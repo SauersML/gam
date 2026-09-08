@@ -14,8 +14,8 @@ use std::cell::UnsafeCell;
 use std::mem::MaybeUninit;
 
 use crate::jet_scalar::{
-    aggregate_shared_source_derivatives, canonical_shared_source_schedule, Order2,
-    RuntimeJetScalar, SymmetricQuadraticCoefficients,
+    Order2, RuntimeJetScalar, SymmetricQuadraticCoefficients, aggregate_shared_source_derivatives,
+    canonical_shared_source_schedule,
 };
 
 #[derive(Clone, Copy, Debug)]
@@ -70,16 +70,6 @@ const EMPTY_CURVATURE_EVENT: CurvatureEvent = CurvatureEvent::RankOne {
     input: 0,
     second: 0.0,
 };
-
-#[inline]
-fn packed_index(index: usize) -> u8 {
-    u8::try_from(index).expect("graph index must fit the fixed-capacity tape representation")
-}
-
-#[inline]
-fn packed_offset(offset: usize) -> u16 {
-    u16::try_from(offset).expect("graph offset must fit the fixed-capacity tape representation")
-}
 
 /// Fixed-capacity scalar scratch with only its logical prefix initialized.
 ///
@@ -146,34 +136,23 @@ struct GraphTape {
 }
 
 impl GraphTape {
-    fn new_boxed() -> Box<Self> {
-        let mut tape = Box::<Self>::new_uninit();
-        let pointer = tape.as_mut_ptr();
-        // SAFETY: each field is initialized in place before `assume_init`.
-        // In-place initialization is important here: the fixed-capacity tape is
-        // deliberately large and must never be materialized as a stack value.
-        unsafe {
-            std::ptr::addr_of_mut!((*pointer).dimension).write(0);
-            std::ptr::addr_of_mut!((*pointer).node_len).write(0);
-            std::ptr::addr_of_mut!((*pointer).edge_len).write(0);
-            std::ptr::addr_of_mut!((*pointer).event_len).write(0);
-            std::ptr::addr_of_mut!((*pointer).diagonal_len).write(0);
-            std::ptr::addr_of_mut!((*pointer).projected_curvature_len).write(0);
-
-            for node in &mut *std::ptr::addr_of_mut!((*pointer).nodes) {
-                std::ptr::write(node, EMPTY_NODE);
-            }
-            std::ptr::addr_of_mut!((*pointer).gradients).write_bytes(0, 1);
-            std::ptr::addr_of_mut!((*pointer).adjoints).write_bytes(0, 1);
-            std::ptr::addr_of_mut!((*pointer).edge_parents).write_bytes(0, 1);
-            std::ptr::addr_of_mut!((*pointer).edge_firsts).write_bytes(0, 1);
-            for event in &mut *std::ptr::addr_of_mut!((*pointer).events) {
-                std::ptr::write(event, EMPTY_CURVATURE_EVENT);
-            }
-            std::ptr::addr_of_mut!((*pointer).diagonal_inputs).write_bytes(0, 1);
-            std::ptr::addr_of_mut!((*pointer).diagonal_seconds).write_bytes(0, 1);
-            std::ptr::addr_of_mut!((*pointer).projected_curvatures).write_bytes(0, 1);
-            tape.assume_init()
+    fn new() -> Self {
+        Self {
+            dimension: 0,
+            node_len: 0,
+            edge_len: 0,
+            event_len: 0,
+            diagonal_len: 0,
+            projected_curvature_len: 0,
+            nodes: [EMPTY_NODE; MAX_GRAPH_NODES],
+            gradients: [0.0; MAX_GRAPH_NODES * MAX_PRIMARY_DIMENSION],
+            adjoints: [0.0; MAX_GRAPH_NODES],
+            edge_parents: [0; MAX_GRAPH_EDGES],
+            edge_firsts: [0.0; MAX_GRAPH_EDGES],
+            events: [EMPTY_CURVATURE_EVENT; MAX_GRAPH_NODES],
+            diagonal_inputs: [0; MAX_GRAPH_EDGES],
+            diagonal_seconds: [0.0; MAX_GRAPH_EDGES],
+            projected_curvatures: [0.0; MAX_PROJECTED_CURVATURE_VALUES],
         }
     }
 }
@@ -251,7 +230,7 @@ impl Order2GraphWorkspace {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            tape: UnsafeCell::new(GraphTape::new_boxed()),
+            tape: UnsafeCell::new(Box::new(GraphTape::new())),
         }
     }
 
@@ -308,8 +287,8 @@ impl Order2GraphWorkspace {
         tape.nodes[node] = GraphNode {
             value,
             support,
-            edge_start: packed_offset(edge_start),
-            edge_len: packed_offset(edge_len),
+            edge_start: edge_start as u16,
+            edge_len: edge_len as u16,
             primary_axis: NO_PRIMARY_AXIS,
         };
         tape.gradients[node * K..(node + 1) * K].copy_from_slice(&gradient);
@@ -327,7 +306,7 @@ impl Order2GraphWorkspace {
             parent < tape.node_len,
             "compiled graph edge parent must name an existing node"
         );
-        tape.edge_parents[tape.edge_len] = packed_index(parent);
+        tape.edge_parents[tape.edge_len] = parent as u8;
         tape.edge_firsts[tape.edge_len] = first;
         tape.edge_len += 1;
     }
@@ -352,7 +331,7 @@ impl Order2GraphWorkspace {
             input < tape.node_len,
             "compiled graph diagonal input must name an existing node"
         );
-        tape.diagonal_inputs[tape.diagonal_len] = packed_index(input);
+        tape.diagonal_inputs[tape.diagonal_len] = input as u8;
         tape.diagonal_seconds[tape.diagonal_len] = second;
         tape.diagonal_len += 1;
     }
@@ -581,8 +560,8 @@ impl<'arena, const K: usize> Order2Graph<'arena, K> {
         Order2GraphWorkspace::push_event(
             tape,
             CurvatureEvent::RankOne {
-                owner: packed_index(owner),
-                input: packed_index(self.node),
+                owner: owner as u8,
+                input: self.node as u8,
                 second,
             },
         );
@@ -615,7 +594,7 @@ impl<'arena, const K: usize> RuntimeJetScalar<'arena> for Order2Graph<'arena, K>
         let tape = workspace.tape_mut();
         let edge_start = tape.edge_len;
         let node = Order2GraphWorkspace::push(tape, x, 1_u16 << axis, gradient, edge_start);
-        tape.nodes[node].primary_axis = packed_index(axis);
+        tape.nodes[node].primary_axis = axis as u8;
         Self { workspace, node }
     }
 
@@ -802,8 +781,8 @@ impl<'arena, const K: usize> RuntimeJetScalar<'arena> for Order2Graph<'arena, K>
         Order2GraphWorkspace::push_event(
             tape,
             CurvatureEvent::Projected {
-                owner: packed_index(owner),
-                curvature_start: packed_offset(curvature_start),
+                owner: owner as u8,
+                curvature_start: curvature_start as u16,
                 support,
             },
         );
@@ -876,9 +855,9 @@ impl<'arena, const K: usize> RuntimeJetScalar<'arena> for Order2Graph<'arena, K>
         Order2GraphWorkspace::push_event(
             tape,
             CurvatureEvent::Cross {
-                owner: packed_index(owner),
-                left: packed_index(self.node),
-                right: packed_index(right.node),
+                owner: owner as u8,
+                left: self.node as u8,
+                right: right.node as u8,
             },
         );
         let node = Order2GraphWorkspace::push(tape, value, support, gradient, edge_start);
@@ -922,9 +901,9 @@ impl<'arena, const K: usize> RuntimeJetScalar<'arena> for Order2Graph<'arena, K>
         Order2GraphWorkspace::push_event(
             tape,
             CurvatureEvent::Diagonal {
-                owner: packed_index(owner),
-                term_start: packed_offset(term_start),
-                len: packed_offset(inputs.len()),
+                owner: owner as u8,
+                term_start: term_start as u16,
+                len: inputs.len() as u16,
             },
         );
         let node = Order2GraphWorkspace::push(tape, value, support, gradient, edge_start);
@@ -990,9 +969,9 @@ impl<'arena, const K: usize> RuntimeJetScalar<'arena> for Order2Graph<'arena, K>
         Order2GraphWorkspace::push_event(
             tape,
             CurvatureEvent::Diagonal {
-                owner: packed_index(owner),
-                term_start: packed_offset(term_start),
-                len: packed_offset(inputs.len()),
+                owner: owner as u8,
+                term_start: term_start as u16,
+                len: inputs.len() as u16,
             },
         );
         let node = Order2GraphWorkspace::push(tape, value, support, gradient, edge_start);
@@ -1161,8 +1140,8 @@ impl<'arena, const K: usize> RuntimeJetScalar<'arena> for Order2Graph<'arena, K>
         Order2GraphWorkspace::push_event(
             tape,
             CurvatureEvent::Projected {
-                owner: packed_index(owner),
-                curvature_start: packed_offset(curvature_start),
+                owner: owner as u8,
+                curvature_start: curvature_start as u16,
                 support,
             },
         );
@@ -1241,9 +1220,9 @@ impl<'arena, const K: usize> RuntimeJetScalar<'arena> for Order2Graph<'arena, K>
         Order2GraphWorkspace::push_event(
             tape,
             CurvatureEvent::Cross {
-                owner: packed_index(owner),
-                left: packed_index(self.node),
-                right: packed_index(other.node),
+                owner: owner as u8,
+                left: self.node as u8,
+                right: other.node as u8,
             },
         );
         let node = Order2GraphWorkspace::push(
@@ -1527,7 +1506,8 @@ mod tests {
         vars: &[S; 5],
         workspace: &'arena S::Workspace,
     ) -> S {
-        let right = vars[4].affine_compose(1.2, -0.1, [0.7, -1.2, 0.45, 0.0, 0.0]);
+        let right =
+            vars[4].affine_compose(1.2, -0.1, [0.7, -1.2, 0.45, 0.0, 0.0]);
         let derived_left = vars[2].multiply_add(&vars[3], &vars[0]);
         let addend = S::linear_combination(vars, &[0.3, -0.8, 0.5, 1.1, -0.4], 5, workspace);
         S::shared_multiply_add_affine_composed_sum(

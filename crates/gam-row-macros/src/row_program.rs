@@ -16,7 +16,11 @@ struct Leaf {
 enum LeafKind {
     /// A stack builder: one Rust function and one CUDA function, each taking
     /// the composition point followed by the compose's scalar arguments.
-    Function { rust: Path, cuda: Ident },
+    Function {
+        rust: Path,
+        cuda: Ident,
+        fifth: Option<Path>,
+    },
     /// The stack is supplied: the compose's five scalar arguments ARE
     /// `[value, first, second, third, fourth]` at the composition point, as
     /// the kernel builder evaluated them there. Nothing is called and the
@@ -46,6 +50,31 @@ impl Leaf {
                 format!("{rust}({})", all.join(", "))
             }
             LeafKind::Supplied => format!("[{}]", arguments.join(", ")),
+        }
+    }
+
+    fn rust_application_source_at_order(
+        &self,
+        point: &str,
+        arguments: &[String],
+        order: usize,
+    ) -> Result<String> {
+        if order <= 4 {
+            return Ok(self.rust_application_source(point, arguments));
+        }
+        match &self.kind {
+            LeafKind::Function {
+                fifth: Some(rust), ..
+            } => {
+                let mut all = vec![point.to_string()];
+                all.extend(arguments.iter().cloned());
+                Ok(format!("{}({})", quote!(#rust), all.join(", ")))
+            }
+            LeafKind::Supplied if arguments.len() == 6 => Ok(format!("[{}]", arguments.join(", "))),
+            _ => Err(syn::Error::new_spanned(
+                &self.alias,
+                "fifth-order emission requires an explicit six-entry leaf stack",
+            )),
         }
     }
 
@@ -90,6 +119,7 @@ struct EmissionSurfaces {
     order2: bool,
     third: bool,
     fourth: bool,
+    fifth: bool,
     full: bool,
     witnesses: bool,
     cuda: bool,
@@ -103,13 +133,14 @@ impl EmissionSurfaces {
             "order2" => &mut self.order2,
             "third" => &mut self.third,
             "fourth" => &mut self.fourth,
+            "fifth" => &mut self.fifth,
             "full" => &mut self.full,
             "witnesses" => &mut self.witnesses,
             "cuda" => &mut self.cuda,
             _ => {
                 return Err(syn::Error::new_spanned(
                     surface,
-                    "row_program emission surface must be one of `generic`, `runtime`, `order2`, `third`, `fourth`, `full`, `witnesses`, or `cuda`",
+                    "row_program emission surface must be one of `generic`, `runtime`, `order2`, `third`, `fourth`, `fifth`, `full`, `witnesses`, or `cuda`",
                 ));
             }
         };
@@ -129,6 +160,7 @@ impl EmissionSurfaces {
             || self.order2
             || self.third
             || self.fourth
+            || self.fifth
             || self.full
             || self.witnesses
             || self.cuda)
@@ -243,10 +275,14 @@ impl Parse for Input {
                 LeafKind::Supplied
             } else {
                 leaf_tokens.parse::<Token![=>]>()?;
-                LeafKind::Function {
-                    rust,
-                    cuda: leaf_tokens.parse()?,
-                }
+                let cuda = leaf_tokens.parse()?;
+                let fifth = if leaf_tokens.peek(Token![=>]) {
+                    leaf_tokens.parse::<Token![=>]>()?;
+                    Some(leaf_tokens.parse()?)
+                } else {
+                    None
+                };
+                LeafKind::Function { rust, cuda, fifth }
             };
             leaves.push(Leaf { alias, kind });
             if leaf_tokens.peek(Token![,]) {
@@ -592,7 +628,8 @@ fn rust_expression(expression: &ProgramExpr, leaves: &[Leaf]) -> TokenStream2 {
             let stack = leaves[*leaf].rust_application(quote!(value.value()), arguments);
             quote!({
                 let value = #value_ident;
-                value.compose_unary(#stack)
+                let stack = #stack;
+                value.compose_unary([stack[0], stack[1], stack[2], stack[3], stack[4]])
             })
         }
     }
@@ -640,7 +677,8 @@ fn rust_runtime_expression(expression: &ProgramExpr, leaves: &[Leaf]) -> TokenSt
             let stack = leaves[*leaf].rust_application(quote!(value.value()), arguments);
             quote!({
                 let value = #value_ident.clone();
-                value.compose_unary(#stack)
+                let stack = #stack;
+                value.compose_unary([stack[0], stack[1], stack[2], stack[3], stack[4]])
             })
         }
     }
@@ -706,7 +744,7 @@ fn primary_parameters(primaries: &[Ident], body: &TokenStream2) -> Vec<Ident> {
         .collect()
 }
 
-/// A supplied stack composes exactly its five entries; a builder leaf takes
+/// A supplied stack composes its five or six entries; a builder leaf takes
 /// whatever scalar arguments its function declares.
 fn validate_supplied_stacks(expression: &ProgramExpr, leaves: &[Leaf]) -> Result<()> {
     match expression {
@@ -723,11 +761,12 @@ fn validate_supplied_stacks(expression: &ProgramExpr, leaves: &[Leaf]) -> Result
             value,
             arguments,
         } => {
-            if matches!(leaves[*leaf].kind, LeafKind::Supplied) && arguments.len() != 5 {
+            if matches!(leaves[*leaf].kind, LeafKind::Supplied) && !matches!(arguments.len(), 5 | 6)
+            {
                 return Err(syn::Error::new_spanned(
                     value,
                     format!(
-                        "a supplied stack composes exactly five entries `[value, first, second, third, fourth]`, got {}",
+                        "a supplied stack composes five or six entries `[value, first, second, third, fourth, (fifth)]`, got {}",
                         arguments.len()
                     ),
                 ));
@@ -1369,7 +1408,10 @@ fn symbolic_expression(
                                 },
                             )
                         }
-                        None => (symbolic_negate(&format!("{stack}[1]")), format!("{stack}[2]")),
+                        None => (
+                            symbolic_negate(&format!("{stack}[1]")),
+                            format!("{stack}[2]"),
+                        ),
                     };
                     match target {
                         SymbolicTarget::Rust => {
@@ -1606,7 +1648,10 @@ impl Rational {
     };
 
     fn new(numerator: i64, denominator: i64) -> Self {
-        assert!(denominator != 0, "a dense Taylor factor has a nonzero denominator");
+        assert!(
+            denominator != 0,
+            "a dense Taylor factor has a nonzero denominator"
+        );
         fn gcd(left: i64, right: i64) -> i64 {
             if right == 0 {
                 left.abs()
@@ -1711,14 +1756,14 @@ struct DenseTaylorJet {
 }
 
 fn dense_taylor_slot_count(dimension: usize) -> usize {
-    5usize.pow(dimension as u32)
+    6usize.pow(dimension as u32)
 }
 
 fn dense_taylor_counts(mut index: usize, dimension: usize) -> Vec<usize> {
     let mut counts = Vec::with_capacity(dimension);
     for _ in 0..dimension {
-        counts.push(index % 5);
-        index /= 5;
+        counts.push(index % 6);
+        index /= 6;
     }
     counts
 }
@@ -1727,7 +1772,7 @@ fn dense_taylor_index(counts: &[usize]) -> usize {
     counts
         .iter()
         .rev()
-        .fold(0usize, |index, count| index * 5 + count)
+        .fold(0usize, |index, count| index * 6 + count)
 }
 
 fn dense_taylor_component(value: String, index: usize) -> Option<String> {
@@ -1933,8 +1978,7 @@ fn dense_taylor_composition_partitions(
             }
         }
         multiplicity_factorial *= (2..=run).product::<usize>();
-        let (factor, expression) =
-            product.expect("composition partition has at least one factor");
+        let (factor, expression) = product.expect("composition partition has at least one factor");
         state.products[index].push((
             factor.over(Rational::new(multiplicity_factorial as i64, 1)),
             expression,
@@ -2027,8 +2071,7 @@ fn dense_taylor_compose(input: DenseTaylorJet, stack: &str) -> DenseTaylorJet {
     // entries multiply them, so a ratio between orders is applied to `B_d`
     // (input work) and never to the product with the leaf's result.
     for (index, terms) in terms.iter().enumerate().skip(1) {
-        let Some(common) = most_common_factor(terms.iter().map(|(_, (factor, _))| *factor))
-        else {
+        let Some(common) = most_common_factor(terms.iter().map(|(_, (factor, _))| *factor)) else {
             continue;
         };
         let mut sum: Option<String> = None;
@@ -2089,7 +2132,13 @@ fn materialize_dense_taylor(
     let mut source = String::new();
     push_dense_taylor_declaration(&mut source, "", &name, "", &value, &support);
     preludes.push(source);
-    DenseTaylorJet::reference(&name, &support, &value.factors, value.dimension, value.order)
+    DenseTaylorJet::reference(
+        &name,
+        &support,
+        &value.factors,
+        value.dimension,
+        value.order,
+    )
 }
 
 struct DenseTaylorExpressionEnvironment<'a> {
@@ -2155,7 +2204,8 @@ fn dense_taylor_expression(
             for argument in arguments {
                 leaf_arguments.push(symbolic_scalar(argument, constants, SymbolicTarget::Rust)?);
             }
-            let application = leaves[*leaf].rust_application_source(&point, &leaf_arguments);
+            let application =
+                leaves[*leaf].rust_application_source_at_order(&point, &leaf_arguments, order)?;
             preludes.push(format!("let {stack} = {application};"));
             // The dense path composes on the point as written, scaled or
             // not. The order-2 emitter absorbs a scaled point into the outer
@@ -2604,7 +2654,9 @@ fn identifier_tokens(text: &str) -> Vec<String> {
 fn call_callee(rhs: &str) -> Option<&str> {
     let rhs = rhs.trim_start();
     let end = rhs
-        .find(|character: char| !(character.is_alphanumeric() || character == '_' || character == ':'))
+        .find(|character: char| {
+            !(character.is_alphanumeric() || character == '_' || character == ':')
+        })
         .unwrap_or(rhs.len());
     let callee = &rhs[..end];
     let first = callee.chars().next()?;
@@ -3004,7 +3056,10 @@ fn schedule_direct_lowering(body: &str) -> String {
                     // on the same side of the run as in program order.
                     let gates_agree = items.iter().enumerate().all(|(gate, other)| {
                         other.kind != ItemKind::Gate
-                            || !other.assigns.iter().any(|assigned| item.references.contains(assigned))
+                            || !other
+                                .assigns
+                                .iter()
+                                .any(|assigned| item.references.contains(assigned))
                             || if gate < candidate {
                                 position(&order, gate).is_some_and(|p| p < run_start)
                             } else {
@@ -3015,7 +3070,8 @@ fn schedule_direct_lowering(body: &str) -> String {
                         flush.push(candidate);
                     }
                 }
-                pending.retain(|candidate| !inputs.contains(candidate) && !flush.contains(candidate));
+                pending
+                    .retain(|candidate| !inputs.contains(candidate) && !flush.contains(candidate));
                 at += flush.len();
                 order.splice(run_start..run_start, flush);
                 call_inputs.extend(inputs.iter().copied());
@@ -3038,13 +3094,13 @@ fn schedule_direct_lowering(body: &str) -> String {
                 // top level; the rest sinks behind the calls.
                 let mut inside_order = Vec::new();
                 for &candidate in &inside_pending {
-                    let independent = items[candidate].references.iter().all(|name| {
-                        match by_name.get(name) {
-                            Some(&defining) if defining != candidate && inside.contains(&defining) => {
-                                inside_order.contains(&defining)
-                            }
-                            _ => true,
+                    let independent = items[candidate].references.iter().all(|name| match by_name
+                        .get(name)
+                    {
+                        Some(&defining) if defining != candidate && inside.contains(&defining) => {
+                            inside_order.contains(&defining)
                         }
+                        _ => true,
                     });
                     if independent {
                         inside_order.push(candidate);
@@ -3055,7 +3111,8 @@ fn schedule_direct_lowering(body: &str) -> String {
                     if items[i].kind != ItemKind::Call {
                         continue;
                     }
-                    let inputs = pending_inputs(&items[i].references, &items, &inside_pending, &by_name);
+                    let inputs =
+                        pending_inputs(&items[i].references, &items, &inside_pending, &by_name);
                     inside_pending.retain(|candidate| !inputs.contains(candidate));
                     inside_order.extend(inputs);
                     inside_order.push(i);
@@ -3067,7 +3124,9 @@ fn schedule_direct_lowering(body: &str) -> String {
                 }
                 if !inside_order.is_empty() {
                     let text = std::mem::take(&mut items[index].text);
-                    let (head, tail) = text.split_once('\n').expect("a gate block has an `if` line");
+                    let (head, tail) = text
+                        .split_once('\n')
+                        .expect("a gate block has an `if` line");
                     let mut rebuilt = format!("{head}\n");
                     for &i in &inside_order {
                         for line in items[i].text.lines() {
@@ -3112,7 +3171,10 @@ fn schedule_direct_lowering(body: &str) -> String {
     let last = order.pop();
     order.extend(pending);
     order.extend(last);
-    order.iter().map(|index| items[*index].text.as_str()).collect()
+    order
+        .iter()
+        .map(|index| items[*index].text.as_str())
+        .collect()
 }
 
 fn push_preludes(source: &mut String, preludes: &[String], indentation: &str) {
@@ -3154,7 +3216,9 @@ fn symbolic_schedule(
         .iter()
         .filter_map(|statement| match statement {
             Statement::Local {
-                name, mutable: true, ..
+                name,
+                mutable: true,
+                ..
             } => Some(name.to_string()),
             _ => None,
         })
@@ -3798,7 +3862,10 @@ fn rust_dense_taylor_body(
         // degree-four coefficients, which is fewer multiplies than the
         // directional form at that order.
         if let Some(root_stack) = &schedule.root_compose_stack {
-            assert!(!fourth, "the root composition is specialised at order 3 only");
+            assert!(
+                !fourth,
+                "the root composition is specialised at order 3 only"
+            );
             push_dense_taylor_derivative_array(&mut source, "inner_first", &schedule.result, 1);
             push_dense_taylor_derivative_array(&mut source, "inner_second", &schedule.result, 2);
             push_dense_taylor_derivative_array(&mut source, "inner_third", &schedule.result, 3);
@@ -3954,6 +4021,12 @@ fn rust_dense_taylor_uncontracted_body(
              \x20   ]\n\
              }\n",
         );
+    } else if order == 5 {
+        source.push_str(
+            "    std::array::from_fn(|a| std::array::from_fn(|b| \
+             std::array::from_fn(|c| std::array::from_fn(|d| \
+             std::array::from_fn(|e| derivative[a + b + c + d + e])))))\n}\n",
+        );
     } else {
         source.push_str(
             "    [\n\
@@ -4098,15 +4171,6 @@ fn rust_order2_body(
         SymbolicTarget::Rust,
     )?;
     let mut source = "{\n".to_string();
-    // Channels whose value is `0.0` on EVERY path reaching the statement being
-    // emitted. A mutable channel starts here when its declaration is `0.0`, and
-    // stays here only while every gate that assigns it assigns `0.0` too, so a
-    // later `channel = 0.0` in a gate is writing the value the channel already
-    // has on both edges of that branch. Together with the self-assignment case
-    // below this is what keeps a gate from restating the channels its term does
-    // not contribute to: an added term touches a handful of channels, and the
-    // union support made it restate all of them (#932).
-    let mut known_zero: HashSet<String> = HashSet::new();
     for statement in &schedule.statements {
         match statement {
             SymbolicStatement::Local(local) => {
@@ -4125,33 +4189,26 @@ fn rust_order2_body(
                 } else {
                     local.value.support()
                 };
-                let mut declare = |source: &mut String, channel: String, value: &str| {
-                    if value == "0.0" {
-                        known_zero.insert(channel.clone());
-                    }
-                    source.push_str(&format!("    let {mutable}{channel}: f64 = {value};\n"));
-                };
-                declare(
-                    &mut source,
-                    format!("{}_v", local.name),
-                    &local.value.value,
-                );
+                source.push_str(&format!(
+                    "    let {mutable}{}_v: f64 = {};\n",
+                    local.name, local.value.value
+                ));
                 for axis in 0..dimension {
                     if support.gradient[axis] {
-                        declare(
-                            &mut source,
-                            format!("{}_g{axis}", local.name),
+                        source.push_str(&format!(
+                            "    let {mutable}{}_g{axis}: f64 = {};\n",
+                            local.name,
                             symbolic_component(&local.value.gradient[axis]),
-                        );
+                        ));
                     }
                     for other in axis..dimension {
                         let index = axis * dimension + other;
                         if support.hessian[index] {
-                            declare(
-                                &mut source,
-                                format!("{}_h{axis}_{other}", local.name),
+                            source.push_str(&format!(
+                                "    let {mutable}{}_h{axis}_{other}: f64 = {};\n",
+                                local.name,
                                 symbolic_component(&local.value.hessian[index]),
-                            );
+                            ));
                         }
                     }
                 }
@@ -4167,53 +4224,26 @@ fn rust_order2_body(
                         .mutable_support
                         .get(&assignment.target)
                         .expect("mutable symbolic assignment support exists");
-                    // An assignment a gate does not need to make. `channel =
-                    // channel` restates the value the channel already holds on
-                    // both edges, and `channel = 0.0` where the channel is `0.0`
-                    // on every path into the gate does the same. Both come from
-                    // the union support: a term contributes to a handful of
-                    // channels and the union makes it name all of them. Skipping
-                    // them leaves the channel's value untouched, which IS the
-                    // value the skipped statement would have written, so the
-                    // emitted schedule is unchanged in what it computes and is
-                    // two thirds shorter on a three-term row program (#932).
-                    let mut assign = |source: &mut String, channel: String, value: &str| {
-                        if value == channel {
-                            return;
-                        }
-                        if value == "0.0" {
-                            if known_zero.contains(&channel) {
-                                return;
-                            }
-                            // Zero on the taken edge only: the channel is no
-                            // longer known-zero after the branch.
-                            known_zero.remove(&channel);
-                        } else {
-                            known_zero.remove(&channel);
-                        }
-                        source.push_str(&format!("        {channel} = {value};\n"));
-                    };
-                    assign(
-                        &mut source,
-                        format!("{}_v", assignment.target),
-                        &assignment.value.value,
-                    );
+                    source.push_str(&format!(
+                        "        {}_v = {};\n",
+                        assignment.target, assignment.value.value,
+                    ));
                     for axis in 0..dimension {
                         if support.gradient[axis] {
-                            assign(
-                                &mut source,
-                                format!("{}_g{axis}", assignment.target),
+                            source.push_str(&format!(
+                                "        {}_g{axis} = {};\n",
+                                assignment.target,
                                 symbolic_component(&assignment.value.gradient[axis]),
-                            );
+                            ));
                         }
                         for other in axis..dimension {
                             let index = axis * dimension + other;
                             if support.hessian[index] {
-                                assign(
-                                    &mut source,
-                                    format!("{}_h{axis}_{other}", assignment.target),
+                                source.push_str(&format!(
+                                    "        {}_h{axis}_{other} = {};\n",
+                                    assignment.target,
                                     symbolic_component(&assignment.value.hessian[index]),
-                                );
+                                ));
                             }
                         }
                     }
@@ -4739,6 +4769,29 @@ pub(crate) fn expand(input: Input) -> Result<TokenStream2> {
         quote!()
     };
 
+    let fifth_function = if emissions.fifth {
+        let fifth_name = format_ident!("{}_fifth_full", name);
+        let fifth_body = rust_dense_taylor_uncontracted_body(
+            &primaries,
+            &constant_names,
+            &leaves,
+            &statements,
+            &result,
+            5,
+        )?;
+        let fifth_primaries = primary_parameters(&primaries, &quote!(#fifth_body));
+        quote! {
+            #[inline(always)]
+            #visibility fn #fifth_name(
+                #(#fifth_primaries: f64,)*
+                #(#constants: f64),*
+            ) -> [[[[[f64; #dimension]; #dimension]; #dimension]; #dimension]; #dimension]
+                #fifth_body
+        }
+    } else {
+        quote!()
+    };
+
     let full_function = if emissions.full {
         let third_full_name = format_ident!("{}_third_full", name);
         let fourth_full_name = format_ident!("{}_fourth_full", name);
@@ -4864,6 +4917,7 @@ pub(crate) fn expand(input: Input) -> Result<TokenStream2> {
         #order2_function
         #third_function
         #fourth_function
+        #fifth_function
         #full_function
         #scalar_witness_function
         #cuda_constant
@@ -5002,6 +5056,31 @@ mod tests {
     }
 
     #[test]
+    fn fifth_surface_requires_and_uses_certified_six_entry_leaves() {
+        let source = quote! {
+            fn fifth_example(x, y;)
+            emit [fifth];
+            leaves { curve => curve_four => cuda_curve => curve_five }
+            witnesses [];
+            { let product = mul(x, y); return compose(curve, product); }
+        };
+        let generated = emitted_function(source, "fifth_example_fifth_full");
+        assert!(generated.contains("curve_five"));
+        assert!(generated.contains("[5]"));
+        assert!(!generated.contains("JetScalar"));
+        let missing = syn::parse2::<Input>(quote! {
+            fn missing_fifth(x, y;)
+            emit [fifth];
+            leaves { curve => curve_four => cuda_curve }
+            witnesses [];
+            { let product = mul(x, y); return compose(curve, product); }
+        })
+        .unwrap();
+        let error = expand(missing).expect_err("a fifth derivative must not silently be zero");
+        assert!(error.to_string().contains("explicit six-entry leaf stack"));
+    }
+
+    #[test]
     fn emission_surfaces_are_mandatory_nonempty_known_and_unique() {
         let missing = parse_error(quote! {
             fn missing(x;)
@@ -5029,7 +5108,7 @@ mod tests {
         });
         assert!(
             unknown.contains(
-                "must be one of `generic`, `runtime`, `order2`, `third`, `fourth`, `full`, `witnesses`, or `cuda`"
+                "must be one of `generic`, `runtime`, `order2`, `third`, `fourth`, `fifth`, `full`, `witnesses`, or `cuda`"
             )
         );
 
@@ -5146,88 +5225,6 @@ mod tests {
         assert!(!rust.contains("0.0*"));
     }
 
-    /// #932: a gate assigns the channels its term reaches, and no others.
-    ///
-    /// The union support tells a gate which channels the mutable carries across
-    /// ALL of its assignments, and the emitter used to write every one of them
-    /// in every gate. A term that reaches three channels then restated the other
-    /// forty — as `channel = channel` for a channel an earlier term had set, and
-    /// as `channel = 0.0` for one nothing had touched. On the survival
-    /// location-scale row that was two thirds of the emitted order-2 body.
-    /// Neither form can change a value, so dropping them leaves the schedule
-    /// computing exactly what it computed.
-    #[test]
-    fn a_gate_assigns_only_the_channels_its_term_reaches_932() {
-        let rust = emitted_function(
-            quote! {
-                fn two_terms(x, y; take_a, take_b)
-                emit [order2];
-                leaves { curve => curve_stack => d_curve }
-                witnesses [];
-                {
-                    let mut out = zero();
-                    if (take_a > 0.0) { out = compose(curve, x); }
-                    if (take_b > 0.0) { out = add(out, mul(y, y)); }
-                    return out;
-                }
-            },
-            "two_terms_order2",
-        )
-        .replace(' ', "");
-
-        // Each channel the mutable carries is declared zero once, where the
-        // scheduler places its declaration.
-        for channel in ["out_v", "out_g0", "out_h0_0", "out_g1", "out_h1_1"] {
-            assert!(
-                rust.contains(&format!("letmut{channel}:f64=0.0;")),
-                "the mutable's {channel} channel is declared zero:\n{rust}"
-            );
-        }
-
-        // The first term is a function of `x` alone, so it must not write the
-        // `y` channels — on the released emitter it wrote them as `= 0.0`.
-        for restated in ["out_g1=0.0;", "out_h1_1=0.0;", "out_h0_1=0.0;"] {
-            assert!(
-                !rust.contains(restated),
-                "a gate restated a channel that is already zero: {restated}\n{rust}"
-            );
-        }
-        // The second term adds `y·y`, which reaches neither `out_g0` nor
-        // `out_h0_0`, so it must not restate them — on the released emitter it
-        // wrote them as `channel = channel`.
-        for restated in ["out_g0=out_g0;", "out_h0_0=out_h0_0;"] {
-            assert!(
-                !rust.contains(restated),
-                "a gate restated a channel its term leaves alone: {restated}\n{rust}"
-            );
-        }
-
-        // NON-VACUITY. Each gate still assigns what its term does reach, and
-        // the one channel both terms carry is still read-modify-written, or the
-        // assertions above would pass on an emitter that assigned nothing.
-        for assigned in [
-            "out_g0=out_stack0[1];",
-            "out_g1=(y+y);",
-            "out_h1_1=(1.0+1.0);",
-            "out_v=(out_v+(y*y));",
-        ] {
-            assert!(
-                rust.contains(assigned),
-                "the gates must still assign the channels their terms reach: {assigned}\n{rust}"
-            );
-        }
-        assert_eq!(
-            rust.matches("if(take_a>0.0){").count(),
-            1,
-            "the first gate is emitted"
-        );
-        assert_eq!(
-            rust.matches("if(take_b>0.0){").count(),
-            1,
-            "the second gate is emitted"
-        );
-    }
-
     #[test]
     fn contracted_formulas_are_direct_sparse_scalar_schedules() {
         let input = quote! {
@@ -5249,7 +5246,7 @@ mod tests {
 
         for formula in [
             "fndirectional_third_contracted(x:f64,y:f64,take:f64,direction_u:&[f64;2usize],)",
-            "let__row_program_product_dense_tmp0_c6:f64=1.0;",
+            "let__row_program_product_dense_tmp0_c7:f64=1.0;",
             "let__row_program_curved_dense_stack1=curve_stack(product_c0);",
             "__row_program_curved_dense_stack1[3]",
             "letdense_derivatives=[",
@@ -5327,7 +5324,9 @@ mod tests {
         for surface in ["rigid_fourth_contracted", "rigid_fourth_full"] {
             let rust = emitted_function(input.clone(), surface);
             // The inner jet (through `margin`) carries no constant.
-            let inner = &rust[..rust.find("__row_program_result_dense_stack").expect("root stack")];
+            let inner = &rust[..rust
+                .find("__row_program_result_dense_stack")
+                .expect("root stack")];
             for literal in literals {
                 assert!(
                     !inner.contains(literal),
@@ -5335,10 +5334,15 @@ mod tests {
                 );
             }
             // The extracted derivatives are coefficient names: no multiply.
-            let start = rust.find("let dense_derivatives = [").or_else(|| rust.find("let derivative = ["));
+            let start = rust
+                .find("let dense_derivatives = [")
+                .or_else(|| rust.find("let derivative = ["));
             let start = start.expect("the extracted derivatives");
             let array = &rust[start..rust[start..].find(']').expect("the array closes") + start];
-            assert!(!array.contains('*'), "{surface} scales an extracted derivative:\n{array}\n{rust}");
+            assert!(
+                !array.contains('*'),
+                "{surface} scales an extracted derivative:\n{array}\n{rust}"
+            );
             // A ratio between orders multiplies the input sum, never the
             // product with the leaf's stack entry.
             assert!(
@@ -5446,7 +5450,10 @@ mod tests {
         assert!(compact.contains("fngiven_order2(_x:f64,"), "{rust}");
         let cuda = emitted_cuda(program);
         // CUDA reads program constants through the row-input struct.
-        assert!(cuda.contains("double out_stack0[3] = {in.a, in.b, in.c};"), "{cuda}");
+        assert!(
+            cuda.contains("double out_stack0[3] = {in.a, in.b, in.c};"),
+            "{cuda}"
+        );
         assert!(!cuda.contains("supplied"), "{cuda}");
 
         let short = syn::parse2::<Input>(quote! {
@@ -5461,7 +5468,7 @@ mod tests {
         })
         .expect("parse row program");
         let error = expand(short).expect_err("a two-entry supplied stack is refused");
-        assert!(error.to_string().contains("exactly five entries"), "{error}");
+        assert!(error.to_string().contains("five or six entries"), "{error}");
     }
 
     /// Every definition sinks to its first use, so a statement's derivative
@@ -5512,9 +5519,14 @@ mod tests {
         let rust = emitted_function(program, "adjacent_order2");
         let first = rust.find("exp_stack (x)").expect("the first leaf call");
         let second = rust.find("exp_stack (z)").expect("the second leaf call");
-        let value = rust.find("let b_v").expect("the value reading the first call");
+        let value = rust
+            .find("let b_v")
+            .expect("the value reading the first call");
         let derivative = rust.find("let b_g0").expect("the derivative of b");
-        assert!(first < second && second < value && value < derivative, "{rust}");
+        assert!(
+            first < second && second < value && value < derivative,
+            "{rust}"
+        );
         let compact = rust.replace(' ', "");
         assert!(
             compact.contains("leta_stack0=exp_stack(x);letc_stack1=exp_stack(z);"),
@@ -5538,7 +5550,9 @@ mod tests {
             }
         };
         let rust = emitted_function(program, "chained_order2");
-        let second = rust.find("exp_stack (b_v").expect("the dependent leaf call");
+        let second = rust
+            .find("exp_stack (b_v")
+            .expect("the dependent leaf call");
         let gradient = rust.find("let b_g0").expect("the gradient of b");
         let hessian = rust.find("let b_h0_1").expect("the Hessian of b");
         assert!(gradient < second && hessian < second, "{rust}");
@@ -5577,22 +5591,37 @@ mod tests {
         assert!(first_gate < only_call && only_call < first_close, "{rust}");
         let inner = rust.find("let inner_g0").expect("the exclusive index jet");
         assert!(first_gate < inner && inner < first_close, "{rust}");
-        let later = rust.find("let later_g1").expect("the second gate's exclusive work");
-        let second_close = rust[second_gate..].find('}').expect("the second gate closes") + second_gate;
+        let later = rust
+            .find("let later_g1")
+            .expect("the second gate's exclusive work");
+        let second_close = rust[second_gate..]
+            .find('}')
+            .expect("the second gate closes")
+            + second_gate;
         assert!(second_gate < later && later < second_close, "{rust}");
         // The exclusive call is issued first inside its block, before the
         // block's own arithmetic.
-        let assignment = rust[first_gate..].find("out_v =").expect("the gate's assignment") + first_gate;
+        let assignment = rust[first_gate..]
+            .find("out_v =")
+            .expect("the gate's assignment")
+            + first_gate;
         assert!(only_call < assignment, "{rust}");
 
         let cuda = emitted_cuda(program);
         let shared_call = cuda.find("d_exp(y,").expect("the shared CUDA call");
         let only_call = cuda.find("d_exp(x,").expect("the exclusive CUDA call");
-        let first_gate = cuda.find("if ((in.a != 0.0))").expect("the first CUDA gate");
-        let first_close = cuda[first_gate..].find("\n    }").expect("the first CUDA gate closes") + first_gate;
+        let first_gate = cuda
+            .find("if ((in.a != 0.0))")
+            .expect("the first CUDA gate");
+        let first_close = cuda[first_gate..]
+            .find("\n    }")
+            .expect("the first CUDA gate closes")
+            + first_gate;
         assert!(shared_call < first_gate, "{cuda}");
         assert!(first_gate < only_call && only_call < first_close, "{cuda}");
-        let inner = cuda.find("double inner_g0").expect("the exclusive CUDA index jet");
+        let inner = cuda
+            .find("double inner_g0")
+            .expect("the exclusive CUDA index jet");
         assert!(first_gate < inner && inner < first_close, "{cuda}");
     }
 
@@ -5648,12 +5677,22 @@ mod tests {
         let second_gate = rust.find("if (b != 0.0)").expect("the second gate");
         for channel in ["let between_v", "let between_g0", "let between_h0_0"] {
             let at = rust.find(channel).expect(channel);
-            assert!(first_close < at && at < second_gate, "{channel} is not between the gates:\n{rust}");
+            assert!(
+                first_close < at && at < second_gate,
+                "{channel} is not between the gates:\n{rust}"
+            );
         }
         let cuda = emitted_cuda(program);
-        let first_gate = cuda.find("if ((in.a != 0.0))").expect("the first CUDA gate");
-        let first_close = cuda[first_gate..].find('}').expect("the first CUDA gate closes") + first_gate;
-        let second_gate = cuda.find("if ((in.b != 0.0))").expect("the second CUDA gate");
+        let first_gate = cuda
+            .find("if ((in.a != 0.0))")
+            .expect("the first CUDA gate");
+        let first_close = cuda[first_gate..]
+            .find('}')
+            .expect("the first CUDA gate closes")
+            + first_gate;
+        let second_gate = cuda
+            .find("if ((in.b != 0.0))")
+            .expect("the second CUDA gate");
         let at = cuda.find("double between_v").expect("the CUDA value");
         assert!(first_close < at && at < second_gate, "{cuda}");
 
@@ -5702,8 +5741,14 @@ mod tests {
         // The stack is named after the compose's owner, `out`.
         let rust = emitted_function(program.clone(), "signed_order2");
         assert!(rust.contains("probit_stack (m_v"), "{rust}");
-        assert!(rust.contains("let out_stack0_u1 : f64 = (out_stack0 [1] * s)"), "{rust}");
-        assert!(rust.contains("let out_stack0_u2 : f64 = ((out_stack0 [2] * s) * s)"), "{rust}");
+        assert!(
+            rust.contains("let out_stack0_u1 : f64 = (out_stack0 [1] * s)"),
+            "{rust}"
+        );
+        assert!(
+            rust.contains("let out_stack0_u2 : f64 = ((out_stack0 [2] * s) * s)"),
+            "{rust}"
+        );
         assert!(rust.contains("(p_g0 * out_stack0_u1)"), "{rust}");
         assert!(!rust.contains("let m_g0"), "{rust}");
         assert!(!rust.contains("let m_h0_0"), "{rust}");
@@ -5711,7 +5756,10 @@ mod tests {
         // in the whole row, independent of the point's support.
         assert_eq!(rust.matches("* s)").count(), 4, "{rust}");
         let cuda = emitted_cuda(program);
-        assert!(cuda.contains("double out_stack0_u1 = (out_stack0[1] * in.s);"), "{cuda}");
+        assert!(
+            cuda.contains("double out_stack0_u1 = (out_stack0[1] * in.s);"),
+            "{cuda}"
+        );
         assert!(!cuda.contains("double m_g0"), "{cuda}");
 
         // A negated point is the same rule with `s = -1`: no multiply at all.
@@ -5729,8 +5777,14 @@ mod tests {
         };
         let rust = emitted_function(program, "negated_order2");
         assert!(rust.contains("exp_stack (n_v"), "{rust}");
-        assert!(rust.contains("let out_stack0_u1 : f64 = - (out_stack0 [1])"), "{rust}");
-        assert!(rust.contains("let out_stack0_u2 : f64 = out_stack0 [2]"), "{rust}");
+        assert!(
+            rust.contains("let out_stack0_u1 : f64 = - (out_stack0 [1])"),
+            "{rust}"
+        );
+        assert!(
+            rust.contains("let out_stack0_u2 : f64 = out_stack0 [2]"),
+            "{rust}"
+        );
         assert!(!rust.contains("let n_g0"), "{rust}");
 
         // A constant declared `: sign` squares to one: `f''` is read as is,
@@ -5749,10 +5803,16 @@ mod tests {
             }
         };
         let rust = emitted_function(program.clone(), "signed_role_order2");
-        assert!(rust.contains("let out_stack0_u2 : f64 = out_stack0 [2]"), "{rust}");
+        assert!(
+            rust.contains("let out_stack0_u2 : f64 = out_stack0 [2]"),
+            "{rust}"
+        );
         assert_eq!(rust.matches("* s)").count(), 2, "{rust}");
         let cuda = emitted_cuda(program);
-        assert!(cuda.contains("double out_stack0_u2 = out_stack0[2];"), "{cuda}");
+        assert!(
+            cuda.contains("double out_stack0_u2 = out_stack0[2];"),
+            "{cuda}"
+        );
 
         // A point scaled from a mutable local is not aliased: a gate may
         // reassign the local, and the alias would read the wrong state.

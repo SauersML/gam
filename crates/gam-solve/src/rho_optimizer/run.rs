@@ -791,6 +791,7 @@ impl OuterProblem {
             efs_fn,
             fixed_point_certificate_fn: None,
             exact_polish_fn: None,
+            criterion_resolution_fn: None,
             rail_face_limit_fn: None,
             soft_rho_guard_gradient_fn: None,
             criterion_invariance_fn: None,
@@ -832,6 +833,7 @@ impl OuterProblem {
             efs_fn,
             fixed_point_certificate_fn: None,
             exact_polish_fn: None,
+            criterion_resolution_fn: None,
             rail_face_limit_fn: None,
             soft_rho_guard_gradient_fn: None,
             criterion_invariance_fn: None,
@@ -875,6 +877,7 @@ impl OuterProblem {
             efs_fn,
             fixed_point_certificate_fn: None,
             exact_polish_fn: None,
+            criterion_resolution_fn: None,
             rail_face_limit_fn: None,
             soft_rho_guard_gradient_fn: None,
             criterion_invariance_fn: None,
@@ -1300,10 +1303,6 @@ pub enum OuterResultOrigin {
     /// ARC hit a run of infeasible probes with no synchronized Hessian, so a
     /// checkpoint was rebuilt from the stored best iterate.
     ArcInfeasibleStallCheckpoint,
-    /// ARC was stopped at a point its own terminal certificate accepts: the
-    /// Newton decrement ½gᵀH⁻¹g of the rail-projected gradient sat at or below
-    /// the criterion's resolution under a PSD reduced Hessian (#2817).
-    ArcCurvatureStationaryStop,
     /// The BFGS cost-stall guard halted the search and published its best
     /// iterate, which was rebuilt into this result.
     BfgsCostStallExit,
@@ -1769,33 +1768,6 @@ pub(crate) fn certificate_hessian_is_psd(hessian: &Array2<f64>) -> Option<bool> 
 /// `measured_resolution` is that measurement. `0.0` reproduces the historical
 /// shift bit for bit, and since the two are combined by `max` this can only
 /// ever admit a point the previous rule refused — never refuse one it admitted.
-/// The shift the certificate's definiteness verdict is ACTUALLY taken at, and
-/// the single owner of that number (#2748).
-///
-/// It is the larger of the measured `‖δH‖₂` and the arithmetic shift
-/// `√ε·max(max|H_ii|, 1)`. The second is what decides whenever no identity
-/// could be measured, and it is not small: on a ρ-Hessian whose largest
-/// diagonal is under 1 it is a flat `√ε = 1.49e-8`.
-///
-/// It is `pub(crate)` and separate because the verdict travels. The
-/// smoothing-correction re-judges the same direction at the same point against
-/// a resolution built from its own eigensolver's backward error — `2.19e-16` on
-/// the measured #2748 `geo_disease` k=12 cell — and refused a direction the
-/// certificate had cleared at `1.49e-8`, eight orders wider. A verdict and the
-/// standard it was taken at have to travel together, or the second layer
-/// applies a strictly stronger test than the first and the fit dies between
-/// them.
-pub(crate) fn certificate_curvature_shift(hessian: &Array2<f64>, measured_resolution: f64) -> f64 {
-    let n = hessian.nrows();
-    let max_diag = (0..n).fold(0.0_f64, |acc, j| acc.max(hessian[[j, j]].abs()));
-    let arithmetic_shift = f64::EPSILON.sqrt() * max_diag.max(1.0);
-    if measured_resolution.is_finite() && measured_resolution > arithmetic_shift {
-        measured_resolution
-    } else {
-        arithmetic_shift
-    }
-}
-
 pub(crate) fn certificate_hessian_is_psd_at_resolution(
     hessian: &Array2<f64>,
     measured_resolution: f64,
@@ -1804,7 +1776,13 @@ pub(crate) fn certificate_hessian_is_psd_at_resolution(
     if n == 0 || hessian.ncols() != n || hessian.iter().any(|v| !v.is_finite()) {
         return None;
     }
-    let shift = certificate_curvature_shift(hessian, measured_resolution);
+    let max_diag = (0..n).fold(0.0_f64, |acc, j| acc.max(hessian[[j, j]].abs()));
+    let arithmetic_shift = f64::EPSILON.sqrt() * max_diag.max(1.0);
+    let shift = if measured_resolution.is_finite() && measured_resolution > arithmetic_shift {
+        measured_resolution
+    } else {
+        arithmetic_shift
+    };
     let mut chol = hessian.clone();
     for j in 0..n {
         chol[[j, j]] += shift;
@@ -2156,17 +2134,13 @@ pub(crate) fn interior_curvature_floor_clearance(
             .iter()
             .fold(f64::INFINITY, |acc, v| acc.min(*v))
     };
-    let measured_resolution =
-        measured_outer_curvature_resolution(hessian, excluded, gradient, invariance);
     Some(CurvatureFloorClearance {
         interior_min_eigenvalue,
         gradient_floor,
         floored_min_eigenvalue,
-        measured_resolution,
-        // The shift the verdict was decided at, from the SAME owner the PSD
-        // test calls and on the SAME block it tested, so the number recorded
-        // and the number applied cannot drift apart (#2748).
-        decided_at_resolution: certificate_curvature_shift(&floored_block, measured_resolution),
+        measured_resolution: measured_outer_curvature_resolution(
+            hessian, excluded, gradient, invariance,
+        ),
         cleared,
     })
 }
@@ -3609,13 +3583,6 @@ pub(crate) enum StationarityBoundSource {
     /// `max(tolerance, scale·√ε)`, widened by the DECLARED-scale rung
     /// `τ·(1 + |scale|)`. A function of the declared problem and nothing else.
     SolverBand,
-    /// The CERTIFICATE's point-anchored widening `τ·(1 + |cost_at_point|)`,
-    /// reported when it strictly exceeds [`Self::SolverBand`] (#2688). A
-    /// different anchor and therefore a different quantity: the engine band is
-    /// sealed at run start, this one moves with wherever the search stopped
-    /// (#2613). Both were `solver-band` until #2688, so a `N× over bound` ratio
-    /// could not be read as a ratio against a resolution standard.
-    CertificateScoreRelative,
     /// The cost-stall guard's measured probe-noise floor `σ̂/Δ` (#2241). Diverges
     /// as the step collapses, which is the regime it fires in.
     ProbeNoiseFloor,
@@ -3652,7 +3619,6 @@ impl StationarityBoundSource {
     pub(crate) fn label(self) -> &'static str {
         match self {
             Self::SolverBand => "solver-band",
-            Self::CertificateScoreRelative => "certificate-score-relative",
             Self::ProbeNoiseFloor => "probe-noise-floor",
             Self::CurvatureResolvability => "curvature-resolvability",
             Self::GradientReproducibility => "gradient-reproducibility",
@@ -4524,6 +4490,11 @@ fn certify_outer_optimality_at_terminal_fidelity(
             StationarityStandard::NoComparison,
         )
     })?;
+    // #2812: the criterion's resolution at this point, from the objective that
+    // knows its own additive terms; every rung below that asks "can the
+    // criterion resolve this decrease" asks it against this one number.
+    let criterion_resolution =
+        criterion_resolution_at(obj.criterion_resolution(), evaluation.cost, context);
 
     let analytic_lane_inner_converged = inner_solve_converged(config.outer_inner_cap.as_ref());
     if !analytic_lane_inner_converged {
@@ -4665,7 +4636,7 @@ fn certify_outer_optimality_at_terminal_fidelity(
     // `let mut bound_source = SolverBand;`, so the engine's declared band, the
     // point-anchored widening and the caller's cap -- three quantities, one of
     // which is not a defect in the fit -- all reported one label.
-    let band_at_point = outer_stationarity_band_and_rung_at(config, evaluation.cost);
+    let band_at_point = outer_stationarity_band_and_rung(config);
     let solver_bound = band_at_point.bound;
     let mut bound_source = band_at_point.source;
     if bound_source == StationarityBoundSource::CallerRequirement {
@@ -4729,13 +4700,12 @@ fn certify_outer_optimality_at_terminal_fidelity(
             stationarity_bound = noise_bound;
         }
     }
-    // #2568 -- the caller's requirement caps the ladder's TOP. Every rung above
-    // widens, so capping here is the only placement that cannot be defeated by a
-    // rung that fires later; in particular the score-relative widening is what
-    // produced the saturated `bound = 1.000e0` this issue was filed against.
+    // Apply the caller's requirement to the value-agreement audit. Curvature
+    // and reproducibility are measured below, so the final stationarity verdict
+    // must apply the cap again after those rungs (#2627).
     //
     // #2688 -- this is now the SECOND cap, not the only one, and it says so.
-    // `outer_stationarity_band_and_rung_at` already capped the engine's own
+    // `outer_stationarity_band_and_rung` already capped the engine's own
     // band and labelled the result; what reaches here is a bound that a
     // widening ABOVE (today: the probe-noise floor) pushed back past the
     // requirement. Before #2688 `required < stationarity_bound` was false by
@@ -5000,14 +4970,16 @@ fn certify_outer_optimality_at_terminal_fidelity(
         // The SAME relative cost floor the cost-stall guard used to declare the
         // criterion stalled (run_plan.rs), so certification asserts nothing
         // tighter than the loop already proved about this surface.
-        let objective_tol = outer_rel_cost_floor(config) * (1.0 + evaluation.cost.abs());
+        let objective_tol = criterion_resolution.band;
         let curvature_grad_bound =
             projected_grad_norm * (objective_tol / predicted_decrease).sqrt();
         if curvature_grad_bound.is_finite() && curvature_grad_bound > stationarity_bound {
             log::info!(
                 "[CERTIFICATE] {context}: curvature-scaled flat-valley bound {curvature_grad_bound:.3e} \
-                 (|Pg|={projected_grad_norm:.3e}, Newton ½gᵀH⁻¹g={predicted_decrease:.3e} ≤ tol {objective_tol:.3e}) \
-                 widened from gradient-band {stationarity_bound:.3e}"
+                 (|Pg|={projected_grad_norm:.3e}, Newton ½gᵀH⁻¹g={predicted_decrease:.3e} ≤ the \
+                 criterion's resolution {objective_tol:.3e}, published={}) widened from \
+                 gradient-band {stationarity_bound:.3e}",
+                criterion_resolution.published,
             );
             stationarity_bound = curvature_grad_bound;
             bound_source = StationarityBoundSource::CurvatureResolvability;
@@ -5042,11 +5014,7 @@ fn certify_outer_optimality_at_terminal_fidelity(
         && run_recorded_value.is_finite()
     {
         const GRADIENT_REPRODUCIBILITY_WIDENING: f64 = 2.0;
-        let objective_tol = config
-            .rel_cost_tolerance
-            .unwrap_or(config.tolerance * 1.0e-2)
-            .max(COST_STALL_REL_TOL_FLOOR)
-            * (1.0 + evaluation.cost.abs());
+        let objective_tol = criterion_resolution.band;
         let cost_drift = (run_recorded_value - evaluation.cost).abs();
         // The spread must compare two measurements of the SAME quantity, so the
         // run-recorded gradient gets the identical #2545 barrier removal the
@@ -5083,6 +5051,21 @@ fn certify_outer_optimality_at_terminal_fidelity(
             stationarity_bound = repro_bound;
             bound_source = StationarityBoundSource::GradientReproducibility;
         }
+    }
+
+    // The caller's requirement constrains the final certificate, including
+    // curvature and reproducibility widening. Applying it only before those
+    // measurements silently certified gradients above the requested limit.
+    if let Some(required) = config.required_projected_gradient_norm
+        && required < stationarity_bound
+    {
+        log::info!(
+            "[2568-REQUIREMENT] {context}: final caller limit {required:.6e} caps \
+             {} bound {stationarity_bound:.6e}; measured |Pg|={projected_grad_norm:.6e}",
+            bound_source.label(),
+        );
+        stationarity_bound = required;
+        bound_source = StationarityBoundSource::CallerRequirement;
     }
 
     // #2458/#2479 -- the bound's own provenance, emitted UNCONDITIONALLY rather
@@ -5172,11 +5155,7 @@ fn certify_outer_optimality_at_terminal_fidelity(
     // with outward pull (`grad_norm` above the stationarity bound) and an analytic
     // Hessian: a well-conditioned interior fit, or a coordinate merely resting near a
     // bound with a vanishing gradient, probes nothing and keeps its ordinary verdict.
-    let asymptote_objective_tol = config
-        .rel_cost_tolerance
-        .unwrap_or(config.tolerance * 1.0e-2)
-        .max(COST_STALL_REL_TOL_FLOOR)
-        * (1.0 + evaluation.cost.abs());
+    let asymptote_objective_tol = criterion_resolution.band;
     let rail_outcome = match analytic_hessian.as_ref() {
         Some(hessian) if !certificate_railed.is_empty() && grad_norm > stationarity_bound => {
             Some(try_certify_asymptote_rail(
@@ -5315,11 +5294,7 @@ fn certify_outer_optimality_at_terminal_fidelity(
         // The SAME relative cost floor the cost-stall guard and both widenings
         // above use: certification asserts nothing tighter about this surface's
         // macroscopic flatness than the loop already proved.
-        let objective_tol = config
-            .rel_cost_tolerance
-            .unwrap_or(config.tolerance * 1.0e-2)
-            .max(COST_STALL_REL_TOL_FLOOR)
-            * (1.0 + evaluation.cost.abs());
+        let objective_tol = criterion_resolution.band;
         // One e-fold in log-λ per coordinate (ρ IS log-λ): the +δ/−δ pair spans e²
         // in λ, a macroscopic move across which no genuine descent slope can hide.
         const LARGE_STEP_DELTA: f64 = 1.0;
@@ -8923,53 +8898,22 @@ pub(crate) fn run_outer_uncertified(
                         break Ok(result);
                     };
                     if let Some(prev_g) = prev_attempt_grad_norm {
-                        // The gate's job, in its own words above, is to catch a
-                        // trajectory that "didn't move the gradient norm" — a
-                        // REPLAY: same seed, same trust radius, cold caches,
-                        // deterministic optimizer, so the retry recomputes what
-                        // the previous attempt already computed. That is
-                        // `cur >= prev`.
-                        //
-                        // It was implemented as `cur < 0.5 * prev`, which is a
-                        // HALVING requirement, and a retry that improves the
-                        // gradient by less than a factor of two was declared a
-                        // replay and threw away the rest of a two-retry budget.
-                        // Measured on gam#2735's stress fixture: `|g|` went
-                        // 1.966390e0 → 1.605910e0, an 18 % reduction — plainly
-                        // not a replay — and the ladder fell through to the
-                        // degraded plan with a retry still unspent. The retry
-                        // count (`arc_retries_left = 2`) is what bounds slow
-                        // grinding; this gate only has to tell motion from
-                        // stillness.
                         let progressed = cur_grad_norm.is_finite()
                             && prev_g.is_finite()
-                            && cur_grad_norm < prev_g;
+                            && cur_grad_norm < 0.5 * prev_g;
                         if !progressed {
                             log::info!(
                                 "[OUTER] {context}: ARC retry stalled at \
-                                 iter={} cost={:.6e} |g|={:.6e} (prev |g|={:.6e}, \
-                                 ratio {:.4}); the retry did not reduce the gradient \
-                                 at all, so deterministic replay is suspected and \
-                                 further retries cannot help; falling through to \
-                                 degraded plan",
+                                 iter={} cost={:.6e} |g|={:.6e} (prev |g|={:.6e}); \
+                                 deterministic replay suspected, falling through \
+                                 to degraded plan",
                                 result.iterations,
                                 result.final_value,
                                 cur_grad_norm,
                                 prev_g,
-                                cur_grad_norm / prev_g,
                             );
                             break Ok(result);
                         }
-                        log::info!(
-                            "[OUTER] {context}: ARC retry reduced the gradient \
-                             {:.6e} -> {:.6e} (ratio {:.4}); spending another of \
-                             the {} remaining retries rather than reading slow \
-                             progress as a replay",
-                            prev_g,
-                            cur_grad_norm,
-                            cur_grad_norm / prev_g,
-                            arc_retries_left,
-                        );
                     }
                     let next_trust_radius =
                         sanitized_operator_trust_restart_radius(result.operator_trust_radius);
@@ -8993,18 +8937,6 @@ pub(crate) fn run_outer_uncertified(
                     prev_attempt_grad_norm = Some(cur_grad_norm);
                     next.initial_rho = Some(result.rho.clone());
                     next.operator_initial_trust_radius = next_trust_radius;
-                    // This is a continuation of ONE exhausted trajectory, not a
-                    // new multistart search.  Leaving the original seed policy
-                    // intact caused `run_outer_with_plan` to enumerate all of
-                    // the generated seeds again after installing the checkpoint:
-                    // the three-seed standard-REML sweep therefore ran twice
-                    // whenever one candidate exhausted its budget (#2817).
-                    // Restrict the resumed plan to the checkpoint which carries
-                    // the evidence for the retry.  Besides avoiding unrelated
-                    // work, this preserves the meaning of the progress gate:
-                    // `prev_attempt_grad_norm` and the next terminal norm now
-                    // belong to the same trajectory.
-                    restrict_arc_retry_to_checkpoint(&mut next);
                     retry_config = Some(next);
                     arc_retries_left -= 1;
                     obj.reset();
@@ -9080,17 +9012,6 @@ pub(crate) fn run_outer_uncertified(
     Err(last_error.unwrap_or_else(|| {
         EstimationError::RemlOptimizationFailed(format!("all plan attempts exhausted ({context})"))
     }))
-}
-
-/// Turn an exhausted ARC plan into a single-checkpoint continuation.
-///
-/// Kept separate from the orchestration loop so the no-multistart-on-retry
-/// contract can be pinned without reproducing a full REML seed cascade.
-pub(crate) fn restrict_arc_retry_to_checkpoint(config: &mut OuterConfig) {
-    config.heuristic_lambdas = None;
-    config.seed_config.max_seeds = 1;
-    config.seed_config.seed_budget = 1;
-    config.screen_initial_rho = false;
 }
 
 // ─── Frontier ρ-scaling auto-switch (issue #986) ─────────────────────────
@@ -9187,7 +9108,12 @@ pub(crate) fn run_per_atom_efs_if_frontier(
     let topology = crate::estimate::reml::per_atom_efs::SharedBorderTopology::disjoint(rho_dim);
 
     obj.reset();
+    let seed_install_started = std::time::Instant::now();
     install_matching_initial_inner_seed(obj, config, &seed, context)?;
+    log::info!(
+        "[OUTER] {context}: inner seed installed in {:.2}s; per-atom EFS starts",
+        seed_install_started.elapsed().as_secs_f64(),
+    );
     let result =
         crate::estimate::reml::per_atom_efs::run_per_atom_efs(obj, &seed, &pa_cfg, &topology)?;
     Ok(Some(result.into_outer_result(the_plan)))
@@ -9295,17 +9221,46 @@ pub(crate) fn outer_tolerance(value: f64) -> Result<Tolerance, EstimationError> 
         .map_err(|err| EstimationError::InvalidInput(format!("outer tolerance is invalid: {err}")))
 }
 
-/// The relative cost floor shared by the cost-stall guard, the curvature-scaled
-/// flat-valley certificate, and the certify-last resume progress gate: nothing
-/// tighter than what the in-loop stall detector already proved about the
-/// surface. `rel_cost_tolerance` when set, else a small fraction of the absolute
-/// tolerance, never below `COST_STALL_REL_TOL_FLOOR`.
-pub(crate) fn outer_rel_cost_floor(config: &OuterConfig) -> f64 {
-    config
-        .rel_cost_tolerance
-        .unwrap_or(config.tolerance * 1.0e-2)
-        .max(COST_STALL_REL_TOL_FLOOR)
+/// The criterion's resolution at a certificate point (#2812).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct CriterionResolution {
+    /// The smallest change in the criterion its arithmetic resolves.
+    pub(crate) band: f64,
+    /// Whether the objective published its band (machine precision times the
+    /// sum of its additive terms' magnitudes) or the engine fell back to the
+    /// last-bit floor of the value alone.
+    pub(crate) published: bool,
 }
+
+/// One owner for "how small a change can this criterion resolve": the band
+/// the objective published, never below the last bit of the value itself
+/// (`ε·(1 + |V|)`), and that floor alone when nothing was published — which
+/// understates a criterion assembled from cancelling terms, so the fallback
+/// is logged by name.
+pub(crate) fn criterion_resolution_at(
+    published: Option<f64>,
+    cost: f64,
+    context: &str,
+) -> CriterionResolution {
+    let last_bit = f64::EPSILON * (1.0 + if cost.is_finite() { cost.abs() } else { 0.0 });
+    match published {
+        Some(band) if band.is_finite() && band > 0.0 => CriterionResolution {
+            band: band.max(last_bit),
+            published: true,
+        },
+        _ => {
+            log::info!(
+                "[CERTIFICATE] {context}: the objective published no criterion resolution; \
+                 using the last-bit floor {last_bit:.3e} of the value alone (#2812)"
+            );
+            CriterionResolution {
+                band: last_bit,
+                published: false,
+            }
+        }
+    }
+}
+
 
 /// Whether a certify-last checkpoint reseed (#2273/#2374) exploited real descent.
 ///
@@ -9325,16 +9280,6 @@ pub(crate) fn certify_resume_made_progress(
     retried_value.is_finite() && retried_value < prior_value - floor
 }
 
-/// The user-requested outer precision, expressed relative to the criterion's
-/// magnitude — the mgcv `magic` rule `‖g‖ ≤ τ·(1 + |V|)`.
-///
-/// This is a CONVERGENCE tolerance, not a resolution floor: at the default
-/// `τ = 1e-5` it sits ~670× above the arithmetic floor `√ε`. What it needs from
-/// the caller is `|V|`, and the whole content of #2613 is *which* `|V|`.
-#[inline]
-pub(crate) fn outer_cost_relative_tolerance(config: &OuterConfig) -> f64 {
-    config.rel_cost_tolerance.unwrap_or(config.tolerance)
-}
 
 /// The arithmetic resolution of the declared objective scale.
 ///
@@ -9384,7 +9329,7 @@ fn outer_arithmetic_gradient_floor(config: &OuterConfig) -> f64 {
 /// iterate and is therefore the correctly-anchored version of the same idea.
 ///
 /// The certificate keeps the point-anchored form, which is what mgcv means:
-/// see [`outer_stationarity_band_and_rung_at`].
+/// see [`outer_stationarity_band_and_rung`].
 pub(crate) fn outer_gradient_tolerance(config: &OuterConfig) -> GradientTolerance {
     let mut abs = outer_engine_gradient_band(config);
     // #2568 -- a caller's requirement is the one input to this band that may
@@ -9417,11 +9362,10 @@ pub(crate) fn outer_gradient_tolerance(config: &OuterConfig) -> GradientToleranc
 /// "the engine decided this" from "the caller decided this" out of a number in
 /// which the two have already been `min`-ed together.
 fn outer_engine_gradient_band(config: &OuterConfig) -> f64 {
-    let mut abs = outer_arithmetic_gradient_floor(config);
-    if let Some(scale) = config.objective_scale {
-        abs = abs.max(outer_cost_relative_tolerance(config) * (1.0 + scale));
-    }
-    abs
+    // #2812: the arithmetic floor alone. The former `rel_tol · (1 + scale)`
+    // term was `tol · |V|` under another name (the declared scale is the
+    // criterion's magnitude).
+    outer_arithmetic_gradient_floor(config)
 }
 
 /// A certificate band together with the rung that produced it (#2688).
@@ -9465,26 +9409,16 @@ pub(crate) struct CertificateBandAt {
 /// `min(max(min(engine, required), score_relative), required)`, the inner `min`
 /// being dominated by the outer one in every ordering of the three. What
 /// changed is that the caller now also learns WHICH of the three it got.
-pub(crate) fn outer_stationarity_band_and_rung_at(
-    config: &OuterConfig,
-    cost_at_point: f64,
-) -> CertificateBandAt {
-    let engine_band = outer_engine_gradient_band(config);
-    // A non-finite criterion value anchors nothing, so the declared band stands.
-    let score_relative = if cost_at_point.is_finite() {
-        outer_cost_relative_tolerance(config) * (1.0 + cost_at_point.abs())
-    } else {
-        f64::NEG_INFINITY
-    };
-    // Strict `>`: on a tie the widening added nothing and must not claim the rung.
-    let (engine_bound, engine_source) = if score_relative > engine_band {
-        (
-            score_relative,
-            StationarityBoundSource::CertificateScoreRelative,
-        )
-    } else {
-        (engine_band, StationarityBoundSource::SolverBand)
-    };
+pub(crate) fn outer_stationarity_band_and_rung(config: &OuterConfig) -> CertificateBandAt {
+    // #2812: the certificate's first-order band is the engine's gradient
+    // band and nothing else. The `rel_tol · (1 + |V|)` widening that used to
+    // sit here was a statement about the criterion's magnitude, not about the
+    // gradient's resolution — a REML value moves under a response rescale
+    // while its stationarity does not — so it is gone; a gradient the
+    // criterion cannot resolve is widened by the curvature rung, from the
+    // criterion's own published resolution.
+    let engine_bound = outer_engine_gradient_band(config);
+    let engine_source = StationarityBoundSource::SolverBand;
     // #2568 -- the score-relative widening above is what produced the saturated
     // `bound = 1.000e0`, so a caller requirement that did not survive it would
     // be defeated by exactly the case it was introduced for. Cap after widening.

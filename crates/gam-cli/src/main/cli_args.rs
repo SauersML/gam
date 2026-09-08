@@ -231,6 +231,7 @@ pub(crate) struct FitArgs {
             "sigma_time_degree",
             "slope_time_k",
             "slope_time_degree",
+            "adaptive_regularization",
             "scale_dimensions",
             "precompute_conformal",
             "inference",
@@ -390,6 +391,13 @@ pub(crate) struct FitArgs {
     /// B-spline degree for the time margin of the slope tensor product.
     #[arg(long = "slope-time-degree", default_value_t = 3, value_parser = parse_positive_usize_cli)]
     pub(crate) slope_time_degree: usize,
+    /// Enable MM-based spatial adaptive regularization (Charbonnier majorizer)
+    /// for compatible smooth terms. Off by default — pass
+    /// `--adaptive-regularization true` to opt in. Only consulted by the bare
+    /// `gam fit` (standard GAM) path; the marginal-slope and
+    /// transformation-normal paths do not use this flag.
+    #[arg(long = "adaptive-regularization", action = ArgAction::Set, default_value_t = false)]
+    pub(crate) adaptive_regularization: bool,
     /// Enable per-axis anisotropic spatial optimization for all eligible
     /// spatial terms (Matérn and Duchon). Hybrid Duchon jointly optimizes a
     /// scalar kappa plus per-axis contrasts; pure Duchon optimizes shape-only
@@ -464,6 +472,15 @@ pub(crate) struct PredictArgs {
     /// is a requirement that refuses when the fit cannot supply it (#2779).
     #[arg(long = "covariance-mode", value_parser = parse_covariance_mode_arg)]
     pub(crate) covariance_mode: Option<InferenceCovarianceMode>,
+    #[arg(long = "mode", value_enum, default_value_t = PredictModeArg::PosteriorMean)]
+    pub(crate) mode: PredictModeArg,
+    /// Disable the O(n⁻¹) frequentist bias correction in the survival
+    /// uncertainty paths. The reported point prediction of `gam predict` is the
+    /// plain plug-in / posterior-mean estimate (`eta`/`mean`) with or without
+    /// `--uncertainty`; `--uncertainty` only appends the SE and credible-band
+    /// columns, so this flag never moves the standard point estimate.
+    #[arg(long = "no-bias-correction", default_value_t = false)]
+    pub(crate) no_bias_correction: bool,
 }
 
 #[derive(Args, Debug)]
@@ -540,6 +557,12 @@ pub(crate) struct DiagnoseArgs {
         help = "Dataset to evaluate diagnostics against (CSV or parquet); typically the training data"
     )]
     pub(crate) data: PathBuf,
+    #[arg(
+        long = "alo",
+        default_value_t = false,
+        help = "Also compute approximate-leave-one-out (ALO) statistics"
+    )]
+    pub(crate) alo: bool,
 }
 
 #[derive(Args, Debug)]
@@ -669,6 +692,12 @@ pub(crate) enum HazardLoadingArg {
 /// only — one knob, two vocabularies.
 pub(crate) fn parse_covariance_mode_arg(raw: &str) -> Result<InferenceCovarianceMode, String> {
     raw.parse()
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum, Eq, PartialEq)]
+pub(crate) enum PredictModeArg {
+    PosteriorMean,
+    Map,
 }
 
 pub(crate) struct CliFirthValidation<'a> {

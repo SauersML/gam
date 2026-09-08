@@ -1078,11 +1078,14 @@ pub(crate) fn joint_outer_evaluate(
     // certification drifts in exactly the near-separating regime this machinery
     // exists for. `None` ⇒ provider used unwrapped (byte-identical released path).
     let provider_box: Box<dyn HessianDerivativeProvider + '_> = match jeffreys_hphi_drift {
-        Some(drift) => Box::new(JeffreysHphiAwareJointDerivatives::new(
+        Some(mut drift) => {
+            drift.completion_psi = ext_bundle.as_ref().and_then(|bundle| bundle.completion_psi.clone());
+            drift.response_scale = rho_curvature_scale;
+            Box::new(JeffreysHphiAwareJointDerivatives::new(
             base_provider_box,
             drift,
             total,
-        )),
+        ))},
         None => base_provider_box,
     };
 

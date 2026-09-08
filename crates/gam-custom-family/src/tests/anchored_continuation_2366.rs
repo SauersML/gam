@@ -406,7 +406,7 @@ fn double_well_options() -> BlockwiseFitOptions {
         outer_max_iter: 50,
         outer_tol: 1e-8,
         outer_rel_cost_tol: None,
-        rho_lower_bound: -10.0,
+        rho_lower_bound: Some(-10.0),
         ridge_floor: 1e-8,
         ridge_policy: RidgePolicy::exact_full_objective(),
         use_remlobjective: true,
@@ -572,13 +572,15 @@ fn continuation_mode(
     let penalty_counts: Vec<usize> = specs.iter().map(|spec| spec.penalties.len()).collect();
     let layout = penalty_label_layout_with_joint(specs, penalty_counts, Vec::new())
         .expect("single-penalty label layout");
+    let (_, anchor) = resolvability_rho_domain(specs, &layout, 1, options.rho_lower_bound)
+        .expect("the resolvability domain of a single penalized term");
     let certified = anchored_continuation_seed(
         family,
         specs,
         &options,
         &layout,
         &gam_problem::RhoPrior::Flat,
-        &array![EFFECTIVE_DF_CEILING],
+        &anchor,
         &array![rho],
     )
     .expect("the continuation from the maximally-smoothed anchor must reach the target rho");

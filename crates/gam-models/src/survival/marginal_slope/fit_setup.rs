@@ -351,41 +351,9 @@ where
         .into_iter()
         .map(|s| {
             let penalty_scale = mean_abs(s.diag().iter().copied()).max(1.0e-8);
-            (likelihood_scale / penalty_scale).ln()
+            (likelihood_scale / penalty_scale).ln().clamp(-12.0, 12.0)
         })
         .collect()
-}
-
-/// Return the closed smoothing-strength domain centred on each block's natural
-/// scale. At either edge one curvature is `sqrt(EPSILON)` times the other, the
-/// resolution relevant to the criterion gradient consumed by the outer solver.
-fn log_lambda_domain(seeds: &Array1<f64>) -> (Array1<f64>, Array1<f64>) {
-    let radius = -0.5 * f64::EPSILON.ln();
-    (
-        seeds.mapv(|seed| seed - radius),
-        seeds.mapv(|seed| seed + radius),
-    )
-}
-
-#[cfg(test)]
-mod log_lambda_domain_tests {
-    use super::*;
-
-    /// gam#2765/gam#2767: clipping a scale-derived seed to an unrelated wall
-    /// let the projected gradient certify while REML was still descending.
-    #[test]
-    fn scale_matched_log_lambda_seed_owns_a_resolution_derived_domain_2767() {
-        let design = DesignMatrix::from(Array2::from_elem((2, 1), 1.0e4));
-        let penalty = Array2::from_elem((1, 1), 1.0e-4);
-        let seeds = Array1::from_vec(block_log_lambda_seeds(&design, [&penalty]));
-        assert!(seeds[0] > 12.0, "the fixture must cross the removed hand box");
-
-        let (lower, upper) = log_lambda_domain(&seeds);
-        let radius = -0.5 * f64::EPSILON.ln();
-        assert_eq!(lower[0], seeds[0] - radius);
-        assert_eq!(upper[0], seeds[0] + radius);
-        assert!(lower[0] < seeds[0] && seeds[0] < upper[0]);
-    }
 }
 
 pub(crate) fn joint_setup(
@@ -397,6 +365,7 @@ pub(crate) fn joint_setup(
     slope_penalties: usize,
     core_rho0_seed: &[f64],
     extra_rho0: &[f64],
+    rho_domain: Option<(Array1<f64>, Array1<f64>)>,
     baseline_initial_theta: &[f64],
     baseline_lower_theta: &[f64],
     baseline_upper_theta: &[f64],
@@ -428,7 +397,6 @@ pub(crate) fn joint_setup(
             rho0vec[start + idx] = value;
         }
     }
-    let (rho_lower, rho_upper) = log_lambda_domain(&rho0vec);
     // Time block has no spatial length scales (pure B-spline on time)
     let empty_kappa = SpatialLogKappaCoords::new_with_dims(Array1::zeros(0), vec![]);
     let marginal_kappa = SpatialLogKappaCoords::from_length_scales_aniso(
@@ -495,12 +463,16 @@ pub(crate) fn joint_setup(
     let log_kappa0 = log_kappa0.clamp_to_bounds(&log_kappa_lower, &log_kappa_upper);
     let setup = ExactJointHyperSetup::new(
         rho0vec,
-        rho_lower,
-        rho_upper,
         log_kappa0,
         log_kappa_lower,
         log_kappa_upper,
     );
+    // The ρ domain of the time block and of the prepared extra blocks lives
+    // in structures the joint driver never sees; the caller derived it (#2812).
+    let setup = match rho_domain {
+        Some((lower, upper)) => setup.with_rho_domain(lower, upper),
+        None => setup,
+    };
     assert_eq!(
         baseline_initial_theta.len(),
         baseline_lower_theta.len(),

@@ -2,13 +2,7 @@ target/
 target-*/
 target_*/
 libbuild.rmeta
-# Repository-root hygiene: transient triage programs, logs, helper wrappers,
-# and generated plots belong outside the source tree.
-/_tmp_*.py
-/apply_*.py
-/scratch_*.log
-/error.log
-/*.png
+error.log
 __pycache__/
 bench/**/__pycache__/
 benchmarks/**/__pycache__/
@@ -195,8 +189,7 @@ azuser@/
 .??*.log
 *.sbatch
 
-# Top-level scratch Python scripts (do not track root .py). The named patterns
-# above document the recurring offenders; this catches new spellings too.
+# top-level scratch python scripts (do not track root .py)
 /*.py
 
 # Internal dev/cluster tooling — not for the public repo

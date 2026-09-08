@@ -213,7 +213,6 @@ pub struct CoactivationExceedance {
 }
 
 impl CoactivationExceedance {
-
     pub fn n_obs(&self) -> usize {
         self.n_obs
     }
@@ -350,7 +349,6 @@ mod tests {
         }
         assert_eq!(got_col, col_sums, "column sums changed");
     }
-
 }
 
 // --------------------------------------------------------------------------
@@ -367,7 +365,7 @@ mod tests {
 #[derive(Clone)]
 pub struct AuditSparseRoute {
     pub indices: ndarray::Array2<u32>,
-    pub values: ndarray::Array3<f32>,
+    pub values: ndarray::Array3<f64>,
     pub n_units: usize,
     pub block_size: usize,
 }
@@ -375,7 +373,7 @@ pub struct AuditSparseRoute {
 impl AuditSparseRoute {
     pub fn new(
         indices: ndarray::Array2<u32>,
-        values: ndarray::Array3<f32>,
+        values: ndarray::Array3<f64>,
         n_units: usize,
         block_size: usize,
         label: &str,
@@ -455,8 +453,8 @@ impl AuditSparseRoute {
 
     pub fn reconstruct(
         &self,
-        decoder: ndarray::ArrayView2<'_, f32>,
-    ) -> Result<ndarray::Array2<f32>, String> {
+        decoder: ndarray::ArrayView2<'_, f64>,
+    ) -> Result<ndarray::Array2<f64>, String> {
         if self.block_size == 1 {
             crate::sparse_dict::reconstruct_sparse_rows(
                 decoder,
@@ -528,7 +526,7 @@ pub fn resample_sparse_architecture_null<R: rand::Rng + ?Sized>(
     let donor_moments = live_amplitude_moments(donor);
     let mut indices = ndarray::Array2::<u32>::zeros((observed.nrows(), donor.width()));
     let mut values =
-        ndarray::Array3::<f32>::zeros((observed.nrows(), donor.width(), donor.block_size));
+        ndarray::Array3::<f64>::zeros((observed.nrows(), donor.width(), donor.block_size));
     for row in 0..observed.nrows() {
         let source = rng.random_range(0..donor.nrows());
         for slot in 0..donor.width() {
@@ -557,7 +555,7 @@ pub fn resample_sparse_architecture_null<R: rand::Rng + ?Sized>(
             let scale = target_gate / gate;
             for offset in 0..donor.block_size {
                 values[[row, slot, offset]] =
-                    (donor.values[[source, slot, offset]] as f64 * scale) as f32;
+                    (donor.values[[source, slot, offset]] as f64 * scale) as f64;
             }
         }
     }

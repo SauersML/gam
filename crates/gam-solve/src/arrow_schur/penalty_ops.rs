@@ -665,12 +665,9 @@ impl BetaPenaltyOp for CoupledCarrierPenaltyOp {
                 }
                 for (start_a, values_a) in &self.carriers[a] {
                     for (start_b, values_b) in &self.carriers[b] {
-                        let Some((skip_a, skip_b, len)) = coupled_run_overlap(
-                            *start_a,
-                            values_a.len(),
-                            *start_b,
-                            values_b.len(),
-                        ) else {
+                        let Some((skip_a, skip_b, len)) =
+                            coupled_run_overlap(*start_a, values_a.len(), *start_b, values_b.len())
+                        else {
                             continue;
                         };
                         let base = start_a + skip_a;
@@ -679,7 +676,8 @@ impl BetaPenaltyOp for CoupledCarrierPenaltyOp {
                         }
                         let len = len.min(diag.len() - base);
                         for i in 0..len {
-                            diag[base + i] += coupling * values_a[skip_a + i] * values_b[skip_b + i];
+                            diag[base + i] +=
+                                coupling * values_a[skip_a + i] * values_b[skip_b + i];
                         }
                     }
                 }
@@ -1677,7 +1675,6 @@ impl FactoredFrameKroneckerOp {
             blocks,
         })
     }
-
 }
 
 impl BetaPenaltyOp for FactoredFrameKroneckerOp {
@@ -1829,6 +1826,190 @@ pub struct CompositePenaltyOp {
     pub k: usize,
     /// Component operators, each contributing additively.
     pub ops: Vec<Arc<dyn BetaPenaltyOp>>,
+}
+
+/// Immutable signed correction from an installed beta majorizer to the exact
+/// objective Hessian. The owner captures the same state, lagged operands and
+/// chart used by assembly. Applying it must add into `out`.
+///
+/// Unlike a Newton penalty, this operator need not be positive. Its diagonal
+/// and dense views are realized only when an evidence consumer requests them;
+/// assembly and matrix-free Hessian applies retain the compact closure.
+#[derive(Clone)]
+pub struct ExactBetaRemainder {
+    dim: usize,
+    content_fingerprint: u64,
+    apply: Arc<dyn Fn(&[f64], &mut [f64]) + Send + Sync>,
+    theta:
+        Option<Arc<dyn Fn(bool, &[f64], &[f64], &mut [f64]) -> Result<(), String> + Send + Sync>>,
+}
+
+impl std::fmt::Debug for ExactBetaRemainder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ExactBetaRemainder")
+            .field("dim", &self.dim)
+            .field("content_fingerprint", &self.content_fingerprint)
+            .finish()
+    }
+}
+
+impl ExactBetaRemainder {
+    pub fn new(
+        dim: usize,
+        content_fingerprint: u64,
+        apply: impl Fn(&[f64], &mut [f64]) + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            dim,
+            content_fingerprint,
+            apply: Arc::new(apply),
+            theta: None,
+        }
+    }
+
+    /// Attach the full prior's derivative of left' A right or left' B right.
+    /// This is not the derivative of the signed remainder: evidence consumers
+    /// have not already included the beta prior's majorizer derivative.
+    pub fn with_theta_bilinear(
+        mut self,
+        theta: impl Fn(bool, &[f64], &[f64], &mut [f64]) -> Result<(), String> + Send + Sync + 'static,
+    ) -> Self {
+        self.theta = Some(Arc::new(theta));
+        self
+    }
+
+    pub fn theta_bilinear(
+        &self,
+        exact: bool,
+        left: &[f64],
+        right: &[f64],
+        out: &mut [f64],
+    ) -> Result<(), String> {
+        assert_eq!(left.len(), self.dim);
+        assert_eq!(right.len(), self.dim);
+        assert_eq!(out.len(), self.dim);
+        let theta = self.theta.as_ref().ok_or_else(|| {
+            format!(
+                "beta curvature producer {:016x} has no analytic theta derivative capability",
+                self.content_fingerprint,
+            )
+        })?;
+        theta(exact, left, right, out)
+    }
+
+    /// Capture a live analytic-penalty descriptor after its target layout and
+    /// lagged weights have been resolved by the caller. `target` can be an
+    /// atom-local vector; `offset` embeds that local action in the full border.
+    pub fn from_analytic_penalty(
+        dim: usize,
+        offset: usize,
+        penalty: gam_terms::analytic_penalties::AnalyticPenaltyKind,
+        target: Array1<f64>,
+        rho: Array1<f64>,
+        scale: f64,
+    ) -> Self {
+        assert!(offset + target.len() <= dim);
+        let mut hasher = Fingerprinter::new();
+        hasher.write_str("analytic-exact-beta-remainder-v1");
+        crate::estimate::reml::outer_eval::hash_analytic_penalty_kind(&mut hasher, &penalty);
+        hasher.write_usize(offset);
+        hasher.write_f64(scale);
+        hasher.write_usize(target.len());
+        hasher.write_usize(rho.len());
+        for &value in target.iter().chain(rho.iter()) {
+            hasher.write_f64(value);
+        }
+        if let gam_terms::analytic_penalties::AnalyticPenaltyKind::DecoderIncoherence(prior) =
+            &penalty
+        {
+            let prepared = Arc::new(prior.prepare_curvature(target.view(), rho.view()));
+            let theta_owner = Arc::clone(&prepared);
+            let local_dim = target.len();
+            return Self::new(dim, hasher.finish_u64(), move |x, out| {
+                let mut local = vec![0.0; local_dim];
+                prepared.remainder_action_add(&x[offset..offset + local_dim], &mut local);
+                for (i, &value) in local.iter().enumerate() {
+                    out[offset + i] += scale * value;
+                }
+            })
+            .with_theta_bilinear(move |exact, left, right, out| {
+                let mut local = vec![0.0; local_dim];
+                theta_owner.theta_bilinear_add(
+                    exact,
+                    &left[offset..offset + local_dim],
+                    &right[offset..offset + local_dim],
+                    &mut local,
+                );
+                for (i, &value) in local.iter().enumerate() {
+                    out[offset + i] += scale * value;
+                }
+                Ok(())
+            });
+        }
+        Self::new(dim, hasher.finish_u64(), move |x, out| {
+            let direction = ArrayView1::from(&x[offset..offset + target.len()]);
+            let exact = penalty.hvp(target.view(), rho.view(), direction);
+            let majorizer = penalty.psd_majorizer_hvp(target.view(), rho.view(), direction);
+            for (local, (&a, &b)) in exact.iter().zip(majorizer.iter()).enumerate() {
+                out[offset + local] += scale * (a - b);
+            }
+        })
+    }
+}
+
+impl BetaPenaltyOp for ExactBetaRemainder {
+    fn dim(&self) -> usize {
+        self.dim
+    }
+
+    fn matvec(&self, x: &[f64], out: &mut [f64]) {
+        assert_eq!(x.len(), self.dim);
+        assert_eq!(out.len(), self.dim);
+        (self.apply)(x, out);
+    }
+
+    fn gradient(&self, beta: &[f64], out: &mut [f64]) {
+        self.matvec(beta, out);
+    }
+
+    fn diagonal(&self, diag: &mut [f64]) {
+        let mut probe = vec![0.0; self.dim];
+        let mut action = vec![0.0; self.dim];
+        for col in 0..self.dim {
+            probe[col] = 1.0;
+            action.fill(0.0);
+            self.matvec(&probe, &mut action);
+            diag[col] += action[col];
+            probe[col] = 0.0;
+        }
+    }
+
+    fn block(&self, id: BetaBlockId, offsets: &[Range<usize>], out: &mut Array2<f64>) {
+        let range = offsets[id.0].clone();
+        let mut probe = vec![0.0; self.dim];
+        let mut action = vec![0.0; self.dim];
+        for (local_col, col) in range.clone().enumerate() {
+            probe[col] = 1.0;
+            action.fill(0.0);
+            self.matvec(&probe, &mut action);
+            for (local_row, row) in range.clone().enumerate() {
+                out[[local_row, local_col]] += action[row];
+            }
+            probe[col] = 0.0;
+        }
+    }
+
+    fn to_dense(&self) -> Array2<f64> {
+        let mut out = Array2::zeros((self.dim, self.dim));
+        self.block(BetaBlockId(0), &[0..self.dim], &mut out);
+        out
+    }
+
+    fn fingerprint(&self, hasher: &mut Fingerprinter) {
+        hasher.write_str("exact-beta-remainder-v1");
+        hasher.write_usize(self.dim);
+        hasher.write_u64(self.content_fingerprint);
+    }
 }
 
 impl BetaPenaltyOp for CompositePenaltyOp {

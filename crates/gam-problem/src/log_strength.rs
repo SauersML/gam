@@ -10,6 +10,24 @@
 //! policy domain, not a claim about the widest representable binary64 input.
 //! This module owns the single domain used by all penalty implementations.
 
+/// `ln √ε`: the log of the relative resolution of a criterion gradient carried
+/// through an inverse whose conditioning is the strength ratio itself. Per
+/// direction the ρ-gradient is the effective degrees of freedom `γ/(γ+λ)`
+/// through `(H+λS)⁻¹`, whose condition in that direction is `λ/γ` once the
+/// penalty dominates; a quantity through an inverse of condition `κ` holds
+/// relative error `εκ`, and value and error cross at `λ/γ = 1/√ε`. Every
+/// derived ρ-domain edge (#2812) is this many e-folds from the spectrum.
+pub fn log_gradient_resolution() -> f64 {
+    0.5 * f64::EPSILON.ln()
+}
+
+/// The precision box `[ln √ε, ln(1/√ε)]` around unit strength: the domain of
+/// a coordinate whose penalty geometry cannot be projected, and the envelope a
+/// seed is placed in before the domain is derived.
+pub fn precision_box() -> (f64, f64) {
+    (log_gradient_resolution(), -log_gradient_resolution())
+}
+
 /// Smallest supported logarithmic strength (inclusive).
 pub const LOG_STRENGTH_MIN: f64 = -700.0;
 

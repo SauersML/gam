@@ -172,6 +172,143 @@ fn rigid_psi_all_beta_axes_wide_timing_979() {
         2 * width,
         start.elapsed()
     );
+    let layout = bms_test_design_hyper_layout(blocks, array![0.0]);
+    let direction = Array1::from_elem(2 * width, 0.03);
+    let start = std::time::Instant::now();
+    let third_axes = family
+        .rigid_hyper_information_third_axes(
+            &states, &layout, 0, None, Some(&direction), &options,
+        )
+        .unwrap()
+        .unwrap();
+    assert!(third_axes.iter().flat_map(|axis| axis.iter()).all(|x| x.is_finite()));
+    eprintln!(
+        "979 third information n={n} p={} elapsed={:?}",
+        2 * width,
+        start.elapsed()
+    );
+}
+
+#[test]
+fn rigid_third_information_axes_match_mixed_drift_finite_difference_979() {
+    use crate::outer_subsample::OuterScoreSubsample;
+
+    for empirical in [false, true] {
+        let n = 41;
+        let mut family = make_block_psi_test_family(n);
+        if empirical {
+            family.latent_measure = empirical_rigid_fd_fixture().0.latent_measure;
+            family.gaussian_frailty_sd = Some(0.82);
+        }
+        // Three coefficients exercise the all-distinct tensor permutations as
+        // well as repeated indices; the two blocks have unequal widths.
+        family.marginal_design = DesignMatrix::Dense(
+            Array2::from_shape_fn((n, 2), |(i, j)| {
+                0.2 + 0.3 * (0.17 * (i + 5 * j) as f64).sin()
+            }).into(),
+        );
+        let slope_motion = Array2::from_shape_fn((n, 1), |(i, _)| {
+            0.3 * (0.23 * i as f64).cos()
+        });
+        let blocks = vec![
+            vec![crate::custom_family::CustomFamilyBlockPsiDerivative::new(
+                None,
+                Array2::from_shape_fn((n, 2), |(i, j)| {
+                    0.2 * (0.11 * (i + 7 * j) as f64).cos()
+                }),
+                Array2::zeros((2, 2)), None, None, None, None,
+            )],
+            vec![crate::custom_family::CustomFamilyBlockPsiDerivative::new(
+                None, slope_motion.clone(), Array2::zeros((1, 1)),
+                None, None, None, None,
+            )],
+        ];
+        let layout = bms_test_design_hyper_layout(blocks.clone(), array![0.0, 0.0]);
+        let beta = array![0.15, -0.1, 0.25];
+        let direction = array![0.3, 0.1, -0.2];
+        let states_for = |model: &BernoulliMarginalSlopeFamily, beta: &Array1<f64>| {
+            let marginal = beta.slice(s![..2]).to_owned();
+            let slope = beta.slice(s![2..]).to_owned();
+            vec![
+                ParameterBlockState {
+                    eta: model.marginal_design.to_dense().dot(&marginal),
+                    beta: marginal,
+                },
+                ParameterBlockState {
+                    eta: model.slope_design.to_dense().dot(&slope),
+                    beta: slope,
+                },
+            ]
+        };
+        let states = states_for(&family, &beta);
+        let mut options = BlockwiseFitOptions::default();
+        options.outer_score_subsample = Some(Arc::new(
+            OuterScoreSubsample::from_uniform_inclusion_mask(
+                (0..n).step_by(2).collect(), n, 979,
+            ),
+        ));
+        let h = 2e-5;
+        for psi in 0..2 {
+            let analytic = family
+                .rigid_hyper_information_third_axes(
+                    &states, &layout, psi, None, Some(&direction), &options,
+                )
+                .unwrap()
+                .unwrap();
+            let evaluate = |step: f64| {
+                let perturbed = states_for(&family, &(&beta + &(&direction * step)));
+                let cache = family.build_exact_eval_cache(&perturbed).unwrap();
+                family
+                    .rigid_psi_hessian_all_beta_axes(
+                        &perturbed, &blocks, psi, &cache, &options,
+                    )
+                    .unwrap()
+                    .unwrap()
+            };
+            let plus = evaluate(h);
+            let minus = evaluate(-h);
+            for axis in 0..3 {
+                let fd = (&plus[axis] - &minus[axis]) / (2.0 * h);
+                let rel = rel_diff_array2(&analytic[axis], &fd);
+                assert!(
+                    rel < 2e-7,
+                    "empirical={empirical} psi={psi} beta axis={axis} third information FD error={rel}"
+                );
+            }
+        }
+        // Different design blocks have zero explicit cross-design derivative.
+        // Moving the slope design isolates the psi_0/psi_1 fifth-order tensor.
+        let analytic = family
+            .rigid_hyper_information_third_axes(
+                &states, &layout, 0, Some(1), None, &options,
+            )
+            .unwrap()
+            .unwrap();
+        let slope = family.slope_design.to_dense().to_owned();
+        let evaluate = |step: f64| {
+            let mut perturbed_family = family.clone();
+            perturbed_family.slope_design =
+                DesignMatrix::Dense((&slope + &(&slope_motion * step)).into());
+            let perturbed_states = states_for(&perturbed_family, &beta);
+            let cache = perturbed_family.build_exact_eval_cache(&perturbed_states).unwrap();
+            perturbed_family
+                .rigid_psi_hessian_all_beta_axes(
+                    &perturbed_states, &blocks, 0, &cache, &options,
+                )
+                .unwrap()
+                .unwrap()
+        };
+        let plus = evaluate(h);
+        let minus = evaluate(-h);
+        for axis in 0..3 {
+            let fd = (&plus[axis] - &minus[axis]) / (2.0 * h);
+            let rel = rel_diff_array2(&analytic[axis], &fd);
+            assert!(
+                rel < 2e-7,
+                "empirical={empirical} psi pair beta axis={axis} third information FD error={rel}"
+            );
+        }
+    }
 }
 
 fn bms_test_design_hyper_layout(
@@ -1027,8 +1164,7 @@ fn bernoulli_flex_hvp_cache_materializes_when_reuse_amortizes_the_row_lowering()
         .bytes
         .saturating_mul(BMS_ROW_PRIMARY_HESSIAN_SINGLE_FRACTION_DEN)
         / BMS_ROW_PRIMARY_HESSIAN_SINGLE_FRACTION_NUM;
-    let too_small =
-        decide_row_primary_hessian_cache(n, r, passes, exact_fit_capacity, capacity, 0);
+    let too_small = decide_row_primary_hessian_cache(n, r, passes, exact_fit_capacity, capacity, 0);
     assert!(
         !too_small.materialize,
         "a cache needing {} B against a single-cache budget of exactly {} B must decline, \
@@ -1388,29 +1524,32 @@ fn bernoulli_contracted_psi_second_order_matches_per_pair_contraction() {
     let x_psi_1 = Array2::from_shape_fn((n, 2), |(r, c)| {
         ((r * 5 + c * 2 + 4) % 8) as f64 / 8.0 - 0.55
     });
-    let hyper_layout = bms_test_design_hyper_layout(vec![
+    let hyper_layout = bms_test_design_hyper_layout(
         vec![
-            CustomFamilyBlockPsiDerivative::new(
-                None,
-                x_psi_0,
-                Array2::zeros((2, 2)),
-                None,
-                None,
-                None,
-                None,
-            ),
-            CustomFamilyBlockPsiDerivative::new(
-                None,
-                x_psi_1,
-                Array2::zeros((2, 2)),
-                None,
-                None,
-                None,
-                None,
-            ),
+            vec![
+                CustomFamilyBlockPsiDerivative::new(
+                    None,
+                    x_psi_0,
+                    Array2::zeros((2, 2)),
+                    None,
+                    None,
+                    None,
+                    None,
+                ),
+                CustomFamilyBlockPsiDerivative::new(
+                    None,
+                    x_psi_1,
+                    Array2::zeros((2, 2)),
+                    None,
+                    None,
+                    None,
+                    None,
+                ),
+            ],
+            Vec::new(),
         ],
-        Vec::new(),
-    ], Array1::zeros(2));
+        Array1::zeros(2),
+    );
 
     let opts = BlockwiseFitOptions::default();
     let ws = family
@@ -1636,6 +1775,7 @@ fn bernoulli_contracted_psi_hook_matches_per_pair_with_penalty() {
         Some(&s_logdet_blocks),
         Some(std::sync::Arc::clone(&psi_workspace)),
         None,
+        None,
     )
     .expect("per-pair callbacks");
 
@@ -1647,6 +1787,7 @@ fn bernoulli_contracted_psi_hook_matches_per_pair_with_penalty() {
         &penalty_counts,
         Some(&s_logdet_blocks),
         Some(std::sync::Arc::clone(&psi_workspace)),
+        None,
         None,
     )
     .expect("contracted hook build")
@@ -1737,9 +1878,7 @@ fn bernoulli_contracted_psi_hook_matches_per_pair_with_penalty() {
             vec![
                 CustomFamilyBlockPsiDerivative::new(
                     None,
-                    hyper_layout.design_derivative_blocks()[0][0]
-                        .x_psi
-                        .clone(),
+                    hyper_layout.design_derivative_blocks()[0][0].x_psi.clone(),
                     Array2::zeros((2, 2)),
                     None,
                     None,
@@ -1748,9 +1887,7 @@ fn bernoulli_contracted_psi_hook_matches_per_pair_with_penalty() {
                 ),
                 CustomFamilyBlockPsiDerivative::new(
                     None,
-                    hyper_layout.design_derivative_blocks()[0][1]
-                        .x_psi
-                        .clone(),
+                    hyper_layout.design_derivative_blocks()[0][1].x_psi.clone(),
                     Array2::zeros((2, 2)),
                     None,
                     None,
@@ -1770,6 +1907,7 @@ fn bernoulli_contracted_psi_hook_matches_per_pair_with_penalty() {
         &penalty_counts,
         Some(&s_logdet_blocks),
         Some(std::sync::Arc::clone(&psi_workspace)),
+        None,
         None,
     )
     .expect("no-penalty hook build")
@@ -1860,29 +1998,32 @@ fn bernoulli_batched_outer_gradient_matches_hypercoord_path_for_rho_and_psi() {
         array![[0.45_f64, -0.18], [-0.18, 0.55]],
         array![[0.95_f64, 0.20], [0.20, 0.65]],
     ];
-    let hyper_layout = bms_test_design_hyper_layout(vec![
+    let hyper_layout = bms_test_design_hyper_layout(
         vec![
-            crate::custom_family::CustomFamilyBlockPsiDerivative::new(
-                Some(0),
-                x_psi_0,
-                s_psi_0,
-                None,
-                None,
-                Some(s_pp_0),
-                None,
-            ),
-            crate::custom_family::CustomFamilyBlockPsiDerivative::new(
-                Some(0),
-                x_psi_1,
-                s_psi_1,
-                None,
-                None,
-                Some(s_pp_1),
-                None,
-            ),
+            vec![
+                crate::custom_family::CustomFamilyBlockPsiDerivative::new(
+                    Some(0),
+                    x_psi_0,
+                    s_psi_0,
+                    None,
+                    None,
+                    Some(s_pp_0),
+                    None,
+                ),
+                crate::custom_family::CustomFamilyBlockPsiDerivative::new(
+                    Some(0),
+                    x_psi_1,
+                    s_psi_1,
+                    None,
+                    None,
+                    Some(s_pp_1),
+                    None,
+                ),
+            ],
+            Vec::new(),
         ],
-        Vec::new(),
-    ], Array1::zeros(2));
+        Array1::zeros(2),
+    );
     let psi_dim = hyper_layout.len();
     assert_eq!(psi_dim, 2, "fixture should expose two ψ coordinates");
 
@@ -2193,10 +2334,8 @@ fn bernoulli_isotropic_matern_psi_psi_joint_hessian_matches_fd_of_first() {
         let slope_psi = build_block_spatial_psi_derivatives(data.view(), &spec, &design)
             .expect("psi deriv")
             .expect("psi deriv rows");
-        let hyper_layout = bms_test_design_hyper_layout(
-            vec![Vec::new(), slope_psi],
-            array![psi_offset],
-        );
+        let hyper_layout =
+            bms_test_design_hyper_layout(vec![Vec::new(), slope_psi], array![psi_offset]);
         let marginal_mat =
             Array2::from_shape_fn((n, 2), |(r, c)| if c == 0 { 1.0 } else { marginal_cov[r] });
         let marginal_design = DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(
@@ -2232,12 +2371,7 @@ fn bernoulli_isotropic_matern_psi_psi_joint_hessian_matches_fd_of_first() {
         let specs = vec![m_spec, l_spec];
         let opts = BlockwiseFitOptions::default();
         let ws = family
-            .exact_newton_joint_psi_workspace_with_options(
-                &states,
-                &specs,
-                &hyper_layout,
-                &opts,
-            )
+            .exact_newton_joint_psi_workspace_with_options(&states, &specs, &hyper_layout, &opts)
             .expect("ws")
             .expect("ws some");
         let total = p_log + 2;
@@ -2439,10 +2573,8 @@ fn profiled_theta_hvp_outer_hessian_matches_fd_of_gradient_psi_and_mixed() {
         let slope_psi = build_block_spatial_psi_derivatives(data.view(), &spec, &design)
             .expect("spatial psi derivatives")
             .expect("spatial psi derivative rows");
-        let hyper_layout = bms_test_design_hyper_layout(
-            vec![Vec::new(), slope_psi],
-            array![psi_offset],
-        );
+        let hyper_layout =
+            bms_test_design_hyper_layout(vec![Vec::new(), slope_psi], array![psi_offset]);
 
         // Well-identified marginal block: [intercept | covariate] (p=2), so the
         // marginal is not degenerate and is less coupled to the slope block.
@@ -2572,7 +2704,7 @@ fn profiled_theta_hvp_outer_hessian_matches_fd_of_gradient_psi_and_mixed() {
     let psi_gradient_scale = 1.0 + analytic_psi_gradient.abs().max(fd_psi_gradient.abs());
     let psi_gradient_rel = (analytic_psi_gradient - fd_psi_gradient).abs() / psi_gradient_scale;
     assert!(
-        psi_gradient_rel < 2e-3,
+        psi_gradient_rel < 2e-6,
         "outer ψ gradient disagrees with centered FD of the outer value: analytic={}, fd={}, \
          rel={psi_gradient_rel:.3e}",
         analytic_psi_gradient,
@@ -2592,17 +2724,13 @@ fn profiled_theta_hvp_outer_hessian_matches_fd_of_gradient_psi_and_mixed() {
         (&gp - &gm).mapv(|v| v / (2.0 * eps))
     };
 
+    let all_match = std::cell::Cell::new(true);
     let assert_matches_fd = |analytic: &Array1<f64>, fd: &Array1<f64>, label: &str, route: &str| {
         for k in 0..theta_dim {
             let scale = 1.0 + analytic[k].abs().max(fd[k].abs());
             let rel = (analytic[k] - fd[k]).abs() / scale;
-            assert!(
-                rel < 2e-3,
-                "[{label} {route}] outer Hessian·dir component {k} disagrees with centered FD of \
-                 the outer gradient: analytic={}, fd={}, rel={rel:.3e}",
-                analytic[k],
-                fd[k]
-            );
+            eprintln!("[{label} {route}] component={k} analytic={:.12e} fd={:.12e} relative_error={rel:.3e}", analytic[k], fd[k]);
+            all_match.set(all_match.get() && rel < 2e-6);
         }
     };
     let check = |dir: Array1<f64>, label: &str| {
@@ -2621,11 +2749,15 @@ fn profiled_theta_hvp_outer_hessian_matches_fd_of_gradient_psi_and_mixed() {
     let mut pure_psi = Array1::<f64>::zeros(theta_dim);
     pure_psi[n_rho] = 1.0;
     check(pure_psi, "pure-ψ");
+    let mut pure_rho = Array1::<f64>::ones(theta_dim);
+    pure_rho[n_rho] = 0.0;
+    check(pure_rho, "pure-ρ");
     // Mixed-ρψ: ρ block all-ones + ψ = 1 — perturbs ρ and ψ together; exposes a
     // ρψ/ψψ block-split error that pure-ρ and pure-ψ would both miss.
     let mut mixed = Array1::<f64>::ones(theta_dim);
     mixed[n_rho] = 1.0;
     check(mixed, "mixed-ρψ");
+    assert!(all_match.get(), "outer Hessian must match the gradient derivative in every direction and representation; component errors printed above");
 }
 
 /// The rigid BLAS-3 batched all-axes second-directional override
@@ -3709,9 +3841,7 @@ fn bms_true_hessian_fixed_theta_c12_probe() {
     let u2 = Array1::from_shape_fn(N, |row| {
         -2.0 + 4.0 * (((row * 211 + 97) % N) as f64 + 0.5) / N as f64
     });
-    let make_radial_design = |covariate_x: &Array1<f64>,
-                              covariate_y: &Array1<f64>,
-                              phase: f64| {
+    let make_radial_design = |covariate_x: &Array1<f64>, covariate_y: &Array1<f64>, phase: f64| {
         Array2::from_shape_fn((N, CENTERS), |(row, column)| {
             let angle = std::f64::consts::TAU * column as f64 / CENTERS as f64 + phase;
             let center_x = 1.55 * angle.cos();
@@ -3753,16 +3883,14 @@ fn bms_true_hessian_fixed_theta_c12_probe() {
         }
         let residual_norm = direction.dot(&direction).sqrt();
         assert!(
-            residual_norm.is_finite()
-                && residual_norm > f64::EPSILON.sqrt() * input_norm.max(1.0),
+            residual_norm.is_finite() && residual_norm > f64::EPSILON.sqrt() * input_norm.max(1.0),
             "deterministic radial direction collapsed in sample-space orthogonalization: \
              input_norm={input_norm:.6e} residual_norm={residual_norm:.6e}"
         );
         direction.mapv_inplace(|value| value / residual_norm);
         direction
     };
-    let mut sample_frame: Vec<Array1<f64>> =
-        Vec::with_capacity(MARGINAL_P + CENTERS);
+    let mut sample_frame: Vec<Array1<f64>> = Vec::with_capacity(MARGINAL_P + CENTERS);
     for column in 0..MARGINAL_P {
         let unit = orthogonalize(marginal_design.column(column).to_owned(), &sample_frame);
         sample_frame.push(unit);
@@ -3826,13 +3954,9 @@ fn bms_true_hessian_fixed_theta_c12_probe() {
         use_outer_hessian: false,
         ..BlockwiseFitOptions::default()
     };
-    let fit = crate::custom_family::fit_custom_family_fixed_log_lambdas(
-        &family,
-        &specs,
-        &options,
-        None,
-    )
-    .expect("fixed-theta c12 BMS mode must converge and certify M_true");
+    let fit =
+        crate::custom_family::fit_custom_family_fixed_log_lambdas(&family, &specs, &options, None)
+            .expect("fixed-theta c12 BMS mode must converge and certify M_true");
     assert!(
         fit.inner_cycles < options.inner_max_cycles,
         "true-Hessian c12 endgame must certify before exhausting the inner budget"
@@ -3841,7 +3965,11 @@ fn bms_true_hessian_fixed_theta_c12_probe() {
         "[979-FIXED-THETA-C12] n={N} centers={CENTERS} theta=[-4,-4] \
          inner_cycles={} beta_inf={:.6e}",
         fit.inner_cycles,
-        fit.beta.iter().copied().map(f64::abs).fold(0.0_f64, f64::max),
+        fit.beta
+            .iter()
+            .copied()
+            .map(f64::abs)
+            .fold(0.0_f64, f64::max),
     );
     assert_eq!(
         gam_runtime::test_support::diagnostic_write_failures(),

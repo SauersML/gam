@@ -366,9 +366,6 @@ pub fn fit_transformation_normal(
         kappa0.len(),
         kappa_dims,
     );
-    let rho_floor = -12.0;
-    let rho_lower = Array1::<f64>::from_elem(n_penalties, rho_floor);
-    let rho_upper = Array1::<f64>::from_elem(n_penalties, 12.0);
     let probe_blocks = vec![probe_block.clone()];
     let (_, cap_hessian) = crate::custom_family::custom_family_outer_derivatives(
         &probe_family,
@@ -417,7 +414,7 @@ pub fn fit_transformation_normal(
         RefCell::new(ExactCoefficientModeBranch::default());
 
     let joint_setup =
-        ExactJointHyperSetup::new(rho0, rho_lower, rho_upper, kappa0, kappa_lower, kappa_upper);
+        ExactJointHyperSetup::new(rho0, kappa0, kappa_lower, kappa_upper);
 
     // Clone response basis parts for use inside closures.
     let rv = resp_val.clone();

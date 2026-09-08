@@ -43,6 +43,27 @@ pub(super) fn firth_penalized_structural_rank(
 }
 
 impl<'a> RemlState<'a> {
+    /// Publish the criterion's round-off band (#2812): machine precision times
+    /// the sum of the magnitudes of its additive terms. The four components
+    /// cancel against each other in a REML/LAML value, so the value's own last
+    /// bit understates what the arithmetic can resolve; the sum of magnitudes
+    /// is what it accumulated.
+    pub(crate) fn publish_criterion_resolution(&self, components: &[f64]) {
+        let magnitude: f64 = components.iter().map(|c| c.abs()).sum();
+        let band = f64::EPSILON * (1.0 + magnitude);
+        self.last_criterion_resolution_bits
+            .store(band.to_bits(), std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// The band the last evaluation published, if any.
+    pub(crate) fn criterion_resolution(&self) -> Option<f64> {
+        let band = f64::from_bits(
+            self.last_criterion_resolution_bits
+                .load(std::sync::atomic::Ordering::Relaxed),
+        );
+        (band.is_finite() && band > 0.0).then_some(band)
+    }
+
     /// Compute the scalar outer objective value used by the planner-selected
     /// outer optimizer.
     ///
@@ -1899,7 +1920,7 @@ impl<'a> RemlState<'a> {
             delta: ridge_passport.delta(),
         };
         let hessian_op: std::sync::Arc<dyn super::reml_outer_engine::HessianFactorization> = {
-            use super::reml_outer_engine::HessianFactorization as _;
+            use super::reml_outer_engine::{DenseCholeskyOperator, HessianFactorization as _};
             let build_spectral = || -> Result<DenseSpectralOperator, EstimationError> {
                 let mut op = if let Some(rank) = structural_rank {
                     DenseSpectralOperator::from_symmetric_with_structural_rank(
@@ -1935,23 +1956,47 @@ impl<'a> RemlState<'a> {
                 }
                 Ok(op)
             };
-            // The scalar objective and its derivatives must be projections of
-            // one numerical operator.  A former value-only shortcut priced
-            // `log|H|` from Cholesky while derivative-bearing requests used the
-            // spectral operator.  At a legitimate lambda-infinity face the
-            // assembled natural-parameter Hessian is ill-conditioned enough
-            // that those factorizations resolve its smallest modes differently;
-            // the optimizer then ranked one surface and differentiated another
-            // (#2834).  Always use the spectral operator here.  This is not a
-            // fallback or an audit relaxation: it removes the second objective
-            // definition, while the root-scale logdet upgrade above still
-            // handles the conditioning wall when the assembled spectrum cannot.
-            if force_spectral_logdet {
-                log::trace!(
-                    "using the canonical spectral Hessian operator for moving-design coordinates"
-                );
+            if mode == super::reml_outer_engine::EvalMode::ValueOnly
+                && matches!(hessian_mode, PseudoLogdetMode::Smooth)
+                && !c_nontrivial
+                && !force_spectral_logdet
+            {
+                match DenseCholeskyOperator::from_spd_with_smooth_logdet_agreement(
+                    &h_total_original,
+                ) {
+                    Ok(mut chol_op) => {
+                        // The Cholesky lane is the LINE SEARCH's lane, so it is
+                        // the one whose noise the optimizer actually walks on.
+                        // It gets the same upgrade, judged against the same
+                        // spectrum-derived budget — obtained here from one
+                        // eigenvalue pass over `h_total_original`, paid only on
+                        // the ill-conditioned branch that the resolution gate
+                        // below has already selected.
+                        let assembled = chol_op.logdet();
+                        if let Some(exact) = *bundle.root_scale_hessian_logdet.get_or_init(|| {
+                            let spectrum =
+                                super::laml_logdet::symmetric_spectrum(&h_total_original)?;
+                            if super::laml_logdet::assembled_logdet_is_resolved(
+                                &spectrum, assembled,
+                            ) {
+                                return None;
+                            }
+                            super::laml_logdet::root_scale_hessian_logdet(
+                                &root_inputs,
+                                &h_total_original,
+                                &spectrum,
+                                assembled,
+                            )
+                        }) {
+                            chol_op.install_root_scale_logdet(exact);
+                        }
+                        std::sync::Arc::new(chol_op)
+                    }
+                    Err(_) => std::sync::Arc::new(build_spectral()?),
+                }
+            } else {
+                std::sync::Arc::new(build_spectral()?)
             }
-            std::sync::Arc::new(build_spectral()?)
         };
 
         let e_for_logdet = &pirls_result.reparam_result.e_transformed;
@@ -2297,6 +2342,7 @@ impl<'a> RemlState<'a> {
             result.criterion_components.logdet_s,
             result.criterion_components.kkt,
         ];
+        self.publish_criterion_resolution(&components);
         crate::estimate::outer_eval_capture::record_outer_criterion_components(
             result.cost,
             components,
@@ -2387,6 +2433,12 @@ impl<'a> RemlState<'a> {
             block_terms,
         );
         let cost_result = self.apply_theta_correction_atom_to_result(cost_result, &block_atom)?;
+        self.publish_criterion_resolution(&[
+            cost_result.criterion_components.fixed_beta,
+            cost_result.criterion_components.logdet_h,
+            cost_result.criterion_components.logdet_s,
+            cost_result.criterion_components.kkt,
+        ]);
         crate::estimate::outer_eval_capture::record_outer_criterion_components(
             cost_result.cost,
             [

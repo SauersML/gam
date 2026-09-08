@@ -239,149 +239,6 @@ const MULTINOMIAL_SEPARATION_ETA_THRESHOLD: f64 = 25.0;
 /// KKT target unchanged.
 const MULTINOMIAL_OUTER_REML_TOL: f64 = 1e-7;
 
-/// Per-observation softmax Fisher-information scale for the λ-floor units.
-///
-/// The penalty enters the criterion as `½ λ βᵀ S β` with a Frobenius-normalized
-/// `S` (`‖S‖_F = 1`, see the term-builder calibration referenced by
-/// [`multinomial_formula_penalty_scale`]), so the ridge `λ S` is directly
-/// comparable to data Fisher information. One observation contributes softmax
-/// information `p(1−p)` in a class's logit direction, which is bounded by the
-/// logistic peak `p(1−p) ≤ ¼` at `p = ½`. Using this maximal per-observation
-/// information as the unit makes the floor's strength interpretable as a count
-/// of equivalent **pseudo-observations** of prior: a ridge that equals
-/// `τ · ¼ · ‖S‖_F` carries the same logit-direction curvature as `τ` real rows
-/// sitting at the most-informative point of the likelihood. This scale is
-/// `K`-independent on purpose — the `K`-dependence of the softmax block
-/// curvature already lives in the penalty matrix via
-/// [`multinomial_formula_penalty_scale`], so the floor (a bound on the
-/// multiplier of that already-scaled penalty) must not double-count it.
-const MULTINOMIAL_FORMULA_FISHER_INFO_PER_OBS: f64 = 0.25;
-
-/// Target prior strength of the λ-floor, in pseudo-observations, for a
-/// WELL-SUPPORTED class. The floor holds the unbiased REML optimizer off the
-/// zero-penalty boundary (where a boundary-overfit smooth or a Firth switch on
-/// finite data would otherwise be accepted) with a prior worth a fixed small
-/// fraction of one observation. `8e-4` pseudo-observations reproduces the
-/// previously fixture-calibrated large-support floor `τ · ¼ = 2e-4` exactly at
-/// the calibration point, now expressed as an effective-prior-strength rather
-/// than a tuned λ value.
-///
-/// MEASURED 2026-07-31 (#2612). This value is not inert and it has never been
-/// measured against the quantity it controls. On the penguins real-data arm
-/// (stride-3, `n_train = 228`, minority class 46, so the wall is
-/// `8.0e-4 × 0.25 × 50/46 = 2.173913043e-4`), **four of the eight live
-/// null-space λ sit on this wall exactly** — `ratio_to_wall = 1.000000`. They
-/// are boundary solutions, not stationary points of the REML criterion: the box
-/// stopped them, and the box is this constant.
-///
-/// Everything downstream is therefore a readout of it. Sweeping ONLY this
-/// constant, same base commit, same split, exact conditioned quadrature:
-///
-/// ```text
-///   pseudo_obs   λ wall      posterior log-loss   plug-in log-loss   calib gap
-///   8.0e-4       2.174e-4    0.161820             0.024718           +0.1187
-///   8.0e-3       2.174e-3    0.069526             0.025097           +0.0401
-///   8.0e-2       2.174e-2    0.065275             0.035297           +0.0360
-/// ```
-///
-/// `calib gap` is `mean predicted probability on the argmax class − held-out
-/// accuracy` (accuracy is `0.982456` in every row; no reference tool involved).
-/// A 10× wall MORE THAN HALVES the published posterior log-loss while the mode
-/// barely moves, so the width is this constant's and the mode is not.
-///
-/// An exact subspace attribution — same fit, saved Laplace covariance zeroed
-/// outside one subspace at a time — says the width does not sit where the wall
-/// is applied. Cost in nats above the plug-in, shipped wall / 10× wall:
-///
-/// ```text
-///   intercept (2 coords, unpenalized)   0.071778  →  0.014949
-///   range space (64 coords, edf≈6e-4)   0.062538  →  0.034422
-///   null space (8 coords, ON the wall)  0.002564  →  0.000989
-/// ```
-///
-/// The railed coordinates carry 1.9% of the cost, yet tightening their prior
-/// tenfold cuts the UNPENALIZED intercept's marginal contribution 4.8×. The
-/// near-flat prior on the linear direction does not make that direction wide; it
-/// makes the joint Hessian near-singular, and the width surfaces on whatever is
-/// correlated with it. Attribution by marginal block therefore names the
-/// carrier, not the cause.
-///
-/// DO NOT TUNE THIS ON THAT CURVE. Choosing `8.0e-3` because it clears a
-/// held-out log-loss bar on one dataset is the objection #2615 raised against
-/// choosing `EFFECTIVE_DF_FLOOR_RELATIVE_FRACTION`, and the sweep above is
-/// diagnostic evidence, not a selection procedure. The measurement says the
-/// criterion has no interior optimum here — a quasi-separated multinomial's
-/// marginal likelihood keeps rewarding a flatter prior on the separating
-/// direction — so the repair is a prior that is derived for that regime (the
-/// Jeffreys/Firth path this same issue is already driving), not a wall chosen to
-/// stop the slide at a convenient place.
-const MULTINOMIAL_FORMULA_PRIOR_PSEUDO_OBS: f64 = 8.0e-4;
-
-/// Reference class support `n_ref`: the effective sample size per class at which
-/// the data Fisher information `n_c · I₁` is large enough that the floor sits at
-/// its well-supported value. Below `n_ref` the per-class data information shrinks
-/// like `n_c`, so to keep the floor's prior from vanishing *relative to* that
-/// shrinking data the effective pseudo-observation count is scaled up by
-/// `n_ref / n_c` (the prior is held to a fixed fraction of the data information,
-/// not a fixed absolute λ). At `n_c = n_ref` the scale is exactly 1.
-const MULTINOMIAL_FORMULA_SPARSE_REFERENCE_SUPPORT: f64 = 50.0;
-
-/// Cap on the floor's prior strength in the very-sparse limit, in
-/// pseudo-observations. As `n_c → 0` the `n_ref / n_c` scaling diverges; the cap
-/// holds the prior at `4e-3` pseudo-observations (`τ_max · ¼ = 1e-3` at the
-/// calibration point, the previously-tuned strong-floor value) so the floor
-/// stays a proper prior rather than a hard constraint that would dominate the
-/// likelihood for a handful-of-rows class.
-const MULTINOMIAL_FORMULA_SPARSE_PRIOR_PSEUDO_OBS_MAX: f64 = 4.0e-3;
-
-/// Continuous, Fisher-information-scaled lower λ floor for the formula path,
-/// derived from the minority class's effective sample size `n_c`.
-///
-/// # Derivation (effective-prior-strength / Fisher geometry)
-///
-/// The penalty `½ λ βᵀ S β` with `‖S‖_F = 1` adds curvature `λ` to the class
-/// logit direction; one observation adds at most `I₁ = ¼` there. So a floor that
-/// sets `λ_floor = τ_eff · I₁` gives the smooth a prior worth `τ_eff`
-/// pseudo-observations. We want a fixed *absolute* prior `τ` for a well-supported
-/// class, but for a minority class with only `n_c` effective observations the
-/// data information in its block is `n_c · I₁`; holding the prior to a fixed
-/// *fraction* of that shrinking data information requires
-///
-/// ```text
-///     τ_eff(n_c) = τ · max(1, n_ref / n_c),   clamped to [τ, τ_max]
-///     λ_floor(n_c) = τ_eff(n_c) · I₁
-/// ```
-///
-/// This is the *same* `base · max(1, c0/c)` envelope as before — but `base`,
-/// `sparse`, and `c0` are no longer fixture-tuned magic numbers: `base = τ·I₁`,
-/// `sparse = τ_max·I₁`, and `c0 = n_ref` are an effective-prior-strength of
-/// `τ`/`τ_max` pseudo-observations against the maximal per-observation softmax
-/// information `I₁ = ¼`. Properties preserved by construction:
-///   * reduces EXACTLY to `τ·I₁` for well-supported classes (`n_c ≥ n_ref`);
-///   * reduces EXACTLY to `τ_max·I₁` for very sparse classes
-///     (`n_c ≤ n_ref·τ/τ_max`, here `n_c ≤ 10`);
-///   * interpolates monotonically and continuously between them in the middle —
-///     no cliff at `n_c = n_ref`.
-/// At the calibration point the endpoints equal the previous `2e-4` / `1e-3`, so
-/// fixtures whose smallest class has `n_c ≥ 50` (penguins, the vgam softmax
-/// arms) are unaffected — they sit at `τ·I₁ = 2e-4` exactly as before.
-fn multinomial_formula_min_lambda(y_one_hot: ArrayView2<'_, f64>) -> f64 {
-    let base = MULTINOMIAL_FORMULA_PRIOR_PSEUDO_OBS * MULTINOMIAL_FORMULA_FISHER_INFO_PER_OBS;
-    let sparse =
-        MULTINOMIAL_FORMULA_SPARSE_PRIOR_PSEUDO_OBS_MAX * MULTINOMIAL_FORMULA_FISHER_INFO_PER_OBS;
-    let min_class_count = (0..y_one_hot.ncols())
-        .map(|class| y_one_hot.column(class).sum())
-        .fold(f64::INFINITY, f64::min);
-    if !min_class_count.is_finite() || min_class_count <= 0.0 {
-        return base;
-    }
-    // Effective pseudo-observation prior strength: held to a fixed fraction of
-    // the shrinking per-class data information once n_c falls below n_ref.
-    let pseudo_obs_scale =
-        (MULTINOMIAL_FORMULA_SPARSE_REFERENCE_SUPPORT / min_class_count).max(1.0);
-    (base * pseudo_obs_scale).clamp(base, sparse)
-}
-
 fn max_abs_eta_location(eta: ArrayView2<'_, f64>) -> (f64, usize, usize) {
     let mut best = (0.0_f64, 0usize, 0usize);
     for ((row, active_class), &value) in eta.indexed_iter() {
@@ -3483,7 +3340,9 @@ pub(crate) fn penalized_multinomial_formula_parts(
         outer_max_iter,
         outer_tol,
         outer_rel_cost_tol,
-        rho_lower_bound: multinomial_formula_min_lambda(y_one_hot.view()).ln(),
+        // The design/penalty spectrum determines the smoothing domain. A
+        // sample-count floor changes the statistical fit and is not a prior.
+        rho_lower_bound: None,
         ridge_floor: MULTINOMIAL_FORMULA_RIDGE_FLOOR,
         // #747: the stabilization floor is SOLVER-ONLY — it keeps the inner
         // joint-Newton linear solve finite during screening (bounding the step
@@ -4895,83 +4754,6 @@ mod fisher_override_tests {
     }
 
     #[test]
-    fn formula_min_lambda_floor_is_continuous_and_information_scaled() {
-        // Build a one-hot label matrix whose smallest class carries `count` rows.
-        fn floor_for_min_count(count: usize) -> f64 {
-            // Two classes: a large one (1000 rows) and a minority one (`count`).
-            let n = 1000 + count;
-            let mut y = Array2::<f64>::zeros((n, 2));
-            for r in 0..1000 {
-                y[[r, 0]] = 1.0;
-            }
-            for r in 1000..n {
-                y[[r, 1]] = 1.0;
-            }
-            multinomial_formula_min_lambda(y.view())
-        }
-
-        // The floor's endpoints are now DERIVED from a target prior strength in
-        // pseudo-observations against the maximal per-observation softmax Fisher
-        // information I₁ = ¼ (base = τ·I₁, sparse = τ_max·I₁). Pin them to the
-        // previously fixture-calibrated values so the near-separable quality arms
-        // (penguins, vgam softmax) — whose smallest class has n_c ≥ 50 — are
-        // byte-for-byte unaffected: the derivation REDUCES TO the old constants
-        // at the calibration point.
-        let base = MULTINOMIAL_FORMULA_PRIOR_PSEUDO_OBS * MULTINOMIAL_FORMULA_FISHER_INFO_PER_OBS;
-        let sparse = MULTINOMIAL_FORMULA_SPARSE_PRIOR_PSEUDO_OBS_MAX
-            * MULTINOMIAL_FORMULA_FISHER_INFO_PER_OBS;
-        assert!(
-            (base - 2.0e-4).abs() < 1e-18,
-            "derived base floor must equal the calibrated 2e-4"
-        );
-        assert!(
-            (sparse - 1.0e-3).abs() < 1e-18,
-            "derived sparse floor must equal the calibrated 1e-3"
-        );
-
-        // Well-supported (n_c >= n_ref=50) sits exactly at the base floor.
-        assert!((floor_for_min_count(50) - base).abs() < 1e-18);
-        assert!((floor_for_min_count(200) - base).abs() < 1e-18);
-        // Very sparse (n_c <= n_ref·base/sparse = 10) clamps to the strong floor.
-        assert!((floor_for_min_count(10) - sparse).abs() < 1e-18);
-        assert!((floor_for_min_count(5) - sparse).abs() < 1e-18);
-        // No cliff at the old hard threshold: 49 vs 50 differ by < 5% (the old
-        // step jumped 5x). Floor is monotone non-increasing in support.
-        let f49 = floor_for_min_count(49);
-        let f50 = floor_for_min_count(50);
-        assert!(
-            f49 >= f50 && f49 <= f50 * 1.05,
-            "floor must be continuous across c0, got {f49} vs {f50}"
-        );
-        let f25 = floor_for_min_count(25);
-        assert!(
-            f25 > f50 && f25 < floor_for_min_count(10),
-            "mid-support floor must interpolate strictly between the two endpoints"
-        );
-
-        // FIRST-PRINCIPLES SCALING: in the interpolating regime the floor equals
-        // exactly τ·I₁·(n_ref/n_c) — the effective-pseudo-observation prior held
-        // to a fixed fraction of the per-class data information n_c·I₁. Halving
-        // the effective sample size doubles the floor (until the cap), and the
-        // absolute value matches the closed-form n_c-scaled prior.
-        for &n_c in &[12usize, 16, 20, 30, 40] {
-            let expected = base * (MULTINOMIAL_FORMULA_SPARSE_REFERENCE_SUPPORT / n_c as f64);
-            assert!(
-                (floor_for_min_count(n_c) - expected).abs() < 1e-15,
-                "floor at n_c={n_c} must be τ·I₁·n_ref/n_c = {expected}, got {}",
-                floor_for_min_count(n_c)
-            );
-        }
-        // Inverse scaling with effective sample size: n_c -> n_c/2 doubles the
-        // floor inside the unclamped band (20 and 40 are both interior; 40 < 50
-        // so it is scaled, 20 > 10 so it is not capped).
-        assert!(
-            (floor_for_min_count(20) - 2.0 * floor_for_min_count(40)).abs() < 1e-15,
-            "floor must scale like 1/n_c (effective Fisher information) in the interior band"
-        );
-    }
-
-    #[test]
     fn formula_penalty_scale_tracks_softmax_fisher_curvature() {
         assert!(
             (multinomial_formula_penalty_scale(2) - 0.5).abs() < 1.0e-12,
@@ -5826,7 +5608,6 @@ mod reference_class_invariance_tests {
         let td = tempdir().expect("tempdir");
         let dir = td.path();
         let (x, cls) = sample_classes(0, 300);
-        let wall = gam_custom_family::EFFECTIVE_DF_CEILING.exp();
 
         for (tag, name_map) in [
             ("abc", ["A", "B", "C"]),
@@ -5846,9 +5627,14 @@ mod reference_class_invariance_tests {
 
             // "Railed" is bit-equality with the wall, exactly as the
             // `EFFECTIVE_DF_CEILING` doc defines it.
-            let railed = model.lambdas.iter().filter(|l| **l == wall).count();
+            let strongest = model
+                .lambdas
+                .iter()
+                .copied()
+                .fold(f64::NEG_INFINITY, f64::max);
+            let railed = model.lambdas.iter().filter(|l| **l == strongest).count();
             eprintln!(
-                "#2579 gate-lambda probe [{tag}]: n_lambda={} railed_at_exp12={}/{} \
+                "#2579 gate-lambda probe [{tag}]: n_lambda={} at_strongest={}/{} \
                  per_block={:?}",
                 model.lambdas.len(),
                 railed,
@@ -5860,11 +5646,10 @@ mod reference_class_invariance_tests {
                     "#2579 gate-lambda probe [{tag}]:   lambda[{i}] = {l:.17e}  ln = {:.12}  \
                      railed = {}",
                     l.ln(),
-                    *l == wall
+                    *l == strongest
                 );
             }
         }
-        eprintln!("#2579 gate-lambda probe: wall = exp(12) = {wall:.17e}");
     }
 
     // gam#1587: now that the reference-symmetric centered `M⊗S_t` joint penalty

@@ -2542,6 +2542,65 @@ impl MultinomialFamily {
         )
     }
 
+    /// Third Fisher derivative, using centered categorical moments through
+    /// order three. Differentiating diag(p)-pp' needs only the probability
+    /// derivatives below; the coefficient pullback reuses the same batched
+    /// third-moment Gram assembly as lower information derivatives.
+    fn assemble_all_axis_third_directional_derivatives(
+        &self,
+        eta: ArrayView2<'_, f64>,
+        beta_u: &Array1<f64>,
+        beta_v: &Array1<f64>,
+    ) -> Result<Vec<Array2<f64>>, String> {
+        let m = self.active_classes();
+        let probs = self.row_probabilities(eta);
+        let eta_u = self.d_eta_from_d_beta(beta_u)?;
+        let eta_v = self.d_eta_from_d_beta(beta_v)?;
+        let mut centered = vec![[0.0; 3]; m + 1];
+        let mut derivatives = vec![[0.0; 8]; m];
+        Ok(self.assemble_all_axis_derivatives_from_row_kernel(|row, moving_class, kernel| {
+            let direction = |class: usize, axis: usize| match axis {
+                0 if class < m => eta_u[[row, class]],
+                1 if class < m => eta_v[[row, class]],
+                2 => f64::from(class == moving_class),
+                _ => 0.0,
+            };
+            // Center by weighted pair differences rather than x-E[x]. This
+            // retains the small complement when a class probability rounds
+            // to one in a separating tail.
+            for class in 0..=m { for axis in 0..3 {
+                centered[class][axis] = (0..=m).map(|other|
+                    probs[[row, other]] * (direction(class, axis) - direction(other, axis))
+                ).sum();
+            }}
+            let mut covariance = [0.0; 3];
+            let mut third_moment = 0.0;
+            for class in 0..=m {
+                let [u, v, w] = centered[class];
+                let p = probs[[row, class]];
+                covariance[0] += p * u * v;
+                covariance[1] += p * u * w;
+                covariance[2] += p * v * w;
+                third_moment += p * u * v * w;
+            }
+            let [cuv, cuw, cvw] = covariance;
+            for class in 0..m {
+                let [u, v, w] = centered[class];
+                let p = probs[[row, class]];
+                derivatives[class] = [p, p*u, p*v, p*(u*v-cuv), p*w,
+                    p*(u*w-cuw), p*(v*w-cvw),
+                    p*(u*v*w-u*cvw-v*cuw-w*cuv-third_moment)];
+            }
+            for a in 0..m { for b in 0..m {
+                let mut value = if a == b { derivatives[a][7] } else { 0.0 };
+                for subset in 0..8 {
+                    value -= derivatives[a][subset] * derivatives[b][7 ^ subset];
+                }
+                kernel[a*m+b] = self.weights[row] * value;
+            }}
+        }))
+    }
+
     /// Index of the single canonical axis `k` if `d_beta_flat` is the unit
     /// vector `e_k` (the Tier-B Jeffreys loop's request shape), else `None`.
     fn canonical_axis_index(&self, d_beta_flat: &Array1<f64>) -> Option<usize> {
@@ -3042,6 +3101,22 @@ impl CustomFamily for MultinomialFamily {
                  specs describe p={p} joint coefficients",
                 axes.len(),
             ));
+        }
+        Ok(Some(axes))
+    }
+
+    fn joint_jeffreys_information_third_directional_all_axes_with_specs(
+        &self,
+        block_states: &[ParameterBlockState],
+        specs: &[ParameterBlockSpec],
+        u: &Array1<f64>,
+        v: &Array1<f64>,
+    ) -> Result<Option<Vec<Array2<f64>>>, String> {
+        let eta = self.collect_eta_matrix(block_states)?;
+        let axes = self.assemble_all_axis_third_directional_derivatives(eta.view(), u, v)?;
+        let p: usize = specs.iter().map(|spec| spec.design.ncols()).sum();
+        if axes.len() != p {
+            return Err(format!("multinomial third information has {} axes, expected {p}", axes.len()));
         }
         Ok(Some(axes))
     }
@@ -6323,6 +6398,36 @@ mod tests {
             "softmax all-axis second-directional assembly drifted from the directional \
              finite difference by relative {max_rel:.3e}"
         );
+    }
+
+    #[test]
+    fn multinomial_third_information_matches_second_fd_979() {
+        let (n, p, k) = (10, 3, 4);
+        let family = family_with_weights(n, p, k, Array1::from_shape_fn(n, |i| 0.6 + i as f64 / 20.0));
+        let m = family.active_classes();
+        let total = m * p;
+        let u = Array1::from_shape_fn(total, |i| (0.3 + i as f64).sin());
+        let v = Array1::from_shape_fn(total, |i| (0.7 + 0.4 * i as f64).cos());
+        for scale in [0.5, 6.0] {
+            let betas = sample_betas(m, p, scale);
+            let states = states_at_betas(&family, &betas);
+            let eta = family.collect_eta_matrix(&states).unwrap();
+            let exact = family.assemble_all_axis_third_directional_derivatives(eta.view(), &u, &v).unwrap();
+            let h = 1.0e-5;
+            for class in 0..m { for column in 0..p {
+                let axis = class*p + column;
+                let eval = |step| family.exact_newton_joint_hessiansecond_directional_derivative(
+                    &perturb_axis(&family, &betas, class, column, step), &u, &v,
+                ).unwrap().unwrap();
+                let plus = eval(h);
+                let minus = eval(-h);
+                for a in 0..total { for b in 0..total {
+                    let fd = (plus[[a,b]] - minus[[a,b]]) / (2.0*h);
+                    assert!((exact[axis][[a,b]] - fd).abs() < 2.0e-7*(1.0+fd.abs()),
+                        "scale={scale} axis={axis} row={a} col={b}: third={} fd={fd}", exact[axis][[a,b]]);
+                }}
+            }}
+        }
     }
 
     /// #753 — a multinomial adapter instance can arm the universal full-span

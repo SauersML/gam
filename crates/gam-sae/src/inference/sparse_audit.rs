@@ -56,7 +56,7 @@ pub struct AbsorptionPairReport {
 
 pub struct AbsorptionAuditReport {
     pub n_units: usize,
-    pub activation_threshold: f32,
+    pub activation_threshold: f64,
     pub pairs: Vec<AbsorptionPairReport>,
 }
 
@@ -156,7 +156,7 @@ pub struct SparseSaeAuditConfig {
     pub max_candidates: usize,
     /// Dictionary blocks promoted to atlas charts; `None` selects every block.
     pub coordinate_blocks: Option<Vec<usize>>,
-    pub activation_threshold: f32,
+    pub activation_threshold: f64,
     pub max_absorption_pairs: usize,
     pub transport_theta_in: Option<Vec<f64>>,
     pub transport_theta_out: Option<Vec<f64>>,
@@ -171,12 +171,12 @@ pub struct SparseSaeAuditConfig {
 /// and each array is named at the call site rather than positional among six
 /// same-shaped neighbours.
 pub struct SparseSaeAuditRequest {
-    pub decoder: ndarray::Array2<f32>,
+    pub decoder: ndarray::Array2<f64>,
     pub route_indices: ndarray::Array2<u32>,
-    pub route_values: ndarray::Array3<f32>,
-    pub data: ndarray::Array2<f32>,
+    pub route_values: ndarray::Array3<f64>,
+    pub data: ndarray::Array2<f64>,
     pub donor_indices: ndarray::Array2<u32>,
-    pub donor_values: ndarray::Array3<f32>,
+    pub donor_values: ndarray::Array3<f64>,
     pub config: SparseSaeAuditConfig,
 }
 
@@ -200,7 +200,7 @@ pub struct SparseSaeAuditReport {
 
 pub fn atlas_nerve_from_sparse_route(
     route: &AuditSparseRoute,
-    activation_threshold: f32,
+    activation_threshold: f64,
     requested_blocks: Option<&[usize]>,
     ambient_data: Option<ndarray::ArrayView2<'_, f64>>,
     familywise_alpha: Option<f64>,
@@ -284,11 +284,7 @@ pub fn atlas_nerve_from_sparse_route(
         .iter()
         .filter(|edge| edge.admitted)
         .map(|edge| {
-            crate::inference::atlas_holonomy::AtlasHolonomyEdgeId::new(
-                edge.a,
-                edge.b,
-                edge.overlap,
-            )
+            crate::inference::atlas_holonomy::AtlasHolonomyEdgeId::new(edge.a, edge.b, edge.overlap)
         })
         .collect::<Result<_, _>>()?;
     let (holonomy_certificate, holonomy_unavailable_reason) = match (
@@ -553,7 +549,7 @@ pub fn run_sparse_sae_audit(
 
 fn absorption_audit(
     route: &AuditSparseRoute,
-    activation_threshold: f32,
+    activation_threshold: f64,
     max_pairs: usize,
 ) -> AbsorptionAuditReport {
     let mut marginals = vec![0usize; route.n_units];
@@ -731,9 +727,7 @@ fn chart_transfer_gate_sparse(
         .map_err(|error| format!("chart {chart_b} overlap coordinates are malformed: {error}"))?;
     // Empirical chart-to-chart transfer operator `A = (X_aᵀX_a)⁻¹ X_aᵀX_b`
     // solving `X_a A ≈ X_b` over the co-firing rows.
-    let Ok(operator) =
-        crate::chart_transfer::pulled_back_operator(x_a.view(), x_b.view())
-    else {
+    let Ok(operator) = crate::chart_transfer::pulled_back_operator(x_a.view(), x_b.view()) else {
         return Ok(None);
     };
     // Both charts are circles, so the shared infinitesimal-rotation generator is
@@ -833,10 +827,10 @@ fn cross_fitted_holonomy_from_ambient(
 }
 
 fn residuals_from_sparse_sae(
-    data: ndarray::ArrayView2<'_, f32>,
-    decoder: ndarray::ArrayView2<'_, f32>,
+    data: ndarray::ArrayView2<'_, f64>,
+    decoder: ndarray::ArrayView2<'_, f64>,
     route: &AuditSparseRoute,
-) -> Result<ndarray::Array2<f32>, String> {
+) -> Result<ndarray::Array2<f64>, String> {
     if data.ncols() != decoder.ncols() || data.nrows() != route.nrows() {
         return Err(format!(
             "audit_sae data shape {:?} is incompatible with decoder {:?} and {} route rows",
@@ -920,7 +914,7 @@ fn standing_sparse_null_calibration(
 fn topology_records_from_codes(
     coordinate_reports: &[crate::sparse_dict::BlockCoordinateReport],
     block_size: usize,
-    activation_threshold: f32,
+    activation_threshold: f64,
 ) -> Vec<AuditTopologyRecord> {
     let threshold = activation_threshold as f64;
     if block_size == 1 {
@@ -1003,7 +997,7 @@ fn sparse_atlas_nerve_richness_statistic(
 ) -> Result<f64, String> {
     let report = atlas_nerve_from_sparse_route(
         route,
-        activation_threshold as f32,
+        activation_threshold as f64,
         Some(chart_blocks),
         None,
         None,

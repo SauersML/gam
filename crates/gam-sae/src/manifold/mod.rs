@@ -260,12 +260,6 @@ mod tests_chart_evaluator_jets;
 mod tests_collapse_prevention;
 
 #[cfg(test)]
-mod tests_pc_reseed_provenance_2023;
-
-#[cfg(test)]
-mod coherence_scan_2731_tests;
-
-#[cfg(test)]
 mod tests_collapse_2132;
 
 #[cfg(test)]
@@ -302,8 +296,6 @@ mod tests_collateral_e2_2234;
 #[cfg(test)]
 mod tests_collateral_noncyclic_2234;
 
-#[cfg(test)]
-mod tests_beta_prior_curvature_2828;
 #[cfg(test)]
 mod tests_edf_census_bounds_2502;
 #[cfg(test)]

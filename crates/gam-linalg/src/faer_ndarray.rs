@@ -802,15 +802,6 @@ pub fn fast_ab<S1: Data<Elem = f64>, S2: Data<Elem = f64>>(
 //   * faster — several independent FMA accumulators expose the
 //     instruction-level parallelism the backend lowers to packed AVX
 //     `vfmadd` lanes, and the row work fans out across the Rayon pool; and
-//     (`f64::mul_add` is only an instruction when the code is COMPILED with
-//     the `fma` target feature; the portable x86_64 baseline this workspace
-//     ships has none, so a plain build lowered every `mul_add` here to a
-//     call into the runtime `fma` dispatcher — measured on a gaussian
-//     n=50,000 / p=93 fit: zero `vfmadd` in the row-major matvec closure and
-//     28% of the fit's cycles inside `fma`/`fma_with_fma`. Each kernel below
-//     is therefore compiled twice, once for the baseline and once with
-//     `fma,avx2` enabled, and its entry point picks the second whenever the
-//     running CPU reports both features — see `fma_avx2_available`.)
 //   * more accurate — `f64::mul_add` fuses each product into its accumulator
 //     with a single rounding (no rounded intermediate product), the lanes
 //     reduce as a small pairwise tree, and the long Xᵀr reduction is split
@@ -870,7 +861,7 @@ fn av_parallel_chunk_rows(p: usize) -> usize {
 /// is hidden under the memory traffic of streaming `X`, so accuracy rises with
 /// no throughput cost.
 #[inline(always)]
-fn fma_dot_body(a: &[f64], b: &[f64]) -> f64 {
+fn fma_dot(a: &[f64], b: &[f64]) -> f64 {
     assert_eq!(a.len(), b.len(), "fma_dot: operand length mismatch");
     let mut sum = [0.0f64; FMA_LANES];
     let mut comp = [0.0f64; FMA_LANES];
@@ -911,40 +902,6 @@ fn fma_dot_body(a: &[f64], b: &[f64]) -> f64 {
     total
 }
 
-/// Whether the running x86_64 CPU executes the `fma,avx2` kernel variants.
-///
-/// `is_x86_feature_detected!` caches its probe in a process-wide static, so
-/// this is a load and a bit test per call — invisible next to any kernel whose
-/// row is at least [`FMA_LANES`] long.
-#[cfg(target_arch = "x86_64")]
-#[inline]
-fn fma_avx2_available() -> bool {
-    std::arch::is_x86_feature_detected!("fma") && std::arch::is_x86_feature_detected!("avx2")
-}
-
-/// [`fma_dot_body`] compiled with the `fma,avx2` target features, so its
-/// `mul_add`s are `vfmadd` instructions over packed lanes instead of calls.
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "fma,avx2")]
-fn fma_dot_fma_avx2(a: &[f64], b: &[f64]) -> f64 {
-    fma_dot_body(a, b)
-}
-
-/// Compensated dot product: [`fma_dot_body`] on the CPU-feature variant the
-/// running machine supports. Bit-identical across variants — an FMA is an FMA
-/// whether it is an instruction or the runtime library's implementation of
-/// one, and the eight lanes keep their per-lane order under vectorization.
-#[inline]
-fn fma_dot(a: &[f64], b: &[f64]) -> f64 {
-    #[cfg(target_arch = "x86_64")]
-    if fma_avx2_available() {
-        // SAFETY: `fma_avx2_available` is the cached CPU probe for exactly the
-        // `fma` and `avx2` features this variant enables.
-        return unsafe { fma_dot_fma_avx2(a, b) };
-    }
-    fma_dot_body(a, b)
-}
-
 /// `out[i] = Σ_j X[i,j]·v[j]` for row-major-contiguous `x_all` (len `n·p`) and
 /// `v` (len `p`). Each output row is an independent [`fma_dot`]; rows fan out
 /// in chunks across the Rayon pool when the work is large.
@@ -980,7 +937,7 @@ fn fast_av_rowmajor_into(x_all: &[f64], v: &[f64], n: usize, p: usize, out: &mut
 /// the saved arithmetic matters when the same cache-resident matrix is applied
 /// hundreds of times.
 #[inline(always)]
-fn standard_fma_dot_body(a: &[f64], b: &[f64]) -> f64 {
+fn standard_fma_dot(a: &[f64], b: &[f64]) -> f64 {
     assert_eq!(
         a.len(),
         b.len(),
@@ -1003,26 +960,6 @@ fn standard_fma_dot_body(a: &[f64], b: &[f64]) -> f64 {
     let pair45 = sum[4] + sum[5];
     let pair67 = sum[6] + sum[7];
     remainder + (pair01 + pair23) + (pair45 + pair67)
-}
-
-/// [`standard_fma_dot_body`] compiled with the `fma,avx2` target features.
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "fma,avx2")]
-fn standard_fma_dot_fma_avx2(a: &[f64], b: &[f64]) -> f64 {
-    standard_fma_dot_body(a, b)
-}
-
-/// Ordinary FMA dot product on the CPU-feature variant the running machine
-/// supports (bit-identical across variants, as for [`fma_dot`]).
-#[inline]
-fn standard_fma_dot(a: &[f64], b: &[f64]) -> f64 {
-    #[cfg(target_arch = "x86_64")]
-    if fma_avx2_available() {
-        // SAFETY: `fma_avx2_available` is the cached CPU probe for exactly the
-        // `fma` and `avx2` features this variant enables.
-        return unsafe { standard_fma_dot_fma_avx2(a, b) };
-    }
-    standard_fma_dot_body(a, b)
 }
 
 fn standard_av_rowmajor_into(x_all: &[f64], v: &[f64], n: usize, p: usize, out: &mut [f64]) {
@@ -1088,7 +1025,13 @@ fn fast_atv_rowmajor_into(x_all: &[f64], v: &[f64], n: usize, p: usize, out: &mu
         let start = b * ATV_BLOCK_ROWS;
         let end = (start + ATV_BLOCK_ROWS).min(n);
         let mut acc = vec![0.0f64; p];
-        atv_block_accumulate(&x_all[start * p..end * p], &v[start..end], &mut acc);
+        for i in start..end {
+            let vi = v[i];
+            let row = &x_all[i * p..i * p + p];
+            for (a, &xij) in acc.iter_mut().zip(row.iter()) {
+                *a = xij.mul_add(vi, *a);
+            }
+        }
         acc
     };
 
@@ -1100,71 +1043,6 @@ fn fast_atv_rowmajor_into(x_all: &[f64], v: &[f64], n: usize, p: usize, out: &mu
     };
 
     pairwise_sum_into(&partials, out);
-}
-
-/// `acc[j] += Σ_i rows[i,j]·v[i]` over a row-major block `rows` of `v.len()`
-/// rows and `acc.len()` columns: the private partial of one
-/// [`fast_atv_rowmajor_into`] reduction block, one FMA per entry.
-#[inline(always)]
-fn atv_block_accumulate_body(rows: &[f64], v: &[f64], acc: &mut [f64]) {
-    let p = acc.len();
-    assert_eq!(rows.len(), v.len() * p, "atv_block_accumulate: block length");
-    for (&vi, row) in v.iter().zip(rows.chunks_exact(p)) {
-        for (a, &xij) in acc.iter_mut().zip(row.iter()) {
-            *a = xij.mul_add(vi, *a);
-        }
-    }
-}
-
-/// [`atv_block_accumulate_body`] compiled with the `fma,avx2` target features.
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "fma,avx2")]
-fn atv_block_accumulate_fma_avx2(rows: &[f64], v: &[f64], acc: &mut [f64]) {
-    atv_block_accumulate_body(rows, v, acc)
-}
-
-/// Block partial of `Xᵀv` on the CPU-feature variant the running machine
-/// supports (bit-identical across variants, as for [`fma_dot`]).
-#[inline]
-fn atv_block_accumulate(rows: &[f64], v: &[f64], acc: &mut [f64]) {
-    #[cfg(target_arch = "x86_64")]
-    if fma_avx2_available() {
-        // SAFETY: `fma_avx2_available` is the cached CPU probe for exactly the
-        // `fma` and `avx2` features this variant enables.
-        return unsafe { atv_block_accumulate_fma_avx2(rows, v, acc) };
-    }
-    atv_block_accumulate_body(rows, v, acc)
-}
-
-/// `y[i] = alpha·x[i] + y[i]` with one FMA per entry, on the CPU-feature
-/// variant the running machine supports (bit-identical across variants, as
-/// for the compensated dot above). The
-/// Lanczos reorthogonalization's projection update is this kernel over the
-/// full basis at every step, so it pays the same per-`mul_add` call price as
-/// the matvecs without it.
-pub(crate) fn fma_axpy_into(alpha: f64, x: &[f64], y: &mut [f64]) {
-    #[cfg(target_arch = "x86_64")]
-    if fma_avx2_available() {
-        // SAFETY: `fma_avx2_available` is the cached CPU probe for exactly the
-        // `fma` and `avx2` features this variant enables.
-        return unsafe { fma_axpy_into_fma_avx2(alpha, x, y) };
-    }
-    fma_axpy_into_body(alpha, x, y)
-}
-
-#[inline(always)]
-fn fma_axpy_into_body(alpha: f64, x: &[f64], y: &mut [f64]) {
-    assert_eq!(x.len(), y.len(), "fma_axpy_into: operand length mismatch");
-    for (yi, &xi) in y.iter_mut().zip(x.iter()) {
-        *yi = alpha.mul_add(xi, *yi);
-    }
-}
-
-/// [`fma_axpy_into_body`] compiled with the `fma,avx2` target features.
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "fma,avx2")]
-fn fma_axpy_into_fma_avx2(alpha: f64, x: &[f64], y: &mut [f64]) {
-    fma_axpy_into_body(alpha, x, y)
 }
 
 /// Compute A * v using faer's SIMD-optimized GEMV.
@@ -3808,64 +3686,6 @@ mod tests {
         (a, b)
     }
 
-    /// The `fma,avx2` variants of every dispatched kernel are bit-identical
-    /// to the baseline bodies: the dispatch changes how an FMA is executed,
-    /// never what it computes. Run on the same ill-conditioned ensemble the
-    /// accuracy gate uses, so any lane reassociation would surface as a
-    /// changed bit. The CPU must execute the variants for this to be a
-    /// comparison at all, so a machine without `fma,avx2` fails loudly
-    /// instead of comparing a body with itself.
-    #[cfg(target_arch = "x86_64")]
-    #[test]
-    fn fma_avx2_kernel_variants_are_bit_identical_to_the_baseline_bodies() {
-        assert!(
-            super::fma_avx2_available(),
-            "this machine reports no fma/avx2: the variant path cannot be exercised here"
-        );
-        for seed in 0..64u64 {
-            let len = 200 + (seed as usize % 57);
-            let (a, b) = ill_conditioned_pair(len, 0x9E37_79B9 ^ seed.wrapping_mul(2654435761));
-            // SAFETY: the assertion above established the CPU features these
-            // variants enable.
-            let (dot_v, std_v) = unsafe {
-                (
-                    super::fma_dot_fma_avx2(&a, &b),
-                    super::standard_fma_dot_fma_avx2(&a, &b),
-                )
-            };
-            assert_eq!(dot_v.to_bits(), super::fma_dot_body(&a, &b).to_bits(), "fma_dot seed={seed}");
-            assert_eq!(
-                std_v.to_bits(),
-                super::standard_fma_dot_body(&a, &b).to_bits(),
-                "standard_fma_dot seed={seed}"
-            );
-            // Xᵀv block partial: `len` rows of width 7 (a remainder-bearing
-            // width), and the axpy over the same data.
-            let p = 7;
-            let rows: Vec<f64> = (0..len * p).map(|k| a[k % len] * (1.0 + (k % 3) as f64)).collect();
-            let mut acc_body = vec![0.0f64; p];
-            let mut acc_var = vec![0.0f64; p];
-            super::atv_block_accumulate_body(&rows, &b, &mut acc_body);
-            // SAFETY: as above.
-            unsafe { super::atv_block_accumulate_fma_avx2(&rows, &b, &mut acc_var) };
-            assert_eq!(
-                acc_var.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
-                acc_body.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
-                "atv block seed={seed}"
-            );
-            let mut y_body = b.clone();
-            let mut y_var = b.clone();
-            super::fma_axpy_into_body(a[0], &a, &mut y_body);
-            // SAFETY: as above.
-            unsafe { super::fma_axpy_into_fma_avx2(a[0], &a, &mut y_var) };
-            assert_eq!(
-                y_var.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
-                y_body.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
-                "axpy seed={seed}"
-            );
-        }
-    }
-
     /// `fma_dot` (compensated Dot2) error-vs-truth never exceeds the naive
     /// sum's and is strictly lower on the ill-conditioned ensemble in aggregate.
     #[test]
@@ -4260,135 +4080,4 @@ mod parallelism_snapshot_2738_tests {
         );
     }
 
-}
-
-#[cfg(test)]
-mod eigh_ordering_contract_tests {
-    use super::*;
-    use ndarray::Array2;
-
-    /// `FaerEigh::eigh` returns eigenvalues in ASCENDING order, and at least one
-    /// consumer's correctness depends on it while nothing pinned it.
-    ///
-    /// `gam-sae`'s `cluster_stable_eigh`
-    /// (`crates/gam-sae/src/manifold/construction_exact_hessian.rs`) finds each
-    /// degenerate cluster with
-    ///
-    /// ```text
-    /// while j < dim && eigs[j] == eigs[i] { j += 1; }
-    /// ```
-    ///
-    /// — a scan for a RUN of equal values, which only enumerates a cluster when
-    /// equal eigenvalues are ADJACENT. Adjacency is a consequence of sorting and
-    /// of nothing else. If the underlying driver ever returned an unsorted
-    /// spectrum, that loop would not error: it would silently see clusters of
-    /// width 1 where a cluster exists, skip the within-cluster re-diagonalisation
-    /// entirely, and return a basis that is not stable under the perturbation the
-    /// function is named for. A silent wrong answer, from a dependency upgrade,
-    /// with no test between it and the fit.
-    ///
-    /// Measured 2026-09-05 while attributing 1,383,210 `eigh` calls in one hung
-    /// SAE test: `cluster_stable_eigh` is one of the two callers the native
-    /// stacks caught in the act, reached from `terminal_exact_newton_polish` ->
-    /// `materialize_exact_stationarity_geometry` -> `exact_hessian_spectral_block`.
-    /// The other is `gam_solve::arrow_schur::factorization::row_sub_floor_null_directions`.
-    #[test]
-    fn eigh_returns_eigenvalues_in_ascending_order() {
-        fn hashed_unit(seed: u64) -> f64 {
-            let mut z = seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
-            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-            z ^= z >> 31;
-            ((z >> 11) as f64 / (1u64 << 53) as f64) * 2.0 - 1.0
-        }
-
-        // Dimensions bracketing the ones the SAE fit actually asks for (1, 2, 3,
-        // 5, 6, 9, 36) plus a size where a driver could plausibly switch
-        // algorithm, and scales spanning 18 decades so the check is not made on
-        // one magnitude.
-        for &n in &[1_usize, 2, 3, 5, 6, 9, 17, 36] {
-            for seed in 0..8_u64 {
-                for &scale in &[1.0_f64, 1.0e-9, 1.0e9] {
-                    let mut m = Array2::<f64>::zeros((n, n));
-                    let mut k = seed.wrapping_mul(1_000_003).wrapping_add(n as u64);
-                    for i in 0..n {
-                        for j in 0..=i {
-                            k = k.wrapping_add(0x1234_5678);
-                            let value = hashed_unit(k) * scale;
-                            m[[i, j]] = value;
-                            m[[j, i]] = value;
-                        }
-                    }
-                    let (values, _) = m.eigh(Side::Lower).expect("eigendecomposition");
-                    assert_eq!(values.len(), n, "n={n}: one eigenvalue per dimension");
-                    for w in 1..n {
-                        assert!(
-                            values[w - 1] <= values[w],
-                            "n={n} seed={seed} scale={scale:e}: eigenvalues are NOT ascending at \
-                             index {w} ({:e} then {:e}). `cluster_stable_eigh` scans for RUNS of \
-                             equal eigenvalues and would silently stop finding degenerate clusters.",
-                            values[w - 1],
-                            values[w]
-                        );
-                    }
-                }
-            }
-        }
-    }
-
-    /// The ordering claim above is only load-bearing because equal eigenvalues
-    /// land ADJACENT. Assert that directly on a planted degeneracy rather than
-    /// inferring it from sortedness, so the property the consumer actually uses
-    /// is the property under test.
-    #[test]
-    fn equal_eigenvalues_are_returned_adjacent() {
-        // diag(2, 7, 2, 7, 2) in a rotated basis: three eigenvalues at 2 and two
-        // at 7, planted so the degeneracy is exact rather than incidental.
-        let d = ndarray::arr1(&[2.0_f64, 7.0, 2.0, 7.0, 2.0]);
-        let n = d.len();
-        // A Householder reflector Q = I - 2vv^T/(v^Tv) is orthogonal and exact
-        // enough here that Q diag(d) Q^T keeps the spectrum to round-off.
-        let v = ndarray::arr1(&[1.0_f64, -2.0, 3.0, -4.0, 5.0]);
-        let vtv: f64 = v.iter().map(|x| x * x).sum();
-        let mut q = Array2::<f64>::zeros((n, n));
-        for i in 0..n {
-            q[[i, i]] = 1.0;
-        }
-        for i in 0..n {
-            for j in 0..n {
-                q[[i, j]] -= 2.0 * v[i] * v[j] / vtv;
-            }
-        }
-        let mut a = Array2::<f64>::zeros((n, n));
-        for i in 0..n {
-            for j in 0..n {
-                let mut acc = 0.0;
-                for k in 0..n {
-                    acc += q[[i, k]] * d[k] * q[[j, k]];
-                }
-                a[[i, j]] = acc;
-            }
-        }
-        let (values, _) = a.eigh(Side::Lower).expect("eigendecomposition");
-        // Three near-2 then two near-7, contiguously. A tolerance is needed
-        // because the similarity transform is floating point; the ADJACENCY is
-        // what is under test, not the digits.
-        let low = values.iter().filter(|v| (**v - 2.0).abs() < 1.0e-9).count();
-        let high = values.iter().filter(|v| (**v - 7.0).abs() < 1.0e-9).count();
-        assert_eq!(low, 3, "planted multiplicity 3 at lambda=2, got {values:?}");
-        assert_eq!(high, 2, "planted multiplicity 2 at lambda=7, got {values:?}");
-        for w in 0..3 {
-            assert!(
-                (values[w] - 2.0).abs() < 1.0e-9,
-                "the three lambda=2 eigenvalues must occupy indices 0..3 contiguously, \
-                 or `cluster_stable_eigh`'s run scan splits the cluster: {values:?}"
-            );
-        }
-        for w in 3..5 {
-            assert!(
-                (values[w] - 7.0).abs() < 1.0e-9,
-                "the two lambda=7 eigenvalues must occupy indices 3..5 contiguously: {values:?}"
-            );
-        }
-    }
 }

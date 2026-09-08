@@ -411,9 +411,9 @@ mod spatial_length_scale_monotone_tests {
     /// STARTS, against where the baseline it is graded against ENDED.
     ///
     /// The monotone gate compares `joint_final_value` (the joint optimizer's
-    /// certified cost over the ±`JOINT_RHO_BOUND` ρ box, at a ψ clamped into the
+    /// certified cost over the derived ρ domain, at a ψ clamped into the
     /// data-derived κ window) against `fit_score(&baseline)` (a standard scalar-ρ
-    /// fit over the ±`RHO_BOUND` box at the SPEC's length scale). Those are two
+    /// fit over the same derived domain at the SPEC's length scale). Those are two
     /// different feasible sets. If the baseline's own ρ̂ or ψ is outside the joint
     /// box, `theta0` is a CLAMPED — hence strictly worse — point, and the
     /// certificate can fail with the optimizer having descended perfectly.
@@ -465,11 +465,6 @@ mod spatial_length_scale_monotone_tests {
             max_iter: 40,
             ..FitOptions::default()
         };
-        /// The ρ box the joint spatial route hands its optimizer, mirrored from
-        /// the private `spatial_optimization::JOINT_RHO_BOUND` so this probe can
-        /// report the clamp without widening that constant's visibility.
-        const JOINT_RHO_BOUND_MIRROR: f64 = 12.0;
-
         let baseline = fit_term_collection_forspec(
             data.view(),
             y.view(),
@@ -481,15 +476,25 @@ mod spatial_length_scale_monotone_tests {
         )
         .unwrap_or_else(|e| panic!("baseline fit failed: {e:?}"));
         let rho_hat = baseline.fit.lambdas.mapv(f64::ln);
+        // The ρ domain the joint route derives from the baseline's own design
+        // and penalties (#2812), so the probe reports the same projection the
+        // driver applies to its seed.
+        let (rho_lower, rho_upper) = joint_rho_resolvability_domain(
+            &baseline.design.design,
+            &baseline.design.penalties,
+            rho_hat.len(),
+        );
         eprintln!(
-            "[zz-start-2454] baseline score={:+.10e} rho_hat={:?} joint_rho_bound=±{}",
+            "[zz-start-2454] baseline score={:+.10e} rho_hat={:?} joint_rho_domain lower={:?} upper={:?}",
             fit_score(&baseline.fit),
             rho_hat.to_vec(),
-            JOINT_RHO_BOUND_MIRROR,
+            rho_lower.to_vec(),
+            rho_upper.to_vec(),
         );
         let clamped: Vec<f64> = rho_hat
             .iter()
-            .map(|&r| r.clamp(-JOINT_RHO_BOUND_MIRROR, JOINT_RHO_BOUND_MIRROR))
+            .enumerate()
+            .map(|(k, &r)| r.clamp(rho_lower[k], rho_upper[k]))
             .collect();
         let moved = rho_hat
             .iter()

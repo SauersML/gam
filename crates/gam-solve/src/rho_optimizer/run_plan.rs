@@ -19,36 +19,6 @@ fn should_start_next_seed(
 /// terminated before — measured on #2569 as one cold seed re-run 17 times to
 /// the identical `|g|` after the identical 42 outer iterations. Returns the
 /// surviving cascade and how many seeds were replayed rather than re-run.
-/// The seeds this outer call has not already started and had refused.
-///
-/// #2569 built the filter and exempted slot 0, because slot 0 carries the
-/// certify-resume loop's reseed point and "the resume exists to explore it".
-/// #2748 measured what that exemption costs when the reseed does not MOVE: on
-/// the `n = 4000` matern flexible cell the outer re-dispatched from slot 0
-/// round after round — `entering seed 0 of 7 (started 0, budget 1)` every time
-/// — and the dispatch's EFS arm re-derived one identical non-converged fixed
-/// point, `final_value = 2.786987e3` to seven digits across four runs at
-/// roughly thirteen minutes each, before the cell died at its wall.
-///
-/// The exemption's own justification is what corrects it. A reseed point earns
-/// its exemption by being NEW, not by sitting at index 0; a slot-0 point that
-/// is already in this run's refusal record is not a reseed the loop has yet to
-/// explore, it is the one it already explored. So the index test is replaced by
-/// the value test the justification was always stating. A resume that genuinely
-/// moves has a slot-0 point absent from the record and is untouched, which is
-/// every case #2569 measured.
-///
-/// This is also the answer to "what may persist across `obj.reset()`", which
-/// #2748 asked as though a solver needed new memory. Nothing new does. The
-/// record consulted here already survives the reset, because it never lived in
-/// the objective: it is carried on the config by the loop that owns the reset
-/// (`OuterConfig::previously_refused_seed_points`). What was missing was not a
-/// place to remember, it was reading the memory that exists with the predicate
-/// that matches it.
-///
-/// The cascade is never emptied. If every generated seed is a recorded replay
-/// the caller's own start is kept so a plan runner still has something to
-/// enter, and the replay count reports that the round had nothing new.
 fn seeds_without_recorded_refusals(
     seeds: Vec<Array1<f64>>,
     previously_refused: &[Array1<f64>],
@@ -58,21 +28,14 @@ fn seeds_without_recorded_refusals(
     }
     let mut kept: Vec<Array1<f64>> = Vec::with_capacity(seeds.len());
     let mut replayed = 0usize;
-    let mut caller_start: Option<Array1<f64>> = None;
     for (seed_idx, seed) in seeds.into_iter().enumerate() {
-        if previously_refused.iter().any(|refused| refused == &seed) {
-            if seed_idx == 0 {
-                caller_start = Some(seed);
-            }
+        if seed_idx > 0 && previously_refused.iter().any(|refused| refused == &seed) {
             replayed += 1;
             continue;
         }
         kept.push(seed);
     }
-    match caller_start {
-        Some(start) if kept.is_empty() => (vec![start], replayed.saturating_sub(1)),
-        _ => (kept, replayed),
-    }
+    (kept, replayed)
 }
 
 /// Seed start points this plan run STARTED and whose mandatory analytic
@@ -87,7 +50,6 @@ fn seeds_without_recorded_refusals(
 fn certificate_refused_seed_points(
     seed_rejections: &[SeedRejection],
     seeds: &[Array1<f64>],
-    budget_exhausted: &[Array1<f64>],
 ) -> Vec<Array1<f64>> {
     let mut points: Vec<Array1<f64>> = Vec::new();
     for rejection in seed_rejections
@@ -100,47 +62,7 @@ fn certificate_refused_seed_points(
             points.push(seed.clone());
         }
     }
-    // #2748 — a seed whose METRIC-FREE solver exhausted its iteration budget
-    // states where the search terminated just as definitely as a refused
-    // certificate does, and the filter's own justification above ("a seed
-    // rejected at screening, domain entry or validation never reached a
-    // solver") admits it: this one reached a solver and ran it to the end.
-    // It was nonetheless recorded nowhere, because the seed loop `continue`s
-    // an exhausted iterate as "resumable work, not a fit candidate" — true,
-    // and orthogonal to whether re-entering the same point would re-derive
-    // the same exhaustion. It would; see [`budget_exhausted_replay_point`].
-    for seed in budget_exhausted {
-        if !points.contains(seed) {
-            points.push(seed.clone());
-        }
-    }
     points
-}
-
-/// The seed point of an exhausted iterate, when re-entering it would provably
-/// reproduce the exhaustion — otherwise `None`.
-///
-/// The certify-resume loop varies exactly two things across dispatches: the
-/// outer BFGS metric (`warm_start_outer_hessian`) and the operator trust radius
-/// (`operator_initial_trust_radius`). A solver that consumes neither is a
-/// function of its seed alone, so `obj.reset()` puts it back in the state it
-/// ran from and the next dispatch recomputes what the last one already has.
-/// [`Solver::Efs`] is that solver: a multiplicative fixed-point iteration with
-/// no curvature model and no trust region. #2748 measured the consequence —
-/// four dispatches of the `n = 4000` matern flexible cell, each running the
-/// fixed point to `max_iter = 200` and each returning `final_value = 2.786987e3`
-/// to seven digits, at roughly thirteen minutes apiece.
-///
-/// `Arc` and `Bfgs` DO consume the transferred metric, so their retry from the
-/// same point is a different trajectory and is deliberately not recorded here;
-/// `HybridEfs` takes safeguarded gradient steps on the ψ coordinates and is
-/// excluded for the same reason. The claim this function makes is only ever
-/// "this exact run has already been performed", never "this point is bad".
-fn budget_exhausted_replay_point(
-    solver: Solver,
-    seed: &Array1<f64>,
-) -> Option<Array1<f64>> {
-    matches!(solver, Solver::Efs).then(|| seed.clone())
 }
 
 /// Parsimonious screening has exactly two roles: the flexible slot-0 basin and
@@ -173,19 +95,14 @@ fn ray_restoration_in(err: &EstimationError) -> Option<&gam_problem::RayRestorat
         EstimationError::CustomFamily(gam_problem::CustomFamilyError::InnerSolveNotConverged {
             terminal:
                 Some(gam_problem::InnerConvergenceTerminalState::JointNewton {
-                    termination_reason,
+                    termination_reason:
+                        gam_problem::JointNewtonTerminalReason::SlowGeometricRate {
+                            ray: Some(ray), ..
+                        },
                     ..
                 }),
             ..
-        }) => match termination_reason {
-            // A ray is a property of the accepted step, so every terminal
-            // reason that can carry one is read here (gam#2695): the
-            // slow-rate exit, and the residual-stall / divergence exits that
-            // used to drop it.
-            gam_problem::JointNewtonTerminalReason::SlowGeometricRate { ray, .. } => ray.as_ref(),
-            gam_problem::JointNewtonTerminalReason::StalledOnDescendingRay { ray, .. } => Some(ray),
-            _ => None,
-        },
+        }) => Some(ray),
         _ => None,
     }
 }
@@ -235,18 +152,6 @@ fn eval_seed_restoring_rays(
             return Err(err);
         }
         let mut restored = seed.clone();
-        // A ray names a BLOCK, and a block's penalty strength is spread over
-        // `rho_count` coordinates. Raising every one of them by `ln r` closes
-        // the ray exactly; raising the subset that still has room raises the
-        // block's total strength by less, which is a step along the same
-        // direction and never the wrong way. Refusing the whole seed because
-        // ONE coordinate of the block sits at its ceiling threw away the others
-        // (gam#2695: the 1569 pair's rays span `rho[3..5]` and refuse on
-        // `rho[3]` alone), and the caller re-enters this loop, so a partial
-        // raise is re-evaluated and can be raised again — up to one restoration
-        // per rho coordinate.
-        let mut capped: Vec<(usize, f64, f64)> = Vec::new();
-        let mut raised_any = false;
         for j in ray.rho_indices() {
             let Some(current) = restored.get(j).copied() else {
                 return Err(err);
@@ -255,49 +160,18 @@ fn eval_seed_restoring_rays(
             // The closure may lie beyond the domain's ceiling: then the block
             // wants more strength than the model resolves, and the honest move
             // is to the ceiling itself (a block collapsing to its null space
-            // is a result, not a wall — #2812).
+            // is a result, not a wall — #2812). A coordinate already at its
+            // ceiling cannot be raised, and the refusal stands.
             let raised = (current + ray.log_strength_ratio).min(ceiling);
             if !(raised.is_finite() && raised > current) {
-                capped.push((j, current, ceiling));
-                continue;
+                log::warn!(
+                    "[OUTER] {context}: seed {seed_idx} descends a ray on a coordinate already \
+                     at its domain ceiling (rho[{j}]={current:.4}, ceiling {ceiling:.4}); \
+                     refusing it as evaluated: {ray}"
+                );
+                return Err(err);
             }
             restored[j] = raised;
-            raised_any = true;
-        }
-        if !raised_any {
-            // EVERY coordinate of the block is at its ceiling: no admissible
-            // strength closes this ray, and the refusal is the model's answer
-            // rather than a missed opportunity.
-            log::warn!(
-                "[OUTER] {context}: seed {seed_idx} descends a ray whose every coordinate is \
-                 already at its domain ceiling ({}); no admissible penalty strength closes it, \
-                 so refusing it as evaluated: {ray}",
-                capped
-                    .iter()
-                    .map(|(j, current, ceiling)| format!(
-                        "rho[{j}]={current:.4} vs ceiling {ceiling:.4}"
-                    ))
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            );
-            return Err(err);
-        }
-        if !capped.is_empty() {
-            log::warn!(
-                "[OUTER] {context}: seed {seed_idx} raises the {} coordinate(s) of this block \
-                 that still have room and leaves {} at the ceiling ({}); the block gains less \
-                 than the ray's full {:.4}, which is a step along it, not past it",
-                ray.rho_count - capped.len(),
-                capped.len(),
-                capped
-                    .iter()
-                    .map(|(j, current, ceiling)| format!(
-                        "rho[{j}]={current:.4} vs ceiling {ceiling:.4}"
-                    ))
-                    .collect::<Vec<_>>()
-                    .join(", "),
-                ray.log_strength_ratio,
-            );
         }
         log::warn!(
             "[OUTER] {context}: seed {seed_idx} is under-penalized, not failed — {ray}; \
@@ -1442,14 +1316,13 @@ pub(crate) fn run_outer_with_plan(
     // already recorded. `config.previously_refused_seed_points` is non-empty
     // only on a certify-resume round, and holds seeds an earlier round started
     // and whose analytic certificate refused. The resume reseeds `initial_rho`
-    // and resets the objective, so every seed in this cascade that is already
-    // in the record is re-entered from the identical state that already refused
-    // it, and the trace shows it terminating at the identical gradient after the
-    // identical iteration count. #2748: that includes slot 0 when the reseed did
-    // not move it, which is the case a slot-0 index exemption could never see. A
-    // seed that was never started is never in the list, so the
-    // `should_start_next_seed` fall-through keeps every rescue it could
-    // previously perform.
+    // and resets the objective; every OTHER seed in this cascade is therefore
+    // re-entered from the identical state that already refused it, and the
+    // trace shows it terminating at the identical gradient after the identical
+    // iteration count. Slot 0 is the caller's reseed point and is never
+    // dropped — the resume exists to explore it — and a seed that was never
+    // started is never in the list, so the `should_start_next_seed`
+    // fall-through keeps every rescue it could previously perform.
     let generated_seed_count = seeds.len();
     let (kept_seeds, replayed_seeds) =
         seeds_without_recorded_refusals(seeds, &config.previously_refused_seed_points);
@@ -1589,11 +1462,6 @@ pub(crate) fn run_outer_with_plan(
     // while their `ObjectiveEvalError` still carries the originating typed
     // `EstimationError`; there is no parallel prose ledger to reconcile later.
     let mut seed_rejections: Vec<SeedRejection> = Vec::new();
-    // #2748 — seed points whose metric-free solver ran to its iteration budget.
-    // Kept apart from `seed_rejections` deliberately: that ledger drives the
-    // structural early exit (`uniform_structural_key`), and an exhausted
-    // iterate is not a failure of the kind that ladder counts.
-    let mut budget_exhausted_seed_points: Vec<Array1<f64>> = Vec::new();
     let layout = cap.theta_layout();
     // Number of smoothing (ρ) coordinates, used to break a near-LAML-tie toward
     // the more-penalized basin in the non-Gaussian multi-start keep-best.
@@ -1662,23 +1530,6 @@ pub(crate) fn run_outer_with_plan(
     // identically in each. Re-deriving a constant of the problem once per seed
     // buys nothing; `max_seeds` / `seed_budget` are inert against it.
     let mut cold_entry_leg_refusal: Option<String> = None;
-    // Non-converged outcomes this ladder has already produced, by value.
-    //
-    // `uniform_structural_key` below catches a cascade of seeds that are
-    // REJECTED for the same reason. It cannot see the other uniform failure
-    // mode: a seed that RUNS, exhausts its budget, and lands on the point a
-    // previous seed already landed on.
-    //
-    // What was actually observed on gam#2748 (n = 4000 matern flexible), stated
-    // without the inference I first drew from it: inside ONE EFS dispatch, the
-    // fixed point reached `max_iter=200` at `final_value = 2.786987e3` — the
-    // same value to seven digits — twice, 12 m 42 s apart, and the cell died at
-    // its 3600 s wall. Whether those were two iterations of THIS ladder or one
-    // seed re-entered elsewhere is not decidable from that log, because nothing
-    // printed the seed index at the point the solver was entered; the `seed N`
-    // strings there come only from the early screening messages. The marker
-    // added at the head of this loop is what makes the next run answer it.
-    let mut non_converged_outcome_values: Vec<f64> = Vec::new();
 
     'seed_attempts: for (seed_idx, seed_as_generated) in seeds.iter().enumerate() {
         // The seed the solver starts from: the generated point, or that point
@@ -1686,17 +1537,6 @@ pub(crate) fn run_outer_with_plan(
         // inner solve read off its ray (#2695).
         let mut seed_owned = seed_as_generated.clone();
         let seed = &mut seed_owned;
-        // The seed index at the point the ladder enters a solver (gam#2748).
-        // Every other `seed N` line in an outer log comes from a screening or
-        // rejection message, so a seed that runs straight through to the solver
-        // printed no index at all — and a log showing only `seed 0` was
-        // therefore consistent both with one seed and with several. One line
-        // here makes "how many seeds ran, and which one produced this outcome"
-        // a reading rather than an inference.
-        log::info!(
-            "[OUTER] {context}: entering seed {seed_idx} of {} (started {started_seeds},              budget {seed_budget}) on {the_plan}",
-            seeds.len(),
-        );
         if !should_start_next_seed(started_seeds, seed_budget, best.is_some()) {
             break;
         }
@@ -2265,35 +2105,14 @@ pub(crate) fn run_outer_with_plan(
                         "[OUTER] {context}: analytic Hessian provided as Hv operator; \
                         routing to opt::MatrixFreeTrustRegion (Steihaug-Toint CG)"
                     );
-                    let seed_hessian = match &seed_eval.hessian {
-                        HessianValue::Dense(hessian) => hessian.clone(),
-                        HessianValue::Operator(operator) => operator
-                            .materialize_dense()
-                            .map_err(|error| {
-                                EstimationError::RemlOptimizationFailed(format!(
-                                    "could not construct the analytic outer curvature chart: {error}"
-                                ))
-                            })?,
-                        HessianValue::Unavailable => {
-                            return Err(EstimationError::RemlOptimizationFailed(
-                                "operator route selected without an analytic Hessian".to_string(),
-                            ));
-                        }
-                    };
-                    let chart = OuterDiagonalChart::from_hessian(&seed_hessian).map_err(|error| {
-                        EstimationError::RemlOptimizationFailed(error.to_string())
-                    })?;
-                    let (scaled_lo, scaled_hi) =
-                        chart.bounds_to_solver(&bounds_template.0, &bounds_template.1);
-                    let bounds_obj = outer_bounds(&scaled_lo, &scaled_hi)?;
+                    let (lo, hi) = &bounds_template;
+                    let bounds_obj = outer_bounds(lo, hi)?;
                     // Scale-aware tolerance via opt 0.5.0:
                     // `relative_to_cost(τ)` = `τ * (1 + |f|)` resolved
                     // at run time from the seed cost and initial grad
                     // norm. Replaces the previous gam-side
                     // precomputed `outer_scaled_tolerance` hack.
-                    let grad_tol = chart.gradient_tolerance_to_solver(
-                        outer_gradient_tolerance(config),
-                    );
+                    let grad_tol = outer_gradient_tolerance(config);
                     let max_iter = outer_max_iterations(config.max_iter)?;
 
                     // Translate the seed_eval into an opt::OperatorSample
@@ -2302,31 +2121,36 @@ pub(crate) fn run_outer_with_plan(
                     // eval. The Hessian translation goes through the
                     // gam->opt operator adapter when the seed Hessian is
                     // an Hv operator; Analytic seeds become Dense.
-                    let initial_op_sample = chart.sample_to_solver(OperatorSample {
+                    let initial_op_sample = OperatorSample {
                         value: seed_eval.cost,
                         gradient: seed_eval.gradient.clone(),
                         hessian: seed_eval.hessian.clone(),
-                    });
-
-                    let bridge_obj = ScaledOuterOperatorBridge {
-                        chart: chart.clone(),
-                        inner: OuterOperatorBridge {
-                            obj,
-                            layout,
-                            outer_inner_cap: config.outer_inner_cap.clone(),
-                            eval_count: 0,
-                            g_norm_initial: None,
-                            last_g_norm: None,
-                            last_value_grad_rho: None,
-                        },
                     };
 
-                    let scaled_seed = chart.to_solver(&seed);
-                    let mut solver = MatrixFreeTrustRegion::new(scaled_seed.clone(), bridge_obj)
+                    // Use the criterion owner's arithmetic resolution, just
+                    // as the terminal curvature certificate does. The solver
+                    // confirms a candidate with a full Newton subsolve before
+                    // declaring the available decrease unresolved (#2817).
+                    let decrement_resolution = criterion_resolution_at(
+                        obj.criterion_resolution(),
+                        seed_eval.cost,
+                        context,
+                    ).band;
+                    let bridge_obj = OuterOperatorBridge {
+                        obj,
+                        layout,
+                        outer_inner_cap: config.outer_inner_cap.clone(),
+                        eval_count: 0,
+                        g_norm_initial: None,
+                        last_g_norm: None,
+                        last_value_grad_rho: None,
+                    };
+
+                    let mut solver = MatrixFreeTrustRegion::new(seed.clone(), bridge_obj)
                         .with_bounds(bounds_obj)
                         .with_gradient_tolerance(grad_tol)
                         .with_max_iterations(max_iter)
-                        .with_initial_sample(scaled_seed, initial_op_sample)
+                        .with_initial_sample(seed.clone(), initial_op_sample)
                         // Looser Eisenstat–Walker forcing factor on the
                         // inner Steihaug–Toint CG (default 0.1 → 0.5). The
                         // matrix-free route is reached only after
@@ -2340,50 +2164,19 @@ pub(crate) fn run_outer_with_plan(
                         // ~64 outer-TR iters × ~30 trace_logdet calls per
                         // Hv) this halves the dominant per-fit work.
                         .with_cg_tolerance(0.5)
-                        // Stop the search on the test that will judge it.
-                        //
-                        // The certificate accepts a point when the Newton
-                        // decrement ½gᵀH⁻¹g at it is below the criterion's own
-                        // resolution `rel_cost_floor·(1 + |V|)` — the
-                        // curvature-resolvability rung, which is what mgcv
-                        // means by convergence and which the certificate
-                        // computes for itself at the end. The solver was
-                        // driven instead to an absolute projected-gradient
-                        // band, which on a flat REML valley is a far stricter
-                        // and unrelated standard: measured on a gaussian
-                        // n=50 000, p=93, K=11 fit, the band was 7.451e-4
-                        // while the certificate accepted 2.173e-2 — 29× wider
-                        // — so no seed could ever stop itself. All six runs
-                        // (three seeds, then the whole sweep again through the
-                        // budget-exhaustion retry) burned their 200-iteration
-                        // budget, 1200 outer evaluations, for a last-100
-                        // improvement of 4e-4 in a criterion of 5.3e4 (#2817).
-                        //
-                        // opt's Steihaug–Toint subsolve already computes the
-                        // decrement: on an interior step its predicted decrease
-                        // IS ½gᵀH⁻¹g. Handing it the certificate's tolerance
-                        // makes the stopping rule and the acceptance rule one
-                        // standard. Anchored on the seed's own cost, so the
-                        // threshold is fixed for the run rather than drifting
-                        // with the iterate.
-                        .with_model_decrement_tolerance(
-                            outer_rel_cost_floor(config) * (1.0 + seed_eval.cost.abs()),
-                        )
                         // The matrix-free route is exclusively for
                         // exact analytic Hessians; an `Unavailable`
                         // here is a routing/contract violation.
                         .with_hessian_fallback_policy(HessianFallbackPolicy::Error);
-                    // Installed unconditionally now that it also carries the
-                    // trajectory census (#2735): a walk that ends on its budget
-                    // has to be able to say whether it crawled or thrashed, and
-                    // the inner-cap channel it used to be gated on is unrelated
-                    // to that question.
-                    let census = Arc::new(OuterStepCensus::default());
-                    solver = solver.with_observer(OuterAcceptObserver {
-                        feedback: config.outer_inner_cap.clone(),
-                        accepted_steps: None,
-                        census: Some(Arc::clone(&census)),
-                    });
+                    if config.required_projected_gradient_norm.is_none() {
+                        solver = solver.with_model_decrement_tolerance(decrement_resolution);
+                    }
+                    if let Some(feedback) = config.outer_inner_cap.as_ref() {
+                        solver = solver.with_observer(OuterAcceptObserver {
+                            feedback: Some(feedback.clone()),
+                            accepted_steps: None,
+                        });
+                    }
                     if let Some(r) = sanitized_operator_trust_restart_radius(
                         config.operator_initial_trust_radius,
                     ) {
@@ -2391,13 +2184,12 @@ pub(crate) fn run_outer_with_plan(
                     }
 
                     let mf_start = std::time::Instant::now();
-                    let mut report = solver.run_report();
-                    chart.solution_to_physical(&mut report.solution);
+                    let report = solver.run_report();
                     let mf_elapsed = mf_start.elapsed().as_secs_f64();
                     let final_radius = report.diagnostics.final_trust_radius;
                     log::info!(
                         "[OUTER summary] matrix-free TR finished status={:?} in {} iters \
-                         elapsed={:.3}s final_value={:.6e} final_trust_radius={} | {}",
+                         elapsed={:.3}s final_value={:.6e} final_trust_radius={}",
                         report.status,
                         report.solution.iterations,
                         mf_elapsed,
@@ -2406,9 +2198,6 @@ pub(crate) fn run_outer_with_plan(
                             Some(r) => format!("{:.3e}", r),
                             None => "n/a".to_string(),
                         },
-                        census
-                            .describe()
-                            .unwrap_or_else(|| "no step observed".to_string()),
                     );
                     // Translate the structured report into an `OuterResult`.
                     // `operator_stop_reason` wiring (read by the gam-side
@@ -2599,21 +2388,6 @@ pub(crate) fn run_outer_with_plan(
                         last_value_grad_rho: None,
                         cost_stall: Some(cost_stall_guard),
                         cost_stall_bounds: Some((lo.clone(), hi.clone())),
-                        // #2817 — the search stops on the test that judges it.
-                        // The certificate accepts a point whose Newton
-                        // decrement ½gᵀH⁻¹g is at or below the criterion's own
-                        // resolution `rel_cost_floor·(1 + |V|)`; the dense ARC
-                        // route was driven instead to an absolute
-                        // projected-gradient band, which on a flat REML valley
-                        // is a far stricter and unrelated standard, so no seed
-                        // could stop itself and every fit ran to its iteration
-                        // cap. Handing the bridge the same floor the
-                        // certificate uses makes the stopping rule and the
-                        // acceptance rule one standard. The matrix-free route
-                        // already does this through opt's own decrement rung
-                        // (`with_model_decrement_tolerance` above); this is the
-                        // dense route's half of the same repair.
-                        curvature_stationary_floor: Some(outer_rel_cost_floor(config)),
                         },
                         Arc::clone(&last_objective_error),
                     );
@@ -2632,14 +2406,12 @@ pub(crate) fn run_outer_with_plan(
                     if let Some(sigma) = config.arc_initial_regularization {
                         optimizer = optimizer.with_initial_regularization(sigma);
                     }
-                    // Same reason as the matrix-free route above: the census
-                    // is what a budget-exhausted ARC run needs to report (#2735).
-                    let arc_census = Arc::new(OuterStepCensus::default());
-                    optimizer = optimizer.with_observer(OuterAcceptObserver {
-                        feedback: config.outer_inner_cap.clone(),
-                        accepted_steps: None,
-                        census: Some(Arc::clone(&arc_census)),
-                    });
+                    if let Some(feedback) = config.outer_inner_cap.as_ref() {
+                        optimizer = optimizer.with_observer(OuterAcceptObserver {
+                            feedback: Some(feedback.clone()),
+                            accepted_steps: None,
+                        });
+                    }
                     // On the exact-Hessian ARC route, forbid both (a)
                     // finite-difference Hessian estimation if the
                     // objective ever returns
@@ -2661,13 +2433,10 @@ pub(crate) fn run_outer_with_plan(
                         Ok(sol) => Ok(solution_into_outer_result(sol, true, *the_plan)),
                         Err(ArcError::MaxIterationsReached { last_solution, .. }) => {
                             log::warn!(
-                                "[OUTER warning] {context}: ARC hit max_iter={} at final_value={:.6e} |g|={:.3e} | {}",
+                                "[OUTER warning] {context}: ARC hit max_iter={} at final_value={:.6e} |g|={:.3e}",
                                 config.max_iter,
                                 last_solution.final_value,
                                 last_solution.final_gradient_norm.unwrap_or(f64::NAN),
-                                arc_census
-                                    .describe()
-                                    .unwrap_or_else(|| "no step observed".to_string()),
                             );
                             // Budget exhaustion (#1371): the optimizer hands back
                             // its LAST iterate, which on a flat REML valley can be
@@ -2780,41 +2549,6 @@ pub(crate) fn run_outer_with_plan(
                                 }
                                 None => Err(EstimationError::RemlOptimizationFailed(format!(
                                     "ARC infeasible-stall sentinel fired without a published best \
-                                     iterate ({context})"
-                                ))),
-                            }
-                        }
-                        Err(ArcError::ObjectiveFailed { message })
-                            if message == ARC_CURVATURE_STATIONARY_SENTINEL =>
-                        {
-                            // #2817 — the bridge stopped ARC at a point its own
-                            // terminal certificate accepts: PSD reduced Hessian,
-                            // and a Newton decrement at or below the criterion's
-                            // resolution. Unlike the infeasible-stall sentinel
-                            // above, the bridge held a synchronized analytic
-                            // Hessian AT this point and evaluated the
-                            // certificate's rung on it, so the rebuilt result is
-                            // reported converged. The mandatory final analytic
-                            // certificate still re-derives its verdict from a
-                            // fresh evaluation, so nothing here exempts the
-                            // point from being judged.
-                            let exit = cost_stall_exit.lock().ok().and_then(|mut slot| slot.take());
-                            match exit {
-                                Some(exit) => {
-                                    let mut result = outer_result_with_gradient_norm(
-                                        exit.rho,
-                                        exit.value,
-                                        exit.iterations,
-                                        Some(exit.grad_norm),
-                                        exit.converged,
-                                        *the_plan,
-                                    );
-                                    result.origin =
-                                        OuterResultOrigin::ArcCurvatureStationaryStop;
-                                    Ok(result)
-                                }
-                                None => Err(EstimationError::RemlOptimizationFailed(format!(
-                                    "ARC curvature-stationary sentinel fired without a published \
                                      iterate ({context})"
                                 ))),
                             }
@@ -3311,10 +3045,6 @@ pub(crate) fn run_outer_with_plan(
                     optimizer = optimizer.with_observer(OuterAcceptObserver {
                         feedback: config.outer_inner_cap.clone(),
                         accepted_steps: Some(Arc::clone(&accepted_steps)),
-                        // BFGS reports no trust radius, so a region census would
-                        // be a column of `None`s; its own non-convergence
-                        // reporting is the line-search failure path.
-                        census: None,
                     });
                     let bfgs_start = std::time::Instant::now();
                     let outcome = optimizer.run();
@@ -3624,29 +3354,11 @@ pub(crate) fn run_outer_with_plan(
                     candidate.solver_claimed_convergence(),
                 );
                 if !candidate.solver_claimed_convergence() {
-                    // #2748 — record the point BEFORE the checkpoint consumes
-                    // the candidate. An exhausted iterate is resumable work and
-                    // not a fit candidate, which is why the cascade continues;
-                    // it is ALSO a completed deterministic run of a metric-free
-                    // solver from a known point, which is why the next dispatch
-                    // must not perform it again. Those two facts are
-                    // independent, and only the first was being kept.
-                    if let Some(point) = seeds
-                        .get(seed_idx)
-                        .and_then(|seed| budget_exhausted_replay_point(the_plan.solver, seed))
-                        && !budget_exhausted_seed_points.contains(&point)
-                    {
-                        log::info!(
-                            "[OUTER] {context}: seed {seed_idx} exhausted its {:?} budget at                              final_value={:.6e}; recording the point so a later dispatch replays                              the outcome instead of re-deriving it (#2748)",
-                            the_plan.solver,
-                            candidate.final_value,
-                        );
-                        budget_exhausted_seed_points.push(point);
-                    }
                     retain_best_outer_checkpoint(&mut best_checkpoint, candidate);
-                    // Continue the declared multistart budget in search of a
-                    // stationary seed; it may never populate or short-circuit
-                    // the certified winner slot.
+                    // An exhausted iterate is resumable work, not a fit
+                    // candidate. Continue the declared multistart budget in
+                    // search of a stationary seed; it may never populate or
+                    // short-circuit the certified winner slot.
                     continue 'seed_attempts;
                 }
                 let candidate = match CertifiedOuterCandidate::from_solver_claim(
@@ -3702,39 +3414,8 @@ pub(crate) fn run_outer_with_plan(
                         best.as_ref().map(CertifiedOuterCandidate::result),
                     )
                 };
-                // A seed that ran its budget out and stopped where an earlier
-                // seed already stopped is the completed-run twin of a uniform
-                // structural rejection: the remaining seeds reach the same
-                // attractor, and each costs a full solve to say so again
-                // (gam#2748). Compare on the exact bits — two independent runs
-                // agreeing to the last bit is the signature of the same
-                // attractor, whereas a tolerance would also swallow genuinely
-                // distinct nearby optima. Only NON-converged outcomes count: a
-                // converged optimum reached from several seeds is the multi-start
-                // working, and keep-best still wants every one of them.
-                let mut ladder_reached_a_repeated_attractor = false;
-                if !candidate.result().converged() {
-                    let value = candidate.result().final_value;
-                    if value.is_finite() {
-                        if non_converged_outcome_values
-                            .iter()
-                            .any(|seen| seen.to_bits() == value.to_bits())
-                        {
-                            ladder_reached_a_repeated_attractor = true;
-                        } else {
-                            non_converged_outcome_values.push(value);
-                        }
-                    }
-                }
                 if candidate_improved {
                     best = Some(candidate);
-                }
-                if ladder_reached_a_repeated_attractor {
-                    log::warn!(
-                        "[OUTER] {context}: seed {seed_idx} exhausted its budget at exactly the                          value a previous seed already reached (bit-identical); the remaining                          seeds descend to the same attractor, so stopping the ladder here                          instead of re-deriving it up to {} more time(s)",
-                        seed_budget.saturating_sub(started_seeds)
-                    );
-                    break 'seed_attempts;
                 }
                 let quality_compare_remaining_gaussian_seeds =
                     config.seed_config.risk_profile.uses_lowest_cost_keep_best()
@@ -3847,7 +3528,7 @@ pub(crate) fn run_outer_with_plan(
     if let Some(certified) = best {
         let mut result = certified.into_result();
         result.refused_seed_points =
-            certificate_refused_seed_points(&seed_rejections, &seeds, &budget_exhausted_seed_points);
+            certificate_refused_seed_points(&seed_rejections, &seeds);
         // NO mint audit here (#2359). Every candidate above was screened at
         // order three, and the winner's order-four audit is paid EXACTLY ONCE —
         // but it is paid by `run_outer`, not here.
@@ -3974,7 +3655,7 @@ pub(crate) fn run_outer_with_plan(
 
     if let Some(mut checkpoint) = best_checkpoint {
         checkpoint.refused_seed_points =
-            certificate_refused_seed_points(&seed_rejections, &seeds, &budget_exhausted_seed_points);
+            certificate_refused_seed_points(&seed_rejections, &seeds);
         return Ok(PlanRunOutcome::Exhausted(checkpoint));
     }
 
@@ -4040,10 +3721,6 @@ pub(crate) fn run_outer_with_plan(
         }
     })
 }
-
-#[cfg(test)]
-#[path = "zz_ray_restoration_reasons_2695_tests.rs"]
-mod zz_ray_restoration_reasons_2695_tests;
 
 #[cfg(test)]
 #[path = "run_plan_tests.rs"]

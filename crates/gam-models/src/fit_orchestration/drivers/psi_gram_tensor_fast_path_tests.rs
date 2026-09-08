@@ -122,11 +122,8 @@ fn psi_gram_tensor_fast_path_skips_n_row_lane_and_matches_streamed() {
     )
     .expect("upper isotropic-scale bounds");
     let log_kappa0 = log_kappa0.clamp_to_bounds(&log_kappa_lower, &log_kappa_upper);
-    const JOINT_RHO_BOUND: f64 = 12.0;
     let setup = ExactJointHyperSetup::new(
         Array1::<f64>::zeros(rho_dim),
-        Array1::<f64>::from_elem(rho_dim, -JOINT_RHO_BOUND),
-        Array1::<f64>::from_elem(rho_dim, JOINT_RHO_BOUND),
         log_kappa0.clone(),
         log_kappa_lower.clone(),
         log_kappa_upper.clone(),

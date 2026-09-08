@@ -391,6 +391,19 @@ pub trait OuterObjective {
         Ok(None)
     }
 
+    /// The round-off band of the criterion at its last evaluation: machine
+    /// precision times the sum of the absolute values of the criterion's
+    /// additive terms (#2812). A change in the criterion below this band is
+    /// not resolved by the arithmetic that produced it, so the certificate's
+    /// curvature rung uses it as the decrease a Newton step must predict to
+    /// count as unresolved descent. `None` (the default) means the objective
+    /// publishes nothing and the engine falls back to the last-bit floor of
+    /// the value alone, which understates a criterion assembled from
+    /// cancelling terms.
+    fn criterion_resolution(&mut self) -> Option<f64> {
+        None
+    }
+
     /// Optional objective-owned hard lower domain for the outer coordinates.
     ///
     /// This is intersected with the caller's configured box at the same single
@@ -1011,6 +1024,10 @@ impl<'a> OuterObjective for CheckpointingObjective<'a> {
         self.inner.soft_rho_guard_gradient(rho)
     }
 
+    fn criterion_resolution(&mut self) -> Option<f64> {
+        self.inner.criterion_resolution()
+    }
+
     fn criterion_invariant_directions(&mut self, theta: &Array1<f64>) -> Option<Array2<f64>> {
         // The invariance is a property of the wrapped criterion's penalty map;
         // the checkpoint layer neither adds nor persists one.
@@ -1122,6 +1139,9 @@ pub struct ClosureObjective<
     /// Optional single-shot transition from an approximate derivative pilot to
     /// the exact objective measure.
     pub(crate) exact_polish_fn: Option<Box<dyn FnMut(&mut S) -> bool>>,
+    /// The criterion's round-off band at the last evaluation (#2812), read
+    /// off the state by the objective that knows its own additive terms.
+    pub(crate) criterion_resolution_fn: Option<Box<dyn FnMut(&mut S) -> Option<f64>>>,
     /// Optional analytic λ→∞ rail-face limit hook (#2348 Inc 5). Installed by
     /// objectives whose criterion has an exact closed-form limit at an
     /// infinite-smoothing face; `None` means the outer certificate falls back
@@ -1305,6 +1325,12 @@ where
         Some(published)
     }
 
+    fn criterion_resolution(&mut self) -> Option<f64> {
+        self.criterion_resolution_fn
+            .as_mut()
+            .and_then(|resolution| resolution(&mut self.state))
+    }
+
     fn criterion_invariant_directions(&mut self, theta: &Array1<f64>) -> Option<Array2<f64>> {
         // Same seam discipline as the barrier hook above (#2629): the closure
         // speaks rho, the certificate speaks theta, and the psi/link block is
@@ -1417,6 +1443,17 @@ impl<S, Fc, Fe, Fr, Fefs, Feo, Fsp, Fseed> ClosureObjective<S, Fc, Fe, Fr, Fefs,
         self
     }
 
+    /// Install the criterion-resolution publisher (#2812): the closure returns
+    /// machine precision times the sum of the absolute values of the
+    /// criterion's additive terms at the last evaluation.
+    pub fn with_criterion_resolution<Fres>(mut self, resolution: Fres) -> Self
+    where
+        Fres: FnMut(&mut S) -> Option<f64> + 'static,
+    {
+        self.criterion_resolution_fn = Some(Box::new(resolution));
+        self
+    }
+
     /// Install the analytic λ→∞ rail-face limit hook (#2348 Inc 5).
     pub fn with_rail_face_limit<Fface>(mut self, limit: Fface) -> Self
     where
@@ -1507,6 +1544,7 @@ where
             efs_fn: self.efs_fn,
             fixed_point_certificate_fn: self.fixed_point_certificate_fn,
             exact_polish_fn: self.exact_polish_fn,
+            criterion_resolution_fn: self.criterion_resolution_fn,
             rail_face_limit_fn: self.rail_face_limit_fn,
             soft_rho_guard_gradient_fn: self.soft_rho_guard_gradient_fn,
             criterion_invariance_fn: self.criterion_invariance_fn,
@@ -1936,6 +1974,10 @@ impl<'a> OuterObjective for CanonicalizedObjective<'a> {
         let native = self.to_native(rho);
         let guard = self.inner.soft_rho_guard_gradient(&native)?;
         (guard.len() == self.perm.len()).then(|| permute_to_canonical(&guard, &self.perm))
+    }
+
+    fn criterion_resolution(&mut self) -> Option<f64> {
+        self.inner.criterion_resolution()
     }
 
     fn criterion_invariant_directions(&mut self, rho: &Array1<f64>) -> Option<Array2<f64>> {

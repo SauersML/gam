@@ -36,17 +36,12 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 /// Family evaluation over all parameter blocks.
 #[derive(Clone, Debug)]
 pub struct FamilyEvaluation {
-    /// Sum of the family log likelihood over all observations.
     pub log_likelihood: f64,
-    /// IRLS working response and weight information, one entry per block.
     pub blockworking_sets: Vec<BlockWorkingSet>,
 }
 
-/// Exact log likelihood and coefficient gradient returned by a joint workspace.
 pub struct ExactNewtonJointGradientEvaluation {
-    /// Sum of the family log likelihood over all observations.
     pub log_likelihood: f64,
-    /// Gradient in flattened coefficient-block order.
     pub gradient: Array1<f64>,
 }
 
@@ -81,10 +76,6 @@ pub struct BatchedOuterHessianTerms {
     pub outer_hessian: gam_problem::HessianValue,
 }
 
-/// Batched contributions used to assemble the profiled REML/LAML gradient.
-///
-/// Each vector uses the unified outer-coordinate order (smoothing coordinates
-/// followed by family hyperparameters) and must therefore have the same length.
 pub struct BatchedOuterGradientTerms {
     /// Explicit ∂J/∂θ_j contributions evaluated at the converged β̂ holding
     /// β fixed (i.e. the part that does NOT flow through H or S):
@@ -122,11 +113,6 @@ pub struct OuterDerivativePilotSchedule {
 }
 
 impl OuterDerivativePilotSchedule {
-    /// Create a pilot/exact-phase schedule around a shared evaluation counter.
-    ///
-    /// `sampled_phase_budget` is the largest counter value belonging to the
-    /// sampled phase. The constructor is infallible; callers must share this
-    /// same counter with the family evaluation that increments it.
     pub fn new(phase_counter: Arc<AtomicUsize>, sampled_phase_budget: usize) -> Self {
         Self {
             phase_counter,
@@ -1174,11 +1160,6 @@ pub trait CustomFamily {
         false
     }
 
-    /// Whether the joint workspace returns the exact flattened coefficient gradient.
-    ///
-    /// `specs` must be a valid block layout. The default validates it and
-    /// returns `false`; implementations returning `true` must also return
-    /// `Some` from the workspace gradient evaluation.
     fn inner_joint_workspace_gradient_available(&self, specs: &[ParameterBlockSpec]) -> bool {
         assert_valid_blockspecs(specs, "inner joint workspace gradient availability");
         false
@@ -1203,7 +1184,9 @@ pub trait CustomFamily {
         // a NaN coefficient reaching a family hook is a bug in the caller,
         // and naming the block makes the report attributable (#780 ban).
         assert!(
-            block_states.iter().all(|state| state.beta.iter().all(|v| !v.is_nan())),
+            block_states
+                .iter()
+                .all(|state| state.beta.iter().all(|v| !v.is_nan())),
             "a family hook received a NaN coefficient"
         );
         assert!(
@@ -1217,11 +1200,6 @@ pub trait CustomFamily {
         false
     }
 
-    /// Whether the joint workspace returns the exact current log likelihood.
-    ///
-    /// `specs` must be a valid block layout. The default validates it and
-    /// returns `false`; implementations returning `true` must also return
-    /// `Some` from the workspace log-likelihood evaluation.
     fn inner_joint_workspace_log_likelihood_available(&self, specs: &[ParameterBlockSpec]) -> bool {
         assert_valid_blockspecs(specs, "inner joint workspace log-likelihood availability");
         false
@@ -1775,9 +1753,9 @@ pub trait CustomFamily {
     /// This is the dominant cost of the outer-REML Jeffreys `H_Φ` drift; a family
     /// whose joint information is a pure design-row Gram (rigid Bernoulli
     /// marginal-slope) can produce the whole object in one chunked BLAS-3 pass
-    /// instead of `p` independent per-axis sweeps. `None` ⇒ the family does not
-    /// expose the exact second derivative on some axis (zero drift), matching the
-    /// per-axis hook's first-`None` collapse.
+    /// instead of `p` independent per-axis sweeps. `None` means that the family
+    /// does not expose an exact second derivative on some axis. An active
+    /// Jeffreys curvature must reject that incomplete derivative contract.
     ///
     /// The default builds the object by calling the per-axis
     /// [`Self::joint_jeffreys_information_second_directional_derivative_with_specs`]
@@ -1805,6 +1783,29 @@ pub trait CustomFamily {
             }
         }
         Ok(Some(axes))
+    }
+
+    /// Third beta-directional derivative of the Jeffreys information, with
+    /// two fixed directions and every coefficient axis as the third:
+    /// `{D³H[u, v, e_a]}`. This is the fifth likelihood derivative needed to
+    /// differentiate the Jeffreys curvature twice in the outer objective.
+    /// `None` declares that the exact derivative is unavailable.
+    fn joint_jeffreys_information_third_directional_all_axes_with_specs(
+        &self,
+        block_states: &[ParameterBlockState],
+        specs: &[ParameterBlockSpec],
+        d_beta_u_flat: &Array1<f64>,
+        d_beta_v_flat: &Array1<f64>,
+    ) -> Result<Option<Vec<Array2<f64>>>, String> {
+        let context = "third Jeffreys information derivative";
+        assert_valid_blockspecs(specs, context);
+        assert_states_match_specs(block_states, specs, context);
+        let total = block_states.iter().map(|state| state.beta.len()).sum::<usize>();
+        for direction in [d_beta_u_flat, d_beta_v_flat] {
+            assert_eq!(direction.len(), total, "{context}: joint direction width");
+            assert!(direction.iter().all(|value| value.is_finite()), "{context}: non-finite direction");
+        }
+        Ok(None)
     }
 
     /// Optional contracted second beta-derivative of the observed joint
@@ -2523,6 +2524,45 @@ pub trait CustomFamily {
         Ok(Some(axes))
     }
 
+    /// Third information derivatives {D_beta_axis D_beta_direction D_psi H}.
+    /// Required for the mixed coefficient/design derivative of Jeffreys curvature.
+    fn exact_newton_joint_psihessian_second_directional_derivative_all_beta_axes(
+        &self,
+        block_states: &[ParameterBlockState],
+        specs: &[ParameterBlockSpec],
+        hyper_layout: &CustomFamilyHyperLayout,
+        psi_index: usize,
+        d_beta_flat: &Array1<f64>,
+    ) -> Result<Option<Vec<Array2<f64>>>, String> {
+        let context = "second beta derivative of joint psi information";
+        assert_valid_blockspecs(specs, context);
+        assert_states_match_specs(block_states, specs, context);
+        assert_hyper_layout_matches_specs(hyper_layout, specs, context);
+        assert_psi_index_in_layout(hyper_layout, psi_index, context);
+        assert_eq!(d_beta_flat.len(), block_states.iter().map(|state| state.beta.len()).sum::<usize>(), "{context}: joint direction width");
+        assert!(d_beta_flat.iter().all(|value| value.is_finite()), "{context}: non-finite direction");
+        Ok(None)
+    }
+
+    /// Third information derivatives {D_beta_axis D_psi_i D_psi_j H}.
+    /// None declares unavailable curvature; it does not declare zero.
+    fn exact_newton_joint_psisecond_order_hessian_directional_derivative_all_beta_axes(
+        &self,
+        block_states: &[ParameterBlockState],
+        specs: &[ParameterBlockSpec],
+        hyper_layout: &CustomFamilyHyperLayout,
+        psi_i: usize,
+        psi_j: usize,
+    ) -> Result<Option<Vec<Array2<f64>>>, String> {
+        let context = "beta derivative of joint psi-pair information";
+        assert_valid_blockspecs(specs, context);
+        assert_states_match_specs(block_states, specs, context);
+        assert_hyper_layout_matches_specs(hyper_layout, specs, context);
+        assert_psi_index_in_layout(hyper_layout, psi_i, context);
+        assert_psi_index_in_layout(hyper_layout, psi_j, context);
+        Ok(None)
+    }
+
     /// How the penalized Hessian's log-determinant and its derivatives
     /// should handle eigenvalues below the numerical-stability floor.
     ///
@@ -2564,10 +2604,7 @@ pub enum EvalScope {
 /// this prevents.
 #[derive(Clone, Debug)]
 pub struct OuterEvalContext {
-    /// Current log smoothing parameters in penalty order.
     pub rho: Arc<Array1<f64>>,
-    /// Monotonically increasing identifier for the outer evaluation.
     pub eval_id: usize,
-    /// Whether this evaluation is an outer derivative or inner coefficient trial.
     pub scope: EvalScope,
 }

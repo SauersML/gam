@@ -130,6 +130,7 @@ fn softmax(eta: &[f64; K]) -> [f64; K] {
 #[test]
 fn gam_multinomial_smooth_by_factor_recovers_truth() {
     init_parallelism();
+    gam::test_support::install_diagnostic_logger();
 
     // ---- synthesize the shared dataset (fixed seed, fed to BOTH engines) ----
     let mut rng = StdRng::seed_from_u64(0x5A7B_1234_u64);

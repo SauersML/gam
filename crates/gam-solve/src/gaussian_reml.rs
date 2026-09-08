@@ -4335,23 +4335,20 @@ fn gaussian_reml_cholesky_lower(xtwx: Array2<f64>) -> Result<Array2<f64>, Estima
         });
     }
     let schedule = RidgeSchedule::geometric(1e-12 * trace / (p as f64), 6);
-    escalate_ridge(
-        schedule,
-        |jitter| {
-            let mut jittered = xtwx.clone();
-            for i in 0..p {
-                jittered[[i, i]] += jitter;
-            }
-            let mut gpu_candidate = jittered.clone();
-            if gam_gpu::try_cholesky_lower_inplace(&mut gpu_candidate).is_some() {
-                return Some(gpu_candidate);
-            }
-            jittered
-                .cholesky(Side::Lower)
-                .ok()
-                .map(|chol| chol.lower_triangular())
-        },
-    )
+    escalate_ridge(schedule, |jitter| {
+        let mut jittered = xtwx.clone();
+        for i in 0..p {
+            jittered[[i, i]] += jitter;
+        }
+        let mut gpu_candidate = jittered.clone();
+        if gam_gpu::try_cholesky_lower_inplace(&mut gpu_candidate).is_some() {
+            return Some(gpu_candidate);
+        }
+        jittered
+            .cholesky(Side::Lower)
+            .ok()
+            .map(|chol| chol.lower_triangular())
+    })
     .map(|success| success.value)
     .map_err(|exhausted| {
         // Cholesky failed at every escalation. The largest shift actually tried

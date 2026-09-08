@@ -4,6 +4,210 @@
 
 use super::*;
 
+/// Explicit Jeffreys curvature derivatives, sharing one spectral preparation
+/// and the same immutable information/row measure as the psi workspace.
+pub struct ExplicitJeffreysCurvatureDrifts {
+    completion_psi: CompletionPsiAction,
+    psi_pair: Arc<
+        dyn Fn(usize, &[f64], &Array2<f64>) -> Result<(Array2<f64>, Array1<f64>), CustomFamilyError> + Send + Sync,
+    >,
+    beta_psi:
+        Arc<dyn Fn(usize, &Array1<f64>) -> Result<Array2<f64>, CustomFamilyError> + Send + Sync>,
+}
+
+fn prepare_explicit_jeffreys_curvature_drifts<F: CustomFamily + Clone + Send + Sync + 'static>(
+    family: &F,
+    states: &[ParameterBlockState],
+    specs: &[ParameterBlockSpec],
+    layout: SharedCustomFamilyHyperLayout,
+    workspace: Option<Arc<dyn ExactNewtonJointPsiWorkspace>>,
+    context: Option<&(Array2<f64>, Array2<f64>)>,
+) -> Result<Option<Arc<ExplicitJeffreysCurvatureDrifts>>, CustomFamilyError> {
+    let Some((z, h)) = context else {
+        return Ok(None);
+    };
+    let axes = family.joint_jeffreys_information_directional_derivative_all_axes_with_specs(states, specs)?
+        .ok_or_else(|| CustomFamilyError::trial_point("active explicit Jeffreys curvature requires coefficient-axis information derivatives"))?;
+    let Some(base) =
+        gam_solve::estimate::reml::jeffreys_subspace::JeffreysHphiDriftBase::prepare_with_axes(
+            h.view(),
+            z.view(),
+            axes,
+        )?
+    else {
+        return Ok(None);
+    };
+    let total = h.nrows();
+    let mut first = Vec::with_capacity(layout.len());
+    let mut first_axes = Vec::with_capacity(layout.len());
+    for psi in 0..layout.len() {
+        let terms = if let Some(ws) = workspace.as_ref() {
+            ws.first_order_terms(psi)?
+        } else {
+            family.exact_newton_joint_psi_terms(states, specs, &layout, psi)?
+        }
+        .ok_or_else(|| {
+            CustomFamilyError::trial_point(format!(
+                "active Jeffreys psi axis {psi} has no information derivative"
+            ))
+        })?;
+        let matrix = if let Some(op) = terms.hessian_psi_operator {
+            op.mul_mat(&Array2::eye(total))
+        } else {
+            terms.hessian_psi
+        };
+        if matrix.dim() != (total, total) {
+            return Err(CustomFamilyError::trial_point(
+                "explicit Jeffreys information derivative has wrong dimension",
+            ));
+        }
+        first.push(matrix);
+        first_axes.push(materialize_authoritative_psi_hessian_directional_derivatives_all_beta_axes(
+            family, states, specs, &layout, workspace.as_deref(), psi, total,
+        )?.ok_or_else(|| CustomFamilyError::trial_point(format!("active Jeffreys psi axis {psi} has no mixed coefficient-axis information derivatives")))?);
+    }
+    let base = Arc::new(base);
+    let first = Arc::new(first);
+    let first_axes = Arc::new(first_axes);
+    let family = Arc::new(family.clone());
+    let states = Arc::new(states.to_vec());
+    let specs = Arc::new(specs.to_vec());
+    let strength = family.joint_jeffreys_term_strength();
+    let psi_pair = {
+        let (base, first, first_axes, family, states, specs, layout, workspace) = (
+            base.clone(),
+            first.clone(),
+            first_axes.clone(),
+            family.clone(),
+            states.clone(),
+            specs.clone(),
+            layout.clone(),
+            workspace.clone(),
+        );
+        Arc::new(
+            move |i: usize,
+                  alpha: &[f64],
+                  mixed: &Array2<f64>|
+                  -> Result<(Array2<f64>, Array1<f64>), CustomFamilyError> {
+                if i >= first.len() || alpha.len() != first.len() {
+                    return Err(CustomFamilyError::trial_point(
+                        "explicit Jeffreys psi pair dimension mismatch",
+                    ));
+                }
+                let mut h_alpha = Array2::zeros((total, total));
+                let mut axes_alpha = vec![Array2::zeros((total, total)); total];
+                let mut axes_mixed = vec![Array2::zeros((total, total)); total];
+                for (j, &weight) in alpha.iter().enumerate() {
+                    if weight == 0.0 {
+                        continue;
+                    }
+                    h_alpha.scaled_add(weight, &first[j]);
+                    let third = if let Some(ws) = workspace.as_ref() {
+                    ws.second_order_hessian_directional_derivative_all_beta_axes(i,j)?
+                } else {
+                    family.exact_newton_joint_psisecond_order_hessian_directional_derivative_all_beta_axes(&states,&specs,&layout,i,j)?
+                }.ok_or_else(|| CustomFamilyError::trial_point(format!("active Jeffreys psi pair ({i},{j}) requires exact third information derivatives")))?;
+                    if third.len() != total || first_axes[j].len() != total {
+                        return Err(CustomFamilyError::trial_point(
+                            "explicit Jeffreys third information derivative axis count mismatch",
+                        ));
+                    }
+                    for a in 0..total {
+                        axes_alpha[a].scaled_add(weight, &first_axes[j][a]);
+                        axes_mixed[a].scaled_add(weight, &third[a]);
+                    }
+                }
+                let score = base.explicit_score_pair(&first[i], &h_alpha, mixed,
+                    first_axes[i].clone(), axes_alpha.clone(), axes_mixed.clone())? * strength;
+                let mut result = base.mixed_perturbation_derivative_batched_axes(
+                    &first[i],
+                    &h_alpha,
+                    mixed,
+                    first_axes[i].clone(),
+                    axes_alpha,
+                    axes_mixed,
+                )?;
+                result *= strength;
+                Ok((result, score))
+            },
+        )
+            as Arc<
+                dyn Fn(usize, &[f64], &Array2<f64>) -> Result<(Array2<f64>, Array1<f64>), CustomFamilyError>
+                    + Send
+                    + Sync,
+            >
+    };
+    let completion_psi: CompletionPsiAction = {
+        let (base, first, family, states, specs, layout, workspace) = (
+            base.clone(), first.clone(), family.clone(), states.clone(), specs.clone(), layout.clone(), workspace.clone(),
+        );
+        Arc::new(move |psi, v| {
+            let h = first.get(psi).ok_or_else(|| CustomFamilyError::trial_point("Jeffreys completion psi index out of range"))?;
+            let axes = family.joint_jeffreys_information_second_directional_all_axes_with_specs(&states, &specs, v)?
+                .ok_or_else(|| CustomFamilyError::trial_point("Jeffreys completion requires second information derivatives"))?;
+            let moving = if let Some(ws) = &workspace {
+                ws.hessian_second_directional_derivative_all_beta_axes(psi, v)?
+            } else {
+                family.exact_newton_joint_psihessian_second_directional_derivative_all_beta_axes(&states, &specs, &layout, psi, v)?
+            }.ok_or_else(|| CustomFamilyError::trial_point("Jeffreys completion requires mixed third information derivatives"))?;
+            Ok(base.completion_drift_action(h, axes, moving)? * strength)
+        })
+    };
+    let beta_psi = Arc::new(
+        move |psi: usize, direction: &Array1<f64>| -> Result<Array2<f64>, CustomFamilyError> {
+            if psi >= first.len() || direction.len() != total {
+                return Err(CustomFamilyError::trial_point(
+                    "explicit Jeffreys beta-psi direction dimension mismatch",
+                ));
+            }
+            let h_beta = family
+                .joint_jeffreys_information_directional_derivative_with_specs(
+                    &states, &specs, direction,
+                )?
+                .ok_or_else(|| {
+                    CustomFamilyError::trial_point(
+                        "active Jeffreys beta-psi drift requires first information derivative",
+                    )
+                })?;
+            let axes_beta = family
+                .joint_jeffreys_information_second_directional_all_axes_with_specs(
+                    &states, &specs, direction,
+                )?
+                .ok_or_else(|| {
+                    CustomFamilyError::trial_point(
+                        "active Jeffreys beta-psi drift requires second information derivatives",
+                    )
+                })?;
+            let axes_mixed = if let Some(ws) = workspace.as_ref() {
+            ws.hessian_second_directional_derivative_all_beta_axes(psi,direction)?
+        } else {
+            family.exact_newton_joint_psihessian_second_directional_derivative_all_beta_axes(&states,&specs,&layout,psi,direction)?
+        }.ok_or_else(|| CustomFamilyError::trial_point(format!("active Jeffreys beta-psi axis {psi} requires exact third information derivatives")))?;
+            let mut mixed = Array2::zeros((total, total));
+            for (a, &value) in direction.iter().enumerate() {
+                if value != 0.0 {
+                    mixed.scaled_add(value, &first_axes[psi][a]);
+                }
+            }
+            let mut result = base.mixed_perturbation_derivative_batched_axes(
+                &first[psi],
+                &h_beta,
+                &mixed,
+                first_axes[psi].clone(),
+                axes_beta,
+                axes_mixed,
+            )?;
+            result *= strength;
+            Ok(result)
+        },
+    );
+    Ok(Some(Arc::new(ExplicitJeffreysCurvatureDrifts {
+        completion_psi,
+        psi_pair,
+        beta_psi,
+    })))
+}
+
 /// Materialize `D_beta(∂_psi H_info)[direction]` from the same ψ authority
 /// that supplied `∂_psi H_info`.
 ///
@@ -85,6 +289,20 @@ fn materialize_authoritative_psi_hessian_directional_derivatives_all_beta_axes<
     psi_index: usize,
     total: usize,
 ) -> Result<Option<Vec<Array2<f64>>>, CustomFamilyError> {
+    // #2714 — announce and time the sweep: one directional-derivative pass per
+    // coefficient axis is the wall clock of an outer gradient evaluation for a
+    // family without a batched route, and a capped run never reaches a
+    // completion line.
+    let sweep_started = std::time::Instant::now();
+    log::info!(
+        "[STAGE] psi Hessian all-beta-axes sweep start psi_index={psi_index} axes={total} \
+         route={}",
+        if psi_workspace.is_some() {
+            "workspace"
+        } else {
+            "family"
+        },
+    );
     let drifts = if let Some(workspace) = psi_workspace {
         workspace.hessian_directional_derivatives_all_beta_axes(psi_index, total)?
     } else {
@@ -95,8 +313,18 @@ fn materialize_authoritative_psi_hessian_directional_derivatives_all_beta_axes<
                 hyper_layout,
                 psi_index,
             )?
-            .map(|axes| axes.into_iter().map(DriftDerivResult::Dense).collect::<Vec<_>>())
+            .map(|axes| {
+                axes.into_iter()
+                    .map(DriftDerivResult::Dense)
+                    .collect::<Vec<_>>()
+            })
     };
+    log::info!(
+        "[STAGE] psi Hessian all-beta-axes sweep done psi_index={psi_index} axes={total} \
+         elapsed={:.2}s declined={}",
+        sweep_started.elapsed().as_secs_f64(),
+        drifts.is_none(),
+    );
     let Some(drifts) = drifts else {
         return Ok(None);
     };
@@ -164,13 +392,20 @@ pub fn build_psi_hyper_coords<F: CustomFamily + Clone + Send + Sync + 'static>(
     let ranges = block_param_ranges(specs);
     let total = beta_flat.len();
     let per_block = split_log_lambdas(&Array1::from_vec(rho.to_vec()), penalty_counts)?;
-    let per_block_lambdas =
-        exact_lambdas_by_block(&per_block, "psi hyper log strength")?;
+    let per_block_lambdas = exact_lambdas_by_block(&per_block, "psi hyper log strength")?;
 
     let mut coords = Vec::new();
 
     let build_psi_hyper_coords_start = std::time::Instant::now();
     let total_axes = hyper_layout.len();
+    // #2714 — announce the build before it runs: a ψ-hyper build that takes
+    // the wall clock of an outer gradient evaluation was invisible until its
+    // completion line, which a capped run never reaches.
+    log::info!(
+        "[STAGE] build_psi_hyper_coords start axis_count={total_axes} beta_dim={total} \
+         workspace_present={}",
+        psi_workspace.is_some(),
+    );
 
     let batched_terms: Option<Vec<ExactNewtonJointPsiTerms>> = match psi_workspace.as_ref() {
         Some(workspace) => workspace.first_order_terms_all()?,
@@ -226,29 +461,6 @@ pub fn build_psi_hyper_coords<F: CustomFamily + Clone + Send + Sync + 'static>(
     // is independent of this flag and stays folded.
     let jeffreys_info_depends_on_psi = family.joint_jeffreys_information_depends_on_psi();
 
-    // The reduced Jeffreys spectrum — `Z_Jᵀ H_info Z_J`, its eigendecomposition,
-    // the conditioning gate, the relative floor and the dominant/worst
-    // eigenvalue indices — is a property of the SNAPSHOT `(H_info, Z_J)` alone.
-    // It does not move with the ψ axis being differentiated, nor with the
-    // coefficient axis of a mixed derivative. gam#979: every explicit-ψ Jeffreys
-    // derivative below used to rebuild it from scratch, so one outer gradient
-    // paid `axes × coefficients` eigendecompositions of the reduced information
-    // for one distinct spectrum. Prepare it once here and hand the prepared plan
-    // to each derivative; the arithmetic each of them performs is unchanged.
-    let jeffreys_plan: Option<gam_solve::estimate::reml::jeffreys_subspace::JointJeffreysPlan> =
-        match jeffreys_hphi_ctx
-            .as_ref()
-            .filter(|_| jeffreys_info_depends_on_psi)
-        {
-            Some((z_j, h_joint)) => Some(
-                gam_solve::estimate::reml::jeffreys_subspace::JointJeffreysPlan::prepare(
-                    h_joint.view(),
-                    z_j.view(),
-                )?,
-            ),
-            None => None,
-        };
-
     // The explicit-ψ Jeffreys score and curvature use the SAME canonical
     // coefficient-axis derivatives {Hdot[e_a]}. Previously each ψ axis rebuilt
     // those p matrices once in the mixed-score loop and AGAIN while preparing
@@ -281,9 +493,9 @@ pub fn build_psi_hyper_coords<F: CustomFamily + Clone + Send + Sync + 'static>(
     };
 
     for psi_global in 0..total_axes {
-        let axis = hyper_layout
-            .axis(psi_global)
-            .ok_or_else(|| CustomFamilyError::trial_point(format!("missing typed hyper axis {psi_global}")))?;
+        let axis = hyper_layout.axis(psi_global).ok_or_else(|| {
+            CustomFamilyError::trial_point(format!("missing typed hyper axis {psi_global}"))
+        })?;
         // 1. Get family-provided likelihood objects (joint flattened space).
         let psi_terms = if let Some(batched) = batched_terms.as_ref() {
             Some(batched[psi_global].clone())
@@ -367,8 +579,15 @@ pub fn build_psi_hyper_coords<F: CustomFamily + Clone + Send + Sync + 'static>(
             } else {
                 None
             };
-        if let (Some(plan), Some(pert_info)) = (jeffreys_plan.as_ref(), firth_pert_info.as_ref()) {
-            let phi_psi = plan.explicit_param_derivative(pert_info)?;
+        if let (Some((z_j, h_joint)), Some(pert_info)) =
+            (jeffreys_hphi_ctx.as_ref(), firth_pert_info.as_ref())
+        {
+            let phi_psi =
+                    gam_solve::estimate::reml::jeffreys_subspace::joint_jeffreys_phi_explicit_param_derivative(
+                        h_joint.view(),
+                        z_j.view(),
+                        pert_info,
+                    )?;
             a -= phi_psi;
         }
         let mut g = &psi_terms.score_psi + &s_psi_beta;
@@ -406,7 +625,9 @@ pub fn build_psi_hyper_coords<F: CustomFamily + Clone + Send + Sync + 'static>(
             } else {
                 None
             };
-        if let (Some(plan), Some(pert_info)) = (jeffreys_plan.as_ref(), firth_pert_info.as_ref()) {
+        if let (Some((z_j, h_joint)), Some(pert_info)) =
+            (jeffreys_hphi_ctx.as_ref(), firth_pert_info.as_ref())
+        {
             if let (Some(base_axes), Some(pert_axes)) = (
                 jeffreys_base_axis_derivatives.as_ref(),
                 firth_pert_axis_derivatives.as_ref(),
@@ -418,15 +639,17 @@ pub fn build_psi_hyper_coords<F: CustomFamily + Clone + Send + Sync + 'static>(
                         pert_axes.len(),
                     )));
                 }
-                // The ambient trace weights depend on the snapshot spectrum and on
-                // `∂_ψH_info` — NOT on the coefficient axis. One preparation serves
-                // every axis; each axis pays only its own Frobenius contraction
-                // (gam#979: this preparation used to run once per coefficient axis).
-                let weights = plan.explicit_param_mixed_trace_weights(pert_info)?;
                 for (a_idx, (hdot_a, psi_hdot_a)) in
                     base_axes.iter().zip(pert_axes.iter()).enumerate()
                 {
-                    let phi_psi_beta_a = weights.contract(hdot_a, psi_hdot_a)?;
+                    let phi_psi_beta_a =
+                            gam_solve::estimate::reml::jeffreys_subspace::joint_jeffreys_phi_explicit_param_second_derivative(
+                                h_joint.view(),
+                                z_j.view(),
+                                pert_info,
+                                hdot_a,
+                                psi_hdot_a,
+                            )?;
                     g[a_idx] -= phi_psi_beta_a;
                 }
             } else {
@@ -459,23 +682,23 @@ pub fn build_psi_hyper_coords<F: CustomFamily + Clone + Send + Sync + 'static>(
                     _ => None,
                 };
                 if let Some((hdots, psi_hdots)) = batched {
-                    let weights = plan.explicit_param_mixed_trace_weights(pert_info)?;
                     for a_idx in 0..total {
                         let phi_psi_beta_a =
-                            weights.contract(&hdots[a_idx], &psi_hdots[a_idx])?;
+                                gam_solve::estimate::reml::jeffreys_subspace::joint_jeffreys_phi_explicit_param_second_derivative(
+                                    h_joint.view(),
+                                    z_j.view(),
+                                    pert_info,
+                                    &hdots[a_idx],
+                                    &psi_hdots[a_idx],
+                                )?;
                         g[a_idx] -= phi_psi_beta_a;
                     }
                 } else {
-                    // Prepared on the first axis the family actually serves, so an
-                    // evaluation where every axis declines behaves exactly as before.
-                    let mut weights: Option<
-                        gam_solve::estimate::reml::jeffreys_subspace::JointJeffreysExplicitMixedTraceWeights,
-                    > = None;
                     for a_idx in 0..total {
                         let mut e_a = Array1::<f64>::zeros(total);
                         e_a[a_idx] = 1.0;
-                        let hdot_a =
-                            family.joint_jeffreys_information_directional_derivative_with_specs(
+                        let hdot_a = family
+                            .joint_jeffreys_information_directional_derivative_with_specs(
                                 synced_states,
                                 specs,
                                 &e_a,
@@ -492,13 +715,14 @@ pub fn build_psi_hyper_coords<F: CustomFamily + Clone + Send + Sync + 'static>(
                                 total,
                             )?;
                         if let (Some(hdot_a), Some(psi_hdot_a)) = (hdot_a, psi_hdot_a) {
-                            if weights.is_none() {
-                                weights =
-                                    Some(plan.explicit_param_mixed_trace_weights(pert_info)?);
-                            }
-                            let prepared =
-                                weights.as_ref().expect("weights prepared on this axis");
-                            let phi_psi_beta_a = prepared.contract(&hdot_a, &psi_hdot_a)?;
+                            let phi_psi_beta_a =
+                                gam_solve::estimate::reml::jeffreys_subspace::joint_jeffreys_phi_explicit_param_second_derivative(
+                                    h_joint.view(),
+                                    z_j.view(),
+                                    pert_info,
+                                    &hdot_a,
+                                    &psi_hdot_a,
+                                )?;
                             g[a_idx] -= phi_psi_beta_a;
                         }
                     }
@@ -645,91 +869,6 @@ pub fn build_psi_hyper_coords<F: CustomFamily + Clone + Send + Sync + 'static>(
 /// the inline construction in [`build_psi_hyper_coords`]. Returns `None` unless
 /// the family uses the joint-Jeffreys term and exposes a dense joint Hessian, so
 /// every non-Jeffreys / operator-only family is byte-unchanged.
-/// The snapshot Jeffreys spectrum together with the per-ψ-axis information
-/// derivatives `∂_{ψ_a}H_info|_β` and the ambient trace weights they induce.
-///
-/// The ψψ value second derivative `∂_{ψ_i}∂_{ψ_j}Φ` is `weights(ψ_i)` contracted
-/// with `(∂_{ψ_j}H_info, ∂_{ψ_i}∂_{ψ_j}H_info)`. Both the spectrum and the
-/// weights of a given first leg are fixed for the whole evaluation: the spectrum
-/// by `(H_info, Z_J)` and the weights additionally by `∂_{ψ_i}H_info`, none of
-/// which move with the second leg. gam#979: forming them inside the pair loop
-/// cost one reduced-information eigendecomposition per PAIR — `axes²` of them
-/// for one spectrum — which is what this cache removes. Each axis's weights are
-/// prepared on first use, so an evaluation that never reaches an axis keeps its
-/// exact previous outcome, including a stratum refusal it never provoked.
-pub struct JeffreysPsiWeightCache {
-    plan: gam_solve::estimate::reml::jeffreys_subspace::JointJeffreysPlan,
-    /// `∂_{ψ_a}H_info|_β` for every ψ axis, in layout order.
-    pub pert_first: Vec<Array2<f64>>,
-    weights: Vec<
-        std::sync::OnceLock<
-            gam_solve::estimate::reml::jeffreys_subspace::JointJeffreysExplicitMixedTraceWeights,
-        >,
-    >,
-}
-
-impl JeffreysPsiWeightCache {
-    /// Prepare the snapshot spectrum once and retain the axis derivatives.
-    pub fn new(
-        z_j: &Array2<f64>,
-        h_joint: &Array2<f64>,
-        pert_first: Vec<Array2<f64>>,
-    ) -> Result<Self, CustomFamilyError> {
-        let plan = gam_solve::estimate::reml::jeffreys_subspace::JointJeffreysPlan::prepare(
-            h_joint.view(),
-            z_j.view(),
-        )?;
-        let weights = (0..pert_first.len())
-            .map(|_| std::sync::OnceLock::new())
-            .collect();
-        Ok(Self {
-            plan,
-            pert_first,
-            weights,
-        })
-    }
-
-    /// Number of ψ axes the cache carries derivatives for.
-    #[must_use]
-    pub fn axes(&self) -> usize {
-        self.pert_first.len()
-    }
-
-    /// The ambient trace weights for first leg `axis`, prepared on first use.
-    ///
-    /// A concurrent first use recomputes rather than blocks; the result is a
-    /// pure function of the plan and the axis derivative, so either writer
-    /// stores the same weights.
-    pub fn weights_for_axis(
-        &self,
-        axis: usize,
-    ) -> Result<
-        &gam_solve::estimate::reml::jeffreys_subspace::JointJeffreysExplicitMixedTraceWeights,
-        CustomFamilyError,
-    > {
-        let slot = self.weights.get(axis).ok_or_else(|| {
-            CustomFamilyError::trial_point(format!(
-                "Jeffreys ψ weight cache has {} axes, asked for axis {axis}",
-                self.weights.len()
-            ))
-        })?;
-        if let Some(prepared) = slot.get() {
-            return Ok(prepared);
-        }
-        let prepared = self
-            .plan
-            .explicit_param_mixed_trace_weights(&self.pert_first[axis])?;
-        // `set` hands the weights back when a concurrent first use filled the
-        // slot first. They are a pure function of the plan and this axis's
-        // derivative, so whose copy the slot holds does not matter: the loser's
-        // is dropped and every caller reads the stored one.
-        if let Err(duplicate) = slot.set(prepared) {
-            drop(duplicate);
-        }
-        Ok(slot.get().expect("weights stored for this axis"))
-    }
-}
-
 pub fn build_jeffreys_hphi_ctx<F: CustomFamily + Clone + Send + Sync + 'static>(
     family: &F,
     synced_states: &[ParameterBlockState],
@@ -766,6 +905,7 @@ pub fn build_contracted_psi_hook(
     s_logdet_blocks: Option<&[PenaltyPseudologdet]>,
     psi_workspace: Option<Arc<dyn ExactNewtonJointPsiWorkspace>>,
     jeffreys_ctx: Option<(Array2<f64>, Array2<f64>)>,
+    explicit_curvature: Option<Arc<ExplicitJeffreysCurvatureDrifts>>,
 ) -> Result<Option<ContractedPsiSecondOrderFn>, CustomFamilyError> {
     // The contraction is a representation/cost choice for the family likelihood
     // ψψ second-order; without a contracted family kernel there is nothing to
@@ -780,9 +920,10 @@ pub fn build_contracted_psi_hook(
         &Array1::from_vec(rho.to_vec()),
         penalty_counts,
     )?);
-    let per_block_lambdas = Arc::new(
-        exact_lambdas_by_block(&per_block, "contracted psi log strength")?,
-    );
+    let per_block_lambdas = Arc::new(exact_lambdas_by_block(
+        &per_block,
+        "contracted psi log strength",
+    )?);
     let beta_arc = Arc::new(beta_flat.clone());
     let ranges_arc = Arc::new(ranges);
     let s_logdet_block_cache = Arc::new(s_logdet_blocks.map(|blocks| blocks.to_vec()));
@@ -864,7 +1005,7 @@ pub fn build_contracted_psi_hook(
     // data-only — no penalty drift, matching the unpenalized Jeffreys info).
     // `None` (no Jeffreys term, or first-order terms unavailable) leaves a clean
     // / well-conditioned fit byte-unchanged.
-    let firth_ctx: Option<Arc<JeffreysPsiWeightCache>> =
+    let firth_ctx: Option<(Arc<Array2<f64>>, Arc<Array2<f64>>, Arc<Vec<Array2<f64>>>)> =
         match jeffreys_ctx {
             Some((z_j, h_joint))
                 if z_j.nrows() == total && h_joint.nrows() == total && h_joint.ncols() == total =>
@@ -904,9 +1045,7 @@ pub fn build_contracted_psi_hook(
                             }
                         }
                         if ok {
-                            Some(Arc::new(JeffreysPsiWeightCache::new(
-                                &z_j, &h_joint, pert_first,
-                            )?))
+                            Some((Arc::new(z_j), Arc::new(h_joint), Arc::new(pert_first)))
                         } else {
                             None
                         }
@@ -917,160 +1056,184 @@ pub fn build_contracted_psi_hook(
             _ => None,
         };
 
-    let hook = move |alpha_psi: &[f64]| -> Result<Option<ContractedPsiSecondOrder>, CustomFamilyError> {
-        if alpha_psi.len() != psi_dim {
-            return Err(CustomFamilyError::trial_point(format!(
-                "contracted ψψ hook: alpha_psi length {} != psi_dim {psi_dim}",
-                alpha_psi.len()
-            )));
-        }
-        // Family likelihood ψψ contraction (one combined-direction row pass).
-        // The basis-axis probe above rejects partial kernels before the operator
-        // skips per-pair ψψ tables; a decline here means the workspace violated
-        // that coverage contract for a combined direction.
-        let Some(likelihood) = workspace.second_order_terms_contracted(alpha_psi)? else {
-            return Ok(None);
-        };
-        let mut objective = likelihood.objective;
-        let mut score = likelihood.score;
-        let mut ld_s = Array1::<f64>::zeros(psi_dim);
-        // Per-output-row penalty drift `Σ_j α_j S_{ψi ψj}` (block-local),
-        // composed onto the likelihood `hessian[i]` operator below.
-        let mut hessian: Vec<DriftDerivResult> = likelihood.hessian;
-        if objective.len() != psi_dim
-            || score.nrows() != psi_dim
-            || score.ncols() != total
-            || hessian.len() != psi_dim
-        {
-            return Err(CustomFamilyError::trial_point(format!(
-                "contracted ψψ hook: family kernel shape mismatch (objective={}, score={}x{}, hessian={}, psi_dim={psi_dim}, beta_dim={total})",
-                objective.len(),
-                score.nrows(),
-                score.ncols(),
-                hessian.len(),
-            )));
-        }
+    let hook =
+        move |alpha_psi: &[f64]| -> Result<Option<ContractedPsiSecondOrder>, CustomFamilyError> {
+            if alpha_psi.len() != psi_dim {
+                return Err(CustomFamilyError::trial_point(format!(
+                    "contracted ψψ hook: alpha_psi length {} != psi_dim {psi_dim}",
+                    alpha_psi.len()
+                )));
+            }
+            // Family likelihood ψψ contraction (one combined-direction row pass).
+            // The basis-axis probe above rejects partial kernels before the operator
+            // skips per-pair ψψ tables; a decline here means the workspace violated
+            // that coverage contract for a combined direction.
+            let Some(likelihood) = workspace.second_order_terms_contracted(alpha_psi)? else {
+                return Ok(None);
+            };
+            let mut objective = likelihood.objective;
+            let mut score = likelihood.score;
+            let mut ld_s = Array1::<f64>::zeros(psi_dim);
+            // Per-output-row penalty drift `Σ_j α_j S_{ψi ψj}` (block-local),
+            // composed onto the likelihood `hessian[i]` operator below.
+            let mut hessian: Vec<DriftDerivResult> = likelihood.hessian;
+            if objective.len() != psi_dim
+                || score.nrows() != psi_dim
+                || score.ncols() != total
+                || hessian.len() != psi_dim
+            {
+                return Err(CustomFamilyError::trial_point(format!(
+                    "contracted ψψ hook: family kernel shape mismatch (objective={}, score={}x{}, hessian={}, psi_dim={psi_dim}, beta_dim={total})",
+                    objective.len(),
+                    score.nrows(),
+                    score.ncols(),
+                    hessian.len(),
+                )));
+            }
 
-        for i in 0..psi_dim {
-            // EXPLICIT Firth/Jeffreys ψψ VALUE second derivative (gam#1607):
-            //   objective[i] -= ∂_{ψ_i}∂_{ψ(α)}Φ.
-            // This applies to both design/penalty and family-owned axes.
-            if let Some(jeffreys) = firth_ctx.as_ref() {
-                let pert_i_alpha = match &hessian[i] {
-                    DriftDerivResult::Dense(m) => m.clone(),
-                    DriftDerivResult::Operator(op) => op.mul_mat(&Array2::<f64>::eye(total)),
-                };
-                let mut pert_alpha = Array2::<f64>::zeros((total, total));
-                for (j, &aj) in alpha_psi.iter().enumerate() {
-                    if aj != 0.0 {
-                        pert_alpha.scaled_add(aj, &jeffreys.pert_first[j]);
+            for i in 0..psi_dim {
+                // EXPLICIT Firth/Jeffreys ψψ VALUE second derivative (gam#1607):
+                //   objective[i] -= ∂_{ψ_i}∂_{ψ(α)}Φ.
+                // This applies to both design/penalty and family-owned axes.
+                if let Some((z_j, h_joint, pert_first)) = firth_ctx.as_ref() {
+                    let pert_i_alpha = match &hessian[i] {
+                        DriftDerivResult::Dense(m) => m.clone(),
+                        DriftDerivResult::Operator(op) => op.mul_mat(&Array2::<f64>::eye(total)),
+                    };
+                    let mut pert_alpha = Array2::<f64>::zeros((total, total));
+                    for (j, &aj) in alpha_psi.iter().enumerate() {
+                        if aj != 0.0 {
+                            pert_alpha.scaled_add(aj, &pert_first[j]);
+                        }
+                    }
+                    let phi_psi_psi =
+                    gam_solve::estimate::reml::jeffreys_subspace::joint_jeffreys_phi_explicit_param_second_derivative(
+                        h_joint.view(),
+                        z_j.view(),
+                        &pert_first[i],
+                        &pert_alpha,
+                        &pert_i_alpha,
+                    )?;
+                    objective[i] -= phi_psi_psi;
+                    if let Some(curvature) = explicit_curvature.as_ref() {
+                        let (correction, score_correction) = (curvature.psi_pair)(i, alpha_psi, &pert_i_alpha)?;
+                        score.row_mut(i).scaled_add(-1.0, &score_correction);
+                        hessian[i] = match &hessian[i] {
+                            DriftDerivResult::Dense(matrix) => {
+                                DriftDerivResult::Dense(matrix + &correction)
+                            }
+                            DriftDerivResult::Operator(operator) => {
+                                DriftDerivResult::Operator(Arc::new(CompositeHyperOperator {
+                                    dense: Some(correction),
+                                    operators: vec![operator.clone()],
+                                    dim_hint: total,
+                                }))
+                            }
+                        };
                     }
                 }
-                let phi_psi_psi = jeffreys
-                    .weights_for_axis(i)?
-                    .contract(&pert_alpha, &pert_i_alpha)?;
-                objective[i] -= phi_psi_psi;
-            }
 
-            // Family-owned axes have no generic penalty motion. Their complete
-            // V_ij/g_ij/H_ij contribution is already in the workspace result.
-            let Some(axis_i) = axes[i].as_ref() else {
-                continue;
-            };
-            let p_block = axis_i.end - axis_i.start;
-            let beta_block = beta_arc.slice(s![axis_i.start..axis_i.end]).to_owned();
-            // Combined same-block penalty second derivative
-            //   S_{ψi ψ(α)}_local = Σ_{j: block_j == block_i} α_j S_{ψi ψj}_local,
-            // and the combined first-leg penalty derivative
-            //   S_ψ(α)_local = Σ_{j: block_j == block_i} α_j S_ψj_local
-            // (the second leg of the bilinear penalty-logdet cross term).
-            let mut s_psi_psi_alpha = Array2::<f64>::zeros((p_block, p_block));
-            let mut s_psi_alpha = Array2::<f64>::zeros((p_block, p_block));
-            for (j, axis_j) in axes.iter().enumerate() {
-                let Some(axis_j) = axis_j.as_ref() else {
+                // Family-owned axes have no generic penalty motion. Their complete
+                // V_ij/g_ij/H_ij contribution is already in the workspace result.
+                let Some(axis_i) = axes[i].as_ref() else {
                     continue;
                 };
-                let aj = alpha_psi[j];
-                if aj == 0.0 || axis_j.block != axis_i.block {
-                    continue;
+                let p_block = axis_i.end - axis_i.start;
+                let beta_block = beta_arc.slice(s![axis_i.start..axis_i.end]).to_owned();
+                // Combined same-block penalty second derivative
+                //   S_{ψi ψ(α)}_local = Σ_{j: block_j == block_i} α_j S_{ψi ψj}_local,
+                // and the combined first-leg penalty derivative
+                //   S_ψ(α)_local = Σ_{j: block_j == block_i} α_j S_ψj_local
+                // (the second leg of the bilinear penalty-logdet cross term).
+                let mut s_psi_psi_alpha = Array2::<f64>::zeros((p_block, p_block));
+                let mut s_psi_alpha = Array2::<f64>::zeros((p_block, p_block));
+                for (j, axis_j) in axes.iter().enumerate() {
+                    let Some(axis_j) = axis_j.as_ref() else {
+                        continue;
+                    };
+                    let aj = alpha_psi[j];
+                    if aj == 0.0 || axis_j.block != axis_i.block {
+                        continue;
+                    }
+                    let deriv_i =
+                        &hyper_layout.design_derivative_blocks()[axis_i.block][axis_i.local];
+                    let s_ij = assemble_block_local_s_psi_psi(
+                        deriv_i,
+                        axis_j.local,
+                        &per_block_lambdas[axis_i.block],
+                        p_block,
+                    );
+                    s_psi_psi_alpha.scaled_add(aj, &s_ij);
+                    s_psi_alpha.scaled_add(aj, &axis_j.s_psi_local);
                 }
-                let deriv_i = &hyper_layout.design_derivative_blocks()[axis_i.block][axis_i.local];
-                let s_ij = assemble_block_local_s_psi_psi(
-                    deriv_i,
-                    axis_j.local,
-                    &per_block_lambdas[axis_i.block],
-                    p_block,
-                );
-                s_psi_psi_alpha.scaled_add(aj, &s_ij);
-                s_psi_alpha.scaled_add(aj, &axis_j.s_psi_local);
+
+                // objective += 0.5 βᵀ S_{ψi ψ(α)} β  (matches ext_ext `a`).
+                let s_beta = s_psi_psi_alpha.dot(&beta_block);
+                objective[i] += 0.5 * beta_block.dot(&s_beta);
+                // score[i] (block-local slice) += S_{ψi ψ(α)} β  (matches ext_ext `g`).
+                {
+                    let mut score_local = score.row_mut(i);
+                    let mut slot = score_local.slice_mut(s![axis_i.start..axis_i.end]);
+                    slot += &s_beta;
+                }
+                // hessian[i] += S_{ψi ψ(α)} as a block-local drift (matches the
+                // ext_ext `b_operator` BlockLocalDrift composite).
+                let block_drift: Arc<dyn HyperOperator> = Arc::new(BlockLocalDrift {
+                    local: s_psi_psi_alpha.clone(),
+                    start: axis_i.start,
+                    end: axis_i.end,
+                    total_dim: total,
+                });
+                let combined = match std::mem::replace(
+                    &mut hessian[i],
+                    DriftDerivResult::Operator(Arc::clone(&block_drift)),
+                ) {
+                    DriftDerivResult::Operator(existing) => {
+                        DriftDerivResult::Operator(Arc::new(CompositeHyperOperator {
+                            dense: None,
+                            operators: vec![existing, block_drift],
+                            dim_hint: total,
+                        }))
+                    }
+                    DriftDerivResult::Dense(dense) => {
+                        DriftDerivResult::Operator(Arc::new(CompositeHyperOperator {
+                            dense: Some(dense),
+                            operators: vec![block_drift],
+                            dim_hint: total,
+                        }))
+                    }
+                };
+                hessian[i] = combined;
+
+                // ld_s[i] += Σ_j α_j tau_hessian_component(S_ψi, S_ψj, S_{ψiψj})
+                //         = tau_hessian_component(S_ψi, S_ψ(α), S_{ψi ψ(α)})
+                // by the (linearity in the second leg + bilinearity of the cross)
+                // of the τ-Hessian; matches the ext_ext `ld_s` contraction.
+                if let Some(ref logdet_blocks) = *s_logdet_block_cache {
+                    let pld = &logdet_blocks[axis_i.block];
+                    ld_s[i] = pld.tau_hessian_component(
+                        &axis_i.s_psi_local,
+                        &s_psi_alpha,
+                        Some(&s_psi_psi_alpha),
+                    );
+                }
             }
 
-            // objective += 0.5 βᵀ S_{ψi ψ(α)} β  (matches ext_ext `a`).
-            let s_beta = s_psi_psi_alpha.dot(&beta_block);
-            objective[i] += 0.5 * beta_block.dot(&s_beta);
-            // score[i] (block-local slice) += S_{ψi ψ(α)} β  (matches ext_ext `g`).
-            {
-                let mut score_local = score.row_mut(i);
-                let mut slot = score_local.slice_mut(s![axis_i.start..axis_i.end]);
-                slot += &s_beta;
-            }
-            // hessian[i] += S_{ψi ψ(α)} as a block-local drift (matches the
-            // ext_ext `b_operator` BlockLocalDrift composite).
-            let block_drift: Arc<dyn HyperOperator> = Arc::new(BlockLocalDrift {
-                local: s_psi_psi_alpha.clone(),
-                start: axis_i.start,
-                end: axis_i.end,
-                total_dim: total,
-            });
-            let combined = match std::mem::replace(
-                &mut hessian[i],
-                DriftDerivResult::Operator(Arc::clone(&block_drift)),
-            ) {
-                DriftDerivResult::Operator(existing) => {
-                    DriftDerivResult::Operator(Arc::new(CompositeHyperOperator {
-                        dense: None,
-                        operators: vec![existing, block_drift],
-                        dim_hint: total,
-                    }))
-                }
-                DriftDerivResult::Dense(dense) => {
-                    DriftDerivResult::Operator(Arc::new(CompositeHyperOperator {
-                        dense: Some(dense),
-                        operators: vec![block_drift],
-                        dim_hint: total,
-                    }))
-                }
-            };
-            hessian[i] = combined;
-
-            // ld_s[i] += Σ_j α_j tau_hessian_component(S_ψi, S_ψj, S_{ψiψj})
-            //         = tau_hessian_component(S_ψi, S_ψ(α), S_{ψi ψ(α)})
-            // by the (linearity in the second leg + bilinearity of the cross)
-            // of the τ-Hessian; matches the ext_ext `ld_s` contraction.
-            if let Some(ref logdet_blocks) = *s_logdet_block_cache {
-                let pld = &logdet_blocks[axis_i.block];
-                ld_s[i] = pld.tau_hessian_component(
-                    &axis_i.s_psi_local,
-                    &s_psi_alpha,
-                    Some(&s_psi_psi_alpha),
-                );
-            }
-        }
-
-        Ok(Some(ContractedPsiSecondOrder {
-            objective,
-            score,
-            hessian,
-            ld_s,
-        }))
-    };
+            Ok(Some(ContractedPsiSecondOrder {
+                objective,
+                score,
+                hessian,
+                ld_s,
+            }))
+        };
 
     // Display boundary (gam#2689): `ContractedPsiSecondOrderFn` is a gam-problem
     // alias over `Result<_, String>`, so the hook stays typed throughout and is
     // rendered exactly here, once, instead of at every `?` inside it.
-    Ok(Some(Arc::new(move |alpha_psi: &[f64]| {
-        hook(alpha_psi).map_err(|error| error.to_string())
-    }) as ContractedPsiSecondOrderFn))
+    Ok(Some(
+        Arc::new(move |alpha_psi: &[f64]| hook(alpha_psi).map_err(|error| error.to_string()))
+            as ContractedPsiSecondOrderFn,
+    ))
 }
 
 /// Build pair callbacks for ψ-ψ and ρ-ψ Hessian entries.
@@ -1107,6 +1270,7 @@ pub fn build_psi_pair_callbacks<F: CustomFamily + Clone + Send + Sync + 'static>
     s_logdet_blocks: Option<&[PenaltyPseudologdet]>,
     psi_workspace: Option<Arc<dyn ExactNewtonJointPsiWorkspace>>,
     jeffreys_ctx: Option<(Array2<f64>, Array2<f64>)>,
+    explicit_curvature: Option<Arc<ExplicitJeffreysCurvatureDrifts>>,
 ) -> Result<
     (
         Box<dyn Fn(usize, usize) -> Result<HyperCoordPair, CustomFamilyError> + Send + Sync>,
@@ -1121,10 +1285,10 @@ pub fn build_psi_pair_callbacks<F: CustomFamily + Clone + Send + Sync + 'static>
         &Array1::from_vec(rho.to_vec()),
         penalty_counts,
     )?);
-    let per_block_lambdas = Arc::new(
-        exact_lambdas_by_block(&per_block, "psi-pair callback log strength")
-            ?,
-    );
+    let per_block_lambdas = Arc::new(exact_lambdas_by_block(
+        &per_block,
+        "psi-pair callback log strength",
+    )?);
     let specs_arc = Arc::new(specs.to_vec());
     let beta_arc = Arc::new(beta_flat.clone());
     let synced_arc = Arc::new(synced_states.to_vec());
@@ -1193,7 +1357,7 @@ pub fn build_psi_pair_callbacks<F: CustomFamily + Clone + Send + Sync + 'static>
     // `build_psi_hyper_coords` use. `None` (no Jeffreys term, or a first-order axis
     // term that can't be materialized total×total — matching the gradient term's own
     // availability gate) leaves a clean / well-conditioned fit byte-unchanged.
-    let firth_pair_ctx: Option<Arc<JeffreysPsiWeightCache>> =
+    let firth_pair_ctx: Option<(Arc<Array2<f64>>, Arc<Array2<f64>>, Arc<Vec<Array2<f64>>>)> =
         match jeffreys_ctx {
             Some((z_j, h_joint))
                 if z_j.nrows() == total && h_joint.nrows() == total && h_joint.ncols() == total =>
@@ -1258,9 +1422,7 @@ pub fn build_psi_pair_callbacks<F: CustomFamily + Clone + Send + Sync + 'static>
                     }
                 }
                 if ok {
-                    Some(Arc::new(JeffreysPsiWeightCache::new(
-                        &z_j, &h_joint, pert_first,
-                    )?))
+                    Some((Arc::new(z_j), Arc::new(h_joint), Arc::new(pert_first)))
                 } else {
                     None
                 }
@@ -1290,7 +1452,11 @@ pub fn build_psi_pair_callbacks<F: CustomFamily + Clone + Send + Sync + 'static>
             rho_penalty_cache_bytes,
             "custom_family::psi_hyper::rho_penalty_cache",
         )
-        .map_err(|err| CustomFamilyError::trial_point(format!("rho-penalty dense cache refused by memory governor: {err}")))?;
+        .map_err(|err| {
+            CustomFamilyError::trial_point(format!(
+                "rho-penalty dense cache refused by memory governor: {err}"
+            ))
+        })?;
     let mut rho_penalty_cache: Vec<RhoPenaltyCacheEntry> = Vec::new();
     for (block_idx, &count) in penalty_counts.iter().enumerate() {
         let (start, end) = ranges_arc[block_idx];
@@ -1440,9 +1606,9 @@ pub fn build_psi_pair_callbacks<F: CustomFamily + Clone + Send + Sync + 'static>
                 // `0.0` when the conditioning gate skips the term, so a clean fit is
                 // byte-unchanged. Invalid shape/eigensystem evidence propagates through
                 // the pair callback together with workspace failures.
-                if let Some(jeffreys) = firth_pair_ctx.as_ref()
-                    && psi_i < jeffreys.axes()
-                    && psi_j < jeffreys.axes()
+                if let Some((z_j, h_joint, pert_first)) = firth_pair_ctx.as_ref()
+                    && psi_i < pert_first.len()
+                    && psi_j < pert_first.len()
                 {
                     let pert_ij_opt: Option<Array2<f64>> =
                         if b_mat.nrows() == total && b_mat.ncols() == total {
@@ -1453,19 +1619,35 @@ pub fn build_psi_pair_callbacks<F: CustomFamily + Clone + Send + Sync + 'static>
                                 .map(|op| op.mul_mat(&Array2::<f64>::eye(total)))
                         };
                     if let Some(pert_ij) = pert_ij_opt {
-                        let phi_psi_psi = jeffreys
-                            .weights_for_axis(psi_i)
-                            .and_then(|weights| {
-                                weights
-                                    .contract(&jeffreys.pert_first[psi_j], &pert_ij)
-                                    .map_err(CustomFamilyError::from)
-                            })
-                            .map_err(|error| {
-                                format!(
-                                    "typed hyper pair ({psi_i}, {psi_j}) Jeffreys second derivative failed: {error}"
-                                )
-                            })?;
+                        let phi_psi_psi =
+                        gam_solve::estimate::reml::jeffreys_subspace::joint_jeffreys_phi_explicit_param_second_derivative(
+                            h_joint.view(),
+                            z_j.view(),
+                            &pert_first[psi_i],
+                            &pert_first[psi_j],
+                            &pert_ij,
+                        )
+                        .map_err(|error| {
+                            format!(
+                                "typed hyper pair ({psi_i}, {psi_j}) Jeffreys second derivative failed: {error}"
+                            )
+                        })?;
                         a -= phi_psi_psi;
+                        if let Some(curvature) = explicit_curvature.as_ref() {
+                            let mut alpha = vec![0.0; hyper_layout.len()];
+                            alpha[psi_j] = 1.0;
+                            let (correction, score_correction) = (curvature.psi_pair)(psi_i, &alpha, &pert_ij)?;
+                            g -= &score_correction;
+                            if b_mat.dim() == (total, total) {
+                                b_mat += &correction;
+                            } else {
+                                b_operator = Some(Arc::new(CompositeHyperOperator {
+                                    dense: Some(correction),
+                                    operators: b_operator.into_iter().collect(),
+                                    dim_hint: total,
+                                }));
+                            }
+                        }
                     }
                 }
 
@@ -1555,7 +1737,8 @@ pub fn build_psi_pair_callbacks<F: CustomFamily + Clone + Send + Sync + 'static>
                     ld_s,
                 })
             },
-        ) as Box<dyn Fn(usize, usize) -> Result<HyperCoordPair, CustomFamilyError> + Send + Sync>
+        )
+            as Box<dyn Fn(usize, usize) -> Result<HyperCoordPair, CustomFamilyError> + Send + Sync>
     };
 
     // ρ-ψ pair callback
@@ -1671,7 +1854,8 @@ pub fn build_psi_pair_callbacks<F: CustomFamily + Clone + Send + Sync + 'static>
                     ld_s,
                 })
             },
-        ) as Box<dyn Fn(usize, usize) -> Result<HyperCoordPair, CustomFamilyError> + Send + Sync>
+        )
+            as Box<dyn Fn(usize, usize) -> Result<HyperCoordPair, CustomFamilyError> + Send + Sync>
     };
 
     Ok((ext_ext, rho_ext))
@@ -1703,6 +1887,7 @@ pub fn build_psi_drift_deriv_callback<F: CustomFamily + Clone + Send + Sync + 's
     hyper_layout: SharedCustomFamilyHyperLayout,
     hessian_beta_independent: bool,
     psi_workspace: Option<Arc<dyn ExactNewtonJointPsiWorkspace>>,
+    explicit_curvature: Option<Arc<ExplicitJeffreysCurvatureDrifts>>,
 ) -> Result<Option<FixedDriftDerivFn>, CustomFamilyError> {
     if hessian_beta_independent {
         // Likelihood Hessian is β-independent; M_i ≡ 0.
@@ -1723,28 +1908,45 @@ pub fn build_psi_drift_deriv_callback<F: CustomFamily + Clone + Send + Sync + 's
     let typed_drift = move |ext_idx: usize,
                             direction: &Array1<f64>|
           -> Result<Option<DriftDerivResult>, CustomFamilyError> {
-            // The family hook takes a psi index (0-based within ψ coordinates)
-            // and a flattened coefficient direction.
-            let result = if let Some(workspace) = psi_workspace.as_ref() {
-                workspace.hessian_directional_derivative(ext_idx, direction)
-            } else {
-                family_arc
-                    .exact_newton_joint_psihessian_directional_derivative(
-                        &synced_arc,
-                        &specs_arc,
-                        &hyper_layout,
-                        ext_idx,
-                        direction,
-                    )
-                    .map(|drift| drift.map(DriftDerivResult::Dense))
-            };
-            match result? {
-                Some(drift) => Ok(Some(drift)),
-                None if hyper_layout.family_axis(ext_idx).is_some() => Err(CustomFamilyError::trial_point(format!(
-                    "family-owned hyper axis {ext_idx} has no exact D_beta H_i[u] term for the requested direction"
-                ))),
-                None => Ok(None),
+        // The family hook takes a psi index (0-based within ψ coordinates)
+        // and a flattened coefficient direction.
+        let result = if let Some(workspace) = psi_workspace.as_ref() {
+            workspace.hessian_directional_derivative(ext_idx, direction)
+        } else {
+            family_arc
+                .exact_newton_joint_psihessian_directional_derivative(
+                    &synced_arc,
+                    &specs_arc,
+                    &hyper_layout,
+                    ext_idx,
+                    direction,
+                )
+                .map(|drift| drift.map(DriftDerivResult::Dense))
+        };
+        let correction = explicit_curvature
+            .as_ref()
+            .map(|curvature| (curvature.beta_psi)(ext_idx, direction))
+            .transpose()?;
+        match (result?, correction) {
+            (Some(DriftDerivResult::Dense(matrix)), Some(correction)) => {
+                Ok(Some(DriftDerivResult::Dense(matrix + correction)))
             }
+            (Some(DriftDerivResult::Operator(operator)), Some(correction)) => Ok(Some(
+                DriftDerivResult::Operator(Arc::new(CompositeHyperOperator {
+                    dim_hint: correction.nrows(),
+                    dense: Some(correction),
+                    operators: vec![operator],
+                })),
+            )),
+            (None, Some(correction)) => Ok(Some(DriftDerivResult::Dense(correction))),
+            (Some(drift), None) => Ok(Some(drift)),
+            (None, None) if hyper_layout.family_axis(ext_idx).is_some() => {
+                Err(CustomFamilyError::trial_point(format!(
+                    "family-owned hyper axis {ext_idx} has no exact D_beta H_i[u] term for the requested direction"
+                )))
+            }
+            (None, None) => Ok(None),
+        }
     };
     // Display boundary (gam#2689): `FixedDriftDerivFn` is a gam-problem alias
     // over `Result<_, String>`; the drift closure stays typed and is rendered
@@ -2057,7 +2259,8 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
         // differentiate the same log|S|_+ objective.
         let s_logdet_blocks = if include_logdet_s {
             use rayon::iter::{IntoParallelIterator, ParallelIterator};
-            let block_results: Vec<Result<PenaltyPseudologdet, CustomFamilyError>> = (0..specs.len())
+            let block_results: Vec<Result<PenaltyPseudologdet, CustomFamilyError>> = (0..specs
+                .len())
                 .into_par_iter()
                 .map(|b| {
                     let spec = &specs[b];
@@ -2167,7 +2370,9 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
                     batched_gradient_override = Some(gradient);
                 } else {
                     let no_dh =
-                        |_: &Array1<f64>| -> Result<Option<DriftDerivResult>, CustomFamilyError> { Ok(None) };
+                        |_: &Array1<f64>| -> Result<Option<DriftDerivResult>, CustomFamilyError> {
+                            Ok(None)
+                        };
                     let no_d2h = |_: &Array1<f64>,
                                   _: &Array1<f64>|
                      -> Result<Option<DriftDerivResult>, CustomFamilyError> {
@@ -2263,7 +2468,7 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
                 psi_workspace.clone(),
             )?;
 
-            let (ext_ext_fn, rho_ext_fn, drift_fn, contracted_psi_fn) =
+            let (ext_ext_fn, rho_ext_fn, drift_fn, contracted_psi_fn, completion_psi) =
                 if eval_mode == EvalMode::ValueGradientHessian {
                     // EXPLICIT Firth/Jeffreys ψψ VALUE second-derivative context
                     // (gam#1607). Built ONCE and shared by BOTH the per-pair
@@ -2293,6 +2498,14 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
                     } else {
                         None
                     };
+                    let explicit_curvature = prepare_explicit_jeffreys_curvature_drifts(
+                        family,
+                        synced_joint_states.as_ref(),
+                        specs,
+                        Arc::clone(&hyper_layout),
+                        psi_workspace.clone(),
+                        jeffreys_ctx.as_ref(),
+                    )?;
                     let (ext_ext_fn, rho_ext_fn) = build_psi_pair_callbacks(
                         family,
                         synced_joint_states.as_ref(),
@@ -2304,6 +2517,7 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
                         s_logdet_blocks.as_deref(),
                         psi_workspace.clone(),
                         jeffreys_ctx.clone(),
+                        explicit_curvature.clone(),
                     )?;
                     // #740: build the direction-contracted ψψ hook from the same psi
                     // workspace + penalty data the per-pair `ext_ext_fn` uses, so the
@@ -2321,7 +2535,9 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
                         s_logdet_blocks.as_deref(),
                         psi_workspace.clone(),
                         jeffreys_ctx,
+                        explicit_curvature.clone(),
                     )?;
+                    let completion_psi = explicit_curvature.as_ref().map(|c| Arc::clone(&c.completion_psi));
                     let drift_fn = build_psi_drift_deriv_callback(
                         family,
                         synced_joint_states.as_ref(),
@@ -2329,18 +2545,21 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
                         Arc::clone(&hyper_layout),
                         hessian_beta_independent,
                         psi_workspace,
+                        explicit_curvature,
                     )?;
                     (
                         Some(ext_ext_fn),
                         Some(rho_ext_fn),
                         drift_fn,
                         contracted_psi_fn,
+                        completion_psi,
                     )
                 } else {
-                    (None, None, None, None)
+                    (None, None, None, None, None)
                 };
 
             Some(ExtCoordBundle {
+                completion_psi,
                 coords: psi_coords,
                 ext_ext_fn,
                 rho_ext_fn,
@@ -2830,75 +3049,80 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
     let beta_flat = inner.block_states[b].beta.clone();
 
     // Build a derivative provider that computes D_β H_L[direction] on demand.
-    let compute_dh = |direction: &Array1<f64>| -> Result<Option<DriftDerivResult>, CustomFamilyError> {
-        if !include_logdet_h {
-            return Ok(None);
-        }
-        match work {
-            BlockWorkingSet::ExactNewton { .. } => {
-                match family.exact_newton_hessian_directional_derivative(
-                    &inner.block_states,
-                    b,
-                    direction,
-                )? {
-                    Some(h_exact) => Ok(Some(DriftDerivResult::Dense(symmetrized_square_matrix(
-                        h_exact,
-                        p,
-                        &format!("block {b} exact-newton dH shape mismatch"),
-                    )?))),
-                    None => Err(CustomFamilyError::UnsupportedConfiguration { reason: format!(
-                        "missing exact-newton dH callback for block {b} while REML gradient requires H_beta term"
-                    ) }),
-                }
+    let compute_dh =
+        |direction: &Array1<f64>| -> Result<Option<DriftDerivResult>, CustomFamilyError> {
+            if !include_logdet_h {
+                return Ok(None);
             }
-            BlockWorkingSet::Diagonal {
-                working_response: _,
-                working_weights,
-            }
-            | BlockWorkingSet::NaturalDiagonal {
-                observed_curvature: working_weights,
-                ..
-            } => {
-                let x_dyn = diagonal_design.as_ref().ok_or_else(|| {
-                    format!("missing dynamic design for block {b} diagonal correction")
-                })?;
-                let wwork = certify_finite_working_weights(working_weights)?;
-                let x_dense = x_dyn.to_dense();
-                let n = x_dense.nrows();
-
-                let mut d_eta = x_dyn.matrixvectormultiply(direction);
-                let geom = family.block_geometry_directional_derivative(
-                    &inner.block_states,
-                    b,
-                    spec,
-                    direction,
-                )?;
-                let mut correction_mat = Array2::<f64>::zeros((p, p));
-
-                if let Some(geom_dir) = geom {
-                    d_eta += &geom_dir.d_offset;
-                    if let Some(dx) = geom_dir.d_design {
-                        d_eta += &dx.dot(&beta_flat);
-                        let mut wx = x_dense.clone();
-                        let mut wdx = dx.clone();
-                        ndarray::Zip::from(wx.rows_mut())
-                            .and(wdx.rows_mut())
-                            .and(wwork.view())
-                            .par_for_each(|mut wxr, mut wdxr, &wi| {
-                                if wi != 1.0 {
-                                    wxr.mapv_inplace(|v| v * wi);
-                                    wdxr.mapv_inplace(|v| v * wi);
-                                }
-                            });
-                        // Same X'(W·Y) pattern as the parallel sibling at
-                        // line ~9258; route through faer for SIMD GEMM
-                        // (n × p² flops at large-scale moderate scale).
-                        correction_mat += &fast_atb(&dx, &wx);
-                        correction_mat += &fast_atb(&x_dense, &wdx);
+            match work {
+                BlockWorkingSet::ExactNewton { .. } => {
+                    match family.exact_newton_hessian_directional_derivative(
+                        &inner.block_states,
+                        b,
+                        direction,
+                    )? {
+                        Some(h_exact) => {
+                            Ok(Some(DriftDerivResult::Dense(symmetrized_square_matrix(
+                                h_exact,
+                                p,
+                                &format!("block {b} exact-newton dH shape mismatch"),
+                            )?)))
+                        }
+                        None => Err(CustomFamilyError::UnsupportedConfiguration {
+                            reason: format!(
+                                "missing exact-newton dH callback for block {b} while REML gradient requires H_beta term"
+                            ),
+                        }),
                     }
                 }
+                BlockWorkingSet::Diagonal {
+                    working_response: _,
+                    working_weights,
+                }
+                | BlockWorkingSet::NaturalDiagonal {
+                    observed_curvature: working_weights,
+                    ..
+                } => {
+                    let x_dyn = diagonal_design.as_ref().ok_or_else(|| {
+                        format!("missing dynamic design for block {b} diagonal correction")
+                    })?;
+                    let wwork = certify_finite_working_weights(working_weights)?;
+                    let x_dense = x_dyn.to_dense();
+                    let n = x_dense.nrows();
 
-                let dw = family
+                    let mut d_eta = x_dyn.matrixvectormultiply(direction);
+                    let geom = family.block_geometry_directional_derivative(
+                        &inner.block_states,
+                        b,
+                        spec,
+                        direction,
+                    )?;
+                    let mut correction_mat = Array2::<f64>::zeros((p, p));
+
+                    if let Some(geom_dir) = geom {
+                        d_eta += &geom_dir.d_offset;
+                        if let Some(dx) = geom_dir.d_design {
+                            d_eta += &dx.dot(&beta_flat);
+                            let mut wx = x_dense.clone();
+                            let mut wdx = dx.clone();
+                            ndarray::Zip::from(wx.rows_mut())
+                                .and(wdx.rows_mut())
+                                .and(wwork.view())
+                                .par_for_each(|mut wxr, mut wdxr, &wi| {
+                                    if wi != 1.0 {
+                                        wxr.mapv_inplace(|v| v * wi);
+                                        wdxr.mapv_inplace(|v| v * wi);
+                                    }
+                                });
+                            // Same X'(W·Y) pattern as the parallel sibling at
+                            // line ~9258; route through faer for SIMD GEMM
+                            // (n × p² flops at large-scale moderate scale).
+                            correction_mat += &fast_atb(&dx, &wx);
+                            correction_mat += &fast_atb(&x_dense, &wdx);
+                        }
+                    }
+
+                    let dw = family
                     .diagonalworking_weights_directional_derivative(
                         &inner.block_states,
                         b,
@@ -2909,27 +3133,27 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
                             "missing diagonal dW callback for block {b} while REML gradient requires H_beta term"
                         )
                     })?;
-                if dw.len() != n {
-                    return Err(CustomFamilyError::DimensionMismatch {
-                        reason: format!(
-                            "block {b} diagonal dW length mismatch: got {}, expected {}",
-                            dw.len(),
-                            n
-                        ),
-                    });
-                }
-                let mut scaled_x = x_dense.clone();
-                ndarray::Zip::from(scaled_x.rows_mut())
-                    .and(&dw)
-                    .par_for_each(|mut sr, &dwi| sr.mapv_inplace(|v| v * dwi));
-                // X'(diag(dW)·X) outer correction term — faer route, same
-                // rationale as above.
-                correction_mat += &fast_atb(&x_dense, &scaled_x);
+                    if dw.len() != n {
+                        return Err(CustomFamilyError::DimensionMismatch {
+                            reason: format!(
+                                "block {b} diagonal dW length mismatch: got {}, expected {}",
+                                dw.len(),
+                                n
+                            ),
+                        });
+                    }
+                    let mut scaled_x = x_dense.clone();
+                    ndarray::Zip::from(scaled_x.rows_mut())
+                        .and(&dw)
+                        .par_for_each(|mut sr, &dwi| sr.mapv_inplace(|v| v * dwi));
+                    // X'(diag(dW)·X) outer correction term — faer route, same
+                    // rationale as above.
+                    correction_mat += &fast_atb(&x_dense, &scaled_x);
 
-                Ok(Some(DriftDerivResult::Dense(correction_mat)))
+                    Ok(Some(DriftDerivResult::Dense(correction_mat)))
+                }
             }
-        }
-    };
+        };
 
     // Build a derivative provider that computes D²_β H_L[u, v] on demand.
     let compute_d2h = |u: &Array1<f64>,
@@ -2951,9 +3175,11 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
                         p,
                         &format!("block {b} exact-newton d2H shape mismatch"),
                     )?))),
-                    None => Err(CustomFamilyError::UnsupportedConfiguration { reason: format!(
-                        "missing exact-newton d2H callback for block {b} while REML Hessian requires H_beta_beta term"
-                    ) }),
+                    None => Err(CustomFamilyError::UnsupportedConfiguration {
+                        reason: format!(
+                            "missing exact-newton d2H callback for block {b} while REML Hessian requires H_beta_beta term"
+                        ),
+                    }),
                 }
             }
             BlockWorkingSet::Diagonal {
@@ -2967,21 +3193,22 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
                 let x_dense = x_dyn.to_dense();
                 let n = x_dense.nrows();
 
-                let reject_second_order_geometry = |label: &str,
-                                                    geom: Option<
-                    BlockGeometryDirectionalDerivative,
-                >|
-                 -> Result<(), CustomFamilyError> {
-                    if let Some(geom_dir) = geom {
-                        let has_offset = geom_dir.d_offset.iter().any(|value| *value != 0.0);
-                        if geom_dir.d_design.is_some() || has_offset {
-                            return Err(CustomFamilyError::UnsupportedConfiguration { reason: format!(
-                                "block {b} diagonal d2H requires second-order block-geometry derivatives for {label}; use an exact-newton or joint outer path"
-                            ) });
+                let reject_second_order_geometry =
+                    |label: &str,
+                     geom: Option<BlockGeometryDirectionalDerivative>|
+                     -> Result<(), CustomFamilyError> {
+                        if let Some(geom_dir) = geom {
+                            let has_offset = geom_dir.d_offset.iter().any(|value| *value != 0.0);
+                            if geom_dir.d_design.is_some() || has_offset {
+                                return Err(CustomFamilyError::UnsupportedConfiguration {
+                                    reason: format!(
+                                        "block {b} diagonal d2H requires second-order block-geometry derivatives for {label}; use an exact-newton or joint outer path"
+                                    ),
+                                });
+                            }
                         }
-                    }
-                    Ok(())
-                };
+                        Ok(())
+                    };
                 reject_second_order_geometry(
                     "first direction",
                     family.block_geometry_directional_derivative(
@@ -3140,7 +3367,6 @@ pub fn evaluate_custom_family_joint_hyper_owned<F: CustomFamily + Clone + Send +
     Ok(outer_eval_result_into_joint_hyper_owned_result(eval_result))
 }
 
-
 pub struct CustomFamilyJointHyperModeSelection {
     pub result: CustomFamilyJointHyperResult,
     pub selected_candidate: usize,
@@ -3185,53 +3411,6 @@ fn canonicalize_screened_objective(
     Ok(screened)
 }
 
-/// The verdict a mode profile reports when no coefficient-mode candidate
-/// survived screening.
-///
-/// It used to be [`CustomFamilyError::UnsupportedConfiguration`] unconditionally,
-/// with every candidate's typed error already rendered to prose. That is the
-/// discard [`CustomFamilyError::into_trial_point`] and the [`From<String>`]
-/// impl next to it both document: `UnsupportedConfiguration` is what
-/// `is_trial_point_infeasible()` answers `false` for, so a profile whose
-/// candidates all said "this theta is infeasible" told the outer search the
-/// PROBLEM was unsupported. The seed loop then had nothing recoverable to
-/// step to and the fit aborted.
-///
-/// Measured on gam#979's large-scale CTN preprocessor: 25 minutes in, with a
-/// certified incumbent already recorded (`best=5.3059e5`), the only candidate
-/// refused with `h' has non-positive values` — a monotonicity refusal at one
-/// trial β, true or false by moving theta — and the whole fit died. The same
-/// mistake is recorded twice before, at #2553 and #2590; this is the third.
-///
-/// So the aggregate carries the aggregate of the verdicts: rho-local only if
-/// EVERY rejection was rho-local. One structural failure among them keeps the
-/// whole profile structural, because a configuration error does not become
-/// true or false by moving theta and must not be retried at every seed.
-fn mode_profile_exhausted_error(
-    rejected_candidates: &[Option<String>],
-    rejection_is_rho_local: &[bool],
-) -> CustomFamilyError {
-    let reasons = rejected_candidates
-        .iter()
-        .enumerate()
-        .map(|(idx, reason)| {
-            format!(
-                "candidate {idx}: {}",
-                reason.as_deref().unwrap_or("no finite converged result")
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("; ");
-    let reason = format!(
-        "no coefficient-mode candidate produced a finite converged profile objective: {reasons}"
-    );
-    if rejection_is_rho_local.iter().all(|rho_local| *rho_local) {
-        CustomFamilyError::trial_point(reason)
-    } else {
-        CustomFamilyError::UnsupportedConfiguration { reason }
-    }
-}
-
 /// Profile a nonconvex coefficient mode without assembling expensive outer
 /// derivatives for every candidate.
 ///
@@ -3262,11 +3441,6 @@ pub fn evaluate_custom_family_joint_hyper_best_mode_shared<
 
     let mut screened_objectives = vec![None; candidates.len()];
     let mut rejected_candidates = vec![None; candidates.len()];
-    // Whether each candidate's rejection is a property of THIS theta. The two
-    // in-loop rejections below (non-convergence, non-finite objective) are
-    // rho-local by construction, so the default is `true` and only a typed
-    // evaluator error can lower it.
-    let mut rejection_is_rho_local = vec![true; candidates.len()];
     let mut screened_results: Vec<Option<OuterObjectiveEvalResult>> =
         (0..candidates.len()).map(|_| None).collect();
     let penalty_counts = validate_blockspecs(specs)?;
@@ -3294,24 +3468,16 @@ pub fn evaluate_custom_family_joint_hyper_best_mode_shared<
         ) {
             Ok(candidate) => candidate,
             Err(error) => {
-                // Keep the producer's verdict, not just its prose. Rendering
-                // the error to `String` here is exactly the discard
-                // `CustomFamilyError::into_trial_point` documents, and the
-                // aggregate below is the only thing the outer search sees.
-                rejection_is_rho_local[candidate_idx] = error.is_trial_point_infeasible();
                 rejected_candidates[candidate_idx] = Some(format!("evaluator error: {error}"));
                 continue;
             }
         };
         if !candidate.inner_converged {
-            // Rho-local by the same rule `InnerSolveNotConverged` is: the
-            // inner solve missed its condition at THIS theta.
             rejected_candidates[candidate_idx] =
                 Some("inner coefficient solve did not converge".to_string());
             continue;
         }
         if !candidate.objective.is_finite() {
-            // Likewise: the profiled objective becomes finite by moving theta.
             rejected_candidates[candidate_idx] =
                 Some("profile objective was non-finite".to_string());
             continue;
@@ -3334,10 +3500,22 @@ pub fn evaluate_custom_family_joint_hyper_best_mode_shared<
             .then_with(|| left.cmp(right))
     });
     if ranked_candidates.is_empty() {
-        return Err(mode_profile_exhausted_error(
-            &rejected_candidates,
-            &rejection_is_rho_local,
-        ));
+        let reasons = rejected_candidates
+            .iter()
+            .enumerate()
+            .map(|(idx, reason)| {
+                format!(
+                    "candidate {idx}: {}",
+                    reason.as_deref().unwrap_or("no finite converged result")
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("; ");
+        return Err(CustomFamilyError::UnsupportedConfiguration {
+            reason: format!(
+                "no coefficient-mode candidate produced a finite converged profile objective: {reasons}"
+            ),
+        });
     }
 
     if matches!(eval_mode, EvalMode::ValueOnly) {
@@ -3403,7 +3581,6 @@ pub fn evaluate_custom_family_joint_hyper_best_mode_shared<
         mode: owned.mode,
     })
 }
-
 
 /// Upgrade a value-only coefficient-mode selection at the identical hyperpoint
 /// into its requested analytic derivative payload without re-entering the
@@ -3488,9 +3665,7 @@ pub fn upgrade_custom_family_joint_hyper_mode_shared<
         Some(selected_inner),
     )
     .map_err(|error| CustomFamilyError::UnsupportedConfiguration {
-        reason: format!(
-            "owned coefficient mode failed requested derivative assembly: {error}"
-        ),
+        reason: format!("owned coefficient mode failed requested derivative assembly: {error}"),
     })?;
     let derivative_objective = derivative_eval.objective;
     derivative_eval.objective = canonicalize_screened_objective(
@@ -3498,8 +3673,7 @@ pub fn upgrade_custom_family_joint_hyper_mode_shared<
         derivative_objective,
         selected_candidate,
     )?;
-    derivative_eval.criterion_components[0] +=
-        derivative_eval.objective - derivative_objective;
+    derivative_eval.criterion_components[0] += derivative_eval.objective - derivative_objective;
     validate_requested_best_mode_derivatives(
         &derivative_eval,
         eval_mode,
@@ -3898,6 +4072,7 @@ pub(crate) fn evaluate_custom_family_joint_hyper_efs_internal_shared<
         psi_workspace.clone(),
     )?;
     let ext_bundle = ExtCoordBundle {
+        completion_psi: None,
         coords: psi_coords,
         ext_ext_fn: None,
         rho_ext_fn: None,
@@ -4129,70 +4304,4 @@ pub fn evaluate_custom_family_joint_hyper_efs_owned_shared<
         ),
         mode,
     })
-}
-
-#[cfg(test)]
-mod mode_profile_exhausted_verdict_tests {
-    use super::mode_profile_exhausted_error;
-    use gam_problem::CustomFamilyError;
-
-    /// gam#979. The aggregate of "this theta is infeasible" is "this theta is
-    /// infeasible". `UnsupportedConfiguration` is the variant
-    /// `is_trial_point_infeasible()` answers `false` for, so reporting it here
-    /// tells the seed loop the PROBLEM is unsupported and it aborts the fit —
-    /// which is what killed the large-scale CTN preprocessor 25 minutes in,
-    /// with a certified incumbent already in hand, on a single candidate's
-    /// monotonicity refusal.
-    #[test]
-    fn every_rejection_rho_local_makes_the_profile_rho_local_979() {
-        let rejected = vec![
-            Some("evaluator error: inner solve refused this trial point: h' <= 0".to_string()),
-            Some("inner coefficient solve did not converge".to_string()),
-        ];
-        let error = mode_profile_exhausted_error(&rejected, &[true, true]);
-        assert!(
-            error.is_trial_point_infeasible(),
-            "a profile whose candidates all refused THIS theta must let the outer \
-             search step away, not abort the fit: {error}"
-        );
-        // The reasons still reach the message; the verdict is what changed.
-        let rendered = error.to_string();
-        assert!(rendered.contains("candidate 0"), "{rendered}");
-        assert!(rendered.contains("candidate 1"), "{rendered}");
-        assert!(rendered.contains("h' <= 0"), "{rendered}");
-    }
-
-    /// The mirror, and the reason this is not simply "always rho-local": a
-    /// structural failure does not become true or false by moving theta, so
-    /// one of them among the candidates keeps the whole profile structural and
-    /// the seed loop stops instead of retrying it at every seed.
-    #[test]
-    fn one_structural_rejection_keeps_the_profile_structural_979() {
-        let rejected = vec![
-            Some("evaluator error: inner solve refused this trial point: h' <= 0".to_string()),
-            Some("evaluator error: block layout is over-parameterized".to_string()),
-        ];
-        let error = mode_profile_exhausted_error(&rejected, &[true, false]);
-        assert!(
-            !error.is_trial_point_infeasible(),
-            "a structural rejection must not be graded rho-local: {error}"
-        );
-        assert!(matches!(
-            error,
-            CustomFamilyError::UnsupportedConfiguration { .. }
-        ));
-    }
-
-    /// A candidate list with no recorded reason still has to produce a verdict,
-    /// and the type system forces a guess there. The guess is the one
-    /// `CustomFamilyError`'s own `From<String>` documents: trial point, because
-    /// grading a rho-local refusal structural aborts a fit that was fittable
-    /// one rho away, while the reverse only costs a bounded number of cheap
-    /// identical failures.
-    #[test]
-    fn a_reasonless_rejection_defaults_to_the_trial_point_verdict_979() {
-        let error = mode_profile_exhausted_error(&[None], &[true]);
-        assert!(error.is_trial_point_infeasible(), "{error}");
-        assert!(error.to_string().contains("no finite converged result"));
-    }
 }

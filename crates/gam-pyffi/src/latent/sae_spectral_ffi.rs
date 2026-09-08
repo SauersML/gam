@@ -17,7 +17,11 @@
 // paths and the Python surface is a thin wrapper (SPEC rule 8): every number is
 // computed in Rust, the FFI only marshals arrays and dicts.
 
-use gam::terms::sae::inference::sparse_audit::{atlas_refusal_code, AbsorptionAuditReport, AuditAtlasReport, AuditTopologyRecord, SparseSaeAuditConfig, SparseSaeAuditReport, SparseSaeAuditRequest, StandingCalibrationConfig, atlas_nerve_from_sparse_route, run_sparse_sae_audit};
+use gam::terms::sae::inference::sparse_audit::{
+    AbsorptionAuditReport, AuditAtlasReport, AuditTopologyRecord, SparseSaeAuditConfig,
+    SparseSaeAuditReport, SparseSaeAuditRequest, StandingCalibrationConfig,
+    atlas_nerve_from_sparse_route, atlas_refusal_code, run_sparse_sae_audit,
+};
 use gam::terms::sae::null_sampler::AuditSparseRoute;
 
 /// Build the fit-report sub-dict for a [`DualCertificateReport`] — the lane's
@@ -774,10 +778,10 @@ fn atlas_nerve_dict<'py>(
 fn atlas_nerve_diagram<'py>(
     py: Python<'py>,
     indices: PyReadonlyArray2<'py, u32>,
-    values: PyReadonlyArray3<'py, f32>,
+    values: PyReadonlyArray3<'py, f64>,
     n_units: usize,
     block_size: usize,
-    activation_threshold: f32,
+    activation_threshold: f64,
     blocks: Option<Vec<usize>>,
     observations: Option<PyReadonlyArray2<'py, f64>>,
     familywise_alpha: Option<f64>,
@@ -887,9 +891,9 @@ fn dimension_spectrometer<'py>(
 #[pyfunction(signature = (decoder, blocks, codes, block))]
 fn block_firing_coordinates<'py>(
     py: Python<'py>,
-    decoder: PyReadonlyArray2<'py, f32>,
+    decoder: PyReadonlyArray2<'py, f64>,
     blocks: PyReadonlyArray2<'py, u32>,
-    codes: PyReadonlyArray3<'py, f32>,
+    codes: PyReadonlyArray3<'py, f64>,
     block: usize,
 ) -> PyResult<Py<PyDict>> {
     let block_values = blocks.as_array().to_owned();
@@ -971,8 +975,8 @@ fn routability_floor(
 #[pyfunction(signature = (decoder, residuals, block_size, delta, quantile_levels))]
 fn routability_audit<'py>(
     py: Python<'py>,
-    decoder: PyReadonlyArray2<'py, f32>,
-    residuals: PyReadonlyArray2<'py, f32>,
+    decoder: PyReadonlyArray2<'py, f64>,
+    residuals: PyReadonlyArray2<'py, f64>,
     block_size: usize,
     delta: f64,
     quantile_levels: Vec<f64>,
@@ -1008,10 +1012,10 @@ fn routability_audit<'py>(
 #[pyfunction(signature = (data, decoder, indices, codes, max_candidates = 16))]
 fn sparse_dict_dual_certificate<'py>(
     py: Python<'py>,
-    data: PyReadonlyArray2<'py, f32>,
-    decoder: PyReadonlyArray2<'py, f32>,
+    data: PyReadonlyArray2<'py, f64>,
+    decoder: PyReadonlyArray2<'py, f64>,
     indices: PyReadonlyArray2<'py, u32>,
-    codes: PyReadonlyArray2<'py, f32>,
+    codes: PyReadonlyArray2<'py, f64>,
     max_candidates: usize,
 ) -> PyResult<Py<PyDict>> {
     let data_values = data.as_array().to_owned();
@@ -1086,7 +1090,7 @@ struct SaeAuditOptions {
     quantile_levels: Option<Vec<f64>>,
     max_candidates: usize,
     coordinate_blocks: Option<Vec<usize>>,
-    activation_threshold: f32,
+    activation_threshold: f64,
     max_absorption_pairs: usize,
     transport_theta_in: Option<Vec<f64>>,
     transport_theta_out: Option<Vec<f64>>,
@@ -1215,7 +1219,7 @@ impl SaeAuditOptions {
                 }
                 "activation_threshold" => {
                     cfg.activation_threshold = value
-                        .extract::<f32>()
+                        .extract::<f64>()
                         .map_err(|err| Self::knob_error(&key, &err))?;
                 }
                 "max_absorption_pairs" => {
@@ -1310,12 +1314,12 @@ impl SaeAuditOptions {
 ))]
 fn audit_sae<'py>(
     py: Python<'py>,
-    decoder: PyReadonlyArray2<'py, f32>,
+    decoder: PyReadonlyArray2<'py, f64>,
     route_indices: PyReadonlyArray2<'py, u32>,
-    route_values: PyReadonlyArray3<'py, f32>,
-    data: PyReadonlyArray2<'py, f32>,
+    route_values: PyReadonlyArray3<'py, f64>,
+    data: PyReadonlyArray2<'py, f64>,
     donor_indices: PyReadonlyArray2<'py, u32>,
-    donor_values: PyReadonlyArray3<'py, f32>,
+    donor_values: PyReadonlyArray3<'py, f64>,
     options: Option<&Bound<'py, PyDict>>,
 ) -> PyResult<Py<PyDict>> {
     let SaeAuditOptions {
@@ -1456,8 +1460,8 @@ mod sae_spectral_ffi_tests {
         let route = AuditSparseRoute::new(
             ndarray::array![[0_u32, 1_u32], [0_u32, 1_u32]],
             ndarray::array![
-                [[1.0_f32, 0.0_f32], [1.0_f32, 0.0_f32]],
-                [[0.0_f32, 1.0_f32], [0.0_f32, 1.0_f32]],
+                [[1.0_f64, 0.0_f64], [1.0_f64, 0.0_f64]],
+                [[0.0_f64, 1.0_f64], [0.0_f64, 1.0_f64]],
             ],
             2,
             2,
@@ -1534,7 +1538,7 @@ mod sae_spectral_ffi_tests {
     fn audit_atlas_builds_cross_fitted_plugin_and_exposes_typed_refusals() {
         const ROWS: usize = 64;
         let mut indices = ndarray::Array2::<u32>::zeros((ROWS, 2));
-        let mut values = ndarray::Array3::<f32>::zeros((ROWS, 2, 2));
+        let mut values = ndarray::Array3::<f64>::zeros((ROWS, 2, 2));
         let mut ambient = ndarray::Array2::<f64>::zeros((ROWS, 3));
         for row in 0..ROWS {
             indices[[row, 0]] = 0;
@@ -1542,8 +1546,8 @@ mod sae_spectral_ffi_tests {
             let angle = std::f64::consts::TAU * row as f64 / ROWS as f64;
             let (sine, cosine) = angle.sin_cos();
             for chart in 0..2 {
-                values[[row, chart, 0]] = cosine as f32;
-                values[[row, chart, 1]] = sine as f32;
+                values[[row, chart, 0]] = cosine as f64;
+                values[[row, chart, 1]] = sine as f64;
             }
             ambient[[row, 0]] = cosine;
             ambient[[row, 1]] = sine;
@@ -1703,7 +1707,7 @@ mod sae_spectral_ffi_tests {
         // than the historical `None, None` combinatorial-only path.
         const ROWS: usize = 64;
         let mut indices = ndarray::Array2::<u32>::zeros((ROWS, 2));
-        let mut values = ndarray::Array3::<f32>::zeros((ROWS, 2, 2));
+        let mut values = ndarray::Array3::<f64>::zeros((ROWS, 2, 2));
         let mut ambient = ndarray::Array2::<f64>::zeros((ROWS, 3));
         for row in 0..ROWS {
             indices[[row, 0]] = 0;
@@ -1711,8 +1715,8 @@ mod sae_spectral_ffi_tests {
             let angle = std::f64::consts::TAU * row as f64 / ROWS as f64;
             let (sine, cosine) = angle.sin_cos();
             for chart in 0..2 {
-                values[[row, chart, 0]] = cosine as f32;
-                values[[row, chart, 1]] = sine as f32;
+                values[[row, chart, 0]] = cosine as f64;
+                values[[row, chart, 1]] = sine as f64;
             }
             ambient[[row, 0]] = cosine;
             ambient[[row, 1]] = sine;
@@ -1799,7 +1803,7 @@ mod sae_spectral_ffi_tests {
     fn uncertifiable_chart_transfer_emits_no_gate() {
         let route = AuditSparseRoute::new(
             ndarray::array![[0_u32, 1_u32], [0_u32, 1_u32]],
-            ndarray::Array3::<f32>::ones((2, 2, 3)),
+            ndarray::Array3::<f64>::ones((2, 2, 3)),
             2,
             3,
             "atlas uncertified route",
@@ -1817,27 +1821,27 @@ mod sae_spectral_ffi_tests {
     #[test]
     fn audit_sae_round_trip_surfaces_external_dictionary_diagnostics() {
         Python::attach(|py| {
-            let decoder = ndarray::array![[1.0_f32, 0.0_f32], [0.0_f32, 1.0_f32]];
+            let decoder = ndarray::array![[1.0_f64, 0.0_f64], [0.0_f64, 1.0_f64]];
             let codes = ndarray::array![
-                [1.0_f32, 0.0_f32],
-                [0.0_f32, 1.0_f32],
-                [0.5_f32, 0.5_f32],
-                [1.0_f32, 1.0_f32],
-                [0.25_f32, 0.75_f32],
-                [0.75_f32, 0.25_f32],
-                [0.2_f32, 0.0_f32],
-                [0.0_f32, 0.2_f32],
+                [1.0_f64, 0.0_f64],
+                [0.0_f64, 1.0_f64],
+                [0.5_f64, 0.5_f64],
+                [1.0_f64, 1.0_f64],
+                [0.25_f64, 0.75_f64],
+                [0.75_f64, 0.25_f64],
+                [0.2_f64, 0.0_f64],
+                [0.0_f64, 0.2_f64],
             ];
             let data = codes.clone();
             let random_weight_codes = ndarray::array![
-                [0.31_f32, 0.72_f32],
-                [0.64_f32, 0.18_f32],
-                [0.12_f32, 0.55_f32],
-                [0.83_f32, 0.27_f32],
-                [0.49_f32, 0.61_f32],
-                [0.22_f32, 0.44_f32],
-                [0.71_f32, 0.09_f32],
-                [0.38_f32, 0.86_f32],
+                [0.31_f64, 0.72_f64],
+                [0.64_f64, 0.18_f64],
+                [0.12_f64, 0.55_f64],
+                [0.83_f64, 0.27_f64],
+                [0.49_f64, 0.61_f64],
+                [0.22_f64, 0.44_f64],
+                [0.71_f64, 0.09_f64],
+                [0.38_f64, 0.86_f64],
             ];
             let indices =
                 ndarray::Array2::from_shape_fn((codes.nrows(), 2), |(_, slot)| slot as u32);
@@ -2510,8 +2514,7 @@ mod ffi_completeness_tests {
                             surrogate_state = surrogate_state
                                 .wrapping_mul(6364136223846793005)
                                 .wrapping_add(1442695040888963407);
-                            let recovered =
-                                (surrogate_state >> 11) as f64 / (1u64 << 53) as f64;
+                            let recovered = (surrogate_state >> 11) as f64 / (1u64 << 53) as f64;
                             (recovered, label_turns, weight)
                         })
                         .collect()
@@ -2583,7 +2586,12 @@ mod ffi_completeness_tests {
                 .extract()
                 .unwrap();
             assert_eq!(samples.len(), 8);
-            let sd: f64 = calibration.get_item("sd").unwrap().unwrap().extract().unwrap();
+            let sd: f64 = calibration
+                .get_item("sd")
+                .unwrap()
+                .unwrap()
+                .extract()
+                .unwrap();
             assert!(
                 sd > 0.0,
                 "the null ensemble must have a spread before any verdict means anything: sd = {sd}"

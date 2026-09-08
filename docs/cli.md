@@ -5,7 +5,7 @@ model blobs, prediction CSVs, posterior draws, generated responses, or HTML
 reports.
 
 ```bash
-gam --help
+gam <command> --help
 ```
 
 ## Commands
@@ -14,7 +14,7 @@ gam --help
 | --- | --- |
 | `gam fit DATA FORMULA --out MODEL` | Fit and save a model. |
 | `gam predict MODEL NEW_DATA --out PREDICTIONS.csv` | Predict from a saved model. |
-| `gam diagnose MODEL DATA` | Compute approximate leave-one-out diagnostics. |
+| `gam diagnose MODEL DATA [--alo]` | Compute residual / calibration diagnostics; `--alo` also computes approximate leave-one-out quantities. |
 | `gam sample MODEL DATA [--out posterior.csv]` | Draw posterior coefficients. |
 | `gam generate MODEL DATA [--out generated.csv]` | Draw synthetic responses from a fitted model. |
 | `gam report MODEL [DATA] [OUT]` | Write a self-contained HTML report. |
@@ -43,6 +43,7 @@ Common options:
 | `--noise-offset-column COLUMN` | Additive offset for the scale / dispersion predictor; under the marginal-slope families, for the slope predictor (`--offset-column` then offsets the marginal predictor). |
 | `--firth` | Firth bias reduction for supported binomial-logit fits. |
 | `--scale-dimensions` | Enable per-axis anisotropy for eligible spatial smooths. |
+| `--adaptive-regularization true|false` | Opt into spatial adaptive regularization for compatible standard GAMs. |
 | `--transformation-normal` | Fit a conditional transformation-normal model. |
 
 CLI links are declared in the formula with `link(type=...)`; there is no
@@ -91,21 +92,23 @@ gam predict model.gam new.csv --out predictions.csv --uncertainty --level 0.95
 | `--uncertainty` | Include uncertainty columns where the model supports them. |
 | `--level VALUE` | Coverage for uncertainty intervals; default `0.95`. |
 | `--covariance-mode conditional|corrected` | Conditional covariance or smoothing-corrected covariance. Absent, the definition the saved fit publishes (the one `gam summary` prices its standard errors from) is used and labeled; naming one is a requirement that refuses when the fit cannot supply it. |
+| `--mode posterior-mean|map` | Point-prediction mode. |
+| `--no-bias-correction` | Disable the `O(n^-1)` frequentist bias correction in the survival uncertainty paths. The standard `posterior_mean` point prediction is never moved by this flag. |
 | `--id-column COLUMN` | Carry an identifier column into the prediction CSV. |
 | `--offset-column COLUMN`, `--noise-offset-column COLUMN` | Prediction-time offsets matching the fitted model. |
 
-Every prediction surface publishes one point estimand, the posterior mean, and
-carries the plug-in (fitted-coefficient) prediction beside it by name; there is
-no mode that swaps one for the other. Standard and location-scale mean models
-write `linear_predictor_plugin`, `mean_plugin`, and `posterior_mean`;
-location-scale models that expose a fitted response-side scale add
-`noise_scale`. With `--uncertainty`, the posterior columns are
-`posterior_mean_standard_error`, `posterior_mean_lower`, and
-`posterior_mean_upper`. Survival predictions write `eta`,
-`survival_prob_plugin` (the plug-in `S(η̂)`), `survival_prob` (the posterior
-mean `E[S(η)]`), `failure_prob`, and `risk_score`, plus `std_error`,
-`mean_lower`, and `mean_upper` with `--uncertainty`. Transformation-normal and
-marginal-slope predictions retain their model-specific schemas.
+Standard and location-scale mean models write an estimand-explicit CSV. The
+default `--mode posterior-mean` columns are `linear_predictor_plugin`,
+`mean_plugin`, and `posterior_mean`; location-scale models that expose a fitted
+response-side scale add `noise_scale`. With `--uncertainty`, the posterior
+columns are `posterior_mean_standard_error`, `posterior_mean_lower`, and
+`posterior_mean_upper`. A point-only `--mode map` emits only the plug-in pair
+(plus `noise_scale` when present), so one column name never changes estimand
+with the mode. Combining `--mode map` with `--uncertainty` retains
+`posterior_mean` because the named posterior uncertainty columns require their
+posterior point; the plug-in pair remains explicit alongside it.
+Transformation-normal, marginal-slope, and survival predictions retain their
+model-specific schemas.
 
 ## Sample and Generate
 

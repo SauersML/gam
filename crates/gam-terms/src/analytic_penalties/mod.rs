@@ -128,7 +128,9 @@ pub(crate) use crate::basis::{
     BasisError, DuchonNullspaceOrder, radial_basis_cartesian_derivative,
 };
 pub(crate) use gam_linalg::faer_ndarray::{FaerEigh, FaerSvd};
-pub(crate) use gam_linalg::lanczos::{SymmetricLanczosOptions, symmetric_lanczos_eigenpairs, symmetric_lanczos_log_quadrature};
+pub(crate) use gam_linalg::lanczos::{
+    SymmetricLanczosOptions, symmetric_lanczos_eigenpairs, symmetric_lanczos_log_quadrature,
+};
 pub(crate) use gam_problem::{GumbelTemperatureSchedule, ScheduleKind};
 
 #[macro_use]
@@ -141,6 +143,7 @@ mod harmonic_roughness;
 mod isometry;
 mod manifest;
 mod nested_prefix;
+pub mod normalized_gram;
 mod nuclear_norm;
 mod op;
 mod ordered_beta_bernoulli;

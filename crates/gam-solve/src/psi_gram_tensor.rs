@@ -48,7 +48,8 @@
 //! the exact path ([`PsiGramTensor::contains`]).
 
 use gam_linalg::decision::{RankDecision, certified_rank, projector_error_bar};
-use ndarray::{Array1, Array2, ArrayView1};
+use ndarray::{Array1, Array2, ArrayView1, Axis};
+use rayon::prelude::*;
 
 /// Relative ceiling on the per-column Chebyshev coefficient tail (#1216).
 ///
@@ -375,38 +376,47 @@ fn weighted_gram_and_rhs(
     // derivative coefficients.  Keeping the reduction compensated preserves the
     // algebraic additivity under replicated rows without relying on BLAS dot's
     // implementation-dependent reduction tree.
-    for ((row, &w), &wz_i) in design.outer_iter().zip(weights.iter()).zip(wz.iter()) {
-        for (a, ((&xa, rhs_slot), rhs_correction)) in row
-            .iter()
-            .zip(rhs.iter_mut())
-            .zip(rhs_comp.iter_mut())
-            .enumerate()
-        {
-            let y_rhs = xa * wz_i - *rhs_correction;
-            let t_rhs = *rhs_slot + y_rhs;
-            *rhs_correction = (t_rhs - *rhs_slot) - y_rhs;
-            *rhs_slot = t_rhs;
+    // Parallelize independent output rows, never partial sums over observations.
+    // Each worker owns both the statistic and compensation, and traverses every
+    // observation in the historical order. Thread scheduling cannot change a
+    // single recurrence or introduce a tree reduction. The existing Rayon pool
+    // owns the thread budget; this routine never creates a pool.
+    let rhs_slots = rhs.as_slice_mut().expect("fresh RHS is contiguous");
+    let rhs_corrections = rhs_comp
+        .as_slice_mut()
+        .expect("fresh RHS compensation is contiguous");
+    gram.axis_iter_mut(Axis(0))
+        .into_par_iter()
+        .zip(gram_comp.axis_iter_mut(Axis(0)).into_par_iter())
+        .zip(rhs_slots.par_iter_mut().zip(rhs_corrections.par_iter_mut()))
+        .enumerate()
+        .for_each(
+            |(a, ((mut gram_row, mut correction_row), (rhs_slot, rhs_correction)))| {
+                let mut gram_tail = gram_row.slice_mut(ndarray::s![a..]);
+                let mut correction_tail = correction_row.slice_mut(ndarray::s![a..]);
+                for ((row, &w), &wz_i) in design.outer_iter().zip(weights.iter()).zip(wz.iter()) {
+                    let xa = row[a];
+                    let y_rhs = xa * wz_i - *rhs_correction;
+                    let t_rhs = *rhs_slot + y_rhs;
+                    *rhs_correction = (t_rhs - *rhs_slot) - y_rhs;
+                    *rhs_slot = t_rhs;
 
-            // Preserve the compensated row summation exactly, but traverse
-            // each output row once instead of repeating multidimensional
-            // bounds and stride arithmetic for every matrix entry. Entries
-            // along b are independent and can be vectorized together.
-            let weighted_xa = xa * w;
-            let mut gram_row = gram.slice_mut(ndarray::s![a, a..]);
-            let mut correction_row = gram_comp.slice_mut(ndarray::s![a, a..]);
-            let design_tail = row.slice(ndarray::s![a..]);
-            for ((slot, correction), &xb) in gram_row
-                .iter_mut()
-                .zip(correction_row.iter_mut())
-                .zip(design_tail.iter())
-            {
-                let y = weighted_xa * xb - *correction;
-                let t = *slot + y;
-                *correction = (t - *slot) - y;
-                *slot = t;
-            }
-        }
-    }
+                    // Entries along b remain independent and can be vectorized together.
+                    let weighted_xa = xa * w;
+                    let design_tail = row.slice(ndarray::s![a..]);
+                    for ((slot, correction), &xb) in gram_tail
+                        .iter_mut()
+                        .zip(correction_tail.iter_mut())
+                        .zip(design_tail.iter())
+                    {
+                        let y = weighted_xa * xb - *correction;
+                        let t = *slot + y;
+                        *correction = (t - *slot) - y;
+                        *slot = t;
+                    }
+                }
+            },
+        );
 
     for a in 0..k {
         for b in 0..a {
@@ -1570,22 +1580,39 @@ mod tests {
         let standard = Array2::from_shape_fn((257, 11), entry);
         let column_major = Array2::from_shape_fn((257, 11).f(), entry);
         let reversed = standard.clone().slice_move(ndarray::s![..;-1, ..;-1]);
-        let weights = Array1::from_shape_fn(257, |i| 0.25 + (i % 7) as f64 / 7.0);
-        let wz = Array1::from_shape_fn(257, |i| weights[i] * (i as f64 * 0.17).cos());
-        for design in [&standard, &column_major, &reversed] {
-            let (gram, rhs) = weighted_gram_and_rhs(design, weights.view(), &wz);
-            let (reference_gram, reference_rhs) = indexed_reference(design, &weights, &wz);
-            for (actual, expected) in gram
-                .iter()
-                .chain(rhs.iter())
-                .zip(reference_gram.iter().chain(reference_rhs.iter()))
-            {
-                assert_eq!(
-                    actual.to_bits(),
-                    expected.to_bits(),
-                    "compensated statistic changed for strides {:?}",
-                    design.strides()
-                );
+        let weights = Array1::from_shape_fn(257, |i| {
+            if i % 13 == 0 {
+                0.0
+            } else {
+                0.25 + (i % 7) as f64 / 7.0
+            }
+        });
+        let reversed_weights = weights.clone().slice_move(ndarray::s![..;-1]);
+        for threads in [1, 4] {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .expect("bounded reduction test pool");
+            for weights in [&weights, &reversed_weights] {
+                let wz = Array1::from_shape_fn(257, |i| weights[i] * (i as f64 * 0.17).cos());
+                for design in [&standard, &column_major, &reversed] {
+                    let (gram, rhs) =
+                        pool.install(|| weighted_gram_and_rhs(design, weights.view(), &wz));
+                    let (reference_gram, reference_rhs) = indexed_reference(design, weights, &wz);
+                    for (actual, expected) in gram
+                        .iter()
+                        .chain(rhs.iter())
+                        .zip(reference_gram.iter().chain(reference_rhs.iter()))
+                    {
+                        assert_eq!(
+                            actual.to_bits(),
+                            expected.to_bits(),
+                            "compensated statistic changed for design strides {:?}, weight strides {:?}, threads={threads}",
+                            design.strides(),
+                            weights.strides(),
+                        );
+                    }
+                }
             }
         }
     }

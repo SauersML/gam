@@ -8,12 +8,12 @@
 //!
 //! The implementation deliberately never constructs the stacked
 //! `(N D) x (K D)` design or a `S_b (x) I_D` penalty.  Isotropic metrics use
-//! only `K x K` normal equations.  Varying Fisher metrics stream exact joint
+//! only `K x K` square-root statistics. Varying Fisher metrics stream exact joint
 //! sufficient statistics into a `(K D) x (K D)` Gram matrix whose storage is
 //! independent of `N`.
 
 use faer::Side;
-use gam_linalg::faer_ndarray::{FaerCholesky, FaerEigh, fast_xt_diag_x, fast_xt_diag_y};
+use gam_linalg::faer_ndarray::{FaerArrayView, FaerCholesky, FaerEigh, FaerQr, array2_to_matmut};
 use gam_linalg::matrix::{DesignMatrix, LinearOperator};
 use gam_linalg::utils::KahanSum;
 // `DeclaredHessianForm`/`Derivative` originate in `gam_problem` and are only
@@ -50,7 +50,6 @@ impl SharedTangentPenalty {
             matrix,
         }
     }
-
 }
 
 /// Owned request for a shared-tangent REML fit.
@@ -85,7 +84,6 @@ impl SharedTangentRemlRequest {
             initial_log_lambdas: None,
         }
     }
-
 }
 
 /// A converged, serializable shared-tangent model.
@@ -119,7 +117,6 @@ impl SharedTangentRemlFit {
     pub fn predict(&self, design: &DesignMatrix) -> Result<Array2<f64>, EstimationError> {
         predict_from_coefficients(design, &self.coefficients)
     }
-
 }
 
 /// Typed curvature-as-estimand record carried by a response-geometry archive.
@@ -338,7 +335,6 @@ impl ResponseGeometryModel {
             template_family: payload.family.clone(),
         }
     }
-
 }
 
 #[derive(Clone, Debug)]
@@ -346,14 +342,15 @@ struct PreparedPenalty {
     output_slot: usize,
     column_start: usize,
     local: Array2<f64>,
+    root: Array2<f64>,
     rank: usize,
 }
 
 #[derive(Clone, Debug)]
 enum SufficientStatistics {
     Isotropic {
-        gram: Array2<f64>,
-        cross: Array2<f64>,
+        root: Array2<f64>,
+        projected_response: Array2<f64>,
     },
     Fisher {
         gram: Array2<f64>,
@@ -373,6 +370,9 @@ struct PreparedSharedTangent {
     effective_observations: usize,
     output_penalty_slots: usize,
     penalties: Vec<PreparedPenalty>,
+    /// The union of the unscaled penalty ranges. Positive smoothing strengths
+    /// change curvature within this space, never its dimension.
+    penalty_range: Array2<f64>,
     statistics: SufficientStatistics,
 }
 
@@ -397,7 +397,8 @@ struct Evaluation {
 struct PenaltySpectrum {
     rank: usize,
     log_pseudo_determinant: f64,
-    pseudo_inverse: Array2<f64>,
+    traces: Array1<f64>,
+    cross_traces: Array2<f64>,
 }
 
 /// Fit a shared-smoothing multi-output Gaussian model by exact profiled REML.
@@ -456,6 +457,14 @@ pub fn fit_shared_tangent_reml(
             .with_gradient(Derivative::Analytic)
             .with_hessian(DeclaredHessianForm::Dense)
             .with_disable_fixed_point(true)
+            // The closed-form QR/root evaluation resolves the per-output
+            // smoothing score to the floating-point floor. The generic outer
+            // band also serves inexact inner solves and can stop equivalent
+            // response frames at distinguishable coefficient maps. State this
+            // exact engine's accuracy requirement before search/certification.
+            .with_required_projected_gradient_norm(Some(
+                f64::EPSILON.sqrt() * prepared.n_outputs as f64,
+            ))
             .with_objective_scale(Some(
                 prepared
                     .effective_observations
@@ -716,9 +725,36 @@ impl PreparedSharedTangent {
         };
 
         let penalties = prepare_penalties(&requested_penalties, k)?;
+        let balanced = gam_terms::construction::balanced_penalty_sum(
+            penalties.iter().map(|penalty| {
+                (
+                    penalty.local.view(),
+                    penalty.column_start..penalty.column_start + penalty.local.nrows(),
+                )
+            }),
+            k,
+        );
+        let (values, vectors) = balanced
+            .eigh(Side::Lower)
+            .map_err(EstimationError::EigendecompositionFailed)?;
+        let tolerance = gam_terms::construction::balanced_penalty_rank_tolerance(
+            values.iter().copied().fold(0.0_f64, f64::max),
+        );
+        let active: Vec<usize> = values
+            .iter()
+            .enumerate()
+            .filter_map(|(index, &value)| (value > tolerance).then_some(index))
+            .collect();
+        let penalty_range =
+            Array2::from_shape_fn((k, active.len()), |(row, col)| vectors[[row, active[col]]]);
         let output_penalty_slots = requested_penalties.len();
         let statistics = match fisher_metric.as_ref() {
-            None => assemble_isotropic_statistics(&design, &response, &weights)?,
+            None => assemble_isotropic_statistics(
+                &design,
+                &response,
+                &weights,
+                gam_linalg::utils::row_chunk_for_byte_budget(n, k + d),
+            )?,
             Some(metric) => assemble_fisher_statistics(&design, &response, &weights, metric)?,
         };
 
@@ -733,6 +769,7 @@ impl PreparedSharedTangent {
             effective_observations,
             output_penalty_slots,
             penalties,
+            penalty_range,
             statistics,
         })
     }
@@ -748,9 +785,10 @@ impl PreparedSharedTangent {
         gam_problem::validate_log_strengths(rho.iter().copied())
             .map_err(|error| invalid(format!("shared-tangent rho: {error}")))?;
         match &self.statistics {
-            SufficientStatistics::Isotropic { gram, cross } => {
-                self.evaluate_isotropic(rho, gram, cross)
-            }
+            SufficientStatistics::Isotropic {
+                root,
+                projected_response,
+            } => self.evaluate_isotropic(rho, root, projected_response),
             SufficientStatistics::Fisher { gram, cross } => self.evaluate_fisher(rho, gram, cross),
         }
     }
@@ -758,33 +796,56 @@ impl PreparedSharedTangent {
     fn evaluate_isotropic(
         &self,
         rho: &Array1<f64>,
-        gram: &Array2<f64>,
-        cross: &Array2<f64>,
+        data_root: &Array2<f64>,
+        projected_response: &Array2<f64>,
     ) -> Result<Evaluation, EstimationError> {
         let d = self.n_outputs;
         let (penalty, lambdas) = self.combined_penalty(rho)?;
-        let spectrum = penalty_spectrum(&penalty, "combined shared-tangent penalty")?;
-        let mut penalized = gram.clone();
-        penalized += &penalty;
-        let (inverse, log_determinant) = spd_inverse_and_logdet(&penalized)?;
-        let coefficients = inverse.dot(cross);
+        let spectrum = self.combined_penalty_spectrum(&penalty, &lambdas)?;
+        let roots: Vec<Array2<f64>> = self
+            .penalties
+            .iter()
+            .enumerate()
+            .map(|(index, block)| {
+                scaled_penalty_root(block, lambdas[index], self.n_coefficients, 1)
+            })
+            .collect();
+        let augmented_rows =
+            data_root.nrows() + roots.iter().map(|root| root.ncols()).sum::<usize>();
+        let mut augmented = Array2::zeros((augmented_rows, self.n_coefficients));
+        augmented
+            .slice_mut(s![..data_root.nrows(), ..])
+            .assign(data_root);
+        let mut offset = data_root.nrows();
+        for root in &roots {
+            augmented
+                .slice_mut(s![offset..offset + root.ncols(), ..])
+                .assign(&root.t());
+            offset += root.ncols();
+        }
+        let (orthogonal, upper) = augmented
+            .qr()
+            .map_err(EstimationError::LinearSystemSolveFailed)?;
+        let (factor, log_determinant) = TangentPrecisionFactor::from_upper(upper)?;
+        let rhs = orthogonal
+            .slice(s![..data_root.nrows(), ..])
+            .t()
+            .dot(projected_response);
+        let coefficients = factor.backsolve(&rhs);
         let profiled_deviance = self.profiled_deviance(&coefficients)?;
         let residual_degrees_of_freedom = self.residual_degrees_of_freedom(spectrum.rank)?;
         validate_profiled_deviance(profiled_deviance)?;
 
         let m = self.penalties.len();
-        let mut penalty_traces = Array1::<f64>::zeros(m);
-        let mut penalty_logdet_traces = Array1::<f64>::zeros(m);
+        let (base_traces, base_cross_traces) = penalty_root_traces(&factor, &roots);
+        let penalty_traces = base_traces * d as f64;
+        let penalty_logdet_traces = &spectrum.traces * d as f64;
         let mut deviance_first = Array1::<f64>::zeros(m);
         let mut penalty_beta = Vec::with_capacity(m);
-        for (index, penalty_block) in self.penalties.iter().enumerate() {
-            penalty_traces[index] =
-                d as f64 * trace_local_base(&inverse, penalty_block, lambdas[index]);
-            penalty_logdet_traces[index] = d as f64
-                * trace_local_base(&spectrum.pseudo_inverse, penalty_block, lambdas[index]);
-            let z = apply_local_base_matrix(penalty_block, lambdas[index], &coefficients);
-            deviance_first[index] = sum_products(&coefficients, &z);
-            penalty_beta.push(z);
+        for (index, root) in roots.iter().enumerate() {
+            let root_beta = root.t().dot(&coefficients);
+            deviance_first[index] = sum_products(&root_beta, &root_beta);
+            penalty_beta.push(root.dot(&root_beta));
         }
 
         // REML profiles the scale out as `φ̂ = D_p/rdf` with `D_p` the PENALIZED
@@ -820,15 +881,10 @@ impl PreparedSharedTangent {
         }
         let mut hessian = Array2::<f64>::zeros((m, m));
         for j in 0..m {
-            let h_sandwich = sandwich_local_base(&inverse, &self.penalties[j], lambdas[j]);
-            let p_sandwich =
-                sandwich_local_base(&spectrum.pseudo_inverse, &self.penalties[j], lambdas[j]);
             for kk in 0..=j {
-                let h_cross = d as f64
-                    * trace_sandwich_local_base(&h_sandwich, &self.penalties[kk], lambdas[kk]);
-                let p_cross = d as f64
-                    * trace_sandwich_local_base(&p_sandwich, &self.penalties[kk], lambdas[kk]);
-                let solved_penalty_beta = inverse.dot(&penalty_beta[kk]);
+                let h_cross = d as f64 * base_cross_traces[[j, kk]];
+                let p_cross = d as f64 * spectrum.cross_traces[[j, kk]];
+                let solved_penalty_beta = factor.solve_mat(&penalty_beta[kk]);
                 let deviance_cross = sum_products(&penalty_beta[j], &solved_penalty_beta);
                 let delta = usize::from(j == kk) as f64;
                 let logdet_second = delta * penalty_traces[j] - h_cross;
@@ -876,11 +932,11 @@ impl PreparedSharedTangent {
             .checked_mul(d)
             .ok_or_else(|| invalid("joint coefficient dimension overflow"))?;
         let (penalty, lambdas) = self.combined_penalty(rho)?;
-        let spectrum = penalty_spectrum(&penalty, "combined shared-tangent penalty")?;
+        let spectrum = self.combined_penalty_spectrum(&penalty, &lambdas)?;
         let mut penalized = gram.clone();
         add_base_penalty_to_joint(&mut penalized, &penalty, d);
-        let (inverse, log_determinant) = spd_inverse_and_logdet(&penalized)?;
-        let beta = inverse.dot(cross);
+        let (factor, log_determinant) = spd_factor_and_logdet(&penalized)?;
+        let beta = factor.solvevec(cross);
         let mut coefficients = Array2::<f64>::zeros((k, d));
         for basis in 0..k {
             for output in 0..d {
@@ -892,17 +948,20 @@ impl PreparedSharedTangent {
         let residual_degrees_of_freedom = self.residual_degrees_of_freedom(spectrum.rank)?;
 
         let m = self.penalties.len();
-        let mut penalty_traces = Array1::<f64>::zeros(m);
-        let mut penalty_logdet_traces = Array1::<f64>::zeros(m);
+        let roots: Vec<Array2<f64>> = self
+            .penalties
+            .iter()
+            .enumerate()
+            .map(|(index, block)| scaled_penalty_root(block, lambdas[index], k, d))
+            .collect();
+        let (penalty_traces, base_cross_traces) = penalty_root_traces(&factor, &roots);
+        let penalty_logdet_traces = &spectrum.traces * d as f64;
         let mut deviance_first = Array1::<f64>::zeros(m);
         let mut penalty_beta = Vec::with_capacity(m);
-        for (index, penalty_block) in self.penalties.iter().enumerate() {
-            penalty_traces[index] = trace_local_joint(&inverse, penalty_block, lambdas[index], d);
-            penalty_logdet_traces[index] = d as f64
-                * trace_local_base(&spectrum.pseudo_inverse, penalty_block, lambdas[index]);
-            let z = apply_local_joint_vector(penalty_block, lambdas[index], d, &beta);
-            deviance_first[index] = beta.dot(&z);
-            penalty_beta.push(z);
+        for (index, root) in roots.iter().enumerate() {
+            let root_beta = root.t().dot(&beta);
+            deviance_first[index] = root_beta.dot(&root_beta);
+            penalty_beta.push(root.dot(&root_beta));
         }
 
         // REML profiles the scale out as `φ̂ = D_p/rdf` with `D_p` the PENALIZED
@@ -938,15 +997,10 @@ impl PreparedSharedTangent {
         }
         let mut hessian = Array2::<f64>::zeros((m, m));
         for j in 0..m {
-            let h_sandwich = sandwich_local_joint(&inverse, &self.penalties[j], lambdas[j], d);
-            let p_sandwich =
-                sandwich_local_base(&spectrum.pseudo_inverse, &self.penalties[j], lambdas[j]);
             for kk in 0..=j {
-                let h_cross =
-                    trace_sandwich_local_joint(&h_sandwich, &self.penalties[kk], lambdas[kk], d);
-                let p_cross = d as f64
-                    * trace_sandwich_local_base(&p_sandwich, &self.penalties[kk], lambdas[kk]);
-                let solved_penalty_beta = inverse.dot(&penalty_beta[kk]);
+                let h_cross = base_cross_traces[[j, kk]];
+                let p_cross = d as f64 * spectrum.cross_traces[[j, kk]];
+                let solved_penalty_beta = factor.solvevec(&penalty_beta[kk]);
                 let deviance_cross = penalty_beta[j].dot(&solved_penalty_beta);
                 let delta = usize::from(j == kk) as f64;
                 let logdet_second = delta * penalty_traces[j] - h_cross;
@@ -969,8 +1023,8 @@ impl PreparedSharedTangent {
                         + (2.0 * std::f64::consts::PI * penalized_deviance
                             / residual_degrees_of_freedom)
                             .ln()));
-        if inverse.dim() != (q, q) {
-            return Err(invalid("internal Fisher inverse shape mismatch"));
+        if beta.len() != q {
+            return Err(invalid("internal Fisher solution shape mismatch"));
         }
         validate_evaluation(cost, &gradient, &hessian)?;
         Ok(Evaluation {
@@ -1040,6 +1094,46 @@ impl PreparedSharedTangent {
             }
         }
         Ok(quadratic.sum())
+    }
+
+    fn combined_penalty_spectrum(
+        &self,
+        penalty: &Array2<f64>,
+        lambdas: &Array1<f64>,
+    ) -> Result<PenaltySpectrum, EstimationError> {
+        let rank = self.penalty_range.ncols();
+        if rank == 0 {
+            return Ok(PenaltySpectrum {
+                rank,
+                log_pseudo_determinant: 0.0,
+                traces: Array1::zeros(self.penalties.len()),
+                cross_traces: Array2::zeros((self.penalties.len(), self.penalties.len())),
+            });
+        }
+        // The restriction is positive definite for every positive lambda.
+        // Reclassifying its eigenvalues against the largest scaled curvature
+        // would change REML's nullity and objective as one strength shrinks.
+        let restricted = self
+            .penalty_range
+            .t()
+            .dot(&penalty.dot(&self.penalty_range));
+        let (factor, log_pseudo_determinant) = spd_factor_and_logdet(&restricted)?;
+        let roots: Vec<Array2<f64>> = self
+            .penalties
+            .iter()
+            .enumerate()
+            .map(|(index, block)| {
+                let root = scaled_penalty_root(block, lambdas[index], self.n_coefficients, 1);
+                self.penalty_range.t().dot(&root)
+            })
+            .collect();
+        let (traces, cross_traces) = penalty_root_traces(&factor, &roots);
+        Ok(PenaltySpectrum {
+            rank,
+            log_pseudo_determinant,
+            traces,
+            cross_traces,
+        })
     }
 
     fn combined_penalty(
@@ -1118,16 +1212,32 @@ fn prepare_penalties(
                 "penalty {slot} contains non-finite values"
             )));
         }
-        let local = symmetric_average(&penalty.matrix);
-        let spectrum = penalty_spectrum(&local, &format!("shared-tangent penalty {slot}"))?;
-        if spectrum.rank == 0 {
+        let analysis = gam_terms::basis::analyze_penalty_block(&penalty.matrix)
+            .map_err(|error| invalid(format!("shared-tangent penalty {slot}: {error}")))?;
+        if analysis.negative_dim != 0 {
+            return Err(invalid(format!(
+                "shared-tangent penalty {slot} must be positive semidefinite"
+            )));
+        }
+        if analysis.rank == 0 {
             continue;
         }
+        let active: Vec<usize> = analysis
+            .eigenvalues
+            .iter()
+            .enumerate()
+            .filter_map(|(index, &value)| (value > analysis.rank_tol).then_some(index))
+            .collect();
+        let root = Array2::from_shape_fn((active.len(), q), |(mode, col)| {
+            let index = active[mode];
+            analysis.eigenvalues[index].sqrt() * analysis.eigenvectors[[col, index]]
+        });
         prepared.push(PreparedPenalty {
             output_slot: slot,
             column_start: penalty.column_start,
-            local,
-            rank: spectrum.rank,
+            rank: root.nrows(),
+            local: root.t().dot(&root),
+            root,
         });
     }
     Ok(prepared)
@@ -1137,25 +1247,48 @@ fn assemble_isotropic_statistics(
     design: &DesignMatrix,
     response: &Array2<f64>,
     weights: &Array1<f64>,
+    chunk_rows: usize,
 ) -> Result<SufficientStatistics, EstimationError> {
     let n = design.nrows();
     let k = design.ncols();
     let d = response.ncols();
-    let mut gram = Array2::<f64>::zeros((k, k));
-    let mut cross = Array2::<f64>::zeros((k, d));
-    let chunk_rows = gam_linalg::utils::row_chunk_for_byte_budget(n, k);
+    let mut root = Array2::<f64>::zeros((0, k));
+    let mut projected_response = Array2::<f64>::zeros((0, d));
     for start in (0..n).step_by(chunk_rows) {
         let end = (start + chunk_rows).min(n);
         let x_chunk = design
             .try_row_chunk(start..end)
             .map_err(|error| invalid(format!("failed to read design row chunk: {error}")))?;
         validate_design_chunk(&x_chunk)?;
-        let weight_chunk = weights.slice(s![start..end]);
-        let response_chunk = response.slice(s![start..end, ..]);
-        gram += &fast_xt_diag_x(&x_chunk, &weight_chunk);
-        cross += &fast_xt_diag_y(&x_chunk, &weight_chunk, &response_chunk);
+        let live_rows: Vec<usize> = (start..end).filter(|&row| weights[row] > 0.0).collect();
+        if live_rows.is_empty() {
+            continue;
+        }
+        let retained_rows = root.nrows();
+        let mut stacked = Array2::zeros((retained_rows + live_rows.len(), k));
+        let mut rhs = Array2::zeros((stacked.nrows(), d));
+        stacked.slice_mut(s![..retained_rows, ..]).assign(&root);
+        rhs.slice_mut(s![..retained_rows, ..])
+            .assign(&projected_response);
+        for (local, &row) in live_rows.iter().enumerate() {
+            let scale = weights[row].sqrt();
+            for col in 0..k {
+                stacked[[retained_rows + local, col]] = scale * x_chunk[[row - start, col]];
+            }
+            for output in 0..d {
+                rhs[[retained_rows + local, output]] = scale * response[[row, output]];
+            }
+        }
+        let (orthogonal, upper) = stacked
+            .qr()
+            .map_err(EstimationError::LinearSystemSolveFailed)?;
+        projected_response = orthogonal.t().dot(&rhs);
+        root = upper;
     }
-    Ok(SufficientStatistics::Isotropic { gram, cross })
+    Ok(SufficientStatistics::Isotropic {
+        root,
+        projected_response,
+    })
 }
 
 fn assemble_fisher_statistics(
@@ -1238,245 +1371,118 @@ fn validated_metric(mut metric: Array2<f64>, row: usize) -> Result<Array2<f64>, 
     Ok(metric)
 }
 
-fn penalty_spectrum(
-    penalty: &Array2<f64>,
-    context: &str,
-) -> Result<PenaltySpectrum, EstimationError> {
-    let (eigenvalues, eigenvectors) = penalty
-        .eigh(Side::Lower)
-        .map_err(EstimationError::EigendecompositionFailed)?;
-    let scale = eigenvalues
-        .iter()
-        .fold(0.0_f64, |acc, value| acc.max(value.abs()));
-    let tolerance = f64::EPSILON.sqrt() * eigenvalues.len().max(1) as f64 * scale;
-    let mut rank = 0usize;
-    let mut log_pseudo_determinant = 0.0;
-    let mut pseudo_inverse = Array2::<f64>::zeros(penalty.dim());
-    for (index, &value) in eigenvalues.iter().enumerate() {
-        if !value.is_finite() {
-            return Err(EstimationError::PenaltySpectrumNonFinite {
-                context: context.to_string(),
-                index,
-                value,
-            });
-        }
-        if value < -tolerance {
-            return Err(EstimationError::PenaltySpectrumIndefinite {
-                context: context.to_string(),
-                index,
-                value,
-                tolerance,
-                scale,
-            });
-        }
-        if value <= tolerance {
-            continue;
-        }
-        rank += 1;
-        log_pseudo_determinant += value.ln();
-        for row in 0..penalty.nrows() {
-            for col in 0..penalty.ncols() {
-                pseudo_inverse[[row, col]] +=
-                    eigenvectors[[row, index]] * eigenvectors[[col, index]] / value;
-            }
-        }
-    }
-    Ok(PenaltySpectrum {
-        rank,
-        log_pseudo_determinant,
-        pseudo_inverse,
-    })
+struct TangentPrecisionFactor {
+    /// Precision is RᵀR. Keeping R avoids squaring the design condition number.
+    upper: Array2<f64>,
 }
 
-fn spd_inverse_and_logdet(matrix: &Array2<f64>) -> Result<(Array2<f64>, f64), EstimationError> {
+impl TangentPrecisionFactor {
+    fn from_upper(upper: Array2<f64>) -> Result<(Self, f64), EstimationError> {
+        if upper.nrows() != upper.ncols()
+            || upper.iter().any(|value| !value.is_finite())
+            || upper.diag().iter().any(|value| *value == 0.0)
+        {
+            return Err(EstimationError::ModelIsIllConditioned {
+                condition_number: f64::INFINITY,
+            });
+        }
+        let log_determinant = 2.0
+            * upper
+                .diag()
+                .iter()
+                .map(|value| value.abs().ln())
+                .sum::<f64>();
+        if !log_determinant.is_finite() {
+            return Err(EstimationError::ModelIsIllConditioned {
+                condition_number: f64::INFINITY,
+            });
+        }
+        Ok((Self { upper }, log_determinant))
+    }
+
+    fn whiten(&self, rhs: &Array2<f64>) -> Array2<f64> {
+        let mut out = rhs.clone();
+        FaerArrayView::new(&self.upper)
+            .as_ref()
+            .transpose()
+            .solve_lower_triangular_in_place(array2_to_matmut(&mut out));
+        out
+    }
+
+    fn backsolve(&self, rhs: &Array2<f64>) -> Array2<f64> {
+        let mut out = rhs.clone();
+        FaerArrayView::new(&self.upper)
+            .as_ref()
+            .solve_upper_triangular_in_place(array2_to_matmut(&mut out));
+        out
+    }
+
+    fn solve_mat(&self, rhs: &Array2<f64>) -> Array2<f64> {
+        self.backsolve(&self.whiten(rhs))
+    }
+
+    fn solvevec(&self, rhs: &Array1<f64>) -> Array1<f64> {
+        self.solve_mat(&rhs.clone().insert_axis(ndarray::Axis(1)))
+            .column(0)
+            .to_owned()
+    }
+}
+
+fn spd_factor_and_logdet(
+    matrix: &Array2<f64>,
+) -> Result<(TangentPrecisionFactor, f64), EstimationError> {
     let factor =
         matrix
             .cholesky(Side::Lower)
             .map_err(|_| EstimationError::ModelIsIllConditioned {
                 condition_number: f64::INFINITY,
             })?;
-    let diagonal = factor.diag();
-    if diagonal
-        .iter()
-        .any(|value| !value.is_finite() || *value <= 0.0)
-    {
-        return Err(EstimationError::ModelIsIllConditioned {
-            condition_number: f64::INFINITY,
-        });
-    }
-    let log_determinant = 2.0 * diagonal.iter().map(|value| value.ln()).sum::<f64>();
-    let identity = Array2::<f64>::eye(matrix.nrows());
-    let inverse = factor.solve_mat(&identity);
-    if !log_determinant.is_finite() || inverse.iter().any(|value| !value.is_finite()) {
-        return Err(EstimationError::ModelIsIllConditioned {
-            condition_number: f64::INFINITY,
-        });
-    }
-    Ok((inverse, log_determinant))
+    TangentPrecisionFactor::from_upper(factor.lower_triangular().t().to_owned())
 }
 
-fn trace_local_base(inverse: &Array2<f64>, penalty: &PreparedPenalty, lambda: f64) -> f64 {
-    let mut trace = 0.0;
-    for row in 0..penalty.local.nrows() {
-        for col in 0..penalty.local.ncols() {
-            trace += lambda
-                * penalty.local[[row, col]]
-                * inverse[[penalty.column_start + col, penalty.column_start + row]];
-        }
-    }
-    trace
-}
-
-fn trace_local_joint(
-    inverse: &Array2<f64>,
+/// Columns are the scaled penalty root, with the output identity implicit
+/// on the isotropic path and lifted only for varying Fisher geometry.
+fn scaled_penalty_root(
     penalty: &PreparedPenalty,
     lambda: f64,
-    n_outputs: usize,
-) -> f64 {
-    let mut trace = 0.0;
-    for output in 0..n_outputs {
-        for row in 0..penalty.local.nrows() {
-            for col in 0..penalty.local.ncols() {
-                trace += lambda
-                    * penalty.local[[row, col]]
-                    * inverse[[
-                        (penalty.column_start + col) * n_outputs + output,
-                        (penalty.column_start + row) * n_outputs + output,
-                    ]];
-            }
-        }
-    }
-    trace
-}
-
-fn apply_local_base_matrix(
-    penalty: &PreparedPenalty,
-    lambda: f64,
-    matrix: &Array2<f64>,
-) -> Array2<f64> {
-    let mut output = Array2::<f64>::zeros(matrix.dim());
-    for row in 0..penalty.local.nrows() {
-        for col in 0..penalty.local.ncols() {
-            let value = lambda * penalty.local[[row, col]];
-            for output_index in 0..matrix.ncols() {
-                output[[penalty.column_start + row, output_index]] +=
-                    value * matrix[[penalty.column_start + col, output_index]];
-            }
-        }
-    }
-    output
-}
-
-fn apply_local_joint_vector(
-    penalty: &PreparedPenalty,
-    lambda: f64,
-    n_outputs: usize,
-    vector: &Array1<f64>,
-) -> Array1<f64> {
-    let mut output = Array1::<f64>::zeros(vector.len());
-    for output_index in 0..n_outputs {
-        for row in 0..penalty.local.nrows() {
-            for col in 0..penalty.local.ncols() {
-                output[(penalty.column_start + row) * n_outputs + output_index] += lambda
-                    * penalty.local[[row, col]]
-                    * vector[(penalty.column_start + col) * n_outputs + output_index];
-            }
-        }
-    }
-    output
-}
-
-fn sandwich_local_base(
-    inverse: &Array2<f64>,
-    penalty: &PreparedPenalty,
-    lambda: f64,
-) -> Array2<f64> {
-    let dimension = inverse.nrows();
-    let mut result = Array2::<f64>::zeros((dimension, dimension));
-    for local_row in 0..penalty.local.nrows() {
-        let global_row = penalty.column_start + local_row;
-        for local_col in 0..penalty.local.ncols() {
-            let value = lambda * penalty.local[[local_row, local_col]];
-            if value == 0.0 {
-                continue;
-            }
-            let global_col = penalty.column_start + local_col;
-            for row in 0..dimension {
-                let left = inverse[[row, global_row]] * value;
-                for col in 0..dimension {
-                    result[[row, col]] += left * inverse[[global_col, col]];
-                }
-            }
-        }
-    }
-    result
-}
-
-fn sandwich_local_joint(
-    inverse: &Array2<f64>,
-    penalty: &PreparedPenalty,
-    lambda: f64,
+    n_coefficients: usize,
     n_outputs: usize,
 ) -> Array2<f64> {
-    let dimension = inverse.nrows();
-    let mut result = Array2::<f64>::zeros((dimension, dimension));
-    for output in 0..n_outputs {
-        for local_row in 0..penalty.local.nrows() {
-            let global_row = (penalty.column_start + local_row) * n_outputs + output;
-            for local_col in 0..penalty.local.ncols() {
-                let value = lambda * penalty.local[[local_row, local_col]];
-                if value == 0.0 {
-                    continue;
-                }
-                let global_col = (penalty.column_start + local_col) * n_outputs + output;
-                for row in 0..dimension {
-                    let left = inverse[[row, global_row]] * value;
-                    for col in 0..dimension {
-                        result[[row, col]] += left * inverse[[global_col, col]];
-                    }
-                }
+    let mut root = Array2::zeros((n_coefficients * n_outputs, penalty.rank * n_outputs));
+    let scale = lambda.sqrt();
+    for mode in 0..penalty.rank {
+        for col in 0..penalty.root.ncols() {
+            for output in 0..n_outputs {
+                root[[
+                    (penalty.column_start + col) * n_outputs + output,
+                    mode * n_outputs + output,
+                ]] = scale * penalty.root[[mode, col]];
             }
         }
     }
-    result
+    root
 }
 
-fn trace_sandwich_local_base(
-    sandwich: &Array2<f64>,
-    penalty: &PreparedPenalty,
-    lambda: f64,
-) -> f64 {
-    let mut trace = 0.0;
-    for row in 0..penalty.local.nrows() {
-        for col in 0..penalty.local.ncols() {
-            trace += lambda
-                * penalty.local[[row, col]]
-                * sandwich[[penalty.column_start + col, penalty.column_start + row]];
+/// tr(A⁻¹ Rj Rjᵀ) and tr(A⁻¹ Rj Rjᵀ A⁻¹ Rk Rkᵀ).
+/// The cross trace is ||Rjᵀ A⁻¹ Rk||²_F, so no dense inverse
+/// sandwiches or cancellation between their large entries is required.
+fn penalty_root_traces(
+    factor: &TangentPrecisionFactor,
+    roots: &[Array2<f64>],
+) -> (Array1<f64>, Array2<f64>) {
+    let whitened: Vec<Array2<f64>> = roots.iter().map(|root| factor.whiten(root)).collect();
+    let mut traces = Array1::zeros(roots.len());
+    let mut cross_traces = Array2::zeros((roots.len(), roots.len()));
+    for j in 0..roots.len() {
+        traces[j] = sum_products(&whitened[j], &whitened[j]);
+        for k in 0..=j {
+            let product = whitened[j].t().dot(&whitened[k]);
+            let value = sum_products(&product, &product);
+            cross_traces[[j, k]] = value;
+            cross_traces[[k, j]] = value;
         }
     }
-    trace
-}
-
-fn trace_sandwich_local_joint(
-    sandwich: &Array2<f64>,
-    penalty: &PreparedPenalty,
-    lambda: f64,
-    n_outputs: usize,
-) -> f64 {
-    let mut trace = 0.0;
-    for output in 0..n_outputs {
-        for row in 0..penalty.local.nrows() {
-            for col in 0..penalty.local.ncols() {
-                trace += lambda
-                    * penalty.local[[row, col]]
-                    * sandwich[[
-                        (penalty.column_start + col) * n_outputs + output,
-                        (penalty.column_start + row) * n_outputs + output,
-                    ]];
-            }
-        }
-    }
-    trace
+    (traces, cross_traces)
 }
 
 fn add_base_penalty_to_joint(joint: &mut Array2<f64>, penalty: &Array2<f64>, n_outputs: usize) {
@@ -1488,18 +1494,6 @@ fn add_base_penalty_to_joint(joint: &mut Array2<f64>, penalty: &Array2<f64>, n_o
             }
         }
     }
-}
-
-fn symmetric_average(matrix: &Array2<f64>) -> Array2<f64> {
-    let mut output = matrix.clone();
-    for row in 0..matrix.nrows() {
-        for col in (row + 1)..matrix.ncols() {
-            let average = 0.5 * (matrix[[row, col]] + matrix[[col, row]]);
-            output[[row, col]] = average;
-            output[[col, row]] = average;
-        }
-    }
-    output
 }
 
 fn predict_from_coefficients(
@@ -1627,6 +1621,10 @@ fn bounded_roundoff_value(
 fn invalid(message: impl Into<String>) -> EstimationError {
     EstimationError::InvalidInput(message.into())
 }
+
+#[cfg(test)]
+#[path = "response_geometry_rotation_tests.rs"]
+mod rotation_tests;
 
 #[cfg(test)]
 mod tests {

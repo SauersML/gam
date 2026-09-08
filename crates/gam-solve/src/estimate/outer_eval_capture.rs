@@ -451,7 +451,7 @@ pub(crate) fn take_outer_curvature_snapshot() -> Option<OuterCurvatureSnapshot> 
 ///
 /// This is public only so sibling workspace evaluators can report through the
 /// same typed sink after their own nonconvex mode selection. It is a no-op
-/// unless `enable_outer_gradient_fd_capture` armed the calling thread.
+/// unless [`enable_outer_gradient_fd_capture_over_theta`] armed the calling thread.
 pub fn record_outer_criterion_components(cost: f64, components: [f64; 4]) {
     FD_CAPTURE.with(|capture| {
         if let Some(state) = capture.borrow_mut().as_mut()
@@ -466,7 +466,7 @@ pub fn record_outer_criterion_components(cost: f64, components: [f64; 4]) {
 ///
 /// Public for the same reason as [`record_outer_criterion_components`]: the
 /// correction is applied in the evaluator, not in the outer runner that builds
-/// the record. No-op unless `enable_outer_gradient_fd_capture` armed this
+/// the record. No-op unless [`enable_outer_gradient_fd_capture_over_theta`] armed this
 /// thread. Called on every application, so the LAST application before the
 /// record is finalized is the one reported -- the seed the audit grades.
 pub fn record_psi_gram_anchor_deltas(gram_delta_max_abs: f64, rhs_delta_max_abs: f64) {

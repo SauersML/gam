@@ -168,6 +168,8 @@ mod per_term_edf_tests {
                 beta_covariance_frequentist: None,
                 coefficient_influence: None,
                 weighted_gram: None,
+                bias_correction_beta: None,
+                bias_correction_jacobian: None,
             }),
             fitted_link: FittedLinkState::Standard(None),
             geometry: None,
@@ -199,30 +201,6 @@ mod per_term_edf_tests {
     /// term's EDF, which is structurally impossible for a sum of non-negative
     /// per-term contributions. After the optimizer reconciles both channels to
     /// the same rank-revealing inverse, `edf_total ≥ max per-term EDF` holds.
-    /// A custom-family fit has no dispersion to scale `H⁻¹` by: its objective
-    /// is the complete negative log-likelihood, so the Laplace covariance is
-    /// the inverse penalized Hessian as it stands (gam#2765). A Gaussian fit
-    /// keeps its profiled `σ̂²`.
-    #[test]
-    fn a_fit_without_an_engine_level_family_scales_its_precision_by_one_2765() {
-        let gaussian = fit_single_thinplate_consistent_edf();
-        let gaussian_scale = gaussian
-            .coefficient_covariance_scale()
-            .expect("a Gaussian fit has a profiled scale");
-        assert!(
-            (gaussian_scale - gaussian.standard_deviation * gaussian.standard_deviation).abs()
-                <= 1e-12 * (1.0 + gaussian_scale.abs()),
-            "Gaussian scale must be σ̂²: got {gaussian_scale}, σ̂ = {}",
-            gaussian.standard_deviation
-        );
-        let mut custom = fit_single_thinplate_consistent_edf();
-        custom.likelihood_family = None;
-        assert_eq!(
-            custom.coefficient_covariance_scale().expect("a custom-family scale is defined"),
-            1.0
-        );
-    }
-
     fn fit_single_thinplate_consistent_edf() -> UnifiedFitResult {
         // p = 11: one intercept column (index 0, unpenalised, EDF 1) plus a
         // 10-coefficient thin-plate block that has spent 7 EDF (F diagonal 0.7).
@@ -279,6 +257,8 @@ mod per_term_edf_tests {
                 beta_covariance_frequentist: None,
                 coefficient_influence: Some(influence),
                 weighted_gram: None,
+                bias_correction_beta: None,
+                bias_correction_jacobian: None,
             }),
             fitted_link: FittedLinkState::Standard(None),
             geometry: None,
@@ -354,6 +334,8 @@ mod per_term_edf_tests {
                 // per-block-trace channel, where the `penalty_cursor` walk matters.
                 coefficient_influence: None,
                 weighted_gram: None,
+                bias_correction_beta: None,
+                bias_correction_jacobian: None,
             }),
             fitted_link: FittedLinkState::Standard(None),
             geometry: None,
@@ -557,6 +539,8 @@ mod per_term_edf_tests {
                 // `penalty_cursor` keys into `penalty_block_trace`.
                 coefficient_influence: None,
                 weighted_gram: None,
+                bias_correction_beta: None,
+                bias_correction_jacobian: None,
             }),
             fitted_link: FittedLinkState::Standard(None),
             geometry: None,
@@ -948,26 +932,6 @@ pub struct CurvatureFloorClearance {
     /// historical `√ε·max(1, max|H_ii|)` arithmetic shift is what decided.
     #[serde(default)]
     pub measured_resolution: f64,
-    /// The shift the verdict was ACTUALLY decided at (#2748): the larger of
-    /// [`Self::measured_resolution`] and the arithmetic shift
-    /// `sqrt(eps)*max(max|H_ii|, 1)`.
-    ///
-    /// [`Self::measured_resolution`] is `0.0` whenever no identity could be
-    /// taken, and on a ρ-Hessian whose largest diagonal is under 1 the shift
-    /// that then decides is a flat `1.49e-8` — eight orders above the
-    /// eigensolver backward error a second layer would derive for itself.
-    /// Recording `0.0` for "the arithmetic shift decided" is the same defect
-    /// [`Self::floored_min_eigenvalue`] exists to fix one field earlier: the
-    /// quantity the decision was taken against was not on the record.
-    ///
-    /// Measured on gam#2748's `geo_disease` k=12 cell: `lambda_min(H+diag|g|)`
-    /// `= -1.129942e-8` cleared at `1.490116e-8`, and the smoothing correction
-    /// then refused the same direction at `2.191651e-16`.
-    ///
-    /// `#[serde(default)]` so a certificate serialized before this field
-    /// existed still deserializes; those carry no measurement here.
-    #[serde(default)]
-    pub decided_at_resolution: f64,
     /// Whether `H + diag(|g|)` is positive semidefinite on that sub-block.
     pub cleared: bool,
 }
@@ -1519,28 +1483,8 @@ impl OuterCriterionCertificate {
             None => "stationary".to_string(),
             Some(refusal) => refusal.to_string(),
         };
-        // A `psd=false` that was nonetheless admitted was admitted BY the
-        // gradient-residue floor, and the numbers that admitted it are already
-        // on the certificate — they were simply never rendered (#2748). A line
-        // reading `hessian_psd=NO ... → stationary` is unreadable without them,
-        // and the downstream smoothing correction re-judges the same direction
-        // and prints its OWN full ledger when it refuses; with both rendered the
-        // two standards can be compared in one log instead of inferred from two.
-        let curvature_detail = match (self.curvature, self.curvature_floor) {
-            (CurvatureEvidence::Measured { psd: false }, Some(clearance)) => format!(
-                " (cleared={} λ_min(H)={:.6e} λ_min(H+diag|g|)={:.6e} max_k|g_k|={:.6e} \
-                 measured_resolution={:.6e} decided_at={:.6e})",
-                clearance.cleared,
-                clearance.interior_min_eigenvalue,
-                clearance.floored_min_eigenvalue,
-                clearance.gradient_floor,
-                clearance.measured_resolution,
-                clearance.decided_at_resolution,
-            ),
-            _ => String::new(),
-        };
         format!(
-            "{stationarity} hessian_psd={}{curvature_detail} curvature_source={curvature_source} railed={} → {verdict}",
+            "{stationarity} hessian_psd={} curvature_source={curvature_source} railed={} → {verdict}",
             self.curvature, railed,
         )
     }
@@ -1783,6 +1727,7 @@ pub struct FitOptions {
     /// evaluator so baseline fits, spatial hyperparameter evaluations, outer
     /// line searches, final refits, and inference all optimize the same target.
     pub firth_bias_reduction: bool,
+    pub adaptive_regularization: Option<AdaptiveRegularizationOptions>,
     /// Fixed prior on smoothing parameters for explicit joint HMC sampling
     /// flows.
     ///
@@ -1817,6 +1762,7 @@ impl Default for FitOptions {
             nullspace_dims: Vec::new(),
             linear_constraints: None,
             firth_bias_reduction: false,
+            adaptive_regularization: None,
             rho_prior: gam_problem::RhoPrior::default(),
             kronecker_penalty_system: None,
             kronecker_factored: None,
@@ -2244,6 +2190,33 @@ mod shipped_criterion_identity_tests {
         assert!(!mixed.upper_tail_gradient_vanishes_everywhere(2));
         // Out of range is malformed, not flat.
         assert!(!mixed.upper_tail_gradient_vanishes(2));
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AdaptiveRegularizationOptions {
+    pub enabled: bool,
+    pub max_mm_iter: usize,
+    pub beta_rel_tol: f64,
+    pub max_epsilon_outer_iter: usize,
+    pub epsilon_log_step: f64,
+    pub min_epsilon: f64,
+    pub weight_floor: f64,
+    pub weight_ceiling: f64,
+}
+
+impl Default for AdaptiveRegularizationOptions {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            max_mm_iter: 10,
+            beta_rel_tol: 1e-3,
+            max_epsilon_outer_iter: 4,
+            epsilon_log_step: std::f64::consts::LN_2,
+            min_epsilon: 1e-8,
+            weight_floor: 1e-8,
+            weight_ceiling: 1e8,
+        }
     }
 }
 
@@ -2761,6 +2734,20 @@ pub struct FitInference {
     /// correction indefinite and the corrected EDF drop below the conditional).
     #[serde(default)]
     pub weighted_gram: Option<Array2<f64>>,
+    /// O(n⁻¹) frequentist bias-correction vector b̂ = H⁻¹ S(λ̂) β̂ in the
+    /// original (untransformed) coefficient basis. Predictions apply
+    /// η̂_BC(x) = η̂(x) + s_*(x)^T b̂ to remove first-order shrinkage bias.
+    #[serde(default)]
+    pub bias_correction_beta: Option<Array1<f64>>,
+    /// O(n⁻¹) frequentist bias-correction Jacobian `A = I + H⁻¹ S(λ̂)` — the
+    /// fixed-ρ linearization `dβ_BC/dβ̂` of the bias-corrected coefficient
+    /// `β_BC = β̂ + b̂`. A credible band centred at `β_BC` must report the
+    /// covariance of that estimator, `A·V·Aᵀ`. Conditional and smoothing-corrected
+    /// covariances both describe β; prediction applies this Jacobian only when
+    /// it applies the corresponding bias correction to the centre.
+    /// `None` when the full inverse (hence `A`) was unavailable.
+    #[serde(default)]
+    pub bias_correction_jacobian: Option<Array2<f64>>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -3202,6 +3189,8 @@ mod assembly_inner_status_gate_tests {
                 beta_covariance_frequentist: None,
                 coefficient_influence: None,
                 weighted_gram: None,
+                bias_correction_beta: None,
+                bias_correction_jacobian: None,
             }),
             fitted_link: FittedLinkState::Standard(None),
             geometry: None,
@@ -3669,6 +3658,9 @@ impl FitInference {
                 "fit_result.weighted_gram",
                 v.iter().copied(),
             )?;
+        }
+        if let Some(v) = self.bias_correction_beta.as_ref() {
+            validate_all_finite_estimation("fit_result.bias_correction_beta", v.iter().copied())?;
         }
         if let Some(v) = self.beta_standard_errors_corrected.as_ref() {
             validate_all_finite_estimation(
@@ -4450,7 +4442,6 @@ impl UnifiedFitResult {
 }
 
 impl UnifiedFitResult {
-
     /// Get the conditional Bayesian covariance matrix (`Vb`) in the saved/raw
     /// coefficient frame, if available.
     ///
@@ -4570,13 +4561,8 @@ impl UnifiedFitResult {
     /// profiled residual variance `σ̂²` for the scale-free profiled Gaussian and
     /// `1.0` for every family whose IRLS working weight already carries the
     /// dispersion / full Fisher information (Gamma, Tweedie, Beta,
-    /// Negative-Binomial, Poisson, Binomial) — see #679. A fit with no
-    /// engine-level family is a custom-family fit whose objective is its
-    /// complete negative log-likelihood — every scale it has is a coefficient —
-    /// so its Laplace posterior precision is the penalized Hessian itself and
-    /// the scale is `1.0`. Refusing it here left a saved custom-family model
-    /// (survival marginal-slope, fitted through the library route) unable to
-    /// reconstruct the covariance the load gate asks for (gam#2765).
+    /// Negative-Binomial, Poisson, Binomial) — see #679. For custom/GAMLSS
+    /// paths with no engine-level family it is undefined.
     pub fn coefficient_covariance_scale(&self) -> Result<f64, EstimationError> {
         match &self.likelihood_family {
             Some(spec) => {
@@ -4595,7 +4581,10 @@ impl UnifiedFitResult {
                 glm.coefficient_covariance_scale(dispersion.phi())
                     .map_err(|error| EstimationError::InvalidInput(error.to_string()))
             }
-            None => Ok(1.0),
+            None => Err(EstimationError::InvalidInput(
+                "this fit has no engine-level family and therefore no scalar coefficient-covariance scale"
+                    .to_string(),
+            )),
         }
     }
 
@@ -4619,14 +4608,17 @@ impl UnifiedFitResult {
     ///     Var(β|y) = E_ρ[φ·H(ρ)⁻¹] + Cov_ρ[β̂(ρ)],
     /// ```
     ///
-    /// so it is the wider of the two, and it is the one whose nominal coverage
-    /// is honest when `λ̂` is itself an estimate. Use
+    /// which integrates conditional covariance over the smoothing posterior.
+    /// Its difference from covariance conditional on the mode can have either
+    /// sign: total covariance compares against the *average* conditional
+    /// covariance, not its value at `ρ̂`. Interval calibration must therefore
+    /// be checked against the intended posterior or repeated-data coverage. Use
     /// [`Self::beta_covariance`] instead only when `λ` is fixed by the caller,
     /// or when you specifically want the conditional-on-`λ̂` object.
     ///
-    /// How much wider is a property of the fit, not a constant: it is small
-    /// where the outer criterion is sharply determined and larger where it is
-    /// broad. A gap of ORDERS of magnitude is a defect, not a feature —
+    /// The smoothing contribution is small where the outer criterion is sharply
+    /// determined and can be large where it is broad. Large differences require
+    /// inspecting the posterior integration diagnostics;
     /// [`SmoothingCorrectionMethod::SigmaPointCubature::max_node_criterion_rise`]
     /// is the published diagnostic for the one that produced #2728.
     pub fn beta_covariance_corrected(&self) -> Option<&Array2<f64>> {
@@ -4704,6 +4696,23 @@ impl UnifiedFitResult {
                 standard_errors,
                 covariance: self.beta_covariance(),
             })
+    }
+
+    /// Get the O(n⁻¹) bias-correction vector b̂ = H⁻¹ S(λ̂) β̂ in the
+    /// original coefficient basis, if available.
+    pub fn bias_correction_beta(&self) -> Option<&Array1<f64>> {
+        self.inference
+            .as_ref()
+            .and_then(|inf| inf.bias_correction_beta.as_ref())
+    }
+
+    /// Get the O(n⁻¹) bias-correction Jacobian `A = I + H⁻¹ S(λ̂)`, if available.
+    /// Prediction uses it to form the conditional bias-corrected band covariance
+    /// `A·V·Aᵀ` (#1870); `None` when the full inverse was unavailable.
+    pub fn bias_correction_jacobian(&self) -> Option<&Array2<f64>> {
+        self.inference
+            .as_ref()
+            .and_then(|inf| inf.bias_correction_jacobian.as_ref())
     }
 
     /// Get the penalized Hessian if available.
@@ -5002,4 +5011,3 @@ impl UnifiedFitResult {
         }
     }
 }
-

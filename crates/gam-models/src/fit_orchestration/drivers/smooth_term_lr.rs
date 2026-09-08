@@ -2476,17 +2476,31 @@ pub fn smooth_term_lr_inference_forspec(
         // On a null-true double-penalty smooth at `ρ̂ = (18, −24)` each axis has
         // ~50 of room and the intersection leaves 18; when one `λ̂` rails the
         // intersection is EMPTY and the replay was declined outright.
-        let reach = 2.0 * gam_solve::estimate::RHO_BOUND;
-        let log_scale_windows: Vec<(f64, f64)> = term_log_lambda
+        // #2812: each term's log-scale window is its own resolvability
+        // interval, `[ln(ε γ_min), ln(γ_max / ε)]` over the design-relative
+        // penalty spectrum on the tested block, expressed relative to `ρ̂`.
+        // Below it the term is unpenalized to working precision, above it the
+        // term sits on its null space; the replay has nothing to explore past
+        // either edge. A term whose geometry cannot be projected keeps the
+        // precision box around unit strength.
+        let block_gram = {
+            let dense = full.design.design.to_dense();
+            let block = dense.slice(ndarray::s![.., coeff_range.start..coeff_range.end]);
+            block.t().dot(&block)
+        };
+        let log_scale_windows: Vec<(f64, f64)> = term_penalties
             .iter()
-            .map(|&rho| {
-                // Clamped to the box's own full width: no `ρ` can move further
-                // than from one wall to the other, and a `λ̂` that underflowed to
-                // zero would otherwise put `ln t` at `±744` and `t` at infinity.
-                (
-                    (-gam_solve::estimate::RHO_BOUND - rho).clamp(-reach, reach),
-                    (gam_solve::estimate::RHO_BOUND - rho).clamp(-reach, reach),
-                )
+            .zip(term_log_lambda.iter())
+            .map(|(local, &rho)| {
+                let interval =
+                    gam_solve::estimate::rho_domain::penalty_range_gammas_from_gram(
+                        &block_gram,
+                        local,
+                    )
+                    .as_deref()
+                    .and_then(gam_solve::estimate::rho_domain::resolvability_interval);
+                let (lo, hi) = gam_solve::estimate::rho_domain::coordinate_domain(interval, None);
+                (lo - rho, hi - rho)
             })
             .collect();
         let reference = lr_null_reference(

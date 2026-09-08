@@ -151,10 +151,9 @@ pub trait ExactNewtonJointPsiWorkspace: Send + Sync {
         d_beta_flat: &Array1<f64>,
     ) -> Result<Option<DriftDerivResult>, String>;
 
-    /// [`Self::hessian_directional_derivative`] along every one of the `total`
-    /// joint coefficient axes at `psi_index`, in axis order. The default is the
-    /// per-axis sweep; a workspace whose family can build the set from one row
-    /// pass overrides it (gam#979). `None` on any axis is `None` for the set.
+    /// Materialize the psi-Hessian derivative along each joint coefficient
+    /// basis vector, in coefficient order. Row-streaming workspaces can compute
+    /// this same tensor in one pass by implementing this method directly.
     fn hessian_directional_derivatives_all_beta_axes(
         &self,
         psi_index: usize,
@@ -162,25 +161,43 @@ pub trait ExactNewtonJointPsiWorkspace: Send + Sync {
     ) -> Result<Option<Vec<DriftDerivResult>>, String> {
         per_axis_psi_hessian_directional_derivatives(self, psi_index, total)
     }
+
+    /// {D_beta_axis D_beta_direction D_psi H}, under this workspace's row measure.
+    fn hessian_second_directional_derivative_all_beta_axes(
+        &self,
+        psi_index: usize,
+        d_beta_flat: &Array1<f64>,
+    ) -> Result<Option<Vec<Array2<f64>>>, String> {
+        Err(format!("exact third information derivatives are unavailable for psi axis {psi_index} and coefficient direction of length {}", d_beta_flat.len()))
+    }
+
+    /// {D_beta_axis D_psi_i D_psi_j H}, under this workspace's row measure.
+    fn second_order_hessian_directional_derivative_all_beta_axes(
+        &self,
+        psi_i: usize,
+        psi_j: usize,
+    ) -> Result<Option<Vec<Array2<f64>>>, String> {
+        Err(format!("exact third information derivatives are unavailable for psi pair ({psi_i}, {psi_j})"))
+    }
 }
 
-/// The per-axis sweep behind
-/// [`ExactNewtonJointPsiWorkspace::hessian_directional_derivatives_all_beta_axes`],
-/// shared by the default and by overrides that fall back to it for the ψ axes
-/// their batched sweep does not cover.
-pub fn per_axis_psi_hessian_directional_derivatives<W: ExactNewtonJointPsiWorkspace + ?Sized>(
-    workspace: &W,
+/// Assemble the coefficient-axis tensor from exact directional derivatives.
+/// A missing axis makes the whole tensor unavailable; errors propagate intact.
+pub fn per_axis_psi_hessian_directional_derivatives(
+    workspace: &(impl ExactNewtonJointPsiWorkspace + ?Sized),
     psi_index: usize,
     total: usize,
 ) -> Result<Option<Vec<DriftDerivResult>>, String> {
     let mut axes = Vec::with_capacity(total);
+    let mut direction = Array1::<f64>::zeros(total);
     for axis in 0..total {
-        let mut direction = Array1::<f64>::zeros(total);
         direction[axis] = 1.0;
-        match workspace.hessian_directional_derivative(psi_index, &direction)? {
-            Some(drift) => axes.push(drift),
-            None => return Ok(None),
-        }
+        let Some(derivative) = workspace.hessian_directional_derivative(psi_index, &direction)?
+        else {
+            return Ok(None);
+        };
+        axes.push(derivative);
+        direction[axis] = 0.0;
     }
     Ok(Some(axes))
 }

@@ -41,18 +41,6 @@
 //! - [`linalg`] — faer ↔ ndarray bridges + numerics helpers
 //! - [`gpu`] — runtime CUDA dispatch for hot linear algebra paths
 
-#![warn(missing_docs)]
-
-/// A compiled copy of the [Rust getting-started guide](crate::getting_started).
-///
-/// Its documentation is sourced from the repository guide so the example is
-/// checked as a rustdoc test; the module also exposes the formula-fit entry
-/// point used by that example.
-#[doc = include_str!("../docs/rust-library-surface.md")]
-pub mod getting_started {
-    pub use gam_models::fit_orchestration::fit_from_formula;
-}
-
 // `config_resolve` was extracted from `src/main/` so the CLI driver and the
 // Python FFI (gam-pyffi) can share the same JSON → FitConfig resolver; pull
 // the current crate in under the `gam` alias so the file can keep using
@@ -180,14 +168,11 @@ pub use gam_solve::rho_uncertainty;
 /// (absent) glob entry with a compat module re-exporting the relocated layer.
 pub mod solver {
     pub use gam_solve::*;
-    /// Compatibility namespace for the high-level fit orchestration API.
     pub mod fit_orchestration {
         pub use gam_models::fit_orchestration::*;
     }
 }
-/// Smooth-term construction plus the sparse-autoencoder term extension.
 pub mod terms {
-    /// Sparse-autoencoder smooth and model-building APIs.
     pub use gam_sae as sae;
     pub use gam_terms::*;
 }

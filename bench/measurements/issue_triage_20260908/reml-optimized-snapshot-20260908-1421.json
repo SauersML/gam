@@ -1,0 +1,17 @@
+{
+  "snapshot": "/scratch.global/sauer354/gam-deslop-a2-target/debug/deps/.reml-optimized-snapshot-20260908-1421",
+  "selected": {
+    "gam_models": "/scratch.global/sauer354/gam-deslop-a2-target/debug/deps/.reml-optimized-snapshot-20260908-1421/libgam_models-7529e38f1ae745f1.rlib",
+    "gam_solve": "/scratch.global/sauer354/gam-deslop-a2-target/debug/deps/.reml-optimized-snapshot-20260908-1421/libgam_solve-7f5b8ec14241822d.rlib",
+    "gam_terms": "/scratch.global/sauer354/gam-deslop-a2-target/debug/deps/.reml-optimized-snapshot-20260908-1421/libgam_terms-ca01838dc35d9557.rlib",
+    "gam_inference": "/scratch.global/sauer354/gam-deslop-a2-target/debug/deps/.reml-optimized-snapshot-20260908-1421/libgam_inference-bc64714db90024fb.rlib",
+    "gam_predict": "/scratch.global/sauer354/gam-deslop-a2-target/debug/deps/.reml-optimized-snapshot-20260908-1421/libgam_predict-5354e2c40a7ed4bf.rlib",
+    "gam_test_support": "/scratch.global/sauer354/gam-deslop-a2-target/debug/deps/.reml-optimized-snapshot-20260908-1421/libgam_test_support-cd0c07673d8e309b.rlib",
+    "gam_problem": "/scratch.global/sauer354/gam-deslop-a2-target/debug/deps/.reml-optimized-snapshot-20260908-1421/libgam_problem-a7ac6b5118c5d832.rlib",
+    "gam_data": "/scratch.global/sauer354/gam-deslop-a2-target/debug/deps/.reml-optimized-snapshot-20260908-1421/libgam_data-de6d167f36044507.rlib",
+    "ndarray": "/scratch.global/sauer354/gam-deslop-a2-target/debug/deps/.reml-optimized-snapshot-20260908-1421/libndarray-3e2fc606731d0706.rlib",
+    "log": "/scratch.global/sauer354/gam-deslop-a2-target/debug/deps/.reml-optimized-snapshot-20260908-1421/liblog-b89474fc20d1da5a.rlib",
+    "opt": "/scratch.global/sauer354/gam-deslop-a2-target/debug/deps/.reml-optimized-snapshot-20260908-1421/libopt-5dde3eb0c3e8fe95.rlib"
+  },
+  "note": "terms/solve opt2; models opt1. New root zero-anisotropy and Cholesky roundoff gate included. Wheel terminal124 after all native libraries built; existing installed extension remains7112."
+}

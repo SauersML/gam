@@ -296,3 +296,35 @@ also contains concurrent macro work; clean committed-source CI remains
 required. A second-host attempt on `acn116` failed before execution (status
 255). These results repair the local rigid-third gates, not the outstanding
 whole-population, runtime-width hand-opponent, or physical-GPU requirements.
+
+The next source audit found that the empirical-rigid module retained a comment
+describing an exact fourth-order oracle after that oracle had been removed.
+Its remaining independent finite-difference test allows percent-level errors
+in the highest channels. The replacement uses a separate 15-coefficient
+bivariate Taylor polynomial, ordinary coefficient convolution, and a
+degree-by-degree solution of the calibration identity. Its CDF uses `libm`
+and its log composition is independent of the production signed-log-CDF
+derivative stack. It checks all 434 ordered V/G/H/T3/T4 entries over seven
+row regimes, both frailty settings, and an exact-zero slope, at a fixed
+**1e-9** scaled bound. Corruption controls reject non-finite pairs, sign
+flips, and a one-sided 1e-8 disagreement.
+
+Historical commit `84678107c` identifies the finite-only retired `cpu_oracle`
+as the secondary arm of the same Block10 test repaired above. The live test
+now numerically checks every matrix entry in that original g/h/w directional
+scope without skipping unconverged stencils; the defective retired hand arm
+is gone. This establishes the replacement's provenance, without claiming
+coverage of additional directions from that test alone.
+
+MSI verification passed all five empirical-rigid tests, including the new
+polynomial oracle and corruption controls, in **0.13 seconds**. Maximum scaled
+errors by order were **8.261e-16 / 7.043e-15 / 4.596e-14 / 3.426e-13 /
+1.597e-12**. The model build took **129.39 seconds**, reusing warm dependencies
+with optimization/LTO disabled and four pinned CPUs; these are correctness
+results, not speed evidence. Logs: `.buildd/issue932-empirical-model-build-aligned.log`
+and `.buildd/issue932-empirical-polynomial.log`; compiler arguments:
+`.buildd/issue932-empirical-model-argv.json`. An initial attempt combined a
+committed source snapshot with concurrent fifth-order callers and failed to
+compile; the successful run uses the consistent shared MSI checkout. Clean
+committed-source CI remains pending. No local compilation or numerical
+execution was used.

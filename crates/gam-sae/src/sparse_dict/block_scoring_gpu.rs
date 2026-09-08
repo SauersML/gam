@@ -11,7 +11,7 @@
 //! `minibatch × G` gate block, whose per-row top-`k` blocks route.
 //!
 //! This module offloads that curved score to the device by REUSING the atom
-//! lane's bit-exact score-GEMM ([`super::scoring_gpu::SCORE_BLOCK_KERNEL_SOURCE`]:
+//! lane's precision-parameterized score GEMM ([`super::scoring_gpu::SCORE_BLOCK_KERNEL_SOURCE`]:
 //! `sparse_dict_score_block_offset`) to form `z` a block-tile at a time, then a
 //! fused epilogue kernel (`sparse_dict_block_gate`, below) reduces each adjacent
 //! `b`-group to `gate_g`, then the atom lane's resident top-`s` fold
@@ -19,27 +19,13 @@
 //! gate stream is never downloaded: only the final `(block, gate)` shortlists
 //! (`m × k`) cross PCIe — the same shortlist-only discipline the atom lane keeps.
 //!
-//! # Precision of the gate (why f32 on the device is sufficient)
-//!
-//! The gate is `gate_g = sqrt(Σ_{r<b} z_{g,r}²)` over only `b ∈ {2,3,4}` terms.
-//! The device forms each `z_{g,r}` bit-identically to the CPU reference (the
-//! score GEMM forbids FMA contraction and accumulates in ascending `c` with
-//! separate-rounding `__fmul_rn`/`__fadd_rn`), and reduces the `b`-group with the
-//! same separate-rounding f32 ops plus an IEEE round-to-nearest `sqrtf` (which
-//! matches Rust's `f32::sqrt`). So the device gate equals the CPU gate to the
-//! bit, and the online fold uses the identical `(gate desc, block asc)` order as
-//! [`super::block::route_row_blocks`] — the routed block support is IDENTICAL to
-//! the CPU oracle by construction.
-//!
-//! Even without that bit-for-bit coincidence f32 would suffice for SELECTION:
-//! the accumulation error of a `b ≤ 4`-term sum of squares is a few ULP of the
-//! largest term, whereas a routing decision only changes when two DISTINCT
-//! blocks' gates fall within that few-ULP window — and two blocks whose subspace
-//! energies agree to f32 rounding contribute interchangeably to the
-//! reconstruction, with the tie broken deterministically by ascending block
-//! index. f64 on the device would move no selection boundary that a downstream
-//! consumer can observe. The selection-level equivalence to the CPU path is the
-//! contract (SPEC 20); the bit-identity is a bonus the shared arithmetic gives.
+//! Rows, frames, projections, gates and resident top-k values remain f64 across
+//! the device boundary. Projection accumulation uses ascending feature order
+//! with separate-rounding double multiplication and addition; the gate uses
+//! the same ordered squared norm. Equal energies do not make different
+//! subspaces interchangeable: support ties retain the ascending block-index
+//! rule, and numerical parity must be checked against the canonical scalar
+//! reference rather than assumed from a blocked GEMM's summation order.
 
 use ndarray::{ArrayView1, ArrayView2};
 
@@ -62,9 +48,8 @@ pub enum BlockRoutePath {
 /// `z` (`n_rows × (n_blocks·b)` row-major, block `g` occupying columns
 /// `[g·b, g·b+b)`), one thread per `(row, block)` output reduces that block's `b`
 /// adjacent `z` columns to `gate = sqrt(Σ_r z_r²)`, writing the `n_rows ×
-/// n_blocks` gate block. Separate-rounding f32 ops + IEEE `sqrtf` match the CPU
-/// reference ([`block_gate_block_cpu`]) to the bit, so the downstream fold
-/// selects the identical block support.
+/// n_blocks` gate block. Every projection and gate stays double precision;
+/// separate-rounding operations follow the canonical scalar reference order.
 ///
 /// `b` is a runtime argument (blocks are 2–4 rows and the width varies per fit),
 /// so unlike the score GEMM's `PP` this kernel is not monomorphised on it.
@@ -72,11 +57,11 @@ pub enum BlockRoutePath {
 pub const BLOCK_GATE_KERNEL_SOURCE: &str = r#"
 extern "C" __global__
 void sparse_dict_block_gate(
-    const float* __restrict__ z,   // [n_rows * (n_blocks*b)] row-major
+    const double* __restrict__ z,   // [n_rows * (n_blocks*b)] row-major
     int n_rows,
     int n_blocks,
     int b,
-    float* __restrict__ gates)     // [n_rows * n_blocks] row-major
+    double* __restrict__ gates)     // [n_rows * n_blocks] row-major
 {
   const long long total = (long long)n_rows * (long long)n_blocks;
   const long long idx = (long long)blockIdx.x * (long long)blockDim.x + (long long)threadIdx.x;
@@ -87,45 +72,42 @@ void sparse_dict_block_gate(
       (long long)row * ((long long)n_blocks * (long long)b) + (long long)block * (long long)b;
   // Separate-rounding accumulation of the b squared projections, ascending r —
   // identical arithmetic to the CPU `e += v*v`. b is tiny (2-4).
-  float acc = 0.0f;
+  double acc = 0.0;
   for (int r = 0; r < b; ++r) {
-    const float v = z[zbase + (long long)r];
-    acc = __fadd_rn(acc, __fmul_rn(v, v));
+    const double v = z[zbase + (long long)r];
+    acc = __dadd_rn(acc, __dmul_rn(v, v));
   }
-  gates[(long long)row * (long long)n_blocks + (long long)block] = sqrtf(acc);
+  gates[(long long)row * (long long)n_blocks + (long long)block] = __dsqrt_rn(acc);
 }
 "#;
 
 /// CPU reference for one row's group ℓ₂ **gate block**: `gate_g = ‖x D_gᵀ‖₂` for
 /// every block `g`, built from the same ascending-`c`, separate-rounding
-/// projection arithmetic ([`block_projections_row`]) the device score GEMM
-/// reproduces bit-for-bit, then the group ℓ₂ ([`block_gates`]). This is the
+/// projection arithmetic ([`block_projections_row`]) followed by the group ℓ₂
+/// ([`block_gates`]). This is the
 /// parity oracle the device gate is locked against.
 #[must_use]
 pub fn block_gate_row_cpu(
-    row: ArrayView1<'_, f32>,
-    decoder: ArrayView2<'_, f32>,
+    row: ArrayView1<'_, f64>,
+    decoder: ArrayView2<'_, f64>,
     n_blocks: usize,
     b: usize,
-) -> Vec<f32> {
+) -> Vec<f64> {
     let w = block_projections_row(row, decoder, n_blocks, b);
     block_gates(w.view())
 }
 
 /// CPU oracle for the block route: each row's top-`k` `(block, gate)` shortlist,
-/// selected by `(gate desc, block asc)`. Bit-identical to
-/// `super::block::route_block_minibatch` up to f32 ties (that path forms `z`
-/// with a blocked GEMM; this one and the device path share the ascending-`c`
-/// scalar dot), which are interchangeable for the reconstruction. This is the
-/// per-row-independent selection the device path must reproduce.
+/// selected by `(gate desc, block asc)`. This canonical scalar selection is
+/// the numerical authority for device routing and CPU tile refinement.
 #[must_use]
 pub fn route_blocks_cpu(
-    rows: ArrayView2<'_, f32>,
-    decoder: ArrayView2<'_, f32>,
+    rows: ArrayView2<'_, f64>,
+    decoder: ArrayView2<'_, f64>,
     n_blocks: usize,
     b: usize,
     k: usize,
-) -> Vec<Vec<(u32, f32)>> {
+) -> Vec<Vec<(u32, f64)>> {
     rows.outer_iter()
         .map(|row| {
             let gates = block_gate_row_cpu(row, decoder, n_blocks, b);
@@ -141,20 +123,20 @@ pub fn route_blocks_cpu(
 #[cfg(target_os = "linux")]
 pub const DEVICE_BLOCK_GATE_MIN_ELEMS: usize = gam_gpu::DEFAULT_DICTIONARY_SCORE_MIN_ELEMS;
 
-/// Peak `z` score elements per device launch. The router walks `G` in
-/// block-tiles sized so each launch's `n_rows × (tile_blocks·b)` `z` block stays
-/// under this cap, keeping peak score memory bounded independent of `G`.
+/// Target bytes for each `z` score buffer, shared by the CPU and GPU tile
+/// planners. A required whole block can exceed the target; its actual f64
+/// allocation is retained rather than silently pricing its elements as f32.
 #[cfg(target_os = "linux")]
-const GPU_BLOCK_ROUTE_TILE_ELEMS: usize = gam_gpu::DEFAULT_DICTIONARY_SCORE_TILE_ELEMS;
+const GPU_BLOCK_ROUTE_TILE_BYTES: usize = gam_gpu::DEFAULT_DICTIONARY_SCORE_TILE_BYTES;
 
 #[cfg(target_os = "linux")]
 pub fn route_blocks_required(
-    rows: ArrayView2<'_, f32>,
-    decoder: ArrayView2<'_, f32>,
+    rows: ArrayView2<'_, f64>,
+    decoder: ArrayView2<'_, f64>,
     b: usize,
     k: usize,
     mode: gam_gpu::GpuPolicy,
-) -> Result<(Vec<Vec<(u32, f32)>>, BlockRoutePath, usize), gam_gpu::GpuError> {
+) -> Result<(Vec<Vec<(u32, f64)>>, BlockRoutePath, usize), gam_gpu::GpuError> {
     use gam_gpu::GpuPolicy;
 
     let m = rows.nrows();
@@ -167,14 +149,15 @@ pub fn route_blocks_required(
     let g = krows / b;
     let active = k.max(1).min(g.max(1));
 
-    // Production CPU fallback: the blocked-GEMM router — the same top-`k`
-    // support as the scalar oracle (`route_blocks_cpu`, which stays as the
-    // device parity reference) but ~2 orders of magnitude faster. Under the
+    // Production CPU route: the blocked-GEMM router. Its screening and scalar
+    // refinement must retain the canonical support near routing ties. Under the
     // default `Auto` policy every below-break-even minibatch and every
     // CUDA-less Linux host lands here, so this closure IS the hot CPU path
     // (#2242: the scalar per-row oracle was burning 75% of block-lane cycles).
-    let cpu_tile_blocks =
-        (GPU_BLOCK_ROUTE_TILE_ELEMS / (rows.nrows().max(1) * b.max(1))).clamp(1, g.max(1));
+    let cpu_tile_blocks = (GPU_BLOCK_ROUTE_TILE_BYTES
+        / std::mem::size_of::<f64>()
+        / (rows.nrows().max(1) * b.max(1)))
+    .clamp(1, g.max(1));
     let cpu_route =
         || super::block::route_block_minibatch(rows, decoder, g, b, active, cpu_tile_blocks);
 
@@ -188,8 +171,9 @@ pub fn route_blocks_required(
         m,
         krows,
         decoder.ncols(),
+        gam_gpu::DictionaryScorePrecision::F64,
         DEVICE_BLOCK_GATE_MIN_ELEMS,
-        GPU_BLOCK_ROUTE_TILE_ELEMS,
+        GPU_BLOCK_ROUTE_TILE_BYTES,
     );
     if !plan.device_admitted {
         if mode == GpuPolicy::Required {
@@ -201,8 +185,8 @@ pub fn route_blocks_required(
             ));
         }
         gam_gpu::engagement::note_route_engagement(
-        "gam-sae sparse_dict block-gate router",
-        "falling back to CPU",
+            "gam-sae sparse_dict block-gate router",
+            "falling back to CPU",
             false,
             &format!(
                 "block {m}x{krows} = {} elems below the device launch break-even \
@@ -223,14 +207,16 @@ pub fn route_blocks_required(
     };
     if runtime.is_none() {
         gam_gpu::engagement::note_route_engagement(
-        "gam-sae sparse_dict block-gate router",
-        "falling back to CPU",
-        false, "Auto admission found no CUDA device");
+            "gam-sae sparse_dict block-gate router",
+            "falling back to CPU",
+            false,
+            "Auto admission found no CUDA device",
+        );
         return Ok((cpu_route(), BlockRoutePath::Cpu, 0));
     }
 
     // Blocks per launch: bound the per-launch `z` block `m × (tile_blocks·b)` to
-    // GPU_BLOCK_ROUTE_TILE_ELEMS, at least one block, never more than G.
+    // The byte target at f64 precision, at least one block, never more than G.
     let tile_blocks = (plan.tile_items / b.max(1)).clamp(1, g);
 
     let out = device::route_blocks_device(rows, decoder, b, g, active, tile_blocks)?;
@@ -264,13 +250,16 @@ mod device {
         BACKEND.get_or_probe("sparse_dict_block_gate", Backend::from_parts)
     }
 
-    /// Combined NVRTC source: the atom lane's bit-exact score GEMM + top-`s` fold
+    /// Combined NVRTC source: the shared score GEMM + top-`s` fold in f64
     /// ([`super::super::scoring_gpu::score_block_kernel_source`], which bakes `PP`)
     /// plus this lane's ℓ₂-gate epilogue ([`super::BLOCK_GATE_KERNEL_SOURCE`]).
     fn combined_kernel_source(p: usize) -> String {
         format!(
             "{}\n{}",
-            super::super::scoring_gpu::score_block_kernel_source(p),
+            super::super::scoring_gpu::score_block_kernel_source(
+                p,
+                gam_gpu::DictionaryScorePrecision::F64
+            ),
             super::BLOCK_GATE_KERNEL_SOURCE
         )
     }
@@ -293,7 +282,7 @@ mod device {
     const ROUTE_PROGRESS_CHECKPOINTS: usize = 16;
 
     pub(super) struct BlockRouteDeviceOutput {
-        pub(super) selections: Vec<Vec<(u32, f32)>>,
+        pub(super) selections: Vec<Vec<(u32, f64)>>,
         pub(super) device_dtoh_bytes: usize,
     }
 
@@ -311,8 +300,8 @@ mod device {
         let bytes = slots
             .checked_mul(
                 std::mem::size_of::<u32>()
-                    + std::mem::size_of::<f32>()
-                    + std::mem::size_of::<f32>(),
+                    + std::mem::size_of::<f64>()
+                    + std::mem::size_of::<f64>(),
             )
             .ok_or_else(|| {
                 gam_gpu::gpu_err!("sparse_dict block-gate fold shared-memory overflow")
@@ -335,8 +324,8 @@ mod device {
     /// top-`k` fold folds those into per-row `(block, gate)` shortlists. Only the
     /// final `m × k` shortlists cross PCIe.
     pub(super) fn route_blocks_device(
-        rows: ArrayView2<'_, f32>,
-        decoder: ArrayView2<'_, f32>,
+        rows: ArrayView2<'_, f64>,
+        decoder: ArrayView2<'_, f64>,
         b: usize,
         n_blocks: usize,
         active: usize,
@@ -382,8 +371,8 @@ mod device {
             .gpu_ctx("sparse_dict block-gate fold load_function")?;
         let stream = backend.stream.clone();
 
-        let rows_storage: Vec<f32>;
-        let rows_host: &[f32] = if let Some(slice) = rows.as_slice() {
+        let rows_storage: Vec<f64>;
+        let rows_host: &[f64] = if let Some(slice) = rows.as_slice() {
             slice
         } else {
             rows_storage = rows.iter().copied().collect();
@@ -394,8 +383,8 @@ mod device {
             .clone_htod(rows_host)
             .gpu_ctx("sparse_dict block-gate htod rows")?;
 
-        let decoder_storage: Vec<f32>;
-        let decoder_host: &[f32] = if let Some(slice) = decoder.as_slice() {
+        let decoder_storage: Vec<f64>;
+        let decoder_host: &[f64] = if let Some(slice) = decoder.as_slice() {
             slice
         } else {
             decoder_storage = decoder.iter().copied().collect();
@@ -420,19 +409,19 @@ mod device {
         let tile_blocks = tile_blocks.clamp(1, n_blocks);
         let max_tile_atoms = tile_blocks * b;
         let mut z_dev = stream
-            .alloc_zeros::<f32>(m * max_tile_atoms)
+            .alloc_zeros::<f64>(m * max_tile_atoms)
             .gpu_ctx("sparse_dict block-gate alloc z")?;
         let mut gate_dev = stream
-            .alloc_zeros::<f32>(m * tile_blocks)
+            .alloc_zeros::<f64>(m * tile_blocks)
             .gpu_ctx("sparse_dict block-gate alloc gates")?;
         let mut top_blocks_dev = stream
             .alloc_zeros::<u32>(m * active)
             .gpu_ctx("sparse_dict block-gate alloc top blocks")?;
         let mut top_gates_dev = stream
-            .alloc_zeros::<f32>(m * active)
+            .alloc_zeros::<f64>(m * active)
             .gpu_ctx("sparse_dict block-gate alloc top gates")?;
         let mut top_mags_dev = stream
-            .alloc_zeros::<f32>(m * active)
+            .alloc_zeros::<f64>(m * active)
             .gpu_ctx("sparse_dict block-gate alloc top mags")?;
         let fold_shared =
             fold_shared_bytes(active, TOP_S_FOLD_THREADS, backend.max_shared_mem_per_block)?;
@@ -560,7 +549,7 @@ mod device {
         }
 
         let mut top_blocks = vec![0u32; m * active];
-        let mut top_gates = vec![0.0f32; m * active];
+        let mut top_gates = vec![0.0f64; m * active];
         stream
             .memcpy_dtoh(&top_blocks_dev, &mut top_blocks)
             .gpu_ctx("sparse_dict block-gate dtoh blocks")?;
@@ -587,7 +576,7 @@ mod device {
             selections,
             device_dtoh_bytes: m
                 .saturating_mul(active)
-                .saturating_mul(std::mem::size_of::<u32>() + std::mem::size_of::<f32>()),
+                .saturating_mul(std::mem::size_of::<u32>() + std::mem::size_of::<f64>()),
         })
     }
 }
@@ -601,15 +590,15 @@ mod tests {
     // admission helper is dead off-Linux and `-D dead-code` rejects the test
     // target there (a wheel-blocking break class). Gate it with its callers.
 
-    /// Deterministic fp32 fixture: `n_rows × p` rows and a `G·b × p` decoder whose
+    /// Deterministic f64 fixture: `n_rows × p` rows and a `G·b × p` decoder whose
     /// blocks are orthonormalised so the gate `‖x D_gᵀ‖₂` is a genuine subspace
     /// energy — the shape the block lane fits.
-    fn fixture(n_rows: usize, n_blocks: usize, b: usize, p: usize) -> (Array2<f32>, Array2<f32>) {
+    fn fixture(n_rows: usize, n_blocks: usize, b: usize, p: usize) -> (Array2<f64>, Array2<f64>) {
         let rows = Array2::from_shape_fn((n_rows, p), |(i, c)| {
-            (((i * 29 + c * 13) as f32) * 0.017).sin() * 0.8
+            (((i * 29 + c * 13) as f64) * 0.017).sin() * 0.8
         });
         let mut decoder = Array2::from_shape_fn((n_blocks * b, p), |(a, c)| {
-            (((a * 11 + c * 3) as f32) * 0.009).cos()
+            (((a * 11 + c * 3 + a * c) as f64) * 0.009).cos()
         });
         // Orthonormalise each block's b rows so it is a real St(b, P) frame.
         for g in 0..n_blocks {
@@ -641,4 +630,96 @@ mod tests {
         }
     }
 
+    fn precision_fixture() -> (Array2<f64>, Array2<f64>) {
+        let mut decoder = Array2::zeros((10, 11));
+        for axis in 0..10 {
+            decoder[[axis, axis]] = 1.0;
+        }
+        let mut rows = Array2::zeros((5, 11));
+        rows[[0, 0]] = 1.0;
+        rows[[0, 2]] = 1.0 + 2.0_f64.powi(-30);
+        rows[[0, 4]] = 0.5;
+        rows[[1, 0]] = 1.0;
+        rows[[1, 2]] = 1.0;
+        rows[[2, 1]] = -0.75;
+        rows[[2, 3]] = 0.5;
+        rows[[2, 8]] = 1.25;
+        rows[[4, 5]] = 2.0;
+        (rows, decoder)
+    }
+
+    #[test]
+    fn block_route_retains_resolved_f64_winner_and_distinct_equal_energy_support_2825() {
+        let (rows, decoder) = precision_fixture();
+        assert_eq!(
+            rows[[0, 0]] as f32,
+            rows[[0, 2]] as f32,
+            "the witness must lose its true winner if observations are rounded to f32"
+        );
+        let selections = route_blocks_cpu(rows.view(), decoder.view(), 5, 2, 3);
+        assert_eq!(
+            selections[0][0].0, 1,
+            "f32 input rounding would incorrectly select block zero"
+        );
+        assert_eq!(
+            selections[1][0].0, 0,
+            "an exact energy tie uses ascending block index"
+        );
+        // Equal gates in row1 project onto orthogonal coordinates. Their
+        // reconstructions differ by sqrt(2), so energies are not substitutes.
+        let projections = block_projections_row(rows.row(1), decoder.view(), 5, 2);
+        let block_zero = decoder
+            .slice(ndarray::s![0..2, ..])
+            .t()
+            .dot(&projections.row(0));
+        let block_one = decoder
+            .slice(ndarray::s![2..4, ..])
+            .t()
+            .dot(&projections.row(1));
+        let squared_distance = block_zero
+            .iter()
+            .zip(block_one.iter())
+            .map(|(left, right)| (left - right).powi(2))
+            .sum::<f64>();
+        assert_eq!(squared_distance, 2.0);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn device_f64_block_route_matches_canonical_support_across_odd_shortlists_and_tiles_2825() {
+        let (rows, decoder) = precision_fixture();
+        let expected = route_blocks_cpu(rows.view(), decoder.view(), 5, 2, 3);
+        assert_eq!(expected[0][0].0, 1);
+        assert_eq!(expected[1][0].0, 0);
+        let gate = gam_gpu::test_gate::gpu_for_test("block_scoring_gpu f64 canonical route");
+        if matches!(gate, gam_gpu::test_gate::GpuTestGate::AbsentDevice) {
+            assert!(
+                device::route_blocks_device(rows.view(), decoder.view(), 2, 5, 3, 2).is_err(),
+                "a required device route cannot manufacture CUDA state"
+            );
+            return;
+        }
+        for (rows, decoder, blocks, width, tile) in [(rows, decoder, 5, 2, 2), {
+            let (rows, decoder) = fixture(5, 7, 3, 35);
+            (rows, decoder, 7, 3, 3)
+        }] {
+            let expected = route_blocks_cpu(rows.view(), decoder.view(), blocks, width, 3);
+            let actual =
+                device::route_blocks_device(rows.view(), decoder.view(), width, blocks, 3, tile)
+                    .expect("the admitted CUDA fixture must route on the device");
+            assert_eq!(
+                actual.selections, expected,
+                "device support and f64 gates must match the canonical scalar route"
+            );
+            assert_eq!(
+                actual.device_dtoh_bytes,
+                rows.nrows() * 3 * (8 + 4),
+                "only u32 IDs and f64 gate shortlists cross back to the host"
+            );
+            let repeated =
+                device::route_blocks_device(rows.view(), decoder.view(), width, blocks, 3, tile)
+                    .expect("the warm device route must repeat");
+            assert_eq!(actual.selections, repeated.selections);
+        }
+    }
 }

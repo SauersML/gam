@@ -4280,7 +4280,7 @@ pub(crate) fn fit_binomial_mean_wiggle_terms_with_selected_basis(
     // The joint `[rho, psi]` box rule, shared with the standard spatial route
     // (`spatial_optimization.rs` is `include!`d into `drivers`, so it lives at
     // the module root).
-    use crate::fit_orchestration::drivers::{JOINT_RHO_BOUND, joint_rho_search_box};
+    use crate::fit_orchestration::drivers::joint_rho_resolvability_domain;
 
     validate_term_weights(
         data,
@@ -4545,22 +4545,20 @@ pub(crate) fn fit_binomial_mean_wiggle_terms_with_selected_basis(
     // `±12`, `|Pg| = |g| = 2.163` (so the projection removed NOTHING — every
     // railed coordinate still has feasible descent), and the search gives up
     // after TWO iterations on a cost stall.
-    let (rho_lower, rho_upper) = joint_rho_search_box(baseline_log_lambdas.view(), JOINT_RHO_BOUND);
-    let widened: Vec<usize> = (0..rho_dim)
-        .filter(|&k| rho_lower[k] < -JOINT_RHO_BOUND || rho_upper[k] > JOINT_RHO_BOUND)
-        .collect();
-    if !widened.is_empty() {
-        log::info!(
-            "[binomial-mean-wiggle] joint rho box fell back to the engine's own \
-             +/-RHO_BOUND on coordinate(s) {widened:?}: the baseline fit's own lambda-hat is \
-             not strictly inside the joint +/-{JOINT_RHO_BOUND} prior, so the prior is \
-             falsified there and the search region becomes the one the graded incumbent was \
-             found in (gam#2760). seed={:?} box=[{:?}, {:?}]",
-            baseline_log_lambdas.to_vec(),
-            rho_lower.to_vec(),
-            rho_upper.to_vec(),
-        );
-    }
+    // #2812: the joint ρ domain is derived per coordinate from the baseline
+    // design and its penalties, so the baseline's own λ̂ is interior to it by
+    // construction; there is no prior box for an incumbent to sit on.
+    let (rho_lower, rho_upper) = joint_rho_resolvability_domain(
+        &baseline_design.design,
+        &baseline_design.penalties,
+        rho_dim,
+    );
+    log::info!(
+        "[binomial-mean-wiggle] joint rho domain per coordinate: lower={:?} upper={:?} seed={:?}",
+        rho_lower.iter().map(|v| (v * 1e3).round() / 1e3).collect::<Vec<_>>(),
+        rho_upper.iter().map(|v| (v * 1e3).round() / 1e3).collect::<Vec<_>>(),
+        baseline_log_lambdas.iter().map(|v| (v * 1e3).round() / 1e3).collect::<Vec<_>>(),
+    );
     let mut lower = Array1::<f64>::zeros(theta_dim);
     let mut upper = Array1::<f64>::zeros(theta_dim);
     lower.slice_mut(s![0..rho_dim]).assign(&rho_lower);
@@ -4803,7 +4801,6 @@ pub(crate) fn fit_binomial_mean_wiggle_terms_with_selected_basis(
         // joint `[ρ, ψ]` route does: the box is the per-dimension `lower`/`upper`
         // pair, and this scalar only feeds the seed grid and the bound-free
         // fallback box.
-        .with_rho_bound(JOINT_RHO_BOUND)
         .with_heuristic_lambdas(seed_heuristic);
 
     let eval_outer = |state: &mut MeanWiggleOuterState,

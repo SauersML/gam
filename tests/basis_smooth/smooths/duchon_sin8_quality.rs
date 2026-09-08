@@ -80,8 +80,14 @@ fn fit_and_predict_diagnostics(
     let test_design = build_term_collection_design(m.view(), &fit.resolvedspec)
         .expect("rebuild design from frozen spec");
     let pred = test_design.design.apply(&fit.fit.beta).to_vec();
-    let diagnostics =
-        QualityDiagnostics::from_standard_fit(label, &fit).with_truth_rmse(&pred, truth);
+    let diagnostics = QualityDiagnostics::from_design(
+        label,
+        &fit.design,
+        &fit.fit.log_lambdas.to_vec(),
+        &fit.fit.lambdas.to_vec(),
+        fit.fit.inference.as_ref().map(|inference| inference.edf_total),
+    )
+    .with_truth_rmse(&pred, truth);
     eprintln!("{}", diagnostics.report());
     pred
 }

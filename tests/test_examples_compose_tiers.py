@@ -1,4 +1,4 @@
-"""End-to-end test for experiments/compose_tiers.py (tiered SAE composition).
+"""End-to-end test for examples/compose_tiers.py (tiered SAE composition).
 
 The driver composes a linear base dictionary (T1, ``sparse_dictionary_fit``)
 with a small curved SAE manifold (T2, ``sae_manifold_fit``) fit on the T1
@@ -22,8 +22,8 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-# The driver is a top-level script in experiments/, not a gamfit submodule.
-_EXAMPLES = Path(__file__).resolve().parent.parent / "experiments"
+# The driver is a top-level script in examples/, not a gamfit submodule.
+_EXAMPLES = Path(__file__).resolve().parent.parent / "examples"
 if str(_EXAMPLES) not in sys.path:
     sys.path.insert(0, str(_EXAMPLES))
 

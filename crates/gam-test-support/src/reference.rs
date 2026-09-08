@@ -758,29 +758,29 @@ pub struct PredictionFingerprint {
 }
 
 impl QualityDiagnostics {
-    pub fn from_standard_fit(
+    pub fn from_design(
         label: impl Into<String>,
-        fit: &gam_models::fit_orchestration::StandardFitResult,
+        fitted_design: &gam_terms::smooth::TermCollectionDesign,
+        rho: &[f64],
+        lambda: &[f64],
+        edf_total: Option<f64>,
     ) -> Self {
-        let design = match design_diagnostics(&fit.design.design) {
+        let design = match design_diagnostics(&fitted_design.design) {
             Ok(diagnostics) => Some(diagnostics),
             Err(err) => {
                 eprintln!("warning: design diagnostics unavailable: {err}");
                 None
             }
         };
-        let penalties = penalty_diagnostics(
-            &fit.design.penalties,
-            fit.fit.lambdas.as_slice().unwrap_or(&[]),
-        );
+        let penalties = penalty_diagnostics(&fitted_design.penalties, lambda);
         Self {
             label: label.into(),
             rmse_vs_truth: None,
             rmse_vs_reference: None,
             reference_rmse_vs_truth: None,
-            edf_total: fit.fit.inference.as_ref().map(|i| i.edf_total),
-            rho: fit.fit.log_lambdas.to_vec(),
-            lambda: fit.fit.lambdas.to_vec(),
+            edf_total,
+            rho: rho.to_vec(),
+            lambda: lambda.to_vec(),
             design,
             penalties,
             prediction: None,

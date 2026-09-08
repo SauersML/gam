@@ -57,6 +57,8 @@ pub struct ExactAClassificationRow {
 #[derive(Debug, Clone)]
 pub struct ExactAClassificationGeometry {
     pub rows: Arc<[ExactAClassificationRow]>,
+    /// Beta part of `A_raw - B_raw`, in the shared border's actual chart.
+    pub delta_beta: Arc<[ExactBetaRemainder]>,
     /// Column indices mapping each `delta_tbeta` carrier column into the arrow
     /// system's shared border.
     pub border_indices: Arc<[usize]>,
@@ -248,6 +250,10 @@ pub struct ArrowSchurSystem {
     /// `A_raw = B_raw + delta_C`.  Evidence factors consume it to make the same
     /// majorizer-metric / clamp-basin classification as the dense route.
     pub exact_a_classification: Option<ExactAClassificationGeometry>,
+    /// Frozen objective beta curvature omitted by this system's Newton
+    /// majorizer. Evidence and derivative consumers retain these same operands
+    /// through the factor cache; they must not reconstruct lagged gates.
+    pub exact_beta_remainders: Vec<ExactBetaRemainder>,
     /// Transient matrix-free image of the exact-A classification.  Raw systems
     /// leave this absent; the rational evidence evaluation installs it only on
     /// its evaluation-local system clone after lifting the Krylov directions.
@@ -280,6 +286,7 @@ impl Clone for ArrowSchurSystem {
             beta_gauge_quotient: self.beta_gauge_quotient.clone(),
             htbeta_operator_fingerprint: self.htbeta_operator_fingerprint,
             exact_a_classification: self.exact_a_classification.clone(),
+            exact_beta_remainders: self.exact_beta_remainders.clone(),
             exact_a_reduced_conditioning: self.exact_a_reduced_conditioning.clone(),
         }
     }
@@ -364,6 +371,7 @@ impl ArrowSchurSystem {
             beta_gauge_quotient: None,
             htbeta_operator_fingerprint: None,
             exact_a_classification: None,
+            exact_beta_remainders: Vec::new(),
             exact_a_reduced_conditioning: None,
         }
     }
@@ -412,6 +420,7 @@ impl ArrowSchurSystem {
             beta_gauge_quotient: None,
             htbeta_operator_fingerprint: None,
             exact_a_classification: None,
+            exact_beta_remainders: Vec::new(),
             exact_a_reduced_conditioning: None,
         }
     }
@@ -493,6 +502,7 @@ impl ArrowSchurSystem {
             beta_gauge_quotient: None,
             htbeta_operator_fingerprint: None,
             exact_a_classification: None,
+            exact_beta_remainders: Vec::new(),
             exact_a_reduced_conditioning: None,
         }
     }
@@ -1040,6 +1050,45 @@ impl ArrowSchurSystem {
 }
 
 /// Chunked Schur assembler that never retains all row cross-blocks.
+/// One chunk's additive evidence contribution, produced by
+/// [`StreamingArrowSchur::evidence_schur_chunk`].
+///
+/// Every field is a per-ROW sum over the chunk's rows (plus, for the reduced
+/// Schur and the classification's majorizer metric, the beta-side block those
+/// rows are scored against, which the caller scales per chunk). Summing the
+/// fields across chunks and factoring the total reproduces the whole-system
+/// evidence exactly — which is what lets a chunked route price a resolved
+/// negative direction under the same #2515 verdict as the in-core one.
+#[derive(Debug)]
+pub struct EvidenceSchurChunk {
+    /// `sum_i log|H_tt^(i)|` over this chunk's rows.
+    pub log_det_tt: f64,
+    /// This chunk's reduced Schur contribution, `H_bb^(chunk) - sum_i H_bt^(i) H_tt^(i)^-1 H_tb^(i)`.
+    pub schur: Array2<f64>,
+    /// The row factors the other two fields were read off, retained ONLY when
+    /// the caller asked to classify and the system carries the exact-A geometry.
+    row_factors: Option<ArrowFactorSlab>,
+}
+
+impl EvidenceSchurChunk {
+    /// This chunk's exact-A reduced classification, in the chunk's own border
+    /// coordinates, from the factorization that produced [`Self::log_det_tt`]
+    /// and [`Self::schur`].
+    ///
+    /// `sys` must be the system the chunk was accumulated from;
+    /// [`StreamingArrowSchur::evidence_schur_chunk`] has already checked that
+    /// its row count and border width match the accumulator's.
+    pub fn exact_a_classification(
+        &self,
+        sys: &ArrowSchurSystem,
+    ) -> Result<Option<ExactAReducedClassification>, ArrowSchurError> {
+        match self.row_factors.as_ref() {
+            Some(factors) => exact_a_reduced_classification(sys, factors),
+            None => Ok(None),
+        }
+    }
+}
+
 pub struct StreamingArrowSchur {
     pub n_rows: usize,
     /// Maximum per-row latent dim (upper bound for scratch buffers).
@@ -1102,19 +1151,22 @@ pub struct StreamingArrowSchur {
     /// regression: #1273 wired the deflation into the dense path only). `None`
     /// for every non-evidence caller, which keeps the strict non-PD refusal.
     pub(crate) row_gauge_deflation: Option<ArrowRowGaugeDeflation>,
-    /// Raw exact-A operands used by the evidence classifier. The verdict and
-    /// operands form one contract; carrying only the refusing policy made the
-    /// streaming evidence route structurally unreachable (#2731).
+    /// #2515/#2731 — the exact-A classification carrier of the system this
+    /// accumulator was built from, copied by [`Self::from_system`].
+    ///
+    /// [`Self::refuse_resolved_indefinite`] is ONE HALF of
+    /// [`ArrowEvidencePolicy::UnitDeflationRefusingIndefinite`]; the raw
+    /// `B`/`delta`/clamp carrier is the operand the OTHER half reads. Wiring the
+    /// verdict in without the operand left the streaming lane setting a policy
+    /// it could not evaluate, and it failed in two different ways at once:
+    /// every per-row direction was classified as if the exact-A geometry did
+    /// not exist (so `streaming_logdet == full_logdet` broke silently, the
+    /// #1377 invariant), and the reduced Schur declined outright with
+    /// `exact-A evidence classification requires its raw B/delta/clamp
+    /// carrier`, which made the chunked in-core evidence route STRUCTURALLY
+    /// unreachable rather than merely different. A policy and the operand it
+    /// requires travel together or not at all.
     pub(crate) exact_a_classification: Option<ExactAClassificationGeometry>,
-}
-
-/// One chunk's additive exact-evidence contribution, formed from one set of
-/// row factors so the Schur block cannot be separated from its classifier.
-pub struct StreamingEvidenceSchurChunk {
-    pub log_det_tt: f64,
-    pub schur: Array2<f64>,
-    pub majorizer_metric: Option<Array2<f64>>,
-    pub clamp_metric: Option<Array2<f64>>,
 }
 
 impl std::fmt::Debug for StreamingArrowSchur {
@@ -1225,6 +1277,12 @@ impl StreamingArrowSchur {
         // would deflate on the dense path but be refused / log-det-divergent on
         // the streaming path, breaking `streaming_logdet == full_logdet`.
         streaming.row_gauge_deflation = sys.row_gauge_deflation.clone();
+        // #2515/#2731 — carry the exact-A classification for the same reason the
+        // gauge deflation is carried: the dense `factor_blocks_for_system` reads
+        // `sys.exact_a_classification.rows[i]` at every per-row factorization and
+        // takes the deflating arm whenever EITHER carrier is installed, so a
+        // streaming lane that drops it factors a different operator than the
+        // dense lane and reports a different log-determinant for the SAME system.
         streaming.exact_a_classification = sys.exact_a_classification.clone();
         streaming
     }
@@ -1244,35 +1302,37 @@ impl StreamingArrowSchur {
         di: usize,
         row_idx: usize,
     ) -> Result<Array2<f64>, ArrowSchurError> {
-        if self.row_gauge_deflation.is_some() || self.exact_a_classification.is_some() {
-            let gauge = self
-                .row_gauge_deflation
-                .as_ref()
-                .map(|deflation| deflation.row(row_idx))
-                .unwrap_or(&[]);
-            let exact_a = self
-                .exact_a_classification
-                .as_ref()
-                .and_then(|geometry| geometry.rows.get(row_idx));
-            factor_one_row_result(
-                row,
-                ridge_t,
-                di,
-                row_idx,
-                self.evidence_factorization,
-                gauge,
-                // Evidence path: opt into spectral discovery of an
-                // intrinsic-dimension-flat direction even when this row's
-                // supplied gauge list is empty/non-spanning — matching the
-                // `allow_spectral_deflation = true` the dense path passes.
-                true,
-                self.refuse_resolved_indefinite,
-                exact_a,
-            )
-            .map(|result| result.factor)
-        } else {
-            factor_one_row(row, ridge_t, di, row_idx, self.evidence_factorization)
+        // Mirror of [`factor_blocks_for_system`], arm for arm: the deflating
+        // recovery is taken whenever EITHER the gauge deflation or the #2515
+        // exact-A geometry is installed, and the row's exact-A operands travel
+        // into it. Deriving that condition differently on the two lanes is what
+        // made the streaming log-determinant diverge from the dense one on an
+        // exact-A system (#2731).
+        let exact_a = self
+            .exact_a_classification
+            .as_ref()
+            .and_then(|geometry| geometry.rows.get(row_idx));
+        if self.row_gauge_deflation.is_none() && exact_a.is_none() {
+            return factor_one_row(row, ridge_t, di, row_idx, self.evidence_factorization);
         }
+        factor_one_row_result(
+            row,
+            ridge_t,
+            di,
+            row_idx,
+            self.evidence_factorization,
+            self.row_gauge_deflation
+                .as_ref()
+                .map_or(&[] as &[Array1<f64>], |deflation| deflation.row(row_idx)),
+            // Evidence path: opt into spectral discovery of an
+            // intrinsic-dimension-flat direction even when this row's
+            // supplied gauge list is empty/non-spanning — matching the
+            // `allow_spectral_deflation = true` the dense path passes.
+            true,
+            self.refuse_resolved_indefinite,
+            exact_a,
+        )
+        .map(|result| result.factor)
     }
 
     /// Build the `(di × k)` cross-block for `row_idx` on demand.
@@ -1490,8 +1550,70 @@ impl StreamingArrowSchur {
         ridge_beta: f64,
         options: &ArrowSolveOptions,
     ) -> Result<(f64, Array2<f64>), ArrowSchurError> {
+        let chunk = self.accumulate_evidence_schur(ridge_t, ridge_beta, options, false)?;
+        Ok((chunk.log_det_tt, chunk.schur))
+    }
+
+    /// One chunk's WHOLE additive evidence contribution: `sum_i log|H_tt^(i)|`,
+    /// the dense reduced Schur, and — when the source system carries the #2515
+    /// exact-A geometry — the reduced majorizer/clamp metrics in the SAME border
+    /// coordinates, all three read off the SAME per-row factorization.
+    ///
+    /// A chunked caller sums all three and factors the total once. Recovering the
+    /// classification from a SECOND factorization would reintroduce exactly what
+    /// #2515 forbids: the value, the inverse and the direction verdict must come
+    /// from one factorization of one operator, or the verdict can describe an
+    /// operator the value was never taken on.
+    pub fn evidence_schur_chunk(
+        &mut self,
+        sys: &ArrowSchurSystem,
+        ridge_t: f64,
+        ridge_beta: f64,
+        options: &ArrowSolveOptions,
+    ) -> Result<EvidenceSchurChunk, ArrowSchurError> {
+        if sys.rows.len() != self.n_rows || sys.k != self.k {
+            return Err(ArrowSchurError::SchurFactorFailed {
+                reason: format!(
+                    "streaming evidence chunk was built from a {}-row, {}-border system and \
+                     handed a {}-row, {}-border one; the exact-A classification would be read \
+                     against a layout the factors were never taken on",
+                    self.n_rows,
+                    self.k,
+                    sys.rows.len(),
+                    sys.k,
+                ),
+            });
+        }
+        self.accumulate_evidence_schur(ridge_t, ridge_beta, options, true)
+    }
+
+    fn accumulate_evidence_schur(
+        &mut self,
+        ridge_t: f64,
+        ridge_beta: f64,
+        options: &ArrowSolveOptions,
+        classify: bool,
+    ) -> Result<EvidenceSchurChunk, ArrowSchurError> {
         self.evidence_factorization = options.evidence_policy.factors_undamped_evidence();
         self.refuse_resolved_indefinite = options.evidence_policy.refuses_resolved_indefinite();
+        // #2515/#2731 — the SAME precondition the dense lane states in
+        // `factor_blocks_for_system`, stated in the same words at the same point
+        // in the routine. Without it the missing carrier surfaced far downstream
+        // as `evidence reduced Schur unit-deflation declined (...)`, naming the
+        // factorization rather than the policy that could never have been
+        // honoured here.
+        if self.refuse_resolved_indefinite && self.exact_a_classification.is_none() {
+            return Err(ArrowSchurError::SchurFactorFailed {
+                reason: "exact-A evidence classification requires the raw B/delta/clamp carrier"
+                    .to_string(),
+            });
+        }
+        let collect = classify && self.exact_a_classification.is_some();
+        let mut collected: Vec<Array2<f64>> = Vec::with_capacity(if collect {
+            self.n_rows
+        } else {
+            0
+        });
         self.reset_accumulator(ridge_beta)?;
         let backend = CpuBatchedBlockSolver;
         let mut log_det_tt = 0.0_f64;
@@ -1517,110 +1639,33 @@ impl StreamingArrowSchur {
                         backend.block_gemm_subtract(&mut self.s_acc, &whitened, &whitened);
                     }
                 }
+                if collect {
+                    collected.push(factor);
+                }
             }
         }
         symmetrize_upper_from_lower(&mut self.s_acc);
         let schur = std::mem::replace(&mut self.s_acc, Array2::<f64>::zeros((self.k, self.k)));
-        Ok((log_det_tt, schur))
-    }
-
-    /// Form a complete chunk contribution for exact-A evidence classification.
-    pub fn evidence_schur_chunk(
-        &mut self,
-        ridge_t: f64,
-        ridge_beta: f64,
-        options: &ArrowSolveOptions,
-    ) -> Result<StreamingEvidenceSchurChunk, ArrowSchurError> {
-        if options.evidence_policy.refuses_resolved_indefinite()
-            && self.exact_a_classification.is_none()
-        {
-            return Err(ArrowSchurError::SchurFactorFailed {
-                reason: "exact-A evidence classification requires the raw B/delta/clamp carrier"
-                    .to_string(),
-            });
-        }
-        let sys = self.as_classification_system()?;
-        let backend = CpuBatchedBlockSolver;
-        let factors = factor_blocks_for_system(
-            &sys,
-            ridge_t,
-            options.evidence_policy,
-            &backend,
-            options.gpu_policy,
-        )?;
-        let mut log_det_tt = 0.0;
-        for row_idx in 0..sys.rows.len() {
-            let factor = factors.factors.factor(row_idx);
-            for axis in 0..factor.nrows() {
-                log_det_tt += 2.0 * factor[[axis, axis]].ln();
-            }
-        }
-        let schur = build_dense_schur_direct(
-            &sys,
-            &factors.factors,
-            ridge_beta,
-            &backend,
-            options.gpu_policy,
-        )?;
-        let classification = exact_a_reduced_classification(&sys, &factors.factors)?;
-        let (majorizer_metric, clamp_metric) = classification.map_or(
-            (None, None),
-            |classification| {
-                (
-                    Some(classification.majorizer_metric),
-                    Some(classification.clamp_metric),
-                )
-            },
-        );
-        Ok(StreamingEvidenceSchurChunk {
+        Ok(EvidenceSchurChunk {
             log_det_tt,
             schur,
-            majorizer_metric,
-            clamp_metric,
+            row_factors: collect.then(|| ArrowFactorSlab::from_blocks(collected)),
         })
-    }
-
-    fn as_classification_system(&self) -> Result<ArrowSchurSystem, ArrowSchurError> {
-        let mut rows = Vec::with_capacity(self.n_rows);
-        for row_idx in 0..self.n_rows {
-            let mut row = (self.row_builder)(row_idx)?;
-            let di = row.htt.nrows();
-            row.htbeta = self.row_htbeta(row_idx, &row, di);
-            rows.push(row);
-        }
-        let mut sys = ArrowSchurSystem::new_with_per_row_dims_empty_hbb_and_htbeta_cols(
-            self.row_dims.to_vec(),
-            self.k,
-            self.k,
-        );
-        sys.rows = rows;
-        sys.hbb = self.hbb.clone();
-        sys.gb = self.gb.clone();
-        sys.row_gauge_deflation = self.row_gauge_deflation.clone();
-        sys.exact_a_classification = self.exact_a_classification.clone();
-        Ok(sys)
     }
 
     pub fn reduced_schur_log_det(
         schur: &Array2<f64>,
         options: &ArrowSolveOptions,
-        majorizer_metric: Option<&Array2<f64>>,
-        clamp_metric: Option<&Array2<f64>>,
+        // #2515/#2731 — the accumulated exact-A carrier for the SUMMED Schur.
+        // `ArrowEvidencePolicy::UnitDeflationRefusingIndefinite` is refused
+        // without it, so a chunked caller that drops it is not choosing a
+        // different verdict, it is choosing an error.
+        exact_a: Option<&ExactAReducedClassification>,
     ) -> Result<f64, ArrowSchurError> {
-        let exact_a = match (majorizer_metric, clamp_metric) {
-            (Some(majorizer_metric), Some(clamp_metric)) => Some(ExactAReducedClassification {
-                majorizer_metric: majorizer_metric.clone(),
-                clamp_metric: clamp_metric.clone(),
-            }),
-            (None, None) => None,
-            _ => return Err(ArrowSchurError::SchurFactorFailed {
-                reason: "partial exact-A reduced-Schur carrier is not a classification".to_string(),
-            }),
-        };
         let schur_factor = factor_dense_reduced_schur_with_exact_a(
             schur,
             options.evidence_policy.reduced_schur_policy(),
-            exact_a.as_ref(),
+            exact_a,
         )?
         .factor;
         let mut log_det_schur = 0.0_f64;
@@ -2254,6 +2299,8 @@ pub struct BetaSchurConditioningSpectrum {
 
 #[derive(Debug, Clone)]
 pub struct ArrowFactorCache {
+    /// Exact-minus-majorizer beta operators captured by the originating assembly.
+    pub exact_beta_remainders: Arc<[ExactBetaRemainder]>,
     /// Per-row lower-triangular Cholesky factors of `H_tt^(i) + ridge_t·I`.
     ///
     /// These are the *damped* factors used inside the Newton solve. The IFT
@@ -2296,8 +2343,7 @@ pub struct ArrowFactorCache {
     /// Stochastic Lanczos Quadrature reduced-Schur log-determinant (see
     /// [`Self::undamped_arrow_log_det_with_schur`] and
     /// [`crate::arrow_schur::slq_logdet`]) so no dense `k × k` Cholesky is ever
-    /// formed; `arrow_log_det_from_cache` reads THIS field first, before any
-    /// `schur_factor` diagonal fallback.
+    /// formed. [`Self::arrow_log_det`] reads this recorded value directly.
     pub joint_hessian_log_det: Option<f64>,
     /// BA mode used to create this cache.
     pub solver_mode: ArrowSolverMode,

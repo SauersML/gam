@@ -606,6 +606,14 @@ pub struct DenseCholeskyOperator {
 }
 
 impl DenseCholeskyOperator {
+    /// Replace the cached `2·Σ ln(diag L)` with a value computed at ROOT
+    /// scale. The Cholesky factor itself is untouched — it is the operator's
+    /// solve/trace kernel, and only the log-determinant scalar is
+    /// `O(ε·κ(H))`-limited (#2644).
+    pub(crate) fn install_root_scale_logdet(&mut self, value: f64) {
+        self.cached_logdet = value;
+    }
+
     /// Construct `L⁻ᵀ` by stable triangular substitution without forming
     /// `H⁻¹`. This is the exact projection factor needed by
     /// `tr(H⁻¹A) = tr(FᵀAF)` and
@@ -773,13 +781,26 @@ impl DenseCholeskyOperator {
         let h_inverse = operator.chol.solve_mat(&Array2::<f64>::eye(n));
         let floor_gap_bound =
             epsilon * epsilon * h_inverse.iter().map(|entry| entry * entry).sum::<f64>();
+        // The floor is not the only difference between these kernels. Both
+        // LLT and the spectral factorization perturb the assembled Hessian.
+        // With gamma_n = n*eps/(1-n*eps), first-order logdet sensitivity gives
+        // |d logdet H| <= ||H^-1||_F ||dH||_F. Budget both factorization errors
+        // before admitting a separate value kernel (#2834). The inverse is
+        // already required for the floor check, so this adds only reductions.
+        let dimension_roundoff = n as f64 * f64::EPSILON;
+        let gamma_n = dimension_roundoff / (1.0 - dimension_roundoff);
+        let matrix_norm = operator.matrix.iter().fold(0.0_f64, |norm, &v| norm.hypot(v));
+        let inverse_norm = h_inverse.iter().fold(0.0_f64, |norm, &v| norm.hypot(v));
+        let factorization_gap_bound = 2.0 * gamma_n * matrix_norm * inverse_norm;
+        let total_gap_bound = floor_gap_bound + factorization_gap_bound;
         let agreement_envelope =
             crate::rho_optimizer::outer_value_agreement_bound(cached_logdet, cached_logdet);
-        if !(floor_gap_bound <= agreement_envelope) {
+        if !(total_gap_bound <= agreement_envelope) {
             return Err(format!(
                 "DenseCholeskyOperator declines a {n}-dimensional Hessian: its exact \
                  log-determinant can differ from the smooth-floored log|H| the derivative lanes \
-                 price by up to {floor_gap_bound:.3e}, above the {agreement_envelope:.3e} \
+                 price by up to {total_gap_bound:.3e} (floor={floor_gap_bound:.3e}, \
+                 factorization={factorization_gap_bound:.3e}), above the {agreement_envelope:.3e} \
                  value-agreement envelope (spectral floor eps={epsilon:.3e})"
             ));
         }

@@ -14,7 +14,7 @@
 //! folds that tile into per-row top-`s` state on the device before moving to the
 //! next tile. The minibatch router [`route_minibatch_required`] walks the whole
 //! `K`-wide dictionary in atom-column tiles (each launch's block capped at
-//! `GPU_ROUTE_TILE_ELEMS`), so peak device score memory is `rows × tile`,
+//! `GPU_ROUTE_TILE_BYTES`), so peak device score memory is `rows × tile`,
 //! **independent of `K`**. The host downloads only the final `rows × s`
 //! `(atom, score)` shortlists instead of every score tile. The lane's no-`N×K`
 //! memory discipline is preserved exactly as on the CPU; the GPU does both the
@@ -39,20 +39,20 @@
 
 #![cfg(target_os = "linux")]
 
+use gam_gpu::DictionaryScorePrecision;
 use ndarray::ArrayView2;
 
-/// The bit-exact-parity NVRTC kernel. A `BM × BN` output tile per CUDA block;
+/// The precision-parameterized NVRTC kernel. A `BM × BN` output tile per CUDA block;
 /// each thread owns one `(row, atom)` output and accumulates over `P` columns in
-/// ascending order with separate-rounding f32 ops so the result matches the CPU
-/// sequential `acc += x·d` to the bit.
+/// ascending order with separate-rounding arithmetic in `ScoreScalar`.
 ///
 /// The row and atom operands for the tile are cooperatively staged into fixed
 /// `PK`-wide shared-memory chunks. This keeps per-block shared memory bounded by
-/// `(BM + BN) * PK * sizeof(float)` even when the live T1 feature width is large
+/// `(BM + BN) * PK * sizeof(ScoreScalar)` even when the live feature width is large
 /// (`P=2048`), while every output still visits chunks and columns in ascending
 /// `c`. The arithmetic is unchanged — each term is summed with
-/// `__fmul_rn`/`__fadd_rn`; shared memory only holds exact copies of the same
-/// operands, so the CPU-oracle parity gate is preserved by construction.
+/// the matching f32 or f64 CUDA intrinsics; shared memory holds exact copies of
+/// the same operands. Atom and block routes instantiate their own precision.
 ///
 /// `PP` (the column count) is baked in as a `#define` so the inner loop is a
 /// fixed trip count (matching the other NVRTC kernels in this repo, which
@@ -63,9 +63,8 @@ pub const SCORE_BLOCK_KERNEL_SOURCE: &str = r#"
 // Register-blocked score GEMM. A block computes a BM×BN output tile with a
 // TM×TN thread block, each thread owning an RM×RN micro-tile of outputs
 // (RM=BM/TM, RN=BN/TN). Every output still accumulates its own dot product in
-// strictly ascending c with SEPARATE-rounding f32 ops (__fmul_rn/__fadd_rn, no
-// FMA contraction), so each result is bit-identical to the CPU
-// `acc += x[c]*d[c]` reference and to the earlier one-output-per-thread kernel.
+// strictly ascending c with separate-rounding ScoreScalar operations and no
+// FMA contraction. Precision is declared by the source generator's prelude.
 // The micro-tile buys (a) RM*RN independent accumulator chains per thread to
 // hide the serial __fadd_rn latency the old kernel was bound by, and (b) operand
 // reuse — each staged row/atom column is consumed RN/RM times from registers
@@ -80,18 +79,18 @@ pub const SCORE_BLOCK_KERNEL_SOURCE: &str = r#"
 
 static __device__ __forceinline__
 void sparse_dict_score_block_impl(
-    const float* __restrict__ rows,    // [n_rows * PP] row-major
-    const float* __restrict__ atoms,   // [total_atoms * PP] row-major decoder
+    const ScoreScalar* __restrict__ rows,    // [n_rows * PP] row-major
+    const ScoreScalar* __restrict__ atoms,   // [total_atoms * PP] row-major decoder
     int n_rows,
     int n_atoms,
     unsigned int atom_offset,          // decoder slice base (0 for the tile form)
-    float* __restrict__ scores)        // [n_rows * n_atoms] row-major
+    ScoreScalar* __restrict__ scores)        // [n_rows * n_atoms] row-major
 {
   // Shared operand chunks: BM rows and BN atoms, each PK columns long. Chunking
   // keeps shared memory fixed-size for high-P jobs while preserving ascending-c
   // accumulation order (the acc registers persist across chunks).
-  __shared__ float sr[BM][PK];
-  __shared__ float sa[BN][PK];
+  __shared__ ScoreScalar sr[BM][PK];
+  __shared__ ScoreScalar sa[BN][PK];
   const int row0  = blockIdx.y * BM;
   const int atom0 = blockIdx.x * BN;
   const int tx = threadIdx.x;   // 0..TN-1
@@ -99,7 +98,7 @@ void sparse_dict_score_block_impl(
   const int lin = ty * TN + tx;
   const int nthreads = TM * TN;
   // This thread owns outputs rows [row0 + ty*RM, +RM) × atoms [atom0 + tx*RN, +RN).
-  float acc[RM][RN];
+  ScoreScalar acc[RM][RN];
   #pragma unroll
   for (int i = 0; i < RM; ++i)
     #pragma unroll
@@ -126,8 +125,8 @@ void sparse_dict_score_block_impl(
     for (int kc = 0; kc < chunk; ++kc) {
       // Stage this column's RM row-fragments and RN atom-fragments into
       // registers, then cross them: RM*RN separate-rounding MACs reusing 8 loads.
-      float rf[RM];
-      float af[RN];
+      ScoreScalar rf[RM];
+      ScoreScalar af[RN];
       #pragma unroll
       for (int i = 0; i < RM; ++i) rf[i] = sr[ty * RM + i][kc];
       #pragma unroll
@@ -136,7 +135,7 @@ void sparse_dict_score_block_impl(
       for (int i = 0; i < RM; ++i)
         #pragma unroll
         for (int j = 0; j < RN; ++j)
-          acc[i][j] = __fadd_rn(acc[i][j], __fmul_rn(rf[i], af[j]));
+          acc[i][j] = score_add_rn(acc[i][j], score_mul_rn(rf[i], af[j]));
     }
     __syncthreads();
   }
@@ -154,23 +153,23 @@ void sparse_dict_score_block_impl(
 
 extern "C" __global__
 void sparse_dict_score_block(
-    const float* __restrict__ rows,    // [n_rows * PP] row-major
-    const float* __restrict__ atoms,   // [n_atoms * PP] row-major (decoder tile)
+    const ScoreScalar* __restrict__ rows,    // [n_rows * PP] row-major
+    const ScoreScalar* __restrict__ atoms,   // [n_atoms * PP] row-major (decoder tile)
     int n_rows,
     int n_atoms,
-    float* __restrict__ scores)        // [n_rows * n_atoms] row-major
+    ScoreScalar* __restrict__ scores)        // [n_rows * n_atoms] row-major
 {
   sparse_dict_score_block_impl(rows, atoms, n_rows, n_atoms, 0u, scores);
 }
 
 extern "C" __global__
 void sparse_dict_score_block_offset(
-    const float* __restrict__ rows,    // [n_rows * PP] row-major
-    const float* __restrict__ atoms,   // [total_atoms * PP] row-major decoder
+    const ScoreScalar* __restrict__ rows,    // [n_rows * PP] row-major
+    const ScoreScalar* __restrict__ atoms,   // [total_atoms * PP] row-major decoder
     int n_rows,
     int n_atoms,
     unsigned int atom_offset,
-    float* __restrict__ scores)        // [n_rows * n_atoms] row-major tile
+    ScoreScalar* __restrict__ scores)        // [n_rows * n_atoms] row-major tile
 {
   sparse_dict_score_block_impl(rows, atoms, n_rows, n_atoms, atom_offset, scores);
 }
@@ -178,25 +177,25 @@ void sparse_dict_score_block_offset(
 #define EMPTY_TOP_ATOM 0xffffffffu
 
 static __device__ __forceinline__
-float sparse_dict_abs_f32(float v) {
+ScoreScalar sparse_dict_abs(ScoreScalar v) {
   return (v < 0.0f) ? -v : v;
 }
 
 static __device__ __forceinline__
-int sparse_dict_better(float mag, unsigned int atom,
-                       float ref_mag, unsigned int ref_atom) {
+int sparse_dict_better(ScoreScalar mag, unsigned int atom,
+                       ScoreScalar ref_mag, unsigned int ref_atom) {
   return (mag > ref_mag) || (mag == ref_mag && atom < ref_atom);
 }
 
 static __device__ __forceinline__
-int sparse_dict_worse(float mag, unsigned int atom,
-                      float ref_mag, unsigned int ref_atom) {
+int sparse_dict_worse(ScoreScalar mag, unsigned int atom,
+                      ScoreScalar ref_mag, unsigned int ref_atom) {
   return (mag < ref_mag) || (mag == ref_mag && atom > ref_atom);
 }
 
 static __device__ __forceinline__
 void sparse_dict_recompute_worst(const unsigned int* atoms,
-                                 const float* mags,
+                                 const ScoreScalar* mags,
                                  int count,
                                  int* worst_idx) {
   int worst = 0;
@@ -210,17 +209,17 @@ void sparse_dict_recompute_worst(const unsigned int* atoms,
 
 static __device__ __forceinline__
 void sparse_dict_offer_top_s(unsigned int* atoms,
-                             float* scores,
-                             float* mags,
+                             ScoreScalar* scores,
+                             ScoreScalar* mags,
                              int active,
                              unsigned int atom,
-                             float score,
+                             ScoreScalar score,
                              int* count,
                              int* worst_idx) {
   if (active <= 0) {
     return;
   }
-  const float mag = sparse_dict_abs_f32(score);
+  const ScoreScalar mag = sparse_dict_abs(score);
   if (*count < active) {
     const int slot = *count;
     atoms[slot] = atom;
@@ -243,14 +242,14 @@ void sparse_dict_offer_top_s(unsigned int* atoms,
 
 static __device__ __forceinline__
 void sparse_dict_sort_top_s(unsigned int* atoms,
-                            float* scores,
-                            float* mags,
+                            ScoreScalar* scores,
+                            ScoreScalar* mags,
                             int active,
                             int count) {
   for (int i = 1; i < count; ++i) {
     const unsigned int atom = atoms[i];
-    const float score = scores[i];
-    const float mag = mags[i];
+    const ScoreScalar score = scores[i];
+    const ScoreScalar mag = mags[i];
     int j = i;
     while (j > 0 && sparse_dict_better(mag, atom, mags[j - 1], atoms[j - 1])) {
       atoms[j] = atoms[j - 1];
@@ -271,14 +270,14 @@ void sparse_dict_sort_top_s(unsigned int* atoms,
 
 extern "C" __global__
 void sparse_dict_fold_top_s(
-    const float* __restrict__ scores,  // [n_rows * n_atoms] current tile
+    const ScoreScalar* __restrict__ scores,  // [n_rows * n_atoms] current tile
     int n_rows,
     int n_atoms,
     unsigned int atom_offset,
     int active,
     unsigned int* __restrict__ top_atoms, // [n_rows * active]
-    float* __restrict__ top_scores,       // [n_rows * active]
-    float* __restrict__ top_mags)         // [n_rows * active]
+    ScoreScalar* __restrict__ top_scores,       // [n_rows * active]
+    ScoreScalar* __restrict__ top_mags)         // [n_rows * active]
 {
   const int row = blockIdx.x;
   if (row >= n_rows || active <= 0) {
@@ -288,13 +287,15 @@ void sparse_dict_fold_top_s(
   const int nthreads = blockDim.x;
   const int candidate_slots = nthreads * active;
 
-  extern __shared__ unsigned char smem[];
-  unsigned int* cand_atoms = (unsigned int*)smem;
+  // Scalars come first in an explicitly 8-byte-aligned arena. An odd active
+  // count therefore cannot misalign double buffers after the 32-bit indices.
+  extern __shared__ __align__(8) unsigned char smem[];
+  ScoreScalar* cand_scores = (ScoreScalar*)smem;
+  ScoreScalar* best_scores = cand_scores + candidate_slots;
+  ScoreScalar* cand_mags = best_scores + active;
+  ScoreScalar* best_mags = cand_mags + candidate_slots;
+  unsigned int* cand_atoms = (unsigned int*)(best_mags + active);
   unsigned int* best_atoms = cand_atoms + candidate_slots;
-  float* cand_scores = (float*)(best_atoms + active);
-  float* best_scores = cand_scores + candidate_slots;
-  float* cand_mags = best_scores + active;
-  float* best_mags = cand_mags + candidate_slots;
 
   const int local_base = tid * active;
   for (int j = 0; j < active; ++j) {
@@ -314,11 +315,11 @@ void sparse_dict_fold_top_s(
   int local_count = 0;
   int local_worst = 0;
   unsigned int* local_atoms = cand_atoms + local_base;
-  float* local_scores = cand_scores + local_base;
-  float* local_mags = cand_mags + local_base;
+  ScoreScalar* local_scores = cand_scores + local_base;
+  ScoreScalar* local_mags = cand_mags + local_base;
   const long long row_base = (long long)row * n_atoms;
   for (int atom = tid; atom < n_atoms; atom += nthreads) {
-    const float score = scores[row_base + atom];
+    const ScoreScalar score = scores[row_base + atom];
     sparse_dict_offer_top_s(
         local_atoms,
         local_scores,
@@ -391,11 +392,53 @@ pub const SCORE_BLOCK_TILE_N: u32 = 64;
 pub const SCORE_BLOCK_THREADS_M: u32 = 16;
 pub const SCORE_BLOCK_THREADS_N: u32 = 16;
 
-/// Prepend the `PP` shape macro so the NVRTC compile is a pure `compile_ptx`
-/// (mirrors `sae_rowjet::softmax_kernel_source` / `arrow_schur_nvrtc`).
+/// Instantiate one shared score/fold implementation at explicit precision and
+/// feature width. No source-text rewriting or duplicate kernel body is needed.
 #[must_use]
-pub fn score_block_kernel_source(p: usize) -> String {
-    format!("#define PP {p}\n{SCORE_BLOCK_KERNEL_SOURCE}")
+pub fn score_block_kernel_source(p: usize, precision: DictionaryScorePrecision) -> String {
+    let prelude = match precision {
+        DictionaryScorePrecision::F32 => {
+            "typedef float ScoreScalar;\n#define score_add_rn __fadd_rn\n#define score_mul_rn __fmul_rn\n"
+        }
+        DictionaryScorePrecision::F64 => {
+            "typedef double ScoreScalar;\n#define score_add_rn __dadd_rn\n#define score_mul_rn __dmul_rn\n"
+        }
+    };
+    format!("#define PP {p}\n{prelude}{SCORE_BLOCK_KERNEL_SOURCE}")
+}
+
+#[cfg(test)]
+mod precision_tests {
+    use super::*;
+    use ndarray::Array2;
+
+    #[test]
+    fn shared_precision_kernel_preserves_atom_f32_route_with_odd_top_s_2825() {
+        let rows = Array2::from_shape_fn((5, 35), |(row, column)| {
+            ((row * 17 + column * 11) as f32 * 0.023).sin()
+        });
+        let decoder = Array2::from_shape_fn((7, 35), |(atom, column)| {
+            ((atom * 13 + column * 3 + atom * column) as f32 * 0.017).cos()
+        });
+        let expected: Vec<_> = rows
+            .outer_iter()
+            .map(|row| super::super::scoring::top_s_online(row, decoder.view(), 3, 3))
+            .collect();
+        assert_eq!(expected.len(), 5);
+        assert!(expected.iter().all(|row| row.len() == 3));
+        let gate = gam_gpu::test_gate::gpu_for_test("scoring_gpu preserved f32 atom route");
+        if matches!(gate, gam_gpu::test_gate::GpuTestGate::AbsentDevice) {
+            assert!(
+                device::route_decoder_tiled_device(rows.view(), decoder.view(), 3, 3).is_err(),
+                "a device-free host must refuse the required atom route"
+            );
+            return;
+        }
+        let actual = device::route_decoder_tiled_device(rows.view(), decoder.view(), 3, 3)
+            .expect("the f32 CUDA atom route must remain supported");
+        assert_eq!(actual.selections, expected);
+        assert_eq!(actual.device_dtoh_bytes, 5 * 3 * (4 + 4));
+    }
 }
 
 /// Minimum score-block element count (`n_rows · n_atoms`) below which the device
@@ -415,14 +458,14 @@ pub enum ScoreBlockPath {
     Cpu,
 }
 
-/// Peak score elements per device launch for the tiled GPU router. The router
+/// Target score-buffer bytes per device launch for the tiled GPU router. The router
 /// NEVER materialises the whole `m × K` block: it walks `K` in atom-column tiles
 /// sized so each launch's `m × cols` block stays under this cap (~2M f32 ≈ 8 MB
 /// device score buffer), then discards it after folding. This keeps peak score
 /// memory bounded **independent of `K`** — the same discipline the CPU lane
 /// ([`super::scoring::top_s_online`]) keeps with its `rows × tile` column tiles —
 /// so a `K ≈ 32_000` fit does not balloon a `device alloc` linearly in `K`.
-const GPU_ROUTE_TILE_ELEMS: usize = gam_gpu::DEFAULT_DICTIONARY_SCORE_TILE_ELEMS;
+const GPU_ROUTE_TILE_BYTES: usize = gam_gpu::DEFAULT_DICTIONARY_SCORE_TILE_BYTES;
 
 pub fn route_minibatch_required(
     rows: ArrayView2<'_, f32>,
@@ -456,8 +499,9 @@ pub fn route_minibatch_required(
         m,
         k,
         decoder.ncols(),
+        DictionaryScorePrecision::F32,
         DEVICE_SCORE_BLOCK_MIN_ELEMS,
-        GPU_ROUTE_TILE_ELEMS,
+        GPU_ROUTE_TILE_BYTES,
     );
     if !plan.device_admitted {
         if mode == gam_gpu::GpuPolicy::Required {
@@ -469,8 +513,8 @@ pub fn route_minibatch_required(
             ));
         }
         gam_gpu::engagement::note_route_engagement(
-        "gam-sae sparse_dict score router",
-        "falling back to CPU",
+            "gam-sae sparse_dict score router",
+            "falling back to CPU",
             false,
             &format!(
                 "block {m}x{k} = {} elems below the device launch break-even \
@@ -491,14 +535,16 @@ pub fn route_minibatch_required(
     };
     if runtime.is_none() {
         gam_gpu::engagement::note_route_engagement(
-        "gam-sae sparse_dict score router",
-        "falling back to CPU",
-        false, "Auto admission found no CUDA device");
+            "gam-sae sparse_dict score router",
+            "falling back to CPU",
+            false,
+            "Auto admission found no CUDA device",
+        );
         return Ok((cpu_route(), ScoreBlockPath::Cpu, 0));
     }
 
     // Atom-columns per device launch: bound the per-launch block to
-    // GPU_ROUTE_TILE_ELEMS, at least one column, never more than K.
+    // The byte target at f32 precision, at least one column, never more than K.
     let tile_cols = plan.tile_items;
 
     let out = device::route_decoder_tiled_device(rows, decoder, active, tile_cols)?;
@@ -534,7 +580,9 @@ mod device {
 
     fn module_for(b: &Backend, p: usize) -> Result<Arc<CudaModule>, GpuError> {
         b.modules
-            .get_or_compile(&b.ctx, p, "sparse_dict score-block", score_block_kernel_source)
+            .get_or_compile(&b.ctx, p, "sparse_dict score-block", |p| {
+                score_block_kernel_source(p, super::DictionaryScorePrecision::F32)
+            })
     }
 
     const TOP_S_FOLD_THREADS: u32 = 32;
@@ -804,4 +852,3 @@ mod device {
         })
     }
 }
-

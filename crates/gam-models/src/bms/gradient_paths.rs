@@ -539,8 +539,6 @@ pub(super) fn joint_setup(
     for (idx, &value) in extra_rho0.iter().enumerate() {
         rho0vec[marginal_penalties + slope_penalties + idx] = value;
     }
-    let rho_lower = Array1::<f64>::from_elem(rho_dim, -12.0);
-    let rho_upper = Array1::<f64>::from_elem(rho_dim, 12.0);
     let marginal_kappa = SpatialLogKappaCoords::from_length_scales_aniso(
         marginalspec,
         &marginal_terms,
@@ -598,8 +596,6 @@ pub(super) fn joint_setup(
     let log_kappa0 = log_kappa0.clamp_to_bounds(&log_kappa_lower, &log_kappa_upper);
     Ok(ExactJointHyperSetup::new(
         rho0vec,
-        rho_lower,
-        rho_upper,
         log_kappa0,
         log_kappa_lower,
         log_kappa_upper,
@@ -688,6 +684,77 @@ pub(crate) fn signed_probit_neglog_unary_stack(signed_margin: f64, weight: f64) 
         -weight * d[3],
         -weight * d[4],
     ]
+}
+
+#[inline]
+pub(super) fn signed_probit_neglog_unary_stack_fifth(signed_margin: f64, weight: f64) -> [f64; 6] {
+    if weight == 0.0 || signed_margin == f64::INFINITY {
+        return [0.0; 6];
+    }
+    gam_math::probability::normal_logcdf_derivatives_through_fifth(signed_margin)
+        .map(|derivative| -weight * derivative)
+}
+
+// The fifth Bell remainder of a unary function composed with an implicit
+// intercept whose derivatives through order four are already known. This
+// polynomial has no fifth coefficient: the missing intercept derivative enters
+// the constraint linearly through F_a and is solved analytically by the caller.
+row_program! {
+    fn implicit_fourth_polynomial(q, g;
+        a10, a01, a20, a11, a02, a30, a21, a12, a03,
+        a40, a31, a22, a13, a04, f0, f1, f2, f3, f4, f5
+    )
+    emit [fifth];
+    leaves { supplied_function => supplied }
+    witnesses [];
+    {
+        let q2 = mul(q, q);
+        let q3 = mul(q2, q);
+        let q4 = mul(q3, q);
+        let g2 = mul(g, g);
+        let g3 = mul(g2, g);
+        let g4 = mul(g3, g);
+        let linear = add(scale(q, a10), scale(g, a01));
+        let quadratic = add(add(scale(q2, a20), scale(mul(q, g), a11)), scale(g2, a02));
+        let cubic = add(add(scale(q3, a30), scale(mul(q2, g), a21)),
+            add(scale(mul(q, g2), a12), scale(g3, a03)));
+        let quartic = add(add(scale(q4, a40), scale(mul(q3, g), a31)),
+            add(scale(mul(q2, g2), a22), add(scale(mul(q, g3), a13), scale(g4, a04))));
+        let polynomial = add(add(linear, quadratic), add(cubic, quartic));
+        return compose(supplied_function, polynomial, f0, f1, f2, f3, f4, f5);
+    }
+}
+
+pub(super) fn implicit_intercept_fifth_composition(
+    intercept: &gam_math::jet_tower::Tower4<2>,
+    slope_coefficient: f64,
+    stack: [f64; 6],
+) -> [[[[[f64; 2]; 2]; 2]; 2]; 2] {
+    let a = intercept;
+    implicit_fourth_polynomial_fifth_full(
+        0.0,
+        0.0,
+        a.g[0],
+        a.g[1] + slope_coefficient,
+        a.h[0][0] / 2.0,
+        a.h[0][1],
+        a.h[1][1] / 2.0,
+        a.t3[0][0][0] / 6.0,
+        a.t3[0][0][1] / 2.0,
+        a.t3[0][1][1] / 2.0,
+        a.t3[1][1][1] / 6.0,
+        a.t4[0][0][0][0] / 24.0,
+        a.t4[0][0][0][1] / 6.0,
+        a.t4[0][0][1][1] / 4.0,
+        a.t4[0][1][1][1] / 6.0,
+        a.t4[1][1][1][1] / 24.0,
+        stack[0],
+        stack[1],
+        stack[2],
+        stack[3],
+        stack[4],
+        stack[5],
+    )
 }
 
 /// The OBSERVED slope `b = s·g`. Identity in `g`, exactly as in the survival
@@ -1572,6 +1639,15 @@ fn rigid_observed_scale_stack(observed_slope: f64) -> [f64; 5] {
     ]
 }
 
+#[inline(always)]
+fn rigid_observed_scale_stack_fifth(observed_slope: f64) -> [f64; 6] {
+    let d = rigid_observed_scale_stack(observed_slope);
+    let inverse = d[0].recip();
+    let fifth =
+        15.0 * observed_slope * (3.0 - 4.0 * observed_slope * observed_slope) * inverse.powi(9);
+    [d[0], d[1], d[2], d[3], d[4], fifth]
+}
+
 row_program! {
     fn rigid_standard_normal_program(
         marginal_eta,
@@ -1586,13 +1662,13 @@ row_program! {
         outcome_sign: sign,
         weight
     )
-    emit [generic, order2, third, fourth, full];
+    emit [generic, order2, third, fourth, fifth, full];
     leaves {
         // The marginal-link stack `[q, q1, q2, q3, q4]` is supplied: the map's
         // constructor evaluated it at the same `eta` the program composes at.
         supplied_link => supplied,
-        observed_scale => rigid_observed_scale_stack => rigid_observed_scale_stack_cuda,
-        signed_probit => signed_probit_neglog_unary_stack => signed_probit_neglog_unary_stack_cuda,
+        observed_scale => rigid_observed_scale_stack => rigid_observed_scale_stack_cuda => rigid_observed_scale_stack_fifth,
+        signed_probit => signed_probit_neglog_unary_stack => signed_probit_neglog_unary_stack_cuda => signed_probit_neglog_unary_stack_fifth,
     }
     // The signed margin is the one intermediate a caller must inspect (a NaN or
     // `-inf` margin is a domain error, not a curvature to erase), so the program
@@ -1606,7 +1682,8 @@ row_program! {
             marginal_q1,
             marginal_q2,
             marginal_q3,
-            marginal_q4
+            marginal_q4,
+            0.0
         );
         let observed_slope = scale(slope, probit_scale);
         let observed_scale_value = compose(observed_scale, observed_slope);
@@ -1683,7 +1760,14 @@ pub(crate) fn rigid_standard_normal_row_nll_generic<S: gam_math::jet_scalar::Jet
     // outcome); `NaN` or `+inf` here is a `NaN` or `-inf` margin on an active
     // row, one compare on a value that is live regardless.
     if !nll.value().is_finite() {
-        return Err(non_finite_signed_margin(marginal, g_value(p), z, y, w, probit_scale));
+        return Err(non_finite_signed_margin(
+            marginal,
+            g_value(p),
+            z,
+            y,
+            w,
+            probit_scale,
+        ));
     }
     Ok(nll)
 }
@@ -2087,6 +2171,44 @@ pub(super) fn rigid_standard_normal_fourth_full(
     ))
 }
 
+/// Fifth likelihood derivatives for the third observed-information drift.
+/// The row compiler evaluates the six distinct symmetric components as scalar
+/// expressions; no runtime differentiation or fifth-order tensor arithmetic is
+/// used to evaluate the row.
+pub(super) fn rigid_standard_normal_fifth_full(
+    marginal: BernoulliMarginalLinkMap,
+    g: f64,
+    z: f64,
+    y: f64,
+    w: f64,
+    probit_scale: f64,
+) -> Result<[[[[[f64; 2]; 2]; 2]; 2]; 2], String> {
+    if w == 0.0 {
+        return Ok([[[[[0.0; 2]; 2]; 2]; 2]; 2]);
+    }
+    let outcome_sign = 2.0 * y - 1.0;
+    let signed_margin =
+        outcome_sign * marginal_slope_standard_normal_scalar_eta(marginal.q, g, z, probit_scale);
+    if !(signed_margin > f64::NEG_INFINITY) {
+        return Err(format!(
+            "non-finite signed margin in rigid probit fifth derivative: {signed_margin}"
+        ));
+    }
+    Ok(rigid_standard_normal_program_fifth_full(
+        marginal.eta_value(),
+        g,
+        marginal.q,
+        marginal.q1,
+        marginal.q2,
+        marginal.q3,
+        marginal.q4,
+        probit_scale,
+        z,
+        outcome_sign,
+        w,
+    ))
+}
+
 /// Contract a symmetric 4-tensor on its last two indices with two
 /// primary-space directions `u = (u_eta, u_g)` and `v = (v_eta, v_g)`,
 /// producing the symmetric 2×2 matrix the outer-Hessian pipeline expects:
@@ -2144,15 +2266,11 @@ pub(super) fn ensure_finite_fourth_full_cache_row(
     }
 }
 
-/// Derivatives of `√x` through 4th order, for `x ≥ 0`. At `x = 0` every
-/// derivative is infinite and that is what is returned; a negative `x` yields
-/// `NaN`. Neither is clamped: a floor fabricated finite derivatives of a
-/// function nobody evaluated (#2469).
 pub(crate) fn unary_derivatives_sqrt(x: f64) -> [f64; 5] {
     // One reciprocal: with `s = √x`, `1/x = r²` for `r = 1/s`, so every
     // derivative is a power of `r` times a constant (the pre-#932 hand chain
     // divided four times).
-    let s = x.sqrt();
+    let s = x.max(1e-300).sqrt();
     let r = 1.0 / s;
     let r2 = r * r;
     let r3 = r2 * r;
@@ -2170,14 +2288,15 @@ pub(crate) fn unary_derivatives_sqrt(x: f64) -> [f64; 5] {
 /// as its own leaf keeps the row program division-free, which is what the
 /// `row_program!` SSA vocabulary supports.
 ///
-/// Like [`unary_derivatives_sqrt`] this does not clamp: the argument is
+/// The `max(1e-300)` floor mirrors [`unary_derivatives_sqrt`]: the argument is
 /// `1 + s²·V ≥ 1` on every reachable path (`V = gᵀΣg ≥ 0` by the covariance
-/// admission check), and a corrupted argument yields the honest IEEE result
-/// (`∞`/`NaN`) rather than the derivatives of a fabricated floor (#2469).
+/// admission check), so the floor is unreachable in production and exists only
+/// so a corrupted argument yields a finite value rather than an ∞/NaN cascade
+/// with no provenance.
 pub(crate) fn unary_derivatives_inverse_sqrt(x: f64) -> [f64; 5] {
     // One reciprocal: `1/x = r²` for `r = 1/√x`, so the stack is odd powers
     // of `r` (the previous body divided five times).
-    let s = x.sqrt();
+    let s = x.max(1e-300).sqrt();
     let r = 1.0 / s;
     let r2 = r * r;
     let r3 = r2 * r;
@@ -2347,6 +2466,56 @@ mod jet_tower_oracle_tests {
     use super::*;
 
     use crate::bms::test_support::rigid_standard_normal_tower;
+
+    #[test]
+    fn rigid_fifth_tensor_matches_derivative_of_fourth_979() {
+        let link = InverseLink::Standard(gam_problem::StandardLink::Probit);
+        for (eta, slope, z, y, weight) in [
+            (0.3, 0.2, 0.4, 1.0, 1.0),
+            (-0.7, -0.5, -1.1, 0.0, 0.8),
+            (-3.0, 0.7, -0.5, 1.0, 1.4),
+            (2.5, -1.0, 0.8, 0.0, 0.6),
+        ] {
+            let marginal = bernoulli_marginal_link_map(&link, eta).unwrap();
+            let fifth =
+                rigid_standard_normal_fifth_full(marginal, slope, z, y, weight, 0.8).unwrap();
+            for axis in 0..2 {
+                let h = 2.0e-5;
+                let mut plus = [eta, slope];
+                let mut minus = plus;
+                plus[axis] += h;
+                minus[axis] -= h;
+                let eval = |point: [f64; 2]| {
+                    rigid_standard_normal_fourth_full(
+                        bernoulli_marginal_link_map(&link, point[0]).unwrap(),
+                        point[1],
+                        z,
+                        y,
+                        weight,
+                        0.8,
+                    )
+                    .unwrap()
+                };
+                let fp = eval(plus);
+                let fm = eval(minus);
+                for a in 0..2 {
+                    for b in 0..2 {
+                        for c in 0..2 {
+                            for d in 0..2 {
+                                let fd = (fp[a][b][c][d] - fm[a][b][c][d]) / (2.0 * h);
+                                let exact = fifth[a][b][c][d][axis];
+                                let band = 2.0e-7 * (1.0 + fd.abs());
+                                assert!(
+                                    (fd - exact).abs() < band,
+                                    "eta={eta} slope={slope} axes={a}{b}{c}{d}{axis}: exact={exact} fd={fd}"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn signed_probit_stack_preserves_extreme_tail_derivatives_and_weight_sign() {

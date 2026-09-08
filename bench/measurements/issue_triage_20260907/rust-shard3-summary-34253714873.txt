@@ -1,0 +1,18 @@
+     Summary [4203.898s] 971 tests run: 954 passed (1 slow), 12 failed, 5 timed out, 8630 skipped
+        FAIL [   0.100s] ( 13/971) gam::basis_smooth misc::constant_curvature_recovers_curvature_sign_1404::curv_production_estimand_identifies_curvature_sign_both_ways
+        FAIL [   0.009s] ( 30/971) gam::basis_smooth smooths::factor_smooth_formula::new_factor_smooth_terms_build_designs
+        FAIL [   0.007s] ( 44/971) gam::glm families::issue_2026_tweedie_estimated_power::bare_tweedie_estimates_variance_power_from_data
+     TIMEOUT [ 600.005s] ( 56/971) gam::inference misc::marginal_slope_neyman_orthogonal_reference::sim_c_scalar_target_matches_dml_reference_under_miscalibration
+        FAIL [   0.020s] (115/971) gam::regressions misc::diagnose_drops_response_column::diagnose_alo_keeps_survival_event_column
+     TIMEOUT [ 600.004s] (157/971) gam::sae sae::sae_factored_frame_solve::factored_matches_full_b_recovery
+     TIMEOUT [ 600.005s] (162/971) gam::survival survival::integration_large_scale_survival_marginal_slope::large_scale_survival_marginal_slope_canonical_gauge_fix
+        FAIL [  15.616s] (387/971) gam-models fit_orchestration::drivers::iso_kappa_reml_gradient_fd_tests::aniso_psi_duchon_order0_power9_16d_noops_scaledims_gaussian_identity_fd
+        FAIL [   0.487s] (613/971) gam-sae manifold::isa_seed::tests::isa_producer_gate_sparse_gated
+        FAIL [   2.701s] (642/971) gam-sae manifold::tests_checkpoint_resume_wiring::checkpoint_banks_resumes_and_discards_across_objectives
+     TIMEOUT [ 600.006s] (647/971) gam-sae manifold::tests_crosscoder_olmo::olmo_l18_l19_pair_crosscoder_fits_with_measured_drift
+     TIMEOUT [ 600.004s] (663/971) gam-sae manifold::tests_startup_validation_1782::topologies_fit_on_circle_data_1782
+        FAIL [   3.692s] (664/971) gam-sae manifold::tests_streaming_efs_cache_1026::streaming_cache_is_efs_dropin_for_dense_cache_1026
+        FAIL [   0.048s] (665/971) gam-sae manifold::tests_structured_residual_floor::tests::near_exact_fit_skips_structured_pass_and_certifies
+        FAIL [   0.040s] (685/971) gam-sae structure_harvest::tests::auto_resolution_writes_the_atom_dim_its_own_plan_builder_accepts
+        FAIL [   0.150s] (690/971) gam-sae structure_harvest::tests_atlas_prior_2280::swiss_roll_cycle_localizer_names_the_spurious_b1_carrier_2280
+        FAIL [  16.063s] (868/971) gam-solve::suite inner_fit_core_scaling::inner_fit_core_scaling

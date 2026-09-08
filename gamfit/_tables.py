@@ -79,14 +79,12 @@ def normalize_table(data: Any) -> tuple[list[str], Any, str]:
     columns, kind = _table_column_views(data)
     headers = list(columns)
     if not headers:
-        from ._exceptions import DataError
-        raise DataError("column '<table>' has no columns")
+        raise ValueError("table must have at least one column")
     reject_duplicate_column_names(headers, kind)
     validate_column_lengths(columns)
     row_count = len(columns[headers[0]])
     if row_count == 0:
-        from ._exceptions import DataError
-        raise DataError("column '<table>' has no observations")
+        raise ValueError("table data cannot be empty")
 
     # Arrow-capable providers hand ownership of a fresh C stream capsule to
     # arrow-rs.  Numeric buffers are then decoded directly from Arrow memory and
@@ -521,8 +519,11 @@ def reject_duplicate_column_names(names: Sequence[str], kind: str) -> None:
         if seen[name] == 2:
             duplicates.append(name)
     if duplicates:
-        from ._exceptions import DataError
-        raise DataError(f"column {duplicates[0]!r} has a duplicate name")
+        listed = ", ".join(repr(name) for name in duplicates)
+        raise ValueError(
+            f"{kind} input has duplicate column names ({listed}); "
+            "every column must have a unique name"
+        )
 
 
 def validate_column_lengths(columns: Mapping[str, Sequence[Any]]) -> None:

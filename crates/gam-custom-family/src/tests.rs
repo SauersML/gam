@@ -523,9 +523,11 @@ pub(crate) fn joint_outer_gradient_uses_projected_trace_for_rank_deficient_penal
         use_outer_hessian: false,
         ..BlockwiseFitOptions::default()
     };
-    let no_dh = |_: &Array1<f64>| -> Result<Option<DriftDerivResult>, CustomFamilyError> { Ok(None) };
-    let no_d2h =
-        |_: &Array1<f64>, _: &Array1<f64>| -> Result<Option<DriftDerivResult>, CustomFamilyError> { Ok(None) };
+    let no_dh =
+        |_: &Array1<f64>| -> Result<Option<DriftDerivResult>, CustomFamilyError> { Ok(None) };
+    let no_d2h = |_: &Array1<f64>,
+                  _: &Array1<f64>|
+     -> Result<Option<DriftDerivResult>, CustomFamilyError> { Ok(None) };
 
     let projected = joint_outer_evaluate(
         &inner,
@@ -703,9 +705,11 @@ pub(crate) fn joint_outer_gradient_projected_trace_drops_joint_null() {
         use_outer_hessian: false,
         ..BlockwiseFitOptions::default()
     };
-    let no_dh = |_: &Array1<f64>| -> Result<Option<DriftDerivResult>, CustomFamilyError> { Ok(None) };
-    let no_d2h =
-        |_: &Array1<f64>, _: &Array1<f64>| -> Result<Option<DriftDerivResult>, CustomFamilyError> { Ok(None) };
+    let no_dh =
+        |_: &Array1<f64>| -> Result<Option<DriftDerivResult>, CustomFamilyError> { Ok(None) };
+    let no_d2h = |_: &Array1<f64>,
+                  _: &Array1<f64>|
+     -> Result<Option<DriftDerivResult>, CustomFamilyError> { Ok(None) };
 
     let projected = joint_outer_evaluate(
         &inner,
@@ -788,9 +792,11 @@ pub(crate) fn large_scale_rho_scan_joint_outer_evaluate_is_projection_invariant(
     let h: Array2<f64> =
         array![[4.0, 0.2, 7.0], [0.2, 9.0, -3.0], [7.0, -3.0, 30.0]].mapv(|v| v * n_scale);
 
-    let no_dh = |_: &Array1<f64>| -> Result<Option<DriftDerivResult>, CustomFamilyError> { Ok(None) };
-    let no_d2h =
-        |_: &Array1<f64>, _: &Array1<f64>| -> Result<Option<DriftDerivResult>, CustomFamilyError> { Ok(None) };
+    let no_dh =
+        |_: &Array1<f64>| -> Result<Option<DriftDerivResult>, CustomFamilyError> { Ok(None) };
+    let no_d2h = |_: &Array1<f64>,
+                  _: &Array1<f64>|
+     -> Result<Option<DriftDerivResult>, CustomFamilyError> { Ok(None) };
 
     let mut g_un_at_10 = 0.0_f64;
     let mut g_pr_at_10 = 0.0_f64;
@@ -836,7 +842,10 @@ pub(crate) fn large_scale_rho_scan_joint_outer_evaluate_is_projection_invariant(
             joint_workspace: None,
             kkt_residual: None,
             active_constraints: None,
-            objective_state: crate::assembly::InnerObjectiveState::unaugmented(&[rho.clone()], None),
+            objective_state: crate::assembly::InnerObjectiveState::unaugmented(
+                &[rho.clone()],
+                None,
+            ),
         };
         let per_block = vec![rho.clone()];
         let options = BlockwiseFitOptions {
@@ -1112,10 +1121,12 @@ pub(crate) fn large_scale_multiblock_outer_gradient_with_realistic_drift_is_boun
     // `hessian_derivative_correction_result` β-chain — not in the
     // evaluator. If it FAILS, the evaluator itself has the defect at
     // large scale + Duchon-shape S.
-    let no_dh = |_: &Array1<f64>| -> Result<Option<DriftDerivResult>, CustomFamilyError> { Ok(None) };
+    let no_dh =
+        |_: &Array1<f64>| -> Result<Option<DriftDerivResult>, CustomFamilyError> { Ok(None) };
     let compute_dh = no_dh;
-    let no_d2h =
-        |_: &Array1<f64>, _: &Array1<f64>| -> Result<Option<DriftDerivResult>, CustomFamilyError> { Ok(None) };
+    let no_d2h = |_: &Array1<f64>,
+                  _: &Array1<f64>|
+     -> Result<Option<DriftDerivResult>, CustomFamilyError> { Ok(None) };
 
     // ── ParameterBlockSpec for each block.
     let mk_spec = |name: &str,
@@ -2030,7 +2041,9 @@ pub(crate) fn advertised_inner_workspace_missing_fails_closed_without_family_fal
     )
     .expect_err("an advertised workspace source must not silently fall back");
     assert!(
-        error.to_string().contains("requested an exact Hessian workspace, but the family returned none"),
+        error
+            .to_string()
+            .contains("requested an exact Hessian workspace, but the family returned none"),
         "unexpected missing-workspace error: {error}",
     );
     assert_eq!(workspace_builds.load(Ordering::Relaxed), 1);
@@ -2234,7 +2247,10 @@ pub(crate) fn finite_working_weight_certificate_preserves_zero_tiny_and_signed_r
 pub(crate) fn finite_working_weight_certificate_rejects_nonfinite_rows_atomically() {
     let nan = array![0.5, f64::NAN];
     let err = certify_finite_working_weights(&nan).expect_err("NaN curvature must be rejected");
-    assert!(err.to_string().contains("row 1"), "error should name the row: {err}");
+    assert!(
+        err.to_string().contains("row 1"),
+        "error should name the row: {err}"
+    );
 
     let inf = array![f64::INFINITY, 0.5];
     certify_finite_working_weights(&inf).expect_err("infinite curvature must be rejected");
@@ -2749,6 +2765,7 @@ pub(crate) fn psi_drift_deriv_workspace_preserves_block_local_operator() {
         Arc::new(test_design_hyper_layout(vec![])),
         false,
         Some(Arc::new(BlockLocalPsiWorkspace)),
+        None,
     )
     .expect("non-Gaussian psi drift callback should be available")
     .expect("workspace-owned drift derivative callback must be installed");
@@ -2863,6 +2880,7 @@ pub(crate) fn contracted_psi_hook_declines_partial_axis_coverage_before_pair_tab
         None,
         Some(Arc::new(PartialContractedPsiWorkspace)),
         None,
+        None,
     )
     .expect("partial contracted psi hook probe should not error");
 
@@ -2946,6 +2964,7 @@ pub(crate) fn contracted_psi_hook_rejects_wrong_score_width_before_installing_op
         &[0],
         None,
         Some(Arc::new(WrongScoreWidthPsiWorkspace)),
+        None,
         None,
     ) {
         Ok(_) => panic!("wrong contracted score width must be rejected before hook install"),
@@ -3224,7 +3243,10 @@ fn owned_uncoupled_terminal_working_sets_materialize_exact_joint_hessian() {
         "owned terminal test",
     )
     .expect_err("coupled likelihoods must retain their joint workspace");
-    assert!(error.to_string().contains("coupled 2-block likelihood"), "{error}");
+    assert!(
+        error.to_string().contains("coupled 2-block likelihood"),
+        "{error}"
+    );
 }
 
 #[test]
@@ -5098,7 +5120,9 @@ pub(crate) fn joint_newton_rejects_one_step_stationary_strict_saddle_at_returned
         "a one-step Newton solve must not return a stationary strict saddle as a coefficient mode",
     );
     assert!(
-        error.to_string().contains("fresh exact returned-mode curvature"),
+        error
+            .to_string()
+            .contains("fresh exact returned-mode curvature"),
         "unexpected returned-mode rejection: {error}",
     );
 }
@@ -5969,7 +5993,7 @@ pub(crate) fn returned_mode_finalizer_rejects_different_certified_objective() {
 
 mod inner_solver_numerics;
 
-mod effective_df_floor_box_2370;
+mod resolvability_rho_domain_2812;
 
 mod anchored_continuation_2366;
 
@@ -6131,14 +6155,8 @@ impl BetaDependentJeffreysInformationFamily {
     /// `∂H/∂β₀` and `∂H/∂β₁`.
     fn information_axes(b0: f64, b1: f64) -> [Array2<f64>; 2] {
         [
-            array![
-                [2.0 * Self::C * b0, Self::E * b1],
-                [Self::E * b1, 0.0]
-            ],
-            array![
-                [0.0, Self::E * b0],
-                [Self::E * b0, 2.0 * Self::C * b1]
-            ],
+            array![[2.0 * Self::C * b0, Self::E * b1], [Self::E * b1, 0.0]],
+            array![[0.0, Self::E * b0], [Self::E * b0, 2.0 * Self::C * b1]],
         ]
     }
 
@@ -6267,13 +6285,16 @@ fn the_jeffreys_value_refuses_a_point_whose_information_is_unavailable_2765() {
     let feasible = vec![jeffreys_seam_state(array![0.7, -0.4])];
     let value = custom_family_joint_jeffreys_value(&family, &feasible, &specs, &ranges, &z_joint)
         .expect("a feasible point has a Jeffreys value");
-    assert!(value.phi.is_finite() && value.phi != 0.0, "phi={}", value.phi);
+    assert!(
+        value.phi.is_finite() && value.phi != 0.0,
+        "phi={}",
+        value.phi
+    );
     assert!(value.roundoff > 0.0, "roundoff={}", value.roundoff);
 
     let infeasible = vec![jeffreys_seam_state(array![-0.7, -0.4])];
-    let error =
-        custom_family_joint_jeffreys_value(&family, &infeasible, &specs, &ranges, &z_joint)
-            .expect_err("an unavailable information is a refusal of the point, not Φ = 0");
+    let error = custom_family_joint_jeffreys_value(&family, &infeasible, &specs, &ranges, &z_joint)
+        .expect_err("an unavailable information is a refusal of the point, not Φ = 0");
     assert!(
         error
             .to_string()
@@ -6325,8 +6346,7 @@ fn outer_jeffreys_hphi_drift_matches_a_central_difference_of_hphi_2765() {
         .max(1e-12);
     for row in 0..2 {
         for column in 0..2 {
-            let coarse =
-                (coarse_plus[[row, column]] - coarse_minus[[row, column]]) / (2.0 * h);
+            let coarse = (coarse_plus[[row, column]] - coarse_minus[[row, column]]) / (2.0 * h);
             let fine = (fine_plus[[row, column]] - fine_minus[[row, column]]) / h;
             // Central differences are `O(h²)`: the `h/2` estimate carries a
             // quarter of the coarse remainder, so `(4·fine − coarse)/3` cancels

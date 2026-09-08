@@ -1,0 +1,25 @@
+     Summary [4595.737s] 950 tests run: 926 passed, 21 failed, 3 timed out, 8651 skipped
+        FAIL [   0.343s] ( 36/950) gam::basis_smooth smooths::spline_k_sweep_easy_truth::spline_k_sweep_uniform_quality
+        FAIL [   0.007s] ( 44/950) gam::glm families::owed_1477_double_vs_single_penalty::tweedie_default_double_penalty_matches_single_penalty_no_overshrink_1477
+        FAIL [   0.007s] ( 46/950) gam::identifiability misc::binary_outcome_bms_identifiability::binary_outcome_shape_bms_matern_fit_is_not_refused_by_identifiability_audit
+        FAIL [   0.006s] ( 60/950) gam::manifolds manifolds::owed_1404::kappa_one_kernel_is_exact_great_circle_1404
+        FAIL [   0.006s] (124/950) gam::regressions misc::workflow_bug_hunt::resolve_family_accepts_tweedie
+        FAIL [   0.015s] (148/950) gam::sae sae::owed_993_real_fit::real_fitted_bound_torus_atom_runs_carve_and_blocks_fission
+     TIMEOUT [2400.022s] (155/950) gam::survival survival::competing_risks_cif_invariant_to_cause_label_permutation_1593::competing_risks_cif_is_invariant_to_cause_label_permutation_1593
+     TIMEOUT [ 600.004s] (156/950) gam::survival survival::repro_2714_latent_frailty_inner_solve::latent_hazard_multiplier_frailty_converges_on_veteran_2714
+        FAIL [ 296.696s] (159/950) gam::survival survival::survival_marginal_slope_neyman_orthogonal_reference::sim_c_scalar_target_is_robust_to_first_stage_error_on_survival
+        FAIL [   2.086s] (163/950) gam::survival survival::survival_transformation_resumes_flat_stall_checkpoint_2373::survival_transformation_two_smooth_fit_reaches_kkt_without_relative_stall
+        FAIL [   0.157s] (355/950) gam-models bms::tests::profiled_theta_hvp_outer_hessian_matches_fd_of_gradient_psi_and_mixed
+        FAIL [   0.012s] (370/950) gam-models fit_orchestration::drivers::design_assembly_constraint_tests::single_block_exact_joint_design_cache_clears_memo_on_theta_change
+        FAIL [   0.058s] (374/950) gam-models fit_orchestration::drivers::iso_kappa_reml_gradient_fd_tests::duchon_hybrid_psi_components_match_fd_order0_power9_3d
+        FAIL [   0.007s] (387/950) gam-models fit_orchestration::materialize::tests::materialize_bernoulli_marginal_slope_names_constant_z_column
+        FAIL [   0.007s] (594/950) gam-sae manifold::fit_drivers::projection_policy_tests::multivariate_compact_projection_skips_without_mutation
+        FAIL [   0.006s] (616/950) gam-sae manifold::tests::sae_arrow_schur_beta_quadratic_model_matches_penalized_loss_change
+        FAIL [   0.017s] (631/950) gam-sae manifold::tests_device_engage_1783::framed_circle_isometry_fit_builds_device_sae_pcg_data_1783
+        FAIL [   4.381s] (637/950) gam-sae manifold::tests_logdet_adjoint_780::sae_exact_a_theta_adjoint_gap_measure_2330_patchd
+        FAIL [  12.300s] (638/950) gam-sae manifold::tests_outer_quasi_laplace_probe_budget_2080::k1_generated_seed_circle_outer_reml_does_not_livelock_2153
+        FAIL [   9.340s] (648/950) gam-sae manifold::tests_streaming_outer_gradient_2026::fixed_point_certificate_covers_non_ordered_beta_bernoulli_exact_gradient
+     TIMEOUT [ 600.025s] (652/950) gam-sae manifold::tests_zoo_micro_local::zz_zoo_micro_local_full_fit_and_oos_discriminator
+        FAIL [   0.019s] (658/950) gam-sae sparse_dict::block::block_tests::small_k_block_fit_runs_on_cpu_baseline_2134
+        FAIL [   0.013s] (666/950) gam-sae sparse_dict::update::exact_solve_tests::returned_ev_is_fresh_code_ev_no_stale_gap
+        FAIL [   0.052s] (672/950) gam-sae structure_harvest::tests::select_torus_resolution_grows_past_default_over_harmonic_gap_2243

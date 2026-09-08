@@ -13,9 +13,6 @@
 //!   custom  → CustomFamilyError
 
 #[macro_export]
-/// Implement `Display`, `Error`, and conversion to `String` for reason-carrying enums.
-///
-/// Every listed variant must have a named `reason` field of type `String`.
 macro_rules! impl_reason_error_boilerplate {
     ($type:ident { $($variant:ident),+ $(,)? }) => {
         impl ::std::fmt::Display for $type {
@@ -37,9 +34,6 @@ macro_rules! impl_reason_error_boilerplate {
 }
 
 #[macro_export]
-/// Return an [`EstimationError::InvalidInput`](crate::model_types::EstimationError::InvalidInput).
-///
-/// Accepts either a `format!`-style literal and arguments or an owned message.
 macro_rules! bail_invalid_estim {
     ($fmt:literal $(, $($arg:tt)*)?) => {
         return Err($crate::model_types::EstimationError::InvalidInput(format!($fmt $(, $($arg)*)?)))
@@ -50,9 +44,6 @@ macro_rules! bail_invalid_estim {
 }
 
 #[macro_export]
-/// Return a [`BasisError::InvalidInput`](crate::terms::basis::BasisError::InvalidInput).
-///
-/// Accepts either a `format!`-style literal and arguments or an owned message.
 macro_rules! bail_invalid_basis {
     ($fmt:literal $(, $($arg:tt)*)?) => {
         return Err($crate::terms::basis::BasisError::InvalidInput(format!($fmt $(, $($arg)*)?)))
@@ -63,9 +54,6 @@ macro_rules! bail_invalid_basis {
 }
 
 #[macro_export]
-/// Return a [`BasisError::DimensionMismatch`](crate::terms::basis::BasisError::DimensionMismatch).
-///
-/// Accepts either a `format!`-style literal and arguments or an owned message.
 macro_rules! bail_dim_basis {
     ($fmt:literal $(, $($arg:tt)*)?) => {
         return Err($crate::terms::basis::BasisError::DimensionMismatch(format!($fmt $(, $($arg)*)?)))
@@ -76,9 +64,6 @@ macro_rules! bail_dim_basis {
 }
 
 #[macro_export]
-/// Return a `GamlssError::InvalidInput` from the current function.
-///
-/// Accepts either a `format!`-style literal and arguments or an owned message.
 macro_rules! bail_invalid_gamlss {
     ($fmt:literal $(, $($arg:tt)*)?) => {
         return Err($crate::families::gamlss::GamlssError::InvalidInput { reason: format!($fmt $(, $($arg)*)?) })
@@ -89,9 +74,6 @@ macro_rules! bail_invalid_gamlss {
 }
 
 #[macro_export]
-/// Return a `GamlssError::DimensionMismatch` from the current function.
-///
-/// Accepts either a `format!`-style literal and arguments or an owned message.
 macro_rules! bail_dim_gamlss {
     ($fmt:literal $(, $($arg:tt)*)?) => {
         return Err($crate::families::gamlss::GamlssError::DimensionMismatch { reason: format!($fmt $(, $($arg)*)?) })
@@ -102,9 +84,6 @@ macro_rules! bail_dim_gamlss {
 }
 
 #[macro_export]
-/// Return a `TransformationNormalError::InvalidInput` from the current function.
-///
-/// Accepts either a `format!`-style literal and arguments or an owned message.
 macro_rules! bail_invalid_tnorm {
     ($fmt:literal $(, $($arg:tt)*)?) => {
         return Err($crate::families::transformation_normal::TransformationNormalError::InvalidInput { reason: format!($fmt $(, $($arg)*)?) })
@@ -115,9 +94,6 @@ macro_rules! bail_invalid_tnorm {
 }
 
 #[macro_export]
-/// Return a `SurvivalError::InvalidInput` from the current function.
-///
-/// Accepts either a `format!`-style literal and arguments or an owned message.
 macro_rules! bail_invalid_surv {
     ($fmt:literal $(, $($arg:tt)*)?) => {
         return Err($crate::families::survival::SurvivalError::InvalidInput { reason: format!($fmt $(, $($arg)*)?) })
@@ -128,9 +104,6 @@ macro_rules! bail_invalid_surv {
 }
 
 #[macro_export]
-/// Return a `SurvivalLocationScaleError::DimensionMismatch` from the current function.
-///
-/// Accepts either a `format!`-style literal and arguments or an owned message.
 macro_rules! bail_dim_sls {
     ($fmt:literal $(, $($arg:tt)*)?) => {
         return Err($crate::families::survival::location_scale::SurvivalLocationScaleError::DimensionMismatch { reason: format!($fmt $(, $($arg)*)?) })
@@ -141,9 +114,6 @@ macro_rules! bail_dim_sls {
 }
 
 #[macro_export]
-/// Return a `CustomFamilyError::DimensionMismatch` from the current function.
-///
-/// Accepts either a `format!`-style literal and arguments or an owned message.
 macro_rules! bail_dim_custom {
     ($fmt:literal $(, $($arg:tt)*)?) => {
         return Err($crate::families::custom_family::CustomFamilyError::DimensionMismatch { reason: format!($fmt $(, $($arg)*)?) })

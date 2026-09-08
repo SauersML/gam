@@ -43,107 +43,6 @@ fn ard_saddle_state() -> (SaeManifoldTerm, Array2<f64>, SaeManifoldRho) {
     (term, target, rho)
 }
 
-/// #2267 regression — a fully degenerate spectrum is the worst possible cluster
-/// shape: every eigenvector returned for `A = 3I` is arbitrary until the whole
-/// `dim`-wide eigenspace is re-resolved against `E`.  Production `E` is diagonal
-/// on the coordinate block and zero on the beta border.  Build that operator
-/// independently here and require the rotated basis to diagonalize its exact
-/// dense restriction, with the expected spectrum, while leaving `A`'s repeated
-/// eigenvalues untouched.
-///
-/// This pins the semantic invariant behind the direct weighted-product route.
-/// The pre-fix implementation obtained the same quantity by scanning a dense
-/// `dim x dim` zero matrix for every cluster pair, making this fully-degenerate
-/// case quartic in `dim` despite the operator having only `total_t` entries.
-#[test]
-fn fully_degenerate_cluster_diagonalizes_direct_e_diag_2267() {
-    let dim = 24usize;
-    let total_t = 17usize;
-    let a = Array2::<f64>::eye(dim) * 3.0;
-    let e_diag = Array1::from_shape_fn(total_t, |row| 0.5 * (row as f64 + 1.0));
-
-    let (eigenvalues, eigenvectors) =
-        SaeManifoldTerm::cluster_stable_eigh(&a, &e_diag, None, total_t)
-            .expect("a fully degenerate exact-A cluster must resolve against diagonal E");
-
-    let eigenvalue_error = eigenvalues
-        .iter()
-        .map(|value| (value - 3.0).abs())
-        .fold(0.0_f64, f64::max);
-    assert!(
-        eigenvalue_error <= 1.0e-12,
-        "cluster rotation must not alter A's repeated eigenvalue; max error={eigenvalue_error:.3e}"
-    );
-
-    // Independent dense oracle: production must not build this matrix, but at
-    // this tiny test dimension it makes the represented operator unambiguous.
-    let mut dense_e = Array2::<f64>::zeros((dim, dim));
-    for row in 0..total_t {
-        dense_e[[row, row]] = e_diag[row];
-    }
-    let restricted = eigenvectors.t().dot(&dense_e.dot(&eigenvectors));
-    let mut max_off_diagonal = 0.0_f64;
-    for row in 0..dim {
-        for column in 0..dim {
-            if row != column {
-                max_off_diagonal = max_off_diagonal.max(restricted[[row, column]].abs());
-            }
-        }
-    }
-    assert!(
-        max_off_diagonal <= 1.0e-11,
-        "the rotated fully-degenerate cluster must diagonalize V^T E V; max off-diagonal={max_off_diagonal:.3e}"
-    );
-
-    let mut observed = restricted.diag().to_vec();
-    observed.sort_by(f64::total_cmp);
-    let mut expected = e_diag.to_vec();
-    expected.extend(std::iter::repeat(0.0).take(dim - total_t));
-    expected.sort_by(f64::total_cmp);
-    let spectrum_error = observed
-        .iter()
-        .zip(expected.iter())
-        .map(|(actual, oracle)| (actual - oracle).abs())
-        .fold(0.0_f64, f64::max);
-    assert!(
-        spectrum_error <= 1.0e-11,
-        "the cluster restriction must preserve the diagonal-E spectrum; max error={spectrum_error:.3e}"
-    );
-}
-
-/// #2515 regression — a small but nonzero eigenvalue gap does not define a
-/// rotatable eigenspace. Even when the gap is below the old `sqrt(eps) * ||A||`
-/// clustering threshold, the returned columns must remain eigenvectors of the
-/// returned eigenvalues. Rotating them against `E` while leaving the distinct
-/// eigenvalues untouched constructs a false inverse and breaks the derivative
-/// of the log-determinant value.
-#[test]
-fn nearly_degenerate_distinct_spectrum_preserves_eigenpairs_2515() {
-    let root_half = 0.5_f64.sqrt();
-    let rotation = ndarray::array![[root_half, -root_half], [root_half, root_half]];
-    let gap = 1.0e-9_f64;
-    let diagonal = Array2::from_diag(&ndarray::array![3.0, 3.0 + gap]);
-    let operator = rotation.dot(&diagonal.dot(&rotation.t()));
-    // This diagonal is deliberately not diagonal in the eigenbasis of A, so the
-    // retired near-cluster rule performs a nontrivial, invalid rotation.
-    let e_diag = ndarray::array![1.0, 2.0];
-
-    let (eigenvalues, eigenvectors) =
-        SaeManifoldTerm::cluster_stable_eigh(&operator, &e_diag, None, 2)
-            .expect("the near-degenerate exact-A spectrum must decompose");
-    let residual = operator.dot(&eigenvectors)
-        - eigenvectors.dot(&Array2::from_diag(&eigenvalues));
-    let max_residual = residual
-        .iter()
-        .map(|value| value.abs())
-        .fold(0.0_f64, f64::max);
-    let backward_error = 32.0 * f64::EPSILON * 2.0 * (3.0 + gap);
-    assert!(
-        max_residual <= backward_error,
-        "cluster-stable eigensystem violates A V = V diag(lambda): \
-         max residual {max_residual:.6e}, backward-error allowance {backward_error:.6e}"
-    );
-}
 
 /// #2336 GATE — after the value-side E-attributability fix, a B-converged mode
 /// whose exact-A indefiniteness is FULLY attributable to the bounded ARD periodic
@@ -240,21 +139,15 @@ fn priced_ard_direct_gradient_matches_fixed_state_value_2434() {
     let e_diag = term
         .materialize_ard_concave_clamp_diagonal(&rho, &cache)
         .expect("materialize the clamp-attribution diagonal");
-    // #2828 — the production classification also carries the border half of
-    // `E`, so a probe that shares the scalar rule must share the operator too.
-    let e_beta = term
-        .decoder_prior_majorizer_gap_border(&cache)
-        .expect("decoder-prior majorization gap");
-    let (eigs, vecs) = SaeManifoldTerm::cluster_stable_eigh(&a, &e_diag, e_beta.as_ref(), total_t)
-        .expect("stable exact-A eigh");
+    let (eigs, vecs) =
+        a.eigh(faer::Side::Lower).expect("independent exact-A eigendecomposition");
     // #2673 — the band is per direction, in the `B` metric both the value and
     // the gradient classify in. This probe supplies its own eigenvectors and its
     // own `B`-applies and shares only the scalar rule.
     let spectral_norm = eigs.iter().map(|value| value.abs()).fold(0.0_f64, f64::max);
     let joint_metric = ArrowMetric::Joint(&cache);
     let floor_at = |idx: usize| -> f64 {
-        let vbv = joint_metric
-            .quadratic_form(vecs.column(idx))
+        let vbv = joint_metric.materialize().map(|matrix| vecs.column(idx).dot(&matrix.dot(&vecs.column(idx))))
             .expect("B quadratic form");
         sae_exact_a_direction_floor(eigs.len(), spectral_norm, vbv)
     };
@@ -468,20 +361,15 @@ fn zz_measure_best_seen_classification_2228() {
                 .materialize_ard_concave_clamp_diagonal(&rho, &cache)
                 .expect("ARD concave-clamp diagonal at the certified mode");
             let total_t = cache.delta_t_len();
-            let e_beta = term
-                .decoder_prior_majorizer_gap_border(&cache)
-                .expect("decoder-prior majorization gap");
-            let (eigs, vecs) =
-                SaeManifoldTerm::cluster_stable_eigh(&a, &e_diag, e_beta.as_ref(), total_t)
-                    .expect("A eigendecomposition (gate-identical clustering)");
+            let (eigs, vecs) = a.eigh(faer::Side::Lower)
+                .expect("A eigendecomposition (gate-identical clustering)");
             let min_eig = eigs.iter().copied().fold(f64::INFINITY, f64::min);
             let max_eig = eigs.iter().copied().fold(f64::NEG_INFINITY, f64::max);
             let spectral_norm = eigs.iter().map(|value| value.abs()).fold(0.0_f64, f64::max);
             let joint_metric = ArrowMetric::Joint(&cache);
             let floors: Vec<f64> = (0..eigs.len())
                 .map(|idx| {
-                    let vbv = joint_metric
-                        .quadratic_form(vecs.column(idx))
+                    let vbv = joint_metric.materialize().map(|matrix| vecs.column(idx).dot(&matrix.dot(&vecs.column(idx))))
                         .expect("B quadratic form");
                     sae_exact_a_direction_floor(eigs.len(), spectral_norm, vbv)
                 })

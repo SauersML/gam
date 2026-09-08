@@ -5878,6 +5878,11 @@ impl RemlArena {
 }
 
 pub(crate) struct RemlState<'a> {
+    /// The criterion's round-off band at the last evaluation (#2812): machine
+    /// precision times the sum of the absolute values of its four additive
+    /// terms, stored as bits (`NaN` = nothing evaluated yet) so `&self`
+    /// evaluators can publish it.
+    pub(crate) last_criterion_resolution_bits: std::sync::atomic::AtomicU64,
     pub(crate) y: ArrayView1<'a, f64>,
     pub(crate) x: DesignMatrix,
     pub(crate) weights: ArrayView1<'a, f64>,

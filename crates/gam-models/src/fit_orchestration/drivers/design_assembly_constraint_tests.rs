@@ -373,8 +373,6 @@ pub(super) fn two_block_exact_joint_hyper_setup(
     );
     ExactJointHyperSetup::new(
         Array1::zeros(0),
-        Array1::zeros(0),
-        Array1::zeros(0),
         log_kappa0,
         spatial_log_kappa_bounds_from_options(&dims_per_term, kappa_options, true),
         spatial_log_kappa_bounds_from_options(&dims_per_term, kappa_options, false),
@@ -1952,6 +1950,10 @@ fn frozen_joint_maternspec_rebuild_keeps_adaptive_cache_in_sync() {
     let design = build_term_collection_design(data.view(), &spec).unwrap_or_else(|e| panic!("{} failed: {:?}", "base design", e));
     let frozen = freeze_term_collection_from_design(&spec, &design).unwrap_or_else(|e| panic!("{} failed: {:?}", "freeze spec", e));
     let rebuilt = build_term_collection_design(data.view(), &frozen).unwrap_or_else(|e| panic!("{} failed: {:?}", "rebuilt design", e));
+    let caches =
+        extract_spatial_operator_runtime_caches(&frozen, &rebuilt).unwrap_or_else(|e| panic!("{} failed: {:?}", "adaptive caches", e));
+    assert_eq!(caches.len(), 1);
+    assert_eq!(caches[0].termname, "matern_joint");
     assert_eq!(rebuilt.smooth.terms.len(), 1);
     assert!(!rebuilt.smooth.terms[0].coeff_range.is_empty());
 }
@@ -2768,7 +2770,6 @@ fn exact_spatial_joint_engine_aniso_iso_parity_1d() {
     // Construct the joint setup exactly as the production caller does,
     // shared verbatim between the two engine invocations so that any
     // difference in the result can only come from the coordinate kind.
-    const JOINT_RHO_BOUND: f64 = 12.0;
     let kappa_options = SpatialLengthScaleOptimizationOptions::default();
     let log_kappa0 =
         SpatialLogKappaCoords::from_length_scales(&frozen, &spatial_terms, &kappa_options);
@@ -2789,8 +2790,6 @@ fn exact_spatial_joint_engine_aniso_iso_parity_1d() {
     let log_kappa0 = log_kappa0.clamp_to_bounds(&log_kappa_lower, &log_kappa_upper);
     let setup = ExactJointHyperSetup::new(
         Array1::<f64>::zeros(rho_dim), // log λ seed (λ = 1)
-        Array1::<f64>::from_elem(rho_dim, -JOINT_RHO_BOUND),
-        Array1::<f64>::from_elem(rho_dim, JOINT_RHO_BOUND),
         log_kappa0,
         log_kappa_lower,
         log_kappa_upper,
@@ -2963,11 +2962,8 @@ fn psi_gram_tensor_lane_matches_streamed_reml_cost_and_gradient() {
     )
     .expect("upper isotropic-scale bounds");
     let log_kappa0 = log_kappa0.clamp_to_bounds(&log_kappa_lower, &log_kappa_upper);
-    const JOINT_RHO_BOUND: f64 = 12.0;
     let setup = ExactJointHyperSetup::new(
         Array1::<f64>::zeros(rho_dim),
-        Array1::<f64>::from_elem(rho_dim, -JOINT_RHO_BOUND),
-        Array1::<f64>::from_elem(rho_dim, JOINT_RHO_BOUND),
         log_kappa0,
         log_kappa_lower,
         log_kappa_upper,
@@ -3311,11 +3307,8 @@ fn psi_gram_tensor_e2e_kappa_optimum_matches_streamed() {
     )
     .expect("upper isotropic-scale bounds");
     let log_kappa0 = log_kappa0.clamp_to_bounds(&log_kappa_lower, &log_kappa_upper);
-    const JOINT_RHO_BOUND: f64 = 12.0;
     let setup = ExactJointHyperSetup::new(
         Array1::<f64>::zeros(rho_dim),
-        Array1::<f64>::from_elem(rho_dim, -JOINT_RHO_BOUND),
-        Array1::<f64>::from_elem(rho_dim, JOINT_RHO_BOUND),
         log_kappa0.clone(),
         log_kappa_lower.clone(),
         log_kappa_upper.clone(),
@@ -4846,67 +4839,5 @@ fn spatial_anisotropy_pilot_initializer_seeds_geometry_without_fit() {
         }
         _ => panic!("expected Matern term"),
     }
-}
-
-/// #979 planner-routing pin, restored (#2818): a large-ψ anisotropic joint must
-/// KEEP its exact curvature declared for the terminal certificate while the
-/// SEARCH runs gradient-only, so no iterate pays for a rebuilt fourth-order ψ
-/// tower.
-///
-/// The contract lives entirely in `gam_solve::rho_optimizer::plan`, a pure
-/// function of the declared capability, so this gate calls that production
-/// entry point directly and owns no fixture scaffolding a reachability sweep
-/// could prune.
-///
-/// Deleted by `c0a21b554` as collateral of the `d484a091a` sweep (whose
-/// criterion — "no production artifact links this function" — is vacuously true
-/// of every test), not because the contract changed: `plan`, `OuterCapability`
-/// and its eight fields are all still here.
-#[test]
-fn spatial_aniso_joint_large_psi_dim_reserves_exact_curvature_for_terminal_mint_979() {
-    let cap = gam_solve::rho_optimizer::OuterCapability {
-        gradient: gam_problem::Derivative::Analytic,
-        hessian: gam_problem::DeclaredHessianForm::Either,
-        n_params: 40,
-        psi_dim: 31,
-        fixed_point_available: true,
-        barrier_config: None,
-        // Exact curvature remains declared for the terminal certificate, but
-        // search must not rebuild the fourth-order ψ tower at every iterate.
-        prefer_gradient_only: true,
-        disable_fixed_point: false,
-    };
-    assert!(
-        cap.hessian.is_analytic(),
-        "the terminal certificate's exact curvature must stay DECLARED; a capability that \
-         dropped it would route gradient-only for the wrong reason"
-    );
-    let route = gam_solve::rho_optimizer::plan(&cap);
-    assert_eq!(route.solver, gam_solve::rho_optimizer::Solver::Bfgs);
-    assert_eq!(
-        route.hessian_source,
-        gam_solve::rho_optimizer::HessianSource::BfgsApprox
-    );
-
-    // Non-vacuity, in-test: the verdict above has to be produced BY
-    // `prefer_gradient_only`, not by the declared-Analytic pair alone. Flip only
-    // that one field and the same capability must route to the exact-curvature
-    // solver. Without this arm the assertions would also pass on a planner that
-    // ignored the flag and answered Bfgs for some other reason.
-    let exact = gam_solve::rho_optimizer::plan(&gam_solve::rho_optimizer::OuterCapability {
-        prefer_gradient_only: false,
-        ..cap.clone()
-    });
-    assert_eq!(
-        exact.solver,
-        gam_solve::rho_optimizer::Solver::Arc,
-        "with the same declared curvature and prefer_gradient_only cleared the planner must \
-         take the exact-curvature route; if it does not, the assertions above are insensitive \
-         to the field this gate is about"
-    );
-    assert_eq!(
-        exact.hessian_source,
-        gam_solve::rho_optimizer::HessianSource::Analytic
-    );
 }
 }

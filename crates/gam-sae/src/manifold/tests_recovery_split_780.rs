@@ -130,7 +130,8 @@ pub(crate) fn sae_sphere_atom_recovers_synthetic_signal() {
     let sst: f64 = z.iter().map(|v| v * v).sum::<f64>();
     let (phi0, jet0) = AmbientSphereHarmonicEvaluator::new(2)
         .unwrap()
-        .evaluate(true_coords.view()).unwrap();
+        .evaluate(true_coords.view())
+        .unwrap();
     let m = phi0.ncols();
     let mut penalty = Array2::<f64>::eye(m);
     penalty *= 1.0e-4;
@@ -706,11 +707,7 @@ pub(crate) fn isometry_wiring_periodic_matches_fd() {
 pub(crate) fn isometry_wiring_sphere_matches_fd() {
     assert_isometry_wiring_matches_fd(
         Arc::new(AmbientSphereHarmonicEvaluator::new(2).unwrap()),
-        array![
-            [0.0, 0.0, 1.0],
-            [0.6, -0.8, 0.0],
-            [0.36, 0.48, 0.8]
-        ],
+        array![[0.0, 0.0, 1.0], [0.6, -0.8, 0.0], [0.36, 0.48, 0.8]],
     );
 }
 
@@ -807,6 +804,7 @@ pub(crate) fn warmstart_test_objective_with_evaluator() -> SaeManifoldOuterObjec
 
 pub(crate) fn near_singular_outer_gradient_cache() -> ArrowFactorCache {
     ArrowFactorCache {
+        exact_beta_remainders: std::sync::Arc::from([]),
         htt_factors: ArrowFactorSlab::from_blocks(vec![array![[1.0_f64, 0.0], [0.0, 1.0e-7]]]),
         htt_factors_undamped: ArrowUndampedFactors::SameAsDamped,
         schur_factor: Some(array![[1.0_f64]]),
@@ -838,6 +836,7 @@ pub(crate) fn diagonal_latent_cache(diagonal: &[f64]) -> ArrowFactorCache {
         factor[[i, i]] = diagonal[i].sqrt();
     }
     ArrowFactorCache {
+        exact_beta_remainders: std::sync::Arc::from([]),
         htt_factors: ArrowFactorSlab::from_blocks(vec![factor]),
         htt_factors_undamped: ArrowUndampedFactors::SameAsDamped,
         schur_factor: None,
@@ -998,6 +997,7 @@ pub(crate) fn rank_deficient_beta_outer_gradient_cache() -> ArrowFactorCache {
         [0.0, 0.0, 0.0, 1.0e-7],
     ];
     ArrowFactorCache {
+        exact_beta_remainders: std::sync::Arc::from([]),
         htt_factors: htt,
         htt_factors_undamped: ArrowUndampedFactors::SameAsDamped,
         schur_factor: Some(schur),

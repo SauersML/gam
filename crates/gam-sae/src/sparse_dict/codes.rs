@@ -1,10 +1,9 @@
 //! Per-row sparse codes via a small active-set least-squares solve.
 //!
 //! Given a row `x` and the `s` atoms the router selected for it, the optimal
-//! codes minimise `‖x − Σ_j c_j d_{a_j}‖² + ρ‖c‖²`. That is the tiny
-//! `s×s` normal-equation system `(Gᵃ + ρI) c = Dᵃ x` where `Gᵃ` is the Gram of
-//! the active atoms and `Dᵃ x` are their projections. `s` is the shared active
-//! budget (a handful), so this is a cheap dense solve regardless of `K`.
+//! Gaussian posterior-mean codes minimise `‖x − Σ_j c_j d_{a_j}‖² + ρ‖c‖²`.
+//! Solve from the active decoder's thin SVD, retaining resolved directions that
+//! forming its Gram would erase. Storage is O(P·s), independent of total K.
 
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
 
@@ -69,31 +68,7 @@ pub fn solve_row_codes(
             codes: vec![0.0; s],
         };
     }
-    let p = row.len();
-    // Active Gram (m×m) and rhs (m) in f64 for a well-conditioned solve.
-    let mut gram = Array2::<f64>::zeros((m, m));
-    let mut rhs = Array1::<f64>::zeros(m);
-    for i in 0..m {
-        let ai = active[i].0 as usize;
-        let di = decoder.row(ai);
-        let mut proj = 0.0f64;
-        for c in 0..p {
-            proj += di[c] as f64 * row[c] as f64;
-        }
-        rhs[i] = proj;
-        for j in i..m {
-            let aj = active[j].0 as usize;
-            let dj = decoder.row(aj);
-            let mut g = 0.0f64;
-            for c in 0..p {
-                g += di[c] as f64 * dj[c] as f64;
-            }
-            gram[[i, j]] = g;
-            gram[[j, i]] = g;
-        }
-        gram[[i, i]] += ridge as f64;
-    }
-    let solution = solve_spd(&gram, &rhs);
+    let solution = posterior_mean(row, decoder, &active[..m], ridge as f64);
 
     let mut indices = Vec::with_capacity(s);
     let mut codes = Vec::with_capacity(s);
@@ -109,54 +84,102 @@ pub fn solve_row_codes(
     SparseCode { indices, codes }
 }
 
-/// Solve the positive-semidefinite active Gram system. A positive ridge makes
-/// the system strictly positive definite and takes the Cholesky path. With
-/// zero ridge, collinear selected atoms are legitimate; the Moore--Penrose
-/// solution is then the unique minimum-norm joint least-squares code. At no
-/// point are off-diagonal Gram terms discarded.
-fn solve_spd(gram: &Array2<f64>, rhs: &Array1<f64>) -> Array1<f64> {
-    use faer::Side;
-    use gam_linalg::faer_ndarray::{FaerCholesky, FaerEigh};
+fn posterior_mean(
+    row: ArrayView1<'_, f32>,
+    decoder: ArrayView2<'_, f32>,
+    active: &[(u32, f32)],
+    ridge: f64,
+) -> Array1<f64> {
+    use gam_linalg::faer_ndarray::FaerSvd;
 
-    let m = rhs.len();
-    if let Ok(factor) = gram.cholesky(Side::Lower) {
-        return factor.solvevec(rhs);
+    let m = active.len();
+    if m == 1 {
+        let direction = decoder.row(active[0].0 as usize);
+        let norm: f64 = direction.iter().map(|&v| (v as f64).powi(2)).sum();
+        let projection: f64 = direction
+            .iter()
+            .zip(row.iter())
+            .map(|(&d, &x)| d as f64 * x as f64)
+            .sum();
+        return Array1::from_vec(vec![if norm + ridge == 0.0 {
+            0.0
+        } else {
+            projection / (norm + ridge)
+        }]);
     }
-
-    let (eigenvalues, eigenvectors) = gram
-        .eigh(Side::Lower)
-        .expect("an active Gram matrix must admit a symmetric eigendecomposition");
-    let spectral_radius = eigenvalues
-        .iter()
-        .map(|value| value.abs())
-        .fold(0.0_f64, f64::max);
-    if spectral_radius == 0.0 {
-        return Array1::<f64>::zeros(m);
-    }
-    let cutoff = f64::EPSILON * (m as f64) * spectral_radius;
-    let mut out = Array1::<f64>::zeros(m);
-    for eigen_index in 0..m {
-        let eigenvalue = eigenvalues[eigen_index];
-        assert!(
-            eigenvalue >= -cutoff,
-            "active Gram matrix is not positive semidefinite: eigenvalue {eigenvalue:e}, cutoff {cutoff:e}"
-        );
-        if eigenvalue <= cutoff {
+    let basis = Array2::from_shape_fn((row.len(), m), |(feature, slot)| {
+        decoder[[active[slot].0 as usize, feature]] as f64
+    });
+    let (left, singular, right_t) = basis
+        .svd(true, true)
+        .expect("finite active decoder must admit a thin SVD");
+    let left = left.expect("requested left singular vectors");
+    let right_t = right_t.expect("requested right singular vectors");
+    let spectral_radius = singular.iter().copied().fold(0.0_f64, f64::max);
+    let rank_floor = f64::EPSILON * row.len().max(m) as f64 * spectral_radius;
+    let mut solution = Array1::<f64>::zeros(m);
+    for (mode, &value) in singular.iter().enumerate() {
+        // Only the unregularized minimum-norm inverse needs a numerical rank
+        // decision. Positive ridge defines every mode, however small it is.
+        if value == 0.0 || (ridge == 0.0 && value <= rank_floor) {
             continue;
         }
-        let eigenvector = eigenvectors.column(eigen_index);
-        let projection = eigenvector.dot(rhs) / eigenvalue;
-        for coordinate in 0..m {
-            out[coordinate] += projection * eigenvector[coordinate];
+        let projection: f64 = left
+            .column(mode)
+            .iter()
+            .zip(row.iter())
+            .map(|(&u, &x)| u * x as f64)
+            .sum();
+        let coefficient = value / (value * value + ridge) * projection;
+        for slot in 0..m {
+            solution[slot] += right_t[[mode, slot]] * coefficient;
         }
     }
-    out
+    solution
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use ndarray::array;
+
+    #[test]
+    fn posterior_mean_preserves_a_small_direction_lost_by_the_normal_equations() {
+        let delta = 1e-10_f32;
+        let row = array![0.0_f32, 1.0];
+        let decoder = array![[1.0_f32, 0.0], [1.0, delta]];
+        let rho = delta * delta;
+        let code = solve_row_codes(row.view(), decoder.view(), &[(0, 0.0), (1, 0.0)], 2, rho);
+        // Exact solve gives c1=delta / (delta² + rho + rho/(1+rho)).
+        let expected =
+            delta as f64 / ((delta as f64).powi(2) + rho as f64 + rho as f64 / (1.0 + rho as f64));
+        assert!((code.codes[1] as f64 / expected - 1.0).abs() < 1e-6);
+        assert!((code.codes[0] as f64 / -expected - 1.0).abs() < 1e-6);
+        assert!((code.codes[1] * delta - 1.0 / 3.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn posterior_mean_matches_response_space_smoother_for_wide_support() {
+        use gam_linalg::faer_ndarray::FaerCholesky;
+        let row = array![1.2_f32, -0.7];
+        let decoder = array![[1.0_f32, 0.0], [0.6, 0.8], [0.0, 1.0]];
+        let active = [(0, 0.0), (1, 0.0), (2, 0.0)];
+        for rho in [0.01_f32, 0.5, 10.0] {
+            let code = solve_row_codes(row.view(), decoder.view(), &active, 3, rho);
+            let basis = decoder.mapv(f64::from).reversed_axes();
+            let covariance = basis.dot(&basis.t());
+            let mut total = covariance.clone();
+            total.diag_mut().mapv_inplace(|value| value + rho as f64);
+            let response = total
+                .cholesky(faer::Side::Lower)
+                .unwrap()
+                .solvevec(&row.mapv(f64::from));
+            let expected = basis.t().dot(&response);
+            for (&actual, &expected) in code.codes.iter().zip(expected.iter()) {
+                assert!((actual as f64 - expected).abs() < 1e-6);
+            }
+        }
+    }
 
     #[test]
     fn zero_prior_variance_has_zero_codes_with_the_requested_sparse_support() {

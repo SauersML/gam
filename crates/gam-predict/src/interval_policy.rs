@@ -983,6 +983,21 @@ pub fn predict_with_uncertainty_generic<T: PredictionTransform>(
     })
 }
 
+/// Which point estimate the caller will accept when the inverse link is curved.
+///
+/// SPEC: the posterior mean `E[g⁻¹(Xβ)]` is always the default. This exists only
+/// so the CLI's `--mode map` can ask for the cheaper plug-in `g⁻¹(η̂)`, and it
+/// is consulted **only on the point-only path**: once an interval is requested a
+/// curved link always reports the posterior mean, because the point prediction is
+/// a property of the model and the inputs and must never depend on whether an
+/// interval was asked for (#398, #1787).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PointEstimate {
+    /// Posterior mean whenever the model's inverse link is curved.
+    PosteriorMeanWhenCurved,
+    /// Force the plug-in point even for a curved link.
+    ForcePlugin,
+}
 
 /// What a prediction surface asks for, independent of how it renders the answer.
 pub struct PredictionRequest {
@@ -998,6 +1013,8 @@ pub struct PredictionRequest {
     /// `Var(y_i) = σ̂²/w_i` (#2077). `None` is the unweighted case and keeps the
     /// band byte-identical to a pooled scalar `σ̂²`.
     pub observation_prior_weights: Option<Array1<f64>>,
+    /// Point-estimate policy for a curved inverse link.
+    pub point_estimate: PointEstimate,
 }
 
 /// The estimands every standard prediction surface publishes before
@@ -1096,14 +1113,16 @@ pub fn resolve_prediction_request(
         }
         // Effectively-linear model + interval: the plug-in equals the posterior
         // mean, so the delta-method path reports the same point as the plain
-        // branch and only adds the band; the point never moves because an
-        // interval was requested (#398, #2115).
+        // branch and only adds the band. `apply_bias_correction: false` is what
+        // keeps that true — recentring η by `X·H⁻¹S(λ̂)β̂` would shift the
+        // reported point the moment an interval was requested (#398, #2115).
         (Some(level), false) => {
             let options = PredictUncertaintyOptions {
                 confidence_level: level,
                 covariance_mode: request.covariance_mode,
                 mean_interval_method: crate::MeanIntervalMethod::TransformEta,
                 includeobservation_interval: request.observation_interval,
+                apply_bias_correction: false,
                 observation_prior_weights: request.observation_prior_weights.clone(),
                 ..PredictUncertaintyOptions::default()
             };
@@ -1124,13 +1143,12 @@ pub fn resolve_prediction_request(
                 uncertainty_covariance_source: Some(prediction.covariance_source),
             })
         }
-        // Point-only. A curved link integrates the posterior mean — the only
-        // point estimand a prediction surface publishes (SPEC: never MAP; the
-        // plug-in pair is carried beside it as explicit columns) — but it must
-        // not ask the backend for interval quantities: passing a confidence
-        // level is the switch that populates SE/bounds, and the surfaces emit
-        // whatever optionals come back (#2136).
-        (None, true) => {
+        // Point-only. A curved link still integrates the posterior mean unless
+        // the caller explicitly asked for the plug-in, but it must not ask the
+        // backend for interval quantities: passing a confidence level is the
+        // switch that populates SE/bounds, and the surfaces emit whatever
+        // optionals come back (#2136).
+        (None, true) if request.point_estimate == PointEstimate::PosteriorMeanWhenCurved => {
             let plugin = predictor.predict_plugin_response(input)?;
             let prediction = predictor.predict_posterior_mean(
                 input,
@@ -1159,6 +1177,23 @@ pub fn resolve_prediction_request(
                 linear_predictor_plugin: prediction.eta,
                 mean_plugin: mean_plugin.clone(),
                 posterior_mean: Some(mean_plugin),
+                posterior_mean_standard_error: None,
+                posterior_mean_lower: None,
+                posterior_mean_upper: None,
+                observation_lower: None,
+                observation_upper: None,
+                point_covariance_source: None,
+                uncertainty_covariance_source: None,
+            })
+        }
+        // The sole request that has no posterior estimand: an explicit
+        // curved-link plug-in point.
+        (None, true) => {
+            let prediction = predictor.predict_plugin_response(input)?;
+            Ok(PredictionColumns {
+                linear_predictor_plugin: prediction.eta,
+                mean_plugin: prediction.mean,
+                posterior_mean: None,
                 posterior_mean_standard_error: None,
                 posterior_mean_lower: None,
                 posterior_mean_upper: None,

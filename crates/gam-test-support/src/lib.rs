@@ -1,16 +1,10 @@
-//! Model-level testing utilities.
+//! Reference-tool, CLI, and calibration test harnesses.
 //!
-//! What lives here: harnesses that genuinely need the model layer — the
-//! reference-tool bridge (`reference`), the CLI harness (`cli_harness`), and the
-//! calibration fixtures (`calibration`).
-//!
-//! What deliberately does NOT live here: fixtures and assertions that own no
-//! model-layer type. Those live in the leaf crate that owns the types they
-//! exercise and are re-exported below, so a crate that only needs (say) a
-//! finite-difference cross-check depends on that leaf rather than on this crate
-//! — which pulls `gam-models`, and through it the whole solver stack, into every
-//! dependent's test build. That back-edge is why `cargo test -p gam-solve --lib`
-//! used to compile the entire model layer before running a single unit test.
+//! These utilities consume design geometry and scalar diagnostics directly;
+//! they do not depend on the model implementations they help test. This keeps
+//! a model unit test from compiling the model crate a second time through a
+//! test-support dependency cycle. Leaf fixtures remain with their owning
+//! crates and are re-exported below for this harness's consumers.
 
 pub mod calibration;
 pub mod cli_harness;

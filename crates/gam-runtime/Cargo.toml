@@ -1,6 +1,6 @@
 [package]
 name = "gam-runtime"
-version = "0.3.155"
+version = "0.3.154"
 edition = "2024"
 rust-version = "1.97"
 description = "Resource policy, caching, and warm-start runtime foundation for the gam penalized-likelihood engine"

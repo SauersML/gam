@@ -807,6 +807,11 @@ fn wrong_rail_pullback_recovers_gradient_only_objective_2392() {
 /// when it is already stationary at iteration 0. `objective_scale = 80` makes
 /// the arithmetic gradient floor `80·√ε`, mirroring the Gaussian-linear
 /// standard-REML fit's matrix-factorization resolution.
+/// The relative resolution this fixture's criterion declares (#2812): the
+/// quadratic is evaluated to `1e-7 · (1 + |V|)`, which is what the widening
+/// it pins was derived against.
+const CURVATURE_WIDEN_RELATIVE_RESOLUTION: f64 = 1.0e-7;
+
 fn audit_interior_with_dense_curvature(
     theta_hat: Array1<f64>,
 ) -> Result<OuterCriterionCertificate, EstimationError> {
@@ -819,9 +824,13 @@ fn audit_interior_with_dense_curvature(
         .with_gradient(Derivative::Analytic)
         .with_hessian(DeclaredHessianForm::Dense)
         .build_objective(
-            (),
-            move |_: &mut (), rho: &Array1<f64>| Ok(0.5 * rho[0] * rho[0]),
-            move |_: &mut (), rho: &Array1<f64>| {
+            std::cell::Cell::new(0.0_f64),
+            move |last_cost: &mut std::cell::Cell<f64>, rho: &Array1<f64>| {
+                last_cost.set(0.5 * rho[0] * rho[0]);
+                Ok(0.5 * rho[0] * rho[0])
+            },
+            move |last_cost: &mut std::cell::Cell<f64>, rho: &Array1<f64>| {
+                last_cost.set(0.5 * rho[0] * rho[0]);
                 Ok(OuterEval {
                     cost: 0.5 * rho[0] * rho[0],
                     gradient: array![rho[0]],
@@ -829,9 +838,14 @@ fn audit_interior_with_dense_curvature(
                     inner_beta_hint: None,
                 })
             },
-            None::<fn(&mut ())>,
-            None::<fn(&mut (), &Array1<f64>) -> Result<EfsEval, EstimationError>>,
-        );
+            None::<fn(&mut std::cell::Cell<f64>)>,
+            None::<
+                fn(&mut std::cell::Cell<f64>, &Array1<f64>) -> Result<EfsEval, EstimationError>,
+            >,
+        )
+        .with_criterion_resolution(|last_cost: &mut std::cell::Cell<f64>| {
+            Some(CURVATURE_WIDEN_RELATIVE_RESOLUTION * (1.0 + last_cost.get().abs()))
+        });
     let mut result = OuterResult::new(
         theta_hat,
         0.0,
@@ -1826,6 +1840,7 @@ fn closure_objective_delegates() {
         efs_fn: None::<fn(&mut i32, &Array1<f64>) -> Result<EfsEval, EstimationError>>,
         fixed_point_certificate_fn: None,
         exact_polish_fn: None,
+        criterion_resolution_fn: None,
         rail_face_limit_fn: None,
         soft_rho_guard_gradient_fn: None,
         criterion_invariance_fn: None,
@@ -1928,6 +1943,7 @@ fn closure_objective_seed_inner_state_delegates_when_hook_present() {
         efs_fn: None::<fn(&mut Vec<f64>, &Array1<f64>) -> Result<EfsEval, EstimationError>>,
         fixed_point_certificate_fn: None,
         exact_polish_fn: None,
+        criterion_resolution_fn: None,
         rail_face_limit_fn: None,
         soft_rho_guard_gradient_fn: None,
         criterion_invariance_fn: None,
@@ -2139,6 +2155,7 @@ fn hybrid_efs_backtracking_uses_half_step_after_first_rejection() {
         }),
         fixed_point_certificate_fn: None,
         exact_polish_fn: None,
+        criterion_resolution_fn: None,
         rail_face_limit_fn: None,
         soft_rho_guard_gradient_fn: None,
         criterion_invariance_fn: None,
@@ -2218,6 +2235,7 @@ fn hybrid_efs_backtracking_propagates_fatal_cost_failure() {
         }),
         fixed_point_certificate_fn: None,
         exact_polish_fn: None,
+        criterion_resolution_fn: None,
         rail_face_limit_fn: None,
         soft_rho_guard_gradient_fn: None,
         criterion_invariance_fn: None,
@@ -2297,6 +2315,7 @@ fn fixed_point_stops_on_second_consecutive_restored_incumbent_2241() {
         }),
         fixed_point_certificate_fn: None,
         exact_polish_fn: None,
+        criterion_resolution_fn: None,
         rail_face_limit_fn: None,
         soft_rho_guard_gradient_fn: None,
         criterion_invariance_fn: None,
@@ -2712,7 +2731,6 @@ fn outer_second_order_bridge_separates_first_and_second_order_requests() {
         last_value_grad_rho: None,
         cost_stall: None,
         cost_stall_bounds: None,
-        curvature_stationary_floor: None,
     };
     let grad_sample = FirstOrderObjective::eval_grad(&mut bridge, &array![1.0]).expect("grad eval");
     assert_eq!(grad_sample.value, 1.0);
@@ -2776,7 +2794,6 @@ fn analytic_route_unavailable_hessian_is_fatal() {
         last_value_grad_rho: None,
         cost_stall: None,
         cost_stall_bounds: None,
-        curvature_stationary_floor: None,
     };
     let err = SecondOrderObjective::eval_hessian(&mut bridge, &array![1.0])
         .expect_err("Analytic route must reject Unavailable Hessian, not pass None to opt");
@@ -2938,7 +2955,6 @@ fn arc_bridge_finite_cost_stall_defers_at_bound_separation() {
         last_value_grad_rho: None,
         cost_stall: Some(guard),
         cost_stall_bounds: Some((lo.clone(), hi.clone())),
-        curvature_stationary_floor: None,
     };
     // Hammer eval_hessian at the lower bound — the ARC per-iterate oracle path.
     // Every finite sample, including the one that fills the stall window, must
@@ -3004,7 +3020,6 @@ fn arc_bridge_finite_stall_delivers_interior_negative_curvature() {
         last_value_grad_rho: None,
         cost_stall: Some(guard),
         cost_stall_bounds: Some((array![-10.0], array![10.0])),
-        curvature_stationary_floor: None,
     };
 
     for _ in 0..5 {
@@ -3082,7 +3097,6 @@ fn arc_bridge_finite_stall_defers_kkt_stationary_bound_descent() {
         last_value_grad_rho: None,
         cost_stall: Some(guard),
         cost_stall_bounds: Some((lo.clone(), hi.clone())),
-        curvature_stationary_floor: None,
     };
     for _ in 0..(COST_STALL_WINDOW + 2) {
         let sample = SecondOrderObjective::eval_hessian(&mut bridge, &lo)
@@ -3163,7 +3177,6 @@ fn arc_bridge_cost_stall_halts_on_infeasible_separation_run() {
         last_value_grad_rho: None,
         cost_stall: Some(guard),
         cost_stall_bounds: Some((lo.clone(), hi.clone())),
-        curvature_stationary_floor: None,
     };
     // One feasible eval records the best; the next `COST_STALL_WINDOW` infeasible
     // evals fill the infeasible-streak window and trip the sentinel.
@@ -3902,7 +3915,7 @@ fn criterion_flat_halt_is_refused_by_the_ladder_not_rescued_by_a_constant_2458()
     // The band the certificate will apply, and the rung that produced it. Read
     // from the helper rather than from the refusal string so this asserts a
     // value and not a message format.
-    let band = outer_stationarity_band_and_rung_at(&config, score);
+    let band = outer_stationarity_band_and_rung(&config);
     assert!(
         matches!(band.source, StationarityBoundSource::SolverBand),
         "the ladder, not the flat-valley constant, must decide this point; got rung {}",
@@ -5599,9 +5612,6 @@ fn strict_curvature_requirement_does_not_reinterpret_floor_clearance_as_psd() {
             // non-negative.
             floored_min_eigenvalue: 0.05,
             measured_resolution: 0.0,
-            // With no measured identity the arithmetic shift decides; the
-            // fixture's deciding eigenvalue is well clear of it either way.
-            decided_at_resolution: f64::EPSILON.sqrt(),
             cleared: true,
         }),
     };
@@ -5896,28 +5906,6 @@ fn run_nonconverged_arc_returns_typed_checkpoint_after_budget_retry_ladder() {
     );
 }
 
-#[test]
-fn arc_budget_retry_continues_only_the_exhausted_checkpoint() {
-    let mut config = OuterConfig::default();
-    config.heuristic_lambdas = Some(vec![0.5, 2.0, 8.0]);
-    config.seed_config.max_seeds = 7;
-    config.seed_config.seed_budget = 3;
-    config.screen_initial_rho = true;
-
-    super::super::run::restrict_arc_retry_to_checkpoint(&mut config);
-
-    assert!(
-        config.heuristic_lambdas.is_none(),
-        "a checkpoint continuation must not regenerate heuristic starts"
-    );
-    assert_eq!(config.seed_config.max_seeds, 1);
-    assert_eq!(config.seed_config.seed_budget, 1);
-    assert!(
-        !config.screen_initial_rho,
-        "the already-evaluated terminal checkpoint must be continued directly"
-    );
-}
-
 // The seed cascade: keep-best / parsimony ranking, Gaussian multistart,
 // expensive-seed screening and its cap ladder, the seed budget, and seed
 // projection before validation. Split out for the source-file length budget.
@@ -6054,10 +6042,3 @@ mod criterion_invariance_certificate_tests_2676;
 // curvature. Split out for the source-file length budget.
 #[path = "run_plan_stationarity_band_tests.rs"]
 mod run_plan_stationarity_band_tests;
-
-// The dense-ARC route's online stop on the test its own certificate applies:
-// the Newton decrement against the criterion's resolution, not an absolute
-// gradient band 29x tighter (#2817). Split out for the source-file length
-// budget.
-#[path = "arc_curvature_stationary_2817_tests.rs"]
-mod arc_curvature_stationary_2817_tests;

@@ -141,6 +141,18 @@ fn psd_root_rows(s: &Array2<f64>) -> Result<Vec<Array1<f64>>, String> {
     Ok(rows)
 }
 
+/// The eigenvalues of a symmetric matrix, for callers whose operator does not
+/// keep a spectrum (the Cholesky lane). `None` when the decomposition fails.
+///
+/// This costs one `O(p³)` eigendecomposition and is only ever called on the
+/// branch the resolution gate has already selected, i.e. where the assembled
+/// log-determinant provably cannot be trusted.
+pub(crate) fn symmetric_spectrum(h: &Array2<f64>) -> Option<Vec<f64>> {
+    use faer::Side;
+    use gam_linalg::faer_ndarray::FaerEigh;
+    h.eigh(Side::Lower).ok().map(|(evals, _)| evals.to_vec())
+}
+
 /// `log|H|` from the singular values of `B = [√W·X ; √λ_k R_k ; √δ I]`.
 ///
 /// Returns `None` — keep the assembled value — in every case listed in the
@@ -342,14 +354,8 @@ fn root_scale_hessian_logdet_inner(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use faer::Side;
-    use gam_linalg::faer_ndarray::FaerEigh;
     use gam_terms::construction::CanonicalPenalty;
     use ndarray::Array2;
-
-    fn symmetric_spectrum(h: &Array2<f64>) -> Option<Vec<f64>> {
-        h.eigh(Side::Lower).ok().map(|(evals, _)| evals.to_vec())
-    }
 
     /// A fixed orthogonal matrix with no axis-aligned column, from a Givens
     /// product. Deterministic, no RNG. The rotation is the point: on an

@@ -105,16 +105,16 @@ fn parse_args() -> Result<Args, String> {
 /// every circle at a decorrelated phase, so the curved structure is genuinely
 /// present (not one circle per row). Rows are generated from a global index so the
 /// train and test splits are drawn i.i.d. from the same generator.
-fn planted(n: usize, p: usize, n_circles: usize, n_linear: usize, index_base: u64) -> Array2<f32> {
-    let mut x = Array2::<f32>::zeros((n, p));
+fn planted(n: usize, p: usize, n_circles: usize, n_linear: usize, index_base: u64) -> Array2<f64> {
+    let mut x = Array2::<f64>::zeros((n, p));
     let lin_start = 2 * n_circles;
     for i in 0..n {
         let gi = index_base + i as u64;
         let ph = (gi as f64) * 0.201_357;
         for c in 0..n_circles {
             let theta = ph * (1.0 + c as f64 * 0.31) + c as f64;
-            x[[i, 2 * c]] = theta.cos() as f32;
-            x[[i, 2 * c + 1]] = theta.sin() as f32;
+            x[[i, 2 * c]] = theta.cos() as f64;
+            x[[i, 2 * c + 1]] = theta.sin() as f64;
         }
         // Linear bulk: shared ramp directions with per-row random amplitudes.
         let mut s = splitmix64(gi ^ 0x51ed_2701_a13f_7c4d);
@@ -125,13 +125,13 @@ fn planted(n: usize, p: usize, n_circles: usize, n_linear: usize, index_base: u6
             }
             s = splitmix64(s);
             let amp = ((s >> 11) as f64 / (1u64 << 53) as f64) * 2.0 - 1.0;
-            x[[i, col]] += amp as f32;
+            x[[i, col]] += amp as f64;
         }
         // Light deterministic noise on any remaining columns.
         for col in (lin_start + n_linear)..p {
             s = splitmix64(s);
             let noise = (((s >> 11) as f64 / (1u64 << 53) as f64) - 0.5) * 0.02;
-            x[[i, col]] = noise as f32;
+            x[[i, col]] = noise as f64;
         }
     }
     x
@@ -139,7 +139,7 @@ fn planted(n: usize, p: usize, n_circles: usize, n_linear: usize, index_base: u6
 
 /// EV of `recon` against `target`, total sum of squares taken about `mean` (the
 /// shared Tier-0 baseline): `1 − ‖target − recon‖² / ‖target − mean‖²`.
-fn ev_vs_mean(target: ArrayView2<'_, f32>, recon: ArrayView2<'_, f32>, mean: &Array1<f64>) -> f64 {
+fn ev_vs_mean(target: ArrayView2<'_, f64>, recon: ArrayView2<'_, f64>, mean: &Array1<f64>) -> f64 {
     let mut rss = 0.0f64;
     let mut tss = 0.0f64;
     for (tr, rr) in target.rows().into_iter().zip(recon.rows()) {
@@ -228,7 +228,7 @@ fn run() -> Result<(), String> {
 
     // --- Held-out Tier-1 EV: transform the test split through the frozen decoder. ---
     let mean = &lin_report.tier0.mean;
-    let r0_test = &z_test - &mean.mapv(|v| v as f32).view().insert_axis(Axis(0));
+    let r0_test = &z_test - &mean.view().insert_axis(Axis(0));
     let (blocks_te, _gates_te, codes_te) = block_sparse_dictionary_transform(
         r0_test.view(),
         lin_report.tier1.decoder.view(),
@@ -246,7 +246,7 @@ fn run() -> Result<(), String> {
     // Held-out EV about the (train) Tier-0 mean: r0_test is already test − mean, so the
     // baseline TSS is ‖r0_test‖² and RSS is ‖r0_test − recon‖²; add the mean back on
     // both sides so ev_vs_mean scores the reconstruction in z-space consistently.
-    let recon_te_z = &recon_te + &mean.mapv(|v| v as f32).view().insert_axis(Axis(0));
+    let recon_te_z = &recon_te + &mean.view().insert_axis(Axis(0));
     let ev_t1_heldout = ev_vs_mean(z_test.view(), recon_te_z.view(), mean);
     println!(
         "[k2000] TIER1 in_sample_ev={:.6} held_out_ev={:.6}",

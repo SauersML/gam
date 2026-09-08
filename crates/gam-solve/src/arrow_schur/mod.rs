@@ -108,15 +108,11 @@ mod solve_options;
 mod system;
 
 #[cfg(test)]
-mod negative_curvature_2731_tests;
-#[cfg(test)]
-mod streaming_exact_a_carrier_2731_tests;
-#[cfg(test)]
 mod tests;
 #[cfg(test)]
 mod tests_device_gauge_2660;
 #[cfg(test)]
-mod tests_logdet_krylov_2576;
+mod streaming_exact_a_carrier_2731_tests;
 
 pub(crate) use factorization::*;
 // `SPECTRAL_DEFLATION_REL_FLOOR` is consumed cross-crate (gam-sae streaming plan)

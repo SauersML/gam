@@ -133,6 +133,28 @@ fn value_and_derivative_lanes_price_one_logdet_2457() {
     }
 }
 
+#[test]
+fn strong_penalty_roundoff_uses_one_logdet_kernel_2834() {
+    // Every eigenvalue is far above the smooth floor. The competing source of
+    // disagreement is the assembled matrix's condition number, as on the
+    // shared/group smooth fixture when its deviation penalty tends to infinity.
+    let rotation = ndarray::array![
+        [0.5, 0.5, 0.5, 0.5],
+        [0.5, -0.5, 0.5, -0.5],
+        [0.5, 0.5, -0.5, -0.5],
+        [0.5, -0.5, -0.5, 0.5]
+    ];
+    for strength in [1e10, 1e12] {
+        let h = rotation
+            .dot(&Array2::from_diag(&ndarray::array![1.0, 2.0, 3.0, strength]))
+            .dot(&rotation.t());
+        assert!(DenseCholeskyOperator::from_spd_with_smooth_logdet_agreement(&h).is_err());
+        assert_eq!(value_lane_logdet(&h), derivative_lane_logdet(&h));
+    }
+    let benign = Array2::from_diag(&ndarray::array![1.0, 2.0, 3.0, 4.0]);
+    assert!(DenseCholeskyOperator::from_spd_with_smooth_logdet_agreement(&benign).is_ok());
+}
+
 /// CONTROL — the fixture must be able to FAIL, or the assertion above proves
 /// nothing. On the floor-touching Hessian the raw LLT log-determinant really
 /// does disagree with the floored one by more than the very envelope the

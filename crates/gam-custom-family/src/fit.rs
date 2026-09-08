@@ -499,360 +499,6 @@ pub(crate) fn wire_output_channels<F: CustomFamily + ?Sized>(
     Ok(Some(wired))
 }
 
-/// Minimum effective degrees of freedom a penalized term must retain in the
-/// outer λ-selection. One effective dimension is the smallest non-arbitrary
-/// floor: it asserts the penalized component must explain at least ONE effective
-/// direction of its own range space, i.e. it has not collapsed entirely onto its
-/// unpenalized polynomial null space. It is NOT a tuning constant — `1.0` is the
-/// boundary between "the smooth contributes" and "the smooth is statistically
-/// indistinguishable from its null-space limit".
-pub(crate) const EFFECTIVE_DF_FLOOR: f64 = 1.0;
-
-/// Fraction of a rank-deficient term's ATTAINABLE df that the floor retains
-/// (#2608).
-///
-/// [`EFFECTIVE_DF_FLOOR`] is absolute, and a rank-1 penalty's structural edf
-/// `γ/(γ + e^ρ)` ranges over `(0, 1]` — it reaches 1 only as `λ → 0`. So the
-/// absolute floor is UNREACHABLE for every rank-1 term and the guard skipped
-/// them all. The null-space half of a Marra–Wood double penalty is rank-1, so
-/// the LINEAR direction of every smooth was exempt from the only protection
-/// against its own collapse: measured on penguins at `edf = 4.6e-5`, dead to
-/// five decimals, while `nnet::multinom` scores 0.9912 there with a purely
-/// LINEAR softmax.
-///
-/// A term that cannot reach the absolute floor is instead asked to retain this
-/// fraction of what it CAN reach. For rank 1 the crossing is closed form,
-/// `ρ*(f) = ln γ + ln((1 − f)/f)`, finite for every `f ∈ (0, 1)` — so the
-/// relative floor is well posed exactly where the absolute one is not, and it is
-/// γ-ADAPTIVE rather than a uniform wall: a well-supported direction (`γ = 1e4`)
-/// is held only 2.8 nats below the ceiling while a weakly supported one
-/// (`γ = 1e-2`) is held 16.6. The fraction sets how much of the attainable df to
-/// keep; the DATA sets where that lands.
-///
-/// This can only TIGHTEN, and only for terms that were previously exempt: when
-/// `edf_max > EFFECTIVE_DF_FLOOR` the target is still the absolute floor, so
-/// every term the guard already bounded is byte-identical.
-///
-/// Chosen on evidence, not picked, and the evidence is a measured curve rather
-/// than an argument. At `0.5` the penguins LINEAR direction came back and
-/// accuracy went `0.8421 → 0.9649` (#2579), leaving one failing assertion:
-/// held-out log-loss against `nnet`'s `0.09494`, i.e. the right class picked
-/// under-confidently (#2612). #2612 pre-registered a sweep and what it would
-/// mean. Three arms off one base commit, differing ONLY in this constant, on
-/// `gam_multinomial_classifies_penguin_species_at_least_as_well_as_nnet_on_real_data`:
-///
-/// ```text
-///   f     log-loss   accuracy   per-class recall
-///   0.50   0.26080    0.9649    [0.961, 0.909, 1.000]
-///   0.75   0.17614    0.9649    [0.961, 0.909, 1.000]
-///   0.85   0.14087    0.9649    [0.961, 0.909, 1.000]     bar = 0.14494
-///   0.90   0.12057    0.9649    [0.961, 0.909, 1.000]   <- chosen
-/// ```
-///
-/// Monotone, 0.140 nats over the sweep. Accuracy and every per-class recall are
-/// INVARIANT at every `f`, so this buys calibration without trading
-/// classification — the failure really was residual shrinkage of the linear
-/// direction, which is reading (1) of the pre-registration.
-///
-/// THE CURVE ALONE DOES NOT CHOOSE THIS CONSTANT, because the sweep above
-/// watches ONE train/test split and `f` has a second effect it cannot see.
-/// Capping ρ lower means less shrinkage, hence a WIDER Laplace posterior, and at
-/// `f = 0.90` a sibling split (stride 4) stopped PREDICTING outright —
-/// `logistic-normal quadrature did not converge through Smolyak level 12` —
-/// against a same-base `f = 0.75` control where it passes. That is attributable
-/// to this constant, and it is a hard failure rather than a metric regression.
-///
-/// So this value was bounded on BOTH sides, by different things: the log-loss bar
-/// is crossed near `f ≈ 0.83`, and the quadrature stopped certifying in
-/// `(0.85, 0.90]`. `0.85` sat in that window with only 0.004 nats of margin.
-///
-/// The upper bound is now GONE rather than respected. The failing fit had spent
-/// 9633 of its 2000000 evaluations, so the LEVEL ceiling was binding and not the
-/// cost guard; raising it to 16 (see `MultinomialPosteriorIntegrationControl`,
-/// the same move #2350 made from 8) lets that split certify. Measured at
-/// `f = 0.90` with the raised ceiling, in one run, BOTH arms pass:
-///
-/// ```text
-///   stride-3   log-loss 0.12057   vs nnet 0.09494   (bar 0.14494)
-///   stride-4   log-loss 0.17246   vs nnet 0.76930
-/// ```
-///
-/// Strictly better than `0.85` on both — 0.12057 against 0.14087, and 0.17246
-/// against 0.20708 — and the stride-3 margin goes 0.004 → 0.024 nats, which is
-/// the difference between a bar that holds and one that flips on noise. It costs
-/// wall clock: that pair ran 515s against 244s, because a wider posterior really
-/// does visit the deeper levels. A well-conditioned fit certifies early and never
-/// pays it.
-///
-/// `ρ*(0.90) = ln γ − 2.20` is finite and moderate; it is `f → 1` that sends `ρ*`
-/// to `−∞`, and this stays a wide margin short of it.
-///
-/// What this does NOT fix, measured rather than assumed: `predict_multinomial_formula`
-/// publishes `E[softmax(η)]` while `nnet` publishes `softmax(η̂)`, and the same
-/// fit reports `0.17614` posterior-mean against `0.16499` plug-in at `f = 0.75`.
-/// Posterior width therefore accounts for `0.011` nats — about an eighth of the
-/// gap that remained there. The rest was the mode, which is why moving this
-/// constant is the right instrument and not a coincidence.
-/// WHAT THIS CONSTANT IS, in closed form (#2615).
-///
-/// For a rank-1 penalty the structural edf is `edf(ρ) = γ/(γ + e^ρ)` and
-/// `edf_max = unit_weight_term_edf_at_physical_strength(gammas, 0.0) = 1`
-/// EXACTLY — at `λ = 0` every positive `γ_j` contributes `1/(1 + 0) = 1`, so
-/// `edf_max` is the penalty rank and carries no design dependence at all. The
-/// relative target is therefore just `f`, and the bisected bound has an exact
-/// solution:
-///
-/// ```text
-///   γ/(γ + e^{ρ*}) = f    ⟺    ρ* = ln γ + ln((1 − f)/f)
-/// ```
-///
-/// which is why `f = 0.90` records `ρ* = ln γ − 2.20`: `ln(1/9) = −2.1972`.
-/// The bisection is not discovering a shape; it is recovering a logit.
-///
-/// AND WHAT `f` MEANS. `edf = γ/(γ + λ)` is the DATA's share of the posterior
-/// precision along that direction — `γ` is the design information, `λ` the
-/// prior precision. So the floor
-///
-/// ```text
-///   edf ≥ f    ⟺    λ/γ ≤ (1 − f)/f
-/// ```
-///
-/// is a ceiling on the PRIOR-TO-DATA PRECISION ODDS for the linear direction of
-/// a smooth. That is the derivation this constant was missing: it is not a
-/// fraction of an arbitrary quantity, it is an odds ratio, and it should be
-/// argued as one.
-///
-///   f = 0.50  ⟺  odds 1:1 — the data merely outvotes the prior. This is the
-///                identifiability threshold, and it is where #2608 started.
-///   f = 0.90  ⟺  odds 1:9 — the prior may carry at most a tenth of the
-///                precision. A much stronger demand than identifiability.
-///
-/// The odds reading also explains the `f → 1 ⟹ ρ* → −∞` behaviour noted below
-/// without appeal to the fit: odds → 0 means no prior mass at all is admissible,
-/// which is `λ = 0`.
-///
-/// HONEST STATUS. The FORM above is derived. The VALUE is not: `0.90` was
-/// selected as the largest value a raised Smolyak ceiling would admit while
-/// beating a log-loss bar on penguins, which is a different claim from "1:9 is
-/// the right odds for a linear trend". Recorded here rather than left implied,
-/// because those two statements have very different standing and the code used
-/// to read as the second. Deriving the value is #2615; the measurements below
-/// are what is actually known.
-/// RETRACTED 2026-07-31 (#2612), BY RE-MEASUREMENT AT THE EXACT QUADRATURE.
-/// Two claims above are refuted, and by one cause: every number in the
-/// `0.5 → 0.85 → 0.90` record was produced through the isotropic Smolyak path
-/// that #2612 subsequently showed was NOT converging on this posterior (off by
-/// four orders at level 16; it went on to refuse outright at the same settings).
-/// The exact conditioned three-class quadrature that replaced it disagrees.
-/// Re-measured on the same fixture, same split, at `c98f0b0d6`:
-///
-///  * "Posterior width therefore accounts for `0.011` nats." It accounts for
-///    `0.137102`. The same fit reports `0.161820` posterior-mean against
-///    `0.024718` plug-in — a factor of 12.5. Do not cite `0.011` again.
-///
-///  * "Moving this constant is the right instrument and not a coincidence." A
-///    same-base control arm at `f = 0.50` — the value #2612 was opened at, and
-///    the far end of the recorded `0.26080 → 0.12057` curve — measures held-out
-///    log-loss `0.160210`, against `0.161820` at `f = 0.90`. That is `0.0016`
-///    nats, not `0.14`. **On this fixture this constant is INERT**, and the
-///    curve it was selected from does not exist at the exact quadrature.
-///
-/// WHY AN UPPER BOUND CANNOT BITE HERE, which is the part worth keeping. This
-/// floor manufactures an UPPER ρ bound. On penguins four of the eight live
-/// null-space λ sit EXACTLY on the ρ box's LOWER wall, `2.173913043e-4` — which
-/// is `multinomial_formula_min_lambda` on this split to every digit
-/// (`8.0e-4 × 0.25 × 50/46`, with 46 the training Chinstrap count). REML is
-/// railed at the least-smoothed value the box permits and is pushing further, so
-/// a ceiling sitting above it never binds. The issue's framing — and this
-/// constant — are about OVER-smoothing; this fixture is railed at the UNDER-
-/// smoothed wall.
-///
-/// The constant this fixture actually reads out is
-/// `MULTINOMIAL_FORMULA_PRIOR_PSEUDO_OBS` in `gam-models::multinomial`, where
-/// the measurement is recorded. None of this makes `0.90` wrong; it makes the
-/// evidence for it void, so the value stands unsupported rather than supported,
-/// and it is NOT re-derivable from the sweep above.
-pub(crate) const EFFECTIVE_DF_FLOOR_RELATIVE_FRACTION: f64 = 0.90;
-
-/// Uniform ρ = log λ over-smoothing ceiling for the custom-family outer box, on
-/// top of which each term's per-coordinate `EFFECTIVE_DF_FLOOR` bound is
-/// tightened. Two forces bracket it:
-///
-///  * FROM BELOW — legitimate REML optima. A smooth mean over a genuinely smooth
-///    signal wants heavy shrinkage: the #1561 Gaussian location-scale `s(x,
-///    bs='tp')` mean over `sin(2πx)` has its REML optimum at ρ ≈ 11 (edf ≈ 15).
-///    The former `10.0` ceiling clipped exactly that — the μ coordinate railed at
-///    ρ = log λ = 10.0 = e¹⁰, the outer bound-projection zeroed its (still −3.5)
-///    gradient, and the fit certified a spurious constrained optimum at edf ≈ 19,
-///    leaving the mean under-smoothed (#1561/#2356). The ceiling MUST sit above
-///    the heavy-but-finite optima the data legitimately selects, matching the
-///    over-smoothing range the seed prepass itself already explores
-///    (`crate::estimate::RHO_BOUND`, optimizer.rs).
-///  * FROM ABOVE — numerical stability. Beyond λ ≈ 10⁹ (ρ ≈ 20.7) the profiled
-///    criterion goes dead-flat, ARC's quadratic model degrades, and the
-///    retry-stall / empty-`block_states` failure paths surface. The ceiling stays
-///    a wide margin below that region.
-///
-/// `12.0` (λ ≈ 163k) is the smallest raise that clears the #1561 mean-smooth
-/// optimum (ρ_μ ≈ 11.06 on the plain arm) with real headroom, and it matches the
-/// value the spatial exact-joint location-scale path already boxes ρ to
-/// (`fit_orchestration::drivers::JOINT_RHO_BOUND`, its joint-search prior) — a regime that path fits
-/// stably. Pushing the uniform ceiling further (e.g. 15) let some delicate
-/// wiggle / real-data tp location-scale fits (gagurine, the spatial
-/// engine↔reference parity fixtures) explore a warm-start/inner-solve path where
-/// the joint PIRLS stopped converging, so 12 keeps the raise tight. The per-term
-/// `EFFECTIVE_DF_FLOOR` bound — not this uniform cap — is what protects a term
-/// from collapsing onto its unpenalized null space, so this only frees the
-/// coordinates whose honest optimum was being clipped at ρ = 10.
-///
-/// #1561 forensic note (2026-07-26): for a location-scale fit with NO spatial
-/// terms, the exact-joint (ρ, ψ) outer optimizer is inactive
-/// (`log_kappa_dim() == 0`), the fit routes through `fit_custom_family`, and
-/// THIS ceiling — not `JOINT_RHO_BOUND` — is the operative ρ box. A
-/// selected λ equal to `exp(EFFECTIVE_DF_CEILING)` to the last bit is a
-/// coordinate railed HERE (`ln λ = 12.000000…` ⇒ check this constant first);
-/// widening the location-scale engine's box cannot move it, and was measured
-/// not to (bit-identical λ across a 5× widening of that box). The value
-/// coincidence with `JOINT_RHO_BOUND` is what makes the misattribution
-/// cheap. A null-space-ridge coordinate railed here with z² = θ̂²g ≤ 1 is
-/// HARMLESS — the criterion is monotone to +∞ and the shrinkage factor
-/// g/(g+e¹²) ≈ 1e-4 means the λ=∞ limit is already attained — while a
-/// Primary railed here with a finite beyond-ceiling optimum is the #2356
-/// class. A ceiling sweep 12→14→20 on the #1561 by-group fixture moved every
-/// truth-RMSE by < 1e-5, both cases included.
-///
-/// Exported `pub` because regimes that PIN a coordinate at the strong-smoothing
-/// wall seed from it (the survival parametric-AFT time-warp seed, #2356): a
-/// wall-pinning seed must move WITH the ceiling, or a ceiling raise strands it
-/// interior and re-opens the flat-ridge crawl the seed exists to kill. Seeding
-/// AT this ceiling is exact even when a term's realized upper bound is tighter
-/// (the `EFFECTIVE_DF_FLOOR` tightening): `run_plan` projects every seed onto
-/// the realized per-coordinate box, so "seed = ceiling" lands ON the wall.
-pub const EFFECTIVE_DF_CEILING: f64 = 12.0;
-
-/// The lower wall of the outer ρ box — the caller's
-/// [`BlockwiseFitOptions::rho_lower_bound`] (default `-10.0`).
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub(crate) struct RhoLowerWall(pub(crate) f64);
-
-/// The uniform over-smoothing ceiling of the outer ρ box —
-/// [`EFFECTIVE_DF_CEILING`] (`12.0`).
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub(crate) struct RhoCeiling(pub(crate) f64);
-
-/// The admissible outer ρ = log λ interval, carried as ONE validated value so
-/// its two walls can neither be transposed nor drift apart.
-///
-/// The walls are independently owned: the floor is the caller's
-/// `rho_lower_bound` (default `-10.0`) and the ceiling is
-/// [`EFFECTIVE_DF_CEILING`] (`12.0`). #2370 was precisely these two constants
-/// drifting apart — #2356 raised the ceiling `10 → 12` while the floor stayed
-/// at `-10`, opening a window in which the derived per-term upper bound could
-/// land *below* the floor and invert the box, whose `f64::clamp(min, max)`
-/// then panicked across the FFI boundary.
-///
-/// The follow-up hazard is the one this type closes. Passing the same two
-/// walls as adjacent bare `f64` parameters let a caller hand them over
-/// BACKWARDS with no compile error: the transposed call produced a
-/// plausible-looking typed error at runtime instead, and a real regression
-/// test was observed doing exactly that against the landed signature. Wrapping
-/// each wall in its own newtype makes the transposition a type error, and
-/// funnelling both through one checked constructor means the ordering
-/// invariant is established once rather than restated at every call site.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub(crate) struct RhoBox {
-    lower: f64,
-    ceiling: f64,
-}
-
-impl RhoBox {
-    /// Build the box, rejecting a non-finite wall or an inverted interval.
-    ///
-    /// The empty case is `lower > ceiling` and nothing else. A box with
-    /// `lower == ceiling` is a legal PINNED coordinate: the caller has fixed λ
-    /// rather than asked for an impossible range, and the derivation handles it
-    /// without a special case — no tightening is possible, so the term keeps the
-    /// uniform ceiling and the emitted box stays well-ordered.
-    ///
-    /// This deliberately matches the outer optimizer, which accepts a pinned
-    /// coordinate (`rho_optimizer::run_plan_tests::pinned_equal_rho_bounds_are_accepted_2370`).
-    /// Refusing here what the layer below accepts would be a cross-layer
-    /// contract split — the same class of defect as #2370 itself, one level up:
-    /// two independently-owned definitions of the same admissible set, free to
-    /// drift apart.
-    pub(crate) fn new(
-        RhoLowerWall(lower): RhoLowerWall,
-        RhoCeiling(ceiling): RhoCeiling,
-    ) -> Result<Self, CustomFamilyError> {
-        gam_problem::validate_log_strength(ceiling).map_err(|error| {
-            CustomFamilyError::InvalidInput {
-                context: "effective-DF rho ceiling",
-                reason: error.to_string(),
-            }
-        })?;
-        gam_problem::validate_log_strength(lower).map_err(|error| {
-            CustomFamilyError::InvalidInput {
-                context: "effective-DF rho lower bound",
-                reason: error.to_string(),
-            }
-        })?;
-        if lower > ceiling {
-            return Err(CustomFamilyError::InvalidInput {
-                context: "effective-DF rho box",
-                reason: format!(
-                    "rho lower bound {lower} exceeds the uniform ceiling {ceiling}; \
-                     the admissible ρ-box is empty"
-                ),
-            });
-        }
-        Ok(Self { lower, ceiling })
-    }
-
-    pub(crate) fn lower(&self) -> f64 {
-        self.lower
-    }
-
-    pub(crate) fn ceiling(&self) -> f64 {
-        self.ceiling
-    }
-}
-
-/// Unit-weight effective degrees of freedom of a single penalized term as a
-/// function of `ρ = log λ`, expressed through the design/penalty generalized
-/// eigenvalues `γ_j` on the penalty range space:
-///
-/// ```text
-/// edf(ρ) = Σ_j γ_j / (γ_j + e^ρ),   γ_j = (design range curvature)_j / (penalty)_j.
-/// ```
-///
-/// This is the data-FREE structural edf: it uses the design column Gram `XᵀX`
-/// (unit weights), NOT the family's Fisher weight, so it is the same regardless
-/// of where the inner solve sits on a near-flat Fisher surface. It is the
-/// quantity whose collapse the #715/#684 over-shrinkage describes — when the
-/// Fisher curvature vanishes the REML objective flattens in ρ and the optimizer
-/// lets λ drift past the point where this structural edf falls below the floor.
-fn unit_weight_term_edf_at_physical_strength(gammas: &[f64], lambda: f64) -> f64 {
-    gammas
-        .iter()
-        .map(|&gamma| {
-            if gamma.is_finite() && gamma > 0.0 {
-                1.0 / (1.0 + lambda / gamma)
-            } else {
-                0.0
-            }
-        })
-        .sum()
-}
-
-pub(crate) fn unit_weight_term_edf(gammas: &[f64], rho: f64) -> Result<f64, CustomFamilyError> {
-    let lambda = gam_problem::checked_exp_log_strength(rho).map_err(|error| {
-        CustomFamilyError::InvalidInput {
-            context: "unit-weight structural EDF",
-            reason: error.to_string(),
-        }
-    })?;
-    Ok(unit_weight_term_edf_at_physical_strength(gammas, lambda))
-}
 
 /// Generalized eigenvalues `γ_j` of the design column Gram `G = XᵀX` against the
 /// penalty `S` on `range(S)`, computed structurally (unit weights).
@@ -911,304 +557,188 @@ pub(crate) fn design_penalty_range_gammas(
     penalty_range_gammas_from_gram(&gram, &s_dense)
 }
 
-/// The pencil core of [`design_penalty_range_gammas`], reading the unit-weight
-/// Gram directly instead of a [`DesignMatrix`].
-///
-/// A [`gam_problem::JointPenaltySpec`] has no `DesignMatrix` of its own: its
-/// matrix spans the CONCATENATION of every block's coefficients, so there is no
-/// single block whose design it multiplies. Splitting the core out here is what
-/// lets a joint penalty reach the identical structural-edf machinery, with
-/// [`stacked_block_design_gram`] supplying the matching Gram (#2579).
-pub(crate) fn penalty_range_gammas_from_gram(
-    gram: &Array2<f64>,
-    s_dense: &Array2<f64>,
-) -> Option<Vec<f64>> {
-    let p = s_dense.nrows();
-    if p == 0 || s_dense.ncols() != p || gram.nrows() != p || gram.ncols() != p {
+pub use gam_solve::estimate::rho_domain::{penalty_range_gammas_from_gram, resolvability_interval};
+
+/// The ρ at which one penalized term is switched off to the gradient's resolution —
+/// the upper edge of its resolvability interval — for a caller that seeds a
+/// term at its null space (the constant-scale AFT time warp). `None` when the
+/// term carries no data curvature against its penalty.
+pub fn penalized_term_switch_off_rho(design: &DesignMatrix, penalty: &Array2<f64>) -> Option<f64> {
+    let p = design.ncols();
+    if p == 0 || penalty.nrows() != p || penalty.ncols() != p {
         return None;
     }
-    // Eigendecompose the penalty to find its range space S = U D Uᵀ.
-    let (s_evals, s_evecs) = s_dense.eigh(Side::Lower).ok()?;
-    let s_max = s_evals.iter().fold(0.0_f64, |a, &b| a.max(b.abs()));
-    if !(s_max > 0.0) {
-        return None;
-    }
-    let s_thresh = positive_eigenvalue_threshold(s_evals.as_slice()?);
-    // Split the penalty eigenbasis into range(S) columns U_r (d_j above the
-    // numerical-zero threshold, with inverse square-root weights d_j^{-1/2})
-    // and ker(S) columns U_0. Null directions carry no penalty, but they are
-    // NOT simply dropped: they are fitted unpenalized for every λ, so any
-    // design curvature they share with the range is absorbed by them and must
-    // be projected out of the range curvature (Schur complement below).
-    let mut range_cols: Vec<usize> = Vec::new();
-    let mut inv_sqrt_d: Vec<f64> = Vec::new();
-    let mut null_cols: Vec<usize> = Vec::new();
-    for (j, &dj) in s_evals.iter().enumerate() {
-        if dj <= s_thresh {
-            null_cols.push(j);
-        } else {
-            range_cols.push(j);
-            inv_sqrt_d.push(1.0 / dj.sqrt());
-        }
-    }
-    let r = range_cols.len();
-    if r == 0 {
-        return None;
-    }
-    // Form U_r (p×r) and the symmetric pencil matrix
-    //   B = D_r^{-1/2} (U_rᵀ G U_r) D_r^{-1/2}   (r×r),
-    // whose eigenvalues are the generalized eigenvalues of (UᵀGU, D) on
-    // range(S). Scaling U_r's columns by d_j^{-1/2} up front gives
-    //   Y = U_r D_r^{-1/2}  (p×r),   B = Yᵀ G Y,
-    // which is symmetric by construction (Gram of G in the Y-columns).
-    let mut y = Array2::<f64>::zeros((p, r));
-    for (col, (&src, &w)) in range_cols.iter().zip(inv_sqrt_d.iter()).enumerate() {
-        let u = s_evecs.column(src);
-        for row in 0..p {
-            y[(row, col)] = u[row] * w;
-        }
-    }
-    let mut b = y.t().dot(gram).dot(&y);
-    if !null_cols.is_empty() {
-        // Quotient the null space out of the range curvature. In the penalty
-        // eigenbasis, with A = UᵀGU partitioned into null (0) and range (r)
-        // blocks, the λ-dependent part of the exact trace identity
-        //   tr{ G (G + λS)⁻¹ } = rank(A₀₀) + Σ_j γ_j/(γ_j + λ)
-        // has γ_j the eigenvalues of the SCHUR COMPLEMENT
-        //   D_r^{-1/2} (A_rr − A_r0 A₀₀⁺ A₀r) D_r^{-1/2},
-        // not of A_rr alone: a range direction whose design curvature is
-        // shared with ker(S) contributes NO λ-resistant df of its own — the
-        // unpenalized null coordinate absorbs that fit at every λ. Keeping
-        // only A_rr (the pre-#audit behaviour) overstates the structural edf
-        // (S = diag(0,1,1), G coupling coordinates 1↔2 with residual ε gives
-        // quotient eigenvalues (ε, 1), not (1+ε, 1)) and mis-places the
-        // smoothing-collapse barrier.
-        let r0 = null_cols.len();
-        let mut u0 = Array2::<f64>::zeros((p, r0));
-        for (col, &src) in null_cols.iter().enumerate() {
-            let u = s_evecs.column(src);
-            for row in 0..p {
-                u0[(row, col)] = u[row];
-            }
-        }
-        let g00 = u0.t().dot(gram).dot(&u0); // r0×r0
-        let g_r0 = y.t().dot(gram).dot(&u0); // r×r0, already D_r^{-1/2}-scaled rows
-        // A₀₀⁺ through the null-block eigendecomposition (r0 is small); the
-        // pseudo-inverse (not an inverse) because the design need not have
-        // full column support on ker(S).
-        let mut g00_sym = g00.clone();
-        for i in 0..r0 {
-            for j in (i + 1)..r0 {
-                let avg = 0.5 * (g00_sym[(i, j)] + g00_sym[(j, i)]);
-                g00_sym[(i, j)] = avg;
-                g00_sym[(j, i)] = avg;
-            }
-        }
-        let (e0, v0) = g00_sym.eigh(Side::Lower).ok()?;
-        let tol0 = positive_eigenvalue_threshold(e0.as_slice()?);
-        // B ← B − G_r0 · A₀₀⁺ · G_r0ᵀ, accumulated per retained null mode:
-        // with w_k = G_r0 v0_k, subtract e0_k⁻¹ · w_k w_kᵀ.
-        for k in 0..r0 {
-            if e0[k] <= tol0 {
-                continue;
-            }
-            let inv_e = 1.0 / e0[k];
-            let w_k = g_r0.dot(&v0.column(k));
-            for i in 0..r {
-                for j in 0..r {
-                    b[(i, j)] -= inv_e * w_k[i] * w_k[j];
-                }
-            }
-        }
-    }
-    // Symmetrize defensively against round-off before the symmetric solver, then
-    // take eigenvalues. These are the γ_j (data-free, unit-weight).
-    let mut b_sym = b.clone();
-    for i in 0..r {
-        for j in (i + 1)..r {
-            let avg = 0.5 * (b_sym[(i, j)] + b_sym[(j, i)]);
-            b_sym[(i, j)] = avg;
-            b_sym[(j, i)] = avg;
-        }
-    }
-    let (b_evals, _) = b_sym.eigh(Side::Lower).ok()?;
-    let mut gammas = Vec::with_capacity(r);
-    for &gj in b_evals.iter() {
-        // A penalized direction with no design support has γ→0: edf→0 for any
-        // λ>0, so it cannot be floored by bounding ρ. Clamp tiny negative
-        // round-off to 0; it never contributes to the retained df sum.
-        if gj.is_finite() && gj > 0.0 {
-            gammas.push(gj);
-        } else {
-            gammas.push(0.0);
-        }
-    }
-    if gammas.is_empty() {
-        return None;
-    }
-    Some(gammas)
+    let x = design.to_dense();
+    let gram = x.t().dot(&x);
+    let gammas = penalty_range_gammas_from_gram(&gram, penalty)?;
+    resolvability_interval(&gammas).map(|(_, upper)| upper.min(gam_problem::LOG_STRENGTH_MAX))
 }
 
-/// Per-outer-coordinate ρ UPPER bound enforcing the effective-df floor.
+fn include_interval(slot: &mut (f64, f64), seen: &mut bool, interval: (f64, f64)) {
+    if *seen {
+        slot.0 = slot.0.min(interval.0);
+        slot.1 = slot.1.max(interval.1);
+    } else {
+        *slot = interval;
+        *seen = true;
+    }
+}
+
+/// Per outer coordinate, the ρ interval on which the terms it drives are
+/// resolvable against their own design curvature — the λ-selection domain
+/// (#2812). This replaces the hand box (`[rho_lower_bound, 12]` tightened to an
+/// effective-df floor of one) whose walls the search used to hit: a search that
+/// reaches an edge of THIS domain has found a term that is unpenalized, or one
+/// that has collapsed to its penalty null space (`edf → nullspace_dim`), to
+/// the gradient's resolution. That is a result, not a wall, and the certificate reads
+/// it as one.
 ///
-/// For each penalized term, the structural unit-weight edf `Σ_j γ_j/(γ_j+e^ρ)`
-/// is monotone decreasing in ρ. The bound is the ρ at which it equals
-/// `EFFECTIVE_DF_FLOOR` (when the term's max attainable edf exceeds the floor),
-/// found by bisection on the closed-form edf. Tied coordinates (shared precision
-/// label) take the TIGHTEST (smallest) per-term bound: the shared λ must retain
-/// the floor for EVERY contributing term, so the binding constraint is the most
-/// restrictive one — relaxing to a looser term's bound would let some other term
-/// fall below its floor. Every coordinate is additionally capped at the caller's
-/// uniform `ceiling` so this can only TIGHTEN, never loosen, the existing bound.
-///
-/// This enters ONLY the λ-selection domain. The inner β solve is exact
-/// CONDITIONAL on the selected λ, so there is no per-λ approximation (same
-/// discipline as the #747 solver-only ridge). It is NOT, however, a bias-free
-/// no-op: whenever the unconstrained REML optimum lies beyond this upper bound,
-/// the bound changes the SELECTED λ, and the selected λ changes the fitted
-/// β̂ = argmin{−ℓ + ½λ βᵀSβ} (∂β̂/∂λ = −(H + λS)⁻¹ S β̂ ≠ 0). The floor is an
-/// explicit smoothing-regularization constraint on the λ-selection — it
-/// deliberately moves the estimate away from the (flat-Fisher) null-space
-/// collapse, not a transparent reparameterization. It is the λ-upper-side dual
-/// of the #752
-/// full-subspace logdet work — there the value/gradient subspace was fixed on the
-/// λ→∞ side of a near-collinear block; here the selection domain is bounded so a
-/// flat Fisher surface cannot push a term past null-space collapse (#715/#684).
-pub(crate) fn effective_df_floor_rho_upper_bounds(
+/// Each physical penalty contributes its own [`resolvability_interval`]. A
+/// shared coordinate must remain free while ANY of its terms is resolvable,
+/// so its domain spans their union. Joint penalties (one carrier
+/// shared across blocks, #2579) are read off the stacked block Gram, and a
+/// group of joint penalties sharing an outer coordinate spans the union
+/// of its members' intervals. A coordinate no projectable geometry reaches
+/// keeps the precision box `[ln ε, ln(1/ε)]` around unit strength. Everything
+/// is intersected with the representable log-strength range, and a
+/// family-declared floor (`options.rho_lower_bound`: the multinomial's derived
+/// minimum strength) raises the lower edge; the engine adds no number of its
+/// own.
+pub(crate) fn resolvability_rho_domain(
     specs: &[ParameterBlockSpec],
     layout: &PenaltyLabelLayout,
     n_rho: usize,
-    rho_box: RhoBox,
-) -> Result<Array1<f64>, CustomFamilyError> {
-    // The edf-floor tightening must be evaluated against the SAME lower wall the
-    // optimizer will actually enforce (`options.rho_lower_bound`), not against a
-    // `-ceiling` proxy. The two are independent constants and are NOT equal in
-    // production: the uniform ceiling is `EFFECTIVE_DF_CEILING = 12` while the
-    // default `rho_lower_bound = -10`. Bisecting for / guarding the edf=1
-    // crossing against `-ceiling = -12` while the box floor sits at `-10` lets
-    // the crossing land in (-12, -10) and emits an upper bound BELOW the lower
-    // bound — an inverted ρ-box whose `f64::clamp(min, max)` in
-    // `project_to_bounds` panics with `min > max` across the FFI boundary
-    // (#2370). Anchoring every check on `lower` keeps the emitted upper bound
-    // strictly above the floor by construction.
-    //
-    // Both walls arrive inside [`RhoBox`], which has already established that
-    // they are finite and correctly ordered, so this body can read them
-    // without re-validating and no caller can transpose them.
-    let ceiling = rho_box.ceiling();
-    let mut upper = Array1::<f64>::from_elem(n_rho, ceiling);
+    family_floor: Option<f64>,
+) -> Result<(Array1<f64>, Array1<f64>), CustomFamilyError> {
+    let precision_box = gam_solve::estimate::rho_domain::precision_box();
+    let mut intervals: Vec<(f64, f64)> = vec![precision_box; n_rho];
+    let mut seen = vec![false; n_rho];
     let mut physical = 0usize;
     for spec in specs {
+        if spec.penalties.is_empty() {
+            continue;
+        }
+        let p = spec.design.ncols();
+        let mut aggregate = Array2::<f64>::zeros((p, p));
+        for penalty in &spec.penalties {
+            let dense = penalty.to_dense();
+            if dense.dim() == aggregate.dim() {
+                aggregate += &dense;
+            }
+        }
+        let x = spec.design.to_dense();
+        let gram = x.t().dot(&x);
         for penalty in &spec.penalties {
             let outer = layout.physical_to_outer.get(physical).copied().flatten();
             physical += 1;
             let Some(outer) = outer else {
                 continue; // fixed penalty: not an outer coordinate.
             };
-            let Some(gammas) = design_penalty_range_gammas(&spec.design, penalty) else {
-                continue; // un-projectable geometry: keep the uniform ceiling.
+            if outer >= n_rho {
+                continue;
+            }
+            let gammas = if spec.penalties.len() == 1 {
+                design_penalty_range_gammas(&spec.design, penalty)
+            } else {
+                gam_solve::estimate::rho_domain::penalty_range_gammas_with_shared_nullspace(
+                    &gram, &penalty.to_dense(), &aggregate,
+                )
             };
-            tighten_effective_df_floor_bound(&gammas, rho_box, &mut upper[outer])?;
+            let Some(interval) = gammas
+                .as_deref()
+                .and_then(resolvability_interval)
+            else {
+                continue; // un-projectable geometry: the precision box stands.
+            };
+            include_interval(&mut intervals[outer], &mut seen[outer], interval);
         }
     }
-    // #2579: for the one family that carries JOINT penalties, the loop above
-    // iterates nothing. `#1587` emptied the multinomial's per-block `penalties`
-    // lists — the centered `M ⊗ S_t` bundle became the sole smoothing carrier —
-    // so `spec.penalties` is empty on every multinomial fit and the guard runs
-    // zero times, while `multinomial.rs` cites this function BY NAME as the
-    // protection that keeps a near-separable fit off the smoothing wall. A `for`
-    // over an empty list is not an error, so nothing reported it: on penguins all
-    // sixteen selected λ railed at `exp(EFFECTIVE_DF_CEILING)` to the last bit and
-    // the fit collapsed to the base rate. `MultinomialFamily` is the only
-    // non-default implementor of `joint_penalty_specs()`, so this hole was
-    // multinomial-only and every other family's bounds are byte-identical.
-    //
-    // The joint specs reach the SAME bisection through the same helper; only the
-    // Gram differs, because a joint penalty spans the stacked block vector rather
-    // than one block's columns.
-    //
-    // The bound is aggregated within a DECLARED group before it is applied, and
-    // that granularity is the whole difficulty. A bound computed per SPEC is
-    // reference-DEPENDENT: the K per-class specs of a term are not a permutation
-    // orbit in the stacked ALR basis, because the reference class's centering row
-    // is `−𝟙ᵀ/K` while an active class's is `e_cᵀ − 𝟙ᵀ/K`. Relabeling therefore
-    // changes each spec's pencil and its bound, and the measured fit drifts by
-    // 1.637e-2 against the 1e-3 bar of
-    // `multinomial_fit_is_invariant_to_reference_class_1587` (refit noise
-    // exactly 0 — structural, not numerical).
-    //
-    // Any aggregation over a set that MAPS TO ITSELF under relabeling restores
-    // invariance, but not every such set is acceptable. Aggregating over ALL
-    // joint specs does restore it — and collapses every coordinate onto one
-    // shared wall (measured: all λ bit-identical at `exp(10.684)`), which
-    // destroys the per-class heterogeneity #1855 exists for AND makes the #1587
-    // gate vacuous, since all-λ-equal is invariant trivially. That is a guard
-    // silently becoming a tautology while its test goes green.
-    //
-    // The GROUP is the finest aggregation that is still invariant: relabeling
-    // permutes a term's K per-class specs among themselves, so the minimum over
-    // the group is invariant while the components (wiggliness vs null-space)
-    // keep their own separate bounds. A spec that declares no group stands
-    // alone — which is what every family other than the multinomial gets, since
-    // `group` defaults to `None`.
-    if !layout.joint_specs.is_empty() {
-        if let Some(joint_gram) = stacked_block_design_gram(specs) {
-            // (group, tightest bound) — group counts are tiny, so a linear scan
-            // beats a map and keeps the emission order deterministic.
-            let mut group_bounds: Vec<(usize, f64)> = Vec::new();
-            let mut solo: Vec<(usize, f64)> = Vec::new();
-            for (joint_idx, joint) in layout.joint_specs.iter().enumerate() {
-                let Some(gammas) = penalty_range_gammas_from_gram(&joint_gram, &joint.matrix)
-                else {
-                    continue; // un-projectable geometry: keep the uniform ceiling.
-                };
-                let Some(rho_star) = effective_df_floor_bound(&gammas, rho_box)? else {
-                    continue; // floor not enforceable inside the box.
-                };
-                match joint.group {
-                    Some(group) => match group_bounds.iter_mut().find(|(g, _)| *g == group) {
-                        Some((_, best)) => *best = best.min(rho_star),
-                        None => group_bounds.push((group, rho_star)),
-                    },
-                    None => {
-                        if let Some(&outer) = layout.joint_to_outer.get(joint_idx) {
-                            solo.push((outer, rho_star));
-                        }
-                    }
+    if !layout.joint_specs.is_empty()
+        && let Some(joint_gram) = stacked_block_design_gram(specs)
+    {
+        let mut aggregate = Array2::<f64>::zeros(joint_gram.dim());
+        for joint in layout.joint_specs.iter() {
+            aggregate += &joint.matrix;
+        }
+        let mut offset = 0;
+        for spec in specs {
+            let p = spec.design.ncols();
+            for penalty in &spec.penalties {
+                let dense = penalty.to_dense();
+                if dense.dim() == (p, p) {
+                    let mut block = aggregate.slice_mut(ndarray::s![offset..offset+p, offset..offset+p]);
+                    block += &dense;
                 }
             }
-            let mut apply = |outer: usize, rho_star: f64| {
-                if outer < n_rho {
-                    let slot = &mut upper[outer];
-                    if rho_star < *slot {
-                        *slot = rho_star;
-                    }
-                }
+            offset += p;
+        }
+        let mut group_intervals: Vec<(usize, (f64, f64))> = Vec::new();
+        for (joint_idx, joint) in layout.joint_specs.iter().enumerate() {
+            let Some(interval) = gam_solve::estimate::rho_domain::penalty_range_gammas_with_shared_nullspace(
+                &joint_gram, &joint.matrix, &aggregate,
+            )
+                .as_deref()
+                .and_then(resolvability_interval)
+            else {
+                continue;
             };
-            for (joint_idx, joint) in layout.joint_specs.iter().enumerate() {
-                let Some(group) = joint.group else { continue };
-                let Some(&(_, rho_star)) = group_bounds.iter().find(|(g, _)| *g == group) else {
-                    continue;
-                };
-                let Some(&outer) = layout.joint_to_outer.get(joint_idx) else {
-                    continue;
-                };
-                apply(outer, rho_star);
-            }
-            for (outer, rho_star) in solo {
-                apply(outer, rho_star);
+            match joint.group {
+                Some(group) => match group_intervals.iter_mut().find(|(g, _)| *g == group) {
+                    Some((_, current)) => {
+                        current.0 = current.0.min(interval.0);
+                        current.1 = current.1.max(interval.1);
+                    }
+                    None => group_intervals.push((group, interval)),
+                },
+                None => {
+                    if let Some(&outer) = layout.joint_to_outer.get(joint_idx)
+                        && outer < n_rho
+                    {
+                        include_interval(&mut intervals[outer], &mut seen[outer], interval);
+                    }
+                }
             }
         }
+        for (joint_idx, joint) in layout.joint_specs.iter().enumerate() {
+            let Some(group) = joint.group else { continue };
+            let Some(&(_, interval)) = group_intervals.iter().find(|(g, _)| *g == group) else {
+                continue;
+            };
+            let Some(&outer) = layout.joint_to_outer.get(joint_idx) else {
+                continue;
+            };
+            if outer < n_rho {
+                include_interval(&mut intervals[outer], &mut seen[outer], interval);
+            }
+        }
+    }
+    let mut lower = Array1::<f64>::zeros(n_rho);
+    let mut upper = Array1::<f64>::zeros(n_rho);
+    for (outer, interval) in intervals.iter().enumerate() {
+        let mut lo = interval.0.max(gam_problem::LOG_STRENGTH_MIN);
+        let hi = interval.1.min(gam_problem::LOG_STRENGTH_MAX);
+        if let Some(floor) = family_floor {
+            lo = lo.max(floor);
+        }
+        if !(lo.is_finite() && hi.is_finite() && lo <= hi) {
+            return Err(CustomFamilyError::InvalidInput {
+                context: "resolvability rho domain",
+                reason: format!(
+                    "coordinate {outer}: the family floor {family_floor:?} lies above the \
+                     term's resolvability ceiling {hi} (interval {interval:?}); the \
+                     admissible domain is empty"
+                ),
+            });
+        }
+        lower[outer] = lo;
+        upper[outer] = hi;
     }
     log::debug!(
-        "[EDF-FLOOR] emitted rho upper bounds (ceiling={:.3}): {:?}",
-        rho_box.ceiling(),
-        upper
-            .iter()
-            .map(|b| (b * 1e6).round() / 1e6)
-            .collect::<Vec<_>>(),
+        "[RHO-DOMAIN] resolvability domain per coordinate: lower={:?} upper={:?}",
+        lower.iter().map(|b| (b * 1e3).round() / 1e3).collect::<Vec<_>>(),
+        upper.iter().map(|b| (b * 1e3).round() / 1e3).collect::<Vec<_>>(),
     );
-    Ok(upper)
+    Ok((lower, upper))
 }
 
 /// Unit-weight Gram of the STACKED block parameter vector, `blkdiag(X_bᵀ X_b)`.
@@ -1250,125 +780,6 @@ fn stacked_block_design_gram(specs: &[ParameterBlockSpec]) -> Option<Array2<f64>
     Some(gram)
 }
 
-/// Tighten one ρ upper bound to the edf-floor crossing of a term's structural γ
-/// spectrum.
-///
-/// Shared by the per-block and the joint (#2579) paths so both obey exactly the
-/// same three enforceability guards, the same 64-step bisection, and the same
-/// tightest-wins rule on a shared coordinate. Keeping one body is the point: a
-/// second copy is how the per-block path and the joint path would drift.
-fn tighten_effective_df_floor_bound(
-    gammas: &[f64],
-    rho_box: RhoBox,
-    slot: &mut f64,
-) -> Result<(), CustomFamilyError> {
-    if let Some(rho_star) = effective_df_floor_bound(gammas, rho_box)? {
-        if rho_star < *slot {
-            *slot = rho_star;
-        }
-    }
-    Ok(())
-}
-
-/// The edf-floor crossing itself, or `None` when the floor is not enforceable
-/// strictly inside the box.
-///
-/// Split out of [`tighten_effective_df_floor_bound`] because the joint path must
-/// AGGREGATE bounds across a group before applying any of them; applying each
-/// spec's own bound is what breaks reference invariance (#2579).
-fn effective_df_floor_bound(
-    gammas: &[f64],
-    rho_box: RhoBox,
-) -> Result<Option<f64>, CustomFamilyError> {
-    let ceiling = rho_box.ceiling();
-    let lower = rho_box.lower();
-    // Maximum attainable structural edf (ρ → −∞) is the number of
-    // design-supported penalized directions. If it cannot reach the floor even
-    // unpenalized, the floor is not enforceable for this term (a
-    // single-dimension range space with the floor at its own cap), so keep the
-    // uniform ceiling.
-    //
-    // KNOWN STRUCTURAL EXEMPTION (#2608). This test is `>`, and
-    // `EFFECTIVE_DF_FLOOR` is exactly `1.0`, so a RANK-1 penalty — whose edf
-    // ranges over `(0, 1]` and reaches `1` only as `λ → 0` — can never satisfy
-    // it and is skipped unconditionally. That is arithmetically forced rather
-    // than an oversight: demanding `edf ≥ 1` of a rank-1 term is a demand for
-    // `ρ = −∞`, and manufacturing a bound there would be worse than none.
-    //
-    // The consequence is not small, and it is why this is written down rather
-    // than left to be re-derived. The null-space half of a Marra–Wood double
-    // penalty IS rank-1, so the LINEAR direction of every smooth is permanently
-    // exempt from the only protection against its own collapse. On penguins
-    // that exemption is what converts "over-smoothed" into "the null model" —
-    // a linear softmax already scores 96.5% there, so the term that dies is the
-    // one carrying almost all of the signal. No amount of work on WHICH
-    // coordinates share a bound (the #2579 grouping above) touches it, because
-    // this term never reaches the bisection at all.
-    let edf_max = unit_weight_term_edf_at_physical_strength(gammas, 0.0);
-    // #2608: a term that can reach the absolute floor is held to it, exactly as
-    // before. A term that CANNOT (any rank-1 penalty, whose edf sup is 1.0 and is
-    // attained only at λ = 0) is held to a fraction of what it can reach, instead
-    // of being skipped entirely.
-    let target = if edf_max > EFFECTIVE_DF_FLOOR {
-        EFFECTIVE_DF_FLOOR
-    } else {
-        EFFECTIVE_DF_FLOOR_RELATIVE_FRACTION * edf_max
-    };
-    // Still refuse when even the relative target is unreachable — a term with no
-    // design support at all (`edf_max = 0`) has nothing to retain, and bounding ρ
-    // against it would manufacture a wall out of an empty range space.
-    if !(edf_max > target) {
-        return Ok(None);
-    }
-    // Bisect for ρ* with edf(ρ*) = floor on [lower, ceiling]; edf is monotone
-    // decreasing in ρ. If edf at the ceiling still exceeds the floor, the
-    // uniform ceiling already retains enough df — keep it.
-    if unit_weight_term_edf(gammas, ceiling)? >= target {
-        return Ok(None);
-    }
-    // If the existing lower side of the box has already smoothed this
-    // term below the structural floor, the floor is not enforceable
-    // inside the optimizer's admissible domain. Do not manufacture an
-    // upper bound numerically indistinguishable from (or below, after
-    // the optimizer's strict bound-validation tolerance is applied)
-    // the lower bound: that turns a legitimate model into an invalid
-    // rho-box before the data likelihood is even evaluated. This case
-    // occurs for very weakly scaled range-space directions, including
-    // dispersion location-scale smooths whose unit-weight generalized
-    // eigenvalues can put the edf=1 crossing just outside the `lower`
-    // wall of the rho box. Evaluating at `lower` (the real floor) rather
-    // than `-ceiling` guarantees the crossing bracketed below is strictly
-    // inside `(lower, ceiling)`, so the emitted upper stays above `lower`.
-    if unit_weight_term_edf(gammas, lower)? <= target {
-        return Ok(None);
-    }
-    let mut lo = lower;
-    let mut hi = ceiling;
-    for _ in 0..64 {
-        let mid = 0.5 * (lo + hi);
-        if unit_weight_term_edf(gammas, mid)? >= target {
-            lo = mid;
-        } else {
-            hi = mid;
-        }
-    }
-    let rho_star = 0.5 * (lo + hi);
-    log::debug!(
-        "[EDF-FLOOR] rank={} edf_max={edf_max:.6} target={target:.6} rho*={rho_star:.6} \
-         box=[{lower:.3},{ceiling:.3}] gamma_min={:.6e} gamma_max={:.6e}",
-        gammas.iter().filter(|g| **g > 0.0).count(),
-        gammas.iter().cloned().fold(f64::INFINITY, f64::min),
-        gammas.iter().cloned().fold(0.0_f64, f64::max),
-    );
-    // Guarding on `lower` keeps the emitted upper strictly above the box floor.
-    // Callers apply tightest-wins: a coordinate must retain the floor for EVERY
-    // term contributing to it.
-    if rho_star > lower + 1e-6 {
-        return Ok(Some(rho_star));
-    }
-    Ok(None)
-}
-
 /// Seed the outer search with the mode the *definition* of `θ̂(ρ)` names, rather
 /// than with whatever mode the inner solver happens to reach from the caller's
 /// coefficients (#2366).
@@ -1398,18 +809,17 @@ fn effective_df_floor_bound(
 ///
 /// `θ̂(ρ)` is defined as the endpoint of the continuation that starts at the
 /// anchor `ρ_A` and follows the segment `ρ(t) = ρ_A + t·(ρ − ρ_A)`, `t: 0 → 1`.
-/// The anchor is the MAXIMAL-smoothing ρ, the [`RhoBox`] ceiling: it is the most
-/// smoothed admissible point, so every penalized term is collapsed onto its
-/// penalty nullspace there, the surviving low-dimensional problem is the
-/// parametric fit, and its mode is unique — which is the one property the
-/// selection rule needs, since a unique mode is what the caller's coefficients
-/// cannot influence.
+/// The anchor is the MAXIMAL-smoothing ρ, the per-coordinate ceiling of the
+/// derived [`resolvability_rho_domain`]: there every penalized term is
+/// switched off to the gradient's resolution, collapsed onto its penalty nullspace,
+/// the surviving low-dimensional problem is the parametric fit, and its mode
+/// is unique — which is the one property the selection rule needs, since a
+/// unique mode is what the caller's coefficients cannot influence.
 ///
-/// It is deliberately NOT the per-term
-/// [`effective_df_floor_rho_upper_bounds`], even though the two coincide for
-/// every term the absolute df floor exempts. That bound answers a different
-/// question — how much df a term must RETAIN — and #2608 made it a partial
-/// collapse for rank-deficient terms. A partially collapsed term is still
+/// Before #2812 the anchor was a hand ceiling tightened to an effective-df
+/// floor, which answered a different question — how much df a term must
+/// RETAIN — and #2608 made it a partial collapse for rank-deficient terms. A
+/// partially collapsed term is still
 /// nonconvex, so anchoring there would return branch selection to the seed.
 ///
 /// The mathematical object is the limit of the exact continuation path, so the
@@ -2993,16 +2403,12 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
     // Establish the ρ box once, validated, so its floor and ceiling reach both
     // the optimizer bounds and the per-term tightening from a single source
     // that cannot be transposed (#2370).
-    let rho_box = RhoBox::new(
-        RhoLowerWall(options.rho_lower_bound),
-        RhoCeiling(EFFECTIVE_DF_CEILING),
-    )?;
     // The per-coordinate ρ at which each penalized term's structural effective
     // df reaches one. This is both the optimizer's upper bound and — because
     // every term sits on its penalty nullspace there, leaving a unique
     // parametric mode — the anchor of the #2366 continuation below.
-    let rho_upper_bounds =
-        effective_df_floor_rho_upper_bounds(specs, &label_layout, n_rho, rho_box)?;
+    let (rho_lower_bounds, rho_upper_bounds) =
+        resolvability_rho_domain(specs, &label_layout, n_rho, options.rho_lower_bound)?;
     // The #2366 continuation anchor is the MAXIMAL-smoothing ρ — the uniform
     // ceiling — and not the per-term upper bound above.
     //
@@ -3021,7 +2427,7 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
     // The anchor is therefore derived from the ρ-box's own ceiling. It is not a
     // fresh constant, and it can only ever sit at or above the per-term bound,
     // so the continuation still starts at the most-smoothed admissible point.
-    let continuation_anchor = Array1::<f64>::from_elem(n_rho, rho_box.ceiling());
+    let continuation_anchor = rho_upper_bounds.clone();
 
     // #2366: for a family whose complete coefficient objective is nonconvex,
     // `argmin_θ ℓ_p(θ, ρ)` can contain disconnected modes and the outer
@@ -3179,32 +2585,15 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
         // (solver/estimate.rs) and the spatial exact-joint path.
         .with_objective_scale(if n_obs > 0 { Some(n_obs as f64) } else { None })
         .with_problem_size(n_obs, p_total.max(1))
-        // Per-coordinate ρ box bounds. The uniform ceiling
-        // [`EFFECTIVE_DF_CEILING`] keeps the optimizer out of the dead-flat
-        // λ ≈ 10⁹ region where ARC's quadratic model breaks down, the retry-stall
-        // detector fires, and downstream empty-block_states crashes surface —
-        // while sitting ABOVE the heavy-but-finite REML optima the data
-        // legitimately selects (the #1561/#2356 location-scale mean wants ρ ≈ 11;
-        // the former ρ ≤ 10 cap railed it into a spurious under-smoothed optimum).
-        //
-        // ON TOP of that uniform ceiling, each penalized term's UPPER bound is
-        // tightened to the ρ at which its structural (unit-weight) effective df
-        // would fall to one — the EFFECTIVE_DF_FLOOR. Near a flat Fisher surface
-        // (multinomial simplex boundary diag(p)−ppᵀ→0, #715; Gaussian log-σ on a
-        // gently-varying scale, #684) the REML criterion loses ρ-curvature and
-        // the optimizer would otherwise let some λ_{class,term} drift past the
-        // point where the term collapses onto its unpenalized polynomial null
-        // space, over-smoothing the cubic/sigmoid/log-σ signal below the mature
-        // reference. The floor is derived from the penalty RANGE-SPACE
-        // eigenstructure (design/penalty generalized eigenvalues), not from the
-        // vanishing Fisher weight, and enters ONLY the λ-selection domain — the
-        // inner β solve at the selected ρ is unchanged and exact, so the
-        // converged β is unbiased (cf. the #747 solver-only ridge). This is the
-        // λ-upper-side dual of the #752 full-subspace logdet work.
-        .with_bounds(
-            Array1::<f64>::from_elem(n_rho, rho_box.lower()),
-            rho_upper_bounds.clone(),
-        );
+        // Per-coordinate ρ domain (#2812): the interval on which each term's
+        // penalty is resolvable against its own design curvature, derived in
+        // `resolvability_rho_domain`. Its lower edge is where the term is
+        // unpenalized to the gradient's resolution, its upper edge where the term sits
+        // on its penalty null space to the gradient's resolution; a search that
+        // reaches either has found a structural result, not a wall. The hand
+        // ceiling of 12 and the effective-df floor of one that used to bound
+        // this search are gone with it.
+        .with_bounds(rho_lower_bounds.clone(), rho_upper_bounds.clone());
     // Install the seed-screening cap only when initial-rho screening is
     // wanted. A caller that pins an already-identified `initial_rho` and
     // opts out (`screen_initial_rho == false`) leaves the OuterConfig
@@ -3500,6 +2889,15 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
         let objective = eval_result.objective;
         let gradient = eval_result.gradient;
         let outer_hessian = eval_result.outer_hessian;
+        outer.last_criterion_resolution = Some(
+            f64::EPSILON
+                * (1.0
+                    + eval_result
+                        .criterion_components
+                        .iter()
+                        .map(|c| c.abs())
+                        .sum::<f64>()),
+        );
         let mode = CustomFamilyOwnedMode {
             objective,
             // `pullback_labeled_outer_eval` has already made `rho` the
@@ -3735,6 +3133,7 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
         outer.seed_cached_beta(n_rho, specs, beta)
     })
     .with_exact_polish(CustomOuterState::begin_exact_polish)
+    .with_criterion_resolution(|outer: &mut CustomOuterState| outer.last_criterion_resolution)
     // EFS may discover the optimum, but only the labeled analytic evaluator
     // owns the exact objective/gradient/coefficient-mode identity consumed by
     // fit assembly. Force the runner's final full-fidelity installation
@@ -4328,31 +3727,16 @@ fn fit_custom_family_fixed_log_lambdas_from_owned_mode_with_provenance<
                 selected_theta,
                 outer,
             } => {
-                // The curvature question is answered by the certificate's own
-                // verdict, the object the outer search accepted the point on —
-                // not by the raw analytic flag. An analytic negative direction the
-                // criterion CONTRADICTED (probed along its eigenvector at every
-                // scale down to the criterion's resolution and found not to
-                // descend, #2612) is a minimum as far as the objective can tell;
-                // refusing it on the flag alone took a fit the outer had
-                // certified and threw it away one call later (gam#2765).
-                // Inadmissible curvature and unevaluated curvature are still
-                // refused: the first is a saddle, the second is no evidence.
                 if matches!(
                     curvature_requirement,
                     OwnedModeCurvatureRequirement::CertifiedLocalMinimum
-                ) && !matches!(
-                    outer.criterion_certificate().curvature_verdict(),
-                    gam_solve::model_types::CurvatureAdmissibility::Admissible
-                        | gam_solve::model_types::CurvatureAdmissibility::CriterionContradicted
-                ) {
+                ) && outer.criterion_certificate().hessian_psd() != Some(true)
+                {
                     return Err(CustomFamilyError::Optimization {
                         context:
                             "fit_custom_family_fixed_log_lambdas_from_owned_mode outer curvature",
-                        reason: format!(
-                            "a profiled nonconvex coefficient mode requires an outer curvature certificate that admits a local minimum; this one is {}",
-                            outer.criterion_certificate().curvature_verdict()
-                        ),
+                        reason: "a profiled nonconvex coefficient mode requires a positive-semidefinite analytic outer Hessian certificate"
+                            .to_string(),
                     });
                 }
                 if selected_theta.len() != outer.rho().len()
@@ -4711,4 +4095,3 @@ pub struct OuterCriterionDiagnostics {
     pub outer_hessian: Option<Array2<f64>>,
     pub inner_converged: bool,
 }
-

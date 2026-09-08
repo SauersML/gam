@@ -420,7 +420,9 @@ pub(crate) fn row_selected_inverse_from_probes(
         }
         if want_tbeta {
             for a in 0..q {
-                inv_vbeta.row_mut(a).scaled_add(-inv_m * w[a], &sinv_probes[l]);
+                inv_vbeta
+                    .row_mut(a)
+                    .scaled_add(-inv_m * w[a], &sinv_probes[l]);
             }
         }
     }
@@ -454,6 +456,7 @@ mod selected_inverse_row_blocks_oracle_tests {
         ]);
         let schur = array![[1.2_f64, 0.0], [0.25, 0.95]];
         ArrowFactorCache {
+            exact_beta_remainders: std::sync::Arc::from([]),
             htt_factors: htt,
             htt_factors_undamped: ArrowUndampedFactors::SameAsDamped,
             schur_factor: Some(schur),
@@ -673,42 +676,6 @@ pub(crate) fn apply_raw_cached_arrow_hessian(
     v_beta: ArrayView1<'_, f64>,
 ) -> Result<SaeArrowVector, String> {
     let mut out = apply_cached_arrow_hessian(cache, v_t, v_beta)?;
-    add_raw_row_deflation_correction(cache, v_t, out.t.view_mut(), "apply_raw_cached_arrow_hessian")?;
-    Ok(out)
-}
-
-/// The `Phi(B_raw) -> B_raw` row-local correction, on its own.
-///
-/// `out_t += Σ_rows U diag(lambda_raw - lambda_conditioned) U^T v_row`, i.e. the
-/// second half of [`apply_raw_cached_arrow_hessian`]. Gauge-only pins carry no
-/// raw spectrum and are skipped: they are structural quotient directions, not a
-/// numerical conditioning of the objective.
-///
-/// #2828 item 2 — this is a free function because it has TWO callers that used
-/// to disagree. `apply_raw_cached_arrow_hessian` needs `cache.schur_factor`, a
-/// dense `K x K` Cholesky the wide-border path never builds, so the matrix-free
-/// exact-stationarity solve reaches its `B` through
-/// `matrix_free_arrow_operator_apply` instead — which applies the CONDITIONED row
-/// factor and so was building `Phi(B_raw) + delta_C`, the operator this file's
-/// own doc names as the mistake. The border half of both applies is already raw
-/// (its Schur term and the `H_bt Phi(B_tt)^-1 H_tb` restoration share one
-/// conditioned factor and cancel algebraically), so applying this to the `t`
-/// block is the whole of the difference.
-pub(crate) fn add_raw_row_deflation_correction(
-    cache: &ArrowFactorCache,
-    v_t: ArrayView1<'_, f64>,
-    mut out_t: ndarray::ArrayViewMut1<'_, f64>,
-    context: &str,
-) -> Result<(), String> {
-    let total_t = cache.delta_t_len();
-    if v_t.len() != total_t || out_t.len() != total_t {
-        return Err(format!(
-            "{context}: raw-deflation correction shapes (v={}, out={}) != cache t dimension \
-             {total_t}",
-            v_t.len(),
-            out_t.len(),
-        ));
-    }
     for row in 0..cache.n_rows() {
         let Some(spectrum) = cache
             .deflation_row_spectra
@@ -723,7 +690,7 @@ pub(crate) fn add_raw_row_deflation_correction(
             || spectrum.cond_evals.len() != q
         {
             return Err(format!(
-                "{context}: row {row} has dimension {q}, but its \
+                "apply_raw_cached_arrow_hessian: row {row} has dimension {q}, but its \
                  spectral carrier is {:?} with {} raw and {} conditioned eigenvalues",
                 spectrum.evecs.dim(),
                 spectrum.raw_evals.len(),
@@ -733,18 +700,15 @@ pub(crate) fn add_raw_row_deflation_correction(
         let base = cache.row_offsets[row];
         let row_v = v_t.slice(s![base..base + q]);
         let coefficients = spectrum.evecs.t().dot(&row_v);
-        let correction_coefficients = Array1::from_iter(
-            (0..q).map(|axis| {
-                (spectrum.raw_evals[axis] - spectrum.cond_evals[axis])
-                    * coefficients[axis]
-            }),
-        );
+        let correction_coefficients = Array1::from_iter((0..q).map(|axis| {
+            (spectrum.raw_evals[axis] - spectrum.cond_evals[axis]) * coefficients[axis]
+        }));
         let correction = spectrum.evecs.dot(&correction_coefficients);
-        out_t
+        out.t
             .slice_mut(s![base..base + q])
             .scaled_add(1.0, &correction);
     }
-    Ok(())
+    Ok(out)
 }
 
 pub(crate) fn cholesky_factor_apply(
@@ -1003,8 +967,7 @@ fn physical_krylov_least_squares(
                 .to_string(),
         );
     }
-    let rank_floor =
-        largest * f64::EPSILON * (design.nrows().max(design.ncols()) as f64);
+    let rank_floor = largest * f64::EPSILON * (design.nrows().max(design.ncols()) as f64);
     let projected = u.t().dot(residual);
     let mut scaled = Array1::<f64>::zeros(singular_values.len());
     for index in 0..singular_values.len() {
@@ -1015,8 +978,7 @@ fn physical_krylov_least_squares(
     let coefficients = vt.t().dot(&scaled);
     if coefficients.iter().any(|value| !value.is_finite()) {
         return Err(
-            "solve_b_preconditioned_gmres: physical Krylov coefficients are non-finite"
-                .to_string(),
+            "solve_b_preconditioned_gmres: physical Krylov coefficients are non-finite".to_string(),
         );
     }
     Ok(coefficients)
@@ -1117,42 +1079,6 @@ where
     F: Fn(&SaeArrowVector) -> Result<SaeArrowVector, String>,
     P: Fn(&SaeArrowVector) -> Result<SaeArrowVector, String>,
 {
-    solve_b_preconditioned_gmres_to(rhs, initial, apply_a, precondition, f64::EPSILON.sqrt())
-}
-
-/// [`solve_b_preconditioned_gmres_from`] with the certificate the CALLER
-/// needs: the solve returns once the physical residual `‖rhs − A x‖` is at
-/// most `relative_tolerance·‖rhs‖`, never asking for less than the arithmetic
-/// floor `√ε·‖rhs‖` a floating-point residual can certify. An inexact Newton
-/// step inside a line search asks for a forcing tolerance; a profile adjoint
-/// asks for the floor.
-///
-/// The Arnoldi recurrence exits its cycle the moment its own residual
-/// estimate meets the target (#2576). Before this the cycle ran its full
-/// `restart` length regardless, and with `restart = dim` on a large system
-/// the physical-residual check at the cycle's end was unreachable in
-/// practice: measured on a 19,680-dimensional exact-observed-information
-/// solve, the estimate passed `√ε` before iteration 256 and the loop was
-/// still running at iteration 512 (725 s). The exit is on the ESTIMATE; the
-/// physical residual at the cycle's end is what certifies, and a cycle whose
-/// estimate lied (an adaptive preconditioner can make it) simply restarts.
-pub(crate) fn solve_b_preconditioned_gmres_to<F, P>(
-    rhs: &SaeArrowVector,
-    initial: &SaeArrowVector,
-    apply_a: F,
-    precondition: P,
-    relative_tolerance: f64,
-) -> Result<(SaeArrowVector, usize), String>
-where
-    F: Fn(&SaeArrowVector) -> Result<SaeArrowVector, String>,
-    P: Fn(&SaeArrowVector) -> Result<SaeArrowVector, String>,
-{
-    if !(relative_tolerance.is_finite() && relative_tolerance > 0.0) {
-        return Err(format!(
-            "solve_b_preconditioned_gmres: relative tolerance must be finite and positive, got \
-             {relative_tolerance}"
-        ));
-    }
     let t_len = rhs.t.len();
     let beta_len = rhs.beta.len();
     if initial.t.len() != t_len || initial.beta.len() != beta_len {
@@ -1188,7 +1114,7 @@ where
     }
     let b = rhs_flat;
     let b_norm = rhs_norm;
-    let relative_floor = relative_tolerance.max(f64::EPSILON.sqrt());
+    let relative_floor = f64::EPSILON.sqrt();
     // Full-memory whenever the live memory ledger admits it. Each restarted
     // cycle must make a strictly representable reduction in the original
     // residual, and inability to do so is the typed numerical-stagnation
@@ -1342,11 +1268,6 @@ where
             // least-squares decide the cycle, stopping early only when Arnoldi
             // proves the generated space itself is closed.
             if arnoldi_space_closed {
-                break;
-            }
-            // The Arnoldi estimate of the residual has met the target: leave
-            // the cycle and let the physical residual below certify it.
-            if g[j + 1].abs() <= relative_floor * b_norm {
                 break;
             }
         }

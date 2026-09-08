@@ -26,19 +26,13 @@
 //!   η = q(t)·c(g) + (probit_scale · g) · z_std,
 //! where `z` is the modeled covariate (here EJECTION_FRACTION), `g` is the per-row
 //! slope (`baseline_slope + slope_design·β_slope`, with
-//! `slope = s(age, bs='tp', k=6)` — an age-modulated EF effect; the z column
+//! `slope = s(age, bs='tp', k=4)` — an age-modulated EF effect; the z column
 //! itself is structurally reserved as the latent score and cannot appear in the
 //! slope surface), and SEX + AGE enter the marginal block. The cumulative
-//! hazard is `Λ = −log Φ(−η)`, strictly increasing
-//! in η. For proportional-hazards risk **ranking** the time term is a common
-//! monotone factor across subjects, so we evaluate η at the time anchor q(t)=0:
-//! `η = probit_scale·g(age)·z_std`, the covariate-driven log-risk. Higher η ⇒ higher
-//! cumulative hazard ⇒ higher predicted risk. We reconstruct η with the *public*
-//! `survival_marginal_slope_vector_eta`, the exact routine the inner likelihood
-//! and saved predictor call, so the test-row scores are self-consistent with the
-//! trained fit (no hand-rederived offsets). The slope design is rebuilt for
-//! each held-out AGE from the frozen spec, so test rows are scored by the trained
-//! coefficients exactly as a deployed predictor would.
+//! hazard is `Λ = −log Φ(−η)`, strictly increasing in η. We evaluate the
+//! saved model's posterior-mean cumulative hazard at a common 100-day horizon
+//! through the production survival predictor. This includes the learned time,
+//! marginal and slope terms and integrates their coefficient uncertainty.
 //!
 //! ## Data — real, identical rows to both engines
 //!
@@ -63,7 +57,7 @@
 //!      risk-discriminator (within a small tolerance for the genuine link
 //!      difference). gam is allowed to *win*; it is not allowed to lose materially.
 //!   3. **Survival-structure invariant (STRUCTURE)**: gam's reconstructed
-//!      cumulative hazard `Λ = −log Φ(−η)` is finite and strictly positive, and
+//!      posterior-mean cumulative hazard is finite and strictly positive, and
 //!      across the held-out EF range it is **monotone** in the covariate
 //!      (successive Λ over sorted EF are non-increasing within numerical eps),
 //!      i.e. gam encodes a single coherent protective EF gradient — a real
@@ -71,5 +65,90 @@
 //!
 //! We do NOT assert pointwise closeness of gam's HR curve to Cox's exp(β·Δ); two
 //! different links need not coincide, and matching a peer tool's noisy fit proves
-//! nothing. We do NOT loosen any bound and we do NOT modify gam source.
+//! nothing. The quality bars are the original issue's acceptance requirements.
 
+use gam::test_support::reference::{Column, run_python};
+use gam::{FitConfig, init_parallelism, load_csvwith_inferred_schema};
+use gam_models::inference::model::FittedModel;
+use gam_models::inference::model_payload_builders::fit_formula_to_payload;
+use gam_models::survival::predict::{SurvivalPredictEstimand, SurvivalPredictRequest, SurvivalPredictionCovarianceMode, harrell_concordance, predict_survival};
+use ndarray::{Array1, Axis};
+use std::path::Path;
+use std::time::Instant;
+
+#[test]
+fn gam_marginal_slope_heldout_concordance_matches_or_beats_lifelines_coxph() {
+    init_parallelism();
+    let ds = load_csvwith_inferred_schema(Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/bench/datasets/heart_failure_clinical_records_dataset.csv"))).expect("heart-failure observations");
+    assert_eq!(ds.values.nrows(), 299);
+    let columns = ds.column_map();
+    let train_rows: Vec<usize> = (0..299).filter(|i| i % 3 != 0).collect();
+    let test_rows: Vec<usize> = (0..299).filter(|i| i % 3 == 0).collect();
+    let mut train = ds.clone();
+    train.values = ds.values.select(Axis(0), &train_rows);
+    let test = ds.values.select(Axis(0), &test_rows);
+    let config = FitConfig {
+        survival_likelihood: Some("marginal-slope".into()),
+        z_column: Some("ejection_fraction".into()),
+        slope_formula: Some("s(age, bs='tp', k=4)".into()),
+        baseline_target: "linear".into(),
+        ..FitConfig::default()
+    };
+    let started = Instant::now();
+    let model = FittedModel::from_payload(fit_formula_to_payload("Surv(time, DEATH_EVENT) ~ sex + age".into(), &train, &config).expect("converged survival model payload"));
+    let fit_seconds = started.elapsed().as_secs_f64();
+    eprintln!("#1082 survival fit: {fit_seconds:.3} seconds");
+    // Exercise the saved model's actual posterior-mean survival surface at a
+    // common follow-up horizon, including the fitted marginal and slope terms.
+    let evaluate = |values: &ndarray::Array2<f64>| {
+        let offset = Array1::zeros(values.nrows());
+        predict_survival(SurvivalPredictRequest {
+            model: &model,
+            data: values.view(),
+            col_map: &columns,
+            training_headers: Some(&train.headers),
+            primary_offset: &offset,
+            noise_offset: &offset,
+            time_grid: Some(&[100.0]),
+            with_uncertainty: false,
+            estimand: SurvivalPredictEstimand::PosteriorMean,
+        }, SurvivalPredictionCovarianceMode::SmoothingCorrected).expect("production survival prediction")
+    };
+    let predicted = evaluate(&test);
+    let gam_risk = predicted.cumulative_hazard.column(0).to_vec();
+    assert!(gam_risk.iter().all(|&risk| risk.is_finite() && risk > 0.0));
+    let test_time = test.column(columns["time"]).to_vec();
+    let test_event = test.column(columns["DEATH_EVENT"]).to_vec();
+    let gam_c = harrell_concordance(&test_time, &test_event, &gam_risk).expect("comparable held-out pairs");
+    let names = ["time", "DEATH_EVENT", "ejection_fraction", "sex", "age"];
+    let training_columns: Vec<Vec<f64>> = names.iter().map(|name| train.values.column(columns[*name]).to_vec()).collect();
+    let testing_columns: Vec<Vec<f64>> = names.iter().map(|name| test.column(columns[*name]).to_vec()).collect();
+    let train_names: Vec<String> = names.iter().map(|name| format!("train_{name}")).collect();
+    let test_names: Vec<String> = names.iter().map(|name| format!("test_{name}")).collect();
+    let reference_columns: Vec<Column<'_>> = train_names.iter().zip(&training_columns).chain(test_names.iter().zip(&testing_columns)).map(|(name, values)| Column::new(name, values)).collect();
+    let reference = run_python(&reference_columns, r#"
+from lifelines import CoxPHFitter
+names = ['time', 'DEATH_EVENT', 'ejection_fraction', 'sex', 'age']
+train = pd.DataFrame({name: df['train_' + name] for name in names}).dropna()
+test = pd.DataFrame({name: df['test_' + name] for name in names}).dropna()
+model = CoxPHFitter().fit(train, duration_col='time', event_col='DEATH_EVENT')
+emit('risk', np.asarray(model.predict_partial_hazard(test)).reshape(-1))
+"#);
+    assert_eq!(reference.vector("risk").len(), test_rows.len());
+    let cox_c = harrell_concordance(&test_time, &test_event, reference.vector("risk")).expect("Cox comparable pairs");
+    eprintln!("#1082 heart failure: posterior_mean_concordance={gam_c}, cox_concordance={cox_c}");
+    assert!(gam_c >= 0.62, "held-out concordance={gam_c}");
+    assert!(gam_c >= cox_c - 0.03, "gam={gam_c}, Cox={cox_c}");
+
+    let mut grid = ndarray::Array2::from_shape_fn((61, ds.headers.len()), |(_, column)| train.values[[0, column]]);
+    for i in 0..grid.nrows() {
+        grid[[i, columns["age"]]] = 60.0;
+        grid[[i, columns["sex"]]] = 0.0;
+        grid[[i, columns["ejection_fraction"]]] = 20.0 + i as f64;
+    }
+    let surface = evaluate(&grid);
+    let hazard = surface.cumulative_hazard.column(0).to_vec();
+    assert!(hazard.iter().all(|&h| h.is_finite() && h > 0.0));
+    assert!(hazard.windows(2).all(|pair| pair[1] <= pair[0] + 1e-10), "ejection fraction must have a coherent protective gradient");
+    assert!(fit_seconds <= 120.0, "#1082 survival fit exceeded 120 seconds: {fit_seconds:.3}");
+}

@@ -633,8 +633,7 @@ fn factor_evidence_unit_deflated_schur(
         return Err(declined("no usable spectrum"));
     }
     if let Some(geometry) = exact_a
-        && (geometry.majorizer_metric.dim() != (n, n)
-            || geometry.clamp_metric.dim() != (n, n))
+        && (geometry.majorizer_metric.dim() != (n, n) || geometry.clamp_metric.dim() != (n, n))
     {
         return Err(declined(
             "exact-A majorizer/clamp metrics do not match the reduced Schur",
@@ -653,8 +652,7 @@ fn factor_evidence_unit_deflated_schur(
         let value = raw_evals[eig_idx];
         if let Some(geometry) = exact_a {
             let direction = evecs.column(eig_idx);
-            let majorizer_curvature =
-                direction.dot(&geometry.majorizer_metric.dot(&direction));
+            let majorizer_curvature = direction.dot(&geometry.majorizer_metric.dot(&direction));
             let clamp_curvature = direction.dot(&geometry.clamp_metric.dot(&direction));
             match classify_exact_a_direction(
                 value,
@@ -708,7 +706,9 @@ fn factor_evidence_unit_deflated_schur(
     for eig_idx in 0..n {
         let lambda = cond_evals[eig_idx];
         if !(lambda.is_finite() && lambda > 0.0) {
-            return Err(declined("conditioned eigenvalue is not finite and positive"));
+            return Err(declined(
+                "conditioned eigenvalue is not finite and positive",
+            ));
         }
         let sqrt_lambda = lambda.sqrt();
         for i in 0..n {
@@ -767,46 +767,19 @@ fn spectral_qr_cholesky_factor(weighted_vt: &Array2<f64>) -> Option<Array2<f64>>
 }
 
 /// Jacobi/Van der Sluis diagonal equilibration scale for a symmetric matrix
-/// (#2015): `d_a = sqrt(|schur[a,a]|)`, floored at `√JACOBI_DIAGONAL_PD_FLOOR`
-/// so a numerically-empty diagonal entry never divides by ~0. This is a PURE
+/// (#2015): `d_a = sqrt(schur[a,a])`, floored at `√JACOBI_DIAGONAL_PD_FLOOR` so
+/// a numerically-empty diagonal entry never divides by ~0. This is a PURE
 /// numerical-conditioning aid for [`factor_dense_reduced_schur`] below — it is
 /// never returned or exposed, and it changes no value any caller of that
 /// function sees, only the accuracy of computing it.
-///
-/// #2822 — the scale is the diagonal's MAGNITUDE, not the signed entry. Van der
-/// Sluis is stated for a positive-definite matrix, where the two agree
-/// (`|S_aa| = S_aa`, and `abs` on a positive finite double is exact), so this is
-/// BIT-IDENTICAL on every matrix that reaches the Cholesky success path — a
-/// positive-definite matrix has no non-positive diagonal. It differs only on the
-/// matrices that fall through to the spectral floor, and there it is the whole
-/// point.
-///
-/// Reading the SIGNED entry made the equilibration ANTI-equilibrating on exactly
-/// the operators the floor exists for. A collapsed reduced Schur carries a
-/// NEGATIVE diagonal; `S_aa > JACOBI_DIAGONAL_PD_FLOOR` is then false, so that
-/// direction was scaled by the substitute `√1e-18 = 1e-9` — dividing an entry of
-/// magnitude `|S_aa|` by `1e-18` and AMPLIFYING it by eighteen decades instead of
-/// normalising it to unit magnitude. `spectral_pd_floored_schur` then reads
-/// `floor = relative_floor · max|λ|` off that inflated spectrum, so the floor is
-/// eighteen decades too high and clamps the HEALTHY directions with it.
-///
-/// Measured on the `owed_1026` mixed-collapse fixture `S = diag(+5, −99)`, whose
-/// healthy Newton step is exactly `Δβ_0 = −g/S = 10/5 = 2`: the signed form gave
-/// `d = (√5, 1e-9)`, `S̃ = diag(1, −9.9e19)`, `floor = 1e-8 · 9.9e19 = 9.9e11`,
-/// so the healthy `λ̃ = 1` was clamped to `9.9e11`, `S_floored,00 = 9.9e11·5 =
-/// 4.95e12` and `Δβ_0 = 2.0202020202e-12` — the live subspace wrong by twelve
-/// orders of magnitude, against a documented contract that it keeps its EXACT
-/// eigenvalue. With the magnitude, `S̃ = diag(1, −1)`, `floor = 1e-8`, the healthy
-/// direction keeps `λ̃ = 1` and `Δβ_0 = 2` exactly, while the collapsed direction
-/// still receives its minimal positive stiffness.
 fn jacobi_diagonal_scale(schur: &Array2<f64>) -> Array1<f64> {
     let n = schur.nrows();
     let floor_sqrt = JACOBI_DIAGONAL_PD_FLOOR.sqrt();
     let mut d = Array1::<f64>::zeros(n);
     for a in 0..n {
-        let magnitude = schur[[a, a]].abs();
-        d[a] = if magnitude.is_finite() && magnitude > JACOBI_DIAGONAL_PD_FLOOR {
-            magnitude.sqrt()
+        let diag = schur[[a, a]];
+        d[a] = if diag.is_finite() && diag > JACOBI_DIAGONAL_PD_FLOOR {
+            diag.sqrt()
         } else {
             floor_sqrt
         };
@@ -824,7 +797,7 @@ fn jacobi_diagonal_scale(schur: &Array2<f64>) -> Array1<f64> {
 /// PLAIN `cholesky_lower(schur)` is not designed to survive: the recursive
 /// `L_ii = sqrt(S_ii − Σ_{j<i} L_ij²)` step loses precision (or falsely
 /// refuses a genuinely PD matrix) when the diagonal spans many orders of
-/// magnitude. Equilibrate FIRST: `D = diag(d)` with `d_a = sqrt(|S_aa|)`
+/// magnitude. Equilibrate FIRST: `D = diag(d)` with `d_a = sqrt(S_aa)`
 /// ([`jacobi_diagonal_scale`] — Van der Sluis equilibration, provably within a
 /// factor of `n` of the OPTIMAL diagonal preconditioner for a symmetric
 /// matrix), factor `S̃ = D⁻¹SD⁻¹` (unit diagonal by construction) with the
@@ -857,7 +830,9 @@ fn jacobi_diagonal_scale(schur: &Array2<f64>) -> Array1<f64> {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) enum ReducedSchurPolicy {
     StrictNewton,
-    NewtonTikhonov { relative_floor: f64 },
+    NewtonTikhonov {
+        relative_floor: f64,
+    },
     EvidenceUnitDeflation {
         relative_floor: f64,
         /// #2515 — refuse a RESOLVED negative direction instead of unit-pinning
@@ -886,9 +861,54 @@ pub(crate) struct DenseReducedSchurFactorization {
 /// `t(beta) = -A_tt^{-1} A_tbeta beta`.  They let the reduced route feed the
 /// same scalar direction classifier as the dense joint route instead of
 /// substituting a local relative eigenvalue test (#2515).
-pub(crate) struct ExactAReducedClassification {
-    pub(crate) majorizer_metric: Array2<f64>,
-    pub(crate) clamp_metric: Array2<f64>,
+#[derive(Debug, Clone)]
+pub struct ExactAReducedClassification {
+    pub majorizer_metric: Array2<f64>,
+    pub clamp_metric: Array2<f64>,
+}
+
+impl ExactAReducedClassification {
+    /// The additive identity for a `k`-wide reduced border.
+    ///
+    /// Both metrics are per-ROW sums over the arrow system's rows — plus, for
+    /// the majorizer, the beta-side penalty those rows are scored against — so
+    /// they are chunk-additive for exactly the reason the reduced Schur
+    /// `H_bb - sum_i H_bt^(i) H_tt^(i)^-1 H_tb^(i)` is. A caller that streams
+    /// the rows in chunks reconstructs the whole-system classification by
+    /// summing the chunk classifications, and factors the total once.
+    #[must_use]
+    pub fn zeros(k: usize) -> Self {
+        Self {
+            majorizer_metric: Array2::<f64>::zeros((k, k)),
+            clamp_metric: Array2::<f64>::zeros((k, k)),
+        }
+    }
+
+    /// Add one chunk's contribution.
+    ///
+    /// Shapes are CHECKED rather than assumed: a mis-sized chunk would
+    /// otherwise broadcast or truncate into a silently wrong metric, and the
+    /// shared direction classifier reads the result as if it were exact — the
+    /// same class of failure the carrier itself exists to remove.
+    pub fn accumulate(&mut self, chunk: &Self) -> Result<(), ArrowSchurError> {
+        if self.majorizer_metric.dim() != chunk.majorizer_metric.dim()
+            || self.clamp_metric.dim() != chunk.clamp_metric.dim()
+        {
+            return Err(ArrowSchurError::SchurFactorFailed {
+                reason: format!(
+                    "exact-A reduced classification chunk carries majorizer {:?} / clamp {:?} for \
+                     an accumulator of majorizer {:?} / clamp {:?}",
+                    chunk.majorizer_metric.dim(),
+                    chunk.clamp_metric.dim(),
+                    self.majorizer_metric.dim(),
+                    self.clamp_metric.dim(),
+                ),
+            });
+        }
+        self.majorizer_metric += &chunk.majorizer_metric;
+        self.clamp_metric += &chunk.clamp_metric;
+        Ok(())
+    }
 }
 
 pub(crate) fn exact_a_reduced_classification(
@@ -909,6 +929,9 @@ pub(crate) fn exact_a_reduced_classification(
     }
     let k = sys.k;
     let mut majorizer_metric = sys.effective_penalty_op().to_dense();
+    for remainder in geometry.delta_beta.iter() {
+        majorizer_metric -= &remainder.to_dense();
+    }
     let mut clamp_metric = Array2::<f64>::zeros((k, k));
     for (row_idx, row) in sys.rows.iter().enumerate() {
         let q = sys.row_dims[row_idx];
@@ -935,8 +958,7 @@ pub(crate) fn exact_a_reduced_classification(
                 });
             }
             for local in 0..q {
-                b_tbeta[[local, system_col]] -=
-                    operands.delta_tbeta[[local, carrier_col]];
+                b_tbeta[[local, system_col]] -= operands.delta_tbeta[[local, carrier_col]];
             }
         }
         let b_tt = &row.htt - &operands.delta_tt;
@@ -975,8 +997,9 @@ pub(crate) fn exact_a_reduced_direction_metrics(
 ) -> Result<(f64, f64), ArrowSchurError> {
     let geometry = sys.exact_a_classification.as_ref().ok_or_else(|| {
         ArrowSchurError::SchurFactorFailed {
-            reason: "exact-A reduced direction classification requires its raw B/delta/clamp carrier"
-                .to_string(),
+            reason:
+                "exact-A reduced direction classification requires its raw B/delta/clamp carrier"
+                    .to_string(),
         }
     })?;
     if direction.len() != sys.k || geometry.rows.len() != sys.rows.len() {
@@ -1014,6 +1037,13 @@ pub(crate) fn exact_a_reduced_direction_metrics(
         .expect("owned exact-A classification direction is contiguous");
     let mut penalty_action = vec![0.0_f64; sys.k];
     sys.penalty_matvec_add(beta_slice, &mut penalty_action);
+    for remainder in geometry.delta_beta.iter() {
+        let mut delta = vec![0.0; sys.k];
+        remainder.matvec(beta_slice, &mut delta);
+        for (value, correction) in penalty_action.iter_mut().zip(delta) {
+            *value -= correction;
+        }
+    }
     let mut majorizer_curvature = physical_direction
         .iter()
         .zip(penalty_action.iter())
@@ -1040,13 +1070,7 @@ pub(crate) fn exact_a_reduced_direction_metrics(
             });
         }
         let mut a_cross = Array1::<f64>::zeros(q);
-        sys_htbeta_apply_row(
-            sys,
-            row_index,
-            row,
-            physical_direction.view(),
-            &mut a_cross,
-        );
+        sys_htbeta_apply_row(sys, row_index, row, physical_direction.view(), &mut a_cross);
         let mut graph = cholesky_solve_vector(htt_factors.factor(row_index), a_cross.view());
         graph.mapv_inplace(|value| -value);
         let mut b_cross = a_cross;
@@ -1843,7 +1867,7 @@ impl<'a, B: BatchedBlockSolver + Sync> ReducedSchurOperator<'a, B> {
 ///
 /// Crate-internal because the `resident` parameter carries the `pub(crate)`
 /// [`SaeResidentReducedSchur`] operator; cross-crate callers use the
-/// [`matrix_free_arrow_evidence_log_det`] convenience, which stages residency
+/// [`matrix_free_arrow_evidence_log_det_surrogate`], which stages residency
 /// internally and exposes no crate-private type.
 pub(crate) fn slq_reduced_schur_log_det<B: BatchedBlockSolver + Sync>(
     sys: &ArrowSchurSystem,
@@ -1889,9 +1913,7 @@ pub(crate) fn slq_reduced_schur_log_det<B: BatchedBlockSolver + Sync>(
         // #2515 — a negative Ritz value is a Rayleigh quotient of raw A, not a
         // saddle verdict. Lift each Ritz direction and ask the same typed
         // B-metric/clamp-basin classifier as the dense and direct-arrow routes.
-        ArrowEvidencePolicy::UnitDeflationRefusingIndefinite {
-            relative_floor: _,
-        } => {
+        ArrowEvidencePolicy::UnitDeflationRefusingIndefinite { relative_floor: _ } => {
             if sys.exact_a_classification.is_none() {
                 return Err(ArrowSchurError::SchurFactorFailed {
                     reason: "matrix-free exact-A evidence policy requires the raw B/delta/clamp \
@@ -1903,13 +1925,8 @@ pub(crate) fn slq_reduced_schur_log_det<B: BatchedBlockSolver + Sync>(
                 k,
                 |v| op.apply(v),
                 |direction| {
-                    exact_a_reduced_direction_metrics(
-                        sys,
-                        htt_factors,
-                        ridge_beta,
-                        direction,
-                    )
-                    .map_err(|error| error.to_string())
+                    exact_a_reduced_direction_metrics(sys, htt_factors, ridge_beta, direction)
+                        .map_err(|error| error.to_string())
                 },
                 num_probes,
                 lanczos_steps,
@@ -1917,9 +1934,13 @@ pub(crate) fn slq_reduced_schur_log_det<B: BatchedBlockSolver + Sync>(
             )
             .map_err(|reason| ArrowSchurError::SchurFactorFailed { reason })
         }
-        ArrowEvidencePolicy::Strict | ArrowEvidencePolicy::PositiveDefinite => {
-            Ok(slq_logdet(k, |v| op.apply(v), num_probes, lanczos_steps, seed))
-        }
+        ArrowEvidencePolicy::Strict | ArrowEvidencePolicy::PositiveDefinite => Ok(slq_logdet(
+            k,
+            |v| op.apply(v),
+            num_probes,
+            lanczos_steps,
+            seed,
+        )),
     }
 }
 
@@ -2011,7 +2032,10 @@ pub(crate) fn maybe_build_evidence_gpu_matvec(
     match crate::gpu_kernels::arrow_schur::gpu_schur_matvec_backend(sys, ridge_t, ridge_beta) {
         Ok(matvec) => Ok(Some(matvec)),
         Err(crate::gpu_kernels::arrow_schur::ArrowSchurGpuFailure::Unavailable) => Ok(None),
-        Err(failure) => Err(device_failure_as_arrow_error("evidence matvec build", failure)),
+        Err(failure) => Err(device_failure_as_arrow_error(
+            "evidence matvec build",
+            failure,
+        )),
     }
 }
 
@@ -2123,11 +2147,9 @@ impl SurrogateLaneState {
 
 /// Split arrow-Schur evidence `log|H| = Σ log|H_tt| + log|S|` where the reduced
 /// Schur term is estimated by the #2080 rational surrogate rather than SLQ, on
-/// ONE shared factorization. The build-once companion to
-/// `matrix_free_arrow_evidence_log_det`:
+/// ONE shared factorization:
 ///
-/// - `lane = None` runs the identical `slq_reduced_schur_log_det` path — a
-///   bit-for-bit fallback so a caller that has not opted in is unchanged.
+/// - `lane = None` evaluates the value-only `slq_reduced_schur_log_det` path.
 /// - `lane = Some(state)` builds (or, when the reduced-Schur dimension is
 ///   unchanged, reuses) the frozen derived-rank [`RationalLogdetPlan`] and
 ///   evaluates it against the current operator. The plan's `Q`/probes/quadrature
@@ -2212,6 +2234,7 @@ pub fn matrix_free_arrow_evidence_evaluation(
             Some(lane),
         )?;
     let factor_cache = ArrowFactorCache {
+        exact_beta_remainders: sys.exact_beta_remainders.clone().into(),
         htt_factors: factorization.factors,
         htt_factors_undamped: ArrowUndampedFactors::SameAsDamped,
         schur_factor: None,
@@ -2308,14 +2331,9 @@ fn matrix_free_arrow_evidence_log_det_surrogate_core(
                     .to_string(),
             });
         }
-        let raw_op = ReducedSchurOperator::new(
-            sys,
-            &htt_factors,
-            ridge_beta,
-            &backend,
-            resident.as_ref(),
-        )
-        .with_gpu_matvec(gpu_matvec);
+        let raw_op =
+            ReducedSchurOperator::new(sys, &htt_factors, ridge_beta, &backend, resident.as_ref())
+                .with_gpu_matvec(gpu_matvec);
         let conditioning = exact_a_ritz_conditioning(
             sys.k,
             |direction| raw_op.apply(direction),
@@ -2376,10 +2394,9 @@ fn matrix_free_arrow_evidence_log_det_surrogate_core(
                     cfg.deflation_subspace_iters,
                     cfg.deflation_target_std_err_rel,
                 )
-                .map_err(|reason| ArrowSchurError::SchurFactorFailed {
+                .ok_or_else(|| ArrowSchurError::SchurFactorFailed {
                     reason: format!(
-                        "rational log-det surrogate plan build failed for reduced Schur dim \
-                         {dim}: {reason}"
+                        "rational log-det surrogate plan build failed for reduced Schur dim {dim}"
                     ),
                 })?;
                 state.plan = Some(derived.plan);
@@ -2421,8 +2438,7 @@ fn matrix_free_arrow_evidence_log_det_surrogate_core(
                 // firing-count structure as `H_ββ` and the two very nearly
                 // cancel to a uniform rescaling, which CG is invariant to. See
                 // `exact_schur_diagonal_is_a_near_uniform_rescaling_of_the_shared_block_2576`.
-                let precond =
-                    reduced_schur_shifted_preconditioner(evidence_system, ridge_beta);
+                let precond = reduced_schur_shifted_preconditioner(evidence_system, ridge_beta);
                 // The derived-plan builder already certified this exact plan on
                 // this exact entry operator with this exact preconditioner. Keep
                 // that evaluation as the first value/derivative payload instead
@@ -2431,7 +2447,7 @@ fn matrix_free_arrow_evidence_log_det_surrogate_core(
                 let eval = match entry_evaluation.take() {
                     Some(eval) => eval,
                     None => plan
-                        .evaluate_family_preconditioned(
+                        .evaluate_preconditioned(
                             &matvec,
                             &precond,
                             state.cfg.cg_rel_tol,
@@ -2581,146 +2597,6 @@ pub fn reduced_schur_lambda_max<B: BatchedBlockSolver + Sync>(
     (lambda.is_finite() && lambda > 0.0).then_some(lambda)
 }
 
-/// A measured direction of negative curvature of the reduced Schur complement,
-/// carried into the FULL arrow coordinates.
-///
-/// `curvature` is the Rayleigh quotient `vᵀSv` re-measured with one extra
-/// `S·v` apply, not the Ritz value the eigensolver reported — the Ritz value
-/// is an estimate from a Krylov space, and a certificate of indefiniteness must
-/// be an evaluation of the operator itself. `border` is the unit mode `v` in
-/// the reduced (border) coordinates and `eliminated` is its exact lift
-/// `L(v)` through the arrow elimination, so `(eliminated, border)` is a
-/// displacement of the full system whose curvature is exactly `curvature`.
-#[derive(Debug, Clone)]
-pub struct ReducedSchurNegativeCurvature {
-    /// `vᵀSv < 0`, measured by an apply rather than reported by the eigensolver.
-    pub curvature: f64,
-    /// The algebraically smallest Ritz value the shifted solve certified.
-    pub ritz_eigenvalue: f64,
-    /// The shift `σ ≥ λ_max` the spectral fold used.
-    pub shift: f64,
-    /// The unit mode in reduced/border coordinates.
-    pub border: Array1<f64>,
-    /// `L(v)`: the same mode in the eliminated blocks' coordinates.
-    pub eliminated: Array1<f64>,
-}
-
-/// The reduced Schur's algebraically most-negative eigenpair, matrix-free, and
-/// the full-space displacement it lifts to — `None` when the operator resolves
-/// no negative direction.
-///
-/// # Why a shift rather than plain Lanczos
-///
-/// [`gam_linalg::lanczos::symmetric_extreme_lanczos_eigenpairs`] certifies
-/// extreme-MAGNITUDE eigenpairs. At a saddle of a penalized fit `λ_max` is the
-/// data curvature and `λ_min` is a small negative number, so the largest
-/// magnitude is the wrong end and the mode that matters is invisible to it.
-/// Running the same solver on `σI − S` fixes that exactly: the spectrum folds
-/// to `σ − λ_j ≥ 0`, its largest element is `σ − λ_min`, and largest-magnitude
-/// is now the end we want. The fold is an exact similarity on the eigenvectors
-/// — it changes which eigenvalue is extreme and nothing else — and `σ` is the
-/// `λ_max` the surrogate's spectral bracket already estimates
-/// ([`reduced_schur_lambda_max`]), so no new spectral information is needed.
-///
-/// # Why this is a statement about the ITERATE
-///
-/// The lift `L` satisfies `[L(v); v]ᵀ H [L(v); v] = vᵀ S v` exactly (see
-/// `arrow_lift_border_direction`). So a negative `curvature` here is not a
-/// property of the reduced surrogate that might vanish in the full problem: it
-/// is negative curvature of the fit's own objective at this point, and a fit
-/// reporting convergence there has converged to something that is not a local
-/// minimum.
-pub fn reduced_schur_negative_curvature<B: BatchedBlockSolver + Sync>(
-    sys: &ArrowSchurSystem,
-    htt_factors: &ArrowFactorSlab,
-    ridge_beta: f64,
-    backend: &B,
-    resident: Option<&SaeResidentReducedSchur>,
-    gpu_matvec: Option<&GpuSchurMatvec>,
-    lambda_max: f64,
-    max_steps: usize,
-    seed: u64,
-) -> Option<ReducedSchurNegativeCurvature> {
-    let k = sys.k;
-    if k == 0 || !(lambda_max.is_finite() && lambda_max > 0.0) {
-        return None;
-    }
-    let op = ReducedSchurOperator::new(sys, htt_factors, ridge_beta, backend, resident)
-        .with_gpu_matvec(gpu_matvec);
-    // Deterministic Rademacher start, the same stream discipline the surrogate
-    // probes and `reduced_schur_lambda_max` use: reproducible across runs and
-    // never orthogonal to the sought eigenspace by construction.
-    let mut start = vec![0.0_f64; k];
-    {
-        let mut state = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15);
-        let mut bits: u64 = 0;
-        let mut remaining: u32 = 0;
-        for value in start.iter_mut() {
-            if remaining == 0 {
-                bits = gam_linalg::utils::splitmix64(&mut state);
-                remaining = 64;
-            }
-            *value = if bits & 1 == 1 { 1.0 } else { -1.0 };
-            bits >>= 1;
-            remaining -= 1;
-        }
-    }
-    // `σ` strictly above `λ_max` so the folded operator is positive semidefinite
-    // even when the power-iteration estimate sits a rounding below the true top.
-    let shift = lambda_max * (1.0 + 8.0 * f64::EPSILON.sqrt());
-    let options = gam_linalg::lanczos::SymmetricExtremeLanczosOptions {
-        target_rank: 1,
-        max_steps: max_steps.clamp(1, k),
-        check_every: 4,
-        relative_residual_tol: f64::EPSILON.sqrt(),
-        breakdown_tol: 0.0,
-    };
-    let mut work = Array1::<f64>::zeros(k);
-    let pairs = gam_linalg::lanczos::symmetric_extreme_lanczos_eigenpairs(
-        k,
-        &start,
-        options,
-        |x: &[f64], out: &mut [f64]| {
-            let xv = Array1::from_iter(x.iter().copied());
-            op.apply_into(&xv, &mut work);
-            for (slot, (&xi, &sv)) in out.iter_mut().zip(x.iter().zip(work.iter())) {
-                *slot = shift * xi - sv;
-            }
-            Ok(())
-        },
-    )
-    .ok()?;
-    // Largest folded eigenvalue ⇒ smallest eigenvalue of `S`.
-    let (best, &folded) = pairs
-        .eigenvalues
-        .iter()
-        .enumerate()
-        .max_by(|a, b| a.1.total_cmp(b.1))?;
-    let ritz_eigenvalue = shift - folded;
-    let mode = pairs.eigenvectors.column(best).to_owned();
-    let norm = mode.dot(&mode).sqrt();
-    if !(norm.is_finite() && norm > 0.0) {
-        return None;
-    }
-    let border = mode / norm;
-    // The certificate: an APPLY of the operator, not the eigensolver's estimate.
-    let curvature = border.dot(&op.apply_owned(&border));
-    if !(curvature.is_finite() && curvature < 0.0) {
-        return None;
-    }
-    let eliminated = arrow_lift_border_direction(sys, htt_factors, border.view(), backend);
-    if eliminated.iter().any(|value| !value.is_finite()) {
-        return None;
-    }
-    Some(ReducedSchurNegativeCurvature {
-        curvature,
-        ritz_eigenvalue,
-        shift,
-        border,
-        eliminated,
-    })
-}
-
 /// Matrix-free reduced-Schur log-determinant `log|S|` via the #2080 fixed
 /// rational surrogate ([`RationalLogdetPlan`]) on the exact `schur_matvec`
 /// apply — the desync-safe companion to `slq_reduced_schur_log_det`. **The
@@ -2792,7 +2668,7 @@ pub fn rational_reduced_schur_log_det<B: BatchedBlockSolver + Sync>(
     // #2576: the exact diag(S) is reachable from `resident` and measured NOT to
     // reduce iterations — see the refutation note at the surrogate-core call site.
     let precond = reduced_schur_shifted_preconditioner(sys, ridge_beta);
-    let eval = plan.evaluate_family_preconditioned(&matvec, &precond, cg_rel_tol, cg_max_iters)?;
+    let eval = plan.evaluate_preconditioned(&matvec, &precond, cg_rel_tol, cg_max_iters)?;
     Some((plan, eval))
 }
 
@@ -2845,17 +2721,13 @@ pub fn rational_reduced_schur_plan_derived<B: BatchedBlockSolver + Sync>(
     deflation_max_rank: usize,
     deflation_subspace_iters: usize,
     deflation_target_std_err_rel: f64,
-) -> Result<DerivedRationalLogdetPlan, String> {
+) -> Option<DerivedRationalLogdetPlan> {
     let k = sys.k;
     if k == 0
         || !(cg_rel_tol.is_finite() && cg_rel_tol > 0.0 && cg_rel_tol < 1.0)
         || !(deflation_target_std_err_rel.is_finite() && deflation_target_std_err_rel >= 0.0)
     {
-        return Err(format!(
-            "inadmissible surrogate request: reduced Schur dim {k}, cg_rel_tol {cg_rel_tol:.3e} \
-             (needs 0 < tol < 1), deflation target {deflation_target_std_err_rel:.3e} (needs \
-             finite and non-negative)"
-        ));
+        return None;
     }
     let lambda_max = reduced_schur_lambda_max(
         sys,
@@ -2866,23 +2738,10 @@ pub fn rational_reduced_schur_plan_derived<B: BatchedBlockSolver + Sync>(
         gpu_matvec,
         power_iters,
         seed,
-    )
-    .ok_or_else(|| {
-        format!(
-            "spectral bracket unavailable: the power iteration produced no finite λ_max for \
-             reduced Schur dim {k} in {power_iters} iterations"
-        )
-    })?;
+    )?;
     let lambda_min = (SPECTRAL_DEFLATION_REL_FLOOR * lambda_max).max(f64::MIN_POSITIVE);
-    let base_plan = RationalLogdetPlan::build(
-        k, num_probes, seed, lambda_min, lambda_max, rel_tol,
-    )
-    .ok_or_else(|| {
-        format!(
-            "quadrature plan unbuildable on bracket [{lambda_min:.6e}, {lambda_max:.6e}] at \
-             rel_tol {rel_tol:.3e} with {num_probes} probes (reduced Schur dim {k})"
-        )
-    })?;
+    let base_plan =
+        RationalLogdetPlan::build(k, num_probes, seed, lambda_min, lambda_max, rel_tol)?;
     // One resident operator across the pilot, every deflation re-solve, and the
     // subspace-iteration `with_two_sided_deflation` applies — the whole rank-derivation
     // ladder (the two-sided deflation: block-power on S + inverse subspace
@@ -2897,109 +2756,20 @@ pub fn rational_reduced_schur_plan_derived<B: BatchedBlockSolver + Sync>(
     let precond = reduced_schur_shifted_preconditioner(sys, ridge_beta);
     // Rank-0 pilot: fixes the |log|S|| scale and is the answer outright when no
     // deflation is requested or the bare bar already clears the target.
-    // `log|S|` exists only for a positive-definite `S`, and every shifted solve
-    // below is a conjugate-gradient recurrence that assumes it. Nothing checked
-    // that assumption: the bracket's LOWER end is not measured, it is set to a
-    // fixed fraction of the estimated `lambda_max`, so an operator whose
-    // spectrum reaches below zero was planned for as if it did not, and the
-    // first thing to notice was a CG breakdown tens of iterations in, reported
-    // as "no finite solution". Measured on gam#2731: `pᵀ(A+σI)p = -1.50e10` at
-    // seed shift `4.2e-15`, on a fit that had already converged.
-    //
-    // A quadratic form is a ONE-SIDED certificate: `vᵀ(S + t_lo·I)v <= 0` proves
-    // the operator is indefinite on this bracket, while a positive value over
-    // finitely many probes proves nothing. So this refuses when it fires and is
-    // silent otherwise — the breakdown path still catches what it misses, and
-    // now names itself. The probes are the plan's own, so this costs one extra
-    // operator application each and introduces no new randomness.
-    let seed_shift = base_plan
-        .nodes
-        .iter()
-        .map(|(t, _)| *t)
-        .filter(|t| t.is_finite())
-        .fold(f64::INFINITY, f64::min);
-    if seed_shift.is_finite() {
-        for (index, probe) in base_plan.probes.iter().enumerate() {
-            let norm_sq = probe.dot(probe);
-            if !(norm_sq > 0.0) {
-                continue;
-            }
-            let mut shifted = matvec(probe.view());
-            shifted.scaled_add(seed_shift, probe);
-            let form = probe.dot(&shifted);
-            if !(form.is_finite() && form > 0.0) {
-                // #2731 — a probe proves indefiniteness but names no direction,
-                // and a direction is the only thing an escape can use. The
-                // spectrum's own most-negative mode is a shifted Lanczos away
-                // (the shift is the `λ_max` this plan already estimated), and
-                // the arrow elimination lifts it into a full-space
-                // displacement, so the refusal reports what descends rather
-                // than only that something does.
-                let escape = reduced_schur_negative_curvature(
-                    sys,
-                    htt_factors,
-                    ridge_beta,
-                    backend,
-                    resident,
-                    gpu_matvec,
-                    lambda_max,
-                    power_iters,
-                    seed,
-                )
-                .map(|found| {
-                    format!(
-                        " The spectrum's most-negative direction is vᵀSv = {:.6e} (Ritz {:.6e}                          under the fold σ = {:.6e}); the arrow elimination lifts it to a                          full-space displacement of {} eliminated coordinates, whose curvature                          is that same number by the Schur identity — so the descent direction                          is available, not merely implied.",
-                        found.curvature,
-                        found.ritz_eigenvalue,
-                        found.shift,
-                        found.eliminated.len(),
-                    )
-                })
-                .unwrap_or_else(|| {
-                    " The shifted Lanczos did not certify a negative eigenpair within its                      step budget, so the probe above is the whole of the evidence."
-                        .to_string()
-                });
-                return Err(format!(
-                    "the reduced Schur is not positive definite on this bracket, so log|S| is \
-                     not defined at this iterate: probe {index} gives \
-                     vᵀ(S + {seed_shift:.6e}·I)v = {form:.6e} with ‖v‖² = {norm_sq:.6e} \
-                     (reduced Schur dim {k}, bracket [{lambda_min:.6e}, {lambda_max:.6e}] whose \
-                     lower end is SPECTRAL_DEFLATION_REL_FLOOR × λ_max, not a measured \
-                     eigenvalue). A converged fit reaching here has converged to a point with \
-                     negative curvature in the reduced Schur, which is a statement about the \
-                     iterate, not about the surrogate.{escape}"
-                ));
-            }
-        }
-    }
-    let pilot = base_plan
-        .evaluate_family_preconditioned(&matvec, &precond, cg_rel_tol, cg_max_iters)
-        .ok_or_else(|| {
-            format!(
-                "rank-0 pilot solve broke down: the shifted-CG family did not return a finite \
-                 solution on the bracket [{lambda_min:.6e}, {lambda_max:.6e}] at cg_rel_tol \
-                 {cg_rel_tol:.3e}, cg_max_iters {cg_max_iters} (reduced Schur dim {k}). The \
-                 seed system's own budget is min(cg_max_iters, dim) = {} iterations. The \
-                 one-sided definiteness probe above did not fire, so this is either an \
-                 indefiniteness those probes missed or a genuine loss of accuracy; the \
-                 `[rational-logdet] shifted-CG seed breakdown` line says which.",
-                cg_max_iters.min(k.max(1))
-            )
-        })?;
+    let pilot = base_plan.evaluate_preconditioned(&matvec, &precond, cg_rel_tol, cg_max_iters)?;
     if deflation_max_rank == 0 {
-        return Ok(DerivedRationalLogdetPlan {
+        return Some(DerivedRationalLogdetPlan {
             plan: base_plan,
             entry_evaluation: pilot,
         });
     }
     let target = deflation_target_std_err_rel * (pilot.estimate.abs() + 1.0);
     if pilot.std_err <= target {
-        return Ok(DerivedRationalLogdetPlan {
+        return Some(DerivedRationalLogdetPlan {
             plan: base_plan,
             entry_evaluation: pilot,
         });
     }
-    let pilot_std_err = pilot.std_err;
     // Grow from the smallest nonzero peel rank (doubling ⇒ log-many re-solves)
     // until the bar clears. The caller's cap is a resource ceiling; reaching it
     // with an over-target bar refuses the surrogate rather than silently
@@ -3033,48 +2803,16 @@ pub fn rational_reduced_schur_plan_derived<B: BatchedBlockSolver + Sync>(
             deflation_subspace_iters,
             seed,
             (basis_cg_rel_tol, cg_max_iters),
-        )
-        .ok_or_else(|| {
-            format!(
-                "two-sided deflation basis unbuildable at rank {r} (top {}, bottom {}) after \
-                 {deflation_subspace_iters} subspace iterations on reduced Schur dim {k}",
-                r.div_ceil(2),
-                r / 2
-            )
-        })?;
-        let eval = plan
-            .evaluate_family_preconditioned(&matvec, &precond, cg_rel_tol, cg_max_iters)
-            .ok_or_else(|| {
-                format!(
-                    "deflated solve broke down at rank {r}: the shifted-CG family did not return \
-                     a finite solution at cg_rel_tol {cg_rel_tol:.3e} (reduced Schur dim {k})"
-                )
-            })?;
+        )?;
+        let eval = plan.evaluate_preconditioned(&matvec, &precond, cg_rel_tol, cg_max_iters)?;
         if eval.std_err <= target {
-            return Ok(DerivedRationalLogdetPlan {
+            return Some(DerivedRationalLogdetPlan {
                 plan,
                 entry_evaluation: eval,
             });
         }
         if r >= cap {
-            // The resource ceiling, reached with an over-target bar. This is a
-            // deliberate refusal rather than a silent weakening of the accuracy
-            // contract — but a refusal that names only its dimension cannot be
-            // acted on, and this one aborts a fit that has already converged.
-            // Every number the caller needs to decide whether to raise the cap,
-            // relax the target, or take the estimate as it stands is here.
-            return Err(format!(
-                "deflation reached its rank ceiling {cap} (requested {deflation_max_rank}, \
-                 reduced Schur dim {k}) with the Hutchinson bar still over target: std_err \
-                 {:.6e} against target {target:.6e} (= {deflation_target_std_err_rel:.3e} × \
-                 (|estimate| + 1)), estimate {:.6e}; the rank-0 pilot's bar was \
-                 {pilot_std_err:.6e}, so deflation removed {:.1}% of the pilot variance and \
-                 needed {:.1}%",
-                eval.std_err,
-                eval.estimate,
-                100.0 * (1.0 - eval.std_err / pilot_std_err.max(f64::MIN_POSITIVE)),
-                100.0 * (1.0 - target / pilot_std_err.max(f64::MIN_POSITIVE)),
-            ));
+            return None;
         }
         rank = rank.saturating_mul(2);
     }
@@ -3140,8 +2878,7 @@ pub fn reduced_schur_logdet_preconditioner_study<B: BatchedBlockSolver + Sync>(
         seed,
     )?;
     let lambda_min = (SPECTRAL_DEFLATION_REL_FLOOR * lambda_max).max(f64::MIN_POSITIVE);
-    let plan =
-        RationalLogdetPlan::build(sys.k, num_probes, seed, lambda_min, lambda_max, rel_tol)?;
+    let plan = RationalLogdetPlan::build(sys.k, num_probes, seed, lambda_min, lambda_max, rel_tol)?;
     let op = ReducedSchurOperator::new(sys, htt_factors, ridge_beta, backend, None);
     let matvec = |v: ArrayView1<f64>| -> Array1<f64> { op.apply(v) };
     let shared_block = reduced_schur_shifted_preconditioner(sys, ridge_beta);
@@ -3172,7 +2909,8 @@ pub fn reduced_schur_logdet_preconditioner_study<B: BatchedBlockSolver + Sync>(
     }
     let mut out = Vec::with_capacity(tiers.len());
     for (kind, preconditioner) in tiers {
-        let eval = plan.evaluate_preconditioned(&matvec, &preconditioner, cg_rel_tol, cg_max_iters)?;
+        let eval =
+            plan.evaluate_preconditioned(&matvec, &preconditioner, cg_rel_tol, cg_max_iters)?;
         out.push(ReducedSchurLogdetPrecondRow {
             preconditioner: kind,
             log_det: eval.estimate,
@@ -3181,283 +2919,6 @@ pub fn reduced_schur_logdet_preconditioner_study<B: BatchedBlockSolver + Sync>(
         });
     }
     Some(out)
-}
-
-/// What one quadrature node of the shifted-solve ladder cost, and what the
-/// operator looked like there.
-#[derive(Debug, Clone)]
-pub struct ShiftLadderNodeProfile {
-    /// Position of this node in the ladder's DESCENDING walk (0 = largest shift,
-    /// solved first and cold; the rest are warm-started from their predecessor).
-    pub ladder_position: usize,
-    /// The shift `t_ℓ`.
-    pub shift: f64,
-    /// The quadrature weight `w_ℓ`.
-    pub weight: f64,
-    /// Iterations summed over every right-hand side solved at this node.
-    pub iterations: usize,
-    /// Largest single-solve iteration count at this node.
-    pub max_solve_iterations: usize,
-    /// Ritz condition estimate `θ_max/θ_min` of the PRECONDITIONED shifted
-    /// operator, read off the CG coefficients of this node's longest solve. `None`
-    /// when that solve converged before resolving two Ritz values.
-    pub krylov_condition: Option<f64>,
-}
-
-/// The complete work profile of one rational log-determinant evaluation, node by
-/// node, plus the residual history of its single most expensive solve.
-///
-/// This is the #2576 discriminator. The issue's headline evidence — "loosening
-/// the CG tolerance from 1e-8 to 1e-4 changes nothing" — is equally consistent
-/// with a solve stagnating at its iteration cap and a solve converging so fast
-/// that four decades of tolerance cost a handful of iterations, and those need
-/// opposite repairs. The two are told apart by the residual CURVE (geometric
-/// decay versus a flat line) and by the Ritz spectrum the same solve hands over
-/// for free. Neither existed before: the evaluation reported one summed
-/// iteration count and nothing else.
-#[derive(Debug, Clone)]
-pub struct ShiftLadderProfile {
-    /// One row per quadrature node, in ladder (descending-shift) order.
-    pub nodes: Vec<ShiftLadderNodeProfile>,
-    /// The surrogate value this evaluation produced.
-    pub log_det: f64,
-    /// Its Hutchinson error bar.
-    pub std_err: f64,
-    /// Iterations over the whole ladder — the quantity the existing
-    /// [`reduced_schur_logdet_preconditioner_study`] reports as a single number.
-    pub total_iterations: usize,
-    /// Full residual and coefficient history of the ladder's most expensive
-    /// single solve. This one is WARM-STARTED from the node above it, so its
-    /// curve begins wherever the previous shift's solution left it.
-    pub hardest_solve: ShiftedPcgTrace,
-    /// One COLD solve at the ladder's smallest shift, from a zero start, on the
-    /// first probe.
-    ///
-    /// This is the honest price of the family: the smallest shift is the
-    /// worst-conditioned member, and a Krylov space built from the right-hand
-    /// side alone — no warm start — is what any evaluator that serves all shifts
-    /// from ONE space must pay. It is also the trace whose residual curve is
-    /// interpretable, since it starts at `‖r‖/‖b‖ = 1` rather than wherever the
-    /// previous node's solution happened to land.
-    pub cold_seed_solve: ShiftedPcgTrace,
-    /// The same cold seed solve with NO diagonal, i.e. on the raw operator.
-    ///
-    /// A shifted family shares its Krylov space only when nothing shift-dependent
-    /// is applied to it, and this module's diagonal is `1/(d + t)` — shift
-    /// dependent by construction. So the two cold traces price the two ways to
-    /// serve the family from one space: rescale the operator by its diagonal ONCE
-    /// (and carry `Σ ln d_g` in the value), or keep the operator and pay the raw
-    /// conditioning. Which is cheaper is a measurement, not an argument.
-    pub cold_seed_solve_undiagonalized: ShiftedPcgTrace,
-    /// `|vᵀSw − wᵀSv| / (‖Sv‖·‖w‖)` on a deterministic probe pair. CG is only
-    /// valid on a symmetric operator, so a non-negligible value here means no
-    /// preconditioner can help and the algorithm itself is wrong for the problem.
-    pub symmetry_defect: f64,
-    /// The `[λ_min, λ_max]` bracket the plan was sized from. `λ_min` is the
-    /// deflation-floor convention `SPECTRAL_DEFLATION_REL_FLOOR·λ_max`, i.e. an
-    /// ASSUMED lower bound, not a measurement — comparing it against
-    /// `hardest_solve`'s smallest Ritz value is how one sees whether the
-    /// quadrature window is sized for a spectrum the operator does not have.
-    pub bracket: (f64, f64),
-}
-
-impl ShiftLadderProfile {
-    /// Iterations of the single hardest solve, against the whole ladder's total.
-    ///
-    /// A shifted family `(S + t_ℓ I)` spans ONE Krylov space for every `t_ℓ`, so
-    /// a multi-shift Krylov evaluator would pay the hardest solve and get the
-    /// rest as vector updates. This ratio is exactly what such a change could
-    /// win, and it is a measurement rather than an argument.
-    #[must_use]
-    pub fn ladder_concentration(&self) -> f64 {
-        let hardest = self.hardest_solve.iterations().max(1) as f64;
-        self.total_iterations as f64 / hardest
-    }
-
-    /// The applies ONE right-hand side may cost, given the operator's own
-    /// conditioning and the plan's own node count:
-    ///
-    /// ```text
-    /// ½·√κ·ln(2/rel_tol)  +  node_count
-    /// ```
-    ///
-    /// — the textbook CG bound for a single solve at the conditioning `κ` the
-    /// cold seed measured, plus one certification apply per node. Nothing here is
-    /// chosen: `κ` is read off the seed's Ritz values and the node count is the
-    /// plan's, so a better-conditioned operator or a coarser quadrature moves the
-    /// budget on its own.
-    ///
-    /// `κ` is the UNDIAGONALIZED seed's, because that is the space a family
-    /// evaluator can actually share: the diagonal here is `1/(diag(S) + t)` and
-    /// anything shift-dependent destroys the shift invariance the one-space
-    /// argument rests on. The diagonal remains available to the single-shift
-    /// repair path, where one fixed `t` makes it a preconditioner again.
-    ///
-    /// `None` when the cold seed resolved no spectrum.
-    #[must_use]
-    pub fn one_krylov_space_apply_budget(&self) -> Option<f64> {
-        Some(
-            self.cold_seed_solve_undiagonalized
-                .conditioning_iteration_bound()?
-                + self.nodes.len() as f64,
-        )
-    }
-}
-
-/// Profile one evaluation of the evidence lane's frozen rational
-/// log-determinant plan: what every quadrature node cost, and what the operator
-/// looked like at the node that cost the most.
-///
-/// Builds the plan, operator and preconditioner exactly as
-/// [`rational_reduced_schur_log_det`] does — same bracket, same probes, same
-/// nodes, same shared-block diagonal — and then evaluates it through a recording
-/// shifted solver. `RationalLogdetPlan::evaluate_with_shifted_solver` is the seam
-/// that makes this possible without a second copy of the ladder: the statistical
-/// functional is untouched and only the numerical inverse is instrumented, so
-/// the `log_det` this reports is the one production computes.
-///
-/// `None` on the same conditions as [`rational_reduced_schur_log_det`].
-pub fn reduced_schur_logdet_shift_ladder_profile<B: BatchedBlockSolver + Sync>(
-    sys: &ArrowSchurSystem,
-    htt_factors: &ArrowFactorSlab,
-    ridge_beta: f64,
-    backend: &B,
-    resident: Option<&SaeResidentReducedSchur>,
-    num_probes: usize,
-    seed: u64,
-    rel_tol: f64,
-    power_iters: usize,
-    cg_rel_tol: f64,
-    cg_max_iters: usize,
-) -> Option<ShiftLadderProfile> {
-    let k = sys.k;
-    if k == 0 {
-        return None;
-    }
-    let lambda_max = reduced_schur_lambda_max(
-        sys,
-        htt_factors,
-        ridge_beta,
-        backend,
-        resident,
-        None,
-        power_iters,
-        seed,
-    )?;
-    let lambda_min = (SPECTRAL_DEFLATION_REL_FLOOR * lambda_max).max(f64::MIN_POSITIVE);
-    let plan = RationalLogdetPlan::build(k, num_probes, seed, lambda_min, lambda_max, rel_tol)?;
-    let op = ReducedSchurOperator::new(sys, htt_factors, ridge_beta, backend, resident);
-    let matvec = |v: ArrayView1<f64>| -> Array1<f64> { op.apply(v) };
-    let precond = reduced_schur_shifted_preconditioner(sys, ridge_beta);
-
-    // (b) in the #2576 fault taxonomy: CG on a non-symmetric operator cannot be
-    // rescued by any preconditioner. Two deterministic probes, no RNG plumbing:
-    // an alternating-sign vector and a linear ramp are not related by any
-    // symmetry of an arrow system, so `vᵀSw = wᵀSv` here is a real test.
-    let mut v = Array1::<f64>::zeros(k);
-    let mut w = Array1::<f64>::zeros(k);
-    for index in 0..k {
-        v[index] = if index % 2 == 0 { 1.0 } else { -1.0 };
-        w[index] = (index as f64 + 1.0) / (k as f64);
-    }
-    let sv = matvec(v.view());
-    let sw = matvec(w.view());
-    let scale = (sv.dot(&sv).sqrt() * w.dot(&w).sqrt()).max(f64::MIN_POSITIVE);
-    let symmetry_defect = (w.dot(&sv) - v.dot(&sw)).abs() / scale;
-
-    // `(ladder_position, shift, iterations-per-solve, trace of the longest solve)`
-    // accumulated by the recording solver. The ladder walks nodes in descending
-    // shift order and every solve at one node happens before the next node's, so
-    // the recorded order IS the ladder position order.
-    type LadderRecord = (f64, Vec<usize>, ShiftedPcgTrace);
-    let recorded: std::sync::Mutex<Vec<LadderRecord>> = std::sync::Mutex::new(Vec::new());
-    let solve = |shift: f64, rhs: &Array1<f64>, warm: &Array1<f64>| {
-        let (outcome, trace) =
-            shifted_pcg_traced(&matvec, &precond, shift, rhs, warm, cg_rel_tol, cg_max_iters);
-        let iterations = trace.iterations();
-        let mut log = recorded.lock().ok()?;
-        match log.last_mut() {
-            Some(entry) if entry.0 == shift => {
-                entry.1.push(iterations);
-                if iterations > entry.2.iterations() {
-                    entry.2 = trace;
-                }
-            }
-            _ => log.push((shift, vec![iterations], trace)),
-        }
-        drop(log);
-        outcome
-    };
-    let eval = plan.evaluate_with_shifted_solver(&solve)?;
-    let log = recorded.into_inner().ok()?;
-
-    // The cold seed: the ladder's SMALLEST shift, first probe, zero start. Every
-    // solve above was warm-started from the node before it, so none of them
-    // prices what a single Krylov space costs from scratch — which is exactly
-    // the quantity a one-space evaluator would pay, and the only trace whose
-    // residual curve starts at 1 and is therefore readable as a convergence
-    // history.
-    let seed_shift = plan
-        .nodes
-        .iter()
-        .map(|(t, _)| *t)
-        .fold(f64::INFINITY, f64::min);
-    let cold_start = Array1::<f64>::zeros(k);
-    let (_, cold_seed_solve) = shifted_pcg_traced(
-        &matvec,
-        &precond,
-        seed_shift,
-        plan.probes.first()?,
-        &cold_start,
-        cg_rel_tol,
-        cg_max_iters,
-    );
-    let (_, cold_seed_solve_undiagonalized) = shifted_pcg_traced(
-        &matvec,
-        &ShiftedDiagonalPreconditioner::identity(),
-        seed_shift,
-        plan.probes.first()?,
-        &cold_start,
-        cg_rel_tol,
-        cg_max_iters,
-    );
-
-    let weight_of = |shift: f64| -> f64 {
-        plan.nodes
-            .iter()
-            .find(|(t, _)| *t == shift)
-            .map(|(_, w)| *w)
-            .unwrap_or(f64::NAN)
-    };
-    let mut hardest = ShiftedPcgTrace::default();
-    let mut nodes = Vec::with_capacity(log.len());
-    let mut total_iterations = 0usize;
-    for (ladder_position, (shift, per_solve, trace)) in log.into_iter().enumerate() {
-        let iterations: usize = per_solve.iter().sum();
-        total_iterations += iterations;
-        if trace.iterations() > hardest.iterations() {
-            hardest = trace.clone();
-        }
-        nodes.push(ShiftLadderNodeProfile {
-            ladder_position,
-            shift,
-            weight: weight_of(shift),
-            iterations,
-            max_solve_iterations: per_solve.iter().copied().max().unwrap_or(0),
-            krylov_condition: trace.krylov_condition_estimate(),
-        });
-    }
-    Some(ShiftLadderProfile {
-        nodes,
-        log_det: eval.estimate,
-        std_err: eval.std_err,
-        total_iterations,
-        hardest_solve: hardest,
-        cold_seed_solve,
-        cold_seed_solve_undiagonalized,
-        symmetry_defect,
-        bracket: (lambda_min, lambda_max),
-    })
 }
 
 /// Convergence certificate for one matrix-free reduced-Schur CG solve.
@@ -3495,7 +2956,11 @@ impl ReducedSchurCgReport {
     pub fn weaker(self, other: Self) -> Self {
         let self_slack = self.relative_residual / self.tolerance.max(f64::MIN_POSITIVE);
         let other_slack = other.relative_residual / other.tolerance.max(f64::MIN_POSITIVE);
-        if other_slack > self_slack { other } else { self }
+        if other_slack > self_slack {
+            other
+        } else {
+            self
+        }
     }
 }
 
@@ -6168,9 +5633,7 @@ pub(crate) fn steihaug_pcg_auto<B: BatchedBlockSolver + Sync>(
         // assume the un-pinned Schur and cannot precondition the gauge pin, so
         // surface a recoverable failure and let the outer LM loop escalate the
         // ridge instead (a bespoke pinned-diagonal preconditioner is the follow-up).
-        if diag.stopping_reason == PcgStopReason::MaxIter
-            && sys.k > PRECOND_ESCALATE_K_THRESHOLD
-        {
+        if diag.stopping_reason == PcgStopReason::MaxIter && sys.k > PRECOND_ESCALATE_K_THRESHOLD {
             return Err(ArrowSchurError::PcgFailed {
                 reason: format!(
                     "gauge-pinned Schur PCG (identity preconditioner) exhausted its \
@@ -6781,38 +6244,6 @@ pub enum ArrowSchurError {
 }
 
 impl ArrowSchurError {
-
-    /// Whether this refusal is a Schur complement that is merely not positive
-    /// definite — a RELOCATABLE trial point rather than a defect.
-    ///
-    /// The distinction is the caller's next move: an indefinite complement means
-    /// the point is in an indefinite basin adjacent to a PD optimum, so the trial
-    /// can be refused and the search steered, whereas a non-finite or non-square
-    /// operator is a defect no relocation fixes. gam-sae's outer ρ-search is
-    /// exactly that caller — it reads an indefinite complement as `+∞` and steers
-    /// ρ back into the PD region (#1782).
-    ///
-    /// ⚠ #2598 — this predicate exists because that caller was recovering the
-    /// same verdict by matching TWO substrings of [`Display`]'s output
-    /// (`"Schur complement Cholesky failed"` and `"not positive definite"`) on a
-    /// `String`-typed spine. The information was already a type here and was
-    /// being rendered to prose and reconstructed, across a crate boundary:
-    /// rewording either message below would have silently reclassified every
-    /// recoverable Schur refusal as a fatal defect with nothing failing. The
-    /// conjunct is preserved exactly — the discriminant carries the first
-    /// substring and `reason` carries the second — so a `SchurFactorFailed`
-    /// whose reason is a non-finite entry, a non-square operator or an
-    /// unavailable device still reports `false` and stays fatal.
-    ///
-    /// [`Display`]: std::fmt::Display
-    pub fn is_non_pd_schur_complement(&self) -> bool {
-        matches!(
-            self,
-            ArrowSchurError::SchurFactorFailed { reason }
-                if reason.contains("not positive definite")
-        )
-    }
-
     /// [`Self::is_non_pd_schur_complement`], read off a message that has already
     /// been rendered — the same verdict for a caller that no longer holds the
     /// value.

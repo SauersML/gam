@@ -125,8 +125,7 @@ pub fn solve_arrow_newton_step_with_options(
             sys,
             build_dense_schur_direct(sys, evidence_htt_factors, 0.0, &backend, options.gpu_policy)?,
         );
-        let exact_a_classification =
-            exact_a_reduced_classification(sys, evidence_htt_factors)?;
+        let exact_a_classification = exact_a_reduced_classification(sys, evidence_htt_factors)?;
         let DenseReducedSchurFactorization {
             factor: evidence_schur_factor,
             conditioned_schur: floored_evidence_schur,
@@ -144,6 +143,7 @@ pub fn solve_arrow_newton_step_with_options(
     }
 
     let mut cache = ArrowFactorCache {
+        exact_beta_remainders: sys.exact_beta_remainders.clone().into(),
         htt_factors,
         htt_factors_undamped,
         schur_factor,
@@ -584,8 +584,8 @@ fn build_resident_base_frame_if_admitted(
         sys,
         options.newton_schur_tikhonov_rel_floor,
     )
-        .map(Some)
-        .map_err(|failure| device_failure_as_arrow_error("resident base-frame build", failure))
+    .map(Some)
+    .map_err(|failure| device_failure_as_arrow_error("resident base-frame build", failure))
 }
 
 /// #1017: build a device-resident framed SAE frame for the LM ridge ladder, or
@@ -646,10 +646,11 @@ pub fn prepare_sae_resident_frame(
     Option<std::sync::Arc<dyn crate::gpu_kernels::arrow_schur::SaeResidentFrame + Send + Sync>>,
     ArrowSchurError,
 > {
-    if options.mode != ArrowSolverMode::InexactPCG || sys
-        .device_sae_pcg
-        .as_ref()
-        .is_none_or(|data| data.frame.is_none())
+    if options.mode != ArrowSolverMode::InexactPCG
+        || sys
+            .device_sae_pcg
+            .as_ref()
+            .is_none_or(|data| data.frame.is_none())
         || !sys.cross_row_penalties.is_empty()
         || options.streaming_chunk_size.is_some()
     {
@@ -1330,59 +1331,11 @@ pub(crate) enum MixedPrecisionAttempt {
     },
 }
 
-/// The eliminated blocks' displacement induced by a border DIRECTION, with no
-/// gradient term: `t(v)_i = -(H_tt^(i))^-1 H_tβ^(i) v`.
-///
-/// This is the linear half of the arrow back-substitution.
-/// [`back_substitute_delta_t`] is this plus the affine term `-(H_tt)^-1 g_t`,
-/// which is what turns a direction into a Newton STEP; a direction must not
-/// carry it, because a gradient offset is not part of a curvature mode and
-/// would make the lift depend on where the iterate happens to sit.
-///
-/// **The lift is exact, and that is the whole point.** For any `v`, writing
-/// `L(v)` for this map and `S = (H_ββ + ρ_β I) - Σ_i H_βt^(i)(H_tt^(i))^-1 H_tβ^(i)`
-/// for the reduced Schur complement,
-///
-/// ```text
-///     [L(v); v]^T H [L(v); v]  =  v^T S v
-/// ```
-///
-/// because `S` IS the quadratic form of the full arrow Hessian restricted to
-/// the graph of `L` (that is the defining property of a Schur complement, not
-/// an approximation to it). So a negative eigenvalue of the reduced Schur is a
-/// direction of negative curvature of the FULL objective, and this map carries
-/// it there with no loss: a mode measured in the eliminated coordinate system
-/// becomes a displacement the fit can actually take.
-///
-/// Every `S·v` apply already computes `(H_tt^(i))^-1 H_tβ^(i) v` per row and
-/// discards it (`schur_matvec_row_into`); this is that intermediate, kept.
-pub(crate) fn arrow_lift_border_direction<B: BatchedBlockSolver + Sync>(
-    sys: &ArrowSchurSystem,
-    htt_factors: &ArrowFactorSlab,
-    direction: ArrayView1<'_, f64>,
-    backend: &B,
-) -> Array1<f64> {
-    back_substitute_rows(sys, htt_factors, direction, backend, false)
-}
-
 pub(crate) fn back_substitute_delta_t<B: BatchedBlockSolver + Sync>(
     sys: &ArrowSchurSystem,
     htt_factors: &ArrowFactorSlab,
     delta_beta: ArrayView1<'_, f64>,
     backend: &B,
-) -> Array1<f64> {
-    back_substitute_rows(sys, htt_factors, delta_beta, backend, true)
-}
-
-/// The shared row-block back-substitution. `with_row_gradient` selects the
-/// affine Newton form over the homogeneous direction lift; the two differ by
-/// exactly the `g_t` term and by nothing else, so they cannot drift apart.
-fn back_substitute_rows<B: BatchedBlockSolver + Sync>(
-    sys: &ArrowSchurSystem,
-    htt_factors: &ArrowFactorSlab,
-    delta_beta: ArrayView1<'_, f64>,
-    backend: &B,
-    with_row_gradient: bool,
 ) -> Array1<f64> {
     let n = sys.rows.len();
     let total_dt_len = sys.row_offsets[n];
@@ -1398,18 +1351,14 @@ fn back_substitute_rows<B: BatchedBlockSolver + Sync>(
         let di = sys.row_dims[i];
         assert!(
             sys.rows[i].gt.len() == di,
-            "back_substitute_rows: row {i} gt len {} != row dim {di}",
+            "back_substitute_delta_t: row {i} gt len {} != row dim {di}",
             sys.rows[i].gt.len()
         );
         let mut htbeta_slice = Array1::<f64>::zeros(di);
         sys_htbeta_apply_row(sys, i, &sys.rows[i], delta_beta, &mut htbeta_slice);
         let mut rhs = Array1::<f64>::zeros(di);
         for c in 0..di {
-            rhs[c] = if with_row_gradient {
-                sys.rows[i].gt[c] + htbeta_slice[c]
-            } else {
-                htbeta_slice[c]
-            };
+            rhs[c] = sys.rows[i].gt[c] + htbeta_slice[c];
         }
         let dt_i = backend.solve_block_vector(htt_factors.factor(i), rhs.view());
         for c in 0..di {
@@ -1434,7 +1383,7 @@ fn back_substitute_rows<B: BatchedBlockSolver + Sync>(
             let seg_len = row_offsets[end] - row_offsets[start];
             assert!(
                 prev_end == row_offsets[start],
-                "back_substitute_rows: non-contiguous row segment at chunk start {start} \
+                "back_substitute_delta_t: non-contiguous row segment at chunk start {start} \
                  (prev_end={prev_end}, row_offset={})",
                 row_offsets[start]
             );
@@ -2023,18 +1972,17 @@ pub(crate) fn solve_arrow_newton_step_artifacts(
     // 1. BA point elimination: per-row Cholesky factors of
     // (H_tt^(i) + ridge_t · I).  `factor_blocks` reads the actual row
     // dimension from `row.htt.nrows()` so heterogeneous systems work.
-    let htt_factors =
-        factor_blocks_for_system(
-            sys,
-            ridge_t,
-            // A Newton step is never an evidence factorization: it ridge-damps a
-            // non-PD block rather than conditioning it, so no deflation and no
-            // sign verdict apply.
-            ArrowEvidencePolicy::Strict,
-            &backend,
-            options.gpu_policy,
-        )?
-        .factors;
+    let htt_factors = factor_blocks_for_system(
+        sys,
+        ridge_t,
+        // A Newton step is never an evidence factorization: it ridge-damps a
+        // non-PD block rather than conditioning it, so no deflation and no
+        // sign verdict apply.
+        ArrowEvidencePolicy::Strict,
+        &backend,
+        options.gpu_policy,
+    )?
+    .factors;
 
     // 2. Reduced RHS r_β = -g_β + Σ_i H_βt^(i) (H_tt^(i))⁻¹ g_t^(i).
     let rhs_beta = reduced_rhs_beta(sys, &htt_factors, &backend);

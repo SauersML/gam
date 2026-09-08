@@ -1509,20 +1509,9 @@ impl<'d> SingleBlockExactJointDesignCache<'d> {
         );
         self.realizer
             .apply_log_kappa(&log_kappa, &self.spatial_terms)?;
-        // The ψ this realization is FOR. `ensure_theta` is memoized on θ, so
-        // every line here is a distinct point, and the cost of a spatial fit is
-        // the number of them: 518 realizations against 189 reported outer
-        // evaluations on the 6-D k=100 fit. Which points those are — a line
-        // search, a probe ladder, or one evaluation re-entered — cannot be read
-        // from a line that prints only how long it took (#2735).
         log::info!(
-            "[STAGE] ensure_theta (apply_log_kappa, {} terms) psi={:?}: {:.3}s",
+            "[STAGE] ensure_theta (apply_log_kappa, {} terms): {:.3}s",
             self.spatial_terms.len(),
-            theta
-                .iter()
-                .skip(self.rho_dim)
-                .map(|value| format!("{value:.6}"))
-                .collect::<Vec<_>>(),
             t_ensure.elapsed().as_secs_f64(),
         );
         self.current_theta = Some(theta.clone());
@@ -2112,97 +2101,124 @@ impl SingleBlockLatentCoordDesignCache {
     }
 }
 
-/// Default half-width of the joint `[ρ, ψ]` search box in `log λ`.
-///
-/// A PRIOR, not a constraint: the joint solve is better conditioned inside
-/// `±12` than over the engine's full `±RHO_BOUND`, and the overwhelming
-/// majority of incumbents live well inside it. What makes it a prior rather
-/// than a wall is [`joint_rho_search_box`], which drops it per coordinate the
-/// moment the data falsifies it.
-pub(crate) const JOINT_RHO_BOUND: f64 = 12.0;
 
-/// The ρ box the joint `[ρ, ψ]` search is handed, given the scalar-ρ
-/// incumbent it will be GRADED against.
+/// The λ-selection domain of the joint spatial search, derived per ρ
+/// coordinate from the term's own design-relative penalty spectrum (#2812):
+/// `[ln(ε γ_min), ln(γ_max / ε)]` over the positive generalized eigenvalues
+/// `γ_j` of the block's design Gram against its penalty, intersected with the
+/// representable log-strength range. Below the lower edge the penalty is under
+/// the round-off of the data curvature (the term is unpenalized to working
+/// precision); above the upper edge the data curvature is under the round-off
+/// of the penalty (the term sits on its null space to working precision). A
+/// search that reaches an edge has found a structural result, not a wall.
 ///
-/// ## The invariant (#2454, corrected by #2760)
+/// This replaces the `±12` prior box and its per-coordinate fallback to the
+/// engine's `±30` rail. MEASURED on the #2760 ladder (noiseless 1-D Duchon
+/// `y = sin(t)`, 12 centers, 5 penalties): REML drives `λ̂` down as `n` grows
+/// and the incumbents crossed `−12` one at a time, 4 of 5 pasted onto the wall
+/// at `n = 1 000 … 8 000` and all 5 at `n = 16 000` (coordinate 0 at
+/// `−12.347`), where the joint gradient at the wall was `+1.484` against a
+/// stationarity bound of `1.030` — a feasible-set defect reported as a
+/// length-scale failure. A domain read off the spectrum has no such wall: the
+/// incumbent of a fit inside its own domain is inside this one, and the only
+/// edges are the two structural limits.
 ///
-/// `try_exact_joint_spatial_length_scale_optimization` grades
-/// `joint_final_value` against `fit_score(&best.fit)` — the incumbent fit,
-/// found by the standard scalar-ρ path over the WIDER `±RHO_BOUND` box. If
-/// `ln λ̂` falls outside the joint box, the seed is silently clamped and the
-/// joint minimum is taken over a set that does not contain the point it is
-/// compared with — so "optimizing κ made the score worse" becomes reachable
-/// with the optimizer descending perfectly, and the certificate reports a
-/// solver failure for a feasible-set failure. Measured on #2454:
-/// `initial=5.692434e1, final=5.692477e1` with all three ρ terminating at
-/// `11.999994`, i.e. pinned on the clamp.
-///
-/// #1464 discovered the same thing for one term kind and widened the upper ρ
-/// bound to `RHO_BOUND` whenever a constant-curvature term is present; that is
-/// this rule for a special case, and it arrives here as `rho_upper_bound`.
-///
-/// ## Interior, not merely contained (#2760)
-///
-/// The first version of this rule widened *only as far as the incumbent*:
-/// `(-JOINT_RHO_BOUND).min(seed)`. That makes the graded point a member of the
-/// closed feasible set and puts it exactly ON the boundary — a different and
-/// much worse thing. The coordinate is then an ACTIVE constraint from iteration
-/// zero, its outward gradient is KKT-projected to zero, and it can never
-/// descend, even when the joint criterion at the ψ the search is about to move
-/// to wants it strictly lower. Containment is not the property this route
-/// needs; the property is that the graded point is INTERIOR, so the joint
-/// search may follow the joint criterion wherever it goes.
-///
-/// MEASURED (#2760, `probe_2760_pg_and_bound_at_every_rung`, noiseless 1-D
-/// Duchon `y = sin(t)`, 12 centers, 5 penalties). REML drives `λ̂` down as `n`
-/// grows, so the incumbents cross `−JOINT_RHO_BOUND` one at a time: 4 of 5
-/// coordinates are pasted onto the wall at `n = 1 000 … 8 000`, and all 5 at
-/// `n = 16 000`, where coordinate 0's incumbent reaches `−12.347`. There the
-/// joint gradient at the wall is `∂V/∂ρ₀ = +1.484` — larger than the entire
-/// stationarity bound `1.030` — so 78 % of `‖g‖` is a direction the box clips
-/// to zero. The BFGS direction is dominated by it, no step reproduces the
-/// predicted decrease, and the line search dies (`StepSizeTooSmall`, 50
-/// attempts, 6 outer iterations) leaving the LENGTH SCALE non-stationary:
-/// `‖Pg‖ = |∂V/∂ψ| = 1.190` against bound `1.030`. The refusal reads as an
-/// iso-κ search failure and is a feasible-set failure one coordinate away.
-///
-/// ## The rule
-///
-/// A coordinate whose incumbent is not strictly inside the joint prior has had
-/// that prior FALSIFIED by the data, so it falls back to the box the incumbent
-/// was actually found in — the engine's `±RHO_BOUND`, the scalar-ρ route's own
-/// search region. Every coordinate whose incumbent is strictly inside the
-/// prior keeps the historical box byte-for-byte, which is every ρ coordinate of
-/// every fit the old rule was not already pinning.
-///
-/// A coordinate whose incumbent sits AT `±RHO_BOUND` still ends up on that
-/// bound. That is not the same defect: it is the scalar route's own certified
-/// rail, reached in the same box, shared by both routes — not one this route
-/// manufactured by moving a wall onto a point.
-///
-/// A non-finite incumbent (`λ̂ = 0` or `∞`, which `ln` maps to `∓∞`) carries no
-/// information about where to search, so it keeps the prior.
-pub(crate) fn joint_rho_search_box(
-    rho_seed: ArrayView1<'_, f64>,
-    rho_upper_bound: f64,
+/// A coordinate whose penalty geometry cannot be projected (no positive
+/// penalty eigenvalue, or a design that does not reach its range) keeps the
+/// precision box `[ln ε, ln(1/ε)]` around unit strength; so does a coordinate
+/// beyond the penalties the design carries, with a warning, since the layout
+/// then disagrees with the fit.
+pub(crate) fn joint_rho_resolvability_domain(
+    design: &DesignMatrix,
+    penalties: &[gam_terms::smooth::BlockwisePenalty],
+    rho_dim: usize,
 ) -> (Array1<f64>, Array1<f64>) {
-    let rho_dim = rho_seed.len();
-    let lower = Array1::<f64>::from_shape_fn(rho_dim, |k| {
-        let seed = rho_seed[k];
-        if seed.is_finite() && seed <= -JOINT_RHO_BOUND {
-            -gam_solve::estimate::RHO_BOUND
-        } else {
-            -JOINT_RHO_BOUND
+    let precision_box = gam_solve::estimate::rho_domain::precision_box();
+    let mut lower = Array1::<f64>::from_elem(rho_dim, precision_box.0);
+    let mut upper = Array1::<f64>::from_elem(rho_dim, precision_box.1);
+    if rho_dim > penalties.len() {
+        log::warn!(
+            "[spatial-kappa] joint rho domain: {rho_dim} coordinates but {} penalty blocks; \
+             the coordinates past the blocks keep the precision box",
+            penalties.len()
+        );
+    }
+    let dense = design.to_dense();
+    for (k, penalty) in penalties.iter().take(rho_dim).enumerate() {
+        let range = penalty.col_range.clone();
+        if range.end > dense.ncols() || range.start >= range.end {
+            continue;
         }
-    });
-    let upper = Array1::<f64>::from_shape_fn(rho_dim, |k| {
-        let seed = rho_seed[k];
-        if seed.is_finite() && seed >= rho_upper_bound {
-            gam_solve::estimate::RHO_BOUND
-        } else {
-            rho_upper_bound
-        }
-    });
+        let block = dense.slice(ndarray::s![.., range.start..range.end]);
+        let gram = block.t().dot(&block);
+        let Some(gammas) = gam_custom_family::penalty_range_gammas_from_gram(&gram, &penalty.local)
+        else {
+            continue;
+        };
+        let Some((lo, hi)) = gam_custom_family::resolvability_interval(&gammas) else {
+            continue;
+        };
+        lower[k] = lo.max(gam_problem::LOG_STRENGTH_MIN);
+        upper[k] = hi.min(gam_problem::LOG_STRENGTH_MAX);
+    }
+    (lower, upper)
+}
+
+/// The joint ρ domain across the blocks of an exact-joint route: the blocks'
+/// penalties, in block order, are the ρ coordinates, and each takes the
+/// resolvability interval of its own block design (#2812). When the blocks'
+/// penalties do not account for every coordinate the layout is not the
+/// driver's to guess: `None`, and the box the setup's builder derived (or the
+/// precision box) stands.
+pub(crate) fn joint_rho_resolvability_domain_over_blocks<'a>(
+    blocks: &[(&'a DesignMatrix, &'a [gam_terms::smooth::BlockwisePenalty])],
+    rho_dim: usize,
+) -> Option<(Array1<f64>, Array1<f64>)> {
+    let declared: usize = blocks.iter().map(|(_, penalties)| penalties.len()).sum();
+    if declared != rho_dim {
+        log::info!(
+            "[spatial-exact-joint] joint rho domain: {rho_dim} coordinates but the {} blocks \
+             declare {declared} penalties between them; the setup's own box stands",
+            blocks.len()
+        );
+        return None;
+    }
+    let mut lower = Array1::<f64>::zeros(rho_dim);
+    let mut upper = Array1::<f64>::zeros(rho_dim);
+    let mut cursor = 0usize;
+    for (design, penalties) in blocks {
+        let n_block = penalties.len();
+        let (block_lower, block_upper) =
+            joint_rho_resolvability_domain(design, penalties, n_block);
+        lower.slice_mut(s![cursor..cursor + n_block]).assign(&block_lower);
+        upper.slice_mut(s![cursor..cursor + n_block]).assign(&block_upper);
+        cursor += n_block;
+    }
+    Some((lower, upper))
+}
+
+/// The per-coordinate ρ domain of one penalized block given as a design and
+/// its penalties as full-block matrices (a survival time block, a prepared
+/// score-warp or link-deviation block): each penalty's resolvability interval
+/// against the block's Gram, intersected with the representable strength
+/// range; a penalty without design curvature keeps the precision box.
+pub(crate) fn penalized_block_rho_domain<'a>(
+    design: &DesignMatrix,
+    penalties: impl IntoIterator<Item = &'a Array2<f64>>,
+) -> (Vec<f64>, Vec<f64>) {
+    let dense = design.to_dense();
+    let gram = dense.t().dot(&dense);
+    let mut lower = Vec::new();
+    let mut upper = Vec::new();
+    for penalty in penalties {
+        let interval = (penalty.nrows() == gram.nrows() && penalty.ncols() == gram.ncols())
+            .then(|| gam_custom_family::penalty_range_gammas_from_gram(&gram, penalty))
+            .flatten()
+            .and_then(|gammas| gam_custom_family::resolvability_interval(&gammas));
+        let (lo, hi) = gam_solve::estimate::rho_domain::coordinate_domain(interval, None);
+        lower.push(lo);
+        upper.push(hi);
+    }
     (lower, upper)
 }
 
@@ -2287,25 +2303,12 @@ fn try_exact_joint_spatial_length_scale_optimization(
 
     let rho_dim = best.fit.lambdas.len();
 
-    // #1464: a constant-curvature `curv()` term's geodesic-exponential kernel
-    // COLLAPSES toward the constant function as κ grows positive (sphere
-    // distances compress), so its global REML optimum at the +κ side is a LARGE
-    // smoothing λ — often ρ > +JOINT_RHO_BOUND. With the symmetric ±12 box the
-    // joint [ρ,ψ] optimizer is structurally clamped into the shallow
-    // under-smoothing basin whose spuriously-low deviance rails κ̂ to the +chart
-    // bound for any curved data (hyperbolic truth mis-recovered as spherical).
-    // When a constant-curvature term is present, widen ONLY the over-smoothing
-    // (upper) ρ bound to the standard `RHO_BOUND`, leaving the lower bound at
-    // −JOINT_RHO_BOUND so an overfit origin is never reachable — the same
-    // asymmetric-bound rationale the standard scalar-ρ path uses for the
-    // gam#1266 high-λ basin. Every other spatial/Matérn/Duchon/sphere joint fit
-    // keeps the historical ±12 box byte-for-byte.
-    let has_constant_curvature_term = !constant_curvature_term_indices(resolvedspec).is_empty();
-    let rho_upper_bound = if has_constant_curvature_term {
-        gam_solve::estimate::RHO_BOUND
-    } else {
-        JOINT_RHO_BOUND
-    };
+    // #1464 used to widen the over-smoothing side of a hand `±12` box to the
+    // engine's `±30` rail when a constant-curvature `curv()` term was present,
+    // because that kernel's REML optimum at the +κ side is a large smoothing
+    // λ. The joint ρ domain is now derived per coordinate from the term's own
+    // spectrum (`joint_rho_resolvability_domain`, #2812), so that basin is
+    // inside the domain whenever the data resolve it, for every term alike.
 
     // Compute per-term dimensionality for anisotropic terms.
     let dims_per_term = spatial_dims_per_term(resolvedspec, spatial_terms);
@@ -2329,6 +2332,7 @@ fn try_exact_joint_spatial_length_scale_optimization(
     // fit. The full joint solve therefore profiles only nuisance ρ (and any
     // non-curvature spatial coordinates) at that certified κ. User-pinned and
     // estimated values share the same fixed-coordinate treatment, including κ=0.
+    let has_constant_curvature_term = !constant_curvature_term_indices(resolvedspec).is_empty();
     let mut cc_profiled_values: Vec<(usize, f64)> = Vec::new();
     if has_constant_curvature_term {
         for (slot, &term_idx) in spatial_terms.iter().enumerate() {
@@ -2446,28 +2450,35 @@ fn try_exact_joint_spatial_length_scale_optimization(
         }
     }
 
+    // The joint ρ domain is derived from the incumbent's own design and
+    // penalties (#2812): this route hands its θ box straight to the joint
+    // optimizer, so the derivation happens here rather than in the
+    // multi-block driver. The setup itself carries only the seed.
     let rho_seed = best.fit.lambdas.mapv(f64::ln);
-    let (rho_lower, rho_upper) = joint_rho_search_box(rho_seed.view(), rho_upper_bound);
-    let widened: Vec<usize> = (0..rho_dim)
-        .filter(|&k| rho_lower[k] < -JOINT_RHO_BOUND || rho_upper[k] > rho_upper_bound)
-        .collect();
-    if !widened.is_empty() {
+    let setup = ExactJointHyperSetup::new(rho_seed, log_kappa0, log_kappa_lower, log_kappa_upper);
+
+    let mut theta0 = setup.theta0();
+    let mut lower = setup.lower();
+    let mut upper = setup.upper();
+    {
+        let (rho_lower, rho_upper) =
+            joint_rho_resolvability_domain(&best.design.design, &best.design.penalties, rho_dim);
+        for k in 0..rho_dim {
+            lower[k] = rho_lower[k];
+            upper[k] = rho_upper[k];
+            theta0[k] = if theta0[k].is_finite() {
+                theta0[k].clamp(rho_lower[k], rho_upper[k])
+            } else {
+                0.5 * (rho_lower[k] + rho_upper[k])
+            };
+        }
         log::info!(
-            "[spatial-kappa] joint rho box fell back to the engine's own +/-RHO_BOUND on \
-             coordinate(s) {widened:?}: their incumbent is not strictly inside the joint \
-             +/-{JOINT_RHO_BOUND} prior, so the prior is falsified there and the search \
-             region becomes the one the incumbent was found in (gam#2760). \
-             seed={:?} box=[{:?}, {:?}]",
-            rho_seed.to_vec(),
-            rho_lower.to_vec(),
-            rho_upper.to_vec(),
+            "[spatial-kappa] joint rho domain per coordinate: lower={:?} upper={:?} seed={:?}",
+            rho_lower.iter().map(|v| (v * 1e3).round() / 1e3).collect::<Vec<_>>(),
+            rho_upper.iter().map(|v| (v * 1e3).round() / 1e3).collect::<Vec<_>>(),
+            theta0.iter().take(rho_dim).map(|v| (v * 1e3).round() / 1e3).collect::<Vec<_>>(),
         );
     }
-    let setup = ExactJointHyperSetup::new(rho_seed, rho_lower, rho_upper, log_kappa0, log_kappa_lower, log_kappa_upper);
-
-    let theta0 = setup.theta0();
-    let lower = setup.lower();
-    let upper = setup.upper();
 
     // ───────────────────────────────────────────────────────────────────────
     //  Both coordinate kinds drive the SAME exact joint optimizer
@@ -2739,6 +2750,7 @@ fn try_exact_joint_spatial_length_scale_optimization(
         fit,
         design: optimized.design,
         resolvedspec: optimized_spec,
+        adaptive_diagnostics: optimized.adaptive_diagnostics,
         kappa_timing: Some(kappa_timing),
     };
 
@@ -5377,16 +5389,6 @@ impl<'d> FrozenTermCollectionIncrementalRealizer<'d> {
                 &mut replay.basis,
                 gauge.local_identifiability_transform.as_ref(),
             );
-            // The rotation `Q` the collection applied BEFORE it derived `T0`
-            // (gam#2760). The freeze copied the term's own `joint_null_rotation`,
-            // which the collection cleared once it composed `Q·T0` into the
-            // metadata, and the chart restored above is the pre-`Q` one — so
-            // without this the replay put an unrotated block through a chart
-            // derived on the rotated one. The local build honours a persisted
-            // rotation instead of re-deriving one, and
-            // `wrap_local_build_as_realization` applies it before the gauge
-            // applies `T0`: the collection's own order.
-            replay.joint_null_rotation = gauge.joint_null_rotation.clone();
         }
         let spec = spec;
         let fixed_blocks = build_term_collection_fixed_blocks(data, &spec)
@@ -6051,7 +6053,6 @@ impl<'d> FrozenTermCollectionIncrementalRealizer<'d> {
         }
 
         let termname = build_spec.name.clone();
-        let t_build = std::time::Instant::now();
         let local = build_single_local_smooth_term(
             self.data,
             &build_spec,
@@ -6109,16 +6110,6 @@ impl<'d> FrozenTermCollectionIncrementalRealizer<'d> {
             spatial_frozen_radial_chart_shape(&build_spec),
             spatial_realized_radial_chart_shape(&local.metadata),
             local.design.ncols(),
-        );
-        // The n×k realization is the trial's dominant cost and had no timer of
-        // its own: the only per-trial number reported was the splice's, under a
-        // label that named the rebuild (measured on the 6-D isotropic Duchon
-        // fit at n=50 000, k=500: 16.6 s per κ trial, of which the splice the
-        // old line reported was 1.7 s).
-        log::info!(
-            "[STAGE] smooth term realization (term {term_idx}, '{termname}', local_cols={}): {:.3}s",
-            local.design.ncols(),
-            t_build.elapsed().as_secs_f64(),
         );
         let realization = wrap_local_build_as_realization(local, &build_spec)
             .map_err(EstimationError::InvalidInput)?;
@@ -6471,7 +6462,7 @@ impl<'d> FrozenTermCollectionIncrementalRealizer<'d> {
         }
         self.dropped_penaltyinfo_by_term[term_idx] = dropped_penaltyinfo;
         log::info!(
-            "[STAGE] collection-gauge placement + splice (term {}, '{}', cols={}): {:.3}s",
+            "[STAGE] smooth basis rebuild (term {}, '{}', cols={}): {:.3}s",
             term_idx,
             target_term.name,
             coeff_range.len(),
@@ -6573,8 +6564,11 @@ pub enum SpatialFitProvenance<'a, M> {
 #[derive(Debug, Clone)]
 pub struct ExactJointHyperSetup {
     rho0: Array1<f64>,
-    rho_lower: Array1<f64>,
-    rho_upper: Array1<f64>,
+    /// A per-coordinate ρ domain the builder derived from structures the
+    /// driver cannot see (a survival time block's own design and penalties);
+    /// `None` leaves the ρ half of the θ box at the precision box until the
+    /// driver derives it from the blocks' seed designs.
+    rho_domain: Option<(Array1<f64>, Array1<f64>)>,
     log_kappa0: SpatialLogKappaCoords,
     log_kappa_lower: SpatialLogKappaCoords,
     log_kappa_upper: SpatialLogKappaCoords,
@@ -6584,36 +6578,42 @@ pub struct ExactJointHyperSetup {
 }
 
 impl ExactJointHyperSetup {
-    fn sanitize_rho_seed(
-        rho0: Array1<f64>,
-        rho_lower: &Array1<f64>,
-        rho_upper: &Array1<f64>,
+    /// The ρ seed inside the arithmetic envelope. The setup carries no ρ box
+    /// of its own: the searchable domain of each ρ coordinate is derived from
+    /// the seed designs by the driver that builds them (#2812), and until then
+    /// the only bound a coordinate has is the one working precision imposes.
+    fn sanitize_rho_seed(rho0: Array1<f64>) -> Array1<f64> {
+        let (lo, hi) = gam_solve::estimate::rho_domain::precision_box();
+        rho0.mapv(|value| if value.is_finite() { value.clamp(lo, hi) } else { 0.0 })
+    }
+
+    /// An auxiliary seed inside the box its caller derived for it.
+    fn sanitize_auxiliary_seed(
+        seed: Array1<f64>,
+        lower: &Array1<f64>,
+        upper: &Array1<f64>,
     ) -> Array1<f64> {
-        Array1::from_iter(rho0.iter().enumerate().map(|(idx, &value)| {
-            let lo = rho_lower[idx];
-            let hi = rho_upper[idx];
-            let fallback = 0.0_f64.clamp(lo, hi);
+        Array1::from_iter(seed.iter().enumerate().map(|(idx, &value)| {
+            let lo = lower[idx];
+            let hi = upper[idx];
             if value.is_finite() {
                 value.clamp(lo, hi)
             } else {
-                fallback
+                0.0_f64.clamp(lo, hi)
             }
         }))
     }
 
     pub(crate) fn new(
         rho0: Array1<f64>,
-        rho_lower: Array1<f64>,
-        rho_upper: Array1<f64>,
         log_kappa0: SpatialLogKappaCoords,
         log_kappa_lower: SpatialLogKappaCoords,
         log_kappa_upper: SpatialLogKappaCoords,
     ) -> Self {
-        let rho0 = Self::sanitize_rho_seed(rho0, &rho_lower, &rho_upper);
+        let rho0 = Self::sanitize_rho_seed(rho0);
         Self {
             rho0,
-            rho_lower,
-            rho_upper,
+            rho_domain: None,
             log_kappa0,
             log_kappa_lower,
             log_kappa_upper,
@@ -6621,6 +6621,19 @@ impl ExactJointHyperSetup {
             auxiliary_lower: Array1::zeros(0),
             auxiliary_upper: Array1::zeros(0),
         }
+    }
+
+    /// The ρ domain a builder derived for coordinates whose penalties are not
+    /// carried by the blocks' term-collection designs (#2812). The seed is
+    /// projected into it.
+    pub(crate) fn with_rho_domain(mut self, lower: Array1<f64>, upper: Array1<f64>) -> Self {
+        assert_eq!(lower.len(), self.rho0.len(), "rho domain lower length mismatch");
+        assert_eq!(upper.len(), self.rho0.len(), "rho domain upper length mismatch");
+        for k in 0..self.rho0.len() {
+            self.rho0[k] = self.rho0[k].clamp(lower[k], upper[k]);
+        }
+        self.rho_domain = Some((lower, upper));
+        self
     }
 
     pub(crate) fn with_auxiliary(
@@ -6639,7 +6652,8 @@ impl ExactJointHyperSetup {
             auxiliary_upper.len(),
             "auxiliary upper bound length mismatch"
         );
-        self.auxiliary0 = Self::sanitize_rho_seed(auxiliary0, &auxiliary_lower, &auxiliary_upper);
+        self.auxiliary0 =
+            Self::sanitize_auxiliary_seed(auxiliary0, &auxiliary_lower, &auxiliary_upper);
         self.auxiliary_lower = auxiliary_lower;
         self.auxiliary_upper = auxiliary_upper;
         self
@@ -6668,10 +6682,17 @@ impl ExactJointHyperSetup {
         out
     }
 
+    /// The θ box with the ρ half at the arithmetic envelope; the driver
+    /// replaces that half with the domain derived from the seed designs.
     pub(crate) fn lower(&self) -> Array1<f64> {
         let mut out =
             Array1::<f64>::zeros(self.rho_dim() + self.log_kappa_dim() + self.auxiliary_dim());
-        out.slice_mut(s![..self.rho_dim()]).assign(&self.rho_lower);
+        match self.rho_domain.as_ref() {
+            Some((lower, _)) => out.slice_mut(s![..self.rho_dim()]).assign(lower),
+            None => out
+                .slice_mut(s![..self.rho_dim()])
+                .fill(gam_solve::estimate::rho_domain::precision_box().0),
+        }
         out.slice_mut(s![self.rho_dim()..self.rho_dim() + self.log_kappa_dim()])
             .assign(self.log_kappa_lower.as_array());
         out.slice_mut(s![self.rho_dim() + self.log_kappa_dim()..])
@@ -6682,7 +6703,12 @@ impl ExactJointHyperSetup {
     pub(crate) fn upper(&self) -> Array1<f64> {
         let mut out =
             Array1::<f64>::zeros(self.rho_dim() + self.log_kappa_dim() + self.auxiliary_dim());
-        out.slice_mut(s![..self.rho_dim()]).assign(&self.rho_upper);
+        match self.rho_domain.as_ref() {
+            Some((_, upper)) => out.slice_mut(s![..self.rho_dim()]).assign(upper),
+            None => out
+                .slice_mut(s![..self.rho_dim()])
+                .fill(gam_solve::estimate::rho_domain::precision_box().1),
+        }
         out.slice_mut(s![self.rho_dim()..self.rho_dim() + self.log_kappa_dim()])
             .assign(self.log_kappa_upper.as_array());
         out.slice_mut(s![self.rho_dim() + self.log_kappa_dim()..])
@@ -6962,115 +6988,107 @@ mod exact_joint_seed_config_tests {
     }
 }
 
-/// The property #2760 is about, asserted on [`joint_rho_search_box`] directly:
-/// the box the joint search is handed must contain the incumbent it will be
-/// GRADED against **strictly inside** it, so no coordinate begins the search
-/// as an active constraint the criterion wants to cross.
+/// The property #2760 is about, asserted on [`joint_rho_resolvability_domain`]
+/// directly: the domain the joint search is handed must contain the incumbent
+/// it will be GRADED against strictly inside it, so no coordinate begins the
+/// search as an active constraint the criterion wants to cross — and a domain
+/// read off the term's own spectrum has no wall for an incumbent to sit on.
 #[cfg(test)]
-mod joint_rho_search_box_tests {
+mod joint_rho_resolvability_domain_tests {
     use super::*;
-    use gam_solve::estimate::RHO_BOUND;
 
-    /// The one claim the box exists to make. `-12.347` is the measured
-    /// `n = 16 000` incumbent from the #2760 ladder; the pre-fix rule returned
-    /// a lower bound of exactly `-12.347`, i.e. the point itself.
+    fn two_column_block(gamma: f64) -> (DesignMatrix, Vec<gam_terms::smooth::BlockwisePenalty>) {
+        let c = gamma.sqrt();
+        let design = DesignMatrix::from(ndarray::array![[c, 0.0], [0.0, c]]);
+        let penalty =
+            gam_terms::smooth::BlockwisePenalty::new(0..2, ndarray::array![[1.0, 0.0], [0.0, 1.0]]);
+        (design, vec![penalty])
+    }
+
+    /// The domain is the resolvability interval of the block's own spectrum:
+    /// `[ln(εγ), ln(γ/ε)]` for two directions of equal design-relative
+    /// curvature γ.
     #[test]
-    fn every_finite_incumbent_is_strictly_inside_the_box() {
-        // Interior, at the prior's edge, past it, at the engine rail, and the
-        // #2760 measurement itself.
-        let seeds = Array1::from(vec![
-            0.0,
-            -11.9,
-            -JOINT_RHO_BOUND,
-            -12.347_446_785_500_143,
-            -24.126_016_487_917_27,
-            11.9,
-            JOINT_RHO_BOUND,
-            17.5,
-        ]);
-        let (lower, upper) = joint_rho_search_box(seeds.view(), JOINT_RHO_BOUND);
-        for (k, &seed) in seeds.iter().enumerate() {
+    fn the_domain_is_the_blocks_resolvability_interval_2812() {
+        for gamma in [1.0e-6_f64, 1.0, 3.0e4] {
+            let (design, penalties) = two_column_block(gamma);
+            let (lower, upper) = joint_rho_resolvability_domain(&design, &penalties, 1);
+            let expected_lower = 0.5 * f64::EPSILON.ln() + gamma.ln();
+            let expected_upper = gamma.ln() - 0.5 * f64::EPSILON.ln();
             assert!(
-                lower[k] < seed && seed < upper[k],
-                "coordinate {k}: incumbent {seed} is not STRICTLY inside its joint box \
-                 [{}, {}] — it starts the joint search as an active constraint, which is \
-                 exactly the #2760 defect (the pre-fix rule returned lower = seed here)",
-                lower[k],
-                upper[k],
+                (lower[0] - expected_lower).abs() < 1e-9
+                    && (upper[0] - expected_upper).abs() < 1e-9,
+                "γ={gamma}: domain [{}, {}] must be [{expected_lower}, {expected_upper}]",
+                lower[0],
+                upper[0]
             );
         }
     }
 
-    /// The historical box, byte-for-byte, for every coordinate the prior still
-    /// covers. This is what keeps the repair from being a global widening.
+    /// Across blocks the coordinates are the blocks' penalties in block
+    /// order, each on its own block's interval; a coordinate count the blocks
+    /// do not account for is not a layout the driver may guess, and every
+    /// coordinate then keeps the precision box.
     #[test]
-    fn a_strictly_interior_incumbent_keeps_the_historical_box() {
-        let seeds = Array1::from(vec![0.0, -11.999, 11.999, -3.0, 5.0]);
-        let (lower, upper) = joint_rho_search_box(seeds.view(), JOINT_RHO_BOUND);
-        for k in 0..seeds.len() {
-            assert_eq!(lower[k], -JOINT_RHO_BOUND);
-            assert_eq!(upper[k], JOINT_RHO_BOUND);
+    fn the_joint_domain_is_the_blocks_intervals_in_block_order_2812() {
+        let (design_a, penalties_a) = two_column_block(1.0);
+        let (design_b, penalties_b) = two_column_block(3.0e4);
+        let blocks = [
+            (&design_a, penalties_a.as_slice()),
+            (&design_b, penalties_b.as_slice()),
+        ];
+        let (lower, upper) =
+            joint_rho_resolvability_domain_over_blocks(&blocks, 2).expect("two penalties, two coordinates");
+        assert!(
+            (lower[0] - 0.5 * f64::EPSILON.ln()).abs() < 1e-9
+                && (upper[0] + 0.5 * f64::EPSILON.ln()).abs() < 1e-9
+                && (lower[1] - (0.5 * f64::EPSILON.ln() + 3.0e4_f64.ln())).abs() < 1e-9
+                && (upper[1] - (3.0e4_f64.ln() - 0.5 * f64::EPSILON.ln())).abs() < 1e-9,
+            "block order: lower={lower:?} upper={upper:?}"
+        );
+        assert!(
+            joint_rho_resolvability_domain_over_blocks(&blocks, 3).is_none(),
+            "an unaccounted coordinate is not the driver's to place"
+        );
+    }
+
+    /// The #2760 incumbents that used to sit on the `±12` wall are interior
+    /// points of the derived domain of a unit-curvature term: a fit inside
+    /// its own domain seeds the joint search inside this one. The one
+    /// incumbent a fit produced at `−24.13` — under the first cut of this
+    /// domain, whose edge sat at the effective degrees of freedom's
+    /// resolution rather than the gradient's — lies past the edge the
+    /// gradient can resolve, and the driver projects such a seed onto it.
+    #[test]
+    fn the_2760_incumbents_are_interior_2812() {
+        let (design, penalties) = two_column_block(1.0);
+        let (lower, upper) = joint_rho_resolvability_domain(&design, &penalties, 1);
+        for seed in [-12.347_446_785_500_143, 11.9, 17.5] {
+            assert!(
+                lower[0] < seed && seed < upper[0],
+                "incumbent {seed} must be strictly inside [{}, {}]",
+                lower[0],
+                upper[0]
+            );
         }
+        let past_the_edge = -24.126_016_487_917_27;
+        assert!(
+            past_the_edge < lower[0] && lower[0] < -18.0,
+            "an incumbent at {past_the_edge} sits past the gradient-resolution floor {}",
+            lower[0]
+        );
     }
 
-    /// The fallback is per coordinate: one incumbent outside the prior must not
-    /// widen its neighbours' boxes.
+    /// A coordinate the design carries no penalty block for keeps the
+    /// precision box around unit strength, and says so.
     #[test]
-    fn the_fallback_is_per_coordinate() {
-        let seeds = Array1::from(vec![-30.0, 0.0, 20.0]);
-        let (lower, upper) = joint_rho_search_box(seeds.view(), JOINT_RHO_BOUND);
-        assert_eq!((lower[0], upper[0]), (-RHO_BOUND, JOINT_RHO_BOUND));
-        assert_eq!((lower[1], upper[1]), (-JOINT_RHO_BOUND, JOINT_RHO_BOUND));
-        assert_eq!((lower[2], upper[2]), (-JOINT_RHO_BOUND, RHO_BOUND));
-    }
-
-    /// #1464's asymmetric widening arrives as `rho_upper_bound = RHO_BOUND`.
-    /// The rule must compose with it rather than fight it: the upper prior is
-    /// already the engine rail, so nothing about the upper side can widen, and
-    /// the lower side still falls back independently.
-    #[test]
-    fn composes_with_the_constant_curvature_upper_widening() {
-        let seeds = Array1::from(vec![-13.0, 25.0]);
-        let (lower, upper) = joint_rho_search_box(seeds.view(), RHO_BOUND);
-        assert_eq!((lower[0], upper[0]), (-RHO_BOUND, RHO_BOUND));
-        assert_eq!((lower[1], upper[1]), (-JOINT_RHO_BOUND, RHO_BOUND));
-    }
-
-    /// The box never narrows past the engine's own rail, and never reports an
-    /// empty or inverted interval — the two ways a bounds bug becomes a
-    /// downstream `outer objective-domain intersection is empty` refusal.
-    #[test]
-    fn the_box_is_always_a_nonempty_subinterval_of_the_engine_rail() {
-        let seeds = Array1::from(vec![
-            f64::NEG_INFINITY,
-            f64::INFINITY,
-            f64::NAN,
-            -RHO_BOUND,
-            RHO_BOUND,
-            0.0,
-        ]);
-        for &upper_bound in &[JOINT_RHO_BOUND, RHO_BOUND] {
-            let (lower, upper) = joint_rho_search_box(seeds.view(), upper_bound);
-            for k in 0..seeds.len() {
-                assert!(lower[k] < upper[k], "coordinate {k} has an empty box");
-                assert!(lower[k] >= -RHO_BOUND, "coordinate {k} escaped the engine rail");
-                assert!(upper[k] <= RHO_BOUND, "coordinate {k} escaped the engine rail");
-            }
-        }
-    }
-
-    /// A non-finite incumbent carries no information about where to search, so
-    /// it must keep the prior rather than trigger the fallback (`ln λ̂` maps
-    /// `λ̂ = 0` to `−∞`, which the old `min` rule would have clamped to the
-    /// engine rail).
-    #[test]
-    fn a_nonfinite_incumbent_keeps_the_prior() {
-        let seeds = Array1::from(vec![f64::NEG_INFINITY, f64::INFINITY, f64::NAN]);
-        let (lower, upper) = joint_rho_search_box(seeds.view(), JOINT_RHO_BOUND);
-        for k in 0..seeds.len() {
-            assert_eq!(lower[k], -JOINT_RHO_BOUND);
-            assert_eq!(upper[k], JOINT_RHO_BOUND);
-        }
+    fn a_coordinate_past_the_blocks_keeps_the_precision_box_2812() {
+        let (design, penalties) = two_column_block(1.0);
+        let (lower, upper) = joint_rho_resolvability_domain(&design, &penalties, 2);
+        let (box_lo, box_hi) = gam_solve::estimate::rho_domain::precision_box();
+        assert_eq!(lower[1], box_lo);
+        assert_eq!(upper[1], box_hi);
+        assert!(lower[0] <= lower[1] && upper[1] <= upper[0]);
     }
 }
 
@@ -7156,11 +7174,18 @@ pub(crate) fn exact_joint_multistart_outer_problem(
     // the `has_constant_curvature` param doc). Drives both the scalar saturation
     // reference and the seed-grid clamp; the actual box is the per-dim
     // `lower`/`upper` arrays passed in.
-    let rho_ceiling = if has_constant_curvature {
-        gam_solve::estimate::RHO_BOUND
-    } else {
-        12.0
-    };
+    // #2812: the ρ domain arrives from the caller, derived per coordinate from
+    // the design and its penalties; the seed lattice spans the same domain.
+    let seed_rho_floor = lower
+        .iter()
+        .take(rho_dim)
+        .copied()
+        .fold(f64::INFINITY, f64::min);
+    let seed_rho_ceiling = upper
+        .iter()
+        .take(rho_dim)
+        .copied()
+        .fold(f64::NEG_INFINITY, f64::max);
     let mut problem = gam_solve::rho_optimizer::OuterProblem::new(n_params)
         .with_gradient(gradient)
         .with_hessian(hessian)
@@ -7230,7 +7255,7 @@ pub(crate) fn exact_joint_multistart_outer_problem(
                 // Let the seed grid reach the widened over-smoothing ceiling so a
                 // smooth whose true REML optimum genuinely lives at large λ can be
                 // discovered (#1464).
-                sc.bounds = (sc.bounds.0, rho_ceiling);
+                sc.bounds = (seed_rho_floor, seed_rho_ceiling);
                 // gam#1464: do NOT inject an explicit over-smoothing probe at
                 // ρ ≈ +15 for constant-curvature terms. The probe seeds the joint
                 // [ρ, ψ] solve at the collapsed-kernel corner where the geodesic
@@ -7248,7 +7273,6 @@ pub(crate) fn exact_joint_multistart_outer_problem(
             }
             sc
         })
-        .with_rho_bound(rho_ceiling)
         .with_heuristic_lambdas(seed_heuristic);
     if let Some((n_obs, p_cols)) = profiled_objective_size {
         // Calibrate to the n-scaled profiled criterion (see the param doc).
@@ -7364,9 +7388,9 @@ where
     // -----------------------------------------------------------------------
     // Full optimization path.
     // -----------------------------------------------------------------------
-    let theta0 = joint_setup.theta0();
-    let lower = joint_setup.lower();
-    let upper = joint_setup.upper();
+    let mut theta0 = joint_setup.theta0();
+    let mut lower = joint_setup.lower();
+    let mut upper = joint_setup.upper();
     if theta0.len() < log_kappa_dim || lower.len() != theta0.len() || upper.len() != theta0.len() {
         return Err(SmoothError::dimension_mismatch(format!(
             "invalid exact joint theta setup: theta0={}, lower={}, upper={}, required_log_kappa_dim={}",
@@ -7390,6 +7414,38 @@ where
             "failed to build and freeze joint block designs during exact joint kappa bootstrap: {e}"
         )
     })?;
+    // The ρ half of the θ box is the resolvability domain of each coordinate
+    // on its own block's seed design (#2812): nothing the setup's builder could
+    // know before these designs existed, and nothing the driver needs a
+    // hand-supplied box for now that they do.
+    {
+        let seed_blocks: Vec<(&DesignMatrix, &[gam_terms::smooth::BlockwisePenalty])> =
+            boot_designs
+                .iter()
+                .map(|d| (&d.design, d.penalties.as_slice()))
+                .collect();
+        if let Some((rho_lower, rho_upper)) =
+            joint_rho_resolvability_domain_over_blocks(&seed_blocks, rho_dim)
+        {
+            for k in 0..rho_dim {
+                lower[k] = rho_lower[k];
+                upper[k] = rho_upper[k];
+            }
+        }
+        for k in 0..rho_dim {
+            theta0[k] = if theta0[k].is_finite() {
+                theta0[k].clamp(lower[k], upper[k])
+            } else {
+                0.5 * (lower[k] + upper[k])
+            };
+        }
+        log::info!(
+            "[spatial-exact-joint] joint rho domain per coordinate: lower={:?} upper={:?} seed={:?}",
+            lower.iter().take(rho_dim).map(|v| (v * 1e3).round() / 1e3).collect::<Vec<_>>(),
+            upper.iter().take(rho_dim).map(|v| (v * 1e3).round() / 1e3).collect::<Vec<_>>(),
+            theta0.iter().take(rho_dim).map(|v| (v * 1e3).round() / 1e3).collect::<Vec<_>>(),
+        );
+    }
     // Capability vs realized policy: the family may *advertise* an exact
     // analytic outer Hessian, but at this realized (n, psi_dim, rho_dim,
     // p_total) the predicted per-eval cost can still exceed the universal
@@ -8501,6 +8557,7 @@ fn try_exact_joint_latent_coord_optimization(
         fit,
         design: optimized.design,
         resolvedspec: resolvedspec.clone(),
+        adaptive_diagnostics: optimized.adaptive_diagnostics,
         kappa_timing: None,
     })
 }
@@ -8746,6 +8803,7 @@ pub fn fit_term_collectionwith_spatial_length_scale_optimization(
             fit: out.fit,
             design: out.design,
             resolvedspec,
+            adaptive_diagnostics: out.adaptive_diagnostics,
             kappa_timing: None,
         });
     }
@@ -8972,6 +9030,7 @@ pub fn fit_term_collectionwith_spatial_length_scale_optimization(
             fit: fitted.fit,
             design: fitted.design,
             resolvedspec,
+            adaptive_diagnostics: fitted.adaptive_diagnostics,
             kappa_timing: None,
         });
     }
@@ -9024,6 +9083,7 @@ pub fn fit_term_collectionwith_spatial_length_scale_optimization(
                 fit: fitted.fit,
                 design: fitted.design,
                 resolvedspec,
+                adaptive_diagnostics: fitted.adaptive_diagnostics,
                 kappa_timing: None,
             });
         }
@@ -9077,6 +9137,7 @@ pub fn fit_term_collectionwith_spatial_length_scale_optimization(
         fit: fitted.fit,
         design: fitted.design,
         resolvedspec,
+        adaptive_diagnostics: fitted.adaptive_diagnostics,
         kappa_timing: None,
     })
 }

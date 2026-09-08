@@ -820,6 +820,8 @@ pub fn survival_fit_from_parts(
             beta_covariance_frequentist: None,
             coefficient_influence: None,
             weighted_gram: None,
+            bias_correction_beta: None,
+            bias_correction_jacobian: None,
         });
 
     let deviance = -2.0 * log_likelihood;

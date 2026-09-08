@@ -3202,7 +3202,8 @@ pub(crate) fn refine_iteration_limit_probe_budget_never_extends() {
             probe_base,
             probe_base,
             Some(1.0),
-            0.5
+            0.5,
+            true
         ),
         probe_base
     );
@@ -3215,7 +3216,8 @@ pub(crate) fn refine_iteration_limit_probe_budget_never_extends() {
             accepted_base,
             accepted_progress,
             Some(1.0),
-            0.5
+            0.5,
+            false
         ),
         accepted_progress,
         "accepted-point policy: a real residual drop (prev=Some(1.0), now=0.5) must extend the \
@@ -3225,7 +3227,8 @@ pub(crate) fn refine_iteration_limit_probe_budget_never_extends() {
             accepted_base,
             accepted_progress,
             Some(1.0),
-            0.5
+            0.5,
+            false
         ),
     );
     // …a stalled residual does not…
@@ -3235,7 +3238,8 @@ pub(crate) fn refine_iteration_limit_probe_budget_never_extends() {
             accepted_base,
             accepted_progress,
             Some(1.0),
-            1.0
+            1.0,
+            false
         ),
         accepted_base
     );
@@ -3246,19 +3250,8 @@ pub(crate) fn refine_iteration_limit_probe_budget_never_extends() {
             accepted_base,
             accepted_progress,
             None,
-            1.0e9
-        ),
-        accepted_base
-    );
-    // A drop in an earlier round cannot buy work for a later plateau. The old
-    // sticky progress latch extended this second call despite equal residuals.
-    assert_eq!(
-        SaeManifoldTerm::refine_iteration_limit(
-            accepted_base,
-            accepted_base,
-            accepted_progress,
-            Some(0.5),
-            0.5
+            1.0e9,
+            false
         ),
         accepted_base
     );

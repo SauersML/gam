@@ -832,15 +832,6 @@ dependencies = [
 
 [[package]]
 name = "bit-set"
-version = "0.8.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "08807e080ed7f9d5433fa9b275196cfc35414f66a0c79d864dc51a0d825231a3"
-dependencies = [
- "bit-vec 0.8.0",
-]
-
-[[package]]
-name = "bit-set"
 version = "0.9.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "34ddef2995421ab6a5c779542c81ee77c115206f4ad9d5a8e05f4ff49716a3dd"
@@ -853,12 +844,6 @@ name = "bit-vec"
 version = "0.6.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "349f9b6a179ed607305526ca489b34ad0a41aed5f7980fa90eb03160b69598fb"
-
-[[package]]
-name = "bit-vec"
-version = "0.8.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5e764a1d40d510daf35e07be9eb06e75770908c27d411ee6c92109c9840eaaf7"
 
 [[package]]
 name = "bit-vec"
@@ -3531,7 +3516,7 @@ dependencies = [
 
 [[package]]
 name = "gam"
-version = "0.3.155"
+version = "0.3.154"
 dependencies = [
  "ad_trait",
  "approx",
@@ -3576,7 +3561,7 @@ dependencies = [
 
 [[package]]
 name = "gam-cli"
-version = "0.3.155"
+version = "0.3.154"
 dependencies = [
  "clap",
  "comfy-table",
@@ -3601,7 +3586,7 @@ dependencies = [
 
 [[package]]
 name = "gam-config"
-version = "0.3.155"
+version = "0.3.154"
 dependencies = [
  "gam-gpu",
  "gam-inference",
@@ -3615,7 +3600,7 @@ dependencies = [
 
 [[package]]
 name = "gam-custom-family"
-version = "0.3.155"
+version = "0.3.154"
 dependencies = [
  "approx",
  "faer",
@@ -3635,7 +3620,7 @@ dependencies = [
 
 [[package]]
 name = "gam-data"
-version = "0.3.155"
+version = "0.3.154"
 dependencies = [
  "arrow",
  "csv",
@@ -3649,7 +3634,7 @@ dependencies = [
 
 [[package]]
 name = "gam-geometry"
-version = "0.3.155"
+version = "0.3.154"
 dependencies = [
  "faer",
  "gam-linalg",
@@ -3662,7 +3647,7 @@ dependencies = [
 
 [[package]]
 name = "gam-gpu"
-version = "0.3.155"
+version = "0.3.154"
 dependencies = [
  "cudarc",
  "faer",
@@ -3680,7 +3665,7 @@ dependencies = [
 
 [[package]]
 name = "gam-identifiability"
-version = "0.3.155"
+version = "0.3.154"
 dependencies = [
  "cudarc",
  "faer",
@@ -3698,7 +3683,7 @@ dependencies = [
 
 [[package]]
 name = "gam-inference"
-version = "0.3.155"
+version = "0.3.154"
 dependencies = [
  "approx",
  "cudarc",
@@ -3726,7 +3711,7 @@ dependencies = [
 
 [[package]]
 name = "gam-linalg"
-version = "0.3.155"
+version = "0.3.154"
 dependencies = [
  "approx",
  "dyn-stack",
@@ -3734,7 +3719,6 @@ dependencies = [
  "gam-runtime",
  "log",
  "ndarray 0.17.2",
- "proptest",
  "rayon",
  "serde",
  "thiserror 2.0.19",
@@ -3742,7 +3726,7 @@ dependencies = [
 
 [[package]]
 name = "gam-math"
-version = "0.3.155"
+version = "0.3.154"
 dependencies = [
  "bumpalo",
  "libm",
@@ -3752,7 +3736,7 @@ dependencies = [
 
 [[package]]
 name = "gam-model-api"
-version = "0.3.155"
+version = "0.3.154"
 dependencies = [
  "gam-linalg",
  "gam-problem",
@@ -3763,7 +3747,7 @@ dependencies = [
 
 [[package]]
 name = "gam-model-kernels"
-version = "0.3.155"
+version = "0.3.154"
 dependencies = [
  "gam-linalg",
  "gam-math",
@@ -3780,7 +3764,7 @@ dependencies = [
 
 [[package]]
 name = "gam-models"
-version = "0.3.155"
+version = "0.3.154"
 dependencies = [
  "approx",
  "csv",
@@ -3823,7 +3807,7 @@ dependencies = [
 
 [[package]]
 name = "gam-predict"
-version = "0.3.155"
+version = "0.3.154"
 dependencies = [
  "faer",
  "gam-data",
@@ -3847,7 +3831,7 @@ dependencies = [
 
 [[package]]
 name = "gam-problem"
-version = "0.3.155"
+version = "0.3.154"
 dependencies = [
  "faer",
  "gam-geometry",
@@ -3863,7 +3847,7 @@ dependencies = [
 
 [[package]]
 name = "gam-pyffi"
-version = "0.1.265"
+version = "0.1.264"
 dependencies = [
  "arrow",
  "csv",
@@ -3892,7 +3876,7 @@ dependencies = [
 
 [[package]]
 name = "gam-row-macros"
-version = "0.3.155"
+version = "0.3.154"
 dependencies = [
  "gam-math",
  "proc-macro2",
@@ -3902,7 +3886,7 @@ dependencies = [
 
 [[package]]
 name = "gam-runtime"
-version = "0.3.155"
+version = "0.3.154"
 dependencies = [
  "log",
  "ndarray 0.17.2",
@@ -3916,7 +3900,7 @@ dependencies = [
 
 [[package]]
 name = "gam-sae"
-version = "0.3.155"
+version = "0.3.154"
 dependencies = [
  "approx",
  "cudarc",
@@ -3946,7 +3930,7 @@ dependencies = [
 
 [[package]]
 name = "gam-solve"
-version = "0.3.155"
+version = "0.3.154"
 dependencies = [
  "approx",
  "cudarc",
@@ -3986,7 +3970,7 @@ dependencies = [
 
 [[package]]
 name = "gam-terms"
-version = "0.3.155"
+version = "0.3.154"
 dependencies = [
  "approx",
  "cudarc",
@@ -4017,13 +4001,12 @@ dependencies = [
 
 [[package]]
 name = "gam-test-support"
-version = "0.3.155"
+version = "0.3.154"
 dependencies = [
  "approx",
  "csv",
  "faer",
  "gam-linalg",
- "gam-models",
  "gam-problem",
  "gam-runtime",
  "gam-terms",
@@ -4981,7 +4964,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "525e9ff3e1a4be2fbea1fdf0e98686a6d98b4d8f937e1bf7402245af1909e8c3"
 dependencies = [
  "byteorder-lite",
- "quick-error 2.0.1",
+ "quick-error",
 ]
 
 [[package]]
@@ -6826,25 +6809,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "proptest"
-version = "1.11.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4b45fcc2344c680f5025fe57779faef368840d0bd1f42f216291f0dc4ace4744"
-dependencies = [
- "bit-set 0.8.0",
- "bit-vec 0.8.0",
- "bitflags 2.13.1",
- "num-traits",
- "rand 0.9.5",
- "rand_chacha 0.9.0",
- "rand_xorshift",
- "regex-syntax",
- "rusty-fork",
- "tempfile",
- "unarray",
-]
-
-[[package]]
 name = "pulp"
 version = "0.22.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6963,12 +6927,6 @@ checksum = "7f6d64c71eb498fe9eae14ce4ec935c555749aef511cca85b5568910d6e48001"
 dependencies = [
  "bytemuck",
 ]
-
-[[package]]
-name = "quick-error"
-version = "1.2.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a1d01941d82fa2ab50be1e79e6714289dd7cde78eba4c074bc5a4374f650dfe0"
 
 [[package]]
 name = "quick-error"
@@ -7191,15 +7149,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "rand_xorshift"
-version = "0.4.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "513962919efc330f829edb2535844d1b912b0fbe2ca165d613e4e8788bb05a5a"
-dependencies = [
- "rand_core 0.9.5",
-]
-
-[[package]]
 name = "range-alloc"
 version = "0.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7350,7 +7299,7 @@ dependencies = [
  "avif-serialize",
  "imgref",
  "loop9",
- "quick-error 2.0.1",
+ "quick-error",
  "rav1e",
  "rayon",
  "rgb",
@@ -7725,18 +7674,6 @@ name = "rustversion"
 version = "1.0.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf54715a573b99ac80df0bc206da022bcd442c974952c7b9720069370852e21f"
-
-[[package]]
-name = "rusty-fork"
-version = "0.3.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cc6bf79ff24e648f6da1f8d1f011e9cac26491b619e6b9280f2b47f1774e6ee2"
-dependencies = [
- "fnv",
- "quick-error 1.2.3",
- "tempfile",
- "wait-timeout",
-]
 
 [[package]]
 name = "ryu"
@@ -8657,7 +8594,7 @@ dependencies = [
  "fax",
  "flate2",
  "half",
- "quick-error 2.0.1",
+ "quick-error",
  "weezl",
  "zune-jpeg",
 ]
@@ -9210,12 +9147,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2896d95c02a80c6d6a5d6e953d479f5ddf2dfdb6a244441010e373ac0fb88971"
 
 [[package]]
-name = "unarray"
-version = "0.1.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "eaea85b334db583fe3274d12b4cd1880032beab409c0d774be044d4480ab9a94"
-
-[[package]]
 name = "unicode-ident"
 version = "1.0.24"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -9407,15 +9338,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6d9b2acfb050df409c972a37d3b8e08cdea3bddb0c09db9d53137e504cfabed0"
 dependencies = [
  "utf8parse",
-]
-
-[[package]]
-name = "wait-timeout"
-version = "0.2.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "09ac3b126d3914f9849036f826e054cbabdc8519970b8998ddaf3b5bd3c65f11"
-dependencies = [
- "libc",
 ]
 
 [[package]]

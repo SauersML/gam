@@ -443,7 +443,6 @@ impl<'a> DenseRightProductView<'a> {
         }
     }
 
-    #[must_use]
     pub fn with_factor(mut self, factor: &'a Array2<f64>) -> Self {
         if self.first.is_none() {
             self.first = Some(factor);
@@ -460,7 +459,6 @@ impl<'a> DenseRightProductView<'a> {
         self
     }
 
-    #[must_use]
     pub fn with_optional_factor(self, factor: Option<&'a Array2<f64>>) -> Self {
         match factor {
             Some(factor) => self.with_factor(factor),

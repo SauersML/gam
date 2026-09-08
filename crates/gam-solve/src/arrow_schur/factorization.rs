@@ -610,13 +610,7 @@ pub(crate) fn factor_spectral_deflated_criterion_row_with_geometry(
                 .zip(geometry.clamp_diag.iter())
                 .map(|(&value, &clamp)| clamp * value * value)
                 .sum::<f64>();
-            classify_exact_a_direction(
-                lambda,
-                d,
-                max_abs,
-                majorizer_curvature,
-                clamp_curvature,
-            )
+            classify_exact_a_direction(lambda, d, max_abs, majorizer_curvature, clamp_curvature)
         });
         let lambda_tilde = if let Some(classification) = exact_classification {
             match classification {
@@ -894,7 +888,7 @@ pub(crate) fn factor_one_row(
         false,
         None,
     )
-        .map(|result| result.factor)
+    .map(|result| result.factor)
 }
 
 pub(crate) fn factor_one_row_result(
@@ -1074,9 +1068,11 @@ pub(crate) fn factor_one_row_result(
                                 refuse_resolved_indefinite,
                                 exact_a,
                             )
-                            .map_err(|reason| ArrowSchurError::PerRowFactorFailed {
-                                row: row_idx,
-                                reason,
+                            .map_err(|reason| {
+                                ArrowSchurError::PerRowFactorFailed {
+                                    row: row_idx,
+                                    reason,
+                                }
                             })?;
                             if let Some(deflated) = deflated {
                                 return Ok(deflated);
@@ -1181,9 +1177,11 @@ pub(crate) fn factor_one_row_result(
                                 refuse_resolved_indefinite,
                                 exact_a,
                             )
-                            .map_err(|reason| ArrowSchurError::PerRowFactorFailed {
-                                row: row_idx,
-                                reason,
+                            .map_err(|reason| {
+                                ArrowSchurError::PerRowFactorFailed {
+                                    row: row_idx,
+                                    reason,
+                                }
                             })?;
                             if let Some(deflated) = deflated {
                                 return Ok(deflated);
@@ -1243,6 +1241,10 @@ pub(crate) fn manifold_mode_fingerprint(latent: &LatentCoordValues) -> u64 {
 pub(crate) fn row_hessian_fingerprint_for_system(sys: &ArrowSchurSystem) -> u64 {
     let mut hasher = Fingerprinter::new();
     hasher.write_str("arrow-schur-row-hessian-v2");
+    hasher.write_usize(sys.exact_beta_remainders.len());
+    for remainder in &sys.exact_beta_remainders {
+        remainder.fingerprint(&mut hasher);
+    }
     hasher.write_usize(sys.rows.len());
     hasher.write_usize(sys.d);
     hasher.write_usize(sys.k);

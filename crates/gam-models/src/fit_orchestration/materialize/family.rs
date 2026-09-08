@@ -174,6 +174,50 @@ fn apply_paren_link(
     Ok((LikelihoodSpec::new(base_spec.response, inverse_link), true))
 }
 
+/// #2026: whether a resolved Tweedie family should have its variance power `p`
+/// estimated by profile likelihood (mgcv `tw()` semantics) instead of held at
+/// the interior fallback baked in by [`resolve_family`].
+///
+/// mgcv's `tw()` family has no canonical `p` — it profiles `p` over the open
+/// interval `(1, 2)`. This returns `true` exactly when the user named the bare
+/// Tweedie family (`tweedie` / `tw` / `tweedie-log`, case- and separator-
+/// insensitive) WITHOUT an explicit numeric power argument. An explicit power
+/// (`tweedie(1.6)` / `tweedie(p=1.6)`) pins `p` and returns `false`; a
+/// non-numeric parenthesized argument (`tweedie(log)`) is a link, not a power,
+/// so it still estimates. The head/argument split mirrors the parser inside
+/// [`resolve_family`] so the two decisions cannot drift.
+pub fn tweedie_power_is_estimated(family: Option<&str>) -> bool {
+    let Some(name) = family else {
+        return false;
+    };
+    let lowered = name.to_ascii_lowercase().replace('_', "-");
+    let (head, arg): (&str, Option<&str>) = if let Some(open) = lowered.find('(')
+        && lowered.ends_with(')')
+    {
+        let head = lowered[..open].trim_end_matches('-').trim();
+        let inner = lowered[open + 1..lowered.len() - 1].trim();
+        if head.is_empty() || inner.is_empty() {
+            (lowered.as_str(), None)
+        } else {
+            (head, Some(inner))
+        }
+    } else {
+        (lowered.as_str(), None)
+    };
+    if !matches!(head, "tweedie" | "tw" | "tweedie-log") {
+        return false;
+    }
+    // An explicit numeric power (`1.6` or `p=1.6`) pins `p`; a missing argument
+    // or a non-numeric link argument leaves `p` to be estimated from the data.
+    match arg {
+        Some(a) => {
+            let numeric = a.strip_prefix("p=").unwrap_or(a).trim();
+            numeric.parse::<f64>().is_err()
+        }
+        None => true,
+    }
+}
+
 /// Nuisance parameters that a family NAME cannot carry on its own.
 ///
 /// The response family is fully determined by its name; `theta`, the Tweedie
@@ -321,15 +365,6 @@ pub fn scalar_family_from_name(
     // same validity gate as the parenthesized `tweedie(p=…)` form above, so one
     // bad power fails identically whichever surface named the family. A power
     // written into the name wins, because it is the more specific statement.
-    if matches!(head_name, "tweedie" | "tw" | "tweedie-log")
-        && tweedie_p_override.is_none()
-    {
-        return Err(WorkflowError::InvalidConfig {
-            reason: "Tweedie family requires an explicit variance power p strictly between 1 and 2 (for example, tweedie(p=1.5)); automatic power profiling is derivative-free hyperparameter search and is forbidden by SPEC.md"
-                .to_string(),
-        }
-        .into());
-    }
     if let Some(p) = tweedie_p_override
         && !gam_spec::is_valid_tweedie_power(p)
     {
@@ -478,16 +513,20 @@ pub fn scalar_family_from_name(
         ),
         // Tweedie compound-Poisson-Gamma family. The variance power p
         // must lie strictly in (1, 2). mgcv's `tw()` has NO canonical
-        // p — it *estimates* p by profile likelihood. We require callers to set
-        // it explicitly via `tweedie(1.6)` / `tweedie(p=1.6)`: profiling it
-        // without an analytic p-derivative would violate SPEC.md's ban on
-        // derivative-free hyperparameter search. The link is fixed to
+        // p — it *estimates* p by profile likelihood; here p can be set
+        // explicitly via the mgcv-style `tweedie(1.6)` / `tweedie(p=1.6)`
+        // parenthesized argument (parsed above into `tweedie_p_override`,
+        // #2026). Absent an explicit power we fall back to p = 1.5, a
+        // neutral interior default; the fitted mean (log-link
+        // quasi-likelihood) is robust to a misspecified p, but the
+        // observation-interval calibration depends on it, so callers on
+        // data whose true p != 1.5 should set it. The link is fixed to
         // log (the only link wired through the Tweedie working-response
         // and dispersion machinery). "tw" matches mgcv's family alias.
         "tweedie" | "tw" => (
             LikelihoodSpec::new(
                 ResponseFamily::Tweedie {
-                    p: tweedie_p_override.expect("explicit Tweedie power validated above"),
+                    p: tweedie_p_override.unwrap_or(1.5),
                 },
                 InverseLink::Standard(StandardLink::Log),
             ),
@@ -496,7 +535,7 @@ pub fn scalar_family_from_name(
         "tweedie-log" => (
             LikelihoodSpec::new(
                 ResponseFamily::Tweedie {
-                    p: tweedie_p_override.expect("explicit Tweedie power validated above"),
+                    p: tweedie_p_override.unwrap_or(1.5),
                 },
                 InverseLink::Standard(StandardLink::Log),
             ),
@@ -800,20 +839,11 @@ mod tweedie_power_tests {
     }
 
     #[test]
-    fn tweedie_bare_requires_explicit_power_instead_of_derivative_free_profiling() {
-        let y = array![0.0, 1.2, 3.4];
-        for family in ["tweedie", "tw", "tweedie(log)"] {
-            let error = resolve_family(
-                Some(family),
-                None,
-                None,
-                y.view(),
-                ResponseColumnKind::Numeric,
-                "y",
-            )
-            .expect_err("a bare Tweedie family must not trigger derivative-free profiling");
-            assert!(error.contains("requires an explicit variance power"), "{error}");
-        }
+    fn tweedie_bare_defaults_to_interior_power() {
+        // No explicit power → the neutral interior default (documented as a
+        // fallback, not a canonical value).
+        assert_eq!(tweedie_p("tweedie"), 1.5);
+        assert_eq!(tweedie_p("tw"), 1.5);
     }
 
     #[test]

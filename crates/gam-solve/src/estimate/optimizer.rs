@@ -1034,6 +1034,9 @@ where
             // family tower, so it uses the declared exact outer Hessian during
             // search instead of approximating it with first-order BFGS.
             let n_obs = y_o.len();
+            // #2812: the ρ domain derived per penalty from the state's own
+            // design and penalties replaces the engine's hand box.
+            let (reml_rho_lower, reml_rho_upper) = reml_state.resolvability_rho_domain();
             let problem = OuterProblem::new(k)
                 .with_gradient(Derivative::Analytic)
                 .with_hessian(if analytic_outer_hessian_available {
@@ -1076,7 +1079,7 @@ where
                 // component still owns the actual convergence decision.
                 .with_objective_scale(Some(n_obs as f64))
                 .with_problem_size(n_obs, x_o.ncols())
-                .with_rho_bound(crate::estimate::RHO_BOUND)
+                .with_bounds(reml_rho_lower.clone(), reml_rho_upper.clone())
                 // Make the outer smoothing-parameter search invariant to the order
                 // the smooth terms / tensor margins were written (#1538/#1539). The
                 // structural keys label each ρ-coordinate by its placement-
@@ -1164,29 +1167,6 @@ where
                 // can never silently un-invert a drifted box.
                 let bnds = reml_seed_config.bounds;
                 let raw_bounds = OrderedRhoBounds::new(bnds.0, bnds.1)?;
-                // The criterion-ranked prepass evaluates the TRUE REML/LAML cost, so
-                // it is safe — and necessary — to let it explore the full
-                // over-smoothing range the outer optimizer itself can reach
-                // (`RHO_BOUND`), not just the narrower default seed-placement band.
-                // A double-penalty (null-space-shrinkage) smooth on data living in
-                // one penalty's null space has its global REML optimum at a LARGE
-                // wiggliness λ (range block fully smoothed), often beyond the seed
-                // band; the cost surface also has a shallower local optimum at a
-                // moderate λ that leaves wiggle under-penalized (EDF inflated,
-                // gam#1266). If the prepass cannot seed past that local optimum, the
-                // outer EFS — which only takes cost-improving steps — relaxes back
-                // into it. The collapsing-kernel spatial smooth (gam#1464) has the
-                // same shape: the high-λ basin sits beyond a shallow low-λ trap.
-                // Widening only the upper (over-smoothing) bound lets the prepass
-                // place the seed in the correct high-λ basin; the lower
-                // (under-smoothing) bound stays at the default so we never seed an
-                // overfit origin. The seed is still only adopted when it strictly
-                // lowers the REML cost, so well-balanced and single-penalty fits are
-                // unaffected.
-                // Widen only the upper (over-smoothing) bound to the full range the
-                // outer optimizer can reach. `with_upper_at_least` only ever *raises*
-                // `hi`, so the box stays ordered by construction (`RHO_BOUND` is a
-                // finite constant) — no re-validation needed.
                 let seed_bounds = raw_bounds.with_upper_at_least(crate::estimate::RHO_BOUND);
                 // risk_shift is the default seed bias when no caller warm-start is given;
                 // it is NOT applied on top of a caller-supplied rho seed.
@@ -1421,6 +1401,11 @@ where
             // first-order form of the logdet/trace terms there), so the outer
             // certificate can PROVE an infinite-smoothing face instead of
             // measuring a tail beside the box.
+            let obj = obj.with_criterion_resolution(
+                |state: &mut &mut crate::estimate::reml::RemlState<'_>| {
+                    state.criterion_resolution()
+                },
+            );
             let obj = obj.with_rail_face_limit(
                 |state: &mut &mut crate::estimate::reml::RemlState<'_>,
                  rho: &Array1<f64>,
@@ -1530,6 +1515,19 @@ where
             // back to the bare absolute tolerance, which at large n is orders
             // below the residual a converged fit floors at.
             let n_obs = y_o.len();
+            // #2812: the ρ head's domain is derived per penalty from the state's
+            // own design and penalties; the link coordinates that follow are not
+            // log strengths and keep the engine's default box.
+            let (link_lower, link_upper) = {
+                let (rho_lower, rho_upper) = reml_state.resolvability_rho_domain();
+                let mut lower = Array1::<f64>::from_elem(theta_dim, -crate::estimate::RHO_BOUND);
+                let mut upper = Array1::<f64>::from_elem(theta_dim, crate::estimate::RHO_BOUND);
+                for k in 0..rho_lower.len().min(theta_dim) {
+                    lower[k] = rho_lower[k];
+                    upper[k] = rho_upper[k];
+                }
+                (lower, upper)
+            };
             let problem = OuterProblem::new(theta_dim)
                 .with_gradient(Derivative::Analytic)
                 .with_hessian(DeclaredHessianForm::Either)
@@ -1550,7 +1548,7 @@ where
                 .with_seed_config(reml_seed_config_mix)
                 .with_screening_cap(Arc::clone(&reml_state.screening_max_inner_iterations))
                 .with_outer_inner_cap(reml_inner_progress_feedback(&reml_state))
-                .with_rho_bound(crate::estimate::RHO_BOUND);
+                .with_bounds(link_lower, link_upper);
             let problem = if let Some(h) = heuristic_theta_ref {
                 problem.with_heuristic_lambdas(h.to_vec())
             } else {
@@ -1825,6 +1823,11 @@ where
             );
             // Same exact-seed cache publish/consume symmetry as the standard
             // REML arm above (issue #236).
+            let obj = obj.with_criterion_resolution(
+                |state: &mut &mut crate::estimate::reml::RemlState<'_>| {
+                    state.criterion_resolution()
+                },
+            );
             let mut obj = obj.with_seed_inner_state(with_reml_beta_seed_hook());
             let outer_result = problem.run(&mut obj, "mixture/SAS flexible link")?;
             drop(obj);
@@ -1927,8 +1930,9 @@ where
             // not silently set the theta fixed-point threshold.
             let theta_bound = reml_tol;
 
-            let rho_lower = Array1::from_elem(final_rho.len(), -crate::estimate::RHO_BOUND);
-            let rho_upper = Array1::from_elem(final_rho.len(), crate::estimate::RHO_BOUND);
+            // The box the certificate searched: the derived ρ domain (#2812),
+            // so a coordinate on a derived edge is scored as railed here too.
+            let (rho_lower, rho_upper) = reml_state.resolvability_rho_domain();
             // Judged against `certificate.stationarity.bound()` just below, so
             // it must be projected against the box that certificate used
             // (#2412) — otherwise a railed coordinate's outward pull is scored
@@ -2259,9 +2263,11 @@ where
     let mut beta_covariance_frequentist = None;
     let mut coefficient_influence = None;
     let mut weighted_gram = None;
+    let mut bias_correction_jacobian = None;
     // Factorization of stabilized Hessian in transformed basis, reused for
     // SE computation via solve-on-demand after dispersion is determined.
     let mut edf_factor: Option<Box<dyn FactorizedSystem>> = None;
+    let mut bias_correction_beta = None;
     let mut rho_posterior_certificate = None;
     let mut rho_posterior_escalation = None;
     // Hold the governor charge across every dense inference allocation in this
@@ -2470,6 +2476,43 @@ where
             }
         }
 
+        if opts.compute_inference {
+            // O(n⁻¹) frequentist bias correction vector b̂ =
+            // H⁻¹ S(λ̂)(β̂ - μ). This is an inference product, unlike the
+            // posterior-identity solves that constrained fits need regardless
+            // of whether standard errors were requested.
+            let beta_t = pirls_res.beta_transformed.as_ref();
+            let mut s_beta_t = Array1::<f64>::zeros(p_dim);
+            for (kk, cp) in pirls_res
+                .reparam_result
+                .canonical_transformed
+                .iter()
+                .enumerate()
+            {
+                let r = &cp.col_range;
+                let local = cp.local_ref();
+                let beta_block = beta_t.slice(ndarray::s![r.clone()]);
+                let centered = &beta_block - &cp.prior_mean;
+                let local_beta = local.dot(&centered);
+                let lam_k = lambdas[kk];
+                let mut acc = s_beta_t.slice_mut(ndarray::s![r.clone()]);
+                acc.scaled_add(lam_k, &local_beta);
+            }
+            let b_t = factor.solve(&s_beta_t).map_err(|reason| {
+                EstimationError::RemlOptimizationFailed(format!(
+                    "exact bias-correction solve failed: {reason}"
+                ))
+            })?;
+            certify_factorized_inference_vector_solve(h, &s_beta_t, &b_t, "bias correction")?;
+            let qs = &pirls_res.reparam_result.qs;
+            let b_orig = qs.dot(&b_t);
+            if b_orig.iter().any(|value| !value.is_finite()) {
+                return Err(EstimationError::RemlOptimizationFailed(
+                    "bias-correction basis map produced non-finite coefficients".to_string(),
+                ));
+            }
+            bias_correction_beta = Some(b_orig);
+        }
         // Preserve the factorization for solve-on-demand SE and covariance
         // computation below, after dispersion has been determined.
         edf_factor = Some(factor);
@@ -2681,8 +2724,8 @@ where
         (outer_result.final_value, Array1::zeros(0), 0.0)
     } else {
         let (value, gradient) = reml_state.compute_cost_and_gradient(&final_rho)?;
-        let lower = Array1::from_elem(final_rho.len(), -crate::estimate::RHO_BOUND);
-        let upper = Array1::from_elem(final_rho.len(), crate::estimate::RHO_BOUND);
+        // The certificate's own box: the derived ρ domain (#2812).
+        let (lower, upper) = reml_state.resolvability_rho_domain();
         // Shipped as the result's `final_grad_norm` and reported in the
         // refusal below, so it uses the certificate's rail-relaxed box (#2412)
         // -- the same projection the certified |Pg| was measured with, even
@@ -2906,6 +2949,14 @@ where
             let mut s_mat = qs.dot(&s_t).dot(&qs.t());
             gam_linalg::matrix::symmetrize_in_place(&mut s_mat);
 
+            // The frequentist bias-corrected coefficient used by prediction is
+            // β_BC = β̂ + b̂ with b̂ = H⁻¹S(β̂ - μ) at fixed smoothing
+            // parameters. Its fixed-ρ linearization with respect to β̂ is
+            // A = I + H⁻¹S. Credible bands centered at β_BC must use the
+            // covariance of that same estimator, A V Aᵀ; otherwise the center is
+            // debiased but the reported uncertainty remains for the shrunken
+            // penalized mode β̂, producing severely over-narrow bands on heavily
+            // smoothed large-scale Duchon fits (#1870).
             // X'WX = H − S(λ) in the original basis — the genuine PSD weighted
             // Gram, reconstructed from the same `penalized_hessian` and `s_mat`
             // that define `F = H⁻¹X'WX` (issue #1027). Stored directly so the
@@ -2971,6 +3022,26 @@ where
                 ))
             })?;
 
+            // The frequentist bias-corrected coefficient used by prediction is
+            // β_BC = β̂ + b̂ with b̂ = H⁻¹S(β̂ - μ) at fixed smoothing
+            // parameters. Its fixed-ρ linearization with respect to β̂ is
+            // A = I + H⁻¹S. Credible bands centered at β_BC must use the
+            // covariance of that same estimator, A V Aᵀ; otherwise the center is
+            // debiased but the reported uncertainty remains for the shrunken
+            // penalized mode β̂, producing severely over-narrow bands on heavily
+            // smoothed large-scale Duchon fits (#1870).
+            //
+            // `A = I + H⁻¹S = 2I − F` exactly, since `F = I − H⁻¹S`. Deriving
+            // it from `F` rather than from a second product keeps the Jacobian
+            // and the influence matrix on the identical `H⁻¹S`, and inherits
+            // the solve's accuracy instead of the inverse's amplification.
+            let mut bc_jac = f_mat.clone();
+            bc_jac *= -1.0;
+            for diagonal in 0..p_cov {
+                bc_jac[[diagonal, diagonal]] += 2.0;
+            }
+            bias_correction_jacobian = Some(bc_jac);
+
             // Frequentist covariance Ve = H⁻¹·X'WX·H⁻¹·φ = φ·H⁻¹·Fᵀ (the
             // sandwich is symmetric, so `F·H⁻¹ = (H⁻¹·Fᵀ)`). Solving
             // `H·Z = Fᵀ` instead of multiplying `F·H⁻¹` gives the companion
@@ -3011,48 +3082,6 @@ where
         // stays unscaled.
         if beta_covariance_unscaled.is_some() {
             let no_outer_gradient = Array1::<f64>::zeros(0);
-            // #2748 -- THE RESOLUTION THE CERTIFICATE'S VERDICT WAS TAKEN AT.
-            //
-            // When the certificate admits a `psd = false` it does so by its
-            // gradient-residue floor, and the definiteness test behind that
-            // clearance is taken at a SHIFT: the larger of the measured
-            // `‖δH‖₂` and the arithmetic `√ε·max(max|H_ii|, 1)`. The second is
-            // what decides whenever no identity could be measured, and on a
-            // ρ-Hessian whose largest diagonal is under 1 it is a flat
-            // `1.490116e-8`.
-            //
-            // `invert_identified_rho_hessian` is about to re-judge the SAME
-            // direction at the SAME point, and derives its own resolution from
-            // its eigensolver's backward error -- `2.191651e-16` on the
-            // measured `geo_disease` k=12 cell, eight orders tighter. It then
-            // refused a direction (`λ_min(H+diag|g|) = -1.129942e-8`) the
-            // certificate had cleared, and the fit died between the two layers
-            // with "this is a genuine contradiction". It is not a contradiction;
-            // it is two standards. A verdict and the standard it was taken at
-            // have to travel together.
-            //
-            // Only a clearance that actually CLEARED contributes: a refusal
-            // carries no admission for this site to honour.
-            //
-            // Narrow on purpose: only a certificate whose curvature evidence is
-            // a MEASURED `psd = false` had a negative direction to admit, and
-            // only then is its clearance load-bearing. A fit whose Hessian is
-            // PSD outright cleared nothing, so it publishes nothing and this
-            // site's resolution is bit-unchanged — the widening reaches exactly
-            // the fits where the two layers can disagree, and no others.
-            let certificate_clearance_resolution = outer_result
-                .criterion_certificate
-                .as_ref()
-                .filter(|certificate| {
-                    matches!(
-                        certificate.curvature,
-                        crate::rho_optimizer::CurvatureEvidence::Measured { psd: false }
-                    )
-                })
-                .and_then(|certificate| certificate.curvature_floor)
-                .filter(|clearance| clearance.cleared)
-                .map(|clearance| clearance.decided_at_resolution)
-                .filter(|value| value.is_finite() && *value > 0.0);
             let measured_hessian_error: Vec<
                 gam_linalg::curvature_resolution::MeasuredHessianError,
             > = outer_result
@@ -3068,17 +3097,6 @@ where
                     )]
                 })
                 .unwrap_or_default();
-            let measured_hessian_error: Vec<
-                gam_linalg::curvature_resolution::MeasuredHessianError,
-            > = measured_hessian_error
-                .into_iter()
-                .chain(certificate_clearance_resolution.map(|value| {
-                    gam_linalg::curvature_resolution::MeasuredHessianError::new(
-                        "outer-certificate curvature-verdict shift (the resolution its own PSD                          test cleared this direction at)",
-                        value,
-                    )
-                }))
-                .collect();
             let smoothing_outcome = reml_state.compute_smoothing_correction_auto(
                 &final_rho,
                 &lambdas,
@@ -3095,16 +3113,6 @@ where
                     .final_gradient
                     .as_ref()
                     .unwrap_or(&no_outer_gradient),
-                // #2748: the rho-Hessian the CERTIFICATE judged, so the
-                // correction can measure how far its own fresh assembly of the
-                // same object at the same point is from it. The gate inside
-                // re-judges a direction the certificate has already cleared;
-                // two assemblies of one mixed-partial object must agree, and
-                // the amount by which they do not is a measured component of
-                // the resolution that re-judgement is entitled to spend. Absent
-                // on a solver that tracks no Hessian, which is an absent
-                // measurement rather than a zero.
-                outer_result.final_hessian.as_ref(),
                 // #2748: the outer certificate does not only accept or refuse
                 // this point -- when it disputes a negative curvature it
                 // EVALUATES the criterion along that direction, and the
@@ -3478,6 +3486,12 @@ where
                 };
                 match truncation {
                     Ok(()) => {
+                        // Persist covariance of β, matching the conditional
+                        // covariance and the reported coefficient frame. The
+                        // frequentist bias transformation A·V·Aᵀ belongs to a
+                        // prediction that actually requests the matching A·β
+                        // centre; applying it here changes every marginal band,
+                        // including apply_bias_correction=false (#1561).
                         gam_linalg::matrix::symmetrize_in_place(&mut corrected);
                         Some(corrected)
                     }
@@ -3512,7 +3526,7 @@ where
                 // nothing else, so the refusal cannot say which of the three
                 // producers summed into this diagonal overran, or by how much.
                 // The matrix being read is
-                //     Σ = φH⁻¹  −  GΔGᵀ  +  J V_ρ Jᵀ   (then optionally A·Σ·Aᵀ)
+                //     Σ = truncate(φH⁻¹ + smoothing correction)
                 // and only the first term is accurate to floating point. Print
                 // the decomposition of the offending entry against each
                 // producer's OWN declared resolution.
@@ -3568,6 +3582,8 @@ where
         beta_covariance_frequentist,
         coefficient_influence,
         weighted_gram,
+        bias_correction_beta,
+        bias_correction_jacobian,
     });
 
     let pirls_status = pirls_res.status;
@@ -3946,4 +3962,3 @@ mod negative_binomial_joint_certificate_tests {
     }
 
 }
-

@@ -5,7 +5,7 @@
 //! residual rows by energy with one-shot's deterministic tie-break, and both
 //! used to carry a private copy of this type (#2470). The capacity is the
 //! caller's: `K` for revival (at most one atom per row, at most `K` dead
-//! atoms) and `k_aux · b` for block births. Peak memory is `cap × P` f32 —
+//! atoms) and `k_aux · b` for block births. Peak memory is `cap × P` values in the residual's native precision —
 //! never `N × K`.
 
 use super::update::DEAD_DENOM;
@@ -17,19 +17,19 @@ use std::collections::BinaryHeap;
 /// MOST-evictable entry (smallest energy, ties broken toward the larger global
 /// index) — that keeps the reservoir holding the worst-reconstructed rows with
 /// one-shot's deterministic tie-break (descending energy, ascending row index).
-pub(super) struct ResidRow {
+pub(super) struct ResidRow<T> {
     pub(super) norm2: f64,
     pub(super) global_index: u64,
-    pub(super) residual: Vec<f32>,
+    pub(super) residual: Vec<T>,
 }
 
-impl PartialEq for ResidRow {
+impl<T> PartialEq for ResidRow<T> {
     fn eq(&self, other: &Self) -> bool {
         self.norm2 == other.norm2 && self.global_index == other.global_index
     }
 }
-impl Eq for ResidRow {}
-impl Ord for ResidRow {
+impl<T> Eq for ResidRow<T> {}
+impl<T> Ord for ResidRow<T> {
     fn cmp(&self, other: &Self) -> Ordering {
         // "Greater" == more evictable == smaller residual energy, then larger
         // global index. `total_cmp` keeps this total and NaN-free (norms are
@@ -40,19 +40,19 @@ impl Ord for ResidRow {
         }
     }
 }
-impl PartialOrd for ResidRow {
+impl<T> PartialOrd for ResidRow<T> {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         Some(self.cmp(other))
     }
 }
 
 /// Bounded reservoir of the worst-reconstructed rows seen this epoch.
-pub(super) struct ResidualReservoir {
+pub(super) struct ResidualReservoir<T> {
     cap: usize,
-    heap: BinaryHeap<ResidRow>,
+    heap: BinaryHeap<ResidRow<T>>,
 }
 
-impl ResidualReservoir {
+impl<T> ResidualReservoir<T> {
     pub(super) fn new(cap: usize) -> Self {
         Self {
             cap: cap.max(1),
@@ -62,7 +62,7 @@ impl ResidualReservoir {
 
     /// Offer a row's residual to the reservoir. Rows already reconstructed (energy
     /// at or below the dead floor) can seed nothing and are dropped.
-    pub(super) fn offer(&mut self, norm2: f64, global_index: u64, residual: Vec<f32>) {
+    pub(super) fn offer(&mut self, norm2: f64, global_index: u64, residual: Vec<T>) {
         if norm2 <= DEAD_DENOM {
             return;
         }
@@ -93,8 +93,8 @@ impl ResidualReservoir {
     /// Rows ranked worst-first: descending residual energy, ties by ascending
     /// global index — the one-shot `revive_dead_atoms` /
     /// `dead_block_birth_proposals` order.
-    pub(super) fn ranked(&self) -> Vec<&ResidRow> {
-        let mut rows: Vec<&ResidRow> = self.heap.iter().collect();
+    pub(super) fn ranked(&self) -> Vec<&ResidRow<T>> {
+        let mut rows: Vec<&ResidRow<T>> = self.heap.iter().collect();
         rows.sort_by(|a, b| {
             b.norm2
                 .total_cmp(&a.norm2)

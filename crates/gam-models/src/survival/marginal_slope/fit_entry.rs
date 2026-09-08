@@ -634,8 +634,11 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
         }
         if influence_absorber_residualized.is_some() {
             // The absorber's single learned ridge sits at the trailing extra
-            // slot; its natural scale centres its resolution-derived outer domain.
-            out.push(crate::marginal_slope_orthogonal::influence_absorber_log_lambda(n));
+            // slot; the seed is clamped into the outer ρ box.
+            out.push(
+                crate::marginal_slope_orthogonal::influence_absorber_log_lambda(n)
+                    .clamp(-12.0, 12.0),
+            );
         }
         out
     };
@@ -657,6 +660,54 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
         ));
         seeds
     };
+    // The ρ domain per coordinate, in the layout the seeds above use: the time
+    // block's penalties against its exit design, the marginal and slope blocks
+    // against their own designs, the prepared extra blocks against theirs, and
+    // the absorber ridge on the precision box (#2812).
+    let rho_domain = {
+        let mut lower = Vec::with_capacity(core_rho0_seed.len() + extra_rho0.len());
+        let mut upper = Vec::with_capacity(core_rho0_seed.len() + extra_rho0.len());
+        let (lo, hi) = crate::fit_orchestration::drivers::penalized_block_rho_domain(
+            &spec.time_block.design_exit,
+            spec.time_block.penalties.iter(),
+        );
+        lower.extend(lo);
+        upper.extend(hi);
+        for design in [&marginal_design, &slope_design] {
+            let (lo, hi) = crate::fit_orchestration::drivers::joint_rho_resolvability_domain(
+                &design.design,
+                &design.penalties,
+                design.penalties.len(),
+            );
+            lower.extend(lo.iter().copied());
+            upper.extend(hi.iter().copied());
+        }
+        let mut extra_blocks: Vec<(&DesignMatrix, Vec<Array2<f64>>)> = Vec::new();
+        if let Some(prepared) = score_warp_prepared.as_ref() {
+            extra_blocks.push((
+                &prepared.block.design,
+                prepared.block.penalties.iter().map(|p| p.to_dense()).collect(),
+            ));
+        }
+        if let Some(prepared) = link_dev_prepared.as_ref() {
+            extra_blocks.push((
+                &prepared.block.design,
+                prepared.block.penalties.iter().map(|p| p.to_dense()).collect(),
+            ));
+        }
+        for (design, dense) in &extra_blocks {
+            let (lo, hi) =
+                crate::fit_orchestration::drivers::penalized_block_rho_domain(design, dense.iter());
+            lower.extend(lo);
+            upper.extend(hi);
+        }
+        if influence_absorber_residualized.is_some() {
+            let (lo, hi) = gam_problem::precision_box();
+            lower.push(lo);
+            upper.push(hi);
+        }
+        Some((Array1::from_vec(lower), Array1::from_vec(upper)))
+    };
     let setup = joint_setup(
         data,
         time_penalties_len,
@@ -666,6 +717,7 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
         slope_design.penalties.len(),
         &core_rho0_seed,
         &extra_rho0,
+        rho_domain,
         &baseline_initial_theta,
         &baseline_lower_theta,
         &baseline_upper_theta,

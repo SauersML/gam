@@ -953,11 +953,7 @@ impl<K: Eq + Hash + Clone, V: Clone + ResidentBytes> ByteLruCache<K, V> {
         }
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         key.hash(&mut hasher);
-        let shard_count =
-            u64::try_from(self.shards.len()).expect("shard count must fit in u64");
-        let shard = usize::try_from(hasher.finish() % shard_count)
-            .expect("shard index is bounded by the usize shard count");
-        &self.shards[shard]
+        &self.shards[(hasher.finish() as usize) % self.shards.len()]
     }
 
     pub fn get(&self, key: &K) -> Option<V> {

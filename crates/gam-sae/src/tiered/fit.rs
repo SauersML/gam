@@ -63,13 +63,24 @@ use crate::tiered::code_space::{
     CodeSpacePromotionReport, harvest_code_space_promotions, linear_distortion_floor,
 };
 
+/// Serial farthest-point block seed budget in element-ops (`N·P·G·b`). Above this
+/// the `O(N·P·K)` corpus pass dominates the whole Tier-1 fit (measured to be the
+/// scaling wall at `K ≈ 1e4`, unrelated to routing), so [`TieredSeedPolicy::Auto`]
+/// switches to the `O(K·b)` coordinate-partition seed. Below it the data-aware
+/// farthest-point seed is affordable and gives the more coherent starting blocks.
+const FARTHEST_POINT_SEED_MAX_OPS: u128 = 1_000_000_000;
+
 /// How Tier-1 seeds its `K = G·b` block frames. The default [`Auto`] keeps the
-/// seed data-placed at every width using the linear-cost data-row construction.
+/// data-aware farthest-point seed at small/moderate `K` and switches to the cheap
+/// coordinate-partition seed once the serial farthest-point pass would dominate —
+/// the "Tier-1 K>small" entry that makes a `K ≈ 1e4` tiered fit tractable end to end
+/// without a caller flag (#2023).
 ///
 /// [`Auto`]: TieredSeedPolicy::Auto
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum TieredSeedPolicy {
-    /// Use the scalable data-row seed.
+    /// Pick by the farthest-point seed cost `N·P·G·b` against
+    /// `FARTHEST_POINT_SEED_MAX_OPS`.
     #[default]
     Auto,
     /// Force the data-aware farthest-point seed regardless of `K`.
@@ -79,14 +90,23 @@ pub enum TieredSeedPolicy {
 }
 
 impl TieredSeedPolicy {
-    /// Resolve to a concrete [`BlockSeedPolicy`]. Since #2023 the choice no
-    /// longer depends on the corpus size or the block geometry: `Auto` is the
-    /// data-row seed at every width.
-    fn resolve(self) -> BlockSeedPolicy {
+    /// Resolve to a concrete [`BlockSeedPolicy`] for a corpus of `n` rows and the
+    /// Tier-1 block geometry (`G` blocks of size `b` in `ℝ^P`).
+    fn resolve(self, n: usize, p: usize, config: &BlockSparseConfig) -> BlockSeedPolicy {
         match self {
-            TieredSeedPolicy::Auto => BlockSeedPolicy::DataRows,
             TieredSeedPolicy::FarthestPoint => BlockSeedPolicy::FarthestPoint,
             TieredSeedPolicy::CoordinatePartition => BlockSeedPolicy::CoordinatePartition,
+            TieredSeedPolicy::Auto => {
+                let ops = (n as u128)
+                    * (p as u128)
+                    * (config.n_blocks as u128)
+                    * (config.block_size as u128);
+                if ops > FARTHEST_POINT_SEED_MAX_OPS {
+                    BlockSeedPolicy::CoordinatePartition
+                } else {
+                    BlockSeedPolicy::FarthestPoint
+                }
+            }
         }
     }
 }
@@ -156,8 +176,8 @@ pub struct TieredFitConfig {
     /// block-gate lane when the mode admits it and a runtime is present.
     pub tier1: BlockSparseConfig,
     /// How Tier-1 seeds its `K` block frames. [`TieredSeedPolicy::Auto`] (default)
-    /// uses the data-row seed, so a `K ≈ 1e4` fit is both linear-cost and
-    /// data-placed from its first routing pass.
+    /// switches to the cheap coordinate-partition seed once the serial
+    /// farthest-point pass would dominate, so a `K ≈ 1e4` tiered fit runs end to end.
     pub tier1_seed: TieredSeedPolicy,
     /// Whether to run the Tier-2 curved refinement on the Tier-1 residual
     /// (`false` ⇒ Tier-0 + Tier-1 only, the linear-bulk baseline).
@@ -265,9 +285,9 @@ pub struct LinearPeelState {
     /// Tier-0 shared mean `μ`, length `P`.
     pub mean: Array1<f64>,
     /// Frozen Tier-1 block frames, `K×P` (`K = G·b`).
-    pub decoder: Array2<f32>,
+    pub decoder: Array2<f64>,
     /// Tier-1's tied encoder scalar `γ`.
-    pub gamma: f32,
+    pub gamma: f64,
     /// Block size `b`.
     pub block_size: usize,
     /// Block routing budget `k`.
@@ -287,8 +307,8 @@ pub struct LinearPeelState {
 /// be charting a residual the deployed model can never reproduce.
 fn route_linear_bulk(
     mean: &Array1<f64>,
-    decoder: ArrayView2<'_, f32>,
-    gamma: f32,
+    decoder: ArrayView2<'_, f64>,
+    gamma: f64,
     block_size: usize,
     block_topk: usize,
     block_tile: usize,
@@ -302,9 +322,8 @@ fn route_linear_bulk(
         ));
     }
     let centered = &z - &mean.view().insert_axis(Axis(0));
-    let centered_f32 = centered.mapv(|value| value as f32);
     let (blocks, _gates, codes) = block_sparse_dictionary_transform(
-        centered_f32.view(),
+        centered.view(),
         decoder,
         gamma,
         block_size,
@@ -312,7 +331,7 @@ fn route_linear_bulk(
         block_tile,
     )?;
     let linear = reconstruct_block_sparse_rows(decoder, blocks.view(), codes.view(), block_size)?;
-    Ok(linear.mapv(|value| value as f64))
+    Ok(linear)
 }
 
 impl LinearPeelState {
@@ -396,15 +415,14 @@ pub fn fit_linear_peel(
     // Tier 0: peel the shared mean; the bulk is fit on R0 = z − μ.
     let tier0 = Tier0Mean::fit(z)?;
     let r0 = tier0.apply(z)?;
-    let r0_f32 = r0.mapv(|value| value as f32);
 
     // Tier 1: block-sparse collapsed-linear bulk on the de-meaned residual. The
     // seed policy resolves against the corpus size + block geometry so a K≈1e4 bulk
     // skips the serial O(N·P·K) farthest-point pass (the large-K entry, #2023).
     let seed_policy = config
         .tier1_seed
-        .resolve();
-    let tier1 = fit_block_sparse_dictionary_with_seed(r0_f32.view(), &config.tier1, seed_policy)?;
+        .resolve(r0.nrows(), r0.ncols(), &config.tier1);
+    let tier1 = fit_block_sparse_dictionary_with_seed(r0.view(), &config.tier1, seed_policy)?;
 
     let (n_obs, output_dim) = r0.dim();
     let linear = route_linear_bulk(
@@ -992,6 +1010,24 @@ mod fit_tests {
     use super::*;
     use ndarray::Array2;
 
+    fn assert_block_certificate(c: &crate::sparse_dict::BlockSparseConvergence, tolerance: f64) {
+        assert_eq!(c.tolerance, tolerance);
+        assert_eq!(c.accepted_births, 0);
+        assert_eq!(c.polar_failures, 0);
+        for residual in [
+            c.ev_residual,
+            c.gamma_residual,
+            c.frame_residual,
+            c.routing_residual,
+            c.reconstruction_residual,
+        ] {
+            assert!(
+                residual.is_finite() && residual <= tolerance,
+                "open certificate: {c:?}"
+            );
+        }
+    }
+
     /// Two planted linear directions in P=6; the tiered driver runs end to end,
     /// returns a finite composed EV, and performs zero PC reseeds.
     #[test]
@@ -1028,40 +1064,12 @@ mod fit_tests {
         // Tier-0 mean captured the +1 / -0.5 offsets it was given.
         assert!(report.tier0.mean.iter().all(|m| m.is_finite()));
         assert!(report.tier2.is_none(), "linear_bulk disables Tier-2");
-        // #2275/#2825: K=6 over ~2 planted planes is over-complete, and this fit used
-        // to reach only an EV plateau with the frame residual pinned open. That was a
-        // property of a SUPPORT STEP THAT WAS NOT A DESCENT STEP — the top-k gate rule
-        // is the exact minimiser of the tied loss only for mutually orthogonal
-        // projectors, so on an over-complete dictionary it could raise the objective
-        // the frame and γ steps lower, and a fixed point it never descended toward
-        // could not be certified. With the support step admitting a block only when
-        // that block lowers the row's loss, the frame residual closes to 2.6e-8
-        // against the same untouched 1e-6 tolerance.
-        assert!(
-            report.tier1.convergence.certified,
-            "an over-complete linear-bulk fit must now CERTIFY; got certified=false, frame_residual={} tol={}",
-            report.tier1.convergence.frame_residual, report.tier1.convergence.tolerance
-        );
-        assert!(
-            report.tier1.convergence.frame_residual <= report.tier1.convergence.tolerance,
-            "a certified fit must report frame_residual at or below tolerance; got {} > {}",
-            report.tier1.convergence.frame_residual,
-            report.tier1.convergence.tolerance
-        );
+        assert_block_certificate(&report.tier1.convergence, config.tier1.tolerance);
     }
 
-    /// #2275/#2825: at `K ≫ intrinsic-rank` this fit was read as legitimately
-    /// un-certifiable — ~`K − rank` blocks are structurally spurious, AuxK revival
-    /// churns their frames, and `frame_residual` sat above tolerance however many
-    /// epochs it was given. That reading was wrong about its own cause. The support
-    /// step ranked blocks by `‖P_g x‖` and took the top `k`, which minimises the tied
-    /// loss ONLY for mutually orthogonal projectors; over-complete blocks overlap, so
-    /// the step could raise the objective the frame and γ steps lower and the
-    /// alternation had no fixed point to converge to. With the support step descending
-    /// that objective the fit CERTIFIES, and Tier-2 — which used to fail its own
-    /// support-sparse fixed point on this residual — converges too.
+    /// Overcomplete Tier-1 must converge before Tier-2 consumes its residual.
     #[test]
-    fn tiered_certifies_at_k_gg_rank_once_the_support_step_descends_2275_2825() {
+    fn tiered_returns_closed_certificate_at_k_gg_rank_2275() {
         // Rank-1 planted structure (a single direction in cols 0,1) in P=8, fit with
         // K = G·b = 16 blocks of size b=1: ~15 blocks are structurally spurious.
         let n = 96usize;
@@ -1074,80 +1082,37 @@ mod fit_tests {
         }
         let mut config = TieredFitConfig::tiered(16, 1); // K=16 ≫ intrinsic rank
         config.tier1.block_topk = 4;
-        config.tier1.aux_k = 4; // revival ON: spurious frames churn -> cannot certify
+        config.tier1.aux_k = 4; // Births must settle before certification.
         config.tier1.max_epochs = 40;
-        // Tier-2 is only a witness that Tier-1's fit still reaches the
+        // Tier-2 is a witness that converged Tier-1 reaches the
         // curved lane. Use the smallest overcomplete dictionary instead of the
         // production default; K=P+4 preserves K>P without importing unrelated
-        // support conditioning into this trichotomy test.
+        // support conditioning into this convergence test.
         config.tier2.n_atoms = p + 4;
         config.tier2.support_k = 1;
 
-        // The objective plateaus, so the tiered fit RETURNS instead of erroring — that
-        // IS the #2275 acceptance criterion.
         let report = fit_tiered(z.view(), &config)
-            .expect("#2275: the tiered fit must RETURN at K ≫ rank, not error");
-
-        // #2825: this fit now CERTIFIES. The open certificate was not a property of
-        // `K ≫ rank` — it was a property of a support step that could raise the very
-        // objective the frame and γ steps lower, so the alternation had no fixed point
-        // to reach. With the support step descending that objective the frame residual
-        // closes to 1.1e-7 against the same untouched 1e-6 tolerance.
-        assert!(
-            report.tier1.convergence.certified,
-            "K ≫ rank fit must now CERTIFY; got certified=false (frame_residual={}, tol={})",
-            report.tier1.convergence.frame_residual, report.tier1.convergence.tolerance
-        );
-        assert!(
-            report.tier1.convergence.frame_residual <= report.tier1.convergence.tolerance,
-            "a certified fit must report frame_residual at or below tolerance; got {} > {}",
-            report.tier1.convergence.frame_residual,
-            report.tier1.convergence.tolerance
-        );
-        // The EV residual is RECORDED (finite) whether or not it reached the absolute
-        // tolerance; the frame certificate above is what decides convergence, and
-        // "no tolerance softening" is pinned by the exact-tolerance assertion below.
-        assert!(
-            report.tier1.convergence.ev_residual.is_finite(),
-            "the plateaued objective residual must be recorded (finite); got {}",
-            report.tier1.convergence.ev_residual
-        );
-        assert!(
-            report.tier1.explained_variance.is_finite(),
-            "Tier-1 EV must be finite"
-        );
-        // Tier-2 RAN on the Tier-1 residual — the clobbered contract never
-        // reached it.
+            .expect("overcomplete Tier-1 must converge and reach Tier-2");
+        assert_block_certificate(&report.tier1.convergence, config.tier1.tolerance);
+        assert!(report.tier1.explained_variance.is_finite());
         assert!(
             report.tier2.is_some(),
-            "#2275: Tier-2 must run on the Tier-1 residual"
+            "Tier-2 must run on a converged Tier-1 residual"
         );
-        assert!(
-            report.explained_variance.is_finite(),
-            "composed EV must be finite"
-        );
-        // No tolerance softening: the open certificate is measured against the SAME
-        // configured tolerance, unchanged.
-        assert_eq!(
-            report.tier1.convergence.tolerance, config.tier1.tolerance,
-            "#2275 must NOT soften tolerance; the open certificate uses the configured tol"
-        );
+        assert!(report.explained_variance.is_finite());
     }
 
-    /// #2275/#2825: at `K ≫ intrinsic-rank` the block entry now returns a CERTIFIED
-    /// fit. The frame fixed-point residual an over-complete frame was said to be unable
-    /// to reach was reachable all along; what could not reach it was an alternation
-    /// whose support step was not a descent step on the shared objective.
+    /// The public overcomplete block entry must return a closed certificate.
     #[test]
-    fn block_sparse_fixed_point_certifies_once_the_support_step_descends_2275_2825() {
+    fn block_sparse_overcomplete_fit_returns_closed_certificate_2275() {
         use crate::sparse_dict::{
             BlockSeedPolicy, BlockSparseConfig, fit_block_sparse_dictionary_with_seed,
         };
         let n = 96usize;
         let p = 8usize;
-        let mut x = Array2::<f32>::zeros((n, p));
+        let mut x = Array2::<f64>::zeros((n, p));
         for i in 0..n {
-            let t = (i as f32) * 0.2;
+            let t = (i as f64) * 0.2;
             x[[i, 0]] = t.cos();
             x[[i, 1]] = t.sin();
         }
@@ -1161,32 +1126,8 @@ mod fit_tests {
             &config,
             BlockSeedPolicy::FarthestPoint,
         )
-        .expect("#2275: the block entry must RETURN the converged fit");
-        let c = &fit.convergence;
-        // #2825: the block entry now certifies this fit. See the two tiered cases
-        // above — the open certificate measured a support step that was not a descent
-        // step, not an over-complete frame that cannot reach a fixed point.
-        assert!(
-            c.certified,
-            "a K ≫ rank fit must now CERTIFY; got certified=false (frame_residual={}, tol={})",
-            c.frame_residual, c.tolerance
-        );
-        assert!(
-            c.frame_residual <= c.tolerance,
-            "a certified fit must report frame_residual at or below tolerance; got {} > {}",
-            c.frame_residual,
-            c.tolerance
-        );
-        assert!(
-            c.ev_residual.is_finite(),
-            "the plateaued objective residual must be recorded (finite); got {}",
-            c.ev_residual
-        );
-        // No tolerance softening: the certificate is measured against the configured tol.
-        assert_eq!(
-            c.tolerance, config.tolerance,
-            "#2275 must NOT soften tolerance"
-        );
+        .expect("the overcomplete block entry must converge");
+        assert_block_certificate(&fit.convergence, config.tolerance);
     }
 
     /// Small deterministic two-circle corpus shared by the Tier-2 path tests.
@@ -1336,31 +1277,35 @@ mod fit_tests {
         assert_eq!(report.ledger.pc_reseed_events, 0);
     }
 
-    /// `TieredSeedPolicy::Auto` is data-placed without a serial farthest-point
-    /// search at both small and large `K`.
+    /// `TieredSeedPolicy::Auto` keeps the data-aware farthest-point seed at small
+    /// `K` and switches to the cheap coordinate-partition seed once the serial
+    /// `N·P·G·b` pass would blow the budget — the "Tier-1 K>small" entry decision.
     #[test]
-    fn auto_seed_is_scalable_and_data_placed_at_every_width_2023() {
+    fn auto_seed_switches_at_the_farthest_point_budget() {
+        // Small geometry (well under the 1e9-op budget) → farthest-point.
         let small = TieredFitConfig::linear_bulk(8, 2);
         assert_eq!(
-            small.tier1_seed.resolve(),
-            BlockSeedPolicy::DataRows
+            small.tier1_seed.resolve(240, 16, &small.tier1),
+            BlockSeedPolicy::FarthestPoint,
+            "small-K tiered fit must keep the data-aware seed"
         );
+        // K≈1e4 at the #2023 target width (N=1e5, P=64) → N·P·G·b ≫ 1e9 → cheap seed.
         let large = TieredFitConfig::linear_bulk(2_500, 4);
         assert_eq!(
-            large.tier1_seed.resolve(),
-            BlockSeedPolicy::DataRows,
-            "large-K tiered fit must remain data-placed"
+            large.tier1_seed.resolve(100_000, 64, &large.tier1),
+            BlockSeedPolicy::CoordinatePartition,
+            "large-K tiered fit must switch to the coordinate-partition seed"
         );
-        // Explicit overrides remain available for controlled comparisons.
+        // Explicit overrides ignore the budget.
         let mut forced = TieredFitConfig::linear_bulk(2_500, 4);
         forced.tier1_seed = TieredSeedPolicy::FarthestPoint;
         assert_eq!(
-            forced.tier1_seed.resolve(),
+            forced.tier1_seed.resolve(100_000, 64, &forced.tier1),
             BlockSeedPolicy::FarthestPoint
         );
         forced.tier1_seed = TieredSeedPolicy::CoordinatePartition;
         assert_eq!(
-            forced.tier1_seed.resolve(),
+            forced.tier1_seed.resolve(240, 16, &forced.tier1),
             BlockSeedPolicy::CoordinatePartition
         );
     }

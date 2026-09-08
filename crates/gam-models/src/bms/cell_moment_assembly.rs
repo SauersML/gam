@@ -517,7 +517,7 @@ impl BernoulliMarginalSlopeFamily {
     /// normal-CDF derivative stack at the fixed base index `η_k0 = a0 + s·g·x_k`
     /// is built ONCE — one transcendental pass — and the cheap polynomial
     /// composition repeats per lift grade.
-    fn empirical_rigid_row_nll_jet<S: gam_math::jet_scalar::JetScalar<2>>(
+    fn empirical_rigid_intercept_jet<S: gam_math::jet_scalar::JetScalar<2>>(
         &self,
         row: usize,
         marginal: BernoulliMarginalLinkMap,
@@ -573,9 +573,32 @@ impl BernoulliMarginalSlopeFamily {
             }
             acc
         };
-        let a_jet = gam_math::jet_scalar::filtered_implicit_solve_scalar::<2, S>(
-            a0, inv_fa, lift_iters, constraint,
-        );
+        Ok(
+            gam_math::jet_scalar::filtered_implicit_solve_scalar::<2, S>(
+                a0, inv_fa, lift_iters, constraint,
+            ),
+        )
+    }
+
+    fn empirical_rigid_row_nll_jet<S: gam_math::jet_scalar::JetScalar<2>>(
+        &self,
+        row: usize,
+        marginal: BernoulliMarginalLinkMap,
+        slope: f64,
+        nodes: &[f64],
+        measure_weights: &[f64],
+        lift_iters: usize,
+    ) -> Result<S, String> {
+        let a_jet = self.empirical_rigid_intercept_jet::<S>(
+            row,
+            marginal,
+            slope,
+            nodes,
+            measure_weights,
+            lift_iters,
+        )?;
+        let s = self.probit_frailty_scale();
+        let g_jet = S::variable(slope, 1);
 
         // Observed signed-probit NLL: η = a(m, g) + s·g·z, r = (2y−1)·η,
         // ℓ = −w·logΦ(r), through the SAME signed-probit scalar kernel the
@@ -597,6 +620,88 @@ impl BernoulliMarginalSlopeFamily {
             ));
         }
         Ok(signed.compose_unary(stack))
+    }
+
+    /// Analytic fifth-order implicit differentiation. The known fourth-order
+    /// intercept determines the fifth Bell remainder of every node. The only
+    /// unknown fifth derivative is multiplied by the scalar F_a, so one division
+    /// finishes every symmetric component; no additional root solve is needed.
+    pub(super) fn empirical_rigid_row_fifth_full(
+        &self,
+        row: usize,
+        marginal: BernoulliMarginalLinkMap,
+        slope: f64,
+        nodes: &[f64],
+        measure_weights: &[f64],
+    ) -> Result<[[[[[f64; 2]; 2]; 2]; 2]; 2], String> {
+        if self.weights[row] == 0.0 {
+            return Ok([[[[[0.0; 2]; 2]; 2]; 2]; 2]);
+        }
+        let a = self.empirical_rigid_intercept_jet::<gam_math::jet_tower::Tower4<2>>(
+            row,
+            marginal,
+            slope,
+            nodes,
+            measure_weights,
+            4,
+        )?;
+        let s = self.probit_frailty_scale();
+        let mut fa = 0.0;
+        let mut remainder = [[[[[0.0; 2]; 2]; 2]; 2]; 2];
+        for (&node, &weight) in nodes.iter().zip(measure_weights) {
+            let eta = a.v + s * slope * node;
+            let d = unary_derivatives_normal_cdf(eta);
+            let fifth = (eta.powi(4) - 6.0 * eta * eta + 3.0) * d[1];
+            fa += weight * d[1];
+            let composed = implicit_intercept_fifth_composition(
+                &a,
+                s * node,
+                [d[0], d[1], d[2], d[3], d[4], fifth],
+            );
+            for i in 0..2 {
+                for j in 0..2 {
+                    for k in 0..2 {
+                        for l in 0..2 {
+                            for m in 0..2 {
+                                remainder[i][j][k][l][m] += weight * composed[i][j][k][l][m];
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if !fa.is_finite() || fa <= 0.0 {
+            return Err(format!(
+                "empirical fifth derivative has non-positive calibration Jacobian {fa}"
+            ));
+        }
+        let eta = marginal.eta;
+        let mu5 = (eta.powi(4) - 6.0 * eta * eta + 3.0) * marginal.mu1;
+        remainder[0][0][0][0][0] -= mu5;
+        let sign = 2.0 * self.y[row] - 1.0;
+        let margin = sign * (a.v + s * slope * self.z[row]);
+        let mut stack = signed_probit_neglog_unary_stack_fifth(margin, self.weights[row]);
+        if !stack.iter().all(|x| x.is_finite()) {
+            return Err(format!(
+                "empirical fifth derivative has non-finite likelihood stack at row {row}"
+            ));
+        }
+        for order in [1, 3, 5] {
+            stack[order] *= sign;
+        }
+        let mut fifth = implicit_intercept_fifth_composition(&a, s * self.z[row], stack);
+        for i in 0..2 {
+            for j in 0..2 {
+                for k in 0..2 {
+                    for l in 0..2 {
+                        for m in 0..2 {
+                            fifth[i][j][k][l][m] -= stack[1] * remainder[i][j][k][l][m] / fa;
+                        }
+                    }
+                }
+            }
+        }
+        Ok(fifth)
     }
 
     fn compile_empirical_bms_index_program(
@@ -3011,12 +3116,10 @@ impl BernoulliMarginalSlopeFamily {
             if l_d1 > BMS_DERIV_TOL {
                 let ell0 = l_val - l_d1 * a_rigid_pre_scale;
                 let observed_slope = probit_scale * l_d1 * slope;
-                return Ok(
-                    (marginal.q * (1.0 + observed_slope * observed_slope).sqrt()
-                        / probit_scale
-                        - ell0)
-                        / l_d1,
-                );
+                return Ok((marginal.q * (1.0 + observed_slope * observed_slope).sqrt()
+                    / probit_scale
+                    - ell0)
+                    / l_d1);
             }
         }
         Ok(a_rigid_pre_scale)
@@ -3221,8 +3324,7 @@ impl BernoulliMarginalSlopeFamily {
                 let seed = if ell1 > BMS_DERIV_TOL {
                     let ell0 = l_val_vec[row] - ell1 * a;
                     let observed_slope = probit_scale * ell1 * slope_eta[row];
-                    (m.q * (1.0 + observed_slope * observed_slope).sqrt() / probit_scale
-                        - ell0)
+                    (m.q * (1.0 + observed_slope * observed_slope).sqrt() / probit_scale - ell0)
                         / ell1
                 } else {
                     a
@@ -3725,32 +3827,287 @@ mod empirical_rigid_jet_oracle_tests {
         );
     }
 
-    // ──────────────────────────────────────────────────────────────────────
-    // EXACT tower oracle (#932): the empirical-grid rigid derivative tower,
-    // single-sourced.
-    //
-    // The FD witness above is the *only* guard the hand-written
-    // `empirical_rigid_{primary_grad_hess,third_full,fourth_full}_closed_form`
-    // IFT/Faà-di-Bruno recursion had — and FD is an APPROXIMATION (percent-band
-    // Richardson tolerance, conditioning-limited on the stiffest mggg channel:
-    // the #833 term sat right at the edge of its 1% band). #932 asks for the
-    // tower to be derived MECHANICALLY from a once-written row NLL and pinned to
-    // the production tensors at the exact f64-FMA floor (~1e-9), so a dropped
-    // IFT term cannot hide inside FD truncation.
-    //
-    // This builds a SECOND, fully exact `Tower4<2>` over the primaries (m, g)
-    // that shares NO code with the production closed-forms: the calibrated
-    // intercept `a(m, g)` is recovered by `jet_tower::implicit_solve` (per-order
-    // linear correction of the dense-symmetric-tensor constraint
-    // `F(a, m, g) = −μ(m) + Σ_k π_k Φ(a + s·g·node_k)`), and the row NLL is the
-    // single scalar `ℓ = unary_derivatives_neglog_phi(sign·(a + s·g·z), w)`
-    // composed onto that tower. Both compute the SAME analytic derivatives, so
-    // they must agree to ~1e-9 with no truncation tolerance — the same exact
-    // discipline the standard-normal `rigid` and `empirical_flex` oracles use.
-    // This is the rigid-empirical analogue of `flex_tower_witness`
-    // (`empirical_flex_jet_oracle_tests`) and the BMS rigid std-normal
-    // `tower.t4` cutover, extended to the last hand-derived BMS tower.
+    #[test]
+    fn empirical_fifth_tensor_matches_derivative_of_fourth_979() {
+        let grid = test_grid();
+        for frailty_sd in [None, Some(0.3)] {
+            let family =
+                empirical_family(vec![1.0], vec![0.5], vec![0.8], frailty_sd, grid.clone());
+            let map = |eta| {
+                bernoulli_marginal_link_map(
+                    &InverseLink::Standard(gam_problem::StandardLink::Probit),
+                    eta,
+                )
+                .unwrap()
+            };
+            let point = [0.4, -0.35];
+            let fifth = family
+                .empirical_rigid_row_fifth_full(
+                    0,
+                    map(point[0]),
+                    point[1],
+                    &grid.nodes,
+                    &grid.weights,
+                )
+                .unwrap();
+            for axis in 0..2 {
+                let h = 2.0e-5;
+                let mut plus = point;
+                let mut minus = point;
+                plus[axis] += h;
+                minus[axis] -= h;
+                let eval = |x: [f64; 2]| {
+                    family
+                        .empirical_rigid_fourth_full_closed_form(
+                            0,
+                            map(x[0]),
+                            x[1],
+                            &grid.nodes,
+                            &grid.weights,
+                        )
+                        .unwrap()
+                };
+                let fp = eval(plus);
+                let fm = eval(minus);
+                for a in 0..2 {
+                    for b in 0..2 {
+                        for c in 0..2 {
+                            for d in 0..2 {
+                                let fd = (fp[a][b][c][d] - fm[a][b][c][d]) / (2.0 * h);
+                                let exact = fifth[a][b][c][d][axis];
+                                assert!(
+                                    (fd - exact).abs() < 2.0e-7 * (1.0 + fd.abs()),
+                                    "frailty={frailty_sd:?} axes={a}{b}{c}{d}{axis} fifth={exact} fd={fd}"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
 
+    // Independent normalized Taylor-polynomial oracle. Production stores dense
+    // derivative tensors and lifts its root with a filtered jet iteration.
+    // This witness stores the 15 monomial coefficients of total degree <= 4,
+    // multiplies by ordinary polynomial convolution, and solves the calibration
+    // identity one homogeneous degree at a time. It shares neither production
+    // tensor algebra, implicit lifting, nor the signed-log-CDF derivative stack.
+    #[derive(Clone, Copy)]
+    struct OraclePolynomial([f64; 15]);
+
+    impl OraclePolynomial {
+        fn slot(m: usize, g: usize) -> usize {
+            let degree = m + g;
+            degree * (degree + 1) / 2 + g
+        }
+
+        fn constant(value: f64) -> Self {
+            let mut out = Self([0.0; 15]);
+            out.0[0] = value;
+            out
+        }
+
+        fn variable(value: f64, axis: usize) -> Self {
+            let mut out = Self::constant(value);
+            out.0[Self::slot(usize::from(axis == 0), usize::from(axis == 1))] = 1.0;
+            out
+        }
+
+        fn add_scaled(mut self, other: Self, scale: f64) -> Self {
+            for (out, coefficient) in self.0.iter_mut().zip(other.0) {
+                *out += scale * coefficient;
+            }
+            self
+        }
+
+        fn product(self, other: Self) -> Self {
+            let mut out = Self::constant(0.0);
+            for degree in 0..=4 {
+                for g in 0..=degree {
+                    let m = degree - g;
+                    let mut coefficient = 0.0;
+                    for i in 0..=m {
+                        for j in 0..=g {
+                            coefficient += self.0[Self::slot(i, j)]
+                                * other.0[Self::slot(m - i, g - j)];
+                        }
+                    }
+                    out.0[Self::slot(m, g)] = coefficient;
+                }
+            }
+            out
+        }
+
+        fn compose(self, coefficients: [f64; 5]) -> Self {
+            let mut delta = self;
+            delta.0[0] = 0.0;
+            let mut power = Self::constant(1.0);
+            let mut out = Self::constant(0.0);
+            for (degree, coefficient) in coefficients.into_iter().enumerate() {
+                out = out.add_scaled(power, coefficient);
+                if degree < 4 {
+                    power = power.product(delta);
+                }
+            }
+            out
+        }
+
+        fn normal_cdf(self) -> Self {
+            let x = self.0[0];
+            let pdf = wnorm_pdf(x);
+            self.compose([
+                wnorm_cdf(x),
+                pdf,
+                -x * pdf / 2.0,
+                (x * x - 1.0) * pdf / 6.0,
+                (3.0 * x - x * x * x) * pdf / 24.0,
+            ])
+        }
+
+        fn log(self) -> Self {
+            let value = self.0[0];
+            assert!(value > 0.0 && value.is_finite());
+            let inverse = 1.0 / value;
+            self.compose([
+                value.ln(),
+                inverse,
+                -inverse.powi(2) / 2.0,
+                inverse.powi(3) / 3.0,
+                -inverse.powi(4) / 4.0,
+            ])
+        }
+
+        fn derivative(self, axes: &[usize]) -> f64 {
+            let g = axes.iter().filter(|&&axis| axis == 1).count();
+            let m = axes.len() - g;
+            let factorial = [1.0, 1.0, 2.0, 6.0, 24.0];
+            self.0[Self::slot(m, g)] * factorial[m] * factorial[g]
+        }
+    }
+
+    fn independent_rigid_polynomial(
+        m: f64,
+        slope: f64,
+        z: f64,
+        y: f64,
+        weight: f64,
+        scale: f64,
+        grid: &EmpiricalZGrid,
+    ) -> OraclePolynomial {
+        let marginal = OraclePolynomial::variable(m, 0).normal_cdf();
+        let slope = OraclePolynomial::variable(slope, 1);
+        let root = witness_intercept(
+            marginal.0[0], slope.0[0], scale, &grid.nodes, &grid.weights,
+        );
+        let jacobian: f64 = grid.nodes.iter().zip(&grid.weights)
+            .map(|(&node, &mass)| mass * wnorm_pdf(root + scale * slope.0[0] * node))
+            .sum();
+        assert!(jacobian.is_finite() && jacobian > 0.0);
+        let residual = |intercept: OraclePolynomial| {
+            grid.nodes.iter().zip(&grid.weights).fold(
+                OraclePolynomial::constant(0.0).add_scaled(marginal, -1.0),
+                |sum, (&node, &mass)| {
+                    sum.add_scaled(intercept.add_scaled(slope, scale * node).normal_cdf(), mass)
+                },
+            )
+        };
+        let mut intercept = OraclePolynomial::constant(root);
+        assert!(residual(intercept).0[0].abs() <= 2e-14, "independent scalar root");
+        for degree in 1..=4 {
+            let known = residual(intercept);
+            for g in 0..=degree {
+                let slot = OraclePolynomial::slot(degree - g, g);
+                intercept.0[slot] = -known.0[slot] / jacobian;
+            }
+        }
+        let constraint = residual(intercept);
+        assert!(constraint.0.iter().all(|x| x.is_finite() && x.abs() <= 2e-12),
+            "polynomial calibration identity: {:?}", constraint.0);
+        let signed = OraclePolynomial::constant(0.0)
+            .add_scaled(intercept.add_scaled(slope, scale * z), 2.0 * y - 1.0);
+        OraclePolynomial::constant(0.0).add_scaled(signed.normal_cdf().log(), -weight)
+    }
+
+    fn exact_oracle_scaled_error(actual: f64, expected: f64) -> f64 {
+        if !actual.is_finite() || !expected.is_finite() {
+            return f64::INFINITY;
+        }
+        (actual - expected).abs() / actual.abs().max(expected.abs()).max(1.0)
+    }
+
+    #[test]
+    fn empirical_rigid_all_channels_match_independent_polynomial_932() {
+        let grid = test_grid();
+        let rows = [
+            (0.25, 0.30, 0.4, 1.0, 1.0),
+            (-0.6, -0.45, -1.0, 0.0, 0.8),
+            (0.05, 0.0, 0.1, 1.0, 1.3),
+            (0.85, -0.15, 0.6, 0.0, 0.9),
+            (-1.1, 0.55, -0.5, 1.0, 1.1),
+            (2.1, 0.45, 1.6, 0.0, 0.7),
+            (-2.4, -0.55, -1.4, 1.0, 1.4),
+        ];
+        let mut worst = [0.0_f64; 5];
+        let mut checked = [0usize; 5];
+        for frailty_sd in [None, Some(0.6)] {
+            for (row, &(m, g, z, y, w)) in rows.iter().enumerate() {
+                let family = empirical_family(vec![y], vec![z], vec![w], frailty_sd, grid.clone());
+                let marginal = bernoulli_marginal_link_map(
+                    &InverseLink::Standard(gam_problem::StandardLink::Probit), m,
+                ).expect("marginal link");
+                let (value, gradient, hessian) = family
+                    .empirical_rigid_primary_grad_hess_closed_form(0, marginal, g, &grid.nodes, &grid.weights)
+                    .expect("empirical rigid V/G/H");
+                let third = family.empirical_rigid_third_full_closed_form(
+                    0, marginal, g, &grid.nodes, &grid.weights,
+                ).expect("empirical rigid third");
+                let fourth = family.empirical_rigid_fourth_full_closed_form(
+                    0, marginal, g, &grid.nodes, &grid.weights,
+                ).expect("empirical rigid fourth");
+                let oracle = independent_rigid_polynomial(
+                    m, g, z, y, w, family.probit_frailty_scale(), &grid,
+                );
+                let mut check = |actual: f64, axes: &[usize]| {
+                    let expected = oracle.derivative(axes);
+                    let error = exact_oracle_scaled_error(actual, expected);
+                    assert!(error <= 1e-9,
+                        "frailty={frailty_sd:?} row={row} axes={axes:?}: actual={actual:.16e} expected={expected:.16e} scaled_error={error:.3e}");
+                    worst[axes.len()] = worst[axes.len()].max(error);
+                    checked[axes.len()] += 1;
+                };
+                check(value, &[]);
+                for a in 0..2 {
+                    check(gradient[a], &[a]);
+                    for b in 0..2 {
+                        check(hessian[a][b], &[a, b]);
+                        for c in 0..2 {
+                            check(third[a][b][c], &[a, b, c]);
+                            for d in 0..2 {
+                                check(fourth[a][b][c][d], &[a, b, c, d]);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(checked, [14, 28, 56, 112, 224]);
+        eprintln!("EMPIRICAL-RIGID-POLYNOMIAL-932 checked={checked:?} worst_scaled_error={worst:?}");
+    }
+
+    #[test]
+    fn empirical_exact_oracle_rejects_corruption_and_nonfinite_932() {
+        for invalid in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            for (actual, expected) in [(invalid, invalid), (invalid, 0.0), (0.0, invalid)] {
+                assert!(exact_oracle_scaled_error(actual, expected) > 1e-9);
+            }
+        }
+        assert_eq!(exact_oracle_scaled_error(0.0, 0.0), 0.0);
+        assert_eq!(exact_oracle_scaled_error(-2.0, -2.0), 0.0);
+        for (actual, expected) in [(1e-8, 0.0), (0.0, -1e-8), (0.75, -0.75), (1.018, 1.0)] {
+            assert!(exact_oracle_scaled_error(actual, expected) > 1e-9);
+        }
+    }
 }
 
 #[cfg(test)]

@@ -1,6 +1,6 @@
 //! Regression (#2373 defect A): a transformation-likelihood ("Royston-Parmar")
-//! survival fit whose gradient-only outer BFGS used to bail on `opt::Bfgs`'s
-//! flat-valley `StallPolicy` must reach the actual KKT contract.
+//! survival fit whose gradient-only outer BFGS bails on `opt::Bfgs`'s
+//! flat-valley `StallPolicy` must still be minted.
 //!
 //! Root cause: this path declares no analytic outer Hessian, so it runs
 //! `opt::Bfgs`, whose flat-stall exit gates on `‖g‖∞ ≤ tol·(1 + ‖ρ‖∞)`. In
@@ -8,10 +8,10 @@
 //! inflating that gate ~10× — so BFGS reports "converged (flat/stalled)" at a
 //! checkpoint whose projected gradient still exceeds the un-inflated terminal
 //! certificate bound, and the certificate (correctly) refuses with real
-//! interior descent remaining. The shared first-order outer route now disables
-//! that duplicate relative-stall predicate and lets BFGS run until the
-//! authoritative analytic certificate accepts the point. No survival-specific
-//! retry, cap, or relaxed tolerance is involved.
+//! interior descent remaining. `optimize_survival_transformation_smoothing` now
+//! resumes the outer search from the printed `rho_checkpoint` with a fresh BFGS
+//! inverse-Hessian metric (bounded), which recovers the descent the accumulated
+//! metric stalled on.
 //!
 //! DGP: the reporter's two-smooth Weibull cohort (shape 1.6, log-hazard slopes
 //! +0.7 / −0.5). With two smooth terms plus the baseline I-spline penalties the
@@ -78,7 +78,7 @@ fn build_two_smooth_survival_frame() -> gam::data::EncodedDataset {
 }
 
 #[test]
-fn survival_transformation_two_smooth_fit_reaches_kkt_without_relative_stall() {
+fn survival_transformation_two_smooth_fit_resumes_past_flat_valley_stall() {
     let ds = build_two_smooth_survival_frame();
     let cfg = FitConfig {
         survival_likelihood: Some("transformation".to_string()),
@@ -88,16 +88,17 @@ fn survival_transformation_two_smooth_fit_reaches_kkt_without_relative_stall() {
         ..FitConfig::default()
     };
     // Before #2373A this cohort refused with a `RemlDidNotConverge` flat-valley
-    // stall; the shared optimizer must now mint a certified fit directly.
+    // stall; the caller-level checkpoint resume must now mint a certified fit.
     let result = fit_from_formula("Surv(time, event) ~ s(x1) + s(x2)", &ds, &cfg)
-        .expect("two-smooth Royston-Parmar fit must reach the analytic KKT certificate");
+        .expect("two-smooth Royston-Parmar fit must certify via the flat-stall checkpoint resume");
     let FitResult::SurvivalTransformation(fit) = result else {
         panic!("expected a survival-transformation (Royston-Parmar) fit result");
     };
 
     let evidence = fit.fit.convergence_evidence();
-    // A minted fit seals a certified `Converged` inner mode; the old relative
-    // stall must not bypass either inner or outer certification.
+    // A minted fit seals a certified `Converged` inner mode; the outer stall
+    // that produced it can only ship as a fit once the resume reaches a
+    // certified stationary rho.
     assert_eq!(
         evidence.inner_status(),
         PirlsStatus::Converged,

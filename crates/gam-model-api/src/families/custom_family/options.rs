@@ -254,12 +254,6 @@ pub(crate) fn validate_hessian_workspace_ready(
     Ok(())
 }
 
-/// Declare second-order outer calculus after validating the coefficient blocks.
-///
-/// `specs` must form a valid custom-family block layout. `coefficient_cost` is
-/// retained for API compatibility and diagnostics; analytic capability is not
-/// demoted on cost. Invalid specifications panic in the common contract
-/// validator.
 pub fn exact_outer_order_from_capability(
     specs: &[ParameterBlockSpec],
     coefficient_cost: u64,
@@ -537,10 +531,6 @@ pub fn block_offsets_from_specs(specs: &[ParameterBlockSpec]) -> Arc<[Range<usiz
 /// magnitude while still bounding pathological probes.
 pub const FIRST_ORDER_BFGS_LOGLAMBDA_STEP_CAP: f64 = 5.0;
 
-/// Report whether a family exposes the strict pseudo-Laplace geometry needed
-/// by the analytic second-order outer solver.
-///
-/// This query is infallible and does not evaluate the likelihood.
 pub fn exact_newton_outer_geometry_supports_second_order_solver<F: CustomFamily + ?Sized>(
     family: &F,
 ) -> bool {
@@ -550,13 +540,9 @@ pub fn exact_newton_outer_geometry_supports_second_order_solver<F: CustomFamily 
 /// Stable public API for installing outer-score subsampling.
 #[derive(Clone)]
 pub struct BlockwiseFitOptions {
-    /// Maximum coefficient-optimizer cycles allowed before non-convergence is returned.
     pub inner_max_cycles: usize,
-    /// Absolute coefficient stationarity tolerance; must be finite and positive.
     pub inner_tol: f64,
-    /// Maximum REML/LAML outer iterations allowed before non-convergence is returned.
     pub outer_max_iter: usize,
-    /// Absolute outer stationarity tolerance; must be finite and positive.
     pub outer_tol: f64,
     /// Optional override for the OUTER smoothing optimizer's
     /// *relative-cost-decrease* convergence stop, decoupled from `outer_tol`.
@@ -575,14 +561,15 @@ pub struct BlockwiseFitOptions {
     /// `None` preserves the legacy coupling (`rel_cost = outer_tol`) for every
     /// existing caller byte-for-byte.
     pub outer_rel_cost_tol: Option<f64>,
-    /// Lower box bound for smoothing coordinates ρ = log λ.
+    /// A family-declared floor for the smoothing coordinates ρ = log λ.
     ///
-    /// The default preserves the historical custom-family domain
-    /// `λ >= exp(-10)`. Families with known calibration failures at the
-    /// near-zero penalty boundary can raise this lower bound without changing
-    /// the upper effective-df cap or adding family-specific branches inside the
-    /// optimizer.
-    pub rho_lower_bound: f64,
+    /// `None` (the default) leaves the λ-selection domain to the engine's
+    /// derived resolvability domain (#2812): per coordinate, the ρ interval on
+    /// which the penalty is resolvable against the term's own design
+    /// curvature. A family with a known calibration limit at the near-zero
+    /// penalty boundary (the multinomial's derived minimum strength) raises
+    /// the lower edge here; nothing here supplies an upper wall.
+    pub rho_lower_bound: Option<f64>,
     /// Optional seed for transient solver damping. The default is zero and the
     /// default [`RidgePolicy`] excludes every damping shift from the quadratic
     /// objective, penalty determinant, and Laplace Hessian. A nonzero value is
@@ -761,7 +748,6 @@ pub struct BlockwiseFitOptions {
     pub seed_screening: bool,
 }
 
-/// Default maximum coefficient cycles for a custom-family fit.
 pub const DEFAULT_CUSTOM_FAMILY_INNER_MAX_CYCLES: usize = 1200;
 
 impl Default for BlockwiseFitOptions {
@@ -781,7 +767,7 @@ impl Default for BlockwiseFitOptions {
             outer_max_iter: 60,
             outer_tol: 1e-5,
             outer_rel_cost_tol: None,
-            rho_lower_bound: -10.0,
+            rho_lower_bound: None,
             // Conditioning is solver state, not a coefficient prior. Start at
             // the exact Hessian (zero shift); rank/curvature-aware damping may
             // regularize rejected Newton steps, but none of it enters the

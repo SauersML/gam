@@ -119,17 +119,6 @@ pub struct RhoQuadratureMixture {
     pub max_gradient_norm: f64,
 }
 
-/// Mixture-corrected coefficient posterior moments (law of total
-/// variance/expectation over the `ρ` mixture). See
-/// `mixture_coefficient_covariance`.
-#[derive(Debug, Clone)]
-pub struct MixtureCoefficientCovariance {
-    /// Mixture posterior mean `β̄ = Σ_m w_m β̂(ρ_m)`.
-    pub beta_bar: Array1<f64>,
-    /// `Vβ_marginal = Σ_m w_m [Vb(ρ_m) + (β̂(ρ_m)−β̄)(β̂(ρ_m)−β̄)ᵀ]`.
-    pub covariance: Array2<f64>,
-}
-
 /// Largest `K` for which the Tier-1 Gauss-Hermite product grid is affordable
 /// (3–5 nodes per axis ⇒ at most 81–125 criterion evaluations).
 pub const TIER1_MAX_DIM: usize = 4;

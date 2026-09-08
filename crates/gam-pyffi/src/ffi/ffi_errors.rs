@@ -869,9 +869,6 @@ pub(crate) fn workflow_error_to_pyerr(py: Python<'_>, err: WorkflowError) -> PyE
         }
         WorkflowError::MissingDependency { reason } => MissingDependencyError::new_err(reason),
         WorkflowError::IntegrationFailed { reason } => IntegrationError::new_err(reason),
-        WorkflowError::InvalidData { column, problem } => {
-            DataError::new_err(format!("column '{column}' {problem}"))
-        }
         WorkflowError::SpatialUnderresolved { .. } => IntegrationError::new_err(err.to_string()),
         WorkflowError::FormulaDsl { .. } => FormulaError::new_err(err.to_string()),
     }

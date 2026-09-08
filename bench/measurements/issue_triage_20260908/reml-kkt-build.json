@@ -1,0 +1,611 @@
+{
+  "command": [
+    "taskset",
+    "-c",
+    "112-115",
+    "rustc",
+    "--crate-name",
+    "gam_solve",
+    "--edition=2024",
+    "crates/gam-solve/src/lib.rs",
+    "--test",
+    "--deny=warnings",
+    "--check-cfg",
+    "cfg(docsrs,test)",
+    "--check-cfg",
+    "cfg(feature, values())",
+    "-Copt-level=1",
+    "-Ccodegen-units=256",
+    "-Clto=off",
+    "-Cdebuginfo=0",
+    "-Cdebug-assertions=on",
+    "-L",
+    "dependency=/scratch.global/sauer354/y2-target/debug/deps",
+    "-L",
+    "native=/scratch.global/sauer354/y2-target/debug/build/zstd-sys-cf55b24880b1a3c0/out",
+    "-o",
+    "/projects/standard/hsiehph/sauer354/gam-main-validation/.buildd/reml-kkt-20260908-v3",
+    "--extern",
+    "gam_model_api=/scratch.global/sauer354/y2-target/debug/deps/libgam_model_api-e0c7d13c15e8a352.rlib",
+    "--extern",
+    "gam_problem=/scratch.global/sauer354/y2-target/debug/deps/libgam_problem-81fc31c6a4cabd27.rlib",
+    "--extern",
+    "gam_math=/scratch.global/sauer354/y2-target/debug/deps/libgam_math-791060a41b576a00.rlib",
+    "--extern",
+    "gam_runtime=/scratch.global/sauer354/y2-target/debug/deps/libgam_runtime-e75ae3ffced32f60.rlib",
+    "--extern",
+    "ndarray=/scratch.global/sauer354/y2-target/debug/deps/libndarray-ab975d6b1aeb6a2f.rlib",
+    "--extern",
+    "gam_linalg=/scratch.global/sauer354/y2-target/debug/deps/libgam_linalg-3608fedf752b15f8.rlib",
+    "--extern",
+    "rand=/scratch.global/sauer354/y2-target/debug/deps/librand-adfbedc03db3331d.rlib",
+    "--extern",
+    "serde_json=/scratch.global/sauer354/y2-target/debug/deps/libserde_json-11ee3b7aff44a200.rlib",
+    "--extern",
+    "gam_spec=/scratch.global/sauer354/y2-target/debug/deps/libgam_spec-6837cdbed434f2ca.rlib",
+    "--extern",
+    "gam_terms=/scratch.global/sauer354/y2-target/debug/deps/libgam_terms-1ca43e98d8fab0bf.rlib",
+    "--extern",
+    "serde=/scratch.global/sauer354/y2-target/debug/deps/libserde-0c936cd7fbae874d.rlib",
+    "--extern",
+    "opt=/scratch.global/sauer354/y2-target/debug/deps/libopt-b8b2b07aaa7c7cb1.rlib",
+    "--extern",
+    "faer=/scratch.global/sauer354/y2-target/debug/deps/libfaer-ca97a0293c7f665e.rlib",
+    "--extern",
+    "cudarc=/scratch.global/sauer354/y2-target/debug/deps/libcudarc-dd3286f95c639fbb.rlib",
+    "--extern",
+    "gam_geometry=/scratch.global/sauer354/y2-target/debug/deps/libgam_geometry-d3063ff39fe7a10d.rlib",
+    "--extern",
+    "tempfile=/scratch.global/sauer354/y2-target/debug/deps/libtempfile-3a05c6673b94f725.rlib",
+    "--extern",
+    "num_dual=/scratch.global/sauer354/y2-target/debug/deps/libnum_dual-c901e8de18fc6eb1.rlib",
+    "--extern",
+    "dyn_stack=/scratch.global/sauer354/y2-target/debug/deps/libdyn_stack-bb03e1839603d1e1.rlib",
+    "--extern",
+    "rayon=/scratch.global/sauer354/y2-target/debug/deps/librayon-b9eab60993769b84.rlib",
+    "--extern",
+    "gam_gpu=/scratch.global/sauer354/y2-target/debug/deps/libgam_gpu-edd8119a6a3ad4b4.rlib",
+    "--extern",
+    "rand_distr=/scratch.global/sauer354/y2-target/debug/deps/librand_distr-e4c951f9be03bc6f.rlib",
+    "--extern",
+    "statrs=/scratch.global/sauer354/y2-target/debug/deps/libstatrs-422a5716824bf862.rlib",
+    "--extern",
+    "approx=/scratch.global/sauer354/y2-target/debug/deps/libapprox-bcfe282b3fa2e63d.rlib",
+    "--extern",
+    "env_logger=/scratch.global/sauer354/y2-target/debug/deps/libenv_logger-37f32cb3b2755a24.rlib",
+    "--extern",
+    "log=/scratch.global/sauer354/y2-target/debug/deps/liblog-17a5faa6bef040a1.rlib"
+  ],
+  "version": "0.3.154",
+  "rustc": "rustc 1.96.0 (ac68faa20 2026-05-25)\nbinary: rustc\ncommit-hash: ac68faa20c58cbccd01ee7208bf3b6e93a7d7f96\ncommit-date: 2026-05-25\nhost: x86_64-unknown-linux-gnu\nrelease: 1.96.0\nLLVM version: 22.1.2\n",
+  "source_sha256": {
+    "crates/gam-solve/src/active_set.rs": "031ca2397cf720437b1a9c25c853f6c297ddef12131287d75b559608558e2b22",
+    "crates/gam-solve/src/cone_reduction.rs": "401e9aa9a7e08edd62cda4c58f1ae98b6faaa5ae06ed4730969ea308e7685f75",
+    "crates/gam-solve/src/constrained_gaussian_reml.rs": "f1464db82efcac5bdf98aac7e0a091e158e4bf81e40ecc0ef02bad87bc1e5d8c",
+    "crates/gam-solve/src/constrained_posterior.rs": "d48034cbe7fa25f2ddda63b2843429c6b419f025de5ddc5796f923662c9d0889",
+    "crates/gam-solve/src/continuation_path.rs": "f19025c844ba400a18e055c0260e7ae98158d356932de87dd70feeeb376656f3",
+    "crates/gam-solve/src/cross_node.rs": "2263abf1192672bdfd4bccdcb3abb39038beb05c3a847871de69f3f97e26c4ae",
+    "crates/gam-solve/src/evidence.rs": "92e81f3649f45f4fdd642afcffdfe5432d5186e5c28b554456a33d285b78001f",
+    "crates/gam-solve/src/gauge.rs": "c0f45a54238f085676ac3d8c02af0a256c88d0c51497d7609fbb89721881511d",
+    "crates/gam-solve/src/gaussian_reml.rs": "a699eb8d73dc950156e8110f91b537767f89cd9e5133a72f65c4f73720bcb1b1",
+    "crates/gam-solve/src/glm_sufficient_lane.rs": "095ed88eb614e1caf1092ccd999ecbf5e8e88a7af599191e59f28304e35103ad",
+    "crates/gam-solve/src/inner_status.rs": "3552f17ed76858ba5766d74b1de3d263866c4fd19016d950ded9a0f3c81534cf",
+    "crates/gam-solve/src/latent_cache.rs": "242cdfac6cfead7ac1d70413b5fc7e3fdc168edd579a4d319dd2e8b4bcc15695",
+    "crates/gam-solve/src/latent_inner.rs": "707a531a8128aa4da1d87a0444665f5a515c5fc686ffe99e1721540cf661768a",
+    "crates/gam-solve/src/lib.rs": "315a3eca6e88c922986ea2f8c47b3b04a4ea4d63319cd53a5430b32b019f5cf5",
+    "crates/gam-solve/src/logdet_bounds.rs": "8e6f8fc4904f97e6de8e9131ad1844e3f52e9ae6cacbdc9496c065c0a17a2170",
+    "crates/gam-solve/src/loop_guard.rs": "80e3289e18f4c7ca37acdb297588cba5ceeb1aaebb87de3ba6b76df27ab3041e",
+    "crates/gam-solve/src/measure_jet_glm_sufficient.rs": "d254e61ba3d53061d0d43d7b3fd7b6530dfbefa550ac26ccc391cdbad62ac634",
+    "crates/gam-solve/src/measure_jet_gram_cache.rs": "90403e934429e2aa3ed71968c980da303d973d1bc920892a0c2b661fa8b9a007",
+    "crates/gam-solve/src/mixture_link.rs": "c7fab69082cc6ba9c529855e1ccfa531e6609208ba3d2eb689f53414fc44a23d",
+    "crates/gam-solve/src/mod.rs": "0fc6af12608538a2cd78b51837e7a904b686474bf3ad0a1b9337ce4b138fa8f6",
+    "crates/gam-solve/src/model_types.rs": "dffa34b7f5bddf68185a8c4f17df6d29a4da608a6c5355322e41e2fcfdaee5de",
+    "crates/gam-solve/src/objective_base.rs": "3b9ff218f8615f60fde106b2d3b73a2d4f4ef23999dca1df759598233b3f17c0",
+    "crates/gam-solve/src/parallel_strategy.rs": "f72ef9f29fb4fd451091d8b06b5eb095fc9a0bd0fb24d3c57d70777b5f88ce63",
+    "crates/gam-solve/src/penalty_invariance.rs": "76bb88054c098f26ed032120599ae9e4dac48152e40be8a1982ffe902b4a8ea7",
+    "crates/gam-solve/src/penalty_invariance_tests.rs": "af3123b9c9b8e96a23ba55924a2705b34168d7d7dc1b9960d17422e472778313",
+    "crates/gam-solve/src/persistent_warm_start.rs": "3b20bb628b54c9181ef3604244038f5a3752e10810da395a0f3e13f705e9955c",
+    "crates/gam-solve/src/priority_selection.rs": "55930787cb53e33dbd28a49c5ff21f2816d4f750ff9880df9a016e8fb4920767",
+    "crates/gam-solve/src/progress_log.rs": "dfdb3d29a1870708cdbfb6ce61b122f84535d96a12b1b3d74e8e17fddc982886",
+    "crates/gam-solve/src/psi_gram_tensor.rs": "7a07dc510ebca769ffa1d505131eccb9c15d98120117229663f96a8e99d8531c",
+    "crates/gam-solve/src/psis.rs": "b878ff3347853d2b86e9d0adaa19515d9a3a07bc2fcec35ebe1c05f6de13bcf0",
+    "crates/gam-solve/src/quadrature.rs": "88a43d7bb66867a975e0db5f9e9da84329cf3ac5f1ef7105d11b688ac587add9",
+    "crates/gam-solve/src/residual_cascade.rs": "6cca4986146bea5f8a9122c8c12671b61371daf7b2b344ed061a8d4bacfe785b",
+    "crates/gam-solve/src/rho_optimizer.rs": "c0e14d257b29ae9fc9a4d670f3cdf2c44c09995a332c3fe7883f29e4d2221c76",
+    "crates/gam-solve/src/rho_prior_eval.rs": "30060c141f69c19174b03a923c705e3efd32fb9be4b1d9f23685cbd453a1139f",
+    "crates/gam-solve/src/rho_uncertainty.rs": "4151dfe57490e83a684e3b33d7d0f36c2a282870684b07e5fa733f8ad91d5b9b",
+    "crates/gam-solve/src/row_measure.rs": "0bbcd7ab93be3975d06a590eb489ae4c28ff7ddde156a51dfb92590238424856",
+    "crates/gam-solve/src/row_sampling_measure.rs": "75c0ed24543ffafb1a101fb131f9ae20c8fdfc13ceca3663a115484b438823bc",
+    "crates/gam-solve/src/seeding.rs": "c7c9eae39e3541c883c5acd5e3c1cb38c2930305c83a4cf7c7623519bb4bb800",
+    "crates/gam-solve/src/sensitivity.rs": "ba974b0968172549e11d6c4f7173ccac6cecf00d4088df5856ee5dfb829ca1ff",
+    "crates/gam-solve/src/spline_scan.rs": "e01978552208360b72f493d3d6c208507089b90d403e27dc65df7de4cea71127",
+    "crates/gam-solve/src/startup_stats.rs": "d563afa6dac60be0b8c080323dd93f420ed934bf36b831d9dd9bee46ae96a53b",
+    "crates/gam-solve/src/streaming_border.rs": "7171a4597a9e78a52b159f4375062cd7345d53e7013005afb9ac868dad240285",
+    "crates/gam-solve/src/structure_search.rs": "ff12b5f12c0a8b9551c19f04de64bb363fd970c8d8913a4cf6ef3549755c6f9e",
+    "crates/gam-solve/src/topology_formula.rs": "9bf801870773714eecc6a77e3e37a72980a0c3a01bfbd148539423d85b9e5ef6",
+    "crates/gam-solve/src/topology_selector.rs": "d4ee20f26f769a9f28ca52006b85971d3a7ce0fcdb5785c514ddeb8d380b4665",
+    "crates/gam-solve/src/topology_stack_gaussian.rs": "e1428ca822ce49aa49c3c9c147db568aebfbf4c2762fc1aca022ce8e16477f54",
+    "crates/gam-solve/src/warm_start_artifact.rs": "1ea0aa0104d573cfe21bfba402a6a3993c377a5b213483cee5b5c87b86c5254a",
+    "crates/gam-solve/src/warm_start_transfer.rs": "fd382b74f1aac9deb24613fe4461b51c4aaed5586da8362561bf92c175c0bd86",
+    "crates/gam-solve/src/arrow_schur/factorization.rs": "57007dea375fc69d77b74b6e26b064886560b53be8a674d185706b878f4c2fc3",
+    "crates/gam-solve/src/arrow_schur/mod.rs": "0f5c84604a545fa5d74f225768aadee2d3ca98b670fb134cb8ccf11b6068ed2e",
+    "crates/gam-solve/src/arrow_schur/newton_step.rs": "4bb2e8ddb1dc93061a1188b5561edd13121b4cd27ff5dbbcdae3eb667b45b5c3",
+    "crates/gam-solve/src/arrow_schur/penalty_ops.rs": "7ef54ef49afee7e37fcbac78cb07db2edc42a75ee19b0ce435afa93988db1f03",
+    "crates/gam-solve/src/arrow_schur/prelude.rs": "4e07233d896c97b701b0cdee7426678949be0c6ee65baa227787bb0d987064e4",
+    "crates/gam-solve/src/arrow_schur/rational_logdet.rs": "cb75bd7d86566ced83e77f917abe708fe7def68ddc89f531317fe0ba424460f3",
+    "crates/gam-solve/src/arrow_schur/reduced_solve.rs": "cc7f833fe974ab409d1cd2895a819af834e861da603508ec65c876e946df0f94",
+    "crates/gam-solve/src/arrow_schur/slq_logdet.rs": "23e5a7e67937a5e563fd7d66a8df10b0d631dba1d9bc51997934401b39fa9ac8",
+    "crates/gam-solve/src/arrow_schur/solve_options.rs": "1eacec71d68954f97754a2686103819a9199111027c777d9571292aca98cb809",
+    "crates/gam-solve/src/arrow_schur/streaming_exact_a_carrier_2731_tests.rs": "6590ac96e09ba7b4760369a06f7bd663505b85623398f344e98505f15be5ab7d",
+    "crates/gam-solve/src/arrow_schur/system.rs": "1c65564aa27237b202f6255a048e591d67de5c2d208a8323e6030b44d54cf08d",
+    "crates/gam-solve/src/arrow_schur/tests.rs": "70737f719dacb4e3a7f14c37902fd3e4d2f9f592b29bf8be05e88b6085b470e7",
+    "crates/gam-solve/src/arrow_schur/tests_device_gauge_2660.rs": "c0d034a31dc7955ed37d5f1008fc0214fe5d8aa999cbee4245a7185f94b65d31",
+    "crates/gam-solve/src/estimate/binomial_reml_outer_cost_1575_tests.rs": "92ec22a7a7d4d2c13c212110ebd574c63c51b663343acc37cded1df824a88cfd",
+    "crates/gam-solve/src/estimate/constrained_marginal_truncation_2705_tests.rs": "a3bd8331ef0b4af4445167bda00a928e3e9cbd972b6ba10c6a1eccf64e3bafe7",
+    "crates/gam-solve/src/estimate/continuous_order_tests.rs": "857404dfcdb8982c668504a94767375b1931678e50b7d4f2dcb876cae927b9d0",
+    "crates/gam-solve/src/estimate/edf_accounting.rs": "e39c73921ab93604b88aff3de5c4cd075c1c048f9074246362d960aca9f5ccfd",
+    "crates/gam-solve/src/estimate/estimate_policy_tests.rs": "c92fc4ac03b9e429a38eaed509cda9ee0c27f66b20d5fb002dd19591aecb4665",
+    "crates/gam-solve/src/estimate/evaluation.rs": "b614b514a84010043c0a033654dc72edbe448fda8db3478d948d3baedcb21367",
+    "crates/gam-solve/src/estimate/external_options.rs": "195aa5e62ddace82c1ad61cbd662df27c73d186d0001475a6c673f97e6a9a70c",
+    "crates/gam-solve/src/estimate/fit.rs": "0eab04e3f0029c2f23b9f29c6e174d8a01a9e1238d21e1f896b706d51a536d2d",
+    "crates/gam-solve/src/estimate/gaussian_high_edf_scale_tests.rs": "363f407a704e4424696b1e4b6f729c3561a6e9b662d4f92fb11b33e8b31bff52",
+    "crates/gam-solve/src/estimate/gaussian_observation_interval_calibration_tests.rs": "c63a412e0e58dbca4e469076d2d8fed5c885c5befd6c206a0bd8bca3012568e6",
+    "crates/gam-solve/src/estimate/hessian_fd_probes.rs": "b0c3b5a2d08bc5b4cfb55e8a2efc202bea4c48ce93e4f8dec0b2ef7c32049bd6",
+    "crates/gam-solve/src/estimate/invert_regularized_rho_hessian_tests.rs": "083830901f8f5cb57a73c8e642841917cdb04d65e9cef1467d2c0d68c463a498",
+    "crates/gam-solve/src/estimate/joint_hyper.rs": "88763795a63fc3553e6d5af1939f669f85e83dc0439922b727bccb06a8d1d810",
+    "crates/gam-solve/src/estimate/link_ext_hessian_2665_tests.rs": "ca5582ba91b4272f1b847f25dfbb1ba98e0a237f95d753983733df60457af937",
+    "crates/gam-solve/src/estimate/mixture_sas_rho_guard_2629_tests.rs": "48b3423df301e1cd7c4cfa43c9075e4775e2db9eddb52e6fc7e408833b03263c",
+    "crates/gam-solve/src/estimate/mod.rs": "b4c04f6f56c3fdf176623c450e84b7d807dc21856593d0a1fb88b075e9d8a346",
+    "crates/gam-solve/src/estimate/optimizer.rs": "a5aadd9570aafd56336ccf87675b9f387b212af7ee7f605415dc68af3955ce54",
+    "crates/gam-solve/src/estimate/outer_eval_capture.rs": "0b239d993dfc639f2dc1f280c0951ee260b4c4911ac3569482839f09b2ebcacd",
+    "crates/gam-solve/src/estimate/penalty.rs": "08850a5303db3cb0e8ee00d18b8ccd882a9899029d8673b9d536ff955562e649",
+    "crates/gam-solve/src/estimate/prefit.rs": "d523062262e32ffa3697e9ffd03791c239102db3ed533abc16df6653c9463717",
+    "crates/gam-solve/src/estimate/rho_domain.rs": "35cdb6031efd5d8e972abb8984e332a641533cbd6ee13190c2dda15047d7cefe",
+    "crates/gam-solve/src/estimate/ridge_continuity_tests.rs": "cbf0afaeebc582682e064c00d0fd815e36807bfa7944f95666e05b9e592c16c6",
+    "crates/gam-solve/src/estimate/smooth_term_summary.rs": "79de04a44ba1b8ed328e1f854337cb0b3c173da44d24e7c6e676af55714654b9",
+    "crates/gam-solve/src/estimate/smoothing_correction.rs": "b2a7a92c4f78b1ba98edd2c1196ce5e3eeb0e9bbbb802de889d601f053db849e",
+    "crates/gam-solve/src/estimate/summary.rs": "3b2ab2f959d0c6ef1fa88a3aab144316f2ea818691ce9eefddab26c358579c0c",
+    "crates/gam-solve/src/gpu/arrow_schur_gpu.rs": "4ae2ad0c523643229039821d2dd64f3ba5dc46f75ecdd9d0f3a34a04a1f65dcb",
+    "crates/gam-solve/src/gpu/mod.rs": "77c2ede6489fbda3bc5d16758bd369b4195ef45535d3d8f4177c4f01ca6e51d1",
+    "crates/gam-solve/src/gpu/pirls_dispatch_wire.rs": "634d7b3346abf085d410570e603ecfa724aa27663294a572d60eed674d5ba6d5",
+    "crates/gam-solve/src/gpu/pirls_gpu.rs": "c6c9ef20469a5fc1f628b30fc3f127aa7d703086f09a92403ff6790b9e418ec5",
+    "crates/gam-solve/src/gpu/pirls_host_dispatch.rs": "13edb9afb5ea104c05e54bb0e5788ae1505e728c224d03ba402fb799a695669e",
+    "crates/gam-solve/src/gpu/reml_gpu.rs": "50d38efd7a6789959fda557779abb880e81636d26093632c57c48cd072803652",
+    "crates/gam-solve/src/gpu/reml_outer.rs": "49b8b794c8986a444024d532c2fdb3c8b6389ff2005010929f2e8b0427b8e3c3",
+    "crates/gam-solve/src/gpu_kernels/arrow_schur.rs": "be7af7b491ea4ec4aeddbeaeac23e98f8a2c8b37337f27aab7d6dfd26b960d55",
+    "crates/gam-solve/src/gpu_kernels/arrow_schur_decline_tests.rs": "57f303e2e1416af5e2047b58bea82e06b0ff14f3a9f108e6f4824da14a2fb739",
+    "crates/gam-solve/src/gpu_kernels/arrow_schur_nvrtc.rs": "6f0d66a09e41772a397c3779cc1a2aeddc5037bbfd9af7825bead5ba2819ee5e",
+    "crates/gam-solve/src/gpu_kernels/batched_k1.rs": "b993589576f42a8e7c3ea07a53d8752cd65d4d10edba94336283ff0bfe74953f",
+    "crates/gam-solve/src/gpu_kernels/mod.rs": "26fc1c7a98e12018795ec72f2dafc96108278dac217c8c105a7bcf89b8a14e3b",
+    "crates/gam-solve/src/gpu_kernels/pirls_row.rs": "58413d356cfce5fab83b2b26c0bf2e3d07010708293d0db44a5fb44a4c3555a8",
+    "crates/gam-solve/src/gpu_kernels/pirls_row_tests.rs": "2731fae4f2bd783aa510095e731ae63f5bf62c10627dd4e7b646c41c7f4047d5",
+    "crates/gam-solve/src/gpu_kernels/reml_trace.rs": "89e8574dd576b3a11dbef7b3aa763c2e35c59534277c8be67bdaae5851e4447d",
+    "crates/gam-solve/src/gpu_kernels/sae_resident.rs": "869b9a1fc54d32c263f3de8ba9894fdf939f90c54d9b460b1c8a8eb2a70d9627",
+    "crates/gam-solve/src/gpu_kernels/sigma_cubature.rs": "c86de72813aa01a56c9a3efd490ca3f02f0162b86dcdf6f1da30ca326688ee1e",
+    "crates/gam-solve/src/inference/alo.rs": "73c907126795106143e1c68424e18efbe8a6c6f9b528a462b771733aedf50a9b",
+    "crates/gam-solve/src/inference/certificate_impls.rs": "1df586e1784e80735538a4d4d118a5a8b7ee5ad9a72a2a026235e6ca19e55ea0",
+    "crates/gam-solve/src/inference/mod.rs": "018f3a258b9cd334bc59f40b2a5788655b0bf67f3fb439f85332d6ceb4170812",
+    "crates/gam-solve/src/inference/pg_gate_evidence.rs": "5fad2cdec0ee8a9fe74b0dd77f6fafe4325365a71cdbd09a3ad282b461e0f044",
+    "crates/gam-solve/src/inference/pg_moments.rs": "6a1cc9120e2341f9ffb80883e1b80c3ee71ac06c521146cbe576b2c2d77230e0",
+    "crates/gam-solve/src/inference/residual_factor.rs": "584bba37dee01f70286fc73f9ea76a005b01dc379d0845ea8d0c40a65984082b",
+    "crates/gam-solve/src/model_types/result_types.rs": "64e212952d293c2ce319ef99a867a84a1a44734ebd1c8562643ca1d216cd44fe",
+    "crates/gam-solve/src/pirls/convergence.rs": "86c412f886dcd90588000a3a846555416559473d56ca34b60751d42a10e19cd0",
+    "crates/gam-solve/src/pirls/curvature.rs": "0b2fe691f087a422c0a2760d6edd0c429c105fd800eeb1902c4cbc53e5adbc17",
+    "crates/gam-solve/src/pirls/damping.rs": "ef03da319ec24b4777b6869420925ef8081545c7bf5f4310ff0d8667d5aa32cd",
+    "crates/gam-solve/src/pirls/deviance.rs": "780fea05e418c119f172142d1dc681f30b5a94a8af80311bd43c23e493d05a50",
+    "crates/gam-solve/src/pirls/dispersion.rs": "0e0cdf12fcd0fa78e76d99e9872e260a68af74cbea98b95abdc266d6d4340f74",
+    "crates/gam-solve/src/pirls/edf.rs": "2a150a3c9a084b62f2ef77c3c007d66ed1acdf6dad952df125b6dfbfdaec5319",
+    "crates/gam-solve/src/pirls/family_state.rs": "4cbe398f40c40e56cc518716c5e995fe77458dd81d41740cb209430dc98e145e",
+    "crates/gam-solve/src/pirls/firth_noncanonical_curvature_2273_tests.rs": "5e3617fde9937f1186609bb3967c442aefc04258e9eadabb63bc8d8206143959",
+    "crates/gam-solve/src/pirls/gam_working_model.rs": "5b763c847c408828d1515bdf0fe4ffba22ad8fb015349f8f876952b92b05cab3",
+    "crates/gam-solve/src/pirls/glm_update.rs": "6bca71777775f570e05c007355ef21bf66a7db44620d06303449a8186bb4312d",
+    "crates/gam-solve/src/pirls/log_link_working_state.rs": "8356214c4e337e2f57a57ed4675bbf8fbdebd84507dca6396f4b91504af0a9e7",
+    "crates/gam-solve/src/pirls/loop_driver.rs": "eba339f940fac7f1aa3e746be8165c199cdb4b927866b2a78696ac12f9fa28e7",
+    "crates/gam-solve/src/pirls/low_rank.rs": "13d6cbf8e195fbb1a11feb26ef18f54878b104d36357c4a6c25d55b87303ef50",
+    "crates/gam-solve/src/pirls/mod.rs": "5a19cca7cc290ae1f25ef4ea87b3a1ecdee8ad368b4f18386c49b4bfd7577070",
+    "crates/gam-solve/src/pirls/newton_solve.rs": "32abbfcfbd6c2cdbd85636a08a13b9d8a30d7bba573639cc3c0540f0bc3cc2f7",
+    "crates/gam-solve/src/pirls/penalty.rs": "a4ad720fdc5439f3e62f864ccaee3e3298f8555e99e805f219dba1ecf996941e",
+    "crates/gam-solve/src/pirls/pls_solver.rs": "1229b37f2523ff0aa4922a4633b687d5e0a26622554ed8ed3c10dd0c44060c86",
+    "crates/gam-solve/src/pirls/prelude.rs": "96ac759b419adf3afb5d14fe3d2f1bea581c87f3d90778adaf05d1595212bfd9",
+    "crates/gam-solve/src/pirls/reweight.rs": "06fe9005dfe046e1aeb66c7ed99f0431504d81d845ad26e0a8f2fe2a2c45b3b0",
+    "crates/gam-solve/src/pirls/sas_saturated_row_2733_tests.rs": "a58e72a3bb74f9f488eecc775818869bcd3d90bc012dcdc1d1bc6f970df63f17",
+    "crates/gam-solve/src/pirls/sparse_fixed_ridge_2657_tests.rs": "416f7607559610d15e32dde521200ce7b92608e4beb093deafa9de3c37190231",
+    "crates/gam-solve/src/pirls/sparse_system.rs": "4eca7ae69114436f47b4e95650269451992b2e7637dc67c31236e2f34660b3d1",
+    "crates/gam-solve/src/pirls/state.rs": "fb47d56bdc81df81e8d44031df898380cb9460c2c922455d02db2155be0b710c",
+    "crates/gam-solve/src/pirls/tests.rs": "0e0059f1e057d4f9eea791e6b7537336b09ae0f9296deb96d472ac7af2583f8d",
+    "crates/gam-solve/src/pirls/working_model_trait.rs": "fb9ef761028b7cf9e0f18564be656a0773e198600e29691177cc1d6a81852f91",
+    "crates/gam-solve/src/pirls/workspace.rs": "6063f162bda1ef8ca07c3985805f32f0e9cf7434ce2e3cb452323373dab260ff",
+    "crates/gam-solve/src/reml/assembly.rs": "c243238dfd88b6bae2a0467431d96aaf696fb1f1fb8d15fdcdcb019b0eea6af9",
+    "crates/gam-solve/src/reml/atoms.rs": "f27217c3d148ce5d3988540db74d28fc5414b9da9b36c0ad43be667d2842479e",
+    "crates/gam-solve/src/reml/block_quadrature_correction.rs": "71495bf38f41954d72295b2b042d8cabbbb0468c1c4e33a05fe283765a956bb3",
+    "crates/gam-solve/src/reml/boundary_laml.rs": "450d023ba573f1e907bcce1d973ef05c8fe8d5825ab125fb8f0a65e017cdcbb3",
+    "crates/gam-solve/src/reml/continuation.rs": "039239c261e85bd8942e63dfecfb10507d4d02ccfb82bd620bf3cb834d938248",
+    "crates/gam-solve/src/reml/eval.rs": "604eb7192e138a31d45ac70c0bb0dea84568fe3a7fa3ba4402149b89803af4cb",
+    "crates/gam-solve/src/reml/firth.rs": "2806f04c94b0fa99742c1f0a73a9c3b75d6312ba7ec7dd38db7620b14b478f24",
+    "crates/gam-solve/src/reml/gradient_hessian.rs": "cfa384fdeb635881bc21c40ca9bf2e7f3074db67a2e94397db92ed38c12b1337",
+    "crates/gam-solve/src/reml/hyper.rs": "9cc353ff6701ba42fd77d3ae10921eb04eabd0448a8e01ee196fe5ff2264e45a",
+    "crates/gam-solve/src/reml/inner_strategy.rs": "78c0b1036a58cd75f9f8d9b6b9ac5d00bc566c8e887a99466c14382ed85b4ff9",
+    "crates/gam-solve/src/reml/jeffreys_subspace.rs": "ba2266ea6d475a78ad9afd67bac951d290ecce6a055b1a2322bdd4b8552dd90c",
+    "crates/gam-solve/src/reml/laml_logdet.rs": "b48669c607dd300eeb164732b37ed15853b71ef5d4b560ee95ee51f72bfa75ca",
+    "crates/gam-solve/src/reml/mod.rs": "6a100bdf98b99103eba31f70a89901d2361361bb3d2e9f38928e29621fbc6c82",
+    "crates/gam-solve/src/reml/objective.rs": "6571509b17176ad48a3b60156ac359d911ab20a70109a195b4a829a1b9fa2069",
+    "crates/gam-solve/src/reml/outer_eval.rs": "9f260f038e971c74a563b41727978efa895ae8b22e9d29e800717089707c9a9a",
+    "crates/gam-solve/src/reml/penalty_logdet.rs": "ea558852fcfb31d116c8099cdc639f2d2b2abbe9136c9d4d973cf7e3b4ae8c79",
+    "crates/gam-solve/src/reml/per_atom_efs.rs": "15d8d17246c0b296d8c3e3c9792613878e0090245c2909af31ed08348799c48f",
+    "crates/gam-solve/src/reml/rail_face_limit.rs": "1a5fcec8e0f16090270f8960c2f1ec4ce7aebad947b7b89d8b5d0d068c5b7546",
+    "crates/gam-solve/src/reml/reml_outer_engine.rs": "91f3c83f44011991fa3fb95d7787a15d22e7240ad604857bbdda77fb53dd4425",
+    "crates/gam-solve/src/reml/reparameterized_inner.rs": "74391783ca68fde4b31bb3e72d3d50d89ad61982d7a0bdafb32b4a2992aede79",
+    "crates/gam-solve/src/reml/rho_key.rs": "b5fe22ce80a7fd73757e88f20f0849607d5d8d062e7bbcab42910f21ec60c341",
+    "crates/gam-solve/src/reml/sparse_exact_penalty.rs": "e584df13b88f6cebc5270b772f82530df685a20dc4c3ddd76c00c20d4a462938",
+    "crates/gam-solve/src/reml/state_caches.rs": "063e28910c2422e90c188e6933001c3f151caa77c54bf05c627e889b9ba27b01",
+    "crates/gam-solve/src/reml/trace.rs": "325b7f1b4bcc6af42a80a4e84851339dd130b2bbe25cc7041f58a302a7e18959",
+    "crates/gam-solve/src/rho_optimizer/asymptote_certificate.rs": "feea49cfc8278f893018cf7186445776d64de5bbac78fb42807695bd927fbdfc",
+    "crates/gam-solve/src/rho_optimizer/asymptote_rail_certify_tests.rs": "dc3be92750903f423d9359514595145c1183990d956a9900483cbaa467806910",
+    "crates/gam-solve/src/rho_optimizer/bridges.rs": "a4d17fe92944eb917f1b41f0fbc1c4d3ced6db73ef26364eaa508f353c2fe2d6",
+    "crates/gam-solve/src/rho_optimizer/capability.rs": "79d530b633398746a0d80f9a75aa82b66fa85a2b8f00de896bded0621fade192",
+    "crates/gam-solve/src/rho_optimizer/certified_outer_result_tests.rs": "a8f13dbe11ed30ad1151daefbc0684360955c3714acfe7e1484fe6e0288742db",
+    "crates/gam-solve/src/rho_optimizer/certify_resume_progress_tests.rs": "4cbccaedd554f33f6b35f180c770e2556ff246fa8e7a0478bd8c8e535bd2d042",
+    "crates/gam-solve/src/rho_optimizer/criterion_curvature_ladder_2748_tests.rs": "b7408b15d9cf75d5f908a92ba2c412a978389971e5d29b7cb4812932b823e719",
+    "crates/gam-solve/src/rho_optimizer/criterion_invariance_certificate_tests_2676.rs": "26dbc8adc8d9fe96915c5928ebe226db3fec65a5a08e247ab9057ed4bbb67540",
+    "crates/gam-solve/src/rho_optimizer/efs_fallback_routing_tests.rs": "a4e87bcd4895d3d3c67af4fb8681f6751c561f681cdca72fce6a7385faad6ef5",
+    "crates/gam-solve/src/rho_optimizer/hessian_operator.rs": "5c8e2f5dd156dc7687ce467d62d3e6b09f4dc56e0862b05a132a93508eb500ae",
+    "crates/gam-solve/src/rho_optimizer/inner_cap_schedule_tests.rs": "8fb4204922791432a57d7aaef9a3e5b8909ad07befc71aca943f17acd9befdff",
+    "crates/gam-solve/src/rho_optimizer/inverted_rho_box_tests.rs": "9f869c1be6a3670c0ef7577870ef41dea2f8b06cae390ffae24a0fee54bfa718",
+    "crates/gam-solve/src/rho_optimizer/kl_certificate.rs": "920823d1f1fb4e8ed6a009f37f6b57698d5de80887ef2216fb0005e19eb2c9d4",
+    "crates/gam-solve/src/rho_optimizer/lower_bound_outward_tests.rs": "27ff71119e031622f5cf96723fab7755c39e55b47f7637f27c7c10eb63915eb9",
+    "crates/gam-solve/src/rho_optimizer/objective.rs": "385b011d8ace4367aa9937b058eb355893ccb81ee80b0c01a1bf79ee2ad36bce",
+    "crates/gam-solve/src/rho_optimizer/outer_stationarity_band_tests.rs": "d2c21fd484dc4c22345bfc3d4e04562b1a8727b36bec1763ba331739e24bf8de",
+    "crates/gam-solve/src/rho_optimizer/projected_gradient_tests.rs": "5aca5dc9b6663fafbc65b9a30e6c578dc979060f06d0d8c3a88bf3cbab787b3c",
+    "crates/gam-solve/src/rho_optimizer/rail_barrier_removal_tests.rs": "af097311b3bfa942a27bd754968c976d6da366ccd742d22934ed2ba6533939ef",
+    "crates/gam-solve/src/rho_optimizer/rail_face.rs": "1075b24fec5e7ada562c32f4dd19381d648c4d8028c15c1162fc873db986fcfe",
+    "crates/gam-solve/src/rho_optimizer/rail_projection_tests.rs": "356c69b224a43defe5b093df39b704ba0b276c4fecb41cf11d880332834687e1",
+    "crates/gam-solve/src/rho_optimizer/run.rs": "b2ee628b7caea2b03619e075b19c6eadfbe78906ca9ef0ec2b74affb8cccead4",
+    "crates/gam-solve/src/rho_optimizer/run_fixed_point_continuation_tests.rs": "34ad758a9da33360fcb81ec1a4ddabbc8166decfb2ae7d81f694aa0d243fa285",
+    "crates/gam-solve/src/rho_optimizer/run_plan.rs": "b7959c1ad0c39519c3c1b7f496187815d7316cfdafc9a568ed9ec324f87c7184",
+    "crates/gam-solve/src/rho_optimizer/run_plan_caller_requirement_tests_2568.rs": "f77a8d13ccdec253df8f3d6e2f73251bbfd4c6cd55b931773d1e25616705e840",
+    "crates/gam-solve/src/rho_optimizer/run_plan_certificate_face_tests.rs": "23389a8291a12baa7386ad5bfd1867b39b9436fe0f1cce4a3da4f50b54924bea",
+    "crates/gam-solve/src/rho_optimizer/run_plan_saddle_escape_tests.rs": "d485d9883447abe6df8ff3b057a24a80f6005864ecb50c96c36da1df5942ee3a",
+    "crates/gam-solve/src/rho_optimizer/run_plan_seed_cascade_tests.rs": "aa810aaa32c732095c2e5c3d2b2632ab4093fe2133af90f070df2c6ae1c24686",
+    "crates/gam-solve/src/rho_optimizer/run_plan_stationarity_band_tests.rs": "a5da9a772b9f3541eedae229695dcb4d522e2bd34b2e9384db98157466057cf5",
+    "crates/gam-solve/src/rho_optimizer/run_plan_tests.rs": "6471e19672fcb2adc0f08f6098d4e7808503facb7935503c51d9003d3cb62ddb",
+    "crates/gam-solve/src/rho_optimizer/run_plan_warm_start_cache_tests.rs": "4c924a6672cc9d5b5e6d61c2b9e2a821a4f6e8d10e855183ee2bcf00795829a3",
+    "crates/gam-solve/src/rho_optimizer/seed_screening.rs": "d1be779bb0ec94416af67476cdeb9f1b77c27731c939e35198a37edfa9ddb44e",
+    "crates/gam-solve/src/rho_optimizer/soft_rho_guard_floor.rs": "bbdf317575bc41fd2dc512993ca3b95d514f15cd6f77a82f8f820505cd20a995",
+    "crates/gam-solve/src/rho_optimizer/soft_rho_guard_floor_tests.rs": "c1d882314a733b209af73a4b08637a10fb0557132a9f38c25bfbbce04bd1f38d",
+    "crates/gam-solve/src/reml/jeffreys_subspace/mixed.rs": "3a39d532706ea502320d055f0aac9335ef6d21fe36703bcb07c6431deb2714ee",
+    "crates/gam-solve/src/reml/reml_outer_engine/corrected_covariance.rs": "aae545f96a9d75afbd4f2e3fce4fa48ab1b07c5900e5086b7dc834dfdecda5de",
+    "crates/gam-solve/src/reml/reml_outer_engine/dense_projection.rs": "0b5f0f53bc2d570e778898e9b9122a26b593c3d7549e1c8950e5be63d1fb965a",
+    "crates/gam-solve/src/reml/reml_outer_engine/dense_spectral.rs": "3bd08f2e2d3278afa33a098c76b44bdffcd7b3acc9135235227a03d8ae4e0b92",
+    "crates/gam-solve/src/reml/reml_outer_engine/derivative_providers.rs": "f0746fbe43479c21df512d723fc3d86cea48e8acba648a5d19bf6f01a4f4921e",
+    "crates/gam-solve/src/reml/reml_outer_engine/efs.rs": "51b634443ed750bfa1df7e13df646b536883177265b9a4047d036bdf4ca7ca5e",
+    "crates/gam-solve/src/reml/reml_outer_engine/error.rs": "7cb3184ca6ac2c74c8889ae44c136d63a7b379ebe2eaf70710de4ff4104c84cd",
+    "crates/gam-solve/src/reml/reml_outer_engine/hessian_operator_trait.rs": "2e764007855810c21667e875da4b042359bc634dd0bc7d9f9373a06c35df37dd",
+    "crates/gam-solve/src/reml/reml_outer_engine/hyper_operator.rs": "7872c001fdd8c248459fcfc954e6a4c83ef2b71774806c6c981f9fe102038cfd",
+    "crates/gam-solve/src/reml/reml_outer_engine/inner_solution.rs": "5d66e1ea87fba9dc6654c40c312e550c490e25eccc477eec68c9cfe73bc2386d",
+    "crates/gam-solve/src/reml/reml_outer_engine/logdet_lane_agreement_2457_tests.rs": "d024256af5a93b25ca82171290a5abd5e882b4dd378b3c99a4690e0143388466",
+    "crates/gam-solve/src/reml/reml_outer_engine/objective.rs": "2b54e06ddf132970f5e39b8424454644e36b7852091c82930487590efba7b3e3",
+    "crates/gam-solve/src/reml/reml_outer_engine/outer_derivatives.rs": "a2457f57e2d558f33b0e534d0da64c90bba6251fe6358013b029f36fffe64648",
+    "crates/gam-solve/src/reml/reml_outer_engine/outer_entry_helpers.rs": "db1f555d81206b856d26af47c46e1d0cde4f16540abba102b528d74dcd0e4bee",
+    "crates/gam-solve/src/reml/reml_outer_engine/penalty_coordinate.rs": "c1d1b81a0495b908c852751de4b216f15df845b0ca7de1f8b6dba7c39423ec06",
+    "crates/gam-solve/src/reml/reml_outer_engine/pseudo_logdet.rs": "c04b9058aea045b8f8ce6ce910476a6fd5613b69d42780064b73f81b887d4134",
+    "crates/gam-solve/src/reml/reml_outer_engine/psi_logdet_chain_tests.rs": "2f44c9c7a4b4e39fe92dff80f039d9eea2974a94b07f1e0aabbe68d8c0d0f83a",
+    "crates/gam-solve/src/reml/reml_outer_engine/sparse_cholesky_backends.rs": "c842b32b71576fa37f207e5c94d3b54dc1a9bb26903268ca504fd21c4195823b",
+    "crates/gam-solve/src/reml/reml_outer_engine/stochastic_trace.rs": "930443ccdac0281b205707fc759b774aa7bf013bc24c88aad7fb3c07012bcced",
+    "crates/gam-solve/src/reml/reml_outer_engine/tests.rs": "251e85a67a6cae965b9793541acda854010b122495c2a48587aba05a319077cb",
+    "crates/gam-solve/src/reml/reml_outer_engine/outer_derivatives/dense.rs": "a0f20dc3250034f78ca9143e935680d21e57ef1582d94c68f468c7278aedf071",
+    "crates/gam-solve/src/reml/reml_outer_engine/outer_derivatives/kkt.rs": "3e5909588655ecdea425dbf4cb8a32e9d2d5dc7c4aaeb0cbfaf1db5eebd30005",
+    "crates/gam-solve/src/reml/reml_outer_engine/outer_derivatives/operator.rs": "1426eb294e5b5596923d3d092e453f45930c9c37c832ca5b10d9106ce8e869f1",
+    "crates/gam-solve/src/reml/reml_outer_engine/outer_derivatives/routing.rs": "2d721aefdab937013512bf83a3567b99a4e24d992e975da3c7eda46da1985f46",
+    "crates/gam-solve/src/reml/reml_outer_engine/outer_derivatives/traces.rs": "288e911e6e120cfa4a5e1de5c2b1445046fd6055e2b125238976bddedc9eeb0b"
+  },
+  "dependencies": {
+    "gam_model_api": {
+      "path": "/scratch.global/sauer354/y2-target/debug/deps/libgam_model_api-e0c7d13c15e8a352.rlib",
+      "fingerprint": 14649528951144264437,
+      "packages": [
+        {
+          "name": "gam-model-api",
+          "version": "0.3.154",
+          "source": "workspace"
+        }
+      ]
+    },
+    "gam_problem": {
+      "path": "/scratch.global/sauer354/y2-target/debug/deps/libgam_problem-81fc31c6a4cabd27.rlib",
+      "fingerprint": 238185903743916346,
+      "packages": [
+        {
+          "name": "gam-problem",
+          "version": "0.3.154",
+          "source": "workspace"
+        }
+      ]
+    },
+    "gam_math": {
+      "path": "/scratch.global/sauer354/y2-target/debug/deps/libgam_math-791060a41b576a00.rlib",
+      "fingerprint": 16541181304435038369,
+      "packages": [
+        {
+          "name": "gam-math",
+          "version": "0.3.154",
+          "source": "workspace"
+        }
+      ]
+    },
+    "gam_runtime": {
+      "path": "/scratch.global/sauer354/y2-target/debug/deps/libgam_runtime-e75ae3ffced32f60.rlib",
+      "fingerprint": 8844287031238122127,
+      "packages": [
+        {
+          "name": "gam-runtime",
+          "version": "0.3.154",
+          "source": "workspace"
+        }
+      ]
+    },
+    "ndarray": {
+      "path": "/scratch.global/sauer354/y2-target/debug/deps/libndarray-ab975d6b1aeb6a2f.rlib",
+      "fingerprint": 15238668943421500057,
+      "packages": [
+        {
+          "name": "ndarray",
+          "version": "0.16.1",
+          "source": "registry+https://github.com/rust-lang/crates.io-index"
+        },
+        {
+          "name": "ndarray",
+          "version": "0.17.2",
+          "source": "registry+https://github.com/rust-lang/crates.io-index"
+        }
+      ]
+    },
+    "gam_linalg": {
+      "path": "/scratch.global/sauer354/y2-target/debug/deps/libgam_linalg-3608fedf752b15f8.rlib",
+      "fingerprint": 17368332288007781025,
+      "packages": [
+        {
+          "name": "gam-linalg",
+          "version": "0.3.154",
+          "source": "workspace"
+        }
+      ]
+    },
+    "rand": {
+      "path": "/scratch.global/sauer354/y2-target/debug/deps/librand-adfbedc03db3331d.rlib",
+      "fingerprint": 1630538143993178901,
+      "packages": [
+        {
+          "name": "rand",
+          "version": "0.8.7",
+          "source": "registry+https://github.com/rust-lang/crates.io-index"
+        },
+        {
+          "name": "rand",
+          "version": "0.9.5",
+          "source": "registry+https://github.com/rust-lang/crates.io-index"
+        },
+        {
+          "name": "rand",
+          "version": "0.10.2",
+          "source": "registry+https://github.com/rust-lang/crates.io-index"
+        }
+      ]
+    },
+    "serde_json": {
+      "path": "/scratch.global/sauer354/y2-target/debug/deps/libserde_json-11ee3b7aff44a200.rlib",
+      "fingerprint": 9711974206181038127,
+      "packages": [
+        {
+          "name": "serde_json",
+          "version": "1.0.151",
+          "source": "registry+https://github.com/rust-lang/crates.io-index"
+        }
+      ]
+    },
+    "gam_spec": {
+      "path": "/scratch.global/sauer354/y2-target/debug/deps/libgam_spec-6837cdbed434f2ca.rlib",
+      "fingerprint": 10099066132464953858,
+      "packages": [
+        {
+          "name": "gam-spec",
+          "version": "0.3.154",
+          "source": "workspace"
+        }
+      ]
+    },
+    "gam_terms": {
+      "path": "/scratch.global/sauer354/y2-target/debug/deps/libgam_terms-1ca43e98d8fab0bf.rlib",
+      "fingerprint": 4891212678374709583,
+      "packages": [
+        {
+          "name": "gam-terms",
+          "version": "0.3.154",
+          "source": "workspace"
+        }
+      ]
+    },
+    "serde": {
+      "path": "/scratch.global/sauer354/y2-target/debug/deps/libserde-0c936cd7fbae874d.rlib",
+      "fingerprint": 1173488584956919962,
+      "packages": [
+        {
+          "name": "serde",
+          "version": "1.0.229",
+          "source": "registry+https://github.com/rust-lang/crates.io-index"
+        }
+      ]
+    },
+    "opt": {
+      "path": "/scratch.global/sauer354/y2-target/debug/deps/libopt-b8b2b07aaa7c7cb1.rlib",
+      "fingerprint": 17804082136799036093,
+      "packages": [
+        {
+          "name": "opt",
+          "version": "0.8.1",
+          "source": "git+https://github.com/SauersML/opt.git?rev=706f0c4c23a21c2e4e205358229fe061717b6410#706f0c4c23a21c2e4e205358229fe061717b6410"
+        }
+      ]
+    },
+    "faer": {
+      "path": "/scratch.global/sauer354/y2-target/debug/deps/libfaer-ca97a0293c7f665e.rlib",
+      "fingerprint": 15866416306983636929,
+      "packages": [
+        {
+          "name": "faer",
+          "version": "0.24.4",
+          "source": "registry+https://github.com/rust-lang/crates.io-index"
+        }
+      ]
+    },
+    "cudarc": {
+      "path": "/scratch.global/sauer354/y2-target/debug/deps/libcudarc-dd3286f95c639fbb.rlib",
+      "fingerprint": 1118443218980222801,
+      "packages": [
+        {
+          "name": "cudarc",
+          "version": "0.19.8",
+          "source": "registry+https://github.com/rust-lang/crates.io-index"
+        }
+      ]
+    },
+    "gam_geometry": {
+      "path": "/scratch.global/sauer354/y2-target/debug/deps/libgam_geometry-d3063ff39fe7a10d.rlib",
+      "fingerprint": 18285291733590191985,
+      "packages": [
+        {
+          "name": "gam-geometry",
+          "version": "0.3.154",
+          "source": "workspace"
+        }
+      ]
+    },
+    "tempfile": {
+      "path": "/scratch.global/sauer354/y2-target/debug/deps/libtempfile-3a05c6673b94f725.rlib",
+      "fingerprint": 765989012847407116,
+      "packages": [
+        {
+          "name": "tempfile",
+          "version": "3.27.0",
+          "source": "registry+https://github.com/rust-lang/crates.io-index"
+        }
+      ]
+    },
+    "num_dual": {
+      "path": "/scratch.global/sauer354/y2-target/debug/deps/libnum_dual-c901e8de18fc6eb1.rlib",
+      "fingerprint": 14090125433273620818,
+      "packages": [
+        {
+          "name": "num-dual",
+          "version": "0.14.1",
+          "source": "registry+https://github.com/rust-lang/crates.io-index"
+        }
+      ]
+    },
+    "dyn_stack": {
+      "path": "/scratch.global/sauer354/y2-target/debug/deps/libdyn_stack-bb03e1839603d1e1.rlib",
+      "fingerprint": 1090354658555471534,
+      "packages": [
+        {
+          "name": "dyn-stack",
+          "version": "0.13.2",
+          "source": "registry+https://github.com/rust-lang/crates.io-index"
+        }
+      ]
+    },
+    "rayon": {
+      "path": "/scratch.global/sauer354/y2-target/debug/deps/librayon-b9eab60993769b84.rlib",
+      "fingerprint": 4901781738981631049,
+      "packages": [
+        {
+          "name": "rayon",
+          "version": "1.12.0",
+          "source": "registry+https://github.com/rust-lang/crates.io-index"
+        }
+      ]
+    },
+    "gam_gpu": {
+      "path": "/scratch.global/sauer354/y2-target/debug/deps/libgam_gpu-edd8119a6a3ad4b4.rlib",
+      "fingerprint": 7634210738362356515,
+      "packages": [
+        {
+          "name": "gam-gpu",
+          "version": "0.3.154",
+          "source": "workspace"
+        }
+      ]
+    },
+    "rand_distr": {
+      "path": "/scratch.global/sauer354/y2-target/debug/deps/librand_distr-e4c951f9be03bc6f.rlib",
+      "fingerprint": 8067701633228384063,
+      "packages": [
+        {
+          "name": "rand_distr",
+          "version": "0.4.3",
+          "source": "registry+https://github.com/rust-lang/crates.io-index"
+        },
+        {
+          "name": "rand_distr",
+          "version": "0.5.1",
+          "source": "registry+https://github.com/rust-lang/crates.io-index"
+        },
+        {
+          "name": "rand_distr",
+          "version": "0.6.0",
+          "source": "registry+https://github.com/rust-lang/crates.io-index"
+        }
+      ]
+    },
+    "statrs": {
+      "path": "/scratch.global/sauer354/y2-target/debug/deps/libstatrs-422a5716824bf862.rlib",
+      "fingerprint": 1912241839707572699,
+      "packages": [
+        {
+          "name": "statrs",
+          "version": "0.18.0",
+          "source": "registry+https://github.com/rust-lang/crates.io-index"
+        },
+        {
+          "name": "statrs",
+          "version": "0.19.0",
+          "source": "registry+https://github.com/rust-lang/crates.io-index"
+        }
+      ]
+    },
+    "approx": {
+      "path": "/scratch.global/sauer354/y2-target/debug/deps/libapprox-bcfe282b3fa2e63d.rlib",
+      "fingerprint": 1932796622091968135,
+      "packages": [
+        {
+          "name": "approx",
+          "version": "0.5.1",
+          "source": "registry+https://github.com/rust-lang/crates.io-index"
+        }
+      ]
+    },
+    "env_logger": {
+      "path": "/scratch.global/sauer354/y2-target/debug/deps/libenv_logger-37f32cb3b2755a24.rlib",
+      "fingerprint": 9914168359999296262,
+      "packages": [
+        {
+          "name": "env_logger",
+          "version": "0.11.11",
+          "source": "registry+https://github.com/rust-lang/crates.io-index"
+        }
+      ]
+    },
+    "log": {
+      "path": "/scratch.global/sauer354/y2-target/debug/deps/liblog-17a5faa6bef040a1.rlib",
+      "fingerprint": 9017142329531603010,
+      "packages": [
+        {
+          "name": "log",
+          "version": "0.4.33",
+          "source": "registry+https://github.com/rust-lang/crates.io-index"
+        }
+      ]
+    }
+  },
+  "cargo_lock_sha256": "8d49d1b479770e0666cf8fe26bc66dd3199ec632c4f03ca300397689bbef69bb",
+  "compile_elapsed_seconds": 92.10576653998578,
+  "compile_exit": 0
+}

@@ -2398,6 +2398,12 @@ pub fn row_atom(input: TokenStream) -> TokenStream {
 /// compute each nonzero gradient and packed Hessian component once, and scatter
 /// Hessian symmetry only at the output seam.
 ///
+/// Two-primary programs may request `emit [fifth]` for the full symmetric
+/// fifth tensor. Such a program must supply six derivatives per leaf: either
+/// six `supplied` entries or an explicit sixth-stack Rust builder declared as
+/// `leaf => order_four_rust => cuda => order_five_rust`. Lower-order emissions
+/// continue to call the order-four builder, preserving their evaluation cost.
+///
 /// A constant may be declared with the role `name: sign`, a value in
 /// `{-1, +1}`: its square is one, so a composition on `scale(x, s)` forms
 /// `s·f'` once and reads `f''` as it is, as a hand kernel that knows the sign

@@ -1,0 +1,41 @@
+{
+  "command": [
+    "taskset",
+    "-c",
+    "112-113",
+    "rustc",
+    "--edition=2024",
+    "--test",
+    "crates/gam-solve/tests/outer_decrement_2817.rs",
+    "--crate-name",
+    "outer_decrement_2817",
+    "--deny=warnings",
+    "-Copt-level=1",
+    "-Cdebuginfo=0",
+    "-Ccodegen-units=16",
+    "-Clto=off",
+    "-L",
+    "dependency=/scratch.global/sauer354/gam-deslop-a2-target/debug/deps",
+    "-L",
+    "native=/scratch.global/sauer354/gam-deslop-a2-target/debug/build/zstd-sys-cf55b24880b1a3c0/out",
+    "-o",
+    ".buildd/outer-decrement-2817-final",
+    "--extern",
+    "gam_solve=/scratch.global/sauer354/gam-deslop-a2-target/debug/deps/libgam_solve-f21cb97c032684e8.rlib",
+    "--extern",
+    "gam_problem=/scratch.global/sauer354/gam-deslop-a2-target/debug/deps/libgam_problem-a7ac6b5118c5d832.rlib",
+    "--extern",
+    "ndarray=/scratch.global/sauer354/gam-deslop-a2-target/debug/deps/libndarray-3e2fc606731d0706.rlib",
+    "--extern",
+    "opt=/scratch.global/sauer354/gam-deslop-a2-target/debug/deps/libopt-5dde3eb0c3e8fe95.rlib"
+  ],
+  "rlib_sha256": {
+    "/scratch.global/sauer354/gam-deslop-a2-target/debug/deps/libgam_solve-f21cb97c032684e8.rlib": "25f8c73ff9c3f814a9d94ee3e03b7d3a3363d7e05de79561ed2f48b2eb35fa53",
+    "/scratch.global/sauer354/gam-deslop-a2-target/debug/deps/libgam_problem-a7ac6b5118c5d832.rlib": "874a6bc21fbeca79aa0ed3f360d1ea9cc87c93d93dc9169bb981b30b7990eeee",
+    "/scratch.global/sauer354/gam-deslop-a2-target/debug/deps/libndarray-3e2fc606731d0706.rlib": "6ff031e72852ea7b9a339d10a8f4b11f32de215a8d404b1f04af0d5761e713eb",
+    "/scratch.global/sauer354/gam-deslop-a2-target/debug/deps/libopt-5dde3eb0c3e8fe95.rlib": "1dd373c8dc89c1efdd3e8b609b4b28a5285355dc45a7efc5063109bdbd14c306"
+  },
+  "source_sha256": "53e3203c8b081a9f28e455bf5b620c4981ed5efd64af0b670f57b71e6d338711",
+  "exit": 0,
+  "seconds": 2.05476713180542
+}

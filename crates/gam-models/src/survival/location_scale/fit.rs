@@ -534,9 +534,22 @@ pub(crate) fn fit_survival_location_scale_terms(
             // when the term's realized upper bound is tighter (the
             // effective-df-floor tightening): `run_plan` projects every seed
             // onto the realized per-coordinate box before use.
+            // The time warp is seeded at its null space: the ρ at which its
+            // penalty switches the term off to working precision (#2812), read
+            // off the exit-time design and the penalty themselves.
             let mut time_seed = rho0.slice_mut(s![range.start..range.end]);
-            for v in time_seed.iter_mut() {
-                *v = gam_custom_family::EFFECTIVE_DF_CEILING;
+            for (k, v) in time_seed.iter_mut().enumerate() {
+                *v = spec
+                    .time_block
+                    .penalties
+                    .get(k)
+                    .and_then(|penalty| {
+                        gam_custom_family::penalized_term_switch_off_rho(
+                            &spec.time_block.design_exit,
+                            penalty,
+                        )
+                    })
+                    .unwrap_or(gam_solve::estimate::rho_domain::precision_box().1);
             }
         }
     }

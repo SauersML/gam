@@ -11,8 +11,7 @@
 //! the single home for that assembly so improvements to it land once.
 
 use crate::fit_orchestration::drivers::{
-    ExactJointHyperSetup, JOINT_RHO_BOUND, joint_rho_search_box,
-    spatial_length_scale_term_indices,
+    ExactJointHyperSetup, spatial_length_scale_term_indices,
 };
 use gam_terms::smooth::{
     SpatialLengthScaleOptimizationOptions, SpatialLogKappaCoords, TermCollectionSpec,
@@ -35,41 +34,19 @@ pub(crate) fn location_scale_coefficient_hessian_cost(
     crate::coefficient_cost::joint_coupled_operator_aware_hessian_cost(n, specs)
 }
 
-/// Assemble the exact-joint hyperparameter setup for a location-scale family
-/// whose linear predictors are described, in theta order, by `blocks`.
-///
-/// `blocks` lists the per-predictor [`TermCollectionSpec`]s (e.g.
-/// `[meanspec, noisespec]` for GAMLSS, `[thresholdspec, log_sigmaspec]` for
-/// survival location-scale). The spatial `log κ` seed and its data-aware
-/// lower/upper bounds are built per block — using `kappa_options` and the
-/// term indices flagged for spatial length-scale optimization — and
-/// concatenated in block order, matching the layout the exact-joint optimizer
-/// expects.
-///
-/// `rho0` carries the caller-assembled smoothing/dispersion seed (already
-/// ordered to match the penalty layout). Its box is the ONE joint-search box
-/// policy, [`joint_rho_search_box`]: the `±JOINT_RHO_BOUND` prior per
-/// coordinate, widened to the engine's own `±RHO_BOUND` on any coordinate
-/// whose incumbent the prior would pin to a wall. This site used to write a
-/// flat `±12` box of its own (`EXACT_JOINT_RHO_BOUND`, a second copy of the
-/// same number), which is the mechanism #2760 and #2748 measured on the
-/// spatial and mean-wiggle routes: an incumbent at or past the wall is an
-/// active constraint from iteration zero, its outward gradient is projected
-/// away, and the search reports a non-stationary refusal one coordinate away
-/// from a feasible-set defect. A location-scale fit with NO spatial terms
-/// never reaches this box — it routes through `fit_custom_family`, whose ρ
-/// ceiling is `gam_custom_family::fit::EFFECTIVE_DF_CEILING`.
+/// The exact-joint hyperparameter setup of a location-scale fit: the ρ seed,
+/// and the κ coordinates and their bounds from the data. The ρ domain is not
+/// this builder's to supply: the driver derives it per coordinate from the
+/// seed design of each block once it has built them (#2812). A location-scale
+/// fit with NO spatial terms never reaches this — it routes through
+/// `fit_custom_family`, whose ρ domain is the same per-term resolvability
+/// interval.
 pub(crate) fn build_location_scale_exact_joint_setup(
     data: ArrayView2<'_, f64>,
     blocks: &[&TermCollectionSpec],
     rho0: Array1<f64>,
     kappa_options: &SpatialLengthScaleOptimizationOptions,
 ) -> Result<ExactJointHyperSetup, gam_terms::basis::BasisError> {
-    let (rho_lower, rho_upper) = joint_rho_search_box(rho0.view(), JOINT_RHO_BOUND);
-
-    // Concatenate per-block anisotropic log(kappa) seeds and their dims in
-    // block order. The exact-joint setup stores the spatial tail in log(kappa),
-    // not log(length_scale); each aniso term contributes d psi entries.
     let mut all_values = Vec::new();
     let mut all_dims = Vec::new();
     let mut lower_vals = Vec::new();
@@ -117,8 +94,6 @@ pub(crate) fn build_location_scale_exact_joint_setup(
 
     Ok(ExactJointHyperSetup::new(
         rho0,
-        rho_lower,
-        rho_upper,
         log_kappa0,
         log_kappa_lower,
         log_kappa_upper,
@@ -296,13 +271,15 @@ mod tests {
                 theta0[k],
                 rho0[k]
             );
+            // #2812: the domain is derived from each block's own spectrum, and
+            // the seed is interior to it.
             assert!(
-                rho0[k].abs() < JOINT_RHO_BOUND,
-                "fixture premise: seed {k} = {} must be interior to the prior",
-                rho0[k]
+                lower[k] < rho0[k] && rho0[k] < upper[k],
+                "seed {k} = {} must be interior to its derived domain [{}, {}]",
+                rho0[k],
+                lower[k],
+                upper[k]
             );
-            assert_eq!(lower[k], -JOINT_RHO_BOUND, "rho lower bound at {k}");
-            assert_eq!(upper[k], JOINT_RHO_BOUND, "rho upper bound at {k}");
         }
 
         // κ tail: must be block A then block B, coordinate-for-coordinate equal

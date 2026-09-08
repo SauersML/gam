@@ -263,33 +263,45 @@ fn certify_flat_valley_point_2596(
     let problem = OuterProblem::new(1)
         .with_gradient(Derivative::Analytic)
         .with_hessian(DeclaredHessianForm::Dense);
-    let mut obj = problem.build_objective_with_eval_order(
-        (),
-        move |_: &mut (), rho: &Array1<f64>| Ok(1.0 + 0.5 * curvature * rho[0] * rho[0]),
-        |_: &mut (), _: &Array1<f64>| {
-            Err(EstimationError::InvalidInput(
-                "this objective is driven through the derivative-order seam".to_string(),
-            ))
-        },
-        move |_: &mut (), rho: &Array1<f64>, order: OuterEvalOrder| {
-            order_log.lock().expect("order log").push(order);
-            Ok(OuterEval {
-                cost: 1.0 + 0.5 * curvature * rho[0] * rho[0],
-                gradient: array![curvature * rho[0]],
-                hessian: match order {
-                    OuterEvalOrder::ValueGradientHessian => {
-                        HessianValue::Dense(array![[curvature]])
-                    }
-                    OuterEvalOrder::Value | OuterEvalOrder::ValueAndGradient => {
-                        HessianValue::Unavailable
-                    }
-                },
-                inner_beta_hint: None,
-            })
-        },
-        None::<fn(&mut ())>,
-        None::<fn(&mut (), &Array1<f64>) -> Result<EfsEval, EstimationError>>,
-    );
+    // #2812: the fixture's criterion declares its own resolution,
+    // `1e-7 · (1 + |V|)`, the band the flat-valley widening is derived against.
+    let mut obj = problem
+        .build_objective_with_eval_order(
+            std::cell::Cell::new(0.0_f64),
+            move |last_cost: &mut std::cell::Cell<f64>, rho: &Array1<f64>| {
+                last_cost.set(1.0 + 0.5 * curvature * rho[0] * rho[0]);
+                Ok(1.0 + 0.5 * curvature * rho[0] * rho[0])
+            },
+            |_: &mut std::cell::Cell<f64>, _: &Array1<f64>| {
+                Err(EstimationError::InvalidInput(
+                    "this objective is driven through the derivative-order seam".to_string(),
+                ))
+            },
+            move |last_cost: &mut std::cell::Cell<f64>, rho: &Array1<f64>, order: OuterEvalOrder| {
+                order_log.lock().expect("order log").push(order);
+                last_cost.set(1.0 + 0.5 * curvature * rho[0] * rho[0]);
+                Ok(OuterEval {
+                    cost: 1.0 + 0.5 * curvature * rho[0] * rho[0],
+                    gradient: array![curvature * rho[0]],
+                    hessian: match order {
+                        OuterEvalOrder::ValueGradientHessian => {
+                            HessianValue::Dense(array![[curvature]])
+                        }
+                        OuterEvalOrder::Value | OuterEvalOrder::ValueAndGradient => {
+                            HessianValue::Unavailable
+                        }
+                    },
+                    inner_beta_hint: None,
+                })
+            },
+            None::<fn(&mut std::cell::Cell<f64>)>,
+            None::<
+                fn(&mut std::cell::Cell<f64>, &Array1<f64>) -> Result<EfsEval, EstimationError>,
+            >,
+        )
+        .with_criterion_resolution(|last_cost: &mut std::cell::Cell<f64>| {
+            Some(1.0e-7 * (1.0 + last_cost.get().abs()))
+        });
     let mut result = OuterResult::new(
         array![offset],
         1.0 + 0.5 * curvature * offset * offset,

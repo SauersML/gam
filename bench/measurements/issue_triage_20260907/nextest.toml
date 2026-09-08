@@ -1,0 +1,9 @@
+# Bounded discovery runs on the saved test binary. A timeout is an unresolved
+# test, never a passing result or a solver convergence allowance.
+[profile.default]
+slow-timeout = { period = "15s", terminate-after = 2 }
+test-threads = 2
+fail-fast = false
+status-level = "pass"
+failure-output = "immediate"
+success-output = "never"

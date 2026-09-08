@@ -25,7 +25,7 @@ The closed-form Gaussian REML primitives have analytic Rust VJPs.
 `GaussianRemlOutput` (`coefficients`, `fitted`, `lam`, `reml_score`, `edf`)
 and route upstream gradients into the matching Rust backward:
 
-```python no-exec
+```python
 import torch
 import gamfit.torch as gt
 
@@ -51,7 +51,7 @@ in-place mutation between forward and backward raises `RuntimeError`.
 
 `from_fitted` wraps a fitted `gamfit.Model` as a frozen `nn.Module`:
 
-```python no-exec
+```python
 import gamfit
 import gamfit.torch as gt
 
@@ -100,7 +100,7 @@ can support reverse AD while lacking the forward-mode JVP these two harvests
 require. For Hugging Face models, select the differentiable attention path when
 the model is loaded:
 
-```python no-exec
+```python
 model = AutoModelForCausalLM.from_pretrained(
     model_id,
     attn_implementation="eager",

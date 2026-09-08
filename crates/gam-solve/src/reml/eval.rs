@@ -601,9 +601,10 @@ fn sigma_step_to_rho_domain(
 }
 
 impl<'a> RemlState<'a> {
-    /// Integrate the sampler's declared density, including the distribution
-    /// prior and precision-to-log-precision Jacobian, rather than treating
-    /// REML's fitting criterion as a normalized posterior.
+    /// The posterior density is distinct from the criterion minimized by REML.
+    /// In particular, a flat criterion on a saturated penalty face cannot be
+    /// normalized as a density on log precision. Use the sampler's declared
+    /// distribution policy for both calibration and quadrature weights.
     fn compute_rho_posterior_cost_uncharged(
         &self,
         rho: &Array1<f64>,
@@ -1057,8 +1058,7 @@ impl<'a> RemlState<'a> {
                         self.without_persistent_warm_start_store(|| self.compute_cost(rho).ok())
                             .and_then(|cost| {
                                 self.rho_prior_distribution_correction(rho)
-                                    .ok()
-                                    .map(|(prior_cost, _)| cost + prior_cost)
+                                    .ok().map(|(prior_cost, _)| cost + prior_cost)
                             })
                     },
                     &mut |rho| {
@@ -1071,8 +1071,7 @@ impl<'a> RemlState<'a> {
                         })
                         .and_then(|(cost, gradient)| {
                             self.rho_prior_distribution_correction(rho)
-                                .ok()
-                                .map(|(prior_cost, prior_gradient)| {
+                                .ok().map(|(prior_cost, prior_gradient)| {
                                     (cost + prior_cost, gradient + prior_gradient)
                                 })
                         })
@@ -1093,7 +1092,6 @@ impl<'a> RemlState<'a> {
         dispersion_phi: f64,
         finalgrad_norm: f64,
         outer_gradient: &Array1<f64>,
-        outer_hessian: Option<&Array2<f64>>,
         caller_measured_hessian_error: &[gam_linalg::curvature_resolution::MeasuredHessianError],
     ) -> Result<SmoothingCorrectionOutcome, EstimationError> {
         use SmoothingCorrectionFallbackSeverity::{NumericalFailure, Routine};
@@ -1105,7 +1103,6 @@ impl<'a> RemlState<'a> {
             final_lambdas,
             final_fit,
             outer_gradient,
-            outer_hessian,
             caller_measured_hessian_error,
         );
         let first_order_correction = first_order.correction.clone();
@@ -2151,10 +2148,6 @@ mod smoothing_correction_outcome_tests {
                     dispersion_phi,
                     finalgrad_norm,
                     &finalgrad,
-                    // This harness has no outer solver behind it, so there is no
-                    // second assembly of the rho-Hessian to compare against: an
-                    // absent measurement, not a zero (#2748).
-                    None,
                     &[],
                 )
                 .expect("smoothing correction evaluation");
@@ -2174,25 +2167,25 @@ mod smoothing_correction_outcome_tests {
             let outcome_description = format!("{outcome:?}");
             let correction =
                 outcome.into_correction_with_method().0.unwrap_or_else(|| {
-                // Name the SPECTRUM, not just the verdict.
-                //
-                // Two hypotheses for `active_rank = 0` have now been refuted by
-                // measurement: the near-boundary ρ (moving to an interior 0.0
-                // changed nothing) and a swallowed outer gradient (the panic
-                // above never fired, so `compute_gradient` succeeded). What is
-                // left is the classification rule itself, and it splits the one
-                // direction three ways —
-                //
-                //   Active             σ > floor
-                //   StructuralZero     |σ| <= eigensolver backward error
-                //   BelowGradientFloor otherwise
-                //
-                // with `floor = Σ_k |g_k|·v_k²` (#2428). Those three have
-                // different causes and different fixes, and `V_ρ = [[0.0]]`
-                // looks identical under all of them. `invert_identified_rho_hessian`
-                // already computes the discriminating numbers; the failure path
-                // just never asked for them.
-                let spectrum = match self_hessian_for_diagnosis.as_ref() {
+                    // Name the SPECTRUM, not just the verdict.
+                    //
+                    // Two hypotheses for `active_rank = 0` have now been refuted by
+                    // measurement: the near-boundary ρ (moving to an interior 0.0
+                    // changed nothing) and a swallowed outer gradient (the panic
+                    // above never fired, so `compute_gradient` succeeded). What is
+                    // left is the classification rule itself, and it splits the one
+                    // direction three ways —
+                    //
+                    //   Active             σ > floor
+                    //   StructuralZero     |σ| <= eigensolver backward error
+                    //   BelowGradientFloor otherwise
+                    //
+                    // with `floor = Σ_k |g_k|·v_k²` (#2428). Those three have
+                    // different causes and different fixes, and `V_ρ = [[0.0]]`
+                    // looks identical under all of them. `invert_identified_rho_hessian`
+                    // already computes the discriminating numbers; the failure path
+                    // just never asked for them.
+                    let spectrum = match self_hessian_for_diagnosis.as_ref() {
                     Ok(h) => {
                         match crate::estimate::smoothing_correction::invert_identified_rho_hessian(
                             h, 0, &finalgrad, None, &[],
@@ -2215,14 +2208,14 @@ mod smoothing_correction_outcome_tests {
                     }
                     Err(err) => format!("rho Hessian unavailable at this rho: {err}"),
                 };
-                panic!(
-                    "cubature/first-order outcome carries a correction matrix; \
+                    panic!(
+                        "cubature/first-order outcome carries a correction matrix; \
                      got: {outcome_description}; rho={final_rho:?} \
                      grad={finalgrad:?} |g|={finalgrad_norm:.6e} \
                      deviance={:.6e} rho-Hessian spectrum: {spectrum}",
-                    final_fit.deviance,
-                )
-            });
+                        final_fit.deviance,
+                    )
+                });
             (correction, after.saturating_sub(before))
         };
 

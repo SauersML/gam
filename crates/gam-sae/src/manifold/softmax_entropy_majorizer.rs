@@ -77,7 +77,12 @@ fn softmax_dense_entropy_hessian_entry(a: &[f64], kk: usize, jj: usize, m: f64, 
 /// arithmetic) as `psd_majorizer_abs_row_sums`, which is what keeps the
 /// bit-for-bit oracle green. Still `O(K)` and still allocation-free.
 #[inline]
-pub(crate) fn active_softmax_gershgorin_majorizer_entry(a: &[f64], kk: usize, m: f64, scale: f64) -> f64 {
+pub(crate) fn active_softmax_gershgorin_majorizer_entry(
+    a: &[f64],
+    kk: usize,
+    m: f64,
+    scale: f64,
+) -> f64 {
     let l_kk = softmax_entropy_log_plus_one(a[kk]);
     // Diagonal entry H_kk.
     let h_kk = scale * a[kk] * ((m - l_kk - 1.0) + a[kk] * (2.0 * l_kk + 1.0 - 2.0 * m));
@@ -139,29 +144,55 @@ pub(crate) fn active_softmax_gershgorin_majorizer_entry(a: &[f64], kk: usize, m:
 /// Two passes over the row (scale, then contraction), diagonal-first then
 /// `j ≠ k` ascending — the SAME traversal and arithmetic as the value helper and
 /// as the dense twin, which is what keeps the bit-for-bit oracle green.
-#[inline]
-fn active_softmax_majorizer_logit_derivative_entry(
-    a: &[f64],
-    kk: usize,
+struct SoftmaxEntropyDerivative<'a> {
+    a: &'a [f64],
     w: usize,
     m: f64,
     scale: f64,
     inv_tau: f64,
-) -> f64 {
-    let a_w = a[w];
-    // ∂a_r/∂z_w = a_r(δ_rw − a_w)/τ ; ∂L_r/∂z_w = (∂a_r/∂z_w)/a_r ;
-    // dm = Σ_r (da_r·l_r + a_r·dl_r). One O(K) pass.
-    let da = |r: usize| a[r] * (if r == w { 1.0 } else { 0.0 } - a_w) * inv_tau;
-    let l = |r: usize| softmax_entropy_log_plus_one(a[r]);
-    let dl = |r: usize| if a[r] > 0.0 { da(r) / a[r] } else { 0.0 };
-    let dm: f64 = (0..a.len()).map(|r| da(r) * l(r) + a[r] * dl(r)).sum();
-    let l_kk = l(kk);
-    let da_kk = da(kk);
-    let dl_kk = dl(kk);
-    // `(H_kj, ∂H_kj/∂z_w)` for one column of the row, built from the SAME
-    // `(a, l, m)` algebra the dense `row_dense_hessian` /
-    // `row_dense_hessian_logit_derivative` pair uses.
-    let hessian_entry = |jj: usize| -> (f64, f64) {
+    dm: f64,
+}
+
+impl<'a> SoftmaxEntropyDerivative<'a> {
+    fn new(a: &'a [f64], w: usize, m: f64, scale: f64, inv_tau: f64) -> Self {
+        let a_w = a[w];
+        // ∂a_r/∂z_w = a_r(δ_rw − a_w)/τ ; ∂L_r/∂z_w = (∂a_r/∂z_w)/a_r ;
+        // dm = Σ_r (da_r·l_r + a_r·dl_r). One O(K) pass.
+        let da = |r: usize| a[r] * (if r == w { 1.0 } else { 0.0 } - a_w) * inv_tau;
+        let l = |r: usize| softmax_entropy_log_plus_one(a[r]);
+        let dl = |r: usize| if a[r] > 0.0 { da(r) / a[r] } else { 0.0 };
+        let dm: f64 = (0..a.len()).map(|r| da(r) * l(r) + a[r] * dl(r)).sum();
+        Self {
+            a,
+            w,
+            m,
+            scale,
+            inv_tau,
+            dm,
+        }
+    }
+
+    /// Value and derivative of one exact entropy Hessian entry. Resolving the
+    /// mean derivative once keeps each requested pair constant-cost.
+    fn entry(&self, kk: usize, jj: usize) -> (f64, f64) {
+        let Self {
+            a,
+            w,
+            m,
+            scale,
+            inv_tau,
+            dm,
+        } = *self;
+        let a_w = a[w];
+        let da = |r: usize| a[r] * (if r == w { 1.0 } else { 0.0 } - a_w) * inv_tau;
+        let l = |r: usize| softmax_entropy_log_plus_one(a[r]);
+        let dl = |r: usize| if a[r] > 0.0 { da(r) / a[r] } else { 0.0 };
+        let l_kk = l(kk);
+        let da_kk = da(kk);
+        let dl_kk = dl(kk);
+        // `(H_kj, ∂H_kj/∂z_w)` for one column of the row, built from the SAME
+        // `(a, l, m)` algebra the dense `row_dense_hessian` /
+        // `row_dense_hessian_logit_derivative` pair uses.
         let indicator = if kk == jj { 1.0 } else { 0.0 };
         let l_jj = l(jj);
         let bracket = indicator * (m - l_kk - 1.0) + a[jj] * (l_kk + l_jj + 1.0 - 2.0 * m);
@@ -172,7 +203,20 @@ fn active_softmax_majorizer_logit_derivative_entry(
             scale * a[kk] * bracket,
             scale * (da_kk * bracket + a[kk] * dbracket),
         )
-    };
+    }
+}
+
+#[inline]
+fn active_softmax_majorizer_logit_derivative_entry(
+    a: &[f64],
+    kk: usize,
+    w: usize,
+    m: f64,
+    scale: f64,
+    inv_tau: f64,
+) -> f64 {
+    let derivative = SoftmaxEntropyDerivative::new(a, w, m, scale, inv_tau);
+    let hessian_entry = |jj: usize| derivative.entry(kk, jj);
     // Pass 1: ‖H_k·‖₂² and the cross term Σ_l H_kl·Ḣ_kl = ½ ∂‖H_k·‖₂²/∂z_w.
     let (h_kk, dh_kk) = hessian_entry(kk);
     let mut sum_sq = h_kk * h_kk;

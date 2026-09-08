@@ -131,6 +131,7 @@ fn fit_options() -> FitOptions {
         nullspace_dims: vec![],
         linear_constraints: None,
         firth_bias_reduction: false,
+        adaptive_regularization: None,
         rho_prior: Default::default(),
         kronecker_penalty_system: None,
         kronecker_factored: None,
@@ -163,7 +164,14 @@ fn run_fit(
     let offset = Array1::zeros(n);
     let kappa_options = SpatialLengthScaleOptimizationOptions {
         enabled: kappa_enabled,
-        max_outer_iter: if kappa_enabled { 15 } else { 1 },
+        // The production budget: a hand cap of 15 here let the joint stage
+        // report an iteration-budget stop as a refusal once the derived ρ
+        // domain (#2812) gave its walk more room than the old ±12 box did.
+        max_outer_iter: if kappa_enabled {
+            SpatialLengthScaleOptimizationOptions::default().max_outer_iter
+        } else {
+            1
+        },
         rel_tol: 1e-5,
         log_step: std::f64::consts::LN_2,
         min_length_scale: bounds.0,

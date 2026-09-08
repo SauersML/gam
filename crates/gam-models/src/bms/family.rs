@@ -346,24 +346,14 @@ pub(crate) fn bernoulli_marginal_link_map(
         });
     }
     let phi_eta = normal_pdf(eta);
-    let phi_q = normal_pdf(q);
-    if !phi_q.is_finite() || phi_q <= 0.0 {
-        return Err(format!(
-            "bernoulli marginal-slope internal probit density must be positive, got phi(q)={phi_q} at eta={eta}, q={q}"
-        ));
-    }
     let mu1 = phi_eta;
     let mu2 = -eta * phi_eta;
     let mu3 = (eta * eta - 1.0) * phi_eta;
     let mu4 = -(eta.powi(3) - 3.0 * eta) * phi_eta;
-    let q1 = mu1 / phi_q;
-    let q1_sq = q1 * q1;
-    let q1_cu = q1_sq * q1;
-    let q1_q = q1_sq * q1_sq;
-    let q2 = mu2 / phi_q + q * q1_sq;
-    let q3 = mu3 / phi_q + 3.0 * q * q1 * q2 - (q * q - 1.0) * q1_cu;
-    let q4 = mu4 / phi_q + (q.powi(3) - 3.0 * q) * q1_q + 4.0 * q * q1 * q3 + 3.0 * q * q2 * q2
-        - 6.0 * (q * q - 1.0) * q1_sq * q2;
+    // In the unclamped region Φ⁻¹∘Φ is exactly the identity. Numerically
+    // inverting a rounded probability and differentiating the inverse again
+    // manufactured spurious high derivatives (especially in the tails).
+    // This exact simplification also fixes all higher derivative orders.
     Ok(BernoulliMarginalLinkMap {
         eta,
         mu,
@@ -371,11 +361,11 @@ pub(crate) fn bernoulli_marginal_link_map(
         mu2,
         mu3,
         mu4,
-        q,
-        q1,
-        q2,
-        q3,
-        q4,
+        q: eta,
+        q1: 1.0,
+        q2: 0.0,
+        q3: 0.0,
+        q4: 0.0,
     })
 }
 

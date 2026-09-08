@@ -166,6 +166,8 @@ pub use indexed_response::{
 pub use joint_penalty::{JointPenaltyBundle, JointPenaltyError, JointPenaltySpec};
 pub use linear_constraints::LinearInequalityConstraints;
 pub use log_strength::{
+    log_gradient_resolution,
+    precision_box,
     IndexedLogStrengthDomainError,
     LOG_STRENGTH_MAX,
     LOG_STRENGTH_MIN,

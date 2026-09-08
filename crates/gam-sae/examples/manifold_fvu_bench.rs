@@ -73,7 +73,6 @@ fn main() -> Result<(), String> {
     let tier0 = Tier0Mean::fit(train.view())?;
     let train_c = tier0.apply(train.view())?;
     let eval_c = tier0.apply(eval.view())?;
-    let train_f32 = train_c.mapv(|v| v as f32);
 
     // Tier-1: the engine's block-sparse dictionary (G blocks of b=2).
     let mut config = BlockSparseConfig::new(N_BLOCKS, BLOCK_SIZE);
@@ -88,13 +87,13 @@ fn main() -> Result<(), String> {
     // Routing is row-independent, so this changes throughput, not the codes.
     config.minibatch = 8192;
     let fit = fit_block_sparse_dictionary_with_seed(
-        train_f32.view(),
+        train_c.view(),
         &config,
         BlockSeedPolicy::CoordinatePartition,
     )?;
     eprintln!(
-        "fit done: ev={:.4} epochs={} certified={}",
-        fit.explained_variance, fit.epochs, fit.convergence.certified
+        "fit done: ev={:.4} epochs={} frame_residual={:.3e}",
+        fit.explained_variance, fit.epochs, fit.convergence.frame_residual
     );
 
     // Code-space census over the fitted blocks (train codes).
@@ -161,7 +160,6 @@ fn main() -> Result<(), String> {
     }
 
     let sel_bits = (N_BLOCKS as f64).log2().ceil() as u32;
-    let eval_f32 = eval_c.mapv(|v| v as f32);
     let n_eval = eval_c.nrows();
     let tss: f64 = {
         let em = eval_c.mean_axis(Axis(0)).ok_or("eval mean")?;
@@ -181,7 +179,7 @@ fn main() -> Result<(), String> {
     // sites). Stopping at top-k=4 capped the linear curve at 384 bits.
     for topk in 1usize..=6 {
         let (blocks, _gates, codes) = block_sparse_dictionary_transform(
-            eval_f32.view(),
+            eval_c.view(),
             fit.decoder.view(),
             fit.gamma,
             BLOCK_SIZE,

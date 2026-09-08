@@ -62,7 +62,10 @@ mod alo_replay;
 pub mod deviation_runtime;
 pub mod gpu;
 pub(crate) use alo_replay::exact_runtime_from_saved;
-pub use alo_replay::{BernoulliMarginalSlopeAloRowGeometry, BernoulliMarginalSlopeAloRowInput, BernoulliMarginalSlopeSavedAloReplay, BernoulliMarginalSlopeSavedAloRowGeometry};
+pub use alo_replay::{
+    BernoulliMarginalSlopeAloRowGeometry, BernoulliMarginalSlopeAloRowInput,
+    BernoulliMarginalSlopeSavedAloReplay, BernoulliMarginalSlopeSavedAloRowGeometry,
+};
 pub(crate) use alo_replay::{
     BernoulliMarginalSlopeSavedAloReplayInput, replay_saved_bernoulli_marginal_slope_alo,
 };
@@ -2633,6 +2636,7 @@ pub(crate) mod family;
 pub(crate) mod flex_row_program;
 pub(crate) mod gradient_paths;
 pub(crate) mod hessian_paths;
+mod information_third;
 pub(crate) mod install_flex;
 pub(crate) mod row_kernel;
 #[cfg(test)]
@@ -2855,13 +2859,16 @@ pub use block_specs::fit_bernoulli_marginal_slope_terms;
 pub use conditional_score_covariance::{
     ConditionalScoreCoordinate, ConditionalScoreCovariance, ScoreCovarianceField,
 };
-pub use gradient_paths::{MarginalSlopeCovariance, MarginalSlopeCovarianceShape, marginal_slope_covariance_from_scores, padded_deviation_seed};
+pub use gradient_paths::{
+    MarginalSlopeCovariance, MarginalSlopeCovarianceShape, marginal_slope_covariance_from_scores,
+    padded_deviation_seed,
+};
 pub use install_flex::CrossBlockIdentifiabilityWarning;
 pub(crate) use install_flex::FlexCompileOutcome;
 
 // pub(crate) re-exports for internal callers:
 pub(crate) use block_specs::push_deviation_aux_blockspecs;
-pub use block_specs::{BmsSlopeJacobian, BmsMarginalJacobian};
+pub use block_specs::{BmsMarginalJacobian, BmsSlopeJacobian};
 pub(crate) use family::{
     BernoulliMarginalLinkMap, bernoulli_marginal_link_map,
     build_link_deviation_block_from_knots_design_seed_and_weights,

@@ -311,11 +311,11 @@ pub fn sparse_dict_dual_certificate(
 /// Keeping the route as `indices[N,s]` / `codes[N,s]` avoids both an `N×K`
 /// expansion and the invalid practice of fabricating convergence evidence just
 /// to call a fit-oriented diagnostic.
-pub fn sparse_route_dual_certificate(
-    data: ArrayView2<'_, f32>,
-    decoder: ArrayView2<'_, f32>,
+pub fn sparse_route_dual_certificate<T: ndarray::NdFloat + Into<f64>>(
+    data: ArrayView2<'_, T>,
+    decoder: ArrayView2<'_, T>,
     indices: ArrayView2<'_, u32>,
-    codes: ArrayView2<'_, f32>,
+    codes: ArrayView2<'_, T>,
     max_candidates: usize,
 ) -> Result<DualCertificateReport, String> {
     let (k, p) = decoder.dim();
@@ -351,12 +351,12 @@ pub fn sparse_route_dual_certificate(
     for i in 0..n {
         // Row residual r = x − x̂ (f64), and the active support (live codes only).
         for c in 0..p {
-            residual[c] = data[[i, c]] as f64 - recon[[i, c]] as f64;
+            residual[c] = data[[i, c]].into() - Into::<f64>::into(recon[[i, c]]);
         }
         active.clear();
         let mut min_active_mass = f64::INFINITY;
         for j in 0..s {
-            let code = codes[[i, j]] as f64;
+            let code = Into::<f64>::into(codes[[i, j]]);
             if code == 0.0 {
                 continue;
             }
@@ -381,7 +381,7 @@ pub fn sparse_route_dual_certificate(
             }
             let mut dot = 0.0f64;
             for c in 0..p {
-                dot += residual[c] * atom[c] as f64;
+                dot += residual[c] * Into::<f64>::into(atom[c]);
             }
             let gate = dot.abs();
             if gate > max_off_gate {
@@ -409,7 +409,7 @@ pub fn sparse_route_dual_certificate(
 /// (reported as the block's leading atom index `g·b`); the implied λ is the
 /// weakest active gate `‖z_g‖₂`.
 pub fn block_dual_certificate(
-    data: ArrayView2<'_, f32>,
+    data: ArrayView2<'_, f64>,
     fit: &BlockSparseFit,
     max_candidates: usize,
 ) -> Result<DualCertificateReport, String> {
@@ -433,10 +433,10 @@ pub fn block_dual_certificate(
 /// fitted-object convenience [`block_dual_certificate`] supplies its learned
 /// tied-encoder scale internally.
 pub fn block_route_dual_certificate(
-    data: ArrayView2<'_, f32>,
-    decoder: ArrayView2<'_, f32>,
+    data: ArrayView2<'_, f64>,
+    decoder: ArrayView2<'_, f64>,
     blocks: ArrayView2<'_, u32>,
-    codes: ArrayView3<'_, f32>,
+    codes: ArrayView3<'_, f64>,
     block_size: usize,
     max_candidates: usize,
 ) -> Result<DualCertificateReport, String> {
@@ -452,10 +452,10 @@ pub fn block_route_dual_certificate(
 }
 
 fn block_route_dual_certificate_scaled(
-    data: ArrayView2<'_, f32>,
-    decoder: ArrayView2<'_, f32>,
+    data: ArrayView2<'_, f64>,
+    decoder: ArrayView2<'_, f64>,
     blocks: ArrayView2<'_, u32>,
-    codes: ArrayView3<'_, f32>,
+    codes: ArrayView3<'_, f64>,
     block_size: usize,
     dual_scale: f64,
     max_candidates: usize,
@@ -500,7 +500,7 @@ fn block_route_dual_certificate_scaled(
 
     let recon = reconstruct_block_sparse_rows(decoder, blocks, codes, b)?;
     let mut rows: Vec<RowCertificate> = Vec::with_capacity(n);
-    let mut residual = ndarray::Array1::<f32>::zeros(p);
+    let mut residual = ndarray::Array1::<f64>::zeros(p);
     let mut active: HashSet<u32> = HashSet::new();
 
     for i in 0..n {
@@ -558,4 +558,3 @@ fn block_route_dual_certificate_scaled(
 
     Ok(assemble_report(rows, max_candidates))
 }
-

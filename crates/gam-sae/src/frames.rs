@@ -3,6 +3,70 @@ use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
 use crate::manifold::SaeManifoldTerm;
 use gam_linalg::faer_ndarray::{FaerSvd, fast_ab, fast_abt, fast_atb};
 
+/// Relative distance between stored frame projectors, evaluated without
+/// cancellation between order-one overlap traces for nearby subspaces.
+pub(crate) fn stored_projector_distance(
+    current: ArrayView2<'_, f64>,
+    next: ArrayView2<'_, f64>,
+) -> Result<f64, String> {
+    if current.dim() != next.dim()
+        || current
+            .iter()
+            .chain(next.iter())
+            .any(|value| !value.is_finite())
+    {
+        return Err("frame projector comparison requires matching finite frames".into());
+    }
+    if current
+        .iter()
+        .zip(next.iter())
+        .all(|(left, right)| left == right)
+    {
+        return Ok(0.0);
+    }
+    let u = current.t();
+    let v = next.t();
+    let gram_u = u.t().dot(&u);
+    let gram_v = v.t().dot(&v);
+    let scale = gram_u
+        .iter()
+        .chain(gram_v.iter())
+        .map(|value| value * value)
+        .sum::<f64>();
+    if !scale.is_finite() {
+        return Err("frame projector norm is not finite".into());
+    }
+    if scale == 0.0 {
+        return Ok(0.0);
+    }
+    // Align only the internal gauge. This also works for singular overlap.
+    let (left, _, right_t) = u
+        .t()
+        .dot(&v)
+        .svd(true, true)
+        .map_err(|error| format!("frame projector alignment: {error}"))?;
+    let left = left.ok_or("frame projector alignment omitted the left factor")?;
+    let right_t = right_t.ok_or("frame projector alignment omitted the right factor")?;
+    let aligned = v.dot(&right_t.t().dot(&left.t()));
+    let difference = &aligned - &u;
+    let midpoint = (&aligned + &u) * 0.5;
+    let gram_midpoint = midpoint.t().dot(&midpoint);
+    let gram_difference = difference.t().dot(&difference);
+    let mixed = midpoint.t().dot(&difference);
+    // VV'-UU' = SD'+DS'; retain the measured roundoff skew in S'D.
+    let mut distance_sq = 0.0;
+    for i in 0..mixed.nrows() {
+        for j in 0..mixed.ncols() {
+            distance_sq += 2.0
+                * (gram_midpoint[[i, j]] * gram_difference[[j, i]] + mixed[[i, j]] * mixed[[j, i]]);
+        }
+    }
+    if !distance_sq.is_finite() {
+        return Err("frame projector displacement is not finite".into());
+    }
+    Ok((distance_sq.max(0.0) / scale).sqrt())
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct FrameProjection {
     pub(crate) p: usize,
@@ -1055,6 +1119,4 @@ impl GrassmannCrossMoment {
     pub fn moment(&self) -> ArrayView2<'_, f64> {
         self.moment.view()
     }
-
 }
-

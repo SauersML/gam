@@ -493,6 +493,7 @@ pub fn assemble_standard_payload(
         design,
         resolvedspec,
         basis_adequacy,
+        adaptive_diagnostics,
         saved_link_state,
         wiggle_knots,
         wiggle_degree,
@@ -518,7 +519,7 @@ pub fn assemble_standard_payload(
         .likelihood_family
         .clone()
         .ok_or_else(|| {
-            "standard fit reached payload assembly without its resolved likelihood family"
+            "standard fit is missing its likelihood family; refusing to save an unknown response scale"
                 .to_string()
         })?;
     let estimator = expectile_tau_for_config(fit_config)
@@ -574,6 +575,7 @@ pub fn assemble_standard_payload(
     }
     payload.set_training_feature_metadata(dataset.headers.clone(), dataset.feature_ranges());
     payload.resolved_termspec = Some(resolved_termspec);
+    payload.adaptive_regularization_diagnostics = adaptive_diagnostics;
     payload.basis_adequacy = basis_adequacy;
     payload.offset_column = fit_config.offset_column.clone();
     payload.noise_offset_column = fit_config.noise_offset_column.clone();
@@ -2148,13 +2150,9 @@ fn payload_for_survival_marginal_slope(
         age_entry[i] = t0;
         age_exit[i] = t1;
     }
-    // The saved baseline chart is the one the fit CERTIFIED, not a re-parse of
-    // the request. A request names only the target (`--baseline-target
-    // weibull`) and leaves scale and shape to the fit's own ψ coordinates;
-    // re-parsing it here demanded `--baseline-scale > 0` and refused to save
-    // exactly the fits that estimated their chart (gam#2765: a follow-up-varying
-    // slope on a Weibull chart converged and then could not leave the process).
-    // `baseline_config` on the fit result is the chart at the certified θ.
+    // The request may leave baseline parameters to estimation. Replaying its
+    // initial values here would save a different time chart from the one the
+    // returned coefficients use; persist the certified fitted chart instead.
     let baseline_cfg = ms_result.baseline_config.clone();
     let likelihood_mode = parse_survival_likelihood_mode(fit_config.resolved_survival_likelihood())?;
     let time_cfg = if parsed.timewiggle.is_some() {
@@ -2924,28 +2922,18 @@ mod standard_payload_penalty_topology_tests {
         encode_recordswith_inferred_schema(headers, rows).expect("encode #2748 fixture")
     }
 
-    #[test]
-    fn flexible_fit_payload_uses_the_full_six_plus_eleven_penalty_topology_2748() {
+    fn check_flexible_binomial_payload(link: StandardLink, link_name: &str) {
         let dataset = six_column_flexible_binomial_fixture();
-        let formula =
-            "y ~ x0 + x1 + x2 + x3 + x4 + link(type=flexible(logit))";
+        let formula = format!("y ~ x0 + x1 + x2 + x3 + x4 + link(type=flexible({link_name}))");
         let config = FitConfig {
             family: Some("binomial".to_string()),
             ..FitConfig::default()
         };
-        let FitResult::Standard(result) = fit_from_formula(formula, &dataset, &config)
+        let FitResult::Standard(result) = fit_from_formula(&formula, &dataset, &config)
             .expect("the small identifiable flexible-link fixture must fit")
         else {
             panic!("flexible-link formula did not produce a standard fit");
         };
-        assert_eq!(
-            result.fit.likelihood_family,
-            Some(LikelihoodSpec::new(
-                ResponseFamily::Binomial,
-                InverseLink::Standard(StandardLink::Logit),
-            )),
-            "the custom link-wiggle solve must retain the response likelihood",
-        );
 
         let mean_dim = result.design.design.ncols();
         let raw_dim = result
@@ -2957,6 +2945,9 @@ mod standard_payload_penalty_topology_tests {
             .raw_total();
         assert_eq!(mean_dim, 6, "fixture must reproduce the base width");
         assert_eq!(raw_dim, 17, "fixture must reproduce #2748's 6 -> 17 join");
+        let expected_family =
+            LikelihoodSpec::new(ResponseFamily::Binomial, InverseLink::Standard(link));
+        assert_eq!(result.fit.likelihood_family.as_ref(), Some(&expected_family));
 
         let payload = assemble_standard_payload(StandardPayloadInputs {
             formula: formula.to_string(),
@@ -2965,22 +2956,21 @@ mod standard_payload_penalty_topology_tests {
             result,
         })
         .expect("payload assembly must use the full realized raw penalty topology");
-        assert_eq!(payload.family, "binomial-logit");
-        assert_eq!(
-            payload.family_state.likelihood(),
-            LikelihoodSpec::new(ResponseFamily::Binomial, InverseLink::Standard(StandardLink::Logit)),
-        );
-        let serialized = serde_json::to_vec(&payload).expect("serialize flexible-link payload");
+        let encoded = serde_json::to_vec(&payload).expect("serialize flexible binomial payload");
         let payload: FittedModelPayload =
-            serde_json::from_slice(&serialized).expect("reload flexible-link payload");
-        assert_eq!(payload.family, "binomial-logit");
-        assert_eq!(
-            payload.family_state.likelihood(),
-            LikelihoodSpec::new(ResponseFamily::Binomial, InverseLink::Standard(StandardLink::Logit)),
-        );
+            serde_json::from_slice(&encoded).expect("reload flexible binomial payload");
+        assert_eq!(payload.family, expected_family.name());
+        match &payload.family_state {
+            FittedFamily::Standard { likelihood, link: saved_link, .. } => {
+                assert_eq!(likelihood, &expected_family);
+                assert_eq!(*saved_link, Some(link));
+            }
+            other => panic!("flexible binomial payload has wrong family state: {other:?}"),
+        }
         let fit = payload
             .fit_result
             .expect("standard payload must retain its canonical fit result");
+        assert_eq!(fit.likelihood_family.as_ref(), Some(&expected_family));
         assert_eq!(
             fit.artifacts.null_space_dim,
             Some(mean_dim),
@@ -2995,49 +2985,12 @@ mod standard_payload_penalty_topology_tests {
     }
 
     #[test]
-    fn flexible_probit_payload_retains_binomial_family_through_reload_2748() {
-        let dataset = six_column_flexible_binomial_fixture();
-        let formula = "y ~ x0 + x1 + x2 + x3 + x4 + link(type=flexible(probit))";
-        let config = FitConfig {
-            family: Some("binomial".to_string()),
-            ..FitConfig::default()
-        };
-        let FitResult::Standard(result) = fit_from_formula(formula, &dataset, &config)
-            .expect("the small identifiable flexible-probit fixture must fit")
-        else {
-            panic!("flexible-probit formula did not produce a standard fit");
-        };
-        assert_eq!(
-            result.fit.likelihood_family,
-            Some(LikelihoodSpec::binomial_probit()),
-        );
+    fn flexible_fit_payload_uses_the_full_six_plus_eleven_penalty_topology_2748() {
+        check_flexible_binomial_payload(StandardLink::Logit, "logit");
+    }
 
-        let payload = assemble_standard_payload(StandardPayloadInputs {
-            formula: formula.to_string(),
-            dataset: &dataset,
-            fit_config: &config,
-            result,
-        })
-        .expect("assemble flexible-probit payload");
-        assert_eq!(payload.family, "binomial-probit");
-        assert_eq!(
-            payload.family_state.likelihood(),
-            LikelihoodSpec::binomial_probit(),
-        );
-        let serialized = serde_json::to_vec(&payload).expect("serialize flexible-probit payload");
-        let reloaded: FittedModelPayload =
-            serde_json::from_slice(&serialized).expect("reload flexible-probit payload");
-        assert_eq!(reloaded.family, "binomial-probit");
-        assert_eq!(
-            reloaded.family_state.likelihood(),
-            LikelihoodSpec::binomial_probit(),
-        );
-        assert_eq!(
-            reloaded
-                .fit_result
-                .expect("reloaded payload retains fit result")
-                .likelihood_family,
-            Some(LikelihoodSpec::binomial_probit()),
-        );
+    #[test]
+    fn flexible_probit_payload_preserves_its_binomial_response_scale_2748() {
+        check_flexible_binomial_payload(StandardLink::Probit, "probit");
     }
 }

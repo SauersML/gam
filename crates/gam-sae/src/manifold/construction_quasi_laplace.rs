@@ -64,7 +64,7 @@ struct ResidualMerits {
 struct AcceptedTerminalResidualStep {
     damping: f64,
     trial_merits: ResidualMerits,
-    predicted_objective_decrease: f64,
+    predicted_quotient_decrease: f64,
     step: DampedResidualStep,
     system: Option<ArrowSchurSystem>,
 }
@@ -353,7 +353,7 @@ impl SaeManifoldTerm {
         // 2. Drive the inner (t, β) solve to the KKT/step-converged optimum and
         //    take one final UNDAMPED factor there to obtain the joint Hessian
         //    log-determinant. We force ridge = 0 and the dense `Direct` Schur
-        //    mode so `arrow_log_det_from_cache` returns the exact
+        //    mode so the factor cache carries the exact
         //    `log|H| = Σ_i log|H_tt^(i)| + log|Schur_β|` (it rejects damped
         //    factors and InexactPCG caches, which have no dense Schur factor).
         //    This is the same evidence convention the main GAM penalized quasi-Laplace path uses.
@@ -499,8 +499,8 @@ impl SaeManifoldTerm {
             // `0.5 log|H| - 0.5 log|H_tt| + rank_charge`; dense, streaming, and
             // criterion-as-atoms assembly therefore cannot drift apart.
             // log_det (= log|A|) and log_det_tt (= log|A_tt|) are produced together
-            // above from the exact observed information; `coordinate_block_log_det`
-            // (the majorizer ½log|B_tt|) is no longer the ranked coordinate term.
+            // above from the exact observed information; the majorizer
+            // ½log|B_tt| is not the ranked coordinate term.
             let quasi_laplace_complexity =
                 rank_adjusted_quasi_laplace_complexity(log_det, log_det_tt, &d_eff, &n_eff)?;
             loss.total() + extra_penalty_energy + quasi_laplace_complexity - occam
@@ -839,6 +839,7 @@ impl SaeManifoldTerm {
             base_refine_iter
         };
         let mut previous_refine_grad_norm: Option<f64> = None;
+        let mut saw_refine_progress = false;
         // #2234 — one progress-gated extra refinement window (see the budget
         // escalation at the non-convergence refusal below). 0 until granted.
         let mut budget_escalation_extra = 0usize;
@@ -962,7 +963,7 @@ impl SaeManifoldTerm {
             // condition number and the traces only need the (PD) factor. So
             // tolerate the ill-conditioning rejection here (a genuine non-PD pivot
             // still errors). The cache stays undamped at ridge=0, so
-            // `arrow_log_det_from_cache` remains exact.
+            // the cache's joint Hessian log-determinant remains exact.
             // The exact KKT stationarity residual is the joint gradient
             // ‖g‖ = √(Σ_i ‖g_t^(i)‖² + ‖g_β‖²), read straight off the assembled
             // system. Unlike the Newton step Δ = H⁻¹g, the gradient is
@@ -1164,6 +1165,7 @@ impl SaeManifoldTerm {
                             progress_refine_iter,
                             previous_refine_grad_norm,
                             grad_norm,
+                            saw_refine_progress,
                         );
                         if total_inner_iter >= refine_limit {
                             // #1117/#1118 — pre-stationarity genuinely-indefinite
@@ -1206,6 +1208,8 @@ impl SaeManifoldTerm {
                         }
                         let remaining = refine_limit - total_inner_iter;
                         let refine_iter = inner_max_iter.max(1).min(remaining);
+                        saw_refine_progress |=
+                            Self::refine_round_made_progress(previous_refine_grad_norm, grad_norm);
                         previous_refine_grad_norm = Some(grad_norm);
                         let refine = self.run_joint_fit_arrow_schur_for_quasi_laplace(
                             target,
@@ -1234,6 +1238,7 @@ impl SaeManifoldTerm {
                 progress_refine_iter,
                 previous_refine_grad_norm,
                 grad_norm,
+                saw_refine_progress,
             );
             let effective_refine_limit = refine_limit
                 .checked_add(budget_escalation_extra)
@@ -1250,8 +1255,8 @@ impl SaeManifoldTerm {
                 // line search sees cliffs in all directions, and the outer fit
                 // freezes at a live gradient and refuses to mint (measured
                 // fleet-wide 2026-07-10: gam-sae 126 test failures, ten-orders
-                // cost-lane disagreement at one ρ). A solve whose latest KKT residual is
-                // MEASURABLY DESCENDING is an unfinished
+                // cost-lane disagreement at one ρ). A solve that is MEASURABLY
+                // DESCENDING (`saw_refine_progress`) is an unfinished
                 // computation, not an infeasibility: grant it one additional
                 // window of the same size and keep refining. The ordinary
                 // nonstationary lane retains that single-window hang bound.
@@ -1338,9 +1343,7 @@ impl SaeManifoldTerm {
                     }
                     last_limit_certificate = Some(predicted_relative_decrease);
                 }
-                if (refine_limit > base_refine_iter || gradient_stationary)
-                    && budget_escalation_extra == 0
-                {
+                if (saw_refine_progress || gradient_stationary) && budget_escalation_extra == 0 {
                     let escalation_window = refine_limit.max(1);
                     // `refine_iteration_limit` is dynamic and may return a
                     // ceiling below the iterations already consumed.  Carry
@@ -1406,6 +1409,7 @@ impl SaeManifoldTerm {
                             polish_escalations += 1;
                             *criterion_fixed_point = false;
                             consecutive_objective_stalls = 0;
+                            saw_refine_progress = true;
                             budget_escalation_extra = total_inner_iter
                                 .saturating_sub(refine_limit)
                                 .saturating_add(refine_limit.max(1));
@@ -1599,6 +1603,8 @@ impl SaeManifoldTerm {
                 )
             })?;
             let refine_iter = inner_max_iter.max(1).min(remaining);
+            saw_refine_progress |=
+                Self::refine_round_made_progress(previous_refine_grad_norm, grad_norm);
             previous_refine_grad_norm = Some(grad_norm);
             let refine = self.run_joint_fit_arrow_schur_for_quasi_laplace(
                 target,
@@ -1864,6 +1870,7 @@ impl SaeManifoldTerm {
                     )? {
                         *criterion_fixed_point = false;
                         consecutive_objective_stalls = 0;
+                        saw_refine_progress = true;
                         continue;
                     }
                 }
@@ -1906,6 +1913,7 @@ impl SaeManifoldTerm {
                     if orbit.moved() {
                         *criterion_fixed_point = false;
                         consecutive_objective_stalls = 0;
+                        saw_refine_progress = true;
                         log::debug!(
                             "SAE inner refine loop: gauge-orbit descent recovered {:.6e} over \
                              {} round(s) at the objective-stall fixed point (span dim {}, \
@@ -2527,6 +2535,7 @@ impl SaeManifoldTerm {
         progress_refine_iter: usize,
         previous_grad_norm: Option<f64>,
         grad_norm: f64,
+        saw_refine_progress: bool,
     ) -> usize {
         // Flat affine-gauge valleys can keep crawling productively after the
         // historical base budget. Extend only when the measured KKT residual has
@@ -2534,12 +2543,13 @@ impl SaeManifoldTerm {
         // work budget (#968/#1029). Value-order probes pass the base budget as
         // their progress budget, so this branch cannot make probes expensive.
         //
-        // #2230 COST-PROPORTIONAL EXTENSION: the latest pair of KKT residuals is
-        // the progress verdict. A historical `|=` latch meant ONE gradient drop
-        // anywhere granted the 16×/64× extended budget for the rest of the evaluation — an
+        // #2230 COST-PROPORTIONAL EXTENSION: `saw_refine_progress` is the
+        // LATEST-round verdict, not a sticky historical OR. The historical
+        // `|=` accumulation meant ONE gradient drop anywhere granted the
+        // 16×/64× extended budget for the rest of the evaluation — an
         // oscillating or stalled tail then ground the full extended budget on
-        // every criterion eval (the #1094 “kept extending via progress from
-        // earlier rounds” pathology, and the
+        // every criterion eval (the #1094 "kept extending via
+        // saw_refine_progress from earlier rounds" pathology, and the
         // dominant per-eval cost of the measured multi-hour outer churn).
         // Under the per-round contract each extension round must PAY for
         // itself with a monotone KKT-residual decrease; the first
@@ -2550,7 +2560,7 @@ impl SaeManifoldTerm {
             return base_refine_iter;
         }
         let making_progress =
-            Self::refine_round_made_progress(previous_grad_norm, grad_norm);
+            saw_refine_progress && Self::refine_round_made_progress(previous_grad_norm, grad_norm);
         if making_progress && grad_norm.is_finite() {
             progress_refine_iter
         } else {
@@ -2582,22 +2592,112 @@ impl SaeManifoldTerm {
     /// locally quadratic and closes the same gap in O(10) steps, making the
     /// strict KKT contract REACHABLE instead of loosened.
     ///
-    /// # Objective-globalized spectral step
+    /// # One merit, and it is the one the gate reads
     ///
-    /// The KKT residual remains the convergence certificate, but it cannot be
-    /// the globalization currency: on a negative eigenmode of the exact Hessian,
-    /// objective descent increases `||g||`.  The old `(A^2 + nu) delta = -A g`
-    /// path therefore rejected the very move that left the saddle and made an
-    /// entire outer-rho neighborhood look infeasible (#2080/#2228).
+    /// This phase solves `g(θ) = 0`, and the gate that judges it is a bound on
+    /// `‖g‖` (raw or gauge-quotient). So the merit here is `½‖g‖²` and nothing
+    /// else. It is a function of the STATE, not of any operator evaluated at the
+    /// state, which is what makes a comparison across two states mean something.
     ///
-    /// The step now uses the absolute spectral Hessian,
-    /// `delta_i = -g_i / (|lambda_i| + sqrt(nu))`.  Thus `g^T delta < 0` on every
-    /// retained mode, irrespective of curvature sign, while it is ordinary
-    /// Newton on a positive-definite basin.  The existing derived damping ladder
-    /// controls its radius, and Armijo acceptance is measured against the actual
-    /// penalized objective.  Rejected trials restore the snapshot bit-for-bit.
-    /// No KKT tolerance changes: only the converged refine-loop gate can mint a
-    /// fit.
+    /// The `#2762` defect was that the acceptance test compared
+    /// `gᵀB(θ₊)⁻¹g(θ₊)` — the trial state's decrement in the MAJORIZER metric —
+    /// against `gᵀA⁺g` at the pre-state, in the EXACT-Hessian metric. Same
+    /// bilinear form, two different operators, measured 67x apart on the
+    /// witness; every step passed it, `‖g‖` rose 15x–107x per accepted step, and
+    /// 482 consecutive steps were accepted after the baseline was made
+    /// self-consistent, because `gᵀB(θ)⁻¹g(θ)` can fall while `‖g‖` rises
+    /// whenever `B` stiffens.
+    ///
+    /// # Why the step is damped, and why that is the actual root cause
+    ///
+    /// Fixing the merit alone does not converge this phase, and the measurement
+    /// says why. At the `#2015` witness — `‖g‖ = 1.23e-4`, the WHOLE residual
+    /// inside the retained range — the undamped step is `‖Δ‖ = 0.44`, its full
+    /// application drives the merit `7.5e-9 → 6.1e0`, and an Armijo test on
+    /// `½‖g‖²` first passes at `α = 4.9e-4`, buying 0.03%. The step's LENGTH is
+    /// set entirely by the near-null eigendirections of `A`; the residual is
+    /// carried by the well-conditioned ones. No scalar step length separates
+    /// them — shrinking the step to keep the flat direction inside the model
+    /// shrinks the useful directions by the same factor.
+    ///
+    /// Damping does separate them. `A` is already materialized and
+    /// diagonalized here, so the whole Levenberg–Marquardt path
+    /// [`ExactHessianSpectralBlock::damped_residual_step`] is available in
+    /// closed form at one diagonal pass per point — including the modeled
+    /// residual this caller prices in its quotient merit. On the same witness
+    /// `ν = 5.7e-7` gives `‖Δ‖ = 4.6e-4`, drives
+    /// the merit `7.5e-9 → 6.2e-11` (`‖g‖ 1.23e-4 → 1.11e-5`, past a `7.1e-5`
+    /// tolerance in ONE step) at a measured/predicted ratio of `0.9992`.
+    ///
+    /// # The ladder, and why every number in it is derived
+    ///
+    /// * The first trial is `ν = 0` — the undamped step this phase has always
+    ///   taken — so the quadratic tail near a well-conditioned root is
+    ///   unchanged, and a state that never needed damping never pays for it.
+    /// * The ladder then runs from `λ_min²` to `λ_max²` over the RETAINED
+    ///   spectrum by [`opt::constants::RIDGE_GROWTH`]: below `λ_min²` a damping
+    ///   cannot move the flattest resolved direction, above `λ_max²` it has
+    ///   already flattened every direction there is.
+    /// * The accepted damping is CARRIED to the next step (divided by the same
+    ///   growth, and snapped back to `0` once it falls under `λ_min²`), so a
+    ///   converging tail walks back to the pure Newton step by itself.
+    /// * A trial is accepted when its MEASURED merit reduction is at least the
+    ///   shared Armijo fraction [`SAE_MANIFOLD_ARMIJO_C1`] of the reduction its
+    ///   own closed-form model predicted, with the shared round-off cushion.
+    ///   Model-predicted reduction is monotonically decreasing along the ladder,
+    ///   so a ladder that falls under the round-off floor
+    ///   [`SAE_MANIFOLD_DIRECTIONAL_DECREASE_REL_FLOOR`] × merit is exhausted —
+    ///   that is a proof of termination, not a cap.
+    ///
+    /// Consequences worth stating as properties:
+    ///
+    /// * every accepted step STRICTLY decreases the quantity the refusal is
+    ///   denominated in, so this phase can no longer leave the state worse than
+    ///   it found it — which is what it measurably did on both `#2762` witnesses;
+    /// * the merit is monotone across steps by construction, so no
+    ///   cross-iteration contraction bail is needed and none is kept;
+    /// * a trial costs ONE assembly. It used to cost an assembly plus a full
+    ///   arrow factorization, because the merit it evaluated needed one.
+    ///
+    /// Indefiniteness of `A` needs no special handling: `Δ(ν)` solves
+    /// `(A² + ν)Δ = −Ag`, whose operator is positive semidefinite for every
+    /// symmetric `A`, so a resolved negative mode is descended, not reflected.
+    /// Every internal failure degrades to `Ok(false)` (fall through to the
+    /// historical stall accounting), never to a new error class, and a rejected
+    /// trial restores the snapshot bit-for-bit.
+    ///
+    /// Returns `Ok(true)` when at least one step was committed (the caller
+    /// re-enters the refine loop, whose existing raw/quotient KKT gate +
+    /// idempotence certificate remain the SOLE acceptance authority — this
+    /// phase mints nothing).
+    /// A residual measured in the two currencies the inner gate speaks: the
+    /// gauge-QUOTIENT merit `½‖Π⊥null r‖²` — which is what
+    /// [`Self::quasi_laplace_kkt_stationary`] is a bound on, since the quotient
+    /// norm is clamped at or below the raw one — and the AMBIENT merit `½‖r‖²`.
+    ///
+    /// Returned together because the polish accepts on the first and holds the
+    /// second as an invariant: a step may not buy quotient progress by pumping
+    /// residual into the gauge orbit, which is the only way a projected norm can
+    /// fall without the residual falling.
+    fn residual_merits(
+        &self,
+        residual: &SaeArrowVector,
+        penalized_gram_scale: &[f64],
+    ) -> ResidualMerits {
+        let ambient_norm_sq = residual.t.dot(&residual.t) + residual.beta.dot(&residual.beta);
+        let quotient_norm_sq = self
+            .quotient_gradient_norm_sq(
+                residual.t.view(),
+                residual.beta.view(),
+                ambient_norm_sq,
+                penalized_gram_scale,
+            )
+            .unwrap_or(ambient_norm_sq);
+        ResidualMerits {
+            quotient: 0.5 * quotient_norm_sq,
+            ambient: 0.5 * ambient_norm_sq,
+        }
+    }
 
     fn terminal_exact_newton_polish(
         &mut self,
@@ -2764,16 +2864,14 @@ impl SaeManifoldTerm {
             // own units — the same relative floor the majorized Armijo lane
             // applies to its directional decrease. A prediction below it is
             // f64 noise in the quadratic model, not a step worth measuring.
-            let pre_objective = self.penalized_objective_total(target, rho_fixed, registry, 1.0)?;
-            let predicted_floor =
-                SAE_MANIFOLD_DIRECTIONAL_DECREASE_REL_FLOOR * (1.0 + pre_objective.abs());
+            let predicted_floor = SAE_MANIFOLD_DIRECTIONAL_DECREASE_REL_FLOOR * pre_merits.quotient;
             let snapshot = self.snapshot_mutable_state();
             let backtrack_started = std::time::Instant::now();
             let mut trials = 0usize;
             let mut accepted: Option<AcceptedTerminalResidualStep> = None;
             let mut nu = damping;
             loop {
-                let damped = match geometry.damped_objective_step(&residual, nu) {
+                let damped = match geometry.damped_residual_step(&residual, nu) {
                     Ok(damped) => damped,
                     Err(err) => {
                         log::debug!(
@@ -2782,10 +2880,10 @@ impl SaeManifoldTerm {
                         break;
                     }
                 };
-                let predicted_objective_decrease =
-                    -(residual.t.dot(&damped.step.t) + residual.beta.dot(&damped.step.beta));
-                if !(predicted_objective_decrease.is_finite()
-                    && predicted_objective_decrease > predicted_floor)
+                let model_merits = self.residual_merits(&damped.model_residual, lambda_smooth);
+                let predicted_quotient_decrease = pre_merits.quotient - model_merits.quotient;
+                if !(predicted_quotient_decrease.is_finite()
+                    && predicted_quotient_decrease > predicted_floor)
                 {
                     // The model's predicted reduction decreases monotonically in
                     // ν, so no larger damping on this ladder can clear the floor
@@ -2793,8 +2891,10 @@ impl SaeManifoldTerm {
                     // stated reason rather than at a trial count.
                     log::debug!(
                         "terminal Newton: damping ladder exhausted at ν={nu:.6e} — predicted \
-                         objective decrease {predicted_objective_decrease:.6e} is under the \
-                         round-off floor {predicted_floor:.6e}",
+                         quotient-merit reduction {predicted_quotient_decrease:.6e} is under the \
+                         round-off floor {predicted_floor:.6e} (quotient merit \
+                         {:.6e})",
+                        pre_merits.quotient,
                     );
                     break;
                 }
@@ -2836,21 +2936,24 @@ impl SaeManifoldTerm {
                         None,
                     )
                 };
-                let trial_objective = self
-                    .penalized_objective_total(target, rho_fixed, registry, 1.0)
-                    .unwrap_or(f64::INFINITY);
-                let sufficient = SAE_MANIFOLD_ARMIJO_C1 * predicted_objective_decrease;
-                // Acceptance is Armijo descent in the scalar objective. The residual is
-                // deliberately not constrained here: at negative curvature, genuine
-                // objective descent can and generally does increase its norm.
-                if trial_objective.is_finite()
-                    && pre_objective - trial_objective
-                        >= sufficient - opt::armijo_roundoff_cushion(pre_objective)
+                let sufficient = SAE_MANIFOLD_ARMIJO_C1 * predicted_quotient_decrease;
+                // Acceptance: a measured reduction of the GATE's currency worth
+                // at least the shared Armijo fraction of what this step's own
+                // model predicted. Invariant, not a second currency: the ambient
+                // residual may not GROW, so quotient progress can never be
+                // bought by pumping residual into the gauge orbit — which is the
+                // only way a projected norm falls while the residual does not.
+                if trial_merits.quotient.is_finite()
+                    && trial_merits.ambient.is_finite()
+                    && pre_merits.quotient - trial_merits.quotient
+                        >= sufficient - opt::armijo_roundoff_cushion(pre_merits.quotient)
+                    && trial_merits.ambient
+                        <= pre_merits.ambient + opt::armijo_roundoff_cushion(pre_merits.ambient)
                 {
                     accepted = Some(AcceptedTerminalResidualStep {
                         damping: nu,
                         trial_merits,
-                        predicted_objective_decrease,
+                        predicted_quotient_decrease,
                         step: damped,
                         system: trial_system,
                     });
@@ -2888,8 +2991,8 @@ impl SaeManifoldTerm {
             let Some(accepted) = accepted else {
                 log::debug!(
                     "terminal Newton bail: no damping on [{smallest_damping:.6e}, \
-                     {largest_damping:.6e}] bought sufficient Armijo decrease of the \
-                     penalized objective at ‖g‖={grad_norm:.6e} ({trials} trial(s))"
+                     {largest_damping:.6e}] bought a sufficient measured decrease of the \
+                     residual merit at ‖g‖={grad_norm:.6e} ({trials} trial(s))"
                 );
                 break;
             };
@@ -2988,11 +3091,11 @@ impl SaeManifoldTerm {
                  {grad_tolerance:.6e}",
                 pre_merits.quotient,
                 accepted.trial_merits.quotient,
-                accepted.predicted_objective_decrease,
+                accepted.predicted_quotient_decrease,
                 pre_merits.quotient - accepted.trial_merits.quotient,
-                if accepted.predicted_objective_decrease > 0.0 {
+                if accepted.predicted_quotient_decrease > 0.0 {
                     (pre_merits.quotient - accepted.trial_merits.quotient)
-                        / accepted.predicted_objective_decrease
+                        / accepted.predicted_quotient_decrease
                 } else {
                     f64::NAN
                 },
@@ -3888,9 +3991,10 @@ impl SaeManifoldTerm {
     /// [`Self::border_channels_for_border_dim`],
     /// [`Self::row_vars_for_row_dim`], `refill_jet_window_with_row_dims`).
     ///
-    /// `ΔC_ββ ≡ 0` (the decoder is linear in β), so `hbb` / `penalty_op` are
-    /// untouched and the whole correction lands in the row blocks and the
-    /// eliminated Schur sum.
+    /// Reconstruction is linear in beta, but nonlinear decoder priors contribute
+    /// a signed beta correction captured by the majorizer assembly. Its shared
+    /// operator is composed with `hbb` / `penalty_op`. Row-local residual and
+    /// assignment-prior corrections enter the row blocks and eliminated Schur sum.
     ///
     /// `ΔC_tβ` is carried by COMPOSING the installed matrix-free row operator
     /// rather than by a dense supplement, because
@@ -4083,9 +4187,26 @@ impl SaeManifoldTerm {
                 );
             }
         }
+        if !majorizer.exact_beta_remainders.is_empty() {
+            let mut ops = vec![majorizer.effective_penalty_op()];
+            ops.extend(
+                majorizer
+                    .exact_beta_remainders
+                    .iter()
+                    .cloned()
+                    .map(|remainder| {
+                        std::sync::Arc::new(remainder)
+                            as std::sync::Arc<dyn gam_solve::arrow_schur::BetaPenaltyOp>
+                    }),
+            );
+            system.set_penalty_op(std::sync::Arc::new(
+                gam_solve::arrow_schur::CompositePenaltyOp { k: border_dim, ops },
+            ));
+        }
         system.exact_a_classification =
             Some(gam_solve::arrow_schur::ExactAClassificationGeometry {
                 rows: classification_rows,
+                delta_beta: majorizer.exact_beta_remainders.clone().into(),
                 border_indices: classification_indices,
             });
         system.refresh_row_hessian_fingerprint();
@@ -4192,7 +4313,7 @@ impl SaeManifoldTerm {
             // (≈8 GB at the K=32k manifold border) does NOT fit the in-core
             // budget, so estimate log|S| via Stochastic Lanczos Quadrature on the
             // matrix-free `schur_matvec` apply (`gam_solve::arrow_schur::
-            // matrix_free_arrow_evidence_log_det`) instead of assembling +
+            // matrix_free_arrow_evidence_log_det_surrogate`) instead of assembling +
             // Cholesky-factoring the dense Schur. Peak memory is the per-row block
             // storage the inner PCG already holds, not the extra O(k²) dense S.
             //
@@ -4312,9 +4433,18 @@ impl SaeManifoldTerm {
             self.beta_dim()
         };
         let mut schur_acc = Array2::<f64>::zeros((border_dim, border_dim));
-        let mut majorizer_acc = Array2::<f64>::zeros((border_dim, border_dim));
-        let mut clamp_acc = Array2::<f64>::zeros((border_dim, border_dim));
-        let mut exact_a_chunks = 0usize;
+        // #2515/#2731 — the exact-A reduced classification is accumulated
+        // alongside the Schur, from the same per-chunk factorization, because it
+        // is additive over rows for exactly the same reason the Schur is. The
+        // policy set below REFUSES a resolved negative direction; that verdict is
+        // read off this carrier, so a route that summed the Schur and dropped the
+        // carrier was not choosing a laxer verdict, it was choosing an error
+        // (`exact-A evidence classification requires its raw B/delta/clamp
+        // carrier`) at every single evaluation.
+        let mut exact_a_acc =
+            gam_solve::arrow_schur::ExactAReducedClassification::zeros(border_dim);
+        let mut classified_chunks = 0usize;
+        let mut total_chunks = 0usize;
         let mut log_det_tt = 0.0_f64;
         // #2515 — same substitution as the matrix-free branch above, and for the
         // same reason: every factorization below is of `exact_a_evidence_system`'s
@@ -4370,47 +4500,48 @@ impl SaeManifoldTerm {
             // the Laplace normalizer is `log|A|`, and every `ΔC` channel except
             // ordered Beta-Bernoulli is row-local, so the correction is
             // chunk-additive exactly as the majorizer is. (`penalty_scale` scales
-            // only β-side penalties, and `ΔC_ββ ≡ 0`.)
+            // beta-side penalties, including their captured signed corrections.)
             let sys = chunk.exact_a_evidence_system(z_chunk, rho, &sys)?;
             let mut streaming = StreamingArrowSchur::from_system(&sys, sys.rows.len().max(1));
-            let evidence = streaming
-                .evidence_schur_chunk(0.0, 0.0, &options)
+            let chunk_evidence = streaming
+                .evidence_schur_chunk(&sys, 0.0, 0.0, &options)
                 .map_err(|err| format!("SaeManifoldTerm::streaming_exact_arrow_log_det: {err}"))?;
-            log_det_tt += evidence.log_det_tt;
-            match (evidence.majorizer_metric, evidence.clamp_metric) {
-                (Some(majorizer), Some(clamp)) => {
-                    majorizer_acc += &majorizer;
-                    clamp_acc += &clamp;
-                    exact_a_chunks += 1;
-                }
-                (None, None) => {}
-                _ => {
-                    return Err("SaeManifoldTerm::streaming_exact_arrow_log_det: partial exact-A \
-                                chunk carrier is not a classification"
-                        .to_string());
-                }
-            }
+            let chunk_exact_a = chunk_evidence
+                .exact_a_classification(&sys)
+                .map_err(|err| format!("SaeManifoldTerm::streaming_exact_arrow_log_det: {err}"))?;
+            log_det_tt += chunk_evidence.log_det_tt;
             for row in 0..border_dim {
                 for col in 0..border_dim {
-                    schur_acc[[row, col]] += evidence.schur[[row, col]];
+                    schur_acc[[row, col]] += chunk_evidence.schur[[row, col]];
                 }
+            }
+            total_chunks += 1;
+            if let Some(chunk_exact_a) = chunk_exact_a {
+                exact_a_acc.accumulate(&chunk_exact_a).map_err(|err| {
+                    format!("SaeManifoldTerm::streaming_exact_arrow_log_det: {err}")
+                })?;
+                classified_chunks += 1;
             }
             start = end;
         }
-        let expected_chunks = n_total.div_ceil(chunk_size);
-        if exact_a_chunks != 0 && exact_a_chunks != expected_chunks {
-            return Err("SaeManifoldTerm::streaming_exact_arrow_log_det: partial exact-A \
-                        chunk carrier would classify a different operator"
-                .to_string());
-        }
-        let exact_a = (exact_a_chunks == expected_chunks).then_some((&majorizer_acc, &clamp_acc));
-        let log_det_schur = StreamingArrowSchur::reduced_schur_log_det(
-            &schur_acc,
-            &options,
-            exact_a.map(|metrics| metrics.0),
-            exact_a.map(|metrics| metrics.1),
-        )
-        .map_err(|err| format!("SaeManifoldTerm::streaming_exact_arrow_log_det: {err}"))?;
+        // All-or-nothing: a PARTIAL sum would price the unclassified chunks' rows
+        // as if their raw exact-A geometry were identically zero, which is a
+        // different operator, not a coarser one.
+        let exact_a = if classified_chunks == 0 {
+            None
+        } else if classified_chunks == total_chunks {
+            Some(&exact_a_acc)
+        } else {
+            return Err(format!(
+                "SaeManifoldTerm::streaming_exact_arrow_log_det: {classified_chunks} of \
+                 {total_chunks} chunks carried the exact-A classification; summing a partial \
+                 carrier would classify the accumulated Schur against a metric the missing \
+                 chunks never contributed to (#2515/#2731)"
+            ));
+        };
+        let log_det_schur =
+            StreamingArrowSchur::reduced_schur_log_det(&schur_acc, &options, exact_a)
+                .map_err(|err| format!("SaeManifoldTerm::streaming_exact_arrow_log_det: {err}"))?;
         if let Some(ri) = rank_inputs.as_deref_mut() {
             ri.log_det_tt = log_det_tt;
         }
@@ -6290,6 +6421,42 @@ impl SaeManifoldTerm {
         self.logdet_theta_adjoint_for_block(rho, cache, &solver, false, operator, residual_target)
     }
 
+    /// Contract the full captured beta prior derivative against a dense beta
+    /// inverse block. The same bilinear owner serves the matrix-free probe
+    /// route; neither route assumes the majorizer derivative was added elsewhere.
+    fn add_beta_prior_dense_theta(
+        cache: &ArrowFactorCache,
+        weight: ArrayView2<'_, f64>,
+        exact_a: bool,
+        out: &mut Array1<f64>,
+    ) -> Result<(), String> {
+        if cache.exact_beta_remainders.is_empty() {
+            return Ok(());
+        }
+        assert_eq!(weight.dim(), (cache.k, cache.k));
+        let mut axis = vec![0.0; cache.k];
+        for coordinate in 0..cache.k {
+            let right = weight.column(coordinate).to_owned();
+            if right.iter().all(|&value| value == 0.0) {
+                continue;
+            }
+            axis[coordinate] = 1.0;
+            for owner in cache.exact_beta_remainders.iter() {
+                owner.theta_bilinear(
+                    exact_a,
+                    &axis,
+                    right
+                        .as_slice()
+                        .expect("owned inverse column is contiguous"),
+                    out.as_slice_mut()
+                        .expect("owned beta adjoint is contiguous"),
+                )?;
+            }
+            axis[coordinate] = 0.0;
+        }
+        Ok(())
+    }
+
     fn logdet_theta_adjoint_for_block(
         &self,
         rho: &SaeManifoldRho,
@@ -6351,14 +6518,6 @@ impl SaeManifoldTerm {
             Some(self.atom_third_jets()?)
         } else {
             None
-        };
-        let patchd_is_obb = matches!(
-            self.assignment.mode,
-            AssignmentMode::OrderedBetaBernoulli { .. }
-        );
-        let patchd_obb_inv_tau = match self.assignment.mode {
-            AssignmentMode::OrderedBetaBernoulli { temperature, .. } => 1.0 / temperature,
-            _ => 0.0,
         };
         let border = self.border_channels_for_cache(cache)?;
         // #932 FRONT C: plain-arrow `(H⁻¹)_ββ = S⁻¹` formed once from the cached
@@ -6523,8 +6682,6 @@ impl SaeManifoldTerm {
                     assignments: &assignments,
                     second_jets: &second_jets,
                     third_jets: patchd_third_jets.as_deref(),
-                    is_obb: patchd_is_obb,
-                    inv_tau: patchd_obb_inv_tau,
                 });
             for w in 0..q {
                 let mut gamma = 0.0_f64;
@@ -6544,7 +6701,7 @@ impl SaeManifoldTerm {
                                 jets.vars[a],
                                 jets.vars[b],
                                 jets.vars[w],
-                            );
+                            )?;
                         }
                         if a == b {
                             dh += match jets.vars[a] {
@@ -6634,8 +6791,19 @@ impl SaeManifoldTerm {
                 let mut dh_mat = Array2::<f64>::zeros((q, q));
                 for a in 0..q {
                     for b in 0..q {
-                        let dh = sae_dot(jets.beta_l_deriv(a, w_beta_pos), jets.first(b))
+                        let mut dh = sae_dot(jets.beta_l_deriv(a, w_beta_pos), jets.first(b))
                             + sae_dot(jets.first(a), jets.beta_l_deriv(b, w_beta_pos));
+                        if exact_a {
+                            dh += sae_dot(jets.beta(w_beta_pos), jets.second(a, b));
+                        }
+                        if let Some(ctx) = patchd_ctx.as_ref() {
+                            dh += self.patchd_residual_third_leg_beta(
+                                ctx,
+                                jets.vars[a],
+                                jets.vars[b],
+                                w_channel,
+                            );
+                        }
                         dh_mat[[a, b]] = dh;
                         gamma += inv_vv[[b, a]] * dh;
                     }
@@ -6650,7 +6818,10 @@ impl SaeManifoldTerm {
                 }
                 for a in 0..q {
                     for (beta_pos, channel) in border.iter().enumerate() {
-                        let dh = sae_dot(jets.beta_l_deriv(a, w_beta_pos), jets.beta(beta_pos));
+                        let mut dh = sae_dot(jets.beta_l_deriv(a, w_beta_pos), jets.beta(beta_pos));
+                        if exact_a {
+                            dh += sae_dot(jets.beta(w_beta_pos), jets.beta_deriv(a, beta_pos));
+                        }
                         gamma += 2.0 * inv_vbeta[[a, channel.index]] * dh;
                     }
                 }
@@ -6675,6 +6846,9 @@ impl SaeManifoldTerm {
             }
         }
 
+        if joint_block {
+            Self::add_beta_prior_dense_theta(cache, beta_inv.view(), exact_a, &mut gamma_beta)?;
+        }
         Ok(SaeArrowVector {
             t: gamma_t,
             beta: gamma_beta,
@@ -6854,7 +7028,6 @@ impl SaeManifoldTerm {
                     .to_string(),
             );
         }
-        let patchd_obb_inv_tau = 0.0_f64;
         let mut assignments = Array1::<f64>::zeros(self.k_atoms());
         let mut jet_window: std::collections::VecDeque<SaeRowJets> =
             std::collections::VecDeque::new();
@@ -6931,8 +7104,6 @@ impl SaeManifoldTerm {
                     assignments: &assignments,
                     second_jets: &second_jets,
                     third_jets: patchd_third_jets.as_deref(),
-                    is_obb: patchd_is_obb,
-                    inv_tau: patchd_obb_inv_tau,
                 });
 
             if ordered_beta_bernoulli_channels.is_some() {
@@ -7018,6 +7189,13 @@ impl SaeManifoldTerm {
                         }
                         _ => None,
                     };
+                let exact_entropy_derivative = if exact_a {
+                    softmax_d_dw.map(|(a, mm, scale, inv_tau, atom_w)| {
+                        SoftmaxEntropyDerivative::new(a, atom_w, mm, scale, inv_tau)
+                    })
+                } else {
+                    None
+                };
                 // t–t block: reuse the dense contraction. On a deflated row the raw
                 // per-slot derivative is retained as a matrix so the Daleckii–Krein
                 // correction can be applied to it after the loop; on a PD row the
@@ -7067,7 +7245,7 @@ impl SaeManifoldTerm {
                                 jets.vars[a],
                                 jets.vars[b],
                                 jets.vars[w],
-                            );
+                            )?;
                         }
                         if let (
                             Some((a_soft, mm, scale, inv_tau, _atom_w)),
@@ -7075,7 +7253,9 @@ impl SaeManifoldTerm {
                             SaeLocalRowVar::Logit { atom: atom_b },
                         ) = (softmax_d_dw, jets.vars[a], jets.vars[b])
                         {
-                            if atom_a == atom_b {
+                            if let Some(derivative) = &exact_entropy_derivative {
+                                dh += w_row_prior * derivative.entry(atom_a, atom_b).1;
+                            } else if atom_a == atom_b {
                                 dh += w_row_prior
                                     * active_softmax_majorizer_logit_derivative_entry(
                                         a_soft, atom_a, _atom_w, mm, scale, inv_tau,
@@ -7193,8 +7373,19 @@ impl SaeManifoldTerm {
                 };
                 for a in 0..q {
                     for b in 0..q {
-                        let dh = sae_dot(jets.beta_l_deriv(a, w_beta_pos), jets.first(b))
+                        let mut dh = sae_dot(jets.beta_l_deriv(a, w_beta_pos), jets.first(b))
                             + sae_dot(jets.first(a), jets.beta_l_deriv(b, w_beta_pos));
+                        if exact_a {
+                            dh += sae_dot(jets.beta(w_beta_pos), jets.second(a, b));
+                        }
+                        if let Some(ctx) = patchd_ctx.as_ref() {
+                            dh += self.patchd_residual_third_leg_beta(
+                                ctx,
+                                jets.vars[a],
+                                jets.vars[b],
+                                w_channel,
+                            );
+                        }
                         if !defl_dirs.is_empty() {
                             dh_mat[[a, b]] = dh;
                         }
@@ -7213,7 +7404,10 @@ impl SaeManifoldTerm {
                 }
                 for a in 0..q {
                     for (beta_pos, channel) in border.iter().enumerate() {
-                        let dh = sae_dot(jets.beta_l_deriv(a, w_beta_pos), jets.beta(beta_pos));
+                        let mut dh = sae_dot(jets.beta_l_deriv(a, w_beta_pos), jets.beta(beta_pos));
+                        if exact_a {
+                            dh += sae_dot(jets.beta(w_beta_pos), jets.beta_deriv(a, beta_pos));
+                        }
                         gamma += 2.0 * inv_vbeta[[a, channel.index]] * dh;
                     }
                 }
@@ -7233,6 +7427,22 @@ impl SaeManifoldTerm {
             }
         }
 
+        if !cache.exact_beta_remainders.is_empty() && m > 0 {
+            let mut prior = vec![0.0; k_border];
+            for (probe, solve) in probes.iter().zip(sinv_probes.iter()) {
+                for owner in cache.exact_beta_remainders.iter() {
+                    owner.theta_bilinear(
+                        exact_a,
+                        probe.as_slice().expect("owned beta probe is contiguous"),
+                        solve.as_slice().expect("owned beta solve is contiguous"),
+                        &mut prior,
+                    )?;
+                }
+            }
+            for (value, &derivative) in gamma_beta.iter_mut().zip(prior.iter()) {
+                *value += inv_m * derivative;
+            }
+        }
         Ok(SaeArrowVector {
             t: gamma_t,
             beta: gamma_beta,

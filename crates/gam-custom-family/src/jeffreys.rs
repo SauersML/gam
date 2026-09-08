@@ -827,64 +827,89 @@ pub(crate) fn custom_family_outer_jeffreys_hphi_drift_batched<
     if !plan.is_active() {
         return Ok(None);
     }
-    let family_owned = family.clone();
+    let family_owned = Arc::new(family.clone());
     let strength = family.joint_jeffreys_term_strength();
-    let states_owned: Vec<ParameterBlockState> = states.to_vec();
-    let specs_owned: Vec<ParameterBlockSpec> = specs.to_vec();
-    let batch: JeffreysHphiDriftBatchFn = Arc::new(move |deltas: &[Array1<f64>]| {
+    let states_owned = Arc::new(states.to_vec());
+    let specs_owned = Arc::new(specs.to_vec());
+    let family_second = Arc::clone(&family_owned);
+    let states_second = Arc::clone(&states_owned);
+    let specs_second = Arc::clone(&specs_owned);
+    let prepare_base = {
+        let family = Arc::clone(&family_owned);
+        let states = Arc::clone(&states_owned);
+        let specs = Arc::clone(&specs_owned);
+        let cached = OnceLock::<Result<
+            Arc<gam_solve::estimate::reml::jeffreys_subspace::JeffreysHphiDriftBase>,
+            CustomFamilyError,
+        >>::new();
+        Arc::new(move || cached.get_or_init(|| {
         // The exact reduced-information plan authorized this closure before it
         // was returned, so an inactive outer gate performs zero derivative work.
         // Acquire the WHOLE canonical-axis set in ONE batched hook call —
         // the same path the value-path `joint_jeffreys_term` uses — so a family
         // that assembles every axis in one shared softmax/Gram pass (multinomial)
         // pays a SINGLE sweep instead of the `p` concurrent cache-miss sweeps the
-        // per-axis fan-out triggered on a fresh β (#1082/#979). `None` batch ⇒ some
-        // axis lacks the exact derivative ⇒ fall back to the per-axis closure,
-        // whose first `None` collapses the base to the zero drift everywhere
-        // (matching the singular hook).
-        let all_axes = family_owned
+        // per-axis fan-out triggered on a fresh β (#1082/#979). An active
+        // curvature requires every exact derivative; an absent batch is an
+        // error, since substituting zero would change the outer objective's
+        // derivative.
+        let all_axes = family
             .joint_jeffreys_information_directional_derivative_all_axes_with_specs(
-                &states_owned,
-                &specs_owned,
+                &states,
+                &specs,
             )?;
-        let base = match all_axes {
-            Some(hdots) => {
-                gam_solve::estimate::reml::jeffreys_subspace::JeffreysHphiDriftBase::prepare_with_plan_axes(
-                    plan.clone(),
-                    hdots,
-                )?
-            }
-            None => gam_solve::estimate::reml::jeffreys_subspace::JeffreysHphiDriftBase::prepare_from_plan(
-                plan.clone(),
-                |direction: &Array1<f64>| {
-                    family_owned.joint_jeffreys_information_directional_derivative_with_specs(
-                        &states_owned,
-                        &specs_owned,
-                        direction,
-                    )
-                },
-            )?,
-        };
-        let Some(base) = base else {
-            let zeros = vec![Some(Array2::<f64>::zeros((total_p, total_p))); deltas.len()];
-            return Ok(zeros);
-        };
+        let axes = all_axes.ok_or_else(|| {
+            CustomFamilyError::trial_point(
+                "active Jeffreys drift requires exact first information derivatives".to_string(),
+            )
+        })?;
+        gam_solve::estimate::reml::jeffreys_subspace::JeffreysHphiDriftBase::prepare_with_plan_axes(
+            plan.clone(), axes,
+        )?.map(Arc::new).ok_or_else(|| CustomFamilyError::trial_point(
+            "active Jeffreys drift could not prepare its information derivative base".to_string()
+        ))
+        }).clone())
+    };
+    let prepare_first = Arc::clone(&prepare_base);
+    let completion_beta = {
+        let prepare = Arc::clone(&prepare_base);
+        let family = Arc::clone(&family_owned);
+        let states = Arc::clone(&states_owned);
+        let specs = Arc::clone(&specs_owned);
+        Arc::new(move |u: &Array1<f64>, v: &Array1<f64>| -> Result<Array1<f64>, CustomFamilyError> {
+            let missing = || CustomFamilyError::trial_point("active Jeffreys mode response requires exact completion derivatives");
+            let h = family.joint_jeffreys_information_directional_derivative_with_specs(&states, &specs, u)?.ok_or_else(missing)?;
+            let axes = family.joint_jeffreys_information_second_directional_all_axes_with_specs(&states, &specs, v)?.ok_or_else(missing)?;
+            let moving = family.joint_jeffreys_information_third_directional_all_axes_with_specs(&states, &specs, u, v)?.ok_or_else(missing)?;
+            Ok(prepare()?.completion_drift_action(&h, axes, moving)? * strength)
+        })
+    };
+    let first = Arc::new(move |deltas: &[Array1<f64>]| {
+        if deltas.is_empty() {
+            return Ok(Vec::new());
+        }
+        // The coefficient snapshot is immutable. Share its base across first
+        // and second derivatives and across every subsequent operator apply,
+        // not merely across directions in a single callback invocation.
+        let base = prepare_first()?;
         // Per direction: the only δ-dependent work — `pert_h = Hdot[δ]` and the
         // `p` second-directional derivatives `H²dot[δ,e_a]` — reusing the base.
         deltas
             .iter()
             .map(|delta| {
-                let pert_h = match family_owned
-                    .joint_jeffreys_information_directional_derivative_with_specs(
-                        &states_owned,
-                        &specs_owned,
-                        delta,
-                    )? {
-                    Some(hd) => hd,
-                    // No exact first derivative ⇒ drift undefined ⇒ safe zero
-                    // (matching `joint_jeffreys_hphi_directional_derivative`).
-                    None => return Ok(Some(Array2::<f64>::zeros((total_p, total_p)))),
-                };
+                let pert_h =
+                    match family_owned
+                        .joint_jeffreys_information_directional_derivative_with_specs(
+                            &states_owned,
+                            &specs_owned,
+                            delta,
+                        )? {
+                        Some(hd) => hd,
+                        None => return Err(
+                            "active Jeffreys drift requires an exact first information derivative"
+                                .to_string(),
+                        ),
+                    };
                 // Batched all-axes second-directional object `{H²dot[δ,e_a]}` in
                 // ONE pass (BLAS-3 for the rigid family; the defining per-axis
                 // implementation for the rest). This collapses the dominant
@@ -895,8 +920,12 @@ pub(crate) fn custom_family_outer_jeffreys_hphi_drift_batched<
                         &states_owned,
                         &specs_owned,
                         delta,
-                    )?;
-                base.perturbation_derivative_batched_axes(&pert_h, pert_axis_matrices)
+                    )?
+                    .ok_or_else(|| {
+                        "active Jeffreys drift requires exact second information derivatives"
+                            .to_string()
+                    })?;
+                base.perturbation_derivative_batched_axes(&pert_h, Some(pert_axis_matrices))
                     .map(|mut derivative| {
                         if strength != 1.0 {
                             derivative *= strength;
@@ -907,5 +936,74 @@ pub(crate) fn custom_family_outer_jeffreys_hphi_drift_batched<
             .collect::<Result<Vec<_>, String>>()
             .map_err(CustomFamilyError::trial_point)
     });
-    Ok(Some(batch))
+    let second = Arc::new(move |pairs: &[(Array1<f64>, Array1<f64>)]| {
+        if pairs.is_empty() {
+            return Ok(Vec::new());
+        }
+        let missing = |derivative: &str| {
+            CustomFamilyError::trial_point(format!(
+                "active Jeffreys outer Hessian requires exact {derivative}; family does not expose it"
+            ))
+        };
+        let base = prepare_base()?;
+        pairs
+            .iter()
+            .map(|(u, v)| {
+                let hu = family_second
+                    .joint_jeffreys_information_directional_derivative_with_specs(
+                        &states_second,
+                        &specs_second,
+                        u,
+                    )?
+                    .ok_or_else(|| missing("first information derivative"))?;
+                let hv = family_second
+                    .joint_jeffreys_information_directional_derivative_with_specs(
+                        &states_second,
+                        &specs_second,
+                        v,
+                    )?
+                    .ok_or_else(|| missing("first information derivative"))?;
+                let huv = family_second
+                    .joint_jeffreys_information_second_directional_derivative_with_specs(
+                        &states_second,
+                        &specs_second,
+                        u,
+                        v,
+                    )?
+                    .ok_or_else(|| missing("second information derivative"))?;
+                let axes_u = family_second
+                    .joint_jeffreys_information_second_directional_all_axes_with_specs(
+                        &states_second,
+                        &specs_second,
+                        u,
+                    )?
+                    .ok_or_else(|| missing("second information derivatives"))?;
+                let axes_v = family_second
+                    .joint_jeffreys_information_second_directional_all_axes_with_specs(
+                        &states_second,
+                        &specs_second,
+                        v,
+                    )?
+                    .ok_or_else(|| missing("second information derivatives"))?;
+                let axes_uv = family_second
+                    .joint_jeffreys_information_third_directional_all_axes_with_specs(
+                        &states_second,
+                        &specs_second,
+                        u,
+                        v,
+                    )?
+                    .ok_or_else(|| {
+                        missing("third information derivatives (fifth likelihood derivatives)")
+                    })?;
+                let mut derivative = base
+                    .mixed_perturbation_derivative_batched_axes(
+                        &hu, &hv, &huv, axes_u, axes_v, axes_uv,
+                    )
+                    .map_err(CustomFamilyError::trial_point)?;
+                derivative *= strength;
+                Ok(derivative)
+            })
+            .collect::<Result<Vec<_>, CustomFamilyError>>()
+    });
+    Ok(Some(JeffreysHphiDriftBatchFn { first, second, completion_beta, completion_psi: None, response_scale: 1.0 }))
 }

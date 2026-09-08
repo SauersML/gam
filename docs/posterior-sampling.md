@@ -27,7 +27,7 @@ bands = posterior.predict(test_df, level=0.95)
 
 ## Model.sample
 
-```text
+```python
 model.sample(
     data,
     *,

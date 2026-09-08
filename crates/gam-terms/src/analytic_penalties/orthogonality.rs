@@ -1,4 +1,5 @@
 use super::*;
+use ndarray::s;
 
 // ---------------------------------------------------------------------------
 // Block-orthogonality penalty
@@ -515,7 +516,129 @@ pub struct DecoderIncoherencePenalty {
     pub weight_schedule: Option<ScalarWeightSchedule>,
 }
 
+struct PreparedCoherencePair {
+    left: std::ops::Range<usize>,
+    right: std::ops::Range<usize>,
+    coefficient: f64,
+    geometry: normalized_gram::NormalizedCrossGram,
+}
+
+/// Immutable geometry of the live normalized decoder-coherence prior. One
+/// preparation supplies the omitted signed curvature, its exact diagonal and
+/// the full prior's bilinear theta derivative, including the live normalizers.
+pub struct PreparedDecoderIncoherence {
+    dimension: usize,
+    pairs: Vec<PreparedCoherencePair>,
+}
+
+impl PreparedDecoderIncoherence {
+    fn pair_direction(pair: &PreparedCoherencePair, direction: &[f64]) -> Array1<f64> {
+        Array1::from_iter(
+            direction[pair.left.clone()]
+                .iter()
+                .chain(direction[pair.right.clone()].iter())
+                .copied(),
+        )
+    }
+
+    fn scatter(pair: &PreparedCoherencePair, local: ArrayView1<'_, f64>, out: &mut [f64]) {
+        for (i, destination) in pair.left.clone().chain(pair.right.clone()).enumerate() {
+            out[destination] += pair.coefficient * local[i];
+        }
+    }
+
+    pub fn remainder_action_add(&self, direction: &[f64], out: &mut [f64]) {
+        assert_eq!(direction.len(), self.dimension);
+        assert_eq!(out.len(), self.dimension);
+        for pair in &self.pairs {
+            // Dense block requests need only incident edges; do not rebuild
+            // every pair's matrix products for a direction supported on one atom.
+            if pair
+                .left
+                .clone()
+                .chain(pair.right.clone())
+                .all(|i| direction[i] == 0.0)
+            {
+                continue;
+            }
+            let local = Self::pair_direction(pair, direction);
+            let delta = pair.geometry.hessian_action(local.view())
+                - pair.geometry.gauss_newton_action(local.view());
+            Self::scatter(pair, delta.view(), out);
+        }
+    }
+
+    pub fn remainder_diagonal_add(&self, out: &mut [f64]) {
+        assert_eq!(out.len(), self.dimension);
+        for pair in &self.pairs {
+            let delta = pair.geometry.diagonal() - pair.geometry.gauss_newton_diagonal();
+            Self::scatter(pair, delta.view(), out);
+        }
+    }
+
+    pub fn theta_bilinear_add(&self, exact: bool, left: &[f64], right: &[f64], out: &mut [f64]) {
+        assert_eq!(left.len(), self.dimension);
+        assert_eq!(right.len(), self.dimension);
+        assert_eq!(out.len(), self.dimension);
+        for pair in &self.pairs {
+            let l = Self::pair_direction(pair, left);
+            let r = Self::pair_direction(pair, right);
+            let local = if exact {
+                pair.geometry.third_bilinear(l.view(), r.view())
+            } else {
+                pair.geometry
+                    .gauss_newton_bilinear_gradient(l.view(), r.view())
+            };
+            Self::scatter(pair, local.view(), out);
+        }
+    }
+}
+
 impl DecoderIncoherencePenalty {
+    pub fn prepare_curvature(
+        &self,
+        target: ArrayView1<'_, f64>,
+        rho: ArrayView1<'_, f64>,
+    ) -> PreparedDecoderIncoherence {
+        assert_eq!(target.len(), self.target.len());
+        let offsets = self.block_offsets();
+        let weight = self.resolved_weight(rho);
+        let pairs = self
+            .pairs
+            .iter()
+            .filter_map(|&(j, k, pair_weight)| {
+                if pair_weight == 0.0 || weight == 0.0 {
+                    return None;
+                }
+                let left = offsets[j]..offsets[j] + self.block_sizes[j] * self.p_out;
+                let right = offsets[k]..offsets[k] + self.block_sizes[k] * self.p_out;
+                let left_matrix = target
+                    .slice(s![left.clone()])
+                    .into_shape_with_order((self.block_sizes[j], self.p_out))
+                    .expect("validated left block span matches its decoder shape");
+                let right_matrix = target
+                    .slice(s![right.clone()])
+                    .into_shape_with_order((self.block_sizes[k], self.p_out))
+                    .expect("validated right block span matches its decoder shape");
+                let geometry = normalized_gram::NormalizedCrossGram::new(
+                    left_matrix,
+                    right_matrix,
+                    normalized_gram::GramNormalization::DecoderNorm,
+                )?;
+                Some(PreparedCoherencePair {
+                    left,
+                    right,
+                    coefficient: 0.5 * weight * pair_weight,
+                    geometry,
+                })
+            })
+            .collect();
+        PreparedDecoderIncoherence {
+            dimension: target.len(),
+            pairs,
+        }
+    }
+
     #[must_use = "build error must be handled"]
     pub fn new(
         target: PsiSlice,
@@ -918,66 +1041,6 @@ impl DecoderIncoherencePenalty {
     /// `O(β · Σ_pairs M_j·M_k·p)`: once `β = K·M·p` and the collinearity gate
     /// admits `O(K)` co-active pairs, the probe loop spends `O(K²)` time
     /// rebuilding a matrix this assembles in `O(K)` (#1026).
-    /// The Gauss–Newton (PSD majorizer) curvature in CARRIER form: one entry per
-    /// cross-Gram element `C[a,b]` of each penalized pair, as
-    /// `(κ, (start_j, B_k[b,·]), (start_k, B_j[a,·]))` with the starts in this
-    /// penalty's own flat-β coordinates.
-    ///
-    /// `H_GN = Σ_pairs κ·JᵀJ` with `J = ∂vec(C)/∂vec(B)`, and `C[a,b] = Σ_o
-    /// B_j[a,o]B_k[b,o]` depends on exactly row `a` of `B_j` and row `b` of
-    /// `B_k`, so `∂C[a,b]/∂B` is two `p`-long runs and `JᵀJ = Σ_{a,b} v_{ab}
-    /// v_{ab}ᵀ`. This is therefore the SAME operator as the
-    /// `include_residual = false` branch of `Self::hvp_impl` and as
-    /// [`Self::accumulate_psd_majorizer_dense`] — stated in the form a
-    /// matrix-free solver can install without materializing `(ΣM_kp)²`.
-    ///
-    /// #2828: the SAE's un-framed matrix-free assembly lane had no way to carry
-    /// this curvature and was dropping it while keeping the gradient.
-    #[must_use]
-    pub fn psd_majorizer_carriers(
-        &self,
-        target: ArrayView1<'_, f64>,
-        rho: ArrayView1<'_, f64>,
-        scale: f64,
-    ) -> Vec<(f64, (usize, Vec<f64>), (usize, Vec<f64>))> {
-        let mut out = Vec::new();
-        if target.len() != self.target.len() {
-            return out;
-        }
-        let offsets = self.block_offsets();
-        let weight = self.resolved_weight(rho);
-        let p = self.p_out;
-        for &(j, k, w_sym) in &self.pairs {
-            if j == k {
-                continue;
-            }
-            let off_j = offsets[j];
-            let off_k = offsets[k];
-            let m_j = self.block_sizes[j];
-            let m_k = self.block_sizes[k];
-            if m_j == 0 || m_k == 0 {
-                continue;
-            }
-            let nj = Self::block_norm_sq(target, off_j, m_j, p);
-            let nk = Self::block_norm_sq(target, off_k, m_k, p);
-            if !(nj > 0.0 && nk > 0.0) {
-                continue;
-            }
-            let kappa = w_sym * weight * scale / (nj * nk);
-            if kappa == 0.0 {
-                continue;
-            }
-            for a in 0..m_j {
-                for b in 0..m_k {
-                    let run_j: Vec<f64> = (0..p).map(|o| target[off_k + b * p + o]).collect();
-                    let run_k: Vec<f64> = (0..p).map(|o| target[off_j + a * p + o]).collect();
-                    out.push((kappa, (off_j + a * p, run_j), (off_k + b * p, run_k)));
-                }
-            }
-        }
-        out
-    }
-
     pub fn accumulate_psd_majorizer_dense(
         &self,
         target: ArrayView1<'_, f64>,

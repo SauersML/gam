@@ -840,12 +840,19 @@ fn cpu_contracted_tile(
                     let mut gamma = 0.0_f64;
                     for a in 0..q {
                         for b in 0..q {
-                            let dh = dot(scheduled.beta_l_deriv(a, w_beta), scheduled.first(b))
+                            let mut dh = dot(scheduled.beta_l_deriv(a, w_beta), scheduled.first(b))
                                 + dot(scheduled.first(a), scheduled.beta_l_deriv(b, w_beta));
+                            if exact_a {
+                                dh += dot(scheduled.beta(w_beta), scheduled.second(a, b));
+                            }
                             gamma += e_row[a * q + b] * dh;
                         }
                         for border in 0..n_beta {
-                            let dh = dot(scheduled.beta_l_deriv(a, w_beta), scheduled.beta(border));
+                            let mut dh =
+                                dot(scheduled.beta_l_deriv(a, w_beta), scheduled.beta(border));
+                            if exact_a {
+                                dh += dot(scheduled.beta(w_beta), scheduled.beta_deriv(a, border));
+                            }
                             gamma += 2.0 * vbeta_row[a * n_beta + border] * dh;
                         }
                     }
@@ -2024,16 +2031,18 @@ extern "C" __global__ void sae_rowjet_trace_t(
 
 // beta[row*nb + w_beta] = tr(E · dh_wβ) over t–t + 2·inv_vβ t–β block.
 extern "C" __global__ void sae_rowjet_trace_beta(
-    const double* first, const double* beta, const double* mixed,
+    const double* first, const double* second, const double* beta, const double* mixed,
     const double* e_tt, const double* inv_vbeta,
-    int q, int p, int nb, unsigned long long total, double* beta_out)
+    int exact_a, int q, int p, int nb, unsigned long long total, double* beta_out)
 {
   unsigned long long index=(unsigned long long)blockIdx.x*blockDim.x+threadIdx.x;
   if(index>=total) return;
   int wb=(int)(index%(unsigned long long)nb);
   int row=(int)(index/(unsigned long long)nb);
   const double* first_row=first+(unsigned long long)row*(unsigned long long)q*p;
+  const double* second_row=second+(unsigned long long)row*(unsigned long long)q*q*p;
   const double* beta_row=beta+(unsigned long long)row*(unsigned long long)nb*p;
+  const double* beta_w=beta_row+(unsigned long long)wb*p;
   const double* mixed_row=mixed+(unsigned long long)row*(unsigned long long)q*nb*p;
   const double* e_row=e_tt+(unsigned long long)row*(unsigned long long)q*q;
   const double* vbeta_row=inv_vbeta+(unsigned long long)row*(unsigned long long)q*nb;
@@ -2045,11 +2054,13 @@ extern "C" __global__ void sae_rowjet_trace_beta(
       const double* fb=first_row+(unsigned long long)b*p;
       const double* m_b=mixed_row+((unsigned long long)b*nb+wb)*p;
       double dh=sae_rj_dot(m_a,fb,p)+sae_rj_dot(fa,m_b,p);
+      if(exact_a) dh+=sae_rj_dot(beta_w,second_row+((unsigned long long)a*q+b)*p,p);
       gamma+=e_row[a*q+b]*dh;
     }
     for(int border=0;border<nb;++border){
       const double* bbeta=beta_row+(unsigned long long)border*p;
       double dh=sae_rj_dot(m_a,bbeta,p);
+      if(exact_a) dh+=sae_rj_dot(beta_w,mixed_row+((unsigned long long)a*nb+border)*p,p);
       gamma+=2.0*vbeta_row[a*nb+border]*dh;
     }
   }
@@ -2561,10 +2572,12 @@ mod device {
             let mut launch = stream.launch_builder(&function);
             launch
                 .arg(&tower.first_dev)
+                .arg(&tower.second_dev)
                 .arg(&tower.beta_dev)
                 .arg(&tower.mixed_dev)
                 .arg(&e_tt_dev)
                 .arg(&inv_vbeta_dev)
+                .arg(&exact_a_i32)
                 .arg(&staged.q_i32)
                 .arg(&staged.p_i32)
                 .arg(&staged.nb_i32)
@@ -2641,17 +2654,7 @@ mod device {
                 exact_a,
             } => {
                 return device_trace_tile(
-                    &stream,
-                    b,
-                    &staged,
-                    inv_tau,
-                    e_tt,
-                    inv_vbeta,
-                    beta_inv,
-                    exact_a,
-                    n,
-                    q,
-                    p,
+                    &stream, b, &staged, inv_tau, e_tt, inv_vbeta, beta_inv, exact_a, n, q, p,
                     n_beta,
                 );
             }
@@ -3355,8 +3358,7 @@ mod tests {
                 .expect("row-local output-base projection");
         }
         assert_ne!(
-            projected_rows[0].beta_outputs,
-            projected_rows[1].beta_outputs,
+            projected_rows[0].beta_outputs, projected_rows[1].beta_outputs,
             "fixture must exercise row-local decoder-border frames"
         );
         let projected = execute_softmax_row_jet_tile(&projected_rows, 1.0, SaeRowJetPath::Cpu)
@@ -3380,7 +3382,12 @@ mod tests {
             let q = original[row].q();
             let n_beta = original[row].n_beta();
             for a in 0..q {
-                assert_projected(row, original[row].first(a), projected[row].first(a), "first");
+                assert_projected(
+                    row,
+                    original[row].first(a),
+                    projected[row].first(a),
+                    "first",
+                );
                 for b in 0..q {
                     assert_projected(
                         row,
@@ -3509,11 +3516,13 @@ mod tests {
                 for a in 0..q {
                     for b in 0..q {
                         let dh = dot(jets.beta_l_deriv(a, w_beta), jets.first(b))
-                            + dot(jets.first(a), jets.beta_l_deriv(b, w_beta));
+                            + dot(jets.first(a), jets.beta_l_deriv(b, w_beta))
+                            + dot(jets.beta(w_beta), jets.second(a, b));
                         expected += e_row[a * q + b] * dh;
                     }
                     for border in 0..n_beta {
-                        let dh = dot(jets.beta_l_deriv(a, w_beta), jets.beta(border));
+                        let dh = dot(jets.beta_l_deriv(a, w_beta), jets.beta(border))
+                            + dot(jets.beta(w_beta), jets.beta_deriv(a, border));
                         expected += 2.0 * vbeta_row[a * n_beta + border] * dh;
                     }
                 }
@@ -3530,6 +3539,106 @@ mod tests {
         assert!(any_logit, "logit-direction trace must engage");
         assert!(any_coord, "coordinate-direction trace must engage");
         assert!(any_beta, "beta-direction trace must engage");
+    }
+
+    /// Explicit Device calls exercise the CUDA Trace kernels, including both
+    /// residual beta legs added for exact A. A/B separation prevents parity
+    /// from passing with the exact-A flag ignored on both paths.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn device_trace_matches_cpu_for_exact_and_majorized_beta_motion_2820() {
+        let skipped = gam_gpu::test_gate::skipped_for_absent_device();
+        let gate = gam_gpu::test_gate::gpu_for_test("exact-A rowjet Trace beta motion #2820");
+        if matches!(gate, gam_gpu::test_gate::GpuTestGate::AbsentDevice) {
+            gam_gpu::test_gate::assert_absent_device_was_counted(skipped);
+            return;
+        }
+        let rows = complete_fixture(2048);
+        let q = rows[0].primaries.len();
+        let n_beta = rows[0].n_beta_borders();
+        let ledger =
+            SaeRowJetMemoryLedger::for_trace_shape(rows[0].n_atoms, q, rows[0].out_dim, n_beta)
+                .expect("bounded Trace fixture memory ledger");
+        let plan = plan_softmax_row_jets_trace(
+            rows.len(),
+            rows[0].n_atoms,
+            q,
+            rows[0].out_dim,
+            n_beta,
+            gam_gpu::GpuPolicy::Required,
+            ledger.fixed_host_bytes + rows.len() * ledger.host_bytes_per_row,
+        )
+        .expect("Required CUDA Trace admission");
+        assert_eq!(plan.path, SaeRowJetPath::Device);
+        assert!(
+            plan.tile_rows >= rows.len(),
+            "the measured fixture must fit one admitted device tile"
+        );
+        let (e_tt, inv_vbeta, beta_inv) = trace_weights(rows.len(), q, n_beta);
+        for inv_tau in [1.0_f64, 1.3] {
+            let mut majorized_beta = Vec::new();
+            for exact_a in [false, true] {
+                let contraction = SaeRowJetContraction::Trace {
+                    e_tt: &e_tt,
+                    inv_vbeta: &inv_vbeta,
+                    beta_inv: &beta_inv,
+                    exact_a,
+                };
+                let cpu = execute_softmax_row_jet_tile_contracted(
+                    &rows,
+                    inv_tau,
+                    SaeRowJetPath::Cpu,
+                    contraction,
+                )
+                .expect("CPU Trace reference");
+                let started = std::time::Instant::now();
+                let gpu = execute_softmax_row_jet_tile_contracted(
+                    &rows,
+                    inv_tau,
+                    SaeRowJetPath::Device,
+                    contraction,
+                )
+                .expect("mandatory actual CUDA Trace execution after device gate");
+                assert_eq!((gpu.n_rows, gpu.q, gpu.n_beta), (rows.len(), q, n_beta));
+                let mut max_error = 0.0_f64;
+                let mut signal = 0.0_f64;
+                for (&expected, &actual) in cpu
+                    .t
+                    .iter()
+                    .chain(&cpu.beta)
+                    .zip(gpu.t.iter().chain(&gpu.beta))
+                {
+                    assert!(expected.is_finite() && actual.is_finite());
+                    max_error = max_error.max((expected - actual).abs());
+                    signal = signal.max(expected.abs());
+                    assert!(
+                        (expected - actual).abs() <= 3.0e-11 * (1.0 + expected.abs()),
+                        "CUDA Trace exact_a={exact_a}, inv_tau={inv_tau}: expected={expected:e}, actual={actual:e}"
+                    );
+                }
+                assert!(signal > 1.0e-3, "Trace oracle must engage");
+                if exact_a {
+                    let delta = cpu
+                        .beta
+                        .iter()
+                        .zip(&majorized_beta)
+                        .map(|(&a, &b): (&f64, &f64)| (a - b).abs())
+                        .fold(0.0_f64, f64::max);
+                    assert!(
+                        delta > 1.0e-3,
+                        "exact residual beta motion must change the Trace: {delta:e}"
+                    );
+                    eprintln!("CUDA_ROWJET_2820 exact-beta separation={delta:e}");
+                } else {
+                    majorized_beta = cpu.beta;
+                }
+                eprintln!(
+                    "CUDA_ROWJET_2820 rows={} exact_a={exact_a} inv_tau={inv_tau} max_error={max_error:e} signal={signal:e} device_seconds={:.6}",
+                    rows.len(),
+                    started.elapsed().as_secs_f64()
+                );
+            }
+        }
     }
 
     /// Independent finite-difference oracle for the θ-adjoint's softmax-logit
@@ -3708,8 +3817,7 @@ mod tests {
         let contracted = SaeRowJetMemoryLedger::for_contracted_shape(k, q, p, n_beta)
             .expect("contracted ledger");
 
-        let input_f64 =
-            (k + 1 + k * p + q * p + q * q * p + n_beta + q * n_beta + n_beta * p) * f;
+        let input_f64 = (k + 1 + k * p + q * p + q * q * p + n_beta + q * n_beta + n_beta * p) * f;
         let input_i32 = (k + q + q) * i;
         // Reduced device state: phase-one dots (k + q + n_beta + q²), reduced
         // outputs (q + n_beta), probe (p), and v_t/v_beta (q + n_beta).

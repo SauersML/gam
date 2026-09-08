@@ -12,7 +12,10 @@ use super::*;
 /// `CompositeHyperOperator`. Returns `None` as soon as either term is absent.
 pub(crate) fn joint_second_derivative_correction_result(
     compute_dh: &dyn Fn(&Array1<f64>) -> Result<Option<DriftDerivResult>, CustomFamilyError>,
-    compute_d2h: &dyn Fn(&Array1<f64>, &Array1<f64>) -> Result<Option<DriftDerivResult>, CustomFamilyError>,
+    compute_d2h: &dyn Fn(
+        &Array1<f64>,
+        &Array1<f64>,
+    ) -> Result<Option<DriftDerivResult>, CustomFamilyError>,
     v_k: &Array1<f64>,
     v_l: &Array1<f64>,
     u_kl: &Array1<f64>,
@@ -46,13 +49,13 @@ fn compose_drift(
             dense += &d;
             Some(DriftDerivResult::Dense(dense))
         }
-        (Some(DriftDerivResult::Operator(operator)), Some(d)) => {
-            Some(DriftDerivResult::Operator(Arc::new(CompositeHyperOperator {
+        (Some(DriftDerivResult::Operator(operator)), Some(d)) => Some(DriftDerivResult::Operator(
+            Arc::new(CompositeHyperOperator {
                 dense: Some(d),
                 operators: vec![operator],
                 dim_hint,
-            })))
-        }
+            }),
+        )),
         (Some(other), None) => Some(other),
         (None, Some(d)) => Some(DriftDerivResult::Dense(d)),
         (None, None) => None,
@@ -176,10 +179,15 @@ impl HessianDerivativeProvider for BorrowedJointDerivProvider<'_> {
 }
 
 pub(crate) struct OwnedJointDerivProvider {
-    pub(crate) compute_dh:
-        Arc<dyn Fn(&Array1<f64>) -> Result<Option<DriftDerivResult>, CustomFamilyError> + Send + Sync>,
+    pub(crate) compute_dh: Arc<
+        dyn Fn(&Array1<f64>) -> Result<Option<DriftDerivResult>, CustomFamilyError> + Send + Sync,
+    >,
     pub(crate) compute_dh_many: Option<
-        Arc<dyn Fn(&[Array1<f64>]) -> Result<Vec<Option<DriftDerivResult>>, CustomFamilyError> + Send + Sync>,
+        Arc<
+            dyn Fn(&[Array1<f64>]) -> Result<Vec<Option<DriftDerivResult>>, CustomFamilyError>
+                + Send
+                + Sync,
+        >,
     >,
     pub(crate) compute_d2h: Arc<
         dyn Fn(&Array1<f64>, &Array1<f64>) -> Result<Option<DriftDerivResult>, CustomFamilyError>
@@ -190,7 +198,9 @@ pub(crate) struct OwnedJointDerivProvider {
     /// `BorrowedJointDerivProvider` for the dispatch contract.
     pub(crate) compute_d2h_many: Option<
         Arc<
-            dyn Fn(&[(Array1<f64>, Array1<f64>)]) -> Result<Vec<Option<DriftDerivResult>>, CustomFamilyError>
+            dyn Fn(
+                    &[(Array1<f64>, Array1<f64>)],
+                ) -> Result<Vec<Option<DriftDerivResult>>, CustomFamilyError>
                 + Send
                 + Sync,
         >,
@@ -344,11 +354,31 @@ impl HessianDerivativeProvider for OwnedJointDerivProvider {
 ///
 /// The closure expects the actual perturbation directions `δβ` (NOT the raw `v_k`
 /// the trait hands the provider); the [`JeffreysHphiAwareJointDerivatives`]
-/// wrapper negates `v_k → δβ = −v_k` before calling. A `None` entry (gated-out
-/// term / missing exact derivative on some axis) leaves the inner likelihood
-/// drift unchanged for that direction.
-pub(crate) type JeffreysHphiDriftBatchFn =
-    Arc<dyn Fn(&[Array1<f64>]) -> Result<Vec<Option<Array2<f64>>>, CustomFamilyError> + Send + Sync>;
+/// wrapper negates `v_k → δβ = −v_k` before calling. A `None` entry denotes an
+/// inactive term. Missing derivatives of active curvature must return an error.
+#[derive(Clone)]
+pub(crate) struct JeffreysHphiDriftBatchFn {
+    pub(crate) completion_beta: Arc<dyn Fn(&Array1<f64>, &Array1<f64>) -> Result<Array1<f64>, CustomFamilyError> + Send + Sync>,
+    pub(crate) completion_psi: Option<CompletionPsiAction>,
+    pub(crate) response_scale: f64,
+    pub(crate) first: Arc<
+        dyn Fn(&[Array1<f64>]) -> Result<Vec<Option<Array2<f64>>>, CustomFamilyError> + Send + Sync,
+    >,
+    pub(crate) second: Arc<
+        dyn Fn(&[(Array1<f64>, Array1<f64>)]) -> Result<Vec<Array2<f64>>, CustomFamilyError>
+            + Send
+            + Sync,
+    >,
+}
+
+impl std::ops::Deref for JeffreysHphiDriftBatchFn {
+    type Target =
+        dyn Fn(&[Array1<f64>]) -> Result<Vec<Option<Array2<f64>>>, CustomFamilyError> + Send + Sync;
+
+    fn deref(&self) -> &Self::Target {
+        self.first.as_ref()
+    }
+}
 
 /// Jeffreys-`H_Φ`-aware joint derivative provider.
 ///
@@ -400,7 +430,10 @@ impl<'a> JeffreysHphiAwareJointDerivatives<'a> {
     /// batched closure with a one-element slice so the singular trait methods reuse
     /// the identical arithmetic; the dominant outer-gradient path goes through
     /// [`Self::hphi_drifts`] where the base is amortized across all `k` directions.
-    pub(crate) fn hphi_drift(&self, v_k: &Array1<f64>) -> Result<Option<Array2<f64>>, CustomFamilyError> {
+    pub(crate) fn hphi_drift(
+        &self,
+        v_k: &Array1<f64>,
+    ) -> Result<Option<Array2<f64>>, CustomFamilyError> {
         let delta = v_k.mapv(|value| -value);
         self.hphi_drift_along(&delta)
     }
@@ -422,6 +455,24 @@ impl<'a> JeffreysHphiAwareJointDerivatives<'a> {
 }
 
 impl HessianDerivativeProvider for JeffreysHphiAwareJointDerivatives<'_> {
+    fn mode_response_rhs_correction(&self) -> Option<gam_solve::estimate::reml::reml_outer_engine::ModeResponseRhsCorrectionFn> {
+        let beta = Arc::clone(&self.drift.completion_beta);
+        let psi = self.drift.completion_psi.clone();
+        let scale = self.drift.response_scale;
+        Some(Arc::new(move |i, j, vi, vj| {
+            let mut result = beta(&(-vj), vi).map_err(|e| e.to_string())?;
+            if let Some(psi) = &psi {
+                if let Some(j) = j {
+                    result += &psi(j, vi).map_err(|e| e.to_string())?;
+                }
+                if let Some(i) = i {
+                    result += &psi(i, vj).map_err(|e| e.to_string())?;
+                }
+            }
+            Ok(result * scale)
+        }))
+    }
+
     fn hessian_derivative_correction(
         &self,
         v_k: &Array1<f64>,
@@ -523,16 +574,9 @@ impl HessianDerivativeProvider for JeffreysHphiAwareJointDerivatives<'_> {
     // already builds, evaluated along a different direction, so it is folded in
     // below and costs one more direction through the same amortized base.
     //
-    // The second, `D²_β H_Φ[−v_l, −v_k]`, is NOT available and this is a
-    // statement about the family interface rather than an omission: `H_Φ` is a
-    // divided-difference object built from `H` and its FIRST directional
-    // derivatives, so its own first β-derivative already consumes the family's
-    // SECOND directional derivatives (`H²dot[δ, e_a]`, which
-    // `custom_family_outer_jeffreys_hphi_drift_batched` streams). A second
-    // β-derivative of `H_Φ` would need THIRD directional derivatives of `H`,
-    // which no family exposes. What is folded in here is therefore everything
-    // that is exactly computable, and the residual is one named term rather than
-    // the whole Jeffreys contribution it used to be.
+    // The second, `D²_β H_Φ[−v_l, −v_k]`, consumes THIRD information
+    // derivatives through the family's explicit fifth-likelihood contract.
+    // Both terms must be present before the provider can claim exact curvature.
     //
     // SIGN. `u_kl` arrives in `δβ` convention already (the inner provider passes
     // it to `compute_dh` unnegated, unlike `v_k`/`v_l`), so it goes through
@@ -558,9 +602,21 @@ impl HessianDerivativeProvider for JeffreysHphiAwareJointDerivatives<'_> {
             .inner
             .hessian_second_derivative_correction_result(v_k, v_l, u_kl)?;
         // Display boundary: `HessianDerivativeProvider` is `String`-erroring (gam#2689).
-        let drift = self
+        let mut drift = self
             .hphi_drift_along(u_kl)
             .map_err(|error| error.to_string())?;
+        // D²Hφ[-v_k,-v_l] has two minus signs, so the bilinear callback can
+        // consume the original response vectors directly.
+        let mut mixed = (self.drift.second)(&[(v_k.clone(), v_l.clone())])
+            .map_err(|error| error.to_string())?;
+        if mixed.len() != 1 {
+            return Err("Jeffreys mixed drift did not return exactly one matrix".to_string());
+        }
+        let mixed = mixed.pop().expect("checked single mixed drift");
+        match &mut drift {
+            Some(matrix) => *matrix += &mixed,
+            None => drift = Some(mixed),
+        }
         Ok(compose_drift(inner, drift, self.p))
     }
 
@@ -575,11 +631,22 @@ impl HessianDerivativeProvider for JeffreysHphiAwareJointDerivatives<'_> {
         // reduced eigendecomposition and the `p` per-axis `Hdot[e_a]` row-streams)
         // is prepared once for the whole outer-Hessian assembly rather than once
         // per pair — the same amortization the first-order path relies on.
-        let deltas: Vec<Array1<f64>> = triples
+        let deltas: Vec<Array1<f64>> = triples.iter().map(|(_, _, u_kl)| u_kl.clone()).collect();
+        let mut drifts = (self.drift)(&deltas).map_err(|error| error.to_string())?;
+        let pairs: Vec<_> = triples
             .iter()
-            .map(|(_, _, u_kl)| u_kl.clone())
+            .map(|(u, v, _)| (u.clone(), v.clone()))
             .collect();
-        let drifts = (self.drift)(&deltas).map_err(|error| error.to_string())?;
+        let mixed = (self.drift.second)(&pairs).map_err(|error| error.to_string())?;
+        if mixed.len() != drifts.len() {
+            return Err("Jeffreys mixed drift batch length mismatch".to_string());
+        }
+        for (drift, mixed) in drifts.iter_mut().zip(mixed) {
+            match drift {
+                Some(matrix) => *matrix += &mixed,
+                None => *drift = Some(mixed),
+            }
+        }
         if drifts.len() != inner.len() {
             return Err(format!(
                 "JeffreysHphiAwareJointDerivatives: batched second-order H_Φ drift returned {} \
@@ -607,29 +674,56 @@ impl HessianDerivativeProvider for JeffreysHphiAwareJointDerivatives<'_> {
     }
 
     fn outer_hessian_derivative_kernel(&self) -> Option<OuterHessianDerivativeKernel> {
-        // Delegate to the inner provider so the matrix-free outer-HESSIAN route
-        // (the `Callback { first, second }` kernel) is preserved. This kernel
-        // feeds ONLY the outer Hessian, never the gradient (the gradient's
-        // first-order trace flows through `hessian_derivative_correction_result`,
-        // which IS wrapped above). The H_Φ SECOND-order drift is the documented
-        // residual gap; routing the kernel unchanged keeps the Hessian a
-        // consistent PD curvature surrogate without forcing dense assembly.
-        self.inner.outer_hessian_derivative_kernel()
+        let OuterHessianDerivativeKernel::Callback { first, second } =
+            self.inner.outer_hessian_derivative_kernel()?
+        else {
+            return None;
+        };
+        let drift_first = self.drift.clone();
+        let drift_second = self.drift.clone();
+        let p = self.p;
+        Some(OuterHessianDerivativeKernel::Callback {
+            first: Arc::new(move |direction| {
+                let inner = first(direction)?;
+                let mut drift = (drift_first)(std::slice::from_ref(direction))
+                    .map_err(|error| error.to_string())?;
+                if drift.len() != 1 {
+                    return Err("Jeffreys first callback batch length mismatch".to_string());
+                }
+                Ok(compose_drift(inner, drift.pop().flatten(), p))
+            }),
+            second: Arc::new(move |u, v| {
+                let inner = second(u, v)?;
+                let mut drift = (drift_second.second)(&[(u.clone(), v.clone())])
+                    .map_err(|error| error.to_string())?;
+                if drift.len() != 1 {
+                    return Err("Jeffreys second callback batch length mismatch".to_string());
+                }
+                Ok(compose_drift(inner, drift.pop(), p))
+            }),
+        })
     }
 
     fn family_outer_hessian_operator(&self) -> Option<Arc<dyn gam_problem::HessianOperator>> {
-        self.inner.family_outer_hessian_operator()
+        // The family operator knows only its own curvature. The unified
+        // callback above composes the active Jeffreys term into the exact Hv.
+        None
     }
 }
 
 /// Optional bundle of extended (ψ) hyperparameter coordinate data to attach
 /// to an `InnerSolution` before calling the unified evaluator.
+pub(crate) type CompletionPsiAction = Arc<dyn Fn(usize, &Array1<f64>) -> Result<Array1<f64>, CustomFamilyError> + Send + Sync>;
+
 pub(crate) struct ExtCoordBundle {
+    pub(crate) completion_psi: Option<CompletionPsiAction>,
     pub(crate) coords: Vec<HyperCoord>,
-    pub(crate) ext_ext_fn:
-        Option<Box<dyn Fn(usize, usize) -> Result<HyperCoordPair, CustomFamilyError> + Send + Sync>>,
-    pub(crate) rho_ext_fn:
-        Option<Box<dyn Fn(usize, usize) -> Result<HyperCoordPair, CustomFamilyError> + Send + Sync>>,
+    pub(crate) ext_ext_fn: Option<
+        Box<dyn Fn(usize, usize) -> Result<HyperCoordPair, CustomFamilyError> + Send + Sync>,
+    >,
+    pub(crate) rho_ext_fn: Option<
+        Box<dyn Fn(usize, usize) -> Result<HyperCoordPair, CustomFamilyError> + Send + Sync>,
+    >,
     pub(crate) drift_fn: Option<FixedDriftDerivFn>,
     /// Direction-contracted ψψ second-order hook (#740). When `Some`, the
     /// outer-Hessian operator builder skips the `K²` per-pair ψψ assembly
@@ -751,13 +845,17 @@ impl ExtCoordBundle {
             Box::new(move |i: usize, j: usize| {
                 callback(i, j).map(|pair| scale_hypercoord_pair(pair, scale))
             })
-                as Box<dyn Fn(usize, usize) -> Result<HyperCoordPair, CustomFamilyError> + Send + Sync>
+                as Box<
+                    dyn Fn(usize, usize) -> Result<HyperCoordPair, CustomFamilyError> + Send + Sync,
+                >
         });
         let rho_ext_fn = self.rho_ext_fn.map(|callback| {
             Box::new(move |i: usize, j: usize| {
                 callback(i, j).map(|pair| scale_hypercoord_pair(pair, scale))
             })
-                as Box<dyn Fn(usize, usize) -> Result<HyperCoordPair, CustomFamilyError> + Send + Sync>
+                as Box<
+                    dyn Fn(usize, usize) -> Result<HyperCoordPair, CustomFamilyError> + Send + Sync,
+                >
         });
         let drift_fn = self.drift_fn.map(|callback| {
             Box::new(move |ext_idx: usize, direction: &Array1<f64>| {
@@ -787,6 +885,7 @@ impl ExtCoordBundle {
             }) as ContractedPsiSecondOrderFn
         });
         Self {
+            completion_psi: self.completion_psi.map(|callback| Arc::new(move |i, v: &Array1<f64>| callback(i, v).map(|value| value * scale)) as CompletionPsiAction),
             coords,
             ext_ext_fn,
             rho_ext_fn,
@@ -845,12 +944,23 @@ mod jeffreys_drift_composition_tests {
     /// `D_β H_Φ[δ] = diag(δ)`: linear, so the direction it was evaluated at is
     /// readable straight off the returned matrix.
     fn identity_drift() -> JeffreysHphiDriftBatchFn {
-        Arc::new(|deltas: &[Array1<f64>]| {
-            Ok(deltas
-                .iter()
-                .map(|delta| Some(Array2::from_diag(delta)))
-                .collect())
-        })
+        JeffreysHphiDriftBatchFn {
+            completion_beta: Arc::new(|u, _| Ok(Array1::zeros(u.len()))),
+            completion_psi: None,
+            response_scale: 1.0,
+            first: Arc::new(|deltas: &[Array1<f64>]| {
+                Ok(deltas
+                    .iter()
+                    .map(|delta| Some(Array2::from_diag(delta)))
+                    .collect())
+            }),
+            second: Arc::new(|pairs| {
+                Ok(pairs
+                    .iter()
+                    .map(|(u, _)| Array2::zeros((u.len(), u.len())))
+                    .collect())
+            }),
+        }
     }
 
     fn wrapper() -> JeffreysHphiAwareJointDerivatives<'static> {
@@ -879,6 +989,36 @@ mod jeffreys_drift_composition_tests {
             Array2::from_diag(&u_kl),
             "the second-order Jeffreys drift must be taken along `u_kl` itself; \
              `-u_kl` would be the same magnitude with the wrong sign"
+        );
+    }
+
+    #[test]
+    fn second_order_correction_includes_bilinear_jeffreys_motion_979() {
+        // Hphi(beta)=diag(beta^2)/2 at beta=ones has D Hphi[u]=diag(u)
+        // and D² Hphi[u,v]=diag(u*v). The independent polynomial identity
+        // exposes a dropped mixed term or a single incorrect response sign.
+        let mut drift = identity_drift();
+        drift.second = Arc::new(|pairs| {
+            Ok(pairs
+                .iter()
+                .map(|(u, v)| Array2::from_diag(&(u * v)))
+                .collect())
+        });
+        let provider = JeffreysHphiAwareJointDerivatives::new(Box::new(SilentInner), drift, 2);
+        let (u, v, second) = (array![0.25, -1.5], array![-0.75, 0.5], array![2.0, -3.0]);
+        let expected = Array2::from_diag(&(&second + &(&u * &v)));
+        let scalar = provider
+            .hessian_second_derivative_correction(&u, &v, &second)
+            .unwrap()
+            .unwrap();
+        assert_eq!(scalar, expected);
+        let batch = provider
+            .hessian_second_derivative_corrections_result(&[(u, v, second)])
+            .unwrap();
+        assert_eq!(batch.len(), 1);
+        assert_eq!(
+            batch[0].clone().unwrap().into_operator().to_dense(),
+            expected
         );
     }
 

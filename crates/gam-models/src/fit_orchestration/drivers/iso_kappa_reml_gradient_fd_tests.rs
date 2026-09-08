@@ -628,9 +628,9 @@ fn iso_kappa_fd_variant_driver_on(
 
     // Rail / ladder probes (#2425). For each requested ρ value the driver emits
     // one probe per ρ coordinate holding that coordinate at the value, plus an
-    // all-ρ probe. `&[11.5]` sits a half e-fold inside `JOINT_RHO_BOUND = 12` so
-    // the centered stencil stays in the box; a longer ladder deliberately walks
-    // PAST the box, because the evaluator is defined on all of θ and the question
+    // all-ρ probe. `&[11.5]` sat a half e-fold inside the `±12` box the joint
+    // route used to hand its optimizer (the domain is derived now, #2812); a
+    // longer ladder deliberately walks PAST it, because the evaluator is defined on all of θ and the question
     // "does V saturate at a λ=∞ face" is only answerable outside 12.
     let mut rail_probes: Vec<(String, Array1<f64>)> = Vec::new();
     for &value in extra_rho_probes {
@@ -2524,6 +2524,37 @@ fn rho_gradient_part_ladder_family_2454(
             .unwrap_or_else(|e| panic!("ensure_theta: {e:?}"));
         enable_rho_outer_audit();
         let design = cache.design();
+        {
+            // TEMPORARY 2454 diagnostic: what the criterion and the frame each see.
+            let p = design.design.ncols();
+            for (k, cp) in design.penalties.iter().enumerate() {
+                let frob = cp.local.iter().map(|v| v * v).sum::<f64>().sqrt();
+                let local_rank = gam_terms::construction::balanced_penalty_structural_rank(
+                    std::iter::once((cp.local.view(), 0..cp.local.nrows())),
+                    cp.local.nrows(),
+                )
+                .expect("single-penalty balanced rank");
+                println!(
+                    "[2454-DIAG] k={k} col_range={:?} local={}x{} local_frob={frob:.3e} local_rank={local_rank} hint={:?} op={}",
+                    cp.col_range,
+                    cp.local.nrows(),
+                    cp.local.ncols(),
+                    cp.structure_hint,
+                    cp.op.is_some()
+                );
+            }
+            let balanced = gam_terms::construction::balanced_penalty_structural_rank(
+                design
+                    .penalties
+                    .iter()
+                    .map(|cp| (cp.local.view(), cp.col_range.clone())),
+                p,
+            );
+            println!(
+                "[2454-DIAG] p={p} nullspace_dims={:?} balanced_structural_rank={:?}",
+                design.nullspace_dims, balanced
+            );
+        }
         let cost = evaluator
             .evaluate_cost_only(
                 &design.design,
@@ -2938,15 +2969,15 @@ fn frobenius(m: &Array2<f64>) -> f64 {
     m.iter().map(|v| v * v).sum::<f64>().sqrt()
 }
 
-fn duchon_psi_component_report(label: &str, n: usize) -> DuchonPsiComponentReport {
+fn duchon_psi_component_report(label: &str, n: usize, axis: usize) -> DuchonPsiComponentReport {
     let fixture = build_iso_kappa_fixture(label, n, LikelihoodSpec::gaussian_identity(), false);
-    assert_eq!(fixture.psi_dim, 1, "{label}: one isotropic ψ axis");
+    assert!(axis < fixture.psi_dim, "{label}: requested ψ axis exists");
     let mut cache = fixture.cache();
     let theta_dim = fixture.rho_dim + fixture.psi_dim;
     // ψ = 0 is the shipped `length_scale=1` seed, where the large-scale line
     // searches fail.
     let theta = Array1::<f64>::zeros(theta_dim);
-    let psi_slot = fixture.rho_dim;
+    let psi_slot = fixture.rho_dim + axis;
     cache.ensure_theta(&theta).expect("ensure_theta at the seed");
     let p_total = cache.design().design.ncols();
     let derivs = crate::spatial_psi_bridge::build_block_spatial_psi_derivatives(
@@ -2956,8 +2987,8 @@ fn duchon_psi_component_report(label: &str, n: usize) -> DuchonPsiComponentRepor
     )
     .expect("spatial psi derivatives build")
     .expect("spatial psi derivatives present");
-    assert_eq!(derivs.len(), 1, "{label}: one ψ block");
-    let deriv = &derivs[0];
+    assert_eq!(derivs.len(), fixture.psi_dim, "{label}: one block per ψ axis");
+    let deriv = &derivs[axis];
     let x_psi_an: Array2<f64> = if deriv.x_psi.nrows() == n && deriv.x_psi.ncols() == p_total {
         deriv.x_psi.clone()
     } else {
@@ -3093,8 +3124,8 @@ fn duchon_psi_component_report(label: &str, n: usize) -> DuchonPsiComponentRepor
     }
 }
 
-fn assert_duchon_psi_components(label: &str, n: usize) {
-    let report = duchon_psi_component_report(label, n);
+fn assert_duchon_psi_components_at_axis(label: &str, n: usize, axis: usize) {
+    let report = duchon_psi_component_report(label, n, axis);
     eprintln!(
         "[{label} COMPONENT SUMMARY] design rel_gap={:.3e} norm_ratio={:.3e} penalties rel_gaps={:?} norm_ratios={:?}",
         report.design_rel_gap,
@@ -3118,6 +3149,17 @@ fn assert_duchon_psi_components(label: &str, n: usize) {
             "{label}: analytic ∂S_{k}/∂ψ differs from the rebuilt penalty by {gap:.3e} (norm ratio {:.3e})",
             report.penalty_norm_ratios[k]
         );
+    }
+}
+
+fn assert_duchon_psi_components(label: &str, n: usize) {
+    assert_duchon_psi_components_at_axis(label, n, 0);
+}
+
+#[test]
+fn duchon_aniso_psi_components_match_rebuilt_design_and_penalties_2735() {
+    for axis in 0..2 {
+        assert_duchon_psi_components_at_axis("duchon_gaussian_aniso_2d", 80, axis);
     }
 }
 

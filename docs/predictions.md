@@ -6,7 +6,7 @@ shape depends on the fitted model class and on the keyword arguments
 
 ## Signature
 
-```text
+```python
 model.predict(
     data,
     *,

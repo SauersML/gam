@@ -1267,6 +1267,8 @@ mod tests {
                 beta_covariance_frequentist: None,
                 coefficient_influence: None,
                 weighted_gram: None,
+                bias_correction_beta: None,
+                bias_correction_jacobian: None,
             }),
             None,
         );
@@ -4275,15 +4277,15 @@ pub fn run_nuts_sampling_flattened_family(
             config,
         ),
         (ResponseFamily::Binomial, InverseLink::Mixture(_), FamilyNutsInputs::Glm(_)) => Err(
-            "BinomialMixture NUTS is not implemented yet; use fit_gam/predict_gam for blended inverse-link models"
+            "BinomialMixture NUTS is not implemented yet; use gam::fit_model and gam::predict::predict_gam for blended inverse-link models"
                 .to_string(),
         ),
         (ResponseFamily::Binomial, InverseLink::Sas(_), FamilyNutsInputs::Glm(_)) => Err(
-            "BinomialSas NUTS is not implemented yet; use fit_gam/predict_gam for SAS-link models"
+            "BinomialSas NUTS is not implemented yet; use gam::fit_model and gam::predict::predict_gam for SAS-link models"
                 .to_string(),
         ),
         (ResponseFamily::Binomial, InverseLink::BetaLogistic(_), FamilyNutsInputs::Glm(_)) => Err(
-            "BinomialBetaLogistic NUTS is not implemented yet; use fit_gam/predict_gam for beta-logistic-link models"
+            "BinomialBetaLogistic NUTS is not implemented yet; use gam::fit_model and gam::predict::predict_gam for beta-logistic-link models"
                 .to_string(),
         ),
         (ResponseFamily::Binomial, InverseLink::Standard(_), FamilyNutsInputs::Glm(_)) => Err(

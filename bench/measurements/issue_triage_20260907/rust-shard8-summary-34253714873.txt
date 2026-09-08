@@ -1,0 +1,29 @@
+2026-09-08T19:18:53.0950764Z      Summary [3779.472s] 943 tests run: 915 passed (1 slow), 24 failed, 4 timed out, 8658 skipped
+2026-09-08T19:18:53.0957657Z         FAIL [  26.240s] ( 31/943) gam::basis_smooth smooths::matern_length_scale_sensitivity::matern_length_scale_sweep_stays_within_budget
+2026-09-08T19:18:53.0993870Z         FAIL [ 142.973s] ( 44/943) gam::glm families::owed_1477_factorial::double_penalty_projector_holds_across_family_dp_prior_factorial_1477_1476
+2026-09-08T19:18:53.1075168Z         FAIL [   0.007s] ( 46/943) gam::identifiability misc::binary_outcome_bms_identifiability::binary_outcome_shape_bms_shared_matern_prs_pc_confound_starts_outer_solver
+2026-09-08T19:18:53.1087262Z         FAIL [   0.013s] ( 48/943) gam::identifiability misc::identifiability_audit_hard_halt_gate::cross_block_alias_with_distinct_priorities_is_not_fatal
+2026-09-08T19:18:53.1102946Z         FAIL [   0.008s] ( 58/943) gam::manifolds manifolds::cylinder_periodic::tensor_periodic_margin_is_exactly_cyclic_at_period_boundary
+2026-09-08T19:18:53.1122199Z         FAIL [   0.026s] ( 89/943) gam::prediction predict::predict_linear_term_extrapolation_se_grows::linear_term_prediction_se_grows_outside_training_range
+2026-09-08T19:18:53.1148313Z         FAIL [   0.007s] (106/943) gam::regressions misc::bms_covariance_declined_2718::a_published_fit_ships_the_curvature_a_declination_would_be_about_2718
+2026-09-08T19:18:53.1166692Z         FAIL [   0.012s] (129/943) gam::regressions sae::latent_sae_gated::penalized_quasi_laplace_criterion_keeps_alpha_finite_on_collapsing_axis
+2026-09-08T19:18:53.1181454Z         FAIL [   0.016s] (146/943) gam::sae sae::owed_993_real_fit::real_fitted_separable_torus_atom_runs_carve_and_proposes_fission
+2026-09-08T19:18:53.1196841Z      TIMEOUT [ 600.004s] (150/943) gam::sae sae::sae_manifold_circle_d2_ridge0_fits::sae_manifold_circle_d2_ridge0_fits
+2026-09-08T19:18:53.1202871Z      TIMEOUT [ 600.006s] (151/943) gam::sae sae::sae_manifold_reconstruction_parity::sae_reconstruction_parity_curved_beats_linear_and_shatter_budget_recovers
+2026-09-08T19:18:53.1210003Z         FAIL [  83.820s] (155/943) gam::survival survival::survival_location_scale_heteroscedastic_globalization_1569::survival_location_scale_heteroscedastic_globalization_converges_1569
+2026-09-08T19:18:54.4510449Z      TIMEOUT [ 600.021s] (157/943) gam::survival survival::survival_marginal_slope_stall::survival_marginal_slope_stall_reproduces_residual_stall_early_exit
+2026-09-08T19:18:54.4876148Z         FAIL [   0.059s] (363/943) gam-models fit_orchestration::drivers::adaptive_bounded_duchon_tests::single_block_no_spatial_fast_path_returns_fully_frozen_spec
+2026-09-08T19:18:54.4883672Z         FAIL [   0.011s] (366/943) gam-models fit_orchestration::drivers::design_assembly_constraint_tests::incremental_frozen_realizer_matches_unified_full_rebuild
+2026-09-08T19:18:54.4889003Z         FAIL [   0.008s] (384/943) gam-models fit_orchestration::materialize::tests::materialize_bernoulli_marginal_slope_prunes_binary_outcome_style_scalar_alias
+2026-09-08T19:18:54.4894552Z         FAIL [   0.007s] (425/943) gam-models survival::construction::tests::baseline_optimizer_reuses_cost_evaluation_for_gradient_at_same_theta_2714
+2026-09-08T19:18:54.4900054Z         FAIL [  37.972s] (474/943) gam-models transformation_normal::kappa_exact_joint_fd_tests::ctn_exact_joint_gradient_matches_fd_duchon_linear_power9_16d
+2026-09-08T19:18:54.4916838Z         FAIL [   0.007s] (484/943) gam-models::suite fit_data_boundary::public_materializer_returns_typed_data_errors_before_design_construction
+2026-09-08T19:18:54.4921334Z         FAIL [   0.253s] (604/943) gam-sae manifold::stratum_births::tests::stratum_local_admits_a_planted_signal_pooled_rejects
+2026-09-08T19:18:54.4925941Z         FAIL [   0.007s] (611/943) gam-sae manifold::tests::phi_eta_one_reproduces_current_atom_bases_bit_for_bit
+2026-09-08T19:18:54.4930651Z         FAIL [   0.515s] (615/943) gam-sae manifold::tests_basin_bundle_envelope::fixed_legal_rho_envelope_value_is_stable_across_re_evaluation
+2026-09-08T19:18:54.4936224Z         FAIL [   4.014s] (617/943) gam-sae manifold::tests_beta_prior_curvature_2828::the_majorized_beta_block_manufactures_a_spurious_negative_direction_2828
+2026-09-08T19:18:54.4942099Z      TIMEOUT [ 600.005s] (618/943) gam-sae manifold::tests_chart_collapse_2691::zz_2691_bounded_sigma_witness_returns_an_answer_at_every_sigma
+2026-09-08T19:18:54.4944950Z         FAIL [   5.554s] (634/943) gam-sae manifold::tests_outer_quasi_laplace_probe_budget_2080::profile_wide_p_criterion_cost_2080
+2026-09-08T19:18:54.4949693Z         FAIL [   0.014s] (637/943) gam-sae manifold::tests_quality_behavior_calibration_2015::qwen_behavior_nats_calibration_matches_exact_kl_2015
+2026-09-08T19:18:54.4955501Z         FAIL [   2.143s] (644/943) gam-sae manifold::tests_streaming_outer_gradient_2026::fixed_point_certificate_covers_ordered_beta_bernoulli_complete_gradient
+2026-09-08T19:18:54.4961180Z         FAIL [ 142.392s] (646/943) gam-sae manifold::tests_tier0_primary_path_2023::tests::e1_arc_outer_search_mints_or_reports_blocker_2266

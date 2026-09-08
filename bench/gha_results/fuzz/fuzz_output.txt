@@ -1,6 +1,6 @@
 Running 100 trials
-  Seed start:        1638882427 [auto]
-  Replay this run:   --seed-start 1638882427
+  Seed start:        1939159787 [auto]
+  Replay this run:   --seed-start 1939159787
   Scenario source:   /home/runner/work/gam/gam/bench/scenarios.json
   Filters: family=all model=all basis=all
   Gamfit timeout:    60s
@@ -10,27 +10,100 @@ Running 100 trials
   Results: /home/runner/work/gam/gam/bench/fuzz_results.jsonl
   Metadata: /home/runner/work/gam/gam/bench/fuzz_results.meta.json
 
-Skipped 2 trial(s) above scenario cost cap 200000; max skipped cost=3950000
-  [  1/100] papuan_oce4_duchon_k12         bino/gam/ducho auc:gamfit=0.8404 auc:mgcv=0.8404 gap=+0.0000 n=  6000 p=  4 [ok]  gamfit=4.5s mgcv=1.8s
-  [  2/100] papuan_oce4_duchon_k24         bino/gam/ducho auc:gamfit=0.8455 auc:mgcv=0.8455 gap=+0.0000 n=  6000 p=  4 [ok]  gamfit=19.3s mgcv=2.0s
-  [  3/100] papuan_oce4_matern_k6          bino/gam/mater auc:gamfit=0.8397 auc:mgcv=0.8379 gap=-0.0019 n=  6000 p=  4 [ok]  gamfit=54.0s mgcv=1.8s
-  [  4/100] papuan_oce4_matern_k12         bino/gam/mater auc:gamfit=0.8464 auc:mgcv=0.8440 gap=-0.0024 n=  6000 p=  4 [ok]  gamfit=37.6s mgcv=2.0s
-  [  5/100] papuan_oce4_matern_k24         bino/gam/mater auc:gamfit=0.8516 auc:mgcv=0.8440 gap=-0.0076 n=  6000 p=  4 [ok]  gamfit=87.7s mgcv=2.0s
-  [  6/100] papuan_oce4_psperpc_k6         bino/gam/ps    auc:gamfit=0.8387 auc:mgcv=0.8389 gap=+0.0002 n=  6000 p=  4 [ok]  gamfit=5.0s mgcv=5.3s
-  [  7/100] papuan_oce4_psperpc_k12        bino/gam/ps    auc:gamfit=0.8387 auc:mgcv=0.8390 gap=+0.0002 n=  6000 p=  4 [ok]  gamfit=60.2s mgcv=2.5s
-  [  8/100] papuan_oce4_psperpc_k24        bino/gam/ps    auc:gamfit=0.8385 auc:mgcv=0.8386 gap=+0.0001 n=  6000 p=  4 [ok]  gamfit=40.5s mgcv=4.2s
-  [  9/100] geo_subpop16_tp_k6             bino/gam/tps   auc:gamfit=0.6240 auc:mgcv=  ERR gap= N/A  n=   960 p= 16 [no-verdict:mgcv_error]  gamfit=1.0s mgcv=0.0s(to-failure)
+Skipped 1 trial(s) above scenario cost cap 200000; max skipped cost=3950000
+  [  1/100] lidar_semipar                  gaus/gam/ps    r2:gamfit=0.9189 r2:mgcv=  ERR gap= N/A  n=   221 p=  1 [no-verdict:mgcv_error]
+    -- MGCV FAILURE --
+    error: r_mgcv fold output missing/invalid eta variance (got 0, expected 45)
+  [  2/100] lidar_semipar                  gaus/gamls/ps    r2:gamfit=0.9191 r2:mgcv=0.9191 gap=-0.0000 n=   221 p=  1 [ok]  gamfit=1.3s mgcv=0.6s
+  [  3/100] bone_gamair                    bino/gam/ps    auc:gamfit=1.0000 auc:mgcv=  ERR gap= N/A  n=    23 p=  2 [no-verdict:mgcv_error]
+    -- MGCV FAILURE --
+    error: r_mgcv predict failed: logistic-normal Gauss-Hermite quadrature did not converge by order 256
+  [  4/100] prostate_gamair                bino/gam/ps    auc:gamfit=0.7603 auc:mgcv=0.7603 gap=+0.0000 n=   654 p=  2 [ok]
+  [  5/100] wine_gamair                    gaus/gam/ps    r2:gamfit=0.2060 r2:mgcv=  ERR gap= N/A  n=    38 p=  5 [no-verdict:mgcv_error]
+    -- MGCV FAILURE --
+    error: r_mgcv fold output missing/invalid eta variance (got 0, expected 8)
+  [  6/100] wine_gamair                    gaus/gamls/ps    r2:gamfit=  ERR r2:mgcv=0.3128 gap=+1.3128 n=    38 p=  5 [no-verdict:gamfit_error] !!!  gamfit=272.8s(to-failure) mgcv=2.6s
+    -- GAMFIT FAILURE --
+    error: exact two-block spatial optimization failed: custom-family optimization error in fit_custom_family outer smoothing: outer smoothing optimization failed certified-fit validation after exhausting strategy fallbacks: Outer smoothing-parameter optimization did not certify a stationary optimum (custom family): cost-only value disagrees with analytic-sample value at the same outer point: value-only=5.4411182133937636e1, analytic-sample=5.4411241074676852e1, disagreement=5.894e-5, roundoff bound=8.108e-7, inner solve: value-lane=converged, derivative-lane=converged; solver provenance: origin=BfgsCostStallExit, plan=solver=Bfgs, search_hessian_source=BfgsApprox, claimed_converged=false, termination=<no opt solver produced this result>, cost_stall_window=[noise_floor=8.937882e-3, probe_radius=3.148262e0, ratio=2.838989e-3], flat_noise_grad_bound=2.838989e-3 after 49 outer iteration(s); final objective 5.441118e1, projected gradient norm 5.713e5 against stationarity bound 2.839e-3 (rung=probe-noise-floor derived_standard=false). A fit is only minted from a converged optimization; the best iterate is carried as a checkpoint — resume by seeding the outer search at rho_checkpoint = [1.9308320264749703, -5.878659341799458, 2.3826788343405534, -2.9766376162687136, 1.8979102134481531, -4.3173349649107475, 2.412743953853971, -2.2746400604354395, 1.3978972413707729, -3.9893224694954106, -0.5386925732849889, -2.5501608346564972, 2.681734666533258, -5.104064073935131, 3.71459863583563, -4.106346444836867, 3.8800344766686856, -6.526116549145451, 2.753503725659036, -5.096836465611301].; last_evaluated_rho=[1.9308320264749703, -5.878659341799458, 2.3826788343405534, -2.9766376162687136, 1.8979102134481531, -4.3173349649107475, 2.412743953853971, -2.2746400604354395, 1.3978972413707729, -3.9893224694954106, -0.5386925732849889, -2.5501608346564972, 2.681734666533258, -5.104064073935131, 3.71459863583563, -4.106346444836867, 3.8800344766686856, -6.526116549145451, 2.753503725659036, -5.096836465611301]; no fit was assembled.
+    traceback: Traceback (most recent call last):
+  File "/home/runner/work/gam/gam/bench/fuzz_vs_mgcv.py", line 536, in run_gamfit
+    model = gamfit.fit(train_df, formula, family=family_arg, config=config)
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/hostedtoolcache/Python/3.11.16/x64/lib/python3.11/site-packages/gamfit/_api.py", line 691, in wrapper
+    return fn(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^
+  File "/opt/hostedtoolcache/Python/3.11.16/x64/lib/python3.11/site-packages/gamfit/_api.py", line 1284, in fit
+    raise map_exception(exc) from exc
+  File "/opt/hostedtoolcache/Python/3.11.16/x64/lib/python3.11/site-packages/gamfit/_api.py", line 1281, in fit
+    rust_module().fit_table(headers, rows, formula, json.dumps(payload), fisher_w)
+gamfit._rust.IntegrationError: exact two-block spatial optimization failed: custom-family optimization error in fit_custom_family outer smoothing: outer smoothing optimization failed certified-fit validation after exhausting strategy fallbacks: Outer smoothing-parameter optimization did not certify a stationary optimum (custom family): cost-only value disagrees with analytic-sample value at the same outer point: value-only=5.4411182133937636e1, analytic-sample=5.4411241074676852e1, disagreement=5.894e-5, roundoff bound=8.108e-7, inner solve: value-lane=converged, derivative-lane=converged; solver provenance: origin=BfgsCostStallExit, plan=solver=Bfgs, search_hessian_source=BfgsApprox, claimed_converged=false, termination=<no opt solver produced this result>, cost_stall_window=[noise_floor=8.937882e-3, probe_radius=3.148262e0, ratio=2.838989e-3], flat_noise_grad_bound=2.838989e-3 after 49 outer iteration(s); final objective 5.441118e1, projected gradient norm 5.713e5 against stationarity bound 2.839e-3 (rung=probe-noise-floor derived_standard=false). A fit is only minted from a converged optimization; the best iterate is carried as a checkpoint — resume by seeding the outer search at rho_checkpoint = [1.9308320264749703, -5.878659341799458, 2.3826788343405534, -2.9766376162687136, 1.8979102134481531, -4.3173349649107475, 2.412743953853971, -2.2746400604354395, 1.3978972413707729, -3.9893224694954106, -0.5386925732849889, -2.5501608346564972, 2.681734666533258, -5.104064073935131, 3.71459863583563, -4.106346444836867, 3.8800344766686856, -6.526116549145451, 2.753503725659036, -5.096836465611301].; last_evaluated_rho=[1.9308320264749703, -5.878659341799458, 2.3826788343405534, -2.9766376162687136, 1.8979102134481531, -4.3173349649107475, 2.412743953853971, -2.2746400604354395, 1.3978972413707729, -3.9893224694954106, -0.5386925732849889, -2.5501608346564972, 2.681734666533258, -5.104064073935131, 3.71459863583563, -4.106346444836867, 3.8800344766686856, -6.526116549145451, 2.753503725659036, -5.096836465611301]; no fit was assembled.
+
+  [  7/100] wine_temp_vs_year              gaus/gam/ps    r2:gamfit=0.3672 r2:mgcv=  ERR gap= N/A  n=    47 p=  1 [no-verdict:mgcv_error]
+    -- MGCV FAILURE --
+    error: r_mgcv fold output missing/invalid eta variance (got 0, expected 10)
+  [  8/100] wine_temp_vs_year              gaus/gamls/ps    r2:gamfit=0.3683 r2:mgcv=0.3674 gap=-0.0009 n=    47 p=  1 [ok]
+  [  9/100] wine_price_vs_temp             gaus/gam/ps    r2:gamfit=-0.6073 r2:mgcv=  ERR gap= N/A  n=    38 p=  1 [no-verdict:mgcv_error]
+    -- MGCV FAILURE --
+    error: r_mgcv fold output missing/invalid eta variance (got 0, expected 8)
+  [ 10/100] wine_price_vs_temp             gaus/gamls/ps    r2:gamfit=-0.3462 r2:mgcv=-0.3800 gap=-0.0337 n=    38 p=  1 [ok]  gamfit=0.6s mgcv=2.8s
+  [ 11/100] horse_colic                    bino/gam/ps    auc:gamfit=0.9448 auc:mgcv=0.9448 gap=+0.0000 n=   216 p=  3 [ok]  gamfit=1.0s mgcv=0.4s
+  [ 12/100] us48_demand_5day               gaus/gam/ps    r2:gamfit=0.9941 r2:mgcv=  ERR gap= N/A  n=    96 p=  4 [no-verdict:mgcv_error]
+    -- MGCV FAILURE --
+    error: r_mgcv fold output missing/invalid eta variance (got 0, expected 20)
+  [ 13/100] us48_demand_5day               gaus/gamls/ps    r2:gamfit=0.9835 r2:mgcv=0.9942 gap=+0.0107 n=    96 p=  4 [warn:gap] !!  gamfit=6.8s mgcv=4.0s
+  [ 14/100] us48_demand_31day              gaus/gam/ps    r2:gamfit=0.9987 r2:mgcv=  ERR gap= N/A  n=   720 p=  4 [no-verdict:mgcv_error]  gamfit=0.8s mgcv=0.0s(to-failure)
+    -- MGCV FAILURE --
+    error: r_mgcv fold output missing/invalid eta variance (got 0, expected 144)
+  [ 15/100] us48_demand_31day              gaus/gamls/ps    r2:gamfit=0.9988 r2:mgcv=0.9987 gap=-0.0001 n=   720 p=  4 [ok]  gamfit=19.1s mgcv=12.7s
+  [ 16/100] haberman_5yr                   bino/gam/ps    auc:gamfit=0.7817 auc:mgcv=0.7725 gap=-0.0092 n=   305 p=  3 [ok]  gamfit=3.0s mgcv=0.2s
+  [ 17/100] geo_disease_tp                 bino/gam/tps   auc:gamfit=0.6156 auc:mgcv=  ERR gap= N/A  n=  4000 p= 16 [no-verdict:mgcv_error]  gamfit=6.6s mgcv=0.0s(to-failure)
     -- MGCV FAILURE --
     error: r_mgcv fit failed: negative length vectors are not allowed
-  [ 10/100] geo_subpop16_tp_k12            bino/gam/tps   auc:gamfit=0.6244 auc:mgcv=  ERR gap= N/A  n=   960 p= 16 [no-verdict:mgcv_error]  gamfit=0.6s mgcv=0.0s(to-failure)
+  [ 18/100] geo_disease_duchon             bino/gam/ducho auc:gamfit=0.6025 auc:mgcv=0.6452 gap=+0.0427 n=  4000 p= 16 [ok]  gamfit=2.8s mgcv=3.1s
+  [ 19/100] geo_disease_matern             bino/gam/mater auc:gamfit=0.6427 auc:mgcv=0.6533 gap=+0.0105 n=  4000 p= 16 [ok]  gamfit=15.6s mgcv=2.7s
+  [ 20/100] geo_disease_shrinkage          bino/gam/tps   auc:gamfit=0.6156 auc:mgcv=  ERR gap= N/A  n=  4000 p= 16 [no-verdict:mgcv_error]  gamfit=4.1s mgcv=0.0s(to-failure)
     -- MGCV FAILURE --
     error: r_mgcv fit failed: negative length vectors are not allowed
-  [ 11/100] geo_subpop16_tp_k24            bino/gam/tps   auc:gamfit=0.6049 auc:mgcv=  ERR gap= N/A  n=   960 p= 16 [no-verdict:mgcv_error]  gamfit=0.9s mgcv=0.0s(to-failure)
+  [ 21/100] geo_disease_ps_per_pc          bino/gam/ps    auc:gamfit=0.6025 auc:mgcv=0.6456 gap=+0.0431 n=  4000 p= 16 [ok]  gamfit=1.4s mgcv=3.1s
+  [ 22/100] geo_disease_eas_tp_k6          bino/gam/tps   auc:gamfit=0.8261 auc:mgcv=  ERR gap= N/A  n=  6000 p= 16 [no-verdict:mgcv_error]  gamfit=1.7s mgcv=0.0s(to-failure)
     -- MGCV FAILURE --
     error: r_mgcv fit failed: negative length vectors are not allowed
-  [ 12/100] geo_subpop16_duchon_k6         bino/gam/ducho auc:gamfit=0.5826 auc:mgcv=0.5826 gap=+0.0000 n=   960 p= 16 [ok]  gamfit=0.3s mgcv=0.6s
-  [ 13/100] geo_subpop16_duchon_k12        bino/gam/ducho auc:gamfit=0.5809 auc:mgcv=0.5938 gap=+0.0129 n=   960 p= 16 [ok]  gamfit=0.4s mgcv=0.6s
-  [ 14/100] geo_subpop16_duchon_k24        bino/gam/ducho auc:gamfit=0.6264 auc:mgcv=0.6238 gap=-0.0025 n=   960 p= 16 [ok]  gamfit=1.0s mgcv=0.6s
-  [ 15/100] geo_subpop16_matern_k6         bino/gam/mater auc:gamfit=0.6395 auc:mgcv=0.5678 gap=-0.0717 n=   960 p= 16 [ok]  gamfit=8.7s mgcv=0.6s
-  [ 16/100] geo_subpop16_matern_k12        bino/gam/mater auc:gamfit=0.5867 auc:mgcv=0.5678 gap=-0.0189 n=   960 p= 16 [ok]  gamfit=4.4s mgcv=0.6s
-  [ 17/100] geo_subpop16_matern_k24        bino/gam/mater auc:gamfit=0.5924 auc:mgcv=0.6262 gap=+0.0338 n=   960 p= 16 [ok]  gamfit=3.2s mgcv=0.6s
+  [ 23/100] geo_disease_eas_tp_k12         bino/gam/tps   auc:gamfit=0.8244 auc:mgcv=  ERR gap= N/A  n=  6000 p= 16 [no-verdict:mgcv_error]  gamfit=4.2s mgcv=0.0s(to-failure)
+    -- MGCV FAILURE --
+    error: r_mgcv fit failed: negative length vectors are not allowed
+  [ 24/100] geo_disease_eas_tp_k24         bino/gam/tps   auc:gamfit=0.8244 auc:mgcv=  ERR gap= N/A  n=  6000 p= 16 [no-verdict:mgcv_error]  gamfit=5.8s mgcv=0.0s(to-failure)
+    -- MGCV FAILURE --
+    error: r_mgcv fit failed: negative length vectors are not allowed
+  [ 25/100] geo_disease_eas_duchon_k6      bino/gam/ducho auc:gamfit=0.8256 auc:mgcv=0.8257 gap=+0.0001 n=  6000 p= 16 [ok]  gamfit=2.7s mgcv=4.0s
+  [ 26/100] geo_disease_eas_duchon_k12     bino/gam/ducho auc:gamfit=0.8259 auc:mgcv=0.8260 gap=+0.0001 n=  6000 p= 16 [ok]  gamfit=3.7s mgcv=3.6s
+  [ 27/100] geo_disease_eas_duchon_k6_down bino/gam/ducho auc:gamfit=0.6364 auc:mgcv=  ERR gap= N/A  n=    60 p= 16 [no-verdict:mgcv_error]
+    -- MGCV FAILURE --
+    error: r_mgcv predict failed: logistic-normal Gauss-Hermite quadrature did not converge by order 256
+  [ 28/100] geo_disease_eas_duchon_k6_down bino/gam/ducho auc:gamfit=0.8485 auc:mgcv=  ERR gap= N/A  n=   120 p= 16 [no-verdict:mgcv_error]
+    -- MGCV FAILURE --
+    error: r_mgcv predict failed: logistic-normal Gauss-Hermite quadrature did not converge by order 256
+  [ 29/100] geo_disease_eas_duchon_k6_down bino/gam/ducho auc:gamfit=0.8419 auc:mgcv=0.8426 gap=+0.0007 n=   600 p= 16 [ok]
+  [ 30/100] geo_disease_eas_duchon_k4_down bino/gam/ducho auc:gamfit=1.0000 auc:mgcv=1.0000 gap=+0.0000 n=    12 p= 16 [ok]
+  [ 31/100] geo_disease_eas_duchon_k4_down bino/gam/ducho auc:gamfit=0.6667 auc:mgcv=0.6667 gap=+0.0000 n=    20 p= 16 [ok]  gamfit=1.3s mgcv=0.0s
+  [ 32/100] geo_disease_eas_duchon_k4_down bino/gam/ducho auc:gamfit=0.7727 auc:mgcv=  ERR gap= N/A  n=    60 p= 16 [no-verdict:mgcv_error]  gamfit=1.0s mgcv=0.0s(to-failure)
+    -- MGCV FAILURE --
+    error: r_mgcv predict failed: logistic-normal Gauss-Hermite quadrature did not converge by order 256
+  [ 33/100] geo_disease_eas_duchon_k24     bino/gam/ducho auc:gamfit=0.8278 auc:mgcv=0.8212 gap=-0.0066 n=  6000 p= 16 [ok]  gamfit=29.4s mgcv=3.7s
+  [ 34/100] geo_disease_eas_matern_k6      bino/gam/mater auc:gamfit=0.8283 auc:mgcv=0.8239 gap=-0.0044 n=  6000 p= 16 [ok]  gamfit=5.4s mgcv=3.6s
+  [ 35/100] geo_disease_eas_matern_k12     bino/gam/mater auc:gamfit=  ERR auc:mgcv=0.8239 gap=+1.8239 n=  6000 p= 16 [no-verdict:gamfit_error] !!!  gamfit=0.4s(to-failure) mgcv=3.5s
+    -- GAMFIT FAILURE --
+    error: Invalid input: exact smoothing-corrected covariance unavailable: OuterHessianInverse { error: "rho Hessian has negative curvature -6.825e-6 below the outer certificate's own bar 6.824e-6 on that direction -- the sum of the EXACT chain-rule term 6.824e-6 of `H_rho = diag(lambda) H_lambda diag(lambda) + diag(g_rho)` (not a resolution: one of the two exact terms) and the curvature resolution of an analytically-formed eigenvalue, which is Weyl's ||dH||_2, measured here as 2.418515e-16 [analytic (Weyl, ||dH||_2); set by eigensolver backward error] from [eigensolver backward error=2.418515e-16, rho-Hessian symmetrization defect |(H - H')/2|_2=0.000000e0, outer-gradient re-evaluation defect max_k |g_fresh - g_outer|=0.000000e0] -- #2690, #2748); the penalty map certified 0 null direction(s) and 0 were deflated before judging, so the direction above was judged; the outer loop certified this point as a minimum, and the curvature is larger than everything this assembly's own exactly-zero identities say it could have got wrong, so this is a genuine contradiction rather than an unresolvable direction" }
+    traceback: Traceback (most recent call last):
+  File "/home/runner/work/gam/gam/bench/fuzz_vs_mgcv.py", line 536, in run_gamfit
+    model = gamfit.fit(train_df, formula, family=family_arg, config=config)
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/hostedtoolcache/Python/3.11.16/x64/lib/python3.11/site-packages/gamfit/_api.py", line 691, in wrapper
+    return fn(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^
+  File "/opt/hostedtoolcache/Python/3.11.16/x64/lib/python3.11/site-packages/gamfit/_api.py", line 1284, in fit
+    raise map_exception(exc) from exc
+  File "/opt/hostedtoolcache/Python/3.11.16/x64/lib/python3.11/site-packages/gamfit/_api.py", line 1281, in fit
+    rust_module().fit_table(headers, rows, formula, json.dumps(payload), fisher_w)
+gamfit._rust.IntegrationError: Invalid input: exact smoothing-corrected covariance unavailable: OuterHessianInverse { error: "rho Hessian has negative curvature -6.825e-6 below the outer certificate's own bar 6.824e-6 on that direction -- the sum of the EXACT chain-rule term 6.824e-6 of `H_rho = diag(lambda) H_lambda diag(lambda) + diag(g_rho)` (not a resolution: one of the two exact terms) and the curvature resolution of an analytically-formed eigenvalue, which is Weyl's ||dH||_2, measured here as 2.418515e-16 [analytic (Weyl, ||dH||_2); set by eigensolver backward error] from [eigensolver backward error=2.418515e-16, rho-Hessian symmetrization defect |(H - H')/2|_2=0.000000e0, outer-gradient re-evaluation defect max_k |g_fresh - g_outer|=0.000000e0] -- #2690, #2748); the penalty map certified 0 null direction(s) and 0 were deflated before judging, so the direction above was judged; the outer loop certified this point as a minimum, and the curvature is larger than everything this assembly's own exactly-zero identities say it could have got wrong, so this is a genuine contradiction rather than an unresolvable direction" }
+
+  [ 36/100] geo_disease_eas_matern_k24     bino/gam/mater auc:gamfit=0.8297 auc:mgcv=0.8263 gap=-0.0034 n=  6000 p= 16 [ok]  gamfit=17.9s mgcv=3.5s

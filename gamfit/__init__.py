@@ -106,6 +106,7 @@ from ._sparse_dictionary import (
     BlockSparseDictionaryConvergence,
     BlockSparseDictionaryFit,
     BlockSparseStreamArtifact,
+    BlockSparseStreamConvergence,
     SparseDictStream,
     SparseDictStreamArtifact,
     SparseDictionaryConvergence,

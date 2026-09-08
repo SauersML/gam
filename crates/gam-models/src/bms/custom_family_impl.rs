@@ -17,20 +17,16 @@ use gam_problem::ConstraintSet;
 fn active_explicit_psi_jeffreys_context(
     h_info: Array2<f64>,
     expected_dim: usize,
-) -> Result<
-    Option<gam_solve::estimate::reml::jeffreys_subspace::JointJeffreysPlan>,
-    String,
-> {
+) -> Result<Option<gam_solve::estimate::reml::jeffreys_subspace::JointJeffreysPlan>, String> {
     if h_info.dim() != (expected_dim, expected_dim) {
         return Ok(None);
     }
 
     let z_joint = Array2::<f64>::eye(expected_dim);
-    let plan =
-        gam_solve::estimate::reml::jeffreys_subspace::JointJeffreysPlan::prepare(
-            h_info.view(),
-            z_joint.view(),
-        )?;
+    let plan = gam_solve::estimate::reml::jeffreys_subspace::JointJeffreysPlan::prepare(
+        h_info.view(),
+        z_joint.view(),
+    )?;
     if !plan.is_active() {
         return Ok(None);
     }
@@ -48,16 +44,20 @@ mod explicit_psi_jeffreys_plan_tests {
         let mut well_conditioned = Array2::<f64>::zeros((2, 2));
         well_conditioned[[0, 0]] = 32.0;
         well_conditioned[[1, 1]] = 64.0;
-        assert!(active_explicit_psi_jeffreys_context(well_conditioned, 2)
-            .expect("well-conditioned plan preparation should succeed")
-            .is_none());
+        assert!(
+            active_explicit_psi_jeffreys_context(well_conditioned, 2)
+                .expect("well-conditioned plan preparation should succeed")
+                .is_none()
+        );
 
         let mut near_singular = Array2::<f64>::zeros((2, 2));
         near_singular[[0, 0]] = 1.0e-10;
         near_singular[[1, 1]] = 64.0;
-        assert!(active_explicit_psi_jeffreys_context(near_singular, 2)
-            .expect("near-singular plan preparation should succeed")
-            .is_some());
+        assert!(
+            active_explicit_psi_jeffreys_context(near_singular, 2)
+                .expect("near-singular plan preparation should succeed")
+                .is_some()
+        );
     }
 
     #[test]
@@ -80,10 +80,10 @@ mod explicit_psi_jeffreys_plan_tests {
                     third[[i, j_idx, k]] =
                         0.3 + 0.11 * (i + j_idx + k) as f64 + 0.07 * (i * j_idx * k) as f64;
                     for l in 0..r {
-                        fourth[[i, j_idx, k, l]] = 0.2
-                            - 0.05 * (i + j_idx + k + l) as f64
-                            + 0.03 * (i * j_idx + i * k + i * l + j_idx * k + j_idx * l + k * l)
-                                as f64;
+                        fourth[[i, j_idx, k, l]] = 0.2 - 0.05 * (i + j_idx + k + l) as f64
+                            + 0.03
+                                * (i * j_idx + i * k + i * l + j_idx * k + j_idx * l + k * l)
+                                    as f64;
                     }
                 }
             }
@@ -117,10 +117,7 @@ mod explicit_psi_jeffreys_plan_tests {
         let pulled = j.t().dot(&primary) + r_psi.t().dot(&third_trace(&c_b));
 
         let frobenius = |left: &Array2<f64>, right: &Array2<f64>| -> f64 {
-            left.iter()
-                .zip(right.iter())
-                .map(|(&x, &y)| x * y)
-                .sum()
+            left.iter().zip(right.iter()).map(|(&x, &y)| x * y).sum()
         };
         let mut scalar_axes = Array1::<f64>::zeros(p);
         for axis in 0..p {
@@ -178,9 +175,9 @@ impl BernoulliMarginalSlopeFamily {
         out: &mut [f64],
     ) -> Result<(), String> {
         let r = primary.total;
-        let expected = r.checked_mul(r).ok_or_else(|| {
-            "BMS explicit-psi primary sandwich dimension overflow".to_string()
-        })?;
+        let expected = r
+            .checked_mul(r)
+            .ok_or_else(|| "BMS explicit-psi primary sandwich dimension overflow".to_string())?;
         if tail_tail.len() != expected || out.len() != expected {
             return Err(format!(
                 "BMS explicit-psi primary sandwich requires {expected} cells for primary dimension {r}, got tail={} and output={}",
@@ -342,18 +339,14 @@ impl BernoulliMarginalSlopeFamily {
         let a_m_block = weights
             .beta_information
             .slice(s![slices.marginal.clone(), ..]);
-        let a_g_block = weights
-            .beta_information
-            .slice(s![slices.slope.clone(), ..]);
+        let a_g_block = weights.beta_information.slice(s![slices.slope.clone(), ..]);
         let b_m_block = weights
             .mixed_information
             .slice(s![slices.marginal.clone(), ..]);
         let b_g_block = weights
             .mixed_information
             .slice(s![slices.slope.clone(), ..]);
-        let b_axis_block = weights
-            .mixed_information
-            .slice(s![axis_range.clone(), ..]);
+        let b_axis_block = weights.mixed_information.slice(s![axis_range.clone(), ..]);
 
         let pulled = gam_linalg::pairwise_reduce::par_deterministic_try_block_fold(
             n_chunks,
@@ -1034,8 +1027,7 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
             // joint Hessian. `None` unless the family uses the Jeffreys term and
             // exposes a dense joint information, so non-Jeffreys families are
             // byte-unchanged.
-            let jeffreys_plan = if self
-                .joint_jeffreys_term_required()
+            let jeffreys_plan = if self.joint_jeffreys_term_required()
                 && derivative_blocks.iter().any(|block| !block.is_empty())
             {
                 match self.joint_jeffreys_information_with_specs(block_states, specs)? {
@@ -1287,7 +1279,6 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
     ) -> Result<f64, String> {
         Self::log_likelihood_only_with_options(self, block_states, options)
     }
-
 
     fn has_explicit_joint_hessian(&self) -> bool {
         true
@@ -1644,6 +1635,120 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
         .map(Some)
     }
 
+    fn joint_jeffreys_information_third_directional_all_axes_with_specs(
+        &self,
+        block_states: &[ParameterBlockState],
+        specs: &[ParameterBlockSpec],
+        d_beta_u_flat: &Array1<f64>,
+        d_beta_v_flat: &Array1<f64>,
+    ) -> Result<Option<Vec<Array2<f64>>>, String> {
+        if self.effective_flex_active(block_states)? {
+            return Ok(None);
+        }
+        if !self.outer_default_trustworthy_for_joint_hessian(specs)
+            && !self.joint_hessian_is_structurally_coupled(block_states)?
+        {
+            return Ok(None);
+        }
+        let slices = block_slices(self);
+        let pm = slices.marginal.len();
+        let p = slices.total;
+        if d_beta_u_flat.len() != p || d_beta_v_flat.len() != p {
+            return Err(format!(
+                "BMS third information derivative expected two directions of length {p}"
+            ));
+        }
+        let mut axes = vec![Array2::<f64>::zeros((p, p)); p];
+        // Read bounded row chunks, including for operator-backed designs. The
+        // fifth row tensor is evaluated once, then shared by every output axis.
+        const CHUNK_ROWS: usize = 4096;
+        for start in (0..self.y.len()).step_by(CHUNK_ROWS) {
+            let end = (start + CHUNK_ROWS).min(self.y.len());
+            let xm = self
+                .marginal_design
+                .try_row_chunk(start..end)
+                .map_err(|e| format!("BMS third information marginal design: {e}"))?;
+            let xg = self
+                .slope_design
+                .try_row_chunk(start..end)
+                .map_err(|e| format!("BMS third information slope design: {e}"))?;
+            for row in start..end {
+                let local = row - start;
+                let x = |a: usize| {
+                    if a < pm {
+                        xm[[local, a]]
+                    } else {
+                        xg[[local, a - pm]]
+                    }
+                };
+                let primary = |a: usize| usize::from(a >= pm);
+                let mut u = [0.0; 2];
+                let mut v = [0.0; 2];
+                for a in 0..p {
+                    u[primary(a)] += x(a) * d_beta_u_flat[a];
+                    v[primary(a)] += x(a) * d_beta_v_flat[a];
+                }
+                let marginal = self.marginal_link_map(block_states[0].eta[row])?;
+                let slope = block_states[1].eta[row];
+                let fifth = match self.latent_measure.empirical_grid_for_training_row(row)? {
+                    None => rigid_standard_normal_fifth_full(
+                        marginal,
+                        slope,
+                        self.z[row],
+                        self.y[row],
+                        self.weights[row],
+                        self.probit_frailty_scale(),
+                    )?,
+                    Some(grid) => self.empirical_rigid_row_fifth_full(
+                        row,
+                        marginal,
+                        slope,
+                        &grid.nodes,
+                        &grid.weights,
+                    )?,
+                };
+                let contracted: [[[f64; 2]; 2]; 2] = std::array::from_fn(|a| {
+                    std::array::from_fn(|b| {
+                        std::array::from_fn(|c| {
+                            let mut value = 0.0;
+                            for d in 0..2 {
+                                for e in 0..2 {
+                                    value += fifth[a][b][c][d][e] * u[d] * v[e];
+                                }
+                            }
+                            value
+                        })
+                    })
+                });
+                for c in 0..p {
+                    for a in 0..=c {
+                        for b in 0..=a {
+                            let contribution =
+                                x(a) * x(b) * x(c) * contracted[primary(a)][primary(b)][primary(c)];
+                            axes[c][[a, b]] += contribution;
+                            if a != b {
+                                axes[c][[b, a]] += contribution;
+                            }
+                            if a != c {
+                                axes[a][[c, b]] += contribution;
+                                if c != b {
+                                    axes[a][[b, c]] += contribution;
+                                }
+                            }
+                            if b != a && b != c {
+                                axes[b][[a, c]] += contribution;
+                                if a != c {
+                                    axes[b][[c, a]] += contribution;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Ok(Some(axes))
+    }
+
     /// gam#979 wide-p Jeffreys completion: `∇²_β tr(W · H(β))` for a
     /// caller-supplied full-joint trace weight `W`, in ONE `O(n · p_block²)`
     /// pass instead of the `p(p+1)/2` pairwise `H''[e_a, e_b]` fallback.
@@ -1965,6 +2070,52 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
             psi_index,
             d_beta_flat,
             &cache,
+        )
+    }
+
+    fn exact_newton_joint_psihessian_second_directional_derivative_all_beta_axes(
+        &self,
+        block_states: &[ParameterBlockState],
+        specs: &[ParameterBlockSpec],
+        hyper_layout: &crate::custom_family::CustomFamilyHyperLayout,
+        psi_index: usize,
+        d_beta_flat: &Array1<f64>,
+    ) -> Result<Option<Vec<Array2<f64>>>, String> {
+        if specs.len() != block_states.len()
+            || specs.iter().zip(block_states).any(|(spec, state)| spec.design.ncols() != state.beta.len())
+        {
+            return Err("BMS third information derivative: coefficient blocks disagree with their specifications".to_string());
+        }
+        self.rigid_hyper_information_third_axes(
+            block_states,
+            hyper_layout,
+            psi_index,
+            None,
+            Some(d_beta_flat),
+            &BlockwiseFitOptions::default(),
+        )
+    }
+
+    fn exact_newton_joint_psisecond_order_hessian_directional_derivative_all_beta_axes(
+        &self,
+        block_states: &[ParameterBlockState],
+        specs: &[ParameterBlockSpec],
+        hyper_layout: &crate::custom_family::CustomFamilyHyperLayout,
+        psi_i: usize,
+        psi_j: usize,
+    ) -> Result<Option<Vec<Array2<f64>>>, String> {
+        if specs.len() != block_states.len()
+            || specs.iter().zip(block_states).any(|(spec, state)| spec.design.ncols() != state.beta.len())
+        {
+            return Err("BMS third information derivative: coefficient blocks disagree with their specifications".to_string());
+        }
+        self.rigid_hyper_information_third_axes(
+            block_states,
+            hyper_layout,
+            psi_i,
+            Some(psi_j),
+            None,
+            &BlockwiseFitOptions::default(),
         )
     }
 
@@ -3566,8 +3717,7 @@ impl BernoulliMarginalSlopeExactNewtonJointPsiWorkspace {
         }
         if hyper_layout.family_axis_count() == 1 && family.gaussian_frailty_sd.is_none() {
             return Err(
-                "BernoulliMarginalSlopeFamily log-sigma axis requires Gaussian frailty"
-                    .to_string(),
+                "BernoulliMarginalSlopeFamily log-sigma axis requires Gaussian frailty".to_string(),
             );
         }
         // Build (or reuse, at a bit-identical β) the exact-cache. This workspace
@@ -3614,6 +3764,36 @@ impl BernoulliMarginalSlopeExactNewtonJointPsiWorkspace {
 impl crate::marginal_slope_shared::MarginalSlopePsiFamily
     for BernoulliMarginalSlopeExactNewtonJointPsiWorkspace
 {
+    fn hessian_second_directional_derivative_all_beta_axes(
+        &self,
+        psi_index: usize,
+        d_beta_flat: &Array1<f64>,
+    ) -> Result<Option<Vec<Array2<f64>>>, String> {
+        self.family.rigid_hyper_information_third_axes(
+            &self.block_states,
+            &self.hyper_layout,
+            psi_index,
+            None,
+            Some(d_beta_flat),
+            &self.options,
+        )
+    }
+
+    fn second_order_hessian_directional_derivative_all_beta_axes(
+        &self,
+        psi_i: usize,
+        psi_j: usize,
+    ) -> Result<Option<Vec<Array2<f64>>>, String> {
+        self.family.rigid_hyper_information_third_axes(
+            &self.block_states,
+            &self.hyper_layout,
+            psi_i,
+            Some(psi_j),
+            None,
+            &self.options,
+        )
+    }
+
     fn is_sigma_aux(&self, psi_index: usize) -> bool {
         self.hyper_layout.family_axis(psi_index) == Some(0)
     }

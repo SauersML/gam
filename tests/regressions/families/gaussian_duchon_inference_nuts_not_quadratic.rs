@@ -128,6 +128,7 @@ fn fit_options(skip_rho_posterior_inference: bool) -> FitOptions {
         nullspace_dims: vec![],
         linear_constraints: None,
         firth_bias_reduction: false,
+        adaptive_regularization: None,
         rho_prior: Default::default(),
         kronecker_penalty_system: None,
         kronecker_factored: None,

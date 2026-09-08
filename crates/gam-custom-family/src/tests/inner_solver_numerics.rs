@@ -667,7 +667,7 @@ pub(crate) fn objective_includes_solverridge_quadratic_term() {
         outer_max_iter: 1,
         outer_tol: 1e-8,
         outer_rel_cost_tol: None,
-        rho_lower_bound: -10.0,
+        rho_lower_bound: Some(-10.0),
         ridge_floor: 1e-4,
         ridge_policy: RidgePolicy::exact_full_objective(),
         use_remlobjective: false,
@@ -723,7 +723,7 @@ pub(crate) fn inner_block_accepts_penalty_improving_step_even_if_loglik_drops() 
         outer_max_iter: 1,
         outer_tol: 1e-8,
         outer_rel_cost_tol: None,
-        rho_lower_bound: -10.0,
+        rho_lower_bound: Some(-10.0),
         ridge_floor: 0.0,
         ridge_policy: RidgePolicy::exact_full_objective(),
         use_remlobjective: false,
@@ -782,7 +782,7 @@ pub(crate) fn exact_newton_backtracking_descent_includes_explicit_ridge() {
         outer_max_iter: 1,
         outer_tol: 1e-8,
         outer_rel_cost_tol: None,
-        rho_lower_bound: -10.0,
+        rho_lower_bound: Some(-10.0),
         ridge_floor: 1.0,
         ridge_policy: RidgePolicy::exact_full_objective(),
         use_remlobjective: false,
@@ -3786,15 +3786,15 @@ pub(crate) fn pseudo_laplace_path_skips_eigendecomposition_avoiding_nan_crash() 
 /// Regression check: when `strict_solve_spd_with_lm_continuation` is given a
 /// strongly negative-definite matrix whose `|λ_min|` exceeds the LM δ-ridge
 /// schedule's terminal δ (≈ ε · trace_scale · 10¹⁶), the bare schedule can't
-/// rescue Cholesky and the terminal eigendecomposition fallback must return
-/// the positive-part Moore–Penrose solution. Negative eigendirections are
-/// outside its range and must contribute exactly zero.
+/// rescue Cholesky and the terminal eigen-floor fallback must return a
+/// finite solution equal to `Q diag(1/Λ̃) Qᵀ rhs`, with
+/// `Λ̃_i = max(Λ_i, ε λ_max)`.
 ///
 /// We also exercise the schedule-success path with a milder matrix to lock
 /// in that the eigen-floor doesn't perturb the LM-δ output for cases the
 /// schedule can already handle.
 #[test]
-pub(crate) fn strict_solve_spd_falls_back_to_positive_pseudoinverse_on_indefinite_matrix() {
+pub(crate) fn strict_solve_spd_falls_back_to_eigen_floor_on_indefinite_matrix() {
     // δ schedule from `delta0 = max(ε·tr/p, 1e-12)`, growth 10×, 16 steps.
     // With `tr = 4·1e30` we get `delta0 ≈ ε·1e30 ≈ 2.2e14`; terminal δ at
     // escalation 16 is `2.2e14 · 1e16 = 2.2e30`. Set `λ_min ≈ -1e32` to
@@ -3809,27 +3809,43 @@ pub(crate) fn strict_solve_spd_falls_back_to_positive_pseudoinverse_on_indefinit
     let rhs = Array1::from_vec(vec![1e30, -5e29, 2.5e29, 7.5e29]);
 
     let (x, stats) = strict_solve_spd_with_lm_continuation(&h, &rhs)
-        .expect("eigendecomposition fallback must succeed on the negative-definite matrix");
+        .expect("eigen-floor fallback must succeed on the negative-definite matrix");
     assert!(
         stats.escalations > 16,
-        "expected eigendecomposition terminal fallback (escalations > MAX_ESCALATIONS), got {}",
+        "expected eigen-floor terminal fallback (escalations > MAX_ESCALATIONS), got {}",
         stats.escalations,
     );
     for &v in x.iter() {
         assert!(
             v.is_finite(),
-            "pseudo-inverse solve returned non-finite component {v}"
+            "eigen-floor solve returned non-finite component {v}"
         );
     }
 
-    // A negative eigenspace is outside the range of the positive-part
-    // Moore–Penrose inverse. It contributes zero rather than an arbitrary
-    // fabricated step.
-    for (i, &value) in x.iter().enumerate() {
-        assert_eq!(
-            value.to_bits(),
-            0.0_f64.to_bits(),
-            "negative eigendirection {i} contributed {value} to the pseudo-inverse solve",
+    // Reconstruct the analytic floored solve and compare component-wise.
+    let mut sym = h.clone();
+    symmetrize_dense_in_place(&mut sym);
+    let (evals, evecs) = FaerEigh::eigh(&sym, Side::Lower).expect("eigh");
+    let max_abs_eval = evals.iter().fold(0.0_f64, |a, &b| a.max(b.abs()));
+    let eps_floor = (CUSTOM_FAMILY_EVAL_FLOOR * max_abs_eval).max(1e-300);
+    let mut want = Array1::<f64>::zeros(p);
+    for k in 0..p {
+        let mut q_t_rhs = 0.0;
+        for i in 0..p {
+            q_t_rhs += evecs[[i, k]] * rhs[i];
+        }
+        let scaled = q_t_rhs / evals[k].max(eps_floor);
+        for i in 0..p {
+            want[i] += evecs[[i, k]] * scaled;
+        }
+    }
+    for i in 0..p {
+        let tol = 1e-9 * want[i].abs().max(1.0) + 1e-9;
+        assert!(
+            (want[i] - x[i]).abs() <= tol,
+            "eigen-floor solve component {i}: want={:.6e}, got={:.6e}",
+            want[i],
+            x[i],
         );
     }
 }
@@ -6837,6 +6853,32 @@ pub(crate) fn structural_edf_quotients_nullspace_range_coupling() {
     }
 }
 
+/// Structural (unit-weight) effective degrees of freedom of one penalized term
+/// at physical strength `λ`, from its design-relative penalty spectrum — the
+/// closed form the resolvability domain's edges are checked against.
+fn unit_weight_term_edf_at_physical_strength(gammas: &[f64], lambda: f64) -> f64 {
+    gammas
+        .iter()
+        .map(|&gamma| {
+            if gamma.is_finite() && gamma > 0.0 {
+                1.0 / (1.0 + lambda / gamma)
+            } else {
+                0.0
+            }
+        })
+        .sum()
+}
+
+fn unit_weight_term_edf(gammas: &[f64], rho: f64) -> Result<f64, CustomFamilyError> {
+    let lambda = gam_problem::checked_exp_log_strength(rho).map_err(|error| {
+        CustomFamilyError::InvalidInput {
+            context: "unit-weight structural EDF",
+            reason: error.to_string(),
+        }
+    })?;
+    Ok(unit_weight_term_edf_at_physical_strength(gammas, lambda))
+}
+
 #[test]
 fn unit_weight_structural_edf_rejects_noncanonical_log_strengths() {
     let gammas = [0.25, 1.0, 4.0];
@@ -6866,34 +6908,21 @@ fn unit_weight_structural_edf_rejects_noncanonical_log_strengths() {
 /// the floor is unenforceable there (edf(-10) ≈ 0.61 < 1) and keeps the uniform
 /// ceiling, so the emitted upper stays ≥ the lower bound.
 #[test]
-fn effective_df_ceiling_never_emits_upper_below_true_rho_lower_wall_2370() {
+fn the_domain_edges_are_where_the_term_is_unpenalized_or_switched_off_2812() {
+    // Two penalized directions with equal design-relative curvature γ, so the
+    // resolvability interval is `[ln(ε γ), ln(γ / ε)]` exactly and the edf at
+    // its edges is readable in closed form.
     let gamma = 2.0e-5_f64;
-    // X = diag(√γ, √γ) ⇒ G = XᵀX = diag(γ, γ); with S = I₂ the generalized
-    // eigenvalues of (G, S) are exactly [γ, γ].
     let x = Array2::from_diag(&array![gamma.sqrt(), gamma.sqrt()]);
     let design = DesignMatrix::from(x);
     let s = array![[1.0, 0.0], [0.0, 1.0]];
     let penalty = PenaltyMatrix::Dense(s);
-
-    // Sanity on the crafted eigenstructure and the edf crossings that make this
-    // the exact (-12, -10) coupled-constant hazard.
     let gammas = design_penalty_range_gammas(&design, &penalty)
         .expect("full-rank 2×2 pair yields two generalized eigenvalues");
     assert_eq!(gammas.len(), 2);
     for &g in &gammas {
         assert!((g - gamma).abs() < 1e-12, "γ must be {gamma}, got {g}");
     }
-    let edf_at_neg10 = unit_weight_term_edf(&gammas, -10.0).expect("canonical ρ");
-    let edf_at_neg12 = unit_weight_term_edf(&gammas, -12.0).expect("canonical ρ");
-    assert!(
-        edf_at_neg10 < EFFECTIVE_DF_FLOOR,
-        "edf at the real lower wall (-10) must sit below the floor: {edf_at_neg10}",
-    );
-    assert!(
-        edf_at_neg12 > EFFECTIVE_DF_FLOOR,
-        "edf at the old -ceiling proxy (-12) must sit above the floor: {edf_at_neg12}",
-    );
-
     let spec = ParameterBlockSpec {
         name: "single_penalty_flex_wiggle".to_string(),
         design,
@@ -6917,60 +6946,47 @@ fn effective_df_ceiling_never_emits_upper_below_true_rho_lower_wall_2370() {
         joint_roots: std::sync::Arc::new(vec![]),
         joint_to_outer: vec![],
     };
-
-    // The old proxy wall (-12): the crossing is admissible, so the upper bound is
-    // tightened to ρ* ≈ -10.82 — BELOW the real -10 wall. This is the inverted
-    // box that panicked.
-    let old_proxy_box = RhoBox::new(RhoLowerWall(-12.0), RhoCeiling(EFFECTIVE_DF_CEILING))
-        .expect("the old proxy box is well-ordered, just not the real wall");
-    let upper_old_proxy = effective_df_floor_rho_upper_bounds(&specs, &layout, 1, old_proxy_box)
-        .expect("bound construction succeeds");
+    let (lower, upper) =
+        resolvability_rho_domain(&specs, &layout, 1, None).expect("domain construction succeeds");
+    let expected_lower = 0.5 * f64::EPSILON.ln() + gamma.ln();
+    let expected_upper = gamma.ln() - 0.5 * f64::EPSILON.ln();
     assert!(
-        upper_old_proxy[0] < -10.0,
-        "regression guard: the old -12 anchor tightens the upper below the real \
-         lower wall (got {}), which is exactly the inversion #2370 fixed",
-        upper_old_proxy[0],
+        (lower[0] - expected_lower).abs() < 1e-9 && (upper[0] - expected_upper).abs() < 1e-9,
+        "domain [{}, {}] must be [ln(√ε γ), ln(γ/√ε)] = [{expected_lower}, {expected_upper}]",
+        lower[0],
+        upper[0]
     );
-
-    // The true wall (-10): the floor is unenforceable at the real lower bound, so
-    // the uniform ceiling is retained and the box stays well-ordered.
-    let lower = -10.0_f64;
-    let true_wall_box = RhoBox::new(RhoLowerWall(lower), RhoCeiling(EFFECTIVE_DF_CEILING))
-        .expect("the production box is well-ordered");
-    let upper_true_wall = effective_df_floor_rho_upper_bounds(&specs, &layout, 1, true_wall_box)
-        .expect("bound construction succeeds");
+    // At the upper edge every direction is switched off to the gradient's
+    // resolution; at the lower edge every direction is unpenalized to it.
+    let edf_at_upper = unit_weight_term_edf(&gammas, upper[0]).expect("canonical ρ");
+    let edf_at_lower = unit_weight_term_edf(&gammas, lower[0]).expect("canonical ρ");
+    // Two directions, each `√ε/(1+√ε)` up to the rounding of
+    // `exp(ln γ − ln √ε)`: the count's contribution equals the round-off a
+    // gradient through the penalized inverse carries there.
+    let sqrt_eps = f64::EPSILON.sqrt();
     assert!(
-        upper_true_wall[0] >= lower,
-        "emitted upper bound {} must never fall below the ρ lower wall {lower}",
-        upper_true_wall[0],
+        edf_at_upper <= gammas.len() as f64 * 2.0 * sqrt_eps,
+        "edf at the domain ceiling must be at the gradient's resolution of its own count: \
+         {edf_at_upper:.3e}"
     );
     assert!(
-        (upper_true_wall[0] - EFFECTIVE_DF_CEILING).abs() < 1e-12,
-        "floor unenforceable at the wall ⇒ keep the uniform ceiling {EFFECTIVE_DF_CEILING}, \
-         got {}",
-        upper_true_wall[0],
+        edf_at_lower >= 2.0 / (1.0 + sqrt_eps) - 4.0 * f64::EPSILON,
+        "edf at the domain floor must be the full two directions: {edf_at_lower:.16}"
     );
-
-    // An INVERTED box (lower > ceiling) is a typed error, not a silent
-    // inversion. The check lives in the `RhoBox` constructor, so such a pair
-    // can no longer reach the derivation at all. `lower == ceiling` is NOT
-    // inverted — it is a legal pinned coordinate, accepted here and by the
-    // outer optimizer alike.
+    // A family-declared floor raises only the lower edge.
+    let (floored_lower, floored_upper) = resolvability_rho_domain(&specs, &layout, 1, Some(-10.0))
+        .expect("domain construction succeeds");
     assert!(
-        RhoBox::new(
-            RhoLowerWall(EFFECTIVE_DF_CEILING + 1.0),
-            RhoCeiling(EFFECTIVE_DF_CEILING),
-        )
-        .is_err(),
-        "lower > ceiling must be rejected as an empty ρ-box",
+        (floored_lower[0] - (-10.0)).abs() < 1e-12 && floored_upper[0] == upper[0],
+        "a family floor of -10 must give [-10, {}], got [{}, {}]",
+        upper[0],
+        floored_lower[0],
+        floored_upper[0]
     );
+    // A floor above the ceiling is an empty domain, and is refused as one.
     assert!(
-        RhoBox::new(
-            RhoLowerWall(EFFECTIVE_DF_CEILING),
-            RhoCeiling(EFFECTIVE_DF_CEILING),
-        )
-        .is_ok(),
-        "lower == ceiling is a pinned coordinate, which the outer optimizer accepts",
+        resolvability_rho_domain(&specs, &layout, 1, Some(upper[0] + 1.0)).is_err(),
+        "a family floor above the resolvability ceiling must be refused"
     );
 }
 

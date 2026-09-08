@@ -4,7 +4,7 @@
 use gam_sae::sparse_dict::{BlockSparseConfig, BlockSparseStreamState};
 use ndarray::{Array2, array};
 
-fn residual_energy(x: &Array2<f64>, prediction: &Array2<f64>, gamma: f32) -> f64 {
+fn residual_energy(x: &Array2<f64>, prediction: &Array2<f64>, gamma: f64) -> f64 {
     x.iter()
         .zip(prediction.iter())
         .map(|(&x, &p)| (x - gamma as f64 * p).powi(2))
@@ -12,11 +12,11 @@ fn residual_energy(x: &Array2<f64>, prediction: &Array2<f64>, gamma: f32) -> f64
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let x = array![[0.4_f32, 4.0], [0.3, -3.0], [-0.3, 3.0]];
-    let mut decoder = array![[1.0_f32, -10.0], [10.0, 3.0]];
+    let x = array![[0.4_f64, 4.0], [0.3, -3.0], [-0.3, 3.0]];
+    let mut decoder = array![[1.0_f64, -10.0], [10.0, 3.0]];
     for mut row in decoder.outer_iter_mut() {
         let norm = row.iter().map(|&v| (v as f64).powi(2)).sum::<f64>().sqrt();
-        row.mapv_inplace(|value| (value as f64 / norm) as f32);
+        row.mapv_inplace(|value| (value as f64 / norm) as f64);
     }
     let mut config = BlockSparseConfig::new(2, 1);
     config.block_topk = 2;

@@ -1410,7 +1410,6 @@ pub fn feasible_step_fraction(
     Ok(apply_feasible_step_boundary_backoff(&limit))
 }
 
-
 /// The clipped step lands ON the blocking face: a binding constraint returns
 /// the exact ratio-test fraction `α = slack/−drift`, and a step that was not
 /// clipped at all is taken whole.
@@ -1562,6 +1561,22 @@ pub trait MarginalSlopePsiFamily: Send + Sync {
         psi_index: usize,
         d_beta_flat: &Array1<f64>,
     ) -> Result<Option<Arc<dyn gam_problem::HyperOperator>>, String>;
+
+    fn hessian_second_directional_derivative_all_beta_axes(
+        &self,
+        psi_index: usize,
+        d_beta_flat: &Array1<f64>,
+    ) -> Result<Option<Vec<Array2<f64>>>, String> {
+        Err(format!("marginal-slope exact third information derivatives are unavailable for psi axis {psi_index} and coefficient direction of length {}", d_beta_flat.len()))
+    }
+
+    fn second_order_hessian_directional_derivative_all_beta_axes(
+        &self,
+        psi_i: usize,
+        psi_j: usize,
+    ) -> Result<Option<Vec<Array2<f64>>>, String> {
+        Err(format!("marginal-slope exact third information derivatives are unavailable for psi pair ({psi_i}, {psi_j})"))
+    }
 }
 
 /// Generic exact-Newton joint-ψ workspace shared by the marginal-slope
@@ -1653,6 +1668,24 @@ impl<F: MarginalSlopePsiFamily> gam_problem::ExactNewtonJointPsiWorkspace
         self.family
             .psi_hessian_directional_derivative(psi_index, d_beta_flat)
             .map(|result| result.map(gam_problem::DriftDerivResult::Operator))
+    }
+
+    fn hessian_second_directional_derivative_all_beta_axes(
+        &self,
+        psi_index: usize,
+        d_beta_flat: &Array1<f64>,
+    ) -> Result<Option<Vec<Array2<f64>>>, String> {
+        self.family
+            .hessian_second_directional_derivative_all_beta_axes(psi_index, d_beta_flat)
+    }
+
+    fn second_order_hessian_directional_derivative_all_beta_axes(
+        &self,
+        psi_i: usize,
+        psi_j: usize,
+    ) -> Result<Option<Vec<Array2<f64>>>, String> {
+        self.family
+            .second_order_hessian_directional_derivative_all_beta_axes(psi_i, psi_j)
     }
 }
 
@@ -1795,9 +1828,8 @@ mod tests {
         // Positive control: a finite BINDING direction is evaluated and clipped,
         // so the refusal below is about finiteness and not about this fixture
         // failing to reach the rule at all.
-        let bounded =
-            feasible_step_fraction(&constraints, &beta, &ndarray::array![-2.0, 0.0])
-                .expect("a finite direction must be evaluated");
+        let bounded = feasible_step_fraction(&constraints, &beta, &ndarray::array![-2.0, 0.0])
+            .expect("a finite direction must be evaluated");
         assert!(
             bounded > 0.0 && bounded < 1.0,
             "a binding finite direction should clip the step, got {bounded}"
@@ -1805,9 +1837,8 @@ mod tests {
         // The defect (gam#2721): `drift < 0.0` is false for NaN, so the row
         // contributed nothing to the minimum and this returned Ok(1.0) -- a
         // non-finite step certified as fully feasible.
-        let refusal =
-            feasible_step_fraction(&constraints, &beta, &ndarray::array![f64::NAN, 0.0])
-                .expect_err("a non-finite direction component must be refused");
+        let refusal = feasible_step_fraction(&constraints, &beta, &ndarray::array![f64::NAN, 0.0])
+            .expect_err("a non-finite direction component must be refused");
         match refusal {
             gam_problem::ContractFeasibleStepError::NonFinite { row, .. } => {
                 assert_eq!(row, 0, "the refusal must name the offending row");

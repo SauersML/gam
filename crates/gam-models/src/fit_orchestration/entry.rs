@@ -6,7 +6,7 @@ use gam_solve::estimate::reml::reml_outer_engine::penalty_matrix_root;
 ///
 /// Everything in here varies per call (the link state extracted from the
 /// formula/config, the linear constraints synthesized from `bounded()` /
-/// shape-constrained terms, the Firth toggle read
+/// shape-constrained terms, the Firth / adaptive-regularization toggles read
 /// off the `FitConfig`). Every *policy* field of `FitOptions` — the ones that
 /// decide HOW the outer REML optimization behaves (`compute_inference`,
 /// `skip_rho_posterior_inference`, `tol`, and the `max_iter` default) — is
@@ -27,6 +27,7 @@ pub struct StandardFitOptionsInputs {
     pub optimize_sas: bool,
     pub linear_constraints: Option<gam_solve::pirls::LinearInequalityConstraints>,
     pub firth_bias_reduction: bool,
+    pub adaptive_regularization: Option<AdaptiveRegularizationOptions>,
 }
 
 /// The single source of truth for standard-fit `FitOptions` *policy*.
@@ -76,6 +77,7 @@ pub fn canonical_standard_fit_options(
         nullspace_dims: vec![],
         linear_constraints: inputs.linear_constraints,
         firth_bias_reduction: inputs.firth_bias_reduction,
+        adaptive_regularization: inputs.adaptive_regularization,
         rho_prior: Default::default(),
         kronecker_penalty_system: None,
         kronecker_factored: None,
@@ -911,6 +913,8 @@ fn deterministic_gaussian_standard_fit(
         beta_covariance_frequentist: None,
         coefficient_influence,
         weighted_gram: Some(xtwx),
+        bias_correction_beta: None,
+        bias_correction_jacobian: None,
     };
     let geometry = Some(gam_solve::estimate::FitGeometry {
         coefficient_gauge,
@@ -990,6 +994,7 @@ fn deterministic_gaussian_standard_fit(
         basis_adequacy: Vec::new(),
         adaptive_spatial_terms: adaptive_spatial_term_mask(&request.spec),
         adaptive_spatial_center_counts: adaptive_spatial_center_counts(&request.spec),
+        adaptive_diagnostics: None,
         kappa_timing: None,
         saved_link_state: gam_solve::estimate::FittedLinkState::Standard(None),
         wiggle_knots: None,
@@ -2107,6 +2112,7 @@ pub fn spline_scan_fast_path(request: &StandardFitRequest<'_>) -> Option<SplineS
         || options.mixture_link.is_some()
         || options.sas_link.is_some()
         || options.linear_constraints.is_some()
+        || options.adaptive_regularization.is_some()
         || options.kronecker_penalty_system.is_some()
         || options.kronecker_factored.is_some()
         || options.firth_bias_reduction
@@ -2283,6 +2289,7 @@ pub fn residual_cascade_fast_path(
         || options.mixture_link.is_some()
         || options.sas_link.is_some()
         || options.linear_constraints.is_some()
+        || options.adaptive_regularization.is_some()
         || options.kronecker_penalty_system.is_some()
         || options.kronecker_factored.is_some()
         || options.firth_bias_reduction
@@ -2409,7 +2416,6 @@ fn materialize_impl<'a>(
     config: &FitConfig,
     structural_only: bool,
 ) -> Result<MaterializedModel<'a>, WorkflowError> {
-    data.validate_fit_boundary()?;
     let config = config
         .clone()
         .resolve()

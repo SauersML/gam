@@ -468,7 +468,6 @@ fn survival_payload_field_audits(payload: &SurvivalPredictResult) -> Vec<FieldAu
         survival_se,
         eta_se,
         covariance_source,
-        survival_plugin,
     } = payload;
     std::hint::black_box((
         times,
@@ -480,7 +479,6 @@ fn survival_payload_field_audits(payload: &SurvivalPredictResult) -> Vec<FieldAu
         survival_se,
         eta_se,
         covariance_source,
-        survival_plugin,
     ));
     vec![
         // Point surfaces: the plug-in/posterior-mean curves themselves carry
@@ -497,9 +495,6 @@ fn survival_payload_field_audits(payload: &SurvivalPredictResult) -> Vec<FieldAu
         // behind the SEs; it is metadata about the audited SE fields, not an
         // uncertainty surface of its own.
         FieldAudit::point("covariance_source"),
-        // The plug-in surface the posterior mean integrated: a point surface
-        // like `survival` itself, carrying no coverage claim of its own.
-        FieldAudit::point("survival_plugin"),
     ]
 }
 
@@ -508,7 +503,6 @@ fn survival_probe() -> SurvivalPredictResult {
     use gam::families::survival::construction::SurvivalLikelihoodMode;
     let one1 = Array1::<f64>::zeros(1);
     let one2 = ndarray::Array2::<f64>::zeros((1, 1));
-    let one2b = ndarray::Array2::<f64>::zeros((1, 1));
     SurvivalPredictResult {
         times: vec![1.0],
         hazard: one2.clone(),
@@ -521,7 +515,6 @@ fn survival_probe() -> SurvivalPredictResult {
         covariance_source: Some(
             gam::families::survival::predict::SurvivalPredictionCovarianceMode::Conditional,
         ),
-        survival_plugin: Some(one2b),
     }
 }
 
