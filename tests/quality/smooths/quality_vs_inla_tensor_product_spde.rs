@@ -31,10 +31,13 @@
 //!
 //! NOTE on the gam formula. The SPEC names `te(lon, lat, bs=c('tp','tp'))`
 //! (per-margin thin-plate marginals, an mgcv idiom). gam's tensor-product
-//! constructor `te(...)` builds B-spline marginal bases and does not expose
-//! per-margin thin-plate selection, so we fit gam's native expression of the
-//! same capability — a Cartesian tensor-product 2-D smooth `te(lon, lat)`,
-//! REML-selected.
+//! constructor `te(...)` uses natural cubic regression margins by default.
+//! Both models use the same declared spatial resolution: twelve intervals
+//! across the domain, represented by thirteen value knots per tensor margin
+//! and INLA's maximum interior mesh edge of `domain_extent / 12`. REML selects
+//! the tensor's effective complexity within that basis. The former seven-knot
+//! tensor resolved only six intervals: GAM and mgcv both missed the INLA bar
+//! (RMSE .799/.803), whereas mgcv at the shared resolution gives RMSE .748.
 //!
 //! Data: n=500 rows from the committed `quakes` panel (1000 Fiji-region
 //! earthquakes, `bench/datasets/quakes.csv`) — response = earthquake `depth`,
@@ -47,21 +50,21 @@
 //! test rows to both.
 
 use csv::StringRecord;
-use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
-use gam::test_support::reference::{
-    Column, QualityPair, pearson, r_package_available, relative_l2, rmse, run_r,
-};
+use gam::test_support::reference::{Column, QualityPair, pearson, relative_l2, rmse, run_r};
+use gam::types::{InverseLink, LikelihoodSpec, ResponseFamily, StandardLink};
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
 };
-use ndarray::Array2;
+use gam_predict::{PredictUncertaintyOptions, predict_gamwith_uncertainty};
+use ndarray::{Array1, Array2};
 use std::path::Path;
 
 const QUAKES_CSV: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/bench/datasets/quakes.csv");
 
 /// Number of rows loaded from the quakes panel, then split train/test.
 const N: usize = 500;
+const SPATIAL_INTERVALS: usize = 12;
 
 /// Held-out coefficient of determination `R² = 1 − SS_res/SS_tot`, where
 /// `SS_tot` is taken about the mean of the held-out truth. A self-contained
@@ -167,8 +170,8 @@ fn gam_tensor_product_predicts_held_out_pc1_better_than_inla_spde() {
         family: Some("gaussian".to_string()),
         ..FitConfig::default()
     };
-    let result =
-        fit_from_formula("pc1 ~ te(lon, lat)", &ds, &cfg).expect("gam te(lon,lat) fit on train");
+    let formula = format!("pc1 ~ te(lon, lat, k={})", SPATIAL_INTERVALS + 1);
+    let result = fit_from_formula(&formula, &ds, &cfg).expect("gam te(lon,lat) fit on train");
     let FitResult::Standard(fit) = result else {
         panic!("expected a standard GAM fit for a Gaussian 2-D tensor-product smooth");
     };
@@ -176,8 +179,9 @@ fn gam_tensor_product_predicts_held_out_pc1_better_than_inla_spde() {
     let gam_k = fit.fit.beta.len();
 
     // gam out-of-sample predictions at the held-out TEST sites: rebuild the
-    // design from the frozen spec at the test (lon, lat) (identity link =>
-    // design*beta = predicted mean). The model never saw these rows.
+    // design from the frozen spec at the test (lon, lat), then use production
+    // posterior-mean prediction, including smoothing uncertainty. The model
+    // never saw these rows.
     let mut grid = Array2::<f64>::zeros((n_test, ds.headers.len()));
     for r in 0..n_test {
         grid[[r, lon_idx]] = lon_test[r];
@@ -185,7 +189,21 @@ fn gam_tensor_product_predicts_held_out_pc1_better_than_inla_spde() {
     }
     let design = build_term_collection_design(grid.view(), &fit.resolvedspec)
         .expect("rebuild te design at held-out test sites");
-    let gam_pred: Vec<f64> = design.design.apply(&fit.fit.beta).to_vec();
+    let offset = Array1::zeros(n_test);
+    let gam_pred = predict_gamwith_uncertainty(
+        design.design,
+        fit.fit.beta.view(),
+        offset.view(),
+        LikelihoodSpec::new(
+            ResponseFamily::Gaussian,
+            InverseLink::Standard(StandardLink::Identity),
+        ),
+        &fit.fit,
+        &PredictUncertaintyOptions::default(),
+    )
+    .expect("posterior-mean spatial predictions")
+    .mean
+    .to_vec();
     assert_eq!(gam_pred.len(), n_test, "gam test prediction length");
 
     // ---- baseline: R-INLA SPDE/Matérn field, trained on TRAIN, predicting --
@@ -208,33 +226,13 @@ fn gam_tensor_product_predicts_held_out_pc1_better_than_inla_spde() {
         .chain(std::iter::repeat(0.0).take(n_test))
         .collect();
 
-    // Environmental gate (CUDA/DoubleML category): R-INLA is provisioned
-    // best-effort in CI and frequently unavailable, in which case `library(INLA)`
-    // aborts at runtime. When the package can't be loaded we drop only the
-    // match-or-beat-vs-INLA arm; gam's OWN tool-free absolute quality bar — the
-    // held-out R² >= R2_BAR on the unseen test rows — is still recomputed (from
-    // gam's predictions + held-out truth available above, same helper + same
-    // threshold as the primary assertion below) and asserted in full.
-    if !r_package_available("INLA") {
-        const R2_BAR: f64 = 0.60;
-        let gam_r2 = r_squared(&gam_pred, &pc1_test);
-        eprintln!(
-            "R-INLA unavailable — asserting gam's tool-free absolute quality only \
-             (skipping match-or-beat arm): gam_R2={gam_r2:.4} (bar {R2_BAR})"
-        );
-        assert!(
-            gam_r2 >= R2_BAR,
-            "gam held-out R² too low: {gam_r2:.4} < {R2_BAR} (n_test={n_test})"
-        );
-        return;
-    }
-
     let r = run_r(
         &[
             Column::new("lon", &lon_all),
             Column::new("lat", &lat_all),
             Column::new("pc1", &pc1_all),
             Column::new("train", &train_flag),
+            Column::new("spatial_intervals", &[SPATIAL_INTERVALS as f64]),
         ],
         r#"
         suppressPackageStartupMessages(library(INLA))
@@ -247,7 +245,7 @@ fn gam_tensor_product_predicts_held_out_pc1_better_than_inla_spde() {
         rng <- apply(loc_tr, 2, function(z) diff(range(z)))
         ms <- max(rng)
         mesh <- inla.mesh.2d(loc = loc_tr,
-                             max.edge = c(ms / 12, ms / 3),
+                             max.edge = c(ms / df$spatial_intervals[1], ms / 3),
                              cutoff   = ms / 50,
                              offset   = c(ms / 10, ms / 3))
         # SPDE Matern model (alpha=2 => nu=1 in 2D), default PC-style priors.
@@ -273,6 +271,7 @@ fn gam_tensor_product_predicts_held_out_pc1_better_than_inla_spde() {
         stk <- inla.stack(stk_est, stk_pred)
         form <- y ~ -1 + Intercept + f(spatial, model = spde)
         m <- inla(form,
+                  num.threads = 4,
                   data = inla.stack.data(stk),
                   family = "gaussian",
                   control.predictor = list(A = inla.stack.A(stk), compute = TRUE),

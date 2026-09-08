@@ -98,6 +98,30 @@ The census logs are at
 `/projects/standard/hsiehph/sauer354/issue1082-focused-results/` on MSI, with the
 result ledger at `/Users/user/gam-validation-artifacts/issue1082-focused-results.tsv`.
 
+The subsequent rounding-correction run passes the new joint-penalty cancellation
+unit test (0.02s). Its multinomial inner solves now certify in a few iterations,
+but repeated outer BFGS searches still reach 360s. The survival run likewise
+repeats BFGS line-search failures with gradient about .426; it was stopped at
+182s after exceeding its 120s fit assertion, and is recorded as terminated
+(exit 143), not as a completed quality result. The next build removes the
+custom-family driver's forced gradient-only preference, allowing the outer
+planner to use the family's declared exact Hessian.
+
+The Poisson regression also passes production posterior-mean and uncertainty
+checks (9.41s): RMSE .0890 against the original .3634 bar, EDF 20.17, all 4500
+truth means inside the nominal 95% bands, RMS standardized error .5824. Commit
+`3a97e147a` retains both the original recovery bars and the uncertainty checks.
+
+Production posterior prediction leaves the spatial discrepancy essentially
+unchanged (RMSE .79949). An independent mgcv tensor with the same 7×7 basis gives
+.80337; one using the existing INLA mesh's twelve-interval spatial resolution
+(13 value knots per tensor margin) gives .74762. The revised comparison ties
+both representations to that shared resolution; its original R² and relative
+RMSE requirements remain unchanged. The fresh GAM run passes in 65.30s:
+posterior-mean RMSE .73052 versus INLA .70544 (ratio 1.036), R² .8767, EDF 33.11
+within the 169-column tensor basis. The curvature-enabled multinomial and survival
+fits and the fresh penguin arms remain in progress.
+
 1. Run every selected test after the corrections, including both synthetic and real-data arms. Record
    actual durations and assertions; missing references remain failures.
 2. Diagnose and fix remaining solver/covariance failures without increasing
