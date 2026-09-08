@@ -1,0 +1,6 @@
+
+running 1 test
+test smooths::shape_constrained_fit_survives_its_own_inference_2601::every_shape_constraint_fits_clean_linear_data_2601 ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 505 filtered out; finished in 20.59s
+

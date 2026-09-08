@@ -1,0 +1,29 @@
+
+running 7 tests
+test efs_ard_fixed_point_recovers_cost_criterion_argmin_and_stays_finite ... 
+thread 'efs_ard_fixed_point_recovers_cost_criterion_argmin_and_stays_finite' (1981821) panicked at tests/regressions/sae/latent_sae_gated.rs:465:43:
+EFS eval should succeed: REML smoothing optimization failed to converge: EncodeAtlas: precomputed basis 'dict' has no closed-form jet sup; route to exact encode
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+FAILED
+test gated_sae_decoder_reconstructs_dictionary_atom_at_zero_residual ... ok
+test latent_coord_assignment_decode_roundtrip_matches_dictionary_atom ... ok
+test penalized_quasi_laplace_criterion_has_interior_minimum_in_log_lambda_smooth ... 
+thread 'penalized_quasi_laplace_criterion_has_interior_minimum_in_log_lambda_smooth' (1983676) panicked at tests/regressions/sae/latent_sae_gated.rs:399:5:
+quasi-Laplace criterion over log λ_smooth must have a finite INTERIOR argmin (validating the −½·rank·logλ Occam term's presence and sign); got argmin=-8 (monotone to an endpoint means the term is missing or wrong-signed)
+FAILED
+test penalized_quasi_laplace_criterion_keeps_alpha_finite_on_collapsing_axis ... 
+thread 'penalized_quasi_laplace_criterion_keeps_alpha_finite_on_collapsing_axis' (1983678) panicked at tests/regressions/sae/latent_sae_gated.rs:307:14:
+criterion should evaluate: IndefiniteObservedInformation { block: "joint" }
+FAILED
+test sae_assignment_modes_follow_documented_behavior ... ok
+test temperature_schedule_is_applied_each_iteration_and_near_zero_behaves_like_argmax ... ok
+
+failures:
+
+failures:
+    efs_ard_fixed_point_recovers_cost_criterion_argmin_and_stays_finite
+    penalized_quasi_laplace_criterion_has_interior_minimum_in_log_lambda_smooth
+    penalized_quasi_laplace_criterion_keeps_alpha_finite_on_collapsing_axis
+
+test result: FAILED. 4 passed; 3 failed; 0 ignored; 0 measured; 0 filtered out; finished in 32.36s
+

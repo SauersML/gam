@@ -1,0 +1,7 @@
+
+running 2 tests
+test firth_accepted_for_binomial_loglog_and_cauchit_2158 ... ok
+test heuristic_rho_seed_produces_a_finite_optimized_reml_fit ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.78s
+

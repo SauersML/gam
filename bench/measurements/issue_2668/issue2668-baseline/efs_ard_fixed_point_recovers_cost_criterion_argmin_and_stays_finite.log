@@ -1,0 +1,15 @@
+
+running 1 test
+test sae::latent_sae_gated::efs_ard_fixed_point_recovers_cost_criterion_argmin_and_stays_finite ... 
+thread 'sae::latent_sae_gated::efs_ard_fixed_point_recovers_cost_criterion_argmin_and_stays_finite' (1975372) panicked at tests/regressions/sae/latent_sae_gated.rs:521:5:
+EFS fixed-point α must sit at (or below) the v1 cost-criterion minimum: V(α*)=-0.5275459907111362, V(α*/e)=1.4724540092877396, V(α*·e)=-2.527545990710731 — the FS step and the exact criterion must agree at the optimum
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+FAILED
+
+failures:
+
+failures:
+    sae::latent_sae_gated::efs_ard_fixed_point_recovers_cost_criterion_argmin_and_stays_finite
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 505 filtered out; finished in 2.01s
+
