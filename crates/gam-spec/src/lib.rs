@@ -2637,6 +2637,7 @@ impl GlmLikelihoodSpec {
     /// the spec. The shape only takes effect for Gamma families; for other
     /// families the scale metadata is left untouched.
     #[inline]
+    #[must_use]
     pub fn with_gamma_shape(mut self, shape: f64) -> Self {
         self.scale = match self.scale {
             LikelihoodScaleMetadata::FixedGammaShape { .. } => {
@@ -2661,6 +2662,7 @@ impl GlmLikelihoodSpec {
     /// from the working residuals, so the IRLS weights `Var(y)=mu(1-mu)/(1+phi)`
     /// reflect the true precision rather than the `phi=1` seed (issue #567).
     #[inline]
+    #[must_use]
     pub fn with_beta_phi(mut self, phi: f64) -> Self {
         if let ResponseFamily::Beta { phi: family_phi } = &mut self.spec.response {
             *family_phi = phi;
@@ -2677,6 +2679,7 @@ impl GlmLikelihoodSpec {
     /// weight / covariance expression. No-op for non-Tweedie families (issue
     /// #771).
     #[inline]
+    #[must_use]
     pub fn with_tweedie_phi(mut self, phi: f64) -> Self {
         if matches!(self.spec.response, ResponseFamily::Tweedie { .. }) {
             self.scale = LikelihoodScaleMetadata::EstimatedTweediePhi { phi };
@@ -2700,6 +2703,7 @@ impl GlmLikelihoodSpec {
     /// PIRLS refresh gate (`negbin_theta_is_estimated()`) already skips the
     /// call, this enforces the same invariant at the data itself.
     #[inline]
+    #[must_use]
     pub fn with_negbin_theta(mut self, theta: f64) -> Self {
         if let ResponseFamily::NegativeBinomial {
             theta: family_theta,
@@ -2742,6 +2746,7 @@ impl GlmLikelihoodSpec {
     /// (the `refine_dispersion_at_converged_eta = true` accept-fit). No-op for
     /// non-Tweedie families and for a user-fixed `phi`.
     #[inline]
+    #[must_use]
     pub fn with_tweedie_phi_frozen_for_search(mut self, phi: f64) -> Self {
         if matches!(self.spec.response, ResponseFamily::Tweedie { .. })
             && self.scale.tweedie_phi_is_estimated()
@@ -2773,6 +2778,7 @@ impl GlmLikelihoodSpec {
     /// not inside the λ search; mgcv likewise"). No-op for non-NB families and
     /// for an already user-fixed θ.
     #[inline]
+    #[must_use]
     pub fn with_negbin_theta_frozen_for_search(mut self, theta: f64) -> Self {
         if let ResponseFamily::NegativeBinomial {
             theta: family_theta,
@@ -2820,6 +2826,7 @@ impl GlmLikelihoodSpec {
     /// reported dispersion / SEs remain the converged-η estimate. No-op for
     /// non-Gamma families and for a user-fixed shape.
     #[inline]
+    #[must_use]
     pub fn with_gamma_shape_frozen_for_search(mut self, shape: f64) -> Self {
         if matches!(self.spec.response, ResponseFamily::Gamma)
             && self.scale.gamma_shape_is_estimated()
@@ -2860,6 +2867,7 @@ impl GlmLikelihoodSpec {
     /// precision / SEs remain the converged-η estimate. No-op for non-Beta
     /// families and for an already-fixed `phi`.
     #[inline]
+    #[must_use]
     pub fn with_beta_phi_frozen_for_search(mut self, phi: f64) -> Self {
         if let ResponseFamily::Beta { phi: family_phi } = &mut self.spec.response
             && self.scale.beta_phi_is_estimated()
