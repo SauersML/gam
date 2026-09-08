@@ -191,3 +191,22 @@ interpret-core 0.7.8, pyGAM 0.12.0, scikit-learn 1.9.0, NumPy 2.2.6. EBM uses
 four workers to respect the shared node; its statistical settings and seed
 match the original fixture. These checks are still not a complete-suite
 significance result.
+
+## Remaining Poisson integration question
+
+The tensor diagnostic now exports the complete fitted design, penalty blocks,
+coefficients, smoothing parameters, and covariance matrices for independent
+replay. `poisson_posterior_audit.py` reconstructs standard Poisson LAML and
+uses positive prior-CDF quadrature. Its conditional coefficient and covariance
+checks agree to **1.40e-10 absolute** and **5.71e-10 relative**, respectively.
+The reported criterion differs by **8.14e-7**, exceeding this reconstruction's
+roundoff estimate. Equivalence to the production smoothing density is therefore
+**not certified**.
+
+Orders 7, 13, and 25 completed in 28.1 seconds on MSI. Their posterior response
+mean RMSEs were 0.25990, 0.21645, and 0.22184. The last two refinements still
+change a prediction by as much as 0.1063, so these are **unconverged exploratory
+results**, not evidence of a resolved quality gap. The raw output and both
+tensor problem exports are retained for a subsequent investigation. No further
+compute was launched while wrapping up. The tensor accuracy gaps and the
+complete-suite superiority requirement remain open.

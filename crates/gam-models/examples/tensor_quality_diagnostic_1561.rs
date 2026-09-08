@@ -62,7 +62,33 @@ fn fixture(output: &Path, poisson: bool) -> Result<(), Box<dyn std::error::Error
         return Err("expected standard tensor fit".into());
     };
     let design = build_term_collection_design(data.values.view(), &fit.resolvedspec)?;
-    let eta = design.design.to_dense().dot(&fit.fit.beta);
+    let x = design.design.to_dense();
+    let eta = x.dot(&fit.fit.beta);
+    let problem = serde_json::json!({
+        "family": family,
+        "x": x.rows().into_iter().map(|row| row.to_vec()).collect::<Vec<_>>(),
+        "y": values.iter().map(|row| row[2]).collect::<Vec<_>>(),
+        "truth": values.iter().map(|row| row[3]).collect::<Vec<_>>(),
+        "beta": fit.fit.beta.to_vec(),
+        "rho": fit.fit.log_lambdas.to_vec(),
+        "phi": fit.fit.dispersion_phi()?,
+        "criterion": fit.fit.reml_score(),
+        "log_likelihood": fit.fit.log_likelihood,
+        "stable_penalty_term": fit.fit.stable_penalty_term,
+        "penalized_objective": fit.fit.penalized_objective(),
+        "penalties": fit.design.penalties.iter().map(|penalty| serde_json::json!({
+            "start": penalty.col_range.start,
+            "end": penalty.col_range.end,
+            "matrix": penalty.local.rows().into_iter().map(|row| row.to_vec()).collect::<Vec<_>>(),
+        })).collect::<Vec<_>>(),
+        "nullspace_dims": fit.design.nullspace_dims,
+        "conditional_covariance": fit.fit.beta_covariance(),
+        "marginal_covariance": fit.fit.beta_covariance_corrected(),
+    });
+    serde_json::to_writer_pretty(
+        std::fs::File::create(output.join(format!("{family}-tensor.json")))?,
+        &problem,
+    )?;
     let mut writer = csv::Writer::from_path(csv_path)?;
     writer.write_record(["x", "z", "y", "truth", "gam"])?;
     for (row, &linear) in values.iter().zip(&eta) {
