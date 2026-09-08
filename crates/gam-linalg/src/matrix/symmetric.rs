@@ -108,12 +108,26 @@ impl SymmetricMatrix {
                     "Dense SymmetricMatrix strict SPD factorization",
                 )
                 .map_err(|error| error.to_string())?;
-                matrix
-                    .cholesky(faer::Side::Lower)
-                    .map(|factor| Box::new(factor) as Box<dyn FactorizedSystem>)
-                    .map_err(|error| {
-                        format!("Dense SymmetricMatrix strict SPD factorization failed: {error}")
-                    })
+                let factor = matrix.cholesky(faer::Side::Lower).map_err(|error| {
+                    format!("Dense SymmetricMatrix strict SPD factorization failed: {error}")
+                })?;
+                let largest_diagonal = matrix.diag().iter().copied().fold(0.0_f64, f64::max);
+                // A Cholesky pivot is a dot product followed by a subtraction:
+                // at most 2n rounded operations, hence Wilkinson's gamma_(2n).
+                let pivot_band =
+                    crate::roundoff::accumulation_growth(2 * matrix.nrows()) * largest_diagonal;
+                if factor
+                    .diag()
+                    .iter()
+                    .copied()
+                    .any(|diagonal| diagonal * diagonal <= pivot_band)
+                {
+                    return Err(format!(
+                        "Dense SymmetricMatrix strict SPD factorization found a Cholesky pivot \
+                         inside its derived roundoff band {pivot_band:e}"
+                    ));
+                }
+                Ok(Box::new(factor) as Box<dyn FactorizedSystem>)
             }
             Self::Sparse(matrix) => crate::sparse_exact::factorize_sparse_spd_strict(matrix)
                 .map(|factor| Box::new(factor) as Box<dyn FactorizedSystem>)
