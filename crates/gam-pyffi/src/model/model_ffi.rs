@@ -3038,10 +3038,13 @@ fn basis_with_jet<'py>(
                 let (penalty, null_basis) =
                     smoothness_penalty_impl(knots_array.view(), degree, order)
                         .map_err(py_value_error)?;
-                assert!(
-                    null_basis.ncols() <= penalty.ncols(),
-                    "smoothness penalty nullspace cannot exceed coefficient count"
-                );
+                if null_basis.ncols() > penalty.ncols() {
+                    return Err(py_value_error(format!(
+                        "basis_with_jet bspline returned a nullspace with {} columns for a {}-coefficient penalty",
+                        null_basis.ncols(),
+                        penalty.ncols()
+                    )));
+                }
                 (jet, penalty)
             };
             Ok((
@@ -6865,12 +6868,8 @@ fn build_latent_duchon_design(
     // wrap = TAU for circle/torus); a `None` axis is a Euclidean (open) axis.
     // When `periodic` is `None`/all-open the basis stays byte-identical to the
     // open Euclidean construction (euclidean / sphere / matern latent fits).
-    let periodic_flags: Option<Vec<bool>> = periodic.and_then(|axes| {
-        if axes.len() == latent_dim && axes.iter().any(|p| p.is_some()) {
-            Some(axes.iter().map(|p| p.is_some()).collect())
-        } else {
-            None
-        }
+    let periodic_axes = periodic.filter(|axes| {
+        axes.len() == latent_dim && axes.iter().any(|p| p.is_some())
     });
     let spec = DuchonBasisSpec {
         radial_reparam: None,
@@ -6884,11 +6883,11 @@ fn build_latent_duchon_design(
         periodic: None,
         boundary: OneDimensionalBoundary::Open,
     };
-    let built = if let Some(flags) = periodic_flags {
+    let built = if let Some(axes) = periodic_axes {
         // `periodic` is Some with the same arity (checked above). Each periodic
         // axis carries an explicit chart period (TAU); non-periodic axes get a
         // placeholder period (unused by the builder for `!periodic` axes).
-        let axes = periodic.expect("periodic_flags is only Some when periodic is Some");
+        let flags: Vec<bool> = axes.iter().map(Option::is_some).collect();
         let periods: Vec<f64> = axes.iter().map(|p| p.unwrap_or(1.0)).collect();
         build_duchon_basis_mixed_periodicity_auto(t_mat.view(), &spec, &flags, Some(&periods))
             .map_err(|err| {
@@ -6963,7 +6962,9 @@ fn build_latent_duchon_periodic_jet(
         // collapsed centers, same domain wrap, same constant-only constraint
         // nullspace — and returns the dense `(n, kernel_cols + 1)` first
         // derivative `∂Φ/∂t` (the trailing constant column's derivative is 0).
-        let period = axes[0].expect("latent_dim == 1 periodic axis carries a period");
+        let period = axes.first().copied().flatten().ok_or_else(|| {
+            "periodic one-dimensional latent basis requires a period for its axis".to_string()
+        })?;
         let dphi_dt = create_duchon_basis_1d_derivative_dense(
             t_mat.column(0),
             centers.column(0),

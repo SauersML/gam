@@ -8464,27 +8464,36 @@ fn affine_design_array_impl(
 
 /// Population variance (divide by `n`, matching numpy `np.var`'s default).
 fn population_variance(values: &[f64]) -> f64 {
-    population_covariance(values, values)
+    if values.is_empty() {
+        return 0.0;
+    }
+    let mean = values.iter().sum::<f64>() / values.len() as f64;
+    values
+        .iter()
+        .map(|value| (value - mean) * (value - mean))
+        .sum::<f64>()
+        / values.len() as f64
 }
 
 /// Population covariance (divide by `n`, matching `population_variance`).
-fn population_covariance(a: &[f64], b: &[f64]) -> f64 {
+fn population_covariance(a: &[f64], b: &[f64]) -> Result<f64, String> {
     let n = a.len();
-    assert_eq!(
-        n,
-        b.len(),
-        "population covariance requires equal-length slices"
-    );
+    if n != b.len() {
+        return Err(format!(
+            "population covariance requires equal-length slices, got {n} and {}",
+            b.len()
+        ));
+    }
     if n == 0 {
-        return 0.0;
+        return Ok(0.0);
     }
     let mean_a = a.iter().sum::<f64>() / n as f64;
     let mean_b = b.iter().sum::<f64>() / n as f64;
-    a.iter()
+    Ok(a.iter()
         .zip(b.iter())
         .map(|(&va, &vb)| (va - mean_a) * (vb - mean_b))
         .sum::<f64>()
-        / n as f64
+        / n as f64)
 }
 
 /// Per-term partial dependence on a grid table.
@@ -8605,7 +8614,7 @@ fn model_variance_share_encoded_impl(
             contrib[i] = s;
         }
         let share = if total_var > 0.0 {
-            population_covariance(&contrib, &eta) / total_var
+            population_covariance(&contrib, &eta)? / total_var
         } else {
             0.0
         };
