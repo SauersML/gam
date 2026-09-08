@@ -72,7 +72,7 @@ uses the shared-scale block estimator: the coefficient problems decouple,
 the residual scale remains global, autograd flows through the differentiable
 block solves, and memory stays linear in F. A representative architecture is:
 
-```python
+```python no-exec
 codes = encoder(x)               # (B, F)
 positions = codes                # (B, F)
 amps = topk_amps(codes)          # (B, F), sparse

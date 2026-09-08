@@ -136,7 +136,7 @@ that combination produces a confidently significant false association. Read
 
 ## diagnose()
 
-```python
+```text
 diag = model.diagnose(data, *, y=None, interval=0.95)
 ```
 
