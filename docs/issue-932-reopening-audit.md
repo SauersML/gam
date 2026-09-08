@@ -272,3 +272,27 @@ ratios **1.049541 / 2.866422** for score-warp orders 3/4 and
 **1.021672 / 4.639822** for link-dev orders 3/4; all wins are 1.00. Its opponent
 remains a dynamic jet. The run as a whole fails the two rigid macro cells
 listed above, so it is not a whole-population acceptance result.
+
+The next rigid-third compiler change shares one root Faà di Bruno component
+emitter between full and contracted surfaces. It combines identical partitions
+with their integer multiplicity and emits each symmetric component once. The
+contracted hand opponent now also uses three unique entries and folds its
+diagonal multiplicity; the 512-row symmetry witness covers both surfaces.
+
+A fresh MSI `acn112` release build took **12.31 seconds** and passed all **27
+unit tests and 10 integration tests**. Hand/generated paired ratios were
+**1.019350 / 1.074325 / 1.147608 / 1.060885 / 1.318502** for order 2,
+contracted third, contracted fourth, full third and full fourth respectively;
+all five cells had wins 1.00. Third/full-third resolutions were 0.0011/0.0031.
+The run used the existing warm Cargo cache, four CPUs (88–91), 15 paired
+repetitions and 512 rows per arm. Log:
+`.buildd/issue932-third-partitions-verified.log`.
+
+This run explicitly rebuilt the crate, and the suite binary timestamp
+(14:20:02) follows both final source timestamps (14:17:15–16). The earlier
+`issue932-third-partitions-strong-hand.log` used a stale binary and is excluded
+from final-candidate evidence. Validation used the shared MSI checkout, which
+also contains concurrent macro work; clean committed-source CI remains
+required. A second-host attempt on `acn116` failed before execution (status
+255). These results repair the local rigid-third gates, not the outstanding
+whole-population, runtime-width hand-opponent, or physical-GPU requirements.

@@ -3733,6 +3733,49 @@ fn push_dense_taylor_schedule_body(source: &mut String, schedule: &DenseTaylorSc
     push_preludes(source, &schedule.result_preludes, "    ");
 }
 
+/// Third-order Faà di Bruno component. Repeated partitions are combined before
+/// emission, so both dense and directional lowerings use the same algebra.
+fn root_third_component(
+    stack: &str,
+    first: [String; 3],
+    second: [String; 3],
+    third: String,
+) -> String {
+    let mut terms: Vec<(String, usize)> = Vec::new();
+    for pair in 0..3 {
+        let term = format!("{} * {}", second[pair], first[2 - pair]);
+        if let Some((_, multiplicity)) = terms.iter_mut().find(|(existing, _)| *existing == term) {
+            *multiplicity += 1;
+        } else {
+            terms.push((term, 1));
+        }
+    }
+    let second_chain = terms.into_iter().map(|(term, count)| {
+        if count == 1 { term } else { format!("{count}.0 * {term}") }
+    }).collect::<Vec<_>>().join(" + ");
+    format!(
+        "{stack}[3] * {} * {} * {} + {stack}[2] * ({second_chain}) + {stack}[1] * {third}",
+        first[0], first[1], first[2],
+    )
+}
+
+fn push_root_third_components(source: &mut String, stack: &str) {
+    source.push_str("    let derivative = [\n");
+    for second_axes in 0..4 {
+        let a = usize::from(second_axes == 3);
+        let b = usize::from(second_axes >= 2);
+        let c = usize::from(second_axes >= 1);
+        let component = root_third_component(
+            stack,
+            [a, b, c].map(|axis| format!("inner_first[{axis}]")),
+            [a + b, a + c, b + c].map(|pair| format!("inner_second[{pair}]")),
+            format!("inner_third[{second_axes}]"),
+        );
+        source.push_str(&format!("        {component},\n"));
+    }
+    source.push_str("    ];\n");
+}
+
 fn rust_dense_taylor_body(
     primaries: &[Ident],
     constants: &HashSet<String>,
@@ -3759,26 +3802,24 @@ fn rust_dense_taylor_body(
             push_dense_taylor_derivative_array(&mut source, "inner_first", &schedule.result, 1);
             push_dense_taylor_derivative_array(&mut source, "inner_second", &schedule.result, 2);
             push_dense_taylor_derivative_array(&mut source, "inner_third", &schedule.result, 3);
-            source.push_str(&format!(
-                "    let inner_u = inner_first[0] * direction_u[0]\n\
-                 \x20       + inner_first[1] * direction_u[1];\n\
-                 \x20   std::array::from_fn(|axis| std::array::from_fn(|other| {{\n\
-                 \x20       let offset = axis + other;\n\
-                 \x20       let inner_a = inner_first[axis];\n\
-                 \x20       let inner_b = inner_first[other];\n\
-                 \x20       let inner_ab = inner_second[offset];\n\
-                 \x20       let inner_au = inner_second[axis] * direction_u[0]\n\
-                 \x20           + inner_second[axis + 1] * direction_u[1];\n\
-                 \x20       let inner_bu = inner_second[other] * direction_u[0]\n\
-                 \x20           + inner_second[other + 1] * direction_u[1];\n\
-                 \x20       let inner_abu = inner_third[offset] * direction_u[0]\n\
-                 \x20           + inner_third[offset + 1] * direction_u[1];\n\
-                 \x20       {root_stack}[3] * inner_u * inner_a * inner_b\n\
-                 \x20           + {root_stack}[2] * (inner_au * inner_b + inner_a * inner_bu\n\
-                 \x20               + inner_u * inner_ab)\n\
-                 \x20           + {root_stack}[1] * inner_abu\n\
-                 \x20   }}))\n"
-            ));
+            source.push_str(
+                "    let inner_u = inner_first[0] * direction_u[0] + inner_first[1] * direction_u[1];\n\
+                 \x20   let inner_second_u: [f64; 2] = std::array::from_fn(|axis|\n\
+                 \x20       inner_second[axis] * direction_u[0] + inner_second[axis + 1] * direction_u[1]);\n\
+                 \x20   let inner_third_u: [f64; 3] = std::array::from_fn(|pair|\n\
+                 \x20       inner_third[pair] * direction_u[0] + inner_third[pair + 1] * direction_u[1]);\n\
+                 \x20   let derivative = [\n"
+            );
+            for (a, b) in [(0, 0), (0, 1), (1, 1)] {
+                let component = root_third_component(
+                    root_stack,
+                    ["inner_u".to_owned(), format!("inner_first[{a}]"), format!("inner_first[{b}]")],
+                    [format!("inner_second_u[{a}]"), format!("inner_second_u[{b}]"), format!("inner_second[{}]", a + b)],
+                    format!("inner_third_u[{}]", a + b),
+                );
+                source.push_str(&format!("        {component},\n"));
+            }
+            source.push_str("    ];\n    [[derivative[0], derivative[1]], [derivative[1], derivative[2]]]\n");
             source.push_str("}\n");
             return syn::parse_str(&source).map_err(|error| {
                 syn::Error::new(
@@ -3888,33 +3929,13 @@ fn rust_dense_taylor_uncontracted_body(
         push_dense_taylor_derivative_array(&mut source, "inner_first", &schedule.result, 1);
         push_dense_taylor_derivative_array(&mut source, "inner_second", &schedule.result, 2);
         push_dense_taylor_derivative_array(&mut source, "inner_third", &schedule.result, 3);
-        // Compute each symmetric component once. Expanding all eight ordered
-        // triples independently produces differently associated sums for the
-        // permutations of 001 and 011, which strict floating-point codegen
-        // cannot merge. The canonical multi-index has only four components.
-        source.push_str(&format!(
-            "    let derivative: [f64; 4] = std::array::from_fn(|second_axes| {{\n\
-             \x20           let axis_a = usize::from(second_axes == 3);\n\
-             \x20           let axis_b = usize::from(second_axes >= 2);\n\
-             \x20           let axis_c = usize::from(second_axes >= 1);\n\
-             \x20           let inner_a = inner_first[axis_a];\n\
-             \x20           let inner_b = inner_first[axis_b];\n\
-             \x20           let inner_c = inner_first[axis_c];\n\
-             \x20           let inner_ab = inner_second[axis_a + axis_b];\n\
-             \x20           let inner_ac = inner_second[axis_a + axis_c];\n\
-             \x20           let inner_bc = inner_second[axis_b + axis_c];\n\
-             \x20           let inner_abc = inner_third[axis_a + axis_b + axis_c];\n\
-             \x20           {root_stack}[3] * inner_a * inner_b * inner_c\n\
-             \x20               + {root_stack}[2] * (inner_ab * inner_c\n\
-             \x20                   + inner_ac * inner_b + inner_bc * inner_a)\n\
-             \x20               + {root_stack}[1] * inner_abc\n\
-             \x20   }});\n\
-             \x20   [\n\
+        push_root_third_components(&mut source, root_stack);
+        source.push_str(
+            "    [\n\
              \x20       [[derivative[0], derivative[1]], [derivative[1], derivative[2]]],\n\
              \x20       [[derivative[1], derivative[2]], [derivative[2], derivative[3]]],\n\
-             \x20   ]\n\
-             }}\n"
-        ));
+             \x20   ]\n}\n"
+        );
         return syn::parse_str(&source).map_err(|error| {
             syn::Error::new(
                 error.span(),
@@ -5261,9 +5282,9 @@ mod tests {
 
     /// The `1/k!` a composition on a primary introduces and the `k!` a
     /// derivative extraction removes cancel in the emitter. On the
-    /// third-order surfaces (the root composition specialised, the inner
-    /// jet's derivatives read directly) no constant multiply is emitted at
-    /// all; on the fourth-order surfaces the dense composition keeps its
+    /// third-order surfaces the inner jet's derivatives carry no constant
+    /// multiply; the root's symmetric partition multiplicities remain.
+    /// On the fourth-order surfaces the dense composition keeps its
     /// Faà di Bruno multiplicities (a `2` for a repeated partition), but the
     /// extracted derivatives are the coefficients themselves. The rigid
     /// Bernoulli row's fourth channel paid seventeen round-trip multiplies
@@ -5295,10 +5316,11 @@ mod tests {
         ];
         for surface in ["rigid_third_contracted", "rigid_third_full"] {
             let rust = emitted_function(input.clone(), surface);
+            let inner = &rust[..rust.find("let derivative =").expect("root third components")];
             for literal in literals {
                 assert!(
-                    !rust.contains(literal),
-                    "{surface} carries a constant multiply: {literal}\n{rust}"
+                    !inner.contains(literal),
+                    "{surface}'s inner jet carries a constant multiply: {literal}\n{rust}"
                 );
             }
         }

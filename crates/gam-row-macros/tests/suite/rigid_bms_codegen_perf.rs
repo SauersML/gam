@@ -257,20 +257,28 @@ fn contract2(derivative: &[f64; 3], left: [f64; 2], right: [f64; 2]) -> f64 {
 fn strongest_hand_third(row: Row) -> [[f64; 2]; 2] {
     let (outer, d1, d2, d3, _) = margin_chain(row);
     let margin_u = dot2(d1, row.direction_u);
-    std::array::from_fn(|axis_a| {
-        std::array::from_fn(|axis_b| {
-            let margin_a = d1[axis_a];
-            let margin_b = d1[axis_b];
-            let margin_ab = d2[axis_a + axis_b];
-            let margin_au = d2[axis_a] * row.direction_u[0] + d2[axis_a + 1] * row.direction_u[1];
-            let margin_bu = d2[axis_b] * row.direction_u[0] + d2[axis_b + 1] * row.direction_u[1];
-            let margin_abu = d3[axis_a + axis_b] * row.direction_u[0]
-                + d3[axis_a + axis_b + 1] * row.direction_u[1];
-            outer[3] * margin_u * margin_a * margin_b
-                + outer[2] * (margin_au * margin_b + margin_a * margin_bu + margin_u * margin_ab)
-                + outer[1] * margin_abu
-        })
-    })
+    // A strongest hand schedule also computes only the three independent
+    // entries and folds the repeated diagonal partition into multiplicity 2.
+    let components: [f64; 3] = std::array::from_fn(|slot| {
+        let axis_a = usize::from(slot == 2);
+        let axis_b = usize::from(slot >= 1);
+        let margin_a = d1[axis_a];
+        let margin_b = d1[axis_b];
+        let margin_ab = d2[axis_a + axis_b];
+        let margin_au = d2[axis_a] * row.direction_u[0] + d2[axis_a + 1] * row.direction_u[1];
+        let margin_bu = d2[axis_b] * row.direction_u[0] + d2[axis_b + 1] * row.direction_u[1];
+        let margin_abu = d3[axis_a + axis_b] * row.direction_u[0]
+            + d3[axis_a + axis_b + 1] * row.direction_u[1];
+        let second_chain = if axis_a == axis_b {
+            2.0 * margin_au * margin_a + margin_u * margin_ab
+        } else {
+            margin_au * margin_b + margin_a * margin_bu + margin_u * margin_ab
+        };
+        outer[3] * margin_u * margin_a * margin_b
+            + outer[2] * second_chain
+            + outer[1] * margin_abu
+    });
+    [[components[0], components[1]], [components[1], components[2]]]
 }
 
 #[inline(always)]
@@ -434,6 +442,12 @@ fn assert_third_full(got: [[[f64; 2]; 2]; 2], want: [[[f64; 2]; 2]; 2]) {
 #[test]
 fn generated_full_third_has_one_value_per_symmetric_component_932() {
     for (row_index, row) in rows().into_iter().enumerate() {
+        let contracted = generated_third(row);
+        assert_eq!(
+            contracted[0][1].to_bits(),
+            contracted[1][0].to_bits(),
+            "row {row_index}: contracted third has separately evaluated transposes"
+        );
         let third = generated_third_full(row);
         assert_third_full(third, strongest_hand_third_full(row));
         for a in 0..2 {

@@ -61,11 +61,8 @@ fn assert_raw_axis_design_derivatives(length_scale: f64, contrast: f64) {
     else {
         panic!("Duchon metadata");
     };
-    assert_eq!(
-        aniso_log_scales.as_deref(),
-        Some([contrast, -contrast].as_slice()),
-        "explicit anisotropy, including zero, must be honored literally"
-    );
+    assert_eq!(aniso_log_scales.as_deref(), Some([contrast, -contrast].as_slice()),
+        "explicit anisotropy, including zero, must be honored literally");
     spec.center_strategy = CenterStrategy::UserProvided(centers.clone());
     spec.radial_reparam = radial_reparam.clone();
     spec.aniso_log_scales = aniso_log_scales.clone();
