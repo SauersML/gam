@@ -934,6 +934,11 @@ pub(crate) fn fit_standard_model(
     wiggle_options.compute_covariance = true;
     let wiggle_link_kind =
         resolved_wiggle_inverse_link(&request.family, &result.fit, &wiggle.link_kind)?;
+    let fitted_wiggle_family = LikelihoodSpec::try_new(
+        request.family.response.clone(),
+        wiggle_link_kind.clone(),
+    )
+    .map_err(|error| format!("invalid resolved link-wiggle likelihood: {error}"))?;
     let selected_wiggle_basis = select_binomial_mean_link_wiggle_basis_from_pilot(
         &result.design,
         &result.fit,
@@ -970,7 +975,7 @@ pub(crate) fn fit_standard_model(
     // fixed at the root by `BinomialMeanWiggleFamily::joint_jeffreys_term_required
     // = false`; the loud `Err` below catches the residual trust-region/active-set
     // non-convergence that the root fix cannot.
-    let solved = match fit_binomial_mean_wiggle_terms_with_selected_basis(
+    let mut solved = match fit_binomial_mean_wiggle_terms_with_selected_basis(
         request.data.view(),
         &result.resolvedspec,
         &result.design,
@@ -1012,6 +1017,11 @@ pub(crate) fn fit_standard_model(
                 .to_string(),
         );
     }
+    // The joint link-wiggle solver is a custom block family and therefore does
+    // not infer the observation-law metadata stored by the generic likelihood
+    // solver. Preserve the resolved response and inverse link explicitly;
+    // response-scale prediction after assembly or reload depends on it (#2748).
+    solved.fit.likelihood_family = Some(fitted_wiggle_family);
 
     Ok(StandardFitResult {
         saved_link_state: result.saved_link_state,
