@@ -1,0 +1,18 @@
+running 8 tests
+test manifold::tests_chart_evaluator_jets::euclidean_affine_gauge_canonicalization_preserves_reconstruction ... ok
+test manifold::tests_chart_evaluator_jets::quotient_step_norm_retains_prior_sensitive_euclidean_affine_orbit ... ok
+test manifold::tests_gauge_posterior_flatness_2720::chart_orbit_directional_derivative_splits_by_objective_term_2720 ... ok
+test manifold::tests_gauge_posterior_flatness_2720::chart_orbit_stays_out_of_the_convergence_quotient_and_is_worth_excluding_2720 ... ok
+test manifold::tests_gauge_posterior_flatness_2720::option_two_prior_aware_compensation_has_no_state_independent_solution_2720 ... ok
+[2720-gate] kind=periodic tol=7.479489e-5 span=0 (chart=1, beta_null=0, channel_null=0)
+test manifold::tests_gauge_posterior_flatness_2720::at_an_inner_fixed_point_the_chart_orbit_slope_is_within_the_kkt_tolerance_2720 ... ok
+[2720-gate] kind=torus tol=7.812950e-5 span=366 (chart=2, beta_null=0, channel_null=392)
+test manifold::tests_gauge_posterior_flatness_2720::quotient_span_is_flat_with_decoder_frames_active_2720 ... ok
+[2720-gate] kind=duchon tol=9.548644e-5 span=704 (chart=2, beta_null=0, channel_null=704)
+[2720-gate] kind=linear tol=9.450092e-5 span=0 (chart=2, beta_null=0, channel_null=0)
+[2720-gate] kind=euclidean tol=9.454592e-5 span=0 (chart=2, beta_null=0, channel_null=0)
+[2720-gate] kind=poincare tol=9.454592e-5 span=0 (chart=2, beta_null=0, channel_null=0)
+[2720-gate] kind=sphere tol=1.826324e-4 span=0 (chart=3, beta_null=0, channel_null=0)
+[2720-gate] kind=klein_bottle tol=2.336843e-4 span=0 (chart=1, beta_null=0, channel_null=0)
+test manifold::tests_gauge_posterior_flatness_2720::quotient_span_is_flat_for_the_penalized_objective_2720 ... ok
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 1260 filtered out; finished in 5.45s
