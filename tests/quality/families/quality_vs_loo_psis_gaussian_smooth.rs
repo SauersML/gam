@@ -34,7 +34,7 @@
 
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
-use gam::test_support::reference::{Column, QualityPair, pad_to, rmse, run_python};
+use gam::test_support::reference::{Column, pad_to, rmse, run_python};
 use gam::{FitConfig, FitResult, fit_from_formula, init_parallelism, load_csvwith_inferred_schema};
 use ndarray::Array2;
 use std::path::Path;
@@ -311,18 +311,12 @@ emit("n_obs", [float(N)])
          arviz_elpd_loo/pt={arviz_elpd_per_point:.5} (total={arviz_elpd_total:.3}) \
          max_pareto_k={max_pareto_k:.3}"
     );
-    eprintln!(
-        "{}",
-        QualityPair::score(
-            "families",
-            "quality_vs_loo_psis_gaussian_smooth::elpd",
-            "held_out_elpd_per_point",
-            gam_test_elpd_mean,
-            "arviz_loo",
-            arviz_elpd_per_point,
-        )
-        .line()
-    );
+    // These diagnostics cannot form a paired model-quality observation:
+    // GAM is scored on held-out rows, while ArviZ estimates LOO on TRAIN rows
+    // from GAM's own posterior. They differ in rows and estimand, and ArviZ
+    // has not fitted an independent predictive model. Keep the diagnostics
+    // and quality assertions below, but do not count this as an external
+    // model win/loss in the #1561 significance test.
 
     // ---- (A) ABSOLUTE held-out bars (gam scored on its own predictions) ----
     assert!(

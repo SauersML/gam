@@ -13,18 +13,12 @@
 //!      This is an absolute statement about gam's accuracy against ground truth,
 //!      not about any other tool's output.
 //!
-//!      The bar is 2.5% (not the interpolation floor): the data are noiseless,
-//!      but REML's restricted-likelihood Occam term forbids `λ → 0`, so a
-//!      faithful REML smoother does NOT interpolate even noiseless data — it
-//!      settles at a smoothed fixed point. On THIS surface the achievable floor
-//!      is ~2.1–2.3% of amplitude for any correct REML engine (mgcv itself lands
-//!      at 2.28%; gam at 2.07%), well above the 0.06% the basis could reach at
-//!      `λ → 0`. A bar tighter than the REML floor cannot be met by any faithful
-//!      smoother and is therefore not the right test; 2.5% comfortably exceeds
-//!      what every correct engine achieves here while still catching gross
-//!      over-smoothing (the pre-fix gam, whose contaminated penalty null space
-//!      drove it to 4.2% of amplitude, fails this bar). The MATCH-OR-BEAT check
-//!      below is the binding quality gate.
+//!      The 2.5% threshold is an empirical accuracy requirement. Although the
+//!      observations are noiseless, their main effects are absent from this
+//!      interaction-only model. Those omitted effects contribute to its
+//!      residual variance and therefore to its selected smoothing. Its error
+//!      is not a universal REML interpolation floor, and REML does not in
+//!      general forbid a zero-penalty boundary solution.
 //!   2. STRUCTURE / IDENTIFIABILITY. `ti` is interaction-ONLY: per-margin
 //!      sum-to-zero centering before the tensor product must purge all main
 //!      effects. We assert this directly on gam's own fitted surface — its
@@ -40,9 +34,14 @@
 //!      `k*k-1 = 35`, or centered only one margin at `(k-1)*k = 30`).
 //!
 //! BASELINE TO MATCH-OR-BEAT: mgcv (`bs="ps", m=list(c(2,2),c(2,2)), k=6`,
-//! method="REML") fits the SAME interaction-only penalized objective with the
-//! SAME marginal basis (cubic P-spline + 2nd-order difference penalty, 6
-//! cols/margin). We fit mgcv on identical rows, ANOVA-center its fitted surface
+//! method="REML") uses cubic P-spline margins with a second-order difference
+//! penalty and six columns per margin. GAM's default margins are natural cubic
+//! regression splines. These have the same dimension but different function
+//! spaces and penalties. GAM also applies null-space shrinkage by default;
+//! the reference below does not. The #1561 audit reproduces GAM's recovery
+//! error with mgcv's natural-cubic `select=TRUE` model. This fixture therefore
+//! compares statistical penalty choices as well as numerical implementations.
+//! We fit mgcv on identical rows, ANOVA-center its fitted surface
 //! the same way, and require gam's recovery error to be no worse than mgcv's by
 //! more than 10% (`rmse_gam <= 1.10 · rmse_mgcv`). mgcv is the bar to match-or-
 //! beat on accuracy, NOT the thing gam must reproduce: the primary claim is
@@ -213,8 +212,8 @@ fn gam_ti_2d_interaction_recovers_truth() {
         ],
         r#"
         suppressPackageStartupMessages(library(mgcv))
-        # bs="ps", m=c(2,2) per margin == gam's tensor margin: cubic B-spline +
-        # 2nd-order difference penalty, 6 columns/margin for k=6.
+        # P-spline baseline: equal dimension to GAM's natural cubic margins,
+        # with a different boundary condition and roughness penalty.
         m <- gam(y ~ ti(x, z, bs = "ps", m = list(c(2, 2), c(2, 2)), k = 6),
                  data = df, method = "REML")
         emit("fitted", as.numeric(fitted(m)))
@@ -234,9 +233,8 @@ fn gam_ti_2d_interaction_recovers_truth() {
     let rel_vs_mgcv = relative_l2(&gam_int, &mgcv_int); // context only
     let gam_marginal = max_marginal_mean(&gam_fitted, GRID, GRID);
     let expected_count = (K - 1) * (K - 1);
-    // 2.5% of amplitude: the REML-achievable recovery floor on this noiseless
-    // surface (~2.1–2.3% for any faithful engine; REML's Occam term forbids the
-    // λ→0 interpolation that would reach ~0.06%). See the module docstring.
+    // Empirical accuracy bar on the interaction component, with omitted main
+    // effects still present in the response used to estimate dispersion.
     let recovery_bar = 0.025 * truth_int_range;
 
     eprintln!(
@@ -286,8 +284,7 @@ fn gam_ti_2d_interaction_recovers_truth() {
     );
 
     // (3) TRUTH RECOVERY (PRIMARY): gam reconstructs the true interaction
-    //     component to within 2.5% of its amplitude — the REML-achievable floor
-    //     on this noiseless surface (see module docstring).
+    //     component to within 2.5% of its amplitude.
     assert!(
         rmse_gam <= recovery_bar,
         "gam fails to recover the true interaction surface: \

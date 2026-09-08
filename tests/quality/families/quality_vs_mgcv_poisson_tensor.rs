@@ -26,11 +26,13 @@
 //! therefore demote it to a MATCH-OR-BEAT ACCURACY BASELINE: gam's RMSE-to-truth
 //! must be no worse than mgcv's RMSE-to-truth by more than 10%
 //!     RMSE(gam_mean, mu_true) <= 1.10 * RMSE(mgcv_mean, mu_true).
-//! To keep that an apples-to-apples accuracy comparison, mgcv is pinned to the
-//! same marginal basis as gam: `bs="ps"` with default `m=c(2,2)` gives cubic
-//! B-spline margins + a 2nd-order penalty, matching gam's `te()` margins
-//! (degree 3, penalty order 2). With `k=6` per margin both engines build 6
-//! basis functions per axis, so neither tool is handicapped by basis convention.
+//! Both engines use six basis functions per margin. GAM now defaults to natural
+//! cubic regression margins; the mgcv `bs="ps"` baseline uses cubic B-splines
+//! with a second-order difference penalty. Equal dimension does not imply
+//! identical function spaces or penalties. The natural-cubic mgcv diagnostic
+//! separates this representation difference from differences between solvers.
+//! GAM also shrinks the joint penalty null space by default; this baseline
+//! does not. The standalone #1561 audit crosses both basis and shrinkage choices.
 //! The legacy rel_l2 / pearson "closeness to mgcv" numbers are still printed for
 //! context but are NOT pass criteria — reproducing a peer tool's noisy fit is
 //! not a quality claim; recovering the truth is.
@@ -113,8 +115,8 @@ fn gam_poisson_tensor_recovers_true_mean_surface() {
     let z_idx = col["z"];
 
     // ---- fit with gam: y ~ te(x, z, k=[6,6]), poisson(log), REML ----------
-    // k=6 per margin: cubic B-spline (degree 3) requires k >= 4; 6 leaves room
-    // to express the sin(x) / z^2 structure and matches the mgcv ps margins.
+    // Six natural-cubic basis functions per margin leave room for the
+    // sin(x) / z^2 surface. The P-spline baseline has equal dimension.
     let cfg = FitConfig {
         family: Some("poisson".to_string()),
         ..FitConfig::default()
@@ -137,9 +139,7 @@ fn gam_poisson_tensor_recovers_true_mean_surface() {
     let gam_eta = design.design.apply(&fit.fit.beta);
     let gam_mean: Vec<f64> = gam_eta.iter().map(|e| e.exp()).collect();
 
-    // ---- fit the SAME model with mgcv (the mature tensor reference) -------
-    // bs="ps" with default m=c(2,2) => cubic B-spline margins + 2nd-order
-    // penalty, matching gam's te() margin construction (see module doc).
+    // ---- fit mgcv's P-spline baseline and natural-cubic diagnostic --------
     let r = run_r(
         &[
             Column::new("x", &x),
@@ -152,6 +152,10 @@ fn gam_poisson_tensor_recovers_true_mean_surface() {
                  family = poisson(link = "log"), method = "REML")
         emit("fitted", as.numeric(fitted(m)))
         emit("edf", sum(m$edf))
+        natural <- gam(y ~ te(x, z, bs = "cr", k = c(6, 6)), data = df,
+                       family = poisson(link = "log"), method = "REML")
+        emit("natural_fitted", as.numeric(fitted(natural)))
+        emit("natural_edf", sum(natural$edf))
         "#,
     );
     let mgcv_mean = r.vector("fitted");
@@ -164,6 +168,12 @@ fn gam_poisson_tensor_recovers_true_mean_surface() {
     // each smoother's RMSE to the truth on the response scale.
     let gam_err = rmse(&gam_mean, &mu_true);
     let mgcv_err = rmse(mgcv_mean, &mu_true);
+    let natural_err = rmse(r.vector("natural_fitted"), &mu_true);
+    eprintln!(
+        "Poisson tensor basis diagnostic: mgcv_ps_rmse={mgcv_err:.8} \
+         mgcv_cr_rmse={natural_err:.8} mgcv_cr_edf={:.5}",
+        r.scalar("natural_edf")
+    );
 
     let mu_min = mu_true.iter().copied().fold(f64::INFINITY, f64::min);
     let mu_max = mu_true.iter().copied().fold(f64::NEG_INFINITY, f64::max);

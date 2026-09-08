@@ -1,0 +1,3 @@
+poisson=true fit_refused=positive smoothing cubature proposal extends beyond the resolved rho domain
+family=gaussian formula=y ~ ti(x, z, k=6) edf=Some(3.895003418879309) rho=[3.5633339048670747, 20.64280313128178, 2.109861317067467], shape=[3], strides=[1], layout=CFcf (0xf), const ndim=1 objective=Some(206.8624569165742)
+Error: "at least one tensor fit refused; observations retained for reference audit"
