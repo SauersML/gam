@@ -55,15 +55,13 @@ fn words(values: impl IntoIterator<Item = f64>) -> String {
         .join(",")
 }
 
-#[test]
-fn thread_count_fit_child() {
-    let Some(kind) = std::env::var_os("GAM_REPRO_CHILD") else {
-        return;
-    };
-    let kind = kind.to_string_lossy();
+/// Fit one fixture and print the exact bit patterns of its user-visible
+/// results. Each fixture is its own `#[test]` so the parent can address it by
+/// name with `--exact`; run directly, it is simply a fit that must converge.
+fn print_child_result(kind: &str) {
     gam::init_parallelism();
     let mut config = FitConfig::default();
-    let formula = match kind.as_ref() {
+    let formula = match kind {
         "gaussian" => {
             config.family = Some("gaussian".into());
             "y ~ s(x, k=10)"
@@ -80,7 +78,7 @@ fn thread_count_fit_child() {
         }
         _ => panic!("unknown child fixture"),
     };
-    let result = fit_from_formula(formula, &data(&kind), &config).expect("fit must converge");
+    let result = fit_from_formula(formula, &data(kind), &config).expect("fit must converge");
     let fit = match &result {
         FitResult::Standard(result) => &result.fit,
         FitResult::SurvivalTransformation(result) => &result.fit,
@@ -99,6 +97,21 @@ fn thread_count_fit_child() {
 }
 
 #[test]
+fn thread_count_fit_child_gaussian() {
+    print_child_result("gaussian");
+}
+
+#[test]
+fn thread_count_fit_child_binomial() {
+    print_child_result("binomial");
+}
+
+#[test]
+fn thread_count_fit_child_survival() {
+    print_child_result("survival");
+}
+
+#[test]
 fn fits_are_bit_identical_across_rayon_thread_counts_and_runs() {
     let exe = std::env::current_exe().expect("current test binary");
     for kind in ["gaussian", "binomial", "survival"] {
@@ -106,9 +119,8 @@ fn fits_are_bit_identical_across_rayon_thread_counts_and_runs() {
         for threads in [1, 2, 8] {
             for run in 0..2 {
                 let output = Command::new(&exe)
-                    .args(["--exact", "thread_count_fit_child", "--nocapture"])
+                    .args(["--exact", &format!("thread_count_fit_child_{kind}"), "--nocapture"])
                     .env("RAYON_NUM_THREADS", threads.to_string())
-                    .env("GAM_REPRO_CHILD", kind)
                     .output()
                     .expect("launch isolated fit process");
                 assert!(
