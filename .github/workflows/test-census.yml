@@ -24,6 +24,8 @@ jobs:
           python-version: '3.12'
       - name: Verify the census detects planted losses
         run: python -m unittest discover -s scripts/tests -p test_test_census.py -v
+      - name: Verify source reachability removal policy
+        run: python -m unittest discover -s scripts/tests -p test_source_removal_guard.py -v
       - name: Positive control against the sweep this gate exists for
         # A census that has stopped detecting anything is byte-identical to a
         # census over a tree that lost nothing, so point the instrument at a
@@ -71,6 +73,7 @@ jobs:
           set -euo pipefail
           git fetch --no-tags --depth=1 origin "$BASE_SHA"
           python scripts/test_census.py --base "$BASE_SHA" --head "$HEAD_SHA" --output test-census.json
+          python scripts/source_removal_guard.py --base "$BASE_SHA" --head "$HEAD_SHA"
       - uses: actions/upload-artifact@v4
         if: always()
         with:
