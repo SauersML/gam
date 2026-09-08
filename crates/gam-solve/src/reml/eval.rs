@@ -608,6 +608,16 @@ fn sigma_step_to_rho_box(rho: &Array1<f64>, direction: &Array1<f64>) -> f64 {
 }
 
 impl<'a> RemlState<'a> {
+    /// Integrate the sampler's declared density, including the distribution
+    /// prior and precision-to-log-precision Jacobian, rather than treating
+    /// REML's fitting criterion as a normalized posterior.
+    fn compute_rho_posterior_cost_uncharged(
+        &self,
+        rho: &Array1<f64>,
+    ) -> Result<f64, EstimationError> {
+        Ok(self.compute_cost_uncharged(rho)? + self.rho_prior_distribution_correction(rho)?.0)
+    }
+
     /// Place one sigma-point node at the criterion level the cubature rule
     /// assumes it occupies, rather than at the step a possibly-inapplicable
     /// quadratic model implies.
@@ -651,7 +661,7 @@ impl<'a> RemlState<'a> {
 
         let target = PROFILE_SIGMA_RISE;
         let mut step = wald_step.min(box_limit);
-        let mut rise = self.compute_cost_uncharged(&at(step))? - centre_cost;
+        let mut rise = self.compute_rho_posterior_cost_uncharged(&at(step))? - centre_cost;
         let mut evaluations = 1usize;
         // Bracket: `lo` is the largest step known to undershoot the target,
         // `hi` the smallest known to overshoot it. `V(ρ̂) − V(ρ̂) = 0` seeds
@@ -739,7 +749,7 @@ impl<'a> RemlState<'a> {
                 break;
             }
             step = next;
-            rise = self.compute_cost_uncharged(&at(step))? - centre_cost;
+            rise = self.compute_rho_posterior_cost_uncharged(&at(step))? - centre_cost;
             evaluations += 1;
         }
         if closeness(rise) < closeness(best.1) {
@@ -1034,7 +1044,11 @@ impl<'a> RemlState<'a> {
                     &outer_hessian,
                     &mut |rho| {
                         self.without_persistent_warm_start_store(|| self.compute_cost(rho).ok())
-                            .map(|cost| cost + self.rho_prior_distribution_correction(rho).0)
+                            .and_then(|cost| {
+                                self.rho_prior_distribution_correction(rho)
+                                    .ok()
+                                    .map(|(prior_cost, _)| cost + prior_cost)
+                            })
                     },
                     &mut |rho| {
                         self.without_persistent_warm_start_store(|| {
@@ -1044,10 +1058,12 @@ impl<'a> RemlState<'a> {
                             // solve and IFT state are shared by construction.
                             self.compute_cost_and_gradient(rho).ok()
                         })
-                        .map(|(cost, gradient)| {
-                            let (prior_cost, prior_gradient) =
-                                self.rho_prior_distribution_correction(rho);
-                            (cost + prior_cost, gradient + prior_gradient)
+                        .and_then(|(cost, gradient)| {
+                            self.rho_prior_distribution_correction(rho)
+                                .ok()
+                                .map(|(prior_cost, prior_gradient)| {
+                                    (cost + prior_cost, gradient + prior_gradient)
+                                })
                         })
                     },
                 ))
@@ -1320,7 +1336,7 @@ impl<'a> RemlState<'a> {
         // correction that is already computed and already correct, and #2601
         // records what happens when a failure to refine the *uncertainty* is
         // allowed to destroy a converged point estimate.
-        let centre_cost = match self.compute_cost_uncharged(final_rho) {
+        let centre_cost = match self.compute_rho_posterior_cost_uncharged(final_rho) {
             Ok(cost) if cost.is_finite() => cost,
             Ok(_) => {
                 return self.finalize_smoothing_outcome(first_order_numerical(
@@ -1385,7 +1401,7 @@ impl<'a> RemlState<'a> {
         }
         let mut proposal_rises = Vec::with_capacity(sigma_points.len());
         for point in &sigma_points {
-            match self.compute_cost_uncharged(point) {
+            match self.compute_rho_posterior_cost_uncharged(point) {
                 Ok(cost) if cost.is_finite() => proposal_rises.push(cost - centre_cost),
                 Ok(_) => {
                     return self.finalize_smoothing_outcome(first_order_numerical(

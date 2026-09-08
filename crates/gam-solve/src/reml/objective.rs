@@ -3339,33 +3339,6 @@ mod tk_math_tests {
     use num_dual::{Dual3_64, Dual64, DualNum, third_derivative};
 
     #[test]
-    pub(crate) fn rho_distribution_default_mask_marks_only_flat_coordinates() {
-        // Whole-Flat → every coordinate needs a distribution default.
-        assert_eq!(
-            rho_distribution_default_coord_mask(&RhoPrior::Flat, 3),
-            vec![true; 3]
-        );
-        // Independent → only mathematically flat holes are defaults.
-        let indep = RhoPrior::Independent(vec![
-            RhoPrior::Flat,
-            RhoPrior::Normal { mean: 0.0, sd: 1.0 },
-            RhoPrior::GammaPrecision {
-                shape: 1.0,
-                rate: 0.0,
-            },
-        ]);
-        assert_eq!(
-            rho_distribution_default_coord_mask(&indep, 3),
-            vec![true, false, true]
-        );
-        // An explicitly-configured scalar prior defaults nothing.
-        assert_eq!(
-            rho_distribution_default_coord_mask(&RhoPrior::Normal { mean: 0.0, sd: 1.0 }, 2,),
-            vec![false; 2]
-        );
-    }
-
-    #[test]
     pub(crate) fn flat_deterministic_criterion_is_zero_for_every_rho_2623() {
         use crate::rho_prior_eval::{InvalidPriorPolicy, evaluate};
         let rho = array![-30.0, -20.0, -4.7, 0.0, 30.0];

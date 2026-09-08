@@ -1400,43 +1400,6 @@ pub(crate) const RHO_DISTRIBUTION_PC_UPPER: f64 = 10.0;
 
 pub(crate) const RHO_DISTRIBUTION_PC_TAIL_PROB: f64 = 0.01;
 
-/// A Gamma prior on the physical precision `λ` with shape `1` and rate `0` has
-/// density proportional to a constant in `λ`. Under the deterministic
-/// MAP-in-`λ` REML convention used for [`RhoPrior::GammaPrecision`], its
-/// negative-log contribution is exactly zero (cost/gradient/Hessian all vanish),
-/// so it is semantically the same "unset/flat" coordinate as [`RhoPrior::Flat`].
-///
-/// Keep this equivalence explicit at the prior-policy boundary. Otherwise an
-/// `Independent([GammaPrecision { shape: 1, rate: 0 }])` is treated as an
-/// explicitly configured prior while `Flat` is treated as an unset coordinate,
-/// sending mathematically identical fits through different default-prior and
-/// seed-selection branches.
-#[inline]
-pub(crate) fn is_unset_flat_rho_prior(prior: &RhoPrior) -> bool {
-    match prior {
-        RhoPrior::Flat => true,
-        RhoPrior::GammaPrecision { shape, rate } => *shape == 1.0 && *rate == 0.0,
-        _ => false,
-    }
-}
-
-/// Per-coordinate `true` where a distributional consumer must derive the proper
-/// default rather than use an explicitly configured prior. A coordinate needs
-/// that default exactly when the caller left it mathematically flat:
-/// `Flat`, or the equivalent `GammaPrecision { shape: 1, rate: 0 }`, either as a
-/// whole prior or as holes in an `Independent` prior. Returned per-`ρ`-coordinate
-/// so the sampling boundary can add a proper density without changing fitting.
-pub(crate) fn rho_distribution_default_coord_mask(configured: &RhoPrior, len: usize) -> Vec<bool> {
-    match configured {
-        RhoPrior::Flat => vec![true; len],
-        RhoPrior::Independent(priors) if priors.len() == len => {
-            priors.iter().map(is_unset_flat_rho_prior).collect()
-        }
-        _ => vec![false; len],
-    }
-}
-
-
 #[inline]
 pub(crate) fn reml_fixed_glm_dispersion(
     likelihood: &GlmLikelihoodSpec,

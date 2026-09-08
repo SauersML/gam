@@ -69,6 +69,65 @@ pub(crate) fn rho_distribution_default_terms(theta: f64, r: f64) -> (f64, f64) {
     (cost, gradient)
 }
 
+/// Convert the fitting objective's prior contribution to a density with respect
+/// to `dρ`. Numerical integration and sampling must use this same correction.
+/// Unset coordinates receive the existing proper PC distribution prior; an
+/// explicit Gamma prior on precision additionally needs `dλ/dρ = exp(ρ)`.
+/// Normal and PC priors are already expressed with respect to `dρ`.
+pub(crate) fn distribution_correction(
+    prior: &RhoPrior,
+    rho: &Array1<f64>,
+    default_pc_rate: f64,
+) -> Result<(f64, Array1<f64>), RhoPriorError> {
+    if !default_pc_rate.is_finite() || default_pc_rate <= 0.0 {
+        return Err(RhoPriorError::constraint_violation(
+            "rho distribution requires a finite positive default PC rate".into(),
+        ));
+    }
+    let independent = match prior {
+        RhoPrior::Independent(priors) => {
+            if priors.len() != rho.len() {
+                return Err(RhoPriorError::dimension_mismatch(format!(
+                    "Independent rho prior length mismatch: got {}, expected {}",
+                    priors.len(),
+                    rho.len()
+                )));
+            }
+            Some(priors)
+        }
+        _ => None,
+    };
+    let mut cost = 0.0;
+    let mut gradient = Array1::zeros(rho.len());
+    for (index, &r) in rho.iter().enumerate() {
+        let scalar = independent.map_or(prior, |priors| &priors[index]);
+        // Share the fitting engine's shape, parameter and scalar-prior checks.
+        scalar_terms(scalar, r, "rho distribution prior")?;
+        let (value, derivative) = match scalar {
+            RhoPrior::Flat => rho_distribution_default_terms(default_pc_rate, r),
+            RhoPrior::GammaPrecision { shape, rate } if *shape == 1.0 && *rate == 0.0 => {
+                rho_distribution_default_terms(default_pc_rate, r)
+            }
+            RhoPrior::GammaPrecision { rate, .. } if *rate == 0.0 => {
+                return Err(RhoPriorError::constraint_violation(
+                    "a zero-rate Gamma precision prior does not define a proper rho distribution"
+                        .into(),
+                ));
+            }
+            RhoPrior::GammaPrecision { .. } => (-r, -1.0),
+            RhoPrior::Normal { .. } | RhoPrior::PenalizedComplexity { .. } => (0.0, 0.0),
+            RhoPrior::Independent(_) => {
+                return Err(RhoPriorError::constraint_violation(
+                    "rho distribution prior must not contain nested Independent priors".into(),
+                ));
+            }
+        };
+        cost += value;
+        gradient[index] = derivative;
+    }
+    Ok((cost, gradient))
+}
+
 /// What a caller wants done when the configured prior is malformed (e.g. a
 /// `Normal` with non-positive `sd`, a `GammaPrecision` with non-positive
 /// `shape`, an `Independent` whose length disagrees with `ρ`, or a nested
@@ -263,6 +322,73 @@ pub fn evaluate_strict(prior: &RhoPrior, rho: &Array1<f64>) -> Result<RhoPriorEv
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn distribution_correction_uses_precision_jacobian_1561() {
+        let prior = RhoPrior::GammaPrecision {
+            shape: 3.0,
+            rate: 2.0,
+        };
+        for r in [-4.0_f64, 0.0, 2.0] {
+            let rho = Array1::from_vec(vec![r]);
+            let criterion = evaluate_strict(&prior, &rho).expect("valid Gamma prior");
+            let (cost, gradient) =
+                distribution_correction(&prior, &rho, 0.5).expect("proper Gamma density");
+            // p(λ) ∝ λ² exp(-2λ), hence p(ρ) ∝ exp(3ρ - 2 exp(ρ)).
+            approx(criterion.cost + cost, 2.0 * r.exp() - 3.0 * r);
+            approx(criterion.gradient[0] + gradient[0], 2.0 * r.exp() - 3.0);
+        }
+    }
+
+    #[test]
+    fn distribution_correction_preserves_coordinate_and_flat_semantics_1561() {
+        let theta = 0.5;
+        let rho = Array1::from_vec(vec![-1.0, 0.0, 2.0]);
+        let flat_gamma = RhoPrior::GammaPrecision {
+            shape: 1.0,
+            rate: 0.0,
+        };
+        let flat = distribution_correction(&RhoPrior::Flat, &rho, theta).unwrap();
+        assert_eq!(
+            flat,
+            distribution_correction(&flat_gamma, &rho, theta).unwrap()
+        );
+        let priors = [
+            RhoPrior::Flat,
+            RhoPrior::Normal { mean: 2.0, sd: 3.0 },
+            flat_gamma,
+        ];
+        let (cost, gradient) =
+            distribution_correction(&RhoPrior::Independent(priors.to_vec()), &rho, theta).unwrap();
+        let mut expected = 0.0;
+        for (index, prior) in priors.iter().enumerate() {
+            let (c, g) =
+                distribution_correction(prior, &Array1::from_vec(vec![rho[index]]), theta).unwrap();
+            expected += c;
+            approx(gradient[index], g[0]);
+        }
+        approx(cost, expected);
+        approx(gradient[1], 0.0);
+    }
+
+    #[test]
+    fn distribution_correction_rejects_improper_and_malformed_priors_1561() {
+        let rho = Array1::from_vec(vec![1.0]);
+        for prior in [
+            RhoPrior::GammaPrecision {
+                shape: 2.0,
+                rate: 0.0,
+            },
+            RhoPrior::Normal {
+                mean: 0.0,
+                sd: -1.0,
+            },
+            RhoPrior::Independent(vec![]),
+            RhoPrior::Independent(vec![RhoPrior::Independent(vec![RhoPrior::Flat])]),
+        ] {
+            assert!(distribution_correction(&prior, &rho, 0.5).is_err());
+        }
+    }
 
     pub(crate) fn approx(a: f64, b: f64) {
         assert!((a - b).abs() <= 1e-12, "expected {a} ~= {b}");

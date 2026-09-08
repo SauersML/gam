@@ -3354,11 +3354,9 @@ impl<'a> RemlState<'a> {
     /// a density: a flat ρ posterior is improper on a finite λ=∞ face.
     ///
     /// `RHO_DISTRIBUTION_PC_UPPER` and `RHO_DISTRIBUTION_PC_TAIL_PROB` calibrate
-    /// the weak PC default for exactly this purpose. This returns the weak PC
-    /// contribution on defaulted coordinates and zero elsewhere, so a sampler
-    /// can add it to the criterion it is handed and recover a proper
-    /// distribution WITHOUT changing the criterion itself. Nothing on the
-    /// certification path calls this.
+    /// the weak PC default for exactly this purpose. Explicit Gamma precision
+    /// priors also need the log-precision Jacobian. Every distribution consumer
+    /// adds the same correction to the fitting criterion.
     ///
     /// Returned as `(cost, gradient)` only: the ρ-posterior samplers consume a
     /// log-density and its gradient, and no consumer of this correction needs
@@ -3366,13 +3364,7 @@ impl<'a> RemlState<'a> {
     pub(crate) fn rho_prior_distribution_correction(
         &self,
         rho: &Array1<f64>,
-    ) -> (f64, Array1<f64>) {
-        let mask = rho_distribution_default_coord_mask(&self.rho_prior, rho.len());
-        let mut cost = 0.0;
-        let mut gradient = Array1::<f64>::zeros(rho.len());
-        if !mask.iter().any(|&d| d) {
-            return (cost, gradient);
-        }
+    ) -> Result<(f64, Array1<f64>), EstimationError> {
         // The SAME weight anchoring the criterion's own prior evaluation uses
         // (#877), so the correction is taken at the coordinate the terms it
         // corrects were evaluated at.
@@ -3381,16 +3373,11 @@ impl<'a> RemlState<'a> {
             RHO_DISTRIBUTION_PC_UPPER,
             RHO_DISTRIBUTION_PC_TAIL_PROB,
         );
-        for (idx, &is_default) in mask.iter().enumerate() {
-            if !is_default {
-                continue;
-            }
-            let (coord_cost, coord_grad) =
-                crate::rho_prior_eval::rho_distribution_default_terms(theta, rho[idx] - anchor);
-            cost += coord_cost;
-            gradient[idx] += coord_grad;
-        }
-        (cost, gradient)
+        let anchored = rho.mapv(|r| r - anchor);
+        crate::rho_prior_eval::distribution_correction(&self.rho_prior, &anchored, theta)
+            .map_err(|error| EstimationError::TrialPointRefused {
+                reason: format!("invalid smoothing posterior prior: {error:?}"),
+            })
     }
 
     /// Emit the configured ρ-prior as a criterion atom after every REML/LAML
