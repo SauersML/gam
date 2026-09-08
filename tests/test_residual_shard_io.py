@@ -1,6 +1,6 @@
 """Roundtrip + manifest + subsample tests for the sharded bf16 harvest format.
 
-Exercises examples/residual_shard_io.py directly (no model / GPU needed):
+Exercises experiments/residual_shard_io.py directly (no model / GPU needed):
 synthetic activations through ShardWriter across several shards, read back via
 ShardReader, and verify bit-exact bf16 roundtrip, manifest correctness, and
 deterministic stratified subsampling.
@@ -15,7 +15,7 @@ import numpy as np
 import pytest
 
 sys.path.insert(
-    0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "examples")
+    0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "experiments")
 )
 
 import residual_shard_io as rs  # noqa: E402
