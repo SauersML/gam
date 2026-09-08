@@ -59,7 +59,7 @@ Sources: [issue and original deployment plan](https://github.com/SauersML/gam/is
 | Removed hand-oracle coverage | Independent replacement for each still-live channel, not a comparison of one lowering with itself | Pending |
 | M=32 complete canonical fourth-order coverage without stack overflow | Executed bounded-stack live-route/canonical test, explicit matrix coverage, no width refusal | Current source and runtime audit pending |
 | Moment-order, implicit-lift, heap and CUDA tile costs | Measurements covering the live changes, including common widths at and below 32 | Pending; isolated primitive wins cannot establish total path speed |
-| GPU initialization error distinguishes memory headroom from missing runtime | Current typed failure propagation and behavior tests | Current source and runtime audit pending |
+| GPU initialization error distinguishes memory headroom from missing runtime | Current typed failure propagation and behavior tests | Verified at the runtime policy boundary on MSI: zero-memory present runtime survives Auto/Required resolution; allocation fault retains its typed diagnosis |
 
 ## Validation record
 
@@ -113,3 +113,13 @@ wired `release_measure_bms_empirical_third_fourth_fixed_vs_dynamic_932` test.
 No local compilation or test execution is used. This validation checks the
 candidate benchmark change; it does not certify unrelated uncommitted files
 or discharge the rest of this table.
+
+The GPU runtime policy regression
+`exhausted_memory_does_not_erase_a_present_runtime_932` passed on MSI along with
+all six existing policy-resolution tests in the standard release profile.
+It injects a present device with zero free memory and a zero memory budget,
+checks that both Auto and Required preserve that runtime, and separately checks
+that `CUDA_ERROR_OUT_OF_MEMORY` remains a `DriverCallFailed` diagnosis. This
+tests the actual policy resolver; it does not claim a physical GPU allocation
+or end-to-end throughput measurement. Log:
+`.buildd/issue932-gpu-memory-contract.log`.

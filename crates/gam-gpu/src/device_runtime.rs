@@ -764,6 +764,53 @@ mod policy_resolution_contract_tests {
     }
 
     #[test]
+    fn exhausted_memory_does_not_erase_a_present_runtime_932() {
+        let device = GpuDeviceInfo {
+            ordinal: 0,
+            name: "memory-exhausted fixture".to_string(),
+            capability: crate::device::GpuCapability::from_compute_capability(8, 0),
+            sm_count: 1,
+            max_threads_per_sm: 2048,
+            max_shared_mem_per_block: 48 * 1024,
+            l2_cache_bytes: 1024 * 1024,
+            total_mem_bytes: 1024 * 1024 * 1024,
+            free_mem_bytes: 0,
+            ecc_enabled: false,
+            integrated: false,
+            mig_mode: false,
+        };
+        let runtime = GpuRuntime {
+            memory_budget_bytes: device.memory_budget_bytes(),
+            devices: vec![device.clone()],
+            device,
+            policy: GpuDispatchPolicy::default(),
+        };
+        assert_eq!(runtime.memory_budget_bytes, 0);
+        for policy in [GpuPolicy::Auto, GpuPolicy::Required] {
+            let resolved = GpuRuntime::resolve_availability(
+                policy,
+                Ok(GpuAvailabilityRef::Available(&runtime)),
+            )
+            .expect("memory pressure is not missing hardware")
+            .expect("the present runtime must survive resolution");
+            assert!(std::ptr::eq(resolved, &runtime));
+
+            let error = GpuRuntime::resolve_availability(
+                policy,
+                Err(GpuError::DriverCallFailed {
+                    reason: "CUDA_ERROR_OUT_OF_MEMORY".to_string(),
+                }),
+            )
+            .expect_err("allocation faults must retain their diagnosis");
+            assert!(matches!(
+                error,
+                GpuError::DriverCallFailed { ref reason }
+                    if reason == "CUDA_ERROR_OUT_OF_MEMORY"
+            ));
+        }
+    }
+
+    #[test]
     fn required_turns_only_typed_absence_into_required_unavailable() {
         let absence = GpuAbsence::DriverUnavailable {
             reason: "synthetic missing driver".to_string(),
