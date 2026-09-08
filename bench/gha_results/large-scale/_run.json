@@ -2,12 +2,12 @@
   "workflow": "Large-scale",
   "publish_job_status": "success",
   "publish_job_status_note": "status of the job that PUBLISHED these results, not the conclusion of run_id -- this job is part of that run, so the run has not concluded here",
-  "run_id": "34163751084",
-  "run_number": "922",
+  "run_id": "34188503553",
+  "run_number": "923",
   "run_attempt": "1",
   "event": "schedule",
   "ref": "refs/heads/main",
-  "sha": "17fd4cc5046c7c07b52a3ecc19950927e50b757d",
-  "completed_utc": "2026-09-07T21:46:30Z",
-  "run_url": "https://github.com/SauersML/gam/actions/runs/34163751084"
+  "sha": "82974c37f4b885e071481ea7a25a0c22bf5230c8",
+  "completed_utc": "2026-09-08T05:01:30Z",
+  "run_url": "https://github.com/SauersML/gam/actions/runs/34188503553"
 }
