@@ -23,15 +23,23 @@ use crate::{PyObject, py_value_error};
 )]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct EuclideanManifold {
-    #[pyo3(get, set)]
+    #[pyo3(get)]
     dim: i64,
 }
 
 #[pymethods]
 impl EuclideanManifold {
     #[new]
-    fn new(dim: i64) -> Self {
-        Self { dim }
+    fn new(dim: i64) -> PyResult<Self> {
+        validate_positive_dimension("EuclideanManifold.dim", dim)?;
+        Ok(Self { dim })
+    }
+
+    #[setter]
+    fn set_dim(&mut self, dim: i64) -> PyResult<()> {
+        validate_positive_dimension("EuclideanManifold.dim", dim)?;
+        self.dim = dim;
+        Ok(())
     }
 
     fn __repr__(&self) -> String {
@@ -87,15 +95,23 @@ impl CircleManifold {
 )]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct SphereManifold {
-    #[pyo3(get, set)]
+    #[pyo3(get)]
     intrinsic_dim: i64,
 }
 
 #[pymethods]
 impl SphereManifold {
     #[new]
-    fn new(intrinsic_dim: i64) -> Self {
-        Self { intrinsic_dim }
+    fn new(intrinsic_dim: i64) -> PyResult<Self> {
+        validate_positive_dimension("SphereManifold.intrinsic_dim", intrinsic_dim)?;
+        Ok(Self { intrinsic_dim })
+    }
+
+    #[setter]
+    fn set_intrinsic_dim(&mut self, intrinsic_dim: i64) -> PyResult<()> {
+        validate_positive_dimension("SphereManifold.intrinsic_dim", intrinsic_dim)?;
+        self.intrinsic_dim = intrinsic_dim;
+        Ok(())
     }
 
     fn __repr__(&self) -> String {
@@ -121,15 +137,23 @@ impl SphereManifold {
 )]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct TorusManifold {
-    #[pyo3(get, set)]
+    #[pyo3(get)]
     dim: i64,
 }
 
 #[pymethods]
 impl TorusManifold {
     #[new]
-    fn new(dim: i64) -> Self {
-        Self { dim }
+    fn new(dim: i64) -> PyResult<Self> {
+        validate_positive_dimension("TorusManifold.dim", dim)?;
+        Ok(Self { dim })
+    }
+
+    #[setter]
+    fn set_dim(&mut self, dim: i64) -> PyResult<()> {
+        validate_positive_dimension("TorusManifold.dim", dim)?;
+        self.dim = dim;
+        Ok(())
     }
 
     fn __repr__(&self) -> String {
@@ -146,6 +170,15 @@ impl TorusManifold {
         out.set_item("dim", self.dim)?;
         Ok(out.into_any().unbind())
     }
+}
+
+fn validate_positive_dimension(name: &str, dimension: i64) -> PyResult<()> {
+    if dimension < 1 {
+        return Err(py_value_error(format!(
+            "{name} must be a positive integer (got {dimension})"
+        )));
+    }
+    Ok(())
 }
 
 /// Validate the `1 <= k <= n` domain shared by the constrained-frame

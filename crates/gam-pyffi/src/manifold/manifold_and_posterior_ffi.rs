@@ -919,7 +919,12 @@ fn cross_fit_shared_precision_groups_json_impl(request_json: &str) -> Result<Str
                 dims.into_iter().collect::<Vec<_>>()
             ));
         }
-        let dimension = *dims.iter().next().expect("dimension checked above");
+        let dimension = dims.iter().next().copied().ok_or_else(|| {
+            format!(
+                "shared precision group {:?} did not establish a coefficient dimension",
+                group.name
+            )
+        })?;
         let numerator = fit_entries.len() as f64 * dimension as f64 + 2.0 * (group.shape - 1.0);
         let denominator = quadratic_sum + 2.0 * group.rate;
         if numerator <= 0.0 {
