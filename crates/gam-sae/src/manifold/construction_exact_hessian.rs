@@ -1250,6 +1250,7 @@ impl SaeManifoldTerm {
     /// recovering the plain case. The softmax, ordered Beta--Bernoulli, and ARD
     /// deltas are logit/coord-space prior curvatures and carry no output metric,
     /// so they are path-independent.
+    #[cfg_attr(not(test), expect(dead_code, reason = "exercised by the exact-Hessian test target"))]
     pub(crate) fn apply_exact_hessian_minus_b(
         &self,
         rho: &SaeManifoldRho,
@@ -2012,6 +2013,7 @@ impl SaeManifoldTerm {
     /// difference — the border half of both applies is already raw, because its
     /// Schur term and its `H_βt Φ(B_tt)⁻¹ H_tβ` restoration share one conditioned
     /// factor and cancel algebraically.
+    #[cfg_attr(not(test), expect(dead_code, reason = "exercised by the matrix-free Hessian test target"))]
     pub(crate) fn apply_exact_hessian_matrix_free(
         &self,
         rho: &SaeManifoldRho,

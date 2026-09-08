@@ -506,12 +506,22 @@ pub fn observe_atlas_topology(atlas: &LocalAtlas) -> Result<AtlasTopologyReadout
         }
     }
     let covered_rows = multiplicity.len();
-    let max_cover_multiplicity = multiplicity.values().copied().max().unwrap_or(0);
-    let mean_cover_multiplicity = if covered_rows == 0 {
+    let ambient_max_cover_multiplicity = multiplicity.values().copied().max().unwrap_or(0);
+    let ambient_mean_cover_multiplicity = if covered_rows == 0 {
         0.0
     } else {
         multiplicity.values().sum::<usize>() as f64 / covered_rows as f64
     };
+    let (intrinsic_max, intrinsic_mean) = atlas.intrinsic_cover_multiplicity();
+    let (max_cover_multiplicity, mean_cover_multiplicity) =
+        if intrinsic_max > ambient_max_cover_multiplicity {
+            (intrinsic_max, intrinsic_mean)
+        } else {
+            (
+                ambient_max_cover_multiplicity,
+                ambient_mean_cover_multiplicity,
+            )
+        };
     // Lebesgue covering dimension: a good cover of a d-manifold refines to
     // multiplicity ≤ d + 1. Applied to the realized mean rather than to 1, because
     // this cover is deliberately unrefined — the builder grows every patch past its
@@ -810,7 +820,7 @@ mod tests_2280 {
     use crate::manifold::local_charts::LocalAtlasConfig;
     use crate::manifold::tests_topology_fixtures::{
         circle, cylinder_strip, embedded_plane, mobius_strip, open_arc, sphere, spherical_band,
-        torus, trefoil_knot,
+        swiss_roll, torus, trefoil_knot,
     };
     use ndarray::{Array2, ArrayView2};
 
@@ -852,6 +862,29 @@ mod tests_2280 {
         let inv = readout.invariants();
         assert_eq!(inv.betti.b1, 0, "{readout}");
         assert_eq!(inv.euler_characteristic, 1, "{readout}");
+    }
+
+    /// Regression for the sampled-cover hole localized in the issue thread.  With
+    /// ambient-distance patches the four inner-end charts centered at rows
+    /// 0/13/131/143 formed a real `H1` representative even though the underlying
+    /// sheet is contractible.  The independent intrinsic realization exposes a
+    /// cover pile-up at that fold, so promotion is honestly refused instead of
+    /// treating the ambient cover's accidental cycle as a cylinder.
+    #[test]
+    fn dense_swiss_roll_is_never_promoted_as_cylinder_2280() {
+        let roll = swiss_roll(80, 16);
+        let first = read(roll.view(), 2);
+        let second = read(roll.view(), 2);
+
+        assert_eq!(
+            first, second,
+            "atlas construction and readout must be deterministic"
+        );
+        assert_ne!(
+            first.observed_manifold(),
+            Some(GraphCompressionKind::Cylinder),
+            "a rolled contractible sheet may be named a disk or honestly refused, but must never be promoted as a cylinder: {first}"
+        );
     }
 
     /// THE ambient-embedding test. A trefoil knot is a smooth `S¹` whose three

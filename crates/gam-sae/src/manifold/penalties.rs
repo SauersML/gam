@@ -2158,6 +2158,7 @@ impl SaeManifoldTerm {
     /// The smoothness Gram `λ S ⊗ I`, the data-fit β Gram (β enters the
     /// reconstruction linearly, so Gauss–Newton IS exact there), and the ARD
     /// prior (a t-tier object) install no majorizer and appear in neither side.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn decoder_prior_beta_hvp_pair(
         &self,
         penalty_scale: f64,
