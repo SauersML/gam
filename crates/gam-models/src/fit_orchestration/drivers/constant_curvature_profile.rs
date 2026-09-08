@@ -61,8 +61,8 @@ fn constant_curvature_psi_profile_value(
         None,
         None,
     )?;
-    let rho_at_bound = (fit.rho - gam_solve::gaussian_reml::RHO_LOWER).abs() <= 1.0e-9
-        || (fit.rho - gam_solve::gaussian_reml::RHO_UPPER).abs() <= 1.0e-9;
+    let (rho_lower, rho_upper) = fit.rho_domain;
+    let rho_at_bound = (fit.rho - rho_lower).abs() <= 1.0e-9 || (fit.rho - rho_upper).abs() <= 1.0e-9;
     Ok((fit.reml_score, rho_at_bound))
 }
 

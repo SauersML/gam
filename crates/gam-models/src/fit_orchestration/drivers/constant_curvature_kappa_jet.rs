@@ -396,8 +396,8 @@ fn profiled_gaussian_reml_psi_jet(
     // the ρ curvature is unusable the profile's second derivative is not
     // identified and this refuses rather than substituting a number.
     let hess_rho = fit.reml_hess_rho;
-    let rho_at_bound = (rho - gam_solve::gaussian_reml::RHO_LOWER).abs() <= 1.0e-9
-        || (rho - gam_solve::gaussian_reml::RHO_UPPER).abs() <= 1.0e-9;
+    let rho_at_bound =
+        (rho - fit.rho_domain.0).abs() <= 1.0e-9 || (rho - fit.rho_domain.1).abs() <= 1.0e-9;
     let schur = if rho_at_bound {
         0.0
     } else if hess_rho.is_finite() && hess_rho.abs() > 1.0e-14 {

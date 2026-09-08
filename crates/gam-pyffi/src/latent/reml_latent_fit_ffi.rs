@@ -1229,6 +1229,29 @@ fn gaussian_reml_fit_state_from_pydict(
         .as_array()
         .to_owned();
 
+    let cache = gam::solver::gaussian_reml::GaussianRemlEigenCache {
+        penalty_eigenvalues,
+        eigenvectors,
+        coefficient_basis,
+        xtwx_fingerprint: get(state, "cache_xtwx_fingerprint")?
+            .extract::<u64>()
+            .map_err(|err| err.to_string())?,
+        penalty_fingerprint: get(state, "cache_penalty_fingerprint")?
+            .extract::<u64>()
+            .map_err(|err| err.to_string())?,
+        logdet_xtwx: get(state, "cache_logdet_xtwx")?
+            .extract::<f64>()
+            .map_err(|err| err.to_string())?,
+        logdet_penalty_positive: get(state, "cache_logdet_penalty_positive")?
+            .extract::<f64>()
+            .map_err(|err| err.to_string())?,
+        penalty_rank: get(state, "cache_penalty_rank")?
+            .extract::<usize>()
+            .map_err(|err| err.to_string())?,
+        nullity: get(state, "cache_nullity")?
+            .extract::<usize>()
+            .map_err(|err| err.to_string())?,
+    };
     Ok(gam::solver::gaussian_reml::GaussianRemlMultiResult {
         lambda: get(state, "lambda")?
             .extract::<f64>()
@@ -1261,29 +1284,8 @@ fn gaussian_reml_fit_state_from_pydict(
             .extract::<f64>()
             .map_err(|err| err.to_string())?,
         sigma2,
-        cache: gam::solver::gaussian_reml::GaussianRemlEigenCache {
-            penalty_eigenvalues,
-            eigenvectors,
-            coefficient_basis,
-            xtwx_fingerprint: get(state, "cache_xtwx_fingerprint")?
-                .extract::<u64>()
-                .map_err(|err| err.to_string())?,
-            penalty_fingerprint: get(state, "cache_penalty_fingerprint")?
-                .extract::<u64>()
-                .map_err(|err| err.to_string())?,
-            logdet_xtwx: get(state, "cache_logdet_xtwx")?
-                .extract::<f64>()
-                .map_err(|err| err.to_string())?,
-            logdet_penalty_positive: get(state, "cache_logdet_penalty_positive")?
-                .extract::<f64>()
-                .map_err(|err| err.to_string())?,
-            penalty_rank: get(state, "cache_penalty_rank")?
-                .extract::<usize>()
-                .map_err(|err| err.to_string())?,
-            nullity: get(state, "cache_nullity")?
-                .extract::<usize>()
-                .map_err(|err| err.to_string())?,
-        },
+        rho_domain: cache.resolvability_rho_domain(),
+        cache,
     })
 }
 
@@ -1414,6 +1416,17 @@ fn batched_gaussian_reml_fits_from_pydict(
                 fitted.nrows()
             ));
         }
+        let cache = gam::solver::gaussian_reml::GaussianRemlEigenCache {
+            penalty_eigenvalues: cache_penalty_eigenvalues.slice(s![b, ..]).to_owned(),
+            eigenvectors: cache_eigenvectors.slice(s![b, .., ..]).to_owned(),
+            coefficient_basis: cache_coefficient_basis.slice(s![b, .., ..]).to_owned(),
+            xtwx_fingerprint: cache_xtwx_fingerprints[b],
+            penalty_fingerprint: cache_penalty_fingerprints[b],
+            logdet_xtwx: cache_logdet_xtwx[b],
+            logdet_penalty_positive: cache_logdet_penalty_positive[b],
+            penalty_rank: rank as usize,
+            nullity: nullity as usize,
+        };
         fits.push(Some(gam::solver::gaussian_reml::GaussianRemlMultiResult {
             lambda: lambdas[b],
             rho: rhos[b],
@@ -1428,17 +1441,8 @@ fn batched_gaussian_reml_fits_from_pydict(
             reml_hess_rho: reml_hess_rhos[b],
             edf: edf[b],
             sigma2: sigma2.slice(s![b, ..]).to_owned(),
-            cache: gam::solver::gaussian_reml::GaussianRemlEigenCache {
-                penalty_eigenvalues: cache_penalty_eigenvalues.slice(s![b, ..]).to_owned(),
-                eigenvectors: cache_eigenvectors.slice(s![b, .., ..]).to_owned(),
-                coefficient_basis: cache_coefficient_basis.slice(s![b, .., ..]).to_owned(),
-                xtwx_fingerprint: cache_xtwx_fingerprints[b],
-                penalty_fingerprint: cache_penalty_fingerprints[b],
-                logdet_xtwx: cache_logdet_xtwx[b],
-                logdet_penalty_positive: cache_logdet_penalty_positive[b],
-                penalty_rank: rank as usize,
-                nullity: nullity as usize,
-            },
+            rho_domain: cache.resolvability_rho_domain(),
+            cache,
         }));
     }
     Ok(fits)

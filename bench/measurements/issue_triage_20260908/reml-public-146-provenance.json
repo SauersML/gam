@@ -1,0 +1,22 @@
+{
+  "command": [
+    "timeout",
+    "120",
+    "taskset",
+    "-c",
+    "112-115",
+    ".venv-python312-issues/bin/python",
+    "-m",
+    "pytest",
+    "-q",
+    "tests/test_reml_rank_deficient_penalty_geometry.py",
+    "-k",
+    "block_reml or binding_constraint",
+    "--tb=short",
+    "--show-capture=no",
+    "-ra"
+  ],
+  "extension_sha256": "fad6cf9fabb9c3859f27a8455dbd4b6189da1421e276d2aaaffae864f5b3f299",
+  "exit_code": 0,
+  "elapsed_seconds": 6.9485872980440035
+}

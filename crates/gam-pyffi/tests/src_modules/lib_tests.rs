@@ -1500,6 +1500,7 @@ fn batched_state_round_trip_matches_refit() {
                 nullity: forward.cache_nullities[b] as usize,
             };
             Some(gam::solver::gaussian_reml::GaussianRemlMultiResult {
+                rho_domain: cache.resolvability_rho_domain(),
                 lambda: forward.lambdas[b],
                 rho: forward.rhos[b],
                 coefficients: forward.coefficients.slice(s![b, .., ..]).to_owned(),

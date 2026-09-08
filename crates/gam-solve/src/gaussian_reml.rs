@@ -5,52 +5,13 @@ use gam_linalg::faer_ndarray::{
     FaerCholesky, FaerEigh, default_rrqr_rank_alpha, fast_ab, fast_atb, fast_xt_diag_x,
     fast_xt_diag_y, rrqr_with_permutation,
 };
-use gam_problem::{
-    DeclaredHessianForm, Derivative, HessianValue, OuterEval, StationarityStandard,
-};
+use gam_problem::{DeclaredHessianForm, Derivative, HessianValue, OuterEval, StationarityStandard};
 use gam_terms::construction::CanonicalPenalty;
 use gam_terms::smooth::BlockwisePenalty;
 use ndarray::{Array1, Array2, Array3, ArrayView1, ArrayView2, ArrayView3, Axis, s};
 use opt::{RidgeSchedule, escalate_ridge};
 use rayon::prelude::*;
-use std::sync::Once;
 
-/// One-time warning latch for backward-pass graceful degradation on a
-/// near-singular penalized Hessian `K = XᵀWX + λS`. When `λ_k` saturates
-/// (e.g. 1e10+), `K` becomes effectively rank-deficient and the analytic VJP
-/// cannot be evaluated. Rather than raising, the backward returns zero
-/// gradients of the correct shape: this is the statistically correct
-/// "shrink-out" gradient — when `λ` has saturated, the atom is unused, so
-/// every input's contribution to the loss is zero in the limit.
-static ILL_CONDITIONED_BACKWARD_WARNED: Once = Once::new();
-
-fn warn_ill_conditioned_backward_once(p: usize, d: usize, condition_number: f64) {
-    ILL_CONDITIONED_BACKWARD_WARNED.call_once(|| {
-        log::warn!(
-            "gaussian_reml_fit_backward: K = XᵀWX + λS is near-singular \
-             (p={p}, d={d}, cond≈{condition_number:.2e}); returning zero gradients \
-             for this fit (λ has saturated, atom is effectively unused). \
-             Further occurrences are silent."
-        );
-    });
-}
-
-fn zero_backward_result(n: usize, p: usize, d: usize) -> GaussianRemlBackwardResult {
-    GaussianRemlBackwardResult {
-        grad_x: Array2::<f64>::zeros((n, p)),
-        grad_y: Array2::<f64>::zeros((n, d)),
-        grad_penalty: Array2::<f64>::zeros((p, p)),
-        grad_weights: Array1::<f64>::zeros(n),
-    }
-}
-
-/// Smoothing-parameter search box in log strength. Public because a caller that
-/// differentiates the λ̂ ROOT (the implicit-function channel) must apply the same
-/// interior test this file's own backward VJP applies — an interior premise
-/// checked against a privately duplicated bound is the desync this crate exists
-/// to prevent.
-pub const RHO_LOWER: f64 = -30.0;
-pub const RHO_UPPER: f64 = 30.0;
 const EIGEN_REL_TOL: f64 = 1.0e-10;
 /// Relative first-order convergence certificate for the block-orthogonal
 /// alternation: the largest per-block |dV/drho|, normalized by the score's
@@ -932,6 +893,8 @@ pub struct GaussianRemlWarmStart {
 pub struct GaussianRemlResult {
     pub lambda: f64,
     pub rho: f64,
+    /// The ρ domain the search ran on (#2812); see `GaussianRemlMultiResult`.
+    pub rho_domain: (f64, f64),
     pub coefficients: Array1<f64>,
     pub fitted: Array1<f64>,
     pub reml_score: f64,
@@ -948,6 +911,10 @@ pub struct GaussianRemlResult {
 pub struct GaussianRemlMultiResult {
     pub lambda: f64,
     pub rho: f64,
+    /// The ρ domain the search ran on (#2812): the resolvability interval of
+    /// the penalty against the weighted design, `[ln ε − ln δ_max, −ln ε − ln δ_min]`
+    /// over the positive penalty-range eigenvalues `δ`.
+    pub rho_domain: (f64, f64),
     pub coefficients: Array2<f64>,
     pub fitted: Array2<f64>,
     pub reml_score: f64,
@@ -1024,7 +991,6 @@ impl GaussianRemlNoAllocWorkspace {
             scaled_projected_rhs: Array2::zeros((n_coefficients, n_outputs)),
         }
     }
-
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1441,6 +1407,7 @@ fn scalar_result_from_multi(
     Ok(GaussianRemlResult {
         lambda: result.lambda,
         rho: result.rho,
+        rho_domain: result.rho_domain,
         coefficients: result.coefficients.column(0).to_owned(),
         fitted: result.fitted.column(0).to_owned(),
         reml_score: result.reml_score,
@@ -1512,24 +1479,26 @@ pub fn gaussian_reml_stationary_set(
     }
     let y2 = y.insert_axis(Axis(1));
     let prepared = prepare_gaussian_reml(x, y2.view(), penalty, nullspace_dim, weights, None)?;
+    // #2812: the scalar search runs on the term's own resolvability interval.
+    let (rho_lower, rho_upper) = prepared.cache.resolvability_rho_domain();
     let endpoint_costs = [
-        prepared.evaluate(RHO_LOWER).cost,
-        prepared.evaluate(RHO_UPPER).cost,
+        prepared.evaluate(rho_lower).cost,
+        prepared.evaluate(rho_upper).cost,
     ];
     validate_reml_profile_residuals(
         &prepared.cache,
         prepared.ywy.view(),
         prepared.projected_rhs_squared.view(),
-        RHO_LOWER,
+        rho_lower,
     )?;
     if prepared.cache.penalty_rank == 0 {
         return Ok(GaussianRemlStationarySet {
             roots: Vec::new(),
             root_brackets: Vec::new(),
             root_gradients: Vec::new(),
-            selected_rho: init_rho.unwrap_or(0.0).clamp(RHO_LOWER, RHO_UPPER),
+            selected_rho: init_rho.unwrap_or(0.0).clamp(rho_lower, rho_upper),
             endpoint_costs,
-            rho_window: [RHO_LOWER, RHO_UPPER],
+            rho_window: [rho_lower, rho_upper],
             root_location_resolution: RHO_BRACKET_RESOLUTION,
         });
     }
@@ -1554,7 +1523,13 @@ pub fn gaussian_reml_stationary_set(
             root_brackets.push(root.bracket);
             root_gradients.push(e.grad);
         };
-        enumerate_and_select_rho(&eval, &enclose, init_rho, Some(&mut observer))?
+        enumerate_and_select_rho(
+            &eval,
+            &enclose,
+            init_rho,
+            prepared.cache.resolvability_rho_domain(),
+            Some(&mut observer),
+        )?
     };
     Ok(GaussianRemlStationarySet {
         roots,
@@ -1562,7 +1537,7 @@ pub fn gaussian_reml_stationary_set(
         root_gradients,
         selected_rho: selection.rho,
         endpoint_costs,
-        rho_window: [RHO_LOWER, RHO_UPPER],
+        rho_window: [rho_lower, rho_upper],
         root_location_resolution: RHO_BRACKET_RESOLUTION,
     })
 }
@@ -1627,11 +1602,12 @@ pub fn gaussian_reml_multi_shared_dispersion_closed_form(
     }
     let per_output_nu = prepared.n_effective as f64 - prepared.cache.nullity as f64;
     let shared_nu = (d as f64) * per_output_nu;
+    let (rho_lower, rho_upper) = prepared.cache.resolvability_rho_domain();
     validate_reml_profile_residuals(
         &prepared.cache,
         pooled_ywy.view(),
         pooled_projected_rhs_squared.view(),
-        RHO_LOWER,
+        rho_lower,
     )?;
     let eval = |rho: f64| {
         let mut value = evaluate_reml_profile(
@@ -1646,7 +1622,7 @@ pub fn gaussian_reml_multi_shared_dispersion_closed_form(
         value
     };
     let rho = if prepared.cache.penalty_rank == 0 {
-        init_rho.unwrap_or(0.0).clamp(RHO_LOWER, RHO_UPPER)
+        init_rho.unwrap_or(0.0).clamp(rho_lower, rho_upper)
     } else {
         let enclose = |a: f64, b: f64| {
             reml_deriv_enclosure_profile(
@@ -1659,7 +1635,14 @@ pub fn gaussian_reml_multi_shared_dispersion_closed_form(
                 b,
             )
         };
-        enumerate_and_select_rho(eval, enclose, init_rho, None)?.rho
+        enumerate_and_select_rho(
+            eval,
+            enclose,
+            init_rho,
+            prepared.cache.resolvability_rho_domain(),
+            None,
+        )?
+        .rho
     };
     let objective = eval(rho);
     let lambda = gam_problem::checked_exp_log_strength(rho)
@@ -1679,6 +1662,7 @@ pub fn gaussian_reml_multi_shared_dispersion_closed_form(
     let (reml_grad_lambda, reml_hess_lambda) =
         rho_derivatives_to_lambda(lambda, objective.grad, objective.hess);
     Ok(GaussianRemlMultiResult {
+        rho_domain: prepared.cache.resolvability_rho_domain(),
         lambda,
         rho,
         coefficients,
@@ -2647,7 +2631,8 @@ fn gaussian_reml_blocks_orthogonal_shared_scale_with_controls(
         fitted,
         lambdas,
         log_lambdas: rhos,
-        reml_score: 0.5 * (d as f64) * logdet_term + 0.5 * scale_term
+        reml_score: 0.5 * (d as f64) * logdet_term
+            + 0.5 * scale_term
             + gaussian_reml_observation_measure(weight.view(), d).value,
         edf,
     })
@@ -2824,6 +2809,7 @@ fn gaussian_reml_multi_closed_form_from_parts(
     let (reml_grad_lambda, reml_hess_lambda) =
         rho_derivatives_to_lambda(lambda, eval.grad, eval.hess);
     Ok(GaussianRemlMultiResult {
+        rho_domain: prepared.cache.resolvability_rho_domain(),
         lambda,
         rho,
         coefficients,
@@ -2937,17 +2923,9 @@ pub fn gaussian_reml_free_b_score(
         let s_beta_col = s_beta.column(output);
         let penalty_quadratic = beta_col.dot(&s_beta_col);
         let dp = weighted_rss + lambda * penalty_quadratic;
-        // A zero penalized deviance is an interpolating fit whose profiled scale
-        // `φ̂ = D_p/ν` is not identifiable: `log(2π·D_p/ν)` has no minimum there,
-        // so the criterion is refused rather than evaluated at a floor (#2469;
-        // the block profile in this file refuses the same case for the same
-        // reason). `D_p` is a sum of non-negative terms, so `!(dp > 0)` is exact
-        // zero or non-finite input, never cancellation.
-        if !(dp > 0.0) {
+        if !dp.is_finite() || dp <= 0.0 {
             crate::bail_invalid_estim!(
-                "Gaussian REML output {output} has a non-positive penalized deviance {dp}: the \
-                 profiled scale is not identifiable (interpolating fit), so the REML criterion \
-                 is undefined there"
+                "Gaussian REML output {output} has non-positive or non-finite penalized deviance {dp}; the profiled scale is not identifiable"
             );
         }
         sigma2[output] = dp / nu;
@@ -3045,19 +3023,12 @@ pub fn gaussian_reml_multi_closed_form_backward_from_fit(
     // suppressed below. (The old gate zeroed the WHOLE backward here, silently
     // dropping real coefficient gradients on unpenalized/flat-penalty fits.)
     let rho_hat = lambda.ln();
-    let rho_at_bound =
-        (rho_hat - RHO_UPPER).abs() <= 1.0e-9 || (rho_hat - RHO_LOWER).abs() <= 1.0e-9;
+    let rho_at_bound = (rho_hat - fit.rho_domain.1).abs() <= 1.0e-9
+        || (rho_hat - fit.rho_domain.0).abs() <= 1.0e-9;
     let implicit_rho_usable =
         fit.reml_hess_rho.is_finite() && fit.reml_hess_rho.abs() > 1.0e-14 && !rho_at_bound;
     let weight = gaussian_reml_weights(n, weights)?;
-    let inverse_hessian = match gaussian_reml_inverse_hessian_from_cache(&fit.cache, lambda) {
-        Ok(inv) => inv,
-        Err(EstimationError::ModelIsIllConditioned { condition_number }) => {
-            warn_ill_conditioned_backward_once(p, d, condition_number);
-            return Ok(zero_backward_result(n, p, d));
-        }
-        Err(err) => return Err(err),
-    };
+    let inverse_hessian = gaussian_reml_inverse_hessian_from_cache(&fit.cache, lambda)?;
     gaussian_reml_multi_closed_form_backward_from_fit_with_inverse_hessian_impl(
         x,
         y,
@@ -3254,28 +3225,15 @@ pub fn gaussian_reml_multi_closed_form_backward_batch<'a>(
             let n = problem.x.nrows();
             let p = problem.x.ncols();
             let d = problem.y.ncols();
-            if !(problem.fit.reml_hess_rho.is_finite() && problem.fit.reml_hess_rho.abs() > 1.0e-14)
-            {
-                // Graceful degradation — see `gaussian_reml_multi_closed_form_backward_from_fit`.
-                warn_ill_conditioned_backward_once(p, d, f64::INFINITY);
-                return Ok(zero_backward_result(n, p, d));
-            }
             let weight = gaussian_reml_weights(n, problem.weights.as_ref().map(|w| w.view()))?;
-            let inverse_hessian = match inverse_hessian_result {
-                Ok(inv) => inv,
-                Err(EstimationError::ModelIsIllConditioned { condition_number }) => {
-                    warn_ill_conditioned_backward_once(p, d, condition_number);
-                    return Ok(zero_backward_result(n, p, d));
-                }
-                Err(err) => return Err(err),
-            };
+            let inverse_hessian = inverse_hessian_result?;
             // Same selection-validity rule as the single-problem entry above:
             // the implicit λ̂-root channel is usable only for an INTERIOR
             // stationary root with usable ρ-curvature (a ρ̂ railed at a box
             // endpoint is locally the constant projection — its channel is 0).
             let rho_hat = problem.fit.lambda.ln();
-            let rho_at_bound =
-                (rho_hat - RHO_UPPER).abs() <= 1.0e-9 || (rho_hat - RHO_LOWER).abs() <= 1.0e-9;
+            let rho_at_bound = (rho_hat - problem.fit.rho_domain.1).abs() <= 1.0e-9
+                || (rho_hat - problem.fit.rho_domain.0).abs() <= 1.0e-9;
             let implicit_rho_usable = problem.fit.reml_hess_rho.is_finite()
                 && problem.fit.reml_hess_rho.abs() > 1.0e-14
                 && !rho_at_bound;
@@ -3387,10 +3345,13 @@ fn validate_gaussian_reml_forward_fit(
         && fit.edf.is_finite())
         || fit.coefficients.iter().any(|value| !value.is_finite())
         || fit.fitted.iter().any(|value| !value.is_finite())
-        || fit.sigma2.iter().any(|value| !(value.is_finite() && *value > 0.0))
+        || fit
+            .sigma2
+            .iter()
+            .any(|value| !value.is_finite() || *value <= 0.0)
     {
         crate::bail_invalid_estim!(
-            "Gaussian REML backward forward state must be finite with positive profiled scales"
+            "Gaussian REML backward requires a finite forward state with positive profiled scales"
         );
     }
     let penalty_fingerprint = matrix_fingerprint(penalty);
@@ -4822,7 +4783,7 @@ fn validate_reml_profile_residuals(
 //   g2 ≥ 0: numerator kernel t/(1+t)² is a unimodal bump peaking at ¼ when t=1.
 //
 // V has poles only at λ = −1/δ_i < 0, i.e. outside the real ρ window, so V is
-// real-analytic on [RHO_LOWER, RHO_UPPER] ⇒ V′ has finitely many isolated roots
+// real-analytic on the derived ρ domain ⇒ V′ has finitely many isolated roots
 // there. That finiteness is what makes exhaustive enumeration well-posed.
 //
 // ---- V″ and its kernel critical points -------------------------------------
@@ -4866,7 +4827,7 @@ fn validate_reml_profile_residuals(
 // midpoint. Children are pushed right-then-left so the leftmost interval is
 // processed first and isolated roots are therefore EMITTED IN ASCENDING ρ with
 // no sort and no heap. Recursion is bounded at MAX_DEPTH =
-// ⌈log₂((RHO_UPPER−RHO_LOWER)/RHO_BRACKET_RESOLUTION)⌉, where the resolution is
+// ⌈log₂((upper−lower)/RHO_BRACKET_RESOLUTION)⌉ over the derived domain, where the resolution is
 // the same ρ-bracket width the safeguarded Newton stop uses. Reaching it without
 // a monotonicity certificate returns `RemlDidNotConverge`; no best-effort fit is
 // minted.
@@ -4894,7 +4855,6 @@ const fn dfs_max_depth(range: f64, resolution: f64) -> usize {
 }
 
 /// Maximum branch-and-bound recursion depth (= 46 for the ±30 window at 1e-12).
-const MAX_DEPTH: usize = dfs_max_depth(RHO_UPPER - RHO_LOWER, RHO_BRACKET_RESOLUTION);
 
 /// A closed real interval `[lo, hi]` used to enclose `V′`/`V″` over a ρ-cell.
 #[derive(Clone, Copy)]
@@ -5314,12 +5274,16 @@ struct ProfileSearchControls {
 }
 
 impl ProfileSearchControls {
-    const PRODUCTION: Self = Self {
-        lower: RHO_LOWER,
-        upper: RHO_UPPER,
-        resolution: RHO_BRACKET_RESOLUTION,
-        max_depth: MAX_DEPTH,
-    };
+    /// The production controls on a derived ρ domain (#2812): the bisection
+    /// depth follows the domain's width at the bracket resolution.
+    fn for_domain(lower: f64, upper: f64) -> Self {
+        Self {
+            lower,
+            upper,
+            resolution: RHO_BRACKET_RESOLUTION,
+            max_depth: dfs_max_depth(upper - lower, RHO_BRACKET_RESOLUTION),
+        }
+    }
 }
 
 fn profile_search_refusal(
@@ -5470,8 +5434,16 @@ fn refine_stationary_rho_core(
 /// Both arguments contain the true range, so the intersection does too. A
 /// non-finite endpoint on one side simply lets the other side govern.
 fn intersect_intervals(left: Interval, right: Interval) -> Interval {
-    let lo = if right.lo.is_nan() { left.lo } else { left.lo.max(right.lo) };
-    let hi = if right.hi.is_nan() { left.hi } else { left.hi.min(right.hi) };
+    let lo = if right.lo.is_nan() {
+        left.lo
+    } else {
+        left.lo.max(right.lo)
+    };
+    let hi = if right.hi.is_nan() {
+        left.hi
+    } else {
+        left.hi.min(right.hi)
+    };
     if lo > hi { left } else { Interval { lo, hi } }
 }
 
@@ -5550,7 +5522,7 @@ fn enumerate_and_select_rho_with_controls(
     controls: ProfileSearchControls,
     mut visit: Option<&mut dyn FnMut(StationaryRoot, &ObjectiveEval)>,
 ) -> Result<ProfileSelection, EstimationError> {
-    const CAP: usize = MAX_DEPTH + 4;
+    let cap = controls.max_depth + 4;
     let lower_eval = eval(controls.lower);
     let upper_eval = eval(controls.upper);
     // Every cell carries the objective jets of BOTH its endpoints. A bisection
@@ -5568,15 +5540,18 @@ fn enumerate_and_select_rho_with_controls(
     // for the same reason the jets are: a bisection introduces exactly one new ρ.
     let lower_point = enclose(controls.lower, controls.lower).0;
     let upper_point = enclose(controls.upper, controls.upper).0;
-    let mut stack = [(
-        controls.lower,
-        lower_eval,
-        lower_point,
-        controls.upper,
-        upper_eval,
-        upper_point,
-        0usize,
-    ); CAP];
+    let mut stack = vec![
+        (
+            controls.lower,
+            lower_eval,
+            lower_point,
+            controls.upper,
+            upper_eval,
+            upper_point,
+            0usize,
+        );
+        cap
+    ];
     let mut top = 1usize;
 
     let (mut best_rho, mut best_eval) = if upper_eval.cost < lower_eval.cost {
@@ -5694,7 +5669,7 @@ fn enumerate_and_select_rho_with_controls(
         }
 
         let mid = a + 0.5 * (b - a);
-        if !(mid > a && mid < b) || top + 2 > CAP {
+        if !(mid > a && mid < b) || top + 2 > cap {
             return Err(profile_search_refusal(
                 &eval,
                 mid,
@@ -5730,13 +5705,14 @@ fn enumerate_and_select_rho(
     eval: impl Fn(f64) -> ObjectiveEval,
     enclose: impl Fn(f64, f64) -> (Interval, Interval),
     init_rho: Option<f64>,
+    domain: (f64, f64),
     visit: Option<&mut dyn FnMut(StationaryRoot, &ObjectiveEval)>,
 ) -> Result<ProfileSelection, EstimationError> {
     enumerate_and_select_rho_with_controls(
         eval,
         enclose,
         init_rho,
-        ProfileSearchControls::PRODUCTION,
+        ProfileSearchControls::for_domain(domain.0, domain.1),
         visit,
     )
 }
@@ -5746,14 +5722,15 @@ fn optimize_rho(
     prepared: &GaussianRemlPrepared,
     init_rho: Option<f64>,
 ) -> Result<f64, EstimationError> {
+    let (rho_lower, rho_upper) = prepared.cache.resolvability_rho_domain();
     validate_reml_profile_residuals(
         &prepared.cache,
         prepared.ywy.view(),
         prepared.projected_rhs_squared.view(),
-        RHO_LOWER,
+        rho_lower,
     )?;
     if prepared.cache.penalty_rank == 0 {
-        return Ok(init_rho.unwrap_or(0.0).clamp(RHO_LOWER, RHO_UPPER));
+        return Ok(init_rho.unwrap_or(0.0).clamp(rho_lower, rho_upper));
     }
     let eval = |rho: f64| prepared.evaluate(rho);
     let enclose = |a: f64, b: f64| {
@@ -5767,7 +5744,14 @@ fn optimize_rho(
             b,
         )
     };
-    Ok(enumerate_and_select_rho(eval, enclose, init_rho, None)?.rho)
+    Ok(enumerate_and_select_rho(
+        eval,
+        enclose,
+        init_rho,
+        prepared.cache.resolvability_rho_domain(),
+        None,
+    )?
+    .rho)
 }
 
 fn evaluate_reml_parts(
@@ -6111,7 +6095,8 @@ mod tests {
         )
         .expect("the control design is finite and full rank");
         let mut control_asserted = 0usize;
-        for rho in [RHO_LOWER, -10.0, 0.0, 10.0] {
+        let (control_lower, _) = control.cache.resolvability_rho_domain();
+        for rho in [control_lower, -10.0, 0.0, 10.0] {
             if point_check("CONTROL", &control, rho, &mut failures) {
                 control_asserted += 1;
             }
@@ -6158,20 +6143,20 @@ mod tests {
         // `ywy`, which is what drives `ywy − Σc²` into cancellation. Reported
         // through the evaluator's own decomposition rather than recomputed.
         let DispersionResidualParts {
-                unpenalized_residual,
-                penalized_residual,
-                ..
-            } = dispersion_residual_parts(
+            unpenalized_residual,
+            penalized_residual,
+            ..
+        } = dispersion_residual_parts(
             &witness.cache,
             witness.ywy.view(),
             witness.projected_rhs_squared.view(),
             0,
-            RHO_LOWER,
+            witness.cache.resolvability_rho_domain().0,
         );
         let ywy = witness.ywy[0];
         if !(penalized_residual >= 0.0 && penalized_residual < 1.0e-25 * ywy) {
             failures.push(format!(
-                "WITNESS regime: the rho-dependent deviance at rho={RHO_LOWER} is \
+                "WITNESS regime: the rho-dependent deviance at the domain floor is \
                  {penalized_residual:.9e} against ywy={ywy:.9e}; this design does \
                  not interpolate its response, so `ywy − Σc²` never cancels and \
                  the fixture has drifted OUT of the regime under test — a pass \
@@ -6179,7 +6164,7 @@ mod tests {
             ));
         }
         let mut witness_asserted = 0usize;
-        for rho in [RHO_LOWER, -25.0, -20.0] {
+        for rho in [witness.cache.resolvability_rho_domain().0, -25.0, -20.0] {
             if point_check("WITNESS", &witness, rho, &mut failures) {
                 witness_asserted += 1;
             }
@@ -6256,7 +6241,7 @@ mod tests {
     ///   branch-and-bound must return a SELECTION on it rather than the
     ///   unresolvable-structure refusal. A regime clause asserts the design still
     ///   interpolates, so a fixture that drifts out of the regime fails loudly
-    ///   instead of going silently green. Measured: it selects `ρ = RHO_UPPER`,
+    ///   instead of going silently green. Measured: it selects the domain ceiling,
     ///   a RAIL answer — reached rather than refused, which is the whole verdict
     ///   #2703 was denied. The clause does not assert WHICH rail: the search
     ///   certifies no interior stationary point, not a direction.
@@ -6276,9 +6261,20 @@ mod tests {
     /// own certified resolution — its amplitude from that frequency, and the
     /// negative control's admissible offset from the search's own bracket-width
     /// acceptance rule.
+    /// The interval the synthetic profiles below are defined on. These
+    /// fixtures are closures in ρ with no penalty spectrum behind them, so
+    /// there is no derived domain to read; the interval is the fixture's own.
+    const SYNTHETIC_PROFILE_DOMAIN: (f64, f64) = (-30.0, 30.0);
+
+    /// The production controls on a fixture's own derived domain.
+    fn production_controls(cache: &GaussianRemlEigenCache) -> ProfileSearchControls {
+        let (lower, upper) = cache.resolvability_rho_domain();
+        ProfileSearchControls::for_domain(lower, upper)
+    }
+
     #[test]
     fn rho_enumeration_resolves_the_small_lambda_rail_and_still_refuses_unresolvable_structure_2703()
-    {
+     {
         let mut failures: Vec<String> = Vec::new();
 
         // ---- WITNESS: the #2703 interpolating regime, at the ENUMERATOR ------
@@ -6315,12 +6311,12 @@ mod tests {
             witness.ywy.view(),
             witness.projected_rhs_squared.view(),
             0,
-            RHO_LOWER,
+            witness.cache.resolvability_rho_domain().0,
         );
         let ywy = witness.ywy[0];
         if !(penalized_residual >= 0.0 && penalized_residual < 1.0e-25 * ywy) {
             failures.push(format!(
-                "WITNESS regime: the rho-dependent deviance at rho={RHO_LOWER} is \
+                "WITNESS regime: the rho-dependent deviance at the domain floor is \
                  {penalized_residual:.9e} against ywy={ywy:.9e}; this design does not \
                  interpolate its response, so `ywy − Σc²` never cancels and the \
                  fixture has drifted OUT of the regime under test — a pass below \
@@ -6345,21 +6341,22 @@ mod tests {
             &witness_eval,
             &witness_enclose,
             None,
-            ProfileSearchControls::PRODUCTION,
+            production_controls(&witness.cache),
             None,
         ) {
             Ok(selection) => {
                 witness_rho = selection.rho;
                 let at_selected = witness_eval(selection.rho).cost;
-                let at_lower = witness_eval(RHO_LOWER).cost;
-                let at_upper = witness_eval(RHO_UPPER).cost;
+                let (witness_lower, witness_upper) = witness.cache.resolvability_rho_domain();
+                let at_lower = witness_eval(witness_lower).cost;
+                let at_upper = witness_eval(witness_upper).cost;
                 if !(selection.rho.is_finite()
-                    && selection.rho >= RHO_LOWER
-                    && selection.rho <= RHO_UPPER)
+                    && selection.rho >= witness_lower
+                    && selection.rho <= witness_upper)
                 {
                     failures.push(format!(
                         "WITNESS: the selected rho={} is not inside the search window \
-                         [{RHO_LOWER}, {RHO_UPPER}]",
+                         [{witness_lower}, {witness_upper}]",
                         selection.rho
                     ));
                 }
@@ -6433,7 +6430,10 @@ mod tests {
             objective(unresolvable_amplitude, unresolvable_wavenumber),
             enclosure(unresolvable_amplitude, unresolvable_wavenumber),
             None,
-            ProfileSearchControls::PRODUCTION,
+            ProfileSearchControls::for_domain(
+                SYNTHETIC_PROFILE_DOMAIN.0,
+                SYNTHETIC_PROFILE_DOMAIN.1,
+            ),
             None,
         ) {
             Ok(selection) => failures.push(format!(
@@ -6460,7 +6460,10 @@ mod tests {
             objective(0.0, unresolvable_wavenumber),
             enclosure(0.0, unresolvable_wavenumber),
             None,
-            ProfileSearchControls::PRODUCTION,
+            ProfileSearchControls::for_domain(
+                SYNTHETIC_PROFILE_DOMAIN.0,
+                SYNTHETIC_PROFILE_DOMAIN.1,
+            ),
             None,
         ) {
             Ok(selection) => {
@@ -6470,8 +6473,7 @@ mod tests {
                 // point of that bracket, which also contains the analytic root.
                 // The bracket's endpoints exceed the two points it contains by at
                 // most its own width, hence the `+ RHO_BRACKET_RESOLUTION`.
-                let scale =
-                    1.0 + selection.rho.abs().max(CENTRE.abs()) + RHO_BRACKET_RESOLUTION;
+                let scale = 1.0 + selection.rho.abs().max(CENTRE.abs()) + RHO_BRACKET_RESOLUTION;
                 let admissible = RHO_BRACKET_RESOLUTION * scale;
                 if (selection.rho - CENTRE).abs() > admissible {
                     failures.push(format!(
@@ -6657,8 +6659,8 @@ mod tests {
         let prepared = prepare_gaussian_reml(x.view(), y.view(), penalty.view(), None, None, None)
             .expect("saturated design must still prepare");
 
-        let a = RHO_LOWER;
-        let b = RHO_LOWER + 1.0e-3;
+        let a = prepared.cache.resolvability_rho_domain().0;
+        let b = a + 1.0e-3;
         let (dv, dvv) = reml_deriv_enclosure(
             &prepared.cache,
             prepared.ywy.view(),
@@ -6703,7 +6705,7 @@ mod tests {
         // `1.0`, `Σ c²·v` reaches `ywy`, and `log(dp)` is `-inf`; through the
         // summed decomposition it is small but finite, so the cost, gradient and
         // curvature are all real numbers.
-        let edge = prepared.evaluate(RHO_LOWER);
+        let edge = prepared.evaluate(prepared.cache.resolvability_rho_domain().0);
         assert!(
             edge.cost.is_finite() && edge.grad.is_finite() && edge.hess.is_finite(),
             "saturated small-lambda jet is not finite: cost={} grad={} hess={}",
@@ -6711,7 +6713,7 @@ mod tests {
             edge.grad,
             edge.hess
         );
-        let sigma2 = prepared.sigma2(RHO_LOWER);
+        let sigma2 = prepared.sigma2(prepared.cache.resolvability_rho_domain().0);
         assert!(
             sigma2.iter().all(|v| v.is_finite() && *v > 0.0),
             "saturated profiled dispersion collapsed to {sigma2:?}"
@@ -6784,8 +6786,7 @@ mod tests {
 
         let coefficient_scale = 7.0_f64;
         let reparameterized_x = x.mapv(|value| value / coefficient_scale);
-        let reparameterized_penalty =
-            penalty.mapv(|value| value / coefficient_scale.powi(2));
+        let reparameterized_penalty = penalty.mapv(|value| value / coefficient_scale.powi(2));
         let reparameterized = gaussian_reml_closed_form_with_nullspace_dim(
             reparameterized_x.view(),
             y.view(),
@@ -6796,14 +6797,10 @@ mod tests {
         )
         .expect("coefficient-reparameterized Gaussian REML profile");
         let score_tolerance = 1.0e-9 * (1.0 + baseline.reml_score.abs());
-        assert!(
-            (reparameterized.reml_score - baseline.reml_score).abs() <= score_tolerance
-        );
+        assert!((reparameterized.reml_score - baseline.reml_score).abs() <= score_tolerance);
         assert!((reparameterized.rho - baseline.rho).abs() <= 1.0e-9);
         assert!(
-            (reparameterized.coefficients[0]
-                - coefficient_scale * baseline.coefficients[0])
-                .abs()
+            (reparameterized.coefficients[0] - coefficient_scale * baseline.coefficients[0]).abs()
                 <= 1.0e-9
         );
         for row in 0..x.nrows() {
@@ -7805,8 +7802,14 @@ mod tests {
         // assertions below read it.
         let selection = {
             let mut collect_root = |root: StationaryRoot, _: &ObjectiveEval| roots.push(root);
-            enumerate_and_select_rho(&eval, &enclose, Some(-20.0), Some(&mut collect_root))
-                .expect("profile certificate")
+            enumerate_and_select_rho(
+                &eval,
+                &enclose,
+                Some(-20.0),
+                cache.resolvability_rho_domain(),
+                Some(&mut collect_root),
+            )
+            .expect("profile certificate")
         };
 
         assert_eq!(roots.len(), 1, "unexpected stationary set");
@@ -7904,8 +7907,16 @@ mod tests {
             };
             let mut roots = Vec::new();
             let selection = {
-                let mut collect_rho = |root: StationaryRoot, _: &ObjectiveEval| roots.push(root.rho);
-                enumerate_and_select_rho(&eval, &enclose, None, Some(&mut collect_rho)).unwrap()
+                let mut collect_rho =
+                    |root: StationaryRoot, _: &ObjectiveEval| roots.push(root.rho);
+                enumerate_and_select_rho(
+                    &eval,
+                    &enclose,
+                    None,
+                    cache.resolvability_rho_domain(),
+                    Some(&mut collect_rho),
+                )
+                .unwrap()
             };
             let selected = selection.rho;
             let selected_cost = eval(selected).cost;
@@ -7914,8 +7925,8 @@ mod tests {
             for &r in &roots {
                 assert!(selected_cost <= eval(r).cost + tol);
             }
-            assert!(selected_cost <= eval(RHO_LOWER).cost + tol);
-            assert!(selected_cost <= eval(RHO_UPPER).cost + tol);
+            assert!(selected_cost <= eval(gam_problem::LOG_STRENGTH_MIN).cost + tol);
+            assert!(selected_cost <= eval(gam_problem::LOG_STRENGTH_MAX).cost + tol);
         }
     }
 
@@ -7978,17 +7989,11 @@ mod tests {
         }
     }
 
-    /// Regression: when `K = XᵀWX + λS` is effectively rank-deficient (e.g.
-    /// `λ` has saturated very large), the backward must NOT error — it must
-    /// degrade gracefully and return zero gradients of the correct shape.
-    /// This is the production-training scenario where individual atoms can
-    /// saturate `λ_k` in early batches; raising here would crash an entire
-    /// step. We construct the degenerate state by running a real forward
-    /// fit and then corrupting `reml_hess_rho` to 0 (the gate variable the
-    /// backward checks). We assert: (a) no error, (b) all gradients finite,
-    /// (c) shapes match the inputs.
+    /// Flat outer curvature disables only the implicit smoothing-root channel.
+    /// The coefficient solve and the explicit score derivatives remain live;
+    /// a batch must differentiate the same function as a scalar call.
     #[test]
-    fn backward_degrades_gracefully_when_k_is_near_singular() {
+    fn backward_preserves_explicit_derivatives_when_rho_curvature_is_flat() {
         // Small, full-rank S with a moderately-conditioned X. The exact
         // numbers don't matter; what matters is that we then force the
         // ill-conditioned gate to fire.
@@ -8041,7 +8046,7 @@ mod tests {
             1.0,
             1.0,
         )
-        .expect("backward must NOT error on near-singular K");
+        .expect("the coefficient Hessian remains positive definite");
 
         assert_eq!(result.grad_x.dim(), (x.nrows(), x.ncols()));
         assert_eq!(result.grad_y.dim(), (y.nrows(), y.ncols()));
@@ -8058,6 +8063,28 @@ mod tests {
         }
         for v in result.grad_weights.iter() {
             assert!(v.is_finite(), "grad_weights must be finite, got {v}");
+        }
+        assert!(result.grad_y.iter().any(|value| value.abs() > 1e-6));
+        let problem = GaussianRemlMultiBackwardProblem {
+            x: x.view(),
+            y: y.view(),
+            weights: None,
+            fit: &fit,
+            grad_lambda: 1.0,
+            grad_coefficients: None,
+            grad_fitted: None,
+            grad_reml_score: 1.0,
+            grad_edf: 1.0,
+        };
+        let batch = gaussian_reml_multi_closed_form_backward_batch(&[problem], penalty.view());
+        let batch = batch[0]
+            .as_ref()
+            .expect("batch derivative must remain available");
+        for (single, batched) in result.grad_y.iter().zip(batch.grad_y.iter()) {
+            assert!((single - batched).abs() < 1e-12);
+        }
+        for (single, batched) in result.grad_x.iter().zip(batch.grad_x.iter()) {
+            assert!((single - batched).abs() < 1e-12);
         }
     }
 }
@@ -8805,7 +8832,7 @@ mod perfect_fit_refusal_tests {
 
         // B: `y = X·[1, 2]` in integers, with mass on the penalized direction.
         // The cancellation landed negative and was clamped to `0`, but
-        // `Σc²·u(RHO_LOWER)` is strictly positive for ANY design carrying
+        // `Σc²·u(lower)` is strictly positive for ANY design carrying
         // penalized mass — the generic case — so the old bar accepted it too.
         let b_x = array![[1.0, 0.0], [1.0, 1.0], [1.0, 2.0], [1.0, 3.0], [1.0, 4.0]];
         let b_y = array![[1.0], [3.0], [5.0], [7.0], [9.0]];
@@ -8825,7 +8852,12 @@ mod perfect_fit_refusal_tests {
 
         vec![
             ("A irrational basis, constant response", a_x, a_y, a_penalty),
-            ("B integer basis, penalized mass present", b_x, b_y, b_penalty),
+            (
+                "B integer basis, penalized mass present",
+                b_x,
+                b_y,
+                b_penalty,
+            ),
             ("C integer basis, all mass in null(S)", c_x, c_y, c_penalty),
             ("D identically zero response", d_x, d_y, d_penalty),
         ]
@@ -8857,7 +8889,7 @@ mod perfect_fit_refusal_tests {
                 prepared.ywy.view(),
                 prepared.projected_rhs_squared.view(),
                 0,
-                RHO_LOWER,
+                prepared.cache.resolvability_rho_domain().0,
             );
             let residual = unpenalized_residual + penalized_residual;
             let ywy = prepared.ywy[0];
@@ -8874,7 +8906,7 @@ mod perfect_fit_refusal_tests {
                 &prepared.cache,
                 prepared.ywy.view(),
                 prepared.projected_rhs_squared.view(),
-                RHO_LOWER,
+                prepared.cache.resolvability_rho_domain().0,
             );
             verdicts.push((name, verdict.is_ok()));
             if verdict.is_ok() {
@@ -8922,7 +8954,7 @@ mod perfect_fit_refusal_tests {
                 prepared.ywy.view(),
                 prepared.projected_rhs_squared.view(),
                 0,
-                RHO_LOWER,
+                prepared.cache.resolvability_rho_domain().0,
             );
             let residual = unpenalized_residual + penalized_residual;
             let ywy = prepared.ywy[0];
@@ -8935,7 +8967,7 @@ mod perfect_fit_refusal_tests {
                 &prepared.cache,
                 prepared.ywy.view(),
                 prepared.projected_rhs_squared.view(),
-                RHO_LOWER,
+                prepared.cache.resolvability_rho_domain().0,
             );
             assert!(
                 verdict.is_ok(),
@@ -8953,14 +8985,20 @@ mod perfect_fit_refusal_tests {
         for (name, x, y, penalty) in zero_residual_designs() {
             for scale in [1.0e-8, 1.0, 1.0e8] {
                 let scaled = y.mapv(|value| value * scale);
-                let prepared =
-                    prepare_gaussian_reml(x.view(), scaled.view(), penalty.view(), None, None, None)
-                        .unwrap_or_else(|error| panic!("{name} at {scale:e}: {error}"));
+                let prepared = prepare_gaussian_reml(
+                    x.view(),
+                    scaled.view(),
+                    penalty.view(),
+                    None,
+                    None,
+                    None,
+                )
+                .unwrap_or_else(|error| panic!("{name} at {scale:e}: {error}"));
                 let verdict = validate_reml_profile_residuals(
                     &prepared.cache,
                     prepared.ywy.view(),
                     prepared.projected_rhs_squared.view(),
-                    RHO_LOWER,
+                    prepared.cache.resolvability_rho_domain().0,
                 );
                 assert!(
                     verdict.is_err(),
@@ -9075,10 +9113,11 @@ mod eigenvalue_range_predicate_agreement_2740_tests {
     fn the_large_rho_logdet_gradient_vanishes_because_sum_and_offset_share_a_population() {
         let cache = disputed_band_cache();
         let spectrum = PenaltyRangeSpectrum::of(&cache);
-        let lambda = RHO_UPPER.exp();
+        let (_, cache_upper) = cache.resolvability_rho_domain();
+        let lambda = cache_upper.exp();
         let n_outputs = 1.0_f64;
 
-        let (term, _edf) = gaussian_reml_logdet_term(&cache, RHO_UPPER, n_outputs);
+        let (term, _edf) = gaussian_reml_logdet_term(&cache, cache_upper, n_outputs);
 
         // The bound is the analytic residual of the SAME sum, not a chosen
         // tolerance, widened by the accumulation of `rank` additions.
@@ -9096,7 +9135,7 @@ mod eigenvalue_range_predicate_agreement_2740_tests {
             term.grad
         );
 
-        // NON-VACUITY: at ρ = RHO_UPPER the disputed band is saturated, so the
+        // NON-VACUITY: at the domain ceiling the disputed band is saturated, so the
         // `δ > 0.0` population would have left most of a whole mode in the
         // gradient — the two predicates are separated here by far more than the
         // bound above.
@@ -9110,7 +9149,7 @@ mod eigenvalue_range_predicate_agreement_2740_tests {
         assert!(
             disputed_trace > 0.5,
             "precondition unmet: the disputed band contributes only {disputed_trace} to \
-             the trace at rho={RHO_UPPER}, so an absolute `> 0.0` sum would barely differ \
+             the trace at the domain ceiling, so an absolute `> 0.0` sum would barely differ \
              from the classified one and this test would be mute"
         );
         assert!(
