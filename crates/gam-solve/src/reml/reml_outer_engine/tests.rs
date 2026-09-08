@@ -8993,7 +8993,9 @@ fn second_mode_response_uses_stationarity_inverse_and_logdet_trace_979() {
         fn hessian_derivative_correction(&self, v: &Array1<f64>) -> Result<Option<Array2<f64>>, String> {
             Ok(Some(Array2::zeros((v.len(), v.len()))))
         }
-        fn hessian_second_derivative_correction(&self, _: &Array1<f64>, _: &Array1<f64>, u: &Array1<f64>) -> Result<Option<Array2<f64>>, String> {
+        fn hessian_second_derivative_correction(&self, v: &Array1<f64>, w: &Array1<f64>, u: &Array1<f64>) -> Result<Option<Array2<f64>>, String> {
+            assert_eq!(v.len(), u.len());
+            assert_eq!(w.len(), u.len());
             Ok(Some(Array2::from_diag(u)))
         }
         fn has_corrections(&self) -> bool { true }
