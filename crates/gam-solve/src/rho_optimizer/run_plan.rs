@@ -2265,14 +2265,35 @@ pub(crate) fn run_outer_with_plan(
                         "[OUTER] {context}: analytic Hessian provided as Hv operator; \
                         routing to opt::MatrixFreeTrustRegion (Steihaug-Toint CG)"
                     );
-                    let (lo, hi) = &bounds_template;
-                    let bounds_obj = outer_bounds(lo, hi)?;
+                    let seed_hessian = match &seed_eval.hessian {
+                        HessianValue::Dense(hessian) => hessian.clone(),
+                        HessianValue::Operator(operator) => operator
+                            .materialize_dense()
+                            .map_err(|error| {
+                                EstimationError::RemlOptimizationFailed(format!(
+                                    "could not construct the analytic outer curvature chart: {error}"
+                                ))
+                            })?,
+                        HessianValue::Unavailable => {
+                            return Err(EstimationError::RemlOptimizationFailed(
+                                "operator route selected without an analytic Hessian".to_string(),
+                            ));
+                        }
+                    };
+                    let chart = OuterDiagonalChart::from_hessian(&seed_hessian).map_err(|error| {
+                        EstimationError::RemlOptimizationFailed(error.to_string())
+                    })?;
+                    let (scaled_lo, scaled_hi) =
+                        chart.bounds_to_solver(&bounds_template.0, &bounds_template.1);
+                    let bounds_obj = outer_bounds(&scaled_lo, &scaled_hi)?;
                     // Scale-aware tolerance via opt 0.5.0:
                     // `relative_to_cost(τ)` = `τ * (1 + |f|)` resolved
                     // at run time from the seed cost and initial grad
                     // norm. Replaces the previous gam-side
                     // precomputed `outer_scaled_tolerance` hack.
-                    let grad_tol = outer_gradient_tolerance(config);
+                    let grad_tol = chart.gradient_tolerance_to_solver(
+                        outer_gradient_tolerance(config),
+                    );
                     let max_iter = outer_max_iterations(config.max_iter)?;
 
                     // Translate the seed_eval into an opt::OperatorSample
@@ -2281,27 +2302,31 @@ pub(crate) fn run_outer_with_plan(
                     // eval. The Hessian translation goes through the
                     // gam->opt operator adapter when the seed Hessian is
                     // an Hv operator; Analytic seeds become Dense.
-                    let initial_op_sample = OperatorSample {
+                    let initial_op_sample = chart.sample_to_solver(OperatorSample {
                         value: seed_eval.cost,
                         gradient: seed_eval.gradient.clone(),
                         hessian: seed_eval.hessian.clone(),
+                    });
+
+                    let bridge_obj = ScaledOuterOperatorBridge {
+                        chart: chart.clone(),
+                        inner: OuterOperatorBridge {
+                            obj,
+                            layout,
+                            outer_inner_cap: config.outer_inner_cap.clone(),
+                            eval_count: 0,
+                            g_norm_initial: None,
+                            last_g_norm: None,
+                            last_value_grad_rho: None,
+                        },
                     };
 
-                    let bridge_obj = OuterOperatorBridge {
-                        obj,
-                        layout,
-                        outer_inner_cap: config.outer_inner_cap.clone(),
-                        eval_count: 0,
-                        g_norm_initial: None,
-                        last_g_norm: None,
-                        last_value_grad_rho: None,
-                    };
-
-                    let mut solver = MatrixFreeTrustRegion::new(seed.clone(), bridge_obj)
+                    let scaled_seed = chart.to_solver(&seed);
+                    let mut solver = MatrixFreeTrustRegion::new(scaled_seed.clone(), bridge_obj)
                         .with_bounds(bounds_obj)
                         .with_gradient_tolerance(grad_tol)
                         .with_max_iterations(max_iter)
-                        .with_initial_sample(seed.clone(), initial_op_sample)
+                        .with_initial_sample(scaled_seed, initial_op_sample)
                         // Looser Eisenstat–Walker forcing factor on the
                         // inner Steihaug–Toint CG (default 0.1 → 0.5). The
                         // matrix-free route is reached only after
@@ -2366,7 +2391,8 @@ pub(crate) fn run_outer_with_plan(
                     }
 
                     let mf_start = std::time::Instant::now();
-                    let report = solver.run_report();
+                    let mut report = solver.run_report();
+                    chart.solution_to_physical(&mut report.solution);
                     let mf_elapsed = mf_start.elapsed().as_secs_f64();
                     let final_radius = report.diagnostics.final_trust_radius;
                     log::info!(
