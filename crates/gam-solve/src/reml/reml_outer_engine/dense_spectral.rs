@@ -62,6 +62,54 @@ pub struct DenseSpectralOperator {
 }
 
 impl DenseSpectralOperator {
+    /// Rank of the union of a likelihood design span and unscaled penalty
+    /// spans.  Each source is normalized before addition, so the answer cannot
+    /// depend on a smoothing strength or on arbitrary units of one component.
+    pub(crate) fn structural_rank_from_spans(
+        design: &Array2<f64>,
+        penalties: &[Array2<f64>],
+    ) -> Result<usize, String> {
+        let p = design.ncols();
+        let mut span_gram = gam_linalg::faer_ndarray::fast_atb(design, design);
+        let design_scale = span_gram
+            .iter()
+            .map(|value| value * value)
+            .sum::<f64>()
+            .sqrt();
+        if design_scale > 0.0 {
+            span_gram.mapv_inplace(|value| value / design_scale);
+        }
+        for penalty in penalties {
+            if penalty.dim() != (p, p) {
+                return Err(format!(
+                    "structural span penalty is {}x{}, expected {p}x{p}",
+                    penalty.nrows(),
+                    penalty.ncols()
+                ));
+            }
+            let scale = penalty
+                .iter()
+                .map(|value| value * value)
+                .sum::<f64>()
+                .sqrt();
+            if scale > 0.0 {
+                span_gram.scaled_add(scale.recip(), penalty);
+            }
+        }
+        gam_linalg::matrix::symmetrize_in_place(&mut span_gram);
+        let (eigenvalues, _) = span_gram
+            .eigh(faer::Side::Lower)
+            .map_err(|error| format!("structural-span eigendecomposition failed: {error}"))?;
+        let largest = eigenvalues
+            .iter()
+            .fold(0.0_f64, |acc, &value| acc.max(value.abs()));
+        let threshold = (p.max(1) as f64) * f64::EPSILON * largest;
+        Ok(eigenvalues
+            .iter()
+            .filter(|&&value| value > threshold)
+            .count())
+    }
+
     /// Create from a symmetric matrix (may be indefinite or singular).
     ///
     /// The eigendecomposition is computed once. Eigenvalues are smoothly
@@ -82,6 +130,23 @@ impl DenseSpectralOperator {
     pub fn from_symmetric_with_mode(
         h: &Array2<f64>,
         mode: PseudoLogdetMode,
+    ) -> Result<Self, String> {
+        Self::from_symmetric_with_mode_and_structural_rank(h, mode, None)
+    }
+
+    /// Build a spectral factorization whose hard-pseudo rank is fixed by the
+    /// model's unscaled likelihood/penalty spans, rather than by the condition
+    /// number of the already-scaled Hessian.
+    ///
+    /// A smoothing strength is allowed to change eigenvalue magnitudes, but it
+    /// cannot change which coefficient directions exist in the Laplace
+    /// integral.  In particular, a `1e13` penalty must not make a second,
+    /// unit-strength smooth look structurally null merely because its Hessian
+    /// eigenvalue is less than `1e-5` of the largest one (#2835).
+    pub(crate) fn from_symmetric_with_mode_and_structural_rank(
+        h: &Array2<f64>,
+        mode: PseudoLogdetMode,
+        structural_rank: Option<usize>,
     ) -> Result<Self, String> {
         use faer::Side;
 
@@ -164,7 +229,28 @@ impl DenseSpectralOperator {
             PseudoLogdetMode::HardPseudo => {
                 let sigma_max = eigenvalues.iter().fold(0.0_f64, |acc, &s| acc.max(s.abs()));
                 let floor = epsilon.max(HARD_PSEUDO_RELATIVE_FLOOR * sigma_max);
-                eigenvalues.iter().map(|&s| s > floor).collect()
+                let mut active: Vec<bool> = eigenvalues.iter().map(|&s| s > floor).collect();
+                if let Some(rank) = structural_rank {
+                    let wanted = rank.min(n);
+                    let already = active.iter().filter(|&&keep| keep).count();
+                    if already < wanted {
+                        // `eigh` returns ascending eigenvalues.  Restore the
+                        // largest positive modes until the scale-independent
+                        // span rank is represented; exact structural aliases
+                        // remain inactive.
+                        let mut remaining = wanted - already;
+                        for index in (0..n).rev() {
+                            if remaining == 0 {
+                                break;
+                            }
+                            if !active[index] && eigenvalues[index] > 0.0 {
+                                active[index] = true;
+                                remaining -= 1;
+                            }
+                        }
+                    }
+                }
+                active
             }
         };
 
