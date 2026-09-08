@@ -155,6 +155,23 @@ replaced by a check of the labeled joint-penalty evaluator actually used by the
 production fit. A local copy of the 5.2 MB failure log is preserved at
 `/Users/user/gam-validation-artifacts/issue1082-curvature-multinomial.log`.
 
+acn112 subsequently rebooted and became reachable again. A focused rebuild of
+the existing snapshot completed in 67 seconds. The corrected derivative probe
+passes joint strengths through `JointPenaltyBundle` and supplies an empty
+block-local rho vector, as the production labeled evaluator does. It now reaches
+the derivative assertions: **one pass, one failure in 0.26 seconds**. Without
+Jeffreys/Firth, all six gradient coordinates and the full Hessian pass at both
+tested rho points. With the term active, the first gradient coordinate is
+0.4309032880370025 versus central finite difference 0.4305678388227818 at
+rho `[-.75, -.45, -.15, .15, .45, .75]`; this exceeds the existing relative
+1e-5 test bar. Its Hessian assertion is not reached. This narrows the remaining
+correctness investigation to the armed criterion; step-size stability and the
+responsible derivative term still need investigation. The failing reproduction
+is retained in the worktree at
+`crates/gam-models/tests/multinomial_outer_derivatives_1082.rs`, and its MSI log is
+`/projects/standard/hsiehph/sauer354/issue1082-resume-derivatives.log`. No further
+long quality run was launched after the request to finish immediately.
+
 1. Run every selected test after the corrections, including both synthetic and real-data arms. Record
    actual durations and assertions; missing references remain failures.
 2. Diagnose and fix remaining solver/covariance failures without increasing
