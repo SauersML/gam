@@ -7271,3 +7271,95 @@ mod tests_exact_hessian_apply_wrappers {
         }
     }
 }
+
+// The residual-currency damped path the terminal polish globalized on before
+// #2080 moved acceptance to the penalized objective. It stays as a TEST ORACLE:
+// the #2762 pins hold it to the pseudoinverse at ν = 0 and to the exact
+// closed-form model residual `g + AΔ(ν) = Σ_i u_i c_i ν/(λ_i² + ν)`, and the
+// #2080 pin uses it to show the objective step descends where this one ascends.
+#[cfg(test)]
+mod tests_damped_residual_path {
+    use super::*;
+
+    /// One point of the damped residual path.
+    pub(crate) struct DampedResidualPathPoint {
+        /// `Δ(ν)`.
+        pub(crate) step: SaeArrowVector,
+        /// `g + AΔ(ν)`, in the same arrow layout as the residual handed in.
+        pub(crate) model_residual: SaeArrowVector,
+        /// `‖Δ(ν)‖²`.
+        pub(crate) step_norm_sq: f64,
+        /// Directions whose damped denominator cleared the null band.
+        pub(crate) retained_rank: usize,
+    }
+
+    impl ExactHessianSpectralBlock {
+        /// `residual` is the stationarity residual `g`; the step returned solves
+        /// the damped system against `−g`, and the modeled residual is reported
+        /// for `g` itself. A direction whose damped denominator `λ² + ν` is inside
+        /// the null band (`≤ rank_floor²`) contributes nothing to the step and its
+        /// whole coefficient to the model residual: at `ν = 0` that is exactly the
+        /// pseudoinverse's own classification.
+        pub(crate) fn damped_residual_step(
+            &self,
+            residual: &SaeArrowVector,
+            nu: f64,
+        ) -> Result<DampedResidualPathPoint, String> {
+            let total_t = residual.t.len();
+            let dim = total_t + residual.beta.len();
+            let spectral_dim = self.eigenvalues.len();
+            if self.eigenvectors.dim() != (dim, spectral_dim) || spectral_dim != dim {
+                return Err(format!(
+                    "damped residual step: eigenvectors {:?} and spectrum {spectral_dim} do not \
+                     match residual dimension {dim}",
+                    self.eigenvectors.dim(),
+                ));
+            }
+            if !(nu.is_finite() && nu >= 0.0) {
+                return Err(format!(
+                    "damped residual step: damping must be finite and ≥ 0; got {nu}"
+                ));
+            }
+            let mut flat = Array1::<f64>::zeros(dim);
+            flat.slice_mut(s![..total_t]).assign(&residual.t);
+            flat.slice_mut(s![total_t..]).assign(&residual.beta);
+            if !flat.iter().all(|value| value.is_finite()) {
+                return Err("damped residual step: residual contains a non-finite value".to_string());
+            }
+            let coefficients = self.eigenvectors.t().dot(&flat);
+            let mut step_coefficients = Array1::<f64>::zeros(spectral_dim);
+            let mut model_coefficients = Array1::<f64>::zeros(spectral_dim);
+            let mut retained_rank = 0usize;
+            for index in 0..spectral_dim {
+                let lambda = self.eigenvalues[index];
+                let floor = self.rank_floor(index);
+                let null_band = floor * floor;
+                let denominator = lambda * lambda + nu;
+                let coefficient = coefficients[index];
+                let surviving = if denominator > null_band {
+                    // Δ solves `(A² + ν) Δ = −A g` in this direction.
+                    step_coefficients[index] = -lambda * coefficient / denominator;
+                    retained_rank += 1;
+                    coefficient * nu / denominator
+                } else {
+                    coefficient
+                };
+                model_coefficients[index] = surviving;
+            }
+            let solution = self.eigenvectors.dot(&step_coefficients);
+            let model = self.eigenvectors.dot(&model_coefficients);
+            Ok(DampedResidualPathPoint {
+                step: SaeArrowVector {
+                    t: solution.slice(s![..total_t]).to_owned(),
+                    beta: solution.slice(s![total_t..]).to_owned(),
+                },
+                model_residual: SaeArrowVector {
+                    t: model.slice(s![..total_t]).to_owned(),
+                    beta: model.slice(s![total_t..]).to_owned(),
+                },
+                step_norm_sq: solution.dot(&solution),
+                retained_rank,
+            })
+        }
+    }
+}
