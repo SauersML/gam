@@ -1,0 +1,486 @@
+{
+  "issue": 2835,
+  "host": "acn112",
+  "python": "3.12.4",
+  "extension_sha256": "d449d353e3c7cd2f0cf3fc3061a6b7085aa90b1ea61a78ede34937ce75f8eef8",
+  "public_test": "tests/test_reml_rank_deficient_penalty_geometry.py",
+  "test_sha256": "23ae8b35852eea63236a71d5009a7ed8f2e8a13d004294df5cb215bde7a1ec77",
+  "cases": [
+    {
+      "case": "firth-0",
+      "seconds": 31.16210436820984,
+      "elf_sha256": "d449d353e3c7cd2f0cf3fc3061a6b7085aa90b1ea61a78ede34937ce75f8eef8",
+      "cpu": 112,
+      "log_file": "rank-eval-complete-firth-0.log",
+      "log_sha256": "4191dd6ae4893e33be6e157cd1a9a2c7140968d57a3c17488233b713a93b1d4a",
+      "pytest_summary": "1 passed in 28.98s",
+      "exit_code": 0
+    },
+    {
+      "case": "firth-1",
+      "seconds": 34.54782676696777,
+      "elf_sha256": "d449d353e3c7cd2f0cf3fc3061a6b7085aa90b1ea61a78ede34937ce75f8eef8",
+      "cpu": 113,
+      "log_file": "rank-eval-complete-firth-1.log",
+      "log_sha256": "d7c6183a9e8ba13eb0596a930b49786563d94f1c97ceee4c51d68ccb60506655",
+      "pytest_summary": "1 passed in 32.36s",
+      "exit_code": 0
+    },
+    {
+      "case": "firth-2",
+      "seconds": 58.94608449935913,
+      "elf_sha256": "d449d353e3c7cd2f0cf3fc3061a6b7085aa90b1ea61a78ede34937ce75f8eef8",
+      "cpu": 114,
+      "log_file": "rank-eval-complete-firth-2.log",
+      "log_sha256": "2c1673316ccbea4d230dcaa8a1d80ecf27de3c32f101711fc0a8a7607db9086e",
+      "pytest_summary": "1 passed in 56.74s",
+      "exit_code": 0
+    },
+    {
+      "case": "firth-3",
+      "seconds": 40.87625074386597,
+      "elf_sha256": "d449d353e3c7cd2f0cf3fc3061a6b7085aa90b1ea61a78ede34937ce75f8eef8",
+      "cpu": 115,
+      "log_file": "rank-eval-complete-firth-3.log",
+      "log_sha256": "b11cd71b2dd4d85631d6c4a9878cd847f8522fe00ea21d93d99349600ea0c6b0",
+      "pytest_summary": "1 passed in 38.69s",
+      "exit_code": 0
+    },
+    {
+      "case": "firth-4",
+      "seconds": 30.273812770843506,
+      "elf_sha256": "d449d353e3c7cd2f0cf3fc3061a6b7085aa90b1ea61a78ede34937ce75f8eef8",
+      "cpu": 112,
+      "log_file": "rank-eval-complete-firth-4.log",
+      "log_sha256": "b07e337689e731aaad5ea914227e42cc59ba3ad5f11ad5d013adeb9355e7ceef",
+      "pytest_summary": "1 passed in 28.72s",
+      "exit_code": 0
+    },
+    {
+      "command": [
+        "timeout",
+        "120",
+        "taskset",
+        "-c",
+        "112",
+        ".venv-python312-issues/bin/python",
+        "-m",
+        "pytest",
+        "-q",
+        "tests/test_reml_rank_deficient_penalty_geometry.py::test_firth_two_smooths_recovers_probability[5]",
+        "--tb=short",
+        "--show-capture=no",
+        "-ra"
+      ],
+      "extension_sha256": "d449d353e3c7cd2f0cf3fc3061a6b7085aa90b1ea61a78ede34937ce75f8eef8",
+      "exit_code": 0,
+      "elapsed_seconds": 40.343040912994184,
+      "log_file": "rank-eval-differential-firth-5.log",
+      "log_sha256": "831091caa3170e11e5e2ca5951124adc5f55a8c8ae81c8fc14a76c4888b611ad",
+      "pytest_summary": "1 passed in 39.58s"
+    },
+    {
+      "case": "firth-6",
+      "seconds": 30.224469423294067,
+      "elf_sha256": "d449d353e3c7cd2f0cf3fc3061a6b7085aa90b1ea61a78ede34937ce75f8eef8",
+      "cpu": 113,
+      "log_file": "rank-eval-complete-firth-6.log",
+      "log_sha256": "a4e161c14ffd3ec43f8aa6dbecd76c9edec61ac7ce7e2826143d5333658561f2",
+      "pytest_summary": "1 passed in 28.67s",
+      "exit_code": 0
+    },
+    {
+      "case": "firth-7",
+      "seconds": 42.89958429336548,
+      "elf_sha256": "d449d353e3c7cd2f0cf3fc3061a6b7085aa90b1ea61a78ede34937ce75f8eef8",
+      "cpu": 114,
+      "log_file": "rank-eval-complete-firth-7.log",
+      "log_sha256": "6d37686896d96de34f5f4fbcda18c76404b0d6a2fccd76f9f34608d7d5f926bc",
+      "pytest_summary": "1 passed in 41.24s",
+      "exit_code": 0
+    },
+    {
+      "command": [
+        "timeout",
+        "120",
+        "taskset",
+        "-c",
+        "113",
+        ".venv-python312-issues/bin/python",
+        "-m",
+        "pytest",
+        "-q",
+        "tests/test_reml_rank_deficient_penalty_geometry.py::test_firth_two_smooths_recovers_probability[8]",
+        "--tb=short",
+        "--show-capture=no",
+        "-ra"
+      ],
+      "extension_sha256": "d449d353e3c7cd2f0cf3fc3061a6b7085aa90b1ea61a78ede34937ce75f8eef8",
+      "exit_code": 0,
+      "elapsed_seconds": 40.900995995965786,
+      "log_file": "rank-eval-differential-firth-8.log",
+      "log_sha256": "d46602325ffc13229ae2c36d86f71148ab42a75a9cd88c1d1bdcf8457a05af7b",
+      "pytest_summary": "1 passed in 40.13s"
+    },
+    {
+      "command": [
+        "timeout",
+        "120",
+        "taskset",
+        "-c",
+        "114",
+        ".venv-python312-issues/bin/python",
+        "-m",
+        "pytest",
+        "-q",
+        "tests/test_reml_rank_deficient_penalty_geometry.py::test_firth_two_smooths_recovers_probability[9]",
+        "--tb=short",
+        "--show-capture=no",
+        "-ra"
+      ],
+      "extension_sha256": "d449d353e3c7cd2f0cf3fc3061a6b7085aa90b1ea61a78ede34937ce75f8eef8",
+      "exit_code": 0,
+      "elapsed_seconds": 72.86905036098324,
+      "log_file": "rank-eval-differential-firth-9.log",
+      "log_sha256": "f62a71c19e71c432d78c5fb8f742628c673892daa2814b49d6542607451dbb0d",
+      "pytest_summary": "1 passed in 72.06s (0:01:12)"
+    },
+    {
+      "case": "firth-10",
+      "seconds": 35.83163928985596,
+      "elf_sha256": "d449d353e3c7cd2f0cf3fc3061a6b7085aa90b1ea61a78ede34937ce75f8eef8",
+      "cpu": 115,
+      "log_file": "rank-eval-complete-firth-10.log",
+      "log_sha256": "b94c5588fde0a1d78e8d1b8c960766037444cf57547e2e19b2e0d03d068bf593",
+      "pytest_summary": "1 passed in 34.21s",
+      "exit_code": 0
+    },
+    {
+      "command": [
+        "timeout",
+        "120",
+        "taskset",
+        "-c",
+        "115",
+        ".venv-python312-issues/bin/python",
+        "-m",
+        "pytest",
+        "-q",
+        "tests/test_reml_rank_deficient_penalty_geometry.py::test_firth_two_smooths_recovers_probability[11]",
+        "--tb=short",
+        "--show-capture=no",
+        "-ra"
+      ],
+      "extension_sha256": "d449d353e3c7cd2f0cf3fc3061a6b7085aa90b1ea61a78ede34937ce75f8eef8",
+      "exit_code": 0,
+      "elapsed_seconds": 28.919213869958185,
+      "log_file": "rank-eval-differential-firth-11.log",
+      "log_sha256": "5087b0b756e9919965a5efadea74127129b8d9470e7dda85fbf643692fb5d387",
+      "pytest_summary": "1 passed in 28.12s"
+    },
+    {
+      "case": "firth-12",
+      "seconds": 59.271498680114746,
+      "elf_sha256": "d449d353e3c7cd2f0cf3fc3061a6b7085aa90b1ea61a78ede34937ce75f8eef8",
+      "cpu": 112,
+      "log_file": "rank-eval-complete-firth-12.log",
+      "log_sha256": "5f0ad6d30de27093497f8ce80629734d95c584ed1e3c849431950b3eb98041b7",
+      "pytest_summary": "1 passed in 57.45s",
+      "exit_code": 0
+    },
+    {
+      "command": [
+        "timeout",
+        "120",
+        "taskset",
+        "-c",
+        "112",
+        ".venv-python312-issues/bin/python",
+        "-m",
+        "pytest",
+        "-q",
+        "tests/test_reml_rank_deficient_penalty_geometry.py::test_firth_two_smooths_recovers_probability[13]",
+        "--tb=short",
+        "--show-capture=no",
+        "-ra"
+      ],
+      "extension_sha256": "d449d353e3c7cd2f0cf3fc3061a6b7085aa90b1ea61a78ede34937ce75f8eef8",
+      "exit_code": 0,
+      "elapsed_seconds": 35.668980921036564,
+      "log_file": "rank-eval-differential-firth-13.log",
+      "log_sha256": "4aa20a6f784d1bdc94270ac561d507ee29ff3c4c4ba60f7941967507178360ad",
+      "pytest_summary": "1 passed in 34.70s"
+    },
+    {
+      "case": "firth-14",
+      "seconds": 30.088634252548218,
+      "elf_sha256": "d449d353e3c7cd2f0cf3fc3061a6b7085aa90b1ea61a78ede34937ce75f8eef8",
+      "cpu": 113,
+      "log_file": "rank-eval-complete-firth-14.log",
+      "log_sha256": "1fa0f74858309a1ef99afbe9f3116713868ec4048a98c81090aade8d5e4f5033",
+      "pytest_summary": "1 passed in 28.42s",
+      "exit_code": 0
+    },
+    {
+      "case": "firth-15",
+      "seconds": 53.971105098724365,
+      "elf_sha256": "d449d353e3c7cd2f0cf3fc3061a6b7085aa90b1ea61a78ede34937ce75f8eef8",
+      "cpu": 114,
+      "log_file": "rank-eval-complete-firth-15.log",
+      "log_sha256": "5871f98a437f23e1aefdbcc675a1056eae6f96713a30a54d1a6ce8fd64c5c581",
+      "pytest_summary": "1 passed in 52.46s",
+      "exit_code": 0
+    },
+    {
+      "case": "firth-16",
+      "seconds": 85.3018536567688,
+      "elf_sha256": "d449d353e3c7cd2f0cf3fc3061a6b7085aa90b1ea61a78ede34937ce75f8eef8",
+      "cpu": 115,
+      "log_file": "rank-eval-complete-firth-16.log",
+      "log_sha256": "b211943273f869337b6a8eb1389f46155274ce21e0a61dfe40156bf3b2d3cea9",
+      "pytest_summary": "1 passed in 83.76s (0:01:23)",
+      "exit_code": 0
+    },
+    {
+      "command": [
+        "timeout",
+        "120",
+        "taskset",
+        "-c",
+        "113",
+        ".venv-python312-issues/bin/python",
+        "-m",
+        "pytest",
+        "-q",
+        "tests/test_reml_rank_deficient_penalty_geometry.py::test_firth_two_smooths_recovers_probability[17]",
+        "--tb=short",
+        "--show-capture=no",
+        "-ra"
+      ],
+      "extension_sha256": "d449d353e3c7cd2f0cf3fc3061a6b7085aa90b1ea61a78ede34937ce75f8eef8",
+      "exit_code": 0,
+      "elapsed_seconds": 34.15631518897135,
+      "log_file": "rank-eval-differential-firth-17.log",
+      "log_sha256": "fa1e0d519d205dec2089480929f9c8c518bda1355e01107eefa0258ab5e143e0",
+      "pytest_summary": "1 passed in 33.35s"
+    },
+    {
+      "case": "firth-18",
+      "seconds": 72.66798663139343,
+      "elf_sha256": "d449d353e3c7cd2f0cf3fc3061a6b7085aa90b1ea61a78ede34937ce75f8eef8",
+      "cpu": 112,
+      "log_file": "rank-eval-complete-firth-18.log",
+      "log_sha256": "c2cd333c8a10abcdfc4127b4aa442d64fd8a255b3011fcdfcf287a6d0fb158b6",
+      "pytest_summary": "1 passed in 71.04s (0:01:11)",
+      "exit_code": 0
+    },
+    {
+      "case": "firth-19",
+      "seconds": 52.2934992313385,
+      "elf_sha256": "d449d353e3c7cd2f0cf3fc3061a6b7085aa90b1ea61a78ede34937ce75f8eef8",
+      "cpu": 113,
+      "log_file": "rank-eval-complete-firth-19.log",
+      "log_sha256": "8a3fc02649f77cc93de28dc27460eb5de10443531cc9f279a267c61c2910c1d2",
+      "pytest_summary": "1 passed in 50.71s",
+      "exit_code": 0
+    },
+    {
+      "command": [
+        "timeout",
+        "120",
+        "taskset",
+        "-c",
+        "114",
+        ".venv-python312-issues/bin/python",
+        "-m",
+        "pytest",
+        "-q",
+        "tests/test_reml_rank_deficient_penalty_geometry.py::test_firth_two_smooths_recovers_probability[20]",
+        "--tb=short",
+        "--show-capture=no",
+        "-ra"
+      ],
+      "extension_sha256": "d449d353e3c7cd2f0cf3fc3061a6b7085aa90b1ea61a78ede34937ce75f8eef8",
+      "exit_code": 0,
+      "elapsed_seconds": 27.643864296958782,
+      "log_file": "rank-eval-differential-firth-20.log",
+      "log_sha256": "e55229cfa230ff67fa66581feaddbe2d9ab5656d408af04b5f9cb0e72028d7ed",
+      "pytest_summary": "1 passed in 26.72s"
+    },
+    {
+      "case": "firth-21",
+      "seconds": 51.48928785324097,
+      "elf_sha256": "d449d353e3c7cd2f0cf3fc3061a6b7085aa90b1ea61a78ede34937ce75f8eef8",
+      "cpu": 114,
+      "log_file": "rank-eval-complete-firth-21.log",
+      "log_sha256": "0eccec4abda4019bdf5383c76d18605c785a3804c6b4475cc50dd5c53abfa016",
+      "pytest_summary": "1 passed in 49.86s",
+      "exit_code": 0
+    },
+    {
+      "case": "firth-22",
+      "seconds": 77.48766279220581,
+      "elf_sha256": "d449d353e3c7cd2f0cf3fc3061a6b7085aa90b1ea61a78ede34937ce75f8eef8",
+      "cpu": 115,
+      "log_file": "rank-eval-complete-firth-22.log",
+      "log_sha256": "efae39ff54b7198051e671b606429b8e28c7b6422efc4c74c6723e5b77af26ba",
+      "pytest_summary": "1 passed in 75.98s (0:01:15)",
+      "exit_code": 0
+    },
+    {
+      "case": "firth-23",
+      "seconds": 52.38433861732483,
+      "elf_sha256": "d449d353e3c7cd2f0cf3fc3061a6b7085aa90b1ea61a78ede34937ce75f8eef8",
+      "cpu": 112,
+      "log_file": "rank-eval-complete-firth-23.log",
+      "log_sha256": "014862c92bcba759ebb53b9a3a477a15309bdb8211741b85bd17210c497d2321",
+      "pytest_summary": "1 passed in 50.87s",
+      "exit_code": 0
+    },
+    {
+      "case": "firth-24",
+      "seconds": 31.499537467956543,
+      "elf_sha256": "d449d353e3c7cd2f0cf3fc3061a6b7085aa90b1ea61a78ede34937ce75f8eef8",
+      "cpu": 113,
+      "log_file": "rank-eval-complete-firth-24.log",
+      "log_sha256": "b4d652c6e4db25e41f4b30ff8441a4f3e1119190f2d1f7d5ca7ead528c44c652",
+      "pytest_summary": "1 passed in 29.59s",
+      "exit_code": 0
+    },
+    {
+      "case": "firth-25",
+      "seconds": 33.06229853630066,
+      "elf_sha256": "d449d353e3c7cd2f0cf3fc3061a6b7085aa90b1ea61a78ede34937ce75f8eef8",
+      "cpu": 114,
+      "log_file": "rank-eval-complete-firth-25.log",
+      "log_sha256": "beb29c678d921b61aac2e906b935c32b946ed45b4b40623de36248827456c998",
+      "pytest_summary": "1 passed in 31.19s",
+      "exit_code": 0
+    },
+    {
+      "case": "firth-26",
+      "seconds": 28.752426862716675,
+      "elf_sha256": "d449d353e3c7cd2f0cf3fc3061a6b7085aa90b1ea61a78ede34937ce75f8eef8",
+      "cpu": 115,
+      "log_file": "rank-eval-complete-firth-26.log",
+      "log_sha256": "b7075142aba019f5451a29ae1206015b3a6ce4e8b15607d93c726ad373e69a0b",
+      "pytest_summary": "1 passed in 27.11s",
+      "exit_code": 0
+    },
+    {
+      "case": "firth-27",
+      "seconds": 52.617199420928955,
+      "elf_sha256": "d449d353e3c7cd2f0cf3fc3061a6b7085aa90b1ea61a78ede34937ce75f8eef8",
+      "cpu": 112,
+      "log_file": "rank-eval-complete-firth-27.log",
+      "log_sha256": "5541c0a0a4d8610e0e0e4c712dace302332a4cad258ce689b05dca66c43d01ee",
+      "pytest_summary": "1 passed in 50.97s",
+      "exit_code": 0
+    },
+    {
+      "case": "firth-28",
+      "seconds": 52.98285484313965,
+      "elf_sha256": "d449d353e3c7cd2f0cf3fc3061a6b7085aa90b1ea61a78ede34937ce75f8eef8",
+      "cpu": 113,
+      "log_file": "rank-eval-complete-firth-28.log",
+      "log_sha256": "fbce0e121efe5ad0574bc7816e996a98416a990919b903ffa0a6855f0c2c520b",
+      "pytest_summary": "1 passed in 51.38s",
+      "exit_code": 0
+    },
+    {
+      "case": "firth-29",
+      "seconds": 29.95604681968689,
+      "elf_sha256": "d449d353e3c7cd2f0cf3fc3061a6b7085aa90b1ea61a78ede34937ce75f8eef8",
+      "cpu": 114,
+      "log_file": "rank-eval-complete-firth-29.log",
+      "log_sha256": "3cab73f675c1a709a4f670f15b8dd56fd29dbb557d28ed15e1468fd2f304762b",
+      "pytest_summary": "1 passed in 28.39s",
+      "exit_code": 0
+    },
+    {
+      "case": "paired-0",
+      "seconds": 34.47367024421692,
+      "elf_sha256": "d449d353e3c7cd2f0cf3fc3061a6b7085aa90b1ea61a78ede34937ce75f8eef8",
+      "cpu": 115,
+      "log_file": "rank-eval-complete-paired-0.log",
+      "log_sha256": "beff3a86fac5c2bb155b0a63f3d92049724ac8a4d3d31f54a4f3dac5093beb86",
+      "pytest_summary": "1 passed in 32.49s",
+      "exit_code": 0
+    },
+    {
+      "case": "paired-2",
+      "seconds": 62.11778259277344,
+      "elf_sha256": "d449d353e3c7cd2f0cf3fc3061a6b7085aa90b1ea61a78ede34937ce75f8eef8",
+      "cpu": 112,
+      "log_file": "rank-eval-complete-paired-2.log",
+      "log_sha256": "5b4997155a5a57fb5e423730874c3800326610d80c576c7279fef06daf2840c4",
+      "pytest_summary": "1 passed in 60.46s (0:01:00)",
+      "exit_code": 0
+    },
+    {
+      "case": "paired-9",
+      "seconds": 76.84237909317017,
+      "elf_sha256": "d449d353e3c7cd2f0cf3fc3061a6b7085aa90b1ea61a78ede34937ce75f8eef8",
+      "cpu": 113,
+      "log_file": "rank-eval-complete-paired-9.log",
+      "log_sha256": "97c9ee5dbf5884ae4f49caad6c06bd514c59ff349a92b60d436e3d8637d04d91",
+      "pytest_summary": "1 passed in 75.11s (0:01:15)",
+      "exit_code": 0
+    }
+  ],
+  "final_artifact_recheck": {
+    "extension_sha256": "7112c1fffe857fb5eaf709c93bbc6de6b899925329f287b53ef66ba506c7509c",
+    "cases": [
+      {
+        "case": "firth-5",
+        "exit": 0,
+        "seconds": 40.42394304275513,
+        "elf_sha256": "7112c1fffe857fb5eaf709c93bbc6de6b899925329f287b53ef66ba506c7509c",
+        "cpu": 114
+      },
+      {
+        "case": "firth-8",
+        "exit": 0,
+        "seconds": 41.04334235191345,
+        "elf_sha256": "7112c1fffe857fb5eaf709c93bbc6de6b899925329f287b53ef66ba506c7509c",
+        "cpu": 115
+      },
+      {
+        "case": "firth-9",
+        "exit": 0,
+        "seconds": 69.64107608795166,
+        "elf_sha256": "7112c1fffe857fb5eaf709c93bbc6de6b899925329f287b53ef66ba506c7509c",
+        "cpu": 114
+      },
+      {
+        "case": "firth-11",
+        "exit": 0,
+        "seconds": 28.047548532485962,
+        "elf_sha256": "7112c1fffe857fb5eaf709c93bbc6de6b899925329f287b53ef66ba506c7509c",
+        "cpu": 115
+      },
+      {
+        "case": "firth-13",
+        "exit": 0,
+        "seconds": 34.8905246257782,
+        "elf_sha256": "7112c1fffe857fb5eaf709c93bbc6de6b899925329f287b53ef66ba506c7509c",
+        "cpu": 114
+      },
+      {
+        "case": "firth-17",
+        "exit": 0,
+        "seconds": 33.69646644592285,
+        "elf_sha256": "7112c1fffe857fb5eaf709c93bbc6de6b899925329f287b53ef66ba506c7509c",
+        "cpu": 115
+      },
+      {
+        "case": "firth-20",
+        "exit": 0,
+        "seconds": 29.458178997039795,
+        "elf_sha256": "7112c1fffe857fb5eaf709c93bbc6de6b899925329f287b53ef66ba506c7509c",
+        "cpu": 114
+      }
+    ],
+    "block_and_constrained": "146 passed, 73 deselected in 5.50s"
+  }
+}
