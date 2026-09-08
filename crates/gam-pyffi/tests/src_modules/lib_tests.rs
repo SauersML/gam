@@ -5,6 +5,9 @@ use super::*;
 use gam::inference::model::{MODEL_PAYLOAD_VERSION, ModelKind};
 use ndarray::{array, s};
 
+#[path = "latent_reml_2833.rs"]
+mod latent_reml_2833;
+
 #[test]
 fn pyffi_sources_use_canonical_gam_module_paths() {
     let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -1760,7 +1763,7 @@ fn issue_876_periodic_latent_duchon_decoder_is_seam_consistent_and_recovers_circ
     let t_flat = Array1::from(theta.clone());
     let t_flat_shift = Array1::from(theta_shift.clone());
 
-    let (design_per, _, _) = build_latent_duchon_design(
+    let (design_per, _) = build_latent_duchon_design(
         t_flat.view(),
         n_obs,
         latent_dim,
@@ -1769,7 +1772,7 @@ fn issue_876_periodic_latent_duchon_decoder_is_seam_consistent_and_recovers_circ
         Some(descriptor.as_slice()),
     )
     .expect("periodic latent Duchon design");
-    let (design_per_shift, _, _) = build_latent_duchon_design(
+    let (design_per_shift, _) = build_latent_duchon_design(
         t_flat_shift.view(),
         n_obs,
         latent_dim,
@@ -1792,10 +1795,10 @@ fn issue_876_periodic_latent_duchon_decoder_is_seam_consistent_and_recovers_circ
     );
 
     // The OPEN Euclidean decoder (None) is NOT periodic: it must visibly differ.
-    let (design_open, _, _) =
+    let (design_open, _) =
         build_latent_duchon_design(t_flat.view(), n_obs, latent_dim, centers.view(), m, None)
             .expect("open Euclidean latent Duchon design");
-    let (design_open_shift, _, _) = build_latent_duchon_design(
+    let (design_open_shift, _) = build_latent_duchon_design(
         t_flat_shift.view(),
         n_obs,
         latent_dim,

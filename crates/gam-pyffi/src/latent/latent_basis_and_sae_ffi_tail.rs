@@ -2254,10 +2254,8 @@ fn gaussian_reml_fit_latent_backward<'py>(
         None,
     )
     .map_err(|err| py_value_error(err.to_string()))?;
-    // The core REML adjoint is the single source of truth for every upstream,
-    // including the score's design derivative.  Contracting that derivative
-    // with the matching basis jet below avoids maintaining a second REML
-    // derivative in this binding layer.
+    // Every output lane uses the same core REML adjoint, including its
+    // determinant, dispersion, and implicit smoothing-strength derivatives.
     let backward = gaussian_reml_multi_closed_form_backward_from_fit(
         design.view(),
         y_view,

@@ -6819,7 +6819,7 @@ fn build_latent_duchon_design(
     centers: ArrayView2<'_, f64>,
     m: usize,
     periodic: Option<&[Option<f64>]>,
-) -> Result<(Array2<f64>, Array2<f64>, Option<Array2<f64>>), String> {
+) -> Result<(Array2<f64>, Array2<f64>), String> {
     if t_flat.len() != n_obs * latent_dim {
         return Err(format!(
             "latent t length {} != n_obs * latent_dim = {}",
@@ -6868,11 +6868,31 @@ fn build_latent_duchon_design(
     // wrap = TAU for circle/torus); a `None` axis is a Euclidean (open) axis.
     // When `periodic` is `None`/all-open the basis stays byte-identical to the
     // open Euclidean construction (euclidean / sphere / matern latent fits).
-    let periodic_axes = periodic.filter(|axes| {
-        axes.len() == latent_dim && axes.iter().any(|p| p.is_some())
+    let periodic_flags: Option<Vec<bool>> = periodic.and_then(|axes| {
+        if axes.len() == latent_dim && axes.iter().any(|p| p.is_some()) {
+            Some(axes.iter().map(|p| p.is_some()).collect())
+        } else {
+            None
+        }
     });
+    // The caller's penalty and coefficient adjoints use a fixed coefficient
+    // frame. Re-estimating a data-metric radial chart here would silently move
+    // that frame with the whole latent batch, changing both the represented
+    // prior and the derivative (issue #2833). Freeze the canonical constrained
+    // kernel frame explicitly; its row-local jets then differentiate exactly
+    // the design used by Gaussian, GLM, and latent optimization entrypoints.
+    // Periodic builders already have a fixed frame and do not use this chart.
+    let radial_reparam = if periodic_flags.is_none() {
+        let effective_nullspace =
+            duchon_effective_nullspace_order(centers, resolved_nullspace);
+        let constraint = duchon_kernel_constraint_nullspace(centers, effective_nullspace)
+            .map_err(|err| err.to_string())?;
+        Some(Array2::eye(constraint.ncols()))
+    } else {
+        None
+    };
     let spec = DuchonBasisSpec {
-        radial_reparam: None,
+        radial_reparam,
         center_strategy: CenterStrategy::UserProvided(center_matrix.clone()),
         length_scale: None,
         power: resolved_power as f64,
@@ -6883,44 +6903,25 @@ fn build_latent_duchon_design(
         periodic: None,
         boundary: OneDimensionalBoundary::Open,
     };
-    let built = if let Some(axes) = periodic_axes {
+    let built = if let Some(flags) = periodic_flags {
         // `periodic` is Some with the same arity (checked above). Each periodic
         // axis carries an explicit chart period (TAU); non-periodic axes get a
         // placeholder period (unused by the builder for `!periodic` axes).
-        let flags: Vec<bool> = axes.iter().map(Option::is_some).collect();
+        let axes = periodic.expect("periodic_flags is only Some when periodic is Some");
         let periods: Vec<f64> = axes.iter().map(|p| p.unwrap_or(1.0)).collect();
         build_duchon_basis_mixed_periodicity_auto(t_mat.view(), &spec, &flags, Some(&periods))
             .map_err(|err| {
                 format!("failed to evaluate periodic N-D Duchon basis for LatentCoord: {err}")
             })?
     } else {
-        // Resolve the data-metric radial chart once on the fixed center cloud,
-        // then replay it at the moving latent rows.  This retains the
-        // conditioning of #1355 without allowing one changed latent row to
-        // rotate every other row (and the caller-supplied penalty) into a new
-        // coefficient frame.
-        let center_built = build_duchon_basis(center_matrix.view(), &spec)
-            .map_err(|err| format!("failed to freeze latent Duchon center chart: {err}"))?;
-        let radial_reparam = match center_built.metadata {
-            gam::terms::basis::BasisMetadata::Duchon { radial_reparam, .. } => radial_reparam,
-            _ => None,
-        };
-        let mut frozen_spec = spec.clone();
-        frozen_spec.radial_reparam = radial_reparam;
-        build_duchon_basis(t_mat.view(), &frozen_spec)
+        build_duchon_basis(t_mat.view(), &spec)
             .map_err(|err| format!("failed to evaluate N-D Duchon basis for LatentCoord: {err}"))?
-    };
-    let radial_reparam = match &built.metadata {
-        gam::terms::basis::BasisMetadata::Duchon { radial_reparam, .. } => {
-            radial_reparam.clone()
-        }
-        _ => None,
     };
     let design = built
         .design
         .try_to_dense_by_chunks("latent_duchon_design")
         .map_err(|err| format!("failed to evaluate N-D Duchon basis for LatentCoord: {err}"))?;
-    Ok((design, t_mat, radial_reparam))
+    Ok((design, t_mat))
 }
 
 /// Input-location jet `∂Φ/∂t` of the PERIODIC latent Duchon design, matching the
@@ -7195,67 +7196,8 @@ fn build_latent_forward_design(
     let basis_kind = latent_basis_kind(basis_kind)?;
     let (design, t_mat) = match basis_kind {
         "duchon" => {
-            let (design, t_mat, radial_reparam) =
+            let (design, t_mat) =
                 build_latent_duchon_design(t_flat, n_obs, latent_dim, centers, m, periodic)?;
-            if !periodic
-                .map(|axes| axes.iter().any(Option::is_some))
-                .unwrap_or(false)
-            {
-                let (resolved_nullspace, resolved_power) = resolve_duchon_orders(
-                    latent_dim,
-                    duchon_nullspace_order_from_m(m),
-                    0,
-                    None,
-                );
-                let periodic_flags = vec![false; latent_dim];
-                let periods = vec![1.0; latent_dim];
-                let (_canonical_design, raw_jet, _hess) =
-                    gam::terms::basis::build_duchon_basis_design_and_jets(
-                        t_mat.view(),
-                        centers,
-                        None,
-                        resolved_power as f64,
-                        resolved_nullspace,
-                        &periodic_flags,
-                        &periods,
-                    )
-                    .map_err(|err| {
-                        format!("failed to evaluate N-D Duchon basis for LatentCoord: {err}")
-                    })?;
-                let jet = if let Some(v) = radial_reparam {
-                    let n_raw_radial = v.nrows();
-                    let n_poly = raw_jet.shape()[1].saturating_sub(n_raw_radial);
-                    let mut charted_jet = Array3::<f64>::zeros((
-                        n_obs,
-                        v.ncols() + n_poly,
-                        latent_dim,
-                    ));
-                    for axis in 0..latent_dim {
-                        let radial = raw_jet.slice(s![.., ..n_raw_radial, axis]).dot(&v);
-                        charted_jet
-                            .slice_mut(s![.., ..v.ncols(), axis])
-                            .assign(&radial);
-                    }
-                    if n_poly > 0 {
-                        charted_jet
-                            .slice_mut(s![.., v.ncols().., ..])
-                            .assign(&raw_jet.slice(s![.., n_raw_radial.., ..]));
-                    }
-                    charted_jet
-                } else {
-                    raw_jet
-                };
-                if jet.shape()[1] != design.ncols() {
-                    return Err(format!(
-                        "latent Duchon canonical design mismatch: forward is {}x{}, jet builder is {}x{}",
-                        design.nrows(),
-                        design.ncols(),
-                        jet.shape()[0],
-                        jet.shape()[1]
-                    ));
-                }
-                return Ok((design, t_mat, jet));
-            }
             // On a PERIODIC latent manifold (circle / torus) the forward design is
             // the periodic Duchon basis (1-D Bernoulli Green's function or the
             // multi-axis chord-distance polyharmonic) — a DIFFERENT kernel and

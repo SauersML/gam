@@ -646,8 +646,7 @@ fn glm_reml_fit_latent_impl(
     }
     // GLM standalone latent fit: no manifold/chart concept here, so the latent
     // Duchon decoder stays the open Euclidean basis (byte-identical).
-    let (design, t_mat, _radial_reparam) =
-        build_latent_duchon_design(t_flat, n_obs, latent_dim, centers, m, None)?;
+    let (design, t_mat) = build_latent_duchon_design(t_flat, n_obs, latent_dim, centers, m, None)?;
     if penalty.dim() != (design.ncols(), design.ncols()) {
         return Err(format!(
             "penalty shape mismatch: expected {}x{}, got {}x{}",
@@ -862,7 +861,7 @@ fn glm_reml_fit_latent<'py>(
         // multi-output canonical fitters (issue #349): the multinomial path
         // consumes the active `(N, K-1, K-1)` leading sub-block and the
         // binomial-multi path the diagonal of each `(N, K, K)` block.
-        let (design, t_mat, _radial_reparam) = build_latent_duchon_design(
+        let (design, t_mat) = build_latent_duchon_design(
             t_values.view(),
             n_obs,
             latent_dim,

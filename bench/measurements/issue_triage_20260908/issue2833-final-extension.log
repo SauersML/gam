@@ -1,0 +1,24 @@
+🍹 Building a mixed python/rust project
+🐍 Found CPython 3.12 at /projects/standard/hsiehph/sauer354/gam-main-validation/.venv-msi/bin/python
+🔗 Found pyo3 bindings with abi3-py3.10 support
+📡 Using build options locked from pyproject.toml
+   Compiling gam-math v0.3.154 (/projects/standard/hsiehph/sauer354/gam-main-validation/crates/gam-math)
+   Compiling gam v0.3.154 (/projects/standard/hsiehph/sauer354/gam-main-validation)
+   Compiling gam-geometry v0.3.154 (/projects/standard/hsiehph/sauer354/gam-main-validation/crates/gam-geometry)
+   Compiling gam-problem v0.3.154 (/projects/standard/hsiehph/sauer354/gam-main-validation/crates/gam-problem)
+   Compiling gam-terms v0.3.154 (/projects/standard/hsiehph/sauer354/gam-main-validation/crates/gam-terms)
+   Compiling gam-model-api v0.3.154 (/projects/standard/hsiehph/sauer354/gam-main-validation/crates/gam-model-api)
+   Compiling gam-solve v0.3.154 (/projects/standard/hsiehph/sauer354/gam-main-validation/crates/gam-solve)
+warning: gam@0.3.154: no .git at /projects/standard/hsiehph/sauer354/gam-main-validation; skipping tracked-file audits (source-archive build)
+   Compiling gam-identifiability v0.3.154 (/projects/standard/hsiehph/sauer354/gam-main-validation/crates/gam-identifiability)
+   Compiling gam-custom-family v0.3.154 (/projects/standard/hsiehph/sauer354/gam-main-validation/crates/gam-custom-family)
+   Compiling gam-model-kernels v0.3.154 (/projects/standard/hsiehph/sauer354/gam-main-validation/crates/gam-model-kernels)
+   Compiling gam-sae v0.3.154 (/projects/standard/hsiehph/sauer354/gam-main-validation/crates/gam-sae)
+   Compiling gam-models v0.3.154 (/projects/standard/hsiehph/sauer354/gam-main-validation/crates/gam-models)
+   Compiling gam-inference v0.3.154 (/projects/standard/hsiehph/sauer354/gam-main-validation/crates/gam-inference)
+   Compiling gam-predict v0.3.154 (/projects/standard/hsiehph/sauer354/gam-main-validation/crates/gam-predict)
+   Compiling gam-config v0.3.154 (/projects/standard/hsiehph/sauer354/gam-main-validation/crates/gam-config)
+   Compiling gam-test-support v0.3.154 (/projects/standard/hsiehph/sauer354/gam-main-validation/crates/gam-test-support)
+   Compiling gam-pyffi v0.1.264 (/projects/standard/hsiehph/sauer354/gam-main-validation/crates/gam-pyffi)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 2m 52s
+📦 Built wheel for abi3 Python ≥ 3.10 to bench/measurements/issue_triage_20260908/final-wheels/gamfit-0.1.264-cp310-abi3-manylinux_2_28_x86_64.whl

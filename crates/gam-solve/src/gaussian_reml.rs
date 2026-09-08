@@ -2,8 +2,8 @@ use crate::estimate::EstimationError;
 use crate::rho_optimizer::{FallbackPolicy, OuterProblem};
 use faer::Side;
 use gam_linalg::faer_ndarray::{
-    FaerCholesky, FaerEigh, default_rrqr_rank_alpha, fast_ab, fast_atb, fast_xt_diag_x,
-    fast_xt_diag_y, rrqr_with_permutation,
+    FaerArrayView, FaerCholesky, FaerEigh, FaerSvd, default_rrqr_rank_alpha, fast_ab, fast_atb,
+    fast_xt_diag_x, fast_xt_diag_y, rrqr_with_permutation,
 };
 use gam_problem::{DeclaredHessianForm, Derivative, HessianValue, OuterEval, StationarityStandard};
 use gam_terms::construction::CanonicalPenalty;
@@ -3821,22 +3821,9 @@ fn add_rank_one_penalty_vjp(
     }
 }
 
-/// The one range/null threshold for a cached penalty spectrum.
-///
-/// `GaussianRemlEigenCache::penalty_rank` is *defined* as the number of
-/// eigenvalues strictly above this value, so any consumer that asks "is this
-/// direction in the range of `S`?" with a different predicate is answering a
-/// different question about the same matrix, and the two answers disagree on
-/// exactly the directions whose reciprocal is `1/roundoff`.
-///
-/// The threshold is relative to `max|δ|` and never floored at an absolute
-/// value, for the reason documented at the cache builder: an absolute floor
-/// breaks REML's invariance under `S → c·S`.
-///
-/// Evaluating this on the STORED eigenvalues gives the same number the cache
-/// builder computed before its sign cleanup: that loop only zeroes eigenvalues
-/// that are negative AND within tolerance, and such a value cannot have carried
-/// `max|δ|`.
+/// Relative rank tolerance in the supplied penalty's coefficient frame.
+/// Applying it to the data-whitened spectrum would make rank depend on X.
+/// No absolute floor is used, preserving invariance under S -> c S.
 fn penalty_range_tolerance(eigenvalues: ArrayView1<'_, f64>) -> f64 {
     let max_abs = eigenvalues
         .iter()
@@ -3844,34 +3831,10 @@ fn penalty_range_tolerance(eigenvalues: ArrayView1<'_, f64>) -> f64 {
     max_abs * EIGEN_REL_TOL
 }
 
-/// The cached penalty spectrum read through the ONE range/null predicate.
-///
-/// [`penalty_range_tolerance`] defines the threshold; this is the single place
-/// that APPLIES it, and every consumer of `cache.penalty_eigenvalues` goes
-/// through here. A direction that fails the test is reported as EXACTLY `0.0`,
-/// so a downstream `δ > 0.0` or `δ == 0.0` on a classified value re-reads that
-/// one predicate instead of introducing a second and a third.
-///
-/// #2740: before this existed the same array was partitioned three ways —
-/// `δ > EIGEN_REL_TOL·max|δ|` (which DEFINES `penalty_rank`), an absolute
-/// `δ > 0.0`, and an absolute `δ == 0.0`. A numerically null direction the
-/// eigensolver returns as a small POSITIVE number (measured at
-/// `3.20001575162645240e-18` on an ordinary second-difference penalty) was then
-/// simultaneously in the range set by one test and out of it by another. That
-/// is not a rounding difference but a POPULATION mismatch: the compactified limit cost
-/// summed `ln δ` over `count(δ > 0.0)` directions and subtracted
-/// `logdet_penalty_positive`, which is reconciled to exactly `penalty_rank`
-/// directions, so the ρ→+∞ limit cost the profile search compares against was
-/// wrong by `ln(3.2e-18) = −40.3` per disputed direction — and the same
-/// mismatch offset `Σ t/(1+t)` by `penalty_rank` in the gradient and in its
-/// interval enclosure.
-///
-/// Classifying rather than only counting also removes the disputed direction
-/// from `log|H| = Σ log(1 + λδ)`: keeping it there while `log|S|₊` counts only
-/// `penalty_rank` directions makes `V(ρ)` diverge like `(count − rank)·ρ/2`
-/// instead of approaching the finite `ρ→+∞` limit the compactified endpoint
-/// claims. Value, gradient, enclosure, limit, coefficients and dispersion all
-/// therefore score the SAME matrix.
+/// All score and adjoint consumers use the same penalty range (#2740).
+/// Its dimension comes from the supplied penalty, before data whitening
+/// (#2833). The ascending generalized spectrum's first `nullity` entries
+/// represent its nullspace, including any positive eigensolver roundoff.
 impl GaussianRemlEigenCache {
     /// The λ-selection domain of this penalty against this design (#2812).
     /// The score's penalty-range modes enter as `log(1 + e^ρ δ_j)` over the
@@ -3903,14 +3866,14 @@ impl GaussianRemlEigenCache {
 #[derive(Clone, Copy)]
 struct PenaltyRangeSpectrum<'a> {
     eigenvalues: &'a Array1<f64>,
-    tolerance: f64,
+    nullity: usize,
 }
 
 impl<'a> PenaltyRangeSpectrum<'a> {
     fn of(cache: &'a GaussianRemlEigenCache) -> Self {
         Self {
             eigenvalues: &cache.penalty_eigenvalues,
-            tolerance: penalty_range_tolerance(cache.penalty_eigenvalues.view()),
+            nullity: cache.nullity,
         }
     }
 
@@ -3923,22 +3886,16 @@ impl<'a> PenaltyRangeSpectrum<'a> {
     #[inline]
     fn get(&self, index: usize) -> f64 {
         let delta = self.eigenvalues[index];
-        if delta > self.tolerance { delta } else { 0.0 }
+        if index >= self.nullity { delta } else { 0.0 }
     }
 
     fn iter(&self) -> impl Iterator<Item = f64> + '_ {
         (0..self.len()).map(move |index| self.get(index))
     }
 
-    /// The number of range directions under this same predicate — the quantity
-    /// `GaussianRemlEigenCache::penalty_rank` is defined to be, recomputed here
-    /// so a sum and the count it is differenced against can never be populated
-    /// by two different rules.
+    /// Check that every direction of the declared range has positive curvature.
     fn rank(&self) -> usize {
-        self.eigenvalues
-            .iter()
-            .filter(|&&delta| delta > self.tolerance)
-            .count()
+        self.iter().filter(|&delta| delta > 0.0).count()
     }
 }
 
@@ -3946,41 +3903,14 @@ fn gaussian_reml_penalty_pseudoinverse_from_cache(
     cache: &GaussianRemlEigenCache,
 ) -> Result<Array2<f64>, EstimationError> {
     let p = cache.penalty_eigenvalues.len();
-    // Ask the range/null question with the SAME predicate that defined
-    // `cache.penalty_rank`.  `δ > 0.0` is a different question: the cache's
-    // cleanup loop zeroes only NEGATIVE eigenvalues inside the tolerance, so a
-    // numerically null direction the eigensolver returned as `+3.2e-18` is
-    // classified null by `penalty_rank` and positive here — and this is the one
-    // consumer that divides by it.  Measured at `p = 8` on a second-difference
-    // penalty: `penalty_rank = 6`, seven eigenvalues pass `δ > 0.0`, and the
-    // seventh contributes `1/3.20001575162645240e-18 = 3.125e17`, which lands in
-    // the returned penalty gradient as entries of `1.618287e15` — fifteen orders
-    // above every legitimate term, on healthy and near-interpolating charts
-    // alike.  See [`penalty_range_tolerance`].
-    // The shared predicate makes the selected count equal `penalty_rank` by
-    // construction only when `penalty_rank` was derived from THIS array.  A
-    // cache supplied through `GaussianRemlWarmStart` or `prepare_gaussian_reml`'s
-    // `Some(eigen_cache)` can carry a rank computed under another rule, and
-    // `validate_gaussian_reml_eigen_cache` checks only
-    // `penalty_rank + nullity == p` — never the rank against the spectrum.  So
-    // the agreement is checked rather than assumed.
-    //
-    // [`gaussian_penalty_positive_logdet`] reconciles the same disagreement by
-    // taking the `penalty_rank` largest, and this site deliberately does NOT
-    // copy that.  There the selected values are consumed as `ln(δ)`, which is
-    // bounded; here they are consumed as `1/δ`, so re-admitting a direction that
-    // failed the relative test reintroduces exactly the `1/roundoff` term this
-    // function was repaired to exclude — the reconciliation would restore the
-    // defect through its own fallback.  A dividing consumer has no safe
-    // reconstruction of a rank it cannot verify, so it refuses and says which
-    // two numbers disagreed.
+    // Divide only on the natural penalty range. A positive roundoff mode in
+    // its nullspace must never enter this inverse (#2739/#2740).
     let spectrum = PenaltyRangeSpectrum::of(cache);
-    let tolerance = spectrum.tolerance;
     let selected: Vec<usize> = (0..p).filter(|eig| spectrum.get(*eig) > 0.0).collect();
     if selected.len() != cache.penalty_rank {
         crate::bail_invalid_estim!(
             "Gaussian REML penalty pseudoinverse: the cache reports penalty_rank={} but {} of its \
-             {p} eigenvalues exceed the range tolerance {tolerance:e}; the pseudoinverse divides by \
+             {p} eigenvalues in the declared range are positive; the pseudoinverse divides by \
              each selected eigenvalue, so it cannot reconcile a rank it did not derive",
             cache.penalty_rank,
             selected.len()
@@ -4112,24 +4042,9 @@ pub fn build_gaussian_reml_eigen_cache_batched(
         }
     }
 
-    let mut results = Vec::with_capacity(k);
-    for (b, xtwx) in xtwx_matrices.into_iter().enumerate() {
-        let lower = match gaussian_reml_cholesky_lower(xtwx) {
-            Ok(l) => l,
-            Err(err) => {
-                results.push(Err(err));
-                continue;
-            }
-        };
-        results.push(gaussian_reml_eigen_cache_from_lower_with_transform(
-            lower,
-            penalty,
-            nullspace_dim,
-            fingerprints[b],
-            None,
-        ));
-    }
-    results
+    xtwx_matrices.into_iter()
+        .map(|xtwx| gaussian_reml_eigen_cache_from_xtwx(xtwx, penalty, nullspace_dim))
+        .collect()
 }
 
 fn batched_whitened_penalty_transforms(
@@ -4170,7 +4085,28 @@ pub fn build_gaussian_reml_eigen_cache_with_nullspace_dim(
     let weight = gaussian_reml_weights(n, weights)?;
 
     let xtwx = dense_xt_diag_x(x, weight.view());
-    gaussian_reml_eigen_cache_from_xtwx(xtwx, penalty, nullspace_dim)
+    // Factor the weighted design before squaring its condition number in X'WX.
+    // The Gram matrix remains the cache identity, never the factorization input.
+    let weighted_design = Array2::from_shape_fn(x.dim(), |(row, col)| {
+        weight[row].sqrt() * x[[row, col]]
+    });
+    let weighted_view = FaerArrayView::new(&weighted_design);
+    let qr = weighted_view.as_ref().qr();
+    let upper_view = qr.thin_R();
+    let mut upper = Array2::from_shape_fn(
+        (upper_view.nrows(), upper_view.ncols()), |(row, col)| upper_view[(row, col)],
+    );
+    if upper.nrows() != x.ncols() || upper.diag().iter().any(|v| !v.is_finite() || *v == 0.0) {
+        return Err(EstimationError::ModelIsIllConditioned { condition_number: f64::INFINITY });
+    }
+    for row in 0..upper.nrows() {
+        if upper[[row, row]] < 0.0 {
+            upper.row_mut(row).mapv_inplace(|value| -value);
+        }
+    }
+    gaussian_reml_eigen_cache_from_lower(
+        upper.t().to_owned(), penalty, nullspace_dim, matrix_fingerprint(xtwx.view()),
+    )
 }
 
 fn validate_gaussian_reml_design(
@@ -4286,20 +4222,46 @@ fn gaussian_reml_eigen_cache_from_lower_with_transform(
     }
     let penalty_fingerprint = matrix_fingerprint(penalty);
     let logdet_xtwx = 2.0 * lower.diag().iter().map(|v| v.ln()).sum::<f64>();
-    let transformed_penalty = match precomputed_transform {
-        Some(transformed) => transformed,
+    // Congruence preserves rank. Determine it in the supplied penalty's frame:
+    // data whitening can give even S=I a 1e12 spectral spread (#2833).
+    let (natural_eigenvalues, natural_eigenvectors) = penalty.eigh(Side::Lower).map_err(|_| {
+        EstimationError::ModelIsIllConditioned { condition_number: f64::INFINITY }
+    })?;
+    let natural_tolerance = penalty_range_tolerance(natural_eigenvalues.view());
+    if natural_eigenvalues.iter().any(|&value| value < -natural_tolerance) {
+        crate::bail_invalid_estim!("Gaussian REML penalty is not positive semidefinite");
+    }
+    let penalty_rank = natural_eigenvalues
+        .iter()
+        .filter(|&&value| value > natural_tolerance)
+        .count();
+    let nullity = p - penalty_rank;
+    let (mut penalty_eigenvalues, eigenvectors) = match precomputed_transform {
+        Some(transformed) => transformed.eigh(Side::Lower).map_err(|_| {
+            EstimationError::ModelIsIllConditioned { condition_number: f64::INFINITY }
+        })?,
         None => {
-            let l_inv = invert_lower_triangular(&lower)?;
-            let penalty_in_metric = dense_ab(l_inv.view(), penalty);
-            dense_ab(penalty_in_metric.view(), l_inv.t())
+            // S = C'C. Singular values of C L^-T preserve relative accuracy
+            // without forming the ill-conditioned squared operator L^-1 S L^-T.
+            let root_transpose = Array2::from_shape_fn((p, p), |(row, col)| {
+                if col < nullity {
+                    0.0
+                } else {
+                    natural_eigenvectors[[row, col]] * natural_eigenvalues[col].sqrt()
+                }
+            });
+            let whitened_root = solve_lower_triangular_matrix(&lower, &root_transpose)?;
+            let (_, singular, vt) = whitened_root.t().svd(false, true).map_err(|_| {
+                EstimationError::ModelIsIllConditioned { condition_number: f64::INFINITY }
+            })?;
+            let vt = vt.ok_or_else(|| EstimationError::ModelIsIllConditioned {
+                condition_number: f64::INFINITY,
+            })?;
+            let values = Array1::from_shape_fn(p, |col| singular[p - 1 - col].powi(2));
+            let vectors = Array2::from_shape_fn((p, p), |(row, col)| vt[[p - 1 - col, row]]);
+            (values, vectors)
         }
     };
-    let (mut penalty_eigenvalues, eigenvectors) =
-        transformed_penalty.eigh(Side::Lower).map_err(|_| {
-            EstimationError::ModelIsIllConditioned {
-                condition_number: f64::INFINITY,
-            }
-        })?;
     // Rank tolerance must be RELATIVE to the largest eigenvalue — never
     // floored at an absolute value. The old `.max(1.0)` clamped the
     // tolerance up whenever max|eig| < 1, classifying genuine modes as
@@ -4320,11 +4282,10 @@ fn gaussian_reml_eigen_cache_from_lower_with_transform(
             );
         }
     }
-    let penalty_rank = penalty_eigenvalues
-        .iter()
-        .filter(|&&value| value > eig_tol)
-        .count();
-    let nullity = p - penalty_rank;
+    if penalty_eigenvalues.iter().skip(nullity).any(|&value| value <= 0.0) {
+        return Err(EstimationError::ModelIsIllConditioned { condition_number: f64::INFINITY });
+    }
+    penalty_eigenvalues.slice_mut(s![..nullity]).fill(0.0);
     if let Some(expected_nullity) = nullspace_dim
         && expected_nullity != nullity
     {
@@ -4332,7 +4293,8 @@ fn gaussian_reml_eigen_cache_from_lower_with_transform(
             "Gaussian REML penalty nullspace mismatch: expected {expected_nullity}, inferred {nullity}"
         );
     }
-    let logdet_penalty_positive = gaussian_penalty_positive_logdet(penalty, penalty_rank)?;
+    let logdet_penalty_positive = natural_eigenvalues.iter().skip(nullity)
+        .map(|value| value.ln()).sum();
     let coefficient_basis = solve_upper_triangular_matrix(&lower.t().to_owned(), &eigenvectors)?;
 
     Ok(GaussianRemlEigenCache {
@@ -4408,47 +4370,6 @@ fn gaussian_reml_cholesky_lower(xtwx: Array2<f64>) -> Result<Array2<f64>, Estima
     })
 }
 
-fn gaussian_penalty_positive_logdet(
-    penalty: ArrayView2<'_, f64>,
-    penalty_rank: usize,
-) -> Result<f64, EstimationError> {
-    if penalty_rank == 0 {
-        return Ok(0.0);
-    }
-    let (pen_eigs, _) = penalty.to_owned().eigh(Side::Lower).map_err(|_| {
-        EstimationError::ModelIsIllConditioned {
-            condition_number: f64::INFINITY,
-        }
-    })?;
-    // Scale-invariant relative tolerance — see the cousin site for the
-    // rationale. Same `.max(1.0)` floor used to live here and corrupted
-    // the positive-eigenvalue count for small-scale penalties. This is a
-    // DIFFERENT array from the cache's (raw `S`, not `L⁻¹SL⁻ᵀ`), but it is the
-    // SAME criterion, so it is read from the one definition rather than
-    // re-derived here (#2740).
-    let pen_tol = penalty_range_tolerance(pen_eigs.view());
-    let mut positive_eigs: Vec<f64> = pen_eigs
-        .iter()
-        .copied()
-        .filter(|&value| value > pen_tol)
-        .collect();
-    if positive_eigs.len() != penalty_rank {
-        positive_eigs = pen_eigs
-            .iter()
-            .copied()
-            .filter(|&value| value > 0.0)
-            .collect();
-        positive_eigs.sort_by(|a, b| b.total_cmp(a));
-        if positive_eigs.len() < penalty_rank {
-            return Err(EstimationError::ModelIsIllConditioned {
-                condition_number: f64::INFINITY,
-            });
-        }
-        positive_eigs.truncate(penalty_rank);
-    }
-    Ok(positive_eigs.iter().map(|value| value.ln()).sum())
-}
-
 fn validate_gaussian_reml_eigen_cache(
     cache: &GaussianRemlEigenCache,
     p: usize,
@@ -4486,26 +4407,22 @@ fn validate_gaussian_reml_eigen_cache(
                 .to_string(),
         );
     }
-    // #2740: `penalty_rank` is DEFINED as the number of eigenvalues clearing
-    // `penalty_range_tolerance`, and `logdet_penalty_positive` is reconciled to
-    // exactly that many directions. Every consumer reads the spectrum through
-    // `PenaltyRangeSpectrum`, which applies the same test — but a cache handed in
-    // through `GaussianRemlWarmStart` or `prepare_gaussian_reml`'s
-    // `Some(eigen_cache)` can carry a rank counted under some other rule, and the
-    // shape check above never compares the rank against the spectrum. Then the
-    // objective's Σ over the range and the `penalty_rank` it is differenced
-    // against are populated by two different rules again, which is the whole
-    // defect. Check it here rather than assume it.
+    if cache.penalty_eigenvalues.windows(2).into_iter().any(|pair| pair[0] > pair[1]) {
+        crate::bail_invalid_estim!("Gaussian REML eigen cache spectrum must be ascending");
+    }
+    if cache.penalty_eigenvalues.iter().take(cache.nullity).any(|&value| value != 0.0) {
+        crate::bail_invalid_estim!("Gaussian REML eigen cache null modes must be exactly zero");
+    }
+    // All declared range directions must remain positive after whitening.
     let spectrum = PenaltyRangeSpectrum::of(cache);
     let classified_rank = spectrum.rank();
     if classified_rank != cache.penalty_rank {
         crate::bail_invalid_estim!(
             "Gaussian REML eigen cache reports penalty_rank={} but {classified_rank} of its {p} \
-             eigenvalues clear the range tolerance {:e}; the log-determinant sums run over the \
+             eigenvalues in its declared range are positive; the log-determinant sums run over the \
              directions that clear it while log|S|₊ and the gradient offset are denominated in \
              penalty_rank, so the two must be the same count",
-            cache.penalty_rank,
-            spectrum.tolerance
+            cache.penalty_rank
         );
     }
     Ok::<(), _>(())
@@ -4586,7 +4503,9 @@ fn prepare_gaussian_reml(
         });
     }
 
-    let cache = gaussian_reml_eigen_cache_from_xtwx(xtwx, penalty, nullspace_dim)?;
+    let cache = build_gaussian_reml_eigen_cache_with_nullspace_dim(
+        x, penalty, nullspace_dim, Some(weight.view()),
+    )?;
     if n_effective <= cache.nullity {
         crate::bail_invalid_estim!(
             "Gaussian REML requires more positive-weight rows than the nullspace dimension; got n_effective={n_effective}, nullity={}",
@@ -9033,16 +8952,49 @@ mod eigenvalue_range_predicate_agreement_2740_tests {
 
     const LARGEST: f64 = 4.0;
 
+    #[test]
+    fn identity_penalty_keeps_every_mode_on_an_ill_conditioned_design_2833() {
+        let x = Array2::from_shape_fn((12, 5), |(row, col)| {
+            let t = 0.1 + 0.8 * row as f64 / 11.0;
+            t.powi(col as i32) * 10.0_f64.powi(-(col as i32))
+        });
+        for scale in [1e-8, 1.0, 1e8] {
+            let penalty = Array2::eye(5) * scale;
+            let cache = build_gaussian_reml_eigen_cache_with_nullspace_dim(
+                x.view(), penalty.view(), Some(0), None,
+            ).expect("data conditioning cannot change the identity penalty's rank");
+            assert_eq!(cache.penalty_rank, 5);
+            assert_eq!(cache.nullity, 0);
+            validate_gaussian_reml_eigen_cache(&cache, 5).unwrap();
+            let mut invalid = cache.clone();
+            invalid.penalty_rank = 4;
+            invalid.nullity = 1;
+            assert!(validate_gaussian_reml_eigen_cache(&invalid, 5).is_err(),
+                "a supplied cache cannot silently discard a positive natural penalty mode");
+            assert!(cache.penalty_eigenvalues[0] <
+                penalty_range_tolerance(cache.penalty_eigenvalues.view()));
+            let inverse = gaussian_reml_penalty_pseudoinverse_from_cache(&cache).unwrap();
+            for row in 0..5 {
+                for col in 0..5 {
+                    let expected = if row == col { 1.0 } else { 0.0 };
+                    assert!((scale * inverse[[row, col]] - expected).abs() < 1e-7,
+                        "natural inverse ({row},{col}) = {} at scale {scale}",
+                        scale * inverse[[row, col]]);
+                }
+            }
+        }
+    }
+
     /// Range: `4.0` and `1.0`. Disputed (positive, below `4.0·1e-10 = 4e-10`):
     /// `5.0e-11` and `3.2e-18` — the second is the magnitude #2739 MEASURED on an
     /// ordinary second-difference penalty. Null: an exact `0.0`.
     ///
     /// `logdet_penalty_positive` is set to the log-determinant over the range
-    /// directions, which is what `gaussian_penalty_positive_logdet` reconciles it
-    /// to on a real cache: it is the quantity the compactified limit differences
+    /// directions, as in the natural penalty rank calculation on a real cache:
+    /// it is the quantity the compactified limit differences
     /// the eigenvalue sum against, so the fixture must denominate it the same way.
     fn disputed_band_cache() -> GaussianRemlEigenCache {
-        let eigenvalues = array![LARGEST, 1.0, 5.0e-11, 3.2e-18, 0.0];
+        let eigenvalues = array![0.0, 3.2e-18, 5.0e-11, 1.0, LARGEST];
         let p = eigenvalues.len();
         GaussianRemlEigenCache {
             penalty_eigenvalues: eigenvalues,
@@ -9063,13 +9015,7 @@ mod eigenvalue_range_predicate_agreement_2740_tests {
         let cache = disputed_band_cache();
         let spectrum = PenaltyRangeSpectrum::of(&cache);
 
-        // The threshold is derived from the spectrum and the file's relative
-        // rank constant, not chosen here.
-        assert_eq!(
-            spectrum.tolerance,
-            LARGEST * EIGEN_REL_TOL,
-            "the range threshold must be the relative one that defines penalty_rank"
-        );
+        assert_eq!(spectrum.nullity, cache.nullity);
 
         // NON-VACUITY: without a disputed band `δ > 0.0` and the relative test
         // coincide and every assertion below would pass on a fixture that could
@@ -9113,11 +9059,16 @@ mod eigenvalue_range_predicate_agreement_2740_tests {
     fn the_large_rho_logdet_gradient_vanishes_because_sum_and_offset_share_a_population() {
         let cache = disputed_band_cache();
         let spectrum = PenaltyRangeSpectrum::of(&cache);
-        let (_, cache_upper) = cache.resolvability_rho_domain();
-        let lambda = cache_upper.exp();
+        // This is an algebraic lambda -> infinity oracle, independent of the
+        // optimizer's finite resolvability window. Saturate even the smallest
+        // positive roundoff mode to distinguish the two range predicates.
+        let smallest_positive = cache.penalty_eigenvalues.iter().copied()
+            .filter(|&value| value > 0.0).fold(f64::INFINITY, f64::min);
+        let limit_rho = (100.0 / smallest_positive).ln();
+        let lambda = limit_rho.exp();
         let n_outputs = 1.0_f64;
 
-        let (term, _edf) = gaussian_reml_logdet_term(&cache, cache_upper, n_outputs);
+        let (term, _edf) = gaussian_reml_logdet_term(&cache, limit_rho, n_outputs);
 
         // The bound is the analytic residual of the SAME sum, not a chosen
         // tolerance, widened by the accumulation of `rank` additions.
