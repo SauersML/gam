@@ -1540,6 +1540,12 @@ pub trait MarginalSlopePsiFamily: Send + Sync {
         Ok(None)
     }
 
+    fn hessian_directional_derivatives_all_beta_axes(
+        &self,
+        psi_index: usize,
+        total: usize,
+    ) -> Result<Option<Vec<gam_problem::DriftDerivResult>>, String>;
+
     /// Hessian directional derivative for the σ-auxiliary parameter, returned
     /// as a dense matrix (the generic wraps it into
     /// [`DriftDerivResult::Dense`](gam_problem::DriftDerivResult::Dense)).
@@ -1622,6 +1628,15 @@ impl<F: MarginalSlopePsiFamily> gam_problem::ExactNewtonJointPsiWorkspace
             }
         }
         self.family.psi_second_order_terms_contracted(alpha_psi)
+    }
+
+    fn hessian_directional_derivatives_all_beta_axes(
+        &self,
+        psi_index: usize,
+        total: usize,
+    ) -> Result<Option<Vec<gam_problem::DriftDerivResult>>, String> {
+        self.family
+            .hessian_directional_derivatives_all_beta_axes(psi_index, total)
     }
 
     fn hessian_directional_derivative(

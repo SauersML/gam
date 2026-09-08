@@ -3731,6 +3731,55 @@ impl crate::marginal_slope_shared::MarginalSlopePsiFamily
             )
     }
 
+    fn hessian_directional_derivatives_all_beta_axes(
+        &self,
+        psi_index: usize,
+        total: usize,
+    ) -> Result<Option<Vec<gam_problem::DriftDerivResult>>, String> {
+        use gam_problem::DriftDerivResult;
+        if total != self.cache.slices.total {
+            return Err(format!(
+                "BMS psi derivative tensor: requested {total} coefficients, expected {}",
+                self.cache.slices.total
+            ));
+        }
+        let sigma = self.is_sigma_aux(psi_index);
+        if !sigma && !self.family.effective_flex_active(&self.block_states)? {
+            return self
+                .family
+                .rigid_psi_hessian_all_beta_axes(
+                    &self.block_states,
+                    self.hyper_layout.design_derivative_blocks(),
+                    psi_index,
+                    &self.cache,
+                    &self.options,
+                )
+                .map(|axes| {
+                    axes.map(|axes| axes.into_iter().map(DriftDerivResult::Dense).collect())
+                });
+        }
+        // Auxiliary-scale and flexible-link models have additional primary
+        // directions. Their exact directional operators retain that calculus.
+        let mut axes = Vec::with_capacity(total);
+        let mut direction = Array1::zeros(total);
+        for axis in 0..total {
+            direction[axis] = 1.0;
+            let derivative = if sigma {
+                self.sigma_hessian_directional_derivative(&direction)?
+                    .map(DriftDerivResult::Dense)
+            } else {
+                self.psi_hessian_directional_derivative(psi_index, &direction)?
+                    .map(DriftDerivResult::Operator)
+            };
+            let Some(derivative) = derivative else {
+                return Ok(None);
+            };
+            axes.push(derivative);
+            direction[axis] = 0.0;
+        }
+        Ok(Some(axes))
+    }
+
     fn psi_hessian_directional_derivative(
         &self,
         psi_index: usize,

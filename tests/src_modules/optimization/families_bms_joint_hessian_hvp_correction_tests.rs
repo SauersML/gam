@@ -1,5 +1,179 @@
 // ── Phase 7: joint-Hessian directional-derivative subsample tests ──
 
+#[test]
+fn rigid_psi_all_beta_axes_matches_directional_and_finite_difference_979() {
+    use crate::outer_subsample::OuterScoreSubsample;
+    // Unequal block widths and nonuniform weights exercise all coefficient
+    // permutations, including repeated indices and both moving designs.
+    for empirical in [false, true] {
+        let n = 97;
+        let mut family = make_block_psi_test_family(n);
+        if empirical {
+            family.latent_measure = empirical_rigid_fd_fixture().0.latent_measure;
+            family.gaussian_frailty_sd = Some(0.82);
+        }
+        let widths = [2, 3];
+        let designs: Vec<_> = widths
+            .iter()
+            .enumerate()
+            .map(|(block, &width)| {
+                Array2::from_shape_fn((n, width), |(i, j)| {
+                    0.2 + (0.13 * (i + 3 * j + 5 * block) as f64).sin() * 0.4
+                })
+            })
+            .collect();
+        family.marginal_design = DesignMatrix::Dense(designs[0].clone().into());
+        family.slope_design = DesignMatrix::Dense(designs[1].clone().into());
+        let states: Vec<_> = designs
+            .iter()
+            .map(|x| {
+                let beta = Array1::from_shape_fn(x.ncols(), |j| 0.12 + j as f64 * 0.03);
+                ParameterBlockState {
+                    eta: x.dot(&beta),
+                    beta,
+                }
+            })
+            .collect();
+        let blocks: Vec<_> = widths
+            .iter()
+            .enumerate()
+            .map(|(block, &width)| {
+                vec![crate::custom_family::CustomFamilyBlockPsiDerivative::new(
+                    None,
+                    Array2::from_shape_fn((n, width), |(i, j)| {
+                        (0.17 * (2 * i + j + 7 * block) as f64).cos() * 0.3
+                    }),
+                    Array2::zeros((width, width)),
+                    None,
+                    None,
+                    None,
+                    None,
+                )]
+            })
+            .collect();
+        for subsampled in [false, true] {
+            let mut options = BlockwiseFitOptions::default();
+            if subsampled {
+                options.outer_score_subsample =
+                    Some(Arc::new(OuterScoreSubsample::from_uniform_inclusion_mask(
+                        (0..n).step_by(3).collect(),
+                        n,
+                        979,
+                    )));
+            }
+            let cache = family.build_exact_eval_cache(&states).unwrap();
+            for psi in 0..2 {
+                let batch = family
+                    .rigid_psi_hessian_all_beta_axes(&states, &blocks, psi, &cache, &options)
+                    .unwrap()
+                    .unwrap();
+                for axis in 0..5 {
+                    let mut direction = Array1::zeros(5);
+                    direction[axis] = 1.0;
+                    let old = family.exact_newton_joint_psihessian_directional_derivative_operator_from_cache_with_options(
+                        &states, &blocks, psi, &direction, &cache, &options,
+                    ).unwrap().unwrap().to_dense();
+                    let rel = rel_diff_array2(&batch[axis], &old);
+                    assert!(
+                        rel < 2e-12,
+                        "empirical={empirical} subsample={subsampled} psi={psi} axis={axis} directional error={rel}"
+                    );
+                    let h = 2e-5;
+                    let evaluate = |step: f64| {
+                        let mut perturbed = states.clone();
+                        let block = usize::from(axis >= widths[0]);
+                        let local = axis - if block == 0 { 0 } else { widths[0] };
+                        perturbed[block].beta[local] += step;
+                        perturbed[block].eta = designs[block].dot(&perturbed[block].beta);
+                        let perturbed_cache = family.build_exact_eval_cache(&perturbed).unwrap();
+                        let terms = family
+                            .exact_newton_joint_psi_terms_from_cache_with_options(
+                                &perturbed,
+                                &blocks,
+                                psi,
+                                &perturbed_cache,
+                                &options,
+                            )
+                            .unwrap()
+                            .unwrap();
+                        match terms.hessian_psi_operator {
+                            Some(op) => op.to_dense(),
+                            None => terms.hessian_psi,
+                        }
+                    };
+                    let fd = (evaluate(h) - evaluate(-h)) / (2.0 * h);
+                    let rel = rel_diff_array2(&batch[axis], &fd);
+                    assert!(
+                        rel < 2e-7,
+                        "empirical={empirical} subsample={subsampled} psi={psi} axis={axis} FD error={rel}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn rigid_psi_all_beta_axes_wide_timing_979() {
+    let n = 1500;
+    let width = 12;
+    let mut family = make_block_psi_test_family(n);
+    let x = Array2::from_shape_fn((n, width), |(i, j)| {
+        (0.11 * (i + 7 * j) as f64).sin() * 0.3 + 0.1
+    });
+    family.marginal_design = DesignMatrix::Dense(x.clone().into());
+    family.slope_design = DesignMatrix::Dense(x.clone().into());
+    let beta = Array1::from_elem(width, 0.02);
+    let states = vec![
+        ParameterBlockState {
+            eta: x.dot(&beta),
+            beta
+        };
+        2
+    ];
+    let blocks = vec![
+        vec![crate::custom_family::CustomFamilyBlockPsiDerivative::new(
+            None,
+            &x * 0.4,
+            Array2::zeros((width, width)),
+            None,
+            None,
+            None,
+            None,
+        )],
+        Vec::new(),
+    ];
+    let cache = family.build_exact_eval_cache(&states).unwrap();
+    let options = BlockwiseFitOptions::default();
+    // Both measurements reuse the exact same warm row tensors.
+    family.rigid_third_full_cached(&states, &cache, 0).unwrap();
+    family.rigid_fourth_full_cached(&states, &cache, 0).unwrap();
+    let start = std::time::Instant::now();
+    let batch = family
+        .rigid_psi_hessian_all_beta_axes(&states, &blocks, 0, &cache, &options)
+        .unwrap()
+        .unwrap();
+    let batched = start.elapsed();
+    let start = std::time::Instant::now();
+    for axis in 0..2 * width {
+        let mut direction = Array1::zeros(2 * width);
+        direction[axis] = 1.0;
+        let old = family
+            .exact_newton_joint_psihessian_directional_derivative_operator_from_cache_with_options(
+                &states, &blocks, 0, &direction, &cache, &options,
+            )
+            .unwrap()
+            .unwrap()
+            .to_dense();
+        assert!(rel_diff_array2(&batch[axis], &old) < 2e-12);
+    }
+    eprintln!(
+        "979 mixed psi-beta n={n} p={} batched={batched:?} per_axis={:?}",
+        2 * width,
+        start.elapsed()
+    );
+}
+
 fn bms_test_design_hyper_layout(
     derivative_blocks: Vec<Vec<crate::custom_family::CustomFamilyBlockPsiDerivative>>,
     values: Array1<f64>,

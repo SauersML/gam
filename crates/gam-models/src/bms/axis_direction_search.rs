@@ -2495,6 +2495,111 @@ impl BernoulliMarginalSlopeFamily {
     /// `HyperOperator`. See
     /// `exact_newton_joint_psi_terms_from_cache_with_options` for the
     /// row-iter / weighting contract.
+    /// All coefficient derivatives of the spatial information drift. For a
+    /// rigid row, eta = X beta has two primary coordinates. Differentiating
+    /// D_psi D_beta^3 ell gives a fourth-order primary tensor contraction and
+    /// three terms where psi differentiates one of the design loadings.
+    /// Sharing those row tensors avoids p separate design/materialization
+    /// passes. Symmetry in the three coefficient indices saves repeated work.
+    pub(super) fn rigid_psi_hessian_all_beta_axes(
+        &self,
+        states: &[ParameterBlockState],
+        derivative_blocks: &[Vec<crate::custom_family::CustomFamilyBlockPsiDerivative>],
+        psi_index: usize,
+        cache: &BernoulliMarginalSlopeExactEvalCache,
+        options: &BlockwiseFitOptions,
+    ) -> Result<Option<Vec<Array2<f64>>>, String> {
+        let Some((block, local)) = psi_derivative_location(derivative_blocks, psi_index)
+        else {
+            return Ok(None);
+        };
+        let axis = self.resolve_psi_axis_spec(derivative_blocks, block, local)?;
+        let p = cache.slices.total;
+        let pm = cache.slices.marginal.len();
+        let n = self.y.len();
+        // Accumulate in flat buffers: this is a cubic scalar loop, where
+        // multidimensional ndarray indexing across codegen units is costly.
+        // Each buffer becomes an Array2 by ownership transfer after the sweep.
+        let mut out = vec![vec![0.0; p * p]; p];
+        let mut weights = vec![0.0; n];
+        for row in cache.outer_weighted_rows_cached(options, n).iter() {
+            weights[row.index] += row.weight;
+        }
+        let mut x = vec![0.0; p];
+        let mut xu = vec![0.0; p];
+        let primary = |a: usize| usize::from(a >= pm);
+        let row_chunk = bms_row_chunk_size(n);
+        for start in (0..n).step_by(row_chunk) {
+            let end = (start + row_chunk).min(n);
+            let xpsi = axis
+                .psi_map
+                .row_chunk(start..end)
+                .map_err(|e| e.to_string())?;
+            let xm = self
+                .marginal_design
+                .try_row_chunk(start..end)
+                .map_err(|e| e.to_string())?;
+            let xg = self
+                .slope_design
+                .try_row_chunk(start..end)
+                .map_err(|e| e.to_string())?;
+            for row in start..end {
+                let weight = weights[row];
+                if weight == 0.0 {
+                    continue;
+                }
+                for a in 0..p {
+                    x[a] = if a < pm {
+                        xm[[row - start, a]]
+                    } else {
+                        xg[[row - start, a - pm]]
+                    };
+                }
+                let psi_row = xpsi.row(row - start);
+                xu.fill(0.0);
+                let offset = if block == 0 { 0 } else { pm };
+                for (a, &value) in psi_row.iter().enumerate() {
+                    xu[offset + a] = value;
+                }
+                let u = psi_row.dot(&states[block].beta);
+                let t3 = self.rigid_third_full_cached(states, cache, row)?;
+                let t4 = self.rigid_fourth_full_cached(states, cache, row)?;
+                for a in 0..p {
+                    for b in a..p {
+                        for c in b..p {
+                            let value = weight
+                                * (t4[primary(a)][primary(b)][primary(c)][block]
+                                    * u * x[a] * x[b] * x[c]
+                                    + t3[primary(a)][primary(b)][primary(c)]
+                                        * (xu[a] * x[b] * x[c]
+                                            + x[a] * xu[b] * x[c]
+                                            + x[a] * x[b] * xu[c]));
+                            out[a][b * p + c] += value;
+                        }
+                    }
+                }
+            }
+        }
+        // Only the ordered triples were accumulated. Expand their equal
+        // permutations once, after summation, rather than on every row.
+        for a in 0..p {
+            for b in a..p {
+                for c in b..p {
+                    let value = out[a][b * p + c];
+                    out[a][c * p + b] = value;
+                    out[b][a * p + c] = value;
+                    out[b][c * p + a] = value;
+                    out[c][a * p + b] = value;
+                    out[c][b * p + a] = value;
+                }
+            }
+        }
+        out.into_iter()
+            .map(|data| Array2::from_shape_vec((p, p), data).map_err(|e| e.to_string()))
+            .collect::<Result<Vec<_>, _>>()
+            .map(Some)
+    }
+
     pub(crate) fn exact_newton_joint_psihessian_directional_derivative_operator_from_cache_with_options(
         &self,
         block_states: &[ParameterBlockState],
