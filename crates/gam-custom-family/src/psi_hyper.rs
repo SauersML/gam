@@ -1779,51 +1779,8 @@ pub(crate) fn evaluate_custom_family_hyper_internal<
         warm_start,
         rho_prior,
         eval_mode,
-        eval_mode,
         None,
     )
-}
-
-/// Whether an inner solve that missed the tightened derivative-quality floor
-/// nevertheless satisfies the tolerance its CALLER asked for.
-///
-/// The tightening below (`JOINT_LAML_DERIV_INNER_TOL_FLOOR`) is an accuracy
-/// REQUEST, not a feasibility precondition: it buys a `β̂` at which the
-/// exact-Newton trace-gradient's `D_βH` coupling is exact, and the value-only
-/// path is already evaluated at the caller's own `inner_tol` without anyone
-/// calling that unsound. So a solve that reaches the caller's contract and no
-/// further has produced exactly what the value path produces, and refusing it
-/// converts "this seed's inner problem is not locally convex at a 1e9 penalty
-/// scale" into "no candidate seeds passed outer startup validation" — measured
-/// on the survival location-scale (gam#2695) and frailty (gam#2714) fits,
-/// where every seed reached a relative stationarity of `1e-9`-`1e-8` against a
-/// caller tolerance of `1e-6` and was refused for missing `1e-11`, so the outer
-/// search never took its first step.
-///
-/// The comparison is the one the solver itself makes: `residual ≤ inner_tol ·
-/// (1 + stationarity_scale)`, reconstructed from the terminal state's own
-/// `stationarity_scale` so the two sides cannot drift apart. Only the joint
-/// Newton path is judged here — it is the only one the floor tightens, and it
-/// is the only terminal state that carries a residual to judge.
-pub(crate) fn joint_newton_meets_caller_inner_contract(
-    terminal: Option<&gam_problem::InnerConvergenceTerminalState>,
-    caller_inner_tol: f64,
-) -> bool {
-    let Some(gam_problem::InnerConvergenceTerminalState::JointNewton {
-        stationarity_residual,
-        stationarity_scale,
-        ..
-    }) = terminal
-    else {
-        return false;
-    };
-    if !(caller_inner_tol.is_finite() && caller_inner_tol > 0.0) {
-        return false;
-    }
-    if !stationarity_residual.is_finite() || !stationarity_scale.is_finite() {
-        return false;
-    }
-    *stationarity_residual <= caller_inner_tol * (1.0 + stationarity_scale.abs())
 }
 
 /// Evaluate the rho-only Laplace criterion from a coefficient mode this caller
@@ -1860,7 +1817,6 @@ pub(crate) fn evaluate_custom_family_hyper_from_coefficient_mode<
         None,
         rho_prior,
         EvalMode::ValueOnly,
-        EvalMode::ValueOnly,
         Some(inner),
     )
 }
@@ -1875,7 +1831,6 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
     warm_start: Option<&ConstrainedWarmStart>,
     rho_prior: gam_problem::RhoPrior,
     eval_mode: EvalMode,
-    inner_quality_mode: EvalMode,
     precomputed_inner: Option<BlockwiseInnerResult>,
 ) -> Result<OuterObjectiveEvalResult, CustomFamilyError> {
     if hyper_layout.block_count() != specs.len() {
@@ -1920,26 +1875,27 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
     // 1e-6 ⇒ ‖r‖≈3e-9; a deliberately loose 1e-3 ⇒ ‖r‖≈1.5e-4), and that
     // residual desyncs the analytic trace-gradient from all three autodiff
     // engines / the joint-stationarity requirement. The joint-Newton mode
-    // converges quadratically, so tightening the derivative-path inner solve to
+    // converges quadratically, so tightening the criterion's inner solve to
     // a stationarity floor costs ~one extra step while pinning β̂ at the true
     // optimum where the trace-gradient's block-coupled `D_βH` term is exact.
-    // Value-only line-search evaluations normally keep the caller's tolerance.
-    // Atomic multi-start screening supplies the requested derivative mode as
-    // `inner_quality_mode`, so the objective winner is solved once at the exact
-    // quality its derivatives require and that owned mode can be reused below.
+    // The same accuracy is required for value-only line searches: log|H(β)|
+    // has first-order sensitivity to coefficient error even though the
+    // penalized likelihood is stationary. Evaluating values at a coarser mode
+    // therefore changes the objective seen by the line search relative to its
+    // analytic gradient. Coefficient quality belongs to the criterion, not to
+    // the requested derivative order (#2668).
     // Restricted to the ρ-only joint path (`psi_dim == 0`): ψ-bearing
     // evaluations already pass through the monotone caller-authority rule in
     // `derivative_quality_options_and_warm_start`; this local branch must not
     // impose a second, competing coefficient-quality policy.
-    const JOINT_LAML_DERIV_INNER_TOL_FLOOR: f64 = 1e-11;
-    let tighten_inner_for_deriv = psi_dim == 0
+    const JOINT_LAML_INNER_TOL_FLOOR: f64 = 1e-11;
+    let tighten_inner_for_laml = psi_dim == 0
         && include_logdet_h
-        && inner_quality_mode != EvalMode::ValueOnly
         && family.has_explicit_joint_hessian()
-        && options.inner_tol > JOINT_LAML_DERIV_INNER_TOL_FLOOR;
-    let tightened_options = tighten_inner_for_deriv.then(|| {
+        && options.inner_tol > JOINT_LAML_INNER_TOL_FLOOR;
+    let tightened_options = tighten_inner_for_laml.then(|| {
         let mut tightened = options.clone();
-        tightened.inner_tol = JOINT_LAML_DERIV_INNER_TOL_FLOOR;
+        tightened.inner_tol = JOINT_LAML_INNER_TOL_FLOOR;
         tightened.inner_max_cycles = tightened.inner_max_cycles.max(200);
         tightened
     });
@@ -1954,26 +1910,9 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
             psi_safe_warm_start.as_ref().or(warm_start),
         )?,
     };
-    // A solve held to the tightened floor that lands inside the caller's own
-    // contract has met the contract; see
-    // [`joint_newton_meets_caller_inner_contract`] for why the difference is a
-    // quality request rather than a soundness condition.
-    if !inner.converged
-        && tightened_options.is_some()
-        && joint_newton_meets_caller_inner_contract(
-            inner.terminal_convergence_state.as_ref(),
-            options.inner_tol,
-        )
-    {
-        log::info!(
-            "[OUTER] the derivative-mode inner solve missed the {:.1e} derivative-quality \
-             floor but meets the caller's inner_tol={:.1e} on its own terminal state; \
-             accepting it at the caller's contract, as the value-only path already is",
-            JOINT_LAML_DERIV_INNER_TOL_FLOOR,
-            options.inner_tol,
-        );
-        inner.converged = true;
-    }
+    // The coefficient solver owns convergence, including curvature and
+    // constraint checks. A small residual alone cannot turn an unfinished
+    // solve (possibly at a saddle) into a Laplace mode.
     if !inner.converged {
         let theta_dim = rho_dim + psi_dim;
         // #2553: the fact that matters is "this trial point is
@@ -3344,7 +3283,6 @@ pub fn evaluate_custom_family_joint_hyper_best_mode_shared<
                 .or_else(|| warm_start.as_ref().map(|warm| &warm.inner)),
             gam_problem::RhoPrior::Flat,
             EvalMode::ValueOnly,
-            eval_mode,
             None,
         ) {
             Ok(candidate) => candidate,
@@ -3428,7 +3366,6 @@ pub fn evaluate_custom_family_joint_hyper_best_mode_shared<
         Arc::clone(&hyper_layout),
         None,
         gam_problem::RhoPrior::Flat,
-        eval_mode,
         eval_mode,
         Some(selected_inner),
     )
@@ -3540,7 +3477,6 @@ pub fn upgrade_custom_family_joint_hyper_mode_shared<
         Arc::clone(&hyper_layout),
         None,
         gam_problem::RhoPrior::Flat,
-        eval_mode,
         eval_mode,
         Some(selected_inner),
     )
@@ -4186,92 +4122,6 @@ pub fn evaluate_custom_family_joint_hyper_efs_owned_shared<
         ),
         mode,
     })
-}
-
-/// The derivative-quality floor's degradation rule, pinned on the measured
-/// states it was written against (gam#2695, gam#2714, gam#2765).
-#[cfg(test)]
-mod caller_contract_2695_tests {
-    use super::*;
-    use gam_problem::{InnerConvergenceTerminalState, JointNewtonTerminalReason};
-
-    fn joint_newton(residual: f64, scale: f64) -> InnerConvergenceTerminalState {
-        InnerConvergenceTerminalState::JointNewton {
-            cycle: 57,
-            stationarity_residual: residual,
-            residual_tol: 1.0e-11 * (1.0 + scale),
-            stationarity_scale: scale,
-            step_inf: 5.354777e-3,
-            step_tol: 3.235091e-11,
-            resolvable_negative_curvature: true,
-            best_stationarity_residual: residual,
-            cycles_since_best_residual: 29,
-            termination_reason: JointNewtonTerminalReason::CycleBudget,
-        }
-    }
-
-    /// The survival location-scale seed that refused every fit: it misses the
-    /// `1e-11` floor by three orders and is three orders INSIDE the caller's
-    /// `1e-6`, so the caller's contract is met and the seed is admissible.
-    #[test]
-    fn a_seed_inside_the_callers_tolerance_is_admissible_2695() {
-        let terminal = joint_newton(6.952333e0, 3.353363e9);
-        assert!(joint_newton_meets_caller_inner_contract(
-            Some(&terminal),
-            1.0e-6
-        ));
-        assert!(
-            !joint_newton_meets_caller_inner_contract(Some(&terminal), 1.0e-11),
-            "the floor itself is missed — that is what makes this a degradation and not a no-op"
-        );
-    }
-
-    /// The #2765 replay's diverged probe: `scale = 2.5e16` with a residual of
-    /// `2.7e17` is seven orders OUTSIDE the caller's contract too, so the
-    /// degradation must not rescue it.
-    #[test]
-    fn a_diverged_solve_is_still_refused_at_the_callers_tolerance_2765() {
-        let terminal = joint_newton(2.729331e17, 2.481211e16);
-        assert!(!joint_newton_meets_caller_inner_contract(
-            Some(&terminal),
-            1.0e-6
-        ));
-    }
-
-    /// Every state that carries no joint-Newton residual to judge keeps the
-    /// refusal: absence of a measurement is not a passing measurement.
-    #[test]
-    fn a_state_without_a_joint_newton_residual_keeps_the_refusal_2695() {
-        assert!(!joint_newton_meets_caller_inner_contract(None, 1.0e-6));
-        let blockwise = InnerConvergenceTerminalState::Blockwise {
-            cycle: 3,
-            max_accepted_step: 1.0e-9,
-            max_proposed_step: 1.0e-3,
-            step_tol: 1.0e-10,
-            objective_change: 1.0e-12,
-            objective_tol: 1.0e-9,
-            joint_stationarity_ok: false,
-        };
-        assert!(!joint_newton_meets_caller_inner_contract(
-            Some(&blockwise),
-            1.0e-6
-        ));
-        let non_finite = joint_newton(f64::NAN, 3.353363e9);
-        assert!(!joint_newton_meets_caller_inner_contract(
-            Some(&non_finite),
-            1.0e-6
-        ));
-        let unbounded_scale = joint_newton(6.952333e0, f64::INFINITY);
-        assert!(!joint_newton_meets_caller_inner_contract(
-            Some(&unbounded_scale),
-            1.0e-6
-        ));
-        let terminal = joint_newton(6.952333e0, 3.353363e9);
-        assert!(!joint_newton_meets_caller_inner_contract(
-            Some(&terminal),
-            f64::NAN
-        ));
-    }
 }
 
 #[cfg(test)]

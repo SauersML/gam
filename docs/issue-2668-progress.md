@@ -213,4 +213,14 @@ error; coarse line-search modes therefore change the numerical objective
 relative to its gradient. The experiment also removes the residual-only
 override of the inner solver's convergence verdict, which ignored negative
 curvature. A quartic with an analytic mode, Laplace value, and rho derivative
-provides an independent focused accuracy check. Results are pending.
+provides an independent focused accuracy check. That public-API integration
+test passes in 0.02 seconds. Its unique mode is beta=1 at rho=0, with
+`V=-9/8+log(5/2)/2` and `dV/drho=3/25`; both evaluation modes meet the analytic
+value within 1e-9 and agree with each other within 1e-12. The receipt is
+`bench/measurements/issue_2668/laml-accuracy-integration.log`.
+
+The monolithic unit-test build was stopped after it spent over three minutes
+compiling unrelated test families. Moving the oracle into a dedicated integration
+target and using 16 codegen units for gam-custom-family reduced its build to
+26.80 seconds against the warm cache. This is the iteration target for further
+criterion-accuracy work. Full regression impact is still under measurement.

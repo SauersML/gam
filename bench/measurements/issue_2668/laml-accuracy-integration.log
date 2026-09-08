@@ -1,0 +1,9 @@
+   Compiling gam-custom-family v0.3.154 (/scratch.global/sauer354/n5/crates/gam-custom-family)
+    Finished `test` profile [optimized + debuginfo] target(s) in 26.80s
+     Running tests/laml_inner_accuracy_2668.rs (/scratch.global/sauer354/m1-target/debug/deps/laml_inner_accuracy_2668-336b1b80fddd6b3c)
+
+running 1 test
+test laml_value_and_gradient_use_the_same_nonlinear_mode ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
