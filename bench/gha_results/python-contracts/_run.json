@@ -2,12 +2,12 @@
   "workflow": "Python Contracts",
   "publish_job_status": "failure",
   "publish_job_status_note": "status of the job that PUBLISHED these results, not the conclusion of run_id -- this job is part of that run, so the run has not concluded here",
-  "run_id": "34236276391",
-  "run_number": "284",
+  "run_id": "34236198720",
+  "run_number": "283",
   "run_attempt": "1",
   "event": "pull_request",
-  "ref": "refs/pull/2866/merge",
-  "sha": "884752e860d0022c2078798c29435f7897bbec76",
-  "completed_utc": "2026-09-08T14:12:24Z",
-  "run_url": "https://github.com/SauersML/gam/actions/runs/34236276391"
+  "ref": "refs/pull/2862/merge",
+  "sha": "24510d20c44ba237b7337ab9e833a1646a1d5d91",
+  "completed_utc": "2026-09-08T14:12:54Z",
+  "run_url": "https://github.com/SauersML/gam/actions/runs/34236198720"
 }
