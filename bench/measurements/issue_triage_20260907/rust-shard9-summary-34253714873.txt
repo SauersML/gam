@@ -1,0 +1,26 @@
+2026-09-08T18:47:42.7975101Z      Summary [2414.331s] 939 tests run: 914 passed, 23 failed, 2 timed out, 8662 skipped
+2026-09-08T18:47:42.7978221Z         FAIL [   0.466s] ( 24/939) gam::basis_smooth smooths::cyclic_smooth_invariant_to_period_origin_1593::cyclic_smooth_fit_is_invariant_to_period_origin_1593
+2026-09-08T18:47:42.8023349Z         FAIL [   8.028s] ( 25/939) gam::basis_smooth smooths::duchon_dimension_scaling_probe::duchon_dimension_scaling_probe
+2026-09-08T18:47:42.8057124Z         FAIL [  56.468s] ( 31/939) gam::basis_smooth smooths::matern_nu_sweep_easy_truth::matern_nu_sweep_uniform_quality_on_sin1
+2026-09-08T18:47:42.8111661Z         FAIL [  83.179s] ( 43/939) gam::glm families::multinomial_edf_per_class_not_overcounted::multinomial_edf_per_class_is_per_class_not_per_block_overcount
+2026-09-08T18:47:42.8216681Z         FAIL [   0.608s] ( 75/939) gam::misc misc::no_production_finite_differences::production_code_has_no_finite_difference_markers
+2026-09-08T18:47:42.8228132Z         FAIL [   0.014s] ( 76/939) gam::misc misc::quality_workflow_classifier_test::test_reference_quality_classifier
+2026-09-08T18:47:42.8236810Z         FAIL [   0.006s] (122/939) gam::regressions misc::workflow_bug_hunt::resolve_family_explicit_family_does_not_infer_conflicting_family_from_link
+2026-09-08T18:47:42.8247265Z         FAIL [   0.008s] (135/939) gam::regressions smooths::periodic_radial_refactor_cc_margin_and_duchon::periodic_radial_duchon_1d_fits_and_wraps
+2026-09-08T18:47:42.8257349Z         FAIL [   1.717s] (139/939) gam::regressions survival::left_truncated_survival_is_covariate_dependent_2705::left_truncated_survival_is_nondegenerate_and_covariate_dependent_2705
+2026-09-08T18:47:42.8345649Z      TIMEOUT [ 600.005s] (150/939) gam::sae sae::sae_manifold_circle_d2_ridge0_fits::zz_1095_2228_measure_seed_vs_settled_r2
+2026-09-08T18:47:42.8350299Z      TIMEOUT [ 600.004s] (151/939) gam::sae sae::sae_manifold_small_n_circle_seed_accept::sae_manifold_small_n_circle_accepts_a_seed_and_fits
+2026-09-08T18:47:42.8354765Z         FAIL [   0.409s] (154/939) gam::survival survival::sbc_survival_prediction_se_coverage::survival_posterior_mean_se_covers_true_survival_probability_at_nominal
+2026-09-08T18:47:42.8370967Z         FAIL [  16.326s] (155/939) gam::survival survival::survival_location_scale_heteroscedastic_globalization_1569::survival_location_scale_heteroscedastic_sweep_diagnostic
+2026-09-08T18:47:43.1221795Z         FAIL [  93.247s] (157/939) gam::survival survival::survival_marginal_slope_vm_exact_integration::survival_marginal_slope_v_plus_m_exact_engages_and_lifts_beta_to_raw_width
+2026-09-08T18:47:45.6044571Z         FAIL [   0.006s] (380/939) gam-models fit_orchestration::materialize::tests::materialize_bernoulli_marginal_slope_prunes_redundant_scalar_term
+2026-09-08T18:47:45.6050142Z         FAIL [  22.494s] (470/939) gam-models transformation_normal::kappa_exact_joint_fd_tests::ctn_exact_joint_gradient_matches_fd_duchon_order0_power9
+2026-09-08T18:47:45.6069216Z         FAIL [   0.016s] (603/939) gam-sae manifold::tests::accepted_iterations_reuse_arrow_and_device_frame_allocations_with_fresh_content
+2026-09-08T18:47:45.6073771Z         FAIL [   5.013s] (611/939) gam-sae manifold::tests_basin_bundle_envelope::freeze_contract_bypasses_the_bundle
+2026-09-08T18:47:45.6078334Z         FAIL [  95.758s] (613/939) gam-sae manifold::tests_certify_external_2266::tests::converged_native_replay_passes_zero_optimization_audit_and_perturbation_fails
+2026-09-08T18:47:45.6084317Z         FAIL [   0.006s] (617/939) gam-sae manifold::tests_chart_evaluator_jets::quotient_step_norm_removes_pure_euclidean_affine_gauge
+2026-09-08T18:47:45.6089315Z         FAIL [   2.894s] (623/939) gam-sae manifold::tests_device_engage_1783::production_factored_large_border_routes_to_resident_inexact_pcg_1017
+2026-09-08T18:47:45.6094424Z         FAIL [   0.820s] (640/939) gam-sae manifold::tests_streaming_outer_gradient_2026::production_objective_forced_streaming_value_gradient_matches_dense
+2026-09-08T18:47:45.6099761Z         FAIL [   0.014s] (649/939) gam-sae sparse_dict::block::block_tests::planted_block_subspaces_recovered
+2026-09-08T18:47:45.6105573Z         FAIL [   0.569s] (658/939) gam-sae sparse_dict::update::exact_solve_tests::shared_rho_fixed_point_converges_and_tracks_planted_noise
+2026-09-08T18:47:45.6111986Z         FAIL [   0.007s] (660/939) gam-sae structure_harvest::tests::apply_move_restructures_warm

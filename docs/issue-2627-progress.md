@@ -143,3 +143,36 @@ test executable checksum is
 This remains a focused shared-development-tree receipt, not full-suite or
 exact-main certification. The gam-pyffi failures above and the outstanding
 complete Rust/Python populations still prevent closing #2627.
+
+## September 8: posterior-sensitive chart orbit and first completed Rust shard
+
+The affine-orbit regression still expected a likelihood symmetry to be removed
+from the posterior convergence norm, contradicting the measured #2720 fix.
+It now explicitly verifies that the compensated fitted-function derivative is
+zero, the Gaussian coordinate-prior derivative is positive, and the convergence
+quotient retains the step. The test was renamed from
+`quotient_step_norm_removes_pure_euclidean_affine_gauge` to
+`quotient_step_norm_retains_prior_sensitive_euclidean_affine_orbit`; one test
+replaces one test, with stronger checks on the premise and no ignored cases.
+
+MSI reports **8 passed, 0 failed, 0 ignored, 1,260 filtered out, 5.45 seconds**,
+including the existing #2720 posterior-flatness population and affine
+reconstruction check. The summary is
+`bench/measurements/issue_triage_20260907/sae-2627-gauge-summary.log`.
+The complete local/MSI log is `sae-2627-gauge.log` in the same measurements
+directory; its SHA-256 is
+`684087d52e7a6f59248363c8be0713874b4f01c6f0b57a47a51702b928ffdf80`.
+The test source hash is
+`e317c659d8298e8c3a444a3f71ffbf199f573c78a417fad7c51f01bec5d98734`;
+the SAE executable hash is
+`182ed0037393416eee37cef5af77ee8ac970185a9699c3649d86e16f35cdee2d`.
+The warm rebuild took 150 seconds. This remains development-tree validation.
+
+Rust CI run 34253714873, at `7c3c5b43b`, completed shard 9 (job 102173061422):
+**939 run, 914 passed, 23 failed, 2 timed out, 8,662 skipped by the shard
+selection, 2,414.331 seconds**. Its final summary and all 25 unsuccessful
+identities are preserved in
+`bench/measurements/issue_triage_20260907/rust-shard9-summary-34253714873.txt`.
+This predates the SAE repairs above and is only one of ten shards; it cannot
+establish a workspace-wide failure count. The other shards and both Python
+jobs were still active. No complete zero-failure verdict exists.

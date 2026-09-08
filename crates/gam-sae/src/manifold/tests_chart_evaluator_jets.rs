@@ -856,7 +856,8 @@ pub(crate) fn euclidean_affine_gauge_canonicalization_preserves_reconstruction()
 }
 
 #[test]
-pub(crate) fn quotient_step_norm_removes_pure_euclidean_affine_gauge() -> Result<(), String> {
+pub(crate) fn quotient_step_norm_retains_prior_sensitive_euclidean_affine_orbit()
+-> Result<(), String> {
     let evaluator = Arc::new(EuclideanPatchEvaluator::new(1, 2)?);
     let coords = array![[-1.0_f64], [-0.4], [0.2], [0.8], [1.3]];
     let (phi, jet) = evaluator.evaluate(coords.view())?;
@@ -889,12 +890,30 @@ pub(crate) fn quotient_step_norm_removes_pure_euclidean_affine_gauge() -> Result
     let delta_beta = gauge.slice(s![n_coord..]);
     let raw = gauge.iter().map(|v| v * v).sum::<f64>();
 
+    // The affine chart orbit is a likelihood symmetry, not a posterior null
+    // direction (#2720). Its compensating decoder change cancels the fitted
+    // function's first variation, while the Gaussian coordinate prior moves.
+    let atom = &term.atoms[0];
+    let coord_offset = term.assignment.coord_offsets()[0];
+    let row_width = term.assignment.row_block_dim();
+    let basis_direction = Array2::from_shape_fn(atom.basis_values.dim(), |(row, col)| {
+        atom.basis_jacobian[[row, col, 0]] * delta_t[row * row_width + coord_offset]
+    });
+    let decoder_direction =
+        Array2::from_shape_vec(atom.decoder_coefficients().dim(), delta_beta.to_vec())
+            .map_err(|error| error.to_string())?;
+    let fitted_direction = basis_direction.dot(atom.decoder_coefficients())
+        + atom.basis_values.dot(&decoder_direction);
+    assert!(fitted_direction.iter().all(|value| value.abs() < 1.0e-12));
+    let coordinates = term.assignment.coords[0].as_matrix();
+    let coordinate_prior_slope = (0..term.n_obs())
+        .map(|row| coordinates[[row, 0]] * delta_t[row * row_width + coord_offset])
+        .sum::<f64>();
+    assert!(coordinate_prior_slope > 0.0);
+
     let quotient =
         term.quotient_newton_step_norm_sq(delta_t, delta_beta, raw, &vec![0.0; term.k_atoms()])?;
 
-    assert!(
-        quotient <= raw.max(1.0) * 1.0e-20,
-        "pure affine gauge step left quotient norm squared {quotient:.3e} from raw {raw:.3e}"
-    );
+    assert_abs_diff_eq!(quotient, raw, epsilon = 1.0e-12);
     Ok(())
 }
