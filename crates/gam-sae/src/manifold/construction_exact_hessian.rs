@@ -265,6 +265,50 @@ pub(crate) struct DampedResidualStep {
 }
 
 impl ExactHessianSpectralBlock {
+    /// Saddle-safe objective step `-(A² + νI)⁻¹|A|g` (#2283).
+    /// Unlike residual minimisation, this is descent on every retained mode,
+    /// including negative-curvature modes where objective descent raises `‖g‖`.
+    fn damped_objective_step(
+        &self,
+        residual: &SaeArrowVector,
+        nu: f64,
+    ) -> Result<(SaeArrowVector, f64, usize), String> {
+        let total_t = residual.t.len();
+        let dim = total_t + residual.beta.len();
+        if self.eigenvectors.dim() != (dim, dim) || self.eigenvalues.len() != dim {
+            return Err("damped objective step: eigensystem and residual dimensions differ".into());
+        }
+        if !(nu.is_finite() && nu >= 0.0) {
+            return Err(format!("damped objective step: damping must be finite and >= 0; got {nu}"));
+        }
+        let mut flat = Array1::<f64>::zeros(dim);
+        flat.slice_mut(s![..total_t]).assign(&residual.t);
+        flat.slice_mut(s![total_t..]).assign(&residual.beta);
+        if !flat.iter().all(|value| value.is_finite()) {
+            return Err("damped objective step: residual contains a non-finite value".into());
+        }
+        let coefficients = self.eigenvectors.t().dot(&flat);
+        let mut step_coefficients = Array1::<f64>::zeros(dim);
+        let mut predicted_decrease = 0.0;
+        let mut retained_rank = 0;
+        for index in 0..dim {
+            let lambda = self.eigenvalues[index];
+            let denominator = lambda * lambda + nu;
+            if denominator > self.rank_floor(index).powi(2) {
+                let coefficient = coefficients[index];
+                let step_coefficient = -lambda.abs() * coefficient / denominator;
+                step_coefficients[index] = step_coefficient;
+                predicted_decrease -= coefficient * step_coefficient;
+                retained_rank += 1;
+            }
+        }
+        let solution = self.eigenvectors.dot(&step_coefficients);
+        Ok((SaeArrowVector {
+            t: solution.slice(s![..total_t]).to_owned(),
+            beta: solution.slice(s![total_t..]).to_owned(),
+        }, predicted_decrease, retained_rank))
+    }
+
     /// The null-band half-width for eigendirection `index`, in `λ` units
     /// (#2673).
     ///

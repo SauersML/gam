@@ -1762,6 +1762,28 @@ mod exact_stationarity_solve_1418_tests {
         assert!(resolved_leftover < 1.0e-5 && flat_leftover > 0.999);
     }
 
+    /// #2283: the trust step must descend even in a negative-curvature mode;
+    /// the residual-minimising Newton direction has the opposite sign there.
+    #[test]
+    fn objective_trust_step_descends_every_retained_indefinite_mode_2283() {
+        let eigenvalues = Array1::from_vec(vec![2.0_f64, -0.5]);
+        let geometry = spectral_block_with_uniform_floor(
+            Array2::from_diag(&eigenvalues), eigenvalues,
+            Array2::from_diag(&Array1::ones(2)), 1.0e-12,
+        );
+        let residual = SaeArrowVector {
+            t: Array1::from_vec(vec![1.0]), beta: Array1::from_vec(vec![3.0]),
+        };
+        let (step, predicted, rank) = geometry
+            .damped_objective_step(&residual, 0.0)
+            .expect("saddle-safe objective step");
+        let directional = residual.t.dot(&step.t) + residual.beta.dot(&step.beta);
+        assert_eq!(rank, 2);
+        assert!(directional < 0.0, "objective direction must descend: g^T delta={directional}");
+        assert_abs_diff_eq!(-directional, predicted, epsilon = 1.0e-14);
+        assert!(step.beta[0] < 0.0, "negative-curvature mode must follow -g");
+    }
+
     /// #2762 — the polish may not leave the state with a LARGER KKT residual
     /// than it found. Ever, at any budget.
     ///

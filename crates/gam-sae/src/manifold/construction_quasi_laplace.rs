@@ -2884,6 +2884,9 @@ impl SaeManifoldTerm {
             let predicted_floor =
                 SAE_MANIFOLD_DIRECTIONAL_DECREASE_REL_FLOOR * pre_merits.quotient;
             let snapshot = self.snapshot_mutable_state();
+            let pre_objective = self
+                .penalized_objective_total(target, rho_fixed, registry, 1.0)
+                .unwrap_or(f64::INFINITY);
             let backtrack_started = std::time::Instant::now();
             let mut trials = 0usize;
             let mut accepted: Option<AcceptedTerminalResidualStep> = None;
@@ -3008,10 +3011,46 @@ impl SaeManifoldTerm {
                 nu = next;
             }
             let Some(accepted) = accepted else {
+                // #2283: residual minimisation rejects objective descent along
+                // negative curvature. Try the saddle-safe absolute-Hessian
+                // path over the same derived damping interval, with the
+                // measured penalized objective as its acceptance currency.
+                let mut nu = 0.0;
+                let mut objective_accepted = false;
+                loop {
+                    let Ok((step, predicted, _)) = geometry.damped_objective_step(&residual, nu)
+                    else { break; };
+                    if !(predicted.is_finite() && predicted > 0.0) { break; }
+                    if self.apply_newton_step(step.t.view(), step.beta.view(), 1.0).is_ok() {
+                        let trial = self.penalized_objective_total(
+                            target, rho_fixed, registry, 1.0,
+                        ).unwrap_or(f64::INFINITY);
+                        if trial.is_finite()
+                            && trial <= pre_objective - SAE_MANIFOLD_ARMIJO_C1 * predicted
+                                + opt::armijo_roundoff_cushion(pre_objective)
+                        {
+                            objective_accepted = true;
+                            made_progress = true;
+                            log::info!(
+                                "[SAE-NEWTON] objective trust step: ν={nu:.6e} \
+                                 objective={pre_objective:.10e} → {trial:.10e} \
+                                 predicted decrease={predicted:.6e}"
+                            );
+                            break;
+                        }
+                    }
+                    self.restore_mutable_state(&snapshot)?;
+                    let next = if nu > 0.0 {
+                        nu * opt::constants::RIDGE_GROWTH
+                    } else { smallest_damping };
+                    if !(next > nu) || next > largest_damping { break; }
+                    nu = next;
+                }
+                if objective_accepted { continue; }
                 log::debug!(
-                    "terminal Newton bail: no damping on [{smallest_damping:.6e}, \
-                     {largest_damping:.6e}] bought a sufficient measured decrease of the \
-                     residual merit at ‖g‖={grad_norm:.6e} ({trials} trial(s))"
+                    "terminal Newton bail: neither residual nor objective trust path accepted \
+                     on [{smallest_damping:.6e}, {largest_damping:.6e}] at ‖g‖={grad_norm:.6e} \
+                     ({trials} residual trial(s))"
                 );
                 break;
             };
