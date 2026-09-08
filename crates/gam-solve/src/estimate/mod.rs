@@ -66,6 +66,7 @@ mod fit;
 mod joint_hyper;
 mod optimizer;
 pub mod outer_eval_capture;
+pub mod rho_domain;
 mod penalty;
 mod prefit;
 pub(crate) mod smoothing_correction;

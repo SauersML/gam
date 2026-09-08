@@ -174,6 +174,39 @@ impl GaussianRemlBlocksDomain {
             .collect()
     }
 
+    fn penalty_eigenbasis(&self) -> Result<(Array2<f64>, Array1<f64>), EstimationError> {
+        let mut basis = Array2::<f64>::zeros((self.p_total, self.p_total));
+        let mut spectrum = Array1::<f64>::zeros(self.p_total);
+        for penalty in &self.canonical_penalties {
+            let start = penalty.col_range.start;
+            for (mode, &delta) in penalty.positive_eigenvalues.iter().enumerate() {
+                spectrum[start + mode] = delta;
+                for row in 0..penalty.block_dim() {
+                    basis[[start + row, start + mode]] = penalty.root[[mode, row]] / delta.sqrt();
+                }
+            }
+            if penalty.nullity > 0 {
+                let (null_basis, rank) = gam_linalg::faer_ndarray::rrqr_nullspace_basis(
+                    &penalty.root.t().to_owned(),
+                    default_rrqr_rank_alpha(),
+                )
+                .map_err(EstimationError::LinearSystemSolveFailed)?;
+                if rank != penalty.rank() {
+                    crate::bail_invalid_estim!(
+                        "canonical block penalty root has inconsistent rank"
+                    );
+                }
+                basis
+                    .slice_mut(s![
+                        penalty.col_range.clone(),
+                        start + rank..penalty.col_range.end
+                    ])
+                    .assign(&null_basis);
+            }
+        }
+        Ok((basis, spectrum))
+    }
+
     fn normal_matrix(
         &self,
         xtwx: &Array2<f64>,
@@ -373,15 +406,8 @@ struct GaussianRemlBlocksProfile {
     xtwy: Array1<f64>,
     nu: f64,
     observation_measure: TermDerivs,
-    /// Block-local penalty eigenvectors.  Coefficients are represented as
-    /// `beta = penalty_basis * diag(mode_scale) * z` during every profile
-    /// evaluation, so a large smoothing strength is never multiplied into the
-    /// ill-scaled normal matrix in the user's coefficient coordinates.
     penalty_basis: Array2<f64>,
-    /// Unscaled penalty eigenvalue for every transformed coordinate, grouped
-    /// by smoothing parameter.  Entries outside a block's penalty range (and
-    /// entries in its null space) are zero.
-    penalty_modes: Vec<Array1<f64>>,
+    penalty_spectrum: Array1<f64>,
 }
 
 struct GaussianRemlBlocksProfileEval {
@@ -410,74 +436,36 @@ impl GaussianRemlBlocksProfile {
             gam_problem::checked_exp_log_strengths(rhos.iter().copied())
                 .map_err(|error| EstimationError::InvalidInput(error.to_string()))?,
         );
-        // Work in a rho-dependent similarity frame.  First rotate every block
-        // into the canonical penalty range/null basis, then equilibrate each
-        // independent mode by the diagonal of X'WX + lambda S.  In particular,
-        // a range mode with lambda=exp(30) has O(1) curvature here rather than
-        // forcing an O(1e13) and an O(1) number into the same Cholesky factor.
-        let rotated_gram = self
-            .penalty_basis
-            .t()
-            .dot(&self.xtwx.dot(&self.penalty_basis));
-        let mut mode_scale = Array1::<f64>::zeros(self.domain.p_total);
-        for coordinate in 0..self.domain.p_total {
-            let penalty_diagonal = self
-                .penalty_modes
-                .iter()
-                .enumerate()
-                .map(|(block, modes)| lambdas[block] * modes[coordinate])
-                .sum::<f64>();
-            let diagonal = rotated_gram[[coordinate, coordinate]] + penalty_diagonal;
-            if !diagonal.is_finite() || diagonal <= 0.0 {
-                return Err(EstimationError::TrialPointRefused {
+        // Rotate into the canonical penalty eigenbasis BEFORE λ is applied,
+        // then equilibrate each mode. The penalty is exactly diagonal in this
+        // frame, so its range cannot contaminate data-scale null directions.
+        let p = self.domain.p_total;
+        let mut scaled_penalty = Array1::<f64>::zeros(p);
+        let mut scales = Array1::<f64>::zeros(p);
+        for (block, penalty) in self.domain.canonical_penalties.iter().enumerate() {
+            for index in penalty.col_range.clone() {
+                let curvature = lambdas[block] * self.penalty_spectrum[index];
+                scales[index] = (self.xtwx[[index, index]] + curvature).sqrt().recip();
+                scaled_penalty[index] = curvature * scales[index] * scales[index];
+            }
+        }
+        let mut normal =
+            Array2::from_shape_fn((p, p), |(i, j)| self.xtwx[[i, j]] * scales[i] * scales[j]);
+        for index in 0..p {
+            normal[[index, index]] += scaled_penalty[index];
+        }
+        let factor =
+            normal
+                .cholesky(Side::Lower)
+                .map_err(|error| EstimationError::TrialPointRefused {
                     reason: format!(
-                        "block Gaussian REML transformed normal diagonal is not positive at coordinate {coordinate}: {diagonal}"
+                        "block Gaussian REML equilibrated factorization failed at this rho: {error}"
                     ),
-                });
-            }
-            mode_scale[coordinate] = diagonal.sqrt().recip();
-        }
-        let mut transformed_normal = rotated_gram.clone();
-        for i in 0..self.domain.p_total {
-            for j in 0..self.domain.p_total {
-                transformed_normal[[i, j]] *= mode_scale[i] * mode_scale[j];
-            }
-        }
-        let mut transformed_penalties = Vec::with_capacity(f_blocks);
-        for (block, modes) in self.penalty_modes.iter().enumerate() {
-            let mut transformed = Array1::<f64>::zeros(self.domain.p_total);
-            for coordinate in 0..self.domain.p_total {
-                transformed[coordinate] =
-                    lambdas[block] * modes[coordinate] * mode_scale[coordinate].powi(2);
-                transformed_normal[[coordinate, coordinate]] += transformed[coordinate];
-            }
-            transformed_penalties.push(transformed);
-        }
-        gam_linalg::matrix::symmetrize_in_place(&mut transformed_normal);
-        let inverse = gam_linalg::utils::certified_spd_inverse(
-            &transformed_normal,
-            "block Gaussian REML penalized normal matrix",
-        )
-        .map(gam_linalg::utils::CertifiedSpdInverse::into_inverse)
-        .map_err(|error| EstimationError::TrialPointRefused {
-            reason: format!(
-                "block Gaussian REML requires an exact SPD penalized normal matrix: {error}"
-            ),
-        })?;
-        // The inverse above certifies this exact, unperturbed normal matrix.
-        // A second strict Cholesky supplies its determinant without exposing a
-        // separate repaired spectrum or rank policy.
-        let lower = transformed_normal
-            .cholesky(Side::Lower)
-            .map_err(|error| EstimationError::TrialPointRefused {
-                reason: format!(
-                    "block Gaussian REML penalized normal log-determinant failed: {error}"
-                ),
-            })?
-            .lower_triangular();
+                })?;
+        let inverse = factor.solve_mat(&Array2::<f64>::eye(p));
         let logdet_normal = 2.0
-            * (lower.diag().iter().map(|value| value.ln()).sum::<f64>()
-                - mode_scale.iter().map(|value| value.ln()).sum::<f64>());
+            * (factor.diag().iter().map(|value| value.ln()).sum::<f64>()
+                - scales.iter().map(|value| value.ln()).sum::<f64>());
         if !logdet_normal.is_finite() {
             return Err(EstimationError::TrialPointRefused {
                 reason: "block Gaussian REML penalized normal log-determinant is not finite"
@@ -485,11 +473,8 @@ impl GaussianRemlBlocksProfile {
             });
         }
 
-        let transformed_rhs = mode_scale.clone() * self.penalty_basis.t().dot(&self.xtwy);
-        let transformed_coefficients = inverse.dot(&transformed_rhs);
-        let coefficients = self
-            .penalty_basis
-            .dot(&(mode_scale.clone() * &transformed_coefficients));
+        let scaled_coefficients = factor.solvevec(&(&self.xtwy * &scales));
+        let coefficients = self.penalty_basis.dot(&(&scaled_coefficients * &scales));
         let fitted = self.design.dot(&coefficients);
         let residual = &self.y - &fitted;
 
@@ -509,18 +494,25 @@ impl GaussianRemlBlocksProfile {
         let mut t_values = Array1::<f64>::zeros(f_blocks);
         let mut edf = Array1::<f64>::zeros(f_blocks);
         for (block, penalty) in self.domain.canonical_penalties.iter().enumerate() {
-            let transformed_penalty = &transformed_penalties[block];
-            let p_beta = transformed_penalty * &transformed_coefficients;
-            let b_value = transformed_coefficients.dot(&p_beta);
+            let start = penalty.col_range.start;
+            let end = penalty.col_range.end;
+            let mut p_beta = Array1::<f64>::zeros(self.domain.p_total);
+            for local in 0..penalty.block_dim() {
+                let index = start + local;
+                p_beta[index] = scaled_penalty[index] * scaled_coefficients[index];
+            }
+            let b_value = scaled_coefficients.dot(&p_beta);
             q += b_value;
             b_values[block] = b_value;
 
-            let mut rp = inverse.clone();
-            for column in 0..self.domain.p_total {
-                let value = transformed_penalty[column];
-                rp.column_mut(column).mapv_inplace(|entry| entry * value);
+            let mut rp = Array2::<f64>::zeros((self.domain.p_total, self.domain.p_total));
+            for index in start..end {
+                rp.column_mut(index)
+                    .assign(&(&inverse.column(index) * scaled_penalty[index]));
             }
-            let trace = rp.diag().sum();
+            let trace = (0..penalty.block_dim())
+                .map(|local| rp[[start + local, start + local]])
+                .sum::<f64>();
             t_values[block] = trace;
             edf[block] = penalty.block_dim() as f64 - trace;
             logdet_penalty += penalty
@@ -778,46 +770,42 @@ pub fn gaussian_reml_fit_blocks_exact(
     }
 
     let xtwx = fast_xt_diag_x(&design.view(), &weight.view());
-    let mut penalty_basis = Array2::<f64>::zeros((p_total, p_total));
-    let mut penalty_modes = vec![Array1::<f64>::zeros(p_total); f_blocks];
-    for (block, penalty) in domain.canonical_penalties.iter().enumerate() {
-        let (eigenvalues, eigenvectors) = penalty.local.eigh(Side::Lower).map_err(|error| {
-            EstimationError::InvalidInput(format!(
-                "block Gaussian REML penalty-basis decomposition failed for block {block}: {error}"
-            ))
-        })?;
-        let start = penalty.col_range.start;
-        let dimension = penalty.block_dim();
-        penalty_basis
-            .slice_mut(s![start..start + dimension, start..start + dimension])
-            .assign(&eigenvectors);
-        // `eigh` is ascending and the canonical PSD reconstruction has exactly
-        // `rank` positive modes.  Reusing that already-certified rank avoids a
-        // second numerical rank decision in the profile evaluator.
-        for local in dimension - penalty.rank()..dimension {
-            penalty_modes[block][start + local] = eigenvalues[local];
-        }
-    }
     let y_owned = y.to_owned();
     let y_matrix = y_owned.view().insert_axis(Axis(1));
     let xtwy = fast_xt_diag_y(&design.view(), &weight.view(), &y_matrix)
         .column(0)
         .to_owned();
+    // #2812: the ρ domain is derived per block from the weighted design Gram
+    // and the block's penalty; the seed lattice spans the same domain.
+    let (rho_lower, rho_upper) = crate::estimate::rho_domain::resolvability_domain_from_gram_blocks(
+        &xtwx,
+        blockwise_penalties
+            .iter()
+            .map(|penalty| (penalty.col_range.clone(), &penalty.local)),
+        f_blocks,
+    );
+    let (penalty_basis, penalty_spectrum) = domain.penalty_eigenbasis()?;
+    let rotated_design = design.dot(&penalty_basis);
+    let rotated_gram = fast_xt_diag_x(&rotated_design.view(), &weight.view());
+    let rotated_rhs = penalty_basis.t().dot(&xtwy);
     let profile = GaussianRemlBlocksProfile {
         domain,
         design,
         observation_measure: gaussian_reml_observation_measure(weight.view(), 1),
         weights: weight,
         y: y_owned,
-        xtwx,
-        xtwy,
+        xtwx: rotated_gram,
+        xtwy: rotated_rhs,
         nu: (n_effective - nullity) as f64,
         penalty_basis,
-        penalty_modes,
+        penalty_spectrum,
     };
 
     let mut seed_config = gam_problem::SeedConfig::default();
-    seed_config.bounds = (RHO_LOWER, RHO_UPPER);
+    seed_config.bounds = (
+        rho_lower.iter().copied().fold(f64::INFINITY, f64::min),
+        rho_upper.iter().copied().fold(f64::NEG_INFINITY, f64::max),
+    );
     seed_config.risk_profile = gam_problem::SeedRiskProfile::Gaussian;
     let mut problem = OuterProblem::new(f_blocks)
         .with_gradient(Derivative::Analytic)
@@ -827,20 +815,21 @@ pub fn gaussian_reml_fit_blocks_exact(
         .with_tolerance(1.0e-10)
         .with_required_projected_gradient_norm(Some(1.0e-8))
         .with_max_iter(200)
-        .with_bounds(
-            Array1::from_elem(f_blocks, RHO_LOWER),
-            Array1::from_elem(f_blocks, RHO_UPPER),
-        )
-        .with_rho_bound(RHO_UPPER)
+        .with_bounds(rho_lower.clone(), rho_upper.clone())
         .with_seed_config(seed_config)
         .with_rho_canonical_keys(Some(canonical_keys))
         .with_fallback_policy(FallbackPolicy::Disabled)
         .with_problem_size(n, p_total);
     if let Some(rhos) = init_rhos {
         problem = problem
-            .with_initial_rho(Array1::from_iter(
-                rhos.iter().map(|rho| rho.clamp(RHO_LOWER, RHO_UPPER)),
-            ))
+            .with_initial_rho(Array1::from_iter(rhos.iter().enumerate().map(
+                |(k, rho)| {
+                    rho.clamp(
+                        rho_lower.get(k).copied().unwrap_or(f64::NEG_INFINITY),
+                        rho_upper.get(k).copied().unwrap_or(f64::INFINITY),
+                    )
+                },
+            )))
             .with_screen_initial_rho(true);
     }
     let mut objective = problem.build_objective(
@@ -3922,6 +3911,34 @@ fn penalty_range_tolerance(eigenvalues: ArrayView1<'_, f64>) -> f64 {
 /// instead of approaching the finite `ρ→+∞` limit the compactified endpoint
 /// claims. Value, gradient, enclosure, limit, coefficients and dispersion all
 /// therefore score the SAME matrix.
+impl GaussianRemlEigenCache {
+    /// The λ-selection domain of this penalty against this design (#2812).
+    /// The score's penalty-range modes enter as `log(1 + e^ρ δ_j)` over the
+    /// positive penalty-range eigenvalues `δ_j`, so below
+    /// `ln √ε − ln δ_max` every mode is unpenalized to the gradient's
+    /// resolution and above `−ln √ε − ln δ_min` every mode is switched off to
+    /// it (the derivation is in `estimate::rho_domain`). A spectrum with no
+    /// positive mode keeps the precision box.
+    pub fn resolvability_rho_domain(&self) -> (f64, f64) {
+        let spectrum = PenaltyRangeSpectrum::of(self);
+        let mut delta_min = f64::INFINITY;
+        let mut delta_max = 0.0_f64;
+        for delta in spectrum.iter() {
+            if delta > 0.0 {
+                delta_min = delta_min.min(delta);
+                delta_max = delta_max.max(delta);
+            }
+        }
+        let interval = (delta_max > 0.0).then(|| {
+            (
+                crate::estimate::rho_domain::log_gradient_resolution() - delta_max.ln(),
+                -crate::estimate::rho_domain::log_gradient_resolution() - delta_min.ln(),
+            )
+        });
+        crate::estimate::rho_domain::coordinate_domain(interval, None)
+    }
+}
+
 #[derive(Clone, Copy)]
 struct PenaltyRangeSpectrum<'a> {
     eigenvalues: &'a Array1<f64>,
@@ -5893,6 +5910,80 @@ fn solve_upper_triangular_matrix(
 mod tests {
     use super::*;
     use ndarray::array;
+
+    #[test]
+    fn block_profile_large_penalties_preserve_the_data_nullspace_fit() {
+        let n = 24;
+        let design = Array2::from_shape_fn((n, 4), |(row, column)| {
+            let t = -1.0 + 2.0 * row as f64 / (n - 1) as f64;
+            t.powi(column as i32)
+        });
+        let y = Array1::from_shape_fn(n, |row| {
+            let t = design[[row, 1]];
+            0.7 - 0.4 * t + 0.3 * t * t + 0.05 * (9.0 * t).sin()
+        });
+        let weights = Array1::ones(n);
+        let penalty = array![[1.0, -1.0], [-1.0, 1.0]];
+        let domain = GaussianRemlBlocksDomain::from_blockwise_penalties(
+            4,
+            &[
+                BlockwisePenalty::new(0..2, penalty.clone()),
+                BlockwisePenalty::new(2..4, penalty),
+            ],
+        )
+        .unwrap();
+        let (penalty_basis, penalty_spectrum) = domain.penalty_eigenbasis().unwrap();
+        let rotated = design.dot(&penalty_basis);
+        let profile = GaussianRemlBlocksProfile {
+            domain,
+            design: design.clone(),
+            weights: weights.clone(),
+            y: y.clone(),
+            xtwx: rotated.t().dot(&rotated),
+            xtwy: rotated.t().dot(&y),
+            nu: (n - 2) as f64,
+            observation_measure: gaussian_reml_observation_measure(weights.view(), 1),
+            penalty_basis,
+            penalty_spectrum,
+        };
+        let limiting_design = Array2::from_shape_fn((n, 2), |(row, column)| {
+            design[[row, 2 * column]] + design[[row, 2 * column + 1]]
+        });
+        let limiting_beta = limiting_design
+            .t()
+            .dot(&limiting_design)
+            .cholesky(Side::Lower)
+            .unwrap()
+            .solvevec(&limiting_design.t().dot(&y));
+        let expected = limiting_design.dot(&limiting_beta);
+        let high = profile.evaluate(array![30.0, 30.0].view()).unwrap();
+        assert!(
+            (&high.fitted - &expected)
+                .iter()
+                .all(|value| value.abs() < 1e-10)
+        );
+        assert!(high.gradient.iter().all(|value| value.abs() < 1e-10));
+        assert!(high.edf.iter().all(|value| (*value - 1.0).abs() < 1e-10));
+        let rho = array![0.2, -0.4];
+        let center = profile.evaluate(rho.view()).unwrap();
+        for axis in 0..2 {
+            let mut below = rho.clone();
+            let mut above = rho.clone();
+            below[axis] -= 1e-4;
+            above[axis] += 1e-4;
+            let below = profile.evaluate(below.view()).unwrap();
+            let above = profile.evaluate(above.view()).unwrap();
+            assert!((center.gradient[axis] - (above.cost - below.cost) / 2e-4).abs() < 1e-7);
+            for other in 0..2 {
+                assert!(
+                    (center.hessian[[other, axis]]
+                        - (above.gradient[other] - below.gradient[other]) / 2e-4)
+                        .abs()
+                        < 1e-7
+                );
+            }
+        }
+    }
 
     /// #2694 / #2703 — a ZERO-WIDTH enclosure must SIGN an order-one `V′`.
     ///
