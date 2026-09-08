@@ -1,0 +1,7 @@
+
+running 1 test
+test predict::dispersion_location_scale_generate_predict_variance_agreement::dispersion_location_scale_generate_matches_predict_variance_negbin ... [negbin-LS] dispersion-LS predict↔generate variance agreement: max rel dev 2.19e-16, dispersion spread max/min=9.20
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 506 filtered out; finished in 37.18s
+

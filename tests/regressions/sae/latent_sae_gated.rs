@@ -75,6 +75,38 @@ impl gam::terms::sae::basis::SaeBasisSecondJet for PrecomputedAffineBasis {
     }
 }
 
+/// The global identity function, evaluated on any batch of coordinates.
+/// Encoding probes single rows and chart centers; those are function inputs,
+/// not indices into the original training-row table.
+#[derive(Debug)]
+struct IdentityBasis;
+
+impl gam::terms::sae::basis::SaeBasisEvaluator for IdentityBasis {
+    fn evaluate(&self, coords: ArrayView2<'_, f64>) -> Result<(Array2<f64>, Array3<f64>), String> {
+        let (n, d) = coords.dim();
+        let jacobian = Array3::from_shape_fn((n, d, d), |(_, basis, axis)| {
+            if basis == axis { 1.0 } else { 0.0 }
+        });
+        Ok((coords.to_owned(), jacobian))
+    }
+
+    fn second_jet_dyn(&self, coords: ArrayView2<'_, f64>) -> Option<Result<Array4<f64>, String>> {
+        Some(<Self as gam::terms::sae::basis::SaeBasisSecondJet>::second_jet(self, coords))
+    }
+
+    fn third_jet_dyn(&self, coords: ArrayView2<'_, f64>) -> Option<Result<Array5<f64>, String>> {
+        let (n, d) = coords.dim();
+        Some(Ok(Array5::zeros((n, d, d, d, d))))
+    }
+}
+
+impl gam::terms::sae::basis::SaeBasisSecondJet for IdentityBasis {
+    fn second_jet(&self, coords: ArrayView2<'_, f64>) -> Result<Array4<f64>, String> {
+        let (n, d) = coords.dim();
+        Ok(Array4::zeros((n, d, d, d)))
+    }
+}
+
 #[test]
 fn latent_coord_assignment_decode_roundtrip_matches_dictionary_atom() {
     let coords =
@@ -234,14 +266,11 @@ fn build_collapse_probe_term(coords: Array2<f64>) -> SaeManifoldTerm {
     .expect("assignment should build");
     // Identity basis φ(t) = t: m = d basis columns, basis_values = the coords,
     // Jacobian = per-row I_d. This makes the decoded output genuinely depend on
-    // the latent coords, so each axis is IDENTIFIED by data and carries real
-    // per-axis data curvature in the inner Hessian. Decoder B = I_d routes axis
-    // j to output channel j (p = d). With real curvature, the ARD α on a
-    // small-but-nonzero-spread axis has a genuine FINITE interior REML optimum
-    // (≈ √(n·c / ‖t‖²)) — far below the deleted α = n/‖t‖² rule's explosion
-    // past the log-α clamp. A *zero*-Jacobian basis would leave the coords
-    // unidentified (the criterion would be flat in α), which is why this probe
-    // supplies real first-jet curvature.
+    // the latent coords and carries real per-axis data curvature with a fixed
+    // decoder. Decoder B = I_d initially routes axis j to output channel j.
+    // This does not by itself identify a joint fit with a freely varying
+    // decoder: t -> c t, B -> B/c preserves its reconstruction. The criterion
+    // must still establish a finite inner optimum before it can be evaluated.
     let basis_values = coords.clone();
     let mut basis_jacobian = Array3::<f64>::zeros((n, d, d));
     for i in 0..n {
@@ -259,11 +288,7 @@ fn build_collapse_probe_term(coords: Array2<f64>) -> SaeManifoldTerm {
         Array2::<f64>::zeros((d, d)),
     )
     .expect("atom should build")
-    .with_basis_second_jet(Arc::new(PrecomputedAffineBasis {
-        origin_coords: coords,
-        phi: basis_values,
-        jacobian: basis_jacobian,
-    }));
+    .with_basis_second_jet(Arc::new(IdentityBasis));
     SaeManifoldTerm::new(vec![atom], assignment).expect("term should build")
 }
 

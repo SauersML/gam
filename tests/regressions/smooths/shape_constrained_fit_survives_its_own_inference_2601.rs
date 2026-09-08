@@ -66,6 +66,7 @@ fn linear_fixture() -> (Vec<f64>, Vec<f64>) {
 
 #[test]
 fn every_shape_constraint_fits_clean_linear_data_2601() {
+    gam_runtime::test_support::install_diagnostic_logger();
     init_parallelism();
     let (x, y) = linear_fixture();
     let mut csv = String::from("x,y\n");

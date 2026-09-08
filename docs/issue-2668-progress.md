@@ -224,3 +224,33 @@ compiling unrelated test families. Moving the oracle into a dedicated integratio
 target and using 16 codegen units for gam-custom-family reduced its build to
 26.80 seconds against the warm cache. This is the iteration target for further
 criterion-accuracy work. Full regression impact is still under measurement.
+
+## Common LAML accuracy integration
+
+The r6 executable again measured **24 passes, four failures, and two timeouts**,
+with all 30 identities and an unchanged binary hash. Receipts are in
+`bench/measurements/issue_2668/issue2668-source-r6/`. The common accuracy policy
+is independently verified, but does not resolve the NB end-to-end stall.
+The first two NB seeds still stop around cost 1028.111, with terminal gradient
+norms 9.426e-4 and 4.209e-4, above their certification bounds. Later inner
+solves alternate between a decrement convergence claim and a returned-mode
+revocation: one sample has decrement 1.076e-17 and coefficient correction
+1.948e-9 against 3.768e-11, with observed objective changes near 1e-11. The
+returned-mode check adds a step-floor condition absent from the earlier
+decrement check. Neither threshold has been relaxed to count a pass.
+
+The SAE identity fixture now evaluates the global function `phi(t)=t` on any
+batch. EFS gets past the previous row-shape exception and reaches its actual
+criterion check: after 6400 granted iterations it rejects a non-idempotent
+inner map (7.80 seconds). The free-decoder scaling orbit remains unresolved.
+The original assertions are unchanged.
+
+The concave inference failure is localized to a smoothing cubature point
+`rho=[18.558,-1.938]`, after two P-IRLS iterations. Its face decrement is
+2.931131e-12 against 1.467844e-13. The adjacent point
+`rho=[18.558,2.689]` converges in three iterations. A separate four-second
+diagnostic from r5 retains the trace in `shape-r5-diagnostic.log`; r6 enables
+the regression's diagnostic logger directly. Inspection also found that the
+post-polish decrement check still excludes active inequality faces, whereas
+the in-loop check already uses their tangent-space decrement. Its relevance
+to the measured failure needs a focused test before changing production.

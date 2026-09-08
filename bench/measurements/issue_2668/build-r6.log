@@ -1,0 +1,9 @@
+   Compiling gam-custom-family v0.3.154 (/scratch.global/sauer354/n5/crates/gam-custom-family)
+   Compiling gam v0.3.154 (/scratch.global/sauer354/n5)
+   Compiling gam-models v0.3.154 (/scratch.global/sauer354/n5/crates/gam-models)
+   Compiling gam-inference v0.3.154 (/scratch.global/sauer354/n5/crates/gam-inference)
+   Compiling gam-test-support v0.3.154 (/scratch.global/sauer354/n5/crates/gam-test-support)
+   Compiling gam-config v0.3.154 (/scratch.global/sauer354/n5/crates/gam-config)
+   Compiling gam-predict v0.3.154 (/scratch.global/sauer354/n5/crates/gam-predict)
+    Finished `test` profile [optimized + debuginfo] target(s) in 5m 29s
+  Executable tests/regressions/main.rs (/scratch.global/sauer354/m1-target/debug/deps/regressions-0f8bf7485b25dd84)

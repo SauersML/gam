@@ -1,0 +1,15 @@
+
+running 1 test
+test sae::latent_sae_gated::penalized_quasi_laplace_criterion_keeps_alpha_finite_on_collapsing_axis ... 
+thread 'sae::latent_sae_gated::penalized_quasi_laplace_criterion_keeps_alpha_finite_on_collapsing_axis' (2160829) panicked at tests/regressions/sae/latent_sae_gated.rs:324:14:
+criterion should evaluate: Numerical("SaeManifoldTerm::penalized_quasi_laplace_criterion: inner solve did not converge at fixed ρ; objective stalled for 3 consecutive refine rounds, but neither the raw KKT gradient ‖g‖=1.391429e-2 nor the quotient KKT gradient ‖Π⊥null g‖=1.391429e-2 met tolerance 7.044921e-4 (‖Π∥null g‖=0.000000e0, null_share=0.0000, quotient_over_tol=1.975e1, intensive_scaled_max=7.189267e-2, intensive_bound=5.040455e-4, intensive_over_bound=1.426e2, orbit=empty(no direction removed)). Objective stagnation and a finite deflated factor are diagnostic only; refusing to rank or differentiate an off-optimum Laplace criterion.")
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+FAILED
+
+failures:
+
+failures:
+    sae::latent_sae_gated::penalized_quasi_laplace_criterion_keeps_alpha_finite_on_collapsing_axis
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 506 filtered out; finished in 0.04s
+

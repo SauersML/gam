@@ -1,0 +1,15 @@
+
+running 1 test
+test sae::latent_sae_gated::efs_ard_fixed_point_recovers_cost_criterion_argmin_and_stays_finite ... 
+thread 'sae::latent_sae_gated::efs_ard_fixed_point_recovers_cost_criterion_argmin_and_stays_finite' (2160611) panicked at tests/regressions/sae/latent_sae_gated.rs:530:14:
+criterion should evaluate: Numerical("SaeManifoldTerm::penalized_quasi_laplace_criterion: inner solve did not converge at fixed ρ; KKT entered its admission band (raw ‖g‖=1.034723e-2, quotient ‖Π⊥null g‖=1.034723e-2, tolerance 2.083621e-1) but an evidence-only re-entry still made a strict state/objective move after 6400 granted iterations (intensive_scaled_max=1.908742e2, intensive_bound=2.083547e-1, intensive_over_bound=9.161e2). Refusing to differentiate a non-idempotent inner map.")
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+FAILED
+
+failures:
+
+failures:
+    sae::latent_sae_gated::efs_ard_fixed_point_recovers_cost_criterion_argmin_and_stays_finite
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 506 filtered out; finished in 7.80s
+
