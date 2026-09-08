@@ -462,11 +462,10 @@ fn empirical_flex_warmed_row_allocation_gate_link_dev_932() {
 // knot count whose runtime lands the primary width on a fixed tier so the vars
 // the dispatch actually specializes are the ones measured here.
 //
-// SPEC (this module's header): NO wall-clock assertions. The asserted gate is
-// (a) fixed-vs-dynamic parity on the exact benchmarked inputs and (b) checksum
-// finiteness; the speed diagnostic is the emitted `dynamic_over_fixed` token
-// (`dynamic_ns / fixed_ns`, > 1 when the specialization wins), which the MSI
-// release harness parses and fails closed on `<= 1`.
+// This is a specialization gate, not evidence of a win against hand code.
+// Parity runs in every profile; the release CI population derives the timing
+// from the test's SpeedGate::open call. Paired, interleaved measurements use
+// the same perturbed inputs and consume every matrix entry in both arms.
 //
 // The fixed fourth (`empirical_fixed_fourth_many_from_plan`) and dynamic fourth
 // (`empirical_dynamic_fourth_batch_from_plan`) production kernels are
@@ -479,6 +478,7 @@ fn empirical_flex_warmed_row_allocation_gate_link_dev_932() {
 // evaluate`) — the measured arithmetic is production either way.
 
 use super::flex_row_program::BmsFlexRowProgram;
+use gam_math::paired_timing::{SpeedGate, paired_interleaved};
 
 /// Uniform deviation knots over the `mruntime` span for a chosen knot count.
 fn tier_knots(n_knots: usize) -> Array1<f64> {
@@ -604,28 +604,12 @@ fn dynamic_third_contracted(
         .expect("dynamic third contraction shape")
 }
 
-/// Feedback-coupled best-of-5 timing barrier (no `std::hint::black_box`): the
-/// running checksum feeds the next perturbation so the optimizer cannot hoist
-/// the evaluation. Returns ns per evaluation.
-fn best_measure_ns<F: FnMut(f64) -> f64>(iterations: usize, base: f64, mut evaluate: F) -> f64 {
-    let mut best = f64::INFINITY;
-    for _ in 0..5 {
-        let mut checksum = 0.0_f64;
-        let started = std::time::Instant::now();
-        for _ in 0..iterations {
-            checksum += evaluate(base + checksum * 1e-18);
-        }
-        assert!(
-            checksum.is_finite(),
-            "BMS-FLEX-CONTRACTED-932 release-measure checksum must stay finite"
-        );
-        best = best.min(started.elapsed().as_secs_f64());
-    }
-    best * 1e9 / iterations as f64
-}
-
 /// Measure one deviation branch at compile-time tier width `K`.
-fn measure_third_fourth_branch<const K: usize>(is_score_warp: bool, runtime: DeviationRuntime) {
+fn measure_third_fourth_branch<const K: usize>(
+    is_score_warp: bool,
+    runtime: DeviationRuntime,
+    gate: &mut Option<SpeedGate>,
+) {
     use super::cell_moment_assembly::{
         EmpiricalBmsFourthJetSchedule, EmpiricalBmsThirdJetSchedule,
         empirical_bms_fourth_jet_schedule, empirical_bms_third_jet_schedule,
@@ -723,91 +707,109 @@ fn measure_third_fourth_branch<const K: usize>(is_score_warp: bool, runtime: Dev
             let (f3, d3) = (fixed_third[(a, b)], dynamic_third[(a, b)]);
             let band3 = 1e-11 * f3.abs().max(d3.abs()).max(1.0);
             assert!(
-                (f3 - d3).abs() <= band3,
+                f3.is_finite() && d3.is_finite() && (f3 - d3).abs() <= band3,
                 "{label}: third[{a}][{b}] fixed {f3:+.15e} vs dynamic {d3:+.15e}"
             );
             let (f4, d4) = (fixed_fourth[0][(a, b)], dynamic_fourth[0][(a, b)]);
             let band4 = 1e-11 * f4.abs().max(d4.abs()).max(1.0);
             assert!(
-                (f4 - d4).abs() <= band4,
+                f4.is_finite() && d4.is_finite() && (f4 - d4).abs() <= band4,
                 "{label}: fourth[{a}][{b}] fixed {f4:+.15e} vs dynamic {d4:+.15e}"
             );
         }
     }
 
-    // ---- timing (diagnostic; NO wall-clock assertion per SPEC) ------------
-    // Iteration counts keep each best-of-5 sweep well under ~1s for the heaviest
-    // tier while giving a stable ns/row read.
-    let iters_third = 800usize;
-    let iters_fourth = 500usize;
-
-    let third_fixed_ns = best_measure_ns(iters_third, point[0], |p0| {
-        let mut perturbed = point;
-        perturbed[0] = p0;
-        let m = fixed_third_contracted::<K>(&plan, &perturbed, &dir_u);
-        m[(0, 0)] + m[(r - 1, r - 1)]
-    });
-    let third_dynamic_ns = best_measure_ns(iters_third, point[0], |p0| {
-        let mut perturbed = point;
-        perturbed[0] = p0;
-        let m = dynamic_third_contracted(&plan, &perturbed, &dir_u, r);
-        m[(0, 0)] + m[(r - 1, r - 1)]
-    });
-    eprintln!(
-        "BMS-FLEX-CONTRACTED-932 branch={label} width={K} grid={GRID_NODES} order=3 \
-         production_fixed={third_fixed_ns:.2} ns/row dynamic={third_dynamic_ns:.2} ns/row \
-         dynamic_over_fixed={:.6}",
-        third_dynamic_ns / third_fixed_ns,
+    let Some(gate) = gate.as_mut() else {
+        return;
+    };
+    // The fastest measured arm is about 0.9 ms per row on Milan, so sixteen
+    // rows already give millisecond-scale samples. Keep the fifteen paired
+    // repetitions without repeating the expensive link-dev fourth hundreds
+    // of times per sample.
+    let third = paired_interleaved(
+        15,
+        16,
+        0x9320_F1E3 ^ u64::from(is_score_warp),
+        |nudge| {
+            let mut perturbed = point;
+            perturbed[0] += nudge;
+            fixed_third_contracted::<K>(&plan, &perturbed, &dir_u)
+                .iter()
+                .sum()
+        },
+        |nudge| {
+            let mut perturbed = point;
+            perturbed[0] += nudge;
+            dynamic_third_contracted(&plan, &perturbed, &dir_u, r)
+                .iter()
+                .sum()
+        },
     );
-
-    let fourth_fixed_ns = best_measure_ns(iters_fourth, point[0], |p0| {
-        let mut perturbed = point;
-        perturbed[0] = p0;
-        let out = BernoulliMarginalSlopeFamily::empirical_fixed_fourth_many_from_plan::<K>(
-            &plan, &perturbed, &pairs,
-        )
-        .expect("fixed-K fourth contraction");
-        out[0][(0, 0)] + out[0][(r - 1, r - 1)]
-    });
-    let fourth_dynamic_ns = best_measure_ns(iters_fourth, point[0], |p0| {
-        let mut perturbed = point;
-        perturbed[0] = p0;
-        let out = BernoulliMarginalSlopeFamily::empirical_dynamic_fourth_batch_from_plan(
-            &plan,
-            &perturbed,
-            &pairs,
-            &fx.primary,
-            1,
-        )
-        .expect("dynamic fourth contraction");
-        out[0][(0, 0)] + out[0][(r - 1, r - 1)]
-    });
-    eprintln!(
-        "BMS-FLEX-CONTRACTED-932 branch={label} width={K} grid={GRID_NODES} order=4 \
-         production_fixed={fourth_fixed_ns:.2} ns/row dynamic={fourth_dynamic_ns:.2} ns/row \
-         dynamic_over_fixed={:.6}",
-        fourth_dynamic_ns / fourth_fixed_ns,
+    gate.faster(
+        &format!("branch={label} width={K} grid={GRID_NODES} order=3 opponent=dynamic_jet"),
+        &third,
+        "production_fixed",
+        "dynamic_jet",
+    );
+    let fourth = paired_interleaved(
+        15,
+        16,
+        0x9320_F1E4 ^ u64::from(is_score_warp),
+        |nudge| {
+            let mut perturbed = point;
+            perturbed[0] += nudge;
+            BernoulliMarginalSlopeFamily::empirical_fixed_fourth_many_from_plan::<K>(
+                &plan, &perturbed, &pairs,
+            )
+            .expect("fixed-K fourth contraction")[0]
+                .iter()
+                .sum()
+        },
+        |nudge| {
+            let mut perturbed = point;
+            perturbed[0] += nudge;
+            BernoulliMarginalSlopeFamily::empirical_dynamic_fourth_batch_from_plan(
+                &plan,
+                &perturbed,
+                &pairs,
+                &fx.primary,
+                1,
+            )
+            .expect("dynamic fourth contraction")[0]
+                .iter()
+                .sum()
+        },
+    );
+    gate.faster(
+        &format!("branch={label} width={K} grid={GRID_NODES} order=4 opponent=dynamic_jet"),
+        &fourth,
+        "production_fixed",
+        "dynamic_jet",
     );
 }
 
 #[test]
 fn release_measure_bms_empirical_third_fourth_fixed_vs_dynamic_932() {
     let (runtime, width) = tier_runtime();
+    let mut gate = (!cfg!(debug_assertions)).then(|| SpeedGate::open("BMS-FLEX-CONTRACTED-932"));
     // Dispatch the runtime-discovered tier width to its compile-time
     // specialization, then measure both deviation branches on it.
     match width {
         8 => {
-            measure_third_fourth_branch::<8>(true, runtime.clone());
-            measure_third_fourth_branch::<8>(false, runtime);
+            measure_third_fourth_branch::<8>(true, runtime.clone(), &mut gate);
+            measure_third_fourth_branch::<8>(false, runtime, &mut gate);
         }
         12 => {
-            measure_third_fourth_branch::<12>(true, runtime.clone());
-            measure_third_fourth_branch::<12>(false, runtime);
+            measure_third_fourth_branch::<12>(true, runtime.clone(), &mut gate);
+            measure_third_fourth_branch::<12>(false, runtime, &mut gate);
         }
         18 => {
-            measure_third_fourth_branch::<18>(true, runtime.clone());
-            measure_third_fourth_branch::<18>(false, runtime);
+            measure_third_fourth_branch::<18>(true, runtime.clone(), &mut gate);
+            measure_third_fourth_branch::<18>(false, runtime, &mut gate);
         }
         other => panic!("tier_runtime returned non-specialized width {other}"),
+    }
+    if let Some(gate) = gate {
+        gate.finish();
     }
 }
