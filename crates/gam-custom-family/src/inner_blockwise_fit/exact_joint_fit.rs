@@ -1527,72 +1527,35 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
                     spectrum_elapsed.as_secs_f64(),
                 );
             }
-            let convexification_started = std::time::Instant::now();
-            let convexification_scope = gam_runtime::process_monitor::track_scope(format!(
-                "joint Newton convexification cycle={cycle} p={total_p}"
-            ));
-            let constrained_geometry = symmetric_constrained_hessian_geometry(
-                &lhs,
-                constrained_levenberg_mu,
-                family.levenberg_on_ill_conditioning(),
-            )?;
-            drop(convexification_scope);
-            let convexification_elapsed = convexification_started.elapsed();
-            if convexification_elapsed >= std::time::Duration::from_secs(1) {
-                log::warn!(
-                    "[gam#979 constrained-QP phase] cycle={cycle} phase=convexification elapsed_s={:.3}",
-                    convexification_elapsed.as_secs_f64(),
+            // A coordinate bound and a general linear inequality define the
+            // same active-face geometry. Both QP routes store constraint-row
+            // indices, so both must use the exact tangent Hessian before any
+            // ambient convexification can alter its identified directions.
+            let exact_face_candidate = if let Some(active_rows) = warm_joint_active.as_deref() {
+                let reduced_face_started = std::time::Instant::now();
+                let reduced_face_scope = gam_runtime::process_monitor::track_scope(format!(
+                    "joint Newton reduced face cycle={cycle} p={total_p} warm_rows={}",
+                    active_rows.len(),
+                ));
+                let result = certified_reduced_face_candidate(
+                    &exact_lhs,
+                    &rhs_step,
+                    &beta_joint,
+                    constraints,
+                    active_rows,
+                    &joint_trust_metric_diag,
+                    joint_trust_radius,
                 );
-            }
-            if cycle <= 2 {
-                let min_eval_raw = constrained_geometry.raw_min_eigenvalue;
-                let min_eval_refl = constrained_geometry.stabilized_min_eigenvalue;
-                log::info!(
-                    "[JN-REFLECT-DIAG #1040] cycle={cycle} CONSTRAINED_QP lambda_min_signed_raw={min_eval_raw:.3e} lambda_min_signed_reflected={min_eval_refl:.3e} nullity={} condition={:.3e} (reflection {})",
-                    constrained_geometry.nullity,
-                    constrained_geometry.condition,
-                    if min_eval_refl > min_eval_raw + min_eval_raw.abs() * 1e-9 {
-                        "CHANGED the spectrum"
-                    } else {
-                        "NO-OP (already PSD)"
-                    },
-                );
-            }
-            // The free solve and bound-multiplier KKT test must use this
-            // same convexified Hessian. Mixing the reflected step model
-            // with the original indefinite curvature or the bare gradient
-            // makes release and entry contradict each other (gam#979).
-            let lhs = constrained_geometry.matrix;
-            let rhs_beta = &lhs.dot(&beta_joint) + &rhs_step;
-            let exact_face_candidate = if lower_bounds.is_none() {
-                if let Some(active_rows) = warm_joint_active.as_deref() {
-                    let reduced_face_started = std::time::Instant::now();
-                    let reduced_face_scope = gam_runtime::process_monitor::track_scope(format!(
-                        "joint Newton reduced face cycle={cycle} p={total_p} warm_rows={}",
+                drop(reduced_face_scope);
+                let reduced_face_elapsed = reduced_face_started.elapsed();
+                if reduced_face_elapsed >= std::time::Duration::from_secs(1) {
+                    log::warn!(
+                        "[gam#979 constrained-QP phase] cycle={cycle} phase=reduced-face elapsed_s={:.3} warm_rows={}",
+                        reduced_face_elapsed.as_secs_f64(),
                         active_rows.len(),
-                    ));
-                    let result = certified_reduced_face_candidate(
-                        &exact_lhs,
-                        &rhs_step,
-                        &beta_joint,
-                        constraints,
-                        active_rows,
-                        &joint_trust_metric_diag,
-                        joint_trust_radius,
                     );
-                    drop(reduced_face_scope);
-                    let reduced_face_elapsed = reduced_face_started.elapsed();
-                    if reduced_face_elapsed >= std::time::Duration::from_secs(1) {
-                        log::warn!(
-                            "[gam#979 constrained-QP phase] cycle={cycle} phase=reduced-face elapsed_s={:.3} warm_rows={}",
-                            reduced_face_elapsed.as_secs_f64(),
-                            active_rows.len(),
-                        );
-                    }
-                    result?
-                } else {
-                    None
                 }
+                result?
             } else {
                 None
             };
@@ -1603,23 +1566,62 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
             ));
             let solve_result = if let Some((candidate, active, _)) = exact_face_candidate {
                 Ok((candidate, active))
-            } else if let Some(bounds) = lower_bounds.as_ref() {
-                solve_quadratic_with_simple_lower_bounds(
-                    &lhs,
-                    &rhs_beta,
-                    &beta_joint,
-                    bounds,
-                    warm_joint_active.as_deref(),
-                )
             } else {
-                gam_solve::active_set::solve_quadratic_with_constraint_set(
+                let convexification_started = std::time::Instant::now();
+                let convexification_scope = gam_runtime::process_monitor::track_scope(format!(
+                    "joint Newton convexification cycle={cycle} p={total_p}"
+                ));
+                let constrained_geometry = symmetric_constrained_hessian_geometry(
                     &lhs,
-                    &rhs_beta,
-                    &beta_joint,
-                    constraints,
-                    warm_joint_active.as_deref(),
-                )
-                .map_err(|error| CustomFamilyError::trial_point(error.to_string()))
+                    constrained_levenberg_mu,
+                    family.levenberg_on_ill_conditioning(),
+                )?;
+                drop(convexification_scope);
+                let convexification_elapsed = convexification_started.elapsed();
+                if convexification_elapsed >= std::time::Duration::from_secs(1) {
+                    log::warn!(
+                        "[gam#979 constrained-QP phase] cycle={cycle} phase=convexification elapsed_s={:.3}",
+                        convexification_elapsed.as_secs_f64(),
+                    );
+                }
+                if cycle <= 2 {
+                    let min_eval_raw = constrained_geometry.raw_min_eigenvalue;
+                    let min_eval_refl = constrained_geometry.stabilized_min_eigenvalue;
+                    log::info!(
+                        "[JN-REFLECT-DIAG #1040] cycle={cycle} CONSTRAINED_QP lambda_min_signed_raw={min_eval_raw:.3e} lambda_min_signed_reflected={min_eval_refl:.3e} nullity={} condition={:.3e} (reflection {})",
+                        constrained_geometry.nullity,
+                        constrained_geometry.condition,
+                        if min_eval_refl > min_eval_raw + min_eval_raw.abs() * 1e-9 {
+                            "CHANGED the spectrum"
+                        } else {
+                            "NO-OP (already PSD)"
+                        },
+                    );
+                }
+                // The free solve and bound-multiplier KKT test must use this
+                // same convexified Hessian. Mixing the reflected step model
+                // with the original indefinite curvature or the bare gradient
+                // makes release and entry contradict each other (gam#979).
+                let lhs = constrained_geometry.matrix;
+                let rhs_beta = &lhs.dot(&beta_joint) + &rhs_step;
+                if let Some(bounds) = lower_bounds.as_ref() {
+                    solve_quadratic_with_simple_lower_bounds(
+                        &lhs,
+                        &rhs_beta,
+                        &beta_joint,
+                        bounds,
+                        warm_joint_active.as_deref(),
+                    )
+                } else {
+                    gam_solve::active_set::solve_quadratic_with_constraint_set(
+                        &lhs,
+                        &rhs_beta,
+                        &beta_joint,
+                        constraints,
+                        warm_joint_active.as_deref(),
+                    )
+                    .map_err(|error| CustomFamilyError::trial_point(error.to_string()))
+                }
             };
             drop(metric_projection_scope);
             let metric_projection_elapsed = metric_projection_started.elapsed();
