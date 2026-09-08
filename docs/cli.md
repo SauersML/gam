@@ -5,7 +5,7 @@ model blobs, prediction CSVs, posterior draws, generated responses, or HTML
 reports.
 
 ```bash
-gam <command> --help
+gam --help
 ```
 
 ## Commands
