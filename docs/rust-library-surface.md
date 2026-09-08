@@ -23,6 +23,16 @@ the tests. Compiler acceptance establishes source validity, not whether a public
 contract is valuable; removing a public contract still requires a semantic
 decision and review of its callers and documentation.
 
+`scripts/public_api_census.py` enforces that review for explicit public
+functions. It compares immutable Git trees by `(source path, function name)`
+rather than inspecting linked binaries or matching names across the workspace.
+Every removal, including a move, requires an exact entry in
+`docs/public-api-census-changes.json` with the semantic reason and executable
+replacement or retirement evidence. Its CI positive control replays the
+`d484a091a` sweep and must both detect and refuse those removals. This gate is a
+backstop against repeating that mechanism; it does not decide whether an API is
+valuable and does not replace external-consumer behavior tests.
+
 There is no compatibility obligation to recreate deleted convenience names.
 Keep one current API per behavior, and use explicit model inputs where defaults
 would silently choose geometry. An exported name with no internal caller can
