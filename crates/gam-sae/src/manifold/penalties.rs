@@ -672,13 +672,11 @@ impl SaeManifoldTerm {
     }
 
     /// #2343 — accumulate the interior AMPLITUDE barrier's gradient into `sys.gb`
-    /// and its exact radial curvature into `sys.hbb` (dense path) or the per-atom
-    /// scalar ridge `atom_curv` (matrix-free / framed path, folded into the smooth
-    /// Gram by the caller exactly like the separation barrier's `lev`), in the
+    /// and its exact radial curvature into the per-atom scalar ridge `atom_curv`
+    /// (folded into the smooth Gram by the caller), in the
     /// full-`B` β layout (index `beta_offsets[k] + a*p + o`) so a framed system
-    /// carries it identically to the analytic β penalties. Returns whether any
-    /// gradient was written (`false`/no-op when the frozen gate is `None`,
-    /// `penalty_scale == 0`, or every atom abstains).
+    /// carries it identically to the analytic β penalties. No-op when the frozen
+    /// gate is `None`, `penalty_scale == 0`, or every atom abstains.
     ///
     /// This is the term the audit (#2343 Finding 9) found MISSING: the
     /// collinearity-gated repulsion and the separation barrier both operate on
@@ -690,19 +688,17 @@ impl SaeManifoldTerm {
         &self,
         sys: &mut ArrowSchurSystem,
         penalty_scale: f64,
-        dense_beta_curvature: bool,
         atom_curv: &mut [f64],
-    ) -> bool {
+    ) {
         if penalty_scale == 0.0 {
-            return false;
+            return;
         }
         let Some(floor2) = self.amplitude_barrier_gate else {
-            return false;
+            return;
         };
         let mu = SAE_AMPLITUDE_BARRIER_STRENGTH;
         let p = self.output_dim();
         let offsets = self.beta_offsets();
-        let mut wrote = false;
         for (atom_idx, atom) in self.atoms.iter().enumerate() {
             let b = atom.decoder_coefficients();
             let m = b.nrows();
@@ -722,25 +718,16 @@ impl SaeManifoldTerm {
                     sys.gb[off + a * p + o] += gscale * b[[a, o]];
                 }
             }
-            wrote = true;
             // Exact radial curvature `P″(s)` as the isotropic PSD ridge `prr·I` on
             // the atom block — `prr·I ⪰ H_A` (H_A's max eigenvalue IS `prr`), the
             // tight Levenberg majorizer, same discipline as the separation
-            // barrier's `lev`. Dense: scatter onto `hbb`'s diagonal; matrix-free:
-            // hand back the per-atom scalar the caller folds into the smooth Gram.
+            // barrier's `lev`. Hand back the per-atom scalar for the structured
+            // smooth Gram on every layout, including framed device assembly.
             let ridge = penalty_scale * prr;
             if ridge > 0.0 {
-                if dense_beta_curvature {
-                    for idx in 0..(m * p) {
-                        let gi = off + idx;
-                        sys.hbb[[gi, gi]] += ridge;
-                    }
-                } else {
-                    atom_curv[atom_idx] += ridge;
-                }
+                atom_curv[atom_idx] += ridge;
             }
         }
-        wrote
     }
 
     /// #2343 — penalized-objective contribution of the interior AMPLITUDE barrier
@@ -1929,6 +1916,16 @@ impl SaeManifoldTerm {
                 .iter()
                 .map(|runs| runs.iter().map(|(_, values)| values.len()).sum::<usize>())
                 .sum::<usize>();
+            // Zero carriers induce the zero beta majorizer even when the
+            // overlap-space metric is nonzero. Omit that operator's storage so
+            // orthogonal decoders retain framed device admission.
+            if plan.carriers
+                .iter()
+                .flat_map(|runs| runs.iter().flat_map(|(_, values)| values.iter()))
+                .all(|&value| value == 0.0)
+            {
+                continue;
+            }
             if dense_beta_curvature {
                 self.scatter_barrier_curvature_dense(
                     &plan.atoms,

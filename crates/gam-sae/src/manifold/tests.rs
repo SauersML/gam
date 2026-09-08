@@ -88,7 +88,9 @@ pub(crate) fn phi_eta_one_reproduces_current_atom_bases_bit_for_bit() {
 
     let sphere_coords = array![[0.0_f64, 0.0, 1.0], [0.6, -0.8, 0.0], [0.36, 0.48, 0.8]];
     let sphere = AmbientSphereHarmonicEvaluator::new(2).unwrap();
-    assert_eta_one_parity(&sphere, sphere_coords.view(), 9);
+    // Degree zero contributes one constant and degree one contributes the
+    // three ambient coordinates. Only the five degree-two harmonics are curved.
+    assert_eta_one_parity(&sphere, sphere_coords.view(), 5);
 
     let centers = array![
         [-1.0_f64, -1.0],
@@ -2518,9 +2520,13 @@ pub(crate) fn sae_rho_seed_dispersion_scaling_shifts_every_scale_coupled_axis() 
 
     assert_abs_diff_eq!(
         scaled.log_lambda_sparse,
-        rho.log_lambda_sparse + shift,
+        rho.log_lambda_sparse,
         epsilon = 1.0e-14
     );
+    // With one softmax atom the assignment is identically one and entropy is
+    // zero. Its sparse strength is absent from the outer layout, not a
+    // response-scaled penalty coordinate.
+    assert!(scaled.sparse_flat_index().is_none());
     assert_abs_diff_eq!(
         scaled.log_lambda_smooth[0],
         rho.log_lambda_smooth[0] + shift,
@@ -2536,6 +2542,38 @@ pub(crate) fn sae_rho_seed_dispersion_scaling_shifts_every_scale_coupled_axis() 
         rho.log_ard[0][1] + shift,
         epsilon = 1.0e-14
     );
+
+    // With multiple atoms the entropy penalty is active. A dispersion above
+    // one scales it together with each smoothness and ARD coordinate.
+    let multi_rho = SaeManifoldRho::new(
+        0.7_f64.ln(),
+        1.3_f64.ln(),
+        vec![array![0.2, -0.4], array![0.3]],
+    );
+    let multi_dispersion = 4.0_f64;
+    let multi_scaled = multi_rho
+        .seed_scaled_by_dispersion_for_assignment(multi_dispersion, AssignmentMode::softmax(1.0))
+        .unwrap();
+    assert!(multi_scaled.sparse_flat_index().is_some());
+    assert_abs_diff_eq!(
+        multi_scaled.log_lambda_sparse,
+        multi_rho.log_lambda_sparse + multi_dispersion.ln(),
+        epsilon = 1.0e-14
+    );
+    for atom in 0..multi_rho.log_ard.len() {
+        assert_abs_diff_eq!(
+            multi_scaled.log_lambda_smooth[atom],
+            multi_rho.log_lambda_smooth[atom] + multi_dispersion.ln(),
+            epsilon = 1.0e-14
+        );
+        for axis in 0..multi_rho.log_ard[atom].len() {
+            assert_abs_diff_eq!(
+                multi_scaled.log_ard[atom][axis],
+                multi_rho.log_ard[atom][axis] + multi_dispersion.ln(),
+                epsilon = 1.0e-14
+            );
+        }
+    }
 
     // #1744 — ordered Beta--Bernoulli admits NO response-dispersion scaling on ANY ρ coordinate
     // (learnable-α or fixed-α). Its free per-row Bernoulli gates overfit under a
@@ -5580,14 +5618,31 @@ pub(crate) fn full_rank_circle_design_keeps_full_harmonic_depth_unchanged() {
 pub(crate) fn sae_arrow_schur_beta_quadratic_model_matches_penalized_loss_change() {
     let coords = array![[0.10], [0.35], [0.80]];
     let (phi, jet) = periodic_basis(&coords);
+    let decoder = array![[0.65], [-0.45], [0.25]];
+    let energy_factor = array![[3.0, 0.4, -0.2], [0.1, 2.5, 0.3], [-0.5, 0.2, 1.8]];
+    // The constructor takes a function Gram, not an arbitrary energy factor.
+    // Keep rejection of an asymmetric input explicit, then form the valid
+    // coupled quadratic whose exact loss change the remainder of this test checks.
+    let invalid_gram = SaeManifoldAtom::new_with_provided_function_gram(
+        "periodic",
+        SaeAtomBasisKind::Periodic,
+        1,
+        phi.clone(),
+        jet.clone(),
+        decoder.clone(),
+        energy_factor.clone(),
+    )
+    .err()
+    .expect("an asymmetric energy factor is not a function Gram");
+    assert!(invalid_gram.contains("Gram is not symmetric"));
     let atom = SaeManifoldAtom::new_with_provided_function_gram(
         "periodic",
         SaeAtomBasisKind::Periodic,
         1,
         phi,
         jet,
-        array![[0.65], [-0.45], [0.25]],
-        array![[3.0, 0.4, -0.2], [0.1, 2.5, 0.3], [-0.5, 0.2, 1.8]],
+        decoder,
+        energy_factor.t().dot(&energy_factor),
     )
     .unwrap();
     let assignment = SaeAssignment::from_blocks_with_mode(

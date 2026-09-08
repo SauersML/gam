@@ -51,6 +51,7 @@ pub(crate) fn low_rank_factored_htbeta_term(
     latent_dim: usize,
     n_obs: usize,
 ) -> SaeManifoldTerm {
+    assert!(frame_rank > 0 && frame_rank <= m && frame_rank <= p);
     let mut atoms = Vec::with_capacity(k_atoms);
     let mut coord_blocks = Vec::with_capacity(k_atoms);
     for atom_idx in 0..k_atoms {
@@ -76,7 +77,10 @@ pub(crate) fn low_rank_factored_htbeta_term(
             frame[[(atom_idx * frame_rank + frame_col) % p, frame_col]] = 1.0;
         }
         let coords_c = Array2::from_shape_fn((m, frame_rank), |(basis_col, frame_col)| {
-            0.2 + 0.03 * (basis_col + 2 * frame_col + atom_idx) as f64
+            // The leading square block is 0.2 I + c 11ᵀ, hence full rank.
+            // An affine row/column formula has rank at most two regardless of
+            // the requested frame rank and silently shrinks the test border.
+            (if basis_col == frame_col { 0.2 } else { 0.0 }) + 0.03 * (1 + atom_idx) as f64
         });
         let decoder = coords_c.dot(&frame.t());
         let mut atom = SaeManifoldAtom::new_with_provided_function_gram(
@@ -89,9 +93,11 @@ pub(crate) fn low_rank_factored_htbeta_term(
             Array2::<f64>::eye(m),
         )
         .expect("atom fixture: basis, jet, decoder and Gram shapes agree by construction");
-        atom.maybe_activate_decoder_frame()
+        let rank = atom
+            .maybe_activate_decoder_frame()
             .expect("frame activation")
             .expect("low-rank atom should activate a frame");
+        assert_eq!(rank, frame_rank);
         atoms.push(atom);
         coord_blocks.push(coords);
     }

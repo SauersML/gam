@@ -1,0 +1,40 @@
+
+running 16 tests
+test manifold::fit_drivers::projection_policy_tests::multivariate_compact_projection_skips_without_mutation ... ok
+beta prior 0: error=1.809350932968634e-11, scale=2.7508572119239873e-2, remainder=6.481806550305412e-2
+beta prior 0, exact=false: third_error=2.1241480796518886e-12, third_signal=3.520763255044149e-2
+beta prior 0, exact=true: third_error=1.4377998791559321e-11, third_signal=5.668135115320313e-2
+beta prior 1: error=1.6802208929744822e-11, scale=1.7074057142825796e-2, remainder=1.2318598302992477e-2
+beta prior 1, exact=false: third_error=3.702097656210768e-12, third_signal=3.131172776407731e-2
+beta prior 1, exact=true: third_error=7.170791738175808e-12, third_signal=3.460583847068183e-2
+beta prior 2: error=1.6541761016508616e-11, scale=2.165544302355944e-2, remainder=7.61972421674874e-2
+beta prior 2, exact=false: third_error=1.4368416179078025e-11, third_signal=1.0176190057831212e-1
+beta prior 2, exact=true: third_error=2.098547030593423e-11, third_signal=6.0592624319920345e-2
+test manifold::penalties::exact_beta::tests::each_decoder_prior_exact_beta_action_matches_its_frozen_gradient_2820 ... ok
+test manifold::tests::compact_layout_riemannian_geometry_matches_dense_on_full_support ... ok
+test manifold::tests::phi_eta_one_reproduces_current_atom_bases_bit_for_bit ... ok
+test manifold::tests::sae_arrow_schur_beta_quadratic_model_matches_penalized_loss_change ... ok
+test manifold::tests::sae_rho_seed_dispersion_scaling_shifts_every_scale_coupled_axis ... ok
+test manifold::tests::separation_barrier_deferred_curvature_matches_dense_hbb_1610 ... ok
+test manifold::tests_barrier_curvature_2731::separation_barrier_multi_edge_curvature_matches_dense_hbb_2731 ... ok
+test manifold::tests_collapse_prevention::repulsion_is_radially_inert_net_radial_is_analytic_barrier_2343 ... ok
+test manifold::tests_device_engage_1783::framed_amplitude_ridge_preserves_device_data_and_curvature_2627 ... ok
+test manifold::tests_device_engage_1783::framed_circle_isometry_fit_builds_device_sae_pcg_data_1783 ... ok
+test manifold::tests_device_engage_1783::offload_gate_admits_d_atom_1_at_token_scale_1783 ... ok
+#1017 accepted-iteration residency telemetry: iterations=2 row_htt_ptr=140029489885280 row_htbeta_ptr=140029489940848 gb_ptr=140029489963920 device_frame_ptr=140029489848336 device_row_htbeta_ptr=140029489932848 device_frame_blocks_ptr=140029489843824 device_frame_g_ptr=140029489892976 device_frame_w_ptr=140029489988688 numerical_content_changed=true
+test manifold::tests::accepted_iterations_reuse_arrow_and_device_frame_allocations_with_fresh_content ... ok
+test manifold::tests_factored_htbeta::factored_row_htbeta_d2_matches_dense_full_b_then_project ... ok
+test manifold::tests_sparse_curvature_operator_2500::dense_exact_a_matches_finite_difference_of_the_kkt_gradient_2330 ... ok
+
+thread 'manifold::tests_device_engage_1783::production_factored_large_border_routes_to_resident_inexact_pcg_1017' (2069662) panicked at crates/gam-sae/src/manifold/tests_device_engage_1783.rs:367:10:
+large factored assembly must install device operands
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test manifold::tests_device_engage_1783::production_factored_large_border_routes_to_resident_inexact_pcg_1017 ... FAILED
+
+failures:
+
+failures:
+    manifold::tests_device_engage_1783::production_factored_large_border_routes_to_resident_inexact_pcg_1017
+
+test result: FAILED. 15 passed; 1 failed; 0 ignored; 0 measured; 1252 filtered out; finished in 2.67s
+
