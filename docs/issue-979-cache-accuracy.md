@@ -1,7 +1,8 @@
 # Issue 979: constrained steps and cached coefficient accuracy
 
-The full binary and survival acceptance checks are still outstanding. These
-results establish two narrower defects and their corrections.
+The larger binary and survival acceptance checks are still outstanding. These
+results establish two defects and their corrections, plus a completed small
+binary fit.
 
 ## Active-face curvature
 
@@ -44,3 +45,24 @@ Current-source correctness log: `codex979-cache-accuracy-current.log` in the
 same log directory. The warm build took 2m39s. Numerical execution and builds
 were entirely on MSI; the cache regression used optimization level 0 for the
 solver and custom-family crates and is not a release-performance measurement.
+
+The accuracy certificate is pushed to main in `a810b7092`.
+
+## Full-fit follow-up
+
+With the accuracy-aware cache and the shared LAML value/gradient accuracy
+contract (`a0ef185cb`), the optimization-level-1 binary reproduction
+`repro979_margslope 160 4 1` finishes in **8.34 seconds**, with 48 outer
+iterations, four final inner cycles, and certified convergence. The spatial
+optimizer performed 241 evaluations. Log: `codex979-cache-binary160.log`.
+
+The larger binary case `1500 12 1` exceeds a 30-second diagnostic cap. At the
+cap, a warm inner solve converges in two cycles (0.079 seconds), with residual
+`4.577e-10`; outer evaluation 36 is starting its gradient. This is useful
+progress evidence, but not a completed fit. Log: `codex979-cache-binary1500-c12.log`.
+
+Survival `160 6` also exceeds 30 seconds. It now actually solves at `1e-11`:
+several completed inner solves have residuals between `2.8e-10` and `5.8e-10`.
+It reaches seven accepted outer iterations; the remaining cost is in the outer
+search and its repeated coefficient corrections. Log: `codex979-cache-survival160.log`.
+All diagnostic fits terminated; no fit from these experiments remains running.
