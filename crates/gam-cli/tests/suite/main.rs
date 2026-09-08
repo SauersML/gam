@@ -9,6 +9,7 @@ mod bug_hunt_explicit_family_emits_wrong_inferred_family_note;
 mod bug_hunt_predict_uncertainty_shifts_point_mean_for_curved_link;
 mod bug_hunt_sas_link_finalize_inner_cap_leak;
 mod bug_hunt_sas_link_outer_inner_cap_guard;
+mod cli_bad_input_contract;
 mod frontend_payload_parity_2470;
 mod regression_bspline_nonzero_anchor_pin_2297;
 mod regression_predict_cli_surfaces_covariance_provenance;
