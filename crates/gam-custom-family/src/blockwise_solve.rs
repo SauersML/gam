@@ -2285,33 +2285,25 @@ pub(crate) const STRICT_SPD_LM_RIDGE_GROWTH: f64 = 10.0;
 // holding a second definition.
 pub(crate) use gam_problem::CUSTOM_FAMILY_RIDGE_FLOOR;
 
-/// Relative eigenvalue floor used wherever an eigendecomposition needs to
-/// distinguish "real" curvature from noise: `eps_floor = EVAL_FLOOR · max|λ|`.
-/// Applied uniformly in the strict-SPD LM eigen fallback, positive-part
-/// pseudo-inverse, and penalty-direction projection.
-pub(crate) const CUSTOM_FAMILY_EVAL_FLOOR: f64 = 1e-12;
-
-/// Absolute relative-condition guard used to prevent the eigen / spectral
-/// floors from collapsing to zero when `max|λ|` is itself tiny. Combined with
-/// `CUSTOM_FAMILY_EVAL_FLOOR · max|λ|` via `.max(...)`.
+/// Relative condition guard for rejecting genuinely negative spectrum in the
+/// penalty-direction projection.
 pub(crate) const CUSTOM_FAMILY_CONDITION_RELATIVE_FLOOR: f64 = 1e-14;
 
 /// Shared engine: try the bare strict path, fall through to an escalating
-/// LM δ-ridge Cholesky, and finally an eigen-floor fallback that clamps every
-/// eigenvalue from below at `eps_floor = 1e-12 · max|λ|`. Each caller
+/// LM δ-ridge Cholesky, and finally an eigendecomposition fallback. Each caller
 /// (solve / inverse / logdet) supplies the three operation-specific closures.
 ///
 /// Centralizing the LM/eigen scaffolding here both removes ~180 lines of
 /// near-duplicated code and guarantees the three sibling helpers stay in
 /// lockstep — any future change to the schedule, the trace_scale heuristic,
-/// or the eigen-floor logic now lives in exactly one place.
+/// or the eigenspectrum fallback now lives in exactly one place.
 pub(crate) fn strict_spd_lm_engine<R>(
     matrix: &Array2<f64>,
     op_label: &'static str,
     empty: R,
     bare_path: impl FnOnce(&Array2<f64>) -> Result<R, CustomFamilyError>,
     process_chol: impl FnOnce(&gam_linalg::faer_ndarray::FaerCholeskyFactor) -> R,
-    process_eigen: impl FnOnce(&Array1<f64>, &Array2<f64>, f64) -> R,
+    process_eigen: impl FnOnce(&Array1<f64>, &Array2<f64>) -> R,
 ) -> Result<(R, StrictSpdLmStats), CustomFamilyError> {
     if let Ok(r) = bare_path(matrix) {
         return Ok((r, StrictSpdLmStats::default()));
@@ -2352,24 +2344,20 @@ pub(crate) fn strict_spd_lm_engine<R>(
         Err(exhausted) => exhausted,
     };
 
-    // δ-ridge schedule exhausted; fall back to rank-aware eigen-floor handling.
-    // Floors every eigenvalue at `eps_floor = 1e-12 · max|λ|` so well-conditioned
-    // modes are resolved exactly and rank-deficient directions are handled with
-    // controlled curvature, preventing the spatial-adaptive pilot from collapsing
-    // to a cold full-data run.
+    // δ-ridge schedule exhausted; expose the exact spectrum to the operation.
+    // The solve consumer applies Moore–Penrose semantics on the resolved positive
+    // eigenspace rather than inventing curvature for null and negative modes.
     let max_esc = STRICT_SPD_LM_MAX_ESCALATIONS;
     let delta = exhausted.next_ridge;
     let (evals, evecs) = FaerEigh::eigh(&sym, Side::Lower).map_err(|e| {
         format!(
             "{op_label} failed even with LM δ-ridge continuation \
              (escalated {max_esc} times to δ={delta:.3e}, trace_scale={trace_scale:.3e}); \
-             eigen-floor fallback also failed: {e}"
+             eigendecomposition fallback also failed: {e}"
         )
     })?;
-    let max_abs_eval = evals.iter().fold(0.0_f64, |a, &b| a.max(b.abs()));
-    let eps_floor = (CUSTOM_FAMILY_EVAL_FLOOR * max_abs_eval).max(1e-300);
     Ok((
-        process_eigen(&evals, &evecs, eps_floor),
+        process_eigen(&evals, &evecs),
         StrictSpdLmStats {
             delta_used: delta,
             escalations: STRICT_SPD_LM_MAX_ESCALATIONS + 1,
@@ -2388,15 +2376,23 @@ pub(crate) fn strict_solve_spd_with_lm_continuation(
         Array1::<f64>::zeros(0),
         |m| strict_solve_spd(m, rhs),
         |chol| chol.solvevec(rhs),
-        |evals, evecs, eps_floor| {
-            // x = Q diag(1/Λ̃) Qᵀ rhs.
+        |evals, evecs| {
+            // The terminal fallback is the Moore–Penrose inverse on the
+            // resolved positive eigenspace. A null or negative direction
+            // contributes zero; inventing an absolute eigenvalue for it
+            // changes both the equation and its physical units.
+            let threshold = positive_eigenvalue_threshold(
+                evals.as_slice().expect("eigh returns contiguous eigenvalues"),
+            );
             let mut q_t_rhs = Array1::<f64>::zeros(p);
             for k in 0..p {
                 let mut acc = 0.0;
                 for i in 0..p {
                     acc += evecs[[i, k]] * rhs[i];
                 }
-                q_t_rhs[k] = acc / evals[k].max(eps_floor);
+                if evals[k] > threshold {
+                    q_t_rhs[k] = acc / evals[k];
+                }
             }
             let mut x = Array1::<f64>::zeros(p);
             for i in 0..p {
