@@ -9239,6 +9239,549 @@ mod tests_atlas_prior_2280 {
         }
         println!("{sweep}");
     }
+
+    /// #2280's open refutation, localized: `swiss_roll(80, 16)` is named
+    /// `Cylinder` — `b₁ = 1` on a contractible sheet — and the mechanism is
+    /// OPEN. The ambient-near-miss story was withdrawn after the derived
+    /// injectivity bar fired on nothing (#2280, 2026-09-04: "it needs a
+    /// diagnostic that names which patch pair carries the spurious cycle, not
+    /// another candidate criterion"). This is that diagnostic.
+    ///
+    /// Method. Rebuild the nerve exactly as `observe_atlas_topology` does
+    /// (incoherent sign pairs dropped from both objects, adjacency from
+    /// registered transitions, cliques gated by non-empty shared support), then
+    /// solve the GF(2) system `[∂₁; δ] z = 0`: a 1-cycle (even degree at every
+    /// vertex) orthogonal to every nerve triangle's boundary. The solution
+    /// space is `Z₁ ∩ B₁^⊥`, which surjects onto `H₁`; reducing each basis
+    /// vector modulo the boundary space `B₁ = im ∂₂` and keeping a nonzero
+    /// residual names a representative of THE spurious class when `b₁ = 1`.
+    /// Mapping the cycle's patches' center rows back through the fixture's
+    /// known parametrization `(t, h) = (1 + 3π·it/(n_t−1), 2·ih/(n_h−1))`
+    /// localizes the defect on the sheet, and three registered discriminators
+    /// separate the candidate mechanisms:
+    ///
+    /// 1. **cross-winding** (the withdrawn story): a cycle edge whose two
+    ///    centers differ by `|Δt| > π` — ambient-near, geodesically far. The
+    ///    fixture's winding gap is a constant `2π` in radius against patch
+    ///    diameters of ~2–4 ambient units, so the prediction is 0 such edges;
+    ///    the probe exists to falsify that, not to assume it.
+    /// 2. **boundary-hugging** (under-coverage at the sheet's free edges):
+    ///    the cycle's `(t, h)` hull touches `t = 1`, `t = 1 + 3π`, `h = 0`, or
+    ///    `h = 2`.
+    /// 3. **interior phantom ring** (a hollow loop of pairwise overlaps whose
+    ///    chords are not admitted): pairs of cycle vertices with NO nerve edge
+    ///    despite ambient-near centers, with the shared-row count that fell
+    ///    below `min_overlap` printed per pair.
+    #[test]
+    fn swiss_roll_cycle_localizer_names_the_spurious_b1_carrier_2280() {
+        use crate::inference::atlas_nerve::{compute_betti, enumerate_full_nerve};
+        use crate::manifold::tests_topology_fixtures::swiss_roll;
+        use std::collections::{BTreeMap, BTreeSet};
+
+        // ---- GF(2) helpers -------------------------------------------------
+        // RREF of a 0/1 matrix over GF(2); returns the reduced rows and the
+        // pivot column of each nonzero row (ascending).
+        fn gf2_rref(mut m: Vec<Vec<u8>>) -> (Vec<Vec<u8>>, Vec<usize>) {
+            let cols = m.first().map_or(0, |r| r.len());
+            let mut pivots = Vec::new();
+            let mut r = 0usize;
+            for c in 0..cols {
+                if let Some(sel) = (r..m.len()).find(|&i| m[i][c] == 1) {
+                    m.swap(r, sel);
+                    for i in 0..m.len() {
+                        if i != r && m[i][c] == 1 {
+                            for j in 0..cols {
+                                m[i][j] ^= m[r][j];
+                            }
+                        }
+                    }
+                    pivots.push(c);
+                    r += 1;
+                }
+                if r == m.len() {
+                    break;
+                }
+            }
+            (m, pivots)
+        }
+
+        // Nullspace basis of a GF(2) matrix given its RREF + pivots.
+        fn gf2_nullspace(rref: &[Vec<u8>], pivots: &[usize], cols: usize) -> Vec<Vec<u8>> {
+            let pivot_col: Vec<bool> = {
+                let mut v = vec![false; cols];
+                for &p in pivots {
+                    v[p] = true;
+                }
+                v
+            };
+            (0..cols)
+                .filter(|&c| !pivot_col[c])
+                .map(|f| {
+                    let mut x = vec![0u8; cols];
+                    x[f] = 1;
+                    for (row, &p) in rref.iter().zip(pivots) {
+                        if row[f] == 1 {
+                            x[p] = 1;
+                        }
+                    }
+                    x
+                })
+                .collect()
+        }
+
+        // Reduce `v` modulo the row space of a GF(2) RREF (returns the
+        // residual; zero residual ⟺ v is in the space).
+        fn gf2_reduce(mut v: Vec<u8>, rref: &[Vec<u8>], pivots: &[usize]) -> Vec<u8> {
+            for (row, &p) in rref.iter().zip(pivots) {
+                if v[p] == 1 {
+                    for (a, b) in v.iter_mut().zip(row) {
+                        *a ^= b;
+                    }
+                }
+            }
+            v
+        }
+
+        // ---- the refuted state, reproduced through production --------------
+        let (n_t, n_h) = (80usize, 16usize);
+        let z = swiss_roll(n_t, n_h);
+        let config = crate::manifold::LocalAtlasConfig::balanced(z.nrows(), 2);
+        let atlas =
+            crate::manifold::LocalAtlas::build(z.view(), config).expect("atlas must build");
+        let readout = crate::manifold::observe_atlas_topology(&atlas).expect("readout");
+        let inv = readout.invariants();
+        assert_eq!((inv.betti.b0, inv.betti.b1), (1, 1), "{readout}");
+        assert!(
+            format!("{:?}", readout.observed_manifold()).contains("Cylinder"),
+            "{readout}"
+        );
+
+        // ---- rebuild the nerve exactly as the readout does ------------------
+        let mut pair_sign: BTreeMap<(usize, usize), i8> = BTreeMap::new();
+        let mut incoherent: BTreeSet<(usize, usize)> = BTreeSet::new();
+        for (a, b, _, sign) in atlas.observed_signed_edges() {
+            let key = (a.min(b), a.max(b));
+            match pair_sign.get(&key) {
+                Some(&existing) if existing != sign => {
+                    incoherent.insert(key);
+                }
+                Some(_) => {}
+                None => {
+                    pair_sign.insert(key, sign);
+                }
+            }
+        }
+        for key in &incoherent {
+            pair_sign.remove(key);
+        }
+        let mut overlap_pairs: BTreeSet<(usize, usize)> = BTreeSet::new();
+        for transition in atlas.transitions() {
+            let (a, b) = (transition.from_patch, transition.to_patch);
+            let key = (a.min(b), a.max(b));
+            if !incoherent.contains(&key) {
+                overlap_pairs.insert(key);
+            }
+        }
+        let chart_count = atlas.chart_count();
+        let mut adjacency = vec![BTreeSet::<usize>::new(); chart_count];
+        for &(a, b) in &overlap_pairs {
+            adjacency[a].insert(b);
+            adjacency[b].insert(a);
+        }
+        let members: Vec<Vec<usize>> = atlas
+            .patches()
+            .iter()
+            .map(|p| p.members.clone())
+            .collect();
+        let nonempty = |simplex: &[usize]| -> bool {
+            let Some((&first, rest)) = simplex.split_first() else {
+                return false;
+            };
+            let mut shared = members[first].clone();
+            for &next in rest {
+                shared = shared
+                    .iter()
+                    .filter(|r| members[next].binary_search(r).is_ok())
+                    .copied()
+                    .collect();
+                if shared.is_empty() {
+                    return false;
+                }
+            }
+            !shared.is_empty()
+        };
+        let inventory = enumerate_full_nerve(chart_count, &nonempty, &adjacency, None)
+            .expect("nerve enumeration");
+        let betti = compute_betti(
+            &inventory.vertices,
+            &inventory.edges,
+            &inventory.triangles,
+            &inventory.tetrahedra,
+        );
+        assert_eq!(
+            (betti.b0, betti.b1, inventory.euler_characteristic),
+            (inv.betti.b0, inv.betti.b1, inv.euler_characteristic),
+            "reconstructed nerve must match the readout exactly"
+        );
+
+        // ---- the localizer: homology class representative over GF(2) --------
+        // Z₁ = ker ∂₁ (even degree at every vertex); B₁ = im ∂₂ (triangle
+        // boundaries as edge vectors). Reduce each nullspace basis vector
+        // modulo B₁'s row space: the residuals span Z₁/B₁ ≅ H₁, and over GF(2)
+        // every nonzero residual is the SAME canonical vector `r` (the span is
+        // one-dimensional, scalars are {0,1}). `r` is itself a cycle — it is a
+        // nullspace vector plus a boundary, and B₁ ⊆ Z₁ — so it is a genuine
+        // representative of THE spurious class.
+        let edge_index: BTreeMap<(usize, usize), usize> = inventory
+            .edges
+            .iter()
+            .enumerate()
+            .map(|(i, e)| ((e[0], e[1]), i))
+            .collect();
+        let e_count = inventory.edges.len();
+        let triangle_set: BTreeSet<[usize; 3]> = inventory
+            .triangles
+            .iter()
+            .map(|t| [t[0], t[1], t[2]])
+            .collect();
+
+        // ∂₁ rows (one per vertex, 1s on incident edges) …
+        let mut vertex_rows: Vec<Vec<u8>> = Vec::with_capacity(chart_count);
+        for v in 0..chart_count {
+            let mut row = vec![0u8; e_count];
+            for (key, &idx) in &edge_index {
+                if key.0 == v || key.1 == v {
+                    row[idx] = 1;
+                }
+            }
+            vertex_rows.push(row);
+        }
+        // … and δ rows (one per triangle, 1s on its boundary edges).
+        let boundary_rows: Vec<Vec<u8>> = inventory
+            .triangles
+            .iter()
+            .map(|tri| {
+                let mut row = vec![0u8; e_count];
+                for (u, w) in [(tri[0], tri[1]), (tri[0], tri[2]), (tri[1], tri[2])] {
+                    row[edge_index[&(u.min(w), u.max(w))]] = 1;
+                }
+                row
+            })
+            .collect();
+
+        let (cycle_rref, cycle_pivots) = gf2_rref(vertex_rows);
+        let kernel = gf2_nullspace(&cycle_rref, &cycle_pivots, e_count);
+        let (boundary_rref, boundary_pivots) = gf2_rref(boundary_rows);
+
+        // Sanity: dim Z₁ − rank ∂₂ = b₁ must reproduce the readout's b₁.
+        assert_eq!(
+            kernel.len().saturating_sub(boundary_pivots.len()),
+            betti.b1,
+            "dim ker ∂₁ ({}) − rank ∂₂ ({}) must equal the nerve's b₁",
+            kernel.len(),
+            boundary_pivots.len()
+        );
+
+        // The class representative: the unique nonzero residual.
+        let mut residuals: Vec<Vec<u8>> = Vec::new();
+        for basis in &kernel {
+            let residual = gf2_reduce(basis.clone(), &boundary_rref, &boundary_pivots);
+            if residual.iter().any(|&b| b == 1) {
+                residuals.push(residual);
+            }
+        }
+        assert!(
+            !residuals.is_empty(),
+            "b₁ = 1 must yield a nullspace vector outside the boundary space \
+             (got {} nullspace vectors, rank ∂₂ = {})",
+            kernel.len(),
+            boundary_pivots.len()
+        );
+        let distinct_count = residuals
+            .iter()
+            .collect::<BTreeSet<_>>()
+            .len();
+        assert_eq!(
+            distinct_count, 1,
+            "with b₁ = 1 every nonzero residual must be the same canonical vector"
+        );
+        let cycle: Vec<u8> = residuals.pop().expect("nonempty by the assert above");
+        let cycle_edges: Vec<(usize, usize)> = inventory
+            .edges
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| cycle[*i] == 1)
+            .map(|(_, e)| (e[0], e[1]))
+            .collect();
+
+        // ---- geometry of the named cycle ------------------------------------
+        let param = |row: usize| -> (f64, f64) {
+            let it = row / n_h;
+            let ih = row % n_h;
+            (
+                1.0 + 3.0 * std::f64::consts::PI * (it as f64) / (n_t as f64 - 1.0),
+                2.0 * (ih as f64) / (n_h as f64 - 1.0),
+            )
+        };
+        let ambient_dist = |a: usize, b: usize| -> f64 {
+            let (da, db) = (atlas.patches()[a].center, atlas.patches()[b].center);
+            (0..z.ncols())
+                .map(|c| {
+                    let d = z[[da, c]] - z[[db, c]];
+                    d * d
+                })
+                .sum::<f64>()
+                .sqrt()
+        };
+        let shared_rows = |a: usize, b: usize| -> usize {
+            members[a]
+                .iter()
+                .filter(|r| members[b].binary_search(r).is_ok())
+                .count()
+        };
+
+        let mut cycle_vertices: BTreeSet<usize> = BTreeSet::new();
+        for &(a, b) in &cycle_edges {
+            cycle_vertices.insert(a);
+            cycle_vertices.insert(b);
+        }
+        let centers: Vec<(f64, f64)> = cycle_vertices
+            .iter()
+            .map(|&v| param(atlas.patches()[v].center))
+            .collect();
+        let t_vals: Vec<f64> = centers.iter().map(|c| c.0).collect();
+        let h_vals: Vec<f64> = centers.iter().map(|c| c.1).collect();
+        let (t_min, t_max) = (
+            t_vals.iter().cloned().fold(f64::INFINITY, f64::min),
+            t_vals.iter().cloned().fold(f64::NEG_INFINITY, f64::max),
+        );
+        let (h_min, h_max) = (
+            h_vals.iter().cloned().fold(f64::INFINITY, f64::min),
+            h_vals.iter().cloned().fold(f64::NEG_INFINITY, f64::max),
+        );
+
+        // Discriminator 1: cross-winding edges (|Δt| > π).
+        let cross_winding = cycle_edges
+            .iter()
+            .filter(|&&(a, b)| {
+                let (ta, _) = param(atlas.patches()[a].center);
+                let (tb, _) = param(atlas.patches()[b].center);
+                (ta - tb).abs() > std::f64::consts::PI
+            })
+            .count();
+
+        // Discriminator 3: missing chords — pairs of cycle vertices with no
+        // nerve edge. Print their ambient distance, |Δt|, |Δh|, and the shared
+        // row count that failed min_overlap.
+        let mut missing_chords = String::new();
+        let cyc: Vec<usize> = cycle_vertices.iter().copied().collect();
+        for (i, &u) in cyc.iter().enumerate() {
+            for &w in cyc.iter().skip(i + 1) {
+                if edge_index.contains_key(&(u.min(w), u.max(w))) {
+                    continue;
+                }
+                let (tu, hu) = param(atlas.patches()[u].center);
+                let (tw, hw) = param(atlas.patches()[w].center);
+                missing_chords.push_str(&format!(
+                    "    chord {u:>3}–{w:>3}: |Δt|={:5.2} |Δh|={:4.2} ambient={:5.2} \
+                     shared_rows={} (< min_overlap {})\n",
+                    (tu - tw).abs(),
+                    (hu - hw).abs(),
+                    ambient_dist(u, w),
+                    shared_rows(u, w),
+                    config.min_overlap
+                ));
+            }
+        }
+
+        // Discriminator 2 readout: the hull vs the free edges of the sheet.
+        let t_low = 1.0;
+        let t_high = 1.0 + 3.0 * std::f64::consts::PI;
+        let touches_t_edge = t_min - t_low < 0.35 || t_high - t_max < 0.35;
+        let touches_h_edge = h_min < 0.3 || 2.0 - h_max < 0.3;
+
+        // Nerve-edge center-distance distribution, for scale.
+        let mut nerve_dists: Vec<f64> = inventory
+            .edges
+            .iter()
+            .map(|e| ambient_dist(e[0], e[1]))
+            .collect();
+        nerve_dists.sort_by(|a, b| a.total_cmp(b));
+        let nerve_median =
+            nerve_dists.get(nerve_dists.len() / 2).copied().unwrap_or(0.0);
+
+        // Local fill: triangles with all three vertices on the cycle.
+        let triangles_inside = triangle_set
+            .iter()
+            .filter(|t| {
+                cycle_vertices.contains(&t[0])
+                    && cycle_vertices.contains(&t[1])
+                    && cycle_vertices.contains(&t[2])
+            })
+            .count();
+
+        // Walk the cycle into closed trails (Hierholzer) for an ordered print.
+        let mut trail_adj: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
+        for &(a, b) in &cycle_edges {
+            trail_adj.entry(a).or_default().push(b);
+            trail_adj.entry(b).or_default().push(a);
+        }
+        let mut trails: Vec<Vec<usize>> = Vec::new();
+        loop {
+            let start = trail_adj
+                .iter()
+                .find(|(_, ns)| !ns.is_empty())
+                .map(|(k, _)| *k);
+            let Some(start) = start else { break };
+            let mut stack = vec![start];
+            let mut trail: Vec<usize> = Vec::new();
+            while let Some(&v) = stack.last() {
+                let next = trail_adj.get_mut(&v).and_then(|ns| ns.pop());
+                if let Some(w) = next {
+                    if let Some(ns) = trail_adj.get_mut(&w) {
+                        if let Some(pos) = ns.iter().position(|&x| x == v) {
+                            ns.remove(pos);
+                        }
+                    }
+                    stack.push(w);
+                } else {
+                    stack.pop();
+                    trail.push(v);
+                }
+            }
+            trail.reverse();
+            trails.push(trail);
+        }
+        // Consecutive windows along each trail that the nerve fills with a
+        // triangle: a hollow ring has none.
+        let mut windows = 0usize;
+        let mut windows_filled = 0usize;
+        let mut walk = String::new();
+        for trail in &trails {
+            if trail.len() < 3 {
+                continue;
+            }
+            for w in trail.windows(3) {
+                let mut tri = [w[0], w[1], w[2]];
+                tri.sort_unstable();
+                windows += 1;
+                if triangle_set.contains(&tri) {
+                    windows_filled += 1;
+                }
+            }
+            let ordered: Vec<String> = trail
+                .iter()
+                .map(|&v| {
+                    let (t, h) = param(atlas.patches()[v].center);
+                    format!("{v}({t:.2},{h:.2})")
+                })
+                .collect();
+            walk.push_str(&format!("    {}\n", ordered.join(" → ")));
+        }
+
+        let mut report = String::from("\n#2280 swiss_roll(80,16) spurious b₁ localizer\n");
+        report.push_str(&format!(
+            "nerve: {chart_count} vertices, {e_count} edges, {} triangles, \
+             b0/b1 = {}/{}, nullity = {}, class reps = {}\n",
+            inventory.triangles.len(),
+            betti.b0,
+            betti.b1,
+            kernel.len(),
+            distinct_count
+        ));
+        report.push_str(&format!(
+            "cycle: {} edges on {} vertices; (t,h) hull t ∈ [{t_min:.2}, {t_max:.2}] \
+             (sheet [1, {t_high:.2}]), h ∈ [{h_min:.2}, {h_max:.2}] (sheet [0, 2])\n",
+            cycle_edges.len(),
+            cycle_vertices.len()
+        ));
+        report.push_str(&format!(
+            "  touches t-edge: {touches_t_edge}, touches h-edge: {touches_h_edge}, \
+             cross-winding edges (|Δt|>π): {cross_winding}\n"
+        ));
+        report.push_str(&format!(
+            "  triangles with all vertices on cycle: {triangles_inside}; walk windows \
+             filled: {windows_filled}/{windows}; nerve-edge center-distance median: \
+             {nerve_median:.2}\n"
+        ));
+        report.push_str("  walk:\n");
+        report.push_str(&walk);
+        // Per-vertex patch anatomy: did the curvature-driven shrink starve
+        // the ring's patches? A full-budget patch has 72 members; the chords
+        // starve when patches on opposite sides of the hole contain too few
+        // of each other's rows.
+        report.push_str("  patches on the cycle:\n");
+        let mut straddling_patches: Vec<usize> = Vec::new();
+        for &v in &cyc {
+            let patch = &atlas.patches()[v];
+            let cert = &atlas.charts()[v].certificate;
+            let t_span = patch
+                .members
+                .iter()
+                .map(|&row| param(row).0)
+                .fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), t| {
+                    (lo.min(t), hi.max(t))
+                });
+            // A patch straddles two windings iff its members' t-range exceeds
+            // the winding period 2π. The withdrawn ambient-near-miss story,
+            // and the graph-connectivity membership fix built on it, require a
+            // straddle to bite; this measures whether one exists.
+            if t_span.1 - t_span.0 > 2.0 * std::f64::consts::PI {
+                straddling_patches.push(v);
+            }
+            report.push_str(&format!(
+                "    patch {:>3}: center row {:>4} = (t={:5.2}, h={:4.2}), {} members \
+                 (budget {}), captured_var {:.3}, min_stretch {:.3}, member t-span \
+                 {:4.2} (< 2π = no winding straddle)\n",
+                v,
+                patch.center,
+                param(patch.center).0,
+                param(patch.center).1,
+                patch.members.len(),
+                config.patch_size,
+                cert.captured_variance_fraction,
+                cert.min_projection_stretch,
+                t_span.1 - t_span.0
+            ));
+        }
+        report.push_str(&format!(
+            "  patches straddling a winding (member t-span > 2π): {} of {} on the cycle\n",
+            straddling_patches.len(),
+            cycle_vertices.len()
+        ));
+        for &(a, b) in &cycle_edges {
+            let (ta, ha) = param(atlas.patches()[a].center);
+            let (tb, hb) = param(atlas.patches()[b].center);
+            report.push_str(&format!(
+                "    edge {a:>3}–{b:>3}: |Δt|={:5.2} |Δh|={:4.2} ambient={:5.2} \
+                 shared_rows={}\n",
+                (ta - tb).abs(),
+                (ha - hb).abs(),
+                ambient_dist(a, b),
+                shared_rows(a, b)
+            ));
+        }
+        if missing_chords.is_empty() {
+            report.push_str("  missing chords inside the cycle: none\n");
+        } else {
+            report.push_str("  missing chords inside the cycle:\n");
+            report.push_str(&missing_chords);
+        }
+        println!("{report}");
+
+        // Accounting assertions only — the localization itself is the
+        // deliverable, printed above; the mechanism it names is pinned by the
+        // discriminators, not by a threshold on a quantity invented here.
+        assert!(
+            !cycle_edges.is_empty(),
+            "{report}\nthe localized class representative must name its edges"
+        );
+        assert_eq!(
+            distinct_count,
+            1,
+            "{report}\nwith b₁ = 1 every nonzero residual must be the same canonical vector"
+        );
+    }
 }
 
 #[cfg(test)]
