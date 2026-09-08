@@ -1901,7 +1901,14 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
     });
     let inner_solve_options = tightened_options.as_ref().unwrap_or(options);
     let mut inner = match precomputed_inner {
-        Some(inner) => inner,
+        Some(inner) if inner.solved_inner_tol <= inner_solve_options.inner_tol => inner,
+        Some(inner) => {
+            // Owning a mode does not upgrade its accuracy. Keep its coefficient
+            // vector and active face as the corrector seed, and solve the same
+            // objective to the accuracy required by this criterion evaluation.
+            let seed = constrained_warm_start_from_inner(rho_current, &inner);
+            inner_blockwise_fit(family, specs, &per_block, inner_solve_options, Some(&seed))?
+        }
         None => inner_blockwise_fit(
             family,
             specs,

@@ -14,6 +14,7 @@ pub(crate) fn screened_outer_warm_start<'a>(
 
 pub(crate) fn cached_inner_mode_from_result(result: &BlockwiseInnerResult) -> CachedInnerMode {
     CachedInnerMode {
+        solved_inner_tol: result.solved_inner_tol,
         log_likelihood: result.log_likelihood,
         penalty_value: result.penalty_value,
         cycles: result.cycles,

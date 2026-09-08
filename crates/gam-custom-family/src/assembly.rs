@@ -2772,6 +2772,10 @@ mod test_support {
 
 #[derive(Clone)]
 pub struct BlockwiseInnerResult {
+    /// Requested relative tolerance used by the producing coefficient solve.
+    /// A cached convergence verdict is valid only for an equally strict or
+    /// looser request; changing accuracy requires correcting the stored mode.
+    pub(crate) solved_inner_tol: f64,
     pub block_states: Vec<ParameterBlockState>,
     /// Exact working-set evidence evaluated at `block_states` by the inner
     /// solve. `None` only when an owned exact-Hessian workspace was the sole
@@ -2854,6 +2858,7 @@ pub(crate) struct ConstrainedWarmStart {
 
 #[derive(Clone)]
 pub(crate) struct CachedInnerMode {
+    pub(crate) solved_inner_tol: f64,
     pub(crate) log_likelihood: f64,
     pub(crate) penalty_value: f64,
     pub(crate) cycles: usize,

@@ -485,6 +485,7 @@ pub(crate) fn load_persistent_custom_family_warm_start<F: CustomFamily + ?Sized>
     }
     let active_sets = normalize_active_sets(record.active_sets);
     let cached_inner = record.inner.map(|inner| CachedInnerMode {
+        solved_inner_tol: inner.solved_inner_tol,
         log_likelihood: inner.log_likelihood,
         penalty_value: inner.penalty_value,
         cycles: inner.cycles,
@@ -550,6 +551,7 @@ pub(crate) fn persistent_block_inner_summary(
         }
         let (block_log_lambdas, joint_log_lambdas) = cached.objective_state.to_parts();
         Some(PersistentBlockInnerSummary {
+            solved_inner_tol: cached.solved_inner_tol,
             log_likelihood: cached.log_likelihood,
             penalty_value: cached.penalty_value,
             cycles: cached.cycles,

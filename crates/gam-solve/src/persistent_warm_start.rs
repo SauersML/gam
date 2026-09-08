@@ -6,9 +6,8 @@ use std::path::PathBuf;
 use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-// v2 (#2615): `PersistentBlockInnerSummary` carries the smoothing state its
-// cached inner mode was solved at, so a restored mode can be keyed correctly.
-const CACHE_VERSION: u32 = 2;
+// v3 (#979): a cached coefficient mode carries its producing solve tolerance.
+const CACHE_VERSION: u32 = 3;
 const MAX_ENTRY_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_TOTAL_BYTES: u64 = 256 * 1024 * 1024;
 const CACHE_TTL_SECS: u64 = 60 * 60 * 24 * 365 * 10;
@@ -42,7 +41,8 @@ pub fn cache_schema_tag() -> String {
     // inner/outer warm-start records. The bump walls off any entries written
     // under the old layouts so a mixed-schema store never aliases a legacy
     // payload into the new artifact reader (and vice versa).
-    "schema3-unified-fingerprinter-v3".to_string()
+    // v4 records coefficient-solve accuracy; older entries cannot certify it.
+    "schema3-unified-fingerprinter-v4".to_string()
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -67,6 +67,7 @@ pub struct PersistentWarmStartRecord {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PersistentBlockInnerSummary {
+    pub solved_inner_tol: f64,
     pub log_likelihood: f64,
     pub penalty_value: f64,
     pub cycles: usize,
@@ -88,7 +89,9 @@ pub struct PersistentBlockInnerSummary {
 
 impl PersistentBlockInnerSummary {
     fn is_valid(&self) -> bool {
-        self.log_likelihood.is_finite()
+        self.solved_inner_tol.is_finite()
+            && self.solved_inner_tol >= 0.0
+            && self.log_likelihood.is_finite()
             && self.penalty_value.is_finite()
             && self.block_logdet_h.is_finite()
             && self.block_logdet_s.is_finite()

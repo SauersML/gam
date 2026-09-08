@@ -496,6 +496,7 @@ pub(crate) fn joint_outer_gradient_uses_projected_trace_for_rank_deficient_penal
     };
     let specs = vec![spec];
     let inner = BlockwiseInnerResult {
+        solved_inner_tol: 1e-6,
         block_states: vec![ParameterBlockState {
             beta: beta.clone(),
             eta: Array1::zeros(1),
@@ -675,6 +676,7 @@ pub(crate) fn joint_outer_gradient_projected_trace_drops_joint_null() {
     };
     let specs = vec![spec];
     let inner = BlockwiseInnerResult {
+        solved_inner_tol: 1e-6,
         block_states: vec![ParameterBlockState {
             beta: beta.clone(),
             eta: Array1::zeros(1),
@@ -815,6 +817,7 @@ pub(crate) fn large_scale_rho_scan_joint_outer_evaluate_is_projection_invariant(
         };
         let specs = vec![spec];
         let inner = BlockwiseInnerResult {
+            solved_inner_tol: 1e-6,
             block_states: vec![ParameterBlockState {
                 beta: beta.clone(),
                 eta: Array1::zeros(1),
@@ -1164,6 +1167,7 @@ pub(crate) fn large_scale_multiblock_outer_gradient_with_realistic_drift_is_boun
     let per_block = vec![array![rho[0]], array![rho[1], rho[2]], array![rho[3]]];
 
     let inner = BlockwiseInnerResult {
+        solved_inner_tol: 1e-6,
         block_states: vec![
             ParameterBlockState {
                 beta: beta_flat.slice(s![0..p_time]).to_owned(),
@@ -3587,6 +3591,57 @@ pub(crate) fn generic_single_block_fallback_includes_nonzero_d2h_drift() {
         h_with,
         h_without
     );
+}
+
+#[test]
+fn cached_mode_is_corrected_when_the_requested_accuracy_tightens_979() {
+    let family = OneBlockQuarticExactFamily {
+        linear: 3.0,
+        curvature: 0.5,
+        second_scale: 1.0,
+    };
+    let specs = vec![ParameterBlockSpec {
+        name: "quartic cache accuracy".into(),
+        design: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(array![[1.0]])),
+        offset: array![0.0],
+        penalties: vec![PenaltyMatrix::Dense(array![[1.0]])],
+        nullspace_dims: vec![0],
+        initial_log_lambdas: array![0.0],
+        initial_beta: Some(array![0.75]),
+        gauge_priority: 100,
+        jacobian_callback: None,
+        stacked_design: None,
+        stacked_offset: None,
+    }];
+    let loose_options = BlockwiseFitOptions {
+        inner_tol: 1e-2,
+        use_remlobjective: false,
+        compute_covariance: false,
+        ..BlockwiseFitOptions::default()
+    };
+    let rho = array![0.0];
+    let loose = inner_blockwise_fit(&family, &specs, &[rho.clone()], &loose_options, None)
+        .expect("coarse quartic mode");
+    assert!(loose.converged);
+    let residual = |inner: &BlockwiseInnerResult| {
+        let beta = inner.block_states[0].beta[0];
+        (3.0 - 2.0 * beta - beta.powi(3) / 6.0).abs()
+    };
+    assert!(residual(&loose) > 1e-9, "fixture must require a correction");
+    let warm = constrained_warm_start_from_inner(&rho, &loose);
+    let tight_options = BlockwiseFitOptions {
+        inner_tol: 1e-11,
+        ..loose_options.clone()
+    };
+    let tight = inner_blockwise_fit(&family, &specs, &[rho.clone()], &tight_options, Some(&warm))
+        .expect("cached coarse mode must be corrected");
+    assert!(tight.converged);
+    assert!(residual(&tight) < 1e-10, "residual={}", residual(&tight));
+    let tight_warm = constrained_warm_start_from_inner(&rho, &tight);
+    let reused = inner_blockwise_fit(&family, &specs, &[rho], &loose_options, Some(&tight_warm))
+        .expect("a tighter mode remains reusable for a looser request");
+    assert_eq!(reused.block_states[0].beta, tight.block_states[0].beta);
+    assert_eq!(reused.solved_inner_tol, tight_options.inner_tol);
 }
 
 pub(crate) fn jeffreys_seam_spec(p: usize) -> ParameterBlockSpec {

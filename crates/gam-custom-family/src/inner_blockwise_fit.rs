@@ -3092,6 +3092,7 @@ fn inner_blockwise_fit_for_product<F: CustomFamily + Clone + Send + Sync + 'stat
         if let Some(cached) = seed.cached_inner.as_ref()
             && cached.objective_state == objective_state
             && cached.converged
+            && cached.solved_inner_tol <= inner_tol
             && (!product.requires_laplace_artifacts()
                 || (cached.block_logdet_h.is_some_and(f64::is_finite)
                     && cached.block_logdet_s.is_some_and(f64::is_finite)))
@@ -3179,6 +3180,7 @@ fn inner_blockwise_fit_for_product<F: CustomFamily + Clone + Send + Sync + 'stat
                     cached.block_logdet_s,
                 );
                 return Ok(BlockwiseInnerResult {
+                    solved_inner_tol: cached.solved_inner_tol,
                     block_states: states,
                     terminal_working_sets: cached.terminal_working_sets.clone(),
                     terminal_likelihood_score: cached.terminal_likelihood_score.clone(),
@@ -4528,6 +4530,7 @@ fn assemble_inner_blockwise_result<F: CustomFamily + Clone + Send + Sync + 'stat
     };
 
     Ok(BlockwiseInnerResult {
+        solved_inner_tol: options.inner_tol,
         block_states: states,
         terminal_working_sets: Some(cached_eval.blockworking_sets.clone()),
         terminal_likelihood_score: None,
