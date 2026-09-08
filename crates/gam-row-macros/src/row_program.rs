@@ -3888,9 +3888,15 @@ fn rust_dense_taylor_uncontracted_body(
         push_dense_taylor_derivative_array(&mut source, "inner_first", &schedule.result, 1);
         push_dense_taylor_derivative_array(&mut source, "inner_second", &schedule.result, 2);
         push_dense_taylor_derivative_array(&mut source, "inner_third", &schedule.result, 3);
+        // Compute each symmetric component once. Expanding all eight ordered
+        // triples independently produces differently associated sums for the
+        // permutations of 001 and 011, which strict floating-point codegen
+        // cannot merge. The canonical multi-index has only four components.
         source.push_str(&format!(
-            "    std::array::from_fn(|axis_a| std::array::from_fn(|axis_b| {{\n\
-             \x20       std::array::from_fn(|axis_c| {{\n\
+            "    let derivative: [f64; 4] = std::array::from_fn(|second_axes| {{\n\
+             \x20           let axis_a = usize::from(second_axes == 3);\n\
+             \x20           let axis_b = usize::from(second_axes >= 2);\n\
+             \x20           let axis_c = usize::from(second_axes >= 1);\n\
              \x20           let inner_a = inner_first[axis_a];\n\
              \x20           let inner_b = inner_first[axis_b];\n\
              \x20           let inner_c = inner_first[axis_c];\n\
@@ -3902,8 +3908,11 @@ fn rust_dense_taylor_uncontracted_body(
              \x20               + {root_stack}[2] * (inner_ab * inner_c\n\
              \x20                   + inner_ac * inner_b + inner_bc * inner_a)\n\
              \x20               + {root_stack}[1] * inner_abc\n\
-             \x20       }})\n\
-             \x20   }}))\n\
+             \x20   }});\n\
+             \x20   [\n\
+             \x20       [[derivative[0], derivative[1]], [derivative[1], derivative[2]]],\n\
+             \x20       [[derivative[1], derivative[2]], [derivative[2], derivative[3]]],\n\
+             \x20   ]\n\
              }}\n"
         ));
         return syn::parse_str(&source).map_err(|error| {

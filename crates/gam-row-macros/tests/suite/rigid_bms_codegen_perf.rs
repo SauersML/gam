@@ -329,15 +329,19 @@ fn strongest_hand_fourth(row: Row) -> [[f64; 2]; 2] {
 #[inline(always)]
 fn strongest_hand_third_full(row: Row) -> [[[f64; 2]; 2]; 2] {
     let (outer, d1, d2, d3, _) = margin_chain(row);
-    std::array::from_fn(|a| {
-        std::array::from_fn(|b| {
-            std::array::from_fn(|c| {
-                outer[3] * d1[a] * d1[b] * d1[c]
-                    + outer[2] * (d2[a + b] * d1[c] + d2[a + c] * d1[b] + d2[b + c] * d1[a])
-                    + outer[1] * d3[a + b + c]
-            })
-        })
-    })
+    // Give the analytic opponent the same symmetry opportunity: a hand
+    // implementation need only evaluate four independent components.
+    let t000 =
+        outer[3] * d1[0] * d1[0] * d1[0] + outer[2] * (3.0 * d2[0] * d1[0]) + outer[1] * d3[0];
+    let t001 = outer[3] * d1[0] * d1[0] * d1[1]
+        + outer[2] * (d2[0] * d1[1] + 2.0 * d2[1] * d1[0])
+        + outer[1] * d3[1];
+    let t011 = outer[3] * d1[0] * d1[1] * d1[1]
+        + outer[2] * (2.0 * d2[1] * d1[1] + d2[2] * d1[0])
+        + outer[1] * d3[2];
+    let t111 =
+        outer[3] * d1[1] * d1[1] * d1[1] + outer[2] * (3.0 * d2[2] * d1[1]) + outer[1] * d3[3];
+    [[[t000, t001], [t001, t011]], [[t001, t011], [t011, t111]]]
 }
 
 #[inline(always)]
@@ -422,6 +426,30 @@ fn assert_third_full(got: [[[f64; 2]; 2]; 2], want: [[[f64; 2]; 2]; 2]) {
         for b in 0..2 {
             for c in 0..2 {
                 close(got[a][b][c], want[a][b][c]);
+            }
+        }
+    }
+}
+
+#[test]
+fn generated_full_third_has_one_value_per_symmetric_component_932() {
+    for (row_index, row) in rows().into_iter().enumerate() {
+        let third = generated_third_full(row);
+        assert_third_full(third, strongest_hand_third_full(row));
+        for a in 0..2 {
+            for b in 0..2 {
+                for c in 0..2 {
+                    assert_eq!(
+                        third[a][b][c].to_bits(),
+                        third[b][c][a].to_bits(),
+                        "row {row_index}: third[{a}][{b}][{c}] has a separately evaluated permutation"
+                    );
+                    assert_eq!(
+                        third[a][b][c].to_bits(),
+                        third[b][a][c].to_bits(),
+                        "row {row_index}: third[{a}][{b}][{c}] has a separately evaluated transposition"
+                    );
+                }
             }
         }
     }
