@@ -260,7 +260,7 @@ pub fn build_duchon_basis_spec_chart(
     let centers = select_centers_by_strategy(data, &spec.center_strategy)?;
     let effective_nullspace_order =
         duchon_effective_nullspace_order(centers.view(), spec.nullspace_order);
-    let aniso = auto_seed_aniso_contrasts(centers.view(), spec.aniso_log_scales.as_deref());
+    let aniso = centered_aniso_contrasts(spec.aniso_log_scales.as_deref());
     let kernel_transform = kernel_constraint_nullspace(
         centers.view(),
         effective_nullspace_order,
@@ -506,12 +506,11 @@ fn build_duchon_basis_uncached(
     let effective_nullspace_order =
         duchon_effective_nullspace_order(centers.view(), spec.nullspace_order);
     let p_order = duchon_p_from_nullspace_order(effective_nullspace_order);
-    // Initialize anisotropy contrasts from knot cloud geometry when the caller
-    // enabled scale-dimensions but left η at the zero default. Duchon η is a
-    // FIXED, geometry-derived basis parameter (never a REML hyper-axis), so the
-    // all-zero auto-seed sentinel is the intended seeding mechanism here — unlike
-    // the Matérn forward path, whose η is optimized and must be honored literally.
-    let aniso = auto_seed_aniso_contrasts(centers.view(), spec.aniso_log_scales.as_deref());
+    // Anisotropy is a literal model coordinate, including zero. The optimizer
+    // crosses the isotropic subspace; replacing zero by a knot-cloud seed
+    // makes the value discontinuous there and invalidates its analytic jets.
+    // Geometry initialization belongs before construction, outside this map.
+    let aniso = centered_aniso_contrasts(spec.aniso_log_scales.as_deref());
     // The native reproducing-norm Gram penalty (`Primary`) is assembled from
     // kernel VALUES at the center pairs (K_CC), not from collocated D1/D2
     // derivative operators, so the build only requires the pointwise kernel to
@@ -1011,7 +1010,7 @@ pub fn duchon_penalties_at_length_scale(
     // build does (duchon_thinplate.rs:151/159). Both are pure functions of the
     // frozen centers + spec, so the κ trial replays the SAME structural choices.
     let effective_nullspace_order = duchon_effective_nullspace_order(centers, nullspace_order);
-    let aniso = auto_seed_aniso_contrasts(centers, aniso_log_scales);
+    let aniso = centered_aniso_contrasts(aniso_log_scales);
     // n-free kernel-constraint nullspace (from centers; cached on the workspace).
     let mut kernel_transform =
         kernel_constraint_nullspace(centers, effective_nullspace_order, &mut workspace.cache)?;

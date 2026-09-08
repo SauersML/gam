@@ -2555,8 +2555,8 @@ pub fn initial_aniso_contrasts(centers: ArrayView2<'_, f64>) -> Vec<f64> {
 ///
 /// Auto-initialization of `η` from knot-cloud geometry is a *separate* concern
 /// handled by [`auto_seed_aniso_contrasts`]; it is reserved for callers that
-/// opt into data-derived geometry (the κ-optimizer's data-driven center
-/// strategies and the pure-Duchon `scale_dims` path), selected by
+/// opt into data-derived geometry (the Matérn κ-optimizer's data-driven center
+/// strategies), selected by
 /// [`resolve_matern_forward_aniso`].
 pub(crate) fn centered_aniso_contrasts(aniso: Option<&[f64]>) -> Option<Vec<f64>> {
     match aniso {
@@ -2569,20 +2569,18 @@ pub(crate) fn centered_aniso_contrasts(aniso: Option<&[f64]>) -> Option<Vec<f64>
 /// Auto-seed anisotropy contrasts from knot-cloud geometry for callers that use
 /// an all-zero vector as the "initialize me" sentinel.
 ///
-/// Used by (a) the pure-Duchon `scale_dims` path, where `η` is a FIXED,
-/// geometry-derived basis parameter that is never enrolled as a REML hyper-axis
-/// (see `spatial_term_supports_hyper_optimization`): "standardize the geometry,
-/// then learn the smoothness"; and (b) the Matérn forward design when the term
+/// Used by the Matérn forward design when the term
 /// uses a **data-driven** center strategy, i.e. the κ-optimizer's seeding
 /// sentinel (the optimizer's analytic ψ-gradient is computed against the same
 /// auto-seeded design, so the pair stays consistent). A non-zero (or absent)
 /// vector is honored verbatim (centered, exactly like [`centered_aniso_contrasts`]);
 /// only an *exactly* all-zero vector is replaced by `initial_aniso_contrasts(centers)`.
 ///
-/// A `UserProvided`-center Matérn term does NOT use this — its geometry is fully
+/// A literal-coordinate Matérn term does NOT use this — its geometry is fully
 /// caller-specified, so an explicit all-zero η must be honored literally; folding
 /// the geometry seed into that path made the public design discontinuous at
-/// `η = 0` and hijacked explicit isotropic requests (#1042).
+/// `η = 0` and hijacked explicit isotropic requests (#1042). Duchon likewise
+/// honors literal coordinates, since its anisotropy is an optimized parameter.
 pub(crate) fn auto_seed_aniso_contrasts(
     centers: ArrayView2<'_, f64>,
     aniso: Option<&[f64]>,

@@ -16,15 +16,20 @@ fn relative_gap(a: &Array2<f64>, b: &Array2<f64>) -> f64 {
 
 #[test]
 fn raw_axis_design_derivatives_match_the_frozen_forward_basis() {
-    assert_raw_axis_design_derivatives(1.0);
+    assert_raw_axis_design_derivatives(1.0, 0.25);
 }
 
 #[test]
 fn amplified_raw_axis_design_derivatives_match_the_frozen_forward_basis() {
-    assert_raw_axis_design_derivatives(1e-6);
+    assert_raw_axis_design_derivatives(1e-6, 0.25);
 }
 
-fn assert_raw_axis_design_derivatives(length_scale: f64) {
+#[test]
+fn isotropic_raw_axis_design_derivatives_match_the_frozen_forward_basis() {
+    assert_raw_axis_design_derivatives(1.0, 0.0);
+}
+
+fn assert_raw_axis_design_derivatives(length_scale: f64, contrast: f64) {
     let data = Array2::from_shape_fn((80, 2), |(i, j)| {
         if j == 0 {
             i as f64 / 79.0
@@ -40,7 +45,7 @@ fn assert_raw_axis_design_derivatives(length_scale: f64) {
         power: 1.0,
         nullspace_order: DuchonNullspaceOrder::Linear,
         identifiability: SpatialIdentifiability::default(),
-        aniso_log_scales: Some(vec![0.25, -0.25]),
+        aniso_log_scales: Some(vec![contrast, -contrast]),
         operator_penalties: DuchonOperatorPenaltySpec::default(),
         boundary: OneDimensionalBoundary::Open,
     };
@@ -56,6 +61,8 @@ fn assert_raw_axis_design_derivatives(length_scale: f64) {
     else {
         panic!("Duchon metadata");
     };
+    assert_eq!(aniso_log_scales.as_deref(), Some([contrast, -contrast].as_slice()),
+        "explicit anisotropy, including zero, must be honored literally");
     spec.center_strategy = CenterStrategy::UserProvided(centers.clone());
     spec.radial_reparam = radial_reparam.clone();
     spec.aniso_log_scales = aniso_log_scales.clone();

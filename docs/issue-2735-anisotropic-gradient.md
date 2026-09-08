@@ -46,5 +46,22 @@ The amplified fixture has first derivative errors below 2.67e-12 and second
 derivative errors below 1.89e-9. Receipts and dependency provenance are retained
 in `bench/measurements/issue_triage_20260908/duchon-anisotropic-corrected*`.
 
+The combined model-level rerun still fails nine spatial comparisons, now with
+worst relative error 0.2836 rather than the original wrong-sign magnitude.
+Its component check finds 17.6% design error and 26.6% native Gram penalty
+error; the three differential-operator penalties agree to about 1.5e-10.
+Thus the logarithmic correction is necessary but does not establish closure.
+
+A second public regression identifies a discontinuity at zero anisotropy:
+the forward basis replaces an explicit `[0, 0]` by approximately
+`[0.09414416, -0.09414416]`, whereas arbitrarily small nonzero contrasts are
+honored literally. All five parameter vectors in the full gradient gate have
+equal raw spatial coordinates, which decode to exactly zero contrasts. The
+new regression rejects this implicit reseeding in 0.18 seconds on the old
+library. With forward construction and native penalty construction honoring
+literal centered contrasts, all three basis tests pass in 1.24 seconds,
+including the zero-contrast case. Its first derivatives agree to 1.36e-11
+and its second derivatives to 2.61e-8. Full-model verification is pending.
+
 The issue remains open pending the full criterion derivative gate and original
 full-size fit. No large-scale timing or recovery result is claimed here.

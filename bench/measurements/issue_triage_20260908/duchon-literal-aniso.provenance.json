@@ -1,0 +1,36 @@
+{
+  "argv": [
+    "/projects/standard/hsiehph/sauer354/.rustup/toolchains/1.97.1-x86_64-unknown-linux-gnu/bin/rustc",
+    "--crate-name",
+    "duchon_anisotropic_derivatives_2735",
+    "--edition=2024",
+    "crates/gam-terms/tests/duchon_anisotropic_derivatives_2735.rs",
+    "--test",
+    "--deny=warnings",
+    "-Copt-level=2",
+    "-Ccodegen-units=16",
+    "-L",
+    "dependency=/scratch.global/sauer354/gam-deslop-a2-target/debug/deps",
+    "-o",
+    "/projects/standard/hsiehph/sauer354/gam-main-validation/.buildd/duchon-anisotropic-components-current",
+    "--extern",
+    "gam_terms=/projects/standard/hsiehph/sauer354/gam-main-validation/.buildd/libgam_terms-2735.rlib",
+    "--extern",
+    "ndarray=/scratch.global/sauer354/gam-deslop-a2-target/debug/deps/libndarray-3e2fc606731d0706.rlib",
+    "-L",
+    "dependency=/scratch.global/sauer354/gam-deslop-a2-target/debug/deps/.library-terms-2735-snapshot"
+  ],
+  "dependencies": {
+    "gam_terms": {
+      "path": "/scratch.global/sauer354/gam-deslop-a2-target/debug/deps/libgam_terms-de768ae521304c7c.rlib",
+      "sha256": "a6dd87158e2b64ea0920140c1e43574e3410b8ede698eeee930a6ca97dc7413d"
+    },
+    "ndarray": {
+      "path": "/scratch.global/sauer354/gam-deslop-a2-target/debug/deps/libndarray-3e2fc606731d0706.rlib",
+      "sha256": "6ff031e72852ea7b9a339d10a8f4b11f32de215a8d404b1f04af0d5761e713eb"
+    }
+  },
+  "source_sha256": "d185405aa7d1c31bddeba9bdd84f998c3a97b355651d15faeb170d1d621c7ae1",
+  "corrected_terms_sha256": "e2f24f3b65d1707a21a665b7aad84e1335951abf5beca16fd6573a96d9282f97",
+  "terms_thinplate_sha256": "e31d38dd7adf942cf8a31e706aedcec6eb2f39f4a9e5122adef30930e40c74e6"
+}

@@ -1,0 +1,75 @@
+
+running 1 test
+test fit_orchestration::drivers::iso_kappa_reml_gradient_fd_tests::aniso_psi_duchon_gaussian_joint_gradient_matches_finite_difference_2735 ... [duchon_gaussian_aniso_2d TOPOLOGY] d=2 rho_dim=5 psi_dim=2 penalty_sources=[1..8, 1..8, 1..8, 1..8, 1..8]
+[duchon_gaussian_aniso_2d zero] COST an=+1.1424664494e2 fd_path=+1.1424664494e2 diff=3.723e-12
+[duchon_gaussian_aniso_2d zero] rho j=0 an=+9.9537e-1 fd=+9.9537e-1 rel=1.009e-8 unc=2.369e-9 step=6.3e-4 order=6 Agree
+[duchon_gaussian_aniso_2d zero] rho j=1 an=+1.1276e0 fd=+1.1276e0 rel=1.192e-8 unc=9.501e-10 step=6.3e-4 order=6 Agree
+[duchon_gaussian_aniso_2d zero] rho j=2 an=+1.4422e0 fd=+1.4422e0 rel=1.017e-8 unc=2.055e-9 step=6.3e-4 order=6 Agree
+[duchon_gaussian_aniso_2d zero] rho j=3 an=+4.5280e-1 fd=+4.5280e-1 rel=1.117e-7 unc=8.259e-10 step=6.3e-4 order=6 Agree
+[duchon_gaussian_aniso_2d zero] rho j=4 an=+1.4709e0 fd=+1.4709e0 rel=3.320e-9 unc=7.394e-10 step=6.3e-4 order=6 Agree
+[duchon_gaussian_aniso_2d zero] psi j=5 an=+2.8072e1 fd=+2.0787e1 rel=2.595e-1 unc=3.120e-8 step=3.1e-4 order=8 Disagree
+[duchon_gaussian_aniso_2d zero] psi j=5 LADDER h=1.00e-2 D=+2.0786724498e1  h=5.00e-3 D=+2.0787057233e1  h=2.50e-3 D=+2.0787140261e1  h=1.25e-3 D=+2.0787161003e1  h=6.25e-4 D=+2.0787166168e1  h=3.13e-4 D=+2.0787167456e1  h=1.56e-4 D=+2.0787167815e1  h=7.81e-5 D=+2.0787168043e1  h=3.91e-5 D=+2.0787168148e1  h=1.95e-5 D=+2.0787167840e1  h=9.77e-6 D=+2.0787167824e1  h=4.88e-6 D=+2.0787167050e1
+[duchon_gaussian_aniso_2d zero] psi j=6 an=-1.7011e1 fd=-1.4224e1 rel=1.638e-1 unc=2.913e-8 step=6.3e-4 order=6 Disagree
+[duchon_gaussian_aniso_2d zero] psi j=6 LADDER h=1.00e-2 D=-1.4221707087e1  h=5.00e-3 D=-1.4223693182e1  h=2.50e-3 D=-1.4224189613e1  h=1.25e-3 D=-1.4224313719e1  h=6.25e-4 D=-1.4224344762e1  h=3.13e-4 D=-1.4224352485e1  h=1.56e-4 D=-1.4224354437e1  h=7.81e-5 D=-1.4224354977e1  h=3.91e-5 D=-1.4224355145e1  h=1.95e-5 D=-1.4224354583e1  h=9.77e-6 D=-1.4224354434e1  h=4.88e-6 D=-1.4224355320e1
+[duchon_gaussian_aniso_2d psi_only] COST an=+1.1606771249e2 fd_path=+1.1606771249e2 diff=1.563e-13
+[duchon_gaussian_aniso_2d psi_only] rho j=0 an=+3.1079e-1 fd=+3.1079e-1 rel=1.081e-7 unc=2.042e-9 step=6.3e-4 order=6 Agree
+[duchon_gaussian_aniso_2d psi_only] rho j=1 an=+9.1710e-1 fd=+9.1710e-1 rel=1.508e-8 unc=7.168e-10 step=6.3e-4 order=6 Agree
+[duchon_gaussian_aniso_2d psi_only] rho j=2 an=+1.0809e0 fd=+1.0809e0 rel=3.179e-8 unc=2.249e-9 step=7.8e-5 order=6 Agree
+[duchon_gaussian_aniso_2d psi_only] rho j=3 an=+2.5550e-1 fd=+2.5550e-1 rel=3.940e-7 unc=1.913e-9 step=1.6e-4 order=6 Agree
+[duchon_gaussian_aniso_2d psi_only] rho j=4 an=+1.9797e0 fd=+1.9797e0 rel=5.900e-9 unc=1.447e-9 step=3.1e-4 order=6 Agree
+[duchon_gaussian_aniso_2d psi_only] psi j=5 an=+2.3006e1 fd=+2.0749e1 rel=9.810e-2 unc=4.477e-9 step=1.6e-4 order=6 Disagree
+[duchon_gaussian_aniso_2d psi_only] psi j=5 LADDER h=1.00e-2 D=+2.0745646865e1  h=5.00e-3 D=+2.0748021565e1  h=2.50e-3 D=+2.0748615288e1  h=1.25e-3 D=+2.0748763722e1  h=6.25e-4 D=+2.0748800814e1  h=3.13e-4 D=+2.0748810092e1  h=1.56e-4 D=+2.0748812409e1  h=7.81e-5 D=+2.0748812960e1  h=3.91e-5 D=+2.0748813244e1  h=1.95e-5 D=+2.0748812957e1  h=9.77e-6 D=+2.0748813429e1  h=4.88e-6 D=+2.0748813607e1
+[duchon_gaussian_aniso_2d psi_only] psi j=6 an=-2.2172e1 fd=-1.7384e1 rel=2.160e-1 unc=4.463e-9 step=6.3e-4 order=6 Disagree
+[duchon_gaussian_aniso_2d psi_only] psi j=6 LADDER h=1.00e-2 D=-1.7383381747e1  h=5.00e-3 D=-1.7383541385e1  h=2.50e-3 D=-1.7383581196e1  h=1.25e-3 D=-1.7383591147e1  h=6.25e-4 D=-1.7383593632e1  h=3.13e-4 D=-1.7383594227e1  h=1.56e-4 D=-1.7383594390e1  h=7.81e-5 D=-1.7383594476e1  h=3.91e-5 D=-1.7383594543e1  h=1.95e-5 D=-1.7383593994e1  h=9.77e-6 D=-1.7383594526e1  h=4.88e-6 D=-1.7383593638e1
+[duchon_gaussian_aniso_2d base] COST an=+1.1426376365e2 fd_path=+1.1426376365e2 diff=3.809e-12
+[duchon_gaussian_aniso_2d base] rho j=0 an=+1.1822e0 fd=+1.1822e0 rel=1.054e-8 unc=8.056e-10 step=6.3e-4 order=6 Agree
+[duchon_gaussian_aniso_2d base] rho j=1 an=+1.1347e0 fd=+1.1347e0 rel=9.100e-9 unc=1.655e-9 step=6.3e-4 order=6 Agree
+[duchon_gaussian_aniso_2d base] rho j=2 an=+1.4765e0 fd=+1.4765e0 rel=1.314e-8 unc=1.692e-9 step=6.3e-4 order=6 Agree
+[duchon_gaussian_aniso_2d base] rho j=3 an=+3.9756e-1 fd=+3.9756e-1 rel=1.263e-7 unc=2.707e-10 step=6.3e-4 order=6 Agree
+[duchon_gaussian_aniso_2d base] rho j=4 an=+1.2431e0 fd=+1.2431e0 rel=4.144e-9 unc=1.522e-9 step=6.3e-4 order=6 Agree
+[duchon_gaussian_aniso_2d base] psi j=5 an=+2.8244e1 fd=+2.0709e1 rel=2.668e-1 unc=1.230e-8 step=1.6e-4 order=6 Disagree
+[duchon_gaussian_aniso_2d base] psi j=5 LADDER h=1.00e-2 D=+2.0708718444e1  h=5.00e-3 D=+2.0708988601e1  h=2.50e-3 D=+2.0709055979e1  h=1.25e-3 D=+2.0709072809e1  h=6.25e-4 D=+2.0709076991e1  h=3.13e-4 D=+2.0709078040e1  h=1.56e-4 D=+2.0709078306e1  h=7.81e-5 D=+2.0709078531e1  h=3.91e-5 D=+2.0709078565e1  h=1.95e-5 D=+2.0709078224e1  h=9.77e-6 D=+2.0709078468e1  h=4.88e-6 D=+2.0709077295e1
+[duchon_gaussian_aniso_2d base] psi j=6 an=-1.7655e1 fd=-1.4541e1 rel=1.764e-1 unc=2.846e-8 step=6.3e-4 order=6 Disagree
+[duchon_gaussian_aniso_2d base] psi j=6 LADDER h=1.00e-2 D=-1.4537988747e1  h=5.00e-3 D=-1.4539976146e1  h=2.50e-3 D=-1.4540472887e1  h=1.25e-3 D=-1.4540597068e1  h=6.25e-4 D=-1.4540628130e1  h=3.13e-4 D=-1.4540635858e1  h=1.56e-4 D=-1.4540637815e1  h=7.81e-5 D=-1.4540638337e1  h=3.91e-5 D=-1.4540638515e1  h=1.95e-5 D=-1.4540638032e1  h=9.77e-6 D=-1.4540637843e1  h=4.88e-6 D=-1.4540638099e1
+[duchon_gaussian_aniso_2d alt] COST an=+1.2138329111e2 fd_path=+1.2138329111e2 diff=8.527e-14
+[duchon_gaussian_aniso_2d alt] rho j=0 an=+2.7734e-1 fd=+2.7734e-1 rel=3.369e-8 unc=1.018e-9 step=6.3e-4 order=6 Agree
+[duchon_gaussian_aniso_2d alt] rho j=1 an=+5.7758e-1 fd=+5.7758e-1 rel=6.546e-9 unc=4.698e-10 step=7.8e-5 order=12 Agree
+[duchon_gaussian_aniso_2d alt] rho j=2 an=+1.2485e0 fd=+1.2485e0 rel=9.473e-9 unc=5.861e-10 step=6.3e-4 order=6 Agree
+[duchon_gaussian_aniso_2d alt] rho j=3 an=+6.9796e-1 fd=+6.9796e-1 rel=4.894e-8 unc=8.380e-10 step=6.3e-4 order=6 Agree
+[duchon_gaussian_aniso_2d alt] rho j=4 an=+1.6296e0 fd=+1.6296e0 rel=2.750e-9 unc=3.465e-10 step=6.3e-4 order=6 Agree
+[duchon_gaussian_aniso_2d alt] psi j=5 an=+1.7297e1 fd=+2.0189e1 rel=1.432e-1 unc=6.230e-9 step=1.6e-4 order=6 Disagree
+[duchon_gaussian_aniso_2d alt] psi j=5 LADDER h=1.00e-2 D=+2.0185340695e1  h=5.00e-3 D=+2.0187974078e1  h=2.50e-3 D=+2.0188632515e1  h=1.25e-3 D=+2.0188797129e1  h=6.25e-4 D=+2.0188838279e1  h=3.13e-4 D=+2.0188848564e1  h=1.56e-4 D=+2.0188851139e1  h=7.81e-5 D=+2.0188851772e1  h=3.91e-5 D=+2.0188851974e1  h=1.95e-5 D=+2.0188851855e1  h=9.77e-6 D=+2.0188851988e1  h=4.88e-6 D=+2.0188852485e1
+[duchon_gaussian_aniso_2d alt] psi j=6 an=-1.9092e1 fd=-1.9041e1 rel=2.705e-3 unc=4.316e-9 step=6.3e-4 order=6 Agree
+[duchon_gaussian_aniso_2d long] COST an=+1.1022827556e2 fd_path=+1.1022827556e2 diff=1.080e-12
+[duchon_gaussian_aniso_2d long] rho j=0 an=+1.7026e0 fd=+1.7026e0 rel=1.379e-8 unc=9.933e-9 step=6.3e-4 order=6 Agree
+[duchon_gaussian_aniso_2d long] rho j=1 an=+3.2187e-1 fd=+3.2187e-1 rel=2.438e-8 unc=6.037e-9 step=6.3e-4 order=6 Agree
+[duchon_gaussian_aniso_2d long] rho j=2 an=+1.1459e0 fd=+1.1459e0 rel=1.078e-8 unc=4.484e-9 step=6.3e-4 order=6 Agree
+[duchon_gaussian_aniso_2d long] rho j=3 an=+1.6942e-1 fd=+1.6942e-1 rel=3.054e-7 unc=2.721e-9 step=6.3e-4 order=6 Agree
+[duchon_gaussian_aniso_2d long] rho j=4 an=+1.2635e0 fd=+1.2635e0 rel=6.535e-9 unc=3.536e-9 step=6.3e-4 order=6 Agree
+[duchon_gaussian_aniso_2d long] psi j=5 an=+1.9020e1 fd=+1.3626e1 rel=2.836e-1 unc=2.521e-8 step=6.3e-4 order=6 Disagree
+[duchon_gaussian_aniso_2d long] psi j=5 LADDER h=1.00e-2 D=+1.3627096742e1  h=5.00e-3 D=+1.3626188809e1  h=2.50e-3 D=+1.3625961709e1  h=1.25e-3 D=+1.3625904924e1  h=6.25e-4 D=+1.3625890712e1  h=3.13e-4 D=+1.3625887106e1  h=1.56e-4 D=+1.3625886117e1  h=7.81e-5 D=+1.3625885695e1  h=3.91e-5 D=+1.3625886165e1  h=1.95e-5 D=+1.3625885671e1  h=9.77e-6 D=+1.3625887036e1  h=4.88e-6 D=+1.3625883996e1
+[duchon_gaussian_aniso_2d long] psi j=6 an=-6.4372e0 fd=-5.9460e0 rel=7.631e-2 unc=1.856e-8 step=6.3e-4 order=6 Disagree
+[duchon_gaussian_aniso_2d long] psi j=6 LADDER h=1.00e-2 D=-5.9459297862e0  h=5.00e-3 D=-5.9459709135e0  h=2.50e-3 D=-5.9459812441e0  h=1.25e-3 D=-5.9459838306e0  h=6.25e-4 D=-5.9459844643e0  h=3.13e-4 D=-5.9459847989e0  h=1.56e-4 D=-5.9459846606e0  h=7.81e-5 D=-5.9459850444e0  h=3.91e-5 D=-5.9459853292e0  h=1.95e-5 D=-5.9459833166e0  h=9.77e-6 D=-5.9459837008e0  h=4.88e-6 D=-5.9459851007e0
+[duchon_gaussian_aniso_2d SUMMARY] pass=false worst_psi_rel=2.836e-1 judged=35 violations=9 unresolved=0
+
+thread 'fit_orchestration::drivers::iso_kappa_reml_gradient_fd_tests::aniso_psi_duchon_gaussian_joint_gradient_matches_finite_difference_2735' (2184160) panicked at crates/gam-models/src/fit_orchestration/drivers/iso_kappa_reml_gradient_fd_tests.rs:67:5:
+anisotropic Duchon Gaussian n=80 per-axis ψ FD failed; worst_psi_rel=2.836e-1
+  zero psi j=5: analytic=+2.807184e1 fd=+2.078717e1 rel=2.595e-1 (oracle unc=3.120e-8 at h=3.1e-4, order 8)
+  zero psi j=6: analytic=-1.701060e1 fd=-1.422436e1 rel=1.638e-1 (oracle unc=2.913e-8 at h=6.3e-4, order 6)
+  psi_only psi j=5: analytic=+2.300563e1 fd=+2.074881e1 rel=9.810e-2 (oracle unc=4.477e-9 at h=1.6e-4, order 6)
+  psi_only psi j=6: analytic=-2.217202e1 fd=-1.738359e1 rel=2.160e-1 (oracle unc=4.463e-9 at h=6.3e-4, order 6)
+  base psi j=5: analytic=+2.824384e1 fd=+2.070908e1 rel=2.668e-1 (oracle unc=1.230e-8 at h=1.6e-4, order 6)
+  base psi j=6: analytic=-1.765490e1 fd=-1.454064e1 rel=1.764e-1 (oracle unc=2.846e-8 at h=6.3e-4, order 6)
+  alt psi j=5: analytic=+1.729738e1 fd=+2.018885e1 rel=1.432e-1 (oracle unc=6.230e-9 at h=1.6e-4, order 6)
+  long psi j=5: analytic=+1.902009e1 fd=+1.362589e1 rel=2.836e-1 (oracle unc=2.521e-8 at h=6.3e-4, order 6)
+  long psi j=6: analytic=-6.437174e0 fd=-5.945985e0 rel=7.631e-2 (oracle unc=1.856e-8 at h=6.3e-4, order 6)
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+FAILED
+
+failures:
+
+failures:
+    fit_orchestration::drivers::iso_kappa_reml_gradient_fd_tests::aniso_psi_duchon_gaussian_joint_gradient_matches_finite_difference_2735
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 1564 filtered out; finished in 11.21s
+

@@ -1,0 +1,36 @@
+
+running 1 test
+test fit_orchestration::drivers::iso_kappa_reml_gradient_fd_tests::duchon_aniso_psi_components_match_rebuilt_design_and_penalties_2735 ... [duchon_gaussian_aniso_2d TOPOLOGY] d=2 rho_dim=5 psi_dim=2 penalty_sources=[1..8, 1..8, 1..8, 1..8, 1..8]
+[duchon_gaussian_aniso_2d COMPONENT] streaming vs materialized ∂X/∂ψ: forward_mul rel=1.742e-15 transpose_mul rel=1.413e-14 row_chunk rel=0.000e0
+[duchon_gaussian_aniso_2d COMPONENT] h=2.0e-3 design |an|=3.428649e2 |fd|=4.159075e2 rel_gap=1.759e-1
+[duchon_gaussian_aniso_2d COMPONENT] h=2.0e-3 penalty[0] |an|=4.057403e-1 |fd|=4.594660e-1 rel_gap=2.658e-1
+[duchon_gaussian_aniso_2d COMPONENT] h=2.0e-3 penalty[1] |an|=0.000000e0 |fd|=0.000000e0 rel_gap=0.000e0
+[duchon_gaussian_aniso_2d COMPONENT] h=2.0e-3 penalty[2] |an|=9.406126e-1 |fd|=9.406103e-1 rel_gap=3.561e-6
+[duchon_gaussian_aniso_2d COMPONENT] h=2.0e-3 penalty[3] |an|=1.180647e0 |fd|=1.180642e0 rel_gap=4.703e-6
+[duchon_gaussian_aniso_2d COMPONENT] h=2.0e-3 penalty[4] |an|=1.392014e-1 |fd|=1.392015e-1 rel_gap=9.135e-7
+[duchon_gaussian_aniso_2d COMPONENT] h=1.0e-3 design |an|=3.428649e2 |fd|=4.159065e2 rel_gap=1.759e-1
+[duchon_gaussian_aniso_2d COMPONENT] h=1.0e-3 penalty[0] |an|=4.057403e-1 |fd|=4.594657e-1 rel_gap=2.658e-1
+[duchon_gaussian_aniso_2d COMPONENT] h=1.0e-3 penalty[1] |an|=0.000000e0 |fd|=0.000000e0 rel_gap=0.000e0
+[duchon_gaussian_aniso_2d COMPONENT] h=1.0e-3 penalty[2] |an|=9.406126e-1 |fd|=9.406120e-1 rel_gap=8.904e-7
+[duchon_gaussian_aniso_2d COMPONENT] h=1.0e-3 penalty[3] |an|=1.180647e0 |fd|=1.180646e0 rel_gap=1.176e-6
+[duchon_gaussian_aniso_2d COMPONENT] h=1.0e-3 penalty[4] |an|=1.392014e-1 |fd|=1.392014e-1 rel_gap=2.284e-7
+[duchon_gaussian_aniso_2d COMPONENT] Richardson design rel_gap=1.759e-1
+[duchon_gaussian_aniso_2d COMPONENT] Richardson penalty[0] rel_gap=2.658e-1
+[duchon_gaussian_aniso_2d COMPONENT] Richardson penalty[1] rel_gap=0.000e0
+[duchon_gaussian_aniso_2d COMPONENT] Richardson penalty[2] rel_gap=1.480e-10
+[duchon_gaussian_aniso_2d COMPONENT] Richardson penalty[3] rel_gap=1.417e-10
+[duchon_gaussian_aniso_2d COMPONENT] Richardson penalty[4] rel_gap=8.358e-11
+[duchon_gaussian_aniso_2d COMPONENT SUMMARY] design rel_gap=1.759e-1 norm_ratio=8.244e-1 penalties rel_gaps=[0.26578823270307284, 0.0, 1.4797448473596075e-10, 1.416834716489263e-10, 8.357504265744807e-11] norm_ratios=[0.8830701503881508, 0.0, 1.0000000000296816, 1.0000000000599, 1.0000000000656264]
+
+thread 'fit_orchestration::drivers::iso_kappa_reml_gradient_fd_tests::duchon_aniso_psi_components_match_rebuilt_design_and_penalties_2735' (2185453) panicked at crates/gam-models/src/fit_orchestration/drivers/iso_kappa_reml_gradient_fd_tests.rs:3140:5:
+duchon_gaussian_aniso_2d: analytic ∂X/∂ψ differs from the rebuilt design by 1.759e-1 (norm ratio 8.244e-1)
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+FAILED
+
+failures:
+
+failures:
+    fit_orchestration::drivers::iso_kappa_reml_gradient_fd_tests::duchon_aniso_psi_components_match_rebuilt_design_and_penalties_2735
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 1564 filtered out; finished in 0.34s
+
