@@ -3,6 +3,8 @@
 //! Run with `cargo run -p gam-models --example gaussian_interval_calibration_1561 --profile test`.
 //! This reports empirical coverage and width ordering; total covariance alone
 //! does not imply an ordering against covariance conditional at the rho mode.
+//! An optional output JSON path exports the first replicate's complete linear
+//! problem and covariance estimates for independent integration audits.
 
 use gam_data::encode_recordswith_inferred_schema;
 use gam_models::fit_orchestration::{FitConfig, FitResult, fit_from_formula};
@@ -11,6 +13,11 @@ use rand::{SeedableRng, rngs::StdRng};
 use rand_distr::{Distribution, Normal, Uniform};
 
 fn main() {
+    let args: Vec<String> = std::env::args().collect();
+    assert!(
+        args.len() <= 2,
+        "usage: gaussian_interval_calibration_1561 [AUDIT_JSON]"
+    );
     const N: usize = 300;
     const REPLICATES: usize = 30;
     let mut rng = StdRng::seed_from_u64(20_260_530);
@@ -69,6 +76,35 @@ fn main() {
             .fit
             .beta_covariance_corrected()
             .expect("marginal coefficient covariance");
+        if replicate == 0
+            && let Some(path) = args.get(1)
+        {
+            let penalties: Vec<_> = fit.design.penalties.iter().map(|penalty| {
+                serde_json::json!({
+                    "start": penalty.col_range.start,
+                    "end": penalty.col_range.end,
+                    "matrix": penalty.local.rows().into_iter().map(|row| row.to_vec()).collect::<Vec<_>>(),
+                })
+            }).collect();
+            let problem = serde_json::json!({
+                "x": design.rows().into_iter().map(|row| row.to_vec()).collect::<Vec<_>>(),
+                "y": data.values.column(2).to_vec(),
+                "truth": truth,
+                "beta": fit.fit.beta.to_vec(),
+                "rho": fit.fit.log_lambdas.to_vec(),
+                "phi": fit.fit.dispersion_phi().expect("Gaussian dispersion"),
+                "criterion": fit.fit.reml_score(),
+                "penalties": penalties,
+                "nullspace_dims": fit.design.nullspace_dims,
+                "conditional_covariance": conditional.rows().into_iter().map(|row| row.to_vec()).collect::<Vec<_>>(),
+                "marginal_covariance": marginal.rows().into_iter().map(|row| row.to_vec()).collect::<Vec<_>>(),
+            });
+            std::fs::write(
+                path,
+                serde_json::to_vec_pretty(&problem).expect("serialize Gaussian problem"),
+            )
+            .expect("write Gaussian integration audit");
+        }
         for (row, &mean) in design.rows().into_iter().zip(&truth) {
             let fitted = row.dot(&fit.fit.beta);
             let conditional_variance = row.dot(&conditional.dot(&row));

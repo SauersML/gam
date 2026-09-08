@@ -101,3 +101,53 @@ comparison remain unresolved. In particular, the cubature's use of the fitting
 criterion needs to be reconciled with the proper distribution correction used
 by the rho-posterior sampler before claiming both integrate the same posterior.
 **Issue #1561 remains open. No fresh complete-suite significance result exists.**
+
+## Independent Gaussian integration and density correction
+
+The first replicate is now exported as `gaussian-integration-problem.json`.
+`gaussian_posterior_audit.py` reconstructs its Gaussian REML criterion,
+coefficient mode, and conditional covariance independently with SciPy. Errors
+are respectively 2.01e-8 absolute, 4.13e-10 maximum coefficient error, and
+1.71e-9 relative covariance error. The criterion reconstruction accounts for
+the determinant of the solver's unpenalized-column scaling.
+
+Integration uses positive Gauss-Legendre quadrature on the two independent
+PC-prior CDF coordinates. This covers unbounded log precision without choosing
+rho bounds or a Gaussian proposal. Dispersion stays fixed at the exported
+estimate, matching the production cubature's estimand. Orders 17, 33, 65, and
+129 refine the calculation; the final refinement changes prediction widths by
+at most **1.04224e-7 relative**. This is numerical convergence evidence for this
+two-penalty fixture, not a general quadrature error certificate.
+
+| Covariance calculation | Maximum width error against independent integral |
+| --- | ---: |
+| Original exported shared-tree model | 23.822566% |
+| Original covariance with its premature bias transform undone | 2.045509% |
+| Shared-tree replay with raw covariance and consistent distribution prior | 0.145918% |
+
+The original covariance had been transformed by `A V Aᵀ`, where
+`A = I + H⁻¹S`, despite the reported coefficients being the original beta.
+The removal of that obsolete frequentist machinery is already in main as
+`360c9bb1c` (#2670); the shared working tree used for these experiments still
+carried it. This audit independently supports the removal and does not claim
+it as a new main-line fix. The earlier 97% coverage result cannot establish
+integration accuracy, and the 23.8% error must not be attributed entirely to
+quadrature: most of it was a mismatched coefficient/covariance estimand.
+
+Commit `c286f7439` additionally makes calibration and cubature weights consume
+the same declared density as the rho sampler. Flat criterion coordinates get
+the existing proper PC distribution prior. Explicit Gamma precision priors
+get their missing log-precision Jacobian; Normal and PC priors are already
+rho densities. Malformed and improper priors are rejected. This does not
+change the REML fitting criterion. Ten shared-prior tests passed on MSI,
+including three distribution regressions; the solver test build also passed
+those three tests. The seven positive-measure analytical checks and solver
+response-scale equivariance check passed against the integrated working tree.
+
+The solver-only replay uses the original converged smoothing parameters as
+seeds and verifies `Vp = Vb + smoothing_correction` to **3.5891e-18 relative**.
+The replayed rho and beta match the original fit, so the improvement comes
+from inference rather than a different optimum. Its export is
+`gaussian-integration-corrected.json`. Raw oracle refinements and solver
+diagnostics accompany this report. The 0.145918% figure describes the tested
+shared-tree positive cubature implementation, not an isolated-main benchmark.

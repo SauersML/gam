@@ -1,0 +1,7 @@
+[2026-09-08T18:40:31Z INFO  gam_solve::estimate::reml::eval] [sigma-cubature] node=0 step=8.9869e-1 wald_step=7.5599e-1 ΔV=1.704360e0 posterior_weight=1.392538e-1 evals=5 box_limited=false tr(φ̂·H(ρ)⁻¹)=6.871459e-2 tr(φ̂·H(ρ̂)⁻¹)=9.101018e-2
+[2026-09-08T18:40:31Z INFO  gam_solve::estimate::reml::eval] [sigma-cubature] node=1 step=8.9869e-1 wald_step=7.5599e-1 ΔV=9.284871e-1 posterior_weight=3.025274e-1 evals=5 box_limited=false tr(φ̂·H(ρ)⁻¹)=1.237356e-1 tr(φ̂·H(ρ̂)⁻¹)=9.101018e-2
+[2026-09-08T18:40:31Z INFO  gam_solve::estimate::reml::eval] [sigma-cubature] node=2 step=1.4710e0 wald_step=2.0204e0 ΔV=9.094391e-1 posterior_weight=3.083452e-1 evals=5 box_limited=false tr(φ̂·H(ρ)⁻¹)=9.410758e-2 tr(φ̂·H(ρ̂)⁻¹)=9.101018e-2
+[2026-09-08T18:40:31Z INFO  gam_solve::estimate::reml::eval] [sigma-cubature] node=3 step=1.4710e0 wald_step=2.0204e0 ΔV=1.119704e0 posterior_weight=2.498736e-1 evals=5 box_limited=false tr(φ̂·H(ρ)⁻¹)=9.440148e-2 tr(φ̂·H(ρ̂)⁻¹)=9.101018e-2
+[2026-09-08T18:40:31Z INFO  gam_solve::estimate::reml::eval] [sigma-cubature] tr(correction)=9.426593e-3 tr(φ̂·H(ρ̂)⁻¹)=9.101018e-2
+[2026-09-08T18:40:31Z INFO  gam_solve::estimate::reml::eval] [smoothing-correction] branch=cubature rank=2 points=4 near_boundary=false grad_norm=1.995e-8 max_rho_var=2.041e0 max_node_criterion_rise=1.704e0 (proposal calibration rise 0.5)
+covariance_identity_relative_error=3.589102141613e-18 rho=[3.3672894995818528, -2.336561389743947], shape=[2], strides=[1], layout=CFcf (0xf), const ndim=1

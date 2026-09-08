@@ -1,0 +1,15 @@
+   Compiling gam-problem v0.3.154 (/projects/standard/hsiehph/sauer354/gam-main-validation/crates/gam-problem)
+   Compiling gam-gpu v0.3.154 (/projects/standard/hsiehph/sauer354/gam-main-validation/crates/gam-gpu)
+   Compiling gam-terms v0.3.154 (/projects/standard/hsiehph/sauer354/gam-main-validation/crates/gam-terms)
+   Compiling gam-model-api v0.3.154 (/projects/standard/hsiehph/sauer354/gam-main-validation/crates/gam-model-api)
+   Compiling gam-solve v0.3.154 (/projects/standard/hsiehph/sauer354/gam-main-validation/crates/gam-solve)
+    Finished `test` profile [optimized + debuginfo] target(s) in 3m 59s
+     Running unittests src/lib.rs (/scratch.global/sauer354/w5-target/debug/deps/gam_solve-6cfdd22166520a14)
+
+running 3 tests
+test rho_prior_eval::tests::distribution_correction_rejects_improper_and_malformed_priors_1561 ... ok
+test rho_prior_eval::tests::distribution_correction_uses_precision_jacobian_1561 ... ok
+test rho_prior_eval::tests::distribution_correction_preserves_coordinate_and_flat_semantics_1561 ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 1654 filtered out; finished in 0.01s
+
