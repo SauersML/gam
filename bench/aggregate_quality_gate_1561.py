@@ -32,13 +32,18 @@ It is a diagnostic: the CLOSURE verdict is unchanged and still runs on every
 scored pair.
 
 Usage:
-  python bench/aggregate_quality_gate_1561.py quality_run.log
+  python bench/aggregate_quality_gate_1561.py quality_run.log --cases quality_cases.txt
   cargo nextest run -p gam --test quality --no-fail-fast \
       --success-output final --failure-output final 2>&1 | \
-      python bench/aggregate_quality_gate_1561.py -
+      python bench/aggregate_quality_gate_1561.py - --cases quality_cases.txt
+
+The case manifest contains one unfiltered libtest case path per line, captured
+from the same binary's `--list` before execution. The reference-quality workflow
+writes it beside the execution log. Without it the report cannot certify closure.
 """
 from __future__ import annotations
 
+import argparse
 import csv
 import math
 import os
@@ -210,22 +215,32 @@ def _parse_nextest(lines: list[str]) -> dict[str, dict]:
 
 def _effect(row: dict) -> float | None:
     gam, ref = row["gam"], row["reference_value"]
-    if not (math.isfinite(gam) and math.isfinite(ref)) or gam <= 0.0 or ref <= 0.0:
+    if not (math.isfinite(gam) and math.isfinite(ref)) or gam < 0.0 or ref < 0.0:
         return None
-    effect = math.log(gam) - math.log(ref)
+    # Exact zero error is a valid boundary, not missing evidence. Preserve its
+    # limiting log ratio without an arbitrary epsilon. Two exact zeros tie.
+    if gam == ref:
+        effect = 0.0
+    elif gam == 0.0:
+        effect = -math.inf
+    elif ref == 0.0:
+        effect = math.inf
+    else:
+        effect = math.log(gam) - math.log(ref)
     return effect if row["lower_is_better"] else -effect
 
 
-def _wilcoxon_less(effects: list[float]) -> tuple[float, float, float]:
-    """One-sided Wilcoxon signed-rank, H1: median < 0. Returns (W+, z, p).
+def _wilcoxon_less(effects: list[float]) -> tuple[float, float]:
+    """Exact one-sided signed-rank sign-randomization test. Returns (W+, p).
 
-    Normal approximation with continuity + tie correction (adequate for the
-    suite's ~100 pairs). Zero-difference pairs are dropped (Wilcoxon convention).
+    Condition on the observed absolute ranks, including ties. Zero differences
+    are dropped (Wilcoxon convention). Twice the midranks are integers, so the
+    finite null distribution can be counted without rounding or Monte Carlo.
     """
     nz = [e for e in effects if e != 0.0]
     n = len(nz)
     if n == 0:
-        return (0.0, 0.0, 1.0)
+        return (0.0, 1.0)
     order = sorted(range(n), key=lambda i: abs(nz[i]))
     ranks = [0.0] * n
     i = 0
@@ -238,20 +253,16 @@ def _wilcoxon_less(effects: list[float]) -> tuple[float, float, float]:
             ranks[order[k]] = avg
         i = j + 1
     w_plus = sum(r for e, r in zip(nz, ranks) if e > 0.0)
-    mean = n * (n + 1) / 4.0
-    # tie correction
-    tie_term = 0.0
-    from collections import Counter
-
-    for c in Counter(abs(e) for e in nz).values():
-        tie_term += c**3 - c
-    var = n * (n + 1) * (2 * n + 1) / 24.0 - tie_term / 48.0
-    if var <= 0.0:
-        return (w_plus, float("nan"), float("nan"))
-    # H1 median<0 => W+ small. Continuity-correct toward the mean.
-    z = (w_plus + 0.5 - mean) / math.sqrt(var)
-    p = 0.5 * math.erfc(-z / math.sqrt(2.0))  # P(Z <= z) lower tail
-    return (w_plus, z, p)
+    threshold = int(2 * w_plus)
+    counts = [0] * (threshold + 1)
+    counts[0] = 1
+    reachable = 0
+    for rank in ranks:
+        doubled = int(2 * rank)
+        reachable = min(threshold, reachable + doubled)
+        for total in range(reachable, doubled - 1, -1):
+            counts[total] += counts[total - doubled]
+    return (w_plus, sum(counts) / (1 << n))
 
 
 def _summarize(label: str, rows: list[dict]) -> dict:
@@ -266,7 +277,16 @@ def _summarize(label: str, rows: list[dict]) -> dict:
             by_case[key].append(e)
     # One independent experimental unit per libtest case. A case with an
     # invalid metric cannot silently contribute only its surviving metrics.
-    effects = [median(es) for case, es in by_case.items() if case not in invalid_cases]
+    effects = []
+    for case, es in by_case.items():
+        if case in invalid_cases:
+            continue
+        effect = median(es)
+        if math.isnan(effect):
+            # Opposite infinite endpoints have no defined even-sample median.
+            invalid_cases.add(case)
+        else:
+            effects.append(effect)
     wins = losses = ties = 0
     for e in effects:
         if e < 0.0:
@@ -275,7 +295,7 @@ def _summarize(label: str, rows: list[dict]) -> dict:
             losses += 1
         else:
             ties += 1
-    w_plus, z, p = _wilcoxon_less(effects) if effects else (0.0, float("nan"), float("nan"))
+    w_plus, p = _wilcoxon_less(effects) if effects else (0.0, float("nan"))
     return {
         "label": label,
         "n": len(set(by_case) | invalid_cases),
@@ -286,15 +306,18 @@ def _summarize(label: str, rows: list[dict]) -> dict:
         "reference_wins": losses,
         "ties": ties,
         "median_log_ratio": median(effects) if effects else float("nan"),
-        "wilcoxon_z": z,
+        "wilcoxon_w_plus": w_plus,
         "p_one_sided_gam_better": p,
     }
 
 
-def main() -> None:
-    if len(sys.argv) not in (2, 3):
-        raise SystemExit(__doc__)
-    src = sys.stdin if sys.argv[1] == "-" else open(sys.argv[1])
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("log", help="complete execution log, or - for stdin")
+    parser.add_argument("--outcomes", help="quality_results.tsv from the same run")
+    parser.add_argument("--cases", help="complete case manifest from the same binary's --list")
+    args = parser.parse_args()
+    src = sys.stdin if args.log == "-" else open(args.log)
     with src if src is not sys.stdin else _nullctx(src):
         lines = src.readlines()
     rows = _parse(lines)
@@ -303,10 +326,20 @@ def main() -> None:
     # `quality_results.tsv`, passed explicitly or found beside the log.
     nextest = _parse_nextest(lines)
     if not nextest:
-        tsv = sys.argv[2] if len(sys.argv) == 3 else _default_outcome_tsv(sys.argv[1])
+        tsv = args.outcomes or _default_outcome_tsv(args.log)
         if tsv:
             nextest = _parse_outcome_tsv(tsv)
             print(f"execution record: {tsv}")
+    manifest = args.cases
+    if manifest is None and args.log != "-":
+        sibling = os.path.join(os.path.dirname(os.path.abspath(args.log)), "quality_cases.txt")
+        if os.path.exists(sibling):
+            manifest = sibling
+    expected_cases = set()
+    if manifest:
+        with open(manifest) as handle:
+            expected_cases = {line.strip() for line in handle if line.strip()}
+        print(f"complete case manifest: {manifest} ({len(expected_cases)} cases)")
     if not rows:
         raise SystemExit(
             "no [QUALITY_PAIR] lines found. Ensure the quality tests emit "
@@ -352,8 +385,13 @@ def main() -> None:
     print()
     recorded_cases = {case for record in nextest.values() for case in record["cases"]}
     unrecorded_cases = {row["case"] for row in rows} - recorded_cases
+    missing_cases = expected_cases - recorded_cases
+    unexpected_cases = recorded_cases - expected_cases if expected_cases else set()
     execution_valid = (
         bool(nextest)
+        and bool(expected_cases)
+        and not missing_cases
+        and not unexpected_cases
         and not unrecorded_cases
         and all(record["failed"] == 0 for record in nextest.values())
     )
@@ -364,17 +402,21 @@ def main() -> None:
         and execution_valid
     )
     print(
-        f"CLOSURE (per-case p<0.05, negative median, valid metrics, successful recorded execution): "
+        f"CLOSURE (exact per-case p<0.05, negative median, valid metrics, complete successful execution): "
         f"{'PASS' if verdict else 'FAIL'} "
         f"(p={overall['p_one_sided_gam_better']:.4f}, "
         f"median log(gam/ref)={overall['median_log_ratio']:.4f}, "
         f"wins {overall['gam_wins']} / losses {overall['reference_wins']})"
     )
     if overall["dropped_nonfinite"]:
-        print(f"INVALID: {overall['dropped_nonfinite']} case(s) have nonfinite/nonpositive metrics; closure blocked.")
+        print(f"INVALID: {overall['dropped_nonfinite']} case(s) have invalid metrics or undefined medians; closure blocked.")
     print(f"Experimental units: {overall['scored']} cases from {len(rows)} metric pairs.")
     if not execution_valid:
-        print("INCOMPLETE: absent execution record or failed cases; closure blocked.")
+        print("INCOMPLETE: absent manifest, mismatched execution, or failed cases; closure blocked.")
+        for case in sorted(missing_cases):
+            print(f"  listed case was not executed: {case}")
+        for case in sorted(unexpected_cases):
+            print(f"  executed case absent from manifest: {case}")
         for case in sorted(unrecorded_cases):
             print(f"  unrecorded emitting case: {case}")
 
@@ -428,6 +470,7 @@ def main() -> None:
                 f"  {e:+.4f}  {r['category']}/{r['test']} "
                 f"[{r['metric']}] gam={r['gam']:.5g} vs {r['reference']}={r['reference_value']:.5g}"
             )
+    return 0 if verdict else 1
 
 
 def _resolution(paired: dict) -> float:
@@ -539,4 +582,4 @@ class _nullctx:
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

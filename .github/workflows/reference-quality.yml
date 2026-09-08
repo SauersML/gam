@@ -172,8 +172,13 @@ jobs:
           # (see the build step), so its binary lands in target/release-dev/deps.
           bin=$(find target/release-dev/deps -maxdepth 1 -type f -perm -u+x -name "quality-*" ! -name '*.*' -printf '%T@ %p\n' 2>/dev/null | sort -rn | head -1 | cut -d' ' -f2-)
           if [ -n "$bin" ] && [ -x "$bin" ]; then
-            mapfile -t tests < <("$bin" --list 2>/dev/null | sed -n 's/: test$//p')
-            if [ "${#tests[@]}" -eq 0 ]; then
+            tests=()
+            if "$bin" --list > "$OUT/quality-list.txt" 2> "$OUT/quality-list.stderr"; then
+              mapfile -t tests < <(sed -n 's/: test$//p' "$OUT/quality-list.txt")
+            else
+              discovery_error=1
+            fi
+            if [ "$discovery_error" -eq 1 ] || [ "${#tests[@]}" -eq 0 ]; then
               discovery_error=1
               measured=0
               tests=(quality_discovery)
@@ -181,6 +186,9 @@ jobs:
           else
             measured=0
             tests=(quality)
+          fi
+          if [ "$measured" -eq 1 ]; then
+            printf '%s\n' "${tests[@]}" > "$OUT/quality_cases.txt"
           fi
           N=${#tests[@]}; i=0
           # Tab-separated, one header row, FULL (un-truncated) metric column so
@@ -609,6 +617,7 @@ jobs:
           name: reference-quality
           files: |
             /tmp/quality-report/completeness.tsv
+            /tmp/quality-report/quality_cases.txt
             /tmp/quality-report/quality_results.tsv
             /tmp/quality-report/quality_results.jsonl
             /tmp/quality-report/quality-aggregate.txt

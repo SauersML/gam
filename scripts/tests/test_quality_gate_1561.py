@@ -3,10 +3,11 @@
 import contextlib
 import importlib.util
 import io
+import itertools
 import math
 from pathlib import Path
 import unittest
-from unittest.mock import patch
+from unittest.mock import mock_open, patch
 
 
 SPEC = importlib.util.spec_from_file_location(
@@ -62,12 +63,30 @@ class QualityGate(unittest.TestCase):
             gate._parse([line("a"), line("a", gam=2.0)])
 
     def test_invalid_channel_invalidates_the_entire_experiment(self):
-        for invalid in (0.0, -1.0, math.nan, math.inf):
+        for invalid in (-1.0, math.nan, math.inf):
             with self.subTest(invalid=invalid):
                 rows = gate._parse([line("a"), line("a", "scale", gam=invalid)])
                 summary = gate._summarize("all", rows)
                 self.assertEqual(summary["scored"], 0)
                 self.assertEqual(summary["dropped_nonfinite"], 1)
+
+    def test_exact_zero_errors_preserve_ties_and_boundary_dominance(self):
+        rows = gate._parse([
+            line("exact_tie", gam=0.0, reference=0.0),
+            line("exact_win", gam=0.0),
+            line("exact_loss", reference=0.0),
+        ])
+        summary = gate._summarize("all", rows)
+        self.assertEqual(summary["scored"], 3)
+        self.assertEqual(summary["dropped_nonfinite"], 0)
+        self.assertEqual((summary["gam_wins"], summary["reference_wins"], summary["ties"]), (1, 1, 1))
+        self.assertEqual(summary["median_log_ratio"], 0.0)
+
+    def test_opposite_infinite_metric_endpoints_do_not_invent_a_median(self):
+        rows = gate._parse([line("a", "mean", gam=0.0), line("a", "scale", reference=0.0)])
+        summary = gate._summarize("all", rows)
+        self.assertEqual(summary["scored"], 0)
+        self.assertEqual(summary["dropped_nonfinite"], 1)
 
     def test_log_ratio_does_not_overflow_or_underflow(self):
         row = gate._parse([line("a", gam=1e300, reference=1e-300)])[0]
@@ -79,16 +98,37 @@ class QualityGate(unittest.TestCase):
         # Distinct differences separated by less than 1e-12 still have distinct
         # ranks. The variance must not treat them as a tied rank group.
         effects = [-1.0, -1.0000000000001, 2.0]
-        w, z, p = gate._wilcoxon_less(effects)
+        w, p = gate._wilcoxon_less(effects)
         self.assertEqual(w, 3.0)
-        self.assertAlmostEqual(z, 0.5 / math.sqrt(3.5))
-        self.assertAlmostEqual(p, 0.5 * math.erfc(-z / math.sqrt(2)))
-        self.assertEqual(gate._wilcoxon_less([0.0, 0.0]), (0.0, 0.0, 1.0))
+        self.assertEqual(p, 5 / 8)
+        self.assertEqual(gate._wilcoxon_less([0.0, 0.0]), (0.0, 1.0))
 
-    def report(self, extra=""):
+    def test_exact_signed_rank_matches_exhaustive_tied_sign_assignments(self):
+        magnitudes = [1, 1, 2, 4, 4]
+        doubled_ranks = [3, 3, 6, 9, 9]
+        assignments = list(itertools.product([-1, 1], repeat=len(magnitudes)))
+        null_sums = [sum(r for r, sign in zip(doubled_ranks, signs) if sign > 0)
+                    for signs in assignments]
+        for signs, observed in zip(assignments, null_sums):
+            effects = [m * sign for m, sign in zip(magnitudes, signs)] + [0.0]
+            w, p = gate._wilcoxon_less(effects)
+            self.assertEqual(w, observed / 2)
+            self.assertEqual(p, sum(s <= observed for s in null_sums) / len(null_sums))
+
+    def test_small_panels_cannot_gain_significance_from_a_normal_approximation(self):
+        self.assertEqual(gate._wilcoxon_less([-1.0] * 4), (0.0, 1 / 16))
+        self.assertEqual(gate._wilcoxon_less([-1.0] * 5), (0.0, 1 / 32))
+
+    def report(self, extra="", manifest_count=40):
         body = "".join(line(f"module::case{i}") for i in range(40)) + extra
         output = io.StringIO()
-        with patch.object(gate.sys, "argv", ["gate", "-"]), \
+        argv = ["gate", "-"]
+        manifest = ""
+        if manifest_count is not None:
+            argv += ["--cases", "quality_cases.txt"]
+            manifest = "".join(f"families::module::case{i}\n" for i in range(manifest_count))
+        with patch.object(gate.sys, "argv", argv), \
+                patch("builtins.open", mock_open(read_data=manifest)), \
                 patch.object(gate.sys, "stdin", io.StringIO(body)), \
                 contextlib.redirect_stdout(output):
             gate.main()
@@ -117,6 +157,18 @@ class QualityGate(unittest.TestCase):
             f"PASS [1.0s] gam::quality families::module::case{i}\n" for i in range(40)
         )
         self.assertIn("): PASS", self.report(execution))
+
+    def test_successful_subset_cannot_certify_the_complete_suite(self):
+        execution = "".join(
+            f"PASS [1.0s] gam::quality families::module::case{i}\n" for i in range(40)
+        )
+        report = self.report(execution, manifest_count=41)
+        self.assertIn("): FAIL", report)
+        self.assertIn("listed case was not executed: families::module::case40", report)
+        self.assertIn("): FAIL", self.report(execution, manifest_count=None))
+        report = self.report(execution, manifest_count=39)
+        self.assertIn("): FAIL", report)
+        self.assertIn("executed case absent from manifest: families::module::case39", report)
 
 
 if __name__ == "__main__":
