@@ -265,43 +265,10 @@ pub(crate) fn constraint_kkt_admits_progress_exhausted_stall(
     }
 }
 
-/// Whether NO inequality is active at this iterate — the condition under which
-/// the plain coefficient-space Newton certificate (the exact decrement, and the
-/// undamped polish that pursues it) is exactly valid for a fit that carries a
-/// constraint system (#2705 group B).
-///
-/// With an empty active set every multiplier is zero, so
-/// `∇L − Aᵀλ = ∇L` and the constrained KKT system IS the unconstrained
-/// stationarity system. Nothing about the certificate has to be weakened for it;
-/// the only obligation the constraints still impose is that a step must not
-/// leave the feasible set, which the polish checks on each candidate.
-///
-/// Deliberately measured on `beta` and `gradient` rather than cached: the active
-/// set is a property of the iterate, and a polish step can change it.
-pub(crate) fn inequalities_are_all_inactive(
-    options: &WorkingModelPirlsOptions,
-    beta: &Array1<f64>,
-    gradient: &Array1<f64>,
-) -> bool {
-    let diagnostics = match options.linear_constraints.as_ref() {
-        Some(lin) => Some(compute_constraint_kkt_diagnostics(beta, gradient, lin)),
-        None => options.coefficient_lower_bounds.as_ref().and_then(|lb| {
-            linear_constraints_from_lower_bounds(lb)
-                .map(|lin| compute_constraint_kkt_diagnostics(beta, gradient, &lin))
-        }),
-    };
-    match diagnostics {
-        None => true,
-        Some(kkt) => kkt.n_active == 0,
-    }
-}
-
 /// The inequality system the fit carries, in one representation: explicit
 /// linear rows, or the rows an equivalent per-coordinate lower-bound box
-/// induces. `None` when the fit is unconstrained. This is the same resolution
-/// [`inequalities_are_all_inactive`] and [`iterate_is_primal_feasible`] make,
-/// owned once so the polish's active face, its feasibility check and its
-/// residual all read one system.
+/// induces. `None` when the fit is unconstrained. The polish's active face,
+/// feasibility check, and residual all read this same system.
 pub(crate) fn polish_inequality_system(
     options: &WorkingModelPirlsOptions,
 ) -> Option<std::borrow::Cow<'_, gam_problem::LinearInequalityConstraints>> {
@@ -671,8 +638,8 @@ where
     let mut plateau_streak = FlatStreak::new(2);
     let mut constrained_objective_plateau_streak =
         FlatStreak::new(CONSTRAINED_OBJECTIVE_PLATEAU_STREAK);
-    let has_explicit_constraints =
-        options.coefficient_lower_bounds.is_some() || options.linear_constraints.is_some();
+    let polish_inequalities = polish_inequality_system(options);
+    let has_explicit_constraints = polish_inequalities.is_some();
     let mut min_penalized_deviance = f64::INFINITY;
     let mut final_state: Option<WorkingState> = None;
     let mut final_state_cache_key: Option<PirlsAcceptedStateCacheKey> = None;
@@ -726,7 +693,7 @@ where
     // off because eleven inactive rows existed.
     //
     // The active set is a property of the ITERATE, so it is asked per use rather
-    // than once up front (`inequalities_are_all_inactive`).
+    // than once up front.
     let undamped_polish_allowed = options.arrow_schur.is_none();
     if let Some(adaptive) = options.adaptive_kkt_tolerance {
         log::info!(
@@ -2447,7 +2414,6 @@ where
     // Condition (3) makes the polish Pareto-safe: a fit that is already
     // machine-stationary (residual at round-off) sees no accepted step, so
     // existing golden values are untouched; only LM-ridge-biased iterates move.
-    let polish_inequalities = polish_inequality_system(options);
     if undamped_polish_allowed {
         // #2273 state locality. The polish inverts the OBJECTIVE's curvature,
         // and the omitted part of it (`HΦ`) is read off the model, which holds
@@ -2622,14 +2588,23 @@ where
     // contract: only a genuinely certified inner mode is recorded as
     // `Converged`.
     let can_still_certify = !status.is_converged() && status != PirlsStatus::Unstable;
-    let final_exact_decrement_sq = if can_still_certify
-        && undamped_polish_allowed
-        && inequalities_are_all_inactive(options, beta.as_ref(), &state.gradient)
-    {
+    let final_exact_decrement_sq = if can_still_certify && undamped_polish_allowed {
         let curvature_correction = model.objective_hessian_matrix_correction().cloned();
-        model
-            .exact_unconstrained_decrement_sq(&beta, &state)?
-            .or_else(|| exact_newton_decrement_sq(&state, curvature_correction.as_ref()))
+        if has_explicit_constraints {
+            // Recompute on the final binding face, just as the in-loop
+            // certificate does. A rejected rounded step can reach this exit
+            // without ever entering the accepted-step plateau branch (#2668).
+            exact_face_newton_decrement_sq(
+                &state,
+                curvature_correction.as_ref(),
+                beta.as_ref(),
+                options,
+            )
+        } else {
+            model
+                .exact_unconstrained_decrement_sq(&beta, &state)?
+                .or_else(|| exact_newton_decrement_sq(&state, curvature_correction.as_ref()))
+        }
     } else {
         None
     };
@@ -2666,7 +2641,7 @@ where
         let geometry_certified = constraint_geometry_is_certified(
             beta.as_ref(),
             &state.gradient,
-            options.linear_constraints.as_ref(),
+            polish_inequalities.as_deref(),
         );
         if geometry_certified && state.certifies_kkt(final_projected_grad, kkt_tolerance) {
             log::debug!(

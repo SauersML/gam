@@ -1,0 +1,25 @@
+
+running 1 test
+[INFO] [STAGE] PIRLS update_with_curvature iter=1 curvature=Fisher elapsed=0.000s source=rebuilt
+[INFO] [GPU] CUDA acceleration disabled: could not load any of: /usr/local/nvidia/lib64/libcuda.so.1, /usr/local/nvidia/lib64/libcuda.so, /usr/local/nvidia/lib/libcuda.so.1, /usr/local/nvidia/lib/libcuda.so, /usr/local/cuda/compat/libcuda.so.1, /usr/local/cuda/compat/libcuda.so, /usr/lib/x86_64-linux-gnu/libcuda.so.1, /usr/lib/x86_64-linux-gnu/libcuda.so, /usr/lib64/libcuda.so.1, /usr/lib64/libcuda.so, /usr/lib/wsl/lib/libcuda.so.1, /usr/lib/wsl/lib/libcuda.so, libcuda.so.1, libcuda.so
+[INFO] [GPU] CUDA acceleration disabled: could not load any of: /usr/local/nvidia/lib64/libcuda.so.1, /usr/local/nvidia/lib64/libcuda.so, /usr/local/nvidia/lib/libcuda.so.1, /usr/local/nvidia/lib/libcuda.so, /usr/local/cuda/compat/libcuda.so.1, /usr/local/cuda/compat/libcuda.so, /usr/lib/x86_64-linux-gnu/libcuda.so.1, /usr/lib/x86_64-linux-gnu/libcuda.so, /usr/lib64/libcuda.so.1, /usr/lib64/libcuda.so, /usr/lib/wsl/lib/libcuda.so.1, /usr/lib/wsl/lib/libcuda.so, libcuda.so.1, libcuda.so
+[INFO] [STAGE] PIRLS dense newton solve backend=CPU p=2 flops~2 elapsed=0.007s route="CPU stable solver"
+[INFO] [PIRLS iter-end] iter=  1 elapsed=0.0069s lm_lambda=3.33e-7 g_norm=2.097e0 last_dev_change=1.049e6 last_halving=1
+[INFO] [PIRLS iter-breakdown] iter=  1 attempts=1 curvature=0.000s solve=0.007s predred=0.000s candidate=0.000s other=0.000s
+[INFO] [PIRLS lm-trajectory] iter=  1 start_lambda=1.000e-6 final_lambda=3.333e-7 log10_ratio=-0.477 accept_rho=1.000 attempts=1
+[INFO] [PIRLS solve-end] iters=1 elapsed=0.0072s g_norm_initial=2.097e6 g_norm_final=2.097e0 convergence_rate=1.000e-6 status=MaxIterationsReached
+
+thread 'terminal_face_decrement_certifies_a_representable_quadratic_minimum' (2182823) panicked at /scratch.global/sauer354/n5/crates/gam-solve/tests/constrained_terminal_decrement_2668.rs:66:5:
+assertion `left == right` failed: the tangent Newton decrement certifies the nearest representable minimum
+  left: MaxIterationsReached
+ right: Converged
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test terminal_face_decrement_certifies_a_representable_quadratic_minimum ... FAILED
+
+failures:
+
+failures:
+    terminal_face_decrement_certifies_a_representable_quadratic_minimum
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+

@@ -1,0 +1,31 @@
+   Compiling gam-solve v0.3.154 (/scratch.global/sauer354/n5/crates/gam-solve)
+    Finished `test` profile [optimized + debuginfo] target(s) in 1m 32s
+     Running tests/constrained_terminal_decrement_2668.rs (/scratch.global/sauer354/m1-target/debug/deps/constrained_terminal_decrement_2668-304ffe21814cc9e4)
+
+running 1 test
+[INFO] [STAGE] PIRLS update_with_curvature iter=1 curvature=Fisher elapsed=0.000s source=rebuilt
+[INFO] [GPU] CUDA acceleration disabled: could not load any of: /usr/local/nvidia/lib64/libcuda.so.1, /usr/local/nvidia/lib64/libcuda.so, /usr/local/nvidia/lib/libcuda.so.1, /usr/local/nvidia/lib/libcuda.so, /usr/local/cuda/compat/libcuda.so.1, /usr/local/cuda/compat/libcuda.so, /usr/lib/x86_64-linux-gnu/libcuda.so.1, /usr/lib/x86_64-linux-gnu/libcuda.so, /usr/lib64/libcuda.so.1, /usr/lib64/libcuda.so, /usr/lib/wsl/lib/libcuda.so.1, /usr/lib/wsl/lib/libcuda.so, libcuda.so.1, libcuda.so
+[INFO] [GPU] CUDA acceleration disabled: could not load any of: /usr/local/nvidia/lib64/libcuda.so.1, /usr/local/nvidia/lib64/libcuda.so, /usr/local/nvidia/lib/libcuda.so.1, /usr/local/nvidia/lib/libcuda.so, /usr/local/cuda/compat/libcuda.so.1, /usr/local/cuda/compat/libcuda.so, /usr/lib/x86_64-linux-gnu/libcuda.so.1, /usr/lib/x86_64-linux-gnu/libcuda.so, /usr/lib64/libcuda.so.1, /usr/lib64/libcuda.so, /usr/lib/wsl/lib/libcuda.so.1, /usr/lib/wsl/lib/libcuda.so, libcuda.so.1, libcuda.so
+[INFO] [STAGE] PIRLS dense newton solve backend=CPU p=2 flops~2 elapsed=0.022s route="CPU stable solver"
+[INFO] [PIRLS iter-end] iter=  1 elapsed=0.0245s lm_lambda=3.33e-7 g_norm=2.097e0 last_dev_change=1.049e6 last_halving=1
+[INFO] [PIRLS iter-breakdown] iter=  1 attempts=1 curvature=0.000s solve=0.022s predred=0.000s candidate=0.000s other=0.002s
+[INFO] [PIRLS lm-trajectory] iter=  1 start_lambda=1.000e-6 final_lambda=3.333e-7 log10_ratio=-0.477 accept_rho=1.000 attempts=1
+[INFO] [PIRLS solve-end] iters=1 elapsed=0.0251s g_norm_initial=2.097e6 g_norm_final=2.097e0 convergence_rate=1.000e-6 status=MaxIterationsReached
+[INFO] [PIRLS final exact-decrement] decrement_sq=1.110223e-16 threshold=1.332268e-15 pass=true gradient_norm=1.525879e-5 status_before=MaxIterationsReached
+[INFO] [STAGE] PIRLS update_with_curvature iter=1 curvature=Fisher elapsed=0.000s source=rebuilt
+[INFO] [PIRLS iter-end] iter=  1 elapsed=0.0002s lm_lambda=3.33e-7 g_norm=2.097e0 last_dev_change=1.049e6 last_halving=1
+[INFO] [PIRLS iter-breakdown] iter=  1 attempts=1 curvature=0.000s solve=0.000s predred=0.000s candidate=0.000s other=0.000s
+[INFO] [PIRLS lm-trajectory] iter=  1 start_lambda=1.000e-6 final_lambda=3.333e-7 log10_ratio=-0.477 accept_rho=1.000 attempts=1
+[INFO] [PIRLS solve-end] iters=1 elapsed=0.0003s g_norm_initial=2.097e6 g_norm_final=2.097e0 convergence_rate=1.000e-6 status=MaxIterationsReached
+[INFO] [PIRLS final exact-decrement] decrement_sq=1.110223e-16 threshold=1.332268e-15 pass=true gradient_norm=1.525879e-5 status_before=MaxIterationsReached
+[INFO] [STAGE] PIRLS update_with_curvature iter=1 curvature=Fisher elapsed=0.000s source=rebuilt
+[INFO] [STAGE] PIRLS dense newton solve backend=CPU p=2 flops~2 elapsed=0.000s route="CPU stable solver"
+[INFO] [PIRLS iter-end] iter=  1 elapsed=0.0001s lm_lambda=3.33e-7 g_norm=2.097e0 last_dev_change=1.049e6 last_halving=1
+[INFO] [PIRLS iter-breakdown] iter=  1 attempts=1 curvature=0.000s solve=0.000s predred=0.000s candidate=0.000s other=0.000s
+[INFO] [PIRLS lm-trajectory] iter=  1 start_lambda=1.000e-6 final_lambda=3.333e-7 log10_ratio=-0.477 accept_rho=1.000 attempts=1
+[INFO] [PIRLS solve-end] iters=1 elapsed=0.0002s g_norm_initial=2.097e6 g_norm_final=2.097e0 convergence_rate=1.000e-6 status=MaxIterationsReached
+[INFO] [PIRLS final exact-decrement] decrement_sq=1.110223e-16 threshold=6.661338e-16 pass=true gradient_norm=1.525879e-5 status_before=MaxIterationsReached
+test terminal_face_decrement_certifies_a_representable_quadratic_minimum ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+

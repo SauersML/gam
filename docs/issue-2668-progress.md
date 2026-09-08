@@ -254,3 +254,37 @@ the regression's diagnostic logger directly. Inspection also found that the
 post-polish decrement check still excludes active inequality faces, whereas
 the in-loop check already uses their tangent-space decrement. Its relevance
 to the measured failure needs a focused test before changing production.
+
+## Terminal constrained-face certificate
+
+A focused quadratic reproduces a separate terminal P-IRLS defect. Its free
+coefficient fits two adjacent floating-point observations with equal weights;
+their exact mean lies between representable values. A constrained coefficient
+has a binding lower bound and a nonzero multiplier. After one damped step makes
+resolvable progress, undamped final refinement reaches the nearest representable
+minimum, but the accepted-step plateau check has never seen that final point.
+The old final check excludes active faces and returns `MaxIterationsReached`.
+
+The final check now uses the same face-restricted Newton decrement as the
+in-loop check. The fixture's weight is derived so its squared decrement is
+exactly epsilon/2 (1.110223e-16), below the existing threshold 1.332268e-15;
+its tangent gradient remains 1.525879e-5. No tolerance was loosened. The
+single-case baseline fails and the corrected integration test passes for
+lower-bound rows, equivalent general linear rows, and an all-infinite box
+(0.03 seconds). The normalized inequality system also supplies the terminal
+geometry check, including lower-bound feasibility. The now-unused
+`inequalities_are_all_inactive` helper was removed.
+
+Receipts: `face-before.log`, `face-after.log`, and `face-warm-compile.log` under
+`bench/measurements/issue_2668/`. The before receipt covers the lower-bound
+case; the final after receipt also covers the two equivalent representations.
+The full r7 regression build is pending; the original concave-inference
+contract is not yet counted resolved.
+
+`scripts/compile_warm_probe.py` compiles a diagnostic against an explicitly
+selected existing Cargo library graph, resolving direct dependencies by their
+fingerprints and recording source/library/binary hashes. It avoids rebuilding
+the dependency graph when a small probe changes. Use it only while the target
+directory is idle: a later attempted baseline compilation overlapped r7 and
+correctly failed when Cargo removed the old library before linking. That
+attempt produced no test result and is excluded from the proof above.

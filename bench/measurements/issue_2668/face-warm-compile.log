@@ -1,0 +1,44 @@
+{
+  "anchor": "gam-solve-5af2bbba83b55f06",
+  "libraries": {
+    "gam_solve": "/scratch.global/sauer354/m1-target/debug/deps/libgam_solve-5af2bbba83b55f06.rlib",
+    "gam_problem": "/scratch.global/sauer354/m1-target/debug/deps/libgam_problem-a958a4093e48359f.rlib",
+    "gam_linalg": "/scratch.global/sauer354/m1-target/debug/deps/libgam_linalg-4381fee49e4d2223.rlib",
+    "ndarray": "/scratch.global/sauer354/m1-target/debug/deps/libndarray-f8db24d5be256c43.rlib",
+    "gam_runtime": "/scratch.global/sauer354/m1-target/debug/deps/libgam_runtime-37fee7f998251627.rlib"
+  },
+  "library_sha256": {
+    "gam_solve": "307104f3c4502d8257bfe897cd4cd8cbf5cc32758128be7159a12e6f3bb06a75",
+    "gam_problem": "74b79642c9f464ab1b70d8df2d72144d86001012f43e5158dc24635732ffa9c5",
+    "gam_linalg": "00d7b40faabab014d07935e1beb78013bd489301a8ab3aa5bd546ffa6817ece8",
+    "ndarray": "725ab79c943fec0c82268ee2791dcbb93bd014dc2ef3ce4a8d95dc8281968bde",
+    "gam_runtime": "19173f210d4d6b986b9f237c3a7408d0d3a4b3008fa18020fdf453f7941d7d88"
+  },
+  "source_sha256": "9ddcfead512700549221d3c195570be8acf12ef3709a2b5f199b00a11a120b1e",
+  "command": [
+    "rustc",
+    "--edition=2024",
+    "-C",
+    "opt-level=2",
+    "-C",
+    "codegen-units=4",
+    "-L",
+    "dependency=/scratch.global/sauer354/m1-target/debug/deps",
+    "/scratch.global/sauer354/n5/crates/gam-solve/tests/constrained_terminal_decrement_2668.rs",
+    "-o",
+    "/scratch.global/sauer354/m1-target/probes/constrained-terminal-before",
+    "--test",
+    "--extern",
+    "gam_solve=/scratch.global/sauer354/m1-target/debug/deps/libgam_solve-5af2bbba83b55f06.rlib",
+    "--extern",
+    "gam_problem=/scratch.global/sauer354/m1-target/debug/deps/libgam_problem-a958a4093e48359f.rlib",
+    "--extern",
+    "gam_linalg=/scratch.global/sauer354/m1-target/debug/deps/libgam_linalg-4381fee49e4d2223.rlib",
+    "--extern",
+    "ndarray=/scratch.global/sauer354/m1-target/debug/deps/libndarray-f8db24d5be256c43.rlib",
+    "--extern",
+    "gam_runtime=/scratch.global/sauer354/m1-target/debug/deps/libgam_runtime-37fee7f998251627.rlib"
+  ]
+}
+rustc 1.97.1 (8bab26f4f 2026-07-14)
+{"compile_seconds": 3.517354827024974, "binary_sha256": "67288903f5b1f809888b9c24fef3333594bd2bd97ca3760002fb78b174d42cc1"}
