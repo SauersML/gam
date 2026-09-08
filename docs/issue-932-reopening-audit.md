@@ -54,7 +54,7 @@ Sources: [issue and original deployment plan](https://github.com/SauersML/gam/is
 | Constrained Firth/Jeffreys root cause | Correction enabled on identifiable geometry and converged constrained binomial-wiggle/Matérn fit, plus affected-family regressions | Incomplete: disabling rationale remains in production |
 | Large-scale flex end-to-end benchmark | A real converged fit selecting the intended branch, cold/warm cache attribution, comparable baseline and timing | Pending; per-row allocation test is insufficient; inspect current Criterion target's capped-fit semantics |
 | Retired hand fourth-order oracle reduced to finiteness | Independent numerical agreement through fourth order on the live route | Pending; finite-only agreement is not sufficient |
-| Block10 fourth-order FD convergence omissions | Every required entry covered by a converged independent witness or exact oracle | Pending; skipping unresolved entries cannot prove all-channel correctness |
+| Block10 fourth-order FD convergence omissions | Every required entry covered by a converged independent witness or exact oracle | Fixed and verified on MSI: all four fixtures, no skipped matrix entries, exact-zero checks for zero directions; original error bounds retained |
 | Loosened oracle tolerances and narrowed fixtures | Justified numerical error bounds, wider relevant fixtures, corruption sensitivity | Pending; inspect each affected oracle, not only the repaired rigid test |
 | Removed hand-oracle coverage | Independent replacement for each still-live channel, not a comparison of one lowering with itself | Pending |
 | M=32 complete canonical fourth-order coverage without stack overflow | Executed bounded-stack live-route/canonical test, explicit matrix coverage, no width refusal | Passed on MSI: four fixtures, every 32×32 third/fourth entry, canonical evaluation on an explicit 1 MiB stack |
@@ -179,3 +179,36 @@ shared-index staging also included changes to `gam-math/src/jet_tower.rs`,
 `gam-solve/src/gaussian_reml.rs` in that commit. The tests above validate the
 moving-edge/model candidate on MSI, not those concurrently staged changes.
 They were preserved; no history or worktree restoration was performed.
+
+The next Block10 investigation isolated a quadrature defect for the very wide
+finite cells created by small nonzero slopes. Integrating one non-affine
+polynomial on `[3,10000]` gave M0 **0.00331604250946477457**, while partitioning
+the identical integral gave **0.00331602882076341855**. The new interval-additivity
+regression failed before the repair. The candidate reduces only integration
+tails whose Gaussian-envelope bound is below half the smallest f64 subnormal;
+the original cell and moving-boundary geometry remain intact. The bound covers
+every absolute moment through the requested degree. CPU and CUDA source
+emission share its radius calculation. With this reduction, all **89** kernel
+tests passed in release, including all 33 moment slots of the new regression.
+Logs: `.buildd/issue932-wide-cell-before.log` and
+`.buildd/issue932-wide-cell-after.log`.
+
+The full Block10 gate now **passes without skipped entries**, including the
+original zero-warp fixture. Its finite checks and zero-direction assertions
+also passed, with the original numerical bands unchanged. Thus the wide-cell
+quadrature defect, rather than an intrinsically nonsmooth calibration root,
+caused the historical discrepancy. The current model binary additionally
+passed all 71 issue-932 correctness witnesses, both independent flex contracted
+tower witnesses, and all five CUDA source-emission tests. Physical CUDA
+execution and release performance remain pending. Logs:
+`.buildd/issue932-block10-wide-domain-result.log`,
+`.buildd/issue932-wide-model-witnesses.log`,
+`.buildd/issue932-wide-flex-witnesses.log`, and
+`.buildd/issue932-wide-cuda-source.log`.
+
+For the model integration check, direct rustc reused the existing warm
+dependency artifacts with optimization and LTO disabled, four pinned CPUs,
+and a 150-second build cap. It completed in 129.93 seconds. The exact compiler
+arguments are saved in `.buildd/issue932-wide-direct-argv.json`. Earlier Cargo
+attempts rebuilt dependency variants and hit development caps; those attempts
+are not passing evidence. No local build or numerical execution was used.

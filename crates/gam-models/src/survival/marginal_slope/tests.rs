@@ -6935,10 +6935,6 @@ fn flex_production_fourth_contraction_matches_scalar_fd_witness() {
                     dir_v[idx] = dir_v_full[idx];
                 }
             }
-            if dir_v.iter().all(|x| x.abs() == 0.0) {
-                continue;
-            }
-
             let production = family
                 .row_flex_primary_fourth_contracted_exact(0, &block_states, dir_u, &dir_v)
                 .unwrap_or_else(|err| {
@@ -6947,6 +6943,12 @@ fn flex_production_fourth_contraction_matches_scalar_fd_witness() {
                         fixture.label
                     )
                 });
+            assert_eq!(production.dim(), (p, p));
+            assert!(production.iter().all(|value| value.is_finite()));
+            if dir_v.iter().all(|x| *x == 0.0) || dir_u.iter().all(|x| *x == 0.0) {
+                assert!(production.iter().all(|value| *value == 0.0));
+                continue;
+            }
 
             // Central difference (Richardson) of the production THIRD contraction
             // `D_u H` along the g/h/w direction `dir_v`.
@@ -6974,30 +6976,20 @@ fn flex_production_fourth_contraction_matches_scalar_fd_witness() {
                     let got = production[[u, v]];
                     let want = fd_fourth[[u, v]];
                     let scale = want.abs().max(1.0);
-                    // Richardson convergence guard: if the coarse (h0) and fine
-                    // (h0/2) central differences of the third contraction disagree
-                    // beyond the assert tolerance, the FD witness has NOT converged —
-                    // the third contraction is non-smooth in the block-state
-                    // perturbation at this point (e.g. the all-zero `zero_warp_edge`
-                    // degenerate fixture: censored event=0, z=0, score_eta=0, every
-                    // warp coeff 0, where the re-solved moving-boundary intercept is
-                    // non-differentiable). The FD witness is unreliable there, not the
-                    // production path (which the #1454 gate FD-validates on smooth
-                    // fixtures). Skip only those provably-non-convergent entries; every
-                    // entry where the FD converges is still asserted strictly.
-                    let fd_unconverged =
-                        (fine[[u, v]] - coarse[[u, v]]).abs() > 2e-2 * scale + 1e-5;
-                    if fd_unconverged {
-                        eprintln!(
-                            "#932 flex fourth[{u},{v}] {}/{u_label}->{v_label}: FD witness \
-                             unconverged (coarse {:+.4e}, fine {:+.4e}); skipping — production \
-                             {got:+.4e}",
-                            fixture.label,
-                            coarse[[u, v]],
-                            fine[[u, v]]
-                        );
-                        continue;
-                    }
+                    // A disagreement between stencil scales is a failed
+                    // witness, not permission to omit a required channel.
+                    assert!(
+                        [got, want, fine[[u, v]], coarse[[u, v]]]
+                            .iter()
+                            .all(|value| value.is_finite())
+                            && (fine[[u, v]] - coarse[[u, v]]).abs()
+                                <= 2e-2 * scale + 1e-5,
+                        "{} / {u_label}->{v_label} fourth[{u},{v}]: FD did not converge: \
+                         coarse={:+.6e}, fine={:+.6e}, production={got:+.6e}",
+                        fixture.label,
+                        coarse[[u, v]],
+                        fine[[u, v]],
+                    );
                     assert!(
                         (got - want).abs() <= 2e-2 * scale + 1e-5,
                         "{} / {u_label}->{v_label} fourth[{u},{v}]: production {got:+.6e} != \

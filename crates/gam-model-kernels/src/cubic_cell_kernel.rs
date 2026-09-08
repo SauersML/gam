@@ -3318,6 +3318,49 @@ const NON_AFFINE_LADDER_RTOL: f64 = 1e-15;
 /// All divisible by 4 so the SIMD sweep needs no scalar tail.
 const NON_AFFINE_LADDER_RUNGS: [usize; 5] = [12, 24, 48, 96, 192];
 
+/// Remove only tails whose entire moment contribution rounds to zero in f64.
+/// For z >= R > sqrt(k), log(z^k exp(-z²/2)) is concave, so its tangent at R
+/// bounds the tail integral by R^k exp(-R²/2)/(R-k/R). With R >= 1 this also
+/// bounds every lower absolute moment. The factor two covers both tails.
+/// Since exp(-eta²/2) <= 1, this is independent of the cell coefficients.
+///
+/// This keeps remote link-knot crossings from dilating a quadrature rule until
+/// all its nodes miss the Gaussian mass. The original mathematical cell and
+/// moving-edge geometry remain unchanged; only unrepresentable integration
+/// tails are removed from the numerical rule's interval.
+fn representable_non_affine_interval(
+    mut cell: DenestedCubicCell,
+    max_degree: usize,
+) -> Option<DenestedCubicCell> {
+    let radius = (max_degree as f64 + 1.0).sqrt();
+    if cell.left >= -radius && cell.right <= radius {
+        return Some(cell);
+    }
+    let radius = gaussian_moment_underflow_radius(max_degree);
+    cell.left = cell.left.max(-radius);
+    cell.right = cell.right.min(radius);
+    (cell.left < cell.right).then_some(cell)
+}
+
+/// Gaussian envelope radius beyond which the sum of both absolute moment
+/// tails, through `max_degree`, rounds to zero in f64. Shared with CUDA source
+/// emission so CPU and device quadrature use the same numerical interval.
+pub fn gaussian_moment_underflow_radius(max_degree: usize) -> f64 {
+    let degree = max_degree as f64;
+    let mut radius = (degree + 1.0).sqrt();
+    let zero_rounding_log = f64::from_bits(1).ln() - std::f64::consts::LN_2;
+    loop {
+        let tail_bound_log =
+            degree * radius.ln() - 0.5 * radius * radius - (radius - degree / radius).ln()
+                + std::f64::consts::LN_2;
+        if tail_bound_log < zero_rounding_log {
+            break;
+        }
+        radius *= 2.0;
+    }
+    radius
+}
+
 /// Runtime-generated Gauss-Legendre rules for the ladder rungs, computed
 /// once per process by Newton iteration on the Legendre polynomial roots
 /// (standard `gauleg`: cosine initial guess, 3-4 Newton steps to machine
@@ -3404,6 +3447,9 @@ fn evaluate_non_affine_cell_simd<const COMPUTE_VALUE: bool>(
     cell: DenestedCubicCell,
     max_degree: usize,
 ) -> (CellMomentVec, f64) {
+    let Some(cell) = representable_non_affine_interval(cell, max_degree) else {
+        return (smallvec![0.0; max_degree + 1], 0.0);
+    };
     let mut prev: Option<(CellMomentVec, f64)> = None;
     for (i, (nodes, weights)) in non_affine_ladder_rules().iter().enumerate() {
         let cur =
@@ -3440,6 +3486,9 @@ fn evaluate_non_affine_cell_simd<const COMPUTE_VALUE: bool>(
 /// partition cell, so that discarded moment work is the dominant waste in the
 /// per-cell pass; this evaluator does only the work the value needs.
 fn evaluate_non_affine_cell_value_terminal(cell: DenestedCubicCell) -> f64 {
+    let Some(cell) = representable_non_affine_interval(cell, 0) else {
+        return 0.0;
+    };
     let center = 0.5 * (cell.left + cell.right);
     let half_width = 0.5 * (cell.right - cell.left);
     let c0 = cell.c0;
@@ -6232,6 +6281,57 @@ mod tests {
                 z.powi(degree as i32) * (-cell.q(z)).exp()
             });
             assert!((state.moments[degree] - target).abs() < 1e-9);
+        }
+    }
+
+    #[test]
+    fn wide_nonaffine_cell_preserves_moments_under_partition_932() {
+        // Small nonzero survival slopes send link-knot crossings far into the
+        // Gaussian tails. Splitting such a cell changes neither its polynomial
+        // nor its integral. Two quadrature rules that both miss the mass must
+        // not certify a zero moment vector.
+        let cell = DenestedCubicCell {
+            left: 3.0,
+            right: 10_000.0,
+            c0: 0.2,
+            c1: 0.0003,
+            c2: 0.000001,
+            c3: 0.000000001,
+        };
+        let whole = evaluate_cell_moments_uncached(cell, 32).expect("wide cell");
+        let breaks = [3.0, 4.0, 6.0, 8.0, 12.0, 16.0, 10_000.0];
+        let mut partitioned = vec![0.0; 33];
+        let mut partitioned_value = 0.0;
+        for interval in breaks.windows(2) {
+            let part = evaluate_cell_moments_uncached(
+                DenestedCubicCell {
+                    left: interval[0],
+                    right: interval[1],
+                    ..cell
+                },
+                32,
+            )
+            .expect("partition cell");
+            partitioned_value += part.value;
+            for (sum, contribution) in partitioned.iter_mut().zip(&part.moments) {
+                *sum += contribution;
+            }
+        }
+        assert!(
+            partitioned[0] > 0.001,
+            "the Gaussian tail carries real mass"
+        );
+        assert!(
+            whole.value.is_finite()
+                && (whole.value - partitioned_value).abs() <= 1e-10 * partitioned_value.abs(),
+            "cell value: whole={:.17e}, partitioned={partitioned_value:.17e}",
+            whole.value
+        );
+        for (degree, (&whole, &split)) in whole.moments.iter().zip(&partitioned).enumerate() {
+            assert!(
+                whole.is_finite() && (whole - split).abs() <= 1e-10 * split.abs(),
+                "moment {degree}: whole={whole:.17e}, partitioned={split:.17e}"
+            );
         }
     }
 

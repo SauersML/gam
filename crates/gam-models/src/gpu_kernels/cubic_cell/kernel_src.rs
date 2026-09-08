@@ -11,7 +11,9 @@
 
 use std::fmt::Write as _;
 
-use crate::cubic_cell_kernel::{GL_NODES_FOR_GPU_KERNEL, GL_WEIGHTS_FOR_GPU_KERNEL};
+use crate::cubic_cell_kernel::{
+    GL_NODES_FOR_GPU_KERNEL, GL_WEIGHTS_FOR_GPU_KERNEL, gaussian_moment_underflow_radius,
+};
 
 /// Emit the full NVRTC source for one `max_degree` specialization. The kernel
 /// symbol is `cubic_deriv_moments_d{max_degree}`. Output is deterministic:
@@ -21,6 +23,12 @@ pub(crate) fn build_cubic_deriv_moments_kernel_source(max_degree: usize) -> Stri
 
     src.push_str(HEADER);
     writeln!(src, "#define MAX_DEGREE {}", max_degree).expect("writes to String are infallible");
+    writeln!(
+        src,
+        "#define GAUSSIAN_MOMENT_RADIUS {:.17e}",
+        gaussian_moment_underflow_radius(max_degree)
+    )
+    .expect("writes to String are infallible");
     src.push_str("#define MOMENT_STRIDE (MAX_DEGREE + 1)\n");
     src.push_str("#define GL_N 384\n");
     src.push_str("#define LANES_PER_WARP 32\n");
@@ -190,9 +198,20 @@ const KERNEL_BODY: &str = r#"    const double* __restrict__ cell_left,
     }
 
     if (branch == BRANCH_NONAFFINE_FIN) {
-        // Map GL nodes from [-1, 1] to [L, R]: z = mid + half * t.
-        const double half = 0.5 * (R - L);
-        const double mid  = 0.5 * (R + L);
+        // The host's Gaussian envelope certifies that the omitted tails round
+        // to zero through MAX_DEGREE. Keep distant knot crossings from placing
+        // every quadrature node outside the representable Gaussian mass.
+        const double integration_left = fmax(L, -GAUSSIAN_MOMENT_RADIUS);
+        const double integration_right = fmin(R, GAUSSIAN_MOMENT_RADIUS);
+        if (!(integration_right > integration_left)) {
+            if (lane == 0) status[cell_id] = STATUS_OK;
+            for (int k = (int)lane; k < (int)MOMENT_STRIDE; k += 32) {
+                moment_output[out_base + (unsigned)k] = 0.0;
+            }
+            return;
+        }
+        const double half = 0.5 * (integration_right - integration_left);
+        const double mid  = 0.5 * (integration_right + integration_left);
 
         // Per-lane partial moments.
         double partial[MOMENT_STRIDE];
