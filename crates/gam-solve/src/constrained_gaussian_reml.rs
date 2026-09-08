@@ -656,10 +656,14 @@ fn whitened_tangent_geometry(
             *value = 0.0;
         }
     }
-    debug_assert_eq!(
-        classification.rank,
-        penalty_values.iter().filter(|&&value| value > 0.0).count()
-    );
+    let surviving = penalty_values.iter().filter(|&&value| value > 0.0).count();
+    if surviving != classification.rank {
+        return Err(EstimationError::InvalidInput(format!(
+            "affine-face penalty spectrum: {surviving} eigenvalue(s) survive the roundoff \
+             floor but the spectrum classification carries rank {}",
+            classification.rank
+        )));
+    }
     let basis = gram_inverse_root.dot(&penalty_vectors);
     let gram_logdet = gram_values.iter().map(|value| value.ln()).sum();
     Ok((basis, penalty_values, gram_logdet))
@@ -687,10 +691,14 @@ fn positive_semidefinite_root(
             0.0
         };
     }
-    debug_assert_eq!(
-        classification.rank,
-        values.iter().filter(|&&v| v > 0.0).count()
-    );
+    let surviving = values.iter().filter(|&&v| v > 0.0).count();
+    if surviving != classification.rank {
+        return Err(EstimationError::InvalidInput(format!(
+            "positive-semidefinite root: {surviving} eigenvalue(s) survive the roundoff \
+             floor but the spectrum classification carries rank {}",
+            classification.rank
+        )));
+    }
     Ok(&vectors.t() * &values.insert_axis(Axis(1)))
 }
 
