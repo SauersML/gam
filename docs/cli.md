@@ -5,7 +5,7 @@ model blobs, prediction CSVs, posterior draws, generated responses, or HTML
 reports.
 
 ```bash
-gam <command> --help
+gam --help
 ```
 
 ## Commands
@@ -14,7 +14,7 @@ gam <command> --help
 | --- | --- |
 | `gam fit DATA FORMULA --out MODEL` | Fit and save a model. |
 | `gam predict MODEL NEW_DATA --out PREDICTIONS.csv` | Predict from a saved model. |
-| `gam diagnose MODEL DATA [--alo]` | Compute residual / calibration diagnostics; `--alo` also computes approximate leave-one-out quantities. |
+| `gam diagnose MODEL DATA` | Compute approximate leave-one-out diagnostics. |
 | `gam sample MODEL DATA [--out posterior.csv]` | Draw posterior coefficients. |
 | `gam generate MODEL DATA [--out generated.csv]` | Draw synthetic responses from a fitted model. |
 | `gam report MODEL [DATA] [OUT]` | Write a self-contained HTML report. |

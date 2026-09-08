@@ -144,8 +144,33 @@ fn frozen_cache(
     target: &Array2<f64>,
     rho: &SaeManifoldRho,
 ) -> (SaeManifoldLoss, ArrowFactorCache) {
-    let mut t = term.clone();
-    let (_value, loss, cache) = t
+    let (_anchor, loss, cache) = anchored_frozen_cache(term, target, rho);
+    (loss, cache)
+}
+
+/// [`frozen_cache`] that also HANDS BACK the state the cache was built on, with
+/// the three per-assembly frozen gates ([`SaeManifoldTerm::decoder_repulsion_gate`],
+/// `barrier_coactivation_gate`, `amplitude_barrier_gate`) pinned by
+/// `streaming_gates_frozen`.
+///
+/// #2828 — this distinction is load-bearing for any finite difference of the
+/// assembled gradient. `SaeManifoldTerm::clone` deliberately DROPS all three
+/// gates and resets `streaming_gates_frozen`, and `assemble_arrow_schur`
+/// refreshes them from whatever state it is called on. A gate is a
+/// lagged-diffusivity constant: the objective the inner Newton step minimises,
+/// whose value the line search reads off `penalized_objective_total`, and whose
+/// Hessian `A` is, all hold it FIXED. Differencing a gradient across endpoints
+/// that each re-derive their own gate therefore measures `∇²P + d(gate)/dθ`
+/// terms belonging to no operator at all. `tests_logdet_adjoint_780` and
+/// `tests_indefinite_a_refusal_2336` already carry this discipline; the returned
+/// anchor is how the gates in this file get it.
+fn anchored_frozen_cache(
+    term: &SaeManifoldTerm,
+    target: &Array2<f64>,
+    rho: &SaeManifoldRho,
+) -> (SaeManifoldTerm, SaeManifoldLoss, ArrowFactorCache) {
+    let mut anchor = term.clone();
+    let (_value, loss, cache) = anchor
         .penalized_quasi_laplace_criterion_with_cache(
             target.view(),
             rho,
@@ -156,7 +181,20 @@ fn frozen_cache(
             1.0e-6,
         )
         .expect("threshold-gate fixed-theta cache");
-    (loss, cache)
+    anchor.streaming_gates_frozen = true;
+    (anchor, loss, cache)
+}
+
+/// A finite-difference endpoint of `anchor`: a clone that keeps the anchor's
+/// three frozen gates instead of re-deriving its own. See
+/// [`anchored_frozen_cache`].
+fn frozen_gate_endpoint(anchor: &SaeManifoldTerm) -> SaeManifoldTerm {
+    let mut endpoint = anchor.clone();
+    endpoint.decoder_repulsion_gate = anchor.decoder_repulsion_gate.clone();
+    endpoint.barrier_coactivation_gate = anchor.barrier_coactivation_gate.clone();
+    endpoint.amplitude_barrier_gate = anchor.amplitude_barrier_gate;
+    endpoint.streaming_gates_frozen = true;
+    endpoint
 }
 
 /// Total number of spectrally/gauge deflated per-row directions in a cache. The
@@ -845,16 +883,21 @@ fn threshold_gate_coordinate_block_theta_adjoint_matches_finite_difference_2500(
 #[test]
 fn dense_exact_a_matches_finite_difference_of_the_kkt_gradient_2330() {
     let (term, target, rho) = threshold_gate_tiny_fixture(false);
-    let (_loss, cache) = frozen_cache(&term, &target, &rho);
+    // #2828 — ONE anchored state owns both sides of this comparison. Previously
+    // `A` was built on the fixture term (whose three per-assembly gates are
+    // `None`) against a cache built inside a throwaway clone (whose gates are
+    // live), and each `±h` endpoint re-derived gates of its own. See
+    // `anchored_frozen_cache`.
+    let (anchor, _loss, cache) = anchored_frozen_cache(&term, &target, &rho);
     assert_eq!(
-        deflated_direction_count(&term, &cache),
+        deflated_direction_count(&anchor, &cache),
         0,
         "#2330 FD gate: the below-threshold arm must be deflation-free, or the +/-h \
          endpoints can straddle a discrete deflation change and the central \
          difference stops being a difference of one smooth branch"
     );
 
-    let a = term
+    let a = anchor
         .materialize_exact_hessian_dense(&rho, target.view(), &cache)
         .expect("dense exact A at the frozen fixture mode");
     let total_t = cache.delta_t_len();
@@ -902,6 +945,59 @@ fn dense_exact_a_matches_finite_difference_of_the_kkt_gradient_2330() {
     };
 
     let h = 1.0e-5_f64;
+
+    // #2828 PREMISE CHECK. `dg/dθ` is only the Hessian of the objective if `g`
+    // is that objective's gradient. `penalized_objective_total` is the scalar the
+    // inner line search ranks — `loss` PLUS the registry, the decoder repulsion
+    // and the two collapse-prevention barriers — so assert `g == ∇P` coordinate
+    // by coordinate BEFORE differencing it again. Without this the gate cannot
+    // tell "A is wrong" from "g is not a gradient", which is exactly the
+    // ambiguity that left #2330 open: the β half of `g` carries decoder-prior
+    // forces that `loss` alone does not see.
+    {
+        let mut base = frozen_gate_endpoint(&anchor);
+        let g0 = gradient(&mut base);
+        let mut worst = 0.0_f64;
+        let mut worst_idx = 0usize;
+        for idx in 0..dim {
+            let mut e = Array1::<f64>::zeros(dim);
+            e[idx] = 1.0;
+            let e_t = e.slice(s![0..total_t]).to_owned();
+            let e_beta = e.slice(s![total_t..dim]).to_owned();
+            let mut plus = frozen_gate_endpoint(&anchor);
+            plus.apply_newton_step(e_t.view(), e_beta.view(), h)
+                .expect("positive objective endpoint");
+            let mut minus = frozen_gate_endpoint(&anchor);
+            minus
+                .apply_newton_step(
+                    e_t.mapv(|value| -value).view(),
+                    e_beta.mapv(|value| -value).view(),
+                    h,
+                )
+                .expect("negative objective endpoint");
+            let fd = (plus
+                .penalized_objective_total(target.view(), &rho, None, 1.0)
+                .expect("positive penalized objective")
+                - minus
+                    .penalized_objective_total(target.view(), &rho, None, 1.0)
+                    .expect("negative penalized objective"))
+                / (2.0 * h);
+            let error = (g0[idx] - fd).abs();
+            if error > worst {
+                worst = error;
+                worst_idx = idx;
+            }
+        }
+        assert!(
+            worst <= 1.0e-6,
+            "#2330 FD gate premise: the assembled (gt, gb) is NOT the gradient of \
+             `penalized_objective_total`; worst coordinate error {worst:.6e} at index \
+             {worst_idx} (of {total_t} coordinate + {k} border). A central difference of \
+             a non-gradient is not a Hessian, so nothing below this line would mean \
+             anything."
+        );
+    }
+
     // TWO directions, so the gate cannot pass by being blind in one block. A
     // coordinate-axis probe would test a single column of `A` and could miss an
     // entire mis-assembled sub-block, so both probes are dense and deterministic
@@ -943,7 +1039,7 @@ fn dense_exact_a_matches_finite_difference_of_the_kkt_gradient_2330() {
         // never reached its own comparison. Measured on `bc5d6bdde`: it dies at
         // this line with `got -0.00001`.
         let endpoint = |sign: f64| -> Array1<f64> {
-            let mut moved = term.clone();
+            let mut moved = frozen_gate_endpoint(&anchor);
             let signed_t = v_t.mapv(|value| sign * value);
             let signed_beta = v_beta.mapv(|value| sign * value);
             moved
@@ -979,21 +1075,33 @@ fn dense_exact_a_matches_finite_difference_of_the_kkt_gradient_2330() {
         // Report the directional pair as well as the worst component: a ratio of
         // -1 is a SIGN convention and a ratio of 2 is a majorization leak, and
         // neither is distinguishable from noise if only a magnitude is printed.
+        // #2828 also reports WHICH block the worst component is in and each
+        // block's own residual, because the three blocks have independent
+        // owners: `tt`/`tβ` come from the row jets and `ΔC`'s residual-curvature
+        // legs, `ββ` from the decoder-prior curvature.
         let directional = analytic.dot(&v);
         let directional_fd = fd.dot(&v);
+        let block_residual = |lo: usize, hi: usize| -> f64 {
+            (lo..hi).fold(0.0_f64, |acc, idx| acc.max((analytic[idx] - fd[idx]).abs()))
+        };
+        let block_of = |idx: usize| if idx < total_t { "t" } else { "beta" };
         assert!(
             worst <= 1.0e-4,
             "#2330: the dense exact A is NOT the second derivative of the penalized \
              objective whose gradient the inner solve drives to zero. Worst component \
-             relative error {worst:.6e} at index {worst_idx} (A.v={:.9e}, FD={:.9e}); \
-             |A.v|={analytic_norm:.6e} |FD|={fd_norm:.6e}; v'Av={directional:.9e} vs \
-             v'(dg/dtheta)v={directional_fd:.9e} (ratio {:.6e}). If this fires, the \
-             IndefiniteObservedInformation refusal is measuring the wrong operator, the \
-             converged-but-indefinite verdict is an artefact of the refusal site rather \
-             than a saddle upstream, and the negative-curvature escape is the WRONG fix. \
-             Probe: {label}, h={h:.3e}",
+             relative error {worst:.6e} at index {worst_idx} (block {}, A.v={:.9e}, \
+             FD={:.9e}); |A.v|={analytic_norm:.6e} |FD|={fd_norm:.6e}; \
+             max|A.v-FD| over the t block = {:.6e}, over the beta block = {:.6e}; \
+             v'Av={directional:.9e} vs v'(dg/dtheta)v={directional_fd:.9e} (ratio \
+             {:.6e}). If this fires, the IndefiniteObservedInformation refusal is \
+             measuring the wrong operator, the converged-but-indefinite verdict is an \
+             artefact of the refusal site rather than a saddle upstream, and the \
+             negative-curvature escape is the WRONG fix. Probe: {label}, h={h:.3e}",
+            block_of(worst_idx),
             analytic[worst_idx],
             fd[worst_idx],
+            block_residual(0, total_t),
+            block_residual(total_t, dim),
             directional_fd / directional,
         );
     }
@@ -1040,3 +1148,4 @@ fn threshold_gate_priced_clamp_theta_diagonal_matches_finite_difference_2820() {
         assert_eq!(fixed_derivative[slot], if atom == 0 { 0.0 } else { derivative[slot] });
     }
 }
+

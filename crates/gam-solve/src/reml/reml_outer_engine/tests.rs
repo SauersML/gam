@@ -7,6 +7,36 @@
 #![cfg(test)]
 
 use super::*;
+
+#[test]
+fn firth_hard_pseudo_rank_is_invariant_to_competing_smoothing_strengths() {
+    let design = array![[1.0, 0.0, 0.0]];
+    let weak_penalty = array![[0.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 0.0]];
+    let alias = Array2::<f64>::zeros((3, 3));
+    let structural_rank =
+        DenseSpectralOperator::structural_rank_from_spans(&design, &[weak_penalty.clone(), alias])
+            .expect("structural span rank");
+    assert_eq!(
+        structural_rank, 2,
+        "a true structural alias must remain absent"
+    );
+
+    for dominant_strength in [1.0, 1.0e8, 1.0e13] {
+        let h = array![
+            [dominant_strength, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [0.0, 0.0, 0.0]
+        ];
+        let op = DenseSpectralOperator::from_symmetric_with_mode_and_structural_rank(
+            &h,
+            PseudoLogdetMode::HardPseudo,
+            Some(structural_rank),
+        )
+        .expect("hard-pseudo factorization");
+        assert_eq!(op.active_rank(), 2);
+        assert_relative_eq!(op.trace_hinv_product(&weak_penalty), 1.0, epsilon = 1e-12);
+    }
+}
 use crate::estimate::smooth_floor_dp;
 use crate::estimate::smoothing_correction::DP_FLOOR;
 use approx::assert_relative_eq;
@@ -6686,7 +6716,8 @@ pub(crate) fn test_symmetric_eigen_diagonal() {
 pub(crate) fn test_pseudoinverse_times_vec_identity() {
     let eye = Array2::<f64>::eye(3);
     let v = Array1::from_vec(vec![1.0, 2.0, 3.0]);
-    let result = pseudoinverse_times_vec(&eye, v.as_slice().expect("contiguous test vector"), 1e-8).expect("pseudoinverse");
+    let result = pseudoinverse_times_vec(&eye, v.as_slice().expect("contiguous test vector"), 1e-8)
+        .expect("pseudoinverse");
     for i in 0..3 {
         assert!((result[i] - v[i]).abs() < 1e-12, "G=I: G⁺v should equal v");
     }
@@ -6701,7 +6732,8 @@ pub(crate) fn test_pseudoinverse_times_vec_singular() {
     g[[1, 0]] = 1.0;
     g[[1, 1]] = 1.0;
     let v = Array1::from_vec(vec![2.0, 0.0]);
-    let result = pseudoinverse_times_vec(&g, v.as_slice().expect("contiguous test vector"), 1e-8).expect("pseudoinverse");
+    let result = pseudoinverse_times_vec(&g, v.as_slice().expect("contiguous test vector"), 1e-8)
+        .expect("pseudoinverse");
     // G⁺ v = [0.25*2 + 0.25*0; 0.25*2 + 0.25*0] = [0.5; 0.5]
     assert!((result[0] - 0.5).abs() < 1e-10);
     assert!((result[1] - 0.5).abs() < 1e-10);
@@ -7020,7 +7052,8 @@ pub(crate) fn test_pseudoinverse_scalar() {
     let mut g = Array2::<f64>::zeros((1, 1));
     g[[0, 0]] = 4.0;
     let v = Array1::from_vec(vec![8.0]);
-    let result = pseudoinverse_times_vec(&g, v.as_slice().expect("contiguous test vector"), 1e-8).expect("pseudoinverse");
+    let result = pseudoinverse_times_vec(&g, v.as_slice().expect("contiguous test vector"), 1e-8)
+        .expect("pseudoinverse");
     assert!((result[0] - 2.0).abs() < 1e-12);
 }
 
@@ -8662,7 +8695,12 @@ fn trace_logdet_block_root_prices_channel_b_at_root_scale() {
 /// Build the box row `gam-terms/src/smooth/term_design.rs` assembles for
 /// `linear(x, min=LO, max=HI)`: `+e_col ≥ LO` and `−e_col ≥ −HI`, entries
 /// exactly `±1`, in ORIGINAL coefficient coordinates.
-fn box_rows_as_assembled(p: usize, col: usize, lo: f64, hi: f64) -> crate::pirls::LinearInequalityConstraints {
+fn box_rows_as_assembled(
+    p: usize,
+    col: usize,
+    lo: f64,
+    hi: f64,
+) -> crate::pirls::LinearInequalityConstraints {
     let mut a = ndarray::Array2::<f64>::zeros((2, p));
     a[[0, col]] = 1.0;
     a[[1, col]] = -1.0;
@@ -8675,7 +8713,8 @@ fn barrier_recognizes_a_box_row_that_carries_a_unit_entry() {
     // this is the case the pre-#2705 recognizer handled. It must be unchanged,
     // and unchanged BIT-FOR-BIT — the normalization divides by |val| == 1.0.
     let raw = box_rows_as_assembled(3, 1, 0.25, 4.0);
-    let cfg = BarrierConfig::from_constraints(Some(&raw)).expect("unit-entry box is a simple bound");
+    let cfg =
+        BarrierConfig::from_constraints(Some(&raw)).expect("unit-entry box is a simple bound");
     assert_eq!(cfg.constrained_indices, vec![1, 1]);
     assert_eq!(cfg.bound_signs, vec![1.0, -1.0]);
     assert_eq!(cfg.lower_bounds, vec![0.25, -4.0]);
@@ -8826,8 +8865,11 @@ impl HessianDerivativeProvider for NoDrift {
 fn spd(diagonal: [f64; 2]) -> Arc<dyn HessianFactorization> {
     let matrix = array![[diagonal[0], 0.0], [0.0, diagonal[1]]];
     Arc::new(
-        DenseSpectralOperator::from_symmetric_with_mode(&matrix, PseudoLogdetMode::PositiveDefinite)
-            .expect("SPD fixture factorizes"),
+        DenseSpectralOperator::from_symmetric_with_mode(
+            &matrix,
+            PseudoLogdetMode::PositiveDefinite,
+        )
+        .expect("SPD fixture factorizes"),
     )
 }
 
@@ -8979,7 +9021,9 @@ pub(crate) fn criterion_value_is_invariant_to_listing_a_zero_multiplier_active_r
     let mut h = xtx.clone();
     h.scaled_add(lambdas[0], &s1);
     h.scaled_add(lambdas[1], &s2);
-    let beta_hat = DenseSpectralOperator::from_symmetric(&h).unwrap().solve(&xty);
+    let beta_hat = DenseSpectralOperator::from_symmetric(&h)
+        .unwrap()
+        .solve(&xty);
     // Certify the premise rather than assume it: at this β̂ the penalized
     // gradient is zero, so every multiplier of every row is zero and no row
     // can be "binding" in any sense the criterion is entitled to price.
@@ -8997,8 +9041,8 @@ pub(crate) fn criterion_value_is_invariant_to_listing_a_zero_multiplier_active_r
             include_logdet_h: true,
             include_logdet_s: true,
         };
-        sol.active_constraints = active
-            .map(|a| std::sync::Arc::new(ActiveLinearConstraintBlock { a }));
+        sol.active_constraints =
+            active.map(|a| std::sync::Arc::new(ActiveLinearConstraintBlock { a }));
         reml_laml_evaluate(&sol, &rho, EvalMode::ValueOnly, None)
             .expect("the criterion must evaluate in both descriptions")
             .cost

@@ -58,11 +58,12 @@ env:
   # registry is already populated under ~/.cargo).  Does not affect the
   # rustc invocation, so does not invalidate Swatinem/rust-cache keys.
   CARGO_REGISTRIES_CRATES_IO_PROTOCOL: sparse
-  # The wheel matrix is a publication boundary, so every compiled wheel must
-  # prove real reuse from the shared content-addressed compiler cache. Merely
-  # enabling a cache is not evidence: each job zeroes its counters immediately
-  # before compilation and refuses publication when the measured hit count is zero.
+  # Measure wrapper use and cache health. A valid cold build seeds the cache;
+  # cache history must not determine whether an artifact can be published.
   SCCACHE_GHA_ENABLED: "true"
+  # Long LTO requests must not outlive the daemon or erase its receipt.
+  # Each lane explicitly stops its daemon once compilation is finished.
+  SCCACHE_IDLE_TIMEOUT: "0"
 
 jobs:
   # Validate the immutable source commit before the matrix fans out.
@@ -89,6 +90,9 @@ jobs:
             exit 1
           fi
           echo "Release source is immutable commit $actual."
+
+      - name: Verify release-cache policy
+        run: python3 -m unittest discover -s scripts/tests -p test_release_cache.py -v
 
       # Resolve metadata once before the matrix fans out. Running without
       # --locked is deliberate in this ephemeral checkout: Cargo can reveal the
@@ -152,41 +156,16 @@ jobs:
           # and the build panics. Trust the mounted tree before the build runs.
           before-script-linux: |
             git config --global --add safe.directory '*'
-            # maturin-action runs this definition in the same container shell
-            # that later invokes maturin. The function therefore brackets the
-            # real compiler invocation with target-local counters and turns a
-            # zero-hit build into a hard refusal before any artifact upload.
+            source .github/scripts/release-cache.sh
+            # This function runs after maturin-action installs sccache and in
+            # the same container as the actual compiler and its cache daemon.
             maturin() {
-              sccache --start-server
-              # maturin-action exports RUSTC_WRAPPER in its Node process, but
-              # Docker receives an empty value on this route. Bind Cargo to the
-              # executable that was just installed inside this container.
-              export RUSTC_WRAPPER="$(command -v sccache)"
-              sccache --zero-stats
+              trap 'sccache --stop-server' EXIT
+              release_cache_start || return $?
               local status=0
               command maturin "$@" || status=$?
-              local stats hits misses errors
-              stats=$(sccache --show-stats)
-              printf '%s\n' "$stats"
-              hits=$(awk '$1 == "Cache" && $2 == "hits" { print $3; exit }' <<< "$stats")
-              misses=$(awk '$1 == "Cache" && $2 == "misses" { print $3; exit }' <<< "$stats")
-              errors=$(awk '$1 == "Cache" && ($2 == "errors" || $2 == "read" || $2 == "write") { total += $NF } END { print total + 0 }' <<< "$stats")
-              if (( status != 0 )); then
-                return "$status"
-              fi
-              if [[ ! "${hits:-}" =~ ^[0-9]+$ || ! "${misses:-}" =~ ^[0-9]+$ || ! "${errors:-}" =~ ^[0-9]+$ ]]; then
-                echo "::error::Could not parse the complete in-container sccache receipt; refusing an unmeasured wheel build."
-                return 1
-              fi
-              if (( hits == 0 )); then
-                echo "::error::Wheel target reused zero compiler objects; refusing a cold publication build."
-                return 1
-              fi
-              if (( errors != 0 )); then
-                echo "::error::Wheel target reported ${errors} cache error(s); refusing an incomplete warm-cache receipt."
-                return 1
-              fi
-              echo "Measured warm wheel build: hits=${hits}, misses=${misses}, cache errors=0."
+              release_cache_verify || status=1
+              return "$status"
             }
       - uses: actions/upload-artifact@v4
         with:
@@ -234,41 +213,14 @@ jobs:
           # blocking build.rs's `git log` author gate.
           before-script-linux: |
             git config --global --add safe.directory '*'
-            # maturin-action runs this definition in the same container shell
-            # that later invokes maturin. The function therefore brackets the
-            # real compiler invocation with target-local counters and turns a
-            # zero-hit build into a hard refusal before any artifact upload.
+            source .github/scripts/release-cache.sh
             maturin() {
-              sccache --start-server
-              # maturin-action exports RUSTC_WRAPPER in its Node process, but
-              # Docker receives an empty value on this route. Bind Cargo to the
-              # executable that was just installed inside this container.
-              export RUSTC_WRAPPER="$(command -v sccache)"
-              sccache --zero-stats
+              trap 'sccache --stop-server' EXIT
+              release_cache_start || return $?
               local status=0
               command maturin "$@" || status=$?
-              local stats hits misses errors
-              stats=$(sccache --show-stats)
-              printf '%s\n' "$stats"
-              hits=$(awk '$1 == "Cache" && $2 == "hits" { print $3; exit }' <<< "$stats")
-              misses=$(awk '$1 == "Cache" && $2 == "misses" { print $3; exit }' <<< "$stats")
-              errors=$(awk '$1 == "Cache" && ($2 == "errors" || $2 == "read" || $2 == "write") { total += $NF } END { print total + 0 }' <<< "$stats")
-              if (( status != 0 )); then
-                return "$status"
-              fi
-              if [[ ! "${hits:-}" =~ ^[0-9]+$ || ! "${misses:-}" =~ ^[0-9]+$ || ! "${errors:-}" =~ ^[0-9]+$ ]]; then
-                echo "::error::Could not parse the complete in-container sccache receipt; refusing an unmeasured wheel build."
-                return 1
-              fi
-              if (( hits == 0 )); then
-                echo "::error::Wheel target reused zero compiler objects; refusing a cold publication build."
-                return 1
-              fi
-              if (( errors != 0 )); then
-                echo "::error::Wheel target reported ${errors} cache error(s); refusing an incomplete warm-cache receipt."
-                return 1
-              fi
-              echo "Measured warm wheel build: hits=${hits}, misses=${misses}, cache errors=0."
+              release_cache_verify || status=1
+              return "$status"
             }
       - uses: actions/upload-artifact@v4
         with:
@@ -297,14 +249,17 @@ jobs:
           python-version: '3.x'
       - name: Set up shared compiler cache
         uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
+        with:
+          # Our measured receipt precedes explicit daemon shutdown. The action
+          # post hook would restart an empty daemon just to print zero stats.
+          disable_annotations: true
       - name: Require reachable shared compiler cache
         shell: bash
         run: |
           set -euo pipefail
-          sccache --start-server
-          echo "RUSTC_WRAPPER=sccache" >> "$GITHUB_ENV"
-          sccache --show-stats
-          sccache --zero-stats
+          source .github/scripts/release-cache.sh
+          release_cache_start
+          echo "RUSTC_WRAPPER=$RUSTC_WRAPPER" >> "$GITHUB_ENV"
       - name: Build macOS wheels
         uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1.51.0
         with:
@@ -318,33 +273,21 @@ jobs:
             --strip
             --out dist
             --manifest-path crates/gam-pyffi/Cargo.toml
-      - name: Require measured warm compiler-cache reuse
+      - name: Require measured compiler-cache health
         shell: bash
         run: |
           set -euo pipefail
-          stats=$(sccache --show-stats)
-          printf '%s\n' "$stats"
-          hits=$(awk '$1 == "Cache" && $2 == "hits" { print $3; exit }' <<< "$stats")
-          misses=$(awk '$1 == "Cache" && $2 == "misses" { print $3; exit }' <<< "$stats")
-          errors=$(awk '$1 == "Cache" && ($2 == "errors" || $2 == "read" || $2 == "write") { total += $NF } END { print total + 0 }' <<< "$stats")
-          if [[ ! "${hits:-}" =~ ^[0-9]+$ || ! "${misses:-}" =~ ^[0-9]+$ || ! "${errors:-}" =~ ^[0-9]+$ ]]; then
-            echo "::error::Could not parse the complete sccache receipt; refusing an unmeasured wheel build."
-            exit 1
-          fi
-          if (( hits == 0 )); then
-            echo "::error::Wheel target reused zero compiler objects; refusing a cold publication build."
-            exit 1
-          fi
-          if (( errors != 0 )); then
-            echo "::error::Wheel target reported ${errors} cache error(s); refusing an incomplete warm-cache receipt."
-            exit 1
-          fi
-          echo "Measured warm wheel build: hits=${hits}, misses=${misses}, cache errors=0."
+          source .github/scripts/release-cache.sh
+          release_cache_verify
       - uses: actions/upload-artifact@v4
         with:
           name: wheels-macos-${{ matrix.platform.target }}
           path: dist/*.whl
           if-no-files-found: error
+      - name: Stop compiler cache
+        if: always()
+        shell: bash
+        run: sccache --stop-server
 
   windows:
     needs: gate
@@ -366,14 +309,16 @@ jobs:
           architecture: ${{ matrix.target }}
       - name: Set up shared compiler cache
         uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
+        with:
+          disable_annotations: true
       - name: Require reachable shared compiler cache
-        shell: pwsh
+        shell: bash
         run: |
-          sccache --start-server
-          if ($LASTEXITCODE -ne 0) { throw 'Shared sccache backend is unreachable; refusing a cold wheel build.' }
-          "RUSTC_WRAPPER=sccache" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-          sccache --show-stats
-          sccache --zero-stats
+          set -euo pipefail
+          source .github/scripts/release-cache.sh
+          release_cache_start
+          # Cargo is a native Windows executable, so use its native path.
+          echo "RUSTC_WRAPPER=$(cygpath -w "$RUSTC_WRAPPER")" >> "$GITHUB_ENV"
       - name: Build Windows wheels
         uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1.51.0
         with:
@@ -387,28 +332,21 @@ jobs:
             --strip
             --out dist
             --manifest-path crates/gam-pyffi/Cargo.toml
-      - name: Require measured warm compiler-cache reuse
-        shell: pwsh
+      - name: Require measured compiler-cache health
+        shell: bash
         run: |
-          $stats = (sccache --show-stats | Out-String)
-          Write-Host $stats
-          $hitMatch = [regex]::Match($stats, '(?m)^Cache hits\s+(\d+)\s*$')
-          $missMatch = [regex]::Match($stats, '(?m)^Cache misses\s+(\d+)\s*$')
-          $errorMatches = [regex]::Matches($stats, '(?m)^Cache (?:read |write )?errors\s+(\d+)\s*$')
-          if (-not $hitMatch.Success -or -not $missMatch.Success -or $errorMatches.Count -ne 3) {
-            throw 'Could not parse the complete sccache receipt; refusing an unmeasured wheel build.'
-          }
-          $hits = [int]$hitMatch.Groups[1].Value
-          $misses = [int]$missMatch.Groups[1].Value
-          $errors = ($errorMatches | ForEach-Object { [int]$_.Groups[1].Value } | Measure-Object -Sum).Sum
-          if ($hits -eq 0) { throw 'Wheel target reused zero compiler objects; refusing a cold publication build.' }
-          if ($errors -ne 0) { throw "Wheel target reported $errors cache error(s); refusing an incomplete warm-cache receipt." }
-          Write-Host "Measured warm wheel build: hits=$hits, misses=$misses, cache errors=0."
+          set -euo pipefail
+          source .github/scripts/release-cache.sh
+          release_cache_verify
       - uses: actions/upload-artifact@v4
         with:
           name: wheels-windows-${{ matrix.target }}
           path: dist/*.whl
           if-no-files-found: error
+      - name: Stop compiler cache
+        if: always()
+        shell: bash
+        run: sccache --stop-server
 
   sdist:
     needs: gate

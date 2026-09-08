@@ -140,10 +140,7 @@ impl<'a> RemlState<'a> {
     /// actually is — is not part of that search, and charging it there would
     /// make a work guard read a covariance refinement as an outer-loop
     /// regression (#2728).
-    pub(crate) fn compute_cost_uncharged(
-        &self,
-        p: &Array1<f64>,
-    ) -> Result<f64, EstimationError> {
+    pub(crate) fn compute_cost_uncharged(&self, p: &Array1<f64>) -> Result<f64, EstimationError> {
         self.compute_cost_charging(p, 0, false)
     }
 
@@ -1352,6 +1349,40 @@ impl<'a> RemlState<'a> {
         } else {
             PseudoLogdetMode::Smooth
         };
+        let firth_structural_rank = if hessian_mode == PseudoLogdetMode::HardPseudo {
+            let design = bundle
+                .firth_dense_operator
+                .as_ref()
+                .expect("HardPseudo is selected only for a Firth operator")
+                .x_dense
+                .clone();
+            let penalties: Vec<Array2<f64>> = self
+                .canonical_penalties
+                .iter()
+                .map(|penalty| {
+                    let mut full = Array2::<f64>::zeros((penalty.total_dim, penalty.total_dim));
+                    full.slice_mut(ndarray::s![
+                        penalty.col_range.clone(),
+                        penalty.col_range.clone()
+                    ])
+                    .assign(&penalty.local);
+                    if let Some(z) = free_basis_opt.as_ref() {
+                        Self::projectwith_basis(&full, z)
+                    } else {
+                        full
+                    }
+                })
+                .collect();
+            Some(
+                DenseSpectralOperator::structural_rank_from_spans(&design, &penalties).map_err(
+                    |error| {
+                        EstimationError::InvalidInput(format!("Firth structural span: {error}"))
+                    },
+                )?,
+            )
+        } else {
+            None
+        };
 
         let c_nontrivial = pirls_result.solve_c_nontrivial;
 
@@ -1399,9 +1430,10 @@ impl<'a> RemlState<'a> {
             ) {
                 Ok(chol_op) => std::sync::Arc::new(chol_op),
                 Err(_) => std::sync::Arc::new(
-                    DenseSpectralOperator::from_symmetric_with_mode(
+                    DenseSpectralOperator::from_symmetric_with_mode_and_structural_rank(
                         h_for_operator.as_ref(),
                         hessian_mode,
+                        firth_structural_rank,
                     )
                     .map_err(|e| {
                         EstimationError::InvalidInput(format!(
@@ -1412,9 +1444,10 @@ impl<'a> RemlState<'a> {
             }
         } else {
             std::sync::Arc::new(
-                DenseSpectralOperator::from_symmetric_with_mode(
+                DenseSpectralOperator::from_symmetric_with_mode_and_structural_rank(
                     h_for_operator.as_ref(),
                     hessian_mode,
+                    firth_structural_rank,
                 )
                 .map_err(|e| {
                     EstimationError::InvalidInput(format!(
@@ -1496,17 +1529,18 @@ impl<'a> RemlState<'a> {
         // differentiates it. `InnerSolution::hessian_logdet_correction` keeps
         // its documented meaning — a uniform curvature rescale — and nothing
         // else.
-        let penalty_subspace_trace =
-            if matches!(hessian_mode, PseudoLogdetMode::Smooth) && c_nontrivial {
-                let (log_det_h_plus, kernel) =
-                    Self::intrinsic_hessian_pseudo_logdet_parts(h_for_operator.as_ref(), penalty_rank)?;
-                kernel.map(|mut kernel| {
-                    kernel.logdet_correction = log_det_h_plus - hessian_op.logdet();
-                    std::sync::Arc::new(kernel)
-                })
-            } else {
-                None
-            };
+        let penalty_subspace_trace = if matches!(hessian_mode, PseudoLogdetMode::Smooth)
+            && c_nontrivial
+        {
+            let (log_det_h_plus, kernel) =
+                Self::intrinsic_hessian_pseudo_logdet_parts(h_for_operator.as_ref(), penalty_rank)?;
+            kernel.map(|mut kernel| {
+                kernel.logdet_correction = log_det_h_plus - hessian_op.logdet();
+                std::sync::Arc::new(kernel)
+            })
+        } else {
+            None
+        };
         let hessian_logdet_correction = 0.0_f64;
 
         // #1271 diagnostic: dump the REML logdet internals at every dense
@@ -1807,11 +1841,39 @@ impl<'a> RemlState<'a> {
         } else {
             PseudoLogdetMode::Smooth
         };
+        let firth_structural_rank = if hessian_mode == PseudoLogdetMode::HardPseudo {
+            let design = bundle
+                .firth_dense_operator_original
+                .as_ref()
+                .or(bundle.firth_dense_operator.as_ref())
+                .expect("HardPseudo is selected only for a Firth operator")
+                .x_dense
+                .clone();
+            let penalties: Vec<Array2<f64>> = self
+                .canonical_penalties
+                .iter()
+                .map(|penalty| {
+                    let mut full = Array2::<f64>::zeros((penalty.total_dim, penalty.total_dim));
+                    full.slice_mut(ndarray::s![
+                        penalty.col_range.clone(),
+                        penalty.col_range.clone()
+                    ])
+                    .assign(&penalty.local);
+                    full
+                })
+                .collect();
+            Some(
+                DenseSpectralOperator::structural_rank_from_spans(&design, &penalties).map_err(
+                    |error| {
+                        EstimationError::InvalidInput(format!("Firth structural span: {error}"))
+                    },
+                )?,
+            )
+        } else {
+            None
+        };
         let c_nontrivial = pirls_result.solve_c_nontrivial;
 
-        // Same Cholesky fast path as `build_dense_assembly`: for ValueOnly
-        // evaluations with `Smooth` mode (no Firth and no beta-dependent
-        // Hessian drift), LLT replaces eigh.
         // `build_dense_original_assembly` is only called when there is no
         // active constraint free-basis, so the no-hard-constraints condition
         // is always satisfied here.
@@ -1834,11 +1896,12 @@ impl<'a> RemlState<'a> {
             delta: ridge_passport.delta(),
         };
         let hessian_op: std::sync::Arc<dyn super::reml_outer_engine::HessianFactorization> = {
-            use super::reml_outer_engine::{DenseCholeskyOperator, HessianFactorization as _};
+            use super::reml_outer_engine::HessianFactorization as _;
             let build_spectral = || -> Result<DenseSpectralOperator, EstimationError> {
-                let mut op = DenseSpectralOperator::from_symmetric_with_mode(
+                let mut op = DenseSpectralOperator::from_symmetric_with_mode_and_structural_rank(
                     &h_total_original,
                     hessian_mode,
+                    firth_structural_rank,
                 )
                 .map_err(|e| {
                     EstimationError::InvalidInput(format!(
@@ -1866,47 +1929,23 @@ impl<'a> RemlState<'a> {
                 }
                 Ok(op)
             };
-            if mode == super::reml_outer_engine::EvalMode::ValueOnly
-                && matches!(hessian_mode, PseudoLogdetMode::Smooth)
-                && !c_nontrivial
-                && !force_spectral_logdet
-            {
-                match DenseCholeskyOperator::from_spd_with_smooth_logdet_agreement(
-                    &h_total_original,
-                ) {
-                    Ok(mut chol_op) => {
-                        // The Cholesky lane is the LINE SEARCH's lane, so it is
-                        // the one whose noise the optimizer actually walks on.
-                        // It gets the same upgrade, judged against the same
-                        // spectrum-derived budget — obtained here from one
-                        // eigenvalue pass over `h_total_original`, paid only on
-                        // the ill-conditioned branch that the resolution gate
-                        // below has already selected.
-                        let assembled = chol_op.logdet();
-                        if let Some(exact) = *bundle.root_scale_hessian_logdet.get_or_init(|| {
-                            let spectrum =
-                                super::laml_logdet::symmetric_spectrum(&h_total_original)?;
-                            if super::laml_logdet::assembled_logdet_is_resolved(
-                                &spectrum, assembled,
-                            ) {
-                                return None;
-                            }
-                            super::laml_logdet::root_scale_hessian_logdet(
-                                &root_inputs,
-                                &h_total_original,
-                                &spectrum,
-                                assembled,
-                            )
-                        }) {
-                            chol_op.install_root_scale_logdet(exact);
-                        }
-                        std::sync::Arc::new(chol_op)
-                    }
-                    Err(_) => std::sync::Arc::new(build_spectral()?),
-                }
-            } else {
-                std::sync::Arc::new(build_spectral()?)
+            // The scalar objective and its derivatives must be projections of
+            // one numerical operator.  A former value-only shortcut priced
+            // `log|H|` from Cholesky while derivative-bearing requests used the
+            // spectral operator.  At a legitimate lambda-infinity face the
+            // assembled natural-parameter Hessian is ill-conditioned enough
+            // that those factorizations resolve its smallest modes differently;
+            // the optimizer then ranked one surface and differentiated another
+            // (#2834).  Always use the spectral operator here.  This is not a
+            // fallback or an audit relaxation: it removes the second objective
+            // definition, while the root-scale logdet upgrade above still
+            // handles the conditioning wall when the assembled spectrum cannot.
+            if force_spectral_logdet {
+                log::trace!(
+                    "using the canonical spectral Hessian operator for moving-design coordinates"
+                );
             }
+            std::sync::Arc::new(build_spectral()?)
         };
 
         let e_for_logdet = &pirls_result.reparam_result.e_transformed;

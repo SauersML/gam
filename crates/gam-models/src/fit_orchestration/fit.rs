@@ -187,23 +187,6 @@ const SURVIVAL_TRANSFORMATION_PIRLS_MAX_STEP_HALVING: usize = 40;
 
 const SURVIVAL_TRANSFORMATION_PIRLS_MIN_STEP_SIZE: f64 = 1e-12;
 
-/// Bounded checkpoint reseeds for the survival-transformation outer search
-/// (#2373). The transformation LAML outer runs a gradient-only BFGS (it declares
-/// no analytic outer Hessian), and `opt::Bfgs`'s flat-valley `StallPolicy` gates
-/// its flat-stall exit on `‖g‖∞ ≤ tol·(1 + ‖ρ‖∞)`. In log-λ space a baseline
-/// penalty that rails near its box edge makes `‖ρ‖∞ ≈ 10`, so that factor
-/// inflates the stall gradient gate ~10×: BFGS reports "converged (flat/stalled)"
-/// at a checkpoint whose projected gradient still exceeds the UN-inflated
-/// terminal certificate bound, and the fit is refused with genuine (unexploited)
-/// interior descent still available. The refusal is arithmetically correct, so
-/// recovery is to keep optimizing: the accumulated inverse-Hessian metric that
-/// produced the sub-tolerance steps is the stall's cause, and a fresh-metric BFGS
-/// resume seeded AT the refused `rho_checkpoint` recovers the descent — exactly
-/// the resume the refusal message advertises. This bounds how many such
-/// fresh-metric resumes are attempted before the honest non-convergence is
-/// surfaced.
-const SURVIVAL_TRANSFORMATION_OUTER_STALL_RESTARTS: usize = 10;
-
 struct SurvivalLocationScaleProfile {
     fit: SurvivalLocationScaleTermFitResult,
     inverse_link: InverseLink,
@@ -581,193 +564,15 @@ mod standard_convergence_gate_tests {
     }
 }
 
-/// **Exact** Tweedie log-likelihood of a fit at a fixed variance power `p` — the
-/// profile objective maximized to estimate `p` (#2026 / #2105).
-///
-/// Refits the mean/dispersion GLM at `Tweedie { p }` reusing the existing fit
-/// machinery (no reimplementation), reconstructs the fitted mean
-/// `μ = exp(Xβ̂ + offset)` on the log link, and evaluates the **exact** Jørgensen
-/// compound-Poisson–gamma log-density (`gam_solve::pirls::tweedie_exact_loglik_total_from_eta`)
-/// at the estimated dispersion `φ̂(p)`.
-///
-/// CRITICAL (#2105): the objective must be the *exact* EDM density, NOT the
-/// separately named saddlepoint approximation. The saddlepoint is exact
-/// only in the many-jumps (large Poisson-rate λ) limit; at the moderate λ of a
-/// typical Tweedie fit its missing `O(1/λ)` normalizer correction, summed across
-/// the sample, biases the profile maximizer **low** (e.g. `p̂ ≈ 1.33` on `p = 1.5`
-/// data). Because the reported dispersion is the Pearson estimate
-/// `φ̂ = Σw(y−μ)²/μ^p / Σw`, an under-estimated `p` inflates `φ̂` and every SE /
-/// interval scaled by `√φ̂`. mgcv's `tw()` profiles `p` on the same exact series
-/// (`ldTweedie`) for exactly this reason.
-///
-/// Returns `Err(reason)` when the refit fails or yields a non-finite objective.
-/// The profile search skips such a node rather than aborting, but it KEEPS the
-/// reason: when every node is unusable the reason is the only thing that says
-/// what actually went wrong, and collapsing it to a bare `None` is what made
-/// `estimate_tweedie_power` blame degenerate data for what is usually an outer
-/// REML refusal (and advise pinning `family="tweedie(p)"`, which does not help).
-fn tweedie_profile_loglik(request: &StandardFitRequest<'_>, p: f64) -> Result<f64, String> {
-    if !gam_spec::is_valid_tweedie_power(p) {
-        return Err(format!("p={p} is not a valid Tweedie variance power"));
-    }
-    let family = LikelihoodSpec::new(ResponseFamily::Tweedie { p }, request.family.link.clone());
-    let fitted = fit_standard_base(request, &family, &request.options)
-        .map_err(|e| format!("the mean/dispersion refit at p={p:.4} failed: {e}"))?;
-    // μ = g⁻¹(Xβ̂ + offset); the Tweedie family is fixed to the log link by
-    // `resolve_family`, so g⁻¹ = exp. `design.apply` reproduces the fitted
-    // linear predictor exactly (same contract the expectile/predict paths use).
-    // `design.apply` already folds the design's fixed affine channel (non-zero
-    // B-spline endpoint anchor, #2297) into `Xβ̂`, so only the user offset is
-    // added here; adding `affine_offset` again would double-count the pin.
-    let mut eta = fitted
-        .design
-        .apply(fitted.fit.beta.view())
-        .map_err(|e| format!("applying the refit design at p={p:.4} failed: {e}"))?;
-    if eta.len() != request.y.len() {
-        return Err(format!(
-            "the refit at p={p:.4} produced {} linear-predictor rows, expected {}",
-            eta.len(),
-            request.y.len()
-        ));
-    }
-    eta += request.offset.as_ref();
-    let mu = eta.mapv(f64::exp);
-    // Profile the dispersion out at this `p` with the SAME prior-weighted Pearson
-    // moment estimator the inner solver uses to report the Tweedie `φ̂`
-    // (`estimate_tweedie_phi_from_eta`): `φ̂ = Σ wᵢ (yᵢ − μᵢ)² / μᵢ^p / Σ wᵢ`.
-    // Computing it here from the reconstructed mean makes the profile objective
-    // independent of whether the fit retained an inference/covariance block (the
-    // seed `φ = 1` carried on `likelihood_scale` would otherwise bias every node
-    // identically-but-wrongly) and gives each `p` its own maximized dispersion —
-    // the whole point of a profile likelihood.
-    const PHI_MIN: f64 = 1e-6;
-    const PHI_MAX: f64 = 1e12;
-    let mut weighted_pearson = 0.0_f64;
-    let mut total_weight = 0.0_f64;
-    for ((&yi, &mui), &wi) in request.y.iter().zip(mu.iter()).zip(request.weights.iter()) {
-        let wi = wi.max(0.0);
-        if wi == 0.0 {
-            continue;
-        }
-        let resid = yi - mui;
-        let var_unit = mui.powf(p).max(f64::MIN_POSITIVE);
-        weighted_pearson += wi * resid * resid / var_unit;
-        total_weight += wi;
-    }
-    if total_weight <= 0.0 || !weighted_pearson.is_finite() || weighted_pearson <= 0.0 {
-        return Err(format!(
-            "the profiled dispersion at p={p:.4} is unusable: weighted Pearson statistic \
-             {weighted_pearson:.6e} over total weight {total_weight:.6e}"
-        ));
-    }
-    let phi = (weighted_pearson / total_weight).clamp(PHI_MIN, PHI_MAX);
-    // Evaluate the EXACT compound-Poisson–gamma density at φ̂(p) — the profile
-    // objective mgcv's `tw()` maximizes. Using a saddlepoint here is what biased
-    // `p̂` low and inflated `φ̂` (#2105).
-    let ll = gam_solve::pirls::tweedie_exact_loglik_total_from_eta(
-        request.y.view(),
-        eta.view(),
-        request.weights.view(),
-        p,
-        phi,
-    )
-    .map_err(|e| {
-        format!("the exact compound-Poisson-gamma density at p={p:.4}, phi={phi:.6e} failed: {e}")
-    })?;
-    if !ll.is_finite() {
-        return Err(format!(
-            "the exact compound-Poisson-gamma density at p={p:.4}, phi={phi:.6e} is non-finite"
-        ));
-    }
-    Ok(ll)
-}
-
-/// Estimate the Tweedie variance power `p ∈ (1, 2)` by profile likelihood, mgcv
-/// `tw()`-style (#2026), via a **golden-section search** over the whole open
-/// interval `(1, 2)` — NO fixed node grid (SPEC: grid search is never allowed;
-/// #2064). The profile objective [`tweedie_profile_loglik`] (a full mean/
-/// dispersion refit at each `p`) is smooth and unimodal in `p` for the
-/// compound-Poisson-gamma law, so golden section brackets the maximizer directly
-/// and contracts the bracket by the golden ratio each step. The mean fit is
-/// robust to a misspecified `p`, but the observation-interval calibration is
-/// not, so this is what makes bare `family="tweedie"` track data whose true
-/// power ≠ 1.5.
-fn estimate_tweedie_power(request: &StandardFitRequest<'_>) -> Result<f64, String> {
-    // Endpoints excluded: the Tweedie unit-deviance / saddlepoint density is
-    // singular at p = 1 (Poisson) and p = 2 (gamma).
-    const EPS: f64 = 1e-3;
-    // Converge the bracket to this width in `p`; finer than the physically
-    // meaningful precision of the variance power.
-    const TOL: f64 = 1e-3;
-    let mut a = 1.0 + EPS;
-    let mut b = 2.0 - EPS;
-    let inv_phi_gr = (5.0_f64.sqrt() - 1.0) / 2.0; // 1/φ ≈ 0.618
-    // Keep the FIRST reason a node was rejected. Every `eval` that fails feeds
-    // `NEG_INFINITY` into the bracket, which is the right thing for the search
-    // but erases why; if no node is ever usable, this is the only surviving
-    // account of the cause.
-    let mut first_rejection: Option<String> = None;
-    let mut eval = |p: f64| match tweedie_profile_loglik(request, p) {
-        Ok(ll) => ll,
-        Err(reason) => {
-            first_rejection.get_or_insert(reason);
-            f64::NEG_INFINITY
-        }
-    };
-    // Iteration count DERIVED from the tolerance (not a magic cap): each step
-    // multiplies the bracket width by `inv_phi_gr`, so `n` steps with
-    // `(b−a)·inv_phi_gr^n ≤ TOL` guarantees convergence to `TOL`.
-    let n_iter = (((TOL / (b - a)).ln() / inv_phi_gr.ln()).ceil() as i64).max(1) as usize;
-    let mut c = b - inv_phi_gr * (b - a);
-    let mut d = a + inv_phi_gr * (b - a);
-    let mut fc = eval(c);
-    let mut fd = eval(d);
-    for _ in 0..n_iter {
-        if fc >= fd {
-            b = d;
-            d = c;
-            fd = fc;
-            c = b - inv_phi_gr * (b - a);
-            fc = eval(c);
-        } else {
-            a = c;
-            c = d;
-            fc = fd;
-            d = a + inv_phi_gr * (b - a);
-            fd = eval(d);
-        }
-    }
-    let p_hat = (0.5 * (a + b)).clamp(1.0 + EPS, 2.0 - EPS);
-    // A finite profile likelihood at the maximizer certifies the search found a
-    // usable optimum (degenerate data — every `p` non-finite — fails here rather
-    // than silently returning the interval midpoint).
-    //
-    // NAME THE ACTUAL CAUSE. The old message asserted "the profile likelihood is
-    // non-finite across (1, 2)" and advised pinning `family="tweedie(p)"`. That
-    // reads as a statement about the data, and it is the wrong advice whenever
-    // the real failure is the per-node refit refusing to certify a fit at all —
-    // in which case pinning `p` changes nothing, because the pinned fit takes
-    // exactly the same refusing path. The profile likelihood cannot even be said
-    // to be "non-finite" there: it was never evaluated.
-    if let Err(at_maximizer) = tweedie_profile_loglik(request, p_hat) {
-        let cause = first_rejection.as_deref().unwrap_or(at_maximizer.as_str());
-        return Err(format!(
-            "tweedie power profiling failed: no variance power in (1, 2) yielded a usable \
-             profile likelihood, so `p` could not be estimated. First cause: {cause}. At the \
-             bracket midpoint p={p_hat:.4}: {at_maximizer}. Pinning the power via \
-             family=\"tweedie(p)\" only helps if the profile refits themselves were sound."
-        ));
-    }
-    log::info!(
-        "[tweedie#2026] estimated variance power p={p_hat:.4} by golden-section profile \
-         likelihood (bare family=\"tweedie\"); set family=\"tweedie(p)\" to pin it."
-    );
-    Ok(p_hat)
-}
-
 pub(crate) fn fit_standard_model(
     mut request: StandardFitRequest<'_>,
 ) -> Result<StandardFitResult, String> {
+    if request.estimate_tweedie_p {
+        return Err(
+            "automatic Tweedie power profiling is derivative-free hyperparameter search and is forbidden by SPEC.md; supply an explicit p strictly between 1 and 2"
+                .to_string(),
+        );
+    }
     // #2750: resolve every AUTO measure-jet representer range against the
     // response, once, before anything reads the spec.
     //
@@ -800,24 +605,6 @@ pub(crate) fn fit_standard_model(
             "[#2750] screened the representer range of {seeded} auto measure-jet term(s) against \
              the response before the standard-fit dispatch"
         );
-    }
-    // #2026: magic-by-default Tweedie power. A bare `family="tweedie"`/`"tw"`
-    // arrives with a placeholder power and `estimate_tweedie_p = true`; profile
-    // `p` over (1, 2) by likelihood and bake the estimate into `family` so the
-    // reported fit — and every observation interval derived from it — uses the
-    // data-driven power rather than the interior fallback. An explicit
-    // `tweedie(1.6)` leaves the flag `false` and skips this entirely.
-    if request.estimate_tweedie_p
-        && matches!(request.family.response, ResponseFamily::Tweedie { .. })
-    {
-        let p_hat = estimate_tweedie_power(&request)?;
-        request.family = LikelihoodSpec::new(
-            ResponseFamily::Tweedie { p: p_hat },
-            request.family.link.clone(),
-        );
-        // The power is now pinned; the final fit below is an ordinary fixed-p
-        // Tweedie fit.
-        request.estimate_tweedie_p = false;
     }
 
     // #1762: near-perfect linear separation drives the binomial REML/ARC
@@ -951,6 +738,11 @@ pub(crate) fn fit_standard_model(
     wiggle_options.compute_covariance = true;
     let wiggle_link_kind =
         resolved_wiggle_inverse_link(&request.family, &result.fit, &wiggle.link_kind)?;
+    let fitted_wiggle_family = LikelihoodSpec::try_new(
+        request.family.response.clone(),
+        wiggle_link_kind.clone(),
+    )
+    .map_err(|error| format!("invalid resolved link-wiggle likelihood: {error}"))?;
     let selected_wiggle_basis = select_binomial_mean_link_wiggle_basis_from_pilot(
         &result.design,
         &result.fit,
@@ -987,7 +779,7 @@ pub(crate) fn fit_standard_model(
     // fixed at the root by `BinomialMeanWiggleFamily::joint_jeffreys_term_required
     // = false`; the loud `Err` below catches the residual trust-region/active-set
     // non-convergence that the root fix cannot.
-    let solved = match fit_binomial_mean_wiggle_terms_with_selected_basis(
+    let mut solved = match fit_binomial_mean_wiggle_terms_with_selected_basis(
         request.data.view(),
         &result.resolvedspec,
         &result.design,
@@ -1029,6 +821,11 @@ pub(crate) fn fit_standard_model(
                 .to_string(),
         );
     }
+    // The joint link-wiggle solver is a custom block family and therefore does
+    // not infer the observation-law metadata stored by the generic likelihood
+    // solver. Preserve the resolved response and inverse link explicitly;
+    // response-scale prediction after assembly or reload depends on it (#2748).
+    solved.fit.likelihood_family = Some(fitted_wiggle_family);
 
     Ok(StandardFitResult {
         saved_link_state: result.saved_link_state,
@@ -2197,92 +1994,49 @@ fn optimize_survival_transformation_smoothing(
     // in the error; a seed or best-so-far smoothing value is never promoted to
     // an estimator merely because a fixed-lambda inner solve was finite.
     //
-    // #2373 checkpoint resume: the gradient-only BFGS can bail on `opt::Bfgs`'s
-    // flat-valley `StallPolicy`, whose gradient gate is inflated by `(1 + ‖ρ‖∞)`
-    // — in log-λ space, ~10× — so it stops at a checkpoint that the un-inflated
-    // terminal certificate then rejects with real interior descent still on the
-    // table. The remedy the refusal itself advertises is to resume from
-    // `rho_checkpoint` with a fresh inverse-Hessian metric (the accumulated
-    // metric that crawled to sub-tolerance steps is the stall's cause). Each
-    // resume rebuilds the problem seeded at the prior checkpoint; `eval_at`'s
-    // warm-β cache is reused across resumes so the inner solves stay warm.
-    // Bounded so a genuine wall surfaces the honest non-convergence rather than
-    // spinning. A `run` that certifies on the first pass takes exactly one
-    // iteration of this loop, bit-for-bit as before.
-    let mut current_seed = seed_rho.clone();
-    let mut carried_iterations = 0usize;
-    let mut resumes_remaining = SURVIVAL_TRANSFORMATION_OUTER_STALL_RESTARTS;
-    let (outer_iterations, criterion_certificate, selected_rho) = loop {
-        let problem = OuterProblem::new(num_smoothing)
-            .with_gradient(Derivative::Analytic)
-            .with_hessian(gam_problem::DeclaredHessianForm::Unavailable)
-            .with_max_iter(120)
-            .with_bounds(lower.clone(), upper.clone())
-            .with_initial_rho(current_seed.clone())
-            .with_seed_config(gam_problem::SeedConfig {
-                max_seeds: 1,
-                seed_budget: 1,
-                ..Default::default()
-            });
-        let mut obj = problem.build_objective(
-            (),
-            |_: &mut (), rho: &Array1<f64>| eval_at(rho).map(|(c, _)| c),
-            |_: &mut (), rho: &Array1<f64>| {
-                let (cost, gradient) = eval_at(rho)?;
-                Ok(OuterEval {
-                    cost,
-                    gradient,
-                    hessian: HessianValue::Unavailable,
-                    inner_beta_hint: None,
-                })
-            },
-            None::<fn(&mut ())>,
-            None::<
-                fn(
-                    &mut (),
-                    &Array1<f64>,
-                )
-                    -> Result<gam_problem::EfsEval, gam_solve::estimate::EstimationError>,
-            >,
-        );
-        match problem.run(&mut obj, &context) {
-            // `run` certified the selected ρ: `iterations` (plus any carried
-            // from earlier resumes) is the true outer count and
-            // `criterion_certificate` carries the analytic stationarity bound the
-            // fit assembly gate requires (#2301 defect D).
-            Ok(result) => {
-                break (
-                    result.iterations.saturating_add(carried_iterations),
-                    result.criterion_certificate,
-                    result.rho,
-                );
-            }
-            Err(error) => {
-                // A flat-valley StallPolicy bail leaves a resumable
-                // `rho_checkpoint`; restart from it with a fresh BFGS metric
-                // while the resume budget lasts. Any other failure, or a spent
-                // budget, surfaces the honest non-convergence unchanged.
-                if resumes_remaining > 0
-                    && let gam_solve::estimate::EstimationError::RemlDidNotConverge {
-                        rho_checkpoint,
-                        iterations,
-                        ..
-                    } = &error
-                    && rho_checkpoint.len() == num_smoothing
-                {
-                    log::info!(
-                        "[OUTER] {context}: resuming from refused checkpoint {rho_checkpoint:?} \
-                         with a fresh BFGS metric ({resumes_remaining} resume(s) left)"
-                    );
-                    carried_iterations = carried_iterations.saturating_add(*iterations);
-                    resumes_remaining -= 1;
-                    current_seed = Array1::from_vec(rho_checkpoint.clone());
-                    continue;
-                }
-                return Err(error.to_string());
-            }
-        }
-    };
+    // The shared gradient-only outer route disables `opt`'s relative-stall
+    // predicate. That predicate scales its stationarity band by
+    // `(1 + ‖ρ‖∞)`, which is not the KKT contract for log smoothing
+    // parameters and used to stop this fit before the certificate's own band.
+    // Keep this caller on that single authoritative route: a refused result is
+    // non-convergence, not an invitation to rebuild BFGS with an arbitrary
+    // caller-owned retry budget.
+    let problem = OuterProblem::new(num_smoothing)
+        .with_gradient(Derivative::Analytic)
+        .with_hessian(gam_problem::DeclaredHessianForm::Unavailable)
+        .with_max_iter(120)
+        .with_bounds(lower.clone(), upper.clone())
+        .with_initial_rho(seed_rho.clone())
+        .with_seed_config(gam_problem::SeedConfig {
+            max_seeds: 1,
+            seed_budget: 1,
+            ..Default::default()
+        });
+    let mut obj = problem.build_objective(
+        (),
+        |_: &mut (), rho: &Array1<f64>| eval_at(rho).map(|(c, _)| c),
+        |_: &mut (), rho: &Array1<f64>| {
+            let (cost, gradient) = eval_at(rho)?;
+            Ok(OuterEval {
+                cost,
+                gradient,
+                hessian: HessianValue::Unavailable,
+                inner_beta_hint: None,
+            })
+        },
+        None::<fn(&mut ())>,
+        None::<
+            fn(
+                &mut (),
+                &Array1<f64>,
+            )
+                -> Result<gam_problem::EfsEval, gam_solve::estimate::EstimationError>,
+        >,
+    );
+    let result = problem.run(&mut obj, &context).map_err(|error| error.to_string())?;
+    let outer_iterations = result.iterations;
+    let criterion_certificate = result.criterion_certificate;
+    let selected_rho = result.rho;
     if selected_rho.len() != num_smoothing {
         return Err(format!(
             "survival transformation smoothing selector returned {} coordinates for \

@@ -1,6 +1,177 @@
-## Unreleased
+## v0.3.155 — gam 0.3.155 / gamfit 0.1.265 (2026-09-06)
 
-### Testing
+The first release since `v0.3.154` (2026-09-02), four days later, and the
+largest thread through it is repair. Two commits three minutes apart on
+September 2 had removed 227,000 lines and 2,321 `#[test]` functions on a
+reachability criterion that is vacuously true of every `#[cfg(test)]` helper,
+taking 148 issue-pinned regressions with them and leaving nothing red at any
+point. All nine pins on open issues are back, rebuilt against production entry
+points rather than the test-only scaffolding a future sweep could prune again;
+the suite is up 9,909 → 10,109 tests and 1,236 → 1,409 issue-pinned names this
+cycle; and the loss is now measurable rather than invisible — a per-push
+inventory gate that floors the per-crate and per-issue counts, splits the
+`tests` tree into its integration binaries so one suite's deletion cannot be
+paid for by another's growth, and re-measures the original sweep on every run,
+beside a detector that refuses a `#[test]` reaching no assertion. In the same
+spirit, the wheel matrix's warm-cache gate turned out to be unsatisfiable by
+construction, which is why `gamfit` 0.1.264 never reached PyPI; it now measures
+whether rustc reached the compiler cache rather than whether the cache happened
+to be warm.
+
+Event histories are rebuilt twice over. The rank of the latent covariance is
+decided by the evidence's own prior — the atom's precision chosen from the
+covariance score by empirical Bayes under the quartic model `½ μ_i t² − ¼ J_i t⁴`
+along every eigen-direction, the atom accepted exactly when that prior puts the
+loading's posterior mode off zero — rather than by a ridge the engine could not
+drive to zero over a criterion unbounded below at the very boundary the decision
+is about. The rate is an unpenalised structural coordinate on a chart of the
+dimensionless `ν = r·T̄` over the band the cohort's breakpoints resolve, not a
+log-rate on a plateau with a vanishing gradient. `EventHistoryFit` reports the
+posterior-mean covariance with its eigenmodes' uncertainty, the participation
+ratio, the canonical-gauge loadings, and `latent_state`, every subject's
+smoothed `E[z_i(t) | history]` with its posterior covariance at every node,
+through Rust, Python and the CLI. Beneath that, the exactly-marginalised engine
+is restored — it returns intercept −0.15, loading 1.08, rate 0.27 on the shared
+80-subject fixture where the Laplace engine that briefly replaced it returned
++28.6, 8.26, 15264 and a forecast of 1.5×10¹² events — every forecast
+probability is a chronological integral, Louis' identity is accumulated in one
+forward sweep instead of an all-pairs node table with a dense `S × S` transfer
+per gap, marks are `recurrent`/`once`/`terminal` and enforced, and the fit
+certifies its own coefficients under refinement of both the quadrature and the
+mesh.
+
+Two deletions change published behaviour. The O(n⁻¹) frequentist bias
+correction is gone end to end: every credible band is now the posterior band of
+the posterior mean it is centred on, which on the Gaussian additive coverage
+gate moves a band that over-covered at 0.917 / 0.975 / 0.992 to a calibrated
+0.825 / 0.933 / 0.975 at nominal 0.80 / 0.90 / 0.95. With it go `gam predict`'s
+`--mode` and `--no-bias-correction`, and the plug-in estimate is published
+beside the posterior mean by name rather than reached through a switch.
+`--adaptive-regularization` and its `FitOptions` twin are deleted as well — an
+opt-in engine whose own request-side policy documented it as worse, carrying
+four hand-set boxes with it. On the Python side `sae_observe_atlas_topology`
+now returns its invariants under a mandatory branch, so a caller cannot read a
+manifold's signature off a cloud the orientation gate refused. Both are
+breaking; both are named as such in the entries below. The release stays on the
+`0.3` line, as every release since 0.3.0 has.
+
+The rest is measurement. On the large-scale CTN preprocessor a
+`ValueGradientHessian` outer evaluation goes from 422 s to 35 s once the joint
+Hessian's β-derivative operators assemble the weighted Gram their own header
+describes instead of streaming all `n` rows once per probe column; the
+feasibility verdict every active-set solve takes on every trial point — 92 % of
+the reduced-face solve's profile at 1.6 M rows — fans across the pool while
+still reporting the row the serial loop would have named; and the dense-product
+GPU dispatch diagnostic keeps one ring per thread after a frame-pointer profile
+put 19.5 % of a 16-thread run inside `record` and 14.8 % in `lock_contended`
+beneath it. The hybrid Duchon kernel is one certified radial profile per
+`(p, s, d)` rather than a 64-node rule per pair that was 1.0 % off at every
+distance and 100 % off at `ρ = 1000`. Hand-set boxes keep going: the
+full-conformal REML strength, the constant-curvature range solve and the
+survival smoothing search all run on the outer engine's certified search on its
+own derived domain, and another two dozen numerical floors become refusals,
+exact limits, or the arithmetic's own constant.
+
+Twenty-one of the twenty-four workspace crates carry content changes this
+cycle. `gam-report` and `gam-spec` do not and stay at 0.3.154, so the fleet's
+build caches keep them; `gam-test-support` moves only because it pins five
+crates that did.
+
+- **The regression suite the September 2 reachability sweep deleted is being
+  rebuilt, and a gate now measures what a sweep like it costs (#2818).**
+  `d484a091a` and `c0a21b554`, three minutes apart, removed 227,000 lines and
+  2,321 `#[test]` functions on the criterion "no production artifact links this
+  symbol" — which is vacuously true of every `#[cfg(test)]` helper, so the sweep
+  pruned test scaffolding and the second commit then deleted the tests that no
+  longer compiled. 148 of the 167 issue-pinned regressions it removed were still
+  absent at the last release, nine of them pinning open issues. All nine are
+  back, rebuilt against production entry points rather than the test-only
+  helpers a future sweep could prune again, and the census reads 9,909 → 10,109
+  tests and 1,236 → 1,409 issue-pinned names across this cycle. The instrument
+  is now permanent: `Test source integrity (#2818)` runs on every push and pull
+  request, floors the per-crate and per-issue inventory against
+  `docs/test-census-floor.json`, splits the `tests` tree into its integration
+  binaries so a deletion in one suite cannot be paid for by growth in another,
+  and re-measures `c0a21b554` itself on every run — a census that has stopped
+  detecting anything prints exactly what a census over a tree that lost nothing
+  prints. A second detector refuses a `#[test]` that reaches no assertion,
+  wired as a bidirectional ratchet against a 14-line ledger of `zz_measure`/
+  `probe` harnesses and re-measuring the #2110 incident every run.
+
+- **The block dictionary's support step descends the objective its frame and
+  γ steps descend (#2825, #2275).** `route_block_minibatch` ranked blocks by the
+  gate `‖P_g x‖` and took the top `k`. For the tied model `x̂ = γ Σ_{g∈S} P_g x`
+  that ranking is the exact minimiser only when the selected projectors are
+  mutually orthogonal, which an over-complete dictionary's blocks are not by
+  construction: the cross term the ranking omits is exactly what lets the top-`k`
+  support price worse than the one already held. Measured, one frame step lowered
+  RSS `10606.237 → 10300.318` at fixed support and re-routing returned it to
+  `10578.838` — 91 % of the gain given back, 85 of 512 rows changing support — so
+  the alternation was not a block-coordinate descent, had no fixed point to
+  reach, and a frame stationarity certificate had nothing to converge to. A row
+  now admits a candidate only while it lowers that row's loss, greedily, and
+  stops when none does; `k` becomes the cap it was always documented to be rather
+  than a quota. Every quantity is a function of the projectors, so the rule is
+  invariant to an `O(b)` change of basis inside a block and stays a pure function
+  of `(x, decoder, γ)` — the transform reproduces the training support exactly.
+  Three `K ≫ rank` fixtures that pinned "this fit legitimately cannot certify"
+  now certify against the same untouched `1e-6` tolerance: frame residual
+  `1.56e-2 → 1.123e-7`, `4.14e-3 → 9.444e-8`, `1.04e-4 → 2.558e-8`.
+
+- **The reduced Schur is equilibrated by `|S_aa|`, so the spectral PD floor
+  stops clamping the healthy subspace (#2822, #1026, #2015).**
+  `factor_dense_reduced_schur` scales by `sqrt(S_aa)` with a `1e-9` substitute
+  "so a numerically-empty diagonal entry never divides by ~0", and it read the
+  SIGNED diagonal. A collapsed reduced Schur carries a negative diagonal — that
+  is precisely the operator the #1026 spectral floor exists for — and a negative
+  entry fails `S_aa > 1e-18`, so it took the substitute. Dividing an entry of
+  magnitude `|S_aa|` by `1e-18` does not normalise it, it amplifies it by
+  eighteen decades, and the equilibration was therefore anti-equilibrating on
+  exactly the matrices that reach the floor. `spectral_pd_floored_schur` then
+  reads its relative floor off that inflated spectrum and clamps every eigenvalue
+  up to it, against its own contract that a well-separated positive direction
+  keeps its exact eigenvalue. On the `owed_1026` mixed-collapse geometry
+  `S = diag(+5, −99)`, whose healthy Newton component is exactly `2`, the signed
+  read returned `2.02e-12`.
+
+- **A startup refusal names the stage that caused it, not the one that reported
+  it (#2822, #2228).** `no candidate seeds passed outer startup validation` is
+  this repository's one forbidden runtime signature, and its headline pointed the
+  reader at seed generation. Its own counters two lines below often said
+  otherwise: measured on CI run 33941725421, six of the eight Python tests
+  carrying the refusal reported `generated=13, screened=13, exact_validated=13,
+  solver_started=0` with all thirteen rejected in the domain phase for the same
+  reason — every seed generated, screened and exact-validated, and nothing about
+  seeding failed. `format_no_seeds_passed` now adds one attribution line when the
+  counters say so unambiguously, and the tests pin its silence as well as its
+  speech: two distinct reasons in one category, `solver_started > 0`, an empty
+  rejection list, or a rejection list shorter than its own count each produce
+  nothing, because a summary that generalises from a prefix is worse than one
+  that is absent. The refusal, its counters, its structural diagnosis and its
+  per-seed list are unchanged; the line is additive.
+
+- **The PyPI wheel gate measures whether rustc reached the compiler cache, not
+  whether the cache happened to be warm (#2832).** Every wheel job refused
+  publication unless `sccache` reported a nonzero hit count. `release-pypi` is a
+  profile (fat LTO, one codegen unit, stripped) that nothing else in the repo
+  compiles, so its objects are shared with no other workflow, and the Actions
+  cache evicts entries unused for seven days while the wheel matrix is dispatched
+  only at release time — the floor was unsatisfiable on the first dispatch of any
+  release by construction. That is what stopped `gamfit` 0.1.264: run
+  33654645604 refused macOS, musllinux and Windows at `hits 0` with `errors 0`,
+  the previous release shipped only because eight dispatches were fired inside
+  two hours until one landed on a still-warm cache, and the version that did
+  reach PyPI got there out of band as a single `manylinux_2_31` wheel that will
+  not install on the glibc 2.28 cluster this workflow builds `manylinux2014` for.
+  The receipt now refuses `Compile requests == 0` — rustc never reached the
+  wrapper, which is the misconfiguration actually worth refusing and a real
+  hazard on the Docker route — keeps refusing an unparseable receipt and any
+  nonzero cache error, and records `hits == 0, misses > 0` as a cold run that
+  seeds the next release. `sccache --start-server` gets a bounded five-attempt
+  retry in all four lanes, so the transient `ServerBusy` 503 that took the
+  `linux (x86_64)` job (and, through `fail-fast`, three of its siblings) no
+  longer takes a release with it.
+
 - Of the three specialised binomial closed-form derivative towers in
   `gamlss::binomial_q_derivs`, only the logit one was cross-checked against the generic
   mu-jet path; probit had tail-limit tests only and cloglog had none. Each closed form is
@@ -8,7 +179,6 @@
   cloglog additionally gets the jet-path agreement test logit already had. Both closed
   forms pass as written -- this closes an unwatched surface rather than fixing a defect. (#932)
 
-### Performance
 - The flex BMS row program's link-deviation basis sum is now one fused jet operation
   (`RuntimeJetScalar::weighted_compose_sum`) rather than a per-coefficient
   `compose_unary` + `multiply_add` loop that streamed `2*|w|` derivative blocks and
@@ -18,7 +188,6 @@
 
 - The Bernoulli marginal-slope ψ-cross accumulator takes its primary-space vector as a view, so the axis sweep no longer allocates a two-element `Array1` three times per axis pair per row across nine call sites (#979).
 
-### Fixed
 - `gam-pyffi`'s FFI prelude re-exported `infer_and_encode_column_major` after `ab6008bc3`
   deleted its only consumer, which fails `cargo check --workspace --all-targets` under
   `-D warnings`. It went unseen because both `-D warnings` arms in `cross-check.yml` pass
@@ -28,7 +197,6 @@
 
 - The Bernoulli marginal-slope ψ-cross rank-1 accumulator reads its two design rows into per-worker scratch instead of allocating and freeing two one-row matrices on every call; the ψ-hyper build makes that call three times per axis pair per row, and it was 6.9 % of the rigid arm's profile in `_int_malloc`/`_int_free` (#979).
 
-### Fixed
 - The `SLS-MACRO-CODEGEN-932` timing cell in `gam-row-macros` compared the generated
   location-scale program against a hand schedule that gated its `u1`/`g` terms on
   `plan.u1.is_some()` -- the row's weight -- while the generated program gates on the
@@ -309,6 +477,37 @@
   docs describe the algorithm that exists: adaptive quadrature with a
   refinement certificate, not "exact".
 
+## v0.3.154 — gam 0.3.154 / gamfit 0.1.264 (2026-09-02)
+
+The first release since `v0.3.153` (2026-08-30), three days later, and two
+pieces of work carry it. Event histories become a family of their own: marked
+counting processes with smooth covariate and time effects per mark and a
+per-subject latent chain marginalised exactly by adaptive Gauss-Hermite
+filtering, a baseline that is the population-average intensity whatever the
+loadings, observed risk scores entering as penalised varying-coefficient
+surfaces, and forecasts at three tiers — population, score-only,
+history-conditioned. And the cone-truncated posterior's moment cubature is
+integrated in the Gibson-Glasbey-Elston order, tilted at Botev's exact saddle
+point by Newton on the analytic stationarity system, and stopped on the
+replicate standard error of eight shifted lattices, so the #979 preprocessor no
+longer converges and then refuses at a face it could not integrate.
+
+Around them: every live family's row log-likelihood is written once and its
+whole derivative tower derived from it, with 27 wall-clock gates asserting the
+compiled rows beat the hand kernels on every push (#932); a continuous `by=`
+smooth keeps its constant; explicit `k`, `BSpline(knots=K)` and periodic bases
+build the dimensions they name; a NaN penalty trace is refused instead of read
+as saturation; and the AIC ratio is called an evidence ratio, not a Bayes
+factor.
+
+Every workspace crate carries content changes this cycle, so all 24 move to
+0.3.154 together and `gam-pyffi`/`gamfit` to 0.1.264.
+
+The wheel matrix for this release failed on a transient GitHub Actions cache
+egress limit (`ServerBusy` from every `sccache --start-server`), so `gamfit`
+0.1.264 was built but never reached PyPI; its contents ship in the next
+`gamfit` release.
+
 - **A continuous `by=` smooth keeps its constant, and event-history forecasts
   have a population tier (#2805).** `s(x, by=z)` with a continuous `z` is the
   varying coefficient `f(x)·z`, whose constant direction is `z` itself and
@@ -439,15 +638,6 @@
   (`gam_linalg::anderson`) with the scalar relaxed step as the first-pass and
   post-reset fallback and the map's own residual norm as the safeguard. The
   n=1000 cell mints in 44 s (was a 290 s refusal); n=500 in 42 s (was 48 s).
-- **The composed-warp degree floor is the measured `C¹` degree, 4 (#2695).**
-  The floor had been raised to 5 on the reading that `∇Φ` consumes a
-  piecewise-constant `I⁗` at degree 4. Its own non-vacuity arm refused on MSI:
-  driving the production Jeffreys gradient across an event-row knot crossing,
-  the gap shrinks 99.5× for a 100× smaller straddle at degree 4 (and ≈100× at
-  5 and 6) and only 1.02× at degree 3. The required continuous basis order is
-  therefore 3, the floor is degree 4 again, the negative control measures
-  degree 3, and the ladder that produced the table (`knot_ladder_2695`) ships
-  as a fixture that prints it on every run.
 
 - **The composed-warp degree floor is the measured `C¹` degree, 4 (#2695).**
   The floor had been raised to 5 on the reading that `∇Φ` consumes a

@@ -847,6 +847,15 @@ where
     let target = initial.target;
     let engine_context = context.to_string();
     let objective = std::rc::Rc::new(std::cell::RefCell::new(objective));
+    // The outer engine asks for the scalar cost and then for derivatives at
+    // the same accepted point, and may ask for either again at that point
+    // (a BFGS line search re-reads the accepted iterate). A baseline
+    // evaluation can be a complete nested latent-survival REML fit, so the
+    // most recent evaluation is retained and served, cloned, for every
+    // request at exactly that theta (#2714).
+    let cost_eval_cache = std::rc::Rc::new(std::cell::RefCell::new(
+        None::<(Array1<f64>, gam_problem::OuterEval)>,
+    ));
     let eval_at = move |obj: &std::rc::Rc<std::cell::RefCell<F>>,
                         theta: &Array1<f64>|
           -> Result<gam_problem::OuterEval, crate::model_types::EstimationError> {
@@ -875,11 +884,29 @@ where
         Ok(eval)
     };
     let cost_objective = std::rc::Rc::clone(&objective);
+    let cost_cache = std::rc::Rc::clone(&cost_eval_cache);
     let cost_eval = eval_at.clone();
     let cost_fn = move |_: &mut (), theta: &Array1<f64>| {
-        cost_eval(&cost_objective, theta).map(|eval| eval.cost)
+        if let Some((cached_theta, eval)) = cost_cache.borrow().as_ref()
+            && cached_theta == theta
+        {
+            return Ok(eval.cost);
+        }
+        let eval = cost_eval(&cost_objective, theta)?;
+        let cost = eval.cost;
+        *cost_cache.borrow_mut() = Some((theta.clone(), eval));
+        Ok(cost)
     };
-    let eval_fn = move |_: &mut (), theta: &Array1<f64>| eval_at(&objective, theta);
+    let eval_fn = move |_: &mut (), theta: &Array1<f64>| {
+        if let Some((cached_theta, eval)) = cost_eval_cache.borrow().as_ref()
+            && cached_theta == theta
+        {
+            return Ok(eval.clone());
+        }
+        let eval = eval_at(&objective, theta)?;
+        *cost_eval_cache.borrow_mut() = Some((theta.clone(), eval.clone()));
+        Ok(eval)
+    };
     run_baseline_theta_optimizer(initial, context, contract, cost_fn, eval_fn)
 }
 
@@ -4458,6 +4485,7 @@ fn finish_time_varying_survival_covariate_template(
 #[cfg(test)]
 mod tests {
     use super::{SURVIVAL_LIKELIHOOD_MODES, SURVIVAL_TIME_FLOOR, SurvivalBaselineConfig, SurvivalBaselineTarget, SurvivalLikelihoodMode, SurvivalMarginalSlopeFrozenOffsetChart, SurvivalTimeBasisConfig, baseline_chain_rule_gradient, baseline_offset_theta_partials, build_survival_marginal_slope_baseline_geometry, build_survival_marginal_slope_baseline_offsets, build_survival_time_basis, build_survival_timewiggle_from_baseline, evaluate_survival_baseline, evaluate_survival_marginal_slope_baseline, fitted_weibull_baseline_from_linear_time_beta, gompertz_cumulative_shape_derivative, gompertz_cumulative_shape_second_derivative, gompertz_hazard_components, marginal_slope_baseline_chain_rule_gradient, marginal_slope_baseline_offset_theta_partials, resolve_survival_time_anchor_for_mode, survival_baseline_config_from_theta, survival_baseline_theta_from_config, survival_data_is_left_truncated, survival_earliest_entry_time_anchor, survival_robust_interior_time_anchor, validate_survival_time_anchor_override};
+    use super::optimize_survival_baseline_config_with_gradient_only;
     use super::{
         center_survival_time_designs_at_anchor, evaluate_survival_time_basis_row,
         resolved_survival_time_basis_config_from_build,
@@ -5526,6 +5554,43 @@ mod tests {
              analytic={analytic:?}, fd={fd:?}, max_err={max_err:.3e}, \
              rel={rel:.3e} (analytic_inf_norm={analytic_norm:.3e})"
         );
+    }
+
+    /// gam#2714: do not execute a nested REML objective twice when the outer
+    /// engine requests cost and derivatives consecutively at one theta.
+    #[test]
+    fn baseline_optimizer_reuses_cost_evaluation_for_gradient_at_same_theta_2714() {
+        use std::cell::RefCell;
+
+        let initial = SurvivalBaselineConfig {
+            target: SurvivalBaselineTarget::Weibull,
+            scale: Some(2.0),
+            shape: Some(1.5),
+            rate: None,
+            makeham: None,
+        };
+        let previous_theta = RefCell::new(None::<Array1<f64>>);
+        let fitted = optimize_survival_baseline_config_with_gradient_only(
+            &initial,
+            "#2714 duplicate-evaluation regression",
+            |cfg| {
+                let theta = survival_baseline_theta_from_config(cfg)?
+                    .expect("Weibull baseline exposes theta");
+                assert_ne!(
+                    previous_theta.borrow().as_ref(),
+                    Some(&theta),
+                    "the adapter re-executed the expensive objective at the same theta"
+                );
+                *previous_theta.borrow_mut() = Some(theta.clone());
+                Ok((theta.dot(&theta), theta.mapv(|value| 2.0 * value)))
+            },
+        )
+        .expect("strictly convex baseline objective converges");
+
+        let theta = survival_baseline_theta_from_config(&fitted)
+            .expect("valid fitted baseline")
+            .expect("Weibull baseline exposes theta");
+        assert!(theta.iter().all(|value| value.abs() <= 1.0e-5));
     }
 
     /// Weibull (dim=2) companion to

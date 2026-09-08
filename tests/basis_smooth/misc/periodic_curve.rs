@@ -95,22 +95,56 @@ fn periodic_bspline_terms_build_with_cyclic_penalty_and_formula_alias() {
         shape: gam::terms::smooth::ShapeConstraint::None,
         joint_null_rotation: None,
     };
-    let spec = TermCollectionSpec {
+    let mut spec = TermCollectionSpec {
         linear_terms: vec![],
         random_effect_terms: vec![],
         smooth_terms: vec![term],
     };
     let design = build_term_collection_design(data.view(), &spec).unwrap();
     assert_eq!(design.smooth.terms.len(), 1);
-    // A cyclic P-spline is a SINGLE-penalty smooth even under `double_penalty`
-    // (#874, matching mgcv's `bs="cc"`): the cyclic difference penalty's only
-    // null direction is the constant, which the periodic sum-to-zero
-    // identifiability constraint removes wholesale. The null-space ("double")
-    // penalty is the projector onto exactly that constant, so after the
-    // constraint transform it is identically zero — an unidentified λ that
-    // makes the outer REML objective flat and prevents convergence. The builder
-    // therefore emits only the wiggliness penalty (see bspline_build.rs).
-    assert_eq!(design.smooth.terms[0].active_penalties.len(), 1);
+    // Without centering the constant function survives. Its function-space
+    // ridge must remain separate from roughness (#2783); dropping it would
+    // leave an unpenalized alias of the global intercept.
+    let penalties = &design.smooth.terms[0].active_penalties;
+    assert_eq!(penalties.len(), 2);
+    let roughness = penalties
+        .iter()
+        .find(|penalty| matches!(penalty.info.source, gam::terms::basis::PenaltySource::Primary))
+        .expect("cyclic roughness penalty");
+    let constant = penalties
+        .iter()
+        .find(|penalty| {
+            matches!(
+                penalty.info.source,
+                gam::terms::basis::PenaltySource::DoublePenaltyNullspace
+            )
+        })
+        .expect("surviving constant-function penalty");
+    assert_eq!(roughness.nullity, 1);
+    assert_eq!(constant.nullity, constant.matrix.ncols() - 1);
+    let ones = ndarray::Array1::ones(roughness.matrix.ncols());
+    assert!(
+        roughness.matrix.dot(&ones).iter().all(|value| value.abs() < 1e-12)
+    );
+    assert!(ones.dot(&constant.matrix.dot(&ones)) > 0.0);
+
+    // Centering removes exactly that constant direction. The resulting cyclic
+    // smooth must have one full-rank penalty and no unidentified second lambda
+    // (#874). Test the constraint explicitly instead of assuming that periodic
+    // knots override the caller's identifiability choice.
+    let SmoothBasisSpec::BSpline1D { spec: basis_spec, .. } = &mut spec.smooth_terms[0].basis
+    else {
+        panic!("expected the declared B-spline basis");
+    };
+    basis_spec.identifiability = BSplineIdentifiability::WeightedSumToZero { weights: None };
+    let centered = build_term_collection_design(data.view(), &spec).unwrap();
+    let centered_penalties = &centered.smooth.terms[0].active_penalties;
+    assert_eq!(centered_penalties.len(), 1);
+    assert_eq!(centered_penalties[0].nullity, 0);
+    assert_eq!(
+        centered_penalties[0].matrix.ncols(),
+        roughness.matrix.ncols() - 1
+    );
 
     let built = build_bspline_basis_1d(
         x.view(),

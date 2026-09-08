@@ -795,9 +795,7 @@ fn code_row(
             } else {
                 -admission_scale * own + 2.0 * gamma64 * gamma64 * overlap
             };
-            if (unconditional || gain < 0.0)
-                && best.is_none_or(|(_, incumbent)| gain < incumbent)
-            {
+            if (unconditional || gain < 0.0) && best.is_none_or(|(_, incumbent)| gain < incumbent) {
                 best = Some((index, gain));
             }
         }
@@ -1561,11 +1559,16 @@ pub(super) fn seed_frames(x: ArrayView2<'_, f32>, n_blocks: usize, b: usize) -> 
 /// How the initial `K = G·b` block frames are chosen before the alternation.
 ///
 /// The alternation (`advance_block_sparse_state`) is seed-agnostic — it reaches
-/// the same fixed point from any valid St(b,P) frame set — but the two seeds differ
+/// the same fixed point from any valid St(b,P) frame set — but the seeds differ
 /// in cost and in how coherent the starting blocks are, which matters at different
 /// `K` regimes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BlockSeedPolicy {
+    /// Deterministic data-row seed (`data_row_frames`): distribute the `K`
+    /// initial axes across the observed rows, centre them, and orthonormalize
+    /// each block.  This costs `O(N·P + K·P)` and puts capacity in the data cloud
+    /// before routing begins, rather than relying on later dead-block revival.
+    DataRows,
     /// Data-aware block-aware farthest-point pass (`seed_frames`). Each block is
     /// anchored on the row farthest from the completed frames and grown to rank `b`
     /// by uncovered-energy affinity, so unrelated subspaces never share a block.
@@ -1575,11 +1578,11 @@ pub enum BlockSeedPolicy {
     FarthestPoint,
     /// Deterministic coordinate-partition seed ([`coordinate_partition_frames`]):
     /// each block is `b` distinct signed unit coordinate axes drawn from a fixed
-    /// splitmix64 stream, `O(K·b)` with no corpus pass. The large-`K` front door —
-    /// at `K ≫ intrinsic-rank` most atoms are structurally spurious and dead-block
-    /// AuxK revival reseeds them from worst-residual ROWS during the epochs, so the
-    /// coherent farthest-point seed is neither affordable nor load-bearing; the
-    /// streaming lane already uses exactly this seed at `K ≈ 1e4`.
+    /// splitmix64 stream, `O(K·b)` with no corpus pass. This remains available
+    /// for synthetic dictionaries that deliberately must
+    /// not depend on a corpus.  It is not a fitting default: at large `K`, dead
+    /// coordinate blocks can remain dead when evidence-adjudicated revival is
+    /// deliberately conservative.
     CoordinatePartition,
 }
 
@@ -1612,6 +1615,84 @@ pub fn coordinate_partition_frames(n_blocks: usize, b: usize, p: usize) -> Array
     decoder
 }
 
+/// Seed `G` block frames from centred observations in `O(N·P + G·b·P)` work.
+///
+/// Axis `a` uses row `floor(a·N/K)`, spreading the dictionary over the corpus
+/// without a search or a caller-supplied random seed. Thus all selected rows
+/// are distinct whenever `K <= N`.
+/// Modified Gram--Schmidt makes each block a Stiefel frame.  If the selected
+/// observations do not span `b` directions, only that block falls back to the
+/// always-valid coordinate frame; degenerate data therefore cannot manufacture
+/// NaNs or an invalid initial dictionary.
+pub(super) fn data_row_frames(x: ArrayView2<'_, f32>, n_blocks: usize, b: usize) -> Array2<f32> {
+    let n = x.nrows();
+    let p = x.ncols();
+    let k = n_blocks * b;
+    let mut decoder = coordinate_partition_frames(n_blocks, b, p);
+    let mut means = vec![0.0_f64; p];
+    for row in x.rows() {
+        for (mean, &value) in means.iter_mut().zip(row.iter()) {
+            *mean += value as f64;
+        }
+    }
+    for mean in &mut means {
+        *mean /= n as f64;
+    }
+
+    for block in 0..n_blocks {
+        let mut axes: Vec<Vec<f64>> = Vec::with_capacity(b);
+        for axis in 0..b {
+            let atom = block * b + axis;
+            let row_index = ((atom as u128 * n as u128) / k as u128) as usize;
+            let mut candidate: Vec<f64> = x
+                .row(row_index)
+                .iter()
+                .zip(means.iter())
+                .map(|(&value, &mean)| value as f64 - mean)
+                .collect();
+            let input_norm = candidate
+                .iter()
+                .map(|value| value * value)
+                .sum::<f64>()
+                .sqrt();
+            for _ in 0..2 {
+                for prior in &axes {
+                    let projection: f64 = candidate
+                        .iter()
+                        .zip(prior.iter())
+                        .map(|(left, right)| left * right)
+                        .sum();
+                    for (value, direction) in candidate.iter_mut().zip(prior.iter()) {
+                        *value -= projection * direction;
+                    }
+                }
+            }
+            let norm = candidate
+                .iter()
+                .map(|value| value * value)
+                .sum::<f64>()
+                .sqrt();
+            let roundoff = f32::EPSILON as f64 * (p.max(1) as f64).sqrt() * input_norm;
+            if !norm.is_finite() || norm <= roundoff {
+                axes.clear();
+                break;
+            }
+            for value in &mut candidate {
+                *value /= norm;
+            }
+            axes.push(candidate);
+        }
+        if axes.len() == b {
+            for (axis, values) in axes.iter().enumerate() {
+                for (column, &value) in values.iter().enumerate() {
+                    decoder[[block * b + axis, column]] = value as f32;
+                }
+            }
+        }
+    }
+    decoder
+}
+
 /// splitmix64 mixing step for the deterministic coordinate seed. A local copy so
 /// the seed stream is self-contained and does not depend on any RNG crate.
 fn splitmix64_block(mut x: u64) -> u64 {
@@ -1630,6 +1711,7 @@ fn seed_frames_by_policy(
     policy: BlockSeedPolicy,
 ) -> Array2<f32> {
     match policy {
+        BlockSeedPolicy::DataRows => data_row_frames(x, n_blocks, b),
         BlockSeedPolicy::FarthestPoint => seed_frames(x, n_blocks, b),
         BlockSeedPolicy::CoordinatePartition => coordinate_partition_frames(n_blocks, b, x.ncols()),
     }
@@ -2200,15 +2282,14 @@ fn validate(x: ArrayView2<'_, f32>, config: &BlockSparseConfig) -> Result<(), Bl
 /// linear-dictionary request is a modeling choice admitted at ANY `K`, not a
 /// shape-derived demotion.
 ///
-/// Seeds with the data-aware [`BlockSeedPolicy::FarthestPoint`] pass. At `K ≫ 1`
-/// that serial `O(N·P·K)` seed dominates the fit; use
-/// [`fit_block_sparse_dictionary_with_seed`] with
-/// [`BlockSeedPolicy::CoordinatePartition`] for the large-`K` front door.
+/// Seeds from centred observations with [`BlockSeedPolicy::DataRows`].  The
+/// `O(N·P + K·P)` seed remains data-placed at large `K`, without the serial
+/// `O(N·P·K)` farthest-point pass or dependence on later dead-block revival.
 pub fn fit_block_sparse_dictionary(
     x: ArrayView2<'_, f32>,
     config: &BlockSparseConfig,
 ) -> Result<BlockSparseFit, BlockSparseFitError> {
-    fit_block_sparse_dictionary_with_seed(x, config, BlockSeedPolicy::FarthestPoint)
+    fit_block_sparse_dictionary_with_seed(x, config, BlockSeedPolicy::DataRows)
 }
 
 /// #2275/#2023 — the captured-fraction EV-plateau constants (the best-effort arm of
@@ -2293,6 +2374,12 @@ fn fit_block_sparse_dictionary_with_seed_inner(
     let reconstruction_residual: f64;
     let mut accepted_births = 0usize;
     let mut polar_failures = 0usize;
+    // The frame residual is read off f32-stored frames, so the configured
+    // tolerance governs wherever it is attainable and the storage resolution
+    // governs below that (#2825). A bar above the floor is unchanged.
+    let frame_bar = config
+        .tolerance
+        .max(super::block_frame::STORED_FRAME_RESOLUTION);
     // The reconstruction EV is the gauge-invariant objective; `entry_ev` anchors the
     // total-improvement denominator of the captured-fraction plateau test (arm 2).
     let entry_ev = seed_ev;
@@ -2360,7 +2447,7 @@ fn fit_block_sparse_dictionary_with_seed_inner(
         // fit is certified, never demoted to best-effort.
         if ev_residual <= config.tolerance
             && gamma_residual <= config.tolerance
-            && frame_residual <= config.tolerance
+            && frame_residual <= frame_bar
         {
             certified = true;
             converged = true;

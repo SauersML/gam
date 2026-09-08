@@ -1,4 +1,4 @@
-"""Unit tests for examples/centroid_ordering.py (the tier-2 ring test).
+"""Unit tests for experiments/centroid_ordering.py (the tier-2 ring test).
 
 Three synthetic cases mirror the injections the construction was validated
 on against real-activation censuses:
@@ -21,7 +21,7 @@ from typing import Any
 import numpy as np
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
-_MOD_PATH = _REPO_ROOT / "examples" / "centroid_ordering.py"
+_MOD_PATH = _REPO_ROOT / "experiments" / "centroid_ordering.py"
 _SPEC = importlib.util.spec_from_file_location("centroid_ordering", _MOD_PATH)
 if _SPEC is None or _SPEC.loader is None:
     raise RuntimeError(f"failed to load centroid_ordering from {_MOD_PATH}")

@@ -80,7 +80,25 @@ pub fn build_term_collection_design_inner_with_policy(
     spec: &TermCollectionSpec,
     policy: &gam_runtime::resource::ResourcePolicy,
 ) -> Result<TermCollectionDesign, BasisError> {
-    use rayon::iter::{IntoParallelIterator, IntoParallelRefIterator, ParallelIterator};
+    build_term_collection_design_inner_with_policy_and_plan(data, spec, policy, false)
+}
+
+/// Build a collection whose sweep-level spatial geometry has already been planned.
+pub fn build_planned_term_collection_design_inner_with_policy(
+    data: ArrayView2<'_, f64>,
+    spec: &TermCollectionSpec,
+    policy: &gam_runtime::resource::ResourcePolicy,
+) -> Result<TermCollectionDesign, BasisError> {
+    build_term_collection_design_inner_with_policy_and_plan(data, spec, policy, true)
+}
+
+fn build_term_collection_design_inner_with_policy_and_plan(
+    data: ArrayView2<'_, f64>,
+    spec: &TermCollectionSpec,
+    policy: &gam_runtime::resource::ResourcePolicy,
+    spatial_plan_is_resolved: bool,
+) -> Result<TermCollectionDesign, BasisError> {
+    use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
 
     let n = data.nrows();
     let p_intercept = usize::from(!term_collection_has_anchored_bspline(spec));
@@ -93,7 +111,11 @@ pub fn build_term_collection_design_inner_with_policy(
     let (smooth_raw_result, (random_blocks_result, linear_block_result)) = rayon::join(
         || {
             let mut ws = crate::basis::BasisWorkspace::with_policy(policy.clone());
-            build_smooth_design_withworkspace_unvalidated(data, &spec.smooth_terms, &mut ws)
+            if spatial_plan_is_resolved {
+                build_smooth_design_from_planned_terms(data, &spec.smooth_terms, &mut ws)
+            } else {
+                build_smooth_design_withworkspace_unvalidated(data, &spec.smooth_terms, &mut ws)
+            }
         },
         || {
             rayon::join(
@@ -108,10 +130,11 @@ pub fn build_term_collection_design_inner_with_policy(
                         return Ok(None);
                     }
 
-                    let linear_columns = (0..p_lin)
-                        .into_par_iter()
-                        .map(|j| {
-                            let linear = &spec.linear_terms[j];
+                    // Fill the final block one column at a time. Collecting all
+                    // realised columns first retained a second O(n * p_lin)
+                    // dense payload while `out` was allocated.
+                    let mut out = Array2::<f64>::zeros((n, p_lin));
+                    for (j, linear) in spec.linear_terms.iter().enumerate() {
                             // `:` interactions carry multiple feature columns; the
                             // materialized column is their elementwise product
                             // (a plain main effect has a single column), gated by
@@ -122,15 +145,10 @@ pub fn build_term_collection_design_inner_with_policy(
                             // `build_term_collection_fixed_blocks`, and the
                             // marginal-slope rank check) shares so they agree on
                             // every interaction.
-                            linear
+                            let column = linear
                                 .realized_design_column(data)
-                                .map_err(BasisError::InvalidInput)
-                        })
-                        .collect::<Result<Vec<_>, _>>()?;
-
-                    let mut out = Array2::<f64>::zeros((n, p_lin));
-                    for (j, column) in linear_columns.iter().enumerate() {
-                        out.column_mut(j).assign(column);
+                                .map_err(BasisError::InvalidInput)?;
+                        out.column_mut(j).assign(&column);
                     }
                     Ok(Some(out))
                 },
@@ -2873,6 +2891,39 @@ pub fn orthogonality_relative_residual_for_design(
 #[cfg(test)]
 mod frozen_linear_term_mass_rebuild_tests {
     use super::*;
+
+    /// The scratch allowance is the final n*p design plus two n-row columns
+    /// (one live realization and one allocator-retained column). The previous
+    /// collect-then-copy path needed two complete n*p payloads.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn million_row_linear_design_stays_below_derived_peak_rss() {
+        fn hwm() -> usize {
+            std::fs::read_to_string("/proc/self/status")
+                .expect("Linux status")
+                .lines()
+                .find_map(|line| line.strip_prefix("VmHWM:")?.split_whitespace().next()?.parse::<usize>().ok())
+                .expect("VmHWM") * 1024
+        }
+        let (n, p) = (1_000_000usize, 16usize);
+        let data = Array2::from_shape_fn((n, p), |(i, j)| ((i + j) % 19) as f64);
+        let spec = TermCollectionSpec {
+            linear_terms: (0..p).map(|j| LinearTermSpec {
+                name: format!("x{j}"), feature_col: j, feature_cols: vec![j],
+                categorical_levels: vec![], double_penalty: false,
+                coefficient_geometry: LinearCoefficientGeometry::Unconstrained,
+                coefficient_min: None, coefficient_max: None, frozen_function_mass: None,
+            }).collect(),
+            random_effect_terms: vec![], smooth_terms: vec![],
+        };
+        let before = hwm();
+        let built = build_term_collection_design(data.view(), &spec).expect("million-row design");
+        let growth = hwm().saturating_sub(before);
+        let column_bytes = n * std::mem::size_of::<f64>();
+        let derived_limit = n * p * std::mem::size_of::<f64>() + 2 * column_bytes;
+        assert!(growth <= derived_limit, "peak RSS growth {growth} exceeded derived {derived_limit}");
+        assert_eq!(built.design.nrows(), n);
+    }
 
     /// One `double_penalty=true` linear term named `x`, no smooth/random-effect
     /// terms — the minimal spec that exercises `linear_function_mass` without

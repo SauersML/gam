@@ -16,8 +16,8 @@
 //!      [`super::intrinsic_seed::farthest_point_landmarks`], the same greedy
 //!      coverage pattern the intrinsic seeder uses), so the patches tile the
 //!      manifold with sublinearly many charts;
-//!   2. one PATCH per center — its nearest ambient rows, at most `patch_size` of
-//!      them — sized so neighboring patches OVERLAP (controlled by
+//!   2. one PATCH per center — its nearest ambient rows, at most
+//!      `patch_size` of them — sized so neighboring patches OVERLAP (controlled by
 //!      [`LocalAtlasConfig`]). The neighborhood is the LARGEST prefix of the
 //!      distance order that yields a certified chart: a local-PCA frame is a
 //!      TANGENT plane only while the patch stays inside the local curvature scale,
@@ -76,7 +76,7 @@ use std::fmt;
 use gam_linalg::faer_ndarray::FaerSvd;
 
 use super::AtlasOrientability;
-use super::intrinsic_seed::farthest_point_landmarks;
+use super::intrinsic_seed::{farthest_point_landmarks, intrinsic_geodesic_embedding};
 
 #[cfg(test)]
 #[path = "local_chart_recovery_tests.rs"]
@@ -139,6 +139,14 @@ fn frame_angular_resolution(certificate: &ChartCertificate) -> f64 {
     let epsilon = 1.0 - captured;
     let sine = (epsilon / captured).sqrt();
     if sine.is_finite() { sine.min(1.0) } else { 1.0 }
+}
+
+fn distance_order(z: ArrayView2<'_, f64>, center: usize) -> Vec<usize> {
+    let mut scored: Vec<(f64, usize)> = (0..z.nrows())
+        .map(|row| (sq_distance(z, center, row), row))
+        .collect();
+    scored.sort_by(|a, b| a.0.total_cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+    scored.into_iter().map(|(_, row)| row).collect()
 }
 
 /// The two frames' COMBINED angular resolution, as a sine: `sin(φ_a + φ_b)`.
@@ -298,6 +306,8 @@ pub enum LocalChartError {
     },
     /// The SVD backing a chart or a transition failed to converge.
     SvdFailure { center: usize, detail: String },
+    /// The independent intrinsic realization needed to audit the cover failed.
+    IntrinsicMetricFailure { detail: String },
     /// Individually chartable centers were dropped (see [`LocalAtlas::rejected_centers`]),
     /// but the certified charts that remain cover fewer than `MIN_ATLAS_ROW_COVERAGE`
     /// of the rows — the surviving sub-atlas describes only a minority of the sample,
@@ -361,6 +371,9 @@ impl fmt::Display for LocalChartError {
                     f,
                     "local_charts: SVD failed for patch at row {center}: {detail}"
                 )
+            }
+            Self::IntrinsicMetricFailure { detail } => {
+                write!(f, "local_charts: intrinsic cover audit failed: {detail}")
             }
             Self::AtlasCoverageTooLow {
                 certified,
@@ -601,6 +614,7 @@ pub struct LocalAtlas {
     charts: Vec<LocalChart>,
     transitions: Vec<ChartTransition>,
     rejected_centers: Vec<RejectedCenter>,
+    intrinsic_cover_multiplicity: (usize, f64),
 }
 
 impl LocalAtlas {
@@ -638,9 +652,10 @@ impl LocalAtlas {
         }
         let min_overlap = config.min_overlap.max(d + 1);
 
+        let membership_coords = intrinsic_geodesic_embedding(z, d)
+            .map_err(|detail| LocalChartError::IntrinsicMetricFailure { detail })?;
         // (1) deterministic farthest-point centers (reused intrinsic-seed machinery).
         let centers = farthest_point_landmarks(z, config.patch_count.max(1).min(n));
-
         // (2)+(3) one certified local-PCA chart per patch, on the largest
         // neighborhood that certifies (see `certified_neighborhood_chart`). A center
         // whose neighborhood cannot certify at any admissible size is DROPPED with its
@@ -698,6 +713,26 @@ impl LocalAtlas {
             });
         }
 
+        // Independently realize the same cover budget in intrinsic coordinates.
+        // A fold can make the ambient cover look regular while its intrinsic
+        // realization piles many charts onto one region; topology may not be
+        // promoted from a cover that fails either coordinate-system certificate.
+        let intrinsic_centers = farthest_point_landmarks(
+            membership_coords.view(),
+            config.patch_count.max(1).min(n),
+        );
+        let mut intrinsic_counts = vec![0usize; n];
+        for center in intrinsic_centers {
+            for row in distance_order(membership_coords.view(), center)
+                .into_iter()
+                .take(patch_size)
+            {
+                intrinsic_counts[row] += 1;
+            }
+        }
+        let intrinsic_max = intrinsic_counts.iter().copied().max().unwrap_or(0);
+        let intrinsic_mean = intrinsic_counts.iter().sum::<usize>() as f64 / n as f64;
+
         // (4) orthogonal Procrustes transition per overlapping patch pair.
         let mut transitions: Vec<ChartTransition> = Vec::new();
         let mut overlap_id = 0usize;
@@ -720,6 +755,7 @@ impl LocalAtlas {
             charts,
             transitions,
             rejected_centers,
+            intrinsic_cover_multiplicity: (intrinsic_max, intrinsic_mean),
         })
     }
 
@@ -767,6 +803,10 @@ impl LocalAtlas {
     #[must_use]
     pub fn rejected_centers(&self) -> &[RejectedCenter] {
         &self.rejected_centers
+    }
+
+    pub(super) fn intrinsic_cover_multiplicity(&self) -> (usize, f64) {
+        self.intrinsic_cover_multiplicity
     }
 
     /// Numerically well-conditioned observed transition signs as
@@ -835,16 +875,6 @@ impl LocalAtlas {
     }
 }
 
-/// Every ambient row ordered by ascending Euclidean distance to `center`, ties
-/// broken by ascending row index (a TOTAL order, so the ordering is independent of
-/// the sort's stability and identical run-to-run). `center` itself is first.
-fn distance_order(z: ArrayView2<'_, f64>, center: usize) -> Vec<usize> {
-    let n = z.nrows();
-    let mut scored: Vec<(f64, usize)> = (0..n).map(|r| (sq_distance(z, center, r), r)).collect();
-    scored.sort_by(|a, b| a.0.total_cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
-    scored.into_iter().map(|(_, r)| r).collect()
-}
-
 /// The chart of the LARGEST certifiable neighborhood of `center`, at most
 /// `patch_size` rows.
 ///
@@ -886,12 +916,12 @@ fn certified_neighborhood_chart(
 }
 
 fn sq_distance(z: ArrayView2<'_, f64>, a: usize, b: usize) -> f64 {
-    let mut acc = 0.0;
-    for c in 0..z.ncols() {
-        let diff = z[[a, c]] - z[[b, c]];
-        acc += diff * diff;
-    }
-    acc
+    (0..z.ncols())
+        .map(|column| {
+            let difference = z[[a, column]] - z[[b, column]];
+            difference * difference
+        })
+        .sum()
 }
 
 /// Intersection of two ascending-sorted row lists, ascending.

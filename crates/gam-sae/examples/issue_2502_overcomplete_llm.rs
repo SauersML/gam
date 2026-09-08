@@ -58,6 +58,19 @@ struct Npy {
     data_off: usize,
 }
 
+/// Cross the state/model boundary through the library's convergence gate.
+///
+/// This example used to read `decoder()` and `gamma()` directly after its epoch
+/// loop.  Those accessors intentionally expose a resumable optimizer state, not
+/// a fitted dictionary; using them here let a run that exhausted `--epochs`
+/// write all of the same model artifacts as a converged run.  Keep the gate in
+/// one small function so the campaign entry point and its regression test cannot
+/// silently drift apart.
+fn finalized_dictionary(state: &BlockSparseStreamState) -> Result<(Array2<f32>, f32), String> {
+    let fit = state.finalize()?;
+    Ok((fit.decoder, fit.gamma))
+}
+
 impl Npy {
     fn open(path: &Path) -> Result<Self, String> {
         let file = File::open(path).map_err(|e| format!("open {}: {e}", path.display()))?;
@@ -182,7 +195,6 @@ fn joint_ls_row(
         }
     }
 }
-
 
 /// Greedy orthogonal matching pursuit over a SHORTLIST, then the exact
 /// projection onto the atoms it picks.
@@ -661,7 +673,8 @@ fn main() -> Result<(), String> {
         );
         (d, args.load_gamma)
     } else {
-        (state.decoder().to_owned(), state.gamma())
+        finalized_dictionary(&state)
+            .map_err(|e| format!("arm {} did not produce a fitted dictionary: {e}", args.arm))?
     };
 
     // Held-out pass: transform, reconstruct, and accumulate the sums the FVU and
@@ -1006,4 +1019,25 @@ fn main() -> Result<(), String> {
         numbers.display()
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Regression for #2502: exhausting the campaign's epoch allowance must
+    /// not turn the current optimizer iterate into a dictionary artifact.
+    #[test]
+    fn unconverged_campaign_state_cannot_become_a_dictionary() {
+        let cfg = BlockSparseConfig::new(1, 1);
+        let seed = Array2::from_shape_vec((1, 2), vec![1.0, 0.0]).unwrap();
+        let state = BlockSparseStreamState::new_with_decoder(seed, &cfg).unwrap();
+
+        let error = finalized_dictionary(&state).unwrap_err();
+
+        assert!(
+            error.contains("streaming fit has not converged"),
+            "unexpected convergence-gate error: {error}"
+        );
+    }
 }

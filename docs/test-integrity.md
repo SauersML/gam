@@ -14,6 +14,17 @@ Tests whose production behavior was removed need a semantic retirement decision;
 tests that exercise surviving behavior need repair. Compilation alone cannot tell
 the two apart. Do not delete a failing test merely because its fixture was deleted.
 
+`scripts/source_removal_guard.py --base BASE --head HEAD` makes that removal
+policy executable over immutable Git trees. It guards every removed public item,
+every removed test-scoped item (including helpers rather than only `#[test]`
+functions), and every private production item with another Rust-source
+occurrence, including in a supported test target. This is intentionally conservative: source references survive
+inlining, monomorphisation and LTO, while a linked symbol table does not. A truly
+unreferenced private item may be removed directly; guarded removals require an
+exact, commit-specific semantic record in `docs/source-removal-changes.json`.
+The record is a reviewed retirement mechanism, not a search box or an override
+that proves reachability.
+
 `scripts/test_census.py --base BASE --head HEAD` compares immutable Git trees,
 independent of the worktree or index. It reports the Rust-file denominator,
 ordinary test declaration count, and issue-suffixed test identities under

@@ -17,7 +17,6 @@ pub use columns::{resolve_offset_column, resolve_weight_column};
 pub(crate) use columns::resolve_continuous_column;
 pub use family::{
     FamilyNuisanceOverrides, resolve_family, response_column_kind, scalar_family_from_name,
-    tweedie_power_is_estimated,
 };
 pub use survival_time::{PreparedSurvivalTimeStack, prepare_survival_time_stack};
 pub use validation::is_binary_response;

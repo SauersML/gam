@@ -4,6 +4,27 @@ use crate::frames::GrassmannFrame;
 use gam_linalg::faer_ndarray::{FaerCholesky, FaerSvd};
 use ndarray::{Array2, ArrayView2, ArrayViewMut2};
 
+/// The resolution of a frame residual read off `f32`-stored frames.
+///
+/// The block dictionary is stored as `f32`. A stationarity residual computed
+/// from those frames is a difference of quantities carrying `f32` round-off, so
+/// below `f32::EPSILON` it is not SMALL, it is UNREPRESENTABLE: the number is
+/// the storage noise, not the distance to the fixed point. A convergence bar
+/// placed under it asks the frames a question their own precision cannot
+/// answer, and no amount of iterating can clear it.
+///
+/// This is not a chosen tolerance. It is the machine epsilon of the type the
+/// frames are stored in — the instrument reporting its own noise floor. The
+/// workspace already states the principle for the timing gates, in
+/// `gam_math::paired_timing`: "There is no chosen tolerance here: the
+/// instrument reports its noise floor, and that is the only denominator a
+/// parity bar can honestly be stated in." Same argument, different instrument.
+///
+/// Callers take `tolerance.max(STORED_FRAME_RESOLUTION)`, so a bar ABOVE the
+/// floor is honoured exactly as configured and only a bar below it is lifted to
+/// the floor (#2825).
+pub(super) const STORED_FRAME_RESOLUTION: f64 = f32::EPSILON as f64;
+
 /// Relative distance of the actual stored projectors, without subtracting
 /// order-one overlap traces to recover a tiny squared displacement.
 pub(super) fn stored_projector_distance(

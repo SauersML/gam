@@ -122,9 +122,15 @@ fn a_non_descent_scale_keeps_the_support_definable_2825() {
             .collect()
     };
     // NON-VACUITY: at a descent scale this row takes both blocks.
-    assert_eq!(live(&code_row(x.view(), decoder.view(), 1.0, 1, 2, &shortlist)).len(), 2);
+    assert_eq!(
+        live(&code_row(x.view(), decoder.view(), 1.0, 1, 2, &shortlist)).len(),
+        2
+    );
     for gamma in [2.0_f32, 3.5] {
-        assert!(2.0 * gamma - gamma * gamma <= 0.0, "gamma {gamma} must be non-descent");
+        assert!(
+            2.0 * gamma - gamma * gamma <= 0.0,
+            "gamma {gamma} must be non-descent"
+        );
         let selected = code_row(x.view(), decoder.view(), gamma, 1, 2, &shortlist);
         assert_eq!(
             live(&selected),
@@ -1077,8 +1083,8 @@ fn coordinate_partition_frames_are_orthonormal_and_data_independent() {
 }
 
 #[test]
-fn farthest_point_seeded_entry_matches_default_byte_for_byte() {
-    // `fit_block_sparse_dictionary` must be exactly the FarthestPoint case of the
+fn data_row_seeded_entry_matches_default_byte_for_byte_2023() {
+    // `fit_block_sparse_dictionary` must be exactly the DataRows case of the
     // seeded entry — same seed, same alternation, same fixed point.
     let (p, b, n_blocks) = (8usize, 2usize, 3usize);
     let planted = planted_frames(p, n_blocks, b);
@@ -1097,17 +1103,47 @@ fn farthest_point_seeded_entry_matches_default_byte_for_byte() {
     };
     let default_fit = fit_block_sparse_dictionary(x.view(), &config).expect("default fit");
     let seeded_fit =
-        fit_block_sparse_dictionary_with_seed(x.view(), &config, BlockSeedPolicy::FarthestPoint)
-            .expect("FarthestPoint seeded fit");
+        fit_block_sparse_dictionary_with_seed(x.view(), &config, BlockSeedPolicy::DataRows)
+            .expect("data-row seeded fit");
     assert_eq!(
         default_fit.decoder, seeded_fit.decoder,
-        "the default entry must be byte-identical to the FarthestPoint seeded entry"
+        "the default entry must be byte-identical to the data-row seeded entry"
     );
     assert_eq!(
         default_fit.explained_variance,
         seeded_fit.explained_variance
     );
     assert_eq!(default_fit.epochs, seeded_fit.epochs);
+}
+
+#[test]
+fn data_row_seed_places_every_overcomplete_block_in_the_observed_cloud_2023() {
+    // A rotated rank-one cloud is adversarial to coordinate axes.  Even with
+    // K > P, the production seed must place every scalar block on the observed
+    // direction rather than create dead blocks and hope AuxK later revives them.
+    let direction = [1.0_f32, 2.0, 3.0, 4.0];
+    let x = Array2::from_shape_fn((32, direction.len()), |(row, column)| {
+        (row as f32 - 15.5) * direction[column]
+    });
+    let frames = data_row_frames(x.view(), 16, 1);
+    let direction_norm = direction
+        .iter()
+        .map(|value| value * value)
+        .sum::<f32>()
+        .sqrt();
+    for block in 0..16 {
+        let alignment = frames
+            .row(block)
+            .iter()
+            .zip(direction.iter())
+            .map(|(&left, &right)| left * right / direction_norm)
+            .sum::<f32>()
+            .abs();
+        assert!(
+            (alignment - 1.0).abs() <= 8.0 * f32::EPSILON,
+            "block {block} was not seeded from the observed cloud: alignment={alignment}"
+        );
+    }
 }
 
 #[test]
@@ -1244,9 +1280,14 @@ fn tied_frame_stationarity_separates_normal_storage_error_from_tangent_signal_28
         action[[1, 0]] = 3.0 * current[[0, 1]] as f64;
         let scale = action.iter().map(|v| v * v).sum::<f64>().sqrt();
         let measured = super::super::block_frame::polar_tied_frame_step(
-            current.view(), action.view_mut(), second.view(), 0.0, 1.0e30,
+            current.view(),
+            action.view_mut(),
+            second.view(),
+            0.0,
+            1.0e30,
             proposal.view_mut(),
-        ).unwrap();
+        )
+        .unwrap();
         assert!((measured - tangent / scale).abs() <= 16.0 * f64::EPSILON);
     }
 }
@@ -1420,5 +1461,295 @@ fn greedy_admission_never_prices_worse_than_the_topk_quota_2825() {
     assert!(
         strictly_better > 0,
         "the quota must be strictly beaten somewhere, or this test is vacuous"
+    );
+}
+
+/// #2825: the frame convergence bar is denominated in the resolution of the
+/// frames it is read from, and this pins BOTH halves of that — the half that
+/// lifts and, more importantly, the half that does not.
+///
+/// The block dictionary is stored as `f32`, so a frame residual computed from
+/// it carries `f32` round-off. Below `f32::EPSILON` such a residual is not
+/// small, it is unrepresentable, and a bar placed under it asks the frames a
+/// question their own storage cannot answer. Six block fits sat exactly there:
+/// at `ev_residual`, `gamma_residual`, `routing_residual` and
+/// `reconstruction_residual` all exactly zero, EV = 1 to fourteen figures, no
+/// births and no polar failures — genuine fixed points — with frame residuals
+/// of `1.7017e-8 .. 2.5664e-8` against configured tolerances of `1e-9` and
+/// `1e-10`, i.e. bars asking for 119x and 1192x finer than the storage
+/// resolution of `1.192093e-7`.
+///
+/// The danger in a floor is that it silently becomes a blanket relaxation. It
+/// does not here, and that is what the second half of this test is for: a
+/// tolerance ABOVE the floor must be honoured EXACTLY as configured, so the
+/// floor can only ever lift a bar that was below the instrument's noise, never
+/// loosen one that was above it.
+#[test]
+fn the_frame_bar_is_denominated_in_the_stored_frame_resolution_2825() {
+    let resolution = super::super::block_frame::STORED_FRAME_RESOLUTION;
+    assert_eq!(
+        resolution,
+        f64::from(f32::EPSILON),
+        "the floor is the machine epsilon of the type the frames are stored in, \
+         not a chosen number"
+    );
+
+    // The six fits' measured band, from the #2825 arm-deletion run. Every one is
+    // below the storage resolution, which is why no amount of iterating cleared
+    // the configured bar.
+    let measured_band = [
+        1.7016687085877477e-8_f64,
+        2.1350316734503195e-8,
+        2.3524703573643420e-8,
+        2.4516826402228734e-8,
+        2.5664090977161682e-8,
+    ];
+    for residual in measured_band {
+        assert!(
+            residual < resolution,
+            "a residual the frames cannot resolve must sit below the floor; \
+             got {residual} against {resolution}"
+        );
+    }
+
+    // BELOW the floor: the bar lifts to the floor, so a fixed point the frames
+    // cannot resolve past is admitted.
+    for tolerance in [1.0e-10_f64, 1.0e-9] {
+        let bar = tolerance.max(resolution);
+        assert_eq!(bar, resolution, "a sub-resolution bar lifts to the floor");
+        for residual in measured_band {
+            assert!(
+                residual > tolerance && residual <= bar,
+                "residual {residual} is unreachable at tol {tolerance} and \
+                 admitted at the floor {bar}"
+            );
+        }
+    }
+
+    // ABOVE the floor: unchanged, exactly. This is the half that keeps the floor
+    // from being a blanket relaxation — a configured bar coarser than the
+    // instrument's noise is the caller's, and the floor never touches it.
+    for tolerance in [1.0e-6_f64, 1.0e-3, 1.0e-1] {
+        assert_eq!(
+            tolerance.max(resolution),
+            tolerance,
+            "a bar above the storage resolution must be honoured exactly as \
+             configured, never loosened"
+        );
+    }
+}
+
+/// #2825 — THE FRAME RESIDUAL CANNOT RESOLVE BELOW THE STORED `f32` QUANTIZATION.
+///
+/// The dictionary is stored as `f32`. Two `f32` renderings of the SAME plane —
+/// here the same subspace written in two different internal gauges — are not
+/// the same bytes, so the projector distance between them is nonzero and of
+/// order `f32::EPSILON`. That number is a property of the storage, not of the
+/// fit: it is what the instrument reports when nothing moved. A bar below it
+/// is therefore not a stricter test but an unreachable one, and it refuses an
+/// exact fixed point on the same evidence it refuses a bad one — which is why
+/// the configured `1e-9` / `1e-10` tolerances could never close.
+///
+/// The control is the other half: a real `1e-4` rotation OUT of the plane must
+/// still sit far above the floor, so denominating the bar in the storage
+/// resolution does not blind the criterion to a frame that actually moved.
+#[test]
+fn frame_residual_cannot_resolve_below_the_stored_f32_quantization_2825() {
+    use gam_linalg::faer_ndarray::FaerEigh;
+    let floor = super::super::block_frame::STORED_FRAME_RESOLUTION;
+    // The two tolerances the #2825 fits were configured with. Both are BELOW
+    // the storage resolution; that is the defect this test pins.
+    let configured = [1.0e-9_f64, 1.0e-10];
+    let mut checked = 0usize;
+    for (p, b) in [(8usize, 2usize), (12, 3), (16, 4)] {
+        // An orthonormal b-frame in R^p kept in f64, so the gauge rotation below
+        // is exact to f64 and every difference the residual sees afterwards comes
+        // from the f32 rendering alone.
+        let mut a = Array2::<f64>::zeros((p, p));
+        for i in 0..p {
+            for j in 0..p {
+                a[[i, j]] = ((i * 5 + j * 3 + 1) % 13) as f64 - 6.0;
+            }
+        }
+        let sym = &a + &a.t();
+        let (_ev, evecs) = sym.eigh(faer::Side::Lower).expect("orthonormal seed");
+        let mut u = Array2::<f64>::zeros((b, p));
+        for r in 0..b {
+            for c in 0..p {
+                u[[r, c]] = evecs[[c, r]];
+            }
+        }
+        // Same plane, different gauge: rotate the first two frame vectors into
+        // each other. The SUBSPACE is unchanged, so a residual reading the
+        // subspace in exact arithmetic would be identically zero.
+        let theta = 0.7_f64;
+        let mut rotated = u.clone();
+        for c in 0..p {
+            rotated[[0, c]] = theta.cos() * u[[0, c]] + theta.sin() * u[[1, c]];
+            rotated[[1, c]] = -theta.sin() * u[[0, c]] + theta.cos() * u[[1, c]];
+        }
+        let stored = u.mapv(|value| value as f32);
+        let gauged = rotated.mapv(|value| value as f32);
+        let unmoved =
+            frame_fixed_point_residual(stored.view(), gauged.view(), 1, b).expect("gauge residual");
+
+        // NON-VACUITY: the two renderings must actually differ in bytes, or
+        // `stored_projector_distance` short-circuits to an exact 0.0 and this
+        // test would pass while measuring nothing.
+        assert!(
+            unmoved > 0.0,
+            "p={p} b={b}: the two f32 renderings must differ, else the bitwise \
+             short-circuit makes this vacuous"
+        );
+        assert!(
+            unmoved <= floor,
+            "p={p} b={b}: a frame that did not move reported {unmoved:.6e}, above \
+             the storage floor {floor:.6e} the bar is denominated in"
+        );
+        for tolerance in configured {
+            assert!(
+                unmoved > tolerance,
+                "p={p} b={b}: an UNMOVED frame reports {unmoved:.6e}, which must \
+                 exceed the configured bar {tolerance:.6e} — that is why #2825's \
+                 exactly-determined fits could never certify"
+            );
+        }
+
+        // CONTROL: rotate the first frame vector 1e-4 rad out of the plane,
+        // along an eigenvector the frame does not span.
+        let angle = 1.0e-4_f64;
+        let mut tilted = u.clone();
+        for c in 0..p {
+            tilted[[0, c]] = angle.cos() * u[[0, c]] + angle.sin() * evecs[[c, b]];
+        }
+        let moved = frame_fixed_point_residual(
+            stored.view(),
+            tilted.mapv(|value| value as f32).view(),
+            1,
+            b,
+        )
+        .expect("tilt residual");
+        eprintln!(
+            "[#2825 storage floor] p={p} b={b} floor={floor:.6e} unmoved={unmoved:.6e} \
+             ({:.3}x floor) moved={moved:.6e} ({:.1}x floor)",
+            unmoved / floor,
+            moved / floor
+        );
+        assert!(
+            moved > 100.0 * floor,
+            "p={p} b={b}: a 1e-4 rotation reported {moved:.6e}; the floor \
+             {floor:.6e} must not blind the criterion to a frame that moved"
+        );
+        checked += 1;
+    }
+    assert_eq!(checked, 3, "every shape must have been measured");
+}
+
+/// #2825 — A FIT WHOSE FRAME RESIDUAL IS STORAGE NOISE CERTIFIES.
+///
+/// `certified` is the field the whole convergence contract rests on and no test
+/// in this crate asserted it. With the frame bar denominated in the storage
+/// resolution, a planted fit closes arm (1) — and it does so with its frame
+/// residual ABOVE the configured tolerance, which is the non-vacuity: it
+/// certifies THROUGH the floor, not because the configured bar was met.
+///
+/// This test asserts only the positive, deliberately. The floor's discriminating
+/// power — that it admits a frame which did not move and still refuses one that
+/// did — is pinned one level down, on the residual function itself, by
+/// [`frame_residual_cannot_resolve_below_the_stored_f32_quantization_2825`],
+/// where a gauge-only rendering reads 0.17-0.27x the floor and a `1e-4` rotation
+/// reads 419-593x it. That is where the floor is applied, so that is where the
+/// separation belongs; re-deriving `tolerance.max(floor)` here would only score
+/// the rule against itself.
+///
+/// MEASURED (this fixture, lane y5): the exactly-determined fit reports
+/// `ev = 1.00000000000000`, `ev_residual = 0`, `gamma_residual = 0` and
+/// `frame_residual = 2.148690e-8` — 0.180x the floor, and 215x the configured
+/// `1e-10` it could never have cleared.
+///
+/// The over-complete arm is asserted as a SECOND POSITIVE, not as a control. It
+/// was written as a control on the belief that a `K > rank` fit cannot reach a
+/// frame fixed point; `8aa65d500` refuted that by making the support step a
+/// descent step on the shared objective, and
+/// `tiered::fit::fit_tests::tiered_certifies_at_k_gg_rank_once_the_support_step_descends_2275_2825`
+/// already records it. Measured here at `frame_residual = 2.352470e-8`, which is
+/// one of the six residuals the landed floor cites.
+#[test]
+fn exactly_determined_block_fit_certifies_at_the_storage_resolution_2825() {
+    let floor = super::super::block_frame::STORED_FRAME_RESOLUTION;
+    let (p, b, n_blocks) = (8usize, 2usize, 3usize);
+    let planted = planted_frames(p, n_blocks, b);
+    let x = planted_data(&planted, n_blocks, b, p, 180);
+    let config = BlockSparseConfig {
+        n_blocks,
+        block_size: b,
+        block_topk: 1,
+        max_epochs: 80,
+        minibatch: 64,
+        block_tile: 8,
+        frame_ridge: 1.0e-9,
+        aux_k: 3,
+        matryoshka_prefix: false,
+        tolerance: 1.0e-10,
+    };
+    let fit = fit_block_sparse_dictionary(x.view(), &config).expect("exactly determined block fit");
+    let exact = fit.convergence;
+    eprintln!(
+        "[#2825 certify] exact: ev={:.14} frame_residual={:.6e} ({:.3}x floor) \
+         ev_residual={:.3e} gamma_residual={:.3e} certified={}",
+        fit.explained_variance,
+        exact.frame_residual,
+        exact.frame_residual / floor,
+        exact.ev_residual,
+        exact.gamma_residual,
+        exact.certified
+    );
+    assert!(
+        exact.certified,
+        "an exactly-determined planted fit must close arm (1): frame_residual \
+         {:.6e} against floor {floor:.6e}",
+        exact.frame_residual
+    );
+    // NON-VACUITY: it certified THROUGH the storage floor. If the frame residual
+    // had met the configured tolerance on its own, this test would say nothing
+    // about the denomination.
+    assert!(
+        exact.frame_residual > config.tolerance,
+        "the frame residual {:.6e} met the configured bar {:.6e} unaided; this \
+         fixture no longer exercises the storage floor",
+        exact.frame_residual,
+        config.tolerance
+    );
+    assert!(
+        exact.frame_residual <= floor,
+        "certified with frame_residual {:.6e} above the floor {floor:.6e}",
+        exact.frame_residual
+    );
+
+    // The over-complete fit, as a second positive: four rank-2 blocks against
+    // six planted directions. Since 8aa65d500 the support step descends the
+    // shared objective, so this reaches a frame fixed point too.
+    let over = BlockSparseConfig {
+        n_blocks: n_blocks + 1,
+        ..config
+    };
+    let over_fit = fit_block_sparse_dictionary(x.view(), &over).expect("over-complete block fit");
+    eprintln!(
+        "[#2825 certify] over-complete: frame_residual={:.6e} ({:.3}x floor) certified={}",
+        over_fit.convergence.frame_residual,
+        over_fit.convergence.frame_residual / floor,
+        over_fit.convergence.certified
+    );
+    assert!(
+        over_fit.convergence.certified,
+        "since 8aa65d500 a K > rank fit reaches a frame fixed point too; got \
+         certified=false at frame_residual {:.6e}",
+        over_fit.convergence.frame_residual
+    );
+    assert!(
+        over_fit.convergence.frame_residual <= floor,
+        "the over-complete residual {:.6e} must also be storage noise, not a \
+         bar the floor loosened past; floor {floor:.6e}",
+        over_fit.convergence.frame_residual
     );
 }

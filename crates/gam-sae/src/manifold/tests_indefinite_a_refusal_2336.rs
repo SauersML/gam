@@ -63,7 +63,7 @@ fn fully_degenerate_cluster_diagonalizes_direct_e_diag_2267() {
     let e_diag = Array1::from_shape_fn(total_t, |row| 0.5 * (row as f64 + 1.0));
 
     let (eigenvalues, eigenvectors) =
-        SaeManifoldTerm::cluster_stable_eigh(&a, &e_diag, total_t)
+        SaeManifoldTerm::cluster_stable_eigh(&a, &e_diag, None, total_t)
             .expect("a fully degenerate exact-A cluster must resolve against diagonal E");
 
     let eigenvalue_error = eigenvalues
@@ -129,7 +129,7 @@ fn nearly_degenerate_distinct_spectrum_preserves_eigenpairs_2515() {
     let e_diag = ndarray::array![1.0, 2.0];
 
     let (eigenvalues, eigenvectors) =
-        SaeManifoldTerm::cluster_stable_eigh(&operator, &e_diag, 2)
+        SaeManifoldTerm::cluster_stable_eigh(&operator, &e_diag, None, 2)
             .expect("the near-degenerate exact-A spectrum must decompose");
     let residual = operator.dot(&eigenvectors)
         - eigenvectors.dot(&Array2::from_diag(&eigenvalues));
@@ -240,8 +240,13 @@ fn priced_ard_direct_gradient_matches_fixed_state_value_2434() {
     let e_diag = term
         .materialize_ard_concave_clamp_diagonal(&rho, &cache)
         .expect("materialize the clamp-attribution diagonal");
-    let (eigs, vecs) =
-        SaeManifoldTerm::cluster_stable_eigh(&a, &e_diag, total_t).expect("stable exact-A eigh");
+    // #2828 — the production classification also carries the border half of
+    // `E`, so a probe that shares the scalar rule must share the operator too.
+    let e_beta = term
+        .decoder_prior_majorizer_gap_border(&cache)
+        .expect("decoder-prior majorization gap");
+    let (eigs, vecs) = SaeManifoldTerm::cluster_stable_eigh(&a, &e_diag, e_beta.as_ref(), total_t)
+        .expect("stable exact-A eigh");
     // #2673 — the band is per direction, in the `B` metric both the value and
     // the gradient classify in. This probe supplies its own eigenvectors and its
     // own `B`-applies and shares only the scalar rule.
@@ -463,8 +468,12 @@ fn zz_measure_best_seen_classification_2228() {
                 .materialize_ard_concave_clamp_diagonal(&rho, &cache)
                 .expect("ARD concave-clamp diagonal at the certified mode");
             let total_t = cache.delta_t_len();
-            let (eigs, vecs) = SaeManifoldTerm::cluster_stable_eigh(&a, &e_diag, total_t)
-                .expect("A eigendecomposition (gate-identical clustering)");
+            let e_beta = term
+                .decoder_prior_majorizer_gap_border(&cache)
+                .expect("decoder-prior majorization gap");
+            let (eigs, vecs) =
+                SaeManifoldTerm::cluster_stable_eigh(&a, &e_diag, e_beta.as_ref(), total_t)
+                    .expect("A eigendecomposition (gate-identical clustering)");
             let min_eig = eigs.iter().copied().fold(f64::INFINITY, f64::min);
             let max_eig = eigs.iter().copied().fold(f64::NEG_INFINITY, f64::max);
             let spectral_norm = eigs.iter().map(|value| value.abs()).fold(0.0_f64, f64::max);

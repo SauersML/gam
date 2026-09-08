@@ -370,10 +370,34 @@ fn sae_exact_a_theta_adjoint_gap_measure_2330_patchd() {
     }
     probes.truncate(8);
 
-    // This state has a narrow admitted basin: a 1e-4 coordinate perturbation
-    // can leave it, and at 1e-5 central-difference truncation was almost 1%.
-    // Verify convergence of the scalar oracle itself before comparing it with
-    // the analytic derivative. Richardson removes its leading O(h²) term.
+    // This state has a narrow admitted basin: a 1e-3 coordinate perturbation
+    // leaves it outright (every endpoint refuses). Verify convergence of the
+    // scalar oracle itself before comparing it with the analytic derivative.
+    // Richardson removes its leading O(h²) term.
+    //
+    // #2828 — the coordinate step is 4e-5, MEASURED, not chosen. The oracle
+    // differences `log|A|` through a rebuilt cache and a fresh symmetric
+    // eigendecomposition, so its noise floor is `O(eps·‖A‖)` per eigenvalue;
+    // at this mode `A` carries a cluster of six eigenvalues near 2.7e-8 against
+    // a spectral norm of 3.0e1, and those directions dominate
+    // `tr(A⁺ ∂A/∂θ)`. Below the floor the central difference gets WORSE as `h`
+    // shrinks, which is the opposite of the regime Richardson assumes. Scanned
+    // over the four coordinate probes at this fixture (`max_rel` is the
+    // analytic-vs-FD gap, `max_oracle` the Richardson non-convergence the gate
+    // charges to the same budget):
+    //
+    //   h = 1e-3  every endpoint REFUSED (outside the admitted basin)
+    //   h = 3e-4  max_rel 9.926e-4  max_oracle 1.827e-2
+    //   h = 1e-4  max_rel 2.347e-5  max_oracle 1.419e-4
+    //   h = 4e-5  max_rel 5.231e-5  max_oracle 6.780e-5   <- used
+    //   h = 1e-5  max_rel 3.350e-4  max_oracle 7.927e-4
+    //   h = 3e-6  max_rel 2.859e-3  max_oracle 5.052e-3
+    //
+    // The U shape is the signature of a roundoff-limited oracle, and it is the
+    // measurement that says the analytic θ-adjoint is RIGHT here: at the
+    // oracle's own optimum the two agree to 2e-5..5e-5, an order of magnitude
+    // inside `COORD_TOL`. The former 1e-5 sat a decade below the floor and was
+    // reading its own noise.
     const COORD_TOL: f64 = 1.0e-3;
     const LOGIT_TOL: f64 = 3.0e-2;
     let mut max_coord_rel = 0.0_f64;
@@ -388,7 +412,7 @@ fn sae_exact_a_theta_adjoint_gap_measure_2330_patchd() {
                 AssignmentMode::OrderedBetaBernoulli { temperature, .. } => 1.0e-3 * temperature,
                 _ => unreachable!("OBB fixture"),
             },
-            SaeLocalRowVar::Coord { .. } => 1.0e-5,
+            SaeLocalRowVar::Coord { .. } => 4.0e-5,
         };
         let mut estimates = [0.0_f64; 3];
         for (step_index, divisor) in [1.0_f64, 2.0, 4.0].into_iter().enumerate() {

@@ -8871,11 +8871,26 @@ pub fn build_smooth_design_withworkspace_unvalidated(
             "joint spatial center planner returned no smooth blocks".to_string(),
         )
     })?;
+    build_smooth_design_from_planned_terms(data, &planned_terms, workspace)
+}
+
+/// Build smooth terms after the sweep-level spatial planner has already run.
+///
+/// Joint model construction plans all response blocks together so compatible
+/// spatial terms share one center selection. Re-entering the ordinary builder
+/// used to plan each block a second time, repeating feature standardization,
+/// center selection, and automatic length-scale initialization before every
+/// block build.
+pub fn build_smooth_design_from_planned_terms(
+    data: ArrayView2<'_, f64>,
+    planned_terms: &[SmoothTermSpec],
+    workspace: &mut crate::basis::BasisWorkspace,
+) -> Result<RawSmoothDesign, BasisError> {
     let policy = workspace.policy().clone();
     let local_builds: Vec<LocalSmoothTermBuild> = {
-        use rayon::iter::{IntoParallelIterator, ParallelIterator};
+        use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
         planned_terms
-            .into_par_iter()
+            .par_iter()
             .map(|term| {
                 let mut term_workspace = crate::basis::BasisWorkspace::with_policy(policy.clone());
                 build_single_local_smooth_term(data, &term, &mut term_workspace)
@@ -8887,7 +8902,7 @@ pub fn build_smooth_design_withworkspace_unvalidated(
 
     let mut local_designs: Vec<DesignMatrix> = Vec::with_capacity(local_builds.len());
     let mut affine_offset = Array1::<f64>::zeros(data.nrows());
-    let mut terms_out = Vec::<SmoothTerm>::with_capacity(terms.len());
+    let mut terms_out = Vec::<SmoothTerm>::with_capacity(planned_terms.len());
     let mut penalties_global = Vec::<BlockwisePenalty>::new();
     let mut nullspace_dims_global = Vec::<usize>::new();
     let mut penaltyinfo_global = Vec::<PenaltyBlockInfo>::new();
@@ -8902,7 +8917,7 @@ pub fn build_smooth_design_withworkspace_unvalidated(
     let mut linear_constraints_b: Vec<f64> = Vec::new();
 
     let mut col_start = 0usize;
-    for (term, mut built) in terms.iter().zip(local_builds.into_iter()) {
+    for (term, mut built) in planned_terms.iter().zip(local_builds.into_iter()) {
         let p_local = built.dim;
         let col_end = col_start + p_local;
         let lb_local = if built.box_reparam {

@@ -606,14 +606,6 @@ pub struct DenseCholeskyOperator {
 }
 
 impl DenseCholeskyOperator {
-    /// Replace the cached `2·Σ ln(diag L)` with a value computed at ROOT
-    /// scale. The Cholesky factor itself is untouched — it is the operator's
-    /// solve/trace kernel, and only the log-determinant scalar is
-    /// `O(ε·κ(H))`-limited (#2644).
-    pub(crate) fn install_root_scale_logdet(&mut self, value: f64) {
-        self.cached_logdet = value;
-    }
-
     /// Construct `L⁻ᵀ` by stable triangular substitution without forming
     /// `H⁻¹`. This is the exact projection factor needed by
     /// `tr(H⁻¹A) = tr(FᵀAF)` and

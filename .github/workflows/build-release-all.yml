@@ -21,12 +21,11 @@ env:
   # repo, so warming sccache here is what makes every later run — and, via a
   # shared SCCACHE_BUCKET, local build.sh — start warm instead of cold. sccache
   # keys on flags too, so each matrix target keeps its own entries.
-  # RUSTC_WRAPPER is set only after the job proves that the shared backend is
-  # reachable. Release binaries are never produced by an unmeasured cold build:
-  # each target zeroes its own counters and must report real cache reuse after
-  # compilation. A cold target may seed the content-addressed cache, but it
-  # cannot publish in that run.
+  # RUSTC_WRAPPER is set after the shared backend is reachable. Every target
+  # measures compiler requests and cache health; cold misses seed future runs.
   SCCACHE_GHA_ENABLED: "true"
+  # Keep long release compiles and their counters alive until explicit cleanup.
+  SCCACHE_IDLE_TIMEOUT: "0"
 
 permissions:
   contents: write
@@ -70,6 +69,13 @@ jobs:
           else
             echo "should_run=true" >> "$GITHUB_OUTPUT"
           fi
+
+      - uses: actions/checkout@v5
+        if: steps.check.outputs.should_run == 'true'
+
+      - name: Verify release-cache policy
+        if: steps.check.outputs.should_run == 'true'
+        run: python3 -m unittest discover -s scripts/tests -p test_release_cache.py -v
 
   build:
     needs: gate
@@ -167,19 +173,20 @@ jobs:
 
       - name: Set up cache-service-v2 sccache
         uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
+        with:
+          # Our receipt is collected before explicit daemon cleanup.
+          disable_annotations: true
 
       - name: Require reachable shared compiler cache
         shell: bash
         run: |
           set -euo pipefail
-          if ! sccache --start-server; then
-            echo "::error::Shared sccache backend is unreachable; refusing a cold release build."
-            exit 1
+          source .github/scripts/release-cache.sh
+          release_cache_start
+          if [[ "$RUNNER_OS" == Windows ]]; then
+            RUSTC_WRAPPER=$(cygpath -w "$RUSTC_WRAPPER")
           fi
-          echo "RUSTC_WRAPPER=sccache" >> "$GITHUB_ENV"
-          sccache --show-stats
-          # Attribute the post-build receipt to this target only.
-          sccache --zero-stats
+          echo "RUSTC_WRAPPER=$RUSTC_WRAPPER" >> "$GITHUB_ENV"
 
       - name: Install NVIDIA CUDA Toolkit
         if: matrix.target == 'x86_64-unknown-linux-gnu'
@@ -194,9 +201,7 @@ jobs:
           # Keep rustup/cargo shims owned by the toolchain setup step. Caching
           # ~/.cargo/bin can restore macOS runner rustup-init stubs over them.
           cache-bin: false
-          # A deliberately rejected cold run is the cache seeder. Persist its
-          # dependency artifacts so the next run is warm instead of repeating
-          # the same full compilation before failing at the publication gate.
+          # Preserve successful dependency work even if a later step fails.
           cache-on-failure: true
 
       - name: Verify Rust toolchain
@@ -220,33 +225,12 @@ jobs:
           GAM_RELEASE_TAG: "main-${{ github.sha }}"
         run: cargo +nightly-2026-07-25 build --release --target ${{ matrix.target }} -p gam-cli
 
-      - name: Require measured warm compiler-cache reuse
+      - name: Require measured compiler-cache health
         shell: bash
         run: |
           set -euo pipefail
-          stats=$(sccache --show-stats)
-          printf '%s\n' "$stats"
-          hits=$(awk '$1 == "Cache" && $2 == "hits" { print $3; exit }' <<< "$stats")
-          misses=$(awk '$1 == "Cache" && $2 == "misses" { print $3; exit }' <<< "$stats")
-          read_errors=$(awk '$1 == "Cache" && $2 == "read" && $3 == "errors" { print $4; exit }' <<< "$stats")
-          write_errors=$(awk '$1 == "Cache" && $2 == "write" && $3 == "errors" { print $4; exit }' <<< "$stats")
-          cache_errors=$(awk '$1 == "Cache" && $2 == "errors" { print $3; exit }' <<< "$stats")
-          for value in "$hits" "$misses" "$read_errors" "$write_errors" "$cache_errors"; do
-            if [[ ! "$value" =~ ^[0-9]+$ ]]; then
-              echo "::error::Could not parse the complete sccache receipt; refusing an unmeasured release build."
-              exit 1
-            fi
-          done
-          if (( hits == 0 )); then
-            echo "::error::Release target ${{ matrix.target }} reused zero compiler objects; its dependency artifacts were saved, but this cold build cannot publish."
-            exit 1
-          fi
-          if (( read_errors != 0 || write_errors != 0 || cache_errors != 0 )); then
-            echo "::error::Release target ${{ matrix.target }} had cache errors (read=${read_errors}, write=${write_errors}, other=${cache_errors}); refusing an incomplete warm-cache receipt."
-            exit 1
-          fi
-          echo "Measured warm release target ${{ matrix.target }}: hits=${hits}, misses=${misses}, cache errors=0."
-
+          source .github/scripts/release-cache.sh
+          release_cache_verify
 
       - name: Package (Unix)
         if: runner.os != 'Windows'
@@ -270,6 +254,11 @@ jobs:
             ${{ matrix.asset_name }}.tar.gz
             ${{ matrix.asset_name }}.zip
           if-no-files-found: error
+
+      - name: Stop compiler cache
+        if: always()
+        shell: bash
+        run: sccache --stop-server
 
   release:
     name: Create Release

@@ -8993,6 +8993,18 @@ pub(crate) fn run_outer_uncertified(
                     prev_attempt_grad_norm = Some(cur_grad_norm);
                     next.initial_rho = Some(result.rho.clone());
                     next.operator_initial_trust_radius = next_trust_radius;
+                    // This is a continuation of ONE exhausted trajectory, not a
+                    // new multistart search.  Leaving the original seed policy
+                    // intact caused `run_outer_with_plan` to enumerate all of
+                    // the generated seeds again after installing the checkpoint:
+                    // the three-seed standard-REML sweep therefore ran twice
+                    // whenever one candidate exhausted its budget (#2817).
+                    // Restrict the resumed plan to the checkpoint which carries
+                    // the evidence for the retry.  Besides avoiding unrelated
+                    // work, this preserves the meaning of the progress gate:
+                    // `prev_attempt_grad_norm` and the next terminal norm now
+                    // belong to the same trajectory.
+                    restrict_arc_retry_to_checkpoint(&mut next);
                     retry_config = Some(next);
                     arc_retries_left -= 1;
                     obj.reset();
@@ -9068,6 +9080,17 @@ pub(crate) fn run_outer_uncertified(
     Err(last_error.unwrap_or_else(|| {
         EstimationError::RemlOptimizationFailed(format!("all plan attempts exhausted ({context})"))
     }))
+}
+
+/// Turn an exhausted ARC plan into a single-checkpoint continuation.
+///
+/// Kept separate from the orchestration loop so the no-multistart-on-retry
+/// contract can be pinned without reproducing a full REML seed cascade.
+pub(crate) fn restrict_arc_retry_to_checkpoint(config: &mut OuterConfig) {
+    config.heuristic_lambdas = None;
+    config.seed_config.max_seeds = 1;
+    config.seed_config.seed_budget = 1;
+    config.screen_initial_rho = false;
 }
 
 // ─── Frontier ρ-scaling auto-switch (issue #986) ─────────────────────────

@@ -540,12 +540,6 @@ pub(crate) struct DiagnoseArgs {
         help = "Dataset to evaluate diagnostics against (CSV or parquet); typically the training data"
     )]
     pub(crate) data: PathBuf,
-    #[arg(
-        long = "alo",
-        default_value_t = false,
-        help = "Also compute approximate-leave-one-out (ALO) statistics"
-    )]
-    pub(crate) alo: bool,
 }
 
 #[derive(Args, Debug)]

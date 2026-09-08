@@ -910,11 +910,7 @@ fn encoded_table_from_columns(
         let column = numeric.column(matrix_column);
         let kind = infer_numeric_array_column_kind(column);
         for (row, value) in column.iter().enumerate() {
-            values[[row, table_column]] = if value.is_finite() {
-                *value
-            } else {
-                f64::NAN
-            };
+            values[[row, table_column]] = *value;
         }
         column_kinds[table_column] = kind;
         schema_columns[table_column] = Some(SchemaColumn {
@@ -3042,10 +3038,13 @@ fn basis_with_jet<'py>(
                 let (penalty, null_basis) =
                     smoothness_penalty_impl(knots_array.view(), degree, order)
                         .map_err(py_value_error)?;
-                assert!(
-                    null_basis.ncols() <= penalty.ncols(),
-                    "smoothness penalty nullspace cannot exceed coefficient count"
-                );
+                if null_basis.ncols() > penalty.ncols() {
+                    return Err(py_value_error(format!(
+                        "basis_with_jet bspline returned a nullspace with {} columns for a {}-coefficient penalty",
+                        null_basis.ncols(),
+                        penalty.ncols()
+                    )));
+                }
                 (jet, penalty)
             };
             Ok((
@@ -6820,7 +6819,7 @@ fn build_latent_duchon_design(
     centers: ArrayView2<'_, f64>,
     m: usize,
     periodic: Option<&[Option<f64>]>,
-) -> Result<(Array2<f64>, Array2<f64>), String> {
+) -> Result<(Array2<f64>, Array2<f64>, Option<Array2<f64>>), String> {
     if t_flat.len() != n_obs * latent_dim {
         return Err(format!(
             "latent t length {} != n_obs * latent_dim = {}",
@@ -6869,12 +6868,8 @@ fn build_latent_duchon_design(
     // wrap = TAU for circle/torus); a `None` axis is a Euclidean (open) axis.
     // When `periodic` is `None`/all-open the basis stays byte-identical to the
     // open Euclidean construction (euclidean / sphere / matern latent fits).
-    let periodic_flags: Option<Vec<bool>> = periodic.and_then(|axes| {
-        if axes.len() == latent_dim && axes.iter().any(|p| p.is_some()) {
-            Some(axes.iter().map(|p| p.is_some()).collect())
-        } else {
-            None
-        }
+    let periodic_axes = periodic.filter(|axes| {
+        axes.len() == latent_dim && axes.iter().any(|p| p.is_some())
     });
     let spec = DuchonBasisSpec {
         radial_reparam: None,
@@ -6888,25 +6883,44 @@ fn build_latent_duchon_design(
         periodic: None,
         boundary: OneDimensionalBoundary::Open,
     };
-    let built = if let Some(flags) = periodic_flags {
+    let built = if let Some(axes) = periodic_axes {
         // `periodic` is Some with the same arity (checked above). Each periodic
         // axis carries an explicit chart period (TAU); non-periodic axes get a
         // placeholder period (unused by the builder for `!periodic` axes).
-        let axes = periodic.expect("periodic_flags is only Some when periodic is Some");
+        let flags: Vec<bool> = axes.iter().map(Option::is_some).collect();
         let periods: Vec<f64> = axes.iter().map(|p| p.unwrap_or(1.0)).collect();
         build_duchon_basis_mixed_periodicity_auto(t_mat.view(), &spec, &flags, Some(&periods))
             .map_err(|err| {
                 format!("failed to evaluate periodic N-D Duchon basis for LatentCoord: {err}")
             })?
     } else {
-        build_duchon_basis(t_mat.view(), &spec)
+        // Resolve the data-metric radial chart once on the fixed center cloud,
+        // then replay it at the moving latent rows.  This retains the
+        // conditioning of #1355 without allowing one changed latent row to
+        // rotate every other row (and the caller-supplied penalty) into a new
+        // coefficient frame.
+        let center_built = build_duchon_basis(center_matrix.view(), &spec)
+            .map_err(|err| format!("failed to freeze latent Duchon center chart: {err}"))?;
+        let radial_reparam = match center_built.metadata {
+            gam::terms::basis::BasisMetadata::Duchon { radial_reparam, .. } => radial_reparam,
+            _ => None,
+        };
+        let mut frozen_spec = spec.clone();
+        frozen_spec.radial_reparam = radial_reparam;
+        build_duchon_basis(t_mat.view(), &frozen_spec)
             .map_err(|err| format!("failed to evaluate N-D Duchon basis for LatentCoord: {err}"))?
+    };
+    let radial_reparam = match &built.metadata {
+        gam::terms::basis::BasisMetadata::Duchon { radial_reparam, .. } => {
+            radial_reparam.clone()
+        }
+        _ => None,
     };
     let design = built
         .design
         .try_to_dense_by_chunks("latent_duchon_design")
         .map_err(|err| format!("failed to evaluate N-D Duchon basis for LatentCoord: {err}"))?;
-    Ok((design, t_mat))
+    Ok((design, t_mat, radial_reparam))
 }
 
 /// Input-location jet `∂Φ/∂t` of the PERIODIC latent Duchon design, matching the
@@ -6948,7 +6962,9 @@ fn build_latent_duchon_periodic_jet(
         // collapsed centers, same domain wrap, same constant-only constraint
         // nullspace — and returns the dense `(n, kernel_cols + 1)` first
         // derivative `∂Φ/∂t` (the trailing constant column's derivative is 0).
-        let period = axes[0].expect("latent_dim == 1 periodic axis carries a period");
+        let period = axes.first().copied().flatten().ok_or_else(|| {
+            "periodic one-dimensional latent basis requires a period for its axis".to_string()
+        })?;
         let dphi_dt = create_duchon_basis_1d_derivative_dense(
             t_mat.column(0),
             centers.column(0),
@@ -7179,8 +7195,67 @@ fn build_latent_forward_design(
     let basis_kind = latent_basis_kind(basis_kind)?;
     let (design, t_mat) = match basis_kind {
         "duchon" => {
-            let (design, t_mat) =
+            let (design, t_mat, radial_reparam) =
                 build_latent_duchon_design(t_flat, n_obs, latent_dim, centers, m, periodic)?;
+            if !periodic
+                .map(|axes| axes.iter().any(Option::is_some))
+                .unwrap_or(false)
+            {
+                let (resolved_nullspace, resolved_power) = resolve_duchon_orders(
+                    latent_dim,
+                    duchon_nullspace_order_from_m(m),
+                    0,
+                    None,
+                );
+                let periodic_flags = vec![false; latent_dim];
+                let periods = vec![1.0; latent_dim];
+                let (_canonical_design, raw_jet, _hess) =
+                    gam::terms::basis::build_duchon_basis_design_and_jets(
+                        t_mat.view(),
+                        centers,
+                        None,
+                        resolved_power as f64,
+                        resolved_nullspace,
+                        &periodic_flags,
+                        &periods,
+                    )
+                    .map_err(|err| {
+                        format!("failed to evaluate N-D Duchon basis for LatentCoord: {err}")
+                    })?;
+                let jet = if let Some(v) = radial_reparam {
+                    let n_raw_radial = v.nrows();
+                    let n_poly = raw_jet.shape()[1].saturating_sub(n_raw_radial);
+                    let mut charted_jet = Array3::<f64>::zeros((
+                        n_obs,
+                        v.ncols() + n_poly,
+                        latent_dim,
+                    ));
+                    for axis in 0..latent_dim {
+                        let radial = raw_jet.slice(s![.., ..n_raw_radial, axis]).dot(&v);
+                        charted_jet
+                            .slice_mut(s![.., ..v.ncols(), axis])
+                            .assign(&radial);
+                    }
+                    if n_poly > 0 {
+                        charted_jet
+                            .slice_mut(s![.., v.ncols().., ..])
+                            .assign(&raw_jet.slice(s![.., n_raw_radial.., ..]));
+                    }
+                    charted_jet
+                } else {
+                    raw_jet
+                };
+                if jet.shape()[1] != design.ncols() {
+                    return Err(format!(
+                        "latent Duchon canonical design mismatch: forward is {}x{}, jet builder is {}x{}",
+                        design.nrows(),
+                        design.ncols(),
+                        jet.shape()[0],
+                        jet.shape()[1]
+                    ));
+                }
+                return Ok((design, t_mat, jet));
+            }
             // On a PERIODIC latent manifold (circle / torus) the forward design is
             // the periodic Duchon basis (1-D Bernoulli Green's function or the
             // multi-axis chord-distance polyharmonic) — a DIFFERENT kernel and
@@ -7334,24 +7409,6 @@ fn build_latent_forward_design(
         ));
     }
     Ok((design, t_mat, jet))
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum SigmaEffMode {
-    Profiled,
-    Fixed,
-}
-
-impl SigmaEffMode {
-    fn parse(value: &str) -> Result<Self, String> {
-        match value.to_ascii_lowercase().as_str() {
-            "profiled" | "profile" | "reml" => Ok(Self::Profiled),
-            "fixed" | "sigma" | "sigma2" => Ok(Self::Fixed),
-            other => Err(format!(
-                "sigma_eff_mode must be 'profiled' or 'fixed'; got {other:?}"
-            )),
-        }
-    }
 }
 
 #[cfg(test)]

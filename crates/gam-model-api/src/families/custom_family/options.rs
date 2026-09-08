@@ -254,6 +254,12 @@ pub(crate) fn validate_hessian_workspace_ready(
     Ok(())
 }
 
+/// Declare second-order outer calculus after validating the coefficient blocks.
+///
+/// `specs` must form a valid custom-family block layout. `coefficient_cost` is
+/// retained for API compatibility and diagnostics; analytic capability is not
+/// demoted on cost. Invalid specifications panic in the common contract
+/// validator.
 pub fn exact_outer_order_from_capability(
     specs: &[ParameterBlockSpec],
     coefficient_cost: u64,
@@ -531,6 +537,10 @@ pub fn block_offsets_from_specs(specs: &[ParameterBlockSpec]) -> Arc<[Range<usiz
 /// magnitude while still bounding pathological probes.
 pub const FIRST_ORDER_BFGS_LOGLAMBDA_STEP_CAP: f64 = 5.0;
 
+/// Report whether a family exposes the strict pseudo-Laplace geometry needed
+/// by the analytic second-order outer solver.
+///
+/// This query is infallible and does not evaluate the likelihood.
 pub fn exact_newton_outer_geometry_supports_second_order_solver<F: CustomFamily + ?Sized>(
     family: &F,
 ) -> bool {
@@ -540,9 +550,13 @@ pub fn exact_newton_outer_geometry_supports_second_order_solver<F: CustomFamily 
 /// Stable public API for installing outer-score subsampling.
 #[derive(Clone)]
 pub struct BlockwiseFitOptions {
+    /// Maximum coefficient-optimizer cycles allowed before non-convergence is returned.
     pub inner_max_cycles: usize,
+    /// Absolute coefficient stationarity tolerance; must be finite and positive.
     pub inner_tol: f64,
+    /// Maximum REML/LAML outer iterations allowed before non-convergence is returned.
     pub outer_max_iter: usize,
+    /// Absolute outer stationarity tolerance; must be finite and positive.
     pub outer_tol: f64,
     /// Optional override for the OUTER smoothing optimizer's
     /// *relative-cost-decrease* convergence stop, decoupled from `outer_tol`.
@@ -747,6 +761,7 @@ pub struct BlockwiseFitOptions {
     pub seed_screening: bool,
 }
 
+/// Default maximum coefficient cycles for a custom-family fit.
 pub const DEFAULT_CUSTOM_FAMILY_INNER_MAX_CYCLES: usize = 1200;
 
 impl Default for BlockwiseFitOptions {

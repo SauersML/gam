@@ -1,0 +1,10 @@
+
+running 5 tests
+test cyclic_alias_default_basis_size_matches_periodic_s_smooth ... ok
+test cyclic_derivative_penalty_wraps_and_has_constant_nullspace ... ok
+test periodic_basis_wraps_partitions_unity_and_has_periodic_derivative ... ok
+test cylinder_formula_builds_tensor_with_periodic_margin ... ok
+test periodic_bspline_terms_build_with_cyclic_penalty_and_formula_alias ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.10s
+

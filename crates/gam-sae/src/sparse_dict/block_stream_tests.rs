@@ -5,6 +5,32 @@ use super::BlockSparseStreamState;
 use crate::sparse_dict::BlockSparseConfig;
 use ndarray::{Array2, array};
 
+#[test]
+fn streaming_seed_is_data_placed_when_dictionary_is_overcomplete_2023() {
+    let direction = [1.0_f32, 2.0, 3.0, 4.0];
+    let seed = Array2::from_shape_fn((32, direction.len()), |(row, column)| {
+        (row as f32 - 15.5) * direction[column]
+    });
+    let config = BlockSparseConfig::new(16, 1);
+    let state = BlockSparseStreamState::new(seed.view(), &config).expect("valid streaming seed");
+    let direction_norm = direction
+        .iter()
+        .map(|value| value * value)
+        .sum::<f32>()
+        .sqrt();
+    for block in 0..config.n_blocks {
+        let alignment = state
+            .decoder
+            .row(block)
+            .iter()
+            .zip(direction.iter())
+            .map(|(&left, &right)| left * right / direction_norm)
+            .sum::<f32>()
+            .abs();
+        assert!((alignment - 1.0).abs() <= 8.0 * f32::EPSILON);
+    }
+}
+
 fn coupled_fixture() -> (Array2<f32>, Array2<f32>, BlockSparseConfig) {
     let x = array![[1.0_f32, 2.0], [-2.0, 1.0], [0.5, 0.2], [-0.7, -0.4]];
     let decoder = array![[1.0_f32, 0.0], [0.6, 0.8]];
@@ -645,4 +671,55 @@ fn overcomplete_stream_accepts_one_evidence_birth_then_dead_tail_is_quiescent_20
         2,
     );
     assert!((artifact.explained_variance - 1.0).abs() <= f64::EPSILON);
+}
+
+#[test]
+fn rerouted_frame_trials_cannot_decrease_streamed_explained_variance_2825() {
+    // The production failure needs more than one over-complete block.  This
+    // deterministic small analogue deliberately has overlapping rank-two
+    // structure, six frames in R^8, top-k three, and no birth machinery.
+    let (rows, p, g, b) = (96usize, 8usize, 6usize, 2usize);
+    let mut bits = 0x2825_u64;
+    let x = Array2::from_shape_fn((rows, p), |(row, column)| {
+        bits = bits.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+        let noise = ((bits >> 40) as f64 / (1_u64 << 24) as f64 - 0.5) * 0.05;
+        let phase = row as f64 * (column + 1) as f64 / rows as f64;
+        (phase.sin() + (phase * 2.0 + column as f64).cos() + noise) as f32
+    });
+    let config = BlockSparseConfig {
+        n_blocks: g,
+        block_size: b,
+        block_topk: 3,
+        max_epochs: 40,
+        minibatch: rows,
+        block_tile: g,
+        frame_ridge: 0.0,
+        aux_k: 0,
+        matryoshka_prefix: false,
+        tolerance: 1.0e-8,
+    };
+    let mut state = BlockSparseStreamState::new(x.slice(ndarray::s![..24, ..]), &config)
+        .expect("over-complete stream");
+    let mut previous = f64::NEG_INFINITY;
+    let mut measurable_improvements = 0usize;
+    for epoch in 0..config.max_epochs {
+        state.partial_fit(x.view()).expect("stream fixture");
+        let stats = state.end_epoch().expect("close epoch");
+        assert!(
+            stats.explained_variance >= previous,
+            "paired rerouting admitted a loss increase at epoch {epoch}: {previous:.17e} -> {:.17e}",
+            stats.explained_variance
+        );
+        if stats.explained_variance > previous && previous.is_finite() {
+            measurable_improvements += 1;
+        }
+        previous = stats.explained_variance;
+        if stats.converged {
+            break;
+        }
+    }
+    assert!(
+        measurable_improvements > 0,
+        "monotonicity would be vacuous if the frame lane never improved"
+    );
 }

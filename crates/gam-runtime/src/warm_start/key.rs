@@ -119,7 +119,8 @@ impl Fingerprinter {
     /// Write one frame header: type discriminator, then length-prefixed tag.
     fn frame(&mut self, code: u8, tag: &[u8]) {
         self.h.update([code]);
-        self.h.update((tag.len() as u32).to_le_bytes());
+        let tag_len = u32::try_from(tag.len()).expect("fingerprint tag length must fit in u32");
+        self.h.update(tag_len.to_le_bytes());
         self.h.update(tag);
     }
 

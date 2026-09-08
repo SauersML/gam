@@ -459,6 +459,12 @@ pub(crate) fn sigma_cubature_evaluate_cpu_rayon(
     rows.into_iter().collect()
 }
 
+/// One atom of the positive discrete measure used for rho marginalisation.
+pub(crate) struct WeightedSigmaPoint {
+    pub result: SigmaPointResult,
+    pub weight: f64,
+}
+
 /// Accumulate the sigma-point cubature total covariance `V̂_p`.
 ///
 /// Math. The estimand is the law of total covariance for the
@@ -468,29 +474,14 @@ pub(crate) fn sigma_cubature_evaluate_cpu_rayon(
 ///     V_p = E_ρ[Cov(β|ρ)] + Cov_ρ[β̂(ρ)] = φ̂·E_ρ[H(ρ)⁻¹] + Cov_ρ[β̂(ρ)].
 /// ```
 ///
-/// `paired[j]` holds the `(H(ρ)⁻¹, β̂(ρ))` pair at the `+` and `−` node of
-/// upgraded ρ-eigendirection `j` (the inverse-Hessian blocks already carrying
-/// their `φ̂`). The two terms are accumulated as
+/// Every point holds `(H(ρ)⁻¹, β̂(ρ))` and a nonnegative mass (the
+/// inverse-Hessian blocks already carry `φ̂`). Both terms are expectations
+/// under that same normalized discrete measure:
 ///
 /// ```text
-///     φ̂·Ê_ρ[H(ρ)⁻¹] = mean over all 2r nodes of the per-node block
-///     Ĉov_ρ[β̂]      = Σ_j c_j c_jᵀ + Σ_k f_k f_kᵀ,
-///     c_j = (β̂(ρ_j⁺) − β̂(ρ_j⁻))/2,     f_k = Qs·J·u_k/√σ_k.
+///     φ̂·Ê_ρ[H(ρ)⁻¹] = Σ_m w_m A_m
+///     Ĉov_ρ[β̂]      = Σ_m w_m (b_m − b̄)(b_m − b̄)ᵀ + Σ_k f_k f_kᵀ.
 /// ```
-///
-/// # Why the covariance term is a PER-DIRECTION chord and not a joint moment
-///
-/// The previous form took the empirical covariance of `β̂` over the whole node
-/// set. That reproduces `J·V_ρ·Jᵀ` for a linear `β̂` only through a conspiracy
-/// between the `√rank` node radius and the `1/(2·rank)` weight, and it breaks
-/// the moment as soon as the two sides of a direction are not at the same
-/// distance — which is exactly what criterion-calibrated nodes produce, and
-/// what an asymmetric criterion (flat one way, a cliff the other) requires.
-///
-/// The per-direction chord has no such conspiracy: with `β̂` linear and the
-/// nodes at `±t_j` it gives `c_j = t_j·Qs·J·u_j`, so at the uncalibrated step
-/// `t_j = σ_j^{-1/2}` the sum is `Σ_j (Qs·J·u_j)(Qs·J·u_j)ᵀ/σ_j = J·V_ρ·Jᵀ`
-/// restricted to the upgraded subspace — *identically*, for any node scaling.
 ///
 /// `fallback_columns` carries the first-order column of every ACTIVE direction
 /// that was not upgraded, so the assembled correction covers the same subspace
@@ -502,18 +493,26 @@ pub(crate) fn sigma_cubature_evaluate_cpu_rayon(
 /// `total − φ̂·H(ρ̂)⁻¹`, the corrected covariance `Vb + correction` telescopes
 /// back to this PSD matrix.
 pub(crate) fn accumulate_sigma_cubature_total_covariance(
-    paired: &[(SigmaPointResult, SigmaPointResult)],
+    points: &[WeightedSigmaPoint],
     fallback_columns: &[Array1<f64>],
     p: usize,
-) -> Array2<f64> {
-    let mut total = Array2::<f64>::zeros((p, p));
-    let node_count = 2 * paired.len();
-    if node_count > 0 {
-        let weight = 1.0 / node_count as f64;
-        for ((cov_plus, _), (cov_minus, _)) in paired {
-            total.scaled_add(weight, cov_plus);
-            total.scaled_add(weight, cov_minus);
+) -> Option<Array2<f64>> {
+    let mass: f64 = points.iter().map(|point| point.weight).sum();
+    if points.is_empty()
+        || !mass.is_finite()
+        || mass <= 0.0
+        || points
+            .iter()
+            .any(|point| !point.weight.is_finite() || point.weight < 0.0)
+    {
+        return None;
         }
+    let mut total = Array2::<f64>::zeros((p, p));
+    let mut mean = Array1::<f64>::zeros(p);
+    for point in points {
+        let weight = point.weight / mass;
+        total.scaled_add(weight, &point.result.0);
+        mean.scaled_add(weight, &point.result.1);
     }
     let accumulate_gram = |column: &Array1<f64>, total: &mut Array2<f64>| {
         for row in 0..p {
@@ -526,14 +525,14 @@ pub(crate) fn accumulate_sigma_cubature_total_covariance(
             }
         }
     };
-    for ((_, beta_plus), (_, beta_minus)) in paired {
-        let chord = (beta_plus - beta_minus).mapv(|value| 0.5 * value);
-        accumulate_gram(&chord, &mut total);
+    for point in points {
+        let centered = (&point.result.1 - &mean).mapv(|value| value * (point.weight / mass).sqrt());
+        accumulate_gram(&centered, &mut total);
     }
     for column in fallback_columns {
         accumulate_gram(column, &mut total);
     }
-    total
+    Some(total)
 }
 
 /// Criterion level a one-sigma sigma-point node sits at.
@@ -578,18 +577,8 @@ const PROFILE_SIGMA_MAX_EVALS: usize = 12;
 
 /// A sigma-point node whose position was calibrated against the criterion.
 pub(crate) struct CalibratedSigmaNode {
-    /// The node itself, `ρ̂ + step·direction`.
-    pub rho: Array1<f64>,
     /// Step length actually taken along `direction`.
     pub step: f64,
-    /// Step length the quadratic model asked for, `σ^{-1/2}`.
-    pub wald_step: f64,
-    /// `V(node) − V(ρ̂)` at the returned step.
-    pub achieved_rise: f64,
-    /// Criterion evaluations this node's calibration spent.
-    pub evaluations: usize,
-    /// The step ran into the ρ box before reaching [`PROFILE_SIGMA_RISE`].
-    pub box_limited: bool,
 }
 
 /// Largest `t ≥ 0` keeping `rho + t·direction` inside the ρ box on every
@@ -611,7 +600,11 @@ fn sigma_step_to_rho_box(rho: &Array1<f64>, direction: &Array1<f64>) -> f64 {
             limit = limit.min((lo - centre) / component);
         }
     }
-    if limit.is_finite() { limit.max(0.0) } else { f64::INFINITY }
+    if limit.is_finite() {
+        limit.max(0.0)
+    } else {
+        f64::INFINITY
+    }
 }
 
 impl<'a> RemlState<'a> {
@@ -648,19 +641,12 @@ impl<'a> RemlState<'a> {
                 .for_each(|(coordinate, component)| *coordinate += step * component);
             point
         };
-        let centre_node = |evaluations: usize| CalibratedSigmaNode {
-            rho: rho_hat.clone(),
-            step: 0.0,
-            wald_step,
-            achieved_rise: 0.0,
-            evaluations,
-            box_limited: true,
-        };
+        let centre_node = CalibratedSigmaNode { step: 0.0 };
         if !wald_step.is_finite() || wald_step <= 0.0 || box_limit <= 0.0 {
             // Either the direction has no resolvable width, or ρ̂ already sits
             // on the box face along it. Both mean the node is the centre and
             // this side of the chord is zero-length.
-            return Ok(centre_node(0));
+            return Ok(centre_node);
         }
 
         let target = PROFILE_SIGMA_RISE;
@@ -704,12 +690,7 @@ impl<'a> RemlState<'a> {
                     // own λ range along this direction. The box face IS the
                     // node; nothing further out exists to sample.
                     return Ok(CalibratedSigmaNode {
-                        rho: at(step),
                         step,
-                        wald_step,
-                        achieved_rise: rise,
-                        evaluations,
-                        box_limited: true,
                     });
                 }
                 lo = step;
@@ -764,14 +745,9 @@ impl<'a> RemlState<'a> {
         if closeness(rise) < closeness(best.1) {
             best = (step, rise);
         }
-        let (step, rise) = if accepts(rise) { (step, rise) } else { best };
+        let (step, _) = if accepts(rise) { (step, rise) } else { best };
         Ok(CalibratedSigmaNode {
-            rho: at(step),
             step,
-            wald_step,
-            achieved_rise: rise,
-            evaluations,
-            box_limited: step >= box_limit,
         })
     }
 }
@@ -1376,7 +1352,28 @@ impl<'a> RemlState<'a> {
                 }
             }
         }
-        let sigma_points: Vec<Array1<f64>> = nodes.iter().map(|node| node.rho.clone()).collect();
+        // The calibrated rays describe a local Gaussian proposal.  They are
+        // not themselves a probability rule: assigning 1/(2r) to one-sigma
+        // axis nodes has covariance V/r, while the old chord accumulator
+        // silently used V.  Build one coherent spherical rule instead.  The
+        // midpoint and half-span of each asymmetric ray pair define the
+        // proposal mean and scale; its 2r atoms lie at radius sqrt(r), hence
+        // all have the same proposal density.
+        let mut proposal_mean = final_rho.clone();
+        let mut proposal_axes: Vec<Array1<f64>> = Vec::with_capacity(rank);
+        for (pair_index, &spectrum_index) in upgraded.iter().enumerate() {
+            let plus = &nodes[2 * pair_index];
+            let minus = &nodes[2 * pair_index + 1];
+            let axis = spectrum.eigenvectors.column(spectrum_index).to_owned();
+            proposal_mean.scaled_add(0.5 * (plus.step - minus.step), &axis);
+            proposal_axes.push(axis.mapv(|value| value * 0.5 * (plus.step + minus.step)));
+        }
+        let radius = (rank as f64).sqrt();
+        let mut sigma_points = Vec::with_capacity(2 * rank);
+        for axis in &proposal_axes {
+            sigma_points.push(&proposal_mean + &axis.mapv(|value| radius * value));
+            sigma_points.push(&proposal_mean - &axis.mapv(|value| radius * value));
+        }
         // Unreachable: `rank >= 1` ensures at least two sigma points
         // (one positive, one negative) per eigenvector. Treat as a
         // NumericalFailure guard so any future regression surfaces.
@@ -1386,6 +1383,29 @@ impl<'a> RemlState<'a> {
                 "empty sigma-point set (unreachable guard)".into(),
             ));
         }
+        let mut proposal_rises = Vec::with_capacity(sigma_points.len());
+        for point in &sigma_points {
+            match self.compute_cost_uncharged(point) {
+                Ok(cost) if cost.is_finite() => proposal_rises.push(cost - centre_cost),
+                Ok(_) => {
+                    return self.finalize_smoothing_outcome(first_order_numerical(
+                        first_order_correction,
+                        "spherical sigma-point criterion is not finite".into(),
+                    ));
+                }
+                Err(error) => {
+                    return self.finalize_smoothing_outcome(first_order_numerical(
+                        first_order_correction,
+                        format!("spherical sigma-point criterion unavailable: {error}").into(),
+                    ));
+                }
+            }
+        }
+        let min_rise = proposal_rises.iter().copied().fold(f64::INFINITY, f64::min);
+        let importance_weights: Vec<f64> = proposal_rises
+            .iter()
+            .map(|rise| (min_rise - rise).exp())
+            .collect();
 
         // Dispatch the sigma-point evaluation to whichever executor is
         // currently the best fit for this build/runtime. See
@@ -1465,28 +1485,20 @@ impl<'a> RemlState<'a> {
         // it — is what makes a wide `Vp` attributable after the fact (#2728).
         if log::log_enabled!(log::Level::Info) {
             for (index, (cov_point, _)) in scaled_pairs.iter().enumerate() {
-                let node = &nodes[index];
                 log::info!(
-                    "[sigma-cubature] node={index} step={:.4e} wald_step={:.4e} ΔV={:.6e} \
-                     target={PROFILE_SIGMA_RISE} evals={} box_limited={} \
+                    "[sigma-cubature] node={index} ΔV={:.6e} \
                      tr(φ̂·H(ρ)⁻¹)={:.6e} tr(φ̂·H(ρ̂)⁻¹)={:.6e}",
-                    node.step,
-                    node.wald_step,
-                    node.achieved_rise,
-                    node.evaluations,
-                    node.box_limited,
+                    proposal_rises[index],
                     cov_point.diag().iter().sum::<f64>(),
                     dispersion_phi * base_cov.diag().iter().sum::<f64>(),
                 );
             }
         }
-        // The executor returns results in node order, and nodes were pushed as
-        // consecutive (+, −) pairs, one pair per upgraded direction.
-        let mut paired: Vec<(SigmaPointResult, SigmaPointResult)> = Vec::with_capacity(rank);
-        let mut remaining = scaled_pairs.into_iter();
-        while let (Some(plus), Some(minus)) = (remaining.next(), remaining.next()) {
-            paired.push((plus, minus));
-        }
+        let weighted_points: Vec<WeightedSigmaPoint> = scaled_pairs
+            .into_iter()
+            .zip(importance_weights)
+            .map(|(result, weight)| WeightedSigmaPoint { result, weight })
+            .collect();
         // Every ACTIVE direction that was not upgraded keeps the first-order
         // column `Qs·J·u_k/√σ_k` it would have contributed to `J·V_ρ·Jᵀ`, so
         // the cubature covers the same subspace the first-order correction
@@ -1502,8 +1514,14 @@ impl<'a> RemlState<'a> {
                     .mapv(|value| value * scale)
             })
             .collect();
-        let mut total_cov =
-            accumulate_sigma_cubature_total_covariance(&paired, &fallback_columns, p);
+        let Some(mut total_cov) =
+            accumulate_sigma_cubature_total_covariance(&weighted_points, &fallback_columns, p)
+        else {
+            return self.finalize_smoothing_outcome(first_order_numerical(
+                first_order_correction,
+                "spherical cubature produced empty, signed, or non-finite mass".into(),
+            ));
+        };
         if !total_cov.iter().all(|v| v.is_finite()) {
             return self.finalize_smoothing_outcome(first_order_numerical(
                 first_order_correction,
@@ -1534,9 +1552,9 @@ impl<'a> RemlState<'a> {
         // unevaluable does not silently become the maximum; a run in which
         // EVERY node was unevaluable reports `-inf`, which is as visibly wrong
         // as it should be.
-        let max_node_criterion_rise = nodes
+        let max_node_criterion_rise = proposal_rises
             .iter()
-            .map(|node| node.achieved_rise)
+            .copied()
             .fold(f64::NEG_INFINITY, f64::max);
         self.finalize_smoothing_outcome(SmoothingCorrectionOutcome::Cubature {
             correction: corr,
@@ -1638,960 +1656,107 @@ impl<'a> RemlState<'a> {
 
 #[cfg(test)]
 mod sigma_cubature_accumulation_tests {
-    //! Math-spec validation tests for the sigma-cubature accumulation formula.
-    //!
-    //! These pin the math of [`accumulate_sigma_cubature_total_covariance`]
-    //! independently of the execution model that produced the per-node
-    //! `(A_m, b_m)` pairs, so the same oracle covers both the CPU Rayon sigma
-    //! loop and the GPU stream-pool sigma executor.
-    //!
-    //! # What the accumulator computes
-    //!
-    //! ```text
-    //!     V̂_p = mean over all 2r nodes of A_m
-    //!         + Σ_j c_j c_jᵀ,   c_j = (b_j⁺ − b_j⁻)/2
-    //!         + Σ_k f_k f_kᵀ    (first-order columns of directions not upgraded)
-    //! ```
-    //!
-    //! The covariance term is a PER-DIRECTION chord Gram, not a joint empirical
-    //! moment over the node set. The joint moment reproduced `J·V_ρ·Jᵀ` only
-    //! through a conspiracy between the `√rank` node radius and the `1/(2·rank)`
-    //! weight, and that conspiracy breaks as soon as the two sides of a
-    //! direction sit at different distances — which is what criterion-calibrated
-    //! nodes are (#2728). The chord form is exact for ANY per-direction node
-    //! scaling, which is what `cubature_linear_exactness_recovers_jvjt` below
-    //! now pins.
-    use super::{SigmaPointResult, accumulate_sigma_cubature_total_covariance};
-    use ndarray::{Array1, Array2};
+    use super::{WeightedSigmaPoint, accumulate_sigma_cubature_total_covariance};
+    use ndarray::{Array1, Array2, array};
 
-    /// Group a flat node list — emitted by the production loop as consecutive
-    /// `(+, −)` pairs, one pair per upgraded ρ-eigendirection — into the pairs
-    /// the accumulator consumes.
-    fn paired(points: &[(Array2<f64>, Array1<f64>)]) -> Vec<(SigmaPointResult, SigmaPointResult)> {
-        points
-            .chunks_exact(2)
-            .map(|pair| (pair[0].clone(), pair[1].clone()))
-            .collect()
-    }
-
-    /// Accumulate a flat node list with no first-order fallback columns.
-    fn accumulate(points: &[(Array2<f64>, Array1<f64>)], p: usize) -> Array2<f64> {
-        accumulate_sigma_cubature_total_covariance(&paired(points), &[], p)
-    }
-
-    fn max_abs_deviation(actual: &Array2<f64>, expected: &Array2<f64>) -> f64 {
-        let mut worst = 0.0_f64;
-        for (a, e) in actual.iter().zip(expected.iter()) {
-            worst = worst.max((a - e).abs());
-        }
-        worst
-    }
-
-    fn outer(v: &Array1<f64>) -> Array2<f64> {
-        v.view()
-            .insert_axis(ndarray::Axis(1))
-            .dot(&v.view().insert_axis(ndarray::Axis(0)))
-    }
-
-    /// Cubature linear exactness: if `b_m = b_0 + J·(ρ_m − ρ̂)` is linear in `ρ`
-    /// and `A_m = A_0` is constant, the accumulator must return
-    /// `A_0 + J·V_ρ,r·Jᵀ` exactly, where `V_ρ,r = Σ_j t_j² u_j u_jᵀ` is the
-    /// covariance the node set represents.
-    ///
-    /// The claim is stronger than the one the joint-moment form could make: it
-    /// holds for ANY per-direction node scaling `t_j`, not only the `√(r·d_j)`
-    /// radius the old `1/(2r)`-weighted rule needed. That is exactly the
-    /// property criterion calibration requires, since it moves each `t_j`
-    /// independently (#2728). Here the nodes sit at `t_j = √d_j`, the one-sigma
-    /// step, so `V_ρ,r` is the ρ-covariance itself.
-    ///
-    /// Any drift from this is a math bug, not a numerics issue, so the
-    /// tolerance is at f64 round-off.
-    #[test]
-    pub(crate) fn cubature_linear_exactness_recovers_jvjt() {
-        // p = 4 outputs, d_ρ = 3 inputs, r = 3 upgraded eigendirections → 6
-        // nodes. Three distinct eigenvalues so off-diagonal covariance entries
-        // are genuinely exercised.
-        let p = 4;
-        let d_rho = 3;
-        let r = 3;
-
-        let eigenvalues = [0.25_f64, 0.49, 0.81];
-        // A hand-built orthonormal U (no RNG): columns are the eigenvectors of
-        // V_ρ,r.
-        let u: Array2<f64> = ndarray::array![
-            [1.0 / 3f64.sqrt(), 1.0 / 2f64.sqrt(), 1.0 / 6f64.sqrt()],
-            [1.0 / 3f64.sqrt(), -1.0 / 2f64.sqrt(), 1.0 / 6f64.sqrt()],
-            [1.0 / 3f64.sqrt(), 0.0, -2.0 / 6f64.sqrt()],
-        ];
-        let ut_u = u.t().dot(&u);
-        for i in 0..d_rho {
-            for j in 0..d_rho {
-                let want = if i == j { 1.0 } else { 0.0 };
-                assert!(
-                    (ut_u[[i, j]] - want).abs() < 1e-12,
-                    "U is not orthonormal at ({i},{j}): got {} expected {}",
-                    ut_u[[i, j]],
-                    want,
-                );
+    fn atom(a: Array2<f64>, b: Array1<f64>, weight: f64) -> WeightedSigmaPoint {
+        WeightedSigmaPoint {
+            result: (a, b),
+            weight,
             }
         }
-
-        // V_ρ,r = U · diag(d) · Uᵀ
-        let mut v_rho_r = Array2::<f64>::zeros((d_rho, d_rho));
-        for k in 0..d_rho {
-            let col = u.column(k);
-            let scaled = col.mapv(|v| v * eigenvalues[k]);
-            for i in 0..d_rho {
-                for j in 0..d_rho {
-                    v_rho_r[[i, j]] += scaled[i] * col[j];
-                }
-            }
+    fn covariance(points: &[WeightedSigmaPoint], fallback: &[Array1<f64>]) -> Array2<f64> {
+        accumulate_sigma_cubature_total_covariance(points, fallback, 2).expect("positive measure")
         }
-
-        // Nodes at ρ_m − ρ̂ = ±√d_j · u_j, in the (+, −) order the production
-        // loop emits.
-        let mut sigma_displacements: Vec<Array1<f64>> = Vec::with_capacity(2 * r);
-        for k in 0..r {
-            let scale = eigenvalues[k].sqrt();
-            let axis = u.column(k).to_owned();
-            for sign in [1.0_f64, -1.0_f64] {
-                sigma_displacements.push(axis.mapv(|v| v * sign * scale));
-            }
-        }
-
-        // Plain integers so the synthetic data is exactly representable.
-        let b0: Array1<f64> = ndarray::array![1.0, -2.0, 3.5, 0.5];
-        let jacobian: Array2<f64> = ndarray::array![
-            [1.0, 0.0, -1.0],
-            [2.0, 1.0, 0.0],
-            [0.0, -1.0, 1.0],
-            [1.0, 1.0, 1.0],
-        ];
-        // A_0 SPD so the output is a real covariance matrix, with off-diagonal
-        // structure so the A-term assertion is not vacuous.
-        let mut a0 = Array2::<f64>::eye(p);
-        a0[[0, 1]] = 0.25;
-        a0[[1, 0]] = 0.25;
-        a0[[2, 3]] = -0.10;
-        a0[[3, 2]] = -0.10;
-
-        let points: Vec<(Array2<f64>, Array1<f64>)> = sigma_displacements
+    fn close(a: &Array2<f64>, b: &Array2<f64>) {
+        let error = a
             .iter()
-            .map(|drho| (a0.clone(), &b0 + &jacobian.dot(drho)))
-            .collect();
-
-        let jvjt = jacobian.dot(&v_rho_r).dot(&jacobian.t());
-        let expected = &a0 + &jvjt;
-        let actual = accumulate(&points, p);
-
-        let mut max_rel_dev = 0.0_f64;
-        for i in 0..p {
-            for j in 0..p {
-                let diff = (actual[[i, j]] - expected[[i, j]]).abs();
-                max_rel_dev = max_rel_dev.max(diff / expected[[i, j]].abs().max(1.0));
-            }
-        }
-        assert!(
-            max_rel_dev < 1e-12,
-            "cubature linear-exactness violation: max_rel_dev={max_rel_dev:.3e}",
-        );
+            .zip(b)
+            .map(|(x, y)| (x - y).abs())
+            .fold(0.0, f64::max);
+        assert!(error < 1e-12, "max error {error:e}: {a:?} != {b:?}");
     }
 
-    /// Asymmetric nodes stay exact. The `+` and `−` node of a direction sit at
-    /// different distances whenever the criterion is asymmetric along it — flat
-    /// one way, a cliff the other — which is exactly the #2728 fixture. For a
-    /// linear `b`, the chord over `(+a, −b)` is `((a+b)/2)·J·u`, so the
-    /// accumulator must return `A_0 + ((a+b)/2)²·(Ju)(Ju)ᵀ`.
-    ///
-    /// The joint-moment form could not state this: its `1/(2r)` weighting ties
-    /// the answer to a symmetric `√r` radius.
     #[test]
-    pub(crate) fn cubature_asymmetric_nodes_use_the_half_chord() {
-        let p = 3;
-        let axis: Array1<f64> = ndarray::array![1.0, 0.0];
-        let jacobian: Array2<f64> = ndarray::array![[2.0, -1.0], [0.5, 1.0], [-1.5, 0.25]];
-        let b0: Array1<f64> = ndarray::array![0.3, -0.7, 1.1];
-        let a0: Array2<f64> =
-            ndarray::array![[1.5, 0.2, 0.0], [0.2, 1.2, 0.1], [0.0, 0.1, 1.0]];
-
-        let plus_step = 0.25_f64;
-        let minus_step = 1.75_f64;
+    fn varying_conditional_covariance_and_linear_mean_use_the_same_measure() {
         let points = vec![
-            (
-                a0.clone(),
-                &b0 + &jacobian.dot(&axis.mapv(|v| v * plus_step)),
-            ),
-            (
-                a0.clone(),
-                &b0 + &jacobian.dot(&axis.mapv(|v| v * -minus_step)),
-            ),
+            atom(array![[1., 0.], [0., 2.]], array![-1., 0.], 0.25),
+            atom(array![[3., 0.], [0., 4.]], array![1., 0.], 0.75),
         ];
-
-        let half_chord = 0.5 * (plus_step + minus_step);
-        let column = jacobian.dot(&axis).mapv(|v| v * half_chord);
-        let expected = &a0 + &outer(&column);
-        let actual = accumulate(&points, p);
-        assert!(
-            max_abs_deviation(&actual, &expected) < 1e-13,
-            "asymmetric half-chord violated: max_abs={:.3e}",
-            max_abs_deviation(&actual, &expected),
-        );
+        close(&covariance(&points, &[]), &array![[3.25, 0.], [0., 3.5]]);
     }
 
-    /// Degenerate sanity: a pair whose two nodes carry the same `β̂` has a
-    /// zero-length chord, so the output is exactly `mean(A_m)`. Guards the
-    /// chord formula against a stray sign or an off-by-one in the pairing.
     #[test]
-    pub(crate) fn cubature_zero_chord_collapses_to_mean_a() {
-        let p = 3;
-        let a0: Array2<f64> = ndarray::array![[2.0, 0.5, 0.0], [0.5, 1.5, 0.25], [0.0, 0.25, 1.0]];
-        let b0: Array1<f64> = ndarray::array![0.1, -0.2, 0.3];
-        let points = vec![(a0.clone(), b0.clone()), (a0.clone(), b0.clone())];
-        let actual = accumulate(&points, p);
-        assert!(
-            max_abs_deviation(&actual, &a0) < 1e-14,
-            "zero-chord pair did not collapse to mean(A_m): max_abs={:.3e}",
-            max_abs_deviation(&actual, &a0),
-        );
+    fn asymmetric_weights_center_the_coefficient_covariance() {
+        let points = vec![
+            atom(Array2::eye(2), array![0., 0.], 1.),
+            atom(Array2::eye(2), array![3., 0.], 2.),
+        ];
+        close(&covariance(&points, &[]), &array![[3., 0.], [0., 1.]]);
     }
 
-    /// The chord depends on the DIFFERENCE across a pair, so a linear `b` gives
-    /// exactly `Σ_k J·d_k·d_kᵀ·Jᵀ` for pair displacements `±d_k` — with no
-    /// `1/M` normaliser anywhere. This is the deeper structural check: it
-    /// exercises the per-direction accumulation with mixed-sign `J` entries and
-    /// unequal per-direction scales, where a residual `1/M` would show up as a
-    /// uniform 1/3 shortfall.
     #[test]
-    pub(crate) fn cubature_pair_differences_carry_the_whole_b_side() {
-        let p = 3;
-        let r = 3;
-        let scales = [0.7_f64, 1.3, 0.4];
-        let mut displacements: Vec<Array1<f64>> = Vec::with_capacity(2 * r);
-        for k in 0..r {
-            for sign in [1.0_f64, -1.0_f64] {
-                let mut d = Array1::<f64>::zeros(r);
-                d[k] = sign * scales[k];
-                displacements.push(d);
-            }
-        }
+    fn variation_between_axis_pair_means_is_not_discarded() {
+        let points = vec![
+            atom(Array2::zeros((2, 2)), array![-2., 0.], 1.),
+            atom(Array2::zeros((2, 2)), array![0., 0.], 1.),
+            atom(Array2::zeros((2, 2)), array![2., 0.], 1.),
+            atom(Array2::zeros((2, 2)), array![4., 0.], 1.),
+        ];
+        close(&covariance(&points, &[]), &array![[5., 0.], [0., 0.]]);
+    }
 
-        let b0: Array1<f64> = ndarray::array![2.5, -1.25, 4.0];
-        let j: Array2<f64> =
-            ndarray::array![[1.0, -2.0, 0.5], [0.0, 1.5, -1.0], [-0.75, 0.25, 2.0]];
-        let a0: Array2<f64> =
-            ndarray::array![[3.0, 0.5, -0.25], [0.5, 2.0, 0.10], [-0.25, 0.10, 1.5]];
+    #[test]
+    fn splitting_an_atom_does_not_change_the_measure() {
+        let a = array![[2., 0.], [0., 3.]];
+        let original = vec![atom(a.clone(), array![1., -1.], 1.)];
+        let split = vec![
+            atom(a.clone(), array![1., -1.], 0.4),
+            atom(a, array![1., -1.], 0.6),
+        ];
+        close(&covariance(&original, &[]), &covariance(&split, &[]));
+    }
 
-        let points: Vec<(Array2<f64>, Array1<f64>)> = displacements
+    #[test]
+    fn translation_and_response_scaling_obey_covariance_laws() {
+        let base = vec![
+            atom(Array2::zeros((2, 2)), array![-1., 2.], 1.),
+            atom(Array2::zeros((2, 2)), array![3., -2.], 1.),
+        ];
+        let shifted_scaled: Vec<_> = base
             .iter()
-            .map(|drho| (a0.clone(), &b0 + &j.dot(drho)))
-            .collect();
-
-        // V_ρ,r = Σ_k d_k d_kᵀ over the `+` displacement of each pair.
-        let mut v_rho = Array2::<f64>::zeros((r, r));
-        for k in 0..r {
-            let d = &displacements[2 * k];
-            for i in 0..r {
-                for jj in 0..r {
-                    v_rho[[i, jj]] += d[i] * d[jj];
-                }
-            }
-        }
-        let expected = &a0 + &j.dot(&v_rho).dot(&j.t());
-        let actual = accumulate(&points, p);
-        assert!(
-            max_abs_deviation(&actual, &expected) < 1e-12,
-            "per-direction b-side accumulation violated: max_abs={:.3e}",
-            max_abs_deviation(&actual, &expected),
-        );
-    }
-
-    /// Constant-A invariance: if every `A_m = A_0` then the A-term equals `A_0`
-    /// exactly regardless of how many pairs there are. Together with the b-side
-    /// tests this localises a future regression onto one side or the other, not
-    /// both at once.
-    #[test]
-    pub(crate) fn cubature_constant_a_in_implies_constant_a_out_on_a_side() {
-        let p = 4;
-        let a0: Array2<f64> = ndarray::array![
-            [2.0, 0.30, 0.10, 0.05],
-            [0.30, 1.50, 0.20, -0.10],
-            [0.10, 0.20, 1.20, 0.15],
-            [0.05, -0.10, 0.15, 0.80],
-        ];
-        // Identical β̂ at every node, so every chord is zero and the output is
-        // exactly the A-term.
-        let zero_b = Array1::<f64>::zeros(p);
-        for pairs in [1usize, 2, 3, 4, 8] {
-            let points: Vec<(Array2<f64>, Array1<f64>)> = (0..2 * pairs)
-                .map(|_| (a0.clone(), zero_b.clone()))
-                .collect();
-            let actual = accumulate(&points, p);
-            assert!(
-                max_abs_deviation(&actual, &a0) < 1e-14,
-                "constant-A invariance violated at {pairs} pair(s): max_abs={:.3e}",
-                max_abs_deviation(&actual, &a0),
-            );
-        }
-    }
-
-    /// Permutation invariance. Re-ordering the PAIRS is a re-ordering of two
-    /// sums, and swapping the two nodes WITHIN a pair only flips the sign of
-    /// that pair's chord, which its Gram is blind to. Both must leave the
-    /// output unchanged to f64 round-off; a stateful accumulator or an
-    /// order-dependent scratch buffer would be caught here.
-    #[test]
-    pub(crate) fn cubature_permutation_invariance_on_antipodal_pairs() {
-        let p = 4;
-        let r = 3;
-        let b0: Array1<f64> = ndarray::array![1.0, -2.0, 3.5, 0.5];
-        let j: Array2<f64> = ndarray::array![
-            [1.0, 0.0, -1.0],
-            [2.0, 1.0, 0.0],
-            [0.0, -1.0, 1.0],
-            [1.0, 1.0, 1.0],
-        ];
-        // Vary A_m across nodes so a re-ordering would actually move terms.
-        let a_for_idx = |idx: usize| -> Array2<f64> {
-            let mut a = Array2::<f64>::eye(p);
-            for d in 0..p {
-                a[[d, d]] = 1.0 + 0.05 * (idx as f64 + 1.0);
-            }
-            a
-        };
-        let scales = [0.7_f64, 1.3, 0.4];
-
-        let mut interleaved: Vec<(Array2<f64>, Array1<f64>)> = Vec::with_capacity(2 * r);
-        for k in 0..r {
-            for sign in [1.0_f64, -1.0_f64] {
-                let mut d = Array1::<f64>::zeros(r);
-                d[k] = sign * scales[k];
-                let bm = &b0 + &j.dot(&d);
-                interleaved.push((a_for_idx(interleaved.len()), bm));
-            }
-        }
-        // Re-order the pairs (2, 0, 1) and flip the node order inside each.
-        let mut reordered: Vec<(Array2<f64>, Array1<f64>)> = Vec::with_capacity(2 * r);
-        for &k in &[2usize, 0, 1] {
-            reordered.push(interleaved[2 * k + 1].clone());
-            reordered.push(interleaved[2 * k].clone());
-        }
-
-        let v_interleaved = accumulate(&interleaved, p);
-        let v_reordered = accumulate(&reordered, p);
-        assert!(
-            max_abs_deviation(&v_interleaved, &v_reordered) < 1e-13,
-            "permutation invariance violated: max_abs={:.3e}",
-            max_abs_deviation(&v_interleaved, &v_reordered),
-        );
-    }
-
-    /// Executor-dispatch parity invariant.
-    ///
-    /// `sigma_cubature_dispatch` is the swap site between the CPU Rayon
-    /// executor and the GPU stream-pool executor. The contract is that both
-    /// branches return per-node `(A_m, b_m)` pairs the accumulator cannot
-    /// distinguish. Since the accumulator is the only piece of that path
-    /// isolable from a constructed `RemlState`, what is pinned here is its
-    /// bitwise determinism on a fixed input — the property either branch must
-    /// satisfy for the swap to be observationally neutral.
-    #[test]
-    pub(crate) fn cubature_dispatch_swap_site_invariant_holds_pre_gpu() {
-        let p = 3;
-        let a: Array2<f64> =
-            ndarray::array![[1.5, 0.20, 0.10], [0.20, 1.20, 0.05], [0.10, 0.05, 0.90]];
-        let b0: Array1<f64> = ndarray::array![0.30, -0.40, 0.10];
-        let mut points: Vec<(Array2<f64>, Array1<f64>)> = Vec::new();
-        for k in 0..3 {
-            for sign in [1.0_f64, -1.0_f64] {
-                let mut bm = b0.clone();
-                bm[k] += sign * 0.25;
-                points.push((a.clone(), bm));
-            }
-        }
-        let first = accumulate(&points, p);
-        let second = accumulate(&points, p);
-        for i in 0..p {
-            for j in 0..p {
-                assert_eq!(
-                    first[[i, j]],
-                    second[[i, j]],
-                    "accumulator non-deterministic at ({i},{j}): first={} second={}",
-                    first[[i, j]],
-                    second[[i, j]],
-                );
-            }
-        }
-    }
-
-    /// Full-SPD `A_m` injection invariance.
-    ///
-    /// Replacing the per-node `A_m = H_m⁻¹` with an arbitrary SPD matrix — still
-    /// SPD, no longer derived from a Hessian — must leave the output equal to
-    /// the analytic expression `mean(A_m) + Σ_j c_j c_jᵀ`. This rules out any
-    /// hidden assumption that `A_m` has inverse-Hessian structure; the formula
-    /// is a total-covariance assembly and nothing more.
-    #[test]
-    pub(crate) fn cubature_arbitrary_spd_a_in_obeys_total_covariance_law() {
-        let p = 3;
-        // SPD by construction via `A = M Mᵀ + εI` for a non-symmetric M.
-        let mk_spd = |scale: f64, off: f64| -> Array2<f64> {
-            let m: Array2<f64> = ndarray::array![
-                [scale, off, 0.5 * off],
-                [-off, scale + 0.1, off],
-                [0.25 * off, -0.5 * off, scale - 0.1],
-            ];
-            let mut a = m.dot(&m.t());
-            for i in 0..p {
-                a[[i, i]] += 1e-3;
-            }
-            a
-        };
-        let a_list = [
-            mk_spd(1.0, 0.20),
-            mk_spd(1.3, 0.10),
-            mk_spd(0.7, -0.15),
-            mk_spd(1.1, 0.05),
-        ];
-        let b_list: [Array1<f64>; 4] = [
-            ndarray::array![0.1, 0.2, 0.3],
-            ndarray::array![-0.1, 0.4, -0.2],
-            ndarray::array![0.5, -0.3, 0.0],
-            ndarray::array![0.2, 0.1, -0.4],
-        ];
-        let points: Vec<(Array2<f64>, Array1<f64>)> = a_list
-            .iter()
-            .zip(b_list.iter())
-            .map(|(a, b)| (a.clone(), b.clone()))
-            .collect();
-
-        let w = 1.0 / a_list.len() as f64;
-        let mut expected = Array2::<f64>::zeros((p, p));
-        for a in &a_list {
-            expected.scaled_add(w, a);
-        }
-        for pair in 0..2 {
-            let chord = (&b_list[2 * pair] - &b_list[2 * pair + 1]).mapv(|v| 0.5 * v);
-            expected = expected + outer(&chord);
-        }
-
-        let actual = accumulate(&points, p);
-        assert!(
-            max_abs_deviation(&actual, &expected) < 1e-13,
-            "arbitrary-SPD A injection broke the total-covariance law: max_abs={:.3e}",
-            max_abs_deviation(&actual, &expected),
-        );
-    }
-
-    /// β-scale linearity: scaling every `b_m` by α (with `A_m` fixed) scales
-    /// every chord by α and therefore the b-side by α², leaving the A-term
-    /// untouched. Pins that the accumulator is bilinear in `b_m` and does not
-    /// square the wrong row.
-    #[test]
-    pub(crate) fn cubature_beta_scaling_propagates_quadratically() {
-        let p = 3;
-        let a0: Array2<f64> = ndarray::array![[2.0, 0.1, 0.0], [0.1, 1.5, 0.05], [0.0, 0.05, 1.0]];
-        let raw_betas: Vec<Array1<f64>> = vec![
-            ndarray::array![1.0, -0.5, 0.3],
-            ndarray::array![-1.0, 0.5, -0.3],
-            ndarray::array![0.7, 0.2, -0.1],
-            ndarray::array![-0.7, -0.2, 0.1],
-        ];
-
-        let unscaled: Vec<(Array2<f64>, Array1<f64>)> =
-            raw_betas.iter().map(|b| (a0.clone(), b.clone())).collect();
-        let v_unscaled = accumulate(&unscaled, p);
-
-        let alpha = 2.5_f64;
-        let scaled: Vec<(Array2<f64>, Array1<f64>)> = raw_betas
-            .iter()
-            .map(|b| (a0.clone(), b.mapv(|x| x * alpha)))
-            .collect();
-        let v_scaled = accumulate(&scaled, p);
-
-        let mut max_rel = 0.0_f64;
-        for i in 0..p {
-            for j in 0..p {
-                let expected = a0[[i, j]] + alpha * alpha * (v_unscaled[[i, j]] - a0[[i, j]]);
-                let diff = (v_scaled[[i, j]] - expected).abs();
-                max_rel = max_rel.max(diff / expected.abs().max(1.0));
-            }
-        }
-        assert!(
-            max_rel < 1e-12,
-            "β-scaling quadratic propagation violated: max_rel={max_rel:.3e}",
-        );
-    }
-
-    /// Full-reversal invariance. Reversing the flat node list reverses the pair
-    /// order AND swaps the two nodes inside each pair; the A-mean is blind to
-    /// the first and each chord only changes sign under the second, so the
-    /// output must not move beyond f64 rounding noise.
-    #[test]
-    pub(crate) fn cubature_full_reversal_permutation_invariance() {
-        let p = 4;
-        let m = 8;
-        let mut points: Vec<(Array2<f64>, Array1<f64>)> = Vec::with_capacity(m);
-        for idx in 0..m {
-            let mut a = Array2::<f64>::eye(p);
-            for d in 0..p {
-                a[[d, d]] = 1.0 + 0.07 * (idx as f64);
-            }
-            let b: Array1<f64> = (0..p)
-                .map(|d| 0.1 + 0.3 * (idx as f64) - 0.05 * (d as f64))
-                .collect();
-            points.push((a, b));
-        }
-        let reversed: Vec<(Array2<f64>, Array1<f64>)> = points.iter().rev().cloned().collect();
-
-        let v_forward = accumulate(&points, p);
-        let v_reverse = accumulate(&reversed, p);
-        assert!(
-            max_abs_deviation(&v_forward, &v_reverse) < 1e-12,
-            "full-reversal permutation invariance violated: max_abs={:.3e}",
-            max_abs_deviation(&v_forward, &v_reverse),
-        );
-    }
-
-    /// Duplicating every pair leaves the A-term unchanged and DOUBLES the
-    /// b-term.
-    ///
-    /// This is the law that distinguishes the per-direction rule from the joint
-    /// moment it replaced. Under the old `1/M`-weighted joint form, duplicating
-    /// the node set was a no-op on both terms. Under the chord form a duplicated
-    /// pair is a second direction contributing its own chord, so the b-side is
-    /// additive over pairs — which is precisely why the correction no longer
-    /// depends on how many directions happen to be upgraded (#2728).
-    #[test]
-    pub(crate) fn cubature_pair_duplication_doubles_the_chord_gram() {
-        let p = 3;
-        let a_mk = |s: f64| -> Array2<f64> {
-            let mut a = Array2::<f64>::eye(p);
-            a[[0, 0]] = 1.0 + s;
-            a[[1, 1]] = 1.2 + 0.5 * s;
-            a[[2, 2]] = 0.8 + 0.3 * s;
-            a[[0, 1]] = 0.1 * s;
-            a[[1, 0]] = 0.1 * s;
-            a
-        };
-        let original: Vec<(Array2<f64>, Array1<f64>)> = (0..4)
-            .map(|i| {
-                let s = (i as f64) / 4.0;
-                let b: Array1<f64> = ndarray::array![s, -s, 0.5 * s];
-                (a_mk(s), b)
+            .map(|p| {
+                atom(
+                    Array2::zeros((2, 2)),
+                    p.result.1.mapv(|x| 3. * x + 7.),
+                    p.weight,
+                )
             })
             .collect();
-        let mut doubled: Vec<(Array2<f64>, Array1<f64>)> = Vec::with_capacity(2 * original.len());
-        for chunk in original.chunks_exact(2) {
-            doubled.extend_from_slice(chunk);
-            doubled.extend_from_slice(chunk);
-        }
-
-        // The A-term is the mean over nodes, so duplicating every pair leaves
-        // it alone.
-        let weight = 1.0 / original.len() as f64;
-        let mut mean_a = Array2::<f64>::zeros((p, p));
-        for (a, _) in &original {
-            mean_a.scaled_add(weight, a);
-        }
-        let v_orig = accumulate(&original, p);
-        let v_doub = accumulate(&doubled, p);
-        let expected = &mean_a + &(&v_orig - &mean_a).mapv(|v| 2.0 * v);
-        assert!(
-            max_abs_deviation(&v_doub, &expected) < 1e-13,
-            "pair duplication did not double the chord Gram: max_abs={:.3e}",
-            max_abs_deviation(&v_doub, &expected),
+        close(
+            &covariance(&shifted_scaled, &[]),
+            &covariance(&base, &[]).mapv(|x| 9. * x),
         );
     }
 
-    /// Rank-deficient `V_ρ` degenerate behaviour: when both nodes of every pair
-    /// carry the same `β̂` — `V_ρ` has rank 0 along the β direction — every
-    /// chord is zero and the output collapses to `mean(A_m)`. The production
-    /// trigger short-circuits this case, but the accumulator must still be
-    /// correct on it in case the trigger is bypassed.
     #[test]
-    pub(crate) fn cubature_rank_deficient_v_rho_collapses_var_to_zero() {
-        let p = 3;
-        let b_const: Array1<f64> = ndarray::array![0.7, -0.2, 0.4];
-        let a_list = [
-            ndarray::array![[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
-            ndarray::array![[2.0, 0.0, 0.0], [0.0, 1.5, 0.0], [0.0, 0.0, 0.8]],
-            ndarray::array![[1.2, 0.1, 0.0], [0.1, 1.3, 0.0], [0.0, 0.0, 0.9]],
-            ndarray::array![[0.9, 0.0, 0.2], [0.0, 1.1, 0.0], [0.2, 0.0, 1.4]],
-        ];
-        let points: Vec<(Array2<f64>, Array1<f64>)> = a_list
-            .iter()
-            .map(|a| (a.clone(), b_const.clone()))
-            .collect();
-        let actual = accumulate(&points, p);
-
-        let w = 1.0 / (a_list.len() as f64);
-        let mut mean_a = Array2::<f64>::zeros((p, p));
-        for a in &a_list {
-            mean_a.scaled_add(w, a);
-        }
-        assert!(
-            max_abs_deviation(&actual, &mean_a) < 1e-13,
-            "rank-deficient V_ρ did not collapse the chord to zero: max_abs={:.3e}",
-            max_abs_deviation(&actual, &mean_a),
+    fn independent_residual_directions_remain_first_order_gaussian() {
+        let fallback = vec![array![2., -1.]];
+        let points = vec![atom(Array2::eye(2), array![0., 0.], 1.)];
+        close(
+            &covariance(&points, &fallback),
+            &array![[5., -2.], [-2., 2.]],
         );
     }
 
-    /// A direction that was NOT upgraded keeps the first-order column it would
-    /// have contributed to `J·V_ρ·Jᵀ`, so the assembled correction covers the
-    /// same subspace the first-order correction does.
-    ///
-    /// Without this the eigen-truncation would silently ship a correction over
-    /// a SMALLER subspace than the term it exists to upgrade — which is what a
-    /// rank-1 truncation did on the #2728 fixture, where it also picked the
-    /// wrong direction to keep. The claim: upgrading direction 0 and falling
-    /// back on direction 1 must reproduce the same matrix as upgrading BOTH,
-    /// whenever `β̂` is linear over the node interval.
     #[test]
-    pub(crate) fn cubature_fallback_columns_restore_the_untreated_subspace() {
-        let p = 3;
-        let a0: Array2<f64> = ndarray::array![[1.4, 0.1, 0.0], [0.1, 1.1, 0.2], [0.0, 0.2, 0.9]];
-        let b0: Array1<f64> = ndarray::array![0.5, -0.25, 0.75];
-        let j: Array2<f64> = ndarray::array![[1.0, -0.5], [0.25, 2.0], [-1.5, 0.75]];
-        let steps = [0.6_f64, 1.4];
-
-        let node = |direction: usize, sign: f64| -> (Array2<f64>, Array1<f64>) {
-            let mut drho = Array1::<f64>::zeros(2);
-            drho[direction] = sign * steps[direction];
-            (a0.clone(), &b0 + &j.dot(&drho))
-        };
-
-        // Both directions upgraded.
-        let both = vec![node(0, 1.0), node(0, -1.0), node(1, 1.0), node(1, -1.0)];
-        let upgraded_both = accumulate(&both, p);
-
-        // Direction 0 upgraded, direction 1 kept as a first-order column
-        // `J·u_1·t_1` — the same column the first-order Gram would build.
-        let only_first = vec![node(0, 1.0), node(0, -1.0)];
-        let mut axis = Array1::<f64>::zeros(2);
-        axis[1] = steps[1];
-        let fallback = vec![j.dot(&axis)];
-        let upgraded_one =
-            accumulate_sigma_cubature_total_covariance(&paired(&only_first), &fallback, p);
-
-        assert!(
-            max_abs_deviation(&upgraded_both, &upgraded_one) < 1e-13,
-            "fallback column did not reproduce the upgraded direction on a \
-             linear β̂: max_abs={:.3e}",
-            max_abs_deviation(&upgraded_both, &upgraded_one),
-        );
-    }
-
-    /// The A-side is convex in its input: with `α + β = 1` the chord terms are
-    /// identical across the three runs and cancel, so
-    /// `V[α·A + β·A'] = α·V[A] + β·V[A']`.
-    #[test]
-    pub(crate) fn cubature_a_side_is_convex_on_input() {
-        let p = 3;
-        let r = 2;
-        let m = 2 * r;
-        let b0: Array1<f64> = ndarray::array![0.4, -0.3, 0.2];
-        let scales = [0.6_f64, 1.1];
-        let points_b: Vec<Array1<f64>> = (0..r)
-            .flat_map(|k| {
-                let b_outer = b0.clone();
-                [1.0_f64, -1.0_f64].into_iter().map(move |sign| {
-                    let mut b = b_outer.clone();
-                    b[k] += sign * scales[k];
-                    b
-                })
-            })
-            .collect();
-        let a_set_1: Vec<Array2<f64>> = (0..m)
-            .map(|i| {
-                let mut a = Array2::<f64>::eye(p);
-                a[[0, 0]] = 1.0 + 0.05 * i as f64;
-                a[[1, 1]] = 1.5 - 0.02 * i as f64;
-                a[[0, 1]] = 0.10;
-                a[[1, 0]] = 0.10;
-                a
-            })
-            .collect();
-        let a_set_2: Vec<Array2<f64>> = (0..m)
-            .map(|i| {
-                let mut a = Array2::<f64>::eye(p);
-                a[[0, 0]] = 2.0 - 0.04 * i as f64;
-                a[[2, 2]] = 0.9 + 0.03 * i as f64;
-                a[[1, 2]] = -0.05;
-                a[[2, 1]] = -0.05;
-                a
-            })
-            .collect();
-        let alpha = 0.3_f64;
-        let beta = 1.0 - alpha;
-        let a_set_mix: Vec<Array2<f64>> = a_set_1
-            .iter()
-            .zip(a_set_2.iter())
-            .map(|(a, ap)| a.mapv(|v| v * alpha) + ap.mapv(|v| v * beta))
-            .collect();
-
-        let build = |a_set: &[Array2<f64>]| -> Vec<(Array2<f64>, Array1<f64>)> {
-            a_set
-                .iter()
-                .zip(points_b.iter())
-                .map(|(a, b)| (a.clone(), b.clone()))
-                .collect()
-        };
-        let v1 = accumulate(&build(&a_set_1), p);
-        let v2 = accumulate(&build(&a_set_2), p);
-        let vmix = accumulate(&build(&a_set_mix), p);
-
-        let expected = v1.mapv(|v| v * alpha) + v2.mapv(|v| v * beta);
-        assert!(
-            max_abs_deviation(&vmix, &expected) < 1e-13,
-            "A-side convexity violated: max_abs={:.3e}",
-            max_abs_deviation(&vmix, &expected),
-        );
-    }
-
-    /// Translation invariance of the b-side. Adding the same offset to every
-    /// `b_m` cannot change a chord, which is a difference; the A-side never
-    /// sees `b` at all. Under the joint-moment form this held only up to the
-    /// cancellation of a raw second moment against `mean·meanᵀ`, so a shift of
-    /// magnitude 10 inflated the intermediates by ~100 and the tolerance had to
-    /// absorb it. The chord form has no such intermediate: the invariance is
-    /// EXACT, and the tolerance says so.
-    #[test]
-    pub(crate) fn cubature_b_translation_leaves_output_unchanged() {
-        let p = 3;
-        let a_const: Array2<f64> =
-            ndarray::array![[1.5, 0.2, 0.0], [0.2, 1.2, 0.1], [0.0, 0.1, 1.0]];
-        let raw_bs: Vec<Array1<f64>> = vec![
-            ndarray::array![0.4, -0.3, 0.2],
-            ndarray::array![-0.4, 0.3, -0.2],
-            ndarray::array![0.1, 0.5, -0.4],
-            ndarray::array![-0.1, -0.5, 0.4],
-        ];
-        let pts_raw: Vec<(Array2<f64>, Array1<f64>)> = raw_bs
-            .iter()
-            .map(|b| (a_const.clone(), b.clone()))
-            .collect();
-        let shift: Array1<f64> = ndarray::array![10.0, -5.0, 3.0];
-        let pts_shifted: Vec<(Array2<f64>, Array1<f64>)> = raw_bs
-            .iter()
-            .map(|b| (a_const.clone(), b + &shift))
-            .collect();
-
-        let v_raw = accumulate(&pts_raw, p);
-        let v_shifted = accumulate(&pts_shifted, p);
-        assert!(
-            max_abs_deviation(&v_raw, &v_shifted) < 1e-14,
-            "b-translation invariance violated: max_abs={:.3e}",
-            max_abs_deviation(&v_raw, &v_shifted),
-        );
-    }
-
-    /// Block-diagonal `A_m` with block-aligned `b_m` must decouple: when the
-    /// bottom half of `β̂` is constant across a pair its chord entries are zero
-    /// there, so the Gram has no cross-block entries and the output stays
-    /// block-diagonal. Pins that the outer-product loop does not wrap indices.
-    #[test]
-    pub(crate) fn cubature_block_diagonal_inputs_yield_block_diagonal_output() {
-        let p_top = 2;
-        let p_bot = 2;
-        let p = p_top + p_bot;
-        let a_top: Array2<f64> = ndarray::array![[1.0, 0.1], [0.1, 1.2]];
-        let a_bot: Array2<f64> = ndarray::array![[0.8, 0.05], [0.05, 0.7]];
-        let mut a_full = Array2::<f64>::zeros((p, p));
-        for i in 0..p_top {
-            for j in 0..p_top {
-                a_full[[i, j]] = a_top[[i, j]];
-            }
-        }
-        for i in 0..p_bot {
-            for j in 0..p_bot {
-                a_full[[p_top + i, p_top + j]] = a_bot[[i, j]];
-            }
-        }
-
-        let b_bot_const: Array1<f64> = ndarray::array![0.5, -0.3];
-        let top_bs: Vec<Array1<f64>> = vec![
-            ndarray::array![0.4, 0.1],
-            ndarray::array![-0.4, -0.1],
-            ndarray::array![0.2, 0.3],
-            ndarray::array![-0.2, -0.3],
-        ];
-        let mut points: Vec<(Array2<f64>, Array1<f64>)> = Vec::with_capacity(top_bs.len());
-        for top in &top_bs {
-            let mut b = Array1::<f64>::zeros(p);
-            for i in 0..p_top {
-                b[i] = top[i];
-            }
-            for i in 0..p_bot {
-                b[p_top + i] = b_bot_const[i];
-            }
-            points.push((a_full.clone(), b));
-        }
-        let v = accumulate(&points, p);
-        let mut max_cross_abs = 0.0_f64;
-        for i in 0..p_top {
-            for j in 0..p_bot {
-                max_cross_abs = max_cross_abs.max(v[[i, p_top + j]].abs());
-                max_cross_abs = max_cross_abs.max(v[[p_top + j, i]].abs());
-            }
-        }
-        assert!(
-            max_cross_abs < 1e-13,
-            "block-diagonal inputs leaked cross-block coupling: max_cross_abs={max_cross_abs:.3e}",
-        );
-    }
-
-    /// The output is symmetric for symmetric inputs — a mean of symmetric
-    /// matrices plus a sum of rank-one Grams. The production caller runs
-    /// `symmetrize_in_place` afterwards, which would mask drift here, so the
-    /// invariant is pinned upstream of that cleanup.
-    #[test]
-    pub(crate) fn cubature_output_is_symmetric_for_symmetric_inputs() {
-        let p = 5;
-        let m = 6;
-        let points: Vec<(Array2<f64>, Array1<f64>)> = (0..m)
-            .map(|idx| {
-                let mut a = Array2::<f64>::eye(p);
-                for i in 0..p {
-                    for j in 0..i {
-                        let v = 0.05 + 0.03 * (i as f64 + j as f64) + 0.02 * (idx as f64);
-                        a[[i, j]] = v;
-                        a[[j, i]] = v;
-                    }
-                    a[[i, i]] = 2.0 + 0.1 * idx as f64;
-                }
-                let b: Array1<f64> = (0..p)
-                    .map(|d| 0.1 * (d as f64 + 1.0) + 0.05 * idx as f64)
-                    .collect();
-                (a, b)
-            })
-            .collect();
-        let v = accumulate(&points, p);
-        let mut max_asym = 0.0_f64;
-        for i in 0..p {
-            for j in (i + 1)..p {
-                max_asym = max_asym.max((v[[i, j]] - v[[j, i]]).abs());
-            }
-        }
-        assert!(
-            max_asym < 1e-13,
-            "output not symmetric for symmetric inputs: max_asym={max_asym:.3e}",
-        );
-    }
-
-    /// The A-side depends only on the multiset of `A_m`, not on their order or
-    /// on which `b_m` they are paired with. With a constant `β̂` every chord is
-    /// zero, so both orderings must return exactly `mean(A_m)`.
-    #[test]
-    pub(crate) fn cubature_a_side_unchanged_under_b_permutation() {
-        let p = 3;
-        let m = 6;
-        let a_set: Vec<Array2<f64>> = (0..m)
-            .map(|i| {
-                let mut a = Array2::<f64>::eye(p);
-                a[[0, 0]] = 1.0 + 0.07 * (i as f64);
-                a[[1, 1]] = 1.5 - 0.05 * (i as f64);
-                a[[2, 2]] = 0.9 + 0.04 * (i as f64);
-                a[[0, 1]] = 0.05;
-                a[[1, 0]] = 0.05;
-                a
-            })
-            .collect();
-        let b_const: Array1<f64> = ndarray::array![0.2, -0.1, 0.3];
-        let original: Vec<(Array2<f64>, Array1<f64>)> =
-            a_set.iter().map(|a| (a.clone(), b_const.clone())).collect();
-        let perm: [usize; 6] = [3, 0, 5, 1, 4, 2];
-        let permuted_a: Vec<(Array2<f64>, Array1<f64>)> = perm
-            .iter()
-            .map(|&i| (a_set[i].clone(), b_const.clone()))
-            .collect();
-
-        let v_orig = accumulate(&original, p);
-        let v_perm = accumulate(&permuted_a, p);
-        let w = 1.0 / m as f64;
-        let mut mean_a = Array2::<f64>::zeros((p, p));
-        for a in &a_set {
-            mean_a.scaled_add(w, a);
-        }
-        assert!(
-            max_abs_deviation(&v_orig, &mean_a) < 1e-13
-                && max_abs_deviation(&v_perm, &mean_a) < 1e-13,
-            "A-side depended on A ordering under constant β̂: orig={:.3e}, perm={:.3e}",
-            max_abs_deviation(&v_orig, &mean_a),
-            max_abs_deviation(&v_perm, &mean_a),
-        );
-    }
-
-    /// V100 hill-climb scaffold — sigma-loop accumulator perf record.
-    ///
-    /// The per-charter goal is a 5x speedup over the CPU Rayon sigma loop at
-    /// large scale on V100. The accumulator is the only piece of the dispatch
-    /// path fully isolable from a constructed `RemlState` (the rest is an inner
-    /// PIRLS per node), so what runs here is the accumulator at large-scale
-    /// shape — `p = 50`, 4 upgraded directions — and the per-call time is
-    /// PRINTED as the hill-climbing record.
-    ///
-    /// Timing is deliberately not a gate: an absolute per-call ceiling is a
-    /// calibration-box assumption that flakes on contended shared runners and
-    /// silently passes real regressions on fast ones, and promoting it to a
-    /// fixed CPU/GPU ratio would encode the box harder (#2313). Correctness
-    /// regressions are caught by the assertions above.
-    #[test]
-    pub(crate) fn sigma_loop_v100_hill_climb_baseline() {
-        let p = 50_usize;
-        let m = 8_usize;
-
-        let points: Vec<(Array2<f64>, Array1<f64>)> = (0..m)
-            .map(|idx| {
-                let mut lower = Array2::<f64>::zeros((p, p));
-                for i in 0..p {
-                    for j in 0..=i {
-                        let off = (i as f64 + 1.0) * (j as f64 + 1.0) + 0.1 * (idx as f64);
-                        lower[[i, j]] = (off.sin()) * 0.05 + if i == j { 1.0 } else { 0.0 };
+    fn signed_empty_and_non_finite_mass_are_refused() {
+        assert!(accumulate_sigma_cubature_total_covariance(&[], &[], 2).is_none());
+        for weight in [-1., f64::NAN, f64::INFINITY] {
+            let points = vec![atom(Array2::eye(2), array![0., 0.], weight)];
+            assert!(accumulate_sigma_cubature_total_covariance(&points, &[], 2).is_none());
                     }
                 }
-                let mut a = lower.dot(&lower.t());
-                for d in 0..p {
-                    a[[d, d]] += 1e-3;
-                }
-                let b: Array1<f64> = (0..p)
-                    .map(|d| {
-                        let phase = (d as f64 + 1.0) * 0.13 + (idx as f64) * 0.27;
-                        phase.cos() * 0.3 - phase.sin() * 0.1
-                    })
-                    .collect();
-                (a, b)
-            })
-            .collect();
-
-        let reps = 20_usize;
-        let t0 = std::time::Instant::now();
-        let mut last_trace = 0.0_f64;
-        for _ in 0..reps {
-            let v = accumulate(&points, p);
-            // Touch the result so the optimiser cannot elide the call. The
-            // trace is a real use of the matrix, not a `black_box` silencer.
-            let mut tr = 0.0_f64;
-            for d in 0..p {
-                tr += v[[d, d]];
-            }
-            last_trace += tr;
-        }
-        let per_call_us = t0.elapsed().as_secs_f64() * 1e6 / reps as f64;
-
-        assert!(
-            last_trace.is_finite(),
-            "accumulator produced non-finite trace sum: {last_trace}"
-        );
-
-        let stage3_ready = super::device_pirls_stage3_ready()
-            .expect("Stage-3 runtime resolution must not fault in the timing test");
-        log::info!(
-            "[sigma-hill-climb] accumulator baseline: per-call={per_call_us:.1}us \
-             (p={p}, M={m}, reps={reps}); stage3_ready={stage3_ready}; the 5x \
-             target gates on stage3_ready=true"
-        );
-    }
 }
 
 #[cfg(test)]
@@ -2899,9 +2064,7 @@ mod smoothing_correction_outcome_tests {
                 let probe = Array1::from_vec(vec![candidate]);
                 state
                     .compute_gradient(&probe)
-                    .unwrap_or_else(|err| {
-                        panic!("outer gradient at rho={candidate}: {err}")
-                    })[0]
+                    .unwrap_or_else(|err| panic!("outer gradient at rho={candidate}: {err}"))[0]
             };
             let mut lo_rho = 1.0 - RHO_BOUND;
             let mut hi_rho = RHO_BOUND - 1.0;
@@ -2960,14 +2123,14 @@ mod smoothing_correction_outcome_tests {
             // silent substitution as the candidate. If the gradient really is
             // unavailable on this route, that is the finding and it must be
             // said out loud rather than converted into a degenerate input.
-            let finalgrad = state
-                .compute_gradient(&final_rho)
-                .unwrap_or_else(|err| panic!(
+            let finalgrad = state.compute_gradient(&final_rho).unwrap_or_else(|err| {
+                panic!(
                     "outer gradient unavailable at rho={final_rho:?}: {err}. \
                      A zero-length substitute would empty the identified subspace \
                      and make the cubature precondition fail for a reason that has \
                      nothing to do with this test's subject."
-                ));
+                )
+            });
             let finalgrad_norm = finalgrad.dot(&finalgrad).sqrt();
 
             // Certify the bracket actually converged. Without this the fixture
@@ -3023,7 +2186,8 @@ mod smoothing_correction_outcome_tests {
             // quantity it was decided against. The type derives `Debug`, so
             // this costs one formatted string on the failure path only.
             let outcome_description = format!("{outcome:?}");
-            let correction = outcome.into_correction_with_method().0.unwrap_or_else(|| {
+            let correction =
+                outcome.into_correction_with_method().0.unwrap_or_else(|| {
                 // Name the SPECTRUM, not just the verdict.
                 //
                 // Two hypotheses for `active_rank = 0` have now been refuted by

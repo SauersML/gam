@@ -36,6 +36,17 @@ fn circle_atom(
     col_cos: usize,
     coords: &Array2<f64>,
 ) -> SaeManifoldAtom {
+    ellipse_atom(name, p, col_sin, col_cos, 1.0, coords)
+}
+
+fn ellipse_atom(
+    name: &str,
+    p: usize,
+    col_sin: usize,
+    col_cos: usize,
+    cosine_scale: f64,
+    coords: &Array2<f64>,
+) -> SaeManifoldAtom {
     let evaluator = Arc::new(
         PeriodicHarmonicEvaluator::new(3)
             .expect("an odd harmonic count is a valid periodic basis size"),
@@ -46,7 +57,7 @@ fn circle_atom(
     // PeriodicHarmonicEvaluator(3) emits [1, sin(2πt), cos(2πt)].
     let mut decoder = Array2::<f64>::zeros((3, p));
     decoder[[1, col_sin]] = 1.0;
-    decoder[[2, col_cos]] = 1.0;
+    decoder[[2, col_cos]] = cosine_scale;
     SaeManifoldAtom::new_with_provided_function_gram(
         name,
         SaeAtomBasisKind::Periodic,
@@ -58,6 +69,45 @@ fn circle_atom(
     )
     .expect("fixture atom: basis width, latent dim and decoder shape agree by construction")
     .with_basis_evaluator(evaluator)
+}
+
+#[test]
+fn collateral_dose_uses_canonical_arc_length_not_raw_chart_parameter() {
+    let n = 240usize;
+    let p = 4usize;
+    let coords = Array2::<f64>::from_shape_fn((n, 1), |(row, _)| (row as f64 + 0.5) / n as f64);
+    // An ellipse is exactly represented by the harmonic basis, but its raw
+    // phase is not unit speed. It therefore separates an intrinsic dose from a
+    // gauge-arbitrary constant raw-parameter step.
+    let atom = ellipse_atom("anisotropic-ring", p, 0, 1, 0.3, &coords);
+    let assignment = SaeAssignment::from_blocks_with_mode_and_manifolds(
+        Array2::<f64>::zeros((n, 1)),
+        vec![coords],
+        vec![LatentManifold::Circle { period: 1.0 }],
+        AssignmentMode::softmax(1.0),
+    )
+    .expect("fixture assignment");
+    let term = SaeManifoldTerm::new(vec![atom], assignment).expect("fixture term");
+    let rows: Vec<usize> = (0..n).collect();
+    let dose = 0.125;
+    let canonical = crate::inference::steering::steer_rows_unit_speed(&term, 0, &rows, dose)
+        .expect("canonical steering field");
+    let expected_rms = (canonical
+        .delta
+        .iter()
+        .map(|value| value * value)
+        .sum::<f64>()
+        / n as f64)
+        .sqrt();
+
+    let curve = collateral_curve(&term, 0, 0, &[], &[dose]).expect("collateral curve");
+    let point = &curve.manifold.points[0];
+    let observed_rms = (point.on_target_effect.powi(2) + point.collateral.powi(2)).sqrt();
+    assert!(
+        (observed_rms - expected_rms).abs() <= 1.0e-12 * expected_rms.max(1.0),
+        "collateral dose used a different coordinate gauge: observed RMS {observed_rms:e}, \
+         canonical RMS {expected_rms:e}"
+    );
 }
 
 #[test]

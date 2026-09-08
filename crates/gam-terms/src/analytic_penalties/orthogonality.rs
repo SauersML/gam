@@ -918,6 +918,66 @@ impl DecoderIncoherencePenalty {
     /// `O(β · Σ_pairs M_j·M_k·p)`: once `β = K·M·p` and the collinearity gate
     /// admits `O(K)` co-active pairs, the probe loop spends `O(K²)` time
     /// rebuilding a matrix this assembles in `O(K)` (#1026).
+    /// The Gauss–Newton (PSD majorizer) curvature in CARRIER form: one entry per
+    /// cross-Gram element `C[a,b]` of each penalized pair, as
+    /// `(κ, (start_j, B_k[b,·]), (start_k, B_j[a,·]))` with the starts in this
+    /// penalty's own flat-β coordinates.
+    ///
+    /// `H_GN = Σ_pairs κ·JᵀJ` with `J = ∂vec(C)/∂vec(B)`, and `C[a,b] = Σ_o
+    /// B_j[a,o]B_k[b,o]` depends on exactly row `a` of `B_j` and row `b` of
+    /// `B_k`, so `∂C[a,b]/∂B` is two `p`-long runs and `JᵀJ = Σ_{a,b} v_{ab}
+    /// v_{ab}ᵀ`. This is therefore the SAME operator as the
+    /// `include_residual = false` branch of `Self::hvp_impl` and as
+    /// [`Self::accumulate_psd_majorizer_dense`] — stated in the form a
+    /// matrix-free solver can install without materializing `(ΣM_kp)²`.
+    ///
+    /// #2828: the SAE's un-framed matrix-free assembly lane had no way to carry
+    /// this curvature and was dropping it while keeping the gradient.
+    #[must_use]
+    pub fn psd_majorizer_carriers(
+        &self,
+        target: ArrayView1<'_, f64>,
+        rho: ArrayView1<'_, f64>,
+        scale: f64,
+    ) -> Vec<(f64, (usize, Vec<f64>), (usize, Vec<f64>))> {
+        let mut out = Vec::new();
+        if target.len() != self.target.len() {
+            return out;
+        }
+        let offsets = self.block_offsets();
+        let weight = self.resolved_weight(rho);
+        let p = self.p_out;
+        for &(j, k, w_sym) in &self.pairs {
+            if j == k {
+                continue;
+            }
+            let off_j = offsets[j];
+            let off_k = offsets[k];
+            let m_j = self.block_sizes[j];
+            let m_k = self.block_sizes[k];
+            if m_j == 0 || m_k == 0 {
+                continue;
+            }
+            let nj = Self::block_norm_sq(target, off_j, m_j, p);
+            let nk = Self::block_norm_sq(target, off_k, m_k, p);
+            if !(nj > 0.0 && nk > 0.0) {
+                continue;
+            }
+            let kappa = w_sym * weight * scale / (nj * nk);
+            if kappa == 0.0 {
+                continue;
+            }
+            for a in 0..m_j {
+                for b in 0..m_k {
+                    let run_j: Vec<f64> = (0..p).map(|o| target[off_k + b * p + o]).collect();
+                    let run_k: Vec<f64> = (0..p).map(|o| target[off_j + a * p + o]).collect();
+                    out.push((kappa, (off_j + a * p, run_j), (off_k + b * p, run_k)));
+                }
+            }
+        }
+        out
+    }
+
     pub fn accumulate_psd_majorizer_dense(
         &self,
         target: ArrayView1<'_, f64>,

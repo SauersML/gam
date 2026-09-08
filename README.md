@@ -158,7 +158,7 @@ overcomplete hard-TopK support lane (`K > p`, per-token active set solved
 against the frozen dictionary, memory `O(N·top_k)` — the LLM-scale path).
 Fits mint only from a converged, certificate-checked optimization.
 
-```python
+```python no-exec
 fit = gamfit.sae_manifold_fit(X=acts, K=32_000, d_atom=1,
                               assignment="topk", top_k=8)   # K >> p, topology=auto
 census = Counter(fit.atom_topologies)     # which shapes the evidence kept
@@ -220,7 +220,7 @@ with on-demand `S(t)`, `h(t)`, `H(t)` on any time grid:
 pred = model.predict(test_df)
 S = pred.survival_at([1, 5, 10, 20])
 H = pred.cumulative_hazard_at([10])
-pred.write_survival_at_csv("surv.csv", times=[...])  # streamed
+pred.write_survival_at_csv("surv.csv", times=[1, 5, 10])  # streamed
 ```
 
 Event histories. `gam_models::event_history` fits marked counting
@@ -304,8 +304,8 @@ matrices, the Grassmann and Stiefel manifolds, and the hyperbolic
 the responses:
 
 ```python
-gamfit.fit(df, "y ~ s(x)", response_geometry="poincare", response_columns=[...])
-gamfit.fit(df, "y ~ s(x)", response_geometry="constant_curvature", response_columns=[...])
+gamfit.fit(df, "y ~ s(x)", response_geometry="poincare", response_columns=["sand", "silt", "clay"])
+gamfit.fit(df, "y ~ s(x)", response_geometry="constant_curvature", response_columns=["nx", "ny", "nz"])
 ```
 
 Model comparison. `compare_models` reports AIC and approximate

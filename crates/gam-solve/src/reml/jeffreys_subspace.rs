@@ -2778,9 +2778,11 @@ impl JeffreysHphiDriftBase {
     /// Per-direction drift `D[gate·H_Φ_raw]` reusing the prepared base. Only the
     /// `δ`-dependent perturbation is evaluated here: the reduced perturbation
     /// `Ḋ = Z_Jᵀ pert_h Z_J` and, per axis, `∂D_a = Z_Jᵀ pert_hessian_dir(e_a) Z_J`
-    /// (the genuinely `δ`-dependent second directional derivatives). Returns
-    /// `Ok(None)` (⇒ caller emits the zero drift) when the family does not expose
-    /// the exact second derivative on some axis, matching the released semantics.
+    /// (the genuinely `δ`-dependent second directional derivatives). Returns an
+    /// error when the family does not expose the exact second
+    /// derivative on some axis.  An active Jeffreys term cannot silently replace
+    /// a missing curvature drift by zero: doing so manufactures an inexact outer
+    /// Hessian while still advertising an analytic one.
     pub(crate) fn perturbation_derivative<PertFn>(
         &self,
         pert_h: &Array2<f64>,
@@ -2793,8 +2795,7 @@ impl JeffreysHphiDriftBase {
         // Acquire the `p` second-directional axis matrices `{H²dot[δ,e_a]}` via the
         // per-axis closure (the parallel sweep preserved from before the batched
         // hook). The first `None` ⇒ the family lacks the exact second derivative
-        // on some axis ⇒ the whole drift collapses to zero, matching the released
-        // singular-hook semantics.
+        // on some axis is a derivative-contract error, not a zero derivative.
         let pert_hdots: Vec<Array2<f64>> = {
             use rayon::iter::{IntoParallelIterator, ParallelIterator};
             let results: Vec<Result<Option<Array2<f64>>, String>> = (0..p)
@@ -2809,7 +2810,14 @@ impl JeffreysHphiDriftBase {
             for result in results {
                 match result? {
                     Some(h2) => pert_hdots.push(h2),
-                    None => return Ok(Array2::zeros((p, p))),
+                    None => {
+                        return Err(
+                            "JeffreysHphiDriftBase::perturbation_derivative: active Jeffreys \
+                             curvature requires a second directional information derivative for \
+                             every coefficient axis"
+                                .to_string(),
+                        );
+                    }
                 }
             }
             pert_hdots
@@ -2822,8 +2830,8 @@ impl JeffreysHphiDriftBase {
     /// (e.g. via the row-kernel BLAS-3
     /// `second_directional_derivative_all_axes_dense_override`), avoiding the `p`
     /// independent full-data second-directional sweeps the per-axis closure runs.
-    /// `None` ⇒ the family lacks the exact second derivative ⇒ zero drift, exactly
-    /// as the per-axis path's first-`None` collapse. The reduction from the axis
+    /// `None` is a derivative-contract error: the active term's drift is unknown,
+    /// not zero. The reduction from the axis
     /// matrices onward is shared with (and bit-identical to) the per-axis path.
     pub fn perturbation_derivative_batched_axes(
         &self,
@@ -2832,7 +2840,11 @@ impl JeffreysHphiDriftBase {
     ) -> Result<Array2<f64>, String> {
         let p = self.p;
         let Some(pert_hdots) = pert_axis_matrices else {
-            return Ok(Array2::zeros((p, p)));
+            return Err(
+                "JeffreysHphiDriftBase::perturbation_derivative_batched_axes: active Jeffreys \
+                 curvature requires second directional information derivatives"
+                    .to_string(),
+            );
         };
         if pert_hdots.len() != p {
             return Err(format!(
@@ -3497,6 +3509,36 @@ mod tests {
             "batched D_β H_Φ[δ] disagrees with a finite difference of the value path's own H_Φ \
              on a β-nonlinear information: max_abs={max_abs:.6e} scale={scale:.6e}\nanalytic=\
              {analytic:?}\nfd={fd:?}"
+        );
+    }
+
+    #[test]
+    fn active_jeffreys_drift_refuses_missing_second_information_derivatives_979() {
+        let h = array![[2.0, 0.1], [0.1, 1.0]];
+        let z = Array2::<f64>::eye(2);
+        let axes = vec![
+            array![[0.2, 0.0], [0.0, -0.1]],
+            array![[0.0, 0.05], [0.05, 0.1]],
+        ];
+        let base = JeffreysHphiDriftBase::prepare_with_axes(h.view(), z.view(), axes)
+            .expect("valid Jeffreys drift base")
+            .expect("conditioning gate open");
+        let perturbation = array![[0.1, 0.0], [0.0, -0.05]];
+
+        let batched_error = base
+            .perturbation_derivative_batched_axes(&perturbation, None)
+            .expect_err("a missing batched second derivative must not become zero curvature");
+        assert!(
+            batched_error.contains("requires second directional information derivatives"),
+            "unexpected batched derivative-contract error: {batched_error}"
+        );
+
+        let per_axis_error = base
+            .perturbation_derivative(&perturbation, |_| Ok(None))
+            .expect_err("a missing per-axis second derivative must not become zero curvature");
+        assert!(
+            per_axis_error.contains("requires a second directional information derivative"),
+            "unexpected per-axis derivative-contract error: {per_axis_error}"
         );
     }
 

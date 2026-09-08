@@ -122,7 +122,6 @@ fn sae_fit_error_to_pyerr(py: Python<'_>, err: gam::terms::sae::manifold::SaeFit
     tensor_knot_offsets = None,
     tensor_degrees = None,
     manifold = "euclidean".to_string(),
-    sigma_eff_mode = "profiled".to_string(),
     max_iter = 200,
     grad_tol = 1.0e-8,
     stationarity_reference = None,
@@ -155,7 +154,6 @@ fn gaussian_reml_optimize_latent<'py>(
     tensor_knot_offsets: Option<Vec<usize>>,
     tensor_degrees: Option<Vec<usize>>,
     manifold: String,
-    sigma_eff_mode: String,
     max_iter: usize,
     grad_tol: f64,
     stationarity_reference: Option<f64>,
@@ -179,7 +177,6 @@ fn gaussian_reml_optimize_latent<'py>(
             )));
         }
     };
-    let sigma_eff_mode = SigmaEffMode::parse(&sigma_eff_mode).map_err(py_value_error)?;
     let dim_selection_values = dim_selection_log_precision
         .as_ref()
         .map(|values| ValidatedDimSelectionPrecisions::new(values.as_array(), latent_dim))
@@ -274,7 +271,6 @@ fn gaussian_reml_optimize_latent<'py>(
         family,
         aux_strength,
         init_lambda,
-        sigma_eff_mode,
         n_obs,
         latent_dim,
         m,
@@ -650,7 +646,8 @@ fn glm_reml_fit_latent_impl(
     }
     // GLM standalone latent fit: no manifold/chart concept here, so the latent
     // Duchon decoder stays the open Euclidean basis (byte-identical).
-    let (design, t_mat) = build_latent_duchon_design(t_flat, n_obs, latent_dim, centers, m, None)?;
+    let (design, t_mat, _radial_reparam) =
+        build_latent_duchon_design(t_flat, n_obs, latent_dim, centers, m, None)?;
     if penalty.dim() != (design.ncols(), design.ncols()) {
         return Err(format!(
             "penalty shape mismatch: expected {}x{}, got {}x{}",
@@ -865,7 +862,7 @@ fn glm_reml_fit_latent<'py>(
         // multi-output canonical fitters (issue #349): the multinomial path
         // consumes the active `(N, K-1, K-1)` leading sub-block and the
         // binomial-multi path the diagonal of each `(N, K, K)` block.
-        let (design, t_mat) = build_latent_duchon_design(
+        let (design, t_mat, _radial_reparam) = build_latent_duchon_design(
             t_values.view(),
             n_obs,
             latent_dim,
@@ -4888,9 +4885,9 @@ fn survival_score_grid_from_times<'py>(
         return Ok(Array1::from_vec(vec![0.0, 1.0]).into_pyarray(py).unbind());
     }
     times.sort_by(|a, b| a.total_cmp(b));
-    let max_t = *times
-        .last()
-        .expect("times is non-empty; the empty case returned above");
+    let max_t = times.last().copied().ok_or_else(|| {
+        py_value_error("survival score grid requires at least one finite positive time".to_string())
+    })?;
     // Data-driven, quantile-spaced evaluation grid spanning [0, max(t)]. The old
     // grid was a fixed {0,1,2,5,10,median} set whose magic constants only made
     // sense for O(1)–O(10) survival times; on any other time scale it either ran

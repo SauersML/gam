@@ -1230,8 +1230,10 @@ impl WarmStartStore {
         let old_access =
             (meta.accessed_unix_secs as u128) * 1_000_000_000u128 + meta.accessed_nanos as u128;
         let touched = now.max(old_access.saturating_add(1));
-        meta.accessed_unix_secs = (touched / 1_000_000_000u128) as u64;
-        meta.accessed_nanos = (touched % 1_000_000_000u128) as u32;
+        meta.accessed_unix_secs = u64::try_from(touched / 1_000_000_000u128)
+            .expect("warm-start access timestamp seconds must fit in u64");
+        meta.accessed_nanos = u32::try_from(touched % 1_000_000_000u128)
+            .expect("subsecond nanoseconds are less than one billion");
         meta.accessed = true;
         let json = serde_json::to_vec_pretty(&meta)?;
         let tmp = meta_path.with_extension(format!(
@@ -1534,8 +1536,10 @@ impl WarmStartStore {
 
     fn unix_now_parts(&self) -> (u64, u32) {
         let total = nanos_since_epoch().saturating_add(u128::from(self.test_time_offset_ns()));
-        let secs = (total / 1_000_000_000u128) as u64;
-        let nanos = (total % 1_000_000_000u128) as u32;
+        let secs = u64::try_from(total / 1_000_000_000u128)
+            .expect("warm-start timestamp seconds must fit in u64");
+        let nanos = u32::try_from(total % 1_000_000_000u128)
+            .expect("subsecond nanoseconds are less than one billion");
         (secs, nanos)
     }
 
@@ -2306,9 +2310,14 @@ mod tests {
         // The token is memoized, and the fix depends on it: an identity that
         // moved between two reads in one process would downgrade the process's
         // own terminus and silently disable resume everywhere.
-        assert_eq!(producer_identity(), producer_identity());
+        let first = producer_identity();
+        let second = producer_identity();
         assert!(
-            !producer_identity().is_empty(),
+            std::ptr::eq(first, second),
+            "the OnceLock must return the same allocation, not merely equal text"
+        );
+        assert!(
+            !first.is_empty(),
             "an empty token would collide with the legacy serde default"
         );
     }
