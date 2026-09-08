@@ -172,3 +172,10 @@ The Block10 discrepancy remains after the edge repair, with the same skipped
 entries (`.buildd/issue932-block10-edge-polynomial.log`). The local candidate
 turns those omissions into assertions and checks zero-direction outputs
 against exact zero; resolving its numerical counterexample is still required.
+
+Publication: `877b32ca5` contains the moving-edge repair and audit. Concurrent
+shared-index staging also included changes to `gam-math/src/jet_tower.rs`,
+`gam-solve/src/constrained_gaussian_reml.rs`, and
+`gam-solve/src/gaussian_reml.rs` in that commit. The tests above validate the
+moving-edge/model candidate on MSI, not those concurrently staged changes.
+They were preserved; no history or worktree restoration was performed.
