@@ -7590,9 +7590,6 @@ impl SaeManifoldTerm {
             if let Some(step) = accepted_step {
                 state_moved = true;
                 moved_at.get_or_insert(StateMoveSite::AcceptedNewtonStep);
-                // Genuine transverse progress: the next plateau is a new one, so
-                // the gauge block is worth asking again (#2762).
-                gauge_block_armed = true;
                 // #2267 — A NEWTON STEP'S NATURAL LENGTH IS ONE.
                 //
                 // `backtracking_line_search` only ever CONTRACTS from its initial
@@ -7803,7 +7800,6 @@ impl SaeManifoldTerm {
                 }
                 state_moved = true;
                 moved_at.get_or_insert(StateMoveSite::ProximalCorrectionStep);
-                gauge_block_armed = true;
             }
             // Affine gauge canonicalization is a representation change, but the
             // decoder smoothness term is part of the optimized objective — a
@@ -8011,6 +8007,49 @@ impl SaeManifoldTerm {
                 moved_at.get_or_insert(StateMoveSite::FrameRefresh);
             }
             tail_marks.extend(hook_marks.into_inner());
+            // #2228 — the quotient above removes the reconstruction-gauge block
+            // from the Newton solve. That block is null for the likelihood but
+            // not for the ARD and smoothness priors, so the pinned Newton step is
+            // a descent method on the full penalized objective only when paired
+            // with the exact orbit minimizer on every accepted iteration.
+            let lambda_smooth = rho.lambda_smooth_vec()?;
+            let mut orbit = GaugeOrbitDescent::default();
+            loop {
+                // A call stops either at this block's stationarity or at the
+                // caller's iteration grant. The latter is not a fixed point, so
+                // continue in a fresh chunk rather than silently truncating the
+                // second block on a late transverse iteration.
+                let chunk = self.descend_gauge_orbit(
+                    target,
+                    rho,
+                    analytic_penalties,
+                    &lambda_smooth,
+                    max_iter.max(1),
+                )?;
+                orbit.rounds = orbit.rounds.saturating_add(chunk.rounds);
+                orbit.objective_decrease += chunk.objective_decrease;
+                orbit.dimension = chunk.dimension;
+                orbit.max_directional_derivative = chunk.max_directional_derivative;
+                orbit.evaluations = orbit.evaluations.saturating_add(chunk.evaluations);
+                if !chunk.moved() {
+                    break;
+                }
+            }
+            gauge_block_armed = false;
+            if orbit.moved() {
+                state_moved = true;
+                moved_at.get_or_insert(StateMoveSite::GaugeOrbitDescent);
+                log::debug!(
+                    "run_joint_fit_arrow_schur: gauge-orbit block recovered {:.6e} over {} \
+                     round(s) after accepted iteration {outer_iteration} (span dim {}, \
+                     maxᵢ|gᵀvᵢ|={:.6e}, {} objective evaluations)",
+                    orbit.objective_decrease,
+                    orbit.rounds,
+                    orbit.dimension,
+                    orbit.max_directional_derivative,
+                    orbit.evaluations,
+                );
+            }
             // Unconditional warranty-bank update (see the bank's declaration):
             // strictly-better penalized objective ⇒ this accepted boundary is
             // the new exit-warranty fallback, independent of any EV/coherence

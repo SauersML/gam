@@ -474,6 +474,41 @@ fn gauge_orbit_descent_is_monotone_and_reports_the_decrease_it_made_2762() {
     }
 }
 
+/// #2228 regression: an accepted transverse Newton iteration must also minimize
+/// the prior-driven block which its quotient pins. Before the fix that block was
+/// visited only at a terminal plateau, so this audit committed more descent.
+#[test]
+fn accepted_inner_iteration_also_minimizes_the_pinned_gauge_block_2228() {
+    let (mut term, z, mut rho) = seeded_two_circle_term(48, 16, 2);
+    term.run_joint_fit_arrow_schur_for_quasi_laplace(
+        z.view(), &mut rho, None, 8, 1.0, 1.0e-6, 1.0e-6,
+    )
+    .expect("one inner block-coordinate iteration");
+
+    let before = term
+        .penalized_objective_total(z.view(), &rho, None, 1.0)
+        .expect("finite objective after the inner iteration");
+    let outcome = term
+        .descend_gauge_orbit(
+            z.view(),
+            &rho,
+            None,
+            &rho.lambda_smooth_vec().expect("one block per atom"),
+            1,
+        )
+        .expect("post-iteration orbit audit");
+    let material_resolution =
+        SAE_MANIFOLD_INNER_OBJECTIVE_STALL_REL_TOL * (1.0 + before.abs());
+
+    assert!(
+        !outcome.moved() && outcome.objective_decrease <= material_resolution,
+        "an accepted inner iteration left {:.6e} of material objective descent in the \
+         beta block that its quotient pins (resolution {:.6e})",
+        outcome.objective_decrease,
+        material_resolution,
+    );
+}
+
 /// ANGLE 4 — the refine loop's terminal mover and terminal restore must have
 /// ONE state authority.
 ///
