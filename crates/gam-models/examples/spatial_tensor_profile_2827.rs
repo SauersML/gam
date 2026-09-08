@@ -1,8 +1,10 @@
 //! Reproduce #2827 through the public formula API on a bounded CSV prefix.
 //!
-//! Usage: spatial_tensor_profile_2827 DATA.csv ROWS [FORMULA]
+//! Usage: spatial_tensor_profile_2827 DATA.csv ROWS [FORMULA] [LOG_LEVEL]
 //! Every log line carries elapsed seconds so tensor setup can be distinguished
 //! from the subsequent optimizer. ROWS is explicit to keep iteration bounded.
+//! LOG_LEVEL defaults to info; debug also exposes the trust-region iteration
+//! trace needed to profile ordinary Gaussian seed retries (#2817).
 
 use gam_data::encode_recordswith_inferred_schema;
 use gam_models::fit_orchestration::{FitConfig, FitResult, fit_from_formula};
@@ -15,7 +17,7 @@ static LOGGER: ElapsedLogger = ElapsedLogger;
 
 impl log::Log for ElapsedLogger {
     fn enabled(&self, metadata: &log::Metadata<'_>) -> bool {
-        metadata.level() <= log::Level::Info
+        metadata.level() <= log::max_level()
     }
 
     fn log(&self, record: &log::Record<'_>) {
@@ -34,9 +36,13 @@ impl log::Log for ElapsedLogger {
 
 fn run() -> Result<(), String> {
     let args: Vec<String> = std::env::args().collect();
-    if !(3..=4).contains(&args.len()) {
-        return Err("usage: spatial_tensor_profile_2827 DATA.csv ROWS [FORMULA]".into());
+    if !(3..=5).contains(&args.len()) {
+        return Err("usage: spatial_tensor_profile_2827 DATA.csv ROWS [FORMULA] [LOG_LEVEL]".into());
     }
+    let log_level = args.get(4).map(|level| level.parse::<log::LevelFilter>())
+        .transpose().map_err(|error| error.to_string())?
+        .unwrap_or(log::LevelFilter::Info);
+    log::set_max_level(log_level);
     let rows = args[2].parse::<usize>().map_err(|error| error.to_string())?;
     if rows == 0 {
         return Err("ROWS must be positive".into());

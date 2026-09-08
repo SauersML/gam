@@ -1,0 +1,20 @@
+{
+  "command": [
+    "timeout",
+    "180",
+    "taskset",
+    "-c",
+    "112-115",
+    ".buildd/gaussian-outer-profile-2817-current",
+    "/scratch.global/sauer354/m1-data/main_50000.csv",
+    "50000",
+    "yg ~ s(x1) + s(x2) + s(x3) + s(x4) + te(x5, x6)",
+    "debug"
+  ],
+  "data_sha256": "0fe89203bc0908e7ab740e8a402ee061ce4f8cd205efa24922c58d807ec9ffb4",
+  "exit_code": 124,
+  "elapsed_seconds": 180.03472744498868,
+  "generated_seed_sweeps": 1,
+  "matrix_free_iteration_lines": 0,
+  "last_traces": []
+}

@@ -2875,6 +2875,7 @@ pub(crate) fn fit_binomial_mean_wiggle(
         .to_string()
     })?;
     let (mut fit, last_alias, frozen_source_beta, frozen_warp_design) = converged;
+    fit.likelihood_scale = likelihood_family.default_scale_metadata();
     fit.likelihood_family = Some(likelihood_family);
     // Capture the mean coefficients whose linear predictor is the *frozen index*
     // `η̂` the warp basis `B(η̂)` was pinned at (#2141). The reported deviance is

@@ -67,6 +67,9 @@ fn check_saved_response_scale(link: &str) {
     })
     .expect("assemble flexible binomial payload");
     let model = FittedModel::from_payload(payload.clone());
+    model
+        .validate_for_persistence()
+        .expect("flexible binomial metadata must pass the saved-model consumer gate");
     let encoded = serde_json::to_vec(&payload).expect("serialize fitted payload");
     let decoded: FittedModelPayload =
         serde_json::from_slice(&encoded).expect("deserialize fitted payload");
