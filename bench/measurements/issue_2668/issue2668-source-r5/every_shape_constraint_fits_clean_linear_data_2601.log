@@ -1,0 +1,16 @@
+
+running 1 test
+test smooths::shape_constrained_fit_survives_its_own_inference_2601::every_shape_constraint_fits_clean_linear_data_2601 ... 
+thread 'smooths::shape_constrained_fit_survives_its_own_inference_2601::every_shape_constraint_fits_clean_linear_data_2601' (2128226) panicked at tests/regressions/smooths/shape_constrained_fit_survives_its_own_inference_2601.rs:154:5:
+shape-constrained fits failed on clean linear data (#2601):
+  concave: The P-IRLS inner loop did not converge within 2 iterations. Last gradient norm was 2.293496e-7.
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+FAILED
+
+failures:
+
+failures:
+    smooths::shape_constrained_fit_survives_its_own_inference_2601::every_shape_constraint_fits_clean_linear_data_2601
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 506 filtered out; finished in 4.29s
+
