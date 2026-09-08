@@ -80,6 +80,24 @@ pub fn build_term_collection_design_inner_with_policy(
     spec: &TermCollectionSpec,
     policy: &gam_runtime::resource::ResourcePolicy,
 ) -> Result<TermCollectionDesign, BasisError> {
+    build_term_collection_design_inner_with_policy_and_plan(data, spec, policy, false)
+}
+
+/// Build a collection whose sweep-level spatial geometry has already been planned.
+pub fn build_planned_term_collection_design_inner_with_policy(
+    data: ArrayView2<'_, f64>,
+    spec: &TermCollectionSpec,
+    policy: &gam_runtime::resource::ResourcePolicy,
+) -> Result<TermCollectionDesign, BasisError> {
+    build_term_collection_design_inner_with_policy_and_plan(data, spec, policy, true)
+}
+
+fn build_term_collection_design_inner_with_policy_and_plan(
+    data: ArrayView2<'_, f64>,
+    spec: &TermCollectionSpec,
+    policy: &gam_runtime::resource::ResourcePolicy,
+    spatial_plan_is_resolved: bool,
+) -> Result<TermCollectionDesign, BasisError> {
     use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
 
     let n = data.nrows();
@@ -93,7 +111,11 @@ pub fn build_term_collection_design_inner_with_policy(
     let (smooth_raw_result, (random_blocks_result, linear_block_result)) = rayon::join(
         || {
             let mut ws = crate::basis::BasisWorkspace::with_policy(policy.clone());
-            build_smooth_design_withworkspace_unvalidated(data, &spec.smooth_terms, &mut ws)
+            if spatial_plan_is_resolved {
+                build_smooth_design_from_planned_terms(data, &spec.smooth_terms, &mut ws)
+            } else {
+                build_smooth_design_withworkspace_unvalidated(data, &spec.smooth_terms, &mut ws)
+            }
         },
         || {
             rayon::join(
