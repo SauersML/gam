@@ -1533,7 +1533,10 @@ where
             let problem = OuterProblem::new(theta_dim)
                 .with_gradient(Derivative::Analytic)
                 .with_hessian(DeclaredHessianForm::Either)
-                .with_prefer_gradient_only(true)
+                // The joint link evaluator already assembles exact curvature
+                // on every evaluation. Use it: BFGS can lose the changing
+                // link/scale coupling and stall with a nonstationary shape.
+                .with_prefer_gradient_only(false)
                 .with_objective_scale(Some(n_obs as f64))
                 .with_problem_size(n_obs, x_o.ncols())
                 .with_psi_dim(mixture_dim + sas_dim)

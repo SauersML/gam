@@ -119,8 +119,24 @@ unchanged (RMSE .79949). An independent mgcv tensor with the same 7×7 basis giv
 both representations to that shared resolution; its original R² and relative
 RMSE requirements remain unchanged. The fresh GAM run passes in 65.30s:
 posterior-mean RMSE .73052 versus INLA .70544 (ratio 1.036), R² .8767, EDF 33.11
-within the 169-column tensor basis. The curvature-enabled multinomial and survival
-fits and the fresh penguin arms remain in progress.
+within the 169-column tensor basis.
+
+Final curvature-enabled rerun: multinomial still timed out at 360 seconds.
+Survival's fit converged in 132.20 seconds, but failed its unchanged 120-second
+fit assertion (133 seconds total); its later prediction-quality assertions were
+not reached. The MSI connection closed during the first penguin arm, leaving
+both fresh penguin results incomplete. The compute nodes subsequently did not
+answer. Logs are in `issue1082-curvature-results/` beside the earlier census.
+
+The attempted small multinomial outer-derivative probe failed immediately because
+the public joint-hyper evaluator counted block-local penalties while this family
+uses full-width joint penalties (six supplied rho coordinates versus zero
+expected). This is a harness failure, not derivative evidence. The unusable probe
+was removed from the suite and saved outside the repository for further work;
+the previously comment-only module supplies no coverage. The independent
+joint-penalty cancellation unit check passed in 0.02 seconds. Issue #1082 remains
+open: neither the outstanding quality gates nor all affected derivative checks
+have been satisfied.
 
 1. Run every selected test after the corrections, including both synthetic and real-data arms. Record
    actual durations and assertions; missing references remain failures.

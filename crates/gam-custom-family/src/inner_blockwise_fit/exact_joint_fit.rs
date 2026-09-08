@@ -10,10 +10,11 @@ use super::*;
 /// The rounding band of the joint stationarity residual `∇L − Sβ` on this
 /// arithmetic, in the `∞`-norm the certificate measures it in (#2812).
 ///
-/// Per coordinate the data gradient accumulates `n` rows and the penalty product
-/// `p_k` terms, so the residual carries at least
-/// `γ_n·|∇L|_∞ + max_k γ_{p_k}·‖|λ_k S_k|·|β_k| + ridge·|β_k|‖_∞` of
-/// rounding and a residual target below it asks the solve for digits the
+/// Per coordinate the data gradient accumulates `n` rows. Each local penalty
+/// product accumulates `p_k` terms; each full-width joint penalty accumulates
+/// `p` terms followed by strength scaling and summation across penalties.
+/// Both representations contribute their absolute summand magnitudes to the
+/// rounding budget. A residual target below it asks the solve for digits the
 /// arithmetic does not have — which is how the strengths a derived ρ domain
 /// admits left the joint Newton refusing a stationary mode. The data term is
 /// the assembled gradient's magnitude, a LOWER bound on its summands', which is
@@ -23,6 +24,7 @@ use super::*;
 fn joint_stationarity_rounding_band(
     s_lambdas: &[Array2<f64>],
     block_betas: &[&Array1<f64>],
+    joint_bundle: Option<&gam_problem::JointPenaltyBundle>,
     diagonal_ridge: f64,
     data_gradient_inf: f64,
     total_n: usize,
@@ -45,9 +47,64 @@ fn joint_stationarity_rounding_band(
             penalty_band = penalty_band.max(growth * magnitude);
         }
     }
+    if let Some(bundle) = joint_bundle {
+        let beta: Vec<f64> = block_betas.iter().flat_map(|b| b.iter().copied()).collect();
+        let mut joint_magnitudes = vec![0.0_f64; beta.len()];
+        for (spec, lambda) in bundle.specs().iter().zip(bundle.lambdas()) {
+            for (row, magnitude) in joint_magnitudes.iter_mut().enumerate() {
+                *magnitude += lambda.abs()
+                    * spec.matrix.row(row).iter().zip(&beta)
+                        .map(|(entry, coefficient)| (entry * coefficient).abs())
+                        .sum::<f64>();
+            }
+        }
+        let growth = gam_linalg::roundoff::accumulation_growth(
+            beta.len() + bundle.specs().len() + 2,
+        );
+        penalty_band += growth * joint_magnitudes.into_iter().fold(0.0_f64, f64::max);
+    }
     let data_band =
         gam_linalg::roundoff::accumulation_growth(total_n.max(1)) * data_gradient_inf.abs();
     data_band + penalty_band
+}
+
+#[cfg(test)]
+mod rounding_tests {
+    use super::joint_stationarity_rounding_band;
+    use gam_problem::{JointPenaltyBundle, JointPenaltySpec};
+    use ndarray::{Array2, array};
+    use std::sync::Arc;
+
+    #[test]
+    fn joint_penalty_cancellation_retains_its_arithmetic_budget() {
+        let matrix = array![[1.0, -1.0], [-1.0, 1.0]];
+        let beta = array![1.0, 1.0];
+        let log_lambda = 1e12_f64.ln();
+        let bundle = JointPenaltyBundle::new(
+            Arc::new(vec![JointPenaltySpec {
+                label: None,
+                matrix: matrix.clone(),
+                initial_log_lambda: log_lambda,
+                nullspace_dim: 1,
+                group: None,
+            }]),
+            vec![log_lambda],
+            2,
+        ).expect("rank-one difference penalty is valid");
+        // S beta vanishes, but the dense product subtracts two large terms.
+        let local = joint_stationarity_rounding_band(
+            &[matrix * log_lambda.exp()], &[&beta], None, 0.0, 0.0, 1,
+        );
+        let joint = joint_stationarity_rounding_band(
+            &[Array2::zeros((2, 2))], &[&beta], Some(&bundle), 0.0, 0.0, 1,
+        );
+        assert!(local > 0.0);
+        assert!(joint >= local, "full-width representation lost the local rounding budget");
+        let zero_beta = array![0.0, 0.0];
+        assert_eq!(joint_stationarity_rounding_band(
+            &[Array2::zeros((2, 2))], &[&zero_beta], Some(&bundle), 0.0, 0.0, 1,
+        ), 0.0, "matrix norm alone must not certify a nonstationary mode");
+    }
 }
 
 /// Clear every cross-cycle statistic whose inference assumes a FIXED step model
@@ -386,11 +443,21 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
     // scale `max|S_λ|·‖β‖₁²` while returning something that can be many orders
     // smaller. `S_λ` is a function of ρ alone and ρ is fixed for this solve, so
     // the matrix factor is read once here; the `‖β‖₁²` factor is per trial point.
-    let penalty_entry_magnitude: f64 = s_lambdas
+    let local_penalty_entry_magnitude: f64 = s_lambdas
         .iter()
         .flat_map(|s_lambda| s_lambda.iter())
         .filter(|value| value.is_finite())
         .fold(0.0_f64, |acc, value| acc.max(value.abs()));
+    // Full-width penalties are evaluated separately by the objective. Their
+    // signed quadratic forms can cancel just as the block-local forms do.
+    let joint_penalty_entry_magnitude = joint_bundle.map_or(0.0, |bundle| {
+        bundle.specs().iter().zip(bundle.lambdas())
+            .map(|(spec, lambda)| {
+                lambda.abs() * spec.matrix.iter().fold(0.0_f64, |acc, value| acc.max(value.abs()))
+            })
+            .sum::<f64>()
+    });
+    let penalty_entry_magnitude = local_penalty_entry_magnitude + joint_penalty_entry_magnitude;
     let mut cycles_since_residual_improved: usize = 0;
     // Number of consecutive non-improving cycles after which the
     // conditioning-based self-vanishing Levenberg–Marquardt damping is
@@ -2293,6 +2360,7 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
             joint_stationarity_rounding_band(
                 &s_lambdas,
                 &block_betas,
+                joint_bundle,
                 joint_mode_diagonal_ridge,
                 grad_inf,
                 total_joint_n,
@@ -4784,6 +4852,7 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
             joint_stationarity_rounding_band(
                 &s_lambdas,
                 &block_betas,
+                joint_bundle,
                 effective_ridge,
                 grad_inf,
                 total_joint_n,

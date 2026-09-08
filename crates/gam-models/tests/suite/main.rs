@@ -8,7 +8,6 @@ mod exact_gaussian_boundary_2663;
 mod fit_data_boundary;
 mod multinomial_contracted_jeffreys_2612;
 mod multinomial_covariance_mode_2612;
-mod multinomial_jeffreys_outer_gradient_fd_2612;
 mod multinomial_lambda_selection_561;
 mod multinomial_parametric_penalty_2612;
 mod multinomial_payload_matches_the_fit_2612;

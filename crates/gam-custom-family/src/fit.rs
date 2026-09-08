@@ -2929,12 +2929,10 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
         );
     }
 
-    // Exact Hessians remain declared whenever the assembled family can supply
-    // them, but #2359 reserves that order-four work for the terminal minimum
-    // certificate. Search uses the exact analytic gradient. Small iteration
-    // budgets still run through this same outer solver and must earn its
-    // convergence certificate; they are not a production shortcut to an
-    // unoptimized fit.
+    // Declare the derivatives selected by the family's capability/work policy
+    // and let the outer planner use that curvature during search. Forcing every
+    // family into gradient-only search discarded affordable exact Hessians and
+    // repeatedly restarted BFGS at cost stalls in the multinomial fit (#1082).
     use gam_problem::OuterEval;
     use gam_solve::model_types::EstimationError;
     use gam_solve::rho_optimizer::{OuterEvalOrder, OuterProblem};
@@ -3136,7 +3134,6 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
         .with_stuck_stall_cold_reeval_signal(Arc::clone(&outer_force_cold))
         .with_gradient(cap_gradient)
         .with_hessian(hessian)
-        .with_prefer_gradient_only(true)
         // The mode-selection consumer below requires a certified local minimum,
         // not merely a stationary point whose raw negative curvature was cleared
         // by the generic gradient-residue floor. Declare that requirement before
