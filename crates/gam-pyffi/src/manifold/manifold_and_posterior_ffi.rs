@@ -4199,7 +4199,6 @@ mod batch_tests {
             family: AuxPriorFamily::Ridge,
             aux_strength: None,
             init_lambda: None,
-            sigma_eff_mode: SigmaEffMode::Profiled,
             n_obs,
             latent_dim,
             m: 2,

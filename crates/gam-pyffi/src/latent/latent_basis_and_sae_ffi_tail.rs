@@ -2170,7 +2170,6 @@ fn interchange_swap_backward<'py>(
     aux_strength = None,
     dim_selection_log_precision = None,
     basis_kind = "duchon".to_string(),
-    sigma_eff_mode = "profiled".to_string(),
     tensor_knots_concat = None,
     tensor_knot_offsets = None,
     tensor_degrees = None,
@@ -2197,7 +2196,6 @@ fn gaussian_reml_fit_latent_backward<'py>(
     aux_strength: Option<f64>,
     dim_selection_log_precision: Option<PyReadonlyArray1<'py, f64>>,
     basis_kind: String,
-    sigma_eff_mode: String,
     tensor_knots_concat: Option<PyReadonlyArray1<'py, f64>>,
     tensor_knot_offsets: Option<Vec<usize>>,
     tensor_degrees: Option<Vec<usize>>,
@@ -2211,7 +2209,6 @@ fn gaussian_reml_fit_latent_backward<'py>(
             )));
         }
     };
-    let sigma_eff_mode = SigmaEffMode::parse(&sigma_eff_mode).map_err(py_value_error)?;
     let basis_kind_normalized = latent_basis_kind(&basis_kind).map_err(py_value_error)?;
     let centers_view = centers.as_array();
     let t_view = t.as_array();
@@ -2257,9 +2254,10 @@ fn gaussian_reml_fit_latent_backward<'py>(
         None,
     )
     .map_err(|err| py_value_error(err.to_string()))?;
-    // Inner adjoint for the returned standard gradients. This still follows
-    // the generic REML VJP path for y/S/w, but grad_t below replaces the
-    // score-design component with the row-shared analytic latent formula.
+    // The core REML adjoint is the single source of truth for every upstream,
+    // including the score's design derivative.  Contracting that derivative
+    // with the matching basis jet below avoids maintaining a second REML
+    // derivative in this binding layer.
     let backward = gaussian_reml_multi_closed_form_backward_from_fit(
         design.view(),
         y_view,
@@ -2273,41 +2271,8 @@ fn gaussian_reml_fit_latent_backward<'py>(
         grad_edf,
     )
     .map_err(|err| py_value_error(err.to_string()))?;
-    let backward_for_t = if grad_reml_score != 0.0 {
-        gaussian_reml_multi_closed_form_backward_from_fit(
-            design.view(),
-            y_view,
-            penalty_view,
-            weights_view,
-            &fit,
-            grad_lambda,
-            grad_coefficients.as_ref().map(|g| g.as_array()),
-            grad_fitted.as_ref().map(|g| g.as_array()),
-            0.0,
-            grad_edf,
-        )
-        .map_err(|err| py_value_error(err.to_string()))?
-    } else {
-        backward.clone()
-    };
-    let grad_x = &backward_for_t.grad_x;
-    let mut grad_t =
-        contract_input_loc_gradient(grad_x.view(), &jet).map_err(basis_error_to_pyerr)?;
-    if grad_reml_score != 0.0 {
-        add_latent_outer_reml_score_gradient(
-            &mut grad_t,
-            grad_reml_score,
-            design.view(),
-            y_view,
-            t_mat.view(),
-            &jet,
-            penalty_view,
-            weights_view,
-            &fit,
-            sigma_eff_mode,
-        )
-        .map_err(py_value_error)?;
-    }
+    let mut grad_t = contract_input_loc_gradient(backward.grad_x.view(), &jet)
+        .map_err(basis_error_to_pyerr)?;
     // Identifiability-mode additive contributions to grad_t plus log-normalizer
     // adjoints. Fixes audit-revised claim that REML ARD/AuxPrior selection
     // needs the normalized prior terms, not only raw quadratic gradients.
@@ -2393,7 +2358,6 @@ struct LatentOuterProblem {
     family: AuxPriorFamily,
     aux_strength: Option<f64>,
     init_lambda: Option<f64>,
-    sigma_eff_mode: SigmaEffMode,
     n_obs: usize,
     latent_dim: usize,
     m: usize,
@@ -2470,19 +2434,21 @@ impl LatentOuterProblem {
         if !want_grad {
             return Ok((value, None));
         }
-        let mut grad_t = Array1::<f64>::zeros(self.n_obs * self.latent_dim);
-        add_latent_outer_reml_score_gradient(
-            &mut grad_t,
-            1.0,
+        let backward = gaussian_reml_multi_closed_form_backward_from_fit(
             design.view(),
             self.y.view(),
-            t_mat.view(),
-            &jet,
             self.penalty.view(),
             weights_view,
             &fit,
-            self.sigma_eff_mode,
-        )?;
+            0.0,
+            None,
+            None,
+            1.0,
+            0.0,
+        )
+        .map_err(|err| err.to_string())?;
+        let mut grad_t = contract_input_loc_gradient(backward.grad_x.view(), &jet)
+            .map_err(|err| err.to_string())?;
         // Identifiability-prior contributions, identical to the backward path's
         // grad_t assembly at `grad_reml_score = 1`.
         if let Some(u_arr) = self.aux_u.as_ref() {
