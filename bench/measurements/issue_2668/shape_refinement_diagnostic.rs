@@ -26,8 +26,12 @@ static LOGGER: RefinementLogger = RefinementLogger;
 
 #[test]
 fn a_install_refinement_logger() {
-    log::set_logger(&LOGGER).expect("the diagnostic owns its process logger");
+    assert!(
+        log::set_logger(&LOGGER).is_ok(),
+        "the diagnostic owns its process logger"
+    );
     log::set_max_level(log::LevelFilter::Debug);
+    assert_eq!(log::max_level(), log::LevelFilter::Debug);
 }
 
 #[path = "../../../tests/regressions/smooths/shape_constrained_fit_survives_its_own_inference_2601.rs"]
