@@ -53,10 +53,22 @@ release_cache_verify_receipt() {
         print "::error::No compiler requests reached this sccache daemon; check wrapper binding and daemon lifetime."
         exit 1
       }
-      errors = value["Cache errors"] + value["Cache read errors"] + value["Cache write errors"]
+      # A READ error can hand the compiler a wrong object; a WRITE error is
+      # the backend refusing to STORE an object the compiler already produced,
+      # and the artifact is what it would be with no cache at all. Measured
+      # 2026-09-09: Publish to PyPI 34376153113 refused three wheels whose
+      # 385-390 compile requests all executed, on 80/120/387 write errors
+      # from the shared backend, and Build and Release All 34373507539 the
+      # same on 5. Cache history must not decide whether an artifact can be
+      # published (pypi-wheels.yml), so a write error is reported and the
+      # unseeded cache is named, but the receipt stands.
+      errors = value["Cache errors"] + value["Cache read errors"]
       if (errors != 0) {
-        print "::error::Compiler cache reported " errors " error(s); refusing an unhealthy cache receipt."
+        print "::error::Compiler cache reported " errors " read error(s); refusing an unhealthy cache receipt."
         exit 1
+      }
+      if (value["Cache write errors"] != 0) {
+        print "::warning::Compiler cache refused " value["Cache write errors"] " write(s): this build compiled every object itself and did not seed the cache; the artifact is unaffected."
       }
       if (value["Cache hits"] == 0) {
         print "::notice::Cold compiler cache: this successful build seeds subsequent releases."

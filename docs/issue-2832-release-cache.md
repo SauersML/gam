@@ -68,3 +68,20 @@ suite before their build matrices. Ruby YAML parsing passed for both edited
 workflows, and `bash -n` passed for the shared helper, also on MSI. No code, build,
 or tests ran locally. A complete cross-platform release was not dispatched as
 part of these focused checks.
+
+## Amendment 2026-09-09: write errors no longer refuse a measured build
+
+The receipt gate refused every wheel of the v0.3.156 matrix
+([Publish to PyPI 34376153113](https://github.com/SauersML/gam/actions/runs/34376153113)):
+the macOS-arm, musllinux-x86_64 and manylinux-arm jobs each executed 385–390
+compile requests with zero compile failures and were refused on 387, 120 and 80
+**write** errors from the shared cache backend; the same day
+[Build and Release All 34373507539](https://github.com/SauersML/gam/actions/runs/34373507539)
+was refused on 5. A write error is the backend declining to store an object the
+compiler has already produced; the artifact is bit-for-bit what a build with no
+cache would produce. Refusing it made cache-backend availability decide
+publication, which is the premise this workflow rejects. Write errors are now
+reported as a warning that names the unseeded cache. Read errors and cache
+errors, which can hand the compiler a wrong object, remain fatal, and the
+zero-request and malformed-receipt refusals are unchanged.
+

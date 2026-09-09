@@ -56,12 +56,22 @@ class ReleaseCacheTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("No compiler requests", result.stdout)
 
-    def test_each_cache_error_counter_refuses_publication(self):
-        for counter in ("Cache errors", "Cache read errors", "Cache write errors"):
+    def test_each_read_error_counter_refuses_publication(self):
+        for counter in ("Cache errors", "Cache read errors"):
             with self.subTest(counter=counter):
                 result = shell("release_cache_verify_receipt", receipt(**{counter: 1}))
                 self.assertNotEqual(result.returncode, 0)
                 self.assertIn("unhealthy cache receipt", result.stdout)
+
+    def test_write_errors_are_reported_but_do_not_refuse_a_measured_build(self):
+        """A write error is the backend refusing to store an object the compiler
+        already produced (Publish to PyPI 34376153113: 80/120/387 on jobs whose
+        every compile request executed). The artifact is unaffected; the receipt
+        names the unseeded cache instead of refusing it."""
+        result = shell("release_cache_verify_receipt", receipt(**{"Cache write errors": 387}))
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        self.assertIn("::warning::Compiler cache refused 387 write(s)", result.stdout)
+        self.assertIn("Measured release build: requests=1041", result.stdout)
 
     def test_missing_malformed_or_duplicate_counters_refuse_publication(self):
         for counter in (
