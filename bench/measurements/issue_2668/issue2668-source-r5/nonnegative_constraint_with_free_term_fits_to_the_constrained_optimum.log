@@ -1,6 +1,6 @@
 
 running 1 test
-test optimization::nonnegative_constraint_kkt_abort_with_free_term::nonnegative_constraint_with_free_term_fits_to_the_constrained_optimum ... wrote predictions: /projects/standard/hsiehph/sauer354/issue2668-source-r5-scratch/.tmpkiXua4/pred_nonneg.csv (rows=4)
+test optimization::nonnegative_constraint_kkt_abort_with_free_term::nonnegative_constraint_with_free_term_fits_to_the_constrained_optimum ... wrote predictions: $MSI_HOME/issue2668-source-r5-scratch/.tmpkiXua4/pred_nonneg.csv (rows=4)
 ok
 
 test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 506 filtered out; finished in 0.28s

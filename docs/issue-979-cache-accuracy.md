@@ -18,7 +18,7 @@ Warm inner solves in the corrected run commonly converged in 2–4 cycles.
 The full fit still exceeded a subsequent 60-second cap, so this is not a
 full-fit performance pass. Both diagnostic processes terminated at their caps.
 
-Logs in `/projects/standard/hsiehph/sauer354/y1-logs/`:
+Logs in `$MSI_HOME/y1-logs/`:
 
 - `codex979-opt1-baseline-survival160.log`
 - `codex979-opt1-face-survival160.log`

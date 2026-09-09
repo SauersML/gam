@@ -50,7 +50,7 @@ this partial diagnostic.
 ## Follow-up source audit
 
 The later issue update reports all five native fits in 3.340 seconds. Its raw
-MSI log, `/projects/standard/hsiehph/sauer354/issue1561-binomial-holdout.log`,
+MSI log, `$MSI_HOME/issue1561-binomial-holdout.log`,
 records each fold's successful fit, EDF, and rho. This does not supersede the
 partial Python run or establish a measured Python-overhead ratio: an exact
 native executable hash and its complete dependency/source provenance were not

@@ -95,7 +95,7 @@ The `quality_1082` target owns the selected source modules exactly once; the lar
 `quality` and `regressions` binaries no longer register them. Reference-quality CI
 discovers and runs both quality binaries and times out focused cases at 360 seconds.
 The census logs are at
-`/projects/standard/hsiehph/sauer354/issue1082-focused-results/` on MSI, with the
+`$MSI_HOME/issue1082-focused-results/` on MSI, with the
 result ledger at `/Users/user/gam-validation-artifacts/issue1082-focused-results.tsv`.
 
 The subsequent rounding-correction run passes the new joint-penalty cancellation
@@ -169,7 +169,7 @@ correctness investigation to the armed criterion; step-size stability and the
 responsible derivative term still need investigation. The failing reproduction
 is retained in the worktree at
 `crates/gam-models/tests/multinomial_outer_derivatives_1082.rs`, and its MSI log is
-`/projects/standard/hsiehph/sauer354/issue1082-resume-derivatives.log`. No further
+`$MSI_HOME/issue1082-resume-derivatives.log`. No further
 long quality run was launched after the request to finish immediately.
 
 1. Run every selected test after the corrections, including both synthetic and real-data arms. Record

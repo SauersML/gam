@@ -1,8 +1,8 @@
-   Compiling gam-problem v0.3.154 (/projects/standard/hsiehph/sauer354/gam-main-validation/crates/gam-problem)
-   Compiling gam-gpu v0.3.154 (/projects/standard/hsiehph/sauer354/gam-main-validation/crates/gam-gpu)
-   Compiling gam-terms v0.3.154 (/projects/standard/hsiehph/sauer354/gam-main-validation/crates/gam-terms)
-   Compiling gam-model-api v0.3.154 (/projects/standard/hsiehph/sauer354/gam-main-validation/crates/gam-model-api)
-   Compiling gam-solve v0.3.154 (/projects/standard/hsiehph/sauer354/gam-main-validation/crates/gam-solve)
+   Compiling gam-problem v0.3.154 ($MSI_HOME/gam-main-validation/crates/gam-problem)
+   Compiling gam-gpu v0.3.154 ($MSI_HOME/gam-main-validation/crates/gam-gpu)
+   Compiling gam-terms v0.3.154 ($MSI_HOME/gam-main-validation/crates/gam-terms)
+   Compiling gam-model-api v0.3.154 ($MSI_HOME/gam-main-validation/crates/gam-model-api)
+   Compiling gam-solve v0.3.154 ($MSI_HOME/gam-main-validation/crates/gam-solve)
     Finished `test` profile [optimized + debuginfo] target(s) in 3m 59s
      Running unittests src/lib.rs (/scratch.global/sauer354/w5-target/debug/deps/gam_solve-6cfdd22166520a14)
 

@@ -24,7 +24,7 @@
     "-L",
     "native=/scratch.global/sauer354/y2-target/debug/build/zstd-sys-cf55b24880b1a3c0/out",
     "-o",
-    "/projects/standard/hsiehph/sauer354/gam-main-validation/.buildd/reml-kkt-20260908-v3",
+    "$MSI_HOME/gam-main-validation/.buildd/reml-kkt-20260908-v3",
     "--extern",
     "gam_model_api=/scratch.global/sauer354/y2-target/debug/deps/libgam_model_api-e0c7d13c15e8a352.rlib",
     "--extern",

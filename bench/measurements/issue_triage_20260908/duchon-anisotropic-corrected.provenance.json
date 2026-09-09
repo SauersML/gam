@@ -1,6 +1,6 @@
 {
   "argv": [
-    "/projects/standard/hsiehph/sauer354/.rustup/toolchains/1.97.1-x86_64-unknown-linux-gnu/bin/rustc",
+    "$MSI_HOME/.rustup/toolchains/1.97.1-x86_64-unknown-linux-gnu/bin/rustc",
     "--crate-name",
     "duchon_anisotropic_derivatives_2735",
     "--edition=2024",
@@ -12,9 +12,9 @@
     "-L",
     "dependency=/scratch.global/sauer354/gam-deslop-a2-target/debug/deps",
     "-o",
-    "/projects/standard/hsiehph/sauer354/gam-main-validation/.buildd/duchon-anisotropic-components-current",
+    "$MSI_HOME/gam-main-validation/.buildd/duchon-anisotropic-components-current",
     "--extern",
-    "gam_terms=/projects/standard/hsiehph/sauer354/gam-main-validation/.buildd/libgam_terms-2735.rlib",
+    "gam_terms=$MSI_HOME/gam-main-validation/.buildd/libgam_terms-2735.rlib",
     "--extern",
     "ndarray=/scratch.global/sauer354/gam-deslop-a2-target/debug/deps/libndarray-3e2fc606731d0706.rlib",
     "-L",

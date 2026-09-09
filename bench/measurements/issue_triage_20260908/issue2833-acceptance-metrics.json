@@ -1,5 +1,5 @@
 {
-  "artifact": "/projects/standard/hsiehph/sauer354/gam-main-validation/gamfit/_rust.abi3.so",
+  "artifact": "$MSI_HOME/gam-main-validation/gamfit/_rust.abi3.so",
   "artifact_sha256": "d449d353e3c7cd2f0cf3fc3061a6b7085aa90b1ea61a78ede34937ce75f8eef8",
   "cases": [
     {

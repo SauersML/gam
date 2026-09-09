@@ -1,6 +1,6 @@
 # Issue 2833 verification
 
-The final MSI extension has SHA256 `7112c1fffe857fb5eaf709c93bbc6de6b899925329f287b53ef66ba506c7509c` and was loaded from `/projects/standard/hsiehph/sauer354/gam-main-validation/gamfit/_rust.abi3.so`. It was built with the existing `gam-deslop-a2-target` dev cache on CPUs 108–109, then extracted from the wheel and installed by atomic rename. The final build completed in 2m52s.
+The final MSI extension has SHA256 `7112c1fffe857fb5eaf709c93bbc6de6b899925329f287b53ef66ba506c7509c` and was loaded from `$MSI_HOME/gam-main-validation/gamfit/_rust.abi3.so`. It was built with the existing `gam-deslop-a2-target` dev cache on CPUs 108–109, then extracted from the wheel and installed by atomic rename. The final build completed in 2m52s.
 
 `issue2833-final-extension-source-sha256.json` records the shared source snapshot before compilation. Other workers' existing changes were present. The root build script was unchanged; its existing source-archive policy skipped tracked-file audits because this remote source directory has no `.git`. The remaining build checks ran normally. The spatial worker formatted its three files after compilation; that formatting is not represented as a new compiled source snapshot.
 

@@ -84,7 +84,7 @@ and optimization level 0 during iteration; these runs are correctness evidence,
 not release-performance measurements. Builds and logs are on shared project or
 scratch storage. Nothing is built or numerically executed on the local Mac.
 
-Logs are in `/projects/standard/hsiehph/sauer354/y1-logs/`:
+Logs are in `$MSI_HOME/y1-logs/`:
 
 - `codex979-cached-contracts.log`
 - `codex979-survival-baseline6.log`

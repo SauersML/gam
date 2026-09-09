@@ -100,7 +100,7 @@ repair. Attempts to connect to acn116 returned SSH status
 255 before starting the test; there is no second-host measurement to report.
 
 The BMS flex candidate is being validated on MSI in the existing
-`/projects/standard/hsiehph/sauer354/gam-main-validation` source directory using
+`$MSI_HOME/gam-main-validation` source directory using
 the warm `/scratch.global/sauer354/y5-target` cache, four Cargo workers and
 serial tests. The first attempt inherited invalid OpenBLAS linker flags;
 clearing them recovered the warm cache. The one-codegen-unit test-crate build

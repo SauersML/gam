@@ -3,7 +3,7 @@
     "taskset",
     "-c",
     "112-115",
-    "/projects/standard/hsiehph/sauer354/gam-main-validation/.venv-msi/bin/maturin",
+    "$MSI_HOME/gam-main-validation/.venv-msi/bin/maturin",
     "build",
     "--profile",
     "dev",

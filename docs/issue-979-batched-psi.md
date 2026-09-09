@@ -30,7 +30,7 @@ regression includes the previously documented pending analytic corrections;
 the batching commit alone does not publish those corrections.
 
 All three final checks pass in 0.92 seconds. The warm model test build took
-2m56s. Logs are under `/projects/standard/hsiehph/sauer354/y1-logs/`:
+2m56s. Logs are under `$MSI_HOME/y1-logs/`:
 
 - `codex979-batched-psi-tests.log`
 - `codex979-batched-psi-flat-tests.log`
