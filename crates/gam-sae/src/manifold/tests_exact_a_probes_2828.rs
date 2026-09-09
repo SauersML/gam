@@ -19,6 +19,7 @@ use crate::assignment::AssignmentMode;
 use crate::manifold::arrow_solver::DeflatedArrowSolver;
 use crate::manifold::construction::ThetaAdjointDhChannel;
 use crate::manifold::tests_sparse_curvature_operator_2500::threshold_gate_tiny_fixture;
+use gam_solve::arrow_schur::{solve_arrow_newton_step_with_options, ArrowSolveOptions};
 use ndarray::Array2;
 
 fn frozen_anchor_and_cache(
@@ -60,7 +61,20 @@ fn resident_softmax_theta_adjoint_matches_dense_under_both_operators_2828() {
     let (mut term, target, rho) = threshold_gate_tiny_fixture(false);
     term.assignment.mode = AssignmentMode::softmax(0.8);
     let rho = rho.for_assignment(term.assignment.mode);
-    let (anchor, cache) = frozen_anchor_and_cache(&term, &target, &rho);
+    // The softmax variant of this fixture is not a quasi-Laplace optimum, so
+    // the cache is the plain arrow-Schur factorisation of the assembled
+    // system at this state (the construction the set-aside variant's own
+    // parity gate used), not a criterion cache.
+    let mut anchor = term.clone();
+    let mut system = anchor
+        .assemble_arrow_schur(target.view(), &rho, None)
+        .expect("cold arrow assembly at the softmax fixture state");
+    SaeManifoldTerm::ensure_row_gauge_deflation_for_quasi_laplace(&mut system);
+    let options = ArrowSolveOptions::direct();
+    let (_delta_t, _delta_beta, cache) =
+        solve_arrow_newton_step_with_options(&system, 0.0, 0.0, &options)
+            .expect("direct arrow-Schur factorisation at the softmax fixture state");
+    anchor.streaming_gates_frozen = true;
     let solver = DeflatedArrowSolver::plain(&cache);
     let inverse = anchor
         .materialize_joint_inverse(&cache, &solver)
