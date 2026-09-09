@@ -1,6 +1,6 @@
 [package]
 name = "gam-model-kernels"
-version = "0.3.156"
+version = "0.3.157"
 edition = "2024"
 description = "Shared model-kernel base crate for the gam penalized-likelihood engine"
 license = "AGPL-3.0-or-later"
@@ -11,12 +11,12 @@ rust-version = "1.97"
 warnings = "deny"
 
 [dependencies]
-gam-linalg = { path = "../gam-linalg", version = "=0.3.156" }
-gam-math = { path = "../gam-math", version = "=0.3.156" }
-gam-problem = { path = "../gam-problem", version = "=0.3.156" }
-gam-runtime = { path = "../gam-runtime", version = "=0.3.156" }
-gam-spec = { path = "../gam-spec", version = "=0.3.156" }
-gam-solve = { path = "../gam-solve", version = "=0.3.156" }
+gam-linalg = { path = "../gam-linalg", version = "=0.3.157" }
+gam-math = { path = "../gam-math", version = "=0.3.157" }
+gam-problem = { path = "../gam-problem", version = "=0.3.157" }
+gam-runtime = { path = "../gam-runtime", version = "=0.3.157" }
+gam-spec = { path = "../gam-spec", version = "=0.3.157" }
+gam-solve = { path = "../gam-solve", version = "=0.3.157" }
 libm = "0.2.16"
 ndarray = { version = "0.17.2", features = ["serde", "rayon"] }
 opt.workspace = true

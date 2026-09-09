@@ -1,3 +1,44 @@
+## v0.3.157 — gam 0.3.157 / gamfit 0.1.267 (2026-09-09)
+
+A same-day follow-up to `v0.3.156`, whose `gamfit` wheels never reached PyPI:
+the release-cache receipt refused every wheel of its matrix on cache **write**
+errors (387/120/80 per job) from the shared backend, on builds whose every
+compile request executed. A write error is the backend declining to store an
+object the compiler already produced, so the artifact was what a build with no
+cache produces; the receipt now reports write errors as a warning that names
+the unseeded cache, and read errors stay fatal. The wheel job sources that gate
+from the packaged commit, which is why this is a release and not a re-run.
+
+- **The joint Newton's descending ray reaches the outer from every
+  non-converged exit again** (#2695). A kept edit of the 2026-09-08 bulk
+  commit had deleted the single-owner `descending_ray_restoration` and its
+  calls at the divergence and flat-residual exits, inlining the computation
+  at the slow-rate exit alone, which is the state `413ffbad8` fixed. The
+  bulk's one new piece there is kept: at a cost-resolution stop with no
+  resolvable negative curvature, the joint trust radius is raised to the
+  exact-mode Newton correction's metric norm so a radius collapsed by rounded
+  objective differences cannot repeat the same certificate with microscopic
+  steps.
+- **The timed row-program hand keeps its activity contract** (#932). The
+  bulk's edit had made the hand's value accumulation unconditional and
+  deleted the far-tail zero-stack row and the pin that keeps the opponent on
+  the generated program's contract; main's version is back.
+- **#2828 measured.** Two probes added in `tests_exact_a_probes_2828.rs`
+  (Focused Rust Proof 34378047451): the resident and dense softmax
+  θ-adjoints agree to 1e-14 under both evidence operators, so the set-aside
+  row-jet second-jet term is unnecessary; the β block of
+  `exact_a_theta_adjoint_joint` disagrees with a Richardson central
+  difference of `log|A|` in every one of twelve probed decoder coefficients
+  (relative gap 0.46–1.71, oracle converged to 1e-10, sign flips included)
+  while the t block passes its gate. That probe stays red as the acceptance;
+  the set-aside `theta_bilinear` third derivative of the decoder priors'
+  exact β curvature is the candidate fix.
+- **Source-integrity guards are green again.** The three guard ledgers
+  record what the repair removed relative to the bulk commit, with the
+  reason per design family, and the test-census floor is regenerated; the
+  #2668 shape-refinement diagnostic's setup test asserts what it installed;
+  three bracketed math tokens rustdoc read as links are fenced.
+
 ## v0.3.156 — gam 0.3.156 / gamfit 0.1.266 (2026-09-09)
 
 The release after `v0.3.155` (2026-09-06), three days later. It carries the
