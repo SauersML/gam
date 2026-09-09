@@ -155,11 +155,25 @@ pub struct EventHistoryFamily {
     cache: Arc<Mutex<Option<(Vec<f64>, Arc<JointEvaluation>)>>>,
 }
 
+/// The mesh refinement the reference population is run on.
+///
+/// It is deliberately not the fit's current refinement. The fit refines its
+/// own mesh until the coefficients are stationary, and a normaliser held
+/// across those rungs has to mean the same thing on each of them; a grid that
+/// moved under the ladder would change the held values' length and their
+/// meaning together. The reference grid's own resolution is therefore its own
+/// numerical choice, and what it has to resolve is the population's decay,
+/// which is smooth in time — not the event times, of which it has none.
+const REFERENCE_REFINEMENT: usize = 0;
+
 /// What one refresh of the risk-set centring produced: the normaliser to hold
 /// over the next solve, and the reference population's own marginal survival.
 #[derive(Clone, Debug)]
 pub struct RiskSetCentring {
-    /// `log M_d(t)` at every cohort node, index `row * marks + d`.
+    /// `log M_d(t)` on the reference grid, index
+    /// `(stratum * nodes + node) * marks + d`. It is held on that grid rather
+    /// than on the cohort's nodes because the fit refines its own mesh
+    /// between solves while this must mean the same thing across them.
     pub log_normaliser: Vec<f64>,
     /// The log of the reference population's risk-set mass at every node of
     /// the reference grid, index `(stratum * nodes + node) * masks + mask`.
@@ -171,6 +185,49 @@ pub struct RiskSetCentring {
     pub masks: usize,
     /// The risk set of every mark, indexing the last axis of `log_risk_mass`.
     pub mask_of_mark: Vec<usize>,
+}
+
+impl ReferenceTables {
+    /// Carry a normaliser held on the reference grid onto a node set, by the
+    /// linear interpolation each node recorded when the tables were built.
+    fn carry_to_nodes(
+        &self,
+        held: &[f64],
+        marks: usize,
+        total_nodes: usize,
+    ) -> Result<Vec<f64>, EventHistoryError> {
+        let nodes = self.grid.len();
+        let expected = self.strata * nodes * marks;
+        if held.len() != expected {
+            return Err(EventHistoryError::InvalidInput {
+                reason: format!(
+                    "a held normaliser of {} entries for {} strata × {nodes} reference nodes × {marks} marks",
+                    held.len(),
+                    self.strata
+                ),
+            });
+        }
+        if self.node_stratum.len() != total_nodes {
+            return Err(EventHistoryError::InvalidInput {
+                reason: format!(
+                    "the reference tables place {} nodes, the family has {total_nodes}",
+                    self.node_stratum.len()
+                ),
+            });
+        }
+        let mut out = vec![0.0; total_nodes * marks];
+        for row in 0..total_nodes {
+            let base = self.node_stratum[row] * nodes;
+            let lower = (base + self.node_lower[row]) * marks;
+            let upper = (base + self.node_lower[row] + 1) * marks;
+            let weight = self.node_weight[row];
+            for d in 0..marks {
+                let low = held[lower + d];
+                out[row * marks + d] = low + weight * (held[upper + d] - low);
+            }
+        }
+        Ok(out)
+    }
 }
 
 /// The reference population's own grid, its per-stratum design rows, and
@@ -256,15 +313,26 @@ impl EventHistoryFamily {
 
     /// The same family with a reference population attached and a normaliser
     /// held over the solve.
+    ///
+    /// The held normaliser arrives on the reference grid and is carried here
+    /// onto this family's own nodes, which is what lets one held value serve
+    /// every rung of the mesh ladder.
     pub fn with_reference(
         mut self,
         reference: Option<Arc<ReferenceTables>>,
-        log_normaliser: Option<Arc<Vec<f64>>>,
-    ) -> Self {
+        held: Option<Arc<Vec<f64>>>,
+    ) -> Result<Self, EventHistoryError> {
+        self.log_normaliser = match (reference.as_ref(), held.as_ref()) {
+            (Some(tables), Some(values)) => Some(Arc::new(tables.carry_to_nodes(
+                values,
+                self.marks(),
+                self.nodes.total_nodes,
+            )?)),
+            _ => None,
+        };
         self.reference = reference;
-        self.log_normaliser = log_normaliser;
         self.cache = Arc::new(Mutex::new(None));
-        self
+        Ok(self)
     }
 
     /// Whether the baselines are centred on the risk sets rather than on the
@@ -332,20 +400,8 @@ impl EventHistoryFamily {
             risk_mass.extend(out.log_risk_mass);
             per_stratum.push(out.log_normaliser);
         }
-        // Carry the population's normaliser to the cohort's own node times.
-        let mut out = vec![0.0; self.nodes.total_nodes * marks];
-        for row in 0..self.nodes.total_nodes {
-            let stratum = tables.node_stratum[row];
-            let lower = tables.node_lower[row];
-            let weight = tables.node_weight[row];
-            for d in 0..marks {
-                let low = per_stratum[stratum][lower * marks + d];
-                let high = per_stratum[stratum][(lower + 1) * marks + d];
-                out[row * marks + d] = low + weight * (high - low);
-            }
-        }
         Ok(RiskSetCentring {
-            log_normaliser: out,
+            log_normaliser: per_stratum.concat(),
             log_risk_mass: risk_mass,
             masks,
             mask_of_mark,
@@ -2045,7 +2101,7 @@ fn fit_at_rank(
                 strata,
                 &frozen_specs,
                 spec.quadrature_order,
-                refinement,
+                REFERENCE_REFINEMENT,
                 &nodes,
             )?)),
             None => None,
@@ -2070,7 +2126,7 @@ fn fit_at_rank(
             time_scale,
             start.map_or_else(Vec::new, RankStart::held_rates),
         )?;
-        let family = family.with_reference(reference, held.clone());
+        let family = family.with_reference(reference, held.clone())?;
         preflight(
             order,
             atoms,
