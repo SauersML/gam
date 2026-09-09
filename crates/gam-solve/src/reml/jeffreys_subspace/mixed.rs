@@ -86,7 +86,7 @@ pub(super) fn inverse_difference(nodes: &[f64], floor: f64, floor_order: usize) 
 
 impl JeffreysHphiDriftBase {
     /// Apply the derivative of the omitted true-Hessian completion to a
-    /// coefficient direction. `axes` contains H[v,e_a] and `moving_axes`
+    /// coefficient direction. `axes` contains `H[v,e_a]` and `moving_axes`
     /// its derivative under `pert_h`. This contracts the fifth likelihood
     /// derivative directly, without assembling a third coefficient tensor.
     pub fn completion_drift_action(
@@ -266,9 +266,9 @@ impl JeffreysHphiDriftBase {
         out
     }
 
-    /// Exact mixed derivative D² H_Φ[u,v] on the current spectral stratum.
+    /// Exact mixed derivative `D² H_Φ[u,v]` on the current spectral stratum.
     /// The inputs are H_u, H_v, H_uv and their coefficient-axis derivatives.
-    /// No mode second response is included; the caller adds D H_Φ[β_uv].
+    /// No mode second response is included; the caller adds `D H_Φ[β_uv]`.
     pub fn mixed_perturbation_derivative_batched_axes(
         &self,
         pert_u: &Array2<f64>,
