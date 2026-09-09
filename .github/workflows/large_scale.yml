@@ -40,6 +40,12 @@ jobs:
       artifact: ${{ steps.runtime.outputs.artifact }}
     steps:
       - name: Resolve newest immutable warm runtime on this history
+        # Only a successful Runtime build carries the artifact, so the window
+        # is the newest 50 SUCCESSFUL builds. Measured 2026-09-09: without the
+        # status filter, 50 consecutive cancelled/failed push builds (a red
+        # build.rs gate under a multi-lane push burst) hid an unexpired
+        # artifact built 20 minutes before the window began, and every
+        # scheduled Large-scale run refused to start.
         id: runtime
         shell: bash
         env:
@@ -73,6 +79,7 @@ jobs:
           done < <(gh run list --repo "$GITHUB_REPOSITORY" \
             --workflow wheel-nightly.yml \
             --branch main \
+            --status success \
             --limit 50 \
             --json databaseId,headSha \
             --jq '.[] | [.databaseId, .headSha] | @tsv')
