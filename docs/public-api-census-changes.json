@@ -1,1 +1,41 @@
-[]
+[
+  {
+    "base": "e29e4da1b4ca349ee734a01e630d988b1b9c127d",
+    "removed": {
+      "crates/gam-custom-family/src/tests/inner_solver_numerics.rs::strict_solve_spd_falls_back_to_eigen_floor_on_indefinite_matrix": 1,
+      "crates/gam-gpu/src/dictionary_score.rs::scalar_bytes": 1,
+      "crates/gam-models/src/fit_orchestration/materialize/family.rs::tweedie_power_is_estimated": 1,
+      "crates/gam-models/src/fit_orchestration/materialize/terms.rs::standard_adaptive_regularization_options": 1,
+      "crates/gam-sae/src/frames.rs::stored_projector_distance": 1,
+      "crates/gam-sae/src/manifold/construction_exact_hessian.rs::materialize": 1,
+      "crates/gam-sae/src/manifold/penalties_exact_beta.rs::separation_overlap_metric": 1,
+      "crates/gam-sae/src/manifold/penalties_exact_beta.rs::separation_remainder": 1,
+      "crates/gam-sae/src/manifold/penalties_spectral.rs::h_first_difference": 1,
+      "crates/gam-sae/src/manifold/penalties_spectral.rs::h_second_difference": 1,
+      "crates/gam-sae/src/manifold/penalties_spectral.rs::log_derivatives": 1,
+      "crates/gam-sae/src/nuisance_atlas.rs::residual": 1,
+      "crates/gam-sae/src/row_jet_program.rs::partial": 1,
+      "crates/gam-sae/src/sparse_dict/block_frame.rs::rayleigh_ritz_tied_frame_step": 1,
+      "crates/gam-sae/src/sparse_dict/scoring.rs::cutoff": 1,
+      "crates/gam-sae/src/sparse_dict/unit_decoder.rs::refine": 1,
+      "crates/gam-solve/src/arrow_schur/penalty_ops.rs::from_analytic_penalty": 1,
+      "crates/gam-solve/src/arrow_schur/penalty_ops.rs::new": 1,
+      "crates/gam-solve/src/arrow_schur/penalty_ops.rs::theta_bilinear": 1,
+      "crates/gam-solve/src/arrow_schur/penalty_ops.rs::with_theta_bilinear": 1,
+      "crates/gam-solve/src/arrow_schur/reduced_solve.rs::accumulate": 1,
+      "crates/gam-solve/src/arrow_schur/reduced_solve.rs::zeros": 1,
+      "crates/gam-solve/src/arrow_schur/system.rs::exact_a_classification": 1,
+      "crates/gam-solve/src/model_types/result_types.rs::bias_correction_beta": 1,
+      "crates/gam-solve/src/model_types/result_types.rs::bias_correction_jacobian": 1,
+      "crates/gam-solve/src/reml/laml_logdet.rs::symmetric_spectrum": 1,
+      "crates/gam-solve/src/reml/objective.rs::criterion_resolution": 1,
+      "crates/gam-solve/src/reml/objective.rs::publish_criterion_resolution": 1,
+      "crates/gam-solve/src/reml/reml_outer_engine/sparse_cholesky_backends.rs::install_root_scale_logdet": 1,
+      "crates/gam-solve/src/rho_optimizer/objective.rs::with_criterion_resolution": 1,
+      "crates/gam-solve/src/rho_optimizer/run.rs::criterion_resolution_at": 1,
+      "crates/gam-solve/src/rho_optimizer/run.rs::outer_stationarity_band_and_rung": 1
+    },
+    "reason": "Repair of the 2026-09-08 bulk overwrite 14e1ce6d8, landed as 87c355b12 and released as v0.3.156 (see the commit message of 87c355b12 for the per-file decisions). 14e1ce6d8 was written from a checkout that predated 37 commits on main and was never compiled; it reverted 221 files to older main versions, deleted 89 files later commits had added, resurrected four files main had deleted with reasoned commits, and mixed parallel implementations of #2828, #2825, #2812/#2817 and #2280 into the same files as main's landed ones. The public functions removed relative to the bulk commit's tree are (a) declarations the bulk ADDED for the set-aside designs: ExactBetaRemainder::{new, with_theta_bilinear, theta_bilinear, from_analytic_penalty}, penalties_exact_beta::{separation_overlap_metric, separation_remainder}, penalties_spectral::{h_first_difference, h_second_difference, log_derivatives}, ExactHessianSpectralBlock::materialize, ExactAReducedClassification::{zeros, accumulate}, StreamingArrowSchur::exact_a_classification, DictionaryScorePrecision::scalar_bytes, unit_decoder::refine, frames::stored_projector_distance, block_frame::rayleigh_ritz_tied_frame_step, scoring::cutoff, RowGate::partial, nuisance_atlas::residual, criterion_resolution_at, outer_stationarity_band_and_rung, publish_criterion_resolution, criterion_resolution, with_criterion_resolution, DenseCholeskyOperator::install_root_scale_logdet, the pub(crate) widening of laml_logdet::symmetric_spectrum, and the test helper strict_solve_spd_falls_back_to_eigen_floor_on_indefinite_matrix; and (b) declarations main had already deleted that the bulk's stale copies re-declared: tweedie_power_is_estimated and standard_adaptive_regularization_options (deleted with --adaptive-regularization in c7196cd9f) and the bias_correction_beta/bias_correction_jacobian accessors (deleted with the O(n^-1) correction in 360c9bb1c). Relative to the pre-bulk main 0ef82308d, ten public functions are gone, all removed by the bulk's kept #2812/#1082 work: RhoBox::{new, lower, ceiling}, effective_df_floor_rho_upper_bounds, penalty_range_gammas_from_gram and unit_weight_term_edf (the custom-family hand box, replaced by resolvability_rho_domain), joint_rho_search_box (the spatial hand box, replaced by joint_rho_resolvability_domain), floored_inverse_prime_floor_sensitivity and floored_inverse_second (replaced by jeffreys_subspace/mixed.rs), and TestSupport reference::from_standard_fit (renamed from_design).",
+    "evidence": "Measured 2026-09-09 with scripts/public_api_census.py: e29e4da1b..8130620c7 removed 32 identities; 0ef82308d..8130620c7 removed 10: crates/gam-custom-family/src/fit.rs::ceiling, crates/gam-custom-family/src/fit.rs::effective_df_floor_rho_upper_bounds, crates/gam-custom-family/src/fit.rs::lower, crates/gam-custom-family/src/fit.rs::new, crates/gam-custom-family/src/fit.rs::penalty_range_gammas_from_gram, crates/gam-custom-family/src/fit.rs::unit_weight_term_edf, crates/gam-models/src/fit_orchestration/drivers/spatial_optimization.rs::joint_rho_search_box, crates/gam-solve/src/reml/jeffreys_subspace.rs::floored_inverse_prime_floor_sensitivity, crates/gam-solve/src/reml/jeffreys_subspace.rs::floored_inverse_second, crates/gam-test-support/src/reference.rs::from_standard_fit. Callers: none of the removed identities is referenced from gamfit/, the CLI, or any test in this tree (the tree compiles with --workspace --all-targets at 87c355b12 and after)."
+  }
+]
