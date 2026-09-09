@@ -1,6 +1,6 @@
 Running 100 trials
-  Seed start:        1939159787 [auto]
-  Replay this run:   --seed-start 1939159787
+  Seed start:        57546331 [auto]
+  Replay this run:   --seed-start 57546331
   Scenario source:   /home/runner/work/gam/gam/bench/scenarios.json
   Filters: family=all model=all basis=all
   Gamfit timeout:    60s
@@ -10,100 +10,338 @@ Running 100 trials
   Results: /home/runner/work/gam/gam/bench/fuzz_results.jsonl
   Metadata: /home/runner/work/gam/gam/bench/fuzz_results.meta.json
 
-Skipped 1 trial(s) above scenario cost cap 200000; max skipped cost=3950000
-  [  1/100] lidar_semipar                  gaus/gam/ps    r2:gamfit=0.9189 r2:mgcv=  ERR gap= N/A  n=   221 p=  1 [no-verdict:mgcv_error]
-    -- MGCV FAILURE --
-    error: r_mgcv fold output missing/invalid eta variance (got 0, expected 45)
-  [  2/100] lidar_semipar                  gaus/gamls/ps    r2:gamfit=0.9191 r2:mgcv=0.9191 gap=-0.0000 n=   221 p=  1 [ok]  gamfit=1.3s mgcv=0.6s
-  [  3/100] bone_gamair                    bino/gam/ps    auc:gamfit=1.0000 auc:mgcv=  ERR gap= N/A  n=    23 p=  2 [no-verdict:mgcv_error]
-    -- MGCV FAILURE --
-    error: r_mgcv predict failed: logistic-normal Gauss-Hermite quadrature did not converge by order 256
-  [  4/100] prostate_gamair                bino/gam/ps    auc:gamfit=0.7603 auc:mgcv=0.7603 gap=+0.0000 n=   654 p=  2 [ok]
-  [  5/100] wine_gamair                    gaus/gam/ps    r2:gamfit=0.2060 r2:mgcv=  ERR gap= N/A  n=    38 p=  5 [no-verdict:mgcv_error]
-    -- MGCV FAILURE --
-    error: r_mgcv fold output missing/invalid eta variance (got 0, expected 8)
-  [  6/100] wine_gamair                    gaus/gamls/ps    r2:gamfit=  ERR r2:mgcv=0.3128 gap=+1.3128 n=    38 p=  5 [no-verdict:gamfit_error] !!!  gamfit=272.8s(to-failure) mgcv=2.6s
+Skipped 2 trial(s) above scenario cost cap 200000; max skipped cost=3950000
+  [  1/100] geo_latlon_equatornoise_duchon bino/gam/ducho auc:gamfit=0.6176 auc:mgcv=0.6176 gap=+0.0000 n=   960 p=  6 [ok]  gamfit=0.9s mgcv=0.5s
+  [  2/100] geo_latlon_equatornoise_matern bino/gam/mater auc:gamfit=0.6084 auc:mgcv=0.6306 gap=+0.0222 n=   960 p=  6 [ok]  gamfit=2.1s mgcv=0.4s
+  [  3/100] geo_latlon_equatornoise_matern bino/gam/mater auc:gamfit=  ERR auc:mgcv=0.6218 gap=+1.6218 n=   960 p=  6 [no-verdict:gamfit_error] !!!  gamfit=8.1s(to-failure) mgcv=0.4s
     -- GAMFIT FAILURE --
-    error: exact two-block spatial optimization failed: custom-family optimization error in fit_custom_family outer smoothing: outer smoothing optimization failed certified-fit validation after exhausting strategy fallbacks: Outer smoothing-parameter optimization did not certify a stationary optimum (custom family): cost-only value disagrees with analytic-sample value at the same outer point: value-only=5.4411182133937636e1, analytic-sample=5.4411241074676852e1, disagreement=5.894e-5, roundoff bound=8.108e-7, inner solve: value-lane=converged, derivative-lane=converged; solver provenance: origin=BfgsCostStallExit, plan=solver=Bfgs, search_hessian_source=BfgsApprox, claimed_converged=false, termination=<no opt solver produced this result>, cost_stall_window=[noise_floor=8.937882e-3, probe_radius=3.148262e0, ratio=2.838989e-3], flat_noise_grad_bound=2.838989e-3 after 49 outer iteration(s); final objective 5.441118e1, projected gradient norm 5.713e5 against stationarity bound 2.839e-3 (rung=probe-noise-floor derived_standard=false). A fit is only minted from a converged optimization; the best iterate is carried as a checkpoint — resume by seeding the outer search at rho_checkpoint = [1.9308320264749703, -5.878659341799458, 2.3826788343405534, -2.9766376162687136, 1.8979102134481531, -4.3173349649107475, 2.412743953853971, -2.2746400604354395, 1.3978972413707729, -3.9893224694954106, -0.5386925732849889, -2.5501608346564972, 2.681734666533258, -5.104064073935131, 3.71459863583563, -4.106346444836867, 3.8800344766686856, -6.526116549145451, 2.753503725659036, -5.096836465611301].; last_evaluated_rho=[1.9308320264749703, -5.878659341799458, 2.3826788343405534, -2.9766376162687136, 1.8979102134481531, -4.3173349649107475, 2.412743953853971, -2.2746400604354395, 1.3978972413707729, -3.9893224694954106, -0.5386925732849889, -2.5501608346564972, 2.681734666533258, -5.104064073935131, 3.71459863583563, -4.106346444836867, 3.8800344766686856, -6.526116549145451, 2.753503725659036, -5.096836465611301]; no fit was assembled.
+    error: smoothing cubature has no positive-width proposal in the resolved domain; the automatic Firth/Jeffreys rescue WAS attempted and also failed to certify, so enabling Firth explicitly will not change this outcome: smoothing cubature has no positive-width proposal in the resolved domain
     traceback: Traceback (most recent call last):
   File "/home/runner/work/gam/gam/bench/fuzz_vs_mgcv.py", line 536, in run_gamfit
     model = gamfit.fit(train_df, formula, family=family_arg, config=config)
             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/opt/hostedtoolcache/Python/3.11.16/x64/lib/python3.11/site-packages/gamfit/_api.py", line 691, in wrapper
+  File "/opt/hostedtoolcache/Python/3.11.16/x64/lib/python3.11/site-packages/gamfit/_api.py", line 693, in wrapper
     return fn(*args, **kwargs)
            ^^^^^^^^^^^^^^^^^^^
-  File "/opt/hostedtoolcache/Python/3.11.16/x64/lib/python3.11/site-packages/gamfit/_api.py", line 1284, in fit
+  File "/opt/hostedtoolcache/Python/3.11.16/x64/lib/python3.11/site-packages/gamfit/_api.py", line 1294, in fit
     raise map_exception(exc) from exc
-  File "/opt/hostedtoolcache/Python/3.11.16/x64/lib/python3.11/site-packages/gamfit/_api.py", line 1281, in fit
+  File "/opt/hostedtoolcache/Python/3.11.16/x64/lib/python3.11/site-packages/gamfit/_api.py", line 1291, in fit
     rust_module().fit_table(headers, rows, formula, json.dumps(payload), fisher_w)
-gamfit._rust.IntegrationError: exact two-block spatial optimization failed: custom-family optimization error in fit_custom_family outer smoothing: outer smoothing optimization failed certified-fit validation after exhausting strategy fallbacks: Outer smoothing-parameter optimization did not certify a stationary optimum (custom family): cost-only value disagrees with analytic-sample value at the same outer point: value-only=5.4411182133937636e1, analytic-sample=5.4411241074676852e1, disagreement=5.894e-5, roundoff bound=8.108e-7, inner solve: value-lane=converged, derivative-lane=converged; solver provenance: origin=BfgsCostStallExit, plan=solver=Bfgs, search_hessian_source=BfgsApprox, claimed_converged=false, termination=<no opt solver produced this result>, cost_stall_window=[noise_floor=8.937882e-3, probe_radius=3.148262e0, ratio=2.838989e-3], flat_noise_grad_bound=2.838989e-3 after 49 outer iteration(s); final objective 5.441118e1, projected gradient norm 5.713e5 against stationarity bound 2.839e-3 (rung=probe-noise-floor derived_standard=false). A fit is only minted from a converged optimization; the best iterate is carried as a checkpoint — resume by seeding the outer search at rho_checkpoint = [1.9308320264749703, -5.878659341799458, 2.3826788343405534, -2.9766376162687136, 1.8979102134481531, -4.3173349649107475, 2.412743953853971, -2.2746400604354395, 1.3978972413707729, -3.9893224694954106, -0.5386925732849889, -2.5501608346564972, 2.681734666533258, -5.104064073935131, 3.71459863583563, -4.106346444836867, 3.8800344766686856, -6.526116549145451, 2.753503725659036, -5.096836465611301].; last_evaluated_rho=[1.9308320264749703, -5.878659341799458, 2.3826788343405534, -2.9766376162687136, 1.8979102134481531, -4.3173349649107475, 2.412743953853971, -2.2746400604354395, 1.3978972413707729, -3.9893224694954106, -0.5386925732849889, -2.5501608346564972, 2.681734666533258, -5.104064073935131, 3.71459863583563, -4.106346444836867, 3.8800344766686856, -6.526116549145451, 2.753503725659036, -5.096836465611301]; no fit was assembled.
+gamfit._rust.IntegrationError: smoothing cubature has no positive-width proposal in the resolved domain; the automatic Firth/Jeffreys rescue WAS attempted and also failed to certify, so enabling Firth explicitly will not change this outcome: smoothing cubature has no positive-width proposal in the resolved domain
 
-  [  7/100] wine_temp_vs_year              gaus/gam/ps    r2:gamfit=0.3672 r2:mgcv=  ERR gap= N/A  n=    47 p=  1 [no-verdict:mgcv_error]
-    -- MGCV FAILURE --
-    error: r_mgcv fold output missing/invalid eta variance (got 0, expected 10)
-  [  8/100] wine_temp_vs_year              gaus/gamls/ps    r2:gamfit=0.3683 r2:mgcv=0.3674 gap=-0.0009 n=    47 p=  1 [ok]
-  [  9/100] wine_price_vs_temp             gaus/gam/ps    r2:gamfit=-0.6073 r2:mgcv=  ERR gap= N/A  n=    38 p=  1 [no-verdict:mgcv_error]
-    -- MGCV FAILURE --
-    error: r_mgcv fold output missing/invalid eta variance (got 0, expected 8)
-  [ 10/100] wine_price_vs_temp             gaus/gamls/ps    r2:gamfit=-0.3462 r2:mgcv=-0.3800 gap=-0.0337 n=    38 p=  1 [ok]  gamfit=0.6s mgcv=2.8s
-  [ 11/100] horse_colic                    bino/gam/ps    auc:gamfit=0.9448 auc:mgcv=0.9448 gap=+0.0000 n=   216 p=  3 [ok]  gamfit=1.0s mgcv=0.4s
-  [ 12/100] us48_demand_5day               gaus/gam/ps    r2:gamfit=0.9941 r2:mgcv=  ERR gap= N/A  n=    96 p=  4 [no-verdict:mgcv_error]
-    -- MGCV FAILURE --
-    error: r_mgcv fold output missing/invalid eta variance (got 0, expected 20)
-  [ 13/100] us48_demand_5day               gaus/gamls/ps    r2:gamfit=0.9835 r2:mgcv=0.9942 gap=+0.0107 n=    96 p=  4 [warn:gap] !!  gamfit=6.8s mgcv=4.0s
-  [ 14/100] us48_demand_31day              gaus/gam/ps    r2:gamfit=0.9987 r2:mgcv=  ERR gap= N/A  n=   720 p=  4 [no-verdict:mgcv_error]  gamfit=0.8s mgcv=0.0s(to-failure)
-    -- MGCV FAILURE --
-    error: r_mgcv fold output missing/invalid eta variance (got 0, expected 144)
-  [ 15/100] us48_demand_31day              gaus/gamls/ps    r2:gamfit=0.9988 r2:mgcv=0.9987 gap=-0.0001 n=   720 p=  4 [ok]  gamfit=19.1s mgcv=12.7s
-  [ 16/100] haberman_5yr                   bino/gam/ps    auc:gamfit=0.7817 auc:mgcv=0.7725 gap=-0.0092 n=   305 p=  3 [ok]  gamfit=3.0s mgcv=0.2s
-  [ 17/100] geo_disease_tp                 bino/gam/tps   auc:gamfit=0.6156 auc:mgcv=  ERR gap= N/A  n=  4000 p= 16 [no-verdict:mgcv_error]  gamfit=6.6s mgcv=0.0s(to-failure)
-    -- MGCV FAILURE --
-    error: r_mgcv fit failed: negative length vectors are not allowed
-  [ 18/100] geo_disease_duchon             bino/gam/ducho auc:gamfit=0.6025 auc:mgcv=0.6452 gap=+0.0427 n=  4000 p= 16 [ok]  gamfit=2.8s mgcv=3.1s
-  [ 19/100] geo_disease_matern             bino/gam/mater auc:gamfit=0.6427 auc:mgcv=0.6533 gap=+0.0105 n=  4000 p= 16 [ok]  gamfit=15.6s mgcv=2.7s
-  [ 20/100] geo_disease_shrinkage          bino/gam/tps   auc:gamfit=0.6156 auc:mgcv=  ERR gap= N/A  n=  4000 p= 16 [no-verdict:mgcv_error]  gamfit=4.1s mgcv=0.0s(to-failure)
-    -- MGCV FAILURE --
-    error: r_mgcv fit failed: negative length vectors are not allowed
-  [ 21/100] geo_disease_ps_per_pc          bino/gam/ps    auc:gamfit=0.6025 auc:mgcv=0.6456 gap=+0.0431 n=  4000 p= 16 [ok]  gamfit=1.4s mgcv=3.1s
-  [ 22/100] geo_disease_eas_tp_k6          bino/gam/tps   auc:gamfit=0.8261 auc:mgcv=  ERR gap= N/A  n=  6000 p= 16 [no-verdict:mgcv_error]  gamfit=1.7s mgcv=0.0s(to-failure)
-    -- MGCV FAILURE --
-    error: r_mgcv fit failed: negative length vectors are not allowed
-  [ 23/100] geo_disease_eas_tp_k12         bino/gam/tps   auc:gamfit=0.8244 auc:mgcv=  ERR gap= N/A  n=  6000 p= 16 [no-verdict:mgcv_error]  gamfit=4.2s mgcv=0.0s(to-failure)
-    -- MGCV FAILURE --
-    error: r_mgcv fit failed: negative length vectors are not allowed
-  [ 24/100] geo_disease_eas_tp_k24         bino/gam/tps   auc:gamfit=0.8244 auc:mgcv=  ERR gap= N/A  n=  6000 p= 16 [no-verdict:mgcv_error]  gamfit=5.8s mgcv=0.0s(to-failure)
-    -- MGCV FAILURE --
-    error: r_mgcv fit failed: negative length vectors are not allowed
-  [ 25/100] geo_disease_eas_duchon_k6      bino/gam/ducho auc:gamfit=0.8256 auc:mgcv=0.8257 gap=+0.0001 n=  6000 p= 16 [ok]  gamfit=2.7s mgcv=4.0s
-  [ 26/100] geo_disease_eas_duchon_k12     bino/gam/ducho auc:gamfit=0.8259 auc:mgcv=0.8260 gap=+0.0001 n=  6000 p= 16 [ok]  gamfit=3.7s mgcv=3.6s
-  [ 27/100] geo_disease_eas_duchon_k6_down bino/gam/ducho auc:gamfit=0.6364 auc:mgcv=  ERR gap= N/A  n=    60 p= 16 [no-verdict:mgcv_error]
-    -- MGCV FAILURE --
-    error: r_mgcv predict failed: logistic-normal Gauss-Hermite quadrature did not converge by order 256
-  [ 28/100] geo_disease_eas_duchon_k6_down bino/gam/ducho auc:gamfit=0.8485 auc:mgcv=  ERR gap= N/A  n=   120 p= 16 [no-verdict:mgcv_error]
-    -- MGCV FAILURE --
-    error: r_mgcv predict failed: logistic-normal Gauss-Hermite quadrature did not converge by order 256
-  [ 29/100] geo_disease_eas_duchon_k6_down bino/gam/ducho auc:gamfit=0.8419 auc:mgcv=0.8426 gap=+0.0007 n=   600 p= 16 [ok]
-  [ 30/100] geo_disease_eas_duchon_k4_down bino/gam/ducho auc:gamfit=1.0000 auc:mgcv=1.0000 gap=+0.0000 n=    12 p= 16 [ok]
-  [ 31/100] geo_disease_eas_duchon_k4_down bino/gam/ducho auc:gamfit=0.6667 auc:mgcv=0.6667 gap=+0.0000 n=    20 p= 16 [ok]  gamfit=1.3s mgcv=0.0s
-  [ 32/100] geo_disease_eas_duchon_k4_down bino/gam/ducho auc:gamfit=0.7727 auc:mgcv=  ERR gap= N/A  n=    60 p= 16 [no-verdict:mgcv_error]  gamfit=1.0s mgcv=0.0s(to-failure)
-    -- MGCV FAILURE --
-    error: r_mgcv predict failed: logistic-normal Gauss-Hermite quadrature did not converge by order 256
-  [ 33/100] geo_disease_eas_duchon_k24     bino/gam/ducho auc:gamfit=0.8278 auc:mgcv=0.8212 gap=-0.0066 n=  6000 p= 16 [ok]  gamfit=29.4s mgcv=3.7s
-  [ 34/100] geo_disease_eas_matern_k6      bino/gam/mater auc:gamfit=0.8283 auc:mgcv=0.8239 gap=-0.0044 n=  6000 p= 16 [ok]  gamfit=5.4s mgcv=3.6s
-  [ 35/100] geo_disease_eas_matern_k12     bino/gam/mater auc:gamfit=  ERR auc:mgcv=0.8239 gap=+1.8239 n=  6000 p= 16 [no-verdict:gamfit_error] !!!  gamfit=0.4s(to-failure) mgcv=3.5s
+  [  4/100] geo_latlon_equatornoise_matern bino/gam/mater auc:gamfit=  ERR auc:mgcv=0.6151 gap=+1.6151 n=   960 p=  6 [no-verdict:gamfit_error] !!!  gamfit=618.1s(to-failure) mgcv=0.4s
     -- GAMFIT FAILURE --
-    error: Invalid input: exact smoothing-corrected covariance unavailable: OuterHessianInverse { error: "rho Hessian has negative curvature -6.825e-6 below the outer certificate's own bar 6.824e-6 on that direction -- the sum of the EXACT chain-rule term 6.824e-6 of `H_rho = diag(lambda) H_lambda diag(lambda) + diag(g_rho)` (not a resolution: one of the two exact terms) and the curvature resolution of an analytically-formed eigenvalue, which is Weyl's ||dH||_2, measured here as 2.418515e-16 [analytic (Weyl, ||dH||_2); set by eigensolver backward error] from [eigensolver backward error=2.418515e-16, rho-Hessian symmetrization defect |(H - H')/2|_2=0.000000e0, outer-gradient re-evaluation defect max_k |g_fresh - g_outer|=0.000000e0] -- #2690, #2748); the penalty map certified 0 null direction(s) and 0 were deflated before judging, so the direction above was judged; the outer loop certified this point as a minimum, and the curvature is larger than everything this assembly's own exactly-zero identities say it could have got wrong, so this is a genuine contradiction rather than an unresolvable direction" }
+    error: smoothing cubature has no positive-width proposal in the resolved domain; the automatic Firth/Jeffreys rescue WAS attempted and also failed to certify, so enabling Firth explicitly will not change this outcome: Invalid input: exact smoothing-corrected covariance unavailable: OuterHessianInverse { error: "rho Hessian has negative curvature -5.676e-8 below the outer certificate's own bar 3.065e-8 on that direction -- the sum of the EXACT chain-rule term 3.065e-8 of `H_rho = diag(lambda) H_lambda diag(lambda) + diag(g_rho)` (not a resolution: one of the two exact terms) and the curvature resolution of an analytically-formed eigenvalue, which is Weyl's ||dH||_2, measured here as 6.708317e-19 [analytic (Weyl, ||dH||_2); set by eigensolver backward error] from [eigensolver backward error=6.708317e-19, rho-Hessian symmetrization defect |(H - H')/2|_2=0.000000e0, outer-gradient re-evaluation defect max_k |g_fresh - g_outer|=0.000000e0] -- #2690, #2748); the penalty map certified 0 null direction(s) and 0 were deflated before judging, so the direction above was judged; the outer loop certified this point as a minimum, and the curvature is larger than everything this assembly's own exactly-zero identities say it could have got wrong, so this is a genuine contradiction rather than an unresolvable direction" }
     traceback: Traceback (most recent call last):
   File "/home/runner/work/gam/gam/bench/fuzz_vs_mgcv.py", line 536, in run_gamfit
     model = gamfit.fit(train_df, formula, family=family_arg, config=config)
             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/opt/hostedtoolcache/Python/3.11.16/x64/lib/python3.11/site-packages/gamfit/_api.py", line 691, in wrapper
+  File "/opt/hostedtoolcache/Python/3.11.16/x64/lib/python3.11/site-packages/gamfit/_api.py", line 693, in wrapper
     return fn(*args, **kwargs)
            ^^^^^^^^^^^^^^^^^^^
-  File "/opt/hostedtoolcache/Python/3.11.16/x64/lib/python3.11/site-packages/gamfit/_api.py", line 1284, in fit
+  File "/opt/hostedtoolcache/Python/3.11.16/x64/lib/python3.11/site-packages/gamfit/_api.py", line 1294, in fit
     raise map_exception(exc) from exc
-  File "/opt/hostedtoolcache/Python/3.11.16/x64/lib/python3.11/site-packages/gamfit/_api.py", line 1281, in fit
+  File "/opt/hostedtoolcache/Python/3.11.16/x64/lib/python3.11/site-packages/gamfit/_api.py", line 1291, in fit
     rust_module().fit_table(headers, rows, formula, json.dumps(payload), fisher_w)
-gamfit._rust.IntegrationError: Invalid input: exact smoothing-corrected covariance unavailable: OuterHessianInverse { error: "rho Hessian has negative curvature -6.825e-6 below the outer certificate's own bar 6.824e-6 on that direction -- the sum of the EXACT chain-rule term 6.824e-6 of `H_rho = diag(lambda) H_lambda diag(lambda) + diag(g_rho)` (not a resolution: one of the two exact terms) and the curvature resolution of an analytically-formed eigenvalue, which is Weyl's ||dH||_2, measured here as 2.418515e-16 [analytic (Weyl, ||dH||_2); set by eigensolver backward error] from [eigensolver backward error=2.418515e-16, rho-Hessian symmetrization defect |(H - H')/2|_2=0.000000e0, outer-gradient re-evaluation defect max_k |g_fresh - g_outer|=0.000000e0] -- #2690, #2748); the penalty map certified 0 null direction(s) and 0 were deflated before judging, so the direction above was judged; the outer loop certified this point as a minimum, and the curvature is larger than everything this assembly's own exactly-zero identities say it could have got wrong, so this is a genuine contradiction rather than an unresolvable direction" }
+gamfit._rust.IntegrationError: smoothing cubature has no positive-width proposal in the resolved domain; the automatic Firth/Jeffreys rescue WAS attempted and also failed to certify, so enabling Firth explicitly will not change this outcome: Invalid input: exact smoothing-corrected covariance unavailable: OuterHessianInverse { error: "rho Hessian has negative curvature -5.676e-8 below the outer certificate's own bar 3.065e-8 on that direction -- the sum of the EXACT chain-rule term 3.065e-8 of `H_rho = diag(lambda) H_lambda diag(lambda) + diag(g_rho)` (not a resolution: one of the two exact terms) and the curvature resolution of an analytically-formed eigenvalue, which is Weyl's ||dH||_2, measured here as 6.708317e-19 [analytic (Weyl, ||dH||_2); set by eigensolver backward error] from [eigensolver backward error=6.708317e-19, rho-Hessian symmetrization defect |(H - H')/2|_2=0.000000e0, outer-gradient re-evaluation defect max_k |g_fresh - g_outer|=0.000000e0] -- #2690, #2748); the penalty map certified 0 null direction(s) and 0 were deflated before judging, so the direction above was judged; the outer loop certified this point as a minimum, and the curvature is larger than everything this assembly's own exactly-zero identities say it could have got wrong, so this is a genuine contradiction rather than an unresolvable direction" }
 
-  [ 36/100] geo_disease_eas_matern_k24     bino/gam/mater auc:gamfit=0.8297 auc:mgcv=0.8263 gap=-0.0034 n=  6000 p= 16 [ok]  gamfit=17.9s mgcv=3.5s
+  [  5/100] geo_latlon_equatornoise_psperp bino/gam/ps    auc:gamfit=0.5706 auc:mgcv=0.4961 gap=-0.0745 n=   960 p=  6 [ok]  gamfit=449.9s mgcv=3.7s
+  [  6/100] geo_latlon_equatornoise_psperp bino/gam/ps    auc:gamfit=  ERR auc:mgcv=0.4975 gap=+1.4975 n=   960 p=  6 [no-verdict:gamfit_error] !!!  gamfit=3210.0s(to-failure) mgcv=8.1s
+    -- GAMFIT FAILURE --
+    error: Outer smoothing-parameter optimization did not certify a stationary optimum (standard REML): gradient |g|=4.008e-1 |Pg|=4.008e-1 bound=1.143e-5 (rung=solver-band derived_standard=false) hessian_psd=NO (cleared=true λ_min(H)=-8.572759e-2 λ_min(H+diag|g|)=1.826968e-6 max_k|g_k|=4.007760e-1 measured_resolution=0.000000e0 decided_at=1.490116e-8) curvature_source=terminal-analytic railed=[0, 1, 3, 4, 6, 7, 8, 11] [#0 theta=3.000000e1 box=[-3.000000e1, 3.000000e1] margin=5.000e-1, #1 theta=3.000000e1 box=[-3.000000e1, 3.000000e1] margin=5.000e-1, #3 theta=2.999999e1 box=[-3.000000e1, 3.000000e1] margin=5.000e-1, #4 theta=3.000000e1 box=[-3.000000e1, 3.000000e1] margin=5.000e-1, #6 theta=2.983653e1 box=[-3.000000e1, 3.000000e1] margin=5.000e-1, #7 theta=3.000000e1 box=[-3.000000e1, 3.000000e1] margin=5.000e-1, #8 theta=2.999999e1 box=[-3.000000e1, 3.000000e1] margin=5.000e-1, #11 theta=3.000000e1 box=[-3.000000e1, 3.000000e1] margin=5.000e-1] → NOT STATIONARY (|Pg|=4.008e-1 > bound=1.143e-5); rail tests: [#0 theta=3.000000e1 box=[-3.000000e1, 3.000000e1] margin=5.000e-1 railed_at=(<=-2.950000e1 or >=2.950000e1), #1 theta=3.000000e1 box=[-3.000000e1, 3.000000e1] margin=5.000e-1 railed_at=(<=-2.950000e1 or >=2.950000e1), #3 theta=2.999999e1 box=[-3.000000e1, 3.000000e1] margin=5.000e-1 railed_at=(<=-2.950000e1 or >=2.950000e1), #4 theta=3.000000e1 box=[-3.000000e1, 3.000000e1] margin=5.000e-1 railed_at=(<=-2.950000e1 or >=2.950000e1), #6 theta=2.983653e1 box=[-3.000000e1, 3.000000e1] margin=5.000e-1 railed_at=(<=-2.950000e1 or >=2.950000e1), #7 theta=3.000000e1 box=[-3.000000e1, 3.000000e1] margin=5.000e-1 railed_at=(<=-2.950000e1 or >=2.950000e1), #8 theta=2.999999e1 box=[-3.000000e1, 3.000000e1] margin=5.000e-1 railed_at=(<=-2.950000e1 or >=2.950000e1), #11 theta=3.000000e1 box=[-3.000000e1, 3.000000e1] margin=5.000e-1 railed_at=(<=-2.950000e1 or >=2.950000e1)]; asymptote-rail declined: interior not stationary: active-face |Pg|=4.008e-1, caller bound 1.143e-5 from solver-band; the active-face Hessian and residual yield no positive finite PD Newton decrement; tail-snap declined: no candidate passed the curvature tie (k=2: ρ=3.00 more than 18 e-folds inside the box; k=5: ρ=8.74 more than 18 e-folds inside the box; k=9: ρ=16.23 more than 18 e-folds inside the box; k=10: ρ=9.73 more than 18 e-folds inside the box); solver provenance: origin=Solver, plan=solver=Bfgs, search_hessian_source=BfgsApprox, claimed_converged=false, termination=line_search_failed(|g|=4.007765e-1) [made no stationarity claim], stop_reason=SolverFailure, line_search=StepSizeTooSmall after 50 attempt(s) [StepSizeTooSmall = the direction descended but no step improved the objective; MaxAttempts = the bracket never closed] after 139 outer iteration(s); final objective 2.182174e2, projected gradient norm 4.008e-1 against stationarity bound 1.143e-5 (rung=solver-band derived_standard=false). A fit is only minted from a converged optimization; the best iterate is carried as a checkpoint — resume by seeding the outer search at rho_checkpoint = [30.0, 30.0, 3.0018724725348607, 29.99999286693047, 30.0, 8.7409402457562, 29.83652941079695, 30.0, 29.999992866942037, 16.229293113653167, 9.727069337637221, 30.0].; the automatic Firth/Jeffreys rescue WAS attempted and also failed to certify, so enabling Firth explicitly will not change this outcome: Outer smoothing-parameter optimization did not certify a stationary optimum (standard REML): gradient |g|=9.473e-5 |Pg|=9.473e-5 bound=1.143e-5 (rung=solver-band derived_standard=false) hessian_psd=n/a curvature_source=unavailable railed=[] → NOT STATIONARY (|Pg|=9.473e-5 > bound=1.143e-5); solver provenance: origin=Solver, plan=solver=Bfgs, search_hessian_source=BfgsApprox, claimed_converged=false, termination=line_search_failed(|g|=9.476029e-5) [made no stationarity claim], stop_reason=SolverFailure, line_search=StepSizeTooSmall after 50 attempt(s) [StepSizeTooSmall = the direction descended but no step improved the objective; MaxAttempts = the bracket never closed] after 51 outer iteration(s); final objective 3.219942e2, projected gradient norm 9.473e-5 against stationarity bound 1.143e-5 (rung=solver-band derived_standard=false). A fit is only minted from a converged optimization; the best iterate is carried as a checkpoint — resume by seeding the outer search at rho_checkpoint = [24.906191025837256, 1.2453958108685539, 15.935680493790471, 24.346253715488018, 24.28905894103873, 16.086703438424177, 24.33441224201951, 16.10631582859552, 15.660790254250372, 24.60647974365644, 4.07944488346042, 24.78404075140884].
+    traceback: Traceback (most recent call last):
+  File "/home/runner/work/gam/gam/bench/fuzz_vs_mgcv.py", line 536, in run_gamfit
+    model = gamfit.fit(train_df, formula, family=family_arg, config=config)
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/hostedtoolcache/Python/3.11.16/x64/lib/python3.11/site-packages/gamfit/_api.py", line 693, in wrapper
+    return fn(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^
+  File "/opt/hostedtoolcache/Python/3.11.16/x64/lib/python3.11/site-packages/gamfit/_api.py", line 1294, in fit
+    raise map_exception(exc) from exc
+  File "/opt/hostedtoolcache/Python/3.11.16/x64/lib/python3.11/site-packages/gamfit/_api.py", line 1291, in fit
+    rust_module().fit_table(headers, rows, formula, json.dumps(payload), fisher_w)
+gamfit._rust.IntegrationError: Outer smoothing-parameter optimization did not certify a stationary optimum (standard REML): gradient |g|=4.008e-1 |Pg|=4.008e-1 bound=1.143e-5 (rung=solver-band derived_standard=false) hessian_psd=NO (cleared=true λ_min(H)=-8.572759e-2 λ_min(H+diag|g|)=1.826968e-6 max_k|g_k|=4.007760e-1 measured_resolution=0.000000e0 decided_at=1.490116e-8) curvature_source=terminal-analytic railed=[0, 1, 3, 4, 6, 7, 8, 11] [#0 theta=3.000000e1 box=[-3.000000e1, 3.000000e1] margin=5.000e-1, #1 theta=3.000000e1 box=[-3.000000e1, 3.000000e1] margin=5.000e-1, #3 theta=2.999999e1 box=[-3.000000e1, 3.000000e1] margin=5.000e-1, #4 theta=3.000000e1 box=[-3.000000e1, 3.000000e1] margin=5.000e-1, #6 theta=2.983653e1 box=[-3.000000e1, 3.000000e1] margin=5.000e-1, #7 theta=3.000000e1 box=[-3.000000e1, 3.000000e1] margin=5.000e-1, #8 theta=2.999999e1 box=[-3.000000e1, 3.000000e1] margin=5.000e-1, #11 theta=3.000000e1 box=[-3.000000e1, 3.000000e1] margin=5.000e-1] → NOT STATIONARY (|Pg|=4.008e-1 > bound=1.143e-5); rail tests: [#0 theta=3.000000e1 box=[-3.000000e1, 3.000000e1] margin=5.000e-1 railed_at=(<=-2.950000e1 or >=2.950000e1), #1 theta=3.000000e1 box=[-3.000000e1, 3.000000e1] margin=5.000e-1 railed_at=(<=-2.950000e1 or >=2.950000e1), #3 theta=2.999999e1 box=[-3.000000e1, 3.000000e1] margin=5.000e-1 railed_at=(<=-2.950000e1 or >=2.950000e1), #4 theta=3.000000e1 box=[-3.000000e1, 3.000000e1] margin=5.000e-1 railed_at=(<=-2.950000e1 or >=2.950000e1), #6 theta=2.983653e1 box=[-3.000000e1, 3.000000e1] margin=5.000e-1 railed_at=(<=-2.950000e1 or >=2.950000e1), #7 theta=3.000000e1 box=[-3.000000e1, 3.000000e1] margin=5.000e-1 railed_at=(<=-2.950000e1 or >=2.950000e1), #8 theta=2.999999e1 box=[-3.000000e1, 3.000000e1] margin=5.000e-1 railed_at=(<=-2.950000e1 or >=2.950000e1), #11 theta=3.000000e1 box=[-3.000000e1, 3.000000e1] margin=5.000e-1 railed_at=(<=-2.950000e1 or >=2.950000e1)]; asymptote-rail declined: interior not stationary: active-face |Pg|=4.008e-1, caller bound 1.143e-5 from solver-band; the active-face Hessian and residual yield no positive finite PD Newton decrement; tail-snap declined: no candidate passed the curvature tie (k=2: ρ=3.00 more than 18 e-folds inside the box; k=5: ρ=8.74 more than 18 e-folds inside the box; k=9: ρ=16.23 more than 18 e-folds inside the box; k=10: ρ=9.73 more than 18 e-folds inside the box); solver provenance: origin=Solver, plan=solver=Bfgs, search_hessian_source=BfgsApprox, claimed_converged=false, termination=line_search_failed(|g|=4.007765e-1) [made no stationarity claim], stop_reason=SolverFailure, line_search=StepSizeTooSmall after 50 attempt(s) [StepSizeTooSmall = the direction descended but no step improved the objective; MaxAttempts = the bracket never closed] after 139 outer iteration(s); final objective 2.182174e2, projected gradient norm 4.008e-1 against stationarity bound 1.143e-5 (rung=solver-band derived_standard=false). A fit is only minted from a converged optimization; the best iterate is carried as a checkpoint — resume by seeding the outer search at rho_checkpoint = [30.0, 30.0, 3.0018724725348607, 29.99999286693047, 30.0, 8.7409402457562, 29.83652941079695, 30.0, 29.999992866942037, 16.229293113653167, 9.727069337637221, 30.0].; the automatic Firth/Jeffreys rescue WAS attempted and also failed to certify, so enabling Firth explicitly will not change this outcome: Outer smoothing-parameter optimization did not certify a stationary optimum (standard REML): gradient |g|=9.473e-5 |Pg|=9.473e-5 bound=1.143e-5 (rung=solver-band derived_standard=false) hessian_psd=n/a curvature_source=unavailable railed=[] → NOT STATIONARY (|Pg|=9.473e-5 > bound=1.143e-5); solver provenance: origin=Solver, plan=solver=Bfgs, search_hessian_source=BfgsApprox, claimed_converged=false, termination=line_search_failed(|g|=9.476029e-5) [made no stationarity claim], stop_reason=SolverFailure, line_search=StepSizeTooSmall after 50 attempt(s) [StepSizeTooSmall = the direction descended but no step improved the objective; MaxAttempts = the bracket never closed] after 51 outer iteration(s); final objective 3.219942e2, projected gradient norm 9.473e-5 against stationarity bound 1.143e-5 (rung=solver-band derived_standard=false). A fit is only minted from a converged optimization; the best iterate is carried as a checkpoint — resume by seeding the outer search at rho_checkpoint = [24.906191025837256, 1.2453958108685539, 15.935680493790471, 24.346253715488018, 24.28905894103873, 16.086703438424177, 24.33441224201951, 16.10631582859552, 15.660790254250372, 24.60647974365644, 4.07944488346042, 24.78404075140884].
+
+
+Reached wall-clock budget after 6 completed trial(s) (4312.8s >= 2400s). Stopping early.
+
+========================================================================================================================
+  ALL TRIALS - auc gap (mgcv - gamfit) | 6 valid / 6 total
+========================================================================================================================
+  #       gap     gamfit       mgcv                              scenario  n rows    p
+------------------------------------------------------------------------------------------------------------------------
+  1  +1.6218        ERR     0.6218    geo_latlon_equatornoise_matern_k12     960    6
+  2  +1.6151        ERR     0.6151    geo_latlon_equatornoise_matern_k24     960    6
+  3  +1.4975        ERR     0.4975   geo_latlon_equatornoise_psperpc_k12     960    6
+  4  +0.0222     0.6084     0.6306     geo_latlon_equatornoise_matern_k6     960    6
+  5  +0.0000     0.6176     0.6176    geo_latlon_equatornoise_duchon_k24     960    6
+  6  -0.0745     0.5706     0.4961    geo_latlon_equatornoise_psperpc_k6     960    6
+
+  mgcv wins: 4 | gamfit wins: 1 | ties: 1 | median gap: +0.7599
+
+========================================================================================================================
+  binomial/gam/duchon - auc gap (mgcv - gamfit) | 1 valid / 1 total
+========================================================================================================================
+  #       gap     gamfit       mgcv                              scenario  n rows    p
+------------------------------------------------------------------------------------------------------------------------
+  1  +0.0000     0.6176     0.6176    geo_latlon_equatornoise_duchon_k24     960    6
+
+  mgcv wins: 0 | gamfit wins: 0 | ties: 1 | median gap: +0.0000
+
+========================================================================================================================
+  binomial/gam/matern - auc gap (mgcv - gamfit) | 3 valid / 3 total
+========================================================================================================================
+  #       gap     gamfit       mgcv                              scenario  n rows    p
+------------------------------------------------------------------------------------------------------------------------
+  1  +1.6218        ERR     0.6218    geo_latlon_equatornoise_matern_k12     960    6
+  2  +1.6151        ERR     0.6151    geo_latlon_equatornoise_matern_k24     960    6
+  3  +0.0222     0.6084     0.6306     geo_latlon_equatornoise_matern_k6     960    6
+
+  mgcv wins: 3 | gamfit wins: 0 | ties: 0 | median gap: +1.6151
+
+========================================================================================================================
+  binomial/gam/ps - auc gap (mgcv - gamfit) | 2 valid / 2 total
+========================================================================================================================
+  #       gap     gamfit       mgcv                              scenario  n rows    p
+------------------------------------------------------------------------------------------------------------------------
+  1  +1.4975        ERR     0.4975   geo_latlon_equatornoise_psperpc_k12     960    6
+  2  -0.0745     0.5706     0.4961    geo_latlon_equatornoise_psperpc_k6     960    6
+
+  mgcv wins: 1 | gamfit wins: 1 | ties: 0 | median gap: +0.7115
+
+========================================================================================================================
+  gamfit fit failures: 3 | mgcv REFERENCE UNAVAILABLE (no comparison made, says nothing about gamfit): 0
+========================================================================================================================
+  [GAMFIT] geo_latlon_equatornoise_matern_k12 binomial/gam/matern
+    error: smoothing cubature has no positive-width proposal in the resolved domain; the automatic Firth/Jeffreys rescue WAS attempted and also failed to certify, so enabling Firth explicitly will not change this outcome: smoothing cubature has no positive-width proposal in the resolved domain
+  [GAMFIT] geo_latlon_equatornoise_matern_k24 binomial/gam/matern
+    error: smoothing cubature has no positive-width proposal in the resolved domain; the automatic Firth/Jeffreys rescue WAS attempted and also failed to certify, so enabling Firth explicitly will not change this outcome: Invalid input: exact smoothing-corrected covariance unavailable: OuterHessianInverse { er
+  [GAMFIT] geo_latlon_equatornoise_psperpc_k12 binomial/gam/ps
+    error: Outer smoothing-parameter optimization did not certify a stationary optimum (standard REML): gradient |g|=4.008e-1 |Pg|=4.008e-1 bound=1.143e-5 (rung=solver-band derived_standard=false) hessian_psd=NO (cleared=true λ_min(H)=-8.572759e-2 λ_min(H+diag|g|)=1.826968e-6 max_k|g_k|=4.007760e-1 measured_re
+
+  comparisons: 6 made | mgcv reference unavailable: 0 | mgcv arm ram-skipped (deliberate): 0 | gamfit fit errors: 3 (of 100 requested trial(s))
+
+========================================================================================================================
+  CI FAIL: harness detected gamfit execution failures
+========================================================================================================================
+    [FAIL] geo_latlon_equatornoise_matern_k12 binomial/gam/matern :: smoothing cubature has no positive-width proposal in the resolved domain; the automatic Firth/Jeffreys rescue WAS attempted and also failed to certify, so enabling Firth explicitly will not change thi
+    [FAIL] geo_latlon_equatornoise_matern_k24 binomial/gam/matern :: smoothing cubature has no positive-width proposal in the resolved domain; the automatic Firth/Jeffreys rescue WAS attempted and also failed to certify, so enabling Firth explicitly will not change thi
+    [FAIL] geo_latlon_equatornoise_psperpc_k12 binomial/gam/ps :: Outer smoothing-parameter optimization did not certify a stationary optimum (standard REML): gradient |g|=4.008e-1 |Pg|=4.008e-1 bound=1.143e-5 (rung=solver-band derived_standard=false) hessian_psd=NO
+
+========================================================================================================================
+  CI FAIL: harness tripped regression gates
+========================================================================================================================
+  trials: 6/100 valid (skipped above cost cap: 2; min required: 80)
+
+  -- gate [per_trial_gap] -- 3 trial(s) with primary-metric gap > 0.30
+    [FAIL] geo_latlon_equatornoise_matern_k12 binomial/gam/matern auc: gamfit=None mgcv=0.621822033898305 gap=+1.6218
+    [FAIL] geo_latlon_equatornoise_matern_k24 binomial/gam/matern auc: gamfit=None mgcv=0.615112994350282 gap=+1.6151
+    [FAIL] geo_latlon_equatornoise_psperpc_k12 binomial/gam/ps auc: gamfit=None mgcv=0.497528248587571 gap=+1.4975
+
+  -- gate [coverage] -- only 6/100 comparable trial(s) produced a valid comparison (skipped above cost cap: 2; ram-skipped mgcv arm: 0; mgcv reference unavailable: 0); minimum required: 80
+
+========================================================================================================================
+  CI FAIL: gates fired: gamfit_only_failures, per_trial_gap, coverage
+========================================================================================================================
+
+----- stderr tail (full stream: fuzz-results artifact, fuzz_solver.log) -----
+[20m 00s] [BFGS Adaptive] Fallback streak (3) reached. Switching primary to Backtracking.
+[20m 01s] [BFGS Adaptive] Strong Wolfe failed at iter 20. Falling back to Backtracking.
+[20m 03s] [BFGS Adaptive] Strong Wolfe failed at iter 21. Falling back to Backtracking.
+[20m 04s] [BFGS Adaptive] Strong Wolfe failed at iter 22. Falling back to Backtracking.
+[20m 15s] [BFGS Adaptive] Strong Wolfe failed at iter 0. Falling back to Backtracking.
+[20m 17s] [BFGS Adaptive] Strong Wolfe failed at iter 1. Falling back to Backtracking.
+[20m 22s] [BFGS Adaptive] Strong Wolfe failed at iter 15. Falling back to Backtracking.
+[20m 24s] [BFGS Adaptive] Strong Wolfe failed at iter 16. Falling back to Backtracking.
+[20m 25s] [BFGS Adaptive] Strong Wolfe failed at iter 18. Falling back to Backtracking.
+[20m 27s] [BFGS Adaptive] Strong Wolfe failed at iter 19. Falling back to Backtracking.
+[20m 28s] [BFGS Adaptive] Strong Wolfe failed at iter 20. Falling back to Backtracking.
+[20m 29s] [BFGS Adaptive] Fallback streak (3) reached. Switching primary to Backtracking.
+[20m 30s] [BFGS Adaptive] Strong Wolfe failed at iter 21. Falling back to Backtracking.
+[20m 31s] [BFGS Adaptive] Strong Wolfe failed at iter 22. Falling back to Backtracking.
+[20m 32s] [BFGS Adaptive] Strong Wolfe failed at iter 23. Falling back to Backtracking.
+[20m 33s] [BFGS Adaptive] Fallback streak (3) reached. Switching primary to Backtracking.
+[20m 34s] [BFGS Adaptive] Strong Wolfe failed at iter 24. Falling back to Backtracking.
+[20m 35s] [BFGS Adaptive] Strong Wolfe failed at iter 25. Falling back to Backtracking.
+[20m 45s] [BFGS Adaptive] Strong Wolfe failed at iter 0. Falling back to Backtracking.
+[20m 46s] [BFGS Adaptive] Strong Wolfe failed at iter 1. Falling back to Backtracking.
+[20m 50s] [BFGS Adaptive] Strong Wolfe failed at iter 14. Falling back to Backtracking.
+[20m 52s] [BFGS Adaptive] Strong Wolfe failed at iter 15. Falling back to Backtracking.
+[20m 53s] [BFGS Adaptive] Strong Wolfe failed at iter 16. Falling back to Backtracking.
+[20m 54s] [BFGS Adaptive] Fallback streak (3) reached. Switching primary to Backtracking.
+[20m 55s] [BFGS Adaptive] Strong Wolfe failed at iter 17. Falling back to Backtracking.
+[20m 56s] [BFGS Adaptive] Strong Wolfe failed at iter 18. Falling back to Backtracking.
+[20m 57s] [BFGS Adaptive] Strong Wolfe failed at iter 19. Falling back to Backtracking.
+[20m 58s] [BFGS Adaptive] Fallback streak (3) reached. Switching primary to Backtracking.
+[20m 59s] [BFGS Adaptive] Strong Wolfe failed at iter 20. Falling back to Backtracking.
+[21m 00s] [BFGS Adaptive] Strong Wolfe failed at iter 21. Falling back to Backtracking.
+[21m 01s] [BFGS Adaptive] Strong Wolfe failed at iter 22. Falling back to Backtracking.
+[21m 12s] [BFGS Adaptive] Strong Wolfe failed at iter 3. Falling back to Backtracking.
+[21m 13s] [BFGS Adaptive] Strong Wolfe failed at iter 4. Falling back to Backtracking.
+[21m 15s] [BFGS Adaptive] Strong Wolfe failed at iter 5. Falling back to Backtracking.
+[21m 15s] [BFGS Adaptive] Fallback streak (3) reached. Switching primary to Backtracking.
+[21m 19s] [BFGS Adaptive] Strong Wolfe failed at iter 9. Falling back to Backtracking.
+[21m 21s] [BFGS Adaptive] Strong Wolfe failed at iter 10. Falling back to Backtracking.
+[21m 22s] [BFGS Adaptive] Strong Wolfe failed at iter 11. Falling back to Backtracking.
+[21m 22s] [BFGS Adaptive] Fallback streak (3) reached. Switching primary to Backtracking.
+[21m 22s] [OUTER] cost-stall STUCK (NOT a flat valley): REML objective improved < 1.000e-7 (relative) over 6 accepted outer steps but the projected gradient is FAR above the certified-stationary band (|g|=4.200e-1 > escape threshold 3.289e-1); refusing to halt-and-ship and continuing the descent (escape 1, value=2.182565e2).
+[21m 25s] [BFGS Adaptive] Strong Wolfe failed at iter 15. Falling back to Backtracking.
+[21m 26s] [BFGS Adaptive] Strong Wolfe failed at iter 16. Falling back to Backtracking.
+[21m 28s] [BFGS Adaptive] Strong Wolfe failed at iter 17. Falling back to Backtracking.
+[21m 29s] [BFGS Adaptive] Fallback streak (3) reached. Switching primary to Backtracking.
+[21m 33s] [BFGS Adaptive] Strong Wolfe failed at iter 21. Falling back to Backtracking.
+[21m 34s] [HGB] target_mse below mandatory floors; target_mse=6.962e-13 floors=3.000e-12
+[21m 34s] [BFGS Adaptive] Strong Wolfe failed at iter 22. Falling back to Backtracking.
+[21m 35s] [HGB] target_mse below mandatory floors; target_mse=6.962e-13 floors=3.000e-12
+[21m 40s] [BFGS Adaptive] Strong Wolfe failed at iter 16. Falling back to Backtracking.
+[21m 42s] [BFGS Adaptive] Strong Wolfe failed at iter 18. Falling back to Backtracking.
+[21m 44s] [BFGS Adaptive] Strong Wolfe failed at iter 19. Falling back to Backtracking.
+[21m 45s] [BFGS Adaptive] Strong Wolfe failed at iter 20. Falling back to Backtracking.
+[21m 45s] [BFGS Adaptive] Fallback streak (3) reached. Switching primary to Backtracking.
+[21m 46s] [BFGS Adaptive] Strong Wolfe failed at iter 21. Falling back to Backtracking.
+[21m 47s] [BFGS Adaptive] Strong Wolfe failed at iter 22. Falling back to Backtracking.
+[21m 49s] [BFGS Adaptive] Strong Wolfe failed at iter 23. Falling back to Backtracking.
+[21m 49s] [BFGS Adaptive] Fallback streak (3) reached. Switching primary to Backtracking.
+[21m 50s] [BFGS Adaptive] Strong Wolfe failed at iter 24. Falling back to Backtracking.
+[21m 51s] [BFGS Adaptive] Strong Wolfe failed at iter 25. Falling back to Backtracking.
+[21m 53s] [BFGS Adaptive] Strong Wolfe failed at iter 26. Falling back to Backtracking.
+[21m 54s] [BFGS Adaptive] Fallback streak (3) reached. Switching primary to Backtracking.
+[21m 55s] [BFGS Adaptive] Strong Wolfe failed at iter 27. Falling back to Backtracking.
+[21m 57s] [BFGS Adaptive] Strong Wolfe failed at iter 28. Falling back to Backtracking.
+[22m 12s] [BFGS Adaptive] Strong Wolfe failed at iter 0. Falling back to Backtracking.
+[22m 14s] [BFGS Adaptive] Strong Wolfe failed at iter 1. Falling back to Backtracking.
+[22m 16s] [BFGS Adaptive] Strong Wolfe failed at iter 2. Falling back to Backtracking.
+[22m 18s] [BFGS Adaptive] Fallback streak (3) reached. Switching primary to Backtracking.
+[22m 22s] [OUTER] cost-stall STUCK (NOT a flat valley): REML objective improved < 1.000e-7 (relative) over 6 accepted outer steps but the projected gradient is FAR above the certified-stationary band (|g|=4.008e-1 > escape threshold 3.288e-1); refusing to halt-and-ship and continuing the descent (escape 1, value=2.182174e2).
+[22m 23s] [BFGS Adaptive] Strong Wolfe failed at iter 6. Falling back to Backtracking.
+[22m 25s] [BFGS Adaptive] Strong Wolfe failed at iter 7. Falling back to Backtracking.
+[22m 31s] [BFGS Adaptive] Strong Wolfe failed at iter 16. Falling back to Backtracking.
+[22m 33s] [BFGS Adaptive] Strong Wolfe failed at iter 18. Falling back to Backtracking.
+[22m 35s] [BFGS Adaptive] Strong Wolfe failed at iter 19. Falling back to Backtracking.
+[22m 36s] [BFGS Adaptive] Strong Wolfe failed at iter 20. Falling back to Backtracking.
+[22m 36s] [BFGS Adaptive] Fallback streak (3) reached. Switching primary to Backtracking.
+[22m 37s] [BFGS Adaptive] Strong Wolfe failed at iter 21. Falling back to Backtracking.
+[22m 39s] [BFGS Adaptive] Strong Wolfe failed at iter 22. Falling back to Backtracking.
+[22m 40s] [BFGS Adaptive] Strong Wolfe failed at iter 23. Falling back to Backtracking.
+[22m 40s] [BFGS Adaptive] Fallback streak (3) reached. Switching primary to Backtracking.
+[22m 41s] [BFGS Adaptive] Strong Wolfe failed at iter 24. Falling back to Backtracking.
+[22m 42s] [BFGS Adaptive] Strong Wolfe failed at iter 25. Falling back to Backtracking.
+[22m 44s] [BFGS Adaptive] Strong Wolfe failed at iter 26. Falling back to Backtracking.
+[22m 45s] [BFGS Adaptive] Fallback streak (3) reached. Switching primary to Backtracking.
+[22m 46s] [BFGS Adaptive] Strong Wolfe failed at iter 27. Falling back to Backtracking.
+[22m 48s] [BFGS Adaptive] Strong Wolfe failed at iter 28. Falling back to Backtracking.
+[23m 03s] [BFGS Adaptive] Strong Wolfe failed at iter 0. Falling back to Backtracking.
+[23m 05s] [BFGS Adaptive] Strong Wolfe failed at iter 1. Falling back to Backtracking.
+[23m 07s] [BFGS Adaptive] Strong Wolfe failed at iter 2. Falling back to Backtracking.
+[23m 07s] [BFGS Adaptive] Fallback streak (3) reached. Switching primary to Backtracking.
+[23m 10s] [BFGS Adaptive] Strong Wolfe failed at iter 6. Falling back to Backtracking.
+[23m 12s] [BFGS Adaptive] Strong Wolfe failed at iter 7. Falling back to Backtracking.
+[23m 14s] [BFGS Adaptive] Strong Wolfe failed at iter 8. Falling back to Backtracking.
+[23m 15s] [BFGS Adaptive] Fallback streak (3) reached. Switching primary to Backtracking.
+[23m 18s] [BFGS Adaptive] CRITICAL: Backtracking failed at iter 10. Resetting Hessian.
+[23m 21s] [BFGS Adaptive] CRITICAL: Backtracking failed at iter 11. Resetting Hessian.
+[23m 26s] [BFGS Adaptive] Strong Wolfe failed at iter 16. Falling back to Backtracking.
+[23m 28s] [BFGS Adaptive] Strong Wolfe failed at iter 18. Falling back to Backtracking.
+[23m 30s] [BFGS Adaptive] Strong Wolfe failed at iter 19. Falling back to Backtracking.
+[23m 32s] [BFGS Adaptive] Strong Wolfe failed at iter 20. Falling back to Backtracking.
+[23m 32s] [BFGS Adaptive] Fallback streak (3) reached. Switching primary to Backtracking.
+[23m 33s] [BFGS Adaptive] Strong Wolfe failed at iter 21. Falling back to Backtracking.
+[23m 34s] [BFGS Adaptive] Strong Wolfe failed at iter 22. Falling back to Backtracking.
+[23m 35s] [BFGS Adaptive] Strong Wolfe failed at iter 23. Falling back to Backtracking.
+[23m 36s] [BFGS Adaptive] Fallback streak (3) reached. Switching primary to Backtracking.
+[23m 37s] [BFGS Adaptive] Strong Wolfe failed at iter 24. Falling back to Backtracking.
+[23m 38s] [BFGS Adaptive] Strong Wolfe failed at iter 25. Falling back to Backtracking.
+[23m 40s] [BFGS Adaptive] Strong Wolfe failed at iter 26. Falling back to Backtracking.
+[23m 41s] [BFGS Adaptive] Fallback streak (3) reached. Switching primary to Backtracking.
+[23m 42s] [BFGS Adaptive] Strong Wolfe failed at iter 27. Falling back to Backtracking.
+[23m 44s] [BFGS Adaptive] Strong Wolfe failed at iter 28. Falling back to Backtracking.
+[23m 59s] [BFGS Adaptive] Strong Wolfe failed at iter 0. Falling back to Backtracking.
+[24m 00s] [BFGS Adaptive] Strong Wolfe failed at iter 1. Falling back to Backtracking.
+[24m 02s] [BFGS Adaptive] Strong Wolfe failed at iter 2. Falling back to Backtracking.
+[24m 02s] [BFGS Adaptive] Fallback streak (3) reached. Switching primary to Backtracking.
+[24m 05s] [BFGS Adaptive] Strong Wolfe failed at iter 6. Falling back to Backtracking.
+[24m 07s] [BFGS Adaptive] Strong Wolfe failed at iter 7. Falling back to Backtracking.
+[24m 09s] [BFGS Adaptive] Strong Wolfe failed at iter 8. Falling back to Backtracking.
+[24m 10s] [BFGS Adaptive] Fallback streak (3) reached. Switching primary to Backtracking.
+[24m 16s] [BFGS Adaptive] Strong Wolfe failed at iter 12. Falling back to Backtracking.
+[24m 17s] [BFGS Adaptive] Strong Wolfe failed at iter 13. Falling back to Backtracking.
+[24m 24s] [BFGS Adaptive] Strong Wolfe failed at iter 16. Falling back to Backtracking.
+[24m 26s] [BFGS Adaptive] Strong Wolfe failed at iter 18. Falling back to Backtracking.
+[24m 28s] [BFGS Adaptive] Strong Wolfe failed at iter 19. Falling back to Backtracking.
+[24m 29s] [BFGS Adaptive] Strong Wolfe failed at iter 20. Falling back to Backtracking.
+[24m 29s] [BFGS Adaptive] Fallback streak (3) reached. Switching primary to Backtracking.
+[24m 30s] [BFGS Adaptive] Strong Wolfe failed at iter 21. Falling back to Backtracking.
+[24m 32s] [BFGS Adaptive] Strong Wolfe failed at iter 22. Falling back to Backtracking.
+[24m 33s] [BFGS Adaptive] Strong Wolfe failed at iter 23. Falling back to Backtracking.
+[24m 33s] [BFGS Adaptive] Fallback streak (3) reached. Switching primary to Backtracking.
+[24m 34s] [BFGS Adaptive] Strong Wolfe failed at iter 24. Falling back to Backtracking.
+[24m 35s] [BFGS Adaptive] Strong Wolfe failed at iter 25. Falling back to Backtracking.
+[24m 37s] [BFGS Adaptive] Strong Wolfe failed at iter 26. Falling back to Backtracking.
+[24m 38s] [BFGS Adaptive] Fallback streak (3) reached. Switching primary to Backtracking.
+[24m 39s] [BFGS Adaptive] Strong Wolfe failed at iter 27. Falling back to Backtracking.
+[24m 41s] [BFGS Adaptive] Strong Wolfe failed at iter 28. Falling back to Backtracking.
+[24m 56s] [BFGS Adaptive] Strong Wolfe failed at iter 0. Falling back to Backtracking.
+[24m 58s] [BFGS Adaptive] Strong Wolfe failed at iter 1. Falling back to Backtracking.
+[24m 59s] [BFGS Adaptive] Strong Wolfe failed at iter 2. Falling back to Backtracking.
+[24m 59s] [BFGS Adaptive] Fallback streak (3) reached. Switching primary to Backtracking.
+[25m 03s] [BFGS Adaptive] Strong Wolfe failed at iter 6. Falling back to Backtracking.
+[25m 04s] [BFGS Adaptive] Strong Wolfe failed at iter 7. Falling back to Backtracking.
+[25m 06s] [BFGS Adaptive] Strong Wolfe failed at iter 8. Falling back to Backtracking.
+[25m 07s] [BFGS Adaptive] Fallback streak (3) reached. Switching primary to Backtracking.
+[25m 12s] [BFGS Adaptive] Strong Wolfe failed at iter 12. Falling back to Backtracking.
+[25m 14s] [BFGS Adaptive] Strong Wolfe failed at iter 13. Falling back to Backtracking.
+[25m 15s] [OUTER] cost-stall STUCK (NOT a flat valley): REML objective improved < 1.000e-7 (relative) over 6 accepted outer steps but the projected gradient is FAR above the certified-stationary band (|g|=4.008e-1 > escape threshold 3.288e-1); refusing to halt-and-ship and continuing the descent (escape 1, value=2.182174e2).
+[25m 16s] [BFGS Adaptive] Strong Wolfe failed at iter 14. Falling back to Backtracking.
+[25m 22s] [BFGS Adaptive] Strong Wolfe failed at iter 16. Falling back to Backtracking.
+[25m 25s] [BFGS Adaptive] Strong Wolfe failed at iter 18. Falling back to Backtracking.
+[25m 26s] [BFGS Adaptive] Strong Wolfe failed at iter 19. Falling back to Backtracking.
+[25m 28s] [BFGS Adaptive] Strong Wolfe failed at iter 20. Falling back to Backtracking.
+[25m 28s] [BFGS Adaptive] Fallback streak (3) reached. Switching primary to Backtracking.
+[25m 29s] [BFGS Adaptive] Strong Wolfe failed at iter 21. Falling back to Backtracking.
+[25m 30s] [BFGS Adaptive] Strong Wolfe failed at iter 22. Falling back to Backtracking.
+[25m 31s] [BFGS Adaptive] Strong Wolfe failed at iter 23. Falling back to Backtracking.
+[25m 32s] [BFGS Adaptive] Fallback streak (3) reached. Switching primary to Backtracking.
+[25m 33s] [BFGS Adaptive] Strong Wolfe failed at iter 24. Falling back to Backtracking.
+[25m 34s] [BFGS Adaptive] Strong Wolfe failed at iter 25. Falling back to Backtracking.
+[25m 36s] [BFGS Adaptive] Strong Wolfe failed at iter 26. Falling back to Backtracking.
+[25m 37s] [BFGS Adaptive] Fallback streak (3) reached. Switching primary to Backtracking.
+[25m 38s] [BFGS Adaptive] Strong Wolfe failed at iter 27. Falling back to Backtracking.
+[25m 40s] [BFGS Adaptive] Strong Wolfe failed at iter 28. Falling back to Backtracking.
+[25m 55s] [BFGS Adaptive] Strong Wolfe failed at iter 0. Falling back to Backtracking.
+[25m 57s] [BFGS Adaptive] Strong Wolfe failed at iter 1. Falling back to Backtracking.
+[26m 02s] [BFGS Adaptive] Strong Wolfe failed at iter 16. Falling back to Backtracking.
+[26m 04s] [BFGS Adaptive] Strong Wolfe failed at iter 18. Falling back to Backtracking.
+[26m 06s] [BFGS Adaptive] Strong Wolfe failed at iter 19. Falling back to Backtracking.
+[26m 07s] [BFGS Adaptive] Strong Wolfe failed at iter 20. Falling back to Backtracking.
+[26m 07s] [BFGS Adaptive] Fallback streak (3) reached. Switching primary to Backtracking.
+[26m 08s] [BFGS Adaptive] Strong Wolfe failed at iter 21. Falling back to Backtracking.
+[26m 10s] [BFGS Adaptive] Strong Wolfe failed at iter 22. Falling back to Backtracking.
+[26m 11s] [BFGS Adaptive] Strong Wolfe failed at iter 23. Falling back to Backtracking.
+[26m 11s] [BFGS Adaptive] Fallback streak (3) reached. Switching primary to Backtracking.
+[26m 12s] [BFGS Adaptive] Strong Wolfe failed at iter 24. Falling back to Backtracking.
+[26m 13s] [BFGS Adaptive] Strong Wolfe failed at iter 25. Falling back to Backtracking.
+[26m 16s] [BFGS Adaptive] Strong Wolfe failed at iter 26. Falling back to Backtracking.
+[26m 16s] [BFGS Adaptive] Fallback streak (3) reached. Switching primary to Backtracking.
+[26m 17s] [BFGS Adaptive] Strong Wolfe failed at iter 27. Falling back to Backtracking.
+[26m 19s] [BFGS Adaptive] Strong Wolfe failed at iter 28. Falling back to Backtracking.
+[27m 49s] [OUTER] standard REML: EFS trial refused after 4 finite iteration(s) at cost=3.265375e2; continuing the exact incumbent with the analytic-gradient fallback: recoverable objective evaluation failure: EFS step rejected after 8 halvings on pure-ρ vector (rho_dim=12, n_params=12, cost=3.265285e2)
+[43m 29s] [OUTER] standard REML: seed 0 solver convergence claim failed analytic certification: Outer smoothing-parameter optimization did not certify a stationary optimum (standard REML): gradient |g|=1.048e-3 |Pg|=1.048e-3 bound=2.857e-5 (rung=probe-noise-floor derived_standard=false) hessian_psd=not-spent curvature_source=screening-not-spent railed=[6, 9, 11] [#6 theta=3.000000e1 box=[-3.000000e1, 3.000000e1] margin=5.000e-1, #9 theta=3.000000e1 box=[-3.000000e1, 3.000000e1] margin=5.000e-1, #11 theta=3.000000e1 box=[-3.000000e1, 3.000000e1] margin=5.000e-1] → NOT STATIONARY (|Pg|=1.048e-3 > bound=2.857e-5); rail tests: [#6 theta=3.000000e1 box=[-3.000000e1, 3.000000e1] margin=5.000e-1 railed_at=(<=-2.950000e1 or >=2.950000e1), #9 theta=3.000000e1 box=[-3.000000e1, 3.000000e1] margin=5.000e-1 railed_at=(<=-2.950000e1 or >=2.950000e1), #11 theta=3.000000e1 box=[-3.000000e1, 3.000000e1] margin=5.000e-1 railed_at=(<=-2.950000e1 or >=2.950000e1)]; solver provenance: origin=BfgsCostStallExit, plan=solver=Bfgs, search_hessian_source=BfgsApprox, claimed_converged=true, termination=<no opt solver produced this result>, cost_stall_window=[noise_floor=1.819225e-5, probe_radius=6.368296e-1, ratio=2.856690e-5], flat_noise_grad_bound=2.856690e-5 after 45 outer iteration(s); final objective 3.221481e2, projected gradient norm 1.048e-3 against stationarity bound 2.857e-5 (rung=probe-noise-floor derived_standard=false). A fit is only minted from a converged optimization; the best iterate is carried as a checkpoint — resume by seeding the outer search at rho_checkpoint = [13.247113191942555, 22.423950458423306, 12.282273317536063, 26.328162185724, 22.3531864988338, 12.649956053603201, 30.0, 9.770709960279106, 9.920133555263174, 30.0, 4.866643608766537, 30.0].; retaining only a resume checkpoint
+[53m 32s] [OUTER] standard REML: seed 1 solver convergence claim failed analytic certification: Outer smoothing-parameter optimization did not certify a stationary optimum (standard REML): gradient |g|=4.681e-4 |Pg|=4.681e-4 bound=1.143e-5 (rung=solver-band derived_standard=false) hessian_psd=not-spent curvature_source=screening-not-spent railed=[] → NOT STATIONARY (|Pg|=4.681e-4 > bound=1.143e-5); solver provenance: origin=BfgsCostStallExit, plan=solver=Bfgs, search_hessian_source=BfgsApprox, claimed_converged=true, termination=<no opt solver produced this result>, cost_stall_window=[noise_floor=8.440558e-7, probe_radius=2.365437e-1, ratio=3.568288e-6], flat_noise_grad_bound=3.568288e-6 after 50 outer iteration(s); final objective 3.220630e2, projected gradient norm 4.681e-4 against stationarity bound 1.143e-5 (rung=solver-band derived_standard=false). A fit is only minted from a converged optimization; the best iterate is carried as a checkpoint — resume by seeding the outer search at rho_checkpoint = [29.4565249917015, 1.269812273574767, 4.336679178183088, 21.34838436573679, 21.610047334589844, 4.1594305002290906, 22.82576748204227, 4.237443246672904, 4.260967669755246, 22.460344621157745, 4.011270888627966, 22.490116955661403].; retaining only a resume checkpoint
+[1h 03m 32s] [OUTER] standard REML: seed 2 solver convergence claim failed analytic certification: Outer smoothing-parameter optimization did not certify a stationary optimum (standard REML): gradient |g|=1.630e-3 |Pg|=1.630e-3 bound=2.168e-5 (rung=probe-noise-floor derived_standard=false) hessian_psd=not-spent curvature_source=screening-not-spent railed=[] → NOT STATIONARY (|Pg|=1.630e-3 > bound=2.168e-5); solver provenance: origin=BfgsCostStallExit, plan=solver=Bfgs, search_hessian_source=BfgsApprox, claimed_converged=true, termination=<no opt solver produced this result>, cost_stall_window=[noise_floor=6.445151e-6, probe_radius=2.973442e-1, ratio=2.167572e-5], flat_noise_grad_bound=2.167572e-5 after 50 outer iteration(s); final objective 3.221637e2, projected gradient norm 1.630e-3 against stationarity bound 2.168e-5 (rung=probe-noise-floor derived_standard=false). A fit is only minted from a converged optimization; the best iterate is carried as a checkpoint — resume by seeding the outer search at rho_checkpoint = [18.866297068043554, 7.089415285525497, 22.114520064441788, 18.227645613418044, 18.37602025231358, 19.19186667609168, 13.312190532278793, 20.33923346645147, 22.316158045450322, 19.66831917211277, 19.16309128803606, 13.025737921515375].; retaining only a resume checkpoint
+[1h 10m 30s] [OUTER] standard REML: EFS trial refused after 39 finite iteration(s) at cost=3.219942e2; continuing the exact incumbent with the analytic-gradient fallback: recoverable objective evaluation failure: EFS step rejected after 8 halvings on pure-ρ vector (rho_dim=12, n_params=12, cost=3.219942e2)
+[1h 11m 12s] [BFGS Adaptive] Strong Wolfe failed at iter 0. Falling back to Backtracking.
+[1h 11m 34s] [BFGS Adaptive] Strong Wolfe failed at iter 1. Falling back to Backtracking.
+[1h 11m 59s] [#1762/#2273] Firth-capable binomial base fit (Binomial Logit) failed (Outer smoothing-parameter optimization did not certify a stationary optimum (standard REML): gradient |g|=4.008e-1 |Pg|=4.008e-1 bound=1.143e-5 (rung=solver-band derived_standard=false) hessian_psd=NO (cleared=true λ_min(H)=-8.572759e-2 λ_min(H+diag|g|)=1.826968e-6 max_k|g_k|=4.007760e-1 measured_resolution=0.000000e0 decided_at=1.490116e-8) curvature_source=terminal-analytic railed=[0, 1, 3, 4, 6, 7, 8, 11] [#0 theta=3.000000e1 box=[-3.000000e1, 3.000000e1] margin=5.000e-1, #1 theta=3.000000e1 box=[-3.000000e1, 3.000000e1] margin=5.000e-1, #3 theta=2.999999e1 box=[-3.000000e1, 3.000000e1] margin=5.000e-1, #4 theta=3.000000e1 box=[-3.000000e1, 3.000000e1] margin=5.000e-1, #6 theta=2.983653e1 box=[-3.000000e1, 3.000000e1] margin=5.000e-1, #7 theta=3.000000e1 box=[-3.000000e1, 3.000000e1] margin=5.000e-1, #8 theta=2.999999e1 box=[-3.000000e1, 3.000000e1] margin=5.000e-1, #11 theta=3.000000e1 box=[-3.000000e1, 3.000000e1] margin=5.000e-1] → NOT STATIONARY (|Pg|=4.008e-1 > bound=1.143e-5); rail tests: [#0 theta=3.000000e1 box=[-3.000000e1, 3.000000e1] margin=5.000e-1 railed_at=(<=-2.950000e1 or >=2.950000e1), #1 theta=3.000000e1 box=[-3.000000e1, 3.000000e1] margin=5.000e-1 railed_at=(<=-2.950000e1 or >=2.950000e1), #3 theta=2.999999e1 box=[-3.000000e1, 3.000000e1] margin=5.000e-1 railed_at=(<=-2.950000e1 or >=2.950000e1), #4 theta=3.000000e1 box=[-3.000000e1, 3.000000e1] margin=5.000e-1 railed_at=(<=-2.950000e1 or >=2.950000e1), #6 theta=2.983653e1 box=[-3.000000e1, 3.000000e1] margin=5.000e-1 railed_at=(<=-2.950000e1 or >=2.950000e1), #7 theta=3.000000e1 box=[-3.000000e1, 3.000000e1] margin=5.000e-1 railed_at=(<=-2.950000e1 or >=2.950000e1), #8 theta=2.999999e1 box=[-3.000000e1, 3.000000e1] margin=5.000e-1 railed_at=(<=-2.950000e1 or >=2.950000e1), #11 theta=3.000000e1 box=[-3.000000e1, 3.000000e1] margin=5.000e-1 railed_at=(<=-2.950000e1 or >=2.950000e1)]; asymptote-rail declined: interior not stationary: active-face |Pg|=4.008e-1, caller bound 1.143e-5 from solver-band; the active-face Hessian and residual yield no positive finite PD Newton decrement; tail-snap declined: no candidate passed the curvature tie (k=2: ρ=3.00 more than 18 e-folds inside the box; k=5: ρ=8.74 more than 18 e-folds inside the box; k=9: ρ=16.23 more than 18 e-folds inside the box; k=10: ρ=9.73 more than 18 e-folds inside the box); solver provenance: origin=Solver, plan=solver=Bfgs, search_hessian_source=BfgsApprox, claimed_converged=false, termination=line_search_failed(|g|=4.007765e-1) [made no stationarity claim], stop_reason=SolverFailure, line_search=StepSizeTooSmall after 50 attempt(s) [StepSizeTooSmall = the direction descended but no step improved the objective; MaxAttempts = the bracket never closed] after 139 outer iteration(s); final objective 2.182174e2, projected gradient norm 4.008e-1 against stationarity bound 1.143e-5 (rung=solver-band derived_standard=false). A fit is only minted from a converged optimization; the best iterate is carried as a checkpoint — resume by seeding the outer search at rho_checkpoint = [30.0, 30.0, 3.0018724725348607, 29.99999286693047, 30.0, 8.7409402457562, 29.83652941079695, 30.0, 29.999992866942037, 16.229293113653167, 9.727069337637221, 30.0].); Firth retry also failed to certify (Outer smoothing-parameter optimization did not certify a stationary optimum (standard REML): gradient |g|=9.473e-5 |Pg|=9.473e-5 bound=1.143e-5 (rung=solver-band derived_standard=false) hessian_psd=n/a curvature_source=unavailable railed=[] → NOT STATIONARY (|Pg|=9.473e-5 > bound=1.143e-5); solver provenance: origin=Solver, plan=solver=Bfgs, search_hessian_source=BfgsApprox, claimed_converged=false, termination=line_search_failed(|g|=9.476029e-5) [made no stationarity claim], stop_reason=SolverFailure, line_search=StepSizeTooSmall after 50 attempt(s) [StepSizeTooSmall = the direction descended but no step improved the objective; MaxAttempts = the bracket never closed] after 51 outer iteration(s); final objective 3.219942e2, projected gradient norm 9.473e-5 against stationarity bound 1.143e-5 (rung=solver-band derived_standard=false). A fit is only minted from a converged optimization; the best iterate is carried as a checkpoint — resume by seeding the outer search at rho_checkpoint = [24.906191025837256, 1.2453958108685539, 15.935680493790471, 24.346253715488018, 24.28905894103873, 16.086703438424177, 24.33441224201951, 16.10631582859552, 15.660790254250372, 24.60647974365644, 4.07944488346042, 24.78404075140884].) — returning the original typed base evidence, not either abandoned iterate.
+[HEARTBEAT] elapsed=     0.0s cmd='Rscript /home/runner/work/gam/gam/bench/gam_bench_mgcv_cv_653wnvhj/run_mgcv_cv.R /home/runner/work/gam/gam/bench/gam_bench_mgcv_cv_653wnvhj/data.json /home/runner/work/gam/gam/bench/gam_bench_mgcv_cv_653wnvhj/out.json /home/runner/work/gam/gam/bench/gam_fuzz_shared_folds_su4m80hz/train_scaled_0.csv ...' pid=12932 p_cpu=0.0% p_mem=0.0% p_rss=0.00 GiB p_hwm=0.00 GiB p_vsz=0.09 GiB py_rss=0.71 GiB py_hwm=0.72 GiB sys_ram=1.66 GiB/15.61 GiB sys_ram_pct=10.6% sys_avail=13.95 GiB swap_free=3.00 GiB cgroup=n/a/n/a cg_pct=n/a bench_free=77.25 GiB/144.26 GiB bench_used=46.4% tmp_free=77.25 GiB/144.26 GiB tmp_used=46.4% load1=2.86962890625
+[HEARTBEAT] elapsed=     0.3s cmd='Rscript /home/runner/work/gam/gam/bench/gam_bench_mgcv_cv_653wnvhj/run_mgcv_cv.R /home/runner/work/gam/gam/bench/gam_bench_mgcv_cv_653wnvhj/data.json /home/runner/work/gam/gam/bench/gam_bench_mgcv_cv_653wnvhj/out.json /home/runner/work/gam/gam/bench/gam_fuzz_shared_folds_su4m80hz/train_scaled_0.csv ...' pid=12932 p_cpu=226.0% p_mem=0.5% p_rss=0.08 GiB p_hwm=0.08 GiB p_vsz=0.59 GiB py_rss=0.71 GiB py_hwm=0.72 GiB sys_ram=1.72 GiB/15.61 GiB sys_ram_pct=11.0% sys_avail=13.90 GiB swap_free=3.00 GiB cgroup=n/a/n/a cg_pct=n/a bench_free=77.25 GiB/144.26 GiB bench_used=46.4% tmp_free=77.25 GiB/144.26 GiB tmp_used=46.4% load1=2.86962890625
+[HEARTBEAT] elapsed=     0.5s cmd='Rscript /home/runner/work/gam/gam/bench/gam_bench_mgcv_cv_653wnvhj/run_mgcv_cv.R /home/runner/work/gam/gam/bench/gam_bench_mgcv_cv_653wnvhj/data.json /home/runner/work/gam/gam/bench/gam_bench_mgcv_cv_653wnvhj/out.json /home/runner/work/gam/gam/bench/gam_fuzz_shared_folds_su4m80hz/train_scaled_0.csv ...' pid=12932 p_cpu=163.0% p_mem=0.8% p_rss=0.14 GiB p_hwm=0.14 GiB p_vsz=0.65 GiB py_rss=0.71 GiB py_hwm=0.72 GiB sys_ram=1.78 GiB/15.61 GiB sys_ram_pct=11.4% sys_avail=13.84 GiB swap_free=3.00 GiB cgroup=n/a/n/a cg_pct=n/a bench_free=77.25 GiB/144.26 GiB bench_used=46.4% tmp_free=77.25 GiB/144.26 GiB tmp_used=46.4% load1=2.86962890625
+[HEARTBEAT] elapsed=     0.8s cmd='Rscript /home/runner/work/gam/gam/bench/gam_bench_mgcv_cv_653wnvhj/run_mgcv_cv.R /home/runner/work/gam/gam/bench/gam_bench_mgcv_cv_653wnvhj/data.json /home/runner/work/gam/gam/bench/gam_bench_mgcv_cv_653wnvhj/out.json /home/runner/work/gam/gam/bench/gam_fuzz_shared_folds_su4m80hz/train_scaled_0.csv ...' pid=12932 p_cpu=142.0% p_mem=0.8% p_rss=0.14 GiB p_hwm=0.14 GiB p_vsz=0.65 GiB py_rss=0.71 GiB py_hwm=0.72 GiB sys_ram=1.78 GiB/15.61 GiB sys_ram_pct=11.4% sys_avail=13.84 GiB swap_free=3.00 GiB cgroup=n/a/n/a cg_pct=n/a bench_free=77.25 GiB/144.26 GiB bench_used=46.4% tmp_free=77.25 GiB/144.26 GiB tmp_used=46.4% load1=2.86962890625
+[HEARTBEAT] elapsed=     1.1s cmd='Rscript /home/runner/work/gam/gam/bench/gam_bench_mgcv_cv_653wnvhj/run_mgcv_cv.R /home/runner/work/gam/gam/bench/gam_bench_mgcv_cv_653wnvhj/data.json /home/runner/work/gam/gam/bench/gam_bench_mgcv_cv_653wnvhj/out.json /home/runner/work/gam/gam/bench/gam_fuzz_shared_folds_su4m80hz/train_scaled_0.csv ...' pid=12932 p_cpu=130.0% p_mem=1.3% p_rss=0.20 GiB p_hwm=0.20 GiB p_vsz=0.78 GiB py_rss=0.71 GiB py_hwm=0.72 GiB sys_ram=1.85 GiB/15.61 GiB sys_ram_pct=11.8% sys_avail=13.77 GiB swap_free=3.00 GiB cgroup=n/a/n/a cg_pct=n/a bench_free=77.25 GiB/144.26 GiB bench_used=46.4% tmp_free=77.25 GiB/144.26 GiB tmp_used=46.4% load1=2.86962890625
+[HEARTBEAT] elapsed=     1.3s cmd='Rscript /home/runner/work/gam/gam/bench/gam_bench_mgcv_cv_653wnvhj/run_mgcv_cv.R /home/runner/work/gam/gam/bench/gam_bench_mgcv_cv_653wnvhj/data.json /home/runner/work/gam/gam/bench/gam_bench_mgcv_cv_653wnvhj/out.json /home/runner/work/gam/gam/bench/gam_fuzz_shared_folds_su4m80hz/train_scaled_0.csv ...' pid=12932 p_cpu=124.0% p_mem=1.3% p_rss=0.21 GiB p_hwm=0.21 GiB p_vsz=0.78 GiB py_rss=0.71 GiB py_hwm=0.72 GiB sys_ram=1.85 GiB/15.61 GiB sys_ram_pct=11.8% sys_avail=13.77 GiB swap_free=3.00 GiB cgroup=n/a/n/a cg_pct=n/a bench_free=77.25 GiB/144.26 GiB bench_used=46.4% tmp_free=77.25 GiB/144.26 GiB tmp_used=46.4% load1=2.7197265625
+[HEARTBEAT] elapsed=     1.6s cmd='Rscript /home/runner/work/gam/gam/bench/gam_bench_mgcv_cv_653wnvhj/run_mgcv_cv.R /home/runner/work/gam/gam/bench/gam_bench_mgcv_cv_653wnvhj/data.json /home/runner/work/gam/gam/bench/gam_bench_mgcv_cv_653wnvhj/out.json /home/runner/work/gam/gam/bench/gam_fuzz_shared_folds_su4m80hz/train_scaled_0.csv ...' pid=12932 p_cpu=162.0% p_mem=1.6% p_rss=0.25 GiB p_hwm=0.25 GiB p_vsz=0.94 GiB py_rss=0.71 GiB py_hwm=0.72 GiB sys_ram=1.88 GiB/15.61 GiB sys_ram_pct=12.0% sys_avail=13.74 GiB swap_free=3.00 GiB cgroup=n/a/n/a cg_pct=n/a bench_free=77.25 GiB/144.26 GiB bench_used=46.4% tmp_free=77.25 GiB/144.26 GiB tmp_used=46.4% load1=2.7197265625
+[HEARTBEAT] elapsed=     1.8s cmd='Rscript /home/runner/work/gam/gam/bench/gam_bench_mgcv_cv_653wnvhj/run_mgcv_cv.R /home/runner/work/gam/gam/bench/gam_bench_mgcv_cv_653wnvhj/data.json /home/runner/work/gam/gam/bench/gam_bench_mgcv_cv_653wnvhj/out.json /home/runner/work/gam/gam/bench/gam_fuzz_shared_folds_su4m80hz/train_scaled_0.csv ...' pid=12932 p_cpu=194.0% p_mem=1.6% p_rss=0.26 GiB p_hwm=0.26 GiB p_vsz=0.94 GiB py_rss=0.71 GiB py_hwm=0.72 GiB sys_ram=1.88 GiB/15.61 GiB sys_ram_pct=12.1% sys_avail=13.73 GiB swap_free=3.00 GiB cgroup=n/a/n/a cg_pct=n/a bench_free=77.25 GiB/144.26 GiB bench_used=46.4% tmp_free=77.25 GiB/144.26 GiB tmp_used=46.4% load1=2.7197265625
+[HEARTBEAT] elapsed=     2.1s cmd='Rscript /home/runner/work/gam/gam/bench/gam_bench_mgcv_cv_653wnvhj/run_mgcv_cv.R /home/runner/work/gam/gam/bench/gam_bench_mgcv_cv_653wnvhj/data.json /home/runner/work/gam/gam/bench/gam_bench_mgcv_cv_653wnvhj/out.json /home/runner/work/gam/gam/bench/gam_fuzz_shared_folds_su4m80hz/train_scaled_0.csv ...' pid=12932 p_cpu=219.0% p_mem=1.6% p_rss=0.25 GiB p_hwm=0.26 GiB p_vsz=0.94 GiB py_rss=0.71 GiB py_hwm=0.72 GiB sys_ram=1.88 GiB/15.61 GiB sys_ram_pct=12.1% sys_avail=13.73 GiB swap_free=3.00 GiB cgroup=n/a/n/a cg_pct=n/a bench_free=77.25 GiB/144.26 GiB bench_used=46.4% tmp_free=77.25 GiB/144.26 GiB tmp_used=46.4% load1=2.7197265625
+Warning message:
+In newton(lsp = lsp, X = G$X, y = G$y, Eb = G$Eb, UrS = G$UrS, L = G$L,  :
+  gam.fit3 algorithm did not converge
+[HEARTBEAT] command-exit rc=0 pid=12932 samples=9 peak_proc_rss=0.26 GiB peak_proc_hwm=0.26 GiB peak_proc_vsz=0.94 GiB last_proc_rss=0.25 GiB last_py_rss=0.71 GiB last_sys_ram=1.88 GiB/15.61 GiB last_sys_ram_pct=12.1% last_cgroup=n/a/n/a last_bench_free=77.25 GiB/144.26 GiB last_tmp_free=77.25 GiB/144.26 GiB

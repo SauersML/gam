@@ -1,13 +1,13 @@
 {
   "workflow": "Fuzz vs mgcv",
-  "publish_job_status": "cancelled",
+  "publish_job_status": "failure",
   "publish_job_status_note": "status of the job that PUBLISHED these results, not the conclusion of run_id -- this job is part of that run, so the run has not concluded here",
-  "run_id": "33605324201",
-  "run_number": "4123",
+  "run_id": "34373504468",
+  "run_number": "4131",
   "run_attempt": "1",
-  "event": "schedule",
+  "event": "workflow_dispatch",
   "ref": "refs/heads/main",
-  "sha": "b3afd40d0a32cc57873618055febd716051a05d6",
-  "completed_utc": "2026-09-02T09:47:31Z",
-  "run_url": "https://github.com/SauersML/gam/actions/runs/33605324201"
+  "sha": "1c8ebb369a33c9ec59dff4b49aa70d4a6a08f139",
+  "completed_utc": "2026-09-09T17:44:19Z",
+  "run_url": "https://github.com/SauersML/gam/actions/runs/34373504468"
 }
