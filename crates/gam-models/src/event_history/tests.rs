@@ -19,7 +19,7 @@ use super::forecast::{
     population_forecast, predictive_pit,
 };
 use super::marginal::{SubjectInputs, subject_marginal};
-use super::preserve::{ReferenceGrid, killing_masks, stratum_normalisers};
+use super::preserve::{ReferenceGrid, ReferenceStrata, killing_masks, stratum_normalisers};
 use crate::custom_family::{BlockwiseFitOptions, ParameterBlockState};
 use gam_math::jet_scalar::{OneSeed, TwoSeed};
 use gam_math::nested_dual::JetField;
@@ -3743,4 +3743,97 @@ fn every_mark_kind_gets_the_risk_set_its_kind_defines() {
     assert_eq!(masks.len(), 3);
     assert_eq!(masks[of_mark[1]], vec![false, false, true, false]);
     assert_eq!(masks[of_mark[0]], vec![true, false, true, false]);
+}
+
+#[test]
+fn a_risk_set_centred_fit_reads_its_baseline_as_the_marginal_incidence() {
+    install_test_logger();
+    // A first-occurrence mark with a real frailty and a constant true
+    // baseline. Under the risk-set centring `exp(η⁰)` is the incidence among
+    // those still at risk at every age, so an intercept-only fit must put it
+    // at the cohort's own crude rate — events over the exposure that was
+    // actually at risk — whatever the frailty does to the risk set. Under the
+    // stationary prior's centring the same intercept is the rate at the start
+    // of follow-up, which a selected risk set leaves above the crude rate.
+    let mut cohort = simulate_marked_cohort(
+        400,
+        5.0,
+        &[-1.3],
+        0.0,
+        &[0.9],
+        0.05,
+        &[MarkKind::Once],
+        4242,
+    );
+    let events: f64 = cohort
+        .subjects
+        .iter()
+        .map(|s| s.events.iter().filter(|e| e.time > s.entry).count() as f64)
+        .sum();
+    // Exposure at risk: a once-only mark stops accruing when it fires.
+    let exposure: f64 = cohort
+        .subjects
+        .iter()
+        .map(|s| {
+            let stop = s
+                .events
+                .iter()
+                .filter(|e| e.time > s.entry)
+                .map(|e| e.time)
+                .fold(s.exit, f64::min);
+            stop - s.entry
+        })
+        .sum();
+    let crude = events / exposure;
+
+    let mut spec = EventHistorySpec::new(vec![intercept_only_spec()]);
+    let prior_centred = fit_event_history(&mut cohort, &spec).expect("prior-centred fit");
+    spec.reference = Some(ReferenceStrata::single(0, cohort.subjects.len()));
+    let centred = fit_event_history(&mut cohort, &spec).expect("risk-set centred fit");
+
+    let prior_rate = prior_centred.mark_coefficients(0)[0].exp();
+    let centred_rate = centred.mark_coefficients(0)[0].exp();
+    emit(&format!(
+        "[preserve] {events} events over {exposure:.1} at-risk years: crude {crude:.5}; risk-set centred {centred_rate:.5} (rank {}, rounds {:?}); prior centred {prior_rate:.5} (rank {})",
+        centred.rank(),
+        centred.normaliser_rounds,
+        prior_centred.rank()
+    ));
+    assert!(
+        centred.rank() > 0,
+        "the fixture must buy a latent direction for the centrings to differ"
+    );
+    assert!(
+        !centred.normaliser_rounds.is_empty(),
+        "a risk-set centred fit must have refreshed its normaliser at least once"
+    );
+    assert!(
+        centred
+            .normaliser_rounds
+            .last()
+            .copied()
+            .unwrap_or(f64::INFINITY)
+            <= spec.normaliser_tolerance,
+        "the re-centring did not reach its fixed point: {:?}",
+        centred.normaliser_rounds
+    );
+    assert!(
+        !centred.reference_risk_mass.is_empty() && centred.reference_masks > 0,
+        "the fit must publish the reference population's own risk mass"
+    );
+    // The identity, read off the fitted intercept against the cohort's own
+    // crude rate. The tolerance is the sampling error of a rate from this
+    // many events, not a fudge: 3/√events is about three standard errors.
+    let tolerance = 3.0 / events.sqrt();
+    let relative = (centred_rate - crude).abs() / crude;
+    assert!(
+        relative < tolerance,
+        "risk-set centred baseline {centred_rate} against the crude rate {crude}: relative {relative} exceeds {tolerance}"
+    );
+    // And the prior-centred intercept is the start-of-follow-up rate, which
+    // the same data put above the crude one.
+    assert!(
+        prior_rate > centred_rate,
+        "the prior's centring reads the intercept at the start of follow-up, above the marginal rate: {prior_rate} vs {centred_rate}"
+    );
 }
