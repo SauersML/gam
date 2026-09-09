@@ -3748,16 +3748,17 @@ fn every_mark_kind_gets_the_risk_set_its_kind_defines() {
 #[test]
 fn a_risk_set_centred_fit_reads_its_baseline_as_the_marginal_incidence() {
     install_test_logger();
-    // A first-occurrence mark with a real frailty and a constant true
-    // baseline. Under the risk-set centring `exp(η⁰)` is the incidence among
-    // those still at risk at every age, so an intercept-only fit must put it
-    // at the cohort's own crude rate — events over the exposure that was
-    // actually at risk — whatever the frailty does to the risk set. Under the
-    // stationary prior's centring the same intercept is the rate at the start
-    // of follow-up, which a selected risk set leaves above the crude rate.
+    // A first-occurrence mark with a real frailty. The population's incidence
+    // among those still at risk falls with time — the survivors are the low
+    // activities — so the claim to check is that the fitted `exp(η⁰(t))`
+    // tracks that falling curve, which is what the risk-set centring says the
+    // baseline is. The stationary prior's centring reads the same intercept
+    // as the rate over the cohort as it started, which sits above the later
+    // risk sets' rate.
+    let follow_up = 5.0_f64;
     let mut cohort = simulate_marked_cohort(
-        400,
-        5.0,
+        600,
+        follow_up,
         &[-1.3],
         0.0,
         &[0.9],
@@ -3765,39 +3766,72 @@ fn a_risk_set_centred_fit_reads_its_baseline_as_the_marginal_incidence() {
         &[MarkKind::Once],
         4242,
     );
-    let events: f64 = cohort
-        .subjects
-        .iter()
-        .map(|s| s.events.iter().filter(|e| e.time > s.entry).count() as f64)
-        .sum();
-    // Exposure at risk: a once-only mark stops accruing when it fires.
-    let exposure: f64 = cohort
-        .subjects
-        .iter()
-        .map(|s| {
-            let stop = s
+    // The empirical hazard among those at risk, in bins of one time unit.
+    let bins = 5usize;
+    let width = follow_up / bins as f64;
+    let mut bin_events = vec![0.0; bins];
+    let mut bin_exposure = vec![0.0; bins];
+    for subject in &cohort.subjects {
+        let stop = subject
+            .events
+            .iter()
+            .filter(|e| e.time > subject.entry)
+            .map(|e| e.time)
+            .fold(subject.exit, f64::min);
+        for (b, (events, exposure)) in bin_events
+            .iter_mut()
+            .zip(bin_exposure.iter_mut())
+            .enumerate()
+        {
+            let (left, right) = (b as f64 * width, (b + 1) as f64 * width);
+            *exposure += (stop.min(right) - subject.entry.max(left)).max(0.0);
+            *events += subject
                 .events
                 .iter()
-                .filter(|e| e.time > s.entry)
-                .map(|e| e.time)
-                .fold(s.exit, f64::min);
-            stop - s.entry
-        })
-        .sum();
-    let crude = events / exposure;
+                .filter(|e| e.time > subject.entry && e.time >= left && e.time < right)
+                .count() as f64;
+        }
+    }
+    let empirical: Vec<f64> = bin_events
+        .iter()
+        .zip(bin_exposure.iter())
+        .map(|(e, x)| e / x)
+        .collect();
 
-    let mut spec = EventHistorySpec::new(vec![intercept_only_spec()]);
+    // A baseline free to follow time, so the model can express a falling
+    // marginal rate; an intercept alone would assert a constant one, which a
+    // selected risk set does not have.
+    let mut spec = EventHistorySpec::new(Vec::new());
+    let rows = design_rows(&cohort, spec.quadrature_order).expect("design rows");
+    spec.covariates = vec![
+        super::formula::covariate_spec_from_formula("s(time)", rows.view(), &cohort)
+            .expect("baseline formula"),
+    ];
     let prior_centred = fit_event_history(&mut cohort, &spec).expect("prior-centred fit");
     spec.reference = Some(ReferenceStrata::single(0, cohort.subjects.len()));
     let centred = fit_event_history(&mut cohort, &spec).expect("risk-set centred fit");
 
-    let prior_rate = prior_centred.mark_coefficients(0)[0].exp();
-    let centred_rate = centred.mark_coefficients(0)[0].exp();
+    // The fitted baseline in each bin: the mean of `exp(η⁰)` over the
+    // training nodes that fall in it.
+    let fitted_in_bins = |fit: &EventHistoryFit| -> Vec<f64> {
+        let eta = fit.mark_eta(0);
+        let mut total = vec![0.0; bins];
+        let mut count = vec![0.0; bins];
+        for subject in &fit.nodes.subjects {
+            for (n, &t) in subject.times.iter().enumerate() {
+                let b = ((t / width) as usize).min(bins - 1);
+                total[b] += eta[subject.first_row + n].exp();
+                count[b] += 1.0;
+            }
+        }
+        total.iter().zip(count.iter()).map(|(t, c)| t / c).collect()
+    };
+    let centred_rate = fitted_in_bins(&centred);
+    let prior_rate = fitted_in_bins(&prior_centred);
     emit(&format!(
-        "[preserve] {events} events over {exposure:.1} at-risk years: crude {crude:.5}; risk-set centred {centred_rate:.5} (rank {}, rounds {:?}); prior centred {prior_rate:.5} (rank {})",
+        "[preserve] rank {} rounds {:?}\n  empirical hazard among those at risk {empirical:.4?}\n  risk-set centred baseline          {centred_rate:.4?}\n  prior centred baseline             {prior_rate:.4?}",
         centred.rank(),
-        centred.normaliser_rounds,
-        prior_centred.rank()
+        centred.normaliser_rounds
     ));
     assert!(
         centred.rank() > 0,
@@ -3821,19 +3855,31 @@ fn a_risk_set_centred_fit_reads_its_baseline_as_the_marginal_incidence() {
         !centred.reference_risk_mass.is_empty() && centred.reference_masks > 0,
         "the fit must publish the reference population's own risk mass"
     );
-    // The identity, read off the fitted intercept against the cohort's own
-    // crude rate. The tolerance is the sampling error of a rate from this
-    // many events, not a fudge: 3/√events is about three standard errors.
-    let tolerance = 3.0 / events.sqrt();
-    let relative = (centred_rate - crude).abs() / crude;
+    // The empirical hazard falls over follow-up, which is the selection the
+    // centring exists to account for.
     assert!(
-        relative < tolerance,
-        "risk-set centred baseline {centred_rate} against the crude rate {crude}: relative {relative} exceeds {tolerance}"
+        empirical[bins - 1] < 0.8 * empirical[0],
+        "the fixture's risk set must be visibly selected: {empirical:?}"
     );
-    // And the prior-centred intercept is the start-of-follow-up rate, which
-    // the same data put above the crude one.
+    // The centred baseline tracks it, bin by bin, within the sampling error
+    // of a rate from that bin's own events.
+    for b in 0..bins {
+        let tolerance = 4.0 / bin_events[b].sqrt();
+        let relative = (centred_rate[b] - empirical[b]).abs() / empirical[b];
+        assert!(
+            relative < tolerance,
+            "bin {b}: risk-set centred baseline {} against the empirical hazard {} (relative {relative} over {tolerance}, {} events)",
+            centred_rate[b],
+            empirical[b],
+            bin_events[b]
+        );
+    }
+    // The prior's centring reads the same surface as a rate over the cohort
+    // as it started, so in the late bins it sits above the risk set's own.
     assert!(
-        prior_rate > centred_rate,
-        "the prior's centring reads the intercept at the start of follow-up, above the marginal rate: {prior_rate} vs {centred_rate}"
+        prior_rate[bins - 1] > centred_rate[bins - 1],
+        "the prior's centring must sit above the late risk set's rate: {} vs {}",
+        prior_rate[bins - 1],
+        centred_rate[bins - 1]
     );
 }
