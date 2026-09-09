@@ -1,16 +1,313 @@
-## Unreleased
+## v0.3.155 — gam 0.3.155 / gamfit 0.1.265 (2026-09-06)
 
-- **Latent Gaussian REML uses one fixed coefficient frame and the core
-  adjoint** (#2833). Duchon latent designs preserve the polynomial constraint
-  frame across coordinate updates, so the supplied penalty and input-location
-  derivatives describe the same function. The backward and latent optimizer
-  now use the core REML derivative, removing duplicate Hessian factorizations
-  and score formulas. Removed `sigma_eff_mode`: its `fixed` and `profiled`
-  branches both used the forward's profiled dispersion.
-- **Flexible binomial fits preserve their response family when saved**
-  (#2748). The joint mean/link-warp producer records the resolved binomial
-  likelihood. Standard payload assembly rejects missing family metadata
-  instead of substituting Gaussian identity.
+The first release since `v0.3.154` (2026-09-02), four days later, and the
+largest thread through it is repair. Two commits three minutes apart on
+September 2 had removed 227,000 lines and 2,321 `#[test]` functions on a
+reachability criterion that is vacuously true of every `#[cfg(test)]` helper,
+taking 148 issue-pinned regressions with them and leaving nothing red at any
+point. All nine pins on open issues are back, rebuilt against production entry
+points rather than the test-only scaffolding a future sweep could prune again;
+the suite is up 9,909 → 10,109 tests and 1,236 → 1,409 issue-pinned names this
+cycle; and the loss is now measurable rather than invisible — a per-push
+inventory gate that floors the per-crate and per-issue counts, splits the
+`tests` tree into its integration binaries so one suite's deletion cannot be
+paid for by another's growth, and re-measures the original sweep on every run,
+beside a detector that refuses a `#[test]` reaching no assertion. In the same
+spirit, the wheel matrix's warm-cache gate turned out to be unsatisfiable by
+construction, which is why `gamfit` 0.1.264 never reached PyPI; it now measures
+whether rustc reached the compiler cache rather than whether the cache happened
+to be warm.
+
+Event histories are rebuilt twice over. The rank of the latent covariance is
+decided by the evidence's own prior — the atom's precision chosen from the
+covariance score by empirical Bayes under the quartic model `½ μ_i t² − ¼ J_i t⁴`
+along every eigen-direction, the atom accepted exactly when that prior puts the
+loading's posterior mode off zero — rather than by a ridge the engine could not
+drive to zero over a criterion unbounded below at the very boundary the decision
+is about. The rate is an unpenalised structural coordinate on a chart of the
+dimensionless `ν = r·T̄` over the band the cohort's breakpoints resolve, not a
+log-rate on a plateau with a vanishing gradient. `EventHistoryFit` reports the
+posterior-mean covariance with its eigenmodes' uncertainty, the participation
+ratio, the canonical-gauge loadings, and `latent_state`, every subject's
+smoothed `E[z_i(t) | history]` with its posterior covariance at every node,
+through Rust, Python and the CLI. Beneath that, the exactly-marginalised engine
+is restored — it returns intercept −0.15, loading 1.08, rate 0.27 on the shared
+80-subject fixture where the Laplace engine that briefly replaced it returned
++28.6, 8.26, 15264 and a forecast of 1.5×10¹² events — every forecast
+probability is a chronological integral, Louis' identity is accumulated in one
+forward sweep instead of an all-pairs node table with a dense `S × S` transfer
+per gap, marks are `recurrent`/`once`/`terminal` and enforced, and the fit
+certifies its own coefficients under refinement of both the quadrature and the
+mesh.
+
+Two deletions change published behaviour. The O(n⁻¹) frequentist bias
+correction is gone end to end: every credible band is now the posterior band of
+the posterior mean it is centred on, which on the Gaussian additive coverage
+gate moves a band that over-covered at 0.917 / 0.975 / 0.992 to a calibrated
+0.825 / 0.933 / 0.975 at nominal 0.80 / 0.90 / 0.95. With it go `gam predict`'s
+`--mode` and `--no-bias-correction`, and the plug-in estimate is published
+beside the posterior mean by name rather than reached through a switch.
+`--adaptive-regularization` and its `FitOptions` twin are deleted as well — an
+opt-in engine whose own request-side policy documented it as worse, carrying
+four hand-set boxes with it. On the Python side `sae_observe_atlas_topology`
+now returns its invariants under a mandatory branch, so a caller cannot read a
+manifold's signature off a cloud the orientation gate refused. Both are
+breaking; both are named as such in the entries below. The release stays on the
+`0.3` line, as every release since 0.3.0 has.
+
+The rest is measurement. On the large-scale CTN preprocessor a
+`ValueGradientHessian` outer evaluation goes from 422 s to 35 s once the joint
+Hessian's β-derivative operators assemble the weighted Gram their own header
+describes instead of streaming all `n` rows once per probe column; the
+feasibility verdict every active-set solve takes on every trial point — 92 % of
+the reduced-face solve's profile at 1.6 M rows — fans across the pool while
+still reporting the row the serial loop would have named; and the dense-product
+GPU dispatch diagnostic keeps one ring per thread after a frame-pointer profile
+put 19.5 % of a 16-thread run inside `record` and 14.8 % in `lock_contended`
+beneath it. The hybrid Duchon kernel is one certified radial profile per
+`(p, s, d)` rather than a 64-node rule per pair that was 1.0 % off at every
+distance and 100 % off at `ρ = 1000`. Hand-set boxes keep going: the
+full-conformal REML strength, the constant-curvature range solve and the
+survival smoothing search all run on the outer engine's certified search on its
+own derived domain, and another two dozen numerical floors become refusals,
+exact limits, or the arithmetic's own constant.
+
+Twenty-one of the twenty-four workspace crates carry content changes this
+cycle. `gam-report` and `gam-spec` do not and stay at 0.3.154, so the fleet's
+build caches keep them; `gam-test-support` moves only because it pins five
+crates that did.
+
+- **The regression suite the September 2 reachability sweep deleted is being
+  rebuilt, and a gate now measures what a sweep like it costs (#2818).**
+  `d484a091a` and `c0a21b554`, three minutes apart, removed 227,000 lines and
+  2,321 `#[test]` functions on the criterion "no production artifact links this
+  symbol" — which is vacuously true of every `#[cfg(test)]` helper, so the sweep
+  pruned test scaffolding and the second commit then deleted the tests that no
+  longer compiled. 148 of the 167 issue-pinned regressions it removed were still
+  absent at the last release, nine of them pinning open issues. All nine are
+  back, rebuilt against production entry points rather than the test-only
+  helpers a future sweep could prune again, and the census reads 9,909 → 10,109
+  tests and 1,236 → 1,409 issue-pinned names across this cycle. The instrument
+  is now permanent: `Test source integrity (#2818)` runs on every push and pull
+  request, floors the per-crate and per-issue inventory against
+  `docs/test-census-floor.json`, splits the `tests` tree into its integration
+  binaries so a deletion in one suite cannot be paid for by growth in another,
+  and re-measures `c0a21b554` itself on every run — a census that has stopped
+  detecting anything prints exactly what a census over a tree that lost nothing
+  prints. A second detector refuses a `#[test]` that reaches no assertion,
+  wired as a bidirectional ratchet against a 14-line ledger of `zz_measure`/
+  `probe` harnesses and re-measuring the #2110 incident every run.
+
+- **The block dictionary's support step descends the objective its frame and
+  γ steps descend (#2825, #2275).** `route_block_minibatch` ranked blocks by the
+  gate `‖P_g x‖` and took the top `k`. For the tied model `x̂ = γ Σ_{g∈S} P_g x`
+  that ranking is the exact minimiser only when the selected projectors are
+  mutually orthogonal, which an over-complete dictionary's blocks are not by
+  construction: the cross term the ranking omits is exactly what lets the top-`k`
+  support price worse than the one already held. Measured, one frame step lowered
+  RSS `10606.237 → 10300.318` at fixed support and re-routing returned it to
+  `10578.838` — 91 % of the gain given back, 85 of 512 rows changing support — so
+  the alternation was not a block-coordinate descent, had no fixed point to
+  reach, and a frame stationarity certificate had nothing to converge to. A row
+  now admits a candidate only while it lowers that row's loss, greedily, and
+  stops when none does; `k` becomes the cap it was always documented to be rather
+  than a quota. Every quantity is a function of the projectors, so the rule is
+  invariant to an `O(b)` change of basis inside a block and stays a pure function
+  of `(x, decoder, γ)` — the transform reproduces the training support exactly.
+  Three `K ≫ rank` fixtures that pinned "this fit legitimately cannot certify"
+  now certify against the same untouched `1e-6` tolerance: frame residual
+  `1.56e-2 → 1.123e-7`, `4.14e-3 → 9.444e-8`, `1.04e-4 → 2.558e-8`.
+
+- **The reduced Schur is equilibrated by `|S_aa|`, so the spectral PD floor
+  stops clamping the healthy subspace (#2822, #1026, #2015).**
+  `factor_dense_reduced_schur` scales by `sqrt(S_aa)` with a `1e-9` substitute
+  "so a numerically-empty diagonal entry never divides by ~0", and it read the
+  SIGNED diagonal. A collapsed reduced Schur carries a negative diagonal — that
+  is precisely the operator the #1026 spectral floor exists for — and a negative
+  entry fails `S_aa > 1e-18`, so it took the substitute. Dividing an entry of
+  magnitude `|S_aa|` by `1e-18` does not normalise it, it amplifies it by
+  eighteen decades, and the equilibration was therefore anti-equilibrating on
+  exactly the matrices that reach the floor. `spectral_pd_floored_schur` then
+  reads its relative floor off that inflated spectrum and clamps every eigenvalue
+  up to it, against its own contract that a well-separated positive direction
+  keeps its exact eigenvalue. On the `owed_1026` mixed-collapse geometry
+  `S = diag(+5, −99)`, whose healthy Newton component is exactly `2`, the signed
+  read returned `2.02e-12`.
+
+- **A startup refusal names the stage that caused it, not the one that reported
+  it (#2822, #2228).** `no candidate seeds passed outer startup validation` is
+  this repository's one forbidden runtime signature, and its headline pointed the
+  reader at seed generation. Its own counters two lines below often said
+  otherwise: measured on CI run 33941725421, six of the eight Python tests
+  carrying the refusal reported `generated=13, screened=13, exact_validated=13,
+  solver_started=0` with all thirteen rejected in the domain phase for the same
+  reason — every seed generated, screened and exact-validated, and nothing about
+  seeding failed. `format_no_seeds_passed` now adds one attribution line when the
+  counters say so unambiguously, and the tests pin its silence as well as its
+  speech: two distinct reasons in one category, `solver_started > 0`, an empty
+  rejection list, or a rejection list shorter than its own count each produce
+  nothing, because a summary that generalises from a prefix is worse than one
+  that is absent. The refusal, its counters, its structural diagnosis and its
+  per-seed list are unchanged; the line is additive.
+
+- **The PyPI wheel gate measures whether rustc reached the compiler cache, not
+  whether the cache happened to be warm (#2832).** Every wheel job refused
+  publication unless `sccache` reported a nonzero hit count. `release-pypi` is a
+  profile (fat LTO, one codegen unit, stripped) that nothing else in the repo
+  compiles, so its objects are shared with no other workflow, and the Actions
+  cache evicts entries unused for seven days while the wheel matrix is dispatched
+  only at release time — the floor was unsatisfiable on the first dispatch of any
+  release by construction. That is what stopped `gamfit` 0.1.264: run
+  33654645604 refused macOS, musllinux and Windows at `hits 0` with `errors 0`,
+  the previous release shipped only because eight dispatches were fired inside
+  two hours until one landed on a still-warm cache, and the version that did
+  reach PyPI got there out of band as a single `manylinux_2_31` wheel that will
+  not install on the glibc 2.28 cluster this workflow builds `manylinux2014` for.
+  The receipt now refuses `Compile requests == 0` — rustc never reached the
+  wrapper, which is the misconfiguration actually worth refusing and a real
+  hazard on the Docker route — keeps refusing an unparseable receipt and any
+  nonzero cache error, and records `hits == 0, misses > 0` as a cold run that
+  seeds the next release. `sccache --start-server` gets a bounded five-attempt
+  retry in all four lanes, so the transient `ServerBusy` 503 that took the
+  `linux (x86_64)` job (and, through `fail-fast`, three of its siblings) no
+  longer takes a release with it.
+
+- Of the three specialised binomial closed-form derivative towers in
+  `gamlss::binomial_q_derivs`, only the logit one was cross-checked against the generic
+  mu-jet path; probit had tail-limit tests only and cloglog had none. Each closed form is
+  now walked from its own loss up through `m1..m4` by five-point central difference, and
+  cloglog additionally gets the jet-path agreement test logit already had. Both closed
+  forms pass as written -- this closes an unwatched surface rather than fixing a defect. (#932)
+
+- The flex BMS row program's link-deviation basis sum is now one fused jet operation
+  (`RuntimeJetScalar::weighted_compose_sum`) rather than a per-coefficient
+  `compose_unary` + `multiply_add` loop that streamed `2*|w|` derivative blocks and
+  re-composed the same point each time. Measured 3.27x on the order-3 link-deviation
+  path at tier width 12, bringing its dynamic-vs-fixed ratio (1.09) onto the score
+  warp's (1.08), which was already a single fused operation. (#979, #932)
+
+- The Bernoulli marginal-slope ψ-cross accumulator takes its primary-space vector as a view, so the axis sweep no longer allocates a two-element `Array1` three times per axis pair per row across nine call sites (#979).
+
+- `gam-pyffi`'s FFI prelude re-exported `infer_and_encode_column_major` after `ab6008bc3`
+  deleted its only consumer, which fails `cargo check --workspace --all-targets` under
+  `-D warnings`. It went unseen because both `-D warnings` arms in `cross-check.yml` pass
+  `--exclude gam-pyffi`. (#979)
+
+- The Bernoulli marginal-slope batched outer gradient no longer returns a `trace_h_inv_hdot` short by the explicit Jeffreys ψ-curvature, which the reference hypercoord path carries in the drift's `dense` part and this path never added: it declines in that regime so the caller evaluates on the reference. Firth-inactive fits keep the fast path. The agreement gate had been red since 2026-07-31 at `rel = 4.132e-3` against `1e-10` (#979, #1607).
+
+- The Bernoulli marginal-slope ψ-cross rank-1 accumulator reads its two design rows into per-worker scratch instead of allocating and freeing two one-row matrices on every call; the ψ-hyper build makes that call three times per axis pair per row, and it was 6.9 % of the rigid arm's profile in `_int_malloc`/`_int_free` (#979).
+
+- The `SLS-MACRO-CODEGEN-932` timing cell in `gam-row-macros` compared the generated
+  location-scale program against a hand schedule that gated its `u1`/`g` terms on
+  `plan.u1.is_some()` -- the row's weight -- while the generated program gates on the
+  term's own coefficient stack. On a censored far-tail row with a zero stack the hand
+  formed `0 * inf` and returned NaN where the program returns a finite zero, so its
+  saving was the guard it was missing. The opponent now carries the program's contract
+  and `the_hand_carries_the_generated_programs_activity_contract_932` pins it. (#932)
+
+- A coefficient-mode profile whose candidates all refused the trial point now reports a trial-point refusal instead of `UnsupportedConfiguration`, so the outer search steps away instead of aborting the fit. On the large-scale CTN preprocessor a single `h' has non-positive values` refusal killed a 25-minute fit that already had a certified incumbent; one structural rejection among the candidates still keeps the whole profile structural (#979, #2553, #2590).
+
+- `Cargo.lock` resolves `numpy` against the workspace's own `ndarray 0.17.2` again: a re-resolution had flipped that one edge to `ndarray 0.16.1`, which left `gam-pyffi` with 945 compile errors (every `into_pyarray` / `from_owned_array` at the Python boundary) because the two crates no longer shared an `ArrayBase` type. No gate job builds the FFI crate, so nothing caught it (#2670).
+
+- The `SLS-ROW-VGH-932` speed cell's hand opponent gates each term on the term's coefficient stack, as production does, instead of on the row weight. The two predicates differ on a censored far-tail row whose stack is exactly zero while its weight is not, where the weight-gated schedule forms `0 * inf` and returns `NaN` in two gradient axes that production and the generic tower both return finite — so the opponent was cheaper by the guard it was missing. Against the corrected opponent production wins by ~9 % where it won by ~2 %, and `the_hand_carries_productions_activity_contract_932` pins the contract on that row (#932).
+
+- The feasibility sweep reads the factored cone's row norm and bound from slices instead of calling two `Result`-returning accessors per row that re-derive the row's carrier and slot, and the cone's constraint values are one `Ψ · B` matrix product instead of one `Array2::dot(&Array1)` per coupled slot. Together those were half of the sweep's remaining profile after it was parallelised (#979).
+
+- The library and Python survival prediction publish `survival_prob_plugin` beside `survival_prob`, the pair `gam predict` already prints: the posterior-mean path integrates that surface on its way to the mean and now reports it instead of discarding it (#2670).
+
+- `ConstraintSet::max_scaled_violation` — the feasibility verdict every active-set solve takes on every trial point — fans its rows across the pool instead of scanning them on one thread. On the large-scale CTN cone (1.6 M rows) a profile of the preprocessor's reduced-face solve put 92 % of the process inside this one function. The reduction carries the smallest terminal row rather than whichever thread reached one first, so the verdict, the row a refusal names and its text are what the serial loop produced (#979, #2721).
+
+- **Breaking (Python):** `sae_observe_atlas_topology` returns the atlas invariants under a mandatory branch — exactly one of `topology["named"]` (with `kind`) or `topology["refused"]` (with `reason`), each carrying the full invariant block — instead of a top-level `betti` / `euler_characteristic` beside an optional `refusal`. Reading the invariants without the verdict was not a hypothetical mistake: structureless Gaussian noise measures `b0=1, b1=0, b2=1, chi=2` here, the sphere row of the classification table, matching a planted sphere invariant for invariant, and is withheld only by the orientation-subcomplex gate — so the old shape let a caller read a manifold's signature off a cloud that is not a manifold. The invariants stay reachable in both arms because they are what a user debugging a refused cloud needs; what is gone is reading them without naming the case, which is now a `KeyError`. This matches the sibling surface `atlas_nerve_diagram`, which already gates its payload behind `computed`. The surface has no in-repo caller, no test and no `gamfit/` export, so nothing in the repository needed updating — a public FFI nothing calls or tests, which is its own small finding (#2280).
+
+- A backend that materializes its own dense curvature no longer refuses it to the active-constraint mode response: `MatrixFreeSpdOperator` inherited the "no dense form at all" default while `as_exact_dense_spectral` was handing that matrix out, and `FirstOrderTraceSkipOperator` refused it while its first-order-trace list was live. `try_tangent_projected_evaluate` turns that error into a REFUSED TRIAL POINT, so on the large-scale CTN preprocessor — whose cone constraints are active at nearly every trial — 52 of the outer search's 55 refused probes were this and not a numerical failure (#979).
+
+- The transformation-normal ψ-Hessian operator assembles the weighted Gram its own HVP describes, once per ψ axis per outer evaluation, and serves `B·v`, `B·F`, `tr(FᵀBF)` and the dense form from it; the five row-streaming kernels that each re-derived the same matrix per probe column are deleted. On the large-scale CTN preprocessor that path was 23 % of samples during a gradient evaluation and 50 % during a Hessian one, and a four-thread gradient evaluation goes from 17.7 s to 8.9 s (#979).
+
+- The order-2 row-program emitter writes only the channels a gate's term reaches. A mutable's union support made every gate restate the other terms' channels, as `channel = channel` where an earlier term had set one and as `channel = 0.0` where nothing had — most of the emitted body on a three-term row. Neither form can change a value; dropping them leaves the schedule computing what it computed and raises the generated-vs-hand ratio on the survival location-scale row from 1.036 to 1.085 on one node and from 1.129 to 1.138 on another (#932).
+
+- The transformation-normal joint Hessian's β-derivative operators (`D H[u]`, `D² H[u, v]`) assemble the weighted Gram their own module header describes, once per operator, and serve every action from it; they used to stream all `n` rows once per probe column, so the outer engine's full-rank projection cost `2 n p k` scalar multiply–adds on one thread. On the large-scale CTN preprocessor (`n = 320000`, `p = 144`) a `ValueGradientHessian` outer evaluation goes from 422 s to 35 s and the fit stops running on 1 of 128 cores (#979).
+
+- The explicit-ψ Jeffreys derivatives read one prepared snapshot spectrum. The reduced-information eigendecomposition is a property of `(H_info, Z_J)` and the ambient trace weights of that plus one ψ axis, but the ψ-hyper gradient rebuilt both inside its coefficient-axis loop — `axes × (1 + p)` eigendecompositions of a single matrix per gradient evaluation — and the ψψ pair callbacks rebuilt them once per PAIR. `JointJeffreysPlan::explicit_param_derivative` and `JeffreysPsiWeightCache` prepare each once, lazily, so a term an evaluation never arms still never touches the spectrum (#979).
+
+- The dense-product GPU dispatch diagnostic keeps one ring per thread instead of one process-wide `Mutex<VecDeque>`. Every `fast_ab` in the workspace passes through that seam, so on the #979 rigid marginal-slope arm at 16 threads a frame-pointer profile spent 19.5 % of the run inside `record` and 14.8 % in `lock_contended` beneath it, against 4.2 % in the Hessian accumulation it was observing; the arm's 40-minute wall carried 325 minutes of system time against 188 of user time. The recorded set is unchanged — every dispatch attempt, device-bound or not, and no ring is discarded when its thread ends (#979).
+
+- The process-wide Duchon radial profile cache stores its profiles in a static `OnceLock` array instead of leaking them, so the compile gate's ban scanner passes; a process may intern at most 64 distinct `(p, s, d)` shapes and the next one is refused rather than silently unbounded (#2670, #2735).
+
+- The survival time-basis smoothing-lambda refusal no longer points the user at `--time-smooth-lambda` / `time_smooth_lambda=`, neither of which exists; it names the seed's real provenance (`FitConfig::time_smooth_lambda`, saved as `survival_time_smooth_lambda`) (#2670).
+
+- `gam predict` on a survival model emits `std_error` / `mean_lower` / `mean_upper` only under `--uncertainty`: they used to ride along on every default prediction because the deleted `--mode posterior-mean` was itself the switch that built the uncertainty object (#2670, #2136).
+
+- The O(n⁻¹) frequentist bias correction is deleted end to end (`apply_bias_correction`, the `bias_correction_beta` / `bias_correction_jacobian` fit fields and their optimizer producers, the `A·V·Aᵀ` map on the smoothing-corrected covariance): every credible band is the posterior band of the posterior mean it is centred on. On the Gaussian additive coverage gate the de-shrunk default band over-covered (0.917 / 0.975 / 0.992 at nominal 0.80 / 0.90 / 0.95) while the posterior band is calibrated (0.825 / 0.933 / 0.975) (#2670).
+
+- `gam predict` no longer takes `--mode` or `--no-bias-correction`: the posterior mean is the one point estimand every surface reports, the plug-in prediction is published beside it by name (`survival_prob_plugin` on survival CSVs, `mean_plugin` on latent event-probability CSVs, as `mean_plugin` already was on the standard surface), and every band is centred on the posterior mean as the library's policy already did (#2670).
+
+- The joint Newton's trust region (via `opt`) treats a step as numerically neutral only when both the realized change and the model's predicted reduction are inside the objective's round-off floor; a resolvable prediction that realizes nothing is rejected, not accepted with `ρ = 1` (#2765).
+
+- A survival marginal-slope fit that estimated its parametric baseline chart is saved with the fitted chart instead of being refused for a missing `--baseline-scale`, and the fixed-λ refit from a certified outer optimum admits a curvature certificate the criterion contradicted (`criterion-contradicted`) as it admits a positive-semidefinite one; only inadmissible or unevaluated curvature is refused (#2765).
+
+- Exact coefficient-mode profiling (survival marginal-slope, bernoulli marginal-slope, transformation-normal) warm-starts every outer evaluation from the certified mode of the accepted outer iterate instead of a cold seed once the search has started; a refused or non-converged probe never becomes the start of the next one (#2765).
+
+- The inner P-IRLS objective band and the joint Newton's residual band carry the unit roundoff once (`accumulation_growth` already includes it), restoring the LM rejection floor and both decrement certificates; the survival LAML gate accepts a residual inside the residual's own rounding band, not only `1e-8` relative (#2668, #2812).
+
+- The multinomial predictive's augmented-mode Newton accepts only a strictly rising trial, so a solve whose remaining gain sits under the log-posterior's round-off converges to resolution instead of exhausting its hundred iterations on steps that change nothing (#2812).
+
+- The SAE manifold joint fit logs one phase clock per iteration, per entry-sweep round and for its setup, and five of its serial row passes (frame refresh, coordinate seeding, target-aware reconstruction, deflation candidates, coherence projections) now fan across the Rayon pool (#2731).
+
+- The custom-family joint Newton arms the exact Jeffreys second-order completion before any decrement certificate is taken (#2714); a slow-geometric-rate exit carries the ray it stalled on (`RayRestoration`), and the outer's seed evaluation restores a named seed by that ray's log-strength ratio before evaluating it again (#2695).
+
+- The penalty pseudo-log-determinant treats a coordinate no penalty block covers as structurally null whether or not a ridge is present, so its rank agrees with the penalized subspace the Hessian carries (#2454, #2760).
+
+- The SAE exact stationarity Hessian is assembled from one arrow probe per coordinate slot plus one per border column instead of one apply per column (#2267, #2731).
+
+- The joint Newton certificate is deferred to a negative-curvature escape only when that escape could lower the objective by more than its resolution within the trust radius (#2765).
+- The joint Newton's slow-geometric-rate exit is a typed terminal reason (`SlowGeometricRate`) whose text distinguishes slow contraction from no contraction (#2695).
+- The two 2705 box-constrained regression tests no longer share one fixture csv path per process (#2705).
+
+- The ψ-hyper build takes the ψ-Hessian directional derivative along every coefficient axis from one row sweep where the family provides it (marginal-slope rigid frame), instead of one sweep per axis (#979).
+
+- The blockwise coefficient loop's early exit and accept test use the objective's round-off slack instead of an absolute `1e-10` (#2469).
+
+- Survival marginal-slope fits with a follow-up-varying slope score trust-region trials on the follow-up-varying frame's likelihood; the value-only path previously read the time-constant closed form, so the slope's variation was invisible to the accept test (#2765).
+
+- `perf_scale` gains `grouped_binomial_sweep_2569`, the #2569 grouped-binomial shape rebuilt from synthetic data with per-fit wall time printed (#2569).
+
+- First-order dynamic jets fill each result once instead of zeroing and overwriting it, the same single-fill the second-order jets use (#979).
+
+- Custom-family inner solves on Firth-armed fits no longer ratchet the trust radius to its floor: the Jeffreys log-determinant's certified round-off (`JointJeffreysPlan::value_roundoff_bound`) is part of the objective-resolution ceiling, so the witness's measurement is admitted, and the row kernel's early exit uses the accept test's round-off slack instead of an absolute `1e-10` (#2695, #2718, #2748). A trial point where the Jeffreys information cannot be formed is refused instead of scored with `Φ = 0` (#2765).
+
+- The three remaining inline copies of the balanced penalty rule in `gam-terms` construction read `balanced_penalty_sum` / `balanced_penalty_rank_tolerance` (#2454).
+
+- The `support_real_chart` example takes `<max_outer_iter> <max_inner_iter>` instead of one shared `<max_iter>`, so an outer budget can be measured with a converged inner solve (#2576).
+
+- **The criterion's `log|S(λ)|₊` ranges over the same structural rank the
+  reparameterization's penalized subspace carries** (#2454). Two
+  λ-free rank rules decided how many directions one penalty set penalizes:
+  the reparameterization ranks the Frobenius-balanced sum `Σ S_k/‖S_k‖_F` at
+  `1e-12·max`, the pseudo-logdet's hint ranked the unweighted sum at
+  `100·p·ε·max`. A component whose norm is small against its neighbour's (a
+  double-penalty null-space term beside a Matérn range penalty) sat above one
+  cut and below the other, so the LAML pair kept an asymptotic slope of `½`
+  per unit ρ that no λ could cancel. `balanced_penalty_structural_rank` in
+  `gam_terms::construction` is now the one owner, used by the split and by
+  every criterion site. The iso-κ ladder of #2760 is measured unchanged by
+  this; its rails have another cause.
+
+- **The constrained joint Newton can form its active face** (#2695, #2714,
+  #2765). Measured on the survival location-scale 1569 pair: every seed was
+  refused with the QP listing one time-block row as active on every cycle
+  while the accepted face stayed empty, because a clipped step was retreated
+  one primal-feasibility tolerance (`1e-8`) off its blocking row, the face is
+  classified at `1e-10`, and an infeasible trial step was projected `1e-6`
+  into the interior — so the reduced-face Newton never ran and the ambient
+  trust step was clipped to `1e-22` of the proposal. A clipped step now lands
+  on its face; an infeasible trial is projected onto the cone in the trust
+  metric (`project_point_onto_constraint_set_in_metric`, returning the binding
+  rows); the cause-specific survival family clips against the same rows its QP
+  solves against. The Jeffreys/Firth term was measured not to be the
+  cause (the seeds stall with it disarmed); what remains on that pair — a
+  collapsed block trust radius that cannot grow, then an absolute stationarity
+  bar on a block whose curvature is nine orders above its neighbours' — is
+  recorded on #2695.
 
 - **Event histories: the rank of the latent covariance is decided by the
   evidence's own prior, the reported latent object is the posterior-mean
@@ -180,6 +477,37 @@
   docs describe the algorithm that exists: adaptive quadrature with a
   refinement certificate, not "exact".
 
+## v0.3.154 — gam 0.3.154 / gamfit 0.1.264 (2026-09-02)
+
+The first release since `v0.3.153` (2026-08-30), three days later, and two
+pieces of work carry it. Event histories become a family of their own: marked
+counting processes with smooth covariate and time effects per mark and a
+per-subject latent chain marginalised exactly by adaptive Gauss-Hermite
+filtering, a baseline that is the population-average intensity whatever the
+loadings, observed risk scores entering as penalised varying-coefficient
+surfaces, and forecasts at three tiers — population, score-only,
+history-conditioned. And the cone-truncated posterior's moment cubature is
+integrated in the Gibson-Glasbey-Elston order, tilted at Botev's exact saddle
+point by Newton on the analytic stationarity system, and stopped on the
+replicate standard error of eight shifted lattices, so the #979 preprocessor no
+longer converges and then refuses at a face it could not integrate.
+
+Around them: every live family's row log-likelihood is written once and its
+whole derivative tower derived from it, with 27 wall-clock gates asserting the
+compiled rows beat the hand kernels on every push (#932); a continuous `by=`
+smooth keeps its constant; explicit `k`, `BSpline(knots=K)` and periodic bases
+build the dimensions they name; a NaN penalty trace is refused instead of read
+as saturation; and the AIC ratio is called an evidence ratio, not a Bayes
+factor.
+
+Every workspace crate carries content changes this cycle, so all 24 move to
+0.3.154 together and `gam-pyffi`/`gamfit` to 0.1.264.
+
+The wheel matrix for this release failed on a transient GitHub Actions cache
+egress limit (`ServerBusy` from every `sccache --start-server`), so `gamfit`
+0.1.264 was built but never reached PyPI; its contents ship in the next
+`gamfit` release.
+
 - **A continuous `by=` smooth keeps its constant, and event-history forecasts
   have a population tier (#2805).** `s(x, by=z)` with a continuous `z` is the
   varying coefficient `f(x)·z`, whose constant direction is `z` itself and
@@ -310,15 +638,6 @@
   (`gam_linalg::anderson`) with the scalar relaxed step as the first-pass and
   post-reset fallback and the map's own residual norm as the safeguard. The
   n=1000 cell mints in 44 s (was a 290 s refusal); n=500 in 42 s (was 48 s).
-- **The composed-warp degree floor is the measured `C¹` degree, 4 (#2695).**
-  The floor had been raised to 5 on the reading that `∇Φ` consumes a
-  piecewise-constant `I⁗` at degree 4. Its own non-vacuity arm refused on MSI:
-  driving the production Jeffreys gradient across an event-row knot crossing,
-  the gap shrinks 99.5× for a 100× smaller straddle at degree 4 (and ≈100× at
-  5 and 6) and only 1.02× at degree 3. The required continuous basis order is
-  therefore 3, the floor is degree 4 again, the negative control measures
-  degree 3, and the ladder that produced the table (`knot_ladder_2695`) ships
-  as a fixture that prints it on every run.
 
 - **The composed-warp degree floor is the measured `C¹` degree, 4 (#2695).**
   The floor had been raised to 5 on the reading that `∇Φ` consumes a

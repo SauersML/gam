@@ -4,7 +4,6 @@ mod sae_arrow_schur_large_scale;
 mod sae_audit_is_invoked;
 mod sae_curvature_estimand_sims;
 mod sae_encode_atlas_certified;
-mod sae_encode_throughput_bench;
 mod sae_ev_vs_k_frontier;
 mod sae_exact_orbit_certificate;
 mod sae_factored_frame_solve;

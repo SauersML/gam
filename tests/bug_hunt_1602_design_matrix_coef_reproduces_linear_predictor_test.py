@@ -7,13 +7,13 @@ coefficients (``summary().coefficients``) are the penalized MLE / posterior mode
 But for curved inverse links (``prediction_uses_posterior_mean() == true``) the
 wiggle-free posterior-mean predict path reported a **bias-corrected** linear
 predictor ``η̂_BC = X @ (β̂ + b̂)`` with ``b̂ = H⁻¹S(β̂−μ)`` the O(1/n)
-frequentist bias-correction vector (``crates/gam-predict/src/standard.rs`` →
-``predict_gam_posterior_mean_from_backendwith_bc``). That broke the documented
+frequentist bias-correction vector (``crates/gam-predict/src/standard.rs``; the
+whole de-shrinkage was later deleted, #2670). That broke the documented
 ``docs/predictions.md`` affine-design contract and the
 ``offset + posterior.samples @ X.T`` recipe — by
 exactly ``X @ b̂`` (1.5–4 % of the lp range) for Poisson/Gamma ``log`` and
 binomial ``logit``/``probit``, while staying exact for the identity link (whose
-plug-in path deliberately sets ``apply_bias_correction: false``).
+plug-in path never applied it).
 
 The fix drops the bias correction from the reported ``linear_predictor`` so the
 identity holds for all links (and so the posterior-mean integral is correctly

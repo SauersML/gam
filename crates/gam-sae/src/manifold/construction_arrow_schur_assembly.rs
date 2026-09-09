@@ -426,7 +426,8 @@ impl SaeManifoldTerm {
             // #2560 — the term's own captured host reading, so this refusal
             // boundary is a property of the fit rather than of the box's
             // momentary free memory.
-            let budget_bytes = sae_host_in_core_budget_from_available(self.host_available_bytes);
+            let budget_bytes =
+                sae_host_in_core_budget_from_available(self.host_available_bytes);
             self.require_exact_dense_assignment_budget(budget_bytes)?;
         }
         // #974 likelihood-whitening seam. The single per-row decision: when the
@@ -1928,68 +1929,6 @@ impl SaeManifoldTerm {
         }
         if frames_engaged {
             // ── #972 / #977 T1 — FACTORED β-tier transform ──────────────────
-            if !sys.exact_beta_remainders.is_empty() {
-                let remainders = std::mem::take(&mut sys.exact_beta_remainders);
-                let projection = frame_projection.clone();
-                let theta_remainders = remainders.clone();
-                let theta_projection = projection.clone();
-                let mut fingerprint = gam_runtime::warm_start::Fingerprinter::new();
-                fingerprint.write_str("sae-framed-exact-beta-remainder-v1");
-                for remainder in &remainders {
-                    remainder.fingerprint(&mut fingerprint);
-                }
-                for (atom, frame) in projection.frames_owned().iter().enumerate() {
-                    fingerprint.write_usize(projection.basis_sizes[atom]);
-                    fingerprint.write_usize(projection.ranks[atom]);
-                    match frame {
-                        Some(frame) => {
-                            fingerprint.write_bool(true);
-                            fingerprint.write_f64_array2(frame);
-                        }
-                        None => fingerprint.write_bool(false),
-                    }
-                }
-                sys.exact_beta_remainders.push(
-                    gam_solve::arrow_schur::ExactBetaRemainder::new(
-                        projection.border_dim(),
-                        fingerprint.finish_u64(),
-                        move |direction, out| {
-                            let lifted = projection.lift_border_vec(ArrayView1::from(direction));
-                            let mut action = vec![0.0; lifted.len()];
-                            for remainder in &remainders {
-                                remainder.matvec(
-                                    lifted.as_slice().expect("owned lift is contiguous"),
-                                    &mut action,
-                                );
-                            }
-                            let projected =
-                                projection.project_border_vec(ArrayView1::from(action.as_slice()));
-                            for (value, &delta) in out.iter_mut().zip(projected.iter()) {
-                                *value += delta;
-                            }
-                        },
-                    )
-                    .with_theta_bilinear(move |exact, left, right, out| {
-                        let left = theta_projection.lift_border_vec(ArrayView1::from(left));
-                        let right = theta_projection.lift_border_vec(ArrayView1::from(right));
-                        let mut derivative = vec![0.0; left.len()];
-                        for owner in &theta_remainders {
-                            owner.theta_bilinear(
-                                exact,
-                                left.as_slice().expect("owned left lift is contiguous"),
-                                right.as_slice().expect("owned right lift is contiguous"),
-                                &mut derivative,
-                            )?;
-                        }
-                        let projected = theta_projection
-                            .project_border_vec(ArrayView1::from(derivative.as_slice()));
-                        for (value, &delta) in out.iter_mut().zip(projected.iter()) {
-                            *value += delta;
-                        }
-                        Ok(())
-                    }),
-                );
-            }
             //
             // The entire β-tier above was assembled in the full-`B` (p-wide)
             // layout: `sys.gb` is `g_B` (length `beta_dim`), `sys.hbb` carries
@@ -2236,6 +2175,16 @@ impl SaeManifoldTerm {
             if beta_penalty_assembly.dense_written {
                 ops.push(Arc::new(DensePenaltyOp(sys.hbb.clone())));
             }
+            // #1026/#2828 — the frozen-gate repulsion's PSD majorizer. On this
+            // lane `add_sae_decoder_repulsion` applied only the GRADIENT and
+            // marked `deferred_factored`, a mark that until now was consumed on
+            // the FRAMED lane alone (#1610), so the curvature was silently
+            // dropped here while its gradient was kept.
+            if beta_penalty_assembly.deferred_factored {
+                if let Some(op) = self.decoder_repulsion_majorizer_carrier_op(penalty_scale) {
+                    ops.push(Arc::new(op));
+                }
+            }
             // #1038/#2731 — the barrier's exact Gauss–Newton curvature, full-`B`
             // layout (no frame projection on the non-frames path). Already CPU (no
             // device data installed on the whitening path), so no extra fallback
@@ -2294,13 +2243,19 @@ impl SaeManifoldTerm {
                     }
                 })
                 .collect();
-            // #1038 — the device SAE PCG kernel folds only the per-atom scalar smooth
-            // blocks and the `G ⊗ I_p` data Gram; it cannot represent the barrier's
-            // cross-atom curvature. When that curvature fires (a co-collapsing
-            // dictionary), skip the device install so the solve falls back to the CPU
-            // reduced-Schur matvec, which routes `H_ββ` through the composite op below
-            // (the carrier included). Healthy fits install none and keep the device PCG.
-            if sep_curvature.is_empty() {
+            // #1038/#2828 — the device SAE PCG kernel folds only the per-atom scalar
+            // smooth blocks and the `G ⊗ I_p` data Gram; it cannot represent the
+            // barrier's cross-atom curvature, nor the repulsion's. When either fires
+            // (a co-collapsing / near-collinear dictionary), skip the device install so
+            // the solve falls back to the CPU reduced-Schur matvec, which routes `H_ββ`
+            // through the composite op below (both carriers included). Healthy fits
+            // install neither and keep the device PCG.
+            let repulsion_carrier = if beta_penalty_assembly.deferred_factored {
+                self.decoder_repulsion_majorizer_carrier_op(penalty_scale)
+            } else {
+                None
+            };
+            if sep_curvature.is_empty() && repulsion_carrier.is_none() {
                 self.install_device_sae_pcg_data(
                     &mut sys,
                     DeviceSaePcgData {
@@ -2323,6 +2278,13 @@ impl SaeManifoldTerm {
             }));
             if beta_penalty_assembly.dense_written {
                 ops.push(Arc::new(DensePenaltyOp(sys.hbb.clone())));
+            }
+            // #1026/#2828 — see the whitened lane above: the repulsion's PSD
+            // majorizer, carried matrix-free because this lane builds no dense
+            // `hbb`. Built above the device gate so the two cannot disagree about
+            // whether it fired.
+            if let Some(op) = repulsion_carrier {
+                ops.push(Arc::new(op));
             }
             // #1038/#2731 — barrier's exact Gauss–Newton curvature (full-`B`, no
             // projection).

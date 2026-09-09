@@ -131,6 +131,12 @@ env:
   # setup-rust-ci, so a cache outage degrades to a cold-but-green build instead
   # of a hard failure.
   SCCACHE_GHA_ENABLED: "true"
+  # THE SHARD FILTERSET, IN ONE PLACE. The `build` job lists the archive's test
+  # population through this filterset and the run-shards execute through it, and
+  # the aggregate asserts the two agree exactly. Two copies of the string would
+  # make a drift between them look like lost tests, so there is one copy. What
+  # it excludes and why is documented at the shard's run step.
+  NEXTEST_SHARD_FILTERSET: "not test(python_rust_ffi_parity_gaussian) and not binary(=quality)"
 
 jobs:
   # ---------------------------------------------------------------------------
@@ -284,6 +290,49 @@ jobs:
             fi
           fi
 
+      # THE POPULATION THAT SHOULD RUN, taken from the archive that was just
+      # built rather than from a number somebody typed (#2818).
+      #
+      # The aggregate job used to certify the shards against
+      # `MIN_WORKSPACE_TESTS = 558` -- the population of ONE regression binary,
+      # standing in for the whole workspace. Run 33946053992 published
+      # `Workspace tests run: 9458 (required floor: 558)`: 8,900 tests could have
+      # failed to execute under a floor that size and the ledger would still
+      # have said MEASURED. A floor cannot catch the failure that actually
+      # happens either -- one shard of ten OOM-killed loses a tenth, not a
+      # majority (run 30427042552 is the same shape one level up: build
+      # `success`, archive step out of disk, all ten shard logs empty).
+      #
+      # `nextest list` under the SAME profile and the SAME filterset as the
+      # shards is the exact set that should execute, so the aggregate can assert
+      # that the shards' run counts sum to it. No constant, and it stays correct
+      # as tests are added. `--list-type full` runs the prebuilt binaries with
+      # `--list`; it links nothing and cannot fail the compile surface.
+      #
+      # `|| true` plus the reducer's own exit status: a listing that could not be
+      # produced must leave the aggregate saying NOT MEASURED, not take down the
+      # build job that still has an archive to upload.
+      - name: List the archived test population
+        if: ${{ always() && steps.archive.outputs.archived == 'true' }}
+        shell: bash
+        run: |
+          set -uo pipefail
+          cargo nextest list \
+            --workspace --all-features --exclude gam-pyffi \
+            --config 'profile.test.debug=0' \
+            --profile ci --config-file .config/nextest.toml \
+            -E "$NEXTEST_SHARD_FILTERSET" \
+            --list-type full --message-format json > archive-listing.json 2>archive-listing.err || true
+          if [ -s archive-listing.json ]; then
+            python3 .github/scripts/nextest_summary.py \
+              --reduce-listing archive-listing.json \
+              --output archive-population.json || true
+          else
+            echo "::warning::cargo nextest list produced no archive listing; the workspace test population cannot be certified and the ledger will report NOT MEASURED."
+            tail -20 archive-listing.err || true
+          fi
+          exit 0
+
       # gam-pyffi unit tests need extension-module OFF so the harness links
       # libpython (host interpreter only present at import time for the real
       # extension). Archive it on its own so its tests still run; covers the
@@ -329,6 +378,7 @@ jobs:
           name: build-logs
           path: |
             archive-build.log
+            archive-population.json
           retention-days: 7
           if-no-files-found: warn
 
@@ -466,7 +516,7 @@ jobs:
             --partition "count:${{ matrix.shard }}/${{ needs.setup.outputs.total }}" \
             --no-fail-fast \
             --test-threads 1 \
-            -E 'not test(python_rust_ffi_parity_gaussian) and not binary(=quality)' \
+            -E "$NEXTEST_SHARD_FILTERSET" \
             2>&1 | tee "$log" || status="${PIPESTATUS[0]}"
           echo "nextest exit status: ${status}"
           # Surface this shard's own pass/fail in the matrix UI; the aggregate
@@ -668,15 +718,33 @@ jobs:
         run: |
           set -uo pipefail
           python3 - <<'PY'
-          import os, re, glob, sys
+          import json, os, re, glob, sys
           from pathlib import Path
 
           sys.path.insert(0, str(Path('.github/scripts').resolve()))
           from nextest_summary import (
+              ArchivePopulation,
               CoverageError,
-              MIN_WORKSPACE_TESTS,
               measure_workspace_test_population,
           )
+
+          # What SHOULD have run, as listed off the archive the build job made
+          # (#2818). Absent = the listing could not be produced, which is not a
+          # zero and not a pass: it is a population nobody can certify, and the
+          # coverage line below says so by name.
+          def read_expected_population():
+              found = sorted(set(glob.glob('agg/build/**/archive-population.json', recursive=True))
+                             | set(glob.glob('agg/build/archive-population.json')))
+              if not found:
+                  return None, ('the build job published no archive test listing, so the '
+                                'population that should have run is unknown')
+              try:
+                  with open(found[0], errors='replace') as handle:
+                      counts = json.load(handle)
+                  return ArchivePopulation(selected=int(counts['selected']),
+                                           runnable=int(counts['runnable'])), ''
+              except (OSError, ValueError, KeyError, TypeError) as exc:
+                  return None, f'the archive test listing could not be read: {exc}'
 
           ANSI = re.compile(r'\x1b\[[0-9;]*m')
           def strip(s): return ANSI.sub('', s)
@@ -835,15 +903,18 @@ jobs:
           # because a matrix cancelled after all uploads is still not a run
           # anyone should read as a verdict.
           expected_shards = int(os.environ.get('EXPECTED_SHARDS') or 0)
-          try:
-              workspace_population = measure_workspace_test_population(
-                  workspace_shard_logs,
-                  expected_shards=expected_shards,
-              )
-              workspace_population_error = ''
-          except CoverageError as exc:
-              workspace_population = None
-              workspace_population_error = str(exc)
+          archive_population, workspace_population_error = read_expected_population()
+          workspace_population = None
+          if archive_population is not None:
+              try:
+                  workspace_population = measure_workspace_test_population(
+                      workspace_shard_logs,
+                      expected_shards=expected_shards,
+                      archive=archive_population,
+                  )
+                  workspace_population_error = ''
+              except CoverageError as exc:
+                  workspace_population_error = str(exc)
           shards_incomplete = (
               expected_shards > 0 and len(workspace_shard_logs) < expected_shards
           )
@@ -935,12 +1006,14 @@ jobs:
                   return f'- {label}: **{measured}** ({n} seen in the shards that did run)'
               return f'- {label}: **{n}**'
           out.append(counter('Compile failures', len(compile_errs), False))
+          expected_detail = (f'{archive_population.runnable} runnable in the archive listing'
+                             if archive_population is not None
+                             else 'the archive population was never listed')
           if workspace_population is None:
-              out.append('- Workspace tests run: **NOT MEASURED** '
-                         f'(required floor: {MIN_WORKSPACE_TESTS})')
+              out.append(f'- Workspace tests run: **NOT MEASURED** ({expected_detail})')
           else:
               out.append(f'- Workspace tests run: **{workspace_population.total}** '
-                         f'(required floor: {MIN_WORKSPACE_TESTS})')
+                         f'(every one of the {expected_detail})')
           out.append(counter('Runtime test failures (FAIL/TIMEOUT/TERMINATING/LEAK)',
                              len(run_fails), True))
           if python_count_is_lower_bound:
@@ -963,7 +1036,8 @@ jobs:
               return f'- {label}: **{"MEASURED" if ok else "NOT MEASURED"}** ({detail})'
           out.append('Coverage:')
           population_detail = (
-              f'{workspace_population.total} tests, floor {MIN_WORKSPACE_TESTS}'
+              f'{workspace_population.total} tests, all {workspace_population.expected} '
+              f'the archive listing says are runnable'
               if workspace_population is not None
               else workspace_population_error or 'no certified population'
           )

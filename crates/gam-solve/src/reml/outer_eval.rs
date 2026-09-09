@@ -50,7 +50,7 @@ mod block_quadrature_correction;
 #[path = "gradient_hessian.rs"]
 mod gradient_hessian;
 #[path = "objective.rs"]
-mod objective;
+pub(crate) mod objective;
 #[path = "rail_face_limit.rs"]
 mod rail_face_limit;
 #[path = "state_caches.rs"]

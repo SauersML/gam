@@ -8,9 +8,7 @@ use gam_custom_family::{
     fit_custom_family_with_rho_prior,
 };
 
-use gam_solve::estimate::{
-    AdaptiveRegularizationOptions, FitOptions, FittedLinkState, UnifiedFitResult,
-};
+use gam_solve::estimate::{FitOptions, FittedLinkState, UnifiedFitResult};
 
 use crate::bms::{
     BernoulliMarginalSlopeFitResult, BernoulliMarginalSlopeTermSpec, DeviationBlockConfig,
@@ -61,7 +59,7 @@ use gam_data::{ColumnKindTag, DataSchema, SchemaColumn};
 use gam_solve::mixture_link::{state_from_beta_logisticspec, state_from_sasspec, state_fromspec};
 
 use gam_terms::smooth::{
-    AdaptiveRegularizationDiagnostics, CoefficientGroupSpec, LinearTermSpec,
+    CoefficientGroupSpec, LinearTermSpec,
     SpatialLengthScaleOptimizationOptions, StandardLatentCoordConfig, TermCollectionDesign,
     TermCollectionSpec,
 };

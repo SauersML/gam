@@ -41,13 +41,9 @@ fn print_multicoordinate_alo(alo: &gam_predict::SavedModelAloDiagnostics) {
 }
 
 pub(crate) fn run_diagnose(args: DiagnoseArgs) -> Result<(), String> {
-    // `diagnose` currently has exactly one implemented diagnostic: ALO. Rather
-    // than erroring with "only --alo is currently implemented for diagnose"
-    // when the user runs the bare subcommand, just run ALO. This is the
-    // useful default and matches user expectation that `gam diagnose` does
-    // SOMETHING (a smoke-test for the most common workflow). If/when more
-    // diagnostics land, this path can route based on explicit flags.
-    // (`args.alo` is intentionally ignored until other diagnostics land.)
+    // `diagnose` currently has exactly one diagnostic, ALO, so it is always
+    // run.  Do not expose a boolean that cannot alter this behavior: the old
+    // `--alo` flag was a silent no-op.
 
     reject_multinomial_model(&args.model, "diagnose")?;
     let model = SavedModel::load_from_path(&args.model)?;

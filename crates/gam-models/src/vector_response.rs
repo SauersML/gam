@@ -843,4 +843,41 @@ mod tests {
             "eta[0,0] must be finite",
         );
     }
+
+    /// gam#932. A non-finite optimizer state arrives at the vector likelihood
+    /// as DATA, not as a bug in the caller: the row loop must refuse it with the
+    /// offending index named, rather than panicking or returning a NaN
+    /// objective that the line search would then read as an improvement.
+    ///
+    /// The historical fixture built the likelihood through a `from_target`
+    /// convenience constructor that no longer exists. The contract does not
+    /// live there — it lives in the shared input validation every
+    /// `VectorLikelihood` row entry point runs — so the likelihood is built
+    /// from its public fields directly, which is also the shape the optimizer
+    /// hands it.
+    #[test]
+    fn vector_likelihood_rejects_nonfinite_optimizer_state_without_panicking_932() {
+        let likelihood = GaussianVectorLikelihood {
+            precision: Array1::from(vec![1.0, 1.0]),
+            factor: None,
+            row_weights: None,
+        };
+        let response = Array2::from_shape_vec((1, 2), vec![0.0, 0.0]).expect("response shape");
+        // Positive control: the same fixture with a finite state is evaluated,
+        // so the refusal below is about the NaN and not about this fixture
+        // failing to reach the validation at all.
+        let finite = Array2::from_shape_vec((1, 2), vec![0.0, 0.0]).expect("finite eta shape");
+        let value = likelihood
+            .log_lik(finite.view(), response.view())
+            .expect("a finite optimizer state must be evaluated");
+        assert!(
+            value.is_finite(),
+            "the finite control must produce a finite objective, got {value}"
+        );
+        let eta = Array2::from_shape_vec((1, 2), vec![0.0, f64::NAN]).expect("eta shape");
+        expect_invalid_input!(
+            likelihood.log_lik(eta.view(), response.view()),
+            "eta[0,1] must be finite",
+        );
+    }
 }

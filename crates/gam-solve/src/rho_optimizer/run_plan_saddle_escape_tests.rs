@@ -781,9 +781,6 @@ fn well_evaluation_error(rho: &Array1<f64>) -> f64 {
 /// `objective_resolution` of `1e-7` (deepest trial: `-6.6e-8`), so the original
 /// acceptance path is not what this test exercises.
 const WELL_EVALUATION_ERROR: f64 = 3.0e-8;
-/// The resolution the well's criterion declares to the outer engine (#2812):
-/// every ladder rung of the escape lands within it.
-const DECLARED_WELL_RESOLUTION: f64 = 1.0e-7;
 
 /// How fast the error term varies in `ρ₁`. A power of two so the arithmetic is
 /// exact, and large enough that consecutive ladder rungs — which halve — see
@@ -851,7 +848,7 @@ fn a_descent_below_the_criterion_resolution_is_not_an_escape_2612() {
         .map(|r1| unresolvable_well_cost(&array![0.0, r1]))
         .fold(f64::INFINITY, f64::min);
     assert!(
-        deepest_trial > -DECLARED_WELL_RESOLUTION,
+        deepest_trial > -1.0e-7,
         "no ladder rung may beat the DECLARED objective resolution, or the escape fires \
          through the pre-#2748 path: deepest trial={deepest_trial:.6e}"
     );
@@ -866,18 +863,13 @@ fn a_descent_below_the_criterion_resolution_is_not_an_escape_2612() {
             seed_budget: 1,
             ..Default::default()
         });
-    // #2812: the well's criterion declares its resolution — the evaluation
-    // error it is built with sits below `DECLARED_WELL_RESOLUTION`, which is
-    // the band the escape must not out-resolve.
-    let mut obj = problem
-        .build_objective(
-            (),
-            |_: &mut (), rho: &Array1<f64>| Ok(unresolvable_well_cost(rho)),
-            |_: &mut (), rho: &Array1<f64>| Ok(unresolvable_well_eval(rho)),
-            None::<fn(&mut ())>,
-            None::<fn(&mut (), &Array1<f64>) -> Result<EfsEval, EstimationError>>,
-        )
-        .with_criterion_resolution(|_: &mut ()| Some(DECLARED_WELL_RESOLUTION));
+    let mut obj = problem.build_objective(
+        (),
+        |_: &mut (), rho: &Array1<f64>| Ok(unresolvable_well_cost(rho)),
+        |_: &mut (), rho: &Array1<f64>| Ok(unresolvable_well_eval(rho)),
+        None::<fn(&mut ())>,
+        None::<fn(&mut (), &Array1<f64>) -> Result<EfsEval, EstimationError>>,
+    );
     let result = audit_stationary_point(&mut obj, array![0.0, 0.0], "unresolvable-well #2612")
         .expect(
             "a point whose only available descent is below the criterion's own resolution must \

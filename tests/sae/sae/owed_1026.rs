@@ -32,7 +32,7 @@ use ndarray::{Array1, Array2, array};
 
 use gam::solver::arrow_schur::{
     ArrowSchurError, ArrowSchurSystem, ArrowSolveOptions, BetaPenaltyOp,
-    solve_arrow_newton_step_with_options,
+    SPECTRAL_DEFLATION_REL_FLOOR, solve_arrow_newton_step_with_options,
 };
 use gam::terms::latent::LatentManifold;
 use gam::terms::{
@@ -317,8 +317,23 @@ fn spectral_floor_preserves_healthy_subspace_under_mixed_collapse_1026() {
     sys.gb[1] = 0.7;
     sys.refresh_row_hessian_fingerprint();
 
-    let mut floored = ArrowSolveOptions::direct();
-    floored.newton_schur_tikhonov_rel_floor = Some(1.0e-8);
+    // The Newton Tikhonov floor and the EVIDENCE policy are two independent
+    // decisions — `ArrowEvidencePolicy`'s own contract is that neither "is
+    // permitted to alter the Newton system or its Tikhonov floor" — and
+    // `solve_arrow_newton_step_with_options` is the FULL EVIDENCE entry: after
+    // the step it rebuilds the UNDAMPED reduced Schur under
+    // `options.evidence_policy` to carry `log|H|`. Here that undamped operator
+    // is the same indefinite `diag(+5, −99)`, so a `Strict` evidence policy
+    // cannot factor it and the call fails even though the floored Newton step
+    // exists. Every SAE production assembly site pairs the two floors at the
+    // same relative floor (`construction_quasi_laplace.rs`:
+    // `.with_newton_schur_tikhonov(F).with_evidence_unit_deflation(F)`), so the
+    // fixture is pinned to that pairing rather than to a combination no caller
+    // builds. The unpaired combination is not left undocumented: the control at
+    // the end of this test holds it to its real, refusing contract.
+    let floored = ArrowSolveOptions::direct()
+        .with_newton_schur_tikhonov(SPECTRAL_DEFLATION_REL_FLOOR)
+        .with_evidence_unit_deflation(SPECTRAL_DEFLATION_REL_FLOOR);
     let (_delta_t, delta_beta, _cache) =
         solve_arrow_newton_step_with_options(&sys, 0.0, 0.0, &floored)
             .expect("mixed-collapse floored solve must succeed");
@@ -337,6 +352,22 @@ fn spectral_floor_preserves_healthy_subspace_under_mixed_collapse_1026() {
         "collapsed β direction must yield a finite (minimally-damped) step; got {}",
         delta_beta[1]
     );
+
+    // Control for the pairing above: the Newton floor ALONE must not be read as
+    // buying an evidence factor. The step is available, but the UNDAMPED
+    // evidence Schur is still indefinite and `Strict` refuses it — as it must,
+    // because a `log|H|` read off a non-PD operator has no value. This is the
+    // contract that made the unpaired form fail; asserting it keeps the pairing
+    // above from looking like a cosmetic option tweak.
+    let newton_floor_only =
+        ArrowSolveOptions::direct().with_newton_schur_tikhonov(SPECTRAL_DEFLATION_REL_FLOOR);
+    match solve_arrow_newton_step_with_options(&sys, 0.0, 0.0, &newton_floor_only) {
+        Err(ArrowSchurError::SchurFactorFailed { .. }) => {}
+        other => panic!(
+            "the Newton Tikhonov floor must not silently supply an evidence factor for an \
+             indefinite UNDAMPED Schur; got {other:?}"
+        ),
+    }
 }
 
 /// #1026 — the reduced-Schur spectral PD-floor (the SAE co-collapse SOLVE-path
@@ -344,10 +375,12 @@ fn spectral_floor_preserves_healthy_subspace_under_mixed_collapse_1026() {
 /// indefinite, the solve must (a) REFUSE with `SchurFactorFailed` under the
 /// default options (no floor) — reproducing the non-PD abort that forces the LM
 /// loop to inflate `ridge_β` and the inner Newton to crawl — and (b) SUCCEED
-/// with a finite step once the floor is engaged, because the floor lifts only
-/// the collapsed eigen-directions to a small positive stiffness. A regression
-/// that dropped the floor (or never wired it on the SAE path) fails (b); a
-/// regression that floored a HEALTHY system fails (a).
+/// with a finite step once the floors are engaged in the pairing production
+/// builds, because the Newton floor lifts only the collapsed eigen-directions to
+/// a small positive stiffness. Arm (c) shows which half of that pairing is
+/// load-bearing for the STEP. A regression that dropped the Newton floor (or
+/// never wired it on the SAE path) fails (b) and (c); a regression that floored
+/// a HEALTHY system fails (a).
 #[test]
 fn reduced_schur_tikhonov_recovers_indefinite_collapse_1026() {
     let sys = indefinite_collapsed_schur_system(0.01, 1.0, 1.0);
@@ -367,9 +400,17 @@ fn reduced_schur_tikhonov_recovers_indefinite_collapse_1026() {
         ),
     }
 
-    // (b) Floor engaged: a finite step on the conditioned (PD-floored) Schur.
-    let mut floored = ArrowSolveOptions::direct();
-    floored.newton_schur_tikhonov_rel_floor = Some(1.0e-8);
+    // (b) Floors engaged, in the pairing production actually builds. The Newton
+    // Tikhonov floor conditions the STEP's reduced Schur; the evidence unit
+    // deflation conditions the separate UNDAMPED reduced Schur this entry point
+    // rebuilds for `log|H|`. They are independent by design
+    // (`ArrowEvidencePolicy`), so the Newton floor alone leaves the evidence
+    // factorization strict and the whole call refuses — see the control in
+    // `spectral_floor_preserves_healthy_subspace_under_mixed_collapse_1026`.
+    // Every SAE assembly site sets both at `SPECTRAL_DEFLATION_REL_FLOOR`.
+    let floored = ArrowSolveOptions::direct()
+        .with_newton_schur_tikhonov(SPECTRAL_DEFLATION_REL_FLOOR)
+        .with_evidence_unit_deflation(SPECTRAL_DEFLATION_REL_FLOOR);
     let (delta_t, delta_beta, _cache) =
         solve_arrow_newton_step_with_options(&sys, 0.0, 0.0, &floored)
             .expect("spectral PD-floor must convert the non-PD refusal into a usable step");
@@ -392,6 +433,22 @@ fn reduced_schur_tikhonov_recovers_indefinite_collapse_1026() {
         step_norm > 0.0,
         "PD-floored solve must take a genuine (non-zero) step, not stall at zero"
     );
+
+    // (c) The Newton floor is the load-bearing half of (b), demonstrated rather
+    // than asserted by comment: evidence unit deflation ALONE — which conditions
+    // only the undamped `log|H|` operator — leaves the STEP's reduced Schur
+    // strict, so the same geometry still refuses. Without this arm a regression
+    // that dropped `newton_schur_tikhonov_rel_floor` while leaving the evidence
+    // policy in place could not be told apart from a healthy solve.
+    let evidence_deflation_only =
+        ArrowSolveOptions::direct().with_evidence_unit_deflation(SPECTRAL_DEFLATION_REL_FLOOR);
+    match solve_arrow_newton_step_with_options(&sys, 0.0, 0.0, &evidence_deflation_only) {
+        Err(ArrowSchurError::SchurFactorFailed { .. }) => {}
+        other => panic!(
+            "evidence unit deflation must not condition the NEWTON step's reduced Schur; \
+             the indefinite geometry must still refuse without the Tikhonov floor, got {other:?}"
+        ),
+    }
 }
 
 /// #1026 — the floor is a strict NO-OP on a healthy (PD) reduced Schur: a

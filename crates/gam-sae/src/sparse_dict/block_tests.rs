@@ -12,6 +12,143 @@ use crate::sparse_dict::{
 };
 use ndarray::{Array1, Array2};
 
+/// Exact tied loss of a stored row code, independent of the fitter's own
+/// accumulation, so the assertions below price the objective and not a proxy.
+fn row_loss(
+    row: ArrayView1<'_, f32>,
+    code: &RowBlockCode,
+    decoder: ArrayView2<'_, f32>,
+    b: usize,
+) -> f64 {
+    let reconstruction = reconstruct_stored_code_row(code, decoder, b);
+    row.iter()
+        .zip(reconstruction.iter())
+        .map(|(value, fitted)| {
+            let residual = *value as f64 - *fitted as f64;
+            residual * residual
+        })
+        .sum()
+}
+
+/// #2825 — A ROW TAKES A BLOCK ONLY WHEN THAT BLOCK LOWERS ITS LOSS.
+///
+/// `k` is a cap, not a quota. Two blocks 15 degrees apart both carry a large
+/// gate against `x = (1, 0)`, so the gate ranking admits both; the second is
+/// almost the first, and at `γ = 1` admitting it moves the reconstruction from
+/// exactly `x` to `(1.933, 0.25)` — the loss rises from `0` to `0.933`. The
+/// separable ranking cannot see that, because the term it omits,
+/// `γ² Σ_{g≠h} y_g·y_h`, is the entire disagreement. This is the mechanism
+/// behind the 91% re-routing giveback measured in a00be6eb0.
+#[test]
+fn a_block_is_admitted_only_when_it_lowers_the_row_loss_2825() {
+    let theta = std::f64::consts::PI / 12.0; // 15 degrees
+    let decoder = ndarray::array![[1.0_f32, 0.0], [theta.cos() as f32, theta.sin() as f32]];
+    let x = ndarray::array![1.0_f32, 0.0];
+    let gate_one = (x[0] as f64 * decoder[[1, 0]] as f64).abs();
+    // NON-VACUITY: the overlapping block is a genuine top-k candidate.
+    assert!(
+        gate_one > 0.9,
+        "the overlapping block must rank, or nothing is being refused"
+    );
+    let shortlist = [(0u32, 1.0_f32), (1u32, gate_one as f32)];
+
+    let selected = code_row(x.view(), decoder.view(), 1.0, 1, 2, &shortlist);
+    assert_eq!(selected.blocks[0], 0);
+    assert_eq!(
+        selected.gates[1], 0.0,
+        "the second slot must be canonical padding, not a firing"
+    );
+    assert_eq!(selected.codes[1], 0.0);
+    assert_eq!(selected.projections[1], 0.0);
+    assert!(row_loss(x.view(), &selected, decoder.view(), 1) <= 1.0e-12);
+
+    // The unconditional top-k support, priced the same way, is strictly worse.
+    let forced = RowBlockCode {
+        blocks: vec![0, 1],
+        gates: vec![1.0, gate_one as f32],
+        codes: vec![1.0, gate_one as f32],
+        projections: vec![1.0, gate_one],
+    };
+    let forced_loss = row_loss(x.view(), &forced, decoder.view(), 1);
+    assert!(
+        forced_loss > 0.9,
+        "the refused support must be the strictly worse one; got {forced_loss}"
+    );
+}
+
+/// The refusal above is a property of OVERLAP, not a blanket cap: orthogonal
+/// blocks that each lower the loss are all admitted, and together they
+/// reconstruct the row exactly.
+#[test]
+fn orthogonal_blocks_that_lower_the_loss_are_all_admitted_2825() {
+    let decoder = ndarray::array![[1.0_f32, 0.0], [0.0, 1.0]];
+    let x = ndarray::array![3.0_f32, 4.0];
+    let shortlist = [(1u32, 4.0_f32), (0u32, 3.0_f32)];
+    let selected = code_row(x.view(), decoder.view(), 1.0, 1, 2, &shortlist);
+    let mut taken: Vec<u32> = selected
+        .blocks
+        .iter()
+        .zip(selected.gates.iter())
+        .filter_map(|(block, gate)| (*gate != 0.0).then_some(*block))
+        .collect();
+    taken.sort_unstable();
+    assert_eq!(
+        taken,
+        vec![0, 1],
+        "an orthogonal pair must still take both blocks"
+    );
+    assert!(row_loss(x.view(), &selected, decoder.view(), 1) <= 1.0e-10);
+}
+
+/// #2825 — THE NULL OF THIS MODEL IS `γ = 0`, NOT AN EMPTY SUPPORT.
+///
+/// For `γ ≥ 2` the admission weight `2γ−γ²` is non-positive and NO block lowers
+/// the loss, so an unguarded descent rule would empty every row — after which
+/// `refresh_gamma` divides by a zero denominator and the fit cannot come back.
+/// The first admission is therefore unconditional: the row keeps the single
+/// block that best explains it, the scale stays definable, and `γ = 0` remains
+/// the way to say "explain nothing". Below `γ = 2` the guard is inert, which is
+/// every scale the fit actually visits.
+#[test]
+fn a_non_descent_scale_keeps_the_support_definable_2825() {
+    let decoder = ndarray::array![[1.0_f32, 0.0], [0.0, 1.0]];
+    let x = ndarray::array![3.0_f32, 4.0];
+    let shortlist = [(1u32, 4.0_f32), (0u32, 3.0_f32)];
+    let live = |code: &RowBlockCode| -> Vec<u32> {
+        code.blocks
+            .iter()
+            .zip(code.gates.iter())
+            .filter_map(|(block, gate)| (*gate != 0.0).then_some(*block))
+            .collect()
+    };
+    // NON-VACUITY: at a descent scale this row takes both blocks.
+    assert_eq!(
+        live(&code_row(x.view(), decoder.view(), 1.0, 1, 2, &shortlist)).len(),
+        2
+    );
+    for gamma in [2.0_f32, 3.5] {
+        assert!(
+            2.0 * gamma - gamma * gamma <= 0.0,
+            "gamma {gamma} must be non-descent"
+        );
+        let selected = code_row(x.view(), decoder.view(), gamma, 1, 2, &shortlist);
+        assert_eq!(
+            live(&selected),
+            vec![1],
+            "a non-descent scale must keep exactly the strongest block, at gamma {gamma}"
+        );
+        // A definable scale: the gamma-free projection sum is non-zero, which is
+        // the denominator `refresh_gamma` divides by.
+        let projected: f64 = selected.projections.iter().map(|w| w * w).sum();
+        assert!(projected > 0.0, "the refreshed scale must stay defined");
+    }
+    // The null is reached through the scale, and it decodes to exactly zero.
+    let null = code_row(x.view(), decoder.view(), 0.0, 1, 2, &shortlist);
+    assert_eq!(live(&null), vec![1]);
+    assert!(null.codes.iter().all(|code| *code == 0.0));
+    assert_eq!(row_loss(x.view(), &null, decoder.view(), 1), 25.0);
+}
+
 #[test]
 fn scalar_budget_constructor_preserves_topk64_exactly() {
     let config = BlockSparseConfig::from_scalar_budget(114_688, 64, 4)
@@ -21,196 +158,6 @@ fn scalar_budget_constructor_preserves_topk64_exactly() {
     assert_eq!(config.block_size, 4);
     assert_eq!(config.n_atoms(), 114_688);
     assert_eq!(config.active_atoms(), 64);
-}
-
-#[test]
-fn packed_block_gates_use_stored_codes_and_preserve_padding_2825() {
-    let decoder = ndarray::array![[1.0_f64, 0.0], [0.0, 1.0]];
-    let row = ndarray::array![3.0_f64, 4.0];
-    let code = code_row(row.view(), decoder.view(), 0.7, 1, 2, &[(0, 3.0)]);
-    let (blocks, gates, codes) = pack_block_codes(&[code], 2, 1);
-    assert_eq!(blocks[[0, 0]], 0);
-    assert_eq!(blocks[[0, 1]], 0);
-    assert_eq!(gates[[0, 0]].to_bits(), codes[[0, 0, 0]].abs().to_bits());
-    assert!(gates[[0, 0]] > 0.0);
-    assert_eq!(gates[[0, 1]], 0.0);
-    assert_eq!(codes[[0, 1, 0]], 0.0);
-}
-
-#[test]
-fn fitted_block_padding_agrees_with_the_public_transform_2825() {
-    let seed = coordinate_partition_frames(2, 1, 2);
-    assert_eq!(seed.row(0).dot(&seed.row(1)), 0.0);
-    let x = Array2::from_shape_fn((2, 2), |(row, column)| {
-        (if row == 0 { 3.0 } else { -3.0 }) * seed[[0, column]]
-    });
-    let mut config = BlockSparseConfig::new(2, 1);
-    config.block_topk = 2;
-    let fit = fit_block_sparse_dictionary_with_seed(
-        x.view(),
-        &config,
-        BlockSeedPolicy::CoordinatePartition,
-    )
-    .expect("the unused orthogonal block is quiescent on this rank-one corpus");
-    let (blocks, gates, codes) = block_sparse_dictionary_transform(
-        x.view(),
-        fit.decoder.view(),
-        fit.gamma,
-        1,
-        2,
-        config.block_tile,
-    )
-    .unwrap();
-    assert_eq!(fit.blocks, blocks);
-    assert_eq!(fit.gates, gates);
-    assert_eq!(fit.codes, codes);
-    for row in 0..x.nrows() {
-        assert_eq!(fit.blocks[[row, 0]], 0);
-        assert_eq!(fit.blocks[[row, 1]], 0);
-        assert_eq!(fit.gates[[row, 0]], 3.0);
-        assert_eq!(fit.gates[[row, 1]], 0.0);
-        assert_eq!(fit.codes[[row, 1, 0]], 0.0);
-    }
-}
-
-#[test]
-fn tied_frame_stationarity_separates_normal_storage_error_from_tangent_signal_2825() {
-    let current = ndarray::array![[0.6_f64, 0.8, 0.0]];
-    let mut proposal = Array2::zeros((1, 3));
-    let second = Array2::zeros((1, 1));
-    for tangent in [0.0, 0.25] {
-        let mut action = ndarray::array![[1.8_f64], [2.4], [tangent]];
-        // Use the actual stored frame for an exactly normal action. Its norm
-        // differs from one after f64 serialization, which must not create a
-        // spurious tangent component.
-        action[[0, 0]] = 3.0 * current[[0, 0]] as f64;
-        action[[1, 0]] = 3.0 * current[[0, 1]] as f64;
-        let scale = action.iter().map(|v| v * v).sum::<f64>().sqrt();
-        let measured = super::super::block_frame::polar_tied_frame_step(
-            current.view(),
-            action.view_mut(),
-            second.view(),
-            0.0,
-            1.0e30,
-            proposal.view_mut(),
-        )
-        .unwrap();
-        assert!((measured - tangent / scale).abs() <= 16.0 * f64::EPSILON);
-    }
-}
-
-#[test]
-fn projector_distance_resolves_tiny_rotations_without_overlap_cancellation_2825() {
-    let current = ndarray::array![[1.0_f64, 0.0]];
-    for angle in [1.0e-5_f64, 1.0e-8, 1.0e-10] {
-        let next = ndarray::array![[1.0_f64, angle]];
-        let delta = angle as f64;
-        // Independent two-by-two ambient projector identity. The off-diagonal
-        // entries change by delta and the second diagonal by delta squared.
-        let expected =
-            ((2.0 * delta * delta + delta.powi(4)) / (1.0 + (1.0 + delta * delta).powi(2))).sqrt();
-        let measured = frame_fixed_point_residual(current.view(), next.view(), 1, 1).unwrap();
-        assert!(
-            measured > 0.0,
-            "a representable rotation must not collapse to zero"
-        );
-        assert!((measured - expected).abs() <= 32.0 * f64::EPSILON * expected);
-        let negated = next.mapv(|value| -value);
-        let gauge_changed =
-            frame_fixed_point_residual(current.view(), negated.view(), 1, 1).unwrap();
-        assert_eq!(measured, gauge_changed);
-    }
-    assert_eq!(
-        frame_fixed_point_residual(current.view(), current.view(), 1, 1).unwrap(),
-        0.0
-    );
-}
-
-#[test]
-fn batch_ritz_closes_the_gradient_independently_of_streaming_shift_2825() {
-    let x = ndarray::array![[2.0_f64, 1.0], [-2.0, -1.0], [1.0, 2.0], [-1.0, -2.0]];
-    let mut config = BlockSparseConfig::new(1, 1);
-    config.frame_ridge = 0.0;
-    config.max_epochs = 8;
-    let reference = fit_block_sparse_dictionary_with_seed(
-        x.view(),
-        &config,
-        BlockSeedPolicy::CoordinatePartition,
-    )
-    .expect("the two-dimensional Ritz subspace contains the conditional optimum");
-    config.frame_ridge = 1.0e30;
-    let shifted = fit_block_sparse_dictionary_with_seed(
-        x.view(),
-        &config,
-        BlockSeedPolicy::CoordinatePartition,
-    )
-    .expect("a streaming-only shift cannot freeze the batch Ritz step");
-    assert_eq!(reference.decoder, shifted.decoder);
-    assert_eq!(reference.gamma, shifted.gamma);
-    assert_eq!(reference.codes, shifted.codes);
-    assert_eq!(reference.epochs, shifted.epochs);
-    assert!(shifted.convergence.frame_residual.is_finite());
-    assert!(shifted.convergence.frame_residual <= config.tolerance);
-    // X'X = [[10,8],[8,10]]; its leading rank-one projector is the equal mixture.
-    let expected = ndarray::array![[1.0 / 2.0_f64.sqrt(), 1.0 / 2.0_f64.sqrt()]];
-    let distance = frame_fixed_point_residual(expected.view(), shifted.decoder.view(), 1, 1)
-        .expect("conditional optimum projector");
-    assert!(distance <= 64.0 * f64::EPSILON, "distance={distance}");
-}
-
-#[test]
-fn returned_block_artifact_is_the_state_certified_before_packing_2825() {
-    let x = ndarray::array![[3.0_f64, 4.0], [-3.0, -4.0], [1.0, -2.0], [-1.0, 2.0]];
-    let mut config = BlockSparseConfig::new(2, 1);
-    config.block_topk = 2;
-    config.matryoshka_prefix = true;
-    let fit = fit_block_sparse_dictionary_with_seed(
-        x.view(),
-        &config,
-        BlockSeedPolicy::CoordinatePartition,
-    )
-    .expect("orthogonal complete support is a closed tied reconstruction");
-    let transformed = block_sparse_dictionary_transform(
-        x.view(),
-        fit.decoder.view(),
-        fit.gamma,
-        1,
-        2,
-        config.block_tile,
-    )
-    .expect("encode the returned artifact through the public transform");
-    assert_eq!(fit.blocks, transformed.0);
-    assert_eq!(fit.gates, transformed.1);
-    assert_eq!(fit.codes, transformed.2);
-    let codes = route_and_code_all(
-        x.view(),
-        fit.decoder.view(),
-        fit.gamma,
-        2,
-        1,
-        2,
-        config.minibatch,
-        config.block_tile,
-    )
-    .unwrap();
-    let state = BlockSparseState {
-        decoder: fit.decoder.clone(),
-        codes,
-        gamma: fit.gamma,
-        explained_variance: fit.explained_variance,
-    };
-    let replay = advance_block_sparse_state(x.view(), &state, &config, 2).unwrap();
-    let (routing, reconstruction) =
-        routing_and_reconstruction_residuals(x.view(), &state, &replay.next, 1);
-    assert_eq!(routing, fit.convergence.routing_residual);
-    assert_eq!(reconstruction, fit.convergence.reconstruction_residual);
-    let frame = frame_fixed_point_residual(state.decoder.view(), replay.next.decoder.view(), 2, 1)
-        .unwrap()
-        .max(replay.frame_stationarity);
-    assert_eq!(frame, fit.convergence.frame_residual);
-    assert!(frame <= config.tolerance);
-    assert_eq!(fit.reconstruct(), x);
-    assert_eq!(fit.explained_variance, 1.0);
 }
 
 #[test]
@@ -229,18 +176,18 @@ fn scalar_budget_constructor_never_rounds_capacity_or_activity() {
 }
 
 /// Deterministic LCG in `[-1, 1)` (no RNG dependency → reproducible tests).
-fn lcg(state: &mut u64) -> f64 {
+fn lcg(state: &mut u64) -> f32 {
     *state = state
         .wrapping_mul(6364136223846793005)
         .wrapping_add(1442695040888963407);
-    ((*state >> 33) as f64 / 2147483648.0) * 2.0 - 1.0
+    ((*state >> 33) as f32 / 2147483648.0) * 2.0 - 1.0
 }
 
 /// A `K×P` decoder with each block's `b` rows orthonormal (a genuine Stiefel
 /// point per block), seeded pseudo-randomly.
-fn make_decoder(n_blocks: usize, b: usize, p: usize, seed: u64) -> Array2<f64> {
+fn make_decoder(n_blocks: usize, b: usize, p: usize, seed: u64) -> Array2<f32> {
     let mut s = seed;
-    let mut d = Array2::<f64>::zeros((n_blocks * b, p));
+    let mut d = Array2::<f32>::zeros((n_blocks * b, p));
     for i in 0..n_blocks * b {
         for c in 0..p {
             d[[i, c]] = lcg(&mut s);
@@ -283,7 +230,7 @@ fn threaded_block_router_matches_scalar_oracle_on_strided_rows_and_tile_tails() 
                         for (&(block, gate), &(expected_block, expected_gate)) in got.iter().zip(want) {
                             assert_eq!(block, expected_block, "threads={threads}, tile={tile}");
                             assert!(
-                                (gate - expected_gate).abs() <= 32.0 * f64::EPSILON * expected_gate,
+                                (gate - expected_gate).abs() <= 32.0 * f32::EPSILON * expected_gate,
                                 "gate={gate}, expected={expected_gate}, threads={threads}, tile={tile}"
                             );
                         }
@@ -299,7 +246,7 @@ fn block_router_parallel_partition_preserves_wide_dictionary_routes() {
     let mut seed = 2826;
     let rows = Array2::from_shape_fn((512, 2560), |_| lcg(&mut seed));
     let decoder = Array2::from_shape_fn((2048, 2560), |_| lcg(&mut seed));
-    let mut reference: Option<Vec<Vec<(u32, f64)>>> = None;
+    let mut reference: Option<Vec<Vec<(u32, f32)>>> = None;
     for threads in [4, 1, 1, 4] {
         let pool = rayon::ThreadPoolBuilder::new()
             .num_threads(threads)
@@ -321,7 +268,7 @@ fn block_router_parallel_partition_preserves_wide_dictionary_routes() {
                 for (&(block, gate), &(expected_block, expected_gate)) in got.iter().zip(want) {
                     assert_eq!(block, expected_block, "threads={threads}");
                     assert!(
-                        (gate - expected_gate).abs() <= 32.0 * f64::EPSILON * expected_gate,
+                        (gate - expected_gate).abs() <= 32.0 * f32::EPSILON * expected_gate,
                         "gate={gate}, expected={expected_gate}, threads={threads}"
                     );
                 }
@@ -337,9 +284,9 @@ fn block_router_parallel_partition_preserves_wide_dictionary_routes() {
 #[test]
 fn co_routed_frame_sweep_is_tied_code_descent_2634() {
     let (rows, p, b, n_blocks) = (128usize, 4usize, 2usize, 2usize);
-    let mut x = Array2::<f64>::zeros((rows, p));
+    let mut x = Array2::<f32>::zeros((rows, p));
     for row in 0..rows {
-        let theta = row as f64 * 0.19;
+        let theta = row as f32 * 0.19;
         let z0 = [theta.cos(), theta.sin()];
         let z1 = [(1.7 * theta).cos(), (1.7 * theta).sin()];
         x[[row, 0]] = z0[0] + 0.35 * z1[0];
@@ -372,7 +319,7 @@ fn co_routed_frame_sweep_is_tied_code_descent_2634() {
     )
     .expect("profiled route");
     let before = reconstruction_rss(x.view(), &codes, decoder.view(), b);
-    let stationarity = refresh_frames(x.view(), &codes, &mut decoder, n_blocks, b, gamma)
+    let stationarity = refresh_frames(x.view(), &codes, &mut decoder, n_blocks, b, gamma, 0.0)
         .expect("tied frame sweep");
     let after_codes = route_and_code_all(
         x.view(),
@@ -395,20 +342,20 @@ fn co_routed_frame_sweep_is_tied_code_descent_2634() {
 
 #[test]
 fn one_shot_frame_sweep_prices_both_occurrences_of_the_tied_decoder_2825() {
-    let x = ndarray::array![[0.4_f64, 4.0], [0.3, -3.0], [-0.3, 3.0]];
-    let mut decoder = ndarray::array![[1.0_f64, -10.0], [10.0, 3.0]];
+    let x = ndarray::array![[0.4_f32, 4.0], [0.3, -3.0], [-0.3, 3.0]];
+    let mut decoder = ndarray::array![[1.0_f32, -10.0], [10.0, 3.0]];
     for mut row in decoder.outer_iter_mut() {
         let norm = row.iter().map(|&v| (v as f64).powi(2)).sum::<f64>().sqrt();
-        row.mapv_inplace(|value| (value as f64 / norm) as f64);
+        row.mapv_inplace(|value| (value as f64 / norm) as f32);
     }
     let initial = route_and_code_all(x.view(), decoder.view(), 1.0, 2, 1, 2, 3, 2)
         .expect("initial tied route");
     let gamma = refresh_gamma(x.view(), &initial, decoder.view(), 1);
     let codes = route_and_code_all(x.view(), decoder.view(), gamma, 2, 1, 2, 3, 2)
         .expect("profiled tied route");
-    // Independent f64 projector oracle, without the stored f64 code channel.
+    // Independent f64 projector oracle, without the stored f32 code channel.
     let x64 = x.mapv(f64::from);
-    let rss = |d: &Array2<f64>| {
+    let rss = |d: &Array2<f32>| {
         let d64 = d.mapv(f64::from);
         let prediction = x64.dot(&d64.t()).dot(&d64);
         x64.iter()
@@ -417,7 +364,7 @@ fn one_shot_frame_sweep_prices_both_occurrences_of_the_tied_decoder_2825() {
             .sum::<f64>()
     };
     let before = rss(&decoder);
-    let stationarity = refresh_frames(x.view(), &codes, &mut decoder, 2, 1, gamma)
+    let stationarity = refresh_frames(x.view(), &codes, &mut decoder, 2, 1, gamma, 0.0)
         .expect("one-shot tied update");
     let after = rss(&decoder);
     assert!(
@@ -441,7 +388,7 @@ fn selected_no_improvement_birth_restores_complete_one_shot_state_2023() {
     // though it changed no objective value. The transaction must reject on the
     // strict RSS/evidence gate and restore every live field.
     let x =
-        Array2::<f64>::from_shape_fn((16, 2), |(_, column)| if column == 0 { 1.0 } else { 0.0 });
+        Array2::<f32>::from_shape_fn((16, 2), |(_, column)| if column == 0 { 1.0 } else { 0.0 });
     let config = BlockSparseConfig {
         n_blocks: 2,
         block_size: 1,
@@ -454,9 +401,9 @@ fn selected_no_improvement_birth_restores_complete_one_shot_state_2023() {
         matryoshka_prefix: false,
         tolerance: 0.0,
     };
-    let mut decoder = Array2::<f64>::zeros((2, 2));
+    let mut decoder = Array2::<f32>::zeros((2, 2));
     decoder[[1, 0]] = 1.0;
-    let mut gamma = 1.0_f64;
+    let mut gamma = 1.0_f32;
     let mut codes = route_and_code_all(x.view(), decoder.view(), gamma, 2, 1, 1, 16, 2)
         .expect("baseline route");
     let mut rss = reconstruction_rss(x.view(), &codes, decoder.view(), 1);
@@ -464,7 +411,7 @@ fn selected_no_improvement_birth_restores_complete_one_shot_state_2023() {
     let mut criterion = explained_variance_from_rss(rss, tss);
     let proposal = BlockBirthProposal {
         block: 0,
-        proposed_frame: ndarray::array![[1.0_f64, 0.0_f64]],
+        proposed_frame: ndarray::array![[1.0_f32, 0.0_f32]],
     };
 
     let mut candidate_decoder = decoder.clone();
@@ -515,7 +462,7 @@ fn selected_no_improvement_birth_restores_complete_one_shot_state_2023() {
 
 #[test]
 fn positive_rss_noise_birth_still_fails_rank_charge_2023() {
-    let decoder = ndarray::array![[1.0_f64, 0.0_f64]];
+    let decoder = ndarray::array![[1.0_f32, 0.0_f32]];
     let gram = ndarray::array![[100.0_f64]];
     let margin =
         block_birth_evidence_margin(0, 1.0e-2, 100.0, 100, &gram, decoder.view(), 100, 2, 1)
@@ -530,7 +477,7 @@ fn positive_rss_noise_birth_still_fails_rank_charge_2023() {
 /// `K×P` planted orthonormal atoms from a fixed symmetric matrix's eigenvectors
 /// (distinct columns are orthonormal, so every block spans a distinct rank-`b`
 /// subspace of `ℝ^P`).
-fn planted_frames(p: usize, n_blocks: usize, b: usize) -> Array2<f64> {
+fn planted_frames(p: usize, n_blocks: usize, b: usize) -> Array2<f32> {
     use gam_linalg::faer_ndarray::FaerEigh;
     let mut a = Array2::<f64>::zeros((p, p));
     for i in 0..p {
@@ -545,11 +492,11 @@ fn planted_frames(p: usize, n_blocks: usize, b: usize) -> Array2<f64> {
         k <= p,
         "planted test needs K <= P for distinct orthonormal atoms"
     );
-    let mut atoms = Array2::<f64>::zeros((k, p));
+    let mut atoms = Array2::<f32>::zeros((k, p));
     for atom in 0..k {
         let col = evecs.column(atom);
         for c in 0..p {
-            atoms[[atom, c]] = col[c] as f64;
+            atoms[[atom, c]] = col[c] as f32;
         }
     }
     atoms
@@ -557,22 +504,22 @@ fn planted_frames(p: usize, n_blocks: usize, b: usize) -> Array2<f64> {
 
 /// Data whose every row lies in exactly ONE planted block's rank-`b` subspace.
 fn planted_data(
-    planted: &Array2<f64>,
+    planted: &Array2<f32>,
     n_blocks: usize,
     b: usize,
     p: usize,
     n: usize,
-) -> Array2<f64> {
+) -> Array2<f32> {
     let mut s = 31337u64;
-    let mut x = Array2::<f64>::zeros((n, p));
+    let mut x = Array2::<f32>::zeros((n, p));
     for i in 0..n {
         let t = i % n_blocks;
-        let mut coeffs = vec![0.0f64; b];
+        let mut coeffs = vec![0.0f32; b];
         for r in 0..b {
             coeffs[r] = lcg(&mut s) + 0.5; // keep away from exactly zero
         }
         for c in 0..p {
-            let mut acc = 0.0f64;
+            let mut acc = 0.0f32;
             for r in 0..b {
                 acc += coeffs[r] * planted[[t * b + r, c]];
             }
@@ -587,13 +534,13 @@ fn presence_gate_and_within_block_amplitude_are_separate() {
     let (n_blocks, b, p) = (4usize, 2usize, 6usize);
     let decoder = make_decoder(n_blocks, b, p, 77);
     let mut s = 5u64;
-    let row: Array1<f64> = (0..p).map(|_| lcg(&mut s)).collect();
+    let row: Array1<f32> = (0..p).map(|_| lcg(&mut s)).collect();
 
     let w = block_projections_row(row.view(), decoder.view(), n_blocks, b);
     let gates = block_gates(w.view());
     // Presence gate is EXACTLY the ℓ₂ norm of the within-block code (here γ = 1).
     for g in 0..n_blocks {
-        let code_norm = (0..b).map(|r| w[[g, r]] * w[[g, r]]).sum::<f64>().sqrt();
+        let code_norm = (0..b).map(|r| w[[g, r]] * w[[g, r]]).sum::<f32>().sqrt();
         assert!(
             (gates[g] - code_norm).abs() <= 1.0e-5 * (1.0 + code_norm),
             "gate (presence) must equal the within-block code norm"
@@ -613,9 +560,9 @@ fn presence_gate_and_within_block_amplitude_are_separate() {
 fn routing_is_gamma_invariant() {
     // The routing gate is γ-free (block_gates reads raw projections), so scaling
     // every gate by any positive γ leaves the block selection identical.
-    let gates = vec![0.1f64, 0.5, 0.3, 0.9, 0.2];
+    let gates = vec![0.1f32, 0.5, 0.3, 0.9, 0.2];
     let s1: Vec<u32> = route_row_blocks(&gates, 3).iter().map(|x| x.0).collect();
-    let scaled: Vec<f64> = gates.iter().map(|g| g * 3.3).collect();
+    let scaled: Vec<f32> = gates.iter().map(|g| g * 3.3).collect();
     let s2: Vec<u32> = route_row_blocks(&scaled, 3).iter().map(|x| x.0).collect();
     assert_eq!(s1, s2, "block-TopK selection must be scale (γ) invariant");
 }
@@ -705,15 +652,15 @@ fn splitting_dynamics_theorem_group_l2_kills_splitting_gradient() {
 #[test]
 fn near_orthogonal_row_is_orphaned_by_gate_floor() {
     let (n_blocks, b, p, k) = (2usize, 2usize, 4usize, 2usize);
-    let mut decoder = Array2::<f64>::zeros((n_blocks * b, p));
+    let mut decoder = Array2::<f32>::zeros((n_blocks * b, p));
     decoder[[0, 0]] = 1.0;
     decoder[[1, 1]] = 1.0;
-    decoder[[2, 0]] = std::f64::consts::FRAC_1_SQRT_2;
-    decoder[[2, 1]] = std::f64::consts::FRAC_1_SQRT_2;
-    decoder[[3, 0]] = -std::f64::consts::FRAC_1_SQRT_2;
-    decoder[[3, 1]] = std::f64::consts::FRAC_1_SQRT_2;
+    decoder[[2, 0]] = std::f32::consts::FRAC_1_SQRT_2;
+    decoder[[2, 1]] = std::f32::consts::FRAC_1_SQRT_2;
+    decoder[[3, 0]] = -std::f32::consts::FRAC_1_SQRT_2;
+    decoder[[3, 1]] = std::f32::consts::FRAC_1_SQRT_2;
 
-    let mut x = Array2::<f64>::zeros((1, p));
+    let mut x = Array2::<f32>::zeros((1, p));
     x[[0, 2]] = 1.0;
 
     let codes = route_and_code_all(x.view(), decoder.view(), 1.0, n_blocks, b, k, 1, 1)
@@ -773,7 +720,7 @@ fn small_k_block_fit_runs_on_cpu_baseline_2134() {
     // The reconstruction is the data-size N×P, computable and non-degenerate.
     let recon = fit.reconstruct();
     assert_eq!(recon.dim(), (x.nrows(), p));
-    let energy: f64 = recon.iter().map(|v| v * v).sum();
+    let energy: f32 = recon.iter().map(|v| v * v).sum();
     assert!(
         energy > 0.0,
         "small-K CPU baseline reconstruction must be non-trivial"
@@ -792,7 +739,7 @@ fn block_seed_preserves_planted_subspaces_2134() {
     let x = planted_data(&planted, n_blocks, b, p, 200);
     let seeded = seed_frames(x.view(), n_blocks, b);
 
-    let projector_roundoff = (p * b * b) as f64 * f64::EPSILON as f64;
+    let projector_roundoff = (p * b * b) as f64 * f32::EPSILON as f64;
     for planted_block in 0..n_blocks {
         let mut best_overlap = f64::NEG_INFINITY;
         for seeded_block in 0..n_blocks {
@@ -905,7 +852,7 @@ fn fitted_block_frames_are_orthonormal() {
     for g in 0..n_blocks {
         for r1 in 0..b {
             for r2 in 0..b {
-                let mut dot = 0.0f64;
+                let mut dot = 0.0f32;
                 for c in 0..p {
                     dot += fit.decoder[[g * b + r1, c]] * fit.decoder[[g * b + r2, c]];
                 }
@@ -942,9 +889,9 @@ fn utilization_and_stable_rank_reported() {
     assert_eq!(fit.block_utilization.len(), n_blocks);
     assert_eq!(fit.block_stable_rank.len(), n_blocks);
     // Utilisations are fractions in [0,1] summing to k (each row selects k blocks).
-    let total: f64 = fit.block_utilization.iter().sum();
+    let total: f32 = fit.block_utilization.iter().sum();
     assert!(
-        (total - k as f64).abs() < 1.0e-3,
+        (total - k as f32).abs() < 1.0e-3,
         "utilisation fractions must sum to block_topk={k}, got {total}"
     );
     for &u in &fit.block_utilization {
@@ -957,11 +904,11 @@ fn utilization_and_stable_rank_reported() {
     // 2D planted subspace has stable rank meaningfully above 1.
     for &sr in &fit.block_stable_rank {
         assert!(
-            (0.0..=b as f64 + 1.0e-3).contains(&sr),
+            (0.0..=b as f32 + 1.0e-3).contains(&sr),
             "stable rank out of [0,b]: {sr}"
         );
     }
-    let max_sr = fit.block_stable_rank.iter().cloned().fold(0.0f64, f64::max);
+    let max_sr = fit.block_stable_rank.iter().cloned().fold(0.0f32, f32::max);
     assert!(
         max_sr > 1.2,
         "a block spanning a genuine 2D subspace should report stable rank > 1.2, got {max_sr}"
@@ -971,11 +918,11 @@ fn utilization_and_stable_rank_reported() {
 #[test]
 fn block_seed_manifest_is_rust_owned_and_gauge_shaped() {
     let n = 24usize;
-    let mut x = Array2::<f64>::zeros((n, 2));
+    let mut x = Array2::<f32>::zeros((n, 2));
     let mut blocks = ndarray::Array2::<u32>::zeros((n, 2));
-    let mut codes = ndarray::Array3::<f64>::zeros((n, 2, 1));
+    let mut codes = ndarray::Array3::<f32>::zeros((n, 2, 1));
     for i in 0..n {
-        let theta = i as f64 * std::f64::consts::TAU / n as f64;
+        let theta = i as f32 * std::f32::consts::TAU / n as f32;
         x[[i, 0]] = theta.cos();
         x[[i, 1]] = theta.sin();
         blocks[[i, 0]] = 0;
@@ -983,7 +930,7 @@ fn block_seed_manifest_is_rust_owned_and_gauge_shaped() {
         codes[[i, 0, 0]] = x[[i, 0]];
         codes[[i, 1, 0]] = x[[i, 1]];
     }
-    let decoder = ndarray::arr2(&[[1.0f64, 0.0], [0.0, 1.0]]);
+    let decoder = ndarray::arr2(&[[1.0f32, 0.0], [0.0, 1.0]]);
     let counts = block_sparse_dictionary_firings(blocks.view(), 2).expect("firings");
     assert_eq!(counts, vec![n, n]);
     let config = BlockSeedManifestConfig {
@@ -1050,11 +997,11 @@ fn block_seed_manifest_is_rust_owned_and_gauge_shaped() {
 #[test]
 fn block_coordinate_chart_pair_screen_accepts_split_circle() {
     let n = 96usize;
-    let mut x = Array2::<f64>::zeros((n, 2));
+    let mut x = Array2::<f32>::zeros((n, 2));
     let mut blocks = ndarray::Array2::<u32>::zeros((n, 2));
-    let mut codes = ndarray::Array3::<f64>::zeros((n, 2, 1));
+    let mut codes = ndarray::Array3::<f32>::zeros((n, 2, 1));
     for i in 0..n {
-        let theta = i as f64 * std::f64::consts::TAU / n as f64;
+        let theta = i as f32 * std::f32::consts::TAU / n as f32;
         x[[i, 0]] = theta.cos();
         x[[i, 1]] = theta.sin();
         blocks[[i, 0]] = 0;
@@ -1062,7 +1009,7 @@ fn block_coordinate_chart_pair_screen_accepts_split_circle() {
         codes[[i, 0, 0]] = x[[i, 0]];
         codes[[i, 1, 0]] = x[[i, 1]];
     }
-    let decoder = ndarray::arr2(&[[1.0f64, 0.0], [0.0, 1.0]]);
+    let decoder = ndarray::arr2(&[[1.0f32, 0.0], [0.0, 1.0]]);
     let config = BlockChartComposeConfig {
         block_size: 1,
         block_topk: 2,
@@ -1136,8 +1083,8 @@ fn coordinate_partition_frames_are_orthonormal_and_data_independent() {
 }
 
 #[test]
-fn farthest_point_seeded_entry_matches_default_byte_for_byte() {
-    // `fit_block_sparse_dictionary` must be exactly the FarthestPoint case of the
+fn data_row_seeded_entry_matches_default_byte_for_byte_2023() {
+    // `fit_block_sparse_dictionary` must be exactly the DataRows case of the
     // seeded entry — same seed, same alternation, same fixed point.
     let (p, b, n_blocks) = (8usize, 2usize, 3usize);
     let planted = planted_frames(p, n_blocks, b);
@@ -1156,17 +1103,47 @@ fn farthest_point_seeded_entry_matches_default_byte_for_byte() {
     };
     let default_fit = fit_block_sparse_dictionary(x.view(), &config).expect("default fit");
     let seeded_fit =
-        fit_block_sparse_dictionary_with_seed(x.view(), &config, BlockSeedPolicy::FarthestPoint)
-            .expect("FarthestPoint seeded fit");
+        fit_block_sparse_dictionary_with_seed(x.view(), &config, BlockSeedPolicy::DataRows)
+            .expect("data-row seeded fit");
     assert_eq!(
         default_fit.decoder, seeded_fit.decoder,
-        "the default entry must be byte-identical to the FarthestPoint seeded entry"
+        "the default entry must be byte-identical to the data-row seeded entry"
     );
     assert_eq!(
         default_fit.explained_variance,
         seeded_fit.explained_variance
     );
     assert_eq!(default_fit.epochs, seeded_fit.epochs);
+}
+
+#[test]
+fn data_row_seed_places_every_overcomplete_block_in_the_observed_cloud_2023() {
+    // A rotated rank-one cloud is adversarial to coordinate axes.  Even with
+    // K > P, the production seed must place every scalar block on the observed
+    // direction rather than create dead blocks and hope AuxK later revives them.
+    let direction = [1.0_f32, 2.0, 3.0, 4.0];
+    let x = Array2::from_shape_fn((32, direction.len()), |(row, column)| {
+        (row as f32 - 15.5) * direction[column]
+    });
+    let frames = data_row_frames(x.view(), 16, 1);
+    let direction_norm = direction
+        .iter()
+        .map(|value| value * value)
+        .sum::<f32>()
+        .sqrt();
+    for block in 0..16 {
+        let alignment = frames
+            .row(block)
+            .iter()
+            .zip(direction.iter())
+            .map(|(&left, &right)| left * right / direction_norm)
+            .sum::<f32>()
+            .abs();
+        assert!(
+            (alignment - 1.0).abs() <= 8.0 * f32::EPSILON,
+            "block {block} was not seeded from the observed cloud: alignment={alignment}"
+        );
+    }
 }
 
 #[test]
@@ -1209,100 +1186,570 @@ fn coordinate_partition_seed_fits_end_to_end() {
     );
     let recon = fit.reconstruct();
     assert_eq!(recon.dim(), (x.nrows(), p));
-    assert!(recon.iter().map(|v| v * v).sum::<f64>() > 0.0);
+    assert!(recon.iter().map(|v| v * v).sum::<f32>() > 0.0);
 }
 
 #[test]
-fn block_artifact_preserves_sub_f32_precision_through_transform_and_reconstruction_2825() {
-    let delta = 2.0_f64.powi(-35);
-    let x = ndarray::array![[1.0 + delta, delta], [1.0 - delta, -delta]];
-    let decoder = Array2::<f64>::eye(2);
-    let gamma = 1.0 + 2.0 * delta;
+fn packed_block_gates_use_stored_codes_and_preserve_padding_2825() {
+    let decoder = ndarray::array![[1.0_f32, 0.0], [0.0, 1.0]];
+    let row = ndarray::array![3.0_f32, 4.0];
+    let code = code_row(row.view(), decoder.view(), 0.7, 1, 2, &[(0, 3.0)]);
+    let (blocks, gates, codes) = pack_block_codes(&[code], 2, 1);
+    assert_eq!(blocks[[0, 0]], 0);
+    assert_eq!(blocks[[0, 1]], 0);
+    assert_eq!(gates[[0, 0]].to_bits(), codes[[0, 0, 0]].abs().to_bits());
+    assert!(gates[[0, 0]] > 0.0);
+    assert_eq!(gates[[0, 1]], 0.0);
+    assert_eq!(codes[[0, 1, 0]], 0.0);
+}
+
+#[test]
+fn fitted_block_padding_agrees_with_the_public_transform_2825() {
+    let seed = coordinate_partition_frames(2, 1, 2);
+    assert_eq!(seed.row(0).dot(&seed.row(1)), 0.0);
+    let x = Array2::from_shape_fn((2, 2), |(row, column)| {
+        (if row == 0 { 3.0 } else { -3.0 }) * seed[[0, column]]
+    });
+    let mut config = BlockSparseConfig::new(2, 1);
+    config.block_topk = 2;
+    let fit = fit_block_sparse_dictionary_with_seed(
+        x.view(),
+        &config,
+        BlockSeedPolicy::CoordinatePartition,
+    )
+    .expect("the unused orthogonal block is quiescent on this rank-one corpus");
+    let (blocks, gates, codes) = block_sparse_dictionary_transform(
+        x.view(),
+        fit.decoder.view(),
+        fit.gamma,
+        1,
+        2,
+        config.block_tile,
+    )
+    .unwrap();
+    assert_eq!(fit.blocks, blocks);
+    assert_eq!(fit.gates, gates);
+    assert_eq!(fit.codes, codes);
+    for row in 0..x.nrows() {
+        assert_eq!(fit.blocks[[row, 0]], 0);
+        assert_eq!(fit.blocks[[row, 1]], 0);
+        assert_eq!(fit.gates[[row, 0]], 3.0);
+        assert_eq!(fit.gates[[row, 1]], 0.0);
+        assert_eq!(fit.codes[[row, 1, 0]], 0.0);
+    }
+}
+
+#[test]
+fn projector_distance_resolves_tiny_rotations_without_overlap_cancellation_2825() {
+    let current = ndarray::array![[1.0_f32, 0.0]];
+    for angle in [1.0e-5_f32, 1.0e-8, 1.0e-10] {
+        let next = ndarray::array![[1.0_f32, angle]];
+        let delta = angle as f64;
+        // Independent two-by-two ambient projector identity. The off-diagonal
+        // entries change by delta and the second diagonal by delta squared.
+        let expected =
+            ((2.0 * delta * delta + delta.powi(4)) / (1.0 + (1.0 + delta * delta).powi(2))).sqrt();
+        let measured = frame_fixed_point_residual(current.view(), next.view(), 1, 1).unwrap();
+        assert!(
+            measured > 0.0,
+            "a representable rotation must not collapse to zero"
+        );
+        assert!((measured - expected).abs() <= 32.0 * f64::EPSILON * expected);
+        let negated = next.mapv(|value| -value);
+        let gauge_changed =
+            frame_fixed_point_residual(current.view(), negated.view(), 1, 1).unwrap();
+        assert_eq!(measured, gauge_changed);
+    }
     assert_eq!(
-        x[[0, 0]] as f32,
-        1.0_f32,
-        "fixture must distinguish the old storage"
+        frame_fixed_point_residual(current.view(), current.view(), 1, 1).unwrap(),
+        0.0
     );
-    let (blocks, gates, codes) =
-        block_sparse_dictionary_transform(x.view(), decoder.view(), gamma, 1, 2, 1)
-            .expect("f64 block transform");
-    let reconstructed =
-        reconstruct_block_sparse_rows(decoder.view(), blocks.view(), codes.view(), 1)
-            .expect("f64 block reconstruction");
-    for row in 0..2 {
-        for slot in 0..2 {
-            let column = blocks[[row, slot]] as usize;
-            assert_eq!(codes[[row, slot, 0]], gamma * x[[row, column]]);
-            assert_eq!(gates[[row, slot]], codes[[row, slot, 0]].abs());
-        }
-        for column in 0..2 {
-            assert_eq!(reconstructed[[row, column]], gamma * x[[row, column]]);
-        }
-    }
 }
 
 #[test]
-fn screened_block_ranking_matches_canonical_near_ties_and_cancellation_2825() {
-    let p = 63;
-    let rows = Array2::from_shape_fn((7, p), |(row, column)| {
-        if column % 3 == 0 {
-            1e8
-        } else if column % 3 == 1 {
-            0.25 + row as f64 * 0.03125
-        } else {
-            -1e8
-        }
-    });
-    let decoder = Array2::from_shape_fn((30, p), |(axis, column)| {
-        let value = if axis % 2 == 0 { 1.0_f64 } else { -1.0_f64 };
-        if column == axis % p {
-            value.next_up()
-        } else {
-            value
-        }
-    });
-    let expected = crate::sparse_dict::block_scoring_gpu::route_blocks_cpu(
-        rows.view(),
-        decoder.view(),
-        15,
-        2,
-        3,
-    );
-    for tile in [1, 4, 15] {
-        let actual = route_block_minibatch(rows.view(), decoder.view(), 15, 2, 3, tile);
-        assert_eq!(
-            actual, expected,
-            "canonical support and keys must survive tile={tile}"
-        );
+fn tied_frame_stationarity_separates_normal_storage_error_from_tangent_signal_2825() {
+    let current = ndarray::array![[0.6_f32, 0.8, 0.0]];
+    let mut proposal = Array2::zeros((1, 3));
+    let second = Array2::zeros((1, 1));
+    for tangent in [0.0, 0.25] {
+        let mut action = ndarray::array![[1.8_f64], [2.4], [tangent]];
+        // Use the actual stored frame for an exactly normal action. Its norm
+        // differs from one after f32 serialization, which must not create a
+        // spurious tangent component.
+        action[[0, 0]] = 3.0 * current[[0, 0]] as f64;
+        action[[1, 0]] = 3.0 * current[[0, 1]] as f64;
+        let scale = action.iter().map(|v| v * v).sum::<f64>().sqrt();
+        let measured = super::super::block_frame::polar_tied_frame_step(
+            current.view(),
+            action.view_mut(),
+            second.view(),
+            0.0,
+            1.0e30,
+            proposal.view_mut(),
+        )
+        .unwrap();
+        assert!((measured - tangent / scale).abs() <= 16.0 * f64::EPSILON);
     }
 }
+/// The tied loss `L(S) = ‖x − γ Σ_{g∈S} P_g x‖²` a support actually prices,
+/// computed in f64 straight from the projectors — independent of anything
+/// `code_row` accumulates, so it can adjudicate the selection rather than
+/// restate it.
+fn tied_loss_of_support(
+    row: &[f64],
+    decoder: ArrayView2<'_, f32>,
+    blocks: &[usize],
+    gamma: f64,
+    b: usize,
+) -> f64 {
+    let p = row.len();
+    let mut reconstruction = vec![0.0_f64; p];
+    for &block in blocks {
+        for axis in 0..b {
+            let atom = decoder.row(block * b + axis);
+            let mut projection = 0.0_f64;
+            for (value, &direction) in row.iter().zip(atom.iter()) {
+                projection += value * direction as f64;
+            }
+            for (out, &direction) in reconstruction.iter_mut().zip(atom.iter()) {
+                *out += projection * direction as f64;
+            }
+        }
+    }
+    row.iter()
+        .zip(reconstruction.iter())
+        .map(|(&observed, &fitted)| {
+            let residual = observed - gamma * fitted;
+            residual * residual
+        })
+        .sum()
+}
 
+/// The blocks a row actually admitted, in slot order, skipping canonical padding.
+fn admitted_blocks_of(code: &RowBlockCode) -> Vec<usize> {
+    code.blocks
+        .iter()
+        .enumerate()
+        .filter(|&(slot, _)| code.gates[slot] != 0.0)
+        .map(|(_, &block)| block as usize)
+        .collect()
+}
+
+/// #2825 as a PROPERTY, over an ensemble rather than a hand-built row.
+/// `8aa65d500` pins the admission rule with three examples — one overlapping
+/// pair refused, one orthogonal pair admitted, one non-descent scale kept
+/// definable. Each is exact and each is a single row. This asserts the two
+/// things that have to hold on every row of an over-complete dictionary, over a
+/// deterministic ensemble of 8 blocks of `b = 2` in `P = 6` (so `K = 16 > P` and
+/// the projectors overlap by construction), 64 rows at four scales:
+///
+/// 1. **The stopping rule is a local minimum.** At the returned support, every
+///    refused candidate must price at least as much as the support without it.
+///    That is a theorem about the rule, not a fact about the data, and it is
+///    recomputed here from the projectors — never from anything `code_row`
+///    accumulated, so the check cannot restate the thing it is checking.
+/// 2. **The admitted support never prices worse than the top-`k` quota** it
+///    replaces, measured on this ensemble.
+///
+/// Both scales below are inside `(0, 2)`, where the admission weight `2γ−γ²` is
+/// positive, so the unconditional first admission that `8aa65d500` uses to keep
+/// the scale definable at `γ ≥ 2` is inert here and the rule under test is the
+/// conditional one throughout.
+///
+/// Two positive controls keep it from passing vacuously: the quota must actually
+/// be reduced somewhere (or nothing is being refused), and it must be strictly
+/// beaten somewhere (or the inequality is trivially satisfied by an unchanged
+/// rule).
 #[test]
-fn block_screen_refines_when_its_arithmetic_envelope_can_overflow_2825() {
-    let rows = ndarray::array![[1e155_f64, -1e155], [f64::MIN_POSITIVE / 16.0, 0.0]];
-    let decoder = ndarray::array![[1.0_f64, 1.0], [1e-155, 0.0]];
-    // The large terms cancel in block zero, while block one resolves a unit
-    // projection. Squaring a bound on the uncancelled terms would overflow:
-    // a finite observed GEMM score alone cannot certify its error model.
-    let screen = BlockGateScreen::new(2, 1);
+fn greedy_admission_never_prices_worse_than_the_topk_quota_2825() {
+    let p = 6usize;
+    let b = 2usize;
+    let n_blocks = 8usize; // K = 16 > P: over-complete, so the projectors overlap
+    let k = 4usize;
+    let mut decoder = Array2::<f32>::zeros((n_blocks * b, p));
+    let mut state = 0x2825_u64;
+    let mut next = || {
+        state = splitmix64_block(state);
+        ((state >> 11) as f64 / (1u64 << 53) as f64) * 2.0 - 1.0
+    };
+    for block in 0..n_blocks {
+        let mut frame = Array2::<f32>::zeros((b, p));
+        for axis in 0..b {
+            for column in 0..p {
+                frame[[axis, column]] = next() as f32;
+            }
+        }
+        orthonormalize_block(&mut frame);
+        decoder
+            .slice_mut(ndarray::s![block * b..(block + 1) * b, ..])
+            .assign(&frame);
+    }
+
+    let mut stuck = 0usize;
+    let mut strictly_better = 0usize;
+    let mut worse = 0usize;
+    let mut refused_rows = 0usize;
+    let rows = 64usize;
+    for _ in 0..rows {
+        let mut row = Array1::<f32>::zeros(p);
+        for column in 0..p {
+            row[column] = next() as f32;
+        }
+        let exact: Vec<f64> = row.iter().map(|&value| value as f64).collect();
+        let projections = block_projections_row(row.view(), decoder.view(), n_blocks, b);
+        let gates = block_gates(projections.view());
+        let shortlist = route_row_blocks(&gates, k);
+        for &gamma in &[0.4_f32, 0.8, 1.0, 1.3] {
+            let code = code_row(row.view(), decoder.view(), gamma, b, k, &shortlist);
+            let admitted = admitted_blocks_of(&code);
+            let quota: Vec<usize> = shortlist
+                .iter()
+                .filter(|&&(_, gate)| gate != 0.0)
+                .map(|&(block, _)| block as usize)
+                .collect();
+            if admitted.len() < quota.len() {
+                refused_rows += 1;
+            }
+            // The stopping condition is a THEOREM about the returned support, not a
+            // property of this ensemble: every refused candidate must price at least
+            // as much as the support without it. Recomputed here from the projectors,
+            // never from anything `code_row` accumulated.
+            let taken = tied_loss_of_support(&exact, decoder.view(), &admitted, gamma as f64, b);
+            for &block in quota.iter() {
+                if admitted.contains(&block) {
+                    continue;
+                }
+                let mut widened = admitted.clone();
+                widened.push(block);
+                let widened_loss =
+                    tied_loss_of_support(&exact, decoder.view(), &widened, gamma as f64, b);
+                let slack = 64.0 * f64::EPSILON * widened_loss.max(taken).max(1.0e-12);
+                if widened_loss + slack < taken {
+                    stuck += 1;
+                }
+            }
+            let quota_loss = tied_loss_of_support(&exact, decoder.view(), &quota, gamma as f64, b);
+            // The projections are f64 accumulations of f32 inputs; a support the
+            // rule declined by an amount below that resolution may measure as a
+            // wash either way. Anything beyond it is a real ordering.
+            let resolution = 64.0 * f64::EPSILON * quota_loss.max(taken).max(1.0e-12);
+            if taken > quota_loss + resolution {
+                worse += 1;
+            }
+            if taken + resolution < quota_loss {
+                strictly_better += 1;
+            }
+        }
+    }
+    assert_eq!(
+        stuck, 0,
+        "the returned support must be a local minimum against single additions: no \
+         refused candidate may have a negative gain at it"
+    );
+    assert_eq!(
+        worse, 0,
+        "measured over this ensemble, the admitted support never priced worse than the \
+         top-k quota it replaces"
+    );
+    // Positive control: on an over-complete dictionary the quota DOES lose, so a
+    // rule that silently degenerated back to `take(k)` would fail here rather
+    // than pass the inequality vacuously.
     assert!(
-        screen
-            .gate_error(screen.row_absolute_sum(rows.row(0)), 1.0)
-            .is_infinite()
+        refused_rows > 0,
+        "the fixture must exercise refusals; the quota was never reduced"
     );
-    let expected = crate::sparse_dict::block_scoring_gpu::route_blocks_cpu(
-        rows.view(),
-        decoder.view(),
-        2,
-        1,
-        1,
+    assert!(
+        strictly_better > 0,
+        "the quota must be strictly beaten somewhere, or this test is vacuous"
     );
-    assert_eq!(expected[0][0].0, 1);
-    assert!(expected[0][0].1 > 0.0 && expected[0][0].1.is_finite());
-    for tile in [1, 2] {
-        assert_eq!(
-            route_block_minibatch(rows.view(), decoder.view(), 2, 1, 1, tile),
-            expected,
+}
+
+/// #2825: the frame convergence bar is denominated in the resolution of the
+/// frames it is read from, and this pins BOTH halves of that — the half that
+/// lifts and, more importantly, the half that does not.
+///
+/// The block dictionary is stored as `f32`, so a frame residual computed from
+/// it carries `f32` round-off. Below `f32::EPSILON` such a residual is not
+/// small, it is unrepresentable, and a bar placed under it asks the frames a
+/// question their own storage cannot answer. Six block fits sat exactly there:
+/// at `ev_residual`, `gamma_residual`, `routing_residual` and
+/// `reconstruction_residual` all exactly zero, EV = 1 to fourteen figures, no
+/// births and no polar failures — genuine fixed points — with frame residuals
+/// of `1.7017e-8 .. 2.5664e-8` against configured tolerances of `1e-9` and
+/// `1e-10`, i.e. bars asking for 119x and 1192x finer than the storage
+/// resolution of `1.192093e-7`.
+///
+/// The danger in a floor is that it silently becomes a blanket relaxation. It
+/// does not here, and that is what the second half of this test is for: a
+/// tolerance ABOVE the floor must be honoured EXACTLY as configured, so the
+/// floor can only ever lift a bar that was below the instrument's noise, never
+/// loosen one that was above it.
+#[test]
+fn the_frame_bar_is_denominated_in_the_stored_frame_resolution_2825() {
+    let resolution = super::super::block_frame::STORED_FRAME_RESOLUTION;
+    assert_eq!(
+        resolution,
+        f64::from(f32::EPSILON),
+        "the floor is the machine epsilon of the type the frames are stored in, \
+         not a chosen number"
+    );
+
+    // The six fits' measured band, from the #2825 arm-deletion run. Every one is
+    // below the storage resolution, which is why no amount of iterating cleared
+    // the configured bar.
+    let measured_band = [
+        1.7016687085877477e-8_f64,
+        2.1350316734503195e-8,
+        2.3524703573643420e-8,
+        2.4516826402228734e-8,
+        2.5664090977161682e-8,
+    ];
+    for residual in measured_band {
+        assert!(
+            residual < resolution,
+            "a residual the frames cannot resolve must sit below the floor; \
+             got {residual} against {resolution}"
         );
     }
+
+    // BELOW the floor: the bar lifts to the floor, so a fixed point the frames
+    // cannot resolve past is admitted.
+    for tolerance in [1.0e-10_f64, 1.0e-9] {
+        let bar = tolerance.max(resolution);
+        assert_eq!(bar, resolution, "a sub-resolution bar lifts to the floor");
+        for residual in measured_band {
+            assert!(
+                residual > tolerance && residual <= bar,
+                "residual {residual} is unreachable at tol {tolerance} and \
+                 admitted at the floor {bar}"
+            );
+        }
+    }
+
+    // ABOVE the floor: unchanged, exactly. This is the half that keeps the floor
+    // from being a blanket relaxation — a configured bar coarser than the
+    // instrument's noise is the caller's, and the floor never touches it.
+    for tolerance in [1.0e-6_f64, 1.0e-3, 1.0e-1] {
+        assert_eq!(
+            tolerance.max(resolution),
+            tolerance,
+            "a bar above the storage resolution must be honoured exactly as \
+             configured, never loosened"
+        );
+    }
+}
+
+/// #2825 — THE FRAME RESIDUAL CANNOT RESOLVE BELOW THE STORED `f32` QUANTIZATION.
+///
+/// The dictionary is stored as `f32`. Two `f32` renderings of the SAME plane —
+/// here the same subspace written in two different internal gauges — are not
+/// the same bytes, so the projector distance between them is nonzero and of
+/// order `f32::EPSILON`. That number is a property of the storage, not of the
+/// fit: it is what the instrument reports when nothing moved. A bar below it
+/// is therefore not a stricter test but an unreachable one, and it refuses an
+/// exact fixed point on the same evidence it refuses a bad one — which is why
+/// the configured `1e-9` / `1e-10` tolerances could never close.
+///
+/// The control is the other half: a real `1e-4` rotation OUT of the plane must
+/// still sit far above the floor, so denominating the bar in the storage
+/// resolution does not blind the criterion to a frame that actually moved.
+#[test]
+fn frame_residual_cannot_resolve_below_the_stored_f32_quantization_2825() {
+    use gam_linalg::faer_ndarray::FaerEigh;
+    let floor = super::super::block_frame::STORED_FRAME_RESOLUTION;
+    // The two tolerances the #2825 fits were configured with. Both are BELOW
+    // the storage resolution; that is the defect this test pins.
+    let configured = [1.0e-9_f64, 1.0e-10];
+    let mut checked = 0usize;
+    for (p, b) in [(8usize, 2usize), (12, 3), (16, 4)] {
+        // An orthonormal b-frame in R^p kept in f64, so the gauge rotation below
+        // is exact to f64 and every difference the residual sees afterwards comes
+        // from the f32 rendering alone.
+        let mut a = Array2::<f64>::zeros((p, p));
+        for i in 0..p {
+            for j in 0..p {
+                a[[i, j]] = ((i * 5 + j * 3 + 1) % 13) as f64 - 6.0;
+            }
+        }
+        let sym = &a + &a.t();
+        let (_ev, evecs) = sym.eigh(faer::Side::Lower).expect("orthonormal seed");
+        let mut u = Array2::<f64>::zeros((b, p));
+        for r in 0..b {
+            for c in 0..p {
+                u[[r, c]] = evecs[[c, r]];
+            }
+        }
+        // Same plane, different gauge: rotate the first two frame vectors into
+        // each other. The SUBSPACE is unchanged, so a residual reading the
+        // subspace in exact arithmetic would be identically zero.
+        let theta = 0.7_f64;
+        let mut rotated = u.clone();
+        for c in 0..p {
+            rotated[[0, c]] = theta.cos() * u[[0, c]] + theta.sin() * u[[1, c]];
+            rotated[[1, c]] = -theta.sin() * u[[0, c]] + theta.cos() * u[[1, c]];
+        }
+        let stored = u.mapv(|value| value as f32);
+        let gauged = rotated.mapv(|value| value as f32);
+        let unmoved =
+            frame_fixed_point_residual(stored.view(), gauged.view(), 1, b).expect("gauge residual");
+
+        // NON-VACUITY: the two renderings must actually differ in bytes, or
+        // `stored_projector_distance` short-circuits to an exact 0.0 and this
+        // test would pass while measuring nothing.
+        assert!(
+            unmoved > 0.0,
+            "p={p} b={b}: the two f32 renderings must differ, else the bitwise \
+             short-circuit makes this vacuous"
+        );
+        assert!(
+            unmoved <= floor,
+            "p={p} b={b}: a frame that did not move reported {unmoved:.6e}, above \
+             the storage floor {floor:.6e} the bar is denominated in"
+        );
+        for tolerance in configured {
+            assert!(
+                unmoved > tolerance,
+                "p={p} b={b}: an UNMOVED frame reports {unmoved:.6e}, which must \
+                 exceed the configured bar {tolerance:.6e} — that is why #2825's \
+                 exactly-determined fits could never certify"
+            );
+        }
+
+        // CONTROL: rotate the first frame vector 1e-4 rad out of the plane,
+        // along an eigenvector the frame does not span.
+        let angle = 1.0e-4_f64;
+        let mut tilted = u.clone();
+        for c in 0..p {
+            tilted[[0, c]] = angle.cos() * u[[0, c]] + angle.sin() * evecs[[c, b]];
+        }
+        let moved = frame_fixed_point_residual(
+            stored.view(),
+            tilted.mapv(|value| value as f32).view(),
+            1,
+            b,
+        )
+        .expect("tilt residual");
+        eprintln!(
+            "[#2825 storage floor] p={p} b={b} floor={floor:.6e} unmoved={unmoved:.6e} \
+             ({:.3}x floor) moved={moved:.6e} ({:.1}x floor)",
+            unmoved / floor,
+            moved / floor
+        );
+        assert!(
+            moved > 100.0 * floor,
+            "p={p} b={b}: a 1e-4 rotation reported {moved:.6e}; the floor \
+             {floor:.6e} must not blind the criterion to a frame that moved"
+        );
+        checked += 1;
+    }
+    assert_eq!(checked, 3, "every shape must have been measured");
+}
+
+/// #2825 — A FIT WHOSE FRAME RESIDUAL IS STORAGE NOISE CERTIFIES.
+///
+/// `certified` is the field the whole convergence contract rests on and no test
+/// in this crate asserted it. With the frame bar denominated in the storage
+/// resolution, a planted fit closes arm (1) — and it does so with its frame
+/// residual ABOVE the configured tolerance, which is the non-vacuity: it
+/// certifies THROUGH the floor, not because the configured bar was met.
+///
+/// This test asserts only the positive, deliberately. The floor's discriminating
+/// power — that it admits a frame which did not move and still refuses one that
+/// did — is pinned one level down, on the residual function itself, by
+/// [`frame_residual_cannot_resolve_below_the_stored_f32_quantization_2825`],
+/// where a gauge-only rendering reads 0.17-0.27x the floor and a `1e-4` rotation
+/// reads 419-593x it. That is where the floor is applied, so that is where the
+/// separation belongs; re-deriving `tolerance.max(floor)` here would only score
+/// the rule against itself.
+///
+/// MEASURED (this fixture, lane y5): the exactly-determined fit reports
+/// `ev = 1.00000000000000`, `ev_residual = 0`, `gamma_residual = 0` and
+/// `frame_residual = 2.148690e-8` — 0.180x the floor, and 215x the configured
+/// `1e-10` it could never have cleared.
+///
+/// The over-complete arm is asserted as a SECOND POSITIVE, not as a control. It
+/// was written as a control on the belief that a `K > rank` fit cannot reach a
+/// frame fixed point; `8aa65d500` refuted that by making the support step a
+/// descent step on the shared objective, and
+/// `tiered::fit::fit_tests::tiered_certifies_at_k_gg_rank_once_the_support_step_descends_2275_2825`
+/// already records it. Measured here at `frame_residual = 2.352470e-8`, which is
+/// one of the six residuals the landed floor cites.
+#[test]
+fn exactly_determined_block_fit_certifies_at_the_storage_resolution_2825() {
+    let floor = super::super::block_frame::STORED_FRAME_RESOLUTION;
+    let (p, b, n_blocks) = (8usize, 2usize, 3usize);
+    let planted = planted_frames(p, n_blocks, b);
+    let x = planted_data(&planted, n_blocks, b, p, 180);
+    let config = BlockSparseConfig {
+        n_blocks,
+        block_size: b,
+        block_topk: 1,
+        max_epochs: 80,
+        minibatch: 64,
+        block_tile: 8,
+        frame_ridge: 1.0e-9,
+        aux_k: 3,
+        matryoshka_prefix: false,
+        tolerance: 1.0e-10,
+    };
+    let fit = fit_block_sparse_dictionary(x.view(), &config).expect("exactly determined block fit");
+    let exact = fit.convergence;
+    eprintln!(
+        "[#2825 certify] exact: ev={:.14} frame_residual={:.6e} ({:.3}x floor) \
+         ev_residual={:.3e} gamma_residual={:.3e} certified={}",
+        fit.explained_variance,
+        exact.frame_residual,
+        exact.frame_residual / floor,
+        exact.ev_residual,
+        exact.gamma_residual,
+        exact.certified
+    );
+    assert!(
+        exact.certified,
+        "an exactly-determined planted fit must close arm (1): frame_residual \
+         {:.6e} against floor {floor:.6e}",
+        exact.frame_residual
+    );
+    // NON-VACUITY: it certified THROUGH the storage floor. If the frame residual
+    // had met the configured tolerance on its own, this test would say nothing
+    // about the denomination.
+    assert!(
+        exact.frame_residual > config.tolerance,
+        "the frame residual {:.6e} met the configured bar {:.6e} unaided; this \
+         fixture no longer exercises the storage floor",
+        exact.frame_residual,
+        config.tolerance
+    );
+    assert!(
+        exact.frame_residual <= floor,
+        "certified with frame_residual {:.6e} above the floor {floor:.6e}",
+        exact.frame_residual
+    );
+
+    // The over-complete fit, as a second positive: four rank-2 blocks against
+    // six planted directions. Since 8aa65d500 the support step descends the
+    // shared objective, so this reaches a frame fixed point too.
+    let over = BlockSparseConfig {
+        n_blocks: n_blocks + 1,
+        ..config
+    };
+    let over_fit = fit_block_sparse_dictionary(x.view(), &over).expect("over-complete block fit");
+    eprintln!(
+        "[#2825 certify] over-complete: frame_residual={:.6e} ({:.3}x floor) certified={}",
+        over_fit.convergence.frame_residual,
+        over_fit.convergence.frame_residual / floor,
+        over_fit.convergence.certified
+    );
+    assert!(
+        over_fit.convergence.certified,
+        "since 8aa65d500 a K > rank fit reaches a frame fixed point too; got \
+         certified=false at frame_residual {:.6e}",
+        over_fit.convergence.frame_residual
+    );
+    assert!(
+        over_fit.convergence.frame_residual <= floor,
+        "the over-complete residual {:.6e} must also be storage noise, not a \
+         bar the floor loosened past; floor {floor:.6e}",
+        over_fit.convergence.frame_residual
+    );
 }

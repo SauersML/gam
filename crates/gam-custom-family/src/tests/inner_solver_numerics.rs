@@ -3786,15 +3786,15 @@ pub(crate) fn pseudo_laplace_path_skips_eigendecomposition_avoiding_nan_crash() 
 /// Regression check: when `strict_solve_spd_with_lm_continuation` is given a
 /// strongly negative-definite matrix whose `|λ_min|` exceeds the LM δ-ridge
 /// schedule's terminal δ (≈ ε · trace_scale · 10¹⁶), the bare schedule can't
-/// rescue Cholesky and the terminal eigen-floor fallback must return a
-/// finite solution equal to `Q diag(1/Λ̃) Qᵀ rhs`, with
-/// `Λ̃_i = max(Λ_i, ε λ_max)`.
+/// rescue Cholesky and the terminal eigendecomposition fallback must return
+/// the positive-part Moore–Penrose solution. Negative eigendirections are
+/// outside its range and must contribute exactly zero.
 ///
 /// We also exercise the schedule-success path with a milder matrix to lock
 /// in that the eigen-floor doesn't perturb the LM-δ output for cases the
 /// schedule can already handle.
 #[test]
-pub(crate) fn strict_solve_spd_falls_back_to_eigen_floor_on_indefinite_matrix() {
+pub(crate) fn strict_solve_spd_falls_back_to_positive_pseudoinverse_on_indefinite_matrix() {
     // δ schedule from `delta0 = max(ε·tr/p, 1e-12)`, growth 10×, 16 steps.
     // With `tr = 4·1e30` we get `delta0 ≈ ε·1e30 ≈ 2.2e14`; terminal δ at
     // escalation 16 is `2.2e14 · 1e16 = 2.2e30`. Set `λ_min ≈ -1e32` to
@@ -3809,43 +3809,27 @@ pub(crate) fn strict_solve_spd_falls_back_to_eigen_floor_on_indefinite_matrix() 
     let rhs = Array1::from_vec(vec![1e30, -5e29, 2.5e29, 7.5e29]);
 
     let (x, stats) = strict_solve_spd_with_lm_continuation(&h, &rhs)
-        .expect("eigen-floor fallback must succeed on the negative-definite matrix");
+        .expect("eigendecomposition fallback must succeed on the negative-definite matrix");
     assert!(
         stats.escalations > 16,
-        "expected eigen-floor terminal fallback (escalations > MAX_ESCALATIONS), got {}",
+        "expected eigendecomposition terminal fallback (escalations > MAX_ESCALATIONS), got {}",
         stats.escalations,
     );
     for &v in x.iter() {
         assert!(
             v.is_finite(),
-            "eigen-floor solve returned non-finite component {v}"
+            "pseudo-inverse solve returned non-finite component {v}"
         );
     }
 
-    // Reconstruct the analytic floored solve and compare component-wise.
-    let mut sym = h.clone();
-    symmetrize_dense_in_place(&mut sym);
-    let (evals, evecs) = FaerEigh::eigh(&sym, Side::Lower).expect("eigh");
-    let max_abs_eval = evals.iter().fold(0.0_f64, |a, &b| a.max(b.abs()));
-    let eps_floor = (CUSTOM_FAMILY_EVAL_FLOOR * max_abs_eval).max(1e-300);
-    let mut want = Array1::<f64>::zeros(p);
-    for k in 0..p {
-        let mut q_t_rhs = 0.0;
-        for i in 0..p {
-            q_t_rhs += evecs[[i, k]] * rhs[i];
-        }
-        let scaled = q_t_rhs / evals[k].max(eps_floor);
-        for i in 0..p {
-            want[i] += evecs[[i, k]] * scaled;
-        }
-    }
-    for i in 0..p {
-        let tol = 1e-9 * want[i].abs().max(1.0) + 1e-9;
-        assert!(
-            (want[i] - x[i]).abs() <= tol,
-            "eigen-floor solve component {i}: want={:.6e}, got={:.6e}",
-            want[i],
-            x[i],
+    // A negative eigenspace is outside the range of the positive-part
+    // Moore–Penrose inverse. It contributes zero rather than an arbitrary
+    // fabricated step.
+    for (i, &value) in x.iter().enumerate() {
+        assert_eq!(
+            value.to_bits(),
+            0.0_f64.to_bits(),
+            "negative eigendirection {i} contributed {value} to the pseudo-inverse solve",
         );
     }
 }

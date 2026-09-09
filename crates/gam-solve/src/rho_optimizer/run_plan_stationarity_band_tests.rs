@@ -10,8 +10,8 @@ use ndarray::array;
 /// The certificate band alone. #2688 moved the rung into the production return
 /// type on purpose, so the value-only form lives in the tests that compare
 /// bands to each other rather than beside the thing it was extracted from.
-fn outer_stationarity_band(config: &OuterConfig) -> f64 {
-    outer_stationarity_band_and_rung(config).bound
+fn outer_stationarity_band_at(config: &OuterConfig, cost_at_point: f64) -> f64 {
+    outer_stationarity_band_and_rung_at(config, cost_at_point).bound
 }
 
 // ─── #2613 diagnostic (zz_measure): the gradient-only stiff-ridge trajectory ──
@@ -481,68 +481,126 @@ fn solver_stationarity_band_is_seed_invariant_2613() {
     );
 }
 
-/// #2812: the certificate's first-order band does not move with the judged
-/// point. The `rel_tol · (1 + |V|)` widening #2613 anchored at the point is
-/// gone; the band is the declared band, and a gradient the criterion cannot
-/// resolve is widened by the curvature rung from the published resolution.
+/// #2613 — and the CERTIFICATE keeps the mgcv `magic` rule it always meant:
+/// `‖g‖ ≤ τ·(1 + |V|)` anchored at the criterion value of the point being
+/// judged. That anchor was never wrong; it is resolved per point, so anchoring
+/// it right costs nothing. Naming the two bands separately is what makes the
+/// asymmetry impossible to reintroduce.
 #[test]
-fn certificate_stationarity_band_does_not_move_with_the_judged_point_2812() {
+fn certificate_stationarity_band_still_tracks_the_judged_point_2613() {
     let config = OuterConfig {
         tolerance: 1.0e-5,
         objective_scale: Some(1_000.0),
         ..OuterConfig::default()
     };
-    let band = outer_stationarity_band(&config);
-    assert_eq!(band, outer_gradient_tolerance(&config).abs);
+    let at_optimum = outer_stationarity_band_at(&config, -5.0e3);
+    let at_a_far_worse_point = outer_stationarity_band_at(&config, -5.0e6);
+    assert!(
+        at_a_far_worse_point > at_optimum,
+        "the certificate band must scale with the criterion at the point it judges: \
+         {at_a_far_worse_point:.6e} vs {at_optimum:.6e}",
+    );
+    // 1e-5 · (1 + 5000), the value the #2392 recovery certifies against.
+    assert!(
+        (at_optimum - 5.001e-2).abs() <= 1.0e-9,
+        "certificate band at V = -5e3 should be τ·(1+|V|) = 5.001e-2, got {at_optimum:.9e}",
+    );
+    // A non-finite criterion licenses no score-relative widening at all: the
+    // band falls back to the solver's, which is where the invariant below
+    // starts.
     assert_eq!(
-        outer_stationarity_band_and_rung(&config).source,
-        StationarityBoundSource::SolverBand
+        outer_stationarity_band_at(&config, f64::NAN).to_bits(),
+        outer_gradient_tolerance(&config).abs.to_bits(),
+        "a non-finite cost must fall back to the declared band, never widen",
     );
 }
 
+/// #2613 — the certificate's band is never STRICTER than the band the solver
+/// was told to reach.
+///
+/// A certificate tighter than the solver's threshold manufactures the "solver
+/// claimed convergence, certificate refused" family out of nothing but a
+/// disagreement between two spellings of one tolerance: the optimizer stops
+/// exactly where it was asked to and is then told the stop was illegitimate.
+/// Looser is fine — that is what the score-relative widening is for. The sweep
+/// below covers the regime where the point's own criterion is SMALLER than the
+/// declared scale, which is the only way the two can cross.
 #[test]
 fn certificate_band_never_undercuts_the_solver_band_2613() {
-    for scale in [None, Some(1.0), Some(1.0e3), Some(1.0e7)] {
-        for required in [None, Some(1.0e-9), Some(1.0e-2)] {
+    for scale in [None, Some(1.0), Some(80.0), Some(1_000.0), Some(1.0e6)] {
+        for tolerance in [1.0e-8, 1.0e-5, 1.0e-3] {
             let config = OuterConfig {
-                tolerance: 1.0e-5,
+                tolerance,
                 objective_scale: scale,
-                required_projected_gradient_norm: required,
                 ..OuterConfig::default()
             };
             let solver_band = outer_gradient_tolerance(&config).abs;
-            let certificate_band = outer_stationarity_band(&config);
-            assert!(
-                certificate_band >= solver_band,
-                "certificate band {certificate_band:.6e} undercuts the solver band {solver_band:.6e}"
-            );
-            assert!(
-                certificate_band.is_finite() && certificate_band > 0.0,
-                "a stationarity bound must be a usable positive number, got {certificate_band:.6e}"
-            );
+            for cost in [
+                0.0,
+                -1.0e-9,
+                1.0,
+                -80.0,
+                1.0e3,
+                -5.0e3,
+                1.0e12,
+                f64::NAN,
+                f64::INFINITY,
+            ] {
+                let certificate_band = outer_stationarity_band_at(&config, cost);
+                assert!(
+                    certificate_band >= solver_band,
+                    "certificate band {certificate_band:.6e} undercuts the solver band                      {solver_band:.6e} at scale={scale:?} tolerance={tolerance:.0e}                      cost={cost:.3e}",
+                );
+                assert!(
+                    certificate_band.is_finite() && certificate_band > 0.0,
+                    "a stationarity bound must be a usable positive number, got                      {certificate_band:?} at scale={scale:?} tolerance={tolerance:.0e}                      cost={cost:.3e}",
+                );
+            }
         }
     }
 }
 
-/// #2812: a declared objective scale gives the arithmetic floor of a gradient
-/// at that scale, `max(tol, scale·√ε)`, and no criterion-relative term.
+/// #2613 — moving the anchor from the seed to the declared scale is
+/// MAGNITUDE-PRESERVING on the routes that declare one, which is why it is not
+/// a tightening in disguise.
+///
+/// A REML/LAML score is a sum over `n` rows, so `1 + |V| = O(n)` is exactly
+/// what `1 + objective_scale` says when the scale is `n_obs`. The declared band
+/// must land on the same order as the point-anchored band evaluated at a
+/// criterion of that size.
 #[test]
-fn declared_objective_scale_gives_the_arithmetic_floor_2812() {
-    let n_obs = 5.0e4;
+fn declared_objective_scale_preserves_the_score_relative_magnitude_2613() {
+    let n_obs = 1_000.0;
     let config = OuterConfig {
         tolerance: 1.0e-5,
         objective_scale: Some(n_obs),
         ..OuterConfig::default()
     };
     let declared = outer_gradient_tolerance(&config).abs;
-    assert_eq!(declared, config.tolerance.max(n_obs * f64::EPSILON.sqrt()));
-    assert_eq!(outer_stationarity_band(&config), declared);
-    let unscaled = OuterConfig {
+    let at_a_score_of_that_size = outer_stationarity_band_at(&config, -n_obs);
+    let ratio = declared / at_a_score_of_that_size;
+    assert!(
+        (0.5..=2.0).contains(&ratio),
+        "the declared band {declared:.6e} and the point-anchored band \
+         {at_a_score_of_that_size:.6e} at |V| = n must agree to within a factor of two \
+         (ratio {ratio:.3})",
+    );
+    // Without a declared scale gam does not know the criterion's magnitude, and
+    // says so by falling back to the absolute tolerance rather than
+    // substituting a trajectory point for it. The cost-stall guard's
+    // `flat_valley_converged_grad_bound(best_value)` — anchored at the BEST
+    // iterate, i.e. the correctly-anchored version of the same idea — is what
+    // covers that case.
+    let undeclared = OuterConfig {
         tolerance: 1.0e-5,
         objective_scale: None,
         ..OuterConfig::default()
     };
-    assert_eq!(outer_gradient_tolerance(&unscaled).abs, unscaled.tolerance);
+    assert_eq!(
+        outer_gradient_tolerance(&undeclared).abs.to_bits(),
+        1.0e-5_f64.to_bits(),
+        "an undeclared route must get its own absolute tolerance, not a guess",
+    );
 }
 
 // ─── #2458 the derived standard, and the typed inability to reach it ─────────
@@ -567,8 +625,6 @@ fn certify_quadratic_at_declared_curvature_2458(
         objective_scale: Some(80.0),
         ..OuterConfig::default()
     };
-    // #2812: the fixture's criterion declares its own resolution,
-    // `1e-7 · (1 + |V|)`, the band the pinned widening was derived against.
     let mut obj = OuterProblem::new(1)
         .with_gradient(Derivative::Analytic)
         .with_hessian(if declares_hessian {
@@ -577,13 +633,9 @@ fn certify_quadratic_at_declared_curvature_2458(
             DeclaredHessianForm::Unavailable
         })
         .build_objective(
-            std::cell::Cell::new(0.0_f64),
-            move |last_cost: &mut std::cell::Cell<f64>, rho: &Array1<f64>| {
-                last_cost.set(0.5 * rho[0] * rho[0]);
-                Ok(0.5 * rho[0] * rho[0])
-            },
-            move |last_cost: &mut std::cell::Cell<f64>, rho: &Array1<f64>| {
-                last_cost.set(0.5 * rho[0] * rho[0]);
+            (),
+            move |_: &mut (), rho: &Array1<f64>| Ok(0.5 * rho[0] * rho[0]),
+            move |_: &mut (), rho: &Array1<f64>| {
                 Ok(OuterEval {
                     cost: 0.5 * rho[0] * rho[0],
                     gradient: array![rho[0]],
@@ -595,14 +647,9 @@ fn certify_quadratic_at_declared_curvature_2458(
                     inner_beta_hint: None,
                 })
             },
-            None::<fn(&mut std::cell::Cell<f64>)>,
-            None::<
-                fn(&mut std::cell::Cell<f64>, &Array1<f64>) -> Result<EfsEval, EstimationError>,
-            >,
-        )
-        .with_criterion_resolution(|last_cost: &mut std::cell::Cell<f64>| {
-            Some(1.0e-7 * (1.0 + last_cost.get().abs()))
-        });
+            None::<fn(&mut ())>,
+            None::<fn(&mut (), &Array1<f64>) -> Result<EfsEval, EstimationError>>,
+        );
     let mut result = OuterResult::new(
         array![theta],
         0.5 * theta * theta,
@@ -730,6 +777,7 @@ fn the_curvature_rung_still_refuses_genuine_nonstationarity_2458() {
 fn exactly_one_rung_is_the_derived_standard_2458() {
     let rungs = [
         StationarityBoundSource::SolverBand,
+        StationarityBoundSource::CertificateScoreRelative,
         StationarityBoundSource::ProbeNoiseFloor,
         StationarityBoundSource::CurvatureResolvability,
         StationarityBoundSource::GradientReproducibility,
@@ -766,6 +814,7 @@ fn exactly_one_rung_is_the_derived_standard_2458() {
     // error HERE, on the test that owns the "which rungs exist" question.
     for rung in rungs {
         let (StationarityBoundSource::SolverBand
+        | StationarityBoundSource::CertificateScoreRelative
         | StationarityBoundSource::ProbeNoiseFloor
         | StationarityBoundSource::CurvatureResolvability
         | StationarityBoundSource::GradientReproducibility

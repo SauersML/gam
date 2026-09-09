@@ -1,0 +1,7119 @@
+{
+  "rows_scored": 100000,
+  "blocks_reported": 60,
+  "angle_tests": 196,
+  "angle_tests_beating_every_null": 156,
+  "permutations_per_test": 200,
+  "blocks": [
+    {
+      "block": 9445,
+      "atoms": [
+        18890,
+        18891
+      ],
+      "firings": 2266,
+      "firing_rate": 0.02266,
+      "mean_gate": 0.27561962604522705,
+      "top_tokens": [
+        {
+          "token_id": 641,
+          "token": " .",
+          "firings": 1885,
+          "share": 0.8318623124448368,
+          "lift_over_corpus": 27.27417417851924
+        },
+        {
+          "token_id": 695,
+          "token": " \n",
+          "firings": 279,
+          "share": 0.12312444836716681,
+          "lift_over_corpus": 13.834207681704136
+        },
+        {
+          "token_id": 328,
+          "token": " \"",
+          "firings": 93,
+          "share": 0.0410414827890556,
+          "lift_over_corpus": 2.635933384011278
+        },
+        {
+          "token_id": 13,
+          "token": ".",
+          "firings": 4,
+          "share": 0.00176522506619594,
+          "lift_over_corpus": 0.9290658243136527
+        },
+        {
+          "token_id": 220,
+          "token": " ",
+          "firings": 1,
+          "share": 0.000441306266548985,
+          "lift_over_corpus": 0.018441548957333263
+        },
+        {
+          "token_id": 1116,
+          "token": " ,",
+          "firings": 1,
+          "share": 0.000441306266548985,
+          "lift_over_corpus": 0.010628763645206768
+        },
+        {
+          "token_id": 2205,
+          "token": " ]",
+          "firings": 1,
+          "share": 0.000441306266548985,
+          "lift_over_corpus": 1.131554529612782
+        },
+        {
+          "token_id": 2228,
+          "token": "  \n",
+          "firings": 1,
+          "share": 0.000441306266548985,
+          "lift_over_corpus": 44.1306266548985
+        },
+        {
+          "token_id": 21228,
+          "token": " ....",
+          "firings": 1,
+          "share": 0.000441306266548985,
+          "lift_over_corpus": 44.1306266548985
+        }
+      ],
+      "angle": [
+        {
+          "token_id": 641,
+          "token": " .",
+          "firings": 1885,
+          "resultant_R1": 0.974175751209259,
+          "null_max_R1": 0.9647821187973022,
+          "resultant_R2": 0.9006733298301697,
+          "null_max_R2": 0.8658137917518616,
+          "exceeds_all_nulls": true
+        },
+        {
+          "token_id": 695,
+          "token": " \n",
+          "firings": 279,
+          "resultant_R1": 0.9936399459838867,
+          "null_max_R1": 0.9708403944969177,
+          "resultant_R2": 0.9748105406761169,
+          "null_max_R2": 0.8879584074020386,
+          "exceeds_all_nulls": true
+        },
+        {
+          "token_id": 328,
+          "token": " \"",
+          "firings": 93,
+          "resultant_R1": 0.9840282797813416,
+          "null_max_R1": 0.9768599271774292,
+          "resultant_R2": 0.9386140704154968,
+          "null_max_R2": 0.9101101160049438,
+          "exceeds_all_nulls": true
+        }
+      ]
+    },
+    {
+      "block": 569,
+      "atoms": [
+        1138,
+        1139
+      ],
+      "firings": 2163,
+      "firing_rate": 0.02163,
+      "mean_gate": 0.2578897178173065,
+      "top_tokens": [
+        {
+          "token_id": 641,
+          "token": " .",
+          "firings": 1714,
+          "share": 0.7924179380490061,
+          "lift_over_corpus": 25.980916001606758
+        },
+        {
+          "token_id": 1116,
+          "token": " ,",
+          "firings": 176,
+          "share": 0.08136846971798428,
+          "lift_over_corpus": 1.9597415635352669
+        },
+        {
+          "token_id": 694,
+          "token": " but",
+          "firings": 84,
+          "share": 0.038834951456310676,
+          "lift_over_corpus": 27.157308710706765
+        },
+        {
+          "token_id": 695,
+          "token": " \n",
+          "firings": 67,
+          "share": 0.030975496994914472,
+          "lift_over_corpus": 3.480392920776907
+        },
+        {
+          "token_id": 2502,
+          "token": " ;",
+          "firings": 35,
+          "share": 0.016181229773462782,
+          "lift_over_corpus": 9.806805923310776
+        },
+        {
+          "token_id": 7643,
+          "token": " although",
+          "firings": 18,
+          "share": 0.008321775312066574,
+          "lift_over_corpus": 39.627501486031306
+        },
+        {
+          "token_id": 3384,
+          "token": " though",
+          "firings": 17,
+          "share": 0.00785945446139621,
+          "lift_over_corpus": 29.10909059776374
+        },
+        {
+          "token_id": 328,
+          "token": " \"",
+          "firings": 9,
+          "share": 0.004160887656033287,
+          "lift_over_corpus": 0.2672374859366273
+        },
+        {
+          "token_id": 4611,
+          "token": " however",
+          "firings": 8,
+          "share": 0.0036985668053629217,
+          "lift_over_corpus": 12.753678639182489
+        },
+        {
+          "token_id": 748,
+          "token": " so",
+          "firings": 6,
+          "share": 0.0027739251040221915,
+          "lift_over_corpus": 4.701567972918968
+        },
+        {
+          "token_id": 539,
+          "token": " by",
+          "firings": 5,
+          "share": 0.002311604253351826,
+          "lift_over_corpus": 0.503617484390376
+        },
+        {
+          "token_id": 440,
+          "token": " with",
+          "firings": 4,
+          "share": 0.0018492834026814608,
+          "lift_over_corpus": 0.31939264295016595
+        }
+      ],
+      "angle": [
+        {
+          "token_id": 641,
+          "token": " .",
+          "firings": 1714,
+          "resultant_R1": 0.9957141876220703,
+          "null_max_R1": 0.9519281387329102,
+          "resultant_R2": 0.9829538464546204,
+          "null_max_R2": 0.8377652764320374,
+          "exceeds_all_nulls": true
+        },
+        {
+          "token_id": 1116,
+          "token": " ,",
+          "firings": 176,
+          "resultant_R1": 0.9889023900032043,
+          "null_max_R1": 0.9714317321777344,
+          "resultant_R2": 0.9563795924186707,
+          "null_max_R2": 0.9043092727661133,
+          "exceeds_all_nulls": true
+        },
+        {
+          "token_id": 694,
+          "token": " but",
+          "firings": 84,
+          "resultant_R1": 0.9923809170722961,
+          "null_max_R1": 0.979276180267334,
+          "resultant_R2": 0.9697726368904114,
+          "null_max_R2": 0.9285919070243835,
+          "exceeds_all_nulls": true
+        },
+        {
+          "token_id": 695,
+          "token": " \n",
+          "firings": 67,
+          "resultant_R1": 0.995789110660553,
+          "null_max_R1": 0.980421245098114,
+          "resultant_R2": 0.9833114743232727,
+          "null_max_R2": 0.9287508726119995,
+          "exceeds_all_nulls": true
+        },
+        {
+          "token_id": 2502,
+          "token": " ;",
+          "firings": 35,
+          "resultant_R1": 0.9985756874084473,
+          "null_max_R1": 0.9915476441383362,
+          "resultant_R2": 0.9943186044692993,
+          "null_max_R2": 0.9667190313339233,
+          "exceeds_all_nulls": true
+        }
+      ]
+    },
+    {
+      "block": 12968,
+      "atoms": [
+        25936,
+        25937
+      ],
+      "firings": 1993,
+      "firing_rate": 0.01993,
+      "mean_gate": 0.26628294587135315,
+      "top_tokens": [
+        {
+          "token_id": 641,
+          "token": " .",
+          "firings": 1619,
+          "share": 0.8123432012042148,
+          "lift_over_corpus": 26.634203318170975
+        },
+        {
+          "token_id": 695,
+          "token": " \n",
+          "firings": 332,
+          "share": 0.16658304064224785,
+          "lift_over_corpus": 18.717195577780657
+        },
+        {
+          "token_id": 328,
+          "token": " \"",
+          "firings": 38,
+          "share": 0.019066733567486203,
+          "lift_over_corpus": 1.2245814751115094
+        },
+        {
+          "token_id": 13,
+          "token": ".",
+          "firings": 1,
+          "share": 0.0005017561465127947,
+          "lift_over_corpus": 0.26408218237515513
+        },
+        {
+          "token_id": 426,
+          "token": " F",
+          "firings": 1,
+          "share": 0.0005017561465127947,
+          "lift_over_corpus": 0.3367490916193253
+        },
+        {
+          "token_id": 220,
+          "token": " ",
+          "firings": 1,
+          "share": 0.0005017561465127947,
+          "lift_over_corpus": 0.020967661784905757
+        },
+        {
+          "token_id": 11235,
+          "token": ".The",
+          "firings": 1,
+          "share": 0.0005017561465127947,
+          "lift_over_corpus": 50.17561465127947
+        }
+      ],
+      "angle": [
+        {
+          "token_id": 641,
+          "token": " .",
+          "firings": 1619,
+          "resultant_R1": 0.9987310171127319,
+          "null_max_R1": 0.9888260960578918,
+          "resultant_R2": 0.9949343204498291,
+          "null_max_R2": 0.9565678238868713,
+          "exceeds_all_nulls": true
+        },
+        {
+          "token_id": 695,
+          "token": " \n",
+          "firings": 332,
+          "resultant_R1": 0.9959869980812073,
+          "null_max_R1": 0.9909496307373047,
+          "resultant_R2": 0.984045684337616,
+          "null_max_R2": 0.9648492932319641,
+          "exceeds_all_nulls": true
+        },
+        {
+          "token_id": 328,
+          "token": " \"",
+          "firings": 38,
+          "resultant_R1": 0.9986027479171753,
+          "null_max_R1": 0.9981229305267334,
+          "resultant_R2": 0.994422197341919,
+          "null_max_R2": 0.992523729801178,
+          "exceeds_all_nulls": true
+        }
+      ]
+    },
+    {
+      "block": 12719,
+      "atoms": [
+        25438,
+        25439
+      ],
+      "firings": 1983,
+      "firing_rate": 0.01983,
+      "mean_gate": 0.275082528591156,
+      "top_tokens": [
+        {
+          "token_id": 641,
+          "token": " .",
+          "firings": 1890,
+          "share": 0.9531013615733737,
+          "lift_over_corpus": 31.24922496961881
+        },
+        {
+          "token_id": 535,
+          "token": " :",
+          "firings": 54,
+          "share": 0.02723146747352496,
+          "lift_over_corpus": 13.029410274413857
+        },
+        {
+          "token_id": 328,
+          "token": " \"",
+          "firings": 18,
+          "share": 0.009077155824508321,
+          "lift_over_corpus": 0.5829900979131869
+        },
+        {
+          "token_id": 847,
+          "token": " )",
+          "firings": 5,
+          "share": 0.0025214321734745334,
+          "lift_over_corpus": 0.5445857826078906
+        },
+        {
+          "token_id": 1116,
+          "token": " ,",
+          "firings": 4,
+          "share": 0.002017145738779627,
+          "lift_over_corpus": 0.04858250815943225
+        },
+        {
+          "token_id": 907,
+          "token": " ?",
+          "firings": 3,
+          "share": 0.0015128593040847202,
+          "lift_over_corpus": 8.404773911581778
+        },
+        {
+          "token_id": 1317,
+          "token": " \u2013",
+          "firings": 3,
+          "share": 0.0015128593040847202,
+          "lift_over_corpus": 1.1123965471211177
+        },
+        {
+          "token_id": 13,
+          "token": ".",
+          "firings": 2,
+          "share": 0.0010085728693898135,
+          "lift_over_corpus": 0.5308278259946387
+        },
+        {
+          "token_id": 729,
+          "token": " !",
+          "firings": 2,
+          "share": 0.0010085728693898135,
+          "lift_over_corpus": 11.206365215442371
+        },
+        {
+          "token_id": 2423,
+          "token": " ...",
+          "firings": 1,
+          "share": 0.0005042864346949068,
+          "lift_over_corpus": 1.4007956519302964
+        },
+        {
+          "token_id": 2502,
+          "token": " ;",
+          "firings": 1,
+          "share": 0.0005042864346949068,
+          "lift_over_corpus": 0.30562814223933743
+        }
+      ],
+      "angle": [
+        {
+          "token_id": 641,
+          "token": " .",
+          "firings": 1890,
+          "resultant_R1": 0.9850780367851257,
+          "null_max_R1": 0.9729840159416199,
+          "resultant_R2": 0.9424335956573486,
+          "null_max_R2": 0.905110239982605,
+          "exceeds_all_nulls": true
+        },
+        {
+          "token_id": 535,
+          "token": " :",
+          "firings": 54,
+          "resultant_R1": 0.9796911478042603,
+          "null_max_R1": 0.9914273023605347,
+          "resultant_R2": 0.9210168719291687,
+          "null_max_R2": 0.9660881161689758,
+          "exceeds_all_nulls": false
+        }
+      ]
+    },
+    {
+      "block": 7845,
+      "atoms": [
+        15690,
+        15691
+      ],
+      "firings": 1895,
+      "firing_rate": 0.01895,
+      "mean_gate": 0.15070602297782898,
+      "top_tokens": [
+        {
+          "token_id": 13,
+          "token": ".",
+          "firings": 20,
+          "share": 0.010554089709762533,
+          "lift_over_corpus": 5.554784057769754
+        },
+        {
+          "token_id": 3507,
+          "token": "apping",
+          "firings": 13,
+          "share": 0.006860158311345646,
+          "lift_over_corpus": 19.05599530929346
+        },
+        {
+          "token_id": 3135,
+          "token": " Br",
+          "firings": 13,
+          "share": 0.006860158311345646,
+          "lift_over_corpus": 15.953856538013131
+        },
+        {
+          "token_id": 3629,
+          "token": " John",
+          "firings": 12,
+          "share": 0.0063324538258575196,
+          "lift_over_corpus": 19.18925401775006
+        },
+        {
+          "token_id": 469,
+          "token": " G",
+          "firings": 11,
+          "share": 0.005804749340369393,
+          "lift_over_corpus": 7.637828079433412
+        },
+        {
+          "token_id": 298,
+          "token": "ro",
+          "firings": 11,
+          "share": 0.005804749340369393,
+          "lift_over_corpus": 23.21899736147757
+        },
+        {
+          "token_id": 6683,
+          "token": " Paul",
+          "firings": 10,
+          "share": 0.005277044854881266,
+          "lift_over_corpus": 32.98153034300791
+        },
+        {
+          "token_id": 387,
+          "token": " P",
+          "firings": 10,
+          "share": 0.005277044854881266,
+          "lift_over_corpus": 19.54461057363432
+        },
+        {
+          "token_id": 496,
+          "token": " O",
+          "firings": 10,
+          "share": 0.005277044854881266,
+          "lift_over_corpus": 25.128785023244124
+        },
+        {
+          "token_id": 357,
+          "token": " A",
+          "firings": 9,
+          "share": 0.00474934036939314,
+          "lift_over_corpus": 3.7396380861363303
+        },
+        {
+          "token_id": 462,
+          "token": " H",
+          "firings": 9,
+          "share": 0.00474934036939314,
+          "lift_over_corpus": 18.266693728435154
+        },
+        {
+          "token_id": 299,
+          "token": "as",
+          "firings": 9,
+          "share": 0.00474934036939314,
+          "lift_over_corpus": 31.6622691292876
+        }
+      ],
+      "angle": [
+        {
+          "token_id": 13,
+          "token": ".",
+          "firings": 20,
+          "resultant_R1": 0.996871829032898,
+          "null_max_R1": 0.9911683201789856,
+          "resultant_R2": 0.987541913986206,
+          "null_max_R2": 0.9650816321372986,
+          "exceeds_all_nulls": true
+        }
+      ]
+    },
+    {
+      "block": 10070,
+      "atoms": [
+        20140,
+        20141
+      ],
+      "firings": 1885,
+      "firing_rate": 0.01885,
+      "mean_gate": 0.2668113112449646,
+      "top_tokens": [
+        {
+          "token_id": 641,
+          "token": " .",
+          "firings": 1612,
+          "share": 0.8551724137931035,
+          "lift_over_corpus": 28.038439796495197
+        },
+        {
+          "token_id": 695,
+          "token": " \n",
+          "firings": 202,
+          "share": 0.10716180371352785,
+          "lift_over_corpus": 12.040652102643579
+        },
+        {
+          "token_id": 328,
+          "token": " \"",
+          "firings": 67,
+          "share": 0.035543766578249335,
+          "lift_over_corpus": 2.282836646001884
+        },
+        {
+          "token_id": 13,
+          "token": ".",
+          "firings": 2,
+          "share": 0.0010610079575596816,
+          "lift_over_corpus": 0.5584252408208851
+        },
+        {
+          "token_id": 426,
+          "token": " F",
+          "firings": 1,
+          "share": 0.0005305039787798408,
+          "lift_over_corpus": 0.35604293877841664
+        },
+        {
+          "token_id": 220,
+          "token": " ",
+          "firings": 1,
+          "share": 0.0005305039787798408,
+          "lift_over_corpus": 0.022168992009186827
+        }
+      ],
+      "angle": [
+        {
+          "token_id": 641,
+          "token": " .",
+          "firings": 1612,
+          "resultant_R1": 0.9988921880722046,
+          "null_max_R1": 0.9930413961410522,
+          "resultant_R2": 0.9955770373344421,
+          "null_max_R2": 0.9729098677635193,
+          "exceeds_all_nulls": true
+        },
+        {
+          "token_id": 695,
+          "token": " \n",
+          "firings": 202,
+          "resultant_R1": 0.9947713613510132,
+          "null_max_R1": 0.9955425262451172,
+          "resultant_R2": 0.9793245792388916,
+          "null_max_R2": 0.9824681878089905,
+          "exceeds_all_nulls": false
+        },
+        {
+          "token_id": 328,
+          "token": " \"",
+          "firings": 67,
+          "resultant_R1": 0.9980435371398926,
+          "null_max_R1": 0.9972368478775024,
+          "resultant_R2": 0.992216169834137,
+          "null_max_R2": 0.9891153573989868,
+          "exceeds_all_nulls": true
+        }
+      ]
+    },
+    {
+      "block": 7506,
+      "atoms": [
+        15012,
+        15013
+      ],
+      "firings": 1865,
+      "firing_rate": 0.01865,
+      "mean_gate": 0.14397725462913513,
+      "top_tokens": [
+        {
+          "token_id": 279,
+          "token": " the",
+          "firings": 1313,
+          "share": 0.7040214477211796,
+          "lift_over_corpus": 16.911396774469843
+        },
+        {
+          "token_id": 264,
+          "token": " a",
+          "firings": 269,
+          "share": 0.14423592493297588,
+          "lift_over_corpus": 11.23332748699189
+        },
+        {
+          "token_id": 310,
+          "token": " to",
+          "firings": 52,
+          "share": 0.027882037533512063,
+          "lift_over_corpus": 1.7827389727309502
+        },
+        {
+          "token_id": 449,
+          "token": " an",
+          "firings": 43,
+          "share": 0.023056300268096516,
+          "lift_over_corpus": 9.853119772690818
+        },
+        {
+          "token_id": 539,
+          "token": " by",
+          "firings": 31,
+          "share": 0.016621983914209115,
+          "lift_over_corpus": 3.6213472579976282
+        },
+        {
+          "token_id": 506,
+          "token": " at",
+          "firings": 30,
+          "share": 0.0160857908847185,
+          "lift_over_corpus": 5.205757567870065
+        },
+        {
+          "token_id": 780,
+          "token": " his",
+          "firings": 25,
+          "share": 0.013404825737265416,
+          "lift_over_corpus": 3.4459706265463796
+        },
+        {
+          "token_id": 836,
+          "token": " their",
+          "firings": 21,
+          "share": 0.011260053619302948,
+          "lift_over_corpus": 6.865886353233505
+        },
+        {
+          "token_id": 1141,
+          "token": " its",
+          "firings": 11,
+          "share": 0.005898123324396783,
+          "lift_over_corpus": 5.839726063759191
+        },
+        {
+          "token_id": 364,
+          "token": " for",
+          "firings": 9,
+          "share": 0.00482573726541555,
+          "lift_over_corpus": 0.8986475354591341
+        },
+        {
+          "token_id": 1024,
+          "token": " her",
+          "firings": 9,
+          "share": 0.00482573726541555,
+          "lift_over_corpus": 1.5719013893861726
+        },
+        {
+          "token_id": 303,
+          "token": " in",
+          "firings": 8,
+          "share": 0.004289544235924933,
+          "lift_over_corpus": 0.29320193000170425
+        }
+      ],
+      "angle": [
+        {
+          "token_id": 279,
+          "token": " the",
+          "firings": 1313,
+          "resultant_R1": 0.9694146513938904,
+          "null_max_R1": 0.9364922642707825,
+          "resultant_R2": 0.8825446963310242,
+          "null_max_R2": 0.7760797739028931,
+          "exceeds_all_nulls": true
+        },
+        {
+          "token_id": 264,
+          "token": " a",
+          "firings": 269,
+          "resultant_R1": 0.9891301393508911,
+          "null_max_R1": 0.9460784792900085,
+          "resultant_R2": 0.957365870475769,
+          "null_max_R2": 0.7985789775848389,
+          "exceeds_all_nulls": true
+        },
+        {
+          "token_id": 310,
+          "token": " to",
+          "firings": 52,
+          "resultant_R1": 0.965106725692749,
+          "null_max_R1": 0.9687565565109253,
+          "resultant_R2": 0.873269259929657,
+          "null_max_R2": 0.8801324367523193,
+          "exceeds_all_nulls": false
+        },
+        {
+          "token_id": 449,
+          "token": " an",
+          "firings": 43,
+          "resultant_R1": 0.9939497709274292,
+          "null_max_R1": 0.9629219770431519,
+          "resultant_R2": 0.976003110408783,
+          "null_max_R2": 0.8607110381126404,
+          "exceeds_all_nulls": true
+        },
+        {
+          "token_id": 539,
+          "token": " by",
+          "firings": 31,
+          "resultant_R1": 0.9013372659683228,
+          "null_max_R1": 0.9690664410591125,
+          "resultant_R2": 0.6435143351554871,
+          "null_max_R2": 0.8810012936592102,
+          "exceeds_all_nulls": false
+        },
+        {
+          "token_id": 506,
+          "token": " at",
+          "firings": 30,
+          "resultant_R1": 0.9681450724601746,
+          "null_max_R1": 0.9701170921325684,
+          "resultant_R2": 0.8895705342292786,
+          "null_max_R2": 0.8852929472923279,
+          "exceeds_all_nulls": true
+        }
+      ]
+    },
+    {
+      "block": 14522,
+      "atoms": [
+        29044,
+        29045
+      ],
+      "firings": 1792,
+      "firing_rate": 0.01792,
+      "mean_gate": 0.27905306220054626,
+      "top_tokens": [
+        {
+          "token_id": 641,
+          "token": " .",
+          "firings": 1448,
+          "share": 0.8080357142857143,
+          "lift_over_corpus": 26.492974238875878
+        },
+        {
+          "token_id": 695,
+          "token": " \n",
+          "firings": 243,
+          "share": 0.13560267857142858,
+          "lift_over_corpus": 15.236256019261639
+        },
+        {
+          "token_id": 328,
+          "token": " \"",
+          "firings": 79,
+          "share": 0.04408482142857143,
+          "lift_over_corpus": 2.8313950821176257
+        },
+        {
+          "token_id": 1116,
+          "token": " ,",
+          "firings": 13,
+          "share": 0.007254464285714286,
+          "lift_over_corpus": 0.1747221648775117
+        },
+        {
+          "token_id": 847,
+          "token": " )",
+          "firings": 3,
+          "share": 0.0016741071428571428,
+          "lift_over_corpus": 0.3615782165998149
+        },
+        {
+          "token_id": 13,
+          "token": ".",
+          "firings": 2,
+          "share": 0.0011160714285714285,
+          "lift_over_corpus": 0.5874060150375939
+        },
+        {
+          "token_id": 2205,
+          "token": " ]",
+          "firings": 2,
+          "share": 0.0011160714285714285,
+          "lift_over_corpus": 2.8617216117216118
+        },
+        {
+          "token_id": 907,
+          "token": " ?",
+          "firings": 1,
+          "share": 0.0005580357142857143,
+          "lift_over_corpus": 3.100198412698412
+        },
+        {
+          "token_id": 2228,
+          "token": "  \n",
+          "firings": 1,
+          "share": 0.0005580357142857143,
+          "lift_over_corpus": 55.80357142857142
+        }
+      ],
+      "angle": [
+        {
+          "token_id": 641,
+          "token": " .",
+          "firings": 1448,
+          "resultant_R1": 0.9722059965133667,
+          "null_max_R1": 0.9709565043449402,
+          "resultant_R2": 0.8943677544593811,
+          "null_max_R2": 0.8902928233146667,
+          "exceeds_all_nulls": true
+        },
+        {
+          "token_id": 695,
+          "token": " \n",
+          "firings": 243,
+          "resultant_R1": 0.9837161898612976,
+          "null_max_R1": 0.9766485095024109,
+          "resultant_R2": 0.9372187256813049,
+          "null_max_R2": 0.9114639759063721,
+          "exceeds_all_nulls": true
+        },
+        {
+          "token_id": 328,
+          "token": " \"",
+          "firings": 79,
+          "resultant_R1": 0.9446031451225281,
+          "null_max_R1": 0.9858198165893555,
+          "resultant_R2": 0.8076431155204773,
+          "null_max_R2": 0.946000874042511,
+          "exceeds_all_nulls": false
+        }
+      ]
+    },
+    {
+      "block": 9339,
+      "atoms": [
+        18678,
+        18679
+      ],
+      "firings": 1742,
+      "firing_rate": 0.01742,
+      "mean_gate": 0.2834432125091553,
+      "top_tokens": [
+        {
+          "token_id": 641,
+          "token": " .",
+          "firings": 1488,
+          "share": 0.8541905855338691,
+          "lift_over_corpus": 28.006248706028494
+        },
+        {
+          "token_id": 695,
+          "token": " \n",
+          "firings": 190,
+          "share": 0.10907003444316878,
+          "lift_over_corpus": 12.255060049794244
+        },
+        {
+          "token_id": 328,
+          "token": " \"",
+          "firings": 42,
+          "share": 0.024110218140068886,
+          "lift_over_corpus": 1.5485046974996073
+        },
+        {
+          "token_id": 1116,
+          "token": " ,",
+          "firings": 11,
+          "share": 0.006314580941446613,
+          "lift_over_corpus": 0.15208528279014
+        },
+        {
+          "token_id": 847,
+          "token": " )",
+          "firings": 5,
+          "share": 0.0028702640642939152,
+          "lift_over_corpus": 0.6199274436919904
+        },
+        {
+          "token_id": 13,
+          "token": ".",
+          "firings": 2,
+          "share": 0.001148105625717566,
+          "lift_over_corpus": 0.6042661187987189
+        },
+        {
+          "token_id": 907,
+          "token": " ?",
+          "firings": 1,
+          "share": 0.000574052812858783,
+          "lift_over_corpus": 3.1891822936599055
+        },
+        {
+          "token_id": 1317,
+          "token": " \u2013",
+          "firings": 1,
+          "share": 0.000574052812858783,
+          "lift_over_corpus": 0.42209765651381104
+        },
+        {
+          "token_id": 2205,
+          "token": " ]",
+          "firings": 1,
+          "share": 0.000574052812858783,
+          "lift_over_corpus": 1.471930289381495
+        },
+        {
+          "token_id": 2228,
+          "token": "  \n",
+          "firings": 1,
+          "share": 0.000574052812858783,
+          "lift_over_corpus": 57.405281285878296
+        }
+      ],
+      "angle": [
+        {
+          "token_id": 641,
+          "token": " .",
+          "firings": 1488,
+          "resultant_R1": 0.9765171408653259,
+          "null_max_R1": 0.9776051640510559,
+          "resultant_R2": 0.9094043970108032,
+          "null_max_R2": 0.9140877723693848,
+          "exceeds_all_nulls": false
+        },
+        {
+          "token_id": 695,
+          "token": " \n",
+          "firings": 190,
+          "resultant_R1": 0.9950262308120728,
+          "null_max_R1": 0.9819876551628113,
+          "resultant_R2": 0.9802507758140564,
+          "null_max_R2": 0.9304707646369934,
+          "exceeds_all_nulls": true
+        },
+        {
+          "token_id": 328,
+          "token": " \"",
+          "firings": 42,
+          "resultant_R1": 0.9594365358352661,
+          "null_max_R1": 0.9926497340202332,
+          "resultant_R2": 0.8556829690933228,
+          "null_max_R2": 0.9708594083786011,
+          "exceeds_all_nulls": false
+        }
+      ]
+    },
+    {
+      "block": 6436,
+      "atoms": [
+        12872,
+        12873
+      ],
+      "firings": 1722,
+      "firing_rate": 0.01722,
+      "mean_gate": 0.24912650883197784,
+      "top_tokens": [
+        {
+          "token_id": 641,
+          "token": " .",
+          "firings": 1183,
+          "share": 0.6869918699186992,
+          "lift_over_corpus": 22.524323603891776
+        },
+        {
+          "token_id": 1116,
+          "token": " ,",
+          "firings": 192,
+          "share": 0.11149825783972125,
+          "lift_over_corpus": 2.685410834290011
+        },
+        {
+          "token_id": 2502,
+          "token": " ;",
+          "firings": 117,
+          "share": 0.06794425087108014,
+          "lift_over_corpus": 41.17833386126069
+        },
+        {
+          "token_id": 694,
+          "token": " but",
+          "firings": 73,
+          "share": 0.042392566782810684,
+          "lift_over_corpus": 29.645151596371107
+        },
+        {
+          "token_id": 535,
+          "token": " :",
+          "firings": 30,
+          "share": 0.017421602787456445,
+          "lift_over_corpus": 8.335695113615525
+        },
+        {
+          "token_id": 328,
+          "token": " \"",
+          "firings": 26,
+          "share": 0.015098722415795587,
+          "lift_over_corpus": 0.9697316901602817
+        },
+        {
+          "token_id": 7643,
+          "token": " although",
+          "firings": 19,
+          "share": 0.011033681765389082,
+          "lift_over_corpus": 52.54134173994801
+        },
+        {
+          "token_id": 3384,
+          "token": " though",
+          "firings": 18,
+          "share": 0.010452961672473868,
+          "lift_over_corpus": 38.71467286101433
+        },
+        {
+          "token_id": 695,
+          "token": " \n",
+          "firings": 17,
+          "share": 0.009872241579558653,
+          "lift_over_corpus": 1.1092406269167026
+        },
+        {
+          "token_id": 440,
+          "token": " with",
+          "firings": 11,
+          "share": 0.006387921022067364,
+          "lift_over_corpus": 1.1032678794589574
+        },
+        {
+          "token_id": 4611,
+          "token": " however",
+          "firings": 8,
+          "share": 0.004645760743321719,
+          "lift_over_corpus": 16.019864632143857
+        },
+        {
+          "token_id": 539,
+          "token": " by",
+          "firings": 4,
+          "share": 0.0023228803716608595,
+          "lift_over_corpus": 0.5060741550459389
+        }
+      ],
+      "angle": [
+        {
+          "token_id": 641,
+          "token": " .",
+          "firings": 1183,
+          "resultant_R1": 0.9956196546554565,
+          "null_max_R1": 0.9502002000808716,
+          "resultant_R2": 0.9825972318649292,
+          "null_max_R2": 0.8235762715339661,
+          "exceeds_all_nulls": true
+        },
+        {
+          "token_id": 1116,
+          "token": " ,",
+          "firings": 192,
+          "resultant_R1": 0.989483654499054,
+          "null_max_R1": 0.9612302184104919,
+          "resultant_R2": 0.9584858417510986,
+          "null_max_R2": 0.8613883256912231,
+          "exceeds_all_nulls": true
+        },
+        {
+          "token_id": 2502,
+          "token": " ;",
+          "firings": 117,
+          "resultant_R1": 0.9964472651481628,
+          "null_max_R1": 0.9651264548301697,
+          "resultant_R2": 0.9858564138412476,
+          "null_max_R2": 0.8750185370445251,
+          "exceeds_all_nulls": true
+        },
+        {
+          "token_id": 694,
+          "token": " but",
+          "firings": 73,
+          "resultant_R1": 0.9920278191566467,
+          "null_max_R1": 0.9736350178718567,
+          "resultant_R2": 0.9685352444648743,
+          "null_max_R2": 0.9023938179016113,
+          "exceeds_all_nulls": true
+        },
+        {
+          "token_id": 535,
+          "token": " :",
+          "firings": 30,
+          "resultant_R1": 0.992165207862854,
+          "null_max_R1": 0.9864804148674011,
+          "resultant_R2": 0.9688882827758789,
+          "null_max_R2": 0.9477062821388245,
+          "exceeds_all_nulls": true
+        },
+        {
+          "token_id": 328,
+          "token": " \"",
+          "firings": 26,
+          "resultant_R1": 0.9962630271911621,
+          "null_max_R1": 0.9867129921913147,
+          "resultant_R2": 0.985112726688385,
+          "null_max_R2": 0.9484875798225403,
+          "exceeds_all_nulls": true
+        }
+      ]
+    },
+    {
+      "block": 9958,
+      "atoms": [
+        19916,
+        19917
+      ],
+      "firings": 1721,
+      "firing_rate": 0.01721,
+      "mean_gate": 0.24701349437236786,
+      "top_tokens": [
+        {
+          "token_id": 641,
+          "token": " .",
+          "firings": 1195,
+          "share": 0.694363742010459,
+          "lift_over_corpus": 22.76602432821177
+        },
+        {
+          "token_id": 1116,
+          "token": " ,",
+          "firings": 191,
+          "share": 0.11098198721673445,
+          "lift_over_corpus": 2.6729765707305986
+        },
+        {
+          "token_id": 694,
+          "token": " but",
+          "firings": 73,
+          "share": 0.04241719930273097,
+          "lift_over_corpus": 29.6623771347769
+        },
+        {
+          "token_id": 695,
+          "token": " \n",
+          "firings": 71,
+          "share": 0.04125508425334108,
+          "lift_over_corpus": 4.635402725094504
+        },
+        {
+          "token_id": 2502,
+          "token": " ;",
+          "firings": 56,
+          "share": 0.03253922138291691,
+          "lift_over_corpus": 19.720740232070852
+        },
+        {
+          "token_id": 328,
+          "token": " \"",
+          "firings": 41,
+          "share": 0.023823358512492735,
+          "lift_over_corpus": 1.530080829318737
+        },
+        {
+          "token_id": 7643,
+          "token": " although",
+          "firings": 19,
+          "share": 0.011040092969203951,
+          "lift_over_corpus": 52.57187128192358
+        },
+        {
+          "token_id": 3384,
+          "token": " though",
+          "firings": 18,
+          "share": 0.010459035444509006,
+          "lift_over_corpus": 38.73716831299632
+        },
+        {
+          "token_id": 4213,
+          "token": " However",
+          "firings": 12,
+          "share": 0.006972690296339338,
+          "lift_over_corpus": 21.12936453436163
+        },
+        {
+          "token_id": 4611,
+          "token": " however",
+          "firings": 10,
+          "share": 0.005810575246949448,
+          "lift_over_corpus": 20.0364663687912
+        },
+        {
+          "token_id": 748,
+          "token": " so",
+          "firings": 8,
+          "share": 0.004648460197559558,
+          "lift_over_corpus": 7.878746097558573
+        },
+        {
+          "token_id": 539,
+          "token": " by",
+          "firings": 6,
+          "share": 0.003486345148169669,
+          "lift_over_corpus": 0.7595523198626729
+        }
+      ],
+      "angle": [
+        {
+          "token_id": 641,
+          "token": " .",
+          "firings": 1195,
+          "resultant_R1": 0.9921253323554993,
+          "null_max_R1": 0.9461473226547241,
+          "resultant_R2": 0.9688717126846313,
+          "null_max_R2": 0.8077940344810486,
+          "exceeds_all_nulls": true
+        },
+        {
+          "token_id": 1116,
+          "token": " ,",
+          "firings": 191,
+          "resultant_R1": 0.9866930246353149,
+          "null_max_R1": 0.9601536989212036,
+          "resultant_R2": 0.9479565620422363,
+          "null_max_R2": 0.8563867211341858,
+          "exceeds_all_nulls": true
+        },
+        {
+          "token_id": 694,
+          "token": " but",
+          "firings": 73,
+          "resultant_R1": 0.989962637424469,
+          "null_max_R1": 0.9667285680770874,
+          "resultant_R2": 0.9603700637817383,
+          "null_max_R2": 0.87870192527771,
+          "exceeds_all_nulls": true
+        },
+        {
+          "token_id": 695,
+          "token": " \n",
+          "firings": 71,
+          "resultant_R1": 0.9925220608711243,
+          "null_max_R1": 0.9719993472099304,
+          "resultant_R2": 0.970324695110321,
+          "null_max_R2": 0.8992433547973633,
+          "exceeds_all_nulls": true
+        },
+        {
+          "token_id": 2502,
+          "token": " ;",
+          "firings": 56,
+          "resultant_R1": 0.9939220547676086,
+          "null_max_R1": 0.9726484417915344,
+          "resultant_R2": 0.9759001731872559,
+          "null_max_R2": 0.904852569103241,
+          "exceeds_all_nulls": true
+        },
+        {
+          "token_id": 328,
+          "token": " \"",
+          "firings": 41,
+          "resultant_R1": 0.9950858354568481,
+          "null_max_R1": 0.9808738231658936,
+          "resultant_R2": 0.9805505275726318,
+          "null_max_R2": 0.9265283346176147,
+          "exceeds_all_nulls": true
+        }
+      ]
+    },
+    {
+      "block": 5944,
+      "atoms": [
+        11888,
+        11889
+      ],
+      "firings": 1701,
+      "firing_rate": 0.01701,
+      "mean_gate": 0.277934730052948,
+      "top_tokens": [
+        {
+          "token_id": 641,
+          "token": " .",
+          "firings": 1486,
+          "share": 0.8736037624926514,
+          "lift_over_corpus": 28.642746311234472
+        },
+        {
+          "token_id": 328,
+          "token": " \"",
+          "firings": 148,
+          "share": 0.08700764256319812,
+          "lift_over_corpus": 5.588159445292108
+        },
+        {
+          "token_id": 695,
+          "token": " \n",
+          "firings": 49,
+          "share": 0.02880658436213992,
+          "lift_over_corpus": 3.2366948721505526
+        },
+        {
+          "token_id": 847,
+          "token": " )",
+          "firings": 10,
+          "share": 0.005878894767783657,
+          "lift_over_corpus": 1.2697396906660168
+        },
+        {
+          "token_id": 13,
+          "token": ".",
+          "firings": 5,
+          "share": 0.0029394473838918285,
+          "lift_over_corpus": 1.5470775704693833
+        },
+        {
+          "token_id": 359,
+          "token": " '",
+          "firings": 1,
+          "share": 0.0005878894767783657,
+          "lift_over_corpus": 0.06875900313197258
+        },
+        {
+          "token_id": 426,
+          "token": " F",
+          "firings": 1,
+          "share": 0.0005878894767783657,
+          "lift_over_corpus": 0.3945566958244065
+        },
+        {
+          "token_id": 2228,
+          "token": "  \n",
+          "firings": 1,
+          "share": 0.0005878894767783657,
+          "lift_over_corpus": 58.78894767783656
+        }
+      ],
+      "angle": [
+        {
+          "token_id": 641,
+          "token": " .",
+          "firings": 1486,
+          "resultant_R1": 0.997340977191925,
+          "null_max_R1": 0.9933081269264221,
+          "resultant_R2": 0.9894386529922485,
+          "null_max_R2": 0.9739874005317688,
+          "exceeds_all_nulls": true
+        },
+        {
+          "token_id": 328,
+          "token": " \"",
+          "firings": 148,
+          "resultant_R1": 0.9914382100105286,
+          "null_max_R1": 0.9962993860244751,
+          "resultant_R2": 0.9663114547729492,
+          "null_max_R2": 0.9854034185409546,
+          "exceeds_all_nulls": false
+        },
+        {
+          "token_id": 695,
+          "token": " \n",
+          "firings": 49,
+          "resultant_R1": 0.9922532439231873,
+          "null_max_R1": 0.9968950748443604,
+          "resultant_R2": 0.9697337746620178,
+          "null_max_R2": 0.9877171516418457,
+          "exceeds_all_nulls": false
+        }
+      ]
+    },
+    {
+      "block": 6746,
+      "atoms": [
+        13492,
+        13493
+      ],
+      "firings": 1683,
+      "firing_rate": 0.01683,
+      "mean_gate": 0.15480689704418182,
+      "top_tokens": [
+        {
+          "token_id": 1473,
+          "token": " An",
+          "firings": 13,
+          "share": 0.007724301841948901,
+          "lift_over_corpus": 27.586792292674648
+        },
+        {
+          "token_id": 19996,
+          "token": " Lady",
+          "firings": 13,
+          "share": 0.007724301841948901,
+          "lift_over_corpus": 21.45639400541361
+        },
+        {
+          "token_id": 47495,
+          "token": " Cec",
+          "firings": 13,
+          "share": 0.007724301841948901,
+          "lift_over_corpus": 35.11046291794955
+        },
+        {
+          "token_id": 3629,
+          "token": " John",
+          "firings": 12,
+          "share": 0.0071301247771836,
+          "lift_over_corpus": 21.606438718738183
+        },
+        {
+          "token_id": 7366,
+          "token": " Jack",
+          "firings": 11,
+          "share": 0.006535947712418301,
+          "lift_over_corpus": 14.208581983518044
+        },
+        {
+          "token_id": 6683,
+          "token": " Paul",
+          "firings": 11,
+          "share": 0.006535947712418301,
+          "lift_over_corpus": 40.849673202614376
+        },
+        {
+          "token_id": 4090,
+          "token": " Ge",
+          "firings": 10,
+          "share": 0.0059417706476530005,
+          "lift_over_corpus": 20.488864302251727
+        },
+        {
+          "token_id": 78400,
+          "token": " Alg",
+          "firings": 10,
+          "share": 0.0059417706476530005,
+          "lift_over_corpus": 19.805902158843338
+        },
+        {
+          "token_id": 34361,
+          "token": " Wor",
+          "firings": 10,
+          "share": 0.0059417706476530005,
+          "lift_over_corpus": 49.51475539710834
+        },
+        {
+          "token_id": 8995,
+          "token": " Frank",
+          "firings": 9,
+          "share": 0.0053475935828877,
+          "lift_over_corpus": 38.19709702062644
+        },
+        {
+          "token_id": 1615,
+          "token": " Al",
+          "firings": 9,
+          "share": 0.0053475935828877,
+          "lift_over_corpus": 38.19709702062644
+        },
+        {
+          "token_id": 9503,
+          "token": " Mont",
+          "firings": 8,
+          "share": 0.004753416518122401,
+          "lift_over_corpus": 52.8157390902489
+        }
+      ],
+      "angle": []
+    },
+    {
+      "block": 3207,
+      "atoms": [
+        6414,
+        6415
+      ],
+      "firings": 1681,
+      "firing_rate": 0.01681,
+      "mean_gate": 0.16153867542743683,
+      "top_tokens": [
+        {
+          "token_id": 469,
+          "token": " G",
+          "firings": 43,
+          "share": 0.02558001189767995,
+          "lift_over_corpus": 33.65791039168415
+        },
+        {
+          "token_id": 426,
+          "token": " F",
+          "firings": 30,
+          "share": 0.01784651992861392,
+          "lift_over_corpus": 11.977530153432161
+        },
+        {
+          "token_id": 414,
+          "token": " D",
+          "firings": 27,
+          "share": 0.016061867935752528,
+          "lift_over_corpus": 20.331478399686745
+        },
+        {
+          "token_id": 326,
+          "token": " S",
+          "firings": 24,
+          "share": 0.014277215942891136,
+          "lift_over_corpus": 33.202827774165435
+        },
+        {
+          "token_id": 436,
+          "token": " L",
+          "firings": 24,
+          "share": 0.014277215942891136,
+          "lift_over_corpus": 27.45618450555988
+        },
+        {
+          "token_id": 1799,
+          "token": " Z",
+          "firings": 21,
+          "share": 0.012492563950029744,
+          "lift_over_corpus": 30.469668170804255
+        },
+        {
+          "token_id": 380,
+          "token": " M",
+          "firings": 21,
+          "share": 0.012492563950029744,
+          "lift_over_corpus": 19.219329153891916
+        },
+        {
+          "token_id": 417,
+          "token": " B",
+          "firings": 21,
+          "share": 0.012492563950029744,
+          "lift_over_corpus": 39.03926234384295
+        },
+        {
+          "token_id": 443,
+          "token": " N",
+          "firings": 18,
+          "share": 0.010707911957168352,
+          "lift_over_corpus": 42.831647828673404
+        },
+        {
+          "token_id": 357,
+          "token": " A",
+          "firings": 17,
+          "share": 0.010113027959547887,
+          "lift_over_corpus": 7.963014141376289
+        },
+        {
+          "token_id": 3135,
+          "token": " Br",
+          "firings": 16,
+          "share": 0.009518143961927425,
+          "lift_over_corpus": 22.13521851611029
+        },
+        {
+          "token_id": 882,
+          "token": " Ch",
+          "firings": 16,
+          "share": 0.009518143961927425,
+          "lift_over_corpus": 21.63214536801687
+        }
+      ],
+      "angle": [
+        {
+          "token_id": 469,
+          "token": " G",
+          "firings": 43,
+          "resultant_R1": 0.9665245413780212,
+          "null_max_R1": 0.9495689868927002,
+          "resultant_R2": 0.8741568326950073,
+          "null_max_R2": 0.8138217926025391,
+          "exceeds_all_nulls": true
+        },
+        {
+          "token_id": 426,
+          "token": " F",
+          "firings": 30,
+          "resultant_R1": 0.9802584648132324,
+          "null_max_R1": 0.9623962044715881,
+          "resultant_R2": 0.9238309860229492,
+          "null_max_R2": 0.8614816665649414,
+          "exceeds_all_nulls": true
+        },
+        {
+          "token_id": 414,
+          "token": " D",
+          "firings": 27,
+          "resultant_R1": 0.9860901832580566,
+          "null_max_R1": 0.9652277827262878,
+          "resultant_R2": 0.9456623792648315,
+          "null_max_R2": 0.8673808574676514,
+          "exceeds_all_nulls": true
+        },
+        {
+          "token_id": 326,
+          "token": " S",
+          "firings": 24,
+          "resultant_R1": 0.9779161214828491,
+          "null_max_R1": 0.961595892906189,
+          "resultant_R2": 0.9139846563339233,
+          "null_max_R2": 0.8549839854240417,
+          "exceeds_all_nulls": true
+        },
+        {
+          "token_id": 436,
+          "token": " L",
+          "firings": 24,
+          "resultant_R1": 0.9764869213104248,
+          "null_max_R1": 0.9655882120132446,
+          "resultant_R2": 0.907555878162384,
+          "null_max_R2": 0.8716698884963989,
+          "exceeds_all_nulls": true
+        },
+        {
+          "token_id": 1799,
+          "token": " Z",
+          "firings": 21,
+          "resultant_R1": 0.9714905023574829,
+          "null_max_R1": 0.9815095067024231,
+          "resultant_R2": 0.8919963240623474,
+          "null_max_R2": 0.9282101988792419,
+          "exceeds_all_nulls": false
+        }
+      ]
+    },
+    {
+      "block": 2031,
+      "atoms": [
+        4062,
+        4063
+      ],
+      "firings": 1665,
+      "firing_rate": 0.01665,
+      "mean_gate": 0.2804417610168457,
+      "top_tokens": [
+        {
+          "token_id": 641,
+          "token": " .",
+          "firings": 1467,
+          "share": 0.8810810810810811,
+          "lift_over_corpus": 28.887904297740363
+        },
+        {
+          "token_id": 695,
+          "token": " \n",
+          "firings": 162,
+          "share": 0.0972972972972973,
+          "lift_over_corpus": 10.932280595201945
+        },
+        {
+          "token_id": 328,
+          "token": " \"",
+          "firings": 18,
+          "share": 0.010810810810810811,
+          "lift_over_corpus": 0.6943359544515614
+        },
+        {
+          "token_id": 13,
+          "token": ".",
+          "firings": 6,
+          "share": 0.0036036036036036037,
+          "lift_over_corpus": 1.896633475580844
+        },
+        {
+          "token_id": 1116,
+          "token": " ,",
+          "firings": 5,
+          "share": 0.003003003003003003,
+          "lift_over_corpus": 0.07232666192203764
+        },
+        {
+          "token_id": 847,
+          "token": " )",
+          "firings": 3,
+          "share": 0.0018018018018018018,
+          "lift_over_corpus": 0.3891580565446657
+        },
+        {
+          "token_id": 535,
+          "token": " :",
+          "firings": 1,
+          "share": 0.0006006006006006006,
+          "lift_over_corpus": 0.28736870842134
+        },
+        {
+          "token_id": 220,
+          "token": " ",
+          "firings": 1,
+          "share": 0.0006006006006006006,
+          "lift_over_corpus": 0.025098228190580885
+        },
+        {
+          "token_id": 2205,
+          "token": " ]",
+          "firings": 1,
+          "share": 0.0006006006006006006,
+          "lift_over_corpus": 1.5400015400015399
+        },
+        {
+          "token_id": 2228,
+          "token": "  \n",
+          "firings": 1,
+          "share": 0.0006006006006006006,
+          "lift_over_corpus": 60.06006006006005
+        }
+      ],
+      "angle": [
+        {
+          "token_id": 641,
+          "token": " .",
+          "firings": 1467,
+          "resultant_R1": 0.9746403694152832,
+          "null_max_R1": 0.9746540784835815,
+          "resultant_R2": 0.9022905230522156,
+          "null_max_R2": 0.9024474620819092,
+          "exceeds_all_nulls": false
+        },
+        {
+          "token_id": 695,
+          "token": " \n",
+          "firings": 162,
+          "resultant_R1": 0.9917941689491272,
+          "null_max_R1": 0.982542097568512,
+          "resultant_R2": 0.9675919413566589,
+          "null_max_R2": 0.931981086730957,
+          "exceeds_all_nulls": true
+        }
+      ]
+    },
+    {
+      "block": 10324,
+      "atoms": [
+        20648,
+        20649
+      ],
+      "firings": 1660,
+      "firing_rate": 0.0166,
+      "mean_gate": 0.13745713233947754,
+      "top_tokens": [
+        {
+          "token_id": 279,
+          "token": " the",
+          "firings": 1013,
+          "share": 0.6102409638554217,
+          "lift_over_corpus": 14.658682773370687
+        },
+        {
+          "token_id": 310,
+          "token": " to",
+          "firings": 110,
+          "share": 0.06626506024096386,
+          "lift_over_corpus": 4.236896434844236
+        },
+        {
+          "token_id": 303,
+          "token": " in",
+          "firings": 79,
+          "share": 0.04759036144578313,
+          "lift_over_corpus": 3.252929695542251
+        },
+        {
+          "token_id": 383,
+          "token": " on",
+          "firings": 66,
+          "share": 0.03975903614457831,
+          "lift_over_corpus": 6.593538332434215
+        },
+        {
+          "token_id": 494,
+          "token": " from",
+          "firings": 61,
+          "share": 0.03674698795180723,
+          "lift_over_corpus": 11.592109763977044
+        },
+        {
+          "token_id": 364,
+          "token": " for",
+          "firings": 56,
+          "share": 0.033734939759036145,
+          "lift_over_corpus": 6.28211168697135
+        },
+        {
+          "token_id": 539,
+          "token": " by",
+          "firings": 51,
+          "share": 0.03072289156626506,
+          "lift_over_corpus": 6.693440428380187
+        },
+        {
+          "token_id": 440,
+          "token": " with",
+          "firings": 46,
+          "share": 0.027710843373493974,
+          "lift_over_corpus": 4.785983311484279
+        },
+        {
+          "token_id": 506,
+          "token": " at",
+          "firings": 39,
+          "share": 0.023493975903614458,
+          "lift_over_corpus": 7.603228447771669
+        },
+        {
+          "token_id": 314,
+          "token": " of",
+          "firings": 32,
+          "share": 0.01927710843373494,
+          "lift_over_corpus": 0.8867115194910277
+        },
+        {
+          "token_id": 6600,
+          "token": " throughout",
+          "firings": 11,
+          "share": 0.006626506024096385,
+          "lift_over_corpus": 20.707831325301203
+        },
+        {
+          "token_id": 888,
+          "token": " over",
+          "firings": 10,
+          "share": 0.006024096385542169,
+          "lift_over_corpus": 8.25218682950982
+        }
+      ],
+      "angle": [
+        {
+          "token_id": 279,
+          "token": " the",
+          "firings": 1013,
+          "resultant_R1": 0.9865063428878784,
+          "null_max_R1": 0.9765913486480713,
+          "resultant_R2": 0.947047233581543,
+          "null_max_R2": 0.9107460975646973,
+          "exceeds_all_nulls": true
+        },
+        {
+          "token_id": 310,
+          "token": " to",
+          "firings": 110,
+          "resultant_R1": 0.9806822538375854,
+          "null_max_R1": 0.9846216440200806,
+          "resultant_R2": 0.9252302646636963,
+          "null_max_R2": 0.9397109746932983,
+          "exceeds_all_nulls": false
+        },
+        {
+          "token_id": 303,
+          "token": " in",
+          "firings": 79,
+          "resultant_R1": 0.9874608516693115,
+          "null_max_R1": 0.9853411912918091,
+          "resultant_R2": 0.9508036971092224,
+          "null_max_R2": 0.9426050782203674,
+          "exceeds_all_nulls": true
+        },
+        {
+          "token_id": 383,
+          "token": " on",
+          "firings": 66,
+          "resultant_R1": 0.9748401641845703,
+          "null_max_R1": 0.9884161949157715,
+          "resultant_R2": 0.9037307500839233,
+          "null_max_R2": 0.954430878162384,
+          "exceeds_all_nulls": false
+        },
+        {
+          "token_id": 494,
+          "token": " from",
+          "firings": 61,
+          "resultant_R1": 0.9839012622833252,
+          "null_max_R1": 0.9885646104812622,
+          "resultant_R2": 0.9371616244316101,
+          "null_max_R2": 0.9556575417518616,
+          "exceeds_all_nulls": false
+        },
+        {
+          "token_id": 364,
+          "token": " for",
+          "firings": 56,
+          "resultant_R1": 0.9882696270942688,
+          "null_max_R1": 0.9858924746513367,
+          "resultant_R2": 0.9537622332572937,
+          "null_max_R2": 0.9446962475776672,
+          "exceeds_all_nulls": true
+        }
+      ]
+    },
+    {
+      "block": 3277,
+      "atoms": [
+        6554,
+        6555
+      ],
+      "firings": 1657,
+      "firing_rate": 0.01657,
+      "mean_gate": 0.269901305437088,
+      "top_tokens": [
+        {
+          "token_id": 641,
+          "token": " .",
+          "firings": 1543,
+          "share": 0.9312009656004828,
+          "lift_over_corpus": 30.53117920001583
+        },
+        {
+          "token_id": 1116,
+          "token": " ,",
+          "firings": 49,
+          "share": 0.029571514785757393,
+          "lift_over_corpus": 0.7122233811598602
+        },
+        {
+          "token_id": 694,
+          "token": " but",
+          "firings": 34,
+          "share": 0.02051901025950513,
+          "lift_over_corpus": 14.34895822343016
+        },
+        {
+          "token_id": 328,
+          "token": " \"",
+          "firings": 5,
+          "share": 0.0030175015087507543,
+          "lift_over_corpus": 0.19380228058771704
+        },
+        {
+          "token_id": 695,
+          "token": " \n",
+          "firings": 5,
+          "share": 0.0030175015087507543,
+          "lift_over_corpus": 0.33904511334278137
+        },
+        {
+          "token_id": 2502,
+          "token": " ;",
+          "firings": 4,
+          "share": 0.0024140012070006035,
+          "lift_over_corpus": 1.4630310345458204
+        },
+        {
+          "token_id": 7643,
+          "token": " although",
+          "firings": 4,
+          "share": 0.0024140012070006035,
+          "lift_over_corpus": 11.495243842860017
+        },
+        {
+          "token_id": 13,
+          "token": ".",
+          "firings": 2,
+          "share": 0.0012070006035003018,
+          "lift_over_corpus": 0.6352634755264747
+        },
+        {
+          "token_id": 4611,
+          "token": " however",
+          "firings": 2,
+          "share": 0.0012070006035003018,
+          "lift_over_corpus": 4.162071046552764
+        },
+        {
+          "token_id": 748,
+          "token": " so",
+          "firings": 1,
+          "share": 0.0006035003017501509,
+          "lift_over_corpus": 1.022881867373137
+        },
+        {
+          "token_id": 279,
+          "token": " the",
+          "firings": 1,
+          "share": 0.0006035003017501509,
+          "lift_over_corpus": 0.014496764394670932
+        },
+        {
+          "token_id": 440,
+          "token": " with",
+          "firings": 1,
+          "share": 0.0006035003017501509,
+          "lift_over_corpus": 0.10423148562178772
+        }
+      ],
+      "angle": [
+        {
+          "token_id": 641,
+          "token": " .",
+          "firings": 1543,
+          "resultant_R1": 0.9965500831604004,
+          "null_max_R1": 0.9770905375480652,
+          "resultant_R2": 0.9862779974937439,
+          "null_max_R2": 0.9248048663139343,
+          "exceeds_all_nulls": true
+        },
+        {
+          "token_id": 1116,
+          "token": " ,",
+          "firings": 49,
+          "resultant_R1": 0.9918395280838013,
+          "null_max_R1": 0.9978369474411011,
+          "resultant_R2": 0.9677083492279053,
+          "null_max_R2": 0.9913713335990906,
+          "exceeds_all_nulls": false
+        },
+        {
+          "token_id": 694,
+          "token": " but",
+          "firings": 34,
+          "resultant_R1": 0.9916602373123169,
+          "null_max_R1": 0.9982792735099792,
+          "resultant_R2": 0.9669641256332397,
+          "null_max_R2": 0.9931318163871765,
+          "exceeds_all_nulls": false
+        }
+      ]
+    },
+    {
+      "block": 12219,
+      "atoms": [
+        24438,
+        24439
+      ],
+      "firings": 1646,
+      "firing_rate": 0.01646,
+      "mean_gate": 0.26458901166915894,
+      "top_tokens": [
+        {
+          "token_id": 641,
+          "token": " .",
+          "firings": 1355,
+          "share": 0.8232077764277035,
+          "lift_over_corpus": 26.990418899268967
+        },
+        {
+          "token_id": 695,
+          "token": " \n",
+          "firings": 249,
+          "share": 0.15127582017010935,
+          "lift_over_corpus": 16.997283165180825
+        },
+        {
+          "token_id": 328,
+          "token": " \"",
+          "firings": 39,
+          "share": 0.023693803159173753,
+          "lift_over_corpus": 1.5217599973778904
+        },
+        {
+          "token_id": 13,
+          "token": ".",
+          "firings": 1,
+          "share": 0.0006075334143377885,
+          "lift_over_corpus": 0.31975442859883607
+        },
+        {
+          "token_id": 426,
+          "token": " F",
+          "firings": 1,
+          "share": 0.0006075334143377885,
+          "lift_over_corpus": 0.4077405465354285
+        },
+        {
+          "token_id": 220,
+          "token": " ",
+          "firings": 1,
+          "share": 0.0006075334143377885,
+          "lift_over_corpus": 0.025387940423643483
+        }
+      ],
+      "angle": [
+        {
+          "token_id": 641,
+          "token": " .",
+          "firings": 1355,
+          "resultant_R1": 0.9989301562309265,
+          "null_max_R1": 0.98912513256073,
+          "resultant_R2": 0.9957292675971985,
+          "null_max_R2": 0.9578514695167542,
+          "exceeds_all_nulls": true
+        },
+        {
+          "token_id": 695,
+          "token": " \n",
+          "firings": 249,
+          "resultant_R1": 0.9950838685035706,
+          "null_max_R1": 0.9918209910392761,
+          "resultant_R2": 0.9805071353912354,
+          "null_max_R2": 0.9681466221809387,
+          "exceeds_all_nulls": true
+        },
+        {
+          "token_id": 328,
+          "token": " \"",
+          "firings": 39,
+          "resultant_R1": 0.9976593852043152,
+          "null_max_R1": 0.9969107508659363,
+          "resultant_R2": 0.9906668663024902,
+          "null_max_R2": 0.9878169298171997,
+          "exceeds_all_nulls": true
+        }
+      ]
+    },
+    {
+      "block": 13589,
+      "atoms": [
+        27178,
+        27179
+      ],
+      "firings": 1621,
+      "firing_rate": 0.01621,
+      "mean_gate": 0.27740851044654846,
+      "top_tokens": [
+        {
+          "token_id": 641,
+          "token": " .",
+          "firings": 1323,
+          "share": 0.8161628624305984,
+          "lift_over_corpus": 26.759438112478637
+        },
+        {
+          "token_id": 695,
+          "token": " \n",
+          "firings": 176,
+          "share": 0.10857495373226403,
+          "lift_over_corpus": 12.199433003625172
+        },
+        {
+          "token_id": 328,
+          "token": " \"",
+          "firings": 113,
+          "share": 0.06971005552128316,
+          "lift_over_corpus": 4.477203309009837
+        },
+        {
+          "token_id": 1116,
+          "token": " ,",
+          "firings": 6,
+          "share": 0.003701418877236274,
+          "lift_over_corpus": 0.08914785349798347
+        },
+        {
+          "token_id": 13,
+          "token": ".",
+          "firings": 2,
+          "share": 0.0012338062924120913,
+          "lift_over_corpus": 0.6493717328484692
+        },
+        {
+          "token_id": 2228,
+          "token": "  \n",
+          "firings": 1,
+          "share": 0.0006169031462060457,
+          "lift_over_corpus": 61.69031462060456
+        }
+      ],
+      "angle": [
+        {
+          "token_id": 641,
+          "token": " .",
+          "firings": 1323,
+          "resultant_R1": 0.9928873777389526,
+          "null_max_R1": 0.989764928817749,
+          "resultant_R2": 0.9718230366706848,
+          "null_max_R2": 0.9597766995429993,
+          "exceeds_all_nulls": true
+        },
+        {
+          "token_id": 695,
+          "token": " \n",
+          "firings": 176,
+          "resultant_R1": 0.996911346912384,
+          "null_max_R1": 0.9916878938674927,
+          "resultant_R2": 0.9876934289932251,
+          "null_max_R2": 0.967104971408844,
+          "exceeds_all_nulls": true
+        },
+        {
+          "token_id": 328,
+          "token": " \"",
+          "firings": 113,
+          "resultant_R1": 0.9981932640075684,
+          "null_max_R1": 0.9932935833930969,
+          "resultant_R2": 0.9927955865859985,
+          "null_max_R2": 0.9733858108520508,
+          "exceeds_all_nulls": true
+        }
+      ]
+    },
+    {
+      "block": 15183,
+      "atoms": [
+        30366,
+        30367
+      ],
+      "firings": 1592,
+      "firing_rate": 0.01592,
+      "mean_gate": 0.1391574889421463,
+      "top_tokens": [
+        {
+          "token_id": 279,
+          "token": " the",
+          "firings": 1145,
+          "share": 0.7192211055276382,
+          "lift_over_corpus": 17.276509861341296
+        },
+        {
+          "token_id": 264,
+          "token": " a",
+          "firings": 170,
+          "share": 0.10678391959798995,
+          "lift_over_corpus": 8.316504641588002
+        },
+        {
+          "token_id": 310,
+          "token": " to",
+          "firings": 106,
+          "share": 0.06658291457286432,
+          "lift_over_corpus": 4.257219601845544
+        },
+        {
+          "token_id": 449,
+          "token": " an",
+          "firings": 41,
+          "share": 0.025753768844221106,
+          "lift_over_corpus": 11.00588412146201
+        },
+        {
+          "token_id": 539,
+          "token": " by",
+          "firings": 18,
+          "share": 0.011306532663316583,
+          "lift_over_corpus": 2.4632968765395606
+        },
+        {
+          "token_id": 314,
+          "token": " of",
+          "firings": 18,
+          "share": 0.011306532663316583,
+          "lift_over_corpus": 0.5200796993245899
+        },
+        {
+          "token_id": 506,
+          "token": " at",
+          "firings": 13,
+          "share": 0.008165829145728644,
+          "lift_over_corpus": 2.64266315395749
+        },
+        {
+          "token_id": 364,
+          "token": " for",
+          "firings": 11,
+          "share": 0.006909547738693468,
+          "lift_over_corpus": 1.2866941785276478
+        },
+        {
+          "token_id": 383,
+          "token": " on",
+          "firings": 10,
+          "share": 0.00628140703517588,
+          "lift_over_corpus": 1.0416927089843913
+        },
+        {
+          "token_id": 836,
+          "token": " their",
+          "firings": 10,
+          "share": 0.00628140703517588,
+          "lift_over_corpus": 3.8301262409609023
+        },
+        {
+          "token_id": 303,
+          "token": " in",
+          "firings": 9,
+          "share": 0.005653266331658292,
+          "lift_over_corpus": 0.3864160172015237
+        },
+        {
+          "token_id": 440,
+          "token": " with",
+          "firings": 7,
+          "share": 0.0043969849246231155,
+          "lift_over_corpus": 0.7594101769642687
+        }
+      ],
+      "angle": [
+        {
+          "token_id": 279,
+          "token": " the",
+          "firings": 1145,
+          "resultant_R1": 0.9732615351676941,
+          "null_max_R1": 0.9559207558631897,
+          "resultant_R2": 0.8969331383705139,
+          "null_max_R2": 0.8339710235595703,
+          "exceeds_all_nulls": true
+        },
+        {
+          "token_id": 264,
+          "token": " a",
+          "firings": 170,
+          "resultant_R1": 0.9927762746810913,
+          "null_max_R1": 0.9625910520553589,
+          "resultant_R2": 0.9714692831039429,
+          "null_max_R2": 0.8573333024978638,
+          "exceeds_all_nulls": true
+        },
+        {
+          "token_id": 310,
+          "token": " to",
+          "firings": 106,
+          "resultant_R1": 0.9741595387458801,
+          "null_max_R1": 0.96794593334198,
+          "resultant_R2": 0.9002245664596558,
+          "null_max_R2": 0.8770845532417297,
+          "exceeds_all_nulls": true
+        },
+        {
+          "token_id": 449,
+          "token": " an",
+          "firings": 41,
+          "resultant_R1": 0.9925801157951355,
+          "null_max_R1": 0.972902774810791,
+          "resultant_R2": 0.9706432223320007,
+          "null_max_R2": 0.8949155211448669,
+          "exceeds_all_nulls": true
+        }
+      ]
+    },
+    {
+      "block": 15512,
+      "atoms": [
+        31024,
+        31025
+      ],
+      "firings": 1567,
+      "firing_rate": 0.01567,
+      "mean_gate": 0.2691766917705536,
+      "top_tokens": [
+        {
+          "token_id": 641,
+          "token": " .",
+          "firings": 1426,
+          "share": 0.9100191448627951,
+          "lift_over_corpus": 29.836693274190004
+        },
+        {
+          "token_id": 695,
+          "token": " \n",
+          "firings": 49,
+          "share": 0.031269942565411615,
+          "lift_over_corpus": 3.513476692742878
+        },
+        {
+          "token_id": 1116,
+          "token": " ,",
+          "firings": 28,
+          "share": 0.017868538608806637,
+          "lift_over_corpus": 0.4303597930830115
+        },
+        {
+          "token_id": 694,
+          "token": " but",
+          "firings": 19,
+          "share": 0.012125079770261647,
+          "lift_over_corpus": 8.479076762420732
+        },
+        {
+          "token_id": 2502,
+          "token": " ;",
+          "firings": 15,
+          "share": 0.009572431397574984,
+          "lift_over_corpus": 5.801473574287869
+        },
+        {
+          "token_id": 328,
+          "token": " \"",
+          "firings": 9,
+          "share": 0.00574345883854499,
+          "lift_over_corpus": 0.36887982264258123
+        },
+        {
+          "token_id": 13,
+          "token": ".",
+          "firings": 4,
+          "share": 0.0025526483726866626,
+          "lift_over_corpus": 1.343499143519296
+        },
+        {
+          "token_id": 847,
+          "token": " )",
+          "firings": 4,
+          "share": 0.0025526483726866626,
+          "lift_over_corpus": 0.551327942264938
+        },
+        {
+          "token_id": 3384,
+          "token": " though",
+          "firings": 4,
+          "share": 0.0025526483726866626,
+          "lift_over_corpus": 9.454253232172825
+        },
+        {
+          "token_id": 7643,
+          "token": " although",
+          "firings": 3,
+          "share": 0.0019144862795149968,
+          "lift_over_corpus": 9.116601331023794
+        },
+        {
+          "token_id": 440,
+          "token": " with",
+          "firings": 3,
+          "share": 0.0019144862795149968,
+          "lift_over_corpus": 0.3306539342858371
+        },
+        {
+          "token_id": 279,
+          "token": " the",
+          "firings": 1,
+          "share": 0.0006381620931716656,
+          "lift_over_corpus": 0.015329380090599703
+        }
+      ],
+      "angle": [
+        {
+          "token_id": 641,
+          "token": " .",
+          "firings": 1426,
+          "resultant_R1": 0.9952670335769653,
+          "null_max_R1": 0.9832026958465576,
+          "resultant_R2": 0.9811913967132568,
+          "null_max_R2": 0.9428648352622986,
+          "exceeds_all_nulls": true
+        },
+        {
+          "token_id": 695,
+          "token": " \n",
+          "firings": 49,
+          "resultant_R1": 0.9945999383926392,
+          "null_max_R1": 0.9962428212165833,
+          "resultant_R2": 0.9785175323486328,
+          "null_max_R2": 0.9850330948829651,
+          "exceeds_all_nulls": false
+        },
+        {
+          "token_id": 1116,
+          "token": " ,",
+          "firings": 28,
+          "resultant_R1": 0.9916500449180603,
+          "null_max_R1": 0.9981701374053955,
+          "resultant_R2": 0.9671412110328674,
+          "null_max_R2": 0.9926969408988953,
+          "exceeds_all_nulls": false
+        }
+      ]
+    },
+    {
+      "block": 13674,
+      "atoms": [
+        27348,
+        27349
+      ],
+      "firings": 1520,
+      "firing_rate": 0.0152,
+      "mean_gate": 0.2600957453250885,
+      "top_tokens": [
+        {
+          "token_id": 641,
+          "token": " .",
+          "firings": 1368,
+          "share": 0.9,
+          "lift_over_corpus": 29.508196721311478
+        },
+        {
+          "token_id": 1116,
+          "token": " ,",
+          "firings": 68,
+          "share": 0.04473684210526316,
+          "lift_over_corpus": 1.0774769293175135
+        },
+        {
+          "token_id": 694,
+          "token": " but",
+          "firings": 38,
+          "share": 0.025,
+          "lift_over_corpus": 17.482517482517483
+        },
+        {
+          "token_id": 695,
+          "token": " \n",
+          "firings": 11,
+          "share": 0.007236842105263158,
+          "lift_over_corpus": 0.8131283264340626
+        },
+        {
+          "token_id": 7643,
+          "token": " although",
+          "firings": 9,
+          "share": 0.0059210526315789476,
+          "lift_over_corpus": 28.195488721804512
+        },
+        {
+          "token_id": 2502,
+          "token": " ;",
+          "firings": 8,
+          "share": 0.005263157894736842,
+          "lift_over_corpus": 3.189792663476874
+        },
+        {
+          "token_id": 3384,
+          "token": " though",
+          "firings": 6,
+          "share": 0.003947368421052632,
+          "lift_over_corpus": 14.619883040935672
+        },
+        {
+          "token_id": 539,
+          "token": " by",
+          "firings": 3,
+          "share": 0.001973684210526316,
+          "lift_over_corpus": 0.42999656002751974
+        },
+        {
+          "token_id": 13,
+          "token": ".",
+          "firings": 2,
+          "share": 0.0013157894736842105,
+          "lift_over_corpus": 0.6925207756232686
+        },
+        {
+          "token_id": 1048,
+          "token": " also",
+          "firings": 1,
+          "share": 0.0006578947368421052,
+          "lift_over_corpus": 0.4011553273427471
+        },
+        {
+          "token_id": 440,
+          "token": " with",
+          "firings": 1,
+          "share": 0.0006578947368421052,
+          "lift_over_corpus": 0.11362603399690938
+        },
+        {
+          "token_id": 535,
+          "token": " :",
+          "firings": 1,
+          "share": 0.0006578947368421052,
+          "lift_over_corpus": 0.3147821707378494
+        }
+      ],
+      "angle": [
+        {
+          "token_id": 641,
+          "token": " .",
+          "firings": 1368,
+          "resultant_R1": 0.9960101842880249,
+          "null_max_R1": 0.9648545980453491,
+          "resultant_R2": 0.9841229915618896,
+          "null_max_R2": 0.8886758685112,
+          "exceeds_all_nulls": true
+        },
+        {
+          "token_id": 1116,
+          "token": " ,",
+          "firings": 68,
+          "resultant_R1": 0.9920268058776855,
+          "null_max_R1": 0.994642436504364,
+          "resultant_R2": 0.9684600234031677,
+          "null_max_R2": 0.9793261289596558,
+          "exceeds_all_nulls": false
+        },
+        {
+          "token_id": 694,
+          "token": " but",
+          "firings": 38,
+          "resultant_R1": 0.9945538640022278,
+          "null_max_R1": 0.9971329569816589,
+          "resultant_R2": 0.9783666729927063,
+          "null_max_R2": 0.9885693788528442,
+          "exceeds_all_nulls": false
+        }
+      ]
+    },
+    {
+      "block": 15047,
+      "atoms": [
+        30094,
+        30095
+      ],
+      "firings": 1506,
+      "firing_rate": 0.01506,
+      "mean_gate": 0.15019838511943817,
+      "top_tokens": [
+        {
+          "token_id": 3507,
+          "token": "apping",
+          "firings": 26,
+          "share": 0.017264276228419653,
+          "lift_over_corpus": 47.95632285672126
+        },
+        {
+          "token_id": 12878,
+          "token": " Young",
+          "firings": 19,
+          "share": 0.012616201859229747,
+          "lift_over_corpus": 36.0462910263707
+        },
+        {
+          "token_id": 3629,
+          "token": " John",
+          "firings": 18,
+          "share": 0.01195219123505976,
+          "lift_over_corpus": 36.21876131836291
+        },
+        {
+          "token_id": 13,
+          "token": ".",
+          "firings": 16,
+          "share": 0.010624169986719787,
+          "lift_over_corpus": 5.5916684140630455
+        },
+        {
+          "token_id": 2088,
+          "token": " Me",
+          "firings": 15,
+          "share": 0.0099601593625498,
+          "lift_over_corpus": 47.42933029785619
+        },
+        {
+          "token_id": 3135,
+          "token": " Br",
+          "firings": 15,
+          "share": 0.0099601593625498,
+          "lift_over_corpus": 23.16316130825535
+        },
+        {
+          "token_id": 20064,
+          "token": " Being",
+          "firings": 14,
+          "share": 0.009296148738379814,
+          "lift_over_corpus": 66.40106241699868
+        },
+        {
+          "token_id": 903,
+          "token": "ern",
+          "firings": 14,
+          "share": 0.009296148738379814,
+          "lift_over_corpus": 25.822635384388374
+        },
+        {
+          "token_id": 89799,
+          "token": " Importance",
+          "firings": 13,
+          "share": 0.008632138114209827,
+          "lift_over_corpus": 41.10541959147536
+        },
+        {
+          "token_id": 7687,
+          "token": " Michael",
+          "firings": 11,
+          "share": 0.0073041168658698535,
+          "lift_over_corpus": 42.96539332864619
+        },
+        {
+          "token_id": 7366,
+          "token": " Jack",
+          "firings": 11,
+          "share": 0.0073041168658698535,
+          "lift_over_corpus": 15.878514925804028
+        },
+        {
+          "token_id": 75014,
+          "token": "ogie",
+          "firings": 10,
+          "share": 0.006640106241699867,
+          "lift_over_corpus": 66.40106241699867
+        }
+      ],
+      "angle": [
+        {
+          "token_id": 3507,
+          "token": "apping",
+          "firings": 26,
+          "resultant_R1": 0.9987755417823792,
+          "null_max_R1": 0.9952172040939331,
+          "resultant_R2": 0.9951127171516418,
+          "null_max_R2": 0.9810001254081726,
+          "exceeds_all_nulls": true
+        }
+      ]
+    },
+    {
+      "block": 3398,
+      "atoms": [
+        6796,
+        6797
+      ],
+      "firings": 1504,
+      "firing_rate": 0.01504,
+      "mean_gate": 0.15544095635414124,
+      "top_tokens": [
+        {
+          "token_id": 3629,
+          "token": " John",
+          "firings": 16,
+          "share": 0.010638297872340425,
+          "lift_over_corpus": 32.23726627981947
+        },
+        {
+          "token_id": 3507,
+          "token": "apping",
+          "firings": 15,
+          "share": 0.00997340425531915,
+          "lift_over_corpus": 27.70390070921986
+        },
+        {
+          "token_id": 7687,
+          "token": " Michael",
+          "firings": 13,
+          "share": 0.008643617021276596,
+          "lift_over_corpus": 50.84480600750938
+        },
+        {
+          "token_id": 7366,
+          "token": " Jack",
+          "firings": 11,
+          "share": 0.007313829787234043,
+          "lift_over_corpus": 15.899629972247919
+        },
+        {
+          "token_id": 6683,
+          "token": " Paul",
+          "firings": 11,
+          "share": 0.007313829787234043,
+          "lift_over_corpus": 45.711436170212764
+        },
+        {
+          "token_id": 77236,
+          "token": " Devin",
+          "firings": 10,
+          "share": 0.006648936170212766,
+          "lift_over_corpus": 21.448181194234728
+        },
+        {
+          "token_id": 8995,
+          "token": " Frank",
+          "firings": 9,
+          "share": 0.005984042553191489,
+          "lift_over_corpus": 42.74316109422493
+        },
+        {
+          "token_id": 8137,
+          "token": " Robert",
+          "firings": 8,
+          "share": 0.005319148936170213,
+          "lift_over_corpus": 48.355899419729205
+        },
+        {
+          "token_id": 47495,
+          "token": " Cec",
+          "firings": 8,
+          "share": 0.005319148936170213,
+          "lift_over_corpus": 24.177949709864603
+        },
+        {
+          "token_id": 85181,
+          "token": " Fey",
+          "firings": 8,
+          "share": 0.005319148936170213,
+          "lift_over_corpus": 4.58547322083639
+        },
+        {
+          "token_id": 89799,
+          "token": " Importance",
+          "firings": 8,
+          "share": 0.005319148936170213,
+          "lift_over_corpus": 25.329280648429584
+        },
+        {
+          "token_id": 6584,
+          "token": " David",
+          "firings": 7,
+          "share": 0.004654255319148936,
+          "lift_over_corpus": 27.377972465581973
+        }
+      ],
+      "angle": []
+    },
+    {
+      "block": 13596,
+      "atoms": [
+        27192,
+        27193
+      ],
+      "firings": 1496,
+      "firing_rate": 0.01496,
+      "mean_gate": 0.20781221985816956,
+      "top_tokens": [
+        {
+          "token_id": 554,
+          "token": " @",
+          "firings": 791,
+          "share": 0.5287433155080213,
+          "lift_over_corpus": 57.7861547003302
+        },
+        {
+          "token_id": 12,
+          "token": "-",
+          "firings": 422,
+          "share": 0.2820855614973262,
+          "lift_over_corpus": 39.5077817223146
+        },
+        {
+          "token_id": 31,
+          "token": "@",
+          "firings": 197,
+          "share": 0.13168449197860962,
+          "lift_over_corpus": 18.573271083019694
+        },
+        {
+          "token_id": 56490,
+          "token": ".@",
+          "firings": 40,
+          "share": 0.026737967914438502,
+          "lift_over_corpus": 22.659294842744494
+        },
+        {
+          "token_id": 30095,
+          "token": ",@",
+          "firings": 39,
+          "share": 0.02606951871657754,
+          "lift_over_corpus": 31.409058694671735
+        },
+        {
+          "token_id": 498,
+          "token": " [",
+          "firings": 4,
+          "share": 0.00267379679144385,
+          "lift_over_corpus": 6.855889208830385
+        },
+        {
+          "token_id": 310,
+          "token": " to",
+          "firings": 1,
+          "share": 0.0006684491978609625,
+          "lift_over_corpus": 0.04273971853330962
+        },
+        {
+          "token_id": 279,
+          "token": " the",
+          "firings": 1,
+          "share": 0.0006684491978609625,
+          "lift_over_corpus": 0.01605691083019367
+        },
+        {
+          "token_id": 2423,
+          "token": " ...",
+          "firings": 1,
+          "share": 0.0006684491978609625,
+          "lift_over_corpus": 1.8568033273915625
+        }
+      ],
+      "angle": [
+        {
+          "token_id": 554,
+          "token": " @",
+          "firings": 791,
+          "resultant_R1": 0.9964113235473633,
+          "null_max_R1": 0.9961415529251099,
+          "resultant_R2": 0.9857384562492371,
+          "null_max_R2": 0.9846426248550415,
+          "exceeds_all_nulls": true
+        },
+        {
+          "token_id": 12,
+          "token": "-",
+          "firings": 422,
+          "resultant_R1": 0.9989595413208008,
+          "null_max_R1": 0.9964897632598877,
+          "resultant_R2": 0.9958449602127075,
+          "null_max_R2": 0.986016035079956,
+          "exceeds_all_nulls": true
+        },
+        {
+          "token_id": 31,
+          "token": "@",
+          "firings": 197,
+          "resultant_R1": 0.9989951252937317,
+          "null_max_R1": 0.9967700242996216,
+          "resultant_R2": 0.9959906935691833,
+          "null_max_R2": 0.9871245622634888,
+          "exceeds_all_nulls": true
+        },
+        {
+          "token_id": 56490,
+          "token": ".@",
+          "firings": 40,
+          "resultant_R1": 0.9988660216331482,
+          "null_max_R1": 0.9981270432472229,
+          "resultant_R2": 0.9954723119735718,
+          "null_max_R2": 0.9925276637077332,
+          "exceeds_all_nulls": true
+        },
+        {
+          "token_id": 30095,
+          "token": ",@",
+          "firings": 39,
+          "resultant_R1": 0.9984071850776672,
+          "null_max_R1": 0.9980645775794983,
+          "resultant_R2": 0.9936425685882568,
+          "null_max_R2": 0.9922774434089661,
+          "exceeds_all_nulls": true
+        }
+      ]
+    },
+    {
+      "block": 12190,
+      "atoms": [
+        24380,
+        24381
+      ],
+      "firings": 1467,
+      "firing_rate": 0.01467,
+      "mean_gate": 0.2770165205001831,
+      "top_tokens": [
+        {
+          "token_id": 641,
+          "token": " .",
+          "firings": 1425,
+          "share": 0.9713701431492843,
+          "lift_over_corpus": 31.84820141473063
+        },
+        {
+          "token_id": 328,
+          "token": " \"",
+          "firings": 33,
+          "share": 0.022494887525562373,
+          "lift_over_corpus": 1.444758351031623
+        },
+        {
+          "token_id": 695,
+          "token": " \n",
+          "firings": 6,
+          "share": 0.00408997955010225,
+          "lift_over_corpus": 0.45954826405643256
+        },
+        {
+          "token_id": 13,
+          "token": ".",
+          "firings": 2,
+          "share": 0.0013633265167007499,
+          "lift_over_corpus": 0.7175402719477632
+        },
+        {
+          "token_id": 1116,
+          "token": " ,",
+          "firings": 1,
+          "share": 0.0006816632583503749,
+          "lift_over_corpus": 0.01641770853445026
+        }
+      ],
+      "angle": [
+        {
+          "token_id": 641,
+          "token": " .",
+          "firings": 1425,
+          "resultant_R1": 0.9929817318916321,
+          "null_max_R1": 0.9929227232933044,
+          "resultant_R2": 0.9722068905830383,
+          "null_max_R2": 0.9720422029495239,
+          "exceeds_all_nulls": true
+        },
+        {
+          "token_id": 328,
+          "token": " \"",
+          "firings": 33,
+          "resultant_R1": 0.9981201887130737,
+          "null_max_R1": 0.9962137341499329,
+          "resultant_R2": 0.9924985766410828,
+          "null_max_R2": 0.9849441051483154,
+          "exceeds_all_nulls": true
+        }
+      ]
+    },
+    {
+      "block": 3146,
+      "atoms": [
+        6292,
+        6293
+      ],
+      "firings": 1449,
+      "firing_rate": 0.01449,
+      "mean_gate": 0.1520635485649109,
+      "top_tokens": [
+        {
+          "token_id": 3507,
+          "token": "apping",
+          "firings": 19,
+          "share": 0.013112491373360938,
+          "lift_over_corpus": 36.423587148224826
+        },
+        {
+          "token_id": 1478,
+          "token": " New",
+          "firings": 15,
+          "share": 0.010351966873706004,
+          "lift_over_corpus": 15.684798293493946
+        },
+        {
+          "token_id": 3629,
+          "token": " John",
+          "firings": 14,
+          "share": 0.00966183574879227,
+          "lift_over_corpus": 29.278290147855365
+        },
+        {
+          "token_id": 15,
+          "token": "0",
+          "firings": 12,
+          "share": 0.008281573498964804,
+          "lift_over_corpus": 0.5945135318711273
+        },
+        {
+          "token_id": 7687,
+          "token": " Michael",
+          "firings": 11,
+          "share": 0.00759144237405107,
+          "lift_over_corpus": 44.655543376771
+        },
+        {
+          "token_id": 77236,
+          "token": " Devin",
+          "firings": 10,
+          "share": 0.006901311249137336,
+          "lift_over_corpus": 22.26229435205592
+        },
+        {
+          "token_id": 8995,
+          "token": " Frank",
+          "firings": 9,
+          "share": 0.006211180124223602,
+          "lift_over_corpus": 44.36557231588288
+        },
+        {
+          "token_id": 6683,
+          "token": " Paul",
+          "firings": 9,
+          "share": 0.006211180124223602,
+          "lift_over_corpus": 38.81987577639751
+        },
+        {
+          "token_id": 13,
+          "token": ".",
+          "firings": 9,
+          "share": 0.006211180124223602,
+          "lift_over_corpus": 3.269042170644001
+        },
+        {
+          "token_id": 89799,
+          "token": " Importance",
+          "firings": 9,
+          "share": 0.006211180124223602,
+          "lift_over_corpus": 29.57704821058858
+        },
+        {
+          "token_id": 12878,
+          "token": " Young",
+          "firings": 8,
+          "share": 0.005521048999309869,
+          "lift_over_corpus": 15.774425712313912
+        },
+        {
+          "token_id": 423,
+          "token": " R",
+          "firings": 8,
+          "share": 0.005521048999309869,
+          "lift_over_corpus": 17.80983548164474
+        }
+      ],
+      "angle": []
+    },
+    {
+      "block": 15274,
+      "atoms": [
+        30548,
+        30549
+      ],
+      "firings": 1442,
+      "firing_rate": 0.01442,
+      "mean_gate": 0.14968085289001465,
+      "top_tokens": [
+        {
+          "token_id": 3507,
+          "token": "apping",
+          "firings": 19,
+          "share": 0.013176144244105409,
+          "lift_over_corpus": 36.60040067807058
+        },
+        {
+          "token_id": 1478,
+          "token": " New",
+          "firings": 14,
+          "share": 0.009708737864077669,
+          "lift_over_corpus": 14.710208884966166
+        },
+        {
+          "token_id": 3135,
+          "token": " Br",
+          "firings": 11,
+          "share": 0.0076282940360610264,
+          "lift_over_corpus": 17.740218688514016
+        },
+        {
+          "token_id": 47495,
+          "token": " Cec",
+          "firings": 11,
+          "share": 0.0076282940360610264,
+          "lift_over_corpus": 34.674063800277395
+        },
+        {
+          "token_id": 469,
+          "token": " G",
+          "firings": 11,
+          "share": 0.0076282940360610264,
+          "lift_over_corpus": 10.03722899481714
+        },
+        {
+          "token_id": 3629,
+          "token": " John",
+          "firings": 11,
+          "share": 0.0076282940360610264,
+          "lift_over_corpus": 23.11604253351826
+        },
+        {
+          "token_id": 882,
+          "token": " Ch",
+          "firings": 9,
+          "share": 0.0062413314840499305,
+          "lift_over_corpus": 14.18484428193166
+        },
+        {
+          "token_id": 2732,
+          "token": " Be",
+          "firings": 9,
+          "share": 0.0062413314840499305,
+          "lift_over_corpus": 32.849113073947
+        },
+        {
+          "token_id": 357,
+          "token": " A",
+          "firings": 9,
+          "share": 0.0062413314840499305,
+          "lift_over_corpus": 4.914434239409394
+        },
+        {
+          "token_id": 19684,
+          "token": " Magn",
+          "firings": 8,
+          "share": 0.005547850208044383,
+          "lift_over_corpus": 34.67406380027739
+        },
+        {
+          "token_id": 38899,
+          "token": "wend",
+          "firings": 8,
+          "share": 0.005547850208044383,
+          "lift_over_corpus": 21.33788541555532
+        },
+        {
+          "token_id": 6683,
+          "token": " Paul",
+          "firings": 8,
+          "share": 0.005547850208044383,
+          "lift_over_corpus": 34.67406380027739
+        }
+      ],
+      "angle": []
+    },
+    {
+      "block": 444,
+      "atoms": [
+        888,
+        889
+      ],
+      "firings": 1428,
+      "firing_rate": 0.01428,
+      "mean_gate": 0.18978749215602875,
+      "top_tokens": [
+        {
+          "token_id": 551,
+          "token": " he",
+          "firings": 240,
+          "share": 0.16806722689075632,
+          "lift_over_corpus": 57.36082829036052
+        },
+        {
+          "token_id": 1292,
+          "token": " she",
+          "firings": 152,
+          "share": 0.10644257703081232,
+          "lift_over_corpus": 50.44671897194897
+        },
+        {
+          "token_id": 310,
+          "token": " to",
+          "firings": 109,
+          "share": 0.07633053221288516,
+          "lift_over_corpus": 4.880468811565547
+        },
+        {
+          "token_id": 92371,
+          "token": " Townsend",
+          "firings": 78,
+          "share": 0.0546218487394958,
+          "lift_over_corpus": 38.46609066161676
+        },
+        {
+          "token_id": 19857,
+          "token": " Ross",
+          "firings": 57,
+          "share": 0.03991596638655462,
+          "lift_over_corpus": 41.57913165266106
+        },
+        {
+          "token_id": 12073,
+          "token": "stein",
+          "firings": 53,
+          "share": 0.03711484593837535,
+          "lift_over_corpus": 27.09112842217179
+        },
+        {
+          "token_id": 1216,
+          "token": " He",
+          "firings": 53,
+          "share": 0.03711484593837535,
+          "lift_over_corpus": 32.84499640564191
+        },
+        {
+          "token_id": 42573,
+          "token": " Nicole",
+          "firings": 51,
+          "share": 0.03571428571428571,
+          "lift_over_corpus": 27.90178571428571
+        },
+        {
+          "token_id": 852,
+          "token": " who",
+          "firings": 37,
+          "share": 0.025910364145658265,
+          "lift_over_corpus": 19.051738342395783
+        },
+        {
+          "token_id": 85181,
+          "token": " Fey",
+          "firings": 36,
+          "share": 0.025210084033613446,
+          "lift_over_corpus": 21.732831063459866
+        },
+        {
+          "token_id": 2838,
+          "token": " She",
+          "firings": 34,
+          "share": 0.023809523809523808,
+          "lift_over_corpus": 20.177562550443906
+        },
+        {
+          "token_id": 20016,
+          "token": " Anderson",
+          "firings": 29,
+          "share": 0.02030812324929972,
+          "lift_over_corpus": 29.011604641856746
+        }
+      ],
+      "angle": [
+        {
+          "token_id": 551,
+          "token": " he",
+          "firings": 240,
+          "resultant_R1": 0.9950251579284668,
+          "null_max_R1": 0.9818902611732483,
+          "resultant_R2": 0.9802696704864502,
+          "null_max_R2": 0.9291764497756958,
+          "exceeds_all_nulls": true
+        },
+        {
+          "token_id": 1292,
+          "token": " she",
+          "firings": 152,
+          "resultant_R1": 0.9948282241821289,
+          "null_max_R1": 0.9811049699783325,
+          "resultant_R2": 0.9795657992362976,
+          "null_max_R2": 0.9258745908737183,
+          "exceeds_all_nulls": true
+        },
+        {
+          "token_id": 310,
+          "token": " to",
+          "firings": 109,
+          "resultant_R1": 0.9948874711990356,
+          "null_max_R1": 0.98207026720047,
+          "resultant_R2": 0.9796949028968811,
+          "null_max_R2": 0.9296302199363708,
+          "exceeds_all_nulls": true
+        },
+        {
+          "token_id": 92371,
+          "token": " Townsend",
+          "firings": 78,
+          "resultant_R1": 0.9978981614112854,
+          "null_max_R1": 0.9842398166656494,
+          "resultant_R2": 0.9916109442710876,
+          "null_max_R2": 0.9381184577941895,
+          "exceeds_all_nulls": true
+        },
+        {
+          "token_id": 19857,
+          "token": " Ross",
+          "firings": 57,
+          "resultant_R1": 0.9970424175262451,
+          "null_max_R1": 0.98529052734375,
+          "resultant_R2": 0.9882117509841919,
+          "null_max_R2": 0.9420182704925537,
+          "exceeds_all_nulls": true
+        },
+        {
+          "token_id": 12073,
+          "token": "stein",
+          "firings": 53,
+          "resultant_R1": 0.9961528182029724,
+          "null_max_R1": 0.9873611927032471,
+          "resultant_R2": 0.9846931099891663,
+          "null_max_R2": 0.9502374529838562,
+          "exceeds_all_nulls": true
+        }
+      ]
+    },
+    {
+      "block": 5917,
+      "atoms": [
+        11834,
+        11835
+      ],
+      "firings": 1387,
+      "firing_rate": 0.01387,
+      "mean_gate": 0.1566430926322937,
+      "top_tokens": [
+        {
+          "token_id": 3135,
+          "token": " Br",
+          "firings": 17,
+          "share": 0.012256669069935111,
+          "lift_over_corpus": 28.50388155798863
+        },
+        {
+          "token_id": 496,
+          "token": " O",
+          "firings": 10,
+          "share": 0.007209805335255948,
+          "lift_over_corpus": 34.33240635836165
+        },
+        {
+          "token_id": 299,
+          "token": "as",
+          "firings": 9,
+          "share": 0.006488824801730353,
+          "lift_over_corpus": 43.25883201153569
+        },
+        {
+          "token_id": 38899,
+          "token": "wend",
+          "firings": 8,
+          "share": 0.005767844268204758,
+          "lift_over_corpus": 22.18401641617215
+        },
+        {
+          "token_id": 382,
+          "token": "ers",
+          "firings": 8,
+          "share": 0.005767844268204758,
+          "lift_over_corpus": 5.243494789277053
+        },
+        {
+          "token_id": 469,
+          "token": " G",
+          "firings": 7,
+          "share": 0.005046863734679163,
+          "lift_over_corpus": 6.6406101772094255
+        },
+        {
+          "token_id": 1369,
+          "token": " Sh",
+          "firings": 7,
+          "share": 0.005046863734679163,
+          "lift_over_corpus": 45.88057940617421
+        },
+        {
+          "token_id": 25274,
+          "token": " Cab",
+          "firings": 7,
+          "share": 0.005046863734679163,
+          "lift_over_corpus": 38.82202872830126
+        },
+        {
+          "token_id": 4361,
+          "token": " Str",
+          "firings": 6,
+          "share": 0.004325883201153569,
+          "lift_over_corpus": 12.016342225426579
+        },
+        {
+          "token_id": 3507,
+          "token": "apping",
+          "firings": 6,
+          "share": 0.004325883201153569,
+          "lift_over_corpus": 12.016342225426579
+        },
+        {
+          "token_id": 19684,
+          "token": " Magn",
+          "firings": 5,
+          "share": 0.003604902667627974,
+          "lift_over_corpus": 22.530641672674836
+        },
+        {
+          "token_id": 462,
+          "token": " H",
+          "firings": 5,
+          "share": 0.003604902667627974,
+          "lift_over_corpus": 13.865010260107592
+        }
+      ],
+      "angle": []
+    },
+    {
+      "block": 13507,
+      "atoms": [
+        27014,
+        27015
+      ],
+      "firings": 1370,
+      "firing_rate": 0.0137,
+      "mean_gate": 0.27166372537612915,
+      "top_tokens": [
+        {
+          "token_id": 641,
+          "token": " .",
+          "firings": 1053,
+          "share": 0.7686131386861313,
+          "lift_over_corpus": 25.20043077659447
+        },
+        {
+          "token_id": 695,
+          "token": " \n",
+          "firings": 272,
+          "share": 0.19854014598540146,
+          "lift_over_corpus": 22.307881571393423
+        },
+        {
+          "token_id": 321,
+          "token": " and",
+          "firings": 24,
+          "share": 0.017518248175182483,
+          "lift_over_corpus": 0.8650986753176535
+        },
+        {
+          "token_id": 328,
+          "token": " \"",
+          "firings": 13,
+          "share": 0.00948905109489051,
+          "lift_over_corpus": 0.6094445147649653
+        },
+        {
+          "token_id": 1116,
+          "token": " ,",
+          "firings": 3,
+          "share": 0.0021897810218978104,
+          "lift_over_corpus": 0.052740390700814314
+        },
+        {
+          "token_id": 318,
+          "token": " (",
+          "firings": 1,
+          "share": 0.00072992700729927,
+          "lift_over_corpus": 0.15937270901730788
+        },
+        {
+          "token_id": 13,
+          "token": ".",
+          "firings": 1,
+          "share": 0.00072992700729927,
+          "lift_over_corpus": 0.384172109104879
+        },
+        {
+          "token_id": 279,
+          "token": " the",
+          "firings": 1,
+          "share": 0.00072992700729927,
+          "lift_over_corpus": 0.01753367781165674
+        },
+        {
+          "token_id": 1317,
+          "token": " \u2013",
+          "firings": 1,
+          "share": 0.00072992700729927,
+          "lift_over_corpus": 0.5367110347788749
+        },
+        {
+          "token_id": 1472,
+          "token": " through",
+          "firings": 1,
+          "share": 0.00072992700729927,
+          "lift_over_corpus": 2.1468441391154998
+        }
+      ],
+      "angle": [
+        {
+          "token_id": 641,
+          "token": " .",
+          "firings": 1053,
+          "resultant_R1": 0.9895769357681274,
+          "null_max_R1": 0.9648663997650146,
+          "resultant_R2": 0.9588220119476318,
+          "null_max_R2": 0.8782603740692139,
+          "exceeds_all_nulls": true
+        },
+        {
+          "token_id": 695,
+          "token": " \n",
+          "firings": 272,
+          "resultant_R1": 0.9949569702148438,
+          "null_max_R1": 0.973825216293335,
+          "resultant_R2": 0.980025589466095,
+          "null_max_R2": 0.9022857546806335,
+          "exceeds_all_nulls": true
+        },
+        {
+          "token_id": 321,
+          "token": " and",
+          "firings": 24,
+          "resultant_R1": 0.9994532465934753,
+          "null_max_R1": 0.990062952041626,
+          "resultant_R2": 0.9978148341178894,
+          "null_max_R2": 0.9612106084823608,
+          "exceeds_all_nulls": true
+        }
+      ]
+    },
+    {
+      "block": 16299,
+      "atoms": [
+        32598,
+        32599
+      ],
+      "firings": 1360,
+      "firing_rate": 0.0136,
+      "mean_gate": 0.16540710628032684,
+      "top_tokens": [
+        {
+          "token_id": 264,
+          "token": " a",
+          "firings": 981,
+          "share": 0.7213235294117647,
+          "lift_over_corpus": 56.177844969763605
+        },
+        {
+          "token_id": 449,
+          "token": " an",
+          "firings": 161,
+          "share": 0.11838235294117647,
+          "lift_over_corpus": 50.59074912016088
+        },
+        {
+          "token_id": 279,
+          "token": " the",
+          "firings": 70,
+          "share": 0.051470588235294115,
+          "lift_over_corpus": 1.2363821339249126
+        },
+        {
+          "token_id": 310,
+          "token": " to",
+          "firings": 20,
+          "share": 0.014705882352941176,
+          "lift_over_corpus": 0.9402738077328117
+        },
+        {
+          "token_id": 1024,
+          "token": " her",
+          "firings": 19,
+          "share": 0.013970588235294118,
+          "lift_over_corpus": 4.550680206936195
+        },
+        {
+          "token_id": 440,
+          "token": " with",
+          "firings": 15,
+          "share": 0.011029411764705883,
+          "lift_over_corpus": 1.904907040536422
+        },
+        {
+          "token_id": 357,
+          "token": " A",
+          "firings": 9,
+          "share": 0.006617647058823529,
+          "lift_over_corpus": 5.210745715609078
+        },
+        {
+          "token_id": 314,
+          "token": " of",
+          "firings": 9,
+          "share": 0.006617647058823529,
+          "lift_over_corpus": 0.30439958872233347
+        },
+        {
+          "token_id": 780,
+          "token": " his",
+          "firings": 9,
+          "share": 0.006617647058823529,
+          "lift_over_corpus": 1.7011946166641465
+        },
+        {
+          "token_id": 1141,
+          "token": " its",
+          "firings": 8,
+          "share": 0.0058823529411764705,
+          "lift_over_corpus": 5.824111822947001
+        },
+        {
+          "token_id": 383,
+          "token": " on",
+          "firings": 8,
+          "share": 0.0058823529411764705,
+          "lift_over_corpus": 0.9755145839430299
+        },
+        {
+          "token_id": 430,
+          "token": " as",
+          "firings": 8,
+          "share": 0.0058823529411764705,
+          "lift_over_corpus": 0.9611687812379854
+        }
+      ],
+      "angle": [
+        {
+          "token_id": 264,
+          "token": " a",
+          "firings": 981,
+          "resultant_R1": 0.9775882959365845,
+          "null_max_R1": 0.9420004487037659,
+          "resultant_R2": 0.912676215171814,
+          "null_max_R2": 0.7912836670875549,
+          "exceeds_all_nulls": true
+        },
+        {
+          "token_id": 449,
+          "token": " an",
+          "firings": 161,
+          "resultant_R1": 0.9733846783638,
+          "null_max_R1": 0.9544820785522461,
+          "resultant_R2": 0.8966412544250488,
+          "null_max_R2": 0.8369457125663757,
+          "exceeds_all_nulls": true
+        },
+        {
+          "token_id": 279,
+          "token": " the",
+          "firings": 70,
+          "resultant_R1": 0.9899954199790955,
+          "null_max_R1": 0.968140721321106,
+          "resultant_R2": 0.9604838490486145,
+          "null_max_R2": 0.8805817365646362,
+          "exceeds_all_nulls": true
+        },
+        {
+          "token_id": 310,
+          "token": " to",
+          "firings": 20,
+          "resultant_R1": 0.9896462559700012,
+          "null_max_R1": 0.9841114282608032,
+          "resultant_R2": 0.9593732953071594,
+          "null_max_R2": 0.937406599521637,
+          "exceeds_all_nulls": true
+        }
+      ]
+    },
+    {
+      "block": 15750,
+      "atoms": [
+        31500,
+        31501
+      ],
+      "firings": 1343,
+      "firing_rate": 0.01343,
+      "mean_gate": 0.20362544059753418,
+      "top_tokens": [
+        {
+          "token_id": 15,
+          "token": "0",
+          "firings": 404,
+          "share": 0.30081906180193596,
+          "lift_over_corpus": 21.595051098487865
+        },
+        {
+          "token_id": 17,
+          "token": "2",
+          "firings": 371,
+          "share": 0.276247207743857,
+          "lift_over_corpus": 29.64025834161556
+        },
+        {
+          "token_id": 24,
+          "token": "9",
+          "firings": 357,
+          "share": 0.26582278481012656,
+          "lift_over_corpus": 36.766636903198695
+        },
+        {
+          "token_id": 16,
+          "token": "1",
+          "firings": 148,
+          "share": 0.11020104244229337,
+          "lift_over_corpus": 8.1994823245754
+        },
+        {
+          "token_id": 220,
+          "token": " ",
+          "firings": 59,
+          "share": 0.04393149664929263,
+          "lift_over_corpus": 1.835833541550047
+        },
+        {
+          "token_id": 23,
+          "token": "8",
+          "firings": 3,
+          "share": 0.0022338049143708115,
+          "lift_over_corpus": 0.5956813104988831
+        },
+        {
+          "token_id": 22,
+          "token": "7",
+          "firings": 1,
+          "share": 0.0007446016381236039,
+          "lift_over_corpus": 0.28204607504681967
+        }
+      ],
+      "angle": [
+        {
+          "token_id": 15,
+          "token": "0",
+          "firings": 404,
+          "resultant_R1": 0.9852507710456848,
+          "null_max_R1": 0.9041866064071655,
+          "resultant_R2": 0.9421406388282776,
+          "null_max_R2": 0.6441137194633484,
+          "exceeds_all_nulls": true
+        },
+        {
+          "token_id": 17,
+          "token": "2",
+          "firings": 371,
+          "resultant_R1": 0.9993633031845093,
+          "null_max_R1": 0.9064335227012634,
+          "resultant_R2": 0.9974550604820251,
+          "null_max_R2": 0.6500031352043152,
+          "exceeds_all_nulls": true
+        },
+        {
+          "token_id": 24,
+          "token": "9",
+          "firings": 357,
+          "resultant_R1": 0.9882004857063293,
+          "null_max_R1": 0.9044161438941956,
+          "resultant_R2": 0.9537332057952881,
+          "null_max_R2": 0.6410610675811768,
+          "exceeds_all_nulls": true
+        },
+        {
+          "token_id": 16,
+          "token": "1",
+          "firings": 148,
+          "resultant_R1": 0.9973613619804382,
+          "null_max_R1": 0.9091130495071411,
+          "resultant_R2": 0.9901977777481079,
+          "null_max_R2": 0.6642230153083801,
+          "exceeds_all_nulls": true
+        },
+        {
+          "token_id": 220,
+          "token": " ",
+          "firings": 59,
+          "resultant_R1": 0.983018159866333,
+          "null_max_R1": 0.9154492020606995,
+          "resultant_R2": 0.9418750405311584,
+          "null_max_R2": 0.6866976022720337,
+          "exceeds_all_nulls": true
+        }
+      ]
+    },
+    {
+      "block": 10186,
+      "atoms": [
+        20372,
+        20373
+      ],
+      "firings": 1342,
+      "firing_rate": 0.01342,
+      "mean_gate": 0.16656793653964996,
+      "top_tokens": [
+        {
+          "token_id": 264,
+          "token": " a",
+          "firings": 1042,
+          "share": 0.7764530551415797,
+          "lift_over_corpus": 60.47142173999841
+        },
+        {
+          "token_id": 449,
+          "token": " an",
+          "firings": 178,
+          "share": 0.13263785394932937,
+          "lift_over_corpus": 56.682843568089474
+        },
+        {
+          "token_id": 279,
+          "token": " the",
+          "firings": 102,
+          "share": 0.07600596125186289,
+          "lift_over_corpus": 1.8257497298069394
+        },
+        {
+          "token_id": 357,
+          "token": " A",
+          "firings": 8,
+          "share": 0.005961251862891207,
+          "lift_over_corpus": 4.693899104638746
+        },
+        {
+          "token_id": 780,
+          "token": " his",
+          "firings": 3,
+          "share": 0.0022354694485842027,
+          "lift_over_corpus": 0.5746708094046794
+        },
+        {
+          "token_id": 310,
+          "token": " to",
+          "firings": 3,
+          "share": 0.0022354694485842027,
+          "lift_over_corpus": 0.14293282919336334
+        },
+        {
+          "token_id": 1473,
+          "token": " An",
+          "firings": 2,
+          "share": 0.0014903129657228018,
+          "lift_over_corpus": 5.322546306152864
+        },
+        {
+          "token_id": 1141,
+          "token": " its",
+          "firings": 2,
+          "share": 0.0014903129657228018,
+          "lift_over_corpus": 1.4755573918047542
+        },
+        {
+          "token_id": 836,
+          "token": " their",
+          "firings": 1,
+          "share": 0.0007451564828614009,
+          "lift_over_corpus": 0.4543637090618298
+        },
+        {
+          "token_id": 314,
+          "token": " of",
+          "firings": 1,
+          "share": 0.0007451564828614009,
+          "lift_over_corpus": 0.034275827178537305
+        }
+      ],
+      "angle": [
+        {
+          "token_id": 264,
+          "token": " a",
+          "firings": 1042,
+          "resultant_R1": 0.9628724455833435,
+          "null_max_R1": 0.9386928081512451,
+          "resultant_R2": 0.8572472333908081,
+          "null_max_R2": 0.7796040177345276,
+          "exceeds_all_nulls": true
+        },
+        {
+          "token_id": 449,
+          "token": " an",
+          "firings": 178,
+          "resultant_R1": 0.9610888957977295,
+          "null_max_R1": 0.9519813656806946,
+          "resultant_R2": 0.8503588438034058,
+          "null_max_R2": 0.8234699964523315,
+          "exceeds_all_nulls": true
+        },
+        {
+          "token_id": 279,
+          "token": " the",
+          "firings": 102,
+          "resultant_R1": 0.9960787892341614,
+          "null_max_R1": 0.9528466463088989,
+          "resultant_R2": 0.9844658374786377,
+          "null_max_R2": 0.8280515670776367,
+          "exceeds_all_nulls": true
+        }
+      ]
+    },
+    {
+      "block": 2517,
+      "atoms": [
+        5034,
+        5035
+      ],
+      "firings": 1338,
+      "firing_rate": 0.01338,
+      "mean_gate": 0.14267252385616302,
+      "top_tokens": [
+        {
+          "token_id": 279,
+          "token": " the",
+          "firings": 883,
+          "share": 0.6599402092675636,
+          "lift_over_corpus": 15.852515235829056
+        },
+        {
+          "token_id": 264,
+          "token": " a",
+          "firings": 248,
+          "share": 0.18535127055306427,
+          "lift_over_corpus": 14.435457208182575
+        },
+        {
+          "token_id": 449,
+          "token": " an",
+          "firings": 63,
+          "share": 0.04708520179372197,
+          "lift_over_corpus": 20.12188110842819
+        },
+        {
+          "token_id": 310,
+          "token": " to",
+          "firings": 47,
+          "share": 0.035127055306427506,
+          "lift_over_corpus": 2.2459754032242647
+        },
+        {
+          "token_id": 430,
+          "token": " as",
+          "firings": 23,
+          "share": 0.0171898355754858,
+          "lift_over_corpus": 2.8087966626610785
+        },
+        {
+          "token_id": 539,
+          "token": " by",
+          "firings": 14,
+          "share": 0.01046337817638266,
+          "lift_over_corpus": 2.2796030885365273
+        },
+        {
+          "token_id": 494,
+          "token": " from",
+          "firings": 13,
+          "share": 0.009715994020926755,
+          "lift_over_corpus": 3.064982340986358
+        },
+        {
+          "token_id": 364,
+          "token": " for",
+          "firings": 10,
+          "share": 0.007473841554559043,
+          "lift_over_corpus": 1.391776825802429
+        },
+        {
+          "token_id": 314,
+          "token": " of",
+          "firings": 10,
+          "share": 0.007473841554559043,
+          "lift_over_corpus": 0.34378296019130833
+        },
+        {
+          "token_id": 440,
+          "token": " with",
+          "firings": 7,
+          "share": 0.00523168908819133,
+          "lift_over_corpus": 0.9035732449380536
+        },
+        {
+          "token_id": 780,
+          "token": " his",
+          "firings": 5,
+          "share": 0.0037369207772795215,
+          "lift_over_corpus": 0.9606480147248128
+        },
+        {
+          "token_id": 303,
+          "token": " in",
+          "firings": 4,
+          "share": 0.0029895366218236174,
+          "lift_over_corpus": 0.20434289964618027
+        }
+      ],
+      "angle": [
+        {
+          "token_id": 279,
+          "token": " the",
+          "firings": 883,
+          "resultant_R1": 0.9484269618988037,
+          "null_max_R1": 0.9024151563644409,
+          "resultant_R2": 0.8111525177955627,
+          "null_max_R2": 0.6442201733589172,
+          "exceeds_all_nulls": true
+        },
+        {
+          "token_id": 264,
+          "token": " a",
+          "firings": 248,
+          "resultant_R1": 0.9925807118415833,
+          "null_max_R1": 0.911702573299408,
+          "resultant_R2": 0.9705744981765747,
+          "null_max_R2": 0.678092896938324,
+          "exceeds_all_nulls": true
+        },
+        {
+          "token_id": 449,
+          "token": " an",
+          "firings": 63,
+          "resultant_R1": 0.9931104779243469,
+          "null_max_R1": 0.924557626247406,
+          "resultant_R2": 0.9727081656455994,
+          "null_max_R2": 0.7265700101852417,
+          "exceeds_all_nulls": true
+        },
+        {
+          "token_id": 310,
+          "token": " to",
+          "firings": 47,
+          "resultant_R1": 0.9635190963745117,
+          "null_max_R1": 0.9338757991790771,
+          "resultant_R2": 0.8604564070701599,
+          "null_max_R2": 0.758850634098053,
+          "exceeds_all_nulls": true
+        },
+        {
+          "token_id": 430,
+          "token": " as",
+          "firings": 23,
+          "resultant_R1": 0.9910762310028076,
+          "null_max_R1": 0.949626088142395,
+          "resultant_R2": 0.9654043912887573,
+          "null_max_R2": 0.821707010269165,
+          "exceeds_all_nulls": true
+        }
+      ]
+    },
+    {
+      "block": 191,
+      "atoms": [
+        382,
+        383
+      ],
+      "firings": 1335,
+      "firing_rate": 0.01335,
+      "mean_gate": 0.13879455626010895,
+      "top_tokens": [
+        {
+          "token_id": 279,
+          "token": " the",
+          "firings": 954,
+          "share": 0.7146067415730337,
+          "lift_over_corpus": 17.16566758522781
+        },
+        {
+          "token_id": 310,
+          "token": " to",
+          "firings": 89,
+          "share": 0.06666666666666667,
+          "lift_over_corpus": 4.262574595055413
+        },
+        {
+          "token_id": 539,
+          "token": " by",
+          "firings": 76,
+          "share": 0.05692883895131086,
+          "lift_over_corpus": 12.402797157148335
+        },
+        {
+          "token_id": 314,
+          "token": " of",
+          "firings": 56,
+          "share": 0.041947565543071164,
+          "lift_over_corpus": 1.9295108345478917
+        },
+        {
+          "token_id": 506,
+          "token": " at",
+          "firings": 37,
+          "share": 0.027715355805243445,
+          "lift_over_corpus": 8.969370810758397
+        },
+        {
+          "token_id": 364,
+          "token": " for",
+          "firings": 31,
+          "share": 0.023220973782771534,
+          "lift_over_corpus": 4.3242036839425575
+        },
+        {
+          "token_id": 440,
+          "token": " with",
+          "firings": 23,
+          "share": 0.017228464419475654,
+          "lift_over_corpus": 2.975555167439664
+        },
+        {
+          "token_id": 303,
+          "token": " in",
+          "firings": 15,
+          "share": 0.011235955056179775,
+          "lift_over_corpus": 0.7680078644005314
+        },
+        {
+          "token_id": 383,
+          "token": " on",
+          "firings": 14,
+          "share": 0.010486891385767791,
+          "lift_over_corpus": 1.739119632797312
+        },
+        {
+          "token_id": 494,
+          "token": " from",
+          "firings": 10,
+          "share": 0.00749063670411985,
+          "lift_over_corpus": 2.362976878271246
+        },
+        {
+          "token_id": 780,
+          "token": " his",
+          "firings": 9,
+          "share": 0.006741573033707865,
+          "lift_over_corpus": 1.7330521937552354
+        },
+        {
+          "token_id": 430,
+          "token": " as",
+          "firings": 5,
+          "share": 0.003745318352059925,
+          "lift_over_corpus": 0.6119801228856088
+        }
+      ],
+      "angle": [
+        {
+          "token_id": 279,
+          "token": " the",
+          "firings": 954,
+          "resultant_R1": 0.9132751226425171,
+          "null_max_R1": 0.8968413472175598,
+          "resultant_R2": 0.6829765439033508,
+          "null_max_R2": 0.634643018245697,
+          "exceeds_all_nulls": true
+        },
+        {
+          "token_id": 310,
+          "token": " to",
+          "firings": 89,
+          "resultant_R1": 0.9672084450721741,
+          "null_max_R1": 0.9214754104614258,
+          "resultant_R2": 0.8948058485984802,
+          "null_max_R2": 0.712805986404419,
+          "exceeds_all_nulls": true
+        },
+        {
+          "token_id": 539,
+          "token": " by",
+          "firings": 76,
+          "resultant_R1": 0.8620761632919312,
+          "null_max_R1": 0.9259777069091797,
+          "resultant_R2": 0.5034621953964233,
+          "null_max_R2": 0.7312706708908081,
+          "exceeds_all_nulls": false
+        },
+        {
+          "token_id": 314,
+          "token": " of",
+          "firings": 56,
+          "resultant_R1": 0.9644558429718018,
+          "null_max_R1": 0.9303854703903198,
+          "resultant_R2": 0.8645930290222168,
+          "null_max_R2": 0.7523452043533325,
+          "exceeds_all_nulls": true
+        },
+        {
+          "token_id": 506,
+          "token": " at",
+          "firings": 37,
+          "resultant_R1": 0.902030348777771,
+          "null_max_R1": 0.9354751110076904,
+          "resultant_R2": 0.730282723903656,
+          "null_max_R2": 0.7673351168632507,
+          "exceeds_all_nulls": false
+        },
+        {
+          "token_id": 364,
+          "token": " for",
+          "firings": 31,
+          "resultant_R1": 0.928467869758606,
+          "null_max_R1": 0.9510045647621155,
+          "resultant_R2": 0.808404803276062,
+          "null_max_R2": 0.8256829380989075,
+          "exceeds_all_nulls": false
+        }
+      ]
+    },
+    {
+      "block": 7282,
+      "atoms": [
+        14564,
+        14565
+      ],
+      "firings": 1315,
+      "firing_rate": 0.01315,
+      "mean_gate": 0.1846274733543396,
+      "top_tokens": [
+        {
+          "token_id": 220,
+          "token": " ",
+          "firings": 537,
+          "share": 0.40836501901140687,
+          "lift_over_corpus": 17.064981989611653
+        },
+        {
+          "token_id": 16,
+          "token": "1",
+          "firings": 410,
+          "share": 0.311787072243346,
+          "lift_over_corpus": 23.198442875248958
+        },
+        {
+          "token_id": 17,
+          "token": "2",
+          "firings": 217,
+          "share": 0.1650190114068441,
+          "lift_over_corpus": 17.70590251146396
+        },
+        {
+          "token_id": 15,
+          "token": "0",
+          "firings": 28,
+          "share": 0.02129277566539924,
+          "lift_over_corpus": 1.5285553241492635
+        },
+        {
+          "token_id": 19,
+          "token": "4",
+          "firings": 23,
+          "share": 0.01749049429657795,
+          "lift_over_corpus": 4.997284084736557
+        },
+        {
+          "token_id": 20,
+          "token": "5",
+          "firings": 19,
+          "share": 0.014448669201520912,
+          "lift_over_corpus": 3.8736378556356335
+        },
+        {
+          "token_id": 23,
+          "token": "8",
+          "firings": 18,
+          "share": 0.013688212927756654,
+          "lift_over_corpus": 3.650190114068441
+        },
+        {
+          "token_id": 18,
+          "token": "3",
+          "firings": 18,
+          "share": 0.013688212927756654,
+          "lift_over_corpus": 3.866726815750467
+        },
+        {
+          "token_id": 24,
+          "token": "9",
+          "firings": 14,
+          "share": 0.01064638783269962,
+          "lift_over_corpus": 1.4725294374411644
+        },
+        {
+          "token_id": 22,
+          "token": "7",
+          "firings": 14,
+          "share": 0.01064638783269962,
+          "lift_over_corpus": 4.032722663901371
+        },
+        {
+          "token_id": 21,
+          "token": "6",
+          "firings": 12,
+          "share": 0.009125475285171103,
+          "lift_over_corpus": 3.537005924484924
+        },
+        {
+          "token_id": 6108,
+          "token": " ^",
+          "firings": 3,
+          "share": 0.0022813688212927757,
+          "lift_over_corpus": 45.627376425855516
+        }
+      ],
+      "angle": [
+        {
+          "token_id": 220,
+          "token": " ",
+          "firings": 537,
+          "resultant_R1": 0.9674012064933777,
+          "null_max_R1": 0.8634251952171326,
+          "resultant_R2": 0.8843377828598022,
+          "null_max_R2": 0.5061795711517334,
+          "exceeds_all_nulls": true
+        },
+        {
+          "token_id": 16,
+          "token": "1",
+          "firings": 410,
+          "resultant_R1": 0.942546010017395,
+          "null_max_R1": 0.8655920624732971,
+          "resultant_R2": 0.8059651255607605,
+          "null_max_R2": 0.5176559686660767,
+          "exceeds_all_nulls": true
+        },
+        {
+          "token_id": 17,
+          "token": "2",
+          "firings": 217,
+          "resultant_R1": 0.9187057614326477,
+          "null_max_R1": 0.8708955645561218,
+          "resultant_R2": 0.7241689562797546,
+          "null_max_R2": 0.5352907776832581,
+          "exceeds_all_nulls": true
+        },
+        {
+          "token_id": 15,
+          "token": "0",
+          "firings": 28,
+          "resultant_R1": 0.9929794073104858,
+          "null_max_R1": 0.9210784435272217,
+          "resultant_R2": 0.9722113013267517,
+          "null_max_R2": 0.7513085007667542,
+          "exceeds_all_nulls": true
+        },
+        {
+          "token_id": 19,
+          "token": "4",
+          "firings": 23,
+          "resultant_R1": 0.997136652469635,
+          "null_max_R1": 0.9221190810203552,
+          "resultant_R2": 0.9885958433151245,
+          "null_max_R2": 0.736831784248352,
+          "exceeds_all_nulls": true
+        }
+      ]
+    },
+    {
+      "block": 8146,
+      "atoms": [
+        16292,
+        16293
+      ],
+      "firings": 1313,
+      "firing_rate": 0.01313,
+      "mean_gate": 0.16141223907470703,
+      "top_tokens": [
+        {
+          "token_id": 3135,
+          "token": " Br",
+          "firings": 17,
+          "share": 0.012947448591012947,
+          "lift_over_corpus": 30.110345560495226
+        },
+        {
+          "token_id": 463,
+          "token": "ack",
+          "firings": 14,
+          "share": 0.010662604722010662,
+          "lift_over_corpus": 33.32063975628331
+        },
+        {
+          "token_id": 882,
+          "token": " Ch",
+          "firings": 14,
+          "share": 0.010662604722010662,
+          "lift_over_corpus": 24.23319255002423
+        },
+        {
+          "token_id": 78377,
+          "token": "inkel",
+          "firings": 12,
+          "share": 0.00913937547600914,
+          "lift_over_corpus": 6.671076989787694
+        },
+        {
+          "token_id": 436,
+          "token": " L",
+          "firings": 10,
+          "share": 0.007616146230007616,
+          "lift_over_corpus": 14.646435057706956
+        },
+        {
+          "token_id": 469,
+          "token": " G",
+          "firings": 10,
+          "share": 0.007616146230007616,
+          "lift_over_corpus": 10.021245039483706
+        },
+        {
+          "token_id": 299,
+          "token": "as",
+          "firings": 9,
+          "share": 0.006854531607006854,
+          "lift_over_corpus": 45.6968773800457
+        },
+        {
+          "token_id": 38899,
+          "token": "wend",
+          "firings": 8,
+          "share": 0.006092916984006093,
+          "lift_over_corpus": 23.434296092331127
+        },
+        {
+          "token_id": 34361,
+          "token": " Wor",
+          "firings": 8,
+          "share": 0.006092916984006093,
+          "lift_over_corpus": 50.774308200050775
+        },
+        {
+          "token_id": 496,
+          "token": " O",
+          "firings": 8,
+          "share": 0.006092916984006093,
+          "lift_over_corpus": 29.013890400029013
+        },
+        {
+          "token_id": 387,
+          "token": " P",
+          "firings": 8,
+          "share": 0.006092916984006093,
+          "lift_over_corpus": 22.566359200022568
+        },
+        {
+          "token_id": 382,
+          "token": "ers",
+          "firings": 8,
+          "share": 0.006092916984006093,
+          "lift_over_corpus": 5.539015440005539
+        }
+      ],
+      "angle": []
+    },
+    {
+      "block": 5901,
+      "atoms": [
+        11802,
+        11803
+      ],
+      "firings": 1309,
+      "firing_rate": 0.01309,
+      "mean_gate": 0.14057908952236176,
+      "top_tokens": [
+        {
+          "token_id": 279,
+          "token": " the",
+          "firings": 908,
+          "share": 0.693659281894576,
+          "lift_over_corpus": 16.662485752932405
+        },
+        {
+          "token_id": 310,
+          "token": " to",
+          "firings": 131,
+          "share": 0.10007639419404125,
+          "lift_over_corpus": 6.39874643184407
+        },
+        {
+          "token_id": 314,
+          "token": " of",
+          "firings": 42,
+          "share": 0.03208556149732621,
+          "lift_over_corpus": 1.4758767938052533
+        },
+        {
+          "token_id": 364,
+          "token": " for",
+          "firings": 38,
+          "share": 0.029029793735676088,
+          "lift_over_corpus": 5.405920621168732
+        },
+        {
+          "token_id": 539,
+          "token": " by",
+          "firings": 29,
+          "share": 0.02215431627196333,
+          "lift_over_corpus": 4.826648425264342
+        },
+        {
+          "token_id": 440,
+          "token": " with",
+          "firings": 26,
+          "share": 0.019862490450725745,
+          "lift_over_corpus": 3.430481943130526
+        },
+        {
+          "token_id": 836,
+          "token": " their",
+          "firings": 19,
+          "share": 0.014514896867838044,
+          "lift_over_corpus": 8.850546870632954
+        },
+        {
+          "token_id": 780,
+          "token": " his",
+          "firings": 17,
+          "share": 0.012987012987012988,
+          "lift_over_corpus": 3.338563749874804
+        },
+        {
+          "token_id": 303,
+          "token": " in",
+          "firings": 15,
+          "share": 0.01145912910618793,
+          "lift_over_corpus": 0.7832624132732693
+        },
+        {
+          "token_id": 494,
+          "token": " from",
+          "firings": 15,
+          "share": 0.01145912910618793,
+          "lift_over_corpus": 3.6148672259267918
+        },
+        {
+          "token_id": 383,
+          "token": " on",
+          "firings": 14,
+          "share": 0.0106951871657754,
+          "lift_over_corpus": 1.773662879896418
+        },
+        {
+          "token_id": 1024,
+          "token": " her",
+          "firings": 9,
+          "share": 0.006875477463712758,
+          "lift_over_corpus": 2.239569206421094
+        }
+      ],
+      "angle": [
+        {
+          "token_id": 279,
+          "token": " the",
+          "firings": 908,
+          "resultant_R1": 0.9704787731170654,
+          "null_max_R1": 0.9581034183502197,
+          "resultant_R2": 0.8877041339874268,
+          "null_max_R2": 0.8449862599372864,
+          "exceeds_all_nulls": true
+        },
+        {
+          "token_id": 310,
+          "token": " to",
+          "firings": 131,
+          "resultant_R1": 0.9755218625068665,
+          "null_max_R1": 0.9673758745193481,
+          "resultant_R2": 0.9136874079704285,
+          "null_max_R2": 0.8774779438972473,
+          "exceeds_all_nulls": true
+        },
+        {
+          "token_id": 314,
+          "token": " of",
+          "firings": 42,
+          "resultant_R1": 0.9650895595550537,
+          "null_max_R1": 0.9776930809020996,
+          "resultant_R2": 0.872205376625061,
+          "null_max_R2": 0.9140172600746155,
+          "exceeds_all_nulls": false
+        },
+        {
+          "token_id": 364,
+          "token": " for",
+          "firings": 38,
+          "resultant_R1": 0.9739502668380737,
+          "null_max_R1": 0.9812948107719421,
+          "resultant_R2": 0.9010440707206726,
+          "null_max_R2": 0.9270340204238892,
+          "exceeds_all_nulls": false
+        },
+        {
+          "token_id": 539,
+          "token": " by",
+          "firings": 29,
+          "resultant_R1": 0.9103320240974426,
+          "null_max_R1": 0.9801459312438965,
+          "resultant_R2": 0.7093456387519836,
+          "null_max_R2": 0.9229258298873901,
+          "exceeds_all_nulls": false
+        },
+        {
+          "token_id": 440,
+          "token": " with",
+          "firings": 26,
+          "resultant_R1": 0.9707117080688477,
+          "null_max_R1": 0.9859319925308228,
+          "resultant_R2": 0.8861891627311707,
+          "null_max_R2": 0.9447180032730103,
+          "exceeds_all_nulls": false
+        }
+      ]
+    },
+    {
+      "block": 8068,
+      "atoms": [
+        16136,
+        16137
+      ],
+      "firings": 1299,
+      "firing_rate": 0.01299,
+      "mean_gate": 0.2712523937225342,
+      "top_tokens": [
+        {
+          "token_id": 641,
+          "token": " .",
+          "firings": 762,
+          "share": 0.5866050808314087,
+          "lift_over_corpus": 19.232953469882254
+        },
+        {
+          "token_id": 695,
+          "token": " \n",
+          "firings": 348,
+          "share": 0.2678983833718245,
+          "lift_over_corpus": 30.10094195189039
+        },
+        {
+          "token_id": 328,
+          "token": " \"",
+          "firings": 172,
+          "share": 0.13240954580446498,
+          "lift_over_corpus": 8.504145523729285
+        },
+        {
+          "token_id": 1116,
+          "token": " ,",
+          "firings": 6,
+          "share": 0.004618937644341801,
+          "lift_over_corpus": 0.11124608969994704
+        },
+        {
+          "token_id": 847,
+          "token": " )",
+          "firings": 4,
+          "share": 0.003079291762894534,
+          "lift_over_corpus": 0.665073814880029
+        },
+        {
+          "token_id": 220,
+          "token": " ",
+          "firings": 2,
+          "share": 0.001539645881447267,
+          "lift_over_corpus": 0.06433956880264384
+        },
+        {
+          "token_id": 13,
+          "token": ".",
+          "firings": 2,
+          "share": 0.001539645881447267,
+          "lift_over_corpus": 0.8103399376038247
+        },
+        {
+          "token_id": 907,
+          "token": " ?",
+          "firings": 1,
+          "share": 0.0007698229407236335,
+          "lift_over_corpus": 4.276794115131297
+        },
+        {
+          "token_id": 2205,
+          "token": " ]",
+          "firings": 1,
+          "share": 0.0007698229407236335,
+          "lift_over_corpus": 1.973904976214445
+        },
+        {
+          "token_id": 2228,
+          "token": "  \n",
+          "firings": 1,
+          "share": 0.0007698229407236335,
+          "lift_over_corpus": 76.98229407236335
+        }
+      ],
+      "angle": [
+        {
+          "token_id": 641,
+          "token": " .",
+          "firings": 762,
+          "resultant_R1": 0.9851793646812439,
+          "null_max_R1": 0.9824155569076538,
+          "resultant_R2": 0.9418394565582275,
+          "null_max_R2": 0.932433009147644,
+          "exceeds_all_nulls": true
+        },
+        {
+          "token_id": 695,
+          "token": " \n",
+          "firings": 348,
+          "resultant_R1": 0.9909121990203857,
+          "null_max_R1": 0.9841243624687195,
+          "resultant_R2": 0.9643141627311707,
+          "null_max_R2": 0.9383329749107361,
+          "exceeds_all_nulls": true
+        },
+        {
+          "token_id": 328,
+          "token": " \"",
+          "firings": 172,
+          "resultant_R1": 0.9569945931434631,
+          "null_max_R1": 0.9852132797241211,
+          "resultant_R2": 0.840094268321991,
+          "null_max_R2": 0.9421409964561462,
+          "exceeds_all_nulls": false
+        }
+      ]
+    },
+    {
+      "block": 7190,
+      "atoms": [
+        14380,
+        14381
+      ],
+      "firings": 1295,
+      "firing_rate": 0.01295,
+      "mean_gate": 0.2729611098766327,
+      "top_tokens": [
+        {
+          "token_id": 641,
+          "token": " .",
+          "firings": 1254,
+          "share": 0.9683397683397683,
+          "lift_over_corpus": 31.74884486359896
+        },
+        {
+          "token_id": 2502,
+          "token": " ;",
+          "firings": 23,
+          "share": 0.01776061776061776,
+          "lift_over_corpus": 10.764010764010763
+        },
+        {
+          "token_id": 328,
+          "token": " \"",
+          "firings": 12,
+          "share": 0.009266409266409266,
+          "lift_over_corpus": 0.595145103815624
+        },
+        {
+          "token_id": 13,
+          "token": ".",
+          "firings": 2,
+          "share": 0.0015444015444015444,
+          "lift_over_corpus": 0.812842918106076
+        },
+        {
+          "token_id": 847,
+          "token": " )",
+          "firings": 2,
+          "share": 0.0015444015444015444,
+          "lift_over_corpus": 0.3335640484668563
+        },
+        {
+          "token_id": 695,
+          "token": " \n",
+          "firings": 1,
+          "share": 0.0007722007722007722,
+          "lift_over_corpus": 0.08676413170795193
+        },
+        {
+          "token_id": 907,
+          "token": " ?",
+          "firings": 1,
+          "share": 0.0007722007722007722,
+          "lift_over_corpus": 4.29000429000429
+        }
+      ],
+      "angle": [
+        {
+          "token_id": 641,
+          "token": " .",
+          "firings": 1254,
+          "resultant_R1": 0.9929299354553223,
+          "null_max_R1": 0.9878813624382019,
+          "resultant_R2": 0.9721605181694031,
+          "null_max_R2": 0.9556391835212708,
+          "exceeds_all_nulls": true
+        },
+        {
+          "token_id": 2502,
+          "token": " ;",
+          "firings": 23,
+          "resultant_R1": 0.9881095886230469,
+          "null_max_R1": 0.9975613951683044,
+          "resultant_R2": 0.9530599117279053,
+          "null_max_R2": 0.9902723431587219,
+          "exceeds_all_nulls": false
+        }
+      ]
+    },
+    {
+      "block": 7925,
+      "atoms": [
+        15850,
+        15851
+      ],
+      "firings": 1289,
+      "firing_rate": 0.01289,
+      "mean_gate": 0.19100229442119598,
+      "top_tokens": [
+        {
+          "token_id": 554,
+          "token": " @",
+          "firings": 833,
+          "share": 0.6462373933281613,
+          "lift_over_corpus": 70.62703752220342
+        },
+        {
+          "token_id": 31,
+          "token": "@",
+          "firings": 178,
+          "share": 0.13809154383242825,
+          "lift_over_corpus": 19.476945533487765
+        },
+        {
+          "token_id": 12,
+          "token": "-",
+          "firings": 160,
+          "share": 0.12412723041117145,
+          "lift_over_corpus": 17.384766164029614
+        },
+        {
+          "token_id": 593,
+          "token": " /",
+          "firings": 49,
+          "share": 0.03801396431342126,
+          "lift_over_corpus": 55.90288869620773
+        },
+        {
+          "token_id": 30095,
+          "token": ",@",
+          "firings": 36,
+          "share": 0.027928626842513578,
+          "lift_over_corpus": 33.64894800302841
+        },
+        {
+          "token_id": 56490,
+          "token": ".@",
+          "firings": 31,
+          "share": 0.02404965089216447,
+          "lift_over_corpus": 20.38106007810548
+        },
+        {
+          "token_id": 478,
+          "token": " +",
+          "firings": 1,
+          "share": 0.0007757951900698216,
+          "lift_over_corpus": 38.78975950349108
+        },
+        {
+          "token_id": 359,
+          "token": " '",
+          "firings": 1,
+          "share": 0.0007757951900698216,
+          "lift_over_corpus": 0.09073627954033
+        }
+      ],
+      "angle": [
+        {
+          "token_id": 554,
+          "token": " @",
+          "firings": 833,
+          "resultant_R1": 0.9914360642433167,
+          "null_max_R1": 0.981692910194397,
+          "resultant_R2": 0.9669433236122131,
+          "null_max_R2": 0.933650016784668,
+          "exceeds_all_nulls": true
+        },
+        {
+          "token_id": 31,
+          "token": "@",
+          "firings": 178,
+          "resultant_R1": 0.9986188411712646,
+          "null_max_R1": 0.9886376857757568,
+          "resultant_R2": 0.9944876432418823,
+          "null_max_R2": 0.957408607006073,
+          "exceeds_all_nulls": true
+        },
+        {
+          "token_id": 12,
+          "token": "-",
+          "firings": 160,
+          "resultant_R1": 0.9980896711349487,
+          "null_max_R1": 0.9893432259559631,
+          "resultant_R2": 0.9923785924911499,
+          "null_max_R2": 0.9588476419448853,
+          "exceeds_all_nulls": true
+        },
+        {
+          "token_id": 593,
+          "token": " /",
+          "firings": 49,
+          "resultant_R1": 0.9839653372764587,
+          "null_max_R1": 0.9942702651023865,
+          "resultant_R2": 0.9369307160377502,
+          "null_max_R2": 0.9772716164588928,
+          "exceeds_all_nulls": false
+        },
+        {
+          "token_id": 30095,
+          "token": ",@",
+          "firings": 36,
+          "resultant_R1": 0.9982181191444397,
+          "null_max_R1": 0.99418705701828,
+          "resultant_R2": 0.9928926229476929,
+          "null_max_R2": 0.9769493341445923,
+          "exceeds_all_nulls": true
+        },
+        {
+          "token_id": 56490,
+          "token": ".@",
+          "firings": 31,
+          "resultant_R1": 0.9986100792884827,
+          "null_max_R1": 0.9953643083572388,
+          "resultant_R2": 0.9944624304771423,
+          "null_max_R2": 0.9815873503684998,
+          "exceeds_all_nulls": true
+        }
+      ]
+    },
+    {
+      "block": 3148,
+      "atoms": [
+        6296,
+        6297
+      ],
+      "firings": 1283,
+      "firing_rate": 0.01283,
+      "mean_gate": 0.16295157372951508,
+      "top_tokens": [
+        {
+          "token_id": 414,
+          "token": " D",
+          "firings": 27,
+          "share": 0.021044427123928292,
+          "lift_over_corpus": 26.638515346744672
+        },
+        {
+          "token_id": 469,
+          "token": " G",
+          "firings": 25,
+          "share": 0.019485580670303974,
+          "lift_over_corpus": 25.63892193461049
+        },
+        {
+          "token_id": 426,
+          "token": " F",
+          "firings": 23,
+          "share": 0.017926734216679657,
+          "lift_over_corpus": 12.03136524609373
+        },
+        {
+          "token_id": 1799,
+          "token": " Z",
+          "firings": 20,
+          "share": 0.01558846453624318,
+          "lift_over_corpus": 38.02064521034922
+        },
+        {
+          "token_id": 326,
+          "token": " S",
+          "firings": 20,
+          "share": 0.01558846453624318,
+          "lift_over_corpus": 36.25224310754228
+        },
+        {
+          "token_id": 380,
+          "token": " M",
+          "firings": 19,
+          "share": 0.014809041309431021,
+          "lift_over_corpus": 22.783140476047727
+        },
+        {
+          "token_id": 882,
+          "token": " Ch",
+          "firings": 18,
+          "share": 0.014029618082618862,
+          "lift_over_corpus": 31.885495642315593
+        },
+        {
+          "token_id": 417,
+          "token": " B",
+          "firings": 17,
+          "share": 0.013250194855806703,
+          "lift_over_corpus": 41.40685892439594
+        },
+        {
+          "token_id": 1124,
+          "token": " Tr",
+          "firings": 16,
+          "share": 0.012470771628994544,
+          "lift_over_corpus": 15.208258084139688
+        },
+        {
+          "token_id": 423,
+          "token": " R",
+          "firings": 15,
+          "share": 0.011691348402182385,
+          "lift_over_corpus": 37.714027103814146
+        },
+        {
+          "token_id": 436,
+          "token": " L",
+          "firings": 14,
+          "share": 0.010911925175370226,
+          "lift_over_corpus": 20.984471491096592
+        },
+        {
+          "token_id": 443,
+          "token": " N",
+          "firings": 13,
+          "share": 0.010132501948558068,
+          "lift_over_corpus": 40.53000779423227
+        }
+      ],
+      "angle": [
+        {
+          "token_id": 414,
+          "token": " D",
+          "firings": 27,
+          "resultant_R1": 0.9847671389579773,
+          "null_max_R1": 0.9917592406272888,
+          "resultant_R2": 0.9400727152824402,
+          "null_max_R2": 0.9675890207290649,
+          "exceeds_all_nulls": false
+        },
+        {
+          "token_id": 469,
+          "token": " G",
+          "firings": 25,
+          "resultant_R1": 0.9953615069389343,
+          "null_max_R1": 0.9844139218330383,
+          "resultant_R2": 0.9816485047340393,
+          "null_max_R2": 0.9389249682426453,
+          "exceeds_all_nulls": true
+        },
+        {
+          "token_id": 426,
+          "token": " F",
+          "firings": 23,
+          "resultant_R1": 0.9860677123069763,
+          "null_max_R1": 0.9885811805725098,
+          "resultant_R2": 0.9450497627258301,
+          "null_max_R2": 0.9550259113311768,
+          "exceeds_all_nulls": false
+        },
+        {
+          "token_id": 1799,
+          "token": " Z",
+          "firings": 20,
+          "resultant_R1": 0.9896819591522217,
+          "null_max_R1": 0.9875199794769287,
+          "resultant_R2": 0.9593486189842224,
+          "null_max_R2": 0.9514999389648438,
+          "exceeds_all_nulls": true
+        },
+        {
+          "token_id": 326,
+          "token": " S",
+          "firings": 20,
+          "resultant_R1": 0.9921431541442871,
+          "null_max_R1": 0.9859514832496643,
+          "resultant_R2": 0.968972384929657,
+          "null_max_R2": 0.944868266582489,
+          "exceeds_all_nulls": true
+        }
+      ]
+    },
+    {
+      "block": 11802,
+      "atoms": [
+        23604,
+        23605
+      ],
+      "firings": 1280,
+      "firing_rate": 0.0128,
+      "mean_gate": 0.24824801087379456,
+      "top_tokens": [
+        {
+          "token_id": 641,
+          "token": " .",
+          "firings": 1001,
+          "share": 0.78203125,
+          "lift_over_corpus": 25.640368852459016
+        },
+        {
+          "token_id": 1116,
+          "token": " ,",
+          "firings": 138,
+          "share": 0.1078125,
+          "lift_over_corpus": 2.5966401734104045
+        },
+        {
+          "token_id": 694,
+          "token": " but",
+          "firings": 88,
+          "share": 0.06875,
+          "lift_over_corpus": 48.07692307692308
+        },
+        {
+          "token_id": 7643,
+          "token": " although",
+          "firings": 11,
+          "share": 0.00859375,
+          "lift_over_corpus": 40.92261904761905
+        },
+        {
+          "token_id": 3384,
+          "token": " though",
+          "firings": 10,
+          "share": 0.0078125,
+          "lift_over_corpus": 28.935185185185183
+        },
+        {
+          "token_id": 2502,
+          "token": " ;",
+          "firings": 8,
+          "share": 0.00625,
+          "lift_over_corpus": 3.787878787878788
+        },
+        {
+          "token_id": 748,
+          "token": " so",
+          "firings": 6,
+          "share": 0.0046875,
+          "lift_over_corpus": 7.944915254237287
+        },
+        {
+          "token_id": 4611,
+          "token": " however",
+          "firings": 5,
+          "share": 0.00390625,
+          "lift_over_corpus": 13.469827586206897
+        },
+        {
+          "token_id": 328,
+          "token": " \"",
+          "firings": 3,
+          "share": 0.00234375,
+          "lift_over_corpus": 0.15052986512524083
+        },
+        {
+          "token_id": 695,
+          "token": " \n",
+          "firings": 2,
+          "share": 0.0015625,
+          "lift_over_corpus": 0.175561797752809
+        },
+        {
+          "token_id": 440,
+          "token": " with",
+          "firings": 1,
+          "share": 0.00078125,
+          "lift_over_corpus": 0.1349309153713299
+        },
+        {
+          "token_id": 1048,
+          "token": " also",
+          "firings": 1,
+          "share": 0.00078125,
+          "lift_over_corpus": 0.47637195121951226
+        }
+      ],
+      "angle": [
+        {
+          "token_id": 641,
+          "token": " .",
+          "firings": 1001,
+          "resultant_R1": 0.9965174198150635,
+          "null_max_R1": 0.9388483166694641,
+          "resultant_R2": 0.9861352443695068,
+          "null_max_R2": 0.7928301095962524,
+          "exceeds_all_nulls": true
+        },
+        {
+          "token_id": 1116,
+          "token": " ,",
+          "firings": 138,
+          "resultant_R1": 0.9917823076248169,
+          "null_max_R1": 0.9542091488838196,
+          "resultant_R2": 0.9674891829490662,
+          "null_max_R2": 0.8467844128608704,
+          "exceeds_all_nulls": true
+        },
+        {
+          "token_id": 694,
+          "token": " but",
+          "firings": 88,
+          "resultant_R1": 0.9931580424308777,
+          "null_max_R1": 0.9776759147644043,
+          "resultant_R2": 0.9728550314903259,
+          "null_max_R2": 0.920528769493103,
+          "exceeds_all_nulls": true
+        }
+      ]
+    },
+    {
+      "block": 6122,
+      "atoms": [
+        12244,
+        12245
+      ],
+      "firings": 1279,
+      "firing_rate": 0.01279,
+      "mean_gate": 0.2556241452693939,
+      "top_tokens": [
+        {
+          "token_id": 641,
+          "token": " .",
+          "firings": 981,
+          "share": 0.7670054730258014,
+          "lift_over_corpus": 25.147720427075456
+        },
+        {
+          "token_id": 695,
+          "token": " \n",
+          "firings": 285,
+          "share": 0.22283033620015638,
+          "lift_over_corpus": 25.037116426983864
+        },
+        {
+          "token_id": 328,
+          "token": " \"",
+          "firings": 7,
+          "share": 0.00547302580140735,
+          "lift_over_corpus": 0.3515109699041329
+        },
+        {
+          "token_id": 847,
+          "token": " )",
+          "firings": 5,
+          "share": 0.003909304143862392,
+          "lift_over_corpus": 0.8443421477024606
+        },
+        {
+          "token_id": 24016,
+          "token": " Background",
+          "firings": 1,
+          "share": 0.0007818608287724785,
+          "lift_over_corpus": 19.54652071931196
+        }
+      ],
+      "angle": [
+        {
+          "token_id": 641,
+          "token": " .",
+          "firings": 981,
+          "resultant_R1": 0.99880051612854,
+          "null_max_R1": 0.9803723692893982,
+          "resultant_R2": 0.9952102899551392,
+          "null_max_R2": 0.9249729514122009,
+          "exceeds_all_nulls": true
+        },
+        {
+          "token_id": 695,
+          "token": " \n",
+          "firings": 285,
+          "resultant_R1": 0.9877300262451172,
+          "null_max_R1": 0.9844568967819214,
+          "resultant_R2": 0.9514148831367493,
+          "null_max_R2": 0.94052654504776,
+          "exceeds_all_nulls": true
+        }
+      ]
+    },
+    {
+      "block": 9213,
+      "atoms": [
+        18426,
+        18427
+      ],
+      "firings": 1279,
+      "firing_rate": 0.01279,
+      "mean_gate": 0.27011245489120483,
+      "top_tokens": [
+        {
+          "token_id": 641,
+          "token": " .",
+          "firings": 894,
+          "share": 0.6989835809225958,
+          "lift_over_corpus": 22.91749445647855
+        },
+        {
+          "token_id": 695,
+          "token": " \n",
+          "firings": 354,
+          "share": 0.2767787333854574,
+          "lift_over_corpus": 31.09873408825364
+        },
+        {
+          "token_id": 328,
+          "token": " \"",
+          "firings": 27,
+          "share": 0.02111024237685692,
+          "lift_over_corpus": 1.355828026773084
+        },
+        {
+          "token_id": 13,
+          "token": ".",
+          "firings": 2,
+          "share": 0.001563721657544957,
+          "lift_over_corpus": 0.8230113987078721
+        },
+        {
+          "token_id": 220,
+          "token": " ",
+          "firings": 1,
+          "share": 0.0007818608287724785,
+          "lift_over_corpus": 0.03267283028719091
+        },
+        {
+          "token_id": 11235,
+          "token": ".The",
+          "firings": 1,
+          "share": 0.0007818608287724785,
+          "lift_over_corpus": 78.18608287724784
+        }
+      ],
+      "angle": [
+        {
+          "token_id": 641,
+          "token": " .",
+          "firings": 894,
+          "resultant_R1": 0.9984718561172485,
+          "null_max_R1": 0.9831333160400391,
+          "resultant_R2": 0.9939013719558716,
+          "null_max_R2": 0.9340382814407349,
+          "exceeds_all_nulls": true
+        },
+        {
+          "token_id": 695,
+          "token": " \n",
+          "firings": 354,
+          "resultant_R1": 0.9967880845069885,
+          "null_max_R1": 0.9838876724243164,
+          "resultant_R2": 0.9872142672538757,
+          "null_max_R2": 0.9371833205223083,
+          "exceeds_all_nulls": true
+        },
+        {
+          "token_id": 328,
+          "token": " \"",
+          "firings": 27,
+          "resultant_R1": 0.998640239238739,
+          "null_max_R1": 0.9976257085800171,
+          "resultant_R2": 0.9945715665817261,
+          "null_max_R2": 0.9905303716659546,
+          "exceeds_all_nulls": true
+        }
+      ]
+    },
+    {
+      "block": 8538,
+      "atoms": [
+        17076,
+        17077
+      ],
+      "firings": 1267,
+      "firing_rate": 0.01267,
+      "mean_gate": 0.19356279075145721,
+      "top_tokens": [
+        {
+          "token_id": 554,
+          "token": " @",
+          "firings": 561,
+          "share": 0.44277821625887925,
+          "lift_over_corpus": 48.39106188621631
+        },
+        {
+          "token_id": 12,
+          "token": "-",
+          "firings": 508,
+          "share": 0.40094711917916337,
+          "lift_over_corpus": 56.1550587085663
+        },
+        {
+          "token_id": 31,
+          "token": "@",
+          "firings": 73,
+          "share": 0.05761641673243883,
+          "lift_over_corpus": 8.126433953799554
+        },
+        {
+          "token_id": 220,
+          "token": " ",
+          "firings": 34,
+          "share": 0.026835043409629045,
+          "lift_over_corpus": 1.1213975515933574
+        },
+        {
+          "token_id": 593,
+          "token": " /",
+          "firings": 23,
+          "share": 0.018153117600631413,
+          "lift_over_corpus": 26.695761177399135
+        },
+        {
+          "token_id": 359,
+          "token": " '",
+          "firings": 16,
+          "share": 0.012628255722178374,
+          "lift_over_corpus": 1.4769889733541957
+        },
+        {
+          "token_id": 56490,
+          "token": ".@",
+          "firings": 11,
+          "share": 0.008681925808997633,
+          "lift_over_corpus": 7.357564244913248
+        },
+        {
+          "token_id": 641,
+          "token": " .",
+          "firings": 10,
+          "share": 0.007892659826361484,
+          "lift_over_corpus": 0.25877573201185194
+        },
+        {
+          "token_id": 535,
+          "token": " :",
+          "firings": 6,
+          "share": 0.004735595895816891,
+          "lift_over_corpus": 2.265835356850187
+        },
+        {
+          "token_id": 6108,
+          "token": " ^",
+          "firings": 5,
+          "share": 0.003946329913180742,
+          "lift_over_corpus": 78.92659826361484
+        },
+        {
+          "token_id": 17,
+          "token": "2",
+          "firings": 2,
+          "share": 0.0015785319652722968,
+          "lift_over_corpus": 0.169370382539946
+        },
+        {
+          "token_id": 1317,
+          "token": " \u2013",
+          "firings": 2,
+          "share": 0.0015785319652722968,
+          "lift_over_corpus": 1.160685268582571
+        }
+      ],
+      "angle": [
+        {
+          "token_id": 554,
+          "token": " @",
+          "firings": 561,
+          "resultant_R1": 0.9893367886543274,
+          "null_max_R1": 0.9367761015892029,
+          "resultant_R2": 0.958005964756012,
+          "null_max_R2": 0.7602960467338562,
+          "exceeds_all_nulls": true
+        },
+        {
+          "token_id": 12,
+          "token": "-",
+          "firings": 508,
+          "resultant_R1": 0.9940000176429749,
+          "null_max_R1": 0.937795877456665,
+          "resultant_R2": 0.9761762619018555,
+          "null_max_R2": 0.7640929818153381,
+          "exceeds_all_nulls": true
+        },
+        {
+          "token_id": 31,
+          "token": "@",
+          "firings": 73,
+          "resultant_R1": 0.9870629906654358,
+          "null_max_R1": 0.9493709206581116,
+          "resultant_R2": 0.9494812488555908,
+          "null_max_R2": 0.8077943325042725,
+          "exceeds_all_nulls": true
+        },
+        {
+          "token_id": 220,
+          "token": " ",
+          "firings": 34,
+          "resultant_R1": 0.9926465749740601,
+          "null_max_R1": 0.957990288734436,
+          "resultant_R2": 0.9708951711654663,
+          "null_max_R2": 0.8452218174934387,
+          "exceeds_all_nulls": true
+        },
+        {
+          "token_id": 593,
+          "token": " /",
+          "firings": 23,
+          "resultant_R1": 0.9916257262229919,
+          "null_max_R1": 0.9650752544403076,
+          "resultant_R2": 0.9666925668716431,
+          "null_max_R2": 0.8663880825042725,
+          "exceeds_all_nulls": true
+        }
+      ]
+    },
+    {
+      "block": 3924,
+      "atoms": [
+        7848,
+        7849
+      ],
+      "firings": 1264,
+      "firing_rate": 0.01264,
+      "mean_gate": 0.1614476889371872,
+      "top_tokens": [
+        {
+          "token_id": 551,
+          "token": " he",
+          "firings": 233,
+          "share": 0.1843354430379747,
+          "lift_over_corpus": 62.91312049077635
+        },
+        {
+          "token_id": 310,
+          "token": " to",
+          "firings": 166,
+          "share": 0.13132911392405064,
+          "lift_over_corpus": 8.397002169056945
+        },
+        {
+          "token_id": 1292,
+          "token": " she",
+          "firings": 112,
+          "share": 0.08860759493670886,
+          "lift_over_corpus": 41.99412082308477
+        },
+        {
+          "token_id": 781,
+          "token": " they",
+          "firings": 96,
+          "share": 0.0759493670886076,
+          "lift_over_corpus": 58.875478363261706
+        },
+        {
+          "token_id": 852,
+          "token": " who",
+          "firings": 43,
+          "share": 0.03401898734177215,
+          "lift_over_corpus": 25.013961280714817
+        },
+        {
+          "token_id": 780,
+          "token": " his",
+          "firings": 38,
+          "share": 0.030063291139240507,
+          "lift_over_corpus": 7.728352477953858
+        },
+        {
+          "token_id": 1216,
+          "token": " He",
+          "firings": 36,
+          "share": 0.028481012658227847,
+          "lift_over_corpus": 25.204435980732608
+        },
+        {
+          "token_id": 353,
+          "token": " I",
+          "firings": 27,
+          "share": 0.021360759493670885,
+          "lift_over_corpus": 14.630657187445813
+        },
+        {
+          "token_id": 1024,
+          "token": " her",
+          "firings": 25,
+          "share": 0.01977848101265823,
+          "lift_over_corpus": 6.442501958520596
+        },
+        {
+          "token_id": 1048,
+          "token": " also",
+          "firings": 23,
+          "share": 0.01819620253164557,
+          "lift_over_corpus": 11.095245446125347
+        },
+        {
+          "token_id": 2838,
+          "token": " She",
+          "firings": 22,
+          "share": 0.01740506329113924,
+          "lift_over_corpus": 14.750053636558677
+        },
+        {
+          "token_id": 42573,
+          "token": " Nicole",
+          "firings": 21,
+          "share": 0.01661392405063291,
+          "lift_over_corpus": 12.97962816455696
+        }
+      ],
+      "angle": [
+        {
+          "token_id": 551,
+          "token": " he",
+          "firings": 233,
+          "resultant_R1": 0.9741307497024536,
+          "null_max_R1": 0.9517179727554321,
+          "resultant_R2": 0.9000769257545471,
+          "null_max_R2": 0.8206619024276733,
+          "exceeds_all_nulls": true
+        },
+        {
+          "token_id": 310,
+          "token": " to",
+          "firings": 166,
+          "resultant_R1": 0.971863865852356,
+          "null_max_R1": 0.9561259746551514,
+          "resultant_R2": 0.8933939933776855,
+          "null_max_R2": 0.83642578125,
+          "exceeds_all_nulls": true
+        },
+        {
+          "token_id": 1292,
+          "token": " she",
+          "firings": 112,
+          "resultant_R1": 0.9735625386238098,
+          "null_max_R1": 0.9569088816642761,
+          "resultant_R2": 0.8978091478347778,
+          "null_max_R2": 0.8370516896247864,
+          "exceeds_all_nulls": true
+        },
+        {
+          "token_id": 781,
+          "token": " they",
+          "firings": 96,
+          "resultant_R1": 0.9690777659416199,
+          "null_max_R1": 0.9583017230033875,
+          "resultant_R2": 0.8806766867637634,
+          "null_max_R2": 0.8460479974746704,
+          "exceeds_all_nulls": true
+        },
+        {
+          "token_id": 852,
+          "token": " who",
+          "firings": 43,
+          "resultant_R1": 0.9658166766166687,
+          "null_max_R1": 0.9673877358436584,
+          "resultant_R2": 0.8741692304611206,
+          "null_max_R2": 0.8780698776245117,
+          "exceeds_all_nulls": false
+        },
+        {
+          "token_id": 780,
+          "token": " his",
+          "firings": 38,
+          "resultant_R1": 0.9753264784812927,
+          "null_max_R1": 0.9724454283714294,
+          "resultant_R2": 0.9059779644012451,
+          "null_max_R2": 0.8941586017608643,
+          "exceeds_all_nulls": true
+        }
+      ]
+    },
+    {
+      "block": 3668,
+      "atoms": [
+        7336,
+        7337
+      ],
+      "firings": 1255,
+      "firing_rate": 0.01255,
+      "mean_gate": 0.20698879659175873,
+      "top_tokens": [
+        {
+          "token_id": 1116,
+          "token": " ,",
+          "firings": 1064,
+          "share": 0.847808764940239,
+          "lift_over_corpus": 20.419286246152193
+        },
+        {
+          "token_id": 2502,
+          "token": " ;",
+          "firings": 128,
+          "share": 0.10199203187250996,
+          "lift_over_corpus": 61.81335265000604
+        },
+        {
+          "token_id": 535,
+          "token": " :",
+          "firings": 21,
+          "share": 0.016733067729083666,
+          "lift_over_corpus": 8.006252501953908
+        },
+        {
+          "token_id": 694,
+          "token": " but",
+          "firings": 9,
+          "share": 0.007171314741035857,
+          "lift_over_corpus": 5.014905413311787
+        },
+        {
+          "token_id": 3384,
+          "token": " though",
+          "firings": 6,
+          "share": 0.004780876494023904,
+          "lift_over_corpus": 17.706949977866312
+        },
+        {
+          "token_id": 641,
+          "token": " .",
+          "firings": 6,
+          "share": 0.004780876494023904,
+          "lift_over_corpus": 0.1567500489843903
+        },
+        {
+          "token_id": 1921,
+          "token": " But",
+          "firings": 4,
+          "share": 0.0031872509960159364,
+          "lift_over_corpus": 26.56042496679947
+        },
+        {
+          "token_id": 1892,
+          "token": " \u2014",
+          "firings": 3,
+          "share": 0.002390438247011952,
+          "lift_over_corpus": 2.812280290602297
+        },
+        {
+          "token_id": 4611,
+          "token": " however",
+          "firings": 2,
+          "share": 0.0015936254980079682,
+          "lift_over_corpus": 5.495260337958511
+        },
+        {
+          "token_id": 14205,
+          "token": " Yet",
+          "firings": 2,
+          "share": 0.0015936254980079682,
+          "lift_over_corpus": 79.6812749003984
+        },
+        {
+          "token_id": 318,
+          "token": " (",
+          "firings": 2,
+          "share": 0.0015936254980079682,
+          "lift_over_corpus": 0.3479531655039232
+        },
+        {
+          "token_id": 748,
+          "token": " so",
+          "firings": 2,
+          "share": 0.0015936254980079682,
+          "lift_over_corpus": 2.7010601661152003
+        }
+      ],
+      "angle": [
+        {
+          "token_id": 1116,
+          "token": " ,",
+          "firings": 1064,
+          "resultant_R1": 0.9643020629882812,
+          "null_max_R1": 0.9436926245689392,
+          "resultant_R2": 0.8637167811393738,
+          "null_max_R2": 0.7906308174133301,
+          "exceeds_all_nulls": true
+        },
+        {
+          "token_id": 2502,
+          "token": " ;",
+          "firings": 128,
+          "resultant_R1": 0.9966353178024292,
+          "null_max_R1": 0.9603866338729858,
+          "resultant_R2": 0.9867033362388611,
+          "null_max_R2": 0.8479818105697632,
+          "exceeds_all_nulls": true
+        },
+        {
+          "token_id": 535,
+          "token": " :",
+          "firings": 21,
+          "resultant_R1": 0.9928253293037415,
+          "null_max_R1": 0.9825329780578613,
+          "resultant_R2": 0.9714771509170532,
+          "null_max_R2": 0.9328334927558899,
+          "exceeds_all_nulls": true
+        }
+      ]
+    },
+    {
+      "block": 19,
+      "atoms": [
+        38,
+        39
+      ],
+      "firings": 1252,
+      "firing_rate": 0.01252,
+      "mean_gate": 0.13870951533317566,
+      "top_tokens": [
+        {
+          "token_id": 279,
+          "token": " the",
+          "firings": 790,
+          "share": 0.6309904153354633,
+          "lift_over_corpus": 15.157108223287612
+        },
+        {
+          "token_id": 310,
+          "token": " to",
+          "firings": 104,
+          "share": 0.08306709265175719,
+          "lift_over_corpus": 5.311195182337416
+        },
+        {
+          "token_id": 264,
+          "token": " a",
+          "firings": 74,
+          "share": 0.05910543130990415,
+          "lift_over_corpus": 4.603226737531475
+        },
+        {
+          "token_id": 364,
+          "token": " for",
+          "firings": 38,
+          "share": 0.03035143769968051,
+          "lift_over_corpus": 5.652036815582963
+        },
+        {
+          "token_id": 314,
+          "token": " of",
+          "firings": 33,
+          "share": 0.026357827476038338,
+          "lift_over_corpus": 1.2124115674350662
+        },
+        {
+          "token_id": 836,
+          "token": " their",
+          "firings": 28,
+          "share": 0.022364217252396165,
+          "lift_over_corpus": 13.63671783682693
+        },
+        {
+          "token_id": 440,
+          "token": " with",
+          "firings": 27,
+          "share": 0.02156549520766773,
+          "lift_over_corpus": 3.724610571272492
+        },
+        {
+          "token_id": 494,
+          "token": " from",
+          "firings": 24,
+          "share": 0.019169329073482427,
+          "lift_over_corpus": 6.047106963243667
+        },
+        {
+          "token_id": 303,
+          "token": " in",
+          "firings": 22,
+          "share": 0.01757188498402556,
+          "lift_over_corpus": 1.201085781546518
+        },
+        {
+          "token_id": 780,
+          "token": " his",
+          "firings": 20,
+          "share": 0.01597444089456869,
+          "lift_over_corpus": 4.106540075724599
+        },
+        {
+          "token_id": 1024,
+          "token": " her",
+          "firings": 15,
+          "share": 0.011980830670926517,
+          "lift_over_corpus": 3.902550707142188
+        },
+        {
+          "token_id": 539,
+          "token": " by",
+          "firings": 15,
+          "share": 0.011980830670926517,
+          "lift_over_corpus": 2.610202760550439
+        }
+      ],
+      "angle": [
+        {
+          "token_id": 279,
+          "token": " the",
+          "firings": 790,
+          "resultant_R1": 0.9658676385879517,
+          "null_max_R1": 0.9556556940078735,
+          "resultant_R2": 0.8694056868553162,
+          "null_max_R2": 0.8339716196060181,
+          "exceeds_all_nulls": true
+        },
+        {
+          "token_id": 310,
+          "token": " to",
+          "firings": 104,
+          "resultant_R1": 0.9743841290473938,
+          "null_max_R1": 0.9694576263427734,
+          "resultant_R2": 0.902999758720398,
+          "null_max_R2": 0.882695198059082,
+          "exceeds_all_nulls": true
+        },
+        {
+          "token_id": 264,
+          "token": " a",
+          "firings": 74,
+          "resultant_R1": 0.9863305687904358,
+          "null_max_R1": 0.9768715500831604,
+          "resultant_R2": 0.9461404085159302,
+          "null_max_R2": 0.9112920165061951,
+          "exceeds_all_nulls": true
+        },
+        {
+          "token_id": 364,
+          "token": " for",
+          "firings": 38,
+          "resultant_R1": 0.9528003931045532,
+          "null_max_R1": 0.9765642881393433,
+          "resultant_R2": 0.833147406578064,
+          "null_max_R2": 0.9108452200889587,
+          "exceeds_all_nulls": false
+        },
+        {
+          "token_id": 314,
+          "token": " of",
+          "firings": 33,
+          "resultant_R1": 0.9513871073722839,
+          "null_max_R1": 0.9792143106460571,
+          "resultant_R2": 0.8295201063156128,
+          "null_max_R2": 0.9187800288200378,
+          "exceeds_all_nulls": false
+        },
+        {
+          "token_id": 836,
+          "token": " their",
+          "firings": 28,
+          "resultant_R1": 0.9904826283454895,
+          "null_max_R1": 0.9791922569274902,
+          "resultant_R2": 0.9622716307640076,
+          "null_max_R2": 0.9206943511962891,
+          "exceeds_all_nulls": true
+        }
+      ]
+    },
+    {
+      "block": 14755,
+      "atoms": [
+        29510,
+        29511
+      ],
+      "firings": 1249,
+      "firing_rate": 0.01249,
+      "mean_gate": 0.1634669303894043,
+      "top_tokens": [
+        {
+          "token_id": 78377,
+          "token": "inkel",
+          "firings": 15,
+          "share": 0.01200960768614892,
+          "lift_over_corpus": 8.766136997188992
+        },
+        {
+          "token_id": 463,
+          "token": "ack",
+          "firings": 14,
+          "share": 0.01120896717373899,
+          "lift_over_corpus": 35.028022417934345
+        },
+        {
+          "token_id": 3507,
+          "token": "apping",
+          "firings": 10,
+          "share": 0.008006405124099279,
+          "lift_over_corpus": 22.240014233609106
+        },
+        {
+          "token_id": 382,
+          "token": "ers",
+          "firings": 9,
+          "share": 0.007205764611689352,
+          "lift_over_corpus": 6.550695101535774
+        },
+        {
+          "token_id": 31904,
+          "token": "utz",
+          "firings": 9,
+          "share": 0.007205764611689352,
+          "lift_over_corpus": 55.42895855145656
+        },
+        {
+          "token_id": 25274,
+          "token": " Cab",
+          "firings": 8,
+          "share": 0.006405124099279423,
+          "lift_over_corpus": 49.27018537907249
+        },
+        {
+          "token_id": 34361,
+          "token": " Wor",
+          "firings": 8,
+          "share": 0.006405124099279423,
+          "lift_over_corpus": 53.37603416066186
+        },
+        {
+          "token_id": 166454,
+          "token": "r\u00ed",
+          "firings": 8,
+          "share": 0.006405124099279423,
+          "lift_over_corpus": 32.02562049639712
+        },
+        {
+          "token_id": 2226,
+          "token": "los",
+          "firings": 8,
+          "share": 0.006405124099279423,
+          "lift_over_corpus": 18.8386002919983
+        },
+        {
+          "token_id": 76925,
+          "token": " Uran",
+          "firings": 7,
+          "share": 0.005604483586869495,
+          "lift_over_corpus": 16.01281024819856
+        },
+        {
+          "token_id": 47495,
+          "token": " Cec",
+          "firings": 7,
+          "share": 0.005604483586869495,
+          "lift_over_corpus": 25.47492539486134
+        },
+        {
+          "token_id": 78400,
+          "token": " Alg",
+          "firings": 7,
+          "share": 0.005604483586869495,
+          "lift_over_corpus": 18.681611956231652
+        }
+      ],
+      "angle": []
+    },
+    {
+      "block": 6947,
+      "atoms": [
+        13894,
+        13895
+      ],
+      "firings": 1247,
+      "firing_rate": 0.01247,
+      "mean_gate": 0.2660949230194092,
+      "top_tokens": [
+        {
+          "token_id": 641,
+          "token": " .",
+          "firings": 1055,
+          "share": 0.8460304731355253,
+          "lift_over_corpus": 27.738704037230338
+        },
+        {
+          "token_id": 695,
+          "token": " \n",
+          "firings": 142,
+          "share": 0.11387329591018444,
+          "lift_over_corpus": 12.794752349458927
+        },
+        {
+          "token_id": 328,
+          "token": " \"",
+          "firings": 46,
+          "share": 0.03688853247794707,
+          "lift_over_corpus": 2.369205682591334
+        },
+        {
+          "token_id": 13,
+          "token": ".",
+          "firings": 1,
+          "share": 0.0008019246190858059,
+          "lift_over_corpus": 0.42206558899252944
+        },
+        {
+          "token_id": 426,
+          "token": " F",
+          "firings": 1,
+          "share": 0.0008019246190858059,
+          "lift_over_corpus": 0.5382044423394671
+        },
+        {
+          "token_id": 220,
+          "token": " ",
+          "firings": 1,
+          "share": 0.0008019246190858059,
+          "lift_over_corpus": 0.033511266990631255
+        },
+        {
+          "token_id": 847,
+          "token": " )",
+          "firings": 1,
+          "share": 0.0008019246190858059,
+          "lift_over_corpus": 0.1732018615736082
+        }
+      ],
+      "angle": [
+        {
+          "token_id": 641,
+          "token": " .",
+          "firings": 1055,
+          "resultant_R1": 0.9989175200462341,
+          "null_max_R1": 0.9913876056671143,
+          "resultant_R2": 0.9956784248352051,
+          "null_max_R2": 0.9667516946792603,
+          "exceeds_all_nulls": true
+        },
+        {
+          "token_id": 695,
+          "token": " \n",
+          "firings": 142,
+          "resultant_R1": 0.9931215047836304,
+          "null_max_R1": 0.995089590549469,
+          "resultant_R2": 0.9728937745094299,
+          "null_max_R2": 0.9807890057563782,
+          "exceeds_all_nulls": false
+        },
+        {
+          "token_id": 328,
+          "token": " \"",
+          "firings": 46,
+          "resultant_R1": 0.9968551993370056,
+          "null_max_R1": 0.9986196160316467,
+          "resultant_R2": 0.9874964356422424,
+          "null_max_R2": 0.9944878220558167,
+          "exceeds_all_nulls": false
+        }
+      ]
+    },
+    {
+      "block": 4529,
+      "atoms": [
+        9058,
+        9059
+      ],
+      "firings": 1240,
+      "firing_rate": 0.0124,
+      "mean_gate": 0.20103053748607635,
+      "top_tokens": [
+        {
+          "token_id": 554,
+          "token": " @",
+          "firings": 671,
+          "share": 0.5411290322580645,
+          "lift_over_corpus": 59.13978494623656
+        },
+        {
+          "token_id": 12,
+          "token": "-",
+          "firings": 323,
+          "share": 0.26048387096774195,
+          "lift_over_corpus": 36.48233486943165
+        },
+        {
+          "token_id": 31,
+          "token": "@",
+          "firings": 174,
+          "share": 0.1403225806451613,
+          "lift_over_corpus": 19.791619272942352
+        },
+        {
+          "token_id": 30095,
+          "token": ",@",
+          "firings": 39,
+          "share": 0.031451612903225803,
+          "lift_over_corpus": 37.8935095219588
+        },
+        {
+          "token_id": 56490,
+          "token": ".@",
+          "firings": 32,
+          "share": 0.025806451612903226,
+          "lift_over_corpus": 21.86987424822307
+        },
+        {
+          "token_id": 50875,
+          "token": " sic",
+          "firings": 1,
+          "share": 0.0008064516129032258,
+          "lift_over_corpus": 20.161290322580644
+        }
+      ],
+      "angle": [
+        {
+          "token_id": 554,
+          "token": " @",
+          "firings": 671,
+          "resultant_R1": 0.9907387495040894,
+          "null_max_R1": 0.9899902939796448,
+          "resultant_R2": 0.9634720087051392,
+          "null_max_R2": 0.9605540037155151,
+          "exceeds_all_nulls": true
+        },
+        {
+          "token_id": 12,
+          "token": "-",
+          "firings": 323,
+          "resultant_R1": 0.9926173090934753,
+          "null_max_R1": 0.9908078908920288,
+          "resultant_R2": 0.9708143472671509,
+          "null_max_R2": 0.9637125134468079,
+          "exceeds_all_nulls": true
+        },
+        {
+          "token_id": 31,
+          "token": "@",
+          "firings": 174,
+          "resultant_R1": 0.9957571625709534,
+          "null_max_R1": 0.9916839599609375,
+          "resultant_R2": 0.983145534992218,
+          "null_max_R2": 0.967197597026825,
+          "exceeds_all_nulls": true
+        },
+        {
+          "token_id": 30095,
+          "token": ",@",
+          "firings": 39,
+          "resultant_R1": 0.9948594570159912,
+          "null_max_R1": 0.9945117831230164,
+          "resultant_R2": 0.9796521067619324,
+          "null_max_R2": 0.9781936407089233,
+          "exceeds_all_nulls": true
+        },
+        {
+          "token_id": 56490,
+          "token": ".@",
+          "firings": 32,
+          "resultant_R1": 0.9960420727729797,
+          "null_max_R1": 0.9964128732681274,
+          "resultant_R2": 0.9842512011528015,
+          "null_max_R2": 0.9857143759727478,
+          "exceeds_all_nulls": false
+        }
+      ]
+    },
+    {
+      "block": 9075,
+      "atoms": [
+        18150,
+        18151
+      ],
+      "firings": 1216,
+      "firing_rate": 0.01216,
+      "mean_gate": 0.24293653666973114,
+      "top_tokens": [
+        {
+          "token_id": 641,
+          "token": " .",
+          "firings": 972,
+          "share": 0.7993421052631579,
+          "lift_over_corpus": 26.207937877480585
+        },
+        {
+          "token_id": 1116,
+          "token": " ,",
+          "firings": 136,
+          "share": 0.1118421052631579,
+          "lift_over_corpus": 2.6936923232937837
+        },
+        {
+          "token_id": 694,
+          "token": " but",
+          "firings": 53,
+          "share": 0.04358552631578947,
+          "lift_over_corpus": 30.479389032020606
+        },
+        {
+          "token_id": 748,
+          "token": " so",
+          "firings": 11,
+          "share": 0.009046052631578948,
+          "lift_over_corpus": 15.33229259589652
+        },
+        {
+          "token_id": 3384,
+          "token": " though",
+          "firings": 7,
+          "share": 0.005756578947368421,
+          "lift_over_corpus": 21.320662768031188
+        },
+        {
+          "token_id": 2502,
+          "token": " ;",
+          "firings": 6,
+          "share": 0.004934210526315789,
+          "lift_over_corpus": 2.990430622009569
+        },
+        {
+          "token_id": 539,
+          "token": " by",
+          "firings": 6,
+          "share": 0.004934210526315789,
+          "lift_over_corpus": 1.0749914000687992
+        },
+        {
+          "token_id": 1921,
+          "token": " But",
+          "firings": 4,
+          "share": 0.003289473684210526,
+          "lift_over_corpus": 27.412280701754383
+        },
+        {
+          "token_id": 7643,
+          "token": " although",
+          "firings": 4,
+          "share": 0.003289473684210526,
+          "lift_over_corpus": 15.664160401002505
+        },
+        {
+          "token_id": 13,
+          "token": ".",
+          "firings": 3,
+          "share": 0.0024671052631578946,
+          "lift_over_corpus": 1.2984764542936287
+        },
+        {
+          "token_id": 4611,
+          "token": " however",
+          "firings": 2,
+          "share": 0.001644736842105263,
+          "lift_over_corpus": 5.671506352087114
+        },
+        {
+          "token_id": 1892,
+          "token": " \u2014",
+          "firings": 2,
+          "share": 0.001644736842105263,
+          "lift_over_corpus": 1.934984520123839
+        }
+      ],
+      "angle": [
+        {
+          "token_id": 641,
+          "token": " .",
+          "firings": 972,
+          "resultant_R1": 0.989858865737915,
+          "null_max_R1": 0.9406960606575012,
+          "resultant_R2": 0.9599782824516296,
+          "null_max_R2": 0.794623851776123,
+          "exceeds_all_nulls": true
+        },
+        {
+          "token_id": 1116,
+          "token": " ,",
+          "firings": 136,
+          "resultant_R1": 0.9916008114814758,
+          "null_max_R1": 0.9634082913398743,
+          "resultant_R2": 0.9671289920806885,
+          "null_max_R2": 0.8667725324630737,
+          "exceeds_all_nulls": true
+        },
+        {
+          "token_id": 694,
+          "token": " but",
+          "firings": 53,
+          "resultant_R1": 0.9948009848594666,
+          "null_max_R1": 0.9698919653892517,
+          "resultant_R2": 0.9793834686279297,
+          "null_max_R2": 0.8916218280792236,
+          "exceeds_all_nulls": true
+        }
+      ]
+    },
+    {
+      "block": 12874,
+      "atoms": [
+        25748,
+        25749
+      ],
+      "firings": 1214,
+      "firing_rate": 0.01214,
+      "mean_gate": 0.2781052887439728,
+      "top_tokens": [
+        {
+          "token_id": 641,
+          "token": " .",
+          "firings": 1173,
+          "share": 0.9662273476112027,
+          "lift_over_corpus": 31.679585167580417
+        },
+        {
+          "token_id": 328,
+          "token": " \"",
+          "firings": 35,
+          "share": 0.028830313014827018,
+          "lift_over_corpus": 1.851657868646565
+        },
+        {
+          "token_id": 695,
+          "token": " \n",
+          "firings": 2,
+          "share": 0.0016474464579901153,
+          "lift_over_corpus": 0.18510634359439498
+        },
+        {
+          "token_id": 13,
+          "token": ".",
+          "firings": 1,
+          "share": 0.0008237232289950577,
+          "lift_over_corpus": 0.43353854157634614
+        },
+        {
+          "token_id": 847,
+          "token": " )",
+          "firings": 1,
+          "share": 0.0008237232289950577,
+          "lift_over_corpus": 0.17790998466415933
+        },
+        {
+          "token_id": 907,
+          "token": " ?",
+          "firings": 1,
+          "share": 0.0008237232289950577,
+          "lift_over_corpus": 4.576240161083653
+        },
+        {
+          "token_id": 2830,
+          "token": " include",
+          "firings": 1,
+          "share": 0.0008237232289950577,
+          "lift_over_corpus": 4.845430758794457
+        }
+      ],
+      "angle": [
+        {
+          "token_id": 641,
+          "token": " .",
+          "firings": 1173,
+          "resultant_R1": 0.9864343404769897,
+          "null_max_R1": 0.9859345555305481,
+          "resultant_R2": 0.94666987657547,
+          "null_max_R2": 0.9448569416999817,
+          "exceeds_all_nulls": true
+        },
+        {
+          "token_id": 328,
+          "token": " \"",
+          "firings": 35,
+          "resultant_R1": 0.9940596222877502,
+          "null_max_R1": 0.9923121333122253,
+          "resultant_R2": 0.9765029549598694,
+          "null_max_R2": 0.9695384502410889,
+          "exceeds_all_nulls": true
+        }
+      ]
+    },
+    {
+      "block": 9835,
+      "atoms": [
+        19670,
+        19671
+      ],
+      "firings": 1208,
+      "firing_rate": 0.01208,
+      "mean_gate": 0.26700806617736816,
+      "top_tokens": [
+        {
+          "token_id": 641,
+          "token": " .",
+          "firings": 1021,
+          "share": 0.8451986754966887,
+          "lift_over_corpus": 27.71143198349799
+        },
+        {
+          "token_id": 321,
+          "token": " and",
+          "firings": 166,
+          "share": 0.13741721854304637,
+          "lift_over_corpus": 6.786035483607228
+        },
+        {
+          "token_id": 695,
+          "token": " \n",
+          "firings": 10,
+          "share": 0.008278145695364239,
+          "lift_over_corpus": 0.9301287298162066
+        },
+        {
+          "token_id": 279,
+          "token": " the",
+          "firings": 4,
+          "share": 0.0033112582781456954,
+          "lift_over_corpus": 0.0795401940462574
+        },
+        {
+          "token_id": 13,
+          "token": ".",
+          "firings": 3,
+          "share": 0.0024834437086092716,
+          "lift_over_corpus": 1.307075636110143
+        },
+        {
+          "token_id": 328,
+          "token": " \"",
+          "firings": 2,
+          "share": 0.0016556291390728477,
+          "lift_over_corpus": 0.10633456256087653
+        },
+        {
+          "token_id": 1048,
+          "token": " also",
+          "firings": 1,
+          "share": 0.0008278145695364238,
+          "lift_over_corpus": 0.5047649814246487
+        },
+        {
+          "token_id": 1345,
+          "token": " while",
+          "firings": 1,
+          "share": 0.0008278145695364238,
+          "lift_over_corpus": 1.273560876209883
+        }
+      ],
+      "angle": [
+        {
+          "token_id": 641,
+          "token": " .",
+          "firings": 1021,
+          "resultant_R1": 0.9973847270011902,
+          "null_max_R1": 0.9162757992744446,
+          "resultant_R2": 0.9895768761634827,
+          "null_max_R2": 0.7592030763626099,
+          "exceeds_all_nulls": true
+        },
+        {
+          "token_id": 321,
+          "token": " and",
+          "firings": 166,
+          "resultant_R1": 0.998054027557373,
+          "null_max_R1": 0.9467818737030029,
+          "resultant_R2": 0.9922387003898621,
+          "null_max_R2": 0.8511578440666199,
+          "exceeds_all_nulls": true
+        }
+      ]
+    },
+    {
+      "block": 7535,
+      "atoms": [
+        15070,
+        15071
+      ],
+      "firings": 1204,
+      "firing_rate": 0.01204,
+      "mean_gate": 0.27323848009109497,
+      "top_tokens": [
+        {
+          "token_id": 641,
+          "token": " .",
+          "firings": 792,
+          "share": 0.6578073089700996,
+          "lift_over_corpus": 21.567452753118022
+        },
+        {
+          "token_id": 695,
+          "token": " \n",
+          "firings": 313,
+          "share": 0.2599667774086379,
+          "lift_over_corpus": 29.20975027063347
+        },
+        {
+          "token_id": 328,
+          "token": " \"",
+          "firings": 62,
+          "share": 0.05149501661129568,
+          "lift_over_corpus": 3.3073228395180267
+        },
+        {
+          "token_id": 847,
+          "token": " )",
+          "firings": 15,
+          "share": 0.012458471760797342,
+          "lift_over_corpus": 2.6908146351614133
+        },
+        {
+          "token_id": 1116,
+          "token": " ,",
+          "firings": 14,
+          "share": 0.011627906976744186,
+          "lift_over_corpus": 0.2800555630237039
+        },
+        {
+          "token_id": 13,
+          "token": ".",
+          "firings": 3,
+          "share": 0.0024916943521594683,
+          "lift_over_corpus": 1.3114180800839306
+        },
+        {
+          "token_id": 535,
+          "token": " :",
+          "firings": 2,
+          "share": 0.0016611295681063123,
+          "lift_over_corpus": 0.7947988364145036
+        },
+        {
+          "token_id": 220,
+          "token": " ",
+          "firings": 1,
+          "share": 0.0008305647840531562,
+          "lift_over_corpus": 0.03470809795458237
+        },
+        {
+          "token_id": 2205,
+          "token": " ]",
+          "firings": 1,
+          "share": 0.0008305647840531562,
+          "lift_over_corpus": 2.12965329244399
+        },
+        {
+          "token_id": 2228,
+          "token": "  \n",
+          "firings": 1,
+          "share": 0.0008305647840531562,
+          "lift_over_corpus": 83.05647840531562
+        }
+      ],
+      "angle": [
+        {
+          "token_id": 641,
+          "token": " .",
+          "firings": 792,
+          "resultant_R1": 0.9887208938598633,
+          "null_max_R1": 0.9893703460693359,
+          "resultant_R2": 0.9554691910743713,
+          "null_max_R2": 0.9582036733627319,
+          "exceeds_all_nulls": false
+        },
+        {
+          "token_id": 695,
+          "token": " \n",
+          "firings": 313,
+          "resultant_R1": 0.9932121634483337,
+          "null_max_R1": 0.9899998903274536,
+          "resultant_R2": 0.9733271598815918,
+          "null_max_R2": 0.9607657790184021,
+          "exceeds_all_nulls": true
+        },
+        {
+          "token_id": 328,
+          "token": " \"",
+          "firings": 62,
+          "resultant_R1": 0.9813947081565857,
+          "null_max_R1": 0.9929019808769226,
+          "resultant_R2": 0.9276108741760254,
+          "null_max_R2": 0.9718818068504333,
+          "exceeds_all_nulls": false
+        }
+      ]
+    },
+    {
+      "block": 2910,
+      "atoms": [
+        5820,
+        5821
+      ],
+      "firings": 1201,
+      "firing_rate": 0.01201,
+      "mean_gate": 0.16155067086219788,
+      "top_tokens": [
+        {
+          "token_id": 3135,
+          "token": " Br",
+          "firings": 17,
+          "share": 0.014154870940882597,
+          "lift_over_corpus": 32.91830451368046
+        },
+        {
+          "token_id": 463,
+          "token": "ack",
+          "firings": 14,
+          "share": 0.011656952539550375,
+          "lift_over_corpus": 36.427976686094915
+        },
+        {
+          "token_id": 433,
+          "token": "rom",
+          "firings": 11,
+          "share": 0.009159034138218152,
+          "lift_over_corpus": 28.62198168193172
+        },
+        {
+          "token_id": 436,
+          "token": " L",
+          "firings": 9,
+          "share": 0.00749375520399667,
+          "lift_over_corpus": 14.411067699993596
+        },
+        {
+          "token_id": 382,
+          "token": "ers",
+          "firings": 8,
+          "share": 0.006661115736885929,
+          "lift_over_corpus": 6.055559760805389
+        },
+        {
+          "token_id": 34361,
+          "token": " Wor",
+          "firings": 8,
+          "share": 0.006661115736885929,
+          "lift_over_corpus": 55.50929780738274
+        },
+        {
+          "token_id": 12878,
+          "token": " Young",
+          "firings": 8,
+          "share": 0.006661115736885929,
+          "lift_over_corpus": 19.03175924824551
+        },
+        {
+          "token_id": 326,
+          "token": " S",
+          "firings": 8,
+          "share": 0.006661115736885929,
+          "lift_over_corpus": 15.490966829967276
+        },
+        {
+          "token_id": 2226,
+          "token": "los",
+          "firings": 8,
+          "share": 0.006661115736885929,
+          "lift_over_corpus": 19.591516873193907
+        },
+        {
+          "token_id": 469,
+          "token": " G",
+          "firings": 8,
+          "share": 0.006661115736885929,
+          "lift_over_corpus": 8.764625969586747
+        },
+        {
+          "token_id": 299,
+          "token": "as",
+          "firings": 7,
+          "share": 0.005828476269775187,
+          "lift_over_corpus": 38.85650846516792
+        },
+        {
+          "token_id": 345,
+          "token": " T",
+          "firings": 7,
+          "share": 0.005828476269775187,
+          "lift_over_corpus": 18.213988343047458
+        }
+      ],
+      "angle": []
+    },
+    {
+      "block": 6896,
+      "atoms": [
+        13792,
+        13793
+      ],
+      "firings": 1192,
+      "firing_rate": 0.01192,
+      "mean_gate": 0.18312789499759674,
+      "top_tokens": [
+        {
+          "token_id": 12,
+          "token": "-",
+          "firings": 351,
+          "share": 0.29446308724832215,
+          "lift_over_corpus": 41.24132874626361
+        },
+        {
+          "token_id": 554,
+          "token": " @",
+          "firings": 329,
+          "share": 0.276006711409396,
+          "lift_over_corpus": 30.16466791359519
+        },
+        {
+          "token_id": 31,
+          "token": "@",
+          "firings": 204,
+          "share": 0.17114093959731544,
+          "lift_over_corpus": 24.138355373387228
+        },
+        {
+          "token_id": 15,
+          "token": "0",
+          "firings": 68,
+          "share": 0.05704697986577181,
+          "lift_over_corpus": 4.095260579021667
+        },
+        {
+          "token_id": 30095,
+          "token": ",@",
+          "firings": 54,
+          "share": 0.04530201342281879,
+          "lift_over_corpus": 54.5807390636371
+        },
+        {
+          "token_id": 56490,
+          "token": ".@",
+          "firings": 50,
+          "share": 0.04194630872483222,
+          "lift_over_corpus": 35.547719258332386
+        },
+        {
+          "token_id": 20,
+          "token": "5",
+          "firings": 26,
+          "share": 0.02181208053691275,
+          "lift_over_corpus": 5.8477427712902825
+        },
+        {
+          "token_id": 17,
+          "token": "2",
+          "firings": 19,
+          "share": 0.015939597315436243,
+          "lift_over_corpus": 1.7102572226862922
+        },
+        {
+          "token_id": 24,
+          "token": "9",
+          "firings": 17,
+          "share": 0.014261744966442953,
+          "lift_over_corpus": 1.9725788335329117
+        },
+        {
+          "token_id": 19,
+          "token": "4",
+          "firings": 17,
+          "share": 0.014261744966442953,
+          "lift_over_corpus": 4.074784276126558
+        },
+        {
+          "token_id": 18,
+          "token": "3",
+          "firings": 15,
+          "share": 0.012583892617449664,
+          "lift_over_corpus": 3.554771925833238
+        },
+        {
+          "token_id": 16,
+          "token": "1",
+          "firings": 12,
+          "share": 0.010067114093959731,
+          "lift_over_corpus": 0.7490412272291466
+        }
+      ],
+      "angle": [
+        {
+          "token_id": 12,
+          "token": "-",
+          "firings": 351,
+          "resultant_R1": 0.9981783032417297,
+          "null_max_R1": 0.9331859350204468,
+          "resultant_R2": 0.9927378296852112,
+          "null_max_R2": 0.7859944105148315,
+          "exceeds_all_nulls": true
+        },
+        {
+          "token_id": 554,
+          "token": " @",
+          "firings": 329,
+          "resultant_R1": 0.9962483644485474,
+          "null_max_R1": 0.9365649223327637,
+          "resultant_R2": 0.9850738644599915,
+          "null_max_R2": 0.7939223051071167,
+          "exceeds_all_nulls": true
+        },
+        {
+          "token_id": 31,
+          "token": "@",
+          "firings": 204,
+          "resultant_R1": 0.9970937967300415,
+          "null_max_R1": 0.9478126764297485,
+          "resultant_R2": 0.9884606003761292,
+          "null_max_R2": 0.8332008719444275,
+          "exceeds_all_nulls": true
+        },
+        {
+          "token_id": 15,
+          "token": "0",
+          "firings": 68,
+          "resultant_R1": 0.9963813424110413,
+          "null_max_R1": 0.9725890159606934,
+          "resultant_R2": 0.9856113195419312,
+          "null_max_R2": 0.9127678275108337,
+          "exceeds_all_nulls": true
+        },
+        {
+          "token_id": 30095,
+          "token": ",@",
+          "firings": 54,
+          "resultant_R1": 0.9954820275306702,
+          "null_max_R1": 0.9662492275238037,
+          "resultant_R2": 0.9820399284362793,
+          "null_max_R2": 0.8923635482788086,
+          "exceeds_all_nulls": true
+        },
+        {
+          "token_id": 56490,
+          "token": ".@",
+          "firings": 50,
+          "resultant_R1": 0.9971093535423279,
+          "null_max_R1": 0.9731970429420471,
+          "resultant_R2": 0.9884851574897766,
+          "null_max_R2": 0.9165394306182861,
+          "exceeds_all_nulls": true
+        }
+      ]
+    },
+    {
+      "block": 4530,
+      "atoms": [
+        9060,
+        9061
+      ],
+      "firings": 1187,
+      "firing_rate": 0.01187,
+      "mean_gate": 0.16192132234573364,
+      "top_tokens": [
+        {
+          "token_id": 463,
+          "token": "ack",
+          "firings": 17,
+          "share": 0.014321819713563605,
+          "lift_over_corpus": 44.755686604886264
+        },
+        {
+          "token_id": 3135,
+          "token": " Br",
+          "firings": 17,
+          "share": 0.014321819713563605,
+          "lift_over_corpus": 33.306557473403736
+        },
+        {
+          "token_id": 38899,
+          "token": "wend",
+          "firings": 13,
+          "share": 0.010951979780960405,
+          "lift_over_corpus": 42.12299915754002
+        },
+        {
+          "token_id": 299,
+          "token": "as",
+          "firings": 11,
+          "share": 0.009267059814658803,
+          "lift_over_corpus": 61.780398764392025
+        },
+        {
+          "token_id": 382,
+          "token": "ers",
+          "firings": 10,
+          "share": 0.008424599831508003,
+          "lift_over_corpus": 7.658727119552729
+        },
+        {
+          "token_id": 34361,
+          "token": " Wor",
+          "firings": 9,
+          "share": 0.007582139848357203,
+          "lift_over_corpus": 63.184498736310026
+        },
+        {
+          "token_id": 2226,
+          "token": "los",
+          "firings": 9,
+          "share": 0.007582139848357203,
+          "lift_over_corpus": 22.300411318697655
+        },
+        {
+          "token_id": 25274,
+          "token": " Cab",
+          "firings": 8,
+          "share": 0.006739679865206402,
+          "lift_over_corpus": 51.84369127081848
+        },
+        {
+          "token_id": 330,
+          "token": "ut",
+          "firings": 7,
+          "share": 0.005897219882055603,
+          "lift_over_corpus": 58.972198820556024
+        },
+        {
+          "token_id": 75,
+          "token": "l",
+          "firings": 7,
+          "share": 0.005897219882055603,
+          "lift_over_corpus": 39.31479921370402
+        },
+        {
+          "token_id": 47495,
+          "token": " Cec",
+          "firings": 7,
+          "share": 0.005897219882055603,
+          "lift_over_corpus": 26.805544918434556
+        },
+        {
+          "token_id": 166454,
+          "token": "r\u00ed",
+          "firings": 7,
+          "share": 0.005897219882055603,
+          "lift_over_corpus": 29.486099410278012
+        }
+      ],
+      "angle": []
+    }
+  ]
+}

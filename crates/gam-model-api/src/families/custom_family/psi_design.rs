@@ -18,6 +18,11 @@ pub use gam_problem::{
     MaterializablePsiDerivativeOperator, MaterializationIntent, SharedCustomFamilyHyperLayout,
 };
 
+/// Family-owned exact coefficient-Hessian workspace for joint Newton fitting.
+///
+/// Implementations may expose dense matrices, matrix-free products, or both.
+/// `Ok(None)` means a representation is unavailable; `Err` reports failure to
+/// evaluate the family at the workspace's current coefficient state.
 pub trait ExactNewtonJointHessianWorkspace: Send + Sync {
     /// Pre-build any per-row jet caches the workspace will hand to the
     /// outer-eval directional-derivative path. Called once when the
@@ -53,6 +58,10 @@ pub trait ExactNewtonJointHessianWorkspace: Send + Sync {
     /// directional caches implement this explicitly as a mode-exhaustive no-op.
     fn warm_up_outer_caches_for_mode(&self, eval_mode: EvalMode) -> Result<(), String>;
 
+    /// Return the dense coefficient Hessian when the workspace exposes one.
+    ///
+    /// The matrix is square in flattened coefficient order. `Ok(None)` selects
+    /// another representation; `Err` reports an evaluation or assembly error.
     fn hessian_dense(&self) -> Result<Option<Array2<f64>>, String> {
         Ok(None)
     }
@@ -99,10 +108,17 @@ pub trait ExactNewtonJointHessianWorkspace: Send + Sync {
         self.hessian_dense()
     }
 
+    /// Return the joint log likelihood cached at this workspace state.
+    ///
+    /// `Ok(None)` means it was not computed; `Err` reports evaluation failure.
     fn joint_log_likelihood_evaluation(&self) -> Result<Option<f64>, String> {
         Ok(None)
     }
 
+    /// Return the cached joint log likelihood and exact coefficient gradient.
+    ///
+    /// `Ok(None)` means the workspace does not expose this payload; `Err`
+    /// reports evaluation failure.
     fn joint_gradient_evaluation(
         &self,
     ) -> Result<Option<ExactNewtonJointGradientEvaluation>, String> {
@@ -123,6 +139,11 @@ pub trait ExactNewtonJointHessianWorkspace: Send + Sync {
         false
     }
 
+    /// Apply the coefficient Hessian to one flattened coefficient direction.
+    ///
+    /// The input must have the workspace coefficient dimension and contain no
+    /// NaNs. `Ok(None)` means matrix-free application is unavailable; `Err`
+    /// reports a family evaluation or dimension error.
     fn hessian_matvec(&self, arr: &Array1<f64>) -> Result<Option<Array1<f64>>, String> {
         assert!(arr.iter().all(|v| !v.is_nan()));
         Ok(None)
@@ -201,6 +222,10 @@ pub trait ExactNewtonJointHessianWorkspace: Send + Sync {
         Ok(true)
     }
 
+    /// Return the coefficient-Hessian diagonal in flattened block order.
+    ///
+    /// `Ok(None)` means the diagonal is unavailable without materialization;
+    /// `Err` reports evaluation failure.
     fn hessian_diagonal(&self) -> Result<Option<Array1<f64>>, String> {
         Ok(None)
     }
@@ -225,6 +250,11 @@ pub trait ExactNewtonJointHessianWorkspace: Send + Sync {
         Ok(None)
     }
 
+    /// Differentiate the coefficient Hessian along `d_beta_flat`.
+    ///
+    /// The direction must match the flattened coefficient dimension. Returns
+    /// `Ok(None)` when a dense derivative is unavailable and `Err` when the
+    /// family cannot evaluate the requested direction.
     fn directional_derivative(
         &self,
         d_beta_flat: &Array1<f64>,
@@ -235,12 +265,14 @@ pub trait ExactNewtonJointHessianWorkspace: Send + Sync {
     /// owning a shared row/derivative cache override this so consumers such as
     /// the accepted-mode Jeffreys certificate do not reconstruct the family
     /// state or rebuild direction-independent row towers once per axis.
-    fn directional_derivative_all_axes(
-        &self,
-    ) -> Result<Option<Vec<Array2<f64>>>, String> {
+    fn directional_derivative_all_axes(&self) -> Result<Option<Vec<Array2<f64>>>, String> {
         Ok(None)
     }
 
+    /// Differentiate the coefficient Hessian along one direction as an operator.
+    ///
+    /// The default wraps [`Self::directional_derivative`] in a dense operator.
+    /// `Ok(None)` and `Err` preserve that method's unavailable/error meanings.
     fn directional_derivative_operator(
         &self,
         d_beta_flat: &Array1<f64>,
@@ -250,6 +282,10 @@ pub trait ExactNewtonJointHessianWorkspace: Send + Sync {
             .map(|matrix| Arc::new(DenseMatrixHyperOperator { matrix }) as Arc<dyn HyperOperator>))
     }
 
+    /// Evaluate first Hessian derivatives for a batch of coefficient directions.
+    ///
+    /// Results preserve input order. The first error aborts the batch; an
+    /// individual `None` denotes an unavailable derivative representation.
     fn directional_derivative_operators(
         &self,
         d_beta_flats: &[Array1<f64>],
@@ -260,6 +296,10 @@ pub trait ExactNewtonJointHessianWorkspace: Send + Sync {
             .collect()
     }
 
+    /// Evaluate the mixed second Hessian derivative along two directions.
+    ///
+    /// Both vectors must match the flattened coefficient dimension and contain
+    /// no NaNs. `Ok(None)` means unsupported; `Err` reports evaluation failure.
     fn second_directional_derivative(
         &self,
         arr: &Array1<f64>,
@@ -270,6 +310,10 @@ pub trait ExactNewtonJointHessianWorkspace: Send + Sync {
         Ok(None)
     }
 
+    /// Evaluate a mixed second Hessian derivative as an operator.
+    ///
+    /// The default wraps [`Self::second_directional_derivative`] in a dense
+    /// operator and preserves its unavailable/error semantics.
     fn second_directional_derivative_operator(
         &self,
         d_beta_u: &Array1<f64>,
@@ -280,6 +324,10 @@ pub trait ExactNewtonJointHessianWorkspace: Send + Sync {
             .map(|matrix| Arc::new(DenseMatrixHyperOperator { matrix }) as Arc<dyn HyperOperator>))
     }
 
+    /// Evaluate mixed second Hessian derivatives for a batch of direction pairs.
+    ///
+    /// Results preserve pair order. The first error aborts the batch; an
+    /// individual `None` denotes an unsupported derivative.
     fn second_directional_derivative_operators(
         &self,
         d_beta_pairs: &[(Array1<f64>, Array1<f64>)],

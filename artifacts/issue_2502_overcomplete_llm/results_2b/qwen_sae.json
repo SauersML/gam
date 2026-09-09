@@ -1,0 +1,29 @@
+{
+  "sae": "/scratch.global/sauer354/a5hf/hub/models--Qwen--SAE-Res-Qwen3.5-2B-Base-W32K-L0_50/snapshots/132ea3697b591df9ee46d738aa1d528e3c6082f7/layer12.sae.pt",
+  "d_sae": 32768,
+  "d_model": 2048,
+  "topk": 50,
+  "rows_scored": 100000,
+  "measured_mean_l0": 50.0,
+  "least_squares_pinv_fallback_rows": 0,
+  "features_used_on_heldout": 24529,
+  "decoder_parameters": 67108864,
+  "encoder_parameters": 67108864,
+  "rate": {
+    "active_scalars_per_token": 50,
+    "selection_bits_per_token": 750.0
+  },
+  "arms": {
+    "qwen_sae": {
+      "heldout_fvu": 0.3001240414155678,
+      "heldout_explained_variance": 0.6998759585844322,
+      "rss": 1060656.65234375
+    },
+    "qwen_sae_ls": {
+      "heldout_fvu": 0.2859692088178821,
+      "heldout_explained_variance": 0.7140307911821179,
+      "rss": 1010632.611328125
+    }
+  },
+  "tss_about_eval_mean": 3534060.94140625
+}

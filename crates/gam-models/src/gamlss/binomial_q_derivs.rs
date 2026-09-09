@@ -752,6 +752,168 @@ mod tests {
     // Logit inverse-link jet (μ and its first four q-derivatives), derived
     // independently of production code: with p = σ(q) and s = p(1-p),
     //   μ = p,  μ' = s,  μ'' = s(1-2p),  μ''' = s(1-6s),  μ'''' = s(1-2p)(1-12s).
+    // A FIVE-POINT CENTRAL DIFFERENCE, used to walk a closed form's own tower
+    // one rung at a time. `sample` is whichever rung is already believed.
+    fn central_fd(sample: impl Fn(f64) -> f64, q: f64, h: f64) -> f64 {
+        (-sample(q + 2.0 * h) + 8.0 * sample(q + h) - 8.0 * sample(q - h) + sample(q - 2.0 * h))
+            / (12.0 * h)
+    }
+
+    // THE LADDER. `rungs[k]` must be d/dq of `rungs[k-1]`, and `rungs[0]` must be
+    // the loss itself. Walking it pins every sign and coefficient the closed form
+    // assembles -- which is exactly where #947 (a spurious fifth-derivative term)
+    // and #948 (a floored variance) lived -- WITHOUT an independent derivation of
+    // the tower to compare against, and so without a second hand-derivation that
+    // could be wrong in the same direction as the first.
+    fn assert_fd_ladder(name: &str, q: f64, rungs: &[&dyn Fn(f64) -> f64]) {
+        for step in 1..rungs.len() {
+            let h = 1.0e-3;
+            let fd = central_fd(|x| rungs[step - 1](x), q, h);
+            let analytic = rungs[step](q);
+            // NON-VACUITY: a ladder whose rungs are all zero passes for free.
+            assert!(
+                analytic.abs() > 1.0e-9 || fd.abs() > 1.0e-9,
+                "{name} rung {step} at q={q} is identically zero -- the ladder proves nothing"
+            );
+            let tol = 2.0e-6 * (1.0 + analytic.abs());
+            assert!(
+                (analytic - fd).abs() < tol,
+                "{name} rung {step} at q={q}: analytic={analytic} fd={fd} diff={}",
+                (analytic - fd).abs()
+            );
+        }
+    }
+
+    // The probit loss F(q) = -w[y lnPhi(q) + (1-y) lnPhi(-q)], read from the VALUE
+    // channel of `normal_logcdf_derivatives`. The closed-form stack reads only
+    // that primitive's orders 1..=4 and never its slot 0, so the ladder's bottom
+    // rung is a quantity production does not consume: a reflection sign or a
+    // weight dropped in the stack's assembly cannot cancel out of both sides.
+    fn probit_loss(y: f64, weight: f64, q: f64) -> f64 {
+        let left = normal_logcdf_derivatives(q);
+        let right = normal_logcdf_derivatives(-q);
+        -weight * (y * left[0] + (1.0 - y) * right[0])
+    }
+
+    #[test]
+    fn probit_closed_form_tower_is_finite_difference_consistent_from_its_loss_932() {
+        for &(y, w, q) in &[
+            (0.3_f64, 2.0_f64, 0.7_f64),
+            (0.8, 1.0, -0.4),
+            (0.0, 1.5, 1.3),
+            (1.0, 0.5, -1.1),
+            (0.42, 3.0, 0.0),
+        ] {
+            let m1 = move |x: f64| binomial_neglog_q_derivatives_probit_closed_form(y, w, x).0;
+            let m2 = move |x: f64| binomial_neglog_q_derivatives_probit_closed_form(y, w, x).1;
+            let m3 = move |x: f64| binomial_neglog_q_derivatives_probit_closed_form(y, w, x).2;
+            let m4 = move |x: f64| binomial_neglog_q_fourth_derivative_probit_closed_form(y, w, x);
+            let loss = move |x: f64| probit_loss(y, w, x);
+            assert_fd_ladder(
+                &format!("probit(y={y}, w={w})"),
+                q,
+                &[&loss, &m1, &m2, &m3, &m4],
+            );
+        }
+    }
+
+    // The cloglog inverse link mu(q) = 1 - exp(-t) with t = exp(q), and its first
+    // four q-derivatives, derived independently of production. Writing A = t e^{-t}:
+    //   mu'    = A
+    //   mu''   = A (1 - t)
+    //   mu'''  = A (1 - 3t + t^2)
+    //   mu'''' = A (1 - 7t + 6t^2 - t^3)
+    pub(crate) fn cloglog_jet(q: f64) -> (f64, f64, f64, f64, f64) {
+        let t = q.exp();
+        let a = t * (-t).exp();
+        // 1 - e^{-t} without the cancellation that bites for small t.
+        let mu = -(-t).exp_m1();
+        (
+            mu,
+            a,
+            a * (1.0 - t),
+            a * (1.0 - 3.0 * t + t * t),
+            a * (1.0 - 7.0 * t + 6.0 * t * t - t * t * t),
+        )
+    }
+
+    // The cloglog loss is ELEMENTARY -- log(1-mu) = -t exactly -- so this rung
+    // shares no primitive at all with the closed form under test.
+    fn cloglog_loss(y: f64, weight: f64, q: f64) -> f64 {
+        let t = q.exp();
+        let log_mu = (-(-t).exp_m1()).ln();
+        -weight * (y * log_mu + (1.0 - y) * (-t))
+    }
+
+    #[test]
+    fn cloglog_closed_form_tower_is_finite_difference_consistent_from_its_loss_932() {
+        for &(y, w, q) in &[
+            (0.3_f64, 2.0_f64, 0.7_f64),
+            (0.8, 1.0, -0.4),
+            (0.0, 1.5, 1.3),
+            (1.0, 0.5, -1.1),
+            (0.42, 3.0, 0.0),
+        ] {
+            let m1 = move |x: f64| binomial_neglog_q_derivatives_cloglog_closed_form(y, w, x).0;
+            let m2 = move |x: f64| binomial_neglog_q_derivatives_cloglog_closed_form(y, w, x).1;
+            let m3 = move |x: f64| binomial_neglog_q_derivatives_cloglog_closed_form(y, w, x).2;
+            let m4 = move |x: f64| binomial_neglog_q_fourth_derivative_cloglog_closed_form(y, w, x);
+            let loss = move |x: f64| cloglog_loss(y, w, x);
+            assert_fd_ladder(
+                &format!("cloglog(y={y}, w={w})"),
+                q,
+                &[&loss, &m1, &m2, &m3, &m4],
+            );
+        }
+    }
+
+    #[test]
+    fn cloglog_closed_form_agrees_with_generic_jet_path_932() {
+        // The same cross-check `logit_closed_form_agrees_with_generic_jet_path`
+        // makes for the canonical link: the specialised closed form and the
+        // generic mu-jet composition are two independent computations of one
+        // derivative tower, and where mu is comfortably interior they must agree
+        // to float precision. Until now only the logit pair was held to this;
+        // the cloglog closed form had no cross-check of any kind.
+        for &(y, w, q) in &[
+            (0.3_f64, 2.0_f64, 0.5_f64),
+            (0.7, 1.0, -1.3),
+            (0.0, 1.5, 0.9),
+            (1.0, 0.5, -0.8),
+            (0.42, 3.0, 0.0),
+        ] {
+            let (m1, m2, m3) = binomial_neglog_q_derivatives_cloglog_closed_form(y, w, q);
+            let m4 = binomial_neglog_q_fourth_derivative_cloglog_closed_form(y, w, q);
+
+            let (mu, d1, d2, d3, d4) = cloglog_jet(q);
+            // NON-VACUITY: the comparison is only meaningful where both are valid.
+            assert!(
+                mu > 1.0e-6 && mu < 1.0 - 1.0e-6,
+                "q={q}: mu={mu} is not comfortably interior, the comparison is vacuous"
+            );
+            let (s1, c2, t3) = binomial_neglog_q_derivatives_from_jet(y, w, mu, d1, d2, d3);
+            let j4 = binomial_neglog_q_fourth_derivative_from_jet(y, w, mu, d1, d2, d3, d4);
+
+            let tol = 1.0e-9 * (1.0 + m1.abs() + m2.abs() + m3.abs() + m4.abs());
+            assert!(
+                (m1 - s1).abs() < tol,
+                "m1 mismatch q={q}: closed={m1} jet={s1}"
+            );
+            assert!(
+                (m2 - c2).abs() < tol,
+                "m2 mismatch q={q}: closed={m2} jet={c2}"
+            );
+            assert!(
+                (m3 - t3).abs() < tol,
+                "m3 mismatch q={q}: closed={m3} jet={t3}"
+            );
+            assert!(
+                (m4 - j4).abs() < tol,
+                "m4 mismatch q={q}: closed={m4} jet={j4}"
+            );
+        }
+    }
+
     pub(crate) fn logit_jet(q: f64) -> (f64, f64, f64, f64, f64) {
         let p = 1.0 / (1.0 + (-q).exp());
         let s = p * (1.0 - p);

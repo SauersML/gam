@@ -5,7 +5,7 @@
 //! time for even covariate dimensions `d ≥ 4` (originally surfaced as a
 //! "non-finite values in self-adjoint eigendecomposition" error inside a
 //! `bernoulli-marginal-slope` slope surface; later a clean fit-time
-//! "Duchon pointwise kernel values require 2*(p+s) > dimension" validation
+//! "Duchon pointwise kernel values: 2*(p+s) > dimension is required" validation
 //! error).
 //!
 //! Root cause: the request-layer cubic structural default resolves the spectral
@@ -225,7 +225,6 @@ fn fit_options() -> FitOptions {
         nullspace_dims: vec![],
         linear_constraints: None,
         firth_bias_reduction: false,
-        adaptive_regularization: None,
         rho_prior: Default::default(),
         kronecker_penalty_system: None,
         kronecker_factored: None,

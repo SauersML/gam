@@ -1,12 +1,6 @@
 use super::*;
 use gam_linalg::faer_ndarray::{FaerEigh, FaerSvd};
 
-#[path = "penalties_exact_beta.rs"]
-mod exact_beta;
-
-#[path = "penalties_spectral.rs"]
-mod spectral;
-
 /// #1610 / Jeffreys — one co-firing connected component of the SAE decoder
 /// Jeffreys prior. The anti-collapse penalty is the Jeffreys prior on the
 /// dictionary, `π(B) ∝ √det F(B)`, i.e. `−½·log det F`, where `F = Q ∘ O` is the
@@ -90,7 +84,7 @@ struct BarrierComponent {
     eps: f64,
 }
 
-/// One co-firing component's installed separation-barrier Newton metric,
+/// One co-firing component's exact Gauss–Newton separation-barrier curvature,
 /// in the FACTORED form it is derived in:
 ///
 /// ```text
@@ -98,8 +92,8 @@ struct BarrierComponent {
 /// ```
 ///
 /// over the component's edges `a, b`, where `v_a = ∂o_a/∂B` is the rank-aware
-/// overlap carrier of edge `a` and `coupling = penalty_scale·M` is the
-/// positive Gram metric in overlap space from
+/// overlap carrier of edge `a` and `coupling = penalty_scale·|M|` is the
+/// (majorized) overlap-space Hessian of
 /// [`SaeManifoldTerm::add_sae_separation_barrier`].
 ///
 /// The alternative — diagonalizing `coupling` and expanding the eigen carriers
@@ -122,6 +116,96 @@ pub(crate) struct SeparationBarrierCurvature {
     pub(crate) coupling: Array2<f64>,
     /// Per-edge carriers `∂o_a/∂B` as `(atom, dense block)` runs.
     pub(crate) carriers: Vec<Vec<(usize, Vec<f64>)>>,
+}
+
+/// #2828 — one separation-barrier EDGE, planned once and read by both the
+/// assembly (which installs a majorizer) and the exact stationarity Hessian
+/// (which undoes it).
+///
+/// A degenerate edge — mismatched decoder width, or a vanishing self-Gram —
+/// carries EMPTY runs rather than being dropped, so the edge indexing stays the
+/// component's own and lines up with the `ne × ne` couplings.
+pub(crate) struct SeparationBarrierEdgePlan {
+    pub(crate) j: usize,
+    pub(crate) k: usize,
+    /// `α_e = penalty_scale·∂P/∂o_e`.
+    pub(crate) alpha: f64,
+    /// The edge's overlap `o_e` the carriers were built at.
+    pub(crate) o: f64,
+    /// `D_j = ‖B_jB_jᵀ‖_F`, `D_k` — needed to differentiate `∂o_e/∂B` again.
+    pub(crate) d_j: f64,
+    pub(crate) d_k: f64,
+    /// `∂o_e/∂B_j` as a dense `M_j·p` run in the atom's own β block order.
+    pub(crate) run_j: Vec<f64>,
+    pub(crate) run_k: Vec<f64>,
+    /// The per-atom Levenberg ridge `2|α_e|·o_e/D_·` the assembly installs in
+    /// place of the indefinite `α_e·∂²o_e/∂B²`.
+    pub(crate) lev_j: f64,
+    pub(crate) lev_k: f64,
+}
+
+impl SeparationBarrierEdgePlan {
+    fn degenerate(j: usize, k: usize) -> Self {
+        Self {
+            j,
+            k,
+            alpha: 0.0,
+            o: 0.0,
+            d_j: 0.0,
+            d_k: 0.0,
+            run_j: Vec::new(),
+            run_k: Vec::new(),
+            lev_j: 0.0,
+            lev_k: 0.0,
+        }
+    }
+}
+
+/// #2828 — one atom's AMPLITUDE-barrier scalars at a fixed decoder state, so the
+/// per-apply path never re-derives them. `energy` is `u = ‖B_k‖²_F`,
+/// `gradient_coefficient` is `2φ(u)` and `radial_curvature` is `P″(s)`; the
+/// exact Hessian is `2φ·I + ((prr − 2φ)/u)·b bᵀ` and the installed majorizer is
+/// `prr·I`. An atom on which the barrier abstains carries no entry at all, which
+/// is what keeps value, gradient, majorizer and remainder abstaining together.
+pub(crate) struct PreparedAmplitudeBarrierAtom {
+    pub(crate) atom: usize,
+    pub(crate) offset: usize,
+    pub(crate) basis_size: usize,
+    pub(crate) energy: f64,
+    pub(crate) gradient_coefficient: f64,
+    pub(crate) radial_curvature: f64,
+}
+
+/// #2828 — the state-dependent half of the β-tier decoder priors' curvature,
+/// prepared once and shared by every apply of one materialization or one Krylov
+/// solve. See [`SaeManifoldTerm::prepare_decoder_prior_beta_curvature`].
+pub(crate) struct PreparedDecoderPriorBetaCurvature {
+    pub(crate) beta_dim: usize,
+    pub(crate) penalty_scale: f64,
+    pub(crate) repulsion: Option<(DecoderIncoherencePenalty, Array1<f64>)>,
+    pub(crate) amplitude: Vec<PreparedAmplitudeBarrierAtom>,
+    pub(crate) separation: Vec<SeparationBarrierComponentPlan>,
+}
+
+/// #2828 — one co-firing component's separation-barrier plan: the edges, their
+/// carriers, and BOTH overlap-space couplings (`penalty_scale·M`, the exact
+/// Hessian, and `penalty_scale·|M|`, the shipped PSD majorizer).
+///
+/// `coupling_majorizer` is `None` exactly when the assembly installs no
+/// curvature for this component (the eigendecomposition failed, the majorizer is
+/// identically zero, or every carrier is degenerate), so a consumer subtracting
+/// the majorizer never subtracts something that was not added.
+pub(crate) struct SeparationBarrierComponentPlan {
+    /// The component's atoms, ascending (ascending in the global β offset too).
+    pub(crate) atoms: Vec<usize>,
+    pub(crate) edges: Vec<SeparationBarrierEdgePlan>,
+    /// Per-edge carriers `∂o_e/∂B` as `(atom, dense block)` runs.
+    pub(crate) carriers: Vec<Vec<(usize, Vec<f64>)>>,
+    /// `penalty_scale·M_exact`, the Daleckii–Krein overlap-space Hessian.
+    /// `None` when the caller did not ask for it (the assembly does not need it
+    /// and would pay `O(ne²s²)` for nothing).
+    pub(crate) coupling_exact: Option<Array2<f64>>,
+    pub(crate) coupling_majorizer: Option<Array2<f64>>,
 }
 
 impl SeparationBarrierCurvature {
@@ -283,12 +367,7 @@ impl SaeManifoldTerm {
         let norm_sq: Vec<f64> = self
             .atoms
             .iter()
-            .map(|atom| {
-                atom.decoder_coefficients()
-                    .iter()
-                    .map(|v| v * v)
-                    .sum::<f64>()
-            })
+            .map(|atom| atom.decoder_coefficients().iter().map(|v| v * v).sum::<f64>())
             .collect();
         // Candidate pair set: only co-active atom pairs. The repulsion is the
         // anti-collapse cure for two atoms that drift onto the SAME decoder
@@ -495,16 +574,6 @@ impl SaeManifoldTerm {
         let beta_dim = self.beta_dim();
         let target_beta = self.flatten_beta();
         let rho_local = Array1::<f64>::zeros(0);
-        sys.exact_beta_remainders.push(
-            gam_solve::arrow_schur::ExactBetaRemainder::from_analytic_penalty(
-                beta_dim,
-                0,
-                AnalyticPenaltyKind::DecoderIncoherence(Arc::new(per_fit.clone())),
-                target_beta.clone(),
-                rho_local.clone(),
-                penalty_scale,
-            ),
-        );
         let grad = per_fit.grad_target(target_beta.view(), rho_local.view());
         for j in 0..beta_dim {
             sys.gb[j] += penalty_scale * grad[j];
@@ -596,12 +665,7 @@ impl SaeManifoldTerm {
         let norm_sq: Vec<f64> = self
             .atoms
             .iter()
-            .map(|atom| {
-                atom.decoder_coefficients()
-                    .iter()
-                    .map(|v| v * v)
-                    .sum::<f64>()
-            })
+            .map(|atom| atom.decoder_coefficients().iter().map(|v| v * v).sum::<f64>())
             .collect();
         let floor2 = Self::barrier_norm_floor_sq(&norm_sq);
         self.amplitude_barrier_gate = (floor2 > 0.0).then_some(floor2);
@@ -646,66 +710,6 @@ impl SaeManifoldTerm {
                 continue;
             };
             let off = offsets[atom_idx];
-            let captured_beta: Vec<f64> = b.iter().copied().collect();
-            let theta_beta = captured_beta.clone();
-            let inverse_u = 1.0 / u;
-            let inverse_shifted = 1.0 / (u + floor2);
-            let inverse_difference = (floor2 / (u + floor2)) * inverse_u;
-            let phi_second = mu * inverse_difference * (inverse_u + inverse_shifted);
-            let phi_third = -2.0
-                * mu
-                * inverse_difference
-                * (inverse_u * inverse_u
-                    + inverse_u * inverse_shifted
-                    + inverse_shifted * inverse_shifted);
-            let mut fingerprint = gam_runtime::warm_start::Fingerprinter::new();
-            fingerprint.write_str("sae-amplitude-exact-remainder-v1");
-            fingerprint.write_usize(off);
-            fingerprint.write_f64(penalty_scale);
-            fingerprint.write_f64(g_coef);
-            fingerprint.write_f64(prr);
-            for &value in &captured_beta {
-                fingerprint.write_f64(value);
-            }
-            sys.exact_beta_remainders.push(
-                gam_solve::arrow_schur::ExactBetaRemainder::new(
-                    sys.k,
-                    fingerprint.finish_u64(),
-                    move |direction, out| {
-                        let radial = captured_beta
-                            .iter()
-                            .enumerate()
-                            .map(|(i, &value)| value * direction[off + i])
-                            .sum::<f64>()
-                            / u;
-                        let coefficient = penalty_scale * (g_coef - prr);
-                        for (i, &value) in captured_beta.iter().enumerate() {
-                            out[off + i] += coefficient * (direction[off + i] - value * radial);
-                        }
-                    },
-                )
-                .with_theta_bilinear(move |exact, left, right, out| {
-                    let mut dot_lr = 0.0;
-                    let mut dot_xl = 0.0;
-                    let mut dot_xr = 0.0;
-                    for (i, &x) in theta_beta.iter().enumerate() {
-                        dot_lr += left[off + i] * right[off + i];
-                        dot_xl += x * left[off + i];
-                        dot_xr += x * right[off + i];
-                    }
-                    for (i, &x) in theta_beta.iter().enumerate() {
-                        let derivative = if exact {
-                            4.0 * phi_second
-                                * (x * dot_lr + left[off + i] * dot_xr + right[off + i] * dot_xl)
-                                + 8.0 * phi_third * x * dot_xl * dot_xr
-                        } else {
-                            2.0 * (6.0 * phi_second + 4.0 * u * phi_third) * x * dot_lr
-                        };
-                        out[off + i] += penalty_scale * derivative;
-                    }
-                    Ok(())
-                }),
-            );
             // Gradient ∂P/∂B = g_coef·B — radial and, since `g_coef < 0`, strictly
             // OUTWARD (the penalized objective decreases as the norm grows).
             let gscale = penalty_scale * g_coef;
@@ -1244,17 +1248,82 @@ impl SaeManifoldTerm {
     /// `m(λ) → ε·e^{(λ+ε)/ε} > 0` below the pole, so the barrier keeps growing
     /// monotonically with frustration — with the bounded restoring force the
     /// interior-point design wants — instead of silently reading `|λ|`.
-    /// Return `(log(m), d log(m), d² log(m))` from the same scalar branches.
-    /// Computing log(m) directly prevents underflow below the spectral floor.
-    fn barrier_spectral_log_derivatives(lam: f64, eps: f64) -> (f64, f64, f64) {
-        spectral::log_derivatives(lam, eps)
+    pub(crate) fn barrier_spectral_m(lam: f64, eps: f64) -> f64 {
+        let x = (lam + eps) / eps;
+        if x >= 30.0 {
+            lam + eps
+        } else if x <= -30.0 {
+            eps * x.exp()
+        } else {
+            eps * x.exp().ln_1p()
+        }
+    }
+
+    /// `m′(λ) = σ((λ + ε)/ε)` — the exact derivative of
+    /// [`Self::barrier_spectral_m`], shared by the gradient seam so
+    /// `Σ (m′(λᵢ)/m(λᵢ))·vᵢvᵢᵀ` is the EXACT spectral derivative of the value
+    /// `−½·Σ ln m(λᵢ)` (no value/gradient desync anywhere on the spectrum).
+    pub(crate) fn barrier_spectral_m_prime(lam: f64, eps: f64) -> f64 {
+        let x = (lam + eps) / eps;
+        if x >= 30.0 {
+            1.0
+        } else if x <= -30.0 {
+            x.exp()
+        } else {
+            1.0 / (1.0 + (-x).exp())
+        }
+    }
+
+    /// `m″(λ) = σ′((λ + ε)/ε)/ε = σ(1−σ)/ε` — the second derivative of
+    /// [`Self::barrier_spectral_m`]. #2828: needed only by the EXACT overlap-space
+    /// Hessian, where the spectral function's own curvature enters through the
+    /// Daleckii–Krein divided difference of `f′ = m′/m`. `m` is affine
+    /// (`λ + ε`) wherever the floor is inactive, and there `m″ = 0` and the
+    /// divided difference collapses to the Gauss–Newton form the assembly ships.
+    pub(crate) fn barrier_spectral_m_second(lam: f64, eps: f64) -> f64 {
+        let x = (lam + eps) / eps;
+        if x >= 30.0 || x <= -30.0 {
+            // `σ(1−σ)` underflows to 0 at both tails; returning the exact 0 keeps
+            // the affine and the exponential branches of `m` consistent with
+            // their own derivatives.
+            return 0.0;
+        }
+        let sigma = 1.0 / (1.0 + (-x).exp());
+        sigma * (1.0 - sigma) / eps
+    }
+
+    /// #2828 — `f′^{[1]}(a, b)`, the first divided difference of
+    /// `f′ = m′/m` for `f = ln ∘ m`. The diagonal `a = b` is `f″`, and the
+    /// off-diagonal is taken by the difference quotient except where the two
+    /// eigenvalues are close enough that the quotient loses more to cancellation
+    /// than the derivative loses to curvature — there the midpoint `f″` is the
+    /// better-conditioned representative of the same quantity.
+    pub(crate) fn barrier_spectral_f_prime_divided(a: f64, b: f64, eps: f64) -> f64 {
+        let f_second = |lam: f64| {
+            let m = Self::barrier_spectral_m(lam, eps);
+            let m1 = Self::barrier_spectral_m_prime(lam, eps);
+            let m2 = Self::barrier_spectral_m_second(lam, eps);
+            (m2 * m - m1 * m1) / (m * m)
+        };
+        let gap = a - b;
+        // `f′` is `O(1/ε)`-Lipschitz here, so a gap below `√ε_machine · scale`
+        // loses at least half its significant digits to the subtraction while the
+        // midpoint second derivative is accurate to `O(gap²)`.
+        let scale = a.abs().max(b.abs()).max(eps).max(1.0);
+        if gap.abs() <= scale * f64::EPSILON.sqrt() {
+            return f_second(0.5 * (a + b));
+        }
+        let f_prime = |lam: f64| {
+            Self::barrier_spectral_m_prime(lam, eps) / Self::barrier_spectral_m(lam, eps)
+        };
+        (f_prime(a) - f_prime(b)) / gap
     }
 
     /// SEPARATION barrier value — the SAE decoder Jeffreys prior
     /// `P_sep = −½ · Σ_components Σ_i [ln m(λ_i(F_C)) − ln m(1)]`, `F = Q ∘ O`
     /// restricted to surviving co-firing edges, `λ_i` its REAL (signed)
     /// eigenvalues, and `m` the smooth spectral floor
-    /// [`Self::barrier_spectral_log_derivatives`] (`m(λ) = λ + ε_C` on the healthy PSD
+    /// [`Self::barrier_spectral_m`] (`m(λ) = λ + ε_C` on the healthy PSD
     /// spectrum, strictly positive on the frustrated indefinite one).
     /// Exactly `0` on a
     /// mutually-orthogonal co-active set (`F = I`) and `0` for `K < 2` or a fully
@@ -1270,12 +1339,7 @@ impl SaeManifoldTerm {
         let norm_sq: Vec<f64> = self
             .atoms
             .iter()
-            .map(|atom| {
-                atom.decoder_coefficients()
-                    .iter()
-                    .map(|v| v * v)
-                    .sum::<f64>()
-            })
+            .map(|atom| atom.decoder_coefficients().iter().map(|v| v * v).sum::<f64>())
             .collect();
         let floor2 = Self::barrier_norm_floor_sq(&norm_sq);
         let mut acc = 0.0_f64;
@@ -1313,10 +1377,10 @@ impl SaeManifoldTerm {
             // value/gradient mismatch, no Armijo conservatism at the pole. The
             // per-eigenvalue −ln m(1) reference keeps a mutually-orthogonal
             // co-active set (F = I) at exactly 0.
-            let ref_ln_m = Self::barrier_spectral_log_derivatives(1.0, eps).0;
+            let ref_ln_m = Self::barrier_spectral_m(1.0, eps).ln();
             let mut logdet = 0.0_f64;
             for &lam in lams.iter() {
-                logdet += Self::barrier_spectral_log_derivatives(lam, eps).0 - ref_ln_m;
+                logdet += Self::barrier_spectral_m(lam, eps).ln() - ref_ln_m;
             }
             acc += -0.5 * logdet;
         }
@@ -1434,7 +1498,7 @@ impl SaeManifoldTerm {
     ///   `M[a,b] = ∂²P/∂o_a∂o_b = q_a q_b (G[jₐ,m_b]G[kₐ,l_b] + G[jₐ,l_b]G[kₐ,m_b])`
     /// (`a = (jₐ,kₐ)`, `b = (l_b,m_b)`), and the β-Hessian's PSD part is
     /// `Σ_{a,b} M[a,b] v_a v_bᵀ`. That is handed out in exactly that FACTORED
-    /// form — the small dense Gram metric `M` beside the per-edge carriers `v_a`
+    /// form — the small dense `|M|` beside the per-edge carriers `v_a`
     /// ([`SeparationBarrierCurvature`]) — and never expanded into the eigen
     /// carriers `w_r = Σ_a e_r[a] v_a`: each `w_r` is dense over the WHOLE
     /// component while each `v_a` touches two atoms, so the expansion costs
@@ -1453,45 +1517,34 @@ impl SaeManifoldTerm {
     /// Value (`−½·Σ ln(λ+ε_C)`), gradient (`G`), and curvature (GN plus the
     /// `|α|` ridge) all read `ε_C` from the same [`BarrierComponent`], so the
     /// three seams cannot desync.
-    pub(crate) fn add_sae_separation_barrier(
+    /// #2828 — build the separation barrier's per-component PLAN once: the edge
+    /// forces `α_e`, their `∂o_e/∂B` carriers, the per-atom Levenberg ridges, and
+    /// BOTH the exact overlap-space Hessian `penalty_scale·M` and the shipped PSD
+    /// majorizer `penalty_scale·|M|`.
+    ///
+    /// [`Self::add_sae_separation_barrier`] consumes the plan to write the
+    /// gradient and the majorizer into the system;
+    /// [`Self::separation_barrier_beta_hvp_pair_prepared`] consumes the SAME
+    /// plan to apply the exact-minus-majorizer remainder that `A = B + ΔC`
+    /// needs. Sharing one producer is what keeps the two from drifting: the
+    /// remainder is defined against the object that was actually installed, not
+    /// against a re-derivation of it.
+    pub(crate) fn separation_barrier_plan(
         &self,
-        sys: &mut ArrowSchurSystem,
         penalty_scale: f64,
-        dense_beta_curvature: bool,
-        atom_curv: &mut [f64],
-        sep_curvature: &mut Vec<SeparationBarrierCurvature>,
-    ) -> bool {
-        if penalty_scale == 0.0 {
-            return false;
-        }
-        let k_atoms = self.k_atoms();
-        if k_atoms < 2 {
-            return false;
+        exact_coupling: bool,
+    ) -> Vec<SeparationBarrierComponentPlan> {
+        let mut plans: Vec<SeparationBarrierComponentPlan> = Vec::new();
+        if penalty_scale == 0.0 || self.k_atoms() < 2 {
+            return plans;
         }
         let p = self.output_dim();
-        let offsets = self.beta_offsets();
         let norm_sq: Vec<f64> = self
             .atoms
             .iter()
-            .map(|atom| {
-                atom.decoder_coefficients()
-                    .iter()
-                    .map(|v| v * v)
-                    .sum::<f64>()
-            })
+            .map(|atom| atom.decoder_coefficients().iter().map(|v| v * v).sum::<f64>())
             .collect();
         let floor2 = Self::barrier_norm_floor_sq(&norm_sq);
-        let mut wrote = false;
-        // #2731 — this seam was 86% of the curved tier's wall clock and nothing
-        // in the tree said so; it took an external `perf` run on a cluster to
-        // find out. The shape that governs the cost (`ne`, the number of
-        // REALIZED co-firing pairs — NOT `K(K−1)/2`, and not the decoder
-        // dimension) is now printed by the seam itself, so the next reader can
-        // reproduce the attribution from one `--log=debug` run.
-        let started = std::time::Instant::now();
-        let mut telemetry_components = 0_usize;
-        let mut telemetry_edges = 0_usize;
-        let mut telemetry_carrier_values = 0_usize;
         for comp in &self.barrier_components(&norm_sq, floor2) {
             let s = comp.atoms.len();
             let ne = comp.edges.len();
@@ -1527,26 +1580,23 @@ impl SaeManifoldTerm {
             // is exact at the pole too.
             let mut g = Array2::<f64>::zeros((s, s));
             for (i, &lam) in lams.iter().enumerate() {
-                let inv = Self::barrier_spectral_log_derivatives(lam, eps).1;
+                let inv =
+                    Self::barrier_spectral_m_prime(lam, eps) / Self::barrier_spectral_m(lam, eps);
                 for a in 0..s {
                     let va = vecs[[a, i]];
                     if va == 0.0 {
                         continue;
                     }
-                    for b in 0..=a {
-                        let contribution = inv * va * vecs[[b, i]];
-                        g[[a, b]] += contribution;
-                        if a != b {
-                            g[[b, a]] += contribution;
-                        }
+                    for b in 0..s {
+                        g[[a, b]] += inv * va * vecs[[b, i]];
                     }
                 }
             }
-            // Per-edge ∂o/∂B carrier `v_e` and force scalar `α_e`; scatter the
-            // gradient and the bounded Levenberg majorizer as we go. A carrier
-            // is stored as the ATOM BLOCKS it occupies — an edge touches exactly
-            // two atoms, so `v_e` is two dense `M_t·p` runs, never a scatter over
-            // the whole β vector.
+            // Per-edge ∂o/∂B carrier `v_e` and force scalar `α_e`. A carrier is
+            // stored as the ATOM BLOCKS it occupies — an edge touches exactly two
+            // atoms, so `v_e` is two dense `M_t·p` runs, never a scatter over the
+            // whole β vector.
+            let mut edges: Vec<SeparationBarrierEdgePlan> = Vec::with_capacity(ne);
             let mut edge_v: Vec<Vec<(usize, Vec<f64>)>> = Vec::with_capacity(ne);
             for e in &comp.edges {
                 let bj = self.atoms[e.j].decoder_coefficients();
@@ -1555,6 +1605,7 @@ impl SaeManifoldTerm {
                 let m_k = bk.nrows();
                 if pj != p || bk.ncols() != p {
                     edge_v.push(Vec::new());
+                    edges.push(SeparationBarrierEdgePlan::degenerate(e.j, e.k));
                     continue;
                 }
                 let cross = bj.dot(&bk.t());
@@ -1564,6 +1615,7 @@ impl SaeManifoldTerm {
                 let d_k = s_k.iter().map(|v| v * v).sum::<f64>().sqrt();
                 if !(d_j > 0.0 && d_k > 0.0) {
                     edge_v.push(Vec::new());
+                    edges.push(SeparationBarrierEdgePlan::degenerate(e.j, e.k));
                     continue;
                 }
                 let inv_dd = 1.0 / (d_j * d_k);
@@ -1573,8 +1625,6 @@ impl SaeManifoldTerm {
                 // `α_e = penalty_scale·(∂P/∂o_e) =
                 // penalty_scale·(−G[jl,kl]·q_e)`.
                 let alpha = penalty_scale * (-g[[e.jl, e.kl]] * e.q);
-                let off_j = offsets[e.j];
-                let off_k = offsets[e.k];
                 let mb_mat = cross.dot(bk);
                 let sjb_mat = s_j.dot(bj);
                 let mtb_mat = cross.t().dot(bj);
@@ -1582,76 +1632,273 @@ impl SaeManifoldTerm {
                 let mut run_j: Vec<f64> = Vec::with_capacity(m_j * p);
                 for a in 0..m_j {
                     for o in 0..p {
-                        let do_j = 2.0 * (mb_mat[[a, o]] * inv_dd - sh_j * sjb_mat[[a, o]]);
-                        sys.gb[off_j + a * p + o] += alpha * do_j;
-                        run_j.push(do_j);
+                        run_j.push(2.0 * (mb_mat[[a, o]] * inv_dd - sh_j * sjb_mat[[a, o]]));
                     }
                 }
                 let mut run_k: Vec<f64> = Vec::with_capacity(m_k * p);
                 for b in 0..m_k {
                     for o in 0..p {
-                        let do_k = 2.0 * (mtb_mat[[b, o]] * inv_dd - sh_k * skb_mat[[b, o]]);
-                        sys.gb[off_k + b * p + o] += alpha * do_k;
-                        run_k.push(do_k);
+                        run_k.push(2.0 * (mtb_mat[[b, o]] * inv_dd - sh_k * skb_mat[[b, o]]));
                     }
                 }
                 // Ascending in the atom index, which is ascending in the global
                 // β offset: the consumers walk the runs in order.
                 let v: Vec<(usize, Vec<f64>)> = if e.j <= e.k {
-                    vec![(e.j, run_j), (e.k, run_k)]
+                    vec![(e.j, run_j.clone()), (e.k, run_k.clone())]
                 } else {
-                    vec![(e.k, run_k), (e.j, run_j)]
+                    vec![(e.k, run_k.clone()), (e.j, run_j.clone())]
                 };
-                if alpha != 0.0 {
-                    wrote = true;
-                }
                 // Bounded Levenberg majorizer for the indefinite `α_e·∂²o_e/∂B²`
                 // part. `|α_e|` keeps it PSD regardless of the sign of `G[jl,kl]`
-                // (a frustrated component can carry either sign). On the dense path
-                // scatter `lev·I` onto the atom block's `hbb` diagonal; on the
-                // matrix-free/framed path hand the per-atom scalar back (folded into
-                // `smooth_scaled_s`, the single source for the CPU op and device
-                // smooth blocks).
-                let lev_j = 2.0 * alpha.abs() * o_overlap / d_j;
-                let lev_k = 2.0 * alpha.abs() * o_overlap / d_k;
-                if dense_beta_curvature {
-                    if lev_j > 0.0 {
-                        for idx in 0..(m_j * p) {
-                            let gi = off_j + idx;
-                            sys.hbb[[gi, gi]] += lev_j;
-                        }
-                    }
-                    if lev_k > 0.0 {
-                        for idx in 0..(m_k * p) {
-                            let gi = off_k + idx;
-                            sys.hbb[[gi, gi]] += lev_k;
-                        }
-                    }
-                } else {
-                    if lev_j > 0.0 {
-                        atom_curv[e.j] += lev_j;
-                    }
-                    if lev_k > 0.0 {
-                        atom_curv[e.k] += lev_k;
-                    }
-                }
+                // (a frustrated component can carry either sign).
+                edges.push(SeparationBarrierEdgePlan {
+                    j: e.j,
+                    k: e.k,
+                    alpha,
+                    o: o_overlap,
+                    d_j,
+                    d_k,
+                    run_j,
+                    run_k,
+                    lev_j: 2.0 * alpha.abs() * o_overlap / d_j,
+                    lev_k: 2.0 * alpha.abs() * o_overlap / d_k,
+                });
                 edge_v.push(v);
             }
-            // The installed overlap-space metric is the Gram matrix
-            // M_ab = 1/2 tr(G F_a G F_b), F_a = q_a(e_j e_k' + e_k e_j').
-            // G = h(F) is positive definite because h=m'/m is positive even on
-            // negative eigenvalues of F. Thus M is positive semidefinite:
-            // its Gram vectors are G^(1/2) F_a G^(1/2)/sqrt(2).
-            // This is the Newton metric, not the exact spectral Hessian;
-            // the latter uses the divided difference of h and is retained by
-            // the signed remainder owner below.
-            let coupling = exact_beta::separation_overlap_metric(&comp.edges, &g, penalty_scale);
-            if coupling.iter().all(|&v| v == 0.0) {
-                continue;
+            // Exact PSD Gauss–Newton curvature: the overlap-space Hessian `M`
+            // (`F` linear in `o` ⇒ no `∂²F/∂o²` term).
+            let mut mm = Array2::<f64>::zeros((ne, ne));
+            for a in 0..ne {
+                let ea = &comp.edges[a];
+                for b in 0..ne {
+                    let eb = &comp.edges[b];
+                    mm[[a, b]] = ea.q
+                        * eb.q
+                        * (g[[ea.jl, eb.kl]] * g[[ea.kl, eb.jl]]
+                            + g[[ea.jl, eb.jl]] * g[[ea.kl, eb.kl]]);
+                }
             }
-            if edge_v.iter().all(|runs| runs.is_empty()) {
-                continue;
+            // #2828 — the EXACT overlap-space Hessian. `mm` above is the
+            // Gauss–Newton form `q_a q_b (G G + G G)`, which is `∂²P/∂o_a∂o_b`
+            // only when `f = ln ∘ m` is `ln(λ + ε)`, i.e. only where the smooth
+            // spectral floor is INACTIVE. `P = −½ tr f(F)` with `F` linear in
+            // `o`, so the true second derivative is the Daleckii–Krein form
+            //
+            //     ∂²P/∂o_a∂o_b = −½ Σ_{i,j} f′^{[1]}(λ_i, λ_j)·E^a_{ij}·E^b_{ij},
+            //     E^a_{ij} = q_a·(V[j_a,i]·V[k_a,j] + V[k_a,i]·V[j_a,j]),
+            //
+            // which reduces to `mm` exactly when `f′^{[1]}(a,b) =
+            // −1/((a+ε)(b+ε))` — the affine branch of `m`. Only the exact-`A`
+            // consumer pays for it; the assembly ships the majorizer and asks for
+            // `exact_coupling = false`.
+            let coupling_exact = exact_coupling.then(|| {
+                let mut carriers = vec![Array2::<f64>::zeros((s, s)); ne];
+                for (index, e) in comp.edges.iter().enumerate() {
+                    for i in 0..s {
+                        for j in 0..s {
+                            carriers[index][[i, j]] = e.q
+                                * (vecs[[e.jl, i]] * vecs[[e.kl, j]]
+                                    + vecs[[e.kl, i]] * vecs[[e.jl, j]]);
+                        }
+                    }
+                }
+                let mut divided = Array2::<f64>::zeros((s, s));
+                for i in 0..s {
+                    for j in 0..s {
+                        divided[[i, j]] =
+                            Self::barrier_spectral_f_prime_divided(lams[i], lams[j], eps);
+                    }
+                }
+                let mut exact = Array2::<f64>::zeros((ne, ne));
+                for a in 0..ne {
+                    for b in a..ne {
+                        let mut acc = 0.0_f64;
+                        for i in 0..s {
+                            for j in 0..s {
+                                acc += divided[[i, j]] * carriers[a][[i, j]] * carriers[b][[i, j]];
+                            }
+                        }
+                        let value = -0.5 * penalty_scale * acc;
+                        exact[[a, b]] = value;
+                        exact[[b, a]] = value;
+                    }
+                }
+                exact
+            });
+            // `M` is symmetric but need not be PSD: `M` is the edge-restriction
+            // of the symmetric Kronecker square of `G`, and a FRUSTRATED
+            // component's `G` carries negative eigenvalues (see
+            // `barrier_spectral_m`), whose products then come back negative. The
+            // shipped majorizer is the matrix ABSOLUTE VALUE `|M| = Σ_r|λ_r|e_re_rᵀ`
+            // — which is what the previous `svd`-based expansion computed, since
+            // the singular values of a symmetric matrix are `|λ_r|`. Stating it as
+            // `eigh` + `abs` makes the majorization a declared choice rather than
+            // a side effect of the factorization used, and `|M| ⪰ M` keeps the
+            // metric PSD and dominating on both spectra.
+            let coupling_majorizer = match mm.eigh(faer::Side::Lower) {
+                Ok((lams_m, vecs_m)) => {
+                    let mut abs_m = Array2::<f64>::zeros((ne, ne));
+                    for (r_i, &lam) in lams_m.iter().enumerate() {
+                        let weight = penalty_scale * lam.abs();
+                        if !(weight > 0.0) {
+                            continue;
+                        }
+                        for a in 0..ne {
+                            let va = vecs_m[[a, r_i]];
+                            if va == 0.0 {
+                                continue;
+                            }
+                            let scaled = weight * va;
+                            for b in 0..ne {
+                                abs_m[[a, b]] += scaled * vecs_m[[b, r_i]];
+                            }
+                        }
+                    }
+                    // The assembly installs NO curvature for a component whose
+                    // majorizer is identically zero or whose carriers are all
+                    // degenerate; `None` records exactly that, so the ΔC
+                    // consumer subtracts nothing that was never added.
+                    (!abs_m.iter().all(|&v| v == 0.0)
+                        && !edge_v.iter().all(|runs| runs.is_empty()))
+                    .then_some(abs_m)
+                }
+                Err(_) => None,
+            };
+            let mut atoms: Vec<usize> = comp.atoms.clone();
+            atoms.sort_unstable();
+            plans.push(SeparationBarrierComponentPlan {
+                atoms,
+                edges,
+                carriers: edge_v,
+                coupling_exact,
+                coupling_majorizer,
+            });
+        }
+        plans
+    }
+
+    /// Accumulate the SEPARATION barrier's analytic gradient into `sys.gb` and a
+    /// PSD majorizer of its curvature into `sys.hbb` (dense path) or the
+    /// `atom_curv` / `sep_curvature` carriers (matrix-free / framed path), in the
+    /// full-`B` β layout. Returns `true` iff anything was written.
+    ///
+    /// The barrier is the SAE decoder Jeffreys prior
+    /// `P = −½ Σ_comp log det(F + ε_C·I)`, `F = Q ∘ O` (see
+    /// [`BarrierComponent`] for the data-derived softening `ε_C`). Per component
+    /// (`G ≜ (F + ε_C·I)⁻¹`):
+    ///
+    /// GRADIENT. `∂P/∂o_e = −G[jₑ,kₑ]·q_e` (edge `e = (j,k)`, since
+    /// `F[j,k] = q_e·o_e` and `ε_C` is a frozen routing constant), and
+    /// `∂o_e/∂B` is the historical rank-aware carrier
+    /// `v_e`: with `M = B_jB_kᵀ`, `S_· = B_·B_·ᵀ`, `D_· = ‖S_·‖_F`,
+    /// `o_e = ‖M‖²_F/(D_jD_k)`,
+    ///   `∂o_e/∂B_j = 2[ (M B_k)/(D_jD_k) − (o_e/D_j²) S_j B_j ]`,
+    ///   `∂o_e/∂B_k = 2[ (Mᵀ B_j)/(D_jD_k) − (o_e/D_k²) S_k B_k ]`,
+    /// so `∂P/∂B = Σ_e α_e·v_e`, `α_e = penalty_scale·(−G[jₑ,kₑ]·q_e)`. For
+    /// the `K = 2` component `F = [[1,r],[r,1]]`, `r = q·o`, this is
+    /// `α = q²o/((1+ε)²−q²o²)·penalty_scale ≥ 0` — the same repulsive
+    /// `∂o/∂B` force as the historical pairwise barrier, with the Jeffreys
+    /// `½` fixing its strength and no smoothstep gate:
+    /// the force vanishes as `O(o)` for separated atoms (so it cannot drag a
+    /// healthy fit off the data optimum, the #1625 concern) and diverges as
+    /// `det F → 0`, an automatic soft gate.
+    ///
+    /// CURVATURE. `F` is LINEAR in the overlaps `o_e`, so the overlap-space Hessian
+    /// is exactly Gauss–Newton and PSD:
+    ///   `M[a,b] = ∂²P/∂o_a∂o_b = q_a q_b (G[jₐ,m_b]G[kₐ,l_b] + G[jₐ,l_b]G[kₐ,m_b])`
+    /// (`a = (jₐ,kₐ)`, `b = (l_b,m_b)`), and the β-Hessian's PSD part is
+    /// `Σ_{a,b} M[a,b] v_a v_bᵀ`. That is handed out in exactly that FACTORED
+    /// form — the small dense `|M|` beside the per-edge carriers `v_a`
+    /// ([`SeparationBarrierCurvature`]) — and never expanded into the eigen
+    /// carriers `w_r = Σ_a e_r[a] v_a`: each `w_r` is dense over the WHOLE
+    /// component while each `v_a` touches two atoms, so the expansion costs
+    /// `ne²·2Mp` to build and `ne·sMp` to store and apply for an operator that
+    /// is `ne²` + `ne·2Mp` in the form it is derived in (#2731). For a
+    /// single-edge component the factored form IS the historical
+    /// self-concordant rank-1 `∂²P/∂o²·v vᵀ`, with `ne = 1`. The remaining
+    /// indefinite `Σ_e (∂P/∂o_e)·∂²o_e/∂B²` part is handled by the per-atom
+    /// Levenberg ridge `2|α_e|·o_e/D_·`, which
+    /// dominates its NEGATIVE part: the
+    /// negative curvature of the cosine² overlap only appears past `o > ½` and
+    /// scales like `2(2o−1)⁺·|α_e|/D_· ≤ 2o·|α_e|/D_·` (at small `o` the overlap
+    /// sits at its minimum, so the dropped term is PSD and needs no domination —
+    /// the metric merely under-counts positive curvature there, which the line
+    /// search absorbs). The total metric GN + ridge is PSD by construction.
+    /// Value (`−½·Σ ln(λ+ε_C)`), gradient (`G`), and curvature (GN plus the
+    /// `|α|` ridge) all read `ε_C` from the same [`BarrierComponent`], so the
+    /// three seams cannot desync.
+    ///
+    /// #2828 — the two curvature approximations this installs (`|M|` for `M`,
+    /// and the `lev` ridge for `α_e·∂²o_e/∂B²`) are exactly what
+    /// [`Self::separation_barrier_beta_hvp_pair_prepared`] separates for the
+    /// exact stationarity Hessian `A`. Both read one
+    /// [`Self::separation_barrier_plan`].
+    pub(crate) fn add_sae_separation_barrier(
+        &self,
+        sys: &mut ArrowSchurSystem,
+        penalty_scale: f64,
+        dense_beta_curvature: bool,
+        atom_curv: &mut [f64],
+        sep_curvature: &mut Vec<SeparationBarrierCurvature>,
+    ) -> bool {
+        if penalty_scale == 0.0 {
+            return false;
+        }
+        if self.k_atoms() < 2 {
+            return false;
+        }
+        let offsets = self.beta_offsets();
+        let mut wrote = false;
+        // #2731 — this seam was 86% of the curved tier's wall clock and nothing
+        // in the tree said so; it took an external `perf` run on a cluster to
+        // find out. The shape that governs the cost (`ne`, the number of
+        // REALIZED co-firing pairs — NOT `K(K−1)/2`, and not the decoder
+        // dimension) is now printed by the seam itself, so the next reader can
+        // reproduce the attribution from one `--log=debug` run.
+        let started = std::time::Instant::now();
+        let mut telemetry_components = 0_usize;
+        let mut telemetry_edges = 0_usize;
+        let mut telemetry_carrier_values = 0_usize;
+        for plan in self.separation_barrier_plan(penalty_scale, false) {
+            for edge in &plan.edges {
+                if edge.run_j.is_empty() && edge.run_k.is_empty() {
+                    continue;
+                }
+                let off_j = offsets[edge.j];
+                let off_k = offsets[edge.k];
+                for (idx, &value) in edge.run_j.iter().enumerate() {
+                    sys.gb[off_j + idx] += edge.alpha * value;
+                }
+                for (idx, &value) in edge.run_k.iter().enumerate() {
+                    sys.gb[off_k + idx] += edge.alpha * value;
+                }
+                if edge.alpha != 0.0 {
+                    wrote = true;
+                }
+                // Dense: scatter `lev·I` onto the atom block's `hbb` diagonal;
+                // matrix-free/framed: hand the per-atom scalar back (folded into
+                // `smooth_scaled_s`, the single source for the CPU op and device
+                // smooth blocks).
+                for (atom, off, lev, width) in [
+                    (edge.j, off_j, edge.lev_j, edge.run_j.len()),
+                    (edge.k, off_k, edge.lev_k, edge.run_k.len()),
+                ] {
+                    if !(lev > 0.0) {
+                        continue;
+                    }
+                    if dense_beta_curvature {
+                        for idx in 0..width {
+                            let gi = off + idx;
+                            sys.hbb[[gi, gi]] += lev;
+                        }
+                    } else {
+                        atom_curv[atom] += lev;
+                    }
+                }
             }
+            let Some(coupling) = plan.coupling_majorizer else {
+                continue;
+            };
             // The curvature is `Σ_{a,b} coupling[a,b]·v_a v_bᵀ`. Expanding it
             // into `ne` eigen-carriers `w_r = Σ_a e_r[a] v_a` — the historical
             // form — costs `ne² · 2Mp` to BUILD and stores `ne` vectors dense
@@ -1663,27 +1910,16 @@ impl SaeManifoldTerm {
             // same operator, built in `ne²` scalar work and applied in
             // `2·ne·2Mp + ne²`.
             telemetry_components += 1;
-            telemetry_edges += ne;
-            telemetry_carrier_values += edge_v
+            telemetry_edges += plan.carriers.len();
+            telemetry_carrier_values += plan
+                .carriers
                 .iter()
                 .map(|runs| runs.iter().map(|(_, values)| values.len()).sum::<usize>())
                 .sum::<usize>();
-            sys.exact_beta_remainders
-                .push(exact_beta::separation_remainder(
-                    self,
-                    comp,
-                    &lams,
-                    &vecs,
-                    &g,
-                    &coupling,
-                    &edge_v,
-                    penalty_scale,
-                ));
-            // A nonzero overlap-space metric induces the zero beta operator
-            // when every carrier is zero (for example, orthogonal decoders).
-            // Keep the exact remainder above, but do not install a zero
-            // majorizer that would spuriously disable framed device assembly.
-            if edge_v
+            // Zero carriers induce the zero beta majorizer even when the
+            // overlap-space metric is nonzero. Omit that operator's storage so
+            // orthogonal decoders retain framed device admission.
+            if plan.carriers
                 .iter()
                 .flat_map(|runs| runs.iter().flat_map(|(_, values)| values.iter()))
                 .all(|&value| value == 0.0)
@@ -1691,11 +1927,17 @@ impl SaeManifoldTerm {
                 continue;
             }
             if dense_beta_curvature {
-                self.scatter_barrier_curvature_dense(comp, &coupling, &edge_v, &offsets, sys);
+                self.scatter_barrier_curvature_dense(
+                    &plan.atoms,
+                    &coupling,
+                    &plan.carriers,
+                    &offsets,
+                    sys,
+                );
             } else {
                 sep_curvature.push(SeparationBarrierCurvature {
                     coupling,
-                    carriers: edge_v,
+                    carriers: plan.carriers,
                 });
             }
             wrote = true;
@@ -1711,6 +1953,472 @@ impl SaeManifoldTerm {
         wrote
     }
 
+    /// #1026/#2828 — the frozen-gate decoder repulsion's PSD (Gauss–Newton)
+    /// majorizer as a matrix-free `CoupledCarrierPenaltyOp` in the full-`B` β
+    /// layout, for the lanes that build no dense `sys.hbb`.
+    ///
+    /// `κ·JᵀJ` with `J = ∂vec(C_jk)/∂vec(B)` is a sum of `M_j·M_k` rank-one
+    /// terms, one per cross-Gram entry: `C[a,b] = Σ_o B_j[a,o]B_k[b,o]`, so
+    /// `∂C[a,b]/∂B` is supported on exactly row `a` of `B_j` (value `B_k[b,·]`)
+    /// and row `b` of `B_k` (value `B_j[a,·]`) — two `p`-long runs. That is the
+    /// carrier form verbatim, with the coupling `κ·I_{M_jM_k}`, so this is the
+    /// SAME operator [`DecoderIncoherencePenalty::psd_majorizer_hvp`] applies and
+    /// [`Self::accumulate_psd_majorizer_dense`] scatters, at `M_jM_k·2p` storage
+    /// and `2·M_jM_k·2p` per matvec instead of `(ΣM_kp)²`.
+    ///
+    /// WHY THIS EXISTS. `add_sae_decoder_repulsion` returns early on
+    /// `!dense_beta_curvature`, having applied only the GRADIENT, and marks
+    /// `deferred_factored`. That mark is consumed on the FRAMED lane (#1610,
+    /// `add_factored_repulsion_curvature`) and nowhere else, so on the un-framed
+    /// matrix-free lane — a streaming or fixed-decoder assembly — the repulsion's
+    /// curvature was silently dropped while its gradient was kept. Two
+    /// consequences, both real: the inner Newton step there solved against a
+    /// curvature its own gradient does not come from, and `B` was not
+    /// lane-invariant, so `A = B + ΔC` (#2828) had no single object to subtract.
+    pub(crate) fn decoder_repulsion_majorizer_carrier_op(
+        &self,
+        penalty_scale: f64,
+    ) -> Option<CoupledCarrierPenaltyOp> {
+        let per_fit = self.live_decoder_repulsion_penalty()?;
+        if penalty_scale == 0.0 {
+            return None;
+        }
+        let beta_dim = self.beta_dim();
+        let target_beta = self.flatten_beta();
+        let rho_local = Array1::<f64>::zeros(0);
+        // The carrier algebra lives beside the penalty's own `hvp` and dense
+        // scatter, so the three cannot drift; this seam only re-bases the runs
+        // onto the arrow system's β offsets, which are the penalty's own by
+        // construction (`add_sae_decoder_repulsion` scatters into `sys.hbb` with
+        // exactly those offsets).
+        let planned =
+            per_fit.psd_majorizer_carriers(target_beta.view(), rho_local.view(), penalty_scale);
+        if planned.is_empty() {
+            return None;
+        }
+        let ne = planned.len();
+        let mut coupling = Array2::<f64>::zeros((ne, ne));
+        let mut carriers: Vec<Vec<(usize, Vec<f64>)>> = Vec::with_capacity(ne);
+        for (index, (kappa, first, second)) in planned.into_iter().enumerate() {
+            coupling[[index, index]] = kappa;
+            // `CoupledCarrierPenaltyOp` walks the runs in order.
+            carriers.push(if first.0 <= second.0 {
+                vec![first, second]
+            } else {
+                vec![second, first]
+            });
+        }
+        Some(CoupledCarrierPenaltyOp {
+            k: beta_dim,
+            coupling,
+            carriers,
+        })
+    }
+
+    /// #2828 — the β-tier decoder priors' EXACT-minus-MAJORIZER curvature
+    /// `ΔC_ββ·v`, in the full-`B` β layout (index `beta_offsets[k] + a·p + o`).
+    ///
+    /// The exact stationarity Hessian is `A = B_raw + ΔC`. Every θ-block leg of
+    /// `ΔC` was already modelled (`apply_exact_hessian_minus_b`: residual
+    /// curvature, the softmax entropy remainder, the periodic-ARD clamp, the
+    /// ThresholdGate clamp, the ordered-Beta–Bernoulli remainder) but the β block
+    /// had NO leg at all, so `A_ββ` inherited the assembly's PSD majorizers
+    /// verbatim and `A` was not the second derivative of the objective whose
+    /// gradient the inner solve drives to zero (#2330 / #2828 item 1). Three
+    /// registry-independent decoder priors install a majorizer rather than their
+    /// exact curvature, and this is their remainder:
+    ///
+    /// * DECODER REPULSION (#1026/#1610/#2343). `B` installs the Gauss–Newton
+    ///   block `κ·JᵀJ` ([`DecoderIncoherencePenalty::psd_majorizer_hvp`]); the
+    ///   exact quotient Hessian is that penalty's own `hvp`. The remainder is the
+    ///   difference of the two closed forms, so it carries the degree-0
+    ///   normalizer's second derivative exactly.
+    /// * AMPLITUDE BARRIER (#2343). `B` installs the tight isotropic Levenberg
+    ///   ridge `prr·I`; the exact Hessian is `H_A = 2φ·I + 4φ′·b bᵀ` with
+    ///   `2φ = g_coef` and `prr = 2φ + 4uφ′`, so the remainder is
+    ///   `(prr − g_coef)·(b(bᵀv)/u − v)` — zero along the radius `b` (where the
+    ///   ridge IS exact) and `−(prr − g_coef)·v` on every tangential direction.
+    /// * SEPARATION BARRIER (#1522/#1610/#2731). See
+    ///   [`Self::separation_barrier_beta_hvp_pair_prepared`].
+    ///
+    /// The smoothness Gram `λ S ⊗ I`, the data-fit β Gram (β enters the
+    /// reconstruction linearly, so Gauss–Newton IS exact there), and the ARD
+    /// prior (a t-tier object) need no remainder.
+    /// #2828 — the β-tier remainder `exact − majorizer`, against a plan
+    /// prepared once for this decoder state. Every apply inside one
+    /// materialization or one Krylov solve shares it.
+    pub(crate) fn decoder_prior_exact_minus_majorizer_beta_hvp_prepared(
+        &self,
+        prepared: &PreparedDecoderPriorBetaCurvature,
+        v: ArrayView1<'_, f64>,
+    ) -> Result<Array1<f64>, String> {
+        let (exact, majorizer) = self.decoder_prior_beta_hvp_pair_prepared(prepared, v)?;
+        Ok(&exact - &majorizer)
+    }
+
+    /// #2828 — everything about the β-tier decoder priors' curvature that depends
+    /// on the DECODER STATE and not on the direction it is applied to: the frozen
+    /// repulsion penalty and its flattened target, the per-atom amplitude-barrier
+    /// scalars, and the separation barrier's per-component plan.
+    ///
+    /// This split is not an optimisation detail, it is what a matrix-free
+    /// operator is: `A·v` is applied once per Krylov step and once per column of
+    /// a materialization, while the plan behind it is a property of the state.
+    /// The separation plan alone walks the co-firing pairs, forms a cross-Gram
+    /// and two self-Grams per edge, and eigendecomposes each component's `F` —
+    /// the seam #2731 measured at 86% of the curved tier's wall clock when it ran
+    /// ONCE per assembly. Measured on a 10-atom, `p = 16`, `n = 60` fixture with
+    /// every pair near-collinear (45 engaged repulsion pairs, `beta_dim = 480`):
+    /// one `apply_exact_hessian_minus_b` is 15.19 ms and rebuilding this plan
+    /// inside it costs 2.79 ms of that, so hoisting it out is a third of the
+    /// apply at a shape where `ne` is still tiny.
+    ///
+    /// A prepared plan is valid for exactly the state it was built from. It
+    /// carries no proof of that — the callers hold `&self` across the applies
+    /// they share it with, which is the proof.
+    pub(crate) fn prepare_decoder_prior_beta_curvature(
+        &self,
+        penalty_scale: f64,
+    ) -> PreparedDecoderPriorBetaCurvature {
+        let beta_dim = self.beta_dim();
+        if penalty_scale == 0.0 {
+            return PreparedDecoderPriorBetaCurvature {
+                beta_dim,
+                penalty_scale,
+                repulsion: None,
+                amplitude: Vec::new(),
+                separation: Vec::new(),
+            };
+        }
+        let repulsion = self
+            .live_decoder_repulsion_penalty()
+            .map(|per_fit| (per_fit, self.flatten_beta()));
+        let mut amplitude = Vec::new();
+        if let Some(floor2) = self.amplitude_barrier_gate {
+            let mu = SAE_AMPLITUDE_BARRIER_STRENGTH;
+            let p = self.output_dim();
+            let offsets = self.beta_offsets();
+            for (atom_idx, atom) in self.atoms.iter().enumerate() {
+                let b = atom.decoder_coefficients();
+                let m = b.nrows();
+                if m == 0 || b.ncols() != p {
+                    continue;
+                }
+                let u = b.iter().map(|value| value * value).sum::<f64>();
+                let Some((_value, g_coef, prr)) = Self::amplitude_barrier_scalars(u, floor2, mu)
+                else {
+                    // The barrier abstains for this atom in value, gradient AND
+                    // curvature, so it gets no entry at all.
+                    continue;
+                };
+                amplitude.push(PreparedAmplitudeBarrierAtom {
+                    atom: atom_idx,
+                    offset: offsets[atom_idx],
+                    basis_size: m,
+                    energy: u,
+                    gradient_coefficient: g_coef,
+                    radial_curvature: prr,
+                });
+            }
+        }
+        PreparedDecoderPriorBetaCurvature {
+            beta_dim,
+            penalty_scale,
+            repulsion,
+            amplitude,
+            separation: self.separation_barrier_plan(penalty_scale, true),
+        }
+    }
+
+    /// #2828 — the β-tier decoder priors' curvature BOTH ways: the exact
+    /// `∂²P/∂B²·v`, and the operator the arrow assembly actually installs.
+    /// Full-`B` β layout (index `beta_offsets[k] + a·p + o`).
+    ///
+    /// Separating the two is what makes each side gateable on its own: `exact` is
+    /// asserted against a second difference of the priors' own values, and
+    /// `majorizer` against what the assembly writes; `A = B + ΔC` then needs only
+    /// their difference and cannot silently subtract something that was never
+    /// added.
+    ///
+    /// * DECODER REPULSION (#1026/#1610/#2343). `B` installs the Gauss–Newton
+    ///   block `κ·JᵀJ` ([`DecoderIncoherencePenalty::psd_majorizer_hvp`]); the
+    ///   exact quotient Hessian is that penalty's own `hvp`, which carries the
+    ///   degree-0 normalizer's second derivative.
+    /// * AMPLITUDE BARRIER (#2343). `B` installs the tight isotropic Levenberg
+    ///   ridge `prr·I`; the exact Hessian is `H_A = 2φ·I + 4φ′·b bᵀ` with
+    ///   `2φ = g_coef` and `prr = 2φ + 4uφ′`, so `H_A·v = g_coef·v +
+    ///   ((prr − g_coef)/u)·b(bᵀv)` — the ridge is exact along the radius `b`
+    ///   and over-claims by `prr − g_coef` on every tangential direction.
+    /// * SEPARATION BARRIER (#1522/#1610/#2731). See
+    ///   [`Self::separation_barrier_beta_hvp_pair_prepared`].
+    ///
+    /// The smoothness Gram `λ S ⊗ I`, the data-fit β Gram (β enters the
+    /// reconstruction linearly, so Gauss–Newton IS exact there), and the ARD
+    /// prior (a t-tier object) install no majorizer and appear in neither side.
+    #[cfg_attr(not(test), allow(dead_code))]
+
+    /// `Self::decoder_prior_beta_hvp_pair` against a plan prepared once for
+    /// this decoder state ([`Self::prepare_decoder_prior_beta_curvature`]).
+    pub(crate) fn decoder_prior_beta_hvp_pair_prepared(
+        &self,
+        prepared: &PreparedDecoderPriorBetaCurvature,
+        v: ArrayView1<'_, f64>,
+    ) -> Result<(Array1<f64>, Array1<f64>), String> {
+        let beta_dim = self.beta_dim();
+        if v.len() != beta_dim || prepared.beta_dim != beta_dim {
+            return Err(format!(
+                "decoder_prior_beta_hvp_pair: direction length {} and prepared width {} must \
+                 both be beta_dim {beta_dim}",
+                v.len(),
+                prepared.beta_dim,
+            ));
+        }
+        let penalty_scale = prepared.penalty_scale;
+        let mut exact = Array1::<f64>::zeros(beta_dim);
+        let mut majorizer = Array1::<f64>::zeros(beta_dim);
+        if penalty_scale == 0.0 {
+            return Ok((exact, majorizer));
+        }
+        // (a) decoder repulsion.
+        if let Some((per_fit, target_beta)) = prepared.repulsion.as_ref() {
+            use gam_terms::analytic_penalties::AnalyticPenalty;
+            let rho_local = Array1::<f64>::zeros(0);
+            let hv = per_fit.hvp(target_beta.view(), rho_local.view(), v);
+            let mv = per_fit.psd_majorizer_hvp(target_beta.view(), rho_local.view(), v);
+            for idx in 0..beta_dim {
+                exact[idx] += penalty_scale * hv[idx];
+                majorizer[idx] += penalty_scale * mv[idx];
+            }
+        }
+        // (b) amplitude barrier.
+        let p = self.output_dim();
+        for entry in &prepared.amplitude {
+            let b = self.atoms[entry.atom].decoder_coefficients();
+            let m = entry.basis_size;
+            let off = entry.offset;
+            let mut radial = 0.0_f64;
+            for a in 0..m {
+                for o in 0..p {
+                    radial += b[[a, o]] * v[off + a * p + o];
+                }
+            }
+            let tangential =
+                penalty_scale * (entry.radial_curvature - entry.gradient_coefficient)
+                    / entry.energy;
+            let ridge = penalty_scale * entry.radial_curvature;
+            for a in 0..m {
+                for o in 0..p {
+                    let idx = off + a * p + o;
+                    exact[idx] += penalty_scale * entry.gradient_coefficient * v[idx]
+                        + tangential * b[[a, o]] * radial;
+                    // `add_sae_amplitude_barrier` writes the ridge only when it
+                    // is strictly positive; mirror that exactly.
+                    if ridge > 0.0 {
+                        majorizer[idx] += ridge * v[idx];
+                    }
+                }
+            }
+        }
+        // (c) separation barrier.
+        let (sep_exact, sep_majorizer) =
+            self.separation_barrier_beta_hvp_pair_prepared(&prepared.separation, v);
+        for idx in 0..beta_dim {
+            exact[idx] += sep_exact[idx];
+            majorizer[idx] += sep_majorizer[idx];
+        }
+        Ok((exact, majorizer))
+    }
+
+    /// #2828 — the SEPARATION barrier's β curvature, BOTH ways: the exact
+    /// `∂²P_sep/∂B²·v` and the operator [`Self::add_sae_separation_barrier`]
+    /// actually installs, accumulated into `(exact, majorizer)` in the full-`B`
+    /// layout. Their difference is the `ΔC` leg; each on its own is a gateable
+    /// object, and `exact` is gated directly against a second difference of
+    /// [`Self::separation_barrier_value`].
+    ///
+    /// `∂P_sep/∂B = Σ_e α_e·v_e` with `v_e = ∂o_e/∂B`, so
+    ///
+    /// ```text
+    ///   exact     = Σ_{a,b} M[a,b]·v_a v_bᵀ        +  Σ_e α_e·∂²o_e/∂B²
+    ///   installed = Σ_{a,b} |M|[a,b]·v_a v_bᵀ      +  Σ_e lev_e·I
+    /// ```
+    ///
+    /// and the two approximations are exactly the two the barrier's own doc
+    /// declares. `M` here is the DALECKII–KREIN overlap-space Hessian (see
+    /// [`Self::separation_barrier_plan`]), not the Gauss–Newton form the
+    /// majorizer is built from: `P = −½ tr f(F)` with `f = ln ∘ m`, and the two
+    /// agree only where the smooth spectral floor is inactive.
+    ///
+    /// `∂²o_e/∂B²·V` is the derivative of the carrier `∂o_e/∂B` along `V`,
+    /// written in the same `(C, S, D)` symbols the carrier is derived in:
+    ///
+    /// ```text
+    ///   Ċ = V_jB_kᵀ + B_jV_kᵀ,  Ṡ_j = V_jB_jᵀ + B_jV_jᵀ,
+    ///   Ḋ_j = 2⟨S_jB_j, V_j⟩/D_j,   r = Ḋ_j/D_j + Ḋ_k/D_k,
+    ///   ȯ  = 2⟨C, Ċ⟩/(D_jD_k) − o·r,
+    ///   (∂²o/∂B²·V)_j = 2[ (ĊB_k + CV_k)/(D_jD_k) − (CB_k/(D_jD_k))·r
+    ///                      − (ȯ/D_j² − 2oḊ_j/D_j³)·S_jB_j
+    ///                      − (o/D_j²)·(Ṡ_jB_j + S_jV_j) ]
+    /// ```
+    ///
+    /// and the `k` leg by `j ↔ k`, `C → Cᵀ`. This is the term the barrier's own
+    /// doc calls "the remaining indefinite `Σ_e (∂P/∂o_e)·∂²o_e/∂B²` part": PSD
+    /// below `o = ½` and genuinely negative above it, which is precisely why the
+    /// inner solve must not see it and the exact `A` must.
+    /// #2828 — the SEPARATION barrier's β curvature BOTH ways, against plans built once for
+    /// this decoder state.
+    pub(crate) fn separation_barrier_beta_hvp_pair_prepared(
+        &self,
+        plans: &[SeparationBarrierComponentPlan],
+        v: ArrayView1<'_, f64>,
+    ) -> (Array1<f64>, Array1<f64>) {
+        let p = self.output_dim();
+        let offsets = self.beta_offsets();
+        let beta_dim = self.beta_dim();
+        let mut exact = Array1::<f64>::zeros(beta_dim);
+        let mut majorizer = Array1::<f64>::zeros(beta_dim);
+        for plan in plans {
+            // (1) the overlap-space couplings, contracted through the carriers.
+            let ne = plan.carriers.len();
+            if ne > 0 {
+                let dots: Vec<f64> = plan
+                    .carriers
+                    .iter()
+                    .map(|runs| {
+                        runs.iter()
+                            .map(|(atom, values)| {
+                                let base = offsets[*atom];
+                                values
+                                    .iter()
+                                    .enumerate()
+                                    .map(|(idx, value)| value * v[base + idx])
+                                    .sum::<f64>()
+                            })
+                            .sum::<f64>()
+                    })
+                    .collect();
+                for a in 0..ne {
+                    let mut exact_weight = 0.0_f64;
+                    let mut majorized_weight = 0.0_f64;
+                    for b in 0..ne {
+                        exact_weight += plan
+                            .coupling_exact
+                            .as_ref()
+                            .map_or(0.0, |coupling| coupling[[a, b]])
+                            * dots[b];
+                        majorized_weight += plan
+                            .coupling_majorizer
+                            .as_ref()
+                            .map_or(0.0, |coupling| coupling[[a, b]])
+                            * dots[b];
+                    }
+                    if exact_weight == 0.0 && majorized_weight == 0.0 {
+                        continue;
+                    }
+                    for (atom, values) in &plan.carriers[a] {
+                        let base = offsets[*atom];
+                        for (idx, value) in values.iter().enumerate() {
+                            exact[base + idx] += exact_weight * value;
+                            majorizer[base + idx] += majorized_weight * value;
+                        }
+                    }
+                }
+            }
+            // (2) the geometric term, and the Levenberg ridge that stands in for
+            // it.
+            for edge in &plan.edges {
+                if edge.run_j.is_empty() && edge.run_k.is_empty() {
+                    continue;
+                }
+                let off_j = offsets[edge.j];
+                let off_k = offsets[edge.k];
+                let bj = self.atoms[edge.j].decoder_coefficients();
+                let bk = self.atoms[edge.k].decoder_coefficients();
+                let (m_j, m_k) = (bj.nrows(), bk.nrows());
+                if edge.alpha != 0.0 {
+                    let vj = Array2::from_shape_fn((m_j, p), |(a, o)| v[off_j + a * p + o]);
+                    let vk = Array2::from_shape_fn((m_k, p), |(b, o)| v[off_k + b * p + o]);
+                    let (hj, hk) = Self::overlap_second_derivative_hvp(
+                        bj,
+                        bk,
+                        edge.o,
+                        edge.d_j,
+                        edge.d_k,
+                        vj.view(),
+                        vk.view(),
+                    );
+                    for a in 0..m_j {
+                        for o in 0..p {
+                            exact[off_j + a * p + o] += edge.alpha * hj[[a, o]];
+                        }
+                    }
+                    for b in 0..m_k {
+                        for o in 0..p {
+                            exact[off_k + b * p + o] += edge.alpha * hk[[b, o]];
+                        }
+                    }
+                }
+                for (off, lev, width) in [
+                    (off_j, edge.lev_j, edge.run_j.len()),
+                    (off_k, edge.lev_k, edge.run_k.len()),
+                ] {
+                    if !(lev > 0.0) {
+                        continue;
+                    }
+                    for idx in 0..width {
+                        majorizer[off + idx] += lev * v[off + idx];
+                    }
+                }
+            }
+        }
+        (exact, majorizer)
+    }
+
+    /// `∂²o/∂B² · V` for the rank-aware decoder overlap
+    /// `o = ‖B_jB_kᵀ‖²_F / (‖B_jB_jᵀ‖_F·‖B_kB_kᵀ‖_F)`, returned as the two atom
+    /// blocks `(m_j × p, m_k × p)`. `o`, `d_j`, `d_k` are the values the carrier
+    /// was built at, so this is literally the directional derivative of that
+    /// carrier. Derivation in the caller's doc.
+    pub(crate) fn overlap_second_derivative_hvp(
+        bj: &Array2<f64>,
+        bk: &Array2<f64>,
+        o: f64,
+        d_j: f64,
+        d_k: f64,
+        vj: ArrayView2<'_, f64>,
+        vk: ArrayView2<'_, f64>,
+    ) -> (Array2<f64>, Array2<f64>) {
+        let cross = bj.dot(&bk.t());
+        let s_j = bj.dot(&bj.t());
+        let s_k = bk.dot(&bk.t());
+        let cross_dot = vj.dot(&bk.t()) + bj.dot(&vk.t());
+        let s_j_dot = vj.dot(&bj.t()) + bj.dot(&vj.t());
+        let s_k_dot = vk.dot(&bk.t()) + bk.dot(&vk.t());
+        let sjb = s_j.dot(bj);
+        let skb = s_k.dot(bk);
+        let d_j_dot = 2.0 * (&sjb * &vj).sum() / d_j;
+        let d_k_dot = 2.0 * (&skb * &vk).sum() / d_k;
+        let e_dot = 2.0 * (&cross * &cross_dot).sum();
+        let inv_dd = 1.0 / (d_j * d_k);
+        let radial = d_j_dot / d_j + d_k_dot / d_k;
+        let o_dot = e_dot * inv_dd - o * radial;
+        let mb = cross.dot(bk);
+        let mtb = cross.t().dot(bj);
+        let coefficient_j = o_dot / (d_j * d_j) - 2.0 * o * d_j_dot / (d_j * d_j * d_j);
+        let coefficient_k = o_dot / (d_k * d_k) - 2.0 * o * d_k_dot / (d_k * d_k * d_k);
+        let hj = ((cross_dot.dot(bk) + cross.dot(&vk)) * inv_dd
+            - &mb * (inv_dd * radial)
+            - &sjb * coefficient_j
+            - (s_j_dot.dot(bj) + s_j.dot(&vj)) * (o / (d_j * d_j)))
+            * 2.0;
+        let hk = ((cross_dot.t().dot(bj) + cross.t().dot(&vj)) * inv_dd
+            - &mtb * (inv_dd * radial)
+            - &skb * coefficient_k
+            - (s_k_dot.dot(bk) + s_k.dot(&vk)) * (o / (d_k * d_k)))
+            * 2.0;
+        (hj, hk)
+    }
+
     /// Dense-`hbb` expansion of one component's factored barrier curvature
     /// `Σ_{a,b} C[a,b]·v_a v_bᵀ`, restricted to the component's own atom blocks.
     ///
@@ -1721,7 +2429,7 @@ impl SaeManifoldTerm {
     /// the expansion it replaces and does not reintroduce its build cost.
     fn scatter_barrier_curvature_dense(
         &self,
-        comp: &BarrierComponent,
+        atoms: &[usize],
         coupling: &Array2<f64>,
         edge_v: &[Vec<(usize, Vec<f64>)>],
         offsets: &[usize],
@@ -1730,12 +2438,10 @@ impl SaeManifoldTerm {
         let ne = edge_v.len();
         // Component support: the atoms' β blocks in ascending global order,
         // with a local index for each.
-        let mut atoms: Vec<usize> = comp.atoms.clone();
-        atoms.sort_unstable();
         let mut local_base: std::collections::BTreeMap<usize, usize> =
             std::collections::BTreeMap::new();
         let mut support: Vec<usize> = Vec::new();
-        for &atom in &atoms {
+        for &atom in atoms {
             let width = self.atoms[atom].basis_size() * self.output_dim();
             local_base.insert(atom, support.len());
             let start = offsets[atom];
@@ -1839,16 +2545,6 @@ impl SaeManifoldTerm {
                 return false;
             };
             let beta_dim = self.beta_dim();
-            sys.exact_beta_remainders.push(
-                gam_solve::arrow_schur::ExactBetaRemainder::from_analytic_penalty(
-                    beta_dim,
-                    0,
-                    AnalyticPenaltyKind::DecoderIncoherence(Arc::new(per_fit.clone())),
-                    target_beta.to_owned(),
-                    rho_local.to_owned(),
-                    penalty_scale,
-                ),
-            );
             let grad = per_fit.grad_target(target_beta, rho_local);
             for j in 0..beta_dim {
                 sys.gb[j] += penalty_scale * grad[j];
@@ -1909,16 +2605,6 @@ impl SaeManifoldTerm {
         }
         let k = self.beta_dim();
         let grad = penalty.grad_target(target_beta, rho_local);
-        sys.exact_beta_remainders.push(
-            gam_solve::arrow_schur::ExactBetaRemainder::from_analytic_penalty(
-                k,
-                0,
-                penalty.clone(),
-                target_beta.to_owned(),
-                rho_local.to_owned(),
-                penalty_scale,
-            ),
-        );
         for j in 0..k {
             sys.gb[j] += penalty_scale * grad[j];
         }
@@ -2031,6 +2717,7 @@ impl SaeManifoldTerm {
         }
         true
     }
+
 }
 
 impl SaeManifoldTerm {
@@ -3158,5 +3845,25 @@ mod tests_findings_234 {
             (gamma_w - gamma_none).abs() > 1e-4,
             "non-uniform weights must move γ off the unweighted value: w={gamma_w} none={gamma_none}"
         );
+    }
+}
+
+// The un-prepared wrappers below build a decoder-prior plan per call; production
+// callers all go through the `_prepared` forms with a plan built once per state
+// (#2828), so the wrappers are test-only conveniences and live here to keep the
+// workspace `warnings = "deny"` gate green (dead_code otherwise).
+#[cfg(test)]
+mod tests_decoder_prior_hvp_wrapper {
+    use super::*;
+
+    impl SaeManifoldTerm {
+        pub(crate) fn decoder_prior_beta_hvp_pair(
+            &self,
+            penalty_scale: f64,
+            v: ArrayView1<'_, f64>,
+        ) -> Result<(Array1<f64>, Array1<f64>), String> {
+            let prepared = self.prepare_decoder_prior_beta_curvature(penalty_scale);
+            self.decoder_prior_beta_hvp_pair_prepared(&prepared, v)
+        }
     }
 }

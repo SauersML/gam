@@ -45,8 +45,8 @@ pub mod kernels;
 pub use device::GpuDeviceInfo;
 pub use device_runtime::{GpuAbsence, GpuAvailability, GpuAvailabilityRef, GpuRuntime};
 pub use dictionary_score::{
-    DEFAULT_DICTIONARY_SCORE_MIN_ELEMS, DEFAULT_DICTIONARY_SCORE_TILE_BYTES,
-    DictionaryScorePrecision, DictionaryScoreRoutePlan,
+    DEFAULT_DICTIONARY_SCORE_MIN_ELEMS, DEFAULT_DICTIONARY_SCORE_TILE_ELEMS,
+    DictionaryScoreRoutePlan,
 };
 pub use gpu_error::GpuError;
 pub use memory::{DeviceBuffer, DeviceCsrMatrix, DeviceMatrix, DeviceVector};
@@ -244,7 +244,10 @@ impl GpuEligibility {
 /// Decide whether a GPU kernel may run. This is deliberately conservative:
 /// with no compiled vendor backend, `auto` returns CPU fallback and `required`
 /// returns an error at the call site through [`GpuDecision::require_supported`].
-pub fn decide(kernel: GpuKernel, eligibility: GpuEligibility) -> Result<GpuDecision, GpuError> {
+pub fn decide(
+    kernel: GpuKernel,
+    eligibility: GpuEligibility,
+) -> Result<GpuDecision, GpuError> {
     let policy = global_policy();
     // Auto must consult the actual probed runtime, not only the
     // compile-time eligibility.  Without this, `decide()` would claim
@@ -408,7 +411,10 @@ mod policy_tests {
     fn parses_canonical_user_gpu_policy_values() {
         assert_eq!(GpuPolicy::parse("auto"), Some(GpuPolicy::Auto));
         assert_eq!(GpuPolicy::parse("off"), Some(GpuPolicy::Off));
-        assert_eq!(GpuPolicy::parse("required"), Some(GpuPolicy::Required));
+        assert_eq!(
+            GpuPolicy::parse("required"),
+            Some(GpuPolicy::Required)
+        );
         assert_eq!(GpuPolicy::parse("force"), None);
         assert_eq!(GpuPolicy::parse("cpu"), None);
         assert_eq!(GpuPolicy::parse(""), None);

@@ -128,7 +128,6 @@ fn fit_tweedie(x: &[f64], y: &[f64], eval: &[f64]) -> TweedieFit {
             covariance_mode: InferenceCovarianceMode::Conditional,
             mean_interval_method: MeanIntervalMethod::Delta,
             includeobservation_interval: true,
-            apply_bias_correction: false,
             edgeworth_one_sided: false,
             boundary_correction: false,
             ood_inflation: false,

@@ -180,7 +180,7 @@ fn local_synth_copd_like_duchon_rejects_inadmissible_explicit_power() {
         .expect_err("the literal d=10, p=1, s=2 Duchon request is inadmissible");
     let message = err.to_string();
     assert!(
-        message.contains("pointwise kernel values require 2*(p+s) > dimension")
+        message.contains("pointwise kernel values: 2*(p+s) > dimension is required")
             && message.contains("p=1")
             && message.contains("s=2"),
         "expected a direct spectral-admissibility diagnostic without power rewriting, got: {message}"

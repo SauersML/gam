@@ -38,8 +38,8 @@
 //! the two coincide once the dictionary is fully populated and revival goes
 //! quiescent.
 
-use super::residual_reservoir::ResidualReservoir;
 use super::scoring::TileScorer;
+use super::residual_reservoir::ResidualReservoir;
 use super::update::{
     DEAD_DENOM, DecoderNormalEq, DecoderRecycleSpace, DecoderSolveStats, route_and_code_all,
     seed_decoder, solve_decoder_with_routability_gate_recycled, unit_norm_rows,
@@ -103,7 +103,7 @@ pub struct SparseDictStreamState {
     col_sumsq: Vec<f64>,
     rss: f64,
     row_count: usize,
-    reservoir: ResidualReservoir<f32>,
+    reservoir: ResidualReservoir,
 
     // ---- cross-epoch state ----
     prev_ev: f64,

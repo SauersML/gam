@@ -4,7 +4,31 @@
 //! is the exact predicate that decides "real descent" vs "genuine floor", so
 //! pinning it directly pins the loop's termination contract independent of the
 //! solver dynamics that produce the reseeds.
-use super::{CERTIFY_RESUME_PROGRESS_REL, certify_resume_made_progress};
+use super::{
+    CERTIFY_RESUME_PROGRESS_REL, OuterConfig, certify_resume_made_progress,
+    outer_rel_cost_floor,
+};
+
+fn config_with_rel_cost(rel_cost: Option<f64>, tolerance: f64) -> OuterConfig {
+    OuterConfig {
+        tolerance,
+        rel_cost_tolerance: rel_cost,
+        ..OuterConfig::default()
+    }
+}
+
+#[test]
+fn rel_cost_floor_prefers_explicit_then_scaled_tolerance_never_below_hard_floor() {
+    // Explicit relative tolerance wins verbatim.
+    let explicit = config_with_rel_cost(Some(1.0e-3), 1.0e-5);
+    assert_eq!(outer_rel_cost_floor(&explicit), 1.0e-3);
+    // Absent, it derives from a small fraction of the absolute tolerance.
+    let derived = config_with_rel_cost(None, 1.0e-2);
+    assert!((outer_rel_cost_floor(&derived) - 1.0e-4).abs() <= 1.0e-16);
+    // But never below the shared hard floor, however tight the tolerances.
+    let tiny = config_with_rel_cost(Some(1.0e-30), 1.0e-30);
+    assert_eq!(outer_rel_cost_floor(&tiny), super::COST_STALL_REL_TOL_FLOOR);
+}
 
 // ── Helper math (arbitrary floor) ────────────────────────────────────
 

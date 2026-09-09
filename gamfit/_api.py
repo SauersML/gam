@@ -251,6 +251,8 @@ def format_cuda_diagnostics() -> str:
 def _build_fit_payload(
     *,
     family: str,
+    negative_binomial_theta: float | None,
+    expectile_tau: float | None,
     offset: str | None,
     weights: str | None,
     persistent_warm_start_root: str | Path | None,
@@ -270,7 +272,6 @@ def _build_fit_payload(
     frailty_sd: float | None,
     hazard_loading: str | None,
     scale_dimensions: bool | None,
-    adaptive_regularization: bool | None,
     firth: bool | None,
     noise_formula: str | None,
     noise_offset: str | None,
@@ -289,6 +290,8 @@ def _build_fit_payload(
     }
     ctn_stage1_recipe = normalize_ctn_stage1(transformation_normal_stage1)
     kwarg_items: dict[str, Any] = {
+        "negative_binomial_theta": negative_binomial_theta,
+        "expectile_tau": expectile_tau,
         "transformation_normal": transformation_normal,
         "ctn_stage1": ctn_stage1_recipe.to_rust_recipe() if ctn_stage1_recipe else None,
         "survival_likelihood": survival_likelihood,
@@ -310,7 +313,6 @@ def _build_fit_payload(
             else str(persistent_warm_start_root)
         ),
         "scale_dimensions": scale_dimensions,
-        "adaptive_regularization": adaptive_regularization,
         "firth": firth,
         "noise_formula": noise_formula,
         "noise_offset": noise_offset,
@@ -714,6 +716,8 @@ def fit(
     formula: str,
     *,
     family: str = ...,
+    negative_binomial_theta: float | None = ...,
+    expectile_tau: float | None = ...,
     offset: str | None = ...,
     weights: str | None = ...,
     persistent_warm_start_root: str | Path | None = ...,
@@ -733,7 +737,6 @@ def fit(
     frailty_sd: float | None = ...,
     hazard_loading: str | None = ...,
     scale_dimensions: bool | None = ...,
-    adaptive_regularization: bool | None = ...,
     firth: bool | None = ...,
     noise_formula: str | None = ...,
     noise_offset: str | None = ...,
@@ -758,6 +761,8 @@ def fit(
     formula: str,
     *,
     family: str = ...,
+    negative_binomial_theta: float | None = ...,
+    expectile_tau: float | None = ...,
     offset: str | None = ...,
     weights: str | None = ...,
     persistent_warm_start_root: str | Path | None = ...,
@@ -777,7 +782,6 @@ def fit(
     frailty_sd: float | None = ...,
     hazard_loading: str | None = ...,
     scale_dimensions: bool | None = ...,
-    adaptive_regularization: bool | None = ...,
     firth: bool | None = ...,
     noise_formula: str | None = ...,
     noise_offset: str | None = ...,
@@ -801,6 +805,8 @@ def fit(
     formula: str,
     *,
     family: str = "auto",
+    negative_binomial_theta: float | None = None,
+    expectile_tau: float | None = None,
     offset: str | None = None,
     weights: str | None = None,
     persistent_warm_start_root: str | Path | None = None,
@@ -820,7 +826,6 @@ def fit(
     frailty_sd: float | None = None,
     hazard_loading: str | None = None,
     scale_dimensions: bool | None = None,
-    adaptive_regularization: bool | None = None,
     firth: bool | None = None,
     noise_formula: str | None = None,
     noise_offset: str | None = None,
@@ -870,6 +875,15 @@ def fit(
         inference — e.g. pass ``family="gaussian"`` to fit an integer rating
         column such as ``0..5`` (which matches the count signature) as a
         continuous response.
+    negative_binomial_theta:
+        Optional fixed positive size/overdispersion parameter for
+        ``family="negative-binomial"``. When omitted, Rust estimates theta.
+        This is the Python spelling of CLI ``--negative-binomial-theta`` and
+        the shared request field ``negative_binomial_theta``.
+    expectile_tau:
+        Optional target in the open interval ``(0, 1)`` for
+        ``family="expectile"``. This is the Python spelling of CLI
+        ``--expectile-tau`` and the shared request field ``expectile_tau``.
     offset:
         Name of the offset column. Corresponds to ``--offset-column``.
     weights:
@@ -974,10 +988,6 @@ def fit(
         When ``True``, enables learned per-axis anisotropic length scales on
         spatial smooths (e.g. multi-dim Duchon / Matern / TPS). Per-axis
         scales are learned, not specified. Corresponds to ``--scale-dimensions``.
-    adaptive_regularization:
-        Enable exact local adaptive regularization for compatible spatial
-        smooths. Omit to use the quality-first automatic policy, which leaves
-        it off unless explicitly requested.
     firth:
         Enable Firth bias-reduced estimation. Corresponds to ``--firth``.
     noise_formula:
@@ -1176,7 +1186,6 @@ def fit(
             weights=weights,
             fisher_rao_w=fisher_rao_w,
             scale_dimensions=scale_dimensions,
-            adaptive_regularization=adaptive_regularization,
             firth=firth,
             precision_hyperpriors=precision_hyperpriors,
             latents=latents,
@@ -1202,6 +1211,8 @@ def fit(
     )
     payload = _build_fit_payload(
         family=family,
+        negative_binomial_theta=negative_binomial_theta,
+        expectile_tau=expectile_tau,
         offset=offset,
         weights=weights,
         persistent_warm_start_root=persistent_warm_start_root,
@@ -1221,7 +1232,6 @@ def fit(
         frailty_sd=frailty_sd,
         hazard_loading=hazard_loading,
         scale_dimensions=scale_dimensions,
-        adaptive_regularization=adaptive_regularization,
         firth=firth,
         noise_formula=noise_formula,
         noise_offset=noise_offset,
@@ -1296,6 +1306,8 @@ def fit_array(
     formula: str,
     *,
     family: str = "auto",
+    negative_binomial_theta: float | None = None,
+    expectile_tau: float | None = None,
     offset: str | None = None,
     weights: str | None = None,
     persistent_warm_start_root: str | Path | None = None,
@@ -1315,7 +1327,6 @@ def fit_array(
     frailty_sd: float | None = None,
     hazard_loading: str | None = None,
     scale_dimensions: bool | None = None,
-    adaptive_regularization: bool | None = None,
     firth: bool | None = None,
     noise_formula: str | None = None,
     noise_offset: str | None = None,
@@ -1363,6 +1374,8 @@ def fit_array(
     )
     payload = _build_fit_payload(
         family=family,
+        negative_binomial_theta=negative_binomial_theta,
+        expectile_tau=expectile_tau,
         offset=offset,
         weights=weights,
         persistent_warm_start_root=persistent_warm_start_root,
@@ -1382,7 +1395,6 @@ def fit_array(
         frailty_sd=frailty_sd,
         hazard_loading=hazard_loading,
         scale_dimensions=scale_dimensions,
-        adaptive_regularization=adaptive_regularization,
         firth=firth,
         noise_formula=noise_formula,
         noise_offset=noise_offset,
@@ -1608,6 +1620,8 @@ def validate_formula(
     formula: str,
     *,
     family: str = "auto",
+    negative_binomial_theta: float | None = None,
+    expectile_tau: float | None = None,
     offset: str | None = None,
     weights: str | None = None,
     persistent_warm_start_root: str | Path | None = None,
@@ -1627,7 +1641,6 @@ def validate_formula(
     frailty_sd: float | None = None,
     hazard_loading: str | None = None,
     scale_dimensions: bool | None = None,
-    adaptive_regularization: bool | None = None,
     firth: bool | None = None,
     noise_formula: str | None = None,
     noise_offset: str | None = None,
@@ -1658,6 +1671,8 @@ def validate_formula(
         rust_config.pop(key, None)
     payload = _build_fit_payload(
         family=family,
+        negative_binomial_theta=negative_binomial_theta,
+        expectile_tau=expectile_tau,
         offset=offset,
         weights=weights,
         persistent_warm_start_root=persistent_warm_start_root,
@@ -1677,7 +1692,6 @@ def validate_formula(
         frailty_sd=frailty_sd,
         hazard_loading=hazard_loading,
         scale_dimensions=scale_dimensions,
-        adaptive_regularization=adaptive_regularization,
         firth=firth,
         noise_formula=noise_formula,
         noise_offset=noise_offset,

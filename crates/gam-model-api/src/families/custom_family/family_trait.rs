@@ -36,12 +36,17 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 /// Family evaluation over all parameter blocks.
 #[derive(Clone, Debug)]
 pub struct FamilyEvaluation {
+    /// Sum of the family log likelihood over all observations.
     pub log_likelihood: f64,
+    /// IRLS working response and weight information, one entry per block.
     pub blockworking_sets: Vec<BlockWorkingSet>,
 }
 
+/// Exact log likelihood and coefficient gradient returned by a joint workspace.
 pub struct ExactNewtonJointGradientEvaluation {
+    /// Sum of the family log likelihood over all observations.
     pub log_likelihood: f64,
+    /// Gradient in flattened coefficient-block order.
     pub gradient: Array1<f64>,
 }
 
@@ -76,6 +81,10 @@ pub struct BatchedOuterHessianTerms {
     pub outer_hessian: gam_problem::HessianValue,
 }
 
+/// Batched contributions used to assemble the profiled REML/LAML gradient.
+///
+/// Each vector uses the unified outer-coordinate order (smoothing coordinates
+/// followed by family hyperparameters) and must therefore have the same length.
 pub struct BatchedOuterGradientTerms {
     /// Explicit ∂J/∂θ_j contributions evaluated at the converged β̂ holding
     /// β fixed (i.e. the part that does NOT flow through H or S):
@@ -113,6 +122,11 @@ pub struct OuterDerivativePilotSchedule {
 }
 
 impl OuterDerivativePilotSchedule {
+    /// Create a pilot/exact-phase schedule around a shared evaluation counter.
+    ///
+    /// `sampled_phase_budget` is the largest counter value belonging to the
+    /// sampled phase. The constructor is infallible; callers must share this
+    /// same counter with the family evaluation that increments it.
     pub fn new(phase_counter: Arc<AtomicUsize>, sampled_phase_budget: usize) -> Self {
         Self {
             phase_counter,
@@ -1160,6 +1174,11 @@ pub trait CustomFamily {
         false
     }
 
+    /// Whether the joint workspace returns the exact flattened coefficient gradient.
+    ///
+    /// `specs` must be a valid block layout. The default validates it and
+    /// returns `false`; implementations returning `true` must also return
+    /// `Some` from the workspace gradient evaluation.
     fn inner_joint_workspace_gradient_available(&self, specs: &[ParameterBlockSpec]) -> bool {
         assert_valid_blockspecs(specs, "inner joint workspace gradient availability");
         false
@@ -1200,6 +1219,11 @@ pub trait CustomFamily {
         false
     }
 
+    /// Whether the joint workspace returns the exact current log likelihood.
+    ///
+    /// `specs` must be a valid block layout. The default validates it and
+    /// returns `false`; implementations returning `true` must also return
+    /// `Some` from the workspace log-likelihood evaluation.
     fn inner_joint_workspace_log_likelihood_available(&self, specs: &[ParameterBlockSpec]) -> bool {
         assert_valid_blockspecs(specs, "inner joint workspace log-likelihood availability");
         false
@@ -2604,7 +2628,10 @@ pub enum EvalScope {
 /// this prevents.
 #[derive(Clone, Debug)]
 pub struct OuterEvalContext {
+    /// Current log smoothing parameters in penalty order.
     pub rho: Arc<Array1<f64>>,
+    /// Monotonically increasing identifier for the outer evaluation.
     pub eval_id: usize,
+    /// Whether this evaluation is an outer derivative or inner coefficient trial.
     pub scope: EvalScope,
 }

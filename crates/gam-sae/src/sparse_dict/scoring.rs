@@ -137,39 +137,14 @@ impl ScoreRouteStats {
     }
 }
 
-/// Precision retained by an online score selector. Learned block frames use
-/// f64 keys; scalar dictionary observations retain their native f32 keys.
-pub trait ScoreValue: Copy + PartialOrd {
-    fn abs(self) -> Self;
-    fn total_cmp(&self, other: &Self) -> std::cmp::Ordering;
-}
-
-impl ScoreValue for f32 {
-    fn abs(self) -> Self {
-        self.abs()
-    }
-    fn total_cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.total_cmp(other)
-    }
-}
-
-impl ScoreValue for f64 {
-    fn abs(self) -> Self {
-        self.abs()
-    }
-    fn total_cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.total_cmp(other)
-    }
-}
-
 /// Online "keep the `s` largest-magnitude scores seen so far" selector for a
 /// single row. Selection is by `|score|` (the dictionary atoms are unit-norm,
 /// so `|xᵀd|` is the magnitude of the optimal 1-atom projection); ties break by
 /// smaller atom index for determinism.
 #[derive(Clone, Debug)]
-pub struct TopSSelector<T> {
+pub struct TopSSelector {
     /// `(atom_index, score, |score|)`, length ≤ `s`, kept unsorted.
-    heap: Vec<(u32, T, T)>,
+    heap: Vec<(u32, f32, f32)>,
     capacity: usize,
     /// Index of the current weakest slot (smallest `|score|`, ties → larger
     /// atom index). Meaningful only once `heap.len() == capacity`; maintained
@@ -177,7 +152,7 @@ pub struct TopSSelector<T> {
     worst_idx: usize,
 }
 
-impl<T: ScoreValue> TopSSelector<T> {
+impl TopSSelector {
     pub fn new(capacity: usize) -> Self {
         Self {
             heap: Vec::with_capacity(capacity.max(1)),
@@ -212,7 +187,7 @@ impl<T: ScoreValue> TopSSelector<T> {
     /// weakest. The selection is bit-identical to a fresh full rescan per offer:
     /// the accept test and the weakest-slot definition are unchanged.
     #[inline]
-    pub fn offer(&mut self, atom: u32, score: T) {
+    pub fn offer(&mut self, atom: u32, score: f32) {
         let mag = score.abs();
         if self.heap.len() < self.capacity {
             self.heap.push((atom, score, mag));
@@ -229,17 +204,14 @@ impl<T: ScoreValue> TopSSelector<T> {
         }
     }
 
-    /// Current kth magnitude once the selector is full. A screened candidate
-    /// can be discarded only when its upper bound is strictly below this key.
-    pub(super) fn cutoff(&self) -> Option<T> {
-        (self.heap.len() == self.capacity).then(|| self.heap[self.worst_idx].2)
-    }
-
     /// Finalise, returning `(atom, score)` pairs sorted by descending `|score|`
     /// (ties by ascending atom index).
-    pub fn finish(mut self) -> Vec<(u32, T)> {
-        self.heap
-            .sort_by(|a, b| b.2.total_cmp(&a.2).then_with(|| a.0.cmp(&b.0)));
+    pub fn finish(mut self) -> Vec<(u32, f32)> {
+        self.heap.sort_by(|a, b| {
+            b.2.partial_cmp(&a.2)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.0.cmp(&b.0))
+        });
         self.heap.into_iter().map(|(a, s, _)| (a, s)).collect()
     }
 }
@@ -252,7 +224,7 @@ pub fn score_row_tile(
     row: ArrayView1<'_, f32>,
     atoms_tile: ArrayView2<'_, f32>,
     atom_offset: usize,
-    sel: &mut TopSSelector<f32>,
+    sel: &mut TopSSelector,
 ) {
     let p = row.len();
     for (local, atom) in atoms_tile.outer_iter().enumerate() {
@@ -326,7 +298,7 @@ impl TileScorer {
     ) -> Vec<Vec<(u32, f32)>> {
         let b = rows.nrows();
         let k = decoder.nrows();
-        let mut selectors: Vec<TopSSelector<f32>> =
+        let mut selectors: Vec<TopSSelector> =
             (0..b).map(|_| TopSSelector::new(self.active)).collect();
 
         let mut start = 0usize;
@@ -363,7 +335,6 @@ impl TileScorer {
             rows.nrows(),
             decoder.nrows(),
             decoder.ncols(),
-            gam_gpu::DictionaryScorePrecision::F32,
         );
         if mode == gam_gpu::GpuPolicy::Off {
             return Ok(ScoreRouteResult {

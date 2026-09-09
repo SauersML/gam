@@ -351,9 +351,41 @@ where
         .into_iter()
         .map(|s| {
             let penalty_scale = mean_abs(s.diag().iter().copied()).max(1.0e-8);
-            (likelihood_scale / penalty_scale).ln().clamp(-12.0, 12.0)
+            (likelihood_scale / penalty_scale).ln()
         })
         .collect()
+}
+
+/// Return the closed smoothing-strength domain centred on each block's natural
+/// scale. At either edge one curvature is `sqrt(EPSILON)` times the other, the
+/// resolution relevant to the criterion gradient consumed by the outer solver.
+fn log_lambda_domain(seeds: &Array1<f64>) -> (Array1<f64>, Array1<f64>) {
+    let radius = -0.5 * f64::EPSILON.ln();
+    (
+        seeds.mapv(|seed| seed - radius),
+        seeds.mapv(|seed| seed + radius),
+    )
+}
+
+#[cfg(test)]
+mod log_lambda_domain_tests {
+    use super::*;
+
+    /// gam#2765/gam#2767: clipping a scale-derived seed to an unrelated wall
+    /// let the projected gradient certify while REML was still descending.
+    #[test]
+    fn scale_matched_log_lambda_seed_owns_a_resolution_derived_domain_2767() {
+        let design = DesignMatrix::from(Array2::from_elem((2, 1), 1.0e4));
+        let penalty = Array2::from_elem((1, 1), 1.0e-4);
+        let seeds = Array1::from_vec(block_log_lambda_seeds(&design, [&penalty]));
+        assert!(seeds[0] > 12.0, "the fixture must cross the removed hand box");
+
+        let (lower, upper) = log_lambda_domain(&seeds);
+        let radius = -0.5 * f64::EPSILON.ln();
+        assert_eq!(lower[0], seeds[0] - radius);
+        assert_eq!(upper[0], seeds[0] + radius);
+        assert!(lower[0] < seeds[0] && seeds[0] < upper[0]);
+    }
 }
 
 pub(crate) fn joint_setup(
@@ -461,18 +493,18 @@ pub(crate) fn joint_setup(
     let log_kappa_upper = SpatialLogKappaCoords::new_with_dims(Array1::from_vec(upper_vals), dims);
     // Project seed onto bounds; spec.length_scale is a hint, not a constraint.
     let log_kappa0 = log_kappa0.clamp_to_bounds(&log_kappa_lower, &log_kappa_upper);
+    // The ρ domain of the time block and of the prepared extra blocks lives
+    // in structures the joint driver never sees; the caller derived it (#2812).
+    // Without a caller-derived domain, centre each block's domain on its own
+    // scale-matched seed (#2767) rather than leaving the engine's wall.
+    let (rho_lower, rho_upper) = rho_domain.unwrap_or_else(|| log_lambda_domain(&rho0vec));
     let setup = ExactJointHyperSetup::new(
         rho0vec,
         log_kappa0,
         log_kappa_lower,
         log_kappa_upper,
-    );
-    // The ρ domain of the time block and of the prepared extra blocks lives
-    // in structures the joint driver never sees; the caller derived it (#2812).
-    let setup = match rho_domain {
-        Some((lower, upper)) => setup.with_rho_domain(lower, upper),
-        None => setup,
-    };
+    )
+    .with_rho_domain(rho_lower, rho_upper);
     assert_eq!(
         baseline_initial_theta.len(),
         baseline_lower_theta.len(),

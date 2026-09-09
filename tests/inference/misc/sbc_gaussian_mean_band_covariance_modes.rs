@@ -39,43 +39,30 @@ const NOMINAL_LEVELS: [f64; 3] = [0.80, 0.90, 0.95];
 const SEED: u64 = 0x1891_C0_7A_9E_5D;
 const DESIGN_SEED: u64 = 0x1891_DE_517_C0;
 
-/// The band configurations under audit: covariance mode × bias correction.
+/// The band configurations under audit: one per covariance mode. Both are the
+/// posterior band of the posterior mean they are centred on — the conditional
+/// `H⁻¹` law and the smoothing-corrected `H⁻¹ + J·Var(ρ̂)·Jᵀ` law, the latter
+/// being the default user-facing band.
 ///
-/// The bias-correction axis is load-bearing for #1870. When
-/// `apply_bias_correction` is on (the DEFAULT, user-facing band), the reported
-/// centre shifts to β_BC = β̂ + H⁻¹S(β̂ − μ); the matching covariance is
-/// A·V·Aᵀ with A = I + H⁻¹S. The fit applies A to the SMOOTHING-CORRECTED
-/// covariance (optimizer.rs:3193) but stores the CONDITIONAL covariance as raw
-/// Vb — so a bias-corrected CONDITIONAL band is centred at β_BC yet reports the
-/// uncertainty of the shrunken mode β̂, the over-narrow band #1870 documents.
-/// This gate exercises all four cells so a red one names exactly the
-/// (mode, bias) configuration that under-covers.
+/// This gate used to carry a second axis, a frequentist de-shrinkage of the
+/// centre with the matching `A·V·Aᵀ` map on the width. Measured on this
+/// fixture (120 replications), the de-shrunk width made the default band
+/// conservative at the 0.80 and 0.90 levels (0.917 / 0.975 empirical) while
+/// the posterior band as it stands is calibrated (0.825 / 0.933 / 0.975), so
+/// the axis and the machinery behind it were deleted (#2670).
 struct BandConfig {
     covariance_mode: InferenceCovarianceMode,
-    apply_bias_correction: bool,
     label: &'static str,
 }
 
-const CONFIGS: [BandConfig; 4] = [
+const CONFIGS: [BandConfig; 2] = [
     BandConfig {
         covariance_mode: InferenceCovarianceMode::Conditional,
-        apply_bias_correction: false,
-        label: "conditional core (bias off)",
-    },
-    BandConfig {
-        covariance_mode: InferenceCovarianceMode::Conditional,
-        apply_bias_correction: true,
-        label: "conditional bias-corrected (#1870 oracle)",
+        label: "conditional (#1870)",
     },
     BandConfig {
         covariance_mode: InferenceCovarianceMode::SmoothingCorrected,
-        apply_bias_correction: false,
-        label: "smoothing-corrected core (#1871)",
-    },
-    BandConfig {
-        covariance_mode: InferenceCovarianceMode::SmoothingCorrected,
-        apply_bias_correction: true,
-        label: "smoothing-corrected bias-corrected (default user band)",
+        label: "smoothing-corrected (#1871, default user band)",
     },
 ];
 
@@ -135,9 +122,9 @@ fn simulate_dataset(
 
 /// The credible band at every training row under the requested configuration.
 ///
-/// Only the covariance mode and the bias-correction flag are varied; the
+/// Only the covariance mode is varied; the
 /// Edgeworth / boundary / OOD modifiers are held OFF (and no-op here anyway
-/// without their inputs) so the gate isolates the covariance-mode × bias axis.
+/// without their inputs) so the gate isolates the covariance-mode axis.
 fn confidence_band(fit: &FitResult, level: f64, config: &BandConfig) -> (Array1<f64>, Array1<f64>) {
     let FitResult::Standard(standard) = fit else {
         panic!(
@@ -159,7 +146,6 @@ fn confidence_band(fit: &FitResult, level: f64, config: &BandConfig) -> (Array1<
         covariance_mode: config.covariance_mode,
         mean_interval_method: MeanIntervalMethod::TransformEta,
         includeobservation_interval: false,
-        apply_bias_correction: config.apply_bias_correction,
         edgeworth_one_sided: false,
         boundary_correction: false,
         ..PredictUncertaintyOptions::default()
@@ -250,7 +236,7 @@ fn gaussian_mean_band_covers_truth_under_both_covariance_modes() {
     }
     assert!(
         failures.is_empty(),
-        "gaussian mean band under-covers the truth (per covariance-mode × bias config):\n{}",
+        "gaussian mean band under-covers the truth (per covariance mode):\n{}",
         failures.join("\n")
     );
 }

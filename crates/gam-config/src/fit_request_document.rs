@@ -76,8 +76,6 @@ impl FitRequestDocument {
 #[serde(deny_unknown_fields)]
 pub struct FitRequestConfigDocument {
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub adaptive_regularization: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub baseline_makeham: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub baseline_rate: Option<f64>,

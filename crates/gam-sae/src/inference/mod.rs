@@ -32,3 +32,10 @@ mod tests_dose_calibration_2249;
 // above pin requested-vs-realized nats; realized position had no reader at all.
 #[cfg(test)]
 mod tests_displacement_2263;
+
+// #2234 / #2263 item 3 — requested-vs-realized INTRINSIC (arc-length)
+// displacement. The module above pins the chart-coordinate round trip in the
+// chart's own parameter; this one asks whether that parameter is the intrinsic
+// unit the steering surface documents.
+#[cfg(test)]
+mod tests_unit_speed_steering_2234;

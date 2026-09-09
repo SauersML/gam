@@ -5,8 +5,8 @@ dictionaries (``K`` up to tens of thousands) where the exact-REML / Arrow-Schur
 dense joint manifold solver is the wrong engine. It routes each row against the
 dictionary in ``K``-tiles, keeps only the top-``active`` atoms, and returns
 fixed-width **sparse** routing (``indices[N, active]`` / ``codes[N, active]``)
-so the ``N x K`` assignment matrix is never materialised. The scalar atom lane stores FP32 state. The block lane stores learned frames,
-codes, gamma and reconstruction in FP64.
+so the ``N x K`` assignment matrix is never materialised. All heavy state is
+FP32.
 """
 
 from __future__ import annotations
@@ -19,8 +19,8 @@ import numpy as np
 from ._binding import rust_module
 
 
-def _as_2d(values: Any, label: str, dtype: Any) -> np.ndarray:
-    arr = np.asarray(values, dtype=dtype)
+def _as_2d_f32(values: Any, label: str) -> np.ndarray:
+    arr = np.asarray(values, dtype=np.float32)
     if arr.ndim == 1:
         arr = arr.reshape((-1, 1))
     if arr.ndim != 2:
@@ -70,7 +70,7 @@ def _block_transform(
     same group-ℓ₂ gate + block-TopK + tied signed codes the trainer uses, so
     held-out encoding is bit-consistent with training.
     """
-    x = _as_2d(X, "X", np.float64)
+    x = _as_2d_f32(X, "X")
     p = decoder.shape[1]
     if x.shape[1] != p:
         raise ValueError(f"X must have P={p} columns; got {x.shape[1]}")
@@ -78,8 +78,8 @@ def _block_transform(
     g_blocks = decoder.shape[0] // b
     k = max(1, min(int(block_topk), g_blocks))
     blocks, gates, codes = rust_module().block_sparse_dictionary_transform_ffi(
-        np.ascontiguousarray(x, dtype=np.float64),
-        np.ascontiguousarray(decoder, dtype=np.float64),
+        np.ascontiguousarray(x, dtype=np.float32),
+        np.ascontiguousarray(decoder, dtype=np.float32),
         float(gamma),
         int(b),
         int(k),
@@ -213,7 +213,7 @@ class SparseDictionaryFit:
         Pass ``score_mode="required"`` to fail-closed when you specifically want
         an admitted route to raise rather than fall back to the host.
         """
-        x = _as_2d(X, "X", np.float32)
+        x = _as_2d_f32(X, "X")
         if x.shape[1] != self.decoder.shape[1]:
             raise ValueError(
                 f"X must have P={self.decoder.shape[1]} columns; got {x.shape[1]}"
@@ -279,7 +279,7 @@ class SparseDictStreamArtifact:
         transparently while ``score_route_stats`` still reports the path. Pass
         ``score_mode="required"`` to fail-closed on an admitted device route.
         """
-        x = _as_2d(X, "X", np.float32)
+        x = _as_2d_f32(X, "X")
         if x.shape[1] != self.decoder.shape[1]:
             raise ValueError(
                 f"X must have P={self.decoder.shape[1]} columns; got {x.shape[1]}"
@@ -351,7 +351,7 @@ class SparseDictStream:
         tolerance: float = 1.0e-6,
         score_mode: str = "auto",
     ) -> None:
-        seed_arr = _as_2d(seed, "seed", np.float32)
+        seed_arr = _as_2d_f32(seed, "seed")
         self._handle = rust_module().SparseDictStream(
             seed_arr,
             int(K),
@@ -373,7 +373,7 @@ class SparseDictStream:
         (``alive_atoms`` is cumulative across the shards seen since the last
         :meth:`end_epoch`).
         """
-        shard_arr = _as_2d(shard, "shard", np.float32)
+        shard_arr = _as_2d_f32(shard, "shard")
         data = dict(self._handle.partial_fit(shard_arr))
         data["score_route_stats"] = _route_stats(data["score_route_stats"])
         return data
@@ -425,34 +425,12 @@ class SparseDictStream:
 
 @dataclass(frozen=True, slots=True)
 class BlockSparseDictionaryConvergence:
-    """Full-alternation evidence on the batch training corpus."""
-
-    ev_residual: float
-    gamma_residual: float
-    frame_residual: float
-    routing_residual: float
-    reconstruction_residual: float
-    accepted_births: int
-    polar_failures: int
-    tolerance: float
-    corpus_rows: int
-
-
-@dataclass(frozen=True, slots=True)
-class BlockSparseStreamConvergence:
-    """Evidence from one complete streaming epoch, identified by row count and epoch.
-
-    Streaming does not measure the batch routing/reconstruction replay residuals.
-    Routing a new sample retains this certificate's original corpus provenance.
-    """
+    """Read-only fixed-point certificate for a block-sparse fit."""
 
     ev_residual: float
     gamma_residual: float
     frame_residual: float
     tolerance: float
-    accepted_births: int
-    corpus_rows: int
-    epoch: int
 
 
 @dataclass(frozen=True)
@@ -460,9 +438,7 @@ class BlockSparseDictionaryFit:
     """A certified-converged block-sparse model (#1026 block extension).
 
     The Rust solver raises on non-convergence, so every instance carries the
-    original training-corpus certificate. A batch fit carries full-alternation
-    evidence; a streaming artifact routed onto a sample retains its distinct
-    final-epoch evidence, without certifying a fit to that sample.
+    residual certificate for its final full alternation.
 
     The ``K = G*b`` atoms are grouped into ``G`` blocks of ``b`` orthonormal
     atoms. Routing selects whole blocks by their group ℓ₂ gate ``‖z_g‖₂``
@@ -479,10 +455,10 @@ class BlockSparseDictionaryFit:
     blocks:
         ``N x block_topk`` selected block indices per row (``uint32``).
     gates:
-        ``N x block_topk`` per-selected-block **gate** ``‖z_g‖₂`` (presence, FP64).
+        ``N x block_topk`` per-selected-block **gate** ``‖z_g‖₂`` (presence, FP32).
     codes:
         ``N x block_topk x b`` signed **within-block code** ``z_g`` (amplitude /
-        direction, FP64), aligned with :attr:`blocks`.
+        direction, FP32), aligned with :attr:`blocks`.
     gamma:
         Shared tied-encoder scalar ``γ`` (one scalar for the whole dictionary).
     block_utilization:
@@ -495,13 +471,9 @@ class BlockSparseDictionaryFit:
         Optional log-spaced nested-prefix ladder ``(K, L(K))``. Empty unless
         ``matryoshka_prefix=True`` was passed to :func:`block_sparse_dictionary_fit`.
     fitted:
-        ``N x P`` dense reconstruction of the supplied rows (FP64). For
-        :meth:`BlockSparseStreamArtifact.to_fit`, these are sample rows.
+        ``N x P`` dense reconstruction of the training rows (FP32).
     convergence:
-        Batch or streaming evidence on its original training corpus.
-    explained_variance:
-        Explained variance on that original training corpus; routing another
-        sample with ``to_fit`` does not recompute or relabel this quantity.
+        Read-only EV, shared-``gamma``, and gauge-invariant frame residuals.
     explained_variance, epochs, block_topk, block_size:
         Run metadata.
     """
@@ -517,7 +489,7 @@ class BlockSparseDictionaryFit:
     fitted: np.ndarray
     explained_variance: float
     epochs: int
-    convergence: BlockSparseDictionaryConvergence | BlockSparseStreamConvergence
+    convergence: BlockSparseDictionaryConvergence
     block_topk: int
     block_size: int
 
@@ -555,7 +527,7 @@ class BlockSparseDictionaryFit:
                 self.codes,
                 int(self.block_size),
             ),
-            dtype=np.float64,
+            dtype=np.float32,
         )
 
     def transform(
@@ -596,7 +568,7 @@ class BlockSparseDictionaryFit:
         """In-block coordinates ``X D_gᵀ`` (``M x b``): the tied projection of each
         row onto block ``g``'s subspace — the direct nursery coordinate ``Z``
         (before any residual bookkeeping). Deterministic, no routing."""
-        x = _as_2d(X, "X", np.float64)
+        x = _as_2d_f32(X, "X")
         return np.ascontiguousarray(
             rust_module().block_sparse_dictionary_block_coords_ffi(
                 x,
@@ -604,14 +576,14 @@ class BlockSparseDictionaryFit:
                 int(self.block_size),
                 int(g),
             ),
-            dtype=np.float64,
+            dtype=np.float32,
         )
 
     def lift_block(self, coords: Any, g: int) -> np.ndarray:
         """Lift ``M x b`` in-block coordinates back to ambient ``M x P`` via the
         block frame: ``coords @ D_g``. Inverse of :meth:`block_coords` on the
         block subspace (``D_g D_gᵀ = I_b``)."""
-        c = np.ascontiguousarray(np.asarray(coords, dtype=np.float64))
+        c = np.ascontiguousarray(np.asarray(coords, dtype=np.float32))
         if c.ndim != 2 or c.shape[1] != self.block_size:
             raise ValueError(
                 f"coords must be M x b (b={self.block_size}); got {c.shape}"
@@ -623,7 +595,7 @@ class BlockSparseDictionaryFit:
                 int(self.block_size),
                 int(g),
             ),
-            dtype=np.float64,
+            dtype=np.float32,
         )
 
     def _reconstruct_from(self, blocks: np.ndarray, codes: np.ndarray) -> np.ndarray:
@@ -633,10 +605,10 @@ class BlockSparseDictionaryFit:
             rust_module().block_sparse_dictionary_reconstruct_ffi(
                 self.decoder,
                 np.ascontiguousarray(blocks, dtype=np.uint32),
-                np.ascontiguousarray(codes, dtype=np.float64),
+                np.ascontiguousarray(codes, dtype=np.float32),
                 int(self.block_size),
             ),
-            dtype=np.float64,
+            dtype=np.float32,
         )
 
     def project_residual(self, X: Any, g: int) -> np.ndarray:
@@ -649,7 +621,7 @@ class BlockSparseDictionaryFit:
         ``g``'s frame. This is the exact per-block target a Tier-2 chart should fit
         (the same ``r_{ig}`` the Rust frame refresh forms), and — unlike the direct
         :meth:`block_coords` — it is meaningful even when blocks share span."""
-        x = _as_2d(X, "X", np.float64)
+        x = _as_2d_f32(X, "X")
         return np.ascontiguousarray(
             rust_module().block_sparse_dictionary_project_residual_ffi(
                 x,
@@ -659,13 +631,13 @@ class BlockSparseDictionaryFit:
                 int(self.block_topk),
                 int(g),
             ),
-            dtype=np.float64,
+            dtype=np.float32,
         )
 
     def block_firings(self, X: Any) -> np.ndarray:
         """Per-block firing counts on ``X`` (``G``-vector): how many rows route to
         each block under the frozen frames. ``n_firings`` for the MDL scorer."""
-        x = _as_2d(X, "X", np.float64)
+        x = _as_2d_f32(X, "X")
         blocks, _gates, _codes = self.transform(x)
         return np.ascontiguousarray(
             rust_module().block_sparse_dictionary_firings_ffi(
@@ -726,7 +698,7 @@ class BlockSparseDictionaryFit:
         alongside); this manifest carries only the (p x b) bases + scalar stats so
         it stays a compact, human-readable JSON. Mirrors the block->chart hand-off
         block_nursery consumes (basis ``Q``, in-block coords, per-block stats)."""
-        x = _as_2d(X, "X", np.float64)
+        x = _as_2d_f32(X, "X")
         return dict(
             rust_module().block_sparse_dictionary_seed_manifest_ffi(
                 x,
@@ -770,7 +742,7 @@ class BlockSparseDictionaryFit:
         held-out evidence, e-BH selection, pair screening, and reconstruction are
         computed by the Rust core.
         """
-        x = _as_2d(X, "X", np.float64)
+        x = _as_2d_f32(X, "X")
         return dict(
             rust_module().block_coordinate_chart_compose_ffi(
                 x,
@@ -847,7 +819,7 @@ def block_sparse_dictionary_fit(
             "pass grassmann=True (or use sparse_dictionary_fit for an unconstrained "
             "atom dictionary)"
         )
-    x = _as_2d(X, "X", np.float64)
+    x = _as_2d_f32(X, "X")
     if block_size > x.shape[1]:
         raise ValueError(
             f"block_size={block_size} cannot exceed P={x.shape[1]} "
@@ -899,7 +871,7 @@ def fixed_budget_block_sparse_dictionary_fit(
     gate, then carried as signed orthonormal coordinates.  This is the
     fixed-budget alternative used by the #2251 concept-probe acceptance harness.
     """
-    x = _as_2d(X, "X", np.float64)
+    x = _as_2d_f32(X, "X")
     payload = rust_module().fixed_budget_block_sparse_dictionary_fit(
         x,
         int(n_atoms),
@@ -921,29 +893,24 @@ def _block_sparse_fit_from_payload(payload: Any) -> BlockSparseDictionaryFit:
     data = dict(payload)
     convergence = dict(data["convergence"])
     return BlockSparseDictionaryFit(
-        decoder=np.ascontiguousarray(data["decoder"], dtype=np.float64),
+        decoder=np.ascontiguousarray(data["decoder"], dtype=np.float32),
         blocks=np.ascontiguousarray(data["blocks"], dtype=np.uint32),
-        gates=np.ascontiguousarray(data["gates"], dtype=np.float64),
-        codes=np.ascontiguousarray(data["codes"], dtype=np.float64),
+        gates=np.ascontiguousarray(data["gates"], dtype=np.float32),
+        codes=np.ascontiguousarray(data["codes"], dtype=np.float32),
         gamma=float(data["gamma"]),
-        block_utilization=np.ascontiguousarray(data["block_utilization"], dtype=np.float64),
-        block_stable_rank=np.ascontiguousarray(data["block_stable_rank"], dtype=np.float64),
+        block_utilization=np.ascontiguousarray(data["block_utilization"], dtype=np.float32),
+        block_stable_rank=np.ascontiguousarray(data["block_stable_rank"], dtype=np.float32),
         matryoshka_prefix_losses=tuple(
             (int(prefix_k), float(loss)) for prefix_k, loss in data["matryoshka_prefix_losses"]
         ),
-        fitted=np.ascontiguousarray(data["fitted"], dtype=np.float64),
+        fitted=np.ascontiguousarray(data["fitted"], dtype=np.float32),
         explained_variance=float(data["explained_variance"]),
         epochs=int(data["epochs"]),
         convergence=BlockSparseDictionaryConvergence(
             ev_residual=float(convergence["ev_residual"]),
             gamma_residual=float(convergence["gamma_residual"]),
             frame_residual=float(convergence["frame_residual"]),
-            routing_residual=float(convergence["routing_residual"]),
-            reconstruction_residual=float(convergence["reconstruction_residual"]),
-            accepted_births=int(convergence["accepted_births"]),
-            polar_failures=int(convergence["polar_failures"]),
             tolerance=float(convergence["tolerance"]),
-            corpus_rows=int(np.asarray(data["blocks"]).shape[0]),
         ),
         block_topk=int(data["block_topk"]),
         block_size=int(data["block_size"]),
@@ -970,9 +937,7 @@ class BlockSparseStreamArtifact:
         Shared tied-encoder scalar ``γ``.
     block_utilization, block_stable_rank:
         Length-``G`` per-block report from the final epoch.
-    convergence:
-        Actual final-epoch residuals, tolerance, births and corpus provenance.
-    block_topk, block_size, epochs, explained_variance:
+    block_topk, block_size, epochs, explained_variance, converged:
         Run metadata.
     """
 
@@ -984,7 +949,7 @@ class BlockSparseStreamArtifact:
     block_stable_rank: np.ndarray
     epochs: int
     explained_variance: float
-    convergence: BlockSparseStreamConvergence
+    converged: bool
 
     @property
     def n_blocks(self) -> int:
@@ -1007,33 +972,28 @@ class BlockSparseStreamArtifact:
         plus the sample's routing/reconstruction — so the ENTIRE block->chart
         seeding surface (``block_frame`` / ``block_coords`` / ``project_residual`` /
         ``block_seeds`` / ``seed_manifest`` …) is available on a streamed fit.
-
-        The convergence certificate and explained variance continue to describe
-        the final complete streaming epoch, not a new fit to ``X``. Streaming
-        measures no prefix-loss ladder, so that report is explicitly empty.
         """
-        x = _as_2d(X, "X", np.float64)
+        x = _as_2d_f32(X, "X")
         blocks, gates, codes = self.transform(x)
         b = self.block_size
         fitted = rust_module().block_sparse_dictionary_reconstruct_ffi(
             self.decoder,
             np.ascontiguousarray(blocks, dtype=np.uint32),
-            np.ascontiguousarray(codes, dtype=np.float64),
+            np.ascontiguousarray(codes, dtype=np.float32),
             int(b),
         )
         return BlockSparseDictionaryFit(
-            decoder=np.ascontiguousarray(self.decoder, dtype=np.float64),
+            decoder=np.ascontiguousarray(self.decoder, dtype=np.float32),
             blocks=blocks,
             gates=gates,
             codes=codes,
             gamma=float(self.gamma),
-            block_utilization=np.ascontiguousarray(self.block_utilization, dtype=np.float64),
-            block_stable_rank=np.ascontiguousarray(self.block_stable_rank, dtype=np.float64),
-            matryoshka_prefix_losses=(),
+            block_utilization=np.ascontiguousarray(self.block_utilization, dtype=np.float32),
+            block_stable_rank=np.ascontiguousarray(self.block_stable_rank, dtype=np.float32),
             fitted=np.ascontiguousarray(fitted),
             explained_variance=float(self.explained_variance),
             epochs=int(self.epochs),
-            convergence=self.convergence,
+            converged=bool(self.converged),
             block_topk=int(self.block_topk),
             block_size=int(b),
         )
@@ -1065,7 +1025,7 @@ class BlockSparseDictStream:
     ----------
     seed:
         A representative ``N_seed x P`` sample fixing ``P`` and seeding the initial
-        block frames (deterministic farthest-point + orthonormalisation).
+        block frames (centred, evenly distributed data rows + orthonormalisation).
     n_blocks, block_size, block_topk, max_epochs, minibatch, block_tile, frame_ridge, aux_k, tolerance:
         Identical hyper-parameters to :func:`block_sparse_dictionary_fit`.
     """
@@ -1084,7 +1044,7 @@ class BlockSparseDictStream:
         aux_k: int = 0,
         tolerance: float = 1.0e-6,
     ) -> None:
-        seed_arr = _as_2d(seed, "seed", np.float64)
+        seed_arr = _as_2d_f32(seed, "seed")
         if block_size > seed_arr.shape[1]:
             raise ValueError(
                 f"block_size={block_size} cannot exceed P={seed_arr.shape[1]}"
@@ -1108,7 +1068,7 @@ class BlockSparseDictStream:
         including :class:`ShardReader` ``batches(n)`` blocks. Returns
         ``{rows, rss, alive_blocks}`` (``alive_blocks`` cumulative since the last
         :meth:`end_epoch`)."""
-        shard_arr = _as_2d(shard, "shard", np.float64)
+        shard_arr = _as_2d_f32(shard, "shard")
         return dict(self._handle.partial_fit(shard_arr))
 
     def end_epoch(self) -> dict[str, Any]:
@@ -1143,31 +1103,22 @@ class BlockSparseDictStream:
         """Hand back the trained block frames + γ + per-block report as a
         :class:`BlockSparseStreamArtifact`."""
         data = dict(self._handle.finalize())
-        convergence = dict(data["convergence"])
         return BlockSparseStreamArtifact(
-            decoder=np.ascontiguousarray(data["decoder"], dtype=np.float64),
+            decoder=np.ascontiguousarray(data["decoder"], dtype=np.float32),
             gamma=float(data["gamma"]),
             block_topk=int(data["block_topk"]),
             block_size=int(data["block_size"]),
-            block_utilization=np.ascontiguousarray(data["block_utilization"], dtype=np.float64),
-            block_stable_rank=np.ascontiguousarray(data["block_stable_rank"], dtype=np.float64),
+            block_utilization=np.ascontiguousarray(data["block_utilization"], dtype=np.float32),
+            block_stable_rank=np.ascontiguousarray(data["block_stable_rank"], dtype=np.float32),
             epochs=int(data["epochs"]),
             explained_variance=float(data["explained_variance"]),
-            convergence=BlockSparseStreamConvergence(
-                ev_residual=float(convergence["ev_residual"]),
-                gamma_residual=float(convergence["gamma_residual"]),
-                frame_residual=float(convergence["frame_residual"]),
-                tolerance=float(convergence["tolerance"]),
-                accepted_births=int(convergence["accepted_births"]),
-                corpus_rows=int(convergence["corpus_rows"]),
-                epoch=int(convergence["epoch"]),
-            ),
+            converged=bool(data["converged"]),
         )
 
     @property
     def decoder(self) -> np.ndarray:
         """A live copy of the current warm-started block frames (``K x P``)."""
-        return np.ascontiguousarray(self._handle.decoder(), dtype=np.float64)
+        return np.ascontiguousarray(self._handle.decoder(), dtype=np.float32)
 
     @property
     def gamma(self) -> float:
@@ -1289,7 +1240,7 @@ def sparse_dictionary_fit(
         to the exact CPU router otherwise. Use ``"required"`` to fail closed
         instead of falling back, or ``"off"`` for deliberate CPU-only runs.
     """
-    x = _as_2d(X, "X", np.float32)
+    x = _as_2d_f32(X, "X")
     payload = rust_module().sparse_dictionary_fit(
         x,
         int(K),
@@ -1369,7 +1320,6 @@ def rank_charge_dof(
 __all__ = [
     "BlockSparseDictStream",
     "BlockSparseDictionaryConvergence",
-    "BlockSparseStreamConvergence",
     "BlockSparseDictionaryFit",
     "BlockSparseStreamArtifact",
     "SparseDictStream",

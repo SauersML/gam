@@ -580,9 +580,9 @@ def test_predict_point_estimate_is_invariant_to_interval_request() -> None:
     whether the caller asked for an uncertainty band. Requesting an interval
     may only *add* the ``std_error`` / ``mean_lower`` / ``mean_upper`` columns;
     it must not move ``mean`` or ``linear_predictor``. Before the fix the
-    interval branch silently enabled the smoothing-shrinkage bias correction
-    (``apply_bias_correction``), recentring η by ``X·H⁻¹Sβ̂`` so the reported
-    point estimate shifted the moment an interval was requested.
+    interval branch silently enabled a frequentist de-shrinkage of the centre
+    (since deleted, #2670), recentring η by ``X·H⁻¹Sβ̂`` so the reported point
+    estimate shifted the moment an interval was requested.
 
     The shift is checked across several families/links (identity-link Gaussian
     is the cleanest: there is no link nonlinearity to justify any correction),

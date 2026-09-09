@@ -493,7 +493,6 @@ pub fn assemble_standard_payload(
         design,
         resolvedspec,
         basis_adequacy,
-        adaptive_diagnostics,
         saved_link_state,
         wiggle_knots,
         wiggle_degree,
@@ -519,7 +518,7 @@ pub fn assemble_standard_payload(
         .likelihood_family
         .clone()
         .ok_or_else(|| {
-            "standard fit is missing its likelihood family; refusing to save an unknown response scale"
+            "standard fit reached payload assembly without its resolved likelihood family"
                 .to_string()
         })?;
     let estimator = expectile_tau_for_config(fit_config)
@@ -575,7 +574,6 @@ pub fn assemble_standard_payload(
     }
     payload.set_training_feature_metadata(dataset.headers.clone(), dataset.feature_ranges());
     payload.resolved_termspec = Some(resolved_termspec);
-    payload.adaptive_regularization_diagnostics = adaptive_diagnostics;
     payload.basis_adequacy = basis_adequacy;
     payload.offset_column = fit_config.offset_column.clone();
     payload.noise_offset_column = fit_config.noise_offset_column.clone();
@@ -2934,7 +2932,6 @@ mod standard_payload_penalty_topology_tests {
         else {
             panic!("flexible-link formula did not produce a standard fit");
         };
-
         let mean_dim = result.design.design.ncols();
         let raw_dim = result
             .fit
@@ -2947,7 +2944,11 @@ mod standard_payload_penalty_topology_tests {
         assert_eq!(raw_dim, 17, "fixture must reproduce #2748's 6 -> 17 join");
         let expected_family =
             LikelihoodSpec::new(ResponseFamily::Binomial, InverseLink::Standard(link));
-        assert_eq!(result.fit.likelihood_family.as_ref(), Some(&expected_family));
+        assert_eq!(
+            result.fit.likelihood_family.as_ref(),
+            Some(&expected_family),
+            "the custom link-wiggle solve must retain the response likelihood",
+        );
 
         let payload = assemble_standard_payload(StandardPayloadInputs {
             formula: formula.to_string(),

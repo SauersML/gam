@@ -1474,96 +1474,6 @@ def _thread3_cliff_gradient_magnitude(
     return None if values is None else np.asarray(values, dtype=float)
 
 
-def _extract_thread3_adaptive_fold_metrics(model_payload: dict[str, typing.Any] | None, ds: dict[str, typing.Any]) -> dict[str, typing.Any]:
-    if not isinstance(model_payload, dict):
-        return {}
-    diag = model_payload.get("adaptive_regularization_diagnostics")
-    if not isinstance(diag, dict):
-        return {}
-    out: dict[str, float | int | bool] = {}
-    mm_iter = diag.get("mm_iterations")
-    if isinstance(mm_iter, (int, float)):
-        out["mm_iterations"] = int(mm_iter)
-    converged = diag.get("converged")
-    if isinstance(converged, bool):
-        out["adaptive_converged"] = converged
-
-    maps = diag.get("maps")
-    if not isinstance(maps, list):
-        return out
-
-    def _json_ndarray(value: typing.Any) -> typing.Any:
-        if isinstance(value, dict) and isinstance(value.get("data"), list):
-            arr = np.asarray(value.get("data"), dtype=float)
-            dim = value.get("dim")
-            if isinstance(dim, list) and dim:
-                try:
-                    shape = tuple(int(d) for d in dim)
-                    if int(np.prod(shape, dtype=np.int64)) == int(arr.size):
-                        return arr.reshape(shape)
-                except Exception:
-                    pass
-            return arr
-        return np.asarray(value, dtype=float)
-
-    corr_rows = []
-    for m in maps:
-        if not isinstance(m, dict):
-            continue
-        try:
-            feature_cols = [int(x) for x in (m.get("feature_cols") or [])]
-            points = _json_ndarray(m.get("collocation_points"))
-            inv_g = _json_ndarray(m.get("inv_grad_weight")).reshape(-1)
-            inv_c = _json_ndarray(m.get("inv_lap_weight")).reshape(-1)
-        except Exception:
-            continue
-        if points.ndim != 2 or points.shape[0] == 0:
-            continue
-        if points.shape[0] != inv_g.shape[0] or points.shape[0] != inv_c.shape[0]:
-            continue
-        grad_mag = _thread3_cliff_gradient_magnitude(points, feature_cols=feature_cols, ds=ds)
-        if grad_mag is None or grad_mag.shape[0] != points.shape[0]:
-            continue
-        with np.errstate(divide="ignore", invalid="ignore"):
-            sens_g = np.where(inv_g > 0.0, 1.0 / inv_g, np.nan)
-            sens_c = np.where(inv_c > 0.0, 1.0 / inv_c, np.nan)
-        corr_rows.append(
-            {
-                "n": int(points.shape[0]),
-                "corr_g": _rank_corr(sens_g, grad_mag),
-                "corr_c": _rank_corr(sens_c, grad_mag),
-            }
-        )
-
-    if corr_rows:
-        denom_parts: list[int] = []
-        valid_g: list[tuple[float, int]] = []
-        valid_c: list[tuple[float, int]] = []
-        for row in corr_rows:
-            n_raw = row.get("n")
-            if n_raw is None:
-                continue
-            n_int = int(n_raw)
-            denom_parts.append(n_int)
-            corr_g = row.get("corr_g")
-            if corr_g is not None:
-                valid_g.append((float(corr_g), n_int))
-            corr_c = row.get("corr_c")
-            if corr_c is not None:
-                valid_c.append((float(corr_c), n_int))
-        denom = max(sum(denom_parts), 1)
-        if valid_g:
-            out["thread3_weight_grad_corr"] = float(
-                sum(v * w for v, w in valid_g) / max(sum(w for _, w in valid_g), 1)
-            )
-        if valid_c:
-            out["thread3_weight_curvature_corr"] = float(
-                sum(v * w for v, w in valid_c) / max(sum(w for _, w in valid_c), 1)
-            )
-        out["thread3_collocation_points"] = int(denom)
-    return out
-
-
 def _rust_native_survival_matrix_from_model(
     *,
     rust_bin: Path,
@@ -1649,8 +1559,6 @@ def run_rust_scenario_cv(
     rust_cfg_override: dict[str, typing.Any] | None = None,
     eval_ood: bool = False,
     collect_continuous_order: bool = False,
-    collect_adaptive_diagnostics: bool = False,
-    adaptive_regularization: bool = False,
     formula_link: str | None = None,
 ) -> typing.Any:
     scenario_name = scenario["name"]
@@ -1680,7 +1588,6 @@ def run_rust_scenario_cv(
     eval_suffix = _evaluation_suffix(folds)
     ood_rows = []
     continuous_rows = []
-    adaptive_rows = []
     rust_cfg = _effective_scenario_fit_mapping(scenario_name, rust_cfg_override) or {}
     smooth_cols = list(rust_cfg.get("smooth_cols") or ([rust_cfg["smooth_col"]] if "smooth_col" in rust_cfg else []))
     linear_cols = list(rust_cfg.get("linear_cols", []))
@@ -1733,7 +1640,6 @@ def run_rust_scenario_cv(
                     train_df,
                     formula,
                     family=_family,
-                    adaptive_regularization=adaptive_regularization,
                 )
                 fit_sec = perf_counter() - t0
             except Exception as e:
@@ -1829,11 +1735,6 @@ def run_rust_scenario_cv(
                     co = _compute_continuous_order_from_lambdas(lambdas[:3], normalization_scale=[1.0, 1.0, 1.0], eps=1e-12)
                     co["n_test"] = int(len(fold.test_idx))
                     continuous_rows.append(co)
-            if collect_adaptive_diagnostics:
-                adaptive_row = _extract_thread3_adaptive_fold_metrics(model_payload, ds)
-                if adaptive_row:
-                    adaptive_row["n_test"] = int(len(fold.test_idx))
-                    adaptive_rows.append(adaptive_row)
 
             try:
                 pred, pred_sec = _time_stable_mean_prediction(
@@ -2089,48 +1990,6 @@ def run_rust_scenario_cv(
             mode = str(metrics["continuous_order_status_mode"])
             metrics["continuous_order_boundary_ok"] = bool(mode in {str(x) for x in expected})
             metrics["continuous_order_expected_statuses"] = [str(x) for x in expected]
-    if adaptive_rows:
-        mm_vals = [(int(r["mm_iterations"]), int(r["n_test"])) for r in adaptive_rows if "mm_iterations" in r]
-        if mm_vals:
-            metrics["mm_iterations"] = float(
-                sum(v * w for v, w in mm_vals) / max(sum(w for _, w in mm_vals), 1)
-            )
-        conv_vals = [
-            (1.0 if bool(r.get("adaptive_converged")) else 0.0, int(r["n_test"]))
-            for r in adaptive_rows
-            if "adaptive_converged" in r
-        ]
-        if conv_vals:
-            metrics["adaptive_converged_rate"] = float(
-                sum(v * w for v, w in conv_vals) / max(sum(w for _, w in conv_vals), 1)
-            )
-        grad_corr = [
-            (float(r["thread3_weight_grad_corr"]), int(r["n_test"]))
-            for r in adaptive_rows
-            if "thread3_weight_grad_corr" in r
-        ]
-        curv_corr = [
-            (float(r["thread3_weight_curvature_corr"]), int(r["n_test"]))
-            for r in adaptive_rows
-            if "thread3_weight_curvature_corr" in r
-        ]
-        if grad_corr:
-            metrics["thread3_weight_grad_corr"] = float(
-                sum(v * w for v, w in grad_corr) / max(sum(w for _, w in grad_corr), 1)
-            )
-        if curv_corr:
-            metrics["thread3_weight_curvature_corr"] = float(
-                sum(v * w for v, w in curv_corr) / max(sum(w for _, w in curv_corr), 1)
-            )
-        colloc_rows = [
-            (int(r["thread3_collocation_points"]), int(r["n_test"]))
-            for r in adaptive_rows
-            if "thread3_collocation_points" in r
-        ]
-        if colloc_rows:
-            metrics["thread3_collocation_points"] = float(
-                sum(v * w for v, w in colloc_rows) / max(sum(w for _, w in colloc_rows), 1)
-            )
     return _finalize_cv_result(
         contender=contender_name,
         scenario_name=scenario_name,
@@ -3293,40 +3152,6 @@ def main() -> None:
                             folds=folds,
                             shared_fold_artifacts=shared_fold_artifacts,
                             rust_cfg_override={"double_penalty": True},
-                            formula_link=_flexible_link_name(
-                                _default_rust_formula_link_for_family(ds["family"])
-                            ),
-                        ),
-                    )
-                _append_contender_result_if_enabled(
-                    results,
-                    s_cfg,
-                    "rust_thread3_adaptive_reml",
-                    lambda: run_rust_scenario_cv(
-                        s_cfg,
-                        contender_name="rust_thread3_adaptive_reml",
-                        ds=ds,
-                        folds=folds,
-                        shared_fold_artifacts=shared_fold_artifacts,
-                        rust_cfg_override={"double_penalty": True},
-                        collect_adaptive_diagnostics=True,
-                        adaptive_regularization=True,
-                    ),
-                )
-                if ds["family"] == "binomial":
-                    _append_contender_result_if_enabled(
-                        results,
-                        s_cfg,
-                        "rust_thread3_adaptive_reml_flexible",
-                        lambda: run_rust_scenario_cv(
-                            s_cfg,
-                            contender_name="rust_thread3_adaptive_reml_flexible",
-                            ds=ds,
-                            folds=folds,
-                            shared_fold_artifacts=shared_fold_artifacts,
-                            rust_cfg_override={"double_penalty": True},
-                            collect_adaptive_diagnostics=True,
-                            adaptive_regularization=True,
                             formula_link=_flexible_link_name(
                                 _default_rust_formula_link_for_family(ds["family"])
                             ),

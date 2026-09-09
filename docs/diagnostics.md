@@ -136,7 +136,7 @@ that combination produces a confidently significant false association. Read
 
 ## diagnose()
 
-```python
+```text
 diag = model.diagnose(data, *, y=None, interval=0.95)
 ```
 
@@ -202,11 +202,22 @@ v.supported_by_python      # bool
 ```
 
 Returns a `FormulaValidation` dataclass that wraps the parsed payload.
-Accepts parser/materialization keyword arguments from `gamfit.fit`
-(family, offset, weights, transformation/survival/baseline settings,
-`z_column`, link, slope formula, frailty, hazard loading, dimension
-scaling, adaptive regularization, Firth, and `config`) but does no
-fitting.
+
+Accepts these parser/materialization keyword arguments from `gamfit.fit`,
+with the same semantics, and does no fitting:
+`family`, `offset`, `weights`, `persistent_warm_start_root`,
+`transformation_normal`, `transformation_normal_stage1`,
+`survival_likelihood`, `survival_time_anchor`, `baseline_target`,
+`baseline_scale`, `baseline_shape`, `baseline_rate`, `baseline_makeham`,
+`z_column`, `link`, `slope_formula`, `frailty_kind`, `frailty_sd`,
+`hazard_loading`, `scale_dimensions`, `firth`, `noise_formula`,
+`noise_offset`, `flexible_link`, `config`.
+
+The list is exact: `validate_formula_docs_list_is_the_signature` in
+`tests/test_validate_formula_docs_kwargs_match_signature.py` fails if it
+drifts from the signature in either direction. It deliberately excludes the
+fit-only objects `constraints`, `latents`, `penalties`, `smooths`,
+`precision_hyperpriors` and `response_geometry`, which validation refuses.
 
 ## plot()
 

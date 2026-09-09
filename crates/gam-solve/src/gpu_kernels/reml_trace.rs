@@ -1303,9 +1303,15 @@ mod tests {
 
     #[test]
     fn splitmix_is_deterministic_and_disperses() {
-        // Self-consistency: same input → same output, and a few near-by
-        // inputs land in distinct buckets (no trivial collisions).
-        assert_eq!(splitmix64_mix(42), splitmix64_mix(42));
+        // Known-answer vectors computed independently from the SplitMix64
+        // definition (Steele, Lea & Flood 2014: add 0x9E3779B97F4A7C15, then
+        // the two xor-shift-multiplies 0xBF58476D1CE4E5B9 / 0x94D049BB133111EB
+        // and a final `z ^ (z >> 31)`). The input-0 value is the generator's
+        // published first output for seed 0, which anchors the other three.
+        assert_eq!(splitmix64_mix(0), 0xe220_a839_7b1d_cdaf);
+        assert_eq!(splitmix64_mix(1), 0x910a_2dec_8902_5cc1);
+        assert_eq!(splitmix64_mix(42), 0xbdd7_3226_2feb_6e95);
+        assert_eq!(splitmix64_mix(u64::MAX), 0xe4d9_7177_1b65_2c20);
         let mut bits_seen = 0u64;
         for x in 0u64..64 {
             bits_seen |= splitmix64_mix(x);

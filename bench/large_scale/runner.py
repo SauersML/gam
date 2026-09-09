@@ -1256,7 +1256,29 @@ def heartbeat_loop(proc: subprocess.Popen[bytes], cmd_preview: str, stop_event: 
             break
 
 
+def _with_gam_instrumentation_level(cmd: list[str]) -> list[str]:
+    """Ask the gam CLI for the log level this runner's phase summary parses.
+
+    Every aggregator in `_emit_phase_summary` reads `log::info!` markers
+    (`[OUTER hessian-route]`, `[KAPPA-PHASE`, `[STAGE] outer eval end`, the
+    `[PIRLS ...]` family). The CLI logs at its quiet `Warn` default unless it
+    is asked otherwise, so without this the marker buffer is EMPTY on every
+    real run and every one of those aggregations is silently inert — the exact
+    failure gam#2617 was about, reintroduced through the invocation instead of
+    through the filter. It is also what left a 40-minute large-scale CTN
+    timeout with nothing in the log but this runner's own heartbeat (gam#979).
+
+    Idempotent, and it never overrides a level a caller asked for.
+    """
+    if not cmd or Path(cmd[0]).name != "gam":
+        return list(cmd)
+    if any(arg == "--log-level" or arg.startswith("--log-level=") for arg in cmd):
+        return list(cmd)
+    return [cmd[0], "--log-level", "info", *cmd[1:]]
+
+
 def run_cmd_stream(cmd: list[str], cwd: Path | None = None) -> tuple[int, str, str]:
+    cmd = _with_gam_instrumentation_level(cmd)
     proc = subprocess.Popen(
         cmd,
         cwd=str(cwd) if cwd is not None else None,
@@ -3056,8 +3078,6 @@ def run_rust_survival(spec: MethodSpec, train_csv: Path, test_csv: Path, out_dir
             "3",
             "--time-num-internal-knots",
             "8",
-            "--time-smooth-lambda",
-            "0.01",
             "--out",
             str(model_path),
         ]

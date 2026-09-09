@@ -903,14 +903,39 @@ pub struct SmoothCollectionGauge {
     /// term reached the splice one column short and every κ fixture on a Duchon
     /// term refused in 0.2 s.
     ///
-    /// `None` means the term-local build applied no chart of its own — the usual
-    /// case for the radial families, whose `OrthogonalToParametric` policy defers
-    /// entirely to this gauge.
+    /// `None` means the term-local build applied no chart of its own. The radial
+    /// families under `OrthogonalToParametric` defer entirely to this gauge and
+    /// report an identity placeholder instead (`freeze_raw_spatial_metadata`), so
+    /// for them this is `Some(I)`; either way it carries no rotation.
     ///
     /// Like `C` and the arm, this is ψ-INDEPENDENT: it is a center-space
     /// constraint (`1ᵀα = 0`, a linear-orthogonality frame) or a frozen replay
     /// chart, never a function of the realized design.
     pub local_identifiability_transform: Option<Array2<f64>>,
+    /// The stage-2 joint-null absorption rotation `Q` the collection applied to
+    /// this term's TERM-LOCAL build BEFORE it derived
+    /// [`Self::coefficient_transform`] (gam#2760).
+    ///
+    /// The aggregation loop rotates the local design and penalties by `Q`, and
+    /// `T0` is then derived on `X_local · Q`, so the complete fixed map from the
+    /// local build's own coordinates to the collection's is `Q · T0`. Once the
+    /// gauge has composed `Q · T0` into the term's metadata the term reports
+    /// `None` for its own rotation, and `Q` cannot be recovered from the
+    /// composition, so it travels here: a moving-ψ replay rebuilds in the local
+    /// chart above, applies `Q`, and only then the fixed `T0` — the order the
+    /// collection used.
+    ///
+    /// Measured before this existed, on the `kappa_loop_n_scaling` Duchon spec
+    /// at the fit's OWN length scale: the replay put the unrotated block through
+    /// the chart derived on the rotated one, every design column and every
+    /// penalty block came out wrong (`‖ΔS‖_F/‖S‖_F` 0.69–1.41, nullities
+    /// `[1,10,0,0,1] → [4,10,2,1,3]`), and the criterion sat 679 above the
+    /// collection's at n = 1000 — the "route agreement" gap the joint κ search
+    /// was then minimizing against.
+    ///
+    /// ψ-INDEPENDENT like the rest of this gauge: an orthogonal chart chosen once
+    /// at the reference realization and never re-derived.
+    pub joint_null_rotation: Option<crate::basis::JointNullRotation>,
     /// The collection coefficient chart derived at the fit's reference
     /// realization, in TERM-LOCAL coefficient coordinates.
     ///
@@ -2765,27 +2790,6 @@ pub struct StandardLatentCoordConfig {
     pub analytic_penalties: Option<std::sync::Arc<crate::AnalyticPenaltyRegistry>>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct AdaptiveSpatialMap {
-    pub termname: String,
-    pub feature_cols: Vec<usize>,
-    pub collocation_points: Array2<f64>,
-    pub inv_magweight: Array1<f64>,
-    pub invgradweight: Array1<f64>,
-    pub inv_lapweight: Array1<f64>,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct AdaptiveRegularizationDiagnostics {
-    pub epsilon_0: f64,
-    pub epsilon_g: f64,
-    pub epsilon_c: f64,
-    pub epsilon_outer_iterations: usize,
-    pub mm_iterations: usize,
-    pub converged: bool,
-    pub maps: Vec<AdaptiveSpatialMap>,
-}
-
 #[derive(Debug, Clone)]
 pub struct LinearColumnConditioning {
     col_idx: usize,
@@ -3425,16 +3429,21 @@ pub fn spatial_term_uses_per_axis_psi(resolvedspec: &TermCollectionSpec, term_id
         return false;
     };
     match &term.basis {
+        // gam#2760 — enrollment is a property of the MODEL, so it must not read
+        // `joint_null_rotation`. That field records whether the spec at hand
+        // asks its local build to apply the stage-2 rotation `Q`, which is a
+        // property of the REALIZATION PATH: the collection clears it once it
+        // composes `Q·T0` into the gauge, and a ψ-replay spec carries it so the
+        // local build reproduces the collection's block. The θ layout is sized
+        // from the resolved spec and the hyper-directions are built from the
+        // realizer's, so a predicate that reads the field answers `d` on one and
+        // `1` on the other and the joint route refuses on the shape mismatch
+        // (`psi_dim=6, hyper_dirs=1` on every `--scale-dimensions` Duchon fit).
+        // `Q` is instead applied where it belongs, by the per-axis producer
+        // (`AnisoBasisPsiDerivatives::rotated_by_joint_null`), exactly as the
+        // isotropic arm has always applied it.
         SmoothBasisSpec::Duchon { spec, .. } => {
-            // A joint null rotation `Q` has to be applied to every ψ-derivative
-            // block — the isotropic arm does it explicitly in
-            // `try_build_spatial_term_log_kappa_derivative`. The per-axis
-            // consumer does not, so a rotated Duchon term stays isotropic
-            // rather than shipping an unrotated per-axis derivative against a
-            // rotated design. (The anisotropic Matérn has the same gap; it is
-            // pre-existing and not touched here.)
-            term.joint_null_rotation.is_none()
-                && crate::basis::duchon_spec_supports_axis_psi(spec, d)
+            crate::basis::duchon_spec_supports_axis_psi(spec, d)
         }
         _ => true,
     }
@@ -8862,11 +8871,26 @@ pub fn build_smooth_design_withworkspace_unvalidated(
             "joint spatial center planner returned no smooth blocks".to_string(),
         )
     })?;
+    build_smooth_design_from_planned_terms(data, &planned_terms, workspace)
+}
+
+/// Build smooth terms after the sweep-level spatial planner has already run.
+///
+/// Joint model construction plans all response blocks together so compatible
+/// spatial terms share one center selection. Re-entering the ordinary builder
+/// used to plan each block a second time, repeating feature standardization,
+/// center selection, and automatic length-scale initialization before every
+/// block build.
+pub fn build_smooth_design_from_planned_terms(
+    data: ArrayView2<'_, f64>,
+    planned_terms: &[SmoothTermSpec],
+    workspace: &mut crate::basis::BasisWorkspace,
+) -> Result<RawSmoothDesign, BasisError> {
     let policy = workspace.policy().clone();
     let local_builds: Vec<LocalSmoothTermBuild> = {
-        use rayon::iter::{IntoParallelIterator, ParallelIterator};
+        use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
         planned_terms
-            .into_par_iter()
+            .par_iter()
             .map(|term| {
                 let mut term_workspace = crate::basis::BasisWorkspace::with_policy(policy.clone());
                 build_single_local_smooth_term(data, &term, &mut term_workspace)
@@ -8878,7 +8902,7 @@ pub fn build_smooth_design_withworkspace_unvalidated(
 
     let mut local_designs: Vec<DesignMatrix> = Vec::with_capacity(local_builds.len());
     let mut affine_offset = Array1::<f64>::zeros(data.nrows());
-    let mut terms_out = Vec::<SmoothTerm>::with_capacity(terms.len());
+    let mut terms_out = Vec::<SmoothTerm>::with_capacity(planned_terms.len());
     let mut penalties_global = Vec::<BlockwisePenalty>::new();
     let mut nullspace_dims_global = Vec::<usize>::new();
     let mut penaltyinfo_global = Vec::<PenaltyBlockInfo>::new();
@@ -8893,7 +8917,7 @@ pub fn build_smooth_design_withworkspace_unvalidated(
     let mut linear_constraints_b: Vec<f64> = Vec::new();
 
     let mut col_start = 0usize;
-    for (term, mut built) in terms.iter().zip(local_builds.into_iter()) {
+    for (term, mut built) in planned_terms.iter().zip(local_builds.into_iter()) {
         let p_local = built.dim;
         let col_end = col_start + p_local;
         let lb_local = if built.box_reparam {

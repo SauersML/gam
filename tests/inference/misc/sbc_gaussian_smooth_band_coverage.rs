@@ -144,7 +144,6 @@ fn confidence_band(fit: &FitResult, level: f64) -> (Array1<f64>, Array1<f64>) {
         covariance_mode: InferenceCovarianceMode::SmoothingCorrected,
         mean_interval_method: MeanIntervalMethod::TransformEta,
         includeobservation_interval: false,
-        apply_bias_correction: false,
         edgeworth_one_sided: false,
         boundary_correction: false,
         ..PredictUncertaintyOptions::default()

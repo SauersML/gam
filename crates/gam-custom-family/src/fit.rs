@@ -2889,15 +2889,6 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
         let objective = eval_result.objective;
         let gradient = eval_result.gradient;
         let outer_hessian = eval_result.outer_hessian;
-        outer.last_criterion_resolution = Some(
-            f64::EPSILON
-                * (1.0
-                    + eval_result
-                        .criterion_components
-                        .iter()
-                        .map(|c| c.abs())
-                        .sum::<f64>()),
-        );
         let mode = CustomFamilyOwnedMode {
             objective,
             // `pullback_labeled_outer_eval` has already made `rho` the
@@ -3133,7 +3124,6 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
         outer.seed_cached_beta(n_rho, specs, beta)
     })
     .with_exact_polish(CustomOuterState::begin_exact_polish)
-    .with_criterion_resolution(|outer: &mut CustomOuterState| outer.last_criterion_resolution)
     // EFS may discover the optimum, but only the labeled analytic evaluator
     // owns the exact objective/gradient/coefficient-mode identity consumed by
     // fit assembly. Force the runner's final full-fidelity installation
@@ -3727,16 +3717,31 @@ fn fit_custom_family_fixed_log_lambdas_from_owned_mode_with_provenance<
                 selected_theta,
                 outer,
             } => {
+                // The curvature question is answered by the certificate's own
+                // verdict, the object the outer search accepted the point on —
+                // not by the raw analytic flag. An analytic negative direction the
+                // criterion CONTRADICTED (probed along its eigenvector at every
+                // scale down to the criterion's resolution and found not to
+                // descend, #2612) is a minimum as far as the objective can tell;
+                // refusing it on the flag alone took a fit the outer had
+                // certified and threw it away one call later (gam#2765).
+                // Inadmissible curvature and unevaluated curvature are still
+                // refused: the first is a saddle, the second is no evidence.
                 if matches!(
                     curvature_requirement,
                     OwnedModeCurvatureRequirement::CertifiedLocalMinimum
-                ) && outer.criterion_certificate().hessian_psd() != Some(true)
-                {
+                ) && !matches!(
+                    outer.criterion_certificate().curvature_verdict(),
+                    gam_solve::model_types::CurvatureAdmissibility::Admissible
+                        | gam_solve::model_types::CurvatureAdmissibility::CriterionContradicted
+                ) {
                     return Err(CustomFamilyError::Optimization {
                         context:
                             "fit_custom_family_fixed_log_lambdas_from_owned_mode outer curvature",
-                        reason: "a profiled nonconvex coefficient mode requires a positive-semidefinite analytic outer Hessian certificate"
-                            .to_string(),
+                        reason: format!(
+                            "a profiled nonconvex coefficient mode requires an outer curvature certificate that admits a local minimum; this one is {}",
+                            outer.criterion_certificate().curvature_verdict()
+                        ),
                     });
                 }
                 if selected_theta.len() != outer.rho().len()

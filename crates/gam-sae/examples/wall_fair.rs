@@ -236,7 +236,7 @@ fn load_even_rows(
     path: &Path,
     take: usize,
     phase: u64,
-) -> Result<(Array2<f64>, Vec<usize>), String> {
+) -> Result<(Array2<f32>, Vec<usize>), String> {
     let mut file = File::open(path).map_err(|e| format!("open {}: {e}", path.display()))?;
     let header = read_npy_header(&mut file)?;
     let n_take = take.min(header.rows);
@@ -244,7 +244,7 @@ fn load_even_rows(
         .cols
         .checked_mul(std::mem::size_of::<f32>())
         .ok_or("row byte count overflow")?;
-    let mut out = Array2::<f64>::zeros((n_take, header.cols));
+    let mut out = Array2::<f32>::zeros((n_take, header.cols));
     let mut buf = vec![0u8; row_bytes];
     let stride = (header.rows / n_take.max(1)).max(1);
     let offset = (phase as usize) % stride;
@@ -257,7 +257,7 @@ fn load_even_rows(
             .map_err(|e| format!("read row {src_row}: {e}"))?;
         for c in 0..header.cols {
             let j = c * 4;
-            out[[i, c]] = f32::from_le_bytes([buf[j], buf[j + 1], buf[j + 2], buf[j + 3]]) as f64;
+            out[[i, c]] = f32::from_le_bytes([buf[j], buf[j + 1], buf[j + 2], buf[j + 3]]);
         }
     }
     Ok((out, vec![header.rows, header.cols]))
@@ -331,7 +331,7 @@ fn read_npy_header(file: &mut File) -> Result<NpyHeader, String> {
     })
 }
 
-fn peel_sink(x: &mut Array2<f64>, seed: u64, iterations: usize) -> f64 {
+fn peel_sink(x: &mut Array2<f32>, seed: u64, iterations: usize) -> f64 {
     let n = x.nrows();
     let p = x.ncols();
     let mut mean = vec![0.0f64; p];
@@ -346,7 +346,7 @@ fn peel_sink(x: &mut Array2<f64>, seed: u64, iterations: usize) -> f64 {
     let mut total = 0.0f64;
     for mut row in x.outer_iter_mut() {
         for c in 0..p {
-            row[c] -= mean[c] as f64;
+            row[c] -= mean[c] as f32;
             total += (row[c] as f64) * (row[c] as f64);
         }
     }
@@ -384,7 +384,7 @@ fn peel_sink(x: &mut Array2<f64>, seed: u64, iterations: usize) -> f64 {
     }
     for i in 0..n {
         for c in 0..p {
-            x[[i, c]] -= (scores[i] * v[c]) as f64;
+            x[[i, c]] -= (scores[i] * v[c]) as f32;
         }
     }
     sink_energy / total.max(1.0e-30)
@@ -397,7 +397,7 @@ fn normalize(v: &mut [f64]) {
     }
 }
 
-fn build_strata(x: &Array2<f64>) -> Vec<Stratum> {
+fn build_strata(x: &Array2<f32>) -> Vec<Stratum> {
     let mut bins: Vec<Vec<usize>> = vec![Vec::new(); 2048];
     let mut energies = vec![0.0f64; x.nrows()];
     for i in 0..x.nrows() {
@@ -474,7 +474,7 @@ fn sturges_cap(n: usize) -> usize {
 fn fit_stratum(
     label: &str,
     stratum: &Stratum,
-    x: &Array2<f64>,
+    x: &Array2<f32>,
     args: &Args,
 ) -> Result<Value, String> {
     let xs = take_rows(x, &stratum.rows);
@@ -589,8 +589,8 @@ fn block_config(n_blocks: usize, args: &Args) -> BlockSparseConfig {
     }
 }
 
-fn take_rows(x: &Array2<f64>, rows: &[usize]) -> Array2<f64> {
-    let mut out = Array2::<f64>::zeros((rows.len(), x.ncols()));
+fn take_rows(x: &Array2<f32>, rows: &[usize]) -> Array2<f32> {
+    let mut out = Array2::<f32>::zeros((rows.len(), x.ncols()));
     for (i, &row) in rows.iter().enumerate() {
         for c in 0..x.ncols() {
             out[[i, c]] = x[[row, c]];
@@ -599,7 +599,7 @@ fn take_rows(x: &Array2<f64>, rows: &[usize]) -> Array2<f64> {
     out
 }
 
-fn energy(x: &Array2<f64>) -> f64 {
+fn energy(x: &Array2<f32>) -> f64 {
     x.iter()
         .map(|&v| {
             let y = v as f64;
@@ -608,7 +608,7 @@ fn energy(x: &Array2<f64>) -> f64 {
         .sum()
 }
 
-fn energy_floor(target: &Array2<f64>, prediction: &Array2<f64>) -> f64 {
+fn energy_floor(target: &Array2<f32>, prediction: &Array2<f32>) -> f64 {
     let rss = target
         .iter()
         .zip(prediction.iter())
@@ -620,7 +620,7 @@ fn energy_floor(target: &Array2<f64>, prediction: &Array2<f64>) -> f64 {
     rss / energy(target).max(1.0e-30)
 }
 
-fn correction_proxy(base: &Array2<f64>, curved: &Array2<f64>, target_energy: f64) -> f64 {
+fn correction_proxy(base: &Array2<f32>, curved: &Array2<f32>, target_energy: f64) -> f64 {
     let e = base
         .iter()
         .zip(curved.iter())

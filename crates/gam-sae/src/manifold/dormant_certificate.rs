@@ -120,6 +120,7 @@ impl AtomOccupancy {
     pub fn n_active(&self) -> usize {
         self.active.len()
     }
+
 }
 
 /// Scalar fixed-point residuals of the ACTIVE state under one replayed alternation.
@@ -166,9 +167,9 @@ impl ActiveStateResiduals {
 pub struct DormantCapacityInputs<'a> {
     /// Candidate fixed-point frames, `K×P` with slot `g` occupying rows
     /// `[g·frame_dim, (g+1)·frame_dim)`.
-    pub frames: ArrayView2<'a, f64>,
+    pub frames: ArrayView2<'a, f32>,
     /// The frames produced by ONE replayed alternation from `frames` (same layout).
-    pub replayed_frames: ArrayView2<'a, f64>,
+    pub replayed_frames: ArrayView2<'a, f32>,
     /// Block size `b`: rows per capacity slot.
     pub frame_dim: usize,
     /// Ledger of the candidate iterate (from its own routing).
@@ -257,6 +258,7 @@ impl DormantCapacityCertificate {
     pub fn n_active(&self) -> usize {
         self.occupancy.n_active()
     }
+
 }
 
 /// Gauge-invariant Grassmann-projector displacement of ONE capacity slot between
@@ -266,16 +268,40 @@ impl DormantCapacityCertificate {
 /// invariant the block lane's whole-dictionary residual is built from — restricted
 /// here to a single slot so the max can range over the ACTIVE set only.
 fn slot_projector_residual(
-    previous: ArrayView2<'_, f64>,
-    next: ArrayView2<'_, f64>,
+    previous: ArrayView2<'_, f32>,
+    next: ArrayView2<'_, f32>,
     slot: usize,
     frame_dim: usize,
-) -> Result<f64, String> {
+) -> f64 {
     let base = slot * frame_dim;
-    crate::frames::stored_projector_distance(
-        previous.slice(ndarray::s![base..base + frame_dim, ..]),
-        next.slice(ndarray::s![base..base + frame_dim, ..]),
-    )
+    let mut previous_norm2 = 0.0_f64;
+    let mut next_norm2 = 0.0_f64;
+    let mut overlap = 0.0_f64;
+    for left in 0..frame_dim {
+        for right in 0..frame_dim {
+            let mut previous_dot = 0.0_f64;
+            let mut next_dot = 0.0_f64;
+            let mut cross_dot = 0.0_f64;
+            for column in 0..previous.ncols() {
+                previous_dot += previous[[base + left, column]] as f64
+                    * previous[[base + right, column]] as f64;
+                next_dot +=
+                    next[[base + left, column]] as f64 * next[[base + right, column]] as f64;
+                cross_dot +=
+                    previous[[base + left, column]] as f64 * next[[base + right, column]] as f64;
+            }
+            previous_norm2 += previous_dot * previous_dot;
+            next_norm2 += next_dot * next_dot;
+            overlap += cross_dot * cross_dot;
+        }
+    }
+    let scale = previous_norm2 + next_norm2;
+    let distance2 = (scale - 2.0 * overlap).max(0.0);
+    if scale == 0.0 {
+        if distance2 == 0.0 { 0.0 } else { f64::INFINITY }
+    } else {
+        (distance2 / scale).sqrt()
+    }
 }
 
 /// Certify a `K ≫ intrinsic-rank` capacity state against conditions 1–5.
@@ -366,7 +392,7 @@ pub fn certify_dormant_capacity(
             replayed_frames,
             slot,
             frame_dim,
-        )?);
+        ));
     }
     let mut dormant_frame_residual = 0.0_f64;
     for &slot in &occupancy.dormant {
@@ -375,7 +401,7 @@ pub fn certify_dormant_capacity(
             replayed_frames,
             slot,
             frame_dim,
-        )?);
+        ));
     }
     let active_residual = active_frame_residual.max(active_residuals.worst());
     let active_kkt_ok = active_residual <= tolerance;
@@ -442,37 +468,3 @@ pub fn certify_dormant_capacity(
     })
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn active_capacity_rejects_a_resolved_small_rotation_2825() {
-        let angle = 1.0e-10_f64;
-        let frames = ndarray::array![[1.0, 0.0]];
-        let replayed = ndarray::array![[angle.cos(), angle.sin()]];
-        let occupancy = AtomOccupancy {
-            active: vec![0],
-            dormant: vec![],
-            effective_rows: vec![2.0],
-            threshold: OccupancyThreshold::FrameIdentifiability { frame_dim: 1 },
-        };
-        let report = certify_dormant_capacity(DormantCapacityInputs {
-            frames: frames.view(),
-            replayed_frames: replayed.view(),
-            frame_dim: 1,
-            occupancy: &occupancy,
-            replayed_occupancy: &occupancy,
-            active_residuals: ActiveStateResiduals::default(),
-            birth_margins: &[],
-            structural_margins: &[],
-            tolerance: angle / 2.0,
-        })
-        .expect("finite capacity certificate");
-        assert!((report.active_frame_residual - angle.sin()).abs() <= 32.0 * f64::EPSILON * angle);
-        assert!(matches!(
-            report.verdict,
-            CapacityVerdict::NotConverged(NotConvergedReason::ActiveFixedPointOpen { .. })
-        ));
-    }
-}

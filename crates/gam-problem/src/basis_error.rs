@@ -177,7 +177,7 @@ fn duchon_smoothness_message(
         format!("dimension+{margin}")
     };
     format!(
-        "Duchon {operator} requires 2*(p+s) > {bound}; got 2*(p+s)={spectral_order}, \
+        "Duchon {operator}: 2*(p+s) > {bound} is required; got 2*(p+s)={spectral_order}, \
          dimension={dimension}, p={nullspace_order}, s={power}. The operator is finite only \
          for a smoother spline: raise power to >= {minimum_power} (or reduce the joint \
          smooth's dimension)."
@@ -269,7 +269,7 @@ mod advice_tests {
     fn a_zero_margin_refusal_states_the_bare_dimension_bound() {
         let err = BasisError::duchon_smoothness_insufficient("pointwise kernel values", 0, 4, 2, 0.5);
         let text = err.to_string();
-        assert!(text.contains("2*(p+s) > dimension;"), "{text}");
+        assert!(text.contains("2*(p+s) > dimension is required;"), "{text}");
         assert!(text.contains("2*(p+s)=5"), "{text}");
     }
 }

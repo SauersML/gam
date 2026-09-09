@@ -1,0 +1,30 @@
+# Known assertion-less `#[test]` functions (#2818).
+#
+# `scripts/assertionless_tests.py --ledger scripts/assertionless_ledger.txt`
+# ratchets the tree against this file and fails in BOTH directions: an offender
+# that is not recorded here is a regression, and an entry here that now asserts
+# something is a stale ledger whose line must be deleted in the fix's own commit.
+# So this list only ever shrinks, and it is also the detector's positive control
+# on every run -- every line is a known-offending input, and a scan that silently
+# measured nothing reports them all as fixed.
+#
+# Sorted, unique, one `path::fn_name` per line. Do not add to it: the way past
+# this gate is to assert the invariant the test already computes, or to move a
+# pure exploratory dump to `examples/`.
+#
+# Each entry below prints a measurement and asserts nothing about it, so it
+# passes for every behaviour of the code it calls.
+crates/gam-models/src/survival/latent/survival/tests.rs::zz_measure_2566_curvature_fd_ladder_full
+crates/gam-models/src/survival/latent/survival/tests.rs::zz_measure_2566_curvature_fine_sweep
+crates/gam-models/src/survival/location_scale/tests.rs::zz_measure_2342_far_tail_dh_nan_localization
+crates/gam-models/tests/suite/probe_2695_warp_smoothness.rs::probe_2695_warp_basis_smoothness_ladder
+crates/gam-sae/src/manifold/tests_chart_collapse_2691.rs::zz_2691_euclidean_line_refusal_sweep
+crates/gam-sae/src/manifold/tests_gauge_orbit_descent_2762.rs::zz2762_removed_span_slope_and_layout_census
+crates/gam-solve/src/residual_cascade.rs::zz_measure_cascade_width_by_level_count_2546
+crates/gam-terms/tests/suite/probe_2761_penalty_topology.rs::probe_basis_level_topology_versus_range
+crates/gam-terms/tests/suite/probe_ispline_boundary_2705.rs::probe_ispline_pair_at_the_boundary_knots_2705
+tests/quality/misc/fit_quality_stress.rs::zz_measure_hifreq_tensor_k10_seed_costs
+tests/quality/misc/fit_quality_stress.rs::zz_measure_hifreq_tensor_k8_lambda_readout
+tests/regressions/misc/regression_2644_outer_criterion_conditioning.rs::zz_probe_2644_matern_low_n_route_agreement
+tests/regressions/misc/regression_2644_outer_criterion_conditioning.rs::zz_probe_2644_matern_outer_gradient
+tests/regressions/misc/regression_2644_outer_criterion_conditioning.rs::zz_probe_2644_prostate_binomial_logit

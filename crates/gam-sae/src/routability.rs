@@ -199,9 +199,9 @@ pub struct RoutabilityAudit {
 /// `quantile_levels` are the quantile levels (each in `[0, 1]`) to report;
 /// `delta` sets the confidence at which the closed-form floor and the empirical
 /// `(1 − δ)`-quantile are compared.
-pub fn routability_audit<T: ndarray::NdFloat + Into<f64>>(
-    decoder: ArrayView2<'_, T>,
-    residuals: ArrayView2<'_, T>,
+pub fn routability_audit(
+    decoder: ArrayView2<'_, f32>,
+    residuals: ArrayView2<'_, f32>,
     block_size: usize,
     delta: f64,
     quantile_levels: &[f64],
@@ -236,7 +236,7 @@ pub fn routability_audit<T: ndarray::NdFloat + Into<f64>>(
     for r in residuals.outer_iter() {
         let mut norm2 = 0.0f64;
         for &v in r.iter() {
-            norm2 += Into::<f64>::into(v) * Into::<f64>::into(v);
+            norm2 += v as f64 * v as f64;
         }
         let norm = norm2.sqrt();
         if norm <= 1.0e-12 {
@@ -249,7 +249,7 @@ pub fn routability_audit<T: ndarray::NdFloat + Into<f64>>(
                 let atom = decoder.row(g * block_size + row_off);
                 let mut dot = 0.0f64;
                 for (rv, av) in r.iter().zip(atom.iter()) {
-                    dot += Into::<f64>::into(*rv) * Into::<f64>::into(*av);
+                    dot += *rv as f64 * *av as f64;
                 }
                 energy += dot * dot;
             }

@@ -1,0 +1,64 @@
+{
+  "arm": "crit2560_k8_ls",
+  "crate_version": "0.3.154",
+  "dictionary": {
+    "G_blocks": 1280,
+    "K_atoms": 2560,
+    "block_size": 2,
+    "block_topk": 8,
+    "decoder_bytes": 26214400,
+    "decoder_bytes_expected": 26214400,
+    "gamma": 0.23788198828697205,
+    "overcomplete_ratio_K_over_p": 1.0,
+    "train_mean_bytes": 10240
+  },
+  "engine": "gam_sae::sparse_dict::BlockSparseStreamState",
+  "epochs": [],
+  "fit": {
+    "aux_k": 0,
+    "converged": false,
+    "device_admitted": true,
+    "epochs_run": 0,
+    "gpu_policy": "Off",
+    "seed_coordinate_fallback_blocks": 0,
+    "seed_policy": "Rows",
+    "train_explained_variance": null,
+    "train_seconds": 7.363e-6
+  },
+  "heldout": {
+    "explained_variance": 0.2593387503556617,
+    "explained_variance_joint_ls": 0.3625956213987407,
+    "fvu": 0.7406612496443383,
+    "fvu_about_train_mean": 0.7380943619728477,
+    "fvu_joint_ls": 0.6374043786012593,
+    "rows_scored": 100000,
+    "rss": 7044063.589057536,
+    "rss_joint_ls": 6062038.451406781,
+    "seconds": 46.448477441,
+    "tss_about_eval_mean": 9510506.446017068,
+    "tss_about_train_mean": 9543581.35215869
+  },
+  "inputs": {
+    "eval": "/scratch.global/sauer354/a5acts/eval.npy",
+    "n_eval": 100000,
+    "n_train": 300000,
+    "p": 2560,
+    "train": "/scratch.global/sauer354/a5acts/train.npy"
+  },
+  "issue": 2502,
+  "overcompleteness": {
+    "G_blocks": 1280,
+    "K_atoms": 2560,
+    "ambient_p": 2560,
+    "atoms_used_exceeds_ambient_p": false,
+    "atoms_used_on_heldout": 2556,
+    "blocks_used_on_heldout": 1278,
+    "note": "atoms_used > p implies the used sub-dictionary is linearly dependent"
+  },
+  "rate": {
+    "active_scalars_per_token": 16,
+    "firings_per_token": 8,
+    "selection_bits_per_token": 82.5754247590989
+  },
+  "wall_seconds": 57.10279343
+}

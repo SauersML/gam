@@ -66,16 +66,41 @@ mod ridge_policy_tests {
 
     /// #2670 — the inhabitants are exactly the two the engine selects. A third
     /// would have to be a second answer to the same question, which is what the
-    /// deleted positive-part variant was. The binding below is irrefutable only
-    /// while that holds: re-adding a variant makes the pattern refutable, and a
-    /// refutable `let` fails to compile here first.
+    /// deleted positive-part variant was.
+    ///
+    /// Two checks of the same property, and they fail at different times, which
+    /// is why both are here. The irrefutable `let` is a COMPILE-TIME assertion:
+    /// re-adding a variant makes the pattern refutable and this file stops
+    /// compiling. The runtime assertions below say the constructors between them
+    /// still reach BOTH inhabitants and reach each exactly once — a compile-time
+    /// check cannot see a constructor that was quietly re-pointed at its
+    /// sibling, and the enum would still have two inhabitants while the engine
+    /// could only select one (#2818: a test that reaches no runtime assertion
+    /// passes for every behaviour of the code it calls).
     #[test]
     fn the_policy_has_no_third_inhabitant() {
-        for policy in [
+        let constructed = [
             RidgePolicy::exact_full_objective(),
             RidgePolicy::solver_only(),
-        ] {
+        ];
+        let mut exact = 0usize;
+        let mut solver = 0usize;
+        for policy in constructed {
             let (RidgePolicy::ExactFullObjective | RidgePolicy::SolverOnly) = policy;
+            match policy {
+                RidgePolicy::ExactFullObjective => exact += 1,
+                RidgePolicy::SolverOnly => solver += 1,
+            }
         }
+        assert_eq!(
+            (exact, solver),
+            (1, 1),
+            "the two constructors must reach the two distinct inhabitants, once each"
+        );
+        assert_ne!(
+            constructed[0], constructed[1],
+            "a constructor re-pointed at its sibling leaves the enum's arity intact \
+             and the engine with one selectable policy"
+        );
     }
 }

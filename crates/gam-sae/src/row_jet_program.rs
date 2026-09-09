@@ -60,137 +60,6 @@ pub enum RowGate {
     PerAtomLogistic { inv_tau: f64 },
 }
 
-impl RowGate {
-    /// Analytic gate partial in the named logit coordinates, through order 3.
-    /// The getter borrows the row's already-resolved gate values. Fixed gates
-    /// are handled by the row layout before requesting a derivative.
-    #[inline]
-    pub(crate) fn partial(
-        self,
-        atom: usize,
-        logits: &[usize],
-        value: impl Fn(usize) -> f64,
-    ) -> f64 {
-        assert!(
-            logits.len() <= 3,
-            "gate partial supports orders zero through three"
-        );
-        let gate = value(atom);
-        if logits.is_empty() {
-            return gate;
-        }
-        match self {
-            Self::PerAtomLogistic { inv_tau } => {
-                if logits.iter().any(|&index| index != atom) {
-                    return 0.0;
-                }
-                let first = gate * (1.0 - gate) * inv_tau;
-                match logits.len() {
-                    1 => first,
-                    2 => first * (1.0 - 2.0 * gate) * inv_tau,
-                    _ => first * (1.0 - 6.0 * gate + 6.0 * gate * gate) * inv_tau * inv_tau,
-                }
-            }
-            Self::Softmax { inv_tau } => {
-                let delta = |a: usize, b: usize| if a == b { 1.0 } else { 0.0 };
-                let a = logits[0];
-                let ga = value(a);
-                let ua = delta(atom, a) - ga;
-                if logits.len() == 1 {
-                    // Preserve the production order-1 rounding order.
-                    return gate * ua * inv_tau;
-                }
-                let b = logits[1];
-                let gb = value(b);
-                let ub = delta(atom, b) - gb;
-                let vab = delta(a, b) - gb;
-                if logits.len() == 2 {
-                    return gate * (ua * ub - ga * vab) * inv_tau * inv_tau;
-                }
-                let c = logits[2];
-                let gc = value(c);
-                let uc = delta(atom, c) - gc;
-                let vac = delta(a, c) - gc;
-                let vbc = delta(b, c) - gc;
-                gate * (ua * ub * uc
-                    - uc * ga * vab
-                    - ub * ga * vac
-                    - ua * gb * vbc
-                    - ga * vac * vab
-                    + ga * gb * vbc)
-                    * inv_tau
-                    * inv_tau
-                    * inv_tau
-            }
-        }
-    }
-}
-
-#[cfg(test)]
-mod gate_partial_tests {
-    use super::RowGate;
-
-    #[test]
-    fn gate_third_partials_match_second_derivative_motion_and_permutations_2820() {
-        let logits = [-0.9_f64, 0.3, 1.1];
-        let inv_tau = 1.0 / 0.7;
-        for gate in [
-            RowGate::Softmax { inv_tau },
-            RowGate::PerAtomLogistic { inv_tau },
-        ] {
-            let values = |logits: [f64; 3]| match gate {
-                RowGate::Softmax { .. } => {
-                    let mut out = logits.map(|x| (x * inv_tau).exp());
-                    let mass: f64 = out.iter().sum();
-                    for value in &mut out {
-                        *value /= mass;
-                    }
-                    out
-                }
-                RowGate::PerAtomLogistic { .. } => {
-                    logits.map(|x| 1.0 / (1.0 + (-x * inv_tau).exp()))
-                }
-            };
-            let base = values(logits);
-            let mut distinct_signal = 0.0_f64;
-            for atom in 0..3 {
-                for a in 0..3 {
-                    for b in 0..3 {
-                        for c in 0..3 {
-                            let h = 2.0e-5;
-                            let mut plus = logits;
-                            let mut minus = logits;
-                            plus[c] += h;
-                            minus[c] -= h;
-                            let plus = values(plus);
-                            let minus = values(minus);
-                            let fd = (gate.partial(atom, &[a, b], |i| plus[i])
-                                - gate.partial(atom, &[a, b], |i| minus[i]))
-                                / (2.0 * h);
-                            let third = gate.partial(atom, &[a, b, c], |i| base[i]);
-                            assert!(
-                                third.is_finite() && (third - fd).abs() < 2.0e-9 * (1.0 + fd.abs()),
-                                "{gate:?}, atom={atom}, partial=({a},{b},{c}): third={third:e}, FD={fd:e}"
-                            );
-                            for order in [[a, c, b], [b, a, c], [b, c, a], [c, a, b], [c, b, a]] {
-                                let permuted = gate.partial(atom, &order, |i| base[i]);
-                                assert!((permuted - third).abs() < 3.0e-14 * (1.0 + third.abs()));
-                            }
-                            if a != b && a != c && b != c {
-                                distinct_signal = distinct_signal.max(third.abs());
-                            }
-                        }
-                    }
-                }
-            }
-            match gate {
-                RowGate::Softmax { .. } => assert!(distinct_signal > 1.0e-3),
-                RowGate::PerAtomLogistic { .. } => assert_eq!(distinct_signal, 0.0),
-            }
-        }
-    }
-}
-
 /// One atom's local basis jet at the current row: the stored
 /// `(value, jacobian, second)` jet tensors of `Φ` plus the decoder block `B`.
 /// Indexed `[basis_col]`, `[basis_col][axis]`, `[basis_col][axis_a][axis_b]`,
@@ -210,9 +79,11 @@ pub struct AtomRowBasisJet {
 }
 
 impl AtomRowBasisJet {
+
     fn out_dim(&self) -> usize {
         self.decoder.first().map_or(0, Vec::len)
     }
+
 }
 
 /// One row of the SAE reconstruction as a jet program: the per-atom basis jets,
@@ -252,6 +123,7 @@ pub struct SaeReconstructionRowProgram {
 }
 
 impl SaeReconstructionRowProgram {
+
     /// The number of reconstruction output columns.
     #[must_use]
     pub fn out_dim(&self) -> usize {
@@ -481,12 +353,13 @@ impl<S: SaeOrder2RowProgramSource> SoftmaxMoment<'_, S> {
 
     #[inline]
     fn gate_first(&self, gated_atom: usize, logit_atom: usize) -> f64 {
-        RowGate::Softmax {
-            inv_tau: self.inv_tau,
-        }
-        .partial(gated_atom, &[logit_atom], |atom| {
-            self.source.gate_value(atom)
-        })
+        let diagonal = if gated_atom == logit_atom { 1.0 } else { 0.0 };
+        // Preserve the historical/tower rounding order `z * (...) * r`; this
+        // channel is later multiplied by tiny beta-border outputs, where one
+        // earlier rounding can dominate a relative-only oracle.
+        self.source.gate_value(gated_atom)
+            * (diagonal - self.source.gate_value(logit_atom))
+            * self.inv_tau
     }
 }
 
@@ -877,3 +750,4 @@ pub(crate) fn execute_independent_logistic_row_program<S: SaeOrder2RowProgramSou
     });
     out
 }
+

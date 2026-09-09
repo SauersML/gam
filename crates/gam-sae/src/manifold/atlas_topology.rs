@@ -428,10 +428,12 @@ pub fn observe_atlas_topology(atlas: &LocalAtlas) -> Result<AtlasTopologyReadout
     //
     // The NERVE is a combinatorial fact about the cover: patches `a` and `b` are
     // joined iff their supports meet. A fitted transition additionally requires
-    // enough shared rows; that sample requirement cannot erase an intersection.
-    // Nothing about how well the two tangent planes are
-    // resolved changes which patches intersect, so nothing about it may change the
-    // nerve's homology — otherwise a chart-conditioning artifact would move `b₁`.
+    // enough shared rows; that sample requirement cannot erase an intersection
+    // (#2280: on `swiss_roll(80, 16)` the transition list omitted two singleton
+    // intersections that the membership nerve restores). Nothing about how well
+    // the two tangent planes are resolved changes which patches intersect, so
+    // nothing about it may change the nerve's homology — otherwise a
+    // chart-conditioning artifact would move `b₁`.
     //
     // The SIGN COCHAIN `s` lives on top of that nerve and is defined only on the
     // edges whose handedness is resolved (see
@@ -488,12 +490,22 @@ pub fn observe_atlas_topology(atlas: &LocalAtlas) -> Result<AtlasTopologyReadout
         }
     }
     let covered_rows = row_charts.len();
-    let max_cover_multiplicity = row_charts.values().map(Vec::len).max().unwrap_or(0);
-    let mean_cover_multiplicity = if covered_rows == 0 {
+    let ambient_max_cover_multiplicity = row_charts.values().map(Vec::len).max().unwrap_or(0);
+    let ambient_mean_cover_multiplicity = if covered_rows == 0 {
         0.0
     } else {
         row_charts.values().map(Vec::len).sum::<usize>() as f64 / covered_rows as f64
     };
+    let (intrinsic_max, intrinsic_mean) = atlas.intrinsic_cover_multiplicity();
+    let (max_cover_multiplicity, mean_cover_multiplicity) =
+        if intrinsic_max > ambient_max_cover_multiplicity {
+            (intrinsic_max, intrinsic_mean)
+        } else {
+            (
+                ambient_max_cover_multiplicity,
+                ambient_mean_cover_multiplicity,
+            )
+        };
     // Lebesgue covering dimension: a good cover of a d-manifold refines to
     // multiplicity ≤ d + 1. Applied to the realized mean rather than to 1, because
     // this cover is deliberately unrefined — the builder grows every patch past its
@@ -538,7 +550,7 @@ pub fn observe_atlas_topology(atlas: &LocalAtlas) -> Result<AtlasTopologyReadout
     }
 
     // Every co-firing pair is an edge, irrespective of whether its overlap can
-    // fit a transition. Build this from the sparse membership incidence already
+    // fit a transition. Built from the sparse membership incidence already
     // measured above: work scales with actual row multiplicities, without an
     // all-patch-pairs intersection scan. The pile-up guard runs before this.
     let mut adjacency = vec![BTreeSet::<usize>::new(); chart_count];
@@ -800,13 +812,17 @@ fn classify(
 }
 
 #[cfg(test)]
+#[path = "tests_nerve_membership_2280.rs"]
+mod tests_nerve_membership_2280;
+
+#[cfg(test)]
 mod tests_2280 {
     use super::*;
     use crate::manifold::LocalAtlas;
     use crate::manifold::local_charts::LocalAtlasConfig;
     use crate::manifold::tests_topology_fixtures::{
         circle, cylinder_strip, embedded_plane, mobius_strip, open_arc, sphere, spherical_band,
-        torus, trefoil_knot,
+        swiss_roll, torus, trefoil_knot,
     };
     use ndarray::{Array2, ArrayView2};
 
@@ -848,6 +864,29 @@ mod tests_2280 {
         let inv = readout.invariants();
         assert_eq!(inv.betti.b1, 0, "{readout}");
         assert_eq!(inv.euler_characteristic, 1, "{readout}");
+    }
+
+    /// Regression for the sampled-cover hole localized in the issue thread.  With
+    /// ambient-distance patches the four inner-end charts centered at rows
+    /// 0/13/131/143 formed a real `H1` representative even though the underlying
+    /// sheet is contractible.  The independent intrinsic realization exposes a
+    /// cover pile-up at that fold, so promotion is honestly refused instead of
+    /// treating the ambient cover's accidental cycle as a cylinder.
+    #[test]
+    fn dense_swiss_roll_is_never_promoted_as_cylinder_2280() {
+        let roll = swiss_roll(80, 16);
+        let first = read(roll.view(), 2);
+        let second = read(roll.view(), 2);
+
+        assert_eq!(
+            first, second,
+            "atlas construction and readout must be deterministic"
+        );
+        assert_ne!(
+            first.observed_manifold(),
+            Some(GraphCompressionKind::Cylinder),
+            "a rolled contractible sheet may be named a disk or honestly refused, but must never be promoted as a cylinder: {first}"
+        );
     }
 
     /// THE ambient-embedding test. A trefoil knot is a smooth `S¹` whose three
@@ -1322,10 +1361,6 @@ mod tests_2280 {
         );
     }
 }
-
-#[cfg(test)]
-#[path = "tests_nerve_membership_2280.rs"]
-mod tests_nerve_membership_2280;
 
 #[cfg(test)]
 mod tests_zz_measure_2280 {

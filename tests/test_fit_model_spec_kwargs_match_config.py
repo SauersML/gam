@@ -32,6 +32,8 @@ from gamfit._api import _build_fit_payload
 
 _BASE: dict[str, typing.Any] = {
     "family": "auto",
+    "negative_binomial_theta": None,
+    "expectile_tau": None,
     "offset": None,
     "weights": None,
     "persistent_warm_start_root": None,
@@ -51,7 +53,6 @@ _BASE: dict[str, typing.Any] = {
     "frailty_sd": None,
     "hazard_loading": None,
     "scale_dimensions": None,
-    "adaptive_regularization": None,
     "firth": None,
     "noise_formula": None,
     "noise_offset": None,
@@ -74,6 +75,8 @@ def _payload(**overrides: typing.Any) -> dict[str, typing.Any]:
     ("kwarg", "value", "config_key"),
     [
         ("noise_formula", "s(x)", "noise_formula"),
+        ("negative_binomial_theta", 2.5, "negative_binomial_theta"),
+        ("expectile_tau", 0.9, "expectile_tau"),
         ("noise_offset", "logvar", "noise_offset"),
         ("flexible_link", True, "flexible_link"),
         ("survival_time_anchor", 25.0, "survival_time_anchor"),

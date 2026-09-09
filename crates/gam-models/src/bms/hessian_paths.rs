@@ -123,6 +123,17 @@ pub(super) struct BernoulliBlockHessianAccumulator {
     pub(super) h_gg: Array2<f64>,
     pub(super) h_mg: Array2<f64>,
     pub(super) dense_correction: Option<Array2<f64>>,
+    /// One-row scratch for [`Self::add_rank1_psi_cross`], which needs the
+    /// row's VALUES rather than the row-indexed `syr` the other pullbacks use.
+    ///
+    /// `try_row_chunk(row..row + 1)` returns an owned `Array2`, so reading the
+    /// two rows allocated and freed twice per call — and the ψ-hyper build
+    /// calls this three times per `(i, j)` axis pair per row. On this issue's
+    /// rigid marginal-slope arm a frame-pointer profile put 6.9 % of the whole
+    /// fit in `_int_malloc`/`_int_free` under exactly that (gam#979). The
+    /// buffers are owned by the accumulator, which is already per-worker.
+    marginal_row: Array2<f64>,
+    slope_row: Array2<f64>,
 }
 
 impl BernoulliBlockHessianAccumulator {
@@ -139,6 +150,8 @@ impl BernoulliBlockHessianAccumulator {
             } else {
                 None
             },
+            marginal_row: Array2::zeros((1, p_m)),
+            slope_row: Array2::zeros((1, p_g)),
         }
     }
 
@@ -469,28 +482,28 @@ impl BernoulliBlockHessianAccumulator {
         let psi_block = PsiBlock::from_index(psi_block_idx)?;
         let need_marg = right_primary[0] != 0.0;
         let need_log = right_primary[1] != 0.0;
-        let marg_chunk = if need_marg {
-            Some(
-                family
-                    .marginal_design
-                    .try_row_chunk(row..row + 1)
-                    .expect("marginal try_row_chunk in add_rank1_psi_cross"),
-            )
-        } else {
-            None
-        };
-        let log_chunk = if need_log {
-            Some(
-                family
-                    .slope_design
-                    .try_row_chunk(row..row + 1)
-                    .expect("slope try_row_chunk in add_rank1_psi_cross"),
-            )
-        } else {
-            None
-        };
-        let x_row = marg_chunk.as_ref().map(|c| c.row(0));
-        let g_row = log_chunk.as_ref().map(|c| c.row(0));
+        // Into the accumulator's own scratch, not a fresh allocation per call:
+        // `row_chunk_into` writes the same values `try_row_chunk` would have
+        // returned. See the buffers' documentation on the struct.
+        if need_marg {
+            family
+                .marginal_design
+                .row_chunk_into(row..row + 1, self.marginal_row.view_mut())
+                .expect("marginal row_chunk_into in add_rank1_psi_cross");
+        }
+        if need_log {
+            family
+                .slope_design
+                .row_chunk_into(row..row + 1, self.slope_row.view_mut())
+                .expect("slope row_chunk_into in add_rank1_psi_cross");
+        }
+        // Moved out so the accumulator's own blocks can be borrowed mutably
+        // below; returned to `self` at the end so the next call reuses them.
+        // There is no early exit between here and that restore.
+        let marginal_row = std::mem::take(&mut self.marginal_row);
+        let slope_row = std::mem::take(&mut self.slope_row);
+        let x_row = need_marg.then(|| marginal_row.row(0));
+        let g_row = need_log.then(|| slope_row.row(0));
 
         // Marginal component of right_primary
         if let Some(x_row) = x_row {
@@ -617,6 +630,8 @@ impl BernoulliBlockHessianAccumulator {
                 }
             }
         }
+        self.marginal_row = marginal_row;
+        self.slope_row = slope_row;
         Ok(())
     }
 

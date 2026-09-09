@@ -10,26 +10,11 @@
 /// its launch and host/device transfer cost.
 pub const DEFAULT_DICTIONARY_SCORE_MIN_ELEMS: usize = 1 << 20;
 
-/// Target score-buffer bytes per launch, independent of scalar precision.
-pub const DEFAULT_DICTIONARY_SCORE_TILE_BYTES: usize =
-    gam_runtime::resource::LIBRARY_ROW_CHUNK_TARGET_BYTES;
-
-/// The precision of observations, decoder entries and resident score buffers.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum DictionaryScorePrecision {
-    F32,
-    F64,
-}
-
-impl DictionaryScorePrecision {
-    #[must_use]
-    pub const fn scalar_bytes(self) -> usize {
-        match self {
-            Self::F32 => std::mem::size_of::<f32>(),
-            Self::F64 => std::mem::size_of::<f64>(),
-        }
-    }
-}
+/// Maximum score elements per device launch. With `f32` scores this is 8 MiB,
+/// matching the library row-chunk target and keeping peak score memory bounded
+/// independent of dictionary width.
+pub const DEFAULT_DICTIONARY_SCORE_TILE_ELEMS: usize =
+    gam_runtime::resource::LIBRARY_ROW_CHUNK_TARGET_BYTES / std::mem::size_of::<f32>();
 
 /// Device admission and tile geometry for one minibatch-by-dictionary score
 /// route.
@@ -41,12 +26,9 @@ pub struct DictionaryScoreRoutePlan {
     pub n_items: usize,
     /// Dot-product width for one score.
     pub feature_dim: usize,
-    /// Precision carried across the score route, including transfer accounting.
-    pub precision: DictionaryScorePrecision,
     /// Minimum `n_rows * n_items` elements required for device admission.
     pub device_min_score_elems: usize,
-    /// Element budget derived from the byte target and scalar precision.
-    /// At least one item is admitted for progress, even if one column exceeds it.
+    /// Maximum `n_rows * tile_items` score elements held by one device launch.
     pub max_tile_score_elems: usize,
     /// Candidate items per launch tile.
     pub tile_items: usize,
@@ -70,11 +52,9 @@ impl DictionaryScoreRoutePlan {
         n_rows: usize,
         n_items: usize,
         feature_dim: usize,
-        precision: DictionaryScorePrecision,
         device_min_score_elems: usize,
-        max_tile_score_bytes: usize,
+        max_tile_score_elems: usize,
     ) -> Self {
-        let max_tile_score_elems = max_tile_score_bytes / precision.scalar_bytes();
         let total_score_elems = n_rows.saturating_mul(n_items);
         let nondegenerate = n_rows > 0 && n_items > 0 && feature_dim > 0;
         let tile_items = if !nondegenerate {
@@ -98,34 +78,28 @@ impl DictionaryScoreRoutePlan {
             n_rows,
             n_items,
             feature_dim,
-            precision,
             device_min_score_elems,
             max_tile_score_elems,
             tile_items,
             tile_count,
             device_admitted: nondegenerate && total_score_elems >= device_min_score_elems,
-            peak_score_bytes: peak_score_elems.saturating_mul(precision.scalar_bytes()),
+            peak_score_bytes: peak_score_elems.saturating_mul(std::mem::size_of::<f32>()),
             dot_flops_lower_bound,
         }
     }
 
     /// Build a plan with the library defaults used by sparse dictionary routers.
     #[must_use]
-    pub fn default_for_shape(
-        n_rows: usize,
-        n_items: usize,
-        feature_dim: usize,
-        precision: DictionaryScorePrecision,
-    ) -> Self {
+    pub fn default_for_shape(n_rows: usize, n_items: usize, feature_dim: usize) -> Self {
         Self::with_limits(
             n_rows,
             n_items,
             feature_dim,
-            precision,
             DEFAULT_DICTIONARY_SCORE_MIN_ELEMS,
-            DEFAULT_DICTIONARY_SCORE_TILE_BYTES,
+            DEFAULT_DICTIONARY_SCORE_TILE_ELEMS,
         )
     }
+
 }
 
 #[cfg(test)]
@@ -134,12 +108,7 @@ mod tests {
 
     #[test]
     fn target_k32k_shape_is_admitted_and_memory_bounded() {
-        let plan = DictionaryScoreRoutePlan::default_for_shape(
-            256,
-            32_768,
-            64,
-            DictionaryScorePrecision::F32,
-        );
+        let plan = DictionaryScoreRoutePlan::default_for_shape(256, 32_768, 64);
         assert!(plan.device_admitted);
         assert_eq!(plan.tile_items, 8_192);
         assert_eq!(plan.tile_count, 4);
@@ -158,18 +127,8 @@ mod tests {
 
     #[test]
     fn peak_score_memory_does_not_grow_with_dictionary_width() {
-        let small = DictionaryScoreRoutePlan::default_for_shape(
-            512,
-            4_096,
-            48,
-            DictionaryScorePrecision::F32,
-        );
-        let large = DictionaryScoreRoutePlan::default_for_shape(
-            512,
-            131_072,
-            48,
-            DictionaryScorePrecision::F32,
-        );
+        let small = DictionaryScoreRoutePlan::default_for_shape(512, 4_096, 48);
+        let large = DictionaryScoreRoutePlan::default_for_shape(512, 131_072, 48);
         assert_eq!(small.tile_items, large.tile_items);
         assert_eq!(small.peak_score_bytes, large.peak_score_bytes);
         assert!(large.tile_count > small.tile_count);
@@ -177,51 +136,9 @@ mod tests {
 
     #[test]
     fn tiny_tile_budget_still_makes_forward_progress() {
-        let plan = DictionaryScoreRoutePlan::with_limits(
-            512,
-            1000,
-            32,
-            DictionaryScorePrecision::F32,
-            1,
-            28,
-        );
+        let plan = DictionaryScoreRoutePlan::with_limits(512, 1000, 32, 1, 7);
         assert_eq!(plan.tile_items, 1);
         assert_eq!(plan.tile_count, 1000);
         assert_eq!(plan.peak_score_bytes, 512 * std::mem::size_of::<f32>());
-    }
-
-    #[test]
-    fn double_precision_halves_tile_width_without_doubling_the_byte_budget_2825() {
-        let single = DictionaryScoreRoutePlan::default_for_shape(
-            256,
-            32_768,
-            64,
-            DictionaryScorePrecision::F32,
-        );
-        let double = DictionaryScoreRoutePlan::default_for_shape(
-            256,
-            32_768,
-            64,
-            DictionaryScorePrecision::F64,
-        );
-        assert_eq!(double.tile_items * 2, single.tile_items);
-        assert_eq!(double.tile_count, 2 * single.tile_count);
-        assert_eq!(double.peak_score_bytes, single.peak_score_bytes);
-        assert_eq!(double.peak_score_bytes, DEFAULT_DICTIONARY_SCORE_TILE_BYTES);
-        assert_eq!(double.dot_flops_lower_bound, single.dot_flops_lower_bound);
-        let one_column = DictionaryScoreRoutePlan::with_limits(
-            512,
-            1000,
-            32,
-            DictionaryScorePrecision::F64,
-            1,
-            28,
-        );
-        assert_eq!(one_column.tile_items, 1);
-        assert_eq!(
-            one_column.peak_score_bytes,
-            512 * 8,
-            "a target smaller than one column must report its actual allocation"
-        );
     }
 }

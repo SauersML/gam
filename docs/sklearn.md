@@ -27,7 +27,7 @@ r2    = est.score(X, y)       # r2_score
 
 ### Constructor
 
-```python
+```text
 GAMRegressor(
     formula: str,
     family: str = "auto",

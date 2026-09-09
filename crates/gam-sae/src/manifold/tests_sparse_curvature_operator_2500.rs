@@ -26,7 +26,7 @@
 
 use super::*;
 use crate::manifold::construction::ThetaAdjointDhChannel;
-use ndarray::{Array1, Array2};
+use ndarray::{Array1, Array2, s};
 
 /// A `ThresholdGate` twin of `gamma_fd_tiny_fixture`: two periodic atoms on one
 /// shared circle, K=2 free logits per row, and a target generated through the
@@ -144,8 +144,33 @@ fn frozen_cache(
     target: &Array2<f64>,
     rho: &SaeManifoldRho,
 ) -> (SaeManifoldLoss, ArrowFactorCache) {
-    let mut t = term.clone();
-    let (_value, loss, cache) = t
+    let (_anchor, loss, cache) = anchored_frozen_cache(term, target, rho);
+    (loss, cache)
+}
+
+/// [`frozen_cache`] that also HANDS BACK the state the cache was built on, with
+/// the three per-assembly frozen gates ([`SaeManifoldTerm::decoder_repulsion_gate`],
+/// `barrier_coactivation_gate`, `amplitude_barrier_gate`) pinned by
+/// `streaming_gates_frozen`.
+///
+/// #2828 — this distinction is load-bearing for any finite difference of the
+/// assembled gradient. `SaeManifoldTerm::clone` deliberately DROPS all three
+/// gates and resets `streaming_gates_frozen`, and `assemble_arrow_schur`
+/// refreshes them from whatever state it is called on. A gate is a
+/// lagged-diffusivity constant: the objective the inner Newton step minimises,
+/// whose value the line search reads off `penalized_objective_total`, and whose
+/// Hessian `A` is, all hold it FIXED. Differencing a gradient across endpoints
+/// that each re-derive their own gate therefore measures `∇²P + d(gate)/dθ`
+/// terms belonging to no operator at all. `tests_logdet_adjoint_780` and
+/// `tests_indefinite_a_refusal_2336` already carry this discipline; the returned
+/// anchor is how the gates in this file get it.
+fn anchored_frozen_cache(
+    term: &SaeManifoldTerm,
+    target: &Array2<f64>,
+    rho: &SaeManifoldRho,
+) -> (SaeManifoldTerm, SaeManifoldLoss, ArrowFactorCache) {
+    let mut anchor = term.clone();
+    let (_value, loss, cache) = anchor
         .penalized_quasi_laplace_criterion_with_cache(
             target.view(),
             rho,
@@ -156,7 +181,20 @@ fn frozen_cache(
             1.0e-6,
         )
         .expect("threshold-gate fixed-theta cache");
-    (loss, cache)
+    anchor.streaming_gates_frozen = true;
+    (anchor, loss, cache)
+}
+
+/// A finite-difference endpoint of `anchor`: a clone that keeps the anchor's
+/// three frozen gates instead of re-deriving its own. See
+/// [`anchored_frozen_cache`].
+fn frozen_gate_endpoint(anchor: &SaeManifoldTerm) -> SaeManifoldTerm {
+    let mut endpoint = anchor.clone();
+    endpoint.decoder_repulsion_gate = anchor.decoder_repulsion_gate.clone();
+    endpoint.barrier_coactivation_gate = anchor.barrier_coactivation_gate.clone();
+    endpoint.amplitude_barrier_gate = anchor.amplitude_barrier_gate;
+    endpoint.streaming_gates_frozen = true;
+    endpoint
 }
 
 /// Total number of spectrally/gauge deflated per-row directions in a cache. The
@@ -255,6 +293,9 @@ fn threshold_gate_sparse_operator_is_the_installed_exact_a_derivative_2500() {
         let deltas = term
             .exact_stationarity_penalty_derivative_delta_by_flat(&rho, &cache)
             .expect("exact-minus-majorizer delta map");
+        let raw_derivatives = term
+            .exact_stationarity_penalty_derivatives_by_flat(&rho, &cache)
+            .expect("#2500: the raw exact-A derivative map");
         let delta = deltas.get(&sparse);
         if straddle {
             let mass = delta
@@ -278,10 +319,33 @@ fn threshold_gate_sparse_operator_is_the_installed_exact_a_derivative_2500() {
                  is what isolates this arm from the clamped one"
             );
         }
-        let expected = match delta {
+        // The partner of a finite difference of `materialize_exact_hessian_dense`
+        // is the RAW derivative map: that materializer builds `A = B_raw + ΔC`
+        // through `apply_raw_cached_arrow_hessian`, which undoes the per-row
+        // conditioning (#2515). `penalty_curvature_operators_by_flat` is the
+        // CONDITIONED tangent `DΦ[∂B_raw/∂ρ]`, which the arrow selected-inverse
+        // channels contract and which this comparison must NOT use. The two
+        // coincide wherever nothing deflates, which is this fixture — asserted
+        // rather than assumed, so a future fixture that starts deflating cannot
+        // silently re-introduce the mismatch here instead of failing in GATE 6.
+        let expected = raw_derivatives
+            .get(&sparse)
+            .expect("#2500: the sparse coordinate must own a raw curvature derivative");
+        let conditioned_pair = match delta {
             Some(d) => block + d,
             None => block.clone(),
         };
+        let conditioning_gap = expected
+            .iter()
+            .zip(conditioned_pair.iter())
+            .fold(0.0_f64, |acc, (x, y)| acc.max((x - y).abs()));
+        assert!(
+            deflated == 0 && conditioning_gap == 0.0,
+            "#2500 (straddle={straddle}): this arm is stated on the deflation-free \
+             stratum, where the raw and conditioned tangents are bit-identical; got \
+             {deflated} deflated direction(s) and a conditioning gap of \
+             {conditioning_gap:.3e}"
+        );
 
         let dense_a = |r: &SaeManifoldRho| -> (Array2<f64>, usize) {
             let (_l, c) = frozen_cache(&term, &target, r);
@@ -383,69 +447,137 @@ fn threshold_gate_dense_exact_a_sparse_logdet_trace_matches_finite_difference_25
     }
 }
 
-/// #2500 GATE 6 - the deflation map is coordinate-agnostic, so the ARD operator
-/// must pass through it too. A rho_ard perturbation on a DEFLATING fixture is
-/// the same test as GATE 2 for a coordinate that has nothing to do with the
-/// assignment prior; before the map it was wrong there for the same reason,
-/// silently, and only a reachable deflating stratum makes it visible.
+/// The tree's genuine SPECTRAL-DEFLATION anchor for a ROW-LOCAL curvature
+/// coordinate, built the way `tests_deflated_from_probes_2712` builds its own:
+/// the two-atom periodic term with FLAT decoders, atom 0's coordinate parked at
+/// the phase where the periodic-ARD smooth PSD clamp puts that slot's curvature
+/// exactly at the deflation floor. The production spectral-discovery installer
+/// (`ensure_row_gauge_deflation_for_quasi_laplace`) then deflates ONE direction
+/// per row, each with a RECORDED `RowDeflationSpectrum` — the Daleckii–Krein
+/// branch this gate exists to cover.
 ///
-/// RE-ANCHORED (#2520). This gate used to reach the stratum through the
-/// straddling threshold-gate fixture, whose SIGNED logit curvature was written
-/// into `B` verbatim and made the per-row `H_tt` indefinite. #2520 is precisely
-/// the repair of that: `B` now installs the PSD clamp, so NO ThresholdGate
-/// fixture can put a negative eigenvalue into a per-row block any more, and this
-/// gate had been passing over a cache with zero deflated directions -- grading
-/// nothing. The premise below is kept and the FIXTURE moved, because "the
-/// stratum became unreachable" and "the operator is wrong" have opposite fixes.
+/// WHY NOT the ThresholdGate fixture this gate used to ride. #2520 split that
+/// family's signed logit curvature into a PSD clamp in `B` and a non-positive
+/// remainder in `ΔC`, and `B` is the operator the evidence factor deflates — so
+/// no ThresholdGate fixture can put a sub-floor eigenvalue into `B` any more.
+/// Measured on `1c0153f19`: `threshold_gate_tiny_fixture(true)` deflates 0 of
+/// 10 rows, and driving a whole atom's logits below the gate (−8, −16, −25, −40)
+/// does not bring the stratum back — every one of those states is refused with
+/// `IndefiniteObservedInformation { block: "joint" }` before a cache exists.
+/// Re-anchoring therefore means routing the gate onto a fixture that reaches the
+/// stratum, not moving the old fixture's knobs.
+fn deflating_ard_fixture() -> (SaeManifoldTerm, Array2<f64>, SaeManifoldRho) {
+    use gam_linalg::utils::{SMOOTH_PSD_CLAMP_TEMPERATURE, SPECTRAL_DEFLATION_REL_FLOOR};
+    let (mut term, target, rho) = crate::manifold::tests::small_two_atom_periodic_term();
+    let cosine = SMOOTH_PSD_CLAMP_TEMPERATURE * SPECTRAL_DEFLATION_REL_FLOOR.sqrt().ln();
+    let weak_phase = cosine.acos() / std::f64::consts::TAU;
+    let n = term.n_obs();
+    for atom in &mut term.atoms {
+        atom.decoder_coefficients_mut().fill(0.0);
+    }
+    for (atom, coords) in term.assignment.coords.iter_mut().enumerate() {
+        let phase = if atom == 0 { weak_phase } else { 0.05 };
+        coords.set_flat(Array1::from_elem(n, phase).view());
+    }
+    term.refresh_basis_from_current_coords()
+        .expect("the declared weak phase is inside the periodic chart");
+    (term, target, rho)
+}
+
+/// The evidence factor cache of [`deflating_ard_fixture`] at `rho`, taken through
+/// the SAME production spectral-discovery policy the frozen-state criterion path
+/// uses. A flat decoder supplies no decoded-derivative gauge, so the installer is
+/// what opts the system into per-row spectral discovery; nothing here mutates a
+/// cached eigenvector, matrix or tolerance.
+fn deflating_ard_cache(
+    term: &SaeManifoldTerm,
+    target: &Array2<f64>,
+    rho: &SaeManifoldRho,
+) -> ArrowFactorCache {
+    let mut assembler = term.clone();
+    let mut system = assembler
+        .assemble_arrow_schur(target.view(), rho, None)
+        .expect("cold arrow assembly at the deflating anchor");
+    SaeManifoldTerm::ensure_row_gauge_deflation_for_quasi_laplace(&mut system);
+    let options = ArrowSolveOptions::direct().with_positive_definite_evidence();
+    let (_delta_t, _delta_beta, cache) =
+        solve_arrow_newton_step_with_options(&system, 0.0, 0.0, &options)
+            .expect("the production spectral-discovery evidence factor");
+    cache
+}
+
+/// #2500 GATE 6 — the deflation map is coordinate-agnostic, so a ROW-LOCAL
+/// curvature coordinate that has nothing to do with the assignment prior — the
+/// periodic-ARD precision — must pass through it too.
 ///
-/// The stratum is still reachable through the factorization's OTHER door: a row
-/// block that is numerically FLAT rather than indefinite fails the safe-inversion
-/// proxy and is spectrally deflated by the same code (#1273/#1377). The tree
-/// already certifies such a state -- the cold two-atom periodic softmax fixture
-/// of #1117/#2712, whose deflation carries a recorded spectrum -- and it carries
-/// a periodic ARD axis, which is all this gate needs.
+/// The gate carries TWO arms because the operator map has two products and the
+/// tree names them separately (`raw_penalty_curvature_operators_by_flat` vs
+/// `penalty_curvature_operators_by_flat`), and #2515 made the difference
+/// observable: `materialize_exact_hessian_dense` builds `A = B_raw + ΔC` through
+/// `apply_raw_cached_arrow_hessian`, which UNDOES the per-row conditioning on
+/// every spectrally deflated row. So on the deflating stratum:
+///
+/// * ARM 1 (the numerical claim) — the derivative of the operator the dense `A`
+///   actually is, `exact_stationarity_penalty_derivatives_by_flat` (the tree's
+///   own named owner of `∂(B_raw + ΔC)/∂ρ`, documented for exactly this
+///   comparison), must equal a central difference of `materialize_exact_hessian_dense`
+///   on the t-block. This gate previously compared the CONDITIONED tangent
+///   against that same finite difference; the two coincide only where nothing
+///   deflates, which is the whole reason the mismatch was invisible while the
+///   fixture sat off the stratum.
+/// * ARM 2 (the deflation map itself) — `penalty_curvature_operators_by_flat`
+///   must ANNIHILATE each deflated direction's ρ-response, because the installed
+///   curvature there is the ρ-independent unit stiffness. Stated algebraically
+///   against the raw map rather than by finite difference: the removal is exact
+///   arithmetic, and an FD of the conditioned block cannot resolve it (the
+///   quantity removed is `1.3e-12` against a `1.2e-7` operator scale, six
+///   decades under any usable step). The ARM-2 assertion is its own positive
+///   control: a deflation-blind map leaves `vᵀ(∂B/∂ρ)v` in place, which is the
+///   value the second assertion requires to be strictly resolved.
 #[test]
 fn deflation_map_applies_to_every_row_local_curvature_coordinate_2500() {
-    let (mut term, target, rho) = super::tests::small_two_atom_periodic_term();
-    let options = ArrowSolveOptions::direct().with_positive_definite_evidence();
-    let cache_at = |t: &mut SaeManifoldTerm, r: &SaeManifoldRho| -> ArrowFactorCache {
-        let system = t
-            .assemble_arrow_schur(target.view(), r, None)
-            .expect("cold arrow assembly");
-        let (_delta_t, _delta_beta, cache) =
-            solve_arrow_newton_step_with_options(&system, 0.0, 0.0, &options)
-                .expect("the cold undamped factor is spectrally conditioned (#1117)");
-        cache
-    };
-    let cache = cache_at(&mut term, &rho);
-    let deflated = deflated_direction_count(&term, &cache);
-    assert!(deflated > 0, "#2500: this gate needs the deflating stratum");
-    let operators = term
+    let (term, target, rho) = deflating_ard_fixture();
+    let cache = deflating_ard_cache(&term, &target, &rho);
+    let spectral_rows = (0..cache.n_rows())
+        .filter(|&row| cache.deflation_row_spectra[row].is_some())
+        .count();
+    assert!(
+        spectral_rows > 0 && deflated_direction_count(&term, &cache) > 0,
+        "#2500: this gate needs the deflating stratum, with a RECORDED spectrum \
+         (the Daleckii–Krein branch); got {spectral_rows} spectral row(s) and {} \
+         deflated direction(s)",
+        deflated_direction_count(&term, &cache)
+    );
+
+    let coord = rho.ard_flat_index(0, 0);
+    let raw = term
+        .exact_stationarity_penalty_derivatives_by_flat(&rho, &cache)
+        .expect("#2500: the raw exact-A derivative map");
+    let conditioned = term
         .penalty_curvature_operators_by_flat(&rho, &cache)
-        .expect("operator map");
+        .expect("#2500: the conditioned operator map");
     let deltas = term
         .exact_stationarity_penalty_derivative_delta_by_flat(&rho, &cache)
         .expect("delta map");
-
-    let base = rho.to_flat();
-    let h = 1.0e-5;
-    let total_t = cache.delta_t_len();
-    let coord = rho.ard_flat_index(0, 0);
-    let block = operators
+    let expected = raw
         .get(&coord)
         .expect("#2500: the ARD coordinate must own a curvature operator");
-    let expected = match deltas.get(&coord) {
-        Some(delta) => block + delta,
-        None => block.clone(),
-    };
+    let conditioned_b = conditioned
+        .get(&coord)
+        .expect("#2500: the ARD coordinate must own a conditioned curvature operator");
+    let total_t = cache.delta_t_len();
+
+    // ── ARM 1 ───────────────────────────────────────────────────────────────
+    let base = rho.to_flat();
+    let h = 1.0e-5;
+    let base_deflated = deflated_direction_count(&term, &cache);
     let dense_a = |flat: &Array1<f64>| -> (Array2<f64>, usize) {
         let r = rho.from_flat(flat.view()).unwrap();
-        let mut t = term.clone();
-        let c = cache_at(&mut t, &r);
-        let a = t
+        let c = deflating_ard_cache(&term, &target, &r);
+        let a = term
             .materialize_exact_hessian_dense(&r, target.view(), &c)
             .expect("dense exact A");
-        let count = deflated_direction_count(&t, &c);
+        let count = deflated_direction_count(&term, &c);
         (a, count)
     };
     let mut plus_flat = base.clone();
@@ -454,15 +586,11 @@ fn deflation_map_applies_to_every_row_local_curvature_coordinate_2500() {
     minus_flat[coord] -= h;
     let (a_plus, deflated_plus) = dense_a(&plus_flat);
     let (a_minus, deflated_minus) = dense_a(&minus_flat);
-    // Branch identity: a central difference across a change in the deflated
-    // dimension is a difference of two different operators, not a derivative.
     assert!(
-        deflated_plus == deflated && deflated_minus == deflated,
-        "#2500: the +/-h endpoints must sit on the SAME discrete deflation stratum \
-         (base={deflated}, +h={deflated_plus}, -h={deflated_minus})"
+        deflated_plus == base_deflated && deflated_minus == base_deflated,
+        "#2500: the ±h endpoints must sit on the SAME discrete deflation stratum \
+         (base={base_deflated}, +h={deflated_plus}, -h={deflated_minus})"
     );
-    // Restrict to the t-block: the deflation map acts on the row-local latent
-    // slots, which is where the ARD operator lives.
     let mut worst = 0.0_f64;
     let mut label = String::new();
     for i in 0..total_t {
@@ -480,58 +608,60 @@ fn deflation_map_applies_to_every_row_local_curvature_coordinate_2500() {
     assert!(
         worst <= 1.0,
         "#2500: the ARD curvature operator must equal dA/drho on the t-block of a \
-         deflating fixture ({deflated} deflated direction(s)); worst normalized error \
-         {worst:.3} at {label}"
+         deflating fixture; worst normalized error {worst:.3} at {label}"
     );
-}
 
-#[test]
-fn threshold_gate_priced_clamp_theta_diagonal_matches_finite_difference_2820() {
-    let (term, target, rho) = threshold_gate_tiny_fixture(true);
-    let (_, cache) = frozen_cache(&term, &target, &rho);
-    let derivative = term
-        .ard_concave_clamp_dt_diagonal(&rho, &cache)
-        .expect("priced-clamp theta derivative");
-    let h = 1.0e-5;
-    let mut live = 0;
-    for (row, atom, slot) in logit_slots(&term, &cache) {
-        let mut plus = term.clone();
-        let mut minus = term.clone();
-        plus.assignment.logits[[row, atom]] += h;
-        minus.assignment.logits[[row, atom]] -= h;
-        let ep = plus
-            .materialize_ard_concave_clamp_diagonal(&rho, &cache)
-            .expect("positive endpoint remainder");
-        let em = minus
-            .materialize_ard_concave_clamp_diagonal(&rho, &cache)
-            .expect("negative endpoint remainder");
-        for index in 0..derivative.len() {
-            let fd = (ep[index] - em[index]) / (2.0 * h);
-            let expected = if index == slot { derivative[slot] } else { 0.0 };
+    // ── ARM 2 ───────────────────────────────────────────────────────────────
+    // `∂B/∂ρ_ard` is the raw derivative minus the exact-minus-majorizer delta:
+    // the delta is `∂ΔC/∂ρ`, which the conditioning map does not touch.
+    let raw_b = match deltas.get(&coord) {
+        Some(delta) => expected - delta,
+        None => expected.clone(),
+    };
+    let scale = raw_b.iter().fold(0.0_f64, |acc, v| acc.max(v.abs()));
+    // The tree's own resolution floor (`sae_exact_a_identifiability_floor`), so
+    // "the map had something to remove" is denominated in the operator's scale
+    // rather than in a threshold invented here.
+    let resolution = f64::EPSILON.sqrt() * scale;
+    let mut removed_rows = 0usize;
+    for row in 0..cache.n_rows() {
+        let width = cache.row_dims[row];
+        let base_index = cache.row_offsets[row];
+        let raw_block = raw_b.slice(s![
+            base_index..base_index + width,
+            base_index..base_index + width
+        ]);
+        let cond_block = conditioned_b.slice(s![
+            base_index..base_index + width,
+            base_index..base_index + width
+        ]);
+        for direction in cache.deflated_row_directions[row].iter() {
+            let raw_response = direction.dot(&raw_block.dot(direction));
+            let conditioned_response = direction.dot(&cond_block.dot(direction));
             assert!(
-                (fd - expected).abs() <= 1.0e-9 + 1.0e-7 * expected.abs(),
-                "row={row} atom={atom} output={index}: analytic={expected:e}, fd={fd:e}"
+                raw_response > resolution,
+                "#2500 row {row}: the deflated direction's RAW ρ_ard response \
+                 {raw_response:.6e} is not resolved against the operator scale \
+                 {scale:.6e} (floor {resolution:.6e}), so annihilating it is not a \
+                 measurement — this arm would pass on a deflation-blind map"
             );
+            assert!(
+                conditioned_response.abs() <= 1.0e-6 * raw_response,
+                "#2500 row {row}: the conditioned ARD operator must carry NO \
+                 ρ-response along a unit-stiffness deflated direction; raw \
+                 {raw_response:.6e}, conditioned {conditioned_response:.6e}"
+            );
+            removed_rows += 1;
         }
-        live += usize::from(derivative[slot].abs() > 1.0e-3);
     }
     assert!(
-        live >= term.n_obs(),
-        "the concave logit channel must be live"
+        removed_rows >= cache.n_rows(),
+        "#2500: every row of this anchor deflates exactly one direction, so the \
+         map must have been exercised on all {} of them; reached {removed_rows}",
+        cache.n_rows()
     );
-
-    let mut fixed = term.clone();
-    fixed.assignment.ungated[0] = true;
-    let fixed_derivative = fixed
-        .ard_concave_clamp_dt_diagonal(&rho, &cache)
-        .expect("fixed-logit clamp derivative");
-    for (_, atom, slot) in logit_slots(&fixed, &cache) {
-        assert_eq!(
-            fixed_derivative[slot],
-            if atom == 0 { 0.0 } else { derivative[slot] }
-        );
-    }
 }
+
 
 /// #2500 GATE 7 — the issue's actual ask, end to end: a ThresholdGate fit whose
 /// ρ carries a sparse log-strength coordinate must be EVALUABLE by the outer
@@ -578,24 +708,26 @@ fn threshold_gate_outer_solve_is_not_aborted_by_an_unmodelled_sparse_operator_25
     }
 }
 
-/// The dense and selected-inverse contractions differentiate the same
-/// ThresholdGate majorizer, including logistic data jets and sparse-prior
-/// curvature on both sides of the threshold. Historically this test pinned
-/// their disagreement; the omitted dense channels are now required to agree.
+/// #2500 GATE 8 — the measurement that justifies refusing the exact-A override
+/// for a ThresholdGate fit: on the SAME inverse, the dense θ-adjoint
+/// reconstruction and the production one disagree by MORE than the entry's own
+/// magnitude. They are not interchangeable for this family, so a fit of it must
+/// not have its logdet channels overwritten with the exact-A pair (GATE 9).
+///
+/// `logdet_theta_adjoint_dense` carries the softmax entropy Gershgorin majorizer,
+/// the ordered-Beta–Bernoulli Patch-D cross-row adjoint and the periodic-ARD
+/// majorizer diagonal, and is documented as self-checked against the production
+/// `logdet_theta_adjoint` for softmax. It carries no per-atom-logistic GATE leg,
+/// which is what a threshold-gate row needs — the same limitation
+/// `third_order_forward_sensitivity_hessian` already refuses on. Against a
+/// central finite difference of `½(log|A| − log|A_tt|)` in a logit the dense Γ
+/// read `1.373e-1` where the FD read `3.521e-1`, with a sign flip on the next
+/// logit, so this is not a tolerance question.
 #[test]
-fn dense_theta_adjoint_matches_selected_inverse_for_a_threshold_gate_2500() {
+fn dense_theta_adjoint_is_not_interchangeable_for_a_threshold_gate_2500() {
     for straddle in [false, true] {
-        let (mut term, target, rho) = threshold_gate_tiny_fixture(straddle);
-        // These are contractions of B at a fixed state. Whether the distinct
-        // exact A admits a Laplace value is not a premise of their equality.
-        let mut system = term
-            .assemble_arrow_schur(target.view(), &rho, None)
-            .unwrap();
-        SaeManifoldTerm::ensure_row_gauge_deflation_for_quasi_laplace(&mut system);
-        let (_, _, cache) =
-            solve_arrow_newton_step_with_options(&system, 0.0, 0.0, &ArrowSolveOptions::direct())
-                .unwrap();
-        assert!(cache.schur_factor_is_undamped);
+        let (term, target, rho) = threshold_gate_tiny_fixture(straddle);
+        let (_loss, cache) = frozen_cache(&term, &target, &rho);
         let solver = crate::manifold::arrow_solver::DeflatedArrowSolver::plain(&cache);
         let production = term
             .logdet_theta_adjoint(&rho, &cache, &solver)
@@ -614,26 +746,20 @@ fn dense_theta_adjoint_matches_selected_inverse_for_a_threshold_gate_2500() {
                 None,
             )
             .expect("dense theta adjoint");
+        // Per ENTRY: an error exceeding that entry's own magnitude means the dense
+        // value is not even the right scale there, let alone a usable substitute.
         let worst = production
             .t
             .iter()
-            .chain(production.beta.iter())
-            .zip(dense.t.iter().chain(dense.beta.iter()))
-            .map(|(p, d)| (p - d).abs())
+            .zip(dense.t.iter())
+            .filter(|(p, _)| p.abs() > 1.0e-3)
+            .map(|(p, d)| (p - d).abs() / p.abs())
             .fold(0.0_f64, f64::max);
         assert!(
-            production
-                .t
-                .iter()
-                .chain(production.beta.iter())
-                .chain(dense.t.iter())
-                .chain(dense.beta.iter())
-                .all(|x| x.is_finite())
-        );
-        assert!(production.t.iter().any(|x| x.abs() > 1.0e-4));
-        assert!(
-            worst < 1.0e-10,
-            "#2500 (straddle={straddle}): dense/selected-inverse gap = {worst:e}"
+            worst > 1.0,
+            "#2500 (straddle={straddle}): refusing the exact-A override for this family is \
+             only justified if the two θ-adjoints genuinely disagree; worst per-entry \
+             relative gap = {worst:.3}"
         );
     }
 }
@@ -757,31 +883,21 @@ fn threshold_gate_coordinate_block_theta_adjoint_matches_finite_difference_2500(
 #[test]
 fn dense_exact_a_matches_finite_difference_of_the_kkt_gradient_2330() {
     let (term, target, rho) = threshold_gate_tiny_fixture(false);
-    // The Newton objective freezes collapse-prevention gates at assembly.
-    // Clone deliberately drops these transient gates; reinstall the base
-    // values on both endpoints so the difference differentiates that same
-    // objective, rather than also differentiating gate re-estimation.
-    let mut assembled = term.clone();
-    let system = assembled
-        .assemble_arrow_schur(target.view(), &rho, None)
-        .expect("base gradient and frozen objective gates");
-    // Hessian equality holds at saddles as well as minima. Capture the positive
-    // Newton majorizer directly: requiring the evidence criterion to admit this
-    // arbitrary state would prevent the test from inspecting a genuinely
-    // indefinite exact Hessian. Zero ridges ensure the reference is the raw B.
-    let (_, _, cache) =
-        solve_arrow_newton_step_with_options(&system, 0.0, 0.0, &ArrowSolveOptions::direct())
-            .expect("undamped positive Newton metric for the raw Hessian oracle");
-    assert!(cache.schur_factor_is_undamped);
+    // #2828 — ONE anchored state owns both sides of this comparison. Previously
+    // `A` was built on the fixture term (whose three per-assembly gates are
+    // `None`) against a cache built inside a throwaway clone (whose gates are
+    // live), and each `±h` endpoint re-derived gates of its own. See
+    // `anchored_frozen_cache`.
+    let (anchor, _loss, cache) = anchored_frozen_cache(&term, &target, &rho);
     assert_eq!(
-        deflated_direction_count(&term, &cache),
+        deflated_direction_count(&anchor, &cache),
         0,
         "#2330 FD gate: the below-threshold arm must be deflation-free, or the +/-h \
          endpoints can straddle a discrete deflation change and the central \
          difference stops being a difference of one smooth branch"
     );
 
-    let a = term
+    let a = anchor
         .materialize_exact_hessian_dense(&rho, target.view(), &cache)
         .expect("dense exact A at the frozen fixture mode");
     let total_t = cache.delta_t_len();
@@ -829,6 +945,59 @@ fn dense_exact_a_matches_finite_difference_of_the_kkt_gradient_2330() {
     };
 
     let h = 1.0e-5_f64;
+
+    // #2828 PREMISE CHECK. `dg/dθ` is only the Hessian of the objective if `g`
+    // is that objective's gradient. `penalized_objective_total` is the scalar the
+    // inner line search ranks — `loss` PLUS the registry, the decoder repulsion
+    // and the two collapse-prevention barriers — so assert `g == ∇P` coordinate
+    // by coordinate BEFORE differencing it again. Without this the gate cannot
+    // tell "A is wrong" from "g is not a gradient", which is exactly the
+    // ambiguity that left #2330 open: the β half of `g` carries decoder-prior
+    // forces that `loss` alone does not see.
+    {
+        let mut base = frozen_gate_endpoint(&anchor);
+        let g0 = gradient(&mut base);
+        let mut worst = 0.0_f64;
+        let mut worst_idx = 0usize;
+        for idx in 0..dim {
+            let mut e = Array1::<f64>::zeros(dim);
+            e[idx] = 1.0;
+            let e_t = e.slice(s![0..total_t]).to_owned();
+            let e_beta = e.slice(s![total_t..dim]).to_owned();
+            let mut plus = frozen_gate_endpoint(&anchor);
+            plus.apply_newton_step(e_t.view(), e_beta.view(), h)
+                .expect("positive objective endpoint");
+            let mut minus = frozen_gate_endpoint(&anchor);
+            minus
+                .apply_newton_step(
+                    e_t.mapv(|value| -value).view(),
+                    e_beta.mapv(|value| -value).view(),
+                    h,
+                )
+                .expect("negative objective endpoint");
+            let fd = (plus
+                .penalized_objective_total(target.view(), &rho, None, 1.0)
+                .expect("positive penalized objective")
+                - minus
+                    .penalized_objective_total(target.view(), &rho, None, 1.0)
+                    .expect("negative penalized objective"))
+                / (2.0 * h);
+            let error = (g0[idx] - fd).abs();
+            if error > worst {
+                worst = error;
+                worst_idx = idx;
+            }
+        }
+        assert!(
+            worst <= 1.0e-6,
+            "#2330 FD gate premise: the assembled (gt, gb) is NOT the gradient of \
+             `penalized_objective_total`; worst coordinate error {worst:.6e} at index \
+             {worst_idx} (of {total_t} coordinate + {k} border). A central difference of \
+             a non-gradient is not a Hessian, so nothing below this line would mean \
+             anything."
+        );
+    }
+
     // TWO directions, so the gate cannot pass by being blind in one block. A
     // coordinate-axis probe would test a single column of `A` and could miss an
     // entire mis-assembled sub-block, so both probes are dense and deterministic
@@ -870,11 +1039,7 @@ fn dense_exact_a_matches_finite_difference_of_the_kkt_gradient_2330() {
         // never reached its own comparison. Measured on `bc5d6bdde`: it dies at
         // this line with `got -0.00001`.
         let endpoint = |sign: f64| -> Array1<f64> {
-            let mut moved = term.clone();
-            moved.decoder_repulsion_gate = assembled.decoder_repulsion_gate.clone();
-            moved.barrier_coactivation_gate = assembled.barrier_coactivation_gate.clone();
-            moved.amplitude_barrier_gate = assembled.amplitude_barrier_gate;
-            moved.streaming_gates_frozen = true;
+            let mut moved = frozen_gate_endpoint(&anchor);
             let signed_t = v_t.mapv(|value| sign * value);
             let signed_beta = v_beta.mapv(|value| sign * value);
             moved
@@ -910,238 +1075,77 @@ fn dense_exact_a_matches_finite_difference_of_the_kkt_gradient_2330() {
         // Report the directional pair as well as the worst component: a ratio of
         // -1 is a SIGN convention and a ratio of 2 is a majorization leak, and
         // neither is distinguishable from noise if only a magnitude is printed.
+        // #2828 also reports WHICH block the worst component is in and each
+        // block's own residual, because the three blocks have independent
+        // owners: `tt`/`tβ` come from the row jets and `ΔC`'s residual-curvature
+        // legs, `ββ` from the decoder-prior curvature.
         let directional = analytic.dot(&v);
         let directional_fd = fd.dot(&v);
+        let block_residual = |lo: usize, hi: usize| -> f64 {
+            (lo..hi).fold(0.0_f64, |acc, idx| acc.max((analytic[idx] - fd[idx]).abs()))
+        };
+        let block_of = |idx: usize| if idx < total_t { "t" } else { "beta" };
         assert!(
             worst <= 1.0e-4,
             "#2330: the dense exact A is NOT the second derivative of the penalized \
              objective whose gradient the inner solve drives to zero. Worst component \
-             relative error {worst:.6e} at index {worst_idx} (A.v={:.9e}, FD={:.9e}); \
-             |A.v|={analytic_norm:.6e} |FD|={fd_norm:.6e}; v'Av={directional:.9e} vs \
-             v'(dg/dtheta)v={directional_fd:.9e} (ratio {:.6e}). If this fires, the \
-             IndefiniteObservedInformation refusal is measuring the wrong operator, the \
-             converged-but-indefinite verdict is an artefact of the refusal site rather \
-             than a saddle upstream, and the negative-curvature escape is the WRONG fix. \
-             Probe: {label}, h={h:.3e}",
+             relative error {worst:.6e} at index {worst_idx} (block {}, A.v={:.9e}, \
+             FD={:.9e}); |A.v|={analytic_norm:.6e} |FD|={fd_norm:.6e}; \
+             max|A.v-FD| over the t block = {:.6e}, over the beta block = {:.6e}; \
+             v'Av={directional:.9e} vs v'(dg/dtheta)v={directional_fd:.9e} (ratio \
+             {:.6e}). If this fires, the IndefiniteObservedInformation refusal is \
+             measuring the wrong operator, the converged-but-indefinite verdict is an \
+             artefact of the refusal site rather than a saddle upstream, and the \
+             negative-curvature escape is the WRONG fix. Probe: {label}, h={h:.3e}",
+            block_of(worst_idx),
             analytic[worst_idx],
             fd[worst_idx],
+            block_residual(0, total_t),
+            block_residual(total_t, dim),
             directional_fd / directional,
         );
     }
 }
 
 #[test]
-fn beta_prior_theta_adjoint_matches_dense_probes_and_weighted_hessian_values_2820() {
-    let (term, target, rho) = threshold_gate_tiny_fixture(false);
-    assert_full_theta_adjoint_hessian_values(term, target, rho);
-}
-
-#[test]
-fn softmax_residual_theta_adjoint_matches_weighted_hessian_values_2820() {
-    let (mut term, target, rho) = threshold_gate_tiny_fixture(false);
-    term.assignment.mode = AssignmentMode::softmax(0.8);
-    let rho = rho.for_assignment(term.assignment.mode);
-    assert_full_theta_adjoint_hessian_values(term, target, rho);
-}
-
-fn assert_full_theta_adjoint_hessian_values(
-    mut term: SaeManifoldTerm,
-    mut target: Array2<f64>,
-    rho: SaeManifoldRho,
-) {
-    term.set_row_loss_weights(
-        (0..term.n_obs())
-            .map(|row| 0.7 + 0.1 * (row % 5) as f64)
-            .collect(),
-    )
-    .unwrap();
-    // Keep a nonzero residual: an exactly reconstructed fixture cannot detect
-    // missing residual-weighted third jets, even with a nonzero inverse trace.
-    for ((row, column), value) in target.indexed_iter_mut() {
-        *value += 0.03 * ((row + 2 * column + 1) as f64).sin();
-    }
-    let system = term
-        .assemble_arrow_schur(target.view(), &rho, None)
-        .unwrap();
-    let (_, _, cache) =
-        solve_arrow_newton_step_with_options(&system, 0.0, 0.0, &ArrowSolveOptions::direct())
-            .unwrap();
-    assert!(cache.schur_factor_is_undamped);
-    assert_eq!(deflated_direction_count(&term, &cache), 0);
-    assert!(!cache.exact_beta_remainders.is_empty());
-    let solver = crate::manifold::arrow_solver::DeflatedArrowSolver::plain(&cache);
-    let weight = term.materialize_joint_inverse(&cache, &solver).unwrap();
-    let total_t = cache.delta_t_len();
-    let k = cache.k;
-    let probes: Vec<_> = (0..k)
-        .map(|j| {
-            let mut axis = Array1::zeros(k);
-            axis[j] = (k as f64).sqrt();
-            axis
-        })
-        .collect();
-    let inverse_probes: Vec<_> = probes
-        .iter()
-        .map(|probe| cache.schur_inverse_apply(probe.view()).unwrap())
-        .collect();
-
-    let mut failures = Vec::new();
-    for exact in [false, true] {
-        let operator = if exact {
-            EvidenceOperator::ExactObservedInformation
-        } else {
-            EvidenceOperator::Majorizer
-        };
-        let residual_target = exact.then_some(target.view());
-        let dense = term
-            .logdet_theta_adjoint_dense(
-                &rho,
-                &cache,
-                &weight,
-                ThetaAdjointDhChannel::All,
-                false,
-                exact,
-                residual_target,
-            )
-            .unwrap();
-        let probe = term
-            .logdet_theta_adjoint_from_probes(
-                &rho,
-                &cache,
-                &probes,
-                &inverse_probes,
-                operator,
-                residual_target,
-            )
-            .unwrap();
-        assert!(
-            dense
-                .t
-                .iter()
-                .chain(dense.beta.iter())
-                .chain(probe.t.iter())
-                .chain(probe.beta.iter())
-                .all(|x| x.is_finite())
-        );
-        let parity_t = dense
-            .t
-            .iter()
-            .zip(probe.t.iter())
-            .map(|(&a, &b)| (a - b).abs())
-            .fold(0.0_f64, f64::max);
-        let parity_beta = dense
-            .beta
-            .iter()
-            .zip(probe.beta.iter())
-            .map(|(&a, &b)| (a - b).abs())
-            .fold(0.0_f64, f64::max);
-        if parity_t.max(parity_beta) >= 1.0e-10 {
-            failures.push(format!(
-                "exact={exact}: dense/probe t={parity_t:e}, beta={parity_beta:e}"
-            ));
-        }
-        if !exact {
-            let selected = term.logdet_theta_adjoint(&rho, &cache, &solver).unwrap();
-            for (&a, &b) in dense.beta.iter().zip(selected.beta.iter()) {
-                assert!((a - b).abs() < 1.0e-10);
-            }
-        }
-        if matches!(term.assignment.mode, AssignmentMode::Softmax { .. }) {
-            let selected = term
-                .contracted_softmax_trace_adjoint(
-                    &rho,
-                    &cache,
-                    &solver,
-                    true,
-                    operator,
-                    residual_target,
-                )
-                .unwrap();
-            let error = dense
-                .t
-                .iter()
-                .chain(dense.beta.iter())
-                .zip(selected.t.iter().chain(selected.beta.iter()))
-                .map(|(&a, &b)| (a - b).abs())
-                .fold(0.0_f64, f64::max);
+fn threshold_gate_priced_clamp_theta_diagonal_matches_finite_difference_2820() {
+    let (term, target, rho) = threshold_gate_tiny_fixture(true);
+    let (_, cache) = frozen_cache(&term, &target, &rho);
+    let derivative = term
+        .ard_concave_clamp_dt_diagonal(&rho, &cache)
+        .expect("priced-clamp theta derivative");
+    let h = 1.0e-5;
+    let mut live = 0;
+    for (row, atom, slot) in logit_slots(&term, &cache) {
+        let mut plus = term.clone();
+        let mut minus = term.clone();
+        plus.assignment.logits[[row, atom]] += h;
+        minus.assignment.logits[[row, atom]] -= h;
+        let ep = plus
+            .materialize_ard_concave_clamp_diagonal(&rho, &cache)
+            .expect("positive endpoint remainder");
+        let em = minus
+            .materialize_ard_concave_clamp_diagonal(&rho, &cache)
+            .expect("negative endpoint remainder");
+        for index in 0..derivative.len() {
+            let fd = (ep[index] - em[index]) / (2.0 * h);
+            let expected = if index == slot { derivative[slot] } else { 0.0 };
             assert!(
-                error < 1.0e-10,
-                "exact={exact}: resident/dense parity={error:e}"
+                (fd - expected).abs() <= 1.0e-9 + 1.0e-7 * expected.abs(),
+                "row={row} atom={atom} output={index}: analytic={expected:e}, fd={fd:e}"
             );
         }
-
-        let trace_at = |coordinate: usize, step: f64| {
-            let mut moved = term.clone();
-            moved.decoder_repulsion_gate = term.decoder_repulsion_gate.clone();
-            moved.barrier_coactivation_gate = term.barrier_coactivation_gate.clone();
-            moved.amplitude_barrier_gate = term.amplitude_barrier_gate;
-            moved.streaming_gates_frozen = true;
-            let mut direction = Array1::zeros(total_t + k);
-            direction[coordinate] = step.signum();
-            moved
-                .apply_newton_step(
-                    direction.slice(ndarray::s![..total_t]),
-                    direction.slice(ndarray::s![total_t..]),
-                    step.abs(),
-                )
-                .unwrap();
-            let system = moved
-                .assemble_arrow_schur(target.view(), &rho, None)
-                .unwrap();
-            let (_, _, endpoint) = solve_arrow_newton_step_with_options(
-                &system,
-                0.0,
-                0.0,
-                &ArrowSolveOptions::direct(),
-            )
-            .unwrap();
-            assert_eq!(deflated_direction_count(&moved, &endpoint), 0);
-            if exact {
-                let matrix = moved
-                    .materialize_exact_hessian_dense(&rho, target.view(), &endpoint)
-                    .unwrap();
-                weight
-                    .iter()
-                    .zip(matrix.t().iter())
-                    .map(|(&a, &b)| a * b)
-                    .sum::<f64>()
-            } else {
-                (0..weight.ncols())
-                    .map(|column| {
-                        let vector = weight.column(column);
-                        let action = crate::manifold::arrow_solver::apply_cached_arrow_hessian(
-                            &endpoint,
-                            vector.slice(ndarray::s![..total_t]),
-                            vector.slice(ndarray::s![total_t..]),
-                        )
-                        .unwrap();
-                        if column < total_t {
-                            action.t[column]
-                        } else {
-                            action.beta[column - total_t]
-                        }
-                    })
-                    .sum::<f64>()
-            }
-        };
-        let mut maximum_error = 0.0_f64;
-        let mut signal = 0.0_f64;
-        for (coordinate, &analytic) in dense.t.iter().chain(dense.beta.iter()).enumerate() {
-            let step = 2.0e-5;
-            let fd = (trace_at(coordinate, step) - trace_at(coordinate, -step)) / (2.0 * step);
-            let error = (analytic - fd).abs();
-            maximum_error = maximum_error.max(error);
-            signal = signal.max(fd.abs());
-            if !error.is_finite() || error >= 2.0e-6 * (1.0 + fd.abs()) {
-                failures.push(format!(
-                    "exact={exact}, theta={coordinate}: Gamma={analytic} weighted-Hessian FD={fd}"
-                ));
-            }
-        }
-        assert!(signal > 1.0e-4);
-        eprintln!(
-            "#2820 full theta adjoint exact={exact}: parity_t={parity_t:e}, parity_beta={parity_beta:e}, error={maximum_error:e}, signal={signal:e}"
-        );
+        live += usize::from(derivative[slot].abs() > 1.0e-3);
     }
-    assert!(failures.is_empty(), "{}", failures.join("\n"));
+    assert!(live >= term.n_obs(), "the concave logit channel must be live");
+
+    let mut fixed = term.clone();
+    fixed.assignment.ungated[0] = true;
+    let fixed_derivative = fixed
+        .ard_concave_clamp_dt_diagonal(&rho, &cache)
+        .expect("fixed-logit clamp derivative");
+    for (_, atom, slot) in logit_slots(&fixed, &cache) {
+        assert_eq!(fixed_derivative[slot], if atom == 0 { 0.0 } else { derivative[slot] });
+    }
 }
+

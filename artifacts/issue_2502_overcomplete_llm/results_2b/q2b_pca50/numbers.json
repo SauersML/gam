@@ -1,0 +1,188 @@
+{
+  "arm": "q2b_pca50",
+  "crate_version": "0.3.154",
+  "dictionary": {
+    "G_blocks": 1,
+    "K_atoms": 50,
+    "block_size": 50,
+    "block_topk": 1,
+    "decoder_bytes": 409600,
+    "decoder_bytes_expected": 409600,
+    "gamma": 1.0,
+    "overcomplete_ratio_K_over_p": 0.0244140625,
+    "train_mean_bytes": 8192
+  },
+  "engine": "gam_sae::sparse_dict::BlockSparseStreamState",
+  "epochs": [
+    {
+      "accepted_births": 0,
+      "converged": false,
+      "dead": 0,
+      "epoch": 1,
+      "gamma": 0.9999999403953552,
+      "seconds": 148.116826732,
+      "train_explained_variance": 0.19014591230865752
+    },
+    {
+      "accepted_births": 0,
+      "converged": false,
+      "dead": 0,
+      "epoch": 2,
+      "gamma": 1.0,
+      "seconds": 286.942352681,
+      "train_explained_variance": 0.35935595077201166
+    },
+    {
+      "accepted_births": 0,
+      "converged": false,
+      "dead": 0,
+      "epoch": 3,
+      "gamma": 1.0,
+      "seconds": 426.440519305,
+      "train_explained_variance": 0.3795954550838251
+    },
+    {
+      "accepted_births": 0,
+      "converged": false,
+      "dead": 0,
+      "epoch": 4,
+      "gamma": 1.0,
+      "seconds": 565.771141388,
+      "train_explained_variance": 0.38504757369899645
+    },
+    {
+      "accepted_births": 0,
+      "converged": false,
+      "dead": 0,
+      "epoch": 5,
+      "gamma": 1.0,
+      "seconds": 709.27317325,
+      "train_explained_variance": 0.3873331511044934
+    },
+    {
+      "accepted_births": 0,
+      "converged": false,
+      "dead": 0,
+      "epoch": 6,
+      "gamma": 1.0,
+      "seconds": 852.382403461,
+      "train_explained_variance": 0.38853287690321003
+    },
+    {
+      "accepted_births": 0,
+      "converged": false,
+      "dead": 0,
+      "epoch": 7,
+      "gamma": 1.0,
+      "seconds": 990.827743423,
+      "train_explained_variance": 0.389250698647704
+    },
+    {
+      "accepted_births": 0,
+      "converged": false,
+      "dead": 0,
+      "epoch": 8,
+      "gamma": 1.0,
+      "seconds": 1129.880324007,
+      "train_explained_variance": 0.3897187626669094
+    },
+    {
+      "accepted_births": 0,
+      "converged": false,
+      "dead": 0,
+      "epoch": 9,
+      "gamma": 1.0,
+      "seconds": 1268.125930812,
+      "train_explained_variance": 0.39004398768909687
+    },
+    {
+      "accepted_births": 0,
+      "converged": false,
+      "dead": 0,
+      "epoch": 10,
+      "gamma": 1.0,
+      "seconds": 1406.785328278,
+      "train_explained_variance": 0.3902819291871289
+    },
+    {
+      "accepted_births": 0,
+      "converged": false,
+      "dead": 0,
+      "epoch": 11,
+      "gamma": 1.0,
+      "seconds": 1546.700230339,
+      "train_explained_variance": 0.39046361241607497
+    },
+    {
+      "accepted_births": 0,
+      "converged": false,
+      "dead": 0,
+      "epoch": 12,
+      "gamma": 1.0,
+      "seconds": 1685.658136304,
+      "train_explained_variance": 0.39060701650063634
+    },
+    {
+      "accepted_births": 0,
+      "converged": false,
+      "dead": 0,
+      "epoch": 13,
+      "gamma": 1.0,
+      "seconds": 1825.510292311,
+      "train_explained_variance": 0.39072279978776514
+    },
+    {
+      "accepted_births": 0,
+      "converged": true,
+      "dead": 0,
+      "epoch": 14,
+      "gamma": 1.0,
+      "seconds": 1965.521492239,
+      "train_explained_variance": 0.3908175033762451
+    }
+  ],
+  "fit": {
+    "aux_k": 64,
+    "converged": true,
+    "device_admitted": false,
+    "epochs_run": 14,
+    "gpu_policy": "Off",
+    "seed_coordinate_fallback_blocks": 0,
+    "seed_policy": "Rows",
+    "train_explained_variance": 0.3908175033762451,
+    "train_seconds": 1953.157062621
+  },
+  "heldout": {
+    "explained_variance": 0.3826820158238562,
+    "fvu": 0.6173179841761438,
+    "fvu_about_train_mean": 0.6148262791824327,
+    "rows_scored": 100000,
+    "rss": 2181639.384240019,
+    "seconds": 11.25655787,
+    "tss_about_eval_mean": 3534060.954260999,
+    "tss_about_train_mean": 3548383.434652568
+  },
+  "inputs": {
+    "eval": "/scratch.global/sauer354/a5acts2b/eval.npy",
+    "n_eval": 100000,
+    "n_train": 300000,
+    "p": 2048,
+    "train": "/scratch.global/sauer354/a5acts2b/train.npy"
+  },
+  "issue": 2502,
+  "overcompleteness": {
+    "G_blocks": 1,
+    "K_atoms": 50,
+    "ambient_p": 2048,
+    "atoms_used_exceeds_ambient_p": false,
+    "atoms_used_on_heldout": 50,
+    "blocks_used_on_heldout": 1,
+    "note": "atoms_used > p implies the used sub-dictionary is linearly dependent"
+  },
+  "rate": {
+    "active_scalars_per_token": 50,
+    "firings_per_token": 1,
+    "selection_bits_per_token": 0.0
+  },
+  "wall_seconds": 1976.798950654
+}

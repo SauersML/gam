@@ -8,8 +8,8 @@ super-resolution, and the contract-composition / loop-holonomy calculus.
 Per the project spec (Python is a thin wrapper over Rust, no math in Python),
 every number here is computed in the Rust core; this module only coerces the
 numpy inputs to the contiguous dtypes the FFI expects and packs the returned
-dicts into frozen dataclasses. Block geometry and audit values retain FP64;
-the scalar dictionary trainer and its automatic router use FP32.
+dicts into frozen dataclasses. All heavy state is FP32, matching the collapsed
+linear / block lanes these diagnostics read.
 """
 
 from __future__ import annotations
@@ -25,8 +25,8 @@ import numpy as np
 from ._binding import rust_module
 
 
-def _as_2d_f64(values: Any, label: str) -> np.ndarray:
-    arr = np.asarray(values, dtype=np.float64)
+def _as_2d_f32(values: Any, label: str) -> np.ndarray:
+    arr = np.asarray(values, dtype=np.float32)
     if arr.ndim != 2:
         raise ValueError(f"{label} must be a 2-D array; got shape {arr.shape}")
     return np.ascontiguousarray(arr)
@@ -64,7 +64,7 @@ def _sparse_route_arrays(
             f"{label} must be a sparse route mapping/object or (indices, values) pair"
         )
     idx = _as_2d_u32(indices, f"{label}.indices")
-    val = np.asarray(values, dtype=np.float64)
+    val = np.asarray(values, dtype=np.float32)
     if block_size == 1 and val.ndim == 2:
         val = val[:, :, None]
     if val.ndim != 3:
@@ -139,7 +139,7 @@ def dimension_spectrometer(
     ``code_ridge`` and ``decoder_ridge`` must be equal. ``score_mode="auto"``
     uses CUDA when the exact router admits the workload and otherwise uses CPU.
     """
-    x = np.ascontiguousarray(_as_2d_f64(data, "data"), dtype=np.float32)
+    x = _as_2d_f32(data, "data")
     payload = rust_module().dimension_spectrometer(
         x,
         k_min,
@@ -196,9 +196,9 @@ def block_firing_coordinates(
 ) -> BlockCoordinateReport:
     """Recover per-firing circle coordinates (phase, amplitude, SEs) for one
     ``b = 2`` block from fixed-width sparse ``blocks`` / ``codes`` routing."""
-    dec = _as_2d_f64(decoder, "decoder")
+    dec = _as_2d_f32(decoder, "decoder")
     blk = _as_2d_u32(blocks, "blocks")
-    cod = np.ascontiguousarray(np.asarray(codes, dtype=np.float64))
+    cod = np.ascontiguousarray(np.asarray(codes, dtype=np.float32))
     if cod.ndim != 3:
         raise ValueError(f"codes must be a 3-D N x k x b array; got shape {cod.shape}")
     payload = rust_module().block_firing_coordinates(dec, blk, cod, block)
@@ -272,8 +272,8 @@ def routability_audit(
 ) -> RoutabilityAudit:
     """Measure a fitted dictionary's max-cross-gate distribution against real
     residual rows and compare it to the closed-form floor."""
-    dec = _as_2d_f64(decoder, "decoder")
-    res = _as_2d_f64(residuals, "residuals")
+    dec = _as_2d_f32(decoder, "decoder")
+    res = _as_2d_f32(residuals, "residuals")
     payload = rust_module().routability_audit(
         dec, res, block_size, delta, list(quantile_levels)
     )
@@ -312,10 +312,10 @@ def sparse_dict_dual_certificate(
 ) -> DualCertificateReport:
     """Certify (or refute) global optimality of a fitted sparse routing and
     surface the strongest strictly-improving birth candidates."""
-    dat = _as_2d_f64(data, "data")
-    dec = _as_2d_f64(decoder, "decoder")
+    dat = _as_2d_f32(data, "data")
+    dec = _as_2d_f32(decoder, "decoder")
     idx = _as_2d_u32(indices, "indices")
-    cod = _as_2d_f64(codes, "codes")
+    cod = _as_2d_f32(codes, "codes")
     payload = rust_module().sparse_dict_dual_certificate(dat, dec, idx, cod, max_candidates)
     return DualCertificateReport(
         n_rows=int(payload["n_rows"]),
@@ -331,7 +331,7 @@ def sparse_dict_dual_certificate(
 
 def _load_decoder_checkpoint(checkpoint: Any, decoder_key: str | None) -> tuple[np.ndarray, dict[str, Any]]:
     if isinstance(checkpoint, np.ndarray):
-        return _as_2d_f64(checkpoint, "checkpoint decoder"), {
+        return _as_2d_f32(checkpoint, "checkpoint decoder"), {
             "format": "array",
             "decoder_key": None,
         }
@@ -339,7 +339,7 @@ def _load_decoder_checkpoint(checkpoint: Any, decoder_key: str | None) -> tuple[
         key = decoder_key or "decoder"
         if key not in checkpoint:
             raise KeyError(f"checkpoint dict does not contain decoder key {key!r}")
-        return _as_2d_f64(checkpoint[key], f"checkpoint[{key!r}]"), {
+        return _as_2d_f32(checkpoint[key], f"checkpoint[{key!r}]"), {
             "format": "mapping",
             "decoder_key": key,
         }
@@ -347,7 +347,7 @@ def _load_decoder_checkpoint(checkpoint: Any, decoder_key: str | None) -> tuple[
     path = Path(checkpoint)
     suffix = path.suffix.lower()
     if suffix == ".npy":
-        return _as_2d_f64(np.load(path), str(path)), {
+        return _as_2d_f32(np.load(path), str(path)), {
             "format": "npy",
             "path": str(path),
             "decoder_key": None,
@@ -357,7 +357,7 @@ def _load_decoder_checkpoint(checkpoint: Any, decoder_key: str | None) -> tuple[
         key = decoder_key or "decoder"
         if key not in archive.files:
             raise KeyError(f"{path} does not contain decoder array {key!r}")
-        return _as_2d_f64(archive[key], f"{path}:{key}"), {
+        return _as_2d_f32(archive[key], f"{path}:{key}"), {
             "format": "npz",
             "path": str(path),
             "decoder_key": key,
@@ -373,7 +373,7 @@ def _load_decoder_checkpoint(checkpoint: Any, decoder_key: str | None) -> tuple[
         key = decoder_key or "decoder"
         if key not in tensors:
             raise KeyError(f"{path} does not contain decoder tensor {key!r}")
-        return _as_2d_f64(tensors[key], f"{path}:{key}"), {
+        return _as_2d_f32(tensors[key], f"{path}:{key}"), {
             "format": "safetensors",
             "path": str(path),
             "decoder_key": key,
@@ -425,7 +425,7 @@ def audit_sae(
     Neither Python nor Rust materializes the logical ``N x K`` matrix.
     """
     dec, checkpoint_meta = _load_decoder_checkpoint(checkpoint, decoder_key)
-    acts = _as_2d_f64(activations, "activations")
+    acts = _as_2d_f32(activations, "activations")
     if acts.shape[1] != dec.shape[1]:
         raise ValueError(
             f"activations have P={acts.shape[1]} columns but decoder has P={dec.shape[1]}"
@@ -436,20 +436,14 @@ def audit_sae(
                 "block audit requires sparse external codes=(block_indices, block_values)"
             )
         route_active = 1 if active is None else int(active)
-        # The scalar router owns FP32 state. Audit the exact values supplied
-        # to that native route, widened without loss for the diagnostic core.
-        route_acts = np.ascontiguousarray(acts, dtype=np.float32)
-        route_decoder = np.ascontiguousarray(dec, dtype=np.float32)
         routed = rust_module().sparse_dictionary_transform_ffi(
-            route_acts,
-            route_decoder,
+            acts,
+            dec,
             route_active,
             int(score_tile),
             float(code_ridge),
             score_mode,
         )
-        acts = route_acts.astype(np.float64)
-        dec = route_decoder.astype(np.float64)
         route_indices, route_values = _sparse_route_arrays(
             routed, "codes", block_size
         )

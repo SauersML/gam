@@ -13,7 +13,7 @@ fn firth_hard_pseudo_rank_is_invariant_to_competing_smoothing_strengths() {
     let design = array![[1.0, 0.0, 0.0]];
     let weak_penalty = array![[0.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 0.0]];
     let penalty_root = array![[0.0, 1.0, 0.0], [0.0, 0.0, 0.0]];
-    let structural_rank = super::super::objective::firth_penalized_structural_rank(
+    let structural_rank = super::super::outer_eval::objective::firth_penalized_structural_rank(
         &design.t().to_owned(),
         &penalty_root,
     )

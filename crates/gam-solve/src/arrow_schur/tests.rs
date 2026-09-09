@@ -847,18 +847,9 @@ pub(crate) fn evidence_row_spectral_deflates_indefinite_non_gauge_block_at_unit_
     pd.htbeta = indef.htbeta.clone();
     pd.gt = array![0.0_f64, 0.0, 0.0];
 
-    let result = factor_one_row_result(
-        &pd,
-        0.0,
-        d,
-        0,
-        true,
-        std::slice::from_ref(&gauge_e1),
-        true,
-        false,
-        None,
-    )
-    .expect("undamped evidence factor must succeed on the genuinely-PD stationary block");
+    let result =
+        factor_one_row_result(&pd, 0.0, d, 0, true, std::slice::from_ref(&gauge_e1), true, false, None)
+        .expect("undamped evidence factor must succeed on the genuinely-PD stationary block");
     // Exactly one gauge direction deflated; the non-gauge spectrum is
     // factored as-is (no ridge), so L Lᵀ reproduces H_tt on the two genuine
     // directions and the deflated gauge direction carries the +1 stiffness.
@@ -1144,8 +1135,11 @@ fn beta_coupling_graph_reads_the_routed_htbeta_not_the_dense_slab() {
     let matrix_free = {
         // Same operator, no dense slab at all: `htbeta_cols = 0`, exactly what
         // `SaeSupportSparseTerm::assemble_arrow_schur` allocates.
-        let mut sys =
-            ArrowSchurSystem::new_with_per_row_dims_empty_hbb_and_htbeta_cols(vec![1, 1, 1], k, 0);
+        let mut sys = ArrowSchurSystem::new_with_per_row_dims_empty_hbb_and_htbeta_cols(
+            vec![1, 1, 1],
+            k,
+            0,
+        );
         assert_eq!(sys.rows[0].htbeta.dim(), (1, 0));
         sys.set_row_htbeta_operator(
             move |row_idx, x, out| {
@@ -1213,8 +1207,11 @@ fn beta_coupling_graph_reads_the_routed_htbeta_not_the_dense_slab() {
     // is still ACTIVE: the predicate is "some entry is nonzero", which the
     // element scan tested and an unsigned probe would have missed.
     let cancelling = {
-        let mut sys =
-            ArrowSchurSystem::new_with_per_row_dims_empty_hbb_and_htbeta_cols(vec![2], 4, 0);
+        let mut sys = ArrowSchurSystem::new_with_per_row_dims_empty_hbb_and_htbeta_cols(
+            vec![2],
+            4,
+            0,
+        );
         sys.set_row_htbeta_operator(
             |_, x, out| {
                 out[0] += x[0] + x[2];
@@ -1228,8 +1225,7 @@ fn beta_coupling_graph_reads_the_routed_htbeta_not_the_dense_slab() {
         sys.set_block_offsets(vec![0..2, 2..4].into());
         sys
     };
-    let mut cancelling_parts =
-        BetaCouplingGraph::build_from_system(&cancelling).component_partition();
+    let mut cancelling_parts = BetaCouplingGraph::build_from_system(&cancelling).component_partition();
     for part in cancelling_parts.iter_mut() {
         part.sort_unstable();
     }
@@ -3111,15 +3107,16 @@ pub(crate) fn sae_direct_uses_canonical_dense_owner_not_matrix_free_pcg_2660() {
     let ridge_t = 1e-7;
     let ridge_beta = 1e-6;
 
-    let resident =
-        prepare_sae_resident_frame(&sys, &options, None).expect("Direct algorithm-selection probe");
+    let resident = prepare_sae_resident_frame(&sys, &options, None)
+        .expect("Direct algorithm-selection probe");
     assert!(
         resident.is_none(),
         "#2660: Direct prepared the forbidden resident matrix-free SAE-PCG owner"
     );
 
-    let (_, _, diagnostics) = solve_arrow_newton_step_core(&sys, ridge_t, ridge_beta, &options)
-        .expect("SAE Direct production-core solve");
+    let (_, _, diagnostics) =
+        solve_arrow_newton_step_core(&sys, ridge_t, ridge_beta, &options)
+            .expect("SAE Direct production-core solve");
     assert!(
         !diagnostics.selected_matrix_free_pcg,
         "#2660: Direct selected the forbidden matrix-free PCG algorithm"
@@ -4721,10 +4718,34 @@ fn rational_reduced_schur_plan_derived_deflates_to_target() {
         2,
         0.0,
     );
+    let refusal = match under_certified {
+        Ok(_) => panic!(
+            "derived surrogate must refuse when its rank ceiling is exhausted before \
+             the requested Hutchinson error bar is certified"
+        ),
+        Err(reason) => reason,
+    };
+    // A refusal that names only its dimension cannot be acted on, and this one
+    // aborts a fit that has already converged (gam#2731). It has to carry which
+    // of the builder's failure points fired and the numbers to decide on:
+    // whether to raise the ceiling, relax the target, or take the bar as it is.
+    for needle in [
+        "rank ceiling",
+        "std_err",
+        "target",
+        "estimate",
+        "pilot",
+    ] {
+        assert!(
+            refusal.contains(needle),
+            "the rank-ceiling refusal must name `{needle}`; got: {refusal}"
+        );
+    }
+    // And it must be THIS failure point, not one of the four breakdowns that
+    // share the call site's message.
     assert!(
-        under_certified.is_none(),
-        "derived surrogate must refuse when its rank ceiling is exhausted before \
-         the requested Hutchinson error bar is certified"
+        !refusal.contains("broke down") && !refusal.contains("unbuildable"),
+        "a ceiling refusal must not read as a numerical breakdown; got: {refusal}"
     );
 }
 
@@ -5818,6 +5839,95 @@ fn evidence_beta_schur_interior_is_raw_and_newton_boundary_is_tikhonov_2308() {
     assert!((newton_log_det - 4.0_f64.ln()).abs() > 1.0);
 }
 
+/// #2822 — the Newton Tikhonov floor must leave a WELL-SEPARATED POSITIVE
+/// direction at its EXACT curvature. That is the contract
+/// `spectral_pd_floored_schur` states ("a well-separated positive direction
+/// keeps its EXACT eigenvalue, so the Newton step in the healthy β subspace is
+/// unchanged") and the whole reason the #1026 co-collapse cure is allowed to run
+/// on a converged dictionary: it may damp the collapsed subspace and nothing
+/// else.
+///
+/// The discriminating fixture is a reduced Schur whose healthy and collapsed
+/// directions have COMPARABLE magnitude — `S = diag(+5, −99)`, the `owed_1026`
+/// mixed-collapse geometry, whose healthy Newton component is exactly
+/// `Δβ_0 = 10/5 = 2`. `boundary` in the #2308 test above cannot see this defect:
+/// its collapsed entry is `−1e-12`, so the two equilibrations happen to produce
+/// the same floored operator there.
+///
+/// Before the fix, `jacobi_diagonal_scale` read the SIGNED diagonal, so `−99`
+/// missed the `S_aa > 1e-18` branch and was scaled by the substitute `1e-9`:
+/// `S̃ = diag(1, −9.9e19)`, `floor = 1e-8·9.9e19 = 9.9e11`, and the healthy
+/// direction's scaled eigenvalue of `1` was clamped up to `9.9e11`, returning
+/// `9.9e11·5 = 4.95e12` in place of `5` — the live subspace wrong by twelve
+/// orders of magnitude, and `Δβ_0 = 2.0202020202e-12` instead of `2`.
+#[test]
+fn newton_tikhonov_leaves_the_healthy_direction_exact_beside_a_large_negative_2822() {
+    let collapsed = array![[5.0_f64, 0.0], [0.0, -99.0]];
+    let floored = factor_dense_reduced_schur(
+        &collapsed,
+        ReducedSchurPolicy::NewtonTikhonov {
+            relative_floor: SPECTRAL_DEFLATION_REL_FLOOR,
+        },
+    )
+    .expect("an indefinite reduced Schur is Tikhonov-conditioned, not refused");
+    let conditioned = floored
+        .conditioned_schur
+        .as_ref()
+        .expect("the indefinite operator was conditioned");
+    assert_abs_diff_eq!(conditioned[[0, 0]], 5.0, epsilon = 1e-12);
+    assert_abs_diff_eq!(conditioned[[0, 1]], 0.0, epsilon = 1e-12);
+    // The collapsed direction still receives the minimal positive stiffness the
+    // floor exists to give it: strictly positive, and orders below the healthy
+    // curvature rather than above it.
+    assert!(
+        conditioned[[1, 1]] > 0.0 && conditioned[[1, 1]] < 1.0e-4,
+        "the collapsed direction must be lifted to a SMALL strictly positive stiffness, got {}",
+        conditioned[[1, 1]]
+    );
+    // The returned Cholesky factor carries the same healthy curvature, so a
+    // caller's `Δβ_0` is the exact `-g_0/5` and not the floored one:
+    // `(L·Lᵀ)_00 = Σ_c L_0c²`.
+    let reconstructed_healthy: f64 = (0..2)
+        .map(|column| floored.factor[[0, column]] * floored.factor[[0, column]])
+        .sum();
+    assert_abs_diff_eq!(reconstructed_healthy, 5.0, epsilon = 1e-12);
+}
+
+/// #2822 companion control — taking the equilibration scale from `|S_aa|`
+/// instead of `S_aa` is a NO-OP on every operator that reaches the Cholesky
+/// success path, because a positive-definite matrix has no non-positive
+/// diagonal. Pin that on the badly-scaled PD operator the #2015 equilibration
+/// exists for: no conditioning happens at all, and `L·Lᵀ` reproduces the caller's
+/// original `S` to relative round-off across a 15-decade diagonal spread.
+#[test]
+fn equilibrated_cholesky_reconstructs_a_badly_scaled_pd_schur_2822() {
+    let schur = array![
+        [1.0e8_f64, 1.0e2, 0.0],
+        [1.0e2, 4.0e-4, 1.0e-6],
+        [0.0, 1.0e-6, 9.0e-8],
+    ];
+    let factored = factor_dense_reduced_schur(&schur, ReducedSchurPolicy::StrictNewton)
+        .expect("a positive-definite reduced Schur factors without conditioning");
+    assert!(
+        factored.conditioned_schur.is_none(),
+        "a positive-definite operator must not be conditioned at all"
+    );
+    for row in 0..3 {
+        for col in 0..3 {
+            let reconstructed: f64 = (0..=row.min(col))
+                .map(|c| factored.factor[[row, c]] * factored.factor[[col, c]])
+                .sum();
+            let scale = (schur[[row, row]] * schur[[col, col]]).sqrt();
+            assert!(
+                (reconstructed - schur[[row, col]]).abs() <= 1.0e-12 * scale,
+                "L·Lᵀ must reproduce S at ({row},{col}): got {reconstructed}, want {}, \
+                 scale {scale}",
+                schur[[row, col]]
+            );
+        }
+    }
+}
+
 /// #2308 — the public cache seam always rebuilds the same undamped evidence
 /// operator, so changing the Newton ridge history cannot change its value,
 /// mask, or inverse. This exercises the metadata propagation rather than only
@@ -5888,10 +5998,7 @@ fn evidence_cache_boundary_is_invariant_to_newton_damping_history_2308() {
 /// matvec applies, and only a duplicate-base fixture can tell the two apart.
 #[test]
 pub(crate) fn resident_schur_elimination_diagonal_matches_operator_diagonal_2576() {
-    for (n_atoms, m_active, arm) in [
-        (32usize, 5usize, "distinct bases"),
-        (4, 5, "duplicate base"),
-    ] {
+    for (n_atoms, m_active, arm) in [(32usize, 5usize, "distinct bases"), (4, 5, "duplicate base")] {
         let n = 48usize;
         let q = 4usize;
         let p = 6usize;
@@ -6202,7 +6309,10 @@ fn coupled_carrier_penalty_op_equals_its_rank_one_expansion_2731() {
     let k = 24_usize;
     // (start, values) runs; deliberately different widths and starts.
     let carriers: Vec<Vec<(usize, Vec<f64>)>> = vec![
-        vec![(0, vec![0.5, -1.25, 0.75]), (6, vec![2.0, 0.25, -0.5, 1.5])],
+        vec![
+            (0, vec![0.5, -1.25, 0.75]),
+            (6, vec![2.0, 0.25, -0.5, 1.5]),
+        ],
         vec![
             (6, vec![-0.75, 1.0, 0.5, -2.25]),
             (13, vec![0.25, -1.5, 3.0]),
@@ -6408,7 +6518,11 @@ fn evidence_classification_prices_a_clamp_basin_before_refusing_a_saddle_2515() 
         1,
         "exactly the negative direction is pinned under the majorizer policy"
     );
-    assert_abs_diff_eq!(spectrum.cond_evals[pinned_indices[0]], 1.0, epsilon = 0.0);
+    assert_abs_diff_eq!(
+        spectrum.cond_evals[pinned_indices[0]],
+        1.0,
+        epsilon = 0.0
+    );
     assert!(
         spectrum.raw_evals[pinned_indices[0]] < 0.0,
         "the pinned direction is the NEGATIVE one, not the 4.0"
@@ -6418,12 +6532,15 @@ fn evidence_classification_prices_a_clamp_basin_before_refusing_a_saddle_2515() 
         majorizer_metric: array![[4.0_f64, 0.0], [0.0, 4.0]],
         clamp_metric: array![[0.0_f64, 0.0], [0.0, 2.0e-2]],
     };
-    let basin =
-        factor_dense_reduced_schur_with_exact_a(&resolved_negative, exact_a, Some(&basin_geometry))
-            .expect(
-                "#2515: raw negative exact-A curvature wholly explained by the bounded ARD clamp \
+    let basin = factor_dense_reduced_schur_with_exact_a(
+        &resolved_negative,
+        exact_a,
+        Some(&basin_geometry),
+    )
+    .expect(
+        "#2515: raw negative exact-A curvature wholly explained by the bounded ARD clamp \
          is a basin, not a saddle",
-            );
+    );
     let reconstructed_basin = basin.factor.dot(&basin.factor.t());
     let basin_spectrum = basin
         .beta_conditioning
@@ -6670,7 +6787,6 @@ fn matrix_free_exact_a_prices_a_clamp_basin_before_refusing_a_saddle_2515() {
         system.rows[0].htbeta[[0, 0]] = 1.0;
         system.hbb[[0, 0]] = 0.5;
         system.exact_a_classification = Some(ExactAClassificationGeometry {
-            delta_beta: Arc::from([]),
             rows: vec![ExactAClassificationRow {
                 delta_tt: array![[-2.0_f64]],
                 delta_tbeta: Array2::<f64>::zeros((1, 0)),
@@ -6683,7 +6799,9 @@ fn matrix_free_exact_a_prices_a_clamp_basin_before_refusing_a_saddle_2515() {
     };
     let options = ArrowSolveOptions::direct()
         .with_newton_schur_tikhonov(SPECTRAL_DEFLATION_REL_FLOOR)
-        .with_indefinite_refusing_evidence_unit_deflation(SPECTRAL_DEFLATION_REL_FLOOR);
+        .with_indefinite_refusing_evidence_unit_deflation(
+            SPECTRAL_DEFLATION_REL_FLOOR,
+        );
     let basin_system = exact_a_system(2.0);
     let (row_logdet, slq_schur) = matrix_free_arrow_evidence_log_det_surrogate(
         &basin_system,
@@ -6766,4 +6884,78 @@ fn matrix_free_exact_a_prices_a_clamp_basin_before_refusing_a_saddle_2515() {
         "#2515: rational and dense saddle refusals must carry one typed marker: \
          {rational_refusal}"
     );
+}
+
+/// #2598 — the rendered-message reader and the value predicate must agree on
+/// EVERY variant, so that rewording `Display` cannot change one without the
+/// other.
+///
+/// This is the gate that makes `rendered_is_non_pd_schur_complement` safe for a
+/// cross-crate caller. gam-sae's ρ-probe classifier sees only the rendered
+/// string, and the verdict decides whether a refusal is a relocatable trial
+/// point (`+∞`, the outer search steers) or a fatal defect. Before this, that
+/// decision was two string literals sitting in another crate: rewording either
+/// message in the `Display` impl reclassified every recoverable Schur refusal
+/// as fatal, and no test anywhere would have failed. Now the reword and the
+/// reader are in one file and this test fails the moment they disagree.
+///
+/// The list below is every variant, each with a reason chosen to be adversarial
+/// for this pairing: a per-row refusal and a PCG refusal whose own reasons name
+/// a non-PD operator (both must be `false` on both sides), and a Schur refusal
+/// whose reason does not (also `false` on both sides).
+#[test]
+fn rendered_verdict_matches_the_value_verdict_for_every_variant_2598() {
+    let cases = [
+        ArrowSchurError::SchurFactorFailed {
+            reason: "non-PD pivot -2.5e-09 at index 2 (matrix is not positive definite)"
+                .to_string(),
+        },
+        ArrowSchurError::SchurFactorFailed {
+            reason: "cholesky_lower: non-finite entry at linear index 7".to_string(),
+        },
+        ArrowSchurError::SchurFactorFailed {
+            reason: "cholesky_lower: non-square 3x4".to_string(),
+        },
+        ArrowSchurError::PerRowFactorFailed {
+            row: 3,
+            reason: "non-PD pivot -1e-12 at index 0 (matrix is not positive definite)".to_string(),
+        },
+        ArrowSchurError::PerRowFactorIllConditioned {
+            row: 1,
+            kappa_estimate: 1e18,
+        },
+        ArrowSchurError::PcgFailed {
+            reason: "residual stalled while the operator is not positive definite".to_string(),
+        },
+        ArrowSchurError::UnboundedNegativeCurvature {
+            curvature: -3.5e-4,
+            direction_norm_sq: 2.0,
+        },
+        ArrowSchurError::AdaptiveCorrectionFailed {
+            reason: "no Armijo-accepted step; the operator is not positive definite".to_string(),
+        },
+    ];
+    let mut saw_recoverable = false;
+    for error in &cases {
+        let rendered = error.to_string();
+        assert_eq!(
+            ArrowSchurError::rendered_is_non_pd_schur_complement(&rendered),
+            error.is_non_pd_schur_complement(),
+            "the rendered reader and the value predicate disagree on {error:?}; \
+             rendered as {rendered:?}"
+        );
+        saw_recoverable |= error.is_non_pd_schur_complement();
+    }
+    assert!(
+        saw_recoverable,
+        "the agreement above is vacuous unless at least one case is recoverable"
+    );
+
+    // The caller wraps the rendered text in its own context before classifying,
+    // so the reader must survive that wrapping.
+    let wrapped = format!(
+        "SaeManifoldTerm::penalized_quasi_laplace_criterion: {}",
+        cases[0]
+    );
+    assert!(ArrowSchurError::rendered_is_non_pd_schur_complement(&wrapped));
 }

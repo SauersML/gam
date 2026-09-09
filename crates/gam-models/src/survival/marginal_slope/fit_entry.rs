@@ -634,11 +634,8 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
         }
         if influence_absorber_residualized.is_some() {
             // The absorber's single learned ridge sits at the trailing extra
-            // slot; the seed is clamped into the outer ρ box.
-            out.push(
-                crate::marginal_slope_orthogonal::influence_absorber_log_lambda(n)
-                    .clamp(-12.0, 12.0),
-            );
+            // slot; its natural scale centres its resolution-derived outer domain.
+            out.push(crate::marginal_slope_orthogonal::influence_absorber_log_lambda(n));
         }
         out
     };

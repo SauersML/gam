@@ -461,6 +461,29 @@ pub fn build_psi_hyper_coords<F: CustomFamily + Clone + Send + Sync + 'static>(
     // is independent of this flag and stays folded.
     let jeffreys_info_depends_on_psi = family.joint_jeffreys_information_depends_on_psi();
 
+    // The reduced Jeffreys spectrum — `Z_Jᵀ H_info Z_J`, its eigendecomposition,
+    // the conditioning gate, the relative floor and the dominant/worst
+    // eigenvalue indices — is a property of the SNAPSHOT `(H_info, Z_J)` alone.
+    // It does not move with the ψ axis being differentiated, nor with the
+    // coefficient axis of a mixed derivative. gam#979: every explicit-ψ Jeffreys
+    // derivative below used to rebuild it from scratch, so one outer gradient
+    // paid `axes × coefficients` eigendecompositions of the reduced information
+    // for one distinct spectrum. Prepare it once here and hand the prepared plan
+    // to each derivative; the arithmetic each of them performs is unchanged.
+    let jeffreys_plan: Option<gam_solve::estimate::reml::jeffreys_subspace::JointJeffreysPlan> =
+        match jeffreys_hphi_ctx
+            .as_ref()
+            .filter(|_| jeffreys_info_depends_on_psi)
+        {
+            Some((z_j, h_joint)) => Some(
+                gam_solve::estimate::reml::jeffreys_subspace::JointJeffreysPlan::prepare(
+                    h_joint.view(),
+                    z_j.view(),
+                )?,
+            ),
+            None => None,
+        };
+
     // The explicit-ψ Jeffreys score and curvature use the SAME canonical
     // coefficient-axis derivatives {Hdot[e_a]}. Previously each ψ axis rebuilt
     // those p matrices once in the mixed-score loop and AGAIN while preparing
@@ -579,15 +602,8 @@ pub fn build_psi_hyper_coords<F: CustomFamily + Clone + Send + Sync + 'static>(
             } else {
                 None
             };
-        if let (Some((z_j, h_joint)), Some(pert_info)) =
-            (jeffreys_hphi_ctx.as_ref(), firth_pert_info.as_ref())
-        {
-            let phi_psi =
-                    gam_solve::estimate::reml::jeffreys_subspace::joint_jeffreys_phi_explicit_param_derivative(
-                        h_joint.view(),
-                        z_j.view(),
-                        pert_info,
-                    )?;
+        if let (Some(plan), Some(pert_info)) = (jeffreys_plan.as_ref(), firth_pert_info.as_ref()) {
+            let phi_psi = plan.explicit_param_derivative(pert_info)?;
             a -= phi_psi;
         }
         let mut g = &psi_terms.score_psi + &s_psi_beta;
@@ -625,9 +641,7 @@ pub fn build_psi_hyper_coords<F: CustomFamily + Clone + Send + Sync + 'static>(
             } else {
                 None
             };
-        if let (Some((z_j, h_joint)), Some(pert_info)) =
-            (jeffreys_hphi_ctx.as_ref(), firth_pert_info.as_ref())
-        {
+        if let (Some(plan), Some(pert_info)) = (jeffreys_plan.as_ref(), firth_pert_info.as_ref()) {
             if let (Some(base_axes), Some(pert_axes)) = (
                 jeffreys_base_axis_derivatives.as_ref(),
                 firth_pert_axis_derivatives.as_ref(),
@@ -639,17 +653,15 @@ pub fn build_psi_hyper_coords<F: CustomFamily + Clone + Send + Sync + 'static>(
                         pert_axes.len(),
                     )));
                 }
+                // The ambient trace weights depend on the snapshot spectrum and on
+                // `∂_ψH_info` — NOT on the coefficient axis. One preparation serves
+                // every axis; each axis pays only its own Frobenius contraction
+                // (gam#979: this preparation used to run once per coefficient axis).
+                let weights = plan.explicit_param_mixed_trace_weights(pert_info)?;
                 for (a_idx, (hdot_a, psi_hdot_a)) in
                     base_axes.iter().zip(pert_axes.iter()).enumerate()
                 {
-                    let phi_psi_beta_a =
-                            gam_solve::estimate::reml::jeffreys_subspace::joint_jeffreys_phi_explicit_param_second_derivative(
-                                h_joint.view(),
-                                z_j.view(),
-                                pert_info,
-                                hdot_a,
-                                psi_hdot_a,
-                            )?;
+                    let phi_psi_beta_a = weights.contract(hdot_a, psi_hdot_a)?;
                     g[a_idx] -= phi_psi_beta_a;
                 }
             } else {
@@ -682,18 +694,18 @@ pub fn build_psi_hyper_coords<F: CustomFamily + Clone + Send + Sync + 'static>(
                     _ => None,
                 };
                 if let Some((hdots, psi_hdots)) = batched {
+                    let weights = plan.explicit_param_mixed_trace_weights(pert_info)?;
                     for a_idx in 0..total {
                         let phi_psi_beta_a =
-                                gam_solve::estimate::reml::jeffreys_subspace::joint_jeffreys_phi_explicit_param_second_derivative(
-                                    h_joint.view(),
-                                    z_j.view(),
-                                    pert_info,
-                                    &hdots[a_idx],
-                                    &psi_hdots[a_idx],
-                                )?;
+                            weights.contract(&hdots[a_idx], &psi_hdots[a_idx])?;
                         g[a_idx] -= phi_psi_beta_a;
                     }
                 } else {
+                    // Prepared on the first axis the family actually serves, so an
+                    // evaluation where every axis declines behaves exactly as before.
+                    let mut weights: Option<
+                        gam_solve::estimate::reml::jeffreys_subspace::JointJeffreysExplicitMixedTraceWeights,
+                    > = None;
                     for a_idx in 0..total {
                         let mut e_a = Array1::<f64>::zeros(total);
                         e_a[a_idx] = 1.0;
@@ -715,14 +727,13 @@ pub fn build_psi_hyper_coords<F: CustomFamily + Clone + Send + Sync + 'static>(
                                 total,
                             )?;
                         if let (Some(hdot_a), Some(psi_hdot_a)) = (hdot_a, psi_hdot_a) {
-                            let phi_psi_beta_a =
-                                gam_solve::estimate::reml::jeffreys_subspace::joint_jeffreys_phi_explicit_param_second_derivative(
-                                    h_joint.view(),
-                                    z_j.view(),
-                                    pert_info,
-                                    &hdot_a,
-                                    &psi_hdot_a,
-                                )?;
+                            if weights.is_none() {
+                                weights =
+                                    Some(plan.explicit_param_mixed_trace_weights(pert_info)?);
+                            }
+                            let prepared =
+                                weights.as_ref().expect("weights prepared on this axis");
+                            let phi_psi_beta_a = prepared.contract(&hdot_a, &psi_hdot_a)?;
                             g[a_idx] -= phi_psi_beta_a;
                         }
                     }
@@ -869,6 +880,91 @@ pub fn build_psi_hyper_coords<F: CustomFamily + Clone + Send + Sync + 'static>(
 /// the inline construction in [`build_psi_hyper_coords`]. Returns `None` unless
 /// the family uses the joint-Jeffreys term and exposes a dense joint Hessian, so
 /// every non-Jeffreys / operator-only family is byte-unchanged.
+/// The snapshot Jeffreys spectrum together with the per-ψ-axis information
+/// derivatives `∂_{ψ_a}H_info|_β` and the ambient trace weights they induce.
+///
+/// The ψψ value second derivative `∂_{ψ_i}∂_{ψ_j}Φ` is `weights(ψ_i)` contracted
+/// with `(∂_{ψ_j}H_info, ∂_{ψ_i}∂_{ψ_j}H_info)`. Both the spectrum and the
+/// weights of a given first leg are fixed for the whole evaluation: the spectrum
+/// by `(H_info, Z_J)` and the weights additionally by `∂_{ψ_i}H_info`, none of
+/// which move with the second leg. gam#979: forming them inside the pair loop
+/// cost one reduced-information eigendecomposition per PAIR — `axes²` of them
+/// for one spectrum — which is what this cache removes. Each axis's weights are
+/// prepared on first use, so an evaluation that never reaches an axis keeps its
+/// exact previous outcome, including a stratum refusal it never provoked.
+pub struct JeffreysPsiWeightCache {
+    plan: gam_solve::estimate::reml::jeffreys_subspace::JointJeffreysPlan,
+    /// `∂_{ψ_a}H_info|_β` for every ψ axis, in layout order.
+    pub pert_first: Vec<Array2<f64>>,
+    weights: Vec<
+        std::sync::OnceLock<
+            gam_solve::estimate::reml::jeffreys_subspace::JointJeffreysExplicitMixedTraceWeights,
+        >,
+    >,
+}
+
+impl JeffreysPsiWeightCache {
+    /// Prepare the snapshot spectrum once and retain the axis derivatives.
+    pub fn new(
+        z_j: &Array2<f64>,
+        h_joint: &Array2<f64>,
+        pert_first: Vec<Array2<f64>>,
+    ) -> Result<Self, CustomFamilyError> {
+        let plan = gam_solve::estimate::reml::jeffreys_subspace::JointJeffreysPlan::prepare(
+            h_joint.view(),
+            z_j.view(),
+        )?;
+        let weights = (0..pert_first.len())
+            .map(|_| std::sync::OnceLock::new())
+            .collect();
+        Ok(Self {
+            plan,
+            pert_first,
+            weights,
+        })
+    }
+
+    /// Number of ψ axes the cache carries derivatives for.
+    #[must_use]
+    pub fn axes(&self) -> usize {
+        self.pert_first.len()
+    }
+
+    /// The ambient trace weights for first leg `axis`, prepared on first use.
+    ///
+    /// A concurrent first use recomputes rather than blocks; the result is a
+    /// pure function of the plan and the axis derivative, so either writer
+    /// stores the same weights.
+    pub fn weights_for_axis(
+        &self,
+        axis: usize,
+    ) -> Result<
+        &gam_solve::estimate::reml::jeffreys_subspace::JointJeffreysExplicitMixedTraceWeights,
+        CustomFamilyError,
+    > {
+        let slot = self.weights.get(axis).ok_or_else(|| {
+            CustomFamilyError::trial_point(format!(
+                "Jeffreys ψ weight cache has {} axes, asked for axis {axis}",
+                self.weights.len()
+            ))
+        })?;
+        if let Some(prepared) = slot.get() {
+            return Ok(prepared);
+        }
+        let prepared = self
+            .plan
+            .explicit_param_mixed_trace_weights(&self.pert_first[axis])?;
+        // `set` hands the weights back when a concurrent first use filled the
+        // slot first. They are a pure function of the plan and this axis's
+        // derivative, so whose copy the slot holds does not matter: the loser's
+        // is dropped and every caller reads the stored one.
+        if let Err(duplicate) = slot.set(prepared) {
+            drop(duplicate);
+        }
+        Ok(slot.get().expect("weights stored for this axis"))
+    }
+}
+
 pub fn build_jeffreys_hphi_ctx<F: CustomFamily + Clone + Send + Sync + 'static>(
     family: &F,
     synced_states: &[ParameterBlockState],
@@ -1005,7 +1101,7 @@ pub fn build_contracted_psi_hook(
     // data-only — no penalty drift, matching the unpenalized Jeffreys info).
     // `None` (no Jeffreys term, or first-order terms unavailable) leaves a clean
     // / well-conditioned fit byte-unchanged.
-    let firth_ctx: Option<(Arc<Array2<f64>>, Arc<Array2<f64>>, Arc<Vec<Array2<f64>>>)> =
+    let firth_ctx: Option<Arc<JeffreysPsiWeightCache>> =
         match jeffreys_ctx {
             Some((z_j, h_joint))
                 if z_j.nrows() == total && h_joint.nrows() == total && h_joint.ncols() == total =>
@@ -1045,7 +1141,9 @@ pub fn build_contracted_psi_hook(
                             }
                         }
                         if ok {
-                            Some((Arc::new(z_j), Arc::new(h_joint), Arc::new(pert_first)))
+                            Some(Arc::new(JeffreysPsiWeightCache::new(
+                                &z_j, &h_joint, pert_first,
+                            )?))
                         } else {
                             None
                         }
@@ -1091,47 +1189,43 @@ pub fn build_contracted_psi_hook(
                 )));
             }
 
-            for i in 0..psi_dim {
-                // EXPLICIT Firth/Jeffreys ψψ VALUE second derivative (gam#1607):
-                //   objective[i] -= ∂_{ψ_i}∂_{ψ(α)}Φ.
-                // This applies to both design/penalty and family-owned axes.
-                if let Some((z_j, h_joint, pert_first)) = firth_ctx.as_ref() {
-                    let pert_i_alpha = match &hessian[i] {
-                        DriftDerivResult::Dense(m) => m.clone(),
-                        DriftDerivResult::Operator(op) => op.mul_mat(&Array2::<f64>::eye(total)),
-                    };
-                    let mut pert_alpha = Array2::<f64>::zeros((total, total));
-                    for (j, &aj) in alpha_psi.iter().enumerate() {
-                        if aj != 0.0 {
-                            pert_alpha.scaled_add(aj, &pert_first[j]);
-                        }
-                    }
-                    let phi_psi_psi =
-                    gam_solve::estimate::reml::jeffreys_subspace::joint_jeffreys_phi_explicit_param_second_derivative(
-                        h_joint.view(),
-                        z_j.view(),
-                        &pert_first[i],
-                        &pert_alpha,
-                        &pert_i_alpha,
-                    )?;
-                    objective[i] -= phi_psi_psi;
-                    if let Some(curvature) = explicit_curvature.as_ref() {
-                        let (correction, score_correction) = (curvature.psi_pair)(i, alpha_psi, &pert_i_alpha)?;
-                        score.row_mut(i).scaled_add(-1.0, &score_correction);
-                        hessian[i] = match &hessian[i] {
-                            DriftDerivResult::Dense(matrix) => {
-                                DriftDerivResult::Dense(matrix + &correction)
-                            }
-                            DriftDerivResult::Operator(operator) => {
-                                DriftDerivResult::Operator(Arc::new(CompositeHyperOperator {
-                                    dense: Some(correction),
-                                    operators: vec![operator.clone()],
-                                    dim_hint: total,
-                                }))
-                            }
-                        };
+        for i in 0..psi_dim {
+            // EXPLICIT Firth/Jeffreys ψψ VALUE second derivative (gam#1607):
+            //   objective[i] -= ∂_{ψ_i}∂_{ψ(α)}Φ.
+            // This applies to both design/penalty and family-owned axes.
+            if let Some(jeffreys) = firth_ctx.as_ref() {
+                let pert_i_alpha = match &hessian[i] {
+                    DriftDerivResult::Dense(m) => m.clone(),
+                    DriftDerivResult::Operator(op) => op.mul_mat(&Array2::<f64>::eye(total)),
+                };
+                let mut pert_alpha = Array2::<f64>::zeros((total, total));
+                for (j, &aj) in alpha_psi.iter().enumerate() {
+                    if aj != 0.0 {
+                        pert_alpha.scaled_add(aj, &jeffreys.pert_first[j]);
                     }
                 }
+                let phi_psi_psi = jeffreys
+                    .weights_for_axis(i)?
+                    .contract(&pert_alpha, &pert_i_alpha)?;
+                objective[i] -= phi_psi_psi;
+                if let Some(curvature) = explicit_curvature.as_ref() {
+                    let (correction, score_correction) =
+                        (curvature.psi_pair)(i, alpha_psi, &pert_i_alpha)?;
+                    score.row_mut(i).scaled_add(-1.0, &score_correction);
+                    hessian[i] = match &hessian[i] {
+                        DriftDerivResult::Dense(matrix) => {
+                            DriftDerivResult::Dense(matrix + &correction)
+                        }
+                        DriftDerivResult::Operator(operator) => {
+                            DriftDerivResult::Operator(Arc::new(CompositeHyperOperator {
+                                dense: Some(correction),
+                                operators: vec![operator.clone()],
+                                dim_hint: total,
+                            }))
+                        }
+                    };
+                }
+            }
 
                 // Family-owned axes have no generic penalty motion. Their complete
                 // V_ij/g_ij/H_ij contribution is already in the workspace result.
@@ -1357,7 +1451,7 @@ pub fn build_psi_pair_callbacks<F: CustomFamily + Clone + Send + Sync + 'static>
     // `build_psi_hyper_coords` use. `None` (no Jeffreys term, or a first-order axis
     // term that can't be materialized total×total — matching the gradient term's own
     // availability gate) leaves a clean / well-conditioned fit byte-unchanged.
-    let firth_pair_ctx: Option<(Arc<Array2<f64>>, Arc<Array2<f64>>, Arc<Vec<Array2<f64>>>)> =
+    let firth_pair_ctx: Option<Arc<JeffreysPsiWeightCache>> =
         match jeffreys_ctx {
             Some((z_j, h_joint))
                 if z_j.nrows() == total && h_joint.nrows() == total && h_joint.ncols() == total =>
@@ -1422,7 +1516,9 @@ pub fn build_psi_pair_callbacks<F: CustomFamily + Clone + Send + Sync + 'static>
                     }
                 }
                 if ok {
-                    Some((Arc::new(z_j), Arc::new(h_joint), Arc::new(pert_first)))
+                    Some(Arc::new(JeffreysPsiWeightCache::new(
+                        &z_j, &h_joint, pert_first,
+                    )?))
                 } else {
                     None
                 }
@@ -1606,9 +1702,9 @@ pub fn build_psi_pair_callbacks<F: CustomFamily + Clone + Send + Sync + 'static>
                 // `0.0` when the conditioning gate skips the term, so a clean fit is
                 // byte-unchanged. Invalid shape/eigensystem evidence propagates through
                 // the pair callback together with workspace failures.
-                if let Some((z_j, h_joint, pert_first)) = firth_pair_ctx.as_ref()
-                    && psi_i < pert_first.len()
-                    && psi_j < pert_first.len()
+                if let Some(jeffreys) = firth_pair_ctx.as_ref()
+                    && psi_i < jeffreys.axes()
+                    && psi_j < jeffreys.axes()
                 {
                     let pert_ij_opt: Option<Array2<f64>> =
                         if b_mat.nrows() == total && b_mat.ncols() == total {
@@ -1619,19 +1715,18 @@ pub fn build_psi_pair_callbacks<F: CustomFamily + Clone + Send + Sync + 'static>
                                 .map(|op| op.mul_mat(&Array2::<f64>::eye(total)))
                         };
                     if let Some(pert_ij) = pert_ij_opt {
-                        let phi_psi_psi =
-                        gam_solve::estimate::reml::jeffreys_subspace::joint_jeffreys_phi_explicit_param_second_derivative(
-                            h_joint.view(),
-                            z_j.view(),
-                            &pert_first[psi_i],
-                            &pert_first[psi_j],
-                            &pert_ij,
-                        )
-                        .map_err(|error| {
-                            format!(
-                                "typed hyper pair ({psi_i}, {psi_j}) Jeffreys second derivative failed: {error}"
-                            )
-                        })?;
+                        let phi_psi_psi = jeffreys
+                            .weights_for_axis(psi_i)
+                            .and_then(|weights| {
+                                weights
+                                    .contract(&jeffreys.pert_first[psi_j], &pert_ij)
+                                    .map_err(CustomFamilyError::from)
+                            })
+                            .map_err(|error| {
+                                format!(
+                                    "typed hyper pair ({psi_i}, {psi_j}) Jeffreys second derivative failed: {error}"
+                                )
+                            })?;
                         a -= phi_psi_psi;
                         if let Some(curvature) = explicit_curvature.as_ref() {
                             let mut alpha = vec![0.0; hyper_layout.len()];
@@ -3411,6 +3506,53 @@ fn canonicalize_screened_objective(
     Ok(screened)
 }
 
+/// The verdict a mode profile reports when no coefficient-mode candidate
+/// survived screening.
+///
+/// It used to be [`CustomFamilyError::UnsupportedConfiguration`] unconditionally,
+/// with every candidate's typed error already rendered to prose. That is the
+/// discard [`CustomFamilyError::into_trial_point`] and the [`From<String>`]
+/// impl next to it both document: `UnsupportedConfiguration` is what
+/// `is_trial_point_infeasible()` answers `false` for, so a profile whose
+/// candidates all said "this theta is infeasible" told the outer search the
+/// PROBLEM was unsupported. The seed loop then had nothing recoverable to
+/// step to and the fit aborted.
+///
+/// Measured on gam#979's large-scale CTN preprocessor: 25 minutes in, with a
+/// certified incumbent already recorded (`best=5.3059e5`), the only candidate
+/// refused with `h' has non-positive values` — a monotonicity refusal at one
+/// trial β, true or false by moving theta — and the whole fit died. The same
+/// mistake is recorded twice before, at #2553 and #2590; this is the third.
+///
+/// So the aggregate carries the aggregate of the verdicts: rho-local only if
+/// EVERY rejection was rho-local. One structural failure among them keeps the
+/// whole profile structural, because a configuration error does not become
+/// true or false by moving theta and must not be retried at every seed.
+fn mode_profile_exhausted_error(
+    rejected_candidates: &[Option<String>],
+    rejection_is_rho_local: &[bool],
+) -> CustomFamilyError {
+    let reasons = rejected_candidates
+        .iter()
+        .enumerate()
+        .map(|(idx, reason)| {
+            format!(
+                "candidate {idx}: {}",
+                reason.as_deref().unwrap_or("no finite converged result")
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+    let reason = format!(
+        "no coefficient-mode candidate produced a finite converged profile objective: {reasons}"
+    );
+    if rejection_is_rho_local.iter().all(|rho_local| *rho_local) {
+        CustomFamilyError::trial_point(reason)
+    } else {
+        CustomFamilyError::UnsupportedConfiguration { reason }
+    }
+}
+
 /// Profile a nonconvex coefficient mode without assembling expensive outer
 /// derivatives for every candidate.
 ///
@@ -3441,6 +3583,11 @@ pub fn evaluate_custom_family_joint_hyper_best_mode_shared<
 
     let mut screened_objectives = vec![None; candidates.len()];
     let mut rejected_candidates = vec![None; candidates.len()];
+    // Whether each candidate's rejection is a property of THIS theta. The two
+    // in-loop rejections below (non-convergence, non-finite objective) are
+    // rho-local by construction, so the default is `true` and only a typed
+    // evaluator error can lower it.
+    let mut rejection_is_rho_local = vec![true; candidates.len()];
     let mut screened_results: Vec<Option<OuterObjectiveEvalResult>> =
         (0..candidates.len()).map(|_| None).collect();
     let penalty_counts = validate_blockspecs(specs)?;
@@ -3468,16 +3615,24 @@ pub fn evaluate_custom_family_joint_hyper_best_mode_shared<
         ) {
             Ok(candidate) => candidate,
             Err(error) => {
+                // Keep the producer's verdict, not just its prose. Rendering
+                // the error to `String` here is exactly the discard
+                // `CustomFamilyError::into_trial_point` documents, and the
+                // aggregate below is the only thing the outer search sees.
+                rejection_is_rho_local[candidate_idx] = error.is_trial_point_infeasible();
                 rejected_candidates[candidate_idx] = Some(format!("evaluator error: {error}"));
                 continue;
             }
         };
         if !candidate.inner_converged {
+            // Rho-local by the same rule `InnerSolveNotConverged` is: the
+            // inner solve missed its condition at THIS theta.
             rejected_candidates[candidate_idx] =
                 Some("inner coefficient solve did not converge".to_string());
             continue;
         }
         if !candidate.objective.is_finite() {
+            // Likewise: the profiled objective becomes finite by moving theta.
             rejected_candidates[candidate_idx] =
                 Some("profile objective was non-finite".to_string());
             continue;
@@ -3500,22 +3655,10 @@ pub fn evaluate_custom_family_joint_hyper_best_mode_shared<
             .then_with(|| left.cmp(right))
     });
     if ranked_candidates.is_empty() {
-        let reasons = rejected_candidates
-            .iter()
-            .enumerate()
-            .map(|(idx, reason)| {
-                format!(
-                    "candidate {idx}: {}",
-                    reason.as_deref().unwrap_or("no finite converged result")
-                )
-            })
-            .collect::<Vec<_>>()
-            .join("; ");
-        return Err(CustomFamilyError::UnsupportedConfiguration {
-            reason: format!(
-                "no coefficient-mode candidate produced a finite converged profile objective: {reasons}"
-            ),
-        });
+        return Err(mode_profile_exhausted_error(
+            &rejected_candidates,
+            &rejection_is_rho_local,
+        ));
     }
 
     if matches!(eval_mode, EvalMode::ValueOnly) {
@@ -4304,4 +4447,70 @@ pub fn evaluate_custom_family_joint_hyper_efs_owned_shared<
         ),
         mode,
     })
+}
+
+#[cfg(test)]
+mod mode_profile_exhausted_verdict_tests {
+    use super::mode_profile_exhausted_error;
+    use gam_problem::CustomFamilyError;
+
+    /// gam#979. The aggregate of "this theta is infeasible" is "this theta is
+    /// infeasible". `UnsupportedConfiguration` is the variant
+    /// `is_trial_point_infeasible()` answers `false` for, so reporting it here
+    /// tells the seed loop the PROBLEM is unsupported and it aborts the fit —
+    /// which is what killed the large-scale CTN preprocessor 25 minutes in,
+    /// with a certified incumbent already in hand, on a single candidate's
+    /// monotonicity refusal.
+    #[test]
+    fn every_rejection_rho_local_makes_the_profile_rho_local_979() {
+        let rejected = vec![
+            Some("evaluator error: inner solve refused this trial point: h' <= 0".to_string()),
+            Some("inner coefficient solve did not converge".to_string()),
+        ];
+        let error = mode_profile_exhausted_error(&rejected, &[true, true]);
+        assert!(
+            error.is_trial_point_infeasible(),
+            "a profile whose candidates all refused THIS theta must let the outer \
+             search step away, not abort the fit: {error}"
+        );
+        // The reasons still reach the message; the verdict is what changed.
+        let rendered = error.to_string();
+        assert!(rendered.contains("candidate 0"), "{rendered}");
+        assert!(rendered.contains("candidate 1"), "{rendered}");
+        assert!(rendered.contains("h' <= 0"), "{rendered}");
+    }
+
+    /// The mirror, and the reason this is not simply "always rho-local": a
+    /// structural failure does not become true or false by moving theta, so
+    /// one of them among the candidates keeps the whole profile structural and
+    /// the seed loop stops instead of retrying it at every seed.
+    #[test]
+    fn one_structural_rejection_keeps_the_profile_structural_979() {
+        let rejected = vec![
+            Some("evaluator error: inner solve refused this trial point: h' <= 0".to_string()),
+            Some("evaluator error: block layout is over-parameterized".to_string()),
+        ];
+        let error = mode_profile_exhausted_error(&rejected, &[true, false]);
+        assert!(
+            !error.is_trial_point_infeasible(),
+            "a structural rejection must not be graded rho-local: {error}"
+        );
+        assert!(matches!(
+            error,
+            CustomFamilyError::UnsupportedConfiguration { .. }
+        ));
+    }
+
+    /// A candidate list with no recorded reason still has to produce a verdict,
+    /// and the type system forces a guess there. The guess is the one
+    /// `CustomFamilyError`'s own `From<String>` documents: trial point, because
+    /// grading a rho-local refusal structural aborts a fit that was fittable
+    /// one rho away, while the reverse only costs a bounded number of cheap
+    /// identical failures.
+    #[test]
+    fn a_reasonless_rejection_defaults_to_the_trial_point_verdict_979() {
+        let error = mode_profile_exhausted_error(&[None], &[true]);
+        assert!(error.is_trial_point_infeasible(), "{error}");
+        assert!(error.to_string().contains("no finite converged result"));
+    }
 }

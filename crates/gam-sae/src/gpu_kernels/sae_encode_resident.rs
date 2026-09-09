@@ -142,13 +142,41 @@ pub struct DeviceEncodeRow {
 // comments name the mirror. These are also the CPU fallback path.
 // ============================================================================
 
+/// Sweep budget of the cyclic Jacobi eigensolver. Cyclic Jacobi converges
+/// quadratically once the off-diagonal mass is small, so for `d ≤ 8` the band
+/// below is reached in a handful of sweeps; the budget only bounds the work on
+/// an input the rotations cannot diagonalise (a non-finite matrix), and running
+/// out of it is REPORTED by [`jacobi_eigh`], never absorbed.
+pub const JACOBI_MAX_SWEEPS: usize = 30;
+
+/// The squared coefficient of the Jacobi stopping band, for a `d×d` matrix.
+///
+/// The sweeps stop when `‖offdiag‖_F ≤ γ_{2d}·u·‖diag‖_F`: by Weyl's inequality
+/// every eigenvalue then lies within `‖offdiag‖_F` of a diagonal entry, and
+/// `γ_{2d}·u·‖diag‖_F` is the rounding band the diagonal already carries from
+/// the `2(d − 1)` rotation updates each of its entries receives per sweep. The
+/// band belongs to the arithmetic, not to a magnitude: the former `1e-300` test
+/// was inert for every matrix that was not already exactly diagonal.
+pub fn jacobi_off_diagonal_band_coefficient_squared(d: usize) -> f64 {
+    let coefficient = gam_linalg::roundoff::accumulation_growth(2 * d)
+        * gam_linalg::roundoff::UNIT_ROUNDOFF;
+    coefficient * coefficient
+}
+
 /// Cyclic Jacobi symmetric eigensolver for a `d×d` matrix (row-major, `d ≤ 8`).
 /// Returns eigenvalues `vals[i]` and eigenvectors as COLUMNS
 /// `vecs[col*d + row]`. This is the device stand-in for the host LAPACK `eigh`
 /// used by `crate::encode::beta_eta_newton`; the Newton step is reconstructed
 /// from the (eigenvector-basis-independent) spectral sum, so the result agrees
 /// with LAPACK to eigen round-off. The CUDA `jacobi_eigh` mirror is identical.
-pub fn jacobi_eigh(a_in: &[f64], d: usize, vals: &mut [f64], vecs: &mut [f64]) {
+///
+/// The return value is the certificate: `true` when the sweeps drove the
+/// off-diagonal mass below the arithmetic's own band
+/// ([`jacobi_off_diagonal_band_coefficient_squared`]), `false` when
+/// [`JACOBI_MAX_SWEEPS`] ran out first. `vals`/`vecs` hold the last iterate in
+/// both cases; a caller must not certify anything on `false`.
+#[must_use]
+pub fn jacobi_eigh(a_in: &[f64], d: usize, vals: &mut [f64], vecs: &mut [f64]) -> bool {
     // Working copy A (row-major), V = I.
     let mut a = a_in.to_vec();
     for r in 0..d {
@@ -158,19 +186,23 @@ pub fn jacobi_eigh(a_in: &[f64], d: usize, vals: &mut [f64], vecs: &mut [f64]) {
     }
     if d == 1 {
         vals[0] = a[0];
-        return;
+        return true;
     }
-    // Fixed, deterministic sweep count: for d ≤ 8, 30 cyclic sweeps drive the
-    // off-diagonal norm to well below f64 round-off.
-    for _sweep in 0..30 {
-        // Off-diagonal magnitude; stop early when negligible.
+    let band_coefficient_squared = jacobi_off_diagonal_band_coefficient_squared(d);
+    let mut converged = false;
+    for _sweep in 0..JACOBI_MAX_SWEEPS {
+        // Off-diagonal mass (upper triangle, so `‖offdiag‖_F² = 2·off`) against
+        // the diagonal's own rounding band.
         let mut off = 0.0_f64;
+        let mut diag_sq = 0.0_f64;
         for r in 0..d {
+            diag_sq += a[r * d + r] * a[r * d + r];
             for c in (r + 1)..d {
                 off += a[r * d + c] * a[r * d + c];
             }
         }
-        if off <= 1e-300 {
+        if 2.0 * off <= band_coefficient_squared * diag_sq {
+            converged = true;
             break;
         }
         for pp in 0..d {
@@ -216,6 +248,7 @@ pub fn jacobi_eigh(a_in: &[f64], d: usize, vals: &mut [f64], vecs: &mut [f64]) {
     for i in 0..d {
         vals[i] = a[i * d + i];
     }
+    converged
 }
 
 // ============================================================================
@@ -302,15 +335,19 @@ __device__ void grad_hess(const double* dec, const double* t, const double* x, d
 }
 
 // Cyclic Jacobi eigensolver (mirror of jacobi_eigh); vecs columns: vecs[col*D+row].
-__device__ void jacobi_eigh(const double* a_in, double* vals, double* vecs){
+// Returns 1 when the off-diagonal mass fell below the arithmetic's band
+// (JACOBI_BAND_COEF2, the host's jacobi_off_diagonal_band_coefficient_squared),
+// 0 when JACOBI_MAX_SWEEPS ran out first.
+__device__ int jacobi_eigh(const double* a_in, double* vals, double* vecs){
   double a[DD*DD];
   for(int i=0;i<DD*DD;++i) a[i]=a_in[i];
   for(int r=0;r<DD;++r) for(int c=0;c<DD;++c) vecs[c*DD+r]=(r==c)?1.0:0.0;
-  if (DD==1){ vals[0]=a[0]; return; }
-  for(int sweep=0;sweep<30;++sweep){
-    double off=0.0;
-    for(int r=0;r<DD;++r) for(int c=r+1;c<DD;++c) off+=a[r*DD+c]*a[r*DD+c];
-    if (off<=1e-300) break;
+  if (DD==1){ vals[0]=a[0]; return 1; }
+  int converged=0;
+  for(int sweep=0;sweep<JACOBI_MAX_SWEEPS;++sweep){
+    double off=0.0; double diag_sq=0.0;
+    for(int r=0;r<DD;++r){ diag_sq+=a[r*DD+r]*a[r*DD+r]; for(int c=r+1;c<DD;++c) off+=a[r*DD+c]*a[r*DD+c]; }
+    if (2.0*off<=JACOBI_BAND_COEF2*diag_sq){ converged=1; break; }
     for(int p=0;p<DD;++p) for(int q=p+1;q<DD;++q){
       double apq=a[p*DD+q]; if(apq==0.0) continue;
       double app=a[p*DD+p]; double aqq=a[q*DD+q];
@@ -326,13 +363,14 @@ __device__ void jacobi_eigh(const double* a_in, double* vals, double* vecs){
     }
   }
   for(int i=0;i<DD;++i) vals[i]=a[i*DD+i];
+  return converged;
 }
 
-// beta/eta/delta; returns 1 on success (lambda_min>0), 0 otherwise.
+// beta/eta/delta; returns 1 on success (Jacobi certified, lambda_min>0), 0 otherwise.
 __device__ int beta_eta_newton(const double* h, const double* g,
                                double* beta, double* eta, double* delta){
   double vals[DD]; double vecs[DD*DD];
-  jacobi_eigh(h, vals, vecs);
+  if (!jacobi_eigh(h, vals, vecs)) return 0;
   double lmin=1.0/0.0; // +inf
   for(int i=0;i<DD;++i) if(vals[i]<lmin) lmin=vals[i];
   if (!(isfinite(lmin) && lmin>0.0)) return 0;
@@ -515,6 +553,7 @@ pub fn encode_kernel_source(dev: &EncodeAtomDevice) -> String {
     format!(
         "#define DD {}\n#define MM {}\n#define PP {}\n#define TOPK {}\n#define NEWTON {}\n\
          #define GMIN_FLOOR ({:e})\n#define REFINE_EPS ({:e})\n\
+         #define JACOBI_MAX_SWEEPS {}\n#define JACOBI_BAND_COEF2 ({:e})\n\
          {ENCODE_KERNEL_SOURCE}",
         dev.d,
         dev.m,
@@ -522,7 +561,9 @@ pub fn encode_kernel_source(dev: &EncodeAtomDevice) -> String {
         dev.topk,
         dev.newton_steps,
         crate::encode::CERTIFIED_GLOBAL_MIN_RECON_FLOOR,
-        crate::encode::NEWTON_REFINE_CONVERGED_EPS
+        crate::encode::NEWTON_REFINE_CONVERGED_EPS,
+        JACOBI_MAX_SWEEPS,
+        jacobi_off_diagonal_band_coefficient_squared(dev.d)
     )
 }
 
@@ -583,7 +624,10 @@ mod tests {
         let a = [4.0, 1.0, 1.0, 3.0];
         let mut vals = [0.0; 2];
         let mut vecs = [0.0; 4];
-        jacobi_eigh(&a, 2, &mut vals, &mut vecs);
+        assert!(
+            jacobi_eigh(&a, 2, &mut vals, &mut vecs),
+            "a 2×2 symmetric matrix diagonalises in one rotation"
+        );
         // A_reconstructed[r][c] = Σ_k vals[k] v_k[r] v_k[c].
         for r in 0..2 {
             for c in 0..2 {

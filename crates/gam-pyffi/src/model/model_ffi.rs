@@ -910,11 +910,7 @@ fn encoded_table_from_columns(
         let column = numeric.column(matrix_column);
         let kind = infer_numeric_array_column_kind(column);
         for (row, value) in column.iter().enumerate() {
-            values[[row, table_column]] = if value.is_finite() {
-                *value
-            } else {
-                f64::NAN
-            };
+            values[[row, table_column]] = *value;
         }
         column_kinds[table_column] = kind;
         schema_columns[table_column] = Some(SchemaColumn {
@@ -3042,10 +3038,13 @@ fn basis_with_jet<'py>(
                 let (penalty, null_basis) =
                     smoothness_penalty_impl(knots_array.view(), degree, order)
                         .map_err(py_value_error)?;
-                assert!(
-                    null_basis.ncols() <= penalty.ncols(),
-                    "smoothness penalty nullspace cannot exceed coefficient count"
-                );
+                if null_basis.ncols() > penalty.ncols() {
+                    return Err(py_value_error(format!(
+                        "basis_with_jet bspline returned a nullspace with {} columns for a {}-coefficient penalty",
+                        null_basis.ncols(),
+                        penalty.ncols()
+                    )));
+                }
                 (jet, penalty)
             };
             Ok((
@@ -6964,7 +6963,9 @@ fn build_latent_duchon_periodic_jet(
         // collapsed centers, same domain wrap, same constant-only constraint
         // nullspace — and returns the dense `(n, kernel_cols + 1)` first
         // derivative `∂Φ/∂t` (the trailing constant column's derivative is 0).
-        let period = axes[0].expect("latent_dim == 1 periodic axis carries a period");
+        let period = axes.first().copied().flatten().ok_or_else(|| {
+            "periodic one-dimensional latent basis requires a period for its axis".to_string()
+        })?;
         let dphi_dt = create_duchon_basis_1d_derivative_dense(
             t_mat.column(0),
             centers.column(0),

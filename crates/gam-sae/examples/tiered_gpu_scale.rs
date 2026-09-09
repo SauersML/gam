@@ -163,12 +163,7 @@ fn run() -> Result<(), String> {
     gam_gpu::configure_global_policy(args.gpu_policy);
 
     let k = args.atoms();
-    let admitted = gam_gpu::DictionaryScoreRoutePlan::default_for_shape(
-        args.minibatch,
-        k,
-        args.p,
-        gam_gpu::DictionaryScorePrecision::F64,
-    );
+    let admitted = gam_gpu::DictionaryScoreRoutePlan::default_for_shape(args.minibatch, k, args.p);
     println!(
         "[tiered gpu scale] N={} P={} K={} (blocks={} b={}) topk={} aux_k={} epochs={} minibatch={} \
          tier2={} gpu={:?}",

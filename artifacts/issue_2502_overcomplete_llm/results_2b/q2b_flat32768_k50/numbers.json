@@ -1,0 +1,227 @@
+{
+  "arm": "q2b_flat32768_k50",
+  "crate_version": "0.3.154",
+  "dictionary": {
+    "G_blocks": 32768,
+    "K_atoms": 32768,
+    "block_size": 1,
+    "block_topk": 50,
+    "decoder_bytes": 268435456,
+    "decoder_bytes_expected": 268435456,
+    "gamma": 0.030051961541175842,
+    "overcomplete_ratio_K_over_p": 16.0,
+    "train_mean_bytes": 8192
+  },
+  "engine": "gam_sae::sparse_dict::BlockSparseStreamState",
+  "epochs": [
+    {
+      "accepted_births": 0,
+      "converged": false,
+      "dead": 0,
+      "epoch": 1,
+      "gamma": 0.04411620274186134,
+      "seconds": 160.732512272,
+      "train_explained_variance": -215.32336993912003
+    },
+    {
+      "accepted_births": 0,
+      "converged": false,
+      "dead": 0,
+      "epoch": 2,
+      "gamma": 0.022095663473010063,
+      "seconds": 316.35699323,
+      "train_explained_variance": 0.002521792740214579
+    },
+    {
+      "accepted_births": 0,
+      "converged": false,
+      "dead": 104,
+      "epoch": 3,
+      "gamma": 0.020917674526572227,
+      "seconds": 476.769534362,
+      "train_explained_variance": 0.2922192620528833
+    },
+    {
+      "accepted_births": 0,
+      "converged": false,
+      "dead": 31,
+      "epoch": 4,
+      "gamma": 0.03964840620756149,
+      "seconds": 632.052349021,
+      "train_explained_variance": 0.17628782505226792
+    },
+    {
+      "accepted_births": 0,
+      "converged": false,
+      "dead": 61,
+      "epoch": 5,
+      "gamma": 0.025592384859919548,
+      "seconds": 789.104834542,
+      "train_explained_variance": 0.26466451440581784
+    },
+    {
+      "accepted_births": 0,
+      "converged": false,
+      "dead": 501,
+      "epoch": 6,
+      "gamma": 0.022984065115451813,
+      "seconds": 945.753427896,
+      "train_explained_variance": 0.22234474041899344
+    },
+    {
+      "accepted_births": 0,
+      "converged": false,
+      "dead": 634,
+      "epoch": 7,
+      "gamma": 0.03820106014609337,
+      "seconds": 1099.926587627,
+      "train_explained_variance": 0.19718132964568758
+    },
+    {
+      "accepted_births": 0,
+      "converged": false,
+      "dead": 679,
+      "epoch": 8,
+      "gamma": 0.026218604296445847,
+      "seconds": 1255.043403576,
+      "train_explained_variance": 0.29025158882919466
+    },
+    {
+      "accepted_births": 0,
+      "converged": false,
+      "dead": 882,
+      "epoch": 9,
+      "gamma": 0.023992015048861504,
+      "seconds": 1410.456360651,
+      "train_explained_variance": 0.1880863389035191
+    },
+    {
+      "accepted_births": 0,
+      "converged": false,
+      "dead": 719,
+      "epoch": 10,
+      "gamma": 0.0333714634180069,
+      "seconds": 1566.347617321,
+      "train_explained_variance": 0.23932410461780784
+    },
+    {
+      "accepted_births": 0,
+      "converged": false,
+      "dead": 658,
+      "epoch": 11,
+      "gamma": 0.02712463028728962,
+      "seconds": 1722.281670495,
+      "train_explained_variance": 0.32086334665991245
+    },
+    {
+      "accepted_births": 0,
+      "converged": false,
+      "dead": 882,
+      "epoch": 12,
+      "gamma": 0.028394702821969986,
+      "seconds": 1876.082640805,
+      "train_explained_variance": 0.18487790679888683
+    },
+    {
+      "accepted_births": 0,
+      "converged": false,
+      "dead": 960,
+      "epoch": 13,
+      "gamma": 0.030264882370829582,
+      "seconds": 2030.274169698,
+      "train_explained_variance": 0.3166850919111376
+    },
+    {
+      "accepted_births": 0,
+      "converged": false,
+      "dead": 939,
+      "epoch": 14,
+      "gamma": 0.03228335455060005,
+      "seconds": 2185.892722268,
+      "train_explained_variance": 0.2797785290955851
+    },
+    {
+      "accepted_births": 0,
+      "converged": false,
+      "dead": 848,
+      "epoch": 15,
+      "gamma": 0.02848590910434723,
+      "seconds": 2341.588990322,
+      "train_explained_variance": 0.2693066571074638
+    },
+    {
+      "accepted_births": 0,
+      "converged": false,
+      "dead": 704,
+      "epoch": 16,
+      "gamma": 0.029815414920449257,
+      "seconds": 2496.086213529,
+      "train_explained_variance": 0.21562448401692336
+    },
+    {
+      "accepted_births": 0,
+      "converged": false,
+      "dead": 753,
+      "epoch": 17,
+      "gamma": 0.029327694326639175,
+      "seconds": 2650.61806445,
+      "train_explained_variance": 0.29580306036741
+    },
+    {
+      "accepted_births": 0,
+      "converged": false,
+      "dead": 707,
+      "epoch": 18,
+      "gamma": 0.030051961541175842,
+      "seconds": 2805.05695502,
+      "train_explained_variance": 0.2406475554611882
+    }
+  ],
+  "fit": {
+    "aux_k": 0,
+    "converged": false,
+    "device_admitted": true,
+    "epochs_run": 18,
+    "gpu_policy": "Required",
+    "seed_coordinate_fallback_blocks": 0,
+    "seed_policy": "Rows",
+    "train_explained_variance": 0.2406475554611882,
+    "train_seconds": 2803.347774751
+  },
+  "heldout": {
+    "explained_variance": 0.2519768566007281,
+    "explained_variance_joint_ls": 0.49294492598678985,
+    "fvu": 0.7480231433992719,
+    "fvu_about_train_mean": 0.7450038680021572,
+    "fvu_joint_ls": 0.5070550740132101,
+    "rows_scored": 100000,
+    "rss": 2643559.383970943,
+    "rss_joint_ls": 1791963.538730007,
+    "seconds": 38.218389136,
+    "tss_about_eval_mean": 3534060.954260999,
+    "tss_about_train_mean": 3548383.434652568
+  },
+  "inputs": {
+    "eval": "/scratch.global/sauer354/a5acts2b/eval.npy",
+    "n_eval": 100000,
+    "n_train": 300000,
+    "p": 2048,
+    "train": "/scratch.global/sauer354/a5acts2b/train.npy"
+  },
+  "issue": 2502,
+  "overcompleteness": {
+    "G_blocks": 32768,
+    "K_atoms": 32768,
+    "ambient_p": 2048,
+    "atoms_used_exceeds_ambient_p": true,
+    "atoms_used_on_heldout": 31183,
+    "blocks_used_on_heldout": 31183,
+    "note": "atoms_used > p implies the used sub-dictionary is linearly dependent"
+  },
+  "rate": {
+    "active_scalars_per_token": 50,
+    "firings_per_token": 50,
+    "selection_bits_per_token": 750.0
+  },
+  "wall_seconds": 2843.962174684
+}

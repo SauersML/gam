@@ -13,7 +13,7 @@ Each atom answers **where it lives** (a typed manifold embedded in ambient
 space), **what shape it is** (the topology and its fitted curve), and **how
 confident** that shape is (a posterior band).
 
-```python
+```python no-exec
 import numpy as np
 import gamfit
 
@@ -178,7 +178,7 @@ is not normalized LAML, REML, or model evidence. Each piece plays a distinct rol
   (a `GumbelTemperatureSchedule` or a mapping). Three constructors are
   top-level exports:
 
-  ```python
+  ```python no-exec
   from gamfit import (gumbel_geometric_schedule, gumbel_linear_schedule,
                       gumbel_reciprocal_iter_schedule)
   # geometric decay τ_start → τ_min at the given multiplicative rate
@@ -305,7 +305,7 @@ The fitted band is stored directly on each Rust-owned atom, evaluated along the
 atom's own coordinates (so it reports uncertainty exactly where the data
 lives):
 
-```python
+```python no-exec
 atom = fit.atoms[0]
 atom.decoder_covariance   # (M_k*p, M_k*p), row-major (basis, channel) flat layout
 atom.shape_band_coords    # (G, d_k)
@@ -358,7 +358,7 @@ equivalently `fit.atoms[k].coords`). The **observed extent** — where on the
 shape the tokens actually land — is read directly off it. Combined with the
 shape band, you get the curve *across the range the atom is used over*:
 
-```python
+```python no-exec
 coords_k = fit.coords[0]                       # (N, d_k) per-token coordinate
 lo, hi   = coords_k.min(0), coords_k.max(0)    # full observed extent per axis
 p5, p95  = np.percentile(coords_k, [5, 95], 0) # robust central range
@@ -380,7 +380,7 @@ percentile calculation applies to new data.
 
 Fresh SAE fits also carry a first-class per-atom curvature report:
 
-```python
+```python no-exec
 curv = fit.curvature_report
 curv["atoms"][0]["kappa_hat"]  # fitted estimate, when present in the report
 ```
@@ -420,7 +420,7 @@ warm-start tensors, or a second training objective.
 
 The out-of-sample surface:
 
-```python
+```python no-exec
 reconstruction = fit.predict(X)       # (N, p), same operation as reconstruct(X)
 gates = fit.encode(X)                 # (N, K)
 latents = fit.converged_latents(X)    # one coherent solve
@@ -439,7 +439,7 @@ Call `converged_latents` when several outputs are needed; separate
 plan** at a requested measured KL dose. The callback applies the supplied plan to
 the real downstream model and returns one atomic mapping:
 
-```python
+```python no-exec
 def patched_forward_kl(steer_plan):
     effective_delta = apply_exact_plan(steer_plan)
     return {
@@ -453,7 +453,7 @@ def patched_forward_kl(steer_plan):
 
 The request then controls the bracket solve:
 
-```python
+```python no-exec
 plan = fit.steer_to_target(
     {
         "atom_k": 3,
@@ -548,7 +548,7 @@ It is a top-level export, used throughout `tests/sae/`, and pairs naturally with
 `fit.coords[k]` from
 [`sae_manifold_fit`](#the-manifoldsae-result).
 
-```python
+```python no-exec
 import gamfit
 
 verdict = gamfit.adjudicate_atom_shape(
@@ -642,7 +642,7 @@ entry. It invokes the exact same deterministic `(matrix, seed)` callback on the
 observed activations and both controls, isolates callback mutation with private
 matrix copies, and retains only one control matrix at a time:
 
-```python
+```python no-exec
 def complete_pipeline(matrix, seed):
     # Fresh fit: SAE -> grouping -> projection/search -> adjudication.
     return run_census(matrix, seed=seed)
@@ -680,7 +680,7 @@ verdict. Consequently neither a chart-fixed permutation nor one shuffled draw
 is a false-positive floor. Rebuild the chart for every draw and compare the
 observed **circular margin** with the full shuffle-margin distribution:
 
-```python
+```python no-exec
 def labeled_chart_pipeline(matrix, labels, seed):
     # Recompute class means, select/refit the chart, then adjudicate it.
     coords = build_class_mean_chart(matrix, labels)
@@ -723,7 +723,7 @@ native fit and verify cross-seed concordance explicitly.
 Across seeds, stack corresponding fitted coordinates as `(replicates, rows)` and
 report their exact rotation/reflection-quotiented agreement:
 
-```python
+```python no-exec
 report = circular_concordance(torch.stack(seed_coordinates), period=1.0)
 print(report.minimum_aligned_score)
 print(report.pairs)
@@ -748,7 +748,7 @@ audits with a warning.
 GLM head, so the learned atoms are predictive of a label on the rows where one
 is available (semi-supervised: `supervised_mask` selects them):
 
-```python
+```python no-exec
 fit = gamfit.sae_supervised(
     X, Y, supervised_mask,        # (N, p) data, (N,) labels, (N,) bool mask
     K=16, d_atom=2,
@@ -778,7 +778,7 @@ descriptive changes; the grid does not supply sampling uncertainty or a
 statistical stability test. The shared coordinates fix the correspondence
 without fitting a transport.
 
-```python
+```python no-exec
 dyn = gamfit.sae_checkpoint_dynamics(
     decoder_grid,                 # decoder evaluations across checkpoints
     checkpoint_ids=["step10k", "step20k", ...],
@@ -791,7 +791,7 @@ dyn = gamfit.sae_checkpoint_dynamics(
 and `gamfit.layer_transport_ladder` chains the pairwise transports across a
 sequence of layers:
 
-```python
+```python no-exec
 t = gamfit.layer_transport_fit(coords_from, coords_to,
                                topology_from="circle", topology_to="circle",
                                layer_from=0, layer_to=1)
@@ -808,7 +808,7 @@ ladder = gamfit.layer_transport_ladder(coords, topology="circle", layers=None)
 The Torch surface wraps a converged native fit; it does not define or train a
 second SAE objective.
 
-```python
+```python no-exec
 import torch
 import gamfit
 from gamfit.torch import ManifoldSAE

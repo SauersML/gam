@@ -1012,8 +1012,6 @@ pub fn blockwise_fit_from_parts(
         beta_covariance_frequentist: None,
         coefficient_influence: None,
         weighted_gram: None,
-        bias_correction_beta: None,
-        bias_correction_jacobian: None,
     });
 
     gam_solve::model_types::UnifiedFitResult::try_from_parts(UnifiedFitResultParts {
@@ -1150,9 +1148,6 @@ impl CustomFamilyWarmStart {
 }
 
 pub(crate) struct CustomOuterState {
-    /// The criterion's round-off band at the last evaluation (#2812): machine
-    /// precision times the sum of the magnitudes of its additive terms.
-    pub(crate) last_criterion_resolution: Option<f64>,
     pub(crate) warm_cache: Option<ConstrainedWarmStart>,
     pub(crate) reset_warm_cache: Option<ConstrainedWarmStart>,
     /// Exact derivative-bearing coefficient mode installed by the most recent
@@ -1203,7 +1198,6 @@ impl CustomOuterState {
         force_cold_signal: Arc<AtomicBool>,
     ) -> Self {
         Self {
-            last_criterion_resolution: None,
             warm_cache: warm_start.clone(),
             reset_warm_cache: warm_start,
             terminal_mode: None,

@@ -291,8 +291,14 @@ pub(super) fn default_beta_guess_external(
                 totalweight += wi;
             }
             if totalweight > 0.0 {
-                let mean_y = (weighted_sum / totalweight).max(1e-10);
-                beta[intercept_col] = mean_y.ln();
+                let mean_y = weighted_sum / totalweight;
+                // A zero weighted mean (every response zero) has no finite
+                // log: the intercept keeps its zero seed and the solve judges
+                // the degenerate data itself, instead of starting at the log
+                // of an invented floor (#2469).
+                if mean_y > 0.0 {
+                    beta[intercept_col] = mean_y.ln();
+                }
             }
         }
     }

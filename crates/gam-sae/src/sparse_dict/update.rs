@@ -1,10 +1,10 @@
 //! Alternating minibatched trainer: route → sparse codes → decoder refresh →
 //! unit-norm projection. No dense `N×K` object is ever formed.
 //!
-//! The decoder refresh starts with **method of optimal directions** (MOD) on
-//! the sparse support. With codes fixed, the reconstruction loss
+//! The decoder refresh is the **method of optimal directions** (MOD) restricted
+//! to the sparse support. With codes fixed, the reconstruction loss
 //! `Σ_i ‖x_i − Σ_j c_{ij} d_{a_{ij}}‖²` is quadratic in the decoder `D` and its
-//! normal equations are `(CᵀC + ρI) D = CᵀX`, where `C` is the (sparse, never
+//! normal equations are `D (CᵀC + ρI) = CᵀX`, where `C` is the (sparse, never
 //! materialised) `N×K` code matrix. We accumulate `A = CᵀC` (`K×K`, but only
 //! the few entries touched by co-active atoms are non-zero) and `B = CᵀX`
 //! (`K×P`) by streaming minibatches, then solve **to the rank-charge floor**.
@@ -20,10 +20,7 @@
 //! block is formed. Dense Cholesky is retained only for genuinely tiny connected
 //! components. CG stops when the relative normal-equation residual is below the
 //! ridge/charge floor, and its Lanczos tridiagonal supplies the condition
-//! estimate reported with the epoch diagnostics. In the one-shot coupled lane,
-//! its normalized result is only a proposal: reject an increase in fixed-code
-//! loss, then take a sparse unit-constrained coordinate sweep. Normalizing MOD
-//! alone does not satisfy the coupled problem's unit-row stationarity equations.
+//! estimate reported with the epoch diagnostics.
 
 use super::codes::{SparseCode, solve_row_codes};
 use super::scoring::{ScoreRoutePath, ScoreRouteStats, TileScorer};
@@ -153,8 +150,8 @@ pub(crate) struct SparseDictIterate {
     /// plateaued but the discrete routing keeps churning. Convergence itself is
     /// decided by the gauge-invariant EV plateau, so both certified and open
     /// iterates are returned; only a still-climbing objective (or a failed linear
-    /// subsolve) is a genuine non-convergence error.
-    /// The block lane instead requires all full-step residuals to close.
+    /// subsolve) is a genuine non-convergence error. Mirrors
+    /// [`super::block::BlockSparseConvergence::certified`].
     certified: bool,
 }
 
@@ -215,7 +212,6 @@ pub(super) fn route_and_code_all(
             batch,
             decoder.nrows(),
             decoder.ncols(),
-            gam_gpu::DictionaryScorePrecision::F32,
         );
         if first_end < n {
             let rest = x.slice(ndarray::s![first_end.., ..]);
@@ -744,25 +740,15 @@ fn run_from_decoder(
                 ..DecoderSolveStats::default()
             }
         } else {
-            let (stats, gate) = solve_decoder_with_routability_gate_recycled(
+            solve_decoder_with_routability_gate_recycled(
                 &mut decoder,
                 &normal_eq,
                 config.decoder_ridge as f64,
                 sigma,
                 config.score_mode,
                 decoder_recycle,
-            )?;
-            unit_norm_rows(&mut decoder)?;
-            super::unit_decoder::refine(
-                &mut decoder,
-                &certified_decoder,
-                &normal_eq,
-                &gate
-                    .iter()
-                    .map(|decision| decision.refresh)
-                    .collect::<Vec<_>>(),
-            )?;
-            stats
+            )?
+            .0
         };
         decoder_solve_stats = stats;
         let refresh_secs = epoch_start.elapsed().as_secs_f64();

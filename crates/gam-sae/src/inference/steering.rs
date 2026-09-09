@@ -67,6 +67,8 @@
 
 use ndarray::{Array1, Array2, ArrayView1};
 
+use crate::basis::SaeBasisEvaluator;
+use crate::chart_canonicalization::{CanonicalChartTopology, chart_arclength_coordinates};
 use crate::manifold::{SaeManifoldAtom, SaeManifoldTerm};
 use gam_problem::{FisherFactorKind, MetricProvenance, RowMetric};
 
@@ -1335,9 +1337,10 @@ fn frame_landed_norm(frame: &Array2<f64>, delta: ArrayView1<'_, f64>) -> f64 {
 /// latent `axis` over `doses`, comparing the on-manifold group action against a
 /// matched-per-row-norm flat-direction control (gam#2234 E2).
 ///
-/// For each dose `δ` the on-manifold ambient move is the fitted group-action
-/// delta [`SaeManifoldTerm::steer_rows`] (chart step `δ` on `axis`, gate held
-/// fixed). The flat control replays the SAME per-row move NORM along one fixed
+/// For each dose `δ` the on-manifold ambient move advances the atom's
+/// canonical, unit-speed chart coordinate by `δ` (gate held fixed). The raw
+/// fitted parameter is gauge-arbitrary and is deliberately not exposed as the
+/// dose axis. The flat control replays the SAME per-row move NORM along one fixed
 /// ambient direction `w` — the atom's mean decode-tangent direction along `axis`,
 /// the manifold analog of a flat SAE's single decoder column. Each move is
 /// decomposed against every atom's local decode-tangent frame at its fitted
@@ -1369,6 +1372,12 @@ pub fn collateral_curve(
     if axis >= d_k {
         return Err(format!(
             "collateral_curve: axis {axis} out of range for atom {atom_k} latent_dim {d_k}"
+        ));
+    }
+    if d_k != 1 || axis != 0 {
+        return Err(format!(
+            "collateral_curve: intrinsic doses require a one-dimensional canonical chart; \
+             atom {atom_k} has latent_dim {d_k} and axis {axis}"
         ));
     }
     if doses.is_empty() {
@@ -1484,9 +1493,7 @@ pub fn collateral_curve(
     let mut manifold_pts = Vec::with_capacity(doses.len());
     let mut flat_pts = Vec::with_capacity(doses.len());
     for &dose in doses {
-        let mut step = Array1::<f64>::zeros(d_k);
-        step[axis] = dose;
-        let on_field = model.steer_rows(atom_k, &rows, step.view())?;
+        let on_field = steer_rows_unit_speed(model, atom_k, &rows, dose)?.delta;
 
         // Matched control: same per-row move NORM, along the fixed direction w.
         let mut flat_field = Array2::<f64>::zeros((n, p));
@@ -1539,3 +1546,442 @@ pub fn collateral_curve(
     })
 }
 
+// ───────────────────────────────────────────────────────────────────────────
+// #2234 / #2263 item 3 — steering in the CANONICAL (unit-speed) chart.
+//
+// `SaeManifoldTerm::steer_rows` is the group action `t ⊕ δ` on the FITTED chart
+// parameter. That parameter is a gauge choice: the fit lands on one point of the
+// `Diff(S¹)` / `Diff([0,1])` orbit, and `chart_arclength_coordinates` states the
+// consequence in its own doc — *"any downstream consumer reading angle/dose/
+// adjacency off the raw `t_i` is reading a gauge-ARBITRARY quantity"*. A dose
+// expressed in the raw parameter is therefore not comparable between rows, between
+// atoms, or between two fits of the same data.
+//
+// #2022's in-loop unit-speed retraction exists to close that gap by re-gauging the
+// fitted chart to arc length, which would make the raw parameter the intrinsic one.
+// It is allowed to refuse: `unit_speed_reparameterization` returns `Ok(None)`
+// whenever the basis family cannot re-express the reparameterized curve inside
+// `CHART_RECOMPOSITION_REL_TOL`, and a finite harmonic basis generically cannot
+// carry the arc-length reparameterization of a non-round ring. So the meaning of a
+// raw `δ` depends on whether an internal gate passed, and the caller is not told
+// which.
+//
+// The surfaces below remove the dependence. They express a displacement in the
+// atom's CANONICAL coordinate — arc length along the fitted decoder curve,
+// rescaled onto the chart's own span, i.e. exactly the coordinate
+// `unit_speed_reparameterization` would have installed had it been able to. The
+// conversion factor between the canonical step and the raw step is the chart's own
+// speed field `‖∂g/∂t‖`; nothing here introduces a scale that is not read off the
+// fitted chart. On a chart that already IS unit-speed the canonical step and the
+// raw step are the same number, so this is a repair of the existing gauge rather
+// than a second one.
+// ───────────────────────────────────────────────────────────────────────────
+
+/// One `d = 1` atom's canonical-chart context, gathered once so a batched
+/// inversion pays for the chart's arc-length quadrature a fixed number of times
+/// instead of once per row.
+struct CanonicalChart<'a> {
+    atom: usize,
+    name: &'a str,
+    evaluator: &'a dyn SaeBasisEvaluator,
+    decoder: &'a Array2<f64>,
+    topology: CanonicalChartTopology,
+    /// The atom's FITTED coordinates. An interval chart's canonical domain is
+    /// derived from the coordinates handed to the arc-length map, so every query
+    /// carries the fitted set as a prefix and the domain never moves out from
+    /// under the map. A circle chart's domain is `[0, period)` regardless, and
+    /// the prefix is omitted.
+    domain_anchor: Option<Array1<f64>>,
+    /// Length of the canonical coordinate's domain: `period` for a circle chart,
+    /// `1` for an interval chart — the span `unit_speed_reparameterization` maps
+    /// onto, so a canonical displacement and a raw displacement are the same
+    /// number on an already-canonical chart.
+    span: f64,
+    /// Raw-parameter domain the canonical map is inverted inside.
+    lo: f64,
+    hi: f64,
+    /// The axis period the atom's own `LatentManifold` wraps at — the period
+    /// [`SaeManifoldTerm::steer_rows`]'s group action uses. Checked against the
+    /// canonical topology at construction, and used to report each row's raw step
+    /// as its SHORTEST representative.
+    axis_period: Option<f64>,
+}
+
+/// The canonical (arc-length) reading of one `d = 1` chart, plus the gauge
+/// diagnostics that say whether the raw chart could have been read instead.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CanonicalChartCoordinates {
+    /// The atom whose chart was read.
+    pub atom: usize,
+    /// Canonical span (`period` for a circle chart, `1` for an interval chart).
+    pub span: f64,
+    /// Canonical coordinate `span · s(t)/L` of each queried raw coordinate — the
+    /// gauge-invariant position #2081 says every angle/dose/adjacency consumer
+    /// should read in place of the raw `t`.
+    pub canonical: Vec<f64>,
+    /// Speed coefficient of variation `stddev(‖γ'‖)/mean(‖γ'‖)` of the fitted
+    /// decoder curve. `0` ⟺ the raw chart already IS the canonical chart, so a
+    /// raw-parameter steer and a canonical steer coincide; a positive value is
+    /// exactly the gauge error a raw-parameter dose commits.
+    pub speed_cv: f64,
+    /// `min ‖γ'‖ / mean ‖γ'‖`. Approaching `0` means the chart nearly collapses
+    /// somewhere, so the canonical map stops being a diffeomorphism and the raw
+    /// coordinate returned by the inverse is a point of a preimage SET.
+    pub min_speed_over_mean: f64,
+    /// `max ‖γ'‖ / mean ‖γ'‖`.
+    pub max_speed_over_mean: f64,
+    /// Total arc length of the fitted decoder curve over the canonical domain —
+    /// the conversion from a canonical (span) displacement to an absolute one.
+    pub total_arc_length: f64,
+}
+
+/// The per-row ambient move that realizes one CANONICAL chart displacement
+/// (gam#2234's "dose in radians", gh#2263 item 3's requested-vs-realized
+/// displacement).
+#[derive(Clone, Debug, PartialEq)]
+pub struct UnitSpeedSteerField {
+    /// The steered atom.
+    pub atom: usize,
+    /// The steered rows, in the order of the returned matrix.
+    pub rows: Vec<usize>,
+    /// The requested displacement in the atom's canonical coordinate.
+    pub canonical_delta: f64,
+    /// The RAW chart step actually applied to each row. Constant across rows
+    /// exactly when the chart is unit-speed; its spread over rows IS the gauge
+    /// error a single raw `δ` would have committed.
+    pub raw_steps: Vec<f64>,
+    /// The ambient steering delta `a_{ik}·(Φ_k(t'_i) − Φ_k(t_i))·B_k`, shape
+    /// `(rows.len(), p)`, in the same fit-space units as
+    /// [`SaeManifoldTerm::steer_rows`] (whose group action produced it).
+    pub delta: Array2<f64>,
+    /// The chart the displacement was expressed in, with its gauge diagnostics.
+    pub chart: CanonicalChartCoordinates,
+}
+
+fn canonical_chart<'a>(
+    model: &'a SaeManifoldTerm,
+    atom_k: usize,
+) -> Result<CanonicalChart<'a>, String> {
+    let k = model.k_atoms();
+    if atom_k >= k {
+        return Err(format!(
+            "canonical chart: atom index {atom_k} out of range (term has {k} atoms)"
+        ));
+    }
+    let atom = &model.atoms[atom_k];
+    let topology = model.d1_unit_speed_topology(atom_k).ok_or_else(|| {
+        format!(
+            "canonical chart: atom {atom_k} ('{}') has no d=1 canonical chart. Arc-length \
+             steering needs a one-dimensional chart with an installed basis evaluator and no \
+             active curvature homotopy; this atom is latent_dim {} with basis {:?} \
+             (homotopy_eta {})",
+            atom.name,
+            atom.latent_dim(),
+            atom.basis_kind(),
+            atom.homotopy_eta
+        )
+    })?;
+    let evaluator = atom.basis_evaluator.as_deref().ok_or_else(|| {
+        format!(
+            "canonical chart: atom {atom_k} ('{}') has no installed basis evaluator",
+            atom.name
+        )
+    })?;
+    let fitted = model.assignment.coords[atom_k]
+        .as_matrix()
+        .column(0)
+        .to_owned();
+    let axis_period = *model.assignment.coords[atom_k]
+        .effective_axis_periods()
+        .first()
+        .ok_or_else(|| {
+            format!(
+                "canonical chart: atom {atom_k} ('{}') has no latent axis",
+                atom.name
+            )
+        })?;
+    let (span, lo, hi, domain_anchor) = match &topology {
+        CanonicalChartTopology::Circle { period } => (*period, 0.0, *period, None),
+        CanonicalChartTopology::Interval => {
+            let mut t_min = f64::INFINITY;
+            let mut t_max = f64::NEG_INFINITY;
+            for &t in fitted.iter() {
+                t_min = t_min.min(t);
+                t_max = t_max.max(t);
+            }
+            (1.0, t_min, t_max, Some(fitted))
+        }
+    };
+    if !(span.is_finite() && span > 0.0 && lo.is_finite() && hi.is_finite() && hi > lo) {
+        return Err(format!(
+            "canonical chart: atom {atom_k} ('{}') has a degenerate canonical domain \
+             [{lo}, {hi}] with span {span}",
+            atom.name
+        ));
+    }
+    // The canonical chart is defined on the domain the arc-length map integrates,
+    // and the move is realized by the group action, which wraps at the MANIFOLD's
+    // own axis period. If those two disagree the surface would silently steer to a
+    // different point than the one it reports; refuse instead.
+    let periods_agree = match (&topology, axis_period) {
+        (CanonicalChartTopology::Circle { period }, Some(axis)) => axis == *period,
+        (CanonicalChartTopology::Interval, None) => true,
+        _ => false,
+    };
+    if !periods_agree {
+        return Err(format!(
+            "canonical chart: atom {atom_k} ('{}') has canonical topology {topology:?} but its \
+             manifold wraps its axis at {axis_period:?}; the arc-length domain and the group \
+             action's period must be the same object",
+            atom.name
+        ));
+    }
+    Ok(CanonicalChart {
+        atom: atom_k,
+        name: &atom.name,
+        evaluator,
+        decoder: atom.decoder_coefficients(),
+        topology,
+        domain_anchor,
+        span,
+        lo,
+        hi,
+        axis_period,
+    })
+}
+
+impl CanonicalChart<'_> {
+    /// Canonical coordinate of each queried raw coordinate, plus the chart's
+    /// speed diagnostics, in ONE arc-length quadrature for the whole batch.
+    fn read(&self, query: &[f64]) -> Result<CanonicalChartCoordinates, String> {
+        let prefix = self.domain_anchor.as_ref().map_or(0, Array1::len);
+        let mut all = Array1::<f64>::zeros(prefix + query.len());
+        if let Some(anchor) = self.domain_anchor.as_ref() {
+            for (i, &t) in anchor.iter().enumerate() {
+                all[i] = t;
+            }
+        }
+        for (i, &t) in query.iter().enumerate() {
+            all[prefix + i] = t;
+        }
+        let reading = chart_arclength_coordinates(
+            self.evaluator,
+            self.decoder.view(),
+            all.view(),
+            &self.topology,
+        )?
+        .ok_or_else(|| {
+            format!(
+                "canonical chart: atom {} ('{}') has a degenerate arc-length chart \
+                 (empty basis/decoder, a collapsed domain, or a non-finite / zero total \
+                 arc length); there is no canonical coordinate to steer in",
+                self.atom, self.name
+            )
+        })?;
+        Ok(CanonicalChartCoordinates {
+            atom: self.atom,
+            span: self.span,
+            canonical: (0..query.len())
+                .map(|i| self.span * reading.coords_u_arc[prefix + i])
+                .collect(),
+            speed_cv: reading.speed_cv,
+            min_speed_over_mean: reading.min_speed_over_mean,
+            max_speed_over_mean: reading.max_speed_over_mean,
+            total_arc_length: reading.total_arc_length,
+        })
+    }
+
+    /// Raw coordinates whose canonical coordinate is `targets`.
+    ///
+    /// `s(t) = ∫‖γ'‖` is non-decreasing in the raw parameter by construction, so
+    /// the canonical map is inverted by bisection on the chart's own domain,
+    /// refined until the bracket is one `f64` ulp of the span — the coordinate's
+    /// representation limit, not a tolerance knob. Every target's bracket is
+    /// halved inside ONE batched chart read, so the cost is `log2(1/ε)` reads
+    /// however many rows are steered. A chart with a zero-speed cell has a flat
+    /// `s`, and the returned coordinate is then a point of the preimage rather
+    /// than the preimage — [`CanonicalChartCoordinates::min_speed_over_mean`]
+    /// is the reader that says when that is happening.
+    fn invert(&self, targets: &[f64]) -> Result<Vec<f64>, String> {
+        let q = targets.len();
+        let mut lo = vec![self.lo; q];
+        let mut hi = vec![self.hi; q];
+        let resolution = f64::EPSILON * self.span;
+        loop {
+            let mut mids = vec![0.0_f64; q];
+            let mut live: Vec<usize> = Vec::new();
+            for i in 0..q {
+                let mid = 0.5 * (lo[i] + hi[i]);
+                mids[i] = mid;
+                if hi[i] - lo[i] > resolution && mid > lo[i] && mid < hi[i] {
+                    live.push(i);
+                }
+            }
+            if live.is_empty() {
+                break;
+            }
+            let probe: Vec<f64> = live.iter().map(|&i| mids[i]).collect();
+            let read = self.read(&probe)?;
+            for (slot, &i) in live.iter().enumerate() {
+                if read.canonical[slot] <= targets[i] {
+                    lo[i] = mids[i];
+                } else {
+                    hi[i] = mids[i];
+                }
+            }
+        }
+        Ok((0..q).map(|i| 0.5 * (lo[i] + hi[i])).collect())
+    }
+
+    /// Move a canonical coordinate by `delta` inside the chart's own topology:
+    /// a circle wraps, a bounded interval patch clamps at its ends.
+    fn advance(&self, base: f64, delta: f64) -> f64 {
+        match self.topology {
+            CanonicalChartTopology::Circle { .. } => (base + delta).rem_euclid(self.span),
+            CanonicalChartTopology::Interval => (base + delta).clamp(0.0, self.span),
+        }
+    }
+}
+
+/// Read one `d = 1` atom's chart in its CANONICAL (arc-length) coordinate at the
+/// supplied raw coordinates (gh#2081's `coords_u_arc`, rescaled onto the chart's
+/// own span so it is directly comparable with a raw coordinate).
+///
+/// This is the coordinate a steering dose, an angle, or an adjacency claim must
+/// be expressed in: the raw fitted parameter is a point of the reparameterization
+/// gauge orbit and carries no unit. Errors when the atom has no `d = 1` canonical
+/// chart (wrong latent dimension, no installed evaluator, an active curvature
+/// homotopy) or when the chart is degenerate.
+pub fn canonical_chart_coordinates(
+    model: &SaeManifoldTerm,
+    atom_k: usize,
+    raw: &[f64],
+) -> Result<CanonicalChartCoordinates, String> {
+    canonical_chart(model, atom_k)?.read(raw)
+}
+
+/// Invert [`canonical_chart_coordinates`]: the raw fitted-chart coordinates whose
+/// canonical (arc-length) coordinates are `canonical`.
+///
+/// This is what turns an honest request — "put this row a quarter of the way
+/// around its feature" — into the `t_to` that [`steer_delta`] /
+/// [`steer_to_target_nats`] take. Values outside `[0, span)` are moved into the
+/// chart's own topology first (a circle wraps, a bounded patch clamps).
+pub fn canonical_chart_raw_coordinates(
+    model: &SaeManifoldTerm,
+    atom_k: usize,
+    canonical: &[f64],
+) -> Result<Vec<f64>, String> {
+    let chart = canonical_chart(model, atom_k)?;
+    let targets: Vec<f64> = canonical
+        .iter()
+        .map(|&c| {
+            if !c.is_finite() {
+                return Err(format!(
+                    "canonical chart: atom {atom_k} was asked for a non-finite canonical \
+                     coordinate {c}"
+                ));
+            }
+            Ok(chart.advance(0.0, c))
+        })
+        .collect::<Result<_, _>>()?;
+    chart.invert(&targets)
+}
+
+/// Steer `rows` of atom `atom_k` by `canonical_delta` in the atom's CANONICAL
+/// (unit-speed / arc-length) chart — the gam#2234 intervention primitive in the
+/// units gam#2234 claims for it.
+///
+/// The requested displacement is applied to each row's canonical coordinate
+/// through the chart's own topology (a circle wraps, a bounded patch clamps), the
+/// resulting canonical position is mapped back to the raw fitted parameter, and
+/// the ambient move is produced by the SAME group action
+/// [`SaeManifoldTerm::steer_rows`] implements — this function selects the STEP,
+/// it does not re-implement the action. The raw step therefore differs from row to
+/// row exactly as the fitted chart's speed does; a chart that is already
+/// unit-speed produces a constant raw step equal to `canonical_delta`, so this is
+/// a strict repair of the raw surface and not an alternative to it.
+///
+/// A displacement that is an exact multiple of the canonical span (`0`, one full
+/// period) is short-circuited to an exactly-zero raw step, so `δ = 0` remains a
+/// bit-exact no-op and a circle closes exactly, as [`SaeManifoldTerm::steer_rows`]
+/// guarantees for the raw action.
+///
+/// Errors when the atom has no `d = 1` canonical chart, when the chart is
+/// degenerate, when a row index is out of range, or when `canonical_delta` is not
+/// finite.
+pub fn steer_rows_unit_speed(
+    model: &SaeManifoldTerm,
+    atom_k: usize,
+    rows: &[usize],
+    canonical_delta: f64,
+) -> Result<UnitSpeedSteerField, String> {
+    if !canonical_delta.is_finite() {
+        return Err(format!(
+            "steer_rows_unit_speed: canonical_delta must be finite, got {canonical_delta}"
+        ));
+    }
+    let chart = canonical_chart(model, atom_k)?;
+    let n = model.n_obs();
+    let mut base_raw = Vec::with_capacity(rows.len());
+    let fitted = model.assignment.coords[atom_k].as_matrix();
+    for &row in rows {
+        if row >= n {
+            return Err(format!(
+                "steer_rows_unit_speed: row {row} out of range (n = {n})"
+            ));
+        }
+        base_raw.push(fitted[[row, 0]]);
+    }
+    let chart_read = chart.read(&base_raw)?;
+
+    // A whole number of canonical spans is the identity of the group action on a
+    // circle chart; take it exactly rather than through the inverse, so `δ = 0`
+    // and `δ = period` keep the bit-exact behaviour the raw action has.
+    let residual = match chart.topology {
+        CanonicalChartTopology::Circle { .. } => canonical_delta.rem_euclid(chart.span),
+        CanonicalChartTopology::Interval => canonical_delta,
+    };
+    let raw_steps = if residual == 0.0 {
+        vec![0.0_f64; rows.len()]
+    } else {
+        let targets: Vec<f64> = chart_read
+            .canonical
+            .iter()
+            .map(|&c| chart.advance(c, residual))
+            .collect();
+        let moved = chart.invert(&targets)?;
+        // The step is reported as its SHORTEST representative, through the same
+        // helper `steer_delta` uses. Both endpoints lie in the chart's own domain,
+        // so a row near the wrap seam would otherwise be reported as taking the
+        // long way round (`0.95 → 0.06` as `−0.89` rather than `+0.11`). The group
+        // action lands identically either way — `retract` wraps — but the reported
+        // spread over rows is only the gauge error if each step is the short one.
+        let periods = [chart.axis_period];
+        let mut steps = Vec::with_capacity(moved.len());
+        for (&to, &from) in moved.iter().zip(base_raw.iter()) {
+            steps.push(shortest_coordinate_delta(&[from], &[to], &periods)?[0]);
+        }
+        steps
+    };
+
+    let p = model.output_dim();
+    let mut delta = Array2::<f64>::zeros((rows.len(), p));
+    let mut step = Array1::<f64>::zeros(1);
+    for (out_row, &row) in rows.iter().enumerate() {
+        step[0] = raw_steps[out_row];
+        let field = model.steer_rows_raw(atom_k, &[row], step.view())?;
+        for c in 0..p {
+            delta[[out_row, c]] = field[[0, c]];
+        }
+    }
+
+    Ok(UnitSpeedSteerField {
+        atom: atom_k,
+        rows: rows.to_vec(),
+        canonical_delta,
+        raw_steps,
+        delta,
+        chart: chart_read,
+    })
+}

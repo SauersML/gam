@@ -6,11 +6,11 @@
 //! uncertainty arms are independent: the curved arm routes through
 //! `predict_posterior_mean`, while the linear/identity arm builds
 //! `PredictUncertaintyOptions { mean_interval_method: TransformEta, .. }`. That arm
-//! passed `apply_bias_correction: !args.no_bias_correction` (default `true`),
-//! recentring η by `X·H⁻¹S(λ̂)β̂` — so requesting an interval silently moved the
-//! reported `mean`/`linear_predictor` (~2.5%) relative to the plain plug-in point
-//! that plain `gam predict` and the Python FFI report. #2115 pinned
-//! `apply_bias_correction: false` in that arm.
+//! used to recentre η by a frequentist de-shrinkage `X·H⁻¹S(λ̂)β̂` — so requesting
+//! an interval silently moved the reported `mean`/`linear_predictor` (~2.5%)
+//! relative to the plain plug-in point that plain `gam predict` and the Python
+//! FFI report. #2115 pinned the arm to the posterior mean; #2670 deleted the
+//! de-shrinkage altogether.
 //!
 //! The #398 invariant is family-agnostic: the point prediction is a property of
 //! the model + inputs, never of whether an interval was requested. This test
@@ -18,8 +18,8 @@
 //! a Gaussian smooth through the CLI, predict on the same new data with and
 //! without `--uncertainty`, and assert the `mean` columns are bit-for-bit equal
 //! (tol 1e-9). The fixture carries a structured wiggle the penalized smooth
-//! cannot fully absorb, so the residual — and hence the pre-fix bias-correction
-//! recentring — is genuinely non-zero.
+//! cannot fully absorb, so the residual — and hence any recentring — is
+//! genuinely non-zero.
 
 use std::process::Command;
 

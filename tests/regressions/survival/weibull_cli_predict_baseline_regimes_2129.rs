@@ -169,15 +169,14 @@ fn fit(train: &Path, formula: &str, model: &Path) {
     assert!(model.is_file(), "gam fit did not write {model:?}");
 }
 
-fn predict_map(model: &Path, grid: &Path, out: &Path) {
+fn predict_plugin(model: &Path, grid: &Path, out: &Path) {
     let mut cmd = Command::new(gam::gam_binary!());
     cmd.arg("predict")
         .arg(model)
         .arg(grid)
-        .args(["--mode", "map"])
         .arg("--out")
         .arg(out);
-    run_or_panic(cmd, "gam predict (map)");
+    run_or_panic(cmd, "gam predict");
 }
 
 /// Least-squares slope of `y` regressed on `x`.
@@ -220,7 +219,7 @@ fn assert_weibull_baseline_recovered(
     let model = dir.path().join("m_wb.json");
     let pred = dir.path().join("p_wb.csv");
     fit(&train, formula, &model);
-    predict_map(&model, &grid, &pred);
+    predict_plugin(&model, &grid, &pred);
 
     let log_t: Vec<f64> = GRID_TIMES.iter().map(|t| t.ln()).collect();
     let eta = read_column(&pred, "eta");
@@ -234,7 +233,7 @@ fn assert_weibull_baseline_recovered(
         2.0 * shape,
     );
 
-    let surv = read_column(&pred, "survival_prob");
+    let surv = read_column(&pred, "survival_prob_plugin");
     let true_s = true_survival(shape, scale);
     for (got, want) in surv.iter().zip(true_s.iter()) {
         assert!(

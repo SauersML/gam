@@ -7,81 +7,6 @@
 //! identically; no test changed subject, assertion or name.
 
 use super::*;
-use ndarray::array;
-
-#[test]
-fn caller_requirement_caps_curvature_and_reproducibility_certificates_2627() {
-    for curvature in [false, true] {
-        for required in [None, Some(1.0e-7)] {
-            let theta = 2.0e-6;
-            let config = OuterConfig {
-                tolerance: 1.0e-12,
-                required_projected_gradient_norm: required,
-                ..OuterConfig::default()
-            };
-            let mut objective = OuterProblem::new(1)
-                .with_gradient(Derivative::Analytic)
-                .with_hessian(if curvature {
-                    DeclaredHessianForm::Dense
-                } else {
-                    DeclaredHessianForm::Unavailable
-                })
-                .build_objective(
-                    (),
-                    |_: &mut (), rho: &Array1<f64>| Ok(0.5 * rho[0] * rho[0]),
-                    move |_: &mut (), rho: &Array1<f64>| {
-                        Ok(OuterEval {
-                            cost: 0.5 * rho[0] * rho[0],
-                            gradient: rho.clone(),
-                            hessian: if curvature {
-                                HessianValue::Dense(array![[1.0]])
-                            } else {
-                                HessianValue::Unavailable
-                            },
-                            inner_beta_hint: None,
-                        })
-                    },
-                    None::<fn(&mut ())>,
-                    None::<fn(&mut (), &Array1<f64>) -> Result<EfsEval, EstimationError>>,
-                )
-                .with_criterion_resolution(|_: &mut ()| Some(1.0e-7));
-            let mut result = OuterResult::new(
-                array![theta],
-                0.5 * theta * theta,
-                1,
-                true,
-                OuterPlan {
-                    solver: Solver::Bfgs,
-                    hessian_source: HessianSource::BfgsApprox,
-                },
-            );
-            // Simulate a previous noisy measurement only for the reproducibility
-            // case; the curvature case has an exactly reproducible gradient.
-            result.final_gradient = Some(array![if curvature { theta } else { 0.0 }]);
-            let certificate = certify_outer_optimality(
-                &mut objective,
-                &config,
-                "caller limit after all widening",
-                &mut result,
-            );
-            if required.is_some() {
-                let refusal = certificate.expect_err("caller limit must refuse this point");
-                assert!(refusal.to_string().contains("rung=caller-requirement"));
-            } else {
-                let certificate = certificate.expect("uncapped measured rung must certify");
-                assert!(certificate.certifies());
-                assert_eq!(
-                    certificate.stationarity.rung().label,
-                    if curvature {
-                        "curvature-resolvability"
-                    } else {
-                        "gradient-reproducibility"
-                    },
-                );
-            }
-        }
-    }
-}
 
 // ─── #2568 caller-side outer stationarity requirement ──────────────
 
@@ -122,39 +47,88 @@ fn the_caller_requirement_rung_names_itself_2568() {
 
 // ─── #2688 the band and the rung that produced it travel together ──────────
 
-/// Each band decider names itself (#2688), and since #2812 there are two: the
-/// engine's declared band and the caller's requirement. The point-anchored
-/// `tol · (1 + |V|)` widening that used to be the third is gone — it was a
-/// statement about the criterion's magnitude, not the gradient's resolution.
+/// The defect, stated as the thing that must not happen again.
+///
+/// Before #2688 the certificate's band was decided three ways and labelled one
+/// way. The three ways are here as three configurations that differ in ONE
+/// input each, and the assertion is that the rung MOVES with them. A rung that
+/// is the same value across conditions which visibly move the number is not a
+/// measurement of anything -- it is a default wearing a measurement's name, and
+/// the old `let mut bound_source = StationarityBoundSource::SolverBand;` at the
+/// call site is exactly that.
 #[test]
-fn each_band_decider_names_itself_2688() {
+fn each_of_the_three_band_deciders_names_itself_2688() {
+    // (1) The engine's declared band. No scale, so the arithmetic floor is
+    // `tolerance`; a criterion value small enough that the point-anchored
+    // widening `tol*(1+|cost|)` cannot exceed it.
     let engine_only = OuterConfig {
         tolerance: 1e-5,
         objective_scale: None,
         required_projected_gradient_norm: None,
         ..Default::default()
     };
-    let bare = outer_stationarity_band_and_rung(&engine_only);
+    let bare = outer_stationarity_band_and_rung_at(&engine_only, 0.0);
     assert_eq!(bare.source, StationarityBoundSource::SolverBand);
     assert_eq!(bare.bound, 1e-5);
-    let capped = outer_stationarity_band_and_rung(&OuterConfig {
-        required_projected_gradient_norm: Some(1.0e-6),
-        ..engine_only.clone()
-    });
+
+    // (2) The SAME config, moving only the judged point. The number moves by
+    // six orders; before #2688 the label did not move at all.
+    let widened = outer_stationarity_band_and_rung_at(&engine_only, -1.0e6);
+    assert_eq!(
+        widened.source,
+        StationarityBoundSource::CertificateScoreRelative,
+        "a band set by the point-anchored widening must not report the engine's \
+         declared band, which is anchored on the DECLARED problem and cannot \
+         move with the criterion value (bound {:.6e} vs {:.6e})",
+        widened.bound,
+        bare.bound
+    );
+    assert!(
+        widened.bound > bare.bound * 1.0e5,
+        "fixture must actually widen: {:.6e} vs {:.6e}",
+        widened.bound,
+        bare.bound
+    );
+
+    // (3) The SAME config and the SAME point, adding only the caller's cap.
+    let capped = outer_stationarity_band_and_rung_at(
+        &OuterConfig {
+            required_projected_gradient_norm: Some(1.0e-3),
+            ..engine_only.clone()
+        },
+        -1.0e6,
+    );
     assert_eq!(
         capped.source,
         StationarityBoundSource::CallerRequirement,
         "a bound the caller decided must not be reported as the engine's"
     );
-    assert_eq!(capped.bound, 1.0e-6);
+    assert_eq!(capped.bound, 1.0e-3);
     // ... and the engine's own bound is still reported beside it, which is what
     // lets a reader tell "the engine refused this" from "the engine would have
     // certified this and the caller would not".
-    assert_eq!(capped.engine_bound, bare.bound);
-    assert_eq!(capped.engine_source, bare.source);
+    assert_eq!(capped.engine_bound, widened.bound);
+    assert_eq!(capped.engine_source, widened.source);
+
+    // Three conditions, three rungs. That is the property; the labels are named
+    // here so a rename cannot silently collapse two of them onto one string.
+    let labels = [
+        bare.source.label(),
+        widened.source.label(),
+        capped.source.label(),
+    ];
     assert_eq!(
-        [bare.source.label(), capped.source.label()],
-        ["solver-band", "caller-requirement"]
+        labels,
+        [
+            "solver-band",
+            "certificate-score-relative",
+            "caller-requirement"
+        ]
+    );
+    assert!(
+        !StationarityBoundSource::CertificateScoreRelative.is_derived_standard(),
+        "the score-relative widening is a gradient-magnitude substitute, not the \
+         derived resolvability standard"
     );
 }
 
@@ -167,27 +141,32 @@ fn a_requirement_that_decided_nothing_does_not_claim_the_rung_2688() {
         required_projected_gradient_norm: Some(1.0e9),
         ..Default::default()
     };
-    let band = outer_stationarity_band_and_rung(&config);
+    let band = outer_stationarity_band_and_rung_at(&config, -1.0e6);
     assert_eq!(
         band.source,
-        StationarityBoundSource::SolverBand,
+        StationarityBoundSource::CertificateScoreRelative,
         "a requirement looser than the engine's band is not a request for \
          anything and must not be credited with the bound"
     );
     // A requirement exactly equal to the band decided nothing either.
-    let tied = outer_stationarity_band_and_rung(&OuterConfig {
-        required_projected_gradient_norm: Some(band.bound),
-        ..config
-    });
+    let tied = outer_stationarity_band_and_rung_at(
+        &OuterConfig {
+            required_projected_gradient_norm: Some(band.bound),
+            ..config
+        },
+        -1.0e6,
+    );
     assert_eq!(tied.bound, band.bound);
-    assert_eq!(tied.source, StationarityBoundSource::SolverBand);
+    assert_eq!(tied.source, StationarityBoundSource::CertificateScoreRelative);
 }
 
-/// The solver band is the engine band capped at the requirement and nothing
-/// else, and the certificate's first-order band is that same number (#2812):
-/// no anchor on the judged point survives.
+/// The refactor must not move a single band. `outer_gradient_tolerance` is the
+/// engine band capped at the requirement and nothing else, and the certificate
+/// band is `min(max(engine, score-relative), required)` -- algebraically the
+/// same number the pre-#2688 `min(max(min(engine, required), score), required)`
+/// produced, which is a claim worth a sweep rather than a comment.
 #[test]
-fn the_certificate_band_is_the_solver_band_capped_at_the_requirement_2812() {
+fn the_rung_refactor_moved_no_band_2688() {
     for scale in [None, Some(1.0), Some(1.0e6)] {
         for required in [None, Some(1.0e-9), Some(1.0e-3), Some(1.0), Some(1.0e9)] {
             let config = OuterConfig {
@@ -196,25 +175,196 @@ fn the_certificate_band_is_the_solver_band_capped_at_the_requirement_2812() {
                 required_projected_gradient_norm: required,
                 ..Default::default()
             };
-            let engine_band = config
-                .objective_scale
-                .map(|s| config.tolerance.max(s * f64::EPSILON.sqrt()))
-                .unwrap_or(config.tolerance);
-            let expected = required.map_or(engine_band, |r| engine_band.min(r));
+            let engine_band = {
+                let mut abs = config
+                    .objective_scale
+                    .map(|s| config.tolerance.max(s * f64::EPSILON.sqrt()))
+                    .unwrap_or(config.tolerance);
+                if let Some(s) = config.objective_scale {
+                    abs = abs.max(config.tolerance * (1.0 + s));
+                }
+                abs
+            };
             assert_eq!(
                 outer_gradient_tolerance(&config).abs,
-                expected,
+                required.map_or(engine_band, |r| engine_band.min(r)),
                 "solver band moved: scale={scale:?} required={required:?}"
             );
-            let got = outer_stationarity_band_and_rung(&config);
+            for cost in [0.0, 1.0, -3.7e2, 1.0e6, f64::INFINITY, f64::NAN] {
+                let widened = if cost.is_finite() {
+                    engine_band.max(config.tolerance * (1.0 + cost.abs()))
+                } else {
+                    engine_band
+                };
+                let expected = required.map_or(widened, |r| widened.min(r));
+                let got = outer_stationarity_band_and_rung_at(&config, cost);
+                assert_eq!(
+                    got.bound.to_bits(),
+                    expected.to_bits(),
+                    "certificate band moved: scale={scale:?} required={required:?} cost={cost}"
+                );
+                assert!(
+                    got.engine_bound >= got.bound,
+                    "the engine's own bound can only be loosened by a cap"
+                );
+            }
+        }
+    }
+}
+
+// ─── #2568 caller-requirement band gates, restored (#2818) ──────────────────
+//
+// `c0a21b554` deleted these four gates because `d484a091a` had already deleted
+// the two `#[cfg(test)]` helpers they shared from this same file —
+// `fn outer_stationarity_band_at` and `fn wide_band_config_2568` — under a
+// criterion ("no production artifact links this function") that is vacuously
+// true of every test-only item. `outer_gradient_tolerance` and
+// `outer_stationarity_band_and_rung_at`, the two production entry points these
+// gates grade, were never touched.
+//
+// Both helpers are inlined as closures in each gate. `outer_stationarity_band_at`
+// was a one-line projection of the production return type
+// (`outer_stationarity_band_and_rung_at(config, cost).bound`); #2688 moved the
+// rung into that type on purpose, so the value-only form belongs beside the
+// tests that compare bands to each other. The duplication is deliberate: a
+// closure has no item name for a symbol-table sweep to name and miss.
+
+/// The load-bearing half of #2568. If the caller's requirement did not reach
+/// the SOLVER's band, the outer loop would still stop at the sealed bound and
+/// the requirement could only ever be a post-hoc rejection.
+#[test]
+fn a_caller_requirement_tightens_the_solver_band_2568() {
+    // The saturating shape this issue was filed against: an objective whose
+    // declared scale widens the engine's band by six orders, so a point nowhere
+    // near stationary clears it.
+    let wide_band_config = |required: Option<f64>| OuterConfig {
+        tolerance: 1e-5,
+        objective_scale: Some(1.0e6),
+        required_projected_gradient_norm: required,
+        ..Default::default()
+    };
+
+    let engine = outer_gradient_tolerance(&wide_band_config(None)).abs;
+    assert!(
+        engine > 1.0e-3,
+        "fixture must reproduce a saturated engine band, got {engine:.6e}"
+    );
+    let tightened = outer_gradient_tolerance(&wide_band_config(Some(1.0e-3))).abs;
+    assert_eq!(
+        tightened, 1.0e-3,
+        "the caller's requirement must become the band the optimizer is told to \
+         reach (engine band was {engine:.6e})"
+    );
+}
+
+/// The widening is what produced `bound = 1.000e0`, so a requirement applied
+/// before it would be defeated by precisely the case it exists for.
+#[test]
+fn a_caller_requirement_survives_the_score_relative_widening_2568() {
+    let wide_band_config = |required: Option<f64>| OuterConfig {
+        tolerance: 1e-5,
+        objective_scale: Some(1.0e6),
+        required_projected_gradient_norm: required,
+        ..Default::default()
+    };
+    let band_at = |config: &OuterConfig, cost_at_point: f64| {
+        outer_stationarity_band_and_rung_at(config, cost_at_point).bound
+    };
+
+    let cost = 1.0e6;
+    let engine = band_at(&wide_band_config(None), cost);
+    assert!(
+        engine > 1.0e-3,
+        "fixture must reproduce a widened certificate band, got {engine:.6e}"
+    );
+    let capped = band_at(&wide_band_config(Some(1.0e-3)), cost);
+    assert_eq!(
+        capped, 1.0e-3,
+        "the certificate band must be capped at the caller's requirement, not \
+         widened past it (engine band was {engine:.6e})"
+    );
+}
+
+/// A caller asking for LESS accuracy than the engine already guarantees is not
+/// asking for anything. If this inverted, the knob would be a way to launder a
+/// fit past a standard the engine derived from the criterion.
+#[test]
+fn a_looser_caller_requirement_never_weakens_the_engine_band_2568() {
+    let band_at = |config: &OuterConfig, cost_at_point: f64| {
+        outer_stationarity_band_and_rung_at(config, cost_at_point).bound
+    };
+
+    let cfg_tight_engine = OuterConfig {
+        tolerance: 1.0e-9,
+        ..Default::default()
+    };
+    let engine = outer_gradient_tolerance(&cfg_tight_engine).abs;
+    // Non-vacuity: a requirement can only be shown not to LOOSEN a band that is
+    // tighter than the requirement to begin with.
+    assert!(
+        engine < 1.0,
+        "the engine band {engine:.6e} must be tighter than the 1.0 requirement below, or \
+         'never weakens' is asserted where there was nothing to weaken"
+    );
+    let with_loose = outer_gradient_tolerance(&OuterConfig {
+        required_projected_gradient_norm: Some(1.0),
+        ..cfg_tight_engine.clone()
+    })
+    .abs;
+    assert_eq!(
+        with_loose, engine,
+        "a requirement of 1.0 must leave a {engine:.6e} engine band in force"
+    );
+    let cost = 1.0e3;
+    let engine_band = band_at(&cfg_tight_engine, cost);
+    assert!(
+        engine_band < 1.0e9,
+        "the engine certificate band {engine_band:.6e} must be tighter than the 1e9 \
+         requirement below for the same reason"
+    );
+    let loose_band = band_at(
+        &OuterConfig {
+            required_projected_gradient_norm: Some(1.0e9),
+            ..cfg_tight_engine
+        },
+        cost,
+    );
+    assert_eq!(
+        loose_band, engine_band,
+        "nor may it widen the certificate band"
+    );
+}
+
+/// The compatibility claim, stated as a test rather than asserted in a doc
+/// comment: `None` must be byte-for-byte today's behaviour on both bands.
+#[test]
+fn an_absent_requirement_reproduces_the_engine_exactly_2568() {
+    let band_at = |config: &OuterConfig, cost_at_point: f64| {
+        outer_stationarity_band_and_rung_at(config, cost_at_point).bound
+    };
+
+    for scale in [None, Some(1.0), Some(1.0e6)] {
+        for cost in [0.0, 1.0, -3.7e2, 1.0e6, f64::INFINITY] {
+            let cfg = OuterConfig {
+                tolerance: 1e-5,
+                objective_scale: scale,
+                required_projected_gradient_norm: None,
+                ..Default::default()
+            };
+            let bare = OuterConfig {
+                tolerance: 1e-5,
+                objective_scale: scale,
+                ..Default::default()
+            };
             assert_eq!(
-                got.bound.to_bits(),
-                expected.to_bits(),
-                "certificate band moved: scale={scale:?} required={required:?}"
+                outer_gradient_tolerance(&cfg).abs,
+                outer_gradient_tolerance(&bare).abs,
+                "solver band moved with scale={scale:?}"
             );
-            assert!(
-                got.engine_bound >= got.bound,
-                "the engine's own bound can only be loosened by a cap"
+            assert_eq!(
+                band_at(&cfg, cost),
+                band_at(&bare, cost),
+                "certificate band moved with scale={scale:?} cost={cost}"
             );
         }
     }

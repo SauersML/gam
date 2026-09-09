@@ -378,6 +378,19 @@ fn gam_multinomial_classifies_penguin_species_at_least_as_well_as_nnet_on_real_d
     let gam_acc = accuracy(&gam_probs_flat, &test_labels, K);
     let gam_log_loss = mean_log_loss(&gam_probs_flat, &test_labels, K);
     let gam_recall = per_class_recall(&gam_probs_flat, &test_labels, K);
+    // gam's OWN held-out quality, printed BEFORE anything that needs another
+    // tool. The reference call below panics with `REFERENCE_ENV_MISSING` on a
+    // box with no R, and that used to take these numbers down with it — so the
+    // one measurement that is a statement about gam, and needs nothing but gam,
+    // was unavailable exactly where the comparison could not be made. A missing
+    // comparator must cost the COMPARISON, not the tool-independent metric.
+    eprintln!(
+        "penguin species multinomial (real-data arm, stride={STRIDE}): GAM-ONLY \
+         gam_acc={gam_acc:.4} gam_logloss={gam_log_loss:.5} gam_recall={gam_recall:?} \
+         lambdas={:?} edf_per_penalty={:?}",
+        model.lambdas,
+        model.edf_per_penalty,
+    );
 
     // All three species must appear in the held-out set for per-class recall to
     // be meaningful (the stride split mixes the file's class blocks).
@@ -659,6 +672,14 @@ fn gam_multinomial_classifies_penguin_species_at_least_as_well_as_nnet() {
 
     let gam_acc = accuracy(&gam_probs_flat, &test_labels, K);
     let gam_log_loss = mean_log_loss(&gam_probs_flat, &test_labels, K);
+    // Same reason as the real-data arm above: the tool-independent numbers go
+    // out before anything that can fail for want of another tool.
+    eprintln!(
+        "penguin species multinomial (stride-4 arm): GAM-ONLY gam_acc={gam_acc:.4} \
+         gam_logloss={gam_log_loss:.5} lambdas={:?} edf_per_penalty={:?}",
+        model.lambdas,
+        model.edf_per_penalty,
+    );
 
     // ---- nnet::multinom on the IDENTICAL train rows -----------------------
     // Emit the four measurements + an integer class code + a train/test flag,

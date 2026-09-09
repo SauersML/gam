@@ -56,9 +56,23 @@ fn sae_default_ordered_beta_bernoulli_concentration_for_k_atoms(k_atoms: usize) 
 /// they are echoed back under `config` so a caller records the cover it actually
 /// measured rather than the one it assumed.
 ///
-/// A refusal is a result, not an error: `observed_manifold` is then `None` and
-/// `refusal` carries the typed reason with its own counts. Only a malformed
-/// atlas (empty input, non-finite rows, no certifiable chart) raises.
+/// A refusal is a result, not an error, and the caller is required to say which
+/// case it is in. The return carries exactly one of
+///
+/// * `topology["named"]` — `kind` plus the full invariant block, or
+/// * `topology["refused"]` — `reason` (the typed refusal with its own counts)
+///   plus the same invariant block.
+///
+/// Both arms carry the invariants, because they are what a caller debugging a
+/// refused cloud needs; what they cannot do is read them without knowing which
+/// arm they are in. The invariants deliberately do NOT sit at the top level:
+/// structureless Gaussian noise measures `b0=1, b1=0, b2=1, chi=2` — the sphere
+/// row of the classification table — and is refused only by the
+/// orientation-subcomplex gate, so a top-level `betti` let a caller read a
+/// manifold's signature off a cloud that is not a manifold (#2280).
+///
+/// Only a malformed atlas (empty input, non-finite rows, no certifiable chart)
+/// raises.
 #[pyfunction]
 #[pyo3(signature = (z, intrinsic_dim, patch_count=None, patch_size=None, min_overlap=None))]
 fn sae_observe_atlas_topology<'py>(
@@ -151,15 +165,28 @@ fn sae_observe_atlas_topology<'py>(
         }
     };
 
-    let out = PyDict::new(py);
-    out.set_item(
-        "observed_manifold",
-        readout.observed_manifold().map(observed_manifold_name),
-    )?;
-    out.set_item("refusal", refusal)?;
-    out.set_item("intrinsic_dim", invariants.intrinsic_dim)?;
-    out.set_item("betti", betti)?;
-    out.set_item(
+    // #2280 — the invariants are reachable in BOTH arms, but only through a
+    // branch the caller cannot skip.
+    //
+    // They used to sit at the top level beside an optional `refusal`, so
+    // `result["betti"]` read fine on a refusal and returned a manifold's
+    // signature for a cloud that is not a manifold. That is not hypothetical:
+    // structureless Gaussian noise measures `b0=1, b1=0, b2=1, chi=2` here — the
+    // sphere row of the classification table, matching a planted sphere invariant
+    // for invariant — and is refused only by the orientation-subcomplex gate. A
+    // caller reading the invariants without the verdict saw a sphere in noise.
+    //
+    // The fix is NOT to hide the invariants on a refusal: they are exactly what a
+    // user debugging a refused cloud needs, and reading them on a refusal is how
+    // the above was found. It is to make the CASE mandatory. Exactly one of
+    // `topology["named"]` / `topology["refused"]` exists, each carrying the full
+    // invariant block, so the old mistake is now a `KeyError` rather than a wrong
+    // number. This matches the sibling surface `atlas_nerve_diagram`, which
+    // already gates its payload behind `computed`.
+    let invariant_block = PyDict::new(py);
+    invariant_block.set_item("intrinsic_dim", invariants.intrinsic_dim)?;
+    invariant_block.set_item("betti", betti)?;
+    invariant_block.set_item(
         "euler_characteristic",
         i64::try_from(invariants.euler_characteristic).map_err(|_| {
             py_value_error(format!(
@@ -168,23 +195,23 @@ fn sae_observe_atlas_topology<'py>(
             ))
         })?,
     )?;
-    out.set_item("simplex_counts", invariants.simplex_counts.clone())?;
-    out.set_item(
+    invariant_block.set_item("simplex_counts", invariants.simplex_counts.clone())?;
+    invariant_block.set_item(
         "orientation_class",
         match invariants.orientation_class {
             AtlasOrientability::Orientable => "orientable",
             AtlasOrientability::NonOrientable => "non_orientable",
         },
     )?;
-    out.set_item(
+    invariant_block.set_item(
         "orientation_cocycle_closes",
         invariants.orientation_cocycle_closes,
     )?;
-    out.set_item(
+    invariant_block.set_item(
         "open_orientation_triangles",
         invariants.open_orientation_triangles,
     )?;
-    out.set_item(
+    invariant_block.set_item(
         "unsigned_orientation_triangles",
         invariants.unsigned_orientation_triangles,
     )?;
@@ -192,19 +219,13 @@ fn sae_observe_atlas_topology<'py>(
     signed_betti.set_item("b0", invariants.signed_subcomplex_betti.b0)?;
     signed_betti.set_item("b1", invariants.signed_subcomplex_betti.b1)?;
     signed_betti.set_item("b2", invariants.signed_subcomplex_betti.b2)?;
-    out.set_item("signed_subcomplex_betti", signed_betti)?;
-    out.set_item(
-        "incoherent_overlap_pairs",
-        invariants.incoherent_overlap_pairs,
-    )?;
-    out.set_item("max_cover_multiplicity", invariants.max_cover_multiplicity)?;
-    out.set_item(
-        "mean_cover_multiplicity",
-        invariants.mean_cover_multiplicity,
-    )?;
-    out.set_item("chart_count", invariants.chart_count)?;
-    out.set_item("dropped_center_count", invariants.dropped_center_count)?;
-    out.set_item(
+    invariant_block.set_item("signed_subcomplex_betti", signed_betti)?;
+    invariant_block.set_item("incoherent_overlap_pairs", invariants.incoherent_overlap_pairs)?;
+    invariant_block.set_item("max_cover_multiplicity", invariants.max_cover_multiplicity)?;
+    invariant_block.set_item("mean_cover_multiplicity", invariants.mean_cover_multiplicity)?;
+    invariant_block.set_item("chart_count", invariants.chart_count)?;
+    invariant_block.set_item("dropped_center_count", invariants.dropped_center_count)?;
+    invariant_block.set_item(
         "orientation_gauge",
         readout
             .orientation_gauge()
@@ -212,7 +233,30 @@ fn sae_observe_atlas_topology<'py>(
             .map(|sign| i64::from(*sign))
             .collect::<Vec<_>>(),
     )?;
-    out.set_item("twisted_edges", readout.twisted_edges().to_vec())?;
+    invariant_block.set_item("twisted_edges", readout.twisted_edges().to_vec())?;
+
+    // Exactly one arm is present, so a caller must name the case it is in.
+    let topology = PyDict::new(py);
+    match (readout.observed_manifold(), refusal) {
+        (Some(kind), _) => {
+            invariant_block.set_item("kind", observed_manifold_name(kind))?;
+            topology.set_item("named", invariant_block)?;
+        }
+        (None, Some(reason)) => {
+            invariant_block.set_item("reason", reason)?;
+            topology.set_item("refused", invariant_block)?;
+        }
+        (None, None) => {
+            return Err(py_value_error(
+                "atlas readout named no manifold and carried no refusal; this is a \
+                 contradiction in the readout, not a result"
+                    .to_string(),
+            ));
+        }
+    }
+
+    let out = PyDict::new(py);
+    out.set_item("topology", topology)?;
     out.set_item("config", cover)?;
     Ok(out.unbind())
 }
@@ -371,11 +415,13 @@ fn sae_auto_k_recommendation(
 /// block-chart MDL scorer's `coordinate_spectrum` (same mean-centred covariance,
 /// same `jacobi_eigh`, zeros clamped, descending). One eigenvalue per coded
 /// coordinate axis.
-fn coordinate_variance_spectrum(coords: ndarray::ArrayView2<'_, f64>) -> Vec<f64> {
+fn coordinate_variance_spectrum(
+    coords: ndarray::ArrayView2<'_, f64>,
+) -> Result<Vec<f64>, String> {
     let n = coords.nrows();
     let d = coords.ncols();
     if d == 0 || n == 0 {
-        return vec![0.0; d];
+        return Ok(vec![0.0; d]);
     }
     let mut means = vec![0.0f64; d];
     for j in 0..d {
@@ -398,10 +444,17 @@ fn coordinate_variance_spectrum(coords: ndarray::ArrayView2<'_, f64>) -> Vec<f64
     }
     let mut vals = vec![0.0f64; d];
     let mut vecs = vec![0.0f64; d * d];
-    gam::terms::sae::gpu_kernels::sae_encode_resident::jacobi_eigh(&cov, d, &mut vals, &mut vecs);
+    if !gam::terms::sae::gpu_kernels::sae_encode_resident::jacobi_eigh(
+        &cov, d, &mut vals, &mut vecs,
+    ) {
+        return Err(format!(
+            "coordinate variance spectrum: the {d}×{d} covariance did not diagonalise within \
+             the Jacobi sweep budget (non-finite coordinates?)"
+        ));
+    }
     let mut spectrum: Vec<f64> = vals.into_iter().map(|v| v.max(0.0)).collect();
     spectrum.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
-    spectrum
+    Ok(spectrum)
 }
 
 pub(crate) fn manifold_description_length_from_arrays(
@@ -435,7 +488,7 @@ pub(crate) fn manifold_description_length_from_arrays(
             ));
         }
         atom_coord_dims.push(block.ncols() as f64);
-        coord_variances.extend(coordinate_variance_spectrum(*block));
+        coord_variances.extend(coordinate_variance_spectrum(*block)?);
     }
 
     let total_var: f64 = coord_variances.iter().sum();
@@ -1336,7 +1389,10 @@ fn response_geometry_fit_curvature<'py>(
     out.set_item("verdict", verdict)?;
     out.set_item("flatness_lr", fit.flatness.lr_stat)?;
     out.set_item("flatness_pvalue", fit.flatness.p_value)?;
-    out.set_item("railed_at_resolution_limit", fit.railed_at_resolution_limit)?;
+    out.set_item(
+        "railed_at_resolution_limit",
+        fit.railed_at_resolution_limit,
+    )?;
     out.set_item(
         "railed_at_hyperbolic_resolution_limit",
         fit.railed_at_hyperbolic_resolution_limit,
@@ -5953,7 +6009,10 @@ fn sparse_dictionary_fit<'py>(
     convergence.set_item("seeded_inner_runs", fit.convergence.seeded_inner_runs)?;
     convergence.set_item("continued_inner_runs", fit.convergence.continued_inner_runs)?;
     convergence.set_item("accepted_births", fit.convergence.accepted_births)?;
-    convergence.set_item("live_atom_high_water", fit.convergence.live_atom_high_water)?;
+    convergence.set_item(
+        "live_atom_high_water",
+        fit.convergence.live_atom_high_water,
+    )?;
     convergence.set_item("support_saturated", fit.convergence.support_saturated)?;
     convergence.set_item("certified", fit.convergence.certified)?;
     out.set_item("convergence", convergence)?;
@@ -6100,7 +6159,7 @@ fn sae_manifold_reconstruct_ffi<'py>(
 ))]
 fn block_sparse_dictionary_fit<'py>(
     py: Python<'py>,
-    x: PyReadonlyArray2<'py, f64>,
+    x: PyReadonlyArray2<'py, f32>,
     n_blocks: usize,
     block_size: usize,
     block_topk: usize,
@@ -6147,7 +6206,7 @@ fn block_sparse_dictionary_fit<'py>(
 ))]
 fn fixed_budget_block_sparse_dictionary_fit<'py>(
     py: Python<'py>,
-    x: PyReadonlyArray2<'py, f64>,
+    x: PyReadonlyArray2<'py, f32>,
     n_atoms: usize,
     active: usize,
     block_size: usize,
@@ -6179,7 +6238,7 @@ fn fixed_budget_block_sparse_dictionary_fit<'py>(
 
 fn block_sparse_dictionary_fit_payload<'py>(
     py: Python<'py>,
-    x_values: Array2<f64>,
+    x_values: Array2<f32>,
     config: BlockSparseConfig,
     operation: &'static str,
 ) -> PyResult<Py<PyDict>> {
@@ -6213,13 +6272,6 @@ fn block_sparse_dictionary_fit_payload<'py>(
     convergence.set_item("ev_residual", fit.convergence.ev_residual)?;
     convergence.set_item("gamma_residual", fit.convergence.gamma_residual)?;
     convergence.set_item("frame_residual", fit.convergence.frame_residual)?;
-    convergence.set_item("routing_residual", fit.convergence.routing_residual)?;
-    convergence.set_item(
-        "reconstruction_residual",
-        fit.convergence.reconstruction_residual,
-    )?;
-    convergence.set_item("accepted_births", fit.convergence.accepted_births)?;
-    convergence.set_item("polar_failures", fit.convergence.polar_failures)?;
     convergence.set_item("tolerance", fit.convergence.tolerance)?;
     out.set_item("convergence", convergence)?;
     out.set_item("block_topk", fit.block_topk)?;
@@ -6233,7 +6285,7 @@ fn block_sparse_dictionary_fit_payload<'py>(
     Ok(out.unbind())
 }
 
-/// Out-of-sample BLOCK encode: route held-out rows `x` (`M×P`, f64) through frozen
+/// Out-of-sample BLOCK encode: route held-out rows `x` (`M×P`, f32) through frozen
 /// block frames `decoder` (`K×P`, `K = G·b`) with tied scalar `gamma`, returning the
 /// fixed-width sparse block routing `(blocks[M,k], gates[M,k], codes[M,k,b])` via the
 /// Rust core — the same group-ℓ₂ gate + block-TopK + tied signed codes the trainer
@@ -6241,13 +6293,13 @@ fn block_sparse_dictionary_fit_payload<'py>(
 #[pyfunction(signature = (x, decoder, gamma, block_size, block_topk, block_tile = 1024))]
 fn block_sparse_dictionary_transform_ffi<'py>(
     py: Python<'py>,
-    x: PyReadonlyArray2<'py, f64>,
-    decoder: PyReadonlyArray2<'py, f64>,
-    gamma: f64,
+    x: PyReadonlyArray2<'py, f32>,
+    decoder: PyReadonlyArray2<'py, f32>,
+    gamma: f32,
     block_size: usize,
     block_topk: usize,
     block_tile: usize,
-) -> PyResult<(Py<PyArray2<u32>>, Py<PyArray2<f64>>, Py<PyArray3<f64>>)> {
+) -> PyResult<(Py<PyArray2<u32>>, Py<PyArray2<f32>>, Py<PyArray3<f32>>)> {
     let x_values = x.as_array().to_owned();
     let decoder_values = decoder.as_array().to_owned();
     let (blocks, gates, codes) =
@@ -6271,11 +6323,11 @@ fn block_sparse_dictionary_transform_ffi<'py>(
 #[pyfunction(signature = (decoder, blocks, codes, block_size))]
 fn block_sparse_dictionary_reconstruct_ffi<'py>(
     py: Python<'py>,
-    decoder: PyReadonlyArray2<'py, f64>,
+    decoder: PyReadonlyArray2<'py, f32>,
     blocks: PyReadonlyArray2<'py, u32>,
-    codes: PyReadonlyArray3<'py, f64>,
+    codes: PyReadonlyArray3<'py, f32>,
     block_size: usize,
-) -> PyResult<Py<PyArray2<f64>>> {
+) -> PyResult<Py<PyArray2<f32>>> {
     let decoder_values = decoder.as_array().to_owned();
     let block_values = blocks.as_array().to_owned();
     let code_values = codes.as_array().to_owned();
@@ -6293,11 +6345,11 @@ fn block_sparse_dictionary_reconstruct_ffi<'py>(
 #[pyfunction(signature = (x, decoder, block_size, block))]
 fn block_sparse_dictionary_block_coords_ffi<'py>(
     py: Python<'py>,
-    x: PyReadonlyArray2<'py, f64>,
-    decoder: PyReadonlyArray2<'py, f64>,
+    x: PyReadonlyArray2<'py, f32>,
+    decoder: PyReadonlyArray2<'py, f32>,
     block_size: usize,
     block: usize,
-) -> PyResult<Py<PyArray2<f64>>> {
+) -> PyResult<Py<PyArray2<f32>>> {
     let x_values = x.as_array().to_owned();
     let decoder_values = decoder.as_array().to_owned();
     let out = detach_py_result(py, "block_sparse_dictionary_block_coords", move || {
@@ -6314,11 +6366,11 @@ fn block_sparse_dictionary_block_coords_ffi<'py>(
 #[pyfunction(signature = (coords, decoder, block_size, block))]
 fn block_sparse_dictionary_lift_block_ffi<'py>(
     py: Python<'py>,
-    coords: PyReadonlyArray2<'py, f64>,
-    decoder: PyReadonlyArray2<'py, f64>,
+    coords: PyReadonlyArray2<'py, f32>,
+    decoder: PyReadonlyArray2<'py, f32>,
     block_size: usize,
     block: usize,
-) -> PyResult<Py<PyArray2<f64>>> {
+) -> PyResult<Py<PyArray2<f32>>> {
     let coord_values = coords.as_array().to_owned();
     let decoder_values = decoder.as_array().to_owned();
     let out = detach_py_result(py, "block_sparse_dictionary_lift_block", move || {
@@ -6335,14 +6387,14 @@ fn block_sparse_dictionary_lift_block_ffi<'py>(
 #[pyfunction(signature = (x, decoder, gamma, block_size, block_topk, block, block_tile = 1024))]
 fn block_sparse_dictionary_project_residual_ffi<'py>(
     py: Python<'py>,
-    x: PyReadonlyArray2<'py, f64>,
-    decoder: PyReadonlyArray2<'py, f64>,
-    gamma: f64,
+    x: PyReadonlyArray2<'py, f32>,
+    decoder: PyReadonlyArray2<'py, f32>,
+    gamma: f32,
     block_size: usize,
     block_topk: usize,
     block: usize,
     block_tile: usize,
-) -> PyResult<Py<PyArray2<f64>>> {
+) -> PyResult<Py<PyArray2<f32>>> {
     let x_values = x.as_array().to_owned();
     let decoder_values = decoder.as_array().to_owned();
     let out = detach_py_result(py, "block_sparse_dictionary_project_residual", move || {
@@ -6389,12 +6441,12 @@ fn block_sparse_dictionary_firings_ffi<'py>(
 ))]
 fn block_sparse_dictionary_seed_manifest_ffi<'py>(
     py: Python<'py>,
-    x: PyReadonlyArray2<'py, f64>,
-    decoder: PyReadonlyArray2<'py, f64>,
+    x: PyReadonlyArray2<'py, f32>,
+    decoder: PyReadonlyArray2<'py, f32>,
     blocks: PyReadonlyArray2<'py, u32>,
-    block_utilization: PyReadonlyArray1<'py, f64>,
-    block_stable_rank: PyReadonlyArray1<'py, f64>,
-    gamma: f64,
+    block_utilization: PyReadonlyArray1<'py, f32>,
+    block_stable_rank: PyReadonlyArray1<'py, f32>,
+    gamma: f32,
     block_size: usize,
     block_topk: usize,
     explained_variance: f64,
@@ -6456,11 +6508,11 @@ fn block_sparse_dictionary_seed_manifest_ffi<'py>(
 ))]
 fn block_coordinate_chart_compose_ffi<'py>(
     py: Python<'py>,
-    x: PyReadonlyArray2<'py, f64>,
-    decoder: PyReadonlyArray2<'py, f64>,
+    x: PyReadonlyArray2<'py, f32>,
+    decoder: PyReadonlyArray2<'py, f32>,
     blocks: PyReadonlyArray2<'py, u32>,
-    codes: PyReadonlyArray3<'py, f64>,
-    gamma: f64,
+    codes: PyReadonlyArray3<'py, f32>,
+    gamma: f32,
     block_size: usize,
     block_topk: usize,
     residual_target: bool,
@@ -6780,7 +6832,7 @@ impl BlockSparseDictStream {
     ))]
     fn new(
         py: Python<'_>,
-        seed: PyReadonlyArray2<'_, f64>,
+        seed: PyReadonlyArray2<'_, f32>,
         n_blocks: usize,
         block_size: usize,
         block_topk: usize,
@@ -6815,7 +6867,7 @@ impl BlockSparseDictStream {
     fn partial_fit<'py>(
         &mut self,
         py: Python<'py>,
-        shard: PyReadonlyArray2<'py, f64>,
+        shard: PyReadonlyArray2<'py, f32>,
     ) -> PyResult<Py<PyDict>> {
         let shard_values = shard.as_array().to_owned();
         let stats = py
@@ -6865,26 +6917,17 @@ impl BlockSparseDictStream {
         out.set_item("block_stable_rank", artifact.block_stable_rank)?;
         out.set_item("epochs", artifact.epochs)?;
         out.set_item("explained_variance", artifact.explained_variance)?;
-        let convergence = PyDict::new(py);
-        convergence.set_item("ev_residual", artifact.convergence.ev_residual)?;
-        convergence.set_item("gamma_residual", artifact.convergence.gamma_residual)?;
-        convergence.set_item("frame_residual", artifact.convergence.frame_residual)?;
-        convergence.set_item("tolerance", artifact.convergence.tolerance)?;
-        convergence.set_item("accepted_births", artifact.convergence.accepted_births)?;
-        convergence.set_item("corpus_rows", artifact.convergence.corpus_rows)?;
-        convergence.set_item("epoch", artifact.convergence.epoch)?;
-        out.set_item("convergence", convergence)?;
         Ok(out.unbind())
     }
 
     /// A live copy of the current warm-started frames (`K×P`, block-orthonormal).
-    fn decoder(&self, py: Python<'_>) -> Py<PyArray2<f64>> {
+    fn decoder(&self, py: Python<'_>) -> Py<PyArray2<f32>> {
         self.inner.decoder().to_owned().into_pyarray(py).unbind()
     }
 
     /// Current shared tied scalar γ.
     #[getter]
-    fn gamma(&self) -> f64 {
+    fn gamma(&self) -> f32 {
         self.inner.gamma()
     }
 
@@ -7542,7 +7585,6 @@ fn predict_columns(
         observation_prior_weights: observation_prior_weights.clone(),
         // This entry point exposes no plug-in switch, so a curved link always
         // reports the posterior mean (SPEC: it is always the default).
-        point_estimate: gam_predict::interval_policy::PointEstimate::PosteriorMeanWhenCurved,
     };
     let resolved = gam_predict::interval_policy::resolve_prediction_request(
         &*predictor,
@@ -7738,7 +7780,6 @@ fn predict_columns_conformal(
         covariance_mode,
         mean_interval_method: gam_predict::MeanIntervalMethod::TransformEta,
         includeobservation_interval: options.observation_interval.unwrap_or(false),
-        apply_bias_correction: false,
         conformal_level: Some(level),
         ..gam_predict::PredictUncertaintyOptions::default()
     };
@@ -7771,7 +7812,6 @@ fn predict_columns_conformal(
             covariance_mode,
             observation_interval: false,
             observation_prior_weights: None,
-            point_estimate: gam_predict::interval_policy::PointEstimate::PosteriorMeanWhenCurved,
         },
     )
     .map_err(|err| format!("conformal point prediction failed: {err}"))?;
@@ -7987,8 +8027,8 @@ fn predict_encoded_table_jackknife_plus_impl(
 /// λ̂ was selected from all training responses, the frozen-λ score construction
 /// is not permutation symmetric in the n+1 augmented points, so the
 /// distribution-free finite-sample coverage theorem applies only where the
-/// per-row frozen-ρ certificate accepts (`frozen_rho_certified` = 1.0, under
-/// the global-ρ grid-Lipschitz assumption); a 0.0 row is the frozen-λ
+/// per-row frozen-ρ certificate accepts (`frozen_rho_certified` = 1.0, on the
+/// REML branch through the augmented optimum); a 0.0 row is the frozen-λ
 /// approximation with no finite-sample guarantee. The exact set is a union of
 /// intervals; the returned `mean_lower`/`mean_upper` are its outer envelope (a
 /// superset).
@@ -8102,7 +8142,7 @@ fn predict_encoded_table_full_conformal_impl(
             "full-conformal at frozen smoothing parameters (exact set given Sλ; the \
              distribution-free finite-sample ≥{:.0}% guarantee needs the symmetric \
              ρ-re-selecting fit and is certified per row only where \
-             frozen_rho_certified=1, under the global-ρ grid-Lipschitz assumption)",
+             frozen_rho_certified=1, on the REML branch through the augmented optimum)",
             conformal_level * 100.0
         )),
         covariance_source: None,
@@ -8119,8 +8159,8 @@ fn predict_encoded_table_full_conformal_impl(
 /// given the frozen `Sλ`; the distribution-free finite-sample
 /// ≥`conformal_level` marginal-coverage theorem additionally requires the
 /// symmetric ρ-re-selecting fit and is certified per row only where the
-/// returned `frozen_rho_certified` column is 1.0 (Layer-3 certificate, under
-/// the global-ρ grid-Lipschitz assumption). Returns the same column JSON as
+/// returned `frozen_rho_certified` column is 1.0 (Layer-3 certificate, on the
+/// REML branch through the augmented optimum). Returns the same column JSON as
 /// `predict_table` plus that certificate column.
 ///
 /// Raises a descriptive Python exception for ineligible models (non-Gaussian,
@@ -8424,27 +8464,36 @@ fn affine_design_array_impl(
 
 /// Population variance (divide by `n`, matching numpy `np.var`'s default).
 fn population_variance(values: &[f64]) -> f64 {
-    population_covariance(values, values)
+    if values.is_empty() {
+        return 0.0;
+    }
+    let mean = values.iter().sum::<f64>() / values.len() as f64;
+    values
+        .iter()
+        .map(|value| (value - mean) * (value - mean))
+        .sum::<f64>()
+        / values.len() as f64
 }
 
 /// Population covariance (divide by `n`, matching `population_variance`).
-fn population_covariance(a: &[f64], b: &[f64]) -> f64 {
+fn population_covariance(a: &[f64], b: &[f64]) -> Result<f64, String> {
     let n = a.len();
-    assert_eq!(
-        n,
-        b.len(),
-        "population covariance requires equal-length slices"
-    );
+    if n != b.len() {
+        return Err(format!(
+            "population covariance requires equal-length slices, got {n} and {}",
+            b.len()
+        ));
+    }
     if n == 0 {
-        return 0.0;
+        return Ok(0.0);
     }
     let mean_a = a.iter().sum::<f64>() / n as f64;
     let mean_b = b.iter().sum::<f64>() / n as f64;
-    a.iter()
+    Ok(a.iter()
         .zip(b.iter())
         .map(|(&va, &vb)| (va - mean_a) * (vb - mean_b))
         .sum::<f64>()
-        / n as f64
+        / n as f64)
 }
 
 /// Per-term partial dependence on a grid table.
@@ -8565,7 +8614,7 @@ fn model_variance_share_encoded_impl(
             contrib[i] = s;
         }
         let share = if total_var > 0.0 {
-            population_covariance(&contrib, &eta) / total_var
+            population_covariance(&contrib, &eta)? / total_var
         } else {
             0.0
         };

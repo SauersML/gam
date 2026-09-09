@@ -27,7 +27,7 @@ use gam::basis::{
     BasisMetadata, CenterStrategy, SpatialIdentifiability, ThinPlateBasisSpec,
     build_thin_plate_basis,
 };
-use gam::estimate::{AdaptiveRegularizationOptions, FitOptions};
+use gam::estimate::FitOptions;
 use gam::faer_ndarray::{FaerCholesky, FaerEigh};
 use gam::smooth::{
     ShapeConstraint, SmoothBasisSpec, SmoothTermSpec, TermCollectionSpec,
@@ -223,10 +223,6 @@ fn standard_fit_options(max_iter: usize) -> FitOptions {
         nullspace_dims: vec![],
         linear_constraints: None,
         firth_bias_reduction: false,
-        adaptive_regularization: Some(AdaptiveRegularizationOptions {
-            enabled: false,
-            ..Default::default()
-        }),
         rho_prior: Default::default(),
         kronecker_penalty_system: None,
         kronecker_factored: None,

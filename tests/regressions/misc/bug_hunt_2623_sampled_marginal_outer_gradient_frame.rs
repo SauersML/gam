@@ -121,8 +121,32 @@ fn fixture(n: usize, k: usize, amp: f64) -> Fixture {
 fn sampled_marginal_splice_outer_gradient_matches_finite_difference_2623() {
     gam::init_parallelism();
 
-    let fix = fixture(240, 6, 3.0);
-    let rho = Array1::from(vec![-1.0_f64, -0.95]);
+    // FIXTURE CELL, CHOSEN BY MEASUREMENT (2026-09-04). The gate arms only where
+    // the #784 splice engages, and the cell this test shipped with —
+    // `fixture(240, 6, 3.0)` at `rho = [-1.0, -0.95]` — stopped engaging once the
+    // admission became a latched property of the MODEL (the `m` largest-|γ_r|
+    // positive-curvature directions at each ρ) instead of a per-ρ threshold
+    // crossing. The gate then failed on its own arming assertion, i.e. it was a
+    // dark instrument: it graded nothing and said so.
+    //
+    // A 144-cell sweep over `n ∈ {120, 240, 480} × k ∈ {4, 6, 8} × amp ∈
+    // {3, 6, 12, 24} × ρ ∈ {-1, 1, 3, 5}` on this same builder found five cells
+    // that engage, every one of them evaluating cleanly:
+    //
+    // ```text
+    // n=120 k=6 amp=12 rho=-1  nodes=25
+    // n=120 k=6 amp=24 rho=-1  nodes=25
+    // n=120 k=8 amp=3  rho=1   nodes=5
+    // n=240 k=4 amp=3  rho=1   nodes=25
+    // n=480 k=8 amp=3  rho=1   nodes=5
+    // ```
+    //
+    // This is the cell nearest the original — same `n`, same amplitude, a
+    // narrower basis at a heavier penalty — and it carries the richer 25-node
+    // quadrature certificate rather than a 5-node one, so the channels this test
+    // grades are formed with room to differ.
+    let fix = fixture(240, 4, 3.0);
+    let rho = Array1::from(vec![1.0_f64, 1.05]);
 
     enable_rho_outer_audit();
     let analytic = evaluate_externalgradient(

@@ -5136,18 +5136,66 @@ mod patterned_order2_perf_tests {
         let entry_exp = (-p[7]).exp();
         let exit_exp = (-p[6]).exp();
 
-        // Share the supplied stacks, but keep the hand chain rule independent.
-        // Every term, including entry, has the program's activity contract:
-        // a zero stack must not be composed against an overflowing index jet.
-        let plan = sls_outer_plan::<3>(kernel);
-        let (u1, event) = sls_program_stacks(&plan);
-        let u0_active = !stack_is_exactly_zero(&plan.u0);
-        let u1_active = !stack_is_exactly_zero(&u1);
-        let event_active = !stack_is_exactly_zero(&event);
-        let [u0_value, u0_first, u0_second] = plan.u0;
-        let [u1_value, u1_first, u1_second] = u1;
-        let [g_value, g_first, g_second] = event;
-        let value = u0_value + u1_value + g_value;
+        let u0_value = kernel.w * kernel.log_s0;
+        let u0_first = -kernel.w * kernel.r0;
+        let u0_second = -kernel.w * kernel.dr0;
+
+        let censored_weight = kernel.w * (1.0 - kernel.d);
+        let event_weight = kernel.w * kernel.d;
+
+        // THE SAME CONTRACT AS PRODUCTION, which is what makes this a race and
+        // not a comparison of two different jobs. `sls_row_nll` — and the
+        // program emitted from it — gates each term on the term's OWN
+        // coefficient stack (`stack_is_exactly_zero`), never on the row weight.
+        // The two predicates differ on a real row: a censored row whose exit
+        // residual channels are all zero carries a nonzero weight and an
+        // exactly zero stack, and applying the chain rule to that zero stack
+        // against a far-tail index jet forms `0 * inf`. Gating on the weight
+        // there returns NaN where production and the generic tower both return
+        // a finite zero, so a weight-gated schedule is not one production could
+        // ship and its saving is the guard it is missing
+        // (`the_hand_carries_productions_activity_contract_932`).
+        //
+        // The ENTRY term is on that contract too, and was the one term still
+        // composed unconditionally: an UNTRUNCATED row carries an exactly zero
+        // `u0` stack with a nonzero weight, and its entry index jet overflows
+        // whenever `exp(-eta_ls_entry)` does. Production skips the term; a hand
+        // that composes it forms the same `0 * inf`
+        // (`every_inactive_sls_term_skips_overflowing_index_channels_932`).
+        let u0_active = u0_value != 0.0 || u0_first != 0.0 || u0_second != 0.0;
+        let mut value = 0.0;
+        if u0_active {
+            value += u0_value;
+        }
+
+        let mut u1_value = 0.0;
+        let mut u1_first = 0.0;
+        let mut u1_second = 0.0;
+        if censored_weight != 0.0 {
+            u1_value -= censored_weight * kernel.log_s1;
+            u1_first += censored_weight * kernel.r1;
+            u1_second += censored_weight * kernel.dr1;
+        }
+
+        let mut g_value = 0.0;
+        let mut g_first = 0.0;
+        let mut g_second = 0.0;
+        if event_weight != 0.0 {
+            u1_value -= event_weight * kernel.logphi1;
+            u1_first -= event_weight * kernel.dlogphi1;
+            u1_second -= event_weight * kernel.d2logphi1;
+            g_value = -event_weight * kernel.log_g;
+            g_first = -event_weight * kernel.d_log_g;
+            g_second = -event_weight * kernel.d2_log_g;
+        }
+        let u1_active = u1_value != 0.0 || u1_first != 0.0 || u1_second != 0.0;
+        let g_active = g_value != 0.0 || g_first != 0.0 || g_second != 0.0;
+        if u1_active {
+            value += u1_value;
+        }
+        if g_active {
+            value += g_value;
+        }
 
         let u0_g4 = -entry_exp;
         let u0_g7 = p[4] * entry_exp;
@@ -5170,7 +5218,7 @@ mod patterned_order2_perf_tests {
             gradient[3] += u1_first * u1_g3;
             gradient[6] += u1_first * u1_g6;
         }
-        if event_active {
+        if g_active {
             gradient[2] += g_first;
             gradient[3] += g_first * g3;
             gradient[5] += g_first * g5;
@@ -5207,7 +5255,7 @@ mod patterned_order2_perf_tests {
             symmetric!(6, 6, u1_second * u1_g6 * u1_g6 - u1_first * u1_g6);
         }
 
-        if event_active {
+        if g_active {
             symmetric!(2, 2, g_second);
             symmetric!(2, 3, g_second * g3);
             symmetric!(2, 5, g_second * g5);
@@ -5354,6 +5402,164 @@ mod patterned_order2_perf_tests {
 
     type SlsOrder2 = gam_math::jet_scalar::PatternedOrder2<SlsHessianPattern, SLS_ROW_K, 24>;
     use gam_math::paired_timing::{SpeedGate, batched, paired_interleaved};
+
+    /// A censored FAR-TAIL row whose `u1` coefficient stack is EXACTLY zero
+    /// while its weight is not: `w > 0`, `d = 0`, the exit residual channels all
+    /// zero, and the exit log-scale far enough out that `exp(-eta_ls_exit)`
+    /// overflows. The batched lowering's own documentation names this row shape
+    /// — "a row's `u1` stack can be all-zero even though the row weight is
+    /// nonzero" — and it is the whole reason the program gates on the stack.
+    fn far_tail_zero_u1_stack_row() -> ([f64; SLS_ROW_K], SurvivalExactRowKernel) {
+        let (mut p, mut kernel) = fixture();
+        p[6] = -1000.0;
+        kernel.d = 0.0;
+        kernel.log_s1 = 0.0;
+        kernel.r1 = 0.0;
+        kernel.dr1 = 0.0;
+        kernel.ddr1 = 0.0;
+        kernel.dddr1 = 0.0;
+        (p, kernel)
+    }
+
+    /// THE OPPONENT IS ON PRODUCTION'S CONTRACT, and this is the row that says
+    /// so. The timed cell below asserts production beats the strongest hand
+    /// schedule *of the same contract*; a hand that gated on the row weight
+    /// instead of the term's coefficient stack was not on that contract, and
+    /// the difference is not academic — on this row it applies the chain rule
+    /// to a zero stack against an overflowed index jet and returns `NaN` in
+    /// `gradient[3]` and `gradient[6]` where production and the independent
+    /// generic tower both return a finite zero. Measured before the fix:
+    ///
+    /// ```text
+    /// production g[1]=+0e0 g[3]=+0e0 g[6]=+0e0
+    /// hand       g[1]=+0e0 g[3]=NaN  g[6]=NaN
+    /// tower      g[1]=+0e0 g[3]=+0e0 g[6]=+0e0
+    /// ```
+    ///
+    /// So this pin is what keeps the race honest: if the opponent ever drops
+    /// the guard again to look faster, it fails here rather than winning a cell.
+    #[test]
+    fn the_hand_carries_productions_activity_contract_932() {
+        let (p, kernel) = far_tail_zero_u1_stack_row();
+        let production = sls_row_vgh_generated(&p, &kernel);
+        let opponent = hand_fused(&p, &kernel);
+        let tower = dense(&p, &kernel);
+        let all_finite = |channels: &(f64, [f64; SLS_ROW_K], [[f64; SLS_ROW_K]; SLS_ROW_K])| {
+            channels.0.is_finite()
+                && channels.1.iter().all(|channel| channel.is_finite())
+                && channels.2.iter().flatten().all(|channel| channel.is_finite())
+        };
+
+        // NON-VACUITY: the row must actually reach the regime the pin is about,
+        // or every assertion below is about an ordinary row.
+        assert!(
+            (-p[6]).exp().is_infinite(),
+            "the fixture must overflow the exit scale, or the 0*inf it guards cannot form"
+        );
+        assert!(
+            kernel.w * (1.0 - kernel.d) != 0.0,
+            "the row's censoring weight must be nonzero, or the two predicates agree here"
+        );
+
+        assert!(
+            all_finite(&production),
+            "production must not form 0*inf on a zero stack: {production:?}"
+        );
+        assert!(
+            all_finite(&tower),
+            "the generic tower is the independent oracle and must agree: {tower:?}"
+        );
+        assert!(
+            all_finite(&opponent),
+            "the timed opponent must carry production's activity contract, or the cell \
+             is racing two different jobs: {opponent:?}"
+        );
+        for axis in 0..SLS_ROW_K {
+            assert_eq!(
+                opponent.1[axis].to_bits(),
+                production.1[axis].to_bits(),
+                "opponent gradient[{axis}] {} vs production {}",
+                opponent.1[axis],
+                production.1[axis]
+            );
+        }
+    }
+
+    /// #932 parity gate for the compiler-emitted contracted third/fourth
+    /// schedules. The canonical specialized and dense jets remain independent
+    /// correctness oracles; the focused `gam-row-macros` release racer carries
+    /// the honest performance gate against the family-specific handwritten
+    /// analytic schedule and these specialized jets.
+    #[test]
+    fn sls_generated_contracted_orders_match_specialized_and_dense_jets_932() {
+        use gam_math::jet_scalar::{OneSeed, TwoSeed};
+        use gam_math::jet_tower::{Tower3, Tower4};
+
+        let (p, kernel) = fixture();
+        let dir_u: [f64; SLS_ROW_K] = [0.7, -1.3, 0.4, 0.6, -0.5, 0.9, -0.2, 0.3, -0.8];
+        let dir_v: [f64; SLS_ROW_K] = [-0.4, 0.6, 1.1, -0.2, 0.8, -0.7, 0.5, -0.9, 0.1];
+
+        let one_vars: [OneSeed<SLS_ROW_K>; SLS_ROW_K] =
+            std::array::from_fn(|a| OneSeed::seed_direction(p[a], a, dir_u[a]));
+        let specialized_third = sls_row_nll(&one_vars, &kernel)
+            .expect("specialized third")
+            .contracted_third();
+        let two_vars: [TwoSeed<SLS_ROW_K>; SLS_ROW_K] =
+            std::array::from_fn(|a| TwoSeed::seed(p[a], a, dir_u[a], dir_v[a]));
+        let specialized_fourth = sls_row_nll(&two_vars, &kernel)
+            .expect("specialized fourth")
+            .contracted_fourth();
+        let generated_third = sls_row_third_generated(&p, &kernel, &dir_u);
+        let generated_fourth = sls_row_fourth_generated(&p, &kernel, &dir_u, &dir_v);
+        let t3_vars: [Tower3<SLS_ROW_K>; SLS_ROW_K] =
+            std::array::from_fn(|a| Tower3::variable(p[a], a));
+        let dense3 = sls_row_nll(&t3_vars, &kernel).expect("dense Tower3");
+        let t4_vars: [Tower4<SLS_ROW_K>; SLS_ROW_K] =
+            std::array::from_fn(|a| Tower4::variable(p[a], a));
+        let dense4 = sls_row_nll(&t4_vars, &kernel).expect("dense Tower4");
+        let dense_fourth = dense4.fourth_contracted(&dir_u, &dir_v);
+        for a in 0..SLS_ROW_K {
+            for b in 0..SLS_ROW_K {
+                let mut dense_third_ab = 0.0;
+                for c in 0..SLS_ROW_K {
+                    dense_third_ab += dense3.t3[a][b][c] * dir_u[c];
+                }
+                let third_band = 1e-11
+                    * specialized_third[a][b]
+                        .abs()
+                        .max(generated_third[a][b].abs())
+                        .max(dense_third_ab.abs())
+                        .max(1.0);
+                assert!(
+                    (specialized_third[a][b] - dense_third_ab).abs() <= third_band
+                        && (generated_third[a][b] - dense_third_ab).abs() <= third_band,
+                    "third[{a}][{b}]: specialized {:+.15e}, generated {:+.15e}, dense {dense_third_ab:+.15e}",
+                    specialized_third[a][b],
+                    generated_third[a][b],
+                );
+                let fourth_band = 1e-11
+                    * specialized_fourth[a][b]
+                        .abs()
+                        .max(generated_fourth[a][b].abs())
+                        .max(dense_fourth[a][b].abs())
+                        .max(1.0);
+                assert!(
+                    (specialized_fourth[a][b] - dense_fourth[a][b]).abs() <= fourth_band
+                        && (generated_fourth[a][b] - dense_fourth[a][b]).abs() <= fourth_band,
+                    "fourth[{a}][{b}]: specialized {:+.15e}, generated {:+.15e}, dense {:+.15e}",
+                    specialized_fourth[a][b],
+                    generated_fourth[a][b],
+                    dense_fourth[a][b],
+                );
+            }
+        }
+
+        // The speed contract for these contracted orders lives in
+        // `gam-row-macros/tests/sls_codegen_perf.rs`, which races the generated
+        // schedules against both the analytic hand schedule and these
+        // specialized jets under the shared paired harness; this test is the
+        // parity oracle only.
+    }
 
     fn fixture() -> ([f64; SLS_ROW_K], SurvivalExactRowKernel) {
         (

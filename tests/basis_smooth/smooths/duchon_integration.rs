@@ -2,7 +2,7 @@ use gam::basis::{
     CenterStrategy, DuchonBasisSpec, DuchonNullspaceOrder, DuchonOperatorPenaltySpec,
     OneDimensionalBoundary,
 };
-use gam::estimate::{AdaptiveRegularizationOptions, FitOptions};
+use gam::estimate::FitOptions;
 use gam::smooth::{
     FittedTermCollectionWithSpec, ShapeConstraint, SmoothBasisSpec, SmoothTermSpec,
     TermCollectionSpec,
@@ -118,7 +118,6 @@ fn assert_invalid_pure_duchon_simulated_10d(power: usize, nullspace_order: Ducho
             nullspace_dims: vec![],
             linear_constraints: None,
             firth_bias_reduction: false,
-            adaptive_regularization: None,
             rho_prior: Default::default(),
             kronecker_penalty_system: None,
             kronecker_factored: None,
@@ -152,94 +151,6 @@ fn duchon_fit_term_collection_gaussian_simulated_10d_p2_s1_rejects_infinite_diag
     assert_invalid_pure_duchon_simulated_10d(1, DuchonNullspaceOrder::Linear);
 }
 
-#[test]
-fn duchon_fit_term_collection_gaussian_simulated_10dwith_exact_adaptive_regularization() {
-    let n = 96usize;
-    let d = 10usize;
-    let (x, y, _) = simulate_duchon_regression(n, d);
-
-    let spec = TermCollectionSpec {
-        linear_terms: vec![],
-        random_effect_terms: vec![],
-        smooth_terms: vec![SmoothTermSpec {
-            frozen_parametric_residualization: None,
-            name: "duchon_10d".to_string(),
-            basis: SmoothBasisSpec::Duchon {
-                feature_cols: (0..d).collect(),
-                spec: DuchonBasisSpec {
-                    radial_reparam: None,
-                    center_strategy: CenterStrategy::FarthestPoint { num_centers: 10 },
-                    length_scale: None,
-                    power: 2.0,
-                    nullspace_order: DuchonNullspaceOrder::Zero,
-                    identifiability: gam::basis::SpatialIdentifiability::default(),
-                    aniso_log_scales: None,
-                    operator_penalties: DuchonOperatorPenaltySpec::default(),
-
-                    periodic: None,
-                    boundary: OneDimensionalBoundary::Open,
-                },
-                input_scale: None,
-            },
-            shape: ShapeConstraint::None,
-            joint_null_rotation: None,
-        }],
-    };
-
-    let weights = Array1::ones(n);
-    let offset = Array1::zeros(n);
-    let err = match gam::smooth::fit_term_collection_forspec(
-        x.view(),
-        y.view(),
-        weights.view(),
-        offset.view(),
-        &spec,
-        gaussian_identity_likelihood(),
-        &FitOptions {
-            resource_policy: gam_runtime::resource::ResourcePolicy::default_library(),
-            latent_cloglog: None,
-            mixture_link: None,
-            optimize_mixture: false,
-            sas_link: None,
-            optimize_sas: false,
-            compute_inference: true,
-            skip_rho_posterior_inference: false,
-            max_iter: 10,
-            tol: 1e-4,
-            nullspace_dims: vec![],
-            linear_constraints: None,
-            firth_bias_reduction: false,
-            adaptive_regularization: Some(AdaptiveRegularizationOptions {
-                enabled: true,
-                max_mm_iter: 4,
-                beta_rel_tol: 1e-4,
-                max_epsilon_outer_iter: 2,
-                epsilon_log_step: std::f64::consts::LN_2,
-                min_epsilon: 1e-6,
-                weight_floor: 1e-8,
-                weight_ceiling: 1e8,
-            }),
-            rho_prior: Default::default(),
-            kronecker_penalty_system: None,
-            kronecker_factored: None,
-            persistent_warm_start_store: None,
-        },
-    ) {
-        Ok(_) => panic!("invalid adaptive pure 10D Duchon configuration should be rejected"),
-        Err(err) => err,
-    };
-    assert!(
-        err.to_string().contains("pointwise kernel values"),
-        "unexpected error: {err}"
-    );
-}
-
-// ---------------------------------------------------------------------------
-// Anisotropic (kappa) Duchon tests
-// ---------------------------------------------------------------------------
-
-/// Generate a 2D dataset where axis 0 carries signal and axis 1 is noise.
-/// Uses a smooth nonlinear function on x1 only to create anisotropy.
 fn simulate_duchon_aniso_2d(
     n: usize,
     seed: u64,
@@ -351,7 +262,6 @@ fn duchon_2d_aniso_binomial_fits_successfully() {
             nullspace_dims: vec![],
             linear_constraints: None,
             firth_bias_reduction: false,
-            adaptive_regularization: None,
             rho_prior: Default::default(),
             kronecker_penalty_system: None,
             kronecker_factored: None,
@@ -364,7 +274,6 @@ fn duchon_2d_aniso_binomial_fits_successfully() {
             .expect("resolved spec"),
         fit: fitted.fit,
         design: fitted.design,
-        adaptive_diagnostics: fitted.adaptive_diagnostics,
         kappa_timing: None,
     };
 
@@ -509,7 +418,6 @@ fn duchon_2d_scale_dimensions_does_not_abort_on_clean_data_issue_382() {
             nullspace_dims: vec![],
             linear_constraints: None,
             firth_bias_reduction: false,
-            adaptive_regularization: None,
             rho_prior: Default::default(),
             kronecker_penalty_system: None,
             kronecker_factored: None,

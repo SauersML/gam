@@ -9,6 +9,10 @@ use std::time::Instant;
 
 pub const DEFAULT_LOOP_PROGRESS_INTERVAL_SECS: u64 = 25;
 
+fn elapsed_nanos(elapsed: std::time::Duration) -> u64 {
+    u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX)
+}
+
 pub struct LoopProgress {
     started: Instant,
     last_emit_nanos: AtomicU64,
@@ -39,7 +43,7 @@ impl LoopProgress {
             .progress
             .fetch_add(delta, Ordering::Relaxed)
             .saturating_add(delta);
-        let elapsed = self.started.elapsed().as_nanos() as u64;
+        let elapsed = elapsed_nanos(self.started.elapsed());
         let last = self.last_emit_nanos.load(Ordering::Relaxed);
         if elapsed < last.saturating_add(self.interval_nanos) {
             return;
@@ -120,5 +124,10 @@ mod tests {
             0,
             "zero-delta tick must emit progress 0"
         );
+    }
+
+    #[test]
+    fn elapsed_nanoseconds_saturate_instead_of_truncating() {
+        assert_eq!(elapsed_nanos(std::time::Duration::MAX), u64::MAX);
     }
 }

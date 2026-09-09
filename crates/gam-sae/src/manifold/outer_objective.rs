@@ -5205,7 +5205,7 @@ mod probe_refusal_classification_2593_tests {
     #[test]
     fn an_unclassified_defect_is_fatal_and_uncounted() {
         let defect = "SaeManifoldTerm::penalized_quasi_laplace_criterion: \
-                      ArrowSchurCache::arrow_log_det returned None (undamped joint Hessian \
+                      arrow_log_det_from_cache returned None (undamped joint Hessian \
                       log-det unavailable for the Laplace normaliser)";
         assert_eq!(ProbeRefusalKind::classify(defect), None);
         assert!(!SaeManifoldOuterObjective::is_recoverable_value_probe_refusal(

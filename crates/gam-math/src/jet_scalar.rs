@@ -672,6 +672,41 @@ pub trait RuntimeJetScalar<'arena>: Clone {
         multiply_add_default(self, right, addend, Self::mul, Self::add)
     }
 
+    /// `addend + Sum_i lefts[i] * f_i(right)` from certified derivative stacks,
+    /// with ONE shared composition point.
+    ///
+    /// This is the shape a warp or deviation basis takes: a fixed inner index
+    /// `right`, one basis function per coefficient, and the coefficient jets as
+    /// the left factors. Written as a loop of `compose_unary` and `multiply_add`
+    /// it allocates and streams `2N` derivative blocks for a result that is one
+    /// block, and every one of those blocks re-reads the SAME `right.h` and
+    /// `right.g` - the composition point does not move with `i`. A runtime jet
+    /// that overrides this writes the single output block instead (gam#979: the
+    /// flexible marginal-slope row's link-deviation loop is `2*|w|` such blocks
+    /// per calibration node, per lift iteration, per row).
+    ///
+    /// The default is exactly the loop it replaces, so a representation that
+    /// does not override it computes what it computed, in the order it did.
+    fn weighted_compose_sum(
+        lefts: &[Self],
+        right: &Self,
+        derivative_stacks: &[[f64; 5]],
+        addend: &Self,
+    ) -> Self {
+        assert_eq!(
+            lefts.len(),
+            derivative_stacks.len(),
+            "weighted compose sum needs one derivative stack per left factor"
+        );
+        let mut sum = addend.clone();
+        for (left, stack) in lefts.iter().zip(derivative_stacks) {
+            let composed = right.compose_unary(*stack);
+            let accumulated = left.multiply_add(&composed, &sum);
+            sum = accumulated;
+        }
+        sum
+    }
+
     /// Sum unary compositions directly from certified derivative stacks.
     fn composed_sum(
         inputs: &[Self],
@@ -2154,6 +2189,74 @@ impl<'arena> RuntimeJetScalar<'arena> for DynamicOrder2<'arena> {
             h,
         }
     }
+
+    /// `addend + Σ_i L_i · f_i(R)` in ONE output block.
+    ///
+    /// Every `f_i(R)` shares the composition point, so its channels are
+    /// `(s0_i, s1_i·R.g, s1_i·R.h + s2_i·R.g⊗R.g)` and the product with `L_i`
+    /// expands to
+    ///
+    /// ```text
+    /// v   = Σ L_i.v·s0_i
+    /// g_a = Σ (L_i.v·s1_i)·R.g_a + s0_i·L_i.g_a
+    /// h_ab = Σ (L_i.v·s1_i)·R.h_ab + (L_i.v·s2_i)·R.g_a·R.g_b
+    ///          + s1_i·(L_i.g_a·R.g_b + R.g_a·L_i.g_b) + s0_i·L_i.h_ab
+    /// ```
+    ///
+    /// so the `R`-dependent coefficients collapse into two scalars, `Σ L_i.v·s1_i`
+    /// and `Σ L_i.v·s2_i`, that multiply `R.h` and `R.g⊗R.g` ONCE. The default
+    /// walks the same algebra through `2N` intermediate jets, each of which
+    /// allocates and streams its own `n²` block; this writes one.
+    #[inline]
+    fn weighted_compose_sum(
+        lefts: &[Self],
+        right: &Self,
+        derivative_stacks: &[[f64; 5]],
+        addend: &Self,
+    ) -> Self {
+        assert_eq!(
+            lefts.len(),
+            derivative_stacks.len(),
+            "weighted compose sum needs one derivative stack per left factor"
+        );
+        let arena = addend.arena;
+        let n = addend.dimension();
+        for left in lefts {
+            addend.assert_compatible(left);
+        }
+        addend.assert_compatible(right);
+        let mut value = addend.v;
+        let mut right_first = 0.0;
+        let mut right_second = 0.0;
+        for (left, stack) in lefts.iter().zip(derivative_stacks) {
+            value += left.v * stack[0];
+            right_first += left.v * stack[1];
+            right_second += left.v * stack[2];
+        }
+        let g = arena_vector(arena, n, |a| {
+            let mut channel = addend.g[a] + right_first * right.g[a];
+            for (left, stack) in lefts.iter().zip(derivative_stacks) {
+                channel += stack[0] * left.g[a];
+            }
+            channel
+        });
+        let h = arena_square(arena, n, |a, b, ab| {
+            let mut channel = addend.h[ab]
+                + right_first * right.h[ab]
+                + right_second * right.g[a] * right.g[b];
+            for (left, stack) in lefts.iter().zip(derivative_stacks) {
+                channel += stack[1] * (left.g[a] * right.g[b] + right.g[a] * left.g[b])
+                    + stack[0] * left.h[ab];
+            }
+            channel
+        });
+        Self {
+            arena,
+            v: value,
+            g,
+            h,
+        }
+    }
 }
 
 /// Runtime-sized one-seed scalar for a Hessian-contracted third derivative.
@@ -2526,6 +2629,74 @@ impl<'arena> RuntimeJetScalar<'arena> for DynamicOneSeedBatch<'arena> {
             });
         Self {
             base: self.base.mul(&other.base),
+            eps,
+        }
+    }
+
+    /// `addend + Σ_i L_i · f_i(R)` with ONE shared composition point, lane by
+    /// lane, on top of the base type's fused form.
+    ///
+    /// The nilpotent part of `f_i(R)` is `f_i'(R.base)·R.eps_l`, so lane `l` is
+    ///
+    /// ```text
+    /// addend.eps_l + Σ_i L_i.base·f_i'(R.base)·R.eps_l + Σ_i L_i.eps_l·f_i(R.base)
+    ///              = R.eps_l · [Σ_i L_i.base·f_i'(R.base)]  +  Σ_i L_i.eps_l·f_i(R.base)
+    /// ```
+    ///
+    /// and BOTH bracketed sums are the base type's `weighted_compose_sum` at the
+    /// same point `R.base` — the first with the derivative stacks shifted by one,
+    /// the second with the stacks themselves. The first does not depend on the
+    /// lane, so it is formed once for the whole batch. The loop this replaces
+    /// wrote `2N` blocks in EVERY lane and in the base; this writes two shared
+    /// blocks plus three per lane (gam#979).
+    #[inline]
+    fn weighted_compose_sum(
+        lefts: &[Self],
+        right: &Self,
+        derivative_stacks: &[[f64; 5]],
+        addend: &Self,
+    ) -> Self {
+        assert_eq!(
+            lefts.len(),
+            derivative_stacks.len(),
+            "weighted compose sum needs one derivative stack per left factor"
+        );
+        for left in lefts {
+            addend.assert_compatible(left);
+        }
+        addend.assert_compatible(right);
+        let arena = addend.base.arena;
+        let terms = lefts.len();
+        let left_bases: &[DynamicOrder2<'arena>] =
+            arena.alloc_slice_fill_with(terms, |term| lefts[term].base);
+        // `f'` carries the stack shifted by one, exactly as the composed-sum
+        // lowering above derives a lane's multiplier jet.
+        let shifted: &[[f64; 5]] = arena.alloc_slice_fill_with(terms, |term| {
+            let stack = derivative_stacks[term];
+            [stack[1], stack[2], stack[3], stack[4], stack[4]]
+        });
+        let zero = addend.base.constant_like(0.0);
+        // Lane-independent: `Σ_i L_i.base · f_i'(R.base)`, formed once.
+        let derivative_sum =
+            DynamicOrder2::weighted_compose_sum(left_bases, &right.base, shifted, &zero);
+        let eps = arena.alloc_slice_fill_with(addend.eps.len(), |lane| {
+            let left_eps: &[DynamicOrder2<'arena>] =
+                arena.alloc_slice_fill_with(terms, |term| lefts[term].eps[lane]);
+            let carried = DynamicOrder2::weighted_compose_sum(
+                left_eps,
+                &right.base,
+                derivative_stacks,
+                &addend.eps[lane],
+            );
+            derivative_sum.multiply_add(&right.eps[lane], &carried)
+        });
+        Self {
+            base: DynamicOrder2::weighted_compose_sum(
+                left_bases,
+                &right.base,
+                derivative_stacks,
+                &addend.base,
+            ),
             eps,
         }
     }
@@ -7246,12 +7417,167 @@ mod unit_tests {
 }
 
 #[cfg(test)]
+mod weighted_compose_sum_979_tests {
+    //! The fused `addend + Σ_i L_i · f_i(R)` against the loop it replaces.
+    //!
+    //! [`RuntimeJetScalar::weighted_compose_sum`]'s default IS that loop, so the
+    //! contract is that a representation which overrides it agrees with the
+    //! loop on every channel. [`DynamicOrder2`] overrides it by collapsing the
+    //! `R`-dependent coefficients into two scalars and writing one output block;
+    //! the loop writes `2N`. The two sum the same terms in a different order, so
+    //! they agree to rounding rather than to the bit, and the fixture is chosen
+    //! to make the difference from a REAL disagreement obvious: dense gradients
+    //! and dense Hessians on every operand, no zero stack entries, and left
+    //! factors that are genuine products rather than the coordinate seeds the
+    //! flexible marginal-slope row happens to pass.
+    use super::{DynamicJetArena, DynamicOrder2, RuntimeJetScalar};
+
+    const DIMENSION: usize = 6;
+    const TERMS: usize = 4;
+
+    fn stacks() -> [[f64; 5]; TERMS] {
+        [
+            [0.31, 0.62, -0.24, 0.11, -0.05],
+            [-0.17, 0.45, 0.33, -0.28, 0.09],
+            [0.52, -0.38, 0.19, 0.07, -0.13],
+            [0.28, 0.71, -0.46, 0.22, 0.04],
+        ]
+    }
+
+    /// A `right` and `TERMS` left factors, all with dense gradient and Hessian
+    /// channels, built from the algebra rather than seeded flat.
+    fn operands(arena: &DynamicJetArena) -> (Vec<DynamicOrder2<'_>>, DynamicOrder2<'_>, DynamicOrder2<'_>) {
+        let vars: Vec<DynamicOrder2<'_>> = (0..DIMENSION)
+            .map(|axis| {
+                DynamicOrder2::variable(0.35 - 0.11 * (axis as f64), axis, DIMENSION, arena)
+            })
+            .collect();
+        let right = vars[0]
+            .mul(&vars[1])
+            .add(&vars[2].compose_unary([0.9, -0.5, 0.27, -0.14, 0.06]));
+        let lefts: Vec<DynamicOrder2<'_>> = (0..TERMS)
+            .map(|term| {
+                let scale = 0.4 + 0.23 * (term as f64);
+                vars[term % DIMENSION]
+                    .mul(&vars[(term + 3) % DIMENSION])
+                    .scale(scale)
+                    .add(&vars[(term + 1) % DIMENSION])
+            })
+            .collect();
+        let addend = vars[4].mul(&vars[5]).scale(-0.7);
+        (lefts, right, addend)
+    }
+
+    /// The default's algebra, written out: one composition and one multiply-add
+    /// per term, in term order.
+    fn by_loop<'arena>(
+        lefts: &[DynamicOrder2<'arena>],
+        right: &DynamicOrder2<'arena>,
+        derivative_stacks: &[[f64; 5]],
+        addend: &DynamicOrder2<'arena>,
+    ) -> DynamicOrder2<'arena> {
+        let mut sum = *addend;
+        for (left, stack) in lefts.iter().zip(derivative_stacks) {
+            sum = left.multiply_add(&right.compose_unary(*stack), &sum);
+        }
+        sum
+    }
+
+    fn close(label: &str, fused: f64, looped: f64) {
+        let tolerance = 1.0e-13 * fused.abs().max(looped.abs()).max(1.0);
+        assert!(
+            (fused - looped).abs() <= tolerance,
+            "{label}: fused {fused:+.17e} vs loop {looped:+.17e} (allowed {tolerance:.3e})"
+        );
+    }
+
+    #[test]
+    fn the_fused_sum_matches_the_composition_and_product_loop() {
+        let arena = DynamicJetArena::new();
+        let (lefts, right, addend) = operands(&arena);
+        let derivative_stacks = stacks();
+
+        let fused = DynamicOrder2::weighted_compose_sum(
+            &lefts,
+            &right,
+            &derivative_stacks,
+            &addend,
+        );
+        let looped = by_loop(&lefts, &right, &derivative_stacks, &addend);
+
+        close("value", fused.value(), looped.value());
+        for axis in 0..DIMENSION {
+            close(&format!("gradient[{axis}]"), fused.g()[axis], looped.g()[axis]);
+        }
+        for entry in 0..DIMENSION * DIMENSION {
+            close(&format!("hessian[{entry}]"), fused.h()[entry], looped.h()[entry]);
+        }
+
+        // NON-VACUITY. Every channel the comparison walks must be able to
+        // disagree: a fixture whose Hessian is zero would pass on an override
+        // that dropped the `R.g ⊗ R.g` term outright.
+        assert!(
+            fused.value().abs() > 1.0e-6,
+            "the fixture must produce a nonzero value"
+        );
+        assert!(
+            fused.g().iter().all(|channel| channel.abs() > 1.0e-9),
+            "every gradient channel must be live: {:?}",
+            fused.g()
+        );
+        assert!(
+            fused.h().iter().filter(|channel| channel.abs() > 1.0e-9).count()
+                > DIMENSION * DIMENSION / 2,
+            "most Hessian channels must be live: {:?}",
+            fused.h()
+        );
+    }
+
+    /// The addend is returned unchanged when there are no terms, and one term
+    /// is the plain product-of-composition — the two edges the fused loop over
+    /// `lefts` would get wrong by starting from the wrong accumulator.
+    #[test]
+    fn the_fused_sum_handles_no_terms_and_one_term() {
+        let arena = DynamicJetArena::new();
+        let (lefts, right, addend) = operands(&arena);
+        let derivative_stacks = stacks();
+
+        let empty = DynamicOrder2::weighted_compose_sum(&[], &right, &[], &addend);
+        close("empty value", empty.value(), addend.value());
+        for entry in 0..DIMENSION * DIMENSION {
+            close(
+                &format!("empty hessian[{entry}]"),
+                empty.h()[entry],
+                addend.h()[entry],
+            );
+        }
+
+        let single = DynamicOrder2::weighted_compose_sum(
+            &lefts[..1],
+            &right,
+            &derivative_stacks[..1],
+            &addend,
+        );
+        let single_loop = by_loop(&lefts[..1], &right, &derivative_stacks[..1], &addend);
+        close("single value", single.value(), single_loop.value());
+        for entry in 0..DIMENSION * DIMENSION {
+            close(
+                &format!("single hessian[{entry}]"),
+                single.h()[entry],
+                single_loop.h()[entry],
+            );
+        }
+    }
+}
+
+#[cfg(test)]
 mod dynamic_batch_fused_979_tests {
     //! The batched one-seed jet's FUSED operations against the generic ones
     //! they replace.
     //!
     //! [`DynamicOneSeedBatch`] overrides `mul`, `multiply_add`,
-    //! `linear_combination` and `affine_composed_sum` so each writes its result
+    //! `linear_combination`, `affine_composed_sum` and `weighted_compose_sum`
+    //! so each writes its result
     //! block once instead of building it from a chain of primitive operations
     //! whose intermediates are allocated, written and read once each (#979: on
     //! the large-scale flex arm the zero-and-refill traffic those chains
@@ -7264,8 +7590,9 @@ mod dynamic_batch_fused_979_tests {
     //! must reproduce the standalone seed for direction `u_l` exactly as the
     //! type's contract claims. The expression below is shaped like the flex row
     //! program's inner index: a weighted combination of primaries, a
-    //! multiply-add against it, a composed sum over several outer functions,
-    //! and a unary composition on top.
+    //! multiply-add against it, a composed sum over several outer functions, a
+    //! weighted sum of compositions at one shared point, and a unary
+    //! composition on top.
 
     use super::{
         DynamicJetArena, DynamicJetBatchWorkspace, DynamicOneSeed, DynamicOneSeedBatch,
@@ -7307,9 +7634,22 @@ mod dynamic_batch_fused_979_tests {
         let scales = [0.8, -1.3, 0.45];
         let inputs = [scored.clone(), combined.clone(), vars[2].clone()];
         let summed = S::affine_composed_sum(&inputs, &scales, &stacks, DIMENSION, workspace);
-        // A product and a unary composition on top, as the observed index has.
+        // A product, as the observed index has.
         let producted = summed.mul(&vars[3]);
-        producted.compose_unary([0.9, -0.5, 0.27, -0.14, 0.06])
+        // A weighted sum of compositions at ONE point: the link-deviation
+        // shape, where the batch's fused override forms the lane-independent
+        // derivative sum once and the standalone seed walks the trait default's
+        // composition-and-product loop. Distinct stacks and distinct left
+        // factors, so a lane that collapsed them would disagree here.
+        let deviation_stacks = [
+            [0.44, -0.21, 0.36, -0.12, 0.05],
+            [-0.29, 0.58, -0.17, 0.23, -0.08],
+        ];
+        let deviation_lefts = [vars[4].clone(), vars[0].clone()];
+        let warped =
+            S::weighted_compose_sum(&deviation_lefts, &producted, &deviation_stacks, &summed);
+        // A unary composition on top, as the observed index has.
+        warped.compose_unary([0.9, -0.5, 0.27, -0.14, 0.06])
     }
 
     fn assert_close(label: &str, fused: &[f64], generic: &[f64]) {

@@ -1,5 +1,5 @@
 use gam::basis::{CenterStrategy, MaternBasisSpec, MaternIdentifiability, MaternNu};
-use gam::estimate::{AdaptiveRegularizationOptions, FitOptions};
+use gam::estimate::FitOptions;
 use gam::smooth::{
     FittedTermCollectionWithSpec, ShapeConstraint, SmoothBasisSpec, SmoothTermSpec,
     SpatialLengthScaleOptimizationOptions, TermCollectionSpec,
@@ -101,7 +101,6 @@ fn matern_fit_term_collection_gaussian_simulated_10d() {
             nullspace_dims: vec![],
             linear_constraints: None,
             firth_bias_reduction: false,
-            adaptive_regularization: None,
             rho_prior: Default::default(),
             kronecker_penalty_system: None,
             kronecker_factored: None,
@@ -144,130 +143,6 @@ fn matern_fit_term_collection_gaussian_simulated_10d() {
     );
 }
 
-#[test]
-fn matern_fit_term_collection_gaussian_simulated_10dwith_exact_adaptive_regularization() {
-    let n = 72usize;
-    let d = 10usize;
-    let (x, y, y_true) = simulate_matern_regression(n, d);
-
-    let spec = TermCollectionSpec {
-        linear_terms: vec![],
-        random_effect_terms: vec![],
-        smooth_terms: vec![SmoothTermSpec {
-            frozen_parametric_residualization: None,
-            name: "matern_10d".to_string(),
-            basis: SmoothBasisSpec::Matern {
-                feature_cols: (0..d).collect(),
-                spec: MaternBasisSpec {
-                    center_strategy: CenterStrategy::FarthestPoint { num_centers: 8 },
-                    length_scale: gam::terms::basis::MaternLengthScale::fixed(0.95),
-                    nu: MaternNu::FiveHalves,
-                    include_intercept: false,
-                    double_penalty: true,
-                    identifiability: MaternIdentifiability::CenterSumToZero,
-                    aniso_log_scales: None,
-                    periodic: None,
-                },
-                input_scale: None,
-            },
-            shape: ShapeConstraint::None,
-            joint_null_rotation: None,
-        }],
-    };
-
-    let weights = Array1::ones(n);
-    let offset = Array1::zeros(n);
-    let fitted = gam::smooth::fit_term_collection_forspec(
-        x.view(),
-        y.view(),
-        weights.view(),
-        offset.view(),
-        &spec,
-        LikelihoodSpec::new(
-            ResponseFamily::Gaussian,
-            InverseLink::Standard(StandardLink::Identity),
-        ),
-        &FitOptions {
-            resource_policy: gam_runtime::resource::ResourcePolicy::default_library(),
-            latent_cloglog: None,
-            mixture_link: None,
-            optimize_mixture: false,
-            sas_link: None,
-            optimize_sas: false,
-            compute_inference: true,
-            skip_rho_posterior_inference: false,
-            max_iter: 10,
-            tol: 1e-4,
-            nullspace_dims: vec![],
-            linear_constraints: None,
-            firth_bias_reduction: false,
-            adaptive_regularization: Some(AdaptiveRegularizationOptions {
-                enabled: true,
-                max_mm_iter: 4,
-                beta_rel_tol: 1e-4,
-                max_epsilon_outer_iter: 2,
-                epsilon_log_step: std::f64::consts::LN_2,
-                min_epsilon: 1e-6,
-                weight_floor: 1e-8,
-                weight_ceiling: 1e8,
-            }),
-            rho_prior: Default::default(),
-            kronecker_penalty_system: None,
-            kronecker_factored: None,
-            persistent_warm_start_store: None,
-        },
-    )
-    .expect("exact adaptive Matérn term-collection fit should succeed");
-
-    let diag = fitted
-        .adaptive_diagnostics
-        .as_ref()
-        .expect("adaptive diagnostics should be present");
-    assert_eq!(diag.mm_iterations, 0);
-    assert!(diag.epsilon_0.is_finite() && diag.epsilon_0 > 0.0);
-    assert!(diag.epsilon_g.is_finite() && diag.epsilon_g > 0.0);
-    assert!(diag.epsilon_c.is_finite() && diag.epsilon_c > 0.0);
-    assert_eq!(diag.maps.len(), 1);
-    assert!(
-        fitted
-            .fit
-            .reml_score()
-            .expect("the fit reports a REML/LAML criterion")
-            .is_finite()
-    );
-
-    let pred_mean = fitted.design.design.to_dense().dot(&fitted.fit.beta) + &offset;
-    assert!(pred_mean.iter().all(|v| v.is_finite()));
-
-    let mse_model = (&pred_mean - &y_true)
-        .mapv(|v| v * v)
-        .mean()
-        .unwrap_or(f64::INFINITY);
-    let y_mean = y_true.mean().unwrap_or(0.0);
-    let mse_baseline = y_true
-        .iter()
-        .map(|&v| {
-            let d = v - y_mean;
-            d * d
-        })
-        .sum::<f64>()
-        / (n as f64);
-
-    // Hardened 0.90 -> 0.60 (matching the non-adaptive variant above).
-    assert!(
-        mse_model < 0.60 * mse_baseline,
-        "exact adaptive Matérn fit should beat mean-only baseline by ≥40%: \
-         mse_model={mse_model:.6e}, mse_baseline={mse_baseline:.6e} (ratio={ratio:.3})",
-        ratio = mse_model / mse_baseline,
-    );
-}
-
-// ---------------------------------------------------------------------------
-// Anisotropic Matérn test (3D)
-// ---------------------------------------------------------------------------
-
-/// Generate a 3D dataset where axis 0 carries strong signal, axis 1 carries
-/// mild signal, and axis 2 is pure noise.
 fn simulate_matern_aniso_3d(n: usize, seed: u64) -> (Array2<f64>, Array1<f64>, Array1<f64>) {
     let mut rng = StdRng::seed_from_u64(seed);
     let noise_dist = Normal::new(0.0, 0.12).expect("normal params must be valid");
@@ -364,7 +239,6 @@ fn matern_3d_aniso_fits_successfully() {
                 nullspace_dims: vec![],
                 linear_constraints: None,
                 firth_bias_reduction: false,
-                adaptive_regularization: None,
                 rho_prior: Default::default(),
                 kronecker_penalty_system: None,
                 kronecker_factored: None,

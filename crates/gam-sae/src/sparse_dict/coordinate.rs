@@ -227,7 +227,7 @@ fn uniform_phase_sd() -> f64 {
 /// metadata.
 fn collect_route_firings(
     blocks: ArrayView2<'_, u32>,
-    codes: ArrayView3<'_, f64>,
+    codes: ArrayView3<'_, f32>,
     n_blocks: usize,
     block: usize,
     block_size: usize,
@@ -547,7 +547,7 @@ pub fn recover_measure_from_code(
 /// block domain without requiring a decoder or a synthetic fit object.
 pub fn block_route_firing_coordinates(
     blocks: ArrayView2<'_, u32>,
-    codes: ArrayView3<'_, f64>,
+    codes: ArrayView3<'_, f32>,
     n_blocks: usize,
     block: usize,
 ) -> Result<BlockCoordinateReport, String> {
@@ -902,7 +902,7 @@ fn harmonic_argmax(rho: &[f64]) -> (f64, f64) {
 /// `codes[N,s,b]` sparse routing, without constructing a fit result.
 pub fn harmonic_route_firing_coordinates(
     blocks: ArrayView2<'_, u32>,
-    codes: ArrayView3<'_, f64>,
+    codes: ArrayView3<'_, f32>,
     n_blocks: usize,
     block: usize,
 ) -> Result<BlockCoordinateReport, String> {
@@ -1078,4 +1078,5 @@ mod tests {
         ];
         assert_eq!(count_separated_positive_modes(&rho, separation_limit(4)), 1);
     }
+
 }

@@ -88,7 +88,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         args.minibatch.min(n_used),
         args.atoms,
         p,
-        gam_gpu::DictionaryScorePrecision::F64,
     );
     println!(
         "[scale_k] gpu={:?} per-minibatch score elems = {} (device_admitted={}, break-even={})",
@@ -154,7 +153,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let rss_after_state = read_rss();
 
     let train_start = Instant::now();
-    let mut shard = Array2::<f64>::zeros((args.minibatch.min(n_used), p));
+    let mut shard = Array2::<f32>::zeros((args.minibatch.min(n_used), p));
     let mut epoch_reports = Vec::new();
     let mut last_ev = f64::NEG_INFINITY;
     for epoch_index in 0..args.epochs {
@@ -717,7 +716,7 @@ fn fill_transformed_rows(
     row0: usize,
     rows: usize,
     peel: &Peel,
-    mut out: ndarray::ArrayViewMut2<'_, f64>,
+    mut out: ndarray::ArrayViewMut2<'_, f32>,
 ) -> Result<(), String> {
     let p = matrix.header.cols;
     for local in 0..rows {
@@ -728,7 +727,7 @@ fn fill_transformed_rows(
         }
         for c in 0..p {
             let centered = matrix.value(source_row, c)? as f64 - peel.mean[c];
-            out[[local, c]] = centered - score * peel.pc[c];
+            out[[local, c]] = (centered - score * peel.pc[c]) as f32;
         }
     }
     Ok(())
@@ -785,7 +784,7 @@ fn bytes_nxp(n: usize, p: usize) -> u64 {
 
 fn expected_payload_upper_bytes(args: &Args, rows: usize, p: usize) -> u64 {
     let blocks = args.atoms / args.block_size;
-    let decoder = bytes_nxp(args.atoms, p).saturating_mul(2);
+    let decoder = bytes_nxp(args.atoms, p);
     let normal_rhs = blocks
         .saturating_mul(p)
         .saturating_mul(args.block_size)
@@ -803,15 +802,15 @@ fn expected_payload_upper_bytes(args: &Args, rows: usize, p: usize) -> u64 {
         .saturating_mul(std::mem::size_of::<f64>())
         .saturating_mul(2) as u64;
     let shard_rows = args.minibatch.min(rows);
-    let shard = bytes_nxp(shard_rows, p).saturating_mul(2);
+    let shard = bytes_nxp(shard_rows, p);
     let scores = shard_rows
         .saturating_mul(args.block_tile)
         .saturating_mul(args.block_size)
-        .saturating_mul(std::mem::size_of::<f64>()) as u64;
+        .saturating_mul(std::mem::size_of::<f32>()) as u64;
     let codes = shard_rows
         .saturating_mul(args.block_topk)
         .saturating_mul(args.block_size + 2)
-        .saturating_mul(std::mem::size_of::<f64>()) as u64;
+        .saturating_mul(std::mem::size_of::<f32>()) as u64;
     decoder + normal_rhs + cofiring_edges + second + shard + scores + codes
 }
 

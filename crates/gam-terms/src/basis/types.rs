@@ -2435,6 +2435,98 @@ impl AnisoPenaltyCrossProvider {
     }
 }
 
+/// `Qᵀ S Q` for one penalty-derivative block, or `None` when `S` is not square
+/// in `Q`'s dimension.
+fn rotate_psi_penalty_block(s_local: &Array2<f64>, q: &Array2<f64>) -> Option<Array2<f64>> {
+    if s_local.nrows() != q.nrows() || s_local.ncols() != q.nrows() {
+        return None;
+    }
+    Some(fast_ab(&fast_atb(q, s_local), q))
+}
+
+impl AnisoBasisPsiDerivatives {
+    /// Carry a per-axis ψ-derivative bundle through the stage-2 joint-null
+    /// absorption rotation `Q` the realized design was built in (gam#2760).
+    ///
+    /// `Q` acts on the smooth's COEFFICIENTS: the design becomes `X·Q` and each
+    /// penalty block `S_k` becomes `Qᵀ S_k Q`, so every ψ-derivative of either
+    /// object transforms the same way — differentiation and the (ψ-independent)
+    /// rotation commute. The isotropic arm of the spatial ψ route has always
+    /// done this; a per-axis bundle handed to a rotated design without it is an
+    /// unrotated derivative of a rotated model, which is why the enrollment
+    /// predicate used to exclude rotated terms from per-axis ψ altogether.
+    ///
+    /// Returns `Ok(None)` — an honest decline, matching the isotropic arm —
+    /// when a block's shape does not admit `Q`, so the caller can fall back
+    /// rather than assert on a mismatch it cannot repair.
+    ///
+    /// MUST be applied before any fixed row-space projector: `Q` acts on
+    /// coefficients and the projector on rows, and the implicit operator
+    /// refuses a coefficient transform once its projector is installed.
+    pub fn rotated_by_joint_null(
+        mut self,
+        rotation: &JointNullRotation,
+    ) -> Result<Option<Self>, BasisError> {
+        let q = &rotation.rotation;
+        if q.nrows() != q.ncols() {
+            return Ok(None);
+        }
+        for matrix in self
+            .design_first
+            .iter_mut()
+            .chain(self.design_second_diag.iter_mut())
+            .chain(self.design_second_cross.iter_mut())
+        {
+            if matrix.ncols() != q.nrows() {
+                return Ok(None);
+            }
+            *matrix = fast_ab(&*matrix, q);
+        }
+        for blocks in self
+            .penalties_first
+            .iter_mut()
+            .chain(self.penalties_second_diag.iter_mut())
+        {
+            for block in blocks.iter_mut() {
+                let Some(rotated) = rotate_psi_penalty_block(block, q) else {
+                    return Ok(None);
+                };
+                *block = rotated;
+            }
+        }
+        if let Some(provider) = self.penalties_cross_provider.take() {
+            let q_owned = q.clone();
+            self.penalties_cross_provider = Some(AnisoPenaltyCrossProvider::new(
+                move |axis_a, axis_b| {
+                    provider
+                        .evaluate(axis_a, axis_b)?
+                        .into_iter()
+                        .map(|block| {
+                            rotate_psi_penalty_block(&block, &q_owned).ok_or_else(|| {
+                                BasisError::InvalidInput(format!(
+                                    "anisotropic cross-penalty block for axes ({axis_a}, {axis_b}) \
+                                     is {}x{}, which the joint-null rotation's {} coefficients \
+                                     cannot rotate",
+                                    block.nrows(),
+                                    block.ncols(),
+                                    q_owned.nrows()
+                                ))
+                            })
+                        })
+                        .collect()
+                },
+            ));
+        }
+        if let Some(operator) = self.implicit_operator.take() {
+            if operator.p_out() != q.nrows() {
+                return Ok(None);
+            }
+            self.implicit_operator = Some(operator.append_full_transform(q)?);
+        }
+        Ok(Some(self))
+    }
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 //  Implicit derivative operator for scalable anisotropic REML gradients
 // ═══════════════════════════════════════════════════════════════════════════

@@ -86,13 +86,9 @@ pub struct StandardFitRequest<'a> {
     pub offset: Arc<Array1<f64>>,
     pub spec: TermCollectionSpec,
     pub family: LikelihoodSpec,
-    /// #2026: estimate the Tweedie variance power `p` by profile likelihood
-    /// (mgcv `tw()` semantics) before the final fit, rather than trusting the
-    /// `p` baked into `family`. Set only for a bare `family="tweedie"`/`"tw"`
-    /// request that named no explicit power; an explicit `tweedie(1.6)` pins `p`
-    /// and leaves this `false`. When `true`, `family` must carry
-    /// `ResponseFamily::Tweedie` on a log link (the placeholder power is
-    /// overwritten with the estimate).
+    /// Legacy request bit retained for source compatibility. Production
+    /// materialization always sets this to `false`; automatic Tweedie power
+    /// profiling is forbidden and bare Tweedie families are rejected.
     pub estimate_tweedie_p: bool,
     pub options: FitOptions,
     pub kappa_options: SpatialLengthScaleOptimizationOptions,
@@ -229,7 +225,6 @@ pub struct StandardFitResult {
     /// whose row count can include periodic image expansion and is therefore
     /// not the next request size.
     pub adaptive_spatial_center_counts: Vec<Option<usize>>,
-    pub adaptive_diagnostics: Option<AdaptiveRegularizationDiagnostics>,
     pub kappa_timing: Option<SpatialLengthScaleOptimizationTiming>,
     pub saved_link_state: FittedLinkState,
     pub wiggle_knots: Option<Array1<f64>>,
@@ -612,13 +607,6 @@ pub struct FitConfig {
     /// formula family. Front ends must set model-wide spatial knobs here rather
     /// than mutating a request after materialization.
     pub spatial_optimization: SpatialLengthScaleOptimizationOptions,
-    /// Enable exact spatial adaptive regularization for standard formula fits.
-    /// `None` uses the quality-first automatic policy. The current automatic
-    /// policy leaves LAREG off unless explicitly requested because the
-    /// optimizer's REML-selected local weights can over-regularize small
-    /// high-yield spatial signals.
-    pub adaptive_regularization: Option<bool>,
-
     /// Route the fit through the transformation-normal family.  When set, the
     /// formula terms are treated as the covariate side of the transformation
     /// model and the response basis is built internally.  Incompatible with
@@ -781,7 +769,6 @@ impl Default for FitConfig {
             ctn_stage1: None,
             scale_dimensions: false,
             spatial_optimization: SpatialLengthScaleOptimizationOptions::default(),
-            adaptive_regularization: None,
             transformation_normal: false,
             firth: false,
             outer_max_iter: None,

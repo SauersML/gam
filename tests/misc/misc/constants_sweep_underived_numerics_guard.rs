@@ -39,7 +39,6 @@ use std::path::PathBuf;
 /// root (`CARGO_MANIFEST_DIR` is the root `gam` crate).
 const TARGET_FILES: &[&str] = &[
     "crates/gam-sae/src/spectrometer.rs",
-    "crates/gam-sae/src/nuisance_atlas.rs",
     "crates/gam-sae/src/dual_certificate.rs",
     "crates/gam-sae/src/front_door.rs",
     "crates/gam-sae/src/null_battery.rs",

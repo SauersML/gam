@@ -11,7 +11,7 @@ use super::block::{
 pub struct BlockChartComposeConfig {
     pub block_size: usize,
     pub block_topk: usize,
-    pub gamma: f64,
+    pub gamma: f32,
     pub residual_target: bool,
     pub min_firings: usize,
     pub max_blocks: usize,
@@ -112,7 +112,7 @@ pub struct BlockChartRecord {
 
 #[derive(Clone, Debug)]
 pub struct BlockChartComposeResult {
-    pub reconstructed: Array2<f64>,
+    pub reconstructed: Array2<f32>,
     pub block_records: Vec<BlockChartRecord>,
     pub pair_records: Vec<BlockChartRecord>,
     pub selected_blocks: Vec<usize>,
@@ -133,7 +133,7 @@ pub struct BlockChartComposeResult {
 pub struct BlockSeedManifestConfig {
     pub block_size: usize,
     pub block_topk: usize,
-    pub gamma: f64,
+    pub gamma: f32,
     pub residual_target: bool,
     pub n_basis_chart: usize,
     pub include_bases: bool,
@@ -162,12 +162,12 @@ pub struct BlockSeedRecord {
     pub block: usize,
     pub block_dim: usize,
     pub n_firings: usize,
-    pub utilization: f64,
-    pub stable_rank: f64,
+    pub utilization: f32,
+    pub stable_rank: f32,
     pub coded_var: Vec<f64>,
     pub total_var: f64,
     pub block_linear_ev: f64,
-    pub basis: Option<Vec<Vec<f64>>>,
+    pub basis: Option<Vec<Vec<f32>>>,
     pub mdl_block: MdlFeaturizerRow,
     pub mdl_chart: MdlFeaturizerRow,
     /// Matched description length (bits) of the FLAT / linear block comparator:
@@ -190,7 +190,7 @@ pub struct BlockSeedManifest {
     pub block_size: usize,
     pub block_topk: usize,
     pub ambient_p: usize,
-    pub gamma: f64,
+    pub gamma: f32,
     pub explained_variance: f64,
     pub residual_target: bool,
     pub n_basis_chart: usize,
@@ -215,10 +215,10 @@ struct CandidateFit {
 }
 
 pub fn compose_block_coordinate_charts(
-    x: ArrayView2<'_, f64>,
-    decoder: ArrayView2<'_, f64>,
+    x: ArrayView2<'_, f32>,
+    decoder: ArrayView2<'_, f32>,
     blocks: ArrayView2<'_, u32>,
-    codes: ArrayView3<'_, f64>,
+    codes: ArrayView3<'_, f32>,
     config: &BlockChartComposeConfig,
 ) -> Result<BlockChartComposeResult, String> {
     validate_inputs(x, decoder, blocks, codes, config)?;
@@ -425,11 +425,11 @@ pub fn block_sparse_dictionary_firings(
 }
 
 pub fn block_sparse_dictionary_seed_manifest(
-    x: ArrayView2<'_, f64>,
-    decoder: ArrayView2<'_, f64>,
+    x: ArrayView2<'_, f32>,
+    decoder: ArrayView2<'_, f32>,
     blocks: ArrayView2<'_, u32>,
-    block_utilization: &[f64],
-    block_stable_rank: &[f64],
+    block_utilization: &[f32],
+    block_stable_rank: &[f32],
     explained_variance: f64,
     config: &BlockSeedManifestConfig,
 ) -> Result<BlockSeedManifest, String> {
@@ -569,7 +569,7 @@ pub fn block_sparse_dictionary_seed_manifest(
 /// the column charge is `block_size` vs `n_basis_chart` columns of `p` ambient
 /// scalars at each arm's own distortion-matched per-scalar precision.
 fn matched_dl_for_block(
-    firing_coords: &Array2<f64>,
+    firing_coords: &Array2<f32>,
     config: &BlockSeedManifestConfig,
     ambient_p: usize,
     ev: f64,
@@ -654,10 +654,10 @@ fn matched_dl_for_block(
 }
 
 fn validate_inputs(
-    x: ArrayView2<'_, f64>,
-    decoder: ArrayView2<'_, f64>,
+    x: ArrayView2<'_, f32>,
+    decoder: ArrayView2<'_, f32>,
     blocks: ArrayView2<'_, u32>,
-    codes: ArrayView3<'_, f64>,
+    codes: ArrayView3<'_, f32>,
     config: &BlockChartComposeConfig,
 ) -> Result<(), String> {
     if config.block_size == 0 {
@@ -694,13 +694,13 @@ fn validate_inputs(
 }
 
 fn block_coords_for_config(
-    x: ArrayView2<'_, f64>,
-    decoder: ArrayView2<'_, f64>,
+    x: ArrayView2<'_, f32>,
+    decoder: ArrayView2<'_, f32>,
     blocks: ArrayView2<'_, u32>,
-    codes: ArrayView3<'_, f64>,
+    codes: ArrayView3<'_, f32>,
     config: &BlockChartComposeConfig,
     block: usize,
-) -> Result<Array2<f64>, String> {
+) -> Result<Array2<f32>, String> {
     if config.residual_target {
         // Leave-one-block-out residual from the CALLER's codes — the same
         // linear tier `base` reconstructs from — so chart subproblems and the
@@ -721,11 +721,11 @@ fn block_coords_for_config(
 }
 
 fn block_coords_for_seed_config(
-    x: ArrayView2<'_, f64>,
-    decoder: ArrayView2<'_, f64>,
+    x: ArrayView2<'_, f32>,
+    decoder: ArrayView2<'_, f32>,
     config: &BlockSeedManifestConfig,
     block: usize,
-) -> Result<Array2<f64>, String> {
+) -> Result<Array2<f32>, String> {
     if config.residual_target {
         block_sparse_dictionary_project_residual(
             x,
@@ -742,10 +742,10 @@ fn block_coords_for_seed_config(
 }
 
 fn select_blocks(
-    x: ArrayView2<'_, f64>,
-    decoder: ArrayView2<'_, f64>,
+    x: ArrayView2<'_, f32>,
+    decoder: ArrayView2<'_, f32>,
     blocks: ArrayView2<'_, u32>,
-    codes: ArrayView3<'_, f64>,
+    codes: ArrayView3<'_, f32>,
     config: &BlockChartComposeConfig,
 ) -> Result<Vec<usize>, String> {
     let g_total = decoder.nrows() / config.block_size;
@@ -766,10 +766,10 @@ fn select_blocks(
 }
 
 fn screen_pairs(
-    x: ArrayView2<'_, f64>,
-    decoder: ArrayView2<'_, f64>,
+    x: ArrayView2<'_, f32>,
+    decoder: ArrayView2<'_, f32>,
     blocks: ArrayView2<'_, u32>,
-    codes: ArrayView3<'_, f64>,
+    codes: ArrayView3<'_, f32>,
     config: &BlockChartComposeConfig,
     selected: &[usize],
 ) -> Result<Vec<(usize, usize, f64)>, String> {
@@ -786,16 +786,7 @@ fn screen_pairs(
             let z0 = take_rows(&z0_all, &rows);
             let z1_all = block_coords_for_config(x, decoder, blocks, codes, config, g1)?;
             let z1 = take_rows(&z1_all, &rows);
-            // Energy ranks determine which pairs are screened, not the order
-            // of their coordinates or persistent identity. Orient the pair
-            // before scoring and fitting so changing the rank cannot exchange
-            // its two coordinate blocks.
-            let (first, second, score) = if g0 < g1 {
-                (g0, g1, pair_score(&z0, &z1)?)
-            } else {
-                (g1, g0, pair_score(&z1, &z0)?)
-            };
-            out.push((first, second, score));
+            out.push((g0, g1, pair_score(&z0, &z1)?));
         }
     }
     out.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
@@ -804,7 +795,7 @@ fn screen_pairs(
 }
 
 fn crossfit_evidence(
-    coords: &Array2<f64>,
+    coords: &Array2<f32>,
     config: &BlockChartComposeConfig,
 ) -> Result<ChartEvidence, String> {
     let n = coords.nrows();
@@ -827,13 +818,13 @@ fn crossfit_evidence(
         let train_coords = take_rows(coords, &train);
         let eval_coords = take_rows(coords, &eval);
         let whitening = fit_whitening(&train_coords, config.whitening_ridge)?;
-        let train_w = whitening.transform(&train_coords);
-        let eval_w = whitening.transform(&eval_coords);
+        let train_w = whitening.transform(&to_f64(&train_coords));
+        let eval_w = whitening.transform(&to_f64(&eval_coords));
         let linear_pred_w = pca_reconstruct(&train_w, &eval_w, 1)?;
         let chart_pred_w = radial_predict(&train_w, &eval_w);
         let linear_pred = whitening.inverse(&linear_pred_w);
         let chart_pred = whitening.inverse(&chart_pred_w);
-        let eval_f = &eval_coords;
+        let eval_f = to_f64(&eval_coords);
         for (pos, &row) in eval.iter().enumerate() {
             linear_loss[row] = row_sse(&eval_f, &linear_pred, pos);
             chart_loss[row] = row_sse(&eval_f, &chart_pred, pos);
@@ -901,7 +892,7 @@ fn crossfit_evidence(
     // rows (#2246): a valid `E_{H0}[E] ≤ 1` instrument, unlike the descriptive
     // BIC `margin` above. Fed to the full-family e-BH in
     // `compose_block_coordinate_charts`; `fdr_selected` is set there.
-    let coords64 = coords;
+    let coords64 = to_f64(coords);
     let log_e =
         super::split_lr_fdr::shell_vs_ring_log_evalue(&coords64, folds, config.whitening_ridge)?;
     Ok(ChartEvidence {
@@ -922,15 +913,15 @@ fn crossfit_evidence(
     })
 }
 
-fn fit_radial_chart_all(coords: &Array2<f64>, ridge: f64) -> Result<Array2<f64>, String> {
+fn fit_radial_chart_all(coords: &Array2<f32>, ridge: f64) -> Result<Array2<f64>, String> {
     let whitening = fit_whitening(coords, ridge)?;
-    let z = whitening.transform(coords);
+    let z = whitening.transform(&to_f64(coords));
     let pred = radial_predict(&z, &z);
     Ok(whitening.inverse(&pred))
 }
 
-fn fit_whitening(coords: &Array2<f64>, ridge: f64) -> Result<Whitening, String> {
-    let x = coords;
+fn fit_whitening(coords: &Array2<f32>, ridge: f64) -> Result<Whitening, String> {
+    let x = to_f64(coords);
     let n = x.nrows();
     let d = x.ncols();
     let mut mean = vec![0.0; d];
@@ -1057,6 +1048,7 @@ fn pca_reconstruct(
     Ok(out)
 }
 
+
 pub(crate) fn jacobi_eigh(mut a: Vec<f64>, n: usize) -> Result<(Vec<f64>, Vec<f64>), String> {
     if a.len() != n * n {
         return Err("jacobi_eigh: matrix length mismatch".to_string());
@@ -1112,10 +1104,10 @@ pub(crate) fn jacobi_eigh(mut a: Vec<f64>, n: usize) -> Result<(Vec<f64>, Vec<f6
     Ok((vals, v))
 }
 
-fn pair_score(z0: &Array2<f64>, z1: &Array2<f64>) -> Result<f64, String> {
+fn pair_score(z0: &Array2<f32>, z1: &Array2<f32>) -> Result<f64, String> {
     let joint = hstack(z0, z1);
     let whitening = fit_whitening(&joint, 1.0e-8)?;
-    let z = whitening.transform(&joint);
+    let z = whitening.transform(&to_f64(&joint));
     let mut radii = Vec::with_capacity(z.nrows());
     for i in 0..z.nrows() {
         let mut ss = 0.0;
@@ -1155,8 +1147,8 @@ fn rows_for_pair(blocks: ArrayView2<'_, u32>, g0: usize, g1: usize) -> Vec<usize
     out
 }
 
-fn take_rows(a: &Array2<f64>, rows: &[usize]) -> Array2<f64> {
-    let mut out = Array2::<f64>::zeros((rows.len(), a.ncols()));
+fn take_rows(a: &Array2<f32>, rows: &[usize]) -> Array2<f32> {
+    let mut out = Array2::<f32>::zeros((rows.len(), a.ncols()));
     for (i, &row) in rows.iter().enumerate() {
         for j in 0..a.ncols() {
             out[[i, j]] = a[[row, j]];
@@ -1165,8 +1157,8 @@ fn take_rows(a: &Array2<f64>, rows: &[usize]) -> Array2<f64> {
     out
 }
 
-fn hstack(a: &Array2<f64>, b: &Array2<f64>) -> Array2<f64> {
-    let mut out = Array2::<f64>::zeros((a.nrows(), a.ncols() + b.ncols()));
+fn hstack(a: &Array2<f32>, b: &Array2<f32>) -> Array2<f32> {
+    let mut out = Array2::<f32>::zeros((a.nrows(), a.ncols() + b.ncols()));
     for i in 0..a.nrows() {
         for j in 0..a.ncols() {
             out[[i, j]] = a[[i, j]];
@@ -1178,7 +1170,7 @@ fn hstack(a: &Array2<f64>, b: &Array2<f64>) -> Array2<f64> {
     out
 }
 
-fn centered_energy(a: &Array2<f64>) -> f64 {
+fn centered_energy(a: &Array2<f32>) -> f64 {
     let mut means = vec![0.0; a.ncols()];
     for j in 0..a.ncols() {
         for i in 0..a.nrows() {
@@ -1196,7 +1188,7 @@ fn centered_energy(a: &Array2<f64>) -> f64 {
     e
 }
 
-fn centered_energy_view(a: ArrayView2<'_, f64>) -> f64 {
+fn centered_energy_view(a: ArrayView2<'_, f32>) -> f64 {
     let mut means = vec![0.0; a.ncols()];
     for j in 0..a.ncols() {
         for i in 0..a.nrows() {
@@ -1214,7 +1206,7 @@ fn centered_energy_view(a: ArrayView2<'_, f64>) -> f64 {
     e
 }
 
-fn coordinate_spectrum(coords: &Array2<f64>) -> Result<Vec<f64>, String> {
+fn coordinate_spectrum(coords: &Array2<f32>) -> Result<Vec<f64>, String> {
     let n = coords.nrows();
     let d = coords.ncols();
     let mut means = vec![0.0; d];
@@ -1243,7 +1235,7 @@ fn coordinate_spectrum(coords: &Array2<f64>) -> Result<Vec<f64>, String> {
     Ok(spectrum)
 }
 
-fn block_basis(decoder: ArrayView2<'_, f64>, block_size: usize, block: usize) -> Vec<Vec<f64>> {
+fn block_basis(decoder: ArrayView2<'_, f32>, block_size: usize, block: usize) -> Vec<Vec<f32>> {
     let mut basis = vec![vec![0.0; block_size]; decoder.ncols()];
     for p in 0..decoder.ncols() {
         for r in 0..block_size {
@@ -1253,11 +1245,24 @@ fn block_basis(decoder: ArrayView2<'_, f64>, block_size: usize, block: usize) ->
     basis
 }
 
+fn to_f64(a: &Array2<f32>) -> Array2<f64> {
+    let mut out = Array2::<f64>::zeros(a.dim());
+    for i in 0..a.nrows() {
+        for j in 0..a.ncols() {
+            out[[i, j]] = a[[i, j]] as f64;
+        }
+    }
+    out
+}
+
+
+
+
 fn subtract_block_contribution(
-    out: &mut Array2<f64>,
-    decoder: ArrayView2<'_, f64>,
+    out: &mut Array2<f32>,
+    decoder: ArrayView2<'_, f32>,
     blocks: ArrayView2<'_, u32>,
-    codes: ArrayView3<'_, f64>,
+    codes: ArrayView3<'_, f32>,
     b: usize,
     row: usize,
     block: usize,
@@ -1277,8 +1282,8 @@ fn subtract_block_contribution(
 }
 
 fn add_lifted_coords(
-    out: &mut Array2<f64>,
-    decoder: ArrayView2<'_, f64>,
+    out: &mut Array2<f32>,
+    decoder: ArrayView2<'_, f32>,
     b: usize,
     row: usize,
     block: usize,
@@ -1286,7 +1291,7 @@ fn add_lifted_coords(
     offset: usize,
 ) {
     for r in 0..b {
-        let code = coords[offset + r] as f64;
+        let code = coords[offset + r] as f32;
         let atom = decoder.row(block * b + r);
         for c in 0..out.ncols() {
             out[[row, c]] += code * atom[c];
@@ -1310,14 +1315,14 @@ mod tests {
     /// mild radial jitter. The radial (curved) chart predicts each point onto the
     /// mean-radius circle and fits it well, while a rank-1 linear PCA cannot capture
     /// a ring — so the chart genuinely beats the linear comparator (a real ACCEPT).
-    fn annulus(n: usize) -> Array2<f64> {
+    fn annulus(n: usize) -> Array2<f32> {
         let mut st = 0x1234_5678u64;
-        let mut z = Array2::<f64>::zeros((n, 2));
+        let mut z = Array2::<f32>::zeros((n, 2));
         for i in 0..n {
             let theta = std::f64::consts::TAU * (i as f64 / n as f64) + 0.01 * unif(&mut st);
             let r = 1.0 + 0.05 * (unif(&mut st) - 0.5);
-            z[[i, 0]] = (r * theta.cos()) as f64;
-            z[[i, 1]] = (r * theta.sin()) as f64;
+            z[[i, 0]] = (r * theta.cos()) as f32;
+            z[[i, 1]] = (r * theta.sin()) as f32;
         }
         z
     }

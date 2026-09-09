@@ -1509,9 +1509,20 @@ impl<'d> SingleBlockExactJointDesignCache<'d> {
         );
         self.realizer
             .apply_log_kappa(&log_kappa, &self.spatial_terms)?;
+        // The ψ this realization is FOR. `ensure_theta` is memoized on θ, so
+        // every line here is a distinct point, and the cost of a spatial fit is
+        // the number of them: 518 realizations against 189 reported outer
+        // evaluations on the 6-D k=100 fit. Which points those are — a line
+        // search, a probe ladder, or one evaluation re-entered — cannot be read
+        // from a line that prints only how long it took (#2735).
         log::info!(
-            "[STAGE] ensure_theta (apply_log_kappa, {} terms): {:.3}s",
+            "[STAGE] ensure_theta (apply_log_kappa, {} terms) psi={:?}: {:.3}s",
             self.spatial_terms.len(),
+            theta
+                .iter()
+                .skip(self.rho_dim)
+                .map(|value| format!("{value:.6}"))
+                .collect::<Vec<_>>(),
             t_ensure.elapsed().as_secs_f64(),
         );
         self.current_theta = Some(theta.clone());
@@ -2750,7 +2761,6 @@ fn try_exact_joint_spatial_length_scale_optimization(
         fit,
         design: optimized.design,
         resolvedspec: optimized_spec,
-        adaptive_diagnostics: optimized.adaptive_diagnostics,
         kappa_timing: Some(kappa_timing),
     };
 
@@ -5389,6 +5399,16 @@ impl<'d> FrozenTermCollectionIncrementalRealizer<'d> {
                 &mut replay.basis,
                 gauge.local_identifiability_transform.as_ref(),
             );
+            // The rotation `Q` the collection applied BEFORE it derived `T0`
+            // (gam#2760). The freeze copied the term's own `joint_null_rotation`,
+            // which the collection cleared once it composed `Q·T0` into the
+            // metadata, and the chart restored above is the pre-`Q` one — so
+            // without this the replay put an unrotated block through a chart
+            // derived on the rotated one. The local build honours a persisted
+            // rotation instead of re-deriving one, and
+            // `wrap_local_build_as_realization` applies it before the gauge
+            // applies `T0`: the collection's own order.
+            replay.joint_null_rotation = gauge.joint_null_rotation.clone();
         }
         let spec = spec;
         let fixed_blocks = build_term_collection_fixed_blocks(data, &spec)
@@ -6053,6 +6073,7 @@ impl<'d> FrozenTermCollectionIncrementalRealizer<'d> {
         }
 
         let termname = build_spec.name.clone();
+        let t_build = std::time::Instant::now();
         let local = build_single_local_smooth_term(
             self.data,
             &build_spec,
@@ -6110,6 +6131,16 @@ impl<'d> FrozenTermCollectionIncrementalRealizer<'d> {
             spatial_frozen_radial_chart_shape(&build_spec),
             spatial_realized_radial_chart_shape(&local.metadata),
             local.design.ncols(),
+        );
+        // The n×k realization is the trial's dominant cost and had no timer of
+        // its own: the only per-trial number reported was the splice's, under a
+        // label that named the rebuild (measured on the 6-D isotropic Duchon
+        // fit at n=50 000, k=500: 16.6 s per κ trial, of which the splice the
+        // old line reported was 1.7 s).
+        log::info!(
+            "[STAGE] smooth term realization (term {term_idx}, '{termname}', local_cols={}): {:.3}s",
+            local.design.ncols(),
+            t_build.elapsed().as_secs_f64(),
         );
         let realization = wrap_local_build_as_realization(local, &build_spec)
             .map_err(EstimationError::InvalidInput)?;
@@ -6462,7 +6493,7 @@ impl<'d> FrozenTermCollectionIncrementalRealizer<'d> {
         }
         self.dropped_penaltyinfo_by_term[term_idx] = dropped_penaltyinfo;
         log::info!(
-            "[STAGE] smooth basis rebuild (term {}, '{}', cols={}): {:.3}s",
+            "[STAGE] collection-gauge placement + splice (term {}, '{}', cols={}): {:.3}s",
             term_idx,
             target_term.name,
             coeff_range.len(),
@@ -8557,7 +8588,6 @@ fn try_exact_joint_latent_coord_optimization(
         fit,
         design: optimized.design,
         resolvedspec: resolvedspec.clone(),
-        adaptive_diagnostics: optimized.adaptive_diagnostics,
         kappa_timing: None,
     })
 }
@@ -8803,7 +8833,6 @@ pub fn fit_term_collectionwith_spatial_length_scale_optimization(
             fit: out.fit,
             design: out.design,
             resolvedspec,
-            adaptive_diagnostics: out.adaptive_diagnostics,
             kappa_timing: None,
         });
     }
@@ -9030,7 +9059,6 @@ pub fn fit_term_collectionwith_spatial_length_scale_optimization(
             fit: fitted.fit,
             design: fitted.design,
             resolvedspec,
-            adaptive_diagnostics: fitted.adaptive_diagnostics,
             kappa_timing: None,
         });
     }
@@ -9083,7 +9111,6 @@ pub fn fit_term_collectionwith_spatial_length_scale_optimization(
                 fit: fitted.fit,
                 design: fitted.design,
                 resolvedspec,
-                adaptive_diagnostics: fitted.adaptive_diagnostics,
                 kappa_timing: None,
             });
         }
@@ -9137,7 +9164,6 @@ pub fn fit_term_collectionwith_spatial_length_scale_optimization(
         fit: fitted.fit,
         design: fitted.design,
         resolvedspec,
-        adaptive_diagnostics: fitted.adaptive_diagnostics,
         kappa_timing: None,
     })
 }

@@ -1624,55 +1624,6 @@ fn adaptive_spatial_start_is_activated_only_by_its_orchestrator() {
 }
 
 #[test]
-fn materialize_standard_keeps_adaptive_regularization_off_by_default_for_duchon() {
-    let data = duchon_workflow_dataset();
-    let materialized = materialize(
-        "y ~ duchon(ct, st, centers=12)",
-        &data,
-        &FitConfig::default(),
-    )
-    .expect("Duchon standard materialization should succeed");
-    let FitRequest::Standard(request) = materialized.request else {
-        panic!("expected standard request");
-    };
-    assert!(request.options.adaptive_regularization.is_none());
-}
-
-#[test]
-fn materialize_standard_honors_adaptive_regularization_enable() {
-    let data = duchon_workflow_dataset();
-    let config = FitConfig {
-        adaptive_regularization: Some(true),
-        ..FitConfig::default()
-    };
-    let materialized = materialize("y ~ duchon(ct, st, centers=12)", &data, &config)
-        .expect("Duchon materialization should allow enabling adaptive regularization");
-    let FitRequest::Standard(request) = materialized.request else {
-        panic!("expected standard request");
-    };
-    let opts = request
-        .options
-        .adaptive_regularization
-        .expect("Duchon should enable adaptive regularization when requested");
-    assert!(opts.enabled);
-}
-
-#[test]
-fn materialize_standard_honors_adaptive_regularization_disable() {
-    let data = duchon_workflow_dataset();
-    let config = FitConfig {
-        adaptive_regularization: Some(false),
-        ..FitConfig::default()
-    };
-    let materialized = materialize("y ~ duchon(ct, st, centers=12)", &data, &config)
-        .expect("Duchon materialization should allow disabling adaptive regularization");
-    let FitRequest::Standard(request) = materialized.request else {
-        panic!("expected standard request");
-    };
-    assert!(request.options.adaptive_regularization.is_none());
-}
-
-#[test]
 fn issue_2094_sas_and_beta_logistic_links_enable_optimize_sas_on_formula_path() {
     // #2094: the learnable `sas` (sinh-arcsinh) and `beta-logistic` links carry
     // a shape pair `(epsilon, log_delta)` that the standard fit only estimates

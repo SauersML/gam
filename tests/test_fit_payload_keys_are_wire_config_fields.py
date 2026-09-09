@@ -48,6 +48,8 @@ class _Latent:
 
 _UNSET_KWARGS: dict[str, typing.Any] = {
     "family": "gaussian",
+    "negative_binomial_theta": None,
+    "expectile_tau": None,
     "offset": None,
     "weights": None,
     "persistent_warm_start_root": None,
@@ -67,7 +69,6 @@ _UNSET_KWARGS: dict[str, typing.Any] = {
     "frailty_sd": None,
     "hazard_loading": None,
     "scale_dimensions": None,
-    "adaptive_regularization": None,
     "firth": None,
     "noise_formula": None,
     "noise_offset": None,
@@ -133,6 +134,8 @@ def _fully_populated_payload() -> dict[str, typing.Any]:
             "offset": "off",
             "weights": "w",
             "transformation_normal": True,
+            "negative_binomial_theta": 2.5,
+            "expectile_tau": 0.9,
             "survival_likelihood": "location-scale",
             "survival_time_anchor": 25.0,
             "baseline_target": "weibull",
@@ -148,7 +151,6 @@ def _fully_populated_payload() -> dict[str, typing.Any]:
             "hazard_loading": "full",
             "persistent_warm_start_root": "warm-start-fixture",
             "scale_dimensions": True,
-            "adaptive_regularization": True,
             "firth": True,
             "noise_formula": "s(x)",
             "noise_offset": "logvar",

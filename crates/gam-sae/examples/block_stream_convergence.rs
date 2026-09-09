@@ -18,10 +18,10 @@ mod npy_header;
 // Independently price the last proposal with the old and freshly chosen
 // supports. This separates frame descent from a discontinuity at a top-k tie.
 fn audit_proposal(
-    x: ArrayView2<'_, f64>,
-    before: ArrayView2<'_, f64>,
-    after: ArrayView2<'_, f64>,
-    gamma: f64,
+    x: ArrayView2<'_, f32>,
+    before: ArrayView2<'_, f32>,
+    after: ArrayView2<'_, f32>,
+    gamma: f32,
     config: &BlockSparseConfig,
 ) -> Result<serde_json::Value, String> {
     let b = config.block_size;
@@ -34,7 +34,7 @@ fn audit_proposal(
         .into_par_iter()
         .map(|row| {
             let project =
-                |decoder: ArrayView2<'_, f64>, blocks: &Array2<u32>, gates: &Array2<f64>| {
+                |decoder: ArrayView2<'_, f32>, blocks: &Array2<u32>, gates: &Array2<f32>| {
                     let mut total = vec![0.0_f64; x.ncols()];
                     for slot in 0..blocks.ncols() {
                         if gates[[row, slot]] == 0.0 {
@@ -175,11 +175,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .chunks_exact(element_bytes)
         .map(|bytes| {
             if is_f32 {
-                f64::from(f32::from_le_bytes(bytes.try_into().expect("four-byte chunk")))
+                f32::from_le_bytes(bytes.try_into().expect("four-byte chunk"))
             } else {
-                f64::from(f16::f16_to_f32(u16::from_le_bytes(
+                f16::f16_to_f32(u16::from_le_bytes(
                     bytes.try_into().expect("two-byte chunk"),
-                )))
+                ))
             }
         })
         .collect();

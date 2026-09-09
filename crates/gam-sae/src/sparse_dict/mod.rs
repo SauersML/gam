@@ -13,10 +13,10 @@
 //! 1. **route** — for each row, score it against the whole dictionary in
 //!    `K`-tiles (`scoring`) and keep only the top-`s` atoms online, so the
 //!    `N×K` score matrix is produced one tile at a time and discarded;
-//! 2. **codes** — compute each row's posterior-mean codes through its active
-//!    decoder's thin SVD (`codes`), with fixed-width storage `(indices, codes)`;
+//! 2. **codes** — solve the small `s×s` active-set least-squares system per row
+//!    (`codes`), giving a fixed-width sparse code `(indices, codes)`;
 //! 3. **decoder** — accumulate the sparse normal equations (method-of-optimal
-//!    -directions / sparse GEMM) and refine on the unit-row constraints (`update`);
+//!    -directions / sparse GEMM) and refresh each atom (`update`);
 //! 4. **project** — re-unit-norm every atom so the code scale is identified.
 //!
 //! All heavy state is FP32. The only dense `K`-sized objects are the decoder
@@ -41,44 +41,25 @@ mod residual_reservoir;
 #[cfg(target_os = "linux")]
 mod score_router_backend;
 mod scoring;
+mod single_atom;
 #[cfg(target_os = "linux")]
 mod scoring_gpu;
-mod single_atom;
 mod split_lr_fdr;
 mod stream;
-mod unit_decoder;
 mod update;
 
 #[cfg(test)]
 mod tests;
 
-pub use block::{
-    BlockSeedPolicy, BlockSparseConfig, BlockSparseConvergence, BlockSparseFit,
-    BlockSparseFitError, block_gates, block_projections_row, block_sparse_dictionary_block_coords,
-    block_sparse_dictionary_lift_block, block_sparse_dictionary_project_residual,
-    block_sparse_dictionary_transform, coordinate_partition_frames, fit_block_sparse_dictionary,
-    fit_block_sparse_dictionary_with_seed, reconstruct_block_sparse_rows, route_row_blocks,
-};
-pub use block_chart::{
-    BlockChartComposeConfig, BlockChartComposeResult, BlockChartRecord, BlockSeedManifest,
-    BlockSeedManifestConfig, BlockSeedRecord, CHART_FDR_ALPHA, ChartEvidence, MdlFeaturizerRow,
-    block_sparse_dictionary_firings, block_sparse_dictionary_seed_manifest,
-    compose_block_coordinate_charts,
-};
+pub use block::{BlockSeedPolicy, BlockSparseConfig, BlockSparseConvergence, BlockSparseFit, BlockSparseFitError, block_gates, block_projections_row, block_sparse_dictionary_block_coords, block_sparse_dictionary_lift_block, block_sparse_dictionary_project_residual, block_sparse_dictionary_transform, coordinate_partition_frames, fit_block_sparse_dictionary, fit_block_sparse_dictionary_with_seed, reconstruct_block_sparse_rows, route_row_blocks};
+pub use block_chart::{BlockChartComposeConfig, BlockChartComposeResult, BlockChartRecord, BlockSeedManifest, BlockSeedManifestConfig, BlockSeedRecord, CHART_FDR_ALPHA, ChartEvidence, MdlFeaturizerRow, block_sparse_dictionary_firings, block_sparse_dictionary_seed_manifest, compose_block_coordinate_charts};
 pub use block_scoring_gpu::{BlockRoutePath, block_gate_row_cpu, route_blocks_cpu};
 #[cfg(target_os = "linux")]
 pub use block_scoring_gpu::{DEVICE_BLOCK_GATE_MIN_ELEMS, route_blocks_required};
-pub use block_stream::{
-    BlockEpochStats, BlockShardStats, BlockSparseStreamArtifact, BlockSparseStreamConvergence,
-    BlockSparseStreamState,
-};
+pub use block_stream::{BlockEpochStats, BlockShardStats, BlockSparseStreamArtifact, BlockSparseStreamState};
 pub use codes::SparseCode;
 pub use cofit::{CofitConfig, CofitReport, CofitRound};
-pub use coordinate::{
-    BlockCoordinateReport, BlockMeasureCoordinateReport, FiringCoordinate, MeasureSpikeCoordinate,
-    MeasureValuedCode, block_route_firing_coordinates, harmonic_measure_coordinates,
-    harmonic_route_firing_coordinates, recover_measure_from_code,
-};
+pub use coordinate::{BlockCoordinateReport, BlockMeasureCoordinateReport, FiringCoordinate, MeasureSpikeCoordinate, MeasureValuedCode, block_route_firing_coordinates, harmonic_measure_coordinates, harmonic_route_firing_coordinates, recover_measure_from_code};
 pub use scoring::{ScoreRoutePath, ScoreRouteResult, ScoreRouteStats, TileScorer, top_s_online};
 #[cfg(target_os = "linux")]
 pub use scoring_gpu::{DEVICE_SCORE_BLOCK_MIN_ELEMS, ScoreBlockPath};
@@ -86,10 +67,8 @@ pub use split_lr_fdr::{
     FdrCertificate, crossfit_ui_log_evalue, family_fdr_certificate, shell_vs_ring_log_evalue,
 };
 pub use stream::{EpochStats, ShardStats, SparseDictArtifact, SparseDictStreamState};
+pub use update::{DecoderSolveStats, LinearBlockRemlStats, SparseDictionaryError, linear_shared_rho_fs_step};
 pub(crate) use update::extend_linear_reml_schedule;
-pub use update::{
-    DecoderSolveStats, LinearBlockRemlStats, SparseDictionaryError, linear_shared_rho_fs_step,
-};
 
 use ndarray::{Array2, ArrayView2};
 
@@ -239,8 +218,8 @@ pub struct SparseDictConvergence {
     /// plateaued but the discrete routing keeps churning. Convergence is decided by
     /// the gauge-invariant EV plateau, so both certified and open fits are returned;
     /// only a still-climbing objective (or a failed linear subsolve) is a genuine
-    /// non-convergence error.
-    /// The block lane instead requires all full-step residuals to close.
+    /// non-convergence error. Mirrors
+    /// `super::block::BlockSparseConvergence::certified`.
     pub certified: bool,
 }
 
@@ -255,11 +234,11 @@ impl SparseDictFit {
     }
 }
 
-pub fn reconstruct_sparse_rows<T: ndarray::NdFloat>(
-    decoder: ArrayView2<'_, T>,
+pub fn reconstruct_sparse_rows(
+    decoder: ArrayView2<'_, f32>,
     indices: ArrayView2<'_, u32>,
-    codes: ArrayView2<'_, T>,
-) -> Result<Array2<T>, String> {
+    codes: ArrayView2<'_, f32>,
+) -> Result<Array2<f32>, String> {
     if indices.dim() != codes.dim() {
         return Err(format!(
             "reconstruct_sparse_rows: indices shape {:?} does not match codes shape {:?}",
@@ -269,7 +248,7 @@ pub fn reconstruct_sparse_rows<T: ndarray::NdFloat>(
     }
     let n = indices.nrows();
     let p = decoder.ncols();
-    let mut out = Array2::<T>::zeros((n, p));
+    let mut out = Array2::<f32>::zeros((n, p));
     for i in 0..n {
         for j in 0..indices.ncols() {
             let atom = indices[[i, j]] as usize;
@@ -280,7 +259,7 @@ pub fn reconstruct_sparse_rows<T: ndarray::NdFloat>(
                 ));
             }
             let code = codes[[i, j]];
-            if code == T::zero() {
+            if code == 0.0 {
                 continue;
             }
             let row = decoder.row(atom);

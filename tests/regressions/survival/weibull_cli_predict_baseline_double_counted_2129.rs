@@ -143,15 +143,14 @@ fn fit(train: &Path, likelihood: &str, model: &Path) {
     );
 }
 
-fn predict(model: &Path, grid: &Path, out: &Path, mode: &str) {
+fn predict(model: &Path, grid: &Path, out: &Path) {
     let mut cmd = Command::new(gam::gam_binary!());
     cmd.arg("predict")
         .arg(model)
         .arg(grid)
-        .args(["--mode", mode])
         .arg("--out")
         .arg(out);
-    run_or_panic(cmd, &format!("gam predict ({mode})"));
+    run_or_panic(cmd, "gam predict");
 }
 
 /// Least-squares slope of `y` regressed on `x`.
@@ -186,10 +185,8 @@ fn weibull_cli_predict_baseline_is_not_double_counted() {
 
     let p_tf = dir.path().join("p_tf.csv");
     let p_wb = dir.path().join("p_wb.csv");
-    let p_wb_pm = dir.path().join("p_wb_pm.csv");
-    predict(&m_tf, &grid, &p_tf, "map");
-    predict(&m_wb, &grid, &p_wb, "map");
-    predict(&m_wb, &grid, &p_wb_pm, "posterior-mean");
+    predict(&m_tf, &grid, &p_tf);
+    predict(&m_wb, &grid, &p_wb);
 
     // ── Control: transformation mode recovers the true Weibull baseline, which
     // proves the data, the CLI, and the survival predict path are sound. ──
@@ -200,7 +197,7 @@ fn weibull_cli_predict_baseline_is_not_double_counted() {
         "control failed: transformation-mode log-cumulative-hazard slope {tf_slope:.3} \
          should recover the true Weibull shape {TRUE_SHAPE}",
     );
-    let tf_surv = read_column(&p_tf, "survival_prob");
+    let tf_surv = read_column(&p_tf, "survival_prob_plugin");
     for (got, want) in tf_surv.iter().zip(true_s.iter()) {
         assert!(
             (got - want).abs() < 0.05,
@@ -225,7 +222,7 @@ fn weibull_cli_predict_baseline_is_not_double_counted() {
     );
 
     // ── Consequence: the map-mode survival curve must track the truth. ──
-    let wb_surv = read_column(&p_wb, "survival_prob");
+    let wb_surv = read_column(&p_wb, "survival_prob_plugin");
     for (got, want) in wb_surv.iter().zip(true_s.iter()) {
         assert!(
             (got - want).abs() < 0.1,
@@ -237,7 +234,7 @@ fn weibull_cli_predict_baseline_is_not_double_counted() {
     // ── Second symptom: the DEFAULT posterior-mean mode must not collapse the
     // survival curve to a flat ≈ 0.5 at every time (the un-centered,
     // unidentified constant time column had an enormous posterior variance). ──
-    let wb_pm_surv = read_column(&p_wb_pm, "survival_prob");
+    let wb_pm_surv = read_column(&p_wb, "survival_prob");
     let max_dev_from_half = wb_pm_surv
         .iter()
         .map(|s| (s - 0.5).abs())

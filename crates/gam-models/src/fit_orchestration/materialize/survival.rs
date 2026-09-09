@@ -1051,7 +1051,14 @@ pub(crate) fn materialize_survival<'a>(
                 score_influence_jacobian: marginal_slope_jac_oof.clone(),
             },
             options: BlockwiseFitOptions {
-                compute_covariance: false,
+                // The same answer the CLI route gives (`run_survival.rs` sets it
+                // unconditionally): a fit computes its coefficient covariance
+                // unless the caller declined inference. This site hard-coded
+                // `false`, so a library-fitted survival marginal-slope model
+                // carried no covariance, could not be saved for posterior-mean
+                // prediction, and disagreed with the CLI's model of the same
+                // data (gam#2765).
+                compute_covariance: config.compute_covariance.unwrap_or(true),
                 persistent_warm_start_store: config.persistent_warm_start_store.clone(),
                 // Robustness (Firth/Jeffreys stabilizer) is the unconditional
                 // default for survival marginal-slope — no flag to thread.

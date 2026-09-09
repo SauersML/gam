@@ -739,11 +739,13 @@ impl BaselineDerivativeContract {
         use gam_problem::{DeclaredHessianForm, Derivative};
         match self {
             // BFGS on a 2–3 dim problem with an exact gradient typically
-            // converges in 5–10 outer evaluations.
+            // converges in 5–10 outer evaluations. The stationarity standard is
+            // the engine's own (#2814): a private `1e-4` sat here only because
+            // the inner solve refused to certify at the strengths the engine's
+            // default walked to.
             BaselineDerivativeContract::GradientOnly => problem
                 .with_gradient(Derivative::Analytic)
                 .with_hessian(DeclaredHessianForm::Unavailable)
-                .with_tolerance(1e-4)
                 .with_max_iter(240),
         }
     }
@@ -845,6 +847,15 @@ where
     let target = initial.target;
     let engine_context = context.to_string();
     let objective = std::rc::Rc::new(std::cell::RefCell::new(objective));
+    // The outer engine asks for the scalar cost and then for derivatives at
+    // the same accepted point, and may ask for either again at that point
+    // (a BFGS line search re-reads the accepted iterate). A baseline
+    // evaluation can be a complete nested latent-survival REML fit, so the
+    // most recent evaluation is retained and served, cloned, for every
+    // request at exactly that theta (#2714).
+    let cost_eval_cache = std::rc::Rc::new(std::cell::RefCell::new(
+        None::<(Array1<f64>, gam_problem::OuterEval)>,
+    ));
     let eval_at = move |obj: &std::rc::Rc<std::cell::RefCell<F>>,
                         theta: &Array1<f64>|
           -> Result<gam_problem::OuterEval, crate::model_types::EstimationError> {
@@ -873,11 +884,29 @@ where
         Ok(eval)
     };
     let cost_objective = std::rc::Rc::clone(&objective);
+    let cost_cache = std::rc::Rc::clone(&cost_eval_cache);
     let cost_eval = eval_at.clone();
     let cost_fn = move |_: &mut (), theta: &Array1<f64>| {
-        cost_eval(&cost_objective, theta).map(|eval| eval.cost)
+        if let Some((cached_theta, eval)) = cost_cache.borrow().as_ref()
+            && cached_theta == theta
+        {
+            return Ok(eval.cost);
+        }
+        let eval = cost_eval(&cost_objective, theta)?;
+        let cost = eval.cost;
+        *cost_cache.borrow_mut() = Some((theta.clone(), eval));
+        Ok(cost)
     };
-    let eval_fn = move |_: &mut (), theta: &Array1<f64>| eval_at(&objective, theta);
+    let eval_fn = move |_: &mut (), theta: &Array1<f64>| {
+        if let Some((cached_theta, eval)) = cost_eval_cache.borrow().as_ref()
+            && cached_theta == theta
+        {
+            return Ok(eval.clone());
+        }
+        let eval = eval_at(&objective, theta)?;
+        *cost_eval_cache.borrow_mut() = Some((theta.clone(), eval.clone()));
+        Ok(eval)
+    };
     run_baseline_theta_optimizer(initial, context, contract, cost_fn, eval_fn)
 }
 
@@ -943,7 +972,10 @@ pub fn parse_survival_time_basis_config(
             }
             if !time_smooth_lambda.is_finite() || time_smooth_lambda < 0.0 {
                 return Err(
-                    "time-basis smoothing lambda must be finite and >= 0 (CLI: --time-smooth-lambda; Python: time_smooth_lambda=)"
+                    "time-basis smoothing lambda must be finite and >= 0; it is \
+                     the REML seed for the time block (FitConfig::time_smooth_lambda, \
+                     default 1e-2), carried on a saved model as \
+                     survival_time_smooth_lambda -- no user surface sets it"
                         .to_string(),
                 );
             }
@@ -4006,6 +4038,108 @@ pub fn append_zero_tail_columns(
 // Time-varying covariate template
 // ---------------------------------------------------------------------------
 
+/// Which follow-up time a time-margin basis is evaluated at.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TimeMarginAbscissa {
+    /// An entry time. A row entering at the origin
+    /// (`age ≤ ENTRY_AT_ORIGIN_THRESHOLD`) carries no entry term in the
+    /// likelihood (`entry_active = false` in `survival::base`), so it has no
+    /// log-time either: its basis rows are zero.
+    Entry,
+    /// An exit or prediction time, which the likelihood always evaluates: it
+    /// must be finite and positive, and anything else is a domain error.
+    Exit,
+}
+
+/// `ln t` for every exit or prediction time, refusing a time the log has no
+/// value for. Replaces the former `t.max(1e-12).ln()`, which accepted a
+/// non-positive time and evaluated the basis at a fabricated `−27.6` (#2469).
+fn exit_log_times(
+    times: ndarray::ArrayView1<'_, f64>,
+    context: &str,
+) -> Result<Array1<f64>, String> {
+    let mut out = Array1::<f64>::zeros(times.len());
+    for (row, &t) in times.iter().enumerate() {
+        if !t.is_finite() || t <= 0.0 {
+            return Err(format!(
+                "{context}: survival times must be finite and positive, but row {row} has {t}"
+            ));
+        }
+        out[row] = t.ln();
+    }
+    Ok(out)
+}
+
+/// `ln t` for every entry time that has one; an origin entry (the same rule
+/// `survival::base` uses to switch the entry term off) has none.
+fn entry_log_times(times: ndarray::ArrayView1<'_, f64>) -> Vec<Option<f64>> {
+    times
+        .iter()
+        .map(|&t| (t > crate::survival::base::ENTRY_AT_ORIGIN_THRESHOLD).then(|| t.ln()))
+        .collect()
+}
+
+fn time_margin_log_times(
+    times: ndarray::ArrayView1<'_, f64>,
+    abscissa: TimeMarginAbscissa,
+    context: &str,
+) -> Result<Vec<Option<f64>>, String> {
+    match abscissa {
+        TimeMarginAbscissa::Entry => Ok(entry_log_times(times)),
+        TimeMarginAbscissa::Exit => {
+            Ok(exit_log_times(times, context)?.iter().map(|&t| Some(t)).collect())
+        }
+    }
+}
+
+/// A provided-knot log-time B-spline basis at the rows that have a log-time;
+/// the rows without one (origin entries) are zero rows.
+fn time_margin_value_rows(
+    log_times: &[Option<f64>],
+    knots: &Array1<f64>,
+    degree: usize,
+    context: &str,
+) -> Result<Array2<f64>, String> {
+    let p_time = knots.len().checked_sub(degree + 1).ok_or_else(|| {
+        format!(
+            "{context}: {} knots are insufficient for degree {degree}",
+            knots.len()
+        )
+    })?;
+    let active: Vec<usize> = (0..log_times.len())
+        .filter(|&row| log_times[row].is_some())
+        .collect();
+    let mut out = Array2::<f64>::zeros((log_times.len(), p_time));
+    if active.is_empty() {
+        return Ok(out);
+    }
+    let compact = Array1::from_iter(active.iter().filter_map(|&row| log_times[row]));
+    let build = build_bspline_basis_1d(
+        compact.view(),
+        &BSplineBasisSpec {
+            degree,
+            penalty_order: 2,
+            knotspec: BSplineKnotSpec::Provided(knots.clone()),
+            double_penalty: false,
+            identifiability: BSplineIdentifiability::None,
+            boundary: OneDimensionalBoundary::Open,
+            boundary_conditions: BSplineBoundaryConditions::default(),
+        },
+    )
+    .map_err(|e| format!("{context}: {e}"))?;
+    let dense = build.design.to_dense();
+    if dense.ncols() != p_time {
+        return Err(format!(
+            "{context}: the basis has {} columns but its knot geometry requires {p_time}",
+            dense.ncols()
+        ));
+    }
+    for (k, &row) in active.iter().enumerate() {
+        out.row_mut(row).assign(&dense.row(k));
+    }
+    Ok(out)
+}
+
 /// Build a time-varying covariate block by tensoring the covariate design
 /// with a 1D B-spline basis on log(time).
 pub fn build_time_varying_survival_covariate_template(
@@ -4023,7 +4157,7 @@ pub fn build_time_varying_survival_covariate_template(
     }
     let num_internal_knots = time_k - (time_degree + 1);
 
-    let log_exit = age_exit.mapv(|t| t.max(1e-12).ln());
+    let log_exit = exit_log_times(age_exit.view(), block_name)?;
 
     let time_spec = BSplineBasisSpec {
         degree: time_degree,
@@ -4077,7 +4211,7 @@ pub fn replay_time_varying_survival_covariate_template(
     time_basis: &SurvivalCovariateTimeBasis,
     block_name: &str,
 ) -> Result<SurvivalCovariateTermBlockTemplate, String> {
-    let log_exit = age_exit.mapv(|t| t.max(1e-12).ln());
+    let log_exit = exit_log_times(age_exit.view(), block_name)?;
     let knots = Array1::from_vec(time_basis.knots.clone());
     let time_build = build_bspline_basis_1d(
         log_exit.view(),
@@ -4127,8 +4261,9 @@ pub struct SlopeTimeMarginRows {
 pub fn slope_time_margin_rows(
     time_basis: &SurvivalCovariateTimeBasis,
     times: ndarray::ArrayView1<'_, f64>,
+    abscissa: TimeMarginAbscissa,
 ) -> Result<SlopeTimeMarginRows, String> {
-    let log_times = times.mapv(|t| t.max(1e-12).ln());
+    let log_times = time_margin_log_times(times, abscissa, "slope time margin")?;
     let knots = Array1::from_vec(time_basis.knots.clone());
     let p_time = knots
         .len()
@@ -4150,40 +4285,30 @@ pub fn slope_time_margin_rows(
         .chunks_mut(p_time)
         .enumerate()
         .try_for_each(|(row, output)| -> Result<(), String> {
+            // An origin entry has no log-time: its tangent row stays zero.
+            let Some(log_time) = log_times[row] else {
+                return Ok(());
+            };
             let mut derivative_log_time = vec![0.0_f64; p_time];
             evaluate_bspline_derivative_scalar(
-                log_times[row],
+                log_time,
                 knots.view(),
                 time_basis.degree,
                 &mut derivative_log_time,
             )
             .map_err(|error| format!("failed to replay the slope time-margin tangent: {error}"))?;
-            let log_time_tangent = 1.0 / times[row].max(1e-12);
+            let log_time_tangent = 1.0 / times[row];
             for column in 0..p_time {
                 output[column] = derivative_log_time[column] * log_time_tangent;
             }
             Ok(())
         })?;
-    let build = build_bspline_basis_1d(
-        log_times.view(),
-        &BSplineBasisSpec {
-            degree: time_basis.degree,
-            penalty_order: 2,
-            knotspec: BSplineKnotSpec::Provided(knots),
-            double_penalty: false,
-            identifiability: BSplineIdentifiability::None,
-            boundary: OneDimensionalBoundary::Open,
-            boundary_conditions: BSplineBoundaryConditions::default(),
-        },
-    )
-    .map_err(|e| format!("failed to replay the slope time margin: {e}"))?;
-    let value = build.design.to_dense();
-    if value.ncols() != p_time {
-        return Err(format!(
-            "the replayed slope time margin has {} columns but its knot geometry requires {p_time}",
-            value.ncols(),
-        ));
-    }
+    let value = time_margin_value_rows(
+        &log_times,
+        &knots,
+        time_basis.degree,
+        "failed to replay the slope time margin",
+    )?;
     Ok(SlopeTimeMarginRows { value, derivative })
 }
 
@@ -4216,8 +4341,9 @@ pub fn replay_slope_follow_up_designs(
             age_exit.len(),
         ));
     }
-    let entry_rows = slope_time_margin_rows(time_basis, age_entry.view())?;
-    let exit_rows = slope_time_margin_rows(time_basis, age_exit.view())?;
+    let entry_rows =
+        slope_time_margin_rows(time_basis, age_entry.view(), TimeMarginAbscissa::Entry)?;
+    let exit_rows = slope_time_margin_rows(time_basis, age_exit.view(), TimeMarginAbscissa::Exit)?;
     if covariate_design.nrows() != exit_rows.value.nrows() {
         return Err(format!(
             "slope follow-up replay has {} covariate rows against {} time rows",
@@ -4273,7 +4399,7 @@ pub fn replay_slope_time_margin_value_tangent_design(
             times.len(),
         ));
     }
-    let time_rows = slope_time_margin_rows(time_basis, times)?;
+    let time_rows = slope_time_margin_rows(time_basis, times, TimeMarginAbscissa::Exit)?;
     if covariate_design.ncols() == 0 || time_rows.value.ncols() == 0 {
         return Err(format!(
             "a follow-up-varying slope needs a non-empty tensor product, got {}x{}",
@@ -4306,22 +4432,14 @@ fn finish_time_varying_survival_covariate_template(
             age_exit.len()
         ));
     }
-    let log_entry = age_entry.mapv(|t| t.max(1e-12).ln());
-    let log_exit = age_exit.mapv(|t| t.max(1e-12).ln());
-    let time_build_entry = build_bspline_basis_1d(
-        log_entry.view(),
-        &BSplineBasisSpec {
-            degree: time_degree,
-            penalty_order: 2,
-            knotspec: BSplineKnotSpec::Provided(knots.clone()),
-            double_penalty: false,
-            identifiability: BSplineIdentifiability::None,
-            boundary: OneDimensionalBoundary::Open,
-            boundary_conditions: BSplineBoundaryConditions::default(),
-        },
-    )
-    .map_err(|e| format!("failed to evaluate {block_name} time-margin basis at entry: {e}"))?;
-    let time_design_entry = time_build_entry.design.to_dense();
+    let log_entry = entry_log_times(age_entry.view());
+    let log_exit = exit_log_times(age_exit.view(), block_name)?;
+    let time_design_entry = time_margin_value_rows(
+        &log_entry,
+        &knots,
+        time_degree,
+        &format!("failed to evaluate {block_name} time-margin basis at entry"),
+    )?;
     let p_time = time_design_exit.ncols();
     if p_time == 0 {
         return Err(format!(
@@ -4345,7 +4463,7 @@ fn finish_time_varying_survival_covariate_template(
             .map_err(|e| {
                 format!("failed to evaluate {block_name} time-margin derivative basis: {e}")
             })?;
-            let chain = 1.0 / age_exit[i].max(1e-12);
+            let chain = 1.0 / age_exit[i];
             for j in 0..p_time {
                 row_out[j] = deriv_buf[j] * chain;
             }
@@ -4367,6 +4485,7 @@ fn finish_time_varying_survival_covariate_template(
 #[cfg(test)]
 mod tests {
     use super::{SURVIVAL_LIKELIHOOD_MODES, SURVIVAL_TIME_FLOOR, SurvivalBaselineConfig, SurvivalBaselineTarget, SurvivalLikelihoodMode, SurvivalMarginalSlopeFrozenOffsetChart, SurvivalTimeBasisConfig, baseline_chain_rule_gradient, baseline_offset_theta_partials, build_survival_marginal_slope_baseline_geometry, build_survival_marginal_slope_baseline_offsets, build_survival_time_basis, build_survival_timewiggle_from_baseline, evaluate_survival_baseline, evaluate_survival_marginal_slope_baseline, fitted_weibull_baseline_from_linear_time_beta, gompertz_cumulative_shape_derivative, gompertz_cumulative_shape_second_derivative, gompertz_hazard_components, marginal_slope_baseline_chain_rule_gradient, marginal_slope_baseline_offset_theta_partials, resolve_survival_time_anchor_for_mode, survival_baseline_config_from_theta, survival_baseline_theta_from_config, survival_data_is_left_truncated, survival_earliest_entry_time_anchor, survival_robust_interior_time_anchor, validate_survival_time_anchor_override};
+    use super::optimize_survival_baseline_config_with_gradient_only;
     use super::{
         center_survival_time_designs_at_anchor, evaluate_survival_time_basis_row,
         resolved_survival_time_basis_config_from_build,
@@ -5437,6 +5556,43 @@ mod tests {
         );
     }
 
+    /// gam#2714: do not execute a nested REML objective twice when the outer
+    /// engine requests cost and derivatives consecutively at one theta.
+    #[test]
+    fn baseline_optimizer_reuses_cost_evaluation_for_gradient_at_same_theta_2714() {
+        use std::cell::RefCell;
+
+        let initial = SurvivalBaselineConfig {
+            target: SurvivalBaselineTarget::Weibull,
+            scale: Some(2.0),
+            shape: Some(1.5),
+            rate: None,
+            makeham: None,
+        };
+        let previous_theta = RefCell::new(None::<Array1<f64>>);
+        let fitted = optimize_survival_baseline_config_with_gradient_only(
+            &initial,
+            "#2714 duplicate-evaluation regression",
+            |cfg| {
+                let theta = survival_baseline_theta_from_config(cfg)?
+                    .expect("Weibull baseline exposes theta");
+                assert_ne!(
+                    previous_theta.borrow().as_ref(),
+                    Some(&theta),
+                    "the adapter re-executed the expensive objective at the same theta"
+                );
+                *previous_theta.borrow_mut() = Some(theta.clone());
+                Ok((theta.dot(&theta), theta.mapv(|value| 2.0 * value)))
+            },
+        )
+        .expect("strictly convex baseline objective converges");
+
+        let theta = survival_baseline_theta_from_config(&fitted)
+            .expect("valid fitted baseline")
+            .expect("Weibull baseline exposes theta");
+        assert!(theta.iter().all(|value| value.abs() <= 1.0e-5));
+    }
+
     /// Weibull (dim=2) companion to
     /// `gompertz_makeham_baseline_chain_rule_gradient_matches_finite_difference`.
     ///
@@ -6288,8 +6444,9 @@ mod tests {
             panic!("a time-varying request must produce a time-varying template");
         };
 
-        let replayed_exit = slope_time_margin_rows(time_basis, age_exit.view())
-            .expect("replayed exit margin");
+        let replayed_exit =
+            slope_time_margin_rows(time_basis, age_exit.view(), super::TimeMarginAbscissa::Exit)
+                .expect("replayed exit margin");
         assert_eq!(replayed_exit.value.dim(), time_basis_exit.dim());
         for (fit_value, replay_value) in time_basis_exit.iter().zip(replayed_exit.value.iter()) {
             assert_eq!(
