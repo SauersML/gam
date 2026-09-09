@@ -318,29 +318,99 @@ class EventHistoryModel:
         out = self._native.population_forecast(float(start), [float(h) for h in horizons], path)
         return self._forecast_dict(out)
 
-    def pit(self, subject: int | str) -> dict[str, np.ndarray]:
-        """Predictive PIT of every event of one subject (uniform under the
-        model), with the event times and marks and the predictive probability
-        of each mark at each event (``mark_probabilities``, events × marks)."""
+    def pit(self, subject: int | str) -> dict[str, Any]:
+        """Predictive PIT of every spell of one subject's follow-up, in time
+        order: one per event and, unless an event ended the follow-up, one
+        for the censored tail after the last event. ``pit`` is
+        ``1 − P(no event in the spell | history)``; ``observed`` says
+        whether the spell ended with an event (an unobserved spell's PIT is
+        the value its uniform is known to exceed, not a draw of it);
+        ``marks`` lists the marks that fired at each spell's end (empty for
+        the tail) and ``mark_probabilities`` (spells × marks) the predictive
+        probability of each mark given an event then."""
         out = self._native.pit(self._subject(subject))
+        names = self.mark_names
         return {
-            "time": np.asarray(out["time"]),
-            "mark": np.asarray(out["mark"]),
-            "pit": np.asarray(out["pit"]),
+            "time": np.asarray(out["time"], dtype=float),
+            "observed": np.asarray(out["observed"], dtype=bool),
+            "pit": np.asarray(out["pit"], dtype=float),
+            "marks": [[names[m] for m in fired] for fired in out["marks"]],
             "mark_probabilities": np.asarray(out["mark_probabilities"]),
         }
 
-    def pit_ks(self) -> float | None:
-        """Kolmogorov–Smirnov distance of all predictive PITs from uniform, or
-        ``None`` when the cohort has no events."""
-        return self._native.pit_ks()
+    def pit_distance(self) -> dict[str, Any]:
+        """Distance of the predictive PIT distribution from the uniform law
+        over the whole cohort: the largest gap between the Kaplan–Meier
+        estimate of the PIT distribution — event spells as observations,
+        censored tails as uniforms known to exceed their value — and the
+        uniform law. Comparing the event PITs alone to the uniform law is
+        wrong under censoring (they are uniform on ``[0, 1 − S(exit)]``);
+        this estimate has no such floor and equals the ordinary
+        Kolmogorov–Smirnov distance when nothing is censored. Returns
+        ``distance`` (``None`` for no spells), ``spells`` and ``events``.
+        With parameters fitted on the same data it is a summary, not a
+        calibrated test."""
+        return dict(self._native.pit_distance())
+
+    def forecast_history(
+        self,
+        entry: float,
+        exit: float,
+        events: Sequence[tuple[float, Any]],
+        covariates: Mapping[str, Any] | Sequence[Any] | Sequence[tuple[float, Any]],
+        horizons: Sequence[float],
+        *,
+        cutoff: float | None = None,
+        future: Mapping[str, Any] | Sequence[Any] | Sequence[tuple[float, Any]] | None = None,
+    ) -> dict[str, Any]:
+        """Forecast a history that is not a training subject's, from its own
+        records: ``entry`` and ``exit``, ``events`` as ``(time, mark)`` pairs
+        (mark names; an event at or before the entry is prior history), and
+        ``covariates`` as one record holding from the entry or ``(start,
+        record)`` pairs whose first start is at or before the entry. With
+        ``cutoff``, the history is cut to what was known then — events at or
+        before it, covariate segments begun before it, follow-up ending
+        there — so the forecast is the one that could have been made at the
+        cutoff, and records after it cannot change it; ``horizons`` and the
+        forecast window then open at the cutoff. ``future`` is the covariate
+        path over the window as in :meth:`forecast`."""
+        mark_index = {name: i for i, name in enumerate(self.mark_names)}
+        event_time = []
+        event_mark = []
+        for time, mark in events:
+            label = str(mark)
+            if label not in mark_index:
+                raise ValueError(f"unknown mark {label!r}; marks: {self.mark_names}")
+            event_time.append(float(time))
+            event_mark.append(mark_index[label])
+        segments = self._future(covariates, float(entry))
+        if not segments:
+            raise ValueError("forecast_history needs the history's covariate values")
+        table = np.ascontiguousarray(
+            np.asarray([values for _, values in segments], dtype=float).reshape(len(segments), -1)
+        )
+        starts = [start for start, _ in segments]
+        window_start = float(exit) if cutoff is None else float(cutoff)
+        path = self._future(future, window_start)
+        out = self._native.forecast_history(
+            float(entry),
+            float(exit),
+            event_time,
+            event_mark,
+            starts,
+            table,
+            None if cutoff is None else float(cutoff),
+            [float(h) for h in horizons],
+            path,
+        )
+        return self._forecast_dict(out)
 
 
 def fit_event_history(
     subjects: Any,
     events: Any,
     covariates: Any,
-    formula: str,
+    formula: str | Sequence[str],
     *,
     marks: Mapping[str, str] | Sequence[str] | None = None,
     id_column: str = "id",
@@ -451,6 +521,6 @@ def fit_event_history(
         segment_subject,
         segment_start,
         segment_row,
-        str(formula),
+        [str(formula)] if isinstance(formula, str) else [str(f) for f in formula],
     )
     return EventHistoryModel(native)

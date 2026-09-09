@@ -6,9 +6,9 @@
 use crate::ffi::ffi_errors::{detach_py_result, py_value_error};
 use gam::families::custom_family::BlockwiseFitOptions;
 use gam::families::event_history::{
-    CovariateSegment, Event, EventHistoryCohort, EventHistoryFit, ForecastRequest,
-    FutureSegment, MarkKind, PopulationForecastRequest, SubjectHistory,
-    fit_event_history_formula, forecast, kolmogorov_smirnov_uniform, latent_state,
+    CovariateSegment, Event, EventHistoryCohort, EventHistoryFit, ForecastRequest, FutureSegment,
+    HistoryForecastRequest, MarkKind, PopulationForecastRequest, SubjectHistory,
+    fit_event_history_formulas, forecast, forecast_history, latent_state, pit_uniform_distance,
     population_forecast, predictive_pit,
 };
 use ndarray::{Array2, Array3};
@@ -149,7 +149,9 @@ impl PyEventHistoryModel {
         let atoms = self.fit.rank();
         let mut covariance = Array3::<f64>::zeros((state.times.len(), atoms, atoms));
         for (n, matrix) in state.covariance.iter().enumerate() {
-            covariance.index_axis_mut(ndarray::Axis(0), n).assign(matrix);
+            covariance
+                .index_axis_mut(ndarray::Axis(0), n)
+                .assign(matrix);
         }
         let out = PyDict::new(py);
         out.set_item("time", state.times)?;
@@ -279,8 +281,10 @@ impl PyEventHistoryModel {
         forecast_dict(py, result)
     }
 
-    /// Predictive PIT of every event of one training subject: times, marks,
-    /// PIT values and the predictive mark probabilities at each event.
+    /// Predictive PIT of every spell of one training subject: the end
+    /// times, whether each spell ended with an event, the PIT values, the
+    /// marks that fired (one list per spell, empty for the censored tail)
+    /// and the predictive mark probabilities at each spell's end.
     fn pit<'py>(&self, py: Python<'py>, subject: usize) -> PyResult<Bound<'py, PyDict>> {
         let history = self
             .cohort
@@ -302,8 +306,15 @@ impl PyEventHistoryModel {
         }
         let out = PyDict::new(py);
         out.set_item("time", pits.iter().map(|p| p.time).collect::<Vec<_>>())?;
-        out.set_item("mark", pits.iter().map(|p| p.mark).collect::<Vec<_>>())?;
+        out.set_item(
+            "observed",
+            pits.iter().map(|p| p.observed).collect::<Vec<_>>(),
+        )?;
         out.set_item("pit", pits.iter().map(|p| p.pit).collect::<Vec<_>>())?;
+        out.set_item(
+            "marks",
+            pits.iter().map(|p| p.marks.clone()).collect::<Vec<_>>(),
+        )?;
         out.set_item(
             "mark_probabilities",
             PyArray2::from_owned_array(py, probabilities),
@@ -311,29 +322,104 @@ impl PyEventHistoryModel {
         Ok(out)
     }
 
-    /// Kolmogorov–Smirnov distance of the cohort's predictive PITs from
-    /// uniform, or `None` when the cohort has no events.
-    fn pit_ks(&self, py: Python<'_>) -> PyResult<Option<f64>> {
+    /// The Kaplan–Meier distance of the cohort's predictive PITs from the
+    /// uniform law over event and censored spells, with the spell and event
+    /// counts it was read from; the distance is `None` for no spells.
+    fn pit_distance<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
         let fit = Arc::clone(&self.fit);
         let cohort = Arc::clone(&self.cohort);
-        detach_py_result(py, "event-history pit", move || {
+        let (distance, spells, events) = detach_py_result(py, "event-history pit", move || {
             let mut pits = Vec::new();
             for subject in &cohort.subjects {
-                pits.extend(
-                    predictive_pit(&fit, &cohort, subject)
-                        .map_err(|e| e.to_string())?
-                        .into_iter()
-                        .map(|p| p.pit),
-                );
+                pits.extend(predictive_pit(&fit, &cohort, subject).map_err(|e| e.to_string())?);
             }
-            Ok(kolmogorov_smirnov_uniform(&pits))
-        })
+            let events = pits.iter().filter(|p| p.observed).count();
+            Ok((pit_uniform_distance(&pits), pits.len(), events))
+        })?;
+        let out = PyDict::new(py);
+        out.set_item("distance", distance)?;
+        out.set_item("spells", spells)?;
+        out.set_item("events", events)?;
+        Ok(out)
+    }
+
+    /// Forecast a history that is not a training subject's — or a training
+    /// subject's prefix — from its own records: entry and exit, events as
+    /// parallel time and mark-index vectors, covariate segments as parallel
+    /// start times and rows of `covariates` (one row per segment, in the
+    /// cohort's columns and level codes). With `cutoff`, the history is cut
+    /// to what was known at the cutoff before forecasting.
+    #[pyo3(signature = (entry, exit, event_time, event_mark, segment_start, covariates, cutoff, horizons, future))]
+    fn forecast_history<'py>(
+        &self,
+        py: Python<'py>,
+        entry: f64,
+        exit: f64,
+        event_time: Vec<f64>,
+        event_mark: Vec<usize>,
+        segment_start: Vec<f64>,
+        covariates: PyReadonlyArray2<'_, f64>,
+        cutoff: Option<f64>,
+        horizons: Vec<f64>,
+        future: Vec<(f64, Vec<f64>)>,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        if event_time.len() != event_mark.len() {
+            return Err(py_value_error(
+                "event_time and event_mark must have equal length".to_string(),
+            ));
+        }
+        let table: Array2<f64> = covariates.as_array().to_owned();
+        if segment_start.len() != table.nrows() {
+            return Err(py_value_error(format!(
+                "{} segment starts for {} covariate rows",
+                segment_start.len(),
+                table.nrows()
+            )));
+        }
+        let history = SubjectHistory {
+            id: "history".to_string(),
+            entry,
+            exit,
+            events: event_time
+                .iter()
+                .zip(event_mark.iter())
+                .map(|(&time, &mark)| Event { time, mark })
+                .collect(),
+            segments: segment_start
+                .iter()
+                .enumerate()
+                .map(|(row, &start)| CovariateSegment { start, row })
+                .collect(),
+        };
+        let fit = Arc::clone(&self.fit);
+        let cohort = Arc::clone(&self.cohort);
+        let future = future_segments(future);
+        let result = detach_py_result(py, "event-history forecast", move || {
+            let history = match cutoff {
+                Some(cutoff) => history
+                    .prefix(cutoff, &cohort.mark_kinds)
+                    .map_err(|e| e.to_string())?,
+                None => history,
+            };
+            forecast_history(
+                &fit,
+                &cohort,
+                &HistoryForecastRequest {
+                    history: &history,
+                    covariates: table.view(),
+                    horizons: &horizons,
+                    future: &future,
+                },
+            )
+            .map_err(|e| e.to_string())
+        })?;
+        forecast_dict(py, result)
     }
 }
 
 /// Fit an event-history model from flat arrays.
 #[pyfunction]
-#[pyo3(signature = (mark_names, mark_kinds, covariate_names, covariate_levels, covariates, subject_ids, entry, exit, event_subject, event_time, event_mark, segment_subject, segment_start, segment_row, formula))]
+#[pyo3(signature = (mark_names, mark_kinds, covariate_names, covariate_levels, covariates, subject_ids, entry, exit, event_subject, event_time, event_mark, segment_subject, segment_start, segment_row, formulas))]
 fn fit_event_history(
     py: Python<'_>,
     mark_names: Vec<String>,
@@ -350,7 +436,7 @@ fn fit_event_history(
     segment_subject: Vec<usize>,
     segment_start: Vec<f64>,
     segment_row: Vec<usize>,
-    formula: String,
+    formulas: Vec<String>,
 ) -> PyResult<PyEventHistoryModel> {
     let n = subject_ids.len();
     if entry.len() != n || exit.len() != n {
@@ -384,7 +470,11 @@ fn fit_event_history(
             segments: Vec::new(),
         })
         .collect();
-    for ((&s, &t), &m) in event_subject.iter().zip(event_time.iter()).zip(event_mark.iter()) {
+    for ((&s, &t), &m) in event_subject
+        .iter()
+        .zip(event_time.iter())
+        .zip(event_mark.iter())
+    {
         let subject = subjects
             .get_mut(s)
             .ok_or_else(|| py_value_error(format!("event subject index {s} is out of range")))?;
@@ -409,8 +499,9 @@ fn fit_event_history(
         subjects,
     };
     let (fit, cohort) = detach_py_result(py, "event-history fit", move || {
-        let fit = fit_event_history_formula(&mut cohort, &formula, BlockwiseFitOptions::default())
-            .map_err(|e| e.to_string())?;
+        let fit =
+            fit_event_history_formulas(&mut cohort, &formulas, BlockwiseFitOptions::default())
+                .map_err(|e| e.to_string())?;
         Ok((fit, cohort))
     })?;
     Ok(PyEventHistoryModel {

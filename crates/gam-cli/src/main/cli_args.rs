@@ -63,9 +63,17 @@ pub(crate) enum Command {
 
 #[derive(Args, Debug)]
 pub(crate) struct FitEventsArgs {
-    #[arg(long, value_name = "CSV", help = "Subjects table: columns id, entry, exit")]
+    #[arg(
+        long,
+        value_name = "CSV",
+        help = "Subjects table: columns id, entry, exit"
+    )]
     pub(crate) subjects: PathBuf,
-    #[arg(long, value_name = "CSV", help = "Events table: columns id, time, mark")]
+    #[arg(
+        long,
+        value_name = "CSV",
+        help = "Events table: columns id, time, mark"
+    )]
     pub(crate) events: PathBuf,
     #[arg(
         long,
@@ -76,9 +84,15 @@ pub(crate) struct FitEventsArgs {
     #[arg(
         long,
         value_name = "RHS",
-        help = "Right-hand side of the log-intensity formula over the covariate columns and `time`, e.g. \"x + s(time)\""
+        help = "Right-hand side of the log-intensity formula over the covariate columns and `time`, e.g. \"x + s(time)\", used by every mark (each with its own coefficients); or give one --mark-formula per mark"
     )]
-    pub(crate) formula: String,
+    pub(crate) formula: Option<String>,
+    #[arg(
+        long,
+        value_name = "NAME=RHS",
+        help = "The formula of one mark, e.g. \"cad=s(time, by=prs_cad)\"; repeat once per mark to give each mark its own terms (instead of --formula)"
+    )]
+    pub(crate) mark_formula: Vec<String>,
     #[arg(
         long,
         value_delimiter = ',',
@@ -89,10 +103,20 @@ pub(crate) struct FitEventsArgs {
     #[arg(
         long,
         value_delimiter = ',',
-        help = "Forecast horizons as offsets after each subject's exit, comma separated"
+        help = "Forecast horizons as offsets after each subject's exit (or after --forecast-cutoff), comma separated"
     )]
     pub(crate) horizons_after_exit: Vec<f64>,
-    #[arg(long, value_name = "JSON", help = "Write the summary here instead of stdout")]
+    #[arg(
+        long,
+        value_name = "TIME",
+        help = "Forecast every subject from what was known at this time: its history cut at the cutoff (events at or before it, covariate segments begun before it), the horizons counted from it; subjects not under follow-up at the cutoff are skipped"
+    )]
+    pub(crate) forecast_cutoff: Option<f64>,
+    #[arg(
+        long,
+        value_name = "JSON",
+        help = "Write the summary here instead of stdout"
+    )]
     pub(crate) out: Option<PathBuf>,
 }
 

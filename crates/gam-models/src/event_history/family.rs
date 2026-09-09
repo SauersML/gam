@@ -7,7 +7,8 @@
 
 use super::chain::{GaussHermite, product_grid_size};
 use super::cohort::{
-    CohortNodes, EventHistoryCohort, EventHistoryError, MarkKind, design_rows, expand_nodes,
+    CohortNodes, CovariateSegment, EventHistoryCohort, EventHistoryError, MarkKind, SubjectHistory,
+    design_rows, expand_nodes,
 };
 use super::covariance::{
     DirectionEvidence, DirectionProfile, NewAtom, SubjectResiduals, best_new_atom,
@@ -17,6 +18,7 @@ use super::marginal::{
     LOST_POSITIVITY, SubjectInputs, expected_intensities, forward_filter, pairwise_sum,
     subject_marginal,
 };
+use super::preserve::{ReferenceGrid, ReferenceStrata, stratum_normalisers};
 use super::scalar::{Tangent, add_real, recip};
 use crate::custom_family::{
     BlockWorkingSet, BlockwiseFitOptions, CustomFamily, ExactNewtonJointGradientEvaluation,
@@ -142,8 +144,51 @@ pub struct EventHistoryFamily {
     rate_band: (f64, f64),
     gh: Arc<GaussHermite>,
     time_scale: f64,
+    /// The reference population's grid and designs, when the baselines are
+    /// the risk sets' marginal rates.
+    reference: Option<Arc<ReferenceTables>>,
+    /// The held risk-set normaliser `log M_d(t)` at every cohort node, index
+    /// `row * marks + d`. Held as data over a solve and refreshed between
+    /// solves; `None` centres on the stationary prior.
+    log_normaliser: Option<Arc<Vec<f64>>>,
     /// The last joint evaluation, keyed on the exact state it was made at.
     cache: Arc<Mutex<Option<(Vec<f64>, Arc<JointEvaluation>)>>>,
+}
+
+/// What one refresh of the risk-set centring produced: the normaliser to hold
+/// over the next solve, and the reference population's own marginal survival.
+#[derive(Clone, Debug)]
+pub struct RiskSetCentring {
+    /// `log M_d(t)` at every cohort node, index `row * marks + d`.
+    pub log_normaliser: Vec<f64>,
+    /// The log of the reference population's risk-set mass at every node of
+    /// the reference grid, index `(stratum * nodes + node) * masks + mask`.
+    /// For a single first-occurrence mark this is `−∫ e^{η⁰}` exactly, which
+    /// is the identity the centring exists for and the check that the
+    /// baseline is the marginal rate rather than a mixture's intercept.
+    pub log_risk_mass: Vec<f64>,
+    /// How many distinct risk sets the marks define.
+    pub masks: usize,
+    /// The risk set of every mark, indexing the last axis of `log_risk_mass`.
+    pub mask_of_mark: Vec<usize>,
+}
+
+/// The reference population's own grid, its per-stratum design rows, and
+/// where every cohort node sits on that grid.
+pub struct ReferenceTables {
+    pub grid: ReferenceGrid,
+    /// The mark kinds, which decide each mark's risk set.
+    kinds: Vec<MarkKind>,
+    /// Per mark, the design of the reference rows, `strata · nodes × p_d`.
+    designs: Vec<Arc<Array2<f64>>>,
+    /// Per mark, the affine offset of those rows.
+    offsets: Vec<Array1<f64>>,
+    strata: usize,
+    /// Per cohort node: its subject's stratum, the reference node below it and
+    /// the weight of the one above.
+    node_stratum: Vec<usize>,
+    node_lower: Vec<usize>,
+    node_weight: Vec<f64>,
 }
 
 impl EventHistoryFamily {
@@ -203,7 +248,107 @@ impl EventHistoryFamily {
             rate_band,
             gh: Arc::new(GaussHermite::new(gauss_hermite_order)?),
             time_scale,
+            reference: None,
+            log_normaliser: None,
             cache: Arc::new(Mutex::new(None)),
+        })
+    }
+
+    /// The same family with a reference population attached and a normaliser
+    /// held over the solve.
+    pub fn with_reference(
+        mut self,
+        reference: Option<Arc<ReferenceTables>>,
+        log_normaliser: Option<Arc<Vec<f64>>>,
+    ) -> Self {
+        self.reference = reference;
+        self.log_normaliser = log_normaliser;
+        self.cache = Arc::new(Mutex::new(None));
+        self
+    }
+
+    /// Whether the baselines are centred on the risk sets rather than on the
+    /// stationary prior.
+    pub fn risk_set_centred(&self) -> bool {
+        self.log_normaliser.is_some()
+    }
+
+    /// Recompute the risk-set normaliser at a coefficient state: run the
+    /// reference population of every stratum forward and read `log M_d(t)`
+    /// off it, then carry it to the cohort's own nodes.
+    ///
+    /// The normaliser is a population quantity — its cost is the reference
+    /// grid, not the cohort — and it is returned as data, to be held over the
+    /// next solve.
+    pub fn refresh_normaliser(
+        &self,
+        states: &[ParameterBlockState],
+    ) -> Result<RiskSetCentring, String> {
+        let tables = self
+            .reference
+            .as_ref()
+            .ok_or_else(|| "this family has no reference population".to_string())?;
+        let marks = self.marks();
+        let atoms = self.atoms;
+        let nodes = tables.grid.len();
+        let empty = Array1::<f64>::zeros(0);
+        let latent: &Array1<f64> = if self.has_latent_block() {
+            &states[marks].beta
+        } else {
+            &empty
+        };
+        let loadings: Vec<f64> = latent.iter().take(marks * atoms).copied().collect();
+        let rates = self.atom_rates(latent);
+        let mut per_stratum: Vec<Vec<f64>> = Vec::with_capacity(tables.strata);
+        let mut risk_mass: Vec<f64> = Vec::new();
+        let (_, mask_of_mark) = super::preserve::killing_masks(&tables.kinds);
+        let mut masks = 0usize;
+        for s in 0..tables.strata {
+            let mut eta0 = vec![0.0; nodes * marks];
+            for d in 0..marks {
+                let design = &tables.designs[d];
+                let beta = &states[d].beta;
+                for n in 0..nodes {
+                    let row = s * nodes + n;
+                    let mut value = tables.offsets[d][row];
+                    for (j, x) in design.row(row).iter().enumerate() {
+                        value += x * beta[j];
+                    }
+                    eta0[n * marks + d] = value;
+                }
+            }
+            let out = stratum_normalisers(
+                &tables.grid,
+                &eta0,
+                &loadings,
+                &rates,
+                self.time_scale,
+                &self.gh,
+                &tables.kinds,
+                atoms,
+            )
+            .map_err(|error| error.to_string())?;
+            masks = out.masks;
+            risk_mass.extend(out.log_risk_mass);
+            per_stratum.push(out.log_normaliser);
+        }
+        // Carry the population's normaliser to the cohort's own node times.
+        let mut out = vec![0.0; self.nodes.total_nodes * marks];
+        for row in 0..self.nodes.total_nodes {
+            let stratum = tables.node_stratum[row];
+            let lower = tables.node_lower[row];
+            let weight = tables.node_weight[row];
+            for d in 0..marks {
+                let low = per_stratum[stratum][lower * marks + d];
+                let high = per_stratum[stratum][(lower + 1) * marks + d];
+                out[row * marks + d] = low + weight * (high - low);
+            }
+        }
+        Ok(RiskSetCentring {
+            log_normaliser: out,
+            log_risk_mass: risk_mass,
+            masks,
+            mask_of_mark,
         })
     }
 
@@ -399,9 +544,8 @@ impl EventHistoryFamily {
                 ));
             }
         }
-        let component = |dir: Option<&Array1<f64>>, index: usize| -> f64 {
-            dir.map_or(0.0, |d| d[index])
-        };
+        let component =
+            |dir: Option<&Array1<f64>>, index: usize| -> f64 { dir.map_or(0.0, |d| d[index]) };
         let loadings: Vec<S> = (0..marks * atoms)
             .map(|q| {
                 S::seeded(
@@ -447,6 +591,7 @@ impl EventHistoryFamily {
             })
             .collect();
         let designs = &self.designs;
+        let held = self.log_normaliser.as_deref().map(Vec::as_slice);
         let subjects = &self.nodes.subjects;
         let gh = &self.gh;
         let time_scale = self.time_scale;
@@ -480,7 +625,15 @@ impl EventHistoryFamily {
                     .iter()
                     .map(|design| design.slice(s![first..first + n, ..]))
                     .collect();
-                let inputs = SubjectInputs {
+                // Held as data over the solve: no derivative channels, so
+                // `∂η/∂a` is `z` rather than `z − a` (see `subject_marginal`).
+                let normaliser: Option<Vec<S>> = held.map(|values| {
+                    values[first * marks..(first + n) * marks]
+                        .iter()
+                        .map(|v| S::seeded(*v, 0.0, 0.0))
+                        .collect()
+                });
+let inputs = SubjectInputs {
                     nodes: subject,
                     eta0: &eta0,
                     loadings: &loadings,
@@ -489,6 +642,7 @@ impl EventHistoryFamily {
                     gh,
                     continuation_gap: 0.0,
                     designs: derivatives.then_some(views.as_slice()),
+                    log_normaliser: normaliser.as_deref(),
                 };
                 let local = subject_marginal(&inputs, derivatives).map_err(|e| e.to_string())?;
                 if derivatives
@@ -552,7 +706,9 @@ impl EventHistoryFamily {
                 for (b, (slot_b, first_b, _)) in chart_slots.iter().enumerate() {
                     let raw = hessian[slot_a * total + slot_b].clone();
                     hessian[slot_a * total + slot_b] = if a == b {
-                        raw.mul(first_a).mul(first_a).add(&rate_gradients[a].mul(second_a))
+                        raw.mul(first_a)
+                            .mul(first_a)
+                            .add(&rate_gradients[a].mul(second_a))
                     } else {
                         raw.mul(first_a).mul(first_b)
                     };
@@ -615,6 +771,7 @@ impl EventHistoryFamily {
             &empty
         };
         let designs = &self.designs;
+        let held = self.log_normaliser.as_deref().map(Vec::as_slice);
         let gh = &self.gh;
         let time_scale = self.time_scale;
         for start in (0..total).step_by(W) {
@@ -659,6 +816,14 @@ impl EventHistoryFamily {
                             eta0.push(Tangent::seeded(states[d].eta[row], grad));
                         }
                     }
+                    // Held as data over the solve: no derivative channels, so
+                    // `∂η/∂a` is `z` rather than `z − a` (see `subject_marginal`).
+                    let normaliser: Option<Vec<Tangent<W>>> = held.map(|values| {
+                        values[first * marks..(first + n) * marks]
+                            .iter()
+                            .map(|v| Tangent::seeded(*v, [0.0; W]))
+                            .collect()
+                    });
                     let inputs = SubjectInputs {
                         nodes: subject,
                         eta0: &eta0,
@@ -668,6 +833,7 @@ impl EventHistoryFamily {
                         gh,
                         continuation_gap: 0.0,
                         designs: None,
+                        log_normaliser: normaliser.as_deref(),
                     };
                     let local = subject_marginal(&inputs, false).map_err(|e| e.to_string())?;
                     Ok(local.loglik.grad)
@@ -709,10 +875,12 @@ impl EventHistoryFamily {
             &empty
         };
         let designs = &self.designs;
+        let held = self.log_normaliser.as_deref().map(Vec::as_slice);
         let gh = &self.gh;
         let time_scale = self.time_scale;
         let slots = self.free_rate_slots();
-        let seeded = |q: usize| Tangent::<1>::seeded(latent_beta[q], [direction[latent_offset + q]]);
+        let seeded =
+            |q: usize| Tangent::<1>::seeded(latent_beta[q], [direction[latent_offset + q]]);
         let loadings: Vec<Tangent<1>> = (0..marks * atoms).map(seeded).collect();
         let band = self.rate_band;
         let rates: Vec<Tangent<1>> = (0..atoms)
@@ -744,6 +912,14 @@ impl EventHistoryFamily {
                         eta0.push(Tangent::seeded(states[d].eta[row], [slope]));
                     }
                 }
+                // Held as data over the solve: no derivative channels, so
+                // `∂η/∂a` is `z` rather than `z − a` (see `subject_marginal`).
+                let normaliser: Option<Vec<Tangent<1>>> = held.map(|values| {
+                    values[first * marks..(first + n) * marks]
+                        .iter()
+                        .map(|v| Tangent::seeded(*v, [0.0]))
+                        .collect()
+                });
                 let inputs = SubjectInputs {
                     nodes: subject,
                     eta0: &eta0,
@@ -753,6 +929,7 @@ impl EventHistoryFamily {
                     gh,
                     continuation_gap: 0.0,
                     designs: None,
+                    log_normaliser: normaliser.as_deref(),
                 };
                 let local = subject_marginal(&inputs, false).map_err(|e| e.to_string())?;
                 Ok((local.loglik.value, local.loglik.grad[0]))
@@ -785,6 +962,7 @@ impl EventHistoryFamily {
         };
         let loadings: Vec<f64> = latent.iter().take(marks * atoms).copied().collect();
         let rates: Vec<f64> = self.atom_rates(latent);
+        let held = self.log_normaliser.as_deref().map(Vec::as_slice);
         let gh = &self.gh;
         let time_scale = self.time_scale;
         let all_marks = vec![true; marks];
@@ -800,6 +978,8 @@ impl EventHistoryFamily {
                         eta0.push(states[d].eta[first + node]);
                     }
                 }
+                let normaliser: Option<Vec<f64>> =
+                    held.map(|values| values[first * marks..(first + n) * marks].to_vec());
                 let inputs = SubjectInputs {
                     nodes: subject,
                     eta0: &eta0,
@@ -809,6 +989,7 @@ impl EventHistoryFamily {
                     gh,
                     continuation_gap: 0.0,
                     designs: None,
+                    log_normaliser: normaliser.as_deref(),
                 };
                 let pass = forward_filter(&inputs, None, &all_marks).map_err(|e| e.to_string())?;
                 let mut scores = Vec::with_capacity(n * marks);
@@ -819,6 +1000,7 @@ impl EventHistoryFamily {
                         &pass.predicted[node],
                         &eta0[node * marks..(node + 1) * marks],
                         &loadings,
+                        None,
                         marks,
                         atoms,
                     );
@@ -930,7 +1112,9 @@ fn rate_band(nodes: &CohortNodes, time_scale: f64) -> Result<(f64, f64), EventHi
         .rate_band
         .map(|(lower, upper)| (lower * time_scale, upper * time_scale))
         .ok_or_else(|| EventHistoryError::InvalidInput {
-            reason: "the cohort admits no band of latent rates: no subject has two distinct breakpoints".to_string(),
+            reason:
+                "the cohort admits no band of latent rates: no subject has two distinct breakpoints"
+                    .to_string(),
         })
 }
 
@@ -973,10 +1157,7 @@ impl CustomFamily for EventHistoryFamily {
         for b in 0..offsets.len() - 1 {
             let range = offsets[b]..offsets[b + 1];
             let gradient = joint.gradient.slice(s![range.clone()]).to_owned();
-            let hessian = joint
-                .hessian
-                .slice(s![range.clone(), range])
-                .to_owned();
+            let hessian = joint.hessian.slice(s![range.clone(), range]).to_owned();
             blockworking_sets.push(BlockWorkingSet::ExactNewton {
                 gradient,
                 hessian: SymmetricMatrix::Dense(hessian),
@@ -1122,6 +1303,20 @@ pub struct EventHistorySpec {
     /// inference the fit supports: it is a twentieth of the width the data
     /// itself leaves undetermined.
     pub quadrature_tolerance: f64,
+    /// The reference population every mark's baseline is the marginal rate
+    /// of. `None` centres the latent term on the stationary prior, so
+    /// `exp(η⁰)` is the intensity averaged over everybody the cohort started
+    /// with; `Some` centres it on the risk set at every age, so `exp(η⁰)` is
+    /// the incidence among those still at risk (see [`super::preserve`]).
+    pub reference: Option<ReferenceStrata>,
+    /// How many times the held risk-set normaliser is refreshed before the
+    /// fit stops, however far it is still moving.
+    pub normaliser_rounds: usize,
+    /// How far the held risk-set normaliser may still move, in nats, before
+    /// the fit stops refreshing it. The normaliser is held as data over each
+    /// solve — its own score has expectation zero — and refreshed between
+    /// them, so the fit is a fixed point of that alternation.
+    pub normaliser_tolerance: f64,
     pub options: BlockwiseFitOptions,
 }
 
@@ -1132,6 +1327,9 @@ impl EventHistorySpec {
             quadrature_order: super::cohort::quadrature_order_for_degree(3),
             gauss_hermite_order: 9,
             quadrature_tolerance: 5e-2,
+            reference: None,
+            normaliser_rounds: 8,
+            normaliser_tolerance: 1e-4,
             options: BlockwiseFitOptions::default(),
         }
     }
@@ -1230,6 +1428,15 @@ pub struct EventHistoryFit {
     pub rank_path: Vec<RankStep>,
     /// The decrease of the outer LAML criterion each accepted atom brought.
     pub atom_evidence: Vec<f64>,
+    /// How far the held risk-set normaliser moved at each re-centring round,
+    /// in nats. Empty when the baselines are centred on the stationary prior.
+    pub normaliser_rounds: Vec<f64>,
+    /// The log of the reference population's risk-set mass on the reference
+    /// grid — its marginal survival, which the centring makes `−∫ e^{η⁰}`.
+    /// Index `(stratum * nodes + node) * masks + mask`.
+    pub reference_risk_mass: Vec<f64>,
+    /// How many distinct risk sets the marks define.
+    pub reference_masks: usize,
 }
 
 impl EventHistoryFit {
@@ -1412,12 +1619,48 @@ pub fn fit_event_history_formula(
     formula: &str,
     options: BlockwiseFitOptions,
 ) -> Result<EventHistoryFit, EventHistoryError> {
+    fit_event_history_formulas(cohort, std::slice::from_ref(&formula), options)
+}
+
+/// Fit an event-history model from formula right-hand sides: one formula
+/// that every mark uses (with its own coefficients), or one formula per mark
+/// in the cohort's mark order, so that a mark's log-intensity carries only
+/// the terms that belong to it — a disease its own score, not every score
+/// of every other disease.
+pub fn fit_event_history_formulas<F: AsRef<str>>(
+    cohort: &mut EventHistoryCohort,
+    formulas: &[F],
+    options: BlockwiseFitOptions,
+) -> Result<EventHistoryFit, EventHistoryError> {
     cohort.validate()?;
+    let marks = cohort.marks();
+    if formulas.len() != 1 && formulas.len() != marks {
+        return Err(EventHistoryError::InvalidInput {
+            reason: format!(
+                "expected one formula or one per mark ({marks}), got {}",
+                formulas.len()
+            ),
+        });
+    }
     let mut spec = EventHistorySpec::new(Vec::new());
     spec.options = options;
     let rows = design_rows(cohort, spec.quadrature_order)?;
-    let covariates = super::formula::covariate_spec_from_formula(formula, rows.view(), cohort)?;
-    spec.covariates = vec![covariates];
+    let mut covariates = Vec::with_capacity(formulas.len());
+    for (d, formula) in formulas.iter().enumerate() {
+        let terms =
+            super::formula::covariate_spec_from_formula(formula.as_ref(), rows.view(), cohort)
+                .map_err(|error| {
+                    if formulas.len() == 1 {
+                        error
+                    } else {
+                        EventHistoryError::InvalidInput {
+                            reason: format!("mark {:?}: {error}", cohort.mark_names[d]),
+                        }
+                    }
+                })?;
+        covariates.push(terms);
+    }
+    spec.covariates = covariates;
     fit_event_history(cohort, &spec)
 }
 
@@ -1600,6 +1843,120 @@ pub struct RankStep {
     pub converged: bool,
 }
 
+/// The reference population's grid, its per-stratum designs, and where every
+/// cohort node sits on that grid.
+///
+/// The grid is one window spanning every subject's follow-up, expanded by the
+/// same node expansion the fit uses, for one pseudo-subject per stratum
+/// holding that stratum's covariate row. Every stratum therefore shares the
+/// node times, and a stratum's rows sit contiguously in the design, which is
+/// what makes the normaliser one lookup per cohort node.
+fn reference_tables(
+    cohort: &EventHistoryCohort,
+    strata: &ReferenceStrata,
+    frozen_specs: &[TermCollectionSpec],
+    quadrature_order: usize,
+    refinement: usize,
+    nodes: &CohortNodes,
+) -> Result<ReferenceTables, EventHistoryError> {
+    strata.validate(cohort.subjects.len(), cohort.covariates.nrows())?;
+    let marks = cohort.marks();
+    let entry = cohort
+        .subjects
+        .iter()
+        .map(|s| s.entry)
+        .fold(f64::INFINITY, f64::min);
+    let exit = cohort
+        .subjects
+        .iter()
+        .map(|s| s.exit)
+        .fold(f64::NEG_INFINITY, f64::max);
+    if !(entry.is_finite() && exit.is_finite() && exit > entry) {
+        return Err(EventHistoryError::InvalidInput {
+            reason: format!(
+                "the cohort spans no window to run a reference population over: ({entry}, {exit})"
+            ),
+        });
+    }
+    let mut population = EventHistoryCohort {
+        mark_names: cohort.mark_names.clone(),
+        mark_kinds: cohort.mark_kinds.clone(),
+        covariate_names: cohort.covariate_names.clone(),
+        covariate_levels: cohort.covariate_levels.clone(),
+        covariates: cohort.covariates.clone(),
+        subjects: strata
+            .rows
+            .iter()
+            .enumerate()
+            .map(|(s, &row)| SubjectHistory {
+                id: format!("reference-{s}"),
+                entry,
+                exit,
+                events: Vec::new(),
+                segments: vec![CovariateSegment { start: entry, row }],
+            })
+            .collect(),
+    };
+    population.validate()?;
+    let expanded = expand_nodes(&population, quadrature_order, refinement)?;
+    let first = &expanded.subjects[0];
+    let grid = ReferenceGrid {
+        times: first.times.clone(),
+        gaps: first.gaps.clone(),
+        weights: first.weights.clone(),
+    };
+    if expanded
+        .subjects
+        .iter()
+        .any(|subject| subject.times != first.times)
+    {
+        return Err(EventHistoryError::NumericalFailure {
+            reason: "the reference strata were expanded onto different node times".to_string(),
+        });
+    }
+    let mut designs = Vec::with_capacity(marks);
+    let mut offsets = Vec::with_capacity(marks);
+    for d in 0..marks {
+        let design = build_term_collection_design(expanded.node_data.view(), &frozen_specs[d])
+            .map_err(|error| EventHistoryError::Fit {
+                reason: format!("reference design for mark {d}: {error}"),
+            })?;
+        let dense = design
+            .design
+            .try_to_dense_arc("event-history reference design")
+            .map_err(|error| EventHistoryError::Fit {
+                reason: error.to_string(),
+            })?;
+        designs.push(dense);
+        offsets.push(design.affine_offset.clone());
+    }
+    // Every cohort node's place on the reference grid: its subject's stratum,
+    // the reference node below it and the weight of the one above.
+    let total = nodes.total_nodes;
+    let mut node_stratum = vec![0usize; total];
+    let mut node_lower = vec![0usize; total];
+    let mut node_weight = vec![0.0; total];
+    for (i, subject) in nodes.subjects.iter().enumerate() {
+        for (n, &time) in subject.times.iter().enumerate() {
+            let row = subject.first_row + n;
+            let (lower, weight) = grid.locate(time);
+            node_stratum[row] = strata.subject[i];
+            node_lower[row] = lower;
+            node_weight[row] = weight;
+        }
+    }
+    Ok(ReferenceTables {
+        grid,
+        kinds: cohort.mark_kinds.clone(),
+        designs,
+        offsets,
+        strata: strata.rows.len(),
+        node_stratum,
+        node_lower,
+        node_weight,
+    })
+}
+
 /// The certified fit at ONE rank: the Gauss-Hermite order and the time mesh
 /// are refined until no fitted coefficient moves by more than the
 /// certificate's tolerance. `start` warm-starts every block from a fit one
@@ -1611,6 +1968,7 @@ fn fit_at_rank(
     atoms: usize,
     start: Option<&RankStart>,
     pinned: Option<(usize, usize)>,
+    held: Option<Arc<Vec<f64>>>,
 ) -> Result<EventHistoryFit, EventHistoryError> {
     let marks = cohort.marks();
     if spec.covariates.len() != 1 && spec.covariates.len() != marks {
@@ -1681,6 +2039,17 @@ fn fit_at_rank(
             designs.push(design);
             dense.push(dense_design);
         }
+        let reference = match &spec.reference {
+            Some(strata) => Some(Arc::new(reference_tables(
+                cohort,
+                strata,
+                &frozen_specs,
+                spec.quadrature_order,
+                refinement,
+                &nodes,
+            )?)),
+            None => None,
+        };
         if atoms > 0 {
             let start = start.ok_or_else(|| EventHistoryError::InvalidInput {
                 reason: "a latent block needs the start the evidence chose for it".to_string(),
@@ -1701,7 +2070,14 @@ fn fit_at_rank(
             time_scale,
             start.map_or_else(Vec::new, RankStart::held_rates),
         )?;
-        preflight(order, atoms, nodes.max_subject_nodes(), marks, family.total_width())?;
+        let family = family.with_reference(reference, held.clone());
+        preflight(
+            order,
+            atoms,
+            nodes.max_subject_nodes(),
+            marks,
+            family.total_width(),
+        )?;
         Ok(Built {
             nodes,
             family,
@@ -1716,7 +2092,8 @@ fn fit_at_rank(
             block.initial_beta = Some(state.beta.clone());
             let count = block.initial_log_lambdas.len();
             if cursor + count <= fit.log_lambdas.len() {
-                block.initial_log_lambdas = fit.log_lambdas.slice(s![cursor..cursor + count]).to_owned();
+                block.initial_log_lambdas =
+                    fit.log_lambdas.slice(s![cursor..cursor + count]).to_owned();
             }
             cursor += count;
         }
@@ -1803,7 +2180,9 @@ fn fit_at_rank(
                 let admissible = atoms > 0
                     && positivity_raises == 0
                     && GaussHermite::new(next_order).is_ok_and(|rule| {
-                        rule.lebesgue_constant * f64::EPSILON * built.nodes.max_subject_nodes() as f64
+                        rule.lebesgue_constant
+                            * f64::EPSILON
+                            * built.nodes.max_subject_nodes() as f64
                             <= spec.quadrature_tolerance
                     });
                 if message.contains(LOST_POSITIVITY) && admissible {
@@ -1864,17 +2243,18 @@ fn fit_at_rank(
             }
         } else {
             let rule = GaussHermite::new(next_order)?;
-            if rule.lebesgue_constant * f64::EPSILON * max_nodes as f64 > spec.quadrature_tolerance {
+            if rule.lebesgue_constant * f64::EPSILON * max_nodes as f64 > spec.quadrature_tolerance
+            {
                 return Err(EventHistoryError::NumericalFailure {
                     reason: format!(
                         "the Gauss-Hermite certificate cannot be checked at order {next_order}: the Lagrange interpolant's Lebesgue constant {:.3e} amplifies roundoff above the tolerance {} over {max_nodes} nodes; the latent integral at order {order} is uncertified",
-                        rule.lebesgue_constant,
-                        spec.quadrature_tolerance
+                        rule.lebesgue_constant, spec.quadrature_tolerance
                     ),
                 });
             }
             let order_candidate = build(next_order, refinement)?;
-            let mut gauss_hermite = check(&order_candidate, &fit, &current_gradient, &covariance, &sd)?;
+            let mut gauss_hermite =
+                check(&order_candidate, &fit, &current_gradient, &covariance, &sd)?;
             gauss_hermite.candidate = next_order;
             if gauss_hermite.coefficient_shift > spec.quadrature_tolerance {
                 log::info!(
@@ -2010,8 +2390,7 @@ fn latent_report(
                 for e in 0..marks {
                     let qd = latent_offset + d * atoms + k;
                     let qe = latent_offset + e * atoms + k;
-                    share[[d, e]] =
-                        loadings[[d, k]] * loadings[[e, k]] + posterior[[qd, qe]];
+                    share[[d, e]] = loadings[[d, k]] * loadings[[e, k]] + posterior[[qd, qe]];
                 }
             }
             0.5 * (&share + &share.t())
@@ -2039,7 +2418,8 @@ fn latent_report(
         let mut variance = 0.0;
         for p in 0..width {
             for q in 0..width {
-                variance += gradient[p] * posterior[[latent_offset + p, latent_offset + q]] * gradient[q];
+                variance +=
+                    gradient[p] * posterior[[latent_offset + p, latent_offset + q]] * gradient[q];
             }
         }
         eigenvalue_sd[j] = variance.max(0.0).sqrt();
@@ -2119,7 +2499,11 @@ fn assemble(
         .copied()
         .collect();
     let report = latent_report(&built.family, latent, &covariance, &atom_log_lambdas)?;
-    let rates: Vec<f64> = report.log_rates.iter().map(|r| r.exp() / time_scale).collect();
+    let rates: Vec<f64> = report
+        .log_rates
+        .iter()
+        .map(|r| r.exp() / time_scale)
+        .collect();
     let Built {
         nodes,
         family,
@@ -2156,6 +2540,9 @@ fn assemble(
         },
         rank_path: Vec::new(),
         atom_evidence: Vec::new(),
+        normaliser_rounds: Vec::new(),
+        reference_risk_mass: Vec::new(),
+        reference_masks: 0,
     })
 }
 
@@ -2324,9 +2711,13 @@ pub fn fit_event_history(
 ) -> Result<EventHistoryFit, EventHistoryError> {
     cohort.validate()?;
     let marks = cohort.marks();
+    if let Some(strata) = &spec.reference {
+        strata.validate(cohort.subjects.len(), cohort.covariates.nrows())?;
+    }
     let time_scale = cohort.time_scale();
+    let held: Option<Arc<Vec<f64>>> = None;
     let pin = Some((spec.gauss_hermite_order.max(3), 0usize));
-    let mut fit = fit_at_rank(cohort, spec, 0, None, pin)?;
+    let mut fit = fit_at_rank(cohort, spec, 0, None, pin, None)?;
     let mut rank_path: Vec<RankStep> = Vec::new();
     let mut atom_evidence: Vec<f64> = Vec::new();
     loop {
@@ -2335,8 +2726,7 @@ pub fn fit_event_history(
             .family
             .residuals(&fit.fit.block_states)
             .map_err(|reason| EventHistoryError::Fit { reason })?;
-        let Some(mut atom) =
-            best_new_atom(&residuals, marks, time_scale, fit.family.rate_band())?
+        let Some(mut atom) = best_new_atom(&residuals, marks, time_scale, fit.family.rate_band())?
         else {
             break;
         };
@@ -2349,12 +2739,14 @@ pub fn fit_event_history(
             let profile = direction_profile(&fit, &atom, time_scale)?;
             let directions: Vec<DirectionEvidence> =
                 std::iter::once(DirectionEvidence::Exact(profile))
-                    .chain(atom.other_directions.iter().map(|&(eigenvalue, information)| {
-                        DirectionEvidence::Quartic {
-                            eigenvalue,
-                            information,
-                        }
-                    }))
+                    .chain(
+                        atom.other_directions
+                            .iter()
+                            .map(|&(eigenvalue, information)| DirectionEvidence::Quartic {
+                                eigenvalue,
+                                information,
+                            }),
+                    )
                     .collect();
             let refined = empirical_bayes_ridge(&directions);
             log::info!(
@@ -2367,7 +2759,11 @@ pub fn fit_event_history(
                 atom.ridge.mode_scale,
                 refined.mode_scale
             );
-            atom.loading = atom.direction.iter().map(|x| refined.mode_scale * x).collect();
+            atom.loading = atom
+                .direction
+                .iter()
+                .map(|x| refined.mode_scale * x)
+                .collect();
             atom.ridge = refined;
         }
         let mut step = RankStep {
@@ -2405,14 +2801,17 @@ pub fn fit_event_history(
             break;
         }
         let start = RankStart {
-            mark_betas: fit.fit.block_states[..marks].iter().map(|s| s.beta.clone()).collect(),
+            mark_betas: fit.fit.block_states[..marks]
+                .iter()
+                .map(|s| s.beta.clone())
+                .collect(),
             loadings: fit.loadings.iter().copied().collect(),
             log_rates: fit.log_rates.clone(),
             log_lambdas: fit.atom_log_lambdas.clone(),
             rate_held: fit.rate_held.clone(),
             atom: Some(atom.clone()),
         };
-        let mut grown = fit_at_rank(cohort, spec, rank + 1, Some(&start), pin);
+        let mut grown = fit_at_rank(cohort, spec, rank + 1, Some(&start), pin, held.clone());
         let refused = grown.as_ref().err().map(|error| error.to_string());
         if let Some(error) = refused
             && boundary.ridge.accepted
@@ -2439,7 +2838,7 @@ pub fn fit_event_history(
                 atom: Some(boundary),
                 ..start
             };
-            grown = fit_at_rank(cohort, spec, rank + 1, Some(&fallback), pin);
+            grown = fit_at_rank(cohort, spec, rank + 1, Some(&fallback), pin, held.clone());
         }
         match grown {
             Ok(candidate) => {
@@ -2482,15 +2881,75 @@ pub fn fit_event_history(
         // certificate the caller reads belongs to the model the caller gets.
         let rank = fit.rank();
         let start = RankStart::carried(
-            fit.fit.block_states[..marks].iter().map(|s| s.beta.clone()).collect(),
+            fit.fit.block_states[..marks]
+                .iter()
+                .map(|s| s.beta.clone())
+                .collect(),
             fit.loadings.iter().copied().collect(),
             fit.log_rates.clone(),
             fit.atom_log_lambdas.clone(),
             fit.rate_held.clone(),
         );
-        fit = fit_at_rank(cohort, spec, rank, Some(&start), None)?;
+        fit = fit_at_rank(cohort, spec, rank, Some(&start), None, held.clone())?;
+    }
+    // Re-centre on the risk sets. The rank grew under the stationary prior's
+    // centring, where `exp(η⁰)` is the intensity averaged over everybody the
+    // cohort started with; the incidence rate the baselines are meant to be is
+    // the rate among those still at risk, and that normaliser is a function of
+    // the coefficients through the reference population's own evolution
+    // (`super::preserve`). It is held as data over each solve — its own score
+    // has expectation zero, because it is predictable and the compensator
+    // identity makes `E[Σ_events ∂log M] = E[∫ R λ ∂log M]` — and refreshed
+    // between them, so the fit is the fixed point of that alternation. At rank
+    // zero there are no loadings, `log M ≡ 0`, and nothing moves.
+    let mut normaliser_rounds: Vec<f64> = Vec::new();
+    let mut reference_risk_mass: Vec<f64> = Vec::new();
+    let mut reference_masks = 0usize;
+    if spec.reference.is_some() && fit.rank() > 0 {
+        let mut held: Option<Arc<Vec<f64>>> = None;
+        for _ in 0..spec.normaliser_rounds {
+            let centring = fit
+                .family
+                .refresh_normaliser(&fit.fit.block_states)
+                .map_err(|reason| EventHistoryError::Fit { reason })?;
+            let next = centring.log_normaliser;
+            let moved = match held.as_ref() {
+                None => f64::INFINITY,
+                Some(previous) => previous
+                    .iter()
+                    .zip(next.iter())
+                    .map(|(a, b)| (a - b).abs())
+                    .fold(0.0, f64::max),
+            };
+            normaliser_rounds.push(moved);
+            log::info!(
+                "[event-history] risk-set centring round {}: the normaliser moved {moved:.3e} nats",
+                normaliser_rounds.len()
+            );
+            reference_risk_mass = centring.log_risk_mass;
+            reference_masks = centring.masks;
+            if moved <= spec.normaliser_tolerance {
+                break;
+            }
+            held = Some(Arc::new(next));
+            let rank = fit.rank();
+            let start = RankStart::carried(
+                fit.fit.block_states[..marks]
+                    .iter()
+                    .map(|s| s.beta.clone())
+                    .collect(),
+                fit.loadings.iter().copied().collect(),
+                fit.log_rates.clone(),
+                fit.atom_log_lambdas.clone(),
+                fit.rate_held.clone(),
+            );
+            fit = fit_at_rank(cohort, spec, rank, Some(&start), None, held.clone())?;
+        }
     }
     fit.rank_path = rank_path;
     fit.atom_evidence = atom_evidence;
+    fit.normaliser_rounds = normaliser_rounds;
+    fit.reference_risk_mass = reference_risk_mass;
+    fit.reference_masks = reference_masks;
     Ok(fit)
 }

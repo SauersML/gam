@@ -125,6 +125,68 @@ posterior covariance at every node of the subject's mesh, is exposed
 carrying its covariance is what makes a fitted path an uncertain object
 rather than an observed one.
 
+## Which population the baseline is the rate of
+
+`η⁰` is a rate averaged over a population, and the centring says which one.
+By default it is the *stationary prior*: `−½|a_d|²` is `−log E_z[e^{a_d·z}]`
+under `z ~ N(0, I)`, so `exp(η⁰)` is the intensity averaged over everybody the
+cohort started with, and raising the latent heterogeneity does not raise it.
+
+That is not an incidence rate. An incidence rate is a rate among those still
+at risk, and they are not a draw from the prior: they are the ones whose own
+latent state kept them event-free, a selection toward the low activities. Two
+equal halves of a cohort at relative hazards `0.2` and `1.8` — mean one — under
+a baseline hazard of `0.1` survive ten years with probability
+
+```text
+S(10) = ½e^{−0.2} + ½e^{−1.8} ≈ 0.492,   not   e^{−1} ≈ 0.368.
+```
+
+Nothing is wrong with that mixture; what is wrong is reading its baseline as
+the population's continuing hazard.
+
+`EventHistorySpec::reference` centres on the risk set instead. The normaliser
+is
+
+```text
+log M_d(t) = log E[e^{a_d·z(t)} | still at risk for d at t⁻],
+```
+
+so `E[λ_d(t) | at risk at t⁻] = exp(η⁰_d(t))` at every age, and for a single
+first-occurrence mark the reference population's *marginal* survival is exactly
+`exp(−∫ e^{η⁰})` — which the prior's constant shift cannot give, since
+`E[λ] = λ̄` does not make `E[e^{−∫λ}] = e^{−∫λ̄}`.
+
+`M` is a property of the population's own evolution, so it is computed by
+running that population forward through the same filter the fit uses: no
+events, and the killing of the marks that leave the risk set in question (a
+once-only mark's own, plus the terminal ones). The *predicted* density at a
+node — before that node's own factor — is the law among those still at risk
+just before it, which is what makes `M` predictable and what breaks the
+circularity, since a node's normaliser then depends only on the killing
+strictly before it. Marks sharing a risk set share a filter, so the cost is one
+filter per once-only mark plus one, over a reference grid, independent of the
+number of subjects.
+
+The normaliser is held as data over each solve and refreshed between them, and
+the fit reports how far it moved at each round (`normaliser_rounds`). Holding
+it costs no consistency: `log M` is predictable, so the score it contributes,
+`−Σ_events ∂log M + ∫ R λ ∂log M`, has expectation zero by the compensator
+identity, and the estimating equation the held normaliser defines is unbiased.
+Holding it is also what keeps the derivatives exact — under this centring
+`∂η/∂a_dk` is `z_k` rather than `z_k − a_dk`, and the curvature of the shift
+vanishes. The reference population's own risk mass is published beside it
+(`reference_risk_mass`): for one first-occurrence mark it is `−∫ e^{η⁰}`, so it
+is the check that the baseline is the marginal rate and not a mixture's
+intercept.
+
+The reference population is stratified by covariate profile
+(`ReferenceStrata`), and the identity is exact within a stratum. Across strata
+it holds only where the covariates the strata condition on are the covariates
+the selection acts through: one stratum is a claim about one profile, not
+about everybody. At rank zero there are no loadings, `log M ≡ 0`, and the two
+centrings are the same model.
+
 ## Marks and risk sets
 
 Every mark has a kind, declared with the cohort:
@@ -230,9 +292,13 @@ fit.quadrature;                // the refinement certificate
 latent_state(&fit, &cohort, &subject)?;  // E[z(t) | history] with its covariance
 ```
 
-`covariates` holds one term collection shared by every mark, or one per mark.
-Feature columns index the covariate table's columns followed by the node time,
-so a smooth of column `n_cov` is a smooth of time. The bases are built on the
+`covariates` holds one term collection that every mark uses (each with its
+own coefficients), or one per mark, so that a mark's log-intensity carries
+only the terms that belong to it — a disease its own score rather than every
+score of every other disease; `fit_event_history_formulas` takes the
+corresponding formulas, one or one per mark. Feature columns index the
+covariate table's columns followed by the node time, so a smooth of column
+`n_cov` is a smooth of time. The bases are built on the
 outcome-free design rows (entry, exit, covariate changes and an event-free
 quadrature of every follow-up), so a data-adaptive basis never depends on
 where the events fell and the time basis spans every window to its ends.
@@ -268,6 +334,11 @@ model = gamfit.fit_event_history(
     subjects, events, covariates, "x + s(time)",
     marks={"relapse": "recurrent", "death": "terminal"},
 )
+# One formula per mark, in the order of `marks`, gives each mark its own terms.
+model = gamfit.fit_event_history(
+    subjects, events, covariates, ["s(time, by=prs_relapse)", "s(time)"],
+    marks={"relapse": "recurrent", "death": "terminal"},
+)
 model.rank, model.covariance, model.temporal_covariance(5.0)
 model.eigenvalues, model.eigenvalue_sd, model.eigenvectors, model.effective_rank
 model.loadings, model.rates, model.atom_log_lambdas, model.atom_evidence, model.rank_path
@@ -276,7 +347,17 @@ f = model.forecast("subject-17", horizons=[6.0, 7.0])
 f["survival"], f["expected_counts"]
 f = model.forecast("subject-17", horizons=[6.0, 7.0], future=[(5.5, {"x": 1.0}), (6.5, {"x": 0.0})])
 p = model.population_forecast({"x": 0.0}, start=5.0, horizons=[6.0, 7.0])
-model.pit("subject-17"); model.pit_ks()
+# A history that was never in the training cohort, from its own records; with
+# `cutoff` the history is cut to what was known then and the window opens there.
+n = model.forecast_history(
+    entry=0.0, exit=6.0, events=[(2.5, "relapse")], covariates={"x": 0.3},
+    horizons=[7.0, 8.0],
+)
+n = model.forecast_history(
+    entry=0.0, exit=6.0, events=[(2.5, "relapse"), (5.0, "relapse")],
+    covariates=[(0.0, {"x": 0.3}), (4.0, {"x": 0.1})], horizons=[5.0, 6.0], cutoff=4.0,
+)
+model.pit("subject-17"); model.pit_distance()
 ```
 
 `subjects` has columns `id, entry, exit`; `events` has `id, time, mark`;
@@ -289,7 +370,12 @@ mark vocabulary with kinds; without it the observed marks are all recurrent
 is the covariate path over the window: absent, the row in force at exit
 holds; one record holds constant; `(start, record)` pairs change at the given
 times. `population_forecast` is the same window from the stationary prior,
-for a subject with no history.
+for a subject with no history. `forecast_history` forecasts any history from
+its own records — events as `(time, mark)` pairs, covariates as one record
+or `(start, record)` pairs — and never consults the training subjects' rows;
+its `cutoff` cuts the history to what was known at that time, so records
+appended after the cutoff cannot change the forecast made there.
+`pit_distance` is the calibration summary described below.
 
 ## CLI
 
@@ -298,6 +384,11 @@ gam fit-events --subjects s.csv --events e.csv --covariates c.csv \
     --formula "x + s(time)" \
     --marks relapse:recurrent,death:terminal \
     --horizons-after-exit 1,2,5 --out summary.json
+# One formula per mark, and every forecast made from what was known at t = 4:
+gam fit-events --subjects s.csv --events e.csv --covariates c.csv \
+    --mark-formula "relapse=s(time, by=prs)" --mark-formula "death=s(time)" \
+    --marks relapse:recurrent,death:terminal \
+    --forecast-cutoff 4 --horizons-after-exit 1,2,5 --out summary.json
 ```
 
 Covariate columns that do not parse as numbers are categorical. The summary
@@ -306,9 +397,13 @@ of every accepted atom, the latent covariance with its eigenvalues, their
 posterior standard deviations and the effective rank, the loadings, rates
 and loading priors, the coefficients, the refinement certificate, the
 smoothed latent state of every subject when the rank is positive, the
-predictive-PIT Kolmogorov–Smirnov distance over every event, and
-per-subject forecasts at the given offsets after exit, each beside the same
-window run without the subject's history (`without_history`).
+predictive-PIT distance from the uniform law over every spell
+(`pit_distance`, with `pit_spells` and `pit_events`), and per-subject
+forecasts at the given offsets after exit, each beside the same window run
+without the subject's history (`without_history`). With `--forecast-cutoff`
+every subject is forecast from its history cut at the cutoff, the offsets
+count from the cutoff, and subjects not under follow-up at the cutoff are
+skipped (`forecast_skipped`).
 
 ## Forecasting and calibration
 
@@ -338,10 +433,35 @@ given covariate values: the population tier with population values, the
 score-only tier with a subject's own score. No weight between the tiers is
 chosen by hand — each is the same probability model conditioned on more.
 
-The predictive PIT of every event, `predictive_pit`, is the Rosenblatt
-transform of the event times under the model: independent uniforms across
+`forecast_history` forecasts a history that was not in the training cohort
+(a `HistoryForecastRequest` carries the history with its own covariate
+rows, in the cohort's columns and level codes); the training subjects'
+rows are never consulted, so serving needs the fit and not the cohort's
+histories. `SubjectHistory::prefix(cutoff, kinds)` cuts a history to what
+was known at an assessment time — events at or before the cutoff, covariate
+segments begun before it, follow-up ending there — and refuses a cutoff
+past the exit, which would fabricate event-free exposure. A forecast from a
+prefix is the forecast that could have been made at the cutoff: appending
+records after the cutoff leaves it unchanged, which is the property a
+retrospective evaluation of prospective forecasts rests on.
+
+The predictive PIT, `predictive_pit`, is emitted per spell: from one event
+(or the entry) to the next event, or to the exit. The PIT of a spell that
+ends in an event is a uniform under the model, and the sequence of them is
+the Rosenblatt transform of the event times: independent uniforms across
 events and subjects when the model is right (the time-rescaling theorem).
-Each carries the predictive probability of every mark at that event, the
-diagnostic of the mark model. `kolmogorov_smirnov_uniform` summarises the
-PITs and is `None` for a cohort without events; with parameters estimated
-from the same data it is a summary, not a calibrated test.
+The spell that ends at the exit without an event is a censored draw of its
+uniform, known only to exceed the value emitted. That censoring is what
+makes the event PITs alone unfit for a uniformity check: with a constant
+hazard `λ` observed to `c` they are uniform on `[0, 1 − e^{−λc}]`, and their
+Kolmogorov–Smirnov distance from the uniform law on `[0, 1]` tends to
+`e^{−λc}` under a perfectly specified model. `pit_uniform_distance`
+estimates the PIT distribution by Kaplan–Meier over event and censored
+spells and measures its largest gap from the uniform law over the covered
+range; it reduces to the Kolmogorov–Smirnov distance when nothing is
+censored, and is `None` for no spells. It rests on the censoring being
+independent of the spell's uniform given the history — true of an
+administrative exit, not of one that ends because of what the subject was
+about to do. Each event spell carries the predictive probability of every
+mark, the diagnostic of the mark model. With parameters estimated from the
+same data the distance is a summary, not a calibrated test.

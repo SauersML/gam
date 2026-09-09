@@ -134,7 +134,13 @@ impl SubjectHistory {
         self.segments
             .iter()
             .rev()
-            .find(|s| if left_limit { s.start < t } else { s.start <= t })
+            .find(|s| {
+                if left_limit {
+                    s.start < t
+                } else {
+                    s.start <= t
+                }
+            })
             .map(|s| s.row)
             .unwrap_or(self.segments[0].row)
     }
@@ -149,6 +155,60 @@ impl SubjectHistory {
                 !self.events.iter().any(|e| e.mark == d && e.time < t)
             }
         }
+    }
+
+    /// The history as it was known at `cutoff`: the events at or before the
+    /// cutoff, the covariate segments that had started before it, and
+    /// follow-up ending there. Nothing recorded later enters — not a later
+    /// event, not a later covariate change — so a forecast made from the
+    /// prefix is a forecast made at the cutoff, and appending records after
+    /// the cutoff cannot change it.
+    ///
+    /// A cutoff after the subject's exit is refused: the window between the
+    /// exit and the cutoff was not observed, and extending the follow-up to
+    /// it would fabricate event-free exposure. A subject whose follow-up a
+    /// terminal event ended at or before the cutoff is returned whole: its
+    /// history was complete at the cutoff.
+    pub fn prefix(
+        &self,
+        cutoff: f64,
+        kinds: &[MarkKind],
+    ) -> Result<SubjectHistory, EventHistoryError> {
+        if !cutoff.is_finite() || cutoff <= self.entry {
+            return Err(invalid(format!(
+                "subject {:?}: the cutoff {cutoff} must be finite and after the entry {}",
+                self.id, self.entry
+            )));
+        }
+        if self
+            .terminal_event(kinds)
+            .is_some_and(|event| event.time <= cutoff)
+        {
+            return Ok(self.clone());
+        }
+        if cutoff > self.exit {
+            return Err(invalid(format!(
+                "subject {:?}: the cutoff {cutoff} is after the exit {}; the follow-up between them was not observed",
+                self.id, self.exit
+            )));
+        }
+        Ok(SubjectHistory {
+            id: self.id.clone(),
+            entry: self.entry,
+            exit: cutoff,
+            events: self
+                .events
+                .iter()
+                .filter(|event| event.time <= cutoff)
+                .cloned()
+                .collect(),
+            segments: self
+                .segments
+                .iter()
+                .filter(|segment| segment.start < cutoff)
+                .cloned()
+                .collect(),
+        })
     }
 }
 
@@ -201,7 +261,9 @@ impl EventHistoryCohort {
             )));
         }
         if self.subjects.is_empty() {
-            return Err(invalid("an event-history cohort needs at least one subject"));
+            return Err(invalid(
+                "an event-history cohort needs at least one subject",
+            ));
         }
         if self.covariates.iter().any(|v| !v.is_finite()) {
             return Err(invalid("covariate table contains a non-finite value"));
@@ -256,7 +318,9 @@ impl EventHistoryCohort {
             if subject.id.is_empty() {
                 return Err(invalid("subject identifier must be non-empty"));
             }
-            if !subject.entry.is_finite() || !subject.exit.is_finite() || subject.exit <= subject.entry
+            if !subject.entry.is_finite()
+                || !subject.exit.is_finite()
+                || subject.exit <= subject.entry
             {
                 return Err(invalid(format!(
                     "subject {:?} needs finite entry < exit, got {} and {}",
@@ -283,16 +347,18 @@ impl EventHistoryCohort {
                     )));
                 }
             }
-            subject
-                .segments
-                .sort_by(|a, b| a.start.total_cmp(&b.start));
+            subject.segments.sort_by(|a, b| a.start.total_cmp(&b.start));
             if subject.segments[0].start > subject.entry {
                 return Err(invalid(format!(
                     "subject {:?}: the first covariate segment must start at or before entry",
                     subject.id
                 )));
             }
-            if let Some(w) = subject.segments.windows(2).find(|w| w[0].start == w[1].start) {
+            if let Some(w) = subject
+                .segments
+                .windows(2)
+                .find(|w| w[0].start == w[1].start)
+            {
                 return Err(invalid(format!(
                     "subject {:?} has two covariate segments starting at {}",
                     subject.id, w[0].start
@@ -505,7 +571,11 @@ pub fn quadrature_order_for_degree(degree: usize) -> usize {
 /// Mesh cells of one subject: the breakpoints (entry, exit, covariate
 /// changes and, when `with_events`, event times), each interval between
 /// consecutive breakpoints split into `2^refinement` equal cells.
-pub(crate) fn mesh_cells(subject: &SubjectHistory, with_events: bool, refinement: usize) -> Vec<(f64, f64)> {
+pub(crate) fn mesh_cells(
+    subject: &SubjectHistory,
+    with_events: bool,
+    refinement: usize,
+) -> Vec<(f64, f64)> {
     let mut breakpoints = vec![subject.entry, subject.exit];
     breakpoints.extend(
         subject
@@ -532,7 +602,11 @@ pub(crate) fn mesh_cells(subject: &SubjectHistory, with_events: bool, refinement
         let width = (right - left) / parts as f64;
         for p in 0..parts {
             let a = left + width * p as f64;
-            let b = if p + 1 == parts { right } else { left + width * (p + 1) as f64 };
+            let b = if p + 1 == parts {
+                right
+            } else {
+                left + width * (p + 1) as f64
+            };
             cells.push((a, b));
         }
     }
@@ -566,7 +640,9 @@ pub fn expand_nodes(
         return Err(invalid("quadrature order must be positive"));
     }
     if refinement >= usize::BITS as usize - 1 {
-        return Err(invalid(format!("mesh refinement level {refinement} is not representable")));
+        return Err(invalid(format!(
+            "mesh refinement level {refinement} is not representable"
+        )));
     }
     let marks = cohort.marks();
     let kinds = &cohort.mark_kinds;
@@ -689,7 +765,10 @@ pub fn expand_nodes(
 /// the event-free mesh. No event time enters, so a data-adaptive basis
 /// (quantile knots, a data-driven range) is a function of the design alone
 /// and the time basis spans every follow-up window to its ends.
-pub fn design_rows(cohort: &EventHistoryCohort, quadrature_order: usize) -> Result<Array2<f64>, EventHistoryError> {
+pub fn design_rows(
+    cohort: &EventHistoryCohort,
+    quadrature_order: usize,
+) -> Result<Array2<f64>, EventHistoryError> {
     if quadrature_order == 0 {
         return Err(invalid("quadrature order must be positive"));
     }
@@ -703,7 +782,10 @@ pub fn design_rows(cohort: &EventHistoryCohort, quadrature_order: usize) -> Resu
         rows.push(data);
     };
     for subject in &cohort.subjects {
-        push(subject.covariate_row_at(subject.entry, false), subject.entry);
+        push(
+            subject.covariate_row_at(subject.entry, false),
+            subject.entry,
+        );
         push(subject.covariate_row_at(subject.exit, false), subject.exit);
         for segment in &subject.segments[1..] {
             push(segment.row, segment.start);

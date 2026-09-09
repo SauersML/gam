@@ -81,6 +81,10 @@ pub(crate) struct SubjectInputs<'a, S> {
     /// derivatives come out in coefficient space. `None` uses the identity:
     /// the node log-intensities themselves are the parameters.
     pub designs: Option<&'a [ArrayView2<'a, f64>]>,
+    /// The risk-set normaliser `log M_d(t)` at every node, index
+    /// `n * marks + d`. `None` centres on the stationary prior instead, the
+    /// constant `½|a_d|²` (see [`super::preserve`]).
+    pub log_normaliser: Option<&'a [S]>,
 }
 
 /// Marginal log-likelihood and its derivatives in the subject-local parameter
@@ -129,15 +133,35 @@ fn numerical(reason: impl Into<String>) -> EventHistoryError {
 /// `−½ Σ_k a_{dk}²` for one mark's loadings: the shift that makes
 /// `exp(η⁰_d)` the population-average intensity (see the module docs).
 pub(crate) fn marginal_shift<S: JetField>(loadings_d: &[S], like: &S) -> S {
-    loadings_d
-        .iter()
-        .fold(like.constant_like(0.0), |acc, a| acc.sub(&square(a).scale(0.5)))
+    loadings_d.iter().fold(like.constant_like(0.0), |acc, a| {
+        acc.sub(&square(a).scale(0.5))
+    })
 }
 
-/// The log-intensity of mark `d` at latent state `z`, given the mark's
-/// `η⁰` and loadings: `η⁰ − ½|a_d|² + a_d · z`.
-pub(crate) fn log_intensity<S: JetField>(eta0: &S, loadings_d: &[S], z: &[S]) -> S {
-    let mut eta = eta0.add(&marginal_shift(loadings_d, eta0));
+/// The centred baseline of mark `d`: `η⁰ − log M_d`, with `log M_d` the
+/// normaliser that makes `exp(η⁰)` the intensity averaged over the declared
+/// population. Without one the population is the stationary prior and the
+/// normaliser is the constant `½|a_d|²`; with one it is the risk set's, and
+/// it is a function of time (see [`super::preserve`]).
+pub(crate) fn centred_baseline<S: JetField>(
+    eta0: &S,
+    loadings_d: &[S],
+    log_normaliser: Option<&S>,
+) -> S {
+    match log_normaliser {
+        Some(shift) => eta0.sub(shift),
+        None => eta0.add(&marginal_shift(loadings_d, eta0)),
+    }
+}
+
+/// The log-intensity of mark `d` at latent state `z`: `η⁰ − log M_d + a_d · z`.
+pub(crate) fn log_intensity<S: JetField>(
+    eta0: &S,
+    loadings_d: &[S],
+    z: &[S],
+    log_normaliser: Option<&S>,
+) -> S {
+    let mut eta = centred_baseline(eta0, loadings_d, log_normaliser);
     for (a, zk) in loadings_d.iter().zip(z.iter()) {
         eta = eta.add(&a.mul(zk));
     }
@@ -307,11 +331,13 @@ pub fn transition_score_polynomials(kappa: f64) -> (Vec<f64>, Vec<f64>) {
     (t.c, dt.c)
 }
 
-fn weighted_sum<S: JetField>(weights: &[S], values: &[S]) -> S {
+pub(crate) fn weighted_sum<S: JetField>(weights: &[S], values: &[S]) -> S {
     weights
         .iter()
         .zip(values.iter())
-        .fold(weights[0].constant_like(0.0), |acc, (w, v)| acc.add(&w.mul(v)))
+        .fold(weights[0].constant_like(0.0), |acc, (w, v)| {
+            acc.add(&w.mul(v))
+        })
 }
 
 /// Pairwise (tree) sum of `terms`: rounding error grows like `log₂ n`
@@ -346,6 +372,7 @@ pub(crate) fn node_likelihood<S: JetField>(
     counts: &[f64],
     exposures: &[f64],
     compensated: Option<&[bool]>,
+    log_normaliser: Option<&[S]>,
     marks: usize,
     atoms: usize,
 ) -> NodeLikelihood<S> {
@@ -359,7 +386,7 @@ pub(crate) fn node_likelihood<S: JetField>(
             0.0
         };
         let loadings_d = &loadings[d * atoms..(d + 1) * atoms];
-        let base = eta0[d].add(&marginal_shift(loadings_d, &eta0[d]));
+        let base = centred_baseline(&eta0[d], loadings_d, log_normaliser.map(|m| &m[d]));
         for i in 0..size {
             let mut eta = base.clone();
             for (k, a) in loadings_d.iter().enumerate() {
@@ -422,7 +449,7 @@ fn posterior_moments<S: JetField>(
 /// Multiply a predicted density on `grid` by the node factor
 /// `exp(ell − shift)` and normalise; returns the filtered density and the
 /// normaliser `c`.
-fn condition<S: JetField>(
+pub(crate) fn condition<S: JetField>(
     grid: &Grid<S>,
     predicted: &[S],
     ell: &[S],
@@ -501,7 +528,8 @@ pub(crate) fn filter_start<S: JetField>(
             .map(|i| {
                 let mut density = like.constant_like(1.0);
                 for k in 0..atoms {
-                    density = density.mul(&normal_density(grid.coordinate(i, k), &zero[k], &unit[k]));
+                    density =
+                        density.mul(&normal_density(grid.coordinate(i, k), &zero[k], &unit[k]));
                 }
                 density
             })
@@ -520,7 +548,8 @@ pub(crate) fn filter_start<S: JetField>(
     let grid = Grid::new(gh, &means, &unit, like);
     let predicted = prior_density(&grid);
     let likelihood = node_terms(&grid);
-    let (alpha, normaliser) = condition(&grid, &predicted, &likelihood.ell, likelihood.shift, label)?;
+    let (alpha, normaliser) =
+        condition(&grid, &predicted, &likelihood.ell, likelihood.shift, label)?;
     Ok(FilteredNode {
         grid,
         transitions: Vec::new(),
@@ -581,14 +610,25 @@ pub(crate) fn filter_step<S: JetField>(
     let (predictive, rough_predicted) =
         predict(gh, like, previous_grid, previous_alpha, &transitions, label)?;
     let rough = node_terms(&predictive);
-    let (rough_alpha, _) = condition(&predictive, &rough_predicted, &rough.ell, rough.shift, label)?;
+    let (rough_alpha, _) = condition(
+        &predictive,
+        &rough_predicted,
+        &rough.ell,
+        rough.shift,
+        label,
+    )?;
     let (means, _) = posterior_moments(&predictive, &rough_alpha, label)?;
-    let scales: Vec<S> = predictive.axes.iter().map(|axis| axis.sigma.clone()).collect();
+    let scales: Vec<S> = predictive
+        .axes
+        .iter()
+        .map(|axis| axis.sigma.clone())
+        .collect();
     let grid = Grid::new(gh, &means, &scales, like);
     let forward = forward_operators(gh, previous_grid, &grid, &transitions, forward_power);
     let predicted = forward.plain(previous_alpha);
     let likelihood = node_terms(&grid);
-    let (alpha, normaliser) = condition(&grid, &predicted, &likelihood.ell, likelihood.shift, label)?;
+    let (alpha, normaliser) =
+        condition(&grid, &predicted, &likelihood.ell, likelihood.shift, label)?;
     Ok(FilteredNode {
         grid,
         transitions,
@@ -632,21 +672,25 @@ pub(crate) fn subject_marginal<S: JetField>(
     let marks = nodes.counts.ncols();
     let atoms = inputs.rates.len();
     if n_nodes == 0 || marks == 0 {
-        return Err(numerical("subject marginal needs at least one node and one mark"));
+        return Err(numerical(
+            "subject marginal needs at least one node and one mark",
+        ));
     }
     if inputs.eta0.len() != n_nodes * marks || inputs.loadings.len() != marks * atoms {
-        return Err(numerical("subject marginal received mismatched parameter slices"));
+        return Err(numerical(
+            "subject marginal received mismatched parameter slices",
+        ));
     }
     if let Some(designs) = inputs.designs
         && (designs.len() != marks || designs.iter().any(|d| d.nrows() != n_nodes))
     {
-        return Err(numerical("subject marginal received design rows of the wrong shape"));
+        return Err(numerical(
+            "subject marginal received design rows of the wrong shape",
+        ));
     }
     let like = &inputs.eta0[0];
     let zero = like.constant_like(0.0);
-    let counts_rows: Vec<Vec<f64>> = (0..n_nodes)
-        .map(|n| nodes.counts.row(n).to_vec())
-        .collect();
+    let counts_rows: Vec<Vec<f64>> = (0..n_nodes).map(|n| nodes.counts.row(n).to_vec()).collect();
     let exposure_rows: Vec<Vec<f64>> = (0..n_nodes).map(|n| nodes.exposure_row(n)).collect();
 
     // ---- forward filter ------------------------------------------------
@@ -722,12 +766,23 @@ pub(crate) fn subject_marginal<S: JetField>(
     // is `E[∂²L_c | y]`, accumulated as each term is met.
     //
     // The complete-data node term is `y η − w e^η` with
-    // `η = η⁰ − ½|a_d|² + a_d · z`, so with the centred coordinate
-    // `ζ_{dk} = z_k − a_{dk}` (the derivative of `η` in `a_{dk}`):
+    // `η = η⁰ − log M_d + a_d · z`, so with the centred coordinate
+    // `ζ_{dk} = ∂η/∂a_{dk}`:
     //   ∂L/∂η⁰ = s,  ∂L/∂a_{dk} = s ζ_{dk},
     //   ∂²L/∂η⁰² = −c,  ∂²L/∂η⁰∂a_{dk} = −c ζ_{dk},
-    //   ∂²L/∂a_{dk}∂a_{dj} = −c ζ_{dk} ζ_{dj} − s δ_{kj},
+    //   ∂²L/∂a_{dk}∂a_{dj} = −c ζ_{dk} ζ_{dj} + s ∂²η/∂a_{dk}∂a_{dj},
     // with `s = y − w e^η` the score and `c = w e^η` the curvature in `η`.
+    //
+    // Which centring is in force decides both. Under the stationary prior's
+    // `log M_d = ½|a_d|²` the derivative is `ζ_{dk} = z_k − a_{dk}` and the
+    // second derivative is `−δ_{kj}`, the curvature of that shift. Under a
+    // supplied risk-set normaliser (`super::preserve`) the normaliser is held
+    // as data over the solve, so `ζ_{dk} = z_k` and the second derivative
+    // vanishes. Holding it costs no consistency: `log M` is predictable, so
+    // its own score contribution `−Σ_events ∂log M + ∫ R λ ∂log M` has
+    // expectation zero by the compensator identity, and the estimating
+    // equation the held normaliser defines is unbiased.
+    let prior_centred = inputs.log_normaliser.is_none();
     let mut mean = vec![zero.clone(); p_total];
     let mut second = vec![zero.clone(); p_total * p_total];
     let mut curvature = vec![zero.clone(); p_total * p_total];
@@ -738,15 +793,22 @@ pub(crate) fn subject_marginal<S: JetField>(
         let smoothed = &smoothed_all[m];
         let exposures = &exposure_rows[m];
         // `W(i) = w_i s(i)`: the smoothed probability of grid point `i`.
-        let w: Vec<S> = (0..size).map(|i| grid.weights[i].mul(&smoothed[i])).collect();
+        let w: Vec<S> = (0..size)
+            .map(|i| grid.weights[i].mul(&smoothed[i]))
+            .collect();
         let rows: Vec<Vec<(usize, f64)>> = (0..marks).map(|d| design_row(m, d)).collect();
-        // Centred coordinates `ζ_{dk}(i)` per mark and atom.
+        // Centred coordinates `ζ_{dk}(i) = ∂η_d/∂a_{dk}` per mark and atom.
         let centred: Vec<Vec<Vec<S>>> = (0..marks)
             .map(|d| {
                 (0..atoms)
                     .map(|k| {
                         let a = &inputs.loadings[d * atoms + k];
-                        (0..size).map(|i| grid.coordinate(i, k).sub(a)).collect()
+                        (0..size)
+                            .map(|i| {
+                                let z = grid.coordinate(i, k);
+                                if prior_centred { z.sub(a) } else { z.clone() }
+                            })
+                            .collect()
                     })
                     .collect()
             })
@@ -826,24 +888,31 @@ pub(crate) fn subject_marginal<S: JetField>(
             let exposure = exposures[d];
             if exposure != 0.0 {
                 for i in 0..size {
-                    let wc = w[i].mul(&filtered[m].likelihood.expeta[d * size + i]).scale(exposure);
+                    let wc = w[i]
+                        .mul(&filtered[m].likelihood.expeta[d * size + i])
+                        .scale(exposure);
                     ec = ec.add(&wc);
                     for k in 0..atoms {
                         let wcz = wc.mul(&centred[d][k][i]);
                         ecz[k] = ecz[k].add(&wcz);
                         for j in 0..atoms {
-                            eczz[k * atoms + j] = eczz[k * atoms + j].add(&wcz.mul(&centred[d][j][i]));
+                            eczz[k * atoms + j] =
+                                eczz[k * atoms + j].add(&wcz.mul(&centred[d][j][i]));
                         }
                     }
                 }
             }
-            for k in 0..atoms {
-                // −s δ_{kj}: the curvature of the marginal shift.
-                eczz[k * atoms + k] = eczz[k * atoms + k].add(&s_mean);
+            if prior_centred {
+                for k in 0..atoms {
+                    // −s δ_{kj}: the curvature of the stationary prior's
+                    // shift. A held risk-set normaliser has none.
+                    eczz[k * atoms + k] = eczz[k * atoms + k].add(&s_mean);
+                }
             }
             for &(c1, x1) in &rows[d] {
                 for &(c2, x2) in &rows[d] {
-                    curvature[c1 * p_total + c2] = curvature[c1 * p_total + c2].sub(&ec.scale(x1 * x2));
+                    curvature[c1 * p_total + c2] =
+                        curvature[c1 * p_total + c2].sub(&ec.scale(x1 * x2));
                 }
                 for k in 0..atoms {
                     let c2 = layout.a(d, k);
@@ -855,7 +924,8 @@ pub(crate) fn subject_marginal<S: JetField>(
             for k in 0..atoms {
                 for j in 0..atoms {
                     let (c1, c2) = (layout.a(d, k), layout.a(d, j));
-                    curvature[c1 * p_total + c2] = curvature[c1 * p_total + c2].sub(&eczz[k * atoms + j]);
+                    curvature[c1 * p_total + c2] =
+                        curvature[c1 * p_total + c2].sub(&eczz[k * atoms + j]);
                 }
             }
         }
@@ -875,27 +945,32 @@ pub(crate) fn subject_marginal<S: JetField>(
                         let ssz = ss.mul(&centred[d][k][i]);
                         mk0[k] = mk0[k].add(&ssz);
                         for j in 0..atoms {
-                            mkj[k * atoms + j] = mkj[k * atoms + j].add(&ssz.mul(&centred[d2][j][i]));
+                            mkj[k * atoms + j] =
+                                mkj[k * atoms + j].add(&ssz.mul(&centred[d2][j][i]));
                         }
                     }
                 }
                 for &(c1, x1) in &rows[d] {
                     for &(c2, x2) in &rows[d2] {
-                        second[c1 * p_total + c2] = second[c1 * p_total + c2].add(&m00.scale(x1 * x2));
+                        second[c1 * p_total + c2] =
+                            second[c1 * p_total + c2].add(&m00.scale(x1 * x2));
                     }
                     for k in 0..atoms {
                         let c2 = layout.a(d2, k);
-                        second[c1 * p_total + c2] = second[c1 * p_total + c2].add(&m0k[k].scale(x1));
+                        second[c1 * p_total + c2] =
+                            second[c1 * p_total + c2].add(&m0k[k].scale(x1));
                     }
                 }
                 for k in 0..atoms {
                     let c1 = layout.a(d, k);
                     for &(c2, x2) in &rows[d2] {
-                        second[c1 * p_total + c2] = second[c1 * p_total + c2].add(&mk0[k].scale(x2));
+                        second[c1 * p_total + c2] =
+                            second[c1 * p_total + c2].add(&mk0[k].scale(x2));
                     }
                     for j in 0..atoms {
                         let c2 = layout.a(d2, j);
-                        second[c1 * p_total + c2] = second[c1 * p_total + c2].add(&mkj[k * atoms + j]);
+                        second[c1 * p_total + c2] =
+                            second[c1 * p_total + c2].add(&mkj[k * atoms + j]);
                     }
                 }
             }
@@ -1079,7 +1154,8 @@ pub(crate) fn subject_marginal<S: JetField>(
                     }
                     let coefficient = t.get(a, b);
                     let e = unit(k, b as u8);
-                    let zk_power: Vec<S> = (0..size).map(|i| alpha[i].mul(&powers[k][a][i])).collect();
+                    let zk_power: Vec<S> =
+                        (0..size).map(|i| alpha[i].mul(&powers[k][a][i])).collect();
                     let moment = next.forward.apply(&e, &zk_power);
                     for i in 0..next_size {
                         a_tilde[i] = a_tilde[i].add(&coefficient.mul(&moment[i]));
@@ -1176,11 +1252,20 @@ fn filter_nodes<S: JetField>(
             &counts_rows[n],
             &exposure_rows[n],
             None,
+            inputs
+                .log_normaliser
+                .map(|m| &m[n * marks..(n + 1) * marks]),
             marks,
             atoms,
         )
     };
-    filtered.push(filter_start(gh, like, atoms, &|grid| node_terms(grid, 0), "first node")?);
+    filtered.push(filter_start(
+        gh,
+        like,
+        atoms,
+        &|grid| node_terms(grid, 0),
+        "first node",
+    )?);
     for n in 0..n_nodes - 1 {
         let transitions = transitions_across(inputs.rates, nodes.gaps[n], inputs.time_scale)?;
         let step = filter_step(
@@ -1300,6 +1385,7 @@ fn backward_smoother<S: JetField>(
                     &inputs.eta0[(n + 1) * marks + d],
                     &inputs.loadings[d * atoms..(d + 1) * atoms],
                     zeta,
+                    inputs.log_normaliser.map(|m| &m[(n + 1) * marks + d]),
                 );
                 let y = counts_rows[n + 1][d];
                 if y != 0.0 {
@@ -1343,13 +1429,21 @@ fn backward_smoother<S: JetField>(
                 .collect();
             let log_total = log_sum_exp(&terms);
             if with_innovation_moments {
-                let weights: Vec<S> = terms.iter().map(|term| exp(&term.sub(&log_total))).collect();
+                let weights: Vec<S> = terms
+                    .iter()
+                    .map(|term| exp(&term.sub(&log_total)))
+                    .collect();
                 for e in innovation_exponents.iter() {
                     let moment = weights
                         .iter()
                         .enumerate()
-                        .fold(zero.clone(), |acc, (l, w)| acc.add(&w.scale(inner_innovation(l, e))));
-                    moments.get_mut(e).expect("registered exponent").push(moment);
+                        .fold(zero.clone(), |acc, (l, w)| {
+                            acc.add(&w.scale(inner_innovation(l, e)))
+                        });
+                    moments
+                        .get_mut(e)
+                        .expect("registered exponent")
+                        .push(moment);
                 }
             }
             log_beta_n.push(log_total);
@@ -1404,14 +1498,16 @@ pub(crate) fn latent_state_moments(
     let marks = nodes.counts.ncols();
     let atoms = inputs.rates.len();
     if n_nodes == 0 || marks == 0 {
-        return Err(numerical("latent state moments need at least one node and one mark"));
+        return Err(numerical(
+            "latent state moments need at least one node and one mark",
+        ));
     }
     if inputs.eta0.len() != n_nodes * marks || inputs.loadings.len() != marks * atoms {
-        return Err(numerical("latent state moments received mismatched parameter slices"));
+        return Err(numerical(
+            "latent state moments received mismatched parameter slices",
+        ));
     }
-    let counts_rows: Vec<Vec<f64>> = (0..n_nodes)
-        .map(|n| nodes.counts.row(n).to_vec())
-        .collect();
+    let counts_rows: Vec<Vec<f64>> = (0..n_nodes).map(|n| nodes.counts.row(n).to_vec()).collect();
     let exposure_rows: Vec<Vec<f64>> = (0..n_nodes).map(|n| nodes.exposure_row(n)).collect();
     let filtered = filter_nodes(inputs, false, &counts_rows, &exposure_rows)?;
     let smoothed = backward_smoother(inputs, &filtered, &counts_rows, &exposure_rows, false)?;
@@ -1467,7 +1563,9 @@ pub(crate) fn forward_filter<S: JetField>(
     let atoms = inputs.rates.len();
     let gh = inputs.gh;
     if n_nodes == 0 || marks == 0 || compensated.len() != marks {
-        return Err(numerical("forward filter needs nodes, marks and a compensator mask"));
+        return Err(numerical(
+            "forward filter needs nodes, marks and a compensator mask",
+        ));
     }
     let like = &inputs.eta0[0];
     let mut grids: Vec<Grid<S>> = Vec::with_capacity(n_nodes);
@@ -1482,13 +1580,22 @@ pub(crate) fn forward_filter<S: JetField>(
             &nodes.counts.row(n).to_vec(),
             &nodes.exposure_row(n),
             Some(compensated),
+            inputs
+                .log_normaliser
+                .map(|m| &m[n * marks..(n + 1) * marks]),
             marks,
             atoms,
         )
     };
     // Node 0: either the stationary prior or a continuation of a filtered state.
     let first = match initial {
-        None => filter_start(gh, like, atoms, &|grid| node_terms(grid, 0), "forecast first node")?,
+        None => filter_start(
+            gh,
+            like,
+            atoms,
+            &|grid| node_terms(grid, 0),
+            "forecast first node",
+        )?,
         Some((grid, filtered)) => filter_step(
             gh,
             like,
@@ -1535,6 +1642,7 @@ pub(crate) fn expected_intensities<S: JetField>(
     density: &[S],
     eta0: &[S],
     loadings: &[S],
+    log_normaliser: Option<&[S]>,
     marks: usize,
     atoms: usize,
 ) -> Vec<S> {
@@ -1547,7 +1655,7 @@ pub(crate) fn expected_intensities<S: JetField>(
                 for (k, zk) in z.iter_mut().enumerate() {
                     *zk = grid.coordinate(i, k).clone();
                 }
-                let eta = log_intensity(&eta0[d], loadings_d, &z);
+                let eta = log_intensity(&eta0[d], loadings_d, &z, log_normaliser.map(|m| &m[d]));
                 acc = acc.add(&grid.weights[i].mul(&density[i]).mul(&exp(&eta)));
             }
             acc

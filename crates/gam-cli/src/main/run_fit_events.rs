@@ -5,8 +5,8 @@ use crate::cli_args::FitEventsArgs;
 use gam::families::custom_family::BlockwiseFitOptions;
 use gam::families::event_history::{
     CovariateSegment, Event, EventHistoryCohort, ForecastRequest, FutureSegment, MarkKind,
-    PopulationForecastRequest, SubjectHistory, fit_event_history_formula, forecast,
-    kolmogorov_smirnov_uniform, latent_state, population_forecast, predictive_pit,
+    PopulationForecastRequest, SubjectHistory, fit_event_history_formulas, forecast, latent_state,
+    pit_uniform_distance, population_forecast, predictive_pit,
 };
 use ndarray::Array2;
 use serde_json::{Map, Value, json};
@@ -30,7 +30,12 @@ fn read_csv(path: &Path) -> Result<(Vec<String>, Vec<Vec<String>>), String> {
     Ok((headers, rows))
 }
 
-fn column<'a>(headers: &[String], rows: &'a [Vec<String>], name: &str, path: &Path) -> Result<Vec<&'a str>, String> {
+fn column<'a>(
+    headers: &[String],
+    rows: &'a [Vec<String>],
+    name: &str,
+    path: &Path,
+) -> Result<Vec<&'a str>, String> {
     let index = headers
         .iter()
         .position(|h| h == name)
@@ -87,7 +92,10 @@ pub(crate) fn run_fit_events(args: FitEventsArgs) -> Result<(), String> {
     let mut subjects: Vec<SubjectHistory> = Vec::with_capacity(ids.len());
     for (i, ((id, entry), exit)) in ids.iter().zip(entries.iter()).zip(exits.iter()).enumerate() {
         if index.insert((*id).to_string(), i).is_some() {
-            return Err(format!("duplicate subject id {id:?} in {}", args.subjects.display()));
+            return Err(format!(
+                "duplicate subject id {id:?} in {}",
+                args.subjects.display()
+            ));
         }
         subjects.push(SubjectHistory {
             id: (*id).to_string(),
@@ -127,14 +135,17 @@ pub(crate) fn run_fit_events(args: FitEventsArgs) -> Result<(), String> {
         }
         (names, kinds)
     };
-    for ((id, time), mark) in event_ids.iter().zip(event_times.iter()).zip(event_marks.iter()) {
+    for ((id, time), mark) in event_ids
+        .iter()
+        .zip(event_times.iter())
+        .zip(event_marks.iter())
+    {
         let subject = *index
             .get(*id)
             .ok_or_else(|| format!("event subject {id:?} is not in the subjects table"))?;
-        let mark_index = mark_names
-            .iter()
-            .position(|m| m == mark)
-            .ok_or_else(|| format!("event mark {mark:?} is not in the mark vocabulary {mark_names:?}"))?;
+        let mark_index = mark_names.iter().position(|m| m == mark).ok_or_else(|| {
+            format!("event mark {mark:?} is not in the mark vocabulary {mark_names:?}")
+        })?;
         subjects[subject].events.push(Event {
             time: parse_f64(time, "event time")?,
             mark: mark_index,
@@ -175,12 +186,53 @@ pub(crate) fn run_fit_events(args: FitEventsArgs) -> Result<(), String> {
         covariates: table,
         subjects,
     };
-    let fit = fit_event_history_formula(
-        &mut cohort,
-        &args.formula,
-        BlockwiseFitOptions::default(),
-    )
-    .map_err(|e| e.to_string())?;
+    // One formula for every mark, or one per mark by name.
+    let formulas: Vec<String> = match (&args.formula, args.mark_formula.is_empty()) {
+        (Some(formula), true) => vec![formula.clone()],
+        (None, false) => {
+            let mut per_mark: Vec<Option<String>> = vec![None; mark_names.len()];
+            for entry in &args.mark_formula {
+                let (name, rhs) = entry
+                    .split_once('=')
+                    .ok_or_else(|| format!("--mark-formula entry {entry:?} is not NAME=RHS"))?;
+                let index = mark_names
+                    .iter()
+                    .position(|m| m == name.trim())
+                    .ok_or_else(|| {
+                        format!(
+                            "--mark-formula names mark {:?}, not in the vocabulary {mark_names:?}",
+                            name.trim()
+                        )
+                    })?;
+                if per_mark[index].replace(rhs.trim().to_string()).is_some() {
+                    return Err(format!(
+                        "--mark-formula gives mark {:?} two formulas",
+                        name.trim()
+                    ));
+                }
+            }
+            per_mark
+                .into_iter()
+                .zip(mark_names.iter())
+                .map(|(formula, name)| {
+                    formula.ok_or_else(|| format!("--mark-formula gives mark {name:?} no formula"))
+                })
+                .collect::<Result<Vec<_>, _>>()?
+        }
+        (Some(_), false) => {
+            return Err(
+                "give either --formula or one --mark-formula per mark, not both".to_string(),
+            );
+        }
+        (None, true) => {
+            return Err(
+                "a log-intensity formula is needed: --formula, or one --mark-formula per mark"
+                    .to_string(),
+            );
+        }
+    };
+    let fit = fit_event_history_formulas(&mut cohort, &formulas, BlockwiseFitOptions::default())
+        .map_err(|e| e.to_string())?;
 
     let mut summary = Map::new();
     summary.insert("marks".to_string(), json!(mark_names));
@@ -190,37 +242,48 @@ pub(crate) fn run_fit_events(args: FitEventsArgs) -> Result<(), String> {
     );
     summary.insert("covariates".to_string(), json!(covariate_names));
     summary.insert("covariate_levels".to_string(), json!(covariate_levels));
-    summary.insert("formula".to_string(), json!(args.formula));
+    summary.insert(
+        "formula".to_string(),
+        if formulas.len() == 1 {
+            json!(formulas[0])
+        } else {
+            json!(formulas)
+        },
+    );
     summary.insert("rank".to_string(), json!(fit.rank()));
     summary.insert("atom_evidence".to_string(), json!(fit.atom_evidence));
     summary.insert(
         "rank_path".to_string(),
-        json!(fit
-            .rank_path
-            .iter()
-            .map(|step| {
-                json!({
-                    "rank": step.rank,
-                    "score_eigenvalue": step.score_eigenvalue,
-                    "standardised_gain": step.standardised_gain,
-                    "proposed_log_rate": step.proposed_log_rate,
-                    "at_resolution_limit": step.at_resolution_limit,
-                    "rate_held": step.rate_held,
-                    "ridge_log_lambda": step.ridge_log_lambda,
-                    "evidence_gain": step.evidence_gain,
-                    "log_likelihood_gain": step.log_likelihood_gain,
-                    "accepted": step.accepted,
-                    "converged": step.converged,
+        json!(
+            fit.rank_path
+                .iter()
+                .map(|step| {
+                    json!({
+                        "rank": step.rank,
+                        "score_eigenvalue": step.score_eigenvalue,
+                        "standardised_gain": step.standardised_gain,
+                        "proposed_log_rate": step.proposed_log_rate,
+                        "at_resolution_limit": step.at_resolution_limit,
+                        "rate_held": step.rate_held,
+                        "ridge_log_lambda": step.ridge_log_lambda,
+                        "evidence_gain": step.evidence_gain,
+                        "log_likelihood_gain": step.log_likelihood_gain,
+                        "accepted": step.accepted,
+                        "converged": step.converged,
+                    })
                 })
-            })
-            .collect::<Vec<_>>()),
+                .collect::<Vec<_>>()
+        ),
     );
     let rows = |matrix: &ndarray::Array2<f64>| -> Vec<Vec<f64>> {
         matrix.rows().into_iter().map(|r| r.to_vec()).collect()
     };
     summary.insert("covariance".to_string(), json!(rows(&fit.covariance)));
     summary.insert("eigenvalues".to_string(), json!(fit.eigenvalues.to_vec()));
-    summary.insert("eigenvalue_sd".to_string(), json!(fit.eigenvalue_sd.to_vec()));
+    summary.insert(
+        "eigenvalue_sd".to_string(),
+        json!(fit.eigenvalue_sd.to_vec()),
+    );
     summary.insert("eigenvectors".to_string(), json!(rows(&fit.eigenvectors)));
     summary.insert("effective_rank".to_string(), json!(fit.effective_rank));
     if fit.rank() > 0 {
@@ -238,7 +301,10 @@ pub(crate) fn run_fit_events(args: FitEventsArgs) -> Result<(), String> {
     }
     summary.insert("log_likelihood".to_string(), json!(fit.fit.log_likelihood));
     summary.insert("reml_score".to_string(), json!(fit.fit.reml_score()));
-    summary.insert("outer_iterations".to_string(), json!(fit.fit.outer_iterations));
+    summary.insert(
+        "outer_iterations".to_string(),
+        json!(fit.fit.outer_iterations),
+    );
     summary.insert("time_scale".to_string(), json!(fit.time_scale));
     summary.insert("loadings".to_string(), json!(rows(&fit.loadings)));
     summary.insert("rates".to_string(), json!(fit.rates));
@@ -246,9 +312,11 @@ pub(crate) fn run_fit_events(args: FitEventsArgs) -> Result<(), String> {
     summary.insert("atom_log_lambdas".to_string(), json!(fit.atom_log_lambdas));
     summary.insert(
         "coefficients".to_string(),
-        json!((0..fit.marks())
-            .map(|d| fit.mark_coefficients(d).to_vec())
-            .collect::<Vec<_>>()),
+        json!(
+            (0..fit.marks())
+                .map(|d| fit.mark_coefficients(d).to_vec())
+                .collect::<Vec<_>>()
+        ),
     );
     let q = &fit.quadrature;
     summary.insert(
@@ -271,22 +339,41 @@ pub(crate) fn run_fit_events(args: FitEventsArgs) -> Result<(), String> {
     );
     let mut pits = Vec::new();
     for subject in &cohort.subjects {
-        pits.extend(
-            predictive_pit(&fit, &cohort, subject)
-                .map_err(|e| e.to_string())?
-                .into_iter()
-                .map(|p| p.pit),
-        );
+        pits.extend(predictive_pit(&fit, &cohort, subject).map_err(|e| e.to_string())?);
     }
-    summary.insert("pit_events".to_string(), json!(pits.len()));
+    summary.insert("pit_spells".to_string(), json!(pits.len()));
     summary.insert(
-        "pit_ks".to_string(),
-        json!(kolmogorov_smirnov_uniform(&pits)),
+        "pit_events".to_string(),
+        json!(pits.iter().filter(|p| p.observed).count()),
+    );
+    summary.insert(
+        "pit_distance".to_string(),
+        json!(pit_uniform_distance(&pits)),
     );
     if !args.horizons_after_exit.is_empty() {
         let mut forecasts = Vec::with_capacity(cohort.subjects.len());
+        let mut skipped = 0usize;
         for subject in &cohort.subjects {
-            let horizons: Vec<f64> = args.horizons_after_exit.iter().map(|h| subject.exit + h).collect();
+            // With a cutoff, the history is what was known then; a subject
+            // not under follow-up at the cutoff has no forecast to make.
+            let known: SubjectHistory = match args.forecast_cutoff {
+                Some(cutoff) => {
+                    if cutoff <= subject.entry || cutoff > subject.exit {
+                        skipped += 1;
+                        continue;
+                    }
+                    subject
+                        .prefix(cutoff, &mark_kinds)
+                        .map_err(|e| e.to_string())?
+                }
+                None => subject.clone(),
+            };
+            let subject = &known;
+            let horizons: Vec<f64> = args
+                .horizons_after_exit
+                .iter()
+                .map(|h| subject.exit + h)
+                .collect();
             let f = forecast(
                 &fit,
                 &cohort,
@@ -322,6 +409,10 @@ pub(crate) fn run_fit_events(args: FitEventsArgs) -> Result<(), String> {
             forecasts.push(entry);
         }
         summary.insert("forecasts".to_string(), Value::Array(forecasts));
+        if let Some(cutoff) = args.forecast_cutoff {
+            summary.insert("forecast_cutoff".to_string(), json!(cutoff));
+            summary.insert("forecast_skipped".to_string(), json!(skipped));
+        }
     }
     let text = serde_json::to_string_pretty(&Value::Object(summary))
         .map_err(|error| format!("serialising the summary: {error}"))?;

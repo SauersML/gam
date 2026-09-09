@@ -28,18 +28,36 @@
 //! it. No weight between the tiers is chosen by hand — each is the same
 //! probability model conditioned on more.
 //!
-//! The predictive PIT of an event is `1 − P(no event of any mark in
-//! (t_prev, t_event] | history)`, which the filter yields as the product of
-//! the normalisers of the zero-count nodes between consecutive events. Under
-//! the model, the sequence of PITs of a subject is a Rosenblatt transform of
-//! its event times: independent uniforms, across events and across
-//! subjects (the time-rescaling theorem). The predictive mark probabilities
-//! at each event complete the diagnostic for marked processes.
+//! The predictive PIT of a spell — the follow-up from one event (or the
+//! entry) to the next event or to the exit — is `1 − P(no event of any mark
+//! in the spell | history)`, which the filter yields as the product of the
+//! normalisers of the zero-count nodes in the spell. Under the model, the
+//! PIT of a spell that ends in an event is a uniform, and the sequence over
+//! a subject's spells is a Rosenblatt transform of its event times:
+//! independent uniforms across events and across subjects (the
+//! time-rescaling theorem). A spell that ends at the exit without an event
+//! is a censored draw of that uniform: all the model says is that its PIT
+//! exceeds the value emitted. Dropping those spells and comparing the event
+//! PITs alone to the uniform law is wrong under censoring — with a constant
+//! hazard `λ` observed to `c`, the event PITs are uniform on `[0, 1 − e^{−λc}]`,
+//! and their distance from the uniform law on `[0, 1]` tends to `e^{−λc}`
+//! under a perfectly specified model. [`pit_uniform_distance`] therefore
+//! estimates the PIT distribution by Kaplan–Meier over event and censored
+//! spells alike and measures its distance from the uniform law, which
+//! reduces to the ordinary Kolmogorov–Smirnov distance when nothing is
+//! censored. The predictive mark probabilities at each event complete the
+//! diagnostic for marked processes.
+//!
+//! A forecast can be made for any history, not only a training subject's:
+//! [`forecast_history`] takes a history with its own covariate rows, and
+//! [`SubjectHistory::prefix`] cuts a history at an assessment time, so that
+//! a forecast made at a cutoff sees exactly what was known then and cannot
+//! change when later records are appended.
 
 use super::chain::Grid;
 use super::cohort::{
-    CohortNodes, CovariateSegment, EventHistoryCohort, EventHistoryError, MarkKind,
-    SubjectHistory, SubjectNodes, cell_rule, expand_nodes, mesh_cells,
+    CohortNodes, CovariateSegment, EventHistoryCohort, EventHistoryError, MarkKind, SubjectHistory,
+    SubjectNodes, cell_rule, expand_nodes, mesh_cells,
 };
 use super::family::EventHistoryFit;
 use super::marginal::{
@@ -84,6 +102,18 @@ pub struct PopulationForecastRequest<'a> {
     pub future: &'a [FutureSegment],
 }
 
+/// A forecast request for a history that is not a training subject's: the
+/// history's covariate segments index `covariates`, the subject's own rows
+/// in the cohort's columns (categorical covariates as level codes).
+pub struct HistoryForecastRequest<'a> {
+    pub history: &'a SubjectHistory,
+    pub covariates: ArrayView2<'a, f64>,
+    /// Absolute horizon times, strictly increasing and after the exit time.
+    pub horizons: &'a [f64],
+    /// The covariate path over the forecast window, as in [`ForecastRequest`].
+    pub future: &'a [FutureSegment],
+}
+
 /// A forecast: per horizon, the probability that no terminal event has
 /// fired, and the expected count of every mark (its cumulative incidence
 /// when terminal, its first-occurrence probability when once-only).
@@ -94,19 +124,30 @@ pub struct Forecast {
     pub expected_counts: Array2<f64>,
 }
 
-/// The predictive PIT of one observed event and the predictive probability
-/// of each mark given that an event happened then.
+/// The predictive PIT of one spell of a subject's follow-up: from the
+/// previous event (or the entry) to the next event, or to the exit when no
+/// further event was observed.
 #[derive(Clone, Debug)]
-pub struct EventPit {
+pub struct SpellPit {
+    /// When the spell ended: the event time, or the exit of a censored spell.
     pub time: f64,
-    pub mark: usize,
+    /// Whether the spell ended with an event. A censored spell's `pit` is a
+    /// lower bound of the uniform the model assigns to it, not a draw.
+    pub observed: bool,
+    /// `1 − P(no event of any mark in the spell | history)`.
     pub pit: f64,
+    /// The marks that fired at the spell's end, one entry per event (empty
+    /// for a censored spell).
+    pub marks: Vec<usize>,
+    /// The predictive probability of each mark given that an event happened
+    /// at the spell's end.
     pub mark_probabilities: Vec<f64>,
 }
 
 fn single_subject_nodes(
     fit: &EventHistoryFit,
     cohort: &EventHistoryCohort,
+    table: ArrayView2<'_, f64>,
     history: &SubjectHistory,
 ) -> Result<CohortNodes, EventHistoryError> {
     let mut one = EventHistoryCohort {
@@ -114,7 +155,7 @@ fn single_subject_nodes(
         mark_kinds: cohort.mark_kinds.clone(),
         covariate_names: cohort.covariate_names.clone(),
         covariate_levels: cohort.covariate_levels.clone(),
-        covariates: cohort.covariates.clone(),
+        covariates: table.to_owned(),
         subjects: vec![history.clone()],
     };
     one.validate()?;
@@ -124,7 +165,10 @@ fn single_subject_nodes(
 /// Population node log-intensities `η⁰` (design × coefficients + offset)
 /// for every mark on a row matrix (covariate columns then time), index
 /// `row * marks + d`.
-fn node_eta0(fit: &EventHistoryFit, rows: ArrayView2<'_, f64>) -> Result<Vec<f64>, EventHistoryError> {
+fn node_eta0(
+    fit: &EventHistoryFit,
+    rows: ArrayView2<'_, f64>,
+) -> Result<Vec<f64>, EventHistoryError> {
     let marks = fit.marks();
     let total = rows.nrows();
     let mut eta0 = vec![0.0; total * marks];
@@ -184,7 +228,7 @@ pub fn latent_state(
 ) -> Result<SmoothedLatentState, EventHistoryError> {
     let atoms = fit.rank();
     let (loadings, rates) = latent_parameters(fit);
-    let nodes = single_subject_nodes(fit, cohort, history)?;
+    let nodes = single_subject_nodes(fit, cohort, cohort.covariates.view(), history)?;
     let eta0 = node_eta0(fit, nodes.node_data.view())?;
     let subject = &nodes.subjects[0];
     let moments = latent_state_moments(&SubjectInputs {
@@ -196,6 +240,7 @@ pub fn latent_state(
         gh: fit.family.gauss_hermite(),
         continuation_gap: 0.0,
         designs: None,
+        log_normaliser: None,
     })?;
     let mut mean = Array2::<f64>::zeros((subject.len(), atoms));
     let mut covariance = Vec::with_capacity(subject.len());
@@ -240,16 +285,18 @@ struct LatentState {
     time: f64,
 }
 
-/// The filtered latent state after a subject's observed history.
+/// The filtered latent state after a subject's observed history, whose
+/// covariate segments index `table`.
 fn observed_state(
     fit: &EventHistoryFit,
     cohort: &EventHistoryCohort,
+    table: ArrayView2<'_, f64>,
     history: &SubjectHistory,
     loadings: &[f64],
     rates: &[f64],
 ) -> Result<LatentState, EventHistoryError> {
     let marks = fit.marks();
-    let observed = single_subject_nodes(fit, cohort, history)?;
+    let observed = single_subject_nodes(fit, cohort, table, history)?;
     let eta0 = node_eta0(fit, observed.node_data.view())?;
     let all_marks = vec![true; marks];
     let mut pass = forward_filter(
@@ -262,6 +309,7 @@ fn observed_state(
             gh: fit.family.gauss_hermite(),
             continuation_gap: 0.0,
             designs: None,
+            log_normaliser: None,
         },
         None,
         &all_marks,
@@ -343,11 +391,14 @@ fn validate_future(
         for (j, value) in segment.covariates.iter().enumerate() {
             if !value.is_finite() {
                 return Err(EventHistoryError::InvalidInput {
-                    reason: format!("future segment {i} has a non-finite covariate value at column {j}"),
+                    reason: format!(
+                        "future segment {i} has a non-finite covariate value at column {j}"
+                    ),
                 });
             }
             let levels = &cohort.covariate_levels[j];
-            if !levels.is_empty() && (value.fract() != 0.0 || *value < 0.0 || *value >= levels.len() as f64)
+            if !levels.is_empty()
+                && (value.fract() != 0.0 || *value < 0.0 || *value >= levels.len() as f64)
             {
                 return Err(EventHistoryError::InvalidInput {
                     reason: format!(
@@ -442,10 +493,8 @@ fn run_window(window: Window<'_>) -> Result<Forecast, EventHistoryError> {
         let mut inner_cell = Vec::with_capacity(q);
         for &(t_j, _, _) in &outer_nodes {
             let rule: Vec<(f64, f64)> = cell_rule(left, t_j, &gl_nodes, &gl_weights).collect();
-            let chain: Vec<(f64, f64, usize)> = rule
-                .iter()
-                .map(|&(s, v)| (s, v, push_point(s)))
-                .collect();
+            let chain: Vec<(f64, f64, usize)> =
+                rule.iter().map(|&(s, v)| (s, v, push_point(s))).collect();
             inner_cell.push(chain);
         }
         outer.push(outer_nodes);
@@ -486,6 +535,7 @@ fn run_window(window: Window<'_>) -> Result<Forecast, EventHistoryError> {
                     gh,
                     continuation_gap: state.as_ref().map_or(0.0, |s| times[0] - s.time),
                     designs: None,
+                    log_normaliser: None,
                 },
                 state.as_ref().map(|s| (&s.grid, s.alpha.as_slice())),
                 &exposed,
@@ -511,12 +561,19 @@ fn run_window(window: Window<'_>) -> Result<Forecast, EventHistoryError> {
                     &pass.predicted[last],
                     eta_at(point_j),
                     &loadings,
+                    None,
                     marks,
                     atoms,
                 );
                 sub_density.push(
                     (0..marks)
-                        .map(|d| if at_risk[d] { log_s_j.exp() * intensities[d] } else { 0.0 })
+                        .map(|d| {
+                            if at_risk[d] {
+                                log_s_j.exp() * intensities[d]
+                            } else {
+                                0.0
+                            }
+                        })
                         .collect(),
                 );
             }
@@ -587,21 +644,19 @@ fn run_window(window: Window<'_>) -> Result<Forecast, EventHistoryError> {
     })
 }
 
-/// The covariate table extended by the future segments' rows, and the
-/// segments as rows of that table starting at `window_start` (with
+/// The covariate table `base` extended by the future segments' rows, and
+/// the segments as rows of that table starting at `window_start` (with
 /// `initial_row` in force before the first future segment, if any).
 fn future_table(
-    cohort: &EventHistoryCohort,
+    base: ArrayView2<'_, f64>,
     future: &[FutureSegment],
     window_start: f64,
     initial_row: Option<usize>,
 ) -> Result<(Array2<f64>, Vec<CovariateSegment>), EventHistoryError> {
-    let n_cov = cohort.covariates.ncols();
-    let base_rows = cohort.covariates.nrows();
+    let n_cov = base.ncols();
+    let base_rows = base.nrows();
     let mut table = Array2::<f64>::zeros((base_rows + future.len(), n_cov));
-    table
-        .slice_mut(ndarray::s![..base_rows, ..])
-        .assign(&cohort.covariates);
+    table.slice_mut(ndarray::s![..base_rows, ..]).assign(&base);
     let mut segments: Vec<CovariateSegment> = Vec::new();
     if future.first().is_none_or(|s| s.start > window_start) {
         let row = initial_row.ok_or_else(|| EventHistoryError::InvalidInput {
@@ -635,37 +690,84 @@ fn future_table(
     Ok((table, segments))
 }
 
-/// Forecast one subject beyond its observed exit.
+/// Forecast one training subject beyond its observed exit.
 pub fn forecast(
     fit: &EventHistoryFit,
     cohort: &EventHistoryCohort,
     request: &ForecastRequest<'_>,
 ) -> Result<Forecast, EventHistoryError> {
+    forecast_on_table(
+        fit,
+        cohort,
+        cohort.covariates.view(),
+        request.history,
+        request.horizons,
+        request.future,
+    )
+}
+
+/// Forecast any history beyond its exit: a subject that was not in the
+/// training cohort, or a training subject's [`SubjectHistory::prefix`] at an
+/// assessment time. The history's covariate segments index the request's
+/// own covariate rows, which must be laid out in the cohort's columns and
+/// level codes. The training subjects' rows are never consulted, so a
+/// serving artifact needs the fit, not the cohort's histories.
+pub fn forecast_history(
+    fit: &EventHistoryFit,
+    cohort: &EventHistoryCohort,
+    request: &HistoryForecastRequest<'_>,
+) -> Result<Forecast, EventHistoryError> {
+    if request.covariates.ncols() != cohort.covariates.ncols() {
+        return Err(EventHistoryError::InvalidInput {
+            reason: format!(
+                "the history's covariate rows have {} columns, the fit's cohort {}",
+                request.covariates.ncols(),
+                cohort.covariates.ncols()
+            ),
+        });
+    }
+    forecast_on_table(
+        fit,
+        cohort,
+        request.covariates,
+        request.history,
+        request.horizons,
+        request.future,
+    )
+}
+
+fn forecast_on_table(
+    fit: &EventHistoryFit,
+    cohort: &EventHistoryCohort,
+    table: ArrayView2<'_, f64>,
+    history: &SubjectHistory,
+    horizons: &[f64],
+    future: &[FutureSegment],
+) -> Result<Forecast, EventHistoryError> {
     let marks = fit.marks();
     let kinds = &cohort.mark_kinds;
-    let history = request.history;
     if kinds.len() != marks || fit.mark_kinds != *kinds {
         return Err(EventHistoryError::InvalidInput {
             reason: "the forecast cohort's mark kinds differ from the fit's".to_string(),
         });
     }
-    validate_horizons(request.horizons, history.exit)?;
-    let last_horizon = request.horizons[request.horizons.len() - 1];
-    validate_future(cohort, request.future, last_horizon)?;
+    validate_horizons(horizons, history.exit)?;
+    let last_horizon = horizons[horizons.len() - 1];
+    validate_future(cohort, future, last_horizon)?;
     // A subject whose follow-up ended with a terminal event has no future:
     // its survival is zero and nothing more can happen.
     if history.terminal_event(kinds).is_some() {
         return Ok(Forecast {
-            horizons: request.horizons.to_vec(),
-            survival: vec![0.0; request.horizons.len()],
-            expected_counts: Array2::zeros((request.horizons.len(), marks)),
+            horizons: horizons.to_vec(),
+            survival: vec![0.0; horizons.len()],
+            expected_counts: Array2::zeros((horizons.len(), marks)),
         });
     }
     let (loadings, rates) = latent_parameters(fit);
-    let state = observed_state(fit, cohort, history, &loadings, &rates)?;
+    let state = observed_state(fit, cohort, table, history, &loadings, &rates)?;
     let (table, segments) = future_table(
-        cohort,
-        request.future,
+        table,
+        future,
         history.exit,
         Some(history.covariate_row_at(history.exit, false)),
     )?;
@@ -680,7 +782,7 @@ pub fn forecast(
         cohort,
         initial: Some(&state),
         start: history.exit,
-        horizons: request.horizons,
+        horizons,
         segments,
         table,
         at_risk,
@@ -708,7 +810,12 @@ pub fn population_forecast(
     validate_horizons(request.horizons, request.start)?;
     let last_horizon = request.horizons[request.horizons.len() - 1];
     validate_future(cohort, request.future, last_horizon)?;
-    let (table, segments) = future_table(cohort, request.future, request.start, None)?;
+    let (table, segments) = future_table(
+        cohort.covariates.view(),
+        request.future,
+        request.start,
+        None,
+    )?;
     let at_risk = vec![true; marks];
     run_window(Window {
         fit,
@@ -723,18 +830,20 @@ pub fn population_forecast(
     })
 }
 
-/// Predictive PIT of every event of a subject, in time order, with the
-/// predictive mark probabilities at each event.
+/// Predictive PIT of every spell of a subject's follow-up, in time order:
+/// one per event, and one for the censored tail when the follow-up did not
+/// end with an event. The event spells carry the predictive mark
+/// probabilities at the event.
 pub fn predictive_pit(
     fit: &EventHistoryFit,
     cohort: &EventHistoryCohort,
     history: &SubjectHistory,
-) -> Result<Vec<EventPit>, EventHistoryError> {
+) -> Result<Vec<SpellPit>, EventHistoryError> {
     let marks = fit.marks();
     let atoms = fit.rank();
     let kinds = &cohort.mark_kinds;
     let (loadings, rates) = latent_parameters(fit);
-    let nodes = single_subject_nodes(fit, cohort, history)?;
+    let nodes = single_subject_nodes(fit, cohort, cohort.covariates.view(), history)?;
     let eta0 = node_eta0(fit, nodes.node_data.view())?;
     let subject = &nodes.subjects[0];
     let pass = forward_filter(
@@ -747,40 +856,53 @@ pub fn predictive_pit(
             gh: fit.family.gauss_hermite(),
             continuation_gap: 0.0,
             designs: None,
+            log_normaliser: None,
         },
         None,
         &vec![true; marks],
     )?;
-    let mut pits = Vec::new();
-    let mut log_survival: f64 = 0.0;
-    for n in 0..subject.len() {
-        if !subject.is_event(n) {
-            log_survival += pass.log_normalisers[n];
-            continue;
-        }
-        let t = subject.times[n];
+    let spell_pit = |log_survival: f64, t: f64| -> Result<f64, EventHistoryError> {
         let pit = -log_survival.exp_m1();
         let slack = 64.0 * f64::EPSILON;
         if !pit.is_finite() || pit < -slack || pit > 1.0 + slack {
             return Err(EventHistoryError::NumericalFailure {
                 reason: format!(
-                    "subject {:?}: predictive survival to the event at {t} is {}, outside [0, 1]",
+                    "subject {:?}: predictive survival to {t} is {}, outside [0, 1]",
                     history.id,
                     log_survival.exp()
                 ),
             });
         }
-        let pit = pit.clamp(0.0, 1.0);
+        Ok(pit.clamp(0.0, 1.0))
+    };
+    let mut pits = Vec::new();
+    let mut log_survival: f64 = 0.0;
+    let mut open = false;
+    for n in 0..subject.len() {
+        if !subject.is_event(n) {
+            log_survival += pass.log_normalisers[n];
+            open = true;
+            continue;
+        }
+        let t = subject.times[n];
+        let pit = spell_pit(log_survival, t)?;
         let intensities = expected_intensities(
             &pass.grids[n],
             &pass.predicted[n],
             &eta0[n * marks..(n + 1) * marks],
             &loadings,
+            None,
             marks,
             atoms,
         );
         let at_risk: Vec<f64> = (0..marks)
-            .map(|d| if history.at_risk(d, t, kinds) { intensities[d] } else { 0.0 })
+            .map(|d| {
+                if history.at_risk(d, t, kinds) {
+                    intensities[d]
+                } else {
+                    0.0
+                }
+            })
             .collect();
         let total: f64 = at_risk.iter().sum();
         let mark_probabilities: Vec<f64> = if total > 0.0 {
@@ -788,24 +910,92 @@ pub fn predictive_pit(
         } else {
             vec![0.0; marks]
         };
+        let mut fired = Vec::new();
         for d in 0..marks {
             let copies = subject.counts[[n, d]].round() as usize;
-            for _ in 0..copies {
-                pits.push(EventPit {
-                    time: t,
-                    mark: d,
-                    pit,
-                    mark_probabilities: mark_probabilities.clone(),
-                });
-            }
+            fired.extend(std::iter::repeat_n(d, copies));
         }
+        pits.push(SpellPit {
+            time: t,
+            observed: true,
+            pit,
+            marks: fired,
+            mark_probabilities,
+        });
         log_survival = 0.0;
+        open = false;
+    }
+    // The tail: exposure after the last event (or the whole follow-up of a
+    // subject without events) that ended at the exit without an event. Its
+    // PIT is a censored draw — the uniform the model assigns to the spell
+    // exceeds this value — and it is what makes the distance below a
+    // statement about the model rather than about the censoring.
+    if open {
+        pits.push(SpellPit {
+            time: history.exit,
+            observed: false,
+            pit: spell_pit(log_survival, history.exit)?,
+            marks: Vec::new(),
+            mark_probabilities: vec![0.0; marks],
+        });
     }
     Ok(pits)
 }
 
-/// Kolmogorov–Smirnov distance of a PIT sample from the uniform law, or
-/// `None` for an empty sample (no events carry no information).
+/// Distance of the predictive PIT distribution from the uniform law,
+/// estimated over event and censored spells alike: the largest gap between
+/// the Kaplan–Meier estimate of the PIT distribution — an event spell is an
+/// observation of its uniform, a censored spell is that uniform observed to
+/// exceed the value emitted — and the uniform law, over the range the spells
+/// cover. Under the model a spell's uniform exceeds its censored value
+/// independently of the uniform itself given the history (the censoring on
+/// the PIT scale is a function of the history and the exit alone), which is
+/// what makes the estimate consistent. Without censoring it is the ordinary
+/// Kolmogorov–Smirnov distance ([`kolmogorov_smirnov_uniform`]). `None` for
+/// no spells. With parameters estimated from the same data it is a summary,
+/// not a calibrated test.
+pub fn pit_uniform_distance(pits: &[SpellPit]) -> Option<f64> {
+    if pits.is_empty() {
+        return None;
+    }
+    // Ties: an event at a value is counted before a censoring at the same
+    // value, which leaves the censored spell in the risk set of the event.
+    let mut spells: Vec<(f64, bool)> = pits.iter().map(|p| (p.pit, p.observed)).collect();
+    spells.sort_by(|a, b| a.0.total_cmp(&b.0).then(b.1.cmp(&a.1)));
+    let n = spells.len();
+    let last_value = spells[n - 1].0;
+    let mut distance = 0.0_f64;
+    let mut survival = 1.0_f64;
+    let mut i = 0usize;
+    while i < n {
+        let value = spells[i].0;
+        let at_risk = (n - i) as f64;
+        let mut events = 0usize;
+        let mut j = i;
+        while j < n && spells[j].0 == value {
+            events += usize::from(spells[j].1);
+            j += 1;
+        }
+        if events > 0 {
+            let before = 1.0 - survival;
+            survival *= 1.0 - events as f64 / at_risk;
+            let after = 1.0 - survival;
+            distance = distance
+                .max((before - value).abs())
+                .max((after - value).abs());
+        }
+        i = j;
+    }
+    // Between the last jump and the largest value the estimate is flat while
+    // the uniform keeps rising: the gap at the end of the covered range.
+    distance = distance.max((1.0 - survival - last_value).abs());
+    Some(distance)
+}
+
+/// Kolmogorov–Smirnov distance of an uncensored PIT sample from the uniform
+/// law, or `None` for an empty sample. This is the right summary only when
+/// every spell ended with an event; see [`pit_uniform_distance`] for the
+/// general case, which this equals when nothing is censored.
 pub fn kolmogorov_smirnov_uniform(pits: &[f64]) -> Option<f64> {
     if pits.is_empty() {
         return None;
