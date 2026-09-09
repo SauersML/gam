@@ -1,3 +1,116 @@
+## v0.3.156 — gam 0.3.156 / gamfit 0.1.266 (2026-09-09)
+
+The release after `v0.3.155` (2026-09-06), three days later. It carries the
+191 non-results commits that landed on `main` in between, and it starts with
+a repair: a bulk commit on 2026-09-08 (`14e1ce6d8`, "Commit remaining
+workspace implementation and validation updates") was written from a checkout
+its own ledger says predated 37 commits on `main`, and nothing in it was
+compiled. It reverted the v0.3.155 version bump and the v0.3.155 / v0.3.154
+changelog entries, rolled 221 files back to versions of `main` from 73 to 426
+commits earlier, deleted 89 files that later commits had added — among them
+the source-removal guard, the public-API census, the assertionless-test
+detector, the test-census floor, and every `tests/bug_hunt_*` pin — moved the
+curated `experiments/` investigations back into `examples/`, and resurrected
+four files `main` had deliberately deleted. This release restores all of that
+from the commit before it and keeps the bulk commit's real work: the #2812
+derived ρ domains that replace the `RhoBox` hand boxes, the #979 fifth-order
+tensors and third directional derivatives, the #1082 multinomial λ-floor
+removal, and every edit that merged cleanly. Where both sides had changed a
+file, each conflict was decided on the code: main's prepared-spectrum Jeffreys
+loop now carries the bulk's explicit-curvature correction; the survival
+smoothing selector uses the derived domain without the left-truncation floor
+`a3b62b711` removed; the atlas nerve is built from row co-membership (the
+transition gate was measured to omit real intersections) beneath main's
+intrinsic pile-up guard. Three parallel designs are set aside with their
+reasons recorded — the #2828 exact-β remainder carrier, the #2825 f64 block
+transport, the #2812/#2817 published criterion resolution — and two probe
+tests are added to measure the one #2828 question reading could not settle.
+The full `--all-targets` check also found three test breakages that predate
+the bulk commit on `main` (a module path that never existed, two deleted
+fields still named); they are fixed, and the second of them is why the
+`quality_1082` binary could not build in Reference Quality Suite #572.
+`gam-report` and `gam-spec`, which the two previous releases had left at
+0.3.154 while every dependant pinned them, now move with the family.
+
+The other blocker was a cluster infra leak: 29 committed measurement logs and
+validation notes under `bench/measurements/` and `docs/` carried the absolute
+MSI project-home path, which the root `build.rs` gate refuses outside
+`experiments/`. Every root-crate build — the rolling wheel, Large-scale,
+Reference Quality, Fuzz vs mgcv, Build and Release All — had been red on that
+one gate since 2026-09-08; the prefix is now the `$MSI_HOME` placeholder.
+
+- **Latent Gaussian REML uses one fixed coefficient frame and the core
+  adjoint** (#2833). Duchon latent designs preserve the polynomial constraint
+  frame across coordinate updates, so the supplied penalty and input-location
+  derivatives describe the same function. The backward and latent optimizer
+  now use the core REML derivative, removing duplicate Hessian factorizations
+  and score formulas. Removed `sigma_eff_mode`: its `fixed` and `profiled`
+  branches both used the forward's profiled dispersion.
+- **Flexible binomial fits preserve their response family when saved**
+  (#2748). The joint mean/link-warp
+  producer records the resolved binomial likelihood and dispersion. Standard
+  payload assembly rejects missing family metadata instead of substituting
+  Gaussian identity.
+- **The composed-warp degree floor is the measured `C¹` degree, 4 (#2695).**
+  The floor had been raised to 5 on the reading that `∇Φ` consumes a
+  piecewise-constant `I⁗` at degree 4. Its own non-vacuity arm refused on MSI:
+  driving the production Jeffreys gradient across an event-row knot crossing,
+  the gap shrinks 99.5× for a 100× smaller straddle at degree 4 (and ≈100× at
+  5 and 6) and only 1.02× at degree 3. The required continuous basis order is
+  therefore 3, the floor is degree 4 again, the negative control measures
+  degree 3, and the ladder that produced the table (`knot_ladder_2695`) ships
+  as a fixture that prints it on every run.
+- **REML and constrained solves** (#2668, #2830, #2831, #2834, #2835, #2840,
+  #2863). The final constrained face is certified after refinement; terminal
+  inner accuracy is preserved and unfinished trials are classified rather than
+  reported as converged; one coefficient-accuracy contract serves values and
+  derivatives; penalty null modes survive constrained and block solves; block
+  Gaussian REML profile trials and rank-deficient faces are stabilized; the
+  terminal objective factorization is unified; Firth curvature stays on the
+  structural coefficient span and keeps its Hessian rank; affine-face rank
+  invariants are typed errors; the centre sigma node is a value.
+- **Jeffreys / Ψ derivatives** (#979). Cached modes are certified at the
+  requested accuracy; active-face curvature is exact for coordinate bounds;
+  second-mode responses are differentiated through stationarity; missing
+  curvature derivatives are refused; mixed spatial information derivatives are
+  batched; each full-third symmetric row-program component is emitted once.
+- **Survival** (#932, #2705, #2714, #2765, #2767). Wide Gaussian cells are
+  resolved with every fourth-order witness enforced; moving-edge monomials are
+  differentiated without singular quotients; nonfinite quadrature moments are
+  rejected; the authoritative outer convergence path is used; accepted
+  baseline evaluations are reused instead of duplicate nested fits; scalar
+  likelihood serves dynamic-slope trials; marginal-slope strength domains are
+  derived.
+- **Inference** (#1561). Cubature is integrated under one probability measure
+  inside the resolved rho domain, using the declared rho density for both
+  cubature and sampling; the quality suite requires a complete suite and exact
+  signed-rank inference, ranking independent cases and blocking incomplete
+  closure.
+- **SAE / manifold** (#2023, #2080, #2234, #2280, #2502, #2627, #2731, #2822,
+  #2825, #2828, #2861, #2862). Exact-A geometry is carried through streaming
+  Schur evidence; the matrix-free exact A and its β block form the true
+  Hessian, with the β-prior curvature prepared once per state; inner solves
+  are globalized on the spectral objective; overcomplete blocks are seeded
+  from data rows; unconverged LLM dictionary artifacts are refused; topology
+  from folded covers is refused and the swiss-roll spurious `b₁` is localized;
+  steering collateral is measured in intrinsic chart units.
+- **Spatial / outer search** (#2735, #2817, #2827). The matrix-free rho trust
+  region is scaled; only the exhausted ARC seed is continued; joint spatial
+  planning is reused across blocks; value-only outer trials are honoured.
+- **Data and frontends** (#2026, #2867, #2876). Constancy is not a
+  shared-boundary rule and the response is exempt; parse errors name the model
+  file and keep `DegenerateColumn` structured; the Python fit API exposes
+  `negative_binomial_theta` and `expectile_tau`; the Python boundary is
+  panic-free; derivative-free Tweedie power profiling is rejected.
+- **Library surface and guards** (#2818, #2829, #2879). `missing_docs` is
+  enabled and the public Rust surface documented; public function removals
+  are gated by source identity; a source-removal guard, a public-API census,
+  Rayon thread-count reproducibility pins (Rust and Python), proptest SPD
+  invariants, and executed Python/CLI documentation examples are in the
+  suite; linear design column assembly streams instead of allocating O(n·p).
+- **CI** (#2832). Release-cache receipts are preserved and Python tests are
+  gated on setup; the wheel matrix measures whether rustc reached sccache.
+
 ## v0.3.155 — gam 0.3.155 / gamfit 0.1.265 (2026-09-06)
 
 The first release since `v0.3.154` (2026-09-02), four days later, and the

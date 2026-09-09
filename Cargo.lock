@@ -3531,7 +3531,7 @@ dependencies = [
 
 [[package]]
 name = "gam"
-version = "0.3.155"
+version = "0.3.156"
 dependencies = [
  "ad_trait",
  "approx",
@@ -3576,7 +3576,7 @@ dependencies = [
 
 [[package]]
 name = "gam-cli"
-version = "0.3.155"
+version = "0.3.156"
 dependencies = [
  "clap",
  "comfy-table",
@@ -3601,7 +3601,7 @@ dependencies = [
 
 [[package]]
 name = "gam-config"
-version = "0.3.155"
+version = "0.3.156"
 dependencies = [
  "gam-gpu",
  "gam-inference",
@@ -3615,7 +3615,7 @@ dependencies = [
 
 [[package]]
 name = "gam-custom-family"
-version = "0.3.155"
+version = "0.3.156"
 dependencies = [
  "approx",
  "faer",
@@ -3635,7 +3635,7 @@ dependencies = [
 
 [[package]]
 name = "gam-data"
-version = "0.3.155"
+version = "0.3.156"
 dependencies = [
  "arrow",
  "csv",
@@ -3649,7 +3649,7 @@ dependencies = [
 
 [[package]]
 name = "gam-geometry"
-version = "0.3.155"
+version = "0.3.156"
 dependencies = [
  "faer",
  "gam-linalg",
@@ -3662,7 +3662,7 @@ dependencies = [
 
 [[package]]
 name = "gam-gpu"
-version = "0.3.155"
+version = "0.3.156"
 dependencies = [
  "cudarc",
  "faer",
@@ -3680,7 +3680,7 @@ dependencies = [
 
 [[package]]
 name = "gam-identifiability"
-version = "0.3.155"
+version = "0.3.156"
 dependencies = [
  "cudarc",
  "faer",
@@ -3698,7 +3698,7 @@ dependencies = [
 
 [[package]]
 name = "gam-inference"
-version = "0.3.155"
+version = "0.3.156"
 dependencies = [
  "approx",
  "cudarc",
@@ -3726,7 +3726,7 @@ dependencies = [
 
 [[package]]
 name = "gam-linalg"
-version = "0.3.155"
+version = "0.3.156"
 dependencies = [
  "approx",
  "dyn-stack",
@@ -3742,7 +3742,7 @@ dependencies = [
 
 [[package]]
 name = "gam-math"
-version = "0.3.155"
+version = "0.3.156"
 dependencies = [
  "bumpalo",
  "libm",
@@ -3752,7 +3752,7 @@ dependencies = [
 
 [[package]]
 name = "gam-model-api"
-version = "0.3.155"
+version = "0.3.156"
 dependencies = [
  "gam-linalg",
  "gam-problem",
@@ -3763,7 +3763,7 @@ dependencies = [
 
 [[package]]
 name = "gam-model-kernels"
-version = "0.3.155"
+version = "0.3.156"
 dependencies = [
  "gam-linalg",
  "gam-math",
@@ -3780,7 +3780,7 @@ dependencies = [
 
 [[package]]
 name = "gam-models"
-version = "0.3.155"
+version = "0.3.156"
 dependencies = [
  "approx",
  "csv",
@@ -3823,7 +3823,7 @@ dependencies = [
 
 [[package]]
 name = "gam-predict"
-version = "0.3.155"
+version = "0.3.156"
 dependencies = [
  "faer",
  "gam-data",
@@ -3847,7 +3847,7 @@ dependencies = [
 
 [[package]]
 name = "gam-problem"
-version = "0.3.155"
+version = "0.3.156"
 dependencies = [
  "faer",
  "gam-geometry",
@@ -3863,7 +3863,7 @@ dependencies = [
 
 [[package]]
 name = "gam-pyffi"
-version = "0.1.265"
+version = "0.1.266"
 dependencies = [
  "arrow",
  "csv",
@@ -3885,14 +3885,14 @@ dependencies = [
 
 [[package]]
 name = "gam-report"
-version = "0.3.154"
+version = "0.3.156"
 dependencies = [
  "serde_json",
 ]
 
 [[package]]
 name = "gam-row-macros"
-version = "0.3.155"
+version = "0.3.156"
 dependencies = [
  "gam-math",
  "proc-macro2",
@@ -3902,7 +3902,7 @@ dependencies = [
 
 [[package]]
 name = "gam-runtime"
-version = "0.3.155"
+version = "0.3.156"
 dependencies = [
  "log",
  "ndarray 0.17.2",
@@ -3916,7 +3916,7 @@ dependencies = [
 
 [[package]]
 name = "gam-sae"
-version = "0.3.155"
+version = "0.3.156"
 dependencies = [
  "approx",
  "cudarc",
@@ -3946,7 +3946,7 @@ dependencies = [
 
 [[package]]
 name = "gam-solve"
-version = "0.3.155"
+version = "0.3.156"
 dependencies = [
  "approx",
  "cudarc",
@@ -3977,7 +3977,7 @@ dependencies = [
 
 [[package]]
 name = "gam-spec"
-version = "0.3.154"
+version = "0.3.156"
 dependencies = [
  "ndarray 0.17.2",
  "serde",
@@ -3986,7 +3986,7 @@ dependencies = [
 
 [[package]]
 name = "gam-terms"
-version = "0.3.155"
+version = "0.3.156"
 dependencies = [
  "approx",
  "cudarc",
@@ -4017,7 +4017,7 @@ dependencies = [
 
 [[package]]
 name = "gam-test-support"
-version = "0.3.155"
+version = "0.3.156"
 dependencies = [
  "approx",
  "csv",
