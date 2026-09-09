@@ -3748,22 +3748,28 @@ fn every_mark_kind_gets_the_risk_set_its_kind_defines() {
 #[test]
 fn a_risk_set_centred_fit_reads_its_baseline_as_the_marginal_incidence() {
     install_test_logger();
-    // A first-occurrence mark with a real frailty. The population's incidence
-    // among those still at risk falls with time — the survivors are the low
-    // activities — so the claim to check is that the fitted `exp(η⁰(t))`
-    // tracks that falling curve, which is what the risk-set centring says the
-    // baseline is. The stationary prior's centring reads the same intercept
-    // as the rate over the cohort as it started, which sits above the later
-    // risk sets' rate.
+    // Two first-occurrence marks sharing one frailty. Two of them, because a
+    // frailty is identified across marks: in a single-mark cohort its only
+    // signature is a marginal rate that falls with time, which a baseline
+    // free to follow time already explains, and the evidence rightly buys no
+    // atom. With two marks the shared over-dispersion is visible and the
+    // baselines stay free.
+    //
+    // The population's incidence among those still at risk falls — the
+    // survivors are the low activities — so the claim to check is that the
+    // fitted `exp(η⁰(t))` tracks that falling curve, which is what the
+    // risk-set centring says the baseline is. The stationary prior's centring
+    // reads the same surface as a rate over the cohort as it started, above
+    // the later risk sets' rate.
     let follow_up = 5.0_f64;
     let mut cohort = simulate_marked_cohort(
         600,
         follow_up,
-        &[-1.3],
+        &[-1.3, -1.5],
         0.0,
-        &[0.9],
+        &[0.9, 0.8],
         0.05,
-        &[MarkKind::Once],
+        &[MarkKind::Once, MarkKind::Once],
         4242,
     );
     // The empirical hazard among those at risk, in bins of one time unit.
@@ -3772,10 +3778,12 @@ fn a_risk_set_centred_fit_reads_its_baseline_as_the_marginal_incidence() {
     let mut bin_events = vec![0.0; bins];
     let mut bin_exposure = vec![0.0; bins];
     for subject in &cohort.subjects {
+        // The first mark's own risk set: it stops accruing when that mark
+        // fires, whatever the other mark did.
         let stop = subject
             .events
             .iter()
-            .filter(|e| e.time > subject.entry)
+            .filter(|e| e.mark == 0 && e.time > subject.entry)
             .map(|e| e.time)
             .fold(subject.exit, f64::min);
         for (b, (events, exposure)) in bin_events
@@ -3788,7 +3796,9 @@ fn a_risk_set_centred_fit_reads_its_baseline_as_the_marginal_incidence() {
             *events += subject
                 .events
                 .iter()
-                .filter(|e| e.time > subject.entry && e.time >= left && e.time < right)
+                .filter(|e| {
+                    e.mark == 0 && e.time > subject.entry && e.time >= left && e.time < right
+                })
                 .count() as f64;
         }
     }
