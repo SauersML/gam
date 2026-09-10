@@ -851,7 +851,21 @@ pub(crate) fn subject_marginal<S: JetField>(
     let mut mean = vec![zero.clone(); p_total];
     let mut second = vec![zero.clone(); p_total * p_total];
     let mut curvature = vec![zero.clone(); p_total * p_total];
-    let mut carried: Vec<S> = vec![zero.clone(); p_total * filtered[0].grid.size()];
+    // Louis' identity is `E[∂²L_c | y] + Var[∂L_c | y]`. Without atoms there
+    // is no latent state to be uncertain about: the complete-data likelihood
+    // *is* the observed one, its score has no posterior spread, and the
+    // variance term is identically zero. Everything that forms it — the
+    // carried second moments, the same-node block over every ordered pair of
+    // marks, and the subtraction of the mean's outer product — is then
+    // arithmetic whose answer is known, and it is the part that grows with
+    // the square of the mark count. The expected curvature and the mean are
+    // still needed, and still formed.
+    let latent_variance = atoms > 0;
+    let mut carried: Vec<S> = if latent_variance {
+        vec![zero.clone(); p_total * filtered[0].grid.size()]
+    } else {
+        Vec::new()
+    };
     // Reused by every node and mark: the grid's size is `order^atoms`, the
     // same at every node, so this is one allocation rather than one per mark
     // per node of a vector as wide as the grid.
@@ -900,38 +914,42 @@ pub(crate) fn subject_marginal<S: JetField>(
         for d in 0..marks {
             let ws = &ws_all[d];
             // B[q] = Σ_i W s_d C[q];  A_k[q] = Σ_i W s_d ζ_{dk} C[q]
-            let mut b = vec![zero.clone(); p_total];
+            let mut b = vec![zero.clone(); if latent_variance { p_total } else { 0 }];
             let mut a_k = vec![vec![zero.clone(); p_total]; atoms];
-            // `W s_d C[q]` is formed once per grid point and reused for the
-            // atom contractions, which is the same arithmetic in the same
-            // order with the product taken once instead of once per atom.
-            for q in 0..p_total {
-                let row = &carried[q * size..(q + 1) * size];
-                let mut acc = zero.clone();
-                for i in 0..size {
-                    weighted[i] = ws[i].mul(&row[i]);
-                    acc = acc.add(&weighted[i]);
-                }
-                b[q] = acc;
-                for k in 0..atoms {
+            if latent_variance {
+                // `W s_d C[q]` is formed once per grid point and reused for the
+                // atom contractions, which is the same arithmetic in the same
+                // order with the product taken once instead of once per atom.
+                for q in 0..p_total {
+                    let row = &carried[q * size..(q + 1) * size];
                     let mut acc = zero.clone();
                     for i in 0..size {
-                        acc = acc.add(&weighted[i].mul(&centred[d][k][i]));
+                        weighted[i] = ws[i].mul(&row[i]);
+                        acc = acc.add(&weighted[i]);
                     }
-                    a_k[k][q] = acc;
+                    b[q] = acc;
+                    for k in 0..atoms {
+                        let mut acc = zero.clone();
+                        for i in 0..size {
+                            acc = acc.add(&weighted[i].mul(&centred[d][k][i]));
+                        }
+                        a_k[k][q] = acc;
+                    }
                 }
             }
             // E[C v_dᵀ] and its transpose.
-            for q in 0..p_total {
-                for &(col, x) in &rows[d] {
-                    let value = b[q].scale(x);
-                    second[q * p_total + col] = second[q * p_total + col].add(&value);
-                    second[col * p_total + q] = second[col * p_total + q].add(&value);
-                }
-                for k in 0..atoms {
-                    let col = layout.a(d, k);
-                    second[q * p_total + col] = second[q * p_total + col].add(&a_k[k][q]);
-                    second[col * p_total + q] = second[col * p_total + q].add(&a_k[k][q]);
+            if latent_variance {
+                for q in 0..p_total {
+                    for &(col, x) in &rows[d] {
+                        let value = b[q].scale(x);
+                        second[q * p_total + col] = second[q * p_total + col].add(&value);
+                        second[col * p_total + q] = second[col * p_total + q].add(&value);
+                    }
+                    for k in 0..atoms {
+                        let col = layout.a(d, k);
+                        second[q * p_total + col] = second[q * p_total + col].add(&a_k[k][q]);
+                        second[col * p_total + q] = second[col * p_total + q].add(&a_k[k][q]);
+                    }
                 }
             }
             // Mean of the node function.
@@ -992,7 +1010,7 @@ pub(crate) fn subject_marginal<S: JetField>(
             }
         }
         // ---- pass 2: the same-node block, every ordered pair of marks -------
-        for d in 0..marks {
+        for d in 0..if latent_variance { marks } else { 0 } {
             let ws = &ws_all[d];
             for d2 in 0..marks {
                 let mut m00 = zero.clone();
@@ -1038,7 +1056,7 @@ pub(crate) fn subject_marginal<S: JetField>(
             }
         }
         // ---- pass 3: the node's functions join the carried vector ----------
-        for d in 0..marks {
+        for d in 0..if latent_variance { marks } else { 0 } {
             for &(col, x) in &rows[d] {
                 let row = &mut carried[col * size..(col + 1) * size];
                 for i in 0..size {
@@ -1239,12 +1257,21 @@ pub(crate) fn subject_marginal<S: JetField>(
     let mut hessian = vec![zero.clone(); p_total * p_total];
     for q in 0..p_total {
         for r in q..p_total {
-            let value = curvature[q * p_total + r]
-                .add(&second[q * p_total + r])
-                .sub(&mean[q].mul(&mean[r]));
-            let mirror = curvature[r * p_total + q]
-                .add(&second[r * p_total + q])
-                .sub(&mean[r].mul(&mean[q]));
+            let (value, mirror) = if latent_variance {
+                (
+                    curvature[q * p_total + r]
+                        .add(&second[q * p_total + r])
+                        .sub(&mean[q].mul(&mean[r])),
+                    curvature[r * p_total + q]
+                        .add(&second[r * p_total + q])
+                        .sub(&mean[r].mul(&mean[q])),
+                )
+            } else {
+                (
+                    curvature[q * p_total + r].clone(),
+                    curvature[r * p_total + q].clone(),
+                )
+            };
             let symmetric = value.add(&mirror).scale(0.5);
             hessian[q * p_total + r] = symmetric.clone();
             hessian[r * p_total + q] = symmetric;
