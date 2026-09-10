@@ -114,6 +114,18 @@ pub(crate) struct FitEventsArgs {
     pub(crate) forecast_cutoff: Option<f64>,
     #[arg(
         long,
+        value_name = "ROW",
+        help = "Centre the baselines on the risk sets rather than on the stationary prior, using this row of the covariates table as the reference population's profile: exp(baseline) is then the incidence among those still at risk at every time, not the rate over the cohort as it started. Repeat once per stratum, with --reference-stratum naming the column that assigns subjects to them"
+    )]
+    pub(crate) reference_row: Vec<usize>,
+    #[arg(
+        long,
+        value_name = "COLUMN",
+        help = "Column of the subjects table assigning each subject to a reference stratum; its distinct values, in sorted order, take the --reference-row profiles in the order given"
+    )]
+    pub(crate) reference_stratum: Option<String>,
+    #[arg(
+        long,
         value_name = "JSON",
         help = "Write the summary here instead of stdout"
     )]

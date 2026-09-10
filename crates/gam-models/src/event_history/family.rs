@@ -1384,7 +1384,7 @@ impl EventHistorySpec {
             gauss_hermite_order: 9,
             quadrature_tolerance: 5e-2,
             reference: None,
-            normaliser_rounds: 8,
+            normaliser_rounds: 16,
             normaliser_tolerance: 1e-4,
             options: BlockwiseFitOptions::default(),
         }
@@ -2963,31 +2963,78 @@ pub fn fit_event_history(
     let mut reference_masks = 0usize;
     if spec.reference.is_some() && fit.rank() > 0 {
         let mut held: Option<Arc<Vec<f64>>> = None;
+        let mut previous_residual: Option<f64> = None;
         for _ in 0..spec.normaliser_rounds {
             let centring = fit
                 .family
                 .refresh_normaliser(&fit.fit.block_states)
                 .map_err(|reason| EventHistoryError::Fit { reason })?;
             let next = centring.log_normaliser;
-            let moved = match held.as_ref() {
-                None => f64::INFINITY,
-                Some(previous) => previous
+            // The residual of the alternation at the point the current fit was
+            // made under: how far one refresh moves the normaliser.
+            let residual: Option<Vec<f64>> = held.as_ref().map(|current| {
+                current
                     .iter()
                     .zip(next.iter())
-                    .map(|(a, b)| (a - b).abs())
-                    .fold(0.0, f64::max),
-            };
+                    .map(|(u, f)| f - u)
+                    .collect()
+            });
+            let moved = residual.as_ref().map_or(f64::INFINITY, |r| {
+                r.iter().map(|v| v.abs()).fold(0.0, f64::max)
+            });
             normaliser_rounds.push(moved);
-            log::info!(
-                "[event-history] risk-set centring round {}: the normaliser moved {moved:.3e} nats",
-                normaliser_rounds.len()
-            );
             reference_risk_mass = centring.log_risk_mass;
             reference_masks = centring.masks;
             if moved <= spec.normaliser_tolerance {
+                log::info!(
+                    "[event-history] risk-set centring round {}: the normaliser moved {moved:.3e} nats: settled",
+                    normaliser_rounds.len()
+                );
                 break;
             }
-            held = Some(Arc::new(next));
+            // The alternation converges linearly — a normaliser shift is
+            // absorbed by the baseline only to the extent the baseline's own
+            // basis can follow its shape, and what is left comes back through
+            // the population's killing at a rate the data decide. Two
+            // successive residuals name that rate, and the geometric series
+            // they imply is summed rather than walked: with residuals `r` and
+            // ratio `ρ = ‖r_k‖/‖r_{k-1}‖`, the limit of `u + r(1 + ρ + ρ² + …)`
+            // is `u + r/(1 − ρ)`. The step is taken only where the ratio is a
+            // contraction the two residuals actually measured; otherwise the
+            // plain alternation stands, which is what keeps a bad ratio from
+            // throwing the iteration somewhere the fit cannot follow.
+            let advance = match (held.as_ref(), residual.as_ref(), previous_residual) {
+                (Some(current), Some(r), Some(before)) if before > 0.0 => {
+                    let ratio = moved / before;
+                    if (0.0..0.95).contains(&ratio) {
+                        let gain = 1.0 / (1.0 - ratio);
+                        log::info!(
+                            "[event-history] risk-set centring round {}: the normaliser moved {moved:.3e} nats, contracting at {ratio:.3}: summing the series ({gain:.2}×)",
+                            normaliser_rounds.len()
+                        );
+                        current
+                            .iter()
+                            .zip(r.iter())
+                            .map(|(u, r)| u + gain * r)
+                            .collect()
+                    } else {
+                        log::info!(
+                            "[event-history] risk-set centring round {}: the normaliser moved {moved:.3e} nats at ratio {ratio:.3}, no contraction to sum",
+                            normaliser_rounds.len()
+                        );
+                        next
+                    }
+                }
+                _ => {
+                    log::info!(
+                        "[event-history] risk-set centring round {}: the normaliser moved {moved:.3e} nats",
+                        normaliser_rounds.len()
+                    );
+                    next
+                }
+            };
+            previous_residual = Some(moved);
+            held = Some(Arc::new(advance));
             let rank = fit.rank();
             let start = RankStart::carried(
                 fit.fit.block_states[..marks]

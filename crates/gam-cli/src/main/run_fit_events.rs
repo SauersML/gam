@@ -4,8 +4,9 @@
 use crate::cli_args::FitEventsArgs;
 use gam::families::custom_family::BlockwiseFitOptions;
 use gam::families::event_history::{
-    CovariateSegment, Event, EventHistoryCohort, ForecastRequest, FutureSegment, MarkKind,
-    PopulationForecastRequest, SubjectHistory, fit_event_history_formulas, forecast, latent_state,
+    CovariateSegment, Event, EventHistoryCohort, EventHistorySpec, ForecastRequest, FutureSegment,
+    MarkKind, PopulationForecastRequest, ReferenceStrata, SubjectHistory,
+    covariate_spec_from_formula, design_rows, fit_event_history, forecast, latent_state,
     pit_uniform_distance, population_forecast, predictive_pit,
 };
 use ndarray::Array2;
@@ -231,8 +232,64 @@ pub(crate) fn run_fit_events(args: FitEventsArgs) -> Result<(), String> {
             );
         }
     };
-    let fit = fit_event_history_formulas(&mut cohort, &formulas, BlockwiseFitOptions::default())
+    // The reference population, when the baselines are to be the incidence
+    // among those still at risk rather than the rate over the cohort as it
+    // started. The strata's profiles are rows of the covariate table; a
+    // column of the subjects table assigns subjects to them.
+    let reference = if args.reference_row.is_empty() {
+        if args.reference_stratum.is_some() {
+            return Err(
+                "--reference-stratum needs at least one --reference-row to assign subjects to"
+                    .to_string(),
+            );
+        }
+        None
+    } else {
+        let subject_stratum = match &args.reference_stratum {
+            None => {
+                if args.reference_row.len() != 1 {
+                    return Err(format!(
+                        "{} --reference-row profiles need --reference-stratum to say which subject is in which",
+                        args.reference_row.len()
+                    ));
+                }
+                vec![0usize; cohort.subjects.len()]
+            }
+            Some(name) => {
+                let values = column(&subject_headers, &subject_rows, name, &args.subjects)?;
+                let mut levels: Vec<String> = values.iter().map(|v| (*v).to_string()).collect();
+                levels.sort();
+                levels.dedup();
+                if levels.len() != args.reference_row.len() {
+                    return Err(format!(
+                        "column {name:?} has {} distinct values but {} --reference-row profiles were given",
+                        levels.len(),
+                        args.reference_row.len()
+                    ));
+                }
+                values
+                    .iter()
+                    .map(|v| levels.iter().position(|l| l == v).expect("level present"))
+                    .collect()
+            }
+        };
+        Some(ReferenceStrata {
+            rows: args.reference_row.clone(),
+            subject: subject_stratum,
+        })
+    };
+    let rows = design_rows(&cohort, EventHistorySpec::new(Vec::new()).quadrature_order)
         .map_err(|e| e.to_string())?;
+    let mut spec = EventHistorySpec::new(
+        formulas
+            .iter()
+            .map(|formula| covariate_spec_from_formula(formula, rows.view(), &cohort))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?,
+    );
+    spec.options = BlockwiseFitOptions::default();
+    spec.reference = reference;
+    let fit = fit_event_history(&mut cohort, &spec).map_err(|e| e.to_string())?;
 
     let mut summary = Map::new();
     summary.insert("marks".to_string(), json!(mark_names));
@@ -251,6 +308,15 @@ pub(crate) fn run_fit_events(args: FitEventsArgs) -> Result<(), String> {
         },
     );
     summary.insert("rank".to_string(), json!(fit.rank()));
+    if spec.reference.is_some() {
+        // How far the held risk-set normaliser moved at each re-centring
+        // round: the last of them is how far the alternation settled.
+        summary.insert(
+            "normaliser_rounds".to_string(),
+            json!(fit.normaliser_rounds),
+        );
+        summary.insert("reference_masks".to_string(), json!(fit.reference_masks));
+    }
     summary.insert("atom_evidence".to_string(), json!(fit.atom_evidence));
     summary.insert(
         "rank_path".to_string(),
