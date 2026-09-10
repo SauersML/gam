@@ -88,6 +88,8 @@ pub struct FitRequestConfigDocument {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ctn_stage1: Option<CtnStage1Document>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub transformation_normal_config: Option<CtnStage1ConfigDocument>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub expectile_tau: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub family: Option<String>,
@@ -200,6 +202,9 @@ pub struct FitRequestConfigDocument {
     pub weights: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub z_column: Option<String>,
+    /// The supplied z column is already transformed by a frozen external model.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub frozen_score: Option<bool>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]

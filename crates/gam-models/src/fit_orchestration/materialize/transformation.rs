@@ -59,7 +59,7 @@ pub(crate) fn materialize_transformation_normal<'a>(
             weights,
             offset,
             covariate_spec,
-            config: TransformationNormalConfig::default(),
+            config: config.transformation_normal_config.clone().unwrap_or_default(),
             options: BlockwiseFitOptions {
                 persistent_warm_start_store: config.persistent_warm_start_store.clone(),
                 ..BlockwiseFitOptions::default()

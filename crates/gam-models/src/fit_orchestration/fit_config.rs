@@ -81,6 +81,14 @@ pub fn validate_survival_baseline_config(
 }
 
 impl FitConfig {
+    pub(crate) fn marginal_slope_latent_policy(&self) -> crate::bms::LatentZPolicy {
+        let mut policy = crate::bms::LatentZPolicy::default();
+        if self.frozen_score {
+            policy.latent_measure = crate::bms::LatentMeasureSpec::StandardNormal;
+        }
+        policy
+    }
+
     /// Opt in to cross-process warm starts at the exact supplied root.
     ///
     /// The path is neither canonicalized nor relocated through temp/cache
@@ -116,6 +124,19 @@ impl FitConfig {
             normalize_optional_column(self.noise_offset_column, "noise_offset_column")?;
         self.weight_column = normalize_optional_column(self.weight_column, "weight_column")?;
         self.z_column = normalize_optional_column(self.z_column, "z_column")?;
+        if self.transformation_normal_config.is_some()
+            && !(self.transformation_normal || self.family.as_deref() == Some("transformation-normal"))
+        {
+            return Err("transformation_normal_config requires a transformation-normal fit".to_string());
+        }
+        if self.frozen_score
+            && (self.z_column.is_none()
+                || self.ctn_stage1.is_some()
+                || !(self.survival_likelihood.as_deref() == Some("marginal-slope")
+                    || self.family.as_deref() == Some("bernoulli-marginal-slope")))
+        {
+            return Err("frozen_score requires a marginal-slope fit with an explicit z_column and no integrated CTN recipe".to_string());
+        }
         if self
             .persistent_warm_start_store
             .as_ref()

@@ -432,6 +432,16 @@ mod tests {
         ];
         for (family, y, shape) in cases {
             let seeded: Vec<_> = shape.iter().map(|&v| Mixed::seed(v, 0.0, 0.0)).collect();
+            // The fast path must agree with the independent AD reference.
+            // Check outside the timed loops so the benchmark still measures
+            // each implementation separately, without hardware speed gates.
+            for eta in [-2.75, 0.75, 2.25] {
+                let analytic = location_derivatives(&family, y, eta, &shape).unwrap();
+                let reference = log_density(&family, y, &Mixed::seed(eta, 1.0, 1.0), &seeded)
+                    .unwrap();
+                assert!((analytic.0 - reference.u).abs() < 2e-11 * (1.0 + reference.u.abs()));
+                assert!((analytic.1 - reference.uv).abs() < 2e-11 * (1.0 + reference.uv.abs()));
+            }
             let mut analytic_time = f64::INFINITY;
             let mut ad_time = f64::INFINITY;
             for _ in 0..3 {
