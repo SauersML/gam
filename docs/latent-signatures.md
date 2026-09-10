@@ -1,8 +1,19 @@
 # Joint latent signatures: mathematical target
 
-This document specifies the next model. It is not a description of the current
-`gam_event_history` implementation. The current implementation and its numerical
-limits are documented in `event-history.md`.
+This document specifies the complete model being built. The `joint` module in
+`gam_event_history` implements its complete-path density, structured Laplace
+posterior, and importance integration. It does not yet implement the complete
+reference evolution, parameter-fitting workflow, structure search, or serving
+interface specified below. The older log-linear Gaussian event model and its
+numerical limits are documented in `event-history.md`.
+
+The implemented state has independent OU innovations with stationary variance
+one, a genetic mean linear in supplied predictable basis rows, and constant
+learned jumps for nonterminal marks. Entry means depend on supplied context,
+genetics, and recorded once-only prevalence. This conditional entry regression
+does not yet provide the reference-law conditioning required below. Decoder
+weights are constant per mark; observation intercepts and slopes are constant
+per channel. These restrictions are explicit parts of the present density.
 
 ## State, events, and a positive decoder
 
@@ -115,6 +126,43 @@ against that oracle and closed-form limits. Correct forecast approximations
 using guided particles or importance sampling only when their diagnostics and
 Monte Carlo uncertainty meet the stated accuracy requirement. Report an
 unresolved calculation if correction degenerates.
+
+The implemented importance bank draws from an equal mixture of the structured
+Laplace Gaussian and the normalized Gaussian path prior conditional on observed
+genetic scores and event jumps. The complete observation factors remain in the
+importance numerator. Including the prior protects against a local Gaussian
+proposal whose tails are too light; it does not ensure efficient sampling in a
+large or multimodal problem. This is defensive mixture sampling, as described
+by [Hesterberg](https://statistics.stanford.edu/technical-reports/weighted-average-importance-sampling-and-defensive-mixture-distributions).
+
+An integration bank belongs to one immutable model specification and history.
+Its nodes and normalized proposal density stay fixed during coefficient and
+reference-sensitivity evaluations. Thus its returned jets differentiate the
+same finite sampled objective as its value. The integral, gradient, and
+curvature are Monte Carlo approximations to their population counterparts.
+The bank reports an estimated log-integral standard error, effective sample
+count, and largest normalized weight, and refuses evaluations outside the
+requested error and effective-sample limits. Those diagnostics are not a
+deterministic certificate or a bound on derivative and forecast errors.
+Independent banks must assess each fitted or served quantity. Replacing a bank
+inside an optimization line search would change the sampled objective and is
+not permitted by this contract.
+
+At a moved parameter state, the bank checks the sufficient tail condition
+`2 Q(theta) - Q(anchor) > 0` on the Gaussian prior precisions. Since the proposal
+contains half the anchor prior and the observation factors have at most
+polynomial growth in the path, this establishes finite second moments of the
+importance weights and polynomial state summaries. It is a sufficient condition,
+not a necessary one; failure requires a new proposal. Weight diagnostics alone
+cannot establish this tail property. Posterior means and selected covariance
+blocks also have their own estimated standardized-error acceptance limit.
+
+Sampling uses the block precision factors directly: a genetic Schur draw and
+backward conditional state draws. It does not form a dense trajectory covariance
+or a Cartesian state grid. Retaining S importance paths costs O(S(NK+G)) storage;
+the API checks that additional memory budget before allocating them. A modest
+state factorization alone does not guarantee that importance sampling remains
+effective as the number of observations grows.
 
 Signature capacity grows through proposed splits/additions and shrinks through
 hierarchical priors. The number of provisioned coordinates is a computational

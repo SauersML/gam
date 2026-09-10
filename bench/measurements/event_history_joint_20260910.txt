@@ -1,0 +1,24 @@
+   Compiling gam-event-history v0.3.157 (/projects/standard/hsiehph/sauer354/mdpp/gam/crates/gam-event-history)
+    Finished `test` profile [optimized] target(s) in 1m 02s
+     Running unittests src/lib.rs (/projects/standard/hsiehph/sauer354/targets/gam-mdpp/debug/deps/gam_event_history-1d9bb59d29392367)
+
+running 15 tests
+test joint::tests::measurement_families_are_normalized_and_have_stable_curvature ... ok
+test joint::precision::tests::structured_draw_map_has_the_inverse_precision_covariance ... ok
+test joint::tests::genetic_drive_and_prevalence_condition_the_entry_state ... ok
+test joint::tests::positive_decoder_is_a_sum_and_stays_in_the_log_domain ... ok
+test joint::tests::zero_signatures_reproduce_the_counting_process_density ... ok
+test joint::tests::event_jumps_act_after_event_intensity_and_respect_measurement_timing ... ok
+test joint::posterior::tests::structured_precision_is_the_hessian_of_the_complete_density ... ok
+test joint::tests::structured_rank_zero_integral_has_no_spurious_latent_normalization ... ok
+test joint::tests::structured_posterior_assimilates_a_measurement_and_missing_values_do_not ... ok
+test joint::tests::complete_joint_density_derivatives_match_finite_differences ... ok
+test joint::tests::missing_measurements_integrate_to_one_and_missing_genetics_are_latent ... ok
+test joint::tests::importance_integral_conditions_missing_genetics_under_the_full_joint_prior ... ok
+test joint::tests::sampled_objective_and_derivatives_include_the_same_reference_sensitivities ... ok
+importance: log integral -2.4650000295527885 vs -2.4574843252862903, SE 0.004236844089967606, ESS 12660.646438652433; mean 1.263330241316884 vs 1.2680922324613615, variance 0.48957316097594245 vs 0.48704663049330477
+test joint::tests::importance_correction_matches_an_independent_measurement_integral ... ok
+test joint::tests::structured_gaussian_limit_integrates_missing_scores_and_large_state_paths ... ok
+
+test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 50 filtered out; finished in 1.67s
+

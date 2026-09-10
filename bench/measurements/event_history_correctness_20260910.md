@@ -91,8 +91,57 @@ The directional-profile product and final Laplace rank criterion remain
 approximations, including a nonregular boundary. Their present implementation
 does not establish exact marginal evidence or globally optimal structure.
 
-The positive-signature decoder, joint modalities, learned entry/ascertainment
-law, disease-triggered state dynamics, and structured state inference are
-specified in `docs/latent-signatures.md` but are not implemented by this
-checkpoint. The serving handle still retains the training cohort; serializing
-the centring snapshot is not a complete deployable-model serialization format.
+The serving handle still retains the training cohort; serializing the centring
+snapshot is not a complete deployable-model serialization format. The following
+joint-model work is subsequent to the older-model checkpoint above.
+
+## Joint signature density and structured integration
+
+Commit `7d35c4af9` added a positive signature decoder, genetic OU drive, conditional
+entry regression, constant learned disease jumps, Student-t/probit/ordinal/count
+measurement channels, and structured latent Laplace inference. The initial
+**11 focused checks passed in 0.04 s**, following a **77 s** warm build.
+
+The subsequent importance-integration change evaluates the complete joint density
+under a mixture of its conditional Gaussian path prior and Laplace approximation.
+It preserves one sampled objective for values and derivatives, carries supplied
+reference sensitivities, and checks finite-variance tails at moved parameter
+states. The integral and posterior moments have separate estimated-error limits;
+unresolved evaluations return errors.
+
+The final **15 focused checks passed in 1.67 s**, following a **62 s** warm build.
+The raw output is `event_history_joint_20260910.txt`. These checks include:
+
+* An eight-signature, 33-node path with two missing genetic scores: the Gaussian
+  integral is one, the structured covariance matches its analytic limit, and
+  4,096 importance paths recover the same integral to roundoff. This is a
+  Gaussian-limit test, not a high-dimensional non-Gaussian inference benchmark.
+* The structured sampling map's covariance agrees with inverse precision to
+  **1e-13**, including a dense genetic border and nonsymmetric temporal blocks.
+* An independent one-dimensional Student-t measurement integral gives log
+  marginal **-2.45748432528629**. The 16,384-path importance estimate is
+  **-2.46500002955279**, with estimated standard error **0.00423684** and effective
+  sample count **12,660.65**. Its final-state mean is **1.26333024**, compared with
+  **1.26809223** independently; variance is **0.48957316**, compared with
+  **0.48704663**. This is one reproducible Monte Carlo realization, not a claim
+  that the estimated standard errors have been externally calibrated.
+* The independent reference first failed its 65-versus-129-node convergence
+  check. Refining to 129 versus 257 nodes reduced log-integral disagreement to
+  **2.58e-10** without relaxing the tolerance. A separate SciPy adaptive integral
+  on MSI gave probability **0.08565014808261512**, reported integration error
+  **2.12e-14**, consistent with that reference.
+* Sampled value, gradient, and curvature agree with finite differences using
+  the same bank, including supplied normalizer sensitivities. A parameter move
+  violating the sufficient finite-variance tail condition is rejected, as are
+  unsatisfied likelihood and posterior-moment error requests.
+
+All builds used the existing MSI cache and four workers. An initial RNG feature
+configuration triggered dependent rebuilds and reached the 95-second cap; the
+dependencies now disable unused default features. The successful final check
+compiled only the event-history crate. No local compilation or tests were run.
+
+The complete reference evolution with disease jumps, learned late-entry
+conditioning from that reference law, parameter fitting, automatic structure
+selection, Python/CLI serving, and deployable model serialization still need
+integration. The importance diagnostics do not establish external calibration,
+biobank-scale performance, or exact evidence. The goal is not complete.
