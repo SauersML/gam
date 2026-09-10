@@ -1,0 +1,10 @@
+
+running 1 test
+test joint::emission::tests::measurement_location_derivative_speed ... measurement location StudentT: analytic 0.003575s, AD 0.010711s, speedup 2.996x (20000 calls, best of three)
+measurement location BinaryProbit: analytic 0.001560s, AD 0.001590s, speedup 1.019x (20000 calls, best of three)
+measurement location OrdinalProbit { categories: 4 }: analytic 0.005999s, AD 0.008585s, speedup 1.431x (20000 calls, best of three)
+measurement location NegativeBinomial: analytic 0.003030s, AD 0.014652s, speedup 4.835x (20000 calls, best of three)
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 76 filtered out; finished in 0.15s
+

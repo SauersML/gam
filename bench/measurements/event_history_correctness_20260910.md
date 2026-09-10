@@ -234,3 +234,62 @@ The error estimates are not deterministic or simultaneous confidence bounds.
 Rare behavior, derivative accuracy, broad reference performance, and external
 calibration need further assessment. Fitting, learned complexity, entry/history
 conditioning, deployment, and the serving interfaces are still unfinished.
+
+## Cohort likelihood and analytic measurement updates
+
+`JointCohortIntegration` now shares one resolved reference evolution per stratum
+across the subject likelihoods. The result retains its coefficients, positional
+stratum map, reference curves/reports, and subject integrals. Subject contributions
+and their derivatives are summed pairwise. The requested integration tolerance
+applies to the aggregate estimated importance error conditional on those
+reference curves. Shared reference error is explicitly separate; summing
+independent subject variances does not account for it.
+
+Cohort inference returns integrated latent/genetic means and selected covariance
+blocks. It does not return Laplace modes as the default estimate and does not
+yet integrate uncertainty in the global coefficients. The constructor rejects
+invalid positional indices, foreign-model banks, missing assignments, and
+unused reference populations. This is the shared observation objective, not
+a fitted model or an implementation of REML/LAML parameter learning.
+
+The structured latent solver's measurement location updates now use analytic
+scores and curvatures for Student-t, binary probit, ordinal probit, and
+negative-binomial observations. The Student-t formulas preserve a finite score
+when a squared residual would overflow, and a finite curvature when its
+prefactor would overflow before multiplying a small inflection-point contrast.
+The full conditional precision test now includes every measurement family and
+measurements after an event jump. AD remains a test oracle for these updates.
+
+The first run had **25 passed, 1 failed** because the new comparison used an
+effectively pure relative tolerance for a nearly zero negative-binomial score:
+the values differed by about **6.6e-17**. The test now uses absolute and relative
+tolerances; separate analytic tail assertions remain in place. After adding the
+cohort tests and numerical edge check, the final **27 focused tests passed in
+8.29 s**, with two test threads after a **40.93 s** targeted MSI compile using
+warm dependencies and four CPUs. Fifty other tests were filtered out. Raw output
+is `event_history_joint_cohort_20260910.txt`; this is not a full-suite result.
+
+The benchmark inside a concurrent test run showed noticeable timing variability,
+so it was also run alone with one CPU and one test thread. That bounded run took
+**0.15 s**. Each measurement below is the best of three batches of 20,000 calls
+on the same final binary, consuming only the location score and curvature:
+
+| Family | Analytic | AD | Observed speedup |
+| --- | ---: | ---: | ---: |
+| Student-t | 0.003575 s | 0.010711 s | 2.996x |
+| Binary probit | 0.001560 s | 0.001590 s | 1.019x |
+| Ordinal probit | 0.005999 s | 0.008585 s | 1.431x |
+| Negative binomial | 0.003030 s | 0.014652 s | 4.835x |
+
+Raw isolated output is `event_history_measurement_speed_20260910.txt`. These
+measurements describe this hot path, not a whole-model fitting speedup or the
+SPEC exception for all remaining production derivative paths.
+
+`SPEC.md` is authoritative for the remaining fitting work: function-level
+penalties with a demonstrated coefficient representation where applicable,
+REML/LAML learning, posterior means, converged fits only, and shared outer
+optimization through `opt`. The prior proposal to start with fixed coefficient
+ridges was not implemented. Nonlinear function-prior normalization, combined
+cohort/reference error assessment, coefficient inference, automatic structure
+learning, entry conditioning, serving parity, and external calibration remain
+unfinished.

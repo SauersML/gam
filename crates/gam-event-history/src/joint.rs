@@ -13,12 +13,14 @@ use ndarray::Array2;
 use serde::{Deserialize, Serialize};
 use std::ops::Range;
 
+mod cohort;
 mod emission;
 mod integration;
 mod posterior;
 mod precision;
 mod reference;
 mod resolution;
+pub use cohort::{JointCohortEvaluation, JointCohortIntegration, JointCohortPosterior};
 pub use integration::{
     IntegratedLikelihood, IntegratedPosterior, IntegrationAccuracy, IntegrationOptions,
     JointIntegration,

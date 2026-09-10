@@ -3,7 +3,6 @@
 //! latent grid. The returned Gaussian is explicitly an approximation.
 use super::precision::{Factorization, Precision};
 use super::*;
-use crate::scalar::Mixed;
 
 #[derive(Clone, Debug)]
 pub struct PosteriorOptions {
@@ -239,22 +238,17 @@ impl JointLikelihood {
                 };
                 eta += loadings[axis] * (path[base + axis] + jump);
             }
-            let shape: Vec<Mixed<f64>> = theta
-                [self.layout.measurement_shape[record.channel].clone()]
-            .iter()
-            .map(|&v| Mixed::seed(v, 0.0, 0.0))
-            .collect();
-            let value = emission::log_density(
+            let (score, curvature) = emission::location_derivatives(
                 &self.spec.measurements[record.channel],
                 y,
-                &Mixed::seed(eta, 1.0, 1.0),
-                &shape,
+                eta,
+                &theta[self.layout.measurement_shape[record.channel].clone()],
             )?;
             for axis in 0..k {
-                gradient[base + axis] += value.u * loadings[axis];
+                gradient[base + axis] += score * loadings[axis];
                 for other in 0..k {
                     precision.diagonal[record.node][[axis, other]] -=
-                        value.uv * loadings[axis] * loadings[other];
+                        curvature * loadings[axis] * loadings[other];
                 }
             }
         }
@@ -416,6 +410,7 @@ impl JointLikelihood {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::scalar::Mixed;
 
     #[test]
     fn structured_precision_is_the_hessian_of_the_complete_density() {
@@ -427,7 +422,12 @@ mod tests {
             entry_columns: 0,
             genetic_mean: vec![0.2],
             genetic_precision: Array2::ones((1, 1)),
-            measurements: vec![MeasurementFamily::BinaryProbit],
+            measurements: vec![
+                MeasurementFamily::BinaryProbit,
+                MeasurementFamily::StudentT,
+                MeasurementFamily::OrdinalProbit { categories: 4 },
+                MeasurementFamily::NegativeBinomial,
+            ],
         })
         .unwrap();
         let h = JointHistory {
@@ -439,12 +439,14 @@ mod tests {
             drive_design: Array2::ones((3, 1)),
             entry_design: vec![],
             genetics: vec![None],
-            measurements: vec![MeasurementRecord {
-                node: 2,
-                channel: 0,
-                value: Some(1.0),
-                after_event: true,
-            }],
+            measurements: (0..4)
+                .map(|channel| MeasurementRecord {
+                    node: 2,
+                    channel,
+                    value: Some(1.0),
+                    after_event: true,
+                })
+                .collect(),
         };
         let theta: Vec<f64> = (0..model.layout.width).map(|i| 0.04 * i as f64).collect();
         let path: Vec<f64> = (0..model.latent_dimension(&h).unwrap())

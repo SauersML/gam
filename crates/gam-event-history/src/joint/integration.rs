@@ -73,8 +73,8 @@ pub struct IntegratedPosterior {
 /// a new bank changes the sampled approximation: never replace it silently
 /// within a derivative evaluation or optimization line search.
 pub struct JointIntegration<'a> {
-    model: &'a JointLikelihood,
-    history: &'a JointHistory,
+    pub(super) model: &'a JointLikelihood,
+    pub(super) history: &'a JointHistory,
     paths: Vec<Vec<f64>>,
     log_proposal: Vec<f64>,
     anchor_theta: Vec<f64>,

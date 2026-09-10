@@ -3,8 +3,9 @@
 This document specifies the complete model being built. The `joint` module in
 `gam_event_history` implements its complete-path density, structured Laplace
 posterior, importance integration, and differentiated reference evolution with
-disease histories, independent replication, and adaptive time/particle
-refinement. The parameter-fitting workflow, structure search, and serving
+disease histories, independent replication, adaptive time/particle
+refinement, and a cohort observation objective sharing these reference strata.
+The parameter-fitting workflow, structure search, and serving
 interface are still unfinished. The older log-linear Gaussian event model and its
 numerical limits are documented in `event-history.md`.
 
@@ -178,6 +179,43 @@ declared parameter priors. Its derivative includes the derivative of the
 reference evolution. A frozen-normalizer score is a different estimating
 procedure and must not substitute for this derivative.
 
+`JointLikelihood::cohort_integration` binds independently sampled subject banks
+to resolved reference populations by positional stratum index. Each coefficient
+evaluation evolves each reference once, then uses that same curve and its
+sensitivities in every assigned subject. The result retains the coefficient
+state, stratum mapping, reference curves and reports, and individual integrals.
+It is a likelihood evaluation, not a converged fit or an evidence estimate.
+Pairwise summation combines the subject likelihoods and their derivative
+channels. Its integration tolerance applies to the aggregate estimated
+log-likelihood standard error conditional on the reference curves. Shared
+reference uncertainty is not independent between subjects and is not included
+in that conditional standard error. A combined cohort error assessment remains
+necessary for final fitting and structure comparisons.
+
+The cohort `posterior` method returns integrated state/genetic means and
+selected covariances at the supplied global coefficients. It does not integrate
+uncertainty in those coefficients. A Laplace mode is an internal proposal
+construction point, not the default estimate of an individual's latent state.
+
+The fitting implementation must follow `SPEC.md`: REML/LAML must learn
+function-level penalty strengths; global posterior means must be the default
+reporting target; and a fit object requires converged optimization. General
+outer optimization belongs in the existing `opt` dependency. A quadratic
+coefficient representation of a function penalty is permitted only with its
+equivalence established: for a declared function `f = B beta`, measure `W`,
+and linear function operator `L`,
+
+```text
+||L f||_W^2 = beta' (L B)' W (L B) beta.
+```
+
+This identity does not justify an arbitrary identity ridge on nonlinear
+decoder logits, rate coordinates, or an intercept. Nonlinear function priors
+also need their normalization and coordinate Jacobians in any evidence
+calculation; substituting a Gaussian penalty determinant would change the
+objective. These penalty and hyperparameter-learning components are not yet
+implemented for the joint model.
+
 Training may use a structured variational approximation with local Gaussian
 state factors and temporal precision blocks, plus shared parameter factors.
 This avoids a Cartesian latent grid; it does not make the posterior Gaussian
@@ -191,6 +229,15 @@ against that oracle and closed-form limits. Correct forecast approximations
 using guided particles or importance sampling only when their diagnostics and
 Monte Carlo uncertainty meet the stated accuracy requirement. Report an
 unresolved calculation if correction degenerates.
+
+The latent solver now uses analytic location scores and curvatures for all
+four measurement families. They avoid differentiating unused shape channels
+and avoid gamma-function evaluations in Student-t and count location updates.
+Tests compare them with derivatives of the complete observation density,
+including extreme tails and measurements after disease jumps. This removes
+one production AD hot path. It does not establish the performance exception
+in `SPEC.md` for all remaining generic coefficient/reference derivative paths;
+those still need analytic replacements or corresponding speed evidence.
 
 The implemented importance bank draws from an equal mixture of the structured
 Laplace Gaussian and the normalized Gaussian path prior conditional on observed
