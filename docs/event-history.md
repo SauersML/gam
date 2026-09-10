@@ -190,6 +190,13 @@ between them is the selection the centring exists for. Every request therefore
 says which reference stratum its person belongs to (`stratum`), since the
 normaliser is a property of a population and a person divides by their own.
 
+One scope limit: `population_forecast` opens its window at the stationary
+prior — the law over the cohort as it started, not over those still at risk at
+the window's start — so under this centring a population tier taken late in
+follow-up reads above the incidence its own baseline names. A
+history-conditioned forecast is unaffected, since it opens at the state that
+history implies.
+
 The reference population is stratified by covariate profile
 (`ReferenceStrata`), and the identity is exact within a stratum. Across strata
 it holds only where the covariates the strata condition on are the covariates

@@ -48,6 +48,17 @@
 //! censored. The predictive mark probabilities at each event complete the
 //! diagnostic for marked processes.
 //!
+//! One scope limit under the risk-set centring: [`population_forecast`] opens
+//! its window at the *stationary prior*, which is the law of the latent state
+//! over the cohort as it started, not over those still at risk at the window's
+//! start. The two agree at the first age the reference population is run from
+//! and separate as the risk set is selected, so a population tier taken late
+//! in follow-up reads above the incidence its own baseline names. A
+//! history-conditioned forecast is unaffected: it opens at the state that
+//! history implies. Opening the population tier at the reference population's
+//! own risk-set law is the fix, and it needs that law carried out of the
+//! reference filter, which is not yet done.
+//!
 //! A forecast can be made for any history, not only a training subject's:
 //! [`forecast_history`] takes a history with its own covariate rows, and
 //! [`SubjectHistory::prefix`] cuts a history at an assessment time, so that
