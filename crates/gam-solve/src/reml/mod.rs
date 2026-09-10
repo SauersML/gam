@@ -5193,14 +5193,14 @@ pub(crate) struct EvalShared {
     /// factorizes the canonical-TRANSFORMED, possibly constraint-projected
     /// penalties, a genuinely different matrix, not a duplicate of this one.)
     pub(crate) penalty_pseudologdet: std::sync::OnceLock<Arc<penalty_logdet::PenaltyPseudologdet>>,
-    /// #2644: the root-scale `log|H|` for this evaluation point, decided once.
+    /// Root-scale value, inverse and derivatives for this evaluation point.
     ///
     /// `None` inside the cell means the upgrade was examined and declined (the
     /// assembled spectrum already resolves the criterion, or the root could not
     /// be shown to reproduce this `H`); an empty cell means it has not been
     /// examined yet. Caching it here is what keeps the extra `O(n·p²)` Gram to
     /// once per ρ rather than once per value/gradient/Hessian call at that ρ.
-    pub(crate) root_scale_hessian_logdet: std::sync::OnceLock<Option<f64>>,
+    pub(crate) root_scale_hessian_operator: std::sync::OnceLock<Option<Arc<reml_outer_engine::DenseSpectralOperator>>>,
     /// The penalty components the criterion APPLIES, `S̃_k = Π S_k Π`, in the
     /// ORIGINAL coefficient frame (#2454).
     ///

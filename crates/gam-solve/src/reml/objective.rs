@@ -1888,17 +1888,18 @@ impl<'a> RemlState<'a> {
         // assembled value rather than silently getting the wrong one.
         let root_lambdas: Vec<f64> =
             gam_problem::checked_exp_log_strengths(rho.iter().copied()).unwrap_or_default();
+        let root_penalties = bundle.applied_canonical_penalties(&self.canonical_penalties)?;
         let root_inputs = super::laml_logdet::HessianRootInputs {
             design: self.x(),
             weights: pirls_result.finalweights.view(),
-            penalties: self.canonical_penalties.as_slice(),
+            penalties: root_penalties.as_slice(),
             lambdas: &root_lambdas,
             delta: ridge_passport.delta(),
         };
         let hessian_op: std::sync::Arc<dyn super::reml_outer_engine::HessianFactorization> = {
             use super::reml_outer_engine::HessianFactorization as _;
-            let build_spectral = || -> Result<DenseSpectralOperator, EstimationError> {
-                let mut op = if let Some(rank) = structural_rank {
+            let build_spectral = || -> Result<std::sync::Arc<DenseSpectralOperator>, EstimationError> {
+                let op = if let Some(rank) = structural_rank {
                     DenseSpectralOperator::from_symmetric_with_structural_rank(
                         &h_total_original,
                         rank,
@@ -1913,24 +1914,30 @@ impl<'a> RemlState<'a> {
                 })?;
                 if let Some(lift) = op.logdet_regularization_lift()
                     && lift.abs() <= f64::EPSILON.sqrt() * (1.0 + op.logdet().abs())
-                    && let Some(exact) = *bundle.root_scale_hessian_logdet.get_or_init(|| {
+                    && let Some(exact) = bundle.root_scale_hessian_operator.get_or_init(|| {
                         if super::laml_logdet::assembled_logdet_is_resolved(
                             op.raw_spectrum(),
                             op.logdet(),
                         ) {
                             return None;
                         }
-                        super::laml_logdet::root_scale_hessian_logdet(
+                        super::laml_logdet::root_scale_hessian_operator(
                             &root_inputs,
                             &h_total_original,
                             op.raw_spectrum(),
                             op.logdet(),
+                            if structural_rank.is_some() {
+                                PseudoLogdetMode::PositiveDefinite
+                            } else {
+                                hessian_mode
+                            },
                         )
+                        .map(std::sync::Arc::new)
                     })
                 {
-                    op.install_root_scale_logdet(exact);
+                    return Ok(std::sync::Arc::clone(exact));
                 }
-                Ok(op)
+                Ok(std::sync::Arc::new(op))
             };
             // The scalar objective and its derivatives must be projections of
             // one numerical operator.  A former value-only shortcut priced
@@ -1948,7 +1955,7 @@ impl<'a> RemlState<'a> {
                     "using the canonical spectral Hessian operator for moving-design coordinates"
                 );
             }
-            std::sync::Arc::new(build_spectral()?)
+            build_spectral()?
         };
 
         let e_for_logdet = &pirls_result.reparam_result.e_transformed;

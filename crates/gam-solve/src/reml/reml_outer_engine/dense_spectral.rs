@@ -119,6 +119,20 @@ impl DenseSpectralOperator {
             .eigh(Side::Lower)
             .map_err(|e| format!("Eigendecomposition failed: {e}"))?;
 
+        Self::from_eigenpairs(eigenvalues, eigenvectors, mode, structural_rank)
+    }
+
+    pub(crate) fn from_eigenpairs(
+        eigenvalues: Array1<f64>,
+        eigenvectors: Array2<f64>,
+        mode: PseudoLogdetMode,
+        structural_rank: Option<usize>,
+    ) -> Result<Self, String> {
+        let n = eigenvalues.len();
+        if eigenvectors.dim() != (n, n) {
+            return Err("spectral Hessian eigenpair dimensions disagree".to_string());
+        }
+
         let structural_mask = if let Some(rank) = structural_rank {
             if rank > n {
                 return Err(format!(
@@ -863,15 +877,6 @@ impl DenseSpectralOperator {
         Some(self.cached_logdet - plain)
     }
 
-    /// Replace `cached_logdet` with a value computed at ROOT scale.
-    ///
-    /// Every other kernel on this operator (traces, solves, the logdet
-    /// Hessian) keeps the assembled eigensystem: those are `O(rank)` quantities
-    /// whose error does not scale with `κ(H)` the way a log-determinant's does,
-    /// and they need the eigenvectors anyway. Only the scalar moves.
-    pub(crate) fn install_root_scale_logdet(&mut self, value: f64) {
-        self.cached_logdet = value;
-    }
 }
 
 impl HessianFactorization for DenseSpectralOperator {

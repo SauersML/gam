@@ -6438,7 +6438,7 @@ impl<'a> RemlState<'a> {
             firth_dense_operator,
             firth_dense_operator_original: None,
             penalty_pseudologdet: std::sync::OnceLock::new(),
-            root_scale_hessian_logdet: std::sync::OnceLock::new(),
+            root_scale_hessian_operator: std::sync::OnceLock::new(),
             applied_canonical_penalties: std::sync::OnceLock::new(),
             penalty_scores_at_mode: std::sync::OnceLock::new(),
             block_local_correction: std::sync::OnceLock::new(),
@@ -6601,7 +6601,7 @@ impl<'a> RemlState<'a> {
             firth_dense_operator: None,
             firth_dense_operator_original,
             penalty_pseudologdet: std::sync::OnceLock::new(),
-            root_scale_hessian_logdet: std::sync::OnceLock::new(),
+            root_scale_hessian_operator: std::sync::OnceLock::new(),
             // Seeded, not left empty: this bundle's sparse system and its
             // `logdet_s_pos` / `det1_values` were already built from THESE
             // components, and a later consumer re-deriving them would be free

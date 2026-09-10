@@ -1,5 +1,7 @@
-//! `log|H|` for the LAML/REML criterion, priced from a ROOT of
-//! `H = XᵀWX + S_λ + δI` instead of from the assembled matrix's spectrum.
+//! LAML/REML spectral operators from a root of `H = XᵀWX + S_λ + δI`.
+//! The root SVD supplies the value, inverse and derivative kernels together.
+//! Updating only the scalar log determinant leaves outer Newton derivatives
+//! with the assembled matrix's condition-dependent error (#2834).
 //!
 //! # Why the assembled matrix cannot answer this
 //!
@@ -61,6 +63,7 @@ use gam_linalg::matrix::DesignMatrix;
 use ndarray::{Array1, Array2, ArrayView1};
 
 use gam_terms::construction::CanonicalPenalty;
+use super::reml_outer_engine::{DenseSpectralOperator, PseudoLogdetMode};
 
 /// The ingredients of `H = XᵀWX + Σ_k λ_k S_k + δI`, in ONE frame.
 pub(crate) struct HessianRootInputs<'a> {
@@ -141,17 +144,18 @@ fn psd_root_rows(s: &Array2<f64>) -> Result<Vec<Array1<f64>>, String> {
     Ok(rows)
 }
 
-/// `log|H|` from the singular values of `B = [√W·X ; √λ_k R_k ; √δ I]`.
+/// The full spectral operator from `B = [√W·X ; √λ_k R_k ; √δ I]`.
 ///
 /// Returns `None` — keep the assembled value — in every case listed in the
 /// module header.
-pub(crate) fn root_scale_hessian_logdet(
+pub(crate) fn root_scale_hessian_operator(
     inputs: &HessianRootInputs<'_>,
     h_assembled: &Array2<f64>,
     spectrum: &[f64],
     assembled_logdet: f64,
-) -> Option<f64> {
-    match root_scale_hessian_logdet_inner(inputs, h_assembled, spectrum, assembled_logdet) {
+    mode: PseudoLogdetMode,
+) -> Option<DenseSpectralOperator> {
+    match root_scale_hessian_operator_inner(inputs, h_assembled, spectrum, assembled_logdet, mode) {
         Ok(value) => Some(value),
         Err(reason) => {
             log::debug!("[2644-logdet] declined: {reason}");
@@ -160,12 +164,13 @@ pub(crate) fn root_scale_hessian_logdet(
     }
 }
 
-fn root_scale_hessian_logdet_inner(
+fn root_scale_hessian_operator_inner(
     inputs: &HessianRootInputs<'_>,
     h_assembled: &Array2<f64>,
     spectrum: &[f64],
     assembled_logdet: f64,
-) -> Result<f64, String> {
+    mode: PseudoLogdetMode,
+) -> Result<DenseSpectralOperator, String> {
     let p = h_assembled.nrows();
     if p == 0 || h_assembled.ncols() != p || spectrum.len() != p {
         return Err(format!(
@@ -302,8 +307,8 @@ fn root_scale_hessian_logdet_inner(
         ));
     }
 
-    let (_, singular, _) = stacked
-        .svd(false, false)
+    let (_, singular, vectors_t) = stacked
+        .svd(false, true)
         .map_err(|_| "the stacked-root SVD did not converge".to_string())?;
     if singular.len() < p {
         return Err(format!("SVD returned {} singular values for p={p}", singular.len()));
@@ -336,7 +341,12 @@ fn root_scale_hessian_logdet_inner(
          {:.3e}, assembled error bound {bound:.3e})",
         logdet - assembled_logdet,
     );
-    Ok(logdet)
+    DenseSpectralOperator::from_eigenpairs(
+        singular.mapv(|sigma| sigma * sigma),
+        vectors_t.ok_or_else(|| "root SVD omitted requested right vectors".to_string())?.t().to_owned(),
+        mode,
+        None,
+    )
 }
 
 #[cfg(test)]
@@ -458,8 +468,27 @@ mod tests {
             s.sort_by(f64::total_cmp);
             s
         };
-        let from_root = root_scale_hessian_logdet(&inputs, &h, &sorted_spectrum, assembled)
+        use super::super::reml_outer_engine::HessianFactorization;
+        let operator = root_scale_hessian_operator(&inputs, &h, &sorted_spectrum, assembled, PseudoLogdetMode::PositiveDefinite)
             .expect("the root reproduces H, so the upgrade must be taken");
+        let from_root = operator.logdet();
+
+        // A scalar-only root upgrade leaves the gradient and Newton step on
+        // the inaccurate assembled spectrum. Test those on the weak modes,
+        // whose curvature was lost when the large penalty was added to H.
+        for i in 3..p {
+            let rhs = q.column(i).to_owned();
+            let solved = operator.solve(&rhs);
+            let expected = &rhs / spectrum[i];
+            let relative = (&solved - &expected).mapv(|v| v * v).sum().sqrt()
+                / expected.mapv(|v| v * v).sum().sqrt();
+            assert!(relative < 2.0e-8, "root inverse mode {i}: {relative:e}");
+            let direction = Array2::from_shape_fn((p, p), |(a, b)| rhs[a] * rhs[b]);
+            let gradient = operator.trace_logdet_gradient(&direction);
+            let second = operator.trace_logdet_hessian_cross(&direction, &direction);
+            assert!((gradient * spectrum[i] - 1.0).abs() < 2.0e-8);
+            assert!((second * spectrum[i].powi(2) + 1.0).abs() < 4.0e-8);
+        }
 
         assert!(
             (from_root - exact).abs() <= 1.0e-9 * exact.abs().max(1.0),
