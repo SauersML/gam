@@ -1514,9 +1514,45 @@ pub struct EventHistoryFit {
     /// normaliser was taken on and the same grid with every cell halved.
     /// `None` when the baselines are centred on the stationary prior.
     pub reference_certificate: Option<f64>,
+    /// The settled risk-set normaliser on the reference grid, index
+    /// `(stratum * nodes + node) * marks + d`. Empty when the baselines are
+    /// centred on the stationary prior. Prediction reads it: a forecast made
+    /// from a fit whose baselines are the risk sets' rates has to divide by
+    /// the same normaliser the fit did, at the times the forecast asks about,
+    /// or it is a forecast from a different model.
+    pub reference_normaliser: Vec<f64>,
 }
 
 impl EventHistoryFit {
+    /// The reference grid the settled normaliser lives on, when the baselines
+    /// are the risk sets' rates.
+    pub fn reference_grid(&self) -> Option<&ReferenceGrid> {
+        self.family.reference().map(|tables| &tables.grid)
+    }
+
+    /// `log M_d(t)` for one stratum at an arbitrary time, by the same linear
+    /// interpolation in the log of the normaliser the fit used. Empty when
+    /// the baselines are centred on the stationary prior.
+    pub fn risk_set_normaliser_at(&self, stratum: usize, t: f64) -> Vec<f64> {
+        let marks = self.marks();
+        let Some(grid) = self.reference_grid() else {
+            return Vec::new();
+        };
+        if self.reference_normaliser.is_empty() {
+            return Vec::new();
+        }
+        let nodes = grid.len();
+        let (lower, weight) = grid.locate(t);
+        let base = stratum * nodes;
+        (0..marks)
+            .map(|d| {
+                let low = self.reference_normaliser[(base + lower) * marks + d];
+                let high = self.reference_normaliser[(base + lower + 1) * marks + d];
+                low + weight * (high - low)
+            })
+            .collect()
+    }
+
     /// The rank of the latent covariance the evidence supports.
     pub fn rank(&self) -> usize {
         self.log_rates.len()
@@ -2621,6 +2657,7 @@ fn assemble(
         reference_risk_mass: Vec::new(),
         reference_masks: 0,
         reference_certificate: None,
+        reference_normaliser: Vec::new(),
     })
 }
 
@@ -3161,5 +3198,6 @@ pub fn fit_event_history(
     fit.reference_risk_mass = reference_risk_mass;
     fit.reference_masks = reference_masks;
     fit.reference_certificate = reference_certificate;
+    fit.reference_normaliser = reference_normaliser;
     Ok(fit)
 }

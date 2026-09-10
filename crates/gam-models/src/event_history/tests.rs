@@ -1123,6 +1123,7 @@ fn fit_recovers_the_covariate_effect_and_a_positive_shared_risk_loading() {
         history: &cohort.subjects[0],
         horizons: &[6.5, 7.0, 8.0],
         future: &[],
+        stratum: 0,
     };
     let f = forecast(&fit, &cohort, &request).expect("forecast");
     assert!(
@@ -1140,7 +1141,7 @@ fn fit_recovers_the_covariate_effect_and_a_positive_shared_risk_loading() {
     // Predictive PIT: uniform up to sampling error on the training cohort.
     let mut spells = Vec::new();
     for subject in &cohort.subjects {
-        let pits = predictive_pit(&fit, &cohort, subject).expect("pit");
+        let pits = predictive_pit(&fit, &cohort, subject, 0).expect("pit");
         // A recurrent mark never ends follow-up, so every subject's last
         // spell is the censored tail after its last event.
         let tail = pits.last().expect("a subject has at least its tail spell");
@@ -1368,7 +1369,7 @@ fn the_smoothed_latent_state_tracks_the_simulated_path() {
     let (mut sum_xy, mut sum_xx, mut sum_yy, mut sum_x, mut sum_y, mut count) =
         (0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
     for (subject, path) in cohort.subjects.iter().zip(paths.iter()) {
-        let state = latent_state(&fit, &cohort, subject).expect("latent state");
+        let state = latent_state(&fit, &cohort, subject, 0).expect("latent state");
         assert_eq!(state.mean.nrows(), state.times.len());
         assert_eq!(state.covariance.len(), state.times.len());
         for (n, &t) in state.times.iter().enumerate() {
@@ -2699,6 +2700,7 @@ fn forecast_tiers_population_score_and_history_are_one_model_conditioned_on_more
             start: 6.0,
             horizons: &horizons,
             future: &at(6.0, 0.0),
+            stratum: 0,
         },
     )
     .expect("population forecast");
@@ -2732,6 +2734,7 @@ fn forecast_tiers_population_score_and_history_are_one_model_conditioned_on_more
                     start: subject.exit,
                     horizons: &horizons,
                     future: &at(subject.exit, score),
+                    stratum: 0,
                 },
             )
             .expect("score-only forecast");
@@ -2742,6 +2745,7 @@ fn forecast_tiers_population_score_and_history_are_one_model_conditioned_on_more
                     history: subject,
                     horizons: &horizons,
                     future: &[],
+                    stratum: 0,
                 },
             )
             .expect("history forecast");
@@ -2878,6 +2882,7 @@ fn terminal_forecasts_match_the_constant_hazard_solution() {
             history: censored,
             horizons: &horizons,
             future: &[],
+            stratum: 0,
         },
     )
     .expect("forecast");
@@ -2917,6 +2922,7 @@ fn terminal_forecasts_match_the_constant_hazard_solution() {
             history: dead,
             horizons: &[dead.exit + 1.0],
             future: &[],
+            stratum: 0,
         },
     )
     .expect("forecast of an absorbed subject");
@@ -2933,6 +2939,7 @@ fn terminal_forecasts_match_the_constant_hazard_solution() {
                 start: 1.0,
                 covariates: vec![0.0],
             }],
+            stratum: 0,
         },
     )
     .expect("population forecast");
@@ -2945,7 +2952,7 @@ fn terminal_forecasts_match_the_constant_hazard_solution() {
         .iter()
         .max_by_key(|s| s.events.len())
         .expect("subject");
-    let pits = predictive_pit(&fit, &cohort, subject).expect("pit");
+    let pits = predictive_pit(&fit, &cohort, subject, 0).expect("pit");
     let ended_by_event = subject.exit == subject.events.last().map_or(f64::NAN, |e| e.time);
     assert_eq!(
         pits.len(),
@@ -3029,6 +3036,7 @@ fn forecast_probabilities_are_coherent_under_a_latent_state() {
                 history: subject,
                 horizons: &horizons,
                 future: &[],
+                stratum: 0,
             },
         )
         .expect("forecast");
@@ -3076,7 +3084,7 @@ fn forecast_probabilities_are_coherent_under_a_latent_state() {
     // probability to, and its own PIT is a censored draw rather than a value
     // the uniform law is asserted of.
     for subject in cohort.subjects.iter().take(12) {
-        let spells = predictive_pit(&fit, &cohort, subject).expect("pit");
+        let spells = predictive_pit(&fit, &cohort, subject, 0).expect("pit");
         for spell in spells.iter() {
             assert!((0.0..=1.0).contains(&spell.pit));
             let sum: f64 = spell.mark_probabilities.iter().sum();
@@ -3291,7 +3299,7 @@ fn a_censored_tail_is_a_spell_and_the_distance_is_read_off_the_kaplan_meier_curv
     let fit = fit_event_history(&mut cohort, &spec).expect("intercept-only fit");
     let mut spells: Vec<SpellPit> = Vec::new();
     for subject in &cohort.subjects {
-        let pits = predictive_pit(&fit, &cohort, subject).expect("pit");
+        let pits = predictive_pit(&fit, &cohort, subject, 0).expect("pit");
         assert_eq!(
             pits.len(),
             1,
@@ -3393,6 +3401,7 @@ fn a_prefix_forecast_sees_only_what_was_known_at_the_cutoff() {
             history: &prefix,
             horizons: &horizons,
             future: &[],
+            stratum: 0,
         },
     )
     .expect("forecast from the prefix");
@@ -3407,6 +3416,7 @@ fn a_prefix_forecast_sees_only_what_was_known_at_the_cutoff() {
             history: &extended.prefix(cutoff, &kinds).expect("prefix"),
             horizons: &horizons,
             future: &[],
+            stratum: 0,
         },
     )
     .expect("forecast from the extended prefix");
@@ -3431,6 +3441,7 @@ fn a_prefix_forecast_sees_only_what_was_known_at_the_cutoff() {
             covariates: row.view(),
             horizons: &horizons,
             future: &[],
+            stratum: 0,
         },
     )
     .expect("forecast_history");
@@ -3454,6 +3465,7 @@ fn a_prefix_forecast_sees_only_what_was_known_at_the_cutoff() {
                 covariates: wide.view(),
                 horizons: &horizons,
                 future: &[],
+                stratum: 0,
             },
         )
         .is_err()
@@ -3497,6 +3509,7 @@ fn a_prefix_forecast_sees_only_what_was_known_at_the_cutoff() {
             history: &whole,
             horizons: &[dead.exit + 1.0],
             future: &[],
+            stratum: 0,
         },
     )
     .expect("forecast of a subject whose follow-up ended");

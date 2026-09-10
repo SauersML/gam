@@ -80,6 +80,9 @@ pub struct FutureSegment {
 pub struct ForecastRequest<'a> {
     /// The subject's observed history (its covariate rows index the cohort).
     pub history: &'a SubjectHistory,
+    /// Which reference stratum this person belongs to, when the fit's
+    /// baselines are the risk sets' rates. Ignored otherwise.
+    pub stratum: usize,
     /// Absolute horizon times, strictly increasing and after the exit time.
     pub horizons: &'a [f64],
     /// The covariate path over the forecast window. Empty holds the row in
@@ -95,6 +98,9 @@ pub struct ForecastRequest<'a> {
 pub struct PopulationForecastRequest<'a> {
     /// Time the forecast window opens.
     pub start: f64,
+    /// Which reference stratum the window's population belongs to, when the
+    /// fit's baselines are the risk sets' rates. Ignored otherwise.
+    pub stratum: usize,
     /// Absolute horizon times, strictly increasing and after `start`.
     pub horizons: &'a [f64],
     /// The covariate path over the window; the first segment must start at
@@ -108,6 +114,9 @@ pub struct PopulationForecastRequest<'a> {
 pub struct HistoryForecastRequest<'a> {
     pub history: &'a SubjectHistory,
     pub covariates: ArrayView2<'a, f64>,
+    /// Which reference stratum this person belongs to, when the fit's
+    /// baselines are the risk sets' rates. Ignored otherwise.
+    pub stratum: usize,
     /// Absolute horizon times, strictly increasing and after the exit time.
     pub horizons: &'a [f64],
     /// The covariate path over the forecast window, as in [`ForecastRequest`].
@@ -142,6 +151,27 @@ pub struct SpellPit {
     /// The predictive probability of each mark given that an event happened
     /// at the spell's end.
     pub mark_probabilities: Vec<f64>,
+}
+
+/// `log M_d(t)` at a set of node times for one stratum, laid out
+/// `n * marks + d` as the filter reads it. Empty when the fit's baselines are
+/// centred on the stationary prior, which is what tells the filter to use the
+/// prior's constant shift instead.
+///
+/// A forecast from a risk-set centred fit has to divide by the same
+/// normaliser the fit did, at the times the forecast asks about. Leaving it
+/// out would evaluate a different model from the one that was fitted — one
+/// whose baselines are rates over the cohort as it started — and the
+/// difference is exactly the selection the centring exists to account for.
+fn forecast_normaliser(fit: &EventHistoryFit, stratum: usize, times: &[f64]) -> Option<Vec<f64>> {
+    if fit.reference_normaliser.is_empty() {
+        return None;
+    }
+    let mut out = Vec::with_capacity(times.len() * fit.marks());
+    for &t in times {
+        out.extend(fit.risk_set_normaliser_at(stratum, t));
+    }
+    Some(out)
 }
 
 fn single_subject_nodes(
@@ -225,12 +255,14 @@ pub fn latent_state(
     fit: &EventHistoryFit,
     cohort: &EventHistoryCohort,
     history: &SubjectHistory,
+    stratum: usize,
 ) -> Result<SmoothedLatentState, EventHistoryError> {
     let atoms = fit.rank();
     let (loadings, rates) = latent_parameters(fit);
     let nodes = single_subject_nodes(fit, cohort, cohort.covariates.view(), history)?;
     let eta0 = node_eta0(fit, nodes.node_data.view())?;
     let subject = &nodes.subjects[0];
+    let normaliser = forecast_normaliser(fit, stratum, &subject.times);
     let moments = latent_state_moments(&SubjectInputs {
         nodes: subject,
         eta0: &eta0,
@@ -240,7 +272,7 @@ pub fn latent_state(
         gh: fit.family.gauss_hermite(),
         continuation_gap: 0.0,
         designs: None,
-        log_normaliser: None,
+        log_normaliser: normaliser.as_deref(),
     })?;
     let mut mean = Array2::<f64>::zeros((subject.len(), atoms));
     let mut covariance = Vec::with_capacity(subject.len());
@@ -292,6 +324,7 @@ fn observed_state(
     cohort: &EventHistoryCohort,
     table: ArrayView2<'_, f64>,
     history: &SubjectHistory,
+    stratum: usize,
     loadings: &[f64],
     rates: &[f64],
 ) -> Result<LatentState, EventHistoryError> {
@@ -299,6 +332,7 @@ fn observed_state(
     let observed = single_subject_nodes(fit, cohort, table, history)?;
     let eta0 = node_eta0(fit, observed.node_data.view())?;
     let all_marks = vec![true; marks];
+    let normaliser = forecast_normaliser(fit, stratum, &observed.subjects[0].times);
     let mut pass = forward_filter(
         &SubjectInputs {
             nodes: &observed.subjects[0],
@@ -309,7 +343,7 @@ fn observed_state(
             gh: fit.family.gauss_hermite(),
             continuation_gap: 0.0,
             designs: None,
-            log_normaliser: None,
+            log_normaliser: normaliser.as_deref(),
         },
         None,
         &all_marks,
@@ -419,6 +453,7 @@ fn validate_future(
 struct Window<'a> {
     fit: &'a EventHistoryFit,
     cohort: &'a EventHistoryCohort,
+    stratum: usize,
     initial: Option<&'a LatentState>,
     start: f64,
     horizons: &'a [f64],
@@ -434,6 +469,7 @@ fn run_window(window: Window<'_>) -> Result<Forecast, EventHistoryError> {
     let Window {
         fit,
         cohort,
+        stratum,
         initial,
         start,
         horizons,
@@ -525,6 +561,7 @@ fn run_window(window: Window<'_>) -> Result<Forecast, EventHistoryError> {
                       eta: &[f64]|
          -> Result<ForwardPass<f64>, EventHistoryError> {
             let nodes = future_chain(times, weights, &exposed, marks);
+            let normaliser = forecast_normaliser(fit, stratum, times);
             forward_filter(
                 &SubjectInputs {
                     nodes: &nodes,
@@ -535,7 +572,7 @@ fn run_window(window: Window<'_>) -> Result<Forecast, EventHistoryError> {
                     gh,
                     continuation_gap: state.as_ref().map_or(0.0, |s| times[0] - s.time),
                     designs: None,
-                    log_normaliser: None,
+                    log_normaliser: normaliser.as_deref(),
                 },
                 state.as_ref().map(|s| (&s.grid, s.alpha.as_slice())),
                 &exposed,
@@ -556,12 +593,13 @@ fn run_window(window: Window<'_>) -> Result<Forecast, EventHistoryError> {
                 let pass = filter(&state, &times, &weights, &chain_eta)?;
                 let log_s_j: f64 = log_s + pass.log_normalisers.iter().sum::<f64>();
                 let last = times.len() - 1;
+                let at_j = forecast_normaliser(fit, stratum, &[t_j]);
                 let intensities = expected_intensities(
                     &pass.grids[last],
                     &pass.predicted[last],
                     eta_at(point_j),
                     &loadings,
-                    None,
+                    at_j.as_deref(),
                     marks,
                     atoms,
                 );
@@ -701,6 +739,7 @@ pub fn forecast(
         cohort,
         cohort.covariates.view(),
         request.history,
+        request.stratum,
         request.horizons,
         request.future,
     )
@@ -731,6 +770,7 @@ pub fn forecast_history(
         cohort,
         request.covariates,
         request.history,
+        request.stratum,
         request.horizons,
         request.future,
     )
@@ -741,6 +781,7 @@ fn forecast_on_table(
     cohort: &EventHistoryCohort,
     table: ArrayView2<'_, f64>,
     history: &SubjectHistory,
+    stratum: usize,
     horizons: &[f64],
     future: &[FutureSegment],
 ) -> Result<Forecast, EventHistoryError> {
@@ -764,7 +805,7 @@ fn forecast_on_table(
         });
     }
     let (loadings, rates) = latent_parameters(fit);
-    let state = observed_state(fit, cohort, table, history, &loadings, &rates)?;
+    let state = observed_state(fit, cohort, table, history, stratum, &loadings, &rates)?;
     let (table, segments) = future_table(
         table,
         future,
@@ -780,6 +821,7 @@ fn forecast_on_table(
     run_window(Window {
         fit,
         cohort,
+        stratum,
         initial: Some(&state),
         start: history.exit,
         horizons,
@@ -820,6 +862,7 @@ pub fn population_forecast(
     run_window(Window {
         fit,
         cohort,
+        stratum: request.stratum,
         initial: None,
         start: request.start,
         horizons: request.horizons,
@@ -838,6 +881,7 @@ pub fn predictive_pit(
     fit: &EventHistoryFit,
     cohort: &EventHistoryCohort,
     history: &SubjectHistory,
+    stratum: usize,
 ) -> Result<Vec<SpellPit>, EventHistoryError> {
     let marks = fit.marks();
     let atoms = fit.rank();
@@ -846,6 +890,7 @@ pub fn predictive_pit(
     let nodes = single_subject_nodes(fit, cohort, cohort.covariates.view(), history)?;
     let eta0 = node_eta0(fit, nodes.node_data.view())?;
     let subject = &nodes.subjects[0];
+    let normaliser = forecast_normaliser(fit, stratum, &subject.times);
     let pass = forward_filter(
         &SubjectInputs {
             nodes: subject,
@@ -856,7 +901,7 @@ pub fn predictive_pit(
             gh: fit.family.gauss_hermite(),
             continuation_gap: 0.0,
             designs: None,
-            log_normaliser: None,
+            log_normaliser: normaliser.as_deref(),
         },
         None,
         &vec![true; marks],
@@ -891,7 +936,9 @@ pub fn predictive_pit(
             &pass.predicted[n],
             &eta0[n * marks..(n + 1) * marks],
             &loadings,
-            None,
+            normaliser
+                .as_deref()
+                .map(|m| &m[n * marks..(n + 1) * marks]),
             marks,
             atoms,
         );

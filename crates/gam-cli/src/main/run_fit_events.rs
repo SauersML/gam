@@ -359,7 +359,7 @@ pub(crate) fn run_fit_events(args: FitEventsArgs) -> Result<(), String> {
     if fit.rank() > 0 {
         let mut states = Vec::with_capacity(cohort.subjects.len());
         for subject in &cohort.subjects {
-            let state = latent_state(&fit, &cohort, subject).map_err(|e| e.to_string())?;
+            let state = latent_state(&fit, &cohort, subject, 0).map_err(|e| e.to_string())?;
             states.push(json!({
                 "id": subject.id,
                 "time": state.times,
@@ -409,7 +409,7 @@ pub(crate) fn run_fit_events(args: FitEventsArgs) -> Result<(), String> {
     );
     let mut pits = Vec::new();
     for subject in &cohort.subjects {
-        pits.extend(predictive_pit(&fit, &cohort, subject).map_err(|e| e.to_string())?);
+        pits.extend(predictive_pit(&fit, &cohort, subject, 0).map_err(|e| e.to_string())?);
     }
     summary.insert("pit_spells".to_string(), json!(pits.len()));
     summary.insert(
@@ -451,6 +451,7 @@ pub(crate) fn run_fit_events(args: FitEventsArgs) -> Result<(), String> {
                     history: subject,
                     horizons: &horizons,
                     future: &[],
+                    stratum: 0,
                 },
             )
             .map_err(|e| e.to_string())?;
@@ -467,6 +468,7 @@ pub(crate) fn run_fit_events(args: FitEventsArgs) -> Result<(), String> {
                         start: subject.exit,
                         covariates: cohort.covariates.row(row).to_vec(),
                     }],
+                    stratum: 0,
                 },
             )
             .map_err(|e| e.to_string())?;

@@ -161,7 +161,7 @@ impl PyEventHistoryModel {
         let fit = Arc::clone(&self.fit);
         let cohort = Arc::clone(&self.cohort);
         let state = detach_py_result(py, "event-history latent state", move || {
-            latent_state(&fit, &cohort, &history).map_err(|e| e.to_string())
+            latent_state(&fit, &cohort, &history, 0).map_err(|e| e.to_string())
         })?;
         let atoms = self.fit.rank();
         let mut covariance = Array3::<f64>::zeros((state.times.len(), atoms, atoms));
@@ -264,6 +264,7 @@ impl PyEventHistoryModel {
                     history: &history,
                     horizons: &horizons,
                     future: &future,
+                    stratum: 0,
                 },
             )
             .map_err(|e| e.to_string())
@@ -291,6 +292,7 @@ impl PyEventHistoryModel {
                     start,
                     horizons: &horizons,
                     future: &future,
+                    stratum: 0,
                 },
             )
             .map_err(|e| e.to_string())
@@ -312,7 +314,7 @@ impl PyEventHistoryModel {
         let fit = Arc::clone(&self.fit);
         let cohort = Arc::clone(&self.cohort);
         let pits = detach_py_result(py, "event-history pit", move || {
-            predictive_pit(&fit, &cohort, &history).map_err(|e| e.to_string())
+            predictive_pit(&fit, &cohort, &history, 0).map_err(|e| e.to_string())
         })?;
         let marks = self.fit.marks();
         let mut probabilities = Array2::<f64>::zeros((pits.len(), marks));
@@ -348,7 +350,7 @@ impl PyEventHistoryModel {
         let (distance, spells, events) = detach_py_result(py, "event-history pit", move || {
             let mut pits = Vec::new();
             for subject in &cohort.subjects {
-                pits.extend(predictive_pit(&fit, &cohort, subject).map_err(|e| e.to_string())?);
+                pits.extend(predictive_pit(&fit, &cohort, subject, 0).map_err(|e| e.to_string())?);
             }
             let events = pits.iter().filter(|p| p.observed).count();
             Ok((pit_uniform_distance(&pits), pits.len(), events))
@@ -426,6 +428,7 @@ impl PyEventHistoryModel {
                     covariates: table.view(),
                     horizons: &horizons,
                     future: &future,
+                    stratum: 0,
                 },
             )
             .map_err(|e| e.to_string())
