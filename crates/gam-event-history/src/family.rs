@@ -307,23 +307,6 @@ impl EventHistoryFamily {
         self.reference.is_some()
     }
 
-    /// The reference population's tables, when the fit has one.
-    pub fn reference(&self) -> Option<&Arc<ReferenceTables>> {
-        self.reference.as_ref()
-    }
-
-    /// The normaliser carried onto this family's nodes, for comparing two
-    /// reference grids on one common set of times.
-    pub fn normaliser_on_nodes(&self, held: &[f64]) -> Result<Vec<f64>, EventHistoryError> {
-        let tables = self
-            .reference
-            .as_ref()
-            .ok_or_else(|| EventHistoryError::InvalidInput {
-                reason: "this family has no reference population".to_string(),
-            })?;
-        tables.carry_to_nodes(held, self.marks(), self.nodes.total_nodes)
-    }
-
     /// The reference law at exactly the supplied coefficient state.
     pub fn refresh_normaliser(&self, states: &[ParameterBlockState]) -> Result<RiskSetCentring, String> {
         self.computed_reference(states)
@@ -777,7 +760,9 @@ impl EventHistoryFamily {
         let rates: Vec<f64> = self.atom_rates(latent);
         let centring = if self.reference.is_some() {
             let values = self.refresh_normaliser(states)?;
-            Some(self.normaliser_on_nodes(&values.log_normaliser).map_err(|error| error.to_string())?)
+            Some(self.reference.as_ref().unwrap().carry_to_nodes(
+                &values.log_normaliser, self.marks(), self.nodes.total_nodes)
+                .map_err(|error| error.to_string())?)
         } else { None };
         let held = centring.as_deref();
         let gh = &self.gh;
@@ -1111,14 +1096,10 @@ pub struct EventHistorySpec {
     /// Starting Gauss-Hermite order per latent axis.
     pub gauss_hermite_order: usize,
     /// The certificate's tolerance: the largest shift any fitted coefficient
-    /// may make under a refinement of the Gauss-Hermite order or of the time
-    /// mesh, in units of that coefficient's posterior standard deviation.
-    /// The order is doubled and the mesh halved until both shifts are below
-    /// it, so a fit is never an artefact of its discretisation at a level
-    /// the data could resolve. The default, a twentieth of a posterior
-    /// standard deviation, is the scale at which a shift cannot change any
-    /// inference the fit supports: it is a twentieth of the width the data
-    /// itself leaves undetermined.
+    /// is estimated to make under a refinement of the Gauss-Hermite order
+    /// or time mesh, in units of its posterior standard deviation. This is
+    /// a local first-order stationarity check, not a bound on every forecast
+    /// or on the posterior approximation. The default is 0.05.
     pub quadrature_tolerance: f64,
     /// The reference population every mark's baseline is the marginal rate
     /// of. `None` centres the latent term on the stationary prior, so
@@ -1541,7 +1522,8 @@ impl Built {
 /// Bytes the family's evaluation may hold at once: the streamed backward
 /// kernel row for one gap, the carried `P × S` conditional expectations,
 /// the per-node densities and operators of every node, per parallel
-/// subject, in the widest scalar the outer solve uses (four channels).
+/// subject, in the widest scalar the outer solve uses (sixteen channels
+/// for mixed reference sensitivities nested over two outer directions).
 fn transient_footprint_bytes(
     order: usize,
     atoms: usize,
@@ -1556,7 +1538,7 @@ fn transient_footprint_bytes(
         + total_width as f64 * s
         + n * s * (4.0 + marks as f64)
         + n * atoms as f64 * 3.0 * g * g;
-    let channels = 4.0;
+    let channels = 16.0;
     let bytes = 8.0 * channels * per_subject * rayon::current_num_threads() as f64;
     Ok(bytes)
 }
@@ -1648,8 +1630,8 @@ impl RankStart {
 pub struct RankStep {
     /// Rank before the step.
     pub rank: usize,
-    /// The score's top eigenvalue at the proposed rate: the second-order
-    /// evidence slope along the proposed direction.
+    /// Top eigenvalue of the differentiated loading curvature at the
+    /// proposed rate, after its quadrature-resolution check.
     pub score_eigenvalue: f64,
     /// `μ² / (4J)` of the top direction: its second-order evidence gain in
     /// nats, the matched-filter statistic the rate maximises.
@@ -1667,15 +1649,11 @@ pub struct RankStep {
     /// `ln λ̂`: the precision of the loading prior the evidence chose;
     /// infinite when no finite prior raises the marginal likelihood.
     pub ridge_log_lambda: f64,
-    /// The evidence the prior buys over the current rank, in nats: the
-    /// marginal likelihood at `λ̂` against the atom pinned to zero, under the
-    /// score's quartic model of the evidence. This is the number the
-    /// decision was made on.
+    /// Fitted Laplace-criterion gain, or zero when no candidate was fitted.
+    /// This is not an exact marginal evidence calculation.
     pub evidence_gain: f64,
     /// The realised increase of the marginal log-likelihood at the mode from
-    /// the rank before to the fitted candidate; zero for a refused atom. The
-    /// quartic model is exact at the boundary, where the decision is made,
-    /// and only a model further out, so the two differ for a strong atom.
+    /// the rank before to the fitted candidate; zero if no fit was attempted.
     pub log_likelihood_gain: f64,
     /// The prior places the loading's posterior mode away from zero, so the
     /// atom was fitted.
@@ -1690,11 +1668,8 @@ pub struct RankStep {
 /// The reference population's grid, its per-stratum designs, and where every
 /// cohort node sits on that grid.
 ///
-/// The grid is one window spanning every subject's follow-up, expanded by the
-/// same node expansion the fit uses, for one pseudo-subject per stratum
-/// holding that stratum's covariate row. Every stratum therefore shares the
-/// node times, and a stratum's rows sit contiguously in the design, which is
-/// what makes the normaliser one lookup per cohort node.
+/// Uniform endpoints span the reference window. Every stratum shares these
+/// times, with its own covariate profile and contiguous design rows.
 fn reference_tables(
     cohort: &EventHistoryCohort,
     strata: &ReferenceStrata,
@@ -2617,7 +2592,7 @@ fn fit_event_history_on_grid(
             at_resolution_limit: atom.at_upper_limit,
             rate_held: atom.rate_held(),
             ridge_log_lambda: atom.ridge.log_lambda,
-            evidence_gain: atom.ridge.gain,
+            evidence_gain: 0.0,
             log_likelihood_gain: 0.0,
             accepted: atom.ridge.accepted,
             converged: true,
