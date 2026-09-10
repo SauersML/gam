@@ -63,6 +63,32 @@ pub struct JointCohortScore {
     conditional_standard_error: Vec<f64>,
 }
 
+/// Cohort observation density times the decoder function prior, in the
+/// current coefficient chart. Other function priors are not included yet.
+/// This is an integrand for coefficient inference, not a fitted model or
+/// a REML/LAML criterion obtained by integrating those coefficients.
+pub struct JointDecoderScore {
+    cohort: JointCohortScore,
+    prior: DecoderPriorEvaluation,
+    log_density: f64,
+    gradient: Vec<f64>,
+}
+
+impl JointDecoderScore {
+    pub fn cohort(&self) -> &JointCohortScore {
+        &self.cohort
+    }
+    pub fn prior(&self) -> &DecoderPriorEvaluation {
+        &self.prior
+    }
+    pub fn log_density(&self) -> f64 {
+        self.log_density
+    }
+    pub fn gradient(&self) -> &[f64] {
+        &self.gradient
+    }
+}
+
 impl JointCohortScore {
     pub fn evaluation(&self) -> &JointCohortEvaluation<f64> {
         &self.evaluation
@@ -155,6 +181,32 @@ fn assemble<S: JetField>(
 }
 
 impl JointCohortIntegration<'_, '_> {
+    pub fn score_with_decoder_prior(
+        &self,
+        theta: &[f64],
+        log_strengths: &[f64],
+        accuracy: &IntegrationAccuracy,
+    ) -> Result<JointDecoderScore, EventHistoryError> {
+        let prior = self.model.decoder_prior(theta, log_strengths)?;
+        let cohort = self.score(theta, accuracy)?;
+        let log_density = cohort.evaluation().log_likelihood() + prior.log_density();
+        let gradient: Vec<_> = cohort
+            .gradient()
+            .iter()
+            .zip(prior.gradient())
+            .map(|(a, b)| a + b)
+            .collect();
+        if !log_density.is_finite() || gradient.iter().any(|v| !v.is_finite()) {
+            return Err(numerical("non-finite cohort density with decoder prior"));
+        }
+        Ok(JointDecoderScore {
+            cohort,
+            prior,
+            log_density,
+            gradient,
+        })
+    }
+
     /// One authoritative coefficient/reference/Jacobian state per stratum.
     /// Strata are processed sequentially, and only aggregate coefficient
     /// scores/errors are retained, avoiding subjects x coefficients storage.
@@ -436,6 +488,39 @@ mod tests {
             .collect();
         let jet = cohort.log_likelihood(&seeds, &accuracy).unwrap();
         let analytic = cohort.score(&theta, &accuracy).unwrap();
+        let regularized = cohort
+            .score_with_decoder_prior(&theta, &[0.3], &accuracy)
+            .unwrap();
+        assert_eq!(
+            regularized.log_density(),
+            value.log_likelihood() + regularized.prior().log_density()
+        );
+        assert_eq!(regularized.cohort().evaluation().coefficients(), &theta);
+        for j in 0..theta.len() {
+            assert!(
+                (regularized.gradient()[j]
+                    - analytic.gradient()[j]
+                    - regularized.prior().gradient()[j])
+                    .abs()
+                    < 1e-12
+            );
+        }
+        let decoder = model.layout.decoder.start;
+        let mut right = theta.clone();
+        let mut left = theta.clone();
+        right[decoder] += 1e-4;
+        left[decoder] -= 1e-4;
+        let right_value = cohort
+            .log_likelihood(&right, &accuracy)
+            .unwrap()
+            .log_likelihood()
+            + model.decoder_prior(&right, &[0.3]).unwrap().log_density();
+        let left_value = cohort
+            .log_likelihood(&left, &accuracy)
+            .unwrap()
+            .log_likelihood()
+            + model.decoder_prior(&left, &[0.3]).unwrap().log_density();
+        assert!((regularized.gradient()[decoder] - (right_value - left_value) / 2e-4).abs() < 5e-7);
         assert_eq!(analytic.evaluation().coefficients(), &theta);
         assert_eq!(analytic.evaluation().strata(), &strata);
         assert_eq!(

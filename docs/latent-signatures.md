@@ -213,8 +213,53 @@ This identity does not justify an arbitrary identity ridge on nonlinear
 decoder logits, rate coordinates, or an intercept. Nonlinear function priors
 also need their normalization and coordinate Jacobians in any evidence
 calculation; substituting a Gaussian penalty determinant would change the
-objective. These penalty and hyperparameter-learning components are not yet
-implemented for the joint model.
+objective. The decoder's normalized function prior is implemented below;
+the remaining function priors and hyperparameter learning are unfinished.
+
+### Decoder function prior
+
+At fixed time and reference stratum write the final intensity as
+`F(x) = c [pi_0 + sum_k pi_k softplus(x_k)]`, where `c` includes the
+baseline and reference normalizer. Its lower asymptote is `L = c pi_0`,
+and its slope as axis `k` tends to positive infinity is `s_k = c pi_k`.
+Thus `b(F) = L / (L + sum_k s_k) = pi_0` is determined by the final
+function, independently of `c`. The penalty `J(F) = -log b(F)` shrinks
+latent disease dependence without penalizing the baseline rate.
+
+With simplex volume as the base measure, the normalized prior is
+
+```text
+p(pi | lambda) = C_K(lambda) pi_0^lambda,
+C_K(lambda) = product_{j=1}^K (lambda + j), lambda > 0.
+```
+
+This is `Dirichlet(1+lambda, 1, ..., 1)`. In decoder coordinates
+`w_k = log(pi_k/pi_0)`, the simplex Jacobian is `pi_0 product_k pi_k`, so
+the log density used in coefficient inference is
+
+```text
+log C_K(lambda) + sum_k w_k
+    - (lambda + K + 1) log(1 + sum_k exp(w_k)).
+```
+
+`JointLikelihood::decoder_prior` includes this normalizer and Jacobian,
+analytic coefficient/hyperparameter derivatives, and a Hessian-vector
+product with linear work and storage in K. Its implementation retains
+curvature even when a simplex probability rounds to one. The exact prior
+means are `(1+lambda)/(K+lambda+1)` for the background and
+`1/(K+lambda+1)` for each signature. They are prior means, not fitted
+posterior estimates. The no-latent-effect function is recovered as
+`lambda` tends to infinity; at K=0 the prior is a point mass with no
+strength coordinate.
+
+`JointCohortIntegration::score_with_decoder_prior` combines this density
+with the shared-reference observation integral and its total coefficient
+score. This is an integrand for coefficient inference. It does not yet
+include the other function priors, integrate global coefficients, learn
+strengths, or produce a fit. Maximizing its joint density would not be
+REML/LAML. A Laplace approximation must also be checked in the strong
+shrinkage limit: exact prior normalization alone does not make an
+approximation to its coefficient integral exact.
 
 Training may use a structured variational approximation with local Gaussian
 state factors and temporal precision blocks, plus shared parameter factors.

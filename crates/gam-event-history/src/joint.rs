@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 use std::ops::Range;
 
 mod cohort;
+mod decoder_prior;
 mod emission;
 mod integration;
 mod posterior;
@@ -23,7 +24,9 @@ mod resolution;
 mod score;
 pub use cohort::{
     JointCohortEvaluation, JointCohortIntegration, JointCohortPosterior, JointCohortScore,
+    JointDecoderScore,
 };
+pub use decoder_prior::DecoderPriorEvaluation;
 pub use integration::{
     IntegratedLikelihood, IntegratedPosterior, IntegratedScore, IntegrationAccuracy,
     IntegrationOptions, JointIntegration,

@@ -391,3 +391,41 @@ coefficient geometry. Function penalties, coefficient curvature, REML/LAML
 learning, coefficient posterior means, learned complexity, entry conditioning,
 serving parity, and calibration remain unfinished. This change adds the complete
 analytic first-order cohort path; it does not add a certified fitted model.
+
+## Normalized decoder function prior
+
+The positive decoder now has a normalized prior on its final intensity
+shape. The background fraction is the intensity's lower asymptote divided
+by that asymptote plus the sum of upper-axis slopes. It is independent of
+the baseline/reference scale. Penalizing its negative log therefore shrinks
+latent disease dependence without putting a ridge on a baseline intercept.
+The resulting Dirichlet law includes its exact finite-product normalizer
+and the simplex-to-logit Jacobian in the coefficient density.
+
+The cohort score can include this decoder prior with analytic coefficient,
+strength, and mixed derivatives. Its negative Hessian product has linear
+work and storage in the signature count. Centering that product on the
+most probable simplex category preserves small curvature when a probability
+rounds to one; log-scaled background terms retain curvature when the
+unscaled background probability underflows.
+
+The initial **36 focused tests passed in 10.64 s**. After the Hessian
+precision correction, **37 focused tests passed in 10.35 s**, following
+a **42.18 s** targeted warm MSI compile with four compile CPUs and two
+test threads. Fifty other tests were filtered out. Raw final output is
+`event_history_decoder_prior_20260910.txt`. No local build or tests ran.
+
+Checks include independent integration on a two-signature simplex (unit
+mass, exact prior means, and zero expected strength score), all pairwise
+coefficient/strength derivatives against test-only AD, scale invariance
+over sixty orders of magnitude, the cohort total-score connection, rank
+zero, and log strengths up to 1e200. Closed-form saturated-curvature
+checks include a logit of 800 with log strength 700: the unscaled
+background underflows but the curvature is approximately exp(-100).
+
+This is one normalized function-prior component and its coefficient
+integrand, not REML/LAML learning. Other function priors, coefficient
+curvature/integration, combined reference error assessment, learned
+complexity, entry conditioning, serving parity, and calibration remain
+unfinished. Exact prior normalization does not establish accuracy of a
+later Laplace approximation to the coefficient integral.
