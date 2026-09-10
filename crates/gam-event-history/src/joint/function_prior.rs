@@ -1,9 +1,15 @@
-//! Gaussian priors induced by squared final-function norms. The root is a
-//! function-measure operator, not an arbitrary coefficient ridge. Its exact
-//! determinant normalizes each penalized coordinate block. Unpenalized
-//! nuisance coordinates still require coefficient integration in REML.
+//! Normalized priors on final-function properties. Gaussian blocks use a
+//! function-measure root and its exact determinant; nonlinear blocks include
+//! their chart Jacobians. Global coefficient integration remains necessary.
 use super::*;
 use std::sync::Arc;
+
+#[path = "structural_prior.rs"]
+mod structural;
+use structural::{ScalarPriorEvaluation, StructuralFunction};
+#[path = "category_prior.rs"]
+mod category;
+use category::{CategoryEvaluation, CategoryPriors};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum FunctionPenalty {
@@ -14,6 +20,12 @@ pub enum FunctionPenalty {
     EntryPrevalence { mark: usize },
     DiseaseJump { mark: usize },
     MeasurementEffect { channel: usize },
+    TemporalVariation,
+    MeasurementPrecision { channel: usize },
+    TailVarianceInflation { channel: usize },
+    CountOverdispersion { channel: usize },
+    CountMean { channel: usize },
+    BaselineLevel,
 }
 
 struct FunctionRoot {
@@ -36,6 +48,10 @@ pub struct JointFunctionPriors<'m> {
     model: &'m JointLikelihood,
     penalties: Vec<FunctionPenalty>,
     gaussian: Vec<GaussianFunction>,
+    structural: Vec<Vec<StructuralFunction>>,
+    category: CategoryPriors,
+    baseline_mean_design: Vec<f64>,
+    log_followup_scale: f64,
     decoder_strengths: usize,
     memory_limit_bytes: usize,
 }
@@ -51,6 +67,9 @@ pub struct FunctionPriorEvaluation<'a, 'm> {
     prior: &'a JointFunctionPriors<'m>,
     decoder: DecoderPriorEvaluation,
     gaussian: Vec<GaussianEvaluation>,
+    structural: Vec<Vec<ScalarPriorEvaluation>>,
+    category: CategoryEvaluation,
+    baseline_weights: Vec<f64>,
     log_density: f64,
     gradient: Vec<f64>,
     strength_gradient: Vec<f64>,
@@ -135,8 +154,9 @@ fn product_root(left: &FunctionRoot, right: &FunctionRoot) -> FunctionRoot {
 impl JointLikelihood {
     /// Equal subject measure; within a follow-up, time measure is normalized
     /// Lebesgue exposure. Genetic effects use the declared Gaussian score law.
-    /// Baseline bases must contain their constant as column zero. The prior
-    /// on variation removes that constant; it leaves its rate level free.
+    /// Baseline bases must contain their constant as column zero. The
+    /// variation penalty removes it; a separate positive-level prior uses
+    /// the geometric baseline rate under the same function measure.
     ///
     /// Entry prevalence is a function contrast against no prevalent diagnosis,
     /// not an invented distribution of pre-entry event-free follow-up.
@@ -191,6 +211,10 @@ impl JointLikelihood {
                 .map(|mark| FunctionPenalty::Decoder { mark })
                 .collect(),
             gaussian: Vec::new(),
+            structural: Vec::new(),
+            category: CategoryPriors::new(self),
+            baseline_mean_design: vec![0.0; b],
+            log_followup_scale: 0.0,
             decoder_strengths,
             memory_limit_bytes,
         };
@@ -253,6 +277,7 @@ impl JointLikelihood {
             }
         }
         if k == 0 {
+            result.add_structural_priors(histories)?;
             return Ok(result);
         }
         // E[(a + b'g)^2] = (a+b'mu)^2 + ||L^{-1}b||^2,
@@ -369,6 +394,7 @@ impl JointLikelihood {
                 scale,
             );
         }
+        result.add_structural_priors(histories)?;
         Ok(result)
     }
 }
@@ -396,14 +422,19 @@ impl<'m> JointFunctionPriors<'m> {
         let decoder = self
             .model
             .decoder_prior(theta, &log_strengths[..self.decoder_strengths])?;
+        let mut gradient = decoder.gradient().to_vec();
+        let category = self.category.evaluate(theta, &mut gradient);
         let mut result = FunctionPriorEvaluation {
             prior: self,
-            log_density: decoder.log_density(),
-            gradient: decoder.gradient().to_vec(),
+            log_density: decoder.log_density() + category.log_density(),
+            gradient,
             strength_gradient: decoder.log_strength_gradient().to_vec(),
             strength_second: decoder.log_strength_second_derivative().to_vec(),
             decoder,
             gaussian: Vec::with_capacity(self.gaussian.len()),
+            structural: Vec::with_capacity(self.structural.len()),
+            category,
+            baseline_weights: Vec::with_capacity(self.model.spec.marks.len()),
         };
         for (index, function) in self.gaussian.iter().enumerate() {
             let half = 0.5 * log_strengths[self.decoder_strengths + index]
@@ -434,6 +465,51 @@ impl<'m> JointFunctionPriors<'m> {
                 result.gradient[q] -= 2.0 * strength_score;
             }
             result.gaussian.push(evaluation);
+        }
+        // Independent exponential priors on the dimensionless geometric
+        // baseline levels, with one shared learned strength across marks.
+        // The change from intercept to level is triangular with the shape
+        // coordinates and has Jacobian equal to that positive level.
+        let rho = log_strengths[self.decoder_strengths + self.gaussian.len()];
+        let b = self.baseline_mean_design.len();
+        let mut baseline_weight = 0.0;
+        for mark in 0..self.model.spec.marks.len() {
+            let start = self.model.layout.baseline.start + mark * b;
+            let log_weight = (rho + theta[start])
+                + self.log_followup_scale
+                + self.baseline_mean_design[1..]
+                    .iter()
+                    .zip(&theta[start + 1..start + b])
+                    .map(|(a, v)| a * v)
+                    .sum::<f64>();
+            let weight = log_weight.exp();
+            result.log_density += log_weight - weight;
+            for (j, &a) in self.baseline_mean_design.iter().enumerate() {
+                result.gradient[start + j] += (1.0 - weight) * a;
+            }
+            baseline_weight += weight;
+            result.baseline_weights.push(weight);
+        }
+        result
+            .strength_gradient
+            .push(self.model.spec.marks.len() as f64 - baseline_weight);
+        result.strength_second.push(-baseline_weight);
+        for (index, functions) in self.structural.iter().enumerate() {
+            let rho = log_strengths[self.decoder_strengths + self.gaussian.len() + 1 + index];
+            let mut first = 0.0;
+            let mut second = 0.0;
+            let mut values = Vec::with_capacity(functions.len());
+            for function in functions {
+                let value = function.evaluate(theta, rho);
+                result.log_density += value.log_density;
+                result.gradient[value.coordinate] += value.first;
+                first += value.strength_first;
+                second += value.strength_second;
+                values.push(value);
+            }
+            result.strength_gradient.push(first);
+            result.strength_second.push(second);
+            result.structural.push(values);
         }
         if !result.log_density.is_finite()
             || result
@@ -496,6 +572,26 @@ impl FunctionPriorEvaluation<'_, '_> {
                 out[q] += cross + 4.0 * evaluation.weighted_penalty * scale_direction;
             }
         }
+        for values in &self.structural {
+            for value in values {
+                out[value.coordinate] -= value.second * direction[value.coordinate];
+            }
+        }
+        self.category.add_negative_hessian(direction, &mut out);
+        let b = self.prior.baseline_mean_design.len();
+        for (mark, &weight) in self.baseline_weights.iter().enumerate() {
+            let start = self.prior.model.layout.baseline.start + mark * b;
+            let delta: f64 = self
+                .prior
+                .baseline_mean_design
+                .iter()
+                .zip(&direction[start..start + b])
+                .map(|(a, v)| a * v)
+                .sum();
+            for (j, &a) in self.prior.baseline_mean_design.iter().enumerate() {
+                out[start + j] += weight * delta * a;
+            }
+        }
         if out.iter().any(|v| !v.is_finite()) {
             return Err(numerical(
                 "function prior Hessian product is not representable",
@@ -536,6 +632,21 @@ impl FunctionPriorEvaluation<'_, '_> {
             }
             if let Some(q) = function.log_scale {
                 out[q] += 2.0 * evaluation.weighted_penalty * value;
+            }
+        }
+        for (index, values) in self.structural.iter().enumerate() {
+            let direction =
+                direction[self.prior.decoder_strengths + self.prior.gaussian.len() + 1 + index];
+            for value in values {
+                out[value.coordinate] += value.mixed * direction;
+            }
+        }
+        let level_direction = direction[self.prior.decoder_strengths + self.prior.gaussian.len()];
+        let b = self.prior.baseline_mean_design.len();
+        for (mark, &weight) in self.baseline_weights.iter().enumerate() {
+            let start = self.prior.model.layout.baseline.start + mark * b;
+            for (j, &a) in self.prior.baseline_mean_design.iter().enumerate() {
+                out[start + j] -= weight * a * level_direction;
             }
         }
         if out.iter().any(|v| !v.is_finite()) {
@@ -659,7 +770,84 @@ mod tests {
                 }
             }
         }
+        let b = prior.baseline_mean_design.len();
+        for mark in 0..prior.model.spec.marks.len() {
+            let start = prior.model.layout.baseline.start + mark * b;
+            let log_level = theta[start..start + b]
+                .iter()
+                .zip(&prior.baseline_mean_design)
+                .fold(
+                    theta[0].constant_like(prior.log_followup_scale),
+                    |v, (x, &a)| v.add(&x.scale(a)),
+                );
+            let total = rho[prior.decoder_strengths + prior.gaussian.len()].add(&log_level);
+            value = value.add(&total).sub(&exp(&total));
+        }
+        value = value.add(&category::tests::oracle(&prior.category, theta));
+        for (index, functions) in prior.structural.iter().enumerate() {
+            for function in functions {
+                value = value.add(&structural::tests::oracle(
+                    function,
+                    theta,
+                    &rho[prior.decoder_strengths + prior.gaussian.len() + 1 + index],
+                ));
+            }
+        }
         value
+    }
+
+    #[test]
+    fn positive_baseline_level_prior_has_the_poisson_gamma_limit_even_without_events() {
+        let model = JointLikelihood::new(JointSpecification {
+            signatures: 0,
+            marks: vec![MarkKind::Recurrent, MarkKind::Recurrent],
+            baseline_columns: 1,
+            drive_columns: 0,
+            entry_columns: 0,
+            measurements: vec![],
+            genetic_mean: vec![],
+            genetic_precision: Array2::zeros((0, 0)),
+        })
+        .unwrap();
+        let history = JointHistory {
+            times: vec![0.0, 1.0, 2.0],
+            exposure: vec![0.0, 2.0, 0.0],
+            events: vec![None; 3],
+            initially_at_risk: vec![true; 2],
+            baseline_design: Array2::ones((3, 1)),
+            drive_design: Array2::zeros((2, 0)),
+            entry_design: vec![],
+            genetics: vec![],
+            measurements: vec![],
+        };
+        let prior = model.function_priors(&[&history], 1 << 20).unwrap();
+        assert_eq!(prior.penalties(), &[FunctionPenalty::BaselineLevel]);
+        let (nodes, weights) = gam_math::special::gauss_legendre(129);
+        let rho = 0.3_f64;
+        for events in [0, 5] {
+            let exposure = 3.0;
+            let rate = exposure + 2.0 * rho.exp();
+            let mut mass = 0.0;
+            let mut mean = 0.0;
+            for (&node, &weight) in nodes.iter().zip(&weights) {
+                let hazard = 50.0 * (node + 1.0) / rate;
+                let q = hazard.ln();
+                let out = prior.evaluate(&[q, -0.4], &[rho]).unwrap();
+                let w = (out.log_density() + events as f64 * q - exposure * hazard - q).exp()
+                    * 50.0
+                    * weight
+                    / rate;
+                mass += w;
+                mean += w * hazard;
+            }
+            let expected = (events + 1) as f64 / rate;
+            assert!((mean / mass / expected - 1.0).abs() < 1e-12);
+        }
+        let extreme = prior.evaluate(&[-1e200, -1e200], &[1e200]).unwrap();
+        for g in extreme.gradient() {
+            assert!((g + 1.0).abs() < 1e-12);
+        }
+        assert!((extreme.log_strength_gradient()[0] + 2.0).abs() < 1e-12);
     }
 
     #[test]
@@ -745,7 +933,8 @@ mod tests {
         let l00 = (1.0_f64 / det).sqrt();
         let l10 = -0.4 / det / l00;
         let l11 = (2.0 / det - l10 * l10).sqrt();
-        for (index, label) in prior.penalties()[prior.decoder_strengths..]
+        for (index, label) in prior.penalties()
+            [prior.decoder_strengths..prior.decoder_strengths + prior.gaussian.len()]
             .iter()
             .enumerate()
         {
@@ -818,7 +1007,13 @@ mod tests {
                             // Equal time mass at t=.5 and t=1.5 gives variance .25.
                             energy += weight * 0.25 * theta[start + 1].powi(2);
                         }
-                        FunctionPenalty::Decoder { .. } => unreachable!(),
+                        FunctionPenalty::Decoder { .. }
+                        | FunctionPenalty::TemporalVariation
+                        | FunctionPenalty::MeasurementPrecision { .. }
+                        | FunctionPenalty::TailVarianceInflation { .. }
+                        | FunctionPenalty::CountOverdispersion { .. }
+                        | FunctionPenalty::CountMean { .. }
+                        | FunctionPenalty::BaselineLevel => unreachable!(),
                     }
                 }
             }
@@ -857,14 +1052,9 @@ mod tests {
         for (a, b) in new.gaussian.iter().zip(&out.gaussian) {
             assert!((a.weighted_penalty - b.weighted_penalty).abs() < 1e-13);
         }
-        for mark in 0..3 {
-            beta[2 * mark] += 100.0;
-            assert_eq!(out.gradient()[2 * mark], 0.0);
+        for (a, b) in new.baseline_weights.iter().zip(&out.baseline_weights) {
+            assert!((a - b).abs() < 1e-13);
         }
-        assert_eq!(
-            changed.evaluate(&beta, &rho).unwrap().log_density(),
-            new.log_density()
-        );
         assert!(
             model
                 .function_priors(&histories.iter().collect::<Vec<_>>(), 1)
@@ -915,6 +1105,12 @@ mod tests {
         let mut rho = vec![0.0; prior.penalties().len()];
         let standard = prior.evaluate(&theta, &rho).unwrap();
         rho[measurement] = 800.0;
+        let noise = prior
+            .penalties()
+            .iter()
+            .position(|p| *p == FunctionPenalty::MeasurementPrecision { channel: 0 })
+            .unwrap();
+        rho[noise] = 800.0;
         theta[model.layout.measurement_shape[0].start] = 400.0;
         let shifted = prior.evaluate(&theta, &rho).unwrap();
         assert_eq!(standard.log_density(), shifted.log_density());

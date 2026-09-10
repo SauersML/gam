@@ -215,8 +215,8 @@ This identity does not justify an arbitrary identity ridge on nonlinear
 decoder logits, rate coordinates, or an intercept. Nonlinear function priors
 also need their normalization and coordinate Jacobians in any evidence
 calculation; substituting a Gaussian penalty determinant would change the
-objective. The decoder and Gaussian function priors are implemented below;
-nuisance-shape/structural priors and hyperparameter learning are unfinished.
+objective. The function priors below are implemented; coefficient integration
+and hyperparameter learning are unfinished.
 
 ### Decoder function prior
 
@@ -255,7 +255,7 @@ posterior estimates. The no-latent-effect function is recovered as
 strength coordinate.
 
 `JointCohortIntegration::score_with_function_priors` combines this density
-and the Gaussian function priors below with the shared-reference observation
+and the function priors below with the shared-reference observation
 integral and its total coefficient score. This is an integrand for coefficient
 inference. It does not integrate global coefficients, learn strengths, or
 produce a fit. Maximizing its joint density would not be REML/LAML.
@@ -271,7 +271,7 @@ normalized exposure measure. The genetic measure is the joint Gaussian law in
 the model specification, including its nonzero mean and covariance. The current
 Gaussian penalties are:
 
-* variance of each baseline log-rate surface, leaving its constant level free;
+* variance of each baseline log-rate surface, excluding its constant level;
 * squared energy of the common genetic-drive mean function;
 * squared energy of the entry mean with no prevalent diagnosis, plus a separate
   squared function contrast for each once-only prevalence indicator;
@@ -311,9 +311,45 @@ scaled before multiplication so `exp(rho)` need not itself be representable.
 coefficient Hessian products, strength derivatives, and mixed products without
 a full coefficients-by-strengths matrix. Roots and evaluation workspace are
 bounded before construction. These are normalized densities on their penalized
-blocks, not a proper prior on every global coordinate. Nuisance/structural
-priors, GAM operator-specific smoothness penalties, coefficient integration,
+blocks. GAM operator-specific smoothness penalties, coefficient integration,
 and REML/LAML optimization still need completion.
+
+### Physical rates and observation measures
+
+The constant baseline level has a separate positive-rate prior. Let `T` be
+the mean observed follow-up span and let `bar eta_d` be the mean baseline
+log rate under the same equal-subject, normalized-exposure measure. The
+dimensionless function `v_d = T exp(bar eta_d)` has an exponential law with
+one shared strength across marks. Its density in baseline coordinates includes
+the Jacobian `v_d`. Together with the centered variation prior this is a
+normalized joint density. At fixed strength, an intercept-only mark with zero
+events has a positive posterior mean; the Poisson/Gamma limit is checked by
+independent integration. Learning that strength, including its boundary when
+all marks are empty, is still a fitting responsibility.
+
+The dynamics prior is exponential on `T r`, the temporal variation functional
+`2 T integral_0^infinity [d exp(-r t)/dt]^2 dt`, with one strength shared by
+the signatures. Measurement priors use physical scale and variance functions:
+
+* Student-t residual precision `sigma^-2` has a Gamma shape-three law.
+  This is the smallest integer shape with a finite prior fourth moment of
+  `sigma`.
+* Student-t variance inflation `2/(nu-2)` and negative-binomial excess
+  variance `(Var(Y)-mu)/mu^2 = 1/size` have Gamma shape-five laws. This is
+  the smallest integer shape with four finite inverse-functional moments.
+* The negative-binomial baseline mean has an exponential law.
+* Binary and ordinal baseline category probabilities have a uniform
+  Dirichlet law. In the probit intercept/threshold chart the density includes
+  the normal-CDF and positive-gap Jacobians; it has no strength coordinate.
+
+Each Gamma/exponential strength is represented by its logarithm. Normalizers,
+chart Jacobians, analytic coefficient/strength derivatives and Hessian
+products are included. These choices establish normalized function priors,
+not calibration or finite posterior moments for every possible dataset.
+Student-t location intercepts retain a flat nuisance measure; their
+integrability must be established during coefficient inference. The
+static-process, Gaussian-observation, Poisson-count and zero-effect limits
+still need explicit handling in the eventual strength optimizer.
 
 Training may use a structured variational approximation with local Gaussian
 state factors and temporal precision blocks, plus shared parameter factors.

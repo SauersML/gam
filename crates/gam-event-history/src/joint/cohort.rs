@@ -68,8 +68,8 @@ pub struct JointCohortScore {
 }
 
 /// Cohort observation density times the declared function priors, in the
-/// current coefficient chart. These include decoder shape and the Gaussian
-/// regression/jump/measurement function penalties, not nuisance-shape priors.
+/// current coefficient chart. These include decoder shape, regression,
+/// dynamics, rate levels, and observation shape/base-probability measures.
 /// This is an integrand for coefficient inference, not a fitted model or
 /// a REML/LAML criterion obtained by integrating those coefficients.
 pub struct JointPriorScore<'p, 'm> {
