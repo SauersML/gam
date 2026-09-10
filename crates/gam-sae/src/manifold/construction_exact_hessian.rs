@@ -63,13 +63,10 @@
 /// #931/#2253 desync in a new place. So the larger, derived, invariant floor
 /// wins at both sites and the absolute one is gone.
 ///
-/// A dense diagonalization carries one requirement `μ` cannot express, because
-/// the matrix-free site never incurs it: an eigenvalue below the
-/// eigendecomposition's own backward error `~dim·ε·‖A‖₂` is not a number at all,
-/// whatever `B` says about it. That is a property of the arithmetic and not a
-/// second classification; it is applied as a floor UNDER this one by
-/// [`ExactHessianSpectralBlock::rank_floor`], which also reports the only
-/// crossing that can survive it.
+/// Classification is per ordinary eigendirection of A. Dense and matrix-free
+/// solves both use Euclidean spectral projections and the same direction floor;
+/// the matrix-free solve lifts Ritz vectors to measure their B quadratic forms.
+/// An aggregate Rayleigh quotient of a solution is not a null-space policy.
 pub(crate) fn sae_exact_a_identifiability_floor() -> f64 {
     f64::EPSILON.sqrt()
 }
@@ -184,6 +181,10 @@ pub(crate) enum ArrowMetric<'a> {
 
 impl ArrowMetric<'_> {
     pub(crate) fn quadratic_form(&self, v: ArrayView1<'_, f64>) -> Result<f64, String> {
+        Ok(v.dot(&self.apply(v)?))
+    }
+
+    fn apply(&self, v: ArrayView1<'_, f64>) -> Result<Array1<f64>, String> {
         match self {
             Self::Joint(cache) => {
                 let total_t = cache.delta_t_len();
@@ -199,7 +200,7 @@ impl ArrowMetric<'_> {
                     v.slice(s![..total_t]),
                     v.slice(s![total_t..]),
                 )?;
-                Ok(v.slice(s![..total_t]).dot(&b_v.t) + v.slice(s![total_t..]).dot(&b_v.beta))
+                Ok(Array1::from_iter(b_v.t.iter().chain(b_v.beta.iter()).copied()))
             }
             Self::Coordinate(cache) => {
                 let total_t = cache.delta_t_len();
@@ -210,15 +211,15 @@ impl ArrowMetric<'_> {
                         v.len(),
                     ));
                 }
-                let mut total = 0.0_f64;
+                let mut out = Array1::zeros(total_t);
                 for row in 0..cache.n_rows() {
                     let width = cache.row_dims[row];
                     let base = cache.row_offsets[row];
                     let block_v = v.slice(s![base..base + width]);
                     let applied = cholesky_factor_apply(cache.undamped_factor(row), block_v);
-                    total += block_v.dot(&applied);
+                    out.slice_mut(s![base..base + width]).assign(&applied);
                 }
-                Ok(total)
+                Ok(out)
             }
         }
     }
@@ -271,8 +272,8 @@ impl ExactHessianSpectralBlock {
     /// backward-error bound for a symmetric eigendecomposition — the computed
     /// spectrum of a perturbed `A + E` with `‖E‖₂ ≲ p(dim)·ε·‖A‖₂` — so an
     /// eigenvalue below it carries no significant digits and `ln λ` is not a
-    /// quantity. The matrix-free site never diagonalizes and so never incurs it.
-    /// It is a FLOOR under the identifiability term, never a ceiling, so it can
+    /// quantity. The matrix-free Ritz solve uses the same arithmetic floor.
+    /// It is a floor under the identifiability term, never a ceiling, so it can
     /// only pin directions, never resurrect one the gradient has deflated.
     fn rank_floor(&self, index: usize) -> f64 {
         sae_exact_a_direction_floor(
@@ -282,14 +283,9 @@ impl ExactHessianSpectralBlock {
         )
     }
 
-    /// The one crossing the union floor cannot remove, reported rather than
-    /// left silent (#2673): a direction whose `|λ|` is inside the
-    /// eigendecomposition's backward error while its pencil curvature `μ` is
-    /// resolved. The value pins it because the number is noise; the gradient
-    /// keeps its `A⁻¹` response because the ratio is identifiable. Reaching this
-    /// needs `vᵢᵀBvᵢ ≲ dim·√ε·‖A‖₂`, i.e. `B` seven orders below `A`'s own norm
-    /// along that direction; it has never been observed, and the previous pair
-    /// of floors would not have said so either way.
+    /// Directions discarded by arithmetic resolution despite a resolved
+    /// identifiability ratio. Both adjoint routes discard these directions;
+    /// report them because they indicate that arithmetic sets the rank.
     fn arithmetic_band_crossings(&self) -> usize {
         let arithmetic = (self.eigenvalues.len() as f64) * f64::EPSILON * self.spectral_norm;
         let identifiability_floor = sae_exact_a_identifiability_floor();
@@ -372,7 +368,7 @@ impl ExactHessianSpectralBlock {
     /// `|λ| ≤ rank_floor` is removed, and that band is the ONLY null predicate
     /// on this route (#2674).  Three independent certificates guard the result:
     /// physical backward residual on the retained range, least-squares
-    /// stationarity for the original RHS, and minimum-norm membership in the
+    /// stationarity for the retained operator, and minimum-norm membership in the
     /// retained range.
     fn solve_stationarity(&self, rhs: &SaeArrowVector) -> Result<SaeArrowVector, String> {
         let total_t = rhs.t.len();
@@ -423,7 +419,10 @@ impl ExactHessianSpectralBlock {
         let applied_coefficients = self.eigenvectors.t().dot(&applied);
         let projected_applied = self.eigenvectors.dot(&applied_coefficients);
         let physical_residual = &projected_applied - &projected_rhs;
-        let residual_coefficients = &applied_coefficients - &coefficients;
+        // The normal equations belong to the truncated operator too. Using
+        // the discarded RHS coefficients here rejects a pure numerical-null
+        // RHS even though its declared pseudoinverse response is exactly zero.
+        let residual_coefficients = &applied_coefficients - &projected_coefficients;
         let normal_coefficients = &self.eigenvalues * &residual_coefficients;
         let normal_residual = self.eigenvectors.dot(&normal_coefficients);
 
@@ -609,306 +608,7 @@ pub(crate) struct BundleEvidenceGeometry<'a> {
     pub(crate) sinv: &'a [Array1<f64>],
 }
 
-/// Certified exact-stationarity solve for a genuinely matrix-free operator.
-/// Dense operators bypass this Krylov path and use the rank-revealing spectral
-/// pseudoinverse owned by [`ExactHessianSpectralBlock`].
-fn solve_exact_stationarity_preconditioned<A, B, P>(
-    rhs: &SaeArrowVector,
-    apply_a: &A,
-    apply_b: &B,
-    precondition: P,
-) -> Result<SaeArrowVector, String>
-where
-    A: Fn(&SaeArrowVector) -> Result<SaeArrowVector, String>,
-    B: Fn(&SaeArrowVector) -> Result<SaeArrowVector, String>,
-    P: Fn(&SaeArrowVector) -> Result<SaeArrowVector, String>,
-{
-    let mut x = solve_b_preconditioned_gmres_with(rhs, |v| apply_a(v), |v| precondition(v))?;
-    // #2080 defect 4 — deflate unidentifiable near-null pencil directions.
-    //
-    // The generalized Rayleigh quotient `μ(x) = xᵀAx / xᵀBx` of the
-    // SOLUTION is a detector: expanding
-    // `x = Σ (vᵢᵀrhs/μᵢ) vᵢ` in the B-orthonormal
-    // `(A, B)`-eigenbasis, any near-null component present in `rhs` enters
-    // `x` with weight `1/μᵢ`, so `μ(x)` collapses to `≈ μ_min` exactly
-    // when the solve was amplified. A healthy solve (`rhs` B-orthogonal to
-    // the flat directions, or no flat directions) leaves `μ(x)` above the
-    // floor and pays only one extra `A`/`B` apply.
-    //
-    // Deflation is EXACT in that eigenbasis with no re-solve: the
-    // amplified term of `x` along a B-normalized eigendirection `v` is
-    // `v·(vᵀBx)` (since `vᵀBx = vᵀrhs/μ_v`), so subtracting the
-    // B-projection removes precisely the unidentifiable component while
-    // leaving every resolved direction untouched.
-    let dim = x.t.len() + x.beta.len();
-    let rank_floor = sae_exact_a_identifiability_floor();
-    // #2627 — anti-runaway ceiling on the TOTAL inverse-power refinement solves
-    // summed over EVERY deflation turn. The two loops nest: the outer turn
-    // deflates one direction per pass and is bounded by `dim`, the inner
-    // inverse-power refinement is bounded by `dim`, and every turn of the inner
-    // loop is a FULL preconditioned GMRES (`A⁻¹Bv`). The product is `dim²`
-    // solves, which the #2472 note undercounts by a factor of `dim` because it
-    // reads only the inner bound. This is a ceiling on the WORK, not a
-    // convergence bound: the per-direction certificates below are unchanged and
-    // still decide every solve that terminates inside the budget. It exists so
-    // that an exact `A = B + ΔC` which is near-singular at the inner mode
-    // surfaces as a typed refusal carrying its own diagnosis instead of a
-    // wall-clock SIGKILL that names nothing.
-    let inverse_power_solve_ceiling = 4usize.saturating_mul(dim).saturating_add(16);
-    let mut inverse_power_solves = 0usize;
-    for _ in 0..dim {
-        let ax = apply_a(&x)?;
-        let bx = apply_b(&x)?;
-        let x_b_norm_sq = sae_inner(&x, &bx);
-        if x_b_norm_sq == 0.0 && sae_inner(&x, &x) == 0.0 {
-            return Ok(x);
-        }
-        if !(x_b_norm_sq.is_finite() && x_b_norm_sq > 0.0) {
-            return Err(format!(
-                "solve_exact_stationarity: invalid B-norm squared {x_b_norm_sq:.6e}"
-            ));
-        }
-        let mu = sae_inner(&x, &ax) / x_b_norm_sq;
-        if !mu.is_finite() {
-            return Err("solve_exact_stationarity: non-finite generalized curvature".into());
-        }
-        // #2253 — accept the solve when the solution's generalized curvature is
-        // RESOLVED, i.e. `|μ| >= rank_floor`, NOT only when `μ >= rank_floor`.
-        // `μ(x) ≈ μ_min` (the smallest-magnitude pencil eigenvalue excited by the
-        // rhs), so `μ < 0` with `|μ|` well above the floor is a genuinely
-        // NEGATIVE-curvature but fully IDENTIFIED direction (the exact Hessian
-        // `A = B + ΔC` is marginally indefinite at a nonzero-residual fit — the
-        // measured K=1-circle μ = −1.66e-3). Its `A⁻¹` response is a REAL, finite
-        // part of `dθ̂/dρ = −A⁻¹ λSθ̂`, and the criterion VALUE's undamped inner
-        // solve moves θ̂ along it identically — so the θ-adjoint −½Γᵀθ̂_ρ MUST keep
-        // it or the analytic outer gradient desyncs from d(value)/dρ (the #2253
-        // non-stationary stall: the adjoint collapsed ~19×, so steepest descent
-        // could not decrease the criterion at its own minimum). Only a genuinely
-        // SINGULAR direction (`|μ| < rank_floor`, spurious `1/μ` amplification of
-        // an unidentified near-null) is deflated below — that one the evidence
-        // factor also stiffens to unit curvature, so its outer-gradient
-        // contribution is ρ-independent and must be projected out.
-        if mu.abs() >= rank_floor {
-            return Ok(x);
-        }
-        // Reaching here means `|μ| < rank_floor`: the solution is dominated by a
-        // genuinely SINGULAR (numerically curvature-free) pencil direction, whose
-        // `1/μ` amplification is an unidentifiable artifact, not a derivative. A
-        // resolved indefinite direction (`μ < 0`, `|μ| ≥ rank_floor`) was already
-        // returned above and is NOT deflated: the criterion value's `½log|B|`
-        // uses the majorized joint factor `B`, which is fully PD along it (the
-        // undamped inner solve SUCCEEDED, so `factor_spectral_deflated_evidence_
-        // row` — which only stiffens non-PD PER-ROW blocks — never fired), so the
-        // value genuinely depends on that direction and its `A⁻¹` IFT response is
-        // a real part of the θ-adjoint. Only the singular direction handled below
-        // is one the criterion factor would stiffen to unit curvature, so only its
-        // response is spurious and must be projected out.
-        // Sharpen the offending direction by inverse power iteration on
-        // the pencil (`v ← A⁻¹(B v)`, B-normalized); the corrupted `x` is
-        // already dominated by it, so it is the natural seed. Convergence
-        // is certified by successive B-normalized direction alignment;
-        // exhaustion or a failed inner solve propagates instead of silently
-        // projecting with `v=x` (which would delete the entire response).
-        let mut v = x.clone();
-        let normalize_b = |v: &mut SaeArrowVector| -> Result<(), String> {
-            let bv = apply_b(v)?;
-            let norm_sq = sae_inner(v, &bv);
-            if !(norm_sq.is_finite() && norm_sq > 0.0) {
-                return Err(format!(
-                    "solve_exact_stationarity: inverse-power direction has invalid \
-                     B-norm squared {norm_sq:.6e}"
-                ));
-            }
-            let inv_norm = 1.0 / norm_sq.sqrt();
-            v.t.mapv_inplace(|val| val * inv_norm);
-            v.beta.mapv_inplace(|val| val * inv_norm);
-            Ok(())
-        };
-        normalize_b(&mut v)?;
-        let mut direction_converged = false;
-        // #2627 — consecutive inverse steps whose refined direction stayed under
-        // the numerical-null floor. See the subspace certificate at the bottom of
-        // this loop for why this, and not eigenvector alignment, is the property
-        // the deflation actually needs.
-        let mut null_confirmations = 0usize;
-        const NUMERICAL_NULL_CONFIRMATIONS: usize = 2;
-        for power_step in 0..dim {
-            // #2472 — every turn of this loop is a FULL preconditioned GMRES
-            // solve (`A⁻¹Bv`), and the loop is bounded by the Krylov dimension,
-            // so the worst case here is `dim` solves inside one deflation turn
-            // inside one Newton step. Silence made that indistinguishable from a
-            // deadlock; the cadence is powers of two, so the line count is
-            // logarithmic in the work done.
-            if power_step.is_power_of_two() {
-                log::info!(
-                    "[SAE-DEFLATE] inverse-power step {power_step}/{dim} \
-                     (each step is one full A-inverse GMRES solve)"
-                );
-            }
-            let bv = apply_b(&v)?;
-            // #2253 — A⁻¹(Bv) is ILL-POSED along a near-null/indefinite pencil
-            // direction (that is exactly the direction we are isolating), so the
-            // refinement GMRES can legitimately exhaust its budget without
-            // reaching tolerance. That is not a fatal error: the seed `v` is
-            // already the B-normalized corrupted solution `x`, which — because
-            // μ(x) collapsed onto μ_min — is ALREADY aligned with the offending
-            // direction. Keep the best `v` and let the alignment/μ checks below
-            // decide, instead of aborting the whole outer gradient.
-            if inverse_power_solves >= inverse_power_solve_ceiling {
-                return Err(format!(
-                    "solve_exact_stationarity: inverse-power refinement exceeded the \
-                     anti-runaway budget of {inverse_power_solve_ceiling} A-inverse GMRES \
-                     solves (dimension {dim}); the exact pencil is numerically singular at \
-                     this iterate and its IFT response is not identifiable"
-                ));
-            }
-            inverse_power_solves += 1;
-            let refined =
-                match solve_b_preconditioned_gmres_with(&bv, |w| apply_a(w), |w| precondition(w)) {
-                    Ok(mut refined) => {
-                        normalize_b(&mut refined)?;
-                        refined
-                    }
-                    Err(_) => {
-                        // Refinement stalled — the current `v` is our best isolate.
-                        direction_converged = true;
-                        break;
-                    }
-                };
-            let b_refined = apply_b(&refined)?;
-            let alignment = sae_inner(&v, &b_refined).abs();
-            if !alignment.is_finite() {
-                return Err("solve_exact_stationarity: non-finite inverse-power alignment".into());
-            }
-            v = refined;
-            // The discriminator asks whether the response's near-zero aggregate
-            // Rayleigh quotient came from a numerical null or cancellation among
-            // resolved pencil directions.  One inverse step amplifies smaller-|μ|
-            // components relative to larger ones.  Therefore a refined direction
-            // whose own curvature is already resolved proves the latter case; it
-            // is unnecessary (and generally much slower) to wait for full
-            // eigenvector alignment before keeping the original finite response.
-            // Strict alignment remains mandatory below before a direction may be
-            // projected as a numerical null.
-            let av = apply_a(&v)?;
-            let bv = apply_b(&v)?;
-            let norm_sq = sae_inner(&v, &bv);
-            if !(norm_sq.is_finite() && norm_sq > 0.0) {
-                return Err(format!(
-                    "solve_exact_stationarity: refined inverse-power direction has invalid \
-                     B-norm squared {norm_sq:.6e}"
-                ));
-            }
-            let refined_mu = sae_inner(&v, &av) / norm_sq;
-            if !refined_mu.is_finite() {
-                return Err(
-                    "solve_exact_stationarity: refined inverse-power direction has non-finite \
-                     generalized curvature"
-                        .into(),
-                );
-            }
-            if refined_mu.abs() >= rank_floor {
-                return Ok(x);
-            }
-            if 1.0 - alignment.min(1.0) <= rank_floor {
-                direction_converged = true;
-                break;
-            }
-            // #2627 — SUBSPACE certificate, and the reason the timeouts existed.
-            //
-            // The alignment test above asks for a converged EIGENVECTOR: consecutive
-            // B-normalized iterates agreeing to `sqrt(eps)`. Inverse power iteration
-            // rotates the iterate toward the smallest-`|μ|` eigenvector at the rate
-            // `(μ_min/μ_next)^k`, so the number of steps that test costs is
-            // `log(sqrt(eps)) / log(μ_min/μ_next)` — UNBOUNDED as the two smallest
-            // near-null curvatures approach each other, and every one of those steps
-            // is a full preconditioned GMRES. A near-null CLUSTER with no interior
-            // gap is not a pathology of this operator, it is its construction: `K`
-            // atoms each contribute a rank-1 radial null to `A = B + ΔC`, so `A` has
-            // a whole band of curvatures under the floor with ratios arbitrarily
-            // close to one. At a ratio of 0.9 the test wants ~80 GMRES solves; at
-            // 0.99, ~1800. Multiply by the outer deflation turn (bounded by `dim`)
-            // and that is the `dim²`-shaped wall clock — and it is a CRITERION
-            // defect, not a loop defect. The loop bound is the correct Krylov bound;
-            // the criterion is buying a property at unbounded cost.
-            //
-            // The property is one the consumer never uses. Deflation subtracts the
-            // B-projection of `x` along `v`, and the guard that makes that
-            // legitimate is the one already enforced after this loop:
-            // `|μ(v)| < rank_floor`, i.e. `v` lies in the numerical-null invariant
-            // subspace. MEMBERSHIP in that subspace is the whole requirement; WHICH
-            // member `v` is does not enter the projection's correctness, and every
-            // vector of the cluster satisfies membership equally. Resolving the
-            // cluster's interior gap is work whose answer is discarded.
-            //
-            // Membership is what surviving inverse steps prove, by the same
-            // amplification argument the discriminator above already relies on: one
-            // inverse step amplifies smaller-`|μ|` components relative to larger
-            // ones, so a refined direction whose OWN curvature is resolved proves
-            // the seed's near-zero Rayleigh quotient was cancellation among resolved
-            // directions — that case returns above on `refined_mu.abs() >=
-            // rank_floor`. Symmetrically, a direction still under the floor after
-            // consecutive amplification steps carries genuine null content rather
-            // than a cancellation artifact. Two consecutive confirmations is that
-            // discriminator; further steps only refine which null vector.
-            null_confirmations += 1;
-            if null_confirmations >= NUMERICAL_NULL_CONFIRMATIONS {
-                direction_converged = true;
-                break;
-            }
-        }
-        if !direction_converged {
-            return Err(format!(
-                "solve_exact_stationarity: inverse-power direction did not converge in the \
-                 derived Krylov dimension {dim}"
-            ));
-        }
-        // #2253 — deflate the isolated direction only when it is UNRESOLVED under
-        // the exact pencil: `|μ|` below the numerical-null floor. A resolved
-        // direction of either sign is a genuine finite part of the IFT response.
-        // It can reach this branch when positive and negative resolved components
-        // cancel in the solution's aggregate Rayleigh quotient; inverse iteration
-        // then proves that no numerical null was present. In that case keep the
-        // original exact solve instead of either deleting the resolved component
-        // or turning benign Rayleigh cancellation into a typed failure.
-        let av = apply_a(&v)?;
-        let bv = apply_b(&v)?;
-        let v_b_norm_sq = sae_inner(&v, &bv);
-        if !(v_b_norm_sq.is_finite() && v_b_norm_sq > 0.0) {
-            return Err(format!(
-                "solve_exact_stationarity: converged inverse-power direction has invalid \
-                 B-norm squared {v_b_norm_sq:.6e}"
-            ));
-        }
-        let v_mu = sae_inner(&v, &av) / v_b_norm_sq;
-        if !v_mu.is_finite() {
-            return Err(format!(
-                "solve_exact_stationarity: inverse power produced non-finite \
-                 generalized curvature μ={v_mu:.6e}"
-            ));
-        }
-        if v_mu.abs() >= rank_floor {
-            return Ok(x);
-        }
-        let proj = sae_inner(&v, &bx);
-        if proj == 0.0 || !proj.is_finite() {
-            return Err(format!(
-                "solve_exact_stationarity: invalid near-null B-projection {proj:.6e}"
-            ));
-        }
-        x.t.scaled_add(-proj, &v.t);
-        x.beta.scaled_add(-proj, &v.beta);
-        log::debug!(
-            "[SAE/#2080-d4] IFT solve deflated a near-null pencil direction \
-             (μ={mu:.3e} < {rank_floor:.1e}, |proj|={:.3e})",
-            proj.abs(),
-        );
-    }
-    Err(format!(
-        "solve_exact_stationarity: numerical-null deflation exhausted the derived \
-         dimension {dim} without an identifiable IFT response"
-    ))
-}
+include!("exact_stationarity_krylov.rs");
 
 /// #2330 Patch D — shared per-row context for the residual-curvature
 /// third-derivative legs: the whitened `√w·M·r` error metric, its `√w` twin,
@@ -1833,7 +1533,7 @@ impl SaeManifoldTerm {
     /// ill-conditioned Krylov-basis coefficient cancellation that can satisfy a
     /// projected residual while failing `A x = P_range rhs` on reapplication.
     /// The IFT step `θ̂_ρ = −A⁺ g_ρ` (the sign lives in the caller's
-    /// `-0.5` contraction) therefore has one dense owner.  GMRES remains only in
+    /// `-0.5` contraction) therefore has one dense owner. Ritz vectors are used in
     /// [`Self::solve_exact_stationarity_matrix_free`], where `A` cannot be
     /// materialized.
     pub(crate) fn solve_exact_stationarity(
@@ -1883,11 +1583,8 @@ impl SaeManifoldTerm {
     /// row factors and H_tbeta operator whose rational log-determinant and shared
     /// inverse-probe bundle were consumed by the value/trace lanes.
     ///
-    /// The reduced beta solve is quotient-aware and matrix-free. Per-row
-    /// spectral deflation is refused by the selected-inverse channels before
-    /// this seam is reached: a border-only probe bundle cannot differentiate
-    /// the Daleckii-Krein deflation map, so proceeding would be a false exactness
-    /// claim rather than a usable fallback.
+    /// The adjoint uses ordinary-A Ritz directions and Euclidean projections,
+    /// with the same per-direction null floor as the dense pseudoinverse.
     fn solve_exact_stationarity_matrix_free(
         &self,
         rho: &SaeManifoldRho,
@@ -1917,40 +1614,10 @@ impl SaeManifoldTerm {
                 rho, target, cache, system, vector, &prepared,
             )
         };
-        // #2674 — the Krylov sequence runs on the SAME operator the dense route
-        // now diagonalizes: the full `A`, with no analytic chart orbit deleted
-        // ahead of the numerics. `A` is the Hessian of the PENALIZED objective
-        // and the orbit is a symmetry of the reconstruction only, so projecting
-        // it out of the applies removed live prior-driven descent here for the
-        // same reason it stalled the dense inner solve. A direction that is
-        // genuinely flat for `A` is still handled, by the `μ` deflation loop in
-        // `solve_exact_stationarity_preconditioned` — measured, not declared.
-        let precondition = |vector: &SaeArrowVector| -> Result<SaeArrowVector, String> {
-            // The outer exact-stationarity residual is certified to 1e-10 in
-            // `solve_b_preconditioned_gmres`; drive its deterministic SPD
-            // reduced preconditioner to the same relative accuracy. In exact
-            // arithmetic CG terminates in at most the reduced dimension, so the
-            // dimension itself is the non-arbitrary iteration bound.
-            // The CG certificate is ADVISORY on this seam and only on this seam:
-            // the inverse-apply is used as a PRECONDITIONER for the outer GMRES,
-            // which certifies the ORIGINAL residual regardless of how well the
-            // preconditioner approximates `A⁻¹` (`certifies_original_residual_
-            // under_ill_scaled_preconditioner_2258`). A truncated inner solve
-            // costs iterations here, never correctness — unlike the trace/
-            // criterion consumers, where a truncation silently biases the
-            // estimate (#2576).
-            let (t, beta, _cg) = matrix_free_arrow_inverse_apply(
-                system,
-                cache,
-                vector.t.view(),
-                vector.beta.view(),
-                1.0e-10,
-                cache.k.max(1),
-            )
-            .map_err(|error| format!("matrix-free evidence inverse: {error}"))?;
-            Ok(SaeArrowVector { t, beta })
-        };
-        solve_exact_stationarity_preconditioned(rhs, &apply_a, &apply_b, precondition)
+        // Classify ordinary A Ritz directions with the dense route's floor
+        // and use Euclidean projections. B is only the classification metric;
+        // its inverse and generalized eigenvectors do not define A's inverse.
+        solve_exact_stationarity_krylov(rhs, &apply_a, &apply_b)
     }
 
     /// PATH C (#2253) — the raw per-flat-coordinate penalty curvature operators
@@ -3925,8 +3592,8 @@ impl SaeManifoldTerm {
         // majorizer, the ordered Beta--Bernoulli row-local PSD majorizer, and
         // `max(V'',0)` ARD curvature): the `½log|B|` Laplace term is consistent
         // with `Γ = ½tr(B⁻¹ ∂B/∂θ)`, but the implicit step is governed by `A`.
-        // `solve_exact_stationarity` applies the TRUE `A⁻¹` with left-`B`
-        // preconditioned GMRES on `A = B + ΔC`, where
+        // `solve_exact_stationarity` applies the spectral pseudoinverse of
+        // `A = B + ΔC`, where
         // `ΔC = apply_exact_hessian_minus_b`, so the correction is no longer
         // biased by `(B⁻¹ − A⁻¹)` and does not assume `A` is SPD.
         //
@@ -3947,7 +3614,7 @@ impl SaeManifoldTerm {
         // #2080(A): collapse the per-coordinate IFT solves into ONE adjoint solve.
         // The implicit correction is `−½·⟨Γ, A⁺ g_ρ_l⟩` for every outer coordinate
         // `l`. The exact θθ-Hessian `A = ∇²_θθ L` is symmetric and its near-null
-        // deflation is a symmetric `B`-orthogonal projection, so `A⁺` is
+        // deflation uses Euclidean spectral projections, so `A⁺` is
         // self-adjoint and `⟨Γ, A⁺ g_ρ_l⟩ = ⟨A⁺Γ, g_ρ_l⟩ = ⟨a, g_ρ_l⟩` with the
         // adjoint `a = A⁺Γ` solved ONCE. A near-null pencil direction contributes
         // `g_i r_i / μ_i` only when BOTH Γ and `g_ρ_l` excite it, in which case the
@@ -3991,11 +3658,11 @@ impl SaeManifoldTerm {
         };
 
         // At massive K (`matrix_free_system = Some`) the materialized operator is
-        // unavailable, so the adjoint rides the certified reduced-Schur/GMRES
+        // unavailable, so the adjoint uses the certified Ritz pseudoinverse
         // route. Every dense arm is owned by the rank-revealing spectral
         // pseudoinverse. On the exact-A logdet arm it reuses the eigensystem that
         // produced Γ; on a B-majorizer arm it materializes that same physical A
-        // once here. There is deliberately no dense-to-GMRES fallback.
+        // once here. Both representations use the same spectral null policy.
         let adjoint = match (matrix_free_system, dense_stationarity_adjoint) {
             (Some(system), None) => {
                 self.solve_exact_stationarity_matrix_free(rho, target, cache, system, &gamma)
@@ -4570,7 +4237,7 @@ impl SaeManifoldTerm {
         }
         // #2267 — the other half of the split; see `materialize_exact_hessian_dense`.
         let eigh_started = std::time::Instant::now();
-        let (eigenvalues, eigenvectors) =
+        let (mut eigenvalues, mut eigenvectors) =
             Self::cluster_stable_eigh(&operator, e_diag, e_beta, total_t)?;
         let eigh_elapsed = eigh_started.elapsed();
         log::info!(
@@ -4585,6 +4252,14 @@ impl SaeManifoldTerm {
             .iter()
             .map(|value| value.abs())
             .fold(0.0_f64, f64::max);
+        // Rank depends on v'Bv, so a repeated A eigenspace must resolve its
+        // B directions too. The matrix-free route uses this same convention.
+        canonicalize_exact_a_rank_clusters(
+            &mut eigenvalues,
+            &mut eigenvectors,
+            spectral_norm,
+            &|v| metric.apply(v.view()),
+        )?;
         let mut metric_scale = Array1::<f64>::zeros(eigenvalues.len());
         for index in 0..eigenvalues.len() {
             let value = metric.quadratic_form(eigenvectors.column(index))?;
@@ -4606,13 +4281,13 @@ impl SaeManifoldTerm {
         };
         let crossings = block.arithmetic_band_crossings();
         if crossings > 0 {
-            // #2673 — the ONE residual crossing, detected in production rather
-            // than left silent. See `ExactHessianSpectralBlock::rank_floor`.
+            // Report when arithmetic, rather than the B-relative scale,
+            // determines the shared spectral rank.
             log::warn!(
-                "[SAE-EXACT-DENSE] #2673 residual crossing: {crossings} of {dimension} \
+                "[SAE-EXACT-DENSE] arithmetic rank limit: {crossings} of {dimension} \
                  directions have |λ| inside the eigendecomposition's backward error \
-                 ({:.6e}) while their pencil curvature is identifiable, so the value pins \
-                 a direction whose A⁻¹ response the gradient keeps",
+                 ({:.6e}) while their B-relative curvature is identifiable; \
+                 value and adjoint discard these directions",
                 (dimension as f64) * f64::EPSILON * block.spectral_norm,
             );
         }
@@ -6715,28 +6390,9 @@ mod test_support {
 mod tests_inverse_power_deflation_cost_2627 {
     use super::*;
 
-    /// #2627 — a GAPLESS near-null cluster must deflate, not exhaust the Krylov
-    /// bound.
-    ///
-    /// `A` is diagonal: fourteen resolved curvatures plus two under the numerical
-    /// null floor whose RATIO is `0.9`. That ratio is the whole fixture. The
-    /// deflation isolate rotates toward the smaller of the two at `0.9^k`, so the
-    /// eigenvector-alignment criterion — consecutive iterates agreeing to `√ε` —
-    /// needs on the order of thirty inverse steps here, and each step is a full
-    /// preconditioned GMRES. Against an inner Krylov bound of `dim = 16` it never
-    /// arrives: before the subspace certificate this call spent its whole inner
-    /// bound in GMRES on EVERY deflation turn and then raised "inverse-power
-    /// direction did not converge in the derived Krylov dimension 16". That is
-    /// the `dim²` shape, and a gapless band under the floor is not adversarial —
-    /// `K` atoms each contribute a rank-1 radial null to `A = B + ΔC`, which is
-    /// exactly such a band.
-    ///
-    /// What deflation needs from the isolate is MEMBERSHIP in the numerical-null
-    /// subspace, which the post-loop `|μ(v)| < rank_floor` guard enforces and
-    /// every member of the cluster satisfies. So the certificate is two
-    /// consecutive amplification steps that stay under the floor, and the assert
-    /// below is the consequence: the unidentifiable `1/μ` amplification is
-    /// removed and every resolved direction is returned untouched.
+    /// A gapless near-null cluster must be removed without disturbing any
+    /// resolved coordinate. The former inverse-power loop exhausted its work
+    /// bound on this fixture; a spectral action classifies the cluster together.
     #[test]
     fn gapless_near_null_cluster_deflates_instead_of_exhausting_the_krylov_bound_2627() {
         const NEAR_NULL: f64 = 1.0e-10;
@@ -6754,14 +6410,13 @@ mod tests_inverse_power_deflation_cost_2627 {
             Ok(out)
         };
         let apply_b = |v: &SaeArrowVector| -> Result<SaeArrowVector, String> { Ok(v.clone()) };
-        let precondition = |v: &SaeArrowVector| -> Result<SaeArrowVector, String> { Ok(v.clone()) };
         let rhs = SaeArrowVector {
             t: Array1::from_elem(dim, 1.0),
             beta: Array1::zeros(0),
         };
 
         let solved =
-            solve_exact_stationarity_preconditioned(&rhs, &apply_a, &apply_b, precondition)
+            solve_exact_stationarity_krylov(&rhs, &apply_a, &apply_b)
                 .expect("a gapless near-null cluster must deflate, not exhaust the Krylov bound");
 
         for slot in 0..RESOLVED {
@@ -6773,12 +6428,11 @@ mod tests_inverse_power_deflation_cost_2627 {
             );
         }
         // Undeflated, each near-null slot carries the full `1/μ` amplification
-        // `1/NEAR_NULL = 1e10`. Two orders of magnitude of reduction is far
-        // outside anything round-off could produce and far inside what the
-        // deflation actually achieves.
+        // `1/NEAR_NULL = 1e10`. The pseudoinverse must instead return zero
+        // in these directions, to the same accuracy as its resolved entries.
         for slot in RESOLVED..dim {
             assert!(
-                solved.t[slot].abs() < 1.0e8,
+                solved.t[slot].abs() < 1.0e-6,
                 "near-null slot {slot} still carries a 1/μ amplification: {:.3e}",
                 solved.t[slot],
             );
@@ -6965,7 +6619,7 @@ mod tests_route_forced_classification_2673 {
     /// Two floors used to classify directions of the same `A = B + ΔC`:
     /// `SAE_EXACT_A_PD_FLOOR_REL` (`1e-9·max(λ_max(A), 1)`, absolute) on the
     /// dense spectral path, and `√ε` on the pencil curvature
-    /// `μ = xᵀAx/xᵀBx` inside `solve_exact_stationarity_preconditioned`. They
+    /// `μ = xᵀAx/xᵀBx` in the former inverse-power solver. They
     /// are now ONE predicate in ONE metric — see
     /// [`sae_exact_a_identifiability_floor`] and
     /// [`ExactHessianSpectralBlock::rank_floor`] — so the two routes below
@@ -6994,7 +6648,7 @@ mod tests_route_forced_classification_2673 {
     ///   `exact_hessian_spectral_block`.
     /// * GRADIENT, same evaluation: `matrix_free_system = Some(..)` →
     ///   `solve_exact_stationarity_matrix_free` →
-    ///   `solve_exact_stationarity_preconditioned`.
+    ///   `solve_exact_stationarity_krylov`.
     ///
     /// And there is no "massive-`K` threshold" to cross. The route predicate is
     /// a working-set comparison in `streaming_plan.rs:151` —
@@ -7009,8 +6663,8 @@ mod tests_route_forced_classification_2673 {
     ///
     /// The SAME state through the two PRODUCTION solves —
     /// `solve_exact_stationarity` (dense rank-revealing pseudoinverse) and
-    /// `solve_exact_stationarity_matrix_free` (`B`-preconditioned GMRES + the `μ`
-    /// deflation loop) — with the same rhs. If the two rules classify the same
+    /// `solve_exact_stationarity_matrix_free` (the Ritz pseudoinverse)
+    /// — with the same rhs. If the two rules classify the same
     /// directions the same way, the solutions agree.
     ///
     /// Reported, not asserted equal. Agreement here is necessary but not
