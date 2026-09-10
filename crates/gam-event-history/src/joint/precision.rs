@@ -113,13 +113,13 @@ impl Precision {
     }
 }
 
-struct Cholesky {
-    lower: Array2<f64>,
-    log_determinant: f64,
+pub(super) struct Cholesky {
+    pub(super) lower: Array2<f64>,
+    pub(super) log_determinant: f64,
 }
 
 impl Cholesky {
-    fn new(matrix: &Array2<f64>) -> Result<Self, EventHistoryError> {
+    pub(super) fn new(matrix: &Array2<f64>) -> Result<Self, EventHistoryError> {
         let n = matrix.nrows();
         let mut lower = Array2::<f64>::zeros((n, n));
         let mut log_determinant = 0.0;

@@ -474,3 +474,43 @@ simultaneous confidence guarantees. They do not assess the subjects' time
 meshes, coefficient curvature/integration, or external calibration. The
 remaining function priors, REML/LAML fitting, learned complexity, conditioned
 entry law, and serving parity are still unfinished.
+
+## Gaussian final-function priors in the joint cohort objective
+
+The joint coefficient integrand now includes normalized Gaussian function
+priors for baseline variation, genetic-drive means, entry means and prevalence
+contrasts, disease jumps, and measurement effects. The roots derive from the
+declared function measures, including the genetic distribution's full covariance
+and mean. Baseline levels and measurement intercepts are left out of these
+penalties. Aliased function bases are refused rather than repaired with a ridge.
+
+Student-t measurement effects are measured in residual-scale units. Their
+conditional prior includes the scale-dependent normalizer and all coefficient,
+strength, and mixed derivatives. The precision is split across products to
+retain finite results when exp(rho) alone overflows or underflows. Shared local
+roots and matrix-vector derivative products avoid a global dense prior Hessian
+or a coefficients-by-strengths cross matrix.
+
+The decoder-only cohort integrand API was replaced by
+`score_with_function_priors`; no compatibility shim remains. This is still
+an integrand, not a REML fit. The same immutable model must own its function
+priors and reference/subject banks.
+
+**44 focused tests passed in 10.83 s**, following a **45.34 s** targeted warm
+MSI compile with four compile CPUs and two test threads. Fifty other tests
+were filtered out. Raw output is `event_history_function_measures_20260910.txt`.
+No local build or tests ran.
+
+The new fixture has two signatures, correlated/nonzero-mean genetics,
+recurrent/once-only/terminal marks, changing time/context designs, and all four
+measurement families. Tests compare the quadratic energies against independent
+Gaussian integration of the complete-law functions, compare all coefficient,
+strength, and scale derivatives against test-only AD, and verify the correct
+density Jacobian under a rescaled/shifted baseline basis. They also check
+unpenalized baseline levels, storage and alias rejection, precision extremes
+of +/-800, and Student-t precision/scale cancellation.
+
+The normalized penalized blocks do not yet define a proper prior on every
+global coordinate. Nuisance/structural priors, GAM operator-specific smoothness
+penalties, global coefficient integration, REML/LAML optimization, automatic
+structure, entry conditioning, serving parity, and calibration remain unfinished.

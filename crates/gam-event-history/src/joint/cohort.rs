@@ -67,22 +67,23 @@ pub struct JointCohortScore {
     conditional_standard_error: Vec<f64>,
 }
 
-/// Cohort observation density times the decoder function prior, in the
-/// current coefficient chart. Other function priors are not included yet.
+/// Cohort observation density times the declared function priors, in the
+/// current coefficient chart. These include decoder shape and the Gaussian
+/// regression/jump/measurement function penalties, not nuisance-shape priors.
 /// This is an integrand for coefficient inference, not a fitted model or
 /// a REML/LAML criterion obtained by integrating those coefficients.
-pub struct JointDecoderScore {
+pub struct JointPriorScore<'p, 'm> {
     cohort: JointCohortScore,
-    prior: DecoderPriorEvaluation,
+    prior: FunctionPriorEvaluation<'p, 'm>,
     log_density: f64,
     gradient: Vec<f64>,
 }
 
-impl JointDecoderScore {
+impl<'p, 'm> JointPriorScore<'p, 'm> {
     pub fn cohort(&self) -> &JointCohortScore {
         &self.cohort
     }
-    pub fn prior(&self) -> &DecoderPriorEvaluation {
+    pub fn prior(&self) -> &FunctionPriorEvaluation<'p, 'm> {
         &self.prior
     }
     pub fn log_density(&self) -> f64 {
@@ -185,13 +186,17 @@ fn assemble<S: JetField>(
 }
 
 impl JointCohortIntegration<'_, '_> {
-    pub fn score_with_decoder_prior(
+    pub fn score_with_function_priors<'p, 'm>(
         &self,
         theta: &[f64],
+        priors: &'p JointFunctionPriors<'m>,
         log_strengths: &[f64],
         accuracy: &IntegrationAccuracy,
-    ) -> Result<JointDecoderScore, EventHistoryError> {
-        let prior = self.model.decoder_prior(theta, log_strengths)?;
+    ) -> Result<JointPriorScore<'p, 'm>, EventHistoryError> {
+        if !priors.belongs_to(self.model) {
+            return Err(invalid("function priors belong to a different joint model"));
+        }
+        let prior = priors.evaluate(theta, log_strengths)?;
         let cohort = self.score(theta, accuracy)?;
         let log_density = cohort.evaluation().log_likelihood() + prior.log_density();
         let gradient: Vec<_> = cohort
@@ -201,9 +206,9 @@ impl JointCohortIntegration<'_, '_> {
             .map(|(a, b)| a + b)
             .collect();
         if !log_density.is_finite() || gradient.iter().any(|v| !v.is_finite()) {
-            return Err(numerical("non-finite cohort density with decoder prior"));
+            return Err(numerical("non-finite cohort density with function priors"));
         }
-        Ok(JointDecoderScore {
+        Ok(JointPriorScore {
             cohort,
             prior,
             log_density,
@@ -544,8 +549,12 @@ mod tests {
                 )
                 .is_err()
         );
+        let priors = model
+            .function_priors(&histories.iter().collect::<Vec<_>>(), 64 << 20)
+            .unwrap();
+        let strengths = vec![0.3; priors.penalties().len()];
         let regularized = cohort
-            .score_with_decoder_prior(&theta, &[0.3], &accuracy)
+            .score_with_function_priors(&theta, &priors, &strengths, &accuracy)
             .unwrap();
         assert_eq!(
             regularized.log_density(),
@@ -570,12 +579,12 @@ mod tests {
             .log_likelihood(&right, &accuracy)
             .unwrap()
             .log_likelihood()
-            + model.decoder_prior(&right, &[0.3]).unwrap().log_density();
+            + priors.evaluate(&right, &strengths).unwrap().log_density();
         let left_value = cohort
             .log_likelihood(&left, &accuracy)
             .unwrap()
             .log_likelihood()
-            + model.decoder_prior(&left, &[0.3]).unwrap().log_density();
+            + priors.evaluate(&left, &strengths).unwrap().log_density();
         assert!((regularized.gradient()[decoder] - (right_value - left_value) / 2e-4).abs() < 5e-7);
         assert_eq!(analytic.evaluation().coefficients(), &theta);
         assert_eq!(analytic.evaluation().strata(), &strata);

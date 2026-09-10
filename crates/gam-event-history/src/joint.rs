@@ -16,6 +16,7 @@ use std::ops::Range;
 mod cohort;
 mod decoder_prior;
 mod emission;
+mod function_prior;
 mod integration;
 mod posterior;
 mod precision;
@@ -24,9 +25,10 @@ mod resolution;
 mod score;
 pub use cohort::{
     CohortScoreTolerance, JointCohortEvaluation, JointCohortIntegration, JointCohortPosterior,
-    JointCohortResolutionReport, JointCohortScore, JointDecoderScore, ResolvedCohortScore,
+    JointCohortResolutionReport, JointCohortScore, JointPriorScore, ResolvedCohortScore,
 };
 pub use decoder_prior::DecoderPriorEvaluation;
+pub use function_prior::{FunctionPenalty, FunctionPriorEvaluation, JointFunctionPriors};
 pub use integration::{
     IntegratedLikelihood, IntegratedPosterior, IntegratedScore, IntegrationAccuracy,
     IntegrationOptions, JointIntegration,

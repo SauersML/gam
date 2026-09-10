@@ -215,8 +215,8 @@ This identity does not justify an arbitrary identity ridge on nonlinear
 decoder logits, rate coordinates, or an intercept. Nonlinear function priors
 also need their normalization and coordinate Jacobians in any evidence
 calculation; substituting a Gaussian penalty determinant would change the
-objective. The decoder's normalized function prior is implemented below;
-the remaining function priors and hyperparameter learning are unfinished.
+objective. The decoder and Gaussian function priors are implemented below;
+nuisance-shape/structural priors and hyperparameter learning are unfinished.
 
 ### Decoder function prior
 
@@ -254,14 +254,66 @@ posterior estimates. The no-latent-effect function is recovered as
 `lambda` tends to infinity; at K=0 the prior is a point mass with no
 strength coordinate.
 
-`JointCohortIntegration::score_with_decoder_prior` combines this density
-with the shared-reference observation integral and its total coefficient
-score. This is an integrand for coefficient inference. It does not yet
-include the other function priors, integrate global coefficients, learn
-strengths, or produce a fit. Maximizing its joint density would not be
-REML/LAML. A Laplace approximation must also be checked in the strong
+`JointCohortIntegration::score_with_function_priors` combines this density
+and the Gaussian function priors below with the shared-reference observation
+integral and its total coefficient score. This is an integrand for coefficient
+inference. It does not integrate global coefficients, learn strengths, or
+produce a fit. Maximizing its joint density would not be REML/LAML.
+A Laplace approximation must also be checked in the strong
 shrinkage limit: exact prior normalization alone does not make an
 approximation to its coefficient integral exact.
+
+### Gaussian function measures
+
+`JointLikelihood::function_priors` freezes function measures from the supplied
+cohort design. Subjects receive equal weight; time within each subject receives
+normalized exposure measure. The genetic measure is the joint Gaussian law in
+the model specification, including its nonzero mean and covariance. The current
+Gaussian penalties are:
+
+* variance of each baseline log-rate surface, leaving its constant level free;
+* squared energy of the common genetic-drive mean function;
+* squared energy of the entry mean with no prevalent diagnosis, plus a separate
+  squared function contrast for each once-only prevalence indicator;
+* squared magnitude of each constant nonterminal disease-jump function;
+* squared measurement effect relative to its intercept, integrated over a
+  standard Gaussian state. For Student-t channels this effect is divided by
+  the channel's residual scale.
+
+The entry contrasts do not invent pre-entry exposure or a prevalence
+distribution. They regularize the declared entry-mean regression; a properly
+selected entry law remains separate work. The baseline basis must carry a unit
+constant in column zero. Its remaining columns are centered under the function
+measure. An aliased function basis is rejected for removal before fitting;
+the code does not add a numerical ridge to make it identifiable.
+
+Each function norm has a root `R` satisfying `||f||^2 = ||R beta||^2`.
+For rank q and strength `lambda = exp(rho)`, the coordinate density includes
+
+```text
+(q/2) rho + (1/2) log det(R'R) - (q/2) log(2 pi)
+    - (lambda/2) ||R beta||^2.
+```
+
+For genetics, with precision `L L'`, the root implements
+`E[(a+b'g)^2] = (a+b'mu)^2 + ||L^{-1}b||^2` directly. This avoids subtracting
+large genetic means to recover a small variance. Design and genetic roots
+combine by a Kronecker product and are shared across signatures.
+
+The Student-t measurement-effect prior uses effective log precision
+`rho - 2 log sigma`; its normalization therefore contributes `-K log sigma`.
+The coefficient score, Hessian products, and coefficient/strength cross
+derivatives include that scale dependence. Omitting it would change both the
+likelihood integrand and subsequent strength learning. Precision products are
+scaled before multiplication so `exp(rho)` need not itself be representable.
+
+`FunctionPriorEvaluation` supplies analytic coefficient gradients,
+coefficient Hessian products, strength derivatives, and mixed products without
+a full coefficients-by-strengths matrix. Roots and evaluation workspace are
+bounded before construction. These are normalized densities on their penalized
+blocks, not a proper prior on every global coordinate. Nuisance/structural
+priors, GAM operator-specific smoothness penalties, coefficient integration,
+and REML/LAML optimization still need completion.
 
 Training may use a structured variational approximation with local Gaussian
 state factors and temporal precision blocks, plus shared parameter factors.
