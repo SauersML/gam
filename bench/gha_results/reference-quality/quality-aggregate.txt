@@ -3,33 +3,34 @@ complete case manifest: /tmp/quality-report/quality_cases.txt (433 cases)
 === #1561 whole-suite quality meta-gate ===
 category        n scored GAMwin REFwin   medlogR  p(1-sided)      p_BH
 factors         1      1      0      1    0.0166      1.0000    1.0000
-families       43     42     21     21   -0.0006      0.2137    0.3206
+families       43     42     21     21   -0.0006      0.2361    0.3542
 manifolds      11     11      7      3   -0.0021      0.1377    0.3125
-misc           25     25     10     15    0.0001      0.7546    0.9055
+misc           24     24     10     14    0.0001      0.6683    0.8019
 smooths        35     35     20     15   -0.0014      0.0817    0.3125
-survival        6      6      4      2   -0.0056      0.1562    0.3125
+survival        6      6      4      2   -0.0050      0.1562    0.3125
 ------------------------------------------------------------------------
-OVERALL       121    120     62     57   -0.0001      0.0564 
+OVERALL       120    119     62     56   -0.0002      0.0508 
 
-CLOSURE (exact per-case p<0.05, negative median, valid metrics, complete successful execution): FAIL (p=0.0564, median log(gam/ref)=-0.0001, wins 62 / losses 57)
+CLOSURE (exact per-case p<0.05, negative median, valid metrics, complete successful execution): FAIL (p=0.0508, median log(gam/ref)=-0.0002, wins 62 / losses 56)
 INVALID: 1 case(s) have invalid metrics or undefined medians; closure blocked.
-Experimental units: 120 cases from 151 metric pairs.
+Experimental units: 119 cases from 149 metric pairs.
 INCOMPLETE: absent manifest, mismatched execution, or failed cases; closure blocked.
 
 --- execution vs emission (silent-attrition guard) ---
 category     executed  failed  emitting
 calibration         9       0         0
 factors             2       0         1
-families           90      21        43
+families           90      22        43
 manifolds          11       1        11
-misc              242      18        25
+misc              242      19        24
 regressions         3       0         0
 smooths            49       9        35
 survival           27      10         6
 
-SILENT ATTRITION: 46 test(s) failed BEFORE emitting a pair (excluded from the significance set):
+SILENT ATTRITION: 48 test(s) failed BEFORE emitting a pair (excluded from the significance set):
   GAM_ERROR/gam_fit_failed families::quality_tweedie_dispersion_location_scale_1060::gam_tweedie_dispersion_location_scale_recovers_phi_surface
   METRIC_OFF/quality_metric families::quality_vs_gamlss_custom_family_location_scale_gaussian::gam_custom_family_location_scale_matches_gamlss_on_real_data
+  REF_ERROR/reference_tool families::quality_vs_gamlss_gaussian_location_scale::gam_gaussian_location_scale_matches_gamlss_on_real_data
   GAM_ERROR/gam_fit_failed families::quality_vs_inla_binomial_smooth_probability::gam_binomial_smooth_recovers_true_probability_on_real_data
   GAM_ERROR/gam_fit_failed families::quality_vs_interpretml_ebm_binomial_logit::gam_binomial_logit_heldout_accuracy_beats_ebm
   GAM_ERROR/gam_fit_failed families::quality_vs_interpretml_ebm_poisson_log::gam_poisson_log_matches_interpretml_ebm
@@ -50,6 +51,7 @@ SILENT ATTRITION: 46 test(s) failed BEFORE emitting a pair (excluded from the si
   GAM_ERROR/gam_fit_failed misc::mega_batch_k::matern_nu_three_halves_1d
   GAM_ERROR/gam_fit_failed misc::mega_batch_k::matern_with_explicit_centers
   GAM_ERROR/gam_fit_failed misc::quality_validation_baseline_1471::tweedie_log_smooth_recovers_truth_and_matches_mgcv
+  REF_ERROR/reference_tool misc::quality_vs_gamlss_gagurine_location_scale::gam_location_scale_predicts_gagurine_better_than_baseline
   GAM_ERROR/gam_fit_failed misc::quality_vs_gpyto_gp_regression::gam_gp_regression_recovers_truth
   GAM_ERROR/gam_fit_failed misc::quality_vs_lifelines_interval_censored_truth_recovery::gam_recovers_interval_censored_latent_truth_match_or_beat_lifelines
   GAM_ERROR/gam_fit_failed misc::quality_vs_r_gpgp_likelihood::gam_gp_smooth_recovers_truth_and_predicts
@@ -76,7 +78,7 @@ SILENT ATTRITION: 46 test(s) failed BEFORE emitting a pair (excluded from the si
   GAM_ERROR/gam_fit_failed survival::quality_vs_survival_location_scale_lognormal::gam_lognormal_location_scale_aft_smooth_matches_survreg_on_real_data
 
 --- #2395 paired-panel power ---
-17 of 151 pairs carry a paired fold panel: 3 resolved BETTER, 2 resolved WORSE, 12 unresolved.
+17 of 149 pairs carry a paired fold panel: 3 resolved BETTER, 2 resolved WORSE, 12 unresolved.
 Pairing gain (unpaired SEM / paired SEM) over these panels: min 1.35x, median 17.23x, max 374.94x. Values above 1 are the common fold-draw swing that comparing two separately-averaged arms would have paid for.
 
 pair                                                         K   effect%    sem%  |e|/sem     d_z   wins  verdict
@@ -117,14 +119,14 @@ DILUTION: 12 paired pair(s) remain unresolved — their sign is not established 
   smooths/quality_vs_mgcv_nottem_cyclic: +0.946% +- 0.367% (2.57 SEM over 10 folds)
 
 Top tests GAM loses (largest log(gam/ref) > 0):
-  +1.4945  families/quality_vs_scipy_conjugate_gaussian_posterior::sd [sd_max_abs_diff_to_truth] gam=0.0010198 vs scipy=0.00022882
+  +1.3884  families/quality_vs_scipy_conjugate_gaussian_posterior::sd [sd_max_abs_diff_to_truth] gam=0.0010198 vs scipy=0.00025442
   +0.5600  misc/quality_vs_mass_ordinal_polr::cum [cum_rmse] gam=0.019019 vs vgam=0.010864
   +0.4857  families/quality_vs_gamlss_gaussian_location_scale_cyclic::fundamental::mu [mu_rmse_to_truth] gam=0.034166 vs gamlss=0.021022
   +0.4485  families/quality_vs_inla_binomial_smooth_probability [prob_rmse_to_truth] gam=0.030373 vs inla=0.019396
-  +0.4309  families/quality_vs_scipy_conjugate_gaussian_posterior::mean [mean_max_abs_diff_to_truth] gam=0.0005603 vs scipy=0.00036417
   +0.4276  families/quality_vs_mgcv_poisson_tensor [rmse_to_truth] gam=0.24002 vs mgcv=0.15652
   +0.4014  smooths/quality_vs_mgcv_duchon_default_rank::2d_n1500 [truth_rmse] gam=0.021397 vs mgcv=0.014322
   +0.3398  misc/quality_vs_mass_ordinal_polr::class [class_rmse] gam=0.015524 vs vgam=0.011051
+  +0.3129  families/quality_vs_scipy_conjugate_gaussian_posterior::mean [mean_max_abs_diff_to_truth] gam=0.0005603 vs scipy=0.00040977
   +0.3002  misc/quality_vs_gamlss_negbin_dispersion_location_scale_1060::log_theta [rmse_log_theta] gam=0.32016 vs gamlss=0.23714
   +0.2961  manifolds/quality_vs_mgcv_sphere_s2_wahba_vs_sos [rmse] gam=2.0782 vs mgcv=1.5456
   +0.2796  families/quality_vs_gamlss_gaussian_location_scale_by_group::log_sigma_a [log_sigma_rmse_to_truth] gam=0.19844 vs gamlss=0.15004
