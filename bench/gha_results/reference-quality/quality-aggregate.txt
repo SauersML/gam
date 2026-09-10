@@ -3,15 +3,15 @@ complete case manifest: /tmp/quality-report/quality_cases.txt (433 cases)
 === #1561 whole-suite quality meta-gate ===
 category        n scored GAMwin REFwin   medlogR  p(1-sided)      p_BH
 factors         1      1      0      1    0.0166      1.0000    1.0000
-families       43     42     21     21   -0.0006      0.2137    0.3206
+families       43     42     21     21   -0.0006      0.2361    0.3542
 manifolds      11     11      7      3   -0.0021      0.1377    0.3125
 misc           25     25     10     15    0.0001      0.7546    0.9055
 smooths        35     35     20     15   -0.0014      0.0817    0.3125
-survival        6      6      4      2   -0.0056      0.1562    0.3125
+survival        6      6      4      2   -0.0050      0.1562    0.3125
 ------------------------------------------------------------------------
-OVERALL       121    120     62     57   -0.0001      0.0564 
+OVERALL       121    120     62     57   -0.0001      0.0627 
 
-CLOSURE (exact per-case p<0.05, negative median, valid metrics, complete successful execution): FAIL (p=0.0564, median log(gam/ref)=-0.0001, wins 62 / losses 57)
+CLOSURE (exact per-case p<0.05, negative median, valid metrics, complete successful execution): FAIL (p=0.0627, median log(gam/ref)=-0.0001, wins 62 / losses 57)
 INVALID: 1 case(s) have invalid metrics or undefined medians; closure blocked.
 Experimental units: 120 cases from 151 metric pairs.
 INCOMPLETE: absent manifest, mismatched execution, or failed cases; closure blocked.
@@ -117,14 +117,14 @@ DILUTION: 12 paired pair(s) remain unresolved — their sign is not established 
   smooths/quality_vs_mgcv_nottem_cyclic: +0.946% +- 0.367% (2.57 SEM over 10 folds)
 
 Top tests GAM loses (largest log(gam/ref) > 0):
-  +1.4945  families/quality_vs_scipy_conjugate_gaussian_posterior::sd [sd_max_abs_diff_to_truth] gam=0.0010198 vs scipy=0.00022882
+  +1.3884  families/quality_vs_scipy_conjugate_gaussian_posterior::sd [sd_max_abs_diff_to_truth] gam=0.0010198 vs scipy=0.00025442
   +0.5600  misc/quality_vs_mass_ordinal_polr::cum [cum_rmse] gam=0.019019 vs vgam=0.010864
   +0.4857  families/quality_vs_gamlss_gaussian_location_scale_cyclic::fundamental::mu [mu_rmse_to_truth] gam=0.034166 vs gamlss=0.021022
   +0.4485  families/quality_vs_inla_binomial_smooth_probability [prob_rmse_to_truth] gam=0.030373 vs inla=0.019396
-  +0.4309  families/quality_vs_scipy_conjugate_gaussian_posterior::mean [mean_max_abs_diff_to_truth] gam=0.0005603 vs scipy=0.00036417
   +0.4276  families/quality_vs_mgcv_poisson_tensor [rmse_to_truth] gam=0.24002 vs mgcv=0.15652
   +0.4014  smooths/quality_vs_mgcv_duchon_default_rank::2d_n1500 [truth_rmse] gam=0.021397 vs mgcv=0.014322
   +0.3398  misc/quality_vs_mass_ordinal_polr::class [class_rmse] gam=0.015524 vs vgam=0.011051
+  +0.3129  families/quality_vs_scipy_conjugate_gaussian_posterior::mean [mean_max_abs_diff_to_truth] gam=0.0005603 vs scipy=0.00040977
   +0.3002  misc/quality_vs_gamlss_negbin_dispersion_location_scale_1060::log_theta [rmse_log_theta] gam=0.32016 vs gamlss=0.23714
   +0.2961  manifolds/quality_vs_mgcv_sphere_s2_wahba_vs_sos [rmse] gam=2.0782 vs mgcv=1.5456
   +0.2796  families/quality_vs_gamlss_gaussian_location_scale_by_group::log_sigma_a [log_sigma_rmse_to_truth] gam=0.19844 vs gamlss=0.15004
