@@ -1074,6 +1074,13 @@ pub(crate) fn subject_marginal<S: JetField>(
         if m == n_gaps {
             break;
         }
+        // The gap carries the latent moments across it and scores its own
+        // rate. Without atoms there is neither: nothing is carried, no rate
+        // is a coefficient, and the whole section is a step over a state that
+        // does not exist.
+        if !latent_variance {
+            continue;
+        }
         // ---- gap m: (m, m+1) ------------------------------------------------
         let next = &filtered[m + 1];
         let next_size = next.grid.size();
