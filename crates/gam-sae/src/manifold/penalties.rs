@@ -1729,45 +1729,14 @@ impl SaeManifoldTerm {
                 }
                 exact
             });
-            // `M` is symmetric but need not be PSD: `M` is the edge-restriction
-            // of the symmetric Kronecker square of `G`, and a FRUSTRATED
-            // component's `G` carries negative eigenvalues (see
-            // `barrier_spectral_m`), whose products then come back negative. The
-            // shipped majorizer is the matrix ABSOLUTE VALUE `|M| = Σ_r|λ_r|e_re_rᵀ`
-            // — which is what the previous `svd`-based expansion computed, since
-            // the singular values of a symmetric matrix are `|λ_r|`. Stating it as
-            // `eigh` + `abs` makes the majorization a declared choice rather than
-            // a side effect of the factorization used, and `|M| ⪰ M` keeps the
-            // metric PSD and dominating on both spectra.
-            let coupling_majorizer = match mm.eigh(faer::Side::Lower) {
-                Ok((lams_m, vecs_m)) => {
-                    let mut abs_m = Array2::<f64>::zeros((ne, ne));
-                    for (r_i, &lam) in lams_m.iter().enumerate() {
-                        let weight = penalty_scale * lam.abs();
-                        if !(weight > 0.0) {
-                            continue;
-                        }
-                        for a in 0..ne {
-                            let va = vecs_m[[a, r_i]];
-                            if va == 0.0 {
-                                continue;
-                            }
-                            let scaled = weight * va;
-                            for b in 0..ne {
-                                abs_m[[a, b]] += scaled * vecs_m[[b, r_i]];
-                            }
-                        }
-                    }
-                    // The assembly installs NO curvature for a component whose
-                    // majorizer is identically zero or whose carriers are all
-                    // degenerate; `None` records exactly that, so the ΔC
-                    // consumer subtracts nothing that was never added.
-                    (!abs_m.iter().all(|&v| v == 0.0)
-                        && !edge_v.iter().all(|runs| runs.is_empty()))
-                    .then_some(abs_m)
-                }
-                Err(_) => None,
-            };
+            // G is positive semidefinite because m'/m is nonnegative. Thus
+            // M is a Gram matrix: dᵀ M d = 1/2 ||G^(1/2) dF G^(1/2)||_F².
+            // An eigenvalue-absolute-value reconstruction adds cubic work and
+            // rounding while representing this same PSD operator. Retain M
+            // directly so its analytic derivative follows the installed Gram.
+            let coupling_majorizer = (!mm.iter().all(|&v| v == 0.0)
+                && !edge_v.iter().all(|runs| runs.is_empty()))
+                .then(|| mm * penalty_scale);
             let mut atoms: Vec<usize> = comp.atoms.clone();
             atoms.sort_unstable();
             plans.push(SeparationBarrierComponentPlan {

@@ -230,15 +230,16 @@ fn decoder_prior_installed_beta_majorizer_equals_the_assembled_hbb_2828() {
         let (mut anchor, target, rho) = amplitude_gated_fixture(amplitude_radius);
         let beta_dim = anchor.beta_dim();
         let system = anchor
-                .assemble_arrow_schur(target.view(), &rho, None)
-                .expect("dense-lane arrow assembly");
+            .assemble_arrow_schur(target.view(), &rho, None)
+            .expect("dense-lane arrow assembly");
         // `assemble_arrow_schur` hands `sys.hbb` back to the term as the reusable
         // border workspace on its way out (`reclaim_border_hbb_workspace`), so the
         // assembled block is read from there rather than from the returned system.
         let mut installed = anchor.border_hbb_workspace.clone();
         let mut no_amplitude = frozen_gate_endpoint(&anchor);
         no_amplitude.amplitude_barrier_gate = Some(0.0);
-        let without = no_amplitude.assemble_arrow_schur(target.view(), &rho, None)
+        let without = no_amplitude
+            .assemble_arrow_schur(target.view(), &rho, None)
             .expect("assembly with only the amplitude ridge disabled");
         let full_op = system.effective_penalty_op();
         let without_op = without.effective_penalty_op();
@@ -323,7 +324,9 @@ fn decoder_repulsion_majorizer_is_the_same_operator_on_both_lanes_2828() {
         .expect("the carrier form of the same majorizer");
     let carrier_dense = carrier.to_dense();
     assert_eq!(carrier_dense.dim(), dense.dim());
-    let scale = dense.iter().fold(0.0_f64, |acc, value| acc.max(value.abs()));
+    let scale = dense
+        .iter()
+        .fold(0.0_f64, |acc, value| acc.max(value.abs()));
     assert!(
         scale > 1.0e-3,
         "the repulsion must install MATERIAL curvature here; max|H| = {scale:.6e}"
@@ -413,7 +416,8 @@ fn rank_aware_overlap_second_derivative_matches_finite_differences_2828() {
 
     // Two directions: one leaning on `B_j`, one on `B_k`, so a leg that is wrong
     // in only one atom block cannot hide.
-    for (label, weight_j, weight_k) in [("j-weighted", 1.0_f64, 0.25_f64), ("k-weighted", 0.25, 1.0)]
+    for (label, weight_j, weight_k) in
+        [("j-weighted", 1.0_f64, 0.25_f64), ("k-weighted", 0.25, 1.0)]
     {
         let vj = Array2::from_shape_fn((m_j, p), |(a, o_col)| {
             weight_j * (((a * p + o_col) as f64) * 0.37 + 0.11).sin()
@@ -515,9 +519,10 @@ fn floored_spectral_second_derivative_is_the_divided_difference_2828() {
         let mut analytic = 0.0_f64;
         for i in 0..lams.len() {
             for j in 0..lams.len() {
-                analytic += SaeManifoldTerm::barrier_spectral_f_prime_divided(lams[i], lams[j], eps)
-                    * e_hat[[i, j]]
-                    * e_hat[[i, j]];
+                analytic +=
+                    SaeManifoldTerm::barrier_spectral_f_prime_divided(lams[i], lams[j], eps)
+                        * e_hat[[i, j]]
+                        * e_hat[[i, j]];
             }
         }
         analytic *= -0.5;
