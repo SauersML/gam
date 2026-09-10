@@ -10,6 +10,9 @@ use structural::{ScalarPriorEvaluation, StructuralFunction};
 #[path = "category_prior.rs"]
 mod category;
 use category::{CategoryEvaluation, CategoryPriors};
+#[path = "coefficient_proposal.rs"]
+mod proposal;
+pub use proposal::PriorCoefficientProposal;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum FunctionPenalty {
@@ -663,7 +666,7 @@ mod tests {
     use super::*;
     use crate::scalar::Mixed;
 
-    fn fixture() -> (JointLikelihood, Vec<JointHistory>, Vec<f64>) {
+    pub(super) fn fixture() -> (JointLikelihood, Vec<JointHistory>, Vec<f64>) {
         let model = JointLikelihood::new(JointSpecification {
             signatures: 2,
             marks: vec![MarkKind::Recurrent, MarkKind::Once, MarkKind::Terminal],

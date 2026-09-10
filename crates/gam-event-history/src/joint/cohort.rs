@@ -195,6 +195,25 @@ fn assemble<S: JetField>(
 }
 
 impl JointCohortIntegration<'_, '_> {
+    /// Construct a normalized coefficient proposal from this cohort's
+    /// declared priors and observed measurement locations. The proposal's
+    /// independent draws can be passed directly to `coefficient_integral`.
+    pub fn coefficient_proposal<'p, 'm>(
+        &self,
+        priors: &'p JointFunctionPriors<'m>,
+        log_strengths: &[f64],
+    ) -> Result<PriorCoefficientProposal<'p, 'm>, EventHistoryError> {
+        if !priors.belongs_to(self.model) {
+            return Err(invalid(
+                "coefficient proposal priors belong to a different joint model",
+            ));
+        }
+        priors.coefficient_proposal(
+            &self.subjects.iter().map(|s| s.history).collect::<Vec<_>>(),
+            log_strengths,
+        )
+    }
+
     pub fn score_with_function_priors<'p, 'm>(
         &self,
         theta: &[f64],

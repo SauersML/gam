@@ -216,8 +216,9 @@ decoder logits, rate coordinates, or an intercept. Nonlinear function priors
 also need their normalization and coordinate Jacobians in any evidence
 calculation; substituting a Gaussian penalty determinant would change the
 objective. The function priors, fixed-bank coefficient integral and assessed
-interior strength optimization below are implemented. Automatic proposal
-construction/refinement and null-boundary inference are unfinished.
+interior strength optimization below are implemented, together with an
+automatic prior-based starting proposal. Posterior proposal adaptation,
+refinement and null-boundary inference are unfinished.
 
 ### Decoder function prior
 
@@ -385,10 +386,50 @@ normalization, independence and chart Jacobians are a caller contract; MCMC
 draws cannot be substituted while retaining these standard-error formulas.
 
 This is a coefficient-integration component, not a fit or a finished REML
-driver. Automatic proposals/refinement, null boundaries and integrated serving
-remain unfinished.
+driver. Posterior proposal adaptation/refinement, null boundaries and
+integrated serving remain unfinished.
 Tests compare the Poisson/Gamma integral and posterior means with closed
 forms, and the complete sampled gradient/Hessian with direct differentiation.
+
+### Normalized starting coefficient proposals
+
+`JointCohortIntegration::coefficient_proposal` constructs a
+`PriorCoefficientProposal` from the cohort's function priors and measurements.
+Its independent draws carry their complete normalized proposal densities and
+can be supplied to `coefficient_integral`. Caller-created proposal draws are
+no longer the only way to enter coefficient integration.
+
+The proposal samples Dirichlet decoder weights, Gaussian function coordinates,
+positive rate levels, temporal variation and measurement shapes under their
+declared laws. Gaussian roots are inverted once with pivoted QR and shared
+across repeated function blocks; the draw transform inverts the complete root,
+including the nonzero genetic mean and covariance. Residual scales are sampled
+before the measurement slopes conditional on them. Baseline levels are sampled
+after the centered variation coefficients, so their geometric-rate prior uses
+the same function measure as its density. Category probabilities are sampled
+on their simplex and converted to probit coordinates using the smaller tail.
+Structural Gamma draws are transformed in the log domain.
+
+Student-t location intercepts retain their flat fitted-prior measure. For
+sampling only, each gets a proper Cauchy law centered on that channel's observed
+mean, with conditional scale `sigma/sqrt(number observed)`. Its normalizer is
+included in the proposal density and removed by the importance ratio; this
+does not introduce a location penalty. A completely unobserved Student-t
+channel is rejected because its flat location integral is undefined. Missing
+measurements for individual subjects continue to contribute likelihood one.
+
+Root workspace and draw storage are checked before allocation. An
+unrepresentable draw raises an error instead of being discarded and replaced,
+which would change the proposal's law. Tests check Gaussian function-space
+moments, normalized prior-score identities, category probabilities, the
+conditional Cauchy transform, reproducibility and chart/error behavior.
+
+This is a starting or defensive proposal, not a claim that prior sampling
+adequately covers a concentrated posterior. Posterior adaptation and
+independent refinement are still required. In particular, the current frozen
+Gaussian latent-path mixture may reject coefficient draws outside its
+finite-variance region; that restriction must be resolved before broad
+automatic coefficient integration can serve as the fitting driver.
 
 ### Assessed interior strength optimization
 
@@ -422,7 +463,7 @@ gradient cannot suppress any of these error terms.
 The returned `JointStrengthOptimum` retains its coefficient draws, weights and
 posterior means. It is an assessed interior optimum of the supplied sampled
 integral, not a completed joint-model fit or a guarantee of global optimality.
-Proposal coverage/integrability, automatic refinement, exact null-boundary
+Posterior proposal coverage/integrability, automatic refinement, exact null-boundary
 comparisons, the selected entry law and serving still need completion. The
 dense optimizer/curvature workspace is checked together with both banks
 before optimization; a memory rejection is a computational limitation, not

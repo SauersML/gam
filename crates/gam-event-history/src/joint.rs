@@ -31,7 +31,9 @@ pub use cohort::{
     StrengthResolutionReport,
 };
 pub use decoder_prior::DecoderPriorEvaluation;
-pub use function_prior::{FunctionPenalty, FunctionPriorEvaluation, JointFunctionPriors};
+pub use function_prior::{
+    FunctionPenalty, FunctionPriorEvaluation, JointFunctionPriors, PriorCoefficientProposal,
+};
 pub use integration::{
     IntegratedLikelihood, IntegratedPosterior, IntegratedScore, IntegrationAccuracy,
     IntegrationOptions, JointIntegration,
