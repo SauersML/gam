@@ -266,11 +266,12 @@ fn complete_joint_density_derivatives_match_finite_differences() {
 #[test]
 fn structured_gaussian_limit_integrates_missing_scores_and_large_state_paths() {
     let mut spec = specification(8, vec![], 2);
+    spec.marks = vec![MarkKind::Once];
     spec.genetic_mean = vec![0.4, -0.2];
     let model = JointLikelihood::new(spec).unwrap();
     let mut theta = vec![0.0; model.layout.width];
-    theta[model.layout.baseline.start] = -800.0;
     let mut h = history(2);
+    h.initially_at_risk = vec![false];
     let nodes = 33;
     h.times = (0..nodes).map(|n| n as f64 / (nodes - 1) as f64).collect();
     h.exposure = vec![1.0 / (nodes - 1) as f64; nodes];
@@ -281,7 +282,7 @@ fn structured_gaussian_limit_integrates_missing_scores_and_large_state_paths() {
     let slopes: Vec<[f64; 2]> = (0..8).map(|k| [0.1 * (k + 1) as f64, -0.15]).collect();
     for (k, b) in slopes.iter().enumerate() {
         for g in 0..2 {
-            theta[model.layout.entry.start + k * 3 + g + 1] = b[g];
+            theta[model.layout.entry.start + k * 6 + g + 1] = b[g];
             theta[model.layout.drive.start + k * 3 + g + 1] = b[g];
         }
     }
@@ -338,7 +339,123 @@ fn structured_gaussian_limit_integrates_missing_scores_and_large_state_paths() {
         .unwrap();
     assert!(corrected.likelihood.log_marginal.abs() < 1e-9);
     assert!(corrected.likelihood.log_standard_error < 1e-12);
-    assert!(corrected.maximum_moment_standard_error < 0.05);
+    assert_eq!(corrected.likelihood.samples, 0);
+    assert!(matches!(
+        corrected.likelihood.method,
+        LatentIntegrationMethod::AnalyticGaussian
+    ));
+    assert_eq!(corrected.maximum_moment_standard_error, 0.0);
+    assert_eq!(corrected.mean, posterior.mode);
+    assert_eq!(corrected.state_covariance, posterior.state_covariance);
+    theta[model.layout.rates.start] = 8.0;
+    theta[model.layout.entry.start] = 3.0;
+    let zero = bank
+        .log_marginal_score(
+            &theta,
+            &vec![0.0; nodes],
+            Array2::zeros((nodes, theta.len())).view(),
+            &IntegrationAccuracy::default(),
+        )
+        .unwrap();
+    assert!(zero.likelihood.log_marginal.abs() < 1e-12);
+    assert!(
+        zero.gradient
+            .iter()
+            .chain(&zero.standard_error)
+            .all(|g| *g == 0.0)
+    );
+}
+
+#[test]
+fn analytic_rank_zero_scores_keep_observation_and_reference_derivatives() {
+    let model =
+        JointLikelihood::new(specification(0, vec![MeasurementFamily::StudentT], 2)).unwrap();
+    let theta = vec![0.2; model.layout.width];
+    let mut h = history(2);
+    h.genetics[0] = Some(0.7);
+    h.measurements.push(MeasurementRecord {
+        node: 4,
+        channel: 0,
+        value: Some(1.3),
+        after_event: false,
+    });
+    let mut rng = SmallRng::seed_from_u64(739);
+    let bank = model
+        .integration(
+            &theta,
+            &h,
+            &[0.04; 5],
+            None,
+            &IntegrationOptions {
+                samples: 0,
+                memory_limit_bytes: 0,
+                ..IntegrationOptions::default()
+            },
+            &mut rng,
+        )
+        .unwrap();
+    let mut jacobian = Array2::zeros((5, theta.len()));
+    jacobian.column_mut(0).fill(0.2);
+    let score = bank
+        .log_marginal_score(
+            &theta,
+            &[0.04; 5],
+            jacobian.view(),
+            &IntegrationAccuracy::default(),
+        )
+        .unwrap();
+    for q in 0..theta.len() {
+        let seeded: Vec<Mixed<f64>> = theta
+            .iter()
+            .enumerate()
+            .map(|(j, &v)| Mixed::seed(v, f64::from(j == q), f64::from(j == q)))
+            .collect();
+        let jet = bank
+            .log_marginal(
+                &seeded,
+                &vec![seeded[0].scale(0.2); 5],
+                &IntegrationAccuracy::default(),
+            )
+            .unwrap();
+        assert!((score.gradient[q] - jet.log_marginal.u).abs() < 1e-12);
+        let eps = 1e-4;
+        let mut plus = theta.clone();
+        let mut minus = theta.clone();
+        plus[q] += eps;
+        minus[q] -= eps;
+        let vp = bank
+            .log_marginal(
+                &plus,
+                &vec![plus[0] * 0.2; 5],
+                &IntegrationAccuracy::default(),
+            )
+            .unwrap()
+            .log_marginal;
+        let vm = bank
+            .log_marginal(
+                &minus,
+                &vec![minus[0] * 0.2; 5],
+                &IntegrationAccuracy::default(),
+            )
+            .unwrap()
+            .log_marginal;
+        assert!((score.gradient[q] - (vp - vm) / (2.0 * eps)).abs() < 1e-7);
+        assert!(
+            (jet.log_marginal.uv - (vp + vm - 2.0 * jet.log_marginal.base) / eps.powi(2)).abs()
+                < 1e-6
+        );
+    }
+    assert_eq!(score.likelihood.samples, 0);
+    assert!(score.standard_error.iter().all(|g| *g == 0.0));
+    assert!(
+        bank.log_marginal_score(
+            &theta,
+            &[0.04; 5],
+            Array2::zeros((1, 1)).view(),
+            &IntegrationAccuracy::default()
+        )
+        .is_err()
+    );
 }
 
 #[test]
@@ -410,9 +527,10 @@ fn importance_integral_conditions_missing_genetics_under_the_full_joint_prior() 
     let expected = -1.0 - 0.5 * (0.7_f64.powi(2) + (2.0 * std::f64::consts::PI).ln());
     assert!((result.likelihood.log_marginal - expected).abs() < 1e-12);
     assert!(result.likelihood.log_standard_error < 1e-14);
-    assert!((result.likelihood.effective_samples - options.samples as f64).abs() < 1e-7);
-    assert!((result.mean[0] - rho * 0.7).abs() < 0.03);
-    assert!((result.genetic_covariance[[0, 0]] - (1.0 - rho * rho)).abs() < 0.03);
+    assert!(result.likelihood.effective_samples.is_none());
+    assert_eq!(result.likelihood.samples, 0);
+    assert!((result.mean[0] - rho * 0.7).abs() < 1e-14);
+    assert!((result.genetic_covariance[[0, 0]] - (1.0 - rho * rho)).abs() < 1e-14);
 }
 
 #[test]
@@ -519,7 +637,7 @@ fn importance_correction_matches_an_independent_measurement_integral() {
         out.likelihood.log_marginal,
         exact.0,
         out.likelihood.log_standard_error,
-        out.likelihood.effective_samples,
+        out.likelihood.effective_samples.unwrap(),
         out.mean[4],
         exact.1,
         out.state_covariance[4][[0, 0]],
@@ -595,8 +713,10 @@ fn sampled_objective_and_derivatives_include_the_same_reference_sensitivities() 
     }
     let mut diffuse = theta.clone();
     diffuse[model.layout.rates.start] = 8.0;
-    let error = bank
-        .log_marginal(&diffuse, &[0.0; 5], &accuracy)
-        .unwrap_err();
-    assert!(error.to_string().contains("finite variance"), "{error}");
+    if let Err(error) = bank.log_marginal(&diffuse, &[0.0; 5], &accuracy) {
+        assert!(
+            error.to_string().contains("importance integral unresolved"),
+            "{error}"
+        );
+    }
 }

@@ -36,7 +36,7 @@ pub use function_prior::{
 };
 pub use integration::{
     IntegratedLikelihood, IntegratedPosterior, IntegratedScore, IntegrationAccuracy,
-    IntegrationOptions, JointIntegration,
+    IntegrationOptions, JointIntegration, LatentIntegrationMethod,
 };
 pub use posterior::{LaplacePosterior, PosteriorOptions};
 pub use reference::{

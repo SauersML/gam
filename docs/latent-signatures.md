@@ -597,12 +597,13 @@ error, global coefficient curvature, or external calibration. A final fitting
 driver and structure-learning implementation remain unfinished.
 
 The implemented importance bank draws from an equal mixture of the structured
-Laplace Gaussian and the normalized Gaussian path prior conditional on observed
-genetic scores and event jumps. The complete observation factors remain in the
-importance numerator. Including the prior protects against a local Gaussian
-proposal whose tails are too light; it does not ensure efficient sampling in a
-large or multimodal problem. This is defensive mixture sampling, as described
-by [Hesterberg](https://statistics.stanford.edu/technical-reports/weighted-average-importance-sampling-and-defensive-mixture-distributions).
+Laplace Gaussian and a multivariate Student t with three degrees of freedom,
+centered at the conditional path-prior mean with the same covariance. The
+complete Gaussian joint law remains in the importance numerator. Three is the
+smallest integer degree of freedom with a finite covariance, allowing that
+covariance match while providing polynomial tails. The Student displacement
+is a structured Gaussian draw divided by the square root of a chi-squared
+draw with three degrees of freedom. Both mixture densities are normalized.
 
 An integration bank belongs to one immutable model specification and history.
 Its nodes and normalized proposal density stay fixed during coefficient and
@@ -617,14 +618,25 @@ Independent banks must assess each fitted or served quantity. Replacing a bank
 inside an optimization line search would change the sampled objective and is
 not permitted by this contract.
 
-At a moved parameter state, the bank checks the sufficient tail condition
-`2 Q(theta) - Q(anchor) > 0` on the Gaussian prior precisions. Since the proposal
-contains half the anchor prior and the observation factors have at most
-polynomial growth in the path, this establishes finite second moments of the
-importance weights and polynomial state summaries. It is a sufficient condition,
-not a necessary one; failure requires a new proposal. Weight diagnostics alone
-cannot establish this tail property. Posterior means and selected covariance
-blocks also have their own estimated standardized-error acceptance limit.
+For every fixed finite coefficient state with a proper Gaussian path law,
+the observation factors grow at most polynomially in that path. The Student
+component therefore gives finite second moments of importance weights and
+polynomial state summaries, without restricting coefficient changes to
+`2 Q(theta) - Q(anchor) > 0`. Finite variance does not ensure adequate coverage
+by a finite sample or efficient sampling in a large or multimodal problem.
+Posterior means and selected covariance blocks retain their own estimated
+standardized-error acceptance limit.
+
+When there are zero signatures, or all marks are already out of their risk
+sets and no measurements are observed, the latent integral is Gaussian by
+model structure. These cases use analytic integration, including the marginal
+density of observed genetic scores and the conditional law of missing scores.
+They return exact Gaussian means and selected covariance blocks, zero sampling
+errors, zero samples, and absent effective-sample/weight diagnostics. The
+`LatentIntegrationMethod` distinguishes them from importance estimates.
+The rank-zero route retains all observation and reference derivatives; the
+fully unobserved route has zero coefficient score. Small rates or loadings
+at a particular coefficient value do not trigger this structural shortcut.
 
 Sampling uses the block precision factors directly: a genetic Schur draw and
 backward conditional state draws. It does not form a dense trajectory covariance

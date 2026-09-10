@@ -324,6 +324,24 @@ impl JointLikelihood {
             None => Factorization::new(&prior.precision)?.solve(&prior.information),
         };
         let mut value = self.log_density(theta, h, &mode, reference)?;
+        if self.gaussian_observation_law(h) {
+            let factor = Factorization::new(&prior.precision)?;
+            mode = factor.solve(&prior.information);
+            value = self.log_density(theta, h, &mode, reference)?;
+            let (state_covariance, genetic_covariance, state_genetic_covariance) =
+                factor.covariance();
+            return Ok(LaplacePosterior {
+                mode,
+                state_covariance,
+                genetic_covariance,
+                state_genetic_covariance,
+                log_marginal: value + 0.5 * dimension as f64 * (2.0 * std::f64::consts::PI).ln()
+                    - 0.5 * factor.log_determinant,
+                newton_decrement: 0.0,
+                iterations: 0,
+                precision_entries: prior.precision.stored_entries(),
+            });
+        }
         for iteration in 0..options.max_iterations {
             let applied = prior.precision.apply(&mode);
             let mut gradient: Vec<f64> = prior
