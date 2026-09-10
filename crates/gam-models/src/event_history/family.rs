@@ -3031,7 +3031,15 @@ pub fn fit_event_history(
                 (Some(current), Some(r), Some(before)) if before > 0.0 => {
                     let ratio = moved / before;
                     if (0.0..0.95).contains(&ratio) {
-                        let gain = 1.0 / (1.0 - ratio);
+                        // The sum of the series, but not more of it than the
+                        // solve can be expected to follow in one step: the
+                        // normaliser's shape moves the risk set it is read
+                        // off, and a step far past what two residuals have
+                        // actually measured lands somewhere the next fit has
+                        // no warm start for. Beyond the cap the alternation
+                        // simply takes more rounds, which is the safe way to
+                        // be wrong about the ratio.
+                        let gain = (1.0 / (1.0 - ratio)).min(4.0);
                         log::info!(
                             "[event-history] risk-set centring round {}: the normaliser moved {moved:.3e} nats, contracting at {ratio:.3}: summing the series ({gain:.2}×)",
                             normaliser_rounds.len()
