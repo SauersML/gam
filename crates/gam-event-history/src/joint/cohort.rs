@@ -5,6 +5,12 @@ use super::*;
 #[path = "cohort_resolution.rs"]
 mod resolution;
 pub use resolution::{CohortScoreTolerance, JointCohortResolutionReport, ResolvedCohortScore};
+#[path = "coefficient_integral.rs"]
+mod coefficients;
+pub use coefficients::{
+    CoefficientImportanceDraw, EvidenceHessianProduct, JointCoefficientEvidence,
+    JointCoefficientIntegral,
+};
 
 /// A fixed sampled objective. Subject banks must have independent importance
 /// draws conditional on the reference populations. A stratum is its positional
@@ -553,6 +559,39 @@ mod tests {
             .function_priors(&histories.iter().collect::<Vec<_>>(), 64 << 20)
             .unwrap();
         let strengths = vec![0.3; priors.penalties().len()];
+        let mut coefficient_draws = Vec::new();
+        let mut direct_weights = Vec::new();
+        for _ in 0..2 {
+            use rand_distr::Distribution;
+            let mut draw = theta.clone();
+            let mut log_proposal = 0.0;
+            for coordinate in &mut draw {
+                let z: f64 = rand_distr::StandardNormal.sample(&mut rng);
+                *coordinate += 0.01 * z;
+                log_proposal +=
+                    -0.5 * z * z - 0.5 * (2.0 * std::f64::consts::PI).ln() - 0.01_f64.ln();
+            }
+            direct_weights.push(
+                *cohort
+                    .log_likelihood(&draw, &accuracy)
+                    .unwrap()
+                    .log_likelihood()
+                    + priors.evaluate(&draw, &strengths).unwrap().log_density()
+                    - log_proposal,
+            );
+            coefficient_draws.push(CoefficientImportanceDraw {
+                coefficients: draw,
+                log_proposal_density: log_proposal,
+            });
+        }
+        let coefficient_bank = cohort
+            .coefficient_integral(&priors, coefficient_draws, &accuracy, &tolerance, 64 << 20)
+            .unwrap();
+        let evidence = coefficient_bank.evaluate(&strengths).unwrap();
+        assert!(
+            (evidence.log_evidence() - (log_sum_exp(&direct_weights) - 2.0_f64.ln())).abs() < 1e-12
+        );
+        assert!(evidence.inner_log_error_estimate() > 0.0);
         let regularized = cohort
             .score_with_function_priors(&theta, &priors, &strengths, &accuracy)
             .unwrap();

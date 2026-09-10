@@ -24,8 +24,10 @@ mod reference;
 mod resolution;
 mod score;
 pub use cohort::{
-    CohortScoreTolerance, JointCohortEvaluation, JointCohortIntegration, JointCohortPosterior,
-    JointCohortResolutionReport, JointCohortScore, JointPriorScore, ResolvedCohortScore,
+    CoefficientImportanceDraw, CohortScoreTolerance, EvidenceHessianProduct,
+    JointCoefficientEvidence, JointCoefficientIntegral, JointCohortEvaluation,
+    JointCohortIntegration, JointCohortPosterior, JointCohortResolutionReport, JointCohortScore,
+    JointPriorScore, ResolvedCohortScore,
 };
 pub use decoder_prior::DecoderPriorEvaluation;
 pub use function_prior::{FunctionPenalty, FunctionPriorEvaluation, JointFunctionPriors};

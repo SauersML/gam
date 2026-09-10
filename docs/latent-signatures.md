@@ -215,8 +215,9 @@ This identity does not justify an arbitrary identity ridge on nonlinear
 decoder logits, rate coordinates, or an intercept. Nonlinear function priors
 also need their normalization and coordinate Jacobians in any evidence
 calculation; substituting a Gaussian penalty determinant would change the
-objective. The function priors below are implemented; coefficient integration
-and hyperparameter learning are unfinished.
+objective. The function priors and a fixed-bank coefficient integral below
+are implemented. Automatic proposal construction, resolution and
+hyperparameter optimization are unfinished.
 
 ### Decoder function prior
 
@@ -311,8 +312,8 @@ scaled before multiplication so `exp(rho)` need not itself be representable.
 coefficient Hessian products, strength derivatives, and mixed products without
 a full coefficients-by-strengths matrix. Roots and evaluation workspace are
 bounded before construction. These are normalized densities on their penalized
-blocks. GAM operator-specific smoothness penalties, coefficient integration,
-and REML/LAML optimization still need completion.
+blocks. GAM operator-specific smoothness penalties, the automatic coefficient
+integration driver, and REML/LAML optimization still need completion.
 
 ### Physical rates and observation measures
 
@@ -350,6 +351,44 @@ Student-t location intercepts retain a flat nuisance measure; their
 integrability must be established during coefficient inference. The
 static-process, Gaussian-observation, Poisson-count and zero-effect limits
 still need explicit handling in the eventual strength optimizer.
+
+### Fixed-bank coefficient evidence
+
+`JointCohortIntegration::coefficient_integral` evaluates the cohort at supplied
+independent draws from a normalized coefficient proposal. Every draw first
+passes the whole-cohort reference/value/score resolution assessment. Its
+likelihood is then cached, so a strength evaluation does not rerun subjects
+or reference populations. For draw `theta_s` from density `q`, it computes
+
+```text
+Z_hat(rho) = (1/S) sum_s exp(ell(theta_s) + log p(theta_s|rho) - log q(theta_s)).
+g(rho) = sum_s w_s partial_rho log p(theta_s|rho).
+H(rho) = sum_s w_s partial_rho^2 log p(theta_s|rho)
+         + Cov_w(partial_rho log p(theta_s|rho)).
+```
+
+These are analytic derivatives of that same sampled integral. The covariance
+term includes cross-strength curvature even when every conditional prior has
+diagonal strength curvature. Hessian-vector products require `O(S H)` work
+and storage for `H` strengths, without a dense `H` by `H` matrix. Coefficient
+means and marginal variances use the same normalized weights. Predictions
+must average their final functions over these weights; substituting a
+function evaluated at the mean coefficient generally changes the answer.
+
+The result reports conditional Monte Carlo errors for log evidence, means,
+strength gradients and Hessian products. Cached inner likelihood errors are
+correlated across coefficient draws and are reported separately as the
+largest per-draw resolution estimate, without a spurious `1/sqrt(S)` reduction.
+Neither this diagnostic nor a large empirical ESS proves proposal coverage,
+finite importance variance or simultaneous error control. The proposal's
+normalization, independence and chart Jacobians are a caller contract; MCMC
+draws cannot be substituted while retaining these standard-error formulas.
+
+This is a coefficient-integration component, not a fit or a finished REML
+driver. Automatic proposals, independent refinement checks, null boundaries,
+converged strength optimization and integrated serving remain unfinished.
+Tests compare the Poisson/Gamma integral and posterior means with closed
+forms, and the complete sampled gradient/Hessian with direct differentiation.
 
 Training may use a structured variational approximation with local Gaussian
 state factors and temporal precision blocks, plus shared parameter factors.
