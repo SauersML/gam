@@ -17,11 +17,16 @@ mod emission;
 mod integration;
 mod posterior;
 mod precision;
+mod reference;
 pub use integration::{
     IntegratedLikelihood, IntegratedPosterior, IntegrationAccuracy, IntegrationOptions,
     JointIntegration,
 };
 pub use posterior::{LaplacePosterior, PosteriorOptions};
+pub use reference::{
+    JointReferenceBank, JointReferenceEvolution, JointReferenceProfile, ReferenceAccuracy,
+    ReferenceDiagnostics, ReferenceOptions,
+};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum MeasurementFamily {
@@ -555,3 +560,6 @@ impl JointLikelihood {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod reference_tests;

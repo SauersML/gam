@@ -145,3 +145,37 @@ conditioning from that reference law, parameter fitting, automatic structure
 selection, Python/CLI serving, and deployable model serialization still need
 integration. The importance diagnostics do not establish external calibration,
 biobank-scale performance, or exact evidence. The goal is not complete.
+
+## Reference particles with disease histories
+
+The subsequent reference implementation carries the same genetic OU states,
+once/terminal risk sets, and nonterminal jumps as the joint density. Its fixed
+event proposals are reweighted at every coefficient evaluation; derivatives
+include those weights and the risk-set moments. The normalized observation
+integral and posterior return the exact coefficient/reference state they used.
+
+The first **18 joint checks passed in 1.63 s** after a **67 s** warm build. After
+stabilizing the reference error calculation, the final **20 checks passed in
+1.64 s**. Raw final output is `event_history_reference_20260910.txt`. The added
+checks cover competing risk-set membership, horizon rejection, refusal of
+excessive event steps and unresolved sampling diagnostics, genetic/jump/event-
+weight derivatives, and consistency of the normalized observation integral with
+its returned reference state. Rare-event log probabilities retain derivatives
+at log hazard **-800**, and moment error estimates avoid multiplying underflowed
+weights by overflowing squared activities.
+
+The final Cargo build first reached its **95 s** cap. A diagnostic retry then
+failed at linking with undefined cached internal Rust symbols; it reported
+**69.17 s** elapsed and about **1,045,752 KiB** maximum RSS. A process observation
+showed about **31 s** of Cargo work before rustc started. Replaying Cargo's exact
+compiler invocation without this crate's incremental-object option, keeping all
+warm dependency artifacts and restricting execution to four CPUs, completed in
+**36.94 s**. The final 20-test result is from that successfully linked binary.
+Neither the timeout nor the link failure is counted as a passing Cargo run.
+
+This is a differentiated finite-step reference engine, not a resolved reference
+calculation. Its event update admits at most one event per interval. Within-bank
+dispersion estimates do not account for all dependence induced by the shared
+normalizer. Adaptive time/particle refinement and independent reference
+replicates remain required, along with the fitting, structure-learning,
+entry-conditioning, serving, and calibration work listed above.

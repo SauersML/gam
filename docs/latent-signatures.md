@@ -2,9 +2,10 @@
 
 This document specifies the complete model being built. The `joint` module in
 `gam_event_history` implements its complete-path density, structured Laplace
-posterior, and importance integration. It does not yet implement the complete
-reference evolution, parameter-fitting workflow, structure search, or serving
-interface specified below. The older log-linear Gaussian event model and its
+posterior, importance integration, and a differentiated reference-particle
+evolution with disease histories. Adaptive reference resolution, the
+parameter-fitting workflow, structure search, and serving interface are still
+unfinished. The older log-linear Gaussian event model and its
 numerical limits are documented in `event-history.md`.
 
 The implemented state has independent OU innovations with stationary variance
@@ -93,6 +94,36 @@ including other diseases, their state jumps, measurements when they affect
 ascertainment, and mortality. With learned disease jumps, independently killing
 one filter per disease is no longer that evolution: prior diseases affect
 subsequent state dynamics. The reference solver must retain that information.
+
+The implemented `JointReferenceBank` retains each proposed disease history and
+Gaussian state innovation. It draws missing genetic scores from their Gaussian
+law conditional on the profile's observed scores. OU half steps surround a
+competing-event update, and a nonterminal event applies its learned jump before
+the next state step. Terminal events remove the particle from every risk set;
+once-only events remove it from their own. Baseline basis rows are interpolated
+within each reference interval, while the supplied drive basis holds constant
+over that interval.
+
+At its anchor parameters the event proposal follows the particle population's
+rates. Later evaluations keep the proposed histories and proposal probabilities
+fixed and differentiate the target/proposal weights, the genetic state drive,
+the jumps, and the risk-set moments. Freezing the proposal is an integration
+device; it does not freeze the normalizer's score. `normalized_log_marginal` and
+`normalized_posterior` compute the reference and observation likelihood at the
+same coefficient state and return the reference object actually used. Its
+coefficient vector and derivative channels travel with its moments. Requests
+outside the reference origin and horizon are rejected.
+
+This particle evolution is not yet the resolved reference solver required for
+release. A finite event step admits at most one event, so midpoint rate
+normalization does not establish the continuous-time survival identity.
+The implementation rejects excessive per-particle step hazards and inadequate
+risk-set effective sample counts, and checks within-bank estimates of moment
+and risk-mass dispersion. Particles interact through their shared normalizer;
+these plug-in standard-error estimates do not capture every dependence term.
+Independent particle replicates and time/particle refinement at fixed
+coefficients remain required. Passing the local diagnostic thresholds must not
+be reported as a calibration certificate.
 
 The conditional mean intensity among the specified risk set is
 `exp(eta0_d(t,c))`. For one first-occurrence disease without death this implies

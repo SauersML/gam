@@ -186,6 +186,45 @@ impl JointLikelihood {
 }
 
 impl JointIntegration<'_> {
+    /// Evaluate the observation integral and its reference evolution at the
+    /// same coefficient state. The returned centering object is precisely
+    /// the one used by this evaluation, including its derivative channels.
+    pub fn normalized_log_marginal<S: JetField>(
+        &self,
+        theta: &[S],
+        reference: &JointReferenceBank<'_>,
+        reference_accuracy: &ReferenceAccuracy,
+        accuracy: &IntegrationAccuracy,
+    ) -> Result<(IntegratedLikelihood<S>, JointReferenceEvolution<S>), EventHistoryError> {
+        if !reference.belongs_to(self.model) {
+            return Err(invalid(
+                "joint reference and likelihood must belong to the same model",
+            ));
+        }
+        let evolution = reference.evolve(theta, reference_accuracy)?;
+        let moments = evolution.at(&self.history.times)?;
+        let likelihood = self.log_marginal(evolution.coefficients(), &moments, accuracy)?;
+        Ok((likelihood, evolution))
+    }
+
+    pub fn normalized_posterior(
+        &self,
+        theta: &[f64],
+        reference: &JointReferenceBank<'_>,
+        reference_accuracy: &ReferenceAccuracy,
+        accuracy: &IntegrationAccuracy,
+    ) -> Result<(IntegratedPosterior, JointReferenceEvolution<f64>), EventHistoryError> {
+        if !reference.belongs_to(self.model) {
+            return Err(invalid(
+                "joint reference and likelihood must belong to the same model",
+            ));
+        }
+        let evolution = reference.evolve(theta, reference_accuracy)?;
+        let moments = evolution.at(&self.history.times)?;
+        let posterior = self.posterior(evolution.coefficients(), &moments, accuracy)?;
+        Ok((posterior, evolution))
+    }
+
     fn evaluate<S: JetField>(
         &self,
         theta: &[S],
