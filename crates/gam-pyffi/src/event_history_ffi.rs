@@ -563,9 +563,10 @@ fn fit_event_history(
         let fit = fit_event_history(&mut cohort, &spec).map_err(|e| e.to_string())?;
         Ok((fit, cohort))
     })?;
-    let strata = match &fit.reference_normaliser.is_empty() {
-        true => vec![0usize; cohort.subjects.len()],
-        false => subject_strata,
+    let strata = if fit.reference_normaliser.is_empty() {
+        vec![0usize; cohort.subjects.len()]
+    } else {
+        subject_strata
     };
     Ok(PyEventHistoryModel {
         fit: Arc::new(fit),
