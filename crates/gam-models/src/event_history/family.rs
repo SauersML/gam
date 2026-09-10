@@ -3078,6 +3078,25 @@ pub fn fit_event_history(
                 fit.atom_log_lambdas.clone(),
                 fit.rate_held.clone(),
             );
+            // The rounds run pinned, as the rank search does: the ladder that
+            // certifies a fit against a finer quadrature and mesh is worth
+            // paying once, for the model the caller gets, not once per round
+            // of an alternation whose intermediate points are discarded.
+            fit = fit_at_rank(cohort, spec, rank, Some(&start), pin, held.clone())?;
+        }
+        // The settled normaliser's own fit is the one certified.
+        if !normaliser_rounds.is_empty() {
+            let rank = fit.rank();
+            let start = RankStart::carried(
+                fit.fit.block_states[..marks]
+                    .iter()
+                    .map(|s| s.beta.clone())
+                    .collect(),
+                fit.loadings.iter().copied().collect(),
+                fit.log_rates.clone(),
+                fit.atom_log_lambdas.clone(),
+                fit.rate_held.clone(),
+            );
             fit = fit_at_rank(cohort, spec, rank, Some(&start), None, held.clone())?;
         }
     }
