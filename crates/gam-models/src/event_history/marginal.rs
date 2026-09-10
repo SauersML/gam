@@ -401,25 +401,51 @@ pub(crate) fn node_likelihood<S: JetField>(
         let base = centred_baseline(&eta0[d], loadings_d, log_normaliser.map(|m| &m[d]));
         let y = counts[d];
         informative.push(exposure != 0.0);
+        // The latent part of the intensity factorises over the grid's axes:
+        // `exp(Σ_k a_k z_k) = Π_k exp(a_k z_k)`, and each axis takes only
+        // `order` distinct coordinates however many points the product grid
+        // has. One table of exponentials per axis therefore replaces one
+        // exponential per state — `atoms · order` of them instead of
+        // `order^atoms` — which is the difference between a cost linear in
+        // the atoms and one exponential in them, at the point where the
+        // exponential is the expensive operation on a dual scalar.
+        let latent: Option<Vec<Vec<S>>> = (exposure != 0.0).then(|| {
+            (0..atoms)
+                .map(|k| {
+                    grid.axes[k]
+                        .points
+                        .iter()
+                        .map(|z| exp(&loadings_d[k].mul(z)))
+                        .collect()
+                })
+                .collect()
+        });
+        let scaled_base = latent.as_ref().map(|_| exp(&base).scale(exposure));
         for i in 0..size {
-            let mut eta = base.clone();
-            for (k, a) in loadings_d.iter().enumerate() {
-                eta = eta.add(&a.mul(grid.coordinate(i, k)));
-            }
             if y != 0.0 {
+                let mut eta = base.clone();
+                for (k, a) in loadings_d.iter().enumerate() {
+                    eta = eta.add(&a.mul(grid.coordinate(i, k)));
+                }
                 ell[i] = ell[i].add(&eta.scale(y));
             }
             // A mark with no exposure at this node has no compensator and so
             // no curvature: its intensity is never formed, which is the work
             // the risk sets save.
-            if exposure != 0.0 {
-                let c = exp(&eta).scale(exposure);
-                ell[i] = ell[i].sub(&c);
-                score.push(add_real(&c.scale(-1.0), y));
-                curvature.push(c);
-            } else {
-                score.push(zero.constant_like(y));
-                curvature.push(zero.clone());
+            match (&latent, &scaled_base) {
+                (Some(tables), Some(front)) => {
+                    let mut c = front.clone();
+                    for (k, table) in tables.iter().enumerate() {
+                        c = c.mul(&table[grid.index(i, k)]);
+                    }
+                    ell[i] = ell[i].sub(&c);
+                    score.push(add_real(&c.scale(-1.0), y));
+                    curvature.push(c);
+                }
+                _ => {
+                    score.push(zero.constant_like(y));
+                    curvature.push(zero.clone());
+                }
             }
         }
     }
