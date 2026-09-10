@@ -581,6 +581,11 @@ impl PreparedDecoderIncoherence {
         assert_eq!(right.len(), self.dimension);
         assert_eq!(out.len(), self.dimension);
         for pair in &self.pairs {
+            if pair.left.clone().chain(pair.right.clone()).all(|i| left[i] == 0.0)
+                || pair.left.clone().chain(pair.right.clone()).all(|i| right[i] == 0.0)
+            {
+                continue;
+            }
             let l = Self::pair_direction(pair, left);
             let r = Self::pair_direction(pair, right);
             let local = if exact {

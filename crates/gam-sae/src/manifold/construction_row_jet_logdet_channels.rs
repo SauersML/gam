@@ -1196,9 +1196,20 @@ impl SaeManifoldTerm {
                 }
                 for (border_pos, channel) in border.iter().enumerate() {
                     gamma_beta[channel.index] += trace.beta[local * n_beta + border_pos];
+                    if let Some(ctx) = patchd_ctx.as_ref() {
+                        for a in 0..q {
+                            for b in 0..q {
+                                gamma_beta[channel.index] += e_row[a * q + b]
+                                    * self.patchd_residual_third_leg_beta(ctx, vars[a], vars[b], channel);
+                            }
+                        }
+                    }
                 }
             }
             start += tile_rows;
+        }
+        if exact_a && joint_block {
+            gamma_beta += &self.exact_decoder_prior_theta_trace(cache, beta_inv.view())?;
         }
         Ok(SaeArrowVector {
             t: gamma_t,

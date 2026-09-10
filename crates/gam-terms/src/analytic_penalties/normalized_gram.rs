@@ -142,6 +142,14 @@ impl NormalizedCrossGram {
         })
     }
 
+    pub fn gradient(&self) -> Array1<f64> {
+        let mut out = Array1::zeros(self.gradients[0].len());
+        for i in 0..3 {
+            out.scaled_add(self.scalar_first[i], &self.gradients[i]);
+        }
+        out
+    }
+
     pub fn diagonal(&self) -> Array1<f64> {
         let mut out = Array1::zeros(self.gradients[0].len());
         for i in 0..3 {

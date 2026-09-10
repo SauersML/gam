@@ -132,6 +132,59 @@ fn resident_softmax_theta_adjoint_matches_dense_under_both_operators_2828() {
 }
 
 #[test]
+fn exact_decoder_prior_theta_trace_matches_curvature_differences_2828() {
+    let (term, target, rho) = threshold_gate_tiny_fixture(false);
+    let (mut anchor, cache) = frozen_anchor_and_cache(&term, &target, &rho);
+    // Make the radial barrier measurable as well as the two overlap priors.
+    anchor.amplitude_barrier_gate = Some(0.02);
+    let width = anchor.beta_dim();
+    assert_eq!(cache.k, width);
+    let inverse = Array2::from_shape_fn((width, width), |(i, j)| {
+        if i == j { 1.0 } else { 0.1 * ((i + j) as f64).cos() }
+    });
+    let analytic = anchor.exact_decoder_prior_theta_trace(&cache, inverse.view())
+        .expect("exact prior trace adjoint");
+    let offsets = anchor.beta_offsets();
+    let p = anchor.output_dim();
+    let price = |endpoint: &SaeManifoldTerm| {
+        let plan = endpoint.prepare_decoder_prior_beta_curvature(1.0);
+        let mut trace = 0.0;
+        for col in 0..width {
+            let (image, _) = endpoint.decoder_prior_beta_hvp_pair_prepared(&plan, inverse.column(col))
+                .expect("exact prior Hessian action");
+            trace += image[col];
+        }
+        trace
+    };
+    for atom in 0..anchor.atoms.len() {
+        for mu in 0..anchor.atoms[atom].basis_size() {
+            for out in 0..p {
+                let mut estimates = Vec::new();
+                for h in [2.0e-5, 1.0e-5] {
+                    let mut endpoints = Vec::new();
+                    for sign in [-1.0, 1.0] {
+                        let mut endpoint = anchor.clone();
+                        endpoint.decoder_repulsion_gate = anchor.decoder_repulsion_gate.clone();
+                        endpoint.barrier_coactivation_gate = anchor.barrier_coactivation_gate.clone();
+                        endpoint.amplitude_barrier_gate = anchor.amplitude_barrier_gate;
+                        endpoint.streaming_gates_frozen = true;
+                        let mut beta = endpoint.atoms[atom].decoder_coefficients().clone();
+                        beta[[mu, out]] += sign * h;
+                        endpoint.atoms[atom].set_decoder_coefficients(beta).expect("same decoder shape");
+                        endpoints.push(price(&endpoint));
+                    }
+                    estimates.push((endpoints[1] - endpoints[0]) / (2.0 * h));
+                }
+                let fd = (4.0 * estimates[1] - estimates[0]) / 3.0;
+                let actual = analytic[offsets[atom] + mu * p + out];
+                assert!((fd - actual).abs() < 1.0e-5 * (1.0 + fd.abs()),
+                    "prior third derivative ({atom},{mu},{out}): {actual:e} versus {fd:e}");
+            }
+        }
+    }
+}
+
+#[test]
 fn exact_a_joint_theta_adjoint_beta_block_matches_finite_difference_2828() {
     let (term, target, rho) = threshold_gate_tiny_fixture(false);
     let (anchor, cache) = frozen_anchor_and_cache(&term, &target, &rho);

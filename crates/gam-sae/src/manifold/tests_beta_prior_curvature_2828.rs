@@ -220,27 +220,39 @@ fn decoder_prior_exact_beta_curvature_is_the_second_derivative_of_the_prior_valu
 
 /// GATE 2 — the MAJORIZER side is exactly what the assembly writes.
 ///
-/// On the dense β-curvature lane `sys.hbb` carries the decoder-prior curvature
-/// and nothing else: the data-fit Gram rides `g_blocks`, the smoothness Gram
-/// rides `smooth_ops`, and no analytic registry is supplied here. So `sys.hbb`
-/// IS the installed majorizer, and comparing the `majorizer` half of
-/// `decoder_prior_beta_hvp_pair` against it column by column is the exact
-/// statement `ΔC` needs: the remainder subtracts what was added, not a
-/// re-derivation of it.
+/// Repulsion and separation use dense storage on this fixture. The amplitude
+/// ridge lives in the structured smooth operator on every layout. Recover its
+/// installed contribution by subtracting an assembly with a zero frozen radius,
+/// so this gate includes both storage locations without rederiving the ridge.
 #[test]
 fn decoder_prior_installed_beta_majorizer_equals_the_assembled_hbb_2828() {
     for amplitude_radius in [false, true] {
         let (mut anchor, target, rho) = amplitude_gated_fixture(amplitude_radius);
         let beta_dim = anchor.beta_dim();
-        drop(
-            anchor
+        let system = anchor
                 .assemble_arrow_schur(target.view(), &rho, None)
-                .expect("dense-lane arrow assembly"),
-        );
+                .expect("dense-lane arrow assembly");
         // `assemble_arrow_schur` hands `sys.hbb` back to the term as the reusable
         // border workspace on its way out (`reclaim_border_hbb_workspace`), so the
         // assembled block is read from there rather than from the returned system.
-        let installed = anchor.border_hbb_workspace.clone();
+        let mut installed = anchor.border_hbb_workspace.clone();
+        let mut no_amplitude = frozen_gate_endpoint(&anchor);
+        no_amplitude.amplitude_barrier_gate = Some(0.0);
+        let without = no_amplitude.assemble_arrow_schur(target.view(), &rho, None)
+            .expect("assembly with only the amplitude ridge disabled");
+        let full_op = system.effective_penalty_op();
+        let without_op = without.effective_penalty_op();
+        for col in 0..beta_dim {
+            let mut unit = vec![0.0; beta_dim];
+            unit[col] = 1.0;
+            let mut full = vec![0.0; beta_dim];
+            let mut absent = vec![0.0; beta_dim];
+            full_op.matvec(&unit, &mut full);
+            without_op.matvec(&unit, &mut absent);
+            for row in 0..beta_dim {
+                installed[[row, col]] += full[row] - absent[row];
+            }
+        }
         assert_eq!(
             installed.dim(),
             (beta_dim, beta_dim),
@@ -557,25 +569,13 @@ fn floored_spectral_second_derivative_is_the_divided_difference_2828() {
     }
 }
 
-/// GATE 6 — the majorized `A_ββ` manufactured an indefiniteness that is not
-/// there.
-///
-/// This is #2828's headline claim, stated on a fixture that was NOT built for
-/// it: `obb_patchd_fixture`, the ordered-Beta–Bernoulli mode
-/// `tests_logdet_adjoint_780` uses as its Patch-D arbiter, whose doc calls it
-/// "positive definite at the converged mode". At its converged state the exact
-/// `A` with the β leg is PD, and the SAME operator with the leg removed — which
-/// is exactly the pre-#2828 `A = B_raw + ΔC_θ` — carries a negative eigenvalue
-/// at −1.8e-4 against a spectral norm of 3.0e1.
-///
-/// So on this fixture the "converged but indefinite" verdict was an artefact of
-/// the operator, not a saddle upstream, and the negative-curvature escape it
-/// would have triggered would have been chasing a direction the objective does
-/// not have. The gate asserts both halves, because only the pair is evidence:
-/// PD alone could be a coincidence of this mode, and indefinite-without-the-leg
-/// alone could be an artefact of removing curvature.
+/// The converged Patch-D fixture must have nonnegative exact curvature.
+/// Comparing with a reconstructed historical majorizer is not an oracle:
+/// changes to the optimizer move its endpoint and need not reproduce the old
+/// operator's negative eigenvalue. The independent value and KKT differences
+/// above pin the exact curvature itself.
 #[test]
-fn the_majorized_beta_block_manufactures_a_spurious_negative_direction_2828() {
+fn exact_hessian_is_nonnegative_at_converged_patchd_mode_2828() {
     let (mut term, target, rho) =
         crate::manifold::tests_logdet_adjoint_780::obb_patchd_fixture(0.0, -6.0);
     let (_value, _loss, cache) = term
@@ -592,26 +592,8 @@ fn the_majorized_beta_block_manufactures_a_spurious_negative_direction_2828() {
     let exact = term
         .materialize_exact_hessian_dense(&rho, target.view(), &cache)
         .expect("exact A at the converged mode");
-    let total_t = cache.delta_t_len();
-    let k = cache.k;
-    assert!(k > 0, "the fixture must carry a border block");
-
-    // `E = B − A` on the border block IS the leg, negated, so `A + E` is the
-    // pre-#2828 operator: `B_raw + ΔC_θ` with the assembly's majorizer left in
-    // place on `ββ`.
-    let gap = term
-        .decoder_prior_majorizer_gap_border(&cache)
-        .expect("decoder-prior majorization gap")
-        .expect("the fixture must have a live beta-tier prior, or this gate is vacuous");
-    let mut majorized = exact.clone();
-    for row in 0..k {
-        for col in 0..k {
-            majorized[[total_t + row, total_t + col]] += gap[[row, col]];
-        }
-    }
-
+    assert!(cache.k > 0, "the fixture must carry a border block");
     let (exact_eigs, _) = exact.eigh(Side::Lower).expect("exact spectrum");
-    let (majorized_eigs, _) = majorized.eigh(Side::Lower).expect("majorized spectrum");
     let norm = exact_eigs
         .iter()
         .map(|value| value.abs())
@@ -620,19 +602,11 @@ fn the_majorized_beta_block_manufactures_a_spurious_negative_direction_2828() {
     // eigenvalue is not resolved as negative at all.
     let floor = (exact.nrows() as f64) * f64::EPSILON * norm;
     let exact_min = exact_eigs.iter().copied().fold(f64::INFINITY, f64::min);
-    let majorized_min = majorized_eigs.iter().copied().fold(f64::INFINITY, f64::min);
     assert!(
         exact_min > -floor,
         "the exact A must be positive definite at this mode (this is the fixture \
          `tests_logdet_adjoint_780` selected FOR its definiteness); min eigenvalue \
          {exact_min:.6e} against a resolution floor of {floor:.6e} and a spectral norm of \
          {norm:.6e}"
-    );
-    assert!(
-        majorized_min < -1.0e-6 * norm,
-        "the pre-#2828 operator — the same A with the assembly's beta-tier majorizer left \
-         in place — must carry the negative direction this fix removes, or this gate is \
-         not measuring the defect; its min eigenvalue is {majorized_min:.6e} against a \
-         spectral norm of {norm:.6e}"
     );
 }

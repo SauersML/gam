@@ -511,11 +511,12 @@ struct ExactHessianBasin {
 }
 
 /// Differential of one coherently priced spectral block.
-/// The derivative of the clamp is diagonal because the model's E is diagonal.
+/// E has a coordinate diagonal and a dense decoder-prior border block.
 /// `a_derivative` includes the negative-subspace projector response.
 struct ExactHessianPricing {
     a_derivative: Array2<f64>,
     clamp_diagonal_derivative: Array1<f64>,
+    clamp_border_derivative: Array2<f64>,
 }
 
 /// Complete dense exact-A derivative cluster.  The stationarity adjoint is
@@ -2207,8 +2208,6 @@ impl SaeManifoldTerm {
             sqrt_w,
             assignments,
             second_jets,
-            is_obb,
-            inv_tau,
             ..
         } = *ctx;
         let classify = |v: SaeLocalRowVar| -> (usize, Option<usize>) {
@@ -2219,7 +2218,7 @@ impl SaeManifoldTerm {
         };
         let (ka, aa) = classify(a_var);
         let (kw, aw) = classify(w_var);
-        if ka != ch.atom || kw != ch.atom {
+        if (aa.is_some() && ka != ch.atom) || (aw.is_some() && kw != ch.atom) {
             return 0.0;
         }
         let atom_idx = ch.atom;
@@ -2232,9 +2231,6 @@ impl SaeManifoldTerm {
                 None => logit_count += 1,
             }
         }
-        if logit_count > 0 && !is_obb {
-            return 0.0;
-        }
         let atom = &self.atoms[atom_idx];
         // ∂^{2−l}φ_m over the coord axes.
         let phi = match coord_axes.len() {
@@ -2243,10 +2239,31 @@ impl SaeManifoldTerm {
             _ => atom.basis_values[[row, m]],
         };
         let s = assignments[atom_idx];
-        let gate_factor = match logit_count {
-            0 => s,
-            1 => s * (1.0 - s) * inv_tau,
-            _ => s * (1.0 - s) * (1.0 - 2.0 * s) * inv_tau * inv_tau,
+        let gate_factor = match self.assignment.mode {
+            AssignmentMode::Softmax { temperature, .. } => {
+                let delta = |i, j| if i == j { 1.0 } else { 0.0 };
+                match logit_count {
+                    0 => s,
+                    1 => {
+                        let j = if aa.is_none() { ka } else { kw };
+                        s * (delta(atom_idx, j) - assignments[j]) / temperature
+                    }
+                    _ => s * ((delta(atom_idx, ka) - assignments[ka])
+                        * (delta(atom_idx, kw) - assignments[kw])
+                        - assignments[ka] * (delta(ka, kw) - assignments[kw]))
+                        / (temperature * temperature),
+                }
+            }
+            AssignmentMode::OrderedBetaBernoulli { temperature, .. }
+            | AssignmentMode::ThresholdGate { temperature, .. } => {
+                if ka != atom_idx || kw != atom_idx { return 0.0; }
+                match logit_count {
+                    0 => s,
+                    1 => s * (1.0 - s) / temperature,
+                    _ => s * (1.0 - s) * (1.0 - 2.0 * s) / (temperature * temperature),
+                }
+            }
+            AssignmentMode::TopK { .. } => if logit_count == 0 { s } else { 0.0 },
         };
         // eo = Σ_out error_metric[out]·output[out] (the channel's output weighting).
         let p = error_metric.len().min(ch.output.len());
@@ -2720,8 +2737,16 @@ impl SaeManifoldTerm {
                     };
                     for a in 0..q {
                         for b in 0..q {
-                            let dh = sae_dot(jets.beta_l_deriv(a, w_beta_pos), jets.first(b))
+                            let mut dh = sae_dot(jets.beta_l_deriv(a, w_beta_pos), jets.first(b))
                                 + sae_dot(jets.first(a), jets.beta_l_deriv(b, w_beta_pos));
+                            if exact_a {
+                                dh += sae_dot(jets.beta(w_beta_pos), jets.second(a, b));
+                            }
+                            if let Some(ctx) = patchd_ctx.as_ref() {
+                                dh += self.patchd_residual_third_leg_beta(
+                                    ctx, jets.vars[a], jets.vars[b], w_channel,
+                                );
+                            }
                             if !defl_dirs.is_empty() {
                                 dh_mat[[a, b]] = dh;
                             }
@@ -2738,13 +2763,21 @@ impl SaeManifoldTerm {
                     }
                     for a in 0..q {
                         for (beta_pos, ch) in border.iter().enumerate() {
-                            let dh = sae_dot(jets.beta_l_deriv(a, w_beta_pos), jets.beta(beta_pos));
+                            let mut dh = sae_dot(jets.beta_l_deriv(a, w_beta_pos), jets.beta(beta_pos));
+                            if exact_a {
+                                dh += sae_dot(jets.beta(w_beta_pos), jets.beta_deriv(a, beta_pos));
+                            }
                             gamma += 2.0 * inv[[base + a, total_t + ch.index]] * dh;
                         }
                     }
                     gamma_beta[w_channel.index] += gamma;
                 }
             }
+        }
+        if want_data && exact_a {
+            gamma_beta += &self.exact_decoder_prior_theta_trace(
+                cache, inv.slice(s![total_t.., total_t..]),
+            )?;
         }
         // Fold the entire ordered-BB prior derivative into the logit slots.
         if want_data {
@@ -4461,6 +4494,7 @@ impl SaeManifoldTerm {
         let q = negative.len();
         let mut a_derivative = Array2::<f64>::zeros((dim, dim));
         let mut clamp_diagonal_derivative = Array1::<f64>::zeros(total_t);
+        let mut clamp_border_derivative = Array2::<f64>::zeros((dim - total_t, dim - total_t));
         for &i in complement {
             let lambda = block.eigenvalues[i];
             if lambda <= block.rank_floor(i) {
@@ -4479,6 +4513,11 @@ impl SaeManifoldTerm {
                 continue;
             }
             let vector = basin.vectors.column(i);
+            for row in total_t..dim {
+                for col in total_t..dim {
+                    clamp_border_derivative[[row - total_t, col - total_t]] += inverse * vector[row] * vector[col];
+                }
+            }
             for row in 0..dim {
                 for col in 0..dim {
                     a_derivative[[row, col]] += inverse * vector[row] * vector[col];
@@ -4546,6 +4585,7 @@ impl SaeManifoldTerm {
         Ok(ExactHessianPricing {
             a_derivative,
             clamp_diagonal_derivative,
+            clamp_border_derivative,
         })
     }
 
@@ -5218,6 +5258,9 @@ impl SaeManifoldTerm {
         // log-determinant theta derivative used in the caller's -1/2 IFT fold.
         logdet_trace.scaled_add(0.5, &(&priced_joint_trace - &priced_tt_trace));
         gamma.t += &(&priced_joint_gamma - &priced_tt_gamma);
+        gamma.beta += &self.decoder_prior_gap_theta_trace(
+            cache, geometry.joint_pricing.clamp_border_derivative.view(),
+        )?;
         let rank_charge = self.production_rank_charge_derivative(target, rho, loss, cache)?;
         gamma.t.scaled_add(2.0, &rank_charge.theta.t);
         gamma.beta.scaled_add(2.0, &rank_charge.theta.beta);
@@ -6149,6 +6192,9 @@ mod test_support {
                 Some(target),
             )?;
             gamma.t += &clamp_gamma;
+            gamma.beta += &self.decoder_prior_gap_theta_trace(
+                cache, geometry.joint_pricing.clamp_border_derivative.view(),
+            )?;
             Ok(gamma)
         }
 

@@ -6634,8 +6634,16 @@ impl SaeManifoldTerm {
                 let mut dh_mat = Array2::<f64>::zeros((q, q));
                 for a in 0..q {
                     for b in 0..q {
-                        let dh = sae_dot(jets.beta_l_deriv(a, w_beta_pos), jets.first(b))
+                        let mut dh = sae_dot(jets.beta_l_deriv(a, w_beta_pos), jets.first(b))
                             + sae_dot(jets.first(a), jets.beta_l_deriv(b, w_beta_pos));
+                        if exact_a {
+                            dh += sae_dot(jets.beta(w_beta_pos), jets.second(a, b));
+                        }
+                        if let Some(ctx) = patchd_ctx.as_ref() {
+                            dh += self.patchd_residual_third_leg_beta(
+                                ctx, jets.vars[a], jets.vars[b], w_channel,
+                            );
+                        }
                         dh_mat[[a, b]] = dh;
                         gamma += inv_vv[[b, a]] * dh;
                     }
@@ -6650,7 +6658,10 @@ impl SaeManifoldTerm {
                 }
                 for a in 0..q {
                     for (beta_pos, channel) in border.iter().enumerate() {
-                        let dh = sae_dot(jets.beta_l_deriv(a, w_beta_pos), jets.beta(beta_pos));
+                        let mut dh = sae_dot(jets.beta_l_deriv(a, w_beta_pos), jets.beta(beta_pos));
+                        if exact_a {
+                            dh += sae_dot(jets.beta(w_beta_pos), jets.beta_deriv(a, beta_pos));
+                        }
                         gamma += 2.0 * inv_vbeta[[a, channel.index]] * dh;
                     }
                 }
@@ -6658,6 +6669,9 @@ impl SaeManifoldTerm {
             }
         }
 
+        if exact_a && joint_block {
+            gamma_beta += &self.exact_decoder_prior_theta_trace(cache, beta_inv.view())?;
+        }
         // Empirical-mass channel of the row-local ordered Beta--Bernoulli
         // majorizer. Its diagonal depends on `M_k = Σ_i z_ik`, so a logit in
         // row `w` differentiates every retained row-local diagonal in column
@@ -7193,8 +7207,16 @@ impl SaeManifoldTerm {
                 };
                 for a in 0..q {
                     for b in 0..q {
-                        let dh = sae_dot(jets.beta_l_deriv(a, w_beta_pos), jets.first(b))
+                        let mut dh = sae_dot(jets.beta_l_deriv(a, w_beta_pos), jets.first(b))
                             + sae_dot(jets.first(a), jets.beta_l_deriv(b, w_beta_pos));
+                        if exact_a {
+                            dh += sae_dot(jets.beta(w_beta_pos), jets.second(a, b));
+                        }
+                        if let Some(ctx) = patchd_ctx.as_ref() {
+                            dh += self.patchd_residual_third_leg_beta(
+                                ctx, jets.vars[a], jets.vars[b], w_channel,
+                            );
+                        }
                         if !defl_dirs.is_empty() {
                             dh_mat[[a, b]] = dh;
                         }
@@ -7213,7 +7235,10 @@ impl SaeManifoldTerm {
                 }
                 for a in 0..q {
                     for (beta_pos, channel) in border.iter().enumerate() {
-                        let dh = sae_dot(jets.beta_l_deriv(a, w_beta_pos), jets.beta(beta_pos));
+                        let mut dh = sae_dot(jets.beta_l_deriv(a, w_beta_pos), jets.beta(beta_pos));
+                        if exact_a {
+                            dh += sae_dot(jets.beta(w_beta_pos), jets.beta_deriv(a, beta_pos));
+                        }
                         gamma += 2.0 * inv_vbeta[[a, channel.index]] * dh;
                     }
                 }
@@ -7221,6 +7246,14 @@ impl SaeManifoldTerm {
             }
         }
 
+        if exact_a && k_border > 0 {
+            let prepared = self.prepare_exact_decoder_prior_third()?;
+            for (probe, solved) in probes.iter().zip(sinv_probes) {
+                self.exact_decoder_prior_theta_pair_add(
+                    cache, &prepared, solved.view(), probe.view(), inv_m, &mut gamma_beta,
+                )?;
+            }
+        }
         if let Some(channels) = ordered_beta_bernoulli_channels.as_ref() {
             let mut column_coefficient = vec![0.0_f64; k_atoms];
             for &(row, atom, _t_index, inverse_diagonal) in &ordered_beta_bernoulli_logit_sites {

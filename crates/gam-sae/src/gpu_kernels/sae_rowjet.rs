@@ -840,12 +840,18 @@ fn cpu_contracted_tile(
                     let mut gamma = 0.0_f64;
                     for a in 0..q {
                         for b in 0..q {
-                            let dh = dot(scheduled.beta_l_deriv(a, w_beta), scheduled.first(b))
+                            let mut dh = dot(scheduled.beta_l_deriv(a, w_beta), scheduled.first(b))
                                 + dot(scheduled.first(a), scheduled.beta_l_deriv(b, w_beta));
+                            if exact_a {
+                                dh += dot(scheduled.beta(w_beta), scheduled.second(a, b));
+                            }
                             gamma += e_row[a * q + b] * dh;
                         }
                         for border in 0..n_beta {
-                            let dh = dot(scheduled.beta_l_deriv(a, w_beta), scheduled.beta(border));
+                            let mut dh = dot(scheduled.beta_l_deriv(a, w_beta), scheduled.beta(border));
+                            if exact_a {
+                                dh += dot(scheduled.beta(w_beta), scheduled.beta_deriv(a, border));
+                            }
                             gamma += 2.0 * vbeta_row[a * n_beta + border] * dh;
                         }
                     }
@@ -2024,15 +2030,16 @@ extern "C" __global__ void sae_rowjet_trace_t(
 
 // beta[row*nb + w_beta] = tr(E · dh_wβ) over t–t + 2·inv_vβ t–β block.
 extern "C" __global__ void sae_rowjet_trace_beta(
-    const double* first, const double* beta, const double* mixed,
+    const double* first, const double* second, const double* beta, const double* mixed,
     const double* e_tt, const double* inv_vbeta,
-    int q, int p, int nb, unsigned long long total, double* beta_out)
+    int exact_a, int q, int p, int nb, unsigned long long total, double* beta_out)
 {
   unsigned long long index=(unsigned long long)blockIdx.x*blockDim.x+threadIdx.x;
   if(index>=total) return;
   int wb=(int)(index%(unsigned long long)nb);
   int row=(int)(index/(unsigned long long)nb);
   const double* first_row=first+(unsigned long long)row*(unsigned long long)q*p;
+  const double* second_row=second+(unsigned long long)row*(unsigned long long)q*q*p;
   const double* beta_row=beta+(unsigned long long)row*(unsigned long long)nb*p;
   const double* mixed_row=mixed+(unsigned long long)row*(unsigned long long)q*nb*p;
   const double* e_row=e_tt+(unsigned long long)row*(unsigned long long)q*q;
@@ -2045,11 +2052,19 @@ extern "C" __global__ void sae_rowjet_trace_beta(
       const double* fb=first_row+(unsigned long long)b*p;
       const double* m_b=mixed_row+((unsigned long long)b*nb+wb)*p;
       double dh=sae_rj_dot(m_a,fb,p)+sae_rj_dot(fa,m_b,p);
+      if(exact_a) {
+        dh+=sae_rj_dot(beta_row+(unsigned long long)wb*p,
+                      second_row+((unsigned long long)a*q+b)*p,p);
+      }
       gamma+=e_row[a*q+b]*dh;
     }
     for(int border=0;border<nb;++border){
       const double* bbeta=beta_row+(unsigned long long)border*p;
       double dh=sae_rj_dot(m_a,bbeta,p);
+      if(exact_a) {
+        dh+=sae_rj_dot(beta_row+(unsigned long long)wb*p,
+                      mixed_row+((unsigned long long)a*nb+border)*p,p);
+      }
       gamma+=2.0*vbeta_row[a*nb+border]*dh;
     }
   }
@@ -2561,10 +2576,12 @@ mod device {
             let mut launch = stream.launch_builder(&function);
             launch
                 .arg(&tower.first_dev)
+                .arg(&tower.second_dev)
                 .arg(&tower.beta_dev)
                 .arg(&tower.mixed_dev)
                 .arg(&e_tt_dev)
                 .arg(&inv_vbeta_dev)
+                .arg(&exact_a_i32)
                 .arg(&staged.q_i32)
                 .arg(&staged.p_i32)
                 .arg(&staged.nb_i32)
@@ -3508,12 +3525,14 @@ mod tests {
                 let mut expected = 0.0_f64;
                 for a in 0..q {
                     for b in 0..q {
-                        let dh = dot(jets.beta_l_deriv(a, w_beta), jets.first(b))
+                        let mut dh = dot(jets.beta_l_deriv(a, w_beta), jets.first(b))
                             + dot(jets.first(a), jets.beta_l_deriv(b, w_beta));
+                        dh += dot(jets.beta(w_beta), jets.second(a, b));
                         expected += e_row[a * q + b] * dh;
                     }
                     for border in 0..n_beta {
-                        let dh = dot(jets.beta_l_deriv(a, w_beta), jets.beta(border));
+                        let mut dh = dot(jets.beta_l_deriv(a, w_beta), jets.beta(border));
+                        dh += dot(jets.beta(w_beta), jets.beta_deriv(a, border));
                         expected += 2.0 * vbeta_row[a * n_beta + border] * dh;
                     }
                 }

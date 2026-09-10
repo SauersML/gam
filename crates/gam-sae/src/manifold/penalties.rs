@@ -1,6 +1,8 @@
 use super::*;
 use gam_linalg::faer_ndarray::{FaerEigh, FaerSvd};
 
+include!("decoder_prior_third.rs");
+
 /// #1610 / Jeffreys — one co-firing connected component of the SAE decoder
 /// Jeffreys prior. The anti-collapse penalty is the Jeffreys prior on the
 /// dictionary, `π(B) ∝ √det F(B)`, i.e. `−½·log det F`, where `F = Q ∘ O` is the
@@ -1282,11 +1284,13 @@ impl SaeManifoldTerm {
     /// divided difference collapses to the Gauss–Newton form the assembly ships.
     pub(crate) fn barrier_spectral_m_second(lam: f64, eps: f64) -> f64 {
         let x = (lam + eps) / eps;
-        if x >= 30.0 || x <= -30.0 {
-            // `σ(1−σ)` underflows to 0 at both tails; returning the exact 0 keeps
-            // the affine and the exponential branches of `m` consistent with
-            // their own derivatives.
+        if x >= 30.0 {
             return 0.0;
+        }
+        if x <= -30.0 {
+            // This branch of m is exponential, whose second derivative is
+            // nonzero. In particular (log m)'' must cancel to zero here.
+            return x.exp() / eps;
         }
         let sigma = 1.0 / (1.0 + (-x).exp());
         sigma * (1.0 - sigma) / eps
