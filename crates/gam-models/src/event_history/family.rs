@@ -155,6 +155,12 @@ pub struct EventHistoryFamily {
     cache: Arc<Mutex<Option<(Vec<f64>, Arc<JointEvaluation>)>>>,
 }
 
+/// Whether a round's residual improved on the one before it, so that the two
+/// of them measure a contraction rather than a divergence.
+fn before_is_smaller(moved: f64, previous: Option<f64>) -> bool {
+    previous.is_none_or(|before| moved < before)
+}
+
 /// The mesh refinement the reference population is run on.
 ///
 /// It is deliberately not the fit's current refinement. The fit refines its
@@ -3067,16 +3073,18 @@ pub fn fit_event_history(
             let advance = match (held.as_ref(), residual.as_ref(), previous_residual) {
                 (Some(current), Some(r), Some(before)) if before > 0.0 => {
                     let ratio = moved / before;
-                    if (0.0..0.95).contains(&ratio) {
-                        // The sum of the series, but not more of it than the
-                        // solve can be expected to follow in one step: the
-                        // normaliser's shape moves the risk set it is read
-                        // off, and a step far past what two residuals have
-                        // actually measured lands somewhere the next fit has
-                        // no warm start for. Beyond the cap the alternation
-                        // simply takes more rounds, which is the safe way to
-                        // be wrong about the ratio.
-                        let gain = (1.0 / (1.0 - ratio)).min(4.0);
+                    // Sum the series only where the contraction is strong
+                    // enough for a geometric model of it to be worth
+                    // trusting. A ratio near one says the alternation is
+                    // barely contracting, and there the sum asks for a step
+                    // many times the last one on the strength of a rate the
+                    // two residuals have not really established: measured, a
+                    // fourfold step taken at a ratio of 0.8 landed further
+                    // from the fixed point than the plain alternation, and
+                    // the round after it had to walk back. Below half, the
+                    // step is at most double and the model has margin.
+                    if (0.0..0.5).contains(&ratio) {
+                        let gain = 1.0 / (1.0 - ratio);
                         log::info!(
                             "[event-history] risk-set centring round {}: the normaliser moved {moved:.3e} nats, contracting at {ratio:.3}: summing the series ({gain:.2}×)",
                             normaliser_rounds.len()
@@ -3102,7 +3110,10 @@ pub fn fit_event_history(
                     next
                 }
             };
-            previous_residual = Some(moved);
+            // A round that moved further than the one before it has not
+            // measured a contraction, so the round after it starts plain
+            // rather than reading a rate off a worsening pair.
+            previous_residual = (before_is_smaller(moved, previous_residual)).then_some(moved);
             held = Some(Arc::new(advance));
             let rank = fit.rank();
             let start = RankStart::carried(
