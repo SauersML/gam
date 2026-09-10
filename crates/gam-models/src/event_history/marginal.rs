@@ -611,7 +611,7 @@ pub(crate) fn filter_start<S: JetField>(
     let (means, _) = posterior_moments(&prior_grid, &rough_alpha, label)?;
     let grid = Grid::new(gh, &means, &unit, like);
     let predicted = prior_density(&grid);
-    let likelihood = node_terms(&grid);
+    let likelihood = node_terms(&grid, derivatives);
     let (alpha, normaliser) =
         condition(&grid, &predicted, &likelihood.ell, likelihood.shift, label)?;
     Ok(FilteredNode {
@@ -691,7 +691,7 @@ pub(crate) fn filter_step<S: JetField>(
     let grid = Grid::new(gh, &means, &scales, like);
     let forward = forward_operators(gh, previous_grid, &grid, &transitions, forward_power);
     let predicted = forward.plain(previous_alpha);
-    let likelihood = node_terms(&grid);
+    let likelihood = node_terms(&grid, derivatives);
     let (alpha, normaliser) =
         condition(&grid, &predicted, &likelihood.ell, likelihood.shift, label)?;
     Ok(FilteredNode {
