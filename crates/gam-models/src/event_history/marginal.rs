@@ -357,9 +357,18 @@ pub(crate) fn pairwise_sum<S: JetField>(terms: &[S], zero: &S) -> S {
 
 /// Node log-likelihood pieces at one grid.
 pub(crate) struct NodeLikelihood<S> {
-    /// `exp(η_{nd})` at every grid point, index `d * size + i`.
-    pub expeta: Vec<S>,
-    /// `Σ_d y η − w e^η` at every grid point.
+    /// The node term's score in `η_d` at every grid point, index
+    /// `d * size + i`: `∂/∂η_d` of the mark's contribution, which for a
+    /// counting mark is `y − w e^{η}`.
+    pub score: Vec<S>,
+    /// Its curvature in `η_d`, `−∂²/∂η_d²`, at every grid point: `w e^{η}`
+    /// for a counting mark. Zero exactly where the mark contributes nothing
+    /// at this node.
+    pub curvature: Vec<S>,
+    /// Whether each mark's curvature is anything but zero at this node, so
+    /// the accumulation can skip the marks that carry no term.
+    pub informative: Vec<bool>,
+    /// `Σ_d` of the mark contributions at every grid point.
     pub ell: Vec<S>,
     /// `max_i ell[i].value()`.
     pub shift: f64,
@@ -377,8 +386,11 @@ pub(crate) fn node_likelihood<S: JetField>(
     atoms: usize,
 ) -> NodeLikelihood<S> {
     let size = grid.size();
-    let mut expeta = Vec::with_capacity(marks * size);
-    let mut ell = vec![eta0[0].constant_like(0.0); size];
+    let zero = eta0[0].constant_like(0.0);
+    let mut score = Vec::with_capacity(marks * size);
+    let mut curvature = Vec::with_capacity(marks * size);
+    let mut informative = Vec::with_capacity(marks);
+    let mut ell = vec![zero.clone(); size];
     for d in 0..marks {
         let exposure = if compensated.is_none_or(|mask| mask[d]) {
             exposures[d]
@@ -387,27 +399,41 @@ pub(crate) fn node_likelihood<S: JetField>(
         };
         let loadings_d = &loadings[d * atoms..(d + 1) * atoms];
         let base = centred_baseline(&eta0[d], loadings_d, log_normaliser.map(|m| &m[d]));
+        let y = counts[d];
+        informative.push(exposure != 0.0);
         for i in 0..size {
             let mut eta = base.clone();
             for (k, a) in loadings_d.iter().enumerate() {
                 eta = eta.add(&a.mul(grid.coordinate(i, k)));
             }
-            let e = exp(&eta);
-            let y = counts[d];
             if y != 0.0 {
                 ell[i] = ell[i].add(&eta.scale(y));
             }
+            // A mark with no exposure at this node has no compensator and so
+            // no curvature: its intensity is never formed, which is the work
+            // the risk sets save.
             if exposure != 0.0 {
-                ell[i] = ell[i].sub(&e.scale(exposure));
+                let c = exp(&eta).scale(exposure);
+                ell[i] = ell[i].sub(&c);
+                score.push(add_real(&c.scale(-1.0), y));
+                curvature.push(c);
+            } else {
+                score.push(zero.constant_like(y));
+                curvature.push(zero.clone());
             }
-            expeta.push(e);
         }
     }
     let shift = ell
         .iter()
         .map(|v| v.value())
         .fold(f64::NEG_INFINITY, f64::max);
-    NodeLikelihood { expeta, ell, shift }
+    NodeLikelihood {
+        score,
+        curvature,
+        informative,
+        ell,
+        shift,
+    }
 }
 
 /// Posterior mean and variance of every atom under `alpha` on `grid`.
@@ -791,7 +817,6 @@ pub(crate) fn subject_marginal<S: JetField>(
         let grid = &filtered[m].grid;
         let size = grid.size();
         let smoothed = &smoothed_all[m];
-        let exposures = &exposure_rows[m];
         // `W(i) = w_i s(i)`: the smoothed probability of grid point `i`.
         let w: Vec<S> = (0..size)
             .map(|i| grid.weights[i].mul(&smoothed[i]))
@@ -813,18 +838,11 @@ pub(crate) fn subject_marginal<S: JetField>(
                     .collect()
             })
             .collect();
-        // Score `s_d(i) = y_d − w e^{η_d(z_i)}` and curvature `c_d(i) = w e^{η_d}`.
-        let scores: Vec<Vec<S>> = (0..marks)
-            .map(|d| {
-                (0..size)
-                    .map(|i| {
-                        add_real(
-                            &filtered[m].likelihood.expeta[d * size + i].scale(-exposures[d]),
-                            counts_rows[m][d],
-                        )
-                    })
-                    .collect()
-            })
+        // The node's score and curvature in every mark's `η`, formed once
+        // with the node factor itself.
+        let node = &filtered[m].likelihood;
+        let scores: Vec<&[S]> = (0..marks)
+            .map(|d| &node.score[d * size..(d + 1) * size])
             .collect();
         // The three passes below must not overlap: the carried vector holds
         // the functions of nodes strictly before `m` (plus the gaps before
@@ -841,17 +859,22 @@ pub(crate) fn subject_marginal<S: JetField>(
             // B[q] = Σ_i W s_d C[q];  A_k[q] = Σ_i W s_d ζ_{dk} C[q]
             let mut b = vec![zero.clone(); p_total];
             let mut a_k = vec![vec![zero.clone(); p_total]; atoms];
+            // `W s_d C[q]` is formed once per grid point and reused for the
+            // atom contractions, which is the same arithmetic in the same
+            // order with the product taken once instead of once per atom.
+            let mut weighted = vec![zero.clone(); size];
             for q in 0..p_total {
                 let row = &carried[q * size..(q + 1) * size];
                 let mut acc = zero.clone();
                 for i in 0..size {
-                    acc = acc.add(&ws[i].mul(&row[i]));
+                    weighted[i] = ws[i].mul(&row[i]);
+                    acc = acc.add(&weighted[i]);
                 }
                 b[q] = acc;
                 for k in 0..atoms {
                     let mut acc = zero.clone();
                     for i in 0..size {
-                        acc = acc.add(&ws[i].mul(&row[i]).mul(&centred[d][k][i]));
+                        acc = acc.add(&weighted[i].mul(&centred[d][k][i]));
                     }
                     a_k[k][q] = acc;
                 }
@@ -885,12 +908,9 @@ pub(crate) fn subject_marginal<S: JetField>(
             let mut ec = zero.clone();
             let mut ecz = vec![zero.clone(); atoms];
             let mut eczz = vec![zero.clone(); atoms * atoms];
-            let exposure = exposures[d];
-            if exposure != 0.0 {
+            if node.informative[d] {
                 for i in 0..size {
-                    let wc = w[i]
-                        .mul(&filtered[m].likelihood.expeta[d * size + i])
-                        .scale(exposure);
+                    let wc = w[i].mul(&node.curvature[d * size + i]);
                     ec = ec.add(&wc);
                     for k in 0..atoms {
                         let wcz = wc.mul(&centred[d][k][i]);
