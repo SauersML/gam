@@ -12,49 +12,15 @@
 //! into each other without changing the process, but `C` is invariant. The
 //! loadings are its factor coordinates.
 //!
-//! The rank is grown from zero by the evidence. At rank `K`, adding an atom
-//! with loading vector `a` and rate `r` changes the log-evidence to second
-//! order in `a` by `½ aᵀ M(r) a` (the first order vanishes: an atom is
-//! symmetric under `a → −a`), with the covariance score
+//! Filtered residual products supply a cheap rate proposal. They are not
+//! the curvature of the integrated likelihood once latent factors exist.
+//! The fitting layer differentiates that likelihood for the actual loading
+//! curvature, uses sampled directional profiles to propose a prior, and
+//! compares jointly fitted ranks using the reported Laplace criterion.
 //!
-//! ```text
-//! M(r) = Σ_i [ Σ_{n,m} e^{−r |t_n − t_m|} s̄_{in} s̄_{im}ᵀ − Σ_n diag(c̄_{in}) ],
-//! ```
-//!
-//! `s̄_{nd} = y_{nd} − w_{nd} μ̄_{nd}` the martingale residuals at the current
-//! fit's filtered intensities and `c̄_{nd} = w_{nd} μ̄_{nd}` their predictable
-//! variation. Along a unit direction `v` the evidence is, to the next order,
-//! `½ μ t² − ¼ J t⁴` in the loading magnitude `t`, with `μ = vᵀ M v` and `J`
-//! the Fisher information of the variance component along `v` (the variance
-//! of the score under the fitted null, from the Poisson cumulants of the
-//! residuals). That quartic is the model of the evidence this module reads.
-//!
-//! The atom's loadings carry an isotropic Gaussian prior `a ~ N(0, λ⁻¹ I)`,
-//! the penalty toward no latent effect, and `λ` is chosen by empirical
-//! Bayes: it maximises the marginal likelihood `∫ L(a) N(a; 0, λ⁻¹I) da`.
-//! Under the quartic model that marginal factorises over the eigenvectors of
-//! `M`, and each factor is a one-dimensional integral
-//!
-//! ```text
-//! Z_i(λ) = √(λ/2π) ∫ exp(½ (μ_i − λ) t² − ¼ J_i t⁴) dt,
-//! ```
-//!
-//! evaluated exactly. A Laplace approximation of the same integral is not
-//! usable here: the integrand is even in `t`, so at `λ = μ_i` its curvature
-//! at the mode vanishes and the Laplace log-determinant diverges — a
-//! criterion that is unbounded below at the very boundary the rank decision
-//! is about. The exact integral is smooth through it. The prior the evidence
-//! chooses places the posterior mode of the loading away from zero exactly
-//! when `λ̂ < μ_max`; that, and nothing else, is what accepts an atom. The
-//! decision is derived from the model and carries no chosen level.
-//!
-//! The rate is found first, by maximising the standardised gain
-//! `μ² / (4 J)` of the top direction over the log-rate (the raw score is
-//! always largest at rate zero, since a slower kernel dominates every faster
-//! one entrywise; the standardised gain is the matched filter), by a secant
-//! Newton on its exact derivative. The double sums are evaluated by the
-//! forward–backward recursion of the exponential kernel in `O(N D)` per
-//! subject, and so are their first two derivatives in the log-rate.
+//! The quartic integrals below belong only to the proposal model. Products
+//! of one-dimensional profiles omit cross-direction interactions; their
+//! gain must not be reported as the joint model's evidence.
 
 use super::cohort::EventHistoryError;
 use faer::Side;
@@ -341,7 +307,7 @@ pub fn quartic_moments(mu: f64, information: f64, lambda: f64) -> (f64, f64, f64
     (log_integral, second / mass, fourth / mass)
 }
 
-/// The exact profile of the marginal log-likelihood along one direction of
+/// A sampled profile of the marginal log-likelihood along one direction of
 /// the loading space, `g(t) = ℓ(t·v) − ℓ(0)` for `t ≥ 0`, sampled with its
 /// slope and carried by the cubic Hermite interpolant through the samples.
 /// The likelihood is even in `t` (an atom's sign is a gauge), so the
@@ -356,20 +322,15 @@ pub struct DirectionProfile {
     pub slopes: Vec<f64>,
 }
 
-/// Subpoints per sample interval for the trapezoidal rule on the profile:
-/// the interpolant is a cubic, so this resolves the integrand far below the
-/// interpolant's own error.
+/// Subpoints per sample interval for numerical integration of the proposal.
+/// This does not bound the sampled profile's interpolation or truncation error.
 const PROFILE_SUBPOINTS: usize = 64;
 
 impl DirectionProfile {
-    /// Hermite cubic through the samples; beyond the last sample, the last
-    /// cubic continued (the profile is sampled until it has fallen far below
-    /// its peak, so nothing there carries mass).
+    /// Hermite cubic within the sampled interval.
     fn evaluate(&self, t: f64) -> f64 {
         let n = self.points.len();
-        if n < 2 {
-            return self.values.first().copied().unwrap_or(0.0);
-        }
+        assert!(n >= 2 && t >= 0.0 && t <= self.points[n - 1]);
         let i = match self.points.iter().position(|&p| t < p) {
             Some(0) => 0,
             Some(i) => i - 1,
@@ -414,9 +375,9 @@ impl DirectionProfile {
         let mut second = 0.0;
         let mut fourth = 0.0;
         for (k, &(t, value)) in samples.iter().enumerate() {
-            // The interior weight is doubled by the reflection; the point at
-            // zero is the axis and counts once.
-            let weight = (value - shift).exp() * if k == 0 { 1.0 } else { 2.0 };
+            // Reflect the trapezoidal rule: both endpoints have half
+            // weight before reflection, including the finite upper endpoint.
+            let weight = (value - shift).exp() * if k == 0 || k == steps { 1.0 } else { 2.0 };
             mass += weight;
             second += weight * t * t;
             fourth += weight * t * t * t * t;
@@ -431,8 +392,8 @@ impl DirectionProfile {
 pub enum DirectionEvidence {
     /// The score's quartic model `g(t) = ½μt² − ¼Jt⁴`.
     Quartic { eigenvalue: f64, information: f64 },
-    /// The exact profile of the log-likelihood along the direction.
-    Exact(DirectionProfile),
+    /// A finite sampled profile; used for proposing a loading prior.
+    Sampled(DirectionProfile),
 }
 
 impl DirectionEvidence {
@@ -453,7 +414,7 @@ impl DirectionEvidence {
                 };
                 (log_integral, second, fourth, mode)
             }
-            Self::Exact(profile) => profile.moments(lambda),
+            Self::Sampled(profile) => profile.moments(lambda),
         }
     }
 
@@ -465,7 +426,7 @@ impl DirectionEvidence {
                 eigenvalue,
                 information,
             } => (*eigenvalue > 0.0 && *information > 0.0).then(|| information / eigenvalue),
-            Self::Exact(profile) => {
+            Self::Sampled(profile) => {
                 let (_, _, _, mode) = profile.moments(0.0);
                 (mode > 0.0).then(|| 1.0 / (mode * mode))
             }
@@ -494,9 +455,8 @@ pub struct RidgeProfile {
 
 /// The empirical-Bayes prior for a loading vector from the evidence along
 /// the eigen-directions of the covariance score: the first direction's
-/// evidence is whatever [`DirectionEvidence`] it carries (the quartic model
-/// when the atom is being judged, the exact profile once it has been), the
-/// others' the quartic model.
+/// integrand is the quartic or sampled profile carried by
+/// [`DirectionEvidence`]. This factorisation is a proposal approximation.
 ///
 /// The negative log marginal likelihood
 /// `c(λ) = −Σ_i ln Z_i(λ)` is `+∞` at `λ → 0` (a prior too loose to
@@ -587,9 +547,6 @@ pub(crate) struct NewAtom {
     pub loading: Vec<f64>,
     /// The score's top eigenvalue at the proposed rate.
     pub eigenvalue: f64,
-    /// `(μ_i, J_i)` of every other eigen-direction of the score, whose
-    /// Occam factors the isotropic prior charges.
-    pub other_directions: Vec<(f64, f64)>,
     /// `μ_max² / (4 J_max)`: the second-order evidence gain of the top
     /// direction, the matched-filter statistic the rate maximises.
     pub standardised_gain: f64,
@@ -833,7 +790,6 @@ pub(crate) fn best_new_atom(
         direction,
         loading,
         eigenvalue: point.top,
-        other_directions,
         standardised_gain,
         ridge,
         at_lower_limit,

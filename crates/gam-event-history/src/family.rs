@@ -7,7 +7,7 @@
 
 use super::chain::{GaussHermite, product_grid_size};
 use super::cohort::{
-    CohortNodes, CovariateSegment, EventHistoryCohort, EventHistoryError, MarkKind, SubjectHistory,
+    CohortNodes, EventHistoryCohort, EventHistoryError, MarkKind,
     design_rows, expand_nodes,
 };
 use super::covariance::{
@@ -20,10 +20,11 @@ use super::marginal::{
 };
 use super::preserve::{ReferenceGrid, ReferenceStrata, stratum_normalisers};
 use super::scalar::{Tangent, add_real, recip};
-use crate::custom_family::{
-    BlockWorkingSet, BlockwiseFitOptions, CustomFamily, ExactNewtonJointGradientEvaluation,
-    FamilyEvaluation, ParameterBlockSpec, ParameterBlockState, PenaltyMatrix, fit_custom_family,
+use gam_custom_family::fit_custom_family;
+use gam_model_api::families::custom_family::{
+    BlockwiseFitOptions, CustomFamily, ExactNewtonJointGradientEvaluation, FamilyEvaluation,
 };
+use gam_problem::{BlockWorkingSet, ParameterBlockSpec, ParameterBlockState, PenaltyMatrix};
 use gam_linalg::matrix::{DenseDesignMatrix, DesignMatrix, SymmetricMatrix};
 use gam_math::jet_scalar::{JetScalar, OneSeed, Order2, TwoSeed};
 use gam_math::nested_dual::JetField;
@@ -37,6 +38,9 @@ use gam_terms::smooth::{
 use ndarray::{Array1, Array2, ArrayView2, s};
 use rayon::prelude::*;
 use std::sync::{Arc, Mutex};
+
+#[path = "objective.rs"]
+mod objective;
 
 /// A scalar that can be seeded with up to two directions and read back.
 pub(crate) trait Directional: JetField + Send + Sync {
@@ -147,55 +151,34 @@ pub struct EventHistoryFamily {
     /// The reference population's grid and designs, when the baselines are
     /// the risk sets' marginal rates.
     reference: Option<Arc<ReferenceTables>>,
-    /// The held risk-set normaliser `log M_d(t)` at every cohort node, index
-    /// `row * marks + d`. Held as data over a solve and refreshed between
-    /// solves; `None` centres on the stationary prior.
-    log_normaliser: Option<Arc<Vec<f64>>>,
     /// The last joint evaluation, keyed on the exact state it was made at.
     cache: Arc<Mutex<Option<(Vec<f64>, Arc<JointEvaluation>)>>>,
 }
 
-/// The mesh refinement the reference population is run on.
-///
-/// It is deliberately not the fit's current refinement. The fit refines its
-/// own mesh until the coefficients are stationary, and a normaliser held
-/// across those rungs has to mean the same thing on each of them; a grid that
-/// moved under the ladder would change the held values' length and their
-/// meaning together. The reference grid's own resolution is therefore its own
-/// numerical choice, and what it has to resolve is the population's decay,
-/// which is smooth in time — not the event times, of which it has none.
-const REFERENCE_REFINEMENT: usize = 0;
-
-/// What one refresh of the risk-set centring produced: the normaliser to hold
-/// over the next solve, and the reference population's own marginal survival.
-#[derive(Clone, Debug)]
+/// A reference-law snapshot evaluated at one coefficient state. The grid,
+/// profile order, risk masks, coefficients, and numerical evolution travel
+/// together when the snapshot is saved or used for prediction.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct RiskSetCentring {
-    /// `log M_d(t)` on the reference grid, index
-    /// `(stratum * nodes + node) * marks + d`. It is held on that grid rather
-    /// than on the cohort's nodes because the fit refines its own mesh
-    /// between solves while this must mean the same thing across them.
+    pub grid: ReferenceGrid,
+    pub profiles: Array2<f64>,
+    pub coefficients: Vec<f64>,
+    pub node_stratum: Vec<usize>,
     pub log_normaliser: Vec<f64>,
-    /// The log of the reference population's risk-set mass at every node of
-    /// the reference grid, index `(stratum * nodes + node) * masks + mask`.
-    /// For a single first-occurrence mark this is `−∫ e^{η⁰}` exactly, which
-    /// is the identity the centring exists for and the check that the
-    /// baseline is the marginal rate rather than a mixture's intercept.
     pub log_risk_mass: Vec<f64>,
-    /// How many distinct risk sets the marks define.
     pub masks: usize,
-    /// The risk set of every mark, indexing the last axis of `log_risk_mass`.
     pub mask_of_mark: Vec<usize>,
 }
 
 impl ReferenceTables {
     /// Carry a normaliser held on the reference grid onto a node set, by the
     /// linear interpolation each node recorded when the tables were built.
-    fn carry_to_nodes(
+    fn carry_to_nodes<S: JetField>(
         &self,
-        held: &[f64],
+        held: &[S],
         marks: usize,
         total_nodes: usize,
-    ) -> Result<Vec<f64>, EventHistoryError> {
+    ) -> Result<Vec<S>, EventHistoryError> {
         let nodes = self.grid.len();
         let expected = self.strata * nodes * marks;
         if held.len() != expected {
@@ -215,15 +198,15 @@ impl ReferenceTables {
                 ),
             });
         }
-        let mut out = vec![0.0; total_nodes * marks];
+        let mut out = vec![held[0].constant_like(0.0); total_nodes * marks];
         for row in 0..total_nodes {
             let base = self.node_stratum[row] * nodes;
             let lower = (base + self.node_lower[row]) * marks;
             let upper = (base + self.node_lower[row] + 1) * marks;
             let weight = self.node_weight[row];
             for d in 0..marks {
-                let low = held[lower + d];
-                out[row * marks + d] = low + weight * (held[upper + d] - low);
+                let low = &held[lower + d];
+                out[row * marks + d] = low.add(&held[upper + d].sub(low).scale(weight));
             }
         }
         Ok(out)
@@ -234,6 +217,8 @@ impl ReferenceTables {
 /// where every cohort node sits on that grid.
 pub struct ReferenceTables {
     pub grid: ReferenceGrid,
+    /// Covariate profiles retained independently of the training histories.
+    pub(crate) profiles: Array2<f64>,
     /// The mark kinds, which decide each mark's risk set.
     kinds: Vec<MarkKind>,
     /// Per mark, the design of the reference rows, `strata · nodes × p_d`.
@@ -306,39 +291,20 @@ impl EventHistoryFamily {
             gh: Arc::new(GaussHermite::new(gauss_hermite_order)?),
             time_scale,
             reference: None,
-            log_normaliser: None,
             cache: Arc::new(Mutex::new(None)),
         })
     }
 
-    /// The same family with a reference population attached and a normaliser
-    /// held over the solve.
-    ///
-    /// The held normaliser arrives on the reference grid and is carried here
-    /// onto this family's own nodes, which is what lets one held value serve
-    /// every rung of the mesh ladder.
-    pub fn with_reference(
-        mut self,
-        reference: Option<Arc<ReferenceTables>>,
-        held: Option<Arc<Vec<f64>>>,
-    ) -> Result<Self, EventHistoryError> {
-        self.log_normaliser = match (reference.as_ref(), held.as_ref()) {
-            (Some(tables), Some(values)) => Some(Arc::new(tables.carry_to_nodes(
-                values,
-                self.marks(),
-                self.nodes.total_nodes,
-            )?)),
-            _ => None,
-        };
+    /// Attach the reference law. Its normaliser is evaluated and
+    /// differentiated at every coefficient state, never held as an offset.
+    pub fn with_reference(mut self, reference: Option<Arc<ReferenceTables>>) -> Self {
         self.reference = reference;
         self.cache = Arc::new(Mutex::new(None));
-        Ok(self)
+        self
     }
 
-    /// Whether the baselines are centred on the risk sets rather than on the
-    /// stationary prior.
     pub fn risk_set_centred(&self) -> bool {
-        self.log_normaliser.is_some()
+        self.reference.is_some()
     }
 
     /// The reference population's tables, when the fit has one.
@@ -358,71 +324,9 @@ impl EventHistoryFamily {
         tables.carry_to_nodes(held, self.marks(), self.nodes.total_nodes)
     }
 
-    /// Recompute the risk-set normaliser at a coefficient state: run the
-    /// reference population of every stratum forward and read `log M_d(t)`
-    /// off it, then carry it to the cohort's own nodes.
-    ///
-    /// The normaliser is a population quantity — its cost is the reference
-    /// grid, not the cohort — and it is returned as data, to be held over the
-    /// next solve.
-    pub fn refresh_normaliser(
-        &self,
-        states: &[ParameterBlockState],
-    ) -> Result<RiskSetCentring, String> {
-        let tables = self
-            .reference
-            .as_ref()
-            .ok_or_else(|| "this family has no reference population".to_string())?;
-        let marks = self.marks();
-        let atoms = self.atoms;
-        let nodes = tables.grid.len();
-        let empty = Array1::<f64>::zeros(0);
-        let latent: &Array1<f64> = if self.has_latent_block() {
-            &states[marks].beta
-        } else {
-            &empty
-        };
-        let loadings: Vec<f64> = latent.iter().take(marks * atoms).copied().collect();
-        let rates = self.atom_rates(latent);
-        let mut per_stratum: Vec<Vec<f64>> = Vec::with_capacity(tables.strata);
-        let mut risk_mass: Vec<f64> = Vec::new();
-        let (_, mask_of_mark) = super::preserve::killing_masks(&tables.kinds);
-        let mut masks = 0usize;
-        for s in 0..tables.strata {
-            let mut eta0 = vec![0.0; nodes * marks];
-            for d in 0..marks {
-                let design = &tables.designs[d];
-                let beta = &states[d].beta;
-                for n in 0..nodes {
-                    let row = s * nodes + n;
-                    let mut value = tables.offsets[d][row];
-                    for (j, x) in design.row(row).iter().enumerate() {
-                        value += x * beta[j];
-                    }
-                    eta0[n * marks + d] = value;
-                }
-            }
-            let out = stratum_normalisers(
-                &tables.grid,
-                &eta0,
-                &loadings,
-                &rates,
-                self.time_scale,
-                &self.gh,
-                &tables.kinds,
-                atoms,
-            )
-            .map_err(|error| error.to_string())?;
-            masks = out.masks;
-            risk_mass.extend(out.log_risk_mass);
-            per_stratum.push(out.log_normaliser);
-        }
-        Ok(RiskSetCentring {
-            log_normaliser: per_stratum.concat(),
-            log_risk_mass: risk_mass,
-            masks,
-            mask_of_mark,
-        })
+    /// The reference law at exactly the supplied coefficient state.
+    pub fn refresh_normaliser(&self, states: &[ParameterBlockState]) -> Result<RiskSetCentring, String> {
+        self.computed_reference(states)
     }
 
     /// Per atom, the offset within the latent block of its rate coefficient,
@@ -588,6 +492,9 @@ impl EventHistoryFamily {
         derivatives: bool,
     ) -> Result<(S, Vec<S>, Vec<S>), String> {
         self.validate_states(states)?;
+        if self.reference.is_some() && self.atoms > 0 {
+            return self.computed_joint(states, u, v, derivatives);
+        }
         let marks = self.marks();
         let atoms = self.atoms;
         let offsets = self.block_offsets();
@@ -664,7 +571,6 @@ impl EventHistoryFamily {
             })
             .collect();
         let designs = &self.designs;
-        let held = self.log_normaliser.as_deref().map(Vec::as_slice);
         let subjects = &self.nodes.subjects;
         let gh = &self.gh;
         let time_scale = self.time_scale;
@@ -698,15 +604,7 @@ impl EventHistoryFamily {
                     .iter()
                     .map(|design| design.slice(s![first..first + n, ..]))
                     .collect();
-                // Held as data over the solve: no derivative channels, so
-                // `∂η/∂a` is `z` rather than `z − a` (see `subject_marginal`).
-                let normaliser: Option<Vec<S>> = held.map(|values| {
-                    values[first * marks..(first + n) * marks]
-                        .iter()
-                        .map(|v| S::seeded(*v, 0.0, 0.0))
-                        .collect()
-                });
-let inputs = SubjectInputs {
+                let inputs = SubjectInputs {
                     nodes: subject,
                     eta0: &eta0,
                     loadings: &loadings,
@@ -715,7 +613,7 @@ let inputs = SubjectInputs {
                     gh,
                     continuation_gap: 0.0,
                     designs: derivatives.then_some(views.as_slice()),
-                    log_normaliser: normaliser.as_deref(),
+                    log_normaliser: None,
                 };
                 let local = subject_marginal(&inputs, derivatives).map_err(|e| e.to_string())?;
                 if derivatives
@@ -811,17 +709,7 @@ let inputs = SubjectInputs {
     fn exact_gradient(&self, states: &[ParameterBlockState]) -> Result<Vec<f64>, String> {
         let total = self.total_width();
         let mut gradient = vec![0.0; total];
-        if total <= 4 {
-            self.exact_gradient_chunks::<4>(states, &mut gradient)?;
-        } else if total <= 8 {
-            self.exact_gradient_chunks::<8>(states, &mut gradient)?;
-        } else if total <= 16 {
-            self.exact_gradient_chunks::<16>(states, &mut gradient)?;
-        } else if total <= 32 {
-            self.exact_gradient_chunks::<32>(states, &mut gradient)?;
-        } else {
-            self.exact_gradient_chunks::<64>(states, &mut gradient)?;
-        }
+        self.exact_gradient_chunks::<8>(states, &mut gradient)?;
         Ok(gradient)
     }
 
@@ -832,90 +720,16 @@ let inputs = SubjectInputs {
         states: &[ParameterBlockState],
         gradient: &mut [f64],
     ) -> Result<(), String> {
-        let marks = self.marks();
-        let atoms = self.atoms;
-        let offsets = self.block_offsets();
-        let total = self.total_width();
-        let latent_offset = offsets[marks];
-        let empty = Array1::<f64>::zeros(0);
-        let latent_beta: &Array1<f64> = if self.has_latent_block() {
-            &states[marks].beta
-        } else {
-            &empty
-        };
-        let designs = &self.designs;
-        let held = self.log_normaliser.as_deref().map(Vec::as_slice);
-        let gh = &self.gh;
-        let time_scale = self.time_scale;
-        for start in (0..total).step_by(W) {
-            let end = (start + W).min(total);
-            let seed = |slot: usize, grad: &mut [f64; W], x: f64| {
-                if (start..end).contains(&slot) {
-                    grad[slot - start] = x;
-                }
-            };
-            let unit = |q: usize| -> Tangent<W> {
+        let values: Vec<f64> = states.iter().flat_map(|s| s.beta.iter().copied()).collect();
+        for start in (0..values.len()).step_by(W) {
+            let beta: Vec<Tangent<W>> = values.iter().enumerate().map(|(q, value)| {
                 let mut grad = [0.0; W];
-                seed(latent_offset + q, &mut grad, 1.0);
-                Tangent::seeded(latent_beta[q], grad)
-            };
-            let loadings: Vec<Tangent<W>> = (0..marks * atoms).map(unit).collect();
-            let slots = self.free_rate_slots();
-            let band = self.rate_band;
-            let rates: Vec<Tangent<W>> = (0..atoms)
-                .map(|k| match slots[k] {
-                    Some(slot) => rate_from_chart(band, &unit(slot)),
-                    None => Tangent::seeded(
-                        self.held_rates[k].expect("a rate without a coefficient is held"),
-                        [0.0; W],
-                    ),
-                })
-                .collect();
-            let per_subject: Result<Vec<[f64; W]>, String> = self
-                .nodes
-                .subjects
-                .par_iter()
-                .map(|subject| {
-                    let n = subject.len();
-                    let first = subject.first_row;
-                    let mut eta0 = Vec::with_capacity(n * marks);
-                    for node in 0..n {
-                        let row = first + node;
-                        for d in 0..marks {
-                            let mut grad = [0.0; W];
-                            for (j, x) in designs[d].row(row).iter().enumerate() {
-                                seed(offsets[d] + j, &mut grad, *x);
-                            }
-                            eta0.push(Tangent::seeded(states[d].eta[row], grad));
-                        }
-                    }
-                    // Held as data over the solve: no derivative channels, so
-                    // `∂η/∂a` is `z` rather than `z − a` (see `subject_marginal`).
-                    let normaliser: Option<Vec<Tangent<W>>> = held.map(|values| {
-                        values[first * marks..(first + n) * marks]
-                            .iter()
-                            .map(|v| Tangent::seeded(*v, [0.0; W]))
-                            .collect()
-                    });
-                    let inputs = SubjectInputs {
-                        nodes: subject,
-                        eta0: &eta0,
-                        loadings: &loadings,
-                        rates: &rates,
-                        time_scale,
-                        gh,
-                        continuation_gap: 0.0,
-                        designs: None,
-                        log_normaliser: normaliser.as_deref(),
-                    };
-                    let local = subject_marginal(&inputs, false).map_err(|e| e.to_string())?;
-                    Ok(local.loglik.grad)
-                })
-                .collect();
-            for g in per_subject? {
-                for (slot, x) in g.iter().enumerate().take(end - start) {
-                    gradient[start + slot] += x;
-                }
+                if q >= start && q < start + W { grad[q - start] = 1.0; }
+                Tangent::seeded(*value, grad)
+            }).collect();
+            let result = self.path_value(states, &beta)?;
+            for (slot, value) in result.grad.iter().enumerate().take((values.len() - start).min(W)) {
+                gradient[start + slot] = *value;
             }
         }
         Ok(())
@@ -930,88 +744,14 @@ let inputs = SubjectInputs {
         direction: &Array1<f64>,
     ) -> Result<(f64, f64), String> {
         self.validate_states(states)?;
-        let marks = self.marks();
-        let atoms = self.atoms;
-        let offsets = self.block_offsets();
-        let total = self.total_width();
-        if direction.len() != total {
-            return Err(format!(
-                "event-history direction has length {}, expected {total}",
-                direction.len()
-            ));
+        let values: Vec<f64> = states.iter().flat_map(|s| s.beta.iter().copied()).collect();
+        if direction.len() != values.len() || direction.iter().any(|x| !x.is_finite()) {
+            return Err("invalid event-history derivative direction".to_string());
         }
-        let latent_offset = offsets[marks];
-        let empty = Array1::<f64>::zeros(0);
-        let latent_beta: &Array1<f64> = if self.has_latent_block() {
-            &states[marks].beta
-        } else {
-            &empty
-        };
-        let designs = &self.designs;
-        let held = self.log_normaliser.as_deref().map(Vec::as_slice);
-        let gh = &self.gh;
-        let time_scale = self.time_scale;
-        let slots = self.free_rate_slots();
-        let seeded =
-            |q: usize| Tangent::<1>::seeded(latent_beta[q], [direction[latent_offset + q]]);
-        let loadings: Vec<Tangent<1>> = (0..marks * atoms).map(seeded).collect();
-        let band = self.rate_band;
-        let rates: Vec<Tangent<1>> = (0..atoms)
-            .map(|k| match slots[k] {
-                Some(slot) => rate_from_chart(band, &seeded(slot)),
-                None => Tangent::seeded(
-                    self.held_rates[k].expect("a rate without a coefficient is held"),
-                    [0.0],
-                ),
-            })
-            .collect();
-        let per_subject: Result<Vec<(f64, f64)>, String> = self
-            .nodes
-            .subjects
-            .par_iter()
-            .map(|subject| {
-                let n = subject.len();
-                let first = subject.first_row;
-                let mut eta0 = Vec::with_capacity(n * marks);
-                for node in 0..n {
-                    let row = first + node;
-                    for d in 0..marks {
-                        let slope: f64 = designs[d]
-                            .row(row)
-                            .iter()
-                            .enumerate()
-                            .map(|(j, x)| x * direction[offsets[d] + j])
-                            .sum();
-                        eta0.push(Tangent::seeded(states[d].eta[row], [slope]));
-                    }
-                }
-                // Held as data over the solve: no derivative channels, so
-                // `∂η/∂a` is `z` rather than `z − a` (see `subject_marginal`).
-                let normaliser: Option<Vec<Tangent<1>>> = held.map(|values| {
-                    values[first * marks..(first + n) * marks]
-                        .iter()
-                        .map(|v| Tangent::seeded(*v, [0.0]))
-                        .collect()
-                });
-                let inputs = SubjectInputs {
-                    nodes: subject,
-                    eta0: &eta0,
-                    loadings: &loadings,
-                    rates: &rates,
-                    time_scale,
-                    gh,
-                    continuation_gap: 0.0,
-                    designs: None,
-                    log_normaliser: normaliser.as_deref(),
-                };
-                let local = subject_marginal(&inputs, false).map_err(|e| e.to_string())?;
-                Ok((local.loglik.value, local.loglik.grad[0]))
-            })
-            .collect();
-        let per_subject = per_subject?;
-        let values: Vec<f64> = per_subject.iter().map(|(v, _)| *v).collect();
-        let slopes: Vec<f64> = per_subject.iter().map(|(_, s)| *s).collect();
-        Ok((pairwise_sum(&values, &0.0), pairwise_sum(&slopes, &0.0)))
+        let beta: Vec<Tangent<1>> = values.iter().enumerate().map(|(q, value)|
+            Tangent::seeded(*value, [direction[q]])).collect();
+        let result = self.path_value(states, &beta)?;
+        Ok((result.value, result.grad[0]))
     }
 
     /// The martingale residuals of every subject at `states`: per node and
@@ -1035,7 +775,11 @@ let inputs = SubjectInputs {
         };
         let loadings: Vec<f64> = latent.iter().take(marks * atoms).copied().collect();
         let rates: Vec<f64> = self.atom_rates(latent);
-        let held = self.log_normaliser.as_deref().map(Vec::as_slice);
+        let centring = if self.reference.is_some() {
+            let values = self.refresh_normaliser(states)?;
+            Some(self.normaliser_on_nodes(&values.log_normaliser).map_err(|error| error.to_string())?)
+        } else { None };
+        let held = centring.as_deref();
         let gh = &self.gh;
         let time_scale = self.time_scale;
         let all_marks = vec![true; marks];
@@ -1073,7 +817,7 @@ let inputs = SubjectInputs {
                         &pass.predicted[node],
                         &eta0[node * marks..(node + 1) * marks],
                         &loadings,
-                        None,
+                        normaliser.as_ref().map(|m| &m[node * marks..(node + 1) * marks]),
                         marks,
                         atoms,
                     );
@@ -1113,8 +857,8 @@ let inputs = SubjectInputs {
         {
             return Ok(Arc::clone(value));
         }
-        let (loglik, _, hessian) = self.evaluate_generic::<f64>(states, None, None, true)?;
-        let gradient = self.exact_gradient(states)?;
+        let (loglik, computed_gradient, hessian) = self.evaluate_generic::<f64>(states, None, None, true)?;
+        let gradient = if self.reference.is_some() && self.atoms > 0 { computed_gradient } else { self.exact_gradient(states)? };
         let total = self.total_width();
         let mut negative_hessian = Array2::<f64>::zeros((total, total));
         for i in 0..total {
@@ -1382,14 +1126,9 @@ pub struct EventHistorySpec {
     /// with; `Some` centres it on the risk set at every age, so `exp(η⁰)` is
     /// the incidence among those still at risk (see [`super::preserve`]).
     pub reference: Option<ReferenceStrata>,
-    /// How many times the held risk-set normaliser is refreshed before the
-    /// fit stops, however far it is still moving.
-    pub normaliser_rounds: usize,
-    /// How far the held risk-set normaliser may still move, in nats, before
-    /// the fit stops refreshing it. The normaliser is held as data over each
-    /// solve — its own score has expectation zero — and refreshed between
-    /// them, so the fit is a fixed point of that alternation.
-    pub normaliser_tolerance: f64,
+    /// Required maximum coarse/fine discrepancy in log reference moments
+    /// and log risk masses, evaluated at the same coefficient state.
+    pub reference_tolerance: f64,
     pub options: BlockwiseFitOptions,
 }
 
@@ -1401,8 +1140,7 @@ impl EventHistorySpec {
             gauss_hermite_order: 9,
             quadrature_tolerance: 5e-2,
             reference: None,
-            normaliser_rounds: 24,
-            normaliser_tolerance: 1e-4,
+            reference_tolerance: 1e-4,
             options: BlockwiseFitOptions::default(),
         }
     }
@@ -1501,62 +1239,49 @@ pub struct EventHistoryFit {
     pub rank_path: Vec<RankStep>,
     /// The decrease of the outer LAML criterion each accepted atom brought.
     pub atom_evidence: Vec<f64>,
-    /// How far the held risk-set normaliser moved at each re-centring round,
-    /// in nats. Empty when the baselines are centred on the stationary prior.
-    pub normaliser_rounds: Vec<f64>,
-    /// The log of the reference population's risk-set mass on the reference
-    /// grid — its marginal survival, which the centring makes `−∫ e^{η⁰}`.
-    /// Index `(stratum * nodes + node) * masks + mask`.
-    pub reference_risk_mass: Vec<f64>,
-    /// How many distinct risk sets the marks define.
-    pub reference_masks: usize,
-    /// The level, in nats, the re-centring alternation settled at: the
-    /// smallest move any round achieved. It is bounded below by the
-    /// convergence of the solves the rounds are made of, so a value near that
-    /// floor is the alternation having converged as far as the fits under it
-    /// can resolve, not a failure to converge.
-    pub normaliser_settled: f64,
-    /// The largest disagreement, in nats, between the reference grid the
-    /// normaliser was taken on and the same grid with every cell halved.
-    /// `None` when the baselines are centred on the stationary prior.
+    /// Reference-grid discrepancies at fixed coefficients, before each
+    /// refinement. Every returned reference fit meets reference_tolerance.
+    pub reference_refinements: Vec<f64>,
+    /// Authoritative centring at the final coefficient state.
+    pub centring: Option<RiskSetCentring>,
+    /// Maximum fixed-parameter coarse/fine discrepancy; absent for prior centring.
     pub reference_certificate: Option<f64>,
-    /// The settled risk-set normaliser on the reference grid, index
-    /// `(stratum * nodes + node) * marks + d`. Empty when the baselines are
-    /// centred on the stationary prior. Prediction reads it: a forecast made
-    /// from a fit whose baselines are the risk sets' rates has to divide by
-    /// the same normaliser the fit did, at the times the forecast asks about,
-    /// or it is a forecast from a different model.
-    pub reference_normaliser: Vec<f64>,
 }
 
 impl EventHistoryFit {
     /// The reference grid the settled normaliser lives on, when the baselines
     /// are the risk sets' rates.
     pub fn reference_grid(&self) -> Option<&ReferenceGrid> {
-        self.family.reference().map(|tables| &tables.grid)
+        self.centring.as_ref().map(|snapshot| &snapshot.grid)
     }
 
     /// `log M_d(t)` for one stratum at an arbitrary time, by the same linear
     /// interpolation in the log of the normaliser the fit used. Empty when
     /// the baselines are centred on the stationary prior.
-    pub fn risk_set_normaliser_at(&self, stratum: usize, t: f64) -> Vec<f64> {
+    pub fn risk_set_normaliser_at(&self, stratum: usize, t: f64) -> Result<Vec<f64>, EventHistoryError> {
         let marks = self.marks();
-        let Some(grid) = self.reference_grid() else {
-            return Vec::new();
+        let Some(snapshot) = self.centring.as_ref() else {
+            if stratum != 0 {
+                return Err(EventHistoryError::InvalidInput { reason: "a model without reference strata requires stratum zero".to_string() });
+            }
+            return Ok(Vec::new());
         };
-        if self.reference_normaliser.is_empty() {
-            return Vec::new();
+        if stratum >= snapshot.profiles.nrows() {
+            return Err(EventHistoryError::InvalidInput {
+                reason: format!("reference stratum {stratum} is outside 0..{}", snapshot.profiles.nrows()),
+            });
         }
+        let grid = &snapshot.grid;
         let nodes = grid.len();
-        let (lower, weight) = grid.locate(t);
+        let (lower, weight) = grid.locate(t)?;
         let base = stratum * nodes;
-        (0..marks)
+        Ok((0..marks)
             .map(|d| {
-                let low = self.reference_normaliser[(base + lower) * marks + d];
-                let high = self.reference_normaliser[(base + lower + 1) * marks + d];
+                let low = snapshot.log_normaliser[(base + lower) * marks + d];
+                let high = snapshot.log_normaliser[(base + lower + 1) * marks + d];
                 low + weight * (high - low)
             })
-            .collect()
+            .collect())
     }
 
     /// The rank of the latent covariance the evidence supports.
@@ -1813,8 +1538,8 @@ impl Built {
     }
 }
 
-/// Bytes the family's evaluation may hold at once: the transient `S × S`
-/// backward kernel of one gap, the carried `P × S` conditional expectations,
+/// Bytes the family's evaluation may hold at once: the streamed backward
+/// kernel row for one gap, the carried `P × S` conditional expectations,
 /// the per-node densities and operators of every node, per parallel
 /// subject, in the widest scalar the outer solve uses (four channels).
 fn transient_footprint_bytes(
@@ -1827,7 +1552,7 @@ fn transient_footprint_bytes(
     let s = product_grid_size(order, atoms)? as f64;
     let g = order as f64;
     let n = max_nodes as f64;
-    let per_subject = s * s
+    let per_subject = 4.0 * s
         + total_width as f64 * s
         + n * s * (4.0 + marks as f64)
         + n * atoms as f64 * 3.0 * g * g;
@@ -1997,46 +1722,25 @@ fn reference_tables(
             ),
         });
     }
-    let mut population = EventHistoryCohort {
-        mark_names: cohort.mark_names.clone(),
-        mark_kinds: cohort.mark_kinds.clone(),
-        covariate_names: cohort.covariate_names.clone(),
-        covariate_levels: cohort.covariate_levels.clone(),
-        covariates: cohort.covariates.clone(),
-        subjects: strata
-            .rows
-            .iter()
-            .enumerate()
-            .map(|(s, &row)| SubjectHistory {
-                id: format!("reference-{s}"),
-                entry,
-                exit,
-                events: Vec::new(),
-                segments: vec![CovariateSegment { start: entry, row }],
-            })
-            .collect(),
-    };
-    population.validate()?;
-    let expanded = expand_nodes(&population, quadrature_order, refinement)?;
-    let first = &expanded.subjects[0];
-    let grid = ReferenceGrid {
-        times: first.times.clone(),
-        gaps: first.gaps.clone(),
-        weights: first.weights.clone(),
-    };
-    if expanded
-        .subjects
-        .iter()
-        .any(|subject| subject.times != first.times)
-    {
-        return Err(EventHistoryError::NumericalFailure {
-            reason: "the reference strata were expanded onto different node times".to_string(),
-        });
+    let intervals = quadrature_order.max(2).checked_shl(refinement as u32)
+        .filter(|&n| n <= 32768).ok_or_else(|| EventHistoryError::NumericalFailure {
+            reason: "reference evolution exceeded its 32768-interval work limit".to_string(),
+        })?;
+    let times: Vec<f64> = (0..=intervals).map(|n|
+        if n == intervals { exit } else { entry + (exit - entry) * n as f64 / intervals as f64 }).collect();
+    let grid = ReferenceGrid { gaps: times.windows(2).map(|w| w[1] - w[0]).collect(), times };
+    let mut node_data = Array2::<f64>::zeros((strata.strata() * grid.len(), cohort.covariates.ncols() + 1));
+    for (s, &profile) in strata.rows.iter().enumerate() {
+        for (n, &time) in grid.times.iter().enumerate() {
+            let row = s * grid.len() + n;
+            for c in 0..cohort.covariates.ncols() { node_data[[row, c]] = cohort.covariates[[profile, c]]; }
+            node_data[[row, cohort.covariates.ncols()]] = time;
+        }
     }
     let mut designs = Vec::with_capacity(marks);
     let mut offsets = Vec::with_capacity(marks);
     for d in 0..marks {
-        let design = build_term_collection_design(expanded.node_data.view(), &frozen_specs[d])
+        let design = build_term_collection_design(node_data.view(), &frozen_specs[d])
             .map_err(|error| EventHistoryError::Fit {
                 reason: format!("reference design for mark {d}: {error}"),
             })?;
@@ -2058,7 +1762,7 @@ fn reference_tables(
     for (i, subject) in nodes.subjects.iter().enumerate() {
         for (n, &time) in subject.times.iter().enumerate() {
             let row = subject.first_row + n;
-            let (lower, weight) = grid.locate(time);
+            let (lower, weight) = grid.locate(time)?;
             node_stratum[row] = strata.subject[i];
             node_lower[row] = lower;
             node_weight[row] = weight;
@@ -2066,6 +1770,7 @@ fn reference_tables(
     }
     Ok(ReferenceTables {
         grid,
+        profiles: cohort.covariates.select(ndarray::Axis(0), &strata.rows),
         kinds: cohort.mark_kinds.clone(),
         designs,
         offsets,
@@ -2087,7 +1792,7 @@ fn fit_at_rank(
     atoms: usize,
     start: Option<&RankStart>,
     pinned: Option<(usize, usize)>,
-    held: Option<Arc<Vec<f64>>>,
+    reference_refinement: usize,
 ) -> Result<EventHistoryFit, EventHistoryError> {
     let marks = cohort.marks();
     if spec.covariates.len() != 1 && spec.covariates.len() != marks {
@@ -2164,7 +1869,7 @@ fn fit_at_rank(
                 strata,
                 &frozen_specs,
                 spec.quadrature_order,
-                REFERENCE_REFINEMENT,
+                reference_refinement,
                 &nodes,
             )?)),
             None => None,
@@ -2189,7 +1894,7 @@ fn fit_at_rank(
             time_scale,
             start.map_or_else(Vec::new, RankStart::held_rates),
         )?;
-        let family = family.with_reference(reference, held.clone())?;
+        let family = family.with_reference(reference);
         preflight(
             order,
             atoms,
@@ -2629,6 +2334,9 @@ fn assemble(
         designs,
         ..
     } = built;
+    let centring = if family.reference.is_some() {
+        Some(family.refresh_normaliser(&fit.block_states).map_err(|reason| EventHistoryError::Fit { reason })?)
+    } else { None };
     Ok(EventHistoryFit {
         nodes,
         family,
@@ -2659,23 +2367,83 @@ fn assemble(
         },
         rank_path: Vec::new(),
         atom_evidence: Vec::new(),
-        normaliser_rounds: Vec::new(),
-        reference_risk_mass: Vec::new(),
-        reference_masks: 0,
-        normaliser_settled: f64::INFINITY,
+        reference_refinements: Vec::new(),
+        centring,
         reference_certificate: None,
-        reference_normaliser: Vec::new(),
     })
 }
 
-/// The exact profile of the marginal log-likelihood along a proposed atom's
-/// direction: `g(t) = ℓ(t·v) − ℓ(0)`, with every other coefficient at the
-/// rank-`K` fit and the new atom's rate at the proposal, sampled with its
-/// slope by one tangent forward filter per point from `t = 0` outward until
-/// the profile has fallen far below its peak. The score's quartic model is
-/// exact at the boundary, where the atom is judged, and only a model
-/// further out; the prior an accepted atom enters with, and the evidence it
-/// reports, are read from this profile instead.
+/// Construct the enlarged model with a zero new loading and fixed rates.
+fn added_atom_probe(fit: &EventHistoryFit, log_rate: f64) -> Result<(EventHistoryFamily, Vec<ParameterBlockState>), EventHistoryError> {
+    let marks = fit.marks();
+    let atoms = fit.rank() + 1;
+    preflight(fit.family.gh.order, atoms, fit.nodes.max_subject_nodes(), marks,
+        fit.family.block_offsets()[marks] + marks * atoms)?;
+    let mut rates: Vec<Option<f64>> = fit.log_rates.iter().map(|r| Some(r.exp())).collect();
+    rates.push(Some(log_rate.exp()));
+    let probe = EventHistoryFamily::new(fit.nodes.clone(), fit.family.designs.clone(),
+        atoms, fit.family.gh.order, fit.time_scale, rates)?
+        .with_reference(fit.family.reference.clone());
+    let mut states = fit.fit.block_states[..marks].to_vec();
+    let mut loadings = Array1::zeros(marks * atoms);
+    for d in 0..marks {
+        for k in 0..fit.rank() { loadings[d * atoms + k] = fit.loadings[[d, k]]; }
+    }
+    states.push(ParameterBlockState { beta: loadings, eta: Array1::zeros(fit.nodes.total_nodes) });
+    Ok((probe, states))
+}
+
+/// Boundary curvature of the computed latent-marginal likelihood. Unlike a
+/// product of filtered residual means, this integrates the existing process
+/// under the full observation law and differentiates reference centring too.
+fn added_atom_curvature(fit: &EventHistoryFit, log_rate: f64) -> Result<Array2<f64>, EventHistoryError> {
+    let (probe, states) = added_atom_probe(fit, log_rate)?;
+    checked_loading_curvature(&probe, &states)
+}
+
+fn loading_curvature(probe: &EventHistoryFamily, states: &[ParameterBlockState]) -> Result<Array2<f64>, EventHistoryError> {
+    use super::scalar::Mixed;
+    let marks = probe.marks();
+    let values: Vec<f64> = states.iter().flat_map(|s| s.beta.iter().copied()).collect();
+    let offset = probe.block_offsets()[marks];
+    let mut curvature = Array2::zeros((marks, marks));
+    for d in 0..marks {
+        for e in 0..=d {
+            let qd = offset + d * probe.atoms + probe.atoms - 1;
+            let qe = offset + e * probe.atoms + probe.atoms - 1;
+            let beta: Vec<Mixed<f64>> = values.iter().enumerate().map(|(q, &value)|
+                Mixed::seed(value, f64::from(q == qd), f64::from(q == qe))).collect();
+            let value = probe.path_value(states, &beta)
+                .map_err(|reason| EventHistoryError::Fit { reason })?.uv;
+            curvature[[d, e]] = value;
+            curvature[[e, d]] = value;
+        }
+    }
+    Ok(curvature)
+}
+
+/// A correct derivative of an unresolved integral is still unresolved.
+/// Check the proposed curvature at fixed parameters before using its sign.
+fn checked_loading_curvature(probe: &EventHistoryFamily, states: &[ParameterBlockState]) -> Result<Array2<f64>, EventHistoryError> {
+    let coarse = loading_curvature(probe, states)?;
+    let mut fine = probe.clone();
+    let next_order = probe.gh.order + 4;
+    preflight(next_order, probe.atoms, probe.nodes.max_subject_nodes(), probe.marks(), probe.total_width())?;
+    fine.gh = Arc::new(GaussHermite::new(next_order)?);
+    if fine.gh.lebesgue_constant * f64::EPSILON * probe.nodes.max_subject_nodes() as f64 > 1e-3 {
+        return Err(EventHistoryError::NumericalFailure { reason:
+            "added-factor curvature cannot be resolved within the interpolation roundoff bound".to_string() });
+    }
+    let refined = loading_curvature(&fine, states)?;
+    let scale = refined.iter().fold(1.0_f64, |s, x| s.max(x.abs()));
+    let gap = coarse.iter().zip(refined.iter()).fold(0.0_f64, |s, (a, b)| s.max((a - b).abs()));
+    if coarse.iter().chain(refined.iter()).any(|x| !x.is_finite()) || gap > 1e-3 * scale {
+        return Err(EventHistoryError::NumericalFailure { reason: format!(
+            "added-factor curvature unresolved between orders {} and {next_order}: discrepancy {gap:.3e}, scale {scale:.3e}", probe.gh.order) });
+    }
+    Ok(coarse)
+}
+
 fn direction_profile(
     fit: &EventHistoryFit,
     atom: &NewAtom,
@@ -2699,10 +2467,9 @@ fn direction_profile(
             order,
             time_scale,
             held.clone(),
-        )
+        ).map(|family| family.with_reference(fit.family.reference.clone()))
     };
-    let mut order = fit.family.gh.order;
-    let mut probe = build(order)?;
+    let probe = build(fit.family.gh.order)?;
     let width = probe.latent_width();
     let total = probe.total_width();
     let latent_offset = probe.block_offsets()[marks];
@@ -2738,15 +2505,9 @@ fn direction_profile(
     }
     let fit_error = |reason: String| EventHistoryError::Fit { reason };
     let base = probe.log_likelihood(&states_at(0.0)).map_err(fit_error)?;
-    // Sampled at an eighth of the quartic model's own mode scale, out to where
-    // the profile under the Laplace-scale prior of that mode has fallen
-    // twenty nats (`e⁻²⁰` of the peak's mass) below its peak past that peak;
-    // the step doubles once the sample count grows long. A loading far past
-    // the mode can tilt a node's posterior more sharply than the grid
-    // represents (its interpolant loses positivity); the order is raised once
-    // for that, as the fit does, and if the representation still fails the
-    // profile ends at its last sample and the interpolant's continuation
-    // carries what little tail is left.
+    // Finite sampled profiles propose a prior. Every sample must be
+    // evaluated successfully at the same quadrature setting; a failed tail
+    // is an unresolved proposal, never an invented continuation.
     let prior = 1.0 / (atom.ridge.mode_scale * atom.ridge.mode_scale);
     let mut step = atom.ridge.mode_scale / 8.0;
     let mut points = vec![0.0];
@@ -2757,30 +2518,7 @@ fn direction_profile(
     loop {
         t += step;
         let sample = probe.directional_log_likelihood(&states_at(t), &direction);
-        let (value, slope) = match sample {
-            Ok(sample) => sample,
-            Err(message) => {
-                let next_order = 2 * order - 1;
-                if message.contains(LOST_POSITIVITY) && order == fit.family.gh.order {
-                    log::info!(
-                        "[event-history] the profile along the proposed direction at loading scale {t:.3} needs Gauss-Hermite order {next_order} ({message})"
-                    );
-                    order = next_order;
-                    probe = build(order)?;
-                    t -= step;
-                    continue;
-                }
-                if points.len() >= 2 {
-                    log::info!(
-                        "[event-history] the profile along the proposed direction ends at loading scale {:.3}, {:.2} nats below its peak: the grid cannot represent the posterior beyond it ({message})",
-                        points[points.len() - 1],
-                        peak - values[values.len() - 1]
-                    );
-                    break;
-                }
-                return Err(fit_error(message));
-            }
-        };
+        let (value, slope) = sample.map_err(fit_error)?;
         let value = value - base;
         peak = peak.max(value - 0.5 * prior * t * t);
         points.push(t);
@@ -2806,30 +2544,15 @@ fn direction_profile(
     })
 }
 
-/// Fit an event-history model, growing the rank of the latent covariance
-/// from zero until the evidence refuses the next direction.
-///
-/// At each rank the next atom is proposed by the covariance score of the
-/// fit's martingale residuals: the direction and rate whose standardised
-/// evidence gain is largest, the most evidence-improving covariance
-/// direction the current rank omits. The atom's loadings get the isotropic
-/// Gaussian prior whose precision maximises the marginal likelihood under
-/// the exact one-dimensional marginal of the score's quartic evidence model
-/// along every direction (see [`super::covariance::empirical_bayes_ridge`]),
-/// and the atom is accepted exactly when that prior places the posterior
-/// mode of its loading away from zero. A refused atom costs no fit; an
-/// accepted one is fitted with its prior held fixed, warm-started at the
-/// mode, and a candidate that reaches no certified optimum is refused with
-/// its reason. Nothing about the latent structure is chosen by hand: not
-/// the number of atoms, not their directions, not their rates, not the
-/// strength of their priors, and no level or tolerance decides the rank.
-///
-/// The rank path runs at ONE setting — the spec's own starting order and
-/// mesh — and only the fit that is returned runs the refinement ladder,
-/// once, at the rank the evidence chose.
-pub fn fit_event_history(
+/// Grow candidate ranks under one reference law and numerical setting.
+/// Filtered residuals propose rates; differentiated likelihood curvature and
+/// sampled profiles propose loadings and their prior. Jointly fitted ranks
+/// are compared by the same outer Laplace criterion. The candidate search
+/// and the Laplace approximation do not establish globally optimal evidence.
+fn fit_event_history_on_grid(
     cohort: &mut EventHistoryCohort,
     spec: &EventHistorySpec,
+    reference_refinement: usize,
 ) -> Result<EventHistoryFit, EventHistoryError> {
     cohort.validate()?;
     let marks = cohort.marks();
@@ -2837,9 +2560,8 @@ pub fn fit_event_history(
         strata.validate(cohort.subjects.len(), cohort.covariates.nrows())?;
     }
     let time_scale = cohort.time_scale();
-    let held: Option<Arc<Vec<f64>>> = None;
     let pin = Some((spec.gauss_hermite_order.max(3), 0usize));
-    let mut fit = fit_at_rank(cohort, spec, 0, None, pin, None)?;
+    let mut fit = fit_at_rank(cohort, spec, 0, None, pin, reference_refinement)?;
     let mut rank_path: Vec<RankStep> = Vec::new();
     let mut atom_evidence: Vec<f64> = Vec::new();
     loop {
@@ -2852,27 +2574,26 @@ pub fn fit_event_history(
         else {
             break;
         };
-        let boundary = atom.clone();
-        if atom.ridge.accepted {
-            // The quartic decision stands; the prior the atom enters with and
-            // the evidence it reports come from the exact profile along its
-            // direction, which the same empirical-Bayes calculation reads in
-            // place of the quartic model of that one direction.
-            let profile = direction_profile(&fit, &atom, time_scale)?;
-            let directions: Vec<DirectionEvidence> =
-                std::iter::once(DirectionEvidence::Exact(profile))
-                    .chain(
-                        atom.other_directions
-                            .iter()
-                            .map(|&(eigenvalue, information)| DirectionEvidence::Quartic {
-                                eigenvalue,
-                                information,
-                            }),
-                    )
-                    .collect();
+        {
+            let curvature = added_atom_curvature(&fit, atom.log_rate)?;
+            let (values, vectors) = super::covariance::eigenmodes(&curvature)?;
+            atom.eigenvalue = values[0];
+            atom.direction = vectors.column(0).to_vec();
+            // The residual statistic supplies a proposal rate only. Every
+            // direction is checked against a sampled profile of the actual
+            // likelihood, even when the residual proxy refused it.
+            let mut directions = Vec::with_capacity(marks);
+            for d in 0..marks {
+                let mut along = atom.clone();
+                along.direction = vectors.column(d).to_vec();
+                along.ridge.mode_scale = (atom.ridge.mode_scale.powi(2) + 1.0 / (1.0 + values[d].abs())).sqrt();
+                directions.push(DirectionEvidence::Sampled(direction_profile(&fit, &along, time_scale)?));
+            }
+            // The product of directional profiles proposes the prior.
+            // Final acceptance below uses the jointly fitted criterion.
             let refined = empirical_bayes_ridge(&directions);
             log::info!(
-                "[event-history] rank {rank} → {}: exact profile along the proposed direction: prior log-precision {:.3} → {:.3}, evidence {:.3} → {:.3} nats, mode scale {:.4} → {:.4}",
+                "[event-history] rank {rank} → {}: sampled profile proposal: prior log-precision {:.3} → {:.3}, evidence {:.3} → {:.3} nats, mode scale {:.4} → {:.4}",
                 rank + 1,
                 atom.ridge.log_lambda,
                 refined.log_lambda,
@@ -2933,37 +2654,24 @@ pub fn fit_event_history(
             rate_held: fit.rate_held.clone(),
             atom: Some(atom.clone()),
         };
-        let mut grown = fit_at_rank(cohort, spec, rank + 1, Some(&start), pin, held.clone());
-        let refused = grown.as_ref().err().map(|error| error.to_string());
-        if let Some(error) = refused
-            && boundary.ridge.accepted
-            && boundary.ridge.log_lambda != atom.ridge.log_lambda
-        {
-            // The exact profile is a one-dimensional reading of a joint
-            // surface: its prior is right along the direction and can be too
-            // weak for the joint solve to certify a mode (measured: a
-            // four-mark candidate stalled at a saddle with its rate at the
-            // fast wall). The boundary model's prior is the more conservative
-            // of the two empirical-Bayes priors; a candidate that reaches no
-            // certified optimum under the first is fitted once under it.
-            log::info!(
-                "[event-history] rank {rank} → {}: no certified optimum under the exact profile's prior ({error}); refitting under the boundary model's prior log-precision {:.3} from its mode scale {:.4}",
-                rank + 1,
-                boundary.ridge.log_lambda,
-                boundary.ridge.mode_scale
-            );
-            step.ridge_log_lambda = boundary.ridge.log_lambda;
-            step.evidence_gain = boundary.ridge.gain;
-            atom.ridge = boundary.ridge.clone();
-            atom.loading = boundary.loading.clone();
-            let fallback = RankStart {
-                atom: Some(boundary),
-                ..start
-            };
-            grown = fit_at_rank(cohort, spec, rank + 1, Some(&fallback), pin, held.clone());
-        }
+        let grown = fit_at_rank(cohort, spec, rank + 1, Some(&start), pin, reference_refinement);
         match grown {
             Ok(candidate) => {
+                let criterion = |fit: &EventHistoryFit| -> Result<f64, EventHistoryError> {
+                    fit.fit.reml_score().filter(|value| value.is_finite())
+                        .ok_or_else(|| EventHistoryError::Fit {
+                            reason: "rank comparison requires a finite joint LAML criterion".to_string(),
+                        })
+                };
+                step.log_likelihood_gain = candidate.fit.log_likelihood - fit.fit.log_likelihood;
+                // Directional profile products propose a prior; they do not
+                // establish the evidence of the jointly fitted candidate.
+                step.evidence_gain = criterion(&fit)? - criterion(&candidate)?;
+                if step.evidence_gain <= 0.0 {
+                    step.accepted = false;
+                    rank_path.push(step);
+                    break;
+                }
                 log::info!(
                     "[event-history] rank {rank} → {}: score eigenvalue {:.4e} at log-rate {:.3}{}, standardised gain {:.3} nats, prior log-precision {:.3}, evidence {:.3} nats, mode scale {:.4}: accepted; log-likelihood {:.3} → {:.3}, fitted log-rate {:.3}",
                     rank + 1,
@@ -2978,7 +2686,6 @@ pub fn fit_event_history(
                     candidate.fit.log_likelihood,
                     candidate.log_rates.last().copied().unwrap_or(f64::NAN)
                 );
-                step.log_likelihood_gain = candidate.fit.log_likelihood - fit.fit.log_likelihood;
                 atom_evidence.push(step.evidence_gain);
                 rank_path.push(step);
                 fit = candidate;
@@ -2990,10 +2697,8 @@ pub fn fit_event_history(
                     "[event-history] rank {rank} → {}: the evidence accepted the atom but its model reached no certified optimum, refused ({error})",
                     rank + 1
                 );
-                step.accepted = false;
-                step.converged = false;
-                rank_path.push(step);
-                break;
+                return Err(EventHistoryError::Fit { reason: format!(
+                    "rank search unresolved at candidate rank {}: {error}", rank + 1) });
             }
         }
     }
@@ -3012,248 +2717,64 @@ pub fn fit_event_history(
             fit.atom_log_lambdas.clone(),
             fit.rate_held.clone(),
         );
-        fit = fit_at_rank(cohort, spec, rank, Some(&start), None, held.clone())?;
-    }
-    // Re-centre on the risk sets. The rank grew under the stationary prior's
-    // centring, where `exp(η⁰)` is the intensity averaged over everybody the
-    // cohort started with; the incidence rate the baselines are meant to be is
-    // the rate among those still at risk, and that normaliser is a function of
-    // the coefficients through the reference population's own evolution
-    // (`super::preserve`). It is held as data over each solve — its own score
-    // has expectation zero, because it is predictable and the compensator
-    // identity makes `E[Σ_events ∂log M] = E[∫ R λ ∂log M]` — and refreshed
-    // between them, so the fit is the fixed point of that alternation. At rank
-    // zero there are no loadings, `log M ≡ 0`, and nothing moves.
-    let mut normaliser_rounds: Vec<f64> = Vec::new();
-    let mut reference_risk_mass: Vec<f64> = Vec::new();
-    let mut reference_normaliser: Vec<f64> = Vec::new();
-    let mut reference_masks = 0usize;
-    let mut normaliser_settled = f64::INFINITY;
-    if spec.reference.is_some() && fit.rank() > 0 {
-        let mut held: Option<Arc<Vec<f64>>> = None;
-        let mut previous_point: Option<Vec<f64>> = None;
-        let mut previous_residual: Option<Vec<f64>> = None;
-        // The best point the alternation has reached, and how many rounds
-        // have failed to improve on it. Each round's fit is solved to its own
-        // tolerance, so the residual cannot fall below the level that solve
-        // noise puts on the normaliser; past that the rounds jitter around a
-        // floor rather than converging, and walking further buys nothing.
-        let mut best: Option<(f64, Arc<Vec<f64>>)> = None;
-        let mut stalled = 0usize;
-        for _ in 0..spec.normaliser_rounds {
-            let centring = fit
-                .family
-                .refresh_normaliser(&fit.fit.block_states)
-                .map_err(|reason| EventHistoryError::Fit { reason })?;
-            let next = centring.log_normaliser;
-            // The residual of the alternation at the point the current fit was
-            // made under: how far one refresh moves the normaliser.
-            let residual: Option<Vec<f64>> = held.as_ref().map(|current| {
-                current
-                    .iter()
-                    .zip(next.iter())
-                    .map(|(u, f)| f - u)
-                    .collect()
-            });
-            let moved = residual.as_ref().map_or(f64::INFINITY, |r| {
-                r.iter().map(|v| v.abs()).fold(0.0, f64::max)
-            });
-            normaliser_rounds.push(moved);
-            reference_risk_mass = centring.log_risk_mass;
-            reference_masks = centring.masks;
-            reference_normaliser = next.clone();
-            if let Some(current) = held.as_ref() {
-                if best.as_ref().is_none_or(|(seen, _)| moved < *seen) {
-                    best = Some((moved, Arc::clone(current)));
-                    stalled = 0;
-                } else {
-                    stalled += 1;
-                }
-            }
-            if moved <= spec.normaliser_tolerance {
-                log::info!(
-                    "[event-history] risk-set centring round {}: the normaliser moved {moved:.3e} nats: settled",
-                    normaliser_rounds.len()
-                );
-                break;
-            }
-            if stalled >= 2 {
-                log::info!(
-                    "[event-history] risk-set centring round {}: the normaliser moved {moved:.3e} nats and two rounds have not improved on {:.3e}: settled at the floor the inner solves leave",
-                    normaliser_rounds.len(),
-                    best.as_ref().map_or(f64::NAN, |(seen, _)| *seen)
-                );
-                break;
-            }
-            // The alternation contracts linearly and slowly: a shift in the
-            // normaliser is absorbed by the baseline only as far as the
-            // baseline's own basis can follow its shape, and what is left
-            // returns through the population's killing at a rate the data set.
-            // Walking that series costs a solve per term.
-            //
-            // The step taken instead is the secant one — Anderson acceleration
-            // at depth one — on the residual map `r(u) = F(u) − u`. Two points
-            // and their residuals give the linear model of `r` along the
-            // direction between them, and the step is to that model's root:
-            //
-            //   γ = ⟨r_k, Δr⟩ / ‖Δr‖²,   Δr = r_k − r_{k−1},  Δu = u_k − u_{k−1}
-            //   u_{k+1} = u_k + r_k − γ (Δu + Δr).
-            //
-            // It reads the whole residual vector rather than the ratio of two
-            // norms, which is what makes it hold when the contraction is not a
-            // single clean rate. A ratio of norms was tried first and did not:
-            // on a two-mark frailty cohort its fourfold step at an apparent
-            // rate of 0.8 landed further from the fixed point than the plain
-            // alternation, and the rounds after it oscillated. `γ` is bounded
-            // so that a near-parallel pair of residuals — where the secant
-            // model is ill-conditioned and says so through a tiny ‖Δr‖ —
-            // cannot turn into an unbounded step.
-            let advance: Vec<f64> = match (
-                held.as_ref(),
-                residual.as_ref(),
-                &previous_point,
-                &previous_residual,
-            ) {
-                (Some(current), Some(r), Some(before_u), Some(before_r)) => {
-                    let delta_r: Vec<f64> =
-                        r.iter().zip(before_r.iter()).map(|(a, b)| a - b).collect();
-                    let denominator: f64 = delta_r.iter().map(|v| v * v).sum();
-                    let numerator: f64 = r.iter().zip(delta_r.iter()).map(|(a, b)| a * b).sum();
-                    if denominator > 0.0 && numerator.is_finite() {
-                        let gamma = (numerator / denominator).clamp(-2.0, 2.0);
-                        log::info!(
-                            "[event-history] risk-set centring round {}: the normaliser moved {moved:.3e} nats; secant step at γ = {gamma:.3}",
-                            normaliser_rounds.len()
-                        );
-                        current
-                            .iter()
-                            .zip(r.iter())
-                            .zip(before_u.iter())
-                            .zip(delta_r.iter())
-                            .map(|(((u, r), pu), dr)| u + r - gamma * ((u - pu) + dr))
-                            .collect()
-                    } else {
-                        log::info!(
-                            "[event-history] risk-set centring round {}: the normaliser moved {moved:.3e} nats; the residuals give no secant, stepping plain",
-                            normaliser_rounds.len()
-                        );
-                        next
-                    }
-                }
-                _ => {
-                    log::info!(
-                        "[event-history] risk-set centring round {}: the normaliser moved {moved:.3e} nats",
-                        normaliser_rounds.len()
-                    );
-                    next
-                }
-            };
-            if let (Some(current), Some(r)) = (held.as_ref(), residual) {
-                previous_point = Some(current.as_ref().clone());
-                previous_residual = Some(r);
-            }
-            held = Some(Arc::new(advance));
-            let rank = fit.rank();
-            let start = RankStart::carried(
-                fit.fit.block_states[..marks]
-                    .iter()
-                    .map(|s| s.beta.clone())
-                    .collect(),
-                fit.loadings.iter().copied().collect(),
-                fit.log_rates.clone(),
-                fit.atom_log_lambdas.clone(),
-                fit.rate_held.clone(),
-            );
-            // The rounds run pinned, as the rank search does: the ladder that
-            // certifies a fit against a finer quadrature and mesh is worth
-            // paying once, for the model the caller gets, not once per round
-            // of an alternation whose intermediate points are discarded.
-            fit = fit_at_rank(cohort, spec, rank, Some(&start), pin, held.clone())?;
-        }
-        // The settled normaliser's own fit is the one certified — the best
-        // point the alternation reached, which is not always the last one it
-        // tried once the rounds are jittering on their floor.
-        if let Some((level, point)) = best.as_ref() {
-            normaliser_settled = *level;
-            held = Some(Arc::clone(point));
-        }
-        if !normaliser_rounds.is_empty() {
-            let rank = fit.rank();
-            let start = RankStart::carried(
-                fit.fit.block_states[..marks]
-                    .iter()
-                    .map(|s| s.beta.clone())
-                    .collect(),
-                fit.loadings.iter().copied().collect(),
-                fit.log_rates.clone(),
-                fit.atom_log_lambdas.clone(),
-                fit.rate_held.clone(),
-            );
-            fit = fit_at_rank(cohort, spec, rank, Some(&start), None, held.clone())?;
-        }
-    }
-    // What the reference grid's own resolution cost. The fit refines its own
-    // mesh until the coefficients are stationary; the reference population is
-    // run on a separate grid whose refinement is fixed, so that a normaliser
-    // held across the ladder means the same thing on every rung. That fixed
-    // choice is certified rather than assumed: the same population is run once
-    // on a grid with every cell halved, both are carried onto the cohort's own
-    // node times, and the largest disagreement is reported in the nats it is
-    // measured in. It is not a tolerance the fit enforces — a normaliser is an
-    // offset, so a shift in it is absorbed by the baseline it centres — but it
-    // is the number that says whether the grid resolved the population's decay.
-    let mut reference_certificate = None;
-    // Only when a normaliser was actually taken: at rank zero there are no
-    // loadings, `log M ≡ 0`, and there is no grid resolution to certify.
-    if let (Some(strata), Some(tables), false) = (
-        spec.reference.as_ref(),
-        fit.family.reference(),
-        reference_normaliser.is_empty(),
-    ) {
-        let refined = reference_tables(
-            cohort,
-            strata,
-            &fit.frozen_specs,
-            spec.quadrature_order,
-            REFERENCE_REFINEMENT + 1,
-            &fit.nodes,
-        )?;
-        let coarse_on_nodes = fit
-            .family
-            .normaliser_on_nodes(&reference_normaliser)
-            .map_err(|error| EventHistoryError::Fit {
-                reason: error.to_string(),
-            })?;
-        let refined_family = fit
-            .family
-            .clone()
-            .with_reference(Some(Arc::new(refined)), None)?;
-        let refined_values = refined_family
-            .refresh_normaliser(&fit.fit.block_states)
-            .map_err(|reason| EventHistoryError::Fit { reason })?;
-        let refined_on_nodes = refined_family
-            .normaliser_on_nodes(&refined_values.log_normaliser)
-            .map_err(|error| EventHistoryError::Fit {
-                reason: error.to_string(),
-            })?;
-        let gap = coarse_on_nodes
-            .iter()
-            .zip(refined_on_nodes.iter())
-            .map(|(a, b)| (a - b).abs())
-            .fold(0.0_f64, f64::max);
-        log::info!(
-            "[event-history] the reference grid at refinement {REFERENCE_REFINEMENT} differs from the halved one by {gap:.3e} nats (a {} node grid)",
-            tables.grid.len()
-        );
-        reference_certificate = Some(gap);
+        fit = fit_at_rank(cohort, spec, rank, Some(&start), None, reference_refinement)?;
     }
     fit.rank_path = rank_path;
     fit.atom_evidence = atom_evidence;
-    fit.normaliser_rounds = normaliser_rounds;
-    fit.reference_risk_mass = reference_risk_mass;
-    fit.reference_masks = reference_masks;
-    fit.normaliser_settled = normaliser_settled;
-    fit.reference_certificate = reference_certificate;
-    fit.reference_normaliser = reference_normaliser;
     Ok(fit)
+}
+
+/// Fit and select structure under one reference-normalised objective, then
+/// verify reference discretisation at fixed coefficients. If unresolved,
+/// repeat selection under the refined objective; never reinterpret a rank
+/// selected under stationary-prior centring as reference-law evidence.
+pub fn fit_event_history(
+    cohort: &mut EventHistoryCohort, spec: &EventHistorySpec,
+) -> Result<EventHistoryFit, EventHistoryError> {
+    if !(spec.reference_tolerance.is_finite() && spec.reference_tolerance > 0.0) {
+        return Err(EventHistoryError::InvalidInput { reason: "reference tolerance must be finite and positive".to_string() });
+    }
+    let mut discrepancies = Vec::new();
+    for refinement in 2..=10 {
+        let mut fit = fit_event_history_on_grid(cohort, spec, refinement)?;
+        let Some(strata) = spec.reference.as_ref() else { return Ok(fit); };
+        let refined = reference_tables(cohort, strata, &fit.frozen_specs,
+            spec.quadrature_order, refinement + 1, &fit.nodes)?;
+        let fine_family = fit.family.clone().with_reference(Some(Arc::new(refined)));
+        let fine = fine_family.refresh_normaliser(&fit.fit.block_states)
+            .map_err(|reason| EventHistoryError::Fit { reason })?;
+        let coarse = fit.family.reference.as_ref().unwrap();
+        let coarse_nodes = coarse.grid.len();
+        let fine_nodes = fine_family.reference.as_ref().unwrap().grid.len();
+        let mut gap = 0.0_f64;
+        // Compare on the fine grid, including midpoints and BOTH endpoints.
+        for s in 0..strata.strata() {
+            for n in 0..fine_nodes {
+                let (low, weight) = coarse.grid.locate(fine_family.reference.as_ref().unwrap().grid.times[n])?;
+                for (a, b, width) in [
+                    (&fit.centring.as_ref().unwrap().log_normaliser, &fine.log_normaliser, fit.marks()),
+                    (&fit.centring.as_ref().unwrap().log_risk_mass, &fine.log_risk_mass, fine.masks),
+                ] {
+                    for d in 0..width {
+                        let left = a[(s * coarse_nodes + low) * width + d];
+                        let right = a[(s * coarse_nodes + low + 1) * width + d];
+                        gap = gap.max((left + weight * (right - left) - b[(s * fine_nodes + n) * width + d]).abs());
+                    }
+                }
+            }
+        }
+        if !gap.is_finite() { return Err(EventHistoryError::NumericalFailure {
+            reason: "non-finite reference refinement discrepancy".to_string(),
+        }); }
+        discrepancies.push(gap);
+        log::info!("[event-history] reference refinement {refinement}: fixed-parameter discrepancy {gap:.3e} nats");
+        if gap <= spec.reference_tolerance {
+            fit.reference_certificate = Some(gap);
+            fit.reference_refinements = discrepancies;
+            return Ok(fit);
+        }
+    }
+    Err(EventHistoryError::NumericalFailure {
+        reason: format!("reference evolution unresolved after refinement: {:?}", discrepancies),
+    })
 }

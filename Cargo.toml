@@ -47,6 +47,7 @@ members = [
     "crates/gam-model-kernels",
     "crates/gam-custom-family",
     "crates/gam-models",
+    "crates/gam-event-history",
     "crates/gam-row-macros",
     "crates/gam-inference",
     "crates/gam-report",
@@ -107,6 +108,7 @@ gam-identifiability = { path = "crates/gam-identifiability", version = "=0.3.157
 gam-terms = { path = "crates/gam-terms", version = "=0.3.157" }
 gam-solve = { path = "crates/gam-solve", version = "=0.3.157" }
 gam-models = { path = "crates/gam-models", version = "=0.3.157" }
+gam-event-history = { path = "crates/gam-event-history", version = "=0.3.157" }
 gam-inference = { path = "crates/gam-inference", version = "=0.3.157" }
 gam-predict = { path = "crates/gam-predict", version = "=0.3.157" }
 gam-report = { path = "crates/gam-report", version = "=0.3.157" }
@@ -326,6 +328,15 @@ codegen-units = 1
 # every crate whose runtime was actually measured to need it; this override is
 # scoped to the one crate where the cost was measured and the benefit was not.
 [profile.test.package.gam-models]
+codegen-units = 16
+
+[profile.test.package.gam-event-history]
+codegen-units = 16
+
+[profile.test.package.gam-custom-family]
+codegen-units = 16
+
+[profile.test.package.gam-terms]
 codegen-units = 16
 
 # The solver's test target also needs parallel code generation. On MSI acn112,

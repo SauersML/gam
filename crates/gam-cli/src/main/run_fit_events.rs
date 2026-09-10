@@ -3,7 +3,7 @@
 
 use crate::cli_args::FitEventsArgs;
 use gam::families::custom_family::BlockwiseFitOptions;
-use gam::families::event_history::{
+use gam::event_history::{
     CovariateSegment, Event, EventHistoryCohort, EventHistorySpec, ForecastRequest, FutureSegment,
     MarkKind, PopulationForecastRequest, ReferenceStrata, SubjectHistory,
     covariate_spec_from_formula, design_rows, fit_event_history, forecast, latent_state,
@@ -76,7 +76,7 @@ fn encode_column(values: &[&str], name: &str) -> (Vec<f64>, Vec<String>) {
     (codes, levels)
 }
 
-fn forecast_json(f: &gam::families::event_history::Forecast) -> Value {
+fn forecast_json(f: &gam::event_history::Forecast) -> Value {
     json!({
         "horizons": f.horizons,
         "survival": f.survival,
@@ -258,20 +258,17 @@ pub(crate) fn run_fit_events(args: FitEventsArgs) -> Result<(), String> {
             }
             Some(name) => {
                 let values = column(&subject_headers, &subject_rows, name, &args.subjects)?;
-                let mut levels: Vec<String> = values.iter().map(|v| (*v).to_string()).collect();
-                levels.sort();
-                levels.dedup();
-                if levels.len() != args.reference_row.len() {
-                    return Err(format!(
-                        "column {name:?} has {} distinct values but {} --reference-row profiles were given",
-                        levels.len(),
-                        args.reference_row.len()
-                    ));
-                }
                 values
                     .iter()
-                    .map(|v| levels.iter().position(|l| l == v).expect("level present"))
-                    .collect()
+                    .map(|v| {
+                        let index = v.parse::<usize>().map_err(|_| format!(
+                            "reference stratum {v:?} in column {name:?} must be a nonnegative integer index"))?;
+                        if index >= args.reference_row.len() {
+                            return Err(format!("reference stratum {index} is outside the {} reference profiles", args.reference_row.len()));
+                        }
+                        Ok(index)
+                    })
+                    .collect::<Result<Vec<_>, String>>()?
             }
         };
         subject_stratum = assigned;
@@ -311,13 +308,12 @@ pub(crate) fn run_fit_events(args: FitEventsArgs) -> Result<(), String> {
     );
     summary.insert("rank".to_string(), json!(fit.rank()));
     if spec.reference.is_some() {
-        // How far the held risk-set normaliser moved at each re-centring
-        // round: the last of them is how far the alternation settled.
+        // Reference-grid discrepancies evaluated at fixed coefficients.
         summary.insert(
-            "normaliser_rounds".to_string(),
-            json!(fit.normaliser_rounds),
+            "reference_refinements".to_string(),
+            json!(fit.reference_refinements),
         );
-        summary.insert("reference_masks".to_string(), json!(fit.reference_masks));
+        summary.insert("reference_masks".to_string(), json!(fit.centring.as_ref().map_or(0, |c| c.masks)));
         summary.insert(
             "reference_certificate".to_string(),
             json!(fit.reference_certificate),

@@ -9,6 +9,61 @@
 
 use gam_math::nested_dual::JetField;
 
+/// Two independent differentiation directions over another jet. The mixed
+/// component differentiates the *computed* filter, including reference-law
+/// evolution and adaptive grid placement. Nesting over a directional jet
+/// supplies the third and fourth derivatives required by LAML.
+#[derive(Clone, Debug)]
+pub(crate) struct Mixed<S> {
+    pub base: S,
+    pub u: S,
+    pub v: S,
+    pub uv: S,
+}
+
+impl<S: JetField> Mixed<S> {
+    pub fn seed(base: S, u: f64, v: f64) -> Self {
+        Self { u: base.constant_like(u), v: base.constant_like(v),
+            uv: base.constant_like(0.0), base }
+    }
+}
+
+impl<S: JetField> JetField for Mixed<S> {
+    fn value(&self) -> f64 { self.base.value() }
+    fn add(&self, other: &Self) -> Self {
+        Self { base: self.base.add(&other.base), u: self.u.add(&other.u),
+            v: self.v.add(&other.v), uv: self.uv.add(&other.uv) }
+    }
+    fn sub(&self, other: &Self) -> Self { self.add(&other.neg()) }
+    fn neg(&self) -> Self { self.scale(-1.0) }
+    fn scale(&self, factor: f64) -> Self {
+        Self { base: self.base.scale(factor), u: self.u.scale(factor),
+            v: self.v.scale(factor), uv: self.uv.scale(factor) }
+    }
+    fn mul(&self, other: &Self) -> Self {
+        Self {
+            base: self.base.mul(&other.base),
+            u: self.u.mul(&other.base).add(&self.base.mul(&other.u)),
+            v: self.v.mul(&other.base).add(&self.base.mul(&other.v)),
+            uv: self.uv.mul(&other.base).add(&self.u.mul(&other.v))
+                .add(&self.v.mul(&other.u)).add(&self.base.mul(&other.uv)),
+        }
+    }
+    fn compose_unary(&self, d: [f64; 5]) -> Self {
+        let first = self.base.compose_unary([d[1], d[2], d[3], d[4], 0.0]);
+        let second = self.base.compose_unary([d[2], d[3], d[4], 0.0, 0.0]);
+        Self { base: self.base.compose_unary(d), u: first.mul(&self.u),
+            v: first.mul(&self.v),
+            uv: first.mul(&self.uv).add(&second.mul(&self.u).mul(&self.v)) }
+    }
+    fn constant_like(&self, value: f64) -> Self {
+        Self::seed(self.base.constant_like(value), 0.0, 0.0)
+    }
+    fn with_value(&self, value: f64) -> Self {
+        Self { base: self.base.with_value(value), ..self.clone() }
+    }
+}
+
 /// `exp(x)`.
 #[inline]
 pub(crate) fn exp<S: JetField>(x: &S) -> S {

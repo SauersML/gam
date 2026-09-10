@@ -5,7 +5,7 @@
 
 use crate::ffi::ffi_errors::{detach_py_result, py_value_error};
 use gam::families::custom_family::BlockwiseFitOptions;
-use gam::families::event_history::{
+use gam::event_history::{
     CovariateSegment, Event, EventHistoryCohort, EventHistoryFit, EventHistorySpec,
     ForecastRequest, FutureSegment, HistoryForecastRequest, MarkKind, PopulationForecastRequest,
     ReferenceStrata, SubjectHistory, covariate_spec_from_formula, design_rows, fit_event_history,
@@ -37,7 +37,7 @@ fn future_segments(future: Vec<(f64, Vec<f64>)>) -> Vec<FutureSegment> {
 
 fn forecast_dict<'py>(
     py: Python<'py>,
-    result: gam::families::event_history::Forecast,
+    result: gam::event_history::Forecast,
 ) -> PyResult<Bound<'py, PyDict>> {
     let out = PyDict::new(py);
     out.set_item("horizons", result.horizons)?;
@@ -83,14 +83,14 @@ impl PyEventHistoryModel {
         self.fit.rank()
     }
 
-    /// How far the held risk-set normaliser moved at each re-centring round,
-    /// in nats; empty when the baselines are centred on the stationary prior.
-    fn normaliser_rounds(&self) -> Vec<f64> {
-        self.fit.normaliser_rounds.clone()
+    /// Fixed-parameter reference-grid discrepancies in nats; empty for
+    /// stationary-prior centring.
+    fn reference_refinements(&self) -> Vec<f64> {
+        self.fit.reference_refinements.clone()
     }
 
     fn reference_masks(&self) -> usize {
-        self.fit.reference_masks
+        self.fit.centring.as_ref().map_or(0, |c| c.masks)
     }
 
     /// The largest disagreement, in nats, between the reference grid the
@@ -221,6 +221,24 @@ impl PyEventHistoryModel {
             )));
         }
         Ok(self.fit.mark_coefficients(mark).to_vec())
+    }
+
+    fn baseline_rates<'py>(&self, py: Python<'py>, values: Vec<f64>, times: Vec<f64>, stratum: usize) -> PyResult<Bound<'py, PyArray2<f64>>> {
+        if values.len() != self.cohort.covariate_names.len() {
+            return Err(py_value_error("baseline covariate width differs from the fitted schema".to_string()));
+        }
+        let mut rows = Array2::zeros((times.len(), values.len() + 1));
+        for (n, &time) in times.iter().enumerate() {
+            self.fit.risk_set_normaliser_at(stratum, time).map_err(|e| py_value_error(e.to_string()))?;
+            for (j, &value) in values.iter().enumerate() { rows[[n, j]] = value; }
+            rows[[n, values.len()]] = time;
+        }
+        let rates = gam::event_history::baseline_log_rates(&self.fit, rows.view())
+            .map_err(|e| py_value_error(e.to_string()))?.mapv(f64::exp);
+        if rates.iter().any(|x| !x.is_finite()) {
+            return Err(py_value_error("baseline rate exceeds floating-point range".to_string()));
+        }
+        Ok(PyArray2::from_owned_array(py, rates))
     }
 
     fn quadrature<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
@@ -563,7 +581,7 @@ fn fit_event_history(
         let fit = fit_event_history(&mut cohort, &spec).map_err(|e| e.to_string())?;
         Ok((fit, cohort))
     })?;
-    let strata = if fit.reference_normaliser.is_empty() {
+    let strata = if fit.centring.is_none() {
         vec![0usize; cohort.subjects.len()]
     } else {
         subject_strata

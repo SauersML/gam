@@ -408,26 +408,19 @@ pub(crate) fn node_likelihood<S: JetField>(
         let base = centred_baseline(&eta0[d], loadings_d, log_normaliser.map(|m| &m[d]));
         let y = counts[d];
         informative.push(exposure != 0.0);
-        // The latent part of the intensity factorises over the grid's axes:
-        // `exp(Σ_k a_k z_k) = Π_k exp(a_k z_k)`, and each axis takes only
-        // `order` distinct coordinates however many points the product grid
-        // has. One table of exponentials per axis therefore replaces one
-        // exponential per state — `atoms · order` of them instead of
-        // `order^atoms` — which is the difference between a cost linear in
-        // the atoms and one exponential in them, at the point where the
-        // exponential is the expensive operation on a dual scalar.
+        // Cache the axis contributions in log space. Exponentiating them
+        // separately can produce 0 * infinity for a finite combined rate.
         let latent: Option<Vec<Vec<S>>> = (exposure != 0.0).then(|| {
             (0..atoms)
                 .map(|k| {
                     grid.axes[k]
                         .points
                         .iter()
-                        .map(|z| exp(&loadings_d[k].mul(z)))
+                        .map(|z| loadings_d[k].mul(z))
                         .collect()
                 })
                 .collect()
         });
-        let scaled_base = latent.as_ref().map(|_| exp(&base).scale(exposure));
         for i in 0..size {
             if y != 0.0 {
                 let mut eta = base.clone();
@@ -439,12 +432,13 @@ pub(crate) fn node_likelihood<S: JetField>(
             // A mark with no exposure at this node has no compensator and so
             // no curvature: its intensity is never formed, which is the work
             // the risk sets save.
-            match (&latent, &scaled_base) {
-                (Some(tables), Some(front)) => {
-                    let mut c = front.clone();
+            match &latent {
+                Some(tables) => {
+                    let mut log_c = base.clone();
                     for (k, table) in tables.iter().enumerate() {
-                        c = c.mul(&table[grid.index(i, k)]);
+                        log_c = log_c.add(&table[grid.index(i, k)]);
                     }
+                    let c = exp(&add_real(&log_c, exposure.ln()));
                     ell[i] = ell[i].sub(&c);
                     if derivatives {
                         score.push(add_real(&c.scale(-1.0), y));
@@ -1398,8 +1392,8 @@ struct Smoothed<S> {
 /// `log β_n = log E[lik_{n+1} β_{n+1} / c_{n+1} | z_n]`, a bounded smooth
 /// function, plus — for the derivatives — the smoothed innovation moments
 /// `E[Π_k u_k^{e_k} | z_n, data]` of every gap, which the gap scores need.
-/// The `S × S` kernel of a gap exists only while that gap is being reduced
-/// to those moments.
+/// Kernel rows are streamed and reduced to those moments; no `S × S`
+/// allocation is formed.
 ///
 /// `β` alone overflows on a wide hull (it is a future-likelihood ratio,
 /// astronomically large where the filtered density is astronomically
@@ -1474,7 +1468,6 @@ fn backward_smoother<S: JetField>(
         // evaluated exactly at every inner point; only the smoother residual
         // `log β_{n+1}` is interpolated.
         let bases = backward_axis_bases(gh, grid, next, transitions);
-        let at_inner = interpolate_at_inner_points(gh.order, &bases, &log_beta[n + 1]);
         let log_c = ln(&filtered[n + 1].normaliser);
         let shift = filtered[n + 1].likelihood.shift;
         let node_log_lik = |zeta: &[S]| -> S {
@@ -1507,6 +1500,7 @@ fn backward_smoother<S: JetField>(
             .map(|e| (e.clone(), Vec::with_capacity(size)))
             .collect();
         for i in 0..size {
+            let at_inner = interpolate_at_inner_points(gh.order, &bases, &log_beta[n + 1], i);
             let terms: Vec<S> = (0..inner_count)
                 .map(|l| {
                     let mut rest_i = i;
@@ -1521,7 +1515,7 @@ fn backward_smoother<S: JetField>(
                         })
                         .collect();
                     add_real(
-                        &node_log_lik(&zeta).add(&at_inner[i * inner_count + l]),
+                        &node_log_lik(&zeta).add(&at_inner[l]),
                         log_inner_weights[l],
                     )
                 })

@@ -79,7 +79,6 @@ pub mod bms;
 pub(crate) mod coefficient_cost;
 pub mod gpu_kernels;
 pub mod custom_family;
-pub mod event_history;
 pub(crate) mod exact_mode_branch;
 pub mod family_runtime;
 pub(crate) mod fnv1a;

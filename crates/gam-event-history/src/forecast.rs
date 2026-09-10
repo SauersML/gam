@@ -174,15 +174,12 @@ pub struct SpellPit {
 /// out would evaluate a different model from the one that was fitted — one
 /// whose baselines are rates over the cohort as it started — and the
 /// difference is exactly the selection the centring exists to account for.
-fn forecast_normaliser(fit: &EventHistoryFit, stratum: usize, times: &[f64]) -> Option<Vec<f64>> {
-    if fit.reference_normaliser.is_empty() {
-        return None;
-    }
+fn forecast_normaliser(fit: &EventHistoryFit, stratum: usize, times: &[f64]) -> Result<Option<Vec<f64>>, EventHistoryError> {
     let mut out = Vec::with_capacity(times.len() * fit.marks());
     for &t in times {
-        out.extend(fit.risk_set_normaliser_at(stratum, t));
+        out.extend(fit.risk_set_normaliser_at(stratum, t)?);
     }
-    Some(out)
+    Ok((!out.is_empty()).then_some(out))
 }
 
 fn single_subject_nodes(
@@ -246,6 +243,20 @@ fn node_eta0(
     Ok(eta0)
 }
 
+/// The fitted baseline surfaces, evaluated directly on covariate rows with
+/// time in the last column. This is distinct from averaging individual
+/// forecasts under an entry-conditioned population.
+pub fn baseline_log_rates(fit: &EventHistoryFit, rows: ArrayView2<'_, f64>) -> Result<Array2<f64>, EventHistoryError> {
+    if rows.ncols() != fit.nodes.time_column + 1 || rows.iter().any(|x| !x.is_finite()) {
+        return Err(EventHistoryError::InvalidInput {
+            reason: "baseline rows need finite covariates followed by time".to_string(),
+        });
+    }
+    let values = node_eta0(fit, rows)?;
+    Array2::from_shape_vec((rows.nrows(), fit.marks()), values)
+        .map_err(|error| EventHistoryError::InvalidInput { reason: error.to_string() })
+}
+
 /// The smoothed latent state of one subject: at every node of its history,
 /// the posterior mean of the atoms and their posterior covariance given the
 /// whole history. This is the quantity a discovery analysis wants — with its
@@ -273,7 +284,7 @@ pub fn latent_state(
     let nodes = single_subject_nodes(fit, cohort, cohort.covariates.view(), history)?;
     let eta0 = node_eta0(fit, nodes.node_data.view())?;
     let subject = &nodes.subjects[0];
-    let normaliser = forecast_normaliser(fit, stratum, &subject.times);
+    let normaliser = forecast_normaliser(fit, stratum, &subject.times)?;
     let moments = latent_state_moments(&SubjectInputs {
         nodes: subject,
         eta0: &eta0,
@@ -338,12 +349,11 @@ fn observed_state(
     stratum: usize,
     loadings: &[f64],
     rates: &[f64],
+    compensated: &[bool],
 ) -> Result<LatentState, EventHistoryError> {
-    let marks = fit.marks();
     let observed = single_subject_nodes(fit, cohort, table, history)?;
     let eta0 = node_eta0(fit, observed.node_data.view())?;
-    let all_marks = vec![true; marks];
-    let normaliser = forecast_normaliser(fit, stratum, &observed.subjects[0].times);
+    let normaliser = forecast_normaliser(fit, stratum, &observed.subjects[0].times)?;
     let mut pass = forward_filter(
         &SubjectInputs {
             nodes: &observed.subjects[0],
@@ -357,7 +367,7 @@ fn observed_state(
             log_normaliser: normaliser.as_deref(),
         },
         None,
-        &all_marks,
+        compensated,
     )?;
     let last = observed.subjects[0].len() - 1;
     Ok(LatentState {
@@ -572,7 +582,7 @@ fn run_window(window: Window<'_>) -> Result<Forecast, EventHistoryError> {
                       eta: &[f64]|
          -> Result<ForwardPass<f64>, EventHistoryError> {
             let nodes = future_chain(times, weights, &exposed, marks);
-            let normaliser = forecast_normaliser(fit, stratum, times);
+            let normaliser = forecast_normaliser(fit, stratum, times)?;
             forward_filter(
                 &SubjectInputs {
                     nodes: &nodes,
@@ -604,7 +614,7 @@ fn run_window(window: Window<'_>) -> Result<Forecast, EventHistoryError> {
                 let pass = filter(&state, &times, &weights, &chain_eta)?;
                 let log_s_j: f64 = log_s + pass.log_normalisers.iter().sum::<f64>();
                 let last = times.len() - 1;
-                let at_j = forecast_normaliser(fit, stratum, &[t_j]);
+                let at_j = forecast_normaliser(fit, stratum, &[t_j])?;
                 let intensities = expected_intensities(
                     &pass.grids[last],
                     &pass.predicted[last],
@@ -803,7 +813,9 @@ fn forecast_on_table(
             reason: "the forecast cohort's mark kinds differ from the fit's".to_string(),
         });
     }
+    fit.risk_set_normaliser_at(stratum, history.entry)?;
     validate_horizons(horizons, history.exit)?;
+    fit.risk_set_normaliser_at(stratum, horizons[horizons.len() - 1])?;
     let last_horizon = horizons[horizons.len() - 1];
     validate_future(cohort, future, last_horizon)?;
     // A subject whose follow-up ended with a terminal event has no future:
@@ -816,7 +828,7 @@ fn forecast_on_table(
         });
     }
     let (loadings, rates) = latent_parameters(fit);
-    let state = observed_state(fit, cohort, table, history, stratum, &loadings, &rates)?;
+    let state = observed_state(fit, cohort, table, history, stratum, &loadings, &rates, &vec![true; marks])?;
     let (table, segments) = future_table(
         table,
         future,
@@ -860,7 +872,9 @@ pub fn population_forecast(
             reason: "the window's start must be finite".to_string(),
         });
     }
+    fit.risk_set_normaliser_at(request.stratum, request.start)?;
     validate_horizons(request.horizons, request.start)?;
+    fit.risk_set_normaliser_at(request.stratum, request.horizons[request.horizons.len() - 1])?;
     let last_horizon = request.horizons[request.horizons.len() - 1];
     validate_future(cohort, request.future, last_horizon)?;
     let (table, segments) = future_table(
@@ -870,11 +884,29 @@ pub fn population_forecast(
         None,
     )?;
     let at_risk = vec![true; marks];
+    // Population forecasts describe people alive and free of once-only
+    // diagnoses at start. Under reference centring they enter from that
+    // selected reference law, not a fresh stationary draw at the late time.
+    // Recurrent events are unobserved here and are integrated out.
+    let initial = if let Some(snapshot) = fit.centring.as_ref() {
+        let origin = snapshot.grid.times[0];
+        if request.start > origin {
+            let history = SubjectHistory {
+                id: "reference::entry".to_string(), entry: origin, exit: request.start,
+                events: Vec::new(),
+                segments: vec![CovariateSegment { start: origin, row: request.stratum }],
+            };
+            let (loadings, rates) = latent_parameters(fit);
+            let compensated: Vec<bool> = fit.mark_kinds.iter().map(|kind| *kind != MarkKind::Recurrent).collect();
+            Some(observed_state(fit, cohort, snapshot.profiles.view(), &history,
+                request.stratum, &loadings, &rates, &compensated)?)
+        } else { None }
+    } else { None };
     run_window(Window {
         fit,
         cohort,
         stratum: request.stratum,
-        initial: None,
+        initial: initial.as_ref(),
         start: request.start,
         horizons: request.horizons,
         segments,
@@ -901,7 +933,7 @@ pub fn predictive_pit(
     let nodes = single_subject_nodes(fit, cohort, cohort.covariates.view(), history)?;
     let eta0 = node_eta0(fit, nodes.node_data.view())?;
     let subject = &nodes.subjects[0];
-    let normaliser = forecast_normaliser(fit, stratum, &subject.times);
+    let normaliser = forecast_normaliser(fit, stratum, &subject.times)?;
     let pass = forward_filter(
         &SubjectInputs {
             nodes: subject,

@@ -3543,6 +3543,7 @@ dependencies = [
  "faer",
  "gam-config",
  "gam-data",
+ "gam-event-history",
  "gam-geometry",
  "gam-gpu",
  "gam-identifiability",
@@ -3645,6 +3646,28 @@ dependencies = [
  "rayon",
  "serde",
  "tempfile",
+]
+
+[[package]]
+name = "gam-event-history"
+version = "0.3.157"
+dependencies = [
+ "faer",
+ "gam-custom-family",
+ "gam-data",
+ "gam-linalg",
+ "gam-math",
+ "gam-model-api",
+ "gam-problem",
+ "gam-runtime",
+ "gam-solve",
+ "gam-terms",
+ "log",
+ "ndarray 0.17.2",
+ "rayon",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.19",
 ]
 
 [[package]]

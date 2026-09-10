@@ -20,7 +20,8 @@ use super::forecast::{
 };
 use super::marginal::{SubjectInputs, subject_marginal};
 use super::preserve::{ReferenceGrid, ReferenceStrata, killing_masks, stratum_normalisers};
-use crate::custom_family::{BlockwiseFitOptions, ParameterBlockState};
+use gam_model_api::families::custom_family::BlockwiseFitOptions;
+use gam_problem::ParameterBlockState;
 use gam_math::jet_scalar::{OneSeed, TwoSeed};
 use gam_math::nested_dual::JetField;
 use gam_terms::smooth::{
@@ -110,23 +111,25 @@ fn forward_operator_is_exact_on_envelope_times_polynomial() {
     // and a linear function wherever the inner point lies inside the hull.
     let bases = backward_axis_bases(&gh, &from, &to, &[transition]);
     let ones = vec![1.0; to.size()];
-    let at_inner = interpolate_at_inner_points(gh.order, &bases, &ones);
-    assert_eq!(at_inner.len(), from.size() * to.size());
-    for (i, v) in at_inner.iter().enumerate() {
-        assert!((v - 1.0).abs() < 1e-9, "constant at inner point {i}: {v}");
+    for i in 0..from.size() {
+        let at_inner = interpolate_at_inner_points(gh.order, &bases, &ones, i);
+        assert_eq!(at_inner.len(), to.size());
+        for v in at_inner {
+            assert!((v - 1.0).abs() < 1e-9, "constant at inner point {i}: {v}");
+        }
     }
     let linear: Vec<f64> = (0..to.size())
         .map(|j| 0.5 + 0.3 * to.coordinate(j, 0))
         .collect();
-    let at_inner = interpolate_at_inner_points(gh.order, &bases, &linear);
     let spread = (2.0 * q).sqrt();
     let hull = gh.nodes[gh.order - 1] * std::f64::consts::SQRT_2 * to.axes[0].sigma;
     for i in 0..from.size() {
+        let at_inner = interpolate_at_inner_points(gh.order, &bases, &linear, i);
         for (l, &x) in gh.nodes.iter().enumerate() {
             let zeta = phi * from.coordinate(i, 0) + spread * x;
             if (zeta - to.axes[0].mu).abs() < hull {
                 let exact = 0.5 + 0.3 * zeta;
-                let got = at_inner[i * to.size() + l];
+                let got = at_inner[l];
                 assert!(
                     (got - exact).abs() < 1e-9,
                     "linear at ({i}, {l}): {got} vs {exact}"
@@ -2124,11 +2127,11 @@ fn dual_loading_derivative_matches_finite_difference_at_zero_loading() {
 #[derive(Clone)]
 struct Traced(EventHistoryFamily);
 
-impl crate::custom_family::CustomFamily for Traced {
+impl gam_model_api::families::custom_family::CustomFamily for Traced {
     fn evaluate(
         &self,
         block_states: &[ParameterBlockState],
-    ) -> Result<crate::custom_family::FamilyEvaluation, String> {
+    ) -> Result<gam_model_api::families::custom_family::FamilyEvaluation, String> {
         let out = self.0.evaluate(block_states)?;
         emit(&format!(
             "[trace] evaluate latent={:?} beta={:?} ll={}",
@@ -2166,12 +2169,12 @@ impl crate::custom_family::CustomFamily for Traced {
     fn levenberg_on_ill_conditioning(&self) -> bool {
         true
     }
-    fn coefficient_hessian_cost(&self, specs: &[crate::custom_family::ParameterBlockSpec]) -> u64 {
+    fn coefficient_hessian_cost(&self, specs: &[gam_problem::ParameterBlockSpec]) -> u64 {
         self.0.coefficient_hessian_cost(specs)
     }
     fn output_channel_assignment(
         &self,
-        specs: &[crate::custom_family::ParameterBlockSpec],
+        specs: &[gam_problem::ParameterBlockSpec],
     ) -> Option<Vec<usize>> {
         self.0.output_channel_assignment(specs)
     }
@@ -2179,7 +2182,7 @@ impl crate::custom_family::CustomFamily for Traced {
         &self,
         block_states: &[ParameterBlockState],
         block_index: usize,
-        block_spec: &crate::custom_family::ParameterBlockSpec,
+        block_spec: &gam_problem::ParameterBlockSpec,
     ) -> gam_problem::CoefficientCoordinate {
         self.0
             .block_coefficient_coordinate(block_states, block_index, block_spec)
@@ -2210,8 +2213,8 @@ impl crate::custom_family::CustomFamily for Traced {
     fn exact_newton_joint_gradient_evaluation(
         &self,
         block_states: &[ParameterBlockState],
-        specs: &[crate::custom_family::ParameterBlockSpec],
-    ) -> Result<Option<crate::custom_family::ExactNewtonJointGradientEvaluation>, String> {
+        specs: &[gam_problem::ParameterBlockSpec],
+    ) -> Result<Option<gam_model_api::families::custom_family::ExactNewtonJointGradientEvaluation>, String> {
         self.0
             .exact_newton_joint_gradient_evaluation(block_states, specs)
     }
@@ -2267,8 +2270,8 @@ fn traced_fixed_lambda_inner_solve_on_the_null_cohort() {
         )
         .expect("latent spec"),
     ];
-    let options = crate::custom_family::BlockwiseFitOptions::default();
-    let result = crate::custom_family::fit_custom_family_fixed_log_lambdas(
+    let options = gam_model_api::families::custom_family::BlockwiseFitOptions::default();
+    let result = gam_custom_family::fit_custom_family_fixed_log_lambdas(
         &Traced(family),
         &specs,
         &options,
@@ -2420,11 +2423,11 @@ fn traced_fixed_lambda_inner_solve_on_the_loaded_cohort_reports_its_cost() {
         )
         .expect("latent spec"),
     ];
-    let options = crate::custom_family::BlockwiseFitOptions::default();
+    let options = gam_model_api::families::custom_family::BlockwiseFitOptions::default();
     let clock = std::time::Instant::now();
     let traced = Traced(family);
     let result =
-        crate::custom_family::fit_custom_family_fixed_log_lambdas(&traced, &specs, &options, None);
+        gam_custom_family::fit_custom_family_fixed_log_lambdas(&traced, &specs, &options, None);
     match result {
         Ok(fit) => {
             emit(&format!(
@@ -3258,7 +3261,7 @@ fn the_quartic_marginal_is_exact_and_the_empirical_bayes_prior_decides_by_the_mo
             break;
         }
     }
-    let exact = DirectionEvidence::Exact(DirectionProfile {
+    let exact = DirectionEvidence::Sampled(DirectionProfile {
         points,
         values,
         slopes,
@@ -3536,52 +3539,32 @@ fn per_mark_formulas_give_each_mark_its_own_terms() {
     assert!(refused.to_string().contains("one per mark"), "{refused}");
 }
 
-/// The risk-set normaliser of a static frailty, computed independently of the
-/// filter it is meant to check: a one-dimensional quadrature over the frailty,
-/// marched on a fine time grid.
-///
-/// With `z ~ N(0, 1)` static and `λ(t, z) = exp(η⁰ − log M(t) + a z)`, the
-/// population still at risk at `t` has density proportional to
-/// `φ(z) exp(−∫₀ᵗ λ(s, z) ds)`, and `M(t) = E[e^{a z} | at risk]` is that
-/// density's own moment. Nothing here shares code with the Gauss-Hermite
-/// filter, so agreement is evidence about the filter and not a tautology.
-fn static_frailty_reference(
-    eta0: f64,
-    loading: f64,
-    times: &[f64],
-    weights: &[f64],
-) -> (Vec<f64>, Vec<f64>) {
+/// Independent continuous-time solution: invert the lognormal Laplace
+/// transform at S(t)=exp(-b t). No temporal recurrence is shared with production.
+fn static_frailty_reference(eta0: f64, loading: f64, times: &[f64]) -> (Vec<f64>, Vec<f64>) {
     let points = 2001;
-    let half_width = 9.0;
-    let step = 2.0 * half_width / (points - 1) as f64;
-    let z: Vec<f64> = (0..points).map(|i| -half_width + step * i as f64).collect();
-    let phi: Vec<f64> = z
-        .iter()
-        .map(|z| (-0.5 * z * z).exp() / (2.0 * std::f64::consts::PI).sqrt())
-        .collect();
+    let step = 18.0 / (points - 1) as f64;
+    let activity: Vec<f64> = (0..points).map(|i| (loading * (-9.0 + step * i as f64)).exp()).collect();
+    let phi: Vec<f64> = (0..points).map(|i| (-0.5 * (-9.0 + step * i as f64).powi(2)).exp()).collect();
     let total: f64 = phi.iter().sum();
-    let mut weight = vec![1.0; points];
-    let mut log_normaliser = Vec::with_capacity(times.len());
-    let mut log_risk_mass = Vec::with_capacity(times.len());
-    for n in 0..times.len() {
-        // The normaliser reads the population still at risk *before* this
-        // node's own killing, which is what makes it predictable.
-        let mass: f64 = (0..points).map(|i| phi[i] * weight[i]).sum();
-        let tilted: f64 = (0..points)
-            .map(|i| phi[i] * weight[i] * (loading * z[i]).exp())
-            .sum();
-        let shift = (tilted / mass).ln();
-        log_normaliser.push(shift);
-        // Then the node's killing, integrated with the node's own weight —
-        // the same quadrature of the compensator the filter uses, so the two
-        // are comparisons of one discretised model rather than of two.
-        for i in 0..points {
-            weight[i] *= (-weights[n] * (eta0 - shift + loading * z[i]).exp()).exp();
+    let mass = |h: f64| -> f64 { activity.iter().zip(&phi).map(|(r, p)| p * (-h * r).exp()).sum::<f64>() / total };
+    let mut normalisers = Vec::new();
+    let mut masses = Vec::new();
+    for &t in times {
+        let target = (-eta0.exp() * t).exp();
+        let mut upper = 1.0;
+        while mass(upper) > target { upper *= 2.0; }
+        let mut lower = 0.0;
+        for _ in 0..55 {
+            let middle = 0.5 * (lower + upper);
+            if mass(middle) > target { lower = middle; } else { upper = middle; }
         }
-        let remaining: f64 = (0..points).map(|i| phi[i] * weight[i]).sum();
-        log_risk_mass.push((remaining / total).ln());
+        let h = 0.5 * (lower + upper);
+        let tilted: f64 = activity.iter().zip(&phi).map(|(r, p)| p * r * (-h * r).exp()).sum::<f64>() / total;
+        normalisers.push((tilted / target).ln());
+        masses.push(target.ln());
     }
-    (log_normaliser, log_risk_mass)
+    (normalisers, masses)
 }
 
 #[test]
@@ -3597,18 +3580,7 @@ fn the_risk_set_normaliser_matches_an_independent_quadrature_of_the_population()
         .map(|n| horizon * n as f64 / (nodes - 1) as f64)
         .collect();
     let gaps: Vec<f64> = times.windows(2).map(|w| w[1] - w[0]).collect();
-    let weights: Vec<f64> = (0..nodes)
-        .map(|n| {
-            let left = if n == 0 { 0.0 } else { gaps[n - 1] };
-            let right = if n + 1 == nodes { 0.0 } else { gaps[n] };
-            0.5 * (left + right)
-        })
-        .collect();
-    let grid = ReferenceGrid {
-        times: times.clone(),
-        gaps,
-        weights,
-    };
+    let grid = ReferenceGrid { times: times.clone(), gaps };
     let gh = GaussHermite::new(15).expect("quadrature");
     let eta0 = vec![eta0_value; nodes];
     let out = stratum_normalisers(
@@ -3623,7 +3595,7 @@ fn the_risk_set_normaliser_matches_an_independent_quadrature_of_the_population()
     )
     .expect("reference population");
     let (expected, expected_mass) =
-        static_frailty_reference(eta0_value, loading, &times, &grid.weights);
+        static_frailty_reference(eta0_value, loading, &times);
     let gap = out
         .log_normaliser
         .iter()
@@ -3705,7 +3677,6 @@ fn without_loadings_the_two_centrings_are_the_same_model() {
     let grid = ReferenceGrid {
         times,
         gaps,
-        weights: vec![0.5; nodes],
     };
     let gh = GaussHermite::new(9).expect("quadrature");
     let eta0: Vec<f64> = (0..nodes * 2).map(|i| -1.0 - 0.01 * i as f64).collect();
@@ -3854,36 +3825,22 @@ fn a_risk_set_centred_fit_reads_its_baseline_as_the_marginal_incidence() {
     emit(&format!(
         "[preserve] rank {} rounds {:?}\n  empirical hazard among those at risk {empirical:.4?}\n  risk-set centred baseline          {centred_rate:.4?}\n  prior centred baseline             {prior_rate:.4?}",
         centred.rank(),
-        centred.normaliser_rounds
+        centred.reference_refinements
     ));
     assert!(
         centred.rank() > 0,
         "the fixture must buy a latent direction for the centrings to differ"
     );
     assert!(
-        !centred.normaliser_rounds.is_empty(),
+        !centred.reference_refinements.is_empty(),
         "a risk-set centred fit must have refreshed its normaliser at least once"
     );
-    // The alternation settles at the level the solves it is made of can
-    // resolve: each round's fit is converged to its own tolerance, and that
-    // noise on the normaliser is a floor the rounds cannot go below. What the
-    // fit has to show is that it reached that floor and that the floor is
-    // small on the scale the normaliser lives on — it is an offset on a log
-    // rate, so a twentieth of a nat is five percent of a rate.
+    assert!(centred.reference_certificate.is_some_and(|gap| gap <= 1e-4));
+    let reevaluated = centred.family.refresh_normaliser(&centred.fit.block_states).unwrap();
+    assert_eq!(centred.centring.as_ref().unwrap().log_normaliser, reevaluated.log_normaliser);
+    assert_eq!(centred.centring.as_ref().unwrap().log_risk_mass, reevaluated.log_risk_mass);
     assert!(
-        centred.normaliser_settled < 0.05,
-        "the re-centring settled at {} nats: {:?}",
-        centred.normaliser_settled,
-        centred.normaliser_rounds
-    );
-    let first = centred.normaliser_rounds[1];
-    assert!(
-        centred.normaliser_settled < 0.2 * first,
-        "the re-centring must improve on its first measured move ({first}), settled at {}",
-        centred.normaliser_settled
-    );
-    assert!(
-        !centred.reference_risk_mass.is_empty() && centred.reference_masks > 0,
+        !centred.centring.as_ref().unwrap().log_risk_mass.is_empty() && centred.centring.as_ref().unwrap().masks > 0,
         "the fit must publish the reference population's own risk mass"
     );
     // The empirical hazard falls over follow-up, which is the selection the
@@ -3913,4 +3870,60 @@ fn a_risk_set_centred_fit_reads_its_baseline_as_the_marginal_incidence() {
         prior_rate[bins - 1],
         centred_rate[bins - 1]
     );
+}
+
+#[test]
+fn finite_combined_log_rate_preserves_value_and_derivatives() {
+    use super::marginal::node_likelihood;
+    use super::scalar::Tangent;
+    let like = Tangent::<1>::seeded(0.0, [0.0]);
+    let grid = Grid::new(&GaussHermite::new(3).unwrap(),
+        &[like.constant_like(800.0)], &[like.constant_like(1.0)], &like);
+    let value = node_likelihood(&grid, &[like.constant_like(-800.0)],
+        &[Tangent::seeded(1.0, [1.0])], &[0.0], &[1.0], None,
+        Some(&[like]), 1, 1, false);
+    assert!((value.ell[1].value + 1.0).abs() < 1e-12);
+    assert!((value.ell[1].grad[0] + 800.0).abs() < 1e-9);
+    assert!(value.ell.iter().all(|value| value.value.is_finite() && value.grad[0].is_finite()));
+}
+
+#[test]
+fn reference_endpoints_are_supported_and_extrapolation_is_rejected() {
+    let grid = ReferenceGrid { times: vec![0.0, 1.0], gaps: vec![1.0] };
+    assert_eq!(grid.locate(0.0).unwrap(), (0, 0.0));
+    assert_eq!(grid.locate(1.0).unwrap(), (0, 1.0));
+    for t in [-0.01, 1.01, f64::NAN, f64::INFINITY] { assert!(grid.locate(t).is_err()); }
+    assert!(ReferenceGrid { times: vec![], gaps: vec![] }.locate(0.0).is_err());
+}
+
+#[test]
+fn reference_grid_and_strata_round_trip_without_changing_positions() {
+    let grid = ReferenceGrid { times: vec![0.1, 1.7, 2.9], gaps: vec![1.7 - 0.1, 2.9 - 1.7] };
+    let strata = ReferenceStrata { rows: (0..12).rev().collect(), subject: vec![10, 2, 11, 0] };
+    let restored: (ReferenceGrid, ReferenceStrata) = serde_json::from_str(
+        &serde_json::to_string(&(grid.clone(), strata.clone())).unwrap()).unwrap();
+    assert_eq!(grid.times, restored.0.times);
+    assert_eq!(grid.gaps, restored.0.gaps);
+    assert_eq!(strata, restored.1);
+    restored.1.validate(4, 12).unwrap();
+}
+
+#[test]
+fn production_reference_grid_converges_to_the_survival_identity() {
+    let gh = GaussHermite::new(15).unwrap();
+    let baseline = -1.2_f64;
+    let target = (-6.0 * baseline.exp()).exp();
+    let mut errors = Vec::new();
+    // These are the production grid's initial resolution and two refinements.
+    for intervals in [36, 72, 144] {
+        let times: Vec<f64> = (0..=intervals).map(|n| 6.0 * n as f64 / intervals as f64).collect();
+        let grid = ReferenceGrid { gaps: times.windows(2).map(|w| w[1] - w[0]).collect(), times };
+        let out = stratum_normalisers(&grid, &vec![baseline; intervals + 1], &[0.9], &[1e-8],
+            1.0, &gh, &[MarkKind::Once], 1).unwrap();
+        errors.push((out.log_risk_mass.last().unwrap().exp() - target).abs());
+    }
+    emit(&format!("continuous-time survival errors: {errors:?}"));
+    assert!(errors[1] < 0.4 * errors[0], "{errors:?}");
+    assert!(errors[2] < 0.4 * errors[1], "{errors:?}");
+    assert!(errors[2] < 2e-5, "{errors:?}");
 }

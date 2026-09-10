@@ -626,56 +626,38 @@ pub(crate) fn backward_axis_bases<S: JetField>(
 }
 
 /// The tensor-product Lagrange interpolant of `values` (on the target grid,
-/// axis 0 fastest) at every backward inner point of every source point:
-/// `out[i * inner + l]` with `i` the source flat index and `l` the inner
-/// flat index, both axis 0 fastest. One axis is contracted at a time, so the
-/// cost is `O(K · G^{2K+1})` rather than `O(G^{3K})`.
+/// axis 0 fastest) at the backward inner points of one source point.
+/// The output indexes the inner point, axis 0 fastest. One axis is
+/// contracted at a time, using O(G^K) transient storage.
 pub(crate) fn interpolate_at_inner_points<S: JetField>(
-    order: usize,
-    bases: &[Vec<S>],
-    values: &[S],
+    order: usize, bases: &[Vec<S>], values: &[S], source: usize,
 ) -> Vec<S> {
     let g = order;
-    let axes = bases.len();
     let zero = values[0].constant_like(0.0);
-    // Layout of `cur`: processed axes first as pairs `i_k · G + l_k` (each of
-    // size G², axis 0 fastest), then the unprocessed target indices `j_k`.
-    let mut cur: Vec<S> = values.to_vec();
-    for a in 0..axes {
-        let processed = (g * g).pow(a as u32);
-        let rest = g.pow((axes - a - 1) as u32);
-        let mut next = vec![zero.clone(); processed * g * g * rest];
-        for r in 0..rest {
-            for pair in 0..g * g {
-                for p in 0..processed {
+    let mut cur = values.to_vec();
+    let mut stride = 1;
+    // Contract one source row at a time. Every intermediate has G^K
+    // entries; no all-source G^(2K) kernel is ever materialised.
+    for basis in bases {
+        let source_axis = (source / stride) % g;
+        let blocks = values.len() / (stride * g);
+        let mut next = vec![zero.clone(); values.len()];
+        for block in 0..blocks {
+            for l in 0..g {
+                for inner in 0..stride {
                     let mut acc = zero.clone();
                     for j in 0..g {
-                        acc = acc.add(&bases[a][pair * g + j].mul(&cur[p + processed * (j + g * r)]));
+                        acc = acc.add(&basis[(source_axis * g + l) * g + j]
+                            .mul(&cur[inner + stride * (j + g * block)]));
                     }
-                    next[p + processed * (pair + g * g * r)] = acc;
+                    next[inner + stride * (l + g * block)] = acc;
                 }
             }
         }
         cur = next;
+        stride *= g;
     }
-    let size = g.pow(axes as u32);
-    let mut out = vec![zero; size * size];
-    for (flat, value) in cur.into_iter().enumerate() {
-        let mut rest = flat;
-        let mut i = 0;
-        let mut l = 0;
-        let mut stride = 1;
-        for _ in 0..axes {
-            // `pair = i_k * G + l_k`, the source-major layout of `bases`.
-            let pair = rest % (g * g);
-            rest /= g * g;
-            i += (pair / g) * stride;
-            l += (pair % g) * stride;
-            stride *= g;
-        }
-        out[i * size + l] = value;
-    }
-    out
+    cur
 }
 
 /// `ln Σ exp(terms)`, stabilised by the largest value.

@@ -107,19 +107,17 @@ class EventHistoryModel:
 
     @property
     def rank(self) -> int:
-        """Rank of the latent covariance the evidence supports. The fit grows
-        it from zero: each atom is proposed by the covariance score of the
-        residuals, its loadings get the Gaussian prior whose precision
-        maximises the marginal likelihood, and it is kept exactly when that
-        prior places the loading's posterior mode away from zero."""
+        """Rank selected by the approximate structure search.
+        Residuals propose rates; differentiated likelihood curvature checks
+        loadings, sampled profiles propose priors, and fitted candidates
+        are compared using a Laplace criterion."""
         return int(self._native.rank())
 
     @property
-    def normaliser_rounds(self) -> np.ndarray:
-        """How far the held risk-set normaliser moved at each re-centring
-        round, in nats. Empty when the baselines are centred on the
-        stationary prior; the last entry is how far the alternation settled."""
-        return np.asarray(self._native.normaliser_rounds())
+    def reference_refinements(self) -> np.ndarray:
+        """Fixed-parameter reference-grid discrepancies in nats.
+        The final discrepancy must meet the reference tolerance."""
+        return np.asarray(self._native.reference_refinements())
 
     @property
     def reference_masks(self) -> int:
@@ -137,8 +135,8 @@ class EventHistoryModel:
 
     @property
     def atom_evidence(self) -> np.ndarray:
-        """The evidence each accepted atom's prior bought over the rank
-        before it, in nats."""
+        """Decrease in the fitted Laplace criterion for each accepted atom.
+        This is an approximate structure score, not an exact Bayes factor."""
         return np.asarray(self._native.atom_evidence())
 
     @property
@@ -259,6 +257,16 @@ class EventHistoryModel:
             return self._subject_index[subject]
         return int(subject)
 
+    def baseline_rates(self, covariates: Mapping[str, Any] | Sequence[Any], times: Sequence[float], *, stratum: int = 0) -> np.ndarray:
+        """Evaluate exp(eta0) directly, returning times × marks.
+        The centring law defines the population interpretation of this surface;
+        a late-start population forecast is a different conditional quantity.
+        """
+        return np.asarray(self._native.baseline_rates(
+            self._covariate_values(covariates), [float(t) for t in times],
+            _positional_index(stratum, "stratum"),
+        ))
+
     def _covariate_values(self, covariates: Mapping[str, Any] | Sequence[Any]) -> list[float]:
         names = self.covariate_names
         levels = self.covariate_levels
@@ -336,10 +344,10 @@ class EventHistoryModel:
         *,
         stratum: int = 0,
     ) -> dict[str, Any]:
-        """Forecast a subject with no observed history from covariate values
-        alone: the latent state starts at its stationary prior at ``start``.
-        Population covariate values give the population tier; a subject's own
-        score gives what the model says before its history is seen.
+        """Forecast from covariate values alone. A reference-centred model
+        conditions its reference law on being alive and free of once-only
+        diagnoses at ``start``, integrating over unobserved recurrent events.
+        A prior-centred model begins with its stationary prior at ``start``.
         ``covariates`` is one record (constant over the window) or a sequence
         of ``(start, record)`` pairs whose first start is at or before
         ``start``."""

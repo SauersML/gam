@@ -43,6 +43,9 @@
 
 #![warn(missing_docs)]
 
+/// Joint latent event histories, reference populations, and forecasting.
+pub use gam_event_history as event_history;
+
 /// A compiled copy of the [Rust getting-started guide](crate::getting_started).
 ///
 /// Its documentation is sourced from the repository guide so the example is

@@ -12,7 +12,7 @@
 //! converged, since a timing gate on a shared machine measures the machine.
 
 use gam::families::custom_family::BlockwiseFitOptions;
-use gam::families::event_history::{
+use gam::event_history::{
     CovariateSegment, Event, EventHistoryCohort, MarkKind, SubjectHistory,
     fit_event_history_formula,
 };

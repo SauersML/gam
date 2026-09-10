@@ -153,15 +153,12 @@ def test_risk_set_centring_reads_the_baseline_as_the_incidence_among_those_at_ri
     centred = gamfit.fit_event_history(
         subjects, events, covariates, "s(time)", marks=kinds, reference_profiles=[0]
     )
-    assert prior.normaliser_rounds.size == 0, "the default centring refreshes no normaliser"
+    assert prior.reference_refinements.size == 0, "the default centring refreshes no normaliser"
     assert prior.reference_certificate is None
-    if centred.rank == 0:
-        # Without a resolved latent direction the two centrings are one model.
-        assert centred.normaliser_rounds.size == 0
-        return
-    assert centred.normaliser_rounds.size >= 1
+    assert centred.reference_refinements.size >= 1
     assert centred.reference_masks >= 1
-    assert centred.reference_certificate is not None and centred.reference_certificate >= 0.0
+    assert centred.reference_certificate is not None and 0.0 <= centred.reference_certificate <= 1e-4
+    assert centred.rank > 0, "this fixture must exercise a nontrivial latent normaliser"
 
     # The empirical hazard of mark "a" among those still at risk for it, in
     # bins of one time unit, against the fitted baseline read through the
@@ -180,14 +177,12 @@ def test_risk_set_centring_reads_the_baseline_as_the_incidence_among_those_at_ri
         empirical.append(count / exposure)
     assert empirical[-1] < 0.85 * empirical[0], f"the risk set must be visibly selected: {empirical}"
 
-    # exp(baseline) at a time, read as the expected count over a short window
-    # from the population tier with no history.
-    def baseline(model, t, w=0.02):
-        out = model.population_forecast({"x": 0.0}, start=t, horizons=[t + w])
-        return float(out["expected_counts"][0, 0]) / w
-
-    fitted = [baseline(centred, (b + 0.5) * width) for b in range(bins)]
-    prior_fitted = [baseline(prior, (b + 0.5) * width) for b in range(bins)]
+    # Read the baseline itself. Conditioning a population forecast on all
+    # once-only diseases being absent does not estimate a single mark's
+    # marginal hazard among everyone still at risk for that mark.
+    times = [(b + 0.5) * width for b in range(bins)]
+    fitted = centred.baseline_rates({"x": 0.0}, times)[:, 0]
+    prior_fitted = prior.baseline_rates({"x": 0.0}, times)[:, 0]
     for b in range(bins):
         assert abs(fitted[b] - empirical[b]) / empirical[b] < 0.45, (
             f"bin {b}: risk-set centred {fitted[b]} against empirical {empirical[b]}"
