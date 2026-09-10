@@ -155,12 +155,6 @@ pub struct EventHistoryFamily {
     cache: Arc<Mutex<Option<(Vec<f64>, Arc<JointEvaluation>)>>>,
 }
 
-/// Whether a round's residual improved on the one before it, so that the two
-/// of them measure a contraction rather than a divergence.
-fn before_is_smaller(moved: f64, previous: Option<f64>) -> bool {
-    previous.is_none_or(|before| moved < before)
-}
-
 /// The mesh refinement the reference population is run on.
 ///
 /// It is deliberately not the fit's current refinement. The fit refines its
@@ -1407,7 +1401,7 @@ impl EventHistorySpec {
             gauss_hermite_order: 9,
             quadrature_tolerance: 5e-2,
             reference: None,
-            normaliser_rounds: 16,
+            normaliser_rounds: 24,
             normaliser_tolerance: 1e-4,
             options: BlockwiseFitOptions::default(),
         }
@@ -3029,7 +3023,8 @@ pub fn fit_event_history(
     let mut reference_masks = 0usize;
     if spec.reference.is_some() && fit.rank() > 0 {
         let mut held: Option<Arc<Vec<f64>>> = None;
-        let mut previous_residual: Option<f64> = None;
+        let mut previous_point: Option<Vec<f64>> = None;
+        let mut previous_residual: Option<Vec<f64>> = None;
         for _ in 0..spec.normaliser_rounds {
             let centring = fit
                 .family
@@ -3059,44 +3054,56 @@ pub fn fit_event_history(
                 );
                 break;
             }
-            // The alternation converges linearly — a normaliser shift is
-            // absorbed by the baseline only to the extent the baseline's own
-            // basis can follow its shape, and what is left comes back through
-            // the population's killing at a rate the data decide. Two
-            // successive residuals name that rate, and the geometric series
-            // they imply is summed rather than walked: with residuals `r` and
-            // ratio `ρ = ‖r_k‖/‖r_{k-1}‖`, the limit of `u + r(1 + ρ + ρ² + …)`
-            // is `u + r/(1 − ρ)`. The step is taken only where the ratio is a
-            // contraction the two residuals actually measured; otherwise the
-            // plain alternation stands, which is what keeps a bad ratio from
-            // throwing the iteration somewhere the fit cannot follow.
-            let advance = match (held.as_ref(), residual.as_ref(), previous_residual) {
-                (Some(current), Some(r), Some(before)) if before > 0.0 => {
-                    let ratio = moved / before;
-                    // Sum the series only where the contraction is strong
-                    // enough for a geometric model of it to be worth
-                    // trusting. A ratio near one says the alternation is
-                    // barely contracting, and there the sum asks for a step
-                    // many times the last one on the strength of a rate the
-                    // two residuals have not really established: measured, a
-                    // fourfold step taken at a ratio of 0.8 landed further
-                    // from the fixed point than the plain alternation, and
-                    // the round after it had to walk back. Below half, the
-                    // step is at most double and the model has margin.
-                    if (0.0..0.5).contains(&ratio) {
-                        let gain = 1.0 / (1.0 - ratio);
+            // The alternation contracts linearly and slowly: a shift in the
+            // normaliser is absorbed by the baseline only as far as the
+            // baseline's own basis can follow its shape, and what is left
+            // returns through the population's killing at a rate the data set.
+            // Walking that series costs a solve per term.
+            //
+            // The step taken instead is the secant one — Anderson acceleration
+            // at depth one — on the residual map `r(u) = F(u) − u`. Two points
+            // and their residuals give the linear model of `r` along the
+            // direction between them, and the step is to that model's root:
+            //
+            //   γ = ⟨r_k, Δr⟩ / ‖Δr‖²,   Δr = r_k − r_{k−1},  Δu = u_k − u_{k−1}
+            //   u_{k+1} = u_k + r_k − γ (Δu + Δr).
+            //
+            // It reads the whole residual vector rather than the ratio of two
+            // norms, which is what makes it hold when the contraction is not a
+            // single clean rate. A ratio of norms was tried first and did not:
+            // on a two-mark frailty cohort its fourfold step at an apparent
+            // rate of 0.8 landed further from the fixed point than the plain
+            // alternation, and the rounds after it oscillated. `γ` is bounded
+            // so that a near-parallel pair of residuals — where the secant
+            // model is ill-conditioned and says so through a tiny ‖Δr‖ —
+            // cannot turn into an unbounded step.
+            let advance: Vec<f64> = match (
+                held.as_ref(),
+                residual.as_ref(),
+                &previous_point,
+                &previous_residual,
+            ) {
+                (Some(current), Some(r), Some(before_u), Some(before_r)) => {
+                    let delta_r: Vec<f64> =
+                        r.iter().zip(before_r.iter()).map(|(a, b)| a - b).collect();
+                    let denominator: f64 = delta_r.iter().map(|v| v * v).sum();
+                    let numerator: f64 = r.iter().zip(delta_r.iter()).map(|(a, b)| a * b).sum();
+                    if denominator > 0.0 && numerator.is_finite() {
+                        let gamma = (numerator / denominator).clamp(-2.0, 2.0);
                         log::info!(
-                            "[event-history] risk-set centring round {}: the normaliser moved {moved:.3e} nats, contracting at {ratio:.3}: summing the series ({gain:.2}×)",
+                            "[event-history] risk-set centring round {}: the normaliser moved {moved:.3e} nats; secant step at γ = {gamma:.3}",
                             normaliser_rounds.len()
                         );
                         current
                             .iter()
                             .zip(r.iter())
-                            .map(|(u, r)| u + gain * r)
+                            .zip(before_u.iter())
+                            .zip(delta_r.iter())
+                            .map(|(((u, r), pu), dr)| u + r - gamma * ((u - pu) + dr))
                             .collect()
                     } else {
                         log::info!(
-                            "[event-history] risk-set centring round {}: the normaliser moved {moved:.3e} nats at ratio {ratio:.3}, no contraction to sum",
+                            "[event-history] risk-set centring round {}: the normaliser moved {moved:.3e} nats; the residuals give no secant, stepping plain",
                             normaliser_rounds.len()
                         );
                         next
@@ -3110,10 +3117,10 @@ pub fn fit_event_history(
                     next
                 }
             };
-            // A round that moved further than the one before it has not
-            // measured a contraction, so the round after it starts plain
-            // rather than reading a rate off a worsening pair.
-            previous_residual = (before_is_smaller(moved, previous_residual)).then_some(moved);
+            if let (Some(current), Some(r)) = (held.as_ref(), residual) {
+                previous_point = Some(current.as_ref().clone());
+                previous_residual = Some(r);
+            }
             held = Some(Arc::new(advance));
             let rank = fit.rank();
             let start = RankStart::carried(
