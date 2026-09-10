@@ -107,7 +107,7 @@ use ndarray::{
 
 use std::sync::Arc;
 
-pub(crate) use gam_solve::arrow_schur::{ArrowBetaGaugeQuotient, ArrowProximalCorrectionOptions, ArrowRowBlock, ArrowSchurError, ArrowSchurSystem, ArrowSolveOptions, ArrowSolverMode, BetaPenaltyOp, CompositePenaltyOp, CoupledCarrierPenaltyOp, DensePenaltyOp, DeviceSaePcgData, DeviceSaeSmoothBlock, FactoredFrameGBlock, FactoredFrameKroneckerOp, IdentityRightKroneckerPenaltyOp, SparseBlockKroneckerPenaltyOp, SparseGBlock, StreamingArrowSchur, matrix_free_arrow_inverse_apply, matrix_free_arrow_operator_apply, prepare_sae_resident_frame, row_sub_floor_null_directions, solve_arrow_newton_step_with_proximal_correction, solve_with_lm_escalation_inner};
+pub(crate) use gam_solve::arrow_schur::{ArrowBetaGaugeQuotient, ArrowProximalCorrectionOptions, ArrowRowBlock, ArrowSchurError, ArrowSchurSystem, ArrowSolveOptions, ArrowSolverMode, BetaPenaltyOp, CompositePenaltyOp, CoupledCarrierPenaltyOp, DensePenaltyOp, DeviceSaePcgData, DeviceSaeSmoothBlock, FactoredFrameGBlock, FactoredFrameKroneckerOp, IdentityRightKroneckerPenaltyOp, SparseBlockKroneckerPenaltyOp, SparseGBlock, StreamingArrowSchur, matrix_free_arrow_operator_apply, prepare_sae_resident_frame, row_sub_floor_null_directions, solve_arrow_newton_step_with_proximal_correction, solve_with_lm_escalation_inner};
 
 pub(crate) use gam_terms::analytic_penalties::{
     AnalyticPenalty, AnalyticPenaltyKind, AnalyticPenaltyRegistry, DecoderIncoherencePenalty,

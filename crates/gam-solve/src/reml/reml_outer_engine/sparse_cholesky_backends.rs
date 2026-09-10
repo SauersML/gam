@@ -763,23 +763,40 @@ impl DenseCholeskyOperator {
         // single near-floor eigenvalue dominates both sides), so gating on it
         // costs the speedup only where the floor genuinely bites.
         //
-        // Admit the fast path exactly when that certified gap is inside the
+        // Admit the fast path only when that gap AND the factorization
+        // roundoff estimate are inside the
         // same relative envelope the outer audit applies to the scalar this
         // log-determinant feeds — ONE predicate, named once, reused rather than
-        // re-derived.  The decline is one-sided: it can cost an LLT speedup, it
-        // can never admit a value the derivative lanes disagree with.  Both
-        // call sites already handle `Err` by building the spectral operator.
+        // re-derived. Both call sites use the spectral operator when a
+        // separate value kernel cannot resolve this envelope. The terminal
+        // audit still checks the actual agreement independently.
         let epsilon = spectral_epsilon_for_dim(n);
         let h_inverse = operator.chol.solve_mat(&Array2::<f64>::eye(n));
         let floor_gap_bound =
             epsilon * epsilon * h_inverse.iter().map(|entry| entry * entry).sum::<f64>();
+        // #2834: even when every eigenvalue is far above the smooth floor,
+        // LLT and eigh perturb an assembled H differently. At a legitimate
+        // large smoothing penalty, that O(n*eps*||H||) perturbation changes
+        // log|H| by tr(H^-1 dH). The floor-only check admitted matrices with
+        // an O(eps*kappa(H)) gap hundreds of times larger than the audit.
+        // Budget both kernels' first-order error using the Frobenius duality
+        // bound. The inverse is already available for the floor check, so
+        // this costs only reductions; well-conditioned probes retain LLT.
+        let dimension_roundoff = n as f64 * f64::EPSILON;
+        let gamma_n = dimension_roundoff / (1.0 - dimension_roundoff);
+        let matrix_norm = operator.matrix.iter().fold(0.0_f64, |norm, &v| norm.hypot(v));
+        let inverse_norm = h_inverse.iter().fold(0.0_f64, |norm, &v| norm.hypot(v));
+        let factorization_gap_bound = 2.0 * gamma_n * matrix_norm * inverse_norm;
+        let total_gap_bound = floor_gap_bound + factorization_gap_bound;
         let agreement_envelope =
             crate::rho_optimizer::outer_value_agreement_bound(cached_logdet, cached_logdet);
-        if !(floor_gap_bound <= agreement_envelope) {
+        if !(total_gap_bound <= agreement_envelope) {
             return Err(format!(
                 "DenseCholeskyOperator declines a {n}-dimensional Hessian: its exact \
                  log-determinant can differ from the smooth-floored log|H| the derivative lanes \
-                 price by up to {floor_gap_bound:.3e}, above the {agreement_envelope:.3e} \
+                 price by an estimated {total_gap_bound:.3e} (smooth floor \
+                 {floor_gap_bound:.3e}, factorization roundoff {factorization_gap_bound:.3e}), \
+                 above the {agreement_envelope:.3e} \
                  value-agreement envelope (spectral floor eps={epsilon:.3e})"
             ));
         }
