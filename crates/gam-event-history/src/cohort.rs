@@ -52,7 +52,7 @@ fn invalid(reason: impl Into<String>) -> EventHistoryError {
 }
 
 /// How a mark behaves when it fires.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum MarkKind {
     /// Can fire any number of times during follow-up.
     Recurrent,
