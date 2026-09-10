@@ -180,6 +180,16 @@ vanishes. The reference population's own risk mass is published beside it
 is the check that the baseline is the marginal rate and not a mixture's
 intercept.
 
+Prediction uses the same centring the fit did. The settled normaliser is
+carried on the fit, on the reference grid it was taken on, and every forecast
+interpolates it at the times it asks about — the filtered state of a history,
+the killed integration of a window, the predictive intensities at an event.
+A forecast that left it out would evaluate a different model from the fitted
+one, whose baselines are rates over the cohort as it started, and the gap
+between them is the selection the centring exists for. Every request therefore
+says which reference stratum its person belongs to (`stratum`), since the
+normaliser is a property of a population and a person divides by their own.
+
 The reference population is stratified by covariate profile
 (`ReferenceStrata`), and the identity is exact within a stratum. Across strata
 it holds only where the covariates the strata condition on are the covariates
