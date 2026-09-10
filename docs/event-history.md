@@ -358,6 +358,15 @@ n = model.forecast_history(
     covariates=[(0.0, {"x": 0.3}), (4.0, {"x": 0.1})], horizons=[5.0, 6.0], cutoff=4.0,
 )
 model.pit("subject-17"); model.pit_distance()
+# Centre the baselines on the risk sets: `exp(baseline)` becomes the incidence
+# among those still at risk, not the rate over the cohort as it started. One
+# covariate row per reference stratum, and each subject's stratum.
+model = gamfit.fit_event_history(
+    subjects, events, covariates, "s(time)",
+    marks={"relapse": "once", "death": "terminal"},
+    reference_profiles=[0],
+)
+model.normaliser_rounds, model.reference_masks
 ```
 
 `subjects` has columns `id, entry, exit`; `events` has `id, time, mark`;
@@ -376,6 +385,10 @@ or `(start, record)` pairs — and never consults the training subjects' rows;
 its `cutoff` cuts the history to what was known at that time, so records
 appended after the cutoff cannot change the forecast made there.
 `pit_distance` is the calibration summary described below.
+`reference_profiles` centres the baselines on the risk sets, naming one
+covariate row per reference stratum, with `reference_stratum` giving each
+subject's; `normaliser_rounds` reports how far the held normaliser moved at
+each round.
 
 ## CLI
 
@@ -389,6 +402,11 @@ gam fit-events --subjects s.csv --events e.csv --covariates c.csv \
     --mark-formula "relapse=s(time, by=prs)" --mark-formula "death=s(time)" \
     --marks relapse:recurrent,death:terminal \
     --forecast-cutoff 4 --horizons-after-exit 1,2,5 --out summary.json
+# Baselines that are the incidence among those still at risk, with one
+# reference population per sex:
+gam fit-events --subjects s.csv --events e.csv --covariates c.csv \
+    --formula "s(time)" --marks relapse:once,death:terminal \
+    --reference-row 0 --reference-row 1 --reference-stratum sex --out summary.json
 ```
 
 Covariate columns that do not parse as numbers are categorical. The summary
@@ -403,7 +421,12 @@ forecasts at the given offsets after exit, each beside the same window run
 without the subject's history (`without_history`). With `--forecast-cutoff`
 every subject is forecast from its history cut at the cutoff, the offsets
 count from the cutoff, and subjects not under follow-up at the cutoff are
-skipped (`forecast_skipped`).
+skipped (`forecast_skipped`). `--reference-row` centres the baselines on the
+risk sets, one row of the covariate table per reference stratum, with
+`--reference-stratum` naming the subjects column that assigns them; the
+summary then reports how far the held normaliser moved at each re-centring
+round (`normaliser_rounds`) and how many risk sets the marks define
+(`reference_masks`).
 
 ## Forecasting and calibration
 

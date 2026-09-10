@@ -6,10 +6,11 @@
 use crate::ffi::ffi_errors::{detach_py_result, py_value_error};
 use gam::families::custom_family::BlockwiseFitOptions;
 use gam::families::event_history::{
-    CovariateSegment, Event, EventHistoryCohort, EventHistoryFit, ForecastRequest, FutureSegment,
-    HistoryForecastRequest, MarkKind, PopulationForecastRequest, SubjectHistory,
-    fit_event_history_formulas, forecast, forecast_history, latent_state, pit_uniform_distance,
-    population_forecast, predictive_pit,
+    CovariateSegment, Event, EventHistoryCohort, EventHistoryFit, EventHistorySpec,
+    ForecastRequest, FutureSegment, HistoryForecastRequest, MarkKind, PopulationForecastRequest,
+    ReferenceStrata, SubjectHistory, covariate_spec_from_formula, design_rows, fit_event_history,
+    forecast, forecast_history, latent_state, pit_uniform_distance, population_forecast,
+    predictive_pit,
 };
 use ndarray::{Array2, Array3};
 use numpy::{PyArray1, PyArray2, PyArray3, PyReadonlyArray2};
@@ -77,6 +78,16 @@ impl PyEventHistoryModel {
 
     fn rank(&self) -> usize {
         self.fit.rank()
+    }
+
+    /// How far the held risk-set normaliser moved at each re-centring round,
+    /// in nats; empty when the baselines are centred on the stationary prior.
+    fn normaliser_rounds(&self) -> Vec<f64> {
+        self.fit.normaliser_rounds.clone()
+    }
+
+    fn reference_masks(&self) -> usize {
+        self.fit.reference_masks
     }
 
     fn atom_evidence(&self) -> Vec<f64> {
@@ -419,7 +430,7 @@ impl PyEventHistoryModel {
 
 /// Fit an event-history model from flat arrays.
 #[pyfunction]
-#[pyo3(signature = (mark_names, mark_kinds, covariate_names, covariate_levels, covariates, subject_ids, entry, exit, event_subject, event_time, event_mark, segment_subject, segment_start, segment_row, formulas))]
+#[pyo3(signature = (mark_names, mark_kinds, covariate_names, covariate_levels, covariates, subject_ids, entry, exit, event_subject, event_time, event_mark, segment_subject, segment_start, segment_row, formulas, reference_rows, reference_stratum))]
 fn fit_event_history(
     py: Python<'_>,
     mark_names: Vec<String>,
@@ -437,6 +448,8 @@ fn fit_event_history(
     segment_start: Vec<f64>,
     segment_row: Vec<usize>,
     formulas: Vec<String>,
+    reference_rows: Vec<usize>,
+    reference_stratum: Vec<usize>,
 ) -> PyResult<PyEventHistoryModel> {
     let n = subject_ids.len();
     if entry.len() != n || exit.len() != n {
@@ -498,10 +511,30 @@ fn fit_event_history(
         covariates,
         subjects,
     };
+    // The reference population, when the baselines are to be the incidence
+    // among those still at risk rather than the rate over the cohort as it
+    // started. No rows means the stationary prior's centring, which is the
+    // model the family has always fitted.
+    let reference = if reference_rows.is_empty() {
+        None
+    } else {
+        Some(ReferenceStrata {
+            rows: reference_rows,
+            subject: reference_stratum,
+        })
+    };
     let (fit, cohort) = detach_py_result(py, "event-history fit", move || {
-        let fit =
-            fit_event_history_formulas(&mut cohort, &formulas, BlockwiseFitOptions::default())
-                .map_err(|e| e.to_string())?;
+        cohort.validate().map_err(|e| e.to_string())?;
+        let mut spec = EventHistorySpec::new(Vec::new());
+        let rows = design_rows(&cohort, spec.quadrature_order).map_err(|e| e.to_string())?;
+        spec.covariates = formulas
+            .iter()
+            .map(|formula| covariate_spec_from_formula(formula, rows.view(), &cohort))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?;
+        spec.options = BlockwiseFitOptions::default();
+        spec.reference = reference;
+        let fit = fit_event_history(&mut cohort, &spec).map_err(|e| e.to_string())?;
         Ok((fit, cohort))
     })?;
     Ok(PyEventHistoryModel {

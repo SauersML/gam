@@ -107,6 +107,19 @@ class EventHistoryModel:
         return int(self._native.rank())
 
     @property
+    def normaliser_rounds(self) -> np.ndarray:
+        """How far the held risk-set normaliser moved at each re-centring
+        round, in nats. Empty when the baselines are centred on the
+        stationary prior; the last entry is how far the alternation settled."""
+        return np.asarray(self._native.normaliser_rounds())
+
+    @property
+    def reference_masks(self) -> int:
+        """How many distinct risk sets the marks define, and so how many
+        reference populations the centring ran forward."""
+        return int(self._native.reference_masks())
+
+    @property
     def atom_evidence(self) -> np.ndarray:
         """The evidence each accepted atom's prior bought over the rank
         before it, in nats."""
@@ -414,6 +427,8 @@ def fit_event_history(
     *,
     marks: Mapping[str, str] | Sequence[str] | None = None,
     id_column: str = "id",
+    reference_profiles: Sequence[int] | None = None,
+    reference_stratum: Sequence[Any] | None = None,
 ) -> EventHistoryModel:
     """Fit an event-history model.
 
@@ -438,6 +453,16 @@ def fit_event_history(
     loadings get the Gaussian prior whose precision maximises the marginal
     likelihood, and it enters exactly when that prior places the loading's
     posterior mode away from zero.
+
+    ``reference_profiles`` centres the baselines on the risk sets rather than
+    on the stationary prior: ``exp(baseline)`` becomes the incidence among
+    those still at risk at every time, instead of the rate over the cohort as
+    it started. It names one row of ``covariates`` per reference stratum — the
+    covariate profile that stratum's reference population carries — and
+    ``reference_stratum`` gives each subject's stratum, in the order of the
+    ``subjects`` table, as labels matching those rows' positions. With one
+    profile and no strata every subject shares it. The two centrings are the
+    same model at rank zero, where there are no loadings to centre.
     """
     rust = rust_module()
     subject_values = _column(subjects, id_column)
@@ -506,6 +531,37 @@ def fit_event_history(
         segment_subject.append(index[label])
     segment_start = _column(covariates, "start").astype(float).tolist()
     segment_row = list(range(len(segment_subject)))
+    # The reference population: one covariate row per stratum, and each
+    # subject's stratum. Without profiles the baselines keep the stationary
+    # prior's centring.
+    reference_rows = [int(r) for r in (reference_profiles or [])]
+    if reference_stratum is not None and not reference_rows:
+        raise ValueError("reference_stratum needs reference_profiles to assign subjects to")
+    if not reference_rows:
+        subject_stratum: list[int] = []
+    elif reference_stratum is None:
+        if len(reference_rows) != 1:
+            raise ValueError(
+                f"{len(reference_rows)} reference profiles need reference_stratum to say which subject is in which"
+            )
+        subject_stratum = [0] * len(subject_ids)
+    else:
+        labels = [str(v) for v in reference_stratum]
+        if len(labels) != len(subject_ids):
+            raise ValueError(
+                f"{len(labels)} subject strata for {len(subject_ids)} subjects"
+            )
+        levels = sorted(set(labels))
+        if len(levels) != len(reference_rows):
+            raise ValueError(
+                f"reference_stratum has {len(levels)} distinct values but {len(reference_rows)} profiles were given"
+            )
+        subject_stratum = [levels.index(v) for v in labels]
+    for row in reference_rows:
+        if not 0 <= row < table.shape[0]:
+            raise ValueError(
+                f"reference profile row {row} is outside the {table.shape[0]} covariate rows"
+            )
     native = rust.fit_event_history(
         mark_names,
         mark_kinds,
@@ -522,5 +578,7 @@ def fit_event_history(
         segment_start,
         segment_row,
         [str(formula)] if isinstance(formula, str) else [str(f) for f in formula],
+        reference_rows,
+        subject_stratum,
     )
     return EventHistoryModel(native)
