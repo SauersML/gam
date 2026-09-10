@@ -662,7 +662,12 @@ impl FunctionPriorEvaluation<'_, '_> {
 }
 
 #[cfg(test)]
+#[path = "function_prior_tests.rs"]
+mod test_support;
+
+#[cfg(test)]
 mod tests {
+    use super::test_support::{category_oracle, structural_oracle};
     use super::*;
     use crate::scalar::Mixed;
 
@@ -786,10 +791,10 @@ mod tests {
             let total = rho[prior.decoder_strengths + prior.gaussian.len()].add(&log_level);
             value = value.add(&total).sub(&exp(&total));
         }
-        value = value.add(&category::tests::oracle(&prior.category, theta));
+        value = value.add(&category_oracle(&prior.category, theta));
         for (index, functions) in prior.structural.iter().enumerate() {
             for function in functions {
-                value = value.add(&structural::tests::oracle(
+                value = value.add(&structural_oracle(
                     function,
                     theta,
                     &rho[prior.decoder_strengths + prior.gaussian.len() + 1 + index],
