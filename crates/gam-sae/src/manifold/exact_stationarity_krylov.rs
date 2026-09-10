@@ -525,7 +525,7 @@ mod tests_null_space_policy_2828 {
         })
         .expect("resolved spectrum");
         assert_eq!(values, original);
-        assert_eq!(vectors, Array2::eye(2));
+        assert_eq!(vectors, Array2::<f64>::eye(2));
     }
 
     #[test]

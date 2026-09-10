@@ -1874,12 +1874,9 @@ impl<'a> RemlState<'a> {
         };
         let c_nontrivial = pirls_result.solve_c_nontrivial;
 
-        // Same Cholesky fast path as `build_dense_assembly`: for ValueOnly
-        // evaluations with `Smooth` mode (no Firth and no beta-dependent
-        // Hessian drift), LLT replaces eigh.
-        // `build_dense_original_assembly` is only called when there is no
-        // active constraint free-basis, so the no-hard-constraints condition
-        // is always satisfied here.
+        // All evaluation orders use the spectral operator in this original
+        // basis. Unlike `build_dense_assembly`, there is no value-only
+        // Cholesky shortcut here (#2834).
         // #2644: the ingredients of `H = XᵀWX + Σ λ_k S_k + δI`, in the
         // ORIGINAL basis that `h_total_original` and `self.canonical_penalties`
         // both live in. `reml::laml_logdet` prices `log|H|` from a root of that
