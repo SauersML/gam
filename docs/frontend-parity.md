@@ -49,7 +49,7 @@ Global flags are `--log-level`, `--verbose`/`-v`, and `--quiet`/`-q`.
 | `sample` | `MODEL DATA`; `--chains`, `--samples`, `--warmup`, `--seed`, `--out` |
 | `generate` | `MODEL DATA`; `--n-draws`, `--seed`, `--out` |
 | `report` | `MODEL [DATA] [OUT]` |
-| `fit-events` | `--subjects`, `--events`, `--covariates`, `--formula` or `--mark-formula` (one per mark), `--marks`, `--horizons-after-exit`, `--forecast-cutoff`, `--out` |
+| `fit-events` | `--subjects`, `--events`, `--covariates`, `--formula` or `--mark-formula` (one per mark), `--marks`, `--horizons-after-exit`, `--forecast-cutoff`, `--reference-row`, `--reference-stratum`, `--out` |
 | `crosscoder` | named anchor/block matrices, atom/harmonic counts, sparsity/smoothness/optimizer overrides, transport-law controls, `--out` |
 
 ## Python public fitting, prediction, and diagnostic inventory
