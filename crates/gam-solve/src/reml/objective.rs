@@ -1877,10 +1877,10 @@ impl<'a> RemlState<'a> {
         // All evaluation orders use the spectral operator in this original
         // basis. Unlike `build_dense_assembly`, there is no value-only
         // Cholesky shortcut here (#2834).
-        // #2644: the ingredients of `H = XᵀWX + Σ λ_k S_k + δI`, in the
-        // ORIGINAL basis that `h_total_original` and `self.canonical_penalties`
-        // both live in. `reml::laml_logdet` prices `log|H|` from a root of that
-        // sum instead of from the assembled matrix's spectrum, whose error is
+        // The root must use the applied split-projected penalties, just as
+        // the inner solve and the outer penalty derivatives do (#2834).
+        // `reml::laml_logdet` builds the complete operator from this root
+        // instead of from the assembled matrix's spectrum, whose error is
         // `O(ε·κ(H))` — the residual noise that stalls the outer line search
         // once one λ has run away. It verifies for itself that the root
         // reproduces the caller's `H`, and declines otherwise, so a Firth term,

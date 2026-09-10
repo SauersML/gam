@@ -5200,7 +5200,8 @@ pub(crate) struct EvalShared {
     /// be shown to reproduce this `H`); an empty cell means it has not been
     /// examined yet. Caching it here is what keeps the extra `O(n·p²)` Gram to
     /// once per ρ rather than once per value/gradient/Hessian call at that ρ.
-    pub(crate) root_scale_hessian_operator: std::sync::OnceLock<Option<Arc<reml_outer_engine::DenseSpectralOperator>>>,
+    pub(crate) root_scale_hessian_operator:
+        std::sync::OnceLock<Option<Arc<reml_outer_engine::DenseSpectralOperator>>>,
     /// The penalty components the criterion APPLIES, `S̃_k = Π S_k Π`, in the
     /// ORIGINAL coefficient frame (#2454).
     ///

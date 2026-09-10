@@ -5924,21 +5924,6 @@ impl<'a> RemlState<'a> {
     }
 
     // Accessor methods for private fields
-    /// The λ-selection domain (#2812): per canonical penalty, the
-    /// resolvability interval of the penalty against the weighted design Gram
-    /// on the penalty's columns.
-    pub(crate) fn resolvability_rho_domain(&self) -> (Array1<f64>, Array1<f64>) {
-        let dense = self.x().to_dense();
-        let gram = gam_linalg::faer_ndarray::fast_xt_diag_x(&dense.view(), &self.weights);
-        crate::estimate::rho_domain::resolvability_domain_from_gram_blocks(
-            &gram,
-            self.canonical_penalties
-                .iter()
-                .map(|penalty| (penalty.col_range.clone(), &penalty.local)),
-            self.canonical_penalties.len(),
-        )
-    }
-
     pub(crate) fn x(&self) -> &DesignMatrix {
         &self.x
     }

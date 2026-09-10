@@ -3081,6 +3081,13 @@ where
                 .collect();
             let smoothing_outcome = reml_state.compute_smoothing_correction_auto(
                 &final_rho,
+                // Use the same domain as both standard REML outer routes and
+                // the shipped-point certificate above. A separately estimated
+                // resolvability box need not contain this certified mode.
+                &(
+                    Array1::from_elem(final_rho.len(), -crate::estimate::RHO_BOUND),
+                    Array1::from_elem(final_rho.len(), crate::estimate::RHO_BOUND),
+                ),
                 &lambdas,
                 &pirls_res,
                 beta_covariance_unscaled.as_ref(),
@@ -3946,4 +3953,3 @@ mod negative_binomial_joint_certificate_tests {
     }
 
 }
-

@@ -62,10 +62,11 @@ use gam_linalg::faer_ndarray::FaerSvd;
 use gam_linalg::matrix::DesignMatrix;
 use ndarray::{Array1, Array2, ArrayView1};
 
-use gam_terms::construction::CanonicalPenalty;
 use super::reml_outer_engine::{DenseSpectralOperator, PseudoLogdetMode};
+use gam_terms::construction::CanonicalPenalty;
 
-/// The ingredients of `H = XᵀWX + Σ_k λ_k S_k + δI`, in ONE frame.
+/// The ingredients of `H = XᵀWX + Σ_k λ_k S_k + δI`, in one frame.
+/// Penalties must be the applied split-projected penalties used by the fit.
 pub(crate) struct HessianRootInputs<'a> {
     pub design: &'a DesignMatrix,
     pub weights: ArrayView1<'a, f64>,
@@ -175,7 +176,9 @@ fn root_scale_hessian_operator_inner(
     if p == 0 || h_assembled.ncols() != p || spectrum.len() != p {
         return Err(format!(
             "shape mismatch: p={p}, H is {}x{}, spectrum has {} entries",
-            h_assembled.nrows(), h_assembled.ncols(), spectrum.len()
+            h_assembled.nrows(),
+            h_assembled.ncols(),
+            spectrum.len()
         ));
     }
     if !(inputs.delta.is_finite() && inputs.delta >= 0.0) {
@@ -184,13 +187,16 @@ fn root_scale_hessian_operator_inner(
     if inputs.design.ncols() != p || inputs.design.nrows() != inputs.weights.len() {
         return Err(format!(
             "design is {}x{} against p={p} and {} weights",
-            inputs.design.nrows(), inputs.design.ncols(), inputs.weights.len()
+            inputs.design.nrows(),
+            inputs.design.ncols(),
+            inputs.weights.len()
         ));
     }
     if inputs.lambdas.len() != inputs.penalties.len() {
         return Err(format!(
             "{} lambdas against {} penalties",
-            inputs.lambdas.len(), inputs.penalties.len()
+            inputs.lambdas.len(),
+            inputs.penalties.len()
         ));
     }
     // A negative weight makes `XᵀWX` indefinite, so its root is complex and
@@ -248,7 +254,8 @@ fn root_scale_hessian_operator_inner(
         if end > p || penalty.root.ncols() != end - start {
             return Err(format!(
                 "penalty {k} root is {}x{} against col_range {start}..{end} in p={p}",
-                penalty.root.nrows(), penalty.root.ncols()
+                penalty.root.nrows(),
+                penalty.root.ncols()
             ));
         }
         let scale = lambda.sqrt();
@@ -273,7 +280,10 @@ fn root_scale_hessian_operator_inner(
     if rows.len() < p {
         // Fewer rows than columns: `BᵀB` is singular and `log|H|` is `-inf`
         // for this root, which disagrees with any finite assembled value.
-        return Err(format!("the root has {} rows for p={p} columns", rows.len()));
+        return Err(format!(
+            "the root has {} rows for p={p} columns",
+            rows.len()
+        ));
     }
 
     let mut stacked = Array2::<f64>::zeros((rows.len(), p));
@@ -311,7 +321,10 @@ fn root_scale_hessian_operator_inner(
         .svd(false, true)
         .map_err(|_| "the stacked-root SVD did not converge".to_string())?;
     if singular.len() < p {
-        return Err(format!("SVD returned {} singular values for p={p}", singular.len()));
+        return Err(format!(
+            "SVD returned {} singular values for p={p}",
+            singular.len()
+        ));
     }
     let mut logdet = 0.0_f64;
     for i in 0..p {
@@ -343,7 +356,10 @@ fn root_scale_hessian_operator_inner(
     );
     DenseSpectralOperator::from_eigenpairs(
         singular.mapv(|sigma| sigma * sigma),
-        vectors_t.ok_or_else(|| "root SVD omitted requested right vectors".to_string())?.t().to_owned(),
+        vectors_t
+            .ok_or_else(|| "root SVD omitted requested right vectors".to_string())?
+            .t()
+            .to_owned(),
         mode,
         None,
     )
@@ -443,8 +459,11 @@ mod tests {
         }
         let penalty = CanonicalPenalty::from_dense_root(penalty_root.clone(), p);
 
-        let h = rotate(&d_data) + rotate(&d_pen).mapv(|v| v * lambda) + Array2::<f64>::eye(p) * delta;
-        let spectrum: Vec<f64> = (0..p).map(|i| d_data[i] + lambda * d_pen[i] + delta).collect();
+        let h =
+            rotate(&d_data) + rotate(&d_pen).mapv(|v| v * lambda) + Array2::<f64>::eye(p) * delta;
+        let spectrum: Vec<f64> = (0..p)
+            .map(|i| d_data[i] + lambda * d_pen[i] + delta)
+            .collect();
         let exact: f64 = spectrum.iter().map(|s| s.ln()).sum();
 
         // What the assembled route reports, from its own eigendecomposition of
@@ -469,8 +488,14 @@ mod tests {
             s
         };
         use super::super::reml_outer_engine::HessianFactorization;
-        let operator = root_scale_hessian_operator(&inputs, &h, &sorted_spectrum, assembled, PseudoLogdetMode::PositiveDefinite)
-            .expect("the root reproduces H, so the upgrade must be taken");
+        let operator = root_scale_hessian_operator(
+            &inputs,
+            &h,
+            &sorted_spectrum,
+            assembled,
+            PseudoLogdetMode::PositiveDefinite,
+        )
+        .expect("the root reproduces H, so the upgrade must be taken");
         let from_root = operator.logdet();
 
         // A scalar-only root upgrade leaves the gradient and Newton step on

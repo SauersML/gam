@@ -53,7 +53,8 @@ pub struct DenseSpectralOperator {
     pub(crate) projected_factor_cache: ProjectedFactorCache,
     /// Full dimension.
     pub(crate) n_dim: usize,
-    /// Raw (unregularized) eigenvalues σ_i of H, in eigenpair order. The fused
+    /// Raw (unregularized) eigenvalues σ_i of H, in eigenpair order. These can
+    /// come from the assembled matrix or its root SVD. The fused
     /// second-order reductions need `σ` itself (not `r_ε(σ)`) to reassociate
     /// the logdet-Hessian diagonal cancellation-free.
     pub(crate) raw_eigenvalues: Vec<f64>,
@@ -844,8 +845,8 @@ pub(crate) fn dense_spectral_stage_log(signature: &str, elapsed_s: f64) {
 }
 
 impl DenseSpectralOperator {
-    /// The raw (unregularized) eigenvalues of the ASSEMBLED `H`, in eigenpair
-    /// order. Read by `reml::laml_logdet` to bound this route's own error.
+    /// Raw eigenvalues in eigenpair order. The assembled-operator caller uses
+    /// them to bound its error before requesting a root-scale operator.
     pub(crate) fn raw_spectrum(&self) -> &[f64] {
         &self.raw_eigenvalues
     }
@@ -876,7 +877,6 @@ impl DenseSpectralOperator {
         }
         Some(self.cached_logdet - plain)
     }
-
 }
 
 impl HessianFactorization for DenseSpectralOperator {

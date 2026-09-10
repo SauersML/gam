@@ -1087,6 +1087,7 @@ impl<'a> RemlState<'a> {
     pub(crate) fn compute_smoothing_correction_auto(
         &self,
         final_rho: &Array1<f64>,
+        rho_domain: &(Array1<f64>, Array1<f64>),
         final_lambdas: &Array1<f64>,
         final_fit: &PirlsResult,
         base_covariance: Option<&Array2<f64>>,
@@ -1194,7 +1195,20 @@ impl<'a> RemlState<'a> {
                     .into(),
             ));
         }
-        let rho_domain = self.resolvability_rho_domain();
+        // The integration domain belongs to the fit. Recomputing a different
+        // design-relative box here can exclude its certified mode (#2834),
+        // leaving every proposal with zero width along an excluded coordinate.
+        if rho_domain.0.len() != n_rho || rho_domain.1.len() != n_rho
+            || final_rho.iter().enumerate().any(|(k, &value)| {
+                !(rho_domain.0[k].is_finite() && rho_domain.1[k].is_finite()
+                    && rho_domain.0[k] < rho_domain.1[k]
+                    && value >= rho_domain.0[k] && value <= rho_domain.1[k])
+            })
+        {
+            return Err(EstimationError::InvalidInput(
+                "smoothing covariance domain must contain the certified rho".into(),
+            ));
+        }
         let near_boundary = final_rho.iter().enumerate().any(|(k, &value)| {
             (value-rho_domain.0[k]).min(rho_domain.1[k]-value) <= AUTO_CUBATURE_BOUNDARY_MARGIN
         });
@@ -1342,8 +1356,8 @@ impl<'a> RemlState<'a> {
         for &index in &upgraded {
             let axis = spectrum.eigenvectors.column(index).to_owned();
             let wald_step = spectrum.eigenvalues[index].sqrt().recip();
-            let plus = self.calibrate_sigma_node(final_rho, centre_cost, &axis, wald_step, &rho_domain)?;
-            let minus = self.calibrate_sigma_node(final_rho, centre_cost, &(-&axis), wald_step, &rho_domain)?;
+            let plus = self.calibrate_sigma_node(final_rho, centre_cost, &axis, wald_step, rho_domain)?;
+            let minus = self.calibrate_sigma_node(final_rho, centre_cost, &(-&axis), wald_step, rho_domain)?;
             let width = 0.5 * (plus.step + minus.step);
             if !width.is_finite() || width <= 0.0 {
                 return Err(EstimationError::TrialPointRefused {
@@ -1370,7 +1384,7 @@ impl<'a> RemlState<'a> {
         let mut proposal_scale = 1.0_f64;
         for (axis, width, _, _, _) in &proposal_axes {
             for sign in [1.0, -1.0] {
-                let limit = sigma_step_to_rho_domain(&proposal_center, &(axis*sign), &rho_domain);
+                let limit = sigma_step_to_rho_domain(&proposal_center, &(axis*sign), rho_domain);
                 proposal_scale = proposal_scale.min(limit / (radius*width));
             }
         }
@@ -1385,7 +1399,7 @@ impl<'a> RemlState<'a> {
             for sign in [1.0, -1.0] {
                 let direction = &axis * sign;
                 let step = radius * width * proposal_scale;
-                if step > sigma_step_to_rho_domain(&proposal_center, &direction, &rho_domain) {
+                if step > sigma_step_to_rho_domain(&proposal_center, &direction, rho_domain) {
                     return Err(EstimationError::TrialPointRefused {
                         reason: "smoothing cubature proposal failed its domain containment check".into(),
                     });
@@ -2145,6 +2159,7 @@ mod smoothing_correction_outcome_tests {
             let outcome = state
                 .compute_smoothing_correction_auto(
                     &final_rho,
+                    &(Array1::from_elem(1, -RHO_BOUND), Array1::from_elem(1, RHO_BOUND)),
                     &final_lambdas,
                     final_fit.as_ref(),
                     Some(&base_cov),
