@@ -341,3 +341,53 @@ coefficient curvature, function-prior normalization, REML/LAML learning,
 posterior coefficient integration, automatic complexity, entry conditioning,
 serving parity, and calibration remain unfinished. No fitted-model object or
 evidence guarantee has been added by this change.
+
+## Analytic reference sensitivities connected to the cohort score
+
+The reference engine now propagates analytic Jacobians through OU means and
+innovation spreads, entry/genetic effects, proposed event probabilities,
+disease jumps, killing weights, survivor mass, and conditional reference
+moments. The scalar reference evolution remains authoritative. Every replayed
+conditional moment and endpoint mass must agree exactly with that evolution
+before its Jacobian is returned.
+
+Resolved references recheck their value-resolution ensembles at the same
+coefficients, then pool the fine-ensemble Jacobians with the risk-mass and
+activity weights. Risk-mass derivatives are included in the moment ratio.
+`JointCohortIntegration::score` obtains these Jacobians from its own references,
+interpolates them alongside the corresponding values, and supplies both to the
+analytic importance-score kernel. The returned evaluation retains the same
+coefficient/reference/stratum state as its likelihood evaluation.
+
+Additional reference derivative workspace has an explicit bound, including
+scalar genetic replay storage. Interpolated Jacobian requests are checked
+before allocation. Cohort evaluation holds one stratum's Jacobians at a time
+and aggregates coefficient scores/errors rather than retaining a full
+subjects-by-coefficients matrix.
+
+The first **32 focused tests passed in 10.49 s** after a **40.13 s** targeted
+compile. After adding allocation checks and a reference timing comparison,
+the final **32 tests passed in 10.64 s** after a **39.24 s** warm targeted MSI
+compile, with four compile CPUs and two test threads. Fifty other tests were
+filtered out. Raw output is `event_history_reference_sensitivities_20260910.txt`.
+
+The added reference fixture has two signatures, recurrent/once-only/terminal
+marks, genetic effects, and nonzero disease jumps. It compares every coefficient
+channel of moment and risk-mass Jacobians with forward AD, including interpolated
+times. It also compares pooled Jacobians, checks foreign/out-of-range/resource
+contracts through the cohort and reference interfaces, and compares the total
+analytic cohort score with the differentiated shared-reference objective.
+
+On the same fixture, **27 coefficient columns**, **128 particles per risk set**,
+and **16 time intervals**, the analytic reference calculation took **0.070984 s**
+versus **0.087336 s** for forward AD in batches of eight: **1.230x**, best of three.
+Both routes return full moment and mass Jacobians, and the analytic timing
+includes its scalar replay check. This ran inside the focused suite and is not
+a broad reference-performance or end-to-end fitting benchmark.
+
+Value resolution does not establish derivative resolution. The reference
+Jacobians still need sampling/refinement error assessment in the cohort's
+coefficient geometry. Function penalties, coefficient curvature, REML/LAML
+learning, coefficient posterior means, learned complexity, entry conditioning,
+serving parity, and calibration remain unfinished. This change adds the complete
+analytic first-order cohort path; it does not add a certified fitted model.

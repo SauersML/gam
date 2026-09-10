@@ -21,19 +21,21 @@ mod precision;
 mod reference;
 mod resolution;
 mod score;
-pub use cohort::{JointCohortEvaluation, JointCohortIntegration, JointCohortPosterior};
+pub use cohort::{
+    JointCohortEvaluation, JointCohortIntegration, JointCohortPosterior, JointCohortScore,
+};
 pub use integration::{
     IntegratedLikelihood, IntegratedPosterior, IntegratedScore, IntegrationAccuracy,
     IntegrationOptions, JointIntegration,
 };
 pub use posterior::{LaplacePosterior, PosteriorOptions};
 pub use reference::{
-    JointReferenceBank, JointReferenceEvolution, JointReferenceProfile, ReferenceAccuracy,
-    ReferenceDiagnostics, ReferenceOptions,
+    JointReferenceBank, JointReferenceEvolution, JointReferenceProfile, JointReferenceSensitivity,
+    ReferenceAccuracy, ReferenceDiagnostics, ReferenceOptions,
 };
 pub use resolution::{
     ReferenceResolutionOptions, ReferenceResolutionReport, ResolvedReference,
-    ResolvedReferenceEvolution,
+    ResolvedReferenceEvolution, ResolvedReferenceSensitivity,
 };
 pub use score::JointPathScore;
 

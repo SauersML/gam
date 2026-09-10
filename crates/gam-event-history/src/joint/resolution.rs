@@ -60,6 +60,37 @@ pub struct ResolvedReferenceEvolution<S> {
     report: ReferenceResolutionReport,
 }
 
+/// Analytic sensitivities of a value-resolved reference. The report certifies
+/// neither sampling nor discretization accuracy of the derivative channels.
+pub struct ResolvedReferenceSensitivity {
+    sensitivity: JointReferenceSensitivity,
+    report: ReferenceResolutionReport,
+}
+
+impl ResolvedReferenceSensitivity {
+    pub fn reference(&self) -> &JointReferenceEvolution<f64> {
+        self.sensitivity.reference()
+    }
+    pub fn report(&self) -> &ReferenceResolutionReport {
+        &self.report
+    }
+    pub fn log_moment_jacobian(&self) -> &Array2<f64> {
+        self.sensitivity.log_moment_jacobian()
+    }
+    pub fn log_risk_mass_jacobian(&self) -> &Array2<f64> {
+        self.sensitivity.log_risk_mass_jacobian()
+    }
+    pub fn at(&self, times: &[f64]) -> Result<(Vec<f64>, Array2<f64>), EventHistoryError> {
+        self.sensitivity.at(times)
+    }
+    pub(in crate::joint) fn into_evolution(self) -> ResolvedReferenceEvolution<f64> {
+        ResolvedReferenceEvolution {
+            reference: self.sensitivity.into_reference(),
+            report: self.report,
+        }
+    }
+}
+
 impl<S: JetField> ResolvedReferenceEvolution<S> {
     pub fn reference(&self) -> &JointReferenceEvolution<S> {
         &self.reference
@@ -178,6 +209,67 @@ fn aggregate<S: JetField>(
 }
 
 impl ResolvedReference<'_> {
+    /// Recheck value resolution at theta, then differentiate the pooled fine
+    /// population analytically. Pooling includes risk-mass sensitivities;
+    /// averaging conditional moment Jacobians alone would omit selection.
+    /// The configured memory limit also bounds additional derivative workspace.
+    pub fn sensitivity(
+        &self,
+        theta: &[f64],
+    ) -> Result<ResolvedReferenceSensitivity, EventHistoryError> {
+        let value = self.evolve(theta)?;
+        let rows = value.reference.log_moments.len();
+        let bytes = rows
+            .checked_mul(theta.len())
+            .and_then(|n| n.checked_mul(16))
+            .ok_or_else(|| invalid("pooled reference Jacobian dimension overflow"))?;
+        let available = self
+            .options
+            .memory_limit_bytes
+            .checked_sub(bytes)
+            .ok_or_else(|| {
+                numerical("pooled reference Jacobians exceed the derivative workspace budget")
+            })?;
+        let mut moment = Array2::<f64>::zeros((rows, theta.len()));
+        let mut mass = moment.clone();
+        let log_count = (self.large.len() as f64).ln();
+        for bank in &self.large {
+            let next = bank.sensitivity_for_resolution(theta, &self.step_limits, available)?;
+            let curve = next.reference();
+            if curve.times() != value.reference.times() {
+                return Err(invalid(
+                    "reference Jacobian pooling requires identical fine grids",
+                ));
+            }
+            for n in 0..rows {
+                let log_mass_weight =
+                    curve.log_risk_mass()[n] - value.reference.log_risk_mass[n] - log_count;
+                let mass_weight = log_mass_weight.exp();
+                let activity_weight = (log_mass_weight + curve.log_moments()[n]
+                    - value.reference.log_moments[n])
+                    .exp();
+                for q in 0..theta.len() {
+                    let dm = next.log_risk_mass_jacobian()[[n, q]];
+                    mass[[n, q]] += mass_weight * dm;
+                    moment[[n, q]] += activity_weight * next.log_moment_jacobian()[[n, q]]
+                        + (activity_weight - mass_weight) * dm;
+                }
+            }
+        }
+        if moment.iter().chain(mass.iter()).any(|v| !v.is_finite()) {
+            return Err(numerical("non-finite pooled reference Jacobian"));
+        }
+        Ok(ResolvedReferenceSensitivity {
+            sensitivity: JointReferenceSensitivity::pooled(
+                value.reference,
+                moment,
+                mass,
+                self.options.memory_limit_bytes,
+            ),
+            report: value.report,
+        })
+    }
+
     pub(super) fn belongs_to(&self, model: &JointLikelihood) -> bool {
         self.large[0].belongs_to(model)
     }

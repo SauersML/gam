@@ -255,8 +255,37 @@ scores under the same normalized importance weights as the likelihood value.
 These low-level APIs require the supplied reference values and Jacobian to
 describe the same coefficient state. They do not generate or certify that
 Jacobian, and must not be wired to fitting with frozen or missing reference
-sensitivities. The resolved cohort wrapper still needs its analytic sensitivity
-interface before it can use this kernel as its default score.
+sensitivities. `JointCohortIntegration::score` now constructs those sensitivities
+from its own reference banks and uses this analytic kernel throughout.
+
+`JointReferenceBank::sensitivity` propagates state, log-weight, and survival-mass
+Jacobians through the retained population. Its analytic updates include OU
+decay and innovation spread, genetic drive and entry regression, event
+probabilities, disease jumps, killing, and conditional moment normalization.
+The scalar value evolution is authoritative: every replayed conditional moment
+and endpoint risk mass must agree exactly with it before a Jacobian is returned.
+Moment interpolation uses the same grid and linear interpolation as the value.
+
+`ResolvedReference::sensitivity` first rechecks all value-resolution ensembles
+at the requested coefficients. It then differentiates the pooled fine ensemble,
+including each replicate's risk-mass derivative. For normalized activity and
+risk weights `a_r` and `m_r`, respectively, the pooled log-moment derivative is
+
+```text
+sum_r a_r d log M_r + sum_r (a_r - m_r) d log risk_mass_r.
+```
+
+An unweighted average of conditional Jacobians would omit that second term.
+The result owns its coefficient vector, value curves, Jacobians, and resolution
+report. The report still assesses values, not derivative sampling or
+discretization error. A combined cohort/reference derivative error assessment
+is required before these scores can certify a fit or a structure comparison.
+
+The cohort processes one stratum's Jacobian workspace at a time, sums its
+subject coefficient scores with compensated summation, and retains aggregate
+conditional score errors. It does not retain a subjects-by-coefficients matrix.
+Reference derivative workspace is bounded separately from the already retained
+bank storage; interpolation also checks its requested Jacobian allocation.
 
 The integrated score reports a delta-method sampling error per coefficient,
 conditional on the supplied reference. A second pass over the fixed paths

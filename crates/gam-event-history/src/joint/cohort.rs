@@ -54,6 +54,27 @@ pub struct JointCohortPosterior {
     subjects: Vec<IntegratedPosterior>,
 }
 
+/// Total analytic score of the shared-reference sampled cohort objective.
+/// Sampling errors are conditional on the supplied resolved reference banks;
+/// their derivative uncertainty is not included in these subject errors.
+pub struct JointCohortScore {
+    evaluation: JointCohortEvaluation<f64>,
+    gradient: Vec<f64>,
+    conditional_standard_error: Vec<f64>,
+}
+
+impl JointCohortScore {
+    pub fn evaluation(&self) -> &JointCohortEvaluation<f64> {
+        &self.evaluation
+    }
+    pub fn gradient(&self) -> &[f64] {
+        &self.gradient
+    }
+    pub fn conditional_standard_error(&self) -> &[f64] {
+        &self.conditional_standard_error
+    }
+}
+
 impl JointCohortPosterior {
     pub fn evaluation(&self) -> &JointCohortEvaluation<f64> {
         &self.evaluation
@@ -134,6 +155,61 @@ fn assemble<S: JetField>(
 }
 
 impl JointCohortIntegration<'_, '_> {
+    /// One authoritative coefficient/reference/Jacobian state per stratum.
+    /// Strata are processed sequentially, and only aggregate coefficient
+    /// scores/errors are retained, avoiding subjects x coefficients storage.
+    pub fn score(
+        &self,
+        theta: &[f64],
+        accuracy: &IntegrationAccuracy,
+    ) -> Result<JointCohortScore, EventHistoryError> {
+        self.model.validate_parameters(theta)?;
+        let mut references = Vec::with_capacity(self.references.len());
+        let mut subjects = vec![None; self.subjects.len()];
+        let mut gradient = vec![0.0; theta.len()];
+        let mut compensation = gradient.clone();
+        let mut error = vec![0.0_f64; theta.len()];
+        for (stratum, bank) in self.references.iter().enumerate() {
+            let reference = bank.sensitivity(theta)?;
+            for (i, subject) in self.subjects.iter().enumerate() {
+                if self.strata[i] != stratum {
+                    continue;
+                }
+                let (moments, jacobian) = reference.at(&subject.history.times)?;
+                let result = subject.log_marginal_score(
+                    reference.reference().coefficients(),
+                    &moments,
+                    jacobian.view(),
+                    accuracy,
+                )?;
+                for q in 0..theta.len() {
+                    let corrected = result.gradient[q] - compensation[q];
+                    let next = gradient[q] + corrected;
+                    compensation[q] = (next - gradient[q]) - corrected;
+                    gradient[q] = next;
+                    error[q] = error[q].hypot(result.standard_error[q]);
+                }
+                subjects[i] = Some(result.likelihood);
+            }
+            references.push(reference.into_evolution());
+        }
+        if gradient.iter().chain(&error).any(|v| !v.is_finite()) {
+            return Err(numerical(
+                "non-finite cohort coefficient score or sampling error",
+            ));
+        }
+        let subjects = subjects
+            .into_iter()
+            .map(|s| s.expect("validated stratum assignment"))
+            .collect();
+        let evaluation = assemble(subjects, references, self.strata, accuracy)?;
+        Ok(JointCohortScore {
+            evaluation,
+            gradient,
+            conditional_standard_error: error,
+        })
+    }
+
     fn evolve<S: JetField>(
         &self,
         theta: &[S],
@@ -359,6 +435,20 @@ mod tests {
             .map(|(j, &v)| Mixed::seed(v, f64::from(j == q), f64::from(j == q)))
             .collect();
         let jet = cohort.log_likelihood(&seeds, &accuracy).unwrap();
+        let analytic = cohort.score(&theta, &accuracy).unwrap();
+        assert_eq!(analytic.evaluation().coefficients(), &theta);
+        assert_eq!(analytic.evaluation().strata(), &strata);
+        assert_eq!(
+            analytic.evaluation().log_likelihood(),
+            value.log_likelihood()
+        );
+        assert!((analytic.gradient()[q] - jet.log_likelihood().u).abs() < 1e-10);
+        assert!(
+            analytic
+                .conditional_standard_error()
+                .iter()
+                .all(|&v| v.is_finite() && v >= 0.0)
+        );
         let mut plus = theta.clone();
         let mut minus = theta.clone();
         let step = 1e-4;

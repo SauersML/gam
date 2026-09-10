@@ -7,6 +7,10 @@ use crate::scalar::sqrt;
 use rand::{Rng, RngExt};
 use rand_distr::{Distribution, StandardNormal};
 
+#[path = "reference_sensitivity.rs"]
+mod sensitivity;
+pub use sensitivity::JointReferenceSensitivity;
+
 /// Origin population, initially alive and free of every once-only mark.
 /// A late-origin profile is a declared entry law, not conditioning on an
 /// unobserved disease-free interval before that origin.

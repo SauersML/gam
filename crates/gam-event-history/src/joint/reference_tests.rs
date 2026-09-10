@@ -26,6 +26,179 @@ fn profile(steps: usize, genes: usize) -> JointReferenceProfile {
 }
 
 #[test]
+fn analytic_reference_jacobians_match_all_parameter_channels_and_pooling() {
+    use gam_math::jet_scalar::Order1;
+    let model = JointLikelihood::new(specification(
+        2,
+        vec![MarkKind::Recurrent, MarkKind::Once, MarkKind::Terminal],
+        1,
+    ))
+    .unwrap();
+    let mut theta: Vec<_> = (0..model.layout.width)
+        .map(|q| 0.1 * (q as f64).sin())
+        .collect();
+    theta[0] = -1.2;
+    theta[1] = -1.4;
+    theta[2] = -2.0;
+    theta[model.layout.drive.start + 1] = 0.3;
+    theta[model.layout.entry.start + 1] = 0.4;
+    theta[model.layout.jumps[0].as_ref().unwrap().start] = 0.6;
+    let p = profile(16, 1);
+    let options = ReferenceOptions {
+        particles: 128,
+        ..ReferenceOptions::default()
+    };
+    let accuracy = ReferenceAccuracy {
+        log_moment_standard_error: 0.2,
+        minimum_risk_effective_samples: 4.0,
+        maximum_step_hazard: 0.2,
+    };
+    let mut rng = SmallRng::seed_from_u64(971);
+    let bank = model
+        .reference_bank(&theta, &p, &options, &accuracy, &mut rng)
+        .unwrap();
+    assert!(bank.sensitivity(&theta, &accuracy, 1).is_err());
+    let hand = bank
+        .sensitivity(&theta, &accuracy, 128 * 1024 * 1024)
+        .unwrap();
+    assert!(hand.at(&[-0.1]).is_err());
+    let limited = bank
+        .sensitivity(&theta, &accuracy, 2 * 1024 * 1024)
+        .unwrap();
+    assert!(limited.at(&vec![0.5; 10000]).is_err());
+    let times = [0.0, 0.33, 1.0];
+    let (_, interpolated) = hand.at(&times).unwrap();
+    for start in (0..theta.len()).step_by(8) {
+        let seeds: Vec<_> = theta
+            .iter()
+            .enumerate()
+            .map(|(q, &v)| {
+                let mut g = [0.0; 8];
+                if q >= start && q < start + 8 {
+                    g[q - start] = 1.0;
+                }
+                Order1::<8> { v, g }
+            })
+            .collect();
+        let jet = bank.evolve(&seeds, &accuracy).unwrap();
+        let at = jet.at(&times).unwrap();
+        for q in start..(start + 8).min(theta.len()) {
+            for n in 0..jet.log_moments().len() {
+                for (a, b) in [
+                    (
+                        hand.log_moment_jacobian()[[n, q]],
+                        jet.log_moments()[n].g[q - start],
+                    ),
+                    (
+                        hand.log_risk_mass_jacobian()[[n, q]],
+                        jet.log_risk_mass()[n].g[q - start],
+                    ),
+                ] {
+                    assert!(
+                        (a - b).abs() < 2e-10 * (1.0 + b.abs()),
+                        "node {n}, coefficient {q}: {a} vs {b}"
+                    );
+                }
+            }
+            for n in 0..at.len() {
+                assert!((interpolated[[n, q]] - at[n].g[q - start]).abs() < 2e-10);
+            }
+        }
+    }
+    // Same fixed population and all coefficient columns; both implementations
+    // return values and full moment/mass Jacobians, with no RNG in the timing.
+    {
+        use std::{hint::black_box, time::Instant};
+        let (mut manual, mut automatic) = (f64::INFINITY, f64::INFINITY);
+        for _ in 0..3 {
+            let started = Instant::now();
+            black_box(
+                bank.sensitivity(black_box(&theta), &accuracy, 128 * 1024 * 1024)
+                    .unwrap(),
+            );
+            manual = manual.min(started.elapsed().as_secs_f64());
+            let started = Instant::now();
+            let mut moments = Array2::<f64>::zeros(hand.log_moment_jacobian().dim());
+            let mut masses = moments.clone();
+            for start in (0..theta.len()).step_by(8) {
+                let seeds: Vec<_> = theta
+                    .iter()
+                    .enumerate()
+                    .map(|(q, &v)| {
+                        let mut g = [0.0; 8];
+                        if q >= start && q < start + 8 {
+                            g[q - start] = 1.0;
+                        }
+                        Order1::<8> { v, g }
+                    })
+                    .collect();
+                let jet = bank.evolve(black_box(&seeds), &accuracy).unwrap();
+                for n in 0..moments.nrows() {
+                    for q in start..(start + 8).min(theta.len()) {
+                        moments[[n, q]] = jet.log_moments()[n].g[q - start];
+                        masses[[n, q]] = jet.log_risk_mass()[n].g[q - start];
+                    }
+                }
+            }
+            black_box((moments, masses));
+            automatic = automatic.min(started.elapsed().as_secs_f64());
+        }
+        eprintln!(
+            "reference {} coefficients, 128 particles/risk set, 16 intervals: analytic {manual:.6}s, AD batches of eight {automatic:.6}s, {:.3}x (best of three)",
+            theta.len(),
+            automatic / manual
+        );
+    }
+    let (resolved, _) = model
+        .resolve_reference(
+            &theta,
+            &p,
+            &ReferenceResolutionOptions {
+                replicates: 4,
+                initial_particles: 64,
+                maximum_particles: 512,
+                log_moment_tolerance: 0.5,
+                risk_mass_tolerance: 0.1,
+                maximum_step_hazard: 0.2,
+                minimum_risk_effective_samples: 4.0,
+                ..ReferenceResolutionOptions::default()
+            },
+            &mut rng,
+        )
+        .unwrap();
+    let pooled = resolved.sensitivity(&theta).unwrap();
+    assert_eq!(pooled.reference().coefficients(), &theta);
+    for q in [
+        0,
+        model.layout.entry.start + 1,
+        model.layout.rates.start,
+        model.layout.jumps[0].as_ref().unwrap().start,
+    ] {
+        let seeds: Vec<_> = theta
+            .iter()
+            .enumerate()
+            .map(|(j, &v)| Order1::<1> {
+                v,
+                g: [f64::from(q == j)],
+            })
+            .collect();
+        let jet = resolved.evolve(&seeds).unwrap();
+        for n in 0..jet.reference().log_moments().len() {
+            assert!(
+                (pooled.log_moment_jacobian()[[n, q]] - jet.reference().log_moments()[n].g[0])
+                    .abs()
+                    < 2e-10
+            );
+            assert!(
+                (pooled.log_risk_mass_jacobian()[[n, q]] - jet.reference().log_risk_mass()[n].g[0])
+                    .abs()
+                    < 2e-10
+            );
+        }
+    }
+}
+
+#[test]
 fn joint_reference_carries_competing_risk_sets_and_rejects_unresolved_steps() {
     let model = JointLikelihood::new(specification(
         0,
