@@ -1,43 +1,29 @@
-//! #2280, stage 3: decide, with a continuous witness, whether the erroneous
-//! swiss-roll `b₁ = 1` is a DISCRETE-nerve artifact (the continuous chart-domain
-//! intersections are real but no SAMPLED row witnesses them) or whether the
-//! continuous domains themselves leave a hole.
+//! #2280: sampled witnesses for intersections missed by the membership nerve.
 //!
-//! The Sep-7 measurement localized the spurious class to the four inner-tip
-//! patches {0, 18, 45, 48}: the full MEMBERSHIP nerve carries triangles
-//! `(0,18,45)` (common row 88) and `(0,45,48)` (common row 87) but not
-//! `(0,18,48)` or `(18,45,48)`, so the `K₄` 1-skeleton on those vertices keeps
-//! one unfilled cycle. Whether a continuous chart-domain intersection is being
-//! missed, or the actual domains leave a gap, was left open — this module is
-//! that evidence.
+//! The Sep-7 measurement localized the Swiss-roll membership nerve's spurious
+//! H1 class to patches {0, 18, 45, 48}. The fixture rows supply triangles
+//! `(0,18,45)` and `(0,45,48)`, but neither `(0,18,48)` nor `(18,45,48)`.
 //!
-//! ## The witness
+//! Extend each patch to the closed ambient ball through its farthest member,
+//! intersected with the analytic fixture surface: `U_i = B(c_i, r_i) ∩ M`.
+//! Evaluate these domains on a grid refined fourfold in each parameter, with
+//! the original fixture rows appended exactly. This preserves every original
+//! membership intersection, including boundary rows without a sqrt roundtrip.
+//! The production enumerator and Betti calculation compare the two predicates.
 //!
-//! A patch's `members` are its center's distance-order prefix, so the continuous
-//! domain the patch IMPLIES is the closed ambient ball through its farthest
-//! member, intersected with the sheet: `U_i = B(c_i, r_i) ∩ M` with
-//! `r_i = max_{m ∈ members} ‖x_m − x_{c_i}‖` — the same `patch_radius` the
-//! membership diagnostic already reads. Sampling those balls on a 4×-finer
-//! grid of the SAME analytic sheet (the fixture generators ARE the sheets)
-//! turns every nerve question into a decidable one:
+//! A negative triple margin supplies a point inside all three balls and thus
+//! positive evidence of a continuous intersection missed by membership. The
+//! converse does not follow: a finite grid can miss intersections and uncovered
+//! regions between its points. Zero uncovered grid points is only sampled
+//! coverage, and the witness nerve's Betti numbers describe that finite nerve.
+//! These measurements neither certify a continuous cover nor choose a general
+//! production repair. A good cover requires every nonempty finite intersection
+//! to be contractible; sampled domain connectivity alone cannot establish that.
 //!
-//! * a chart set co-fires continuously iff a witness-grid point lies in all
-//!   its balls (grid spacing ~0.25 in `h` and ~0.12 in arc against patch radii
-//!   ~1–2.6; the margin probe below reports how close each call is);
-//! * the WITNESS nerve is enumerated with production's own
-//!   [`enumerate_full_nerve`] and its Betti numbers read with
-//!   [`compute_betti`], so the comparison is between two predicates on one
-//!   enumerator, not between two implementations.
-//!
-//! Every membership intersection is a continuous one (a shared row is a sheet
-//! point inside both balls), so the witness complex contains the membership
-//! complex — asserted, not assumed. What the witness ADDS is exactly the
-//! intersections no sampled row falls into. If the added triangles kill the
-//! class, the hole is a sampling artifact of the discrete predicate; if the
-//! class survives with the sheet fully covered, the continuous intersections
-//! themselves fail to fill it; if the sheet is NOT fully covered, the domains
-//! leave a real gap. The swiss-roll test pins whichever branch the witness
-//! measures; torus/Möbius controls pin the machinery on known answers.
+//! The Swiss-roll regression pins membership (1,1,0), witness (1,0,0), and both
+//! missing triples' negative margins. Torus and Möbius controls pin their known
+//! signatures. Connectivity is reported on the refinement lattice with the
+//! fixture's actual seam identifications, separately from the witness nerve.
 
 use super::*;
 use crate::inference::atlas_nerve::SimplexInventory;
@@ -59,7 +45,7 @@ struct WitnessCover {
 }
 
 impl WitnessCover {
-    fn build(atlas: &LocalAtlas, data: ArrayView2<'_, f64>, grid: Array2<f64>) -> Self {
+    fn build(atlas: &LocalAtlas, data: ArrayView2<'_, f64>, grid: ArrayView2<'_, f64>) -> Self {
         let charts = atlas.chart_count();
         let words = charts.div_ceil(64);
         let mut centers = Vec::with_capacity(charts);
@@ -118,7 +104,7 @@ impl WitnessCover {
     }
 
     /// Witness nerve at every cardinality, enumerated by the production
-    /// enumerator with the continuous predicate.
+    /// enumerator with the sampled ball-intersection predicate.
     fn nerve(&self) -> SimplexInventory {
         let count = self.centers.len();
         let mut adjacency = vec![BTreeSet::new(); count];
@@ -195,14 +181,9 @@ fn membership_nerve(atlas: &LocalAtlas) -> SimplexInventory {
     .expect("membership nerve must enumerate")
 }
 
-/// The witness grid for a fixture: the fixture's own rows PLUS a 4×-refinement
-/// of the same analytic sheet. Including the fixture rows exactly is what
-/// makes containment provable (a shared row is a sheet point inside both patch
-/// balls AND on the grid), and the refinement supplies the intersections no
-/// sampled row falls into. `grid_shape` then names the refinement's extent for
-/// the domain-connectivity flood fill; fixture rows are appended after it.
-fn witness_grid(fine: Array2<f64>, data: &Array2<f64>, grid_shape: (usize, usize)) -> Array2<f64> {
-    let _ = grid_shape;
+/// Append the exact fixture rows to the refined sample of the same surface.
+/// Connectivity uses only the refinement; all rows participate in the nerve.
+fn witness_grid(fine: Array2<f64>, data: &Array2<f64>) -> Array2<f64> {
     let mut grid = Array2::<f64>::zeros((fine.nrows() + data.nrows(), data.ncols()));
     for row in 0..fine.nrows() {
         for column in 0..fine.ncols() {
@@ -217,61 +198,61 @@ fn witness_grid(fine: Array2<f64>, data: &Array2<f64>, grid_shape: (usize, usize
     grid
 }
 
-/// Connected components of each continuous domain, counted on the witness
-/// grid's REFINEMENT lattice (4-neighbor adjacency over the first
-/// `grid_shape.0 * grid_shape.1` points; the appended fixture rows only add
-/// points, never remove them, so a domain connected on the refinement is
-/// connected on the full grid). A domain with more than one component breaks
-/// the good-cover hypothesis the nerve theorem needs, so it is reported — the
-/// witness Betti numbers are only a statement about the SHEET while every
-/// domain is connected.
+#[derive(Clone, Copy)]
+enum GridTopology {
+    Rectangle,
+    Torus,
+    Mobius,
+}
+
+/// Count components of each domain's occupied REFINEMENT vertices, with
+/// four-neighbor edges and the fixture's seam identifications. Torus coordinates
+/// are periodic in both directions; the Möbius u seam reverses the width index.
+/// The appended fixture rows are deliberately excluded: they need not coincide
+/// with refinement vertices, and arbitrary attachments can create false splits
+/// or joins. These graph counts do not certify continuous domain connectivity.
 fn domain_components(
     witness: &WitnessCover,
     grid_shape: (usize, usize),
-    fixture_shape: (usize, usize),
+    topology: GridTopology,
 ) -> Vec<usize> {
     let (n_t, n_h) = grid_shape;
-    let (f_t, f_h) = fixture_shape;
+    assert!(n_t > 0 && n_h > 0, "refinement dimensions must be positive");
     let charts = witness.centers.len();
     let lattice = n_t * n_h;
-    let total = lattice + f_t * f_h;
-    // Lattice adjacency (4-neighbor); each appended fixture row attaches to
-    // the refinement point at its parametrization position and that point's
-    // four lattice neighbors, so fixture rows can only ADD connectivity.
-    let mut adjacency: Vec<Vec<usize>> = vec![Vec::new(); total];
+    assert!(lattice <= witness.contains.len());
+    let mut adjacency: Vec<Vec<usize>> = vec![Vec::new(); lattice];
+    // Add each undirected edge once, including the seam edges.
     for it in 0..n_t {
         for ih in 0..n_h {
             let point = it * n_h + ih;
-            for (jt, jh) in [
-                (it + 1, ih),
-                (it.saturating_sub(1), ih),
-                (it, ih + 1),
-                (it, ih.saturating_sub(1)),
-            ] {
-                if jt < n_t && jh < n_h {
-                    let next = jt * n_h + jh;
-                    adjacency[point].push(next);
+            let next_t = if it + 1 < n_t {
+                Some((it + 1) * n_h + ih)
+            } else {
+                match topology {
+                    GridTopology::Rectangle => None,
+                    GridTopology::Torus => Some(ih),
+                    GridTopology::Mobius => Some(n_h - 1 - ih),
                 }
+            };
+            let next_h = if ih + 1 < n_h {
+                Some(point + 1)
+            } else if matches!(topology, GridTopology::Torus) {
+                Some(it * n_h)
+            } else {
+                None
+            };
+            for next in [next_t, next_h].into_iter().flatten() {
+                adjacency[point].push(next);
+                adjacency[next].push(point);
             }
-        }
-    }
-    for it in 0..f_t {
-        for ih in 0..f_h {
-            let fixture = lattice + it * f_h + ih;
-            let near_t =
-                ((it as f64 / (f_t as f64 - 1.0).max(1.0)) * (n_t - 1) as f64).round() as usize;
-            let near_h =
-                ((ih as f64 / (f_h as f64 - 1.0).max(1.0)) * (n_h - 1) as f64).round() as usize;
-            let near = (near_t.min(n_t - 1)) * n_h + near_h.min(n_h - 1);
-            adjacency[fixture].push(near);
-            adjacency[near].push(fixture);
         }
     }
     let mut components = Vec::with_capacity(charts);
     for chart in 0..charts {
-        let mut seen = vec![false; total];
+        let mut seen = vec![false; lattice];
         let mut count = 0;
-        for start in 0..total {
+        for start in 0..lattice {
             if seen[start] || !witness.has(start, chart) {
                 continue;
             }
@@ -298,27 +279,18 @@ struct WitnessReadout {
     witness_betti: BettiSignature,
     membership_betti: BettiSignature,
     uncovered: usize,
-    min_multiplicity: usize,
-    added_edges: usize,
-    added_triangles: usize,
-    max_domain_components: usize,
 }
 
 fn check(
     label: &str,
-    data: &Array2<f64>,
-    fine: Array2<f64>,
+    atlas: &LocalAtlas,
+    witness: &WitnessCover,
     grid_shape: (usize, usize),
-    fixture_shape: (usize, usize),
+    topology: GridTopology,
 ) -> WitnessReadout {
-    let grid = witness_grid(fine, data, grid_shape);
-    let atlas = LocalAtlas::build(data.view(), LocalAtlasConfig::balanced(data.nrows(), 2))
-        .unwrap_or_else(|e| panic!("{label} must build an atlas: {e}"));
-    let witness = WitnessCover::build(&atlas, data.view(), grid.clone());
-
     let mut uncovered = 0;
     let mut min_multiplicity = usize::MAX;
-    for point in 0..grid.nrows() {
+    for point in 0..witness.contains.len() {
         let multiplicity = witness.multiplicity(point);
         min_multiplicity = min_multiplicity.min(multiplicity as usize);
         if multiplicity == 0 {
@@ -326,7 +298,7 @@ fn check(
         }
     }
 
-    let membership = membership_nerve(&atlas);
+    let membership = membership_nerve(atlas);
     let nerve = witness.nerve();
     let membership_betti = compute_betti(
         &membership.vertices,
@@ -361,11 +333,11 @@ fn check(
         "{label}: membership triangles absent from the witness nerve: {missing_tris:?}"
     );
 
-    let components = domain_components(&witness, grid_shape, fixture_shape);
+    let components = domain_components(witness, grid_shape, topology);
     let max_components = components.iter().copied().max().unwrap_or(0);
     eprintln!(
         "#2280 witness {label}: charts={} membership=({},{},{:?}) witness=({},{},{:?}) \
-         added_edges={} added_triangles={} uncovered={} min_multiplicity={} max_domain_components={}",
+         added_edges={} added_triangles={} uncovered_grid_points={} min_multiplicity={} max_lattice_components={}",
         atlas.chart_count(),
         membership_betti.b0,
         membership_betti.b1,
@@ -382,7 +354,7 @@ fn check(
     for chart in 0..components.len() {
         if components[chart] > 1 {
             eprintln!(
-                "#2280 witness {label}: DISCONNECTED domain chart={chart} center={} radius={:.4} components={}",
+                "#2280 witness {label}: multiple lattice components chart={chart} center={} radius={:.4} components={}",
                 witness.centers[chart], witness.radii[chart], components[chart]
             );
         }
@@ -391,18 +363,14 @@ fn check(
         witness_betti,
         membership_betti,
         uncovered,
-        min_multiplicity,
-        added_edges: witness_edges.len() - membership_edges.len(),
-        added_triangles: witness_triangles.len() - membership_triangles.len(),
-        max_domain_components: max_components,
     }
 }
 
 /// Margin of the best witness-grid point against a chart triple: the smallest
 /// over grid points of the WORST ball margin, `min_p max_i (‖x_p − c_i‖ − r_i)`
 /// (negative = a sheet point exists inside all three domains). Reported for
-/// the two triples whose absent triangles carry the Sep-7 class, gated on the
-/// atlas reproducing the named centers (rows 0, 143, 13, 131 for patches 0,
+/// the two triples whose absent triangles carry the Sep-7 class, requiring the
+/// atlas to reproduce the named centers (rows 0, 143, 13, 131 for patches 0,
 /// 18, 45, 48 respectively).
 fn triple_margin(
     witness: &WitnessCover,
@@ -410,14 +378,12 @@ fn triple_margin(
     grid: &Array2<f64>,
     triple: [usize; 3],
     expected_centers: [usize; 3],
-) -> Option<f64> {
-    let actual: Vec<_> = triple.iter().map(|&c| witness.centers[c]).collect();
-    if actual != expected_centers {
-        eprintln!(
-            "#2280 witness: triple {triple:?} centers drifted {actual:?} != {expected_centers:?}; margin skipped"
-        );
-        return None;
-    }
+) -> f64 {
+    let actual = triple.map(|chart| witness.centers[chart]);
+    assert_eq!(
+        actual, expected_centers,
+        "triple {triple:?}: centers drifted"
+    );
     let mut best = f64::INFINITY;
     for point in 0..grid.nrows() {
         let worst = triple
@@ -427,136 +393,181 @@ fn triple_margin(
         best = best.min(worst);
     }
     eprintln!(
-        "#2280 witness: triple {triple:?} continuous margin {best:.4} (negative = nonempty intersection)"
+        "#2280 witness: triple {triple:?} sampled margin {best:.4} (negative = nonempty intersection)"
     );
-    Some(best)
+    best
 }
 
 #[test]
 fn torus_witness_nerve_reads_the_true_topology_2280() {
+    let data = torus(60, 26, 2.0, 0.8);
+    let grid = witness_grid(torus(240, 104, 2.0, 0.8), &data);
+    let atlas = LocalAtlas::build(data.view(), LocalAtlasConfig::balanced(data.nrows(), 2))
+        .expect("torus must build an atlas");
+    let witness = WitnessCover::build(&atlas, data.view(), grid.view());
     let readout = check(
         "torus_60x26",
-        &torus(60, 26, 2.0, 0.8),
-        torus(240, 104, 2.0, 0.8),
+        &atlas,
+        &witness,
         (240, 104),
-        (60, 26),
+        GridTopology::Torus,
     );
-    assert_eq!(readout.uncovered, 0, "torus domains must cover the sheet");
     assert_eq!(
-        (
-            readout.witness_betti.b0,
-            readout.witness_betti.b1,
-            readout.witness_betti.b2
-        ),
-        (1, 2, Some(1)),
-        "torus witness nerve must read the true (1,2,1)"
+        readout.uncovered, 0,
+        "torus must cover all witness-grid points"
     );
+    for betti in [readout.membership_betti, readout.witness_betti] {
+        assert_eq!((betti.b0, betti.b1, betti.b2), (1, 2, Some(1)));
+    }
 }
 
 #[test]
 fn mobius_witness_nerve_reads_the_true_topology_2280() {
+    let data = mobius_strip(40, 10);
+    let grid = witness_grid(mobius_strip(160, 40), &data);
+    let atlas = LocalAtlas::build(data.view(), LocalAtlasConfig::balanced(data.nrows(), 2))
+        .expect("Möbius strip must build an atlas");
+    let witness = WitnessCover::build(&atlas, data.view(), grid.view());
     let readout = check(
         "mobius_40x10",
-        &mobius_strip(40, 10),
-        mobius_strip(160, 40),
+        &atlas,
+        &witness,
         (160, 40),
-        (40, 10),
+        GridTopology::Mobius,
     );
-    assert_eq!(readout.uncovered, 0, "möbius domains must cover the sheet");
     assert_eq!(
-        (
-            readout.witness_betti.b0,
-            readout.witness_betti.b1,
-            readout.witness_betti.b2
-        ),
+        readout.uncovered, 0,
+        "Möbius must cover all witness-grid points"
+    );
+    for betti in [readout.membership_betti, readout.witness_betti] {
+        assert_eq!((betti.b0, betti.b1, betti.b2), (1, 1, Some(0)));
+    }
+}
+
+#[test]
+fn swiss_roll_witness_fills_missing_membership_intersections_2280() {
+    let data = swiss_roll(80, 16);
+    let grid = witness_grid(swiss_roll(320, 64), &data);
+    let atlas = LocalAtlas::build(data.view(), LocalAtlasConfig::balanced(data.nrows(), 2))
+        .expect("Swiss roll must build an atlas");
+    let witness = WitnessCover::build(&atlas, data.view(), grid.view());
+    let readout = check(
+        "swiss_roll_80x16",
+        &atlas,
+        &witness,
+        (320, 64),
+        GridTopology::Rectangle,
+    );
+    let membership = readout.membership_betti;
+    assert_eq!(
+        (membership.b0, membership.b1, membership.b2),
         (1, 1, Some(0)),
-        "möbius witness nerve must read the true (1,1,0)"
+        "the diagnostic must reproduce the membership nerve's spurious class"
+    );
+    let sampled = readout.witness_betti;
+    assert_eq!(
+        (sampled.b0, sampled.b1, sampled.b2),
+        (1, 0, Some(0)),
+        "the refined witness nerve must fill the spurious class"
+    );
+    assert_eq!(
+        readout.uncovered, 0,
+        "Swiss roll must cover all witness-grid points"
+    );
+
+    for (triple, centers) in [([0, 18, 48], [0, 143, 131]), ([18, 45, 48], [143, 13, 131])] {
+        let margin = triple_margin(&witness, &data, &grid, triple, centers);
+        assert!(
+            margin < 0.0,
+            "{triple:?}: a strict interior witness must exist"
+        );
+        assert!(
+            witness.co_fires(&triple),
+            "{triple:?}: the witness predicate must admit the triple"
+        );
+        let mut shared = atlas.patches()[triple[0]].members.clone();
+        for &chart in &triple[1..] {
+            shared = sorted_intersection(&shared, &atlas.patches()[chart].members);
+        }
+        assert!(
+            shared.is_empty(),
+            "{triple:?}: fixture membership must miss this intersection"
+        );
+    }
+}
+
+#[test]
+fn lattice_components_respect_surface_seams_2280() {
+    let shape = (4, 5);
+    let make_witness = |occupied: &[usize]| WitnessCover {
+        centers: vec![0],
+        radii: vec![1.0],
+        words: 1,
+        contains: (0..shape.0 * shape.1)
+            .map(|point| vec![u64::from(occupied.contains(&point))])
+            .collect(),
+    };
+
+    // One patch crosses BOTH torus seams. Cutting the parameter rectangle
+    // manufactures four components from its four corner samples.
+    let torus = make_witness(&[0, 4, 15, 19]);
+    assert_eq!(
+        domain_components(&torus, shape, GridTopology::Rectangle),
+        vec![4]
+    );
+    assert_eq!(
+        domain_components(&torus, shape, GridTopology::Torus),
+        vec![1]
+    );
+
+    // A Möbius seam connects the last u row to the first with reversed width.
+    let mobius = make_witness(&[1, 18]);
+    assert_eq!(
+        domain_components(&mobius, shape, GridTopology::Rectangle),
+        vec![2]
+    );
+    assert_eq!(
+        domain_components(&mobius, shape, GridTopology::Torus),
+        vec![2]
+    );
+    assert_eq!(
+        domain_components(&mobius, shape, GridTopology::Mobius),
+        vec![1]
+    );
+
+    // Equal-width seam points are NOT neighbors on the Möbius strip.
+    let untwisted = make_witness(&[1, 16]);
+    assert_eq!(
+        domain_components(&untwisted, shape, GridTopology::Mobius),
+        vec![2]
+    );
+    assert_eq!(
+        domain_components(&untwisted, shape, GridTopology::Torus),
+        vec![1]
     );
 }
 
 #[test]
-fn swiss_roll_witness_nerve_decides_the_continuous_question_2280() {
-    let data = swiss_roll(80, 16);
-    let fine = swiss_roll(320, 64);
-    let readout = check("swiss_roll_80x16", &data, fine, (320, 64), (80, 16));
-    let grid = witness_grid(swiss_roll(320, 64), &data, (320, 64));
-
-    // The margins on the two triples whose missing triangles carry the Sep-7
-    // class: {0,18,48} and {18,45,48} (patches 18 and 48 sit at grid rows
-    // 8·16+15 = 143 and 8·16+3 = 131).
-    let atlas = LocalAtlas::build(data.view(), LocalAtlasConfig::balanced(data.nrows(), 2))
-        .expect("swiss roll must build an atlas");
-    let witness = WitnessCover::build(&atlas, data.view(), grid.clone());
-    let first = triple_margin(&witness, &data, &grid, [0, 18, 48], [0, 143, 8 * 16 + 3]);
-    let second = triple_margin(
-        &witness,
-        &data,
-        &grid,
-        [18, 45, 48],
-        [8 * 16 + 15, 13, 8 * 16 + 3],
+fn lattice_components_exclude_appended_fixture_rows_2280() {
+    let mut witness = WitnessCover {
+        centers: vec![0],
+        radii: vec![1.0],
+        words: 1,
+        contains: vec![vec![1]; 4],
+    };
+    assert_eq!(
+        domain_components(&witness, (2, 2), GridTopology::Rectangle),
+        vec![1]
     );
-
-    // Pre-registered fork, pinned by measurement. The sheet is contractible,
-    // so the true signature is (1,0,0) and the membership nerve's (1,1,0) is
-    // known-wrong. Whichever branch the witness reads is a FACT about the
-    // continuous domains, and it names the fix lane:
-    //   * (1,0,0): the continuous intersections exist and close the hole — the
-    //     membership predicate under-witnesses them, fix the predicate;
-    //   * (1,1,0) with uncovered > 0: the domains leave a real gap — fix
-    //     coverage (density-aware budget), not the predicate;
-    //   * (1,1,0) with uncovered == 0: the domains cover the sheet yet their
-    //     intersections do not fill the cycle — the good-cover hypothesis
-    //     itself is failing (disconnected intersections), and no predicate or
-    //     budget fix can save the nerve readout without addressing it.
-    eprintln!(
-        "#2280 witness summary: membership=({},{},{:?}) witness=({},{},{:?}) added_edges={} \
-         added_triangles={} min_multiplicity={} max_domain_components={}",
-        readout.membership_betti.b0,
-        readout.membership_betti.b1,
-        readout.membership_betti.b2,
-        readout.witness_betti.b0,
-        readout.witness_betti.b1,
-        readout.witness_betti.b2,
-        readout.added_edges,
-        readout.added_triangles,
-        readout.min_multiplicity,
-        readout.max_domain_components,
+    // A fixture row has no lattice edge. Counting it as an isolated vertex
+    // would manufacture a component even when its position duplicates a sample.
+    witness.contains.push(vec![1]);
+    assert_eq!(
+        domain_components(&witness, (2, 2), GridTopology::Rectangle),
+        vec![1]
     );
-    match (
-        readout.witness_betti.b0,
-        readout.witness_betti.b1,
-        readout.uncovered,
-    ) {
-        (1, 0, 0) => {
-            assert_eq!(
-                readout.witness_betti.b2,
-                Some(0),
-                "contractible witness cover"
-            );
-            for (name, margin) in [("0-18-48", first), ("18-45-48", second)] {
-                if let Some(margin) = margin {
-                    assert!(
-                        margin < 0.0,
-                        "{name}: continuous intersection must exist when the witness kills the class"
-                    );
-                }
-            }
-            eprintln!("#2280 witness: SAMPLING ARTIFACT — continuous intersections close the hole");
-        }
-        (1, 1, uncovered) => {
-            if uncovered == 0 {
-                eprintln!(
-                    "#2280 witness: GOOD-COVER FAILURE — domains cover the sheet yet the cycle survives; \
-                     disconnected intersections are the suspect (max_domain_components={})",
-                    readout.max_domain_components
-                );
-            } else {
-                eprintln!(
-                    "#2280 witness: REAL GAP — {uncovered} sheet points lie in no continuous domain; \
-                     the fix lane is coverage (density-aware budget), not the predicate"
-                );
-            }
-        }
-        other => panic!("swiss-roll witness signature drifted to {other:?}"),
-    }
+    assert!(
+        witness.has(4, 0),
+        "appended rows still participate in the witness predicate"
+    );
 }
