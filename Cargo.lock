@@ -3664,6 +3664,7 @@ dependencies = [
  "gam-terms",
  "log",
  "ndarray 0.17.2",
+ "opt",
  "rand 0.10.2",
  "rand_distr 0.6.0",
  "rayon",

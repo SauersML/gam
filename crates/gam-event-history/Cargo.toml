@@ -23,6 +23,7 @@ gam-solve = { path = "../gam-solve", version = "=0.3.157" }
 gam-terms = { path = "../gam-terms", version = "=0.3.157" }
 log = "0.4.29"
 ndarray = { version = "0.17.2", features = ["serde", "rayon"] }
+opt.workspace = true
 rand = { version = "0.10.1", default-features = false }
 rand_distr = { version = "0.6.0", default-features = false }
 rayon = "1.12.0"

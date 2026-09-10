@@ -3,6 +3,11 @@
 //! at a coefficient mode. Reference and subject integrals are cached once per
 //! draw, with their resolution estimates retained separately.
 use super::*;
+#[path = "strength_fit.rs"]
+mod strength_fit;
+pub use strength_fit::{
+    JointStrengthOptimum, StrengthOptimizationOptions, StrengthResolutionReport,
+};
 
 /// An independent draw from a normalized proposal density in the model's
 /// coefficient chart. The caller must supply the COMPLETE proposal density
@@ -15,6 +20,7 @@ pub struct CoefficientImportanceDraw {
 }
 
 pub struct JointCoefficientIntegral<'p, 'm> {
+    cohort_identity: std::sync::Arc<()>,
     priors: &'p JointFunctionPriors<'m>,
     draws: Vec<CoefficientImportanceDraw>,
     log_likelihood: Vec<f64>,
@@ -155,6 +161,7 @@ impl JointCohortIntegration<'_, '_> {
                 inner_log_error_estimate.max(value.report().log_error_estimate);
         }
         Ok(JointCoefficientIntegral {
+            cohort_identity: std::sync::Arc::clone(&self.identity),
             priors,
             draws,
             log_likelihood,
@@ -393,6 +400,7 @@ mod tests {
             log_likelihood.push(count as f64 * beta - exposure * hazard);
         }
         let bank = JointCoefficientIntegral {
+            cohort_identity: std::sync::Arc::new(()),
             priors: &priors,
             draws,
             log_likelihood,
@@ -447,6 +455,7 @@ mod tests {
             log_likelihood.push(-0.5 * (x + 0.8 * z * z - 0.5).powi(2) - 0.2 * z * z);
         }
         let bank = JointCoefficientIntegral {
+            cohort_identity: std::sync::Arc::new(()),
             priors: &priors,
             draws,
             log_likelihood,

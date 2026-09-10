@@ -9,13 +9,15 @@ pub use resolution::{CohortScoreTolerance, JointCohortResolutionReport, Resolved
 mod coefficients;
 pub use coefficients::{
     CoefficientImportanceDraw, EvidenceHessianProduct, JointCoefficientEvidence,
-    JointCoefficientIntegral,
+    JointCoefficientIntegral, JointStrengthOptimum, StrengthOptimizationOptions,
+    StrengthResolutionReport,
 };
 
 /// A fixed sampled objective. Subject banks must have independent importance
 /// draws conditional on the reference populations. A stratum is its positional
 /// reference index; labels are never sorted or recoded here.
 pub struct JointCohortIntegration<'a, 'm> {
+    identity: std::sync::Arc<()>,
     model: &'m JointLikelihood,
     subjects: &'a [JointIntegration<'m>],
     references: &'a [ResolvedReference<'m>],
@@ -152,6 +154,7 @@ impl JointLikelihood {
             ));
         }
         Ok(JointCohortIntegration {
+            identity: std::sync::Arc::new(()),
             model: self,
             subjects,
             references,

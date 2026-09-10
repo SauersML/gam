@@ -27,7 +27,8 @@ pub use cohort::{
     CoefficientImportanceDraw, CohortScoreTolerance, EvidenceHessianProduct,
     JointCoefficientEvidence, JointCoefficientIntegral, JointCohortEvaluation,
     JointCohortIntegration, JointCohortPosterior, JointCohortResolutionReport, JointCohortScore,
-    JointPriorScore, ResolvedCohortScore,
+    JointPriorScore, JointStrengthOptimum, ResolvedCohortScore, StrengthOptimizationOptions,
+    StrengthResolutionReport,
 };
 pub use decoder_prior::DecoderPriorEvaluation;
 pub use function_prior::{FunctionPenalty, FunctionPriorEvaluation, JointFunctionPriors};

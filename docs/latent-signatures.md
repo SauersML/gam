@@ -215,9 +215,9 @@ This identity does not justify an arbitrary identity ridge on nonlinear
 decoder logits, rate coordinates, or an intercept. Nonlinear function priors
 also need their normalization and coordinate Jacobians in any evidence
 calculation; substituting a Gaussian penalty determinant would change the
-objective. The function priors and a fixed-bank coefficient integral below
-are implemented. Automatic proposal construction, resolution and
-hyperparameter optimization are unfinished.
+objective. The function priors, fixed-bank coefficient integral and assessed
+interior strength optimization below are implemented. Automatic proposal
+construction/refinement and null-boundary inference are unfinished.
 
 ### Decoder function prior
 
@@ -312,8 +312,8 @@ scaled before multiplication so `exp(rho)` need not itself be representable.
 coefficient Hessian products, strength derivatives, and mixed products without
 a full coefficients-by-strengths matrix. Roots and evaluation workspace are
 bounded before construction. These are normalized densities on their penalized
-blocks. GAM operator-specific smoothness penalties, the automatic coefficient
-integration driver, and REML/LAML optimization still need completion.
+blocks. GAM operator-specific smoothness penalties and the automatic
+coefficient-integration/boundary driver still need completion.
 
 ### Physical rates and observation measures
 
@@ -385,10 +385,50 @@ normalization, independence and chart Jacobians are a caller contract; MCMC
 draws cannot be substituted while retaining these standard-error formulas.
 
 This is a coefficient-integration component, not a fit or a finished REML
-driver. Automatic proposals, independent refinement checks, null boundaries,
-converged strength optimization and integrated serving remain unfinished.
+driver. Automatic proposals/refinement, null boundaries and integrated serving
+remain unfinished.
 Tests compare the Poisson/Gamma integral and posterior means with closed
 forms, and the complete sampled gradient/Hessian with direct differentiation.
+
+### Assessed interior strength optimization
+
+`JointCoefficientIntegral::optimize_strengths` maximizes the integrated
+evidence with the workspace's pinned `opt` BFGS implementation. It supplies
+analytic first derivatives, uses no strength bounds, and disables the generic
+relative-stall exit. The final evidence score is recomputed and must satisfy
+the absolute tolerance in dimensionless log-strength coordinates. A failed
+solve never yields a strength optimum.
+
+Acceptance also requires a separate independent coefficient bank from the
+same cohort and the same frozen function measure. Those validation draws
+must not have selected the fitting bank or its optimum. Cohort identities are
+retained by both banks; unrelated datasets or duplicated banks are rejected.
+The negative evidence Hessian must admit a Cholesky factor without clipping
+or jitter. That factor defines the units for comparing strength scores and
+curvatures between banks. The report includes the log-evidence discrepancy,
+whitened score/curvature errors, and the largest posterior-mean error in
+coefficient posterior-SD units. Effective sample counts and all resolution
+targets must pass.
+
+Inner likelihood errors are propagated through normalized weights. If every
+cached log likelihood changes by at most `d`, weight ratios lie between
+`exp(-2d)` and `exp(2d)`; this gives score, curvature and mean perturbation
+bounds from weighted centered moments. Here `d` is an estimated numerical
+error, so the resulting diagnostics remain estimates rather than deterministic
+or simultaneous confidence certificates. Correlated transformed Hessian
+errors use sums of absolute transformation coefficients. A small optimization
+gradient cannot suppress any of these error terms.
+
+The returned `JointStrengthOptimum` retains its coefficient draws, weights and
+posterior means. It is an assessed interior optimum of the supplied sampled
+integral, not a completed joint-model fit or a guarantee of global optimality.
+Proposal coverage/integrability, automatic refinement, exact null-boundary
+comparisons, the selected entry law and serving still need completion. The
+dense optimizer/curvature workspace is checked together with both banks
+before optimization; a memory rejection is a computational limitation, not
+evidence against an additional signature. A conjugate Poisson/Gamma test
+checks the learned strength against its analytic optimum and requires
+underresolved or nonstationary results to fail.
 
 Training may use a structured variational approximation with local Gaussian
 state factors and temporal precision blocks, plus shared parameter factors.
