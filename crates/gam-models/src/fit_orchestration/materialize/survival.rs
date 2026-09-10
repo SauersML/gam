@@ -1047,7 +1047,7 @@ pub(crate) fn materialize_survival<'a>(
                 slope_offset: log_sigma_offset.clone(),
                 score_warp: marginal_slope_score_warp.clone(),
                 link_dev: marginal_slope_link_dev.clone(),
-                latent_z_policy: Default::default(),
+                latent_z_policy: config.marginal_slope_latent_policy(),
                 score_influence_jacobian: marginal_slope_jac_oof.clone(),
             },
             options: BlockwiseFitOptions {

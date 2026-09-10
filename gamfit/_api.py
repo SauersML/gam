@@ -13,6 +13,7 @@ from typing import Any, NamedTuple, overload
 
 from ._binding import RustExtensionUnavailableError, extension_status, rust_module
 from ._calibrated_slope import CtnStage1, normalize_ctn_stage1
+from ._ctn_model import CtnMarginalSlopeModel, fit_ctn_chain
 from ._cuda import cuda_diagnostics as _cuda_diagnostics
 from ._cuda import cuda_subprocess_env as _cuda_subprocess_env
 from ._cuda import cuda_subprocess_library_dirs as _cuda_subprocess_library_dirs
@@ -288,12 +289,14 @@ def _build_fit_payload(
         "offset": offset,
         "weights": weights,
     }
-    ctn_stage1_recipe = normalize_ctn_stage1(transformation_normal_stage1)
+    if transformation_normal_stage1 is not None:
+        raise ValueError("CtnStage1 uses gamfit.fit with labelled data; it is not a native payload option")
+    if config and "ctn_stage1" in config:
+        raise ValueError("the experimental Rust influence path is not a Python prediction API; use CtnStage1")
     kwarg_items: dict[str, Any] = {
         "negative_binomial_theta": negative_binomial_theta,
         "expectile_tau": expectile_tau,
         "transformation_normal": transformation_normal,
-        "ctn_stage1": ctn_stage1_recipe.to_rust_recipe() if ctn_stage1_recipe else None,
         "survival_likelihood": survival_likelihood,
         "survival_time_anchor": survival_time_anchor,
         "baseline_target": baseline_target,
@@ -896,20 +899,12 @@ def fit(
         Fit a conditional transformation-normal model (``h(Y|x) ~ N(0,1))``).
         Corresponds to ``--transformation-normal``.
     transformation_normal_stage1:
-        Stage-1 CTN recipe for a *calibrated* marginal-slope chain
-        (:class:`gamfit.CtnStage1`, or a mapping of its fields). Supply it on a
-        marginal-slope model (``family="bernoulli-marginal-slope"`` or a
-        survival ``survival_likelihood="marginal-slope"``) to auto-enable the
-        cross-fitted, Neyman-orthogonal score calibration of #461: the Rust core
-        fits the CTN ``h(Y|x) ~ N(0,1)`` per fold, derives an out-of-fold latent
-        score ``z`` that replaces the in-sample one, and absorbs the Stage-1
-        score-influence directions so the fitted slope surface ``β(x)`` is
-        insensitive to Stage-1 calibration error. There is no boolean to toggle
-        orthogonalization — supplying this recipe *is* the request (magic by
-        default). A raw ``z_column`` selects the free-warp ``score_warp`` path.
-        All numerics stay in Rust; this only marshals the recipe. The Stage-1
-        ``response`` column must exist in ``data`` alongside the Stage-2
-        response and covariates.
+        CTN recipe with explicit fold or group columns. Returns a
+        :class:`CtnMarginalSlopeModel` containing a full-training CTN and an
+        ordinary marginal-slope outcome fitted on OOF transformed scores.
+        Prediction replays the saved CTN on the raw score. No influence
+        absorber or second score normalization is applied. Cross-fitting
+        alone supplies no orthogonality or outcome-calibration guarantee.
     survival_likelihood:
         Survival likelihood formulation. One of ``"transformation"``,
         ``"weibull"``, ``"location-scale"``, ``"marginal-slope"``,
@@ -1106,6 +1101,14 @@ def fit(
         Rust engine errors are mapped into the typed gamfit exception
         hierarchy.
     """
+    if transformation_normal_stage1 is not None:
+        options = {name: value for name, value in locals().items()
+                   if name in inspect.signature(fit).parameters
+                   and name not in {"data", "formula", "transformation_normal_stage1"}}
+        if response_geometry is not None:
+            raise ValueError("CtnStage1 does not support response_geometry")
+        return fit_ctn_chain(fit, data, formula,
+                             normalize_ctn_stage1(transformation_normal_stage1), options)
     if constraints:
         # Alias normalization, smooth-term scanning, and the `shape=` rewrite all
         # live in Rust (`gam::terms::smooth::apply_shape_constraints_to_formula`);
@@ -1530,6 +1533,8 @@ def loads(model_bytes: bytes) -> Model:
     # `Model` archive nor a multinomial payload, so detect them first by the
     # schema tag and reconstruct a `ResponseGeometryModel`.
     head = model_bytes[:256].lstrip()
+    if head.startswith(b"{") and b"gamfit.CtnMarginalSlopeModel" in model_bytes[:256]:
+        return CtnMarginalSlopeModel.from_payload(json.loads(model_bytes))
     if head.startswith(b"{") and b"gamfit.ResponseGeometryModel" in model_bytes[:512]:
         payload = json.loads(model_bytes.decode("utf-8"))
         if str(payload.get("schema", "")).startswith("gamfit.ResponseGeometryModel/"):

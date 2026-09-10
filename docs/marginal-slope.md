@@ -47,11 +47,17 @@ When the score must be conditioned on covariates to reach the latent
 `N(0, 1)` scale, supply a Stage-1 transformation-normal recipe with
 `transformation_normal_stage1=`. This is the single calibrated
 marginal-slope entry: it fits the conditional transformation
-`h(score | covariates) ~ N(0, 1)`, cross-fits it out-of-fold, and absorbs
-the Stage-1 score-influence directions so the fitted slope surface
-`β(x)` is insensitive to Stage-1 calibration error (Neyman-orthogonal
-cross-fitting). You do not materialise or pass a `z_column` yourself — the
-conditioned score is produced and cross-fitted inside the one fit.
+`h(score | covariates) ~ N(0, 1)` in each fold's training complement. An
+ordinary penalized marginal-slope outcome uses those OOF scores, with no
+influence absorber or second normalization. A separate full-training CTN is
+saved together with the outcome in `CtnMarginalSlopeModel`. Prediction replays
+that frozen transform on raw scores. Cross-fitting alone establishes neither
+Neyman orthogonality nor outcome calibration.
+
+Supply explicit fold labels or a group column. Group assignment is seeded and
+independent of row order; supplied folds are checked for group separation when
+both columns are present. All fitting data must belong to the outer training
+sample. Fold-local knots and geometry never use the outer test sample.
 
 ```python
 model = gamfit.fit(
@@ -62,11 +68,14 @@ model = gamfit.fit(
     transformation_normal_stage1=gamfit.CtnStage1(
         response="raw_score",
         covariates="duchon(pc1, pc2, pc3, pc4, centers=20)",
+        group_column="family_id", folds=2, seed=20260910,
     ),
     scale_dimensions=True,
 )
 
-probs = model.predict(test_df, return_type="dict")["mean"]
+probs = model.predict(test_df)
+model.save("predictor.gamfit")
+probs_reloaded = gamfit.load("predictor.gamfit").predict(test_df)
 ```
 
 By default, Bernoulli marginal-slope prediction returns a 1-D NumPy
@@ -84,8 +93,12 @@ symmetric about `linear_predictor` on the link scale.
 - `transformation_normal_stage1=gamfit.CtnStage1(response=..., covariates=...)`
   is the Stage-1 recipe: `response` is the raw score column to condition,
   `covariates` is the covariate-side formula right-hand side used to fit
-  `h(score | covariates) ~ N(0, 1)`. Supplying it *is* the request for the
-  orthogonalized chain — there is no separate boolean.
+  `h(score | covariates) ~ N(0, 1)`. `fold_column` supplies explicit labels;
+  `group_column` assigns entire families together. Failed folds raise an error.
+- Saved `transform` and `outcome` components are available for manual replay.
+  Outcome intervals are conditional on the fitted CTN, not full two-stage
+  uncertainty estimates. The experimental Rust influence path is separate
+  from this Python prediction API.
 - The base link is fixed to probit. The Python `link=` keyword is not
   needed for marginal-slope fits.
 
@@ -93,6 +106,13 @@ The main formula controls the baseline risk; `slope_formula` controls
 the strength of the score effect at each point in covariate space.
 
 The same recipe drives the survival likelihood:
+
+For prospective net survival, the saved chain also exposes
+`model.survival_at(baseline_df, [1., 3., 5.])`. It supplies the requested
+times and zero event indicators internally, without reading observed outcome
+times. `entry_time=a0` conditions the curve on a common event-free entry time;
+use absolute times `a0 + horizon` in that case. Competing-risk incidence needs
+separate cause components and a CIF, not one minus disease-only net survival.
 
 ```python
 model = gamfit.fit(
@@ -103,6 +123,7 @@ model = gamfit.fit(
     transformation_normal_stage1=gamfit.CtnStage1(
         response="raw_score",
         covariates="s(bmi) + s(hba1c)",
+        group_column="family_id", folds=2,
     ),
 )
 
@@ -212,9 +233,11 @@ standardised score produced outside this pipeline — pass it directly with
 `z_column=` and omit the Stage-1 recipe. This raw-`z` path uses the
 free-warp `score_warp` fallback for shape miscalibration, and the
 automatic latent-measure gate described below for conditional
-miscalibration; prefer the calibrated chain above when the score's
-Stage-1 model is itself part of what you want the fit to be orthogonal
-to.
+miscalibration. Use `config={"frozen_score": True}` when an external
+transformation already supplies the declared conditional standard-normal
+measure and must not be normalized again. This asserts a score-distribution
+assumption; it does not prove it. Prefer the CTN chain when the fitted
+transformation should travel with the outcome predictor.
 
 ```python
 model = gamfit.fit(
@@ -394,6 +417,7 @@ gamfit.fit(df,
     slope_formula="s(age)",
     transformation_normal_stage1=gamfit.CtnStage1(
         response="raw_score", covariates="s(age)",
+        group_column="family_id", folds=2,
     ),
     frailty_kind="gaussian-shift",
     frailty_sd=0.3,
@@ -442,9 +466,10 @@ df = pd.DataFrame({
     "pc3":  rng.normal(0, 1, n),
 })
 df["disease"] = (rng.uniform(0, 1, n) < 0.25).astype(float)
+df["family_id"] = np.arange(n)  # This illustrative sample is unrelated.
 
 # Condition the score on the PCs and fit the slope surface in one
-# cross-fitted, orthogonalized call.
+# cross-fitted predictive call.
 model = gamfit.fit(
     df,
     "disease ~ matern(pc1, pc2, pc3, centers=20)",
@@ -453,10 +478,11 @@ model = gamfit.fit(
     transformation_normal_stage1=gamfit.CtnStage1(
         response="PGS",
         covariates="matern(pc1, pc2, pc3, centers=20)",
+        group_column="family_id", folds=2,
     ),
     scale_dimensions=True,
 )
 
 test = df.head(50).copy()
-probs = model.predict(test, return_type="dict")["mean"]
+probs = model.predict(test)
 ```

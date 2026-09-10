@@ -13,15 +13,10 @@ This test reconstructs that repro deterministically (it was lost once when the
 ad-hoc ``repro_surv.py`` was deleted) so the bug can never silently regress and
 the reproducer is preserved in-tree.
 
-Status: #808 is OPEN. The v2 "W-aware operating-point identifiability
-reduction" landed but does NOT fix it: on this design the priority-ordered
-Gram-Schmidt selector drops the *entire* slope block (``slope N -> 0``,
-because time+marginal already span its W-metric directions) yet the frozen
-residual lives in the *time* block (``block_grad_inf ~= [159, 19, 2]``), so the
-stall persists. The test therefore asserts the DESIRED post-fix contract
-(the fit converges to a usable model) and is marked ``xfail(strict=True)``.
-When #808 is genuinely fixed this test will XPASS; flip it to a hard assertion
-at that point and delete the xfail marker.
+This is a hard numerical acceptance test, not an issue-status record. A closed
+issue or an old convergence comment is not evidence that the current build
+passes. Predictions must be finite, nonconstant and monotone on the requested
+time grid, and score contrasts must not vanish through block removal.
 
 The fit is run in a child process under a hard wall timeout so a stalled
 solve cannot hang CI; a timeout is treated as "did not converge" (the bug).
@@ -92,16 +87,22 @@ _CHILD = textwrap.dedent(
     # "outer optimization did not converge"). Sanity-check the fit is usable:
     # predict must produce finite, non-constant survival probabilities.
     pred = model.predict(d)
+    grid = np.linspace(40., 60., 41)
+    survival = np.asarray(pred.survival_at(grid))
+    assert np.isfinite(survival).all()
+    assert ((survival >= 0) & (survival <= 1)).all()
+    assert (np.diff(survival, axis=1) <= 1e-9).all()
+    low, high = d.copy(), d.copy()
+    low['PGS_z'], high['PGS_z'] = -1., 1.
+    contrast = (model.predict(high).survival_at(grid)
+                - model.predict(low).survival_at(grid))
+    assert np.max(np.abs(contrast)) > 1e-6, 'score-effect block was lost'
     sys.stdout.write("CONVERGED\\n")
     """
 )
 
 
-# #1512 / SPEC.md (xfail is never allowed): this stands FAILING as the signal of
-# the open #808 bug — clustered-PC survival marginal-slope inner solve stalls
-# (residual ~3.7e8 >> tol, frozen |g|=1.863); v2 W-aware reduction drops the
-# whole slope block but the residual lives in the time block, so the outer
-# REML never converges. Fix #808 to green this.
+# No xfail or relaxed convergence escape: numerical failure stays visible.
 def test_survival_marginal_slope_clustered_pc_converges_808() -> None:
     env = dict(os.environ)
     env.setdefault("OMP_NUM_THREADS", "1")

@@ -224,7 +224,7 @@ pub(crate) fn materialize_bernoulli_marginal_slope<'a>(
         frailty: config.frailty.clone(),
         score_warp: routing.score_warp,
         link_dev: routing.link_dev,
-        latent_z_policy: Default::default(),
+        latent_z_policy: config.marginal_slope_latent_policy(),
         score_influence_jacobian,
     };
 

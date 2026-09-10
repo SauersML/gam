@@ -37,6 +37,7 @@ from pathlib import Path
 from ._api import (
     SUPPORT_SAE_SCHEMA,
     CtnStage1,
+    CtnMarginalSlopeModel,
     SharedPrecisionGroup,
     bspline_basis,
     bspline_basis_derivative,

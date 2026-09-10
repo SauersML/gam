@@ -573,6 +573,11 @@ pub struct FitConfig {
     pub slope_formula: Option<String>,
     /// Column name for the z (exposure/dose) variable in marginal-slope models.
     pub z_column: Option<String>,
+    /// Consume an externally fitted latent score without fitting another
+    /// conditional or rank-based transform. Distribution checks remain on.
+    pub frozen_score: bool,
+    /// Standalone CTN response-basis options, also used by predictive cross-fitting.
+    pub transformation_normal_config: Option<TransformationNormalConfig>,
     /// Optional non-negative per-row training weights column.
     pub weight_column: Option<String>,
     /// Expectile asymmetry `τ ∈ (0, 1)` for `family = "expectile"`.
@@ -764,6 +769,8 @@ impl Default for FitConfig {
             noise_formula: None,
             slope_formula: None,
             z_column: None,
+            frozen_score: false,
+            transformation_normal_config: None,
             weight_column: None,
             expectile_tau: None,
             ctn_stage1: None,

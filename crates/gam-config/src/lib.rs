@@ -38,46 +38,52 @@ const DEFAULT_LEARNED_FRAILTY_SCALE: FrailtyScale = FrailtyScale::Learned { init
 
 impl CtnStage1Document {
     fn into_recipe(self) -> Result<CtnStage1Recipe, String> {
-        let mut config = TransformationNormalConfig::default();
-        if let Some(overrides) = self.config {
-            if let Some(value) = overrides.response_degree {
-                config.response_degree = value;
-            }
-            if let Some(value) = overrides.response_num_internal_knots {
-                config.response_num_internal_knots = value;
-            }
-            if let Some(value) = overrides.response_penalty_order {
-                config.response_penalty_order = value;
-            }
-            if let Some(value) = overrides.response_extra_penalty_orders {
-                config.response_extra_penalty_orders = value;
-            }
-            if let Some(value) = overrides.double_penalty {
-                config.double_penalty = value;
-            }
-        }
-        if config.response_degree == 0 {
-            return Err("ctn_stage1.config.response_degree must be >= 1".to_string());
-        }
-        if config.response_num_internal_knots < 2 {
-            return Err("ctn_stage1.config.response_num_internal_knots must be >= 2".to_string());
-        }
-        if config.response_penalty_order == 0
-            || config
-                .response_extra_penalty_orders
-                .iter()
-                .any(|order| *order == 0)
-        {
-            return Err("ctn_stage1 response penalty orders must be >= 1".to_string());
-        }
         CtnStage1Recipe::new(
             &self.response_column,
             &self.covariate_formula_rhs,
-            config,
+            resolve_ctn_config(self.config)?,
             self.weight_column.as_deref(),
             self.offset_column.as_deref(),
         )
     }
+}
+
+fn resolve_ctn_config(
+    overrides: Option<CtnStage1ConfigDocument>,
+) -> Result<TransformationNormalConfig, String> {
+    let mut config = TransformationNormalConfig::default();
+    if let Some(overrides) = overrides {
+        if let Some(value) = overrides.response_degree {
+            config.response_degree = value;
+        }
+        if let Some(value) = overrides.response_num_internal_knots {
+            config.response_num_internal_knots = value;
+        }
+        if let Some(value) = overrides.response_penalty_order {
+            config.response_penalty_order = value;
+        }
+        if let Some(value) = overrides.response_extra_penalty_orders {
+            config.response_extra_penalty_orders = value;
+        }
+        if let Some(value) = overrides.double_penalty {
+            config.double_penalty = value;
+        }
+    }
+    if config.response_degree == 0 {
+        return Err("ctn_stage1.config.response_degree must be >= 1".to_string());
+    }
+    if config.response_num_internal_knots < 2 {
+        return Err("ctn_stage1.config.response_num_internal_knots must be >= 2".to_string());
+    }
+    if config.response_penalty_order == 0
+        || config
+            .response_extra_penalty_orders
+            .iter()
+            .any(|order| *order == 0)
+    {
+        return Err("ctn_stage1 response penalty orders must be >= 1".to_string());
+    }
+    Ok(config)
 }
 
 #[derive(Clone, Debug)]
@@ -211,6 +217,10 @@ pub fn resolve_fit_request_config(
         fit_config.slope_time_degree = value;
     }
     fit_config.z_column = json_config.z_column;
+    fit_config.frozen_score = json_config.frozen_score.unwrap_or(false);
+    if let Some(config) = json_config.transformation_normal_config {
+        fit_config.transformation_normal_config = Some(resolve_ctn_config(Some(config))?);
+    }
     if let Some(formula) = json_config.slope_formula {
         fit_config.slope_formula = Some(formula);
     }
