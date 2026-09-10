@@ -169,7 +169,14 @@ filter per once-only mark plus one, over a reference grid, independent of the
 number of subjects.
 
 The normaliser is held as data over each solve and refreshed between them, and
-the fit reports how far it moved at each round (`normaliser_rounds`). Holding
+the fit reports how far it moved at each round (`normaliser_rounds`) and the
+level it settled at (`normaliser_settled`). The rounds take the secant step on
+the residual rather than walking the alternation, since walking it costs a
+solve per term. They settle at the level the solves under them can resolve —
+each round's fit is converged to its own tolerance, and that noise on the
+normaliser is a floor the rounds cannot go below — so the fit stops when two
+rounds fail to improve on the best and returns the best point it reached, not
+the last one it tried. Holding
 it costs no consistency: `log M` is predictable, so the score it contributes,
 `−Σ_events ∂log M + ∫ R λ ∂log M`, has expectation zero by the compensator
 identity, and the estimating equation the held normaliser defines is unbiased.

@@ -1510,6 +1510,12 @@ pub struct EventHistoryFit {
     pub reference_risk_mass: Vec<f64>,
     /// How many distinct risk sets the marks define.
     pub reference_masks: usize,
+    /// The level, in nats, the re-centring alternation settled at: the
+    /// smallest move any round achieved. It is bounded below by the
+    /// convergence of the solves the rounds are made of, so a value near that
+    /// floor is the alternation having converged as far as the fits under it
+    /// can resolve, not a failure to converge.
+    pub normaliser_settled: f64,
     /// The largest disagreement, in nats, between the reference grid the
     /// normaliser was taken on and the same grid with every cell halved.
     /// `None` when the baselines are centred on the stationary prior.
@@ -2656,6 +2662,7 @@ fn assemble(
         normaliser_rounds: Vec::new(),
         reference_risk_mass: Vec::new(),
         reference_masks: 0,
+        normaliser_settled: f64::INFINITY,
         reference_certificate: None,
         reference_normaliser: Vec::new(),
     })
@@ -3021,10 +3028,18 @@ pub fn fit_event_history(
     let mut reference_risk_mass: Vec<f64> = Vec::new();
     let mut reference_normaliser: Vec<f64> = Vec::new();
     let mut reference_masks = 0usize;
+    let mut normaliser_settled = f64::INFINITY;
     if spec.reference.is_some() && fit.rank() > 0 {
         let mut held: Option<Arc<Vec<f64>>> = None;
         let mut previous_point: Option<Vec<f64>> = None;
         let mut previous_residual: Option<Vec<f64>> = None;
+        // The best point the alternation has reached, and how many rounds
+        // have failed to improve on it. Each round's fit is solved to its own
+        // tolerance, so the residual cannot fall below the level that solve
+        // noise puts on the normaliser; past that the rounds jitter around a
+        // floor rather than converging, and walking further buys nothing.
+        let mut best: Option<(f64, Arc<Vec<f64>>)> = None;
+        let mut stalled = 0usize;
         for _ in 0..spec.normaliser_rounds {
             let centring = fit
                 .family
@@ -3047,10 +3062,26 @@ pub fn fit_event_history(
             reference_risk_mass = centring.log_risk_mass;
             reference_masks = centring.masks;
             reference_normaliser = next.clone();
+            if let Some(current) = held.as_ref() {
+                if best.as_ref().is_none_or(|(seen, _)| moved < *seen) {
+                    best = Some((moved, Arc::clone(current)));
+                    stalled = 0;
+                } else {
+                    stalled += 1;
+                }
+            }
             if moved <= spec.normaliser_tolerance {
                 log::info!(
                     "[event-history] risk-set centring round {}: the normaliser moved {moved:.3e} nats: settled",
                     normaliser_rounds.len()
+                );
+                break;
+            }
+            if stalled >= 2 {
+                log::info!(
+                    "[event-history] risk-set centring round {}: the normaliser moved {moved:.3e} nats and two rounds have not improved on {:.3e}: settled at the floor the inner solves leave",
+                    normaliser_rounds.len(),
+                    best.as_ref().map_or(f64::NAN, |(seen, _)| *seen)
                 );
                 break;
             }
@@ -3139,7 +3170,13 @@ pub fn fit_event_history(
             // of an alternation whose intermediate points are discarded.
             fit = fit_at_rank(cohort, spec, rank, Some(&start), pin, held.clone())?;
         }
-        // The settled normaliser's own fit is the one certified.
+        // The settled normaliser's own fit is the one certified — the best
+        // point the alternation reached, which is not always the last one it
+        // tried once the rounds are jittering on their floor.
+        if let Some((level, point)) = best.as_ref() {
+            normaliser_settled = *level;
+            held = Some(Arc::clone(point));
+        }
         if !normaliser_rounds.is_empty() {
             let rank = fit.rank();
             let start = RankStart::carried(
@@ -3215,6 +3252,7 @@ pub fn fit_event_history(
     fit.normaliser_rounds = normaliser_rounds;
     fit.reference_risk_mass = reference_risk_mass;
     fit.reference_masks = reference_masks;
+    fit.normaliser_settled = normaliser_settled;
     fit.reference_certificate = reference_certificate;
     fit.reference_normaliser = reference_normaliser;
     Ok(fit)
