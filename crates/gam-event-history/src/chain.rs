@@ -521,11 +521,11 @@ pub(crate) fn forward_operators<S: JetField>(
         let new = &to.axes[axis];
         let phi = &transition.phi;
         let q = &transition.innovation;
-        let root_q = sqrt(q);
+        let root_q = if q.value() == 0.0 { q.constant_like(0.0) } else { sqrt(q) };
         let sigma2 = square(&old.sigma);
         let tau2 = square(phi).mul(&sigma2).add(q);
         let inv_tau2 = recip(&tau2);
-        let ratio = sqrt(&q.mul(&inv_tau2));
+        let ratio = if q.value() == 0.0 { q.constant_like(0.0) } else { sqrt(&q.mul(&inv_tau2)) };
         let phi_mu = phi.mul(&old.mu);
         // The standardised innovation at inner node `x` of target point `z'`:
         // with `z = μ + √2 σ (centre + ratio·x)` and `d = z' − φμ`,
@@ -607,7 +607,9 @@ pub(crate) fn backward_axis_bases<S: JetField>(
         .map(|(axis, transition)| {
             let old = &from.axes[axis];
             let new = &to.axes[axis];
-            let spread = sqrt(&transition.innovation.scale(2.0));
+            let spread = if transition.innovation.value() == 0.0 {
+                transition.innovation.constant_like(0.0)
+            } else { sqrt(&transition.innovation.scale(2.0)) };
             let inverse_scale = recip(&new.sigma.scale(std::f64::consts::SQRT_2));
             let mut bases = vec![old.mu.constant_like(0.0); g * g * g];
             for i in 0..g {

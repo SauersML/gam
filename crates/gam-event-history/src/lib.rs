@@ -20,6 +20,7 @@ mod formula;
 mod marginal;
 mod preserve;
 mod scalar;
+mod static_state;
 
 pub use cohort::{
     CohortNodes, CovariateSegment, Event, EventHistoryCohort, EventHistoryError, MarkKind,

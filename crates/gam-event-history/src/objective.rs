@@ -46,8 +46,9 @@ impl EventHistoryFamily {
         let rates = self.atom_rates(&latent);
         let out = self.reference_values(&beta,
             &beta[latent_offset..latent_offset + self.marks() * self.atoms], &rates)?;
-        let (_, mask_of_mark) = crate::preserve::killing_masks(&self.reference.as_ref().unwrap().kinds);
-        let tables = self.reference.as_ref().unwrap();
+        let tables = self.reference.as_ref()
+            .ok_or_else(|| "reference centring requires reference tables".to_string())?;
+        let (_, mask_of_mark) = crate::preserve::killing_masks(&tables.kinds);
         Ok(RiskSetCentring { grid: tables.grid.clone(), profiles: tables.profiles.clone(),
             coefficients: beta, node_stratum: tables.node_stratum.clone(),
             log_normaliser: out.log_normaliser,
@@ -66,7 +67,8 @@ impl EventHistoryFamily {
         let rates: Vec<S> = self.free_rate_slots().iter().enumerate().map(|(k, slot)| {
             match slot {
                 Some(slot) => rate_from_chart(self.rate_band, &beta[latent_offset + slot]),
-                None => beta[0].constant_like(self.held_rates[k].unwrap()),
+                None => beta[0].constant_like(self.held_rates[k]
+                    .expect("a non-free atom rate has a held value")),
             }
         }).collect();
         let normalisers = if let (Some(tables), true) = (self.reference.as_ref(), self.atoms > 0) {
@@ -237,8 +239,27 @@ mod tests {
         }
     }
 
+    fn recurrent_family(event_time: f64, rates: Vec<Option<f64>>, order: usize) -> (EventHistoryFamily, Vec<ParameterBlockState>) {
+        let mut cohort = EventHistoryCohort {
+            mark_names: vec!["event".to_string()], mark_kinds: vec![MarkKind::Recurrent],
+            covariate_names: Vec::new(), covariate_levels: Vec::new(), covariates: Array2::zeros((1, 0)),
+            subjects: vec![SubjectHistory { id: "one".to_string(), entry: 0.0, exit: 1.0,
+                events: vec![Event { time: event_time, mark: 0 }],
+                segments: vec![CovariateSegment { start: 0.0, row: 0 }] }],
+        };
+        cohort.validate().unwrap();
+        let nodes = Arc::new(expand_nodes(&cohort, 9, 0).unwrap());
+        let states = vec![
+            ParameterBlockState { beta: array![0.0], eta: Array1::zeros(nodes.total_nodes) },
+            ParameterBlockState { beta: array![2.0, 0.0], eta: Array1::zeros(nodes.total_nodes) },
+        ];
+        let family = EventHistoryFamily::new(nodes.clone(), vec![Arc::new(Array2::ones((nodes.total_nodes, 1)))],
+            2, order, 1.0, rates).unwrap();
+        (family, states)
+    }
+
     #[test]
-    fn added_static_factor_rejects_unresolved_curvature() {
+    fn static_factor_curvature_matches_the_time_invariant_integral() {
         let points = 4001;
         let mut mass = 0.0;
         let mut second = 0.0;
@@ -251,22 +272,9 @@ mod tests {
         }
         let expected = second / mass;
         assert!(expected < -0.3);
+        let mut curvatures = Vec::new();
         for event_time in [0.1, 0.5, 0.9] {
-            let mut cohort = EventHistoryCohort {
-                mark_names: vec!["event".to_string()], mark_kinds: vec![MarkKind::Recurrent],
-                covariate_names: Vec::new(), covariate_levels: Vec::new(), covariates: Array2::zeros((1, 0)),
-                subjects: vec![SubjectHistory { id: "one".to_string(), entry: 0.0, exit: 1.0,
-                    events: vec![Event { time: event_time, mark: 0 }],
-                    segments: vec![CovariateSegment { start: 0.0, row: 0 }] }],
-            };
-            cohort.validate().unwrap();
-            let nodes = Arc::new(expand_nodes(&cohort, 9, 4).unwrap());
-            let states = vec![
-                ParameterBlockState { beta: array![0.0], eta: Array1::zeros(nodes.total_nodes) },
-                ParameterBlockState { beta: array![2.0, 0.0], eta: Array1::zeros(nodes.total_nodes) },
-            ];
-            let family = EventHistoryFamily::new(nodes.clone(), vec![Arc::new(Array2::ones((nodes.total_nodes, 1)))],
-                2, 17, 1.0, vec![Some(1e-10), Some(1e-10)]).unwrap();
+            let (family, states) = recurrent_family(event_time, vec![Some(0.0), Some(0.0)], 33);
             let beta = vec![Mixed::seed(0.0, 0.0, 0.0), Mixed::seed(2.0, 0.0, 0.0), Mixed::seed(0.0, 1.0, 1.0)];
             let curvature = family.path_value(&states, &beta).unwrap().uv;
             let h = 1e-3;
@@ -274,9 +282,36 @@ mod tests {
             let finite = (eval(h) + eval(-h) - 2.0 * eval(0.0)) / (h * h);
             eprintln!("event {event_time}: AD={curvature}, finite={finite}, target={expected}");
             assert!((curvature - finite).abs() < 2e-5);
-            // The derivative is of the computed filter, whose high-frailty
-            // integral is unresolved here. It must not be used as evidence.
-            assert!(checked_loading_curvature(&family, &states).is_err());
+            assert!((curvature - expected).abs() < 1e-4, "{curvature} vs {expected}");
+            assert!(checked_loading_curvature(&family, &states).is_ok());
+            curvatures.push(curvature);
+        }
+        assert!(curvatures.iter().all(|c| (c - curvatures[0]).abs() < 1e-12));
+    }
+
+    #[test]
+    fn unresolved_near_static_curvature_is_rejected() {
+        let (family, states) = recurrent_family(0.1, vec![Some(1e-10), Some(1e-10)], 17);
+        assert!(checked_loading_curvature(&family, &states).is_err());
+    }
+
+    #[test]
+    fn mixed_static_and_dynamic_factors_have_finite_total_derivatives() {
+        let (family, mut states) = recurrent_family(0.5, vec![Some(0.0), Some(0.7)], 9);
+        states[1].beta = array![0.3, 0.2];
+        let joint = family.joint_evaluation(&states).unwrap();
+        for slot in 0..2 {
+            let h = 1e-4;
+            let mut plus = states.clone();
+            let mut minus = states.clone();
+            plus[1].beta[slot] += h;
+            minus[1].beta[slot] -= h;
+            let gp = family.exact_gradient(&plus).unwrap();
+            let gm = family.exact_gradient(&minus).unwrap();
+            for j in 0..3 {
+                let fd = -(gp[j] - gm[j]) / (2.0 * h);
+                assert!((fd - joint.hessian[[j, slot + 1]]).abs() < 1e-5);
+            }
         }
     }
 }

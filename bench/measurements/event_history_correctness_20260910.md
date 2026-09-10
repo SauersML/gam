@@ -28,9 +28,27 @@ inspection, and Git operations.
 * Reference time refinement at 36, 72, and 144 intervals gave absolute survival
   errors **4.1093e-5**, **1.0289e-5**, and **2.5732e-6**, respectively.
 
+## Static-factor correction
+
+A subsequent change represents the actual static boundary by rate zero and
+integrates a fully static history on a single posterior-adapted grid. With
+33 nodes per axis, added-loading curvature is **-0.3735106145** at event times
+0.1, 0.5, and 0.9. The independent integral gives **-0.3734935154**. The event-time
+spread is below **1e-12** and the finite-difference discrepancy below **2e-8**.
+The regression completed in **0.08 s**, following a **42.05 s** warm build.
+
+The five objective regressions subsequently **passed in 2.88 s** after a
+**35.92 s** warm build. They include mixed static/dynamic derivatives and
+continued rejection of unresolved near-static curvature.
+
+After making the slow-plateau proposal an actual static factor, the censored
+survival fit and PIT regression **passed in 0.84 s** (400 subjects); its
+Kaplan–Meier PIT distance was **0.019**. The final focused run completed with
+**33 passed, 0 failed in 27.40 s**, with 16 broader fit tests excluded.
+
 ## Unresolved results
 
-The high-variance static-frailty example still exposes latent-grid integration
+The high-variance near-static-frailty example still exposes latent-grid integration
 error. At event time 0.1, a 17-point-per-axis calculation gave loading curvature
 approximately **-0.45573**, versus **-0.37349** from independent integration.
 Automatic differentiation agreed with finite differences of the computed
@@ -42,6 +60,11 @@ Combined `cargo check` for `gam-pyffi` and `gam-cli` reached its **120 s** bound
 a cached retry reached its **90 s** bound. Neither is a successful integration
 check. No fresh native Python wheel, complete end-to-end fit suite, external
 calibration study, or biobank-scale benchmark was completed.
+
+A bounded profile of the optimized root build script identified its substring
+scanner as the integration-check bottleneck: about **75%** of sampled CPU time
+was in `find_banned_code_fragments` and its byte comparisons. This was a
+25-second, 49-Hz profile; the repository checks were not disabled.
 
 The directional-profile product and final Laplace rank criterion remain
 approximations, including a nonregular boundary. Their present implementation

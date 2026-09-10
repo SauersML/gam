@@ -554,9 +554,9 @@ pub(crate) struct NewAtom {
     pub ridge: RidgeProfile,
     /// The residuals cannot tell the proposed rate from one twice as slow
     /// (the gain is flat to double precision across that doubling), or the
-    /// proposal sits at [`resolvable_rate_band`]'s lower limit: the atom is
-    /// a static frailty as far as the data resolve, and every slower rate is
-    /// the same model.
+    /// proposal sits at [`resolvable_rate_band`]'s lower limit. This proposes
+    /// an actual static factor, whose likelihood is evaluated at rate zero.
+    /// Flatness of the proposal statistic does not prove likelihood equality.
     pub at_lower_limit: bool,
     /// The residuals cannot tell the proposed rate from one twice as fast,
     /// or the proposal wanted a rate the node mesh cannot resolve and was
@@ -786,7 +786,7 @@ pub(crate) fn best_new_atom(
     let at_lower_limit = point.rho <= lower + margin(lower) || flat_slower;
     let at_upper_limit = point.rho >= upper - margin(upper) || (flat_faster && !flat_slower);
     Ok(Some(NewAtom {
-        log_rate: point.rho,
+        log_rate: if at_lower_limit { f64::NEG_INFINITY } else { point.rho },
         direction,
         loading,
         eigenvalue: point.top,

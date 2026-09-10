@@ -246,11 +246,11 @@ impl EventHistoryFamily {
             || held_rates
                 .iter()
                 .flatten()
-                .any(|r| !(r.is_finite() && *r > 0.0))
+                .any(|r| !(r.is_finite() && *r >= 0.0))
         {
             return Err(EventHistoryError::InvalidInput {
                 reason: format!(
-                    "event-history family needs one positive finite or free rate per atom: got {:?} for {atoms} atoms",
+                    "event-history family needs one nonnegative finite or free rate per atom: got {:?} for {atoms} atoms",
                     held_rates
                 ),
             });
@@ -475,7 +475,7 @@ impl EventHistoryFamily {
         derivatives: bool,
     ) -> Result<(S, Vec<S>, Vec<S>), String> {
         self.validate_states(states)?;
-        if self.reference.is_some() && self.atoms > 0 {
+        if self.atoms > 0 && (self.reference.is_some() || self.held_rates.contains(&Some(0.0))) {
             return self.computed_joint(states, u, v, derivatives);
         }
         let marks = self.marks();
@@ -758,9 +758,9 @@ impl EventHistoryFamily {
         };
         let loadings: Vec<f64> = latent.iter().take(marks * atoms).copied().collect();
         let rates: Vec<f64> = self.atom_rates(latent);
-        let centring = if self.reference.is_some() {
+        let centring = if let Some(reference) = self.reference.as_ref() {
             let values = self.refresh_normaliser(states)?;
-            Some(self.reference.as_ref().unwrap().carry_to_nodes(
+            Some(reference.carry_to_nodes(
                 &values.log_normaliser, self.marks(), self.nodes.total_nodes)
                 .map_err(|error| error.to_string())?)
         } else { None };
@@ -2042,7 +2042,8 @@ fn fit_at_rank(
             }
         } else {
             let rule = GaussHermite::new(next_order)?;
-            if rule.lebesgue_constant * f64::EPSILON * max_nodes as f64 > spec.quadrature_tolerance
+            if !built.family.held_rates.iter().all(|r| *r == Some(0.0))
+                && rule.lebesgue_constant * f64::EPSILON * max_nodes as f64 > spec.quadrature_tolerance
             {
                 return Err(EventHistoryError::NumericalFailure {
                     reason: format!(
@@ -2405,7 +2406,8 @@ fn checked_loading_curvature(probe: &EventHistoryFamily, states: &[ParameterBloc
     let next_order = probe.gh.order + 4;
     preflight(next_order, probe.atoms, probe.nodes.max_subject_nodes(), probe.marks(), probe.total_width())?;
     fine.gh = Arc::new(GaussHermite::new(next_order)?);
-    if fine.gh.lebesgue_constant * f64::EPSILON * probe.nodes.max_subject_nodes() as f64 > 1e-3 {
+    if !probe.held_rates.iter().all(|r| *r == Some(0.0))
+        && fine.gh.lebesgue_constant * f64::EPSILON * probe.nodes.max_subject_nodes() as f64 > 1e-3 {
         return Err(EventHistoryError::NumericalFailure { reason:
             "added-factor curvature cannot be resolved within the interpolation roundoff bound".to_string() });
     }
@@ -2718,17 +2720,24 @@ pub fn fit_event_history(
         let fine_family = fit.family.clone().with_reference(Some(Arc::new(refined)));
         let fine = fine_family.refresh_normaliser(&fit.fit.block_states)
             .map_err(|reason| EventHistoryError::Fit { reason })?;
-        let coarse = fit.family.reference.as_ref().unwrap();
+        let coarse = fit.family.reference.as_ref().ok_or_else(|| EventHistoryError::Fit {
+            reason: "reference fit is missing its coarse reference tables".to_string(),
+        })?;
+        let coarse_centring = fit.centring.as_ref().ok_or_else(|| EventHistoryError::Fit {
+            reason: "reference fit is missing its centring values".to_string(),
+        })?;
+        let fine_tables = fine_family.reference.as_ref()
+            .expect("the refined family was constructed with reference tables");
         let coarse_nodes = coarse.grid.len();
-        let fine_nodes = fine_family.reference.as_ref().unwrap().grid.len();
+        let fine_nodes = fine_tables.grid.len();
         let mut gap = 0.0_f64;
         // Compare on the fine grid, including midpoints and BOTH endpoints.
         for s in 0..strata.strata() {
             for n in 0..fine_nodes {
-                let (low, weight) = coarse.grid.locate(fine_family.reference.as_ref().unwrap().grid.times[n])?;
+                let (low, weight) = coarse.grid.locate(fine_tables.grid.times[n])?;
                 for (a, b, width) in [
-                    (&fit.centring.as_ref().unwrap().log_normaliser, &fine.log_normaliser, fit.marks()),
-                    (&fit.centring.as_ref().unwrap().log_risk_mass, &fine.log_risk_mass, fine.masks),
+                    (&coarse_centring.log_normaliser, &fine.log_normaliser, fit.marks()),
+                    (&coarse_centring.log_risk_mass, &fine.log_risk_mass, fine.masks),
                 ] {
                     for d in 0..width {
                         let left = a[(s * coarse_nodes + low) * width + d];

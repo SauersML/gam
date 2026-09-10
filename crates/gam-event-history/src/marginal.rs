@@ -185,9 +185,9 @@ pub(crate) fn transitions_across<S: JetField>(
         .iter()
         .map(|nu| {
             let kappa = nu.scale(gap / time_scale);
-            if !(kappa.value() > 0.0) {
+            if !(kappa.value().is_finite() && kappa.value() >= 0.0) {
                 return Err(numerical(format!(
-                    "atom transition across a gap of {gap}: rate · gap = {} is not positive (rate {})",
+                    "atom transition across a gap of {gap}: rate · gap = {} is not nonnegative and finite (rate {})",
                     kappa.value(),
                     nu.value()
                 )));
@@ -633,6 +633,9 @@ pub(crate) fn predict<S: JetField>(
     label: &str,
 ) -> Result<(Grid<S>, Vec<S>), EventHistoryError> {
     let atoms = transitions.len();
+    if atoms > 0 && transitions.iter().all(|t| t.innovation.value() == 0.0) {
+        return Ok((previous_grid.clone(), previous_alpha.to_vec()));
+    }
     let (means, variances) = posterior_moments(previous_grid, previous_alpha, label)?;
     let centres: Vec<S> = (0..atoms)
         .map(|k| transitions[k].phi.mul(&means[k]))
@@ -666,6 +669,14 @@ pub(crate) fn filter_step<S: JetField>(
     derivatives: bool,
     label: &str,
 ) -> Result<FilteredNode<S>, EventHistoryError> {
+    if !transitions.is_empty() && transitions.iter().all(|t| t.innovation.value() == 0.0) {
+        let likelihood = node_terms(previous_grid, derivatives);
+        let (alpha, normaliser) = condition(previous_grid, previous_alpha, &likelihood.ell,
+            likelihood.shift, label)?;
+        return Ok(FilteredNode { grid: previous_grid.clone(), transitions,
+            forward: OperatorFamily { per_axis: Vec::new(), order: gh.order },
+            predicted: previous_alpha.to_vec(), alpha, normaliser, likelihood });
+    }
     let (predictive, rough_predicted) =
         predict(gh, like, previous_grid, previous_alpha, &transitions, label)?;
     let rough = node_terms(&predictive, false);
@@ -1332,6 +1343,19 @@ fn filter_nodes<S: JetField>(
     let atoms = inputs.rates.len();
     let gh = inputs.gh;
     let like = &inputs.eta0[0];
+    if atoms > 0 && inputs.rates.iter().all(|r| r.value() == 0.0) {
+        if derivatives { return Err(numerical("static frailties use derivatives of the integrated objective")); }
+        let pass = crate::static_state::filter(inputs, None, &vec![true; marks])?;
+        return Ok((0..n_nodes).map(|n| {
+            let likelihood = node_likelihood(&pass.grids[n], &inputs.eta0[n * marks..(n + 1) * marks],
+                inputs.loadings, &counts_rows[n], &exposure_rows[n], None,
+                inputs.log_normaliser.map(|m| &m[n * marks..(n + 1) * marks]), marks, atoms, false);
+            FilteredNode { grid: pass.grids[n].clone(), transitions: Vec::new(),
+                forward: OperatorFamily { per_axis: Vec::new(), order: gh.order },
+                predicted: pass.predicted[n].clone(), alpha: pass.alpha[n].clone(),
+                normaliser: exp(&add_real(&pass.log_normalisers[n], -likelihood.shift)), likelihood }
+        }).collect());
+    }
     let mut filtered: Vec<FilteredNode<S>> = Vec::with_capacity(n_nodes);
     let forward_power: u8 = if derivatives { 2 } else { 0 };
     let node_terms = |grid: &Grid<S>, n: usize, store: bool| -> NodeLikelihood<S> {
@@ -1409,6 +1433,11 @@ fn backward_smoother<S: JetField>(
     with_innovation_moments: bool,
 ) -> Result<Smoothed<S>, EventHistoryError> {
     let n_nodes = filtered.len();
+    if !inputs.rates.is_empty() && inputs.rates.iter().all(|r| r.value() == 0.0) {
+        if with_innovation_moments { return Err(numerical("static frailties have no innovation scores")); }
+        return Ok(Smoothed { marginals: vec![filtered[n_nodes - 1].alpha.clone(); n_nodes],
+            innovation_moments: Vec::new() });
+    }
     let marks = inputs.nodes.counts.ncols();
     let atoms = inputs.rates.len();
     let gh = inputs.gh;
@@ -1492,7 +1521,9 @@ fn backward_smoother<S: JetField>(
         };
         let spreads: Vec<S> = transitions
             .iter()
-            .map(|t| sqrt(&t.innovation.scale(2.0)))
+            .map(|t| if t.innovation.value() == 0.0 {
+                t.innovation.constant_like(0.0)
+            } else { sqrt(&t.innovation.scale(2.0)) })
             .collect();
         let mut log_beta_n = Vec::with_capacity(size);
         let mut moments: HashMap<Vec<u8>, Vec<S>> = innovation_exponents
@@ -1659,6 +1690,9 @@ pub(crate) fn forward_filter<S: JetField>(
         return Err(numerical(
             "forward filter needs nodes, marks and a compensator mask",
         ));
+    }
+    if atoms > 0 && inputs.rates.iter().all(|r| r.value() == 0.0) {
+        return crate::static_state::filter(inputs, initial, compensated);
     }
     let like = &inputs.eta0[0];
     let mut grids: Vec<Grid<S>> = Vec::with_capacity(n_nodes);

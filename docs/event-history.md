@@ -114,6 +114,15 @@ stationarity checks compare gradients at fixed coefficients, converting their
 discrepancy to a coefficient shift through the fitted posterior covariance.
 The default acceptable shift is `0.05` posterior standard deviations.
 
+At the static boundary, an atom has rate zero. If every atom is static, the
+whole history is integrated on one quadrature grid placed using the mode and
+precision of its latent posterior. Node updates use that same grid, so moving
+a recurrent event within an otherwise constant-exposure interval leaves the
+likelihood and its loading curvature unchanged. Grid placement is differentiated.
+This path uses no transition interpolation; its integration order can therefore
+increase without the transition interpolant's roundoff restriction. Near-zero
+positive rates still require the dynamic solver's convergence checks.
+
 The state grid still has `G^K` points. Backward interpolation streams one
 source row at a time, so it no longer allocates the `G^(2K)` all-source kernel.
 This removes that quadratic memory allocation; it does not remove exponential
