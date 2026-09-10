@@ -116,3 +116,82 @@ def test_one_formula_per_mark_gives_each_mark_its_own_terms() -> None:
         assert "one per mark" in str(error)
     else:
         raise AssertionError("three formulas for two marks must be refused")
+
+
+def test_risk_set_centring_reads_the_baseline_as_the_incidence_among_those_at_risk() -> None:
+    # Two first-occurrence marks sharing one frailty: a frailty is identified
+    # across marks, not within one, where a baseline free to follow time
+    # already explains the only signature it has.
+    rng = np.random.default_rng(11)
+    n, follow_up = 400, 5.0
+    ids, times, marks, exits = [], [], [], []
+    for i in range(n):
+        frailty = rng.normal()
+        at_risk = {"a": True, "b": True}
+        rate = {"a": np.exp(-1.3 + 0.9 * frailty), "b": np.exp(-1.5 + 0.8 * frailty)}
+        t = 0.0
+        while True:
+            total = sum(rate[m] for m in ("a", "b") if at_risk[m])
+            if total <= 0:
+                break
+            t -= np.log(rng.uniform()) / total
+            if t >= follow_up:
+                break
+            live = [m for m in ("a", "b") if at_risk[m]]
+            mark = live[0] if len(live) == 1 else (
+                "a" if rng.uniform() * total < rate["a"] else "b"
+            )
+            ids.append(f"s{i}"), times.append(t), marks.append(mark)
+            at_risk[mark] = False
+        exits.append(follow_up)
+    subjects = pd.DataFrame({"id": [f"s{i}" for i in range(n)], "entry": 0.0, "exit": exits})
+    events = pd.DataFrame({"id": ids, "time": times, "mark": marks})
+    covariates = pd.DataFrame({"id": [f"s{i}" for i in range(n)], "start": 0.0, "x": 0.0})
+    kinds = {"a": "once", "b": "once"}
+
+    prior = gamfit.fit_event_history(subjects, events, covariates, "s(time)", marks=kinds)
+    centred = gamfit.fit_event_history(
+        subjects, events, covariates, "s(time)", marks=kinds, reference_profiles=[0]
+    )
+    assert prior.normaliser_rounds.size == 0, "the default centring refreshes no normaliser"
+    assert prior.reference_certificate is None
+    if centred.rank == 0:
+        # Without a resolved latent direction the two centrings are one model.
+        assert centred.normaliser_rounds.size == 0
+        return
+    assert centred.normaliser_rounds.size >= 1
+    assert centred.reference_masks >= 1
+    assert centred.reference_certificate is not None and centred.reference_certificate >= 0.0
+
+    # The empirical hazard of mark "a" among those still at risk for it, in
+    # bins of one time unit, against the fitted baseline read through the
+    # population forecast at the same times.
+    bins = 5
+    width = follow_up / bins
+    stop = {f"s{i}": follow_up for i in range(n)}
+    for sid, t, m in zip(ids, times, marks):
+        if m == "a":
+            stop[sid] = min(stop[sid], t)
+    empirical = []
+    for b in range(bins):
+        left, right = b * width, (b + 1) * width
+        exposure = sum(max(min(stop[f"s{i}"], right) - left, 0.0) for i in range(n))
+        count = sum(1 for t, m in zip(times, marks) if m == "a" and left <= t < right)
+        empirical.append(count / exposure)
+    assert empirical[-1] < 0.85 * empirical[0], f"the risk set must be visibly selected: {empirical}"
+
+    # exp(baseline) at a time, read as the expected count over a short window
+    # from the population tier with no history.
+    def baseline(model, t, w=0.02):
+        out = model.population_forecast({"x": 0.0}, start=t, horizons=[t + w])
+        return float(out["expected_counts"][0, 0]) / w
+
+    fitted = [baseline(centred, (b + 0.5) * width) for b in range(bins)]
+    prior_fitted = [baseline(prior, (b + 0.5) * width) for b in range(bins)]
+    for b in range(bins):
+        assert abs(fitted[b] - empirical[b]) / empirical[b] < 0.45, (
+            f"bin {b}: risk-set centred {fitted[b]} against empirical {empirical[b]}"
+        )
+    assert prior_fitted[-1] > fitted[-1], (
+        f"the prior's centring sits above the late risk set's rate: {prior_fitted} vs {fitted}"
+    )

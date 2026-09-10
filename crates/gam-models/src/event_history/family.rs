@@ -3084,7 +3084,13 @@ pub fn fit_event_history(
     // offset, so a shift in it is absorbed by the baseline it centres — but it
     // is the number that says whether the grid resolved the population's decay.
     let mut reference_certificate = None;
-    if let (Some(strata), Some(tables)) = (spec.reference.as_ref(), fit.family.reference()) {
+    // Only when a normaliser was actually taken: at rank zero there are no
+    // loadings, `log M ≡ 0`, and there is no grid resolution to certify.
+    if let (Some(strata), Some(tables), false) = (
+        spec.reference.as_ref(),
+        fit.family.reference(),
+        reference_normaliser.is_empty(),
+    ) {
         let refined = reference_tables(
             cohort,
             strata,
