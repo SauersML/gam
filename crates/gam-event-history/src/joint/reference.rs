@@ -37,11 +37,59 @@ impl JointReferenceProfile {
             measurements: vec![],
         }
     }
+
+    pub(super) fn midpoint(left: f64, right: f64) -> Result<f64, EventHistoryError> {
+        let mid = left + 0.5 * (right - left);
+        if !mid.is_finite() || mid <= left || mid >= right {
+            return Err(numerical(
+                "joint reference interval has no representable interior midpoint",
+            ));
+        }
+        Ok(mid)
+    }
+
+    /// Split the declared piecewise-linear baseline and piecewise-constant
+    /// drive without changing either function during a time comparison.
+    pub(super) fn refined(&self) -> Result<Self, EventHistoryError> {
+        let n = self.times.len();
+        let rows = n
+            .checked_mul(2)
+            .and_then(|n| n.checked_sub(1))
+            .ok_or_else(|| invalid("joint reference refinement dimension overflow"))?;
+        let mut times = Vec::with_capacity(rows);
+        for pair in self.times.windows(2) {
+            times.push(pair[0]);
+            times.push(Self::midpoint(pair[0], pair[1])?);
+        }
+        times.push(self.times[n - 1]);
+        let baseline_design =
+            Array2::from_shape_fn((rows, self.baseline_design.ncols()), |(i, j)| {
+                if i % 2 == 0 {
+                    self.baseline_design[[i / 2, j]]
+                } else {
+                    0.5 * self.baseline_design[[i / 2, j]]
+                        + 0.5 * self.baseline_design[[i / 2 + 1, j]]
+                }
+            });
+        let drive_design =
+            Array2::from_shape_fn((rows - 1, self.drive_design.ncols()), |(i, j)| {
+                self.drive_design[[i / 2, j]]
+            });
+        Ok(Self {
+            times,
+            baseline_design,
+            drive_design,
+            entry_design: self.entry_design.clone(),
+            genetics: self.genetics.clone(),
+        })
+    }
 }
 
 #[derive(Clone, Debug)]
 pub struct ReferenceOptions {
+    /// Particle count in each required conditional risk population.
     pub particles: usize,
+    /// Retained bank storage; transient scalar/jet work is additional.
     pub memory_limit_bytes: usize,
 }
 
@@ -61,7 +109,6 @@ impl Default for ReferenceOptions {
 #[derive(Clone, Debug)]
 pub struct ReferenceAccuracy {
     pub log_moment_standard_error: f64,
-    pub risk_mass_standard_error: f64,
     pub minimum_risk_effective_samples: f64,
     /// Per-particle pre-jump total hazard times step. This limits the frozen
     /// rate exposure; it does not bound omitted multiple events when a jump
@@ -73,7 +120,6 @@ impl Default for ReferenceAccuracy {
     fn default() -> Self {
         Self {
             log_moment_standard_error: 0.01,
-            risk_mass_standard_error: 0.01,
             minimum_risk_effective_samples: 64.0,
             maximum_step_hazard: 0.1,
         }
@@ -85,7 +131,6 @@ impl Default for ReferenceAccuracy {
 #[derive(Clone, Debug)]
 pub struct ReferenceDiagnostics {
     pub maximum_log_moment_standard_error: f64,
-    pub maximum_risk_mass_standard_error: f64,
     pub minimum_risk_effective_samples: f64,
     pub maximum_step_hazard: f64,
 }
@@ -94,12 +139,12 @@ pub struct ReferenceDiagnostics {
 /// interval midpoints; interpolation never extrapolates beyond its origin
 /// and horizon. Reference sensitivities stay attached to their coefficients.
 pub struct JointReferenceEvolution<S> {
-    theta: Vec<S>,
-    times: Vec<f64>,
-    log_moments: Vec<S>,
-    log_risk_mass: Vec<S>,
-    marks: usize,
-    diagnostics: ReferenceDiagnostics,
+    pub(super) theta: Vec<S>,
+    pub(super) times: Vec<f64>,
+    pub(super) log_moments: Vec<S>,
+    pub(super) log_risk_mass: Vec<S>,
+    pub(super) marks: usize,
+    pub(super) diagnostics: ReferenceDiagnostics,
 }
 
 impl<S: JetField> JointReferenceEvolution<S> {
@@ -120,6 +165,14 @@ impl<S: JetField> JointReferenceEvolution<S> {
     }
 
     pub fn at(&self, times: &[f64]) -> Result<Vec<S>, EventHistoryError> {
+        self.interpolate(&self.log_moments, times)
+    }
+
+    pub(super) fn risk_mass_at(&self, times: &[f64]) -> Result<Vec<S>, EventHistoryError> {
+        self.interpolate(&self.log_risk_mass, times)
+    }
+
+    fn interpolate(&self, values: &[S], times: &[f64]) -> Result<Vec<S>, EventHistoryError> {
         let mut out = Vec::with_capacity(times.len() * self.marks);
         for &time in times {
             if !time.is_finite() || time < self.times[0] || time > self.times[self.times.len() - 1]
@@ -130,17 +183,15 @@ impl<S: JetField> JointReferenceEvolution<S> {
             }
             let right = self.times.partition_point(|&t| t < time);
             if right == 0 || self.times[right] == time {
-                out.extend_from_slice(
-                    &self.log_moments[right * self.marks..(right + 1) * self.marks],
-                );
+                out.extend_from_slice(&values[right * self.marks..(right + 1) * self.marks]);
             } else {
                 let fraction =
                     (time - self.times[right - 1]) / (self.times[right] - self.times[right - 1]);
                 for d in 0..self.marks {
                     out.push(
-                        self.log_moments[(right - 1) * self.marks + d]
+                        values[(right - 1) * self.marks + d]
                             .scale(1.0 - fraction)
-                            .add(&self.log_moments[right * self.marks + d].scale(fraction)),
+                            .add(&values[right * self.marks + d].scale(fraction)),
                     );
                 }
             }
@@ -155,43 +206,81 @@ impl<S: JetField> JointReferenceEvolution<S> {
 /// as well as the OU states and the evolving risk-set moments.
 pub struct JointReferenceBank<'a> {
     model: &'a JointLikelihood,
-    profile: &'a JointReferenceProfile,
+    profile: JointReferenceProfile,
     genes: Vec<Vec<f64>>,
     normals: Vec<f64>,
     choices: Vec<Option<usize>>,
     log_proposal: Vec<f64>,
+    groups: Vec<Option<usize>>,
+    mark_groups: Vec<usize>,
+    particles: usize,
 }
 
 struct Population<S> {
     states: Vec<Vec<S>>,
     log_weight: Vec<S>,
     risk: Vec<Vec<bool>>,
+    log_mass: Vec<S>,
 }
 
 impl JointLikelihood {
     pub fn reference_bank<'a, R: Rng + ?Sized>(
         &'a self,
         theta: &[f64],
-        profile: &'a JointReferenceProfile,
+        profile: &JointReferenceProfile,
         options: &ReferenceOptions,
         accuracy: &ReferenceAccuracy,
         rng: &mut R,
     ) -> Result<JointReferenceBank<'a>, EventHistoryError> {
+        Ok(self
+            .reference_bank_generated(theta, profile, options, accuracy, rng, true)?
+            .0)
+    }
+
+    pub(super) fn reference_bank_generated<'a, R: Rng + ?Sized>(
+        &'a self,
+        theta: &[f64],
+        profile: &JointReferenceProfile,
+        options: &ReferenceOptions,
+        accuracy: &ReferenceAccuracy,
+        rng: &mut R,
+        check_within_bank: bool,
+    ) -> Result<(JointReferenceBank<'a>, JointReferenceEvolution<f64>), EventHistoryError> {
         self.validate_parameters(theta)?;
         self.validate_history(&profile.history(self.spec.marks.len()))?;
+        for pair in profile.times.windows(2) {
+            JointReferenceProfile::midpoint(pair[0], pair[1])?;
+        }
         if options.particles < 2 {
             return Err(invalid("joint reference needs at least two particles"));
         }
         let k = self.spec.signatures;
         let n = profile.times.len();
+        let mut groups = Vec::new();
+        let mut mark_groups = Vec::new();
+        for (d, kind) in self.spec.marks.iter().enumerate() {
+            let key = (*kind == MarkKind::Once).then_some(d);
+            let index = match groups.iter().position(|g| *g == key) {
+                Some(index) => index,
+                None => {
+                    groups.push(key);
+                    groups.len() - 1
+                }
+            };
+            mark_groups.push(index);
+        }
+        let count = options
+            .particles
+            .checked_mul(groups.len())
+            .ok_or_else(|| invalid("joint reference population dimension overflow"))?;
         let normal_count = n
             .checked_mul(2)
             .and_then(|n| n.checked_sub(1))
             .and_then(|n| n.checked_mul(k))
-            .and_then(|n| n.checked_mul(options.particles))
+            .and_then(|n| n.checked_mul(count))
             .ok_or_else(|| invalid("joint reference noise dimension overflow"))?;
         let steps = (n - 1)
-            .checked_mul(options.particles)
+            .checked_mul(count)
             .ok_or_else(|| invalid("joint reference history dimension overflow"))?;
         let bytes = normal_count
             .checked_mul(8)
@@ -201,11 +290,45 @@ impl JointLikelihood {
                     .and_then(|s| b.checked_add(s))
             })
             .and_then(|b| {
-                options
-                    .particles
+                count
                     .checked_mul(profile.genetics.len())
                     .and_then(|g| g.checked_mul(8))
                     .and_then(|g| b.checked_add(g))
+            })
+            .and_then(|b| {
+                count
+                    .checked_mul(std::mem::size_of::<Vec<f64>>())
+                    .and_then(|v| b.checked_add(v))
+            })
+            .and_then(|b| {
+                profile
+                    .times
+                    .len()
+                    .checked_add(profile.baseline_design.len())
+                    .and_then(|v| v.checked_add(profile.drive_design.len()))
+                    .and_then(|v| v.checked_add(profile.entry_design.len()))
+                    .and_then(|v| v.checked_mul(8))
+                    .and_then(|v| b.checked_add(v))
+            })
+            .and_then(|b| {
+                profile
+                    .genetics
+                    .len()
+                    .checked_mul(std::mem::size_of::<Option<f64>>())
+                    .and_then(|v| b.checked_add(v))
+            })
+            .and_then(|b| b.checked_add(std::mem::size_of::<JointReferenceBank<'_>>()))
+            .and_then(|b| {
+                groups
+                    .len()
+                    .checked_mul(std::mem::size_of::<Option<usize>>())
+                    .and_then(|v| b.checked_add(v))
+            })
+            .and_then(|b| {
+                mark_groups
+                    .len()
+                    .checked_mul(std::mem::size_of::<usize>())
+                    .and_then(|v| b.checked_add(v))
             })
             .ok_or_else(|| invalid("joint reference storage overflow"))?;
         if bytes > options.memory_limit_bytes {
@@ -236,8 +359,8 @@ impl JointLikelihood {
         }
         let factor = Factorization::new(&precision)?;
         let mean = factor.solve(&information);
-        let mut genes = Vec::with_capacity(options.particles);
-        for _ in 0..options.particles {
+        let mut genes = Vec::with_capacity(count);
+        for _ in 0..count {
             let z: Vec<f64> = (0..missing.len())
                 .map(|_| StandardNormal.sample(rng))
                 .collect();
@@ -258,32 +381,40 @@ impl JointLikelihood {
         let mut log_proposal = vec![0.0; steps];
         let mut bank = JointReferenceBank {
             model: self,
-            profile,
+            profile: profile.clone(),
             genes,
             normals,
             choices: vec![],
             log_proposal: vec![],
+            groups,
+            mark_groups,
+            particles: options.particles,
         };
-        bank.run(theta, accuracy, |index, probabilities| {
-            let total: f64 = probabilities.iter().map(|(_, p)| p.exp()).sum();
-            let threshold = rng.random::<f64>() * total;
-            let mut cumulative = 0.0;
-            let mut selected = probabilities.len() - 1;
-            for (j, (_, p)) in probabilities.iter().enumerate() {
-                cumulative += p.exp();
-                if threshold < cumulative {
-                    selected = j;
-                    break;
+        let evolution = bank.run(
+            theta,
+            accuracy,
+            |index, probabilities| {
+                let total: f64 = probabilities.iter().map(|(_, p)| p.exp()).sum();
+                let threshold = rng.random::<f64>() * total;
+                let mut cumulative = 0.0;
+                let mut selected = probabilities.len() - 1;
+                for (j, (_, p)) in probabilities.iter().enumerate() {
+                    cumulative += p.exp();
+                    if threshold < cumulative {
+                        selected = j;
+                        break;
+                    }
                 }
-            }
-            let (choice, probability) = probabilities[selected];
-            choices[index] = choice;
-            log_proposal[index] = probability - total.ln();
-            Ok((choice, log_proposal[index]))
-        })?;
+                let (choice, probability) = probabilities[selected];
+                choices[index] = choice;
+                log_proposal[index] = probability - total.ln();
+                Ok((choice, log_proposal[index]))
+            },
+            check_within_bank,
+        )?;
         bank.choices = choices;
         bank.log_proposal = log_proposal;
-        Ok(bank)
+        Ok((bank, evolution))
     }
 }
 
@@ -310,9 +441,25 @@ impl JointReferenceBank<'_> {
         theta: &[S],
         accuracy: &ReferenceAccuracy,
     ) -> Result<JointReferenceEvolution<S>, EventHistoryError> {
-        self.run(theta, accuracy, |i, _| {
-            Ok((self.choices[i], self.log_proposal[i]))
-        })
+        self.run(
+            theta,
+            accuracy,
+            |i, _| Ok((self.choices[i], self.log_proposal[i])),
+            true,
+        )
+    }
+
+    pub(super) fn evolve_for_resolution<S: JetField>(
+        &self,
+        theta: &[S],
+        accuracy: &ReferenceAccuracy,
+    ) -> Result<JointReferenceEvolution<S>, EventHistoryError> {
+        self.run(
+            theta,
+            accuracy,
+            |i, _| Ok((self.choices[i], self.log_proposal[i])),
+            false,
+        )
     }
 
     fn moments<S: JetField>(
@@ -332,18 +479,13 @@ impl JointReferenceBank<'_> {
                 "joint reference state or path weight is non-finite",
             ));
         }
-        let total = log_sum_exp(&population.log_weight);
-        let count = population.states.len();
+        let count = self.particles;
         let correction = count as f64 / (count - 1) as f64;
         let mut moments = Vec::new();
         let mut masses = Vec::new();
         for d in 0..self.model.spec.marks.len() {
-            let active: Vec<usize> = (0..count).filter(|&p| population.risk[p][d]).collect();
-            if active.is_empty() {
-                return Err(numerical(
-                    "joint reference risk set has no represented survivors",
-                ));
-            }
+            let group = self.mark_groups[d];
+            let active: Vec<usize> = (group * count..(group + 1) * count).collect();
             let weights: Vec<S> = active
                 .iter()
                 .map(|&p| population.log_weight[p].clone())
@@ -381,21 +523,8 @@ impl JointReferenceBank<'_> {
             diagnostics.maximum_log_moment_standard_error = diagnostics
                 .maximum_log_moment_standard_error
                 .max((correction * moment_variance).sqrt());
-            let probability = (mass.value() - total.value()).exp();
-            let risk_variance: f64 = population
-                .log_weight
-                .iter()
-                .enumerate()
-                .map(|(p, w)| {
-                    let deviation = f64::from(population.risk[p][d]) - probability;
-                    (2.0 * (w.value() - total.value())).exp() * deviation * deviation
-                })
-                .sum();
-            diagnostics.maximum_risk_mass_standard_error = diagnostics
-                .maximum_risk_mass_standard_error
-                .max((correction * risk_variance).sqrt());
             moments.push(moment);
-            masses.push(mass.sub(&total));
+            masses.push(population.log_mass[group].clone());
         }
         Ok((moments, masses))
     }
@@ -405,6 +534,7 @@ impl JointReferenceBank<'_> {
         theta: &[S],
         accuracy: &ReferenceAccuracy,
         mut select: F,
+        check_within_bank: bool,
     ) -> Result<JointReferenceEvolution<S>, EventHistoryError>
     where
         F: FnMut(usize, &[(Option<usize>, f64)]) -> Result<(Option<usize>, f64), EventHistoryError>,
@@ -413,14 +543,13 @@ impl JointReferenceBank<'_> {
         let count = self.genes.len();
         if [
             accuracy.log_moment_standard_error,
-            accuracy.risk_mass_standard_error,
             accuracy.maximum_step_hazard,
         ]
         .iter()
         .any(|v| !v.is_finite() || *v <= 0.0)
             || !accuracy.minimum_risk_effective_samples.is_finite()
             || accuracy.minimum_risk_effective_samples < 2.0
-            || accuracy.minimum_risk_effective_samples > count as f64
+            || accuracy.minimum_risk_effective_samples > self.particles as f64
         {
             return Err(invalid(
                 "joint reference needs positive finite error limits and an effective sample count in [2, particles]",
@@ -443,6 +572,7 @@ impl JointReferenceBank<'_> {
             states: vec![vec![zero.clone(); k]; count],
             log_weight: vec![zero.clone(); count],
             risk: vec![vec![true; marks]; count],
+            log_mass: vec![zero.clone(); self.groups.len()],
         };
         for p in 0..count {
             for axis in 0..k {
@@ -464,8 +594,7 @@ impl JointReferenceBank<'_> {
             .collect();
         let mut diagnostics = ReferenceDiagnostics {
             maximum_log_moment_standard_error: 0.0,
-            maximum_risk_mass_standard_error: 0.0,
-            minimum_risk_effective_samples: count as f64,
+            minimum_risk_effective_samples: self.particles as f64,
             maximum_step_hazard: 0.0,
         };
         let (mut log_moments, mut log_risk_mass) =
@@ -492,9 +621,6 @@ impl JointReferenceBank<'_> {
             let spread: Vec<S> = variance.iter().map(sqrt).collect();
             let propagate = |population: &mut Population<S>, block: usize| {
                 for p in 0..count {
-                    if !population.risk[p].iter().any(|&r| r) {
-                        continue;
-                    }
                     for axis in 0..k {
                         let drive = self.model.mean(
                             theta,
@@ -513,13 +639,13 @@ impl JointReferenceBank<'_> {
             propagate(&mut population, 2 * n - 1);
             let (midpoint, mid_mass) = self.moments(theta, &population, &mut diagnostics)?;
             log_moments.extend(midpoint.iter().cloned());
+            let middle_mass_start = log_risk_mass.len();
             log_risk_mass.extend(mid_mass);
             times.push(self.profile.times[n - 1] + 0.5 * dt);
+            let mut killing = vec![zero.clone(); count];
             for p in 0..count {
-                if !population.risk[p].iter().any(|&r| r) {
-                    continue;
-                }
                 let active: Vec<usize> = (0..marks).filter(|&d| population.risk[p][d]).collect();
+                let focal = self.groups[p / self.particles];
                 let mut log_rates = Vec::with_capacity(active.len());
                 for &d in &active {
                     let mut baseline = zero.clone();
@@ -541,20 +667,36 @@ impl JointReferenceBank<'_> {
                 }
                 let total_rate = log_sum_exp(&log_rates);
                 let log_hazard = add_real(&total_rate, dt.ln());
-                if !log_hazard.value().is_finite()
-                    || log_hazard.value() > accuracy.maximum_step_hazard.ln()
-                {
-                    return Err(numerical(
-                        "joint reference event step is unresolved; refine the reference time grid",
-                    ));
+                if !log_hazard.value().is_finite() {
+                    return Err(numerical("joint reference log rate is non-finite"));
+                }
+                if log_hazard.value() > accuracy.maximum_step_hazard.ln() {
+                    return Err(EventHistoryError::ReferenceStep {
+                        log_hazard: log_hazard.value(),
+                        maximum: accuracy.maximum_step_hazard,
+                    });
                 }
                 diagnostics.maximum_step_hazard = diagnostics
                     .maximum_step_hazard
                     .max(log_hazard.value().exp());
-                let mut probabilities = vec![(None, exp(&log_hazard).neg())];
-                let event = log_event(&log_hazard);
+                let mut retained = Vec::new();
                 for (&d, rate) in active.iter().zip(&log_rates) {
-                    probabilities.push((Some(d), event.add(rate).sub(&total_rate)));
+                    if self.model.spec.marks[d] == MarkKind::Terminal || focal == Some(d) {
+                        killing[p] = killing[p].add(&exp(&add_real(rate, dt.ln())));
+                    } else {
+                        retained.push((d, rate.clone()));
+                    }
+                }
+                let mut probabilities = vec![(None, zero.clone())];
+                if !retained.is_empty() {
+                    let total =
+                        log_sum_exp(&retained.iter().map(|(_, r)| r.clone()).collect::<Vec<_>>());
+                    let exposure = add_real(&total, dt.ln());
+                    probabilities[0].1 = exp(&exposure).neg();
+                    let event = log_event(&exposure);
+                    for (d, rate) in retained {
+                        probabilities.push((Some(d), event.add(&rate).sub(&total)));
+                    }
                 }
                 let values: Vec<(Option<usize>, f64)> =
                     probabilities.iter().map(|(d, p)| (*d, p.value())).collect();
@@ -569,35 +711,65 @@ impl JointReferenceBank<'_> {
                 population.log_weight[p] =
                     population.log_weight[p].add(&add_real(target, -proposal));
                 if let Some(d) = choice {
-                    match self.model.spec.marks[d] {
-                        MarkKind::Terminal => population.risk[p].fill(false),
-                        kind => {
-                            if kind == MarkKind::Once {
-                                population.risk[p][d] = false;
-                            }
-                            for axis in 0..k {
-                                population.states[p][axis] = population.states[p][axis]
-                                    .add(&self.model.jump(theta, Some(d), axis));
-                            }
-                        }
+                    if self.model.spec.marks[d] == MarkKind::Once {
+                        population.risk[p][d] = false;
                     }
+                    for axis in 0..k {
+                        population.states[p][axis] =
+                            population.states[p][axis].add(&self.model.jump(theta, Some(d), axis));
+                    }
+                }
+            }
+            // Integrate the killing rather than randomly losing survivors.
+            // Normalize the non-killing transition first (its exact mass is
+            // one), then retain its survival fraction and conditional law.
+            for group in 0..self.groups.len() {
+                let start = group * self.particles;
+                let end = start + self.particles;
+                // Remove a common log-weight offset before subtracting the
+                // normalizers. Otherwise a finite survival loss can disappear
+                // beside a very negative event importance log weight.
+                let shift = population.log_weight[start..end]
+                    .iter()
+                    .map(JetField::value)
+                    .fold(f64::NEG_INFINITY, f64::max);
+                for p in start..end {
+                    population.log_weight[p] = add_real(&population.log_weight[p], -shift);
+                }
+                let before = log_sum_exp(&population.log_weight[start..end]);
+                for p in start..end {
+                    population.log_weight[p] = population.log_weight[p].sub(&killing[p]);
+                }
+                let after = log_sum_exp(&population.log_weight[start..end]);
+                population.log_mass[group] = population.log_mass[group].add(&after.sub(&before));
+                for p in start..end {
+                    population.log_weight[p] = population.log_weight[p].sub(&after);
                 }
             }
             propagate(&mut population, 2 * n);
             let (moment, mass) = self.moments(theta, &population, &mut diagnostics)?;
+            // The full killed step supplies the endpoint mass. Its log-linear
+            // interpolation supplies the midpoint mass at the midpoint time;
+            // labeling the interval-start mass as a midpoint creates a lag
+            // even for a constant, non-latent hazard.
+            for d in 0..marks {
+                log_risk_mass[middle_mass_start + d] = log_risk_mass[middle_mass_start + d]
+                    .scale(0.5)
+                    .add(&mass[d].scale(0.5));
+            }
             log_moments.extend(moment);
             log_risk_mass.extend(mass);
             times.push(self.profile.times[n]);
         }
-        if diagnostics.maximum_log_moment_standard_error > accuracy.log_moment_standard_error
-            || diagnostics.maximum_risk_mass_standard_error > accuracy.risk_mass_standard_error
-            || diagnostics.minimum_risk_effective_samples + 16.0 * f64::EPSILON * (count as f64)
-                < accuracy.minimum_risk_effective_samples
+        if check_within_bank
+            && (diagnostics.maximum_log_moment_standard_error > accuracy.log_moment_standard_error
+                || diagnostics.minimum_risk_effective_samples
+                    + 16.0 * f64::EPSILON * (count as f64)
+                    < accuracy.minimum_risk_effective_samples)
         {
             return Err(numerical(format!(
-                "joint reference sampling unresolved: maximum log-moment SE {}, risk-mass SE {}, minimum risk ESS {}",
+                "joint reference sampling unresolved: maximum log-moment SE {}, minimum risk ESS {}",
                 diagnostics.maximum_log_moment_standard_error,
-                diagnostics.maximum_risk_mass_standard_error,
                 diagnostics.minimum_risk_effective_samples
             )));
         }
@@ -649,21 +821,24 @@ mod tests {
         };
         let bank = JointReferenceBank {
             model: &model,
-            profile: &profile,
+            profile,
             genes: vec![vec![]; 2],
             normals: vec![],
             choices: vec![],
             log_proposal: vec![],
+            groups: vec![None],
+            mark_groups: vec![0],
+            particles: 2,
         };
         let theta = vec![0.0; model.layout.width];
         let mut population = Population {
             states: vec![vec![1e300], vec![0.0]],
             log_weight: vec![-800.0, 0.0],
             risk: vec![vec![true]; 2],
+            log_mass: vec![0.0],
         };
         let mut diagnostic = ReferenceDiagnostics {
             maximum_log_moment_standard_error: 0.0,
-            maximum_risk_mass_standard_error: 0.0,
             minimum_risk_effective_samples: 2.0,
             maximum_step_hazard: 0.0,
         };

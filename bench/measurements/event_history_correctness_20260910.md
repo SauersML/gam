@@ -179,3 +179,58 @@ dispersion estimates do not account for all dependence induced by the shared
 normalizer. Adaptive time/particle refinement and independent reference
 replicates remain required, along with the fitting, structure-learning,
 entry-conditioning, serving, and calibration work listed above.
+
+## Independent reference replication and adaptive resolution
+
+Reference risk sets now use conditional populations: terminal hazards and the
+population's focal once-only hazard enter survival weights. Other diagnoses and
+their state jumps remain simulated. This removes random survivor deletion,
+including its sampling noise in constant-hazard special cases. Non-killing
+transition mass is normalized before the survival fraction is retained.
+
+The new controller compares independent replicated ensembles on a coarse grid,
+a refined grid at the same particle count, and the refined grid with twice the
+particles. It pools risk-weighted moments, estimates dispersion between entire
+populations, and refines until the requested error estimates pass. Later
+coefficient/jet evaluations retain the three fixed ensembles and repeat their
+checks. The normalized likelihood and posterior interfaces now require this
+resolved reference object. Exceeded round, particle, time-step, or retained-bank
+memory limits return errors.
+
+The initial run had **22 passed, 1 failed**: a midpoint risk mass was incorrectly
+carried from the interval start, creating an artificial time-refinement
+discrepancy even at rank zero. Midpoint log masses now interpolate the actual
+endpoint log masses. A reference interval with no representable interior
+midpoint is also rejected.
+
+The final **23 focused tests passed in 8.47 s**, with two test threads, after a
+**42.35 s** targeted compile on MSI using warm dependency artifacts and four
+CPUs. Raw output is `event_history_reference_resolution_20260910.txt`. Fifty
+other tests were filtered out; this is not a full-suite pass.
+
+The independent static positive-frailty comparison, at baseline `exp(-1.2)` and
+horizon 6, gave:
+
+| Quantity | Reference calculation | Independent continuous-time target |
+| --- | ---: | ---: |
+| Survival | 0.1642156753 | 0.1641187100 |
+| Final log moment | -0.2314710947 | -0.2303382673 |
+
+This fixture used a small positive OU rate (raw rate coordinate -16) to approach
+the static limit. The controller selected **192 intervals**, **2,048 particles
+per risk set**, and **four independent replicates**, in six rounds. Its final
+estimated log-moment error was **0.03465482**, below the fixture's **0.05** limit;
+estimated risk error was **0.000162045**, below its **0.01** limit. Maximum
+between-replicate standard errors were **0.00156350** for log moments and
+**1.901e-6** for risk mass. These are the explicitly requested fixture
+tolerances, not evidence of 1e-4 accuracy for general reference curves.
+
+Other checks establish deterministic rank-zero survival, correct risk-weighted
+pooling, nonzero between-population uncertainty despite zero within-population
+diagnostics, refusal when accuracy is invalidated at new coefficients, resource
+limit failures, and value/derivative consistency through the resolved reference.
+
+The error estimates are not deterministic or simultaneous confidence bounds.
+Rare behavior, derivative accuracy, broad reference performance, and external
+calibration need further assessment. Fitting, learned complexity, entry/history
+conditioning, deployment, and the serving interfaces are still unfinished.

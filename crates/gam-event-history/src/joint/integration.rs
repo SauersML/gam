@@ -192,36 +192,35 @@ impl JointIntegration<'_> {
     pub fn normalized_log_marginal<S: JetField>(
         &self,
         theta: &[S],
-        reference: &JointReferenceBank<'_>,
-        reference_accuracy: &ReferenceAccuracy,
+        reference: &ResolvedReference<'_>,
         accuracy: &IntegrationAccuracy,
-    ) -> Result<(IntegratedLikelihood<S>, JointReferenceEvolution<S>), EventHistoryError> {
+    ) -> Result<(IntegratedLikelihood<S>, ResolvedReferenceEvolution<S>), EventHistoryError> {
         if !reference.belongs_to(self.model) {
             return Err(invalid(
                 "joint reference and likelihood must belong to the same model",
             ));
         }
-        let evolution = reference.evolve(theta, reference_accuracy)?;
-        let moments = evolution.at(&self.history.times)?;
-        let likelihood = self.log_marginal(evolution.coefficients(), &moments, accuracy)?;
+        let evolution = reference.evolve(theta)?;
+        let moments = evolution.reference().at(&self.history.times)?;
+        let likelihood =
+            self.log_marginal(evolution.reference().coefficients(), &moments, accuracy)?;
         Ok((likelihood, evolution))
     }
 
     pub fn normalized_posterior(
         &self,
         theta: &[f64],
-        reference: &JointReferenceBank<'_>,
-        reference_accuracy: &ReferenceAccuracy,
+        reference: &ResolvedReference<'_>,
         accuracy: &IntegrationAccuracy,
-    ) -> Result<(IntegratedPosterior, JointReferenceEvolution<f64>), EventHistoryError> {
+    ) -> Result<(IntegratedPosterior, ResolvedReferenceEvolution<f64>), EventHistoryError> {
         if !reference.belongs_to(self.model) {
             return Err(invalid(
                 "joint reference and likelihood must belong to the same model",
             ));
         }
-        let evolution = reference.evolve(theta, reference_accuracy)?;
-        let moments = evolution.at(&self.history.times)?;
-        let posterior = self.posterior(evolution.coefficients(), &moments, accuracy)?;
+        let evolution = reference.evolve(theta)?;
+        let moments = evolution.reference().at(&self.history.times)?;
+        let posterior = self.posterior(evolution.reference().coefficients(), &moments, accuracy)?;
         Ok((posterior, evolution))
     }
 

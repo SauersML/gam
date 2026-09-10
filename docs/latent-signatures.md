@@ -2,10 +2,10 @@
 
 This document specifies the complete model being built. The `joint` module in
 `gam_event_history` implements its complete-path density, structured Laplace
-posterior, importance integration, and a differentiated reference-particle
-evolution with disease histories. Adaptive reference resolution, the
-parameter-fitting workflow, structure search, and serving interface are still
-unfinished. The older log-linear Gaussian event model and its
+posterior, importance integration, and differentiated reference evolution with
+disease histories, independent replication, and adaptive time/particle
+refinement. The parameter-fitting workflow, structure search, and serving
+interface are still unfinished. The older log-linear Gaussian event model and its
 numerical limits are documented in `event-history.md`.
 
 The implemented state has independent OU innovations with stationary variance
@@ -91,39 +91,73 @@ M_d(t,c) = E_reference[R_d(x(t-),c) | Y_d(t)=1, c].
 
 This expectation is taken under the model's complete reference evolution,
 including other diseases, their state jumps, measurements when they affect
-ascertainment, and mortality. With learned disease jumps, independently killing
-one filter per disease is no longer that evolution: prior diseases affect
+ascertainment, and mortality. With learned disease jumps, a killed no-event
+filter that omits other diagnoses is insufficient: prior diseases affect
 subsequent state dynamics. The reference solver must retain that information.
 
 The implemented `JointReferenceBank` retains each proposed disease history and
 Gaussian state innovation. It draws missing genetic scores from their Gaussian
 law conditional on the profile's observed scores. OU half steps surround a
 competing-event update, and a nonterminal event applies its learned jump before
-the next state step. Terminal events remove the particle from every risk set;
-once-only events remove it from their own. Baseline basis rows are interpolated
-within each reference interval, while the supplied drive basis holds constant
-over that interval.
+the next state step. Each required risk set has a conditional particle
+population. Mortality and that population's focal once-only disease enter
+survival weights rather than randomly deleting particles. Other diagnoses are
+still simulated, retain their once-only status, and apply their state jumps.
+Terminal/recurrent marks share the alive population; an all-once model does not
+allocate an unused alive population. This representation is linear in the
+number of risk sets, not a Cartesian product of all diagnosis combinations.
+
+For risk set H, the conditional reference equation is a state/event evolution
+with killing rate `kappa_H`, minus its conditional mean killing rate to preserve
+unit conditional mass. The survival mass is retained separately. The numerical
+step normalizes the non-killing transition (whose mass is one), applies its
+survival factors, and saves their normalizing constant. This reduces sampling
+noise in the risk mass while preserving disease histories relevant to future
+rates. It does not make a finite time step exact.
+
+Baseline basis rows are interpolated within each reference interval, while the
+supplied drive basis holds constant over that interval. Refinement preserves
+these declared functions. A reference interval without a representable interior
+midpoint is rejected. Midpoint risk masses interpolate endpoint log masses;
+they are not mislabeled interval-start masses.
 
 At its anchor parameters the event proposal follows the particle population's
 rates. Later evaluations keep the proposed histories and proposal probabilities
 fixed and differentiate the target/proposal weights, the genetic state drive,
 the jumps, and the risk-set moments. Freezing the proposal is an integration
 device; it does not freeze the normalizer's score. `normalized_log_marginal` and
-`normalized_posterior` compute the reference and observation likelihood at the
-same coefficient state and return the reference object actually used. Its
+`normalized_posterior` require a `ResolvedReference`, compute the reference and
+observation likelihood at the same coefficient state, and return the reference
+object actually used. Its
 coefficient vector and derivative channels travel with its moments. Requests
 outside the reference origin and horizon are rejected.
 
-This particle evolution is not yet the resolved reference solver required for
-release. A finite event step admits at most one event, so midpoint rate
-normalization does not establish the continuous-time survival identity.
-The implementation rejects excessive per-particle step hazards and inadequate
-risk-set effective sample counts, and checks within-bank estimates of moment
-and risk-mass dispersion. Particles interact through their shared normalizer;
-these plug-in standard-error estimates do not capture every dependence term.
-Independent particle replicates and time/particle refinement at fixed
-coefficients remain required. Passing the local diagnostic thresholds must not
-be reported as a calibration certificate.
+`resolve_reference` compares three ensembles at fixed coefficients: coarse
+time, half-size time intervals at the same particle count, and the fine grid
+with twice the particles. Each ensemble contains independent reference
+populations. Pooling averages their risk masses and risk-weighted activities,
+then takes the conditional-moment ratio. It does not average conditional
+moments without their risk weights. Entire populations, rather than interacting
+particles within them, provide the replicate uncertainty estimate.
+
+The acceptance estimate combines observed time and particle discrepancies with
+a configured multiple of the corresponding Monte Carlo standard errors. The
+controller refines time or particles until both moment and risk-mass estimates
+meet their tolerances; excessive event-step hazards trigger time refinement.
+Round, particle, and total retained-bank memory limits produce explicit failures.
+All three ensembles remain fixed during later coefficient and jet evaluations,
+which recheck the diagnostics. A failed check requires resolution outside the
+objective evaluation, never silent replacement of the samples during a line
+search.
+
+These are estimated numerical-error controls, not deterministic certificates.
+A finite event step admits at most one simulated non-killing event, so midpoint
+rate normalization does not establish the continuous-time survival identity.
+Two-level differences can underestimate discretization error, and a finite
+replicate sample can miss rare behavior. The standard-error multiplier has no
+claimed simultaneous confidence coverage. Value diagnostics do not certify
+derivative error or external calibration. Broader validation and performance
+assessment remain necessary before release.
 
 The conditional mean intensity among the specified risk set is
 `exp(eta0_d(t,c))`. For one first-occurrence disease without death this implies

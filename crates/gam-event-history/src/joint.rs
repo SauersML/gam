@@ -18,6 +18,7 @@ mod integration;
 mod posterior;
 mod precision;
 mod reference;
+mod resolution;
 pub use integration::{
     IntegratedLikelihood, IntegratedPosterior, IntegrationAccuracy, IntegrationOptions,
     JointIntegration,
@@ -26,6 +27,10 @@ pub use posterior::{LaplacePosterior, PosteriorOptions};
 pub use reference::{
     JointReferenceBank, JointReferenceEvolution, JointReferenceProfile, ReferenceAccuracy,
     ReferenceDiagnostics, ReferenceOptions,
+};
+pub use resolution::{
+    ReferenceResolutionOptions, ReferenceResolutionReport, ResolvedReference,
+    ResolvedReferenceEvolution,
 };
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

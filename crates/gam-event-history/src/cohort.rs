@@ -35,6 +35,10 @@ pub enum EventHistoryError {
     InvalidInput { reason: String },
     #[error("{reason}")]
     NumericalFailure { reason: String },
+    #[error(
+        "joint reference event step is unresolved (log hazard {log_hazard}, limit {maximum}); refine the reference time grid"
+    )]
+    ReferenceStep { log_hazard: f64, maximum: f64 },
     #[error("{reason}")]
     Fit { reason: String },
 }
