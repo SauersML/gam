@@ -19,6 +19,14 @@ from ._binding import rust_module
 MARK_KINDS = ("recurrent", "once", "terminal")
 
 
+def _positional_index(value: Any, name: str) -> int:
+    if isinstance(value, (bool, np.bool_)) or not isinstance(value, (int, np.integer)):
+        raise ValueError(f"{name} must contain integer indices, got {value!r}")
+    if value < 0:
+        raise ValueError(f"{name} indices must be nonnegative, got {value!r}")
+    return int(value)
+
+
 def _column(frame: Any, name: str) -> np.ndarray:
     if isinstance(frame, dict):
         if name not in frame:
@@ -339,7 +347,7 @@ class EventHistoryModel:
         if not path:
             raise ValueError("population_forecast needs covariate values")
         out = self._native.population_forecast(
-            float(start), [float(h) for h in horizons], path, int(stratum)
+            float(start), [float(h) for h in horizons], path, _positional_index(stratum, "stratum")
         )
         return self._forecast_dict(out)
 
@@ -428,7 +436,7 @@ class EventHistoryModel:
             None if cutoff is None else float(cutoff),
             [float(h) for h in horizons],
             path,
-            int(stratum),
+            _positional_index(stratum, "stratum"),
         )
         return self._forecast_dict(out)
 
@@ -442,7 +450,7 @@ def fit_event_history(
     marks: Mapping[str, str] | Sequence[str] | None = None,
     id_column: str = "id",
     reference_profiles: Sequence[int] | None = None,
-    reference_stratum: Sequence[Any] | None = None,
+    reference_stratum: Sequence[int] | None = None,
 ) -> EventHistoryModel:
     """Fit an event-history model.
 
@@ -474,7 +482,7 @@ def fit_event_history(
     it started. It names one row of ``covariates`` per reference stratum — the
     covariate profile that stratum's reference population carries — and
     ``reference_stratum`` gives each subject's stratum, in the order of the
-    ``subjects`` table, as labels matching those rows' positions. With one
+    ``subjects`` table, as integer indices into ``reference_profiles``. With one
     profile and no strata every subject shares it. The two centrings are the
     same model at rank zero, where there are no loadings to centre.
     """
@@ -548,7 +556,12 @@ def fit_event_history(
     # The reference population: one covariate row per stratum, and each
     # subject's stratum. Without profiles the baselines keep the stationary
     # prior's centring.
-    reference_rows = [int(r) for r in (reference_profiles or [])]
+    reference_rows = (
+        [] if reference_profiles is None
+        else [_positional_index(value, "reference_profiles") for value in reference_profiles]
+    )
+    if reference_profiles is not None and not reference_rows:
+        raise ValueError("reference_profiles must contain at least one profile row")
     if reference_stratum is not None and not reference_rows:
         raise ValueError("reference_stratum needs reference_profiles to assign subjects to")
     if not reference_rows:
@@ -560,17 +573,15 @@ def fit_event_history(
             )
         subject_stratum = [0] * len(subject_ids)
     else:
-        labels = [str(v) for v in reference_stratum]
-        if len(labels) != len(subject_ids):
+        subject_stratum = [_positional_index(value, "reference_stratum") for value in reference_stratum]
+        if len(subject_stratum) != len(subject_ids):
             raise ValueError(
-                f"{len(labels)} subject strata for {len(subject_ids)} subjects"
+                f"{len(subject_stratum)} subject strata for {len(subject_ids)} subjects"
             )
-        levels = sorted(set(labels))
-        if len(levels) != len(reference_rows):
+        if any(not 0 <= value < len(reference_rows) for value in subject_stratum):
             raise ValueError(
-                f"reference_stratum has {len(levels)} distinct values but {len(reference_rows)} profiles were given"
+                f"reference_stratum indices must be in 0..{len(reference_rows) - 1}"
             )
-        subject_stratum = [levels.index(v) for v in labels]
     for row in reference_rows:
         if not 0 <= row < table.shape[0]:
             raise ValueError(
