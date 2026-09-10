@@ -384,11 +384,18 @@ pub(crate) fn node_likelihood<S: JetField>(
     log_normaliser: Option<&[S]>,
     marks: usize,
     atoms: usize,
+    derivatives: bool,
 ) -> NodeLikelihood<S> {
     let size = grid.size();
     let zero = eta0[0].constant_like(0.0);
-    let mut score = Vec::with_capacity(marks * size);
-    let mut curvature = Vec::with_capacity(marks * size);
+    // The score and curvature are read only by the accumulation that forms
+    // the gradient and Hessian. A grid placement pass, or a filter run for a
+    // forecast, needs the node's value alone — and these two vectors are
+    // `marks × size` of the caller's scalar, which for a seeded dual is the
+    // largest thing the node touches.
+    let width = if derivatives { marks * size } else { 0 };
+    let mut score = Vec::with_capacity(width);
+    let mut curvature = Vec::with_capacity(width);
     let mut informative = Vec::with_capacity(marks);
     let mut ell = vec![zero.clone(); size];
     for d in 0..marks {
@@ -439,12 +446,16 @@ pub(crate) fn node_likelihood<S: JetField>(
                         c = c.mul(&table[grid.index(i, k)]);
                     }
                     ell[i] = ell[i].sub(&c);
-                    score.push(add_real(&c.scale(-1.0), y));
-                    curvature.push(c);
+                    if derivatives {
+                        score.push(add_real(&c.scale(-1.0), y));
+                        curvature.push(c);
+                    }
                 }
                 _ => {
-                    score.push(zero.constant_like(y));
-                    curvature.push(zero.clone());
+                    if derivatives {
+                        score.push(zero.constant_like(y));
+                        curvature.push(zero.clone());
+                    }
                 }
             }
         }
@@ -570,7 +581,8 @@ pub(crate) fn filter_start<S: JetField>(
     gh: &GaussHermite,
     like: &S,
     atoms: usize,
-    node_terms: &dyn Fn(&Grid<S>) -> NodeLikelihood<S>,
+    node_terms: &dyn Fn(&Grid<S>, bool) -> NodeLikelihood<S>,
+    derivatives: bool,
     label: &str,
 ) -> Result<FilteredNode<S>, EventHistoryError> {
     let zero: Vec<S> = (0..atoms).map(|_| like.constant_like(0.0)).collect();
@@ -588,7 +600,7 @@ pub(crate) fn filter_start<S: JetField>(
             .collect()
     };
     let prior_grid = Grid::new(gh, &zero, &unit, like);
-    let rough = node_terms(&prior_grid);
+    let rough = node_terms(&prior_grid, false);
     let (rough_alpha, _) = condition(
         &prior_grid,
         &prior_density(&prior_grid),
@@ -656,12 +668,13 @@ pub(crate) fn filter_step<S: JetField>(
     previous_alpha: &[S],
     transitions: Vec<AtomTransition<S>>,
     forward_power: u8,
-    node_terms: &dyn Fn(&Grid<S>) -> NodeLikelihood<S>,
+    node_terms: &dyn Fn(&Grid<S>, bool) -> NodeLikelihood<S>,
+    derivatives: bool,
     label: &str,
 ) -> Result<FilteredNode<S>, EventHistoryError> {
     let (predictive, rough_predicted) =
         predict(gh, like, previous_grid, previous_alpha, &transitions, label)?;
-    let rough = node_terms(&predictive);
+    let rough = node_terms(&predictive, false);
     let (rough_alpha, _) = condition(
         &predictive,
         &rough_predicted,
@@ -1293,7 +1306,7 @@ fn filter_nodes<S: JetField>(
     let like = &inputs.eta0[0];
     let mut filtered: Vec<FilteredNode<S>> = Vec::with_capacity(n_nodes);
     let forward_power: u8 = if derivatives { 2 } else { 0 };
-    let node_terms = |grid: &Grid<S>, n: usize| -> NodeLikelihood<S> {
+    let node_terms = |grid: &Grid<S>, n: usize, store: bool| -> NodeLikelihood<S> {
         node_likelihood(
             grid,
             &inputs.eta0[n * marks..(n + 1) * marks],
@@ -1306,13 +1319,15 @@ fn filter_nodes<S: JetField>(
                 .map(|m| &m[n * marks..(n + 1) * marks]),
             marks,
             atoms,
+            store,
         )
     };
     filtered.push(filter_start(
         gh,
         like,
         atoms,
-        &|grid| node_terms(grid, 0),
+        &|grid, store| node_terms(grid, 0, store),
+        derivatives,
         "first node",
     )?);
     for n in 0..n_nodes - 1 {
@@ -1324,7 +1339,8 @@ fn filter_nodes<S: JetField>(
             &filtered[n].alpha,
             transitions,
             forward_power,
-            &|grid| node_terms(grid, n + 1),
+            &|grid, store| node_terms(grid, n + 1, store),
+            derivatives,
             &format!("node {}", n + 1),
         )?;
         filtered.push(step);
@@ -1634,6 +1650,7 @@ pub(crate) fn forward_filter<S: JetField>(
                 .map(|m| &m[n * marks..(n + 1) * marks]),
             marks,
             atoms,
+            false,
         )
     };
     // Node 0: either the stationary prior or a continuation of a filtered state.
@@ -1642,7 +1659,8 @@ pub(crate) fn forward_filter<S: JetField>(
             gh,
             like,
             atoms,
-            &|grid| node_terms(grid, 0),
+            &|grid, _| node_terms(grid, 0),
+            false,
             "forecast first node",
         )?,
         Some((grid, filtered)) => filter_step(
@@ -1652,7 +1670,8 @@ pub(crate) fn forward_filter<S: JetField>(
             filtered,
             transitions_across(inputs.rates, inputs.continuation_gap, inputs.time_scale)?,
             0,
-            &|grid| node_terms(grid, 0),
+            &|grid, _| node_terms(grid, 0),
+            false,
             "forecast first node",
         )?,
     };
@@ -1668,7 +1687,8 @@ pub(crate) fn forward_filter<S: JetField>(
             &alpha[n],
             transitions_across(inputs.rates, nodes.gaps[n], inputs.time_scale)?,
             0,
-            &|grid| node_terms(grid, n + 1),
+            &|grid, _| node_terms(grid, n + 1),
+            false,
             &format!("forecast node {}", n + 1),
         )?;
         log_normalisers.push(ln(&step.normaliser).add(&like.constant_like(step.likelihood.shift)));

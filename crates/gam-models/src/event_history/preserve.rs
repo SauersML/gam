@@ -319,6 +319,7 @@ pub(crate) fn stratum_normalisers<S: JetField>(
                 Some(shift),
                 marks,
                 atoms,
+                false,
             );
             let (alpha, normaliser) = condition(
                 mask_grid,
