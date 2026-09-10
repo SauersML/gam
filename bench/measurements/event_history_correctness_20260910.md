@@ -46,6 +46,20 @@ survival fit and PIT regression **passed in 0.84 s** (400 subjects); its
 Kaplan–Meier PIT distance was **0.019**. The final focused run completed with
 **33 passed, 0 failed in 27.40 s**, with 16 broader fit tests excluded.
 
+## Reference integration refinement
+
+Reference acceptance now checks both time refinement and latent quadrature at
+fixed parameters. It refines the larger contribution until their sum meets
+the requested tolerance. The additional regression detects latent integration
+error with an unchanged time grid and rejects comparisons across different
+coefficient states or non-finite reference moments. The six objective checks
+passed in **2.19 s**. After the finite static-rate reporting change, the final
+focused suite completed with **34 passed, 0 failed in 27.86 s**; **16 broader
+fit tests were excluded**.
+
+Rank-path output now names `proposed_rate` in the data's time unit. A static
+proposal is zero, avoiding an infinite logarithm in that diagnostic.
+
 ## Unresolved results
 
 The high-variance near-static-frailty example still exposes latent-grid integration
@@ -65,6 +79,13 @@ A bounded profile of the optimized root build script identified its substring
 scanner as the integration-check bottleneck: about **75%** of sampled CPU time
 was in `find_banned_code_fragments` and its byte comparisons. This was a
 25-second, 49-Hz profile; the repository checks were not disabled.
+The replacement overlapping substring search passed **609,336** exhaustive
+Unicode/overlap comparisons. On the build-script source microbenchmark it took
+**206.47 ms**, compared with **548.24 ms** for the old search (**2.66×**).
+The benchmark is `experiments/event_history_scanner.rs`. This is a matcher
+benchmark, not a measured whole-build speedup: a complete integration check
+still reached its 65-second cap, and a direct scanner run reached 55 seconds
+(11.41 seconds user CPU, 0.85 seconds system CPU).
 
 The directional-profile product and final Laplace rank criterion remain
 approximations, including a nonregular boundary. Their present implementation

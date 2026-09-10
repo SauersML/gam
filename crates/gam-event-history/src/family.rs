@@ -170,6 +170,41 @@ pub struct RiskSetCentring {
     pub mask_of_mark: Vec<usize>,
 }
 
+impl RiskSetCentring {
+    /// Compare reference calculations at identical parameters and profiles.
+    fn discrepancy(&self, refined: &Self, marks: usize) -> Result<f64, EventHistoryError> {
+        if self.coefficients != refined.coefficients || self.profiles != refined.profiles
+            || self.mask_of_mark != refined.mask_of_mark || self.masks != refined.masks {
+            return Err(EventHistoryError::InvalidInput { reason:
+                "reference refinement requires identical coefficients, profiles, and risk masks".to_string() });
+        }
+        let mut gap = 0.0_f64;
+        for (a, b, width) in [
+            (&self.log_normaliser, &refined.log_normaliser, marks),
+            (&self.log_risk_mass, &refined.log_risk_mass, self.masks),
+        ] {
+            if a.len() != self.profiles.nrows() * self.grid.len() * width
+                || b.len() != refined.profiles.nrows() * refined.grid.len() * width
+                || a.iter().chain(b).any(|x| !x.is_finite()) {
+                return Err(EventHistoryError::NumericalFailure { reason:
+                    "reference refinement has invalid or non-finite risk moments".to_string() });
+            }
+            for s in 0..self.profiles.nrows() {
+                for (n, &time) in refined.grid.times.iter().enumerate() {
+                    let (low, weight) = self.grid.locate(time)?;
+                    for d in 0..width {
+                        let left = a[(s * self.grid.len() + low) * width + d];
+                        let right = a[(s * self.grid.len() + low + 1) * width + d];
+                        gap = gap.max((left + weight * (right - left)
+                            - b[(s * refined.grid.len() + n) * width + d]).abs());
+                    }
+                }
+            }
+        }
+        Ok(gap)
+    }
+}
+
 impl ReferenceTables {
     /// Carry a normaliser held on the reference grid onto a node set, by the
     /// linear interpolation each node recorded when the tables were built.
@@ -1220,12 +1255,12 @@ pub struct EventHistoryFit {
     pub rank_path: Vec<RankStep>,
     /// The decrease of the outer LAML criterion each accepted atom brought.
     pub atom_evidence: Vec<f64>,
-    /// Reference-grid discrepancies at fixed coefficients, before each
+    /// Summed time and latent-order discrepancies at fixed coefficients, before each
     /// refinement. Every returned reference fit meets reference_tolerance.
     pub reference_refinements: Vec<f64>,
     /// Authoritative centring at the final coefficient state.
     pub centring: Option<RiskSetCentring>,
-    /// Maximum fixed-parameter coarse/fine discrepancy; absent for prior centring.
+    /// Sum of the fixed-parameter time and latent-order discrepancies; absent for prior centring.
     pub reference_certificate: Option<f64>,
 }
 
@@ -1636,8 +1671,8 @@ pub struct RankStep {
     /// `μ² / (4J)` of the top direction: its second-order evidence gain in
     /// nats, the matched-filter statistic the rate maximises.
     pub standardised_gain: f64,
-    /// The log-rate the proposal named.
-    pub proposed_log_rate: f64,
+    /// Proposed rate in the data's time unit; zero denotes a static factor.
+    pub proposed_rate: f64,
     /// The proposal wanted a rate faster than the cohort's breakpoints
     /// resolve and was held at the fastest they do: the residuals carry
     /// structure the design cannot time.
@@ -2590,7 +2625,7 @@ fn fit_event_history_on_grid(
             rank,
             score_eigenvalue: atom.eigenvalue,
             standardised_gain: atom.standardised_gain,
-            proposed_log_rate: atom.log_rate,
+            proposed_rate: atom.log_rate.exp() / time_scale,
             at_resolution_limit: atom.at_upper_limit,
             rate_held: atom.rate_held(),
             ridge_log_lambda: atom.ridge.log_lambda,
@@ -2712,50 +2747,48 @@ pub fn fit_event_history(
         return Err(EventHistoryError::InvalidInput { reason: "reference tolerance must be finite and positive".to_string() });
     }
     let mut discrepancies = Vec::new();
-    for refinement in 2..=10 {
-        let mut fit = fit_event_history_on_grid(cohort, spec, refinement)?;
+    let mut fitting_spec = spec.clone();
+    let mut refinement = 2;
+    for _ in 0..16 {
+        let mut fit = fit_event_history_on_grid(cohort, &fitting_spec, refinement)?;
         let Some(strata) = spec.reference.as_ref() else { return Ok(fit); };
         let refined = reference_tables(cohort, strata, &fit.frozen_specs,
             spec.quadrature_order, refinement + 1, &fit.nodes)?;
         let fine_family = fit.family.clone().with_reference(Some(Arc::new(refined)));
         let fine = fine_family.refresh_normaliser(&fit.fit.block_states)
             .map_err(|reason| EventHistoryError::Fit { reason })?;
-        let coarse = fit.family.reference.as_ref().ok_or_else(|| EventHistoryError::Fit {
-            reason: "reference fit is missing its coarse reference tables".to_string(),
-        })?;
         let coarse_centring = fit.centring.as_ref().ok_or_else(|| EventHistoryError::Fit {
             reason: "reference fit is missing its centring values".to_string(),
         })?;
-        let fine_tables = fine_family.reference.as_ref()
-            .expect("the refined family was constructed with reference tables");
-        let coarse_nodes = coarse.grid.len();
-        let fine_nodes = fine_tables.grid.len();
-        let mut gap = 0.0_f64;
-        // Compare on the fine grid, including midpoints and BOTH endpoints.
-        for s in 0..strata.strata() {
-            for n in 0..fine_nodes {
-                let (low, weight) = coarse.grid.locate(fine_tables.grid.times[n])?;
-                for (a, b, width) in [
-                    (&coarse_centring.log_normaliser, &fine.log_normaliser, fit.marks()),
-                    (&coarse_centring.log_risk_mass, &fine.log_risk_mass, fine.masks),
-                ] {
-                    for d in 0..width {
-                        let left = a[(s * coarse_nodes + low) * width + d];
-                        let right = a[(s * coarse_nodes + low + 1) * width + d];
-                        gap = gap.max((left + weight * (right - left) - b[(s * fine_nodes + n) * width + d]).abs());
-                    }
-                }
+        let time_gap = coarse_centring.discrepancy(&fine, fit.marks())?;
+        let next_order = fit.family.gh.order + 4;
+        let latent_gap = if fit.rank() == 0 { 0.0 } else {
+            preflight(next_order, fit.rank(), fine.grid.len(), fit.marks(), fit.family.total_width())?;
+            let mut latent_family = fine_family.clone();
+            latent_family.gh = Arc::new(GaussHermite::new(next_order)?);
+            if !latent_family.held_rates.iter().all(|r| *r == Some(0.0))
+                && latent_family.gh.lebesgue_constant * f64::EPSILON * fine.grid.len() as f64
+                    > spec.reference_tolerance {
+                return Err(EventHistoryError::NumericalFailure { reason:
+                    "reference latent quadrature cannot be refined within its interpolation roundoff bound".to_string() });
             }
-        }
-        if !gap.is_finite() { return Err(EventHistoryError::NumericalFailure {
-            reason: "non-finite reference refinement discrepancy".to_string(),
-        }); }
+            let latent = latent_family.refresh_normaliser(&fit.fit.block_states)
+                .map_err(|reason| EventHistoryError::Fit { reason })?;
+            fine.discrepancy(&latent, fit.marks())?
+        };
+        let gap = time_gap + latent_gap;
         discrepancies.push(gap);
-        log::info!("[event-history] reference refinement {refinement}: fixed-parameter discrepancy {gap:.3e} nats");
+        log::info!("[event-history] reference refinement {refinement}: time discrepancy {time_gap:.3e}, latent discrepancy {latent_gap:.3e} nats");
         if gap <= spec.reference_tolerance {
             fit.reference_certificate = Some(gap);
             fit.reference_refinements = discrepancies;
             return Ok(fit);
+        }
+        if latent_gap > time_gap {
+            fitting_spec.gauss_hermite_order = next_order;
+        } else {
+            refinement += 1;
+            if refinement > 10 { break; }
         }
     }
     Err(EventHistoryError::NumericalFailure {

@@ -2845,6 +2845,8 @@ fn terminal_forecasts_match_the_constant_hazard_solution() {
     let mut cohort = competing_risks_cohort(64);
     let spec = EventHistorySpec::new(vec![intercept_only_spec()]);
     let fit = fit_event_history(&mut cohort, &spec).expect("intercept-only fit");
+    assert!(fit.rank_path.iter().all(|step| step.proposed_rate.is_finite()
+        && step.proposed_rate >= 0.0));
     // The maximum-likelihood rates: events over exposure, per mark.
     let exposure: f64 = cohort.subjects.iter().map(|s| s.exit - s.entry).sum();
     let counts: Vec<f64> = (0..3)

@@ -57,8 +57,9 @@ S(t) = exp(-integral exp(eta0(s)) ds).
 This identity describes the continuous model. Finite numerical steps approximate
 it. Reference evolution uses symmetric OU splitting and a midpoint killing
 equation, evaluated on a grid that includes both reference endpoints. The
-driver compares log normalisers and log risk masses on a twice-finer grid at
-the **same coefficients**. It refines until the discrepancy is below
+driver compares log normalisers and log risk masses on a twice-finer time grid,
+then raises the latent integration order on that finer grid at the **same
+coefficients**. It refines the larger error contribution until the sum is below
 `reference_tolerance` (default `1e-4` nats), or returns an unresolved numerical
 error. A discrepancy above tolerance is not a successful certificate.
 
@@ -70,8 +71,8 @@ normaliser and no compensator argument used to discard its observed score.
 The normaliser and risk masses exported with a fit are evaluated at the returned
 coefficient state using that fit's reference grid. Forecasting reads those
 values and uses the same interpolation. `reference_refinements` records
-fixed-parameter grid discrepancies; `reference_certificate` records the
-accepted final discrepancy.
+fixed-parameter time-plus-latent discrepancies; `reference_certificate` records
+the accepted final discrepancy.
 
 The reference interval is the cohort's overall follow-up interval. A reference
 forecast outside that interval is rejected. Endpoint clamping does not extend
@@ -122,6 +123,8 @@ likelihood and its loading curvature unchanged. Grid placement is differentiated
 This path uses no transition interpolation; its integration order can therefore
 increase without the transition interpolant's roundoff restriction. Near-zero
 positive rates still require the dynamic solver's convergence checks.
+The rank path reports `proposed_rate` in the data's time unit, so static
+proposals are represented by zero in both Python and JSON output.
 
 The state grid still has `G^K` points. Backward interpolation streams one
 source row at a time, so it no longer allocates the `G^(2K)` all-source kernel.

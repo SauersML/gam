@@ -330,7 +330,7 @@ pub(crate) fn run_fit_events(args: FitEventsArgs) -> Result<(), String> {
                         "rank": step.rank,
                         "score_eigenvalue": step.score_eigenvalue,
                         "standardised_gain": step.standardised_gain,
-                        "proposed_log_rate": step.proposed_log_rate,
+                        "proposed_rate": step.proposed_rate,
                         "at_resolution_limit": step.at_resolution_limit,
                         "rate_held": step.rate_held,
                         "ridge_log_lambda": step.ridge_log_lambda,

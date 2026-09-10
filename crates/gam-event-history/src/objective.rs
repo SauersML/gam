@@ -239,6 +239,26 @@ mod tests {
         }
     }
 
+    #[test]
+    fn reference_refinement_detects_latent_error_at_fixed_parameters() {
+        let (mut family, mut states) = single_event();
+        family.held_rates = vec![Some(0.0)];
+        family.gh = Arc::new(GaussHermite::new(9).unwrap());
+        states[1].beta[0] = 2.0;
+        let coarse = family.refresh_normaliser(&states).unwrap();
+        family.gh = Arc::new(GaussHermite::new(33).unwrap());
+        let fine = family.refresh_normaliser(&states).unwrap();
+        let gap = coarse.discrepancy(&fine, 1).unwrap();
+        assert!(gap > 1e-4, "unresolved latent reference integral: {gap}");
+        assert_eq!(fine.discrepancy(&fine, 1).unwrap(), 0.0);
+        let mut different = fine.clone();
+        different.coefficients[0] += 0.1;
+        assert!(coarse.discrepancy(&different, 1).is_err());
+        different = fine.clone();
+        different.log_normaliser[0] = f64::NAN;
+        assert!(coarse.discrepancy(&different, 1).is_err());
+    }
+
     fn recurrent_family(event_time: f64, rates: Vec<Option<f64>>, order: usize) -> (EventHistoryFamily, Vec<ParameterBlockState>) {
         let mut cohort = EventHistoryCohort {
             mark_names: vec!["event".to_string()], mark_kinds: vec![MarkKind::Recurrent],

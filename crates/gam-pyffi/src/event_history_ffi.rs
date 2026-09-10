@@ -8,7 +8,8 @@ use gam::families::custom_family::BlockwiseFitOptions;
 use gam::event_history::{
     CovariateSegment, Event, EventHistoryCohort, EventHistoryFit, EventHistorySpec,
     ForecastRequest, FutureSegment, HistoryForecastRequest, MarkKind, PopulationForecastRequest,
-    ReferenceStrata, SubjectHistory, covariate_spec_from_formula, design_rows, fit_event_history,
+    ReferenceStrata, SubjectHistory, covariate_spec_from_formula, design_rows,
+    fit_event_history as fit_event_history_model,
     forecast, forecast_history, latent_state, pit_uniform_distance, population_forecast,
     predictive_pit,
 };
@@ -83,7 +84,7 @@ impl PyEventHistoryModel {
         self.fit.rank()
     }
 
-    /// Fixed-parameter reference-grid discrepancies in nats; empty for
+    /// Summed time and latent-order reference discrepancies in nats; empty for
     /// stationary-prior centring.
     fn reference_refinements(&self) -> Vec<f64> {
         self.fit.reference_refinements.clone()
@@ -93,8 +94,8 @@ impl PyEventHistoryModel {
         self.fit.centring.as_ref().map_or(0, |c| c.masks)
     }
 
-    /// The largest disagreement, in nats, between the reference grid the
-    /// normaliser was taken on and the same grid with every cell halved.
+    /// Sum of time-refinement and latent-order discrepancies at fixed
+    /// coefficients, in nats.
     fn reference_certificate(&self) -> Option<f64> {
         self.fit.reference_certificate
     }
@@ -110,7 +111,7 @@ impl PyEventHistoryModel {
             item.set_item("rank", step.rank)?;
             item.set_item("score_eigenvalue", step.score_eigenvalue)?;
             item.set_item("standardised_gain", step.standardised_gain)?;
-            item.set_item("proposed_log_rate", step.proposed_log_rate)?;
+            item.set_item("proposed_rate", step.proposed_rate)?;
             item.set_item("at_resolution_limit", step.at_resolution_limit)?;
             item.set_item("rate_held", step.rate_held)?;
             item.set_item("ridge_log_lambda", step.ridge_log_lambda)?;
@@ -187,10 +188,6 @@ impl PyEventHistoryModel {
 
     fn rate_held(&self) -> Vec<bool> {
         self.fit.rate_held.clone()
-    }
-
-    fn log_rates(&self) -> Vec<f64> {
-        self.fit.log_rates.clone()
     }
 
     fn atom_log_lambdas(&self) -> Vec<f64> {
@@ -578,7 +575,7 @@ fn fit_event_history(
             .map_err(|e| e.to_string())?;
         spec.options = BlockwiseFitOptions::default();
         spec.reference = reference;
-        let fit = fit_event_history(&mut cohort, &spec).map_err(|e| e.to_string())?;
+        let fit = fit_event_history_model(&mut cohort, &spec).map_err(|e| e.to_string())?;
         Ok((fit, cohort))
     })?;
     let strata = if fit.centring.is_none() {
