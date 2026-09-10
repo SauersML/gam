@@ -839,6 +839,10 @@ pub(crate) fn subject_marginal<S: JetField>(
     let mut second = vec![zero.clone(); p_total * p_total];
     let mut curvature = vec![zero.clone(); p_total * p_total];
     let mut carried: Vec<S> = vec![zero.clone(); p_total * filtered[0].grid.size()];
+    // Reused by every node and mark: the grid's size is `order^atoms`, the
+    // same at every node, so this is one allocation rather than one per mark
+    // per node of a vector as wide as the grid.
+    let mut weighted: Vec<S> = vec![zero.clone(); filtered[0].grid.size()];
     for m in 0..n_nodes {
         let grid = &filtered[m].grid;
         let size = grid.size();
@@ -888,7 +892,6 @@ pub(crate) fn subject_marginal<S: JetField>(
             // `W s_d C[q]` is formed once per grid point and reused for the
             // atom contractions, which is the same arithmetic in the same
             // order with the product taken once instead of once per atom.
-            let mut weighted = vec![zero.clone(); size];
             for q in 0..p_total {
                 let row = &carried[q * size..(q + 1) * size];
                 let mut acc = zero.clone();
