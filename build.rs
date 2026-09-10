@@ -1623,19 +1623,19 @@ fn find_banned_code_fragments(line: &str, fragment: &str) -> Vec<usize> {
 
     let needs_left_boundary = is_ident_byte(fragment_bytes[0]);
     let needs_right_boundary = is_ident_byte(fragment_bytes[fragment_bytes.len() - 1]);
-    let mut start = 0usize;
-    while start + fragment_bytes.len() <= line_bytes.len() {
-        if &line_bytes[start..start + fragment_bytes.len()] == fragment_bytes {
-            let left_is_bounded =
-                !needs_left_boundary || start == 0 || !is_ident_byte(line_bytes[start - 1]);
-            let end = start + fragment_bytes.len();
-            let right_is_bounded =
-                !needs_right_boundary || end == line_bytes.len() || !is_ident_byte(line_bytes[end]);
-            if left_is_bounded && right_is_bounded {
-                hits.push(start);
-            }
+    let mut search = 0usize;
+    while let Some(relative) = line[search..].find(fragment) {
+        let start = search + relative;
+        let left_is_bounded =
+            !needs_left_boundary || start == 0 || !is_ident_byte(line_bytes[start - 1]);
+        let end = start + fragment_bytes.len();
+        let right_is_bounded =
+            !needs_right_boundary || end == line_bytes.len() || !is_ident_byte(line_bytes[end]);
+        if left_is_bounded && right_is_bounded {
+            hits.push(start);
         }
-        start += 1;
+        // Preserve overlapping matches and valid UTF-8 slice boundaries.
+        search = start + line[start..].chars().next().expect("nonempty fragment matched").len_utf8();
     }
     hits
 }

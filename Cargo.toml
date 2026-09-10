@@ -257,6 +257,12 @@ path = "examples/perf/arrow_schur_hill_climb.rs"
 lto = "thin"
 codegen-units = 1
 
+# The root package's source scanners are substantial build-script work.
+# Named package overrides also govern its build script, unlike an inherited
+# profile opt-level. Keep the audit running as optimized code during iteration.
+[profile.dev.package.gam]
+opt-level = 2
+
 # Test profile — strip full DWARF and only keep line tables. With ~300
 # integration test targets under `tests/`, the default `debug = true` profile
 # emits ~150–500 MB of DWARF per linked test binary; on a vanilla ubuntu-latest
