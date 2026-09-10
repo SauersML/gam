@@ -90,6 +90,12 @@ impl PyEventHistoryModel {
         self.fit.reference_masks
     }
 
+    /// The largest disagreement, in nats, between the reference grid the
+    /// normaliser was taken on and the same grid with every cell halved.
+    fn reference_certificate(&self) -> Option<f64> {
+        self.fit.reference_certificate
+    }
+
     fn atom_evidence(&self) -> Vec<f64> {
         self.fit.atom_evidence.clone()
     }

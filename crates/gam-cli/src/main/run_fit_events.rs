@@ -316,6 +316,10 @@ pub(crate) fn run_fit_events(args: FitEventsArgs) -> Result<(), String> {
             json!(fit.normaliser_rounds),
         );
         summary.insert("reference_masks".to_string(), json!(fit.reference_masks));
+        summary.insert(
+            "reference_certificate".to_string(),
+            json!(fit.reference_certificate),
+        );
     }
     summary.insert("atom_evidence".to_string(), json!(fit.atom_evidence));
     summary.insert(

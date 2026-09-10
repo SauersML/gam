@@ -120,6 +120,14 @@ class EventHistoryModel:
         return int(self._native.reference_masks())
 
     @property
+    def reference_certificate(self) -> float | None:
+        """The largest disagreement, in nats, between the reference grid the
+        risk-set normaliser was taken on and the same grid with every cell
+        halved: what the grid's own resolution cost. ``None`` when the
+        baselines are centred on the stationary prior."""
+        return self._native.reference_certificate()
+
+    @property
     def atom_evidence(self) -> np.ndarray:
         """The evidence each accepted atom's prior bought over the rank
         before it, in nats."""

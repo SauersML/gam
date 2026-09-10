@@ -341,6 +341,23 @@ impl EventHistoryFamily {
         self.log_normaliser.is_some()
     }
 
+    /// The reference population's tables, when the fit has one.
+    pub fn reference(&self) -> Option<&Arc<ReferenceTables>> {
+        self.reference.as_ref()
+    }
+
+    /// The normaliser carried onto this family's nodes, for comparing two
+    /// reference grids on one common set of times.
+    pub fn normaliser_on_nodes(&self, held: &[f64]) -> Result<Vec<f64>, EventHistoryError> {
+        let tables = self
+            .reference
+            .as_ref()
+            .ok_or_else(|| EventHistoryError::InvalidInput {
+                reason: "this family has no reference population".to_string(),
+            })?;
+        tables.carry_to_nodes(held, self.marks(), self.nodes.total_nodes)
+    }
+
     /// Recompute the risk-set normaliser at a coefficient state: run the
     /// reference population of every stratum forward and read `log M_d(t)`
     /// off it, then carry it to the cohort's own nodes.
@@ -1493,6 +1510,10 @@ pub struct EventHistoryFit {
     pub reference_risk_mass: Vec<f64>,
     /// How many distinct risk sets the marks define.
     pub reference_masks: usize,
+    /// The largest disagreement, in nats, between the reference grid the
+    /// normaliser was taken on and the same grid with every cell halved.
+    /// `None` when the baselines are centred on the stationary prior.
+    pub reference_certificate: Option<f64>,
 }
 
 impl EventHistoryFit {
@@ -2599,6 +2620,7 @@ fn assemble(
         normaliser_rounds: Vec::new(),
         reference_risk_mass: Vec::new(),
         reference_masks: 0,
+        reference_certificate: None,
     })
 }
 
@@ -2960,6 +2982,7 @@ pub fn fit_event_history(
     // zero there are no loadings, `log M ≡ 0`, and nothing moves.
     let mut normaliser_rounds: Vec<f64> = Vec::new();
     let mut reference_risk_mass: Vec<f64> = Vec::new();
+    let mut reference_normaliser: Vec<f64> = Vec::new();
     let mut reference_masks = 0usize;
     if spec.reference.is_some() && fit.rank() > 0 {
         let mut held: Option<Arc<Vec<f64>>> = None;
@@ -2985,6 +3008,7 @@ pub fn fit_event_history(
             normaliser_rounds.push(moved);
             reference_risk_mass = centring.log_risk_mass;
             reference_masks = centring.masks;
+            reference_normaliser = next.clone();
             if moved <= spec.normaliser_tolerance {
                 log::info!(
                     "[event-history] risk-set centring round {}: the normaliser moved {moved:.3e} nats: settled",
@@ -3049,10 +3073,60 @@ pub fn fit_event_history(
             fit = fit_at_rank(cohort, spec, rank, Some(&start), None, held.clone())?;
         }
     }
+    // What the reference grid's own resolution cost. The fit refines its own
+    // mesh until the coefficients are stationary; the reference population is
+    // run on a separate grid whose refinement is fixed, so that a normaliser
+    // held across the ladder means the same thing on every rung. That fixed
+    // choice is certified rather than assumed: the same population is run once
+    // on a grid with every cell halved, both are carried onto the cohort's own
+    // node times, and the largest disagreement is reported in the nats it is
+    // measured in. It is not a tolerance the fit enforces — a normaliser is an
+    // offset, so a shift in it is absorbed by the baseline it centres — but it
+    // is the number that says whether the grid resolved the population's decay.
+    let mut reference_certificate = None;
+    if let (Some(strata), Some(tables)) = (spec.reference.as_ref(), fit.family.reference()) {
+        let refined = reference_tables(
+            cohort,
+            strata,
+            &fit.frozen_specs,
+            spec.quadrature_order,
+            REFERENCE_REFINEMENT + 1,
+            &fit.nodes,
+        )?;
+        let coarse_on_nodes = fit
+            .family
+            .normaliser_on_nodes(&reference_normaliser)
+            .map_err(|error| EventHistoryError::Fit {
+                reason: error.to_string(),
+            })?;
+        let refined_family = fit
+            .family
+            .clone()
+            .with_reference(Some(Arc::new(refined)), None)?;
+        let refined_values = refined_family
+            .refresh_normaliser(&fit.fit.block_states)
+            .map_err(|reason| EventHistoryError::Fit { reason })?;
+        let refined_on_nodes = refined_family
+            .normaliser_on_nodes(&refined_values.log_normaliser)
+            .map_err(|error| EventHistoryError::Fit {
+                reason: error.to_string(),
+            })?;
+        let gap = coarse_on_nodes
+            .iter()
+            .zip(refined_on_nodes.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0_f64, f64::max);
+        log::info!(
+            "[event-history] the reference grid at refinement {REFERENCE_REFINEMENT} differs from the halved one by {gap:.3e} nats (a {} node grid)",
+            tables.grid.len()
+        );
+        reference_certificate = Some(gap);
+    }
     fit.rank_path = rank_path;
     fit.atom_evidence = atom_evidence;
     fit.normaliser_rounds = normaliser_rounds;
     fit.reference_risk_mass = reference_risk_mass;
     fit.reference_masks = reference_masks;
+    fit.reference_certificate = reference_certificate;
     Ok(fit)
 }
