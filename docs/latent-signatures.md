@@ -239,6 +239,34 @@ one production AD hot path. It does not establish the performance exception
 in `SPEC.md` for all remaining generic coefficient/reference derivative paths;
 those still need analytic replacements or corresponding speed evidence.
 
+`log_density_score` now supplies analytic complete-path coefficient scores for
+the baseline surfaces, positive decoder, OU rates, genetic drive and entry
+regressions, disease jumps, measurement locations/loadings, and measurement
+shape parameters. The genetic distribution is fixed by the specification, so
+its density has no fitted-coefficient score. Missing genetic values remain
+latent path coordinates. Measurements after an event contribute to that event's
+jump score as well as to their observation parameters.
+
+The reference score is retained separately: a node contributes
+`exposure * lambda - event` to its log-moment derivative. `JointPathScore::pullback`
+requires the node-major reference Jacobian and adds its contribution to the
+coefficient score. `JointIntegration::log_marginal_score` averages these total
+scores under the same normalized importance weights as the likelihood value.
+These low-level APIs require the supplied reference values and Jacobian to
+describe the same coefficient state. They do not generate or certify that
+Jacobian, and must not be wired to fitting with frozen or missing reference
+sensitivities. The resolved cohort wrapper still needs its analytic sensitivity
+interface before it can use this kernel as its default score.
+
+The integrated score reports a delta-method sampling error per coefficient,
+conditional on the supplied reference. A second pass over the fixed paths
+accumulates `weight * (path_score - mean_score)` with scaled Euclidean norms.
+It avoids squaring a tiny weight before multiplying a large score, subtracting
+raw second moments, and retaining a samples-by-coefficients array. These errors
+do not include reference uncertainty, finite-sample bias, or derivative
+discretization error. Coefficient Hessians and the higher derivatives required
+by LAML remain to be connected to the same objective.
+
 The implemented importance bank draws from an equal mixture of the structured
 Laplace Gaussian and the normalized Gaussian path prior conditional on observed
 genetic scores and event jumps. The complete observation factors remain in the

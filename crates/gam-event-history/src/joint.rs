@@ -20,10 +20,11 @@ mod posterior;
 mod precision;
 mod reference;
 mod resolution;
+mod score;
 pub use cohort::{JointCohortEvaluation, JointCohortIntegration, JointCohortPosterior};
 pub use integration::{
-    IntegratedLikelihood, IntegratedPosterior, IntegrationAccuracy, IntegrationOptions,
-    JointIntegration,
+    IntegratedLikelihood, IntegratedPosterior, IntegratedScore, IntegrationAccuracy,
+    IntegrationOptions, JointIntegration,
 };
 pub use posterior::{LaplacePosterior, PosteriorOptions};
 pub use reference::{
@@ -34,6 +35,7 @@ pub use resolution::{
     ReferenceResolutionOptions, ReferenceResolutionReport, ResolvedReference,
     ResolvedReferenceEvolution,
 };
+pub use score::JointPathScore;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum MeasurementFamily {

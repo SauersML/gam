@@ -69,6 +69,40 @@ pub struct IntegratedPosterior {
     pub maximum_moment_standard_error: f64,
 }
 
+/// Analytic score of the fixed importance estimate, including the supplied
+/// reference Jacobian. Its delta-method Monte Carlo error is conditional on
+/// that reference and does not establish reference derivative accuracy.
+pub struct IntegratedScore {
+    pub likelihood: IntegratedLikelihood<f64>,
+    pub gradient: Vec<f64>,
+    pub standard_error: Vec<f64>,
+}
+
+fn accumulate_score_error(out: &mut [f64], weight: f64, score: &[f64], mean: &[f64]) {
+    for j in 0..out.len() {
+        // Square only after multiplying: w^2 may underflow while w*(s-E s)
+        // is representable. hypot also avoids overflowing a sum of squares.
+        out[j] = out[j].hypot(weight * (score[j] - mean[j]));
+    }
+}
+
+#[cfg(test)]
+mod score_error_tests {
+    use super::accumulate_score_error;
+
+    #[test]
+    fn rare_large_scores_retain_their_sampling_error() {
+        let mut se = [0.0];
+        accumulate_score_error(&mut se, 1e-200, &[1e200], &[1.0]);
+        accumulate_score_error(&mut se, 1.0, &[0.0], &[1.0]);
+        assert!((se[0] - 2.0_f64.sqrt()).abs() < 1e-14);
+        let mut large = [0.0];
+        accumulate_score_error(&mut large, 0.5, &[1e200], &[0.0]);
+        accumulate_score_error(&mut large, 0.5, &[-1e200], &[0.0]);
+        assert!((large[0] / 1e200 - 0.5_f64.sqrt()).abs() < 1e-14);
+    }
+}
+
 /// Retained importance nodes tied to one immutable model and history. Drawing
 /// a new bank changes the sampled approximation: never replace it silently
 /// within a derivative evaluation or optimization line search.
@@ -186,6 +220,66 @@ impl JointLikelihood {
 }
 
 impl JointIntegration<'_> {
+    /// Differentiate the same sampled integral as log_marginal analytically.
+    /// The Jacobian rows are node-major marks, columns are coefficients, and
+    /// must describe the supplied moments at theta. Resolved reference value
+    /// diagnostics alone do not certify these sensitivities.
+    pub fn log_marginal_score(
+        &self,
+        theta: &[f64],
+        reference: &[f64],
+        reference_jacobian: ndarray::ArrayView2<'_, f64>,
+        accuracy: &IntegrationAccuracy,
+    ) -> Result<IntegratedScore, EventHistoryError> {
+        let (likelihood, weights) = self.evaluate(theta, reference, accuracy)?;
+        let mut gradient = vec![0.0; theta.len()];
+        let mut weight_sum = 0.0;
+        for (path, &weight) in self.paths.iter().zip(&weights) {
+            if weight == 0.0 {
+                continue;
+            }
+            let score = self
+                .model
+                .log_density_score(theta, self.history, path, reference)?
+                .pullback(reference_jacobian)?;
+            weight_sum += weight;
+            for j in 0..theta.len() {
+                gradient[j] += (weight / weight_sum) * (score[j] - gradient[j]);
+            }
+        }
+        // Replay fixed paths rather than storing samples x coefficients or
+        // subtracting large raw second moments to obtain a small variance.
+        let mut standard_error = vec![0.0; theta.len()];
+        for (path, &weight) in self.paths.iter().zip(&weights) {
+            if weight == 0.0 {
+                continue;
+            }
+            let score = self
+                .model
+                .log_density_score(theta, self.history, path, reference)?
+                .pullback(reference_jacobian)?;
+            accumulate_score_error(&mut standard_error, weight, &score, &gradient);
+        }
+        let correction = (weights.len() as f64 / (weights.len() - 1) as f64).sqrt();
+        for se in &mut standard_error {
+            *se *= correction;
+        }
+        if gradient
+            .iter()
+            .chain(&standard_error)
+            .any(|v| !v.is_finite())
+        {
+            return Err(numerical(
+                "joint importance score or its sampling error is unresolved",
+            ));
+        }
+        Ok(IntegratedScore {
+            likelihood,
+            gradient,
+            standard_error,
+        })
+    }
+
     /// Evaluate the observation integral and its reference evolution at the
     /// same coefficient state. The returned centering object is precisely
     /// the one used by this evaluation, including its derivative channels.

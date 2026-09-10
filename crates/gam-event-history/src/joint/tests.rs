@@ -441,6 +441,7 @@ fn importance_correction_matches_an_independent_measurement_integral() {
         let mut mass = 0.0;
         let mut first = 0.0;
         let mut second = 0.0;
+        let mut location_score = 0.0;
         for (&x, &w) in rule.nodes.iter().zip(&rule.weights) {
             let z = std::f64::consts::SQRT_2 * x;
             let weight = w / std::f64::consts::PI.sqrt()
@@ -455,11 +456,15 @@ fn importance_correction_matches_an_independent_measurement_integral() {
             mass += weight;
             first += weight * z;
             second += weight * z * z;
+            let residual = 2.0 - z;
+            location_score +=
+                weight * 5.0 * residual / (4.0 * 0.6_f64.powi(2) + residual * residual);
         }
         (
             mass.ln(),
             first / mass,
             second / mass - (first / mass).powi(2),
+            location_score / mass,
         )
     };
     let exact = oracle(257);
@@ -479,6 +484,21 @@ fn importance_correction_matches_an_independent_measurement_integral() {
     let out = bank
         .posterior(&theta, &[0.0; 5], &IntegrationAccuracy::default())
         .unwrap();
+    let score = bank
+        .log_marginal_score(
+            &theta,
+            &[0.0; 5],
+            Array2::zeros((5, theta.len())).view(),
+            &IntegrationAccuracy::default(),
+        )
+        .unwrap();
+    let coordinate = model.layout.measurement_location[0].start;
+    assert!((coarse.3 - exact.3).abs() < 1e-7);
+    assert!((score.gradient[coordinate] - exact.3).abs() < 5.0 * score.standard_error[coordinate]);
+    eprintln!(
+        "integrated location score {} vs independent {}; estimated SE {}",
+        score.gradient[coordinate], exact.3, score.standard_error[coordinate]
+    );
     assert!(
         (out.likelihood.log_marginal - exact.0).abs() < 5.0 * out.likelihood.log_standard_error
     );

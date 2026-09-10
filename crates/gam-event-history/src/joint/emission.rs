@@ -181,6 +181,80 @@ pub(super) fn location_derivatives(
     Ok((score, curvature))
 }
 
+/// Analytic scores in location and the declared raw shape coordinates.
+pub(super) fn parameter_scores(
+    family: &MeasurementFamily,
+    y: f64,
+    eta: f64,
+    shape: &[f64],
+) -> Result<(f64, Vec<f64>), EventHistoryError> {
+    let location = location_derivatives(family, y, eta, shape)?.0;
+    let sigmoid = |x: f64| (-softplus(&(-x))).exp();
+    let mut scores = vec![0.0; shape.len()];
+    match family {
+        MeasurementFamily::BinaryProbit => {}
+        MeasurementFamily::OrdinalProbit { categories } => {
+            let category = y as usize;
+            for j in 0..category.saturating_sub(1) {
+                scores[j] = -location * sigmoid(shape[j]);
+            }
+            if category > 0 && category < categories - 1 {
+                let upper: f64 = shape[..category].iter().map(softplus).sum();
+                let z = upper - eta;
+                let log_probability = log_density(family, y, &eta, shape)?;
+                scores[category - 1] = (-0.5 * z * z
+                    - 0.5 * (2.0 * std::f64::consts::PI).ln()
+                    - log_probability
+                    - softplus(&(-shape[category - 1])))
+                .exp();
+            }
+        }
+        MeasurementFamily::StudentT => {
+            let df = 2.0 + softplus(&shape[1]);
+            let contrast = 2.0 * ((y - eta).abs().ln() - shape[0]) - df.ln();
+            let fraction = sigmoid(contrast);
+            scores[0] = (df + 1.0) * fraction - 1.0;
+            scores[1] = 0.5
+                * sigmoid(shape[1])
+                * (gam_math::jet_tower::digamma(0.5 * (df + 1.0))
+                    - gam_math::jet_tower::digamma(0.5 * df)
+                    - 1.0 / df
+                    - softplus(&contrast)
+                    + (1.0 + 1.0 / df) * fraction);
+        }
+        MeasurementFamily::NegativeBinomial => {
+            let size = softplus(&shape[0]);
+            let log_size = size.ln();
+            let log_derivative = -softplus(&(-shape[0]));
+            let derivative = log_derivative.exp();
+            let total = crate::chain::log_sum_exp(&[log_size, eta]);
+            // psi(size+y)-psi(size) = 1/size + psi(size+y)-psi(size+1)
+            // for a positive count. Multiplying by the softplus derivative
+            // before exposing 1/size preserves a finite score at small size.
+            let gamma_score = if y == 0.0 {
+                0.0
+            } else {
+                (log_derivative - log_size).exp()
+                    * (1.0
+                        + size
+                            * (gam_math::jet_tower::digamma(size + y)
+                                - gam_math::jet_tower::digamma(size + 1.0)))
+            };
+            let count_term = if y == 0.0 {
+                0.0
+            } else {
+                (y.ln() - total + log_derivative).exp()
+            };
+            scores[0] =
+                gamma_score + derivative * (log_size - total + (eta - total).exp()) - count_term;
+        }
+    }
+    if scores.iter().any(|v| !v.is_finite()) {
+        return Err(numerical("non-finite measurement shape score"));
+    }
+    Ok((location, scores))
+}
+
 pub(super) fn log_density<S: JetField>(
     family: &MeasurementFamily,
     y: f64,

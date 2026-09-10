@@ -293,3 +293,51 @@ ridges was not implemented. Nonlinear function-prior normalization, combined
 cohort/reference error assessment, coefficient inference, automatic structure
 learning, entry conditioning, serving parity, and external calibration remain
 unfinished.
+
+## Analytic complete-path and integrated coefficient scores
+
+The joint model now evaluates complete-path coefficient scores analytically,
+including OU rate/variance derivatives, genetic drive and entry effects,
+positive decoder weights, event-jump effects before future transitions and
+after-event measurements, and all measurement location and shape parameters.
+The reference adjoint is retained and requires an explicit Jacobian for its
+coefficient pullback. The importance-score API uses the same retained paths,
+proposal density, normalized weights, and finite-variance check as its value.
+
+The first **30 focused tests passed in 8.78 s** after a **49.20 s** warm targeted
+compile. Review then identified that squaring an importance weight before
+multiplying a large score could lose a representable variance contribution.
+Score uncertainty now replays the fixed paths and accumulates weighted centered
+scores with `hypot`. This uses additional computation and linear coefficient
+workspace instead of retaining a samples-by-coefficients matrix.
+
+The final **31 focused tests passed in 9.28 s** after a **45.39 s** targeted
+compile on MSI, with four compile CPUs and two test threads. Fifty other tests
+were filtered out. The raw output is `event_history_joint_scores_20260910.txt`.
+No local compilation or test execution was used.
+
+A fixture with **65 coefficients**, two signatures, partly missing genetics,
+recurrent/once-only/terminal marks, and all four observation families compares
+every analytic coefficient against forward AD in batches of eight, including
+a nonzero reference Jacobian. Separate checks cover extreme measurement shape
+scores, invalid Jacobians, and the integrated fixed-sample objective. Its
+full-path score benchmark measured **0.035384 s analytic** versus **0.184323 s
+batched forward AD** for 1,000 calls, best of three: **5.209x** on that fixture.
+It ran inside the focused suite; this is neither an isolated whole-model
+benchmark nor evidence that remaining reference AD meets the SPEC exception.
+
+An independent one-dimensional Gauss-Hermite measurement integral gave a
+location score of **1.2680922324611585**. The importance score was
+**1.2718421977068752**, with estimated conditional sampling error
+**0.008321465269082408**. Both 129- and 257-node independent rules agree at the
+test's requested accuracy. Additional numerical checks retain variance from
+weights of order 1e-200 paired with scores of order 1e200, and avoid overflow
+when forming the Euclidean norm of large weighted scores.
+
+The score kernel does not itself resolve or differentiate the reference law.
+Its Jacobian must be from the same parameters as the supplied moments; value
+resolution does not certify that Jacobian. The cohort sensitivity connection,
+coefficient curvature, function-prior normalization, REML/LAML learning,
+posterior coefficient integration, automatic complexity, entry conditioning,
+serving parity, and calibration remain unfinished. No fitted-model object or
+evidence guarantee has been added by this change.
