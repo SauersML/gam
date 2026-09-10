@@ -325,6 +325,8 @@ class EventHistoryModel:
         covariates: Mapping[str, Any] | Sequence[Any] | Sequence[tuple[float, Any]],
         start: float,
         horizons: Sequence[float],
+        *,
+        stratum: int = 0,
     ) -> dict[str, Any]:
         """Forecast a subject with no observed history from covariate values
         alone: the latent state starts at its stationary prior at ``start``.
@@ -336,7 +338,9 @@ class EventHistoryModel:
         path = self._future(covariates, float(start))
         if not path:
             raise ValueError("population_forecast needs covariate values")
-        out = self._native.population_forecast(float(start), [float(h) for h in horizons], path)
+        out = self._native.population_forecast(
+            float(start), [float(h) for h in horizons], path, int(stratum)
+        )
         return self._forecast_dict(out)
 
     def pit(self, subject: int | str) -> dict[str, Any]:
@@ -383,6 +387,7 @@ class EventHistoryModel:
         *,
         cutoff: float | None = None,
         future: Mapping[str, Any] | Sequence[Any] | Sequence[tuple[float, Any]] | None = None,
+        stratum: int = 0,
     ) -> dict[str, Any]:
         """Forecast a history that is not a training subject's, from its own
         records: ``entry`` and ``exit``, ``events`` as ``(time, mark)`` pairs
@@ -423,6 +428,7 @@ class EventHistoryModel:
             None if cutoff is None else float(cutoff),
             [float(h) for h in horizons],
             path,
+            int(stratum),
         )
         return self._forecast_dict(out)
 

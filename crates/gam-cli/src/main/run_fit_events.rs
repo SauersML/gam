@@ -236,6 +236,7 @@ pub(crate) fn run_fit_events(args: FitEventsArgs) -> Result<(), String> {
     // among those still at risk rather than the rate over the cohort as it
     // started. The strata's profiles are rows of the covariate table; a
     // column of the subjects table assigns subjects to them.
+    let mut subject_stratum: Vec<usize> = vec![0; cohort.subjects.len()];
     let reference = if args.reference_row.is_empty() {
         if args.reference_stratum.is_some() {
             return Err(
@@ -245,7 +246,7 @@ pub(crate) fn run_fit_events(args: FitEventsArgs) -> Result<(), String> {
         }
         None
     } else {
-        let subject_stratum = match &args.reference_stratum {
+        let assigned = match &args.reference_stratum {
             None => {
                 if args.reference_row.len() != 1 {
                     return Err(format!(
@@ -273,9 +274,10 @@ pub(crate) fn run_fit_events(args: FitEventsArgs) -> Result<(), String> {
                     .collect()
             }
         };
+        subject_stratum = assigned;
         Some(ReferenceStrata {
             rows: args.reference_row.clone(),
-            subject: subject_stratum,
+            subject: subject_stratum.clone(),
         })
     };
     let rows = design_rows(&cohort, EventHistorySpec::new(Vec::new()).quadrature_order)
@@ -358,8 +360,9 @@ pub(crate) fn run_fit_events(args: FitEventsArgs) -> Result<(), String> {
     summary.insert("effective_rank".to_string(), json!(fit.effective_rank));
     if fit.rank() > 0 {
         let mut states = Vec::with_capacity(cohort.subjects.len());
-        for subject in &cohort.subjects {
-            let state = latent_state(&fit, &cohort, subject, 0).map_err(|e| e.to_string())?;
+        for (i, subject) in cohort.subjects.iter().enumerate() {
+            let state = latent_state(&fit, &cohort, subject, subject_stratum[i])
+                .map_err(|e| e.to_string())?;
             states.push(json!({
                 "id": subject.id,
                 "time": state.times,
@@ -408,8 +411,11 @@ pub(crate) fn run_fit_events(args: FitEventsArgs) -> Result<(), String> {
         }),
     );
     let mut pits = Vec::new();
-    for subject in &cohort.subjects {
-        pits.extend(predictive_pit(&fit, &cohort, subject, 0).map_err(|e| e.to_string())?);
+    for (i, subject) in cohort.subjects.iter().enumerate() {
+        pits.extend(
+            predictive_pit(&fit, &cohort, subject, subject_stratum[i])
+                .map_err(|e| e.to_string())?,
+        );
     }
     summary.insert("pit_spells".to_string(), json!(pits.len()));
     summary.insert(
@@ -423,7 +429,7 @@ pub(crate) fn run_fit_events(args: FitEventsArgs) -> Result<(), String> {
     if !args.horizons_after_exit.is_empty() {
         let mut forecasts = Vec::with_capacity(cohort.subjects.len());
         let mut skipped = 0usize;
-        for subject in &cohort.subjects {
+        for (i, subject) in cohort.subjects.iter().enumerate() {
             // With a cutoff, the history is what was known then; a subject
             // not under follow-up at the cutoff has no forecast to make.
             let known: SubjectHistory = match args.forecast_cutoff {
@@ -451,7 +457,7 @@ pub(crate) fn run_fit_events(args: FitEventsArgs) -> Result<(), String> {
                     history: subject,
                     horizons: &horizons,
                     future: &[],
-                    stratum: 0,
+                    stratum: subject_stratum[i],
                 },
             )
             .map_err(|e| e.to_string())?;
@@ -468,7 +474,7 @@ pub(crate) fn run_fit_events(args: FitEventsArgs) -> Result<(), String> {
                         start: subject.exit,
                         covariates: cohort.covariates.row(row).to_vec(),
                     }],
-                    stratum: 0,
+                    stratum: subject_stratum[i],
                 },
             )
             .map_err(|e| e.to_string())?;

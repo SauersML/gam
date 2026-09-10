@@ -23,6 +23,9 @@ use std::sync::Arc;
 pub(crate) struct PyEventHistoryModel {
     fit: Arc<EventHistoryFit>,
     cohort: Arc<EventHistoryCohort>,
+    /// Each training subject's reference stratum, so prediction divides by
+    /// the normaliser of the population that subject belongs to.
+    strata: Vec<usize>,
 }
 
 fn future_segments(future: Vec<(f64, Vec<f64>)>) -> Vec<FutureSegment> {
@@ -152,6 +155,7 @@ impl PyEventHistoryModel {
     /// posterior mean (`nodes × atoms`) and the posterior covariance
     /// (`nodes × atoms × atoms`) of the atoms given the whole history.
     fn latent_state<'py>(&self, py: Python<'py>, subject: usize) -> PyResult<Bound<'py, PyDict>> {
+        let stratum = self.strata.get(subject).copied().unwrap_or(0);
         let history = self
             .cohort
             .subjects
@@ -161,7 +165,7 @@ impl PyEventHistoryModel {
         let fit = Arc::clone(&self.fit);
         let cohort = Arc::clone(&self.cohort);
         let state = detach_py_result(py, "event-history latent state", move || {
-            latent_state(&fit, &cohort, &history, 0).map_err(|e| e.to_string())
+            latent_state(&fit, &cohort, &history, stratum).map_err(|e| e.to_string())
         })?;
         let atoms = self.fit.rank();
         let mut covariance = Array3::<f64>::zeros((state.times.len(), atoms, atoms));
@@ -247,6 +251,7 @@ impl PyEventHistoryModel {
         horizons: Vec<f64>,
         future: Vec<(f64, Vec<f64>)>,
     ) -> PyResult<Bound<'py, PyDict>> {
+        let stratum = self.strata.get(subject).copied().unwrap_or(0);
         let history = self
             .cohort
             .subjects
@@ -264,7 +269,7 @@ impl PyEventHistoryModel {
                     history: &history,
                     horizons: &horizons,
                     future: &future,
-                    stratum: 0,
+                    stratum,
                 },
             )
             .map_err(|e| e.to_string())
@@ -273,13 +278,14 @@ impl PyEventHistoryModel {
     }
 
     /// Forecast a subject with no history from a covariate path alone.
-    #[pyo3(signature = (start, horizons, future))]
+    #[pyo3(signature = (start, horizons, future, stratum))]
     fn population_forecast<'py>(
         &self,
         py: Python<'py>,
         start: f64,
         horizons: Vec<f64>,
         future: Vec<(f64, Vec<f64>)>,
+        stratum: usize,
     ) -> PyResult<Bound<'py, PyDict>> {
         let fit = Arc::clone(&self.fit);
         let cohort = Arc::clone(&self.cohort);
@@ -292,7 +298,7 @@ impl PyEventHistoryModel {
                     start,
                     horizons: &horizons,
                     future: &future,
-                    stratum: 0,
+                    stratum,
                 },
             )
             .map_err(|e| e.to_string())
@@ -305,6 +311,7 @@ impl PyEventHistoryModel {
     /// marks that fired (one list per spell, empty for the censored tail)
     /// and the predictive mark probabilities at each spell's end.
     fn pit<'py>(&self, py: Python<'py>, subject: usize) -> PyResult<Bound<'py, PyDict>> {
+        let stratum = self.strata.get(subject).copied().unwrap_or(0);
         let history = self
             .cohort
             .subjects
@@ -314,7 +321,7 @@ impl PyEventHistoryModel {
         let fit = Arc::clone(&self.fit);
         let cohort = Arc::clone(&self.cohort);
         let pits = detach_py_result(py, "event-history pit", move || {
-            predictive_pit(&fit, &cohort, &history, 0).map_err(|e| e.to_string())
+            predictive_pit(&fit, &cohort, &history, stratum).map_err(|e| e.to_string())
         })?;
         let marks = self.fit.marks();
         let mut probabilities = Array2::<f64>::zeros((pits.len(), marks));
@@ -347,10 +354,14 @@ impl PyEventHistoryModel {
     fn pit_distance<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
         let fit = Arc::clone(&self.fit);
         let cohort = Arc::clone(&self.cohort);
+        let strata = self.strata.clone();
         let (distance, spells, events) = detach_py_result(py, "event-history pit", move || {
             let mut pits = Vec::new();
-            for subject in &cohort.subjects {
-                pits.extend(predictive_pit(&fit, &cohort, subject, 0).map_err(|e| e.to_string())?);
+            for (index, subject) in cohort.subjects.iter().enumerate() {
+                pits.extend(
+                    predictive_pit(&fit, &cohort, subject, strata[index])
+                        .map_err(|e| e.to_string())?,
+                );
             }
             let events = pits.iter().filter(|p| p.observed).count();
             Ok((pit_uniform_distance(&pits), pits.len(), events))
@@ -368,7 +379,7 @@ impl PyEventHistoryModel {
     /// start times and rows of `covariates` (one row per segment, in the
     /// cohort's columns and level codes). With `cutoff`, the history is cut
     /// to what was known at the cutoff before forecasting.
-    #[pyo3(signature = (entry, exit, event_time, event_mark, segment_start, covariates, cutoff, horizons, future))]
+    #[pyo3(signature = (entry, exit, event_time, event_mark, segment_start, covariates, cutoff, horizons, future, stratum))]
     fn forecast_history<'py>(
         &self,
         py: Python<'py>,
@@ -381,6 +392,7 @@ impl PyEventHistoryModel {
         cutoff: Option<f64>,
         horizons: Vec<f64>,
         future: Vec<(f64, Vec<f64>)>,
+        stratum: usize,
     ) -> PyResult<Bound<'py, PyDict>> {
         if event_time.len() != event_mark.len() {
             return Err(py_value_error(
@@ -428,7 +440,7 @@ impl PyEventHistoryModel {
                     covariates: table.view(),
                     horizons: &horizons,
                     future: &future,
-                    stratum: 0,
+                    stratum,
                 },
             )
             .map_err(|e| e.to_string())
@@ -524,6 +536,11 @@ fn fit_event_history(
     // among those still at risk rather than the rate over the cohort as it
     // started. No rows means the stationary prior's centring, which is the
     // model the family has always fitted.
+    let subject_strata = if reference_stratum.is_empty() {
+        vec![0usize; subject_ids.len()]
+    } else {
+        reference_stratum.clone()
+    };
     let reference = if reference_rows.is_empty() {
         None
     } else {
@@ -546,9 +563,14 @@ fn fit_event_history(
         let fit = fit_event_history(&mut cohort, &spec).map_err(|e| e.to_string())?;
         Ok((fit, cohort))
     })?;
+    let strata = match &fit.reference_normaliser.is_empty() {
+        true => vec![0usize; cohort.subjects.len()],
+        false => subject_strata,
+    };
     Ok(PyEventHistoryModel {
         fit: Arc::new(fit),
         cohort: Arc::new(cohort),
+        strata,
     })
 }
 
