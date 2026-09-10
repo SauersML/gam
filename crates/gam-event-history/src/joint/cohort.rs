@@ -2,6 +2,10 @@
 //! likelihood evaluations, not fitted models or evidence approximations.
 use super::*;
 
+#[path = "cohort_resolution.rs"]
+mod resolution;
+pub use resolution::{CohortScoreTolerance, JointCohortResolutionReport, ResolvedCohortScore};
+
 /// A fixed sampled objective. Subject banks must have independent importance
 /// draws conditional on the reference populations. A stratum is its positional
 /// reference index; labels are never sorted or recoded here.
@@ -488,6 +492,58 @@ mod tests {
             .collect();
         let jet = cohort.log_likelihood(&seeds, &accuracy).unwrap();
         let analytic = cohort.score(&theta, &accuracy).unwrap();
+        let tolerance = CohortScoreTolerance {
+            log_error: 100.0,
+            coefficient_score_error: vec![100.0; theta.len()],
+            standard_error_multiplier: 3.0,
+        };
+        let resolved = cohort
+            .resolved_score(&theta, &accuracy, &tolerance)
+            .unwrap();
+        assert_eq!(resolved.score().gradient(), analytic.gradient());
+        assert_eq!(resolved.score().evaluation().coefficients(), &theta);
+        assert_eq!(
+            resolved.score().evaluation().log_likelihood(),
+            analytic.evaluation().log_likelihood()
+        );
+        assert!(resolved.report().reference_log_standard_error > 0.0);
+        assert!(
+            resolved
+                .report()
+                .reference_score_standard_error
+                .iter()
+                .any(|&e| e > 0.0)
+        );
+        assert!(
+            resolved.report().log_error_estimate
+                > analytic.evaluation().conditional_log_standard_error()
+        );
+        let strict_score = CohortScoreTolerance {
+            log_error: 100.0,
+            coefficient_score_error: vec![1e-12; theta.len()],
+            standard_error_multiplier: 3.0,
+        };
+        assert!(
+            cohort
+                .resolved_score(&theta, &accuracy, &strict_score)
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("cohort value/score resolution failed")
+        );
+        assert!(
+            cohort
+                .resolved_score(
+                    &theta,
+                    &accuracy,
+                    &CohortScoreTolerance {
+                        log_error: 1.0,
+                        coefficient_score_error: vec![],
+                        standard_error_multiplier: 3.0,
+                    }
+                )
+                .is_err()
+        );
         let regularized = cohort
             .score_with_decoder_prior(&theta, &[0.3], &accuracy)
             .unwrap();

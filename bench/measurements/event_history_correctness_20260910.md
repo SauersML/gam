@@ -429,3 +429,48 @@ curvature/integration, combined reference error assessment, learned
 complexity, entry conditioning, serving parity, and calibration remain
 unfinished. Exact prior normalization does not establish accuracy of a
 later Laplace approximation to the coefficient integral.
+
+## Whole-cohort reference and score resolution
+
+`JointCohortIntegration::resolved_score` now checks reference error in each
+stratum's summed log likelihood and total analytic coefficient score. It
+evaluates all three reference ensembles and performs delete-one-population
+jackknife assessments. The populations are independent replicates; subjects
+sharing one normalizer are not treated as independent sources of reference
+error. The check retains the same final coefficient/reference state as the
+ordinary cohort score.
+
+The combined estimate includes reference sampling dispersion and estimated
+bias, subject importance uncertainty, and absolute reference time/particle
+refinement changes at fixed parameters. Conditional subject errors in a
+refinement difference are added conservatively because the subject banks
+are shared across that comparison. The method enforces both a likelihood
+budget and an explicit budget for every coefficient score, rejecting an
+unresolved result. It never resamples during the objective evaluation.
+
+The first compile found a missing scalar type argument in a test helper;
+that was corrected. The final **40 focused tests passed in 11.29 s** after
+a **48.38 s** targeted warm MSI compile with four compile CPUs and two
+test threads. Fifty other tests were filtered out. Raw output is
+`event_history_cohort_resolution_20260910.txt`. No local build/tests ran.
+
+Tests compare each population deletion's values and Jacobians against direct
+re-pooling, check allocation rejection, preserve jackknife standard errors
+of order 1e200, and verify linear error growth when a shared population's
+downstream cohort contribution is multiplied. Separate checks prevent
+cancellation of opposing stratum refinement changes and account for the
+subject bank correlation between comparisons. The native cohort fixture
+checks authoritative-state equality, positive shared-reference uncertainty,
+and rejection of a deliberately unresolved coefficient-score budget.
+
+Population deletion uses a second sequential pass over reference
+sensitivities rather than R-squared reference replays or retaining an
+R-by-time-by-coefficients Jacobian array. Downstream likelihoods are still
+re-evaluated for each deletion; this is an accuracy checkpoint, not a
+routine line-search callback or a broad performance benchmark.
+
+The checks are estimated numerical errors, not deterministic bounds or
+simultaneous confidence guarantees. They do not assess the subjects' time
+meshes, coefficient curvature/integration, or external calibration. The
+remaining function priors, REML/LAML fitting, learned complexity, conditioned
+entry law, and serving parity are still unfinished.

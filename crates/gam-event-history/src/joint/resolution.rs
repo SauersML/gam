@@ -4,6 +4,10 @@
 use super::*;
 use rand::Rng;
 
+#[path = "reference_functional.rs"]
+pub(super) mod functional;
+pub(super) use functional::{FunctionalAssessment, FunctionalValue};
+
 #[derive(Clone, Debug)]
 pub struct ReferenceResolutionOptions {
     pub replicates: usize,
@@ -218,7 +222,19 @@ impl ResolvedReference<'_> {
         theta: &[f64],
     ) -> Result<ResolvedReferenceSensitivity, EventHistoryError> {
         let value = self.evolve(theta)?;
-        let rows = value.reference.log_moments.len();
+        Ok(ResolvedReferenceSensitivity {
+            sensitivity: self.pooled_sensitivity(theta, &self.large, value.reference)?,
+            report: value.report,
+        })
+    }
+
+    fn pooled_sensitivity(
+        &self,
+        theta: &[f64],
+        banks: &[JointReferenceBank<'_>],
+        reference: JointReferenceEvolution<f64>,
+    ) -> Result<JointReferenceSensitivity, EventHistoryError> {
+        let rows = reference.log_moments.len();
         let bytes = rows
             .checked_mul(theta.len())
             .and_then(|n| n.checked_mul(16))
@@ -232,22 +248,21 @@ impl ResolvedReference<'_> {
             })?;
         let mut moment = Array2::<f64>::zeros((rows, theta.len()));
         let mut mass = moment.clone();
-        let log_count = (self.large.len() as f64).ln();
-        for bank in &self.large {
+        let log_count = (banks.len() as f64).ln();
+        for bank in banks {
             let next = bank.sensitivity_for_resolution(theta, &self.step_limits, available)?;
             let curve = next.reference();
-            if curve.times() != value.reference.times() {
+            if curve.times() != reference.times() {
                 return Err(invalid(
                     "reference Jacobian pooling requires identical fine grids",
                 ));
             }
             for n in 0..rows {
                 let log_mass_weight =
-                    curve.log_risk_mass()[n] - value.reference.log_risk_mass[n] - log_count;
+                    curve.log_risk_mass()[n] - reference.log_risk_mass[n] - log_count;
                 let mass_weight = log_mass_weight.exp();
-                let activity_weight = (log_mass_weight + curve.log_moments()[n]
-                    - value.reference.log_moments[n])
-                    .exp();
+                let activity_weight =
+                    (log_mass_weight + curve.log_moments()[n] - reference.log_moments[n]).exp();
                 for q in 0..theta.len() {
                     let dm = next.log_risk_mass_jacobian()[[n, q]];
                     mass[[n, q]] += mass_weight * dm;
@@ -259,15 +274,12 @@ impl ResolvedReference<'_> {
         if moment.iter().chain(mass.iter()).any(|v| !v.is_finite()) {
             return Err(numerical("non-finite pooled reference Jacobian"));
         }
-        Ok(ResolvedReferenceSensitivity {
-            sensitivity: JointReferenceSensitivity::pooled(
-                value.reference,
-                moment,
-                mass,
-                self.options.memory_limit_bytes,
-            ),
-            report: value.report,
-        })
+        Ok(JointReferenceSensitivity::pooled(
+            reference,
+            moment,
+            mass,
+            self.options.memory_limit_bytes,
+        ))
     }
 
     pub(super) fn belongs_to(&self, model: &JointLikelihood) -> bool {

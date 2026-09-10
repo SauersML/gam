@@ -23,8 +23,8 @@ mod reference;
 mod resolution;
 mod score;
 pub use cohort::{
-    JointCohortEvaluation, JointCohortIntegration, JointCohortPosterior, JointCohortScore,
-    JointDecoderScore,
+    CohortScoreTolerance, JointCohortEvaluation, JointCohortIntegration, JointCohortPosterior,
+    JointCohortResolutionReport, JointCohortScore, JointDecoderScore, ResolvedCohortScore,
 };
 pub use decoder_prior::DecoderPriorEvaluation;
 pub use integration::{

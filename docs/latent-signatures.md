@@ -189,8 +189,10 @@ Pairwise summation combines the subject likelihoods and their derivative
 channels. Its integration tolerance applies to the aggregate estimated
 log-likelihood standard error conditional on the reference curves. Shared
 reference uncertainty is not independent between subjects and is not included
-in that conditional standard error. A combined cohort error assessment remains
-necessary for final fitting and structure comparisons.
+in that conditional standard error. The stronger `resolved_score` checkpoint
+below assesses it at the cohort level; final fitting and structure comparisons
+must use those checks as well as resolve their higher derivatives and subject
+time discretization.
 
 The cohort `posterior` method returns integrated state/genetic means and
 selected covariances at the supplied global coefficients. It does not integrate
@@ -322,9 +324,9 @@ sum_r a_r d log M_r + sum_r (a_r - m_r) d log risk_mass_r.
 
 An unweighted average of conditional Jacobians would omit that second term.
 The result owns its coefficient vector, value curves, Jacobians, and resolution
-report. The report still assesses values, not derivative sampling or
-discretization error. A combined cohort/reference derivative error assessment
-is required before these scores can certify a fit or a structure comparison.
+report. That reference report assesses values, not derivative sampling or
+discretization error. `JointCohortIntegration::resolved_score` separately
+assesses the reference's effect on the entire likelihood and its total score.
 
 The cohort processes one stratum's Jacobian workspace at a time, sums its
 subject coefficient scores with compensated summation, and retains aggregate
@@ -340,6 +342,51 @@ raw second moments, and retaining a samples-by-coefficients array. These errors
 do not include reference uncertainty, finite-sample bias, or derivative
 discretization error. Coefficient Hessians and the higher derivatives required
 by LAML remain to be connected to the same objective.
+
+### Shared-reference error in the cohort objective
+
+`resolved_score` evaluates each stratum's summed log likelihood and total
+coefficient score under the coarse-time, fine-time, and increased-particle
+reference ensembles. It also evaluates these same functions after deleting
+each independent reference population from an ensemble. Its jackknife measures
+reference uncertainty after combining all subjects sharing that population.
+Treating those subjects' reference errors as independent would miss a common
+normalizer error that can grow linearly with cohort size.
+
+For R populations and deletion values `F_(-r)`, the reference standard error
+estimate is `sqrt((R-1)/R sum_r (F_(-r)-mean(F_(-r)))^2)`. The corresponding
+bias estimate is `(R-1)(mean(F_(-r))-F)`. These calculations apply separately
+to the likelihood and every total coefficient score. A deletion differentiates
+the remaining ratio of risk-weighted activity to risk mass; it does not freeze
+the normalizer or average conditional Jacobians without their mass derivatives.
+The implementation subtracts a population from the pooled value/Jacobian,
+then checks against direct re-pooling in tests. It uses two sequential passes
+over the populations instead of R-squared reference replays or retaining all
+population Jacobians.
+
+The combined estimate includes absolute stratum refinement discrepancies,
+the estimated final reference bias, and sampling-error margins. Independent
+reference ensembles use root-sum-square errors. The same subject importance
+banks are reused across refinements, so the conditional standard errors of a
+difference are conservatively added rather than assumed independent. Stratum
+discrepancies are added in absolute value to prevent cancellation. Replication
+and importance banks must be independently generated where these calculations
+assume independence.
+
+`CohortScoreTolerance` supplies a likelihood-error budget and an absolute budget
+for every coefficient score; an optimizer must derive those budgets from its
+coefficient geometry and stationarity requirement. The method refuses an
+unresolved evaluation and returns the original fine-ensemble coefficient,
+normalizer, and score state only when the combined estimates pass. It never
+changes a mesh, proposal, or random draw inside the objective. Refinement and
+optimization restarts must happen outside that fixed objective.
+
+This is a potentially expensive resolution checkpoint, with downstream
+evaluations for every population deletion. It is not required on every line
+search trial. Its finite-replicate error estimates are not deterministic bounds
+or simultaneous confidence guarantees, and they do not assess subject time-mesh
+error, global coefficient curvature, or external calibration. A final fitting
+driver and structure-learning implementation remain unfinished.
 
 The implemented importance bank draws from an equal mixture of the structured
 Laplace Gaussian and the normalized Gaussian path prior conditional on observed
