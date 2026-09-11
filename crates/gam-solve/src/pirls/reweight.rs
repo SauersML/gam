@@ -2502,6 +2502,10 @@ where
         const MAX_UNDAMPED_POLISH_STEPS: usize = 8;
         for polish_iter in 0..MAX_UNDAMPED_POLISH_STEPS {
             let Some(bare_h) = state.hessian.as_dense() else {
+                log::debug!(
+                    "[PIRLS] undamped polish step {}: stop, the Hessian is not dense",
+                    polish_iter + 1
+                );
                 break;
             };
             let g_norm_before = constrained_stationarity_norm(
@@ -2511,6 +2515,10 @@ where
                 options.linear_constraints.as_ref(),
             );
             if state.certifies_kkt(g_norm_before, kkt_tolerance) {
+                log::debug!(
+                    "[PIRLS] undamped polish step {}: stop, strict KKT certified (‖g‖={g_norm_before:.3e})",
+                    polish_iter + 1
+                );
                 break;
             }
             // Only bother when there is a residual worth removing and the
@@ -2518,6 +2526,11 @@ where
             let bare_finite = state.gradient.iter().all(|v| v.is_finite())
                 && bare_h.iter().all(|v| v.is_finite());
             if !(g_norm_before > 0.0 && bare_finite) {
+                log::debug!(
+                    "[PIRLS] undamped polish step {}: stop, residual {g_norm_before:.3e} is zero or \
+                     the gradient/Hessian is not finite",
+                    polish_iter + 1
+                );
                 break;
             }
             // `solve_direction_with_dense_factor` returns the Newton DIRECTION
@@ -2547,10 +2560,16 @@ where
                     )
                 })
                 .filter(|rows| rows.nrows() > 0);
+            let active_row_count = active_rows.as_ref().map_or(0, |rows| rows.nrows());
             let Some(direction) = (match active_rows.as_ref() {
                 Some(rows) => active_face_newton_direction(&curvature, &state.gradient, rows),
                 None => unconstrained_newton_direction(&curvature, &state.gradient),
             }) else {
+                log::debug!(
+                    "[PIRLS] undamped polish step {}: stop, no Newton direction on a face with \
+                     {active_row_count} binding row(s) (reduced curvature did not factorize)",
+                    polish_iter + 1
+                );
                 break;
             };
             let step_finite = direction.iter().all(|v| v.is_finite());
@@ -2561,18 +2580,34 @@ where
             let step_norm_sq = direction.dot(&direction);
             let step_reasonable = step_finite && (step_norm_sq <= 0.25 * beta_norm_sq.max(1.0));
             if !step_reasonable {
+                log::debug!(
+                    "[PIRLS] undamped polish step {}: stop, step not reasonable \
+                     (‖step‖²={step_norm_sq:.3e}, bound {:.3e}, finite={step_finite})",
+                    polish_iter + 1,
+                    0.25 * beta_norm_sq.max(1.0)
+                );
                 break;
             }
             let polished: Array1<f64> = beta.as_ref() + &direction;
             if !polished.iter().all(|v| v.is_finite()) {
+                log::debug!(
+                    "[PIRLS] undamped polish step {}: stop, polished iterate is not finite",
+                    polish_iter + 1
+                );
                 break;
             }
             let polished_beta = Coefficients::new(polished);
-            let Ok(polished_state) =
-                model.update_with_curvature(&polished_beta, state.hessian_curvature)
-            else {
-                break;
-            };
+            let polished_state =
+                match model.update_with_curvature(&polished_beta, state.hessian_curvature) {
+                    Ok(polished_state) => polished_state,
+                    Err(error) => {
+                        log::debug!(
+                            "[PIRLS] undamped polish step {}: stop, re-evaluation failed: {error}",
+                            polish_iter + 1
+                        );
+                        break;
+                    }
+                };
             // The step is exact on the face it was built for — the whole space
             // while the active set is empty (every multiplier is zero, so
             // `∇L − Aᵀλ = ∇L`), the active face otherwise — but it says nothing
@@ -2600,25 +2635,53 @@ where
                 options.coefficient_lower_bounds.as_ref(),
                 options.linear_constraints.as_ref(),
             );
-            // Commit ONLY on a strict improvement, and only when the polished
+            // Commit ONLY on measured progress, and only when the polished
             // objective did not increase (a quadratic Newton step cannot
             // increase F, so this rejects nonlinear-family overshoot).
             // Same dispersion scale `k` as the gain-ratio objective above.
+            //
+            // Progress is either a strictly smaller stationarity residual or a
+            // decrease of the objective larger than the objective's own rounding
+            // band. The second is what an exact Newton step shows where the
+            // residual cannot: at a steep penalty (λ ≈ 1e8 on a shape face,
+            // #2668) the gradient `X'W(η − z) + λSβ` is formed by cancellation,
+            // so its norm sits at an arithmetic floor (2.26e-7 → 2.38e-7 across
+            // the step) while the same step lowered F by 1.46e-12, exactly the
+            // model's ½·gᵀH⁻¹g and twenty bands above resolution. Refusing that
+            // step left the solve one Newton step short of a certifiable mode.
+            // A machine-stationary fit still sees no committed step: its
+            // decrease is inside the band and its residual cannot shrink.
             let polish_dev_scale = model.penalized_deviance_scale()?;
             let obj_before = penalizedobjective(&state, polish_dev_scale);
             let obj_after = penalizedobjective(&polished_state, polish_dev_scale);
             let objective_ok = obj_before.is_finite()
                 && obj_after.is_finite()
                 && obj_after <= obj_before + obj_before.abs().max(1.0) * 1e-12;
-            if !(g_norm_after.is_finite() && g_norm_after < g_norm_before && objective_ok) {
+            let resolvable_decrease = obj_before - obj_after
+                > penalized_objective_rounding_band(&state, polish_dev_scale);
+            let residual_improved = g_norm_after < g_norm_before;
+            if !(g_norm_after.is_finite()
+                && objective_ok
+                && (residual_improved || resolvable_decrease))
+            {
+                log::debug!(
+                    "[PIRLS] undamped polish step {}: stop, no measured progress \
+                     (‖g‖ {g_norm_before:.6e} -> {g_norm_after:.6e}, objective {obj_before:.15e} -> \
+                     {obj_after:.15e}, Δ={:.3e}, ‖step‖={:.3e}, binding rows {active_row_count})",
+                    polish_iter + 1,
+                    obj_after - obj_before,
+                    step_norm_sq.sqrt()
+                );
                 break;
             }
             log::debug!(
                 "[PIRLS] undamped Newton polish (#1122) step {}: \
-                 ‖g‖ {g_norm_before:.3e} → {g_norm_after:.3e} \
-                 (‖step‖={:.3e})",
+                 ‖g‖ {g_norm_before:.3e} → {g_norm_after:.3e}, ΔF={:.3e} \
+                 (‖step‖={:.3e}, committed on {})",
                 polish_iter + 1,
-                step_norm_sq.sqrt()
+                obj_after - obj_before,
+                step_norm_sq.sqrt(),
+                if residual_improved { "residual" } else { "objective decrease" }
             );
             beta = polished_beta;
             state = polished_state;
