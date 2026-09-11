@@ -341,27 +341,27 @@ impl CustomFamily for DirichletCommonFamily {
                     let aa = alpha[a][i];
                     let ab = alpha[b][i];
                     let a0 = alpha0[i];
-                    // EXPECTED (Fisher) information in η-space, NOT the observed
-                    // Hessian. The Dirichlet log-link is non-canonical, so the
-                    // observed information carries the score-residual term
-                    // `−α_a·R_a` with `R_a = ψ(α₀) − ψ(α_a) + ln y_a`. Far from the
-                    // optimum that residual is O(1) and flips the sign of the
-                    // diagonal block, making the *observed* joint Hessian
-                    // INDEFINITE — the joint-Newton inner step then loses its
-                    // descent guarantee and the coupled K-block solve oscillates /
-                    // exhausts its cycle budget on the small, concentrated Skye
-                    // composition (#729 arm 10b). The Fisher information
-                    // `E[−∂²ℓ/∂η_a∂η_b]` drops the residual term (`E[R_a]=0`), is
-                    // globally PSD (a score covariance), and equals the observed
-                    // Hessian at the MLE — Fisher scoring converges to the SAME
-                    // stationary point with guaranteed-descent curvature and is
-                    // consistent with the per-block working weights `evaluate`
-                    // emits. The outer REML trace calculus below differentiates
-                    // this SAME Fisher matrix, so the logdet/trace derivatives stay
-                    // exact (mgcv's penalized-likelihood REML is built on Fisher
-                    // scoring identically).
+                    // OBSERVED information in η-space, as the trait contract of
+                    // `exact_newton_joint_hessian` requires. The Dirichlet log-link
+                    // is non-canonical, so the diagonal block carries the
+                    // score-residual term `−α_a·R_a` with
+                    // `R_a = ψ(α₀) − ψ(α_a) + ln y_a` on top of the Fisher weight
+                    // `α_a²(ψ'(α_a) − ψ'(α₀))`. That term does not vanish at the
+                    // penalized mode: only its X-weighted sum does (the score),
+                    // not its X-weighted outer product. The engine solves the
+                    // mode response `u_k = −H⁻¹ A_k β̂` with THIS matrix, so
+                    // returning the Fisher information made `u_k` the wrong
+                    // derivative of β̂ and the analytic outer gradient disagreed
+                    // with the LAML objective. On the 15-row Skye series ARC
+                    // rejected 33 of 33 steps and exhausted its 60-iteration
+                    // budget at |g|=6.5e-2 (#1561). Indefiniteness away from the mode is
+                    // handled by the inner solve's trust region and
+                    // `levenberg_on_ill_conditioning` damping. The per-block working
+                    // weights `evaluate` emits remain Fisher weights; they only
+                    // shape IRLS working responses, whose score is exact.
                     weights[i] = if a == b {
-                        aa * aa * (trigamma(aa) - trigamma(a0))
+                        let score_residual = digamma(a0) - digamma(aa) + self.log_y[a][i];
+                        aa * aa * (trigamma(aa) - trigamma(a0)) - aa * score_residual
                     } else {
                         -aa * ab * trigamma(a0)
                     };
@@ -458,14 +458,16 @@ impl CustomFamily for DirichletCommonFamily {
                     let trig_a0 = trigamma(a0);
                     let tetr_a0 = tetragamma(a0);
                     weights[i] = if a == b {
-                        // β-directional derivative of the EXPECTED (Fisher)
-                        // diagonal block `α_a²(ψ'(α_a) − ψ'(α₀))` — the residual
-                        // term `−α_a·R_a` is absent from the Fisher Hessian, so it
-                        // contributes nothing here. Keeping H and D_β H on the same
-                        // (Fisher) matrix is what makes the outer REML trace exact.
+                        // β-directional derivative of the OBSERVED diagonal block
+                        // `α_a²(ψ'(α_a) − ψ'(α₀)) − α_a·R_a`. Keeping H, D_β H and
+                        // D²_β H on the same (observed) matrix is what makes the
+                        // outer REML trace exact.
                         let trig_aa = trigamma(aa);
+                        let score_residual = digamma(a0) - digamma(aa) + self.log_y[a][i];
+                        let d_score_residual = trig_a0 * da0 - trig_aa * da;
                         2.0 * aa * da * (trig_aa - trig_a0)
                             + aa * aa * (tetragamma(aa) * da - tetr_a0 * da0)
+                            - (da * score_residual + aa * d_score_residual)
                     } else {
                         let ab = alpha[b][i];
                         let db = d_alpha[b][i];
@@ -582,14 +584,11 @@ impl CustomFamily for DirichletCommonFamily {
                     let tetr0 = tetragamma(a0);
                     let pent0 = pentagamma(a0);
                     weights[i] = if a == b {
-                        // Second β-directional derivative of the EXPECTED (Fisher)
-                        // diagonal block `w_aa = α_a²(ψ'(α_a) − ψ'(α₀))`. The
-                        // observed-information residual term `−α_a·R_a`
-                        // (R_a = ψ(α₀) − ψ(α_a) + log_y_a) is NOT part of the Fisher
-                        // Hessian and is therefore absent from every order of its
-                        // directional derivative; dropping it keeps H, D_β H and
-                        // D²_β H consistent on one (Fisher) matrix so the exact
-                        // outer-REML 3rd-order trace term stays exact.
+                        // Second β-directional derivative of the OBSERVED diagonal
+                        // block `w_aa = α_a²(ψ'(α_a) − ψ'(α₀)) − α_a·R_a`
+                        // (R_a = ψ(α₀) − ψ(α_a) + log_y_a), keeping H, D_β H and
+                        // D²_β H consistent on one matrix so the outer-REML
+                        // 3rd-order trace term stays exact.
                         let aa = alpha[a][i];
                         let dua = du_alpha[a][i];
                         let dva = dv_alpha[a][i];
@@ -611,7 +610,16 @@ impl CustomFamily for DirichletCommonFamily {
                         let duv_g =
                             pent_a * dua * dva + tetr_a * duva - (pent0 * du0 * dv0 + tetr0 * duv0);
 
-                        d_uv_a2 * g + du_a2 * dv_g + dv_a2 * du_g + a2 * duv_g
+                        // Observed-information residual `α_a·R_a` and its mixed
+                        // second derivative, subtracted from the Fisher part.
+                        let score_residual = digamma(a0) - digamma(aa) + self.log_y[a][i];
+                        let du_r = trig0 * du0 - trig_a * dua;
+                        let dv_r = trig0 * dv0 - trig_a * dva;
+                        let duv_r = tetr0 * du0 * dv0 + trig0 * duv0 - tetr_a * dua * dva - trig_a * duva;
+                        let duv_residual =
+                            duva * score_residual + dua * dv_r + dva * du_r + aa * duv_r;
+
+                        d_uv_a2 * g + du_a2 * dv_g + dv_a2 * du_g + a2 * duv_g - duv_residual
                     } else {
                         // w_ab = −α_a α_b ψ'(α₀), a ≠ b.
                         let aa = alpha[a][i];
@@ -1158,7 +1166,7 @@ fn gam_dirichlet_regression_recovers_truth_on_real_data() {
         r#"
         suppressPackageStartupMessages(library(DirichletReg))
         Y <- DR_data(cbind(df${p0}, df${p1}, df${p2}))
-        m <- DirichletReg(Y ~ -1 + {rhs}, data = df)
+        m <- DirichReg(Y ~ -1 + {rhs}, data = df)
         co <- coef(m)
         flat <- as.numeric(unlist(co))
         emit("coef", flat)
