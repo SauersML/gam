@@ -1449,7 +1449,7 @@ mod parity_tests {
             for c in 0..k {
                 let yc = y_one_hot[[row, c]];
                 if yc != 0.0 {
-                    ll += yc * probs[c].max(1.0e-300).ln();
+                    ll += yc * probs[c].ln();
                 }
             }
         }
@@ -1702,7 +1702,7 @@ mod parity_tests {
                 row_sum += fit.fitted_probabilities[[row, c]];
                 let yc = y[[row, c]];
                 if yc != 0.0 {
-                    log_lik += yc * probs[c].max(1.0e-300).ln();
+                    log_lik += yc * probs[c].ln();
                 }
             }
             assert!(

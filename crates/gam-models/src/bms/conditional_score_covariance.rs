@@ -984,7 +984,8 @@ mod tests {
         };
         let mut out = Vec::with_capacity(n + 1);
         while out.len() < n {
-            let u1 = unit().max(1e-12);
+            // `unit` draws from the open interval (0, 1), so `ln u1` is finite.
+            let u1 = unit();
             let u2 = unit();
             let r = (-2.0 * u1.ln()).sqrt();
             out.push(r * (std::f64::consts::TAU * u2).cos());
@@ -997,9 +998,7 @@ mod tests {
     fn standardized(mut v: Vec<f64>) -> Vec<f64> {
         let n = v.len() as f64;
         let mean = v.iter().sum::<f64>() / n;
-        let sd = (v.iter().map(|x| (x - mean) * (x - mean)).sum::<f64>() / n)
-            .sqrt()
-            .max(1e-12);
+        let sd = (v.iter().map(|x| (x - mean) * (x - mean)).sum::<f64>() / n).sqrt();
         for value in v.iter_mut() {
             *value = (*value - mean) / sd;
         }

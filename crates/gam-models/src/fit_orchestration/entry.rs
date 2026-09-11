@@ -2656,7 +2656,8 @@ mod sz_factor_smooth_recovery_tests {
         }
         /// Standard normal via Box–Muller (one of the pair).
         fn normal(&mut self) -> f64 {
-            let u1 = (self.unif()).max(1e-12);
+            // `unif` is in [0, 1); its complement is in (0, 1], so `ln u1` is finite.
+            let u1 = 1.0 - self.unif();
             let u2 = self.unif();
             (-2.0 * u1.ln()).sqrt() * (std::f64::consts::TAU * u2).cos()
         }

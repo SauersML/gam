@@ -529,7 +529,8 @@ mod marginal_slope_screen_response_tests {
     }
 
     fn normal(state: &mut u64) -> f64 {
-        let u1 = unit(state).max(1.0e-300);
+        // `unit` draws from the open interval (0, 1), so `ln u1` is finite.
+        let u1 = unit(state);
         let u2 = unit(state);
         (-2.0 * u1.ln()).sqrt() * (std::f64::consts::TAU * u2).cos()
     }

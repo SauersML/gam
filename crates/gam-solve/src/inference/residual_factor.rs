@@ -1334,7 +1334,8 @@ mod tests {
     }
 
     fn lcg_normal(state: &mut u64) -> f64 {
-        let u1 = lcg_uniform(state).max(1e-12);
+        // `lcg_uniform` is in [0, 1); its complement is in (0, 1], so `ln u1` is finite.
+        let u1 = 1.0 - lcg_uniform(state);
         let u2 = lcg_uniform(state);
         (-2.0 * u1.ln()).sqrt() * (std::f64::consts::TAU * u2).cos()
     }

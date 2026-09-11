@@ -3482,7 +3482,7 @@ mod empirical_rigid_jet_oracle_tests {
         (-0.5 * x * x).exp() / (2.0 * std::f64::consts::PI).sqrt()
     }
     fn wnorm_logcdf(x: f64) -> f64 {
-        wnorm_cdf(x).max(1e-300).ln()
+        wnorm_cdf(x).ln()
     }
 
     fn witness_intercept(mu: f64, slope: f64, s: f64, nodes: &[f64], weights: &[f64]) -> f64 {
@@ -4358,7 +4358,7 @@ mod empirical_flex_jet_oracle_tests {
     }
 
     fn witness_normal_logcdf(x: f64) -> f64 {
-        witness_normal_cdf(x).max(1e-300).ln()
+        witness_normal_cdf(x).ln()
     }
 
     /// Solve the flex calibration root `Σ_k π_k Φ(η(a; x_k)) = μ` with an
