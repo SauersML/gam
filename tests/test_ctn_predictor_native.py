@@ -12,6 +12,12 @@ def test_native_ctn_chain_save_load_and_batches(tmp_path):
     data = pd.DataFrame({"pgs": 2 + .4 * x + z, "x": x,
                          "y": (rng.normal(size=n) < -.2 + .3 * x + .5 * z).astype(int),
                          "group": np.arange(n)})
+    data["irrelevant_date"] = pd.Timestamp("2020-01-01")
+    gamfit.validate_formula(
+        data, "y ~ x", family="bernoulli-marginal-slope", slope_formula="1",
+        transformation_normal_stage1=gamfit.CtnStage1(
+            "pgs", "x", group_column="group", folds=2,
+            response_num_internal_knots=2))
     model = gamfit.fit(
         data, "y ~ x", family="bernoulli-marginal-slope", slope_formula="1",
         transformation_normal_stage1=gamfit.CtnStage1(
@@ -26,11 +32,53 @@ def test_native_ctn_chain_save_load_and_batches(tmp_path):
     np.testing.assert_allclose(restored.predict(test), before, rtol=1e-8, atol=1e-10)
     np.testing.assert_allclose(restored.predict(test.iloc[::-1]), before[::-1], rtol=1e-8, atol=1e-10)
     np.testing.assert_allclose(restored.predict(test.iloc[[3]]), before[[3]], rtol=1e-8, atol=1e-10)
-    from gamfit._ctn_model import _with_score
-    manual = restored.outcome.predict(_with_score(test, restored.transform.transformation_score(test)))
+    import json
+    payload = json.loads(restored.dumps())
+    transform_payload = payload["payload"]["score_transform"]
+    payload["payload"]["score_transform"] = None
+    payload["payload"]["score_crossfit_folds"] = None
+    outcome = gamfit.loads(json.dumps(payload).encode())
+    # Explicit application uses the same saved native CTN evaluator.
+    manual = outcome.predict(test.assign(__gamfit_ctn_score=restored.transformation_score(test)))
     np.testing.assert_allclose(manual, before, rtol=1e-8, atol=1e-10)
-    for payload in (model.outcome.dumps(), restored.outcome.dumps()):
-        import json
-        saved = json.loads(payload)["payload"]
+    assert transform_payload["score_transform"] is None
+    transform = gamfit.loads(json.dumps({"model_type": "transformation-normal", "payload": transform_payload}).encode())
+    gamfit.validate_formula(
+        data, "y ~ x", family="bernoulli-marginal-slope", slope_formula="1",
+        transformation_normal_stage1=transform)
+    attached = gamfit.fit(
+        data, "y ~ x", family="bernoulli-marginal-slope", slope_formula="1",
+        transformation_normal_stage1=transform,
+        persistent_warm_start_root=tmp_path / "warm-attached")
+    np.testing.assert_allclose(attached.transformation_score(test), transform.transformation_score(test),
+                               rtol=1e-8, atol=1e-10)
+    attached.save(tmp_path / "attached.gamfit")
+    np.testing.assert_allclose(gamfit.load(tmp_path / "attached.gamfit").predict(test),
+                               attached.predict(test), rtol=1e-8, atol=1e-10)
+    # The same saved transform also crosses the native survival boundary.
+    event_time = rng.exponential(np.exp(-.4 * z))
+    censor_time = rng.uniform(.5, 2., n)
+    survival_data = data.assign(entry=0., exit=np.minimum(event_time, censor_time),
+                                event=(event_time <= censor_time).astype(int))
+    survival = gamfit.fit(
+        survival_data, "Surv(entry, exit, event) ~ x",
+        survival_likelihood="marginal-slope", slope_formula="1",
+        transformation_normal_stage1=transform,
+        config={"time_num_internal_knots": 2},
+        persistent_warm_start_root=tmp_path / "warm-survival")
+    prospective = test.assign(entry=0., exit=2., event=0)
+    times = [.1, .5, 1., 2.]
+    probabilities = np.asarray(survival.predict(prospective).survival_at(times))
+    assert np.isfinite(probabilities).all()
+    assert ((probabilities >= 0) & (probabilities <= 1)).all()
+    assert (np.diff(probabilities, axis=1) <= 1e-10).all()
+    survival.save(tmp_path / "survival.gamfit")
+    loaded_survival = gamfit.load(tmp_path / "survival.gamfit")
+    np.testing.assert_allclose(loaded_survival.predict(prospective).survival_at(times),
+                               probabilities, rtol=1e-8, atol=1e-10)
+    np.testing.assert_allclose(loaded_survival.predict(prospective.iloc[[3]]).survival_at(times),
+                               probabilities[[3]], rtol=1e-8, atol=1e-10)
+    for state in (model.dumps(), restored.dumps()):
+        saved = json.loads(state)["payload"]
         assert saved.get("latent_z_rank_int_calibration") is None
         assert saved.get("latent_z_conditional_calibration") is None

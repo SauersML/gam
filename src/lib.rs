@@ -322,7 +322,7 @@ pub use families::protocol::{
 };
 pub use families::transformation_normal;
 pub use gam_models::fit_orchestration::{
-    BernoulliMarginalSlopeFitRequest, BinomialLocationScaleFitRequest, CrossFitScoreCalibration,
+    BernoulliMarginalSlopeFitRequest, BinomialLocationScaleFitRequest,
     CtnStage1Recipe, DispersionLocationScaleFitRequest, DispersionLocationScaleFitResult,
     FitConfig, FitRequest, FitResult, FormulaFitResult, GaussianLocationScaleFitRequest,
     LatentBinaryFitRequest, LatentSurvivalFitRequest, LinkWiggleConfig, MaterializedModel,

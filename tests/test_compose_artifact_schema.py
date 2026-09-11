@@ -6,9 +6,9 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-_EXAMPLES = Path(__file__).resolve().parent.parent / "examples"
-if str(_EXAMPLES) not in sys.path:
-    sys.path.insert(0, str(_EXAMPLES))
+_EXPERIMENTS = Path(__file__).resolve().parent.parent / "experiments"
+if str(_EXPERIMENTS) not in sys.path:
+    sys.path.insert(0, str(_EXPERIMENTS))
 
 import compose_artifact_schema as cas  # noqa: E402
 
@@ -41,7 +41,7 @@ def _compose_payload() -> dict:
 
 
 def test_version_guard_accepts_current_wheel() -> None:
-    cas.require_gamfit_version("0.1.267")
+    cas.require_gamfit_version("0.1.268")
 
 
 def test_explained_variance_uses_train_mean_not_heldout_mean() -> None:

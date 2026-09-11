@@ -50,7 +50,8 @@ marginal-slope entry: it fits the conditional transformation
 `h(score | covariates) ~ N(0, 1)` in each fold's training complement. An
 ordinary penalized marginal-slope outcome uses those OOF scores, with no
 influence absorber or second normalization. A separate full-training CTN is
-saved together with the outcome in `CtnMarginalSlopeModel`. Prediction replays
+saved together with the outcome in the native GAM `Model`. Rust owns the
+composition, folds and persistence for library, CLI and Python. Prediction replays
 that frozen transform on raw scores. Cross-fitting alone establishes neither
 Neyman orthogonality nor outcome calibration.
 
@@ -95,10 +96,10 @@ symmetric about `linear_predictor` on the link scale.
   `covariates` is the covariate-side formula right-hand side used to fit
   `h(score | covariates) ~ N(0, 1)`. `fold_column` supplies explicit labels;
   `group_column` assigns entire families together. Failed folds raise an error.
-- Saved `transform` and `outcome` components are available for manual replay.
+- `model.transformation_score(data)` replays the embedded transform using raw PGS
+  and its fitted covariates. The native payload stores the transform and outcome.
   Outcome intervals are conditional on the fitted CTN, not full two-stage
-  uncertainty estimates. The experimental Rust influence path is separate
-  from this Python prediction API.
+  uncertainty estimates. The predictive chain does not claim Neyman orthogonality.
 - The base link is fixed to probit. The Python `link=` keyword is not
   needed for marginal-slope fits.
 
@@ -107,12 +108,11 @@ the strength of the score effect at each point in covariate space.
 
 The same recipe drives the survival likelihood:
 
-For prospective net survival, the saved chain also exposes
-`model.survival_at(baseline_df, [1., 3., 5.])`. It supplies the requested
-times and zero event indicators internally, without reading observed outcome
-times. `entry_time=a0` conditions the curve on a common event-free entry time;
-use absolute times `a0 + horizon` in that case. Competing-risk incidence needs
-separate cause components and a CIF, not one minus disease-only net survival.
+Use a prospective prediction frame with entry fixed at baseline and exit set
+to the requested prediction horizon, rather than each person's observed outcome
+time. Evaluate the returned survival surface at explicit times. For delayed
+entry, condition on surviving to entry. Competing-risk incidence needs separate
+cause components and a CIF, not one minus disease-only net survival.
 
 ```python
 model = gamfit.fit(
@@ -130,6 +130,22 @@ model = gamfit.fit(
 pred = model.predict(test_df)
 S = pred.survival_at([1, 5, 10])
 ```
+
+An already fitted external CTN can be passed through the same native composition:
+
+```python
+reference = gamfit.load("reference.gamfit")
+model = gamfit.fit(
+    df, "Surv(entry, exit, event) ~ s(age) + sex + duchon(pc1, pc2)",
+    survival_likelihood="marginal-slope", slope_formula="1 + duchon(pc1, pc2)",
+    transformation_normal_stage1=reference,
+)
+```
+
+This applies the supplied CTN unchanged to both fitting and prediction. No
+target-data refit, additional normalization, or influence matrix is performed.
+Matching score and covariate definitions remains the caller's responsibility;
+an external transform does not certify target-population conditional normality.
 
 The main formula specifies the baseline survival surface; the score's
 slope on the marginal-calibrated probit survival scale is a smooth

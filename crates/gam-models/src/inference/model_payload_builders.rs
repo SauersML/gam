@@ -1615,6 +1615,10 @@ pub fn fit_formula_to_payload(
     dataset: &EncodedDataset,
     fit_config: &FitConfig,
 ) -> Result<FittedModelPayload, WorkflowError> {
+    if fit_config.ctn_stage1.is_some() || fit_config.frozen_ctn.is_some() {
+        return crate::inference::ctn::fit_chain(formula, dataset, fit_config)
+            .map_err(|reason| WorkflowError::IntegrationFailed { reason });
+    }
     // Expectile (Newey–Powell LAWS) family (#1777): the expectile estimator is an
     // OUTER driver that wraps the standard Gaussian-identity GAM with iterative
     // asymmetric reweighting, so it is selected *before* `materialize` (which has
@@ -1636,11 +1640,6 @@ pub fn fit_formula_to_payload(
         apply_request_metadata(&mut payload, fit_config, Vec::new());
         return Ok(payload);
     }
-    // Calibrated marginal-slope chain (#461): when a CTN Stage-1 recipe is present
-    // (config.ctn_stage1), the marginal-slope materializer cross-fits the CTN and
-    // produces the calibrated `z` out-of-fold — no z_column is needed and no
-    // Stage-1 pre-fit / synthetic column round-trip is performed here. The recipe
-    // rides on fit_config straight into materialize.
     // Standard-fit dispatch must materialize at the adaptive structural start:
     // this request becomes the first fitted design below. Other estimator
     // materializers do not consume this standard-only orchestration field.

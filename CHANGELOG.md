@@ -1,3 +1,11 @@
+## gamfit 0.1.268 (2026-09-11)
+
+- Existing CTN composition now lives in Rust, shared by the library, CLI and Python.
+- One native model stores a frozen external CTN or a full-training CTN alongside
+  the marginal-slope outcome; explicit folds or groups govern cross-fitting.
+- Python-only composition and automatic CTN influence absorption are removed.
+- Payload version 16 rejects previous archives; refit models with this runtime.
+
 ## v0.3.157 — gam 0.3.157 / gamfit 0.1.267 (2026-09-09)
 
 A same-day follow-up to `v0.3.156`, whose `gamfit` wheels never reached PyPI:

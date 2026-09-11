@@ -405,18 +405,13 @@ pub(crate) fn materialize_survival<'a>(
                 == SurvivalLikelihoodMode::MarginalSlope,
         },
     );
-    // Alias `z` to the dose column for the marginal termspec only when a raw
-    // z_column is supplied. With a CTN Stage-1 recipe there is no dose column
-    // (z is produced out-of-fold by cross-fitting) and the marginal formula
-    // references only the x covariates, so no alias is needed.
+    // CTN composition supplies its generated score before materialization.
     let marginal_slope_aliased_col_map = if survival_mode == SurvivalLikelihoodMode::MarginalSlope {
         match config.z_column.as_deref() {
             Some(z_column) => Some(column_map_with_alias(col_map, "z", z_column)),
-            None if config.ctn_stage1.is_some() => None,
             None => {
                 return Err(WorkflowError::InvalidConfig {
-                    reason: "marginal-slope survival requires z_column in FitConfig (or a CTN \
-                             Stage-1 recipe via ctn_stage1, which produces z by cross-fitting)"
+                    reason: "marginal-slope survival materialization requires z_column"
                         .to_string(),
                 });
             }
@@ -545,20 +540,13 @@ pub(crate) fn materialize_survival<'a>(
             smooth_terms: vec![],
         }
     };
-    // `z_column` is OPTIONAL for the survival marginal-slope when a CTN Stage-1
-    // recipe is present: the calibrated chain produces the single `z` surface
-    // out-of-fold from the cross-fitted CTN, so there is no raw dose column to
-    // read (no throwaway pre-fit column — the no-slop cutover, #461). Without a
-    // recipe, the primitive standalone survival marginal-slope still requires a
-    // raw `z_column` dose.
+    // Both supplied and CTN-generated scores have an explicit column here.
     let marginal_z_column_name = if survival_mode == SurvivalLikelihoodMode::MarginalSlope {
         match config.z_column.as_deref() {
             Some(name) => Some(name),
-            None if config.ctn_stage1.is_some() => None,
             None => {
                 return Err(WorkflowError::InvalidConfig {
-                    reason: "marginal-slope survival requires z_column in FitConfig (or a CTN \
-                             Stage-1 recipe via ctn_stage1, which produces z by cross-fitting)"
+                    reason: "marginal-slope survival materialization requires z_column"
                         .to_string(),
                 });
             }
@@ -574,77 +562,7 @@ pub(crate) fn materialize_survival<'a>(
         marginal_slope_base_link,
     ) = if survival_mode == SurvivalLikelihoodMode::MarginalSlope {
         let base_link = resolve_survival_marginal_slope_base_link(parsed.linkspec.as_ref())?;
-        if marginal_z_column_name.is_none() {
-            // Calibrated chain: the CTN Stage-1 recipe produces a SINGLE z surface
-            // out-of-fold, so no dose column is read. Stand in an n×1 placeholder
-            // surface (the cross-fit below overrides column 0) and build the
-            // slope surface from the formula (or the marginal termspec). The
-            // single-surface invariant matches the cross-fit guard further down.
-            let placeholder_z = Array2::<f64>::zeros((data.values.nrows(), 1));
-            let (slopespec, routing) = if let Some(ls_formula) =
-                config.slope_formula.as_deref()
-            {
-                let (_, ls_parsed) = parse_matching_auxiliary_formula(
-                    ls_formula,
-                    &parsed.response,
-                    "slope_formula",
-                )?;
-                if ls_parsed.linkspec.is_some() {
-                    return Err(
-                        "link(...) is not supported in slope_formula for the survival marginal-slope family"
-                            .to_string()
-                            .into(),
-                    );
-                }
-                if ls_parsed.timewiggle.is_some() {
-                    return Err(
-                        "timewiggle(...) is not supported in slope_formula for the survival marginal-slope family"
-                            .to_string()
-                            .into(),
-                    );
-                }
-                if ls_parsed.survivalspec.is_some() {
-                    return Err(
-                        "survmodel(...) is not supported in slope_formula for the survival marginal-slope family"
-                            .to_string()
-                            .into(),
-                    );
-                }
-                let mut spec = build_termspec_with_geometry_and_overrides(
-                    &ls_parsed.terms,
-                    data,
-                    col_map,
-                    &mut inference_notes,
-                    config.scale_dimensions,
-                    &policy,
-                    config.smooth_overrides.as_ref(),
-                    None,
-                )?;
-                prune_unidentified_linear_terms_for_marginal_slope(
-                    &mut spec,
-                    data,
-                    "survival marginal-slope slope_formula",
-                    &mut inference_notes,
-                )?;
-                let routing = route_marginal_slope_deviation_blocks(
-                    parsed.linkwiggle.as_ref(),
-                    ls_parsed.linkwiggle.as_ref(),
-                )?;
-                (spec, routing)
-            } else {
-                (
-                    termspec.clone(),
-                    route_marginal_slope_deviation_blocks(parsed.linkwiggle.as_ref(), None)?,
-                )
-            };
-            (
-                Some(placeholder_z),
-                Some(slopespec.clone()),
-                Some(vec![slopespec]),
-                routing,
-                Some(base_link),
-            )
-        } else if let Some(ls_formula) = config.slope_formula.as_deref() {
+        if let Some(ls_formula) = config.slope_formula.as_deref() {
             let default_z_column = marginal_z_column_name.expect("z column present when no recipe");
             let (_, ls_parsed) =
                 parse_matching_auxiliary_formula(ls_formula, &parsed.response, "slope_formula")?;
@@ -744,39 +662,6 @@ pub(crate) fn materialize_survival<'a>(
     };
     let marginal_slope_score_warp = marginal_slope_deviation_routing.score_warp;
     let marginal_slope_link_dev = marginal_slope_deviation_routing.link_dev;
-
-    // Auto-enable Neyman-orthogonal, cross-fitted score calibration when the
-    // survival marginal-slope `z` was generated by a CTN Stage-1 fit (design
-    // §5). Computed once (it refits the CTN K times) — outside the per-baseline
-    // request closure below. When active it replaces the (single) CTN-generated
-    // z surface with its out-of-fold value and captures the score-influence
-    // Jacobian `J` for Stage-2's leakage-projection block. With no CTN Stage-1
-    // recipe, the raw z surfaces stand and `score_warp` is the fallback basis.
-    let crossfit_calibration = if survival_mode == SurvivalLikelihoodMode::MarginalSlope {
-        crossfit_score_calibration(data, col_map, config.ctn_stage1.as_ref(), &policy)
-            .map_err(|reason| WorkflowError::IntegrationFailed { reason })?
-    } else {
-        None
-    };
-    let (marginal_z, marginal_slope_jac_oof) = match (marginal_z, crossfit_calibration) {
-        (Some(mut z_surfaces), Some(calibration)) => {
-            // A CTN Stage-1 chain produces exactly one latent score surface; the
-            // OOF projection is defined against that single column.
-            if z_surfaces.ncols() != 1 {
-                return Err(WorkflowError::InvalidConfig {
-                    reason: format!(
-                        "cross-fitted score calibration applies to a single CTN-generated z \
-                         surface, but the survival marginal-slope model has {} z surfaces; \
-                         multi-surface slope is incompatible with the CTN Stage-1 chain",
-                        z_surfaces.ncols()
-                    ),
-                });
-            }
-            z_surfaces.column_mut(0).assign(&calibration.z_oof);
-            (Some(z_surfaces), Some(calibration.jac_oof))
-        }
-        (z, _) => (z, None),
-    };
 
     if survival_mode == SurvivalLikelihoodMode::MarginalSlope {
         if parsed.linkwiggle.is_some() {
@@ -1048,7 +933,7 @@ pub(crate) fn materialize_survival<'a>(
                 score_warp: marginal_slope_score_warp.clone(),
                 link_dev: marginal_slope_link_dev.clone(),
                 latent_z_policy: config.marginal_slope_latent_policy(),
-                score_influence_jacobian: marginal_slope_jac_oof.clone(),
+                score_influence_jacobian: None,
             },
             options: BlockwiseFitOptions {
                 // The same answer the CLI route gives (`run_survival.rs` sets it

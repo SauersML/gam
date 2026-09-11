@@ -63,6 +63,13 @@ class CtnStage1:
         return {key: value for key, value in asdict(self).items()
                 if (key.startswith("response_") or key == "double_penalty") and value is not None}
 
+    def native_document(self):
+        """Marshal the shared Rust fit-request schema without fitting in Python."""
+        return {"response_column": self.response, "covariate_formula_rhs": self.covariates,
+                "fold_column": self.fold_column, "group_column": self.group_column,
+                "folds": self.folds, "seed": self.seed, "weight_column": self.weights,
+                "offset_column": self.offset, "config": self.response_config()}
+
 
 def normalize_ctn_stage1(value: Any) -> CtnStage1 | None:
     if value is None or isinstance(value, CtnStage1):

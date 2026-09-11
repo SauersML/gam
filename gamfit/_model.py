@@ -275,7 +275,10 @@ class Model:
         distinction instead of presenting two different estimands as a generic
         ``linear_predictor`` / ``mean`` pair (#2785).
         """
-        headers, rows, table_kind = normalize_table(data)
+        required = rust_module().required_model_columns(self._model_bytes, False)
+        if required is not None and id_column is not None:
+            required = sorted(set(required) | {id_column})
+        headers, rows, table_kind = normalize_table(data, required_columns=required)
         row_ids = extract_row_ids(headers, rows, id_column)
         # #1054: interval='conformal' routes to the exact Gaussian jackknife+
         # path (no held-out fold needed; targets conformal_level coverage with
@@ -360,8 +363,9 @@ class Model:
     ) -> Any:
         """Evaluate ``Phi^-1(F_hat(y|x))`` on labelled rows.
 
-        This method is defined only for conditional transformation-normal
-        models and requires both the fitted covariates and the observed
+        This method is defined for conditional transformation-normal models
+        and outcome models containing a saved CTN. It requires the CTN's
+        fitted covariates and the observed
         response column.  It is intentionally distinct from :meth:`predict`,
         whose CTM point estimate is the response-scale conditional mean
         ``E[Y|x]`` and therefore does not consume an observed response.
@@ -371,7 +375,10 @@ class Model:
         array; ``return_type=`` or ``id_column=`` requests a one-column table
         named ``score`` (plus the requested identifier).
         """
-        headers, rows, table_kind = normalize_table(data)
+        required = rust_module().required_model_columns(self._model_bytes, True)
+        if id_column is not None:
+            required = sorted(set(required) | {id_column})
+        headers, rows, table_kind = normalize_table(data, required_columns=required)
         row_ids = extract_row_ids(headers, rows, id_column)
         try:
             scores = rust_module().transformation_score_table(

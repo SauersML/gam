@@ -88,19 +88,11 @@ pub(crate) fn materialize_bernoulli_marginal_slope<'a>(
         .slope_formula
         .as_deref()
         .ok_or_else(|| "Bernoulli marginal-slope requires slope_formula".to_string())?;
-    // `z_column` is OPTIONAL when a CTN Stage-1 recipe is present: the calibrated
-    // chain produces `z` out-of-fold from the cross-fitted CTN, so there is no
-    // raw dose column to read (and no throwaway pre-fit column — that round-trip
-    // is what the no-slop cutover removes, #461). Without a recipe, the primitive
-    // standalone marginal-slope still requires a raw `z_column` dose.
-    let z_column = config.z_column.as_deref();
-    if z_column.is_none() && config.ctn_stage1.is_none() {
-        return Err(WorkflowError::InvalidConfig {
-            reason: "Bernoulli marginal-slope requires z_column (or a CTN Stage-1 recipe via \
-                     ctn_stage1, which produces z by cross-fitting)"
+    // Native CTN composition supplies its generated score before materialization.
+    let z_column = config.z_column.as_deref().ok_or_else(|| WorkflowError::InvalidConfig {
+            reason: "Bernoulli marginal-slope materialization requires z_column"
                 .to_string(),
-        });
-    }
+        })?;
 
     let (_, parsed_slope) =
         parse_matching_auxiliary_formula(slope_formula, &parsed.response, "slope_formula")?;
@@ -110,25 +102,23 @@ pub(crate) fn materialize_bernoulli_marginal_slope<'a>(
         }
         .into());
     }
-    if let Some(z_column) = z_column {
-        validate_marginal_slope_z_column_exclusion(
-            parsed,
-            &parsed_slope,
-            z_column,
-            "Bernoulli marginal-slope",
-            "slope_formula",
-        )?;
-        // The literal-name check above cannot see the score entering the main
-        // formula under its canonical alias `z` (gam#2432); the alias is
-        // installed a few lines below, so refuse here rather than let the BMS
-        // confounding audit report it as a solver failure much later.
-        validate_marginal_slope_z_alias_exclusion(
-            parsed,
-            col_map,
-            z_column,
-            "Bernoulli marginal-slope",
-        )?;
-    }
+    validate_marginal_slope_z_column_exclusion(
+        parsed,
+        &parsed_slope,
+        z_column,
+        "Bernoulli marginal-slope",
+        "slope_formula",
+    )?;
+    // The literal-name check above cannot see the score entering the main
+    // formula under its canonical alias `z` (gam#2432); the alias is
+    // installed a few lines below, so refuse here rather than let the BMS
+    // confounding audit report it as a solver failure much later.
+    validate_marginal_slope_z_alias_exclusion(
+        parsed,
+        col_map,
+        z_column,
+        "Bernoulli marginal-slope",
+    )?;
 
     let mut inference_notes = Vec::new();
     // Bernoulli marginal-slope: structurally operator-only at large scale, so
@@ -139,13 +129,7 @@ pub(crate) fn materialize_bernoulli_marginal_slope<'a>(
             marginal_slope_large_scale_active: true,
         },
     );
-    // Alias `z` to the dose column only when a raw z_column is supplied; with a
-    // CTN Stage-1 chain there is no dose column and the formulas reference only
-    // the x covariates.
-    let aliased_col_map = match z_column {
-        Some(z_column) => column_map_with_alias(col_map, "z", z_column),
-        None => col_map.clone(),
-    };
+    let aliased_col_map = column_map_with_alias(col_map, "z", z_column);
     let mut marginalspec = build_termspec_with_geometry_and_overrides(
         &parsed.terms,
         data,
@@ -187,30 +171,12 @@ pub(crate) fn materialize_bernoulli_marginal_slope<'a>(
         parsed_slope.linkwiggle.as_ref(),
     )?;
 
-    // Auto-enable Neyman-orthogonal, cross-fitted score calibration when a CTN
-    // Stage-1 recipe is present (design §5). Cross-fitting yields out-of-fold `z`
-    // (the calibrated dose, with no raw column read) and the score-influence
-    // Jacobian `J`, absorbed by Stage-2 as the realized leakage-projection block.
-    // With no CTN Stage-1 recipe, `z` is the raw dose column and the free-warp
-    // `score_warp` is the fallback basis.
-    let (z, score_influence_jacobian) =
-        match crossfit_score_calibration(data, col_map, config.ctn_stage1.as_ref(), &policy)
-            .map_err(|reason| WorkflowError::IntegrationFailed { reason })?
-        {
-            Some(calibration) => (calibration.z_oof, Some(calibration.jac_oof)),
-            None => {
-                // No recipe ⇒ a raw z_column is required (guarded above) and read here.
-                let z_column = z_column.expect("z_column presence checked when ctn_stage1 is None");
-                let z_idx = resolve_role_col(col_map, z_column, "z")?;
-                let z = data.values.column(z_idx).to_owned();
-                validate_bernoulli_marginal_slope_z_column_variance(
-                    z_column,
-                    z.view(),
-                    weights.view(),
-                )?;
-                (z, None)
-            }
-        };
+    // CTN composition is completed by the shared fitted-model service before
+    // ordinary outcome materialization. No influence Jacobian is installed.
+    let z_idx = resolve_role_col(col_map, z_column, "z")?;
+    let z = data.values.column(z_idx).to_owned();
+    validate_bernoulli_marginal_slope_z_column_variance(z_column, z.view(), weights.view())?;
+    let score_influence_jacobian = None;
 
     let spec = BernoulliMarginalSlopeTermSpec {
         y,

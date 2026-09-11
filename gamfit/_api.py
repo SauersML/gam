@@ -13,7 +13,6 @@ from typing import Any, NamedTuple, overload
 
 from ._binding import RustExtensionUnavailableError, extension_status, rust_module
 from ._calibrated_slope import CtnStage1, normalize_ctn_stage1
-from ._ctn_model import CtnMarginalSlopeModel, fit_ctn_chain
 from ._cuda import cuda_diagnostics as _cuda_diagnostics
 from ._cuda import cuda_subprocess_env as _cuda_subprocess_env
 from ._cuda import cuda_subprocess_library_dirs as _cuda_subprocess_library_dirs
@@ -290,9 +289,11 @@ def _build_fit_payload(
         "weights": weights,
     }
     if transformation_normal_stage1 is not None:
-        raise ValueError("CtnStage1 uses gamfit.fit with labelled data; it is not a native payload option")
-    if config and "ctn_stage1" in config:
-        raise ValueError("the experimental Rust influence path is not a Python prediction API; use CtnStage1")
+        if isinstance(transformation_normal_stage1, Model):
+            payload["frozen_ctn"] = json.loads(transformation_normal_stage1.dumps())
+        else:
+            recipe = normalize_ctn_stage1(transformation_normal_stage1)
+            payload["ctn_stage1"] = recipe.native_document()
     kwarg_items: dict[str, Any] = {
         "negative_binomial_theta": negative_binomial_theta,
         "expectile_tau": expectile_tau,
@@ -725,7 +726,7 @@ def fit(
     weights: str | None = ...,
     persistent_warm_start_root: str | Path | None = ...,
     transformation_normal: bool | None = ...,
-    transformation_normal_stage1: CtnStage1 | Mapping[str, Any] | None = ...,
+    transformation_normal_stage1: Model | CtnStage1 | Mapping[str, Any] | None = ...,
     survival_likelihood: str | None = ...,
     survival_time_anchor: float | None = ...,
     baseline_target: str | None = ...,
@@ -770,7 +771,7 @@ def fit(
     weights: str | None = ...,
     persistent_warm_start_root: str | Path | None = ...,
     transformation_normal: bool | None = ...,
-    transformation_normal_stage1: CtnStage1 | Mapping[str, Any] | None = ...,
+    transformation_normal_stage1: Model | CtnStage1 | Mapping[str, Any] | None = ...,
     survival_likelihood: str | None = ...,
     survival_time_anchor: float | None = ...,
     baseline_target: str | None = ...,
@@ -814,7 +815,7 @@ def fit(
     weights: str | None = None,
     persistent_warm_start_root: str | Path | None = None,
     transformation_normal: bool | None = None,
-    transformation_normal_stage1: CtnStage1 | Mapping[str, Any] | None = None,
+    transformation_normal_stage1: Model | CtnStage1 | Mapping[str, Any] | None = None,
     survival_likelihood: str | None = None,
     survival_time_anchor: float | None = None,
     baseline_target: str | None = None,
@@ -899,8 +900,9 @@ def fit(
         Fit a conditional transformation-normal model (``h(Y|x) ~ N(0,1))``).
         Corresponds to ``--transformation-normal``.
     transformation_normal_stage1:
-        CTN recipe with explicit fold or group columns. Returns a
-        :class:`CtnMarginalSlopeModel` containing a full-training CTN and an
+        CTN recipe with explicit fold or group columns, or an already fitted
+        standalone CTN :class:`Model` to freeze without refitting. Returns a
+        native :class:`Model` containing a full-training CTN and an
         ordinary marginal-slope outcome fitted on OOF transformed scores.
         Prediction replays the saved CTN on the raw score. No influence
         absorber or second score normalization is applied. Cross-fitting
@@ -1101,14 +1103,6 @@ def fit(
         Rust engine errors are mapped into the typed gamfit exception
         hierarchy.
     """
-    if transformation_normal_stage1 is not None:
-        options = {name: value for name, value in locals().items()
-                   if name in inspect.signature(fit).parameters
-                   and name not in {"data", "formula", "transformation_normal_stage1"}}
-        if response_geometry is not None:
-            raise ValueError("CtnStage1 does not support response_geometry")
-        return fit_ctn_chain(fit, data, formula,
-                             normalize_ctn_stage1(transformation_normal_stage1), options)
     if constraints:
         # Alias normalization, smooth-term scanning, and the `shape=` rewrite all
         # live in Rust (`gam::terms::smooth::apply_shape_constraints_to_formula`);
@@ -1198,7 +1192,20 @@ def fit(
             config=nested_config or None,
         )
 
-    headers, rows, table_kind = normalize_table(data)
+    required_columns = None
+    if (transformation_normal_stage1 is not None or transformation_normal
+            or family == "transformation-normal"
+            or (config and ("ctn_stage1" in config or "frozen_ctn" in config
+                            or config.get("transformation_normal")))):
+        schema_config = {**(config or {}), "family": family, "slope_formula": slope_formula,
+                         "noise_formula": noise_formula, "weights": weights, "offset": offset,
+                         "noise_offset": noise_offset, "survival_likelihood": survival_likelihood}
+        if isinstance(transformation_normal_stage1, Model):
+            schema_config["frozen_ctn"] = json.loads(transformation_normal_stage1.dumps())
+        elif transformation_normal_stage1 is not None:
+            schema_config["ctn_stage1"] = normalize_ctn_stage1(transformation_normal_stage1).native_document()
+        required_columns = rust_module().ctn_required_fit_columns(formula, json.dumps(schema_config))
+    headers, rows, table_kind = normalize_table(data, required_columns=required_columns)
     rust_config = dict(config or {})
     for key in (
         "response_geometry",
@@ -1315,7 +1322,7 @@ def fit_array(
     weights: str | None = None,
     persistent_warm_start_root: str | Path | None = None,
     transformation_normal: bool | None = None,
-    transformation_normal_stage1: CtnStage1 | Mapping[str, Any] | None = None,
+    transformation_normal_stage1: Model | CtnStage1 | Mapping[str, Any] | None = None,
     survival_likelihood: str | None = None,
     survival_time_anchor: float | None = None,
     baseline_target: str | None = None,
@@ -1533,8 +1540,6 @@ def loads(model_bytes: bytes) -> Model:
     # `Model` archive nor a multinomial payload, so detect them first by the
     # schema tag and reconstruct a `ResponseGeometryModel`.
     head = model_bytes[:256].lstrip()
-    if head.startswith(b"{") and b"gamfit.CtnMarginalSlopeModel" in model_bytes[:256]:
-        return CtnMarginalSlopeModel.from_payload(json.loads(model_bytes))
     if head.startswith(b"{") and b"gamfit.ResponseGeometryModel" in model_bytes[:512]:
         payload = json.loads(model_bytes.decode("utf-8"))
         if str(payload.get("schema", "")).startswith("gamfit.ResponseGeometryModel/"):
@@ -1631,7 +1636,7 @@ def validate_formula(
     weights: str | None = None,
     persistent_warm_start_root: str | Path | None = None,
     transformation_normal: bool | None = None,
-    transformation_normal_stage1: CtnStage1 | Mapping[str, Any] | None = None,
+    transformation_normal_stage1: Model | CtnStage1 | Mapping[str, Any] | None = None,
     survival_likelihood: str | None = None,
     survival_time_anchor: float | None = None,
     baseline_target: str | None = None,
@@ -1665,7 +1670,6 @@ def validate_formula(
     FormulaValidation
         Structured validation diagnostics from the Rust parser/materializer.
     """
-    headers, rows, _table_kind = normalize_table(data)
     rust_config = dict(config or {})
     for key in (
         "response_geometry",
@@ -1708,6 +1712,10 @@ def validate_formula(
         config=rust_config or None,
     )
     try:
+        required_columns = None
+        if payload.get("ctn_stage1") is not None or payload.get("frozen_ctn") is not None:
+            required_columns = rust_module().ctn_required_fit_columns(formula, json.dumps(payload))
+        headers, rows, _table_kind = normalize_table(data, required_columns=required_columns)
         raw = rust_module().validate_formula_json(
             headers,
             rows,

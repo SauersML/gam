@@ -73,9 +73,21 @@ def _try_import(name: str) -> Any | None:
 CATEGORICAL_CELL_SENTINEL = "\x00"
 
 
-def normalize_table(data: Any) -> tuple[list[str], Any, str]:
+def normalize_table(data: Any, *, required_columns=None) -> tuple[list[str], Any, str]:
     if isinstance(data, PreNormalizedTable):
         return data.headers, data.rows, data.kind
+    if required_columns is not None:
+        columns, kind = _table_column_views(data)
+        names = list(required_columns)
+        missing = set(names) - set(columns)
+        if missing:
+            raise ValueError(f"missing required columns: {sorted(missing)}")
+        if kind == "pandas":
+            data = data.loc[:, names]
+        elif kind in {"polars", "pyarrow"}:
+            data = data.select(names)
+        else:
+            data = {name: columns[name] for name in names}
     columns, kind = _table_column_views(data)
     headers = list(columns)
     if not headers:
