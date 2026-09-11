@@ -715,5 +715,17 @@
     ],
     "reason": "#2469: KRONECKER_STRUCTURAL_ZERO_TOL classified joint eigenvalues in the Kronecker reparameterization, now against the marginal eigensolver bands (structural and lambda-weighted); the two function-local LOG_EPS slacks tested whether 2m - k_dim is an even integer, which is exact for integer and half-integer m; MIN_NORM2 floored atom, code and variance norms in the linear dictionary, replaced by exact zero tests and the residual and variance rounding bands.",
     "evidence": "All three are private to the files this commit edits (construction.rs, duchon_kernel_math.rs, dictionary.rs), where every use is replaced."
+  },
+  {
+    "base": "eefacba43976e8bd99550849ed4389fa7687bbd0",
+    "items": [
+      "crates/gam-models/src/survival/base.rs:const:DERIVATIVE_ROW_NORM_TOL",
+      "crates/gam-models/src/survival/base.rs:const:INTEGER_TOL",
+      "crates/gam-models/src/survival/base.rs:const:KEY_TOL",
+      "crates/gam-models/src/survival/base.rs:const:SCALE_TOL",
+      "crates/gam-models/src/survival/base.rs:const:STRUCTURAL_DERIV_TOL"
+    ],
+    "reason": "#2469: five function-local tolerances in survival constraint building. INTEGER_TOL is an exact integer test; SCALE_TOL and KEY_TOL keyed near-proportional rows together, now only bit-identical normalized normals merge; DERIVATIVE_ROW_NORM_TOL is an exactly-zero row; STRUCTURAL_DERIV_TOL is the offset and basis-entry rounding bands gamma_n*max|offset| and gamma_p*max|entry|.",
+    "evidence": "All five are function-local constants in crates/gam-models/src/survival/base.rs, which this commit edits."
   }
 ]

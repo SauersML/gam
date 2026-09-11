@@ -1126,7 +1126,6 @@ fn cause_specific_hessian_second_directional_derivative(
 }
 
 pub fn survival_event_code_from_value(value: f64, row_index: usize) -> Result<u8, String> {
-    const INTEGER_TOL: f64 = 1e-8;
     const MAX_AUTO_CAUSES: u8 = 32;
     if !value.is_finite() {
         return Err(SurvivalError::EventCodeInvalid {
@@ -1146,8 +1145,9 @@ pub fn survival_event_code_from_value(value: f64, row_index: usize) -> Result<u8
         }
         .into());
     }
+    // An event code is an integer; a value that is not one is not a code.
     let rounded = value.round();
-    if (value - rounded).abs() > INTEGER_TOL {
+    if value != rounded {
         return Err(SurvivalError::EventCodeInvalid {
             reason: format!(
                 "survival event value at row {} must be an integer code with 0=censored, got {value}",
@@ -1202,34 +1202,25 @@ fn compress_positive_collinear_constraints(
     a: &Array2<f64>,
     b: &Array1<f64>,
 ) -> LinearInequalityConstraints {
-    const SCALE_TOL: f64 = 1e-14;
-    const KEY_TOL: f64 = 1e-8;
-
-    let mut grouped: BTreeMap<Vec<i64>, (Vec<f64>, f64)> = BTreeMap::new();
+    // Rows merge only when their normalized normals are bit-identical: exactly
+    // proportional constraints collapse to the tightest right-hand side, while a
+    // merely near-collinear pair stays two constraints, which is the safe side.
+    let mut grouped: BTreeMap<Vec<u64>, (Vec<f64>, f64)> = BTreeMap::new();
     let mut fallbackrows: Vec<(Vec<f64>, f64)> = Vec::new();
 
     for i in 0..a.nrows() {
         let row = a.row(i);
         let scale = row.iter().fold(0.0_f64, |acc, &v| acc.max(v.abs()));
-        if !scale.is_finite() || scale <= SCALE_TOL {
+        if !scale.is_finite() || scale == 0.0 {
             if b[i] > 0.0 {
                 fallbackrows.push((row.to_vec(), b[i]));
             }
             continue;
         }
 
-        let normalizedrow: Vec<f64> = row
-            .iter()
-            .map(|&v| {
-                let scaled = v / scale;
-                if scaled.abs() <= KEY_TOL { 0.0 } else { scaled }
-            })
-            .collect();
+        let normalizedrow: Vec<f64> = row.iter().map(|&v| v / scale).collect();
         let normalized_rhs = b[i] / scale;
-        let key: Vec<i64> = normalizedrow
-            .iter()
-            .map(|&v| (v / KEY_TOL).round() as i64)
-            .collect();
+        let key: Vec<u64> = normalizedrow.iter().map(|&v| (v + 0.0).to_bits()).collect();
 
         match grouped.get_mut(&key) {
             Some((_, rhs_max)) => {
@@ -1749,7 +1740,6 @@ impl WorkingModelSurvival {
 
     pub fn monotonicity_linear_constraints(&self) -> Option<LinearInequalityConstraints> {
         let p = self.coefficient_dim();
-        const DERIVATIVE_ROW_NORM_TOL: f64 = 1e-12;
         if p == 0 {
             return None;
         }
@@ -1760,11 +1750,10 @@ impl WorkingModelSurvival {
             self.monotonicity_constraint_rows.as_ref(),
             self.monotonicity_constraint_offsets.as_ref(),
         ) {
+            // A collocation row whose derivative normal is exactly zero states no
+            // constraint on the coefficients.
             let activerows: Vec<usize> = (0..rows.nrows())
-                .filter(|&i| {
-                    rows.row(i).iter().fold(0.0_f64, |acc, &v| acc.max(v.abs()))
-                        > DERIVATIVE_ROW_NORM_TOL
-                })
+                .filter(|&i| rows.row(i).iter().any(|&v| v != 0.0))
                 .collect();
             if activerows.is_empty() {
                 return None;
@@ -2113,9 +2102,17 @@ impl WorkingModelSurvival {
             crate::bail_invalid_estim!("structural monotonicity requires at least one time column");
         }
         if enabled {
-            const STRUCTURAL_DERIV_TOL: f64 = 1e-12;
+            // Offsets and basis entries are formed by arithmetic, so a sign or zero
+            // is decided outside each quantity's own rounding band: `γ_n·max|offset|`
+            // across the rows for an offset, `γ_p·max|entry|` across the row for a
+            // basis entry.
+            let offset_band = gam_linalg::roundoff::accumulation_growth(self.offset_derivative_exit.len())
+                * self
+                    .offset_derivative_exit
+                    .iter()
+                    .fold(0.0_f64, |acc, &v| acc.max(v.abs()));
             for (i, &offset) in self.offset_derivative_exit.iter().enumerate() {
-                if offset < -STRUCTURAL_DERIV_TOL {
+                if offset < -offset_band {
                     crate::bail_invalid_estim!(
                         "structural monotonicity requires nonnegative derivative offsets; found offset_derivative_exit[{i}]={offset:.3e}"
                     );
@@ -2124,9 +2121,11 @@ impl WorkingModelSurvival {
             let mut derivative_row = vec![0.0_f64; p];
             for i in 0..self.nrows() {
                 self.fill_derivative_row(i, &mut derivative_row);
+                let row_band = gam_linalg::roundoff::accumulation_growth(p)
+                    * derivative_row.iter().fold(0.0_f64, |acc, &v| acc.max(v.abs()));
                 for j in 0..time_columns {
                     let v = derivative_row[j];
-                    if v < -STRUCTURAL_DERIV_TOL {
+                    if v < -row_band {
                         crate::bail_invalid_estim!(
                             "structural monotonicity requires nonnegative time-derivative basis entries; found x_derivative[{i},{j}]={v:.3e}"
                         );
@@ -2134,7 +2133,7 @@ impl WorkingModelSurvival {
                 }
                 for j in time_columns..p {
                     let v = derivative_row[j];
-                    if v.abs() > STRUCTURAL_DERIV_TOL {
+                    if v.abs() > row_band {
                         crate::bail_invalid_estim!(
                             "structural monotonicity requires zero derivative contribution outside the time block; found x_derivative[{i},{j}]={v:.3e}"
                         );
@@ -2145,17 +2144,21 @@ impl WorkingModelSurvival {
                 self.monotonicity_constraint_rows.as_ref(),
                 self.monotonicity_constraint_offsets.as_ref(),
             ) {
+                let collocation_offset_band = gam_linalg::roundoff::accumulation_growth(offsets.len())
+                    * offsets.iter().fold(0.0_f64, |acc, &v| acc.max(v.abs()));
                 for (i, &offset) in offsets.iter().enumerate() {
-                    if offset < -STRUCTURAL_DERIV_TOL {
+                    if offset < -collocation_offset_band {
                         crate::bail_invalid_estim!(
                             "structural monotonicity requires nonnegative collocation derivative offsets; found monotonicity_constraint_offsets[{i}]={offset:.3e}"
                         );
                     }
                 }
                 for i in 0..rows.nrows() {
+                    let row_band = gam_linalg::roundoff::accumulation_growth(p)
+                        * rows.row(i).iter().fold(0.0_f64, |acc, &v| acc.max(v.abs()));
                     for j in 0..time_columns {
                         let v = rows[[i, j]];
-                        if v < -STRUCTURAL_DERIV_TOL {
+                        if v < -row_band {
                             crate::bail_invalid_estim!(
                                 "structural monotonicity requires nonnegative collocation derivative basis entries; found monotonicity_constraint_rows[{i},{j}]={v:.3e}"
                             );
@@ -2163,7 +2166,7 @@ impl WorkingModelSurvival {
                     }
                     for j in time_columns..p {
                         let v = rows[[i, j]];
-                        if v.abs() > STRUCTURAL_DERIV_TOL {
+                        if v.abs() > row_band {
                             crate::bail_invalid_estim!(
                                 "structural monotonicity requires zero collocation derivative contribution outside the time block; found monotonicity_constraint_rows[{i},{j}]={v:.3e}"
                             );
