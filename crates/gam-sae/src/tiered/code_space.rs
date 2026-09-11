@@ -838,9 +838,17 @@ mod code_space_tests {
         let mut codes = SparseAtomCodes::empty(n, k);
         for i in 0..n {
             let theta = TAU * (i as f64) / (n as f64);
+            // #2822: an exact ring is reproduced EXACTLY by the Periodic candidate, an
+            // interpolation profiled Gaussian REML abstains on by design (#2723), so the race
+            // handed the verdict to another candidate. A deterministic perturbation above the
+            // profiled residual's resolution keeps the ring scoreable.
+            let wobble = |col: f64| {
+                let x = (i as f64 + 1.0) * 12.9898 + (col + 1.0) * 78.233;
+                0.02 * (x.sin() * 43758.5453).sin()
+            };
             let row = codes.row_mut(i);
-            row.assign(0, theta.cos());
-            row.assign(1, theta.sin());
+            row.assign(0, theta.cos() + wobble(0.0));
+            row.assign(1, theta.sin() + wobble(1.0));
         }
         let report =
             harvest_code_space_pair_promotions(decoder.view(), &codes, n, 0.05).expect("runs");
