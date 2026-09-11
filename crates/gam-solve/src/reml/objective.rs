@@ -1550,7 +1550,19 @@ impl<'a> RemlState<'a> {
             && c_nontrivial
         {
             let (log_det_h_plus, kernel) =
-                Self::intrinsic_hessian_pseudo_logdet_parts(h_for_operator.as_ref(), penalty_rank)?;
+                match super::reml_outer_engine::HessianFactorization::as_exact_dense_spectral(
+                    &*hessian_op,
+                ) {
+                    Some(spectral) => Self::intrinsic_hessian_pseudo_logdet_parts_from_eigensystem(
+                        &spectral.raw_eigenvalues,
+                        &spectral.eigenvectors,
+                        penalty_rank,
+                    )?,
+                    None => Self::intrinsic_hessian_pseudo_logdet_parts(
+                        h_for_operator.as_ref(),
+                        penalty_rank,
+                    )?,
+                };
             kernel.map(|mut kernel| {
                 kernel.logdet_correction = log_det_h_plus - hessian_op.logdet();
                 std::sync::Arc::new(kernel)
@@ -2008,7 +2020,21 @@ impl<'a> RemlState<'a> {
         let penalty_subspace_trace =
             if matches!(hessian_mode, PseudoLogdetMode::Smooth) && c_nontrivial {
                 let (log_det_h_plus, kernel) =
-                    Self::intrinsic_hessian_pseudo_logdet_parts(&h_total_original, penalty_rank)?;
+                    match super::reml_outer_engine::HessianFactorization::as_exact_dense_spectral(
+                        &*hessian_op,
+                    ) {
+                        Some(spectral) => {
+                            Self::intrinsic_hessian_pseudo_logdet_parts_from_eigensystem(
+                                &spectral.raw_eigenvalues,
+                                &spectral.eigenvectors,
+                                penalty_rank,
+                            )?
+                        }
+                        None => Self::intrinsic_hessian_pseudo_logdet_parts(
+                            &h_total_original,
+                            penalty_rank,
+                        )?,
+                    };
                 kernel.map(|mut kernel| {
                     kernel.logdet_correction = log_det_h_plus - hessian_op.logdet();
                     std::sync::Arc::new(kernel)

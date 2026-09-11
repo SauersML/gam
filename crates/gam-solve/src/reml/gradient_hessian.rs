@@ -4511,11 +4511,39 @@ impl<'a> RemlState<'a> {
         let (h_evals, h_evecs) = h_sym
             .eigh(Side::Lower)
             .map_err(EstimationError::EigendecompositionFailed)?;
-        let h_thr = super::reml_outer_engine::positive_eigenvalue_threshold(
+        Self::intrinsic_hessian_pseudo_logdet_parts_from_eigensystem(
             h_evals
                 .as_slice()
                 .expect("eigh returns an owned contiguous eigenvalue Array1"),
-        );
+            &h_evecs,
+            penalty_rank,
+        )
+    }
+
+    /// [`Self::intrinsic_hessian_pseudo_logdet_parts`] on an eigensystem the
+    /// caller already holds. The criterion's Hessian operator owns the most
+    /// accurate eigensystem of `H_pen` available (the root-scale SVD when one
+    /// was installed, #2644); re-decomposing the assembled matrix here would
+    /// price `log|H_pen|₊` and every trace this kernel serves at that matrix's
+    /// `O(ε·κ(H))` error instead.
+    pub(super) fn intrinsic_hessian_pseudo_logdet_parts_from_eigensystem(
+        h_evals: &[f64],
+        h_evecs: &Array2<f64>,
+        penalty_rank: usize,
+    ) -> Result<(f64, Option<super::reml_outer_engine::PenaltySubspaceTrace>), EstimationError>
+    {
+        let p = h_evals.len();
+        if p == 0 {
+            return Ok((0.0, None));
+        }
+        if h_evecs.dim() != (p, p) {
+            crate::bail_invalid_estim!(
+                "intrinsic_hessian_pseudo_logdet_parts: {p} eigenvalues against a {}x{} eigenvector matrix",
+                h_evecs.nrows(),
+                h_evecs.ncols()
+            );
+        }
+        let h_thr = super::reml_outer_engine::positive_eigenvalue_threshold(h_evals);
         // `null(H_pen) ⊆ null(S_λ)`: `H_pen = XᵀWX + S_λ` with both terms PSD,
         // so `vᵀHv ≥ vᵀS_λv` and `Hv = 0 ⟹ S_λv = 0`. The Hessian can have AT
         // MOST the penalty's nullity, whatever a magnitude threshold on its
