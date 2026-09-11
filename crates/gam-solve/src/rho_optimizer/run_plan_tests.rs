@@ -2733,6 +2733,138 @@ fn outer_second_order_bridge_separates_first_and_second_order_requests() {
     );
 }
 
+/// #2627: on the dense ARC route every bridge call is a probe at a candidate
+/// ARC has not accepted, because `run_plan` precomputes the seed and hands it
+/// over through `with_initial_sample`. A saturated Bernoulli row at that
+/// candidate — the payload both SAS-link CLI fits abort with, `eta=-10240.0` —
+/// is a statement about the candidate's own linear predictor, so the bridge
+/// must give ARC a recoverable error (shorten the step), not a fatal one (end
+/// the fit). Pinned at all three request orders, with the payload preserved.
+#[test]
+fn outer_second_order_bridge_rejects_a_candidate_whose_row_geometry_refuses_2627() {
+    let problem = OuterProblem::new(1)
+        .with_gradient(Derivative::Analytic)
+        .with_hessian(DeclaredHessianForm::Either);
+    let mut obj = problem.build_objective_with_eval_order(
+        (),
+        |_: &mut (), theta: &Array1<f64>| Ok(theta[0] * theta[0]),
+        |_: &mut (), _: &Array1<f64>| {
+            Err(EstimationError::InvalidInput(
+                "legacy eager eval should not run".to_string(),
+            ))
+        },
+        |_: &mut (), _: &Array1<f64>, _: OuterEvalOrder| {
+            Err(EstimationError::PirlsRowGeometryUnrepresentable {
+                row: 0,
+                quantity: "saturated Bernoulli row inconsistent with response",
+                eta: -10240.0,
+                value: 0.0,
+            })
+        },
+        None::<fn(&mut ())>,
+        None::<fn(&mut (), &Array1<f64>) -> Result<EfsEval, EstimationError>>,
+    );
+    let mut bridge = OuterSecondOrderBridge {
+        obj: &mut obj,
+        layout: OuterThetaLayout::new(1, 0),
+        hessian_source: HessianSource::Analytic,
+        materialize_operator_max_dim: OUTER_HVP_MATERIALIZE_MAX_DIM,
+        eval_count: 0,
+        outer_inner_cap: None,
+        g_norm_initial: None,
+        last_g_norm: None,
+        last_value_grad_rho: None,
+        cost_stall: None,
+        cost_stall_bounds: None,
+        curvature_stationary_floor: None,
+    };
+    let Err(cost_error) = ::opt::ZerothOrderObjective::eval_cost(&mut bridge, &array![1.0]) else {
+        panic!("a candidate whose row geometry refuses must not produce a cost");
+    };
+    assert!(
+        cost_error.is_recoverable(),
+        "ARC value probe at a refused candidate must shorten the step: {}",
+        cost_error.message()
+    );
+    let Err(grad_error) = FirstOrderObjective::eval_grad(&mut bridge, &array![1.0]) else {
+        panic!("a candidate whose row geometry refuses must not produce a gradient");
+    };
+    assert!(
+        grad_error.is_recoverable(),
+        "ARC gradient probe at a refused candidate must shorten the step: {}",
+        grad_error.message()
+    );
+    let Err(hess_error) = SecondOrderObjective::eval_hessian(&mut bridge, &array![1.0]) else {
+        panic!("a candidate whose row geometry refuses must not produce a Hessian sample");
+    };
+    assert!(
+        hess_error.is_recoverable(),
+        "ARC trial sample at a refused candidate must shorten the step: {}",
+        hess_error.message()
+    );
+    assert!(
+        matches!(
+            hess_error.downcast_ref::<EstimationError>(),
+            Some(EstimationError::PirlsRowGeometryUnrepresentable { eta, .. })
+                if eta.to_bits() == (-10240.0_f64).to_bits()
+        ),
+        "the recoverable error must carry the producer's payload unchanged: {}",
+        hess_error.message()
+    );
+}
+
+/// Control for the pin above: the dense ARC bridge does not turn every inner
+/// failure into a rejected step. A refusal no step can repair stays fatal at
+/// the same three request orders.
+#[test]
+fn outer_second_order_bridge_keeps_structural_refusals_fatal_2627() {
+    let problem = OuterProblem::new(1)
+        .with_gradient(Derivative::Analytic)
+        .with_hessian(DeclaredHessianForm::Either);
+    let mut obj = problem.build_objective_with_eval_order(
+        (),
+        |_: &mut (), theta: &Array1<f64>| Ok(theta[0] * theta[0]),
+        |_: &mut (), _: &Array1<f64>| {
+            Err(EstimationError::InvalidInput(
+                "legacy eager eval should not run".to_string(),
+            ))
+        },
+        |_: &mut (), _: &Array1<f64>, _: OuterEvalOrder| {
+            Err(EstimationError::InvalidInput(
+                "structural refusal independent of theta".to_string(),
+            ))
+        },
+        None::<fn(&mut ())>,
+        None::<fn(&mut (), &Array1<f64>) -> Result<EfsEval, EstimationError>>,
+    );
+    let mut bridge = OuterSecondOrderBridge {
+        obj: &mut obj,
+        layout: OuterThetaLayout::new(1, 0),
+        hessian_source: HessianSource::Analytic,
+        materialize_operator_max_dim: OUTER_HVP_MATERIALIZE_MAX_DIM,
+        eval_count: 0,
+        outer_inner_cap: None,
+        g_norm_initial: None,
+        last_g_norm: None,
+        last_value_grad_rho: None,
+        cost_stall: None,
+        cost_stall_bounds: None,
+        curvature_stationary_floor: None,
+    };
+    let Err(cost_error) = ::opt::ZerothOrderObjective::eval_cost(&mut bridge, &array![1.0]) else {
+        panic!("a structural refusal must not produce a cost");
+    };
+    assert!(cost_error.is_fatal(), "structural refusal must stay fatal: {}", cost_error.message());
+    let Err(grad_error) = FirstOrderObjective::eval_grad(&mut bridge, &array![1.0]) else {
+        panic!("a structural refusal must not produce a gradient");
+    };
+    assert!(grad_error.is_fatal(), "structural refusal must stay fatal: {}", grad_error.message());
+    let Err(hess_error) = SecondOrderObjective::eval_hessian(&mut bridge, &array![1.0]) else {
+        panic!("a structural refusal must not produce a Hessian sample");
+    };
+    assert!(hess_error.is_fatal(), "structural refusal must stay fatal: {}", hess_error.message());
+}
+
 /// Phase 1.1 — On `HessianSource::Analytic` the bridge MUST surface a
 /// fatal error rather than producing `SecondOrderSample { hessian: None }`
 /// when the runtime returns `HessianValue::Unavailable`. A `None` here

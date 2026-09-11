@@ -1620,8 +1620,8 @@ pub(crate) fn remember_value_probe(
     });
 }
 
-/// Classify a failure produced while evaluating one BFGS line-search value
-/// probe.
+/// Classify a failure produced while evaluating one trial-point probe: a BFGS
+/// line-search value probe, or any sample the dense ARC bridge requests.
 ///
 /// [`EstimationError::HessianNotPositiveDefinite`] is deliberately fatal at
 /// the general objective boundary: the same type can describe a structural
@@ -1633,8 +1633,16 @@ pub(crate) fn remember_value_probe(
 /// "reject this trial and shorten the step", not "abort the whole fit".
 ///
 /// Keep that context-dependent verdict here instead of globally adding the
-/// Hessian variant to `is_trial_point_infeasible`: gradient and terminal
-/// evaluations continue to expose the failure as fatal.
+/// Hessian variant to `is_trial_point_infeasible`: the seed, the first-order
+/// route's gradient evaluations and terminal evaluations continue to expose
+/// the failure as fatal.
+///
+/// On the dense ARC route every call is a probe (#2627). `run_plan` evaluates
+/// the seed before `OuterSecondOrderBridge` exists and hands it to `opt::Arc`
+/// through `with_initial_sample`, so each value, gradient or Hessian request
+/// the bridge receives inside `run()` is at a candidate ARC has not accepted.
+/// `opt::Arc` answers a recoverable failure there by trying the antipodal
+/// hard-case step or raising its regularization; a fatal one ends the fit.
 fn into_line_search_value_probe_error(
     context: &str,
     err: EstimationError,
@@ -2585,7 +2593,7 @@ impl ZerothOrderObjective for OuterSecondOrderBridge<'_> {
         let eval = self
             .obj
             .eval_with_order(x, OuterEvalOrder::Value)
-            .map_err(|err| into_objective_error("outer eval_cost failed", err))?;
+            .map_err(|err| into_line_search_value_probe_error("outer eval_cost failed", err))?;
         let cost = finite_cost_or_error("outer eval_cost failed", eval.cost)?;
         log::info!(
             "[STAGE] outer eval end order=Value elapsed={:.3}s cost={:.6e} trial_rho_distance={:.3e}",
@@ -2613,7 +2621,7 @@ impl FirstOrderObjective for OuterSecondOrderBridge<'_> {
         let eval = self
             .obj
             .eval_with_order(x, OuterEvalOrder::ValueAndGradient)
-            .map_err(|err| into_objective_error("outer eval failed", err))?;
+            .map_err(|err| into_line_search_value_probe_error("outer eval failed", err))?;
         let eval = finite_outer_first_order_eval_or_error("outer eval failed", self.layout, eval)?;
         self.eval_count += 1;
         let g_norm = eval.gradient.iter().map(|v| v * v).sum::<f64>().sqrt();
@@ -2971,7 +2979,7 @@ impl SecondOrderObjective for OuterSecondOrderBridge<'_> {
         let eval = self
             .obj
             .eval_with_order(x, OuterEvalOrder::ValueGradientHessian)
-            .map_err(|err| into_objective_error("outer eval failed", err))?;
+            .map_err(|err| into_line_search_value_probe_error("outer eval failed", err))?;
         // Infeasible (non-finite cost) trials are the near-separable
         // multinomial failure mode: ARC probes the unbounded λ→0 separating
         // region where the inner softmax solve does not converge. These never
