@@ -488,7 +488,6 @@ where
     // the regime where AA(1) provably improves the rate. State is local to
     // this PIRLS call; costs nothing while `force_fisher_for_rest` stays
     // false because the mixing branch is never entered.
-    const AA1_DAMPING_FLOOR: f64 = 1e-12;
     const AA1_DISABLE_REJECT_THRESHOLD: usize = 3;
 
     struct AndersonOneState {
@@ -567,7 +566,11 @@ where
                 .and(prev_beta)
                 .for_each(|dx, &old, &prev| *dx = old - prev);
             let den = self.dr.dot(&self.dr);
-            if !den.is_finite() || den < AA1_DAMPING_FLOOR {
+            // `dr` subtracts two residuals entry by entry; a difference inside that
+            // subtraction's rounding band `γ·(‖r_k‖ + ‖r_prev‖)` carries no secant.
+            let secant_band = gam_linalg::roundoff::accumulation_growth(len + 1)
+                * (self.r_k.dot(&self.r_k).sqrt() + prev_residual.dot(prev_residual).sqrt());
+            if !den.is_finite() || den.sqrt() <= secant_band {
                 return None;
             }
             let alpha = (self.dr.dot(&self.r_k) / den).clamp(-1.0, 1.0);

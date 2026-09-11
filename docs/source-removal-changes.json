@@ -822,5 +822,16 @@
     ],
     "reason": "#2469: SYM_REL_TOL (1e-9 against max(max|P_ij|, 1)) accepted asymmetric SPD points, now the n-term inner-product rounding band gamma_n*max|P_ij| without the unit floor.",
     "evidence": "SYM_REL_TOL was an associated constant of SpdManifold in crates/gam-geometry/src/manifolds/spd.rs, used only in SpdManifold::matrix, which this commit edits."
+  },
+  {
+    "base": "8f5c928679ecfbe35f57d7912665a6810e79c1c4",
+    "items": [
+      "crates/gam-geometry/src/manifold.rs:const:CUT_LOCUS_EPS",
+      "crates/gam-linalg/src/sparse_exact.rs:const:ZERO_TOL",
+      "crates/gam-problem/src/joint_penalty.rs:const:SYMMETRY_TOL",
+      "crates/gam-solve/src/pirls/reweight.rs:const:AA1_DAMPING_FLOOR"
+    ],
+    "reason": "#2469: CUT_LOCUS_EPS (1e-7) is the eigensolver band n*eps at the rotation cut locus; SYMMETRY_TOL (an absolute 1e-10) is the pullback rounding band gamma_{n^2}*max|S_ij|; AA1_DAMPING_FLOOR (an absolute 1e-12 on ||dr||^2) is the rounding band of the residual subtraction; ZERO_TOL (1e-12) was a test drop tolerance for integer fixtures with exact zeros, now 0.0 like the production caller.",
+    "evidence": "Each constant was declared in the one file that uses it: crates/gam-geometry/src/manifold.rs (function-local), crates/gam-problem/src/joint_penalty.rs (associated), crates/gam-solve/src/pirls/reweight.rs (function-local), crates/gam-linalg/src/sparse_exact.rs (test module); all four files are edited here."
   }
 ]

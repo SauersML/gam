@@ -174,11 +174,6 @@ impl std::fmt::Display for JointPenaltyError {
 impl std::error::Error for JointPenaltyError {}
 
 impl JointPenaltySpec {
-    /// Symmetry tolerance for [`validate`]. Cross-block pullbacks via `T`
-    /// accumulate roundoff, so an exact symmetric requirement is too tight;
-    /// this matches the floor used by the surrounding penalty code paths.
-    const SYMMETRY_TOL: f64 = 1e-10;
-
     /// Total compiled parameter count this penalty acts on.
     #[inline]
     pub fn dim(&self) -> usize {
@@ -236,15 +231,21 @@ impl JointPenaltySpec {
                 nullspace_dim: self.nullspace_dim,
             });
         }
+        let mut magnitude = 0.0_f64;
         for ((row, col), &value) in self.matrix.indexed_iter() {
             if !value.is_finite() {
                 return Err(JointPenaltyError::NonFiniteEntry { row, col, value });
             }
+            magnitude = magnitude.max(value.abs());
         }
+        // A cross-block pullback `TᵀST` forms each entry from `n²` rounded products,
+        // so the two triangles can disagree by that accumulation's rounding band
+        // `γ_{n²}·max|S_ij|`; anything larger is not a symmetric penalty.
+        let symmetry_band = gam_linalg::roundoff::accumulation_growth(nrows * nrows) * magnitude;
         for row in 0..nrows {
             for col in (row + 1)..ncols {
                 let asymmetry = (self.matrix[[row, col]] - self.matrix[[col, row]]).abs();
-                if asymmetry > Self::SYMMETRY_TOL {
+                if asymmetry > symmetry_band {
                     return Err(JointPenaltyError::NotSymmetric {
                         row,
                         col,

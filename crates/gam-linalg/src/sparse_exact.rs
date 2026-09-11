@@ -1310,14 +1310,9 @@ mod tests {
     use crate::faer_ndarray::FaerCholesky;
     use ndarray::{Array1, Array2, array};
 
-    /// Drop tolerance the dense→sparse fixtures below hand to
-    /// [`dense_to_sparse`]. These fixtures are small integer-valued matrices
-    /// with exact structural zeros, so any cutoff strictly between `0` and the
-    /// smallest stored magnitude selects the same pattern; this one is not a
-    /// production policy and no production path reads it. The production
-    /// dense→sparse caller passes `0.0`, and
-    /// [`canonicalize_sparse_symmetric_upper`] now derives its own band.
-    const ZERO_TOL: f64 = 1e-12;
+    // The dense→sparse fixtures below are small integer-valued matrices with exact
+    // structural zeros, so they drop exactly the zero entries, as the production
+    // dense→sparse caller does.
 
     fn approx_eq(a: f64, b: f64, tol: f64) {
         assert!(
@@ -1335,7 +1330,7 @@ mod tests {
     fn dense_to_sparse_symmetric_upper_stores_only_upper_triangle() {
         // Full symmetric 3x3 matrix — only upper triangle (i<=j) should be stored.
         let m = array![[4.0, 1.0, 2.0], [1.0, 5.0, 3.0], [2.0, 3.0, 6.0]];
-        let s = dense_to_sparse_symmetric_upper(&m, ZERO_TOL).unwrap();
+        let s = dense_to_sparse_symmetric_upper(&m, 0.0).unwrap();
         // Upper triangle has 3 diagonal + 3 off-diagonal = 6 entries.
         assert_eq!(s.compute_nnz(), 6);
     }
@@ -1349,7 +1344,7 @@ mod tests {
         let a = array![[4.0, 2.0, 0.0], [2.0, 5.0, 3.0], [0.0, 3.0, 6.0]];
         let v = array![1.0, 2.0, 3.0];
         let expected = a.dot(&v); // dense reference
-        let a_sparse = dense_to_sparse_symmetric_upper(&a, ZERO_TOL).unwrap();
+        let a_sparse = dense_to_sparse_symmetric_upper(&a, 0.0).unwrap();
         let got = sparse_symmetric_upper_matvec_public(&a_sparse, &v);
         for i in 0..3 {
             approx_eq(got[i], expected[i], 1e-13);
@@ -1361,7 +1356,7 @@ mod tests {
         // Pure diagonal matrix: matvec should scale each component.
         let a = array![[3.0, 0.0, 0.0], [0.0, 5.0, 0.0], [0.0, 0.0, 7.0]];
         let v = array![2.0, 4.0, 6.0];
-        let a_sparse = dense_to_sparse_symmetric_upper(&a, ZERO_TOL).unwrap();
+        let a_sparse = dense_to_sparse_symmetric_upper(&a, 0.0).unwrap();
         let got = sparse_symmetric_upper_matvec_public(&a_sparse, &v);
         approx_eq(got[0], 6.0, 1e-14);
         approx_eq(got[1], 20.0, 1e-14);
@@ -1374,7 +1369,7 @@ mod tests {
     fn solve_sparse_spd_recovers_known_solution() {
         // A = [[4,2],[2,5]]; A^{-1} b = [0.5, 2.0] for b = [6, 11].
         let a = array![[4.0, 2.0], [2.0, 5.0]];
-        let a_sparse = dense_to_sparse_symmetric_upper(&a, ZERO_TOL).unwrap();
+        let a_sparse = dense_to_sparse_symmetric_upper(&a, 0.0).unwrap();
         let factor = factorize_sparse_spd(&a_sparse).unwrap();
         let rhs = array![6.0, 11.0];
         let x = solve_sparse_spd(&factor, &rhs).unwrap();
@@ -1397,7 +1392,7 @@ mod tests {
     #[test]
     fn solve_sparse_spd_3x3_round_trip() {
         let a: Array2<f64> = array![[9.0, 3.0, 1.0], [3.0, 8.0, 2.0], [1.0, 2.0, 7.0]];
-        let a_sparse = dense_to_sparse_symmetric_upper(&a, ZERO_TOL).unwrap();
+        let a_sparse = dense_to_sparse_symmetric_upper(&a, 0.0).unwrap();
         let factor = factorize_sparse_spd(&a_sparse).unwrap();
         for j in 0..3 {
             let mut ej = Array1::<f64>::zeros(3);
@@ -1415,7 +1410,7 @@ mod tests {
     fn logdet_from_factor_matches_dense_logdet_diagonal() {
         // Diagonal matrix diag(4,9,16): log-det = log(4)+log(9)+log(16)
         let a: Array2<f64> = array![[4.0, 0.0, 0.0], [0.0, 9.0, 0.0], [0.0, 0.0, 16.0]];
-        let a_sparse = dense_to_sparse_symmetric_upper(&a, ZERO_TOL).unwrap();
+        let a_sparse = dense_to_sparse_symmetric_upper(&a, 0.0).unwrap();
         let factor = factorize_sparse_spd(&a_sparse).unwrap();
         let logdet = logdet_from_factor(&factor).unwrap();
         let expected = 4.0_f64.ln() + 9.0_f64.ln() + 16.0_f64.ln();
@@ -1426,7 +1421,7 @@ mod tests {
     fn logdet_from_factor_matches_2x2_formula() {
         // A = [[4,2],[2,5]]; det(A) = 20-4 = 16; log-det = log(16)
         let a = array![[4.0, 2.0], [2.0, 5.0]];
-        let a_sparse = dense_to_sparse_symmetric_upper(&a, ZERO_TOL).unwrap();
+        let a_sparse = dense_to_sparse_symmetric_upper(&a, 0.0).unwrap();
         let factor = factorize_sparse_spd(&a_sparse).unwrap();
         let logdet = logdet_from_factor(&factor).unwrap();
         approx_eq(logdet, 16.0_f64.ln(), 1e-12);
@@ -1435,7 +1430,7 @@ mod tests {
     #[test]
     fn solve_sparse_spd_dimension_mismatch_returns_error() {
         let a = array![[4.0, 2.0], [2.0, 5.0]];
-        let a_sparse = dense_to_sparse_symmetric_upper(&a, ZERO_TOL).unwrap();
+        let a_sparse = dense_to_sparse_symmetric_upper(&a, 0.0).unwrap();
         let factor = factorize_sparse_spd(&a_sparse).unwrap();
         let rhs = array![1.0, 2.0, 3.0]; // wrong length
         assert!(solve_sparse_spd(&factor, &rhs).is_err());
@@ -1450,7 +1445,7 @@ mod tests {
             [0.0, 0.1, 2.5, 0.3],
             [0.0, 0.0, 0.3, 2.0]
         ];
-        let h_sparse = dense_to_sparse_symmetric_upper(&h, ZERO_TOL).unwrap();
+        let h_sparse = dense_to_sparse_symmetric_upper(&h, 0.0).unwrap();
 
         // Dense inverse for reference via column solves
         let chol = h.cholesky(Side::Lower).unwrap();
@@ -1482,7 +1477,7 @@ mod tests {
             [0.0, 0.1, 2.5, 0.3],
             [0.0, 0.0, 0.3, 2.0]
         ];
-        let h_sparse = dense_to_sparse_symmetric_upper(&h, ZERO_TOL).unwrap();
+        let h_sparse = dense_to_sparse_symmetric_upper(&h, 0.0).unwrap();
 
         // Genuinely DENSE reference: log det(H) = 2 · Σ_i log L_ii read off a
         // dense LLT (`FaerCholesky`), which shares no AMD ordering, no CSC
@@ -1512,7 +1507,7 @@ mod tests {
     fn solve_sparse_spdmulti_recovers_identity_inverse() {
         // A = diag(4,9): A^{-1} * A = I
         let a = array![[4.0, 0.0], [0.0, 9.0]];
-        let a_sparse = dense_to_sparse_symmetric_upper(&a, ZERO_TOL).unwrap();
+        let a_sparse = dense_to_sparse_symmetric_upper(&a, 0.0).unwrap();
         let factor = factorize_sparse_spd(&a_sparse).unwrap();
         // Solve against the identity matrix
         let rhs = Array2::<f64>::eye(2);
@@ -1526,7 +1521,7 @@ mod tests {
     #[test]
     fn solve_sparse_spdmulti_3x3_matches_column_wise_solve() {
         let a: Array2<f64> = array![[9.0, 3.0, 1.0], [3.0, 8.0, 2.0], [1.0, 2.0, 7.0]];
-        let a_sparse = dense_to_sparse_symmetric_upper(&a, ZERO_TOL).unwrap();
+        let a_sparse = dense_to_sparse_symmetric_upper(&a, 0.0).unwrap();
         let factor = factorize_sparse_spd(&a_sparse).unwrap();
         // multi-rhs: two distinct RHS vectors as columns
         let rhs = array![[1.0, 0.0], [0.0, 1.0], [0.0, 0.0]];
@@ -1545,7 +1540,7 @@ mod tests {
     fn solve_sparse_spdmulti_rows_selects_subset_of_rows() {
         // A = [[4,2],[2,5]]; A^{-1} has known entries.
         let a = array![[4.0, 2.0], [2.0, 5.0]];
-        let a_sparse = dense_to_sparse_symmetric_upper(&a, ZERO_TOL).unwrap();
+        let a_sparse = dense_to_sparse_symmetric_upper(&a, 0.0).unwrap();
         let factor = factorize_sparse_spd(&a_sparse).unwrap();
         // Solve against a 2x2 RHS, requesting only row 0..1 (first row only).
         let rhs = Array2::<f64>::eye(2);
@@ -1562,7 +1557,7 @@ mod tests {
         // A = [[4,2],[2,5]]; A^{-1} diagonal = [5/16, 4/16] = [0.3125, 0.25].
         // diagonal_sum from row_start=0, rhs=I_2 sums diag(A^{-1})[0..2] = trace.
         let a = array![[4.0, 2.0], [2.0, 5.0]];
-        let a_sparse = dense_to_sparse_symmetric_upper(&a, ZERO_TOL).unwrap();
+        let a_sparse = dense_to_sparse_symmetric_upper(&a, 0.0).unwrap();
         let factor = factorize_sparse_spd(&a_sparse).unwrap();
         let rhs = Array2::<f64>::eye(2);
         let diag_sum = solve_sparse_spdmulti_diagonal_sum(&factor, &rhs, 0).unwrap();
@@ -1578,7 +1573,7 @@ mod tests {
             [0.0, 1.0, 2.5, 1.0],
             [0.0, 0.0, 1.0, 2.0]
         ];
-        let h_sparse = dense_to_sparse_symmetric_upper(&h, ZERO_TOL).unwrap();
+        let h_sparse = dense_to_sparse_symmetric_upper(&h, 0.0).unwrap();
 
         let chol = h.cholesky(Side::Lower).unwrap();
         let mut h_inv = Array2::<f64>::zeros((4, 4));

@@ -979,9 +979,10 @@ pub(crate) fn skew_log_orthogonal(v: &Array2<f64>) -> GeometryResult<Array2<f64>
     // A rotation by π (eigenvalue −1 of V) is the cut locus: the logarithm is
     // not single-valued there. Detect it from M's spectrum directly — on such a
     // plane sin θ = 0 so K carries no signal and an element-wise scaling would
-    // silently drop the π rotation.
-    const CUT_LOCUS_EPS: f64 = 1.0e-7;
-    if evals.iter().any(|&lam| lam <= -1.0 + CUT_LOCUS_EPS) {
+    // silently drop the π rotation. M's eigenvalues lie in [−1, 1]; one inside the
+    // eigensolver band `n·ε` of −1 is that rotation to working precision.
+    let cut_locus_band = n as f64 * f64::EPSILON;
+    if evals.iter().any(|&lam| lam + 1.0 <= cut_locus_band) {
         return Err(GeometryError::Unsupported(
             "matrix logarithm undefined: rotation angle at π (beyond the injectivity radius)",
         ));
@@ -993,8 +994,9 @@ pub(crate) fn skew_log_orthogonal(v: &Array2<f64>) -> GeometryResult<Array2<f64>
             let lam = (0.5 * (evals[i] + evals[j])).clamp(-1.0, 1.0);
             let sin_theta = (1.0 - lam * lam).max(0.0).sqrt();
             // c(λ) = θ / sin θ, with the removable singularity at θ = 0
-            // (λ = 1) taken in the limit c → 1.
-            let scale = if sin_theta <= 1.0e-9 {
+            // (λ = 1) taken in the limit c → 1. The float just below 1 already
+            // gives sin θ ≈ 1.5e-8, so the limit is needed exactly at sin θ = 0.
+            let scale = if sin_theta == 0.0 {
                 1.0
             } else {
                 lam.acos() / sin_theta
