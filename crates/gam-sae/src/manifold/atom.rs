@@ -128,10 +128,10 @@ pub enum SaeAtomBasisKind {
     /// by the evaluator (as harmonics/degree are for the periodic/patch kinds), so
     /// this stays a unit variant.
     ///
-    /// PLANNED COMPLETION / OPT-IN: the topology race does NOT enrol this candidate
-    /// by default (see `crate::structure_harvest::finite_set_race_enrolled`); the
-    /// enum arm + evaluator land as inert scaffolding so unenrolled code cannot
-    /// affect any birth, and the enrolment flag flips only after full-suite +
+    /// NOT ENROLLED: no topology race enrols this candidate. Its opt-in flag was
+    /// removed in d484a091a, so the enum arm + evaluator are inert scaffolding:
+    /// unenrolled, they cannot affect any birth.
+    /// Enrolling it again would take a restored producer plus full-suite and
     /// real-data (weekday) verification. First-class integration into the
     /// continuous-latent optimizer is the remaining follow-up.
     FiniteSet,

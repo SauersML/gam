@@ -196,10 +196,9 @@ pub fn sae_atom_basis_kind_name(kind: &SaeAtomBasisKind) -> String {
         SaeAtomBasisKind::Poincare => "poincare".to_string(),
         SaeAtomBasisKind::Cylinder => "cylinder".to_string(),
         SaeAtomBasisKind::Mobius => "mobius".to_string(),
-        // The finite-set (discrete-anchor) candidate is inert scaffolding that is
-        // not enrolled in the topology race by default, so a discovered dictionary
-        // never actually carries it (see
-        // `structure_harvest::finite_set_race_enrolled`). Round-trip it under the
+        // The finite-set (discrete-anchor) candidate is inert scaffolding that no
+        // topology race enrols (its opt-in flag was removed in d484a091a), so a
+        // discovered dictionary never actually carries it. Round-trip it under the
         // same `"finite_set"` token the gam-sae inference/harvest paths already
         // emit, so serialization stays consistent the moment it is enrolled.
         SaeAtomBasisKind::FiniteSet => "finite_set".to_string(),

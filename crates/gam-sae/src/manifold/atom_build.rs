@@ -417,8 +417,8 @@ pub fn sae_build_atom_plans(
             }
             SaeAtomBasisKind::FiniteSet => {
                 // The finite-set (discrete-anchor) candidate is inert scaffolding
-                // not enrolled in the topology race by default
-                // (`structure_harvest::finite_set_race_enrolled` is false), and its
+                // that no topology race enrols (its opt-in flag was removed in
+                // d484a091a), and its
                 // latent is CATEGORICAL rather than a continuous seed coordinate, so
                 // there is no user-facing finite-set seed geometry to derive a plan
                 // from here. First-class integration into the continuous-latent
