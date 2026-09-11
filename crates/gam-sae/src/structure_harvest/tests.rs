@@ -1859,11 +1859,23 @@ fn birth_topology_race_assigns_circle_vs_line_by_evidence() {
     // turning a straight line cannot express. Two output channels carry the
     // circle; the rest are zero.
     let p = 4usize;
+    // #2822: each target is reproduced EXACTLY by its intended candidate (Periodic for
+    // the circle, EuclideanPatch for the line), an interpolation profiled Gaussian REML
+    // abstains on by design (#2723), which handed the verdict to the other candidate. A
+    // deterministic perturbation above the profiled residual's resolution keeps both
+    // targets scoreable.
+    let wobble = |row: usize, col: usize| {
+        let x = (row as f64 + 1.0) * 12.9898 + (col as f64 + 1.0) * 78.233;
+        0.02 * (x.sin() * 43758.5453).sin()
+    };
     let mut circle_target = Array2::<f64>::zeros((n, p));
     for row in 0..n {
         let t = coords[[row, 0]];
         circle_target[[row, 0]] = (TAU * t).cos();
         circle_target[[row, 1]] = (TAU * t).sin();
+        for c in 0..p {
+            circle_target[[row, c]] += wobble(row, c);
+        }
     }
 
     // LINE target: γ(t) = t·u — a straight ray, zero turning. The circle basis
@@ -1873,7 +1885,7 @@ fn birth_topology_race_assigns_circle_vs_line_by_evidence() {
     for row in 0..n {
         let t = coords[[row, 0]];
         for c in 0..p {
-            line_target[[row, c]] = t * u[c];
+            line_target[[row, c]] = t * u[c] + wobble(row, c);
         }
     }
 
