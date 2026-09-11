@@ -55,7 +55,7 @@
 //! |---|---|---|---|---|---|
 //! | criterion | 1e-6 relative | 1024 ulps ≈ 2e-13 relative | **DERIVED** | 2 ulps | ~4e11 ulps |
 //! | β | 1e-4 relative | 1e-7 relative | **GUARD** | 1.4e-10 | 4.98e-4 |
-//! | certified ρ̂ | *not checked* | 1e-5 absolute | **GUARD** | 2.0e-7 | — |
+//! | certified ρ̂ | *not checked* | `‖V_ρ‖∞·(‖Pg_cold‖+‖Pg_warm‖)`, else 1e-5 absolute | **DERIVED** from each arm's certificate; **GUARD** only without `V_ρ` | 2.0e-7 | — |
 //!
 //! **DERIVED** means the number follows from the structure of the problem and
 //! tightening it would contradict an argument. The criterion bound is the only
@@ -109,6 +109,11 @@ struct ArmOutcome {
     criterion: f64,
     beta: Vec<f64>,
     log_lambdas: Vec<f64>,
+    /// The certified KKT-projected outer gradient norm at this arm's ρ̂.
+    projected_grad_norm: Option<f64>,
+    /// `‖V_ρ‖∞`, the max absolute row sum of the published inverse outer
+    /// Hessian over ρ, when the fit publishes one.
+    rho_covariance_inf_norm: Option<f64>,
 }
 
 /// Signed ulp distance between two `f64`s, using the standard
@@ -136,14 +141,15 @@ fn ulp_distance(left: f64, right: f64) -> i128 {
 /// reassociation behaviour changes with it.
 const CRITERION_ULP_BUDGET: i128 = 1024;
 
-/// GUARD, not a derivation. Sup-norm bound on the certified log-λ. It sizes the
-/// certified-optimum ball, `‖Δρ̂‖ ≲ ‖H⁻¹‖·‖P∇F‖`, with the outer search
-/// certifying `‖P∇F‖ ≤ 1e-7` — but the flat-direction amplification `‖H⁻¹‖` is
-/// problem-dependent and is not computed here, so there is no constant to
-/// deduce. The only justification is the measured 2.0e-7, about two orders
-/// below this bound; the slack is deliberate headroom for a legitimately
-/// flatter fixture. Tighten on evidence whenever you like — nothing here
-/// argues for 1e-5 specifically.
+/// GUARD, used only when an arm publishes no `V_ρ` or no gradient certificate.
+///
+/// Where both arms publish them, the certified log-λ is judged against the
+/// DERIVED ball instead: to first order `ρ̂_cold − ρ̂_warm = V_ρ·(g_cold − g_warm)`
+/// at a stationary point, so `‖Δρ̂‖∞ ≤ ‖V_ρ‖∞·(‖Pg_cold‖ + ‖Pg_warm‖)`. That bound
+/// carries the flat-direction amplification the fixture actually has, so a
+/// flatter REML surface (a Matérn length-scale arm) gets the wider ball it
+/// earns and a well-curved one a tighter ball than this constant. The constant
+/// itself is calibrated to the measured 2.0e-7 and nothing argues for 1e-5.
 const RHO_ABS_BOUND: f64 = 1e-5;
 
 /// GUARD, not a derivation. Sup-norm bound on β relative to its own scale. β̂ is
@@ -382,6 +388,18 @@ fn fit_once(
             .expect("the fit reports a REML/LAML criterion"),
         beta: fit.fit.beta.to_vec(),
         log_lambdas: fit.fit.log_lambdas.to_vec(),
+        projected_grad_norm: fit
+            .fit
+            .convergence_evidence()
+            .outer_certificate()
+            .map(|certificate| certificate.stationarity.projected_norm()),
+        rho_covariance_inf_norm: fit.fit.artifacts.rho_covariance.as_ref().map(|covariance| {
+            covariance
+                .rows()
+                .into_iter()
+                .map(|row| row.iter().map(|value| value.abs()).sum::<f64>())
+                .fold(0.0_f64, f64::max)
+        }),
     }
 }
 
@@ -485,9 +503,33 @@ fn fits_are_invariant_to_warm_start_cache_state_across_families() {
                 COEF_REL_BOUND * beta_scale
             ));
         }
-        if let Some(gap) = first_absolute_gap(&cold.log_lambdas, &warm.log_lambdas, RHO_ABS_BOUND) {
+        let (rho_bound, rho_bound_kind) = match (
+            cold.projected_grad_norm,
+            warm.projected_grad_norm,
+            cold.rho_covariance_inf_norm,
+            warm.rho_covariance_inf_norm,
+        ) {
+            (
+                Some(cold_gradient),
+                Some(warm_gradient),
+                Some(cold_covariance),
+                Some(warm_covariance),
+            ) => (
+                cold_covariance.max(warm_covariance) * (cold_gradient + warm_gradient),
+                format!(
+                    "derived ‖V_ρ‖∞·(‖Pg_cold‖ + ‖Pg_warm‖) with ‖V_ρ‖∞ = max({cold_covariance:.3e}, \
+                     {warm_covariance:.3e}), ‖Pg‖ = ({cold_gradient:.3e}, {warm_gradient:.3e})"
+                ),
+            ),
+            _ => (
+                RHO_ABS_BOUND,
+                "guard: an arm published no V_ρ or no gradient certificate".to_string(),
+            ),
+        };
+        if let Some(gap) = first_absolute_gap(&cold.log_lambdas, &warm.log_lambdas, rho_bound) {
             failures.push(format!(
-                "[{}] certified log-λ depends on cache state (bound {RHO_ABS_BOUND:.3e}): {gap}",
+                "[{}] certified log-λ depends on cache state (bound {rho_bound:.3e}, \
+                 {rho_bound_kind}): {gap}",
                 case.name
             ));
         }
