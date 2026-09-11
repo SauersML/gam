@@ -469,11 +469,13 @@ struct SamplePayload {
     link_spec: String,
     /// The sampler that produced the draws, stamped by that sampler itself
     /// (`PosteriorSampler::label`): `"nuts"`, `"polya-gamma"`, `"laplace"`,
-    /// or `"truncated-laplace"`. Callers use it to badge the posterior or to
-    /// warn when a class has fallen back to the approximate path.
+    /// `"truncated-laplace"`, or `"conjugate-gaussian"`. Callers use it to badge
+    /// the posterior or to warn when a class has fallen back to the approximate
+    /// path.
     method: String,
-    /// Whether `method` targets the model's exact posterior (the MCMC routes)
-    /// rather than a Gaussian approximation of it (every Laplace form).
+    /// Whether `method` targets the model's exact posterior (the MCMC routes and
+    /// the closed-form conjugate Gaussian route) rather than a Gaussian
+    /// approximation of it (every Laplace form).
     exact: bool,
     /// Which coefficient covariance the draws describe, in the same
     /// vocabulary `predict()` reports (`"conditional"` or

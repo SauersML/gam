@@ -2228,6 +2228,123 @@ mod tests {
     }
 
     #[test]
+    fn gaussian_identity_dispatch_draws_the_exact_conjugate_posterior() {
+        // Profiled Gaussian with non-uniform weights, an offset and a
+        // non-diagonal penalty. Its target is Gaussian in closed form:
+        // P = (XᵀWX + S)/φ, μ = P⁻¹ XᵀW(y − o)/φ, Σ = P⁻¹, solved here by hand.
+        // The saved Hessian is deliberately not SPD: this route rebuilds the
+        // posterior from the data and must never factor it, whereas the NUTS
+        // route this replaces fails on exactly that factorization.
+        let t = [-0.8, -0.2, 0.3, 0.9, 1.4];
+        let x = array![
+            [1.0, t[0]],
+            [1.0, t[1]],
+            [1.0, t[2]],
+            [1.0, t[3]],
+            [1.0, t[4]]
+        ];
+        let y = array![0.41, 0.07, -0.18, -0.55, -1.02];
+        let w = array![1.0, 0.5, 2.0, 1.5, 0.8];
+        let offset = array![0.1, -0.05, 0.0, 0.2, -0.1];
+        let penalty = array![[0.3, 0.05], [0.05, 0.6]];
+        let phi = 0.37;
+        let mode = array![0.0, 0.0];
+        let non_spd_hessian = array![[0.0, 0.0], [0.0, 0.0]];
+        let cfg = NutsConfig {
+            n_samples: 4000,
+            nwarmup: 20,
+            n_chains: 2,
+            target_accept: 0.8,
+            seed: 20260911,
+        };
+        let out = run_nuts_sampling_flattened_family(
+            LikelihoodSpec {
+                response: ResponseFamily::Gaussian,
+                link: InverseLink::Standard(StandardLink::Identity),
+            },
+            FamilyNutsInputs::Glm(GlmFlatInputs {
+                x: x.view(),
+                y: y.view(),
+                weights: w.view(),
+                penalty_matrix: penalty.view(),
+                mode: mode.view(),
+                hessian: non_spd_hessian.view(),
+                likelihood_scale: LikelihoodScaleMetadata::ProfiledGaussian,
+                dispersion: gam_solve::estimate::Dispersion::estimated(phi)
+                    .expect("finite positive dispersion"),
+                firth_bias_reduction: false,
+                offset: Some(offset.view()),
+            }),
+            &cfg,
+        )
+        .expect("Gaussian identity draws from its conjugate posterior");
+
+        let (mut a11, mut a12, mut a22, mut b1, mut b2) = (0.0, 0.0, 0.0, 0.0, 0.0);
+        for i in 0..t.len() {
+            let r = y[i] - offset[i];
+            a11 += w[i];
+            a12 += w[i] * t[i];
+            a22 += w[i] * t[i] * t[i];
+            b1 += w[i] * r;
+            b2 += w[i] * t[i] * r;
+        }
+        let p11 = (a11 + penalty[[0, 0]]) / phi;
+        let p12 = (a12 + penalty[[0, 1]]) / phi;
+        let p22 = (a22 + penalty[[1, 1]]) / phi;
+        let det = p11 * p22 - p12 * p12;
+        let (c11, c12, c22) = (p22 / det, -p12 / det, p11 / det);
+        let (b1, b2) = (b1 / phi, b2 / phi);
+        let mu = [c11 * b1 + c12 * b2, c12 * b1 + c22 * b2];
+        let sd = [c11.sqrt(), c22.sqrt()];
+
+        assert_eq!(out.sampler, PosteriorSampler::ConjugateGaussian);
+        assert!(out.sampler.targets_exact_posterior());
+        assert_eq!(out.sampler.label(), "conjugate-gaussian");
+        assert_eq!(out.rhat, 1.0);
+        assert_eq!(out.ess, (cfg.n_samples * cfg.n_chains) as f64);
+        assert!(out.converged);
+        for j in 0..2 {
+            assert!(
+                (out.posterior_mean[j] - mu[j]).abs() <= 1e-10 * (1.0 + mu[j].abs()),
+                "posterior mean {j}: {} vs closed form {}",
+                out.posterior_mean[j],
+                mu[j]
+            );
+            assert!(
+                (out.posterior_std[j] - sd[j]).abs() <= 1e-10 * sd[j],
+                "posterior sd {j}: {} vs closed form {}",
+                out.posterior_std[j],
+                sd[j]
+            );
+        }
+
+        let draws = cfg.n_samples * cfg.n_chains;
+        assert_eq!(out.samples.dim(), (draws, 2));
+        assert!(out.samples.iter().all(|v| v.is_finite()));
+        let sample_mean = out
+            .samples
+            .mean_axis(ndarray::Axis(0))
+            .expect("non-empty draws");
+        let sample_var = out.samples.var_axis(ndarray::Axis(0), 1.0);
+        for j in 0..2 {
+            // Independent draws: the sample mean carries Monte-Carlo error sd/√N,
+            // and the sample variance a relative error √(2/N) ≈ 1.6 % at N = 8000.
+            assert!(
+                (sample_mean[j] - mu[j]).abs() <= 5.0 * sd[j] / (draws as f64).sqrt(),
+                "draw mean {j}: {} vs {}",
+                sample_mean[j],
+                mu[j]
+            );
+            assert!(
+                (sample_var[j] / (sd[j] * sd[j]) - 1.0).abs() <= 5.0 * (2.0 / draws as f64).sqrt(),
+                "draw variance {j}: {} vs {}",
+                sample_var[j],
+                sd[j] * sd[j]
+            );
+        }
+    }
+
+    #[test]
     fn family_dispatch_routes_probit_to_nuts_path() {
         let x = array![[1.0, 0.2], [1.0, -0.1], [1.0, 1.2], [1.0, -0.7]];
         let y = array![1.0, 0.0, 1.0, 0.0];
@@ -3644,6 +3761,12 @@ pub enum PosteriorSampler {
     /// Reflective HMC on the inequality-truncated Gaussian posterior
     /// approximation; `rhat` / `ess` are measured.
     TruncatedLaplaceHmc,
+    /// Independent draws from the exact conjugate posterior of the
+    /// Gaussian-identity target at the fitted smoothing parameters and
+    /// dispersion. That posterior is Gaussian in closed form, so the reported
+    /// mean and standard deviations are its exact moments, and `rhat = 1.0` /
+    /// `ess = n_draws` hold by construction.
+    ConjugateGaussian,
 }
 
 impl PosteriorSampler {
@@ -3654,16 +3777,17 @@ impl PosteriorSampler {
             Self::PolyaGammaGibbs => "polya-gamma",
             Self::Laplace => "laplace",
             Self::TruncatedLaplaceHmc => "truncated-laplace",
+            Self::ConjugateGaussian => "conjugate-gaussian",
         }
     }
 
     /// Whether the draws target the model's exact posterior rather than a
-    /// Gaussian approximation of it. Only the MCMC routes on the exact
-    /// likelihood qualify; every Laplace form is an approximation, however
-    /// its draws are produced.
+    /// Gaussian approximation of it. The MCMC routes on the exact likelihood
+    /// and the closed-form conjugate Gaussian route qualify; every Laplace form
+    /// is an approximation, however its draws are produced.
     pub const fn targets_exact_posterior(self) -> bool {
         match self {
-            Self::Nuts | Self::PolyaGammaGibbs => true,
+            Self::Nuts | Self::PolyaGammaGibbs | Self::ConjugateGaussian => true,
             Self::Laplace | Self::TruncatedLaplaceHmc => false,
         }
     }
@@ -4265,6 +4389,121 @@ pub(crate) fn run_nuts_sampling(
     Ok(result)
 }
 
+/// Exact posterior draws for the Gaussian-identity target.
+///
+/// The target the NUTS route would sample is
+/// `log p(β) = −Σᵢ wᵢ (yᵢ − oᵢ − xᵢᵀβ)² / (2φ) − βᵀSβ / (2·cov_scale)`, with
+/// `φ` the resolved target dispersion and `cov_scale` the coefficient-covariance
+/// scale (`φ` for a profiled Gaussian, `1` for a fixed one). That density is
+/// Gaussian in `β`: precision `P = XᵀWX/φ + S/cov_scale`, mean
+/// `μ = P⁻¹ XᵀW(y − o)/φ`. Hamiltonian dynamics on it could only add Monte-Carlo
+/// error to moments that are available in closed form. So the reported mean and
+/// standard deviations are the exact moments, and the draws are independent,
+/// `β = μ + L z` with `L Lᵀ = P⁻¹` and `z ~ N(0, I)`, streamed per chain from the
+/// same splitmix64 seed chain as every other sampler here.
+///
+/// The fitted `mode` and saved `hessian` are validated for shape like every GLM
+/// sampler input, but the posterior is rebuilt from the data, penalty and
+/// dispersion themselves. A stabilizing ridge or a stopping tolerance in the
+/// fit therefore cannot move the reported posterior.
+fn run_conjugate_gaussian_sampling(
+    x: ArrayView2<f64>,
+    y: ArrayView1<f64>,
+    weights: ArrayView1<f64>,
+    penalty_matrix: ArrayView2<f64>,
+    mode: ArrayView1<f64>,
+    hessian: ArrayView2<f64>,
+    likelihood: GlmLikelihoodSpec,
+    dispersion: gam_solve::model_types::Dispersion,
+    offset: Option<ArrayView1<f64>>,
+    config: &NutsConfig,
+) -> Result<NutsResult, String> {
+    validate_nuts_config(config).map_err(String::from)?;
+    validate_hmc_arrays(
+        x,
+        y,
+        weights,
+        penalty_matrix,
+        mode,
+        hessian,
+        "conjugate Gaussian",
+    )
+    .map_err(String::from)?;
+    let (_, cov_scale) = resolve_hmc_likelihood(likelihood, dispersion).map_err(String::from)?;
+    let phi = dispersion.phi();
+    if !(phi.is_finite() && phi > 0.0) {
+        return Err(format!(
+            "conjugate Gaussian posterior requires a finite positive dispersion, got {phi}"
+        ));
+    }
+    let n = x.nrows();
+    let dim = x.ncols();
+    let response = match offset {
+        Some(offset) => {
+            if offset.len() != n {
+                return Err(HmcError::DimensionMismatch {
+                    reason: format!(
+                        "conjugate Gaussian offset length {} does not match {n} observations",
+                        offset.len()
+                    ),
+                }
+                .into());
+            }
+            &y - &offset
+        }
+        None => y.to_owned(),
+    };
+
+    // P = XᵀWX/φ + S/cov_scale and b = XᵀW(y − o)/φ, formed from the target's
+    // own weights and scales.
+    let weighted_x = &x * &weights.insert_axis(Axis(1));
+    let mut precision = fast_ab(&x.t().to_owned(), &weighted_x);
+    precision.mapv_inplace(|value| value / phi);
+    precision.scaled_add(1.0 / cov_scale, &penalty_matrix);
+    let rhs = fast_atv(&weighted_x, &response).mapv(|value| value / phi);
+
+    let whitening = hessian_whitening_transform(
+        precision.view(),
+        dim,
+        1.0,
+        "conjugate Gaussian posterior precision Cholesky failed",
+    )?;
+    let chol = whitening.chol;
+    let posterior_mean = chol.dot(&whitening.chol_t.dot(&rhs));
+    let posterior_std = chol.map_axis(Axis(1), |row| row.dot(&row).sqrt());
+
+    let total_samples = config.n_chains * config.n_samples;
+    let mut samples = Array2::<f64>::zeros((total_samples, dim));
+    let mut z = Array1::<f64>::zeros(dim);
+    for chain in 0..config.n_chains {
+        let mut rng = StdRng::seed_from_u64(chain_stream_seed(
+            config.seed,
+            chain,
+            0x5C2E_9A41_D07B_36F1,
+        ));
+        for draw in 0..config.n_samples {
+            for value in z.iter_mut() {
+                *value = sample_standard_normal(&mut rng);
+            }
+            let beta = &posterior_mean + &chol.dot(&z);
+            samples
+                .row_mut(chain * config.n_samples + draw)
+                .assign(&beta);
+        }
+    }
+
+    Ok(NutsResult {
+        samples,
+        posterior_mean,
+        posterior_std,
+        rhat: 1.0,
+        ess: total_samples as f64,
+        converged: true,
+        sampler: PosteriorSampler::ConjugateGaussian,
+        covariance: InferenceCovarianceMode::Conditional,
+    })
+}
+
 /// Penalty subtracted from the log-density when the `ρ`-criterion closure
 /// reports an infeasible / non-finite point during Tier-2 `ρ`-posterior NUTS
 /// (#938). The fallback density is the whitened standard normal shifted down by
@@ -4511,7 +4750,11 @@ pub fn explicit_fit_hessian_for_whitening<'a>(
     Ok(hessian)
 }
 
-/// Family-agnostic flattened NUTS entrypoint across all supported likelihood families.
+/// Family-agnostic flattened posterior-sampling entrypoint across all supported
+/// likelihood families. A Gaussian-identity target is Gaussian in closed form,
+/// so it draws exactly from that conjugate posterior; a standard Bernoulli-logit
+/// target uses Pólya-Gamma Gibbs when its assumptions hold; every other family
+/// runs NUTS.
 pub fn run_nuts_sampling_flattened_family(
     likelihood: LikelihoodSpec,
     inputs: FamilyNutsInputs<'_>,
@@ -4549,7 +4792,7 @@ pub fn run_nuts_sampling_flattened_family(
             ResponseFamily::Gaussian,
             InverseLink::Standard(StandardLink::Identity),
             FamilyNutsInputs::Glm(glm),
-        ) => run_nuts_sampling(
+        ) => run_conjugate_gaussian_sampling(
             glm.x,
             glm.y,
             glm.weights,
@@ -4560,7 +4803,6 @@ pub fn run_nuts_sampling_flattened_family(
                 .clone()
                 .expect("GLM match arm has resolved likelihood"),
             glm.dispersion,
-            glm.firth_bias_reduction,
             glm.offset,
             config,
         ),

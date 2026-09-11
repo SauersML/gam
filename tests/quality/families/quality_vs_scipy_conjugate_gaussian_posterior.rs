@@ -1,6 +1,6 @@
 //! End-to-end quality (OBJECTIVE METRIC — recovery of an exact analytic
-//! posterior): gam's NUTS posterior for a Gaussian / identity-link penalized
-//! smooth must recover the *closed-form* conjugate posterior `N(μ_post, Vb)`,
+//! posterior): gam's posterior-sampling route for a Gaussian / identity-link
+//! penalized smooth must recover the *closed-form* conjugate posterior `N(μ_post, Vb)`,
 //! a mathematical ground-truth quantity available in closed form. The
 //! pass/fail assertion is gam's error against the analytic `μ_post`/`sd_post`
 //! computed exactly (no sampling) — NOT closeness to any tool's fitted output.
@@ -16,9 +16,10 @@
 //! scipy's role is demoted to a BASELINE-TO-MATCH-OR-BEAT: `scipy.stats`
 //! draws 10k i.i.d. samples from the *same* exact target and we assert gam's
 //! recovery error is no worse than scipy's own finite-sample Monte-Carlo error
-//! (within a slack factor). gam is a true MCMC sampler vs. scipy's i.i.d.
-//! draws on a Gaussian, so matching that floor is a strong, objective claim
-//! about gam's whitening + triangular-solve machinery — not "we mimic scipy".
+//! (within a slack factor). For this target gam's sampling entry point draws
+//! from the conjugate posterior in closed form and reports its exact moments,
+//! so the check measures whether gam builds the SAME posterior (penalty scale,
+//! dispersion, weights) — not "we mimic scipy".
 //!
 //! Comparator: **scipy.stats** — but only as the source of the EXACT analytic
 //! `μ_post`/`Σ_post` (ground truth) plus a finite-sample MC-error baseline. For
@@ -37,20 +38,19 @@
 //! posterior is available in closed form, so `scipy.stats.multivariate_normal`
 //! samples it exactly.
 //!
-//! gam's NUTS path whitens the coefficient space with the *fitted penalized
-//! Hessian* (the φ-scaled `(1/φ)·H`) as the mass matrix and draws the φ-scaled
-//! covariance `φ·H⁻¹`, so gam's draws must reproduce scipy's exact posterior.
-//! This is the cleanest possible check of gam's whitening + Cholesky-inversion
-//! machinery (`explicit_fit_hessian_for_whitening` →
-//! `run_nuts_sampling_flattened_family`): a real divergence is a real bug in
-//! the sampler's mass matrix or the triangular solve.
+//! gam's sampling entry point (`run_nuts_sampling_flattened_family`) recognizes
+//! the Gaussian-identity target as conjugate. It rebuilds `P = (XᵀX + S_λ)/φ`
+//! from the data, penalty and dispersion, reports the exact moments of
+//! `N(P⁻¹Xᵀy/φ, P⁻¹)`, and draws independent samples through `L Lᵀ = P⁻¹`. So
+//! gam's reported moments must reproduce scipy's exact posterior. A real
+//! divergence is a real bug in the posterior gam builds: the penalty scale,
+//! the dispersion, or the triangular solve.
 //!
 //! We feed BOTH engines the *identical* materialized design matrix `X`, the
 //! identical penalty `S_λ = λP` (gam's `weighted_blockwise_penalty_sum` at the
 //! fitted λ), the identical response `y`, and the identical noise variance
-//! `σ² = φ` (gam's estimated dispersion). The only difference is the sampling
-//! mechanism: gam runs NUTS (1 chain, 10k draws — this convex Gaussian target
-//! converges in a few leapfrogs), scipy draws i.i.d. from the exact Gaussian.
+//! `σ² = φ` (gam's estimated dispersion). gam reports closed-form moments and
+//! 10k independent draws; scipy draws 10k i.i.d. samples from the exact Gaussian.
 
 use gam::hmc::{
     FamilyNutsInputs, GlmFlatInputs, NutsConfig, explicit_fit_hessian_for_whitening,
@@ -118,13 +118,11 @@ fn gam_nuts_posterior_matches_scipy_exact_conjugate_gaussian() {
         "fitted dispersion must be positive, got {phi}"
     );
 
-    // ---- run gam's NUTS over the coefficient vector -----------------------
-    // We whiten with the SAVED penalized Hessian H = XᵀX + S_λ (the exact
-    // function the CLI `sample` path uses; the sampler scales the Cholesky by
-    // √φ so the drawn covariance is the φ-scaled posterior φ·H⁻¹).
-    // One chain, 10k post-warmup draws: this convex Gaussian target mixes
-    // immediately, so the Monte-Carlo error on each coordinate mean is
-    // ~ sd/sqrt(10000) ≈ sd/100.
+    // ---- gam's posterior sampling over the coefficient vector -------------
+    // The same entry point the CLI `sample` path uses. For this Gaussian-
+    // identity target it reports the closed-form conjugate moments and 10k
+    // independent draws; the saved penalized Hessian is still handed over, as
+    // every GLM sampler input is, and is shape-validated.
     let likelihood = LikelihoodSpec {
         response: ResponseFamily::Gaussian,
         link: InverseLink::Standard(StandardLink::Identity),
