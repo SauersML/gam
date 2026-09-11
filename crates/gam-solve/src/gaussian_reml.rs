@@ -6046,13 +6046,7 @@ fn optimize_rho_no_alloc(
     validate_reml_profile_residuals(cache, ywy.view(), projected_rhs_squared.view(), rho_lower)?;
     if cache.penalty_rank == 0 {
         return Ok(init_rho.unwrap_or(0.0).clamp(rho_lower, rho_upper));
-    }} or die "noalloc head"; s{    Ok(enumerate_and_select_rho(eval, enclose, init_rho, None)?.rho)
-}
-
-fn fill_coefficients_no_alloc}{    Ok(enumerate_and_select_rho(eval, enclose, init_rho, cache.resolvability_rho_domain(), None)?.rho)
-}
-
-fn fill_coefficients_no_alloc
+    }
     let eval = |rho: f64| {
         evaluate_reml_parts(
             cache,
@@ -6074,7 +6068,7 @@ fn fill_coefficients_no_alloc
             b,
         )
     };
-    Ok(enumerate_and_select_rho(eval, enclose, init_rho, None)?.rho)
+    Ok(enumerate_and_select_rho(eval, enclose, init_rho, cache.resolvability_rho_domain(), None)?.rho)
 }
 
 fn fill_coefficients_no_alloc(
