@@ -143,6 +143,93 @@ pub(crate) fn stable_hybrid_duchon_radial(
     accum.iter().map(|acc| inv_beta * acc.sum()).collect()
 }
 
+/// κ-partials of [`stable_hybrid_duchon_radial`], differentiated under the same
+/// Schwinger integral (#2735).
+///
+/// With `p = 2m`, `q = 2s`, `n = p + q`, the value's weight
+/// `w(u) = (1 − u²)^{p−1} u^{2q−1}` and `κ_u = u·κ`, the Matérn block identity
+/// `∂_κ M_n^d(κ, R) = −2nκ · M_{n+1}^d(κ, R)` gives
+///
+/// ```text
+/// ∂_κ f  = (1/B) ∫ w(u) · u² · (−2nκ) · M_{n+1}(κ_u) du
+/// ∂²_κ f = (1/B) ∫ w(u) · u² · [ −2n · M_{n+1}(κ_u) + 4n(n+1) · κ_u² · M_{n+2}(κ_u) ] du
+/// ```
+///
+/// The extra `u²` (and `u²·κ_u²` beside `M_{n+2}`) offsets exactly the stronger
+/// `u → 0` growth of the higher-order Matérn factor, so each integrand keeps the
+/// value's exponent `d − 4m − 1` and the same 64-point Gauss–Legendre rule stays
+/// spectral. On the same fixed nodes this is the exact κ-derivative of the value
+/// the quadrature returns. The partial-fraction κ-partial it replaces at `d > 4m`
+/// differentiates coefficients `∝ κ^{−2n}` that cancel catastrophically: at
+/// `d = 16, m = 2, s = 9` the operator penalty's analytic ∂S/∂ψ carried an error
+/// growing like κ^−43 against a penalty scaling like κ^−26.
+fn stable_hybrid_duchon_radial_kappa_partial(
+    d: usize,
+    m: usize,
+    s: usize,
+    kappa: f64,
+    r: f64,
+    max_order: usize,
+    kappa_derivative_order: usize,
+) -> Vec<f64> {
+    assert!(m >= 1, "stable_hybrid_duchon_radial_kappa_partial: m ≥ 1");
+    assert!(s >= 1, "stable_hybrid_duchon_radial_kappa_partial: s ≥ 1");
+    assert!(kappa > 0.0, "stable_hybrid_duchon_radial_kappa_partial: κ > 0");
+    assert!(r > 0.0, "stable_hybrid_duchon_radial_kappa_partial: r > 0");
+    assert!(
+        max_order <= 6,
+        "stable_hybrid_duchon_radial_kappa_partial requires max_order <= 6: max_order={max_order}"
+    );
+    assert!(
+        kappa_derivative_order == 1 || kappa_derivative_order == 2,
+        "stable_hybrid_duchon_radial_kappa_partial supports kappa_derivative_order 1 or 2: order={kappa_derivative_order}"
+    );
+    assert!(
+        schwinger_radial_is_convergent(d, m),
+        "stable_hybrid_duchon_radial_kappa_partial: requires d > 4m"
+    );
+
+    let (nodes, weights) = gauss_legendre_64();
+    let p_eff = 2 * m;
+    let q_eff = 2 * s;
+    let matern_order = p_eff + q_eff;
+    let n = matern_order as f64;
+    let log_beta =
+        ln_gamma(p_eff as f64) + ln_gamma(q_eff as f64) - ln_gamma((p_eff + q_eff) as f64);
+    let inv_beta = (-log_beta).exp();
+
+    let mut accum = vec![KahanSum::default(); max_order + 1];
+    for (xi, wi) in nodes.iter().zip(weights.iter()) {
+        // The same node map and weight as the value, times the `u²` the chain
+        // rule brings down from `κ_u = u·κ`.
+        let u = 0.5 * (1.0 + xi);
+        if u <= 0.0 || u >= 1.0 {
+            continue;
+        }
+        let kappa_u = u * kappa;
+        let one_minus_u2_pow = (1.0 - u * u).powi((p_eff - 1) as i32);
+        let u_pow = u.powi((2 * q_eff - 1) as i32);
+        let weight = wi * one_minus_u2_pow * u_pow * u * u;
+        let next_order =
+            matern_block_radial_derivatives(d, matern_order + 1, kappa_u, r, max_order);
+        if kappa_derivative_order == 1 {
+            let scale = weight * (-2.0 * n * kappa);
+            for (k, v) in next_order.iter().enumerate() {
+                accum[k].add(scale * v);
+            }
+        } else {
+            let second_order =
+                matern_block_radial_derivatives(d, matern_order + 2, kappa_u, r, max_order);
+            let first_scale = weight * (-2.0 * n);
+            let second_scale = weight * 4.0 * n * (n + 1.0) * kappa_u * kappa_u;
+            for k in 0..=max_order {
+                accum[k].add(first_scale * next_order[k] + second_scale * second_order[k]);
+            }
+        }
+    }
+    accum.iter().map(|acc| inv_beta * acc.sum()).collect()
+}
+
 pub(crate) fn factorial_f64(n: usize) -> f64 {
     let mut acc = 1.0_f64;
     for k in 2..=n {
@@ -2005,6 +2092,13 @@ pub fn radial_derivatives_of_isotropic_duchon_kappa_partial(
     if use_duchon_small_chi_riesz_series(kappa, r) {
         return duchon_small_chi_riesz_series_radial_derivatives(d, a, b, kappa, r, max_order, 1);
     }
+    // The value's second chart (`radial_derivatives_of_isotropic_duchon`): at
+    // `d > 4m` the partial-fraction coefficients below cancel catastrophically,
+    // so the κ-partial is taken under the same Schwinger integral as the value
+    // (#2735).
+    if schwinger_radial_is_convergent(d, m) {
+        return stable_hybrid_duchon_radial_kappa_partial(d, m, s, kappa, r, max_order, 1);
+    }
 
     let kappa_sq = kappa * kappa;
     let mut total = vec![KahanSum::default(); max_order + 1];
@@ -2076,6 +2170,10 @@ pub fn radial_derivatives_of_isotropic_duchon_kappa_partial2(
     let b = 2 * s;
     if use_duchon_small_chi_riesz_series(kappa, r) {
         return duchon_small_chi_riesz_series_radial_derivatives(d, a, b, kappa, r, max_order, 2);
+    }
+    // Mirrors the value's chart order: Schwinger at `d > 4m` (#2735).
+    if schwinger_radial_is_convergent(d, m) {
+        return stable_hybrid_duchon_radial_kappa_partial(d, m, s, kappa, r, max_order, 2);
     }
 
     let kappa_sq = kappa * kappa;

@@ -3742,3 +3742,69 @@ fn auto_streaming_engages_for_large_synthetic_basis() {
         "chunk {chunk} outside the expected ~256 MiB / (200·8) window"
     );
 }
+
+/// #2735: at `d > 4m` the value is evaluated on the Schwinger chart, so its κ
+/// partials have to be taken under the same integral. The partial-fraction κ
+/// partial cancels catastrophically there: at d = 16, m = 2, s = 9 the operator
+/// penalty's analytic ∂S/∂ψ carried an error growing like κ^−43 against a penalty
+/// scaling like κ^−26 (MSI job 388376).
+///
+/// On the same fixed quadrature nodes the analytic partials are the exact
+/// κ-derivatives of the value, so a Richardson difference of the value differs
+/// from them only by its own error. At `h = 3e-4·κ` and local κ-exponents up to
+/// ~42 that is ≈ 4e-8 (first) and ≈ 1e-6 (second) of the derivative's scale,
+/// below the 1e-6 and 1e-4 bars used here.
+#[test]
+fn schwinger_kappa_partials_are_the_derivatives_of_the_values_chart_2735() {
+    use super::closed_form_penalty::{
+        radial_derivatives_of_isotropic_duchon,
+        radial_derivatives_of_isotropic_duchon_kappa_partial,
+        radial_derivatives_of_isotropic_duchon_kappa_partial2,
+    };
+
+    let (d, m, s) = (16usize, 2usize, 9usize);
+    let max_order = 5usize;
+    for &kappa in &[0.607_f64, 1.0, 1.65] {
+        for &chi in &[0.3_f64, 0.6, 1.0, 2.0] {
+            let r = chi / kappa;
+            let value = |k: f64| radial_derivatives_of_isotropic_duchon(d, m, s as f64, k, r, max_order);
+            let first = radial_derivatives_of_isotropic_duchon_kappa_partial(d, m, s, kappa, r, max_order);
+            let second =
+                radial_derivatives_of_isotropic_duchon_kappa_partial2(d, m, s, kappa, r, max_order);
+            let h = 3.0e-4 * kappa;
+            let f0 = value(kappa);
+            let fp1 = value(kappa + h);
+            let fm1 = value(kappa - h);
+            let fp2 = value(kappa + 2.0 * h);
+            let fm2 = value(kappa - 2.0 * h);
+            for order in 0..=max_order {
+                let d1_h = (fp1[order] - fm1[order]) / (2.0 * h);
+                let d1_2h = (fp2[order] - fm2[order]) / (4.0 * h);
+                let fd_first = (4.0 * d1_h - d1_2h) / 3.0;
+                let d2_h = (fp1[order] - 2.0 * f0[order] + fm1[order]) / (h * h);
+                let d2_2h = (fp2[order] - 2.0 * f0[order] + fm2[order]) / (4.0 * h * h);
+                let fd_second = (4.0 * d2_h - d2_2h) / 3.0;
+                let first_scale = first[order]
+                    .abs()
+                    .max(fd_first.abs())
+                    .max(f0[order].abs() / kappa);
+                let second_scale = second[order]
+                    .abs()
+                    .max(fd_second.abs())
+                    .max(f0[order].abs() / (kappa * kappa));
+                let rel_first = (first[order] - fd_first).abs() / first_scale;
+                let rel_second = (second[order] - fd_second).abs() / second_scale;
+                assert!(
+                    rel_first <= 1.0e-6,
+                    "∂_κ f^({order}) at κ={kappa}, κR={chi}: analytic {:+.10e} vs Richardson {fd_first:+.10e} (rel {rel_first:.3e})",
+                    first[order]
+                );
+                assert!(
+                    rel_second <= 1.0e-4,
+                    "∂²_κ f^({order}) at κ={kappa}, κR={chi}: analytic {:+.10e} vs Richardson {fd_second:+.10e} (rel {rel_second:.3e})",
+                    second[order]
+                );
+            }
+        }
+    }
+}
