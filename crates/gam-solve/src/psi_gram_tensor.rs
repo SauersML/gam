@@ -3314,10 +3314,11 @@ mod tests {
         // n-TRANSPORT. The crossing is n-free in exact arithmetic (cutoff and the
         // third eigenvalue both scale linearly in n), so the two builds must agree
         // to the bisection's own resolution, not to a window-sized slop. The
-        // bisection stops at `PSI_BAND_BISECTION_ATOL·(1+|ψ|)`; allow a few of
-        // those plus the O(1/n) Ostrowski excursion of the crossing itself,
-        // converted through the margin slope `d/dψ ln(ε²) = 2α`.
-        let bisection_resolution = PSI_BAND_BISECTION_ATOL * (1.0 + psi_hi.abs());
+        // bisection stops once its bracket's ends are adjacent floats, a spacing of
+        // at most `f64::EPSILON·|ψ|`; allow a few of those plus the O(1/n)
+        // Ostrowski excursion of the crossing itself, converted through the margin
+        // slope `d/dψ ln(ε²) = 2α`.
+        let bisection_resolution = f64::EPSILON * psi_hi.abs().max(f64::MIN_POSITIVE);
         let transport = 8.0 * bisection_resolution + (1.0 / 200.0) / (2.0 * alpha);
         assert!(
             (floors[0] - floors[1]).abs() <= transport,

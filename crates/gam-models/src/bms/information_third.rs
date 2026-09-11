@@ -127,7 +127,7 @@ impl BernoulliMarginalSlopeFamily {
             xu: Array2::zeros((rows, p)),
             xv: Array2::zeros((rows, p)),
             xuv: Array2::zeros((rows, p)),
-            coefficients: vec![[[[0.0; 4]; 2]; 2]; 2]; rows],
+            coefficients: vec![[[[[0.0; 4]; 2]; 2]; 2]; rows],
         };
         let offset_i = if axes.block_i == 0 { 0 } else { pm };
         for row in start..end {
