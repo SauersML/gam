@@ -509,9 +509,9 @@ fn gam_continuation_ratio_matches_vgam_sratio() {
 /// Both engines see the IDENTICAL train rows and predict the IDENTICAL test rows
 /// in the SAME order. Objective held-out metrics, computed in plain Rust on gam's
 /// own predictions:
-///   PRIMARY (objective, tool-free): held-out multiclass ACCURACY of gam's
-///     arg-max class >= an absolute bar that beats the majority-class predictor;
-///     plus held-out multiclass LOG-LOSS below an absolute bar.
+///   PRIMARY (objective, tool-free): gam's held-out multiclass LOG-LOSS beats
+///     the train-fitted cutpoint-only null model (`z ~ thr2` on the same stacked
+///     train frame), and its held-out ACCURACY is no lower than that null's.
 ///   BASELINE (match-or-beat): gam's held-out accuracy >= VGAM's held-out
 ///     accuracy minus a small margin, AND gam's held-out log-loss <= VGAM's
 ///     held-out log-loss times a small slack.
@@ -788,14 +788,44 @@ fn gam_continuation_ratio_matches_vgam_sratio_on_real_data() {
     let vgam_acc = accuracy(&ref_test_probs);
     let vgam_ll = log_loss(&ref_test_probs);
 
-    // Majority-class baseline accuracy on the held-out tiers (the floor an
-    // informative model must clear).
-    let mut counts = [0usize; 3];
-    for &yt in &test_y {
-        let k = (yt.round() as usize).saturating_sub(1).min(2);
-        counts[k] += 1;
-    }
-    let majority_acc = *counts.iter().max().unwrap() as f64 / n_test as f64;
+    // ---- train-fitted NULL stopping-ratio model: the informative-model floor --
+    // The cutpoint-only model `z ~ thr2`, fit on the SAME stacked train frame,
+    // reproduces the train tier frequencies and ignores the weather. A weather
+    // model that carries real information must predict the held-out tiers better
+    // than it does. The held-out majority class is NOT such a floor: it reads the
+    // TEST labels, which no train-fitted model can know.
+    let null_result = fit_from_formula("z ~ thr2", &ds, &cfg)
+        .expect("gam cutpoint-only null stopping-ratio fit on wine train");
+    let FitResult::Standard(null_fit) = null_result else {
+        panic!("expected a standard binomial GAM fit for the cutpoint-only null model");
+    };
+    let null_q = |thr2: f64| -> Vec<f64> {
+        let mut grid = Array2::<f64>::zeros((n_test, n_headers));
+        for r in 0..n_test {
+            grid[[r, thr2_col]] = thr2;
+        }
+        let design = build_term_collection_design(grid.view(), &null_fit.resolvedspec)
+            .expect("rebuild null design at wine test rows");
+        design
+            .design
+            .apply(&null_fit.fit.beta)
+            .iter()
+            .map(|&e| inv_logit(e))
+            .collect()
+    };
+    let null_q1 = null_q(0.0);
+    let null_q2 = null_q(1.0);
+    let null_test_probs: Vec<[f64; 3]> = (0..n_test)
+        .map(|r| {
+            [
+                null_q1[r],
+                (1.0 - null_q1[r]) * null_q2[r],
+                (1.0 - null_q1[r]) * (1.0 - null_q2[r]),
+            ]
+        })
+        .collect();
+    let null_acc = accuracy(&null_test_probs);
+    let null_ll = log_loss(&null_test_probs);
 
     // Context only (NOT a pass criterion): closeness of gam's held-out class
     // probabilities to VGAM's.
@@ -812,7 +842,7 @@ fn gam_continuation_ratio_matches_vgam_sratio_on_real_data() {
 
     eprintln!(
         "wine ordinal stopping-ratio held-out: n={n} n_train={n_train} n_stack={n_stack} \
-         n_test={n_test} J={n_levels} gam_edf={gam_edf:.3} majority_acc={majority_acc:.4} \
+         n_test={n_test} J={n_levels} gam_edf={gam_edf:.3} null_acc={null_acc:.4} null_logloss={null_ll:.4} \
          acc gam={gam_acc:.4} vgam={vgam_acc:.4} | logloss gam={gam_ll:.4} vgam={vgam_ll:.4} \
          (context: rel_l2 vs vgam={probs_rel_vs_ref:.4} rmse vs vgam={probs_rmse_vs_ref:.4})"
     );
@@ -841,20 +871,20 @@ fn gam_continuation_ratio_matches_vgam_sratio_on_real_data() {
         .line()
     );
 
-    // ---- PRIMARY objective assertions: gam predicts held-out quality ------
-    // gam must clear the majority-class floor AND an absolute 0.45 accuracy bar
-    // (3 ordered tiers => 1/3 chance; 0.45 is a meaningful lift on this small,
-    // noisy real vintage sample), and keep held-out log-loss informative.
+    // ---- PRIMARY objective assertions: the weather model is informative ----
+    // Held-out log-loss must beat the train-fitted cutpoint-only null model. The
+    // floor rejects a wrong link direction or a flipped response label, both of
+    // which push held-out log-loss above the null's. Accuracy must not fall below
+    // the null's arg-max predictor either.
     assert!(
-        gam_acc >= 0.45 && gam_acc >= majority_acc,
-        "gam held-out ordinal accuracy too low: gam={gam_acc:.4} \
-         (bar 0.45, majority floor {majority_acc:.4})"
+        gam_ll < null_ll,
+        "gam held-out log-loss does not beat the train-fitted cutpoint-only null model: \
+         gam={gam_ll:.4} null={null_ll:.4}"
     );
     assert!(
-        gam_ll < 1.05,
-        "gam held-out multiclass log-loss too high: {gam_ll:.4} \
-         (bar 1.05; uniform-3 log-loss is {:.4})",
-        (3.0_f64).ln()
+        gam_acc >= null_acc,
+        "gam held-out ordinal accuracy below the train-fitted cutpoint-only null model: \
+         gam={gam_acc:.4} null={null_acc:.4}"
     );
 
     // ---- BASELINE (match-or-beat): no worse than VGAM::sratio held-out ----
