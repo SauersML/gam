@@ -389,9 +389,9 @@ pub(crate) fn prepare_survival_location_scale_model(
             // constant-in-t direction, so the time block carries no location
             // intercept the gauge contract would attribute to it. Keep the
             // threshold (location) intercept here — it is the free location level
-            // b0, NOT aliased with the multiplicative scale constant nor with any
-            // time-warp constant (there is none) — mirroring why the constant
-            // log_sigma block keeps its intercept (`log_sigma_fixed_cols = 0`).
+            // b0, NOT aliased with any time-warp constant (there is none). The
+            // constant log-σ is the coordinate aliased with this level's scale, and
+            // `log_sigma_fixed_cols` below fixes it instead.
             // Dropping it (#736) left the raw covariate column to double as both
             // level and slope, pinning the covariate to a wrong-signed value.
             0
@@ -484,26 +484,33 @@ pub(crate) fn prepare_survival_location_scale_model(
     let non_intercept_start =
         infer_non_intercept_start_design(&log_sigma_prep.design_exit, &spec.weights)?;
     let log_sigma_full_ncols = log_sigma_prep.design_exit.ncols();
-    // The scale channel enters the survival location-scale likelihood as
-    // `z = (h(t) - eta_t(x)) / exp(eta_sigma)`: `eta_sigma` is MULTIPLICATIVE,
-    // not an additive predictor. The location predictor (`eta_t`) and the
-    // log-scale predictor (`eta_sigma`) are SEPARATELY identifiable even when
-    // they are spanned by the same covariate basis — they enter the likelihood
-    // through different sufficient statistics (the standardized residual `z`
-    // versus the `-log sigma` / `z²` curvature), exactly as in the Gaussian
-    // location-scale model. Residualizing the scale design against the location
-    // design — the former scale-deviation reparameterization — therefore
-    // imposes a spurious constraint: when `s(x)` drives BOTH channels, every
-    // scale column lies in the location design's span, the residual collapses to
-    // ~0, and the genuine heteroscedastic signal is erased. The flat identity
-    // audit then drops those zeroed columns from the reduced spec while the
-    // family keeps the full-width `x_log_sigma`, tripping
-    // `exact_newton_joint_gradient_evaluation`'s "joint gradient length mismatch
-    // for block 2" shape check. Identifiability across the location/scale blocks
-    // is instead supplied by `output_channel_assignment` (each block drives its
-    // own audit channel), so the scale design is kept RAW — an identity
-    // reparameterization — matching `identified_gaussian_log_sigma_design`.
-    let log_sigma_fixed_cols = 0usize;
+    // The row program forms the standardized residual `u = h(t) − η_t·e^{−η_σ}`
+    // and the event Jacobian `g = ḣ + e^{−η_σ}·(η_t·η̇_σ − η̇_t)`
+    // (`sls_row_program`): the scale divides only the location predictor, and
+    // outside the σ-scaled log-t baseline no `−log σ` term enters. Every row is
+    // then a function of `η_t·e^{−η_σ}` alone, so `(η_t, η_σ) → (c·η_t, η_σ + log c)`
+    // leaves the likelihood exactly unchanged for any `c > 0` while the threshold
+    // smoothing penalty falls as `c²`: the penalized inner problem has no finite
+    // minimizer along that ray (#2106 reports a joint-Newton residual growing
+    // 1.13× per cycle, every step accepted, no block penalty opposing the step).
+    // The constant column of the log-σ design is the ray's only coordinate, so it
+    // is fixed at zero and the threshold owns the scale. It stays free in two
+    // cases: the σ-scaled log-t baseline (`location_log_time_offset`, #892), whose
+    // Jacobian carries `−η_σ` and so identifies σ, and a threshold with a nonzero
+    // offset, which no `c ≠ 1` can rescale.
+    //
+    // The scale design is otherwise kept RAW, an identity reparameterization
+    // matching `identified_gaussian_log_sigma_design`. Residualizing it against
+    // the location design erased every scale column that shares the location's
+    // basis; the audit dropped those zeroed columns while the family kept the
+    // full-width `x_log_sigma`, and `exact_newton_joint_gradient_evaluation`
+    // refused the shape ("joint gradient length mismatch for block 2").
+    let threshold_scale_is_free = threshold_prep.offset.iter().all(|&value| value == 0.0);
+    let log_sigma_fixed_cols = if time_prepared.location_log_time_offset || !threshold_scale_is_free {
+        0
+    } else {
+        non_intercept_start.min(log_sigma_full_ncols)
+    };
     let scale_transform = ScaleDeviationTransform::identity(
         survival_primary_design.ncols(),
         log_sigma_prep.design_exit.ncols(),

@@ -2682,7 +2682,7 @@ fn prepare_model_assigns_distinct_descending_gauge_priorities() {
 }
 
 #[test]
-fn prepare_model_keeps_intercept_only_log_sigma_width() {
+fn prepare_model_fixes_the_constant_log_sigma_the_threshold_scale_aliases() {
     let n = 4usize;
     let derivative_guard = 1e-6;
     let spec = SurvivalLocationScaleSpec {
@@ -2730,11 +2730,18 @@ fn prepare_model_keeps_intercept_only_log_sigma_width() {
         cache_mirror_sessions: Vec::new(),
     };
 
+    // Outside the σ-scaled log-t baseline every row depends on `η_t·e^{−η_σ}`
+    // only, so the constant log-σ is exactly the `(η_t, η_σ) → (c·η_t, η_σ + log c)`
+    // ray: it is fixed and the log-σ block keeps no column.
     let prepared =
         prepare_survival_location_scale_model(&spec).expect("location-scale model prepares");
+    assert!(
+        prepared.family.location_log_time.is_none(),
+        "the fixture must not be the σ-scaled log-t regime, where −log σ identifies σ"
+    );
     assert_eq!(
-        prepared.log_sigma_fixed_cols, 0,
-        "constant log-sigma is a multiplicative free scale parameter and must not be dropped as an additive gauge"
+        prepared.log_sigma_fixed_cols, 1,
+        "the constant log-sigma is aliased with the threshold's scale and must be fixed"
     );
     assert_eq!(prepared.log_sigma_full_ncols, 1);
     let log_sigma = prepared
@@ -2742,11 +2749,23 @@ fn prepare_model_keeps_intercept_only_log_sigma_width() {
         .iter()
         .find(|block| block.name == "log_sigma")
         .expect("prepared model should contain log_sigma block");
-    assert_eq!(
-        log_sigma.design.ncols(),
-        1,
-        "intercept-only log_sigma must stay width 1 rather than canonicalizing to a zero-width block"
-    );
+    assert_eq!(log_sigma.design.ncols(), 0);
+
+    // A nonzero threshold offset cannot be rescaled by any c ≠ 1, so σ is
+    // identified and the constant log-σ stays free.
+    let mut offset_spec = spec.clone();
+    if let CovariateBlockKind::Static(block) = &mut offset_spec.threshold_block {
+        block.offset = Array1::from_elem(n, 0.5);
+    }
+    let prepared = prepare_survival_location_scale_model(&offset_spec)
+        .expect("location-scale model with a threshold offset prepares");
+    assert_eq!(prepared.log_sigma_fixed_cols, 0);
+    let log_sigma = prepared
+        .blockspecs
+        .iter()
+        .find(|block| block.name == "log_sigma")
+        .expect("prepared model should contain log_sigma block");
+    assert_eq!(log_sigma.design.ncols(), 1);
 }
 
 fn spec_from_dense_for_test(
