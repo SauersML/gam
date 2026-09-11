@@ -24,7 +24,7 @@ pub(crate) fn sas_log_delta_edge_barriercostgrad(raw_log_delta: f64) -> (f64, f6
     if w <= 0.0 || !raw_log_delta.is_finite() {
         return (0.0, 0.0);
     }
-    let b = sas_log_delta_bound().max(f64::EPSILON);
+    let b = sas_log_delta_bound();
     let u = raw_log_delta / b;
     let t = u.tanh();
     // `−w·ln(1 − t²) = 2w·ln cosh u`, in the form that never forms `1 − t²`
@@ -53,7 +53,7 @@ pub(crate) fn sas_epsilon_bound() -> f64 {
 
 #[inline]
 pub(crate) fn sas_effective_epsilon(raw_epsilon: f64) -> (f64, f64) {
-    let bound = sas_epsilon_bound().max(f64::EPSILON);
+    let bound = sas_epsilon_bound();
     let t = (raw_epsilon / bound).tanh();
     let epsilon = bound * t;
     let d_epsilon_d_raw = 1.0 - t * t;
@@ -62,7 +62,7 @@ pub(crate) fn sas_effective_epsilon(raw_epsilon: f64) -> (f64, f64) {
 
 #[inline]
 pub(crate) fn sas_effective_epsilon_second(raw_epsilon: f64) -> (f64, f64, f64) {
-    let bound = sas_epsilon_bound().max(f64::EPSILON);
+    let bound = sas_epsilon_bound();
     let t = (raw_epsilon / bound).tanh();
     let first = 1.0 - t * t;
     let second = -2.0 * t * first / bound;
@@ -75,7 +75,7 @@ pub(crate) fn sas_log_delta_edge_barriercostgradhess(raw_log_delta: f64) -> (f64
     if w <= 0.0 || !raw_log_delta.is_finite() {
         return (0.0, 0.0, 0.0);
     }
-    let b = sas_log_delta_bound().max(f64::EPSILON);
+    let b = sas_log_delta_bound();
     let u = raw_log_delta / b;
     let t = u.tanh();
     let ln_cosh_u = ln_cosh(u);

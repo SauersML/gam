@@ -838,7 +838,8 @@ struct SmoothBoundJet {
 /// would otherwise inject into the far-tail jet.
 #[inline]
 fn smooth_bound_jet(value: f64, bound: f64) -> SmoothBoundJet {
-    let b = bound.max(f64::EPSILON);
+    // Every caller passes a named positive bound constant.
+    let b = bound;
     let a = SPLICE_INTERIOR_FRAC * b; // interior half-width
     let l = 2.0 * (b - a); // splice width; c = a + l = (2 - frac) * b
     let ax = value.abs();

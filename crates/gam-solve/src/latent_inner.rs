@@ -264,8 +264,8 @@ impl<'a, A: ArrowSystemAssembler> LatentInnerSolver<'a, A> {
                 );
                 if let Ok((_, _, cache)) = solve_arrow_newton_step_with_options(
                     &system,
-                    ridge_t.max(1e-12),
-                    ridge_beta.max(1e-12),
+                    ridge_t,
+                    ridge_beta,
                     &solve_options,
                 ) {
                     last_cache = Some(cache);

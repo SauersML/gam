@@ -763,9 +763,12 @@ pub fn compute_envelopeaudit(
     let kkt_norm = kkt_residual_norm;
     let penalty_norm = referencegradient.dot(referencegradient).sqrt();
     let beta_norm = beta.dot(beta).sqrt();
-    let scale = penalty_norm.max((ridge_assumed.abs() * beta_norm).max(1e-12));
+    let scale = penalty_norm.max(ridge_assumed.abs() * beta_norm);
     let rel_kkt = if scale > 0.0 { kkt_norm / scale } else { 0.0 };
-    let ridge_mismatch = (ridge_used - ridge_assumed).abs() > 1e-12;
+    // Two ridges that agree inside the rounding band of the subtraction comparing
+    // them are the same ridge.
+    let ridge_mismatch = (ridge_used - ridge_assumed).abs()
+        > gam_linalg::roundoff::accumulation_band(2, ridge_used.abs() + ridge_assumed.abs());
     let kktviolation = kkt_norm > abs_tolerance && rel_kkt > rel_tolerance;
     let isviolated = kktviolation || ridge_mismatch;
 
