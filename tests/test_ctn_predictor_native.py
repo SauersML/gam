@@ -21,6 +21,19 @@ def test_standalone_ctn_schema_uses_fit_request(tmp_path, mode):
     assert np.isfinite(model.transformation_score(data)).all()
     posterior = json.loads(model.dumps())["payload"]["unified"]["geometry"]["constrained_posterior"]
     assert posterior["moment_status"] == "Available"
+    declined = json.loads(model.dumps())
+    for key in ("unified", "fit_result"):
+        fit = declined["payload"][key]
+        geometry = fit["geometry"]["constrained_posterior"]
+        geometry["moment_status"] = {"Declined": {
+            "ambient_precision_failure": "regression fixture",
+            "properness": {"CertificationFailed": {"reason": "regression fixture"}}}}
+        geometry["unconstrained_center"] = None
+        geometry["correction"] = None
+        fit["covariance_conditional"] = None
+        fit["covariance_corrected"] = None
+    with pytest.raises(gamfit.GamError, match="posterior-mean"):
+        gamfit.loads(json.dumps(declined).encode()).transformation_score(data)
 
 
 def test_native_ctn_chain_save_load_and_batches(tmp_path):
