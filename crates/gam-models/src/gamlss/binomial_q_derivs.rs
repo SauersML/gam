@@ -1131,5 +1131,85 @@ mod tests {
         gate.finish();
     }
 
+    /// #932 parity + not-slower pin for the #1591 order prune: the production
+    /// m1..m3 generic-link path composes a `Tower3<1>` twin
+    /// ([`binomial_neglog_q_derivatives_from_jet`]) instead of the full
+    /// `Tower4<1>` composition whose fourth channel nothing reads. Both sides
+    /// are jet lowerings of the same expression — there is no hand-vs-jet
+    /// claim here, and at K=1 the skipped fourth-order seeding is a
+    /// sub-nanosecond effect that timing noise can invert — so this cell
+    /// asserts the prune's real contracts: bit-identity on every read
+    /// channel, and — since it does strictly less arithmetic — not being
+    /// measurably the slower arm under the shared [`SpeedGate`].
+    #[test]
+    fn release_measure_binomial_q_tower3_prune_vs_tower4_932() {
+        use gam_math::paired_timing::{SpeedGate, batched, paired_interleaved};
 
+        let y = 0.7_f64;
+        let w = 1.3_f64;
+        let q0 = -0.6_f64;
+
+        let tower4_m123 = |q: f64| -> (f64, f64, f64) {
+            let (mu, d1, d2, d3, d4) = logit_jet(q);
+            if w == 0.0 || !binomial_mu_is_interior(mu) {
+                return (0.0, 0.0, 0.0);
+            }
+            let tower = binomial_loglik_q_tower(y, mu, d1, d2, d3, d4);
+            (-w * tower.g[0], -w * tower.h[0][0], -w * tower.t3[0][0][0])
+        };
+
+        // Parity pin on the exact benchmarked inputs: the prune is proven
+        // bit-identical on the read channels, so this is an equality check.
+        let (mu, d1, d2, d3, _) = logit_jet(q0);
+        let pruned = binomial_neglog_q_derivatives_from_jet(y, w, mu, d1, d2, d3);
+        let full = tower4_m123(q0);
+        assert_eq!(
+            pruned.0.to_bits(),
+            full.0.to_bits(),
+            "m1 prune bit-identity"
+        );
+        assert_eq!(
+            pruned.1.to_bits(),
+            full.1.to_bits(),
+            "m2 prune bit-identity"
+        );
+        assert_eq!(
+            pruned.2.to_bits(),
+            full.2.to_bits(),
+            "m3 prune bit-identity"
+        );
+
+        // Speed contract, release profile only (`SpeedGate::open` documents
+        // why). The prune does strictly less arithmetic than the full `Tower4`
+        // it prunes -- it drops the fourth-order channel and its cross terms --
+        // but on one variable that channel is one term of a row whose cost is
+        // the logit's exponential, and the saving sits below the instrument's
+        // resolution: 0.992, 1.003, 0.997 and 0.995 on four EPYC hosts, wins
+        // between 0.13 and 0.93. The 1.56x once measured here was one call per
+        // iteration, where the harness's own per-call cost was the arm. The
+        // contract is parity within resolution, `not_slower`, and the
+        // bit-identity pin above is what says the prune reads the same
+        // channels.
+        if cfg!(debug_assertions) {
+            return;
+        }
+        let mut gate = SpeedGate::open("BINOMIAL-Q-PRUNE-932");
+        let timing = paired_interleaved(
+            15,
+            5_000,
+            0x9320_09E1,
+            batched(64, |nudge| {
+                let (jet_mu, jet_d1, jet_d2, jet_d3, _) = logit_jet(q0 + nudge);
+                let (m1, m2, m3) =
+                    binomial_neglog_q_derivatives_from_jet(y, w, jet_mu, jet_d1, jet_d2, jet_d3);
+                m1 + m2 + m3
+            }),
+            batched(64, |nudge| {
+                let (m1, m2, m3) = tower4_m123(q0 + nudge);
+                m1 + m2 + m3
+            }),
+        );
+        gate.not_slower("m1..m3", &timing, "production_tower3", "full_tower4");
+        gate.finish();
+    }
 }
