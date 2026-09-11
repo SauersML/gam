@@ -3,7 +3,7 @@ use opt::{BacktrackConfig, armijo_roundoff_cushion, backtracking_line_search};
 
 use crate::manifold::{
     GeometryError, GeometryResult, RiemannianManifold, check_len, cholesky_spd, dot, flatten,
-    from_flat, inverse, jacobi_symmetric, spectral_map_spd, spectral_map_symmetric, sym,
+    from_flat, inverse, symmetric_eigen, spectral_map_spd, spectral_map_symmetric, sym,
     tangent_basis_metric_orthonormal,
 };
 
@@ -308,7 +308,7 @@ impl RiemannianManifold for SpdManifold {
         // divided-difference pullbacks need anyway.
         let p = self.matrix(point)?;
         let u = sym(&from_flat(tangent_vec, self.n, self.n)?);
-        let (p_evals, p_vecs) = jacobi_symmetric(&p)?;
+        let (p_evals, p_vecs) = symmetric_eigen(&p)?;
         for &lam in p_evals.iter() {
             if !(lam.is_finite() && lam > 0.0) {
                 return Err(GeometryError::InvalidPoint(
@@ -319,7 +319,7 @@ impl RiemannianManifold for SpdManifold {
         let sqrt_p = spectral_reconstruct(&p_vecs, &p_evals, f64::sqrt);
         let inv_sqrt_p = spectral_reconstruct(&p_vecs, &p_evals, |x| 1.0 / x.sqrt());
         let middle = sym(&fast_ab(&fast_ab(&inv_sqrt_p, &u), &inv_sqrt_p));
-        let (m_evals, m_vecs) = jacobi_symmetric(&middle)?;
+        let (m_evals, m_vecs) = symmetric_eigen(&middle)?;
         let exp_middle = spectral_reconstruct(&m_vecs, &m_evals, f64::exp);
 
         // Adjoint of the trailing `flatten(sym(·))`.

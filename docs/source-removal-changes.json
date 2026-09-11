@@ -801,5 +801,18 @@
     ],
     "reason": "#2469: BSS_SCORE_TOL (an absolute 1e-10) padded the BSS acceptance and tie-break, now the score rounding band with an exact tie-break; INTERACTION_NUMERICAL_FLOOR (a 1e-12 interaction fraction) is the squared rounding band of the interaction accumulation. monotonicity_constraints_cluster_spline_like_near_duplicates asserted the 1e-8 near-duplicate clustering that 72dca84ee removed and is restated to the exact-merge contract.",
     "evidence": "BSS_SCORE_TOL and INTERACTION_NUMERICAL_FLOOR are private to crates/gam-solve/src/row_sampling_measure.rs and crates/gam-terms/src/structure/anova_atom.rs, edited here. The renamed test lived in crates/gam-models/src/survival/base.rs; at f9a38e3 it failed against the exact merge (cargo test -p gam-models --lib -- survival::base on MSI lane c9: assertion left 4, right 2)."
+  },
+  {
+    "base": "fc994aeec68a4a4b4b95f2c24d0cbaed77359fc6",
+    "items": [
+      "crates/gam-geometry/src/manifold.rs:const:JACOBI_REL_TOL",
+      "crates/gam-geometry/src/manifold.rs:const:JACOBI_SWEEP_BUDGET",
+      "crates/gam-geometry/src/manifold.rs:fn:jacobi_converges_on_large_norm_spd",
+      "crates/gam-geometry/src/manifold.rs:fn:jacobi_handles_clustered_spectrum",
+      "crates/gam-geometry/src/manifold.rs:fn:jacobi_symmetric",
+      "crates/gam-terms/src/basis/duchon_thinplate.rs:const:KNOT_MAXIMIN_TIE_REL_TOL"
+    ],
+    "reason": "#2469: JACOBI_REL_TOL (1e-13) and JACOBI_SWEEP_BUDGET (64) were the stopping rule and rotation budget of a private Jacobi eigensolver, replaced by the workspace self-adjoint eigensolver and renamed symmetric_eigen with its callers and two tests; KNOT_MAXIMIN_TIE_REL_TOL (1e-9 relative to the squared radius) is the rotation round-off bound on squared distances.",
+    "evidence": "At the base, git grep finds jacobi_symmetric in crates/gam-geometry/src/manifold.rs, manifolds/grassmann.rs, manifolds/spd.rs and manifolds/conformance_tests.rs, and the two Jacobi constants and KNOT_MAXIMIN_TIE_REL_TOL only in their declaring files; every reference is updated here, and gam-geometry already depends on faer and gam-linalg."
   }
 ]

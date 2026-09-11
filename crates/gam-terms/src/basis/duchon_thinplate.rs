@@ -1932,19 +1932,6 @@ pub(crate) fn kernel_constraint_nullspace_from_matrix(
     Ok(z)
 }
 
-/// Relative tolerance (against the data's squared radius) below which two
-/// farthest-point candidates' maximin — or centroid — distances are treated as
-/// *tied* and resolved by the rotation/permutation-invariant support-distance
-/// profile rather than by their exact floating-point ordering.
-///
-/// A generic (non-90°) rigid rotation of the covariates re-expresses every
-/// coordinate with ~1 ulp of round-off, so the squared distances that drive the
-/// farthest-point recursion differ from their exact rotation-invariant values by
-/// ~`ε·‖x‖²`. This tolerance is set several orders of magnitude above that
-/// round-off floor yet far below any genuine gap between geometrically-distinct
-/// candidates, so it absorbs the sub-ulp perturbation without altering the
-/// selection on data whose maximin values are genuinely separated.
-const KNOT_MAXIMIN_TIE_REL_TOL: f64 = 1e-9;
 
 /// Deterministically selects thin-plate knots via farthest-point sampling.
 ///
@@ -2126,9 +2113,9 @@ fn select_thin_plate_knot_rows(
     // each of them by ~`ε·radius²`, so exact-equality tie-break gates let that
     // round-off — rather than the intended rotation-invariant key — decide
     // near-equidistant candidates, and a single flip cascades into a materially
-    // different knot set. `tie_tol` sits well above that round-off floor and far
-    // below any genuine maximin gap, so near-ties are consistently resolved by
-    // the invariant support-distance profile in every rotated frame.
+    // different knot set. `tie_tol` is the bound on that round-off itself, so
+    // near-ties are consistently resolved by the invariant support-distance
+    // profile in every rotated frame while genuine maximin gaps still decide.
     //
     // The scale is the squared radius ITSELF, with no floor (gam#2750). It used
     // to be `.max(1.0)`, which compares a squared LENGTH against the
@@ -2148,10 +2135,20 @@ fn select_thin_plate_knot_rows(
     // the squared radius, and the tolerance — so the comparisons are exactly
     // invariant. A degenerate cloud (all rows coincident) gives `radius² = 0` and
     // `tie_tol = 0`, which is the right test there: every squared distance is
-    // exactly zero, so exact equality already ties everything, and the previous
-    // `1e-9` tied exactly the same set.
+    // exactly zero, so exact equality already ties everything.
+    //
+    // The bound: a generic rotation re-expresses each coordinate through `d`
+    // rounded products, leaving at most `γ_d·max|x|` in it, and a squared distance
+    // of length at most `r` moves by at most `2·√d·r·2·√d·γ_d·max|x|` under such
+    // perturbations. It scales as `c²` with the data, like every distance it
+    // referees, and grows with the coordinates' offset exactly as the round-off does.
     let knot_scale2 = dist2_to_centroid.iter().copied().fold(0.0_f64, f64::max);
-    let tie_tol = KNOT_MAXIMIN_TIE_REL_TOL * knot_scale2;
+    let max_abs_coordinate = data.iter().fold(0.0_f64, |acc, value| acc.max(value.abs()));
+    let tie_tol = 4.0
+        * d as f64
+        * gam_linalg::roundoff::accumulation_growth(d)
+        * max_abs_coordinate
+        * knot_scale2.sqrt();
 
     // Seed = centroid-nearest row; near-equidistant rows (within `tie_tol`) are
     // resolved by the invariant support-distance profile so the seed is a

@@ -61,7 +61,7 @@ use ndarray::{Array1, Array2, ArrayView1};
 
 use crate::manifold::{
     GeometryError, GeometryResult, ManifoldSpec, RiemannianManifold, cholesky_spd, dot, flatten,
-    from_flat, jacobi_symmetric, norm, qr_thin,
+    from_flat, symmetric_eigen, norm, qr_thin,
 };
 
 // ---------------------------------------------------------------------------
@@ -322,7 +322,7 @@ fn grassmann_pair_conditioning(p: &Array1<f64>, q: &Array1<f64>, n: usize, k: us
     let z = from_flat(q.view(), n, k).expect("frame shape");
     let cross = y.t().dot(&z);
     let gram = cross.t().dot(&cross);
-    let (eigenvalues, _) = jacobi_symmetric(&gram).expect("symmetric k×k eigendecomposition");
+    let (eigenvalues, _) = symmetric_eigen(&gram).expect("symmetric k×k eigendecomposition");
     let smallest = eigenvalues.iter().fold(f64::INFINITY, |a, &b| a.min(b));
     smallest.max(0.0).sqrt()
 }

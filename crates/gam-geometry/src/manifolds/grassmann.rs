@@ -2,7 +2,7 @@ use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
 
 use crate::manifold::{
     GEOMETRY_EPS, GeometryError, GeometryResult, RiemannianManifold, check_len, dot, flatten,
-    from_flat, identity, inverse, jacobi_symmetric, projected_standard_basis_tangent, qr_thin, sym,
+    from_flat, identity, inverse, symmetric_eigen, projected_standard_basis_tangent, qr_thin, sym,
     thin_svd_gram,
 };
 use crate::manifolds::sphere::SphereManifold;
@@ -153,7 +153,7 @@ impl RiemannianManifold for GrassmannManifold {
         let normal = z - fast_ab(&y, &yt_z);
         let m = fast_ab(&normal, &inv);
         let gram = fast_atb(&m, &m);
-        let (evals, v) = jacobi_symmetric(&gram)?;
+        let (evals, v) = symmetric_eigen(&gram)?;
         let mut sigma = Array1::<f64>::zeros(self.k);
         // U = M·V scaled column-wise by 1/tan(σ_j) (M·V is n×k · k×k, carrying n).
         let m_v = fast_ab(&m, &v);
@@ -474,7 +474,7 @@ fn grassmann_exp_factors(
 ) -> GeometryResult<(Array1<f64>, Array2<f64>, Array2<f64>, Array2<f64>)> {
     use gam_linalg::faer_ndarray::fast_atb;
     let gram = sym(&fast_atb(delta, delta));
-    let (mut evals, vecs) = jacobi_symmetric(&gram)?;
+    let (mut evals, vecs) = symmetric_eigen(&gram)?;
     evals.mapv_inplace(|value| value.max(0.0));
     let cos_sqrt = symmetric_primary_reconstruct(&vecs, &evals, |lambda| lambda.sqrt().cos());
     let sinc_sqrt = symmetric_primary_reconstruct(&vecs, &evals, |lambda| sinc(lambda.sqrt()));

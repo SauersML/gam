@@ -768,108 +768,31 @@ pub(crate) fn inverse(a: &Array2<f64>) -> GeometryResult<Array2<f64>> {
     Ok(out)
 }
 
-/// Sweep budget multiplier for the classical Jacobi eigensolver: the iteration
-/// cap is `JACOBI_SWEEP_BUDGET · n²`. Classical (largest-off-diagonal) Jacobi
-/// converges quadratically once the off-diagonals are small, needing only a
-/// handful of full `O(n²)` sweeps; this generous multiple lets even clustered
-/// spectra finish while still failing loudly on a genuinely stalled matrix.
-const JACOBI_SWEEP_BUDGET: usize = 64;
-
-/// Relative off-diagonal convergence threshold for [`jacobi_symmetric`]: the
-/// largest off-diagonal magnitude must fall below `JACOBI_REL_TOL · ‖A‖_F`. Near
-/// `f64` precision so the diagonalization is accurate to working precision.
-const JACOBI_REL_TOL: f64 = 1.0e-13;
-
-pub(crate) fn jacobi_symmetric(a: &Array2<f64>) -> GeometryResult<(Array1<f64>, Array2<f64>)> {
-    let n = a.nrows();
-    if n != a.ncols() {
+/// Symmetric eigendecomposition of the symmetrized input through the workspace's
+/// one self-adjoint eigensolver (`gam_linalg::faer_ndarray::FaerEigh`); the
+/// eigenvectors are the columns of the returned matrix.
+///
+/// This replaced a private classical Jacobi sweep that stopped once the largest
+/// off-diagonal fell below `1e-13·‖A‖_F` within a `64·n²` rotation budget: one
+/// owner, and a backward-stable decomposition instead of a chosen stopping rule.
+pub(crate) fn symmetric_eigen(a: &Array2<f64>) -> GeometryResult<(Array1<f64>, Array2<f64>)> {
+    use faer::Side;
+    use gam_linalg::faer_ndarray::FaerEigh;
+    if a.nrows() != a.ncols() {
         return Err(GeometryError::InvalidPoint(
-            "Jacobi eigensolver requires square input",
+            "symmetric eigensolver requires square input",
         ));
     }
-    let mut d = sym(a);
-    let mut v = identity(n);
-    let max_iter = JACOBI_SWEEP_BUDGET * n.max(1) * n.max(1);
-    // Relative convergence threshold: the largest off-diagonal magnitude must
-    // fall to `1e-13 * ||A||_F`. A fixed absolute `1e-13` is meaningless for
-    // matrices whose scale is far from unity (a well-scaled large-norm matrix
-    // could never reach it; a tiny-norm matrix would "converge" trivially),
-    // and silently returning the partially-diagonalized state after exhausting
-    // `max_iter` hides genuine non-convergence (e.g. clustered/degenerate
-    // spectra that stall the classical sweep). The Frobenius norm is invariant
-    // under the orthogonal Jacobi rotations, so it is computed once from the
-    // symmetrized input.
-    let frob_norm = {
-        let mut acc = 0.0;
-        for i in 0..n {
-            for j in 0..n {
-                acc += d[[i, j]] * d[[i, j]];
-            }
-        }
-        acc.sqrt()
-    };
-    let threshold = JACOBI_REL_TOL * frob_norm;
-    let mut converged = false;
-    for _ in 0..max_iter {
-        let mut p = 0usize;
-        let mut q = 0usize;
-        let mut best = 0.0;
-        for i in 0..n {
-            for j in i + 1..n {
-                let val = d[[i, j]].abs();
-                if val > best {
-                    best = val;
-                    p = i;
-                    q = j;
-                }
-            }
-        }
-        // `best <= threshold` (rather than `<`) makes the exactly-diagonal and
-        // zero-norm cases (`best == threshold == 0`) converge immediately.
-        if best <= threshold {
-            converged = true;
-            break;
-        }
-        let tau = (d[[q, q]] - d[[p, p]]) / (2.0 * d[[p, q]]);
-        let t = tau.signum() / (tau.abs() + (1.0 + tau * tau).sqrt());
-        let c = 1.0 / (1.0 + t * t).sqrt();
-        let s = t * c;
-        for k in 0..n {
-            let dpk = d[[p, k]];
-            let dqk = d[[q, k]];
-            d[[p, k]] = c * dpk - s * dqk;
-            d[[q, k]] = s * dpk + c * dqk;
-        }
-        for k in 0..n {
-            let dkp = d[[k, p]];
-            let dkq = d[[k, q]];
-            d[[k, p]] = c * dkp - s * dkq;
-            d[[k, q]] = s * dkp + c * dkq;
-        }
-        for k in 0..n {
-            let vkp = v[[k, p]];
-            let vkq = v[[k, q]];
-            v[[k, p]] = c * vkp - s * vkq;
-            v[[k, q]] = s * vkp + c * vkq;
-        }
-    }
-    if !converged {
-        return Err(GeometryError::Singular(
-            "Jacobi eigensolver did not converge within max_iter (off-diagonal mass above 1e-13 * Frobenius norm)",
-        ));
-    }
-    let mut evals = Array1::<f64>::zeros(n);
-    for i in 0..n {
-        evals[i] = d[[i, i]];
-    }
-    Ok((evals, v))
+    sym(a)
+        .eigh(Side::Lower)
+        .map_err(|_| GeometryError::Singular("symmetric eigendecomposition failed"))
 }
 
 pub(crate) fn spectral_map_spd(
     a: &Array2<f64>,
     f: impl Fn(f64) -> GeometryResult<f64>,
 ) -> GeometryResult<Array2<f64>> {
-    let (evals, evecs) = jacobi_symmetric(a)?;
+    let (evals, evecs) = symmetric_eigen(a)?;
     let n = a.nrows();
     let mut diag = Array2::<f64>::zeros((n, n));
     for i in 0..n {
@@ -890,7 +813,7 @@ pub(crate) fn spectral_map_symmetric(
     a: &Array2<f64>,
     f: impl Fn(f64) -> GeometryResult<f64>,
 ) -> GeometryResult<Array2<f64>> {
-    let (evals, evecs) = jacobi_symmetric(a)?;
+    let (evals, evecs) = symmetric_eigen(a)?;
     let n = a.nrows();
     let mut diag = Array2::<f64>::zeros((n, n));
     for i in 0..n {
@@ -919,7 +842,7 @@ pub(crate) fn thin_svd_gram(
     use gam_linalg::faer_ndarray::{fast_ab, fast_atb};
     let (n, k) = y.dim();
     let gram = fast_atb(y, y);
-    let (evals, v) = jacobi_symmetric(&gram)?;
+    let (evals, v) = symmetric_eigen(&gram)?;
     let yv = fast_ab(y, &v);
     let mut sigma = Array1::<f64>::zeros(k);
     let mut u = Array2::<f64>::zeros((n, k));
@@ -1490,7 +1413,7 @@ mod matrix_log_tests {
 
 #[cfg(test)]
 mod jacobi_tests {
-    use super::{GeometryError, jacobi_symmetric};
+    use super::{GeometryError, symmetric_eigen};
     use ndarray::Array2;
 
     /// A large-norm SPD matrix has off-diagonal residuals after
@@ -1500,7 +1423,7 @@ mod jacobi_tests {
     /// convergence here and returns the correct spectrum instead of grinding
     /// through `max_iter` sweeps and silently returning a partial diagonal.
     #[test]
-    fn jacobi_converges_on_large_norm_spd() {
+    fn symmetric_eigen_converges_on_large_norm_spd() {
         // Q diag(1e8, 2e8, 3e8) Qᵀ for an orthogonal Q built from a planar
         // rotation in the (0,1) plane; eigenvalues are huge so the matrix
         // norm is ~1e8 and any absolute 1e-13 off-diagonal test is hopeless.
@@ -1518,7 +1441,7 @@ mod jacobi_tests {
         }
         let a = q.dot(&diag).dot(&q.t());
 
-        let (evals, evecs) = jacobi_symmetric(&a).expect("large-norm SPD must converge");
+        let (evals, evecs) = symmetric_eigen(&a).expect("large-norm SPD must converge");
         let mut sorted: Vec<f64> = evals.to_vec();
         sorted.sort_by(|x, y| x.partial_cmp(y).unwrap());
         // Bound source: `JACOBI_REL_TOL = 1.0e-13`, the solver's OWN convergence
@@ -1561,7 +1484,7 @@ mod jacobi_tests {
     /// relative threshold being so tight that ordinary near-degenerate SPD
     /// inputs trip the new non-convergence error.
     #[test]
-    fn jacobi_handles_clustered_spectrum() {
+    fn symmetric_eigen_handles_clustered_spectrum() {
         // diag(5, 5, 1) rotated in the (0,2) plane; the degenerate pair stays
         // degenerate under rotation.
         let theta = 0.4_f64;
@@ -1578,7 +1501,7 @@ mod jacobi_tests {
         }
         let a = q.dot(&diag).dot(&q.t());
 
-        let (evals, evecs) = jacobi_symmetric(&a).expect("clustered SPD must converge");
+        let (evals, evecs) = symmetric_eigen(&a).expect("clustered SPD must converge");
         let mut sorted: Vec<f64> = evals.to_vec();
         sorted.sort_by(|x, y| x.partial_cmp(y).unwrap());
         assert!((sorted[0] - 1.0).abs() <= 1.0e-12);
@@ -1608,7 +1531,7 @@ mod jacobi_tests {
         let mut a = Array2::<f64>::eye(3);
         a[[0, 1]] = f64::NAN;
         a[[1, 0]] = f64::NAN;
-        match jacobi_symmetric(&a) {
+        match symmetric_eigen(&a) {
             Err(GeometryError::Singular(_)) => {}
             other => panic!("expected Singular non-convergence error, got {other:?}"),
         }
