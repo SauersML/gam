@@ -12,6 +12,7 @@ def test_native_ctn_chain_save_load_and_batches(tmp_path):
     data = pd.DataFrame({"pgs": 2 + .4 * x + z, "x": x,
                          "y": (rng.normal(size=n) < -.2 + .3 * x + .5 * z).astype(int),
                          "group": np.arange(n)})
+    data["irrelevant_date"] = pd.Timestamp("2020-01-01")
     model = gamfit.fit(
         data, "y ~ x", family="bernoulli-marginal-slope", slope_formula="1",
         transformation_normal_stage1=gamfit.CtnStage1(
@@ -26,11 +27,27 @@ def test_native_ctn_chain_save_load_and_batches(tmp_path):
     np.testing.assert_allclose(restored.predict(test), before, rtol=1e-8, atol=1e-10)
     np.testing.assert_allclose(restored.predict(test.iloc[::-1]), before[::-1], rtol=1e-8, atol=1e-10)
     np.testing.assert_allclose(restored.predict(test.iloc[[3]]), before[[3]], rtol=1e-8, atol=1e-10)
-    from gamfit._ctn_model import _with_score
-    manual = restored.outcome.predict(_with_score(test, restored.transform.transformation_score(test)))
+    import json
+    payload = json.loads(restored.dumps())
+    transform_payload = payload["payload"]["score_transform"]
+    payload["payload"]["score_transform"] = None
+    payload["payload"]["score_crossfit_folds"] = None
+    outcome = gamfit.loads(json.dumps(payload).encode())
+    # Explicit application uses the same saved native CTN evaluator.
+    manual = outcome.predict(test.assign(__gamfit_ctn_score=restored.transformation_score(test)))
     np.testing.assert_allclose(manual, before, rtol=1e-8, atol=1e-10)
-    for payload in (model.outcome.dumps(), restored.outcome.dumps()):
-        import json
-        saved = json.loads(payload)["payload"]
+    assert transform_payload["score_transform"] is None
+    transform = gamfit.loads(json.dumps({"model_type": "transformation-normal", "payload": transform_payload}).encode())
+    attached = gamfit.fit(
+        data, "y ~ x", family="bernoulli-marginal-slope", slope_formula="1",
+        transformation_normal_stage1=transform,
+        persistent_warm_start_root=tmp_path / "warm-attached")
+    np.testing.assert_allclose(attached.transformation_score(test), transform.transformation_score(test),
+                               rtol=1e-8, atol=1e-10)
+    attached.save(tmp_path / "attached.gamfit")
+    np.testing.assert_allclose(gamfit.load(tmp_path / "attached.gamfit").predict(test),
+                               attached.predict(test), rtol=1e-8, atol=1e-10)
+    for state in (model.dumps(), restored.dumps()):
+        saved = json.loads(state)["payload"]
         assert saved.get("latent_z_rank_int_calibration") is None
         assert saved.get("latent_z_conditional_calibration") is None

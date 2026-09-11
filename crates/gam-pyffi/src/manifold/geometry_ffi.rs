@@ -4964,6 +4964,8 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(build_model_predict_payload_json, module)?)?;
     module.add_function(wrap_pyfunction!(predict_table, module)?)?;
     module.add_function(wrap_pyfunction!(transformation_score_table, module)?)?;
+    module.add_function(wrap_pyfunction!(ctn_required_fit_columns, module)?)?;
+    module.add_function(wrap_pyfunction!(required_model_columns, module)?)?;
     module.add_function(wrap_pyfunction!(predict_table_conformal, module)?)?;
     // #1054: exact Gaussian jackknife+ conformal intervals (no calibration fold).
     module.add_function(wrap_pyfunction!(predict_table_jackknife_plus, module)?)?;

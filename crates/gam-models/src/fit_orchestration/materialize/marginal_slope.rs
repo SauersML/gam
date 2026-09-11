@@ -88,16 +88,11 @@ pub(crate) fn materialize_bernoulli_marginal_slope<'a>(
         .slope_formula
         .as_deref()
         .ok_or_else(|| "Bernoulli marginal-slope requires slope_formula".to_string())?;
-    // `z_column` is OPTIONAL when a CTN Stage-1 recipe is present: the calibrated
-    // chain produces `z` out-of-fold from the cross-fitted CTN, so there is no
-    // raw dose column to read (and no throwaway pre-fit column — that round-trip
-    // is what the no-slop cutover removes, #461). Without a recipe, the primitive
-    // standalone marginal-slope still requires a raw `z_column` dose.
+    // Native CTN composition supplies its generated score before materialization.
     let z_column = config.z_column.as_deref();
-    if z_column.is_none() && config.ctn_stage1.is_none() {
+    if z_column.is_none() {
         return Err(WorkflowError::InvalidConfig {
-            reason: "Bernoulli marginal-slope requires z_column (or a CTN Stage-1 recipe via \
-                     ctn_stage1, which produces z by cross-fitting)"
+            reason: "Bernoulli marginal-slope materialization requires z_column"
                 .to_string(),
         });
     }
@@ -187,30 +182,13 @@ pub(crate) fn materialize_bernoulli_marginal_slope<'a>(
         parsed_slope.linkwiggle.as_ref(),
     )?;
 
-    // Auto-enable Neyman-orthogonal, cross-fitted score calibration when a CTN
-    // Stage-1 recipe is present (design §5). Cross-fitting yields out-of-fold `z`
-    // (the calibrated dose, with no raw column read) and the score-influence
-    // Jacobian `J`, absorbed by Stage-2 as the realized leakage-projection block.
-    // With no CTN Stage-1 recipe, `z` is the raw dose column and the free-warp
-    // `score_warp` is the fallback basis.
-    let (z, score_influence_jacobian) =
-        match crossfit_score_calibration(data, col_map, config.ctn_stage1.as_ref(), &policy)
-            .map_err(|reason| WorkflowError::IntegrationFailed { reason })?
-        {
-            Some(calibration) => (calibration.z_oof, Some(calibration.jac_oof)),
-            None => {
-                // No recipe ⇒ a raw z_column is required (guarded above) and read here.
-                let z_column = z_column.expect("z_column presence checked when ctn_stage1 is None");
-                let z_idx = resolve_role_col(col_map, z_column, "z")?;
-                let z = data.values.column(z_idx).to_owned();
-                validate_bernoulli_marginal_slope_z_column_variance(
-                    z_column,
-                    z.view(),
-                    weights.view(),
-                )?;
-                (z, None)
-            }
-        };
+    // CTN composition is completed by the shared fitted-model service before
+    // ordinary outcome materialization. No influence Jacobian is installed.
+    let z_column = z_column.ok_or("marginal-slope materialization requires a score column")?;
+    let z_idx = resolve_role_col(col_map, z_column, "z")?;
+    let z = data.values.column(z_idx).to_owned();
+    validate_bernoulli_marginal_slope_z_column_variance(z_column, z.view(), weights.view())?;
+    let score_influence_jacobian = None;
 
     let spec = BernoulliMarginalSlopeTermSpec {
         y,

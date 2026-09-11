@@ -1013,7 +1013,7 @@ fn issue_789_transformation_normal_rejects_marginal_slope_controls_before_dispat
 }
 
 #[test]
-fn bernoulli_marginal_slope_ctn_stage1_recipe_only_dispatches_to_bms_issue_2139() {
+fn ctn_composition_requires_the_complete_fitted_model_service() {
     let data = workflow_test_dataset();
     let recipe = CtnStage1Recipe::new(
         "z",
@@ -1031,11 +1031,11 @@ fn bernoulli_marginal_slope_ctn_stage1_recipe_only_dispatches_to_bms_issue_2139(
 
     let err = materialize("event ~ bmi", &data, &config)
         .err()
-        .expect("recipe-only BMS request should reach BMS validation");
+        .expect("a composed fit cannot be reduced to one materialized block");
     let msg = err.to_string();
     assert!(
-        msg.contains("Bernoulli marginal-slope requires slope_formula"),
-        "recipe-only BMS request should fail with BMS-specific validation, got: {msg}"
+        msg.contains("CTN composition requires fit_from_formula"),
+        "materialization must direct CTN callers to the complete model service: {msg}"
     );
     assert!(
         !msg.contains("unknown family"),

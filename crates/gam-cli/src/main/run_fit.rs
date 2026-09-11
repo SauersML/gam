@@ -268,6 +268,15 @@ pub(crate) fn run_fit(args: FitArgs) -> Result<(), String> {
     let formula_text = resolved_invocation.formula;
     let fit_config = resolved_invocation.fit_config;
     let parsed = parse_formula(&formula_text)?;
+    if fit_config.ctn_stage1.is_some() || fit_config.frozen_ctn.is_some() {
+        let out = args.out.as_ref().ok_or("CTN fitting requires --out")?;
+        let required = gam::inference::ctn::required_fit_columns(&formula_text, &fit_config)?;
+        let dataset = load_fit_dataset_with_roles(&args.data, &required.into_iter().collect::<Vec<_>>(), &parsed, false)?;
+        let payload = gam::inference::model_payload_builders::fit_formula_to_payload(formula_text, &dataset, &fit_config)
+            .map_err(|error| error.to_string())?;
+        let model = FittedModel::from_payload(payload);
+        return write_model_json(out, &model);
+    }
     validate_fit_args_preflight(&args, &parsed, &fit_config)?;
     let formula_link = parsed.linkspec.clone();
     let effective_link_arg = formula_link.as_ref().map(|s| s.link.clone());

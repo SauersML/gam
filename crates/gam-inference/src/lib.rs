@@ -39,7 +39,7 @@ pub mod gpu_polya_gamma;
 pub mod polya_gamma;
 pub mod posterior;
 pub use gam_models::inference::{
-    full_conformal, generative, model, model_extension, model_payload_builders, predict_io,
+    ctn, full_conformal, generative, model, model_extension, model_payload_builders, predict_io,
 };
 pub use gam_terms::inference::formula_dsl;
 pub mod probability;

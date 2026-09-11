@@ -38,13 +38,18 @@ const DEFAULT_LEARNED_FRAILTY_SCALE: FrailtyScale = FrailtyScale::Learned { init
 
 impl CtnStage1Document {
     fn into_recipe(self) -> Result<CtnStage1Recipe, String> {
-        CtnStage1Recipe::new(
+        let mut recipe = CtnStage1Recipe::new(
             &self.response_column,
             &self.covariate_formula_rhs,
             resolve_ctn_config(self.config)?,
             self.weight_column.as_deref(),
             self.offset_column.as_deref(),
-        )
+        )?;
+        recipe.fold_column = self.fold_column;
+        recipe.group_column = self.group_column;
+        recipe.folds = self.folds;
+        recipe.seed = self.seed;
+        Ok(recipe)
     }
 }
 
@@ -226,6 +231,12 @@ pub fn resolve_fit_request_config(
     }
     if let Some(stage1) = json_config.ctn_stage1 {
         fit_config.ctn_stage1 = Some(stage1.into_recipe()?);
+    }
+    if let Some(value) = json_config.frozen_ctn {
+        let model: gam_models::inference::model::FittedModel = serde_json::from_value(value)
+            .map_err(|error| format!("invalid frozen CTN: {error}"))?;
+        model.validate_for_persistence().map_err(|error| error.to_string())?;
+        fit_config.frozen_ctn = Some(gam_models::inference::ctn::FrozenCtn(Box::new(model.payload().clone())));
     }
     fit_config.link = json_config.link;
     if let Some(flag) = json_config.flexible_link {

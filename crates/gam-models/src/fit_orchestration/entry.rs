@@ -1327,6 +1327,12 @@ pub fn fit_from_formula_with_notes(
     data: &Dataset,
     config: &FitConfig,
 ) -> Result<FormulaFitResult, WorkflowError> {
+    if config.ctn_stage1.is_some() || config.frozen_ctn.is_some() {
+        let payload = crate::inference::model_payload_builders::fit_formula_to_payload(
+            formula.to_string(), data, config)?;
+        return Ok(FormulaFitResult { inference_notes: payload.inference_notes.clone(),
+                                    result: FitResult::Ctn(Box::new(payload)) });
+    }
     let mut config = config
         .clone()
         .resolve()
@@ -2389,6 +2395,10 @@ pub fn materialize<'a>(
     data: &'a Dataset,
     config: &FitConfig,
 ) -> Result<MaterializedModel<'a>, WorkflowError> {
+    if config.ctn_stage1.is_some() || config.frozen_ctn.is_some() {
+        return Err(WorkflowError::InvalidConfig { reason:
+            "CTN composition requires fit_from_formula or fit_formula_to_payload".into() });
+    }
     materialize_impl(formula, data, config, false)
 }
 

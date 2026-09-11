@@ -405,18 +405,13 @@ pub(crate) fn materialize_survival<'a>(
                 == SurvivalLikelihoodMode::MarginalSlope,
         },
     );
-    // Alias `z` to the dose column for the marginal termspec only when a raw
-    // z_column is supplied. With a CTN Stage-1 recipe there is no dose column
-    // (z is produced out-of-fold by cross-fitting) and the marginal formula
-    // references only the x covariates, so no alias is needed.
+    // CTN composition supplies its generated score before materialization.
     let marginal_slope_aliased_col_map = if survival_mode == SurvivalLikelihoodMode::MarginalSlope {
         match config.z_column.as_deref() {
             Some(z_column) => Some(column_map_with_alias(col_map, "z", z_column)),
-            None if config.ctn_stage1.is_some() => None,
             None => {
                 return Err(WorkflowError::InvalidConfig {
-                    reason: "marginal-slope survival requires z_column in FitConfig (or a CTN \
-                             Stage-1 recipe via ctn_stage1, which produces z by cross-fitting)"
+                    reason: "marginal-slope survival materialization requires z_column"
                         .to_string(),
                 });
             }
@@ -545,20 +540,13 @@ pub(crate) fn materialize_survival<'a>(
             smooth_terms: vec![],
         }
     };
-    // `z_column` is OPTIONAL for the survival marginal-slope when a CTN Stage-1
-    // recipe is present: the calibrated chain produces the single `z` surface
-    // out-of-fold from the cross-fitted CTN, so there is no raw dose column to
-    // read (no throwaway pre-fit column — the no-slop cutover, #461). Without a
-    // recipe, the primitive standalone survival marginal-slope still requires a
-    // raw `z_column` dose.
+    // Both supplied and CTN-generated scores have an explicit column here.
     let marginal_z_column_name = if survival_mode == SurvivalLikelihoodMode::MarginalSlope {
         match config.z_column.as_deref() {
             Some(name) => Some(name),
-            None if config.ctn_stage1.is_some() => None,
             None => {
                 return Err(WorkflowError::InvalidConfig {
-                    reason: "marginal-slope survival requires z_column in FitConfig (or a CTN \
-                             Stage-1 recipe via ctn_stage1, which produces z by cross-fitting)"
+                    reason: "marginal-slope survival materialization requires z_column"
                         .to_string(),
                 });
             }
@@ -751,32 +739,8 @@ pub(crate) fn materialize_survival<'a>(
     // request closure below. When active it replaces the (single) CTN-generated
     // z surface with its out-of-fold value and captures the score-influence
     // Jacobian `J` for Stage-2's leakage-projection block. With no CTN Stage-1
-    // recipe, the raw z surfaces stand and `score_warp` is the fallback basis.
-    let crossfit_calibration = if survival_mode == SurvivalLikelihoodMode::MarginalSlope {
-        crossfit_score_calibration(data, col_map, config.ctn_stage1.as_ref(), &policy)
-            .map_err(|reason| WorkflowError::IntegrationFailed { reason })?
-    } else {
-        None
-    };
-    let (marginal_z, marginal_slope_jac_oof) = match (marginal_z, crossfit_calibration) {
-        (Some(mut z_surfaces), Some(calibration)) => {
-            // A CTN Stage-1 chain produces exactly one latent score surface; the
-            // OOF projection is defined against that single column.
-            if z_surfaces.ncols() != 1 {
-                return Err(WorkflowError::InvalidConfig {
-                    reason: format!(
-                        "cross-fitted score calibration applies to a single CTN-generated z \
-                         surface, but the survival marginal-slope model has {} z surfaces; \
-                         multi-surface slope is incompatible with the CTN Stage-1 chain",
-                        z_surfaces.ncols()
-                    ),
-                });
-            }
-            z_surfaces.column_mut(0).assign(&calibration.z_oof);
-            (Some(z_surfaces), Some(calibration.jac_oof))
-        }
-        (z, _) => (z, None),
-    };
+    // CTN composition now supplies a frozen score before this materializer.
+    let marginal_slope_jac_oof = None;
 
     if survival_mode == SurvivalLikelihoodMode::MarginalSlope {
         if parsed.linkwiggle.is_some() {

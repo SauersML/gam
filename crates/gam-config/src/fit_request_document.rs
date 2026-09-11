@@ -87,6 +87,8 @@ pub struct FitRequestConfigDocument {
     pub baseline_target: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ctn_stage1: Option<CtnStage1Document>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frozen_ctn: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub transformation_normal_config: Option<CtnStage1ConfigDocument>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -310,6 +312,10 @@ impl SmoothDescriptorsDocument {
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct CtnStage1Document {
+    pub fold_column: Option<String>,
+    pub group_column: Option<String>,
+    pub folds: usize,
+    pub seed: u64,
     pub response_column: String,
     pub covariate_formula_rhs: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]

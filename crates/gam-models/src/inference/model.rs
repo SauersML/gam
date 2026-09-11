@@ -62,7 +62,7 @@ use std::path::Path;
 // exclusive fit representation (`UnifiedFitResult`, spline scan, residual
 // cascade). Readers must never guess it from optional working evidence or
 // prediction-time reconstruction grids.
-pub const MODEL_PAYLOAD_VERSION: u32 = 15;
+pub const MODEL_PAYLOAD_VERSION: u32 = 16;
 
 /// Coefficient parameterization of a saved transformation-normal (CTN) fit.
 ///
@@ -354,6 +354,10 @@ impl TransformationScoreCalibration {
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct FittedModelPayload {
+    /// Frozen CTN replayed on the observed raw score before outcome prediction.
+    pub score_transform: Option<Box<FittedModelPayload>>,
+    /// Row-aligned nuisance folds, absent for an externally fitted transform.
+    pub score_crossfit_folds: Option<Vec<usize>>,
     pub version: u32,
     pub formula: String,
     pub model_kind: ModelKind,
@@ -943,6 +947,8 @@ impl FittedModelPayload {
             transformation_geometry: None,
             transformation_cone_carrier: None,
             transformation_score_calibration: None,
+            score_transform: None,
+            score_crossfit_folds: None,
             resolved_termspec: None,
             resolved_termspec_noise: None,
             resolved_slopespec: None,
@@ -3403,6 +3409,15 @@ impl FittedModel {
                 )?;
             }
         }
+        if let Some(transform) = payload.score_transform.as_ref() {
+            if let Some(z) = payload.z_column.as_ref() {
+                required.remove(z);
+            }
+            let transform = FittedModel::from_payload((**transform).clone());
+            required.extend(transform.prediction_required_columns()?);
+            let parsed = parse_formula(&transform.formula).map_err(|error| error.to_string())?;
+            required.insert(parsed.response);
+        }
         Ok(required)
     }
 
@@ -4320,6 +4335,21 @@ impl FittedModel {
         // MODEL_PAYLOAD_VERSION constant — every payload must round-trip
         // identically between writers and readers running the same schema.
         self.validate_payload_version()?;
+        if self.score_transform.is_none() && self.score_crossfit_folds.is_some() {
+            return Err(FittedModelError::SchemaMismatch { reason: "CTN folds require a saved score transform".into() });
+        }
+        if let Some(payload) = self.score_transform.as_ref() {
+            if !matches!(self.predict_model_class(), PredictModelClass::BernoulliMarginalSlope | PredictModelClass::Survival)
+                || self.z_column.as_deref() != Some("__gamfit_ctn_score") {
+                return Err(FittedModelError::SchemaMismatch { reason: "saved CTN requires its marginal-slope outcome score input".into() });
+            }
+            let transform = FittedModel::from_payload((**payload).clone());
+            if transform.score_transform.is_some()
+                || transform.predict_model_class() != PredictModelClass::TransformationNormal {
+                return Err(FittedModelError::SchemaMismatch { reason: "score_transform must be a standalone CTN".into() });
+            }
+            transform.validate_for_persistence()?;
+        }
         if let (Some(fit_result), Some(unified)) =
             (self.fit_result.as_ref(), self.unified.as_ref())
             && fit_result.training_sample_size() != unified.training_sample_size()
