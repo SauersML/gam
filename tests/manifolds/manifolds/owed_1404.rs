@@ -81,12 +81,16 @@ fn kappa_one_kernel_is_exact_great_circle_1404() {
         [2.0 * x / s, 2.0 * y / s, (1.0 - r2) / s]
     };
     for i in 0..pts.nrows() {
-        // Exact-zero self-distance. The model kernel is `ℓ·expm1(−d/ℓ)` (#2747:
-        // the `−1` is annihilated by the sum-to-zero frame), so the diagonal is
-        // exactly zero. A cancellation-prone `acos(p·q)` reference would give
-        // `d ≈ 2e-4` and a diagonal near `−2e-4` instead.
+        // Self-distance at round-off. The model kernel is `ℓ·expm1(−d/ℓ)` (#2747:
+        // the `−1` is annihilated by the sum-to-zero frame), and the great-circle
+        // distance `atan2(|p×p|, p·p)` of a point to itself is the norm of a cross
+        // product whose exact value is zero, so the computed diagonal carries only
+        // the rounding of that product: a few ulps of the unit embedding
+        // (measured −5.97e−17). A cancellation-prone `acos(p·q)` reference would
+        // give `d ≈ 2e-4` and a diagonal near `−2e-4`, twelve orders above.
+        let self_distance_roundoff = 64.0 * f64::EPSILON * LENGTH_SCALE.max(1.0);
         assert!(
-            k[(i, i)] == 0.0,
+            k[(i, i)].abs() <= self_distance_roundoff,
             "great-circle self-distance not zero: K[{i},{i}] = {} (acos cancellation?)",
             k[(i, i)]
         );
