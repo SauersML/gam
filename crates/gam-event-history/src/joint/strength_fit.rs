@@ -542,6 +542,7 @@ mod tests {
                 log_standard_error: 0.0,
                 effective_samples: 1.0 / sum(weights.iter().map(|w| w * w)),
                 inner_log_error_estimate: 0.01,
+                log_weights: shift.iter().map(|v| v - log_total).collect(),
                 weights,
                 coefficient_mean: vec![0.0; 2],
                 coefficient_variance: vec![1.0; 2],

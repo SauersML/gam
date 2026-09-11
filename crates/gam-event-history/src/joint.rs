@@ -29,8 +29,8 @@ pub use cohort::{
     EvidenceHessianProduct, GuidedCoefficientProposal, JointCoefficientEvidence,
     JointCoefficientInference, JointCoefficientIntegral, JointCohortEvaluation,
     JointCohortIntegration, JointCohortPosterior, JointCohortResolutionReport, JointCohortScore,
-    JointPriorScore, JointStrengthOptimum, ResolvedCohortScore, StrengthOptimizationOptions,
-    StrengthResolutionReport,
+    JointPriorScore, JointStrengthOptimum, PredictiveDensityOptions, PredictiveHistoryDensity,
+    ResolvedCohortScore, StrengthOptimizationOptions, StrengthResolutionReport,
 };
 pub use decoder_prior::DecoderPriorEvaluation;
 pub use function_prior::{

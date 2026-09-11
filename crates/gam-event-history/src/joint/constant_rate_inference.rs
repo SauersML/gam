@@ -90,6 +90,60 @@ struct RateStatistic {
     gamma: [f64; 3],
 }
 
+struct RateStatistics {
+    log_exposure: Vec<f64>,
+    counts: Vec<usize>,
+    genetic_density: f64,
+}
+
+impl ConstantRatePosterior {
+    pub(super) fn predictive_log_density(
+        &self,
+        additional: &JointCohortIntegration<'_, '_>,
+        memory_limit_bytes: usize,
+    ) -> Result<f64, EventHistoryError> {
+        if additional.model.spec.signatures != 0
+            || additional.model.spec.baseline_columns != 1
+            || !additional.model.spec.measurements.is_empty()
+            || additional.subjects.iter().any(|s| {
+                s.history
+                    .baseline_design
+                    .column(0)
+                    .iter()
+                    .any(|&x| x != 1.0)
+            })
+        {
+            return Err(invalid(
+                "constant-rate prediction requires the same unit-intercept model",
+            ));
+        }
+        let stats = additional.constant_rate_statistics(memory_limit_bytes)?;
+        let Some(gamma) = &self.gamma else {
+            return Ok(if stats.counts.iter().any(|&n| n > 0) {
+                f64::NEG_INFINITY
+            } else {
+                stats.genetic_density
+            });
+        };
+        let log_density = stats.genetic_density
+            + sum(gamma.iter().enumerate().map(|(d, g)| {
+                // Integer event counts give an exact finite log-Gamma ratio.
+                // This avoids cancellation between two large log-Gamma values.
+                let event_factor =
+                    sum((0..stats.counts[d]).map(|j| (g.shape + j as f64).ln() - g.log_rate));
+                event_factor
+                    - (g.shape + stats.counts[d] as f64)
+                        * emission::softplus(&(stats.log_exposure[d] - g.log_rate))
+            }));
+        if !log_density.is_finite() {
+            return Err(numerical(
+                "constant-rate predictive density is unrepresentable",
+            ));
+        }
+        Ok(log_density)
+    }
+}
+
 fn log_add(a: f64, b: f64) -> f64 {
     if a == f64::NEG_INFINITY {
         return b;
@@ -130,15 +184,12 @@ fn evidence(statistics: &[RateStatistic], log_c: f64) -> (f64, f64, f64) {
 }
 
 impl JointCohortIntegration<'_, '_> {
-    pub(super) fn infer_constant_rates(
+    fn constant_rate_statistics(
         &self,
-        priors: &JointFunctionPriors<'_>,
-        options: &CoefficientInferenceOptions,
-    ) -> Result<ConstantRatePosterior, EventHistoryError> {
+        memory_limit_bytes: usize,
+    ) -> Result<RateStatistics, EventHistoryError> {
         let d = self.model.spec.marks.len();
-        if d.checked_mul(256)
-            .is_none_or(|n| n > options.pilot.memory_limit_bytes)
-        {
+        if d.checked_mul(256).is_none_or(|n| n > memory_limit_bytes) {
             return Err(invalid(
                 "constant-rate inference exceeds its statistics/posterior memory budget",
             ));
@@ -192,6 +243,24 @@ impl JointCohortIntegration<'_, '_> {
                 "constant-rate sufficient statistics are unrepresentable",
             ));
         }
+        Ok(RateStatistics {
+            log_exposure,
+            counts,
+            genetic_density,
+        })
+    }
+
+    pub(super) fn infer_constant_rates(
+        &self,
+        priors: &JointFunctionPriors<'_>,
+        options: &CoefficientInferenceOptions,
+    ) -> Result<ConstantRatePosterior, EventHistoryError> {
+        let d = self.model.spec.marks.len();
+        let RateStatistics {
+            log_exposure,
+            counts,
+            genetic_density,
+        } = self.constant_rate_statistics(options.pilot.memory_limit_bytes)?;
         if log_exposure.iter().all(|&x| x == f64::NEG_INFINITY) {
             return Err(numerical(
                 "baseline-level evidence is unidentified without risk exposure",
@@ -511,6 +580,32 @@ mod tests {
                 assert!((result.log_evidence() - observed_genetics).abs() < 1e-12);
                 assert_eq!(posterior.no_event_probability(&[1e300; 3]).unwrap(), 1.0);
                 assert_eq!(posterior.iterations(), 0);
+                let mut event_history = history.clone();
+                event_history.events[2] = Some(0);
+                let new_subjects = [model
+                    .integration(
+                        &theta,
+                        &event_history,
+                        &[0.0; 15],
+                        None,
+                        &IntegrationOptions::default(),
+                        &mut rng,
+                    )
+                    .unwrap()];
+                let additional = model
+                    .cohort_integration(&new_subjects, &references, &[0])
+                    .unwrap();
+                let prediction = cohort
+                    .predictive_history_density(
+                        &result,
+                        &additional,
+                        &accuracy,
+                        &tolerance,
+                        &PredictiveDensityOptions::default(),
+                    )
+                    .unwrap();
+                assert_eq!(prediction.log_density(), f64::NEG_INFINITY);
+                assert_eq!(prediction.log_error_estimate(), 0.0);
             } else {
                 assert!(!posterior.is_zero_rate());
                 assert!(posterior.iterations() > 0);

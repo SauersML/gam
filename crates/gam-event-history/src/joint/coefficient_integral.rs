@@ -7,7 +7,7 @@ use super::*;
 mod inference;
 pub use inference::{
     CoefficientInferenceOptions, CoefficientRefinementRound, ConstantRatePosterior,
-    JointCoefficientInference,
+    JointCoefficientInference, PredictiveDensityOptions, PredictiveHistoryDensity,
 };
 #[path = "strength_fit.rs"]
 mod strength_fit;
@@ -43,6 +43,9 @@ pub struct JointCoefficientEvidence {
     effective_samples: f64,
     inner_log_error_estimate: f64,
     weights: Vec<f64>,
+    /// Preserve tiny weights for later predictive likelihood ratios: a new
+    /// history can make an underflowing training weight relevant again.
+    log_weights: Vec<f64>,
     coefficient_mean: Vec<f64>,
     coefficient_variance: Vec<f64>,
     mean_standard_error: Vec<f64>,
@@ -215,6 +218,9 @@ impl JointCoefficientIntegral<'_, '_> {
         for w in &mut weights {
             *w /= total;
         }
+        for log_weight in &mut log_weights {
+            *log_weight -= log_total + total.ln();
+        }
         let effective_samples = 1.0 / sum(weights.iter().map(|w| w * w));
         // sqrt(n/(n-1)*sum (normalized_weight-1/n)^2), avoiding the
         // cancellation in n*sum(w^2)-1 for an almost exact proposal.
@@ -244,6 +250,7 @@ impl JointCoefficientIntegral<'_, '_> {
             effective_samples,
             inner_log_error_estimate: self.inner_log_error_estimate,
             weights,
+            log_weights,
             coefficient_mean,
             coefficient_variance,
             mean_standard_error,

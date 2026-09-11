@@ -585,6 +585,57 @@ observed genetic density with a missing correlated score, and change time
 units by factors of `1e100` and `1e-100`. These are model/numerical checks;
 they do not establish external calibration or complete signature selection.
 
+### Coefficient-integrated predictive history densities
+
+`JointCohortIntegration::predictive_history_density` evaluates the joint
+observation density of an additional cohort under the fitted coefficient
+distribution:
+
+```text
+p(H_new | D, learned strengths)
+    = integral p(H_new | theta) p(theta | D, learned strengths) d theta.
+```
+
+The additional subjects are conditionally independent of training subjects
+given the model parameters. Training histories must not be supplied again.
+The method checks the inference's training-cohort identity, the additional
+cohort's model, and reuse of the training reference populations. At each
+coefficient draw it regenerates the corresponding reference moments and
+resolves the complete additional-cohort likelihood under those moments.
+Thus each latent integral uses the same coefficient/reference state. The
+sampled route rejects unsupported reference horizons. The analytic
+constant-rate route needs no finite reference horizon because its normalizer
+is identically one.
+
+Several additional subjects share uncertain coefficients. Their joint
+predictive density is an average of their joint likelihood, not the product
+of separately averaged subject predictions. The test demonstrates the
+difference using an independently known Gamma posterior. For constant rates,
+Gamma integration handles both new events and event-free exposure exactly,
+including the marginal density of partially observed genetics. An event
+under the zero-rate posterior has log predictive density negative infinity.
+
+For a sampled coefficient law, let `w_i` be normalized training weights and
+`v_i` their normalized values after multiplying by the additional likelihood.
+The conditional coefficient Monte Carlo standard error of the log predictive
+density is `sqrt(n/(n-1) sum_i (v_i-w_i)^2)`. This retains the shared numerator
+and denominator error: a constant added likelihood has zero coefficient
+sampling error. Log training weights are retained even when their ordinary
+weights underflow, since a later likelihood can make those draws relevant.
+Training and new-history likelihood errors are not independent over
+coefficient draws. The reported error estimate adds twice the training
+log-likelihood error estimate and the maximum additional-cohort error to the
+requested multiple of the coefficient standard error. The numerical error
+target and effective coefficient sample requirement must both pass.
+
+This returns a density in the model's observation measure. It is not a
+terminal-survival curve, a cumulative-incidence forecast, or a conditional
+forecast obtained by averaging coefficient-specific likelihood ratios.
+Conditioning on a new subject's earlier outcomes requires the corresponding
+joint predictive numerator and denominator. General future-path integration,
+the reference-conditioned entry law, standalone serialization, and unified
+Python/CLI serving remain unfinished.
+
 Training may use a structured variational approximation with local Gaussian
 state factors and temporal precision blocks, plus shared parameter factors.
 This avoids a Cartesian latent grid; it does not make the posterior Gaussian

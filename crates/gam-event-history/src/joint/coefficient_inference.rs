@@ -6,6 +6,9 @@ use rand::Rng;
 #[path = "constant_rate_inference.rs"]
 mod constant_rates;
 pub use constant_rates::ConstantRatePosterior;
+#[path = "coefficient_prediction.rs"]
+mod prediction;
+pub use prediction::{PredictiveDensityOptions, PredictiveHistoryDensity};
 
 #[derive(Clone, Debug, Default)]
 pub struct CoefficientInferenceOptions {
@@ -66,6 +69,7 @@ enum CoefficientLaw<'p, 'm> {
 /// retain independently assessed importance draws. Posterior means remain
 /// the reporting target in both cases.
 pub struct JointCoefficientInference<'p, 'm> {
+    cohort_identity: std::sync::Arc<()>,
     law: CoefficientLaw<'p, 'm>,
 }
 
@@ -215,10 +219,12 @@ impl JointCohortIntegration<'_, '_> {
                 options,
             )?;
             return Ok(JointCoefficientInference {
+                cohort_identity: std::sync::Arc::clone(&self.identity),
                 law: CoefficientLaw::ConstantRates(self.infer_constant_rates(priors, options)?),
             });
         }
         Ok(JointCoefficientInference {
+            cohort_identity: std::sync::Arc::clone(&self.identity),
             law: CoefficientLaw::Sampled(self.infer_sampled_coefficients(
                 priors,
                 initial_coefficients,
@@ -567,6 +573,170 @@ mod tests {
             result.evidence().log_evidence(),
             exact_evidence,
             result.rounds().last().unwrap().resolution
+        );
+        // Serving uses the inferred coefficient law, not its mean. A whole
+        // additional cohort shares those coefficients, so its joint density
+        // must not be computed as a product of separately averaged densities.
+        let new_history = JointHistory {
+            events: vec![None; 17],
+            ..history.clone()
+        };
+        let new_history2 = new_history.clone();
+        let new_banks = [
+            model
+                .integration(
+                    &seed,
+                    &new_history,
+                    &[0.0; 17],
+                    None,
+                    &IntegrationOptions::default(),
+                    &mut rng,
+                )
+                .unwrap(),
+            model
+                .integration(
+                    &seed,
+                    &new_history2,
+                    &[0.0; 17],
+                    None,
+                    &IntegrationOptions::default(),
+                    &mut rng,
+                )
+                .unwrap(),
+        ];
+        let additional = model
+            .cohort_integration(&new_banks[..1], &references, &[0])
+            .unwrap();
+        let both = model
+            .cohort_integration(&new_banks, &references, &[0, 0])
+            .unwrap();
+        let predictive_options = PredictiveDensityOptions {
+            log_error_tolerance: 0.2,
+            ..PredictiveDensityOptions::default()
+        };
+        let exact_prediction = cohort
+            .predictive_history_density(
+                &exact,
+                &additional,
+                &accuracy,
+                &tolerance,
+                &predictive_options,
+            )
+            .unwrap();
+        let direct = 8.0 * (8.0_f64 / 15.0).ln();
+        assert!((exact_prediction.log_density() - direct).abs() < 1e-12);
+        assert!(exact_prediction.coefficient_log_standard_error().is_none());
+        assert!(exact_prediction.effective_coefficient_samples().is_none());
+        assert_eq!(exact_prediction.log_error_estimate(), 0.0);
+        let joint_prediction = cohort
+            .predictive_history_density(&exact, &both, &accuracy, &tolerance, &predictive_options)
+            .unwrap();
+        assert!((joint_prediction.log_density() - 8.0 * (4.0_f64 / 11.0).ln()).abs() < 1e-12);
+        assert!(joint_prediction.log_density() - 2.0 * exact_prediction.log_density() > 1.0);
+        let mut event_history = new_history.clone();
+        event_history.events[4] = Some(0);
+        event_history.events[12] = Some(0);
+        let event_banks = [model
+            .integration(
+                &seed,
+                &event_history,
+                &[0.0; 17],
+                None,
+                &IntegrationOptions::default(),
+                &mut rng,
+            )
+            .unwrap()];
+        let event_cohort = model
+            .cohort_integration(&event_banks, &references, &[0])
+            .unwrap();
+        let event_prediction = cohort
+            .predictive_history_density(
+                &exact,
+                &event_cohort,
+                &accuracy,
+                &tolerance,
+                &predictive_options,
+            )
+            .unwrap();
+        let b = 32.0_f64 / 7.0;
+        assert!(
+            (event_prediction.log_density()
+                - (72.0_f64.ln() - 2.0 * b.ln() - 10.0 * (4.0 / b).ln_1p()))
+            .abs()
+                < 1e-12
+        );
+        let sampled = JointCoefficientInference {
+            cohort_identity: std::sync::Arc::clone(&cohort.identity),
+            law: CoefficientLaw::Sampled(result),
+        };
+        let prediction = cohort
+            .predictive_history_density(
+                &sampled,
+                &additional,
+                &accuracy,
+                &tolerance,
+                &predictive_options,
+            )
+            .unwrap();
+        let target = 8.0 * (rate / (rate + 4.0)).ln();
+        assert!(
+            (prediction.log_density() - target).abs()
+                < 5.0 * prediction.coefficient_log_standard_error().unwrap()
+        );
+        let other = model
+            .cohort_integration(&subjects, &references, &[0])
+            .unwrap();
+        assert!(
+            other
+                .predictive_history_density(
+                    &sampled,
+                    &additional,
+                    &accuracy,
+                    &tolerance,
+                    &predictive_options
+                )
+                .is_err()
+        );
+        assert!(
+            cohort
+                .predictive_history_density(
+                    &sampled,
+                    &cohort,
+                    &accuracy,
+                    &tolerance,
+                    &predictive_options
+                )
+                .is_err()
+        );
+        let insufficient = PredictiveDensityOptions {
+            memory_limit_bytes: 1,
+            ..predictive_options.clone()
+        };
+        assert!(
+            cohort
+                .predictive_history_density(
+                    &sampled,
+                    &additional,
+                    &accuracy,
+                    &tolerance,
+                    &insufficient
+                )
+                .is_err()
+        );
+        let unresolved = PredictiveDensityOptions {
+            log_error_tolerance: 1e-12,
+            ..predictive_options
+        };
+        assert!(
+            cohort
+                .predictive_history_density(
+                    &sampled,
+                    &additional,
+                    &accuracy,
+                    &tolerance,
+                    &unresolved
+                )
+                .is_err()
         );
     }
 }

@@ -14,7 +14,8 @@ pub use coefficients::{
     CoefficientImportanceDraw, CoefficientInferenceOptions, CoefficientRefinementRound,
     ConstantRatePosterior, EvidenceHessianProduct, JointCoefficientEvidence,
     JointCoefficientInference, JointCoefficientIntegral, JointStrengthOptimum,
-    StrengthOptimizationOptions, StrengthResolutionReport,
+    PredictiveDensityOptions, PredictiveHistoryDensity, StrengthOptimizationOptions,
+    StrengthResolutionReport,
 };
 
 /// A fixed sampled objective. Subject banks must have independent importance
