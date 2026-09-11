@@ -255,8 +255,18 @@ mod tests {
         let outcome =
             run_sae_manifold_certify(certify_request(target.clone(), term, rho, pin, provenance))
                 .expect("converged replay audit");
-        let SaeExternalCertificationOutcome::Certified(report) = outcome else {
-            panic!("a natively converged exact replay must pass the zero-step audit");
+        let report = match outcome {
+            SaeExternalCertificationOutcome::Certified(report) => report,
+            SaeExternalCertificationOutcome::NonStationary(report) => panic!(
+                "a natively converged exact replay must pass the zero-step audit; it was refused: \
+                 {} (inner KKT certifies: {}, outer projected gradient {:?} against bound {:?}, \
+                 {} optimization iterations)",
+                report.reason,
+                report.inner.certifies(),
+                report.outer_projected_gradient_norm,
+                report.outer_stationarity_bound,
+                report.optimization_iterations
+            ),
         };
         assert!(matches!(
             report.outer_termination.verdict,
