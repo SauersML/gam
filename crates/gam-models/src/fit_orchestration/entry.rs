@@ -1240,6 +1240,7 @@ fn exact_gaussian_boundary(
     let p = x.ncols();
     let mut penalty_faces = vec![DeterministicPenaltyFace::Zero; design.penalties.len()];
     let mut infinite_face_penalty = Array2::<f64>::zeros((p, p));
+    let mut restricted_certification = false;
     for (penalty_index, block) in design.penalties.iter().enumerate() {
         let r = block.col_range.clone();
         if r.is_empty()
@@ -1278,18 +1279,109 @@ fn exact_gaussian_boundary(
                 .sum::<f64>();
             value.is_finite() && value.abs() <= gamma * operand_scale
         });
-        if annihilates {
+        // The dot-product bound above prices only the rounding of `S_k β`, not
+        // the error β carries from its normal-equation solve. On a square,
+        // ill-conditioned design (`n = p`, #2355) that solve error alone can
+        // exceed the bound, so an exact line reports a roughness penalty that
+        // does not annihilate it and the fit interpolates at EDF = p. Uniqueness
+        // of β is certified above (full column rank on the positive-weight
+        // support), so the response is reproduced on `null(S_k)` if and only if
+        // β itself lies there: a certified restricted solve is then an exact
+        // annihilation witness, and aliasing cannot make it disagree with β.
+        let reproduced_on_null_space = !annihilates && {
+            let null_basis = embedded_penalty_null_basis(p, r.clone(), &block.local)
+                .map_err(|reason| WorkflowError::IntegrationFailed {
+                    reason: format!(
+                        "deterministic Gaussian candidate could not resolve penalty \
+                         {penalty_index}'s null space: {reason}"
+                    ),
+                })?;
+            exact_gaussian_coefficients(
+                &x,
+                &adjusted_response,
+                request.weights.as_ref(),
+                Some(&null_basis),
+            )
+            .is_some()
+        };
+        restricted_certification |= reproduced_on_null_space;
+        if annihilates || reproduced_on_null_space {
             penalty_faces[penalty_index] = DeterministicPenaltyFace::Infinite;
             infinite_face_penalty
                 .slice_mut(ndarray::s![r.clone(), r])
                 .scaled_add(1.0, &block.local);
         }
     }
+    // A face certified only by its restricted solve leaves β carrying the
+    // full-design solve error in that face's range, while the boundary geometry
+    // treats β as lying in every infinite-face null space (its penalty
+    // quadratic is exactly zero). Re-solve on the joint tangent space
+    // `null(S_infinite)`: uniqueness makes it the same coefficient in exact
+    // arithmetic, and a joint solve that does not certify declines the route.
+    let beta = if restricted_certification {
+        let joint_null_basis = embedded_penalty_null_basis(p, 0..p, &infinite_face_penalty)
+            .map_err(|reason| WorkflowError::IntegrationFailed {
+                reason: format!(
+                    "deterministic Gaussian candidate could not resolve the joint \
+                     infinite-face null space: {reason}"
+                ),
+            })?;
+        let Some(tangent_beta) = exact_gaussian_coefficients(
+            &x,
+            &adjusted_response,
+            request.weights.as_ref(),
+            Some(&joint_null_basis),
+        ) else {
+            return Ok(None);
+        };
+        tangent_beta
+    } else {
+        beta
+    };
 
     Ok(Some(ExactGaussianBoundary {
         beta,
         penalty_faces,
     }))
+}
+
+/// Columns spanning `null(S)` for one block-local PSD penalty embedded in the
+/// full `p`-coefficient frame. Every coordinate outside `range` is free; the
+/// block's own null directions come from its spectrum at the same relative
+/// rank floor `deterministic_gaussian_standard_fit` uses for an infinite face.
+fn embedded_penalty_null_basis(
+    p: usize,
+    range: std::ops::Range<usize>,
+    local: &Array2<f64>,
+) -> Result<Array2<f64>, String> {
+    use gam_linalg::faer_ndarray::FaerEigh;
+    let symmetric = (local + &local.t().to_owned()) * 0.5;
+    let (eigenvalues, eigenvectors) = symmetric
+        .eigh(faer::Side::Lower)
+        .map_err(|error| format!("penalty spectrum: {error}"))?;
+    let largest = eigenvalues
+        .iter()
+        .fold(0.0_f64, |largest, &value| largest.max(value.abs()));
+    let rank_floor = f64::EPSILON * (range.len().max(1) as f64) * largest;
+    let null_directions: Vec<usize> = eigenvalues
+        .iter()
+        .enumerate()
+        .filter_map(|(index, &value)| (value <= rank_floor).then_some(index))
+        .collect();
+    let outside = p - range.len();
+    let mut basis = Array2::<f64>::zeros((p, outside + null_directions.len()));
+    let mut column = 0usize;
+    for coordinate in (0..range.start).chain(range.end..p) {
+        basis[[coordinate, column]] = 1.0;
+        column += 1;
+    }
+    for &direction in &null_directions {
+        for (offset, coordinate) in range.clone().enumerate() {
+            basis[[coordinate, column]] = eigenvectors[[offset, direction]];
+        }
+        column += 1;
+    }
+    Ok(basis)
 }
 
 fn try_deterministic_gaussian_standard_fit(
