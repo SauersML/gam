@@ -276,20 +276,27 @@ where
             let upper_trace_sq = trace_factor_quadratic_square(factor, &upper_inv);
             let lower_score = lower_trace_sq / lower_denom - lower_trace;
             let upper_score = upper_trace_sq / upper_denom + upper_trace;
+            // Each trace accumulates `rows·dim·(dim+1)` rounded products and each score
+            // adds a quotient and a sum: scores that agree inside that accumulation's
+            // band over both sides satisfy the BSS condition to working precision.
+            let score_band =
+                gam_linalg::roundoff::accumulation_growth(factor.nrows() * dim * (dim + 1) + 2)
+                    * ((lower_trace_sq / lower_denom).abs()
+                        + lower_trace.abs()
+                        + (upper_trace_sq / upper_denom).abs()
+                        + upper_trace.abs());
             if lower_score.is_finite()
                 && upper_score.is_finite()
                 && lower_score > 0.0
                 && upper_score > 0.0
-                && lower_score + BSS_SCORE_TOL >= upper_score
+                && lower_score + score_band >= upper_score
             {
                 match chosen {
                     None => chosen = Some((row, lower_score, upper_score)),
-                    Some((best_row, best_lower, best_upper)) => {
-                        let gap = lower_score - upper_score;
-                        let best_gap = best_lower - best_upper;
-                        if gap > best_gap + BSS_SCORE_TOL
-                            || ((gap - best_gap).abs() <= BSS_SCORE_TOL && row < best_row)
-                        {
+                    Some((_, best_lower, best_upper)) => {
+                        // Rows are visited in increasing order, so a tie keeps the
+                        // earlier row.
+                        if lower_score - upper_score > best_lower - best_upper {
                             chosen = Some((row, lower_score, upper_score));
                         }
                     }
@@ -918,8 +925,6 @@ const DESIGNED_SAMPLE_SALT: u64 = 0x73AD_0987_5EED_D51F;
 /// Salt mixed into the enrichment seed so the offset hash is distinct from any
 /// other `splitmix64_hash` use of the same numeric seed elsewhere in the crate.
 const ENRICHMENT_SALT: u64 = 0x980E_1C45_F00D_AC70;
-
-const BSS_SCORE_TOL: f64 = 1e-10;
 
 /// Per-row Fisher mass `tr(M_n)` from the metric's criterion-facing traces.
 ///

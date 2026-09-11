@@ -791,5 +791,15 @@
     ],
     "reason": "#2469: six declared tolerances. AUX_LEVEL_DEDUP_TOL (1e-12) is exact deduplication of integer-valued levels; MATERN_NU_HALF_INTEGER_TOL (1e-9) is equality with exactly representable half-integers; GRID_COINCIDENCE_TOLERANCE (1e-12) is exact coincidence, the interval branch being continuous at the grid point; PSI_BAND_BISECTION_ATOL (1e-10) is bisection to adjacent floats; MOBIUS_DENOM_EPS (1e-14) is the Mobius denominator rounding band; AUTO_OUTER_DISTINCT_STEP_L2_TOL (1e-10) is the rounding band of the key distance.",
     "evidence": "At the base, git grep finds each name only in the one file that declares it (gam-identifiability kernel.rs, gam-terms smooth_overrides.rs, gam-models survival/predict.rs, gam-solve psi_gram_tensor.rs, gam-geometry manifolds/constant_curvature.rs, gam-models marginal_slope_shared.rs), and this commit replaces every use there."
+  },
+  {
+    "base": "58bcaab77c9a74ba907644359ac209e1105ba6c8",
+    "items": [
+      "crates/gam-models/src/survival/base.rs:fn:monotonicity_constraints_cluster_spline_like_near_duplicates",
+      "crates/gam-solve/src/row_sampling_measure.rs:const:BSS_SCORE_TOL",
+      "crates/gam-terms/src/structure/anova_atom.rs:const:INTERACTION_NUMERICAL_FLOOR"
+    ],
+    "reason": "#2469: BSS_SCORE_TOL (an absolute 1e-10) padded the BSS acceptance and tie-break, now the score rounding band with an exact tie-break; INTERACTION_NUMERICAL_FLOOR (a 1e-12 interaction fraction) is the squared rounding band of the interaction accumulation. monotonicity_constraints_cluster_spline_like_near_duplicates asserted the 1e-8 near-duplicate clustering that 72dca84ee removed and is restated to the exact-merge contract.",
+    "evidence": "BSS_SCORE_TOL and INTERACTION_NUMERICAL_FLOOR are private to crates/gam-solve/src/row_sampling_measure.rs and crates/gam-terms/src/structure/anova_atom.rs, edited here. The renamed test lived in crates/gam-models/src/survival/base.rs; at f9a38e3 it failed against the exact merge (cargo test -p gam-models --lib -- survival::base on MSI lane c9: assertion left 4, right 2)."
   }
 ]
