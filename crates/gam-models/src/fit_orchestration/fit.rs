@@ -1894,13 +1894,45 @@ fn optimize_survival_transformation_smoothing(
         )?;
         // The envelope gradient exists only at a certified beta optimum. A
         // finite exhausted state is a checkpoint, not a derivative-bearing
-        // objective sample; return typed inner non-convergence so the generic
-        // outer bridge can retreat from this rho without fabricating a cost or
+        // objective sample, so refuse this trial point and let the generic
+        // outer bridge retreat from this rho without fabricating a cost or a
         // zero gradient.
+        //
+        // The refusal carries the solve's real terminal status. Mapping every
+        // non-`Converged` status to `PirlsDidNotConverge { max_iterations }`
+        // printed "did not converge within 400 iterations" for solves that had
+        // stopped after 2 to 9 iterations on a numerical plateau
+        // (`LmStepSearchExhausted`, exact decrement just above its threshold),
+        // pointing diagnosis at a budget that was never spent (#2705, #1561).
+        // Both variants grade as the same trial-point retreat
+        // (`EstimationError::is_trial_point_infeasible`, one table since #2593).
         if !survival_pirls_status_is_certified(summary.status) {
-            return Err(gam_solve::estimate::EstimationError::PirlsDidNotConverge {
-                max_iterations: opts.max_iterations,
-                last_change: summary.lastgradient_norm,
+            // The exact decrement is the half of the certificate a plateau exit
+            // misses by, so the refusal reports it on the same monotonicity rows,
+            // curvature correction and deviance scale the LAML gate uses.
+            let decrement = gam_solve::pirls::exact_newton_decrement_evidence(
+                &summary.state,
+                summary.beta.as_ref(),
+                candidate.monotonicity_linear_constraints().as_ref(),
+                gam_solve::pirls::WorkingModel::objective_hessian_matrix_correction(&candidate),
+                gam_solve::pirls::WorkingModel::penalized_deviance_scale(&candidate)?,
+            );
+            let decrement_note = match decrement.decrement_sq {
+                Some(decrement_sq) => format!("{decrement_sq:.3e}"),
+                None => "unavailable (the face curvature did not factorize)".to_string(),
+            };
+            return Err(gam_solve::estimate::EstimationError::TrialPointRefused {
+                reason: format!(
+                    "survival transformation inner P-IRLS at this trial rho ended with status \
+                     {:?} after {} of {} iteration(s) (projected gradient norm {:.6e}, exact \
+                     Newton decrement {decrement_note} against threshold {:.3e}) without a strict \
+                     convergence certificate; no envelope gradient exists at this rho",
+                    summary.status,
+                    summary.iterations,
+                    opts.max_iterations,
+                    summary.lastgradient_norm,
+                    decrement.threshold,
+                ),
             });
         }
         let beta = summary.beta.as_ref().to_owned();
