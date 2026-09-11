@@ -47,6 +47,14 @@ on:
         description: "pytest -k expression. Empty = skip Python."
         default: ""
         required: false
+      py_path:
+        description: "Repository-relative Python test file or directory to collect."
+        default: "tests"
+        required: false
+      py_timeout_seconds:
+        description: "Execution-only Python test budget; excludes runtime build/install."
+        default: "600"
+        required: false
       torch_filter:
         description: "pytest -k expr over tests/torch (pip-installs CPU torch). Empty = skip torch."
         default: ""
@@ -414,7 +422,17 @@ jobs:
       - name: Run Python tests (filtered, fail-fast)
         if: ${{ github.event.inputs.py_filter != '' }}
         working-directory: ${{ runner.temp }}
-        run: python -m pytest "${{ github.workspace }}/tests/" -k "${{ github.event.inputs.py_filter }}" -p no:cacheprovider -x -q --tb=short
+        env:
+          TEST_PATH: ${{ github.event.inputs.py_path || 'tests' }}
+          TEST_FILTER: ${{ github.event.inputs.py_filter }}
+          TEST_BUDGET: ${{ github.event.inputs.py_timeout_seconds || '600' }}
+        run: |
+          set -euo pipefail
+          [[ "$TEST_PATH" == tests || "$TEST_PATH" == tests/* ]]
+          [[ "$TEST_PATH" != *..* && "$TEST_BUDGET" =~ ^[1-9][0-9]*$ ]]
+          timeout --signal=TERM --kill-after=5s "${TEST_BUDGET}s" \
+            python -m pytest "$GITHUB_WORKSPACE/$TEST_PATH" -k "$TEST_FILTER" \
+            -p no:cacheprovider -x -q --tb=short
 
       # ---- torch path (opt-in; only when a torch_filter was given) ----------
       - name: Install CPU torch wheel

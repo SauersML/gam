@@ -6,9 +6,9 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-_EXAMPLES = Path(__file__).resolve().parent.parent / "examples"
-if str(_EXAMPLES) not in sys.path:
-    sys.path.insert(0, str(_EXAMPLES))
+_EXPERIMENTS = Path(__file__).resolve().parent.parent / "experiments"
+if str(_EXPERIMENTS) not in sys.path:
+    sys.path.insert(0, str(_EXPERIMENTS))
 
 import compose_artifact_schema as cas  # noqa: E402
 
