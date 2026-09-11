@@ -332,7 +332,6 @@ mod tests {
         let p = 256usize;
         let k_router = 32_000usize; // frontier width: floor ≈ 0.11
         let n_signal = 40usize; // rare — 1 % of rows
-        let signal_amp = 6.0; // strong on the rows it fires
         let noise = 1.0; // diffuse bulk
 
         let mut ctr = 1u64;
@@ -353,8 +352,16 @@ mod tests {
             }
         }
         // Plant the rank-1 signal on the first n_signal rows (rare, high energy).
+        //
+        // #2822: the screen stratifies rows into factor-of-two energy bands, so "high
+        // energy" means above the bulk's band. A bulk row carries about p·noise² of energy;
+        // a `6·N(0, 1)` amplitude added ~36 to rows of ~256 and left every planted row in
+        // the bulk's band, where no stratum can clear the floor. Amplitudes in
+        // [1.3, 1.5)·√(p·noise²) lift each planted row to about 2.7–3.25 bulk energies:
+        // one band above the bulk, with comparable energies so all 40 rows carry the ESS.
+        let bulk_row_energy = (p as f64) * noise * noise;
         for i in 0..n_signal {
-            let a = signal_amp * gauss(&mut ctr);
+            let a = (1.3 + 0.2 * (i as f64) / (n_signal as f64)) * bulk_row_energy.sqrt();
             for j in 0..p {
                 r[[i, j]] += a * dir[j];
             }
