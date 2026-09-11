@@ -39,14 +39,17 @@
 //! never a reason to weaken these bounds.
 
 use csv::StringRecord;
-use gam::matrix::LinearOperator;
+use gam::matrix::DesignMatrix;
+use gam::predict::standard::StandardPredictor;
+use gam::predict::{PosteriorMeanOptions, PredictInput, PredictableModel};
 use gam::smooth::build_term_collection_design;
 use gam::test_support::reference::{Column, QualityPair, run_python};
+use gam::types::{InverseLink, LikelihoodSpec, ResponseFamily, StandardLink};
 use gam::{
-    FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
-    load_csvwith_inferred_schema,
+    FitConfig, FitResult, StandardFitResult, encode_recordswith_inferred_schema, fit_from_formula,
+    init_parallelism, load_csvwith_inferred_schema,
 };
-use ndarray::Array2;
+use ndarray::{Array1, Array2};
 use rand::SeedableRng;
 use rand::rngs::StdRng;
 use rand_distr::{Distribution, Poisson, Uniform};
@@ -71,6 +74,35 @@ fn truth_eta(x1: f64, x2: f64) -> f64 {
 fn poisson_dev_unit(y: f64, mu: f64) -> f64 {
     let term = if y > 0.0 { y * (y / mu).ln() } else { 0.0 };
     2.0 * (term - (y - mu))
+}
+
+/// gam's production count-mean estimate at `rows` design rows: the posterior
+/// mean `E[exp(η)]` under the fit's conditional Laplace posterior, through the
+/// same `StandardPredictor` the CLI and FFI dispatch to. The default point
+/// estimate is the posterior mean, never the plug-in `exp(Xβ̂)` (SPEC 3), so that
+/// is what is scored against the truth and the held-out counts.
+fn gam_posterior_mean_count(fit: &StandardFitResult, design: DesignMatrix, rows: usize) -> Vec<f64> {
+    let link = InverseLink::Standard(StandardLink::Log);
+    let predictor = StandardPredictor {
+        beta: fit.fit.beta.clone(),
+        family: LikelihoodSpec::new(ResponseFamily::Poisson, link.clone()),
+        link_kind: Some(link),
+        covariance: fit.fit.beta_covariance().cloned(),
+        link_wiggle: None,
+    };
+    let input = PredictInput {
+        design,
+        offset: Array1::zeros(rows),
+        design_noise: None,
+        offset_noise: None,
+        auxiliary_scalar: None,
+        auxiliary_matrix: None,
+    };
+    let prediction = predictor
+        .predict_posterior_mean(&input, &fit.fit, &PosteriorMeanOptions::point_only())
+        .expect("gam posterior-mean count prediction");
+    assert_eq!(prediction.mean.len(), rows, "posterior-mean row count mismatch");
+    prediction.mean.to_vec()
 }
 
 #[test]
@@ -132,8 +164,8 @@ fn gam_poisson_log_matches_interpretml_ebm() {
     };
     let gam_edf = fit.fit.edf_total().expect("gam reports total edf");
 
-    // Rebuild the frozen design at the TEST covariates; for a log link
-    // design*beta is eta_hat and exp(eta_hat) is the fitted mean mu_hat.
+    // Rebuild the frozen design at the TEST covariates and take gam's
+    // posterior-mean count mean there.
     let n_test = test_idx.len();
     let mut grid = Array2::<f64>::zeros((n_test, ds.headers.len()));
     for (row, &i) in test_idx.iter().enumerate() {
@@ -142,9 +174,7 @@ fn gam_poisson_log_matches_interpretml_ebm() {
     }
     let design = build_term_collection_design(grid.view(), &fit.resolvedspec)
         .expect("rebuild design at test points");
-    let gam_eta: Vec<f64> = design.design.apply(&fit.fit.beta).to_vec();
-    let gam_mu: Vec<f64> = gam_eta.iter().map(|e| e.exp()).collect();
-    assert_eq!(gam_mu.len(), n_test, "gam test-mu length mismatch");
+    let gam_mu = gam_posterior_mean_count(&fit, design.design, n_test);
 
     // ---- fit the SAME data with InterpretML EBM (Poisson deviance) -----------
     // ExplainableBoostingRegressor with the Poisson-deviance objective is the ML
@@ -356,7 +386,7 @@ fn gam_poisson_log_matches_interpretml_ebm_on_real_data() {
     let gam_edf = fit.fit.edf_total().expect("gam reports total edf");
 
     // gam predictions at the held-out rows: rebuild the frozen design at the
-    // test covariates; the log link => fitted mean μ = exp(design*beta).
+    // test covariates and take gam's posterior-mean count mean there.
     let n_test = test_rows.len();
     let mut test_grid = Array2::<f64>::zeros((n_test, p_cols));
     for (i, &row) in test_rows.iter().enumerate() {
@@ -365,9 +395,7 @@ fn gam_poisson_log_matches_interpretml_ebm_on_real_data() {
     }
     let test_design = build_term_collection_design(test_grid.view(), &fit.resolvedspec)
         .expect("rebuild design at held-out points");
-    let gam_test_eta: Vec<f64> = test_design.design.apply(&fit.fit.beta).to_vec();
-    let gam_test_mu: Vec<f64> = gam_test_eta.iter().map(|e| e.exp()).collect();
-    assert_eq!(gam_test_mu.len(), n_test, "gam test-mu length mismatch");
+    let gam_test_mu = gam_posterior_mean_count(&fit, test_design.design, n_test);
     assert!(
         gam_test_mu.iter().all(|v| v.is_finite() && *v > 0.0),
         "gam held-out mean must be finite and positive"

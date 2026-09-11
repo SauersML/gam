@@ -49,16 +49,19 @@
 //! `f(age, model="rw2", scale.model=TRUE)`, the canonical INLA penalized smooth),
 //! binomial/logit.
 
-use gam::matrix::LinearOperator;
+use gam::matrix::{DesignMatrix, LinearOperator};
+use gam::predict::standard::StandardPredictor;
+use gam::predict::{PosteriorMeanOptions, PredictInput, PredictableModel};
 use gam::smooth::build_term_collection_design;
 use gam::test_support::reference::{
     Column, QualityPair, r_package_available, relative_l2, rmse, run_r,
 };
+use gam::types::{InverseLink, LikelihoodSpec, ResponseFamily, StandardLink};
 use gam::{
-    FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
-    load_csvwith_inferred_schema,
+    FitConfig, FitResult, StandardFitResult, encode_recordswith_inferred_schema, fit_from_formula,
+    init_parallelism, load_csvwith_inferred_schema,
 };
-use ndarray::Array2;
+use ndarray::{Array1, Array2};
 use rand::SeedableRng;
 use rand::rngs::StdRng;
 use rand_distr::{Distribution, Uniform};
@@ -69,6 +72,39 @@ const PROSTATE_CSV: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/bench/datasets/
 
 fn invlogit(eta: f64) -> f64 {
     1.0 / (1.0 + (-eta).exp())
+}
+
+/// gam's production probability estimate at `rows` design rows: the posterior
+/// mean `E[logit⁻¹(η)]` under the fit's conditional Laplace posterior, through
+/// the same `StandardPredictor` the CLI and FFI dispatch to. The default point
+/// estimate is the posterior mean, never the plug-in `logit⁻¹(Xβ̂)` (SPEC 3), so
+/// that is what is scored against the truth and against INLA's posterior mean.
+fn gam_posterior_mean_probability(
+    fit: &StandardFitResult,
+    design: DesignMatrix,
+    rows: usize,
+) -> Vec<f64> {
+    let link = InverseLink::Standard(StandardLink::Logit);
+    let predictor = StandardPredictor {
+        beta: fit.fit.beta.clone(),
+        family: LikelihoodSpec::new(ResponseFamily::Binomial, link.clone()),
+        link_kind: Some(link),
+        covariance: fit.fit.beta_covariance().cloned(),
+        link_wiggle: None,
+    };
+    let input = PredictInput {
+        design,
+        offset: Array1::zeros(rows),
+        design_noise: None,
+        offset_noise: None,
+        auxiliary_scalar: None,
+        auxiliary_matrix: None,
+    };
+    let prediction = predictor
+        .predict_posterior_mean(&input, &fit.fit, &PosteriorMeanOptions::point_only())
+        .expect("gam posterior-mean probability prediction");
+    assert_eq!(prediction.mean.len(), rows, "posterior-mean row count mismatch");
+    prediction.mean.to_vec()
 }
 
 /// Known latent probability that generated the synthetic response.
@@ -186,11 +222,11 @@ fn gam_binomial_smooth_recovers_true_probability() {
         "Vp dimension must match the design column count"
     );
 
-    // Probability-scale fitted values and posterior SD via the delta method:
+    // Probability-scale point: gam's posterior mean E[logit^{-1}(eta)].
+    // Probability-scale posterior SD via the delta method at the mode:
     //   var(eta_i) = x_i^T Vp x_i = sum_jk X[i,j] Vp[j,k] X[i,k]
-    //   p_i        = logit^{-1}(eta_i)
-    //   sd_p_i     = p_i (1 - p_i) * sqrt(var(eta_i))   (d p / d eta = p(1-p))
-    let mut gam_prob = Vec::with_capacity(n);
+    //   sd_p_i     = p̂_i (1 - p̂_i) * sqrt(var(eta_i)),  p̂_i = logit^{-1}(eta_i)
+    let gam_prob = gam_posterior_mean_probability(&fit, design.design.clone(), n);
     let mut gam_prob_sd = Vec::with_capacity(n);
     for i in 0..n {
         let xi = xmat.row(i);
@@ -208,7 +244,6 @@ fn gam_binomial_smooth_recovers_true_probability() {
         }
         let sd_eta = var_eta.max(0.0).sqrt();
         let p = invlogit(gam_eta[i]);
-        gam_prob.push(p);
         gam_prob_sd.push(p * (1.0 - p) * sd_eta);
     }
 
@@ -525,7 +560,7 @@ fn gam_binomial_smooth_recovers_true_probability_on_real_data() {
     let gam_edf = fit.fit.edf_total().expect("gam reports total edf");
 
     // gam predicted probabilities at held-out points: rebuild the frozen design
-    // at the test covariates; with the logit link, design*beta IS eta.
+    // at the test covariates and take gam's posterior-mean probability there.
     let mut test_grid = Array2::<f64>::zeros((test_rows.len(), p));
     for (i, &src_row) in test_rows.iter().enumerate() {
         test_grid[[i, pc1_idx]] = pc1[src_row];
@@ -533,13 +568,7 @@ fn gam_binomial_smooth_recovers_true_probability_on_real_data() {
     }
     let test_design = build_term_collection_design(test_grid.view(), &fit.resolvedspec)
         .expect("rebuild s(pc1)+s(pc2) design at held-out points");
-    let gam_test_eta = test_design.design.apply(&fit.fit.beta);
-    assert_eq!(
-        gam_test_eta.len(),
-        test_rows.len(),
-        "gam eta length mismatch"
-    );
-    let gam_test_prob: Vec<f64> = gam_test_eta.iter().map(|&e| invlogit(e)).collect();
+    let gam_test_prob = gam_posterior_mean_probability(&fit, test_design.design, test_rows.len());
 
     // ---- fit the SAME train rows with R-INLA, predict the SAME test rows ---
     // One data.frame carries every row (train + test) in identical order with an
