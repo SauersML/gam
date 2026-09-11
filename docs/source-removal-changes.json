@@ -2,8 +2,7 @@
   {
     "base": "4249f82e62ffb0949bed239248006e68994a3242",
     "items": [
-      "crates/gam-event-history/src/joint/category_prior.rs:fn:oracle",
-      "crates/gam-event-history/src/joint/structural_prior.rs:fn:oracle"
+      "crates/gam-event-history/src/joint/category_prior.rs:fn:oracle"
     ],
     "reason": "Move the independent AD oracles to a private test-support module shared by the prior test modules; preserve their equations and every original test case.",
     "evidence": "function_prior_tests.rs supplies category_oracle and structural_oracle. The category, structural, and combined prior tests now call those same reference equations without exporting a test module."
