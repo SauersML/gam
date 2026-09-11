@@ -5319,6 +5319,119 @@ mod fisher_override_tests {
             .any(|(a, b)| (a - b).abs() > 1.0e-6);
         assert!(differs, "scaled curvature must change the first step");
     }
+
+    /// #1101 regression: the fixed-λ inner solve now surfaces the joint Laplace
+    /// coefficient covariance `H⁻¹`, and the multinomial predictor derives
+    /// finite delta-method per-class probability standard errors from it. Before
+    /// this change `MultinomialFitOutputs` carried NO covariance at all, so the
+    /// covariance-dimension / predictor assertions below could not even compile
+    /// (fail-before). Asserts, with un-weakened bounds:
+    ///   1. covariance is `(P·(K−1))²`, all-finite, symmetric, and PSD (every
+    ///      diagonal ≥ 0 and `vᵀΣv ≥ 0` on probe vectors);
+    ///   2. the delta-method per-class probability SEs are finite and within
+    ///      `[0, 1]` (a probability SE can never exceed the unit interval);
+    ///   3. predicted probabilities are finite, in `[0, 1]`, and each row sums
+    ///      to 1 (simplex).
+    #[test]
+    fn covariance_and_delta_method_se_are_finite_and_wellformed_1101() {
+        let (design, y, penalty, lambdas) = toy();
+        let p = design.ncols();
+        let k = y.ncols();
+        let m = k - 1;
+        let d = p * m;
+
+        let fit = fit_penalized_multinomial(MultinomialFitInputs {
+            design: design.view(),
+            y_one_hot: y.view(),
+            penalty: penalty.view(),
+            lambdas: lambdas.view(),
+            row_weights: None,
+            fisher_w_override: None,
+            max_iter: 50,
+            tol: 1.0e-9,
+            resume_from: None,
+        })
+        .expect("fit must succeed");
+        // (1) Covariance shape, finiteness, symmetry.
+        let cov = &fit.coefficient_covariance;
+        assert_eq!(
+            cov.dim(),
+            (d, d),
+            "covariance must be (P·(K−1))² = ({d},{d})"
+        );
+        for &v in cov.iter() {
+            assert!(v.is_finite(), "covariance entry must be finite (got {v})");
+        }
+        for i in 0..d {
+            for j in 0..d {
+                let asym = (cov[[i, j]] - cov[[j, i]]).abs();
+                assert!(
+                    asym <= 1e-9 * (1.0 + cov[[i, j]].abs()),
+                    "covariance must be symmetric at ({i},{j}): |Σ_ij − Σ_ji| = {asym:.3e}"
+                );
+            }
+        }
+        // PSD: diagonal ≥ 0 and quadratic forms on deterministic probe vectors
+        // (unit axes and the all-ones vector) are non-negative. `H = XᵀWX + λS`
+        // with W PSD (softmax Fisher) and S PSD (identity here) is positive
+        // definite, so its inverse is PD; these probes must all be positive.
+        for i in 0..d {
+            assert!(
+                cov[[i, i]] >= 0.0,
+                "covariance diagonal[{i}] must be ≥ 0 (got {})",
+                cov[[i, i]]
+            );
+        }
+        let mut probes: Vec<Vec<f64>> = Vec::new();
+        for i in 0..d {
+            let mut e = vec![0.0_f64; d];
+            e[i] = 1.0;
+            probes.push(e);
+        }
+        probes.push(vec![1.0_f64; d]);
+        for v in &probes {
+            let mut q = 0.0_f64;
+            for i in 0..d {
+                for j in 0..d {
+                    q += v[i] * cov[[i, j]] * v[j];
+                }
+            }
+            assert!(q >= -1e-9, "covariance must be PSD: vᵀΣv = {q:.3e} < 0");
+        }
+
+        // (2) & (3) Delta-method SEs and simplex probabilities on the training
+        // design (any P-column matrix in the fitted basis works).
+        let (probs, prob_se) = fit
+            .logistic_normal_softmax_moments(design.view())
+            .expect("logistic-normal softmax moments must succeed");
+        let n = design.nrows();
+        assert_eq!(probs.dim(), (n, k));
+        assert_eq!(prob_se.dim(), (n, k));
+        for row in 0..n {
+            let mut rowsum = 0.0_f64;
+            for c in 0..k {
+                let pc = probs[[row, c]];
+                assert!(
+                    pc.is_finite() && (0.0..=1.0).contains(&pc),
+                    "prob[{row},{c}]={pc}"
+                );
+                rowsum += pc;
+                let se = prob_se[[row, c]];
+                assert!(
+                    se.is_finite(),
+                    "prob_se[{row},{c}] must be finite (got {se})"
+                );
+                assert!(
+                    (0.0..=1.0).contains(&se),
+                    "prob_se[{row},{c}] must be in [0,1] (got {se})"
+                );
+            }
+            assert!(
+                (rowsum - 1.0).abs() < 1e-9,
+                "row {row} probabilities must sum to 1 (got {rowsum})"
+            );
+        }
+    }
 }
 
 #[cfg(test)]

@@ -675,4 +675,76 @@ mod tests {
         assert_eq!(a, b, "intrinsic embedding must be bit-identical run-to-run");
     }
 
+    /// Chart coordinates and embedding functions are not the same dimension:
+    /// sphere latitude needs a 3-frame, and a 2-torus needs two independent
+    /// phase planes. Pin the production allocation rule so those coordinates
+    /// cannot silently collapse back to zero.
+    #[test]
+    fn intrinsic_seed_allocates_every_chart_function_2240() {
+        assert_eq!(
+            intrinsic_chart_embedding_axes(&SaeAtomBasisKind::Periodic, 1),
+            2
+        );
+        assert_eq!(
+            intrinsic_chart_embedding_axes(&SaeAtomBasisKind::Periodic, 3),
+            4
+        );
+        assert_eq!(
+            intrinsic_chart_embedding_axes(&SaeAtomBasisKind::Sphere, 2),
+            3
+        );
+        assert_eq!(
+            intrinsic_chart_embedding_axes(&SaeAtomBasisKind::Torus, 2),
+            4
+        );
+        assert_eq!(
+            intrinsic_chart_embedding_axes(&SaeAtomBasisKind::ProjectivePlane, 2),
+            3
+        );
+        // `SaeAtomBasisKind::Linear` no longer exists; a flat chart kind takes the
+        // latent-dimension arm.
+        assert_eq!(
+            intrinsic_chart_embedding_axes(&SaeAtomBasisKind::Duchon, 2),
+            2
+        );
+
+        // Ten points spanning four ambient dimensions make the kNN graph
+        // complete for a four-axis embedding, so classical MDS recovers four
+        // genuine functions. Both coordinates of each chart must vary. With
+        // the old latent-dimension allocation, sphere latitude and torus axis 1
+        // were identically zero here.
+        let mut z = Array2::<f64>::zeros((10, 4));
+        for axis in 0..4 {
+            z[[2 * axis, axis]] = 1.0;
+            z[[2 * axis + 1, axis]] = -1.0;
+        }
+        z[[8, 0]] = 0.5;
+        z[[8, 1]] = -0.25;
+        z[[8, 2]] = 0.75;
+        z[[8, 3]] = 0.125;
+        z[[9, 0]] = -0.375;
+        z[[9, 1]] = 0.625;
+        z[[9, 2]] = 0.25;
+        z[[9, 3]] = -0.875;
+        let seed = sae_intrinsic_seed_initial_coords(
+            z.view(),
+            &[SaeAtomBasisKind::Sphere, SaeAtomBasisKind::Torus],
+            &[2, 2],
+        )
+        .unwrap();
+        for atom in 0..2 {
+            for axis in 0..2 {
+                let (lo, hi) = seed
+                    .slice(ndarray::s![atom, .., axis])
+                    .iter()
+                    .fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), &v| {
+                        (lo.min(v), hi.max(v))
+                    });
+                assert!(
+                    hi > lo,
+                    "intrinsic chart {atom} axis {axis} must carry a genuine coordinate"
+                );
+            }
+        }
+    }
 }
