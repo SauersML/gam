@@ -15,8 +15,13 @@ Two classes are reported from the tree at one immutable revision:
   support in the wrong scope, or production code whose only callers are tests.
 * unreferenced: a `pub(crate)`/`pub(super)`/`pub(in ...)` item named nowhere.
 
-Bare `pub` items are out of scope: their consumers may live outside the
+Bare `pub` items are out of scope by default: their consumers may live outside the
 workspace, which is exactly the library surface a symbol-table sweep deletes.
+`--include-public` brings them in for a deletion sweep of everything only tests use.
+A bare `pub` item is then test-only when test code names it and no production line
+does, where a line that only re-exports names (`pub use`) is not a consumer, the
+`gamfit` Python sources are production lines, and a foreign export (the Python
+extension's surface, `no_mangle`, `export_name`) is never a candidate.
 Definitions inside test scope are never candidates -- the predicate is vacuously
 true there, which is how #2818 happened. Trait members, in a trait definition or
 an `impl Trait for` block, carry no visibility of their own and are dispatched
@@ -26,10 +31,10 @@ to rustc.
 
 The reference test is lexical: a name on a production line in another file, or on
 another line of the same file, is a consumer -- a `pub use` re-export included,
-since it is such a line. That errs toward reporting less, never toward calling a
-live item dead. Comments and literals never supply a reference. Where this lives:
-beside `scripts/test_census.py`, never in `build.rs` (#2110 -- a gate there took
-the gamfit wheel down).
+since it is such a line, unless `--include-public` is given. That errs toward
+reporting less, never toward calling a live item dead. Comments and literals never
+supply a reference. Where this lives: beside `scripts/test_census.py`, never in
+`build.rs` (#2110 -- a gate there took the gamfit wheel down).
 """
 
 import argparse
@@ -56,6 +61,10 @@ DEFINITION = re.compile(
 IMPL = re.compile(r"^\s*(?:(?:unsafe|default)\s+)*impl\b")
 TRAIT = re.compile(r"^\s*(?:pub(?:\s*\([^)]*\))?\s+)?(?:(?:unsafe|auto)\s+)*trait\s")
 TOKEN = re.compile(r"[A-Za-z_][A-Za-z_0-9]*")
+REEXPORT = re.compile(r"^\s*pub(?:\s*\([^)]*\))?\s+use\b")
+FOREIGN_EXPORT = re.compile(r"\b(?:no_mangle|export_name|pyfunction|pymethods|pyclass|pymodule)\b")
+FOREIGN_EXPORT_CRATE = "crates/gam-pyffi/"
+PYTHON_ROOT = "gamfit"
 ROOTS = ("crates", "src", "tests", "examples", "bench", "benches")
 LEDGER = "scripts/src_items_used_only_by_tests_ledger.txt"
 CLASSES = {"test_only": "test-only", "unreferenced": "unreferenced"}
@@ -109,15 +118,33 @@ def trait_member_lines(lines):
     return marked
 
 
-def read_tree(root, revision):
-    """{path: source} for every Rust blob under the scanned roots at `revision`."""
-    listing = git(root, "ls-tree", "-rz", "--full-tree", revision, "--", *ROOTS)
+def foreign_export(path, lines, number):
+    """Whether the item declared on `number` is exported to a foreign caller."""
+    if path.startswith(FOREIGN_EXPORT_CRATE):
+        return True
+    above = number - 1
+    while above >= 1 and (not lines[above - 1].strip() or lines[above - 1].lstrip().startswith("#")):
+        if FOREIGN_EXPORT.search(lines[above - 1]):
+            return True
+        above -= 1
+    return False
+
+
+def read_tree(root, revision, include_python=False):
+    """{path: source} for every Rust blob under the scanned roots at `revision`.
+
+    With `include_python`, the `gamfit` package's Python sources are read too: they
+    name the Python extension's exports.
+    """
+    roots = ROOTS + (PYTHON_ROOT,) if include_python else ROOTS
+    listing = git(root, "ls-tree", "-rz", "--full-tree", revision, "--", *roots)
     entries = []
     for entry in listing.split(b"\0"):
         if not entry:
             continue
         metadata, path = entry.split(b"\t", 1)
-        if path.endswith(b".rs") and metadata.split()[1] == b"blob":
+        python = include_python and path.endswith(b".py") and path.startswith(PYTHON_ROOT.encode() + b"/")
+        if (path.endswith(b".rs") or python) and metadata.split()[1] == b"blob":
             entries.append((metadata.split()[2], path.decode()))
     if not entries:
         raise ValueError(f"{revision}: no Rust source files examined")
@@ -136,14 +163,21 @@ def read_tree(root, revision):
     return files
 
 
-def scan(files):
-    """Classify every candidate definition in `files` ({path: source})."""
+def scan(files, include_public=False):
+    """Classify every candidate definition in `files` ({path: source}).
+
+    With `include_public`, bare `pub` items are candidates as well and a re-export
+    line is not a consumer (see the module docstring).
+    """
     test_references = {}
     files_naming = Counter()
     lines_naming = {}
     candidates = []
     for path in sorted(files):
         source = files[path]
+        if path.endswith(".py"):
+            files_naming.update(set(TOKEN.findall(source)))
+            continue
         clean = strip_comments_and_literals(source)
         lines = clean.splitlines()
         if is_test_file(path):
@@ -156,16 +190,25 @@ def scan(files):
         scope = test_lines(source, path, clean)
         members = trait_member_lines(lines)
         named = Counter()
+        reexporting = False
         for number, line in enumerate(lines, 1):
             tokens = set(TOKEN.findall(line))
             if number in scope:
                 for token in tokens:
                     test_references.setdefault(token, path)
                 continue
+            if include_public and (reexporting or REEXPORT.match(line)):
+                # A facade re-exporting an item does not consume it. A rename
+                # introduces the name its consumers use, so it stays a reference.
+                reexporting = ";" not in line
+                if " as " not in line:
+                    continue
             named.update(tokens)
             definition = None if number in members else DEFINITION.match(line)
-            if (definition is None or definition["public"] or definition["name"].startswith("_")
+            if (definition is None or definition["name"].startswith("_")
                     or len(definition["name"]) <= 2 or definition["name"] in EXEMPT_NAMES):
+                continue
+            if definition["public"] and (not include_public or foreign_export(path, lines, number)):
                 continue
             candidates.append((path, number, definition["kind"], definition["name"], bool(definition["scoped"])))
         files_naming.update(named.keys())
@@ -220,6 +263,8 @@ def main(argv=None):
     parser.add_argument("--head", default="HEAD", help="immutable revision whose tree is scanned")
     parser.add_argument("--ledger", type=Path, help=f"ratchet against a committed ledger, normally {LEDGER}")
     parser.add_argument("--output", type=Path, help="write the report as JSON")
+    parser.add_argument("--include-public", action="store_true",
+                        help="also report bare `pub` items only tests name; a re-export is not a consumer")
     parser.add_argument("--positive-control", action="store_true",
                         help=f"re-measure the {CONTROL_REVISION[:9]} incident and stop")
     args = parser.parse_args(argv)
@@ -230,7 +275,7 @@ def main(argv=None):
               f"among {count} test-only findings")
         return 0
     head = resolve(root, args.head)
-    report = scan(read_tree(root, head))
+    report = scan(read_tree(root, head, include_python=args.include_public), include_public=args.include_public)
     if args.output is not None:
         args.output.write_text(json.dumps(dict(report, revision=head), indent=2, sort_keys=True) + "\n")
     print(f"{head[:9]}: {len(report['test_only'])} test-only, {len(report['unreferenced'])} unreferenced")
