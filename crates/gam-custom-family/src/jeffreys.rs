@@ -962,7 +962,19 @@ pub(crate) fn custom_family_outer_jeffreys_hphi_drift_batched<
                     .ok_or_else(missing)
             })?;
             let moving = family.joint_jeffreys_information_third_directional_all_axes_with_specs(&states, &specs, u, v)?.ok_or_else(missing)?;
-            Ok(prepare()?.completion_drift_action(&h, &axes, &moving)? * strength)
+            let base = prepare()?;
+            let mut action = base.completion_drift_action(&h, &axes, &moving)?;
+            // #1082: where the conditioning gate or the relative floor moves, the
+            // completion also carries their motion; its drift needs `H²[u,·]` too.
+            if base.hessian_motion_active() {
+                let axes_u = kept_along_response(&kept_second, u, || {
+                    family
+                        .joint_jeffreys_information_second_directional_all_axes_with_specs(&states, &specs, u)?
+                        .ok_or_else(missing)
+                })?;
+                action -= &base.motion_drift_action(v, &h, &axes, &axes_u, &moving)?;
+            }
+            Ok(action * strength)
         })
     };
     let first = Arc::new(move |deltas: &[Array1<f64>]| {
