@@ -256,9 +256,10 @@ solved on the motion-completed curvature, but its outer-Hessian drift
 (`completion_beta`) still differentiated only the frozen-policy completion. Both
 penguin arms are killed at 400 s again. The terminal adjudication measures the
 analytic outer Hessian against the criterion's own curvature along the disputed
-eigenvector: ‖dH‖ = 1.1e−6 on arm 1 (sub-resolution) but 0.272 on arm 2 (analytic
-λ_min = −4.9e−5 against criterion curvature 0.295 ± 0.023). An inexact outer
-Hessian is therefore still manufacturing negative curvature there.
+eigenvector: ‖dH‖ = 1.1e−6 on arm 1 and 0.272 on arm 2 (analytic λ_min = −4.9e−5
+against criterion curvature 0.295 ± 0.023). The arm-2 figure is within 1.4× of
+that ladder's own finite-difference floor (0.197), so by itself it does not show
+an inexact Hessian; job 391813 below shows the probe does not change with it.
 
 **Outer-Hessian drift of the motion (`dc97c1b68`).**
 `JeffreysHphiDriftBase::motion_drift_action` returns `D_u M[·, v]`, the β-drift of
@@ -268,6 +269,39 @@ the floor's third-order sensitivities, and `completion_beta` subtracts it where 
 motion is active. Unit tests pin the gate's third partials (both bands) and the
 gate-band and moving-floor curvature drift against central differences, each with
 a positive control that the frozen drift misses the term.
+
+**Derivative reproduction green (job 391813, `df54d37bd`).** The workspace gate
+passes, 43 gam-solve `jeffreys_subspace` pins and 16 gam-custom-family `jeffreys`
+pins pass, and `multinomial_outer_derivatives_1082` passes both tests. The armed
+outer gradient and Hessian both match central differences at shifts 0 and −3.
+Smooth-by-factor passes in 20.2 s. Both penguin arms are killed at 400 s again. The
+unbiased probe's first ARC seeds end bit-identically to job 388047: arm 1 at
+−1.408429 (|g| = 6.273e−4, 28 accepted / 35 rejected) and 9.333945, arm 2 at 13.31456
+and then 10.92247 (|g| = 4.24e−5). The probe runs before Jeffreys arms, so the
+motion-drift correction does not reach it.
+
+**Rotated axes and the ψ drift (job 394320, `0bd6fa927`).** `90be2f44a` keeps each
+mode response's axis derivatives rotated once, so a pair rotates only its third
+derivative (five rotations per pair become one). `0bd6fa927` subtracts the same
+motion drift in the ψ route's completion drift, perturbing the axis derivatives by
+`∂_ψ Hdot[e_a]`. The gate, both pin sets and the derivative reproduction pass
+unchanged.
+
+**Why the penguin probe does not stop.** opt's ARC halts only when |Pg| is within
+tolerance and its reduced Hessian is PSD at the arithmetic shift. The arm-2 incumbent
+(|g| = 4.2e−5; λ_min = −4.9e−5 on the certificate's judged sub-block, against a
+resolution of 1.19e−4) fails that test for good. The bridge's #2817 stop, the Newton
+decrement at the criterion's resolution, is consulted only after the cost-stall
+window fills without a strict-saddle verdict. At these incumbents the guard's
+verdict is NO: "window filled at a strict-saddle incumbent" fires at 10.92254 and
+10.92247, and the seed runs to `max_iter`. The terminal certificate reads the same
+point PSD at resolution. The two layers judge different subspaces. The certificate
+removes every margin-railed coordinate. The guard keeps a margin-railed coordinate
+whose gradient points into the box (pinned in `rail_projection_tests.rs`).
+`228742666` prints the facts behind every strict-saddle refusal: the free-set and
+interior λ_min, the resolution, and each railed coordinate's ρ, gradient and diagonal
+curvature. Job 400176 will show whether railed coordinates are what separates the
+two verdicts.
 
 1. Run every selected test after the corrections, including both synthetic and real-data arms. Record
    actual durations and assertions; missing references remain failures.
