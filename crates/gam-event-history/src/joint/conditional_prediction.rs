@@ -176,13 +176,14 @@ impl JointCohortIntegration<'_, '_> {
                 let mut prefix_error = 0.0_f64;
                 let mut extended_error = 0.0_f64;
                 for draw in &law.integral.draws {
-                    let past = prefix.resolved_score(&draw.coefficients, accuracy, tolerance)?;
-                    before.push(*past.score().evaluation().log_likelihood());
-                    prefix_error = prefix_error.max(past.report().log_error_estimate);
-                    let future =
-                        extended.resolved_score(&draw.coefficients, accuracy, tolerance)?;
-                    after.push(*future.score().evaluation().log_likelihood());
-                    extended_error = extended_error.max(future.report().log_error_estimate);
+                    let (past, error) =
+                        prefix.resolved_log_integral(&draw.coefficients, accuracy, tolerance)?;
+                    before.push(past);
+                    prefix_error = prefix_error.max(error);
+                    let (future, error) =
+                        extended.resolved_log_integral(&draw.coefficients, accuracy, tolerance)?;
+                    after.push(future);
+                    extended_error = extended_error.max(error);
                 }
                 conditional_mixture(
                     &law.evidence.log_weights,

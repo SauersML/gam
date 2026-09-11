@@ -197,10 +197,13 @@ impl JointCohortIntegration<'_, '_> {
                 let mut likelihoods = Vec::with_capacity(n);
                 let mut additional_error = 0.0_f64;
                 for draw in &law.integral.draws {
-                    let value =
-                        additional.resolved_score(&draw.coefficients, accuracy, tolerance)?;
-                    likelihoods.push(*value.score().evaluation().log_likelihood());
-                    additional_error = additional_error.max(value.report().log_error_estimate);
+                    let (value, error) = additional.resolved_log_integral(
+                        &draw.coefficients,
+                        accuracy,
+                        tolerance,
+                    )?;
+                    likelihoods.push(value);
+                    additional_error = additional_error.max(error);
                 }
                 mixture(
                     &law.evidence.log_weights,

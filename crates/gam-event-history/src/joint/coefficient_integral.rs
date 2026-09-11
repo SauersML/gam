@@ -129,7 +129,9 @@ fn moments(weights: &[f64], values: impl Iterator<Item = f64> + Clone) -> (f64, 
 impl JointCohortIntegration<'_, '_> {
     /// Freeze resolved cohort likelihoods at independent coefficient draws.
     /// Each cache entry comes from the authoritative coefficient/reference
-    /// state and the complete shared-reference resolution assessment. No
+    /// state and the complete shared-reference likelihood-value assessment.
+    /// Only the tolerance's log-error budget and standard-error multiplier
+    /// apply: coefficient scores are not used by this integral. No
     /// likelihood or reference evolution is repeated during strength search.
     ///
     /// Proposal construction, integrability, bank refinement, smoothness
@@ -165,12 +167,12 @@ impl JointCohortIntegration<'_, '_> {
         let mut log_likelihood = Vec::with_capacity(draws.len());
         let mut inner_log_error_estimate = 0.0_f64;
         for draw in &draws {
-            let value = self.resolved_score(&draw.coefficients, accuracy, tolerance)?;
-            log_likelihood.push(*value.score().evaluation().log_likelihood());
+            let (value, error) =
+                self.resolved_log_integral(&draw.coefficients, accuracy, tolerance)?;
+            log_likelihood.push(value);
             // Inner banks are reused at coefficient draws, so their errors
             // are correlated. Do not divide this diagnostic by sqrt(draws).
-            inner_log_error_estimate =
-                inner_log_error_estimate.max(value.report().log_error_estimate);
+            inner_log_error_estimate = inner_log_error_estimate.max(error);
         }
         Ok(JointCoefficientIntegral {
             cohort_identity: std::sync::Arc::clone(&self.identity),

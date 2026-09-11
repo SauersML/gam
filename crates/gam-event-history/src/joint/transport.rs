@@ -22,6 +22,85 @@ fn genes<S: JetField>(h: &JointHistory, coordinates: &[S], zero: &S) -> (Vec<S>,
     (genes, missing)
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rand::{SeedableRng, rngs::SmallRng};
+
+    #[test]
+    fn posterior_moments_follow_the_current_entry_and_drive_with_the_same_innovations() {
+        let model = JointLikelihood::new(JointSpecification {
+            signatures: 1,
+            marks: vec![MarkKind::Once],
+            baseline_columns: 1,
+            drive_columns: 1,
+            entry_columns: 0,
+            measurements: vec![MeasurementFamily::BinaryProbit],
+            genetic_mean: vec![],
+            genetic_precision: Array2::zeros((0, 0)),
+        })
+        .unwrap();
+        let history = JointHistory {
+            times: vec![0.0, 0.5, 1.0],
+            exposure: vec![0.0, 1.0, 0.0],
+            events: vec![None; 3],
+            initially_at_risk: vec![false],
+            baseline_design: Array2::ones((3, 1)),
+            drive_design: Array2::ones((2, 1)),
+            entry_design: vec![],
+            genetics: vec![],
+            measurements: vec![MeasurementRecord {
+                node: 1,
+                channel: 0,
+                value: Some(1.0),
+                after_event: false,
+            }],
+        };
+        // An observed binary channel keeps the general integration path.
+        // Its zero slope makes the exact conditional state law N(0, OU).
+        let mut theta = vec![0.0; model.layout.width];
+        let mut rng = SmallRng::seed_from_u64(80219);
+        let bank = model
+            .integration(
+                &theta,
+                &history,
+                &[0.0; 3],
+                None,
+                &IntegrationOptions {
+                    samples: 4096,
+                    ..IntegrationOptions::default()
+                },
+                &mut rng,
+            )
+            .unwrap();
+        let accuracy = IntegrationAccuracy {
+            log_standard_error: 0.05,
+            moment_standard_error: 0.1,
+            ..IntegrationAccuracy::default()
+        };
+        let anchor = bank.posterior(&theta, &[0.0; 3], &accuracy).unwrap();
+        theta[model.layout.entry.start] = 20.0;
+        theta[model.layout.drive.start] = 20.0;
+        let moved = bank.posterior(&theta, &[0.0; 3], &accuracy).unwrap();
+        assert_eq!(
+            anchor.likelihood.log_marginal,
+            moved.likelihood.log_marginal
+        );
+        assert_eq!(
+            anchor.likelihood.effective_samples,
+            moved.likelihood.effective_samples
+        );
+        for n in 0..3 {
+            assert!((moved.mean[n] - anchor.mean[n] - 20.0).abs() < 2e-13);
+            assert!(
+                (moved.state_covariance[n][[0, 0]] - anchor.state_covariance[n][[0, 0]]).abs()
+                    < 2e-13
+            );
+            assert!(anchor.mean[n].abs() < 4.0 * anchor.mean_standard_error[n]);
+        }
+    }
+}
+
 impl JointLikelihood {
     /// Invert the triangular OU map at the proposal anchor. Return its
     /// conditional path log density so q(path)/p(path|genes) can be retained

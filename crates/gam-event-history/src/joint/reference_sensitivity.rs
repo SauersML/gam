@@ -112,7 +112,7 @@ fn add_regression(
 impl JointReferenceBank<'_> {
     fn activity_sensitivity(
         &self,
-        theta: &[f64],
+        decoder: &super::super::decoder::PreparedDecoder<f64>,
         mark: usize,
         particle: usize,
         population: &PopulationSensitivity,
@@ -121,32 +121,24 @@ impl JointReferenceBank<'_> {
         out.fill(0.0);
         let k = self.model.spec.signatures;
         let start = self.model.layout.decoder.start + mark * k;
-        let mut numerator = vec![0.0];
-        let mut denominator = vec![0.0];
-        for axis in 0..k {
-            numerator.push(
-                theta[start + axis]
-                    + emission::log_softplus(&population.value.states[particle][axis]),
-            );
-            denominator.push(theta[start + axis]);
-        }
-        let log_num = log_sum_exp(&numerator);
-        let log_den = log_sum_exp(&denominator);
+        let weights = &decoder.weights(mark)[1..];
+        let log_activity = decoder.activity(mark, &population.value.states[particle]);
         for axis in 0..k {
             let x = population.value.states[particle][axis];
-            let state_score = (theta[start + axis] - emission::softplus(&(-x)) - log_num).exp();
-            for q in 0..theta.len() {
+            let state_score = (weights[axis] - emission::softplus(&(-x)) - log_activity).exp();
+            for q in 0..out.len() {
                 out[q] += state_score * population.state[[particle * k + axis, q]];
             }
-            out[start + axis] +=
-                (numerator[axis + 1] - log_num).exp() - (denominator[axis + 1] - log_den).exp();
+            out[start + axis] += (weights[axis] + emission::log_softplus(&x) - log_activity).exp()
+                - weights[axis].exp();
         }
-        log_num - log_den
+        log_activity
     }
 
     fn moment_sensitivity(
         &self,
         theta: &[f64],
+        decoder: &super::super::decoder::PreparedDecoder<f64>,
         population: &PopulationSensitivity,
         expected: &[f64],
     ) -> Result<Array2<f64>, EventHistoryError> {
@@ -159,7 +151,7 @@ impl JointReferenceBank<'_> {
             let weights = &population.value.log_weight[start..end];
             let mass = log_sum_exp(weights);
             let activities: Vec<_> = (start..end)
-                .map(|p| self.model.activity(theta, d, &population.value.states[p]))
+                .map(|p| decoder.activity(d, &population.value.states[p]))
                 .collect();
             let weighted: Vec<_> = weights
                 .iter()
@@ -173,7 +165,7 @@ impl JointReferenceBank<'_> {
                 ));
             }
             for p in start..end {
-                self.activity_sensitivity(theta, d, p, population, &mut derivative);
+                self.activity_sensitivity(decoder, d, p, population, &mut derivative);
                 let active = (weighted[p - start] - numerator).exp();
                 let risk = (weights[p - start] - mass).exp();
                 for q in 0..width {
@@ -335,8 +327,13 @@ impl JointReferenceBank<'_> {
         }
         let mut moment_jacobian = Array2::zeros((rows, width));
         let mut mass_jacobian = Array2::zeros((rows, width));
-        let initial =
-            self.moment_sensitivity(theta, &population, &reference.log_moments[..marks])?;
+        let decoder = super::super::decoder::PreparedDecoder::new(self.model, theta);
+        let initial = self.moment_sensitivity(
+            theta,
+            &decoder,
+            &population,
+            &reference.log_moments[..marks],
+        )?;
         for d in 0..marks {
             moment_jacobian.row_mut(d).assign(&initial.row(d));
         }
@@ -346,7 +343,7 @@ impl JointReferenceBank<'_> {
             let endrow = 2 * n * marks;
             self.propagate_sensitivity(theta, &mut population, n, 2 * n - 1);
             let midpoint = &reference.log_moments[midrow..midrow + marks];
-            let mid = self.moment_sensitivity(theta, &population, midpoint)?;
+            let mid = self.moment_sensitivity(theta, &decoder, &population, midpoint)?;
             for d in 0..marks {
                 moment_jacobian.row_mut(midrow + d).assign(&mid.row(d));
                 mass_jacobian
@@ -366,7 +363,7 @@ impl JointReferenceBank<'_> {
                     }
                     let mut derivative = vec![0.0; width];
                     let activity =
-                        self.activity_sensitivity(theta, d, p, &population, &mut derivative);
+                        self.activity_sensitivity(&decoder, d, p, &population, &mut derivative);
                     let mut baseline = 0.0;
                     for b in 0..self.model.spec.baseline_columns {
                         let feature = 0.5 * self.profile.baseline_design[[n - 1, b]]
@@ -493,6 +490,7 @@ impl JointReferenceBank<'_> {
             self.propagate_sensitivity(theta, &mut population, n, 2 * n);
             let endpoint = self.moment_sensitivity(
                 theta,
+                &decoder,
                 &population,
                 &reference.log_moments[endrow..endrow + marks],
             )?;

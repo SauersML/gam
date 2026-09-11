@@ -1,0 +1,105 @@
+MSI acn112; four CPUs; warm rustc replay, opt-level2, codegen16, deny warnings. Cached dependencies, not a whole-workspace rebuild.
+Warm build seconds: 46.27746682500583
+
+running 71 tests
+test joint::cohort::coefficients::inference::constant_rates::tests::constant_rate_evidence_has_analytic_total_curvature_and_stable_limits ... ok
+test joint::cohort::coefficients::inference::prediction::conditional::tests::conditional_density_reweights_the_past_and_cancels_shared_sampling_error ... ok
+test joint::cohort::coefficients::inference::prediction::conditional::tests::continuation_rejects_changes_to_every_past_observation_channel ... ok
+test joint::cohort::coefficients::inference::prediction::tests::predictive_ratio_keeps_tiny_training_weights_and_shared_denominator_error ... ok
+test joint::cohort::coefficients::inference::constant_rates::tests::automatic_constant_rates_cover_risk_sets_genetics_time_units_and_the_null_boundary ... ok
+test joint::cohort::coefficients::strength_fit::tests::inner_log_error_bounds_correlated_score_and_curvature_changes_after_whitening ... ok
+test joint::cohort::coefficients::strength_fit::tests::opt_strength_solution_matches_conjugate_evidence_and_rejects_unresolved_results ... ok
+test joint::cohort::coefficients::tests::coefficient_evidence_matches_poisson_gamma_mean_score_and_curvature ... ok
+test joint::cohort::coefficients::tests::evidence_hessian_includes_off_diagonal_posterior_score_covariance ... ok
+test joint::cohort::pilot::tests::guided_coefficients_follow_the_normalized_cohort_and_preserve_posterior_means ... ok
+test joint::cohort::resolution::tests::resolution_does_not_cancel_stratum_errors_or_independently_count_shared_subject_noise ... ok
+test joint::cohort::coefficients::inference::tests::adaptive_coefficient_inference_matches_the_conjugate_evidence_and_mean ... ok
+test joint::decoder::tests::decoder_preserves_extreme_simplex_mass_and_matches_direct_log_sums ... ok
+test joint::decoder::tests::prepared_decoder_speed ... ok
+test joint::decoder_prior::tests::function_penalty_is_invariant_to_intensity_scale_and_leaves_baselines_free ... ok
+test joint::decoder_prior::tests::function_prior_hessian_retains_saturated_simplex_curvature ... ok
+test joint::decoder_prior::tests::function_prior_includes_the_chart_jacobian_and_all_derivatives ... ok
+test joint::decoder_prior::tests::function_prior_normalization_and_means_match_simplex_integration ... ok
+test joint::decoder_prior::tests::function_prior_preserves_strong_shrinkage_and_weak_strength_extremes ... ok
+test joint::emission::tests::analytic_measurement_locations_agree_with_density_derivatives ... ok
+test joint::emission::tests::analytic_measurement_tails_preserve_representable_scores ... ok
+test joint::emission::tests::measurement_location_derivative_speed ... ok
+test joint::function_prior::category::tests::category_chart_retains_curvature_from_an_underflowing_gap_slope ... ok
+test joint::function_prior::category::tests::probit_category_base_measure_is_uniform_on_its_probability_simplex ... ok
+test joint::function_prior::proposal::tests::coefficient_proposals_preserve_charts_reproducibility_and_error_contracts ... ok
+test joint::function_prior::proposal::tests::normalized_coefficient_draws_follow_all_declared_function_measures ... ok
+test joint::function_prior::structural::tests::physical_priors_normalize_and_have_the_declared_finite_moments ... ok
+test joint::function_prior::structural::tests::physical_shape_priors_include_exact_normalizers_and_chart_curvature ... ok
+test joint::function_prior::structural::tests::scalar_prior_curvature_survives_saturated_softplus_and_large_cancelling_scales ... ok
+test joint::function_prior::tests::function_energies_equal_direct_integration_of_the_model_functions ... ok
+test joint::function_prior::tests::function_prior_all_coefficient_strength_and_scale_curvatures_match_the_density ... ok
+test joint::function_prior::tests::function_prior_preserves_extreme_precision_products_and_student_scale_units ... ok
+test joint::function_prior::tests::function_prior_respects_basis_changes_and_rejects_aliases_and_storage_overruns ... ok
+test joint::function_prior::tests::positive_baseline_level_prior_has_the_poisson_gamma_limit_even_without_events ... ok
+test joint::integration::score_error_tests::rare_large_scores_retain_their_sampling_error ... ok
+test joint::integration::score_error_tests::student_proposal_has_normalized_polynomial_tails_and_finite_weight_variance ... ok
+test joint::posterior::tests::structured_precision_is_the_hessian_of_the_complete_density ... ok
+test joint::precision::tests::structured_draw_map_has_the_inverse_precision_covariance ... ok
+test joint::reference::rank_zero::tests::analytic_rate_integrals_match_independent_quadrature_through_four_derivatives ... ok
+test joint::reference::rank_zero::tests::rank_zero_reference_preserves_competing_risk_survival_and_total_derivatives ... ok
+test joint::reference::tests::rare_event_probabilities_keep_their_log_sensitivities ... ok
+test joint::reference::tests::reference_moment_errors_do_not_multiply_underflow_by_overflow ... ok
+test joint::cohort::tests::cohort_shares_reference_states_and_preserves_total_scores_and_means ... ok
+test joint::reference_tests::joint_reference_carries_competing_risk_sets_and_rejects_unresolved_steps ... ok
+test joint::reference_tests::joint_reference_derivatives_include_genetics_jumps_and_event_weights ... ok
+test joint::reference_tests::analytic_reference_jacobians_match_all_parameter_channels_and_pooling ... ok
+test joint::reference_tests::reference_resolution_uses_the_analytic_rank_zero_law ... ok
+test joint::reference_tests::normalized_joint_integral_uses_the_returned_reference_state_and_total_score ... ok
+test joint::resolution::functional::tests::population_deletion_matches_direct_repooling_including_sensitivities ... ok
+test joint::resolution::functional::tests::shared_reference_jackknife_scales_with_cohort_size_and_keeps_large_errors ... ok
+test joint::resolution::tests::reference_replicates_pool_risk_weighted_moments_and_measure_between_bank_error ... ok
+test joint::score::tests::full_path_coefficient_score_speed ... ok
+test joint::score::tests::full_path_score_includes_shapes_genetic_drive_jumps_and_reference ... ok
+test joint::score::tests::innovation_transport_preserves_anchor_weights_and_total_scores_away_from_the_anchor ... ok
+test joint::score::tests::integrated_analytic_score_matches_the_fixed_importance_objective ... ok
+test joint::tests::analytic_rank_zero_scores_keep_observation_and_reference_derivatives ... ok
+test joint::tests::complete_joint_density_derivatives_match_finite_differences ... ok
+test joint::tests::event_jumps_act_after_event_intensity_and_respect_measurement_timing ... ok
+test joint::tests::genetic_drive_and_prevalence_condition_the_entry_state ... ok
+test joint::tests::importance_correction_matches_an_independent_measurement_integral ... ok
+test joint::tests::importance_integral_conditions_missing_genetics_under_the_full_joint_prior ... ok
+test joint::tests::measurement_families_are_normalized_and_have_stable_curvature ... ok
+test joint::tests::missing_measurements_integrate_to_one_and_missing_genetics_are_latent ... ok
+test joint::tests::positive_decoder_is_a_sum_and_stays_in_the_log_domain ... ok
+test joint::tests::sampled_objective_and_derivatives_include_the_same_reference_sensitivities ... ok
+test joint::tests::structured_gaussian_limit_integrates_missing_scores_and_large_state_paths ... ok
+test joint::tests::structured_posterior_assimilates_a_measurement_and_missing_values_do_not ... ok
+test joint::tests::structured_rank_zero_integral_has_no_spurious_latent_normalization ... ok
+test joint::tests::zero_signatures_reproduce_the_counting_process_density ... ok
+test joint::transport::tests::posterior_moments_follow_the_current_entry_and_drive_with_the_same_innovations ... ok
+test joint::reference_tests::resolved_positive_reference_matches_the_static_survival_and_selected_law ... ok
+
+test result: ok. 71 passed; 0 failed; 0 ignored; 0 measured; 51 filtered out; finished in 6.85s
+
+
+
+running 1 test
+test joint::decoder::tests::prepared_decoder_speed ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 121 filtered out; finished in 0.04s
+
+decoder: direct=25.881818ms, prepared=10.547638ms, ratio=2.454
+
+
+running 1 test
+test joint::cohort::coefficients::inference::tests::nonzero_signature_cohort_reaches_coefficient_inference ... FAILED
+
+failures:
+
+failures:
+    joint::cohort::coefficients::inference::tests::nonzero_signature_cohort_reaches_coefficient_inference
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 121 filtered out; finished in 1.40s
+
+nonzero inference: 8 coefficients, 7 strengths
+coefficient pilot evaluation 1: elapsed 10.129µs
+coefficient pilot evaluation 2: elapsed 624.130876ms
+
+thread 'joint::cohort::coefficients::inference::tests::nonzero_signature_cohort_reaches_coefficient_inference' (1953616) panicked at crates/gam-event-history/src/joint/coefficient_inference.rs:485:14:
+called `Result::unwrap()` on an `Err` value: CoefficientIntegration { coefficients: [-0.11464603499500814, -0.03032642751091208, -0.5528964352985355, 0.02201222763428598, 0.17651650147668052, 0.7811033523685109, 0.037514746956117784, 1.1650115149929932], source: IntegrationResolution { reason: "joint reference accuracy invalidated at these coefficients: log error 0.22250694838137206, risk error 0, minimum risk ESS 123.09034417993375; resolve again outside the objective evaluation" } }
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace

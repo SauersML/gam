@@ -386,12 +386,14 @@ impl ResolvedReference<'_> {
             &evaluate(&self.large)?,
         )?;
         if !self.accepted(&result.report) {
-            return Err(numerical(format!(
-                "joint reference accuracy invalidated at these coefficients: log error {}, risk error {}, minimum risk ESS {}; resolve again outside the objective evaluation",
-                result.report.log_error_estimate,
-                result.report.risk_error_estimate,
-                result.report.minimum_risk_effective_samples
-            )));
+            return Err(EventHistoryError::IntegrationResolution {
+                reason: format!(
+                    "joint reference accuracy invalidated at these coefficients: log error {}, risk error {}, minimum risk ESS {}; resolve again outside the objective evaluation",
+                    result.report.log_error_estimate,
+                    result.report.risk_error_estimate,
+                    result.report.minimum_risk_effective_samples
+                ),
+            });
         }
         Ok(result)
     }

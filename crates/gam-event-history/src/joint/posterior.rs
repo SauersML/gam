@@ -167,6 +167,7 @@ impl JointLikelihood {
     ) -> Result<(), EventHistoryError> {
         let k = self.spec.signatures;
         let m = precision.genes;
+        let decoder = super::decoder::PreparedDecoder::new(self, theta);
         let mut risk = h.initially_at_risk.clone();
         for n in 0..h.times.len() {
             let base = m + n * k;
@@ -175,24 +176,15 @@ impl JointLikelihood {
                 if !risk[d] {
                     continue;
                 }
-                let weights = &theta
-                    [self.layout.decoder.start + d * k..self.layout.decoder.start + (d + 1) * k];
-                let mut numerator = vec![0.0];
-                let mut denominator = vec![0.0];
-                for axis in 0..k {
-                    numerator.push(weights[axis] + emission::log_softplus(&x[axis]));
-                    denominator.push(weights[axis]);
-                }
-                let log_numerator = log_sum_exp(&numerator);
+                let weights = &decoder.weights(d)[1..];
+                let log_activity = decoder.activity(d, x);
                 let baseline: f64 = (0..self.spec.baseline_columns)
                     .map(|b| {
                         theta[self.layout.baseline.start + d * self.spec.baseline_columns + b]
                             * h.baseline_design[[n, b]]
                     })
                     .sum();
-                let log_rate = baseline + log_numerator
-                    - log_sum_exp(&denominator)
-                    - reference[n * self.spec.marks.len() + d];
+                let log_rate = baseline + log_activity - reference[n * self.spec.marks.len() + d];
                 let compensator = if h.exposure[n] == 0.0 {
                     0.0
                 } else {
@@ -202,7 +194,7 @@ impl JointLikelihood {
                 let residual = event - compensator;
                 let u: Vec<f64> = (0..k)
                     .map(|axis| {
-                        (weights[axis] - emission::softplus(&(-x[axis])) - log_numerator).exp()
+                        (weights[axis] - emission::softplus(&(-x[axis])) - log_activity).exp()
                     })
                     .collect();
                 for axis in 0..k {

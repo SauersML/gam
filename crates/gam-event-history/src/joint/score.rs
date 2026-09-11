@@ -150,6 +150,7 @@ impl JointLikelihood {
                 }
             }
         }
+        let decoder = super::decoder::PreparedDecoder::new(self, theta);
         let mut risk = h.initially_at_risk.clone();
         for n in 0..h.times.len() {
             for d in 0..marks {
@@ -157,21 +158,15 @@ impl JointLikelihood {
                     continue;
                 }
                 let start = self.layout.decoder.start + d * k;
-                let mut numerator = vec![0.0];
-                let mut denominator = vec![0.0];
-                for axis in 0..k {
-                    numerator.push(theta[start + axis] + emission::log_softplus(&state(n)[axis]));
-                    denominator.push(theta[start + axis]);
-                }
-                let log_num = log_sum_exp(&numerator);
-                let log_den = log_sum_exp(&denominator);
+                let weights = decoder.weights(d);
+                let log_activity = decoder.activity(d, state(n));
                 let baseline: f64 = (0..self.spec.baseline_columns)
                     .map(|b| {
                         theta[self.layout.baseline.start + d * self.spec.baseline_columns + b]
                             * h.baseline_design[[n, b]]
                     })
                     .sum();
-                let log_rate = baseline + log_num - log_den - reference[n * marks + d];
+                let log_rate = baseline + log_activity - reference[n * marks + d];
                 let exposure = if h.exposure[n] == 0.0 {
                     0.0
                 } else {
@@ -186,13 +181,15 @@ impl JointLikelihood {
                 }
                 for axis in 0..k {
                     coefficients[start + axis] += residual
-                        * ((numerator[axis + 1] - log_num).exp()
-                            - (denominator[axis + 1] - log_den).exp());
+                        * ((weights[axis + 1] + emission::log_softplus(&state(n)[axis])
+                            - log_activity)
+                            .exp()
+                            - weights[axis + 1].exp());
                     if !dynamics {
                         state_score[n * k + axis] += residual
-                            * (theta[start + axis]
+                            * (weights[axis + 1]
                                 - emission::softplus(&(-state(n)[axis]))
-                                - log_num)
+                                - log_activity)
                                 .exp();
                     }
                 }
@@ -529,6 +526,24 @@ mod tests {
             minimum_effective_samples: 16.0,
             ..IntegrationAccuracy::default()
         };
+        assert_eq!(
+            bank.reference_difference_error(&theta, &reference, &reference, &accuracy)
+                .unwrap(),
+            0.0
+        );
+        let shifted: Vec<_> = reference.iter().map(|v| v + 0.01).collect();
+        let paired = bank
+            .reference_difference_error(&theta, &reference, &shifted, &accuracy)
+            .unwrap();
+        let separate = bank
+            .log_marginal(&theta, &reference, &accuracy)
+            .unwrap()
+            .log_standard_error
+            + bank
+                .log_marginal(&theta, &shifted, &accuracy)
+                .unwrap()
+                .log_standard_error;
+        assert!(paired > 0.0 && paired < separate);
         let out = bank
             .log_marginal_score(&theta, &reference, jacobian.view(), &accuracy)
             .unwrap();

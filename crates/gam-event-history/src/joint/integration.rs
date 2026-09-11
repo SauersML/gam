@@ -627,11 +627,13 @@ impl JointIntegration<'_> {
             || effective_samples + 16.0 * f64::EPSILON * (samples as f64)
                 < accuracy.minimum_effective_samples
         {
-            return Err(numerical(format!(
-                "joint importance integral unresolved: estimated log SE {log_standard_error:.6}, \
+            return Err(EventHistoryError::IntegrationResolution {
+                reason: format!(
+                    "joint importance integral unresolved: estimated log SE {log_standard_error:.6}, \
                 effective samples {effective_samples:.1}/{samples}; requested SE {} and effective samples {}",
-                accuracy.log_standard_error, accuracy.minimum_effective_samples
-            )));
+                    accuracy.log_standard_error, accuracy.minimum_effective_samples
+                ),
+            });
         }
         Ok((
             IntegratedLikelihood {
@@ -657,6 +659,27 @@ impl JointIntegration<'_> {
         accuracy: &IntegrationAccuracy,
     ) -> Result<IntegratedLikelihood<S>, EventHistoryError> {
         Ok(self.evaluate(theta, reference, accuracy)?.0)
+    }
+
+    /// Paired delta-method error of log L(second) - log L(first). Shared
+    /// innovations induce covariance; summing separate errors discards it.
+    pub(super) fn reference_difference_error(
+        &self,
+        theta: &[f64],
+        first: &[f64],
+        second: &[f64],
+        accuracy: &IntegrationAccuracy,
+    ) -> Result<f64, EventHistoryError> {
+        let (_, a) = self.evaluate(theta, first, accuracy)?;
+        let (_, b) = self.evaluate(theta, second, accuracy)?;
+        if a.is_empty() {
+            return Ok(0.0);
+        }
+        let correction = (a.len() as f64 / (a.len() - 1) as f64).sqrt();
+        Ok(a.iter()
+            .zip(&b)
+            .fold(0.0_f64, |sum, (x, y)| sum.hypot(x - y))
+            * correction)
     }
 
     /// Self-normalized importance moments with delta-method standard errors.

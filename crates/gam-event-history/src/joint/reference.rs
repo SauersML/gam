@@ -470,7 +470,7 @@ impl JointReferenceBank<'_> {
 
     fn moments<S: JetField>(
         &self,
-        theta: &[S],
+        decoder: &super::decoder::PreparedDecoder<S>,
         population: &Population<S>,
         diagnostics: &mut ReferenceDiagnostics,
     ) -> Result<(Vec<S>, Vec<S>), EventHistoryError> {
@@ -499,7 +499,7 @@ impl JointReferenceBank<'_> {
             let mass = log_sum_exp(&weights);
             let activities: Vec<S> = active
                 .iter()
-                .map(|&p| self.model.activity(theta, d, &population.states[p]))
+                .map(|&p| decoder.activity(d, &population.states[p]))
                 .collect();
             let numerator: Vec<S> = weights
                 .iter()
@@ -568,6 +568,7 @@ impl JointReferenceBank<'_> {
             return self.rank_zero_evolution(theta);
         }
         let zero = theta[0].constant_like(0.0);
+        let decoder = super::decoder::PreparedDecoder::new(self.model, theta);
         let entry = self.model.entry_features(&self.profile.history(marks));
         let genes: Vec<Vec<S>> = self
             .genes
@@ -607,7 +608,7 @@ impl JointReferenceBank<'_> {
             maximum_step_hazard: 0.0,
         };
         let (mut log_moments, mut log_risk_mass) =
-            self.moments(theta, &population, &mut diagnostics)?;
+            self.moments(&decoder, &population, &mut diagnostics)?;
         let mut times = vec![self.profile.times[0]];
         for n in 1..nodes {
             let dt = self.profile.times[n] - self.profile.times[n - 1];
@@ -646,7 +647,7 @@ impl JointReferenceBank<'_> {
                 }
             };
             propagate(&mut population, 2 * n - 1);
-            let (midpoint, mid_mass) = self.moments(theta, &population, &mut diagnostics)?;
+            let (midpoint, mid_mass) = self.moments(&decoder, &population, &mut diagnostics)?;
             log_moments.extend(midpoint.iter().cloned());
             let middle_mass_start = log_risk_mass.len();
             log_risk_mass.extend(mid_mass);
@@ -670,7 +671,7 @@ impl JointReferenceBank<'_> {
                     }
                     log_rates.push(
                         baseline
-                            .add(&self.model.activity(theta, d, &population.states[p]))
+                            .add(&decoder.activity(d, &population.states[p]))
                             .sub(&midpoint[d]),
                     );
                 }
@@ -756,7 +757,7 @@ impl JointReferenceBank<'_> {
                 }
             }
             propagate(&mut population, 2 * n);
-            let (moment, mass) = self.moments(theta, &population, &mut diagnostics)?;
+            let (moment, mass) = self.moments(&decoder, &population, &mut diagnostics)?;
             // The full killed step supplies the endpoint mass. Its log-linear
             // interpolation supplies the midpoint mass at the midpoint time;
             // labeling the interval-start mass as a midpoint creates a lag
@@ -851,11 +852,17 @@ mod tests {
             minimum_risk_effective_samples: 2.0,
             maximum_step_hazard: 0.0,
         };
-        let (moments, _) = bank.moments(&theta, &population, &mut diagnostic).unwrap();
+        let decoder = super::decoder::PreparedDecoder::new(&model, &theta);
+        let (moments, _) = bank
+            .moments(&decoder, &population, &mut diagnostic)
+            .unwrap();
         assert!(moments[0].is_finite());
         assert!(diagnostic.maximum_log_moment_standard_error > 1e-50);
         assert!(diagnostic.maximum_log_moment_standard_error < 1e-45);
         population.states[0][0] = f64::INFINITY;
-        assert!(bank.moments(&theta, &population, &mut diagnostic).is_err());
+        assert!(
+            bank.moments(&decoder, &population, &mut diagnostic)
+                .is_err()
+        );
     }
 }

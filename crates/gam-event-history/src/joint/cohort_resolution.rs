@@ -57,6 +57,7 @@ struct ChannelError {
     time_discrepancy: f64,
     particle_discrepancy: f64,
     bias: f64,
+    paired_conditional: Option<[f64; 2]>,
 }
 
 impl ChannelError {
@@ -75,10 +76,12 @@ impl ChannelError {
         // Reference ensembles are independent. Subject banks are reused
         // between resolutions, so sum their conditional SEs for differences;
         // treating those conditional errors as independent would be wrong.
-        let time =
-            self.reference[0].hypot(self.reference[1]) + self.conditional[0] + self.conditional[1];
-        let particle =
-            self.reference[1].hypot(self.reference[2]) + self.conditional[1] + self.conditional[2];
+        let paired = self.paired_conditional.unwrap_or([
+            self.conditional[0] + self.conditional[1],
+            self.conditional[1] + self.conditional[2],
+        ]);
+        let time = self.reference[0].hypot(self.reference[1]) + paired[0];
+        let particle = self.reference[1].hypot(self.reference[2]) + paired[1];
         let final_error = self.reference[2].hypot(self.conditional[2]);
         self.time_discrepancy
             + self.particle_discrepancy
@@ -88,6 +91,87 @@ impl ChannelError {
 }
 
 impl JointCohortIntegration<'_, '_> {
+    /// Coefficient quadrature and predictive mixtures need resolved VALUES,
+    /// not a coefficient-score certificate at every integration node. Their
+    /// strength derivatives differentiate the cached values and function prior.
+    /// The returned estimate still includes shared-reference deletions and
+    /// time/particle comparisons at fixed coefficients and fixed innovations.
+    pub(in crate::joint) fn resolved_log_integral(
+        &self,
+        theta: &[f64],
+        accuracy: &IntegrationAccuracy,
+        tolerance: &CohortScoreTolerance,
+    ) -> Result<(f64, f64), EventHistoryError> {
+        if [tolerance.log_error, tolerance.standard_error_multiplier]
+            .iter()
+            .any(|v| !v.is_finite() || *v <= 0.0)
+        {
+            return Err(invalid(
+                "likelihood resolution needs positive finite value/error targets",
+            ));
+        }
+        let authoritative = self.log_likelihood(theta, accuracy)?;
+        let mut channel = ChannelError {
+            paired_conditional: Some([0.0; 2]),
+            ..ChannelError::default()
+        };
+        for (stratum, reference) in self.references.iter().enumerate() {
+            let assessed = reference.assess_values(
+                theta,
+                |curve| {
+                    let mut value = 0.0;
+                    let mut correction = 0.0;
+                    let mut error = 0.0_f64;
+                    for (subject, &assigned) in self.subjects.iter().zip(self.strata) {
+                        if assigned != stratum {
+                            continue;
+                        }
+                        let moments = curve.at(&subject.history.times)?;
+                        let result = subject.log_marginal(theta, &moments, accuracy)?;
+                        let add = result.log_marginal - correction;
+                        let next = value + add;
+                        correction = (next - value) - add;
+                        value = next;
+                        error = error.hypot(result.log_standard_error);
+                    }
+                    Ok(FunctionalValue {
+                        values: vec![value],
+                        conditional_standard_error: vec![error],
+                    })
+                },
+                |first, second| {
+                    let mut error = 0.0_f64;
+                    for (subject, &assigned) in self.subjects.iter().zip(self.strata) {
+                        if assigned != stratum {
+                            continue;
+                        }
+                        let a = first.at(&subject.history.times)?;
+                        let b = second.at(&subject.history.times)?;
+                        error = error
+                            .hypot(subject.reference_difference_error(theta, &a, &b, accuracy)?);
+                    }
+                    Ok(error)
+                },
+            )?;
+            channel.add(&assessed.assessment, 0);
+            let pairs = channel
+                .paired_conditional
+                .as_mut()
+                .expect("paired likelihood assessment");
+            for (total, value) in pairs.iter_mut().zip(assessed.conditional_difference) {
+                *total = total.hypot(value);
+            }
+        }
+        let error = channel.estimate(tolerance.standard_error_multiplier);
+        if !error.is_finite() || error > tolerance.log_error {
+            return Err(numerical(format!(
+                "joint cohort likelihood resolution failed: log error {error} (budget {}); refine outside the objective evaluation",
+                tolerance.log_error
+            )));
+        }
+        Ok((*authoritative.log_likelihood(), error))
+    }
+
     fn stratum_functional(
         &self,
         stratum: usize,

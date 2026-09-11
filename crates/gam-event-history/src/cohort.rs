@@ -35,6 +35,18 @@ pub enum EventHistoryError {
     InvalidInput { reason: String },
     #[error("{reason}")]
     NumericalFailure { reason: String },
+    /// A finite coefficient point needs a different integration bank or
+    /// resolution. It is not outside the probability model's parameter space.
+    #[error("{reason}")]
+    IntegrationResolution { reason: String },
+    #[error(
+        "coefficient integration requires refinement before optimization can continue: {source}"
+    )]
+    CoefficientIntegration {
+        coefficients: Vec<f64>,
+        #[source]
+        source: Box<EventHistoryError>,
+    },
     #[error(
         "joint reference event step is unresolved (log hazard {log_hazard}, limit {maximum}); refine the reference time grid"
     )]

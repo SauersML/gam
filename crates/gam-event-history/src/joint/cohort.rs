@@ -178,10 +178,12 @@ fn assemble<S: JetField>(
         .iter()
         .fold(0.0_f64, |sum, s| sum.hypot(s.log_standard_error));
     if conditional_log_standard_error > accuracy.log_standard_error {
-        return Err(numerical(format!(
-            "joint cohort importance integral unresolved: conditional log SE {conditional_log_standard_error}, requested {}",
-            accuracy.log_standard_error
-        )));
+        return Err(EventHistoryError::IntegrationResolution {
+            reason: format!(
+                "joint cohort importance integral unresolved: conditional log SE {conditional_log_standard_error}, requested {}",
+                accuracy.log_standard_error
+            ),
+        });
     }
     // Pairwise summation retains small derivative contributions as the cohort
     // grows, including when many subject scores cancel near a stationary fit.
@@ -545,6 +547,24 @@ mod tests {
             analytic.evaluation().log_likelihood()
         );
         assert!(resolved.report().reference_log_standard_error > 0.0);
+        let (value_only, value_error) = cohort
+            .resolved_log_integral(&theta, &accuracy, &tolerance)
+            .unwrap();
+        assert_eq!(value_only, *resolved.score().evaluation().log_likelihood());
+        assert!(value_error > 0.0 && value_error < resolved.report().log_error_estimate);
+        assert!(
+            cohort
+                .resolved_log_integral(
+                    &theta,
+                    &accuracy,
+                    &CohortScoreTolerance {
+                        log_error: value_error * 0.5,
+                        coefficient_score_error: vec![],
+                        standard_error_multiplier: 3.0,
+                    }
+                )
+                .is_err()
+        );
         assert!(
             resolved
                 .report()
@@ -586,6 +606,23 @@ mod tests {
             .function_priors(&histories.iter().collect::<Vec<_>>(), 64 << 20)
             .unwrap();
         let strengths = vec![0.3; priors.penalties().len()];
+        let unresolved = cohort
+            .guided_coefficient_proposal(
+                &priors,
+                &theta,
+                &strengths,
+                &IntegrationAccuracy {
+                    log_standard_error: 1e-12,
+                    ..accuracy.clone()
+                },
+                &CoefficientPilotOptions::default(),
+            )
+            .err()
+            .unwrap();
+        assert!(
+            matches!(unresolved, EventHistoryError::CoefficientIntegration { coefficients, source }
+            if coefficients == theta && matches!(*source, EventHistoryError::IntegrationResolution { .. }))
+        );
         let mut coefficient_draws = Vec::new();
         let mut direct_weights = Vec::new();
         for _ in 0..2 {

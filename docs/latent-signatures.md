@@ -383,7 +383,7 @@ against independent formulas.
 
 `JointCohortIntegration::coefficient_integral` evaluates the cohort at supplied
 independent draws from a normalized coefficient proposal. Every draw first
-passes the whole-cohort reference/value/score resolution assessment. Its
+passes a whole-cohort likelihood-value resolution assessment. Its
 likelihood is then cached, so a strength evaluation does not rerun subjects
 or reference populations. For draw `theta_s` from density `q`, it computes
 
@@ -393,6 +393,25 @@ g(rho) = sum_s w_s partial_rho log p(theta_s|rho).
 H(rho) = sum_s w_s partial_rho^2 log p(theta_s|rho)
          + Cov_w(partial_rho log p(theta_s|rho)).
 ```
+
+The value assessment evolves the same reference ensembles and checks the
+complete stratum likelihood under each population deletion. It retains shared
+reference uncertainty, time/particle discrepancies and conditional subject
+sampling error. For the coarse/fine comparisons, the same subject innovations
+give a paired log-ratio standard error:
+`sqrt(S/(S-1) * sum_s (w_fine,s - w_coarse,s)^2)`. Identical reference curves
+therefore have zero conditional comparison error. Independent subjects combine
+by root-sum-square; the reference populations retain their separate uncertainty.
+The same value assessment serves predictive coefficient mixtures.
+
+These draws are integration nodes, not coefficient stationary points. Their
+likelihood values do not require constructing a coefficient Jacobian or
+certifying its score at every node. The score and its resolution checkpoint
+remain available for coefficient optimization. The coefficient-integrated
+strength derivatives below depend on the cached likelihood and function prior,
+so eliminating those unused Jacobians changes neither that sampled objective
+nor its derivatives. Only the likelihood budget and error multiplier in the
+supplied cohort tolerance apply to this value assessment.
 
 These are analytic derivatives of that same sampled integral. The covariance
 term includes cross-strength curvature even when every conditional prior has
@@ -890,6 +909,14 @@ or a Cartesian state grid. Retaining S importance paths costs O(S(NK+G)) storage
 the API checks that additional memory budget before allocating them. A modest
 state factorization alone does not guarantee that importance sampling remains
 effective as the number of observations grows.
+
+An invalidated reference/importance resolution is a numerical refinement
+request, not a forbidden statistical parameter value. The coefficient pilot
+stops on these failures and returns `CoefficientIntegration`, carrying the
+trial coefficient vector and its underlying error. It must not backtrack to
+the edge of the currently usable bank and call that edge an optimum. The
+controller still needs to rebuild or refine banks outside the fixed objective
+and restart the solve; this general restart workflow remains unfinished.
 
 Signature capacity grows through proposed splits/additions and shrinks through
 hierarchical priors. The number of provisioned coordinates is a computational

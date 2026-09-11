@@ -3,6 +3,8 @@
 //! subjects using that population; particles within a population are not iid
 //! replicates. All meshes and random draws remain fixed during this assessment.
 use super::*;
+#[path = "reference_value.rs"]
+mod value;
 
 pub(in crate::joint) struct FunctionalValue {
     pub values: Vec<f64>,
@@ -349,6 +351,11 @@ mod tests {
                 diagnostics: curve.diagnostics.clone(),
             });
             let deleted = leave_one_out(&combined, &single, curves.len(), 1 << 20).unwrap();
+            let values =
+                value::delete_population(combined.reference(), single.reference(), curves.len())
+                    .unwrap();
+            assert_eq!(values.log_moments, deleted.reference().log_moments);
+            assert_eq!(values.log_risk_mass, deleted.reference().log_risk_mass);
             let retained: Vec<_> = curves
                 .iter()
                 .enumerate()

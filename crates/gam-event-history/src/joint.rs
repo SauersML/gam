@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 use std::ops::Range;
 
 mod cohort;
+mod decoder;
 mod decoder_prior;
 mod emission;
 mod function_prior;
@@ -392,14 +393,7 @@ impl JointLikelihood {
     }
 
     fn activity<S: JetField>(&self, theta: &[S], mark: usize, state: &[S]) -> S {
-        let mut numerator = vec![theta[0].constant_like(0.0)];
-        let mut denominator = numerator.clone();
-        for (k, x) in state.iter().enumerate() {
-            let weight = &theta[self.layout.decoder.start + mark * self.spec.signatures + k];
-            numerator.push(weight.add(&emission::log_softplus(x)));
-            denominator.push(weight.clone());
-        }
-        log_sum_exp(&numerator).sub(&log_sum_exp(&denominator))
+        decoder::PreparedDecoder::new(self, theta).activity(mark, state)
     }
 
     fn mean<S: JetField>(
@@ -538,6 +532,7 @@ impl JointLikelihood {
                 }
             }
         }
+        let decoder = decoder::PreparedDecoder::new(self, theta);
         let mut risk = h.initially_at_risk.clone();
         for n in 0..h.times.len() {
             for d in 0..marks {
@@ -552,7 +547,7 @@ impl JointLikelihood {
                     );
                 }
                 let log_rate = eta
-                    .add(&self.activity(theta, d, state(n)))
+                    .add(&decoder.activity(d, state(n)))
                     .sub(&log_reference_moments[n * marks + d]);
                 if h.exposure[n] > 0.0 {
                     result = result.sub(&exp(&log_rate).scale(h.exposure[n]));

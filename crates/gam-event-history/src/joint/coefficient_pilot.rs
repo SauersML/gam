@@ -90,12 +90,38 @@ impl JointCohortIntegration<'_, '_> {
             ));
         }
         let last_rejected = std::cell::RefCell::new(None);
+        let needs_refinement = std::cell::RefCell::new(None);
+        #[cfg(test)]
+        let trace = (std::time::Instant::now(), std::cell::Cell::new(0_usize));
         let objective = opt::FusedObjective::new(|theta: &Array1<f64>| {
+            #[cfg(test)]
+            {
+                let count = trace.1.get() + 1;
+                trace.1.set(count);
+                if count.is_power_of_two() {
+                    eprintln!(
+                        "coefficient pilot evaluation {count}: elapsed {:?}",
+                        trace.0.elapsed()
+                    );
+                }
+            }
             let theta = theta.to_vec();
             let value = self
                 .score_with_function_priors(&theta, priors, log_strengths, accuracy)
                 .map_err(|error| {
                     *last_rejected.borrow_mut() = Some(error.to_string());
+                    if matches!(
+                        &error,
+                        EventHistoryError::ReferenceStep { .. }
+                            | EventHistoryError::IntegrationResolution { .. }
+                    ) {
+                        let refinement = EventHistoryError::CoefficientIntegration {
+                            coefficients: theta.clone(),
+                            source: Box::new(error),
+                        };
+                        *needs_refinement.borrow_mut() = Some(refinement.clone());
+                        return opt::ObjectiveEvalError::fatal_from(refinement);
+                    }
                     opt::ObjectiveEvalError::recoverable_from(error)
                 })?;
             Ok(opt::FirstOrderSample {
@@ -118,6 +144,9 @@ impl JointCohortIntegration<'_, '_> {
             )
             .run_with_metric()
             .map_err(|e| {
+                if let Some(error) = needs_refinement.borrow_mut().take() {
+                    return error;
+                }
                 numerical(format!(
                     "coefficient proposal optimization failed: {e}; last rejected evaluation: {:?}",
                     last_rejected.borrow()
