@@ -565,7 +565,8 @@ fn simultaneous_critical(
 
 fn fill_standard_normals(rng: &mut StdRng, output: &mut [f64]) {
     for pair in output.chunks_mut(2) {
-        let uniform_radius = rng.random::<f64>().max(f64::MIN_POSITIVE);
+        // The complement of a [0, 1) draw lies in (0, 1], so `ln` is finite.
+        let uniform_radius = 1.0 - rng.random::<f64>();
         let uniform_angle = rng.random::<f64>();
         let radius = (-2.0 * uniform_radius.ln()).sqrt();
         let angle = std::f64::consts::TAU * uniform_angle;

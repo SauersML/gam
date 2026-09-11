@@ -728,7 +728,8 @@ fn sample_standard_normal<R: rand::Rng + ?Sized>(rng: &mut R) -> f64 {
     // Box-Muller transform — sufficient for posterior-mean-style sampling.
     // The same construction is used by the NUTS warmup; keeping it in
     // sync avoids two divergent gaussian RNG paths inside the engine.
-    let u1 = rng.random::<f64>().max(1e-16);
+    // `random::<f64>()` lies in [0, 1); its complement lies in (0, 1], so `ln u1` is finite.
+    let u1 = 1.0 - rng.random::<f64>();
     let u2 = rng.random::<f64>();
     (-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos()
 }

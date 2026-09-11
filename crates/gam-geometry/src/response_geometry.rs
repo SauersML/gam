@@ -1986,8 +1986,8 @@ mod tests {
             if let Some(z) = self.spare.take() {
                 return z;
             }
-            // Box–Muller; clamp u1 away from 0 so ln is finite.
-            let u1 = self.u01().max(1e-12);
+            // Box–Muller; `u01` draws from the open interval (0, 1), so `ln u1` is finite.
+            let u1 = self.u01();
             let u2 = self.u01();
             let r = (-2.0 * u1.ln()).sqrt();
             let theta = 2.0 * std::f64::consts::PI * u2;

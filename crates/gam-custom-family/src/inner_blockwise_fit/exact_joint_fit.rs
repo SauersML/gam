@@ -5436,8 +5436,12 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
                     }
                     max_ratio = max_ratio.max(ratio);
                 }
-                if valid {
-                    Some(objective_change / (1.0 - max_ratio).max(1.0e-12))
+                // A contraction `1 − r` inside the rounding band `γ₃·r` of a ratio of
+                // two decrements bounds nothing.
+                if valid
+                    && 1.0 - max_ratio > gam_linalg::roundoff::accumulation_growth(3) * max_ratio
+                {
+                    Some(objective_change / (1.0 - max_ratio))
                 } else {
                     None
                 }

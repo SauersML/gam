@@ -40,11 +40,18 @@ pub fn rho_so2_jvp(theta: ArrayView1<'_, f64>) -> Array3<f64> {
 /// Closed-form `SO(3)` exponential `exp([ω]×)` (Rodrigues) for a single
 /// rotation vector, returned as a row-major 3×3 array.
 pub fn rho_so3_single(ox: f64, oy: f64, oz: f64) -> [[f64; 3]; 3] {
-    let angle = (ox * ox + oy * oy + oz * oz).sqrt().max(1.0e-12);
-    let ax = ox / angle;
-    let ay = oy / angle;
-    let az = oz / angle;
-    let k = [[0.0, -az, ay], [az, 0.0, -ax], [-ay, ax, 0.0]];
+    // Rodrigues in the unnormalised vector ω = θ·a: R = I + (sin θ/θ)·[ω]× +
+    // ((1 − cos θ)/θ²)·[ω]×², with 1 − cos θ = 2·sin²(θ/2), so both coefficients take
+    // their exact limits 1 and ½ at θ = 0 without normalising the axis.
+    let angle = (ox * ox + oy * oy + oz * oz).sqrt();
+    let half_angle = 0.5 * angle;
+    let (sinc, half_sinc) = if angle == 0.0 {
+        (1.0, 1.0)
+    } else {
+        (angle.sin() / angle, half_angle.sin() / half_angle)
+    };
+    let versine_coefficient = 0.5 * half_sinc * half_sinc;
+    let k = [[0.0, -oz, oy], [oz, 0.0, -ox], [-oy, ox, 0.0]];
     let mut kk = [[0.0_f64; 3]; 3];
     for i in 0..3 {
         for j in 0..3 {
@@ -55,13 +62,11 @@ pub fn rho_so3_single(ox: f64, oy: f64, oz: f64) -> [[f64; 3]; 3] {
             kk[i][j] = acc;
         }
     }
-    let s = angle.sin();
-    let one_minus_c = 1.0 - angle.cos();
     let mut out = [[0.0_f64; 3]; 3];
     for i in 0..3 {
         for j in 0..3 {
             let id = if i == j { 1.0 } else { 0.0 };
-            out[i][j] = id + s * k[i][j] + one_minus_c * kk[i][j];
+            out[i][j] = id + sinc * k[i][j] + versine_coefficient * kk[i][j];
         }
     }
     out

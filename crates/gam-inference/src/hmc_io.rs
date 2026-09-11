@@ -5107,7 +5107,9 @@ pub fn laplace_directional_cubic_diagnostic(
         .eigh(Side::Lower)
         .map_err(|e| format!("directional cubic diagnostic eigendecomposition failed: {e}"))?;
     let max_eval = evals.iter().fold(0.0_f64, |acc, &ev| acc.max(ev.abs()));
-    let tol = (max_eval * 1.0e-12).max(1.0e-14);
+    // An eigenvalue inside the eigensolver band `p·ε·max|λ|` carries no curvature to
+    // standardize by.
+    let tol = p as f64 * f64::EPSILON * max_eval;
     let mut directional = Array1::<f64>::zeros(p);
     let mut max_abs = 0.0_f64;
 

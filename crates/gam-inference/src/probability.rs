@@ -576,15 +576,16 @@ pub fn tweedie_quantile(q: f64, mu: f64, phi: f64, power: f64) -> f64 {
     }
 
     // Bisection on the strictly-increasing continuous part above the atom.
+    // Bisect until no representable `y` lies strictly between the bracket's ends.
     for _ in 0..200 {
         let mid = 0.5 * (lo + hi);
+        if !(lo < mid && mid < hi) {
+            break;
+        }
         if cdf(mid) < q {
             lo = mid;
         } else {
             hi = mid;
-        }
-        if hi - lo <= (hi.abs() + 1.0) * 1e-12 {
-            break;
         }
     }
     0.5 * (lo + hi)

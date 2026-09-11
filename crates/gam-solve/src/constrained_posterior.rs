@@ -5822,7 +5822,8 @@ mod coverage_gate_tests {
             ((self.next_u64() >> 11) as f64 + 0.5) / (1u64 << 53) as f64
         }
         fn normal(&mut self) -> f64 {
-            let (u1, u2) = (self.unit().max(1.0e-12), self.unit());
+            // `unit` draws from the open interval (0, 1), so `ln u1` is finite.
+            let (u1, u2) = (self.unit(), self.unit());
             (-2.0 * u1.ln()).sqrt() * (std::f64::consts::TAU * u2).cos()
         }
     }
