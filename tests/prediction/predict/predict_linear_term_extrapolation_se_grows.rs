@@ -109,8 +109,8 @@ fn linear_term_prediction_se_grows_outside_training_range() {
         .arg(&out_path);
     run_or_panic(predict_cmd, "gam predict --uncertainty");
 
-    let se = read_column(&out_path, "std_error");
-    let mean = read_column(&out_path, "mean");
+    let se = read_column(&out_path, "posterior_mean_standard_error");
+    let mean = read_column(&out_path, "posterior_mean");
     assert_eq!(se.len(), probes.len(), "one SE per probe");
 
     // Point prediction must extrapolate (sanity: the slope is alive out there).

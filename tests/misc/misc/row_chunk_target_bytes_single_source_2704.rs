@@ -37,8 +37,10 @@ const SCAN_ROOTS: &[&str] = &["crates", "src", "tests", "bench"];
 
 /// This file, relative to the workspace root. It is skipped because it builds
 /// the very spellings it hunts for; a scanner that trips on its own needles
-/// reports a violation that does not exist.
-const THIS_GUARD: &str = "tests/row_chunk_target_bytes_single_source_2704.rs";
+/// reports a violation that does not exist. Taken from `file!()` rather than
+/// spelled out: a hand-written path went stale when the guard moved into
+/// `tests/misc/misc/`, and the guard then reported its own doc comments.
+const THIS_GUARD: &str = file!();
 
 /// Sites that spell the canonical value but mean a DIFFERENT quantity, plus the
 /// canonical definition itself. Each entry is

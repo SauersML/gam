@@ -105,11 +105,14 @@ fn factor_by_emits_independent_per_level_lambda_1427() {
     init_parallelism();
     let cfg = gaussian_cfg();
 
-    // Per-smooth λ count: fit a single standalone `s(x)` on one group's data.
-    // (Robust to `double_penalty`: this is 1 or 2 depending on config, but the
-    // by-factor count must be an exact multiple of it.)
-    let one_group = grouped_dataset(1427, &["a"], 200);
-    let single = fit_from_formula(&format!("y ~ s(x, k={K})"), &one_group, &cfg)
+    // Per-smooth λ count: fit a single standalone `s(x)` (no `by=`), so the
+    // factor column is unused. (Robust to `double_penalty`: this is 1 or 2
+    // depending on config, but the by-factor count must be an exact multiple of
+    // it.) The dataset carries two levels because the fit boundary refuses a
+    // one-level factor column even when the formula never names it.
+    let data2 = grouped_dataset(1427, &["a", "b"], 200);
+    let data3 = grouped_dataset(1427, &["a", "b", "c"], 200);
+    let single = fit_from_formula(&format!("y ~ s(x, k={K})"), &data2, &cfg)
         .expect("standalone s(x) fit ok");
     let per_smooth_lambdas = n_lambdas(&single);
     assert!(
@@ -118,8 +121,6 @@ fn factor_by_emits_independent_per_level_lambda_1427() {
     );
 
     // Now the by-factor smooths at L=2 and L=3 levels.
-    let data2 = grouped_dataset(1427, &["a", "b"], 200);
-    let data3 = grouped_dataset(1427, &["a", "b", "c"], 200);
     let by2 = fit_from_formula(&format!("y ~ s(x, by=g, k={K})"), &data2, &cfg)
         .expect("by-factor L=2 fit ok");
     let by3 = fit_from_formula(&format!("y ~ s(x, by=g, k={K})"), &data3, &cfg)

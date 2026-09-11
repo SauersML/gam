@@ -220,7 +220,9 @@ fn factor_smooth_forms_route_to_new_termspec_variants() {
         }
     ));
 
-    let parsed = parse_formula("y ~ s(fac, x, bs=re, k=5)").unwrap();
+    // `bs=re` is a parametric random intercept + slope with no basis dimension,
+    // so the builder refuses `k=` for it; the flavour is selected without one.
+    let parsed = parse_formula("y ~ s(fac, x, bs=re)").unwrap();
     let spec = build_termspec(
         &parsed.terms,
         &ds,
@@ -282,7 +284,7 @@ fn new_factor_smooth_terms_build_designs() {
         "y ~ s(x, by=z)",
         "y ~ fs(x, fac, k=5)",
         "y ~ sz(fac, x, k=5)",
-        "y ~ s(fac, x, bs=re, k=5) + group(fac)",
+        "y ~ s(fac, x, bs=re) + group(fac)",
     ] {
         let parsed = parse_formula(formula).unwrap();
         let mut notes = Vec::new();
