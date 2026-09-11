@@ -3751,9 +3751,17 @@ fn auto_streaming_engages_for_large_synthetic_basis() {
 ///
 /// On the same fixed quadrature nodes the analytic partials are the exact
 /// κ-derivatives of the value, so a Richardson difference of the value differs
-/// from them only by its own error. At `h = 3e-4·κ` and local κ-exponents up to
-/// ~42 that is ≈ 4e-8 (first) and ≈ 1e-6 (second) of the derivative's scale,
-/// below the 1e-6 and 1e-4 bars used here.
+/// from them only by the difference's own error. That error is measured here,
+/// not assumed. The Richardson levels at `h` and `2h` disagree by about 15 times
+/// the truncation error at `h`, so their disagreement bounds the reference; a
+/// floor of 1e-9 of the derivative's scale covers a coincidentally small
+/// disagreement.
+///
+/// A hand-derived budget missed at the first point it met. It assumed a power-law
+/// κ-dependence, and at κ = 0.607, κR = 0.3 the third radial derivative agreed to
+/// rel 1.29e-6 against a 1e-6 bar (MSI job 399029), because κ enters through
+/// `M_{n+1}(uκR)` with `n = 22`, far steeper than any power law. The replaced
+/// partial-fraction partial was wrong by rel 1.00 at the same kind of point.
 #[test]
 fn schwinger_kappa_partials_are_the_derivatives_of_the_values_chart_2735() {
     use super::closed_form_penalty::{
@@ -3777,13 +3785,19 @@ fn schwinger_kappa_partials_are_the_derivatives_of_the_values_chart_2735() {
             let fm1 = value(kappa - h);
             let fp2 = value(kappa + 2.0 * h);
             let fm2 = value(kappa - 2.0 * h);
+            let fp4 = value(kappa + 4.0 * h);
+            let fm4 = value(kappa - 4.0 * h);
             for order in 0..=max_order {
-                let d1_h = (fp1[order] - fm1[order]) / (2.0 * h);
-                let d1_2h = (fp2[order] - fm2[order]) / (4.0 * h);
-                let fd_first = (4.0 * d1_h - d1_2h) / 3.0;
-                let d2_h = (fp1[order] - 2.0 * f0[order] + fm1[order]) / (h * h);
-                let d2_2h = (fp2[order] - 2.0 * f0[order] + fm2[order]) / (4.0 * h * h);
-                let fd_second = (4.0 * d2_h - d2_2h) / 3.0;
+                let d1 = |plus: &[f64], minus: &[f64], step: f64| (plus[order] - minus[order]) / (2.0 * step);
+                let d2 = |plus: &[f64], minus: &[f64], step: f64| {
+                    (plus[order] - 2.0 * f0[order] + minus[order]) / (step * step)
+                };
+                let fd_first = (4.0 * d1(&fp1[..], &fm1[..], h) - d1(&fp2[..], &fm2[..], 2.0 * h)) / 3.0;
+                let coarse_first =
+                    (4.0 * d1(&fp2[..], &fm2[..], 2.0 * h) - d1(&fp4[..], &fm4[..], 4.0 * h)) / 3.0;
+                let fd_second = (4.0 * d2(&fp1[..], &fm1[..], h) - d2(&fp2[..], &fm2[..], 2.0 * h)) / 3.0;
+                let coarse_second =
+                    (4.0 * d2(&fp2[..], &fm2[..], 2.0 * h) - d2(&fp4[..], &fm4[..], 4.0 * h)) / 3.0;
                 let first_scale = first[order]
                     .abs()
                     .max(fd_first.abs())
@@ -3792,17 +3806,23 @@ fn schwinger_kappa_partials_are_the_derivatives_of_the_values_chart_2735() {
                     .abs()
                     .max(fd_second.abs())
                     .max(f0[order].abs() / (kappa * kappa));
-                let rel_first = (first[order] - fd_first).abs() / first_scale;
-                let rel_second = (second[order] - fd_second).abs() / second_scale;
+                let first_bar = 4.0 * (fd_first - coarse_first).abs() + 1.0e-9 * first_scale;
+                let second_bar = 4.0 * (fd_second - coarse_second).abs() + 1.0e-9 * second_scale;
+                let first_gap = (first[order] - fd_first).abs();
+                let second_gap = (second[order] - fd_second).abs();
                 assert!(
-                    rel_first <= 1.0e-6,
-                    "∂_κ f^({order}) at κ={kappa}, κR={chi}: analytic {:+.10e} vs Richardson {fd_first:+.10e} (rel {rel_first:.3e})",
-                    first[order]
+                    first_gap <= first_bar,
+                    "∂_κ f^({order}) at κ={kappa}, κR={chi}: analytic {:+.10e} vs Richardson {fd_first:+.10e} \
+                     (gap {first_gap:.3e} > measured difference bar {first_bar:.3e}; rel {:.3e})",
+                    first[order],
+                    first_gap / first_scale
                 );
                 assert!(
-                    rel_second <= 1.0e-4,
-                    "∂²_κ f^({order}) at κ={kappa}, κR={chi}: analytic {:+.10e} vs Richardson {fd_second:+.10e} (rel {rel_second:.3e})",
-                    second[order]
+                    second_gap <= second_bar,
+                    "∂²_κ f^({order}) at κ={kappa}, κR={chi}: analytic {:+.10e} vs Richardson {fd_second:+.10e} \
+                     (gap {second_gap:.3e} > measured difference bar {second_bar:.3e}; rel {:.3e})",
+                    second[order],
+                    second_gap / second_scale
                 );
             }
         }
