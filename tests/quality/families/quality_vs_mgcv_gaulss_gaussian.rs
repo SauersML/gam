@@ -262,15 +262,19 @@ fn gam_gaulss_linear_mean_smooth_sigma_predicts_lidar_at_least_as_well_as_mgcv()
         test_rows.len(),
         gam_nll - mgcv_nll
     );
+    // The #1561 aggregate scores a lower-is-better metric by log(gam / reference),
+    // which needs a positive error. A continuous density's mean NLL can be negative
+    // (it is here), so the pair carries the per-observation perplexity exp(NLL):
+    // positive, monotone in NLL, and its log-ratio is exactly gam_NLL − mgcv_NLL.
     eprintln!(
         "{}",
         QualityPair::error(
             "families",
             "quality_vs_mgcv_gaulss_gaussian",
-            "held_out_nll",
-            gam_nll,
+            "held_out_perplexity",
+            gam_nll.exp(),
             "mgcv",
-            mgcv_nll,
+            mgcv_nll.exp(),
         )
         .line()
     );
