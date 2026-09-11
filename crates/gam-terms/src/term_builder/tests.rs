@@ -2500,6 +2500,14 @@ fn no_whitelisted_smooth_option_is_accepted_and_inert() {
             ("thinplate", "scale_dims") => {
                 Some("a derivative-planning hint for TPS, not an anisotropy knob")
             }
+            // `scale_dims=true` arms per-axis anisotropy for the Duchon arm as
+            // `aniso_log_scales = Some(0, …, 0)`, which the spatial optimizer
+            // then learns during the fit. Zero anisotropy is a literal model
+            // coordinate (fba2bc637), so the cold design this guard
+            // fingerprints is the isotropic one by construction.
+            ("duchon", "scale_dims") => {
+                Some("arms fit-time per-axis anisotropy; the cold build is at literal zero")
+            }
             // Measure-jet Ψ (hyperparameter) switches: the representer
             // length-scale and the τ₀ multiscale threshold are read by the Ψ
             // learner during the fit, not by the design built at the spec's
