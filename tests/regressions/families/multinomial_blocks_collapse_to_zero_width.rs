@@ -7,7 +7,7 @@
 //! Root cause: `MultinomialFamily::build_block_specs` builds `K − 1` blocks
 //! that all share the identical `P`-column design `X`, but it left
 //! `jacobian_callback = None`. With every block reporting a single output
-//! channel, `canonicalize_for_identifiability` took the *flat* audit, which
+//! channel, `canonicalize_for_identifiability_with_operating_scalars` took the *flat* audit, which
 //! assembles the joint design by placing every block's columns side by side
 //! over the same `N` rows — `[X | X | … | X]`. RRQR then declared the repeated
 //! columns redundant aliases and, by gauge priority, stripped every block past

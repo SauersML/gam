@@ -9,7 +9,7 @@
 //     GAM, gaussian/binomial/survival location-scale, royston-parmar, and
 //     any custom-family workflow whose blocks live in a common row space.
 //     Wired into every fit path via `fit_custom_family_with_rho_prior` →
-//     `canonicalize_for_identifiability` in `custom_family.rs`.
+//     `canonical::canonicalize_for_identifiability_with_operating_scalars`.
 //
 //   * [`audit_identifiability_channel_aware`] — multi-channel audit on
 //     the `(n·K) × p_total` channel-weighted joint design. Suitable for
@@ -48,7 +48,7 @@
 //
 // After this per-block construction the resulting reparameterised designs are
 // passed to `fit_custom_family`, which routes through
-// `canonicalize_for_identifiability` for the final post-construction unified
+// `canonicalize_for_identifiability_with_operating_scalars` for the final post-construction unified
 // flat audit. Because the BMS blocks are already rank-clean after the W-metric
 // residualisation, that second audit passes cleanly; its value is as a
 // defensive gate for any future code path that bypasses the BMS construction.
@@ -1673,7 +1673,7 @@ fn audit_identifiability_impl(
     //
     // When the caller supplies a non-trivial `gauge_priority` configuration
     // (at least two distinct priority values), the canonical-gauge pipeline
-    // (`canonicalize_for_identifiability`) is designed to handle cross-block
+    // (`canonicalize_for_identifiability_with_operating_scalars`) is designed to handle cross-block
     // rank deficiency by presenting higher-priority columns first to the
     // RRQR pivot and attributing the alias drops to the lower-priority
     // block. The audit MUST NOT FATAL on this case — doing so defeats the

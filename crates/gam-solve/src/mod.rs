@@ -74,8 +74,36 @@ pub mod topology_stack_gaussian;
 pub mod warm_start_artifact;
 pub mod warm_start_transfer;
 
-pub use evidence::{CircularGaussianFit2d, EvidenceHvpLogDet, EvidenceIftGradientTerms, EvidenceLogDetSource, GaussianMixtureCertificate, GaussianMixtureCheckpoint, GaussianMixtureConfig, GaussianMixtureError, GaussianMixtureFit, RingGaussianMixtureFit, SelectedTopology, StackingCertificate, StackingCheckpoint, StackingConfig, StackingError, StackingWeights, TopologyCandidate, TopologyKind, TopologyScoreScale, TopologySelectOptions, UNION_STRUCTURE_LADDER, UnionComponentFit, UnionComponentKind, UnionStructure, UnionStructureFit, fit_gaussian_mixture, fit_ring_gaussian_mixture, solve_stacking_weights};
-pub use topology_selector::{AdaptiveRungError, AdaptiveRungFailureStage, AdaptiveRungKind, AdaptiveRungOrderFailure, AutoTopologyKind, EvidenceCertification, Headline, HeldOutDensityProvider, MIXTURE_K_LADDER, MixtureRungFit, MixtureRungResult, PredictiveCandidateKind, PredictiveRaceCandidate, PredictiveRaceVerdict, RingOfClustersRungFit, RingOfClustersRungResult, STACKING_CV_FOLDS, STACKING_CV_SEED, TopologyAutoFitEvidence, TopologyAutoRankedFit, TopologyAutoSelector, TopologyAutoSelectorResult, TopologyCandidateEvidence, TopologyCandidateFailure, TopologyCandidateFailureStage, TopologyCandidateOutcome, TopologyCandidateRanked, TopologyCandidateSelectionResult, TopologyRaceParallelCandidate, TopologySelectionScoreKind, TopologySelectionScoreScale, UnionRungFit, UnionRungResult, adjudicate_predictive_race, build_cv_log_density_table, deterministic_cv_folds_seeded, fit_free_cluster_rung, fit_ring_of_clusters_rung, parse_union_name, run_topology_race_parallel, select_topology_candidate_lifecycle, select_topology_with_fit, tk_normalized_score, tk_normalized_score_with_resolution};
+pub use evidence::{
+    CircularGaussianFit2d, EvidenceHvpLogDet, EvidenceIftGradientTerms, EvidenceLogDetSource,
+    GaussianMixtureCertificate, GaussianMixtureCheckpoint, GaussianMixtureConfig,
+    GaussianMixtureError, GaussianMixtureFit, RingGaussianMixtureFit, SelectedTopology,
+    StackingCertificate, StackingCheckpoint, StackingConfig, StackingError, StackingWeights,
+    TopologyCandidate, TopologyKind, TopologyScoreScale, TopologySelectOptions,
+    UNION_STRUCTURE_LADDER, UnionComponentFit, UnionComponentKind, UnionStructure,
+    UnionStructureFit, evidence_grad_rho, evidence_hessian_log_det,
+    evidence_ift_gradient_correction, fit_gaussian_mixture, fit_ring_gaussian_mixture,
+    fit_union_ladder, fit_union_structure, hessian_log_det_from_hvp, laplace_evidence,
+    resume_gaussian_mixture, resume_stacking_weights, select_topology, solve_stacking_weights,
+    union_per_point_log_density, union_responsibility_split,
+};
+pub use topology_selector::{
+    AdaptiveRungError, AdaptiveRungFailureStage, AdaptiveRungKind, AdaptiveRungOrderFailure,
+    AutoTopologyKind, EvidenceCertification, Headline, HeldOutDensityProvider, MIXTURE_K_LADDER,
+    MixtureRungFit, MixtureRungResult, PredictiveCandidateKind, PredictiveRaceCandidate,
+    PredictiveRaceVerdict, RingOfClustersRungFit, RingOfClustersRungResult, STACKING_CV_FOLDS,
+    STACKING_CV_SEED, TopologyAutoFitEvidence, TopologyAutoRankedFit, TopologyAutoSelector,
+    TopologyAutoSelectorResult, TopologyCandidateEvidence, TopologyCandidateFailure,
+    TopologyCandidateFailureStage, TopologyCandidateOutcome, TopologyCandidateRanked,
+    TopologyCandidateSelectionResult, TopologyRaceParallelCandidate, TopologySelectionScoreKind,
+    TopologySelectionScoreScale, UnionRungFit, UnionRungResult, adjudicate_predictive_race,
+    build_cv_log_density_table, deterministic_cv_folds, deterministic_cv_folds_seeded,
+    fit_free_cluster_rung, fit_mixture_rung, fit_ring_of_clusters_rung, fit_union_candidate,
+    fit_union_rung, mixture_density_provider, parse_union_name, ring_of_clusters_density_provider,
+    run_topology_race_parallel, select_topology_candidate_lifecycle, select_topology_with_fit,
+    select_topology_with_fit_parallel, tk_normalized_score, tk_normalized_score_with_resolution,
+    topology_scores_are_resolvably_ordered, union_density_provider,
+};
 
 /// Process-wide counter of smoothing-corrections that took the sigma-cubature
 /// (second-order) branch in

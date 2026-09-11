@@ -555,6 +555,19 @@ impl PirlsResult {
         SignedWeightsView::new(self.finalweights.view())
     }
 
+    /// Typed view of the score-side Fisher weights `W_F = h'²/(φ V(μ)) ≥ 0`
+    /// stored on this result, PSD-by-construction. Used by PSD-Gram kernels
+    /// (`dense_xtwx_view`, `sparse_csr_weighted_xtwx_*`, `xt_diag_x_psd_op`)
+    /// without a runtime sign scan; the PSD obligation is discharged
+    /// algebraically by the Fisher formula at the construction site in
+    /// `solver/pirls/mod.rs`. New callers that need the same diagonal under
+    /// a sign-honest API should route through `as_signed()` on the returned
+    /// view rather than reconstructing from the raw array.
+    #[inline]
+    pub fn solve_weights_psd(&self) -> PsdWeightsView<'_> {
+        PsdWeightsView::from_view_unchecked(self.solveweights.view())
+    }
+
     /// Scale-invariant relative gradient residual at the accepted PIRLS state.
     ///
     /// Returns ‖g‖ / (1 + ‖score‖ + ‖Sβ‖ + ridge·‖β‖). Numerator is

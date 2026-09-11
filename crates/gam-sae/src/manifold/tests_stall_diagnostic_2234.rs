@@ -47,11 +47,10 @@ use super::*;
 ///     gam-solve LIBRARY, gone from `crates/gam-solve/src/evidence.rs`;
 ///   * `gam_sae::manifold::construction::coordinate_block_log_det`;
 ///   * `criterion_as_atoms` in `construction_quasi_laplace.rs`.
-/// At `origin/main` only prose survives: `construction_quasi_laplace.rs:356`
-/// and `outer_objective.rs:5208` still name `arrow_log_det_from_cache` in a
-/// comment and in an error string for a function that no longer exists. Getting
-/// that arm back is a production change, reported on #2818 rather than made
-/// here.
+/// #2829 retired those names (docs/rust-library-surface.md):
+/// `ArrowFactorCache::arrow_log_det` owns the recorded evidence log-determinant,
+/// so this arm stays unrestored; independent criterion acceptance is tracked on
+/// #2333 and #2828.
 ///
 /// ─── How the restored arm differs from the deleted one ───
 ///

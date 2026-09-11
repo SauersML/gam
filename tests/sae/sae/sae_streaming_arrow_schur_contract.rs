@@ -188,8 +188,8 @@ fn per_token_block_dim_is_independent_of_k_at_fixed_active() {
 // (d) The out-of-core streaming FIT driver is chunk-size invariant.
 // ---------------------------------------------------------------------------
 //
-// `run_joint_fit_arrow_schur_streaming` is the memory-bounded fit driver for
-// the LLM-scale teacher: it re-seeds each chunk's `(logits, coords, Z)` from a
+// The retired (#2829) `run_joint_fit_arrow_schur_streaming` was the memory-bounded
+// fit driver for the LLM-scale teacher: it re-seeds each chunk's `(logits, coords, Z)` from a
 // `chunk_init` closure and never materializes the `(N×M)`/`(N×K)` per-row
 // buffers. Because it re-seeds the per-row latent state from `chunk_init` on
 // every pass (rather than carrying it forward), each outer iteration's reduced

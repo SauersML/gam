@@ -251,13 +251,12 @@ transition and observed-orientability evidence is not a closed-sphere homology
 or calibrated population-topology certificate. These tests also do not prove
 atlas recognition, held-out unrolling quality or MDL promotion.
 
-Three other #2280 identities remain unresolved:
+The other three #2280 identities are restored in `local_charts.rs` together with
+the `LocalAtlas::co_collapse_candidates` query they exercise (#2829):
 `co_collapse_flags_duplicate_charts_2280`,
 `co_collapse_thresholds_bracket_the_gate_2280`, and
-`co_collapse_spares_healthy_swiss_roll_atlas_2280`. Their
-`LocalAtlas::co_collapse_candidates` query was deleted, and no replacement has
-been verified. Because #2280 itself remains open, disappearance of that callable
-is not evidence of an intentionally retired product requirement.
+`co_collapse_spares_healthy_swiss_roll_atlas_2280`. The exported
+`CoCollapseCandidate` report had survived the sweep with no producer.
 
 Executed source blobs:
 
@@ -459,8 +458,8 @@ immutable commit census or evidence that those declarations executed.
 | Four measured-span #2612 pins | External `gam-solve` target `measured_span_2612` calls `under_identified_subspace_in_metric` with explicit identity or congruent shear metrics. | **4 passed in 0.022 seconds**, after a 3.70-second warm build. Tests check the strict one-observation boundary, empty bounded span, disagreement with the penalty kernel in both directions, and physical-span preservation under both signs of a nonorthogonal shear. A wrong-metric control must change the selected dimension. |
 | `softmax_trace_whitening_prefold_matches_dense_adjoint_2333` and the four later deflation-fold checks | `construction_row_jet_logdet_channels::tests_trace_whitening_2333` exercises the live Trace consumer and production deflation contraction. | **5 passed in 0.05 seconds.** The first consumer run correctly failed its branch-activation assertion because the cold fixture had no spectral deflation. The revised state has one exactly saturated softmax row, which supplies a genuine null logit direction; the other rows retain both live atoms. The consumer records one spectrally deflated row. |
 | `fully_degenerate_cluster_diagonalizes_direct_e_diag_2267`, `nearly_degenerate_distinct_spectrum_preserves_eigenpairs_2515` | `exact_pencil::pencil_tests`, reached through production pencil pricing. | The original helper-only tests moved to determinant/gradient and eigenpair checks on the actual production pencil. The obsolete `cluster_stable_eigh` helper was removed. These are explicit contract moves, not disappearance based on private symbol reachability. |
-| Five historical cofit #2023 pins | Active `tiered::fit_tiered` versus the former `cofit_arrow` and `sparse_dict::cofit` bridges. | **Unresolved.** The old modules retain configuration/report types but no callable producer. Nearby tiered-fit tests do not by themselves establish the former no-op fixed-point, quality comparison, or insufficient-round refusal contracts. |
-| Three co-collapse #2280 pins | `LocalAtlas` patch geometry and topology readout. | **Unresolved.** Transition-composition tests do not replace duplicate-chart detection. The current topology investigation separately compares the full membership nerve against transition-backed edges and localizes actual H1 representatives. |
+| Five historical cofit #2023 pins | Active `tiered::fit_tiered` versus the former `cofit_arrow` and `sparse_dict::cofit` bridges. | **Retired with their subject (#2829).** `fit_tiered` carries the contracts on the live route: match-or-beat against the pure-linear tier and a recurred, certified fixed point are asserted by `tiered_curved_refinement_is_certified_and_records_promotions`, and the budget refusal by `insufficient_inner_budget_returns_error_instead_of_a_tiered_report_2023`. The producer-less cofit configuration/report types are deleted. |
+| Three co-collapse #2280 pins | `LocalAtlas::co_collapse_candidates`. | **Restored (#2829)** with the query itself; the surviving `CoCollapseCandidate` report is its output. |
 | Solved-mode response #2765 and terminal exact-curvature scheduling #979 | Current survival marginal-slope mode response and spatial outer driver. | **Unresolved.** A doc-comment-only historical test file is not coverage; local Hessian derivatives do not establish a fitted mode's response, and an outer-Hessian check does not establish terminal scheduling. |
 
 The four Trace fold checks passed within a **12-test run: 10 passed, 2 failed**,

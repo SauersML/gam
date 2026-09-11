@@ -6443,6 +6443,45 @@ fn batched_mixed_jeffreys_drift_matches_each_pair_alone_979() {
     }
 }
 
+/// #979: the completion drift keeps each coordinate response's information
+/// derivatives for its coefficient snapshot. Repeated and interleaved requests
+/// must return exactly what a fresh drift, which has kept nothing, returns.
+#[test]
+fn completion_drift_along_repeated_responses_matches_a_fresh_drift_979() {
+    let family = BetaDependentJeffreysInformationFamily;
+    let specs = vec![jeffreys_seam_spec(2)];
+    let ranges = block_param_ranges(&specs);
+    let states = vec![jeffreys_seam_state(array![0.7, -0.4])];
+    let build = || {
+        custom_family_outer_jeffreys_hphi_drift_batched(&family, &states, &specs, &ranges)
+            .expect("Jeffreys drift construction")
+            .expect("an active Jeffreys geometry exposes a drift")
+    };
+    let kept = build();
+    let responses = [array![0.35, 0.22], array![-0.18, 0.41], array![0.05, -0.3]];
+    for repeat in 0..2 {
+        for left in 0..responses.len() {
+            for right in 0..responses.len() {
+                let u = -&responses[right];
+                let v = &responses[left];
+                let along_kept = (kept.completion_beta)(&u, v).expect("completion along kept responses");
+                let fresh = (build().completion_beta)(&u, v).expect("completion from a fresh drift");
+                assert!(
+                    along_kept.iter().any(|value| *value != 0.0),
+                    "pair ({left},{right}): the fixture must exercise a nonzero completion"
+                );
+                assert!(
+                    along_kept
+                        .iter()
+                        .zip(fresh.iter())
+                        .all(|(left_value, right_value)| left_value.to_bits() == right_value.to_bits()),
+                    "repeat {repeat} pair ({left},{right}): kept {along_kept:?} vs fresh {fresh:?}"
+                );
+            }
+        }
+    }
+}
+
 /// gam#2515 class: the shared dense-design cache is keyed on the source
 /// matrix's heap address. A stale clone planted under a live matrix's key
 /// (what address reuse produces) must not be handed back as that matrix.

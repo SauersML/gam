@@ -17,11 +17,10 @@
 //! primitives:
 //!
 //!   * `marginal_slope_covariance_from_scores`   (covariance auto-derivation)
-//!   * `survival_marginal_slope_vector_scale`    (scale c(a) = √(1 + rᵀΣr))
-//!   * `survival_marginal_slope_vector_eta`      (probit index q·c + rᵀz)
-//!   * `survival_marginal_slope_vector_neglog`   (per-row negative log-lik)
+//!   * `survival_marginal_slope_vector_neglog`   (per-row negative log-lik,
+//!     which forms the scale c(a) = √(1 + rᵀΣr) and the probit index q·c + rᵀz)
 //!
-//! These four functions are exactly what the inner survival fit chains
+//! These functions are exactly what the inner survival fit chains
 //! together inside its hot loop (see `survival_marginal_slope.rs` around
 //! line 2898). Driving them from synthetic data with a known truth
 //! validates the multi-z (K=2) survival marginal-slope contract just as

@@ -425,6 +425,10 @@ impl SaeAtomGeometryPlan {
         &self.resolution
     }
 
+    pub fn reference_metric(&self) -> &SaeReferenceMetricPlan {
+        &self.reference_metric
+    }
+
     /// Sectional curvature carried by a constant-curvature reference metric.
     #[must_use]
     pub fn constant_curvature(&self) -> Option<f64> {
@@ -509,6 +513,13 @@ impl SaeAtomGeometryPlan {
                 SaeReferenceRoughnessKind::ConstantCurvatureDirichlet
             }
             _ => SaeReferenceRoughnessKind::ProvidedFunctionGram,
+        }
+    }
+
+    pub fn duchon_centers(&self) -> Option<&Array2<f64>> {
+        match &self.resolution {
+            SaeBasisResolution::DuchonCoordinates { centers } => Some(centers),
+            _ => None,
         }
     }
 
@@ -796,6 +807,15 @@ pub(crate) struct SaeAtomEvaluationBundle {
     pub(crate) evaluator: Arc<dyn SaeBasisSecondJet>,
 }
 
+/// Coordinate velocities of the three `SO(3)` Killing fields on the spherical
+/// cover used by `RP²`, ordered by rotations about the ambient `x`, `y`, and
+/// `z` axes.
+///
+/// The cover chart is `(latitude, longitude)`. Its longitude coordinate is
+/// singular at a pole, so an `SO(3)` orbit cannot be represented by a unique
+/// two-component chart velocity there. Refusing that state is essential: a
+/// fabricated finite longitude velocity would silently change the quotient
+
 fn duchon_nullspace_from_m(m: usize) -> gam_terms::basis::DuchonNullspaceOrder {
     match m {
         1 => gam_terms::basis::DuchonNullspaceOrder::Zero,
@@ -816,6 +836,7 @@ fn periodic_reference_penalty(order: usize) -> Result<Array2<f64>, String> {
     }
     Ok(penalty)
 }
+
 
 /// Laplace--Beltrami roughness Gram of the ambient sphere basis, raised to
 /// `power`.
@@ -1193,6 +1214,70 @@ fn donut_weak_laplacian_block(k: usize, i_inv: &Array2<f64>, i_stiff: &Array2<f6
     block
 }
 
+/// Generalized-eigenvalue spectrum of the exact embedded-donut Laplace--Beltrami
+/// operator restricted to `theta`-frequency `k`: the eigenvalues of
+/// `G^{-1} B_k` (a self-adjoint pencil `B_k u = lambda G u`). As `A -> infinity`
+/// this multiset converges to `{ k^2/A^2 + l^2 : l = 0..H }` (with `l >= 1`
+/// doubled for sine/cosine), i.e. the ANISOTROPIC flat product torus, not the
+/// isotropic `k^2 + l^2`.
+pub fn embedded_donut_laplacian_block_eigenvalues(
+    per_axis_order: usize,
+    aspect: f64,
+    k: usize,
+) -> Result<Vec<f64>, String> {
+    if !(aspect.is_finite() && aspect > 1.0) {
+        return Err(format!(
+            "embedded_donut_laplacian_block_eigenvalues requires a finite aspect A > 1, got {aspect}"
+        ));
+    }
+    if per_axis_order == 0 {
+        return Err(
+            "embedded_donut_laplacian_block_eigenvalues requires per_axis_order >= 1".to_string(),
+        );
+    }
+    let (i_inv, i_stiff, gram) = donut_phi_block_integrals(per_axis_order, aspect);
+    let block = donut_weak_laplacian_block(k, &i_inv, &i_stiff);
+    // Whiten by the SPD donut Gram: eig(G^{-1} B) = eig(L^{-1} B L^{-T}) with
+    // G = L L^T. Two forward substitutions with L keep it self-adjoint.
+    let factor = gram
+        .cholesky(Side::Lower)
+        .map_err(|error| format!("donut Gram Cholesky failed: {error}"))?;
+    let lower = factor.lower_triangular();
+    let whitened = {
+        let step = donut_forward_substitution(&lower, &block);
+        let step_t = step.t().to_owned();
+        let second = donut_forward_substitution(&lower, &step_t);
+        second.t().to_owned()
+    };
+    let mut symmetric = whitened;
+    donut_symmetrize(&mut symmetric);
+    let (values, _) = symmetric
+        .eigh(Side::Lower)
+        .map_err(|error| format!("donut whitened eigendecomposition failed: {error}"))?;
+    let mut sorted: Vec<f64> = values.to_vec();
+    sorted.sort_by(|a, b| a.partial_cmp(b).expect("finite donut eigenvalues"));
+    Ok(sorted)
+}
+
+/// Solve the lower-triangular system `L X = B` for `X` (column-by-column
+/// forward substitution). `L` must be square lower-triangular with nonzero
+/// diagonal; `B` has matching row count.
+fn donut_forward_substitution(lower: &Array2<f64>, rhs: &Array2<f64>) -> Array2<f64> {
+    let n = lower.nrows();
+    let cols = rhs.ncols();
+    let mut x = Array2::<f64>::zeros((n, cols));
+    for c in 0..cols {
+        for i in 0..n {
+            let mut acc = rhs[[i, c]];
+            for j in 0..i {
+                acc -= lower[[i, j]] * x[[j, c]];
+            }
+            x[[i, c]] = acc / lower[[i, i]];
+        }
+    }
+    x
+}
+
 /// Exact closed-form squared Laplace--Beltrami roughness Gram for the embedded
 /// donut torus of aspect `A = aspect > 1`, in the tensor real Fourier basis of
 /// [`TorusHarmonicEvaluator`] (`latent_dim = 2`, order `per_axis_order`). The
@@ -1438,6 +1523,59 @@ mod tests {
                 SaeReferenceMetricPlan::DiscreteCounting,
             )
             .is_err()
+        );
+    }
+
+
+
+    /// Expected block spectrum of the anisotropic flat product torus at
+    /// `theta`-frequency `k`: `k^2/A^2 + l^2` with `l = 0` once and `l = 1..H`
+    /// twice (sine and cosine), sorted ascending.
+    fn expected_anisotropic_flat_block(per_axis_order: usize, aspect: f64, k: usize) -> Vec<f64> {
+        let base = (k * k) as f64 / (aspect * aspect);
+        let mut values = vec![base];
+        for l in 1..=per_axis_order {
+            let value = base + (l * l) as f64;
+            values.push(value);
+            values.push(value);
+        }
+        values.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        values
+    }
+
+    #[test]
+    fn embedded_donut_eigenvalues_converge_to_anisotropic_flat_not_isotropic() {
+        let per_axis_order = 4;
+        // Thin-tube limit: A -> infinity. Convergence of the Laplace--Beltrami
+        // spectrum to the flat product torus is O(1/A^2).
+        let aspect = 2000.0;
+        for k in 0..=per_axis_order {
+            let eigenvalues =
+                embedded_donut_laplacian_block_eigenvalues(per_axis_order, aspect, k).unwrap();
+            let expected = expected_anisotropic_flat_block(per_axis_order, aspect, k);
+            assert_eq!(eigenvalues.len(), expected.len());
+            for (got, want) in eigenvalues.iter().zip(expected.iter()) {
+                assert!(
+                    (got - want).abs() <= 1.0e-3,
+                    "k={k}: donut eigenvalue {got} != anisotropic-flat target {want}"
+                );
+            }
+        }
+
+        // Decisive discriminant: at k=3, l=0 the anisotropic target is
+        // k^2/A^2 = 9/A^2 (~2.25e-6), while the ISOTROPIC flat torus would put
+        // this mode at k^2 = 9. The smallest block eigenvalue must land on the
+        // former, nowhere near the latter.
+        let smallest =
+            embedded_donut_laplacian_block_eigenvalues(per_axis_order, aspect, 3).unwrap()[0];
+        let anisotropic_target = 9.0 / (aspect * aspect);
+        assert!(
+            (smallest - anisotropic_target).abs() <= 1.0e-3,
+            "smallest k=3 eigenvalue {smallest} should track k^2/A^2 = {anisotropic_target}"
+        );
+        assert!(
+            smallest < 0.5,
+            "smallest k=3 eigenvalue {smallest} must not approach the isotropic k^2 = 9"
         );
     }
 

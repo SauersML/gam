@@ -9,7 +9,7 @@
 //! link_dev blocks silently (via a `log::warn!` side message) when
 //! `install_compiled_flex_block_into_runtime` returned `FullyAliased`.
 //! After the architectural change those blocks are kept with their
-//! original designs and the unified audit (`canonicalize_for_identifiability`
+//! original designs and the unified audit (`canonicalize_for_identifiability_with_operating_scalars`
 //! → `audit_identifiability`) attributes any alias to the correct block
 //! via `dropped_columns` (gauge_priority ordering ensures score_warp_dev
 //! and link_dev are always the lower-priority participants in an alias pair

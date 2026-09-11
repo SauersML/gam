@@ -21,3 +21,161 @@
 //! execution path; the CPU reference is therefore the single implementation
 //! until a real batched kernel exists end to end.
 
+use crate::arrow_schur::ArrowSchurSystem;
+use crate::gpu_kernels::arrow_schur::{
+    ArrowSchurGpuFailure, ArrowSchurGpuSolution, solve_arrow_newton_step_dense_reference,
+};
+
+/// Refit a color class of mutually support-disjoint K=1 atoms concurrently.
+///
+/// `systems[a]` is atom `a`'s leave-one-out arrow/border system (assembled by the
+/// caller, who owns the residual/Σ state). Returns one result per atom,
+/// positionally aligned with `systems`: coloring guarantees independence, so the
+/// results compose without interaction and the caller writes each accepted
+/// `(δt, δβ)` straight back into its atom's chart/gate.
+///
+/// A per-atom capability decline (a matrix-free atom, or a device transient) is
+/// served transparently by the CPU reference — that element is still `Ok`. Only a
+/// genuine numerical PD failure yields a per-atom `Err`, which the caller escalates
+/// by re-calling with that atom's bumped ridge. This mirrors the recoverable-vs-
+/// fatal split the single-system device seams use, so a non-dense atom can never
+/// surface a fatal `RemlConvergenceError`.
+#[must_use]
+pub fn solve_batched_k1_border(
+    systems: &[ArrowSchurSystem],
+    ridge_t: f64,
+    ridge_beta: f64,
+) -> Vec<Result<ArrowSchurGpuSolution, ArrowSchurGpuFailure>> {
+    systems
+        .iter()
+        .map(|sys| cpu_reference_k1(sys, ridge_t, ridge_beta))
+        .collect()
+}
+
+/// One atom's K=1 border solve on the CPU. This is the canonical bit-parity oracle
+/// the device batched kernel is validated against, and the fallback whenever the
+/// device declines the class or a single atom. A non-PD/rank-deficient system
+/// surfaces as [`ArrowSchurGpuFailure::SchurFactorFailed`], the same numerical
+/// variant the caller's LM escalation responds to with a ridge bump.
+fn cpu_reference_k1(
+    sys: &ArrowSchurSystem,
+    ridge_t: f64,
+    ridge_beta: f64,
+) -> Result<ArrowSchurGpuSolution, ArrowSchurGpuFailure> {
+    solve_arrow_newton_step_dense_reference(sys, ridge_t, ridge_beta)
+        .map_err(|reason| ArrowSchurGpuFailure::SchurFactorFailed { reason })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A well-posed K=1 arrow/border atom: PD per-row blocks, a PD border, and a
+    /// small deterministic cross-block, so the dense reference solves cleanly.
+    fn pd_k1_system(n: usize, d: usize, k: usize, seed: f64) -> ArrowSchurSystem {
+        let mut sys = ArrowSchurSystem::new(n, d, k);
+        for (i, row) in sys.rows.iter_mut().enumerate() {
+            for r in 0..d {
+                row.htt[[r, r]] = 2.0 + seed;
+                row.gt[r] = 0.1 * (i as f64 + 1.0) + seed;
+                for c in 0..k {
+                    row.htbeta[[r, c]] = 0.05 * ((r + c + i) as f64 + 1.0);
+                }
+            }
+        }
+        for r in 0..k {
+            sys.hbb[[r, r]] = 2.0 + seed;
+            sys.gb[r] = 0.2 * (r as f64 + 1.0) + seed;
+        }
+        sys
+    }
+
+    /// A K=1 atom with a negative-definite per-row block: the guarded Cholesky in
+    /// the dense reference hits a negative pivot and returns an error, standing in
+    /// for a per-atom numerical decline.
+    fn indefinite_k1_system(n: usize, d: usize, k: usize) -> ArrowSchurSystem {
+        let mut sys = pd_k1_system(n, d, k, 0.0);
+        for row in sys.rows.iter_mut() {
+            for r in 0..d {
+                row.htt[[r, r]] = -2.0;
+            }
+        }
+        sys
+    }
+
+    fn assert_solution_eq(a: &ArrowSchurGpuSolution, b: &ArrowSchurGpuSolution) {
+        assert_eq!(a.delta_t.len(), b.delta_t.len());
+        assert_eq!(a.delta_beta.len(), b.delta_beta.len());
+        for (x, y) in a.delta_t.iter().zip(b.delta_t.iter()) {
+            assert!((x - y).abs() < 1e-12, "delta_t mismatch: {x} vs {y}");
+        }
+        for (x, y) in a.delta_beta.iter().zip(b.delta_beta.iter()) {
+            assert!((x - y).abs() < 1e-12, "delta_beta mismatch: {x} vs {y}");
+        }
+    }
+
+    #[test]
+    fn empty_class_returns_empty() {
+        let out = solve_batched_k1_border(&[], 1e-6, 1e-6);
+        assert!(
+            out.is_empty(),
+            "an empty color class must return no results"
+        );
+    }
+
+    #[test]
+    fn single_atom_matches_dense_reference() {
+        let sys = pd_k1_system(5, 2, 3, 0.0);
+        let batched = solve_batched_k1_border(std::slice::from_ref(&sys), 1e-6, 1e-6);
+        assert_eq!(batched.len(), 1);
+        let reference = solve_arrow_newton_step_dense_reference(&sys, 1e-6, 1e-6)
+            .expect("PD reference atom must solve");
+        let got = batched[0].as_ref().expect("batched single atom must solve");
+        assert_solution_eq(got, &reference);
+    }
+
+    #[test]
+    fn class_results_are_positional_and_independent() {
+        // Three atoms with distinct data: the batched result for each must equal
+        // the atom solved on its own (support-disjoint atoms do not interact).
+        let systems = [
+            pd_k1_system(4, 2, 2, 0.0),
+            pd_k1_system(6, 2, 3, 0.5),
+            pd_k1_system(3, 1, 2, 1.0),
+        ];
+        let batched = solve_batched_k1_border(&systems, 1e-6, 1e-6);
+        assert_eq!(batched.len(), systems.len());
+        for (idx, sys) in systems.iter().enumerate() {
+            let alone = solve_arrow_newton_step_dense_reference(sys, 1e-6, 1e-6)
+                .expect("each PD atom must solve on its own");
+            let in_class = batched[idx]
+                .as_ref()
+                .expect("each atom must solve in-class");
+            assert_solution_eq(in_class, &alone);
+        }
+    }
+
+    #[test]
+    fn per_atom_decline_is_isolated_never_fatal() {
+        // A class mixing a PD atom with a numerically-declining atom: the decline
+        // must be confined to its own element (a returned `Err`), never fail the
+        // class or panic. This is the contract that keeps a non-dense/decline atom
+        // from ever escalating into a fatal RemlConvergenceError.
+        let systems = [pd_k1_system(4, 2, 2, 0.0), indefinite_k1_system(4, 2, 2)];
+        let batched = solve_batched_k1_border(&systems, 0.0, 0.0);
+        assert_eq!(batched.len(), 2);
+        assert!(
+            batched[0].is_ok(),
+            "the PD atom must still solve in a mixed class"
+        );
+        // Only the `Err` variants are `Debug` (the `Ok` solution type is not), so
+        // match rather than format the whole `Result`.
+        match &batched[1] {
+            Err(ArrowSchurGpuFailure::SchurFactorFailed { .. }) => {}
+            Err(other) => {
+                panic!("the indefinite atom must decline as SchurFactorFailed; got {other:?}")
+            }
+            Ok(_) => panic!("the indefinite atom must decline per-atom, but it solved"),
+        }
+    }
+}

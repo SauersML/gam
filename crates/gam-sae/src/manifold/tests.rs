@@ -2999,7 +2999,7 @@ pub(crate) fn sae_value_probe_refusal_classification_is_inner_only() {
     // an infeasibility) stays FATAL — it is NOT in the recoverable set.
     assert!(
         !SaeManifoldOuterObjective::is_recoverable_value_probe_refusal(
-            "SaeManifoldTerm::penalized_quasi_laplace_criterion: arrow_log_det_from_cache returned None (undamped joint Hessian log-det unavailable for the Laplace normaliser)"
+            "SaeManifoldTerm::penalized_quasi_laplace_criterion: ArrowFactorCache::arrow_log_det returned None (undamped joint Hessian log-det unavailable for the Laplace normaliser)"
         )
     );
     assert!(

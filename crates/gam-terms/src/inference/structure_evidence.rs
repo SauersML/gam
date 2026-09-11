@@ -65,7 +65,7 @@
 //! [`plan_probe_for_contested_claim`] (the design loop: contested claims
 //! get a [`ProbePlan`] whose δ runs through
 //! `crate::inference::steering::steer_delta` and whose per-hypothesis
-//! μ₀/μ₁ come from `crate::inference::steering::predicted_response`).
+//! μ₀/μ₁ are the steered model's own predicted responses).
 //!
 //! # The math, fixed here so implementations cannot drift
 //!
@@ -819,7 +819,13 @@ pub struct StructureCertificate {
 }
 
 impl StructureCertificate {
+    pub fn confirmed(&self) -> impl Iterator<Item = &CertificateEntry> {
+        self.entries.iter().filter(|e| e.confirmed)
+    }
 
+    pub fn contested(&self) -> impl Iterator<Item = &CertificateEntry> {
+        self.entries.iter().filter(|e| !e.confirmed)
+    }
 }
 
 /// Calibrate one (super)uniform p-value into a single e-value, in log

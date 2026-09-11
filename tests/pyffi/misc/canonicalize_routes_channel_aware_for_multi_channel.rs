@@ -1,4 +1,4 @@
-//! Regression test: `canonicalize_for_identifiability` routes through
+//! Regression test: `canonicalize_for_identifiability_with_operating_scalars` routes through
 //! `audit_identifiability_channel_aware` when any block declares
 //! `n_outputs > 1` via its `jacobian_callback`.
 //!

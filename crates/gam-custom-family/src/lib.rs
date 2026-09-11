@@ -149,6 +149,7 @@ mod custom_family_persistent_warm_start;
 mod assembly;
 mod block_spec;
 mod blockwise_solve;
+mod coefficient_groups;
 mod covariance;
 mod fit;
 mod inner_blockwise_fit;
@@ -173,6 +174,7 @@ pub use self::block_spec::{
     RealizedCoefficientGroupSpecs,
 };
 pub use assembly::*;
+pub use coefficient_groups::*;
 pub(crate) use blockwise_solve::*;
 pub(crate) use covariance::*;
 // Two covariance helpers are part of the public flat-namespace API consumed by

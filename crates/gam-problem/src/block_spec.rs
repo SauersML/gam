@@ -35,7 +35,7 @@ use gam_linalg::matrix::{DesignMatrix, SymmetricMatrix};
 /// The identifiability canonicalisation step uses the `n_outputs`-channel
 /// weighted joint design `W_joint = Σ_i sqrt(W_i) ⊗ J_i` to detect
 /// block-against-block aliasing.  When this trait is present on
-/// `ParameterBlockSpec::channel_hessian`, `canonicalize_for_identifiability`
+/// `ParameterBlockSpec::channel_hessian`, `canonicalize_for_identifiability_with_operating_scalars`
 /// routes through `audit_identifiability_channel_aware`; when absent it falls
 /// back to the scalar-weight flat audit.
 ///

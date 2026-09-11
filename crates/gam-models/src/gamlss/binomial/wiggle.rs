@@ -714,6 +714,120 @@ impl BinomialLocationScaleWiggleFamily {
         Ok((n, eta_t, eta_ls, etaw))
     }
 
+    pub fn initializewiggle_knots_from_q(
+        q_seed: ArrayView1<'_, f64>,
+        degree: usize,
+        num_internal_knots: usize,
+    ) -> Result<Array1<f64>, String> {
+        gam_terms::basis::initializewiggle_knots_from_seed(q_seed, degree, num_internal_knots)
+    }
+
+    pub(crate) fn wiggle_basiswith_options(
+        &self,
+        q0: ArrayView1<'_, f64>,
+        basis_options: BasisOptions,
+    ) -> Result<Array2<f64>, String> {
+        monotone_wiggle_basis_with_derivative_order(
+            q0,
+            &self.wiggle_knots,
+            self.wiggle_degree,
+            basis_options.derivative_order,
+        )
+    }
+
+    pub(crate) fn wiggle_design(&self, q0: ArrayView1<'_, f64>) -> Result<Array2<f64>, String> {
+        self.wiggle_basiswith_options(q0, BasisOptions::value())
+    }
+
+    pub(crate) fn wiggle_dq_dq0(
+        &self,
+        q0: ArrayView1<'_, f64>,
+        beta_link_wiggle: ArrayView1<'_, f64>,
+    ) -> Result<Array1<f64>, String> {
+        let d_constrained = self.wiggle_basiswith_options(q0, BasisOptions::first_derivative())?;
+        if d_constrained.ncols() != beta_link_wiggle.len() {
+            return Err(GamlssError::DimensionMismatch {
+                reason: format!(
+                    "wiggle derivative col mismatch: got {}, expected {}",
+                    d_constrained.ncols(),
+                    beta_link_wiggle.len()
+                ),
+            }
+            .into());
+        }
+        Ok(d_constrained.dot(&beta_link_wiggle) + 1.0)
+    }
+
+    pub(crate) fn wiggle_d2q_dq02(
+        &self,
+        q0: ArrayView1<'_, f64>,
+        beta_link_wiggle: ArrayView1<'_, f64>,
+    ) -> Result<Array1<f64>, String> {
+        let d2_constrained =
+            self.wiggle_basiswith_options(q0, BasisOptions::second_derivative())?;
+        if d2_constrained.ncols() != beta_link_wiggle.len() {
+            return Err(GamlssError::DimensionMismatch {
+                reason: format!(
+                    "wiggle second-derivative col mismatch: got {}, expected {}",
+                    d2_constrained.ncols(),
+                    beta_link_wiggle.len()
+                ),
+            }
+            .into());
+        }
+        Ok(d2_constrained.dot(&beta_link_wiggle))
+    }
+
+    pub(crate) fn wiggle_d3q_dq03(
+        &self,
+        q0: ArrayView1<'_, f64>,
+        beta_link_wiggle: ArrayView1<'_, f64>,
+    ) -> Result<Array1<f64>, String> {
+        let d3_constrained = self.wiggle_d3basis_constrained(q0)?;
+        if d3_constrained.ncols() != beta_link_wiggle.len() {
+            return Err(GamlssError::DimensionMismatch {
+                reason: format!(
+                    "wiggle third-derivative col mismatch: got {}, expected {}",
+                    d3_constrained.ncols(),
+                    beta_link_wiggle.len()
+                ),
+            }
+            .into());
+        }
+        Ok(d3_constrained.dot(&beta_link_wiggle))
+    }
+
+    pub(crate) fn wiggle_d3basis_constrained(
+        &self,
+        q0: ArrayView1<'_, f64>,
+    ) -> Result<Array2<f64>, String> {
+        monotone_wiggle_basis_with_derivative_order(q0, &self.wiggle_knots, self.wiggle_degree, 3)
+    }
+
+    pub(crate) fn wiggle_d4q_dq04(
+        &self,
+        q0: ArrayView1<'_, f64>,
+        beta_link_wiggle: ArrayView1<'_, f64>,
+    ) -> Result<Array1<f64>, String> {
+        let d4 = monotone_wiggle_basis_with_derivative_order(
+            q0,
+            &self.wiggle_knots,
+            self.wiggle_degree,
+            4,
+        )?;
+        if d4.ncols() != beta_link_wiggle.len() {
+            return Err(GamlssError::DimensionMismatch {
+                reason: format!(
+                    "wiggle fourth-derivative col mismatch: got {}, expected {}",
+                    d4.ncols(),
+                    beta_link_wiggle.len()
+                ),
+            }
+            .into());
+        }
+        Ok(d4.dot(&beta_link_wiggle))
+    }
+
     pub(crate) fn dense_block_designs(
         &self,
     ) -> Result<(Cow<'_, Array2<f64>>, Cow<'_, Array2<f64>>), String> {
@@ -2597,6 +2711,26 @@ impl BinomialLocationScaleWiggleFamily {
         Ok(out)
     }
 
+    /// Build a turnkey wiggle block from a q-seed vector and knot settings.
+    /// Returns both the block input and the generated knot vector.
+    pub fn buildwiggle_block_input(
+        q_seed: ArrayView1<'_, f64>,
+        degree: usize,
+        num_internal_knots: usize,
+        penalty_order: usize,
+        double_penalty: bool,
+    ) -> Result<(ParameterBlockInput, Array1<f64>), String> {
+        let knots = Self::initializewiggle_knots_from_q(q_seed, degree, num_internal_knots)?;
+        let block = buildwiggle_block_input_from_knots(
+            q_seed,
+            &knots,
+            degree,
+            penalty_order,
+            double_penalty,
+        )?;
+        Ok((block, knots))
+    }
+
     /// Lower the canonical runtime-width row program to the eight structured
     /// order-two coefficient channels consumed by dense and matrix-free paths.
     /// The order-2 row program of one batch: the core and the wiggle bases
@@ -2914,6 +3048,30 @@ impl BinomialWiggleSecondDirectionalRows {
         out.slice_mut(s![pt + pls.., pt + pls..]).assign(&h_ww);
         mirror_upper_to_lower(&mut out);
         Ok(out)
+    }
+}
+
+impl BinomialLocationScaleWiggleFamily {
+    /// Build the [`BlockEffectiveJacobian`] for block `block_idx`.
+    ///
+    /// The two-output map is (η_threshold, η_log_sigma).
+    /// The wiggle block operates on the combined linear predictor through the
+    /// nonlinear inverse link and has a zero effective linear Jacobian.
+    ///
+    /// - block 0 (threshold):  output 0 = design rows, output 1 = zeros
+    /// - block 1 (log_sigma):  output 0 = zeros, output 1 = design rows
+    /// - block 2 (wiggle):     all zeros (nonlinear link modulation)
+    pub fn block_effective_jacobian(
+        specs: &[ParameterBlockSpec],
+        block_idx: usize,
+    ) -> Result<Box<dyn BlockEffectiveJacobian>, String> {
+        crate::block_layout::block_jacobian::AdditiveWiggleBlockLayout {
+            family: "BinomialLocationScaleWiggleFamily",
+            n_outputs: 2,
+            additive_blocks: &[Self::BLOCK_T, Self::BLOCK_LOG_SIGMA],
+            wiggle_block: Some(Self::BLOCK_WIGGLE),
+        }
+        .block_effective_jacobian(specs, block_idx)
     }
 }
 

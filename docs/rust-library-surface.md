@@ -165,14 +165,56 @@ producer is not a substitute for an implemented public contract.
 | `Dual2::{seed_directional,from_channels,seed_inner,seed_outer}` | Maintain the public `Dual2` value/first/second fields, `constant`, `variable`, and `Dual22::channels`. The analytic polynomial channel-order test in `gam-math` verifies the actual representation; redundant setters and getter/setter roundtrips are not separate product behavior. |
 | `enable_outer_gradient_fd_capture` | Maintain `enable_outer_gradient_fd_capture_over_theta`; it arms the complete current diagnostic and owns its typed sink. Consumers now document that actual function. |
 | `triangle_cocycle_defect`, `triangle_sign_product` | Consumers compose the public `ChartTransition` rotations/signs. The restored `local_chart_recovery_tests.rs` independently checks the composition on plane, sphere-band, and Swiss-roll fixtures; no duplicate arithmetic wrapper is required. |
-| `LocalAtlas::co_collapse_candidates` | **Unresolved.** The three historical #2280 co-collapse contracts have no verified replacement. Public transition composition does not establish duplicate-chart detection. #2280 must resolve this behavior explicitly. |
-| `cofit_block_and_curved`, `cofit_linear_via_arrow`, `cofit_composed_via_arrow` | **Unresolved.** Their modules currently retain configuration/report types but no callable producer. `tiered::fit_tiered` is the active fitting route; its fixed-point and stationarity contracts must be compared to the five historical #2023 pins before the old bridge is retired. |
+| `LocalAtlas::co_collapse_candidates` | **Restored.** The exported `CoCollapseCandidate` report survived the sweep with no producer. The query is a pure function of the fitted atlas: well-conditioned transitions, mutual coverage `|shared| / min(patch sizes)`, and the Procrustes residual. The three historical #2280 pins (`co_collapse_flags_duplicate_charts_2280`, `co_collapse_thresholds_bracket_the_gate_2280`, `co_collapse_spares_healthy_swiss_roll_atlas_2280`) are restored beside it. |
+| `cofit_block_and_curved`, `cofit_linear_via_arrow`, `cofit_composed_via_arrow` | **Retired, with their carriers.** `Tier2SupportFit` documents itself as the replacement for the former dense co-fit report, and `tiered::fit_tiered` is the route that mints curved fits. The live route's tests cover the historical contracts: match-or-beat against the pure-linear tier and a recurred fixed point with a certifying outer certificate (`tiered_curved_refinement_is_certified_and_records_promotions`, `tier2_branch_constructs_the_support_sparse_path`). The budget-refusal contract is now pinned on the live route by `insufficient_inner_budget_returns_error_instead_of_a_tiered_report_2023`. The producer-less `ArrowCofitConfig`, `ArrowCofitReport`, `CofitConfig`, `CofitReport` and `CofitRound` are deleted rather than kept as abandoned carriers. The composed-versus-A/B parity pin compared two retired implementations with each other and has no live subject. |
 
-This is a decision record for the issue's concrete examples, not a claim that all
-1,206 historical public declarations have been audited. Remaining identities must
-be resolved by crate, module/type, and signature; a same-named definition in a
-different owner is not evidence of recovery. #2829 remains open until the
-remaining public behavior decisions and their acceptance evidence are complete.
+#### Applying the rule once to every removed identity
+
+`d484a091a` removed 1,234 `(source path, function name)` declarations. The rule
+above was applied to each of them once, and every identity's disposition is
+recorded in [`public-api-2829-disposition.tsv`](public-api-2829-disposition.tsv).
+
+A removed item comes back when something that survived still depends on it:
+
+- an exported type that survived while its only producer was removed (a carrier
+  with no producer), or
+- surviving documentation, a rustdoc link, a comment, or an error string in the
+  same crate that names the removed item as a current entry point.
+
+Restoration is a three-way merge of that file's sweep removal onto current
+`main` (`git merge-file current sweep pre-sweep`), so it re-inserts exactly what
+the sweep removed and keeps every later change. Conflicts were resolved by
+hand. Restored copies of items that a later commit had already re-added were
+dropped, and restored items the table above retires were removed again.
+
+| Disposition | Identities |
+| --- | --- |
+| Restored in place | 891 |
+| Defined elsewhere in the same crate | 20 |
+| Retired by the decisions above | 19 |
+| Retired: nothing that survived depends on it | 278 |
+| Retired by the owning work's own decision | 3 |
+| Deferred to the owner of an actively edited file | 23 |
+
+Retired identities carry no compatibility obligation. Restoration is closed
+under calls: after the merges, no restored body calls a function the sweep
+removed.
+
+Where a file's owner judged a producer superseded, the surviving carrier was
+deleted instead of getting its producer back, with an entry in
+`docs/source-removal-changes.json`: `ArrowBlocks` and `ArrowDirection`
+(`gpu_kernels/resident_arrow.rs`), `DeviceResidentPcgInput` and
+`DeviceResidentPcgOutput` (`bms/gpu/device_pcg.rs`),
+`BernoulliMarginalSlopeAloRowInput` and `BernoulliMarginalSlopeAloRowGeometry`
+(`bms/alo_replay.rs`), and `GraphBirthCandidate` (`structure_harvest.rs`).
+
+The deferred identities live in files other active work owns (survival, jets,
+and the finite-set race scaffolding). Steering retired its own carriers
+(`CoordinateSetResult`, `InterchangeResult`) and their deleted producers. Their owners were given each
+surviving carrier and dangling reference. Prose that still named a retired item now names
+the maintained entry point: error labels in `canonical.rs` and
+`estimate/fit.rs`, rustdoc links in `reduced_solve.rs` and
+`multinomial_reml.rs`, and comments across the workspace.
 
 The external acceptance targets executed on MSI: two public-library tests, four
 structural-coordinate tests, and four measured-span tests passed. The generic

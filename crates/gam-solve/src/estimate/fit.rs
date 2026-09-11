@@ -244,7 +244,7 @@ where
     };
     if resolved_family.is_royston_parmar() {
         crate::bail_invalid_estim!(
-            "fit_gam external design path does not support RoystonParmar; use survival training APIs"
+            "fit_gam_with_penalty_specs external design path does not support RoystonParmar; use survival training APIs"
         );
     }
     // Validate the external-design family/link policy before looking at response
@@ -268,7 +268,7 @@ where
             violation
         );
     }
-    validate_penalty_specs(&specs, x.ncols(), "fit_gam")?;
+    validate_penalty_specs(&specs, x.ncols(), "fit_gam_with_penalty_specs")?;
     let ext_opts = ExternalOptimOptions {
         family: resolved_family,
         latent_cloglog: opts.latent_cloglog,

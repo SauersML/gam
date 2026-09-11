@@ -4864,7 +4864,7 @@ impl SplineScanFit {
     /// Validates shape, finiteness, strict knot ordering, positive weights and
     /// σ², so a corrupt payload fails loudly here instead of inside a later
     /// `predict`. The restored fit replays the Gaussian bridge bit-for-bit:
-    /// every field `predict`/`edf`/`deriv_at_knot` reads is either stored
+    /// every field `predict`/`edf` reads is either stored
     /// verbatim or derived by the same expressions the fitter uses.
     pub fn from_state(state: &SplineScanState) -> Result<Self, String> {
         let order = state.order;

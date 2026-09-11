@@ -2135,7 +2135,7 @@ impl SaeManifoldOuterObjective {
         // that selected it — the objective↔gradient desync class (#931/#1206)
         // moved from the line search into selection. The fold is removed from
         // every fitting/ranking lane; encoder consistency remains available as
-        // a pure diagnostic (`penalized_quasi_laplace_criterion_cotrained`). The fitted-data
+        // a pure diagnostic (`SaeManifoldTerm::amortized_encoder_consistency`). The fitted-data
         // collapse detector is a structural ledger verdict, not an objective
         // fold: changing a finite penalized quasi-Laplace value by a constant sentinel would pair
         // that post-hoc value with the analytic penalized quasi-Laplace derivative (#2253).
@@ -4759,6 +4759,95 @@ pub struct CurvatureWalkReport {
     pub reseeds: usize,
 }
 
+/// Curvature-homotopy output linear-span (low-rank / Eckart-Young) anchor.
+///
+/// This stage-1 primitive certifies the rank-`Σ basis_size` Eckart-Young residual
+/// CEILING of the target by sequential residual SVDs, canonicalizing every
+/// recovered output *linear subspace* (the span of the top singular vectors — the
+/// "linear span" this anchor names) through the same [`GrassmannFrame`] gauge used
+/// by the #972 frame machinery. The ceiling is a lower bound on the residual at
+/// every `eta`; it is NOT a claim that the `eta = 0` parametric endpoint is a
+/// linear/affine model (for curved bases that base-topology chart still embeds
+/// curvature). It does not mutate `term` or replace the existing seed cascade.
+pub fn linear_span_anchor(
+    term: &SaeManifoldTerm,
+    targets: ArrayView2<'_, f64>,
+) -> Result<LinearSpanAnchor, String> {
+    let n = term.n_obs();
+    let p = term.output_dim();
+    if targets.dim() != (n, p) {
+        return Err(format!(
+            "linear_span_anchor: targets shape {:?} != ({n}, {p})",
+            targets.dim()
+        ));
+    }
+    if term.k_atoms() == 0 {
+        return Err("linear_span_anchor: term must contain at least one atom".into());
+    }
+    if !targets.iter().all(|v| v.is_finite()) {
+        return Err("linear_span_anchor: targets must be finite".into());
+    }
+    let gates = neutral_gate_weights(term.assignment.mode, term.k_atoms());
+    let mut residual = targets.to_owned();
+    let mut reconstruction = Array2::<f64>::zeros((n, p));
+    let mut atoms = Vec::with_capacity(term.k_atoms());
+    for (atom_idx, atom) in term.atoms.iter().enumerate() {
+        let gate = gates[atom_idx];
+        if !(gate.is_finite() && gate > 0.0) {
+            return Err(format!(
+                "linear_span_anchor: neutral gate for atom {atom_idx} must be positive finite; got {gate}"
+            ));
+        }
+        let requested_rank = atom.basis_size().min(n).min(p);
+        if requested_rank == 0 {
+            return Err(format!(
+                "linear_span_anchor: atom {atom_idx} has no recoverable linear span rank"
+            ));
+        }
+        let weighted = residual.mapv(|v| gate * v);
+        let (_u_opt, singular_values_full, vt_opt) = weighted
+            .svd(false, true)
+            .map_err(|err| format!("linear_span_anchor: SVD failed for atom {atom_idx}: {err}"))?;
+        let vt = vt_opt.ok_or_else(|| {
+            format!("linear_span_anchor: SVD returned no right factor for atom {atom_idx}")
+        })?;
+        let rank = requested_rank
+            .min(vt.nrows())
+            .min(singular_values_full.len());
+        if rank == 0 {
+            return Err(format!(
+                "linear_span_anchor: atom {atom_idx} SVD returned rank zero"
+            ));
+        }
+        let mut frame = Array2::<f64>::zeros((p, rank));
+        for col in 0..rank {
+            for row in 0..p {
+                frame[[row, col]] = vt[[col, row]];
+            }
+        }
+        let singular_values = singular_values_full.slice(s![..rank]).to_owned();
+        let frame = GrassmannFrame::from_oriented(frame, singular_values.clone());
+        let frame_matrix = frame.frame().to_owned();
+        let mut coordinates = residual.dot(&frame_matrix);
+        coordinates.mapv_inplace(|v| v / gate);
+        let contribution = fast_abt(&coordinates, &frame_matrix).mapv(|v| gate * v);
+        reconstruction += &contribution;
+        residual -= &contribution;
+        atoms.push(LinearSpanAtomAnchor {
+            gate_weight: gate,
+            frame,
+            decoder_coordinates: coordinates,
+            singular_values,
+        });
+    }
+    let residual_norm_sq = residual.iter().map(|v| v * v).sum();
+    Ok(LinearSpanAnchor {
+        atoms,
+        reconstruction,
+        residual_norm_sq,
+    })
+}
+
 #[derive(Debug, Clone)]
 pub struct LinearSpanAtomAnchor {
     pub gate_weight: f64,
@@ -5205,7 +5294,7 @@ mod probe_refusal_classification_2593_tests {
     #[test]
     fn an_unclassified_defect_is_fatal_and_uncounted() {
         let defect = "SaeManifoldTerm::penalized_quasi_laplace_criterion: \
-                      arrow_log_det_from_cache returned None (undamped joint Hessian \
+                      ArrowFactorCache::arrow_log_det returned None (undamped joint Hessian \
                       log-det unavailable for the Laplace normaliser)";
         assert_eq!(ProbeRefusalKind::classify(defect), None);
         assert!(!SaeManifoldOuterObjective::is_recoverable_value_probe_refusal(

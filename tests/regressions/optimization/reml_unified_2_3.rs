@@ -3,7 +3,6 @@
 //! Each test here was previously a placeholder `assert!(false, ...)` stub. They
 //! are now genuine tests written against the public `gam-solve` REML API:
 //!
-//!   * `fit_gam` — full penalized fit (returns β̂, λ̂, status).
 //!   * `evaluate_externalcost_andridge` — outer REML/LAML score (`EvalMode::ValueOnly`
 //!     internally) plus the stabilization ridge that was applied.
 //!   * `evaluate_externalgradient` — analytic outer score derivative

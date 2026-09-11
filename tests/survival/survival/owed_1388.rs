@@ -28,7 +28,7 @@
 //!   * `15ae5d389` (#1388) — preflight WARN surfacing the `p_joint > n`
 //!     under-determination so the failure is diagnosable from the log.
 //!
-//! CERTIFICATE (public API only — `canonicalize_for_identifiability`):
+//! CERTIFICATE (public API only — `canonicalize_for_identifiability_with_operating_scalars`):
 //! reconstruct the issue's geometry at unit scale — a channel-aware survival
 //! marginal-slope joint whose total column count EXCEEDS the row count
 //! (`p_joint > n`) via categorical level expansion in a lower-priority block,
@@ -41,7 +41,7 @@
 //! the fan-out would overflow that worker and abort the process (the `join`
 //! below observes a panic-free completion), so the bounded stack is the active
 //! guard for failure #2; the `Ok(..)` + post-T assertions are the guard for #1.
-//! Were the rank-invariant fix reverted, `canonicalize_for_identifiability`
+//! Were the rank-invariant fix reverted, `canonicalize_for_identifiability_with_operating_scalars`
 //! would return `Err(DimensionMismatch { reason: "... post-T rank invariant
 //! violated ..." })` and the test would fail.
 

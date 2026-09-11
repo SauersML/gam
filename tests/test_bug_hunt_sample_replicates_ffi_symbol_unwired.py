@@ -23,7 +23,7 @@ raises `AttributeError: module 'gamfit._rust' has no attribute
 'generative_replicates'` on every call.  The whole #1057 feature — replicate
 sampling, posterior-predictive checks, simulation-based calibration — is
 unreachable from Python, even though the Rust core
-(`src/inference/generative.rs::sampleobservation_replicates`) is implemented.
+(`crates/gam-models/src/inference/generative.rs::sampleobservation_seeded_replicates`) is implemented.
 
 This test asserts the user-facing contract with OBJECTIVE checks (the family
 generative law is its own ground truth, no reference tool needed):

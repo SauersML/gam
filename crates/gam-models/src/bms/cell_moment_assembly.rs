@@ -4457,7 +4457,7 @@ mod empirical_flex_jet_oracle_tests {
     // build a SECOND, fully exact witness from an INDEPENDENT jet kernel:
     //
     //   * the implicit intercept `a(θ)` is solved as an exact dense-symmetric
-    //     `Tower4` via `jet_tower::implicit_solve`, independently assembled
+    //     `Tower4` via an exact implicit tower solve, independently assembled
     //     from the scalar fixture rather than the production runtime row plan,
     //     and
     //   * the I-spline deviation basis enters through its OWN
@@ -4467,7 +4467,8 @@ mod empirical_flex_jet_oracle_tests {
     //
     // Both the production jet and this tower compute the SAME analytic
     // derivatives, so they must agree to ~1e-9 with no truncation tolerance —
-    // exactly the discipline the rigid `verify_kernel_channels` oracle uses.
+    // exactly the discipline the rigid tensor oracle
+    // (`rigid_full_tower_matches_independent_algebra_932`) uses.
     // The primaries are θ = (q, b, β₀) in tower slots (0, 1, 2); the remaining
     // deviation coordinates are held at their fixed values as tower constants.
 

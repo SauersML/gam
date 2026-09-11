@@ -1917,7 +1917,7 @@ mod smoothing_correction_outcome_tests {
     /// hence `Vp = Vb + correction`) must scale by exactly `c²`, never `c⁴`.
     ///
     /// This is the DETERMINISTIC companion to the first-order integration test
-    /// `corrected_covariance_is_response_scale_equivariant`. A full `fit_gam`
+    /// `corrected_covariance_is_response_scale_equivariant`. A full `fit_gam_with_penalty_specs`
     /// will not reliably land ρ̂ anywhere in particular, so instead of hoping,
     /// this test calls [`RemlState::compute_smoothing_correction_auto`]
     /// directly with a fixed `final_rho`.

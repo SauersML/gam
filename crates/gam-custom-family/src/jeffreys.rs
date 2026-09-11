@@ -876,10 +876,27 @@ pub(crate) fn custom_family_outer_jeffreys_hphi_drift_batched<
         let family = Arc::clone(&family_owned);
         let states = Arc::clone(&states_owned);
         let specs = Arc::clone(&specs_owned);
+        // #979: the completion is only ever read along pairs of coordinate mode
+        // responses, `(−v_l, v_k)`, over every ρ pair of the dense outer Hessian and
+        // every column of the operator route's pair right-hand side. Its information
+        // derivative `H[u]` and all-axes `H²[v,·]` therefore repeat across pairs and
+        // across operator applications. Both are kept for this coefficient snapshot,
+        // one entry per coordinate response, keyed by exact bit pattern; the third
+        // derivative stays per pair.
+        let kept_first = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let kept_second = Arc::new(std::sync::Mutex::new(Vec::new()));
         Arc::new(move |u: &Array1<f64>, v: &Array1<f64>| -> Result<Array1<f64>, CustomFamilyError> {
             let missing = || CustomFamilyError::trial_point("active Jeffreys mode response requires exact completion derivatives");
-            let h = family.joint_jeffreys_information_directional_derivative_with_specs(&states, &specs, u)?.ok_or_else(missing)?;
-            let axes = family.joint_jeffreys_information_second_directional_all_axes_with_specs(&states, &specs, v)?.ok_or_else(missing)?;
+            let h = kept_along_response(&kept_first, u, || {
+                family
+                    .joint_jeffreys_information_directional_derivative_with_specs(&states, &specs, u)?
+                    .ok_or_else(missing)
+            })?;
+            let axes = kept_along_response(&kept_second, v, || {
+                family
+                    .joint_jeffreys_information_second_directional_all_axes_with_specs(&states, &specs, v)?
+                    .ok_or_else(missing)
+            })?;
             let moving = family.joint_jeffreys_information_third_directional_all_axes_with_specs(&states, &specs, u, v)?.ok_or_else(missing)?;
             Ok(prepare()?.completion_drift_action(&h, &axes, &moving)? * strength)
         })
@@ -1020,6 +1037,32 @@ pub(crate) fn custom_family_outer_jeffreys_hphi_drift_batched<
             .collect::<Result<Vec<_>, CustomFamilyError>>()
     });
     Ok(Some(JeffreysHphiDriftBatchFn { first, second, completion_beta, completion_psi: None, response_scale: 1.0 }))
+}
+
+/// The value kept for `direction`, matched by exact bit pattern, or `compute`'s
+/// result, kept for the next request along the same direction.
+fn kept_along_response<T>(
+    kept: &std::sync::Mutex<Vec<(Vec<u64>, Arc<T>)>>,
+    direction: &Array1<f64>,
+    compute: impl FnOnce() -> Result<T, CustomFamilyError>,
+) -> Result<Arc<T>, CustomFamilyError> {
+    let key: Vec<u64> = direction.iter().map(|value| value.to_bits()).collect();
+    let find = |entries: &[(Vec<u64>, Arc<T>)]| {
+        entries
+            .iter()
+            .find(|(seen, _)| *seen == key)
+            .map(|(_, value)| Arc::clone(value))
+    };
+    if let Some(value) = find(&kept.lock().unwrap_or_else(std::sync::PoisonError::into_inner)) {
+        return Ok(value);
+    }
+    let value = Arc::new(compute()?);
+    let mut entries = kept.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(existing) = find(&entries) {
+        return Ok(existing);
+    }
+    entries.push((key, Arc::clone(&value)));
+    Ok(value)
 }
 
 /// Index of `direction` among the distinct directions seen so far, by exact bit

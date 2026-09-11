@@ -29,7 +29,7 @@ pub(crate) const BMS_PROBIT_SEPARATION_ETA_INF: f64 = 35.0;
 
 // ── Canonical-gauge priority ladder (issue #322) ─────────────────────────────
 //
-// The priority-ordered RRQR in `canonicalize_for_identifiability` presents
+// The priority-ordered RRQR in `canonicalize_for_identifiability_with_operating_scalars` presents
 // higher-priority blocks first and routes any shared cross-block alias drop
 // into the lowest-priority block that still spans the aliased direction. The
 // values below form a single ordered ladder so the relationships that the
@@ -1681,7 +1681,7 @@ pub(crate) fn build_marginal_blockspec_bms(
         initial_beta: widen_marginal_beta_hint(beta_hint, p_marginal),
         // Canonical-gauge architecture (issue #322): give marginal_surface
         // strictly higher priority than slope_surface so the priority-
-        // ordered RRQR in `canonicalize_for_identifiability` presents
+        // ordered RRQR in `canonicalize_for_identifiability_with_operating_scalars` presents
         // marginal columns first and routes any cross-block alias drop into
         // slope.  Equal priorities (the previous default of 100/100)
         // produced a same-priority `hard_alias_pair` whenever a
@@ -1745,7 +1745,7 @@ pub(crate) fn build_slope_blockspec_bms(
         initial_beta: beta_hint,
         // Canonical-gauge architecture (issue #322): slope is strictly
         // lower priority than marginal so the priority-ordered RRQR in
-        // `canonicalize_for_identifiability` demotes a shared cross-block
+        // `canonicalize_for_identifiability_with_operating_scalars` demotes a shared cross-block
         // direction here, not in marginal.  Mirrors the survival-mgs
         // value (marginal=150, slope=120).  See the matching comment
         // on `build_marginal_blockspec_bms` for the failure mode this

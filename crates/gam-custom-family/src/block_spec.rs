@@ -30,6 +30,19 @@ pub struct CoefficientLabel {
     pub column: usize,
 }
 
+impl CoefficientLabel {
+    pub fn by_block_name(block: impl Into<String>, column: usize) -> Self {
+        Self {
+            block: CoefficientBlockSelector::Name(block.into()),
+            column,
+        }
+    }
+}
+
+pub fn coefficient_label(block: impl Into<String>, column: usize) -> CoefficientLabel {
+    CoefficientLabel::by_block_name(block, column)
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct CoefficientGroupSpec {
     pub label: String,
@@ -50,6 +63,15 @@ impl CoefficientGroupSpec {
         }
     }
 
+    pub fn with_parent(mut self, parent: impl Into<String>) -> Self {
+        self.parent = Some(parent.into());
+        self
+    }
+
+    pub fn with_prior(mut self, prior: CoefficientGroupPrior) -> Self {
+        self.prior = Some(prior);
+        self
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]

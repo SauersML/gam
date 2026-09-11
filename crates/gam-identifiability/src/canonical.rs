@@ -592,7 +592,7 @@ fn canonicalize_for_identifiability_inner(
     if coordinates.len() != specs.len() {
         return Err(CustomFamilyError::DimensionMismatch {
             reason: format!(
-                "canonicalize_for_identifiability: {} coefficient-coordinate declaration(s) \
+                "canonicalize_for_identifiability_with_operating_scalars: {} coefficient-coordinate declaration(s) \
                  for {} parameter block(s); every block must declare whether its coordinate \
                  is reparameterisable (#2748)",
                 coordinates.len(),
@@ -650,7 +650,7 @@ fn canonicalize_for_identifiability_inner(
     let use_channel_aware = max_n_outputs > 1;
 
     log::debug!(
-        "[CANON] canonicalize_for_identifiability: blocks={} n_rows={} \
+        "[CANON] canonicalize_for_identifiability_with_operating_scalars: blocks={} n_rows={} \
          max_n_outputs={} route={}",
         specs.len(),
         n_rows,
@@ -758,7 +758,7 @@ fn canonicalize_for_identifiability_inner(
                     )
                     .map_err(|e| CustomFamilyError::DimensionMismatch {
                         reason: format!(
-                            "canonicalize_for_identifiability: build \
+                            "canonicalize_for_identifiability_with_operating_scalars: build \
                                          BlockJacobianAsRowOp for block '{}': {e}",
                             spec.name,
                         ),
@@ -919,7 +919,7 @@ fn canonicalize_for_identifiability_inner(
                 probit_frailty_scale: 1.0,
             };
             spec.effective_jacobian_at(
-                "canonicalize_for_identifiability: dynamic zero-Jacobian veto probe",
+                "canonicalize_for_identifiability_with_operating_scalars: dynamic zero-Jacobian veto probe",
                 &state,
             )
             .map(|j| j.iter().all(|v| *v == 0.0))
@@ -968,7 +968,7 @@ fn canonicalize_for_identifiability_inner(
             }
             match spec
                 .design
-                .try_to_dense_arc("canonicalize_for_identifiability: dead-column veto probe")
+                .try_to_dense_arc("canonicalize_for_identifiability_with_operating_scalars: dead-column veto probe")
             {
                 Ok(dense) => {
                     // A zero-placeholder design (all entries zero) means the true
@@ -1067,7 +1067,7 @@ fn canonicalize_for_identifiability_inner(
         for &col in &dropped_sorted {
             if col >= p_raw {
                 crate::bail_dim_custom!(
-                    "canonicalize_for_identifiability: audit reported dropped column \
+                    "canonicalize_for_identifiability_with_operating_scalars: audit reported dropped column \
                          {col} for block '{}' which has only {} columns",
                     spec.name,
                     p_raw,
@@ -1112,7 +1112,7 @@ fn canonicalize_for_identifiability_inner(
             Some(beta_raw) => {
                 if beta_raw.len() != p_raw {
                     crate::bail_dim_custom!(
-                        "canonicalize_for_identifiability: block '{}' initial_beta \
+                        "canonicalize_for_identifiability_with_operating_scalars: block '{}' initial_beta \
                              length {} != design ncols {}",
                         spec.name,
                         beta_raw.len(),
@@ -1228,7 +1228,7 @@ fn canonicalize_for_identifiability_inner(
                             .map(|a| a.as_ref().clone())
                             .map_err(|reason| CustomFamilyError::DimensionMismatch {
                                 reason: format!(
-                                    "canonicalize_for_identifiability: the MAP-uniqueness check \
+                                    "canonicalize_for_identifiability_with_operating_scalars: the MAP-uniqueness check \
                                      could not materialise the stacked design for block '{}', so \
                                      its cross-channel span cannot be seen: {reason}",
                                     s.name,
@@ -1555,7 +1555,7 @@ fn canonicalize_for_identifiability_inner(
                     .collect();
                 return Err(CustomFamilyError::DimensionMismatch {
                     reason: format!(
-                        "canonicalize_for_identifiability: post-T rank invariant violated — \
+                        "canonicalize_for_identifiability_with_operating_scalars: post-T rank invariant violated — \
                          under the drop-deciding {} convention the reduced design J_can is \
                          rank-deficient: rank(J_can)={rank_j_can} but rank_target=\
                          min(rank(J_pre)={rank_j_pre}, p_red={p_total_red})={rank_target} \
@@ -2011,11 +2011,11 @@ fn build_reduced_design(
         DesignMatrix::Sparse(_) => {
             let dense = raw
                 .try_to_dense_by_chunks(&format!(
-                    "canonicalize_for_identifiability sparse->dense block '{block_name}'"
+                    "canonicalize_for_identifiability_with_operating_scalars sparse->dense block '{block_name}'"
                 ))
                 .map_err(|reason| CustomFamilyError::DimensionMismatch {
                     reason: format!(
-                        "canonicalize_for_identifiability: densify sparse block '{block_name}' \
+                        "canonicalize_for_identifiability_with_operating_scalars: densify sparse block '{block_name}' \
                          failed: {reason}"
                     ),
                 })?;
@@ -2036,7 +2036,7 @@ fn build_reduced_design(
     let op = CoefficientTransformOperator::new(inner_dense, t_i.clone()).map_err(|reason| {
         CustomFamilyError::DimensionMismatch {
             reason: format!(
-                "canonicalize_for_identifiability: build CoefficientTransformOperator \
+                "canonicalize_for_identifiability_with_operating_scalars: build CoefficientTransformOperator \
                  for block '{block_name}': {reason}"
             ),
         }
@@ -2393,13 +2393,12 @@ mod tests {
     // true of everything by construction. `CoefficientCoordinate` and
     // `Gauge::is_identity` were never touched.
     //
-    // The public wrapper `canonicalize_for_identifiability` was NOT so lucky:
+    // The public wrapper that supplied `None` operating scalars was NOT so lucky:
     // the same sweep deleted it, leaving only the private
     // `canonicalize_for_identifiability_inner` and the public
-    // `canonicalize_for_identifiability_with_operating_scalars`. Every remaining
-    // mention of the old name in this crate is prose or an error string naming a
-    // function that no longer exists (`canonical.rs:595`, `:653`, `:1231`,
-    // `:1558`, and `audit.rs:12`). These gates therefore call the surviving
+    // `canonicalize_for_identifiability_with_operating_scalars`, and #2829
+    // retired the wrapper's name (docs/rust-library-surface.md). These gates
+    // therefore call the surviving
     // public entry point with `None` operating scalars, which is byte-for-byte
     // what the deleted wrapper did: its entire body was
     // `canonicalize_for_identifiability_inner(specs, coordinates, true, None)`.

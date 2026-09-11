@@ -2,7 +2,7 @@ use gam::families::bms::{MarginalSlopeCovarianceShape, marginal_slope_covariance
 use ndarray::{Array1, array};
 
 // The K=1 reduction is an identity over the reals, not over IEEE-754.
-// `marginal_slope_preserving_scale` squares the probit scale once and applies
+// The marginal-slope-preserving scale squares the probit scale once and applies
 // it to the quadratic form of the *raw* slopes (the diagonal quadratic form
 // accumulates `coefficient * slope * slope`), so production evaluates
 // `fl(fl(p*p) * fl(s*s))` while the scalar identity below folds the scale into

@@ -17,8 +17,8 @@
 //! per-row / Schur factor succeeds — the same Ceres-style LM damping the
 //! training-time `run_joint_fit_arrow_schur` driver already used inline.
 //! Both `run_joint_fit_arrow_schur` (the multi-iteration training/predict
-//! driver) and `solve_newton_step` (the single-shot Newton entry that the
-//! basis-refresh refinement uses) now self-heal, so the OOS predict /
+//! driver) and the single-shot Newton entry that the basis-refresh refinement
+//! uses now self-heal, so the OOS predict /
 //! reconstruct call path can no longer surface the per-row factor failure.
 //!
 //! No `let _`, no `#[allow]`, no `#[ignore]`, no env vars.

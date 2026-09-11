@@ -5,9 +5,9 @@
 //! Every other curved producer in this crate discovers curvature from a
 //! *residual*: the structured-residual birth path
 //! ([`crate::structure_harvest`]) mines the reconstruction residual `R = x − x̂`
-//! for factor directions, and the compose/co-fit lane
-//! (`crate::sparse_dict::cofit`) fits charts to the linear tier's
-//! least-squares residual. Both share a sufficient statistic that is a function
+//! for factor directions, and the tiered curved refinement
+//! ([`crate::tiered::fit_tiered`]) fits charts to the Tier-1 linear peel's
+//! residual. Both share a sufficient statistic that is a function
 //! ONLY of the linear residual.
 //!
 //! There is an exact impossibility result for that statistic. Two linear atoms

@@ -11,7 +11,7 @@
 //! tests pass GREEN. They then act as permanent regression guards: any
 //! future change that degrades small-n smooth-function coverage trips them.
 //!
-//! Coverage strategy (independent of optimizer / REML / fit_gam):
+//! Coverage strategy (independent of optimizer / REML / external-design fitting):
 //!   - Test A: build the basis directly, do unpenalized OLS via Cholesky,
 //!     measure held-out test R² on a smooth bivariate target. This isolates
 //!     the basis from REML and the outer optimizer.

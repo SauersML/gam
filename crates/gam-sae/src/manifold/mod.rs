@@ -163,6 +163,7 @@ pub use crate::frames::*;
 
 mod arrow_solver;
 mod atlas_topology;
+mod amortized_routing;
 mod atom;
 mod atom_build;
 mod basin_bundle;
@@ -174,10 +175,6 @@ mod certificate;
 mod chart_atlas;
 mod chart_degeneracy;
 mod checkpoint;
-// #2693 / #985 E1: the block-routing -> dense-engine co-fit bridge. It sits on the
-// DENSE side of the boundary because the engine's only constructor takes a dense
-// `SaeAssignment`; it consumes `crate::sparse_dict`'s public surface from outside.
-mod cofit_arrow;
 mod construction;
 mod construction_ard;
 mod construction_arrow_schur_assembly;
@@ -216,6 +213,7 @@ mod minimal_seed;
 mod oos_entry;
 mod oos_logit_seed;
 mod outer_objective;
+mod pair_kappa;
 mod pair_phase;
 mod pca_seed;
 mod penalties;
@@ -556,7 +554,6 @@ pub use behavior_isometry::*;
 pub use certificate::*;
 pub use chart_atlas::*;
 pub use chart_degeneracy::*;
-pub use cofit_arrow::*;
 pub use construction_aux_types::*;
 pub use construction_cache_refresh::*;
 pub use construction_padded_blocks::*;
@@ -620,6 +617,7 @@ pub use loss::*;
 pub use minimal_seed::*;
 pub use oos_entry::*;
 pub use outer_objective::*;
+pub use pair_kappa::*;
 pub use pair_phase::*;
 pub use pca_seed::*;
 pub use penalties::*;

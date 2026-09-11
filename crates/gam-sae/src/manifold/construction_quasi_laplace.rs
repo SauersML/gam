@@ -353,7 +353,7 @@ impl SaeManifoldTerm {
         // 2. Drive the inner (t, β) solve to the KKT/step-converged optimum and
         //    take one final UNDAMPED factor there to obtain the joint Hessian
         //    log-determinant. We force ridge = 0 and the dense `Direct` Schur
-        //    mode so `arrow_log_det_from_cache` returns the exact
+        //    mode so `ArrowFactorCache::arrow_log_det` returns the exact
         //    `log|H| = Σ_i log|H_tt^(i)| + log|Schur_β|` (it rejects damped
         //    factors and InexactPCG caches, which have no dense Schur factor).
         //    This is the same evidence convention the main GAM penalized quasi-Laplace path uses.
@@ -487,7 +487,7 @@ impl SaeManifoldTerm {
                 })?;
             let d_eff = self.rank_dof_from_grams(&grams, &n_eff, rho, disp)?;
             // Occupancy-aware effective sample size N_eff,k = Σ_i a_{ik}², the #2a
-            // per-atom BIC log-scale (same quantity `per_atom_realised_rank_dof` uses
+            // per-atom BIC log-scale (same quantity `rank_dof_from_grams` uses
             // internally for the MP edge; recomputed here — a cheap Σa² — to price the
             // charge in the same currency).
             // #5/#2498 — the same-state gated-signal certificate above owns the
@@ -499,8 +499,8 @@ impl SaeManifoldTerm {
             // `0.5 log|H| - 0.5 log|H_tt| + rank_charge`; dense, streaming, and
             // criterion-as-atoms assembly therefore cannot drift apart.
             // log_det (= log|A|) and log_det_tt (= log|A_tt|) are produced together
-            // above from the exact observed information; `coordinate_block_log_det`
-            // (the majorizer ½log|B_tt|) is no longer the ranked coordinate term.
+            // above from the exact observed information; the majorizer `½log|B_tt|` is
+            // no longer the ranked coordinate term.
             let quasi_laplace_complexity =
                 rank_adjusted_quasi_laplace_complexity(log_det, log_det_tt, &d_eff, &n_eff)?;
             loss.total() + extra_penalty_energy + quasi_laplace_complexity - occam
@@ -682,14 +682,14 @@ impl SaeManifoldTerm {
     /// assignment-sparsity negative logit curvature) that surfaces
     /// `PerRowFactorFailed` from the undamped `factor_one_row`. Both the dense
     /// (`penalized_quasi_laplace_criterion_with_cache`) and the streaming
-    /// (`penalized_quasi_laplace_criterion_streaming_exact`) criterion paths route through this same
+    /// (`penalized_quasi_laplace_criterion_streaming_exact_with_lane`) criterion paths route through this same
     /// driver, so they converge to the identical inner state (#847).
     ///
     /// ⚠ #2509 — a shared inner state is NOT a shared log-determinant. #2330
     /// Phase-2 changed which OPERATOR each lane factors at that shared state:
     /// dense prices the exact observed information `A = B + ΔC`
     /// (`exact_observed_information_log_dets`), streaming prices the Arrow–Schur
-    /// majorizer `B` (`streaming_exact_arrow_log_det`). The #847 bit-identity
+    /// majorizer `B` (`streaming_exact_arrow_log_det_with_lane_and_system`). The #847 bit-identity
     /// claim held for `B` against `B` and does not survive that migration.
     /// Freeze the collapse-prevention gates for one criterion evaluation,
     /// returning whether they were ALREADY frozen so the caller can restore.
@@ -962,7 +962,7 @@ impl SaeManifoldTerm {
             // condition number and the traces only need the (PD) factor. So
             // tolerate the ill-conditioning rejection here (a genuine non-PD pivot
             // still errors). The cache stays undamped at ridge=0, so
-            // `arrow_log_det_from_cache` remains exact.
+            // `ArrowFactorCache::arrow_log_det` remains exact.
             // The exact KKT stationarity residual is the joint gradient
             // ‖g‖ = √(Σ_i ‖g_t^(i)‖² + ‖g_β‖²), read straight off the assembled
             // system. Unlike the Newton step Δ = H⁻¹g, the gradient is
@@ -3004,6 +3004,24 @@ impl SaeManifoldTerm {
         Ok(made_progress)
     }
 
+    /// Public analytic outer-ρ gradient at a converged inner state, constructing
+    /// the deflated arrow solver from the supplied cache. Use this seam from
+    /// integration tests and external consumers that have a converged
+    /// `(loss, cache)` from [`Self::penalized_quasi_laplace_criterion_with_cache`] but no access to
+    /// the crate-private `DeflatedArrowSolver`.
+    pub fn analytic_outer_rho_gradient_at_converged(
+        &self,
+        target: ArrayView2<'_, f64>,
+        rho: &SaeManifoldRho,
+        loss: &SaeManifoldLoss,
+        cache: &ArrowFactorCache,
+    ) -> Result<SaeOuterRhoGradientComponents, String> {
+        self.assignment.validate_rho_domain(rho)?;
+        let solver = self.outer_gradient_arrow_solver(cache, &rho.lambda_smooth_vec()?)?;
+        self.analytic_outer_rho_gradient_components(target, rho, loss, cache, &solver)
+            .map_err(|e| e.to_string())
+    }
+
     pub(crate) fn outer_gradient_arrow_solver<'a>(
         &'a self,
         cache: &'a ArrowFactorCache,
@@ -3380,7 +3398,7 @@ impl SaeManifoldTerm {
     /// `border_dim²` Schur is NEVER formed here), so the EFS hyperparameter lane
     /// can take its matrix-free ARD / smoothness traces off this cache in the
     /// streaming regime instead of hard-erroring on the dense criterion path. The
-    /// log-determinant is the chunked matrix-free `streaming_exact_arrow_log_det`.
+    /// log-determinant is the chunked matrix-free `streaming_exact_arrow_log_det_with_lane_and_system`.
     /// Convenience over [`Self::penalized_quasi_laplace_criterion_streaming_exact_with_cache_and_lane`]
     /// with no #2080 surrogate lane (bit-identical SLQ evidence).
     pub fn penalized_quasi_laplace_criterion_streaming_exact_with_cache(
@@ -3694,7 +3712,7 @@ impl SaeManifoldTerm {
         // Drive the inner (t, β) state to the SAME KKT/step-converged optimum the
         // dense `penalized_quasi_laplace_criterion_with_cache` reaches before factoring. At that
         // optimum the per-row `H_tt^(i)` blocks are PD, so the undamped
-        // (`ridge_t = 0`) streaming factorization in `streaming_exact_arrow_log_det`
+        // (`ridge_t = 0`) streaming factorization in `streaming_exact_arrow_log_det_with_lane_and_system`
         // succeeds — without this, a state stopped after only `inner_max_iter`
         // steps can leave a rank-deficient / indefinite row block (`p_out = 1` →
         // rank-1 `JᵀJ`, softmax negative-logit curvature) that surfaces
@@ -3709,7 +3727,7 @@ impl SaeManifoldTerm {
         // (matrix-free, feasible at massive K — the dense border_dim² Schur is
         // never materialised here); it is RETURNED so the EFS lane can take its
         // matrix-free ARD/smoothness traces off it. The log-determinant itself is
-        // recomputed chunk-by-chunk in `streaming_exact_arrow_log_det` to bound
+        // recomputed chunk-by-chunk in `streaming_exact_arrow_log_det_with_lane_and_system` to bound
         // peak memory.
         //
         // #2509 Phase-2b — that recomputation now prices the exact observed
@@ -3776,7 +3794,7 @@ impl SaeManifoldTerm {
             self.reml_extra_penalty_value_total(registry)
                 .map_err(|err| {
                     format!(
-                        "SaeManifoldTerm::penalized_quasi_laplace_criterion_streaming_exact: {err}"
+                        "SaeManifoldTerm::penalized_quasi_laplace_criterion_streaming_exact_with_lane: {err}"
                     )
                 })?;
         let v = {
@@ -3820,7 +3838,7 @@ impl SaeManifoldTerm {
                 )
                 .map_err(|e| {
                     format!(
-                        "SaeManifoldTerm::penalized_quasi_laplace_criterion_streaming_exact: rank-charge dispersion is required: {e}"
+                        "SaeManifoldTerm::penalized_quasi_laplace_criterion_streaming_exact_with_lane: rank-charge dispersion is required: {e}"
                     )
                 })?;
             let d_eff = self.rank_dof_from_grams(&ri.grams, &ri.n_eff, rho, disp)?;
@@ -3834,7 +3852,7 @@ impl SaeManifoldTerm {
         Ok((v, loss, converged_cache, evidence_artifacts))
     }
 
-    /// `Self::penalized_quasi_laplace_criterion_streaming_exact` with the #2080 surrogate lane
+    /// The streaming exact criterion with the #2080 surrogate lane
     /// threaded to the streaming `log|S|` term (`None` = bit-identical SLQ).
     pub fn penalized_quasi_laplace_criterion_streaming_exact_with_lane(
         &mut self,
@@ -4143,7 +4161,7 @@ impl SaeManifoldTerm {
         }
         let mut system = full_chunk
             .assemble_arrow_schur_scaled(target, rho, registry, 1.0)
-            .map_err(|error| format!("SaeManifoldTerm::streaming_exact_arrow_log_det: {error}"))?;
+            .map_err(|error| format!("SaeManifoldTerm::streaming_exact_arrow_log_det_with_lane_and_system: {error}"))?;
         // The exact-stationarity inverse consumes this system with the factor
         // cache emitted from it. Persist the completed row/registry fingerprint
         // now so the stale-pair guard compares two identities from the same
@@ -4162,7 +4180,7 @@ impl SaeManifoldTerm {
     ) -> Result<(f64, Option<StreamingEvidenceArtifacts>), String> {
         if target.dim() != (self.n_obs(), self.output_dim()) {
             return Err(format!(
-                "SaeManifoldTerm::streaming_exact_arrow_log_det: target must be ({}, {}); got {:?}",
+                "SaeManifoldTerm::streaming_exact_arrow_log_det_with_lane_and_system: target must be ({}, {}); got {:?}",
                 self.n_obs(),
                 self.output_dim(),
                 target.dim()
@@ -4255,7 +4273,7 @@ impl SaeManifoldTerm {
                     )
                     .map_err(|err| {
                         format!(
-                            "SaeManifoldTerm::streaming_exact_arrow_log_det: matrix-free criterion log-det: {err:?}"
+                            "SaeManifoldTerm::streaming_exact_arrow_log_det_with_lane_and_system: matrix-free criterion log-det: {err:?}"
                         )
                     })?;
                     (
@@ -4277,7 +4295,7 @@ impl SaeManifoldTerm {
                     )
                     .map_err(|err| {
                         format!(
-                            "SaeManifoldTerm::streaming_exact_arrow_log_det: matrix-free criterion log-det: {err:?}"
+                            "SaeManifoldTerm::streaming_exact_arrow_log_det_with_lane_and_system: matrix-free criterion log-det: {err:?}"
                         )
                     })?;
                     (log_det_tt, log_det_schur, None)
@@ -4285,7 +4303,7 @@ impl SaeManifoldTerm {
             };
             if !log_det_schur.is_finite() {
                 return Err(format!(
-                    "SaeManifoldTerm::streaming_exact_arrow_log_det: matrix-free reduced-Schur \
+                    "SaeManifoldTerm::streaming_exact_arrow_log_det_with_lane_and_system: matrix-free reduced-Schur \
                      log|S| non-finite ({log_det_schur})"
                 ));
             }
@@ -4365,7 +4383,7 @@ impl SaeManifoldTerm {
             let z_chunk = target.slice(s![start..end, ..]);
             let sys = chunk
                 .assemble_arrow_schur_scaled(z_chunk, rho, registry, penalty_scale)
-                .map_err(|err| format!("SaeManifoldTerm::streaming_exact_arrow_log_det: {err}"))?;
+                .map_err(|err| format!("SaeManifoldTerm::streaming_exact_arrow_log_det_with_lane_and_system: {err}"))?;
             // #2509/#2515 Phase-2b — same substitution as the matrix-free branch:
             // the Laplace normalizer is `log|A|`, and every `ΔC` channel except
             // ordered Beta-Bernoulli is row-local, so the correction is
@@ -4375,7 +4393,7 @@ impl SaeManifoldTerm {
             let mut streaming = StreamingArrowSchur::from_system(&sys, sys.rows.len().max(1));
             let evidence = streaming
                 .evidence_schur_chunk(0.0, 0.0, &options)
-                .map_err(|err| format!("SaeManifoldTerm::streaming_exact_arrow_log_det: {err}"))?;
+                .map_err(|err| format!("SaeManifoldTerm::streaming_exact_arrow_log_det_with_lane_and_system: {err}"))?;
             log_det_tt += evidence.log_det_tt;
             match (evidence.majorizer_metric, evidence.clamp_metric) {
                 (Some(majorizer), Some(clamp)) => {
@@ -4385,7 +4403,7 @@ impl SaeManifoldTerm {
                 }
                 (None, None) => {}
                 _ => {
-                    return Err("SaeManifoldTerm::streaming_exact_arrow_log_det: partial exact-A \
+                    return Err("SaeManifoldTerm::streaming_exact_arrow_log_det_with_lane_and_system: partial exact-A \
                                 chunk carrier is not a classification"
                         .to_string());
                 }
@@ -4399,7 +4417,7 @@ impl SaeManifoldTerm {
         }
         let expected_chunks = n_total.div_ceil(chunk_size);
         if exact_a_chunks != 0 && exact_a_chunks != expected_chunks {
-            return Err("SaeManifoldTerm::streaming_exact_arrow_log_det: partial exact-A \
+            return Err("SaeManifoldTerm::streaming_exact_arrow_log_det_with_lane_and_system: partial exact-A \
                         chunk carrier would classify a different operator"
                 .to_string());
         }
@@ -4410,7 +4428,7 @@ impl SaeManifoldTerm {
             exact_a.map(|metrics| metrics.0),
             exact_a.map(|metrics| metrics.1),
         )
-        .map_err(|err| format!("SaeManifoldTerm::streaming_exact_arrow_log_det: {err}"))?;
+        .map_err(|err| format!("SaeManifoldTerm::streaming_exact_arrow_log_det_with_lane_and_system: {err}"))?;
         if let Some(ri) = rank_inputs.as_deref_mut() {
             ri.log_det_tt = log_det_tt;
         }

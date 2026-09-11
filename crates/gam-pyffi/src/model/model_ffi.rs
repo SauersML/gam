@@ -5871,9 +5871,9 @@ fn gaussian_reml_fit_blocks_backward<'py>(
 /// Constrained Gaussian REML forward fit with a single penalty block and an
 /// optional linear inequality system `A·β ≥ b`.
 ///
-/// Wraps the same constrained PIRLS+REML driver (`fit_gam` with
-/// `FitOptions.linear_constraints`) that backs the formula-API shape
-/// constraints. Forward-only: no analytic VJP through the active-set
+/// Wraps the constrained Gaussian REML driver
+/// (`constrained_gaussian_reml_forward` over a `LinearInequalityConstraints`
+/// system) that backs the formula-API shape constraints. Forward-only: no analytic VJP through the active-set
 /// inner solver is exposed here (the BUG-3 tangent-projection backward
 /// is implemented inside the REML driver but not yet plumbed out as a
 /// reusable Python VJP — see `gaussian_reml_fit_blocks_forward` for the

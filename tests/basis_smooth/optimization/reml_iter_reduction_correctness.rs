@@ -5,11 +5,6 @@
 //!     gradient floor from `tol` to `max(tol, n·1e-9)` so the loop
 //!     does not chase sub-ULP gradient components when the relative-
 //!     from-seed component has already declared convergence.
-//!   - `with_arc_initial_regularization(0.25)`: lets the first ARC
-//!     step be ~4× the default on the typically quadratic-like
-//!     Gaussian profile likelihood.
-//!   - `with_operator_initial_trust_radius(4.0)`: matrix-free TR
-//!     analog for k > OUTER_HVP_MATERIALIZE_MAX_DIM problems.
 //!
 //! Strictness: β agreement against a deliberately tightened reference
 //! must be at most `1e-7` per-coefficient. This bar is fixed; if a

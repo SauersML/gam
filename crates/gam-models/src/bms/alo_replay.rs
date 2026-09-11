@@ -12,26 +12,6 @@ use gam_problem::InverseLink;
 use gam_problem::ParameterBlockState;
 use ndarray::{Array1, Array2};
 
-/// Complete saved-row state for exact rigid Bernoulli marginal-slope ALO replay.
-pub struct BernoulliMarginalSlopeAloRowInput<'a> {
-    pub base_link: &'a InverseLink,
-    pub marginal_eta: f64,
-    pub slope: f64,
-    pub latent_z: f64,
-    pub response: f64,
-    pub prior_weight: f64,
-    pub probit_frailty_scale: f64,
-}
-
-/// Negative-log-likelihood derivatives in the affine fitted coordinates
-/// `[marginal eta, slope]` for one saved Bernoulli marginal-slope row.
-#[derive(Clone, Debug, PartialEq)]
-pub struct BernoulliMarginalSlopeAloRowGeometry {
-    pub negative_log_likelihood: f64,
-    pub nll_score: [f64; 2],
-    pub observed_hessian: [[f64; 2]; 2],
-}
-
 /// Exact saved-row geometry in the full local primary frame
 /// `[marginal eta, slope, score-warp coefficients..., link-deviation
 /// coefficients...]`.

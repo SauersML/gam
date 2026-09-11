@@ -513,7 +513,7 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
             FlexCompileOutcome::FullyAliased { reason } => {
                 // Record via the structured channel. The block is still
                 // included with its original (non-compiled) design so the
-                // unified audit's canonicalize_for_identifiability sees it
+                // unified audit's canonicalize_for_identifiability_with_operating_scalars sees it
                 // and attributes the drop to score_warp_dev via
                 // dropped_columns (gauge_priority=80 is below marginal=150
                 // and slope=120 so RRQR correctly demotes score_warp_dev).
@@ -1363,7 +1363,7 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
                 //
                 // Contrast with the outer-inner-fit audit policy (fail-fatal):
                 // `fit_custom_family` routes through
-                // `canonicalize_for_identifiability`, which returns
+                // `canonicalize_for_identifiability_with_operating_scalars`, which returns
                 // `CustomFamilyError::IdentifiabilityFailure` on a fatal audit.
                 // At the outer fit the full penalty is in play; rank-deficiency
                 // there is a genuine model-specification problem that must be

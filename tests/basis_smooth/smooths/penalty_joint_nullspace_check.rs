@@ -30,7 +30,7 @@
 //!   n_B^T [[0]] n_B = 0.
 //!   n^T S n = 0.  CHECK FAILS.
 //!
-//! # `canonicalize_for_identifiability` end-to-end test
+//! # `canonicalize_for_identifiability_with_operating_scalars` end-to-end test
 //!
 //! A clean 2-block model (no aliasing) with full-rank penalties on both
 //! blocks passes canonicalize without triggering any failure.
@@ -169,5 +169,5 @@ fn map_uniqueness_check_fails_when_s_zero_on_null_direction() {
     }
 }
 
-// ── canonicalize_for_identifiability end-to-end tests ────────────────────────
+// ── canonicalize_for_identifiability_with_operating_scalars end-to-end tests ────────────────────────
 

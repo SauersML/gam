@@ -70,7 +70,7 @@
 //! `n_rows · q`) to `DeviceRequest`, add one kernel `sae_arrow_third_dir` with
 //! the same `(row, a, b)` thread mapping and the same `__dadd_rn` accumulation as
 //! `sae_arrow_htt`, and add a `t3: Vec<f64>` block (shape `[n_rows, q, q]`) to
-//! [`ArrowBlocks`]. No new tensor is materialized and no new transfer shape is
+//! the per-row arrow download. No new tensor is materialized and no new transfer shape is
 //! introduced — the contraction with `v` happens inside the kernel, so the
 //! download stays `O(q²)` per row. `ArrowCurvature` gains no variant: the third
 //! order is a separate directional product, not a curvature mode.
@@ -100,41 +100,6 @@ impl ArrowCurvature {
             Self::ExactNewton => 1.0,
         }
     }
-}
-
-/// Reduced arrow sufficient statistics for one row tile.
-///
-/// The `ξ` (latent `t`) blocks are per row — the arrow's `t` block is
-/// block-diagonal by row — while the `β` blocks are summed over the tile.
-#[derive(Debug, Clone, PartialEq)]
-pub struct ArrowBlocks {
-    pub n_rows: usize,
-    pub q: usize,
-    pub n_beta: usize,
-    /// `[n_rows, q]` — `g_ξ = J_ξᵀ r`.
-    pub g_t: Vec<f64>,
-    /// `[n_rows, q, q]` — `H_ξξ`.
-    pub h_tt: Vec<f64>,
-    /// `[n_rows, q, n_beta]` — `H_ξβ`.
-    pub h_tb: Vec<f64>,
-    /// `[n_beta]` — `g_β = Σ_rows J_βᵀ r`.
-    pub g_beta: Vec<f64>,
-    /// `[n_beta, n_beta]` — `H_ββ = Σ_rows J_βᵀ J_β` (no residual curvature:
-    /// reconstruction is linear in `β`).
-    pub h_bb: Vec<f64>,
-}
-
-impl ArrowBlocks {
-
-}
-
-/// A `(t, β)` direction / product in the arrow coordinates of one tile.
-#[derive(Debug, Clone, PartialEq)]
-pub struct ArrowDirection {
-    /// `[n_rows, q]`.
-    pub t: Vec<f64>,
-    /// `[n_beta]`.
-    pub beta: Vec<f64>,
 }
 
 /// Score-only reduction: `g_ξ` per row and the tile's shared `g_β`.

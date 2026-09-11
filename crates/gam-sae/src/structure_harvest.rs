@@ -84,7 +84,7 @@ use crate::atom_codes::SparseAtomCodes;
 use crate::basis::{AmbientSphereHarmonicEvaluator, SaeBasisEvaluator, SaeBasisSecondJet};
 use crate::description_length::{BirthMdlPrescreen, predicted_birth_dl_bits};
 use crate::frames::GrassmannFrame;
-use crate::manifold::{AssignmentMode, AtlasSeamKind, AtlasTopologyReadout, GraphCompressionKind, GraphStructureSelection, LearnedGraphAtom, SAE_AMBIENT_SPHERE_DEFAULT_DEGREE, SAE_EUCLIDEAN_PATCH_MAX_DEGREE, SAE_MAX_PERIODIC_HARMONICS, SaeAtomBasisKind, SaeAtomGeometryPlan, SaeBasisResolution, SaeManifoldAtom, SaeManifoldRho, SaeManifoldTerm, SaeReferenceMetricPlan, SphereChartTransition, UnitSpeedChartTransition, amplitude_concentration_certificate, anisotropic_flat_product_torus_penalty, anisotropic_flat_product_torus_penalty_aspect_derivative, embedded_donut_torus_reference_penalty, embedded_donut_torus_reference_penalty_aspect_derivative};
+use crate::manifold::{AssignmentMode, AtlasSeamKind, AtlasTopologyReadout, GraphCompressionKind, SAE_AMBIENT_SPHERE_DEFAULT_DEGREE, SAE_EUCLIDEAN_PATCH_MAX_DEGREE, SAE_MAX_PERIODIC_HARMONICS, SaeAtomBasisKind, SaeAtomGeometryPlan, SaeBasisResolution, SaeManifoldAtom, SaeManifoldRho, SaeManifoldTerm, SaeReferenceMetricPlan, SphereChartTransition, UnitSpeedChartTransition, amplitude_concentration_certificate, anisotropic_flat_product_torus_penalty, anisotropic_flat_product_torus_penalty_aspect_derivative, embedded_donut_torus_reference_penalty, embedded_donut_torus_reference_penalty_aspect_derivative};
 use crate::migration_ledger::SaeMigrationLedger;
 use crate::null_sampler::{NULL_REPLICATES, coactivation_exceedance_for_pairs};
 use gam_linalg::faer_ndarray::FaerSvd;
@@ -4358,17 +4358,6 @@ fn radial_promoted_specs(
         return Ok(None);
     }
     Ok(Some(promoted))
-}
-
-/// A graph birth candidate enrolled in structure search.
-///
-/// The candidate edge set is the derived anchor-kNN graph; REML per-edge losses
-/// decide survival, and the selection currency is the SUM of surviving one-edge
-/// charges. Named shapes are only certified compressions of the learned graph.
-#[derive(Clone, Debug)]
-pub struct GraphBirthCandidate {
-    pub atom: LearnedGraphAtom,
-    pub selection: GraphStructureSelection,
 }
 
 /// #2280 — build the local-chart atlas on a birth's ambient residual image and read

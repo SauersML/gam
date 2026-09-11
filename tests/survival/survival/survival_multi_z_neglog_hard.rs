@@ -2,8 +2,8 @@
 //! `gam::families::survival::marginal_slope::survival_marginal_slope_vector_neglog`.
 //!
 //! All expected values are recomputed from primitive building blocks
-//! (`survival_marginal_slope_vector_scale`, `quadratic_form`,
-//! `normal_cdf`) so the test file is self-contained.
+//! (the probit scale `c(a) = √(1 + rᵀΣr)` via `quadratic_form`,
+//! and `normal_cdf`) so the test file is self-contained.
 
 use gam::families::bms::MarginalSlopeCovariance;
 use gam::families::survival::marginal_slope::{RigidVectorValueWorkspace, survival_marginal_slope_vector_neglog};

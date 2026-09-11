@@ -1493,4 +1493,39 @@ mod fit_tests {
             report.explained_variance
         );
     }
+
+    /// #2023 refusal contract on the live route. The retired dense co-fit bridges
+    /// pinned that a budget too small to reach a fixed point returns an error and
+    /// never mints a report (`insufficient_iterations_return_error_instead_of_open_arrow_cofit_2023`,
+    /// `insufficient_rounds_return_error_instead_of_an_open_cofit_2023`). Those
+    /// producers are gone; `fit_tiered` is the route that mints curved fits, so the
+    /// contract is carried here. The geometry is the certified sibling
+    /// `tier2_branch_constructs_the_support_sparse_path` (inner budget 256) with the
+    /// inner budget cut to ONE cycle: `solve_fixed_point` certifies only after two
+    /// consecutive candidate cycles, and the coupled phase must earn its certificate
+    /// on its own trajectory, so a one-cycle budget cannot recur.
+    #[test]
+    fn insufficient_inner_budget_returns_error_instead_of_a_tiered_report_2023() {
+        let z = two_circle_fixture_2634();
+        let p = z.ncols();
+        let mut config = TieredFitConfig::tiered(2, 1);
+        config.tier1.block_topk = 1;
+        config.tier1.aux_k = 2;
+        config.tier1.max_epochs = 200;
+        config.tier2.atom_basis = "periodic".to_string();
+        config.tier2.atom_dim = 1;
+        config.tier2.n_atoms = p + 1;
+        config.tier2.support_k = 1;
+        config.tier2.max_outer_iter = 32;
+        config.tier2.max_inner_iter = 1;
+
+        let error = fit_tiered(z.view(), &config)
+            .expect_err("a one-cycle inner budget must not mint a TieredFitReport");
+        assert!(
+            error.contains("did not recur")
+                || error.contains("without an analytic stationarity certificate"),
+            "the refusal must be the support engine's own non-recurrence or missing \
+             outer certificate, got: {error}"
+        );
+    }
 }

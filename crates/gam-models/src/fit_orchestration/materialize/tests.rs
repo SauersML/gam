@@ -666,7 +666,7 @@ fn workflow_test_dataset() -> Dataset {
 }
 
 /// #1590 end-to-end: a cause-specific competing-risks Weibull fit must reach
-/// convergence rather than aborting in `canonicalize_for_identifiability` with
+/// convergence rather than aborting in `canonicalize_for_identifiability_with_operating_scalars` with
 /// "post-T rank invariant violated". This is the exact public-API repro from
 /// the issue (`Surv(entry, exit, event) ~ age`, `event ∈ {0, 1, 2}`,
 /// `survival_likelihood = "weibull"`), driven straight through the orchestration
