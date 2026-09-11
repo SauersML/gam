@@ -41,6 +41,7 @@ mod smooth_not_covariate_scale_invariant;
 mod smooth_term_predict_flat_clamped_outside_training_range;
 mod summary_penalty_cursor_skips_unpenalized_re;
 mod sz_factor_smooth_fits_and_predicts;
+mod tensor_null_blocks_keep_a_supported_trend_1561;
 mod tensor_periodic_margin_predict_offbyone;
 mod thinplate_formula_fit_knot_collision;
 mod tps_smallk_basis_regression;

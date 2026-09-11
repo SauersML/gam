@@ -385,6 +385,102 @@ mod tensor_function_space_runtime_tests {
         );
     }
 
+    fn cubic_marginal() -> BSplineBasisSpec {
+        BSplineBasisSpec {
+            degree: 3,
+            penalty_order: 2,
+            knotspec: BSplineKnotSpec::Generate {
+                data_range: (0.0, 1.0),
+                num_internal_knots: 2,
+            },
+            double_penalty: false,
+            identifiability: BSplineIdentifiability::None,
+            boundary: OneDimensionalBoundary::Open,
+            boundary_conditions: BSplineBoundaryConditions::default(),
+        }
+    }
+
+    fn physical_null_ridges(built: &BasisBuildResult) -> Vec<Array2<f64>> {
+        built
+            .active_penalties
+            .iter()
+            .filter(|penalty| matches!(penalty.info.source, PenaltySource::TensorGlobalRidge))
+            .map(|penalty| penalty.matrix.mapv(|v| v * penalty.info.normalization_scale))
+            .collect()
+    }
+
+    fn least_squares(design: &Array2<f64>, target: &Array1<f64>) -> Array1<f64> {
+        use gam_linalg::faer_ndarray::FaerEigh;
+        let normal = design.t().dot(design);
+        let (evals, evecs) = FaerEigh::eigh(&normal, faer::Side::Lower).expect("normal eigh");
+        let projected = evecs.t().dot(&design.t().dot(target));
+        evecs.dot(&(&projected / &evals))
+    }
+
+    /// #1561: the tensor double penalty used to be ONE ridge over the whole
+    /// joint polynomial null, so REML shrank a supported x trend together with
+    /// absent z and x·z trends. Each functional-ANOVA block of that null (under
+    /// the domain measure) now carries its own REML coordinate, and each block
+    /// ridge measures exactly the integrated square of its own block function and
+    /// nothing of the others, in the raw chart and in every identifiability chart.
+    #[test]
+    fn tensor_null_ridge_gives_each_retained_anova_block_its_own_coordinate() {
+        let side = 12;
+        let data = Array2::from_shape_fn((side * side, 2), |(row, col)| {
+            let index = if col == 0 { row / side } else { row % side };
+            index as f64 / (side - 1) as f64
+        });
+        let block_functions: [(fn(f64, f64) -> f64, f64); 4] = [
+            (|_, _| 1.0, 1.0),
+            (|x, _| x - 0.5, 1.0 / 12.0),
+            (|_, z| z - 0.5, 1.0 / 12.0),
+            (|x, z| (x - 0.5) * (z - 0.5), 1.0 / 144.0),
+        ];
+        let charts = [
+            (TensorBSplineIdentifiability::None, vec![0usize, 1, 2, 3]),
+            (TensorBSplineIdentifiability::SumToZero, vec![1, 2, 3]),
+            (TensorBSplineIdentifiability::MarginalSumToZero, vec![3]),
+        ];
+        for (identifiability, retained) in charts {
+            let label = format!("{identifiability:?}");
+            let spec = TensorBSplineSpec {
+                marginalspecs: vec![cubic_marginal(), cubic_marginal()],
+                periods: Vec::new(),
+                double_penalty: true,
+                identifiability,
+                penalty_decomposition: TensorBSplinePenaltyDecomposition::MarginalKroneckerSum,
+            };
+            let built = build_tensor_bspline_basis(data.view(), &[0, 1], &spec)
+                .expect("double-penalty tensor basis");
+            let ridges = physical_null_ridges(&built);
+            assert_eq!(
+                ridges.len(),
+                retained.len(),
+                "{label}: one null ridge per retained ANOVA block"
+            );
+            let design = built.design.to_dense();
+            for (&block, ridge_owner) in retained.iter().zip(0..) {
+                let (function, energy) = block_functions[block];
+                let target = Array1::from_iter(data.rows().into_iter().map(|p| function(p[0], p[1])));
+                let beta = least_squares(&design, &target);
+                let residual = &design.dot(&beta) - &target;
+                assert!(
+                    residual.iter().all(|r| r.abs() < 1e-9),
+                    "{label}: block {block} is representable in the chart"
+                );
+                for (ridge_index, ridge) in ridges.iter().enumerate() {
+                    let measured = beta.dot(&ridge.dot(&beta));
+                    let expected = if ridge_index == ridge_owner { energy } else { 0.0 };
+                    assert!(
+                        (measured - expected).abs() <= 1e-8 * energy,
+                        "{label}: ridge {ridge_index} on block {block} measured {measured:.6e}, \
+                         expected {expected:.6e}"
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn tensor_nonzero_anchor_is_rejected_before_its_affine_lift_can_be_dropped() {
         let data = array![[0.0, 0.0], [0.25, 0.75], [0.75, 0.25], [1.0, 1.0]];

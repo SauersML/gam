@@ -2781,7 +2781,7 @@ fn ridge_from_null_metric_action(
 /// `M` is never formed at all. This is the #2318 rule — *rank revelation acts
 /// on `A`, not on `AᵀA`* — applied to the metric restriction, which is where
 /// the sibling `null(S_c)` computation twenty lines up already applies it.
-fn constructive_ridge_from_null_metric_factor(
+pub(crate) fn constructive_ridge_from_null_metric_factor(
     n: &Array2<f64>,
     metric_factor: &Array2<f64>,
     context: &str,

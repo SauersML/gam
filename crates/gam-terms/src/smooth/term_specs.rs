@@ -5856,6 +5856,214 @@ pub fn tensor_margin_range_null_projectors(
         .collect()
 }
 
+fn numerical_rank(matrix: &Array2<f64>) -> Result<usize, BasisError> {
+    use gam_linalg::faer_ndarray::{FaerSvd, default_rrqr_rank_alpha};
+    if matrix.nrows() == 0 || matrix.ncols() == 0 {
+        return Ok(0);
+    }
+    let (_, singular, _) = matrix.svd(false, false).map_err(BasisError::LinalgError)?;
+    let sigma_max = singular.iter().copied().fold(0.0_f64, f64::max);
+    let tol = default_rrqr_rank_alpha()
+        * f64::EPSILON
+        * matrix.nrows().max(matrix.ncols()) as f64
+        * sigma_max;
+    Ok(singular.iter().filter(|&&sigma| sigma > tol).count())
+}
+
+/// Functional-ANOVA blocks of a tensor's joint polynomial null space, with one
+/// null-function ridge per block that the coefficient chart retains.
+///
+/// The joint null of `Σ_j S_j ⊗ I` is `⊗_j null(S_j)`. Within each margin's
+/// null, the constant `K_j` and its complement `L_j` under the margin's function
+/// Gram (the non-constant trends) are orthogonal function subspaces, so the
+/// joint null is the direct sum of the blocks `⊗_j (K_j or L_j)`: the grand
+/// constant, one trend block per margin, and every trend interaction. Integrated
+/// squared function values do not mix across these blocks.
+///
+/// A single ridge over the whole joint null gives every block one smoothing
+/// parameter, and REML sizes that parameter by the blocks' average energy, so a
+/// well-supported trend in one margin is shrunk together with absent trends in
+/// the others (#1561: the Poisson `te` fixture kept about a fifth of its x
+/// trend). One parameter per block shrinks the null of `te(x, z)` the way
+/// `s(x) + s(z) + ti(x, z)` shrinks theirs. On every null function the block
+/// ridges sum to that single ridge, so equal parameters reproduce it, and sending
+/// every parameter to infinity still recovers the zero function.
+///
+/// An identifiability chart removes lower-order blocks: the tensor sum-to-zero
+/// removes the constant, and marginal centering (`ti`) removes every block with
+/// a constant factor. Blocks are kept in order of interaction order, highest
+/// first, while their coordinates stay independent on the chart's null space.
+/// That reproduces both cases and needs no record of which chart produced a
+/// frozen transform.
+fn tensor_null_function_block_ridges(
+    normalized_marginal_penalties: &[(Array2<f64>, f64)],
+    marginal_function_grams: &[Array2<f64>],
+    chart: Option<&Array2<f64>>,
+    chart_primary: &ConstructiveQuadratic,
+) -> Result<Vec<ConstructiveQuadratic>, BasisError> {
+    use gam_linalg::faer_ndarray::FaerEigh;
+    let margins = normalized_marginal_penalties.len();
+    if marginal_function_grams.len() != margins {
+        crate::bail_dim_basis!(
+            "tensor null blocks need one function Gram per margin; got {} for {margins} margins",
+            marginal_function_grams.len()
+        );
+    }
+    let Some(chart_null) = crate::basis::constructive_nullspace_basis(chart_primary)? else {
+        return Ok(Vec::new());
+    };
+
+    // Per margin: the constant frame and the trend frame, each orthonormal.
+    let mut margin_frames = Vec::<[Array2<f64>; 2]>::with_capacity(margins);
+    for ((penalty, _), gram) in normalized_marginal_penalties
+        .iter()
+        .zip(marginal_function_grams)
+    {
+        let analysis = crate::basis::analyze_penalty_block(penalty)?;
+        let null_idx: Vec<usize> = analysis
+            .eigenvalues
+            .iter()
+            .enumerate()
+            .filter(|(_, ev)| **ev <= analysis.rank_tol)
+            .map(|(idx, _)| idx)
+            .collect();
+        let null = analysis.eigenvectors.select(Axis(1), &null_idx);
+        let width = penalty.nrows();
+        let ones = Array1::<f64>::from_elem(width, 1.0);
+        let constant_energy = ones.dot(&penalty.dot(&ones)) / width as f64;
+        if null.ncols() == 0 || constant_energy > analysis.rank_tol {
+            margin_frames.push([Array2::zeros((width, 0)), null]);
+            continue;
+        }
+        let constant_coords = null.t().dot(&ones);
+        let constant_coords = &constant_coords / constant_coords.dot(&constant_coords).sqrt();
+        let null_gram = null.t().dot(&gram.dot(&null));
+        let normal = null_gram.dot(&constant_coords);
+        let normal = &normal / normal.dot(&normal).sqrt();
+        // Orthonormal complement of the Gram-image of the constant inside the
+        // null coordinates: the eigenvectors of `I - n nᵀ` with eigenvalue one.
+        let mut complement = Array2::<f64>::eye(null.ncols());
+        complement -= &(normal
+            .view()
+            .insert_axis(Axis(1))
+            .dot(&normal.view().insert_axis(Axis(0))));
+        let (evals, evecs) = FaerEigh::eigh(&complement, faer::Side::Lower)
+            .map_err(BasisError::LinalgError)?;
+        let mut order: Vec<usize> = (0..evals.len()).collect();
+        order.sort_by(|&a, &b| evals[b].total_cmp(&evals[a]));
+        let trend_coords = evecs.select(Axis(1), &order[..null.ncols() - 1]);
+        margin_frames.push([
+            null.dot(&constant_coords).insert_axis(Axis(1)),
+            null.dot(&trend_coords),
+        ]);
+    }
+
+    // Blocks `⊗_j frames[j][bit j]`, with their Gram images `⊗_j G_j frames[j][bit j]`.
+    let mut blocks = Vec::<(usize, Array2<f64>, Array2<f64>)>::new();
+    for mask in 0..(1usize << margins) {
+        let mut frame = Array2::<f64>::eye(1);
+        let mut gram_frame = Array2::<f64>::eye(1);
+        for (dim, (frames, gram)) in margin_frames.iter().zip(marginal_function_grams).enumerate() {
+            let factor = &frames[(mask >> dim) & 1];
+            frame = kronecker_product(&frame, factor);
+            gram_frame = kronecker_product(&gram_frame, &gram.dot(factor));
+        }
+        if frame.ncols() > 0 {
+            blocks.push((mask, frame, gram_frame));
+        }
+    }
+    if blocks.is_empty() {
+        crate::bail_invalid_basis!(
+            "tensor chart has a {}-dimensional null space but no margin carries a null block",
+            chart_null.ncols()
+        );
+    }
+    let total_cols: usize = blocks.iter().map(|(_, frame, _)| frame.ncols()).sum();
+    let mut frame_all = Array2::<f64>::zeros((blocks[0].1.nrows(), total_cols));
+    let mut offset = 0;
+    for (_, frame, _) in &blocks {
+        frame_all
+            .slice_mut(s![.., offset..offset + frame.ncols()])
+            .assign(frame);
+        offset += frame.ncols();
+    }
+    // Dual frame: `W F = I`, and `W` vanishes on the penalized range.
+    let frame_gram = frame_all.t().dot(&frame_all);
+    let (gram_evals, gram_evecs) =
+        FaerEigh::eigh(&frame_gram, faer::Side::Lower).map_err(BasisError::LinalgError)?;
+    if gram_evals.iter().any(|&ev| ev <= 0.0 || ev.is_nan()) {
+        crate::bail_invalid_basis!(
+            "tensor null blocks are not linearly independent (smallest frame Gram eigenvalue {:.3e})",
+            gram_evals.iter().copied().fold(f64::INFINITY, f64::min)
+        );
+    }
+    let dual = gram_evecs
+        .dot(&Array2::from_diag(&gram_evals.mapv(f64::recip)))
+        .dot(&gram_evecs.t())
+        .dot(&frame_all.t());
+
+    // Energy factor of each block ridge, `M_b^{1/2} W_b`, in the chart.
+    let mut offset = 0;
+    let mut factors = Vec::<(usize, Array2<f64>)>::with_capacity(blocks.len());
+    for (mask, frame, gram_frame) in &blocks {
+        let width = frame.ncols();
+        let block_dual = dual.slice(s![offset..offset + width, ..]).to_owned();
+        offset += width;
+        let metric = frame.t().dot(gram_frame);
+        let metric = (&metric + &metric.t()) * 0.5;
+        let (metric_evals, metric_evecs) =
+            FaerEigh::eigh(&metric, faer::Side::Lower).map_err(BasisError::LinalgError)?;
+        let root = Array2::from_diag(&metric_evals.mapv(|ev| ev.max(0.0).sqrt()))
+            .dot(&metric_evecs.t());
+        let factor = root.dot(&block_dual);
+        let factor = match chart {
+            Some(z) => fast_ab(&factor, z),
+            None => factor,
+        };
+        factors.push((*mask, factor));
+    }
+
+    let mut by_order: Vec<usize> = (0..factors.len()).collect();
+    by_order.sort_by_key(|&index| {
+        let mask = factors[index].0;
+        (std::cmp::Reverse(mask.count_ones()), mask)
+    });
+    let null_dim = chart_null.ncols();
+    let mut kept = Vec::<usize>::new();
+    let mut coordinates = Array2::<f64>::zeros((0, null_dim));
+    let mut rank = 0;
+    for index in by_order {
+        if rank == null_dim {
+            break;
+        }
+        let block_coordinates = fast_ab(&factors[index].1, &chart_null);
+        let candidate =
+            ndarray::concatenate(Axis(0), &[coordinates.view(), block_coordinates.view()])
+                .map_err(|e| BasisError::InvalidInput(format!("tensor null blocks: {e}")))?;
+        let candidate_rank = numerical_rank(&candidate)?;
+        if candidate_rank == rank + block_coordinates.nrows() {
+            kept.push(index);
+            coordinates = candidate;
+            rank = candidate_rank;
+        }
+    }
+    if rank != null_dim {
+        crate::bail_invalid_basis!(
+            "tensor null blocks span {rank} of the chart's {null_dim} null directions"
+        );
+    }
+    kept.sort_by_key(|&index| factors[index].0);
+    kept.into_iter()
+        .map(|index| {
+            crate::basis::constructive_ridge_from_null_metric_factor(
+                &chart_null,
+                &factors[index].1,
+                "tensor null-function block ridge",
+            )
+        })
+        .collect()
+}
+
 pub fn build_tensor_bspline_basis(
     data: ArrayView2<'_, f64>,
     feature_cols: &[usize],
@@ -6102,7 +6310,11 @@ pub fn build_tensor_bspline_basis(
         match spec.penalty_decomposition {
             TensorBSplinePenaltyDecomposition::MarginalKroneckerSum => marginal_penalties.len(),
             TensorBSplinePenaltyDecomposition::Separable => marginal_penalties.len() * 2,
-        } + if spec.double_penalty { 1 } else { 0 },
+        } + if spec.double_penalty {
+            1usize << marginal_penalties.len()
+        } else {
+            0
+        },
     );
 
     // Tensor-product smoothing parameters are one-per-margin.  Therefore the
@@ -6116,44 +6328,13 @@ pub fn build_tensor_bspline_basis(
         .iter()
         .map(normalize_penalty_in_constrained_space)
         .collect();
-    let tensor_function_gram = if spec.double_penalty {
-        if marginal_function_grams.len() != marginalnum_basis.len() {
-            crate::bail_dim_basis!(
-                "TensorBSpline double penalty requires one function Gram per margin; got {} for {} margins",
-                marginal_function_grams.len(),
-                marginalnum_basis.len()
-            );
-        }
-        let mut gram = Array2::<f64>::eye(1);
-        for marginal_gram in &marginal_function_grams {
-            gram = kronecker_product(&gram, marginal_gram);
-        }
-        Some(gram)
-    } else {
-        None
-    };
-    // A single PSD sum has exactly the joint null space shared by every
-    // marginal roughness block. It is used only to define the global
-    // null-component penalty; the ordinary tensor candidates below retain
-    // their one-coordinate-per-margin decomposition.
-    let joint_wiggliness = if spec.double_penalty {
-        let mut sum = Array2::<f64>::zeros((total_cols, total_cols));
-        for dim in 0..normalized_marginal_penalties.len() {
-            let mut embedded = Array2::<f64>::eye(1);
-            for (margin, &width) in marginalnum_basis.iter().enumerate() {
-                let factor = if margin == dim {
-                    normalized_marginal_penalties[margin].0.clone()
-                } else {
-                    Array2::<f64>::eye(width)
-                };
-                embedded = kronecker_product(&embedded, &factor);
-            }
-            sum += &embedded;
-        }
-        Some(sum)
-    } else {
-        None
-    };
+    if spec.double_penalty && marginal_function_grams.len() != marginalnum_basis.len() {
+        crate::bail_dim_basis!(
+            "TensorBSpline double penalty requires one function Gram per margin; got {} for {} margins",
+            marginal_function_grams.len(),
+            marginalnum_basis.len()
+        );
+    }
     let mut kronecker_marginal_penalties =
         Vec::<Array2<f64>>::with_capacity(normalized_marginal_penalties.len());
 
@@ -6162,8 +6343,9 @@ pub fn build_tensor_bspline_basis(
             // Accumulate the Kronecker-sum of the per-margin penalties,
             // `Σ_dim S_dim`, whose null space is exactly the *joint* null space
             // of all marginal penalties — the tensor of marginal polynomial
-            // null spaces. The tensor double penalty (below) shrinks only this
-            // joint null, never the already-penalized interaction range.
+            // null spaces. The tensor double penalty (built after the
+            // identifiability chart) shrinks only this joint null, never the
+            // already-penalized interaction range.
             for dim in 0..normalized_marginal_penalties.len() {
                 let mut s_dim = Array2::<f64>::eye(1);
                 let mut factors = Vec::<Array2<f64>>::with_capacity(marginalnum_basis.len());
@@ -6187,24 +6369,6 @@ pub fn build_tensor_bspline_basis(
                     source: PenaltySource::TensorMarginal { dim },
                     normalization_scale: normalized_marginal_penalties[dim].1,
                     kronecker_factors: Some(factors),
-                    op: None,
-                });
-            }
-
-            if let (Some(primary), Some(gram)) =
-                (joint_wiggliness.as_ref(), tensor_function_gram.as_ref())
-                && let Some(shrink) =
-                    crate::basis::function_space_nullspace_shrinkage(primary, gram)?
-            {
-                let (matrix, normalization_scale) = normalize_penalty_in_constrained_space(&shrink);
-                candidates.push(PenaltyCandidate {
-                    matrix: ConstructiveQuadratic::try_from_dense_psd(
-                        matrix,
-                        "tensor global null-function ridge",
-                    )?,
-                    source: PenaltySource::TensorGlobalRidge,
-                    normalization_scale,
-                    kronecker_factors: None,
                     op: None,
                 });
             }
@@ -6242,24 +6406,6 @@ pub fn build_tensor_bspline_basis(
                     source: PenaltySource::TensorSeparable { penalized_margins },
                     normalization_scale,
                     kronecker_factors: Some(factors),
-                    op: None,
-                });
-            }
-
-            if let (Some(primary), Some(gram)) =
-                (joint_wiggliness.as_ref(), tensor_function_gram.as_ref())
-                && let Some(matrix) =
-                    crate::basis::function_space_nullspace_shrinkage(primary, gram)?
-            {
-                let (matrix, normalization_scale) = normalize_penalty_in_constrained_space(&matrix);
-                candidates.push(PenaltyCandidate {
-                    matrix: ConstructiveQuadratic::try_from_dense_psd(
-                        matrix,
-                        "separable tensor global null-function ridge",
-                    )?,
-                    source: PenaltySource::TensorGlobalRidge,
-                    normalization_scale,
-                    kronecker_factors: None,
                     op: None,
                 });
             }
@@ -6367,59 +6513,36 @@ pub fn build_tensor_bspline_basis(
                 })
             })
             .collect::<Result<Vec<_>, _>>()?;
+    }
 
-        if candidates
+    if spec.double_penalty {
+        // The null-function ridges are built in the coefficient chart the fit
+        // uses, after identifiability, because the chart decides which null
+        // blocks remain free (see `tensor_null_function_block_ridges`).
+        let physical_primary_terms = candidates
             .iter()
-            .any(|candidate| matches!(candidate.source, PenaltySource::TensorGlobalRidge))
-        {
-            let width = candidates
-                .first()
-                .ok_or_else(|| {
-                    BasisError::InvalidInput(
-                        "TensorBSpline global ridge has no penalty candidates".to_string(),
-                    )
-                })?
-                .matrix
-                .nrows();
-            let physical_primary_terms = candidates
-                .iter()
-                .filter(|candidate| !matches!(candidate.source, PenaltySource::TensorGlobalRidge))
-                .map(|candidate| {
-                    candidate.matrix.scaled(
-                        candidate.normalization_scale,
-                        "physical tensor primary penalty",
-                    )
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            let joint_primary = ConstructiveQuadratic::sum(
-                &physical_primary_terms,
-                "joint tensor primary penalty",
-            )?;
-            for candidate in &mut candidates {
-                if !matches!(candidate.source, PenaltySource::TensorGlobalRidge) {
-                    continue;
-                }
-                let physical_ridge = candidate
+            .map(|candidate| {
+                candidate
                     .matrix
-                    .scaled(candidate.normalization_scale, "physical tensor null ridge")?;
-                match crate::basis::rebuild_metric_consistent_ridge(
-                    &joint_primary,
-                    &physical_ridge,
-                )? {
-                    Some(rebuilt) => {
-                        let (_, scale) = normalize_penalty_in_constrained_space(rebuilt.dense());
-                        candidate.matrix =
-                            rebuilt.scaled(1.0 / scale, "normalized rebuilt tensor null ridge")?;
-                        candidate.normalization_scale = scale;
-                    }
-                    None => {
-                        candidate.matrix = ConstructiveQuadratic::zero(width);
-                        candidate.normalization_scale = 1.0;
-                    }
-                }
-                candidate.kronecker_factors = None;
-                candidate.op = None;
-            }
+                    .scaled(candidate.normalization_scale, "physical tensor primary penalty")
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let chart_primary =
+            ConstructiveQuadratic::sum(&physical_primary_terms, "joint tensor primary penalty")?;
+        for ridge in tensor_null_function_block_ridges(
+            &normalized_marginal_penalties,
+            &marginal_function_grams,
+            z_opt.as_ref(),
+            &chart_primary,
+        )? {
+            let (_, scale) = normalize_penalty_in_constrained_space(ridge.dense());
+            candidates.push(PenaltyCandidate {
+                matrix: ridge.scaled(1.0 / scale, "normalized tensor null-function block ridge")?,
+                source: PenaltySource::TensorGlobalRidge,
+                normalization_scale: scale,
+                kronecker_factors: None,
+                op: None,
+            });
         }
     }
 
