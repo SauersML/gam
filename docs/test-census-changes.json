@@ -127,5 +127,20 @@
     "unit_test_decreases": {
       "crates/gam-solve": 1
     }
+  },
+  {
+    "base": "9f7dea1eef2f9f3272723cfe06ae3c858169f64a",
+    "reason": "#2627: c9481ef60 removed the production finite-difference curvature ladder (SPEC keeps finite differences in tests; no_production_finite_differences flagged gam-linalg curvature_resolution.rs). The retired tests measured that ladder: five gam-linalg unit tests of the value-based Law 1 API (the_two_laws_are_not_interchangeable_on_the_same_number, the_ladder_recovers_the_curvature_m4_and_eps_f_it_was_built_from, a_disagreement_is_measured_and_an_agreement_measures_nothing, a_ladder_that_cannot_determine_the_fit_returns_no_measurement, the_measured_pair_reconstructs_law_one_for_this_fixture) and three gam-solve #2748 fixtures of the ladder's measurement and measured escape.",
+    "evidence": "c9481ef60 deletes SymmetricProbe, LadderCurvature, measure_symmetric_ladder and CurvatureResolution::finite_difference from crates/gam-linalg/src/curvature_resolution.rs, and LadderExtension, measured_escape and OuterResult::criterion_hessian_error from crates/gam-solve/src/rho_optimizer/run.rs. The planted #2748 fixture keeps a_curvature_the_criterion_cannot_resolve_is_not_an_escape_2748 and a_genuine_saddle_still_descends_and_never_reaches_the_ladder_2748; the Law 2 resolution tests stay in curvature_resolution.rs. Census at c9481ef60 (run 34650696354): units/crates/gam-linalg 287 -> 282, issues/2748 40 -> 37.",
+    "removed_pins": {
+      "an_honest_negative_curvature_escapes_on_the_measured_floor_the_declared_one_hid_2748": 1,
+      "the_ladder_recovers_a_criterion_curvature_the_analytic_hessian_got_wrong_2748": 1,
+      "the_ladder_spans_signal_and_plateau_on_both_sides_of_the_derived_end_2748": 1
+    },
+    "test_count_decrease": 8,
+    "unit_test_decreases": {
+      "crates/gam-linalg": 5,
+      "crates/gam-solve": 3
+    }
   }
 ]
