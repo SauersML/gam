@@ -2,6 +2,22 @@
 import numpy as np
 import pandas as pd
 import gamfit
+import pytest
+
+
+@pytest.mark.parametrize("mode", ["keyword", "config"])
+def test_standalone_ctn_schema_uses_fit_request(tmp_path, mode):
+    rng = np.random.default_rng(714)
+    x = rng.uniform(-1, 1, 160)
+    data = pd.DataFrame({"pgs": 2 + .4 * x + rng.normal(size=160), "x": x,
+                         "irrelevant_date": pd.Timestamp("2020-01-01")})
+    config = {"transformation_normal_config": {"response_num_internal_knots": 2}}
+    kwargs = {"transformation_normal": True} if mode == "keyword" else {}
+    if mode == "config":
+        config["transformation_normal"] = True
+    model = gamfit.fit(data, "pgs ~ x", config=config, **kwargs,
+                       persistent_warm_start_root=tmp_path / "warm")
+    assert np.isfinite(model.transformation_score(data)).all()
 
 
 def test_native_ctn_chain_save_load_and_batches(tmp_path):
