@@ -91,19 +91,22 @@ pub(crate) fn sae_basis_evaluator_jacobians_match_central_differences() {
     // quadrupoles.
     assert_eq!(sphere_phi.dim(), (sphere_coords.nrows(), 9));
     assert_eq!(sphere_jet.dim(), (sphere_coords.nrows(), 9, 3));
+    // #2822: the jet is ∂Φ/∂(x, y, z) of the AMBIENT evaluator, not a (lat, lon) chart
+    // derivative; the removed chart's formulas read ambient coordinates as angles. Each
+    // column is `N · P_l^(|m|)(z) · A_m(x, y)` with `A_m` homogeneous of degree `|m|` in
+    // (x, y), columns ordered `l = 0..=2`, `m = -l..=l`, so Euler's identity
+    // `x·∂ₓΦ + y·∂_yΦ = |m|·Φ` holds exactly for every column at every point.
+    let abs_m = [0.0_f64, 1.0, 0.0, 1.0, 2.0, 1.0, 0.0, 1.0, 2.0];
     for row in 0..sphere_coords.nrows() {
-        let lat = sphere_coords[[row, 0]];
-        let lon = sphere_coords[[row, 1]];
-        let clat = lat.cos();
-        let slat = lat.sin();
-        let clon = lon.cos();
-        let slon = lon.sin();
-        let z = slat;
-        let dx_dlon = -clat * slon;
-        let dy_dlon = clat * clon;
-        assert_eq!(sphere_jet[[row, 3, 1]], 0.0);
-        assert!((sphere_jet[[row, 5, 1]] - dy_dlon * z).abs() <= 1.0e-12);
-        assert!((sphere_jet[[row, 6, 1]] - dx_dlon * z).abs() <= 1.0e-12);
+        let (x, y) = (sphere_coords[[row, 0]], sphere_coords[[row, 1]]);
+        for (col, &am) in abs_m.iter().enumerate() {
+            let euler = x * sphere_jet[[row, col, 0]] + y * sphere_jet[[row, col, 1]];
+            let expected = am * sphere_phi[[row, col]];
+            assert!(
+                (euler - expected).abs() <= 1.0e-12 * (1.0 + expected.abs()),
+                "row {row} column {col}: x·∂ₓΦ + y·∂_yΦ = {euler}, expected |m|·Φ = {expected}"
+            );
+        }
     }
 
     assert_jacobian_matches_central_difference(
