@@ -6,8 +6,10 @@ positive event code ``k`` (``event == k`` is the event of interest for block
 ``k``; every competing cause is treated as censoring), plus a pooled
 any-event baseline. Per-cause baselines are addressed by the integer event code:
 cause ``k`` -> coefficient block ``k-1`` -> endpoint name ``cause_k`` (see
-``crates/gam-models/src/survival/predict.rs`` and ``base.rs``
-``cause_specific_event_indicator``). The integer code is the *physical cause
+``crates/gam-models/src/survival/predict.rs``, and
+``fit_cause_specific_survival_transformation_custom`` in
+``crates/gam-models/src/fit_orchestration/fit.rs``, which projects each block's
+target as ``event == k``). The integer code is the *physical cause
 identity*; which integer a given physical cause is assigned is an arbitrary gauge
 choice.
 

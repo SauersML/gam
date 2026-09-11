@@ -298,15 +298,17 @@ fn validate_cause_specific_block(
             reason: "dimension mismatch".to_string(),
         });
     }
-    // A cause-specific block's `event_target` is the binary cause-k indicator
-    // produced by `cause_specific_event_indicator`; a label > 1 here means the
-    // caller passed raw multi-cause codes instead of projecting per cause. That
-    // is a valid finite label, not non-finite input, so it gets its own clear
-    // error rather than the misleading "non-finite input".
+    // A cause-specific block's `event_target` is the binary cause-k indicator.
+    // The fit projects it per cause as `code == cause_code`, in
+    // `fit_cause_specific_survival_transformation_custom`
+    // (fit_orchestration/fit.rs). A label > 1 here means the caller passed raw
+    // multi-cause codes instead of projecting per cause. That is a valid finite
+    // label, not non-finite input, so it gets its own clear error rather than
+    // the misleading "non-finite input".
     if let Some(&label) = block.event_target.iter().find(|&&v| v > 1) {
         return Err(SurvivalError::EventCodeInvalid {
             reason: format!(
-                "cause-specific block event_target must be the binary cause indicator {{0, 1}}, got multi-cause label {label}; project raw codes per cause via cause_specific_event_indicator"
+                "cause-specific block event_target must be the binary cause indicator {{0, 1}}, got multi-cause label {label}; project raw codes per cause first (1 where the code equals the block's cause, 0 otherwise)"
             ),
         });
     }
@@ -1821,7 +1823,7 @@ impl WorkingModelSurvival {
         if let Some(&label) = event_target.iter().find(|&&v| v > 1) {
             return Err(SurvivalError::EventCodeInvalid {
                 reason: format!(
-                    "single-hazard survival engine requires a binary {{0, 1}} event_target, got multi-cause label {label}; competing-risks codes must be projected via pooled_any_event_indicator / cause_specific_event_indicator before construction"
+                    "single-hazard survival engine requires a binary {{0, 1}} event_target, got multi-cause label {label}; project competing-risks codes before construction: code > 0 for the pooled any-event baseline, code == k for cause k's block"
                 ),
             });
         }
@@ -3126,13 +3128,6 @@ impl gam_solve::estimate::reml::reml_outer_engine::HessianDerivativeProvider
     fn has_corrections(&self) -> bool {
         true
     }
-}
-
-#[derive(Debug, Clone)]
-pub struct CrudeRiskResult {
-    pub risk: f64,
-    pub diseasegradient: Array1<f64>,
-    pub mortalitygradient: Array1<f64>,
 }
 
 #[derive(Debug, Clone)]
