@@ -2622,11 +2622,19 @@ fn every_registered_d2_topology_fits_at_least_once_2604() {
     // columns, and a 2-column seed puts every point on a great circle (which is
     // rank-deficient for a degree-2 design, so the sphere would refuse for a
     // reason that has nothing to do with the sphere).
+    //
+    // #2822: the flat d=2 charts (torus, euclidean patch, constant curvature) read
+    // seed columns 0 and 1 directly (`topology_candidates_for_dim`), so those two
+    // columns must vary independently. When both were affine in the same `t`, every
+    // point sat on one line and those three designs were singular ("condition number
+    // inf") for a reason that has nothing to do with their topology. Column 1 is the
+    // golden-ratio low-discrepancy sequence, which fills its range independently of t.
+    let golden_step = (5.0_f64.sqrt() - 1.0) / 2.0;
     let coords = Array2::<f64>::from_shape_fn((n, 3), |(row, axis)| {
         let t = row as f64 / n as f64;
         match axis {
             0 => t * 2.0,
-            1 => t * 3.0 - 1.5,
+            1 => (row as f64 * golden_step).fract() * 3.0 - 1.5,
             _ => (t * std::f64::consts::TAU).cos(),
         }
     });
