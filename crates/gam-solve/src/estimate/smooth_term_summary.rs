@@ -52,10 +52,6 @@ use gam_terms::inference::smooth_test::{
 use gam_terms::smooth::{ShapeConstraint, TermCollectionDesign, TermCollectionSpec};
 use ndarray::Array2;
 
-/// Relative floor below which a normalized λ is treated as zero when inverting
-/// the three-λ Matérn identity for the continuous smoothness order.
-const CONTINUOUS_ORDER_EPS: f64 = 1e-12;
-
 /// Build the smooth/random-effect rows of a model summary.
 ///
 /// `design` and `spec` describe the term structure being presented — the real
@@ -261,9 +257,5 @@ fn continuous_order_for_term(
         normalized_scale(term_penalty_start + 1)?,
         normalized_scale(term_penalty_start + 2)?,
     ];
-    Some(compute_continuous_smoothness_order(
-        lambda_tilde,
-        scales,
-        CONTINUOUS_ORDER_EPS,
-    ))
+    Some(compute_continuous_smoothness_order(lambda_tilde, scales))
 }

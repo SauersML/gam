@@ -147,26 +147,28 @@ fn unscale_to_physical_lambdas(
 //   R = 4  => exact boundary (perfect square) => treated as Matérn-compatible.
 //
 // 4) Degenerate limits and guards
-// - If lambda0 or lambda2 is non-finite or <= eps, the 3-term inversion is unstable;
-//   report UndefinedZeroLambda and do not divide by those terms.
-// - Intrinsic limit (lambda0 -> 0+, with finite lambda1/lambda2):
+// - If lambda0 or lambda2 is zero (or negative), the 3-term inversion would
+//   divide by it: report the limit below when the remaining lambdas define one,
+//   and UndefinedZeroLambda otherwise, without dividing by those terms.
+// - Intrinsic limit (lambda0 = 0, with positive lambda1/lambda2):
 //     R = lambda1^2/(lambda0*lambda2) -> +inf
 //     nu = R/(R-2) -> 1+
 //     kappa^2 = lambda1/((R-2)lambda2) -> 0+.
-//   We expose this explicitly as IntrinsicLimit with nu≈1 and kappa^2≈0.
-// - If R <= 2 (+eps), nu = R/(R-2) is undefined or numerically unstable; keep
-//   nu/kappa2 unset.
+//   We expose this explicitly as IntrinsicLimit with nu=1 and kappa^2=0. A small
+//   positive lambda0 is not a special case: the closed forms below approach the
+//   same limit continuously.
+// - If R - 2 lies inside R's own rounding band (R <= 2 included), nu = R/(R-2)
+//   is undefined or has no correct digit; keep nu/kappa2 unset.
 //
 // Status policy in this implementation:
 // - Ok:                R >= 4 and valid finite nu/kappa2.
 // - NonMaternRegime:   R < 4; if additionally R > 2, we still report effective
 //                      nu/kappa2 as diagnostics, but mark non-Matérn status.
-// - IntrinsicLimit:    lambda0 is negligible; report nu≈1, kappa^2≈0.
+// - IntrinsicLimit:    lambda0 is zero; report nu=1, kappa^2=0.
 // - UndefinedZeroLambda: invalid scaling/lambda inputs or unstable inversion.
 pub fn compute_continuous_smoothness_order(
     lambda_tilde: [f64; 3],
     normalization_scale: [f64; 3],
-    eps: f64,
 ) -> ContinuousSmoothnessOrder {
     let Some(lambda) = unscale_to_physical_lambdas(lambda_tilde, normalization_scale) else {
         return ContinuousSmoothnessOrder {
@@ -191,16 +193,10 @@ pub fn compute_continuous_smoothness_order(
             status: ContinuousSmoothnessOrderStatus::UndefinedZeroLambda,
         };
     }
-    // Scale-aware degeneracy floor.
-    // Using only an absolute epsilon can misclassify limits when lambdas are
-    // globally tiny or globally huge, so we threshold relative to the largest
-    // physical lambda magnitude in this term.
-    let lambda_scale = lambda0.abs().max(lambda1.abs()).max(lambda2.abs()).max(1.0);
-    let lambda_floor = eps * lambda_scale;
 
-    // Intrinsic limit: mass term vanishes (kappa^2 -> 0).
-    if lambda0 <= lambda_floor {
-        if lambda1 > lambda_floor && lambda2 > lambda_floor {
+    // Intrinsic limit: mass term vanishes (kappa^2 = 0).
+    if lambda0 <= 0.0 {
+        if lambda1 > 0.0 && lambda2 > 0.0 {
             return ContinuousSmoothnessOrder {
                 lambda0,
                 lambda1,
@@ -221,10 +217,10 @@ pub fn compute_continuous_smoothness_order(
             status: ContinuousSmoothnessOrderStatus::UndefinedZeroLambda,
         };
     }
-    // First-order fallback when stiffness collapses:
-    //   lambda2 ~ 0 => use lambda0/lambda1 = kappa^2 with nu ≈ 1.
-    if lambda2 <= lambda_floor {
-        if lambda1 > lambda_floor && lambda1.is_finite() {
+    // First-order limit when stiffness vanishes:
+    //   lambda2 = 0 => use lambda0/lambda1 = kappa^2 with nu = 1.
+    if lambda2 <= 0.0 {
+        if lambda1 > 0.0 {
             return ContinuousSmoothnessOrder {
                 lambda0,
                 lambda1,
@@ -267,16 +263,23 @@ pub fn compute_continuous_smoothness_order(
     //   Delta_P = lambda1^2 - 4*lambda0*lambda2 = lambda0*lambda2*(R-4).
     // Non-Matérn regime is flagged by Delta_P < 0 (equiv. R < 4),
     // but nu/kappa2 are still reported when R > 2 as effective diagnostics.
+    //
+    // Delta_P is two rounded products and a subtraction: a value inside that
+    // inner product's rounding band gamma_2*(lambda1^2 + 4*lambda0*lambda2) is the
+    // perfect-square boundary R = 4 to the resolution the arithmetic has.
     let discriminant = lambda1 * lambda1 - 4.0 * lambda0 * lambda2;
-    let disc_tol = eps * lambda_scale * lambda_scale;
-    let status = if discriminant < -disc_tol {
+    let discriminant_band =
+        gam_linalg::roundoff::accumulation_band(2, lambda1 * lambda1 + 4.0 * lambda0 * lambda2);
+    let status = if discriminant < -discriminant_band {
         ContinuousSmoothnessOrderStatus::NonMaternRegime
     } else {
         // Includes exact boundary R=4 (perfect-square case) and numerically
         // indistinguishable near-boundary points.
         ContinuousSmoothnessOrderStatus::Ok
     };
-    if r_ratio <= 2.0 + eps {
+    // R is two rounded products and a quotient; when R - 2 sits inside R's own
+    // rounding band gamma_3*R, nu = R/(R-2) has no correct digit.
+    if r_ratio - 2.0 <= gam_linalg::roundoff::accumulation_growth(3) * r_ratio {
         return ContinuousSmoothnessOrder {
             lambda0,
             lambda1,

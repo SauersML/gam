@@ -741,5 +741,13 @@
     ],
     "reason": "#2469: seven thresholds in the REML outer derivative path. TK_HESSIAN_PD_EIGENVALUE_FLOOR is the eigensolver band gamma_p*max|lambda|; IFT_WARM_START_DRHO_EPS and DEGENERATE_DRHO_NORM_SQ are exact zero tests on drho; TANGENT_ALPHA_NOOP_EPS is a bit-identical prediction; DIAGNOSTIC_BOUND_SLACK, DIAGNOSTIC_BETA_MAGNITUDE and DIAGNOSTIC_CURVATURE_REL_THRESHOLD parameterized a trace-only barrier curvature probe that shaped a log line and nothing else, deleted with the probe.",
     "evidence": "All seven were declared in crates/gam-solve/src/reml/gradient_hessian.rs; at the base git grep finds the public IFT_WARM_START_DRHO_EPS only there and in reml/objective.rs, both edited here (the objective.rs no-op test now drives drho = 0), and the other six are function-local."
+  },
+  {
+    "base": "8053cbc23caf349c7f238bb257ae7349f6d22ed7",
+    "items": [
+      "crates/gam-solve/src/estimate/smooth_term_summary.rs:const:CONTINUOUS_ORDER_EPS"
+    ],
+    "reason": "#2469: CONTINUOUS_ORDER_EPS was a 1e-12 relative floor handed to compute_continuous_smoothness_order as eps and used against a scale max(|lambda|, 1) that mixes lambdas of different units. The limits are now exact zeros, the Matern boundary is the discriminant rounding band gamma_2*(lambda1^2 + 4*lambda0*lambda2), and nu is unset when R - 2 is inside gamma_3*R; the eps parameter is gone.",
+    "evidence": "At the base, git grep finds CONTINUOUS_ORDER_EPS only in crates/gam-solve/src/estimate/smooth_term_summary.rs, and compute_continuous_smoothness_order is called only there and in estimate/continuous_order_tests.rs (estimate/mod.rs re-exports it); every call site is updated here."
   }
 ]
