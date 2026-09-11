@@ -163,14 +163,7 @@ impl<const P: usize, G: SlopeRowGeometry<P>> SurvivalMarginalSlopeRowKernel<P, G
                 "survival third information derivative requires finite directions of length {p}"
             ));
         }
-        let identity = Array2::<f64>::eye(p);
-        let jacobians = self
-            .jacobian_action_matrix(identity.view())
-            .ok_or("survival third information derivative requires row Jacobians")?;
-        if jacobians.dim() != (self.family.n, P * p) {
-            return Err("survival third information row Jacobian shape mismatch".into());
-        }
-        let mut axes = vec![Array2::<f64>::zeros((p, p)); p];
+        let mut tensors = Vec::with_capacity(self.family.n);
         for row in 0..self.family.n {
             let inputs = rigid_row_inputs(
                 &self.family,
@@ -195,20 +188,9 @@ impl<const P: usize, G: SlopeRowGeometry<P>> SurvivalMarginalSlopeRowKernel<P, G
                     }
                 }
             }
-            for axis in 0..p {
-                let mut primary_hessian = [[0.0; P]; P];
-                for a in 0..P {
-                    for b in 0..P {
-                        for c in 0..P {
-                            primary_hessian[a][b] +=
-                                tensor[a][b][c] * jacobians[[row, c * p + axis]];
-                        }
-                    }
-                }
-                self.add_pullback_hessian(row, &primary_hessian, &mut axes[axis]);
-            }
+            tensors.push(tensor);
         }
-        Ok(axes)
+        self.all_axes_primary_tensor_pullback(&tensors)
     }
 }
 
