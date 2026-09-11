@@ -5001,9 +5001,14 @@ fn certify_outer_optimality_at_terminal_fidelity(
         let curvature_grad_bound =
             projected_grad_norm * (objective_tol / predicted_decrease).sqrt();
         if curvature_grad_bound.is_finite() && curvature_grad_bound > stationarity_bound {
+            // The bound widens whenever it exceeds the gradient band, but it clears
+            // |Pg| only when the decrement is inside the tolerance. Render the
+            // comparison this point actually satisfies: the historical line always
+            // printed `≤`, including on refusals where the decrement was 360× over.
+            let relation = if predicted_decrease <= objective_tol { "≤" } else { ">" };
             log::info!(
                 "[CERTIFICATE] {context}: curvature-scaled flat-valley bound {curvature_grad_bound:.3e} \
-                 (|Pg|={projected_grad_norm:.3e}, Newton ½gᵀH⁻¹g={predicted_decrease:.3e} ≤ tol {objective_tol:.3e}) \
+                 (|Pg|={projected_grad_norm:.3e}, Newton ½gᵀH⁻¹g={predicted_decrease:.3e} {relation} tol {objective_tol:.3e}) \
                  widened from gradient-band {stationarity_bound:.3e}"
             );
             stationarity_bound = curvature_grad_bound;
