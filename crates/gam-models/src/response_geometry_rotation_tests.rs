@@ -126,8 +126,41 @@ fn formula_shared_tangent_fit_preserves_output_rotations_2627() {
         prediction_error < 1.0e-7,
         "optimized prediction rotation error={prediction_error:e}"
     );
-    for (base_lambda, rotated_lambda) in base.lambdas.iter().zip(rotated.lambdas.iter()) {
-        assert!((base_lambda - rotated_lambda).abs() < 1.0e-6);
+    // Rotating the response only relabels the outputs, so the REML criterion is
+    // rotation-invariant and both fits certify the SAME optimum, stopping at two
+    // points inside its certified ball. To first order
+    // `ρ̂_base − ρ̂_rot = H⁻¹·(g_base − g_rot)`, so the log-λ displacement is bounded
+    // by `(‖Pg_base‖ + ‖Pg_rot‖)/σ_min(H)` at the base optimum: the amplification
+    // this criterion actually has, rather than an absolute constant on λ.
+    let base_rho = base.lambdas.mapv(f64::ln);
+    let rotated_rho = rotated.lambdas.mapv(f64::ln);
+    let base_hessian = prepared
+        .evaluate(&base_rho)
+        .expect("same-point base diagnostic")
+        .hessian;
+    let sigma_min = base_hessian
+        .eigh(Side::Lower)
+        .expect("outer Hessian spectrum")
+        .0
+        .iter()
+        .copied()
+        .fold(f64::INFINITY, f64::min);
+    let gradient_sum = base.outer_certificate.stationarity.projected_norm()
+        + rotated.outer_certificate.stationarity.projected_norm();
+    assert!(
+        sigma_min > 0.0,
+        "the certified optimum must be locally strict for a displacement ball to exist: \
+         sigma_min={sigma_min:e}"
+    );
+    let rho_ball = gradient_sum / sigma_min;
+    for (index, (base_value, rotated_value)) in base_rho.iter().zip(rotated_rho.iter()).enumerate()
+    {
+        let displacement = (base_value - rotated_value).abs();
+        assert!(
+            displacement <= rho_ball,
+            "log-lambda[{index}] rotation displacement {displacement:e} exceeds the certified ball \
+             {rho_ball:e} (projected-gradient sum {gradient_sum:e}, sigma_min {sigma_min:e})"
+        );
     }
     assert!((base.sigma2 - rotated.sigma2).abs() <= 1.0e-9 * base.sigma2.max(1.0));
 }
