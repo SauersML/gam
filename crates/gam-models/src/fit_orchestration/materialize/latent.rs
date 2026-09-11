@@ -615,9 +615,15 @@ fn initial_latent_matrix(spec: &LatentSpec, y: ArrayView1<'_, f64>) -> Result<Ar
                 })
                 .sum::<f64>()
                 / y.len().max(1) as f64;
-            let sd = var.sqrt().max(1e-12);
+            let sd = var.sqrt();
+            // A response whose spread sits inside its mean's rounding band
+            // `γ_{n+1}·max|y|` is constant to working precision: it has no axis to
+            // standardize along, so the leading coordinate starts at zero.
+            let magnitude = y.iter().fold(0.0_f64, |acc, v| acc.max(v.abs()));
+            let resolvable =
+                sd > gam_linalg::roundoff::accumulation_growth(y.len() + 1) * magnitude;
             for n in 0..spec.n {
-                out[[n, 0]] = (y[n] - mean) / sd;
+                out[[n, 0]] = if resolvable { (y[n] - mean) / sd } else { 0.0 };
             }
             if spec.d > 1 {
                 let mut seed = 0xD1B54A32D192ED03_u64 ^ ((spec.n as u64) << 16) ^ spec.d as u64;

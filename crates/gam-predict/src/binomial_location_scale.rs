@@ -355,11 +355,40 @@ impl BinomialLocationScalePredictor {
                     let cov_tls = 0.5 * (cov_tls_t + cov_tls_ls);
                     let suv_t = solved_t.slice(ndarray::s![p_t + p_s..p_total]);
                     let suv_ls = solved_ls.slice(ndarray::s![p_t + p_s..p_total]);
-                    let det = (var_t * var_ls - cov_tls * cov_tls).max(1e-12);
-                    let inv_uu = [
-                        [var_ls / det, -cov_tls / det],
-                        [-cov_tls / det, var_t / det],
-                    ];
+                    /// Moore-Penrose pseudo-inverse of the positive semi-definite 2×2
+                    /// matrix `[[a, b], [b, c]]`. An eigen-direction whose eigenvalue sits
+                    /// inside the eigensolver band `2·ε·λ_max` is deterministic to working
+                    /// precision and carries nothing to condition on.
+                    fn pseudo_inverse_psd_2x2(a: f64, b: f64, c: f64) -> [[f64; 2]; 2] {
+                        let half_trace = 0.5 * (a + c);
+                        let radius = (0.25 * (a - c) * (a - c) + b * b).sqrt();
+                        let lambda_max = half_trace + radius;
+                        if !(lambda_max > 0.0) {
+                            return [[0.0; 2]; 2];
+                        }
+                        if half_trace - radius > 2.0 * f64::EPSILON * lambda_max {
+                            let det = a * c - b * b;
+                            return [[c / det, -b / det], [-b / det, a / det]];
+                        }
+                        // Rank one: `v·vᵀ/λ_max` for the leading eigenvector, read off
+                        // whichever row of `A − λ_max·I` is the larger.
+                        let first = (b, lambda_max - a);
+                        let second = (lambda_max - c, b);
+                        let (vx, vy) = if first.0 * first.0 + first.1 * first.1
+                            >= second.0 * second.0 + second.1 * second.1
+                        {
+                            first
+                        } else {
+                            second
+                        };
+                        let scale = 1.0 / (lambda_max * (vx * vx + vy * vy));
+                        [[vx * vx * scale, vx * vy * scale], [vx * vy * scale, vy * vy * scale]]
+                    }
+                    // Condition the wiggle coefficients on (t, ls) through the
+                    // pseudo-inverse of their covariance rather than a floored determinant:
+                    // a floor of 1e-12 turned a deterministic direction into an enormous
+                    // gain on the other one.
+                    let inv_uu = pseudo_inverse_psd_2x2(var_t, cov_tls, var_ls);
                     let mut k0 = Array1::<f64>::zeros(p_w);
                     let mut k1 = Array1::<f64>::zeros(p_w);
                     for j in 0..p_w {
