@@ -1343,7 +1343,7 @@ pub(crate) fn analytic_penalty_row_hessian_fingerprint(
     target_t: ArrayView1<'_, f64>,
     rho_local: ArrayView1<'_, f64>,
 ) -> Option<u64> {
-    if penalty.tier() != PenaltyTier::Psi || !analytic_penalty_is_row_block_diagonal(penalty) {
+    if penalty.tier() != gam_terms::analytic_penalties::PenaltyTier::Psi || !analytic_penalty_is_row_block_diagonal(penalty) {
         return None;
     }
 

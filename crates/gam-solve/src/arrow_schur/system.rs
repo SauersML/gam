@@ -1062,10 +1062,10 @@ impl ArrowSchurSystem {
     /// `target_t` is the full flat latent-coordinate vector (row-major, `N·d` entries)
     /// at the current iterate; `target_beta` is the current `β`. `rho`
     /// is the global ρ vector restricted to each penalty's local slice
-    /// by [`AnalyticPenaltyRegistry::rho_layout`].
+    /// by [`gam_terms::analytic_penalties::AnalyticPenaltyRegistry::rho_layout`].
     pub fn add_analytic_penalty_contributions(
         &mut self,
-        registry: &AnalyticPenaltyRegistry,
+        registry: &gam_terms::analytic_penalties::AnalyticPenaltyRegistry,
         target_t: ArrayView1<'_, f64>,
         target_beta: ArrayView1<'_, f64>,
         rho_global: ArrayView1<'_, f64>,
@@ -1079,7 +1079,7 @@ impl ArrowSchurSystem {
         for (penalty, (rho_slice, tier, _name)) in registry.penalties.iter().zip(layout.iter()) {
             let rho_local = rho_global.slice(ndarray::s![rho_slice.clone()]);
             match tier {
-                PenaltyTier::Psi => {
+                gam_terms::analytic_penalties::PenaltyTier::Psi => {
                     if analytic_penalty_is_row_block_diagonal(penalty) {
                         // Row-block-diagonal: fold gradient + per-row d×d
                         // curvature into rows[i].htt, exactly representable by
@@ -1106,10 +1106,10 @@ impl ArrowSchurSystem {
                         });
                     }
                 }
-                PenaltyTier::Beta => {
+                gam_terms::analytic_penalties::PenaltyTier::Beta => {
                     self.add_beta_penalty(penalty, target_beta, rho_local);
                 }
-                PenaltyTier::Rho => {
+                gam_terms::analytic_penalties::PenaltyTier::Rho => {
                     // Rho-tier hyperpriors do not contribute to the inner
                     // (t, β) Newton step; they enter only at the REML
                     // outer level.
@@ -1998,7 +1998,7 @@ impl StreamingArrowSchur {
     ) -> Result<f64, ArrowSchurError> {
         let (log_det_tt, schur) =
             self.reduced_schur_and_log_det_tt(ridge_t, ridge_beta, options)?;
-        Ok(log_det_tt + Self::reduced_schur_log_det(&schur, options)?)
+        Ok(log_det_tt + Self::reduced_schur_log_det(&schur, options, None, None)?)
     }
 
     pub fn solve(

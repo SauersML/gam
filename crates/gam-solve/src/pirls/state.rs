@@ -564,8 +564,8 @@ impl PirlsResult {
     /// a sign-honest API should route through `as_signed()` on the returned
     /// view rather than reconstructing from the raw array.
     #[inline]
-    pub fn solve_weights_psd(&self) -> PsdWeightsView<'_> {
-        PsdWeightsView::from_view_unchecked(self.solveweights.view())
+    pub fn solve_weights_psd(&self) -> gam_linalg::matrix::PsdWeightsView<'_> {
+        gam_linalg::matrix::PsdWeightsView::from_view_unchecked(self.solveweights.view())
     }
 
     /// Scale-invariant relative gradient residual at the accepted PIRLS state.

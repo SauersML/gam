@@ -29,7 +29,7 @@ use std::fmt;
 use crate::mixture_link::{state_from_beta_logisticspec, state_from_sasspec, state_fromspec};
 pub use crate::model_types::{CoefficientPriorMean, Dispersion, EstimationError, PenaltySpec};
 use crate::pirls::{self, PirlsResult};
-use gam_linalg::matrix::{DesignMatrix, LinearOperator};
+use gam_linalg::matrix::DesignMatrix;
 use gam_linalg::utils::{KahanSum, row_mismatch_message};
 use gam_problem::{
     Coefficients, GlmLikelihoodSpec, InverseLink, LatentCLogLogState, LikelihoodScaleMetadata,
