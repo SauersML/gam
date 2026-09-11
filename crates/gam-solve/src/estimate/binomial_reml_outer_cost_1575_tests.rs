@@ -521,10 +521,11 @@ fn binomial_logit_outer_objective_is_a_function_of_rho_1575() {
 ///   alpha=1e-12 cost=inf   "did not converge within 1 iterations. Last gradient norm was 6.321214e-4."
 /// ```
 ///
-/// (The count in that message is `pirls_result.iteration`, not the budget —
-/// `PirlsDidNotConverge` is constructed with `max_iterations: iteration`. So
-/// "within 1 iterations" is a solve that quit after one step, not a solve given
-/// one step.)
+/// (These lines predate 8b975a50f. The count in them is `pirls_result.iteration`,
+/// not the budget, so "within 1 iterations" is a solve that quit after one step,
+/// not a solve given one step. `PirlsDidNotConverge` now carries `iterations`,
+/// `budget` and `stop` separately, and the same solve prints "stopped without
+/// converging after 1 of B iteration(s): <reason>".)
 ///
 /// A rho displacement of 1e-7 from a converged mode is not a hard inner
 /// problem. What differs between the two calls is everything the inner solve
