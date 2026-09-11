@@ -172,6 +172,80 @@ is retained in the worktree at
 `$MSI_HOME/issue1082-resume-derivatives.log`. No further
 long quality run was launched after the request to finish immediately.
 
+## Evidence collected on 2026-09-11
+
+All measurements below are at `origin/main` `73f25df20`, test profile (optimized
+workspace crates), four Rayon workers, one test process per case, 400-second job
+cap against the unchanged 360-second acceptance line. Logs are under
+`/scratch.global/sauer354/i1082-logs/` on MSI.
+
+**Reference stack.** MSI's `R/4.2.2-openblas` module does not start on the
+msismall nodes (`libreadline.so.6` missing; R exits 127) and the system python is
+3.6.8 without lifelines or pyGAM, so the first census (job 381385) measured
+timing only. A working stack is
+`PATH=/common/software/install/manual/R/4.2.0-openblas-rocky8-fix/bin:/scratch.global/sauer354/w4-pyref310/bin`
+with `R_LIBS_USER=/scratch.global/sauer354/w4-Rlib`: mgcv, VGAM, nnet, gamlss and
+survival load, and the python environment carries lifelines 0.30.0 and pyGAM
+0.12.0. INLA does not load there: after the udunits module supplies
+`libudunits2.so.0`, the library's `sf` and `fmesher` builds require
+`GLIBC_2.32`/`GLIBCXX_3.4.29`, newer than the Rocky 8 nodes provide.
+
+**Focused census with references (job 383949): 26 of 27 `quality_1082` cases
+pass**, the slowest in 29.8 s (Cox-like survival), 25.3 s (frailty), 21.2 s
+(multinomial smooth-by-factor) and 20.8 s (pyGAM Poisson real data). The 27th,
+the INLA spatial comparison, is `REFERENCE_ENV_MISSING:INLA` and is not a
+measurement of gam. Both penguin follow-up arms still exceed the budget: killed at
+400 s (job 381385) and again at 420 s with INFO logging (job 383312).
+
+**Penguin mechanism (job 383312, arm 1).** The unbiased probe (24 outer
+coordinates, every evaluation a dense value/gradient/Hessian at 0.3–1 s; 527
+evaluations summing to 249.7 s) reaches an incumbent with projected gradient
+6.3e-4 against the certificate's solver-band bound 2.57e-3. The cost-stall guard
+reads its reduced Hessian as a strict saddle and grants eight escapes, each buying
+about 3e-5 of objective. That is above the window's relative floor, so the window
+never fills and the seed runs to `max_iter = 100`. Seeds 1–3 repeat this, and the
+budget-exhaustion retry replays seed 1 bit-identically (final value 9.333945e0,
+33 accepted / 46 rejected, twice). The terminal certificate then withdraws the
+curvature verdict — `λ_min = −6.696e−7` predicts a decrease of 3.35e−7 against a
+criterion resolution of 2.525e−5 — and accepts `|Pg| = 4.06e−4`, but the probe
+is refused for lack of a certified optimum on its budget and the fit arms
+Jeffreys/Firth before the deadline.
+
+**Armed outer-gradient defect localized.** The failing derivative reproduction is
+a formula defect in the Jeffreys composition, not inner precision and not the
+family:
+
+- job 383758: the armed analytic gradient is identical from a cold start, from its
+  own mode and from four displaced warm starts, at inner tolerance 1e-10 and
+  1e-13; the inner mode certifies at residual 7.36e-11;
+- job 384768: every multinomial Jeffreys information hook (first, second, all-axes
+  second, all-axes third derivative) matches central differences to at most
+  7e-10 relative at `h = 1e-5`;
+- job 385018: the value-path Jeffreys gradient matches FD of `Φ` (≤ 1.4e-7) and
+  the batched drift `D_β H_Φ[u]` matches FD of `H_Φ` (≤ 1e-9), but
+  `H_Φ + completion` against `−FD(∇Φ)` is off by 1.067 and 1.080 relative in the
+  moderate regime (full and intercept spans), 0.234 for the separated intercept
+  span, and exact (3.4e-10) only where the conditioning gate is saturated.
+
+With `Φ = G·U`, the exact Hessian also carries `∇G⊗∇U + ∇U⊗∇G + U·∇²G` and the
+motion of the relative floor `REL·λ_max`. The mode response `∂β̂/∂ρ` is solved on
+`M_true = H + S_λ + H_Φ + completion`, so without those terms it is the response
+of a different objective. The correction adds
+`JointJeffreysPlan::hessian_motion` and routes
+`custom_family_joint_jeffreys_second_order_completion` through it; both are exactly
+unchanged where the gate is saturated and no eigenvalue feels the floor. Two unit
+tests compare the completed Hessian with finite differences in the gate band and
+under a moving floor, each with a positive control that the frozen-policy Hessian
+misses by more than 1e-3.
+
+**Resolution-aware saddle verdict.** The dense ARC bridge and its seed now take
+the reduced-Hessian definiteness verdict at the criterion's curvature resolution
+`2·rel_cost_floor·(1 + |V|)` through `certificate_curvature_shift`, the
+certificate's single owner of resolvable curvature. Negative curvature that one
+e-fold of `log λ` cannot turn into a resolvable decrease no longer forces escapes.
+Making the online curvature-stationary exit consistent with that standard, and
+removing the bit-identical seed replay, belong to #2817 and are being done there.
+
 1. Run every selected test after the corrections, including both synthetic and real-data arms. Record
    actual durations and assertions; missing references remain failures.
 2. Diagnose and fix remaining solver/covariance failures without increasing
