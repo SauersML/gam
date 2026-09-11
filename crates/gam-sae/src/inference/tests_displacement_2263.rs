@@ -12,7 +12,7 @@
 //! repository. A steer is two objects:
 //!
 //! 1. the **chart round trip** — read `t_from`, write `t_to`, re-encode the
-//!    edited row, compare. Entirely ours: [`set_coordinate`] composes
+//!    edited row, compare. Entirely ours: a coordinate write composes
 //!    [`EncodeAtlas::certified_encode_row`] with [`steer_delta`], and no model
 //!    participates;
 //! 2. the **behavioral readout** — which month the LLM then says. Not ours.

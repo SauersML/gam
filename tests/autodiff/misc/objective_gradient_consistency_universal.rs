@@ -53,8 +53,8 @@
 //!
 //! 3. The SURVIVAL LAML objective
 //!    (`WorkingModelSurvival::unified_lamlobjective_and_rhogradient`),
-//!    reached through the public
-//!    `evaluate_survival_lamlcost_and_gradient(rho, β₀)` shim. That shim
+//!    was reached through the public
+//!    `evaluate_survival_lamlcost_and_gradient(rho, β₀)` shim, which d484a091a retired, so no survival arm runs today. That shim
 //!    re-converges the inner survival mode internally (set `λ = exp(ρ)` on
 //!    the active blocks → constrained inner PIRLS → `update_state` →
 //!    unified survival LAML at the re-fitted `β̂(ρ)`), so FD-checking `∇V`
@@ -999,8 +999,8 @@ fn custom_family_lamlobjective_gradient_consistent_at_large_lambda_boundary() {
 // Objective 3: SURVIVAL LAML objective
 // ======================================================================
 //
-// `WorkingModelSurvival::evaluate_survival_lamlcost_and_gradient(rho, β₀)`
-// re-converges the inner survival mode at the given ρ (set λ = exp(ρ) on
+// The retired (d484a091a) `WorkingModelSurvival::evaluate_survival_lamlcost_and_gradient(rho, β₀)`
+// re-converged the inner survival mode at the given ρ (set λ = exp(ρ) on
 // the active penalty blocks → constrained inner PIRLS → `update_state` →
 // the unified survival LAML at the re-fitted β̂(ρ)) and returns the LAML
 // VALUE and its analytic ρ-GRADIENT together. We FD-check `gradient`

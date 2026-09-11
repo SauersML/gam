@@ -6613,7 +6613,7 @@ impl SaeManifoldTerm {
         // #850 / gam#577 / gam#579 — `max_iter == 0` is a genuine FREEZE of the
         // warm-started inner `(t, β)` state, a verbatim reuse and NOT a
         // convergence request. The caller (`penalized_quasi_laplace_criterion_with_cache_refine_policy`
-        // / `penalized_quasi_laplace_criterion_streaming_exact`) runs this with `max_iter == 0`
+        // / `penalized_quasi_laplace_criterion_streaming_exact_with_lane`) runs this with `max_iter == 0`
         // precisely to hold β at the seed, then factors once at that frozen
         // iterate (`converge_inner_for_undamped_logdet`'s `inner_max_iter == 0`
         // branch). Everything below — the rank-reduction reparametrization, the
