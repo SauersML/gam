@@ -189,6 +189,90 @@ fn rigid_psi_all_beta_axes_wide_timing_979() {
     );
 }
 
+/// #979: the beta third-information all-axes object assembled from per-axis
+/// weighted Grams must equal the direct triple sum `Σ_rows x_a x_b x_c C_row` over
+/// the same per-row contraction, for both latent measures and unequal block widths.
+#[test]
+fn rigid_third_information_all_axes_grams_match_triple_sum_979() {
+    for empirical in [false, true] {
+        let n = 37;
+        let mut family = make_block_psi_test_family(n);
+        if empirical {
+            family.latent_measure = empirical_rigid_fd_fixture().0.latent_measure;
+            family.gaussian_frailty_sd = Some(0.82);
+        }
+        family.marginal_design = DesignMatrix::Dense(
+            Array2::from_shape_fn((n, 3), |(i, j)| {
+                0.2 + 0.3 * (0.17 * (i + 5 * j) as f64).sin()
+            })
+            .into(),
+        );
+        family.slope_design = DesignMatrix::Dense(
+            Array2::from_shape_fn((n, 2), |(i, j)| 0.4 * (0.13 * (i + 3 * j) as f64).cos())
+                .into(),
+        );
+        let (pm, p) = (3, 5);
+        let beta = array![0.15, -0.1, 0.05, 0.25, -0.12];
+        let marginal = beta.slice(s![..pm]).to_owned();
+        let slope = beta.slice(s![pm..]).to_owned();
+        let xm = family.marginal_design.to_dense();
+        let xg = family.slope_design.to_dense();
+        let states = vec![
+            ParameterBlockState {
+                eta: xm.dot(&marginal),
+                beta: marginal,
+            },
+            ParameterBlockState {
+                eta: xg.dot(&slope),
+                beta: slope,
+            },
+        ];
+        let u_direction = array![0.3, 0.1, -0.2, 0.05, 0.4];
+        let v_direction = array![-0.15, 0.25, 0.1, -0.3, 0.2];
+        let assembled = super::custom_family_impl::rigid_third_information_all_axes(
+            &family,
+            &states,
+            &u_direction,
+            &v_direction,
+        )
+        .expect("Gram-assembled third information");
+        let block = |a: usize| usize::from(a >= pm);
+        let mut expected = vec![Array2::<f64>::zeros((p, p)); p];
+        for row in 0..n {
+            let x: Vec<f64> = xm.row(row).iter().chain(xg.row(row).iter()).copied().collect();
+            let mut u = [0.0; 2];
+            let mut v = [0.0; 2];
+            for a in 0..p {
+                u[block(a)] += x[a] * u_direction[a];
+                v[block(a)] += x[a] * v_direction[a];
+            }
+            let contracted = super::custom_family_impl::rigid_row_third_information_contraction(
+                &family, &states, row, u, v,
+            )
+            .expect("row contraction");
+            for c in 0..p {
+                for a in 0..p {
+                    for b in 0..p {
+                        expected[c][[a, b]] +=
+                            x[a] * x[b] * x[c] * contracted[block(a)][block(b)][block(c)];
+                    }
+                }
+            }
+        }
+        for axis in 0..p {
+            assert!(
+                expected[axis].iter().any(|value| *value != 0.0),
+                "empirical={empirical} axis={axis}: the fixture must exercise a nonzero tensor"
+            );
+            let rel = rel_diff_array2(&assembled[axis], &expected[axis]);
+            assert!(
+                rel < 1e-12,
+                "empirical={empirical} axis={axis}: Gram assembly differs from the triple sum by {rel}"
+            );
+        }
+    }
+}
+
 #[test]
 fn rigid_third_information_axes_match_mixed_drift_finite_difference_979() {
     use crate::outer_subsample::OuterScoreSubsample;

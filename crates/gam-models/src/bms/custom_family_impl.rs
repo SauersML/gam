@@ -34,6 +34,140 @@ fn active_explicit_psi_jeffreys_context(
     Ok(Some(plan))
 }
 
+/// Row `row`'s fifth likelihood tensor in the two primaries, contracted with both
+/// coefficient directions projected through that row's designs:
+/// `C[a][b][c] = Σ_{d,e} ∂⁵ℓ[a,b,c,d,e]·u_d·v_e`.
+pub(super) fn rigid_row_third_information_contraction(
+    family: &BernoulliMarginalSlopeFamily,
+    block_states: &[ParameterBlockState],
+    row: usize,
+    u: [f64; 2],
+    v: [f64; 2],
+) -> Result<[[[f64; 2]; 2]; 2], String> {
+    let marginal = family.marginal_link_map(block_states[0].eta[row])?;
+    let slope = block_states[1].eta[row];
+    let fifth = match family.latent_measure.empirical_grid_for_training_row(row)? {
+        None => rigid_standard_normal_fifth_full(
+            marginal,
+            slope,
+            family.z[row],
+            family.y[row],
+            family.weights[row],
+            family.probit_frailty_scale(),
+        )?,
+        Some(grid) => family.empirical_rigid_row_fifth_full(
+            row,
+            marginal,
+            slope,
+            &grid.nodes,
+            &grid.weights,
+        )?,
+    };
+    Ok(std::array::from_fn(|a| {
+        std::array::from_fn(|b| {
+            std::array::from_fn(|c| {
+                let mut value = 0.0;
+                for d in 0..2 {
+                    for e in 0..2 {
+                        value += fifth[a][b][c][d][e] * u[d] * v[e];
+                    }
+                }
+                value
+            })
+        })
+    }))
+}
+
+/// `{D³H[u, v, e_c]}` for the rigid two-block family.
+///
+/// Every coefficient triple contributes `x_a·x_b·x_c·C[P(a)][P(b)][P(c)]`, where `P`
+/// names the design block and `C` is the row contraction above. For output axis `c`
+/// each block pair is therefore one weighted Gram
+/// `X_Paᵀ diag(C_(Pa,Pb,P(c)) ⊙ x_c) X_Pb` over a row chunk (#979). The former
+/// per-row scatter of every ordered triple into six strided ndarray writes was half
+/// of the binary marginal-slope fit at 1500 rows and 24 coefficients.
+pub(super) fn rigid_third_information_all_axes(
+    family: &BernoulliMarginalSlopeFamily,
+    block_states: &[ParameterBlockState],
+    d_beta_u_flat: &Array1<f64>,
+    d_beta_v_flat: &Array1<f64>,
+) -> Result<Vec<Array2<f64>>, String> {
+    let slices = block_slices(family);
+    let pm = slices.marginal.len();
+    let p = slices.total;
+    if d_beta_u_flat.len() != p || d_beta_v_flat.len() != p {
+        return Err(format!(
+            "BMS third information derivative expected two directions of length {p}"
+        ));
+    }
+    let offsets = [0, pm];
+    let widths = [pm, p - pm];
+    let mut axes = vec![Array2::<f64>::zeros((p, p)); p];
+    // Read bounded row chunks, including for operator-backed designs. The fifth row
+    // tensor is evaluated once per row, then shared by every output axis.
+    const CHUNK_ROWS: usize = 4096;
+    for start in (0..family.y.len()).step_by(CHUNK_ROWS) {
+        let end = (start + CHUNK_ROWS).min(family.y.len());
+        let xm = family
+            .marginal_design
+            .try_row_chunk(start..end)
+            .map_err(|e| format!("BMS third information marginal design: {e}"))?;
+        let xg = family
+            .slope_design
+            .try_row_chunk(start..end)
+            .map_err(|e| format!("BMS third information slope design: {e}"))?;
+        let designs = [xm.view(), xg.view()];
+        let mut contracted = Vec::with_capacity(end - start);
+        for row in start..end {
+            let local = row - start;
+            let mut u = [0.0; 2];
+            let mut v = [0.0; 2];
+            for block in 0..2 {
+                for (column, &value) in designs[block].row(local).iter().enumerate() {
+                    u[block] += value * d_beta_u_flat[offsets[block] + column];
+                    v[block] += value * d_beta_v_flat[offsets[block] + column];
+                }
+            }
+            contracted.push(rigid_row_third_information_contraction(
+                family,
+                block_states,
+                row,
+                u,
+                v,
+            )?);
+        }
+        let mut weights = Array1::<f64>::zeros(end - start);
+        for c in 0..p {
+            let block_c = usize::from(c >= pm);
+            let column_c = designs[block_c].column(c - offsets[block_c]);
+            for (block_a, block_b) in [(0_usize, 0_usize), (0, 1), (1, 1)] {
+                if widths[block_a] == 0 || widths[block_b] == 0 {
+                    continue;
+                }
+                for (local, weight) in weights.iter_mut().enumerate() {
+                    *weight = contracted[local][block_a][block_b][block_c] * column_c[local];
+                }
+                let gram = gam_linalg::faer_ndarray::fast_xt_diag_y(
+                    &designs[block_a],
+                    &weights,
+                    &designs[block_b],
+                );
+                let rows_a = offsets[block_a]..offsets[block_a] + widths[block_a];
+                let rows_b = offsets[block_b]..offsets[block_b] + widths[block_b];
+                axes[c]
+                    .slice_mut(ndarray::s![rows_a.clone(), rows_b.clone()])
+                    .scaled_add(1.0, &gram);
+                if block_a != block_b {
+                    axes[c]
+                        .slice_mut(ndarray::s![rows_b, rows_a])
+                        .scaled_add(1.0, &gram.t());
+                }
+            }
+        }
+    }
+    Ok(axes)
+}
+
 #[cfg(test)]
 mod explicit_psi_jeffreys_plan_tests {
     use super::*;
@@ -1650,103 +1784,8 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
         {
             return Ok(None);
         }
-        let slices = block_slices(self);
-        let pm = slices.marginal.len();
-        let p = slices.total;
-        if d_beta_u_flat.len() != p || d_beta_v_flat.len() != p {
-            return Err(format!(
-                "BMS third information derivative expected two directions of length {p}"
-            ));
-        }
-        let mut axes = vec![Array2::<f64>::zeros((p, p)); p];
-        // Read bounded row chunks, including for operator-backed designs. The
-        // fifth row tensor is evaluated once, then shared by every output axis.
-        const CHUNK_ROWS: usize = 4096;
-        for start in (0..self.y.len()).step_by(CHUNK_ROWS) {
-            let end = (start + CHUNK_ROWS).min(self.y.len());
-            let xm = self
-                .marginal_design
-                .try_row_chunk(start..end)
-                .map_err(|e| format!("BMS third information marginal design: {e}"))?;
-            let xg = self
-                .slope_design
-                .try_row_chunk(start..end)
-                .map_err(|e| format!("BMS third information slope design: {e}"))?;
-            for row in start..end {
-                let local = row - start;
-                let x = |a: usize| {
-                    if a < pm {
-                        xm[[local, a]]
-                    } else {
-                        xg[[local, a - pm]]
-                    }
-                };
-                let primary = |a: usize| usize::from(a >= pm);
-                let mut u = [0.0; 2];
-                let mut v = [0.0; 2];
-                for a in 0..p {
-                    u[primary(a)] += x(a) * d_beta_u_flat[a];
-                    v[primary(a)] += x(a) * d_beta_v_flat[a];
-                }
-                let marginal = self.marginal_link_map(block_states[0].eta[row])?;
-                let slope = block_states[1].eta[row];
-                let fifth = match self.latent_measure.empirical_grid_for_training_row(row)? {
-                    None => rigid_standard_normal_fifth_full(
-                        marginal,
-                        slope,
-                        self.z[row],
-                        self.y[row],
-                        self.weights[row],
-                        self.probit_frailty_scale(),
-                    )?,
-                    Some(grid) => self.empirical_rigid_row_fifth_full(
-                        row,
-                        marginal,
-                        slope,
-                        &grid.nodes,
-                        &grid.weights,
-                    )?,
-                };
-                let contracted: [[[f64; 2]; 2]; 2] = std::array::from_fn(|a| {
-                    std::array::from_fn(|b| {
-                        std::array::from_fn(|c| {
-                            let mut value = 0.0;
-                            for d in 0..2 {
-                                for e in 0..2 {
-                                    value += fifth[a][b][c][d][e] * u[d] * v[e];
-                                }
-                            }
-                            value
-                        })
-                    })
-                });
-                for c in 0..p {
-                    for a in 0..=c {
-                        for b in 0..=a {
-                            let contribution =
-                                x(a) * x(b) * x(c) * contracted[primary(a)][primary(b)][primary(c)];
-                            axes[c][[a, b]] += contribution;
-                            if a != b {
-                                axes[c][[b, a]] += contribution;
-                            }
-                            if a != c {
-                                axes[a][[c, b]] += contribution;
-                                if c != b {
-                                    axes[a][[b, c]] += contribution;
-                                }
-                            }
-                            if b != a && b != c {
-                                axes[b][[a, c]] += contribution;
-                                if a != c {
-                                    axes[b][[c, a]] += contribution;
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        Ok(Some(axes))
+        rigid_third_information_all_axes(self, block_states, d_beta_u_flat, d_beta_v_flat)
+            .map(Some)
     }
 
     /// gam#979 wide-p Jeffreys completion: `∇²_β tr(W · H(β))` for a
