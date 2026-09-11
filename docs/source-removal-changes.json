@@ -814,5 +814,13 @@
     ],
     "reason": "#2469: JACOBI_REL_TOL (1e-13) and JACOBI_SWEEP_BUDGET (64) were the stopping rule and rotation budget of a private Jacobi eigensolver, replaced by the workspace self-adjoint eigensolver and renamed symmetric_eigen with its callers and two tests; KNOT_MAXIMIN_TIE_REL_TOL (1e-9 relative to the squared radius) is the rotation round-off bound on squared distances.",
     "evidence": "At the base, git grep finds jacobi_symmetric in crates/gam-geometry/src/manifold.rs, manifolds/grassmann.rs, manifolds/spd.rs and manifolds/conformance_tests.rs, and the two Jacobi constants and KNOT_MAXIMIN_TIE_REL_TOL only in their declaring files; every reference is updated here, and gam-geometry already depends on faer and gam-linalg."
+  },
+  {
+    "base": "8c30cabcc28de0df51d086f07bb737511bd6bf95",
+    "items": [
+      "crates/gam-geometry/src/manifolds/spd.rs:const:SYM_REL_TOL"
+    ],
+    "reason": "#2469: SYM_REL_TOL (1e-9 against max(max|P_ij|, 1)) accepted asymmetric SPD points, now the n-term inner-product rounding band gamma_n*max|P_ij| without the unit floor.",
+    "evidence": "SYM_REL_TOL was an associated constant of SpdManifold in crates/gam-geometry/src/manifolds/spd.rs, used only in SpdManifold::matrix, which this commit edits."
   }
 ]

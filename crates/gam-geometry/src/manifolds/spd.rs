@@ -13,10 +13,6 @@ pub struct SpdManifold {
 }
 
 impl SpdManifold {
-    /// Relative tolerance on the asymmetry `max|P_ij − P_ji|` for accepting a
-    /// flattened matrix as a symmetric SPD point.
-    const SYM_REL_TOL: f64 = 1.0e-9;
-
     pub const fn new(n: usize) -> Self {
         Self { n }
     }
@@ -26,8 +22,9 @@ impl SpdManifold {
         // An SPD point must be symmetric. Reject a non-symmetric input rather
         // than silently replacing it with (P+Pᵀ)/2 — that would accept an
         // off-manifold matrix as a *different* valid point and quietly move the
-        // base of exp/log. Only residual float asymmetry (within tolerance) is
-        // then cleaned by `sym` before the positive-definiteness check.
+        // base of exp/log. Only asymmetry inside the rounding band `γ_n·max|P_ij|`
+        // of an `n`-term inner product — a Gram entry formed in the other order —
+        // is then cleaned by `sym` before the positive-definiteness check.
         let mut max_abs = 0.0_f64;
         let mut max_asym = 0.0_f64;
         for i in 0..self.n {
@@ -36,7 +33,9 @@ impl SpdManifold {
                 max_asym = max_asym.max((raw[[i, j]] - raw[[j, i]]).abs());
             }
         }
-        if !max_asym.is_finite() || max_asym > Self::SYM_REL_TOL * max_abs.max(1.0) {
+        if !max_asym.is_finite()
+            || max_asym > gam_linalg::roundoff::accumulation_growth(self.n) * max_abs
+        {
             return Err(GeometryError::InvalidPoint(
                 "SPD point must be a symmetric matrix",
             ));
