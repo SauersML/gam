@@ -3,28 +3,27 @@ use super::*;
 pub(crate) fn ctn_penalty_scale_log_lambdas(
     penalties: &[PenaltyMatrix],
     likelihood_diagonal_mean: f64,
-) -> Array1<f64> {
+) -> Result<Array1<f64>, String> {
     if penalties.is_empty() {
-        return Array1::zeros(0);
+        return Ok(Array1::zeros(0));
     }
-
-    let likelihood_scale = likelihood_diagonal_mean.max(CTN_SEED_SCALE_FLOOR);
-    Array1::from_iter(penalties.iter().map(|penalty| {
-        let penalty_scale = penalty_diag_scale(penalty).max(CTN_SEED_SCALE_FLOOR);
-        // Lower-bound the SEED log-lambda at 0 (i.e., λ ≥ 1) so we never
-        // start the outer optimizer in the under-regularized regime where
-        // the CTN inner is structurally rank-deficient (small-n / p > n).
-        // The outer BFGS is free to step below 0 when there's enough data
-        // to support it; only the cold-start is constrained. Without this
-        // floor, ratios like n=64, p_resp×p_cov ≈ 200 produce a seed of
-        // log_lambda ≈ -12 (λ ≈ 6e-6), which leaves the inner solve to
-        // pick wild β coefficients and cascade into predict-time monotonicity
-        // violations (h' < 0 on the response grid, observed as -1e15 spikes
-        // in CI synthetic-large-scale tests).
-        (likelihood_scale / penalty_scale)
-            .ln()
-            .clamp(CTN_SEED_LOG_LAMBDA_MIN, CTN_SEED_LOG_LAMBDA_MAX)
-    }))
+    if !likelihood_diagonal_mean.is_finite() || likelihood_diagonal_mean <= 0.0 {
+        return Err("CTN smoothing seed requires a finite positive likelihood scale".to_string());
+    }
+    let mut seed = Array1::zeros(penalties.len());
+    for (index, penalty) in penalties.iter().enumerate() {
+        let scale = penalty_diag_scale(penalty);
+        if !scale.is_finite() || scale <= 0.0 {
+            return Err(format!("CTN smoothing penalty {index} has no finite positive scale"));
+        }
+        // Match the initial effective penalty scale to the likelihood scale.
+        // Clamping log(lambda) at zero makes the starting model depend on the
+        // arbitrary units of S: a small lambda can multiply a very large
+        // response-derivative penalty into appropriate regularization. Compute
+        // in log space so the ratio itself need not be representable.
+        seed[index] = likelihood_diagonal_mean.ln() - scale.ln();
+    }
+    Ok(seed)
 }
 
 pub(crate) fn penalty_diag_scale(penalty: &PenaltyMatrix) -> f64 {

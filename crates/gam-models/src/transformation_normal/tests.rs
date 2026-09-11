@@ -110,9 +110,24 @@ pub(crate) fn ctn_penalty_scale_seed_uses_likelihood_to_penalty_ratio() {
         PenaltyMatrix::Dense(array![[2.0, 0.0], [0.0, 2.0]]),
         PenaltyMatrix::Dense(array![[4.0, 0.0], [0.0, 4.0]]),
     ];
-    let rho = ctn_penalty_scale_log_lambdas(&penalties, 8.0);
+    let rho = ctn_penalty_scale_log_lambdas(&penalties, 8.0).unwrap();
     assert!((rho[0] - 4.0_f64.ln()).abs() < 1.0e-12);
     assert!((rho[1] - 2.0_f64.ln()).abs() < 1.0e-12);
+}
+
+#[test]
+fn ctn_penalty_scale_seed_preserves_effective_strength_across_units() {
+    for scale in [1e-30, 1.0, 1e30] {
+        let penalties = vec![PenaltyMatrix::Dense(array![[scale, 0.0], [0.0, scale]])];
+        let rho = ctn_penalty_scale_log_lambdas(&penalties, 8.0).unwrap();
+        assert!((rho[0].exp() * scale / 8.0 - 1.0).abs() < 1e-12);
+    }
+    let zero = vec![PenaltyMatrix::Dense(Array2::zeros((2, 2)))];
+    assert!(ctn_penalty_scale_log_lambdas(&zero, 8.0).is_err());
+    let identity = vec![PenaltyMatrix::Dense(Array2::eye(2))];
+    for scale in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+        assert!(ctn_penalty_scale_log_lambdas(&identity, scale).is_err());
+    }
 }
 
 #[test]
