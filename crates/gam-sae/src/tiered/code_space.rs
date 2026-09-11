@@ -45,8 +45,9 @@ use crate::manifold::curve_promotion::{
     CurvePromotionProposal, LinearCommunity, PromotionContext, propose_curve_promotion,
 };
 use crate::manifold::{
-    SaeSupportOuterRequest, SaeSupportSeedRequest, SaeSupportTermSeedRequest,
-    build_sae_support_seed, build_sae_support_term_seed, run_sae_support_outer,
+    GraphCompressionKind, LocalAtlas, LocalAtlasConfig, SaeSupportOuterRequest,
+    SaeSupportSeedRequest, SaeSupportTermSeedRequest, build_sae_support_seed,
+    build_sae_support_term_seed, observe_atlas_topology, run_sae_support_outer,
     sae_support_effective_atom_dims,
 };
 use crate::sparse_dict::BlockSparseFit;
@@ -356,17 +357,18 @@ pub struct CensusPairVerdict {
     pub null_exceedances: u32,
     /// `(1 + exceedances) / (1 + permutations)`; NaN when no nulls were run.
     pub null_p_hat: f64,
-    /// REML topology-race verdict on the accepted pair's ambient image
-    /// ([`crate::structure_harvest::discover_primary_atom_topologies`], the
-    /// same evidence race the seed dictionary uses): the winning basis kind's
-    /// `Debug` label (e.g. `Periodic` for a genuine ring, `EuclideanPatch` for
-    /// a flat cloud the DL ledger accepted on amplitude-law concentration
-    /// alone). `None` when the pair was refused or the race declined.
+    /// Topology verdict on the accepted pair: the `Debug` label of the d = 1
+    /// chart that realizes it (`Periodic` for a ring), present only when the #2280
+    /// local-chart atlas of the pair's code cloud names a closed curve and the
+    /// d = 1 race then fits that chart on the pair's ambient image. A union of
+    /// lines, a solid cloud or an undersupported pair gets `None`, even when the
+    /// DL ledger accepted it on amplitude-law concentration. `None` also when the
+    /// pair was refused.
     pub topology_kind: Option<String>,
     /// Latent dimension the winning topology carries; `None` with the above.
     pub topology_dim: Option<usize>,
-    /// The race's own refusal text when it declined to adjudicate (kept
-    /// verbatim so a declined race never reads as a flat verdict).
+    /// The atlas's or the race's own text when the pair was not named a ring
+    /// (kept verbatim so a declined adjudication never reads as a flat verdict).
     pub topology_error: Option<String>,
 }
 
@@ -390,6 +392,78 @@ fn hashed_permutation(f: usize, m: usize) -> Vec<usize> {
     let mut idx: Vec<usize> = (0..f).collect();
     idx.sort_by_key(|&i| splitmix64(i as u64 ^ salt));
     idx
+}
+
+/// Ring versus flat for one ACCEPTED pair, read from the pair's own code cloud.
+///
+/// The DL ledger accepts a pair on amplitude-law concentration, which an
+/// exclusion mixture (two lines through the origin) satisfies too, so "curved"
+/// needs an independent verdict. A REML race over the pair's ambient image cannot
+/// supply it once the codes carry noise: the image `pair_codes · atoms` is rank 2
+/// by construction, so a flat 2-D patch on its principal projections reproduces it
+/// up to the penalty's shrinkage, and at fixed coordinates that patch is charged
+/// nothing for its second coordinate per row. At `d = 1` the race enrols only the
+/// circle, so it cannot say "flat" either.
+///
+/// A ring and a flat cloud differ in topology, so the verdict comes from the #2280
+/// local-chart atlas of the `f × 2` code cloud at chart rank 1. The readout names a
+/// closed curve only when the charts' transitions close a cycle, and it abstains on
+/// a union of lines or a solid blob. Once it names a circle, the `d = 1` race fits
+/// the circle chart on the image and reports its basis kind, so the label comes
+/// from a fitted candidate. Returns `(kind, latent_dim, refusal)`: the atlas's or
+/// the race's own text rides in `refusal` whenever no kind is returned.
+fn adjudicate_pair_ring(
+    pair_codes: ArrayView2<'_, f64>,
+    image: ArrayView2<'_, f64>,
+) -> (Option<String>, Option<usize>, Option<String>) {
+    let f = pair_codes.nrows();
+    let atlas = match LocalAtlas::build(pair_codes, LocalAtlasConfig::balanced(f, 1)) {
+        Ok(atlas) => atlas,
+        Err(error) => {
+            return (
+                None,
+                None,
+                Some(format!("the pair's code-cloud atlas did not build: {error}")),
+            );
+        }
+    };
+    let readout = match observe_atlas_topology(&atlas) {
+        Ok(readout) => readout,
+        Err(error) => {
+            return (
+                None,
+                None,
+                Some(format!("the pair's code-cloud atlas readout failed: {error}")),
+            );
+        }
+    };
+    if readout.observed_manifold() != Some(GraphCompressionKind::Circle) {
+        return (
+            None,
+            None,
+            Some(format!("the pair's code cloud is not a closed curve: {readout}")),
+        );
+    }
+    match crate::structure_harvest::discover_primary_atom_topologies(
+        image,
+        &vec![0usize; f],
+        1,
+        &[1],
+    ) {
+        Ok(choices) => match choices.first() {
+            Some(choice) => (
+                Some(format!("{:?}", choice.basis_kind)),
+                Some(choice.latent_dim),
+                None,
+            ),
+            None => (
+                None,
+                None,
+                Some("the d = 1 race returned no candidate".to_string()),
+            ),
+        },
+        Err(error) => (None, None, Some(error)),
+    }
 }
 
 /// Run the permutation null for one accepted pair cloud (`f×2`).
@@ -615,27 +689,14 @@ pub fn harvest_code_space_pair_promotions(
         let (ran, exceed) = if proposal.accept {
             n_accepted += 1;
             dl_saved_bits += observed_saving;
-            // Topology adjudication of the ACCEPTED pair: race the pair's
-            // ambient image through the seed dictionary's own evidence race,
-            // so "curved" never rests on the DL ledger alone (an exclusion
-            // mixture also concentrates its amplitude law; the race is where
-            // ring vs flat is decided by REML).
+            // Topology adjudication of the ACCEPTED pair, so "curved" never rests
+            // on the DL ledger alone (an exclusion mixture also concentrates its
+            // amplitude law). Ring versus flat is read from the pair's code-cloud
+            // atlas; see `adjudicate_pair_ring`.
             if f >= 16 {
                 let image = pair_codes.dot(&atoms);
-                match crate::structure_harvest::discover_primary_atom_topologies(
-                    image.view(),
-                    &vec![0usize; f],
-                    1,
-                    &[2],
-                ) {
-                    Ok(choices) => {
-                        if let Some(choice) = choices.first() {
-                            topology_kind = Some(format!("{:?}", choice.basis_kind));
-                            topology_dim = Some(choice.latent_dim);
-                        }
-                    }
-                    Err(error) => topology_error = Some(error),
-                }
+                (topology_kind, topology_dim, topology_error) =
+                    adjudicate_pair_ring(pair_codes.view(), image.view());
             } else {
                 topology_error = Some(format!("race needs >= 16 rows, pair has {f}"));
             }
@@ -948,5 +1009,60 @@ mod code_space_tests {
             "zero residual must fall to the resolution floor, got {backstop}"
         );
         assert!(linear_distortion_floor(zero.view(), 0.0).is_err());
+    }
+
+    /// #2280 / #2502: ring versus flat is a topology verdict on the pair's code
+    /// cloud, and it must be able to say no. The helper that names a noisy ring must
+    /// refuse two lines through the origin (the exclusion mixture a DL ledger also
+    /// accepts on amplitude-law concentration) and a solid disk. The ring arm is the
+    /// positive control for both refusals: a helper that always refused fails it.
+    #[test]
+    fn pair_ring_adjudication_names_a_ring_and_refuses_lines_and_a_disk_2280() {
+        let f = 256;
+        let mut atoms = A2::<f64>::zeros((2, 4));
+        atoms[[0, 0]] = 1.0;
+        atoms[[1, 1]] = 1.0;
+        let wobble = |row: usize, col: usize| {
+            let x = (row as f64 + 1.0) * 12.9898 + (col as f64 + 1.0) * 78.233;
+            0.02 * (x.sin() * 43758.5453).sin()
+        };
+        let ring = A2::from_shape_fn((f, 2), |(row, col)| {
+            let theta = TAU * (row as f64) / (f as f64);
+            let clean = if col == 0 { theta.cos() } else { theta.sin() };
+            clean + wobble(row, col)
+        });
+        // Two lines through the origin: each row fires one atom, amplitude in [-1, 1].
+        let half = f / 2;
+        let lines = A2::from_shape_fn((f, 2), |(row, col)| {
+            let amplitude = 2.0 * ((row / 2) as f64 + 0.5) / (half as f64) - 1.0;
+            if col == row % 2 { amplitude } else { 0.0 }
+        });
+        // A solid disk: a sunflower lattice, uniform over the unit disk.
+        let golden_angle = std::f64::consts::PI * (3.0 - 5.0_f64.sqrt());
+        let disk = A2::from_shape_fn((f, 2), |(row, col)| {
+            let radius = ((row as f64 + 0.5) / f as f64).sqrt();
+            let angle = golden_angle * row as f64;
+            if col == 0 { radius * angle.cos() } else { radius * angle.sin() }
+        });
+
+        let (kind, dim, refusal) = adjudicate_pair_ring(ring.view(), ring.dot(&atoms).view());
+        assert_eq!(
+            (kind.as_deref(), dim),
+            (Some("Periodic"), Some(1)),
+            "a noisy ring must be named a ring (refusal: {refusal:?})"
+        );
+        for (label, cloud) in [("two lines", &lines), ("solid disk", &disk)] {
+            let (kind, dim, refusal) =
+                adjudicate_pair_ring(cloud.view(), cloud.dot(&atoms).view());
+            assert_eq!(
+                (kind.as_deref(), dim),
+                (None, None),
+                "{label} must not be named a ring: kind={kind:?} dim={dim:?}"
+            );
+            assert!(
+                refusal.is_some(),
+                "{label}: a declined adjudication must carry its reason"
+            );
+        }
     }
 }
