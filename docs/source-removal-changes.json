@@ -535,5 +535,26 @@
     ],
     "reason": "Historical acknowledgement for cc78d6e37 (#2627), pushed onto 952517d12. a893d85bc (#2026) retired the bare-tweedie power profile, a derivative-free hyperparameter search forbidden by SPEC.md; a bare `tweedie` is now a typed refusal and an explicit `tweedie(p)` pins p. The two tests asserting that the profile recovered p_true (and their helper `estimated_bare_tweedie_power` and recovery tolerance `TOL`) asserted the retired behaviour and failed at the refusal. cc78d6e37 restated them to the shipped contract on the same DGPs: `bare_tweedie_is_refused_instead_of_silently_fitting_a_default_power` (bare `tweedie`/`tw` refused with the explicit-power error; `tweedie(1.4)` and `tweedie(p=1.8)` pinned verbatim) and `explicit_off_grid_tweedie_power_is_pinned_verbatim` (off-grid p=1.65 carried verbatim), with helpers `simulate_tweedie` and `fitted_tweedie_power`.",
     "evidence": "test.yml run 34624047829 at 994668d56: both removed tests failed with InvalidConfig \"Tweedie family requires an explicit variance power ...\". MSI lane v7 at 5ac3be42c with the restated file overlaid: cargo test -p gam --all-features --test glm -- families::issue_2026_tweedie_estimated_power: 2 passed, 0 failed. The #2818 source-removal guard run 34643272847 named exactly these four identities; the unit test count of tests/glm is unchanged (two tests out, two in, no pinned names)."
+  },
+  {
+    "reason" : "Historical acknowledgement for cb8dd972c, which committed the #2829 restoration from a shared index. #2829 applies docs/rust-library-surface.md's rule to the declarations d484a091a removed: a surviving exported type whose only producer was removed is either given its producer back or deleted. These carriers are deleted instead of restored: - crates/gam-sae/src/manifold/cofit_arrow.rs and crates/gam-sae/src/sparse_dict/cofit.rs kept only ArrowCofitConfig, ArrowCofitReport, CofitConfig, CofitRound and CofitReport (with two Default impls). Their bridges are retired: Tier2SupportFit documents itself as the replacement dense co-fit report, and tiered::fit_tiered carries the contracts. The budget refusal is pinned by insufficient_inner_budget_returns_error_instead_of_a_tiered_report_2023. - crates/gam-models/src/bms/gpu/device_pcg.rs held only DeviceResidentPcgInput and DeviceResidentPcgOutput, whose producer run_pcg_against_row_hessian_device was removed. - crates/gam-models/src/bms/alo_replay.rs: BernoulliMarginalSlopeAloRowInput and BernoulliMarginalSlopeAloRowGeometry had no producer or consumer after bernoulli_marginal_slope_alo_row_geometry was removed. gam-b6 agreed. - crates/gam-sae/src/gpu_kernels/resident_arrow.rs: ArrowBlocks (with an empty impl) and ArrowDirection had no producer or consumer. sae-perf agreed. - crates/gam-sae/src/structure_harvest.rs: GraphBirthCandidate lost its producer graph_birth_candidate_for_structure_search. sae-arch and sae-red agreed.",
+    "base" : "4891f95811ac9fab5deb2e8846fb6a1ea0a38b6a",
+    "evidence" : "- git grep -w at the landing base finds each identity only at its own definition, plus the re-export lines removed in the same commit. - The compile gate `cargo check --locked --workspace --all-targets` on MSI lane p2829 (tags b17 and g2) covers the landed tree. - docs/public-api-2829-disposition.tsv records every d484a091a identity's disposition.",
+    "items" : [
+      "crates/gam-models/src/bms/alo_replay.rs:struct:BernoulliMarginalSlopeAloRowGeometry",
+      "crates/gam-models/src/bms/alo_replay.rs:struct:BernoulliMarginalSlopeAloRowInput",
+      "crates/gam-models/src/bms/gpu/device_pcg.rs:struct:DeviceResidentPcgInput",
+      "crates/gam-models/src/bms/gpu/device_pcg.rs:struct:DeviceResidentPcgOutput",
+      "crates/gam-sae/src/gpu_kernels/resident_arrow.rs:struct:ArrowBlocks",
+      "crates/gam-sae/src/gpu_kernels/resident_arrow.rs:struct:ArrowDirection",
+      "crates/gam-sae/src/manifold/cofit_arrow.rs:fn:default",
+      "crates/gam-sae/src/manifold/cofit_arrow.rs:struct:ArrowCofitConfig",
+      "crates/gam-sae/src/manifold/cofit_arrow.rs:struct:ArrowCofitReport",
+      "crates/gam-sae/src/sparse_dict/cofit.rs:fn:default",
+      "crates/gam-sae/src/sparse_dict/cofit.rs:struct:CofitConfig",
+      "crates/gam-sae/src/sparse_dict/cofit.rs:struct:CofitReport",
+      "crates/gam-sae/src/sparse_dict/cofit.rs:struct:CofitRound",
+      "crates/gam-sae/src/structure_harvest.rs:struct:GraphBirthCandidate"
+    ]
   }
 ]

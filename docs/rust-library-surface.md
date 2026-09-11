@@ -189,8 +189,8 @@ dropped, and restored items the table above retires were removed again.
 
 | Disposition | Identities |
 | --- | --- |
-| Restored in place | 891 |
-| Defined elsewhere in the same crate | 20 |
+| Restored in place | 894 |
+| Defined elsewhere in the same crate | 17 |
 | Retired by the decisions above | 19 |
 | Retired: nothing that survived depends on it | 278 |
 | Retired by the owning work's own decision | 3 |
@@ -209,9 +209,21 @@ deleted instead of getting its producer back, with an entry in
 (`bms/alo_replay.rs`), and `GraphBirthCandidate` (`structure_harvest.rs`).
 
 The deferred identities live in files other active work owns (survival, jets,
-and the finite-set race scaffolding). Steering retired its own carriers
-(`CoordinateSetResult`, `InterchangeResult`) and their deleted producers. Their owners were given each
-surviving carrier and dangling reference. Prose that still named a retired item now names
+and the finite-set race scaffolding); those owners were given each surviving
+carrier and dangling reference. Steering retired its own carriers
+(`CoordinateSetResult`, `InterchangeResult`) and their deleted producers.
+
+Three restorations were adapted rather than taken verbatim:
+
+- The restored allocation-free Gaussian REML selection (`optimize_rho_no_alloc`)
+  reads `GaussianRemlEigenCache::resolvability_rho_domain()`, the derived domain
+  `optimize_rho` uses. It does not read the removed `RHO_LOWER`/`RHO_UPPER`
+  box, which SPEC forbids.
+- `manifold/fit_drivers.rs` is not restored: its 16 removed functions would take
+  the file past build.rs's 10,000-line tracked-file limit. Those names stay
+  retired, and the prose that cited them is reworded.
+- `MixtureCoefficientCovariance` and `struct Dual`, removed alongside their
+  producers, are restored with them. Prose that still named a retired item now names
 the maintained entry point: error labels in `canonical.rs` and
 `estimate/fit.rs`, rustdoc links in `reduced_solve.rs` and
 `multinomial_reml.rs`, and comments across the workspace.
