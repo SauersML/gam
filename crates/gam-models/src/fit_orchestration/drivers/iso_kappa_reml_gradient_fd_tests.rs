@@ -2574,6 +2574,75 @@ fn zz_measure_monotone_fixture_psi_gradient_at_the_kappa_seed_2735() {
             eprintln!("[zz-psi-2735] psi={psi:+.6} rho j={j} an={:+.6e} fd={fd}", grad[j]);
         }
     }
+
+    // #2671: the CLI's κ phase searches the CONDITIONED response. The CLI's seed
+    // cost is −99.18710, where the raw-response evaluator above reads −98.94443
+    // at the same θ, and the CLI's analytic ∂V/∂ψ there is −14.08 against the
+    // raw evaluator's +1.375. Put the seed through an evaluator built from the
+    // conditioned response, exactly as `run_exact_joint_spatial_optimization`
+    // builds its own, so the two routes are compared at one θ.
+    let conditioned_y = gam_solve::estimate::gaussian_identity_outer_response_conditioning(
+        &frozen_design.design,
+        &frozen_design.penalties,
+        &external_opts,
+        y.view(),
+        weights.view(),
+        offset.view(),
+    )
+    .unwrap_or_else(|e| panic!("response conditioning failed: {e:?}"));
+    eprintln!(
+        "[zz-psi-2735 conditioned] response conditioning applied: {}",
+        conditioned_y.is_some()
+    );
+    let conditioned_response = conditioned_y.as_ref().map_or(y.view(), |c| c.view());
+    let mut conditioned_evaluator = gam_solve::estimate::ExternalJointHyperEvaluator::new(
+        conditioned_response,
+        weights.view(),
+        &frozen_design.design,
+        offset.view(),
+        &frozen_design.penalties,
+        &external_opts,
+        "#2735 psi seed evaluator, conditioned response",
+    )
+    .unwrap_or_else(|e| panic!("conditioned evaluator failed: {e:?}"));
+    for psi_offset in [0.0_f64, 1.0] {
+        let mut theta = Array1::<f64>::zeros(rho_dim + psi_dim);
+        for (j, &rho) in rho_seed.iter().enumerate() {
+            theta[j] = rho;
+        }
+        theta[rho_dim] = psi_seed + psi_offset;
+        let psi = theta[rho_dim];
+        let (cost, grad) = match analytic_at(&theta, &mut cache, &mut conditioned_evaluator) {
+            Ok(evaluation) => evaluation,
+            Err(err) => {
+                eprintln!(
+                    "[zz-psi-2735 conditioned] psi={psi:+.6} analytic evaluation refused: {err}"
+                );
+                continue;
+            }
+        };
+        eprintln!(
+            "[zz-psi-2735 conditioned] psi={psi:+.6} COST_vg={cost:+.12e} analytic_grad={:?}",
+            grad.as_slice().unwrap_or(&[]),
+        );
+        let an = grad[rho_dim];
+        for hh in [1e-3_f64, 1e-4] {
+            let mut plus = theta.clone();
+            plus[rho_dim] += hh;
+            let mut minus = theta.clone();
+            minus[rho_dim] -= hh;
+            let central = match (
+                cost_at(&plus, &mut cache, &mut conditioned_evaluator),
+                cost_at(&minus, &mut cache, &mut conditioned_evaluator),
+            ) {
+                (Ok(cp), Ok(cm)) => format!("{:+.8e}", (cp - cm) / (2.0 * hh)),
+                (plus, minus) => format!("refused (plus {plus:?}, minus {minus:?})"),
+            };
+            eprintln!(
+                "[zz-psi-2735 conditioned] psi={psi:+.6} h={hh:.1e} an={an:+.8e} fd_cost_only={central}"
+            );
+        }
+    }
 }
 
 /// One rung of the #2454 ladder: the analytic outer gradient, the central
