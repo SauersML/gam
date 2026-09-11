@@ -1232,7 +1232,13 @@ fn kjet_mobius_w(
     let a = (kappa * (2.0 * xy + yy)).scale(-1.0) + 1.0;
     let b = kappa * xx + 1.0;
     let denom = (kappa * kappa) * (xx * yy) + (kappa * (2.0 * xy)).scale(-1.0) + 1.0;
-    if denom.v.abs() <= MOBIUS_DENOM_EPS {
+    // Same antipodal test as `mobius_add`, on the value channel: the
+    // denominator's rounding band.
+    let denom_band = gam_linalg::roundoff::accumulation_band(
+        2 * x.len() + 3,
+        1.0 + (2.0 * kappa.v * xy).abs() + kappa.v * kappa.v * xx * yy,
+    );
+    if denom.v.abs() <= denom_band {
         return Err(GeometryError::Singular(
             "Möbius addition at the κ>0 antipodal point",
         ));
@@ -1356,7 +1362,13 @@ pub fn exp_map_kappa_jet(
     let two_k_xs = (kappa * 2.0) * xs; // 2κ⟨x,step⟩
     // denom = 1 − 2κ⟨x,step⟩ + κ²‖x‖²‖step‖²  (no Sub on the tower; Neg+Add).
     let denom = two_k_xs.scale(-1.0) + (kappa * kappa) * (ss * xx) + 1.0;
-    if denom.v.abs() <= MOBIUS_DENOM_EPS {
+    // Same antipodal test as `mobius_add`, on the value channel: the
+    // denominator's rounding band.
+    let denom_band = gam_linalg::roundoff::accumulation_band(
+        2 * d + 3,
+        1.0 + two_k_xs.v.abs() + kappa.v * kappa.v * ss.v * xx,
+    );
+    if denom.v.abs() <= denom_band {
         return Err(GeometryError::Singular(
             "Möbius addition at the κ>0 antipodal point",
         ));
