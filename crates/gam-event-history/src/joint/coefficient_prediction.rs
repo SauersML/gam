@@ -2,6 +2,8 @@
 //! Both latent states and global coefficients are integrated. A fitted mean
 //! coefficient vector is never substituted for the coefficient distribution.
 use super::*;
+#[path = "conditional_prediction.rs"]
+mod conditional;
 
 #[derive(Clone, Debug)]
 pub struct PredictiveDensityOptions {
@@ -87,7 +89,26 @@ fn mixture(
     let log_error_estimate = options.standard_error_multiplier * coefficient_se
         + 2.0 * training_error
         + additional_error;
-    if !log_error_estimate.is_finite()
+    finish(
+        log_density,
+        coefficient_se,
+        log_error_estimate,
+        effective_samples,
+        options,
+    )
+}
+
+fn finish(
+    log_density: f64,
+    coefficient_se: f64,
+    log_error_estimate: f64,
+    effective_samples: f64,
+    options: &PredictiveDensityOptions,
+) -> Result<PredictiveHistoryDensity, EventHistoryError> {
+    if !log_density.is_finite()
+        || !coefficient_se.is_finite()
+        || !effective_samples.is_finite()
+        || !log_error_estimate.is_finite()
         || log_error_estimate > options.log_error_tolerance
         || effective_samples < options.minimum_effective_samples
     {
@@ -104,26 +125,12 @@ fn mixture(
 }
 
 impl JointCohortIntegration<'_, '_> {
-    /// p(additional histories | training observations, learned strengths).
-    /// Additional subjects must be conditionally independent of the training
-    /// subjects under the joint model. Do not pass training histories again.
-    /// This integrates a joint density for the whole additional cohort;
-    /// multiplying separate subject predictions would discard their shared
-    /// coefficient uncertainty.
-    ///
-    /// The additional cohort must reuse reference objects from this training
-    /// cohort, with its own positional stratum map. Every coefficient draw
-    /// regenerates those reference moments and resolves the resulting full
-    /// additional-cohort likelihood at that same coefficient state.
-    /// No endpoint extrapolation or substitute centering is introduced.
-    pub fn predictive_history_density(
+    fn validate_prediction(
         &self,
         inference: &JointCoefficientInference<'_, '_>,
         additional: &JointCohortIntegration<'_, '_>,
-        accuracy: &IntegrationAccuracy,
-        tolerance: &CohortScoreTolerance,
         options: &PredictiveDensityOptions,
-    ) -> Result<PredictiveHistoryDensity, EventHistoryError> {
+    ) -> Result<(), EventHistoryError> {
         if !std::sync::Arc::ptr_eq(&self.identity, &inference.cohort_identity)
             || !std::ptr::eq(self.model, additional.model)
             || std::sync::Arc::ptr_eq(&self.identity, &additional.identity)
@@ -148,6 +155,29 @@ impl JointCohortIntegration<'_, '_> {
                 "predictive density requires positive finite error and effective-sample targets",
             ));
         }
+        Ok(())
+    }
+    /// p(additional histories | training observations, learned strengths).
+    /// Additional subjects must be conditionally independent of the training
+    /// subjects under the joint model. Do not pass training histories again.
+    /// This integrates a joint density for the whole additional cohort;
+    /// multiplying separate subject predictions would discard their shared
+    /// coefficient uncertainty.
+    ///
+    /// The additional cohort must reuse reference objects from this training
+    /// cohort, with its own positional stratum map. Every coefficient draw
+    /// regenerates those reference moments and resolves the resulting full
+    /// additional-cohort likelihood at that same coefficient state.
+    /// No endpoint extrapolation or substitute centering is introduced.
+    pub fn predictive_history_density(
+        &self,
+        inference: &JointCoefficientInference<'_, '_>,
+        additional: &JointCohortIntegration<'_, '_>,
+        accuracy: &IntegrationAccuracy,
+        tolerance: &CohortScoreTolerance,
+        options: &PredictiveDensityOptions,
+    ) -> Result<PredictiveHistoryDensity, EventHistoryError> {
+        self.validate_prediction(inference, additional, options)?;
         match &inference.law {
             CoefficientLaw::ConstantRates(law) => Ok(PredictiveHistoryDensity {
                 log_density: law.predictive_log_density(additional, options.memory_limit_bytes)?,

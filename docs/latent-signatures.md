@@ -631,10 +631,59 @@ target and effective coefficient sample requirement must both pass.
 This returns a density in the model's observation measure. It is not a
 terminal-survival curve, a cumulative-incidence forecast, or a conditional
 forecast obtained by averaging coefficient-specific likelihood ratios.
-Conditioning on a new subject's earlier outcomes requires the corresponding
-joint predictive numerator and denominator. General future-path integration,
+Conditioning on a new subject's earlier outcomes uses the corresponding
+joint predictive numerator and denominator described next. General future-path integration,
 the reference-conditioned entry law, standalone serialization, and unified
 Python/CLI serving remain unfinished.
+
+### Conditioning on earlier histories
+
+`JointCohortIntegration::conditional_history_density` pairs each earlier
+history with an extension and computes
+
+```text
+p(new outcomes | earlier histories, D)
+    = integral L(extended | theta) p(theta | D) dtheta
+      / integral L(earlier | theta) p(theta | D) dtheta.
+```
+
+Earlier outcomes therefore update coefficient weights as well as the latent
+state law. Averaging coefficient-specific conditional likelihood ratios under
+the unchanged training weights would give a different answer. Both integrals
+retain the person's original entry and latent trajectory. This method never
+restarts a stationary prior at the assessment cutoff.
+
+The paired subjects must retain their order and reference population. The
+extension must preserve the exact prefix mesh, quadrature exposures, event
+records, baseline and drive designs, entry context, genetics, and measurement
+records, including before/after-event timing. New measurement records cannot
+be inserted before the cutoff. Current genotype values carry no acquisition
+times, so this interface does not permit changing them in a continuation.
+These are checks on the model's numerical observation histories; creating
+those histories from raw records remains an interface responsibility.
+
+The sampled ratio uses the same coefficient bank for both integrals. If
+`u_i` and `v_i` are its normalized weights after the earlier and extended
+histories respectively, its conditional coefficient log-standard-error is
+`sqrt(n/(n-1) sum_i (v_i-u_i)^2)`. Both integrals must pass the effective
+sample requirement. The combined error estimate includes twice the training
+likelihood error and the earlier/extended likelihood errors, without dividing
+their correlated contributions by the number of coefficient draws. An
+unchanged history uses the exact conditional identity of one. With no
+appended events or observed measurements, the result is the probability of
+no event of any mark over the new windows. A numerical value above one is
+rejected for refinement, never clipped. It is not terminal survival with
+nonterminal events integrated out.
+
+The constant-rate route conditions the Gamma posterior analytically:
+`shape += earlier event count`, `rate += earlier risk exposure`, then evaluates
+the appended events/exposure under that updated distribution. It accumulates
+appended exposure directly, avoiding subtraction of large totals. Earlier
+once-only diagnoses still remove their marks from future risk, and the
+unchanged genetic density cancels. Conditioning on an event impossible under
+the zero-rate law is rejected. Tests check independent Gamma formulas,
+coefficient reweighting, unchanged-history normalization, all past-data
+checks, and once-only risk removal across extreme time-unit changes.
 
 Training may use a structured variational approximation with local Gaussian
 state factors and temporal precision blocks, plus shared parameter factors.

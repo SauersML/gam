@@ -97,6 +97,55 @@ struct RateStatistics {
 }
 
 impl ConstantRatePosterior {
+    pub(super) fn conditional_predictive_log_density(
+        &self,
+        prefix: &JointCohortIntegration<'_, '_>,
+        extended: &JointCohortIntegration<'_, '_>,
+        memory_limit_bytes: usize,
+    ) -> Result<f64, EventHistoryError> {
+        if extended.subjects.iter().any(|s| {
+            s.history
+                .baseline_design
+                .column(0)
+                .iter()
+                .any(|&x| x != 1.0)
+        }) {
+            return Err(invalid(
+                "constant-rate continuation requires unit-intercept designs",
+            ));
+        }
+        // Accumulate appended exposure directly, rather than subtracting two
+        // potentially huge totals. Past once-only events still remove risk.
+        let past = prefix.constant_rate_statistics(memory_limit_bytes, None)?;
+        let future = extended.constant_rate_statistics(memory_limit_bytes, Some(prefix))?;
+        let Some(gamma) = &self.gamma else {
+            if past.counts.iter().any(|&n| n > 0) {
+                return Err(invalid(
+                    "cannot condition on an event with zero probability under the zero-rate law",
+                ));
+            }
+            return Ok(if future.counts.iter().any(|&n| n > 0) {
+                f64::NEG_INFINITY
+            } else {
+                0.0
+            });
+        };
+        let log_density = sum(gamma.iter().enumerate().map(|(d, g)| {
+            let shape = g.shape + past.counts[d] as f64;
+            let log_rate = log_add(g.log_rate, past.log_exposure[d]);
+            let events = sum((0..future.counts[d]).map(|j| (shape + j as f64).ln() - log_rate));
+            events
+                - (shape + future.counts[d] as f64)
+                    * emission::softplus(&(future.log_exposure[d] - log_rate))
+        }));
+        if !log_density.is_finite() {
+            return Err(numerical(
+                "constant-rate conditional prediction is unrepresentable",
+            ));
+        }
+        Ok(log_density)
+    }
+
     pub(super) fn predictive_log_density(
         &self,
         additional: &JointCohortIntegration<'_, '_>,
@@ -117,7 +166,7 @@ impl ConstantRatePosterior {
                 "constant-rate prediction requires the same unit-intercept model",
             ));
         }
-        let stats = additional.constant_rate_statistics(memory_limit_bytes)?;
+        let stats = additional.constant_rate_statistics(memory_limit_bytes, None)?;
         let Some(gamma) = &self.gamma else {
             return Ok(if stats.counts.iter().any(|&n| n > 0) {
                 f64::NEG_INFINITY
@@ -187,6 +236,7 @@ impl JointCohortIntegration<'_, '_> {
     fn constant_rate_statistics(
         &self,
         memory_limit_bytes: usize,
+        prefix: Option<&JointCohortIntegration<'_, '_>>,
     ) -> Result<RateStatistics, EventHistoryError> {
         let d = self.model.spec.marks.len();
         if d.checked_mul(256).is_none_or(|n| n > memory_limit_bytes) {
@@ -198,14 +248,15 @@ impl JointCohortIntegration<'_, '_> {
         let mut counts = vec![0usize; d];
         let mut genetic_density = 0.0;
         let mut genetic_correction = 0.0;
-        for subject in self.subjects {
+        for (subject_index, subject) in self.subjects.iter().enumerate() {
             let h = subject.history;
+            let start = prefix.map_or(0, |p| p.subjects[subject_index].history.times.len());
             let mut risk = h.initially_at_risk.clone();
             let mut exposure = vec![0.0; d];
             let mut correction = vec![0.0; d];
             for n in 0..h.times.len() {
                 for mark in 0..d {
-                    if risk[mark] {
+                    if risk[mark] && n >= start {
                         let contribution = h.exposure[n] - correction[mark];
                         let next = exposure[mark] + contribution;
                         correction[mark] = (next - exposure[mark]) - contribution;
@@ -213,9 +264,11 @@ impl JointCohortIntegration<'_, '_> {
                     }
                 }
                 if let Some(mark) = h.events[n] {
-                    counts[mark] = counts[mark]
-                        .checked_add(1)
-                        .ok_or_else(|| numerical("constant-rate event count overflow"))?;
+                    if n >= start {
+                        counts[mark] = counts[mark]
+                            .checked_add(1)
+                            .ok_or_else(|| numerical("constant-rate event count overflow"))?;
+                    }
                     if self.model.spec.marks[mark] == MarkKind::Once {
                         risk[mark] = false;
                     }
@@ -224,11 +277,15 @@ impl JointCohortIntegration<'_, '_> {
             for mark in 0..d {
                 log_exposure[mark] = log_add(log_exposure[mark], exposure[mark].ln());
             }
-            let observed = subject
-                .analytic_observed_genetic_log_density()
-                .ok_or_else(|| {
-                    invalid("constant-rate inference requires analytic genetic integration")
-                })?;
+            let observed = if prefix.is_some() {
+                0.0
+            } else {
+                subject
+                    .analytic_observed_genetic_log_density()
+                    .ok_or_else(|| {
+                        invalid("constant-rate inference requires analytic genetic integration")
+                    })?
+            };
             let contribution = observed - genetic_correction;
             let next = genetic_density + contribution;
             genetic_correction = (next - genetic_density) - contribution;
@@ -260,7 +317,7 @@ impl JointCohortIntegration<'_, '_> {
             log_exposure,
             counts,
             genetic_density,
-        } = self.constant_rate_statistics(options.pilot.memory_limit_bytes)?;
+        } = self.constant_rate_statistics(options.pilot.memory_limit_bytes, None)?;
         if log_exposure.iter().all(|&x| x == f64::NEG_INFINITY) {
             return Err(numerical(
                 "baseline-level evidence is unidentified without risk exposure",
@@ -606,6 +663,19 @@ mod tests {
                     .unwrap();
                 assert_eq!(prediction.log_density(), f64::NEG_INFINITY);
                 assert_eq!(prediction.log_error_estimate(), 0.0);
+                let impossible = cohort
+                    .conditional_history_density(
+                        &result,
+                        &additional,
+                        &additional,
+                        &accuracy,
+                        &tolerance,
+                        &PredictiveDensityOptions::default(),
+                    )
+                    .err()
+                    .unwrap()
+                    .to_string();
+                assert!(impossible.contains("zero probability"), "{impossible}");
             } else {
                 assert!(!posterior.is_zero_rate());
                 assert!(posterior.iterations() > 0);
@@ -637,6 +707,58 @@ mod tests {
                         .all(|v| *v > 0.0)
                 );
                 assert_eq!(posterior.no_event_probability(&[0.0; 3]).unwrap(), 1.0);
+                // A new person has a once-only diagnosis at the cutoff.
+                // Its future risk vanishes; only the recurrent mark's Gamma
+                // rate remains, updated from rate 6 to 7 by the past exposure.
+                let full_history = history.clone();
+                let prefix_history = JointHistory {
+                    times: history.times[..3].to_vec(),
+                    exposure: history.exposure[..3].to_vec(),
+                    events: history.events[..3].to_vec(),
+                    baseline_design: history
+                        .baseline_design
+                        .slice(ndarray::s![..3, ..])
+                        .to_owned(),
+                    drive_design: history.drive_design.slice(ndarray::s![..2, ..]).to_owned(),
+                    ..history.clone()
+                };
+                let past_banks = [model
+                    .integration(
+                        &theta,
+                        &prefix_history,
+                        &[0.0; 9],
+                        None,
+                        &IntegrationOptions::default(),
+                        &mut rng,
+                    )
+                    .unwrap()];
+                let full_banks = [model
+                    .integration(
+                        &theta,
+                        &full_history,
+                        &[0.0; 15],
+                        None,
+                        &IntegrationOptions::default(),
+                        &mut rng,
+                    )
+                    .unwrap()];
+                let past_cohort = model
+                    .cohort_integration(&past_banks, &references, &[0])
+                    .unwrap();
+                let full_cohort = model
+                    .cohort_integration(&full_banks, &references, &[0])
+                    .unwrap();
+                let conditional = cohort
+                    .conditional_history_density(
+                        &result,
+                        &past_cohort,
+                        &full_cohort,
+                        &accuracy,
+                        &tolerance,
+                        &PredictiveDensityOptions::default(),
+                    )
+                    .unwrap();
+                assert!((conditional.log_density().exp() - 7.0 / 9.0).abs() < 1e-6);
             }
             assert!(posterior.no_event_probability(&[1.0]).is_err());
             assert!(posterior.no_event_probability(&[0.0, -1.0, 0.0]).is_err());

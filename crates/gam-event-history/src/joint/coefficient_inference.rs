@@ -725,7 +725,7 @@ mod tests {
         );
         let unresolved = PredictiveDensityOptions {
             log_error_tolerance: 1e-12,
-            ..predictive_options
+            ..predictive_options.clone()
         };
         assert!(
             cohort
@@ -735,6 +735,125 @@ mod tests {
                     &accuracy,
                     &tolerance,
                     &unresolved
+                )
+                .is_err()
+        );
+        let prefix_history = JointHistory {
+            times: new_history.times[..9].to_vec(),
+            exposure: new_history.exposure[..9].to_vec(),
+            events: new_history.events[..9].to_vec(),
+            baseline_design: new_history
+                .baseline_design
+                .slice(ndarray::s![..9, ..])
+                .to_owned(),
+            drive_design: new_history
+                .drive_design
+                .slice(ndarray::s![..8, ..])
+                .to_owned(),
+            ..new_history.clone()
+        };
+        let prefix_banks = [model
+            .integration(
+                &seed,
+                &prefix_history,
+                &[0.0; 9],
+                None,
+                &IntegrationOptions::default(),
+                &mut rng,
+            )
+            .unwrap()];
+        let prefix = model
+            .cohort_integration(&prefix_banks, &references, &[0])
+            .unwrap();
+        let conditional = cohort
+            .conditional_history_density(
+                &exact,
+                &prefix,
+                &additional,
+                &accuracy,
+                &tolerance,
+                &predictive_options,
+            )
+            .unwrap();
+        let expected = 8.0 * ((b + 2.0) / (b + 4.0)).ln();
+        assert!((conditional.log_density() - expected).abs() < 1e-12);
+        assert!(
+            (conditional.log_density().exp() - exact_rates.no_event_probability(&[2.0]).unwrap())
+                .abs()
+                > 0.05
+        );
+        let sampled_conditional = cohort
+            .conditional_history_density(
+                &sampled,
+                &prefix,
+                &additional,
+                &accuracy,
+                &tolerance,
+                &predictive_options,
+            )
+            .unwrap();
+        let sampled_expected = 8.0 * ((rate + 2.0) / (rate + 4.0)).ln();
+        assert!(
+            (sampled_conditional.log_density() - sampled_expected).abs()
+                < 5.0
+                    * sampled_conditional
+                        .coefficient_log_standard_error()
+                        .unwrap()
+        );
+        let unchanged = cohort
+            .conditional_history_density(
+                &sampled,
+                &prefix,
+                &prefix,
+                &accuracy,
+                &tolerance,
+                &predictive_options,
+            )
+            .unwrap();
+        assert_eq!(unchanged.log_density(), 0.0);
+        assert!(unchanged.coefficient_log_standard_error().is_none());
+        let event_prefix_history = JointHistory {
+            events: event_history.events[..9].to_vec(),
+            ..prefix_history.clone()
+        };
+        let event_prefix_banks = [model
+            .integration(
+                &seed,
+                &event_prefix_history,
+                &[0.0; 9],
+                None,
+                &IntegrationOptions::default(),
+                &mut rng,
+            )
+            .unwrap()];
+        let event_prefix = model
+            .cohort_integration(&event_prefix_banks, &references, &[0])
+            .unwrap();
+        let event_continuation = cohort
+            .conditional_history_density(
+                &exact,
+                &event_prefix,
+                &event_cohort,
+                &accuracy,
+                &tolerance,
+                &predictive_options,
+            )
+            .unwrap();
+        assert!(
+            (event_continuation.log_density()
+                - (9.0_f64.ln() - (b + 2.0).ln() - 10.0 * (2.0 / (b + 2.0)).ln_1p()))
+            .abs()
+                < 1e-12
+        );
+        assert!(
+            cohort
+                .conditional_history_density(
+                    &exact,
+                    &prefix,
+                    &event_cohort,
+                    &accuracy,
+                    &tolerance,
+                    &predictive_options
                 )
                 .is_err()
         );
