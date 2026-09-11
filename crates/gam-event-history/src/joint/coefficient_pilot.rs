@@ -91,20 +91,7 @@ impl JointCohortIntegration<'_, '_> {
         }
         let last_rejected = std::cell::RefCell::new(None);
         let needs_refinement = std::cell::RefCell::new(None);
-        #[cfg(test)]
-        let trace = (std::time::Instant::now(), std::cell::Cell::new(0_usize));
         let objective = opt::FusedObjective::new(|theta: &Array1<f64>| {
-            #[cfg(test)]
-            {
-                let count = trace.1.get() + 1;
-                trace.1.set(count);
-                if count.is_power_of_two() {
-                    eprintln!(
-                        "coefficient pilot evaluation {count}: elapsed {:?}",
-                        trace.0.elapsed()
-                    );
-                }
-            }
             let theta = theta.to_vec();
             let value = self
                 .score_with_function_priors(&theta, priors, log_strengths, accuracy)
