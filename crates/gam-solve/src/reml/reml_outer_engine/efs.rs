@@ -186,13 +186,6 @@ pub fn compute_efs_update(
     efs_penalty_like_steps(solution, rho, gradient)
 }
 
-/// Regularization threshold for pseudoinverse of the trace Gram matrix.
-///
-/// Eigenvalues below `PSI_GRAM_PINV_TOL * max_eigenvalue` are treated as
-/// zero when computing the pseudoinverse G⁺. This prevents amplification
-/// of noise in near-singular directions of the ψ-ψ Gram matrix.
-pub(crate) const PSI_GRAM_PINV_TOL: f64 = 1e-8;
-
 /// Initial step-size damping factor for the preconditioned gradient on ψ.
 ///
 /// The raw step `Δψ_raw = -G⁺ g_ψ` is scaled by α ∈ (0, 1] before
@@ -243,7 +236,8 @@ pub struct HybridEfsResult {
 ///   where:
 ///   - `g_ψ` is the REML/LAML gradient restricted to the ψ block
 ///   - `G_{de} = tr(H⁻¹ B_d H⁻¹ B_e)` is the trace Gram matrix for ψ-ψ pairs
-///   - `G⁺` is the Moore-Penrose pseudoinverse (truncated at `PSI_GRAM_PINV_TOL`)
+///   - `G⁺` is the Moore-Penrose pseudoinverse, truncated at the eigensolver's
+///     rounding band `n·ε·λ_max`
 ///   - `α ∈ (0, 1]` is the damping factor
 ///
 /// ## Why this works (reference: response.md Section 2)
@@ -267,9 +261,8 @@ pub struct HybridEfsResult {
 /// ## Step-size safeguarding
 ///
 /// 1. Compute G for the ψ-ψ block from H⁻¹ B_d products (already available).
-/// 2. Pseudoinverse: G⁺ via eigendecomposition, truncating eigenvalues below
-///    `PSI_GRAM_PINV_TOL * max_eigenvalue` to avoid noise amplification in
-///    near-singular directions.
+/// 2. Pseudoinverse: G⁺ via eigendecomposition, dropping the eigenvalues inside
+///    the eigensolver's rounding band `n·ε·λ_max`, which it cannot tell from zero.
 /// 3. Raw step: `Δψ_raw = -G⁺ g_ψ`.
 /// 4. Damping: `Δψ = α × Δψ_raw` with initial `α = PSI_INITIAL_ALPHA`.
 /// 5. Capping: `||Δψ||_∞ ≤ EFS_MAX_STEP` (same cap as ρ coordinates).
@@ -366,7 +359,9 @@ pub fn compute_hybrid_efs_update(
                     op.as_deref(),
                 )
             };
-            if gram.abs() >= PSI_GRAM_PINV_TOL.max(1e-30) {
+            // `G = tr(H⁻¹BH⁻¹B)` is a squared norm: any positive value is a metric
+            // for the step, which is clamped and line-searched like the rest.
+            if gram > 0.0 {
                 let global_idx = psi_global_indices[0];
                 let raw_step = -PSI_INITIAL_ALPHA * psi_gradient[0] / gram;
                 steps[global_idx] = raw_step.clamp(-EFS_MAX_STEP, EFS_MAX_STEP);
@@ -570,11 +565,10 @@ pub fn compute_hybrid_efs_update(
         // Step 2: Pseudoinverse G⁺ via eigendecomposition.
         //
         // For small n_psi (typically 2-10 anisotropic axes), this is cheap.
-        // We truncate eigenvalues below PSI_GRAM_PINV_TOL * λ_max to form
-        // the pseudoinverse, avoiding noise amplification in near-singular
-        // directions. This is the standard approach for constrained
-        // optimization on submanifolds (see response.md Section 4).
-        let delta_psi = pseudoinverse_times_vec(&gram, &psi_gradient, PSI_GRAM_PINV_TOL)?;
+        // Eigenvalues inside the eigensolver's rounding band are dropped: the
+        // decomposition cannot tell them from zero (see response.md Section 4
+        // for the submanifold view of the step).
+        let delta_psi = pseudoinverse_times_vec(&gram, &psi_gradient)?;
 
         // Step 3: Apply damping and capping.
         //
@@ -594,15 +588,17 @@ pub fn compute_hybrid_efs_update(
     })
 }
 
-/// Compute G⁺ v where G⁺ is the pseudoinverse of symmetric matrix G.
+/// Compute G⁺ v where G⁺ is the pseudoinverse of the positive semi-definite
+/// Gram matrix G.
 ///
-/// Uses eigendecomposition with truncation: eigenvalues below
-/// `tol * max_eigenvalue` are treated as zero. For small matrices
-/// (typical n_psi = 2-10), the O(n³) cost is negligible.
+/// Uses the eigendecomposition truncated at the eigensolver's rounding band: an
+/// eigenvalue at or below `n·ε·λ_max` (negative ones included, which a Gram
+/// matrix only produces by rounding) is indistinguishable from zero and
+/// contributes nothing. For small matrices (typical n_psi = 2-10), the O(n³)
+/// cost is negligible.
 pub(crate) fn pseudoinverse_times_vec(
     gram: &ndarray::Array2<f64>,
     v: &[f64],
-    tol: f64,
 ) -> Result<ndarray::Array1<f64>, String> {
     let n = gram.nrows();
     assert_eq!(n, v.len(), "pseudoinverse_times_vec dimension mismatch");
@@ -610,32 +606,20 @@ pub(crate) fn pseudoinverse_times_vec(
         return Ok(ndarray::Array1::zeros(0));
     }
 
-    // Special case: scalar (1x1).
+    // Special case: scalar (1x1). The entry is its own eigenvalue, and the band
+    // `ε·g` never reaches a positive `g`.
     if n == 1 {
         let g = gram[[0, 0]];
-        if g.abs() < tol.max(1e-30) {
+        if g <= 0.0 {
             return Ok(ndarray::Array1::zeros(1));
         }
         return Ok(ndarray::Array1::from_vec(vec![v[0] / g]));
     }
 
-    // Eigendecomposition of symmetric G via the faer crate would be ideal,
-    // but to keep this self-contained we use a simple symmetric
-    // eigendecomposition via Jacobi rotations for small matrices, or
-    // fall back to diagonal-only pseudoinverse for safety.
-    //
-    // For production quality, this should use faer's `SelfAdjointEigendecomposition`.
-    // Here we implement a robust fallback that works for typical n_psi = 2-10.
-
-    // Attempt: use ndarray's built-in symmetric eigendecomposition if available,
-    // otherwise fall back to a diagonal approximation.
-    //
-    // Robust implementation: compute G = Q Λ Q^T via iterative Jacobi.
-    // For n ≤ 10 this converges in a handful of sweeps.
     let (eigenvalues, eigenvectors) = symmetric_eigen(gram)?;
 
     let max_eval = eigenvalues.iter().cloned().fold(0.0_f64, f64::max);
-    let cutoff = tol * max_eval;
+    let cutoff = n as f64 * f64::EPSILON * max_eval;
 
     // G⁺ v = Q diag(1/λ_i for λ_i > cutoff, else 0) Q^T v
     let qt_v: Vec<f64> = (0..n)

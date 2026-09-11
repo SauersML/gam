@@ -749,5 +749,13 @@
     ],
     "reason": "#2469: CONTINUOUS_ORDER_EPS was a 1e-12 relative floor handed to compute_continuous_smoothness_order as eps and used against a scale max(|lambda|, 1) that mixes lambdas of different units. The limits are now exact zeros, the Matern boundary is the discriminant rounding band gamma_2*(lambda1^2 + 4*lambda0*lambda2), and nu is unset when R - 2 is inside gamma_3*R; the eps parameter is gone.",
     "evidence": "At the base, git grep finds CONTINUOUS_ORDER_EPS only in crates/gam-solve/src/estimate/smooth_term_summary.rs, and compute_continuous_smoothness_order is called only there and in estimate/continuous_order_tests.rs (estimate/mod.rs re-exports it); every call site is updated here."
+  },
+  {
+    "base": "23ad957e5f172c1e01543329d3af161bad8a9158",
+    "items": [
+      "crates/gam-solve/src/reml/reml_outer_engine/efs.rs:const:PSI_GRAM_PINV_TOL"
+    ],
+    "reason": "#2469: PSI_GRAM_PINV_TOL truncated the psi-psi trace Gram pseudo-inverse at 1e-8*lambda_max, and at an absolute 1e-8 on the one-psi path. The pseudo-inverse now keeps eigenpairs above the eigensolver band n*eps*lambda_max, and the one-psi path steps whenever the Gram is positive; steps stay clamped to EFS_MAX_STEP and line-searched by the caller.",
+    "evidence": "At the base, git grep finds PSI_GRAM_PINV_TOL only in crates/gam-solve/src/reml/reml_outer_engine/efs.rs, and pseudoinverse_times_vec is called only there and in reml_outer_engine/tests.rs; both files are edited here."
   }
 ]

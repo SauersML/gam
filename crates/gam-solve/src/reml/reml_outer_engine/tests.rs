@@ -6742,7 +6742,7 @@ pub(crate) fn test_symmetric_eigen_diagonal() {
 pub(crate) fn test_pseudoinverse_times_vec_identity() {
     let eye = Array2::<f64>::eye(3);
     let v = Array1::from_vec(vec![1.0, 2.0, 3.0]);
-    let result = pseudoinverse_times_vec(&eye, v.as_slice().expect("contiguous test vector"), 1e-8)
+    let result = pseudoinverse_times_vec(&eye, v.as_slice().expect("contiguous test vector"))
         .expect("pseudoinverse");
     for i in 0..3 {
         assert!((result[i] - v[i]).abs() < 1e-12, "G=I: G⁺v should equal v");
@@ -6758,7 +6758,7 @@ pub(crate) fn test_pseudoinverse_times_vec_singular() {
     g[[1, 0]] = 1.0;
     g[[1, 1]] = 1.0;
     let v = Array1::from_vec(vec![2.0, 0.0]);
-    let result = pseudoinverse_times_vec(&g, v.as_slice().expect("contiguous test vector"), 1e-8)
+    let result = pseudoinverse_times_vec(&g, v.as_slice().expect("contiguous test vector"))
         .expect("pseudoinverse");
     // G⁺ v = [0.25*2 + 0.25*0; 0.25*2 + 0.25*0] = [0.5; 0.5]
     assert!((result[0] - 0.5).abs() < 1e-10);
@@ -7078,7 +7078,7 @@ pub(crate) fn test_pseudoinverse_scalar() {
     let mut g = Array2::<f64>::zeros((1, 1));
     g[[0, 0]] = 4.0;
     let v = Array1::from_vec(vec![8.0]);
-    let result = pseudoinverse_times_vec(&g, v.as_slice().expect("contiguous test vector"), 1e-8)
+    let result = pseudoinverse_times_vec(&g, v.as_slice().expect("contiguous test vector"))
         .expect("pseudoinverse");
     assert!((result[0] - 2.0).abs() < 1e-12);
 }
