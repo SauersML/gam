@@ -5,13 +5,6 @@ use gam_problem::InverseLink;
 
 pub(crate) const FIRTH_DERIVATIVE_PARALLEL_MIN_N: usize = 16_384;
 
-/// Reciprocal-condition-number floor below which the reduced Fisher information
-/// `I_r` is flagged as near-singular (a diagnostic warning only, not a hard
-/// gate). At `λ_min/λ_max < 1e-10` the SPD assumption on the identifiable
-/// subspace is numerically fragile and the exact pseudodet derivatives may be
-/// ill-conditioned near active-subspace boundaries.
-pub(crate) const FIRTH_REDUCED_FISHER_RCOND_WARN: f64 = 1e-10;
-
 /// β-dependent reduced-space pieces of the Firth/Jeffreys operator at the
 /// current `η`, produced by `FirthDenseOperator::firth_reduced_core` from a
 /// cached β-independent [`FirthDesignFactor`]. The full operator build consumes
@@ -570,7 +563,7 @@ impl FirthDenseOperator {
         // Reduced Fisher I_r = X_rᵀ W X_r on the identifiable subspace.
         let fisher_reduced = gam_linalg::faer_ndarray::fast_xt_diag_x(&factor.x_reduced, &w);
         if let Ok((eigvals_ir, _)) = fisher_reduced.eigh(Side::Lower) {
-            let max_ev = eigvals_ir.iter().copied().fold(0.0_f64, f64::max).max(1.0);
+            let max_ev = eigvals_ir.iter().copied().fold(0.0_f64, f64::max);
             let min_ev = eigvals_ir
                 .iter()
                 .copied()
@@ -578,7 +571,9 @@ impl FirthDenseOperator {
                 .fold(f64::INFINITY, f64::min);
             if min_ev.is_finite() {
                 let rel = min_ev / max_ev;
-                if rel < FIRTH_REDUCED_FISHER_RCOND_WARN {
+                // The eigensolver resolves eigenvalues to `r·ε·λ_max`; a smallest one
+                // inside that band leaves I_r singular to working precision.
+                if rel <= eigvals_ir.len() as f64 * f64::EPSILON {
                     log::warn!(
                         "[REML/Firth] reduced Fisher I_r is near-singular (min/max={:.3e}/{:.3e}, rel={:.3e}); exact derivatives may be ill-conditioned near active-subspace boundaries.",
                         min_ev,

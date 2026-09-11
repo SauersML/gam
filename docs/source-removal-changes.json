@@ -843,5 +843,15 @@
     ],
     "reason": "#2469: MULTINOMIAL_SIMPLEX_TOL (1e-9) is the row-sum rounding band gamma_K*sum_c y_c; EMPIRICAL_GRID_WEIGHT_EXHAUSTED_REL_TOL (1e-14) is the rounding band of the grid-compression subtractions; BMS_VARIANCE_FLOOR (1e-12 on an sd or a variance) is the weighted-mean spread band gamma_{n+1}*max|z|, or exact positivity for a supplied normalization.",
     "evidence": "At the base, git grep finds MULTINOMIAL_SIMPLEX_TOL only in crates/gam-models/src/vector_response.rs, and BMS_VARIANCE_FLOOR and EMPIRICAL_GRID_WEIGHT_EXHAUSTED_REL_TOL only in crates/gam-models/src/bms/mod.rs, bms/empirical_measure_sensitivity.rs and bms/gradient_paths.rs; every use is replaced here."
+  },
+  {
+    "base": "8ea7e1085013dea183f4096ff8d819570e5b3114",
+    "items": [
+      "crates/gam-models/src/survival/location_scale/time_block.rs:const:FEASIBILITY_TOL",
+      "crates/gam-models/src/survival/location_scale/time_block.rs:const:VALUE_VARIATION_TOL",
+      "crates/gam-solve/src/reml/firth.rs:const:FIRTH_REDUCED_FISHER_RCOND_WARN"
+    ],
+    "reason": "#2469: FEASIBILITY_TOL (1e-12) is the rounding band of the guard/offset subtraction; VALUE_VARIATION_TOL (1e-12) is the partition-of-unity rounding band gamma_p*max|value|; FIRTH_REDUCED_FISHER_RCOND_WARN (1e-10 against max(lambda_max, 1)) is the eigensolver band r*eps.",
+    "evidence": "FEASIBILITY_TOL and VALUE_VARIATION_TOL were function-local in crates/gam-models/src/survival/location_scale/time_block.rs, and at the base git grep finds FIRTH_REDUCED_FISHER_RCOND_WARN only in crates/gam-solve/src/reml/firth.rs; both files are edited here."
   }
 ]

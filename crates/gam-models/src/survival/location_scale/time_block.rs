@@ -277,7 +277,6 @@ pub(crate) fn structural_time_coefficient_lower_bounds(
     }
 
     const DERIVATIVE_TOL: f64 = 1e-12;
-    const FEASIBILITY_TOL: f64 = 1e-12;
     // A time column is a monotone I-spline SHAPE column — bounded `β ≥ 0`, the
     // exact domain-wide monotonicity certificate — iff it either VARIES IN VALUE
     // across the observed entry∪exit domain OR has POSITIVE DERIVATIVE SUPPORT at
@@ -297,7 +296,6 @@ pub(crate) fn structural_time_coefficient_lower_bounds(
     // active) is still correctly bound. The two clauses are a strict SUPERSET of
     // the old derivative-only rule, so no already-bound column ever loses its
     // constraint.
-    const VALUE_VARIATION_TOL: f64 = 1e-12;
     // Diagnostics only: nonzero entries at or below the derivative-activity
     // tolerance above are reported as "sub-tolerance nonzeros" to explain a
     // missing structural lower bound. An exact zero is a hard zero, not round-off.
@@ -310,7 +308,11 @@ pub(crate) fn structural_time_coefficient_lower_bounds(
                 "structural time coefficient bounds require finite derivative offsets; found offset[{row}]={offset}"
             ) }.into());
         }
-        if lower_bound - offset > FEASIBILITY_TOL {
+        // A shortfall inside the rounding band `γ₂·(|guard| + |offset|)` of the
+        // subtraction that compares them still encodes the guard.
+        if lower_bound - offset
+            > gam_linalg::roundoff::accumulation_band(2, lower_bound.abs() + offset.abs())
+        {
             return Err(SurvivalLocationScaleError::ConstraintViolation { reason: format!(
                 "structural time coefficient bounds require derivative offsets to encode the derivative guard at row {row}: offset={offset:.3e} < guard={lower_bound:.3e}"
             ) }.into());
@@ -391,7 +393,10 @@ pub(crate) fn structural_time_coefficient_lower_bounds(
             vmin = vmin.min(value);
             vmax = vmax.max(value);
         }
-        let value_varies = (vmax - vmin) > VALUE_VARIATION_TOL;
+        // Each value is a sum over the `p` partition-of-unity basis functions; a spread
+        // inside that sum's rounding band `γ_p·max|value|` is arithmetic, not variation.
+        let value_varies =
+            (vmax - vmin) > gam_linalg::roundoff::accumulation_growth(p) * vmin.abs().max(vmax.abs());
         if value_varies || has_positive_support {
             lower_bounds[col] = 0.0;
             has_shape_column = true;
