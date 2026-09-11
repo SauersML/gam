@@ -3116,7 +3116,12 @@ mod tests {
         let x_derivative = array![[0.0, 1.0]];
         let penalties = PenaltyBlocks::new(Vec::new());
         let monotonicity = SurvivalMonotonicityPenalty { tolerance: 3.0 };
-        let mode = array![0.0, 0.0];
+        // The whitened origin is the mode. The event row's hazard density
+        // carries `log s` with `s = x_derivative · β = β[1]`, so a mode at
+        // `β[1] = 0` puts the origin on the density's `−∞` boundary: that is the
+        // exact value, not a representational failure. An interior mode keeps
+        // the structural derivative strictly positive.
+        let mode = array![0.0, 0.5];
         let hessian = Array2::<f64>::eye(2);
 
         let posterior = super::survival_hmc::SurvivalPosterior::new(
