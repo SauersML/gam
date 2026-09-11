@@ -9119,32 +9119,36 @@ pub fn dense_fisher_gaussian_fit(
 /// sign of the last rounding.
 ///
 /// Positive control, MEASURED rather than argued: with the bar reverted to the
-/// bare `residual > 0.0` and nothing else changed, two of these three tests go
-/// red, and the failure names the two designs the issue measured as wrongly
-/// accepted —
+/// bare `residual > 0.0` and nothing else changed, the refusal tests go red and
+/// name the design the issue measured as wrongly accepted —
 ///
 /// ```text
 ///   A irrational basis, constant response:      residual 1.776357e-15,
 ///                                               ywy 5.880000e0,   resolution 4.177991e-13
-///   B integer basis, penalized mass present:    residual 3.743049e-13,
-///                                               ywy 1.650000e2,   resolution 9.379164e-12
 /// ```
 ///
 /// while `a_genuine_residual_is_accepted_at_every_scale` stays green, so the
 /// reverted bar fails for the reason under test rather than by refusing (or
-/// accepting) everything. Both accepted residuals sit two to four orders BELOW
-/// their own resolution — the old predicate was reading debris, and the margin
-/// by which it was doing so is what these numbers record.
+/// accepting) everything. The accepted residual sits two orders BELOW its own
+/// resolution — the old predicate was reading debris.
+///
+/// A response that interpolates exactly but carries mass on a PENALIZED
+/// direction is a different case, and it is not a perfect fit of the profile:
+/// at the domain's lower edge `ρ_min = ln √ε − ln δ_max` the penalized residual
+/// `Σ c²·u(ρ_min)` is `c²·√ε/(1+√ε)`, a genuine positive deviance of the
+/// penalized fit. It was once measured at `3.743049e-13` only because the
+/// search box then extended far below the resolvable domain; on the derived
+/// domain it is `5.960464e-7` for `y = X·[1, 2]`, and the bar accepts it.
 #[cfg(test)]
 mod perfect_fit_refusal_tests {
     use super::*;
     use ndarray::array;
 
-    /// Build the four designs of #2723. Every one of them has a residual that is
-    /// EXACTLY zero: each response lies exactly in its design's column span.
-    /// They differ only in how the floating-point debris of `ywy − Σc²` lands
-    /// and in whether any penalized direction carries mass — the two accidents
-    /// the old `residual > 0.0` bar was actually reading.
+    /// Build the three zero-profile-residual designs of #2723. Every response
+    /// lies exactly in its design's column span with no mass on a penalized
+    /// direction, so the profiled deviance is EXACTLY zero at every `ρ`. They
+    /// differ only in how the floating-point debris of `ywy − Σc²` lands — the
+    /// accident the old `residual > 0.0` bar was actually reading.
     fn zero_residual_designs() -> Vec<(&'static str, Array2<f64>, Array2<f64>, Array2<f64>)> {
         // A: constant response on an irrational (periodic-harmonic) basis. The
         // cancellation is INEXACT and landed POSITIVE (+1.776e-15), which is the
@@ -9161,14 +9165,6 @@ mod perfect_fit_refusal_tests {
         let a_y = Array2::<f64>::from_elem((n, 1), 0.7);
         let a_penalty = array![[0.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
 
-        // B: `y = X·[1, 2]` in integers, with mass on the penalized direction.
-        // The cancellation landed negative and was clamped to `0`, but
-        // `Σc²·u(lower)` is strictly positive for ANY design carrying
-        // penalized mass — the generic case — so the old bar accepted it too.
-        let b_x = array![[1.0, 0.0], [1.0, 1.0], [1.0, 2.0], [1.0, 3.0], [1.0, 4.0]];
-        let b_y = array![[1.0], [3.0], [5.0], [7.0], [9.0]];
-        let b_penalty = array![[0.0, 0.0], [0.0, 1.0]];
-
         // C: constant response on an exact integer basis, all mass in `null(S)`.
         // Statistically identical to A; the old bar refused it purely because the
         // integer basis put the debris on the other side and left `Σc²·u = 0`.
@@ -9183,18 +9179,68 @@ mod perfect_fit_refusal_tests {
 
         vec![
             ("A irrational basis, constant response", a_x, a_y, a_penalty),
-            (
-                "B integer basis, penalized mass present",
-                b_x,
-                b_y,
-                b_penalty,
-            ),
             ("C integer basis, all mass in null(S)", c_x, c_y, c_penalty),
             ("D identically zero response", d_x, d_y, d_penalty),
         ]
     }
 
-    /// All four zero-residual designs must reach the SAME verdict, and that
+    /// An exactly interpolated response with mass on the penalized direction
+    /// (`y = X·[1, 2]`) is NOT a zero profile residual: at the domain's lower
+    /// edge the penalized fit shrinks the slope, and `Σ c²·u(ρ_min)` is a
+    /// genuine positive deviance. The bar must accept it, at every response
+    /// scale, and the accepted amount must be the penalized part rather than
+    /// cancellation debris in `ywy − Σc²`.
+    #[test]
+    fn a_penalized_residual_at_the_domain_edge_is_accepted_at_every_scale_2723() {
+        let x = array![[1.0, 0.0], [1.0, 1.0], [1.0, 2.0], [1.0, 3.0], [1.0, 4.0]];
+        let base_y = array![[1.0], [3.0], [5.0], [7.0], [9.0]];
+        let penalty = array![[0.0, 0.0], [0.0, 1.0]];
+
+        for scale in [1.0e-8, 1.0, 1.0e8] {
+            let y = base_y.mapv(|value| value * scale);
+            let prepared =
+                prepare_gaussian_reml(x.view(), y.view(), penalty.view(), None, None, None)
+                    .unwrap_or_else(|error| panic!("scale {scale:e}: preparation failed: {error}"));
+            let rho_min = prepared.cache.resolvability_rho_domain().0;
+            let DispersionResidualParts {
+                unpenalized_residual,
+                penalized_residual,
+                ..
+            } = dispersion_residual_parts(
+                &prepared.cache,
+                prepared.ywy.view(),
+                prepared.projected_rhs_squared.view(),
+                0,
+                rho_min,
+            );
+            let ywy = prepared.ywy[0];
+            let resolution = profile_residual_resolution(&prepared.cache, ywy);
+            assert!(
+                unpenalized_residual <= resolution,
+                "scale {scale:e}: the unpenalized residual {unpenalized_residual:.6e} must be \
+                 cancellation debris (resolution {resolution:.6e}); the response interpolates"
+            );
+            assert!(
+                penalized_residual > resolution,
+                "scale {scale:e}: the penalized residual {penalized_residual:.6e} at rho_min \
+                 {rho_min:.6e} must be resolvably positive (resolution {resolution:.6e})"
+            );
+            let verdict = validate_reml_profile_residuals(
+                &prepared.cache,
+                prepared.ywy.view(),
+                prepared.projected_rhs_squared.view(),
+                rho_min,
+            );
+            assert!(
+                verdict.is_ok(),
+                "scale {scale:e}: a genuine penalized residual {penalized_residual:.6e} (ywy \
+                 {ywy:.6e}) was refused: {:?}",
+                verdict.err()
+            );
+        }
+    }
+
+    /// All three zero-residual designs must reach the SAME verdict, and that
     /// verdict must be refusal: a profiled Gaussian likelihood has no finite
     /// scale for an exactly-interpolated response, so every candidate ties at
     /// `−∞` and abstention is the only defensible outcome.
@@ -9256,7 +9302,7 @@ mod perfect_fit_refusal_tests {
             .collect();
         assert!(
             failures.is_empty(),
-            "#2723: the four exactly-zero-residual designs did not agree on refusal. \
+            "#2723: the three exactly-zero-residual designs did not agree on refusal. \
              Accepted: {accepted:?}. Details:\n  - {}",
             failures.join("\n  - ")
         );
