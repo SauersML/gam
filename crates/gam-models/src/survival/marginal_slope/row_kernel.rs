@@ -312,26 +312,6 @@ impl<const K: usize, const LIN: u32> SparseTower4<K, LIN> {
         }
     }
 
-    /// Contract `t4` with two primary-space directions —
-    /// `out[a][b] = Σ_{c,d} t4[a][b][c][d]·u[c]·w[d]` — in the EXACT accumulation
-    /// order of [`gam_math::jet_tower::Tower4::fourth_contracted`] (k outer, l
-    /// inner), so the second-directional consumer is bit-identical.
-    #[inline]
-    pub(crate) fn fourth_contracted(&self, u: &[f64; K], w: &[f64; K]) -> [[f64; K]; K] {
-        let mut out = [[0.0; K]; K];
-        for i in 0..K {
-            for j in 0..K {
-                let mut acc = 0.0;
-                for k in 0..K {
-                    for l in 0..K {
-                        acc += self.t4[i][j][k][l] * u[k] * w[l];
-                    }
-                }
-                out[i][j] = acc;
-            }
-        }
-        out
-    }
 }
 
 impl<const K: usize, const LIN: u32> JetScalar<K> for SparseTower4<K, LIN> {
