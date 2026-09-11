@@ -800,6 +800,14 @@ pub struct SaeManifoldTerm {
     /// per call means two probes of the same rho can be priced by two different
     /// operators depending on what else the box was doing between them.
     ///
+    /// The figure carried is the process's stationary memory CAPACITY (host total
+    /// clamped by the cgroup hard limit), not its free memory. Free memory is what
+    /// the rest of the job cgroup happens to leave, so a cgroup near its limit can
+    /// report almost none (the governor measured 53,248 bytes with 448 GB free on
+    /// the host) and every plan, however small, is refused at a zero budget. The
+    /// process ledger moved to capacity for that reason (#2684, #2702), and SPEC-20
+    /// forbids a verdict that depends on neighbours.
+    ///
     /// Held as a plain value, not an `Option` with a live-sampling fallback: an
     /// `Option` would make "which environment did this plan see" depend on
     /// whether some caller remembered to freeze it, which is the same

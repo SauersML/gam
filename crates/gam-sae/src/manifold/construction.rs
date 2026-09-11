@@ -861,7 +861,7 @@ impl SaeManifoldTerm {
             // #2532 — sample the environment ONCE, here, and carry it. See the
             // field docs: the plan's route selects which operator the criterion
             // prices, so it must not move under a fit because the box got busy.
-            host_available_bytes: sae_process_available_memory_bytes(),
+            host_available_bytes: sae_process_memory_capacity_bytes(),
             chart_atlases: Vec::new(),
             temperature_schedule: None,
             last_row_layout: None,

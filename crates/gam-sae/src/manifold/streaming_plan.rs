@@ -306,7 +306,7 @@ pub fn sae_streaming_plan_for_shape(
         d_max,
         border_dim,
         gpu_policy,
-        sae_process_available_memory_bytes(),
+        sae_process_memory_capacity_bytes(),
     )
 }
 
@@ -636,8 +636,18 @@ pub(crate) fn sae_topk_curved_budget_from_budget(
 /// let the *value* move under a fit: the row-jet tile geometry and the GMRES
 /// restart length are both sized from it, so two runs of one fit could take
 /// different Krylov paths because another tenant allocated in between.
-pub(crate) fn sae_process_available_memory_bytes() -> usize {
-    gam_runtime::resource::process_available_memory_bytes()
+///
+/// The figure is the observation's stationary CAPACITY (host total clamped by the
+/// binding cgroup hard limit, zero when the probe failed closed), not its free
+/// memory. Free memory is whatever the rest of the job cgroup leaves at the instant
+/// of the one observation, so a cgroup near its limit reports almost none and every
+/// SAE plan, however small, is refused at a zero budget. The process ledger and
+/// materialization cap moved to capacity for exactly that reason (#2684, #2702);
+/// the SAE budget keeps its own reserve and fraction on top of it (see
+/// [`sae_host_in_core_budget_from_available`]).
+pub(crate) fn sae_process_memory_capacity_bytes() -> usize {
+    let capacity = gam_runtime::resource::process_memory_availability().capacity_bytes();
+    usize::try_from(capacity).unwrap_or(usize::MAX)
 }
 
 /// Pure in-core budget rule, factored out of [`sae_host_in_core_budget_bytes`]
@@ -674,7 +684,7 @@ pub(crate) const fn sae_host_in_core_budget_from_available(available: usize) -> 
 }
 
 pub(crate) fn sae_host_in_core_budget_bytes() -> (usize, usize) {
-    let available = sae_process_available_memory_bytes();
+    let available = sae_process_memory_capacity_bytes();
     (sae_host_in_core_budget_from_available(available), available)
 }
 
@@ -739,7 +749,7 @@ mod cpu_sized_plan_laziness_tests {
         // the test fails for a reason that has nothing to do with the property
         // it is trying to pin. #2532's explicit-reading entry point is what lets
         // it ask the question without the race.
-        let available = sae_process_available_memory_bytes();
+        let available = sae_process_memory_capacity_bytes();
         let plan = sae_streaming_plan_for_shape_with_available(
             700,
             60,
