@@ -1615,11 +1615,37 @@ pub fn coordinate_partition_frames(n_blocks: usize, b: usize, p: usize) -> Array
     decoder
 }
 
-/// Seed `G` block frames from centred observations in `O(N·P + G·b·P)` work.
+/// Deflate `values` against an orthonormal `basis` with two passes of modified
+/// Gram--Schmidt, removing the in-span component to input precision.
+fn deflate_two_pass(values: &mut [f64], basis: &[Vec<f64>]) {
+    for _ in 0..2 {
+        for direction in basis {
+            let projection: f64 = values
+                .iter()
+                .zip(direction.iter())
+                .map(|(left, right)| left * right)
+                .sum();
+            for (value, component) in values.iter_mut().zip(direction.iter()) {
+                *value -= projection * component;
+            }
+        }
+    }
+}
+
+/// Seed `G` block frames from centred observations without a corpus-wide search.
 ///
-/// Axis `a` uses row `floor(a·N/K)`, spreading the dictionary over the corpus
-/// without a search or a caller-supplied random seed. Thus all selected rows
-/// are distinct whenever `K <= N`.
+/// Atom `a` draws its row from its own stride window `[floor(a·N/K), floor((a+1)·N/K))`,
+/// so all selected rows are distinct whenever `K <= N` and no caller-supplied random
+/// seed is needed. Inside the window the row is chosen the way `seed_frames` chooses rows,
+/// restricted to the window: a block's first axis takes the row adding the most energy
+/// beyond every direction already seeded, and each later axis weights that novelty by the
+/// row's affinity to the block's partial frame. A bare stride aliases with periodic row
+/// structure: rows cycling through `G` subspaces put every frame on one of them (#2822).
+/// When no row in the window adds rank, or the seeded span already has rank `P`, the
+/// stride row is used, so an overcomplete dictionary still places every block on the
+/// observed cloud. Work is `O(N·P·r)` for seeded span rank `r <= min(K, P)`, with `O(P·r)`
+/// scratch beyond the decoder.
+///
 /// Modified Gram--Schmidt makes each block a Stiefel frame.  If the selected
 /// observations do not span `b` directions, only that block falls back to the
 /// always-valid coordinate frame; degenerate data therefore cannot manufacture
@@ -1638,47 +1664,86 @@ pub(super) fn data_row_frames(x: ArrayView2<'_, f32>, n_blocks: usize, b: usize)
     for mean in &mut means {
         *mean /= n as f64;
     }
+    let centred_row = |row: usize| -> Vec<f64> {
+        x.row(row)
+            .iter()
+            .zip(means.iter())
+            .map(|(&value, &mean)| value as f64 - mean)
+            .collect()
+    };
+    let energy = |values: &[f64]| values.iter().map(|value| value * value).sum::<f64>();
+    let resolution = f32::EPSILON as f64 * (p.max(1) as f64).sqrt();
+    // Orthonormal span of every direction seeded by completed blocks (at most `P`).
+    let mut seeded_span: Vec<Vec<f64>> = Vec::with_capacity(k.min(p));
 
     for block in 0..n_blocks {
         let mut axes: Vec<Vec<f64>> = Vec::with_capacity(b);
+        // The part of each accepted axis beyond `seeded_span`, orthonormalized.
+        let mut block_span: Vec<Vec<f64>> = Vec::with_capacity(b);
         for axis in 0..b {
             let atom = block * b + axis;
-            let row_index = ((atom as u128 * n as u128) / k as u128) as usize;
-            let mut candidate: Vec<f64> = x
-                .row(row_index)
-                .iter()
-                .zip(means.iter())
-                .map(|(&value, &mean)| value as f64 - mean)
-                .collect();
-            let input_norm = candidate
-                .iter()
-                .map(|value| value * value)
-                .sum::<f64>()
-                .sqrt();
-            for _ in 0..2 {
-                for prior in &axes {
-                    let projection: f64 = candidate
-                        .iter()
-                        .zip(prior.iter())
-                        .map(|(left, right)| left * right)
-                        .sum();
-                    for (value, direction) in candidate.iter_mut().zip(prior.iter()) {
-                        *value -= projection * direction;
+            let stride_row = ((atom as u128 * n as u128) / k as u128) as usize;
+            let window_end = (((atom as u128 + 1) * n as u128) / k as u128) as usize;
+            let mut row_index = stride_row;
+            if seeded_span.len() + block_span.len() < p {
+                let mut best_score = 0.0_f64;
+                for row in stride_row..window_end.clamp(stride_row + 1, n) {
+                    let centred = centred_row(row);
+                    let input_energy = energy(&centred);
+                    let mut novel = centred.clone();
+                    deflate_two_pass(&mut novel, &seeded_span);
+                    deflate_two_pass(&mut novel, &block_span);
+                    let novel_energy = energy(&novel);
+                    if !(novel_energy.is_finite()
+                        && novel_energy.sqrt() > resolution * input_energy.sqrt())
+                    {
+                        continue;
+                    }
+                    let affinity: f64 = if axes.is_empty() {
+                        1.0
+                    } else {
+                        axes.iter()
+                            .map(|direction| {
+                                let projection: f64 = centred
+                                    .iter()
+                                    .zip(direction.iter())
+                                    .map(|(left, right)| left * right)
+                                    .sum();
+                                projection * projection
+                            })
+                            .sum()
+                    };
+                    let score = affinity * novel_energy;
+                    if score > best_score {
+                        best_score = score;
+                        row_index = row;
                     }
                 }
             }
-            let norm = candidate
-                .iter()
-                .map(|value| value * value)
-                .sum::<f64>()
-                .sqrt();
-            let roundoff = f32::EPSILON as f64 * (p.max(1) as f64).sqrt() * input_norm;
+            let mut candidate: Vec<f64> = centred_row(row_index);
+            let input_norm = energy(&candidate).sqrt();
+            deflate_two_pass(&mut candidate, &axes);
+            let norm = energy(&candidate).sqrt();
+            let roundoff = resolution * input_norm;
             if !norm.is_finite() || norm <= roundoff {
                 axes.clear();
+                block_span.clear();
                 break;
             }
             for value in &mut candidate {
                 *value /= norm;
+            }
+            if seeded_span.len() + block_span.len() < p {
+                let mut novel = candidate.clone();
+                deflate_two_pass(&mut novel, &seeded_span);
+                deflate_two_pass(&mut novel, &block_span);
+                let novel_norm = energy(&novel).sqrt();
+                if novel_norm.is_finite() && novel_norm > resolution {
+                    for value in &mut novel {
+                        *value /= novel_norm;
+                    }
+                    block_span.push(novel);
+                }
             }
             axes.push(candidate);
         }
@@ -1688,6 +1753,7 @@ pub(super) fn data_row_frames(x: ArrayView2<'_, f32>, n_blocks: usize, b: usize)
                     decoder[[block * b + axis, column]] = value as f32;
                 }
             }
+            seeded_span.extend(block_span);
         }
     }
     decoder
