@@ -5940,12 +5940,41 @@ pub fn build_tensor_bspline_basis(
         // mismatch. Keep marginal builders unconstrained at this stage.
         let mut marginal_unconstrained = marginalspec.clone();
         marginal_unconstrained.identifiability = BSplineIdentifiability::None;
+        // A declared tensor period realizes this margin as a cyclic B-spline on
+        // `[start, start + period)`, the way the formula builder's `period=`
+        // does, so the fit-time design is the wrap-around basis the freeze
+        // restores at predict time. A margin that is already periodic keeps its
+        // own geometry; a declared period needs a generated range to anchor on.
+        let declared_period = spec.periods.get(dim).and_then(|period| *period);
+        if let Some(period) = declared_period
+            && !matches!(marginalspec.knotspec, BSplineKnotSpec::PeriodicUniform { .. })
+            && marginal_unconstrained.boundary.period().is_none()
+        {
+            let BSplineKnotSpec::Generate { data_range, .. } = marginalspec.knotspec else {
+                crate::bail_invalid_basis!(
+                    "TensorBSpline margin {dim} declares period {period} but its knot \
+                     specification has no generated range to anchor the period on; use a \
+                     PeriodicUniform marginal knotspec"
+                );
+            };
+            if !(period.is_finite() && period > 0.0) {
+                crate::bail_invalid_basis!(
+                    "TensorBSpline margin {dim} period must be positive and finite, got {period}"
+                );
+            }
+            marginal_unconstrained.boundary = crate::basis::OneDimensionalBoundary::Cyclic {
+                start: data_range.0,
+                end: data_range.0 + period,
+            };
+        }
         let built = build_bspline_basis_1d(data.column(col), &marginal_unconstrained)?;
         // A cr (`NaturalCubicRegression`) margin emits `CubicRegression1D`
         // metadata whose `knots` are the k value-knots; a B-spline margin emits
         // `BSpline1D` with the clamped knot vector. Capture either so the
         // tensor freeze can rebuild the exact same marginal knotspec (#1074).
-        let (knots, marginal_is_cr, effective_degree, function_gram) = match built.metadata {
+        let (knots, marginal_is_cr, effective_degree, function_gram, marginal_periodic) = match built
+            .metadata
+        {
             BasisMetadata::BSpline1D {
                 knots,
                 periodic,
@@ -5968,14 +5997,14 @@ pub fn build_tensor_bspline_basis(
                 } else {
                     None
                 };
-                (knots, false, effective_degree, gram)
+                (knots, false, effective_degree, gram, periodic)
             }
             BasisMetadata::CubicRegression1D { knots, .. } => {
                 let gram = spec
                     .double_penalty
                     .then(|| crate::basis::cubic_regression_function_gram(&knots))
                     .transpose()?;
-                (knots, true, marginalspec.degree, gram)
+                (knots, true, marginalspec.degree, gram, None)
             }
             _ => {
                 crate::bail_invalid_basis!(
@@ -5983,11 +6012,20 @@ pub fn build_tensor_bspline_basis(
                 );
             }
         };
-        let metadata_knots = match marginalspec.knotspec {
-            BSplineKnotSpec::PeriodicUniform {
-                data_range,
-                num_basis,
-            } => Array1::linspace(data_range.0, data_range.1, num_basis),
+        let metadata_knots = match (&marginalspec.knotspec, marginal_periodic) {
+            (
+                BSplineKnotSpec::PeriodicUniform {
+                    data_range,
+                    num_basis,
+                },
+                _,
+            ) => Array1::linspace(data_range.0, data_range.1, *num_basis),
+            // A margin made periodic by its declared period records the same
+            // periodic control-site geometry, so the freeze rebuilds it as the
+            // `PeriodicUniform` margin it was fitted as.
+            (_, Some((start, period, num_basis))) if declared_period.is_some() => {
+                Array1::linspace(start, start + period, num_basis)
+            }
             _ => knots,
         };
         if let Some(function_gram) = function_gram {
@@ -6014,8 +6052,8 @@ pub fn build_tensor_bspline_basis(
                 let inner: &SparseColMat<usize, f64> = sd;
                 Some(inner.clone())
             }
-            None => match marginalspec.knotspec {
-                BSplineKnotSpec::PeriodicUniform { .. } => {
+            None => match (&marginalspec.knotspec, marginal_periodic) {
+                (BSplineKnotSpec::PeriodicUniform { .. }, _) | (_, Some(_)) => {
                     Some(dense_local_margin_to_sparse(&dense_marginal)?)
                 }
                 _ => None,
