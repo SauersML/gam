@@ -30,6 +30,28 @@ impl Default for StrengthOptimizationOptions {
     }
 }
 
+impl StrengthOptimizationOptions {
+    pub(super) fn validate(&self) -> Result<(), EventHistoryError> {
+        if [
+            self.stationarity_tolerance,
+            self.log_evidence_tolerance,
+            self.relative_resolution_tolerance,
+            self.standard_error_multiplier,
+            self.minimum_effective_samples,
+        ]
+        .iter()
+        .any(|v| !v.is_finite() || *v <= 0.0)
+            || self.relative_resolution_tolerance >= 1.0
+            || self.maximum_iterations == 0
+        {
+            return Err(invalid(
+                "strength optimization requires positive finite tolerances, relative resolution below one, and a positive iteration limit",
+            ));
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct StrengthResolutionReport {
     pub gradient_infinity_norm: f64,
@@ -40,6 +62,31 @@ pub struct StrengthResolutionReport {
     pub validation_log_evidence: f64,
     pub validation_effective_samples: f64,
     pub iterations: usize,
+}
+
+impl StrengthResolutionReport {
+    pub(super) fn resolved(
+        &self,
+        fitted: &JointCoefficientEvidence,
+        options: &StrengthOptimizationOptions,
+    ) -> bool {
+        [
+            self.gradient_infinity_norm,
+            self.log_evidence_error_estimate,
+            self.whitened_score_error_estimate,
+            self.whitened_curvature_error_estimate,
+            self.maximum_standardized_mean_error,
+        ]
+        .iter()
+        .all(|v| v.is_finite())
+            && self.gradient_infinity_norm <= options.stationarity_tolerance
+            && self.log_evidence_error_estimate <= options.log_evidence_tolerance
+            && self.whitened_score_error_estimate <= options.relative_resolution_tolerance
+            && self.whitened_curvature_error_estimate <= options.relative_resolution_tolerance
+            && self.maximum_standardized_mean_error <= options.relative_resolution_tolerance
+            && fitted.effective_samples >= options.minimum_effective_samples
+            && self.validation_effective_samples >= options.minimum_effective_samples
+    }
 }
 
 /// A converged, numerically assessed INTERIOR strength optimum of a sampled
@@ -139,7 +186,7 @@ fn whitened_error(value: &JointCoefficientEvidence, inverse: &Array2<f64>) -> Wh
     }
 }
 
-fn assess(
+pub(super) fn assessment(
     fitted: &JointCoefficientEvidence,
     validation: &JointCoefficientEvidence,
     options: &StrengthOptimizationOptions,
@@ -223,22 +270,17 @@ fn assess(
         validation_effective_samples: validation.effective_samples,
         iterations,
     };
-    if [
-        report.log_evidence_error_estimate,
-        report.whitened_score_error_estimate,
-        report.whitened_curvature_error_estimate,
-        maximum_mean_error,
-    ]
-    .iter()
-    .any(|v| !v.is_finite())
-        || report.gradient_infinity_norm > options.stationarity_tolerance
-        || report.log_evidence_error_estimate > options.log_evidence_tolerance
-        || report.whitened_score_error_estimate > options.relative_resolution_tolerance
-        || report.whitened_curvature_error_estimate > options.relative_resolution_tolerance
-        || maximum_mean_error > options.relative_resolution_tolerance
-        || fitted.effective_samples < options.minimum_effective_samples
-        || validation.effective_samples < options.minimum_effective_samples
-    {
+    Ok(report)
+}
+
+fn assess(
+    fitted: &JointCoefficientEvidence,
+    validation: &JointCoefficientEvidence,
+    options: &StrengthOptimizationOptions,
+    iterations: usize,
+) -> Result<StrengthResolutionReport, EventHistoryError> {
+    let report = assessment(fitted, validation, options, iterations)?;
+    if !report.resolved(fitted, options) {
         return Err(numerical(format!(
             "strength integral unresolved: {report:?}"
         )));
@@ -274,22 +316,7 @@ impl<'p, 'm> JointCoefficientIntegral<'p, 'm> {
                 "strength optimization requires finite seeds and separate independent banks from one cohort/function measure",
             ));
         }
-        if [
-            options.stationarity_tolerance,
-            options.log_evidence_tolerance,
-            options.relative_resolution_tolerance,
-            options.standard_error_multiplier,
-            options.minimum_effective_samples,
-        ]
-        .iter()
-        .any(|v| !v.is_finite() || *v <= 0.0)
-            || options.relative_resolution_tolerance >= 1.0
-            || options.maximum_iterations == 0
-        {
-            return Err(invalid(
-                "strength optimization requires positive finite tolerances, relative resolution below one, and a positive iteration limit",
-            ));
-        }
+        options.validate()?;
         // Include BOTH retained input banks, evaluations, BFGS's dense metric
         // and the curvature assessment before starting any expensive work.
         let p = self.draws[0].coefficients.len();
@@ -308,6 +335,23 @@ impl<'p, 'm> JointCoefficientIntegral<'p, 'm> {
                 "strength optimization exceeds its combined bank/optimizer memory budget",
             ));
         }
+        let (log_strengths, evidence, iterations) =
+            self.strength_stationary_point(initial, options)?;
+        let checked = validation.evaluate(&log_strengths)?;
+        let report = assess(&evidence, &checked, options, iterations)?;
+        Ok(JointStrengthOptimum {
+            integral: self,
+            log_strengths,
+            evidence,
+            report,
+        })
+    }
+
+    pub(super) fn strength_stationary_point(
+        &self,
+        initial: &[f64],
+        options: &StrengthOptimizationOptions,
+    ) -> Result<(Vec<f64>, JointCoefficientEvidence, usize), EventHistoryError> {
         let objective = opt::FusedObjective::new(|rho: &Array1<f64>| {
             let values: Vec<_> = rho.iter().copied().collect();
             let value = self
@@ -344,14 +388,7 @@ impl<'p, 'm> JointCoefficientIntegral<'p, 'm> {
                 "strength solver stopped without meeting the final evidence score tolerance",
             ));
         }
-        let checked = validation.evaluate(&log_strengths)?;
-        let report = assess(&evidence, &checked, options, solution.iterations)?;
-        Ok(JointStrengthOptimum {
-            integral: self,
-            log_strengths,
-            evidence,
-            report,
-        })
+        Ok((log_strengths, evidence, solution.iterations))
     }
 }
 

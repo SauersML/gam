@@ -11,7 +11,8 @@ pub use resolution::{CohortScoreTolerance, JointCohortResolutionReport, Resolved
 #[path = "coefficient_integral.rs"]
 mod coefficients;
 pub use coefficients::{
-    CoefficientImportanceDraw, EvidenceHessianProduct, JointCoefficientEvidence,
+    CoefficientImportanceDraw, CoefficientInferenceOptions, CoefficientRefinementRound,
+    EvidenceHessianProduct, JointCoefficientEvidence, JointCoefficientInference,
     JointCoefficientIntegral, JointStrengthOptimum, StrengthOptimizationOptions,
     StrengthResolutionReport,
 };

@@ -152,6 +152,9 @@ impl JointCohortIntegration<'_, '_> {
 }
 
 impl GuidedCoefficientProposal<'_, '_> {
+    pub(super) fn workspace_bytes(&self) -> usize {
+        self.workspace_bytes
+    }
     pub fn center(&self) -> &[f64] {
         &self.center
     }

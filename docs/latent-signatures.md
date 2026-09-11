@@ -490,13 +490,49 @@ gradient cannot suppress any of these error terms.
 The returned `JointStrengthOptimum` retains its coefficient draws, weights and
 posterior means. It is an assessed interior optimum of the supplied sampled
 integral, not a completed joint-model fit or a guarantee of global optimality.
-Posterior proposal coverage/integrability, automatic refinement, exact null-boundary
+Posterior proposal coverage/integrability, exact null-boundary
 comparisons, the selected entry law and serving still need completion. The
 dense optimizer/curvature workspace is checked together with both banks
 before optimization; a memory rejection is a computational limitation, not
 evidence against an additional signature. A conjugate Poisson/Gamma test
 checks the learned strength against its analytic optimum and requires
 underresolved or nonstationary results to fail.
+
+### Adaptive coefficient inference
+
+`JointCohortIntegration::infer_coefficients` connects proposal fitting,
+coefficient integration, strength optimization, and independent validation.
+Each round fits the guided proposal against the same normalized cohort
+likelihood and function priors, draws a fresh fitting bank, caches its resolved
+likelihoods, and optimizes integrated evidence. Only then does it draw the
+separate validation bank. Acceptance requires the value, whitened strength
+score and curvature, coefficient means, and effective sample counts to pass
+the assessment above.
+
+The initial bank size follows the required effective sample count and the
+coefficient/strength dimensions. If the assessment fails, the driver doubles
+the sample count and re-anchors the proposal at the preceding posterior mean
+and learned strengths. It discards both old banks before allocating their
+replacements. A combined memory check covers both banks, evidence arrays,
+proposal, optimizer, and assessment workspace before sampling. Exhausting
+that budget returns an unresolved error. An inner likelihood error floor
+requires refinement of the subject/reference banks; drawing more coefficients
+cannot eliminate it. Optimizer and inner-integration failures propagate.
+
+The returned `JointCoefficientInference` owns the final fitting draws and
+their normalized proposal densities together with their posterior weights,
+means, evidence, learned strengths, and refinement reports. It never replaces
+posterior means with the proposal mode. The conjugate end-to-end test checks
+the production cohort likelihood at every retained draw, the analytic evidence
+optimum, and the analytic posterior mean, and exercises unresolved-memory
+rejection.
+
+These are conditional Monte Carlo error estimates, not confidence sequences
+for the sequential stopping rule or a proof of tail coverage. This driver
+handles interior strength inference for a declared structure and supplied
+latent/reference banks. Exact null boundaries, automatic rank selection,
+subject/reference re-anchoring, integrated forecasts, and a standalone model
+shared by Rust, Python, and the CLI still need implementation.
 
 Training may use a structured variational approximation with local Gaussian
 state factors and temporal precision blocks, plus shared parameter factors.

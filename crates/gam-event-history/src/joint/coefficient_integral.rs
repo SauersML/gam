@@ -3,6 +3,11 @@
 //! at a coefficient mode. Reference and subject integrals are cached once per
 //! draw, with their resolution estimates retained separately.
 use super::*;
+#[path = "coefficient_inference.rs"]
+mod inference;
+pub use inference::{
+    CoefficientInferenceOptions, CoefficientRefinementRound, JointCoefficientInference,
+};
 #[path = "strength_fit.rs"]
 mod strength_fit;
 pub use strength_fit::{

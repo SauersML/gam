@@ -24,8 +24,9 @@ mod reference;
 mod resolution;
 mod score;
 pub use cohort::{
-    CoefficientImportanceDraw, CoefficientPilotOptions, CohortScoreTolerance,
-    EvidenceHessianProduct, GuidedCoefficientProposal, JointCoefficientEvidence,
+    CoefficientImportanceDraw, CoefficientInferenceOptions, CoefficientPilotOptions,
+    CoefficientRefinementRound, CohortScoreTolerance, EvidenceHessianProduct,
+    GuidedCoefficientProposal, JointCoefficientEvidence, JointCoefficientInference,
     JointCoefficientIntegral, JointCohortEvaluation, JointCohortIntegration, JointCohortPosterior,
     JointCohortResolutionReport, JointCohortScore, JointPriorScore, JointStrengthOptimum,
     ResolvedCohortScore, StrengthOptimizationOptions, StrengthResolutionReport,
