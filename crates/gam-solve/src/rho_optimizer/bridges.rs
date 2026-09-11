@@ -665,6 +665,12 @@ pub(crate) struct CostStallGuard {
     /// means the incumbent is a certified strict saddle and therefore cannot
     /// justify an infeasible-neighbourhood stall.
     best_hessian_psd: Option<bool>,
+    /// The reduced-Hessian facts behind `best_hessian_psd == Some(false)`, so a
+    /// strict-saddle refusal can say which curvature it refused on (#1082).
+    best_curvature: Option<IncumbentCurvature>,
+    /// Facts staged by the bridge for the sample it is about to observe; adopted
+    /// only if that sample becomes the incumbent.
+    staged_curvature: Option<IncumbentCurvature>,
     no_improve_streak: usize,
     /// Consecutive infeasible (non-finite cost) outer trials since the last
     /// finite observation. On a near-separable multinomial fit ARC repeatedly
@@ -746,6 +752,8 @@ impl CostStallGuard {
             best_rho: None,
             best_grad_norm: f64::INFINITY,
             best_hessian_psd: None,
+            best_curvature: None,
+            staged_curvature: None,
             no_improve_streak: 0,
             infeasible_streak: 0,
             accepted_iters: 0,
@@ -914,6 +922,19 @@ impl CostStallGuard {
     /// `eval_hessian` is not called at the seed. Without this hook the
     /// infeasible-trial stall path has no finite best iterate to halt back to
     /// when the next few ARC probes run into the λ→0 separating region.
+    /// Stage the reduced-Hessian facts of the sample about to be observed. They
+    /// travel with the incumbent only if that sample becomes it (#1082).
+    pub(crate) fn stage_sample_curvature(&mut self, curvature: Option<IncumbentCurvature>) {
+        self.staged_curvature = curvature;
+    }
+
+    fn best_curvature_note(&self) -> String {
+        self.best_curvature.as_ref().map_or_else(
+            || "no reduced-Hessian facts recorded".to_string(),
+            |curvature| curvature.to_string(),
+        )
+    }
+
     pub(crate) fn observe_seed(&mut self, rho: &Array1<f64>, value: f64, grad_norm: f64) {
         self.observe_seed_with_curvature(rho, value, grad_norm, None);
     }
@@ -935,6 +956,7 @@ impl CostStallGuard {
         grad_norm: f64,
         hessian_psd: Option<bool>,
     ) {
+        let staged_curvature = self.staged_curvature.take();
         if !value.is_finite() {
             return;
         }
@@ -942,6 +964,7 @@ impl CostStallGuard {
         self.best_rho = Some(rho.clone());
         self.best_grad_norm = grad_norm;
         self.best_hessian_psd = hessian_psd;
+        self.best_curvature = staged_curvature;
         self.no_improve_streak = 0;
         self.infeasible_streak = 0;
         self.accepted_iters = self.accepted_iters.saturating_add(1);
@@ -1004,6 +1027,7 @@ impl CostStallGuard {
         inner_converged: bool,
         hessian_psd: Option<bool>,
     ) -> CostStallVerdict {
+        let staged_curvature = self.staged_curvature.take();
         if !value.is_finite() {
             // A non-finite accepted objective is the inner-solver's problem,
             // not a stall; reset so a later real descent is not falsely
@@ -1039,6 +1063,7 @@ impl CostStallGuard {
             self.best_rho = Some(rho.clone());
             self.best_grad_norm = grad_norm;
             self.best_hessian_psd = hessian_psd;
+            self.best_curvature = staged_curvature;
             // Keep the shared exit cell tracking the best feasible iterate so the
             // ARC budget-exhaustion path can recover it instead of the optimizer's
             // last (possibly degenerate-corner) iterate (#1371).
@@ -1097,10 +1122,11 @@ impl CostStallGuard {
             if self.grant_escape_unless_replay(incumbent) {
                 log::warn!(
                     "[OUTER] ARC cost-stall window filled at a strict-saddle incumbent \
-                     (hessian_psd=NO at best-so-far, value={:.6e}): refusing to certify the \
-                     saddle and returning control to cubic regularization to exploit the \
+                     (hessian_psd=NO at best-so-far, value={:.6e}; {}): refusing to certify \
+                     the saddle and returning control to cubic regularization to exploit the \
                      negative curvature (escape {}).",
                     self.best_value,
+                    self.best_curvature_note(),
                     self.stuck_escapes,
                 );
                 return CostStallVerdict::Continue;
@@ -1151,8 +1177,9 @@ impl CostStallGuard {
             self.infeasible_streak = 0;
             self.no_improve_streak = 0;
             log::warn!(
-                "[OUTER] ARC infeasible-probe run reached a strict-saddle incumbent; \
-                 refusing the stall and returning control to cubic regularization"
+                "[OUTER] ARC infeasible-probe run reached a strict-saddle incumbent ({}); \
+                 refusing the stall and returning control to cubic regularization",
+                self.best_curvature_note(),
             );
             return CostStallVerdict::Continue;
         }
@@ -1240,6 +1267,7 @@ impl CostStallGuard {
         self.best_rho = Some(rho.clone());
         self.best_grad_norm = grad_norm;
         self.best_hessian_psd = hessian_psd;
+        self.best_curvature = self.staged_curvature.take();
         self.no_improve_streak = self.window;
         self.publish_stall(rho, value, grad_norm)
     }
@@ -3070,6 +3098,18 @@ impl SecondOrderObjective for OuterSecondOrderBridge<'_> {
                 curvature_resolution,
             )
         });
+        if let Some(guard) = self.cost_stall.as_mut() {
+            guard.stage_sample_curvature(match (hessian_psd, hessian.as_ref()) {
+                (Some(false), Some(dense)) => incumbent_curvature(
+                    x,
+                    &eval.gradient,
+                    dense,
+                    rail_bounds.as_ref().map(|(lower, upper)| (lower, upper)),
+                    curvature_resolution,
+                ),
+                _ => None,
+            });
+        }
         // Observe finite cost progress, but never let this first-order guard
         // halt a second-order route. ARC must receive this exact sample so its
         // projected-gradient + reduced-Hessian gate can either certify a mode
@@ -3676,7 +3716,24 @@ pub(crate) fn reduced_hessian_psd_at_point(
     if bounds.is_some_and(|(lower, upper)| lower.len() != n || upper.len() != n) {
         return None;
     }
-    let free: Vec<usize> = (0..n)
+    let free = reduced_free_coordinates(x, gradient, bounds);
+    if free.is_empty() {
+        return Some(true);
+    }
+    let reduced = Array2::from_shape_fn((free.len(), free.len()), |(row, column)| {
+        hessian[[free[row], free[column]]]
+    });
+    super::run::certificate_hessian_is_psd_at_resolution(&reduced, measured_resolution)
+}
+
+/// The coordinates [`reduced_hessian_psd_at_point`] judges: every coordinate except
+/// fixed ones and those strictly active at a bound with an outward gradient.
+fn reduced_free_coordinates(
+    x: &Array1<f64>,
+    gradient: &Array1<f64>,
+    bounds: Option<(&Array1<f64>, &Array1<f64>)>,
+) -> Vec<usize> {
+    (0..x.len())
         .filter(|&index| {
             let Some((lower, upper)) = bounds else {
                 return true;
@@ -3686,14 +3743,104 @@ pub(crate) fn reduced_hessian_psd_at_point(
             let strict_upper = x[index] >= upper[index] - 1.0e-10 && gradient[index] < 0.0;
             !(fixed || strict_lower || strict_upper)
         })
-        .collect();
-    if free.is_empty() {
-        return Some(true);
+        .collect()
+}
+
+/// One margin-railed coordinate of a strict-saddle incumbent.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct RailedCurvature {
+    index: usize,
+    rho: f64,
+    gradient: f64,
+    curvature: f64,
+}
+
+/// The reduced-Hessian facts behind a strict-saddle verdict (#1082).
+///
+/// The guard judges definiteness on [`reduced_free_coordinates`]; the terminal
+/// certificate judges the interior sub-block, with every margin-railed coordinate
+/// removed. A refusal that keeps a search running at a point the certificate later
+/// accepts shows up here as `free_min < −resolution` with `interior_min` at or
+/// above it, and `railed` names the coordinates that make the difference.
+#[derive(Clone, Debug)]
+pub(crate) struct IncumbentCurvature {
+    free_min: f64,
+    interior_min: Option<f64>,
+    resolution: f64,
+    railed: Vec<RailedCurvature>,
+}
+
+impl std::fmt::Display for IncumbentCurvature {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "free-set λ_min={:.3e}, interior λ_min=", self.free_min)?;
+        match self.interior_min {
+            Some(value) => write!(f, "{value:.3e}")?,
+            None => f.write_str("none (every coordinate railed)")?,
+        }
+        write!(f, ", resolution={:.3e}, railed=[", self.resolution)?;
+        for (position, railed) in self.railed.iter().enumerate() {
+            if position > 0 {
+                f.write_str("; ")?;
+            }
+            write!(
+                f,
+                "#{} ρ={:.4e} g={:.3e} H_kk={:.3e}",
+                railed.index, railed.rho, railed.gradient, railed.curvature
+            )?;
+        }
+        f.write_str("]")
     }
-    let reduced = Array2::from_shape_fn((free.len(), free.len()), |(row, column)| {
-        hessian[[free[row], free[column]]]
+}
+
+/// Smallest eigenvalue of `hessian` restricted to `indices`, or `None` when the
+/// restriction is empty or the eigensolver fails.
+fn restricted_min_eigenvalue(hessian: &Array2<f64>, indices: &[usize]) -> Option<f64> {
+    use gam_linalg::faer_ndarray::FaerEigh;
+    if indices.is_empty() {
+        return None;
+    }
+    let restricted = Array2::from_shape_fn((indices.len(), indices.len()), |(row, column)| {
+        hessian[[indices[row], indices[column]]]
     });
-    super::run::certificate_hessian_is_psd_at_resolution(&reduced, measured_resolution)
+    let (eigenvalues, _) = restricted.eigh(faer::Side::Lower).ok()?;
+    eigenvalues.iter().copied().reduce(f64::min)
+}
+
+/// The facts [`IncumbentCurvature`] carries, at the same point, free set, rail box
+/// and resolution the verdict was taken at. `bounds` is the rail-relaxed box, whose
+/// endpoints are exactly the certificate's railed thresholds.
+pub(crate) fn incumbent_curvature(
+    x: &Array1<f64>,
+    gradient: &Array1<f64>,
+    hessian: &Array2<f64>,
+    bounds: Option<(&Array1<f64>, &Array1<f64>)>,
+    resolution: f64,
+) -> Option<IncumbentCurvature> {
+    let n = x.len();
+    if gradient.len() != n || hessian.dim() != (n, n) {
+        return None;
+    }
+    let free_min =
+        restricted_min_eigenvalue(hessian, &reduced_free_coordinates(x, gradient, bounds))?;
+    let railed_indices: Vec<usize> = match bounds {
+        Some((lower, upper)) => (0..n).filter(|&k| x[k] <= lower[k] || x[k] >= upper[k]).collect(),
+        None => Vec::new(),
+    };
+    let interior: Vec<usize> = (0..n).filter(|k| !railed_indices.contains(k)).collect();
+    Some(IncumbentCurvature {
+        free_min,
+        interior_min: restricted_min_eigenvalue(hessian, &interior),
+        resolution,
+        railed: railed_indices
+            .into_iter()
+            .map(|index| RailedCurvature {
+                index,
+                rho: x[index],
+                gradient: gradient[index],
+                curvature: hessian[[index, index]],
+            })
+            .collect(),
+    })
 }
 
 #[cfg(test)]
