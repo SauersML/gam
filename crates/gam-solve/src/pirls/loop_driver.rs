@@ -720,7 +720,16 @@ pub(super) fn build_diagonal_penalty_from_kronecker(
     let mut diag = Array1::<f64>::zeros(p);
     let mut positive_indices = Vec::new();
 
-    const KRONECKER_STRUCTURAL_ZERO_TOL: f64 = 1e-12;
+    // A joint eigenvalue whose structural (λ-free) sum sits inside the marginal
+    // eigensolvers' rounding bands `Σ_k γ_{q_k}·max|σ_k|` is a joint null
+    // direction: no marginal spectrum can tell it from zero.
+    let structural_zero_band: f64 = (0..d)
+        .map(|k| {
+            let marginal = &kron_result.marginal_eigenvalues[k];
+            gam_linalg::roundoff::accumulation_growth(marginal.len())
+                * marginal.iter().fold(0.0_f64, |acc, value| acc.max(value.abs()))
+        })
+        .sum();
     let mut multi_idx = vec![0usize; d];
     let mut flat = 0usize;
     loop {
@@ -731,7 +740,7 @@ pub(super) fn build_diagonal_penalty_from_kronecker(
             structural_sigma += marginal_eigenvalue;
             sigma += lambdas[k] * marginal_eigenvalue;
         }
-        let joint_null = structural_sigma <= KRONECKER_STRUCTURAL_ZERO_TOL;
+        let joint_null = structural_sigma <= structural_zero_band;
         if kron_result.has_double_penalty && lambdas.len() > d && joint_null {
             sigma += lambdas[d];
         }
@@ -2673,7 +2682,8 @@ pub(super) fn sparse_from_denseview(x: ArrayView2<f64>) -> Option<DesignMatrix> 
         return None;
     }
 
-    const ZERO_EPS: f64 = 1e-12;
+    // Structural sparsity is exact zeros: dropping a small nonzero would change
+    // the matrix the solve sees, not store it more cheaply.
     let total = nrows.saturating_mul(ncols);
     if total == 0 {
         return None;
@@ -2682,7 +2692,7 @@ pub(super) fn sparse_from_denseview(x: ArrayView2<f64>) -> Option<DesignMatrix> 
     let sparse_nnz_limit = ((total as f64) * SPARSE_DENSITY_LIMIT).floor() as usize;
     let mut nnz = 0usize;
     for &val in x.iter() {
-        if val.abs() > ZERO_EPS {
+        if val != 0.0 {
             nnz += 1;
             if nnz > sparse_nnz_limit {
                 return None;
@@ -2692,7 +2702,7 @@ pub(super) fn sparse_from_denseview(x: ArrayView2<f64>) -> Option<DesignMatrix> 
     let mut triplets = Vec::with_capacity(nnz);
     for (row_idx, row) in x.outer_iter().enumerate() {
         for (col_idx, &val) in row.iter().enumerate() {
-            if val.abs() > ZERO_EPS {
+            if val != 0.0 {
                 triplets.push(Triplet::new(row_idx, col_idx, val));
             }
         }

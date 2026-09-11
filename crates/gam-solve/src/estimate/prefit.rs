@@ -178,8 +178,7 @@ pub(crate) fn detect_prefit_unpenalized_rank_deficiency_in_design(
     }
     let spectral_scale = eigenvalues
         .iter()
-        .fold(0.0_f64, |scale, &value| scale.max(value.abs()))
-        .max(1.0);
+        .fold(0.0_f64, |scale, &value| scale.max(value.abs()));
     // Rank tolerance is the floating-point noise floor for the Gram entries.
     // Each Gram entry is a sum of `active_rows` products with error ~eps per
     // term; the spectral perturbation bound is `O(active_rows · eps ·
@@ -189,8 +188,7 @@ pub(crate) fn detect_prefit_unpenalized_rank_deficiency_in_design(
     // well above the noise floor but inside the old 1e-10 cutoff. Such cases
     // must be classified as NearDegenerate via the condition-number branch
     // below, not as exact rank loss.
-    let noise_floor = (active_rows.max(q) as f64) * f64::EPSILON * spectral_scale;
-    let tolerance = noise_floor.max(8.0 * f64::EPSILON);
+    let tolerance = (active_rows.max(q) as f64) * f64::EPSILON * spectral_scale;
     let rank = eigenvalues
         .iter()
         .filter(|&&value| value > tolerance)
@@ -282,19 +280,18 @@ fn separator_from_column_extrema(
     min_neg: &[f64],
     max_neg: &[f64],
 ) -> Option<PrefitSeparationDiagnostic> {
-    const GAP_TOL: f64 = 1e-12;
     for col in 0..unpenalized_columns.len() {
         if !unpenalized_columns[col] {
             continue;
         }
-        if min_pos[col] > max_neg[col] + GAP_TOL {
+        if min_pos[col] > max_neg[col] {
             return Some(PrefitSeparationDiagnostic {
                 column_index: col,
                 threshold: 0.5 * (min_pos[col] + max_neg[col]),
                 positive_above_threshold: true,
             });
         }
-        if min_neg[col] > max_pos[col] + GAP_TOL {
+        if min_neg[col] > max_pos[col] {
             return Some(PrefitSeparationDiagnostic {
                 column_index: col,
                 threshold: 0.5 * (min_neg[col] + max_pos[col]),

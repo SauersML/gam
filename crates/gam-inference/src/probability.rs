@@ -829,11 +829,12 @@ fn inverse_regularized_lower_gamma(p: f64, a: f64) -> f64 {
     };
 
     // Halley refinement of the seeded quantile. Halley's cubic convergence
-    // reaches `f64` accuracy from the standard Wilson-Hilferty / asymptotic seed
-    // in only a few steps; this cap is a generous safety bound, not the expected
-    // iteration count, and the loop also exits early via the in-loop tolerance.
-    const MAX_HALLEY_STEPS: usize = 16;
-    for _ in 0..MAX_HALLEY_STEPS {
+    // shrinks the step geometrically from the standard Wilson-Hilferty /
+    // asymptotic seed; once a step is no smaller than the one before it, or no
+    // longer moves the iterate, the quantile is at the resolution its residual's
+    // arithmetic has and no further step can improve it.
+    let mut previous_step = f64::INFINITY;
+    loop {
         if x <= 0.0 {
             return 0.0;
         }
@@ -865,13 +866,14 @@ fn inverse_regularized_lower_gamma(p: f64, a: f64) -> f64 {
         // denominator never collapses below ½.
         let u = err / dens;
         let step = u / (1.0 - 0.5 * (u * (a1 / x - 1.0)).min(1.0));
+        if !(step.abs() < previous_step) || x - step == x {
+            break;
+        }
+        previous_step = step.abs();
         x -= step;
         if x <= 0.0 {
             // Overshot the support floor: step back to half the prior iterate.
             x = 0.5 * (x + step);
-        }
-        if step.abs() < 1.0e-12 * x.max(1.0e-300) {
-            break;
         }
     }
     x

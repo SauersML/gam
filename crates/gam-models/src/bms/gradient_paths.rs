@@ -2270,7 +2270,7 @@ pub(crate) fn unary_derivatives_sqrt(x: f64) -> [f64; 5] {
     // One reciprocal: with `s = √x`, `1/x = r²` for `r = 1/s`, so every
     // derivative is a power of `r` times a constant (the pre-#932 hand chain
     // divided four times).
-    let s = x.max(1e-300).sqrt();
+    let s = x.sqrt();
     let r = 1.0 / s;
     let r2 = r * r;
     let r3 = r2 * r;
@@ -2288,15 +2288,14 @@ pub(crate) fn unary_derivatives_sqrt(x: f64) -> [f64; 5] {
 /// as its own leaf keeps the row program division-free, which is what the
 /// `row_program!` SSA vocabulary supports.
 ///
-/// The `max(1e-300)` floor mirrors [`unary_derivatives_sqrt`]: the argument is
-/// `1 + s²·V ≥ 1` on every reachable path (`V = gᵀΣg ≥ 0` by the covariance
-/// admission check), so the floor is unreachable in production and exists only
-/// so a corrupted argument yields a finite value rather than an ∞/NaN cascade
-/// with no provenance.
+/// The argument is `1 + s²·V ≥ 1` on every reachable path (`V = gᵀΣg ≥ 0` by
+/// the covariance admission check), so no floor is applied: a corrupted argument
+/// surfaces as a non-finite derivative, which the row program's finiteness
+/// checks refuse with provenance instead of receiving a fabricated finite value.
 pub(crate) fn unary_derivatives_inverse_sqrt(x: f64) -> [f64; 5] {
     // One reciprocal: `1/x = r²` for `r = 1/√x`, so the stack is odd powers
     // of `r` (the previous body divided five times).
-    let s = x.max(1e-300).sqrt();
+    let s = x.sqrt();
     let r = 1.0 / s;
     let r2 = r * r;
     let r3 = r2 * r;

@@ -55,7 +55,6 @@ impl ParametricColumnConditioning {
     /// Reads only the specified columns from `x` (via `extract_column`) to
     /// compute per-column mean/variance — no full-design densification.
     pub(crate) fn from_column_indices(x: &DesignMatrix, unpenalized_cols: &[usize]) -> Self {
-        const SCALE_EPS: f64 = 1e-12;
         let n = x.nrows();
         if n == 0 {
             return Self {
@@ -72,9 +71,15 @@ impl ParametricColumnConditioning {
         for (k, &j) in unpenalized_cols.iter().enumerate() {
             let col = block.column(k);
             let first = col[0];
-            let is_constant = col.iter().all(|&v| (v - first).abs() <= 1e-12);
+            // A column read through a lazily transformed design is a combination
+            // of up to `p` stored columns, so values that differ by less than
+            // `γ_p` relative to the column's magnitude differ by arithmetic.
+            let column_resolution = gam_linalg::roundoff::accumulation_growth(x.ncols());
+            let magnitude = col.iter().fold(0.0_f64, |acc, &v| acc.max(v.abs()));
+            let spread_band = column_resolution * magnitude;
+            let is_constant = col.iter().all(|&v| (v - first).abs() <= spread_band);
             if is_constant {
-                if (first - 1.0).abs() <= 1e-12 && intercept_idx.is_none() {
+                if (first - 1.0).abs() <= column_resolution && intercept_idx.is_none() {
                     intercept_idx = Some(j);
                 }
                 continue;
@@ -88,7 +93,7 @@ impl ParametricColumnConditioning {
                 })
                 .sum::<f64>()
                 / n as f64;
-            if !var.is_finite() || var <= SCALE_EPS * SCALE_EPS {
+            if !var.is_finite() || var.sqrt() <= spread_band {
                 continue;
             }
             columns.push((j, mean, var.sqrt()));
