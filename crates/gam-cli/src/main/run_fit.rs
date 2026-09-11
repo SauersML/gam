@@ -274,7 +274,7 @@ pub(crate) fn run_fit(args: FitArgs) -> Result<(), String> {
         let dataset = load_fit_dataset_with_roles(&args.data, &required.into_iter().collect::<Vec<_>>(), &parsed, false)?;
         let payload = gam::inference::model_payload_builders::fit_formula_to_payload(formula_text, &dataset, &fit_config)
             .map_err(|error| error.to_string())?;
-        let model = FittedModel::from_payload(payload);
+        let model = SavedModel::from_payload(payload);
         return write_model_json(out, &model);
     }
     validate_fit_args_preflight(&args, &parsed, &fit_config)?;
