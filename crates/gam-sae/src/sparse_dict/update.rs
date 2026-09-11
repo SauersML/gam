@@ -5281,7 +5281,45 @@ mod exact_solve_tests {
             tolerance: 1.0e-9,
             score_mode: gam_gpu::GpuPolicy::Off,
         };
-        let fit = fit_sparse_dictionary(x.view(), &config).expect("fit");
+        let fit = match fit_sparse_dictionary(x.view(), &config) {
+            Ok(fit) => fit,
+            // The fit is deterministic, so rerunning it at every shorter budget reproduces
+            // the trajectory the failing run walked. EV per budget separates a fit still
+            // climbing when the budget ran out from a routing limit cycle whose up-swings
+            // keep the plateau window from confirming (#2822).
+            Err(error @ SparseDictionaryError::InnerNonConvergence { .. }) => {
+                let trajectory: Vec<String> = (1..config.max_epochs)
+                    .map(|budget| {
+                        let shorter = SparseDictConfig {
+                            n_atoms: config.n_atoms,
+                            active: config.active,
+                            minibatch: config.minibatch,
+                            max_epochs: budget,
+                            score_tile: config.score_tile,
+                            code_ridge: config.code_ridge,
+                            decoder_ridge: config.decoder_ridge,
+                            tolerance: config.tolerance,
+                            score_mode: config.score_mode,
+                        };
+                        match fit_sparse_dictionary(x.view(), &shorter) {
+                            Ok(fit) => {
+                                format!("{budget}:returned ev={:.12}", fit.explained_variance)
+                            }
+                            Err(SparseDictionaryError::InnerNonConvergence {
+                                explained_variance,
+                                ev_residual,
+                                ..
+                            }) => format!(
+                                "{budget}:open ev={explained_variance:.12} resid={ev_residual:.2e}"
+                            ),
+                            Err(other) => format!("{budget}:{other}"),
+                        }
+                    })
+                    .collect();
+                panic!("fit: {error}; trajectory by budget: {}", trajectory.join(" "));
+            }
+            Err(other) => panic!("fit: {other}"),
+        };
         let s = fit.active;
         assert!(s > 1, "test must run the coupled s>1 lane");
 
