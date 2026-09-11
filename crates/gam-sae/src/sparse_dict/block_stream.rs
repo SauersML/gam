@@ -54,7 +54,7 @@ use super::block_frame::polar_tied_frame_step;
 use super::residual_reservoir::ResidualReservoir;
 use super::update::{DEAD_DENOM, DecoderSolveStats};
 use gam_linalg::faer_ndarray::with_faer_sequential;
-use ndarray::{Array2, ArrayView2, Axis};
+use ndarray::{Array2, ArrayView1, ArrayView2, Axis};
 use rayon::prelude::*;
 
 /// One minibatch row's gamma-free reconstruction and scalar moments. Keeping
@@ -127,6 +127,68 @@ fn block_row_postings(codes: &[RowBlockCode], blocks: usize) -> Vec<Vec<(usize, 
         }
     }
     postings
+}
+
+/// One selected row's contribution to its block's tied projector moments:
+/// `coupling += v wᵀ + x (U v)ᵀ` and `data_cross += x wᵀ`, where
+/// `v = k P_g x - Σ_h P_h x` is formed from the row's code `w` and its
+/// gamma-free reconstruction `sum`. Returns `(‖x‖², ‖v‖², xᵀv)` for the block's
+/// data energy and negative-curvature bound.
+///
+/// `frame` is the block's `b` directions in f64, row-major (`frame[axis * p + c]`);
+/// `coupling` and `data_cross` are the block's `P×b` moments, row-major
+/// (`[c * b + axis]`); `v` (length `P`) and `v_coordinates` (length `b`) are
+/// caller-owned scratch. Every accumulator receives the same floating-point
+/// operations in the same order as the per-element `[[c, axis]]` loop this kernel
+/// replaced, so the moments are bit-identical to it (#2826).
+fn accumulate_tied_row_moments(
+    frame: &[f64],
+    w: &[f64],
+    xi: ArrayView1<'_, f32>,
+    sum: &[f64],
+    k: f64,
+    v: &mut [f64],
+    v_coordinates: &mut [f64],
+    coupling: &mut [f64],
+    data_cross: &mut [f64],
+) -> (f64, f64, f64) {
+    let b = w.len();
+    let p = sum.len();
+    v_coordinates.fill(0.0);
+    let mut x_norm_sq = 0.0;
+    let mut v_norm_sq = 0.0;
+    let mut x_dot_v = 0.0;
+    // Pass 1: v, the three scalar reductions and U v, each summed in `c` order.
+    for (c, ((value, &x), &total)) in v.iter_mut().zip(xi.iter()).zip(sum).enumerate() {
+        let mut own = 0.0;
+        for (axis, &weight) in w.iter().enumerate() {
+            own += weight * frame[axis * p + c];
+        }
+        *value = k * own - total;
+        let x = x as f64;
+        x_norm_sq += x * x;
+        v_norm_sq += *value * *value;
+        x_dot_v += x * *value;
+        for (axis, coordinate) in v_coordinates.iter_mut().enumerate() {
+            *coordinate += frame[axis * p + c] * *value;
+        }
+    }
+    // Pass 2: each coupling entry takes `v w` and then `x (U v)` as two separate
+    // additions, exactly as the two loops it replaced did.
+    for (((coupling_row, data_row), &value), &x) in coupling
+        .chunks_exact_mut(b)
+        .zip(data_cross.chunks_exact_mut(b))
+        .zip(v.iter())
+        .zip(xi.iter())
+    {
+        let x = x as f64;
+        for (axis, &weight) in w.iter().enumerate() {
+            coupling_row[axis] += value * weight;
+            data_row[axis] += x * weight;
+            coupling_row[axis] += x * v_coordinates[axis];
+        }
+    }
+    (x_norm_sq, v_norm_sq, x_dot_v)
 }
 
 fn profiled_scalar(old_gamma: f32, rss: f64, numerator: f64, denominator: f64) -> (f32, f64) {
@@ -605,36 +667,42 @@ impl BlockSparseStreamState {
                         block,
                         ((((((coupling, data_cross), second), usage), energy), bound), entries),
                     )| {
+                        // An unselected block has nothing to accumulate, and its
+                        // usage below adds zero.
+                        if entries.is_empty() {
+                            return;
+                        }
+                        // The block's directions are read as f64 once per
+                        // minibatch, not cast per feature per selected row.
+                        let frame: Vec<f64> = self
+                            .decoder
+                            .slice(ndarray::s![block * b..(block + 1) * b, ..])
+                            .iter()
+                            .map(|&value| f64::from(value))
+                            .collect();
+                        // Both moments are allocated by `Array2::zeros` and only
+                        // mutated in place, so they stay in standard layout.
+                        let coupling = coupling
+                            .as_slice_mut()
+                            .expect("block coupling moments are standard layout");
+                        let data_cross = data_cross
+                            .as_slice_mut()
+                            .expect("block data moments are standard layout");
+                        let mut v = vec![0.0; p];
                         let mut v_coordinates = vec![0.0; b];
                         for &(row, slot) in entries {
                             let w = &codes[row].projections[slot * b..(slot + 1) * b];
-                            let xi = rows.row(row);
-                            v_coordinates.fill(0.0);
-                            let mut x_norm_sq = 0.0;
-                            let mut v_norm_sq = 0.0;
-                            let mut x_dot_v = 0.0;
-                            for c in 0..p {
-                                let mut own = 0.0;
-                                for (axis, &weight) in w.iter().enumerate() {
-                                    own += weight * self.decoder[[block * b + axis, c]] as f64;
-                                }
-                                let v = self.k as f64 * own - projected[row].sum[c];
-                                let x = xi[c] as f64;
-                                x_norm_sq += x * x;
-                                v_norm_sq += v * v;
-                                x_dot_v += x * v;
-                                for (axis, &weight) in w.iter().enumerate() {
-                                    coupling[[c, axis]] += v * weight;
-                                    data_cross[[c, axis]] += x * weight;
-                                    v_coordinates[axis] +=
-                                        self.decoder[[block * b + axis, c]] as f64 * v;
-                                }
-                            }
-                            for c in 0..p {
-                                for axis in 0..b {
-                                    coupling[[c, axis]] += xi[c] as f64 * v_coordinates[axis];
-                                }
-                            }
+                            let (x_norm_sq, v_norm_sq, x_dot_v) = accumulate_tied_row_moments(
+                                &frame,
+                                w,
+                                rows.row(row),
+                                &projected[row].sum,
+                                self.k as f64,
+                                &mut v,
+                                &mut v_coordinates,
+                                coupling,
+                                data_cross,
+                            );
                             *energy += x_norm_sq;
                             *bound += (x_norm_sq.sqrt() * v_norm_sq.sqrt() - x_dot_v).max(0.0);
                             for left in 0..b {

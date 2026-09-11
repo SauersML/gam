@@ -723,3 +723,130 @@ fn rerouted_frame_trials_cannot_decrease_streamed_explained_variance_2825() {
         "monotonicity would be vacuous if the frame lane never improved"
     );
 }
+
+#[test]
+fn tied_row_moment_kernel_is_bit_identical_to_the_indexed_loop_2826() {
+    // `partial_fit`'s tied projector moments moved from a per-element
+    // `[[c, axis]]` loop to a two-pass slice kernel for speed only. The moments
+    // feed the frame step, its stationarity certificate and the paired frame
+    // trials, so the kernel must perform the old loop's floating-point
+    // operations in the same order: bit equality, not a tolerance.
+    let mut bits = 0x2826_u64;
+    let mut draw = move || {
+        bits = bits
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        (bits >> 11) as f64 / (1_u64 << 53) as f64 - 0.5
+    };
+    for (b, p, k) in [(1usize, 5usize, 1usize), (2, 37, 8), (3, 64, 3)] {
+        let entries = 23usize;
+        // Rows are views into a transposed matrix, so each has a non-unit
+        // stride, as a Fortran-ordered shard does.
+        let columns = Array2::from_shape_fn((p, entries), |_| (4.0 * draw()) as f32);
+        let rows = columns.t();
+        let decoder = Array2::from_shape_fn((b, p), |_| draw() as f32);
+        let codes = Array2::from_shape_fn((entries, b), |_| 3.0 * draw());
+        let sums = Array2::from_shape_fn((entries, p), |_| 2.0 * draw());
+        let frame: Vec<f64> = decoder.iter().map(|&value| f64::from(value)).collect();
+
+        let mut coupling = vec![0.0_f64; p * b];
+        let mut data_cross = vec![0.0_f64; p * b];
+        let mut v = vec![0.0_f64; p];
+        let mut v_coordinates = vec![0.0_f64; b];
+        let mut reference_coupling = Array2::<f64>::zeros((p, b));
+        let mut reference_data = Array2::<f64>::zeros((p, b));
+        let mut merged_coupling = Array2::<f64>::zeros((p, b));
+        for entry in 0..entries {
+            let w = codes.row(entry).to_vec();
+            let sum = sums.row(entry).to_vec();
+            let xi = rows.row(entry);
+            assert_ne!(xi.strides()[0], 1, "the fixture must exercise a strided row");
+            let (x_norm_sq, v_norm_sq, x_dot_v) = super::accumulate_tied_row_moments(
+                &frame,
+                &w,
+                xi,
+                &sum,
+                k as f64,
+                &mut v,
+                &mut v_coordinates,
+                &mut coupling,
+                &mut data_cross,
+            );
+
+            // The loop as it stood before the kernel, with
+            // `decoder[[block * b + axis, c]]` narrowed to this one block's rows.
+            let mut reference_v_coordinates = vec![0.0; b];
+            let mut reference_x_norm_sq = 0.0;
+            let mut reference_v_norm_sq = 0.0;
+            let mut reference_x_dot_v = 0.0;
+            for c in 0..p {
+                let mut own = 0.0;
+                for (axis, &weight) in w.iter().enumerate() {
+                    own += weight * decoder[[axis, c]] as f64;
+                }
+                let value = k as f64 * own - sum[c];
+                let x = xi[c] as f64;
+                reference_x_norm_sq += x * x;
+                reference_v_norm_sq += value * value;
+                reference_x_dot_v += x * value;
+                for (axis, &weight) in w.iter().enumerate() {
+                    reference_coupling[[c, axis]] += value * weight;
+                    reference_data[[c, axis]] += x * weight;
+                    reference_v_coordinates[axis] += decoder[[axis, c]] as f64 * value;
+                }
+            }
+            for c in 0..p {
+                for axis in 0..b {
+                    reference_coupling[[c, axis]] += xi[c] as f64 * reference_v_coordinates[axis];
+                }
+            }
+            // Positive control: the same two coupling terms added as ONE sum per
+            // element. A fixture that cannot tell this association from the
+            // original order would make the bit equality below vacuous.
+            for c in 0..p {
+                let mut own = 0.0;
+                for (axis, &weight) in w.iter().enumerate() {
+                    own += weight * decoder[[axis, c]] as f64;
+                }
+                let value = k as f64 * own - sum[c];
+                for (axis, &weight) in w.iter().enumerate() {
+                    merged_coupling[[c, axis]] +=
+                        value * weight + xi[c] as f64 * reference_v_coordinates[axis];
+                }
+            }
+            for (got, expected, name) in [
+                (x_norm_sq, reference_x_norm_sq, "x_norm_sq"),
+                (v_norm_sq, reference_v_norm_sq, "v_norm_sq"),
+                (x_dot_v, reference_x_dot_v, "x_dot_v"),
+            ] {
+                assert_eq!(
+                    got.to_bits(),
+                    expected.to_bits(),
+                    "{name} differs at entry {entry} (b={b}, p={p}, k={k}): {got:e} vs {expected:e}"
+                );
+            }
+        }
+        for c in 0..p {
+            for axis in 0..b {
+                for (got, expected, name) in [
+                    (coupling[c * b + axis], reference_coupling[[c, axis]], "coupling"),
+                    (data_cross[c * b + axis], reference_data[[c, axis]], "data_cross"),
+                ] {
+                    assert_eq!(
+                        got.to_bits(),
+                        expected.to_bits(),
+                        "{name}[{c}, {axis}] differs (b={b}, p={p}, k={k}): {got:e} vs {expected:e}"
+                    );
+                }
+            }
+        }
+        assert!(
+            merged_coupling
+                .iter()
+                .zip(reference_coupling.iter())
+                .any(|(merged, original)| merged.to_bits() != original.to_bits()),
+            "b={b}, p={p}, k={k}: the fixture does not resolve an association change, so \
+             bit equality with the original loop would not distinguish the two orders"
+        );
+    }
+}
