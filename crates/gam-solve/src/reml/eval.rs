@@ -1434,7 +1434,20 @@ impl<'a> RemlState<'a> {
             .map(|node| (minimum_rise - node.achieved_rise).exp())
             .collect();
         let sigma_points: Vec<Array1<f64>> = nodes.iter().map(|node| node.rho.clone()).collect();
-        let point_results = sigma_cubature_dispatch(self, &sigma_points, Some(final_fit))?;
+        // A node whose inner fit fails, or whose penalized Hessian does not
+        // certify SPD at its perturbed ρ, leaves the cubature measure
+        // unintegrable. That refuses the UPGRADE, not the fit the outer loop
+        // certified: the first-order correction at ρ̂ stays the outcome, with the
+        // node's refusal as its numerical-failure reason.
+        let point_results = match sigma_cubature_dispatch(self, &sigma_points, Some(final_fit)) {
+            Ok(results) => results,
+            Err(error) => {
+                return self.finalize_smoothing_outcome(first_order_numerical(
+                    first_order_correction,
+                    format!("sigma-point cubature could not integrate its nodes: {error}").into(),
+                ));
+            }
+        };
 
         // Dispersion scaling of the curvature (conditional-covariance) term.
         //
