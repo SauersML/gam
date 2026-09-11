@@ -2031,7 +2031,7 @@ fn required_model_columns(model_bytes: Vec<u8>, observed_score: bool) -> PyResul
     let mut columns = model.prediction_required_columns().map_err(py_value_error)?;
     if observed_score {
         let response = response_column_name(&model.formula)
-            .ok_or_else(|| py_value_error("CTN requires a named observed response"))?;
+            .ok_or_else(|| py_value_error("CTN requires a named observed response".to_string()))?;
         columns.insert(response);
     }
     Ok(Some(columns.into_iter().collect()))
