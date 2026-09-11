@@ -693,5 +693,17 @@
     ],
     "reason": "#2469: the warm-start transfer box. TransferConfig (and its Default impl) carried a saturation threshold and an interior clamp that refused to copy a parent rho past |rho| = 9 and pulled near-box values inward; RHO_SATURATION and the persist-side SATURATION_THRESHOLD gate repeated the same box; PROJECTED_BETA_CLAMP clamped the projected beta at 1e6. A finite converged parent rho is now copied as certified and the beta projection is minimum-norm through the eigen-expansion of TtT above gamma_red*max(lambda). saturated_parent_rho_not_copied asserted the retired refusal and is restated as a_large_finite_parent_rho_is_copied_verbatim; near_box_parent_rho_is_interior_clamped asserted the retired clamp.",
     "evidence": "At the base, git grep finds RHO_SATURATION only in warm_start_artifact.rs and warm_start_transfer.rs, TransferConfig only in warm_start_transfer.rs and custom_family_persistent_warm_start.rs, and the two private constants only in their own files; all three files are edited here, and build_warm_start takes the descriptor, terms, default rho and parent directly."
+  },
+  {
+    "base": "1ebf559eb76f88a6a45d6ba92b1a9accf2d7cdee",
+    "items": [
+      "crates/gam-terms/src/smooth/term_specs.rs:const:AUTO_LENGTH_SCALE_FLOOR",
+      "crates/gam-terms/src/smooth/term_specs.rs:const:BLOCK_SPARSE_ZERO_EPS",
+      "crates/gam-terms/src/smooth/term_specs.rs:const:EIGENVALUE_POSITIVITY_FLOOR",
+      "crates/gam-terms/src/smooth/term_specs.rs:const:SCALE_EPS",
+      "crates/gam-terms/src/smooth/term_specs.rs:const:STRUCTURAL_ZERO_FLOOR"
+    ],
+    "reason": "#2469: five hand tolerances of tensor-smooth construction. EIGENVALUE_POSITIVITY_FLOOR and STRUCTURAL_ZERO_FLOOR classified Kronecker joint eigenvalues, now against the marginal eigensolver bands (unweighted for the structural null, lambda-weighted for the penalized rank); BLOCK_SPARSE_ZERO_EPS dropped small entries from block-sparse penalties, which now keep exact nonzeros; SCALE_EPS is the column mean rounding band gamma_n*max|x|; AUTO_LENGTH_SCALE_FLOOR floored the automatic length scale, which a point cloud with no extent now declines to produce.",
+    "evidence": "All five were declared in crates/gam-terms/src/smooth/term_specs.rs; at the base git grep finds the public BLOCK_SPARSE_ZERO_EPS in no other file, and the private constants are used only there. This commit edits that file."
   }
 ]

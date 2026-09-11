@@ -2549,13 +2549,20 @@ impl KroneckerPenaltySystem {
         let mut rank = 0usize;
         let mut grad = Array1::<f64>::zeros(n_pen);
         let mut hess = Array2::<f64>::zeros((n_pen, n_pen));
-        // Positivity floor for a penalized eigenvalue `σ`: below this the mode
-        // is treated as an unpenalized (null-space) direction and excluded from
-        // both the rank count and the pseudo-log-determinant.
-        const EIGENVALUE_POSITIVITY_FLOOR: f64 = 1e-12;
-        // Floor on the *structural* eigenvalue sum (λ-independent) used to
-        // classify the joint null space.
-        const STRUCTURAL_ZERO_FLOOR: f64 = 1e-12;
+        // A joint eigenvalue is a sum over marginals of `λ_k·σ_k`, each `σ_k` off a
+        // marginal eigensolve that carries the band `γ_{q_k}·max|σ_k|`. The
+        // structural (λ-free) sum classifies the joint null space against the
+        // unweighted bands; the penalized sum counts toward the rank and the
+        // pseudo-log-determinant only above its λ-weighted band.
+        let marginal_bands: Vec<f64> = (0..d)
+            .map(|k| {
+                let marginal = &self.marginal_eigensystems[k].0;
+                gam_linalg::roundoff::accumulation_growth(marginal.len())
+                    * marginal.iter().fold(0.0_f64, |acc, value| acc.max(value.abs()))
+            })
+            .collect();
+        let structural_zero_band: f64 = marginal_bands.iter().sum();
+        let penalized_band: f64 = (0..d).map(|k| lambdas[k].abs() * marginal_bands[k]).sum();
         let mut multi_idx = vec![0usize; d];
         loop {
             let mut sigma = 0.0;
@@ -2565,15 +2572,15 @@ impl KroneckerPenaltySystem {
                 structural_sigma += marginal_eigenvalue;
                 sigma += lambdas[k] * marginal_eigenvalue;
             }
-            let joint_null = structural_sigma <= STRUCTURAL_ZERO_FLOOR;
+            let joint_null = structural_sigma <= structural_zero_band;
             if self.has_double_penalty && joint_null {
                 sigma += lambdas[d];
             }
-            if structural_sigma > STRUCTURAL_ZERO_FLOOR {
+            if structural_sigma > structural_zero_band {
                 sigma += objective_ridge;
             }
 
-            if sigma > EIGENVALUE_POSITIVITY_FLOOR {
+            if sigma > penalized_band {
                 rank += 1;
                 logdet += sigma.ln();
                 let inv_sigma = 1.0 / sigma;
@@ -4530,8 +4537,6 @@ pub struct RandomEffectBlock {
     pub kept_levels: Vec<u64>,
 }
 
-pub const BLOCK_SPARSE_ZERO_EPS: f64 = 1e-12;
-
 pub const BLOCK_SPARSE_MAX_DENSITY: f64 = 0.20;
 
 pub fn blocks_have_intrinsic_sparse_structure(blocks: &[DesignBlock]) -> bool {
@@ -4550,7 +4555,7 @@ pub fn sparse_compatible_block_nnz(block: &DesignBlock) -> Option<usize> {
         DesignBlock::Dense(dense) => dense.as_dense_ref().map(|matrix| {
             matrix
                 .iter()
-                .filter(|&&value| value.abs() > BLOCK_SPARSE_ZERO_EPS)
+                .filter(|&&value| value != 0.0)
                 .count()
         }),
     }
@@ -4611,7 +4616,7 @@ pub fn try_build_sparse_design_from_blocks(
                 for col in 0..sparse.ncols() {
                     for idx in col_ptr[col]..col_ptr[col + 1] {
                         let value = values[idx];
-                        if value.abs() > BLOCK_SPARSE_ZERO_EPS {
+                        if value != 0.0 {
                             triplets.push(Triplet::new(row_idx[idx], col_offset + col, value));
                         }
                     }
@@ -4627,7 +4632,7 @@ pub fn try_build_sparse_design_from_blocks(
                 for row in 0..matrix.nrows() {
                     for col in 0..matrix.ncols() {
                         let value = matrix[[row, col]];
-                        if value.abs() > BLOCK_SPARSE_ZERO_EPS {
+                        if value != 0.0 {
                             triplets.push(Triplet::new(row, col_offset + col, value));
                         }
                     }
@@ -4958,10 +4963,6 @@ pub fn plan_joint_spatial_centers_for_term_blocks(
     Ok(planned_blocks)
 }
 
-/// Tiny positive floor for the auto length scale, guarding against a zero
-/// kernel range when every feature column is (near-)constant.
-const AUTO_LENGTH_SCALE_FLOOR: f64 = 1e-6;
-
 /// Widest per-axis range of the selected feature columns. Returns `None` when
 /// every selected column is constant / non-finite (no usable spatial scale).
 fn feature_columns_max_range(data: ArrayView2<'_, f64>, feature_cols: &[usize]) -> Option<f64> {
@@ -5097,7 +5098,7 @@ pub fn auto_initial_length_scale(data: ArrayView2<'_, f64>, feature_cols: &[usiz
         return 1.0;
     };
     let init = max_range / (n as f64).sqrt();
-    init.max(AUTO_LENGTH_SCALE_FLOOR).min(max_range)
+    init.min(max_range)
 }
 
 /// Density-adaptive auto length scale for a kernel basis with `num_centers`
@@ -5151,7 +5152,7 @@ pub fn auto_initial_length_scale_for_centers(
     // shrinks it — never grows it — when `num_centers > n`.
     let resolution_points = n.max(num_centers).max(1) as f64;
     let spacing = max_range / resolution_points.sqrt();
-    spacing.max(AUTO_LENGTH_SCALE_FLOOR).min(max_range)
+    spacing.min(max_range)
 }
 
 /// Rotation-invariant center-resolution range for the companion Matérn basin.
@@ -5173,7 +5174,8 @@ pub fn matern_low_rank_center_resolution_length_scale(
     }
     let extent = feature_columns_rotation_invariant_range(data, feature_cols)?;
     let length_scale = extent / (num_centers as f64).sqrt();
-    Some(length_scale.max(AUTO_LENGTH_SCALE_FLOOR).min(extent))
+    // A point cloud with no extent has no spatial scale to derive one from.
+    (extent > 0.0).then(|| length_scale.min(extent))
 }
 
 /// Low-rank radial-basis length-scale seed tied to the requested center spacing.
@@ -5198,7 +5200,7 @@ pub fn auto_initial_length_scale_for_low_rank_centers(
     };
     let resolution_points = num_centers.max(1) as f64;
     let spacing = max_range / resolution_points.sqrt();
-    spacing.max(AUTO_LENGTH_SCALE_FLOOR).min(max_range)
+    spacing.min(max_range)
 }
 
 /// Requested center count encoded by a [`CenterStrategy`], if it carries an
@@ -5293,7 +5295,6 @@ pub fn auto_init_length_scale_in_basis(data: ArrayView2<'_, f64>, basis: &mut Sm
 
 impl LinearFitConditioning {
     pub fn from_columns(design: &TermCollectionDesign, selected_cols: &[usize]) -> Self {
-        const SCALE_EPS: f64 = 1e-12;
         let n = design.design.nrows();
         let p = design.design.ncols();
         let mut columns = Vec::with_capacity(selected_cols.len());
@@ -5310,6 +5311,7 @@ impl LinearFitConditioning {
         // pass-1 mean. This matches the original `Σ (x − mean)² / n` formula
         // without the catastrophic cancellation of `E[X²] − E[X]²`.
         let mut sums = vec![0.0_f64; selected_cols.len()];
+        let mut magnitudes = vec![0.0_f64; selected_cols.len()];
         for start in (0..n).step_by(chunk_rows) {
             let end = (start + chunk_rows).min(n);
             let chunk = design
@@ -5320,6 +5322,7 @@ impl LinearFitConditioning {
                 let column = chunk.column(col_idx);
                 for &v in column.iter() {
                     sums[k] += v;
+                    magnitudes[k] = magnitudes[k].max(v.abs());
                 }
             }
         }
@@ -5344,7 +5347,10 @@ impl LinearFitConditioning {
         for (k, &col_idx) in selected_cols.iter().enumerate() {
             let mean = means[k];
             let var = sq_devs[k] * inv_n;
-            let (mean, scale) = if var.is_finite() && var > SCALE_EPS * SCALE_EPS {
+            // A spread inside the column mean's rounding band `γ_n·max|x|` is
+            // arithmetic, not variation.
+            let spread_band = gam_linalg::roundoff::accumulation_growth(n) * magnitudes[k];
+            let (mean, scale) = if var.is_finite() && var.sqrt() > spread_band {
                 (mean, var.sqrt())
             } else {
                 // Leave nearly-constant columns untouched; centering them would collapse
