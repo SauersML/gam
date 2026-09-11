@@ -186,7 +186,7 @@ fn dot(a: &ArrayView1<f64>, b: &ArrayView1<f64>, reduction: DotReduction) -> f64
 /// must set `out <- A v`. The initial guess is `x = 0`. Convergence target is
 /// `‖r‖ ≤ max(rel_tol, γ_p) · ‖rhs‖`: a textbook RELATIVE residual criterion,
 /// with the relative target raised to the residual's own rounding band `γ_p`
-/// (see [`attainable_relative_residual`]) so it never chases progress the
+/// (see `attainable_relative_residual`) so it never chases progress the
 /// arithmetic cannot show. A zero rhs has the exact solution `x = 0`.
 /// Inexact-Newton callers (e.g. Eisenstat–Walker forcing for the joint
 /// PIRLS solver) rely on this relative contract: the historical
