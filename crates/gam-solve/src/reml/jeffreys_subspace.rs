@@ -2931,6 +2931,13 @@ pub struct JeffreysHphiDriftBase {
     divided_differences: std::sync::OnceLock<mixed::InverseDividedDifferences>,
 }
 
+/// Coefficient-axis information derivatives `{H²[d, e_a]}` rotated once into a
+/// drift base's eigenbasis, so every pair of an outer Hessian that reads the same
+/// mode response shares the rotation (#979, #1082).
+pub struct JeffreysRotatedAxes {
+    rows: Array2<f64>,
+}
+
 impl JeffreysHphiDriftBase {
     /// Whether the conditioning gate or the relative floor moves with β at this
     /// snapshot — the rule of [`JointJeffreysPlan::hessian_motion_active`] on the same
@@ -2953,8 +2960,16 @@ impl JeffreysHphiDriftBase {
             })
     }
 
-    /// β-drift of the gate and relative-floor motion inside the Jeffreys
-    /// mode-response curvature, applied to a coefficient direction (gam#1082).
+    /// Rotate `{H²[d, e_a]}` into this base's eigenbasis once; see
+    /// [`Self::completion_drift_action_from_rotated`].
+    pub fn rotate_axes(&self, axes: &[Array2<f64>]) -> Result<JeffreysRotatedAxes, String> {
+        Ok(JeffreysRotatedAxes {
+            rows: self.rotate_axis_rows(axes)?,
+        })
+    }
+
+    /// β-drift along `u` of the motion-completed Jeffreys completion, applied to `v`
+    /// (gam#1082).
     ///
     /// [`JointJeffreysPlan::hessian_motion`] completes `−∇²Φ` with
     /// `−M = −(⟨extra_trace_weight, H''⟩ + remainder)`, where with `Φ = G·U`
@@ -2966,11 +2981,10 @@ impl JeffreysHphiDriftBase {
     /// F[a,b] = ½·r·(w_a λ_max,b + w_b λ_max,a) + ½·S_ff·r²·λ_max,a λ_max,b .
     /// ```
     ///
-    /// The outer Hessian's second-order mode response reads `D_β(completion)[u]·v`, and
-    /// [`Self::completion_drift_action`] differentiates only the frozen-policy part.
-    /// This returns `D_u M[·, v]` by the product rule over every factor above; the
-    /// completion drift is the frozen action minus this. The extreme eigenvalues are
-    /// differentiated to third order:
+    /// The outer Hessian's second-order mode response reads `D_β(completion)[u]·v`.
+    /// This is the frozen-policy drift ([`Self::completion_drift_action`]) minus
+    /// `D_u M[·, v]`, which the product rule gives over every factor above, with the
+    /// extreme eigenvalues differentiated to third order:
     ///
     /// ```text
     /// λ_e,avu = T̃_a[e,e] + D²λ_e[B̃_av, P̃_u] + D²λ_e[B̃_au, P̃_v] + D²λ_e[B̃_uv, P̃_a] + D³λ_e[P̃_a, P̃_v, P̃_u],
@@ -2979,24 +2993,53 @@ impl JeffreysHphiDriftBase {
     /// ```
     ///
     /// where `P̃`, `B̃` and `T̃` are the first, second and third information derivatives
-    /// in the reduced eigenbasis. Inputs: `pert_h = H[u]`, `axes_v = {H²[v, e_a]}`,
-    /// `axes_u = {H²[u, e_a]}`, `moving_axes = {H³[u, v, e_a]}`. Zero where the motion is
-    /// inactive.
-    pub fn motion_drift_action(
+    /// in the reduced eigenbasis. Inputs: `pert_h = H[u]`; `axes_v = {H²[v, e_a]}` and
+    /// `axes_u = {H²[u, e_a]}` rotated by [`Self::rotate_axes`]; `moving_axes =
+    /// {H³[u, v, e_a]}`. `axes_u` is read only where the motion is active, and is
+    /// required there.
+    pub fn completion_drift_action_from_rotated(
         &self,
         v: &Array1<f64>,
         pert_h: &Array2<f64>,
-        axes_v: &[Array2<f64>],
-        axes_u: &[Array2<f64>],
+        axes_v: &JeffreysRotatedAxes,
+        axes_u: Option<&JeffreysRotatedAxes>,
         moving_axes: &[Array2<f64>],
     ) -> Result<Array1<f64>, String> {
-        let (p, m) = (self.p, self.m);
-        if v.len() != p || pert_h.dim() != (p, p) {
-            return Err("Jeffreys motion drift direction dimension mismatch".into());
+        if v.len() != self.p || pert_h.dim() != (self.p, self.p) {
+            return Err("Jeffreys completion drift direction dimension mismatch".into());
         }
-        let mut result = Array1::<f64>::zeros(p);
-        if !self.hessian_motion_active() {
-            return Ok(result);
+        let p_u = symmetric_basis_contraction(pert_h.view(), self.ambient_eigenbasis.view());
+        let third_rows = self.rotate_axis_rows(moving_axes)?;
+        let mut action = self.completion_drift_from_rows(&p_u, &axes_v.rows, &third_rows)?;
+        if self.hessian_motion_active() {
+            let axes_u = axes_u.ok_or_else(|| {
+                "Jeffreys completion drift requires H²[u,·] where the gate or the floor moves"
+                    .to_string()
+            })?;
+            action -= &self.motion_drift_from_rows(v, &p_u, &axes_v.rows, &axes_u.rows, &third_rows)?;
+        }
+        Ok(action)
+    }
+
+    /// `D_u M[·, v]` on rotated objects; see
+    /// [`Self::completion_drift_action_from_rotated`].
+    fn motion_drift_from_rows(
+        &self,
+        v: &Array1<f64>,
+        p_u: &Array2<f64>,
+        second_v_rows: &Array2<f64>,
+        second_u_rows: &Array2<f64>,
+        third_rows: &Array2<f64>,
+    ) -> Result<Array1<f64>, String> {
+        let (p, m) = (self.p, self.m);
+        let row_shape = (p, m * m);
+        if v.len() != p
+            || p_u.dim() != (m, m)
+            || second_v_rows.dim() != row_shape
+            || second_u_rows.dim() != row_shape
+            || third_rows.dim() != row_shape
+        {
+            return Err("Jeffreys motion drift dimension mismatch".into());
         }
         let (imin, imax) = (self.idx_min, self.idx_max);
         let evals = &self.evals;
@@ -3011,7 +3054,7 @@ impl JeffreysHphiDriftBase {
         } else {
             0.0
         };
-        let psi = floored_inverse_divided_differences(evals, floor);
+        let floor_moves = rate != 0.0;
         let mut ungated = 0.0_f64;
         let (mut s_f, mut s_ff, mut s_fff) = (0.0_f64, 0.0_f64, 0.0_f64);
         let mut inverse = Array1::<f64>::zeros(m);
@@ -3040,18 +3083,18 @@ impl JeffreysHphiDriftBase {
                 1.0 / gap
             }
         };
-        let second_v_rows = self.rotate_axis_rows(axes_v)?;
-        let second_u_rows = self.rotate_axis_rows(axes_u)?;
-        let third_rows = self.rotate_axis_rows(moving_axes)?;
-        let square =
-            |rows: &Array2<f64>, axis: usize| Array2::from_shape_fn((m, m), |(i, j)| rows[[axis, i * m + j]]);
-        let p_u = symmetric_basis_contraction(pert_h.view(), self.ambient_eigenbasis.view());
+        let square = |rows: &Array2<f64>, axis: usize| {
+            Array2::from_shape_fn((m, m), |(i, j)| rows[[axis, i * m + j]])
+        };
+        // `Σ_ij Ψ_ij P̃_a[i,j] P̃_u[i,j]` for every axis, read off the base's `Ψ ∘ P̃_a`
+        // rows instead of rebuilding `Ψ` per pair.
+        let divided_u = self.aw_rows.dot(&Array1::from_iter(p_u.iter().copied()));
         let mut p_v = Array2::<f64>::zeros((m, m));
         let mut b_uv = Array2::<f64>::zeros((m, m));
         for axis in 0..p {
             if v[axis] != 0.0 {
                 p_v.scaled_add(v[axis], &square(&self.a_rows, axis));
-                b_uv.scaled_add(v[axis], &square(&second_u_rows, axis));
+                b_uv.scaled_add(v[axis], &square(second_u_rows, axis));
             }
         }
         struct FirstOrder {
@@ -3096,7 +3139,9 @@ impl JeffreysHphiDriftBase {
                 .map(|x| Array1::from_shape_fn(m, |j| x[[e, j]] * gap_inverse(e, j)))
                 .collect();
             let mut sum = 0.0_f64;
-            for (outer, middle, last) in [(0usize, 1usize, 2usize), (0, 2, 1), (1, 0, 2), (1, 2, 0), (2, 0, 1), (2, 1, 0)] {
+            for (outer, middle, last) in
+                [(0usize, 1usize, 2usize), (0, 2, 1), (1, 0, 2), (1, 2, 0), (2, 0, 1), (2, 1, 0)]
+            {
                 sum += hats[outer].dot(&factors[middle].dot(&hats[last]))
                     - factors[outer][[e, e]] * hats[middle].dot(&hats[last]);
             }
@@ -3107,17 +3152,14 @@ impl JeffreysHphiDriftBase {
                             b: &Array2<f64>,
                             fx: &FirstOrder,
                             fy: &FirstOrder,
-                            lambda_max_xy: f64|
+                            lambda_max_xy: f64,
+                            divided: f64|
          -> f64 {
-            let mut divided = 0.0_f64;
             let mut kernel = 0.0_f64;
             let mut floor_cross = 0.0_f64;
             for i in 0..m {
                 kernel += inverse[i] * b[[i, i]];
                 floor_cross += inverse_floor[i] * (x[[i, i]] * fy.lambda_max + y[[i, i]] * fx.lambda_max);
-                for j in 0..m {
-                    divided += psi[[i, j]] * x[[i, j]] * y[[i, j]];
-                }
             }
             0.5 * divided
                 + 0.5 * kernel
@@ -3132,23 +3174,22 @@ impl JeffreysHphiDriftBase {
                 + g1 * lambda_min_xy
                 + g2 * lambda_max_xy
         };
-        let fu = first(&p_u);
+        let fu = first(p_u);
         let fv = first(&p_v);
-        let floor_moves = rate != 0.0;
         // `D_u w_x = Σ_i (∂²d/∂λ∂f·λ_i,u + ∂²d/∂f²·f_u)·λ_i,x + Σ_i ∂d/∂f·λ_i,xu`.
         let floor_trace_drift = |x: &Array2<f64>, b_xu: &Array2<f64>| -> f64 {
             let mut sum = 0.0_f64;
             for i in 0..m {
-                let lambda_xu = b_xu[[i, i]] + d2_extreme(i, x, &p_u);
+                let lambda_xu = b_xu[[i, i]] + d2_extreme(i, x, p_u);
                 sum += (inverse_lambda_floor[i] * p_u[[i, i]] + inverse_floor_floor[i] * rate * fu.lambda_max)
                     * x[[i, i]]
                     + inverse_floor[i] * lambda_xu;
             }
             sum
         };
-        let lambda_min_vu = second_extreme(imin, &p_v, &p_u, &b_uv);
-        let lambda_max_vu = second_extreme(imax, &p_v, &p_u, &b_uv);
-        let value_vu = value_second(&p_v, &p_u, &b_uv, &fv, &fu, lambda_max_vu);
+        let lambda_min_vu = second_extreme(imin, &p_v, p_u, &b_uv);
+        let lambda_max_vu = second_extreme(imax, &p_v, p_u, &b_uv);
+        let value_vu = value_second(&p_v, p_u, &b_uv, &fv, &fu, lambda_max_vu, v.dot(&divided_u));
         let gate_vu = gate_second(&fv, &fu, lambda_min_vu, lambda_max_vu);
         let floor_trace_vu = if floor_moves {
             floor_trace_drift(&p_v, &b_uv)
@@ -3167,24 +3208,25 @@ impl JeffreysHphiDriftBase {
             + ungated * (g12 * fu.lambda_min + g22 * fu.lambda_max)
             + 0.5 * fu.gate * s_f * rate
             + 0.5 * gate * s_f_drift * rate;
+        let mut result = Array1::<f64>::zeros(p);
         for axis in 0..p {
             let p_a = square(&self.a_rows, axis);
-            let b_av = square(&second_v_rows, axis);
-            let b_au = square(&second_u_rows, axis);
-            let t_a = square(&third_rows, axis);
+            let b_av = square(second_v_rows, axis);
+            let b_au = square(second_u_rows, axis);
+            let t_a = square(third_rows, axis);
             let fa = first(&p_a);
             let lambda_min_av = second_extreme(imin, &p_a, &p_v, &b_av);
             let lambda_max_av = second_extreme(imax, &p_a, &p_v, &b_av);
-            let lambda_min_au = second_extreme(imin, &p_a, &p_u, &b_au);
-            let lambda_max_au = second_extreme(imax, &p_a, &p_u, &b_au);
-            let value_au = value_second(&p_a, &p_u, &b_au, &fa, &fu, lambda_max_au);
+            let lambda_min_au = second_extreme(imin, &p_a, p_u, &b_au);
+            let lambda_max_au = second_extreme(imax, &p_a, p_u, &b_au);
+            let value_au = value_second(&p_a, p_u, &b_au, &fa, &fu, lambda_max_au, divided_u[axis]);
             let gate_au = gate_second(&fa, &fu, lambda_min_au, lambda_max_au);
             let third_extreme = |e: usize| {
                 t_a[[e, e]]
-                    + d2_extreme(e, &b_av, &p_u)
+                    + d2_extreme(e, &b_av, p_u)
                     + d2_extreme(e, &b_au, &p_v)
                     + d2_extreme(e, &b_uv, &p_a)
-                    + d3_extreme(e, [&p_a, &p_v, &p_u])
+                    + d3_extreme(e, [&p_a, &p_v, p_u])
             };
             let lambda_min_avu = third_extreme(imin);
             let lambda_max_avu = third_extreme(imax);
@@ -3715,10 +3757,16 @@ mod tests {
             + base
                 .completion_drift_action(&pert_h, &axes_v, &moving)
                 .expect("frozen completion drift");
-        let exact = &frozen
-            - &base
-                .motion_drift_action(&v, &pert_h, &axes_v, &axes_u, &moving)
-                .expect("motion drift");
+        let exact = hphi_drift.dot(&v)
+            + base
+                .completion_drift_action_from_rotated(
+                    &v,
+                    &pert_h,
+                    &base.rotate_axes(&axes_v).expect("rotated H²[v,·]"),
+                    Some(&base.rotate_axes(&axes_u).expect("rotated H²[u,·]")),
+                    &moving,
+                )
+                .expect("motion-completed drift");
         let step = 1e-5;
         let fd = (curvature(&(beta + &(&u * step))).dot(&v) - curvature(&(beta - &(&u * step))).dot(&v))
             / (2.0 * step);

@@ -951,30 +951,28 @@ pub(crate) fn custom_family_outer_jeffreys_hphi_drift_batched<
         let kept_second = Arc::new(std::sync::Mutex::new(Vec::new()));
         Arc::new(move |u: &Array1<f64>, v: &Array1<f64>| -> Result<Array1<f64>, CustomFamilyError> {
             let missing = || CustomFamilyError::trial_point("active Jeffreys mode response requires exact completion derivatives");
+            let base = prepare()?;
             let h = kept_along_response(&kept_first, u, || {
                 family
                     .joint_jeffreys_information_directional_derivative_with_specs(&states, &specs, u)?
                     .ok_or_else(missing)
             })?;
-            let axes = kept_along_response(&kept_second, v, || {
-                family
-                    .joint_jeffreys_information_second_directional_all_axes_with_specs(&states, &specs, v)?
-                    .ok_or_else(missing)
-            })?;
-            let moving = family.joint_jeffreys_information_third_directional_all_axes_with_specs(&states, &specs, u, v)?.ok_or_else(missing)?;
-            let base = prepare()?;
-            let mut action = base.completion_drift_action(&h, &axes, &moving)?;
+            // The rotation into the base's eigenbasis is kept with the derivative, so
+            // a pair only rotates its own third derivative.
+            let rotated = |direction: &Array1<f64>| {
+                kept_along_response(&kept_second, direction, || {
+                    let axes = family
+                        .joint_jeffreys_information_second_directional_all_axes_with_specs(&states, &specs, direction)?
+                        .ok_or_else(missing)?;
+                    Ok(base.rotate_axes(&axes)?)
+                })
+            };
+            let axes_v = rotated(v)?;
             // #1082: where the conditioning gate or the relative floor moves, the
-            // completion also carries their motion; its drift needs `H²[u,·]` too.
-            if base.hessian_motion_active() {
-                let axes_u = kept_along_response(&kept_second, u, || {
-                    family
-                        .joint_jeffreys_information_second_directional_all_axes_with_specs(&states, &specs, u)?
-                        .ok_or_else(missing)
-                })?;
-                action -= &base.motion_drift_action(v, &h, &axes, &axes_u, &moving)?;
-            }
-            Ok(action * strength)
+            // completion carries their motion, and its drift also reads `H²[u,·]`.
+            let axes_u = if base.hessian_motion_active() { Some(rotated(u)?) } else { None };
+            let moving = family.joint_jeffreys_information_third_directional_all_axes_with_specs(&states, &specs, u, v)?.ok_or_else(missing)?;
+            Ok(base.completion_drift_action_from_rotated(v, &h, &axes_v, axes_u.as_deref(), &moving)? * strength)
         })
     };
     let first = Arc::new(move |deltas: &[Array1<f64>]| {

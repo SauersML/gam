@@ -219,6 +219,17 @@ impl JeffreysHphiDriftBase {
         let e = symmetric_basis_contraction(pert_h.view(), self.ambient_eigenbasis.view());
         let a = self.rotate_axis_rows(axes)?;
         let da = self.rotate_axis_rows(moving_axes)?;
+        self.completion_drift_from_rows(&e, &a, &da)
+    }
+
+    /// [`Self::completion_drift_action`] on already-rotated objects: `e = Uᵀ H[u] U`,
+    /// and `a`, `da` the rotated rows of `{H[v, e_a]}` and `{H[u, v, e_a]}`.
+    pub(super) fn completion_drift_from_rows(
+        &self,
+        e: &Array2<f64>,
+        a: &Array2<f64>,
+        da: &Array2<f64>,
+    ) -> Result<Array1<f64>, String> {
         let (g_min, g_max) =
             conditioning_gate_weight_grad(self.evals[self.idx_min], self.evals[self.idx_max]);
         let dg = g_min * e[[self.idx_min, self.idx_min]]
