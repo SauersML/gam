@@ -153,13 +153,16 @@ impl RiemannianManifold for GrassmannManifold {
         let normal = z - fast_ab(&y, &yt_z);
         let m = fast_ab(&normal, &inv);
         let gram = fast_atb(&m, &m);
-        let (evals, v) = symmetric_eigen(&gram)?;
+        let (_, v) = symmetric_eigen(&gram)?;
         let mut sigma = Array1::<f64>::zeros(self.k);
         // U = M·V scaled column-wise by 1/tan(σ_j) (M·V is n×k · k×k, carrying n).
         let m_v = fast_ab(&m, &v);
         let mut u = Array2::<f64>::zeros((self.n, self.k));
         for j in 0..self.k {
-            let tan_sigma = evals[j].max(0.0).sqrt();
+            // tan σ_j = ‖M·v_j‖, read off M itself. The Gram eigenvalue tan²σ_j carries
+            // the eigensolver's absolute band ε·tan²σ_max, which swamps a small angle
+            // beside one near π/2; ‖M·v_j‖ carries only M's own rounding.
+            let tan_sigma = m_v.column(j).dot(&m_v.column(j)).sqrt();
             sigma[j] = tan_sigma.atan();
             if tan_sigma > GEOMETRY_EPS {
                 let inv_tan = 1.0 / tan_sigma;

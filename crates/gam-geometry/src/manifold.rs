@@ -979,9 +979,22 @@ pub(crate) fn skew_log_orthogonal(v: &Array2<f64>) -> GeometryResult<Array2<f64>
     // A rotation by π (eigenvalue −1 of V) is the cut locus: the logarithm is
     // not single-valued there. Detect it from M's spectrum directly — on such a
     // plane sin θ = 0 so K carries no signal and an element-wise scaling would
-    // silently drop the π rotation. M's eigenvalues lie in [−1, 1]; one inside the
-    // eigensolver band `n·ε` of −1 is that rotation to working precision.
-    let cut_locus_band = n as f64 * f64::EPSILON;
+    // silently drop the π rotation. V is orthogonal only to the defect
+    // `‖VᵀV − I‖_F` it arrives with, which bounds how far M's spectrum sits from
+    // that of the nearest orthogonal matrix, so an eigenvalue within that defect,
+    // the `n·γ_n` rounding of measuring it and the eigensolver band `n·ε` of −1 is
+    // a rotation by π (or a reflection) to working precision.
+    let vtv = fast_atb(v, v);
+    let mut defect_sq = 0.0;
+    for i in 0..n {
+        for j in 0..n {
+            let e = vtv[[i, j]] - if i == j { 1.0 } else { 0.0 };
+            defect_sq += e * e;
+        }
+    }
+    let cut_locus_band = defect_sq.sqrt()
+        + n as f64 * gam_linalg::roundoff::accumulation_growth(n)
+        + n as f64 * f64::EPSILON;
     if evals.iter().any(|&lam| lam + 1.0 <= cut_locus_band) {
         return Err(GeometryError::Unsupported(
             "matrix logarithm undefined: rotation angle at π (beyond the injectivity radius)",
