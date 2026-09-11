@@ -270,7 +270,9 @@ pub(crate) fn planted_line_cloud(n: usize, p: usize, span: f64, sigma: f64) -> P
 
 /// The euclidean/ordinal companion sweep. Reports whether the fit refuses and
 /// with what, plus the linear recovery R² of the fitted chart coordinate
-/// against the planted ordinal position.
+/// against the planted ordinal position. It grades nothing about the table; it
+/// asserts only that every row is readable (a refusal names its reason, a fit
+/// carries a finite EV and chart, and R² is a squared correlation).
 #[test]
 fn zz_2691_euclidean_line_refusal_sweep() {
     // Every chart dimension the issue reports the euclidean arm refusing at.
@@ -305,6 +307,10 @@ fn zz_2691_euclidean_line_refusal_sweep() {
                 match result {
                     Err(error) => {
                         let text = format!("{error}").replace('\n', " ");
+                        assert!(
+                            !text.trim().is_empty(),
+                            "a refusal row must name its reason (n={n}, p={p}, sigma={sigma})"
+                        );
                         eprintln!("[2691-line] {n}\t{p}\t{sigma:.3}\t-\t-\t-\t{secs:.1}\tREFUSED: {text}");
                     }
                     Ok(_) => {
@@ -331,6 +337,16 @@ fn zz_2691_euclidean_line_refusal_sweep() {
                             0.0
                         };
                         let std = (sxx / nn).sqrt();
+                        assert!(
+                            ev.is_finite() && coord.iter().all(|value| value.is_finite()),
+                            "a fit that returned Ok must carry a finite EV and chart \
+                             (n={n}, p={p}, sigma={sigma}, ev={ev})"
+                        );
+                        assert!(
+                            (0.0..=1.0 + 1.0e-12).contains(&r2),
+                            "the recovery R² is a squared correlation \
+                             (n={n}, p={p}, sigma={sigma}, r2={r2})"
+                        );
                         eprintln!(
                             "[2691-line] {n}\t{p}\t{sigma:.3}\t{ev:.4}\t{std:.3e}\t{r2:.4}\t{secs:.1}\t-"
                         );

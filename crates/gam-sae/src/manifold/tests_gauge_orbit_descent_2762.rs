@@ -229,9 +229,11 @@ fn gauge_orbit_descent_commits_nothing_and_moves_nothing_at_zero_rounds_2762() {
 
 /// #2762 PROBE — the removed span's whole first-order state at the seed and
 /// after a planted displacement inside it, plus the layout the step application
-/// actually uses. Printed, not asserted: this exists so the planted-witness test
-/// beside it is premised on measurements rather than on what the layout comment
-/// says.
+/// actually uses. Printed, not graded: it asserts only the premises its table is
+/// read under (a finite seed objective and gradient, a non-empty removed span to
+/// plant along, a nonzero span-removed gradient to sweep along). This exists so
+/// the planted-witness test beside it is premised on measurements rather than on
+/// what the layout comment says.
 #[test]
 fn zz2762_removed_span_slope_and_layout_census() {
     let k = 2usize;
@@ -261,6 +263,14 @@ fn zz2762_removed_span_slope_and_layout_census() {
     let basis = term
         .likelihood_flat_block_basis(&lambda_smooth)
         .expect("descent block");
+    assert!(
+        seed_objective.is_finite() && gradient.iter().all(|value| value.is_finite()),
+        "the census reads the seed objective and gradient, so both must be finite"
+    );
+    assert!(
+        !basis.is_empty(),
+        "the census plants along the first removed-span direction, so the span must be non-empty"
+    );
     eprintln!(
         "[zz2762] seed objective={seed_objective:.9e} ‖g‖={:.6e} span_dim={}",
         gradient.dot(&gradient).sqrt(),
@@ -358,6 +368,11 @@ fn zz2762_removed_span_slope_and_layout_census() {
         }
     }
     let slope = direction.dot(&direction).sqrt();
+    assert!(
+        slope.is_finite() && slope > 0.0,
+        "the sweep normalizes the span-removed gradient, so its norm must be finite and positive: \
+         {slope:e}"
+    );
     for value in direction.iter_mut() {
         *value /= slope;
     }
