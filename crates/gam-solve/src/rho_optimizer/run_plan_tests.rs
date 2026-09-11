@@ -5997,6 +5997,85 @@ fn run_nonconverged_arc_returns_typed_checkpoint_after_budget_retry_ladder() {
     );
 }
 
+/// gam#2817 — the ARC budget-exhaustion retry continues ONE exhausted
+/// trajectory, so it must not re-enter a seed the exhausted attempt already ran.
+///
+/// Same quartic ladder as
+/// `run_nonconverged_arc_returns_typed_checkpoint_after_budget_retry_ladder`:
+/// every seed exhausts `max_iter = 1`, the cascade runs past the initial `[5.0]`
+/// to the neutral baseline `[0.0]`, and both retries fire. A retry is seeded at
+/// the exhausted checkpoint, never at `[5.0]`, so `[5.0]`'s evaluation count is
+/// what one solver start from a seed costs on this route. `[0.0]` is started by
+/// the first attempt as well; a retry that re-enters it pays that start again
+/// from the state `obj.reset()` restored, which is the replay gam#1082's penguin
+/// arm measured bit-identically on every retry.
+#[test]
+fn arc_budget_retry_does_not_replay_a_seed_the_exhausted_attempt_started_2817() {
+    const OFFSET: f64 = 0.5;
+    const SCALE: f64 = 1.0e6;
+    let mut seed_config = gam_problem::SeedConfig::default();
+    seed_config.seed_budget = 1;
+    seed_config.risk_profile = gam_problem::SeedRiskProfile::Gaussian;
+    let (_d, session) = tmp_cache_session("arc-retry-replay-2817");
+    let problem = OuterProblem::new(1)
+        .with_gradient(Derivative::Analytic)
+        .with_hessian(DeclaredHessianForm::Either)
+        .with_seed_config(seed_config)
+        .with_initial_rho(array![5.0])
+        .with_max_iter(1)
+        .with_cache_session(Arc::clone(&session));
+    let evaluated: Arc<std::sync::Mutex<Vec<f64>>> = Arc::default();
+    let recorder = Arc::clone(&evaluated);
+    let mut obj = problem.build_objective(
+        (),
+        |_: &mut (), theta: &Array1<f64>| Ok(SCALE * (theta[0] - OFFSET).powi(4)),
+        move |_: &mut (), theta: &Array1<f64>| {
+            recorder
+                .lock()
+                .expect("the evaluation recorder is never poisoned")
+                .push(theta[0]);
+            let d = theta[0] - OFFSET;
+            Ok(OuterEval {
+                cost: SCALE * d.powi(4),
+                gradient: array![SCALE * 4.0 * d.powi(3)],
+                hessian: HessianValue::Dense(array![[SCALE * 12.0 * d.powi(2)]]),
+                inner_beta_hint: None,
+            })
+        },
+        None::<fn(&mut ())>,
+        None::<fn(&mut (), &Array1<f64>) -> Result<EfsEval, EstimationError>>,
+    );
+    let error = problem
+        .run(&mut obj, "arc budget retry replay #2817")
+        .expect_err("an exhausted ARC ladder must return typed non-convergence");
+    assert!(
+        matches!(error, EstimationError::RemlDidNotConverge { .. }),
+        "expected typed REML non-convergence, got {error}"
+    );
+    let evaluated = evaluated
+        .lock()
+        .expect("the evaluation recorder is never poisoned")
+        .clone();
+    let starts_at = |point: f64| evaluated.iter().filter(|&&theta| theta == point).count();
+    let initial = starts_at(5.0);
+    let baseline = starts_at(0.0);
+    eprintln!(
+        "[#2817 arc retry replay] evaluations at initial seed [5.0]={initial}, at neutral \
+         baseline [0.0]={baseline}; trail={evaluated:?}"
+    );
+    assert!(
+        initial > 0 && baseline > 0,
+        "fixture precondition: the first attempt must start both the initial seed and the \
+         neutral baseline (initial={initial}, baseline={baseline})"
+    );
+    assert_eq!(
+        baseline, initial,
+        "an ARC budget retry re-entered the neutral baseline the exhausted attempt had already \
+         run: {baseline} evaluation(s) there against {initial} at the initial seed, which no \
+         retry can reach"
+    );
+}
+
 #[test]
 fn arc_budget_retry_continues_only_the_exhausted_checkpoint() {
     let mut config = OuterConfig::default();

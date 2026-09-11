@@ -137,10 +137,12 @@ pub(crate) struct OuterConfig {
     /// `max_seeds` truncation; the certified keep-best loop optimizes each one.
     pub(crate) initial_rho_candidates: Vec<Array1<f64>>,
     /// Seed points an EARLIER round of this same [`run_outer`] call already
-    /// started and whose certification it already refused (#2569).
+    /// started and either refused at certification (#2569) or ran to exhaustion
+    /// (#2817).
     ///
-    /// Set only by the certify-resume loop, from
-    /// [`OuterResult::refused_seed_points`]. The plan runner drops these from
+    /// Set by the certify-resume loop, from [`OuterResult::refused_seed_points`],
+    /// and by the ARC budget-exhaustion retry, from
+    /// [`OuterResult::started_seed_points`]. The plan runner drops these from
     /// its cascade (never the caller's own `initial_rho`, which is the reseed
     /// point the resume exists to explore), because re-running them from the
     /// reset state they were refused in reproduces the recorded verdict digit
@@ -1485,6 +1487,19 @@ pub struct OuterResult {
     /// recorded refusal digit for digit. A seed that has NOT been started and
     /// refused is never suppressed, so no rescue path is closed.
     pub refused_seed_points: Vec<Array1<f64>>,
+    /// Every seed point this plan run started a solver from (#2817).
+    ///
+    /// `refused_seed_points` records only a verdict that re-entering the point
+    /// provably reproduces: a certificate refusal, or an exhaustion by a solver
+    /// that consumes no transferred metric (`Solver::Efs`). The ARC
+    /// budget-exhaustion retry needs the complementary fact. It continues ONE
+    /// exhausted trajectory from its checkpoint, and every other seed the
+    /// exhausted attempt started has already run to its terminal state from the
+    /// state `obj.reset()` restores, so entering it again is a second multistart
+    /// rather than a continuation (gam#1082's penguin arm re-ran one such seed
+    /// bit-identically on every retry). A seed the attempt never started is not
+    /// in this list, so the fall-through keeps its rescue role.
+    pub started_seed_points: Vec<Array1<f64>>,
 }
 
 /// An active-set reduction reseed (#2392): re-run the outer search with a set of
@@ -1531,6 +1546,7 @@ impl OuterResult {
             cost_stall_probe_scale: None,
             origin: OuterResultOrigin::Solver,
             refused_seed_points: Vec::new(),
+            started_seed_points: Vec::new(),
         }
     }
 
@@ -8562,6 +8578,19 @@ pub(crate) fn run_outer_uncertified(
                     // `prev_attempt_grad_norm` and the next terminal norm now
                     // belong to the same trajectory.
                     restrict_arc_retry_to_checkpoint(&mut next);
+                    // `seed_budget = 1` is not binding while nothing has certified
+                    // (`should_start_next_seed`), so the resumed plan falls through
+                    // past the checkpoint to the generated seeds and model-derived
+                    // candidates. Each one the exhausted attempt started has already
+                    // run to its terminal state from the state `obj.reset()`
+                    // restores, and entering it again replays that run. Suppress
+                    // exactly those, accumulated across retries; a seed that was
+                    // never started keeps its rescue role (#2817, #2569).
+                    for point in &result.started_seed_points {
+                        if !next.previously_refused_seed_points.contains(point) {
+                            next.previously_refused_seed_points.push(point.clone());
+                        }
+                    }
                     retry_config = Some(next);
                     arc_retries_left -= 1;
                     obj.reset();

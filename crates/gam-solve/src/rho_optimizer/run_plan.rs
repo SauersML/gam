@@ -117,6 +117,45 @@ fn certificate_refused_seed_points(
     points
 }
 
+/// Count one solver start and remember the seed point it started from (#2817).
+///
+/// The count drives `should_start_next_seed`. The points leave on an exhausted
+/// checkpoint as `OuterResult::started_seed_points`, which the ARC budget retry
+/// suppresses so that it continues the exhausted trajectory instead of replaying
+/// every seed the attempt already ran. The generated seed is recorded, not a
+/// projected copy, so the points compare equal to the cascade the retry filters
+/// with [`seeds_without_recorded_refusals`].
+fn note_started_seed(
+    started_seeds: &mut usize,
+    started_seed_points: &mut Vec<Array1<f64>>,
+    seed_as_generated: &Array1<f64>,
+) {
+    *started_seeds += 1;
+    if !started_seed_points.contains(seed_as_generated) {
+        started_seed_points.push(seed_as_generated.clone());
+    }
+}
+
+/// A one-shot reseed retry returns its own outcome, and that checkpoint knows only
+/// the reseed's starts. Fold in the seeds the enclosing attempt already started,
+/// so an ARC budget retry built from the checkpoint cannot replay them (#2817).
+fn with_enclosing_started_seed_points(
+    outcome: PlanRunOutcome,
+    started_seed_points: &[Array1<f64>],
+) -> PlanRunOutcome {
+    match outcome {
+        PlanRunOutcome::Exhausted(mut checkpoint) => {
+            for point in started_seed_points {
+                if !checkpoint.started_seed_points.contains(point) {
+                    checkpoint.started_seed_points.push(point.clone());
+                }
+            }
+            PlanRunOutcome::Exhausted(checkpoint)
+        }
+        other => other,
+    }
+}
+
 /// The seed point of an exhausted iterate, when re-entering it would provably
 /// reproduce the exhaustion — otherwise `None`.
 ///
@@ -1599,6 +1638,9 @@ pub(crate) fn run_outer_with_plan(
     // the more-penalized basin in the non-Gaussian multi-start keep-best.
     let rho_dim = layout.rho_dim();
     let mut started_seeds = 0usize;
+    // The seed points behind `started_seeds`, recorded by `note_started_seed` and
+    // handed to an exhausted checkpoint for the ARC budget retry (#2817).
+    let mut started_seed_points: Vec<Array1<f64>> = Vec::new();
     // Set to `Some(key)` when every observed rejection so far carries
     // the same genuinely structural `(KktRefusalDiagnosis,
     // carrying_block)` pair AND we've seen at least
@@ -1876,7 +1918,7 @@ pub(crate) fn run_outer_with_plan(
             ),
         };
         if let Some(seed_cost) = zero_iteration_cost {
-            started_seeds += 1;
+            note_started_seed(&mut started_seeds, &mut started_seed_points, seed_as_generated);
             let mut candidate = OuterResult::new(seed.clone(), seed_cost, 0, true, *the_plan);
             candidate.origin = OuterResultOrigin::SeedAcceptedWithoutIteration;
             match CertifiedOuterCandidate::from_solver_claim(obj, config, context, candidate) {
@@ -2222,7 +2264,7 @@ pub(crate) fn run_outer_with_plan(
                         err,
                     ));
                 }
-                started_seeds += 1;
+                note_started_seed(&mut started_seeds, &mut started_seed_points, seed_as_generated);
                 seed_slot = started_seeds;
 
                 let cheap_materializable_operator = matches!(
@@ -2928,7 +2970,7 @@ pub(crate) fn run_outer_with_plan(
                             ));
                         }
                     };
-                    started_seeds += 1;
+                    note_started_seed(&mut started_seeds, &mut started_seed_points, seed_as_generated);
                     seed_slot = started_seeds;
                     let device_input = crate::gpu::reml_outer::RemlOuterGpuInput {
                         seed_rho: seed.clone(),
@@ -3107,7 +3149,7 @@ pub(crate) fn run_outer_with_plan(
                             ));
                         }
                     };
-                    started_seeds += 1;
+                    note_started_seed(&mut started_seeds, &mut started_seed_points, seed_as_generated);
                     seed_slot = started_seeds;
                     // The seed a BFGS run is handed, and the (cost, gradient)
                     // it is handed WITH it. `with_initial_sample` below means
@@ -3533,7 +3575,7 @@ pub(crate) fn run_outer_with_plan(
                     "fixed-point solver failed",
                 ) {
                     Ok(result) => {
-                        started_seeds += 1;
+                        note_started_seed(&mut started_seeds, &mut started_seed_points, seed_as_generated);
                         seed_slot = started_seeds;
                         Ok(result)
                     }
@@ -3563,7 +3605,7 @@ pub(crate) fn run_outer_with_plan(
                         return Ok(PlanRunOutcome::FirstOrderFallbackRequested(request));
                     }
                     Err(FixedPointOuterRunError::Failed(err)) => {
-                        started_seeds += 1;
+                        note_started_seed(&mut started_seeds, &mut started_seed_points, seed_as_generated);
                         seed_slot = started_seeds;
                         Err(err)
                     }
@@ -3582,7 +3624,7 @@ pub(crate) fn run_outer_with_plan(
                     "hybrid EFS solver failed",
                 ) {
                     Ok(result) => {
-                        started_seeds += 1;
+                        note_started_seed(&mut started_seeds, &mut started_seed_points, seed_as_generated);
                         seed_slot = started_seeds;
                         Ok(result)
                     }
@@ -3612,7 +3654,7 @@ pub(crate) fn run_outer_with_plan(
                         return Ok(PlanRunOutcome::FirstOrderFallbackRequested(request));
                     }
                     Err(FixedPointOuterRunError::Failed(err)) => {
-                        started_seeds += 1;
+                        note_started_seed(&mut started_seeds, &mut started_seed_points, seed_as_generated);
                         seed_slot = started_seeds;
                         Err(err)
                     }
@@ -3940,7 +3982,9 @@ pub(crate) fn run_outer_with_plan(
         retry_config.seed_config.seed_budget = 1;
         obj.reset();
         match run_outer_with_plan(obj, &retry_config, context, cap, the_plan, false) {
-            Ok(outcome) => return Ok(outcome),
+            Ok(outcome) => {
+                return Ok(with_enclosing_started_seed_points(outcome, &started_seed_points));
+            }
             Err(retry_error) => {
                 log::warn!(
                     "[OUTER] {context}: confirmed-tail reseed retry failed ({retry_error}); \
@@ -3971,7 +4015,9 @@ pub(crate) fn run_outer_with_plan(
         retry_config.seed_config.seed_budget = 1;
         obj.reset();
         match run_outer_with_plan(obj, &retry_config, context, cap, the_plan, false) {
-            Ok(outcome) => return Ok(outcome),
+            Ok(outcome) => {
+                return Ok(with_enclosing_started_seed_points(outcome, &started_seed_points));
+            }
             Err(retry_error) => {
                 log::warn!(
                     "[OUTER] {context}: saddle-escape reseed retry failed ({retry_error}); \
@@ -3984,6 +4030,7 @@ pub(crate) fn run_outer_with_plan(
     if let Some(mut checkpoint) = best_checkpoint {
         checkpoint.refused_seed_points =
             certificate_refused_seed_points(&seed_rejections, &seeds, &budget_exhausted_seed_points);
+        checkpoint.started_seed_points = started_seed_points;
         return Ok(PlanRunOutcome::Exhausted(checkpoint));
     }
 
