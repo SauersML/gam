@@ -177,10 +177,11 @@ fn fit_and_predict(
         stderr_tail(&predict.stderr)
     );
     (
-        read_named_column(out_path, "mean"),
-        read_named_column(out_path, "sigma"),
-        read_named_column(out_path, "mean_lower"),
-        read_named_column(out_path, "mean_upper"),
+        // The unified location-scale prediction schema (c268bc693, #2803).
+        read_named_column(out_path, "posterior_mean"),
+        read_named_column(out_path, "noise_scale"),
+        read_named_column(out_path, "posterior_mean_lower"),
+        read_named_column(out_path, "posterior_mean_upper"),
     )
 }
 

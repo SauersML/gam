@@ -616,11 +616,28 @@ mod tests {
         assert_eq!(gradient[[0, 1]], 0.0);
         assert_eq!(curvature[[0, 1]], 0.0);
 
+        // Active cells carry the Bernoulli score and Fisher weight. Production
+        // evaluates them through the stable natural-parameter observation (the
+        // curvature in the log domain), so they agree with the textbook
+        // `w·(y − μ)` and `w·μ(1 − μ)` to roundoff, not bit for bit.
+        let agrees = |value: f64, reference: f64| {
+            (value - reference).abs() <= 8.0 * f64::EPSILON * reference.abs().max(1.0)
+        };
         for &(row, output) in &[(0usize, 0usize), (1, 0), (1, 1)] {
             let mu = logit_mu(eta[[row, output]]);
             let weight = cell_weights[[row, output]];
-            assert_eq!(gradient[[row, output]], weight * (y[[row, output]] - mu));
-            assert_eq!(curvature[[row, output]], weight * mu * (1.0 - mu));
+            let score = weight * (y[[row, output]] - mu);
+            let fisher = weight * mu * (1.0 - mu);
+            assert!(
+                agrees(gradient[[row, output]], score),
+                "cell ({row},{output}) score {} vs w(y-mu) {score}",
+                gradient[[row, output]]
+            );
+            assert!(
+                agrees(curvature[[row, output]], fisher),
+                "cell ({row},{output}) curvature {} vs w mu(1-mu) {fisher}",
+                curvature[[row, output]]
+            );
         }
     }
 

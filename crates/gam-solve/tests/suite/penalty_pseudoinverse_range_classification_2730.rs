@@ -5,23 +5,32 @@
 //! `GaussianRemlEigenCache::penalty_rank` is defined by a relative,
 //! scale-invariant threshold.  The pseudoinverse feeding
 //! `gaussian_reml_multi_shared_dispersion_penalty_gradient_from_fit` used to ask
-//! the same question with an absolute `delta > 0.0`, and the eigensolver returns
+//! the same question with an absolute `delta > 0.0`, and the eigensolver returned
 //! numerically null directions as small POSITIVE numbers — the cache's cleanup
-//! loop only zeroes negative ones.  The reciprocal of such a value then lands in
+//! loop only zeroed negative ones.  The reciprocal of such a value then landed in
 //! the returned gradient.
 //!
 //! Measured on this fixture before the repair: `penalty_rank = 6` while seven
-//! eigenvalues pass `delta > 0.0`, the seventh being `3.20001575162645240e-18`;
-//! removing the range pseudoinverse from the returned gradient leaves
+//! eigenvalues passed `delta > 0.0`, the seventh being `3.20001575162645240e-18`;
+//! removing the range pseudoinverse from the returned gradient left
 //! `1.6182871562151468e15` against a range contribution of `1.4682801591665569e0`.
+//!
+//! Since then the defect has been closed at the cache boundary rather than
+//! inside the gradient (#2833, #2739). A built cache takes its rank from the
+//! supplied penalty's own spectrum and zeroes the whitened null block, and
+//! `validate_gaussian_reml_eigen_cache` refuses any cache — built here or supplied
+//! through a warm start — whose null modes are not exactly zero, or whose declared
+//! rank disagrees with the positive count in its declared range. So a
+//! roundoff-positive null eigenvalue can no longer reach the gradient at all. The
+//! tests below pin that boundary and the magnitude property on a healthy cache.
 //!
 //! The chart here is deliberately NOT near-interpolating — its pooled deviance
 //! sits about ten orders of magnitude above its own roundoff — so neither test
 //! can pass or fail for a reason belonging to the near-interpolating regime.
 //!
-//! The two tests are separate `#[test]` functions on purpose: as one function
-//! the first assertion aborts before the second property is ever exercised, and
-//! an arm that never runs is not an arm.
+//! The tests are separate `#[test]` functions on purpose: as one function the
+//! first assertion aborts before the next property is ever exercised, and an arm
+//! that never runs is not an arm.
 
 use gam_solve::gaussian_reml::{
     GaussianRemlMultiResult, gaussian_reml_multi_shared_dispersion_closed_form,
@@ -31,6 +40,10 @@ use ndarray::{Array1, Array2};
 
 const ROWS: usize = 46;
 const COEFFICIENTS: usize = 8;
+
+/// The roundoff-positive null eigenvalue the eigensolver produced on this fixture
+/// before the cache boundary zeroed null modes.
+const MEASURED_ROUNDOFF_NULL_EIGENVALUE: f64 = 3.20001575162645240e-18;
 
 fn design() -> Array2<f64> {
     let mut x = Array2::<f64>::zeros((ROWS, COEFFICIENTS));
@@ -98,10 +111,9 @@ struct Fixture {
     gradient: Array2<f64>,
 }
 
-/// The fixture together with the preconditions BOTH tests depend on.  A green in
-/// either test is mute unless the spectrum actually carries a positive-but-null
-/// direction, so those checks live here and fail loudly rather than being
-/// assumed.
+/// The healthy fixture together with the invariants every test depends on: the
+/// cache's null block is exactly zero (the production cache boundary), and the
+/// chart is healthy.
 fn fixture() -> Fixture {
     let x = design();
     let s = penalty();
@@ -111,19 +123,16 @@ fn fixture() -> Fixture {
             .expect("healthy shared-dispersion forward fit");
 
     let rank = fit.cache.penalty_rank;
-    let positive = fit
-        .cache
-        .penalty_eigenvalues
-        .iter()
-        .filter(|delta| **delta > 0.0)
-        .count();
     assert_eq!(rank, COEFFICIENTS - 2, "fixture must have rank 6");
     assert_eq!(fit.cache.nullity, 2, "fixture must have nullity 2");
     assert!(
-        positive > rank,
-        "precondition unmet: the spectrum carries no positive-but-null direction \
-         (rank={rank}, eigenvalues passing `> 0.0`={positive}); this fixture cannot \
-         exercise the branch under test and a pass here would be mute"
+        fit.cache
+            .penalty_eigenvalues
+            .iter()
+            .take(fit.cache.nullity)
+            .all(|&delta| delta == 0.0),
+        "a built cache must carry exactly zero null modes: {:?}",
+        fit.cache.penalty_eigenvalues
     );
 
     let shared_nu = (ROWS - fit.cache.nullity) as f64;
@@ -202,47 +211,59 @@ fn penalty_gradient_carries_no_term_the_classified_range_cannot_explain() {
     );
 }
 
-/// A direction the cache classified as NULL must not influence the gradient at
-/// all.  Rescale that eigenvalue — it stays null under the relative threshold
-/// either way — and the returned gradient must be bit-identical.  `λ·δ`
-/// underflows to zero in `1/(1 + λ·δ)` for both values, so the inverse Hessian is
-/// untouched and this isolates the pseudoinverse.  Under an absolute `δ > 0.0`
-/// test the gradient moves by the rescaling factor.
-///
-/// This fails for a reason independent of the magnitude bound above: it would
-/// still fire if the spurious term were small enough to sit under that bound.
+/// A direction the cache classifies as NULL must not influence the gradient. A
+/// cache arriving with the measured roundoff-positive null eigenvalue — the
+/// input that used to leak `1/roundoff` into the gradient — is now refused at the
+/// cache boundary, before any range selection could read it. The unplanted
+/// healthy cache is the positive control that the refusal belongs to the planted
+/// value, not to the fixture.
 #[test]
 fn penalty_gradient_does_not_read_an_eigenvalue_the_cache_classified_as_null() {
     let case = fixture();
-    let rank = case.fit.cache.penalty_rank;
+    let null_slot = case.fit.cache.nullity - 1;
 
-    let null_index = (0..COEFFICIENTS)
-        .find(|index| {
-            !case.retained.contains(index) && case.fit.cache.penalty_eigenvalues[*index] > 0.0
-        })
-        .expect("the fixture precondition established a positive null direction");
-
-    let mut perturbed = case.fit.clone();
-    perturbed.cache.penalty_eigenvalues[null_index] *= 1.0e-3;
-    let perturbed_gradient = gaussian_reml_multi_shared_dispersion_penalty_gradient_from_fit(
+    let mut planted = case.fit.clone();
+    planted.cache.penalty_eigenvalues[null_slot] = MEASURED_ROUNDOFF_NULL_EIGENVALUE;
+    assert!(
+        planted.cache.penalty_eigenvalues[null_slot] > 0.0
+            && planted.cache.penalty_rank == case.fit.cache.penalty_rank
+            && planted.cache.nullity == case.fit.cache.nullity,
+        "the plant must add one positive null eigenvalue and leave rank and nullity untouched"
+    );
+    let planted_result = gaussian_reml_multi_shared_dispersion_penalty_gradient_from_fit(
         case.x.view(),
         case.y.view(),
         case.s.view(),
         None,
-        &perturbed,
-    )
-    .expect("penalty gradient after rescaling a null eigenvalue");
+        &planted,
+    );
+    match planted_result {
+        Ok(_) => panic!(
+            "a cache whose null slot {null_slot} holds {MEASURED_ROUNDOFF_NULL_EIGENVALUE:e} was \
+             served a gradient; a roundoff-positive null eigenvalue must be refused at the cache \
+             boundary, not read by the pseudoinverse"
+        ),
+        Err(error) => assert!(
+            error.to_string().contains("null modes must be exactly zero"),
+            "the planted null eigenvalue must be refused by the cache null-mode invariant, got: \
+             {error}"
+        ),
+    }
 
+    let healthy = gaussian_reml_multi_shared_dispersion_penalty_gradient_from_fit(
+        case.x.view(),
+        case.y.view(),
+        case.s.view(),
+        None,
+        &case.fit,
+    )
+    .expect("the unplanted healthy cache is served a gradient");
     for row in 0..COEFFICIENTS {
         for col in 0..COEFFICIENTS {
             assert_eq!(
                 case.gradient[[row, col]].to_bits(),
-                perturbed_gradient[[row, col]].to_bits(),
-                "entry ({row},{col}) moved from {} to {} when eigenvalue {null_index} — \
-                 classified null by penalty_rank={rank} — was scaled by 1e-3; the gradient \
-                 is reading a direction the cache calls null",
-                case.gradient[[row, col]],
-                perturbed_gradient[[row, col]]
+                healthy[[row, col]].to_bits(),
+                "the healthy cache must reproduce the fixture gradient bit for bit at ({row},{col})"
             );
         }
     }
@@ -251,18 +272,14 @@ fn penalty_gradient_does_not_read_an_eigenvalue_the_cache_classified_as_null() {
 /// #2739 follow-up. The shared predicate makes the selected count equal
 /// `penalty_rank` only when `penalty_rank` was derived from this same array. A
 /// cache supplied through `GaussianRemlWarmStart` or `prepare_gaussian_reml`'s
-/// `Some(eigen_cache)` can carry a rank computed under another rule, and
-/// `validate_gaussian_reml_eigen_cache` checks only `penalty_rank + nullity == p`
-/// — never the rank against the spectrum. Both cases below leave that shape
-/// invariant intact, so a refusal cannot come from the shape validator instead.
+/// `Some(eigen_cache)` can carry a rank computed under another rule, so the
+/// cache boundary must refuse a declared rank its own spectrum does not support.
+/// Both cases below leave `penalty_rank + nullity == p` intact, so a refusal
+/// cannot come from the shape check instead.
 ///
 /// The demotion case is the isolated one: `penalty_rank` and `nullity` are both
 /// untouched, so `shared_nu`, the pooled deviance and `deviance_scale` are all
-/// unchanged and nothing but the range selection can move. Declaring a smaller
-/// rank would NOT be isolated — `nullity` has to rise with it to keep
-/// `penalty_rank + nullity == p`, which changes the residual degrees of freedom
-/// and moves the gradient through the deviance term for a reason that has
-/// nothing to do with the pseudoinverse.
+/// unchanged and nothing but the range selection can move.
 #[test]
 fn penalty_gradient_refuses_a_cache_whose_rank_disagrees_with_its_own_spectrum() {
     let case = fixture();

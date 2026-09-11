@@ -865,8 +865,9 @@ fn tweedie_dispersion_location_scale_assembles_covariance_and_is_predictable() {
             }
         })
         .collect();
+    // An explicit power is required (a893d85bc); fit at the simulated one.
     assert_orthogonal_dispersion_family_predictable(
-        "tweedie",
+        &format!("tweedie(p={p})"),
         DispersionFamilyKind::Tweedie { p },
         &x,
         &y,

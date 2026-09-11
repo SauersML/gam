@@ -81,10 +81,12 @@ fn kappa_one_kernel_is_exact_great_circle_1404() {
         [2.0 * x / s, 2.0 * y / s, (1.0 - r2) / s]
     };
     for i in 0..pts.nrows() {
-        // Exact-zero self-distance: a cancellation-prone `acos(p·q)` reference
-        // would land near exp(−2e-4/ℓ) ≈ 0.99987 here; the exact geodesic is 1.
+        // Exact-zero self-distance. The model kernel is `ℓ·expm1(−d/ℓ)` (#2747:
+        // the `−1` is annihilated by the sum-to-zero frame), so the diagonal is
+        // exactly zero. A cancellation-prone `acos(p·q)` reference would give
+        // `d ≈ 2e-4` and a diagonal near `−2e-4` instead.
         assert!(
-            (k[(i, i)] - 1.0).abs() < 1e-12,
+            k[(i, i)] == 0.0,
             "great-circle self-distance not zero: K[{i},{i}] = {} (acos cancellation?)",
             k[(i, i)]
         );

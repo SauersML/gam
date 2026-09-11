@@ -314,8 +314,18 @@ fn check_case(shape: &Shape, n: usize, degen: Degeneracy, seed: u64) -> Result<(
         ));
     }
 
-    // I3 finite objective.
-    if !fit.fit.reml_score().is_some_and(f64::is_finite) {
+    // I3 finite objective. A certified exact interpolation (φ̂ = 0) has an
+    // unbounded profiled Gaussian likelihood, so it declines the criterion
+    // (`reml_score() == None`, #2595) instead of publishing a number. That
+    // absence is the contract, not a violation; every other fit must carry a
+    // finite criterion.
+    let certified_exact_boundary = fit
+        .fit
+        .dispersion()
+        .is_some_and(|dispersion| dispersion.is_zero_estimate());
+    if !(fit.fit.reml_score().is_some_and(f64::is_finite)
+        || (certified_exact_boundary && fit.fit.reml_score().is_none()))
+    {
         return Err(format!(
             "{repro}\n  I3 VIOLATED: non-finite reml_score {:?}",
             fit.fit.reml_score()

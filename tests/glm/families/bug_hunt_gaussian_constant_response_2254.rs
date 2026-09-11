@@ -71,15 +71,33 @@ fn gaussian_constant_response_fits_completely_and_builds_payload_2254() {
                 panic!("`{formula}` on constant y did not produce a standard fit");
             };
 
-            // (1) The fit carries a complete inference bundle.
+            // (1) The fit carries a complete inference bundle. The penalized
+            // precision is published in the fit's coefficient gauge. On the
+            // exact-boundary shortcut (e2e456fba) a mixed zero/infinite penalty
+            // face has no finite ambient Hessian, so the precision lives on the
+            // tangent space `null(S_infinite)` that the gauge describes. An
+            // identity gauge is the ordinary raw p×p frame.
             let hessian = fit.fit.penalized_hessian().unwrap_or_else(|| {
                 panic!("`{formula}` on constant y={yval}: missing penalized Hessian")
             });
             let p = fit.fit.beta.len();
+            let gauge = &fit
+                .fit
+                .geometry
+                .as_ref()
+                .unwrap_or_else(|| panic!("`{formula}` on constant y={yval}: missing fit geometry"))
+                .coefficient_gauge;
+            assert_eq!(
+                gauge.raw_total(),
+                p,
+                "`{formula}`: the coefficient gauge must span the raw coefficient vector"
+            );
+            let free = gauge.reduced_total();
             assert_eq!(
                 (hessian.nrows(), hessian.ncols()),
-                (p, p),
-                "`{formula}`: penalized Hessian must be p×p"
+                (free, free),
+                "`{formula}`: penalized precision must be square in the coefficient gauge \
+                 ({free} free of {p} raw coordinates)"
             );
             assert!(
                 hessian.iter().all(|v| v.is_finite()),

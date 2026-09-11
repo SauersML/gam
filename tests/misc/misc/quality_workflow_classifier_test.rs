@@ -7,17 +7,22 @@ fn test_reference_quality_classifier() {
     // Extract the classifier logic
     let start_marker = "gamfit_re='IntegrationFailed|InvalidConfig";
 
+    // The block is the marker line plus the `if ... fi` chain written at the
+    // SAME indentation. It contains nested `if`s (the REF_ERROR source lookup),
+    // so stopping at the first `fi` would cut the script mid-block and make it
+    // print nothing.
     let mut classifier_code = String::new();
-    let mut in_block = false;
+    let mut block_indent: Option<usize> = None;
     for line in yaml.lines() {
         let trimmed = line.trim();
-        if trimmed.starts_with(start_marker) {
-            in_block = true;
+        let indent = line.len() - line.trim_start().len();
+        if block_indent.is_none() && trimmed.starts_with(start_marker) {
+            block_indent = Some(indent);
         }
-        if in_block {
+        if let Some(block_indent) = block_indent {
             classifier_code.push_str(line);
             classifier_code.push('\n');
-            if trimmed == "fi" {
+            if trimmed == "fi" && indent == block_indent {
                 break;
             }
         }
@@ -70,9 +75,16 @@ echo "$outcome,$cause"
                 .output()
                 .unwrap();
             let stdout = String::from_utf8(output.stdout).unwrap();
-            let trimmed = stdout.trim();
-            let parts: Vec<&str> = trimmed.split(',').collect();
-            (parts[0].to_string(), parts[1].to_string())
+            // The classifier may echo diagnostics (the REF_ERROR source lookup
+            // does) before the script's final `outcome,cause` line.
+            let last = stdout.trim().lines().last().unwrap_or_default();
+            let (outcome, cause) = last.split_once(',').unwrap_or_else(|| {
+                panic!(
+                    "classifier printed no `outcome,cause` line; stdout={stdout:?} stderr={:?}",
+                    String::from_utf8_lossy(&output.stderr)
+                )
+            });
+            (outcome.to_string(), cause.to_string())
         };
 
     // Test 1: PASS
