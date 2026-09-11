@@ -4639,22 +4639,21 @@ impl SaeManifoldTerm {
         // `pc_pair_offset` rotates the residual-PC assignment so a co-collapse
         // multi-start RETRY (offset = retry index) reads a disjoint principal
         // subspace from the previous attempt; the per-atom breach arm passes 0
-        // (its single reseed needs no rotation).
+        // (its single reseed needs no rotation). On the data-row branch the same
+        // index selects the next block of worst-reconstructed rows.
         let n = self.n_obs();
-        // #2023 dead-atom DATA-ROW reseed (default-off via GAM_SAE_DATA_ROW_RESEED).
-        // The PCA reseed's diversity is capped at pc_pairs ≈ min(n, p)/2 principal
-        // pairs; a co-collapsed dictionary leaves residual ≈ target, so once a
-        // multi-start RETRY exhausts that pool (pc_pair_offset ≥ pc_pairs) it
-        // re-reads the SAME leading PCs → the same degenerate basin → the
-        // reseed-duplication spiral. When the lever is on AND every reseeded atom
-        // is a FLAT kind (EuclideanPatch | Linear — the only kinds whose PCA seed
-        // is the euclidean score-projection this data-row path mirrors), draw the
-        // exhausted-pool retries from DISTINCT DATA ROWS (n ≫ p, unbounded
-        // diversity) instead. Unset (default) ⇒ this branch never runs and the
-        // seed is bit-identical to the historical PCA path. Chart kinds
-        // (Periodic/Sphere/Torus/Cylinder/…) always fall through to the PCA seed
-        // — their data-row anchoring is the curved-tier follow-up.
-        let pc_pairs = (residual.ncols().min(n)) / 2;
+        // #2023 dead-atom DATA-ROW reseed (the typed, default-off lever
+        // `data_row_reseed`). The PCA reseed's diversity is capped at ≈ min(n, p)/2
+        // principal pairs, and a co-collapsed dictionary leaves residual ≈ target,
+        // so its retries keep re-reading the same leading components. With the
+        // lever on and every reseeded atom a FLAT kind (EuclideanPatch | Linear —
+        // the only kinds whose PCA seed is the euclidean score-projection this path
+        // mirrors), EVERY reseed, at every retry, draws from the worst-reconstructed
+        // data rows instead: the architecture's "dead-atom resampling draws from
+        // high-residual data rows, never from PCs". Unset (default) ⇒ this branch
+        // never runs and the seed is bit-identical to the historical PCA path. Chart
+        // kinds (Periodic/Sphere/Torus/Cylinder/…) always fall through to the PCA
+        // seed — their data-row anchoring is the curved-tier follow-up.
         // #2023 — typed per-fit opt-in (was the GAM_SAE_DATA_ROW_RESEED env lever).
         let data_row_reseed = self.data_row_reseed;
         let all_flat = basis_kinds.iter().all(|k| {
@@ -4679,15 +4678,10 @@ impl SaeManifoldTerm {
         // Per reseeded ATOM, not per call: one exhausted-pool retry that
         // re-plants four atoms on the same leading PCs is four chances to
         // re-collapse, and a per-call count would report it as one.
-        let seeded = if data_row_reseed && all_flat && n > 0 && pc_pair_offset >= pc_pairs.max(1) {
-            // Distinct anchor row per (atom, retry), spanning the full n-row range
-            // so successive exhausted-pool retries never re-anchor identically.
-            let anchor_rows: Vec<usize> = (0..atoms.len())
-                .map(|slot| (slot + pc_pair_offset.wrapping_mul(atoms.len().max(1))) % n)
-                .collect();
+        let seeded = if data_row_reseed && all_flat && n > 0 {
             self.data_row_reseeded_atoms =
                 self.data_row_reseeded_atoms.saturating_add(atoms.len());
-            sae_data_row_anchored_euclidean_coords(residual.view(), &dims, &anchor_rows)?
+            sae_data_row_anchored_euclidean_coords(residual.view(), &dims, pc_pair_offset)?
         } else {
             self.pc_reseeded_atoms = self.pc_reseeded_atoms.saturating_add(atoms.len());
             sae_pca_seed_initial_coords_with_pc_offset(

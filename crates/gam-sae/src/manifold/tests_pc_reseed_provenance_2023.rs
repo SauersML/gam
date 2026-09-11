@@ -138,3 +138,62 @@ fn the_data_row_rule_is_opt_in_so_the_default_is_still_a_pc_reseed_2023() {
     );
     assert_eq!(term.data_row_reseeded_atoms, 0);
 }
+
+/// With the lever ON a flat atom resamples from the WORST-RECONSTRUCTED data rows at
+/// every retry, not only once the PC pool is exhausted, and the retry index walks
+/// down that ranking.
+///
+/// The residual is planted so the ranking is known by construction. The fixture's
+/// decoder is zero, so the reconstruction residual is `-target`, whose row energies
+/// are 0.25, 0.64, 4.0 and 1.44: the order is rows [2, 3, 1, 0]. In this residual no
+/// row's similarity to an anchor exceeds the anchor's own, so the anchor row lands at
+/// exactly `+0.5`. Before this rule both arms failed on the same calls: at retry 0
+/// the data-row branch waited for the pool to empty (`pc_pairs = min(n, p) / 2 = 1`),
+/// and at retry 1 the anchor was index arithmetic, row 1, not the second-worst row.
+#[test]
+fn flat_atoms_reseed_from_the_worst_reconstructed_rows_at_every_retry_2023() {
+    let mut term = trivial_k1_euclidean_term();
+    assert_eq!(
+        (term.n_obs(), term.output_dim()),
+        (4, 3),
+        "#2023: the planted residual below is written for this fixture's shape"
+    );
+    let target = ndarray::array![
+        [0.5, 0.0, 0.0],
+        [0.0, 0.8, 0.0],
+        [0.0, 0.0, 2.0],
+        [1.2, 0.0, 0.0],
+    ];
+    let rho = SaeManifoldRho::new(0.0, 0.0, vec![Array1::<f64>::zeros(1)]);
+    term.set_data_row_reseed(true);
+
+    term.reseed_atoms_onto_distinct_residual_pcs(&[0], target.view(), &rho, 0)
+        .expect("#2023: the first reseed must succeed");
+    assert_eq!(
+        (term.data_row_reseeded_atoms, term.pc_reseeded_atoms),
+        (1, 0),
+        "#2023: with the lever on, the FIRST reseed of a flat atom must already draw \
+         from data rows"
+    );
+    let coords = term.assignment.coords[0].as_matrix();
+    assert_eq!(
+        coords[[2, 0]],
+        0.5,
+        "#2023: retry 0 must anchor at the worst-reconstructed row, row 2: {coords:?}"
+    );
+
+    term.reseed_atoms_onto_distinct_residual_pcs(&[0], target.view(), &rho, 1)
+        .expect("#2023: the second reseed must succeed");
+    assert_eq!(
+        (term.data_row_reseeded_atoms, term.pc_reseeded_atoms),
+        (2, 0),
+        "#2023: every retry of a flat atom with the lever on draws from data rows"
+    );
+    let coords = term.assignment.coords[0].as_matrix();
+    assert_eq!(
+        coords[[3, 0]],
+        0.5,
+        "#2023: retry 1 must anchor at the second-worst row, row 3, instead of \
+         re-anchoring on row 2: {coords:?}"
+    );
+}
