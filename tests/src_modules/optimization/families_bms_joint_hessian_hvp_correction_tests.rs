@@ -273,6 +273,143 @@ fn rigid_third_information_all_axes_grams_match_triple_sum_979() {
     }
 }
 
+/// #979: the ψ third-information object assembled from per-axis weighted Grams equals
+/// the explicit sum of every coefficient triple's design-row products over the same
+/// per-row data, for a β direction on either design block and for a ψ pair, under
+/// both latent measures and unequal block widths.
+#[test]
+fn rigid_hyper_third_information_grams_match_triple_sum_979() {
+    for empirical in [false, true] {
+        let n = 29;
+        let mut family = make_block_psi_test_family(n);
+        if empirical {
+            family.latent_measure = empirical_rigid_fd_fixture().0.latent_measure;
+            family.gaussian_frailty_sd = Some(0.82);
+        }
+        family.marginal_design = DesignMatrix::Dense(
+            Array2::from_shape_fn((n, 3), |(i, j)| {
+                0.2 + 0.3 * (0.17 * (i + 5 * j) as f64).sin()
+            })
+            .into(),
+        );
+        family.slope_design = DesignMatrix::Dense(
+            Array2::from_shape_fn((n, 2), |(i, j)| 0.4 * (0.13 * (i + 3 * j) as f64).cos())
+                .into(),
+        );
+        let blocks = vec![
+            vec![crate::custom_family::CustomFamilyBlockPsiDerivative::new(
+                None,
+                Array2::from_shape_fn((n, 3), |(i, j)| 0.2 * (0.11 * (i + 7 * j) as f64).cos()),
+                Array2::zeros((3, 3)),
+                None,
+                None,
+                None,
+                None,
+            )],
+            vec![crate::custom_family::CustomFamilyBlockPsiDerivative::new(
+                None,
+                Array2::from_shape_fn((n, 2), |(i, j)| 0.3 * (0.23 * (i + 2 * j) as f64).cos()),
+                Array2::zeros((2, 2)),
+                None,
+                None,
+                None,
+                None,
+            )],
+        ];
+        let layout = bms_test_design_hyper_layout(blocks, array![0.0, 0.0]);
+        let (pm, p) = (3, 5);
+        let beta = array![0.15, -0.1, 0.05, 0.25, -0.12];
+        let marginal = beta.slice(s![..pm]).to_owned();
+        let slope = beta.slice(s![pm..]).to_owned();
+        let states = vec![
+            ParameterBlockState {
+                eta: family.marginal_design.to_dense().dot(&marginal),
+                beta: marginal,
+            },
+            ParameterBlockState {
+                eta: family.slope_design.to_dense().dot(&slope),
+                beta: slope,
+            },
+        ];
+        let direction = array![0.3, 0.1, -0.2, 0.05, 0.4];
+        let options = BlockwiseFitOptions::default();
+        let mut row_weights = vec![0.0; n];
+        for row in crate::marginal_slope_shared::outer_weighted_rows(&options, n) {
+            row_weights[row.index] = row.weight;
+        }
+        let block = |a: usize| usize::from(a >= pm);
+        for (psi_i, psi_j) in [(0, None), (1, None), (0, Some(1))] {
+            let beta_direction = psi_j.is_none().then_some(&direction);
+            let assembled = family
+                .rigid_hyper_information_third_axes(&states, &layout, psi_i, psi_j, beta_direction, &options)
+                .expect("Gram-assembled psi third information")
+                .expect("the rigid path assembles psi third information");
+            let axis_i = family
+                .resolve_psi_axis_spec(layout.design_derivative_blocks(), psi_i, 0)
+                .expect("first moving design axis");
+            let axis_j = psi_j.map(|j| {
+                family
+                    .resolve_psi_axis_spec(layout.design_derivative_blocks(), j, 0)
+                    .expect("second moving design axis")
+            });
+            let axes = super::information_third::HyperThirdInformationAxes {
+                axis_i: &axis_i,
+                block_i: psi_i,
+                axis_j: axis_j.as_ref(),
+                map_ij: None,
+                beta_direction,
+            };
+            let rows = family
+                .rigid_hyper_third_information_rows(&states, &axes, &row_weights, 0..n)
+                .expect("psi third information rows");
+            let mut expected = vec![Array2::<f64>::zeros((p, p)); p];
+            for local in 0..n {
+                let (x, xu, xv, xuv) = (
+                    rows.x.row(local),
+                    rows.xu.row(local),
+                    rows.xv.row(local),
+                    rows.xuv.row(local),
+                );
+                for c in 0..p {
+                    for a in 0..p {
+                        for b in 0..p {
+                            let r = rows.coefficients[local][block(a)][block(b)][block(c)];
+                            let first_u =
+                                xu[a] * x[b] * x[c] + x[a] * xu[b] * x[c] + x[a] * x[b] * xu[c];
+                            let first_v =
+                                xv[a] * x[b] * x[c] + x[a] * xv[b] * x[c] + x[a] * x[b] * xv[c];
+                            let mixed = xuv[a] * x[b] * x[c]
+                                + x[a] * xuv[b] * x[c]
+                                + x[a] * x[b] * xuv[c]
+                                + xu[a] * xv[b] * x[c]
+                                + xu[a] * x[b] * xv[c]
+                                + xv[a] * xu[b] * x[c]
+                                + x[a] * xu[b] * xv[c]
+                                + xv[a] * x[b] * xu[c]
+                                + x[a] * xv[b] * xu[c];
+                            expected[c][[a, b]] += x[a] * x[b] * x[c] * r[0]
+                                + first_u * r[2]
+                                + first_v * r[1]
+                                + mixed * r[3];
+                        }
+                    }
+                }
+            }
+            for axis in 0..p {
+                assert!(
+                    expected[axis].iter().any(|value| *value != 0.0),
+                    "empirical={empirical} psi=({psi_i},{psi_j:?}) axis={axis}: the fixture must exercise a nonzero tensor"
+                );
+                let rel = rel_diff_array2(&assembled[axis], &expected[axis]);
+                assert!(
+                    rel < 1e-12,
+                    "empirical={empirical} psi=({psi_i},{psi_j:?}) axis={axis}: Gram assembly differs from the triple sum by {rel}"
+                );
+            }
+        }
+    }
+}
+
 #[test]
 fn rigid_third_information_axes_match_mixed_drift_finite_difference_979() {
     use crate::outer_subsample::OuterScoreSubsample;
