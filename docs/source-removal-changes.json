@@ -666,5 +666,18 @@
     ],
     "reason": "#2469: MAX_HALLEY_STEPS capped the inverse-gamma quantile iteration, which now stops when a step is no smaller than the previous one or no longer moves the iterate; SCALE_EPS and the inline 1e-12 constancy and intercept tolerances of parametric conditioning are the column's rounding band gamma_p*max|x|; GAP_TOL padded a strict separation comparison; KRONECKER_STRUCTURAL_ZERO_TOL is the marginal eigensolvers' band sum_k gamma_{q_k}*max|sigma_k|; ZERO_EPS dropped small nonzeros from structural sparsity, which is exact zeros.",
     "evidence": "Every use was in the same function as its declaration and is replaced in the same commit. MSI lane c9 with this wave stacked: cargo check --workspace --all-targets 0 errors, 0 warnings; gam-solve --lib -- prefit penalty kronecker sparse_from_dense loop_driver 108 passed 0 failed; gam-inference --lib -- probability quantile gamma 62 passed 0 failed."
+  },
+  {
+    "base": "7c9276adf257ec01ca2624deef6922c5d7e1a664",
+    "items": [
+      "crates/gam-models/src/survival/location_scale/constants.rs:const:DYKSTRA_PROJECTION_TOL",
+      "crates/gam-models/src/survival/location_scale/constants.rs:const:DYKSTRA_ROW_DEGENERACY_FLOOR",
+      "crates/gam-models/src/survival/location_scale/constants.rs:const:PSD_EIGENVALUE_ABS_FLOOR",
+      "crates/gam-models/src/survival/location_scale/constants.rs:const:PSD_EIGENVALUE_REL_TOL",
+      "crates/gam-models/src/survival/location_scale/constants.rs:const:REDUCED_AFT_OBJ_TOL_FLOOR",
+      "crates/gam-models/src/survival/location_scale/constants.rs:const:STRUCTURAL_GUESS_AGE_FLOOR"
+    ],
+    "reason": "#2469: six hand floors of the location-scale survival solver. DYKSTRA_PROJECTION_TOL is the downstream feasibility gate the projection is certified against; DYKSTRA_ROW_DEGENERACY_FLOOR is an exactly-zero row normal; PSD_EIGENVALUE_REL_TOL and PSD_EIGENVALUE_ABS_FLOOR are the eigensolver band gamma_p*max|lambda|; REDUCED_AFT_OBJ_TOL_FLOOR is the caller inner_tol raised to the objective rounding band gamma_{n+p^2}*|ll|; STRUCTURAL_GUESS_AGE_FLOOR is replaced by declining the warm start at a zero exit age.",
+    "evidence": "At the base, git grep finds these names only in location_scale/constants.rs, time_block.rs, moments.rs, truncated_moments.rs, family_solver.rs, fit.rs and tests.rs, every one of which this commit edits."
   }
 ]

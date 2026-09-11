@@ -101,7 +101,10 @@ pub(crate) fn factorize_psd_covariance(
     let max_abs_eigenvalue = eigenvalues
         .iter()
         .fold(0.0_f64, |acc, &ev| acc.max(ev.abs()));
-    let tol = (max_abs_eigenvalue * PSD_EIGENVALUE_REL_TOL).max(PSD_EIGENVALUE_ABS_FLOOR);
+    // An eigenvalue inside the eigensolver's rounding band `γ_p·max|λ|` is zero to
+    // the resolution this decomposition has: below `−band` the block is genuinely
+    // indefinite, and only directions above `band` carry covariance.
+    let tol = gam_linalg::roundoff::accumulation_growth(eigenvalues.len()) * max_abs_eigenvalue;
     if eigenvalues.iter().any(|&ev| ev < -tol) {
         return Err(SurvivalLocationScaleError::InvalidConfiguration {
             reason: format!(

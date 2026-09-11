@@ -224,7 +224,9 @@ pub(crate) fn build_truncated_coefficient_law(
     let max_eigenvalue = eigenvalues
         .iter()
         .fold(0.0_f64, |acc, &value| acc.max(value.abs()));
-    let floor = (max_eigenvalue * PSD_EIGENVALUE_REL_TOL).max(PSD_EIGENVALUE_ABS_FLOOR);
+    // A Gram eigenvalue inside the eigensolver's rounding band `γ_p·max|λ|` is a
+    // rank-deficient gauge direction.
+    let floor = gam_linalg::roundoff::accumulation_growth(eigenvalues.len()) * max_eigenvalue;
     if eigenvalues.iter().any(|&value| value <= floor) {
         return Err(format!(
             "survival location-scale truncated response moments: the coefficient gauge is rank \

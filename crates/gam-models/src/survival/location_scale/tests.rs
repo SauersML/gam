@@ -6571,7 +6571,7 @@ fn reduced_parametric_aft_converges_and_recovers_lognormal_mle_2112() {
         inverse_link: residual_distribution_inverse_link(ResidualDistribution::Gaussian),
         derivative_guard: DEFAULT_SURVIVAL_LOCATION_SCALE_DERIVATIVE_GUARD,
         max_iter: 200,
-        // 1e-8 == REDUCED_AFT_OBJ_TOL_FLOOR: the pre-fix failing regime (see doc).
+        // 1e-8: the pre-fix failing regime (see `fit_parametric_aft_direct_mle`).
         tol: 1e-8,
         time_block: TimeBlockInput {
             design_entry: DesignMatrix::from(design_entry),

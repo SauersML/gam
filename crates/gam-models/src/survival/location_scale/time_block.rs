@@ -103,7 +103,12 @@ pub(crate) fn structural_time_initial_beta_guess(
 
     let mut target = Array1::<f64>::zeros(n);
     for i in 0..n {
-        let desired = 1.0 / age_exit[i].max(STRUCTURAL_GUESS_AGE_FLOOR);
+        // An exit at age 0 has no finite `1/age` target: the warm start is
+        // unavailable rather than built on a floored age.
+        if !(age_exit[i] > 0.0) {
+            return None;
+        }
+        let desired = 1.0 / age_exit[i];
         target[i] = (desired - derivative_offset_exit[i]).max(0.0);
     }
 
@@ -604,15 +609,16 @@ pub fn project_onto_linear_constraints(
 
     // Dykstra safety net (alternating projection is guaranteed to converge to
     // the exact projection onto a convex intersection of halfspaces). Collapse
-    // bit-identical rows first (tied-time duplicates that DO coincide), run to
-    // the internal tolerance, then HARD-CHECK feasibility against the
-    // downstream gate — no silent infeasible return.
+    // bit-identical rows first (tied-time duplicates that DO coincide), run until
+    // the violation clears the downstream gate the result is certified against,
+    // then HARD-CHECK feasibility against it — no silent infeasible return. A row
+    // whose normal is exactly zero states no halfspace and is skipped.
     let mut seen: std::collections::HashSet<Box<[u64]>> =
         std::collections::HashSet::with_capacity(n_rows);
     let mut unique_rows: Vec<usize> = Vec::with_capacity(n_rows);
     for i in 0..n_rows {
         let row_i = constraints.a.row(i);
-        if row_i.dot(&row_i) <= DYKSTRA_ROW_DEGENERACY_FLOOR {
+        if row_i.dot(&row_i) == 0.0 {
             continue;
         }
         let mut key: Vec<u64> = Vec::with_capacity(dim + 1);
@@ -630,7 +636,7 @@ pub fn project_onto_linear_constraints(
         for (slot, &i) in unique_rows.iter().enumerate() {
             let row = constraints.a.row(i);
             let row_norm_sq = row.dot(&row);
-            if row_norm_sq <= DYKSTRA_ROW_DEGENERACY_FLOOR {
+            if row_norm_sq == 0.0 {
                 continue;
             }
             let y = &beta + &corrections.row(slot);
@@ -645,7 +651,7 @@ pub fn project_onto_linear_constraints(
             corrections.row_mut(slot).assign(&(&y - &projected));
             beta.assign(&projected);
         }
-        if max_violation <= DYKSTRA_PROJECTION_TOL {
+        if max_violation <= DOWNSTREAM_FEASIBILITY_GATE_TOL {
             break;
         }
     }

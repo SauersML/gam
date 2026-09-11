@@ -48,23 +48,6 @@ pub(crate) const MONOTONE_CONE_FEASIBILITY_GATE_TOL: f64 =
 /// near-degenerate constraint set and keeps the warm-start best-effort.
 pub(crate) const DYKSTRA_PROJECTION_MAX_SWEEPS: usize = 100;
 
-/// Absolute feasibility tolerance at which the Dykstra projection sweep is
-/// declared converged (max constraint violation below this stops the loop).
-pub(crate) const DYKSTRA_PROJECTION_TOL: f64 = 1e-10;
-
-/// Squared-row-norm floor below which a constraint row is treated as
-/// structurally empty and skipped during Dykstra projection (avoids dividing
-/// the projection step by a vanishing normal).
-pub(crate) const DYKSTRA_ROW_DEGENERACY_FLOOR: f64 = 1e-18;
-
-/// Relative tolerance (× the largest |eigenvalue|) for accepting a covariance
-/// block as positive semidefinite, floored by an absolute value so an
-/// all-tiny-eigenvalue block is not rejected on pure round-off. Eigenvalues
-/// below `-tol` flag a genuine indefinite block.
-pub(crate) const PSD_EIGENVALUE_REL_TOL: f64 = 1e-12;
-
-pub(crate) const PSD_EIGENVALUE_ABS_FLOOR: f64 = 1e-14;
-
 /// Levenberg damping schedule for the direct parametric-AFT Newton solve. When
 /// the Hessian is not Cholesky-factorizable, damping starts at
 /// `INITIAL × max(1, ‖diag H‖∞)`, grows by `GROWTH` per failed factorization,
@@ -107,21 +90,6 @@ pub(crate) const BLOCKWISE_OUTER_MAX_ITER: usize = 60;
 
 pub(crate) const BLOCKWISE_OUTER_TOL: f64 = 1e-5;
 
-/// Objective-suboptimality floor handed to the reduced parametric-AFT direct
-/// MLE as its Newton stopping tolerance. The inner-solve tolerance can be
-/// configured arbitrarily small; flooring it here keeps the stopping test — the
-/// half-Newton-decrement `½·gᵀH⁻¹g`, an estimate of the log-likelihood gap
-/// `ℓ(θ*) − ℓ(θ)` — above the round-off noise of the objective evaluation.
-///
-/// This is deliberately an OBJECTIVE tolerance, not a gradient tolerance: the
-/// log-likelihood gradient is a SUM over the `n` observations, so its attainable
-/// sup-norm floor grows like `n·ε`, and an absolute gradient tolerance therefore
-/// spuriously fails to converge on perfectly benign data as `n` grows (gam#2112).
-/// The Newton decrement `gᵀH⁻¹g` divides the n-scaled gradient by the n-scaled
-/// curvature and is affine-invariant, so a single fixed tolerance certifies
-/// stationarity uniformly across `n`. See `fit_parametric_aft_direct_mle`.
-pub(crate) const REDUCED_AFT_OBJ_TOL_FLOOR: f64 = 1e-8;
-
 /// Near-stationary acceptance tolerance for a stalled line search in the reduced
 /// parametric-AFT direct MLE. When the damped-Newton ascent direction admits no
 /// Armijo-sufficient step — i.e. `ℓ` can no longer be increased to numerical
@@ -141,10 +109,6 @@ pub(crate) const REDUCED_AFT_NEWTON_STALL_TOL: f64 = 1e-4;
 /// floored at 1). Stabilizes the best-effort guess against a rank-deficient
 /// derivative design without materially biasing it.
 pub(crate) const STRUCTURAL_GUESS_RIDGE_REL: f64 = 1e-6;
-
-/// Floor on the exit age when forming the `1/age` structural-derivative target
-/// for the time warm-start, guarding against a divide-by-zero at age 0.
-pub(crate) const STRUCTURAL_GUESS_AGE_FLOOR: f64 = 1e-9;
 
 /// Target byte budget for one row-chunk when streaming a design matrix's
 /// trailing columns into a dense buffer. The per-chunk row count is derived as

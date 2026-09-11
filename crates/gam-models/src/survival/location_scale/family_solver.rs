@@ -104,8 +104,8 @@ impl SurvivalLocationScaleFamily {
     /// the joint negative-log-likelihood Hessian `H` (the observed information),
     /// whose inverse is the conditional covariance the caller assembles.
     ///
-    /// `obj_tol` is the objective-suboptimality tolerance on `½λ²` described
-    /// above (floored by the caller at [`REDUCED_AFT_OBJ_TOL_FLOOR`]).
+    /// `obj_tol` is the caller's objective-suboptimality tolerance on `½λ²`
+    /// described above, raised to the objective's own rounding band.
     pub(crate) fn fit_parametric_aft_direct_mle(
         &self,
         specs: &[ParameterBlockSpec],
@@ -309,7 +309,14 @@ impl SurvivalLocationScaleFamily {
             // iterate has τ=0.
             let newton_decrement = g.dot(&delta);
             last_newton_decrement = newton_decrement;
-            if 0.5 * newton_decrement <= obj_tol {
+            // The log-likelihood accumulates `n` rows and the decrement `p²`
+            // products; a predicted gain inside that accumulation's rounding band
+            // `γ_{n+p²}·|ℓ|` cannot be told from zero, so the caller's tolerance is
+            // raised to it.
+            let n_rows = states.iter().map(|state| state.eta.len()).max().unwrap_or(0);
+            let objective_band =
+                gam_linalg::roundoff::accumulation_growth(n_rows + p_total * p_total) * ll.abs();
+            if 0.5 * newton_decrement <= obj_tol.max(objective_band) {
                 converged = true;
                 break;
             }
