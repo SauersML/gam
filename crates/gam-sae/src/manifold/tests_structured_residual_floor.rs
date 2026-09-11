@@ -167,7 +167,13 @@ mod tests {
     /// — degrading to the already-certified pass-0 iid fit.
     #[test]
     fn near_exact_fit_skips_structured_pass_and_certifies() {
-        let target = circle_target(7.0);
+        // #2822: an exactly representable target leaves a profiled residual of zero, which
+        // Gaussian REML refuses to score by design (#2723), so the pass-0 criterion was
+        // infeasible and the fit refused before the floor guard was reached. A 3e-5
+        // perturbation keeps the residual resolvable while its relative energy (about 6e-12)
+        // stays far below STRUCTURED_RESIDUAL_MIN_REL_ENERGY, so this is still the
+        // near-exact regime the guard exists for.
+        let target = with_noise(circle_target(7.0), 3.0e-5);
         let report = run_primary(target);
         // Reaching here means run_sae_manifold_fit returned Ok — before the floor
         // guard this panicked with the StructuredResidual outer non-certification.
