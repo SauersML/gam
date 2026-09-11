@@ -363,7 +363,13 @@ impl DirectionProfile {
         let mut mode = 0.0;
         let mut samples: Vec<(f64, f64)> = Vec::with_capacity(steps + 1);
         for k in 0..=steps {
-            let t = k as f64 * spacing;
+            // `steps · (last / steps)` can round one ulp above `last`, outside
+            // the sampled interval; the upper endpoint is the last sample itself.
+            let t = if k == steps {
+                last
+            } else {
+                k as f64 * spacing
+            };
             let value = self.evaluate(t) - 0.5 * lambda * t * t;
             if value > shift {
                 shift = value;
