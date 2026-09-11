@@ -723,7 +723,12 @@ impl CustomFamily for SurvivalMarginalSlopeFamily {
     }
 
     fn joint_jeffreys_information_third_directional_available(&self) -> bool {
-        true
+        // The row kernel's closed-form third information derivative covers the
+        // rigid single-slope path only; the hook below returns `None` for a
+        // per-score slope, a flex runtime (score-warp, link-deviation or an
+        // influence absorber) and a time wiggle. Declaring the capability on
+        // those would plan an outer Hessian with no derivative to consume.
+        !(self.per_z_slope_active() || self.flex_active() || self.flex_timewiggle_active())
     }
 
     fn joint_jeffreys_information_third_directional_all_axes_with_specs(
