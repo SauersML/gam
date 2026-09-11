@@ -3014,7 +3014,8 @@ fn build_marginal_slope_predict_context(
     derivative_offset_exit: &Array1<f64>,
     age_exit: &Array1<f64>,
 ) -> Result<MarginalSlopePredictContext, SurvivalPredictError> {
-    let z_name = model.z_column.as_deref().ok_or("saved marginal-slope model lacks score column")?;
+    let z_name = model.z_column.as_deref()
+        .ok_or_else(|| "saved marginal-slope model lacks score column".to_string())?;
     let z_raw = crate::inference::ctn::latent_scores(model, data, col_map)?;
 
     let slopespec = resolve_termspec_for_prediction(
