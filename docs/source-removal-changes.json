@@ -757,5 +757,16 @@
     ],
     "reason": "#2469: PSI_GRAM_PINV_TOL truncated the psi-psi trace Gram pseudo-inverse at 1e-8*lambda_max, and at an absolute 1e-8 on the one-psi path. The pseudo-inverse now keeps eigenpairs above the eigensolver band n*eps*lambda_max, and the one-psi path steps whenever the Gram is positive; steps stay clamped to EFS_MAX_STEP and line-searched by the caller.",
     "evidence": "At the base, git grep finds PSI_GRAM_PINV_TOL only in crates/gam-solve/src/reml/reml_outer_engine/efs.rs, and pseudoinverse_times_vec is called only there and in reml_outer_engine/tests.rs; both files are edited here."
+  },
+  {
+    "base": "6f3e608dce1e6b3b809a5b9a2f954979f111d5d8",
+    "items": [
+      "crates/gam-terms/src/analytic_penalties/equivariant_penalty.rs:const:SMALL_MATRIX_SINGULAR_TOL",
+      "crates/gam-terms/src/analytic_penalties/equivariant_penalty.rs:const:SO3_ANGLE_FLOOR",
+      "crates/gam-terms/src/dictionary.rs:const:GEOM_FACTOR_CAP",
+      "crates/gam-terms/src/dictionary.rs:const:GEOM_R_EPS"
+    ],
+    "reason": "#2469: SMALL_MATRIX_SINGULAR_TOL (an absolute 1e-12 pivot) is the elimination band n*eps*max|a_ij|; SO3_ANGLE_FLOOR (1e-12) is replaced by the unnormalised Rodrigues formula with exact t = 0 limits; GEOM_R_EPS (1e-12) is the step-ratio rounding band gamma_{2*len+1}*r; GEOM_FACTOR_CAP (1e6) capped the extrapolation ladder below its own geometric-sum bound r/(1-r).",
+    "evidence": "All four are private constants of crates/gam-terms/src/analytic_penalties/equivariant_penalty.rs and crates/gam-terms/src/dictionary.rs, used only in those files, both of which this commit edits."
   }
 ]

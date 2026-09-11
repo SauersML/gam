@@ -1,13 +1,5 @@
 use ndarray::{ArrayView1, ArrayView2, ArrayView3, ArrayViewD, IxDyn};
 
-/// Pivot magnitude at or below which a small matrix is declared singular during
-/// Gauss-Jordan inversion.
-const SMALL_MATRIX_SINGULAR_TOL: f64 = 1.0e-12;
-
-/// Floor on the SO(3) rotation angle (axis-angle magnitude) used to normalise
-/// the rotation axis, avoiding a 0/0 at the identity rotation.
-const SO3_ANGLE_FLOOR: f64 = 1.0e-12;
-
 /// RELATIVE Tikhonov ridge added to the diagonal of `WᵀW` before inverting it
 /// for the orthogonal projector `P_perp`, keeping the small solve
 /// well-conditioned for near-rank-deficient atom bases. The ridge is scaled by
@@ -77,6 +69,7 @@ fn invert_small_matrix(matrix: &[Vec<f64>], context: &str) -> Result<Vec<Vec<f64
         return Err(format!("{context}: matrix must not be empty"));
     }
     let mut aug = vec![vec![0.0_f64; 2 * n]; n];
+    let mut magnitude = 0.0_f64;
     for i in 0..n {
         if matrix[i].len() != n {
             return Err(format!("{context}: matrix must be square"));
@@ -87,6 +80,7 @@ fn invert_small_matrix(matrix: &[Vec<f64>], context: &str) -> Result<Vec<Vec<f64
                 return Err(format!("{context}: matrix entry [{i},{j}] is not finite"));
             }
             aug[i][j] = value;
+            magnitude = magnitude.max(value.abs());
         }
         aug[i][n + i] = 1.0;
     }
@@ -100,7 +94,9 @@ fn invert_small_matrix(matrix: &[Vec<f64>], context: &str) -> Result<Vec<Vec<f64
                 pivot_abs = candidate;
             }
         }
-        if pivot_abs <= SMALL_MATRIX_SINGULAR_TOL {
+        // Elimination with partial pivoting is backward stable to `n·ε·max|a_ij|`: a
+        // best available pivot inside that band is zero to the precision it has.
+        if pivot_abs <= n as f64 * f64::EPSILON * magnitude {
             return Err(format!("{context}: matrix is singular at pivot {col}"));
         }
         if pivot != col {
@@ -167,19 +163,26 @@ fn equivariant_rotation(
             let ox = dynamic_value(&g, &[batch, atom, 0], "SO3 group coordinates")?;
             let oy = dynamic_value(&g, &[batch, atom, 1], "SO3 group coordinates")?;
             let oz = dynamic_value(&g, &[batch, atom, 2], "SO3 group coordinates")?;
-            let angle = (ox * ox + oy * oy + oz * oz).sqrt().max(SO3_ANGLE_FLOOR);
-            let ax = ox / angle;
-            let ay = oy / angle;
-            let az = oz / angle;
-            let k = vec![vec![0.0, -az, ay], vec![az, 0.0, -ax], vec![-ay, ax, 0.0]];
+            // Rodrigues in the unnormalised axis-angle vector ω = θ·a:
+            // R = I + (sin θ/θ)·[ω]× + ((1 − cos θ)/θ²)·[ω]×², with 1 − cos θ = 2·sin²(θ/2), so
+            // both coefficients are formed without cancellation and take their exact limits
+            // 1 and ½ at the identity rotation θ = 0.
+            let angle = (ox * ox + oy * oy + oz * oz).sqrt();
+            let half_angle = 0.5 * angle;
+            let (sinc, half_sinc) = if angle == 0.0 {
+                (1.0, 1.0)
+            } else {
+                (angle.sin() / angle, half_angle.sin() / half_angle)
+            };
+            let versine_coefficient = 0.5 * half_sinc * half_sinc;
+            let k = vec![vec![0.0, -oz, oy], vec![oz, 0.0, -ox], vec![-oy, ox, 0.0]];
             let kk = square_matmul(&k, &k, 3);
-            let s = angle.sin();
-            let one_minus_c = 1.0 - angle.cos();
             let mut out = vec![vec![0.0_f64; 3]; 3];
             for i in 0..3 {
                 for j in 0..3 {
-                    out[i][j] =
-                        if i == j { 1.0 } else { 0.0 } + s * k[i][j] + one_minus_c * kk[i][j];
+                    out[i][j] = if i == j { 1.0 } else { 0.0 }
+                        + sinc * k[i][j]
+                        + versine_coefficient * kk[i][j];
                 }
             }
             Ok(out)

@@ -24,9 +24,7 @@ const INACTIVE_LAMBDA: f64 = 1.0e30;
 // the plain step's, so it can never degrade the fit (monotonicity preserved) — the
 // only risk of a bad `r` estimate is a rejected proposal, never a worse model.
 const GEOM_R_MIN: f64 = 0.1;
-const GEOM_R_EPS: f64 = 1.0e-12;
 const GEOM_COS_MIN: f64 = 0.9;
-const GEOM_FACTOR_CAP: f64 = 1.0e6;
 // Line-search ladder over the extrapolation step length: the spiral's straight-line
 // tangent is closest to the fixed point at an interior factor, so probe a geometric
 // ladder from `BASE` up to the geometric-sum bound `r/(1−r)` and keep the best.
@@ -486,7 +484,12 @@ fn try_geometric_extrapolation(
         return None;
     }
     let ratio = cross / prev_norm2;
-    if !(ratio > GEOM_R_MIN && ratio < 1.0 - GEOM_R_EPS) {
+    // `r` is a quotient of two inner products over every atom entry; a contraction
+    // `1 − r` inside that quotient's rounding band `γ_{2·len+1}·r` is no measured
+    // contraction, and `r/(1−r)` would extrapolate along arithmetic.
+    let contraction_band =
+        gam_linalg::roundoff::accumulation_growth(2 * delta.len() + 1) * ratio;
+    if !(ratio > GEOM_R_MIN && 1.0 - ratio > contraction_band) {
         return None;
     }
     // Collinearity of the two steps — the single-dominant-mode assumption. A
@@ -495,7 +498,7 @@ fn try_geometric_extrapolation(
     if !(cosine > GEOM_COS_MIN) {
         return None;
     }
-    let max_factor = (ratio / (1.0 - ratio)).min(GEOM_FACTOR_CAP);
+    let max_factor = ratio / (1.0 - ratio);
     if !(max_factor.is_finite() && max_factor > 1.0) {
         return None;
     }
