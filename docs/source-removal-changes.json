@@ -656,7 +656,7 @@
     "evidence": "Measured with scripts/source_removal_guard.py --base d2708daab --head 7ff6dcf9a on MSI: exactly these 17 identities (run 34646214849 stopped at the census floor before its guard step ran). MSI lane c9, waves 1-5 applied cumulatively on 5ac3be42c: cargo check --workspace --all-targets after each wave, 0 errors and 0 warnings (root ban scanner included), so no caller of a removed item remains. gam-solve --lib -- reml pirls loop_guard stochastic_trace dispersion over the stack: 588 passed, 2 failed, the same two names that fail on the unpatched base."
   },
   {
-    "base": "7d39db6487a46f99409cb526c499e235d20ab755",
+    "base": "376d9b0961a1d2011e87240762df984844b369f8",
     "items": [
       "crates/gam-inference/src/probability.rs:const:MAX_HALLEY_STEPS",
       "crates/gam-solve/src/estimate/penalty.rs:const:SCALE_EPS",
