@@ -1,5 +1,18 @@
 [
   {
+    "base": "994668d561f1c71d075ad388974e86aed7f4b971",
+    "test_count_decrease": 2,
+    "removed_pins": {
+      "bernoulli_marginal_slope_ctn_stage1_recipe_only_dispatches_to_bms_issue_2139": 1
+    },
+    "unit_test_decreases": {
+      "tests/inference": 3,
+      "tests/survival": 2
+    },
+    "reason": "Replace the automatic CTN influence-absorber recipe and its orthogonality-specific simulation assertions with ordinary native CTN/outcome composition. Remove the retired crossfit_score_calibration/Jacobian carrier and contiguous-row partition helpers. The existing score/quantile evaluator is moved from gam-predict/input.rs to gam-models/inference/predict_input.rs and re-exported, not deleted. Structural validation moves out of the FFI placeholder branch into the shared CTN service. The former issue-2139 materialization test is replaced by ctn_composition_requires_the_complete_fitted_model_service because a composed fit is no longer a single materialized request. Independent influence-kernel tests remain. The inventory floor also predates main: at base 994668d, gam-models already has 1404 tests against the old floor of 1435; this change adds three native fold/schema tests there, reaching 1407. The refreshed floor records measured source inventories, not a numerical acceptance claim.",
+    "evidence": "Read-only source report https://github.com/SauersML/gam/actions/runs/34631844294 compares immutable base 994668d561f1c71d075ad388974e86aed7f4b971 with e6b2b97539c74ebdb62d86db29154165b077601a. Native acceptance https://github.com/SauersML/gam/actions/runs/34631210886 passes recipe fitting, frozen CTN attachment, explicit transform/outcome equivalence, save/load, row order, batching and finite monotone survival at f4fbeae8929183c3ef4acfd75113bee73ddf4418 in 3.42 seconds. tests/test_ctn_predictor_native.py replaces Python-only composition mocks; inference/ctn.rs adds group/fold/schema tests. The latest structural-validation changes are checked separately; no orthogonality, clustered-PC convergence, or AoU success is asserted."
+  },
+  {
     "base": "d67a2ec2aa43b8f57917abb92607b5bd007af58c",
     "test_count_decrease": 0,
     "removed_pins": {
