@@ -1,6 +1,6 @@
-//! Importance integration of the complete joint law. The proposal is frozen
-//! during evaluation so values and jet derivatives describe the same sampled
-//! objective. A Student component protects tails missed by the local Gaussian.
+//! Importance integration in fixed OU innovation coordinates. The proposal
+//! and innovations stay frozen; paths follow the evaluated coefficients.
+//! Values, analytic scores, jets, and moments use that same transport.
 use super::precision::{Factorization, Precision};
 use super::*;
 use rand::{Rng, RngExt};
@@ -163,14 +163,16 @@ mod score_error_tests {
     }
 }
 
-/// Retained importance nodes tied to one immutable model and history. Drawing
+/// Retained innovation nodes tied to one immutable model and history. Drawing
 /// a new bank changes the sampled approximation: never replace it silently
 /// within a derivative evaluation or optimization line search.
 pub struct JointIntegration<'a> {
     pub(super) model: &'a JointLikelihood,
     pub(super) history: &'a JointHistory,
-    paths: Vec<Vec<f64>>,
-    log_proposal: Vec<f64>,
+    innovations: Vec<Vec<f64>>,
+    /// log q_anchor(path) - log p_anchor(states | genes). The OU map's
+    /// Jacobian cancels its conditional density at every coefficient state.
+    log_proposal_over_dynamics: Vec<f64>,
     analytic: Option<AnalyticGaussian>,
     posterior_options: PosteriorOptions,
 }
@@ -323,8 +325,8 @@ impl JointLikelihood {
             return Ok(JointIntegration {
                 model: self,
                 history: h,
-                paths: vec![],
-                log_proposal: vec![],
+                innovations: vec![],
+                log_proposal_over_dynamics: vec![],
                 analytic: Some(self.analytic_genes(h)?),
                 posterior_options: options.posterior.clone(),
             });
@@ -365,8 +367,8 @@ impl JointLikelihood {
         )?;
         let factor = Factorization::new(&precision)?;
         let student_normalizer = student_log_normalizer(dimension, prior_factor.log_determinant);
-        let mut paths = Vec::with_capacity(options.samples);
-        let mut log_proposal = Vec::with_capacity(options.samples);
+        let mut innovations = Vec::with_capacity(options.samples);
+        let mut log_proposal_over_dynamics = Vec::with_capacity(options.samples);
         for _ in 0..options.samples {
             let use_prior = rng.random::<bool>();
             let z: Vec<f64> = (0..dimension).map(|_| StandardNormal.sample(rng)).collect();
@@ -401,14 +403,15 @@ impl JointLikelihood {
                     "joint integration proposal is not numerically resolved",
                 ));
             }
-            paths.push(path);
-            log_proposal.push(density);
+            let (coordinates, dynamics) = self.path_innovations(theta, h, &path)?;
+            innovations.push(coordinates);
+            log_proposal_over_dynamics.push(density - dynamics);
         }
         Ok(JointIntegration {
             model: self,
             history: h,
-            paths,
-            log_proposal,
+            innovations,
+            log_proposal_over_dynamics,
             analytic: None,
             posterior_options: options.posterior.clone(),
         })
@@ -451,29 +454,29 @@ impl JointIntegration<'_> {
         }
         let mut gradient = vec![0.0; theta.len()];
         let mut weight_sum = 0.0;
-        for (path, &weight) in self.paths.iter().zip(&weights) {
+        for (innovations, &weight) in self.innovations.iter().zip(&weights) {
             if weight == 0.0 {
                 continue;
             }
             let score = self
                 .model
-                .log_density_score(theta, self.history, path, reference)?
+                .innovation_score(theta, self.history, innovations, reference)?
                 .pullback(reference_jacobian)?;
             weight_sum += weight;
             for j in 0..theta.len() {
                 gradient[j] += (weight / weight_sum) * (score[j] - gradient[j]);
             }
         }
-        // Replay fixed paths rather than storing samples x coefficients or
+        // Replay fixed innovations rather than storing samples x coefficients or
         // subtracting large raw second moments to obtain a small variance.
         let mut standard_error = vec![0.0; theta.len()];
-        for (path, &weight) in self.paths.iter().zip(&weights) {
+        for (innovations, &weight) in self.innovations.iter().zip(&weights) {
             if weight == 0.0 {
                 continue;
             }
             let score = self
                 .model
-                .log_density_score(theta, self.history, path, reference)?
+                .innovation_score(theta, self.history, innovations, reference)?
                 .pullback(reference_jacobian)?;
             accumulate_score_error(&mut standard_error, weight, &score, &gradient);
         }
@@ -549,7 +552,7 @@ impl JointIntegration<'_> {
             || !accuracy.minimum_effective_samples.is_finite()
             || accuracy.minimum_effective_samples < 2.0
             || (self.analytic.is_none()
-                && accuracy.minimum_effective_samples > self.paths.len() as f64)
+                && accuracy.minimum_effective_samples > self.innovations.len() as f64)
         {
             return Err(invalid(
                 "joint integration accuracy needs positive error tolerance and an effective sample count in [2, samples]",
@@ -590,13 +593,19 @@ impl JointIntegration<'_> {
                 vec![],
             ));
         }
-        let mut log_weights = Vec::with_capacity(self.paths.len());
-        for (path, &proposal) in self.paths.iter().zip(&self.log_proposal) {
-            let path: Vec<S> = path.iter().map(|&x| theta[0].constant_like(x)).collect();
+        let mut log_weights = Vec::with_capacity(self.innovations.len());
+        for (innovations, &proposal) in self
+            .innovations
+            .iter()
+            .zip(&self.log_proposal_over_dynamics)
+        {
+            let path = self
+                .model
+                .transport_path(theta, self.history, innovations)?;
             log_weights.push(add_real(
                 &self
                     .model
-                    .log_density(theta, self.history, &path, reference)?,
+                    .path_density(theta, self.history, &path, reference, false)?,
                 -proposal,
             ));
         }
@@ -639,7 +648,7 @@ impl JointIntegration<'_> {
 
     /// The importance estimate integrates the complete density. Jets include
     /// all supplied reference sensitivities. The proposal and integration
-    /// nodes are fixed, making derivatives exact for this finite sampled
+    /// innovation nodes are fixed, making derivatives exact for this finite sampled
     /// objective, not exact derivatives of the population integral.
     pub fn log_marginal<S: JetField>(
         &self,
@@ -681,9 +690,14 @@ impl JointIntegration<'_> {
         let k = self.model.spec.signatures;
         let m = self.history.genetics.iter().filter(|g| g.is_none()).count();
         let nodes = self.history.times.len();
-        let anchor = &self.paths[0];
+        let anchor = self
+            .model
+            .transport_path(theta, self.history, &self.innovations[0])?;
         let mut mean = vec![0.0; anchor.len()];
-        for (path, &w) in self.paths.iter().zip(&weights) {
+        for (innovations, &w) in self.innovations.iter().zip(&weights) {
+            let path = self
+                .model
+                .transport_path(theta, self.history, innovations)?;
             for i in 0..mean.len() {
                 mean[i] += w * (path[i] - anchor[i]);
             }
@@ -694,7 +708,10 @@ impl JointIntegration<'_> {
         let mut state_covariance = vec![Array2::<f64>::zeros((k, k)); nodes];
         let mut genetic_covariance = Array2::<f64>::zeros((m, m));
         let mut state_genetic_covariance = vec![Array2::<f64>::zeros((k, m)); nodes];
-        for (path, &w) in self.paths.iter().zip(&weights) {
+        for (innovations, &w) in self.innovations.iter().zip(&weights) {
+            let path = self
+                .model
+                .transport_path(theta, self.history, innovations)?;
             let centered: Vec<f64> = path.iter().zip(&mean).map(|(x, m)| x - m).collect();
             for i in 0..m {
                 for j in 0..m {
@@ -726,7 +743,10 @@ impl JointIntegration<'_> {
         let mut gene_error_squared = Array2::<f64>::zeros((m, m));
         let mut state_error_squared = vec![Array2::<f64>::zeros((k, k)); nodes];
         let mut cross_error_squared = vec![Array2::<f64>::zeros((k, m)); nodes];
-        for (path, &w) in self.paths.iter().zip(&weights) {
+        for (innovations, &w) in self.innovations.iter().zip(&weights) {
+            let path = self
+                .model
+                .transport_path(theta, self.history, innovations)?;
             let delta: Vec<f64> = path.iter().zip(&mean).map(|(x, m)| x - m).collect();
             let w2 = w * w * weights.len() as f64 / (weights.len() - 1) as f64;
             for i in 0..mean.len() {

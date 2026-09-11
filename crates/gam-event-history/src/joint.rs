@@ -23,6 +23,7 @@ mod precision;
 mod reference;
 mod resolution;
 mod score;
+mod transport;
 pub use cohort::{
     CoefficientImportanceDraw, CoefficientInferenceOptions, CoefficientPilotOptions,
     CoefficientRefinementRound, CohortScoreTolerance, ConstantRatePosterior,
@@ -450,6 +451,17 @@ impl JointLikelihood {
         path: &[S],
         log_reference_moments: &[S],
     ) -> Result<S, EventHistoryError> {
+        self.path_density(theta, h, path, log_reference_moments, true)
+    }
+
+    fn path_density<S: JetField>(
+        &self,
+        theta: &[S],
+        h: &JointHistory,
+        path: &[S],
+        log_reference_moments: &[S],
+        dynamics: bool,
+    ) -> Result<S, EventHistoryError> {
         self.validate_parameters(theta)?;
         let dimension = self.latent_dimension(h)?;
         let marks = self.spec.marks.len();
@@ -490,38 +502,40 @@ impl JointLikelihood {
                 result = result.sub(&di.mul(&dj).scale(0.5 * self.spec.genetic_precision[[i, j]]));
             }
         }
-        let entry = self.entry_features(h);
-        for axis in 0..k {
-            let mean = self.mean(theta, self.layout.entry.start, &entry, &genes, axis);
-            let residual = state(0)[axis].sub(&mean);
-            result = result.sub(&add_real(&residual.mul(&residual), log_tau).scale(0.5));
-        }
-        let rates: Vec<S> = theta[self.layout.rates.clone()]
-            .iter()
-            .map(emission::softplus)
-            .collect();
-        for n in 1..h.times.len() {
-            let dt = h.times[n] - h.times[n - 1];
-            let columns = h.drive_design.row(n - 1).to_vec();
+        if dynamics {
+            let entry = self.entry_features(h);
             for axis in 0..k {
-                let decay = rates[axis].scale(-dt);
-                let phi = exp(&decay);
-                let weight = emission::expm1(&decay).neg();
-                let variance = emission::expm1(&decay.scale(2.0)).neg();
-                if variance.value() <= 0.0 || !variance.value().is_finite() {
-                    return Err(numerical("joint OU innovation variance is unresolved"));
+                let mean = self.mean(theta, self.layout.entry.start, &entry, &genes, axis);
+                let residual = state(0)[axis].sub(&mean);
+                result = result.sub(&add_real(&residual.mul(&residual), log_tau).scale(0.5));
+            }
+            let rates: Vec<S> = theta[self.layout.rates.clone()]
+                .iter()
+                .map(emission::softplus)
+                .collect();
+            for n in 1..h.times.len() {
+                let dt = h.times[n] - h.times[n - 1];
+                let columns = h.drive_design.row(n - 1).to_vec();
+                for axis in 0..k {
+                    let decay = rates[axis].scale(-dt);
+                    let phi = exp(&decay);
+                    let weight = emission::expm1(&decay).neg();
+                    let variance = emission::expm1(&decay.scale(2.0)).neg();
+                    if variance.value() <= 0.0 || !variance.value().is_finite() {
+                        return Err(numerical("joint OU innovation variance is unresolved"));
+                    }
+                    let drive = self.mean(theta, self.layout.drive.start, &columns, &genes, axis);
+                    let after = state(n - 1)[axis].add(&self.jump(theta, h.events[n - 1], axis));
+                    let mean = phi.mul(&after).add(&weight.mul(&drive));
+                    let residual = state(n)[axis].sub(&mean);
+                    result = result.sub(
+                        &add_real(
+                            &div(&residual.mul(&residual), &variance).add(&ln(&variance)),
+                            log_tau,
+                        )
+                        .scale(0.5),
+                    );
                 }
-                let drive = self.mean(theta, self.layout.drive.start, &columns, &genes, axis);
-                let after = state(n - 1)[axis].add(&self.jump(theta, h.events[n - 1], axis));
-                let mean = phi.mul(&after).add(&weight.mul(&drive));
-                let residual = state(n)[axis].sub(&mean);
-                result = result.sub(
-                    &add_real(
-                        &div(&residual.mul(&residual), &variance).add(&ln(&variance)),
-                        log_tau,
-                    )
-                    .scale(0.5),
-                );
             }
         }
         let mut risk = h.initially_at_risk.clone();

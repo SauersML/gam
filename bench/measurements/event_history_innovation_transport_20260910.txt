@@ -1,0 +1,17 @@
+MSI acn112; four-CPU affinity, two test/Rayon threads.
+Warm native rustc replay, opt-level=2, codegen-units=16, deny warnings.
+Pinned direct opt revision: 8945838bcd3003c8790657a2cb63de0956ce416a.
+Cached workspace dependencies; not a fresh whole-workspace rebuild.
+Warm build seconds: 47.48805786497542
+
+joint:: group excluding the separate nonzero-signature development probe:
+68 passed, 0 failed, 0 ignored, 51 filtered out; 13.19 seconds.
+Includes the innovation change-of-variables identity and all analytic
+coefficient derivatives away from the anchor, including nearly static OU
+transitions; existing integrated value/score/mean tests also passed.
+
+The nonzero_signature_cohort_reaches_coefficient_inference probe was run
+separately and exceeded its 40-second test-process limit. Python subprocess
+terminated that owned test process. It did not return a fit or pass.
+This is an unresolved end-to-end fitting/performance test, not evidence of a
+finished joint-model inference workflow or release validation.

@@ -812,17 +812,30 @@ driver and structure-learning implementation remain unfinished.
 
 The implemented importance bank draws from an equal mixture of the structured
 Laplace Gaussian and a multivariate Student t with three degrees of freedom,
-centered at the conditional path-prior mean with the same covariance. The
-complete joint law, including its Gaussian path prior, remains in the importance
-numerator. Three is the smallest integer degree of freedom with a finite covariance, allowing that
+centered at the conditional path-prior mean with the same covariance. At the
+proposal anchor, absolute paths are converted into their OU innovations.
+Missing genetic coordinates and those innovations are retained, together with
+`log q_anchor(path) - log p_anchor(states | genes)`. Every later coefficient
+evaluation maps the same innovations through its own entry mean, genetic drive,
+OU rates and disease jumps. The OU density cancels the transport Jacobian
+analytically; the weight is the genetic/observation density minus that retained
+log ratio. This is the complete joint integral under a change of coordinates.
+Three is the smallest integer degree of freedom with a finite covariance, allowing that
 covariance match while providing polynomial tails. The Student displacement
 is a structured Gaussian draw divided by the square root of a chi-squared
 draw with three degrees of freedom. Both mixture densities are normalized.
 
 An integration bank belongs to one immutable model specification and history.
-Its nodes and normalized proposal density stay fixed during coefficient and
-reference-sensitivity evaluations. Thus its returned jets differentiate the
-same finite sampled objective as its value. The integral, gradient, and
+Its innovation nodes and proposal stay fixed during coefficient and
+reference-sensitivity evaluations. Absolute paths follow the current
+coefficients, including in reported posterior means and covariances. A reverse
+OU recursion adds the path's analytic coefficient sensitivities to the
+observation score, without storing a node-by-coefficient Jacobian. Thus its
+returned jets and hand-derived scores differentiate the same finite sampled
+objective as its value. Tests verify the change-of-variables identity at the
+anchor and all coefficient derivatives away from it, including nearly static
+OU transitions, missing genetics and simultaneous post-diagnosis measurements.
+The integral, gradient, and
 curvature are Monte Carlo approximations to their population counterparts.
 The bank reports an estimated log-integral standard error, effective sample
 count, and largest normalized weight, and refuses evaluations outside the

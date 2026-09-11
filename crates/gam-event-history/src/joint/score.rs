@@ -38,7 +38,7 @@ impl JointPathScore {
     }
 }
 
-fn regression_score(
+pub(super) fn regression_score(
     out: &mut [f64],
     start: usize,
     columns: &[f64],
@@ -67,7 +67,21 @@ impl JointLikelihood {
         path: &[f64],
         reference: &[f64],
     ) -> Result<JointPathScore, EventHistoryError> {
-        let log_density = self.log_density(theta, h, path, reference)?;
+        self.path_density_score(theta, h, path, reference, true)
+            .map(|v| v.0)
+    }
+
+    /// The optional state adjoints exclude the OU density, whose normalized
+    /// innovation law cancels its transport Jacobian analytically.
+    pub(super) fn path_density_score(
+        &self,
+        theta: &[f64],
+        h: &JointHistory,
+        path: &[f64],
+        reference: &[f64],
+        dynamics: bool,
+    ) -> Result<(JointPathScore, Vec<f64>), EventHistoryError> {
+        let log_density = self.path_density(theta, h, path, reference, dynamics)?;
         let k = self.spec.signatures;
         let marks = self.spec.marks.len();
         let mut missing = 0;
@@ -86,45 +100,53 @@ impl JointLikelihood {
         let state = |n: usize| &path[missing + n * k..missing + (n + 1) * k];
         let mut coefficients = vec![0.0; theta.len()];
         let mut reference_score = vec![0.0; reference.len()];
-        let entry = self.entry_features(h);
-        for axis in 0..k {
-            let mean = self.mean(theta, self.layout.entry.start, &entry, &genes, axis);
-            regression_score(
-                &mut coefficients,
-                self.layout.entry.start,
-                &entry,
-                &genes,
-                axis,
-                state(0)[axis] - mean,
-            );
-        }
-        for n in 1..h.times.len() {
-            let dt = h.times[n] - h.times[n - 1];
-            let columns = h.drive_design.row(n - 1).to_vec();
+        let mut state_score = if dynamics {
+            vec![]
+        } else {
+            vec![0.0; h.times.len() * k]
+        };
+        if dynamics {
+            let entry = self.entry_features(h);
             for axis in 0..k {
-                let raw = theta[self.layout.rates.start + axis];
-                let rate = emission::softplus(&raw);
-                let phi = (-rate * dt).exp();
-                let weight = -(-rate * dt).exp_m1();
-                let variance = -(-2.0 * rate * dt).exp_m1();
-                let drive = self.mean(theta, self.layout.drive.start, &columns, &genes, axis);
-                let after = state(n - 1)[axis] + self.jump(theta, h.events[n - 1], axis);
-                let residual = state(n)[axis] - (phi * after + weight * drive);
-                let mean_score = residual / variance;
+                let mean = self.mean(theta, self.layout.entry.start, &entry, &genes, axis);
                 regression_score(
                     &mut coefficients,
-                    self.layout.drive.start,
-                    &columns,
+                    self.layout.entry.start,
+                    &entry,
                     &genes,
                     axis,
-                    mean_score * weight,
+                    state(0)[axis] - mean,
                 );
-                let dphi = -dt * phi * (-emission::softplus(&(-raw))).exp();
-                coefficients[self.layout.rates.start + axis] += dphi
-                    * ((after - drive) * mean_score
-                        - phi * (residual * mean_score - 1.0) / variance);
-                if let Some(range) = h.events[n - 1].and_then(|d| self.layout.jumps[d].as_ref()) {
-                    coefficients[range.start + axis] += mean_score * phi;
+            }
+            for n in 1..h.times.len() {
+                let dt = h.times[n] - h.times[n - 1];
+                let columns = h.drive_design.row(n - 1).to_vec();
+                for axis in 0..k {
+                    let raw = theta[self.layout.rates.start + axis];
+                    let rate = emission::softplus(&raw);
+                    let phi = (-rate * dt).exp();
+                    let weight = -(-rate * dt).exp_m1();
+                    let variance = -(-2.0 * rate * dt).exp_m1();
+                    let drive = self.mean(theta, self.layout.drive.start, &columns, &genes, axis);
+                    let after = state(n - 1)[axis] + self.jump(theta, h.events[n - 1], axis);
+                    let residual = state(n)[axis] - (phi * after + weight * drive);
+                    let mean_score = residual / variance;
+                    regression_score(
+                        &mut coefficients,
+                        self.layout.drive.start,
+                        &columns,
+                        &genes,
+                        axis,
+                        mean_score * weight,
+                    );
+                    let dphi = -dt * phi * (-emission::softplus(&(-raw))).exp();
+                    coefficients[self.layout.rates.start + axis] += dphi
+                        * ((after - drive) * mean_score
+                            - phi * (residual * mean_score - 1.0) / variance);
+                    if let Some(range) = h.events[n - 1].and_then(|d| self.layout.jumps[d].as_ref())
+                    {
+                        coefficients[range.start + axis] += mean_score * phi;
+                    }
                 }
             }
         }
@@ -166,6 +188,13 @@ impl JointLikelihood {
                     coefficients[start + axis] += residual
                         * ((numerator[axis + 1] - log_num).exp()
                             - (denominator[axis + 1] - log_den).exp());
+                    if !dynamics {
+                        state_score[n * k + axis] += residual
+                            * (theta[start + axis]
+                                - emission::softplus(&(-state(n)[axis]))
+                                - log_num)
+                                .exp();
+                    }
                 }
             }
             if let Some(d) = h.events[n] {
@@ -203,6 +232,9 @@ impl JointLikelihood {
             coefficients[location.start] += score;
             for axis in 0..k {
                 coefficients[location.start + axis + 1] += score * x[axis];
+                if !dynamics {
+                    state_score[record.node * k + axis] += score * theta[location.start + axis + 1];
+                }
                 if record.after_event {
                     if let Some(range) =
                         h.events[record.node].and_then(|d| self.layout.jumps[d].as_ref())
@@ -219,15 +251,19 @@ impl JointLikelihood {
         if coefficients
             .iter()
             .chain(&reference_score)
+            .chain(&state_score)
             .any(|v| !v.is_finite())
         {
             return Err(numerical("non-finite complete-path coefficient score"));
         }
-        Ok(JointPathScore {
-            log_density,
-            coefficients,
-            reference: reference_score,
-        })
+        Ok((
+            JointPathScore {
+                log_density,
+                coefficients,
+                reference: reference_score,
+            },
+            state_score,
+        ))
     }
 }
 
@@ -349,6 +385,69 @@ mod tests {
             }
         }
         gradient
+    }
+
+    #[test]
+    fn innovation_transport_preserves_anchor_weights_and_total_scores_away_from_the_anchor() {
+        let (model, h, anchor, path, reference, jacobian) = fixture();
+        let (innovations, dynamics) = model.path_innovations(&anchor, &h, &path).unwrap();
+        let restored = model.transport_path(&anchor, &h, &innovations).unwrap();
+        for (a, b) in restored.iter().zip(&path) {
+            assert!((a - b).abs() < 1e-13);
+        }
+        let complete = model.log_density(&anchor, &h, &path, &reference).unwrap();
+        let transformed = model
+            .path_density(&anchor, &h, &restored, &reference, false)
+            .unwrap()
+            + dynamics;
+        assert!((complete - transformed).abs() < 1e-12);
+        for static_limit in [false, true] {
+            let mut theta: Vec<_> = anchor
+                .iter()
+                .enumerate()
+                .map(|(i, v)| v + 0.4 * (i as f64).cos())
+                .collect();
+            if static_limit {
+                for index in model.layout.rates.clone() {
+                    theta[index] = -35.0;
+                }
+            }
+            let score = model
+                .innovation_score(&theta, &h, &innovations, &reference)
+                .unwrap()
+                .pullback(jacobian.view())
+                .unwrap();
+            for j in 0..theta.len() {
+                let coefficients: Vec<_> = theta
+                    .iter()
+                    .enumerate()
+                    .map(|(i, &v)| Order1::<1> {
+                        v,
+                        g: [f64::from(i == j)],
+                    })
+                    .collect();
+                let moments: Vec<_> = reference
+                    .iter()
+                    .enumerate()
+                    .map(|(i, &v)| Order1::<1> {
+                        v,
+                        g: [jacobian[[i, j]]],
+                    })
+                    .collect();
+                let current_path = model
+                    .transport_path(&coefficients, &h, &innovations)
+                    .unwrap();
+                let jet = model
+                    .path_density(&coefficients, &h, &current_path, &moments, false)
+                    .unwrap();
+                assert!(
+                    (score[j] - jet.g[0]).abs() < 2e-10 * (1.0 + score[j].abs()),
+                    "coordinate {j}, static={static_limit}: {} vs {}",
+                    score[j],
+                    jet.g[0]
+                );
+            }
+        }
     }
 
     #[test]
