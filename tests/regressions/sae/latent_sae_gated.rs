@@ -268,9 +268,14 @@ fn build_collapse_probe_term(coords: Array2<f64>) -> SaeManifoldTerm {
     // Jacobian = per-row I_d. This makes the decoded output genuinely depend on
     // the latent coords and carries real per-axis data curvature with a fixed
     // decoder. Decoder B = I_d initially routes axis j to output channel j.
-    // This does not by itself identify a joint fit with a freely varying
-    // decoder: t -> c t, B -> B/c preserves its reconstruction. The criterion
-    // must still establish a finite inner optimum before it can be evaluated.
+    // The map t -> c t, B -> B/c preserves the reconstruction, so the joint
+    // (t, B) fit is identified only when both halves of that orbit are priced:
+    // the ARD prior charges ½α‖t‖² (∝ c²) and the decoder roughness charges
+    // ½λ_smooth·tr(Bᵀ G B) (∝ 1/c²). A zero function Gram G leaves the decoder
+    // unpenalized, the joint objective then decreases monotonically as c -> 0,
+    // and no inner optimum exists for the criterion to be evaluated at (#2668).
+    // The identity Gram is the smallest reference seminorm that closes the
+    // orbit; it adds no signal and no coupling between axes.
     let basis_values = coords.clone();
     let mut basis_jacobian = Array3::<f64>::zeros((n, d, d));
     for i in 0..n {
@@ -285,7 +290,7 @@ fn build_collapse_probe_term(coords: Array2<f64>) -> SaeManifoldTerm {
         basis_values.clone(),
         basis_jacobian.clone(),
         Array2::<f64>::eye(d),
-        Array2::<f64>::zeros((d, d)),
+        Array2::<f64>::eye(d),
     )
     .expect("atom should build")
     .with_basis_second_jet(Arc::new(IdentityBasis));
