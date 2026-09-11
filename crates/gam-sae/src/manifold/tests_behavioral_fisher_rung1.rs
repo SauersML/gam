@@ -31,7 +31,10 @@
 //! `G ≈ Σᵢ vᵢ vᵢᵀ = U_n U_nᵀ` computed by `s` random harvest-time probes.
 
 use crate::assignment::{AssignmentMode, SaeAssignment};
-use crate::manifold::{SaeAtomBasisKind, SaeManifoldAtom, SaeManifoldRho, SaeManifoldTerm};
+use crate::basis::EuclideanPatchEvaluator;
+use crate::manifold::{
+    SaeAtomBasisKind, SaeBasisEvaluator, SaeManifoldAtom, SaeManifoldRho, SaeManifoldTerm,
+};
 use gam_problem::{MetricProvenance, RowMetric, pack_probe_factors};
 use gam_terms::latent::LatentManifold;
 use ndarray::{Array1, Array2, Array3};
@@ -53,6 +56,16 @@ fn lcg_normal(s: &mut u64) -> f64 {
 /// atoms, width-2 basis, one latent axis, distinct nonzero decoders so the
 /// residual the metric weights is genuinely nonzero.
 fn build_term(n: usize, p: usize, k: usize) -> SaeManifoldTerm {
+    let coord_block = Array2::<f64>::from_shape_fn((n, 1), |(r, _)| 0.05 * (r as f64));
+    // #2822: stagewise growth prices the θ-adjoint, which needs each atom's basis second
+    // jets, so the atoms carry the width-2 `[1, t]` patch evaluator over their own latent
+    // coordinate instead of a hand-built constant basis with no evaluator attached.
+    let evaluator = Arc::new(
+        EuclideanPatchEvaluator::new(1, 1).expect("a degree-1 patch on one latent axis is valid"),
+    );
+    let (phi, jet) = evaluator
+        .evaluate(coord_block.view())
+        .expect("the fixture coordinates are finite");
     let atoms: Vec<SaeManifoldAtom> = (0..k)
         .map(|i| {
             let f = (i as f64) + 1.0;
@@ -63,17 +76,16 @@ fn build_term(n: usize, p: usize, k: usize) -> SaeManifoldTerm {
                 format!("atom{i}"),
                 SaeAtomBasisKind::EuclideanPatch,
                 1,
-                Array2::<f64>::from_elem((n, 2), 1.0),
-                Array3::<f64>::zeros((n, 2, 1)),
+                phi.clone(),
+                jet.clone(),
                 decoder,
                 Array2::<f64>::eye(2),
             )
             .expect("the fixture's basis, decoder and Gram blocks agree in dimension")
+            .with_basis_second_jet(evaluator.clone())
         })
         .collect();
-    let coords: Vec<Array2<f64>> = (0..k)
-        .map(|_| Array2::<f64>::from_shape_fn((n, 1), |(r, _)| 0.05 * (r as f64)))
-        .collect();
+    let coords: Vec<Array2<f64>> = (0..k).map(|_| coord_block.clone()).collect();
     let manifolds = vec![LatentManifold::Euclidean; k];
     let logits =
         Array2::<f64>::from_shape_fn((n, k), |(r, c)| 0.3 * (c as f64) - 0.1 * (r as f64) + 0.2);
