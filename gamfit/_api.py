@@ -1192,20 +1192,6 @@ def fit(
             config=nested_config or None,
         )
 
-    required_columns = None
-    if (transformation_normal_stage1 is not None or transformation_normal
-            or family == "transformation-normal"
-            or (config and ("ctn_stage1" in config or "frozen_ctn" in config
-                            or config.get("transformation_normal")))):
-        schema_config = {**(config or {}), "family": family, "slope_formula": slope_formula,
-                         "noise_formula": noise_formula, "weights": weights, "offset": offset,
-                         "noise_offset": noise_offset, "survival_likelihood": survival_likelihood}
-        if isinstance(transformation_normal_stage1, Model):
-            schema_config["frozen_ctn"] = json.loads(transformation_normal_stage1.dumps())
-        elif transformation_normal_stage1 is not None:
-            schema_config["ctn_stage1"] = normalize_ctn_stage1(transformation_normal_stage1).native_document()
-        required_columns = rust_module().ctn_required_fit_columns(formula, json.dumps(schema_config))
-    headers, rows, table_kind = normalize_table(data, required_columns=required_columns)
     rust_config = dict(config or {})
     for key in (
         "response_geometry",
@@ -1215,10 +1201,6 @@ def fit(
     ):
         rust_config.pop(key, None)
     _normalize_groups_config(rust_config)
-    rust_config["training_table_kind"] = table_kind
-    resolved_precision_hyperpriors = _resolve_precision_hyperpriors(
-        precision_hyperpriors, formula, headers, rows, rust_config.get("group_metadata")
-    )
     payload = _build_fit_payload(
         family=family,
         negative_binomial_theta=negative_binomial_theta,
@@ -1246,12 +1228,27 @@ def fit(
         noise_formula=noise_formula,
         noise_offset=noise_offset,
         flexible_link=flexible_link,
-        precision_hyperpriors=resolved_precision_hyperpriors,
+        precision_hyperpriors=None,
         latents=latents,
         penalties=penalties,
         smooths=smooths,
         config=rust_config or None,
     )
+
+    # Column discovery and fitting consume the same request. In particular,
+    # CTN mode and its response-basis settings must survive this boundary.
+    required_columns = None
+    if ("ctn_stage1" in payload or "frozen_ctn" in payload
+            or payload.get("transformation_normal")
+            or payload.get("family") == "transformation-normal"):
+        required_columns = rust_module().ctn_required_fit_columns(formula, json.dumps(payload))
+    headers, rows, table_kind = normalize_table(data, required_columns=required_columns)
+    payload["training_table_kind"] = table_kind
+    resolved_precision_hyperpriors = _resolve_precision_hyperpriors(
+        precision_hyperpriors, formula, headers, rows, rust_config.get("group_metadata")
+    )
+    if resolved_precision_hyperpriors is not None:
+        payload["precision_hyperpriors"] = resolved_precision_hyperpriors
 
     # ── Vector-response (multinomial-logit) dispatch (#328). ──────────────
     # The scalar `fit_table` payload pipeline is parameterised by a single
