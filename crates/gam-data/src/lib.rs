@@ -682,8 +682,18 @@ fn resolve_requested_columns(
 
     let requested_set: HashSet<&str> = requested_columns.iter().map(String::as_str).collect();
     let mut selected = Vec::with_capacity(requested_set.len());
+    let mut selected_names: HashSet<&str> = HashSet::with_capacity(requested_set.len());
     for (idx, name) in all_headers.iter().enumerate() {
         if requested_set.contains(name.as_str()) {
+            // A requested column the file names twice cannot be projected onto
+            // one column. Without this the count check below mistook the extra
+            // match for a missing column and reported an empty list of names.
+            if !selected_names.insert(name.as_str()) {
+                return Err(DataError::DegenerateColumn {
+                    column: name.clone(),
+                    problem: "has a duplicate name".to_string(),
+                });
+            }
             selected.push(idx);
         }
     }
