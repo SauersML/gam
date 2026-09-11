@@ -2412,8 +2412,9 @@ impl SaeManifoldTerm {
         // the assembled gradient is not the gradient of the scalar the line
         // search descends — an objective↔gradient desync — and no amount of
         // solver work can close a gap the two functions disagree about. The
-        // one-sided finite difference is reported beside the analytic slope so
-        // the two are compared rather than asserted.
+        // analytic slope is reported beside the best objective drop the steps
+        // along `−g/‖g‖` achieve, so a desync reads as a steep claimed slope with
+        // no drop, without forming a derivative from objective values.
         let mut steepest = gradient.clone();
         let steepest_norm = steepest.dot(&steepest).sqrt();
         let ambient = if steepest_norm.is_finite() && steepest_norm > 0.0 {
@@ -2423,7 +2424,6 @@ impl SaeManifoldTerm {
             let analytic_slope = gradient.dot(&steepest);
             let mut ambient_best_drop = 0.0_f64;
             let mut ambient_best_alpha = 0.0_f64;
-            let mut finite_difference = f64::NAN;
             let mut alpha = 1.0e-8_f64;
             while alpha <= 1.0e3 {
                 let applied = self
@@ -2436,9 +2436,6 @@ impl SaeManifoldTerm {
                 if applied
                     && let Ok(trial) = self.penalized_objective_total(target, rho, registry, 1.0)
                 {
-                    if (alpha - 1.0e-6).abs() < 1.0e-18 && trial.is_finite() {
-                        finite_difference = (trial - base_objective) / alpha;
-                    }
                     if trial.is_finite() && base_objective - trial > ambient_best_drop {
                         ambient_best_drop = base_objective - trial;
                         ambient_best_alpha = alpha;
@@ -2449,14 +2446,8 @@ impl SaeManifoldTerm {
                 }
                 alpha *= 10.0;
             }
-            let ratio = if analytic_slope != 0.0 {
-                finite_difference / analytic_slope
-            } else {
-                f64::NAN
-            };
             format!(
-                "ambient_slope={analytic_slope:.6e}, ambient_fd_slope={finite_difference:.6e} \
-                 (fd/analytic {ratio:.6e}), ambient_best_objective_drop={ambient_best_drop:.6e} \
+                "ambient_slope={analytic_slope:.6e}, ambient_best_objective_drop={ambient_best_drop:.6e} \
                  at α={ambient_best_alpha:.3e}"
             )
         } else {
