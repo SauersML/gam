@@ -6880,4 +6880,76 @@ mod tests {
         assert!(report.recurred && report.objective < before);
     }
 
+    /// #2634 — the support term accepts the same two KKT currencies as the
+    /// dense manifold lane. Replicating rows makes the raw decoder gradient
+    /// extensive while its diagonal curvature grows by the identical factor;
+    /// only the componentwise parameter-space audit remains invariant.
+    #[test]
+    fn support_parameter_certificate_survives_raw_global_refusal_2634() {
+        let rows = 1_024usize;
+        let evaluator: Arc<dyn SaeBasisSecondJet> =
+            Arc::new(EuclideanPatchEvaluator::new(1, 1).expect("patch"));
+        let atoms = vec![atom(
+            "replicated-line",
+            SaeAtomBasisKind::Linear,
+            1,
+            evaluator,
+            &[0.0],
+            array![[0.0], [10.0]],
+        )];
+        let coordinates: Vec<Vec<f64>> = (0..rows)
+            .map(|row| vec![if row % 2 == 0 { -10.0 } else { 10.0 }])
+            .collect();
+        let state = SaeAssignmentState::from_topk_support(
+            rows,
+            1,
+            1,
+            1,
+            vec![vec![0]; rows],
+            vec![vec![1.0]; rows],
+            coordinates,
+        )
+        .expect("state");
+        let term = SaeSupportSparseTerm::new(atoms, state).expect("term");
+        let fitted = term.reconstruct().expect("fitted");
+        let target = fitted.mapv(|value| value + 1.0e-4);
+        let lambda = vec![0.0];
+        let ard = vec![vec![0.0]];
+        let stationarity = term
+            .raw_stationarity(target.view(), &lambda, &ard)
+            .expect("stationarity");
+        let objective = term
+            .penalized_objective(target.view(), &lambda, &ard)
+            .expect("objective");
+        let objective_scale = objective.abs().max(1.0);
+        let parameter_scale = term.parameter_iterate_scale().expect("parameter scale");
+        let tolerance = 1.0e-5;
+
+        assert!(
+            stationarity.max_abs() > tolerance * objective_scale,
+            "the replicated raw/global certificate must refuse"
+        );
+        assert!(
+            stationarity.scaled_max_abs() <= tolerance * parameter_scale,
+            "the componentwise parameter certificate must be intensive"
+        );
+        assert!(stationarity.kkt_certifies(
+            objective_scale,
+            parameter_scale,
+            tolerance
+        ));
+
+        let error = accumulate_parameter_scaled_gradient(
+            &mut 0.0,
+            1.0,
+            0.0,
+            SaeInnerKktScaleBlock::SharedDecoder,
+            0,
+        )
+        .expect_err("zero curvature cannot scale a nonzero gradient");
+        assert!(matches!(
+            error,
+            SaeInnerKktScaleError::InvalidCurvature { .. }
+        ));
+    }
 }
