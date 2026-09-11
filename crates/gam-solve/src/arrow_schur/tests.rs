@@ -6959,3 +6959,190 @@ fn rendered_verdict_matches_the_value_verdict_for_every_variant_2598() {
     );
     assert!(ArrowSchurError::rendered_is_non_pd_schur_complement(&wrapped));
 }
+
+/// #2598 — pin `ArrowSchurError::is_non_pd_schur_complement` to the exact
+/// conjunct gam-sae used to reconstruct from `to_string()`: the discriminant
+/// must be `SchurFactorFailed` AND its reason must name a non-PD operator.
+///
+/// The negative arms are the load-bearing ones. A `SchurFactorFailed` raised
+/// for a non-finite or non-square operator, and a refusal of another class whose
+/// own reason happens to name a non-PD operator, both rendered a string that the
+/// old two-substring match rejected; they must stay fatal here, or a genuine
+/// assembly defect gets masked as a recoverable trial-point refusal.
+///
+/// `rendered_verdict_matches_the_value_verdict_for_every_variant_2598` pins the
+/// rendered reader to this predicate, and so cannot see the predicate drift: a
+/// reader and a predicate that flipped together would still agree. This test
+/// states the value verdicts themselves.
+#[test]
+fn non_pd_schur_predicate_preserves_the_two_substring_conjunct_2598() {
+    let non_pd = ArrowSchurError::SchurFactorFailed {
+        reason: "non-PD pivot -2.5e-09 at index 2 (matrix is not positive definite)".to_string(),
+    };
+    assert!(
+        non_pd.is_non_pd_schur_complement(),
+        "an indefinite reduced Schur complement is the recoverable trial-point refusal: {non_pd}"
+    );
+
+    let non_finite = ArrowSchurError::SchurFactorFailed {
+        reason: "cholesky_lower: non-finite entry at linear index 7".to_string(),
+    };
+    assert!(
+        !non_finite.is_non_pd_schur_complement(),
+        "a non-finite Schur operator is a defect, not a relocatable trial point: {non_finite}"
+    );
+
+    let non_square = ArrowSchurError::SchurFactorFailed {
+        reason: "cholesky_lower: non-square 3x4".to_string(),
+    };
+    assert!(
+        !non_square.is_non_pd_schur_complement(),
+        "a non-square Schur operator is a defect: {non_square}"
+    );
+
+    let per_row = ArrowSchurError::PerRowFactorFailed {
+        row: 3,
+        reason: "non-PD pivot -1e-12 at index 0 (matrix is not positive definite)".to_string(),
+    };
+    assert!(
+        !per_row.is_non_pd_schur_complement(),
+        "a per-row H_tt refusal is a different class and has its own predicate: {per_row}"
+    );
+
+    let ill_conditioned = ArrowSchurError::PerRowFactorIllConditioned {
+        row: 1,
+        kappa_estimate: 1e18,
+    };
+    assert!(!ill_conditioned.is_non_pd_schur_complement());
+
+    let pcg = ArrowSchurError::PcgFailed {
+        reason: "residual stalled while the operator is not positive definite".to_string(),
+    };
+    assert!(
+        !pcg.is_non_pd_schur_complement(),
+        "only the Schur-factor discriminant carries this verdict: {pcg}"
+    );
+
+    let unbounded = ArrowSchurError::UnboundedNegativeCurvature {
+        curvature: -3.5e-4,
+        direction_norm_sq: 2.0,
+    };
+    assert!(
+        !unbounded.is_non_pd_schur_complement(),
+        "unbounded negative curvature along a step is not a Schur-factor refusal: {unbounded}"
+    );
+
+    let adaptive = ArrowSchurError::AdaptiveCorrectionFailed {
+        reason: "no Armijo-accepted step; the operator is not positive definite".to_string(),
+    };
+    assert!(
+        !adaptive.is_non_pd_schur_complement(),
+        "an adaptive-correction refusal naming a non-PD operator stays fatal: {adaptive}"
+    );
+}
+
+/// #2548: matrix-free SAE assembly reclaims the dense shared-block workspace.
+/// A diagnostic that reads `hbb` directly then sees an empty matrix and silently
+/// assigns zero curvature to the decoder gradient. The public diagonal accessor
+/// must follow the installed operator, exactly like the solve does.
+///
+/// Built on the per-row-dims constructor with no rows: the uniform-rows
+/// empty-`hbb` convenience constructor this pin used was removed in d484a091a.
+#[test]
+fn shared_block_diagonal_survives_dense_workspace_reclamation_2548() {
+    use crate::arrow_schur::prelude::SharedBetaMatvec;
+    use std::sync::Arc;
+
+    let mut system =
+        ArrowSchurSystem::new_with_per_row_dims_empty_hbb_and_htbeta_cols(Vec::new(), 3, 0);
+    let expected = array![2.0, 5.0, 11.0];
+    let diagonal = expected.clone();
+    let matvec: SharedBetaMatvec = Arc::new(
+        move |input: ArrayView1<'_, f64>, output: &mut Array1<f64>| {
+            for component in 0..output.len() {
+                output[component] = diagonal[component] * input[component];
+            }
+        },
+    );
+    system.set_penalty_op(Arc::new(MatvecDiagPenaltyOp::new(
+        3,
+        matvec,
+        expected.clone(),
+    )));
+
+    assert_eq!(system.hbb.dim(), (0, 0));
+    assert_eq!(system.shared_block_diagonal(), expected);
+}
+
+/// #1017 fail-loud guard: at an SAE LLM-scale border the dense reduced Schur is a
+/// `k × k` f64 matrix (qwen `k = 98304` ⇒ 77 GiB). `build_dense_schur_direct` must
+/// REFUSE that allocation with a `SchurFactorFailed` carrying an actionable
+/// message — never OOM-kill the host by silently degrading into the dense
+/// factorization. The square-root BA route materialises the same matrix and
+/// carries the same refusal.
+///
+/// The system uses an empty dense `hbb` plus a cheap structured penalty op, so the
+/// guard is checked BEFORE any `k × k` allocation — the test itself never tries to
+/// allocate it. Built on the per-row-dims constructor (`vec![d; n]`): the
+/// uniform-rows empty-`hbb` convenience constructor was removed in d484a091a.
+#[test]
+fn build_dense_schur_direct_refuses_oversize_border_1017() {
+    use crate::arrow_schur::prelude::SharedBetaMatvec;
+    use std::sync::Arc;
+
+    // k chosen so k×k×8 bytes > the 8 GiB budget (k=40000 ⇒ ~11.9 GiB) while the
+    // structured op keeps the actual allocation tiny.
+    let k = 40_000usize;
+    let n = 2usize;
+    let d = 2usize;
+    let mut sys = ArrowSchurSystem::new_with_per_row_dims_empty_hbb_and_htbeta_cols(vec![d; n], k, k);
+    for row in sys.rows.iter_mut() {
+        for a in 0..d {
+            row.htt[[a, a]] = 3.0;
+        }
+    }
+    // Cheap structured penalty op (identity scaled): matvec + diagonal only, no
+    // dense materialization. Its presence makes `effective_penalty_op()` return
+    // the Arc without densifying, so the guard fires before any k×k buffer.
+    let matvec: SharedBetaMatvec = Arc::new(|x: ArrayView1<'_, f64>, out: &mut Array1<f64>| {
+        for a in 0..out.len() {
+            out[a] = x[a];
+        }
+    });
+    sys.set_penalty_op(Arc::new(MatvecDiagPenaltyOp::new(
+        k,
+        matvec,
+        Array1::<f64>::ones(k),
+    )));
+
+    let backend = CpuBatchedBlockSolver;
+    let htt_factors = backend
+        .factor_blocks(&sys.rows, 0.0, d, false)
+        .expect("SPD per-row blocks must factor");
+
+    let err =
+        build_dense_schur_direct(&sys, &htt_factors, 1e-6, &backend, gam_gpu::GpuPolicy::Auto)
+            .expect_err("oversize border must be refused, not allocated");
+    match err {
+        ArrowSchurError::SchurFactorFailed { reason } => {
+            assert!(
+                reason.contains("host budget") && reason.contains("matrix-free"),
+                "refusal must be actionable (border-too-large, matrix-free-only): {reason}"
+            );
+        }
+        other => panic!("expected SchurFactorFailed for oversize border, got {other:?}"),
+    }
+
+    let err =
+        build_dense_schur_sqrt_ba(&sys, &htt_factors, 1e-6, &backend, gam_gpu::GpuPolicy::Auto)
+            .expect_err("oversize square-root BA border must be refused, not allocated");
+    match err {
+        ArrowSchurError::SchurFactorFailed { reason } => {
+            assert!(
+                reason.contains("host budget") && reason.contains("matrix-free"),
+                "sqrt-BA refusal must be actionable (border-too-large, matrix-free-only): {reason}"
+            );
+        }
+        other => panic!("expected SchurFactorFailed for oversize sqrt-BA border, got {other:?}"),
+    }
+}

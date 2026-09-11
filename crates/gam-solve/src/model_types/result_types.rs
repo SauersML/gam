@@ -5058,3 +5058,196 @@ impl UnifiedFitResult {
         }
     }
 }
+
+#[cfg(test)]
+mod curvature_evidence_serialized_contract_2561_tests {
+    use super::{
+        CertifiedRung, CurvatureAdmissibility, CurvatureEvidence, OuterCriterionCertificate,
+        OuterStationarityCertificate,
+    };
+
+    /// `hessian_psd` is a PUBLISHED contract with an external consumer
+    /// (`gamfit/_summary.py`, domain `null | true | false`) and it is carried in
+    /// stored model bytes that have no version tag. #2561 replaced the raw
+    /// `Option<bool>` field with `CurvatureEvidence` and kept the wire form
+    /// via `#[serde(from = "Option<bool>", into = "Option<bool>")]`.
+    ///
+    /// Nothing gated that. The type is `Serialize + Deserialize` by derive, so
+    /// deleting the two serde attributes still compiles and still passes every
+    /// test that exercises the enum in memory — while silently changing the
+    /// published JSON from `null | true | false` to a Rust variant name and
+    /// making every previously-stored certificate unloadable.
+    ///
+    /// The round trip is deliberately LOSSY and the doc says so: every unmeasured
+    /// state reloads as `NotAvailable`. Asserting the loss rather than working
+    /// around it is the point — it records that those states are
+    /// acceptance-identical, which is the fact that makes the loss sound.
+    #[test]
+    fn curvature_evidence_serializes_as_the_legacy_optional_bool_2561() {
+        // A stationary certificate whose only free conjunct is the evidence
+        // under test, so what it publishes is about that evidence alone.
+        let certificate_with = |curvature: CurvatureEvidence| -> OuterCriterionCertificate {
+            let rung: CertifiedRung = gam_problem::StationarityRung {
+                label: "solver-band",
+                derived_standard: false,
+            }
+            .into();
+            OuterCriterionCertificate {
+                stationarity: OuterStationarityCertificate::AnalyticGradient {
+                    grad_norm: 1.0e-9,
+                    projected_grad_norm: 1.0e-9,
+                    bound: 1.0e-6,
+                    rung,
+                },
+                curvature,
+                lambdas_railed: Vec::new(),
+                railed_facts: Vec::new(),
+                curvature_floor: None,
+            }
+        };
+        for (evidence, expected) in [
+            (CurvatureEvidence::Measured { psd: true }, "true"),
+            (CurvatureEvidence::Measured { psd: false }, "false"),
+            (CurvatureEvidence::NotAvailable, "null"),
+            (CurvatureEvidence::NotSpent, "null"),
+            (CurvatureEvidence::NoEstimand, "null"),
+            (CurvatureEvidence::CriterionContradicted, "null"),
+        ] {
+            let wire = serde_json::to_string(&evidence).expect("evidence serializes");
+            assert_eq!(
+                wire, expected,
+                "the published `hessian_psd` domain is `null | true | false`; \
+                 {evidence:?} serialized as {wire}"
+            );
+            // The certificate publishes it under the legacy key.
+            let published = serde_json::to_value(certificate_with(evidence))
+                .expect("certificate serializes");
+            assert_eq!(
+                published.get("hessian_psd").map(|value| value.to_string()),
+                Some(expected.to_string()),
+                "the certificate must publish {evidence:?} under `hessian_psd`: {published}"
+            );
+        }
+
+        // Legacy documents reload, and a `null` NEVER becomes a measurement.
+        for (wire, expected) in [
+            ("true", CurvatureEvidence::Measured { psd: true }),
+            ("false", CurvatureEvidence::Measured { psd: false }),
+            ("null", CurvatureEvidence::NotAvailable),
+        ] {
+            let parsed: CurvatureEvidence =
+                serde_json::from_str(wire).expect("legacy hessian_psd reloads");
+            assert_eq!(
+                parsed, expected,
+                "legacy {wire} must reload as {expected:?}"
+            );
+        }
+
+        // The lossy half, asserted rather than hidden.
+        for lossy in [
+            CurvatureEvidence::NotSpent,
+            CurvatureEvidence::NoEstimand,
+            CurvatureEvidence::CriterionContradicted,
+        ] {
+            let wire = serde_json::to_string(&lossy).expect("serializes");
+            let back: CurvatureEvidence = serde_json::from_str(&wire).expect("reloads");
+            assert_eq!(
+                back,
+                CurvatureEvidence::NotAvailable,
+                "{lossy:?} is documented to reload as NotAvailable"
+            );
+            assert_eq!(
+                back.psd(),
+                None,
+                "the whole point of #2561 is that an unmeasured curvature never \
+                 presents as a measured one, on either side of the wire"
+            );
+        }
+    }
+
+    /// The defect #2561 names, stated as a test: an ABSENT measurement and a
+    /// PRESENT admissible one must not be the same answer.
+    ///
+    /// The old predicate was `hessian_psd != Some(false) || floor cleared`, and
+    /// its `true` was produced by two structurally different facts — a Hessian
+    /// measured and found admissible, and a route that never measured one. A
+    /// gate whose passing condition is satisfied by the ABSENCE of an
+    /// observation cannot fail on the case it exists to catch.
+    ///
+    /// Acceptance is deliberately unchanged (neither refuses), so the only
+    /// thing separating them is the verdict the production certificate reports.
+    #[test]
+    fn an_unmeasured_curvature_is_not_the_same_answer_as_an_admissible_one_2561() {
+        // A stationary certificate whose only free conjunct is the curvature
+        // evidence under test, so every verdict below is about that evidence.
+        let certificate_with = |curvature: CurvatureEvidence| -> OuterCriterionCertificate {
+            let rung: CertifiedRung = gam_problem::StationarityRung {
+                label: "solver-band",
+                derived_standard: false,
+            }
+            .into();
+            OuterCriterionCertificate {
+                stationarity: OuterStationarityCertificate::AnalyticGradient {
+                    grad_norm: 1.0e-9,
+                    projected_grad_norm: 1.0e-9,
+                    bound: 1.0e-6,
+                    rung,
+                },
+                curvature,
+                lambdas_railed: Vec::new(),
+                railed_facts: Vec::new(),
+                curvature_floor: None,
+            }
+        };
+        let measured = certificate_with(CurvatureEvidence::Measured { psd: true });
+        assert_eq!(
+            measured.hessian_psd(),
+            Some(true),
+            "a measured PSD Hessian reports its verdict"
+        );
+        assert_eq!(
+            measured.curvature_verdict(),
+            CurvatureAdmissibility::Admissible,
+            "a measured PSD Hessian is admissible"
+        );
+        for unmeasured in [
+            CurvatureEvidence::NotAvailable,
+            CurvatureEvidence::NotSpent,
+            CurvatureEvidence::NoEstimand,
+        ] {
+            let certificate = certificate_with(unmeasured);
+            assert_eq!(
+                certificate.hessian_psd(),
+                None,
+                "{unmeasured:?} answered no curvature question, so it has no verdict"
+            );
+            assert_eq!(
+                certificate.curvature_verdict(),
+                CurvatureAdmissibility::Unevaluated {
+                    evidence: unmeasured
+                },
+                "{unmeasured:?} must be reported as unevaluated, naming why"
+            );
+            assert_ne!(
+                certificate.curvature_verdict(),
+                CurvatureAdmissibility::Admissible,
+                "an unevaluated curvature must not compare equal to an admissible one"
+            );
+            assert!(
+                certificate.curvature_not_refused(),
+                "absence of a measurement does not refuse: acceptance is unchanged"
+            );
+        }
+        // And the three unmeasured states stay distinguishable from each other
+        // in memory, which is why the enum exists: `NoEstimand` (no curvature
+        // to have) is a different fact from `NotAvailable` (a curvature
+        // question that could not be answered) and from `NotSpent` (a
+        // screening pass that declined to ask).
+        assert_ne!(
+            CurvatureEvidence::NoEstimand,
+            CurvatureEvidence::NotAvailable
+        );
+        assert_ne!(CurvatureEvidence::NotSpent, CurvatureEvidence::NotAvailable);
+        assert_ne!(CurvatureEvidence::NoEstimand, CurvatureEvidence::NotSpent);
+    }
+}

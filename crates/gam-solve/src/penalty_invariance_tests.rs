@@ -576,3 +576,103 @@ fn reduced_criterion_fixture() -> (Array2<f64>, Array1<f64>, Array2<f64>) {
         .expect("one lifted direction");
     (h_rho, g_rho, lifted)
 }
+
+/// `S_2 = c * S_0` is the redundancy `geo_disease_matern` carries, and the
+/// invariance must be the exact line `(c, 0, -1)` — recovered from the Gram, not
+/// from a pairwise cosine threshold.
+///
+/// The direction is read through the production lift at unit lambdas, where
+/// `t = diag(lambda)^{-1} w` is `w` itself, so no basis getter is needed.
+#[test]
+fn proportional_penalties_yield_the_exact_lambda_null_direction_2676() {
+    let s0 = array![[2.0, 0.5, 0.0], [0.5, 1.0, 0.0], [0.0, 0.0, 0.0]];
+    let s1 = array![[0.0, 0.0, 0.0], [0.0, 3.0, 1.0], [0.0, 1.0, 2.0]];
+    let scale = 0.75_f64;
+    let s2 = s0.mapv(|value| scale * value);
+    let bundle = vec![penalty(s0, 3), penalty(s1, 3), penalty(s2, 3)];
+
+    let invariance = PenaltyMapInvariance::from_canonical_penalties(&bundle, 3)
+        .expect("penalty map gram must decompose");
+    assert_eq!(
+        invariance.dimension(),
+        1,
+        "one proportional pair is exactly one linear redundancy"
+    );
+    let lifted = invariance
+        .theta_directions(&Array1::ones(3), 3, 0)
+        .expect("one direction at unit lambdas");
+    assert_eq!(lifted.ncols(), 1);
+    let w = lifted.column(0).to_owned();
+    // Fix the sign, then compare against (c, 0, -1) normalised.
+    let expected = {
+        let raw = Array1::from(vec![scale, 0.0, -1.0]);
+        let norm = raw.dot(&raw).sqrt();
+        raw.mapv(|value| value / norm)
+    };
+    let aligned = if w.dot(&expected) < 0.0 {
+        w.mapv(|value| -value)
+    } else {
+        w
+    };
+    for index in 0..3 {
+        assert!(
+            (aligned[index] - expected[index]).abs() < 1e-12,
+            "null direction component {index}: got {}, expected {}",
+            aligned[index],
+            expected[index],
+        );
+    }
+}
+
+/// A three-term redundancy no pairwise measure can see: `A_2 = A_0 + A_1` with
+/// all three pairs far from proportional. The certification must find it, and
+/// the direction it returns must be the right one.
+///
+/// This is why the pairwise screen is documented as a SCREEN: it would report
+/// nothing here.
+#[test]
+fn a_three_term_redundancy_no_pair_can_see_is_certified_2676() {
+    let s0 = array![[2.0_f64, 0.5, 0.0], [0.5, 1.0, 0.0], [0.0, 0.0, 0.0]];
+    let s1 = array![[0.0_f64, 0.0, 0.0], [0.0, 3.0, 1.0], [0.0, 1.0, 2.0]];
+    let s2 = &s0 + &s1;
+    // Every pair is measurably distinct, so nothing pairwise fires.
+    for (a, b) in [(&s0, &s1), (&s0, &s2), (&s1, &s2)] {
+        let aa: f64 = a.iter().map(|v| v * v).sum();
+        let ab: f64 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
+        let scale = ab / aa;
+        let residual: f64 = a
+            .iter()
+            .zip(b.iter())
+            .map(|(x, y)| (y - scale * x) * (y - scale * x))
+            .sum::<f64>()
+            .sqrt()
+            / aa.sqrt();
+        assert!(
+            residual > 1e-2,
+            "the fixture must be pairwise-invisible; got a pair defect of {residual:.3e}"
+        );
+    }
+    let bundle = vec![penalty(s0, 3), penalty(s1, 3), penalty(s2, 3)];
+    let invariance =
+        PenaltyMapInvariance::from_canonical_penalties(&bundle, 3).expect("gram decomposes");
+    assert_eq!(invariance.dimension(), 1);
+    // `w ∝ (1, 1, -1)`, normalised, up to sign.
+    let lifted = invariance
+        .theta_directions(&Array1::ones(3), 3, 0)
+        .expect("one direction at unit lambdas");
+    let w = lifted.column(0).to_owned();
+    let expected = Array1::from(vec![1.0_f64, 1.0, -1.0]).mapv(|v| v / 3.0_f64.sqrt());
+    let aligned = if w.dot(&expected) < 0.0 {
+        w.mapv(|value| -value)
+    } else {
+        w
+    };
+    for index in 0..3 {
+        assert!(
+            (aligned[index] - expected[index]).abs() < 1e-12,
+            "component {index}: got {}, expected {}",
+            aligned[index],
+            expected[index]
+        );
+    }
+}
