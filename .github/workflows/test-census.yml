@@ -33,6 +33,15 @@ jobs:
           set -euo pipefail
           git fetch --no-tags --depth=2 origin d484a091a4d133aec6f3ed980754b6cda151d41b
           python scripts/public_api_census.py --positive-control
+      - name: Positive control against the symbol-table sweep's own commit
+        # A removal guard that has stopped refusing anything prints exactly what a
+        # diff that removed nothing prints, so point it at d484a091a -- "delete
+        # every function no production artifact links" -- on every run, and
+        # require each arm (public, test-scoped, private with callers) to refuse.
+        run: |
+          set -euo pipefail
+          git fetch --no-tags --depth=2 origin d484a091a4d133aec6f3ed980754b6cda151d41b
+          python scripts/source_removal_guard.py --positive-control
       - name: Positive control against the sweep this gate exists for
         # A census that has stopped detecting anything is byte-identical to a
         # census over a tree that lost nothing, so point the instrument at a
