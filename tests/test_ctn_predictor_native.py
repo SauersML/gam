@@ -1,4 +1,5 @@
 """Bound this native acceptance test externally; no xfail or convergence bypass."""
+import json
 import numpy as np
 import pandas as pd
 import gamfit
@@ -18,6 +19,8 @@ def test_standalone_ctn_schema_uses_fit_request(tmp_path, mode):
     model = gamfit.fit(data, "pgs ~ x", config=config, **kwargs,
                        persistent_warm_start_root=tmp_path / "warm")
     assert np.isfinite(model.transformation_score(data)).all()
+    posterior = json.loads(model.dumps())["payload"]["unified"]["geometry"]["constrained_posterior"]
+    assert posterior["moment_status"] == "Available"
 
 
 def test_native_ctn_chain_save_load_and_batches(tmp_path):
@@ -48,7 +51,6 @@ def test_native_ctn_chain_save_load_and_batches(tmp_path):
     np.testing.assert_allclose(restored.predict(test), before, rtol=1e-8, atol=1e-10)
     np.testing.assert_allclose(restored.predict(test.iloc[::-1]), before[::-1], rtol=1e-8, atol=1e-10)
     np.testing.assert_allclose(restored.predict(test.iloc[[3]]), before[[3]], rtol=1e-8, atol=1e-10)
-    import json
     payload = json.loads(restored.dumps())
     transform_payload = payload["payload"]["score_transform"]
     payload["payload"]["score_transform"] = None

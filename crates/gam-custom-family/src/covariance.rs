@@ -1513,54 +1513,16 @@ pub(crate) fn materialize_owned_terminal_unpenalized_hessian<
 /// zero variance in every constraint-normal direction.
 fn spd_covariance_from_precision(
     precision: &Array2<f64>,
-    dim_for_tol: usize,
     face: &str,
 ) -> Result<Array2<f64>, CustomFamilyError> {
-    let p = precision.nrows();
-    let (evals, evecs) = FaerEigh::eigh(precision, Side::Lower).map_err(|e| {
-        format!("joint posterior-precision eigendecomposition failed on the {face}: {e}")
-    })?;
-    let max_abs_eval = evals.iter().fold(0.0_f64, |acc, &ev| acc.max(ev.abs()));
-    let eps_np = f64::EPSILON * (dim_for_tol as f64) * (dim_for_tol as f64);
-    let tol = (10.0 * eps_np * max_abs_eval).max(100.0 * f64::EPSILON);
-    if let Some(&min_eval) = evals
-        .iter()
-        .filter(|&&ev| ev < -tol)
-        .min_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
-    {
-        let below = evals.iter().filter(|&&ev| ev < -tol).count();
-        return Err(CustomFamilyError::trial_point(format!(
-            "joint posterior precision H + S_λ is non-PD at the converged optimum on the \
-             {face} ({below} eigenvalue(s) below -tol, min(λ)={min_eval:.6e}, \
-             max|λ|={max_abs_eval:.6e}, tol={tol:.6e}); the mode is not a strict posterior \
-             maximum, so the reported covariance would be meaningless — fit-quality failure \
-             surfaced instead of δ-ridge masking (gam#748)"
-        )));
-    }
-    let flat = evals.iter().filter(|&&ev| ev <= tol).count();
-    if flat > 0 {
-        return Err(CustomFamilyError::trial_point(format!(
-            "joint posterior precision H + S_λ is singular at the converged optimum on the \
-             {face}: {flat} flat direction(s) (max|λ|={max_abs_eval:.6e}, tol={tol:.6e}). The \
-             posterior is improper along a flat direction — its variance is unbounded, so no \
-             finite covariance entry is honest there (a pseudo-inverse would claim zero \
-             variance, a δ-ridge an arbitrary finite one). Identify the direction via a \
-             constraint, penalty, or canonicalisation instead"
-        )));
-    }
-    // Strictly SPD: exact inverse through the eigenbasis, Σ = V diag(1/λ) Vᵀ.
-    let mut cov = Array2::<f64>::zeros((p, p));
-    for (k, &ev) in evals.iter().enumerate() {
-        let inv_ev = 1.0 / ev;
-        for i in 0..p {
-            let vi = evecs[[i, k]];
-            for j in 0..p {
-                cov[[i, j]] += inv_ev * vi * evecs[[j, k]];
-            }
-        }
-    }
-    symmetrize_dense_in_place(&mut cov);
-    Ok(cov)
+    // Small positive curvature is not a structural null: its units depend on
+    // the coefficient chart. Use the existing strict, unjittered Cholesky
+    // and inverse backward-error certificate, not a spectral rank cutoff.
+    gam_linalg::utils::certified_spd_inverse(precision, face)
+        .map(|certified| certified.into_inverse())
+        .map_err(|error| CustomFamilyError::trial_point(format!(
+            "joint posterior precision is non-PD at the converged optimum or its inverse could not be certified on the {face}: {error}"
+        )))
 }
 
 /// `Debug` is derived because the assembly is named in test panic messages that
@@ -1858,7 +1820,6 @@ pub(crate) fn compute_joint_posterior<F: CustomFamily + Clone + Send + Sync + 's
                 .then(|| {
                     spd_covariance_from_precision(
                         &precision,
-                        p,
                         "full posterior precision H + S_λ + H_Φ + H_completion",
                     )
                 })
@@ -1892,7 +1853,6 @@ pub(crate) fn compute_joint_posterior<F: CustomFamily + Clone + Send + Sync + 's
             // beats a silent wrong number.
             let ambient = match spd_covariance_from_precision(
                 &precision,
-                p,
                 "ambient constrained-posterior precision H + S_λ + H_Φ + H_completion",
             ) {
                 Ok(ambient) => ambient,
@@ -2373,6 +2333,19 @@ mod required_covariance_tests {
     //! knife-edge), so the assertion is deterministic and load-independent.
     use super::*;
     use ndarray::array;
+
+    #[test]
+    fn posterior_inverse_preserves_small_positive_curvature() {
+        let precision = array![[1.0e-12, 2.0e-7], [2.0e-7, 1.0]];
+        let covariance = spd_covariance_from_precision(&precision, "small score units").unwrap();
+        let expected = array![[1.0e12, -2.0e5], [-2.0e5, 1.0]] / 0.96;
+        for (&actual, &expected) in covariance.iter().zip(expected.iter()) {
+            assert!((actual - expected).abs() <= 1e-12 * expected.abs());
+        }
+        for precision in [array![[1., 1.], [1., 1.]], array![[1., 2.], [2., 1.]]] {
+            assert!(spd_covariance_from_precision(&precision, "invalid precision").is_err());
+        }
+    }
 
     #[derive(Clone)]
     struct TrivialFamily;
