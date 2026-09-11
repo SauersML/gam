@@ -2746,7 +2746,7 @@ pub fn audit_identifiability_channel_aware(
 /// route exclusively through the channel-aware audit, so without this they
 /// never benefit from the `[J; S]` augmentation the flat path already applies.
 ///
-/// `S_blockdiag` is the unit-weight STRUCTURAL sum of each block's penalty
+/// `S_blockdiag` is the normalized STRUCTURAL sum of each block's penalty
 /// matrices (the same ρ-invariant `block_structural_penalty_dense` the flat
 /// audit uses): only `∩_m ker(S_m)` matters for the rank verdict, independent
 /// of the fitted λ values. Blocks with no penalty contribute no rows, so for an
@@ -2855,7 +2855,7 @@ fn channel_aware_penalty_aware_joint_rank(
     }
 
     // Per-block structural penalties, parallel to `specs` (None ⇒ no penalty
-    // rows for that block). Reuses the exact unit-weight sum the flat audit
+    // rows for that block). Reuses the same normalized sum the flat audit
     // uses so the two paths agree on the ρ-invariant penalty geometry.
     let block_penalties: Vec<Option<Array2<f64>>> =
         specs.iter().map(block_structural_penalty_dense).collect();
@@ -3370,9 +3370,9 @@ fn locate_block_column(
     )))
 }
 
-/// Structural (λ-invariant) penalty for a block: the unit-weight sum of its
-/// penalty matrices, materialised dense (`p_block × p_block`), or `None` when
-/// the block carries no penalty.
+/// Structural (λ-invariant) penalty for a block: the sum of its independently
+/// normalized penalty matrices, materialised dense (`p_block × p_block`), or
+/// `None` when the block carries no penalty.
 ///
 /// Identifiability of a PENALIZED block is governed by `H + S`, not the raw
 /// design `H` alone: a direction killed by the data design but COVERED by the
@@ -3384,12 +3384,14 @@ fn locate_block_column(
 /// appending any square-root `√S` for the rank/null verdict and avoids a matrix
 /// square root.
 ///
-/// Using the unit-weight STRUCTURAL sum (not a fitted λ) keeps the gate
-/// ρ-invariant: only the penalties' shared null space `∩_m ker(S_m)` matters,
-/// which is independent of the smoothing-parameter values. A block with no
-/// penalty returns `None`, so its augmented design is just `J` — the gate then
-/// reduces EXACTLY to the historical raw-design rank check, leaving every
-/// unpenalized block/family's verdict unchanged.
+/// Only the penalties' shared null space `∩_m ker(S_m)` matters. Positive
+/// scalar weights on PSD penalties preserve that intersection, so divide each
+/// matrix by its largest absolute entry before summing. In particular, response
+/// derivative penalties grow when CTN response units shrink. Summing their raw
+/// magnitudes can bury both the design and other penalties below the QR cutoff,
+/// incorrectly rejecting data-identified affine directions. This normalization
+/// changes only the structural audit, never the fitted penalties or strengths.
+/// A block with no penalty retains the raw-design rank check.
 pub(crate) fn block_structural_penalty_dense(spec: &ParameterBlockSpec) -> Option<Array2<f64>> {
     let p = spec.design.ncols();
     if p == 0 || spec.penalties.is_empty() {
@@ -3400,7 +3402,12 @@ pub(crate) fn block_structural_penalty_dense(spec: &ParameterBlockSpec) -> Optio
     for penalty in &spec.penalties {
         let dense = penalty.to_dense();
         if dense.nrows() == p && dense.ncols() == p {
-            s += &dense;
+            let scale = dense.iter().map(|v| v.abs()).fold(0.0_f64, f64::max);
+            if scale > 0.0 {
+                ndarray::Zip::from(&mut s)
+                    .and(&dense)
+                    .for_each(|sum, &value| *sum += value / scale);
+            }
             any = true;
         }
     }
@@ -3704,6 +3711,42 @@ mod tests {
             return ndarray::Array1::<f64>::zeros(n.max(1));
         }
         ndarray::Array1::linspace(-1.0, 1.0, n)
+    }
+
+    #[test]
+    fn structural_audit_is_invariant_to_independent_penalty_units() {
+        // Data identify the unpenalized location; two distinct PSD penalties
+        // identify the two design-null directions. Their arbitrary units must
+        // not erase either the data direction or the smaller penalty.
+        for (first, second) in [(1.0, 1.0), (1e30, 1e-30), (1e-30, 1e30)] {
+            let mut design = Array2::<f64>::zeros((32, 3));
+            design.column_mut(0).fill(1.0);
+            let mut spec = spec_from_dense("transformation", design);
+            spec.penalties = vec![
+                gam_problem::PenaltyMatrix::Dense(ndarray::arr2(&[
+                    [0.0, 0.0, 0.0],
+                    [0.0, first, 0.0],
+                    [0.0, 0.0, 0.0],
+                ])),
+                gam_problem::PenaltyMatrix::Dense(ndarray::arr2(&[
+                    [0.0, 0.0, 0.0],
+                    [0.0, 0.0, 0.0],
+                    [0.0, 0.0, second],
+                ])),
+            ];
+            let audit = audit_identifiability(&[spec.clone()]).unwrap();
+            assert!(!audit.fatal, "{}", audit.summary);
+            assert_eq!(audit.blocks[0].design_range_rank, 3);
+            assert!(audit.dropped_columns.is_empty());
+
+            // Removing one penalty leaves a real unidentified direction even
+            // at the extreme scale. Normalization must not manufacture rank.
+            spec.penalties.pop();
+            let audit = audit_identifiability(&[spec]).unwrap();
+            assert!(audit.fatal);
+            assert_eq!(audit.blocks[0].design_range_rank, 2);
+            assert_eq!(audit.dropped_columns.len(), 1);
+        }
     }
 
     /// `pair_report_threshold` floors at `REPORT_FLOOR_NEAR_EXACT` and ceilings

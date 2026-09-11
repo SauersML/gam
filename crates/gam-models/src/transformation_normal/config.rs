@@ -127,25 +127,6 @@ pub(crate) const CTN_INNER_MAX_CYCLES_PER_DIM: usize = 2;
 
 pub(crate) const CTN_INNER_MAX_CYCLES_CEILING: usize = 400;
 
-/// Numerical floor on a Gram/penalty diagonal scale before it enters the
-/// `likelihood_scale / penalty_scale` ratio that seeds the outer log-λ search.
-/// A genuinely zero diagonal (an all-zero penalty block, or a degenerate
-/// likelihood Gram) would otherwise produce a `0/0` or `x/0` seed; flooring
-/// both scales at a value far below any meaningful curvature keeps the ratio
-/// finite without perturbing well-posed problems.
-pub(crate) const CTN_SEED_SCALE_FLOOR: f64 = 1.0e-8;
-
-/// Lower bound on the cold-start seed log-λ (i.e. λ ≥ 1). Keeps the outer
-/// optimizer out of the under-regularized regime where the CTN inner solve is
-/// structurally rank-deficient (small-n / p > n); the optimizer is free to step
-/// below this once the data support it. See `ctn_penalty_scale_log_lambdas`.
-pub(crate) const CTN_SEED_LOG_LAMBDA_MIN: f64 = 0.0;
-
-/// Upper bound on the cold-start seed log-λ, matching the outer ρ-bound used
-/// across the location-scale families: λ ≈ e¹² caps the seed in the strongly
-/// over-smoothed regime so a tiny penalty scale cannot seed an absurd λ.
-pub(crate) const CTN_SEED_LOG_LAMBDA_MAX: f64 = 12.0;
-
 /// Floor on the warm-start global residual scale `sqrt(weighted_ss / Σw)`.
 /// Guards the degenerate near-perfect-fit case (residuals collapse to numerical
 /// zero) so the per-residual `residual_floor` below — and the subsequent

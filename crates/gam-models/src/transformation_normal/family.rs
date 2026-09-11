@@ -634,10 +634,10 @@ impl TransformationNormalFamily {
         let likelihood_diagonal_mean = self
             .x_val_kron
             .weighted_gram_diagonal_mean(self.weights.as_ref(), &policy)?;
-        Ok(ctn_penalty_scale_log_lambdas(
+        ctn_penalty_scale_log_lambdas(
             &self.tensor_penalties,
             likelihood_diagonal_mean,
-        ))
+        )
     }
 
     /// Return the single coefficient block under one explicit smoothing state.
