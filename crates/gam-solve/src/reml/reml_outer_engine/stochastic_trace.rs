@@ -438,16 +438,9 @@ impl StochasticTraceEstimator {
 
     /// Create a new estimator sharing fit-level stochastic trace state.
     pub(crate) fn with_shared_trace_state(
-        mut config: StochasticTraceConfig,
+        config: StochasticTraceConfig,
         trace_state: Arc<Mutex<StochasticTraceState>>,
     ) -> Self {
-        let override_tol = match trace_state.lock() {
-            Ok(guard) => guard.solve_rel_tol_override,
-            Err(poisoned) => poisoned.into_inner().solve_rel_tol_override,
-        };
-        if let Some(rel_tol) = override_tol.filter(|v| v.is_finite() && *v > 0.0) {
-            config.solve_rel_tol = rel_tol;
-        }
         Self {
             config,
             trace_state,
@@ -554,7 +547,6 @@ impl StochasticTraceEstimator {
             }
         }
 
-        self.record_probe_batch(Self::max_probe_variance(&m2s, n_drawn), n_drawn);
         self.raise_probe_floor(n_drawn);
         means
     }
@@ -612,14 +604,6 @@ impl StochasticTraceEstimator {
             }
         }
 
-        self.record_probe_batch(
-            Self::max_probe_variance(
-                m2s.as_slice()
-                    .expect("m2s is a locally allocated contiguous accumulator"),
-                n_drawn,
-            ),
-            n_drawn,
-        );
         self.raise_probe_floor(n_drawn);
         for d in 0..n_coords {
             for e in (d + 1)..n_coords {
@@ -629,25 +613,6 @@ impl StochasticTraceEstimator {
             }
         }
         means
-    }
-
-    pub(crate) fn max_probe_variance(m2s: &[f64], n_drawn: usize) -> f64 {
-        if n_drawn <= 1 {
-            return 0.0;
-        }
-        let denom = (n_drawn - 1) as f64;
-        m2s.iter()
-            .map(|m2| (*m2 / denom).max(0.0))
-            .fold(0.0_f64, f64::max)
-    }
-
-    pub(crate) fn record_probe_batch(&self, sigma_sq: f64, n_drawn: usize) {
-        let mut state = match self.trace_state.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        state.last_probe_sigma_sq = Some(state.last_probe_sigma_sq.unwrap_or(0.0).max(sigma_sq));
-        state.last_probe_count = state.last_probe_count.max(n_drawn);
     }
 
     pub(crate) fn estimate_hinv_traces_with_control_variates(

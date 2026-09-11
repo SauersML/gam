@@ -631,8 +631,8 @@ fn hifreq_tensor_k6() -> Result<(), String> {
 // the `O(n p²)` assembly nor the `O(p³)` factorization is the cost.
 //
 // `[HGB]` names the REGION, not the consumer, and the distinction matters. It
-// is emitted by a BUDGET-SETTING routine (`reml/gradient_hessian.rs`): it
-// computes `k_target` and writes `solve_rel_tol_override` /
+// was emitted by a BUDGET-SETTING routine (`reml/gradient_hessian.rs`, deleted
+// with its hand-picked constants in #2469): it computed `k_target` and wrote `solve_rel_tol_override` /
 // `monotone_probe_floor` into `trace_state`, then returns. It does no heavy
 // work, and its own `k=` field — the requested stochastic-trace probe floor —
 // reads **`k=0` in every run at every k** (4, 6, 8, 10). So what consumes the

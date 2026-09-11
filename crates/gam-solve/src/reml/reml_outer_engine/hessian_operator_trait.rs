@@ -14,10 +14,6 @@ use super::*;
 pub struct StochasticTraceState {
     pub monotone_probe_floor: usize,
     pub cg_warm_starts: HashMap<u64, Array1<f64>>,
-    pub solve_rel_tol_override: Option<f64>,
-    pub last_linear_residual_norm: Option<f64>,
-    pub last_probe_sigma_sq: Option<f64>,
-    pub last_probe_count: usize,
 }
 
 /// Abstract interface for Hessian linear algebra operations.

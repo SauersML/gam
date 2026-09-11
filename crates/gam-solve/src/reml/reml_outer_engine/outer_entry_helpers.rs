@@ -12,14 +12,9 @@ pub struct RemlLamlResult {
     /// Newton-decrement energy `½ rᵀH⁻¹r` of the converged inner KKT
     /// residual at this `ρ`, where `r = ∇_β L(β̂, ρ)` and `H` is the inner
     /// Hessian. Bounds the inner sub-optimality `|V(β̂) − V(β*)| ≤
-    /// ½ rᵀH⁻¹r` to first order, and is consumed by:
-    ///
-    /// * the HyperGradientBudget controller, which uses it as the
-    ///   inner-channel energy proxy `E_inner` when estimating
-    ///   `s_inner` and re-allocating per-channel tolerances; and
-    /// * the trust-energy gate in the outer strategy, which shrinks the
-    ///   trust radius when this energy exceeds
-    ///   `TRUST_ENERGY_FACTOR × |predicted_decrease|`.
+    /// ½ rᵀH⁻¹r` to first order, and is consumed by the trust-energy gate in
+    /// the outer strategy, which shrinks the trust radius when this energy
+    /// exceeds `TRUST_ENERGY_FACTOR × |predicted_decrease|`.
     ///
     /// `None` when the inner solve did not compute an energy estimate
     /// (e.g., projected-pseudo-inverse paths that lack a full-H solve).

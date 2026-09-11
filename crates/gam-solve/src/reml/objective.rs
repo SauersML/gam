@@ -2267,7 +2267,6 @@ impl<'a> RemlState<'a> {
         self.validate_tk_ext_coords(mode, &assembly.ext_coords)?;
         let tk_atom = self.tierney_kadane_terms(rho, bundle, mode, &assembly.ext_coords)?;
         let trace_state = self.hypergradient_trace_state();
-        Self::reset_hypergradient_trace_telemetry(&trace_state);
         let assembly_ext_len = assembly.ext_coords.len();
         let mut inner_solution = assembly.build();
         inner_solution.stochastic_trace_state = trace_state;
@@ -2775,7 +2774,6 @@ impl<'a> RemlState<'a> {
                 &bundle,
                 super::reml_outer_engine::EvalMode::ValueAndGradient,
             )?;
-            let ift_residual_energy = result.ift_residual_energy;
             let grad = result
                 .gradient
                 .ok_or(EstimationError::GradientUnavailable {
@@ -2789,7 +2787,6 @@ impl<'a> RemlState<'a> {
                 t_assemble.elapsed().as_secs_f64() * 1000.0,
                 t_eval_start.elapsed().as_secs_f64() * 1000.0
             );
-            self.update_hypergradient_budget_after_outer_eval(p, &grad, ift_residual_energy);
             return Ok(grad);
         }
         let result = self.evaluate_unified(
@@ -2797,7 +2794,6 @@ impl<'a> RemlState<'a> {
             &bundle,
             super::reml_outer_engine::EvalMode::ValueAndGradient,
         )?;
-        let ift_residual_energy = result.ift_residual_energy;
         let grad = result
             .gradient
             .ok_or(EstimationError::GradientUnavailable {
@@ -2811,7 +2807,6 @@ impl<'a> RemlState<'a> {
             t_assemble.elapsed().as_secs_f64() * 1000.0,
             t_eval_start.elapsed().as_secs_f64() * 1000.0
         );
-        self.update_hypergradient_budget_after_outer_eval(p, &grad, ift_residual_energy);
         Ok(grad)
     }
 
@@ -2967,7 +2962,6 @@ impl<'a> RemlState<'a> {
             self.evaluate_unified(p, &bundle, eval_mode)?
         };
         let assemble_ms = t_assemble.elapsed().as_secs_f64() * 1000.0;
-        let ift_residual_energy = result.ift_residual_energy;
 
         let gradient = result.gradient.ok_or_else(|| {
             EstimationError::InvalidInput(format!(
@@ -3007,7 +3001,6 @@ impl<'a> RemlState<'a> {
                 t_eval_start.elapsed().as_secs_f64() * 1000.0
             );
         }
-        self.update_hypergradient_budget_after_outer_eval(p, &eval.gradient, ift_residual_energy);
         self.cache_manager.store_outer_eval(&rho_key, &eval);
         Ok(eval)
     }

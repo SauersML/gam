@@ -1376,30 +1376,23 @@ impl MatrixFreeSpdOperator {
             return self.solve(rhs);
         };
 
-        if let Some(state) = trace_state {
+        if let (Some(state), Some(id)) = (trace_state, probe_id) {
             let mut guard = match state.lock() {
                 Ok(guard) => guard,
                 Err(poisoned) => poisoned.into_inner(),
             };
-            guard.last_linear_residual_norm = Some(
-                guard
-                    .last_linear_residual_norm
-                    .unwrap_or(0.0)
-                    .max(residual_norm),
-            );
-            if let Some(id) = probe_id {
-                guard.cg_warm_starts.insert(id, solution.clone());
-            }
+            guard.cg_warm_starts.insert(id, solution.clone());
         }
 
         let probe_label = probe_id
             .map(|id| id.to_string())
             .unwrap_or_else(|| "untracked".to_string());
         log::info!(
-            "[CG-TRACE] probe_id={} iters={} rel_tol={} warm_start_used={}",
+            "[CG-TRACE] probe_id={} iters={} rel_tol={} residual={:.3e} warm_start_used={}",
             probe_label,
             iters,
             rel_tol,
+            residual_norm,
             warm_start_used
         );
 

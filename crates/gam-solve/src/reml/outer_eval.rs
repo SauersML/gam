@@ -41,7 +41,6 @@ pub(crate) use gam_terms::construction::{
 // `gam_problem` contract so gam-solve has no back-edge into the gam-inference SCC.
 pub(crate) use gam_problem::laplace_sampler_contract::BlockExcessTarget;
 pub(crate) use ndarray::{Array1, Array2, ArrayView1, s};
-pub(crate) use std::collections::VecDeque;
 pub(crate) use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 pub(crate) use std::sync::{Arc, Mutex};
 

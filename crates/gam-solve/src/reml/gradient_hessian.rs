@@ -61,7 +61,7 @@ impl<'a> RemlState<'a> {
         Some(next_step_cap)
     }
 
-    pub(crate) fn reset_hypergradient_budget_controller(&self) {
+    pub(crate) fn reset_hypergradient_runtime(&self) {
         *self
             .hypergradient_runtime
             .lock()
@@ -77,190 +77,6 @@ impl<'a> RemlState<'a> {
             .expect("hypergradient runtime mutex poisoned");
         let state = slot.get_or_insert_with(HyperGradientRuntimeState::new);
         Arc::clone(&state.trace_state)
-    }
-
-    pub(crate) fn reset_hypergradient_trace_telemetry(
-        trace_state: &Arc<Mutex<super::reml_outer_engine::StochasticTraceState>>,
-    ) {
-        let mut trace = match trace_state.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        trace.last_linear_residual_norm = None;
-        trace.last_probe_sigma_sq = None;
-        trace.last_probe_count = 0;
-    }
-
-    pub(crate) fn hypergradient_adaptive_kkt_override(
-        &self,
-        pirls_config: &pirls::PirlsConfig,
-    ) -> Option<pirls::AdaptiveKktTolerance> {
-        let tau = self
-            .hypergradient_runtime
-            .lock()
-            .expect("hypergradient runtime mutex poisoned")
-            .as_ref()?
-            .adaptive_kkt_override?;
-        if !tau.is_finite() || tau <= 0.0 {
-            return None;
-        }
-        let ceiling = pirls_config.convergence_tolerance;
-        let floor =
-            (self.config.reml_convergence_tolerance / ADAPTIVE_KKT_FLOOR_REML_DIVISOR).min(ceiling);
-        if !(floor > 0.0 && ceiling >= floor) {
-            return None;
-        }
-        let tau = tau.clamp(floor, ceiling);
-        Some(pirls::AdaptiveKktTolerance {
-            eta: 1.0,
-            floor: tau,
-            ceiling: tau,
-            outer_grad_norm: tau,
-        })
-    }
-
-    pub(crate) fn update_hypergradient_budget_after_outer_eval(
-        &self,
-        rho: &Array1<f64>,
-        gradient: &Array1<f64>,
-        ift_residual_energy: Option<f64>,
-    ) {
-        if rho.iter().any(|v| !v.is_finite()) || gradient.iter().any(|v| !v.is_finite()) {
-            return;
-        }
-
-        let mut slot = self
-            .hypergradient_runtime
-            .lock()
-            .expect("hypergradient runtime mutex poisoned");
-        let state = slot.get_or_insert_with(HyperGradientRuntimeState::new);
-        let (e_linear, sigma_sq, k, current_floor) = {
-            let trace = match state.trace_state.lock() {
-                Ok(guard) => guard,
-                Err(poisoned) => poisoned.into_inner(),
-            };
-            let linear_residual_norm = trace.last_linear_residual_norm.unwrap_or(0.0).max(0.0);
-            (
-                // Convert CG residual norm to 1/2*norm^2 so the channel is an energy like e_inner.
-                0.5 * linear_residual_norm * linear_residual_norm,
-                trace.last_probe_sigma_sq.unwrap_or(0.0).max(0.0),
-                trace.last_probe_count,
-                trace.monotone_probe_floor,
-            )
-        };
-        let e_inner = ift_residual_energy.unwrap_or(0.0).max(0.0);
-        state.budget.push(HyperGradHistoryEntry {
-            rho: rho.clone(),
-            g_outer: gradient.clone(),
-            e_inner,
-            e_linear,
-            sigma_sq,
-            k,
-        });
-
-        let sensitivity_estimate = state.budget.reestimate_sensitivities();
-        let sensitivity_stable = state.budget.sensitivities_stable();
-        let force_engage = state.budget.history.len() >= HGB_WARMUP_ITERS_MAX;
-        if !state.budget.warmup_engaged
-            && state.budget.history.len() >= HGB_WARMUP_ITERS_MIN
-            && (sensitivity_stable || force_engage)
-        {
-            if sensitivity_stable {
-                log::info!(
-                    "[HGB] engage after {} iters (sensitivity stable)",
-                    state.budget.history.len()
-                );
-            } else {
-                log::info!(
-                    "[HGB] engage after {} iters (max warmup reached)",
-                    state.budget.history.len()
-                );
-            }
-            state.budget.warmup_engaged = true;
-        }
-
-        if !state.budget.warmup_engaged {
-            state.adaptive_kkt_override = None;
-            match state.trace_state.lock() {
-                Ok(mut trace) => trace.solve_rel_tol_override = None,
-                Err(poisoned) => {
-                    let mut trace = poisoned.into_inner();
-                    trace.solve_rel_tol_override = None;
-                }
-            }
-            return;
-        }
-
-        let [s_inner, s_linear, s_trace] = if let Some(sensitivities) = sensitivity_estimate {
-            sensitivities
-        } else {
-            // Routine per-evaluation fallback (fires whenever the cross-channel
-            // sensitivity estimate is unavailable, i.e. nearly every early
-            // iteration) — not an anomaly. Keep it for `debug` tracing but off
-            // the default `warn` stream so it does not re-create the #1688
-            // firehose.
-            log::debug!("[HGB] sensitivity_unavailable falling_back_to_per_channel");
-            [S_INNER_INIT, S_LINEAR_INIT, S_TRACE_INIT]
-        };
-
-        let previous_grad_norm = state.budget.previous_gradient_norm().max(1e-12);
-        state.budget.target_mse = (HGB_TARGET_FRACTION * previous_grad_norm).powi(2);
-        let (eps2_inner, eps2_linear, eps2_trace, floor_active) = state
-            .budget
-            .allocate_with_sensitivities(s_inner, s_linear, s_trace);
-
-        let ceiling = self.config.pirls_convergence_tolerance;
-        let pirls_floor =
-            (self.config.reml_convergence_tolerance / ADAPTIVE_KKT_FLOOR_REML_DIVISOR).min(ceiling);
-        let tau_raw = eps2_inner.sqrt() / s_inner;
-        let tau_inner = if pirls_floor > 0.0 && ceiling >= pirls_floor {
-            tau_raw.clamp(pirls_floor, ceiling)
-        } else {
-            tau_raw
-        }
-        .max(0.0);
-        state.adaptive_kkt_override =
-            (tau_inner.is_finite() && tau_inner > 0.0).then_some(tau_inner);
-
-        let rel_tol = eps2_linear.sqrt() / s_linear;
-        let k_target = if eps2_trace > 0.0 && sigma_sq.is_finite() && sigma_sq > 0.0 {
-            (sigma_sq / eps2_trace).ceil().clamp(0.0, usize::MAX as f64) as usize
-        } else {
-            current_floor
-        };
-        let raised_floor = current_floor.max(k_target);
-        {
-            let mut trace = match state.trace_state.lock() {
-                Ok(guard) => guard,
-                Err(poisoned) => poisoned.into_inner(),
-            };
-            trace.solve_rel_tol_override =
-                (rel_tol.is_finite() && rel_tol > 0.0).then_some(rel_tol);
-            if raised_floor > trace.monotone_probe_floor {
-                trace.monotone_probe_floor = raised_floor;
-            }
-        }
-
-        let active = ["i", "l", "t"]
-            .iter()
-            .zip(floor_active.iter())
-            .filter_map(|(name, active)| active.then_some(*name))
-            .collect::<Vec<_>>()
-            .join(",");
-        log::info!(
-            "[HGB] target_mse={:.3e} s_i={:.3e} s_l={:.3e} s_t={:.3e} eps²_i={:.3e} eps²_l={:.3e} eps²_t={:.3e} τ={:.3e} rtol={:.3e} k={} floor_active=[{}]",
-            state.budget.target_mse,
-            s_inner,
-            s_linear,
-            s_trace,
-            eps2_inner,
-            eps2_linear,
-            eps2_trace,
-            tau_inner,
-            rel_tol,
-            k_target,
-            active,
-        );
     }
 
     pub(crate) fn apply_inner_polish_step_to_warm_start(
@@ -3975,7 +3791,7 @@ impl<'a> RemlState<'a> {
         // the helpers' doc-comments for the per-slot staleness arguments.
         self.clear_warm_start_predictor_state();
         self.clear_warm_start_adaptive_signals();
-        self.reset_hypergradient_budget_controller();
+        self.reset_hypergradient_runtime();
         // The λ-search frozen NB θ (#1082) is computed from the seed fit on the
         // PREVIOUS design; a new surface (different X / penalties) must re-freeze
         // it from its own seed. `0` = "not yet frozen".
@@ -5920,7 +5736,7 @@ impl<'a> RemlState<'a> {
         self.outer_inner_cap.store(0, Ordering::Relaxed);
         self.screening_max_inner_iterations
             .store(0, Ordering::Relaxed);
-        self.reset_hypergradient_budget_controller();
+        self.reset_hypergradient_runtime();
     }
 
     // Accessor methods for private fields
@@ -6960,10 +6776,7 @@ impl<'a> RemlState<'a> {
                     adaptive_lm_lambda_hint(cached_lambda, last_iters, last_converged);
             }
             let adaptive_kkt_tolerance = if !in_screening {
-                if let Some(override_tol) = self.hypergradient_adaptive_kkt_override(&pirls_config)
-                {
-                    Some(override_tol)
-                } else if let Some(outer_grad_norm) = self.previous_outer_gradient_norm(&key_opt) {
+                if let Some(outer_grad_norm) = self.previous_outer_gradient_norm(&key_opt) {
                     // Ceiling is pinned to the tight inner tolerance. Loosening
                     // it to a fixed 1e-6 ceiling (#1575) made every inner solve
                     // uniformly coarse so the outer REML gradient was inaccurate
