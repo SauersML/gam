@@ -1381,6 +1381,35 @@ pub(crate) fn try_tangent_projected_evaluate(
                              curvature: {error}"
                         )
                     })?;
+                // #979: locate the smallest eigenvalue the criterion's
+                // pseudo-log-determinant keeps relative to this face. A kept
+                // direction normal to the face prices curvature the constrained
+                // mode never explores; one inside the tangent disagrees with the
+                // certified tangent curvature there.
+                if let Some(kernel) = solution.penalty_subspace_trace.as_ref() {
+                    let inverse = &kernel.h_proj_inverse;
+                    let rank = inverse.nrows();
+                    let diagonal = (0..rank)
+                        .all(|i| (0..rank).all(|j| i == j || inverse[[i, j]] == 0.0));
+                    let shaped = inverse.ncols() == rank
+                        && kernel.u_s.ncols() == rank
+                        && kernel.u_s.nrows() == z.nrows();
+                    let smallest = (0..rank).max_by(|&left, &right| {
+                        inverse[[left, left]].total_cmp(&inverse[[right, right]])
+                    });
+                    if let (true, true, Some(column)) = (diagonal, shaped, smallest) {
+                        let direction = kernel.u_s.column(column);
+                        let tangent_part = z.t().dot(&direction);
+                        log::info!(
+                            "[979-FACE-LOGDET] kept_rank={rank}/{} tangent_dim={} \
+                             sigma_min_kept={:.6e} normal_fraction={:.3e}",
+                            z.nrows(),
+                            z.ncols(),
+                            1.0 / inverse[[column, column]],
+                            direction.dot(&direction) - tangent_part.dot(&tangent_part),
+                        );
+                    }
+                }
                 let response_tangent = z.t().dot(&response_full).dot(&z);
                 let response_tangent_op =
                     DenseSpectralOperator::from_symmetric(&response_tangent).map_err(|error| {
