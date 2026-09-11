@@ -4599,7 +4599,11 @@ mod tests {
     }
 
     #[test]
-    fn monotonicity_constraints_cluster_spline_like_near_duplicates() {
+    fn monotonicity_constraints_keep_spline_like_near_duplicates_distinct() {
+        // Near-duplicate collocation normals are distinct halfspaces: collapsing them
+        // to one row with the tightest right-hand side would drop constraints whose
+        // normals differ from the kept one, so only bit-identical normalized normals
+        // merge.
         let a = array![
             [0.0, 0.401, 0.302, 0.197],
             [0.0, 0.40100000003, 0.30199999998, 0.19700000001],
@@ -4610,14 +4614,13 @@ mod tests {
 
         let compressed = compress_positive_collinear_constraints(&a, &b);
 
-        assert_eq!(compressed.a.nrows(), 2);
-        let mut clustered_face = false;
+        assert_eq!(compressed.a.nrows(), 4);
+        let mut near_duplicate_rhs = Vec::new();
         let mut distinct_face = false;
         for i in 0..compressed.a.nrows() {
             let row = compressed.a.row(i);
             if row[1] > 0.99 && row[2] > 0.7 && row[3] > 0.49 {
-                clustered_face = true;
-                assert!((compressed.b[i] - (2.0e-8 / 0.401)).abs() <= 1e-12);
+                near_duplicate_rhs.push(compressed.b[i]);
             } else {
                 distinct_face = true;
                 assert!((row[1] - 0.25).abs() <= 1e-12);
@@ -4626,7 +4629,16 @@ mod tests {
                 assert!((compressed.b[i] - 6.0e-8).abs() <= 1e-18);
             }
         }
-        assert!(clustered_face);
+        // Each near-duplicate face keeps its own right-hand side on its own
+        // normalization.
+        let mut expected = vec![
+            2.0e-8 / 0.401,
+            2.00000000004e-8 / 0.40100000003,
+            1.99999999996e-8 / 0.40099999997,
+        ];
+        expected.sort_by(f64::total_cmp);
+        near_duplicate_rhs.sort_by(f64::total_cmp);
+        assert_eq!(near_duplicate_rhs, expected);
         assert!(distinct_face);
     }
 

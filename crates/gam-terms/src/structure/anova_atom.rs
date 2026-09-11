@@ -116,22 +116,6 @@ use gam_math::score_opt::{
 /// knob.
 pub const FISSION_MAX_INTERACTION_FRACTION: f64 = 1e-4;
 
-/// Interaction energy fraction at or below which the gauge-projected
-/// interaction block is f64 roundoff rather than signal, so the binding Wald
-/// test cannot constitute proof of binding. An exactly-additive surface fits to
-/// machine precision; its scale-included posterior covariance collapses
-/// (`σ̂² → 0`) while the projected interaction coefficients are pure centering
-/// roundoff, so the Wald statistic degenerates into a `0/0` ratio — roundoff
-/// coefficients divided by a vanishing covariance — that can read as
-/// overwhelmingly significant (`p ≈ 0`). At or below this floor (a relative
-/// amplitude of `1e-6`, far above the ~`1e-30` roundoff an exactly-additive
-/// carve actually lands at, yet far below any interaction a finite-sample fit
-/// can statistically resolve) the surface is additive by construction and no
-/// such statistic counts as binding: absence of an interaction is not evidence
-/// of one. This keeps a numerically-additive atom from being held whole on a
-/// phantom edge. Auto-applied — no knob.
-const INTERACTION_NUMERICAL_FLOOR: f64 = 1e-12;
-
 /// Which binding notion a carve report speaks about (see module docs).
 ///
 /// The two are independent, and which of them a given adjudication ran is
@@ -1229,6 +1213,7 @@ pub fn carve(input: &CarveInput<'_>, alpha: f64) -> Result<CarveReport, String> 
     let mut child_b: Vec<ChildDecoder> = Vec::with_capacity(input.coeffs.len());
     let mut binding_tests: Vec<Option<SmoothTestResult>> = Vec::with_capacity(input.coeffs.len());
     let mut interaction_energy = 0.0f64;
+    let mut interaction_abs_energy = 0.0f64;
     let mut centered_energy = 0.0f64;
 
     for (dim, c) in input.coeffs.iter().enumerate() {
@@ -1243,14 +1228,20 @@ pub fn carve(input: &CarveInput<'_>, alpha: f64) -> Result<CarveReport, String> 
         // Interaction values on the sample: f₁₂(θ_n) = φ̃¹_n ᵀ C φ̃²_n,
         // computed as the row-wise dot of (Φ̃₁ C) with Φ̃₂.
         let phi_a_c_c = phi_a_c.dot(c);
+        // `Σ_jk |φ̃¹_j|·|C_jk|·|φ̃²_k|`, the absolute sum each `f₁₂` is accumulated
+        // from: its rounding band bounds what an exactly additive surface leaves.
+        let abs_phi_a_c_c = phi_a_c.mapv(f64::abs).dot(&c.mapv(f64::abs));
         let main_a_vals = phi_a_c.dot(&blocks.main_a);
         let main_b_vals = phi_b_c.dot(&blocks.main_b);
         for row in 0..n {
             let mut f12 = 0.0f64;
+            let mut f12_abs = 0.0f64;
             for k in 0..m2 {
                 f12 += phi_a_c_c[[row, k]] * phi_b_c[[row, k]];
+                f12_abs += abs_phi_a_c_c[[row, k]] * phi_b_c[[row, k]].abs();
             }
             interaction_energy += f12 * f12;
+            interaction_abs_energy += f12_abs * f12_abs;
             let centered = main_a_vals[row] + main_b_vals[row] + f12;
             centered_energy += centered * centered;
         }
@@ -1321,8 +1312,12 @@ pub fn carve(input: &CarveInput<'_>, alpha: f64) -> Result<CarveReport, String> 
     // statistic becomes a 0/0 artifact that can read as overwhelmingly
     // significant (p ≈ 0). Below the floor the surface is additive by
     // construction, so no statistic counts as binding and the atom is free to
-    // fission — see `INTERACTION_NUMERICAL_FLOOR`.
-    let numerically_additive = interaction_fraction <= INTERACTION_NUMERICAL_FLOOR;
+    // fission. The roundoff floor is the squared rounding band
+    // `γ²·Σ_n (Σ_jk |φ̃¹_j||C_jk||φ̃²_k|)²` of the products and the centering that
+    // formed the interaction block; no finite-sample fit resolves anything inside it.
+    let interaction_band = gam_linalg::roundoff::accumulation_growth(m1 * m2 + m1 + m2);
+    let numerically_additive =
+        interaction_energy <= interaction_band * interaction_band * interaction_abs_energy;
     let binding_proven = !numerically_additive && edge_p_value.is_some_and(|p| p <= alpha);
     let negligible = interaction_fraction <= FISSION_MAX_INTERACTION_FRACTION;
     let fission = if negligible && !binding_proven {
