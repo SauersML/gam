@@ -89,13 +89,10 @@ pub(crate) fn materialize_bernoulli_marginal_slope<'a>(
         .as_deref()
         .ok_or_else(|| "Bernoulli marginal-slope requires slope_formula".to_string())?;
     // Native CTN composition supplies its generated score before materialization.
-    let z_column = config.z_column.as_deref();
-    if z_column.is_none() {
-        return Err(WorkflowError::InvalidConfig {
+    let z_column = config.z_column.as_deref().ok_or_else(|| WorkflowError::InvalidConfig {
             reason: "Bernoulli marginal-slope materialization requires z_column"
                 .to_string(),
-        });
-    }
+        })?;
 
     let (_, parsed_slope) =
         parse_matching_auxiliary_formula(slope_formula, &parsed.response, "slope_formula")?;
@@ -105,25 +102,23 @@ pub(crate) fn materialize_bernoulli_marginal_slope<'a>(
         }
         .into());
     }
-    if let Some(z_column) = z_column {
-        validate_marginal_slope_z_column_exclusion(
-            parsed,
-            &parsed_slope,
-            z_column,
-            "Bernoulli marginal-slope",
-            "slope_formula",
-        )?;
-        // The literal-name check above cannot see the score entering the main
-        // formula under its canonical alias `z` (gam#2432); the alias is
-        // installed a few lines below, so refuse here rather than let the BMS
-        // confounding audit report it as a solver failure much later.
-        validate_marginal_slope_z_alias_exclusion(
-            parsed,
-            col_map,
-            z_column,
-            "Bernoulli marginal-slope",
-        )?;
-    }
+    validate_marginal_slope_z_column_exclusion(
+        parsed,
+        &parsed_slope,
+        z_column,
+        "Bernoulli marginal-slope",
+        "slope_formula",
+    )?;
+    // The literal-name check above cannot see the score entering the main
+    // formula under its canonical alias `z` (gam#2432); the alias is
+    // installed a few lines below, so refuse here rather than let the BMS
+    // confounding audit report it as a solver failure much later.
+    validate_marginal_slope_z_alias_exclusion(
+        parsed,
+        col_map,
+        z_column,
+        "Bernoulli marginal-slope",
+    )?;
 
     let mut inference_notes = Vec::new();
     // Bernoulli marginal-slope: structurally operator-only at large scale, so
@@ -134,13 +129,7 @@ pub(crate) fn materialize_bernoulli_marginal_slope<'a>(
             marginal_slope_large_scale_active: true,
         },
     );
-    // Alias `z` to the dose column only when a raw z_column is supplied; with a
-    // CTN Stage-1 chain there is no dose column and the formulas reference only
-    // the x covariates.
-    let aliased_col_map = match z_column {
-        Some(z_column) => column_map_with_alias(col_map, "z", z_column),
-        None => col_map.clone(),
-    };
+    let aliased_col_map = column_map_with_alias(col_map, "z", z_column);
     let mut marginalspec = build_termspec_with_geometry_and_overrides(
         &parsed.terms,
         data,
@@ -184,7 +173,6 @@ pub(crate) fn materialize_bernoulli_marginal_slope<'a>(
 
     // CTN composition is completed by the shared fitted-model service before
     // ordinary outcome materialization. No influence Jacobian is installed.
-    let z_column = z_column.ok_or("marginal-slope materialization requires a score column")?;
     let z_idx = resolve_role_col(col_map, z_column, "z")?;
     let z = data.values.column(z_idx).to_owned();
     validate_bernoulli_marginal_slope_z_column_variance(z_column, z.view(), weights.view())?;
