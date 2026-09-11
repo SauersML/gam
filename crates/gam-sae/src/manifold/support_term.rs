@@ -5738,15 +5738,22 @@ impl SaeSupportSparseTerm {
         if !delta_t.iter().chain(delta_beta.iter()).all(|v| v.is_finite()) {
             return Ok(None);
         }
-        // The majorizer model's own prediction for this step: `d` solves
-        // `B d = −g`, so the quadratic model predicts a decrease of
-        // `−g·d·(s − s²/2)` at scale `s`. The acceptance line below reports
-        // the actual decrease against it. Measured on the 3000×48 chart of
-        // #2576 the ratio's median is 0.46 (q25 0.32, q75 0.56) and 72 % of
-        // the steps are halved at least once: the objective's curvature along
-        // the step is 2.3–4.1× the majorizer's, the residual's second-jet term
-        // the majorizer drops. That ratio is the number to watch when the
-        // step's model changes.
+        // #2576 — the step is the FIRST iteration of Steihaug–Toint CG on the
+        // exact observed information `A`, preconditioned by the majorizer `B`.
+        // `d` solves `B d = −g`, which is that iteration's search direction, and
+        // one exact Hessian–vector product prices the objective's own curvature
+        // `dᵀA d` along it, so the exact model's minimiser along `d` is
+        // `s* = −g·d / dᵀA d`. Measured on the 3000×48 chart of #2576 (09-04),
+        // the objective is quadratic along the majorizer step to 2–5 %, with
+        // curvature 2.3–4.1× the majorizer's (the residual's second-jet term the
+        // majorizer drops). The ladder from `s = 1` therefore accepted `½` or `¼`
+        // on 67 of 93 steps where `s* ≈ ⅓` is the model's own answer.
+        // Backtracking from `s*` keeps acceptance on the actual objective. A
+        // non-positive exact curvature leaves `s*` undefined, while `d` is still a
+        // descent direction, so the ladder then starts from `s = 1` exactly as
+        // before. Further Steihaug iterations would each need another majorizer
+        // inverse (the reduced-Schur CG, ~1.4 s per apply in that measurement), so
+        // they are not taken here.
         let (beta_offsets, beta_dim) = self.beta_layout()?;
         let gradient_dot_step = {
             let mut acc = 0.0_f64;
@@ -5768,6 +5775,19 @@ impl SaeSupportSparseTerm {
                 delta_beta.len()
             ));
         }
+        let rows = self.support_outer_differential_rows(target, ard_precisions, &beta_offsets)?;
+        let direction = SaeArrowVector {
+            t: delta_t.clone(),
+            beta: delta_beta.clone(),
+        };
+        let applied = self.support_outer_exact_hessian_apply(&system, &rows, &direction)?;
+        let exact_curvature = direction.t.dot(&applied.t) + direction.beta.dot(&applied.beta);
+        let exact_scale = (gradient_dot_step < 0.0
+            && exact_curvature.is_finite()
+            && exact_curvature > 0.0)
+            .then(|| -gradient_dot_step / exact_curvature)
+            .filter(|scale| scale.is_finite() && *scale > 0.0);
+        let first_scale = exact_scale.unwrap_or(1.0);
         self.snapshot_coordinates(coordinate_snapshot);
         let restore: Vec<Array2<f64>> = self
             .atoms
@@ -5776,10 +5796,17 @@ impl SaeSupportSparseTerm {
             .collect();
         let output_dim = self.output_dim;
         // Backtracking on the SAME objective the certificate reads, from the
-        // full Newton length. The floor is the coordinate sweep's own halving
-        // budget, so neither block can be walked further than the other.
-        for halving in 0..=24 {
-            let scale = 2.0_f64.powi(-(halving as i32));
+        // exact model's scale. The floor is the coordinate sweep's own halving
+        // budget measured in ABSOLUTE scale, `2⁻²⁴` of the full majorizer step, so
+        // a long exact first trial cannot shorten how far the ladder may walk and
+        // neither block can be walked further than the other.
+        let scale_floor = 2.0_f64.powi(-24);
+        let mut halving = 0usize;
+        loop {
+            let scale = first_scale * 2.0_f64.powi(-(halving as i32));
+            if scale < scale_floor {
+                break;
+            }
             self.install_coordinates(coordinate_snapshot)?;
             scaled_step.clear();
             scaled_step.extend(delta_t.iter().map(|value| scale * value));
@@ -5833,9 +5860,18 @@ impl SaeSupportSparseTerm {
             let objective_resolution =
                 objective_cells.sqrt() * f64::EPSILON * objective.abs();
             if trial.is_finite() && objective - trial > objective_resolution {
-                let predicted = -gradient_dot_step * (scale - 0.5 * scale * scale);
+                // The prediction comes from the model the first trial was chosen
+                // from, so the ratio reads that model's accuracy along this step.
+                let (model, predicted) = match exact_scale {
+                    Some(_) => (
+                        "exact",
+                        -(scale * gradient_dot_step + 0.5 * scale * scale * exact_curvature),
+                    ),
+                    None => ("majorizer", -gradient_dot_step * (scale - 0.5 * scale * scale)),
+                };
                 log::info!(
-                    "support joint Newton: accepted scale=2^-{halving} predicted={predicted:+.3e} \
+                    "support joint Newton: accepted scale={scale:.6e} (2^-{halving} of \
+                     {first_scale:.6e}, {model} model) predicted={predicted:+.3e} \
                      actual={:+.3e} ratio={:.3} objective={objective:.9e} -> {trial:.9e}",
                     objective - trial,
                     if predicted != 0.0 { (objective - trial) / predicted } else { f64::NAN },
@@ -5843,6 +5879,7 @@ impl SaeSupportSparseTerm {
                 self.reconstruct_into(fitted)?;
                 return Ok(Some(trial));
             }
+            halving += 1;
         }
         self.install_coordinates(coordinate_snapshot)?;
         for (atom, decoder) in restore.into_iter().enumerate() {
