@@ -2383,7 +2383,7 @@ fn matrix_free_arrow_evidence_log_det_surrogate_core(
             options.evidence_policy,
             ArrowEvidencePolicy::UnitDeflationRefusingIndefinite { .. }
         );
-    let classified_system = if rational_exact_a {
+    let mut classified_system = if rational_exact_a {
         if sys.exact_a_classification.is_none() {
             return Err(ArrowSchurError::SchurFactorFailed {
                 reason: "rational exact-A evidence policy requires the raw B/delta/clamp \
@@ -2416,7 +2416,6 @@ fn matrix_free_arrow_evidence_log_det_surrogate_core(
     } else {
         None
     };
-    let evidence_system = classified_system.as_ref().unwrap_or(sys);
 
     let log_det_schur = match lane {
         None => {
@@ -2435,41 +2434,77 @@ fn matrix_free_arrow_evidence_log_det_surrogate_core(
             slq?.estimate
         }
         Some(state) => {
-            let dim = evidence_system.k;
+            let dim = sys.k;
             // (Re)build the frozen plan when absent or dimension-mismatched (a
             // basin mutation changed the border); otherwise reuse the frozen Q.
             let need_build = state.plan.as_ref().map_or(true, |p| p.dim != dim);
             let mut entry_evaluation = None;
             if need_build {
                 let cfg = state.cfg.clone();
-                let derived = rational_reduced_schur_plan_derived(
-                    evidence_system,
-                    &htt_factors,
-                    ridge_beta,
-                    &backend,
-                    resident.as_ref(),
-                    gpu_matvec,
-                    cfg.num_probes,
-                    cfg.seed,
-                    cfg.rel_tol,
-                    cfg.power_iters,
-                    cfg.cg_rel_tol,
-                    cfg.cg_max_iters,
-                    cfg.deflation_max_rank,
-                    cfg.deflation_subspace_iters,
-                    cfg.deflation_target_std_err_rel,
-                )
-                .map_err(|reason| ArrowSchurError::SchurFactorFailed {
-                    reason: format!(
-                        "rational log-det surrogate plan build failed for reduced Schur dim \
-                         {dim}: {reason}"
-                    ),
-                })?;
+                // #2731 — the conditioning above reads a FIXED-STEP Lanczos, so a
+                // bottom mode its Krylov space did not resolve reaches this builder
+                // unpriced, and the builder's one-sided probes cannot see it. When
+                // the build refuses, search the conditioned operator for a certified
+                // negative mode and hand it to the same exact-A classifier: a saddle
+                // is refused with the typed marker, while a clamp basin or numerical
+                // null is priced and the build retried. No certified mode means the
+                // refusal was about something else, and it is returned unchanged.
+                // Healthy builds never pay for the search.
+                let mut priced_missed_modes = 0usize;
+                let derived = loop {
+                    let reason = match rational_reduced_schur_plan_derived(
+                        classified_system.as_ref().unwrap_or(sys),
+                        &htt_factors,
+                        ridge_beta,
+                        &backend,
+                        resident.as_ref(),
+                        gpu_matvec,
+                        cfg.num_probes,
+                        cfg.seed,
+                        cfg.rel_tol,
+                        cfg.power_iters,
+                        cfg.cg_rel_tol,
+                        cfg.cg_max_iters,
+                        cfg.deflation_max_rank,
+                        cfg.deflation_subspace_iters,
+                        cfg.deflation_target_std_err_rel,
+                    ) {
+                        Ok(derived) => break derived,
+                        Err(reason) => reason,
+                    };
+                    let priced = match classified_system.as_mut() {
+                        Some(classified) if priced_missed_modes < dim => {
+                            price_certified_bottom_mode(
+                                sys,
+                                classified,
+                                &htt_factors,
+                                ridge_beta,
+                                &backend,
+                                resident.as_ref(),
+                                gpu_matvec,
+                                cfg.power_iters,
+                                cfg.cg_max_iters,
+                                slq_seed,
+                            )?
+                        }
+                        _ => false,
+                    };
+                    if !priced {
+                        return Err(ArrowSchurError::SchurFactorFailed {
+                            reason: format!(
+                                "rational log-det surrogate plan build failed for reduced Schur \
+                                 dim {dim}: {reason}"
+                            ),
+                        });
+                    }
+                    priced_missed_modes += 1;
+                };
                 state.plan = Some(derived.plan);
                 entry_evaluation = Some(derived.entry_evaluation);
                 // The old-dim S⁻¹·probes are meaningless against the new border.
                 state.warm_inverse_probes = None;
             }
+            let evidence_system = classified_system.as_ref().unwrap_or(sys);
             let plan = state
                 .plan
                 .as_ref()
@@ -2589,6 +2624,142 @@ fn matrix_free_arrow_evidence_log_det_surrogate_core(
         }
     };
     Ok((log_det_tt, log_det_schur, factorization))
+}
+
+/// #2731 — find and price ONE bottom mode of the conditioned rational exact-A
+/// operator that its fixed-step conditioning did not resolve.
+///
+/// Runs the folded Lanczos of `reduced_schur_negative_curvature` on `classified`,
+/// the operator the plan builder actually solved, for at most `max_steps` (the
+/// builder's own seed-solve budget, within which the ladder broke down). A
+/// certified mode is orthogonalized against the directions already priced,
+/// re-measured on the RAW exact-A operator, and handed to the shared classifier
+/// with its majorizer and clamp metrics:
+///
+/// * `Saddle` → the typed `indefinite_evidence_marker` refusal, which the outer
+///   search maps to an infeasible probe;
+/// * `ClampBasin` / `NumericalNull` → appended to the conditioning at its price,
+///   returning `Ok(true)` so the caller retries the build;
+/// * no certified negative mode, or no positive spectral bound to fold about →
+///   `Ok(false)`. Declining to measure is not a verdict, so the caller returns the
+///   builder's own refusal unchanged.
+fn price_certified_bottom_mode<B: BatchedBlockSolver + Sync>(
+    sys: &ArrowSchurSystem,
+    classified: &mut ArrowSchurSystem,
+    htt_factors: &ArrowFactorSlab,
+    ridge_beta: f64,
+    backend: &B,
+    resident: Option<&SaeResidentReducedSchur>,
+    gpu_matvec: Option<&GpuSchurMatvec>,
+    power_iters: usize,
+    max_steps: usize,
+    seed: u64,
+) -> Result<bool, ArrowSchurError> {
+    let Some(lambda_max) = reduced_schur_lambda_max(
+        classified,
+        htt_factors,
+        ridge_beta,
+        backend,
+        resident,
+        gpu_matvec,
+        power_iters,
+        seed,
+    ) else {
+        return Ok(false);
+    };
+    let Some(mode) = reduced_schur_negative_curvature(
+        classified,
+        htt_factors,
+        ridge_beta,
+        backend,
+        resident,
+        gpu_matvec,
+        lambda_max,
+        max_steps,
+        seed,
+    ) else {
+        return Ok(false);
+    };
+    let (mut directions, mut shifts) = classified
+        .exact_a_reduced_conditioning
+        .as_ref()
+        .map_or_else(
+            || (Vec::new(), Vec::new()),
+            |conditioning| (conditioning.directions.to_vec(), conditioning.shifts.to_vec()),
+        );
+    // Ritz vectors of one symmetric operator are orthogonal, but this mode comes
+    // from a different Krylov run, so remove what the priced span already carries
+    // before its price is added as a rank-1 correction.
+    let mut direction = mode.border;
+    for _ in 0..2 {
+        for priced in &directions {
+            let overlap = priced.dot(&direction);
+            direction.scaled_add(-overlap, priced);
+        }
+    }
+    let norm = direction.dot(&direction).sqrt();
+    if !(norm.is_finite() && norm > f64::EPSILON.sqrt()) {
+        return Err(ArrowSchurError::SchurFactorFailed {
+            reason: format!(
+                "rational exact-A conditioning: the certified bottom mode (curvature {:.6e}) \
+                 lies in the span already priced (residual norm {norm:.3e}), so the carrier \
+                 and the operator disagree",
+                mode.curvature
+            ),
+        });
+    }
+    direction.mapv_inplace(|value| value / norm);
+    let raw = direction.dot(
+        &ReducedSchurOperator::new(sys, htt_factors, ridge_beta, backend, resident)
+            .with_gpu_matvec(gpu_matvec)
+            .apply(direction.view()),
+    );
+    let (majorizer, clamp) =
+        exact_a_reduced_direction_metrics(sys, htt_factors, ridge_beta, direction.view())?;
+    let priced = match classify_exact_a_direction(
+        raw,
+        sys.k,
+        lambda_max.max(raw.abs()),
+        majorizer,
+        clamp,
+    ) {
+        ExactADirectionClassification::NumericalNull => 1.0,
+        ExactADirectionClassification::ClampBasin { curvature } => curvature,
+        ExactADirectionClassification::Saddle { curvature, basin } => {
+            return Err(ArrowSchurError::SchurFactorFailed {
+                reason: format!(
+                    "matrix-free reduced-Schur {}: the rational ladder's bottom mode, missed by \
+                     its fixed-step conditioning, has raw exact-A curvature {curvature:.6e} and \
+                     clamp basin {basin:.6e}; the shared majorizer-metric classifier declares a \
+                     genuine saddle (#2731/#2515)",
+                    ArrowSchurError::indefinite_evidence_marker(),
+                ),
+            });
+        }
+        ExactADirectionClassification::ResolvedPositive { curvature } => {
+            return Err(ArrowSchurError::SchurFactorFailed {
+                reason: format!(
+                    "rational exact-A conditioning: the conditioned operator certifies curvature \
+                     {:.6e} along a direction whose raw exact-A curvature {curvature:.6e} \
+                     resolves positive, so the carrier and the operator disagree",
+                    mode.curvature
+                ),
+            });
+        }
+    };
+    log::info!(
+        "[rational exact-A] priced a bottom mode its fixed-step conditioning missed: raw \
+         curvature {raw:.6e}, majorizer {majorizer:.6e}, clamp {clamp:.6e}, priced \
+         {priced:.6e} ({} directions priced)",
+        directions.len() + 1
+    );
+    directions.push(direction);
+    shifts.push(priced - raw);
+    classified.exact_a_reduced_conditioning = Some(ExactAReducedRitzConditioning {
+        directions: directions.into(),
+        shifts: shifts.into(),
+    });
+    Ok(true)
 }
 
 /// Power-iteration estimate of the largest eigenvalue `λ_max` of the SPD reduced

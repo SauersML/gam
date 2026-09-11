@@ -246,3 +246,131 @@ fn a_definite_reduced_schur_yields_no_negative_direction() {
         "an SPD reduced Schur has no negative direction to report, got {found:?}"
     );
 }
+
+/// #2731 `charts = 32` — the rational exact-A lane conditions its operator from a
+/// FIXED-STEP Lanczos, and a Krylov space that has not resolved the bottom of the
+/// spectrum prices nothing there. The plan builder then solves shifted systems on
+/// an operator that is still indefinite. Its Rademacher probes see only a positive
+/// Rayleigh quotient, and the seed CG breaks down with an untyped error, which
+/// aborts the fit instead of letting the outer search steer away.
+///
+/// `S_A = diag(-1/2, 4, 5)`: the one row eliminates `1` from the first border
+/// coordinate only, so `e1` carries the k=1 #2515 fixture's geometry (majorizer
+/// curvature 3/2, basin `-1/2 + clamp`) and `e2`, `e3` are resolved positive. One
+/// conditioning step from any Rademacher start sees the quotient
+/// `(-1/2 + 4 + 5)/3` and prices nothing, and every Rademacher probe of a diagonal
+/// operator sees the same positive form. So this is exactly the production
+/// shape: a missed bottom mode that no one-sided probe can see.
+#[test]
+fn the_rational_lane_prices_or_refuses_a_bottom_mode_its_fixed_step_conditioning_missed() {
+    let exact_a_system = |first_border_curvature: f64, clamp_value: f64| {
+        let mut system = ArrowSchurSystem::new(1, 1, 3);
+        system.rows[0].htt[[0, 0]] = 1.0;
+        system.rows[0].htbeta[[0, 0]] = 1.0;
+        system.hbb[[0, 0]] = first_border_curvature;
+        system.hbb[[1, 1]] = 4.0;
+        system.hbb[[2, 2]] = 5.0;
+        system.exact_a_classification = Some(ExactAClassificationGeometry {
+            rows: vec![ExactAClassificationRow {
+                delta_tt: ndarray::array![[-2.0_f64]],
+                delta_tbeta: Array2::<f64>::zeros((1, 0)),
+                clamp_diag: ndarray::array![clamp_value],
+            }]
+            .into(),
+            border_indices: std::sync::Arc::from([] as [usize; 0]),
+        });
+        system
+    };
+    let options = ArrowSolveOptions::direct()
+        .with_newton_schur_tikhonov(SPECTRAL_DEFLATION_REL_FLOOR)
+        .with_indefinite_refusing_evidence_unit_deflation(SPECTRAL_DEFLATION_REL_FLOOR);
+    let lane = || {
+        SurrogateLaneState::new(SurrogateLaneConfig {
+            num_probes: 4,
+            seed: 0x2731,
+            rel_tol: 1.0e-10,
+            power_iters: 16,
+            cg_rel_tol: 1.0e-12,
+            cg_max_iters: 64,
+            deflation_max_rank: 0,
+            deflation_subspace_iters: 1,
+            deflation_target_std_err_rel: 1.0,
+        })
+    };
+    let conditioning_steps = 1;
+
+    // Precondition, so a fixture that stops reproducing the defect cannot pass
+    // vacuously: the fixed-step conditioning really does miss `e1`.
+    let s_a = ndarray::array![[-0.5_f64, 0.0, 0.0], [0.0, 4.0, 0.0], [0.0, 0.0, 5.0]];
+    let missed = exact_a_ritz_conditioning(
+        3,
+        |direction| s_a.dot(&direction),
+        |_| Ok((1.5, 2.0)),
+        conditioning_steps,
+        0x2731,
+    )
+    .expect("one Lanczos step on a finite operator is a conditioning, not a refusal");
+    assert!(
+        missed.directions.is_empty(),
+        "the fixture must reproduce #2731: one conditioning step has to price nothing, \
+         got {} priced directions",
+        missed.directions.len()
+    );
+
+    // The clamp restores a positive basin along the missed mode: priced, so the
+    // ladder completes on diag(3/2, 4, 5).
+    let (row_logdet, basin_schur) = matrix_free_arrow_evidence_log_det_surrogate(
+        &exact_a_system(0.5, 2.0),
+        0.0,
+        0.0,
+        &options,
+        4,
+        conditioning_steps,
+        0x2731,
+        Some(&mut lane()),
+    )
+    .expect("#2731: a clamp-attributable bottom mode the conditioning missed is a priced basin");
+    assert!(row_logdet.abs() <= 1.0e-12, "row log|H_tt| {row_logdet:e}");
+    assert!(
+        (basin_schur - 30.0_f64.ln()).abs() <= 1.0e-7,
+        "#2731: log|S| must be priced at the basin, log(3/2·4·5) = {:.12e}, got {basin_schur:.12e}",
+        30.0_f64.ln()
+    );
+
+    // No clamp: the missed mode is a genuine saddle, refused with the typed marker
+    // the outer search maps to an infeasible probe.
+    let refusal = matrix_free_arrow_evidence_log_det_surrogate(
+        &exact_a_system(0.5, 0.0),
+        0.0,
+        0.0,
+        &options,
+        4,
+        conditioning_steps,
+        0x2731,
+        Some(&mut lane()),
+    )
+    .expect_err("#2731: a missed bottom mode beyond its clamp basin is a saddle")
+    .to_string();
+    assert!(
+        ArrowSchurError::rendered_is_indefinite_evidence(&refusal),
+        "#2731: the rational lane must refuse a missed saddle with the typed marker: {refusal}"
+    );
+
+    // Negative control: a definite operator is untouched by the missed-mode search.
+    let (_, definite_schur) = matrix_free_arrow_evidence_log_det_surrogate(
+        &exact_a_system(2.0, 0.0),
+        0.0,
+        0.0,
+        &options,
+        4,
+        conditioning_steps,
+        0x2731,
+        Some(&mut lane()),
+    )
+    .expect("#2731: a definite reduced Schur needs no pricing");
+    assert!(
+        (definite_schur - 20.0_f64.ln()).abs() <= 1.0e-7,
+        "#2731: log|diag(1, 4, 5)| = {:.12e}, got {definite_schur:.12e}",
+        20.0_f64.ln()
+    );
+}
