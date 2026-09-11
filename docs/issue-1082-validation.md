@@ -246,6 +246,29 @@ e-fold of `log λ` cannot turn into a resolvable decrease no longer forces escap
 Making the online curvature-stationary exit consistent with that standard, and
 removing the bit-identical seed replay, belong to #2817 and are being done there.
 
+**Validation of both corrections (job 388047, `37c192a39` + both patches).** The
+workspace gate passes, as do 386 gam-solve Jeffreys/rho-optimizer pins and 16
+gam-custom-family `jeffreys` pins. The armed outer gradient now matches central
+differences to at most 2.0e-9 relative on all six ρ axes at shifts 0 and −3, and
+smooth-by-factor passes in 25.9 s. The derivative reproduction still fails on the
+Hessian, `(3,3)` analytic 0.19796545 against FD 0.19753201. The mode response is
+solved on the motion-completed curvature, but its outer-Hessian drift
+(`completion_beta`) still differentiated only the frozen-policy completion. Both
+penguin arms are killed at 400 s again. The terminal adjudication measures the
+analytic outer Hessian against the criterion's own curvature along the disputed
+eigenvector: ‖dH‖ = 1.1e−6 on arm 1 (sub-resolution) but 0.272 on arm 2 (analytic
+λ_min = −4.9e−5 against criterion curvature 0.295 ± 0.023). An inexact outer
+Hessian is therefore still manufacturing negative curvature there.
+
+**Outer-Hessian drift of the motion (`dc97c1b68`).**
+`JeffreysHphiDriftBase::motion_drift_action` returns `D_u M[·, v]`, the β-drift of
+the gate/floor motion part `M` of `∇²Φ`. It is the product rule over every factor
+of `M`, with the extreme eigenvalues to third order, the gate's third partials and
+the floor's third-order sensitivities, and `completion_beta` subtracts it where the
+motion is active. Unit tests pin the gate's third partials (both bands) and the
+gate-band and moving-floor curvature drift against central differences, each with
+a positive control that the frozen drift misses the term.
+
 1. Run every selected test after the corrections, including both synthetic and real-data arms. Record
    actual durations and assertions; missing references remain failures.
 2. Diagnose and fix remaining solver/covariance failures without increasing
