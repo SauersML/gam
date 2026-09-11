@@ -78,6 +78,6 @@ fn main() {
     let before = run(old);
     let after = run(new);
     assert_eq!(before.0, after.0);
-    println!("{comparisons} exhaustive Unicode/overlap comparisons; equal hit counts {}", before.0);
-    println!("old {:?}; new {:?}; speedup {:.2}", before.1, after.1, before.1.as_secs_f64()/after.1.as_secs_f64());
+    eprintln!("{comparisons} exhaustive Unicode/overlap comparisons; equal hit counts {}", before.0);
+    eprintln!("old {:.6}s; new {:.6}s; speedup {:.2}", before.1.as_secs_f64(), after.1.as_secs_f64(), before.1.as_secs_f64()/after.1.as_secs_f64());
 }
