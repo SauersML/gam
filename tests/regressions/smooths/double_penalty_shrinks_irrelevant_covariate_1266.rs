@@ -11,9 +11,11 @@
 // both of its coordinates (bending and null-space) must be able to reach the
 // λ = ∞ face when the criterion is lowest there.
 //
-// WHAT THIS TEST DOES NOT CLAIM, AND WHY (#2668 group C, measured 2026-09-04).
-// The previous version asserted `mean z edf < 1.0` over five seeds against an
-// "mgcv select=TRUE" reference. On the identical data, with the identical basis
+// WHAT THE DELETION-FACE TEST DOES NOT CLAIM, AND WHY (#2668 group C, measured
+// 2026-09-04). The original contract asserts `mean z edf < 1.0` over five seeds
+// against an "mgcv select=TRUE" reference; #2668 keeps it as its own test
+// (`default_double_penalty_shrinks_irrelevant_covariate_edf_below_one`, below),
+// reading per-term EDF from the production summary rows. On the identical data, with the identical basis
 // family (gam's default `bs=ps` is a cubic B-spline with an integrated squared
 // second-derivative penalty = mgcv `bs="bs", m=c(3,2)`), mgcv's own REML
 // optimum for `s(z)` was 0.45 / 1.84 / 1.01 / 1.76 / 0.62 edf (mean 1.14) on
@@ -211,6 +213,52 @@ fn default_double_penalty_is_never_beaten_by_deleting_the_irrelevant_covariate_1
         !interior.is_empty(),
         "every seed in 200..220 sits exactly on the deletion face (at-face={at_face:?}); \
          the bound was never a comparison between two distinct optima"
+    );
+}
+
+/// The original #1266 Half-B contract, restored for #2668: on seeds 200..205
+/// the default double penalty (mgcv `select = TRUE`) must shrink the irrelevant
+/// covariate's smooth well below its ~2-EDF null-space floor, mean EDF < 1.
+///
+/// Per-term EDF is read from the production summary rows (`smooth_term_edf`
+/// above). The earlier version of this test passed the block-LOCAL
+/// `coeff_range` to `per_term_edf`, so s(z)'s window held s(x)'s last column
+/// and dropped its own; that inflated the reported z EDF and is not a property
+/// of the fit.
+#[test]
+fn default_double_penalty_shrinks_irrelevant_covariate_edf_below_one() {
+    init_parallelism();
+
+    let cfg = FitConfig {
+        family: Some("gaussian".to_string()),
+        ..FitConfig::default()
+    };
+
+    let mut z_edf: Vec<f64> = Vec::new();
+    let mut x_edf: Vec<f64> = Vec::new();
+    let mut fitted_rhos: Vec<Vec<f64>> = Vec::new();
+    for seed in 200u64..205 {
+        let data = irrelevant_covariate_dataset(seed, 800);
+        let fit = fit_from_formula("y ~ s(x) + s(z)", &data, &cfg).expect("fit ok");
+        z_edf.push(smooth_term_edf(&fit, "z"));
+        x_edf.push(smooth_term_edf(&fit, "x"));
+        fitted_rhos.push(standard(&fit).fit.log_lambdas.to_vec());
+    }
+
+    let mean_z = z_edf.iter().sum::<f64>() / z_edf.len() as f64;
+    let mean_x = x_edf.iter().sum::<f64>() / x_edf.len() as f64;
+
+    assert!(
+        mean_x > 2.5,
+        "supported smooth s(x) failed to recover the sin(6x) signal: \
+         mean x edf={mean_x:.6}, values={x_edf:?}"
+    );
+    assert!(
+        mean_z < 1.0,
+        "default double penalty failed to shrink the irrelevant covariate s(z) \
+         (mgcv select=TRUE): mean z edf={mean_z:.6} (must be < 1.0), \
+         values={z_edf:?}; supported mean x edf={mean_x:.6}, x values={x_edf:?}; \
+         fitted rho=[x bend, x null, z bend, z null] by seed={fitted_rhos:?}"
     );
 }
 
