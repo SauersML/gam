@@ -63,6 +63,10 @@ on:
         description: "Issue number, for labeling / concurrency keying only."
         default: ""
         required: false
+      source_base:
+        description: "Optional exact base SHA for a read-only source retirement report."
+        default: ""
+        required: false
 
 # Key concurrency on the issue so two DIFFERENT issues validating at once do not
 # cancel each other; a newer dispatch for the SAME issue supersedes the older.
@@ -444,8 +448,47 @@ jobs:
         working-directory: ${{ runner.temp }}
         run: python -m pytest "${{ github.workspace }}/tests/torch" -k "${{ github.event.inputs.torch_filter }}" -p no:cacheprovider -x -q --tb=short
 
+      - name: Report source retirements for review
+        if: ${{ github.event.inputs.source_base != '' }}
+        timeout-minutes: 5
+        env:
+          BASE_SHA: ${{ github.event.inputs.source_base }}
+        run: |
+          set -euo pipefail
+          [[ "$BASE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          git fetch --no-tags --depth=1 origin "$BASE_SHA"
+          python - <<'PY'
+          import json, os, sys
+          from pathlib import Path
+          sys.path.insert(0, 'scripts')
+          import test_census as tests
+          import public_api_census as api
+          import source_removal_guard as source
+          root = Path.cwd()
+          base, head = os.environ['BASE_SHA'], os.environ['TARGET_SHA']
+          before, after = tests.census(root, base, {}), tests.census(root, head, {})
+          old, new, words = source.changed_inventory(root, base, head)
+          result = {
+              'base': base, 'head': head,
+              'tests': tests.difference(before, after),
+              'before_floor': tests.floor_from(before),
+              'after_floor': tests.floor_from(after),
+              'source': source.removals(old, new, words),
+              'public_api': api.difference(api.census(root, base, {}), api.census(root, head, {})),
+          }
+          Path('source-change-report.json').write_text(json.dumps(result, indent=2) + '\n')
+          PY
+
+      - name: Upload read-only retirement report
+        if: ${{ github.event.inputs.source_base != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: source-change-report
+          path: source-change-report.json
+          retention-days: 7
+
       - name: Guard against an empty request
-        if: ${{ github.event.inputs.rust_filter == '' && github.event.inputs.py_filter == '' && github.event.inputs.torch_filter == '' }}
+        if: ${{ github.event.inputs.rust_filter == '' && github.event.inputs.py_filter == '' && github.event.inputs.torch_filter == '' && github.event.inputs.source_base == '' }}
         run: |
           echo "::error::None of rust_filter / py_filter / torch_filter was provided; nothing to validate."
           exit 1
