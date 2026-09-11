@@ -1770,7 +1770,12 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
     }
 
     fn joint_jeffreys_information_third_directional_available(&self) -> bool {
-        true
+        // The closed-form third information derivative covers only the rigid
+        // two-primary path: a configured score-warp or link-deviation runtime
+        // widens the primary space, and the hook below returns `None` for it.
+        // Declaring the capability there would plan an outer Hessian whose
+        // completion then has no derivative to consume.
+        !self.flex_active()
     }
 
     fn joint_jeffreys_information_third_directional_all_axes_with_specs(
