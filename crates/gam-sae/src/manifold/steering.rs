@@ -26,11 +26,17 @@
 //! The steered contribution keeps the fitted per-row gate `a_{ik}` untouched:
 //! the intervention changes only which value the feature takes at fixed strength.
 //!
-//! Two surfaces:
+//! Two surfaces, one moved coordinate:
 //! * [`SaeManifoldTerm::steer_rows`] returns the ambient DELTA
 //!   `a·(Φ(t⊕δ)−Φ(t))·B_k` for the selected rows — the caller ADDS it to `x`.
 //! * [`SaeManifoldTerm::steer_decode`] returns the full steered per-atom
 //!   contribution `a·Φ(t⊕δ)·B_k` (absolute, not a delta) for E4 zoo scoring.
+//!
+//! Both read `t ⊕ δ` from `steered_coords`, which is the one place that decides
+//! what `δ` means, so a delta and a decode requested with the same `δ` land on
+//! the same point. On a one-dimensional chart `δ` is an arc-length displacement
+//! in the atom's canonical coordinate (gam#2234 "meaningful units", gh#2263
+//! item 3), realized per row as that row's own fitted-chart step.
 
 use super::*;
 
@@ -117,10 +123,16 @@ impl SaeManifoldTerm {
     /// Apply the manifold group action `t ⊕ δ` to atom `k`'s coordinates on the
     /// selected `rows`, returning the steered coordinates `(rows.len(), d_k)`.
     ///
-    /// `δ` is a single length-`d_k` chart-coordinate step applied to every
-    /// selected row through [`LatentManifold::retract`] — the group action of the
-    /// atom's own manifold (circle phase add, translation, blockwise product).
-    /// The FITTED coordinates are read (never mutated) from the assignment state.
+    /// The group action is [`LatentManifold::retract`] — the atom's own manifold
+    /// (circle phase add, translation, blockwise product) — and the FITTED
+    /// coordinates are read (never mutated) from the assignment state. What `δ`
+    /// means is decided here, once, for every steering surface:
+    ///
+    /// * `d_k = 1`: `δ` is a displacement in the atom's canonical arc-length
+    ///   coordinate. Each row is retracted by its own fitted-chart step, the one
+    ///   that realizes that displacement from the row's own position, so the same
+    ///   `δ` moves every row the same intrinsic distance.
+    /// * `d_k > 1`: `δ` is the same chart-coordinate step for every row.
     fn steered_coords(
         &self,
         atom: usize,
@@ -141,6 +153,13 @@ impl SaeManifoldTerm {
                 delta.len()
             ));
         }
+        let arc_length_steps = if d == 1 {
+            Some(crate::inference::steering::canonical_chart_steps(
+                self, atom, rows, delta[0],
+            )?)
+        } else {
+            None
+        };
         let manifold = coord.manifold();
         let base = coord.as_matrix();
         let n = coord.n_obs();
@@ -152,7 +171,12 @@ impl SaeManifoldTerm {
                 ));
             }
             // t ⊕ δ — the group action via the atom's manifold retraction.
-            let moved = manifold.retract(base.row(row), delta);
+            let moved = match &arc_length_steps {
+                Some(steps) => {
+                    manifold.retract(base.row(row), ArrayView1::from(&steps[out_row..=out_row]))
+                }
+                None => manifold.retract(base.row(row), delta),
+            };
             for a in 0..d {
                 steered[[out_row, a]] = moved[a];
             }
@@ -233,24 +257,6 @@ impl SaeManifoldTerm {
         rows: &[usize],
         delta: ArrayView1<'_, f64>,
     ) -> Result<Array2<f64>, String> {
-        if delta.len() == 1 {
-            return crate::inference::steering::steer_rows_unit_speed(
-                self, atom, rows, delta[0],
-            )
-            .map(|field| field.delta);
-        }
-        self.steer_rows_raw(atom, rows, delta)
-    }
-
-    /// Apply the fitted-coordinate group action without assigning physical units
-    /// to that coordinate. This is crate-private so all user-facing one-dimensional
-    /// steering goes through the canonical arc-length map.
-    pub(crate) fn steer_rows_raw(
-        &self,
-        atom: usize,
-        rows: &[usize],
-        delta: ArrayView1<'_, f64>,
-    ) -> Result<Array2<f64>, String> {
         let steered_coords = self.steered_coords(atom, rows, delta)?;
         let base_coords = self.base_coords(atom, rows)?;
         let atom_ref = &self.atoms[atom];
@@ -290,7 +296,10 @@ impl SaeManifoldTerm {
     /// `k` on the selected `rows`, shape `(rows.len(), p)` — the ABSOLUTE moved
     /// contribution (not a delta), used by the E4 zoo ground-truth check where
     /// the steered reconstruction is compared against the planted manifold point
-    /// at `θ + δ`. Same amplitude/gate handling as [`Self::steer_rows`].
+    /// at `θ + δ`. Same moved coordinate and same amplitude/gate handling as
+    /// [`Self::steer_rows`]: on a one-dimensional chart `δ` is the canonical
+    /// arc-length displacement here too, so `steer_decode(δ) − steer_decode(0)`
+    /// is `steer_rows(δ)` up to rounding.
     pub fn steer_decode(
         &self,
         atom: usize,

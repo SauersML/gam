@@ -168,7 +168,7 @@ def render(measurement, path):
     )
     svg.append(
         f'<text x="92" y="{legend_y - 2}" font-size="12" fill="#111827">'
-        "raw chart step (what steer_rows applies today)</text>"
+        "raw chart step (the historical steer_rows / steer_decode)</text>"
     )
     svg.append(
         f'<rect x="400" y="{legend_y - 11}" width="14" height="9" fill="#2563eb" '
@@ -176,7 +176,7 @@ def render(measurement, path):
     )
     svg.append(
         f'<text x="422" y="{legend_y - 2}" font-size="12" fill="#111827">'
-        "canonical (arc-length) step — steer_rows_unit_speed</text>"
+        "canonical (arc-length) step — steer_decode</text>"
     )
     svg.append(
         f'<text x="70" y="{legend_y + 20}" font-size="12" fill="#374151">'

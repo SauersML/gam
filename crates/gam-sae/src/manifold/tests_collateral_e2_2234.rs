@@ -90,15 +90,10 @@ fn collateral_dose_uses_canonical_arc_length_not_raw_chart_parameter() {
     let term = SaeManifoldTerm::new(vec![atom], assignment).expect("fixture term");
     let rows: Vec<usize> = (0..n).collect();
     let dose = 0.125;
-    let canonical = crate::inference::steering::steer_rows_unit_speed(&term, 0, &rows, dose)
+    let canonical = term
+        .steer_rows(0, &rows, ndarray::array![dose].view())
         .expect("canonical steering field");
-    let expected_rms = (canonical
-        .delta
-        .iter()
-        .map(|value| value * value)
-        .sum::<f64>()
-        / n as f64)
-        .sqrt();
+    let expected_rms = (canonical.iter().map(|value| value * value).sum::<f64>() / n as f64).sqrt();
 
     let curve = collateral_curve(&term, 0, 0, &[], &[dose]).expect("collateral curve");
     let point = &curve.manifold.points[0];

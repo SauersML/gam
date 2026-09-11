@@ -1,9 +1,10 @@
 //! #2234 / #2263 item 3 — **is a requested chart displacement realized as the
 //! INTRINSIC displacement it is documented to be?**
 //!
-//! The historical [`crate::manifold::SaeManifoldTerm::steer_rows`] implementation
-//! sent `δ` directly to `LatentManifold::retract(t, δ)` — a raw offset of the
-//! FITTED chart parameter.
+//! The historical [`crate::manifold::SaeManifoldTerm::steer_rows`] /
+//! [`crate::manifold::SaeManifoldTerm::steer_decode`] implementation sent `δ`
+//! directly to `LatentManifold::retract(t, δ)` — a raw offset of the FITTED chart
+//! parameter.
 //! Those are the same object only when the fitted parameter is arc length. The
 //! chart parameterization is a gauge freedom (#2022 / #1019 / #2081): the fit
 //! lands on one point of the `Diff(S¹)` orbit, and
@@ -354,24 +355,47 @@ struct ChartReport {
     base_decode: Array2<f64>,
 }
 
-/// Realized planted-arc displacement of one row, read as the difference of two
-/// calibrated angle recoveries through the SAME decode path.
+/// Realized planted-arc displacement of one row of a steered decode over every
+/// row, read as the difference of two calibrated angle recoveries.
 fn realized_row_displacement(
-    term: &SaeManifoldTerm,
     ring: &PlantedRing,
     report: &ChartReport,
     row: usize,
-    raw_step: f64,
+    steered: &Array2<f64>,
 ) -> f64 {
-    let steered = term
-        .steer_decode(0, &[row], array![raw_step].view())
-        .expect("steered decode");
     let from: Vec<f64> = (0..P_OUT).map(|j| report.base_decode[[row, j]]).collect();
-    let to: Vec<f64> = (0..P_OUT).map(|j| steered[[0, j]]).collect();
+    let to: Vec<f64> = (0..P_OUT).map(|j| steered[[row, j]]).collect();
     let theta_from = report.recovery.theta_of(&from);
     let theta_to = report.recovery.theta_of(&to);
     let step = wrap_pi(theta_to - theta_from);
     ring.arc(theta_from + step) - ring.arc(theta_from)
+}
+
+/// What the historical surface returned for a raw step: atom 0's contribution
+/// `a_i·Φ(retract(t_i, δ))·B` for every row, with `δ` sent straight into the
+/// FITTED chart parameter. Built from the manifold's own retraction, the atom's
+/// own decoder and the fitted gates — the pieces
+/// [`SaeManifoldTerm::steer_decode`] is built from — so this arm and the public
+/// surface differ in nothing but the step.
+fn raw_step_decode(term: &SaeManifoldTerm, raw_step: f64) -> Array2<f64> {
+    let coord = &term.assignment.coords[0];
+    let fitted = coord.as_matrix();
+    let step = array![raw_step];
+    let mut moved = Array2::<f64>::zeros((N_ROWS, 1));
+    for row in 0..N_ROWS {
+        moved[[row, 0]] = coord.manifold().retract(fitted.row(row), step.view())[0];
+    }
+    let mut decode = term.atoms[0]
+        .decode_at_coords(moved.view())
+        .expect("raw-step decode");
+    for row in 0..N_ROWS {
+        let gate = term
+            .assignment
+            .try_assignments_row(row)
+            .expect("fitted gate")[0];
+        decode.row_mut(row).mapv_inplace(|x| gate * x);
+    }
+    decode
 }
 
 fn chart_report(term: &SaeManifoldTerm, ring: &PlantedRing) -> ChartReport {
@@ -434,8 +458,9 @@ fn chart_report(term: &SaeManifoldTerm, ring: &PlantedRing) -> ChartReport {
     };
     // Orientation probe: an eighth of a period is far from the antipode on every
     // fixture here, so the SIGN of the realized displacement is determined.
+    let probe_decode = raw_step_decode(term, 0.125);
     let mut probe: Vec<f64> = (0..N_ROWS)
-        .map(|row| realized_row_displacement(term, ring, &report, row, 0.125))
+        .map(|row| realized_row_displacement(ring, &report, row, &probe_decode))
         .collect();
     probe.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     if probe[N_ROWS / 2] < 0.0 {
@@ -463,10 +488,9 @@ struct RealizedDisplacement {
 
 impl RealizedDisplacement {
     fn measure(
-        term: &SaeManifoldTerm,
         ring: &PlantedRing,
         report: &ChartReport,
-        raw_steps: &[f64],
+        steered: &Array2<f64>,
         requested: f64,
     ) -> Self {
         let perimeter = ring.perimeter();
@@ -474,8 +498,7 @@ impl RealizedDisplacement {
         let mut worst = 0.0_f64;
         let mut worst_row = 0usize;
         for row in 0..N_ROWS {
-            let signed = report.orientation
-                * realized_row_displacement(term, ring, report, row, raw_steps[row]);
+            let signed = report.orientation * realized_row_displacement(ring, report, row, steered);
             let gap = signed - requested;
             let wrapped = gap - perimeter * (gap / perimeter).round();
             aligned.push(requested + wrapped);
@@ -535,13 +558,28 @@ const SEPARATION_REL_TOL: f64 = 1.0e-3;
 /// sits about 600× above what the instrument actually resolves.
 const NULL_REL_TOL: f64 = 1.0e-9;
 
-/// One `(fixture, step source)` sweep over the requested displacements.
+/// One `(fixture, surface)` sweep over the requested displacements.
 struct Sweep {
     /// `(requested, mean, median, min, max, worst_abs, worst_row)`. Every
     /// displacement is in planted arc length.
     rows: Vec<(f64, f64, f64, f64, f64, f64, usize)>,
     worst_rel: f64,
     worst_at: usize,
+    /// Canonical arm only: the largest `|steer_rows(δ) − (steer_decode(δ) −
+    /// steer_decode(0))|` over the sweep, as a multiple of that entry's rounding
+    /// allowance ([`split_allowance`]). The delta a caller patches with and the
+    /// decode this test measures must be one move, so anything above `1` means the
+    /// two public surfaces steered the same request to different points. `0` on
+    /// the raw arm, which has no delta surface.
+    split: f64,
+}
+
+/// The rounding allowance for comparing `a·(x − y)` against `a·x − a·y` at one
+/// entry: three products and two subtractions, each off by at most half an ulp
+/// of an operand no larger than `scale`, so `4·ε·scale` bounds their sum. The bar
+/// is representational rounding, not a tuned tolerance.
+fn split_allowance(scale: f64) -> f64 {
+    4.0 * f64::EPSILON * scale
 }
 
 fn sweep(
@@ -554,31 +592,37 @@ fn sweep(
     let mut rows = Vec::with_capacity(TWELFTHS.len());
     let mut worst_rel = 0.0_f64;
     let mut worst_at = 0usize;
+    let mut split = 0.0_f64;
     for &k in &TWELFTHS {
         let fraction = k as f64 / 12.0;
         let requested = fraction * ring.perimeter();
-        let raw_steps: Vec<f64> = if canonical {
-            // The canonical surface picks the STEP; the ambient move is still
-            // produced by the same group action, so the two arms differ in
-            // nothing but the step.
-            let canonical = crate::inference::steering::steer_rows_unit_speed(
-                term, 0, &rows_idx, fraction,
-            )
-            .expect("canonical steer");
-            let public = term
+        let steered = if canonical {
+            // The public surfaces, asked for the fraction exactly as a caller asks.
+            // The absolute decode is what gets measured; the delta a caller patches
+            // with is checked to be the same move.
+            let decode = term
+                .steer_decode(0, &rows_idx, array![fraction].view())
+                .expect("public steer_decode");
+            let delta = term
                 .steer_rows(0, &rows_idx, array![fraction].view())
-                .expect("public steer");
-            assert_eq!(
-                public, canonical.delta,
-                "the public steer_rows surface bypassed canonical arc-length steering"
-            );
-            canonical.raw_steps
+                .expect("public steer_rows");
+            for row in 0..N_ROWS {
+                for j in 0..P_OUT {
+                    let moved = decode[[row, j]] - report.base_decode[[row, j]];
+                    let scale = decode[[row, j]]
+                        .abs()
+                        .max(report.base_decode[[row, j]].abs());
+                    let gap = (delta[[row, j]] - moved).abs();
+                    split = split.max(gap / split_allowance(scale.max(f64::MIN_POSITIVE)));
+                }
+            }
+            decode
         } else {
-            // What a caller passes today: the requested fraction of the period,
+            // The historical surface: the requested fraction of the period,
             // straight into the raw chart parameter.
-            vec![fraction; N_ROWS]
+            raw_step_decode(term, fraction)
         };
-        let realized = RealizedDisplacement::measure(term, ring, report, &raw_steps, requested);
+        let realized = RealizedDisplacement::measure(ring, report, &steered, requested);
         let rel = realized.worst / requested;
         if rel > worst_rel {
             worst_rel = rel;
@@ -598,6 +642,7 @@ fn sweep(
         rows,
         worst_rel,
         worst_at,
+        split,
     }
 }
 
@@ -720,6 +765,7 @@ fn ellipse_ring_chart_is_not_unit_speed() {
 #[test]
 fn requested_ring_fraction_is_realized_only_in_the_canonical_chart() {
     let mut ladder: Vec<(f64, f64, f64, f64, f64)> = Vec::new();
+    let mut splits: Vec<(f64, f64)> = Vec::new();
     for &minor in &RING_MINORS {
         let name = format!("minor{minor}");
         let ring = PlantedRing::new(1.0, minor);
@@ -747,6 +793,7 @@ fn requested_ring_fraction_is_realized_only_in_the_canonical_chart() {
             raw.worst_rel,
             canonical.worst_rel,
         ));
+        splits.push((minor, canonical.split));
     }
 
     eprintln!(
@@ -755,6 +802,12 @@ fn requested_ring_fraction_is_realized_only_in_the_canonical_chart() {
     for (minor, cv, ratio, raw, canonical) in &ladder {
         eprintln!(
             "[#2234 ladder] {minor:.2} | {cv:.4e} | {ratio:.4} | {raw:.3e} | {canonical:.3e}"
+        );
+    }
+    for (minor, split) in &splits {
+        eprintln!(
+            "[#2234 split] {minor:.2} | max |steer_rows − (steer_decode − base)| = {split:.3e} \
+             rounding allowances"
         );
     }
 
@@ -791,8 +844,8 @@ fn requested_ring_fraction_is_realized_only_in_the_canonical_chart() {
         if minor == 1.0 {
             continue;
         }
-        // Anti-no-op control, and the other side of the SAME bar. If
-        // `steer_rows_unit_speed` were secretly returning the raw step, every
+        // Anti-no-op control, and the other side of the SAME bar. If the public
+        // surfaces were secretly applying the raw step, every
         // assertion above would still pass on the round arm; a non-unit-speed
         // chart must show the two surfaces genuinely disagreeing across the bar.
         assert!(
@@ -801,6 +854,17 @@ fn requested_ring_fraction_is_realized_only_in_the_canonical_chart() {
              requested displacement by only {raw:.3e} of the request, below the \
              {SEPARATION_REL_TOL:e} bar the canonical arm is held to, so the canonical arm's \
              success is not evidence of a repair. Chart speed max/min={ratio:.4}"
+        );
+    }
+    for &(minor, split) in &splits {
+        // The delta a caller patches with and the decode measured above must be ONE
+        // move. Before the moved coordinate was single-sourced, `steer_rows` stepped
+        // a one-dimensional chart in arc length while `steer_decode` stepped the raw
+        // parameter, so on a non-unit-speed chart the same `δ` reached two points.
+        assert!(
+            split <= 1.0,
+            "[minor={minor}] steer_rows and steer_decode steered the same request to different \
+             points: the worst entry differs by {split:.3e} times its rounding allowance"
         );
     }
 }

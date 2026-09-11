@@ -157,52 +157,6 @@ pub struct SteerPlan {
     pub metric_provenance: MetricProvenance,
 }
 
-/// Result of writing one certified chart coordinate into an activation row.
-///
-/// The edited row is always `x + δ`, where `δ` is the delta returned by
-/// [`steer_delta`] for the atom's current encoded coordinate and the requested
-/// target coordinate. Because only the on-manifold atom chord is added, every
-/// component of `x` outside this atom's chart residual is preserved exactly; this
-/// is the locality guarantee missing from whole-residual linear-steering
-/// baselines.
-#[derive(Clone, Debug)]
-pub struct CoordinateSetResult {
-    /// The edited activation/reconstruction row.
-    pub edited: Array1<f64>,
-    /// Certified coordinate read from the input row before the write.
-    pub t_from_certified: Array1<f64>,
-    /// Certificate attached to `t_from_certified`.
-    pub encode_certificate: crate::encode::RowCertificate,
-    /// Steering plan whose `delta` was added to the row.
-    pub steer: SteerPlan,
-}
-
-/// Result of a coordinate interchange: donor position read from `x_source`, then
-/// written into `x_target` while preserving the target residual and intensity.
-#[derive(Clone, Debug)]
-pub struct InterchangeResult {
-    /// Target row after the donor coordinate has been delta-written into it.
-    pub edited_target: Array1<f64>,
-    /// Donor/source coordinate that was transplanted.
-    pub donor_t: Array1<f64>,
-    /// Target coordinate before the transplant.
-    pub target_t_before: Array1<f64>,
-    /// Target behavior coordinate after the transplant, re-read from the edit.
-    pub target_t_after: Array1<f64>,
-    /// Steering dose in nats, when a behavioral metric is available.
-    pub predicted_nats: Option<f64>,
-    /// Norm of the steering delta outside the local atom tangent frame.
-    pub off_manifold_norm: f64,
-    /// Reported steering validity radius.
-    pub validity_radius: Option<f64>,
-    /// Geodesic chart-coordinate landing error. Wrapped axes use their shortest
-    /// signed displacement. This is a descriptive reconstruction diagnostic,
-    /// not a p/e-value: no counterfactual null distribution is available here.
-    pub landing_error: f64,
-    /// Underlying coordinate-write plan.
-    pub set_result: CoordinateSetResult,
-}
-
 fn shortest_coordinate_delta(
     from: &[f64],
     to: &[f64],
@@ -1261,8 +1215,8 @@ fn validity_radius(ctx: &SteerContext<'_>, t_from: &[f64]) -> Result<f64, String
 /// loop.
 #[derive(Clone, Debug, PartialEq, serde::Serialize)]
 pub struct CollateralPoint {
-    /// The chart-coordinate dose applied to the target atom's steered axis
-    /// (radians / fraction-of-period, per the atom's manifold).
+    /// The canonical arc-length displacement applied to the target atom's chart,
+    /// in the chart's own span units (a fraction of the ring for a circle chart).
     pub dose: f64,
     /// RMS-over-rows on-target effect: `‖proj_{T_k} Δ‖`, the energy the
     /// intervention deposits into the TARGET atom's own local decode-tangent
@@ -1493,7 +1447,7 @@ pub fn collateral_curve(
     let mut manifold_pts = Vec::with_capacity(doses.len());
     let mut flat_pts = Vec::with_capacity(doses.len());
     for &dose in doses {
-        let on_field = steer_rows_unit_speed(model, atom_k, &rows, dose)?.delta;
+        let on_field = model.steer_rows(atom_k, &rows, Array1::from_elem(1, dose).view())?;
 
         // Matched control: same per-row move NORM, along the fixed direction w.
         let mut flat_field = Array2::<f64>::zeros((n, p));
@@ -1602,7 +1556,7 @@ struct CanonicalChart<'a> {
     hi: f64,
     /// The axis period the atom's own `LatentManifold` wraps at — the period
     /// [`SaeManifoldTerm::steer_rows`]'s group action uses. Checked against the
-    /// canonical topology at construction, and used to report each row's raw step
+    /// canonical topology at construction, and used to take each row's raw step
     /// as its SHORTEST representative.
     axis_period: Option<f64>,
 }
@@ -1633,29 +1587,6 @@ pub struct CanonicalChartCoordinates {
     /// Total arc length of the fitted decoder curve over the canonical domain —
     /// the conversion from a canonical (span) displacement to an absolute one.
     pub total_arc_length: f64,
-}
-
-/// The per-row ambient move that realizes one CANONICAL chart displacement
-/// (gam#2234's "dose in radians", gh#2263 item 3's requested-vs-realized
-/// displacement).
-#[derive(Clone, Debug, PartialEq)]
-pub struct UnitSpeedSteerField {
-    /// The steered atom.
-    pub atom: usize,
-    /// The steered rows, in the order of the returned matrix.
-    pub rows: Vec<usize>,
-    /// The requested displacement in the atom's canonical coordinate.
-    pub canonical_delta: f64,
-    /// The RAW chart step actually applied to each row. Constant across rows
-    /// exactly when the chart is unit-speed; its spread over rows IS the gauge
-    /// error a single raw `δ` would have committed.
-    pub raw_steps: Vec<f64>,
-    /// The ambient steering delta `a_{ik}·(Φ_k(t'_i) − Φ_k(t_i))·B_k`, shape
-    /// `(rows.len(), p)`, in the same fit-space units as
-    /// [`SaeManifoldTerm::steer_rows`] (whose group action produced it).
-    pub delta: Array2<f64>,
-    /// The chart the displacement was expressed in, with its gauge diagnostics.
-    pub chart: CanonicalChartCoordinates,
 }
 
 fn canonical_chart<'a>(
@@ -1888,37 +1819,38 @@ pub fn canonical_chart_raw_coordinates(
     chart.invert(&targets)
 }
 
-/// Steer `rows` of atom `atom_k` by `canonical_delta` in the atom's CANONICAL
-/// (unit-speed / arc-length) chart — the gam#2234 intervention primitive in the
-/// units gam#2234 claims for it.
+/// The fitted-chart step that moves each of `rows` of atom `atom_k` by
+/// `canonical_delta` in the atom's CANONICAL (unit-speed / arc-length) chart.
+/// This is the step [`SaeManifoldTerm::steer_rows`] and
+/// [`SaeManifoldTerm::steer_decode`] hand to the group action for a
+/// one-dimensional atom, which is what puts the gam#2234 intervention primitive
+/// in the units gam#2234 claims for it.
 ///
 /// The requested displacement is applied to each row's canonical coordinate
-/// through the chart's own topology (a circle wraps, a bounded patch clamps), the
-/// resulting canonical position is mapped back to the raw fitted parameter, and
-/// the ambient move is produced by the SAME group action
-/// [`SaeManifoldTerm::steer_rows`] implements — this function selects the STEP,
-/// it does not re-implement the action. The raw step therefore differs from row to
-/// row exactly as the fitted chart's speed does; a chart that is already
-/// unit-speed produces a constant raw step equal to `canonical_delta`, so this is
-/// a strict repair of the raw surface and not an alternative to it.
+/// through the chart's own topology (a circle wraps, a bounded patch clamps), and
+/// the resulting canonical position is mapped back to the raw fitted parameter.
+/// This selects the STEP; it does not re-implement the action. The step therefore
+/// differs from row to row exactly as the fitted chart's speed does, a chart that
+/// is already unit-speed yields a constant step equal to `canonical_delta`, and
+/// the spread over rows is the gauge error a single raw step would have committed.
 ///
 /// A displacement that is an exact multiple of the canonical span (`0`, one full
-/// period) is short-circuited to an exactly-zero raw step, so `δ = 0` remains a
-/// bit-exact no-op and a circle closes exactly, as [`SaeManifoldTerm::steer_rows`]
-/// guarantees for the raw action.
+/// period) is short-circuited to an exactly-zero step, so `δ = 0` is a bit-exact
+/// no-op and a circle closes exactly.
 ///
 /// Errors when the atom has no `d = 1` canonical chart, when the chart is
 /// degenerate, when a row index is out of range, or when `canonical_delta` is not
 /// finite.
-pub fn steer_rows_unit_speed(
+pub(crate) fn canonical_chart_steps(
     model: &SaeManifoldTerm,
     atom_k: usize,
     rows: &[usize],
     canonical_delta: f64,
-) -> Result<UnitSpeedSteerField, String> {
+) -> Result<Vec<f64>, String> {
     if !canonical_delta.is_finite() {
         return Err(format!(
-            "steer_rows_unit_speed: canonical_delta must be finite, got {canonical_delta}"
+            "SaeManifoldTerm::steer: the canonical displacement must be finite, got \
+             {canonical_delta}"
         ));
     }
     let chart = canonical_chart(model, atom_k)?;
@@ -1928,12 +1860,12 @@ pub fn steer_rows_unit_speed(
     for &row in rows {
         if row >= n {
             return Err(format!(
-                "steer_rows_unit_speed: row {row} out of range (n = {n})"
+                "SaeManifoldTerm::steer: row {row} out of range (n = {n})"
             ));
         }
         base_raw.push(fitted[[row, 0]]);
     }
-    let chart_read = chart.read(&base_raw)?;
+    let base_canonical = chart.read(&base_raw)?.canonical;
 
     // A whole number of canonical spans is the identity of the group action on a
     // circle chart; take it exactly rather than through the inverse, so `δ = 0`
@@ -1942,46 +1874,24 @@ pub fn steer_rows_unit_speed(
         CanonicalChartTopology::Circle { .. } => canonical_delta.rem_euclid(chart.span),
         CanonicalChartTopology::Interval => canonical_delta,
     };
-    let raw_steps = if residual == 0.0 {
-        vec![0.0_f64; rows.len()]
-    } else {
-        let targets: Vec<f64> = chart_read
-            .canonical
-            .iter()
-            .map(|&c| chart.advance(c, residual))
-            .collect();
-        let moved = chart.invert(&targets)?;
-        // The step is reported as its SHORTEST representative, through the same
-        // helper `steer_delta` uses. Both endpoints lie in the chart's own domain,
-        // so a row near the wrap seam would otherwise be reported as taking the
-        // long way round (`0.95 → 0.06` as `−0.89` rather than `+0.11`). The group
-        // action lands identically either way — `retract` wraps — but the reported
-        // spread over rows is only the gauge error if each step is the short one.
-        let periods = [chart.axis_period];
-        let mut steps = Vec::with_capacity(moved.len());
-        for (&to, &from) in moved.iter().zip(base_raw.iter()) {
-            steps.push(shortest_coordinate_delta(&[from], &[to], &periods)?[0]);
-        }
-        steps
-    };
-
-    let p = model.output_dim();
-    let mut delta = Array2::<f64>::zeros((rows.len(), p));
-    let mut step = Array1::<f64>::zeros(1);
-    for (out_row, &row) in rows.iter().enumerate() {
-        step[0] = raw_steps[out_row];
-        let field = model.steer_rows_raw(atom_k, &[row], step.view())?;
-        for c in 0..p {
-            delta[[out_row, c]] = field[[0, c]];
-        }
+    if residual == 0.0 {
+        return Ok(vec![0.0_f64; rows.len()]);
     }
-
-    Ok(UnitSpeedSteerField {
-        atom: atom_k,
-        rows: rows.to_vec(),
-        canonical_delta,
-        raw_steps,
-        delta,
-        chart: chart_read,
-    })
+    let targets: Vec<f64> = base_canonical
+        .iter()
+        .map(|&c| chart.advance(c, residual))
+        .collect();
+    let moved = chart.invert(&targets)?;
+    // Each step is its SHORTEST representative, through the same helper
+    // `steer_delta` uses. Both endpoints lie in the chart's own domain, so a row
+    // near the wrap seam would otherwise take the long way round (`0.95 → 0.06` as
+    // `−0.89` rather than `+0.11`). `retract` wraps, so the moved point is the same
+    // either way, but the spread of the steps over rows is only the gauge error if
+    // each step is the short one.
+    let periods = [chart.axis_period];
+    let mut steps = Vec::with_capacity(moved.len());
+    for (&to, &from) in moved.iter().zip(base_raw.iter()) {
+        steps.push(shortest_coordinate_delta(&[from], &[to], &periods)?[0]);
+    }
+    Ok(steps)
 }
