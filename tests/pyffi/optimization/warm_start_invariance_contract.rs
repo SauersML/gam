@@ -428,7 +428,9 @@ fn fits_are_invariant_to_warm_start_cache_state_across_families() {
         },
         InvarianceCase {
             name: "tweedie_smooth",
-            family: "tweedie",
+            // A Tweedie fit needs an explicit variance power (a893d85bc); the
+            // cache-state invariance under test does not depend on its value.
+            family: "tweedie(p=1.5)",
             formula: "y ~ s(x, k=8)",
             data: tweedie_data,
         },

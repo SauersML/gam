@@ -154,7 +154,9 @@ def test_tweedie_dispersion_location_scale_is_predictable() -> None:
     )
     df = pd.DataFrame({"y": y, "x": x})
 
-    m = gamfit.fit(df, "y ~ s(x)", family="tweedie", noise_formula="s(x)")
+    # An explicit power is required (a bare ``tweedie`` is refused, a893d85bc);
+    # pass the power the simulator drew from.
+    m = gamfit.fit(df, "y ~ s(x)", family=f"tweedie({p})", noise_formula="s(x)")
     x_grid = np.linspace(-1.5, 1.5, 40)
     true_mean = np.exp(0.5 + 0.6 * x_grid)
     _assert_joint_covariance_and_predictable(

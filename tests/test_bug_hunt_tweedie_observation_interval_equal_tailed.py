@@ -47,7 +47,7 @@ def _skewed_tweedie(rng, n):
 def test_tweedie_observation_interval_is_equal_tailed_not_symmetric():
     rng = np.random.default_rng(83)
     train, test = _skewed_tweedie(rng, 6000), _skewed_tweedie(rng, 20000)
-    m = gamfit.fit(train, "y ~ s(x)", family="tweedie")
+    m = gamfit.fit(train, "y ~ s(x)", family=f"tweedie({POWER})")
     p = m.predict(test, interval=0.95, observation_interval=True)
 
     y = test["y"].to_numpy()
@@ -75,7 +75,7 @@ def test_tweedie_observation_upper_edge_is_above_the_symmetric_band():
     undershot the true upper quantile, the cause of the upper-tail under-cover)."""
     rng = np.random.default_rng(83)
     train, test = _skewed_tweedie(rng, 6000), _skewed_tweedie(rng, 20000)
-    m = gamfit.fit(train, "y ~ s(x)", family="tweedie")
+    m = gamfit.fit(train, "y ~ s(x)", family=f"tweedie({POWER})")
     p = m.predict(test, interval=0.95, observation_interval=True)
 
     hi = p["observation_upper"].to_numpy()

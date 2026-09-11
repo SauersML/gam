@@ -77,7 +77,7 @@ fn fit_tweedie_eta_se(x: &[f64], y: &[f64], eval: &[f64]) -> Option<(Vec<f64>, f
     let x_idx = col["x"];
 
     let cfg = FitConfig {
-        family: Some("tweedie".to_string()),
+        family: Some(format!("tweedie(p={TWEEDIE_P})")),
         ..FitConfig::default()
     };
     let FitResult::Standard(fit) = fit_from_formula("y ~ x", &ds, &cfg).ok()? else {

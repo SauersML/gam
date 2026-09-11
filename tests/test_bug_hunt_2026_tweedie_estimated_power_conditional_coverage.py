@@ -1,7 +1,7 @@
-"""Regression for #2026 (conditional-coverage angle): a bare ``family="tweedie"``
-must ESTIMATE the variance power ``p`` (mgcv ``tw()`` semantics), so that the
-observation interval is calibrated *conditional on the mean* on data whose true
-power differs from the old hardcoded fallback ``p = 1.5``.
+"""Regression for #2026 (conditional-coverage angle): a Tweedie observation
+interval must be calibrated *conditional on the mean* on data whose true power
+differs from the old hardcoded fallback ``p = 1.5``, and a Tweedie fit must never
+silently use a power the caller did not choose.
 
 The mean-variance law is ``Var(Y|x) = phi * mu(x)**p``. The fitted mean (log-link
 quasi-likelihood) is robust to a misspecified ``p``, but the observation-interval
@@ -11,17 +11,20 @@ one end and too narrow at the other, and the marginal (pooled) coverage hides it
 The #2026 report shows the low-mean quartile collapsing to ~0.73 at a nominal
 0.90 on ``p_true = 1.1`` data while the hardcoded ``p = 1.5`` was used.
 
-The sibling test ``tests/issue_2026_tweedie_estimated_power.rs`` asserts the
-recovered power ``p_hat`` tracks the truth (the proxy). This test asserts the
-user-visible SYMPTOM directly, from a second angle, with a falsifiable contrast:
+HISTORY: #2026 first profiled ``p`` for a bare ``family="tweedie"``, and this file
+asserted that the profiled fit covered nominally. a893d85bc retired the profile
+(a derivative-free hyperparameter search, forbidden by SPEC.md): a bare
+``tweedie`` is now refused and the caller must name the power. This file keeps
+the user-visible symptom and its falsifiable contrast under that contract:
 
-  * bare ``family="tweedie"``  -> ``p`` estimated -> low-mean coverage ~nominal;
-  * ``family="tweedie(1.5)"``  -> ``p`` pinned at the old buggy fallback on the
-    same ``p_true = 1.1`` data -> low-mean coverage under-covers.
+  * bare ``family="tweedie"``            -> refused, never a silent default;
+  * ``family="tweedie(1.1)"`` (the truth) -> low-mean coverage ~nominal;
+  * ``family="tweedie(1.5)"``            -> ``p`` pinned at the old fallback on
+    the same ``p_true = 1.1`` data -> low-mean coverage under-covers.
 
-If the estimation regressed to the fixed fallback, the first assertion fails
-(low-mean coverage collapses back toward ~0.73) AND the contrast collapses (the
-two fits would cover identically), so the test cannot pass for the wrong reason.
+If the interval ignored the requested power, the true-power fit would inherit
+the fallback's under-coverage AND the contrast would collapse (the two fits
+would cover identically), so the tests cannot pass for the wrong reason.
 """
 
 import numpy as np
@@ -71,47 +74,53 @@ def _low_mean_quartile_coverage(model, test):
     return inside[low_stratum].mean(), inside.mean(), mean
 
 
-def test_bare_tweedie_low_mean_coverage_is_near_nominal_on_p_neq_1p5_data():
+def test_bare_tweedie_is_refused_instead_of_silently_pinning_1p5():
+    rng = np.random.default_rng(20262)
+    train, _ = _gradient_tweedie(rng, 600)
+    with pytest.raises(Exception, match="explicit variance power"):
+        gamfit.fit(train, "y ~ s(x)", family="tweedie")
+
+
+def test_true_power_low_mean_coverage_is_near_nominal_on_p_neq_1p5_data():
     rng = np.random.default_rng(20260)
     train, _ = _gradient_tweedie(rng, 6000)
     test, mu_true = _gradient_tweedie(rng, 20000)
 
-    # Bare tweedie -> the power is estimated by profile likelihood (#2026).
-    m_est = gamfit.fit(train, "y ~ s(x)", family="tweedie")
+    m_true = gamfit.fit(train, "y ~ s(x)", family=f"tweedie({P_TRUE})")
 
     # Precondition: the mean must be recovered, so a coverage failure is an
     # INTERVAL defect (the reported bug), not a broken fit. The log-link mean is
     # robust to the power regardless, so this holds for both fits.
-    pr = m_est.predict(test, interval=LEVEL, observation_interval=True)
+    pr = m_true.predict(test, interval=LEVEL, observation_interval=True)
     mean_hat = pr["posterior_mean"].to_numpy()
     corr = np.corrcoef(np.log(mean_hat), np.log(mu_true))[0, 1]
     assert corr > 0.95, f"mean not recovered (precondition failed): corr={corr:.3f}"
 
-    low_est, marg_est, _ = _low_mean_quartile_coverage(m_est, test)
+    low_true, _, _ = _low_mean_quartile_coverage(m_true, test)
 
-    # The estimated-power fit must cover the low-mean stratum within 6 points of
-    # nominal. Before #2026 (fixed p=1.5 on p_true=1.1 data) this stratum fell to
-    # ~0.73 -- a ~17-point deficit -- so this bound is a decisive gate.
-    assert low_est >= LEVEL - NOMINAL_DEFICIT, (
-        f"bare family='tweedie' under-covers the low-mean quartile: {low_est:.3f} "
-        f"< {LEVEL - NOMINAL_DEFICIT:.3f} (nominal {LEVEL}). The power was not "
-        f"estimated toward p_true={P_TRUE}; it regressed to the fixed fallback."
+    # The true-power fit must cover the low-mean stratum within 6 points of
+    # nominal. With the fixed p=1.5 fallback on p_true=1.1 data this stratum fell
+    # to ~0.73 -- a ~17-point deficit -- so this bound is a decisive gate.
+    assert low_true >= LEVEL - NOMINAL_DEFICIT, (
+        f"family='tweedie({P_TRUE})' under-covers the low-mean quartile: {low_true:.3f} "
+        f"< {LEVEL - NOMINAL_DEFICIT:.3f} (nominal {LEVEL}); the observation interval "
+        f"does not honour the requested power."
     )
 
 
-def test_estimated_power_strictly_beats_pinned_1p5_in_low_mean_stratum():
+def test_true_power_strictly_beats_pinned_1p5_in_low_mean_stratum():
     """Mechanism check: on the SAME p_true=1.1 data, pinning tweedie(1.5) (the old
-    hardcoded fallback) reproduces the low-mean under-coverage, while the bare
-    (estimated) fit fixes it. This proves the cure is the power estimation, not an
-    incidental change in interval shape or width."""
+    hardcoded fallback) reproduces the low-mean under-coverage, while naming the
+    true power fixes it. This proves the cure is the power the interval uses, not
+    an incidental change in interval shape or width."""
     rng = np.random.default_rng(20261)
     train, _ = _gradient_tweedie(rng, 6000)
     test, _ = _gradient_tweedie(rng, 20000)
 
-    m_est = gamfit.fit(train, "y ~ s(x)", family="tweedie")
+    m_true = gamfit.fit(train, "y ~ s(x)", family=f"tweedie({P_TRUE})")
     m_pinned = gamfit.fit(train, "y ~ s(x)", family="tweedie(1.5)")
 
-    low_est, _, _ = _low_mean_quartile_coverage(m_est, test)
+    low_true, _, _ = _low_mean_quartile_coverage(m_true, test)
     low_pinned, _, _ = _low_mean_quartile_coverage(m_pinned, test)
 
     # The pinned-1.5 fit is the pre-#2026 behaviour and must still under-cover.
@@ -119,10 +128,10 @@ def test_estimated_power_strictly_beats_pinned_1p5_in_low_mean_stratum():
         f"precondition: pinned tweedie(1.5) should under-cover the low-mean "
         f"stratum on p_true={P_TRUE} data, but got {low_pinned:.3f}"
     )
-    # Estimating the power must materially improve low-mean coverage over the
+    # Naming the true power must materially improve low-mean coverage over the
     # pinned fallback -- a strict, seed-robust gap.
-    assert low_est >= low_pinned + 0.08, (
-        f"estimating p did not repair low-mean coverage: estimated={low_est:.3f} "
+    assert low_true >= low_pinned + 0.08, (
+        f"the true power did not repair low-mean coverage: true={low_true:.3f} "
         f"vs pinned-1.5={low_pinned:.3f} (need >= +0.08)"
     )
 

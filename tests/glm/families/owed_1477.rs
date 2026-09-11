@@ -158,7 +158,7 @@ struct FitOut {
 /// mean on `grid_x` on the response scale (log link → mean = exp(eta)).
 fn fit_tweedie(basis: &str, data: &gam::data::EncodedDataset, grid_x: &[f64]) -> FitOut {
     let cfg = FitConfig {
-        family: Some("tweedie".to_string()),
+        family: Some(format!("tweedie(p={P_TWEEDIE})")),
         ..FitConfig::default()
     };
     let formula = format!("y ~ s(x, bs=\"{basis}\", k=10)");

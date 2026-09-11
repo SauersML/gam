@@ -1,24 +1,24 @@
-//! Regression test for #2026: a bare `family="tweedie"` must ESTIMATE the
-//! variance power `p` from the data (mgcv `tw()` semantics), not silently fit
-//! at the hardcoded fallback `p = 1.5`.
+//! Regression tests for #2026: a Tweedie fit must never silently use a variance
+//! power the caller did not choose.
 //!
-//! BUG (before this fix): `resolve_family` mapped a bare `family="tweedie"` to
+//! BUG (#2026): `resolve_family` mapped a bare `family="tweedie"` to
 //! `ResponseFamily::Tweedie { p: 1.5 }` and the fit used that fixed power
 //! unconditionally. On data whose true power `p ≠ 1.5` the fitted mean is robust
 //! (log-link quasi-likelihood), but the conditional variance `Var(Y|x) = φ μ^p`
 //! — and every observation interval derived from it — is miscalibrated because
-//! `p` is wrong. mgcv's `tw()` profiles `p` over `(1, 2)`; gam did not.
+//! `p` is wrong, and nothing told the caller.
 //!
-//! FIX (#2026): a bare `family="tweedie"`/`"tw"` (no explicit power) now profiles
-//! `p` by maximum saddlepoint likelihood over `(1, 2)` before the reported fit,
-//! so the recovered power tracks the data. An explicit `tweedie(1.6)` still pins
-//! `p`.
+//! HISTORY: #2026 first answered this by profiling `p` over `(1, 2)` for a bare
+//! `tweedie`, and these tests asserted that the profiled power tracked the truth.
+//! a893d85bc retired that profile because it is a derivative-free hyperparameter
+//! search, which SPEC.md forbids. The shipped contract is now: a bare
+//! `tweedie`/`tw` is REFUSED with a typed configuration error naming the explicit
+//! form, and an explicit `tweedie(p)` pins `p` exactly. The #2026 defect (a
+//! silent default power) therefore cannot recur. These tests pin that contract,
+//! on the same compound-Poisson-gamma DGPs the estimator tests used.
 //!
 //! DGP: Tweedie compound-Poisson-gamma (Jørgensen) with a correctly-specified
-//! log-linear mean `log μ = 0.5 + 0.8·x`, x ~ U(0,1), true power `p_true = 1.8`,
-//! `φ = 1`. METRIC: the recovered power `p̂` reported on the fitted family must
-//! land within `TOL` of `p_true`. This FAILS before the fix (`p̂ ≡ 1.5`, error
-//! `|1.5 − 1.8| = 0.3 > TOL`) and PASSES after (profile recovery).
+//! log-linear mean `log μ = 0.5 + 0.8·x`, x ~ U(0,1), `φ = 1`.
 
 use csv::StringRecord;
 use gam::data::EncodedDataset;
@@ -34,10 +34,6 @@ const N: usize = 800;
 const P_TRUE: f64 = 1.8;
 const PHI: f64 = 1.0;
 const SEED: u64 = 2_026_018;
-/// Recovery tolerance. The old hardcoded fallback `p = 1.5` misses by
-/// `|1.5 − 1.8| = 0.3`, so any tolerance `< 0.3` fails before the fix; the
-/// profile estimator recovers `p_true` comfortably inside `0.2` after it.
-const TOL: f64 = 0.2;
 
 fn true_mu(x: f64) -> f64 {
     (0.5 + 0.8 * x).exp()
@@ -116,9 +112,8 @@ fn recovered_power(fit: &gam::StandardFitResult) -> f64 {
 }
 
 /// Simulate a compound-Poisson-gamma (Jørgensen) Tweedie sample at `p_true`
-/// (mean `true_mu(x)`, dispersion `PHI`) and return the power a bare
-/// `family="tweedie"` fit estimates from it.
-fn estimated_bare_tweedie_power(p_true: f64, n: usize, seed: u64) -> f64 {
+/// with mean `true_mu(x)` and dispersion `PHI`.
+fn simulate_tweedie(p_true: f64, n: usize, seed: u64) -> EncodedDataset {
     let mut rng = StdRng::seed_from_u64(seed);
     let unif01 = Uniform::new(0.0_f64, 1.0).expect("uniform x");
     let mut x = Vec::with_capacity(n);
@@ -137,115 +132,83 @@ fn estimated_bare_tweedie_power(p_true: f64, n: usize, seed: u64) -> f64 {
         x.push(xi);
         y.push(yi);
     }
-    let ds = encode(&[("x", &x), ("y", &y)]);
+    encode(&[("x", &x), ("y", &y)])
+}
+
+/// Fit `y ~ x` with the given family string and return the power the fitted
+/// engine family carries.
+fn fitted_tweedie_power(family: &str, ds: &EncodedDataset) -> f64 {
     let cfg = FitConfig {
-        family: Some("tweedie".to_string()),
+        family: Some(family.to_string()),
         ..FitConfig::default()
     };
-    let FitResult::Standard(fit) = fit_from_formula("y ~ x", &ds, &cfg).expect("bare tweedie fit")
+    let FitResult::Standard(fit) = fit_from_formula("y ~ x", ds, &cfg)
+        .unwrap_or_else(|e| panic!("explicit {family} fit failed: {e:?}"))
     else {
-        panic!("Tweedie(log) is a scalar GLM => expected FitResult::Standard");
+        panic!("Tweedie(log) is a scalar GLM => expected FitResult::Standard for {family}");
     };
     recovered_power(&fit)
 }
 
 #[test]
-fn bare_tweedie_estimates_variance_power_from_data() {
+fn bare_tweedie_is_refused_instead_of_silently_fitting_a_default_power() {
     init_parallelism();
 
-    // ---- Tweedie compound-Poisson-gamma DGP (Jørgensen), true p = 1.8 --------
-    let mut rng = StdRng::seed_from_u64(SEED);
-    let unif01 = Uniform::new(0.0_f64, 1.0).expect("uniform x");
-    let mut x = Vec::with_capacity(N);
-    let mut y = Vec::with_capacity(N);
-    for _ in 0..N {
-        let xi: f64 = unif01.sample(&mut rng);
-        let mu = true_mu(xi);
-        let lambda = mu.powf(2.0 - P_TRUE) / (PHI * (2.0 - P_TRUE));
-        let shape = (2.0 - P_TRUE) / (P_TRUE - 1.0);
-        let scale = PHI * (P_TRUE - 1.0) * mu.powf(P_TRUE - 1.0);
-        let n_jumps = poisson_sample(lambda, &mut rng, &unif01);
-        let mut yi = 0.0;
-        for _ in 0..n_jumps {
-            yi += gamma_sample(shape, scale, &mut rng);
-        }
-        x.push(xi);
-        y.push(yi);
+    let ds = simulate_tweedie(P_TRUE, N, SEED);
+
+    // ---- bare tweedie: refused, never fitted at a power nobody chose --------
+    for bare in ["tweedie", "tw"] {
+        let cfg = FitConfig {
+            family: Some(bare.to_string()),
+            ..FitConfig::default()
+        };
+        let err = match fit_from_formula("y ~ x", &ds, &cfg) {
+            Ok(FitResult::Standard(fit)) => panic!(
+                "bare family=\"{bare}\" fitted at p={} instead of refusing; a893d85bc \
+                 requires an explicit power, and a silent default is the #2026 defect",
+                recovered_power(&fit)
+            ),
+            Ok(_) => panic!("bare family=\"{bare}\" fitted instead of refusing"),
+            Err(err) => format!("{err:?}"),
+        };
+        assert!(
+            err.contains("explicit variance power"),
+            "bare family=\"{bare}\" must be refused with the typed explicit-power \
+             configuration error, got: {err}"
+        );
     }
 
-    let ds = encode(&[("x", &x), ("y", &y)]);
-
-    // ---- bare tweedie: p must be ESTIMATED (mgcv tw() semantics) -------------
-    let cfg = FitConfig {
-        family: Some("tweedie".to_string()),
-        ..FitConfig::default()
-    };
-    let result = fit_from_formula("y ~ x", &ds, &cfg).expect("bare tweedie fit");
-    let FitResult::Standard(fit) = result else {
-        panic!("Tweedie(log) is a scalar GLM => expected FitResult::Standard");
-    };
-    let p_hat = recovered_power(&fit);
-
     // ---- explicit tweedie(p): the pinned power is preserved verbatim ---------
-    let cfg_fixed = FitConfig {
-        family: Some("tweedie(1.4)".to_string()),
-        ..FitConfig::default()
-    };
-    let result_fixed = fit_from_formula("y ~ x", &ds, &cfg_fixed).expect("pinned tweedie fit");
-    let FitResult::Standard(fit_fixed) = result_fixed else {
-        panic!("expected FitResult::Standard for tweedie(1.4)");
-    };
-    let p_fixed = recovered_power(&fit_fixed);
-
-    eprintln!(
-        "tweedie #2026 (seed {SEED}, p_true={P_TRUE}): n={N} \
-         bare_p_hat={p_hat:.4} (err {:.4}) fixed_p={p_fixed:.4} \
-         old_fallback_err={:.4}",
-        (p_hat - P_TRUE).abs(),
-        (1.5 - P_TRUE).abs(),
-    );
-
-    // An explicit power is never touched by the estimator.
+    let p_fixed = fitted_tweedie_power("tweedie(1.4)", &ds);
+    eprintln!("tweedie #2026 (seed {SEED}, p_true={P_TRUE}): n={N} fixed_p={p_fixed:.4}");
     assert!(
-        (p_fixed - 1.4).abs() < 1e-9,
+        (p_fixed - 1.4).abs() < 1e-12,
         "explicit tweedie(1.4) must pin p exactly; got {p_fixed}"
     );
-
-    // The bare-tweedie power must be ESTIMATED toward the truth, not left at the
-    // hardcoded 1.5 fallback. Before #2026 this is exactly 1.5 (err 0.3 > TOL).
+    let p_named = fitted_tweedie_power(&format!("tweedie(p={P_TRUE})"), &ds);
     assert!(
-        (p_hat - P_TRUE).abs() < TOL,
-        "bare family=\"tweedie\" did not estimate the variance power: recovered p̂={p_hat:.4} \
-         is {:.4} from the true p={P_TRUE} (tolerance {TOL}). The pre-#2026 hardcoded \
-         fallback p=1.5 gives error {:.4}; a working profile estimator must beat it.",
-        (p_hat - P_TRUE).abs(),
-        (1.5 - P_TRUE).abs(),
+        (p_named - P_TRUE).abs() < 1e-12,
+        "explicit tweedie(p={P_TRUE}) must pin p exactly; got {p_named}"
     );
 }
 
-/// #2064 — the grid scan is gone; the estimator is a golden-section search over
-/// the whole open interval (1, 2). This guards the estimator on a truth that
-/// sits OFF the removed fixed grid nodes {1.1, …, 1.9}: `p_true = 1.65`, halfway
-/// between the two nearest old nodes (1.6 and 1.7). The continuous optimizer must
-/// still recover it from data — the tolerance (0.15 at n = 3000) mirrors the
-/// n = 800 / 0.2 calibration of the sibling test, scaled for the larger sample,
-/// so it is robust to the (real) sampling variance of the weakly-identified
-/// Tweedie power rather than a flaky point bound.
+/// #2064 removed the fixed power grid {1.1, …, 1.9}. The power is a continuous
+/// parameter: a truth that sits OFF the old grid nodes (`p = 1.65`, halfway
+/// between 1.6 and 1.7) must be carried through the fit verbatim when requested
+/// explicitly, not snapped to a node.
 #[test]
-fn tweedie_power_recovers_an_off_grid_truth() {
+fn explicit_off_grid_tweedie_power_is_pinned_verbatim() {
     init_parallelism();
 
     const P_OFF_GRID: f64 = 1.65;
-    let p_hat = estimated_bare_tweedie_power(P_OFF_GRID, 3000, 2_064_017);
+    let ds = simulate_tweedie(P_OFF_GRID, 3000, 2_064_017);
+    let p_hat = fitted_tweedie_power(&format!("tweedie(p={P_OFF_GRID})"), &ds);
     eprintln!(
-        "tweedie #2064: p_true={P_OFF_GRID} n=3000 bare_p_hat={p_hat:.4} \
-         (err {:.4}); the removed grid had no node here (nearest 1.6 / 1.7)",
-        (p_hat - P_OFF_GRID).abs()
+        "tweedie #2064: p_true={P_OFF_GRID} n=3000 fitted_p={p_hat:.6}; \
+         the removed grid had no node here (nearest 1.6 / 1.7)"
     );
     assert!(
-        (p_hat - P_OFF_GRID).abs() < 0.15,
-        "golden-section power estimator did not recover the off-grid truth: \
-         p̂={p_hat:.4} is {:.4} from p_true={P_OFF_GRID} (tolerance 0.15)",
-        (p_hat - P_OFF_GRID).abs()
+        (p_hat - P_OFF_GRID).abs() < 1e-12,
+        "explicit off-grid tweedie(p={P_OFF_GRID}) was not pinned verbatim: fitted p={p_hat}"
     );
 }

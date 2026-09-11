@@ -119,7 +119,7 @@ fn gamma_sample(shape: f64, scale: f64, rng: &mut StdRng) -> f64 {
 
 fn fit_mu(formula: &str, ds: &EncodedDataset, x_idx: usize, grid: &[f64]) -> (Vec<f64>, f64) {
     let cfg = FitConfig {
-        family: Some("tweedie".to_string()),
+        family: Some(format!("tweedie(p={P_TRUE})")),
         ..FitConfig::default()
     };
     let result =

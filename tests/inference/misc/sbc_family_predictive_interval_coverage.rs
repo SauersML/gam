@@ -376,13 +376,15 @@ fn beta_predictive_interval_covers_new_observation_at_nominal() {
 
 #[test]
 fn tweedie_predictive_interval_covers_new_observation_at_nominal() {
-    // True power p = 1.5 (the bare-Tweedie default), dispersion φ = 0.6:
-    // compound Poisson–Gamma with a point mass at zero plus a right-skewed
-    // positive part — the #817 skew defect's compound-distribution instance.
+    // True power p = 1.5, dispersion φ = 0.6: compound Poisson–Gamma with a
+    // point mass at zero plus a right-skewed positive part — the #817 skew
+    // defect's compound-distribution instance. The fit is given the true power
+    // explicitly (a bare `tweedie` is refused; a893d85bc), so the family string
+    // must name the same `power` the simulator draws from.
     let phi = 0.6;
     let power = 1.5;
     run_family_predictive_gate(&FamilyCase {
-        family: "tweedie",
+        family: "tweedie(p=1.5)",
         seed: 0x1891_7E_ED1E_00,
         eta_prior: (0.7, 0.9, 0.7),
         log_link: true,

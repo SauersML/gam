@@ -144,7 +144,7 @@ fn build_data(seed: u64) -> gam::data::EncodedDataset {
 
 fn fit_tweedie(double_penalty: bool, data: &gam::data::EncodedDataset, grid_x: &[f64]) -> FitOut {
     let cfg = FitConfig {
-        family: Some("tweedie".to_string()),
+        family: Some(format!("tweedie(p={P_TWEEDIE})")),
         ..FitConfig::default()
     };
     let formula = format!("y ~ s(x, bs=\"ps\", k=10, double_penalty={double_penalty})");

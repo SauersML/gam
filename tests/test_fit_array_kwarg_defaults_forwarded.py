@@ -20,7 +20,9 @@ def test_fit_array_documented_defaults_reach_likelihood_spec() -> None:
     # observable via Summary.family_name (the current likelihood accessor).
 
     tweedie_y = np.exp(0.2 + 0.4 * x[:, 0]) + 0.1
-    tweedie = gamfit.fit_array(x, tweedie_y, "y ~ x0", family="tweedie")
+    # A Tweedie family needs an explicit variance power (a bare ``tweedie`` is
+    # refused, a893d85bc).
+    tweedie = gamfit.fit_array(x, tweedie_y, "y ~ x0", family="tweedie(1.5)")
     assert tweedie.summary().family_name == "Tweedie Log", (
         "fit_array should forward the documented Tweedie family into the fitted model"
     )

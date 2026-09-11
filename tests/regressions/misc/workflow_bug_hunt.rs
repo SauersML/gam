@@ -108,27 +108,45 @@ fn resolve_family_binomial_with_explicit_link_overrides_default_logit() {
 
 #[test]
 fn resolve_family_accepts_tweedie() {
-    // GitHub issue #158: family='tweedie' must be a recognized family.
+    // GitHub issue #158: family='tweedie' must be a recognized family. Since
+    // a893d85bc the power must be explicit, so every accepted spelling names it
+    // and it is carried verbatim; a bare name is a typed refusal, not "unknown
+    // family" and not a silent default power (#2026).
     let y = array![0.0, 1.0, 2.0, 0.0, 3.5, 0.0];
-    let resolved = resolve_family(
-        Some("tweedie"),
-        None,
-        None,
-        y.view(),
-        ResponseColumnKind::Numeric,
-        "y",
-    )
-    .expect("tweedie family should be recognized");
-    match resolved.response {
-        ResponseFamily::Tweedie { p } => {
-            assert!(
-                p > 1.0 && p < 2.0,
-                "default tweedie p should lie in (1, 2); got {p}"
-            );
+    for spelling in ["tweedie(p=1.5)", "tweedie(1.5)", "tw(p=1.5)"] {
+        let resolved = resolve_family(
+            Some(spelling),
+            None,
+            None,
+            y.view(),
+            ResponseColumnKind::Numeric,
+            "y",
+        )
+        .unwrap_or_else(|err| panic!("{spelling} should be recognized, got: {err}"));
+        match resolved.response {
+            ResponseFamily::Tweedie { p } => assert!(
+                (p - 1.5).abs() < 1e-12,
+                "{spelling} must carry p = 1.5 verbatim; got {p}"
+            ),
+            other => panic!("expected Tweedie response family for {spelling}, got {other:?}"),
         }
-        other => panic!("expected Tweedie response family, got {other:?}"),
+        assert_eq!(resolved.link, InverseLink::Standard(StandardLink::Log));
     }
-    assert_eq!(resolved.link, InverseLink::Standard(StandardLink::Log));
+    for bare in ["tweedie", "tw"] {
+        let err = resolve_family(
+            Some(bare),
+            None,
+            None,
+            y.view(),
+            ResponseColumnKind::Numeric,
+            "y",
+        )
+        .expect_err("a bare tweedie name must be refused instead of fitting a default power");
+        assert!(
+            err.contains("explicit variance power"),
+            "bare {bare} must be refused with the explicit-power error, got: {err}"
+        );
+    }
 }
 
 #[test]
@@ -210,7 +228,7 @@ fn resolve_family_explicit_family_does_not_infer_conflicting_family_from_link() 
     let log = parse_link_choice(Some("log"), false)
         .expect("log parses")
         .expect("log choice present");
-    for family in ["tweedie", "tweedie-log"] {
+    for family in ["tweedie(p=1.5)", "tweedie-log(p=1.5)"] {
         let resolved = resolve_family(
             Some(family),
             None,

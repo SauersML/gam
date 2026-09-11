@@ -87,7 +87,7 @@ fn fit_tweedie(x: &[f64], y: &[f64], eval: &[f64]) -> TweedieFit {
     let x_idx = col["x"];
 
     let cfg = FitConfig {
-        family: Some("tweedie".to_string()),
+        family: Some(format!("tweedie(p={TWEEDIE_P})")),
         ..FitConfig::default()
     };
     let FitResult::Standard(fit) =
