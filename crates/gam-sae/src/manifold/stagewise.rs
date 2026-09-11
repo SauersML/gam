@@ -3901,6 +3901,9 @@ mod tests {
     /// approximation of the greedy sequence — it IS the greedy sequence.
     #[test]
     fn batched_disjoint_birth_fit_matches_serial_bit_for_bit() {
+        // The indefinite exact-A refusal names its block, mode, curvature and floor
+        // only in a `log::warn!` line; install the backend so a failure shows them.
+        gam_runtime::test_support::install_diagnostic_logger();
         let n = 40usize;
         let p = 6usize;
         let h = n / 2;
@@ -4053,6 +4056,9 @@ mod tests {
     /// production path co-accepts.)
     #[test]
     fn batched_driver_matches_serial_and_batches() {
+        // The indefinite exact-A refusal names its block, mode, curvature and floor
+        // only in a `log::warn!` line; install the backend so a failure shows them.
+        gam_runtime::test_support::install_diagnostic_logger();
         let n = 900usize;
         let p = 16usize;
         let q = 3usize; // circles in ambient planes {0,1},{2,3},{4,5}; dims 6-15 noise
@@ -4149,6 +4155,9 @@ mod tests {
     /// dominant-variance migration.)
     #[test]
     fn batched_round_co_accepts_via_both_routes() {
+        // The indefinite exact-A refusal names its block, mode, curvature and floor
+        // only in a `log::warn!` line; install the backend so a failure shows them.
+        gam_runtime::test_support::install_diagnostic_logger();
         let n = 40usize;
         let p = 8usize;
         let h = n / 2;
