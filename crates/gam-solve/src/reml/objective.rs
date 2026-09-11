@@ -4594,9 +4594,8 @@ mod ift_warm_start_tests {
             frame_was_original: true,
             lambda_s_beta_blocks: None,
         };
-        // Δρ = 1e-15 is well below IFT_WARM_START_DRHO_EPS (1e-12);
-        // every component of the new ρ is essentially the cached ρ.
-        let new_rho = ndarray::array![1e-15_f64];
+        // Δρ = 0: every component of the new ρ is the cached ρ.
+        let new_rho = ndarray::array![0.0_f64];
         let predicted = predict_warm_start_beta_ift_inner(&cache, &canonical, &new_rho, p, None)
             .expect("noop must return Some(β_cur)");
         for i in 0..p {

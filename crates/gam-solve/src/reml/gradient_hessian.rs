@@ -2058,14 +2058,17 @@ impl<'a> RemlState<'a> {
         let h_factor = if let Ok(chol) = h_tk_eval.cholesky(Side::Lower) {
             HFactor::Cholesky(chol)
         } else if let Ok((evals, evecs)) = h_tk_eval.eigh(Side::Lower) {
-            // Smallest eigenvalue at or below this floor means the effective
-            // Hessian failed positive-definiteness (Cholesky already declined),
-            // so the Tierney–Kadane Laplace correction is undefined here.
-            const TK_HESSIAN_PD_EIGENVALUE_FLOOR: f64 = 1e-12;
+            // An eigenvalue inside the eigensolver's rounding band `γ_p·max|λ|`
+            // (or below it) means the effective Hessian failed
+            // positive-definiteness (Cholesky already declined), so the
+            // Tierney–Kadane Laplace correction is undefined here.
+            let spectral_scale = evals.iter().fold(0.0_f64, |acc, ev| acc.max(ev.abs()));
+            let resolvable_eigenvalue =
+                gam_linalg::roundoff::accumulation_growth(evals.len()) * spectral_scale;
             if let Some((idx, ev)) = evals
                 .iter()
                 .enumerate()
-                .find(|(_, ev)| **ev <= TK_HESSIAN_PD_EIGENVALUE_FLOOR)
+                .find(|(_, ev)| **ev <= resolvable_eigenvalue)
             {
                 crate::bail_invalid_estim!(
                     "Tierney-Kadane correction requires a positive definite Hessian; eigenvalue {idx} is {ev}"
@@ -2609,9 +2612,9 @@ impl<'a> RemlState<'a> {
             );
             return None;
         }
-        if dtheta.iter().all(|d| d.abs() <= IFT_WARM_START_DRHO_EPS) {
+        if dtheta.iter().all(|d| *d == 0.0) {
             log::info!(
-                "[IFT-NOOP] reason=all_dtheta_below_eps max_dtheta={:.3e} joint_dim={}",
+                "[IFT-NOOP] reason=all_dtheta_zero max_dtheta={:.3e} joint_dim={}",
                 max_abs_dtheta,
                 cache.theta.len(),
             );
@@ -4189,48 +4192,11 @@ impl<'a> RemlState<'a> {
     /// Construct a `BarrierConfig` from linear inequality constraints `A β ≥ b`
     /// by extracting rows that represent simple coordinate bounds (β_j ≥ b_i).
     ///
-    /// Delegates to `BarrierConfig::from_constraints` and logs a diagnostic
-    /// barrier-curvature check at a test point near the bounds.
+    /// Delegates to `BarrierConfig::from_constraints`.
     pub(crate) fn barrier_config_from_constraints(
         constraints: &crate::pirls::LinearInequalityConstraints,
     ) -> Option<super::reml_outer_engine::BarrierConfig> {
-        let config = super::reml_outer_engine::BarrierConfig::from_constraints(Some(constraints))?;
-        // Diagnostic: check curvature significance at a test point near bounds.
-        {
-            // Place the diagnostic test point a small slack inside the feasible
-            // side of each bound, and probe the barrier curvature at unit β
-            // magnitude against a 5%-of-curvature significance threshold. These
-            // only shape the emitted trace line, not the fit.
-            const DIAGNOSTIC_BOUND_SLACK: f64 = 0.01;
-            const DIAGNOSTIC_BETA_MAGNITUDE: f64 = 1.0;
-            const DIAGNOSTIC_CURVATURE_REL_THRESHOLD: f64 = 0.05;
-            let max_idx = config
-                .constrained_indices
-                .iter()
-                .max()
-                .copied()
-                .unwrap_or(0);
-            let mut beta_test = Array1::<f64>::zeros(max_idx + 1);
-            for ((&idx, &rhs), &sign) in config
-                .constrained_indices
-                .iter()
-                .zip(config.lower_bounds.iter())
-                .zip(config.bound_signs.iter())
-            {
-                beta_test[idx] = (rhs + DIAGNOSTIC_BOUND_SLACK) / sign;
-            }
-            let significant = config.barrier_curvature_is_significant(
-                &beta_test,
-                DIAGNOSTIC_BETA_MAGNITUDE,
-                DIAGNOSTIC_CURVATURE_REL_THRESHOLD,
-            );
-            log::trace!(
-                "[barrier] curvature significant={significant} (tau={:.2e}, n_constrained={})",
-                config.tau,
-                config.constrained_indices.len(),
-            );
-        }
-        Some(config)
+        super::reml_outer_engine::BarrierConfig::from_constraints(Some(constraints))
     }
 
     pub(super) fn enforce_constraint_kkt(&self, pr: &PirlsResult) -> Result<(), EstimationError> {
@@ -5245,13 +5211,13 @@ impl<'a> RemlState<'a> {
                     max_abs_drho = d.abs();
                 }
             }
-            // No-op case: every |Δρ_k| below the eps floor.
-            if !any_non_finite && max_abs_drho <= IFT_WARM_START_DRHO_EPS {
+            // No-op case: every Δρ_k is exactly zero.
+            if !any_non_finite && max_abs_drho == 0.0 {
                 // Same NOOP marker the inner function would emit, so the
                 // bench runner aggregator's count is preserved across
                 // both the early-out path and the post-factor path.
                 log::info!(
-                    "[IFT-NOOP] reason=all_drho_below_eps max_drho={:.3e} drho_dim={}",
+                    "[IFT-NOOP] reason=all_drho_zero max_drho={:.3e} drho_dim={}",
                     max_abs_drho,
                     cache.rho.len(),
                 );
@@ -5507,16 +5473,14 @@ impl<'a> RemlState<'a> {
             return Some((cur_beta, WarmStartPredictionSource::Flat));
         }
         // d_rho = ρ_k − ρ_{k-1}; step_rho = ρ_new − ρ_k.
-        // Squared-norm floor (≈1e-12 in ‖Δρ‖) below which the previous ρ-step is
-        // treated as a degenerate/zero-length direction the tangent predictor
-        // cannot extrapolate along.
-        const DEGENERATE_DRHO_NORM_SQ: f64 = 1e-24;
+        // A previous ρ-step of exactly zero length is no direction the tangent
+        // predictor can extrapolate along; any nonzero one is.
         let d_rho_norm_sq: f64 = cur_rho
             .iter()
             .zip(prev_rho.iter())
             .map(|(c, p)| (c - p) * (c - p))
             .sum();
-        if !d_rho_norm_sq.is_finite() || d_rho_norm_sq <= DEGENERATE_DRHO_NORM_SQ {
+        if !d_rho_norm_sq.is_finite() || d_rho_norm_sq == 0.0 {
             // Degenerate Δρ direction (the previous ρ-step had zero or
             // unfinite length). Diagnostic rather than bug: this fires
             // when the outer optimizer landed on a flat region or the
@@ -5601,16 +5565,8 @@ impl<'a> RemlState<'a> {
         // [TANGENT-QUALITY] block in execute_pirls_if_needed
         // doesn't fire on a near-identity prediction (would
         // contaminate the residual percentile distribution with
-        // ~zero residuals — same bug class as commit 52372fd5).
-        const TANGENT_ALPHA_NOOP_EPS: f64 = 1e-12;
-        if alpha.abs() <= TANGENT_ALPHA_NOOP_EPS {
-            log::info!(
-                "[TANGENT-NOOP] reason=alpha_below_eps alpha={:.3e} eps={:.3e}",
-                alpha,
-                TANGENT_ALPHA_NOOP_EPS,
-            );
-            return Some((cur_beta, WarmStartPredictionSource::Flat));
-        }
+        // ~zero residuals — same bug class as commit 52372fd5). The prediction
+        // is a no-op exactly when it reproduces the current β representably.
         let mut predicted = cur_beta.0.clone();
         for ((p, c), pp) in predicted
             .iter_mut()
@@ -5618,6 +5574,13 @@ impl<'a> RemlState<'a> {
             .zip(prev_beta.0.iter())
         {
             *p = c + alpha * (c - pp);
+        }
+        if predicted.iter().zip(cur_beta.0.iter()).all(|(p, c)| p == c) {
+            log::info!(
+                "[TANGENT-NOOP] reason=prediction_equals_current alpha={:.3e}",
+                alpha,
+            );
+            return Some((cur_beta, WarmStartPredictionSource::Flat));
         }
         if !predicted.iter().all(|v: &f64| v.is_finite()) {
             log::info!(
@@ -8061,11 +8024,6 @@ pub(crate) enum WarmStartPredictionSource {
     Flat,
 }
 
-/// Below this magnitude in any Δρ_k, the per-component IFT contribution is
-/// numerically negligible and skipped (saves one back-solve per inactive
-/// component).
-pub(crate) const IFT_WARM_START_DRHO_EPS: f64 = 1e-12;
-
 /// Bit-pattern sentinel used by `RemlObjectiveState::last_ift_prediction_residual`
 /// to encode "no signal yet" unambiguously. Decodes via `f64::from_bits`
 /// to a quiet NaN — readers detect the sentinel via NaN's
@@ -8229,7 +8187,9 @@ pub(crate) fn predict_warm_start_beta_ift_inner_with_outcome(
     };
     for (idx, cp) in canonical_penalties.iter().enumerate() {
         let dr = drho[idx];
-        if dr.abs() <= IFT_WARM_START_DRHO_EPS {
+        // A component whose Δρ_k is exactly zero contributes nothing to the
+        // right-hand side.
+        if dr == 0.0 {
             continue;
         }
         any_active = true;
@@ -8461,9 +8421,9 @@ pub(crate) fn predict_warm_start_beta_ift_from_mode_response_cols(
         return None;
     }
 
-    if drho.iter().all(|d| d.abs() <= IFT_WARM_START_DRHO_EPS) {
+    if drho.iter().all(|d| *d == 0.0) {
         log::info!(
-            "[IFT-NOOP] reason=all_drho_below_eps max_drho={:.3e} drho_dim={}",
+            "[IFT-NOOP] reason=all_drho_zero max_drho={:.3e} drho_dim={}",
             max_abs_drho,
             k,
         );
