@@ -101,9 +101,27 @@ fn checkpoint_banks_resumes_and_discards_across_objectives() {
     let resumed_rho = second
         .try_resume_from_checkpoint(flat.len())
         .expect("banked rho must satisfy the objective domain");
+    // Every refusal inside the resume is a `log::warn!` the test harness never shows, so a
+    // `None` here would name nothing. Walk the same three stages on a fresh objective and
+    // carry the one that refuses into the assertion.
+    let refusal = if resumed_rho.is_some() {
+        String::new()
+    } else {
+        let (mut probe, _) = tiny_objective(salt);
+        match super::checkpoint::SaeFitCheckpoint::load(&probe.checkpoint_path) {
+            Err(error) => format!("load refused: {error}"),
+            Ok(ckpt) => match ckpt.verify_compatible(&probe.checkpoint_fingerprint, flat.len()) {
+                Err(error) => format!("verify refused: {error}"),
+                Ok(()) => match ckpt.install_into(&mut probe.term) {
+                    Err(error) => format!("install refused: {error}"),
+                    Ok(()) => "load, verify and install all accept here".to_string(),
+                },
+            },
+        }
+    };
     assert!(
         resumed_rho.is_some(),
-        "identical data + schema must resume the banked checkpoint"
+        "identical data + schema must resume the banked checkpoint; {refusal}"
     );
     let resumed_rho = resumed_rho.unwrap();
     assert_eq!(
