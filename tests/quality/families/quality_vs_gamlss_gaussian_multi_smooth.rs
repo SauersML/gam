@@ -35,31 +35,33 @@
 //! Notes on the gam side that this test pins down by reading the source:
 //!   * `fit_from_formula(..., FitConfig{ noise_formula: Some(...), .. })` routes
 //!     through `materialize_location_scale` -> `FitRequest::GaussianLocationScale`.
-//!     This in-Rust path does NOT rescale `y`, so the reconstructed mu / sigma
-//!     are already in raw response units.
-//!   * gam's noise (sigma) link is `sigma = LOGB_SIGMA_FLOOR + exp(eta_scale)`
-//!     with `LOGB_SIGMA_FLOOR = 0.01` (see `families::sigma_link`); the location
-//!     block carries role `BlockRole::Location`, the log-sigma block role
-//!     `BlockRole::Scale`.
+//!     The Gaussian location-scale model fits on `y / response_scale` and maps the
+//!     coefficients back to raw response units, so mu = X_mean*beta_location is
+//!     already raw.
+//!   * gam's noise (sigma) link in raw units is
+//!     `sigma = response_scale*LOGB_SIGMA_FLOOR + exp(eta_scale)`
+//!     (`families::sigma_link::LOGB_SIGMA_FLOOR`). sigma is read through the
+//!     production `GaussianLocationScalePredictor`, so the floor is the one
+//!     prediction uses. The location block carries role `BlockRole::Location`,
+//!     the log-sigma block role `BlockRole::Scale`.
 //!   * The spec's `linkwiggle(...)` term is a *binomial-only* link correction
 //!     (`reject_explicit_linkwiggle_for_nonbinomial` rejects it for a Gaussian
 //!     response); it is meaningless here, so the gam formula is the pair of
 //!     two-smooth additive blocks without it.
 
 use gam::estimate::BlockRole;
+use gam::families::sigma_link::LOGB_SIGMA_FLOOR;
 use gam::gamlss::GaussianLocationScaleFitResult;
 use gam::matrix::LinearOperator;
+use gam::predict::gaussian_location_scale::GaussianLocationScalePredictor;
+use gam::predict::{PredictInput, PredictableModel};
 use gam::smooth::build_term_collection_design;
 use gam::test_support::reference::{Column, QualityPair, relative_l2, rmse, run_r};
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
 };
-use ndarray::Array2;
+use ndarray::{Array1, Array2};
 use std::time::Instant;
-
-/// gam's location-scale noise link floor: sigma = 0.01 + exp(eta_scale).
-/// Mirrors `families::sigma_link::LOGB_SIGMA_FLOOR`.
-const LOGB_SIGMA_FLOOR: f64 = 0.01;
 
 #[test]
 fn gam_gaussian_multi_smooth_matches_gamlss() {
@@ -135,7 +137,11 @@ fn gam_gaussian_multi_smooth_matches_gamlss() {
     let result = fit_from_formula("y ~ s(x1, bs='tp', k=6) + s(x2, bs='tp', k=6)", &ds, &cfg)
         .expect("gam multi-smooth location-scale fit");
     let fit_elapsed = fit_started.elapsed();
-    let FitResult::GaussianLocationScale(GaussianLocationScaleFitResult { fit, .. }) = result
+    let FitResult::GaussianLocationScale(GaussianLocationScaleFitResult {
+        fit,
+        response_scale,
+        ..
+    }) = result
     else {
         panic!("expected a Gaussian location-scale fit");
     };
@@ -179,20 +185,35 @@ fn gam_gaussian_multi_smooth_matches_gamlss() {
         grid[[i, x2_idx]] = grid_x2[i];
     }
 
-    // Rebuild the SAME frozen mean / log-sigma designs at the grid points and
-    // apply each block's coefficients. mu = X_mean*beta_location;
-    // sigma = LOGB_SIGMA_FLOOR + exp(X_scale*beta_scale).
+    // Rebuild the SAME frozen mean / log-sigma designs at the grid points.
+    // mu = X_mean*beta_location; sigma comes from the production Gaussian
+    // location-scale predictor, sigma = response_scale*LOGB_SIGMA_FLOOR +
+    // exp(X_scale*beta_scale).
     let mean_design_grid = build_term_collection_design(grid.view(), &fit.meanspec_resolved)
         .expect("rebuild mean design at grid");
     let scale_design_grid = build_term_collection_design(grid.view(), &fit.noisespec_resolved)
         .expect("rebuild log-sigma design at grid");
 
     let gam_mu: Vec<f64> = mean_design_grid.design.apply(&beta_location).to_vec();
-    let gam_eta_sigma: Vec<f64> = scale_design_grid.design.apply(&beta_scale).to_vec();
-    let gam_sigma: Vec<f64> = gam_eta_sigma
-        .iter()
-        .map(|&e| LOGB_SIGMA_FLOOR + e.exp())
-        .collect();
+    let gam_sigma: Vec<f64> = GaussianLocationScalePredictor {
+        beta_mu: beta_location.clone(),
+        beta_noise: beta_scale.clone(),
+        sigma_floor: LOGB_SIGMA_FLOOR,
+        response_scale,
+        covariance: None,
+        link_wiggle: None,
+    }
+    .predict_noise_scale(&PredictInput {
+        design: mean_design_grid.design,
+        offset: Array1::zeros(grid_n),
+        design_noise: Some(scale_design_grid.design),
+        offset_noise: None,
+        auxiliary_scalar: None,
+        auxiliary_matrix: None,
+    })
+    .expect("production Gaussian location-scale sigma at grid")
+    .expect("Gaussian location-scale predictor exposes a noise scale")
+    .to_vec();
     let gam_log_sigma: Vec<f64> = gam_sigma.iter().map(|&s| s.ln()).collect();
 
     assert_eq!(gam_mu.len(), grid_n);

@@ -43,13 +43,16 @@
 //! finding.
 
 use csv::StringRecord;
+use gam::families::sigma_link::LOGB_SIGMA_FLOOR;
 use gam::matrix::LinearOperator;
+use gam::predict::gaussian_location_scale::GaussianLocationScalePredictor;
+use gam::predict::{PredictInput, PredictableModel};
 use gam::smooth::build_term_collection_design;
 use gam::test_support::reference::{Column, QualityPair, relative_l2, rmse, run_r};
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
 };
-use ndarray::Array2;
+use ndarray::{Array1, Array2};
 use rand::SeedableRng;
 use rand::rngs::StdRng;
 use rand_distr::{Distribution, Normal, Uniform};
@@ -200,6 +203,17 @@ fn gam_location_scale_by_group_matches_gamlss() {
     // gam μ and σ on each per-group grid: set the group code so the by= term
     // activates only that group's block, and read off X·β through the frozen
     // resolved specs (mean uses meanspec_resolved, σ uses noisespec_resolved).
+    // σ goes through the production Gaussian location-scale predictor, whose
+    // raw-unit noise link is σ = response_scale·LOGB_SIGMA_FLOOR + exp(X_noise·β);
+    // exp(X_noise·β) alone drops that floor and biases log σ̂ low.
+    let sigma_predictor = GaussianLocationScalePredictor {
+        beta_mu: beta_mean.clone(),
+        beta_noise: beta_scale.clone(),
+        sigma_floor: LOGB_SIGMA_FLOOR,
+        response_scale: fit.response_scale,
+        covariance: None,
+        link_wiggle: None,
+    };
     let predict_group = |grid: &[f64], code: f64| -> (Vec<f64>, Vec<f64>) {
         let mut design_pts = Array2::<f64>::zeros((grid.len(), ncols));
         for (i, &xv) in grid.iter().enumerate() {
@@ -213,8 +227,18 @@ fn gam_location_scale_by_group_matches_gamlss() {
             build_term_collection_design(design_pts.view(), &fit.fit.noisespec_resolved)
                 .expect("rebuild noise design at grid");
         let mu = mean_design.design.apply(beta_mean).to_vec();
-        let log_sigma = noise_design.design.apply(beta_scale).to_vec();
-        let sigma: Vec<f64> = log_sigma.iter().map(|v| v.exp()).collect();
+        let sigma = sigma_predictor
+            .predict_noise_scale(&PredictInput {
+                design: mean_design.design,
+                offset: Array1::zeros(grid.len()),
+                design_noise: Some(noise_design.design),
+                offset_noise: None,
+                auxiliary_scalar: None,
+                auxiliary_matrix: None,
+            })
+            .expect("production Gaussian location-scale sigma at grid")
+            .expect("Gaussian location-scale predictor exposes a noise scale")
+            .to_vec();
         (mu, sigma)
     };
 
