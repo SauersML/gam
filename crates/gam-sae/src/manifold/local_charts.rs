@@ -77,7 +77,7 @@ use std::fmt;
 use gam_linalg::faer_ndarray::FaerSvd;
 
 use super::AtlasOrientability;
-use super::intrinsic_seed::{farthest_point_landmarks, intrinsic_geodesic_embedding};
+use super::intrinsic_seed::intrinsic_geodesic_embedding;
 
 #[cfg(test)]
 #[path = "local_chart_recovery_tests.rs"]
@@ -799,13 +799,19 @@ impl LocalAtlas {
             });
         }
 
-        // Independently realize the same cover budget in intrinsic coordinates.
+        // Independently realize the same cover in intrinsic coordinates: the same
+        // budget AND the same net, the ambient cover's own occupancy-normalized net.
         // A fold can make the ambient cover look regular while its intrinsic
         // realization piles many charts onto one region; topology may not be
-        // promoted from a cover that fails either coordinate-system certificate.
-        let intrinsic_centers = farthest_point_landmarks(
+        // promoted from a cover that fails either coordinate-system certificate. An
+        // area-equalizing net here would pile rows up wherever the intrinsic
+        // coordinate is sparsely sampled (a 1-D realization of a closed curve is
+        // folded, so its density is non-uniform by construction) and refuse honest
+        // covers for a property of the net rather than of the data.
+        let intrinsic_centers = occupancy_normalized_centers(
             membership_coords.view(),
-            config.patch_count.max(1).min(n),
+            requested_centers,
+            n.div_ceil(requested_centers),
         );
         let mut intrinsic_counts = vec![0usize; n];
         for center in intrinsic_centers {
@@ -1470,6 +1476,7 @@ fn determinant(m: &Array2<f64>) -> f64 {
 mod tests {
     use super::*;
 
+    use crate::manifold::intrinsic_seed::farthest_point_landmarks;
     use crate::manifold::tests_topology_fixtures::{
         cylinder_strip, embedded_plane, mobius_strip, spherical_band, swiss_roll, torus,
     };
