@@ -285,16 +285,15 @@ fn penalty_gradient_refuses_a_cache_whose_rank_disagrees_with_its_own_spectrum()
     let case = fixture();
     let rank = case.fit.cache.penalty_rank;
 
-    // (a) Demote the smallest RETAINED eigenvalue to the smallest positive
-    // double. It stays positive, so the count under an absolute `> 0.0` test is
-    // unchanged, but it falls below any relative range tolerance — the selected
-    // count becomes `rank - 1` while the cache still claims `rank`.
-    let smallest_retained = *case
-        .retained
-        .last()
-        .expect("the fixture retains at least one direction");
+    // (a) Demote the first range direction, the smallest entry past the declared
+    // null block, to curvature exactly zero. The cache still claims `rank` range
+    // directions while only `rank - 1` of its range entries are positive, which
+    // is the one range predicate every consumer shares (#2740). A tiny POSITIVE
+    // entry is not a disagreement: #2833 keeps a small positive mode in the range
+    // below any relative tolerance by design, so the demotion goes to zero.
+    let first_range = case.fit.cache.nullity;
     let mut demoted = case.fit.clone();
-    demoted.cache.penalty_eigenvalues[smallest_retained] = f64::MIN_POSITIVE;
+    demoted.cache.penalty_eigenvalues[first_range] = 0.0;
     assert_eq!(
         demoted.cache.penalty_rank, rank,
         "the demotion must leave the declared rank untouched"
@@ -311,18 +310,26 @@ fn penalty_gradient_refuses_a_cache_whose_rank_disagrees_with_its_own_spectrum()
         None,
         &demoted,
     );
+    let demoted_error = match demoted_result {
+        Ok(_) => panic!(
+            "a cache claiming rank {rank} while only {} of its range entries are positive was \
+             served a gradient instead of being refused; the pseudoinverse divides by each \
+             selected eigenvalue, so it must not silently build from a different number of \
+             directions than the cache reports",
+            rank - 1
+        ),
+        Err(error) => error.to_string(),
+    };
     assert!(
-        demoted_result.is_err(),
-        "a cache claiming rank {rank} while only {} of its eigenvalues clear the range \
-         tolerance was served a gradient instead of being refused; the pseudoinverse \
-         divides by each selected eigenvalue, so it must not silently build from a \
-         different number of directions than the cache reports",
-        rank - 1
+        demoted_error.contains("reports penalty_rank"),
+        "the demotion must be refused by the rank-versus-spectrum check, not by another \
+         validation: {demoted_error}"
     );
 
-    // (b) Over-declare the rank past the number of positive eigenvalues. A
-    // distinct failure: here no selection rule could satisfy the claim, whereas
-    // in (a) an absolute `> 0.0` rule would have satisfied it and been wrong.
+    // (b) Over-declare the rank past the number of positive eigenvalues by
+    // dissolving the declared null block. A distinct shape of the same
+    // disagreement: here no range entry was demoted, the claim itself outgrows
+    // the positive spectrum.
     let positive = case
         .fit
         .cache
