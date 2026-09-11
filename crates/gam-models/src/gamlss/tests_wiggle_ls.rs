@@ -1821,3 +1821,132 @@ pub(crate) fn release_measure_bls_wiggle_order2_rows_vs_per_column_tower_932() {
     gate.faster("order2", &timing, "production", "per_column_tower");
     gate.finish();
 }
+
+#[test]
+pub(crate) fn binomial_location_scalewiggle_termswith_matern_spatial_blocks_fit_finitely() {
+    let n = 30usize;
+    let mut data = Array2::<f64>::zeros((n, 2));
+    for i in 0..n {
+        let t = i as f64 / (n as f64 - 1.0);
+        data[[i, 0]] = t;
+        data[[i, 1]] = (2.5 * std::f64::consts::PI * t).sin();
+    }
+    let y = Array1::from_iter((0..n).map(|i| if i % 4 == 0 || i % 9 == 0 { 1.0 } else { 0.0 }));
+    let weights = Array1::from_elem(n, 1.0);
+    let q_seed = Array1::linspace(-1.5, 1.5, n);
+    let (wiggle_block, knots) =
+        BinomialLocationScaleWiggleFamily::buildwiggle_block_input(q_seed.view(), 2, 4, 2, false)
+            .expect("wiggle block");
+    let spec = BinomialLocationScaleWiggleTermSpec {
+        y,
+        weights,
+        link_kind: InverseLink::Standard(StandardLink::Probit),
+        thresholdspec: simple_matern_term_collection(&[0, 1], 0.45),
+        log_sigmaspec: empty_term_collection(),
+        threshold_offset: Array1::zeros(n),
+        log_sigma_offset: Array1::zeros(n),
+        wiggle_knots: knots,
+        wiggle_degree: 2,
+        wiggle_block,
+    };
+    let fit = fit_binomial_location_scalewiggle_terms(
+        data.view(),
+        spec,
+        &spatial_fit_smoke_options(),
+        &spatial_kappa_options(),
+    )
+    .expect("binomial location-scale wiggle spatial fit");
+    assert!(fit.fit.penalized_objective().is_some_and(f64::is_finite));
+    assert_eq!(fit.fit.block_states.len(), 3);
+}
+
+/// gam#2647, as the property rather than as a symptom: **the fitted optimum must
+/// not depend on the inner cycle budget.**
+///
+/// The failure this pins is not "the solve ran out of cycles". It is that the
+/// penalized criterion had no minimiser: the monotone warp's linear element is a
+/// rescale of the index it is composed onto, and with an order-2 roughness and
+/// `double_penalty = false` that element was unpenalized, so the objective
+/// decreased monotonically along the orbit toward an infimum at `‖β‖ = ∞`. A
+/// solve on such a criterion returns wherever its budget happened to stop, and
+/// the measured signature was exactly that: `‖β‖∞` climbing 230× while
+/// `½βᵀSβ` fell like `‖β‖⁻²` and `−loglik` stayed flat to `8e-4`.
+///
+/// So the discriminating question is not "does it converge" — a guard can make
+/// anything stop — but "does it converge to the SAME point from two different
+/// budgets". Before the gauge closure the 48- and 200-cycle arms disagreed and
+/// neither was stationary; after it they agree bit-for-bit. This test cannot be
+/// satisfied by loosening a tolerance or lengthening a budget, which is what
+/// makes it worth its ~0.2 s.
+#[test]
+pub(crate) fn binomial_location_scalewiggle_optimum_is_budget_independent_2647() {
+    let n = 30usize;
+    let mut data = Array2::<f64>::zeros((n, 2));
+    for i in 0..n {
+        let t = i as f64 / (n as f64 - 1.0);
+        data[[i, 0]] = t;
+        data[[i, 1]] = (2.5 * std::f64::consts::PI * t).sin();
+    }
+    let y = Array1::from_iter((0..n).map(|i| if i % 4 == 0 || i % 9 == 0 { 1.0 } else { 0.0 }));
+    let weights = Array1::from_elem(n, 1.0);
+    let q_seed = Array1::linspace(-1.5, 1.5, n);
+
+    let fit_at = |inner_max_cycles: usize| -> f64 {
+        let (wiggle_block, knots) = BinomialLocationScaleWiggleFamily::buildwiggle_block_input(
+            q_seed.view(),
+            2,
+            4,
+            2,
+            false,
+        )
+        .expect("wiggle block");
+        let spec = BinomialLocationScaleWiggleTermSpec {
+            y: y.clone(),
+            weights: weights.clone(),
+            link_kind: InverseLink::Standard(StandardLink::Probit),
+            thresholdspec: simple_matern_term_collection(&[0, 1], 0.45),
+            log_sigmaspec: empty_term_collection(),
+            threshold_offset: Array1::zeros(n),
+            log_sigma_offset: Array1::zeros(n),
+            wiggle_knots: knots,
+            wiggle_degree: 2,
+            wiggle_block,
+        };
+        let options = BlockwiseFitOptions {
+            inner_max_cycles,
+            ..spatial_fit_smoke_options()
+        };
+        let fit = fit_binomial_location_scalewiggle_terms(
+            data.view(),
+            spec,
+            &options,
+            &spatial_kappa_options(),
+        )
+        .unwrap_or_else(|error| {
+            panic!(
+                "binomial location-scale wiggle spatial fit refused at \
+                 inner_max_cycles={inner_max_cycles}: {error}"
+            )
+        });
+        fit.fit
+            .penalized_objective()
+            .expect("a converged fit must carry a penalized objective")
+    };
+
+    let short = fit_at(48);
+    let long = fit_at(200);
+    assert!(
+        short.is_finite() && long.is_finite(),
+        "penalized objective must be finite at both budgets: 48 -> {short}, 200 -> {long}"
+    );
+    // Same criterion, same minimiser: the two solves differ only in a budget
+    // neither of them needs, so any difference at all is evidence the objective
+    // is still being descended rather than located.
+    let spread = (short - long).abs() / (1.0 + short.abs());
+    assert!(
+        spread <= 1e-9,
+        "the fitted optimum moved with the inner cycle budget (gam#2647): \
+         48 cycles -> {short:.12e}, 200 cycles -> {long:.12e}, relative spread {spread:.3e}. \
+         A criterion whose argmin depends on how long you look for it does not have one."
+    );
+}
