@@ -174,14 +174,22 @@ mod tests {
         // stays far below STRUCTURED_RESIDUAL_MIN_REL_ENERGY, so this is still the
         // near-exact regime the guard exists for.
         let target = with_noise(circle_target(7.0), 3.0e-5);
-        let report = run_primary(target);
+        let target_energy: f64 = target.iter().map(|v| v * v).sum();
+        let report = run_primary(target.clone());
         // Reaching here means run_sae_manifold_fit returned Ok — before the floor
         // guard this panicked with the StructuredResidual outer non-certification.
+        // The guard compares residual energy with the floor times the target energy, so
+        // a failure reports where the returned fit's residual sits against that floor.
+        let residual_energy: f64 = (&target - &report.fitted).iter().map(|v| v * v).sum();
         assert!(
             report.structured_residual_diagnostics.is_empty(),
             "near-exact fit must SKIP the structured-residual pass (nothing to \
-             whiten); got {} pass diagnostic(s)",
-            report.structured_residual_diagnostics.len()
+             whiten); got {} pass diagnostic(s) {:?}; returned residual energy fraction \
+             {:e} against the floor {:e}",
+            report.structured_residual_diagnostics.len(),
+            report.structured_residual_diagnostics,
+            residual_energy / target_energy,
+            crate::manifold::fit_entry::STRUCTURED_RESIDUAL_MIN_REL_ENERGY
         );
     }
 
