@@ -2948,6 +2948,91 @@ mod root_cause_tests {
         assert!(obsolete_bound > threshold);
     }
 
+    /// #2705: the exact-decrement half of the inner certificate is published as
+    /// `exact_newton_decrement_evidence`, so a consumer that re-checks
+    /// stationarity (the survival LAML gate) accepts exactly the modes P-IRLS
+    /// minted. Three states pin it. A stiff mode whose gradient misses strict
+    /// KKT but whose decrement is inside the objective's rounding band
+    /// certifies. The same gradient on unit curvature does not. And a
+    /// coordinate held at its lower bound by a large multiplier certifies on its
+    /// binding face, where the unconstrained decrement is dominated by that
+    /// multiplier and refuses.
+    #[test]
+    pub(crate) fn exact_newton_decrement_evidence_certifies_what_the_gradient_band_refuses_2705() {
+        let gradient = 5.0e-5_f64;
+        let stiffness = 1.6e8_f64;
+        let beta = Coefficients::new(array![0.0]);
+        let mut stiff = scalar_working_state(&beta, HessianCurvatureKind::Observed, gradient, 428.0);
+        stiff.hessian = gam_linalg::matrix::SymmetricMatrix::Dense(array![[stiffness]]);
+        assert!(
+            !stiff.certifies_kkt(gradient, 1.0e-8),
+            "the stiff fixture must sit outside strict KKT, or it pins nothing"
+        );
+        let certified = exact_newton_decrement_evidence(&stiff, beta.as_ref(), None, None, 1.0);
+        let stiff_decrement_sq = certified
+            .decrement_sq
+            .expect("a positive-definite Hessian has an exact decrement");
+        assert_relative_eq!(
+            stiff_decrement_sq,
+            gradient.powi(2) / stiffness,
+            max_relative = 1.0e-12
+        );
+        assert!(
+            certified.certifies(),
+            "stiff decrement {stiff_decrement_sq:.3e} must certify against threshold {:.3e}",
+            certified.threshold
+        );
+
+        let unit = scalar_working_state(&beta, HessianCurvatureKind::Observed, gradient, 428.0);
+        let refused = exact_newton_decrement_evidence(&unit, beta.as_ref(), None, None, 1.0);
+        assert!(
+            !refused.certifies(),
+            "unit-curvature decrement {:?} must not certify against threshold {:.3e}",
+            refused.decrement_sq,
+            refused.threshold
+        );
+
+        let multiplier = 10.0_f64;
+        let face_beta = array![0.0, 1.0];
+        let face_state = WorkingState {
+            eta: LinearPredictor::new(array![0.0]),
+            gradient: array![multiplier, gradient],
+            hessian: gam_linalg::matrix::SymmetricMatrix::Dense(array![[1.0, 0.0], [0.0, stiffness]]),
+            log_likelihood: 0.0,
+            deviance: 428.0,
+            penalty_term: 0.0,
+            firth: FirthDiagnostics::Inactive,
+            ridge_used: 0.0,
+            hessian_curvature: HessianCurvatureKind::Observed,
+            gradient_natural_scale: 0.0,
+        };
+        let lower_bounds = gam_problem::LinearInequalityConstraints::from_per_coordinate_lower_bounds(
+            &array![0.0, f64::NEG_INFINITY],
+        )
+        .expect("one finite lower bound induces one constraint row");
+        let unconstrained = exact_newton_decrement_evidence(&face_state, &face_beta, None, None, 1.0);
+        assert!(
+            !unconstrained.certifies(),
+            "the multiplier dominates the unconstrained decrement {:?}",
+            unconstrained.decrement_sq
+        );
+        let on_face =
+            exact_newton_decrement_evidence(&face_state, &face_beta, Some(&lower_bounds), None, 1.0);
+        let face_decrement_sq = on_face
+            .decrement_sq
+            .expect("the reduced curvature on the binding face factorizes");
+        assert_relative_eq!(
+            face_decrement_sq,
+            gradient.powi(2) / stiffness,
+            max_relative = 1.0e-12
+        );
+        assert!(
+            on_face.certifies(),
+            "face decrement {face_decrement_sq:.3e} must certify against threshold {:.3e}",
+            on_face.threshold
+        );
+    }
+
     #[test]
     pub(crate) fn lm_gain_value_matches_working_state_objective_2316() {
         let beta = Coefficients::new(array![0.0]);
