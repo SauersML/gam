@@ -10,6 +10,8 @@ use rand_distr::{Distribution, StandardNormal};
 #[path = "reference_sensitivity.rs"]
 mod sensitivity;
 pub use sensitivity::JointReferenceSensitivity;
+#[path = "reference_rank_zero.rs"]
+mod rank_zero;
 
 /// Origin population, initially alive and free of every once-only mark.
 /// A late-origin profile is a declared entry law, not conditioning on an
@@ -562,6 +564,9 @@ impl JointReferenceBank<'_> {
         let k = self.model.spec.signatures;
         let marks = self.model.spec.marks.len();
         let nodes = self.profile.times.len();
+        if k == 0 {
+            return self.rank_zero_evolution(theta);
+        }
         let zero = theta[0].constant_like(0.0);
         let entry = self.model.entry_features(&self.profile.history(marks));
         let genes: Vec<Vec<S>> = self

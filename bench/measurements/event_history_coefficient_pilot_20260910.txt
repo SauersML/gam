@@ -1,0 +1,80 @@
+Warm build seconds: 43.253
+opt source: 8945838bcd3003c8790657a2cb63de0956ce416a; targeted native replay with warm dependencies.
+Locked offline workspace metadata passed.
+
+running 61 tests
+test joint::cohort::coefficients::strength_fit::tests::inner_log_error_bounds_correlated_score_and_curvature_changes_after_whitening ... ok
+test joint::cohort::coefficients::tests::coefficient_evidence_matches_poisson_gamma_mean_score_and_curvature ... ok
+test joint::cohort::coefficients::tests::evidence_hessian_includes_off_diagonal_posterior_score_covariance ... ok
+guided coefficient pilot: 6 iterations; beta mode -0.0000000000936227176514763, mean -0.06422957614614089 (exact -0.06380006372422597); log evidence -6.72190793694178 (exact -6.7240766112533805)
+test joint::cohort::pilot::tests::guided_coefficients_follow_the_normalized_cohort_and_preserve_posterior_means ... ok
+test joint::cohort::resolution::tests::resolution_does_not_cancel_stratum_errors_or_independently_count_shared_subject_noise ... ok
+strength optimum [-1.2545056645243213], analytic -1.252762968495368; StrengthResolutionReport { gradient_infinity_norm: 8.80724204677108e-9, log_evidence_error_estimate: 2.1731425590943918e-5, whitened_score_error_estimate: 0.01332323663529144, whitened_curvature_error_estimate: 0.016825554824628258, maximum_standardized_mean_error: 0.036730755374921854, validation_log_evidence: -4.193066398235796, validation_effective_samples: 32767.987535302116, iterations: 6 }
+test joint::cohort::coefficients::strength_fit::tests::opt_strength_solution_matches_conjugate_evidence_and_rejects_unresolved_results ... ok
+test joint::decoder_prior::tests::function_penalty_is_invariant_to_intensity_scale_and_leaves_baselines_free ... ok
+test joint::decoder_prior::tests::function_prior_hessian_retains_saturated_simplex_curvature ... ok
+test joint::decoder_prior::tests::function_prior_includes_the_chart_jacobian_and_all_derivatives ... ok
+test joint::decoder_prior::tests::function_prior_normalization_and_means_match_simplex_integration ... ok
+test joint::decoder_prior::tests::function_prior_preserves_strong_shrinkage_and_weak_strength_extremes ... ok
+test joint::emission::tests::analytic_measurement_locations_agree_with_density_derivatives ... ok
+test joint::emission::tests::analytic_measurement_tails_preserve_representable_scores ... ok
+measurement location StudentT: analytic 0.003511s, AD 0.010574s, speedup 3.012x (20000 calls, best of three)
+measurement location BinaryProbit: analytic 0.001532s, AD 0.001574s, speedup 1.027x (20000 calls, best of three)
+measurement location OrdinalProbit { categories: 4 }: analytic 0.005813s, AD 0.008434s, speedup 1.451x (20000 calls, best of three)
+measurement location NegativeBinomial: analytic 0.002910s, AD 0.014437s, speedup 4.961x (20000 calls, best of three)
+test joint::emission::tests::measurement_location_derivative_speed ... ok
+test joint::function_prior::category::tests::category_chart_retains_curvature_from_an_underflowing_gap_slope ... ok
+test joint::function_prior::category::tests::probit_category_base_measure_is_uniform_on_its_probability_simplex ... ok
+test joint::function_prior::proposal::tests::coefficient_proposals_preserve_charts_reproducibility_and_error_contracts ... ok
+test joint::function_prior::proposal::tests::normalized_coefficient_draws_follow_all_declared_function_measures ... ok
+test joint::function_prior::structural::tests::physical_priors_normalize_and_have_the_declared_finite_moments ... ok
+test joint::function_prior::structural::tests::physical_shape_priors_include_exact_normalizers_and_chart_curvature ... ok
+test joint::function_prior::structural::tests::scalar_prior_curvature_survives_saturated_softplus_and_large_cancelling_scales ... ok
+test joint::function_prior::tests::function_energies_equal_direct_integration_of_the_model_functions ... ok
+test joint::function_prior::tests::function_prior_all_coefficient_strength_and_scale_curvatures_match_the_density ... ok
+test joint::function_prior::tests::function_prior_preserves_extreme_precision_products_and_student_scale_units ... ok
+test joint::function_prior::tests::function_prior_respects_basis_changes_and_rejects_aliases_and_storage_overruns ... ok
+test joint::function_prior::tests::positive_baseline_level_prior_has_the_poisson_gamma_limit_even_without_events ... ok
+test joint::integration::score_error_tests::rare_large_scores_retain_their_sampling_error ... ok
+test joint::integration::score_error_tests::student_proposal_has_normalized_polynomial_tails_and_finite_weight_variance ... ok
+test joint::posterior::tests::structured_precision_is_the_hessian_of_the_complete_density ... ok
+test joint::precision::tests::structured_draw_map_has_the_inverse_precision_covariance ... ok
+test joint::reference::rank_zero::tests::analytic_rate_integrals_match_independent_quadrature_through_four_derivatives ... ok
+test joint::reference::rank_zero::tests::rank_zero_reference_preserves_competing_risk_survival_and_total_derivatives ... ok
+test joint::reference::tests::rare_event_probabilities_keep_their_log_sensitivities ... ok
+test joint::reference::tests::reference_moment_errors_do_not_multiply_underflow_by_overflow ... ok
+reference 27 coefficients, 128 particles/risk set, 16 intervals: analytic 0.051965s, AD batches of eight 0.065959s, 1.269x (best of three)
+test joint::reference_tests::analytic_reference_jacobians_match_all_parameter_channels_and_pooling ... ok
+test joint::reference_tests::joint_reference_carries_competing_risk_sets_and_rejects_unresolved_steps ... ok
+test joint::reference_tests::joint_reference_derivatives_include_genetics_jumps_and_event_weights ... ok
+test joint::cohort::tests::cohort_shares_reference_states_and_preserves_total_scores_and_means ... ok
+test joint::reference_tests::reference_resolution_uses_the_analytic_rank_zero_law ... ok
+test joint::reference_tests::normalized_joint_integral_uses_the_returned_reference_state_and_total_score ... ok
+test joint::resolution::functional::tests::population_deletion_matches_direct_repooling_including_sensitivities ... ok
+test joint::resolution::functional::tests::shared_reference_jackknife_scales_with_cohort_size_and_keeps_large_errors ... ok
+test joint::resolution::tests::reference_replicates_pool_risk_weighted_moments_and_measure_between_bank_error ... ok
+full path 65 coefficients: analytic 0.027480s, forward AD batches of eight 0.146483s, 5.331x (1000 calls, best of three)
+test joint::score::tests::full_path_coefficient_score_speed ... ok
+test joint::score::tests::full_path_score_includes_shapes_genetic_drive_jumps_and_reference ... ok
+test joint::score::tests::integrated_analytic_score_matches_the_fixed_importance_objective ... ok
+test joint::tests::analytic_rank_zero_scores_keep_observation_and_reference_derivatives ... ok
+test joint::tests::complete_joint_density_derivatives_match_finite_differences ... ok
+test joint::tests::event_jumps_act_after_event_intensity_and_respect_measurement_timing ... ok
+test joint::tests::genetic_drive_and_prevalence_condition_the_entry_state ... ok
+integrated location score 1.2834926152631427 vs independent 1.2680922324611585; estimated SE 0.008628658938082102
+importance: log integral -2.4603613952839725 vs -2.4574843252862903, SE 0.005340322638950357, ESS 11166.63890131144; mean 1.2588305781955533 vs 1.2680922324613615, variance 0.4835355953250511 vs 0.48704663049330477
+test joint::tests::importance_correction_matches_an_independent_measurement_integral ... ok
+test joint::tests::importance_integral_conditions_missing_genetics_under_the_full_joint_prior ... ok
+test joint::tests::measurement_families_are_normalized_and_have_stable_curvature ... ok
+test joint::tests::missing_measurements_integrate_to_one_and_missing_genetics_are_latent ... ok
+test joint::tests::positive_decoder_is_a_sum_and_stays_in_the_log_domain ... ok
+test joint::tests::sampled_objective_and_derivatives_include_the_same_reference_sensitivities ... ok
+test joint::tests::structured_gaussian_limit_integrates_missing_scores_and_large_state_paths ... ok
+test joint::tests::structured_posterior_assimilates_a_measurement_and_missing_values_do_not ... ok
+test joint::tests::structured_rank_zero_integral_has_no_spurious_latent_normalization ... ok
+test joint::tests::zero_signatures_reproduce_the_counting_process_density ... ok
+resolved positive reference: S=0.16421567530231113 target=0.16411871001119188; log M=-0.23147109468525429 static=-0.2303382672586183; ReferenceResolutionReport { replicates: 4, particles_per_risk_set: 2048, time_intervals: 192, rounds: 6, maximum_log_moment_standard_error: 0.0015634970384257063, maximum_risk_mass_standard_error: 1.900983112139617e-6, maximum_time_log_discrepancy: 0.001603125373220049, maximum_time_risk_discrepancy: 0.00012973274168726068, maximum_particle_log_discrepancy: 0.006390767236493788, maximum_particle_risk_discrepancy: 2.1715966285751342e-6, log_error_estimate: 0.034654821350325986, risk_error_estimate: 0.00016204502227705437, minimum_risk_effective_samples: 852.8814294960831 }
+test joint::reference_tests::resolved_positive_reference_matches_the_static_survival_and_selected_law ... ok
+
+test result: ok. 61 passed; 0 failed; 0 ignored; 0 measured; 50 filtered out; finished in 10.70s
+

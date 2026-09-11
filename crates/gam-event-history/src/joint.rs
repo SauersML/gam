@@ -24,11 +24,11 @@ mod reference;
 mod resolution;
 mod score;
 pub use cohort::{
-    CoefficientImportanceDraw, CohortScoreTolerance, EvidenceHessianProduct,
-    JointCoefficientEvidence, JointCoefficientIntegral, JointCohortEvaluation,
-    JointCohortIntegration, JointCohortPosterior, JointCohortResolutionReport, JointCohortScore,
-    JointPriorScore, JointStrengthOptimum, ResolvedCohortScore, StrengthOptimizationOptions,
-    StrengthResolutionReport,
+    CoefficientImportanceDraw, CoefficientPilotOptions, CohortScoreTolerance,
+    EvidenceHessianProduct, GuidedCoefficientProposal, JointCoefficientEvidence,
+    JointCoefficientIntegral, JointCohortEvaluation, JointCohortIntegration, JointCohortPosterior,
+    JointCohortResolutionReport, JointCohortScore, JointPriorScore, JointStrengthOptimum,
+    ResolvedCohortScore, StrengthOptimizationOptions, StrengthResolutionReport,
 };
 pub use decoder_prior::DecoderPriorEvaluation;
 pub use function_prior::{

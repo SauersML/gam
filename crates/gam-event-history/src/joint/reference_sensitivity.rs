@@ -294,6 +294,14 @@ impl JointReferenceBank<'_> {
         } else {
             self.evolve_for_resolution(theta, accuracy)?
         };
+        if k == 0 {
+            return Ok(JointReferenceSensitivity {
+                reference,
+                moment_jacobian: Array2::zeros((rows, width)),
+                mass_jacobian: self.rank_zero_mass_jacobian(theta)?,
+                workspace_limit: memory_limit_bytes,
+            });
+        }
         let mut population = PopulationSensitivity {
             value: Population {
                 states: vec![vec![0.0; k]; count],

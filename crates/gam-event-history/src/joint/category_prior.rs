@@ -4,7 +4,7 @@
 use super::*;
 
 pub(super) struct CategoryPriors {
-    channels: Vec<(usize, Range<usize>)>,
+    pub(super) channels: Vec<(usize, Range<usize>)>,
 }
 
 struct ChannelEvaluation {
@@ -121,33 +121,8 @@ impl CategoryEvaluation {
 }
 
 #[cfg(test)]
-pub(super) mod tests {
+mod tests {
     use super::*;
-    pub(in crate::joint::function_prior) fn oracle<S: JetField>(
-        prior: &CategoryPriors,
-        theta: &[S],
-    ) -> S {
-        let mut total = theta[0].constant_like(0.0);
-        for (intercept, gaps) in &prior.channels {
-            let cuts = gaps.len() + 1;
-            total = add_real(
-                &total,
-                (1..=cuts).map(|j| (j as f64).ln()).sum::<f64>()
-                    - 0.5 * cuts as f64 * (2.0 * std::f64::consts::PI).ln(),
-            );
-            let mut cut = theta[0].constant_like(0.0);
-            for j in 0..cuts {
-                if j > 0 {
-                    let q = &theta[gaps.start + j - 1];
-                    cut = cut.add(&emission::softplus(q));
-                    total = total.sub(&emission::softplus(&q.neg()));
-                }
-                let z = cut.sub(&theta[*intercept]);
-                total = total.sub(&z.mul(&z).scale(0.5));
-            }
-        }
-        total
-    }
 
     #[test]
     fn probit_category_base_measure_is_uniform_on_its_probability_simplex() {

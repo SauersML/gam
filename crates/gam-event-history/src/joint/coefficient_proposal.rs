@@ -186,6 +186,9 @@ impl<'m> JointFunctionPriors<'m> {
 }
 
 impl PriorCoefficientProposal<'_, '_> {
+    pub(in crate::joint) fn workspace_bytes(&self) -> usize {
+        self.workspace_bytes
+    }
     pub fn log_strengths(&self) -> &[f64] {
         &self.log_strengths
     }

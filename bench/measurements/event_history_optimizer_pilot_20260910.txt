@@ -1,0 +1,20 @@
+Development opt test build seconds: 12.522
+
+running 14 tests
+test tests::bfgs_consumer_can_remove_the_generic_relative_stall_authority ... ok
+test tests::bfgs_cost_stall_guard_does_not_disturb_normal_convergence ... ok
+test tests::bfgs_critical_reset_respects_axis_step_caps ... ok
+test tests::bfgs_local_mode_forces_strict_search_policy ... ok
+test tests::bfgs_retained_metric_preserves_the_search_and_repeated_run_state ... ok
+test tests::bfgs_initial_metric_survives_first_step_scaling ... ok
+test tests::bfgs_with_bounds_wires_finite_diff_gradient_bounds_automatically ... ok
+test tests::bfgs_with_initial_metric_diagonal_validates_shape ... ok
+test tests::bfgs_with_gradient_tolerance_converges_immediately_at_optimum ... ok
+test tests::bfgs_with_initial_metric_identity_is_default ... ok
+test tests::bfgs_with_initial_metric_scalar_validates_positive ... ok
+test tests::bfgs_with_initial_sample_serves_first_call_from_cache ... ok
+test tests::test_bfgs_trust_region_predicted_decrease_respects_active_mask ... ok
+test tests::test_bfgs_trust_region_fallback_freezes_active_bound_coordinates ... ok
+
+test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 163 filtered out; finished in 0.02s
+

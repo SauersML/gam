@@ -1,6 +1,9 @@
 //! Cohort observation integrals under shared reference strata. These are
 //! likelihood evaluations, not fitted models or evidence approximations.
 use super::*;
+#[path = "coefficient_pilot.rs"]
+mod pilot;
+pub use pilot::{CoefficientPilotOptions, GuidedCoefficientProposal};
 
 #[path = "cohort_resolution.rs"]
 mod resolution;

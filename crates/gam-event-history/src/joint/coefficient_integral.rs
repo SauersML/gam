@@ -96,9 +96,12 @@ fn moments(weights: &[f64], values: impl Iterator<Item = f64> + Clone) -> (f64, 
         .iter()
         .enumerate()
         .max_by(|a, b| a.1.total_cmp(b.1))
-        .unwrap()
+        .expect("coefficient moment weights are nonempty")
         .0;
-    let pivot = values.clone().nth(pivot_index).unwrap();
+    let pivot = values
+        .clone()
+        .nth(pivot_index)
+        .expect("coefficient moment values match the weights");
     let mean = pivot
         + sum(weights
             .iter()

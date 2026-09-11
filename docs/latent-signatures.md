@@ -355,6 +355,32 @@ still need explicit handling in the eventual strength optimizer.
 
 ### Fixed-bank coefficient evidence
 
+`JointCohortIntegration::guided_coefficient_proposal` first optimizes the
+normalized cohort log likelihood plus the declared function log priors at
+fixed strengths, using the total analytic score through `opt::Bfgs`. Subject
+draws and reference banks remain fixed throughout that search. A recomputed
+final gradient must meet the requested stationarity tolerance; a stalled or
+failed solve does not return a proposal.
+
+The proposal is an equal mixture of the normalized prior proposal and a
+Gaussian centered at that stationary point. Its covariance is the BFGS
+inverse search metric retained by `opt::Bfgs::run_with_metric`, checked by
+Cholesky factorization. This matrix is an approximation used for sampling;
+it is not claimed to be the observed Hessian, exact evidence curvature, or
+posterior covariance. The mixture density includes both components regardless
+of which component generated a draw. Allocation budgets include the dense
+optimizer matrices, prior proposal workspace, and retained draws. Numerical
+draw failures are reported rather than silently resampled.
+
+Fresh coefficient draws from the completed proposal enter the resolved
+coefficient integral below. Fitting a proposal does not learn its strengths
+or establish posterior coverage, tail integrability, reference accuracy, or
+global optimality. Inference still averages final functions using the
+coefficient evidence weights. The Poisson–Gamma regression checks that the
+returned coefficient mean differs from the proposal mode and agrees with
+the analytic posterior mean, and checks the full mixture density and evidence
+against independent formulas.
+
 `JointCohortIntegration::coefficient_integral` evaluates the cohort at supplied
 independent draws from a normalized coefficient proposal. Every draw first
 passes the whole-cohort reference/value/score resolution assessment. Its
@@ -425,11 +451,12 @@ moments, normalized prior-score identities, category probabilities, the
 conditional Cauchy transform, reproducibility and chart/error behavior.
 
 This is a starting or defensive proposal, not a claim that prior sampling
-adequately covers a concentrated posterior. Posterior adaptation and
-independent refinement are still required. In particular, the current frozen
-Gaussian latent-path mixture may reject coefficient draws outside its
-finite-variance region; that restriction must be resolved before broad
-automatic coefficient integration can serve as the fitting driver.
+adequately covers a concentrated posterior. The guided proposal adds a
+data-informed component; independent refinement is still required. The latent
+path proposal uses a Student/Gaussian mixture to retain finite variance as
+coefficients move, but can still fail its finite-sample accuracy checks.
+An automatic fitting driver must resolve those errors and coefficient
+coverage rather than treating proposal construction as finished inference.
 
 ### Assessed interior strength optimization
 
@@ -599,8 +626,8 @@ driver and structure-learning implementation remain unfinished.
 The implemented importance bank draws from an equal mixture of the structured
 Laplace Gaussian and a multivariate Student t with three degrees of freedom,
 centered at the conditional path-prior mean with the same covariance. The
-complete Gaussian joint law remains in the importance numerator. Three is the
-smallest integer degree of freedom with a finite covariance, allowing that
+complete joint law, including its Gaussian path prior, remains in the importance
+numerator. Three is the smallest integer degree of freedom with a finite covariance, allowing that
 covariance match while providing polynomial tails. The Student displacement
 is a structured Gaussian draw divided by the square root of a chi-squared
 draw with three degrees of freedom. Both mixture densities are normalized.
@@ -637,6 +664,25 @@ errors, zero samples, and absent effective-sample/weight diagnostics. The
 The rank-zero route retains all observation and reference derivatives; the
 fully unobserved route has zero coefficient score. Small rates or loadings
 at a particular coefficient value do not trigger this structural shortcut.
+
+The rank-zero reference population also has an analytic route. For a profile
+interval with linear log baseline, its integrated hazard is
+`dt * exp(eta_left) * exprel(eta_right - eta_left)`, evaluated in a scaled
+log form. Log risk mass is minus the cumulative terminal hazard, with the
+mark's own cumulative hazard added for a once-only mark. Log normalizers and
+their coefficient derivatives are zero. Values at the stored endpoints and
+midpoints, and their total derivatives, therefore do not require event-step
+refinement or a hazard cap. Interpolation between stored points retains its
+separate resolution requirement. Positive-rank references still use the
+controlled numerical evolution.
+
+The relative-exponential derivative tower uses moments of a tilted uniform
+law, with a positive series near zero and a contracting recurrence away from
+zero. Normalized moments avoid underflow in ratios. Tests compare through
+fourth derivatives with independent quadrature and check competing-risk masses
+and first derivatives across time refinements. This analytic route also lets
+coefficient pilots cross rate values that the former finite-event reference
+step incorrectly made numerically inaccessible at rank zero.
 
 Sampling uses the block precision factors directly: a genetic Schur draw and
 backward conditional state draws. It does not form a dense trajectory covariance

@@ -232,9 +232,30 @@ fn joint_reference_carries_competing_risk_sets_and_rejects_unresolved_steps() {
     coarse.times = vec![0.0, 1.0];
     coarse.baseline_design = Array2::ones((2, 1));
     coarse.drive_design = Array2::ones((1, 1));
+    let exact = model
+        .reference_bank(&theta, &coarse, &options, &accuracy, &mut rng)
+        .unwrap()
+        .evolve(&theta, &accuracy)
+        .unwrap();
+    for (actual, expected) in exact.log_risk_mass()[6..].iter().zip(final_mass) {
+        assert!((actual - expected).abs() < 1e-12);
+    }
+    // A positive-rank population still needs resolved event steps.
+    let latent = JointLikelihood::new(specification(1, model.spec.marks.clone(), 0)).unwrap();
+    let mut latent_theta = vec![0.0; latent.layout.width];
+    latent_theta[latent.layout.baseline.clone()].copy_from_slice(&theta);
     assert!(
-        model
-            .reference_bank(&theta, &coarse, &options, &accuracy, &mut rng)
+        latent
+            .reference_bank(
+                &latent_theta,
+                &coarse,
+                &ReferenceOptions {
+                    particles: 64,
+                    ..options
+                },
+                &accuracy,
+                &mut rng
+            )
             .err()
             .unwrap()
             .to_string()
@@ -404,7 +425,7 @@ fn normalized_joint_integral_uses_the_returned_reference_state_and_total_score()
 }
 
 #[test]
-fn reference_resolution_refines_large_steps_and_preserves_the_rank_zero_law() {
+fn reference_resolution_uses_the_analytic_rank_zero_law() {
     let model = JointLikelihood::new(specification(
         0,
         vec![MarkKind::Once, MarkKind::Terminal, MarkKind::Recurrent],
@@ -426,8 +447,7 @@ fn reference_resolution_refines_large_steps_and_preserves_the_rank_zero_law() {
     let (resolved, out) = model
         .resolve_reference(&theta, &p, &options, &mut rng)
         .unwrap();
-    assert!(out.report().rounds > 1);
-    assert!(out.report().time_intervals >= 8);
+    assert_eq!(out.report().rounds, 1);
     assert!(out.report().log_error_estimate < 1e-10);
     assert!(out.report().risk_error_estimate < 1e-10);
     let last = out.reference().log_risk_mass().len() - 3;
@@ -440,16 +460,16 @@ fn reference_resolution_refines_large_steps_and_preserves_the_rank_zero_law() {
     );
     let mut too_fast = theta.clone();
     too_fast[0] = 3.0;
-    assert!(resolved.evolve(&too_fast).is_err());
+    let high = resolved.evolve(&too_fast).unwrap();
+    let last = high.reference().log_risk_mass().len() - 3;
+    assert!((high.reference().log_risk_mass()[last] + 3.0_f64.exp() + 0.1).abs() < 1e-12);
     let short = ReferenceResolutionOptions {
         maximum_rounds: 1,
         ..options.clone()
     };
-    assert!(
-        model
-            .resolve_reference(&theta, &p, &short, &mut rng)
-            .is_err()
-    );
+    model
+        .resolve_reference(&theta, &p, &short, &mut rng)
+        .unwrap();
     let tiny = ReferenceResolutionOptions {
         memory_limit_bytes: 1,
         ..options
