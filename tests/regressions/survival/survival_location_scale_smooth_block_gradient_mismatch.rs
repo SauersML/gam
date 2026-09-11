@@ -85,6 +85,7 @@ fn assert_finite_non_degenerate_coefficients(label: &str, fit: &FitResult) {
 
 fn fit_result_kind(fit: &FitResult) -> &'static str {
     match fit {
+        FitResult::Ctn(_) => "Ctn",
         FitResult::Standard(_) => "Standard",
         FitResult::GaussianLocationScale(_) => "GaussianLocationScale",
         FitResult::BinomialLocationScale(_) => "BinomialLocationScale",
