@@ -671,7 +671,7 @@ pub fn fit_transformation_normal(
             // cannot survive the driver's rotation back to full data.
             let eval_options =
                 crate::outer_subsample::exact_outer_options_for_row_set(&options, row_set);
-            let selection = evaluate_custom_family_joint_hyper_best_mode_shared(
+            let carried = evaluate_custom_family_joint_hyper_best_mode_shared(
                 &geometry.family,
                 &geometry.blocks,
                 &eval_options,
@@ -679,7 +679,41 @@ pub fn fit_transformation_normal(
                 Arc::clone(&geometry.hyper_layout),
                 &warm_starts,
                 eval_mode,
-            )
+            );
+            // The carried anchor is the accepted iterate's mode, certified on
+            // THAT iterate's covariate design. A trial whose log κ has moved far
+            // enough rebuilds the Duchon design, and the same coefficients can
+            // then give h' ≤ 0 on some rows (direct-alpha SCOP: h' = Σ M_k(y)·α_k(x)
+            // with α_k = X_cov·β_k), so the anchor is infeasible at this θ before
+            // any inner step is taken. Refusing the trial there refuses a point
+            // whose inner problem has a feasible optimum: on the large-scale
+            // smoke cohort every later seed and both saddle-escape reseeds died
+            // this way (`h' has non-positive values`, min −4.05) and the fit
+            // failed. The family's own construction has constant positive shape
+            // rows, so it is monotone on every design; the profile at this θ
+            // starts from it instead. Only the anchored case re-profiles: a
+            // refused cold profile is final, and wherever the anchor is feasible
+            // it stays the only start (#2765).
+            let selection = match carried {
+                Err(error)
+                    if error.is_trial_point_infeasible()
+                        && warm_starts.iter().any(Option::is_some) =>
+                {
+                    log::info!(
+                        "[transformation-normal] carried coefficient mode is infeasible at this trial point; re-profiling from the family's monotone construction: {error}"
+                    );
+                    evaluate_custom_family_joint_hyper_best_mode_shared(
+                        &geometry.family,
+                        &geometry.blocks,
+                        &eval_options,
+                        &rho,
+                        Arc::clone(&geometry.hyper_layout),
+                        &[None],
+                        eval_mode,
+                    )
+                }
+                other => other,
+            }
             .map_err(|e| format!("transformation exact joint mode profile: {e}"))?;
             for (candidate_idx, rejection) in selection.rejected_candidates.iter().enumerate() {
                 if let Some(rejection) = rejection {
