@@ -102,6 +102,22 @@ runs:
               try(install.packages(p, type = "source",
                                    repos = "https://cloud.r-project.org"), silent=TRUE)
           }
+          # tram >= 1.4-2 declares Depends: R (>= 4.5.0) while setup-bench-r
+          # provisions R 4.4.3, so neither pass above can install it (the run
+          # log reads "tram version 1.4-5 is in the repositories but depends on
+          # R (>= 4.5.0)") and the tram comparison is never measured. tram 1.4-1
+          # is the newest release that declares R (>= 3.5.0): build it from the
+          # CRAN archive, after its CRAN dependencies, whenever the runner R
+          # predates 4.5.0.
+          if (!requireNamespace("tram", quietly=TRUE) && getRversion() < "4.5.0") {
+            tram_deps <- c("mvtnorm","Formula","multcomp","variables","basefun",
+                           "sandwich","mlt")
+            tram_missing <- tram_deps[!vapply(tram_deps, requireNamespace, logical(1), quietly=TRUE)]
+            if (length(tram_missing)) try(install.packages(tram_missing), silent=TRUE)
+            try(install.packages(
+                  "https://cloud.r-project.org/src/contrib/Archive/tram/tram_1.4-1.tar.gz",
+                  repos = NULL, type = "source"), silent=TRUE)
+          }
           # These are required by the always-on stack verification below. Do
           # not let a swallowed install error defer the failure until the
           # load-check step, where the real CRAN/source-build error is gone.
