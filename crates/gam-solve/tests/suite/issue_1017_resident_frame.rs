@@ -165,7 +165,10 @@ fn nonlinear_prepare_keeps_frame_identity_and_refreshes_current_content_1017() {
         calls: Arc::new(Mutex::new(Vec::new())),
         refreshes: Arc::clone(&refreshes),
     });
-    let options = ArrowSolveOptions::direct();
+    // Only the InexactPCG mode carries a resident SAE frame
+    // (`prepare_sae_resident_frame` returns no frame for any other mode), so
+    // the refresh contract is exercised under the mode that owns it.
+    let options = ArrowSolveOptions::inexact_pcg();
 
     let prepared = prepare_sae_resident_frame(&sys, &options, Some(Arc::clone(&frame)))
         .expect("compatible frame refresh must not fail")
