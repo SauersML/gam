@@ -1260,3 +1260,362 @@ pub(crate) fn execute_independent_logistic_row_program<S: SaeOrder2RowProgramSou
     out
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    impl SaeOrder2RowProgramSource for SaeReconstructionRowProgram {
+        fn n_atoms(&self) -> usize {
+            self.atoms.len()
+        }
+
+        fn out_dim(&self) -> usize {
+            self.out_dim()
+        }
+
+        fn n_primaries(&self) -> usize {
+            self.n_primaries
+        }
+
+        fn primary(&self, slot: usize) -> SaeRowPrimary {
+            for (atom, &candidate) in self.logit_slot.iter().enumerate() {
+                if candidate == Some(slot) {
+                    return SaeRowPrimary::Logit { atom };
+                }
+            }
+            for (atom, slots) in self.coord_slot.iter().enumerate() {
+                for (axis, &candidate) in slots.iter().enumerate() {
+                    if candidate == slot {
+                        return SaeRowPrimary::Coord { atom, axis };
+                    }
+                }
+            }
+            panic!("row-program primary slot {slot} is not mapped");
+        }
+
+        fn gate_value(&self, atom: usize) -> f64 {
+            self.gate_value[atom]
+        }
+
+        fn atom_is_active(&self, atom: usize) -> bool {
+            self.fixed_gate_value.get(atom).copied().flatten() != Some(0.0)
+        }
+
+        fn fill_decoded(&self, atom: usize, out: &mut [f64]) {
+            out.fill(0.0);
+            for basis in 0..self.atoms[atom].n_basis() {
+                let phi = self.atoms[atom].phi[basis];
+                for (c, value) in out.iter_mut().enumerate() {
+                    *value += phi * self.atoms[atom].decoder[basis][c];
+                }
+            }
+        }
+
+        fn fill_decoded_first(&self, atom: usize, axis: usize, out: &mut [f64]) {
+            out.fill(0.0);
+            for basis in 0..self.atoms[atom].n_basis() {
+                let d_phi = self.atoms[atom].d_phi[basis][axis];
+                for (c, value) in out.iter_mut().enumerate() {
+                    *value += d_phi * self.atoms[atom].decoder[basis][c];
+                }
+            }
+        }
+
+        fn fill_decoded_second(&self, atom: usize, axis_a: usize, axis_b: usize, out: &mut [f64]) {
+            out.fill(0.0);
+            for basis in 0..self.atoms[atom].n_basis() {
+                let d2_phi = self.atoms[atom].d2_phi[basis][axis_a][axis_b];
+                for (c, value) in out.iter_mut().enumerate() {
+                    *value += d2_phi * self.atoms[atom].decoder[basis][c];
+                }
+            }
+        }
+
+        fn n_beta_borders(&self) -> usize {
+            0
+        }
+
+        // `n_beta_borders()` is 0 for the owned oracle, so every border index is
+        // out of range by construction. Report the index that was asked for:
+        // the whole point of a failure here is to name the caller that invented
+        // a border this source does not have.
+        fn beta_border_atom(&self, border: usize) -> usize {
+            panic!(
+                "owned row-program oracle has no beta borders, but border {border} was requested"
+            )
+        }
+
+        fn beta_border_basis_value(&self, border: usize) -> f64 {
+            panic!(
+                "owned row-program oracle has no beta borders, but border {border} was requested"
+            )
+        }
+
+        fn beta_border_basis_first(&self, border: usize, axis: usize) -> f64 {
+            panic!(
+                "owned row-program oracle has no beta borders, but border {border} axis {axis} \
+                 was requested"
+            )
+        }
+
+        fn beta_border_output(&self, border: usize) -> &[f64] {
+            panic!(
+                "owned row-program oracle has no beta borders, but border {border} was requested"
+            )
+        }
+    }
+
+    /// Conditioning-aware beta-border derivative oracle.  The compiled gate
+    /// channel is checked against both double-double softmax arithmetic and an
+    /// independent five-point derivative of `z_k(ℓ) Phi` evaluated entirely in
+    /// double-double precision.  The sweep spans balanced and saturated tails and
+    /// twelve orders of border scale, so a tiny derivative is judged against the
+    /// operation's conditioning rather than an impossible relative-only floor.
+    #[test]
+    fn softmax_beta_border_gate_derivative_matches_quad_and_fd_across_tails_932() {
+        // Parametrized softmax fixture with `n_atoms` softmax atoms, each carrying a
+        // free logit primary and `latent_dim` free coord primaries, so
+        // `n_primaries = n_atoms·(1 + latent_dim)`. Layout: logit slots
+        // `0..n_atoms`, then atom `k`'s coord axis `j` at `n_atoms + k·latent_dim +
+        // j`. This oracle instantiates it with four atoms and one latent axis.
+        fn softmax_fixture_k(
+            n_atoms: usize,
+            latent_dim: usize,
+            n_basis: usize,
+            out_dim: usize,
+            inv_tau: f64,
+        ) -> SaeReconstructionRowProgram {
+            let mk_atom = |seed: f64| {
+                let phi: Vec<f64> = (0..n_basis)
+                    .map(|b| 0.3 + 0.2 * (b as f64 + seed))
+                    .collect();
+                let d_phi: Vec<Vec<f64>> = (0..n_basis)
+                    .map(|b| {
+                        (0..latent_dim)
+                            .map(|axis| 0.1 * (b as f64 + 1.0) - 0.05 * axis as f64 + 0.03 * seed)
+                            .collect()
+                    })
+                    .collect();
+                let d2_phi: Vec<Vec<Vec<f64>>> = (0..n_basis)
+                    .map(|b| {
+                        (0..latent_dim)
+                            .map(|a| {
+                                (0..latent_dim)
+                                    .map(|bb| {
+                                        0.02 * (b as f64 + 1.0)
+                                            + 0.01 * (a as f64)
+                                            + 0.01 * (bb as f64)
+                                            + 0.004 * seed
+                                    })
+                                    .collect()
+                            })
+                            .collect()
+                    })
+                    .collect();
+                let decoder: Vec<Vec<f64>> = (0..n_basis)
+                    .map(|b| {
+                        (0..out_dim)
+                            .map(|c| 0.5 - 0.1 * (b as f64) + 0.07 * (c as f64) + 0.02 * seed)
+                            .collect()
+                    })
+                    .collect();
+                AtomRowBasisJet {
+                    phi,
+                    d_phi,
+                    d2_phi,
+                    decoder,
+                    latent_dim,
+                }
+            };
+            let logits: Vec<f64> = (0..n_atoms)
+                .map(|k| 0.4 - 0.13 * k as f64 + 0.05 * (k as f64).sin())
+                .collect();
+            let e: Vec<f64> = logits.iter().map(|&l| (l * inv_tau).exp()).collect();
+            let s: f64 = e.iter().sum();
+            let gate_value: Vec<f64> = e.iter().map(|&v| v / s).collect();
+            let atoms: Vec<AtomRowBasisJet> = (0..n_atoms).map(|k| mk_atom(k as f64)).collect();
+            let logit_slot: Vec<Option<usize>> = (0..n_atoms).map(Some).collect();
+            let coord_slot: Vec<Vec<usize>> = (0..n_atoms)
+                .map(|k| {
+                    (0..latent_dim)
+                        .map(|j| n_atoms + k * latent_dim + j)
+                        .collect()
+                })
+                .collect();
+            SaeReconstructionRowProgram {
+                atoms,
+                gate_value,
+                logits,
+                gate_shift: vec![0.0; n_atoms],
+                gate: RowGate::Softmax { inv_tau },
+                logit_slot,
+                coord_slot,
+                fixed_gate_value: Vec::new(),
+                n_primaries: n_atoms * (1 + latent_dim),
+            }
+        }
+
+        use qd::Quad;
+
+        fn q(value: f64) -> Quad {
+            Quad::from_f64(value)
+        }
+
+        fn q_to_f64(value: Quad) -> f64 {
+            value.0 + value.1
+        }
+
+        fn quad_border_value(
+            logits: &[f64],
+            inv_tau: f64,
+            gated_atom: usize,
+            logit_atom: usize,
+            displacement: f64,
+            phi: f64,
+        ) -> Quad {
+            let shifted_max = logits
+                .iter()
+                .enumerate()
+                .map(|(atom, &value)| {
+                    (value
+                        + if atom == logit_atom {
+                            displacement
+                        } else {
+                            0.0
+                        })
+                        * inv_tau
+                })
+                .fold(f64::NEG_INFINITY, f64::max);
+            let exps: Vec<Quad> = logits
+                .iter()
+                .enumerate()
+                .map(|(atom, &value)| {
+                    let displaced = q(value)
+                        + q(if atom == logit_atom {
+                            displacement
+                        } else {
+                            0.0
+                        });
+                    (displaced * q(inv_tau) - q(shifted_max)).exp()
+                })
+                .collect();
+            let denominator = exps
+                .iter()
+                .copied()
+                .fold(Quad::ZERO, |sum, value| sum + value);
+            exps[gated_atom] / denominator * q(phi)
+        }
+
+        let cases = [
+            vec![0.4, -0.7, 0.1, -0.2],
+            vec![35.0, 2.0, -18.0, -40.0],
+            vec![-35.0, -2.0, 18.0, 40.0],
+            vec![8.0, 8.0 - 1.0e-10, -8.0, -24.0],
+        ];
+        let mut comparisons = 0usize;
+        let mut max_conditioned_error = 0.0_f64;
+        let mut max_fd_conditioned_error = 0.0_f64;
+        for logits in cases {
+            for inv_tau in [0.25_f64, 1.3, 4.0] {
+                let mut program = softmax_fixture_k(4, 1, 2, 1, inv_tau);
+                program.logits.clone_from(&logits);
+                let shift = logits.iter().copied().fold(f64::NEG_INFINITY, f64::max) * inv_tau;
+                let exps: Vec<f64> = logits
+                    .iter()
+                    .map(|&value| (value * inv_tau - shift).exp())
+                    .collect();
+                let denominator: f64 = exps.iter().sum();
+                program.gate_value = exps.iter().map(|&value| value / denominator).collect();
+                let moment = SoftmaxMoment {
+                    source: &program,
+                    inv_tau,
+                };
+                for gated_atom in 0..4 {
+                    for logit_atom in 0..4 {
+                        for phi in [1.0e-12_f64, 1.0, 1.0e12] {
+                            let got = moment.gate_first(gated_atom, logit_atom) * phi;
+                            let z_k = quad_border_value(
+                                &logits, inv_tau, gated_atom, logit_atom, 0.0, 1.0,
+                            );
+                            let z_j = quad_border_value(
+                                &logits, inv_tau, logit_atom, logit_atom, 0.0, 1.0,
+                            );
+                            let diagonal: f64 = if gated_atom == logit_atom { 1.0 } else { 0.0 };
+                            let exact = z_k * (q(diagonal) - z_j) * q(inv_tau) * q(phi);
+                            let exact_f64 = q_to_f64(exact);
+                            let condition = q_to_f64(
+                                z_k * (q(diagonal.abs()) + z_j) * q(inv_tau.abs()) * q(phi.abs()),
+                            )
+                            .abs();
+                            let error = (got - exact_f64).abs();
+                            let allowance = 64.0 * f64::EPSILON * condition + 1.0e-300;
+                            max_conditioned_error = max_conditioned_error.max(error / allowance);
+                            assert!(
+                                error <= allowance,
+                                "gate derivative tail/scale error {error:e} > {allowance:e}; \
+                                 gated={gated_atom} logit={logit_atom} r={inv_tau} phi={phi:e}"
+                            );
+
+                            let h = 1.0e-4_f64;
+                            let fm2 = quad_border_value(
+                                &logits,
+                                inv_tau,
+                                gated_atom,
+                                logit_atom,
+                                -2.0 * h,
+                                phi,
+                            );
+                            let fm1 = quad_border_value(
+                                &logits, inv_tau, gated_atom, logit_atom, -h, phi,
+                            );
+                            let fp1 =
+                                quad_border_value(&logits, inv_tau, gated_atom, logit_atom, h, phi);
+                            let fp2 = quad_border_value(
+                                &logits,
+                                inv_tau,
+                                gated_atom,
+                                logit_atom,
+                                2.0 * h,
+                                phi,
+                            );
+                            let fd = (fm2 - q(8.0) * fm1 + q(8.0) * fp1 - fp2) / q(12.0 * h);
+                            let fd_error = (q_to_f64(fd) - exact_f64).abs();
+                            // A five-point stencil subtracts four nearby function
+                            // values. In a saturated softmax tail the derivative
+                            // can be tiny while every value is O(phi), so the
+                            // truncation bound alone does not cover Quad rounding
+                            // amplified by 1/h. Bound that cancellation by the
+                            // stencil's absolute condition number and Quad's own
+                            // machine epsilon; this remains scale-aware instead of
+                            // introducing an arbitrary absolute floor.
+                            let stencil_condition = (q_to_f64(fm2).abs()
+                                + 8.0 * q_to_f64(fm1).abs()
+                                + 8.0 * q_to_f64(fp1).abs()
+                                + q_to_f64(fp2).abs())
+                                / (12.0 * h);
+                            let fd_roundoff_allowance = 64.0 * Quad::EPSILON.0 * stencil_condition;
+                            let fd_allowance =
+                                2.0e-12 * condition + fd_roundoff_allowance + 1.0e-300;
+                            max_fd_conditioned_error =
+                                max_fd_conditioned_error.max(fd_error / fd_allowance);
+                            assert!(
+                                fd_error <= fd_allowance,
+                                "quad five-point derivative error {fd_error:e} > {fd_allowance:e}; \
+                                 truncation_condition={condition:e} \
+                                 stencil_condition={stencil_condition:e} \
+                                 gated={gated_atom} logit={logit_atom} r={inv_tau} phi={phi:e}"
+                            );
+                            comparisons += 1;
+                        }
+                    }
+                }
+            }
+        }
+        eprintln!(
+            "[SAE-SOFTMAX-ACCURACY-932] comparisons={comparisons} \
+             max_f64_condition_fraction={max_conditioned_error:.3e} \
+             max_quad_fd_condition_fraction={max_fd_conditioned_error:.3e}"
+        );
+        assert_eq!(comparisons, 576);
+    }
+}
