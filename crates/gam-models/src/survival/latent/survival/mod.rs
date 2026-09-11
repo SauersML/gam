@@ -278,6 +278,11 @@ pub struct LatentSurvivalTermSpec {
     pub unloaded_hazard_exit: Array1<f64>,
     pub meanspec: TermCollectionSpec,
     pub mean_offset: Array1<f64>,
+    /// Log smoothing strengths the mean block's outer search starts from when
+    /// the caller carries them from an earlier fit of the same term (the latent
+    /// workflow's baseline-θ probes). `None`, or a length that does not match
+    /// the mean design's penalties, starts at zero.
+    pub initial_mean_log_lambdas: Option<Array1<f64>>,
 }
 
 pub struct LatentSurvivalTermFitResult {
@@ -675,7 +680,11 @@ pub fn fit_latent_survival_terms(
 
     let mut blocks = vec![
         build_time_blockspec(&time_prepared, &spec.time_block),
-        build_mean_blockspec(&mean_design, mean_offset),
+        build_mean_blockspec(
+            &mean_design,
+            mean_offset,
+            spec.initial_mean_log_lambdas.as_ref(),
+        ),
     ];
     if let Some(initial_sigma) = learned_initial_sigma {
         blocks.push(build_log_sigma_blockspec(
@@ -844,7 +853,7 @@ pub fn fit_latent_binary_terms(
 
     let blocks = vec![
         build_time_blockspec(&time_prepared, &spec.time_block),
-        build_mean_blockspec(&mean_design, mean_offset),
+        build_mean_blockspec(&mean_design, mean_offset, None),
     ];
     let fit = fit_custom_family(&family, &blocks, options).map_err(|e| e.to_string())?;
     let baseline_offset_residuals = family.offset_channel_residuals(&fit.block_states)?;
@@ -1144,14 +1153,30 @@ fn build_time_blockspec(
     }
 }
 
-fn build_mean_blockspec(design: &TermCollectionDesign, offset: Array1<f64>) -> ParameterBlockSpec {
+/// The mean block's starting log smoothing strengths: a carried vector when it
+/// belongs to this penalty set (same length), zero otherwise.
+fn mean_block_seed_log_lambdas(n_penalties: usize, carried: Option<&Array1<f64>>) -> Array1<f64> {
+    carried
+        .filter(|carried| carried.len() == n_penalties)
+        .cloned()
+        .unwrap_or_else(|| Array1::zeros(n_penalties))
+}
+
+fn build_mean_blockspec(
+    design: &TermCollectionDesign,
+    offset: Array1<f64>,
+    initial_log_lambdas: Option<&Array1<f64>>,
+) -> ParameterBlockSpec {
     ParameterBlockSpec {
         name: "mean".to_string(),
         design: design.design.clone(),
         offset,
         penalties: design.penalties_as_penalty_matrix(),
         nullspace_dims: design.nullspace_dims.clone(),
-        initial_log_lambdas: Array1::zeros(design.penalties.len()),
+        initial_log_lambdas: mean_block_seed_log_lambdas(
+            design.penalties.len(),
+            initial_log_lambdas,
+        ),
         initial_beta: None,
         // Strictly below `time_transform` (200) so any constant direction
         // shared between the monotone time baseline and the mean intercept is

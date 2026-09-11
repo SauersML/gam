@@ -1221,6 +1221,7 @@ pub(crate) fn run_survival(args: SurvivalArgs) -> Result<(), String> {
                     unloaded_hazard_exit: prepared.unloaded_hazard_exit.clone(),
                     meanspec: termspec.clone(),
                     mean_offset: threshold_offset.clone(),
+                    initial_mean_log_lambdas: None,
                 },
                 frailty: frailty.clone(),
                 options: options.clone(),

@@ -953,6 +953,14 @@ pub(crate) fn materialize_survival<'a>(
         })
     };
 
+    // Warm-start cache for the latent baseline-θ probes (gam#2714): every probe
+    // runs a complete nested custom-family REML fit over the mean and time
+    // smoothing strengths. Carrying the previous probe's converged strengths into
+    // the next request starts that search next to the optimum a small θ step
+    // barely moves, instead of at zero, exactly as the location-scale branch
+    // above does with `location_scale_smoothing_warm_start`.
+    let latent_smoothing_warm_start: RefCell<Option<(Option<Array1<f64>>, Option<Array1<f64>>)>> =
+        RefCell::new(None);
     let build_latent_survival_request =
         |candidate: &crate::survival::construction::SurvivalBaselineConfig| {
             let loading = latent_loading.ok_or_else(|| {
@@ -1025,13 +1033,27 @@ pub(crate) fn materialize_survival<'a>(
                     )
                 };
             let time_p = prepared.time_design_exit.ncols();
+            // A baseline-θ probe after the first starts both smoothing searches
+            // from the previous probe's converged strengths; a carried vector
+            // for a different penalty set is not a seed for this one.
+            let (carried_mean_log_lambdas, carried_time_log_lambdas) = latent_smoothing_warm_start
+                .borrow()
+                .as_ref()
+                .map(|(mean, time)| (mean.clone(), time.clone()))
+                .unwrap_or((None, None));
             let time_initial_log_lambdas = if prepared.time_penalties.is_empty() {
                 None
             } else {
-                Some(Array1::from_elem(
-                    prepared.time_penalties.len(),
-                    config.time_smooth_lambda.ln(),
-                ))
+                Some(
+                    carried_time_log_lambdas
+                        .filter(|carried| carried.len() == prepared.time_penalties.len())
+                        .unwrap_or_else(|| {
+                            Array1::from_elem(
+                                prepared.time_penalties.len(),
+                                config.time_smooth_lambda.ln(),
+                            )
+                        }),
+                )
             };
             let time_block = TimeBlockInput {
                 design_entry: prepared.time_design_entry.clone(),
@@ -1064,6 +1086,7 @@ pub(crate) fn materialize_survival<'a>(
                     unloaded_hazard_exit: prepared.unloaded_hazard_exit,
                     meanspec: termspec.clone(),
                     mean_offset: threshold_offset.clone(),
+                    initial_mean_log_lambdas: carried_mean_log_lambdas,
                 },
                 frailty: config.frailty.clone(),
                 options: BlockwiseFitOptions {
@@ -1262,11 +1285,28 @@ pub(crate) fn materialize_survival<'a>(
                     SurvivalLikelihoodMode::Latent => {
                         let request = build_latent_survival_request(candidate)?;
                         match fit_model(FitRequest::LatentSurvival(request)) {
-                            Ok(FitResult::LatentSurvival(result)) => (
-                                result.fit.log_likelihood,
-                                result.fit.stable_penalty_term,
-                                result.baseline_offset_residuals,
-                            ),
+                            Ok(FitResult::LatentSurvival(result)) => {
+                                // The next probe's nested fit starts from this
+                                // probe's converged strengths.
+                                let carried_log_lambdas = |role: gam_problem::BlockRole| {
+                                    result
+                                        .fit
+                                        .block_by_role(role)
+                                        .map(|block| block.lambdas.mapv(f64::ln))
+                                        .filter(|log_lambdas| {
+                                            log_lambdas.iter().all(|value| value.is_finite())
+                                        })
+                                };
+                                *latent_smoothing_warm_start.borrow_mut() = Some((
+                                    carried_log_lambdas(gam_problem::BlockRole::Mean),
+                                    carried_log_lambdas(gam_problem::BlockRole::Time),
+                                ));
+                                (
+                                    result.fit.log_likelihood,
+                                    result.fit.stable_penalty_term,
+                                    result.baseline_offset_residuals,
+                                )
+                            }
                             Ok(_) => {
                                 return Err("internal latent survival workflow returned the wrong result variant".to_string());
                             }

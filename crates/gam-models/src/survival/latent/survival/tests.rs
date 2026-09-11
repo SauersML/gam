@@ -918,7 +918,31 @@
             unloaded_hazard_exit: Array1::from_elem(n, 0.02),
             meanspec: empty_meanspec(),
             mean_offset: Array1::zeros(n),
+            initial_mean_log_lambdas: None,
         }
+    }
+
+    /// gam#2714: the latent workflow's baseline-θ probes carry the previous
+    /// probe's converged mean strengths into the next nested fit; a vector for
+    /// a different penalty set must not become a seed.
+    #[test]
+    fn mean_block_seed_takes_a_carried_strength_only_for_its_own_penalty_set_2714() {
+        let carried = array![1.5, -2.0];
+        assert_eq!(
+            mean_block_seed_log_lambdas(2, Some(&carried)),
+            carried,
+            "a carried strength of the right length is the seed"
+        );
+        assert_eq!(
+            mean_block_seed_log_lambdas(3, Some(&carried)),
+            Array1::<f64>::zeros(3),
+            "a carried strength for another penalty set starts at zero"
+        );
+        assert_eq!(
+            mean_block_seed_log_lambdas(2, None),
+            Array1::<f64>::zeros(2),
+            "no carried strength starts at zero"
+        );
     }
 
     /// A valid latent-binary term spec mirroring `valid_survival_spec` but
