@@ -157,34 +157,35 @@ fn diagnose_alo_keeps_survival_event_column() {
     );
     assert!(model_path.is_file(), "gam fit did not write {model_path:?}");
 
+    // ALO is the only diagnostic `gam diagnose` computes; the former `--alo`
+    // flag was a no-op and was removed (c4214ce08), so it must not be passed.
     let out = Command::new(gam::gam_binary!())
         .arg("diagnose")
-        .arg("--alo")
         .arg(&model_path)
         .arg(&train_path)
         .output()
-        .expect("spawn gam diagnose --alo (survival)");
+        .expect("spawn gam diagnose (survival)");
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
 
     assert!(
         !stderr.contains("survival event column") && !stdout.contains("survival event column"),
-        "`gam diagnose --alo` dropped the survival event column from its own \
+        "`gam diagnose` dropped the survival event column from its own \
          training data:\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}"
     );
     assert!(
         out.status.success(),
-        "`gam diagnose --alo` failed on a survival fit's training data.\n\
+        "`gam diagnose` failed on a survival fit's training data.\n\
          --- stdout ---\n{stdout}\n--- stderr ---\n{stderr}"
     );
     assert!(
         stdout.contains("ALO diagnostics"),
-        "survival `gam diagnose --alo` produced no ALO diagnostics table.\n\
+        "survival `gam diagnose` produced no ALO diagnostics table.\n\
          --- stdout ---\n{stdout}\n--- stderr ---\n{stderr}"
     );
     assert!(
         stdout.contains("ALO coordinates (survival)"),
-        "survival `gam diagnose --alo` did not print its typed survival ALO frame.\n\
+        "survival `gam diagnose` did not print its typed survival ALO frame.\n\
          --- stdout ---\n{stdout}"
     );
 }

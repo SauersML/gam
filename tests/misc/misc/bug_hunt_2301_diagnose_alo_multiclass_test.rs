@@ -9,7 +9,9 @@
 //! parameter-aligned, saved-Hessian ALO machinery, and `gam diagnose` now calls
 //! that one dispatcher instead of duplicating a Standard-only replay.
 //!
-//! This test drives the real CLI (`gam fit` + `gam diagnose --alo`) on:
+//! This test drives the real CLI (`gam fit` + `gam diagnose`) on the cases
+//! below. ALO is the only diagnostic `gam diagnose` computes, so the former
+//! `--alo` flag was a no-op and was removed (c4214ce08); it is not passed here:
 //! 1. a Gaussian location-scale fit (`--predict-noise`) — must now SUCCEED
 //!    and print an ALO diagnostics table;
 //! 2. a survival fit (`Surv(...) ~ x`) — must also succeed through its typed
@@ -86,19 +88,15 @@ fn diagnose_alo_supports_location_scale_and_survival_2301() {
     assert!(ls_model.is_file(), "gam fit did not write {ls_model:?}");
 
     let mut diagnose_ls = Command::new(gam_binary!());
-    diagnose_ls
-        .arg("diagnose")
-        .arg("--alo")
-        .arg(&ls_model)
-        .arg(&ls_data);
+    diagnose_ls.arg("diagnose").arg(&ls_model).arg(&ls_data);
     let ls_output = diagnose_ls
         .output()
-        .expect("spawn gam diagnose --alo (location-scale)");
+        .expect("spawn gam diagnose (location-scale)");
     let ls_stdout = String::from_utf8_lossy(&ls_output.stdout);
     let ls_stderr = String::from_utf8_lossy(&ls_output.stderr);
     assert!(
         ls_output.status.success(),
-        "diagnose --alo must now succeed for a location-scale fit (#2301):\n\
+        "diagnose must now succeed for a location-scale fit (#2301):\n\
          --- stdout ---\n{ls_stdout}\n--- stderr ---\n{ls_stderr}"
     );
     assert!(
@@ -138,19 +136,15 @@ fn diagnose_alo_supports_location_scale_and_survival_2301() {
     assert!(surv_model.is_file(), "gam fit did not write {surv_model:?}");
 
     let mut diagnose_surv = Command::new(gam_binary!());
-    diagnose_surv
-        .arg("diagnose")
-        .arg("--alo")
-        .arg(&surv_model)
-        .arg(&surv_data);
+    diagnose_surv.arg("diagnose").arg(&surv_model).arg(&surv_data);
     let surv_output = diagnose_surv
         .output()
-        .expect("spawn gam diagnose --alo (survival)");
+        .expect("spawn gam diagnose (survival)");
     let surv_stdout = String::from_utf8_lossy(&surv_output.stdout);
     let surv_stderr = String::from_utf8_lossy(&surv_output.stderr);
     assert!(
         surv_output.status.success(),
-        "diagnose --alo must succeed for a survival fit (#2301):\n\
+        "diagnose must succeed for a survival fit (#2301):\n\
          --- stdout ---\n{surv_stdout}\n--- stderr ---\n{surv_stderr}"
     );
     assert!(
