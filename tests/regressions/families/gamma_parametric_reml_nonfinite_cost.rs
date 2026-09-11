@@ -12,7 +12,7 @@
 //! Root cause (fixed): the Gamma log-likelihood consumed by the outer
 //! objective used the *full saturated* form, whose normalizing term
 //! `shape·ln(shape) − lnΓ(shape)` overflows once the per-iterate shape
-//! estimate saturates to `GAMMA_SHAPE_MAX = 1e12` (which happens on the
+//! estimate saturates at a very large value (which happened on the
 //! common high-dispersion / CV≈1 case, and at the extreme ρ probed during
 //! seed screening). The outer objective now uses the scaled-deviance form
 //! `ℓ = −½ D(y, μ)`, matching the Tweedie family and the mgcv convention:

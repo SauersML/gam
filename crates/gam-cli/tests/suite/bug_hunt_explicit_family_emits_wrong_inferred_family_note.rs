@@ -32,10 +32,10 @@
 //! curve wearing a Gamma label.
 //!
 //! `s(x)` fits such data to essentially zero residual, and the Gamma shape MLE
-//! for zero dispersion is `+inf`: `gamma_shape_score` stays positive out to
-//! `GAMMA_SHAPE_MAX = 1e12`, so `pirls::dispersion` refuses with
+//! for zero dispersion is `+inf`: the dispersion statistic sits inside its own
+//! rounding band, so `pirls::dispersion` refuses with
 //!
-//!   Gamma shape MLE is not finite inside the declared profiling domain
+//!   Gamma shape MLE is not finite: the dispersion statistic ... is inside its rounding band
 //!
 //! and the whole fit dies before reaching the line this test is about. **That
 //! refusal is correct behaviour, not a defect** — the fixture was asking the

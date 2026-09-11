@@ -8,10 +8,6 @@
 
 use super::*;
 
-pub(crate) const GAMMA_SHAPE_MIN: f64 = 1e-8;
-pub(crate) const GAMMA_SHAPE_MAX: f64 = 1e12;
-pub(crate) const GAMMA_SHAPE_TARGET_TOL: f64 = 1e-12;
-
 /// Saturation threshold used only by inner-loop separation diagnostics.
 pub(super) const PIRLS_ETA_ABS_CAP: f64 = 40.0;
 
@@ -97,38 +93,81 @@ pub(crate) fn estimate_gamma_shape_from_eta(
         crate::bail_invalid_estim!("Gamma shape profiling requires positive total prior weight");
     }
     let target = weighted_target / total_weight;
-    if !(target.is_finite() && target > 0.0) {
+    // Each row's term `r − ln r − 1` is formed with three rounded operations over
+    // a cancelling sum of magnitude `r + |ln r| + 1`, and the terms are reduced
+    // pairwise. A statistic inside that accumulation's rounding band is zero
+    // dispersion to the resolution this arithmetic has: the shape MLE is `+∞`
+    // and there is no finite estimate to return.
+    let magnitude_rows: Vec<Result<(f64, f64), EstimationError>> = (0..eta.len())
+        .into_par_iter()
+        .map(|i| {
+            let wi = priorweights[i];
+            if wi == 0.0 {
+                return Ok((0.0, 0.0));
+            }
+            let ratio = y[i] / means[i];
+            Ok((wi * (ratio + ratio.ln().abs() + 1.0), 0.0))
+        })
+        .collect();
+    let (weighted_magnitude, _) = certified_pairs_sum(magnitude_rows)?;
+    let reduction_depth = 3 + (usize::BITS - eta.len().leading_zeros()) as usize;
+    let target_band =
+        gam_linalg::roundoff::accumulation_band(reduction_depth, weighted_magnitude) / total_weight;
+    if !(target.is_finite() && target > target_band) {
         crate::bail_invalid_estim!(
-            "Gamma shape MLE is not a finite interior value (profile target={target:?})"
+            "Gamma shape MLE is not finite: the dispersion statistic {target:?} is inside its rounding band {target_band:?}"
         );
     }
 
+    // `ln α − ψ(α)` falls from `+∞` as `α → 0⁺` to `0` as `α → ∞`, so for a
+    // positive statistic the score has exactly one root. Bracket it by halving
+    // and doubling outward from the closed-form approximation; the only way out
+    // of either walk is the representable range itself.
     let discriminant = (target - 3.0) * (target - 3.0) + 24.0 * target;
     let approx = ((3.0 - target) + discriminant.sqrt()) / (12.0 * target);
-    let mut lo = GAMMA_SHAPE_MIN;
-    let mut hi = approx.max(1.0).min(GAMMA_SHAPE_MAX);
-    if gamma_shape_score(lo, target) <= 0.0 {
+    if !(approx.is_finite() && approx > 0.0) {
         crate::bail_invalid_estim!(
-            "Gamma shape MLE lies below the declared profiling domain ({GAMMA_SHAPE_MIN}, {GAMMA_SHAPE_MAX})"
+            "Gamma shape approximation is not representable (profile target={target:?}, approximation={approx:?})"
         );
     }
-    while hi < GAMMA_SHAPE_MAX && gamma_shape_score(hi, target) > 0.0 {
-        hi = (hi * 2.0).min(GAMMA_SHAPE_MAX);
+    let mut lo = approx;
+    let mut hi = approx;
+    while gamma_shape_score(lo, target) <= 0.0 {
+        lo *= 0.5;
+        if !(lo > 0.0) {
+            crate::bail_invalid_estim!(
+                "Gamma shape MLE lies below the representable range (profile target={target:?})"
+            );
+        }
     }
-    if gamma_shape_score(hi, target) > 0.0 {
+    while gamma_shape_score(hi, target) > 0.0 {
+        hi *= 2.0;
+        if !hi.is_finite() {
+            crate::bail_invalid_estim!(
+                "Gamma shape MLE exceeds the representable range (profile target={target:?})"
+            );
+        }
+    }
+    // The score is a cancelling difference of `ln α` and `ψ(α)`. Once the
+    // statistic is inside that difference's rounding band at the bracket, the
+    // root's position is set by arithmetic, not by the data.
+    let score_band =
+        gam_linalg::roundoff::accumulation_band(2, hi.ln().abs() + digamma(hi).abs() + target);
+    if target <= score_band {
         crate::bail_invalid_estim!(
-            "Gamma shape MLE is not finite inside the declared profiling domain ({GAMMA_SHAPE_MIN}, {GAMMA_SHAPE_MAX})"
+            "Gamma shape MLE is not resolvable: the dispersion statistic {target:?} is inside the shape score's rounding band {score_band:?} at shape {hi:?}"
         );
     }
-    for _ in 0..80 {
+    // Bisect until no representable shape lies strictly inside the bracket.
+    loop {
         let mid = lo + 0.5 * (hi - lo);
+        if !(mid > lo && mid < hi) {
+            break;
+        }
         if gamma_shape_score(mid, target) > 0.0 {
             lo = mid;
         } else {
             hi = mid;
-        }
-        if (hi - lo) <= GAMMA_SHAPE_TARGET_TOL * hi {
-            break;
         }
     }
     let shape = lo + 0.5 * (hi - lo);
