@@ -1750,11 +1750,8 @@ pub fn audit_stationary_point(
 /// O(‖H‖)-scaled arithmetic carry O(ε·‖H‖) roundoff, so a `√ε`-relative
 /// margin cleanly separates a true negative direction from accumulated
 /// floating-point noise on a flat (near-semidefinite) valley.
-pub(crate) fn certificate_hessian_is_psd(hessian: &Array2<f64>) -> Option<bool> {
-    certificate_hessian_is_psd_at_resolution(hessian, 0.0)
-}
 
-/// [`certificate_hessian_is_psd`] with an explicit **measured** curvature
+/// The same probe with an explicit **measured** curvature
 /// resolution, which the shift is raised to when it is the larger (#2748).
 ///
 /// The `√ε·max(1, max|H_ii|)` shift above is a statement about the *arithmetic*
@@ -1843,7 +1840,7 @@ pub(crate) fn certificate_hessian_is_psd_at_resolution(
 /// the interior is empty — there is no feasible curvature to certify and the rail
 /// KKT signs are the whole certificate — so the empty sub-block is trivially PSD.
 /// With no railed coordinate and no declared invariance it is exactly
-/// [`certificate_hessian_is_psd`].
+/// [`certificate_hessian_is_psd_at_resolution`] at zero measured resolution.
 ///
 /// # The invariance argument (#2676)
 ///
@@ -2410,7 +2407,7 @@ fn adjudicate_negative_curvature(
             ));
         }
     };
-    // The SAME √ε·‖H‖ margin `certificate_hessian_is_psd` uses to separate a
+    // The SAME √ε·‖H‖ margin `certificate_hessian_is_psd_at_resolution` uses to separate a
     // genuine negative eigenvalue from O(ε·‖H‖) assembly roundoff: only a truly
     // negative direction — not a flat / near-semidefinite one — carries a descent
     // the reseed can exploit. Measured on the interior sub-block's diagonal so the
@@ -3303,14 +3300,14 @@ impl LadderExtension<'_> {
 /// `gᵀ H⁻¹ g` toward the roundoff-regularized `|g_flat|² / shift` and is
 /// REJECTED; only a residual that is small along the well-curved directions and
 /// nearly orthogonal to the flat ones certifies. An indefinite Hessian never
-/// reaches here — the certificate's curvature gate (`certificate_hessian_is_psd`)
+/// reaches here — the certificate's curvature gate (`certificate_hessian_is_psd_at_resolution`)
 /// rejects a genuinely indefinite point independently, and this factorization
 /// returns `None` on a non-PSD shifted factor so the caller falls back to the
 /// gradient-only bound.
 ///
 /// `hessian` and `grad` are the analytic outer Hessian and the KKT-PROJECTED
 /// gradient at the certified point. The shift `√ε · max|H_jj|` matches
-/// [`certificate_hessian_is_psd`] so the definiteness verdict and this decrement
+/// [`certificate_hessian_is_psd_at_resolution`] so the definiteness verdict and this decrement
 /// agree on the same regularized operator. Returns `None` when the shapes are
 /// malformed, an entry is non-finite, the shifted factor is not PD, or the
 /// resulting quadratic form is negative (which a PD factor rules out; retained
@@ -5300,7 +5297,7 @@ fn certify_outer_optimality_at_terminal_fidelity(
     {
         let n = layout.n_params;
         // Curvature scale of the analytic outer Hessian: its dominant diagonal,
-        // the same ‖H‖ scale `certificate_hessian_is_psd` and
+        // the same ‖H‖ scale `certificate_hessian_is_psd_at_resolution` and
         // `newton_predicted_decrease` regularize against. A coordinate's curvature
         // ROW is indistinguishable from the assembly's roundoff — it has no
         // curvature the arithmetic can resolve and has collapsed onto the penalty

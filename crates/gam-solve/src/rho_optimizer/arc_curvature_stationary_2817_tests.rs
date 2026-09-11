@@ -308,7 +308,7 @@ fn a_strict_saddle_is_never_adjudicated_stationary_2817() {
     );
     let (lower, upper) = wide_box_2817(2);
     assert_eq!(
-        reduced_hessian_psd_at_point(&array![0.5, 0.5], &gradient, &hessian, Some((&lower, &upper))),
+        reduced_hessian_psd_at_point(&array![0.5, 0.5], &gradient, &hessian, Some((&lower, &upper)), 0.0),
         Some(false),
         "the reduced-Hessian gate must see the negative eigenvalue"
     );

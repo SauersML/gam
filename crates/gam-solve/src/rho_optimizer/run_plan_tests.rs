@@ -396,17 +396,17 @@ fn certificate_flags_value_gradient_desync() {
 #[test]
 fn certificate_hessian_psd_probe_classifies_definiteness() {
     assert_eq!(
-        certificate_hessian_is_psd(&Array2::<f64>::eye(3)),
+        certificate_hessian_is_psd_at_resolution(&Array2::<f64>::eye(3), 0.0),
         Some(true)
     );
     let indefinite = array![[1.0, 2.0], [2.0, 1.0]];
-    assert_eq!(certificate_hessian_is_psd(&indefinite), Some(false));
+    assert_eq!(certificate_hessian_is_psd_at_resolution(&indefinite, 0.0), Some(false));
     assert_eq!(
-        certificate_hessian_is_psd(&Array2::<f64>::zeros((0, 0))),
+        certificate_hessian_is_psd_at_resolution(&Array2::<f64>::zeros((0, 0)), 0.0),
         None
     );
     let non_finite = array![[f64::NAN]];
-    assert_eq!(certificate_hessian_is_psd(&non_finite), None);
+    assert_eq!(certificate_hessian_is_psd_at_resolution(&non_finite, 0.0), None);
 }
 
 #[test]
@@ -3281,12 +3281,12 @@ fn reduced_hessian_psd_keeps_weak_bound_direction_in_critical_cone_2316() {
     let hessian = array![[-1.0, 0.0], [0.0, 2.0]];
 
     assert_eq!(
-        reduced_hessian_psd_at_point(&point, &array![0.0, 0.0], &hessian, Some((&lower, &upper)),),
+        reduced_hessian_psd_at_point(&point, &array![0.0, 0.0], &hessian, Some((&lower, &upper)), 0.0),
         Some(false),
         "a zero-multiplier lower-bound axis remains in the critical cone"
     );
     assert_eq!(
-        reduced_hessian_psd_at_point(&point, &array![1.0, 0.0], &hessian, Some((&lower, &upper))),
+        reduced_hessian_psd_at_point(&point, &array![1.0, 0.0], &hessian, Some((&lower, &upper)), 0.0),
         Some(true),
         "strict complementarity removes the bound-normal direction"
     );

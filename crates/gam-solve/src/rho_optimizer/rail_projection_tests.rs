@@ -166,14 +166,14 @@ fn a_rail_direction_does_not_poison_the_curvature_verdict() {
     let hessian = array![[-3.0, 0.0], [0.0, 2.0]];
 
     assert_eq!(
-        reduced_hessian_psd_at_point(&x, &gradient, &hessian, Some((&bounds.0, &bounds.1))),
+        reduced_hessian_psd_at_point(&x, &gradient, &hessian, Some((&bounds.0, &bounds.1)), 0.0),
         Some(false),
         "the raw box keeps the rail direction in the critical cone"
     );
 
     let relaxed = rail_relaxed_bounds(&bounds);
     assert_eq!(
-        reduced_hessian_psd_at_point(&x, &gradient, &hessian, Some((&relaxed.0, &relaxed.1))),
+        reduced_hessian_psd_at_point(&x, &gradient, &hessian, Some((&relaxed.0, &relaxed.1)), 0.0),
         Some(true),
         "the rail direction leaves the cone; the interior block is judged alone"
     );
@@ -192,7 +192,7 @@ fn a_near_bound_coordinate_with_feasible_descent_keeps_its_curvature() {
     let hessian = array![[-3.0, 0.0], [0.0, 2.0]];
 
     assert_eq!(
-        reduced_hessian_psd_at_point(&x, &gradient, &hessian, Some((&relaxed.0, &relaxed.1))),
+        reduced_hessian_psd_at_point(&x, &gradient, &hessian, Some((&relaxed.0, &relaxed.1)), 0.0),
         Some(false),
         "a near-bound coordinate that is not railed keeps its negative curvature"
     );
@@ -218,6 +218,7 @@ fn the_guard_stays_no_more_permissive_than_the_certificate() {
         &gradient,
         &hessian,
         Some((&relaxed.0, &relaxed.1)),
+        0.0,
     );
     assert_eq!(guard, Some(false));
 }

@@ -2554,12 +2554,21 @@ pub(crate) fn run_outer_with_plan(
                     // use (#2412); the seed must not be judged against a
                     // different critical cone than the iterates that follow it.
                     let seed_rail_bounds = rail_relaxed_bounds(&(lo.clone(), hi.clone()));
+                    // Judged at the same criterion curvature resolution the
+                    // bridge's later verdicts use (#1082), so the seed is not a
+                    // strict saddle by a standard the iterates never face.
+                    let seed_curvature_resolution = if seed_eval.cost.is_finite() {
+                        2.0 * outer_rel_cost_floor(config) * (1.0 + seed_eval.cost.abs())
+                    } else {
+                        0.0
+                    };
                     let seed_hessian_psd = seed_hessian.as_ref().and_then(|dense| {
                         reduced_hessian_psd_at_point(
                             &seed,
                             &seed_eval.gradient,
                             dense,
                             Some((&seed_rail_bounds.0, &seed_rail_bounds.1)),
+                            seed_curvature_resolution,
                         )
                     });
 

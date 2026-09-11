@@ -2817,7 +2817,7 @@ impl OuterSecondOrderBridge<'_> {
     /// input is the certificate's:
     ///
     /// * the reduced Hessian on the rail-relaxed free set must be PSD. That is
-    ///   the certificate's own `certificate_hessian_is_psd` gate, reached here
+    ///   the certificate's own `certificate_hessian_is_psd_at_resolution` gate, reached here
     ///   through [`reduced_hessian_psd_at_point`] on a free set that is a
     ///   SUPERSET of the certificate's, so this can never certify curvature the
     ///   certificate would reject — and a strict saddle, where the criterion
@@ -3032,12 +3032,25 @@ impl SecondOrderObjective for OuterSecondOrderBridge<'_> {
         // permissive than the authority it answers to and can never certify
         // curvature the certificate would reject.
         let rail_bounds = self.cost_stall_bounds.as_ref().map(rail_relaxed_bounds);
+        // #1082: judge definiteness at the criterion's curvature resolution
+        // `2·floor·(1 + |V|)` — the standard the terminal adjudication already
+        // applies — so negative curvature that no step in the adjudication's
+        // range can turn into a resolvable decrease stops reading as a strict
+        // saddle that the cost-stall guard must keep escaping from. No floor
+        // configured (or a non-finite cost) keeps the arithmetic shift alone.
+        let curvature_resolution = match self.curvature_stationary_floor {
+            Some(floor) if floor.is_finite() && floor > 0.0 && eval.cost.is_finite() => {
+                2.0 * floor * (1.0 + eval.cost.abs())
+            }
+            _ => 0.0,
+        };
         let hessian_psd = hessian.as_ref().and_then(|dense| {
             reduced_hessian_psd_at_point(
                 x,
                 &eval.gradient,
                 dense,
                 rail_bounds.as_ref().map(|(lower, upper)| (lower, upper)),
+                curvature_resolution,
             )
         });
         // Observe finite cost progress, but never let this first-order guard
@@ -3873,11 +3886,27 @@ pub(crate) fn rail_projected_gradient_norm(
 /// optimizer, then adjudicate second-order stationarity with the final outer
 /// certificate's PSD rule. This keeps the infeasible-stall guard from treating
 /// an interior (or weak-bound) strict saddle as a terminal neighbourhood.
+///
+/// The definiteness test is taken at a MEASURED curvature resolution through `run::certificate_hessian_is_psd_at_resolution`
+/// — the certificate's single owner of "resolvable curvature" (#2748) — rather
+/// than at the arithmetic shift alone (#1082).
+///
+/// The search route passes `2·ε_f`, with `ε_f = rel_cost_floor·(1 + |V|)` the
+/// criterion's own resolution. Along an eigenvector of `λ < 0` at a stationary
+/// point the claim predicts the decrease `½|λ|α²`, and the largest step the
+/// negative-curvature adjudication takes is one e-fold of `log λ` (`α = 1`), so
+/// a direction with `½|λ| ≤ ε_f` predicts nothing the criterion can represent
+/// anywhere in the range that could falsify it. Counting such a direction as a
+/// strict saddle is what kept the penguin probe's cost-stall guard granting
+/// escapes that each bought ~3e-5 of a 2.5e-5 resolution until the seed ran out
+/// of iterations (λ_min = −6.7e−7, job 383312). `0.0` is the arithmetic shift
+/// alone, the historical verdict bit for bit.
 pub(crate) fn reduced_hessian_psd_at_point(
     x: &Array1<f64>,
     gradient: &Array1<f64>,
     hessian: &Array2<f64>,
     bounds: Option<(&Array1<f64>, &Array1<f64>)>,
+    measured_resolution: f64,
 ) -> Option<bool> {
     let n = x.len();
     if gradient.len() != n || hessian.nrows() != n || hessian.ncols() != n {
@@ -3903,12 +3932,16 @@ pub(crate) fn reduced_hessian_psd_at_point(
     let reduced = Array2::from_shape_fn((free.len(), free.len()), |(row, column)| {
         hessian[[free[row], free[column]]]
     });
-    certificate_hessian_is_psd(&reduced)
+    super::run::certificate_hessian_is_psd_at_resolution(&reduced, measured_resolution)
 }
 
 #[cfg(test)]
 #[path = "projected_gradient_tests.rs"]
 mod projected_gradient_tests;
+
+#[cfg(test)]
+#[path = "resolvable_curvature_1082_tests.rs"]
+mod resolvable_curvature_1082_tests;
 
 pub(crate) const LOWER_BOUND_SEPARATION_ACTIVE_MIN: usize = 2;
 
