@@ -158,7 +158,6 @@ fn fixed_state_exact_a_logdet(
         .ok()?;
     term.exact_observed_information_log_dets(rho, target.view(), &cache)
         .ok()
-        .map(|(log_a, _log_a_tt)| log_a)
 }
 
 // #2330 Patch D — an ordered-Beta--Bernoulli fixture whose target is generated
@@ -349,10 +348,10 @@ fn sae_exact_a_theta_adjoint_gap_measure_2330_patchd() {
             1.0e-6,
         )
         .expect("PD converged cache");
-    let (log_a, log_a_tt) = term
+    let log_a = term
         .exact_observed_information_log_dets(&rho, target.view(), &cache)
-        .expect("exact-A log dets at the converged mode");
-    eprintln!("PATCHD base log|A|={log_a:.9e} log|A_tt|={log_a_tt:.9e}");
+        .expect("exact-A log det at the converged mode");
+    eprintln!("PATCHD base log|A|={log_a:.9e}");
     let gamma = term
         .exact_a_theta_adjoint_joint(&rho, target.view(), &cache)
         .expect("analytic exact-A joint theta adjoint");

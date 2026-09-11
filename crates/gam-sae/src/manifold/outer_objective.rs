@@ -1193,13 +1193,12 @@ impl SaeManifoldOuterObjective {
                     &evaluation.loss,
                     &evaluation.cache,
                     &solver,
-                    // #2515 — the ranked criterion on this lane is
-                    // `½log|S_A| + rank_charge` (`rank_adjusted_quasi_laplace_-
-                    // complexity` takes `½(log_det − log_det_tt)` and BOTH come
-                    // off `exact_a_evidence_system`, so the per-row t-block
-                    // log-dets cancel and the reduced Schur of `A` is the whole
-                    // operator exposure). Its derivative is therefore
-                    // `½tr(S_A⁻¹ ∂S_A/∂ρ)`, which the from-probes channels
+                    // #2515/#2668 — the ranked criterion on this lane is
+                    // `½log|A| + rank_charge`, coordinate block included
+                    // (`rank_adjusted_quasi_laplace_complexity` takes `½log_det`, and
+                    // `log_det = log|A_tt| + log|S_A|` comes off
+                    // `exact_a_evidence_system`). Its derivative is
+                    // `½tr(A⁻¹ ∂A/∂ρ)`, which the from-probes channels
                     // reconstruct only if the row geometry and the `S⁻¹` come from
                     // the same operator. `cache` stays `B`: it is the Newton/IFT
                     // scale that `solve_exact_stationarity_matrix_free` rebuilds

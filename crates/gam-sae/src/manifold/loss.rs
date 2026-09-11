@@ -79,8 +79,8 @@ pub struct SaeOuterRhoGradientComponents {
     /// `analytic_outer_rho_gradient_components_with_bundle`).
     ///
     /// #2087 — that last summand is why this is NOT the ρ-derivative of
-    /// `loss.total() + extra_penalty_energy` alone. The scalar criterion replaces
-    /// the coordinate-block `½log|H_tt|` with the realised-rank charge, so the
+    /// `loss.total() + extra_penalty_energy` alone. The scalar criterion adds
+    /// the realised-rank charge to `½log|H|`, so the
     /// charge lives in the quasi-Laplace COMPLEXITY and `SaeManifoldTerm::loss`
     /// cannot see it. An audit that finite-differences `loss.total()` and compares
     /// it to this field is comparing two different quantities and will report the

@@ -163,10 +163,7 @@ struct ExactHessianSpectralBlock {
 /// classified, so the two cannot be paired up wrongly:
 ///
 /// * the JOINT block is `A` itself, so its metric is the whole arrow operator,
-///   border and all;
-/// * the COORDINATE block is `A_tt`, so its metric is `B`'s block-diagonal
-///   `H_tt` — the same restriction, taken on the same coordinates, not the
-///   Schur complement.
+///   border and all.
 ///
 /// Both are applies through the cached factors, never a materialized `B`: the
 /// dense route already carries one `dim × dim` block and #2724/#2757 price that
@@ -175,8 +172,6 @@ struct ExactHessianSpectralBlock {
 pub(crate) enum ArrowMetric<'a> {
     /// `B` on the joint `(t, β)` coordinates.
     Joint(&'a ArrowFactorCache),
-    /// `H_tt`, `B`'s block-diagonal coordinate restriction.
-    Coordinate(&'a ArrowFactorCache),
 }
 
 impl ArrowMetric<'_> {
@@ -201,25 +196,6 @@ impl ArrowMetric<'_> {
                     v.slice(s![total_t..]),
                 )?;
                 Ok(Array1::from_iter(b_v.t.iter().chain(b_v.beta.iter()).copied()))
-            }
-            Self::Coordinate(cache) => {
-                let total_t = cache.delta_t_len();
-                if v.len() != total_t {
-                    return Err(format!(
-                        "ArrowMetric::Coordinate: direction length {} != coordinate dimension \
-                         {total_t}",
-                        v.len(),
-                    ));
-                }
-                let mut out = Array1::zeros(total_t);
-                for row in 0..cache.n_rows() {
-                    let width = cache.row_dims[row];
-                    let base = cache.row_offsets[row];
-                    let block_v = v.slice(s![base..base + width]);
-                    let applied = cholesky_factor_apply(cache.undamped_factor(row), block_v);
-                    out.slice_mut(s![base..base + width]).assign(&applied);
-                }
-                Ok(out)
             }
         }
     }
@@ -490,13 +466,12 @@ impl ExactHessianSpectralBlock {
 }
 
 /// One coherent dense exact-A quotient geometry.  The joint eigensystem owns
-/// the stationarity pseudoinverse; the priced joint/coordinate inverses own the
-/// exact-A log-determinant derivative.  They are deliberately derived from the
-/// same materialized blocks and classification floors.
+/// the stationarity pseudoinverse; the priced joint inverse owns the exact-A
+/// log-determinant derivative.  Both are derived from the same materialized
+/// block and classification floor.
 struct ExactHessianQuotientGeometry {
     joint: ExactHessianSpectralBlock,
     joint_pricing: ExactHessianPricing,
-    coordinate_pricing: ExactHessianPricing,
 }
 
 /// Value and classified basin spectrum, without realizing a dense differential.
@@ -583,7 +558,7 @@ impl EvidenceOperator {
 /// evaluation, where the cache and the bundle were produced by one
 /// factorization of one system and cannot be paired across evaluations. The
 /// criterion that route feeds ranks `½log|S_A|` —
-/// `rank_adjusted_quasi_laplace_complexity` takes `½(log_det − log_det_tt)` and
+/// `rank_adjusted_quasi_laplace_complexity` takes `½log_det` (coordinate block included) and
 /// both come off `exact_a_evidence_system`, so the per-row t-block
 /// log-determinants cancel and the reduced Schur of `A` is the whole operator
 /// exposure — so a `B`-rooted derivative here would differentiate an operator
@@ -2094,31 +2069,6 @@ impl SaeManifoldTerm {
         Ok(g)
     }
 
-    /// PATH C (#2253) — the block-diagonal row-local t-inverse `H_bd⁻¹` (dim×dim;
-    /// β block zero) built from the per-row undamped Cholesky factors, the same
-    /// inverse the rank-charge coordinate-block trace subtracts. Shared by ch4
-    /// and ch5.
-    pub(crate) fn materialize_block_diag_t_inverse(&self, cache: &ArrowFactorCache) -> Array2<f64> {
-        let total_t = cache.delta_t_len();
-        let dim = total_t + cache.k;
-        let mut h_bd = Array2::<f64>::zeros((dim, dim));
-        for row in 0..self.n_obs() {
-            let q = cache.row_dims[row];
-            let base = cache.row_offsets[row];
-            let factor = cache.undamped_factor(row);
-            let mut unit = Array1::<f64>::zeros(q);
-            for col in 0..q {
-                unit.fill(0.0);
-                unit[col] = 1.0;
-                let solved = cholesky_solve_vector(factor, unit.view());
-                for r in 0..q {
-                    h_bd[[base + r, base + col]] = solved[r];
-                }
-            }
-        }
-        h_bd
-    }
-
     /// PATH C (#2253) CH5 — dense reconstruction of the θ-adjoint contraction
     /// `Γ_w = tr(inv · K_w)`, `K_w = ∂H/∂θ_w`, for an ARBITRARY dense joint
     /// inverse `inv` (dim×dim over the `(t, β)` blocks) and a chosen subset of
@@ -2126,7 +2076,6 @@ impl SaeManifoldTerm {
     ///
     /// With `inv = G` and `ThetaAdjointDhChannel::All` this reproduces the
     /// production [`Self::logdet_theta_adjoint`] (self-checked by the FD gate);
-    /// with `inv = h_bd` it reproduces [`Self::coordinate_block_logdet_theta_adjoint`].
     /// Feeding the TWISTED inverse `−G M_i G` gives the part-(a) term
     /// `−tr(G M_i G K_w)` of `dΓ/dρ_i`; the two MIXED channels give part-(b).
     ///
@@ -3049,25 +2998,16 @@ impl SaeManifoldTerm {
         };
 
         let g = self.materialize_joint_inverse(cache, &solver)?;
-        let h_bd = self.materialize_block_diag_t_inverse(cache);
         let operators = self.penalty_curvature_operators_by_flat(rho, cache)?;
         // `∂A/∂ρᵢ = ∂H/∂ρᵢ (operators) + ∂(ΔC)/∂ρᵢ (this delta)`. BOTH the twist
         // inverse ∂G/∂ρ = −G(∂A/∂ρ)G and the IFT `Mᵢ·a` term differentiate the
         // EXACT stationarity Hessian A, so both add this delta (#2330).
         let exact_deltas = self.exact_stationarity_penalty_derivative_delta_by_flat(rho, cache)?;
 
-        // Effective adjoint Γ_eff = Γ_joint − Γ_tt + 2∇R, assembled EXACTLY as
-        // the gradient does (construction_exact_hessian.rs analytic assembler).
+        // Effective adjoint Γ_eff = Γ_joint + 2∇R, assembled EXACTLY as the
+        // gradient does (construction_exact_hessian.rs analytic assembler).
         let rank_charge = self.production_rank_charge_derivative(target, rho, loss, cache)?;
         let mut gamma_eff = self.logdet_theta_adjoint(rho, cache, &solver)?;
-        let gamma_tt = self.coordinate_block_logdet_theta_adjoint(
-            rho,
-            cache,
-            EvidenceOperator::Majorizer,
-            None,
-        )?;
-        gamma_eff.t -= &gamma_tt.t;
-        gamma_eff.beta -= &gamma_tt.beta;
         gamma_eff.t.scaled_add(2.0, &rank_charge.theta.t);
         gamma_eff.beta.scaled_add(2.0, &rank_charge.theta.beta);
 
@@ -3096,7 +3036,7 @@ impl SaeManifoldTerm {
         let mut hessian = Array2::<f64>::zeros((n_params, n_params));
         for &i in &flats {
             let m_i = &operators[&i];
-            // Twisted inverses G_i = −G (∂A/∂ρ_i) G, h_bd_i = −h_bd (∂A/∂ρ_i) h_bd.
+            // Twisted inverse G_i = −G (∂A/∂ρ_i) G.
             // The Laplace logdet is logdet(A_exact), so ∂G/∂ρ_i differentiates the
             // EXACT stationarity Hessian ∂A/∂ρ_i = M_i + ΔC-delta_i — NOT the
             // majorized M_i alone, which is one-sided on ARD (delta ≠ 0 only for
@@ -3106,22 +3046,12 @@ impl SaeManifoldTerm {
                 None => m_i.clone(),
             };
             let g_i = -g.dot(&twist_op).dot(&g);
-            let h_bd_i = -h_bd.dot(&twist_op).dot(&h_bd);
 
-            // dΓ_joint/dρ_i and dΓ_tt/dρ_i = part(a) twist + part(b) mixed.
+            // dΓ_joint/dρ_i = part(a) twist + part(b) mixed.
             let mut d_gamma_joint = self.logdet_theta_adjoint_dense(
                 rho,
                 cache,
                 &g_i,
-                ThetaAdjointDhChannel::All,
-                false,
-                false,
-                None,
-            )?;
-            let mut d_gamma_tt = self.logdet_theta_adjoint_dense(
-                rho,
-                cache,
-                &h_bd_i,
                 ThetaAdjointDhChannel::All,
                 false,
                 false,
@@ -3143,19 +3073,8 @@ impl SaeManifoldTerm {
                     false,
                     None,
                 )?;
-                let mixed_tt = self.logdet_theta_adjoint_dense(
-                    rho,
-                    cache,
-                    &h_bd,
-                    ThetaAdjointDhChannel::SoftmaxSparseMixed,
-                    false,
-                    false,
-                    None,
-                )?;
                 d_gamma_joint.t += &mixed_joint.t;
                 d_gamma_joint.beta += &mixed_joint.beta;
-                d_gamma_tt.t += &mixed_tt.t;
-                d_gamma_tt.beta += &mixed_tt.beta;
             } else {
                 // ARD coordinate: part(b) mixed channel for this flat index.
                 let mixed_joint = self.logdet_theta_adjoint_dense(
@@ -3167,24 +3086,12 @@ impl SaeManifoldTerm {
                     false,
                     None,
                 )?;
-                let mixed_tt = self.logdet_theta_adjoint_dense(
-                    rho,
-                    cache,
-                    &h_bd,
-                    ThetaAdjointDhChannel::ArdMixed { target_flat: i },
-                    false,
-                    false,
-                    None,
-                )?;
                 d_gamma_joint.t += &mixed_joint.t;
                 d_gamma_joint.beta += &mixed_joint.beta;
-                d_gamma_tt.t += &mixed_tt.t;
-                d_gamma_tt.beta += &mixed_tt.beta;
             }
 
-            // dΓ_eff/dρ_i = dΓ_joint − dΓ_tt (+2∇R' folded into joint above).
-            let mut d_gamma = flatten(&d_gamma_joint);
-            d_gamma -= &flatten(&d_gamma_tt);
+            // dΓ_eff/dρ_i = dΓ_joint (+2∇R' folded in above).
+            let d_gamma = flatten(&d_gamma_joint);
             // resid_i = dΓ_eff/dρ_i − (∂A/∂ρ_i)·a, with ∂A/∂ρ_i = M_i + ΔC-delta_i
             // (the IFT term differentiates the EXACT A, not the majorized H).
             let mut a_op_i_a = m_i.dot(&a_flat);
@@ -3426,14 +3333,7 @@ impl SaeManifoldTerm {
                         .assignment_log_strength_hessian_trace(rho, cache, solver)
                         .map_err(OuterGradientError::internal)?,
                 };
-                let coordinate_trace = self
-                    .coordinate_block_assignment_log_strength_hessian_trace(
-                        rho,
-                        evidence_cache,
-                        evidence_operator,
-                    )
-                    .map_err(OuterGradientError::internal)?;
-                logdet_trace[sparse_index] = joint_trace - coordinate_trace;
+                logdet_trace[sparse_index] = joint_trace;
             }
         }
 
@@ -3534,18 +3434,7 @@ impl SaeManifoldTerm {
                         reason: format!("analytic_outer_rho_gradient_components: {err}"),
                     })?,
             };
-            let coordinate = self
-                .coordinate_block_ard_log_precision_hessian_trace(
-                    rho,
-                    evidence_cache,
-                    evidence_operator,
-                )
-                .map_err(|err| OuterGradientError::InternalInvariant {
-                    reason: format!(
-                        "analytic_outer_rho_gradient_components: coordinate-block ARD trace: {err}"
-                    ),
-                })?;
-            Some((joint, coordinate))
+            Some(joint)
         };
         // #1026 shared-ARD: `ard_flat_index` maps `(k, axis)` onto the flat outer
         // coordinate for BOTH parameterizations. In `Shared` mode several atoms
@@ -3559,14 +3448,14 @@ impl SaeManifoldTerm {
             for axis in 0..rho.log_ard[k].len() {
                 let idx = rho.ard_flat_index(k, axis);
                 explicit[idx] += ard_explicit[k][axis];
-                if let Some((joint, coordinate)) = ard_logdet_traces.as_ref() {
-                    logdet_trace[idx] += joint[k][axis] - coordinate[k][axis];
+                if let Some(joint) = ard_logdet_traces.as_ref() {
+                    logdet_trace[idx] += joint[k][axis];
                 }
             }
         }
 
-        // The scalar criterion replaces `½ log|H_tt|` with the realised-rank
-        // charge. Its direct rho differential belongs alongside the explicit
+        // The scalar criterion adds the realised-rank charge to `½ log|H|`.
+        // Its direct rho differential belongs alongside the explicit
         // penalty channels and is present on every layout (dense or probes).
         //
         // #2087 ATTRIBUTION — folding it in means `explicit` is no longer the
@@ -3595,7 +3484,7 @@ impl SaeManifoldTerm {
         let majorizer_gamma = if exact_a_logdet_route {
             None
         } else {
-            let mut gamma = match logdet_derivative_bundle {
+            let gamma = match logdet_derivative_bundle {
                 Some((probes, sinv)) => self
                     .logdet_theta_adjoint_from_probes(
                         rho,
@@ -3610,25 +3499,10 @@ impl SaeManifoldTerm {
                     .logdet_theta_adjoint(rho, cache, solver)
                     .map_err(OuterGradientError::internal)?,
             };
-            // The coordinate-block leg must be taken on the SAME geometry as the
-            // joint one — `½log|H| − ½log|H_tt|` is one difference, and pairing an
-            // `A` joint with a `B` coordinate block is the same class of error the
-            // geometry type exists to remove.
-            let coordinate_gamma = self
-                .coordinate_block_logdet_theta_adjoint(
-                    rho,
-                    evidence_cache,
-                    evidence_operator,
-                    Some(target),
-                )
-                .map_err(OuterGradientError::internal)?;
-            gamma.t -= &coordinate_gamma.t;
-            gamma.beta -= &coordinate_gamma.beta;
             Some(gamma)
         };
-        // `½ Γ_joint·theta_hat - ½ Γ_tt·theta_hat + ∇R·theta_hat`
-        // is represented by one effective logdet adjoint
-        // `Γ_eff = Γ_joint - Γ_tt + 2∇R`, preserving the existing
+        // `½ Γ_joint·theta_hat + ∇R·theta_hat` is represented by one effective
+        // logdet adjoint `Γ_eff = Γ_joint + 2∇R`, preserving the existing
         // `-½ <Γ_eff, A^-1 g_rho>` contraction convention below.
         let majorizer_gamma = majorizer_gamma.map(|mut gamma| {
             gamma.t.scaled_add(2.0, &rank_charge.theta.t);
@@ -3969,11 +3843,9 @@ impl SaeManifoldTerm {
         // #2724 - the shared exact-stationarity size expression (streaming_plan.rs).
         let dim = sae_exact_stationarity_dim(cache.delta_t_len(), cache.k);
         let solver = DeflatedArrowSolver::plain(cache);
-        // The full joint inverse `G = H⁻¹` and the block-diagonal row-local
-        // t-inverse `H_bd⁻¹` are the two shared helpers whose own docs already say
-        // "Shared by ch4 and ch5"; ch4 had kept inline copies of both (#2500).
+        // The full joint inverse `G = H⁻¹` is the shared helper ch4 and ch5 both
+        // read (#2500).
         let g = self.materialize_joint_inverse(cache, &solver)?;
-        let h_bd = self.materialize_block_diag_t_inverse(cache);
 
 
         // #2500 — ch4 and ch5 read ONE operator map. The doc on
@@ -4008,43 +3880,31 @@ impl SaeManifoldTerm {
         }
         let c_by_flat = self.penalty_curvature_operators_by_flat(rho, cache)?;
 
-        // Precompute G·Cᵢ, H_bd⁻¹·Cᵢ, and their traces for each flat coordinate.
+        // Precompute G·Cᵢ and its trace for each flat coordinate.
         let flats: Vec<usize> = c_by_flat.keys().copied().collect();
         let mut gc: Vec<Array2<f64>> = Vec::with_capacity(flats.len());
-        let mut hc: Vec<Array2<f64>> = Vec::with_capacity(flats.len());
         let mut tr_g: Vec<f64> = Vec::with_capacity(flats.len());
-        let mut tr_h: Vec<f64> = Vec::with_capacity(flats.len());
         for &flat in &flats {
             let c = &c_by_flat[&flat];
             let gci = g.dot(c);
-            let hci = h_bd.dot(c);
             tr_g.push((0..dim).map(|d| gci[[d, d]]).sum());
-            tr_h.push((0..dim).map(|d| hci[[d, d]]).sum());
             gc.push(gci);
-            hc.push(hci);
         }
 
-        // block[i,j] = ½·δ_{ij}·(tr(G Cᵢ) − tr(H_bd⁻¹ Cᵢ))
-        //            − ½·(tr(G Cᵢ G C_j) − tr(H_bd⁻¹ Cᵢ H_bd⁻¹ C_j)).
+        // block[i,j] = ½·δ_{ij}·tr(G Cᵢ) − ½·tr(G Cᵢ G C_j): the Daleckii–Krein
+        // Hessian of ½log|H|, coordinate block included (#2668).
         let mut hessian = Array2::<f64>::zeros((n_params, n_params));
         for (ii, &fi) in flats.iter().enumerate() {
             for (jj, &fj) in flats.iter().enumerate() {
                 let (gi, gj) = (&gc[ii], &gc[jj]);
-                let (hi, hj) = (&hc[ii], &hc[jj]);
                 let mut cross_g = 0.0_f64;
-                let mut cross_h = 0.0_f64;
                 for a in 0..dim {
                     for b in 0..dim {
                         cross_g += gi[[a, b]] * gj[[b, a]];
-                        cross_h += hi[[a, b]] * hj[[b, a]];
                     }
                 }
-                let diag = if ii == jj {
-                    0.5 * (tr_g[ii] - tr_h[ii])
-                } else {
-                    0.0
-                };
-                hessian[[fi, fj]] += diag - 0.5 * (cross_g - cross_h);
+                let diag = if ii == jj { 0.5 * tr_g[ii] } else { 0.0 };
+                hessian[[fi, fj]] += diag - 0.5 * cross_g;
             }
         }
         Ok(hessian)
@@ -4209,27 +4069,18 @@ impl SaeManifoldTerm {
         rho: &SaeManifoldRho,
         target: ArrayView2<'_, f64>,
         cache: &ArrowFactorCache,
-    ) -> Result<(f64, f64), SaeCriterionError> {
+    ) -> Result<f64, SaeCriterionError> {
         let total_t = cache.delta_t_len();
         let a = self.materialize_exact_hessian_dense(rho, target, cache)?;
         let e_diag = self.materialize_ard_concave_clamp_diagonal(rho, cache)?;
-        // #2828 — the border half of `E = B − A`. The COORDINATE block carries no
-        // border rows, so it is priced without it.
+        // #2828 — the border half of `E = B − A`.
         let e_beta = self.decoder_prior_majorizer_gap_border(cache)?;
-        let coordinate_operator = a.slice(s![..total_t, ..total_t]).to_owned();
         let joint = Self::exact_hessian_spectral_block(
             a,
             &e_diag,
             e_beta.as_ref(),
             total_t,
             ArrowMetric::Joint(cache),
-        )?;
-        let coordinate = Self::exact_hessian_spectral_block(
-            coordinate_operator,
-            &e_diag,
-            None,
-            total_t,
-            ArrowMetric::Coordinate(cache),
         )?;
         let joint_pricing = Self::classify_exact_hessian_basin(
             &joint,
@@ -4239,15 +4090,7 @@ impl SaeManifoldTerm {
             |v| ArrowMetric::Joint(cache).quadratic_form(v),
             "joint",
         )?;
-        let coordinate_pricing = Self::classify_exact_hessian_basin(
-            &coordinate,
-            &e_diag,
-            None,
-            total_t,
-            |v| ArrowMetric::Coordinate(cache).quadratic_form(v),
-            "coordinate",
-        )?;
-        Ok((joint_pricing.log_det, coordinate_pricing.log_det))
+        Ok(joint_pricing.log_det)
     }
 
     /// Build a cluster-stable eigensystem and the shared absolute null floor for
@@ -4632,10 +4475,9 @@ impl SaeManifoldTerm {
     }
 
     /// #2330 Phase-2/#2653 — one coherent quotient geometry for the exact-A
-    /// outer-ρ derivative.  The priced pseudo-inverses `(A⁺, A_tt⁺)` and the
-    /// raw signed stationarity pseudoinverse are derived from the SAME joint
-    /// eigensystem and floor. `A_tt⁺` is embedded with a zero β border for
-    /// `logdet_theta_adjoint_dense` indexing.  A genuine saddle still refuses
+    /// outer-ρ derivative.  The priced pseudo-inverse `A⁺` and the raw signed
+    /// stationarity pseudoinverse are derived from the SAME joint eigensystem
+    /// and floor.  A genuine saddle still refuses
     /// the log-determinant derivative; resolved negative directions remain live
     /// in the stationarity solve when the value's clamp pricing admits them.
     fn materialize_exact_hessian_quotient_geometry(
@@ -4645,12 +4487,9 @@ impl SaeManifoldTerm {
         cache: &ArrowFactorCache,
     ) -> Result<ExactHessianQuotientGeometry, String> {
         let total_t = cache.delta_t_len();
-        // #2724 - same shared size expression as the admission ledger.
-        let dim = sae_exact_stationarity_dim(total_t, cache.k);
         let a = self.materialize_exact_hessian_dense(rho, target, cache)?;
         let e_diag = self.materialize_ard_concave_clamp_diagonal(rho, cache)?;
         let e_beta = self.decoder_prior_majorizer_gap_border(cache)?;
-        let a_tt_block = a.slice(s![..total_t, ..total_t]).to_owned();
         let joint = Self::exact_hessian_spectral_block(
             a,
             &e_diag,
@@ -4667,31 +4506,9 @@ impl SaeManifoldTerm {
             "joint",
         )
         .map_err(|error| error.to_string())?;
-        let coordinate = Self::exact_hessian_spectral_block(
-            a_tt_block,
-            &e_diag,
-            None,
-            total_t,
-            ArrowMetric::Coordinate(cache),
-        )?;
-        let mut coordinate_pricing = Self::price_exact_hessian_block(
-            &coordinate,
-            &e_diag,
-            None,
-            total_t,
-            |v| ArrowMetric::Coordinate(cache).quadratic_form(v),
-            "coordinate",
-        )
-        .map_err(|error| error.to_string())?;
-        let mut coordinate_derivative = Array2::<f64>::zeros((dim, dim));
-        coordinate_derivative
-            .slice_mut(s![..total_t, ..total_t])
-            .assign(&coordinate_pricing.a_derivative);
-        coordinate_pricing.a_derivative = coordinate_derivative;
         Ok(ExactHessianQuotientGeometry {
             joint,
             joint_pricing,
-            coordinate_pricing,
         })
     }
 
@@ -5195,8 +5012,8 @@ impl SaeManifoldTerm {
     ///   deflating arm        worst |production − dense| = 3.31e0  (on a −2.50e-1 entry)
     /// ```
     ///
-    /// and against a central finite difference of `½(log|A| − log|A_tt|)` in a
-    /// logit, the dense Γ read `1.373e-1` where the FD read `3.521e-1`, with a
+    /// and against a central finite difference of `½(log|A| − log|A_tt|)` (the
+    /// criterion's complexity when this was measured) in a logit, the dense Γ read `1.373e-1` where the FD read `3.521e-1`, with a
     /// SIGN FLIP on the next logit. So this is not a tolerance question.
     ///
     /// Before the sparse operator was modelled, a ThresholdGate fit could not
@@ -5228,19 +5045,14 @@ impl SaeManifoldTerm {
         // dA. Chain its remaining explicit dE term to rho and theta here.
         let (priced_joint_trace, priced_joint_gamma) =
             self.priced_clamp_adjoint_extras(rho, cache, &geometry.joint_pricing)?;
-        let (priced_tt_trace, priced_tt_gamma) =
-            self.priced_clamp_adjoint_extras(rho, cache, &geometry.coordinate_pricing)?;
         let a_pinv = &geometry.joint_pricing.a_derivative;
-        let a_tt_pinv = &geometry.coordinate_pricing.a_derivative;
         // This value diagonalizes `A_raw = B_raw + ΔC`; differentiate that raw
         // operator, not the row-conditioned operator carried by arrow factors.
         let da_by_flat = self.exact_stationarity_penalty_derivatives_by_flat(rho, cache)?;
         let frob = |x: &Array2<f64>, y: &Array2<f64>| -> f64 { (x * y).sum() };
         let mut logdet_trace = Array1::<f64>::zeros(n_params);
         for (&i, da) in da_by_flat.iter() {
-            // A_tt⁺ has a zero β border, so frobbing it against the full ∂A/∂ρ_i
-            // restricts to the t–t block automatically.
-            logdet_trace[i] = 0.5 * frob(&a_pinv, da) - 0.5 * frob(&a_tt_pinv, da);
+            logdet_trace[i] = 0.5 * frob(&a_pinv, da);
         }
         // Ordered-Beta–Bernoulli sparse coordinate: its ∂A/∂ρ_sparse is the exact
         // integrated-marginal logit Hessian (cross-row), absent from the operator
@@ -5251,7 +5063,7 @@ impl SaeManifoldTerm {
                 AssignmentMode::OrderedBetaBernoulli { .. }
             ) {
                 logdet_trace[sparse] =
-                    self.dense_exact_a_ordered_bb_sparse_trace(rho, cache, &a_pinv, &a_tt_pinv)?;
+                    self.dense_exact_a_ordered_bb_sparse_trace(rho, cache, &a_pinv)?;
             }
         }
         let mut gamma = self.logdet_theta_adjoint_dense(
@@ -5263,21 +5075,10 @@ impl SaeManifoldTerm {
             true,
             Some(target),
         )?;
-        let gamma_tt = self.logdet_theta_adjoint_dense(
-            rho,
-            cache,
-            &a_tt_pinv,
-            ThetaAdjointDhChannel::All,
-            true,
-            true,
-            Some(target),
-        )?;
-        gamma.t -= &gamma_tt.t;
-        gamma.beta -= &gamma_tt.beta;
         // The scalar criterion carries a leading half; Gamma is the full
         // log-determinant theta derivative used in the caller's -1/2 IFT fold.
-        logdet_trace.scaled_add(0.5, &(&priced_joint_trace - &priced_tt_trace));
-        gamma.t += &(&priced_joint_gamma - &priced_tt_gamma);
+        logdet_trace.scaled_add(0.5, &priced_joint_trace);
+        gamma.t += &priced_joint_gamma;
         gamma.beta += &self.decoder_prior_gap_theta_trace(
             cache, geometry.joint_pricing.clamp_border_derivative.view(),
         )?;
@@ -5309,8 +5110,8 @@ impl SaeManifoldTerm {
     /// `G = Σ_i inv[i,i]·w_i·curv_i`, `curv'_i = z_i(1−z_i)(1−6z_i+6z_i²)/τ³`):
     ///   `Γ[w=(r,c)] = weight·{ S''_c·u_r·P + 2·S'_c·w_r·curv_r·(inv·u)_r
     ///                          + S'_c·u_r·G + S_c·inv[r,r]·w_r·curv'_r }`.
-    /// Contracts whichever pseudo-inverse the caller passes (`A⁺` for the joint
-    /// leg, `A_tt⁺` for the coordinate leg), on the logit t-slots.
+    /// Contracts the matrix the caller passes as `inv` (production passes `A⁺`
+    /// of the joint operator), on the logit t-slots.
     fn dense_exact_a_ordered_bb_logit_theta_adjoint(
         &self,
         cache: &ArrowFactorCache,
@@ -5390,7 +5191,6 @@ impl SaeManifoldTerm {
         rho: &SaeManifoldRho,
         cache: &ArrowFactorCache,
         a_pinv: &Array2<f64>,
-        a_tt_pinv: &Array2<f64>,
     ) -> Result<f64, String> {
         if self.assignment.effective_alpha_is_learnable() {
             return Err(
@@ -5443,12 +5243,11 @@ impl SaeManifoldTerm {
                 }
             }
         }
-        // ½[tr(A⁺ ∂A/∂ρ_sparse) − tr(A_tt⁺ ∂A/∂ρ_sparse)], column by column over
+        // ½tr(A⁺ ∂A/∂ρ_sparse), column by column over
         // the flat logit basis: ∂A/∂ρ_sparse·e_j = ΔC_obb·e_j + hdiag[j]·e_j.
         let n_logits = n * k_atoms;
         let mut e = Array1::<f64>::zeros(n_logits);
         let mut tr_joint = 0.0_f64;
-        let mut tr_coord = 0.0_f64;
         for jrow in 0..n {
             for jatom in 0..k_atoms {
                 let Some(gj) = logit_gindex[jrow][jatom] else {
@@ -5471,15 +5270,13 @@ impl SaeManifoldTerm {
                         }
                         if let Some(gi) = logit_gindex[irow][iatom] {
                             tr_joint += a_pinv[[gi, gj]] * val;
-                            tr_coord += a_tt_pinv[[gi, gj]] * val;
                         }
                     }
                 }
                 tr_joint += a_pinv[[gj, gj]] * hdiag[jflat];
-                tr_coord += a_tt_pinv[[gj, gj]] * hdiag[jflat];
             }
         }
-        Ok(0.5 * (tr_joint - tr_coord))
+        Ok(0.5 * tr_joint)
     }
 
     /// Assemble `ΔC = A − B` per row, so the arrow evidence system can carry the
@@ -6030,27 +5827,10 @@ mod test_support {
         let geometry = term
             .materialize_exact_hessian_quotient_geometry(&rho, target.view(), &cache)
             .expect("priced spectral geometry");
-        let base_e = term
-            .materialize_ard_concave_clamp_diagonal(&rho, &cache)
-            .expect("base clamp");
-        let coordinate = super::SaeManifoldTerm::exact_hessian_spectral_block(
-            geometry
-                .joint
-                .operator
-                .slice(s![..cache.delta_t_len(), ..cache.delta_t_len()])
-                .to_owned(),
-            &base_e,
-            None,
-            cache.delta_t_len(),
-            super::ArrowMetric::Coordinate(&cache),
-        )
-        .expect("coordinate spectral geometry");
         let h = 1.0e-6;
         let mut live = 0;
-        for (block, pricing) in [
-            (&geometry.joint, &geometry.joint_pricing),
-            (&coordinate, &geometry.coordinate_pricing),
-        ] {
+        {
+            let (block, pricing) = (&geometry.joint, &geometry.joint_pricing);
             let (_, analytic) = term
                 .priced_clamp_adjoint_extras(&rho, &cache, pricing)
                 .expect("explicit clamp derivative");

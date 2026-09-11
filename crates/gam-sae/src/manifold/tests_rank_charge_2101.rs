@@ -172,13 +172,12 @@ fn rank_charge_k3_accepts_clean_atoms() {
 #[test]
 fn rank_charge_prices_zero_dof_without_re_adjudicating_disappearance() {
     let zero_charge =
-        super::construction::rank_adjusted_quasi_laplace_complexity(1.0, 0.5, &[0.0], &[10.0])
+        super::construction::rank_adjusted_quasi_laplace_complexity(1.0, &[0.0], &[10.0])
             .expect("the upstream same-state signal proof owns decoder disappearance");
-    assert_eq!(zero_charge, 0.25);
+    assert_eq!(zero_charge, 0.5);
 
     let error = super::construction::rank_adjusted_quasi_laplace_complexity(
         1.0,
-        0.5,
         &[0.0, f64::NAN],
         &[10.0, 10.0],
     )

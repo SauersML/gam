@@ -184,7 +184,7 @@ impl SaeCriterion {
     ///
     /// `data_fit_priors_value` is `loss.total() + extra_penalty_energy`;
     /// `quasi_laplace_complexity_value` is the exact production scalar
-    /// `½log|H| − ½log|H_tt| + rank_charge`; `occam` is the smoothing Occam
+    /// `½log|H| + rank_charge`; `occam` is the smoothing Occam
     /// term (the criterion subtracts it). The gradient component arrays are the
     /// `SaeOuterRhoGradientComponents` channels.
     #[must_use]

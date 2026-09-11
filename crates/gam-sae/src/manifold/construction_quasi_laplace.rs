@@ -89,33 +89,28 @@ impl SaeManifoldTerm {
     ///
     /// ```text
     /// V(ρ) = ℓ_pen(t̂, β̂; ρ) + E_extra
-    ///        + ½ log|A| − ½ log|A_tt| + Σ_k ½ · dof_k · log(max(N_eff_k, 1))
+    ///        + ½ log|A| + Σ_k ½ · dof_k · log(max(N_eff_k, 1))
     ///        − ½ · p · (Σ_k rank S_k) · log λ_smooth
     /// ```
     ///
     /// where `ℓ_pen = loss.total()` is the penalised objective at the inner
     /// optimum and the middle line is the #2a occupancy-aware BIC/Laplace
     /// complexity assembled by `rank_adjusted_quasi_laplace_complexity` from
-    /// the EXACT observed information: `log|A|` joint, `log|A_tt|` on the
-    /// coordinate block, plus the per-atom realised-DOF rank charge.
+    /// the EXACT observed information: the joint `log|A|`, coordinate block
+    /// included, plus the per-atom realised-DOF rank charge.
     ///
-    /// #2a SUPERSEDED the majorizer form. This doc previously described the
-    /// charge as `½ log|B|` over the PSD / Gauss--Newton arrow-Schur factor, and
-    /// argued that because `B_tt` carries `α = exp(log_ard)` on its diagonal,
-    /// `½ log|B|` rises as α grows and balances the `−½·n·log α` already inside
-    /// `loss.ard` — concluding the criterion therefore needs no clamp to stay
-    /// finite on a collapsing axis. **That balance no longer exists**, because
-    /// `− ½ log|A_tt|` subtracts the coordinate block, which is the only place α
-    /// enters, and the rank charge `Σ ½·dof·log(max(N_eff,1))` is α-free.
-    ///
-    /// gam#2627 measured the consequence on a collapsed axis (`‖t₁‖² ≈ 4e-10`,
-    /// `n = 4`): `dV/d log α = −2.0000000000` to ~1e-12 with zero curvature,
-    /// i.e. exactly `−n/2` — the `loss.ard` term standing alone. Whether
-    /// `−½·n·log α` should have been dropped from `V` when #2a retired the
-    /// majorizer coordinate term, or whether #2a owes `V` a replacement
-    /// α-charge, is an open question on that issue. Until it is settled, do not
-    /// rely on the retired balance above as a reason this criterion is
-    /// clamp-free on a collapsing axis.
+    /// #2a superseded the majorizer form (`½ log|B|` over the PSD /
+    /// Gauss--Newton arrow-Schur factor), and this seam then also subtracted the
+    /// coordinate block `½ log|A_tt|`. That subtraction removed the only place
+    /// `α = exp(log_ard)` enters the complexity while `loss.ard` kept its
+    /// `−½·n·log α` normalizer; the rank charge `Σ ½·dof·log(max(N_eff,1))` is
+    /// α-free. gam#2627 measured the consequence on a collapsed axis
+    /// (`‖t₁‖² ≈ 4e-10`, `n = 4`): `dV/d log α = −2.0000000000` to ~1e-12 with
+    /// zero curvature, exactly `−n/2`, the `loss.ard` term standing alone.
+    /// #2668 keeps the coordinate block inside `log|A|`. On a Euclidean ARD axis
+    /// `A_tt` carries α on its diagonal, so `∂(½ log|A|)/∂ log α = ½·α·tr[A⁻¹]_tt`
+    /// and V's log-α stationarity condition is the MacKay fixed point
+    /// `α = n/(‖t‖² + tr[A⁻¹]_tt)` that the EFS step iterates.
     ///
     /// The final `−½·p·rank(S)·log λ_smooth` term is the smoothing-penalty
     /// normaliser `−½ log|λ S|_+` restricted to its ρ-dependent part: `S_k` is
@@ -222,7 +217,7 @@ impl SaeManifoldTerm {
             // Phase-2 migrated the DENSE lane to the exact observed information
             // `A = ∇²_θθ L = B + ΔC` and left this one on the Arrow–Schur
             // majorizer `B`, so the objectives split by exactly
-            // `½·[(log|A| − log|A_tt|) − (log|B| − log|B_tt|)]` whenever `ΔC ≠ 0`
+            // `½·(log|A| − log|B|)` whenever `ΔC ≠ 0`
             // (residual curvature, softmax entropy-minus-majorizer, the periodic
             // ARD concave clamp, ordered Beta–Bernoulli). The #1225 statement
             // above is the CONTRACT, and it is currently unmet on this branch;
@@ -415,13 +410,12 @@ impl SaeManifoldTerm {
         loss.criterion_gauge_deflated_directions = cache.gauge_deflated_directions;
         // #2330 Phase-2: rank the EXACT observed-information Laplace term ½log|A|
         // (A = B + ΔC = ∇²_θθ L), not the majorizer surrogate ½log|B|. One
-        // eigendecomposition yields BOTH the joint log|A| and the coordinate-block
-        // log|A_tt|, applying the shared PD floor; an indefinite A (a majorizer
-        // saddle) returns the typed IndefiniteObservedInformation refusal, which
-        // makes saddle-ρ probe-infeasible (+inf) and steers the outer away until
-        // the #2336 accepted-lane saddle-escape lands.
-        let (log_det, log_det_tt) =
-            self.exact_observed_information_log_dets(rho, target, &cache)?;
+        // eigendecomposition yields the joint log|A|, applying the shared PD
+        // floor; an indefinite A (a majorizer saddle) returns the typed
+        // IndefiniteObservedInformation refusal, which makes saddle-ρ
+        // probe-infeasible (+inf) and steers the outer away until the #2336
+        // accepted-lane saddle-escape lands.
+        let log_det = self.exact_observed_information_log_dets(rho, target, &cache)?;
 
         // 3. Smoothing-penalty Occam term `−½·Σ_k r_k·rank(S_k)·log λ_smooth`
         //    plus the profiled-frame evidence-dimension correction
@@ -445,15 +439,16 @@ impl SaeManifoldTerm {
             .map_err(|err| format!("SaeManifoldTerm::penalized_quasi_laplace_criterion: {err}"))?;
 
         let v = {
-            // #5/(B): replace the COORDINATE-block ½log|H_tt| in the Laplace
-            // complexity with the honest BIC ½·d_eff·log n on each atom's realised
-            // decoder rank. The decoder-scale mispricing (`½log(a²‖B‖²)` scale,
-            // over-charging real atoms + rewarding a²‖B‖²→0) lives ENTIRELY in the
-            // coordinate block (`H_tt ∝ ‖B‖²`); the β/Schur block is
-            // ‖B‖-independent (ρ⁰ coupling) and stays. `d_eff` is rotation-
-            // invariant, so it accepts a real rank-2 circle but does not
-            // distinguish clean-vs-blend (producer's job). A certified vanished
-            // atom is a typed boundary before rank pricing.
+            // #5/(B): the Laplace complexity is ½log|A| plus the honest BIC
+            // ½·d_eff·log n on each atom's realised decoder rank. The coordinate
+            // block stays inside log|A| (#2668): every row of `A_tt` carries the ARD
+            // precision α that balances the `−½·n·log α` normalizer in `loss.ard`,
+            // and subtracting the block, as this seam once did to remove the
+            // decoder-scale term (`H_tt ∝ ‖B‖²`), left V falling linearly in log α
+            // on a collapsing axis. `d_eff` is rotation-invariant, so it accepts a
+            // real rank-2 circle but does not distinguish clean-vs-blend (producer's
+            // job). A certified vanished atom is a typed boundary before rank
+            // pricing.
             // Decoder disappearance is certified first from the raw output-frame
             // residual and gated decoder Grams. It has no tuned noise multiple:
             // the boundary is derived from the residual reduction's floating-point
@@ -495,14 +490,12 @@ impl SaeManifoldTerm {
             // disappearance verdict from `d_eff == 0`: DOF also contains the
             // smooth-basis charge and is not a physical reconstruction signal.
             // #2a — occupancy-aware BIC/Laplace scale. The shared scalar helper
-            // owns the exact replacement
-            // `0.5 log|H| - 0.5 log|H_tt| + rank_charge`; dense, streaming, and
+            // owns `0.5 log|A| + rank_charge`; dense, streaming, and
             // criterion-as-atoms assembly therefore cannot drift apart.
-            // log_det (= log|A|) and log_det_tt (= log|A_tt|) are produced together
-            // above from the exact observed information; the majorizer `½log|B_tt|` is
-            // no longer the ranked coordinate term.
+            // log_det (= log|A|, coordinate block included) comes from the exact
+            // observed information above (#2668).
             let quasi_laplace_complexity =
-                rank_adjusted_quasi_laplace_complexity(log_det, log_det_tt, &d_eff, &n_eff)?;
+                rank_adjusted_quasi_laplace_complexity(log_det, &d_eff, &n_eff)?;
             loss.total() + extra_penalty_energy + quasi_laplace_complexity - occam
         };
         Ok((v, loss, cache))
@@ -3759,8 +3752,8 @@ impl SaeManifoldTerm {
             &options,
             true,
         )?;
-        // #9: accumulate the per-atom Grams + N_eff + log_det_tt in the same
-        // log-det pass. These are required by the canonical rank-charge criterion.
+        // #9: accumulate the per-atom Grams + N_eff in the same log-det pass.
+        // These are required by the canonical rank-charge criterion.
         let mut rank_inputs = StreamingRankInputs::default();
         // #2515 — an INDEFINITE exact-A verdict from the arrow evidence route must
         // arrive here as the SAME typed error the dense route raises, not as a
@@ -3799,19 +3792,16 @@ impl SaeManifoldTerm {
                 })?;
         let v = {
             let ri = rank_inputs;
-            // #9/#5 streaming rank charge: replace the coordinate-block ½log|H_tt|
-            // (= log_det_tt/2, exposed by the log-det pass) with Σ ½·d_eff·log n on
-            // each atom's realised decoder rank, priced through the SAME
-            // `rank_dof_from_grams` MP hard count as the dense path off the
-            // chunk-accumulated Grams. The β/Schur block (the ‖B‖-independent part
-            // of log_det) is untouched by the rank charge — but it is where #2509
-            // lives. The shared seam is `0.5*(log_det − log_det_tt) + rank_charge`,
-            // and on THIS lane `log_det = log_det_tt + log|S_B|` by construction,
-            // so the criterion's whole exposure to the A-vs-B operator split is
-            // `log|S_A|` against `log|S_B|`: the per-row t-block log-dets cancel.
-            // (On the dense lane the two log-dets come from two independent
-            // spectral classifications of `A` and `A_tt`, so their difference is
-            // `log|S_A|` only where neither PD floor deflates a direction.)
+            // #9/#5 streaming rank charge: the criterion charges ½·log_det, the
+            // whole joint arrow log-det with the coordinate blocks included, as the
+            // dense lane charges ½log|A|, and adds Σ ½·d_eff·log n on each atom's
+            // realised decoder rank, priced through the SAME `rank_dof_from_grams`
+            // MP hard count as the dense path off the chunk-accumulated Grams. The
+            // shared seam is `0.5*log_det + rank_charge`. On THIS lane
+            // `log_det = Σ log|H_tt| + log|S_B|` by construction, so the per-row
+            // t-block log-dets enter both lanes identically and the criterion's
+            // exposure to the A-vs-B operator split (#2509) is `log|S_A|` against
+            // `log|S_B|`.
             let residual = self.reconstruction_residual(target, rho)?;
             let residual_energy = self.residual_energy_for_vanishing(residual.view())?;
             match self.vanished_atoms_from_signal_upper_bound(
@@ -3846,7 +3836,7 @@ impl SaeManifoldTerm {
             // disappearance verdict. The scalar rank-charge seam only prices the
             // already-certified live state.
             let quasi_laplace_complexity =
-                rank_adjusted_quasi_laplace_complexity(log_det, ri.log_det_tt, &d_eff, &ri.n_eff)?;
+                rank_adjusted_quasi_laplace_complexity(log_det, &d_eff, &ri.n_eff)?;
             loss.total() + extra_penalty_energy + quasi_laplace_complexity - occam
         };
         Ok((v, loss, converged_cache, evidence_artifacts))
@@ -4187,13 +4177,11 @@ impl SaeManifoldTerm {
             ));
         }
         // #9: when the rank charge is on, accumulate the per-atom Grams + effective
-        // sample sizes chunk-additively alongside the log-det (single pass), and
-        // hand back the coordinate-block `log_det_tt` (= 2·htt_half). Zero cost /
-        // untouched when `None`.
+        // sample sizes chunk-additively alongside the log-det (single pass). Zero
+        // cost / untouched when `None`.
         if let Some(ri) = rank_inputs.as_deref_mut() {
             ri.grams = self.empty_decoder_gram_accumulator();
             ri.n_eff = vec![0.0; self.k_atoms()];
-            ri.log_det_tt = 0.0;
         }
         let plan = self.streaming_plan()?.admitted_or_error(
             self.n_obs(),
@@ -4306,9 +4294,6 @@ impl SaeManifoldTerm {
                     "SaeManifoldTerm::streaming_exact_arrow_log_det_with_lane_and_system: matrix-free reduced-Schur \
                      log|S| non-finite ({log_det_schur})"
                 ));
-            }
-            if let Some(ri) = rank_inputs.as_deref_mut() {
-                ri.log_det_tt = log_det_tt;
             }
             return Ok((
                 log_det_tt + log_det_schur,
@@ -4429,9 +4414,6 @@ impl SaeManifoldTerm {
             exact_a.map(|metrics| metrics.1),
         )
         .map_err(|err| format!("SaeManifoldTerm::streaming_exact_arrow_log_det_with_lane_and_system: {err}"))?;
-        if let Some(ri) = rank_inputs.as_deref_mut() {
-            ri.log_det_tt = log_det_tt;
-        }
         Ok((log_det_tt + log_det_schur, None))
     }
 
@@ -4859,174 +4841,6 @@ impl SaeManifoldTerm {
             }
         }
         Ok(0.5 * trace)
-    }
-
-    /// Derivative of the coordinate-block logdet
-    /// `½ Σ_i log|H_tt^(i)|` with respect to the assignment-strength rho
-    /// coordinate. The canonical criterion subtracts this term from the full
-    /// joint logdet, so the outer gradient must subtract this trace too.
-    /// `operator` (#2515) selects the `∂H/∂ρ_sparse` operand exactly as the joint
-    /// leg's does: `B`'s diagonal Gershgorin majorizer, or `A`'s dense entropy
-    /// Hessian. Both legs of `½log|H| − ½log|H_tt|` must name the same operator.
-    pub(crate) fn coordinate_block_assignment_log_strength_hessian_trace(
-        &self,
-        rho: &SaeManifoldRho,
-        cache: &ArrowFactorCache,
-        operator: EvidenceOperator,
-    ) -> Result<f64, String> {
-        self.assignment.validate_rho_domain(rho)?;
-        let k_atoms = self.k_atoms();
-        let assignment_dim = self.assignment.assignment_coord_dim();
-        let row_weights = self.row_loss_weights.as_deref();
-
-        let softmax = match self.assignment.mode {
-            AssignmentMode::Softmax {
-                temperature,
-                sparsity,
-            } if k_atoms > 1 => {
-                let inv_tau = temperature.recip();
-                Some((
-                    temperature,
-                    rho.lambda_sparse()? * sparsity * inv_tau * inv_tau,
-                ))
-            }
-            AssignmentMode::Softmax { .. } => return Ok(0.0),
-            _ => None,
-        };
-        // Per-row softmax assignment scratch, reused across rows (the softmax arm
-        // reads `a` rather than raw logits so both operator arms come off ONE
-        // vector — see `softmax_sparse_curvature_rho_derivative_block`).
-        let mut softmax_assignments = Array1::<f64>::zeros(k_atoms);
-        let mut hdiag = if softmax.is_none() {
-            crate::assignment::assignment_prior_log_strength_hdiag_weighted(
-                &self.assignment,
-                rho,
-                row_weights,
-            )?
-        } else {
-            Array1::<f64>::zeros(0)
-        };
-        if softmax.is_none() && hdiag.is_empty() {
-            return Ok(0.0);
-        }
-
-        let ordered_beta_bernoulli_channels =
-            ordered_beta_bernoulli_psd_majorizer_third_channels_weighted(
-                &self.assignment,
-                rho,
-                row_weights,
-            )?;
-        let learnable_alpha = matches!(
-            self.assignment.mode,
-            AssignmentMode::OrderedBetaBernoulli {
-                learnable_alpha: true,
-                ..
-            }
-        );
-        if let Some(channels) = ordered_beta_bernoulli_channels.as_ref() {
-            for row in 0..self.n_obs() {
-                for atom in 0..k_atoms {
-                    let index = row * k_atoms + atom;
-                    hdiag[index] = if learnable_alpha {
-                        super::construction_arrow_schur_assembly::ordered_beta_bernoulli_psd_majorized_log_alpha_hdiag(
-                            channels, row, k_atoms, atom, hdiag[index],
-                        )
-                    } else {
-                        super::construction_arrow_schur_assembly::ordered_beta_bernoulli_psd_majorized_hdiag(
-                            channels, row, k_atoms, atom, hdiag[index],
-                        )
-                    };
-                }
-            }
-        }
-
-        let mut total_trace = 0.0_f64;
-        for row in 0..self.n_obs() {
-            let q = cache.row_dims[row];
-            let factor = cache.undamped_factor(row);
-            let mut inverse = Array2::<f64>::zeros((q, q));
-            let mut unit = Array1::<f64>::zeros(q);
-            for col in 0..q {
-                unit.fill(0.0);
-                unit[col] = 1.0;
-                let solved = cholesky_solve_vector(factor, unit.view());
-                for inverse_row in 0..q {
-                    inverse[[inverse_row, col]] = solved[inverse_row];
-                }
-            }
-            let mut derivative = Array2::<f64>::zeros((q, q));
-            if let Some((_temperature, scale)) = softmax.as_ref() {
-                let row_weight = row_weights.map_or(1.0, |weights| weights[row]);
-                match self.last_row_layout {
-                    Some(_) => {}
-                    None => {
-                        self.assignment.try_assignments_row_into(
-                            row,
-                            softmax_assignments
-                                .as_slice_mut()
-                                .expect("softmax assignment scratch is contiguous"),
-                        )?;
-                        let a_soft = softmax_assignments
-                            .as_slice()
-                            .expect("softmax assignment scratch is contiguous");
-                        let m = softmax_majorizer_log_mean(a_soft);
-                        let slot_atoms: Vec<usize> = (0..assignment_dim.min(q)).collect();
-                        let block = softmax_sparse_curvature_rho_derivative_block(
-                            a_soft,
-                            &slot_atoms,
-                            m,
-                            *scale,
-                            row_weight,
-                            operator,
-                        );
-                        for (a, _) in slot_atoms.iter().enumerate() {
-                            for (b, _) in slot_atoms.iter().enumerate() {
-                                derivative[[a, b]] = block[[a, b]];
-                            }
-                        }
-                    }
-                }
-            } else {
-                let assignment_base = row * k_atoms;
-                match self.last_row_layout {
-                    Some(ref layout) => {
-                        for (slot, &atom) in layout.active_atoms[row].iter().enumerate() {
-                            derivative[[slot, slot]] = hdiag[assignment_base + atom];
-                        }
-                    }
-                    None => {
-                        for atom in 0..assignment_dim.min(q) {
-                            derivative[[atom, atom]] = hdiag[assignment_base + atom];
-                        }
-                    }
-                }
-            }
-            let mut row_trace = 0.0_f64;
-            for a in 0..q {
-                for b in 0..q {
-                    row_trace += inverse[[b, a]] * derivative[[a, b]];
-                }
-            }
-            let directions = cache
-                .deflated_row_directions
-                .get(row)
-                .map(Vec::as_slice)
-                .unwrap_or(&[]);
-            let spectrum = cache
-                .deflation_row_spectra
-                .get(row)
-                .and_then(Option::as_ref);
-            // A clamp-basin classification changes the priced spectrum without
-            // unit-deflating a direction.  Its direction list is therefore empty,
-            // but the stored raw/conditioned spectrum still owns a non-identity
-            // Daleckii--Krein map and must differentiate it (#2515/#2336).
-            if Self::row_deflation_is_live(directions, spectrum) {
-                row_trace -=
-                    Self::deflation_block_correction(&inverse, &derivative, directions, spectrum);
-            }
-            total_trace += row_trace;
-        }
-        Ok(0.5 * total_trace)
     }
 
     /// Matrix-free sibling of [`Self::assignment_log_strength_hessian_trace`]
@@ -6300,25 +6114,6 @@ impl SaeManifoldTerm {
             EvidenceOperator::Majorizer,
             None,
         )
-    }
-
-    /// `Γ_tt = ∂_theta Σ_i log|H_tt^(i)|`, the state derivative of the
-    /// coordinate-block logdet removed by the canonical rank-charge criterion.
-    /// #2515 — the coordinate-block leg takes NO solver. Its `joint_block = false`
-    /// arm never reaches one: `fast_selected` short-circuits on `joint_block`,
-    /// `beta_inv` is the zero block, and every row's `(H⁻¹)_tt` is the row-local
-    /// Cholesky inverse. Accepting a solver here only created a way for a caller
-    /// to pair this leg with a different operator's inverse than the joint leg it
-    /// is subtracted from, which is the class of defect #2515 is about.
-    pub(crate) fn coordinate_block_logdet_theta_adjoint(
-        &self,
-        rho: &SaeManifoldRho,
-        cache: &ArrowFactorCache,
-        operator: EvidenceOperator,
-        residual_target: Option<ArrayView2<'_, f64>>,
-    ) -> Result<SaeArrowVector, String> {
-        let solver = DeflatedArrowSolver::plain(cache);
-        self.logdet_theta_adjoint_for_block(rho, cache, &solver, false, operator, residual_target)
     }
 
     fn logdet_theta_adjoint_for_block(

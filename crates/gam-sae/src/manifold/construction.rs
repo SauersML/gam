@@ -47,17 +47,15 @@ use super::fit_drivers::GaugeOrbitDescent;
 // WBIC count remains audit-only.
 
 /// #9 streaming rank-charge inputs, accumulated in a SINGLE pass through
-/// `SaeManifoldTerm::streaming_exact_arrow_log_det_with_lane_and_system`: the coordinate-block
-/// log-det `log_det_tt` (= 2·`htt_half`; the part the
-/// rank charge replaces), plus the per-atom decoder Grams `G_k =
-/// Φ_kᵀdiag(a_k²)Φ_k` and the effective sample sizes `N_eff,k = Σ_row a_k²`.
+/// `SaeManifoldTerm::streaming_exact_arrow_log_det_with_lane_and_system`: the
+/// per-atom decoder Grams `G_k = Φ_kᵀdiag(a_k²)Φ_k` and the effective sample sizes
+/// `N_eff,k = Σ_row a_k²`.
 /// Both are chunk-additive, so accumulating them over the streaming chunks equals
 /// the dense `accumulate_decoder_gram` / `Σ a²` exactly — the streaming criterion
 /// then prices atoms through the SAME `rank_dof_from_grams` MP hard count as the
 /// dense path (the dense-vs-streaming parity guarantee).
 #[derive(Default)]
 pub struct StreamingRankInputs {
-    pub(crate) log_det_tt: f64,
     pub(crate) grams: Vec<Array2<f64>>,
     pub(crate) n_eff: Vec<f64>,
 }
@@ -694,19 +692,26 @@ pub(crate) fn realised_rank_charge_dof(
 
 /// The one production Laplace-complexity scalar:
 ///
-/// `0.5 * log|H| - 0.5 * log|H_tt| +
-///  sum_k 0.5 * d_eff_k * log(max(N_eff_k, 1))`.
+/// `0.5 * log|H| + sum_k 0.5 * d_eff_k * log(max(N_eff_k, 1))`.
+///
+/// `log|H|` is the joint `(t, β)` log-determinant, coordinate block included.
+/// On a Euclidean ARD axis the Gaussian coordinate prior contributes its
+/// normalizer `−½·n·log α` to `loss.total()`, and the coordinate block of
+/// `log|H|` carries the balancing `α` on every row of `H_tt`. Subtracting
+/// `½log|H_tt|` removed that balance while keeping the normalizer, so the
+/// criterion can fall with `α` where the EFS step (`α = n/(‖t‖² + tr H⁻¹)`)
+/// solves the full Laplace equation — two different equations for one
+/// coordinate. Measured on the #2668 collapse fixture: `V(α*) − V(e·α*) = 2 =
+/// n/2` at `n = 4`, and the grid argmin pinned at its top endpoint.
 ///
 /// Dense, streaming, and criterion-as-atoms assembly all call this function so
-/// the value cannot retain the full coordinate logdet after the analytic
-/// gradient has switched to the realised-rank charge. Decoder disappearance is
+/// the three routes rank the same scalar. Decoder disappearance is
 /// not re-adjudicated here from a scalar DOF: each production criterion first
 /// runs the same-state gated-signal certificate, and only that certificate may
 /// return [`SaeCriterionError::VanishedAtoms`]. A zero DOF that reaches this
 /// arithmetic seam therefore contributes exactly zero charge.
 pub(crate) fn rank_adjusted_quasi_laplace_complexity(
     log_det: f64,
-    log_det_tt: f64,
     d_eff: &[f64],
     n_eff: &[f64],
 ) -> Result<f64, SaeCriterionError> {
@@ -717,10 +722,9 @@ pub(crate) fn rank_adjusted_quasi_laplace_complexity(
             n_eff.len()
         )));
     }
-    if !(log_det.is_finite() && log_det_tt.is_finite()) {
+    if !log_det.is_finite() {
         return Err(SaeCriterionError::Numerical(format!(
-            "rank_adjusted_quasi_laplace_complexity: non-finite logdet input \
-             (joint={log_det}, coordinate={log_det_tt})"
+            "rank_adjusted_quasi_laplace_complexity: non-finite joint logdet input {log_det}"
         )));
     }
     let mut rank_charge = 0.0_f64;
@@ -737,7 +741,7 @@ pub(crate) fn rank_adjusted_quasi_laplace_complexity(
         }
         rank_charge += 0.5 * dof * occupancy.max(1.0).ln();
     }
-    let value = 0.5 * (log_det - log_det_tt) + rank_charge;
+    let value = 0.5 * log_det + rank_charge;
     if value.is_finite() {
         Ok(value)
     } else {

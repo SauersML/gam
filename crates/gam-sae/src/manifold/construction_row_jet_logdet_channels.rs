@@ -1722,7 +1722,6 @@ mod tests_trace_adjoint_dense_parity_2333 {
         let joint_inverse = term
             .materialize_joint_inverse(&cache, &solver)
             .expect("#2333 dense joint inverse");
-        let coordinate_inverse = term.materialize_block_diag_t_inverse(&cache);
         let dense_joint = term
             .logdet_theta_adjoint_dense(
                 &rho,
@@ -1734,53 +1733,25 @@ mod tests_trace_adjoint_dense_parity_2333 {
                 None,
             )
             .expect("#2333 dense joint theta-adjoint");
-        let dense_coordinate = term
-            .logdet_theta_adjoint_dense(
-                &rho,
-                &cache,
-                &coordinate_inverse,
-                ThetaAdjointDhChannel::All,
-                false,
-                false,
-                None,
-            )
-            .expect("#2333 dense coordinate-block theta-adjoint");
         let production_joint = term
             .logdet_theta_adjoint(&rho, &cache, &solver)
             .expect("#2333 production joint adjoint");
-        let production_coordinate = term
-            .coordinate_block_logdet_theta_adjoint(
-                &rho,
-                &cache,
-                EvidenceOperator::Majorizer,
-                None,
-            )
-            .expect("#2333 production coordinate-block adjoint");
 
         let joint_gap = max_abs_gap(&dense_joint, &production_joint);
-        let coordinate_gap = max_abs_gap(&dense_coordinate, &production_coordinate);
         let joint_scale = scale_of(&production_joint);
-        let coordinate_scale = scale_of(&production_coordinate);
         eprintln!(
             "#2333 TRACE_DENSE_PARITY live_fold_rows={live_rows} \
              anchor=(sparse={anchor_sparse:.1}, smooth={anchor_smooth:.1}) \
-             joint_gap={joint_gap:.6e} joint_scale={joint_scale:.6e} \
-             coordinate_gap={coordinate_gap:.6e} coordinate_scale={coordinate_scale:.6e}"
+             joint_gap={joint_gap:.6e} joint_scale={joint_scale:.6e}"
         );
         assert!(
-            joint_scale > 0.0 && coordinate_scale > 0.0,
-            "#2333 both adjoint legs must be non-trivial; joint scale {joint_scale:.3e}, \
-             coordinate scale {coordinate_scale:.3e}"
+            joint_scale > 0.0,
+            "#2333 the joint adjoint must be non-trivial; joint scale {joint_scale:.3e}"
         );
         assert!(
             joint_gap <= 1.0e-12 * (1.0 + joint_scale),
             "#2333 joint Trace/dense parity exceeded 1e-12 relative: gap={joint_gap:.6e} \
              scale={joint_scale:.6e}"
-        );
-        assert!(
-            coordinate_gap <= 1.0e-12 * (1.0 + coordinate_scale),
-            "#2333 coordinate-block Trace/dense parity exceeded 1e-12 relative: \
-             gap={coordinate_gap:.6e} scale={coordinate_scale:.6e}"
         );
     }
 }

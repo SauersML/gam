@@ -1331,8 +1331,8 @@ fn zz_measure_wide_p_criterion_cost_localizer_2080() {
             a_dense.ncols()
         );
         assert!(
-            log_dets.0.is_finite() && log_dets.1.is_finite(),
-            "p={p}: the exact observed-information log-dets this phase is timed on must be \
+            log_dets.is_finite(),
+            "p={p}: the exact observed-information log-det this phase is timed on must be \
              finite, got {log_dets:?}"
         );
         assert!(
@@ -2552,7 +2552,7 @@ fn zz_measure_wide_p_cost_exponent_2080() {
                     z.view(),
                     &cache,
                 ) {
-                    Ok((joint, tt)) => format!("log_dets ok joint={joint:.6e} tt={tt:.6e}"),
+                    Ok(joint) => format!("log_det ok joint={joint:.6e}"),
                     Err(error) => format!("log_dets refused: {error}"),
                 };
 

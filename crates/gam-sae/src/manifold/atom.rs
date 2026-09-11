@@ -392,8 +392,8 @@ impl ArdAxisPrior {
     // not re-export it. The homogeneity is load-bearing HERE in a specific way: the
     // `½log|B|` θ-adjoint's explicit-`ρ` channel uses
     // `∂/∂ρ_ard[α·s_{τ₀}(c)] = α·s_{τ₀}(c) = psd_majorizer_hess`, so the
-    // log-precision log-det traces (`ard_log_precision_hessian_trace`,
-    // `coordinate_block_ard_log_precision_hessian_trace`) are the exact `∂B/∂ρ_ard`
+    // log-precision log-det trace (`ard_log_precision_hessian_trace`) is the exact
+    // `∂B/∂ρ_ard`
     // with no code change. A non-homogeneous `s_{τ}(α·c)` would silently desync
     // them.
 

@@ -400,7 +400,7 @@ fn threshold_gate_sparse_operator_is_the_installed_exact_a_derivative_2500() {
 /// error the raw operator produced: the dense exact-A sparse log-determinant
 /// trace `½[tr(A⁺ ∂A/∂ρ) − tr(A_tt⁺ ∂A/∂ρ)]` must be the central finite
 /// difference of the PRODUCTION value it differentiates,
-/// `½(log|A| − log|A_tt|)` from `exact_observed_information_log_dets`.
+/// `½log|A|` from `exact_observed_information_log_dets`.
 ///
 /// Measured before the deflation map: 4.40108e-1 analytic against 5.08109e-1 FD
 /// on the straddling arm (stable across four decades of `h`, so not FD noise),
@@ -422,10 +422,10 @@ fn threshold_gate_dense_exact_a_sparse_logdet_trace_matches_finite_difference_25
             trace[sparse]
         );
 
-        let log_dets = |r: &SaeManifoldRho| -> (f64, f64) {
+        let log_det = |r: &SaeManifoldRho| -> f64 {
             let (_l, c) = frozen_cache(&term, &target, r);
             term.exact_observed_information_log_dets(r, target.view(), &c)
-                .expect("production exact-A log dets")
+                .expect("production exact-A log det")
         };
         let base = rho.to_flat();
         let h = 1.0e-5;
@@ -433,9 +433,9 @@ fn threshold_gate_dense_exact_a_sparse_logdet_trace_matches_finite_difference_25
         plus_flat[sparse] += h;
         let mut minus_flat = base.clone();
         minus_flat[sparse] -= h;
-        let (joint_plus, tt_plus) = log_dets(&rho.from_flat(plus_flat.view()).unwrap());
-        let (joint_minus, tt_minus) = log_dets(&rho.from_flat(minus_flat.view()).unwrap());
-        let fd = 0.5 * ((joint_plus - joint_minus) - (tt_plus - tt_minus)) / (2.0 * h);
+        let joint_plus = log_det(&rho.from_flat(plus_flat.view()).unwrap());
+        let joint_minus = log_det(&rho.from_flat(minus_flat.view()).unwrap());
+        let fd = 0.5 * (joint_plus - joint_minus) / (2.0 * h);
         let err = (trace[sparse] - fd).abs();
         let tol = 1.0e-6 + 1.0e-5 * fd.abs();
         assert!(
@@ -720,7 +720,8 @@ fn threshold_gate_outer_solve_is_not_aborted_by_an_unmodelled_sparse_operator_25
 /// `logdet_theta_adjoint` for softmax. It carries no per-atom-logistic GATE leg,
 /// which is what a threshold-gate row needs — the same limitation
 /// `third_order_forward_sensitivity_hessian` already refuses on. Against a
-/// central finite difference of `½(log|A| − log|A_tt|)` in a logit the dense Γ
+/// central finite difference of `½(log|A| − log|A_tt|)` (the criterion's
+/// complexity when this was measured) in a logit the dense Γ
 /// read `1.373e-1` where the FD read `3.521e-1`, with a sign flip on the next
 /// logit, so this is not a tolerance question.
 #[test]
@@ -760,87 +761,6 @@ fn dense_theta_adjoint_is_not_interchangeable_for_a_threshold_gate_2500() {
             "#2500 (straddle={straddle}): refusing the exact-A override for this family is \
              only justified if the two θ-adjoints genuinely disagree; worst per-entry \
              relative gap = {worst:.3}"
-        );
-    }
-}
-
-/// #2500 GATE 8b — the leg of the production θ-adjoint that the ThresholdGate
-/// gradient falls back to and that IS exact: `coordinate_block_logdet_theta_adjoint`
-/// reproduces a central finite difference of the per-row undamped factors' own
-/// log-determinant on every free logit.
-///
-/// Convention, measured rather than read: the returned vector is
-/// `∂(Σ_i log|H_tt^(i)|)/∂θ` with NO leading ½, even though the function's own doc
-/// describes it as the derivative of `½ Σ_i log|H_tt^(i)|`. Halving the reference
-/// puts every entry off by exactly a factor of two.
-///
-/// Measured on this fixture the analytic/FD ratio is `1.0000` on every entry
-/// checked, so this is a tight gate rather than a loose one, and it pins the half
-/// of the fallback that is load-bearing for the row-local prior curvature this
-/// issue added.
-#[test]
-fn threshold_gate_coordinate_block_theta_adjoint_matches_finite_difference_2500() {
-    for straddle in [false, true] {
-        let (term, target, rho) = threshold_gate_tiny_fixture(straddle);
-        let (_loss, cache) = frozen_cache(&term, &target, &rho);
-        let coord = term
-            .coordinate_block_logdet_theta_adjoint(
-                &rho,
-                &cache,
-                crate::manifold::EvidenceOperator::Majorizer,
-                None,
-            )
-            .expect("coordinate-block theta adjoint");
-        let base_deflated = deflated_direction_count(&term, &cache);
-        let block_logdet = |t: &SaeManifoldTerm| -> (f64, usize) {
-            let (_l, c) = frozen_cache(t, &target, &rho);
-            let mut acc = 0.0_f64;
-            for row in 0..t.n_obs() {
-                let factor = c.undamped_factor(row);
-                for d in 0..c.row_dims[row] {
-                    acc += 2.0 * factor[[d, d]].ln();
-                }
-            }
-            (acc, deflated_direction_count(t, &c))
-        };
-        let h = 1.0e-6;
-        let mut worst = 0.0_f64;
-        let mut label = String::new();
-        let mut checked = 0usize;
-        for (row, atom, slot) in logit_slots(&term, &cache) {
-            let mut plus = term.clone();
-            plus.assignment.logits[[row, atom]] += h;
-            let mut minus = term.clone();
-            minus.assignment.logits[[row, atom]] -= h;
-            let (lp, dp) = block_logdet(&plus);
-            let (lm, dm) = block_logdet(&minus);
-            // A central difference across a change in the deflated dimension
-            // differences two different operators, not a derivative.
-            if dp != base_deflated || dm != base_deflated {
-                continue;
-            }
-            let fd = (lp - lm) / (2.0 * h);
-            let analytic = coord.t[slot];
-            let tol = 1.0e-6 + 1.0e-4 * analytic.abs().max(fd.abs());
-            let ratio = (analytic - fd).abs() / tol;
-            if ratio > worst {
-                worst = ratio;
-                label = format!(
-                    "row {row} atom {atom}: analytic={analytic:.9e} fd={fd:.9e} tol={tol:.3e}"
-                );
-            }
-            checked += 1;
-        }
-        assert!(
-            checked >= 4,
-            "#2500 (straddle={straddle}): the FD gate must reach at least four logits on a \
-             fixed deflation stratum; checked={checked}"
-        );
-        assert!(
-            worst <= 1.0,
-            "#2500 (straddle={straddle}): the coordinate-block theta-adjoint must \
-             differentiate the per-row log|H_tt| it is defined as; worst normalized error \
-             {worst:.3} at {label}"
         );
     }
 }

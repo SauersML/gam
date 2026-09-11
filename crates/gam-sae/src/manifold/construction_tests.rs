@@ -375,7 +375,7 @@ mod amortized_encoder_tests {
 
         // The production `logdet_trace` channel in ISOLATION, reproduced exactly as
         // `analytic_outer_rho_gradient_components` assembles it (smooth EDF trace +
-        // ARD joint minus coordinate-block trace), so this validates CH4
+        // ARD joint trace), so this validates CH4
         // independently of the rank-charge / third-order channels.
         let base = rho.to_flat();
         let h = 1.0e-5;
@@ -403,34 +403,20 @@ mod amortized_encoder_tests {
             let ard_joint = t
                 .ard_log_precision_hessian_trace(&r, &cache, &solver, EvidenceOperator::Majorizer)
                 .expect("ard joint logdet trace");
-            let ard_coord = t
-                .coordinate_block_ard_log_precision_hessian_trace(
-                    &r,
-                    &cache,
-                    EvidenceOperator::Majorizer,
-                )
-                .expect("ard coordinate-block logdet trace");
             let mut v = Array1::<f64>::zeros(n_params);
             for a in 0..r.log_lambda_smooth.len() {
                 v[r.smooth_flat_index(a)] = 0.5 * smooth_logdet[a];
             }
             for kk in 0..r.log_ard.len() {
                 for axis in 0..r.log_ard[kk].len() {
-                    v[r.ard_flat_index(kk, axis)] += ard_joint[kk][axis] - ard_coord[kk][axis];
+                    v[r.ard_flat_index(kk, axis)] += ard_joint[kk][axis];
                 }
             }
             if let Some(si) = r.sparse_flat_index() {
                 let joint = t
                     .assignment_log_strength_hessian_trace(&r, &cache, &solver)
                     .expect("sparse joint logdet trace");
-                let coord = t
-                    .coordinate_block_assignment_log_strength_hessian_trace(
-                        &r,
-                        &cache,
-                        EvidenceOperator::Majorizer,
-                    )
-                    .expect("sparse coordinate-block logdet trace");
-                v[si] = joint - coord;
+                v[si] = joint;
             }
             v
         };
@@ -589,7 +575,7 @@ mod amortized_encoder_tests {
     /// production third-order gradient `g3[j] = −½⟨A⁺Γ_eff, g_ρ,j⟩`. `g3` is
     /// `∂Φ/∂ρ − ∂L/∂ρ` for a scalar `Φ`, so it MUST be conservative
     /// (`∂g3[ard]/∂ρ_smooth == ∂g3[smooth]/∂ρ_ard`); the full-set gate shows it is
-    /// not. This splits `g3` by `Γ_eff = Γ_joint − Γ_tt + 2∇R` and prints each
+    /// not. This splits `g3` by `Γ_eff = Γ_joint + 2∇R` and prints each
     /// part's cross asymmetry so ONE run names the offending adjoint. Pure
     /// diagnostic — asserts only finiteness so it never masks the defect.
     #[test]
@@ -610,7 +596,7 @@ mod amortized_encoder_tests {
         let smooth0 = rho.smooth_flat_index(0);
         let ard0 = rho.ard_flat_index(0, 0);
 
-        // g3 restricted to ONE Γ_eff part (0 = Γ_joint, 1 = Γ_tt, 2 = 2∇R),
+        // g3 restricted to ONE Γ_eff part (0 = Γ_joint, 2 = 2∇R),
         // component `j`, at a REBUILT fixed-θ̂ cache at ρ + sign·h·e_perturb.
         let g3_part = |sign: f64, perturb: usize, j: usize, part: usize| -> f64 {
             let mut flat = base.clone();
@@ -631,14 +617,6 @@ mod amortized_encoder_tests {
             let solver = DeflatedArrowSolver::plain(&cache);
             let gamma = match part {
                 0 => t.logdet_theta_adjoint(&r, &cache, &solver).unwrap(),
-                1 => t
-                    .coordinate_block_logdet_theta_adjoint(
-                        &r,
-                        &cache,
-                        EvidenceOperator::Majorizer,
-                        None,
-                    )
-                    .unwrap(),
                 _ => {
                     let rc = t
                         .production_rank_charge_derivative(target.view(), &r, &loss, &cache)
@@ -657,7 +635,7 @@ mod amortized_encoder_tests {
             -0.5 * dot
         };
 
-        for (name, part) in [("Gamma_joint", 0usize), ("Gamma_tt", 1), ("2_grad_R", 2)] {
+        for (name, part) in [("Gamma_joint", 0usize), ("2_grad_R", 2)] {
             let d_ard_by_smooth = (g3_part(1.0, smooth0, ard0, part)
                 - g3_part(-1.0, smooth0, ard0, part))
                 / (2.0 * h);
@@ -813,21 +791,11 @@ mod amortized_encoder_tests {
         };
         let solver = DeflatedArrowSolver::plain(&cache);
 
-        // Γ_eff = Γ_joint − Γ_tt + 2∇R, the gradient's effective adjoint.
+        // Γ_eff = Γ_joint + 2∇R, the gradient's effective adjoint.
         let mut gamma_eff = term
             .logdet_theta_adjoint(&rho, &cache, &solver)
             .expect("gamma_joint");
         {
-            let gtt = term
-                .coordinate_block_logdet_theta_adjoint(
-                    &rho,
-                    &cache,
-                    EvidenceOperator::Majorizer,
-                    None,
-                )
-                .expect("gamma_tt");
-            gamma_eff.t -= &gtt.t;
-            gamma_eff.beta -= &gtt.beta;
             let rc = term
                 .production_rank_charge_derivative(target.view(), &rho, &loss, &cache)
                 .expect("rank charge");
@@ -888,16 +856,6 @@ mod amortized_encoder_tests {
                 let mut g = t
                     .logdet_theta_adjoint(&r, &cache, &solver)
                     .expect("gamma_joint");
-                let gtt = t
-                    .coordinate_block_logdet_theta_adjoint(
-                        &r,
-                        &cache,
-                        EvidenceOperator::Majorizer,
-                        None,
-                    )
-                    .expect("gamma_tt");
-                g.t -= &gtt.t;
-                g.beta -= &gtt.beta;
                 let rc = t
                     .production_rank_charge_derivative(target.view(), &r, &loss, &cache)
                     .expect("rank charge");
@@ -1078,7 +1036,7 @@ mod amortized_encoder_tests {
         }
     }
 
-    /// #2330 — the EXACT observed-information Laplace log-dets `(log|A|, log|A_tt|)`
+    /// #2330 — the EXACT observed-information Laplace log-det `log|A|`
     /// from the strict-Cholesky production path (`exact_observed_information_log_dets`)
     /// equal the independent dense eigendecomposition oracle `Σ ln λ_i(A)`, and `A`
     /// is certified positive definite (min eigenvalue > 0) at the converged mode.
@@ -1086,7 +1044,7 @@ mod amortized_encoder_tests {
     /// exact observed information `A = ∇²_θθ L`, NOT the majorized surrogate `B`.
     #[test]
     fn exact_observed_information_log_det_matches_eigendecomposition_2330() {
-        use ndarray::{Array1, Array2, array, s};
+        use ndarray::{Array1, Array2, array};
         // This module does not `use super::*`; the arbiter is the first test here
         // to build a `SaeArrowVector`, call `.eigh` (FaerEigh), and name `Side`.
         use super::{
@@ -1188,8 +1146,7 @@ mod amortized_encoder_tests {
                 .all(|(index, &lambda)| lambda >= -floors[index])
         {
             // PD on the gauge quotient (min_eig may be a gauge null in [−floor, floor]).
-            let (log_a, log_a_tt) =
-                result.expect("A is PD on the quotient so the log-dets must be Ok");
+            let log_a = result.expect("A is PD on the quotient so the log-det must be Ok");
             let kept: f64 = eigs
                 .iter()
                 .enumerate()
@@ -1199,28 +1156,6 @@ mod amortized_encoder_tests {
             assert!(
                 (log_a - kept).abs() <= 1.0e-9 * (1.0 + kept.abs()),
                 "log|A| kept-eigenvalue sum {log_a} != oracle {kept}"
-            );
-            let a_tt = sym.slice(s![..total_t, ..total_t]).to_owned();
-            let (eigs_tt, vecs_tt) = a_tt.eigh(Side::Lower).expect("A_tt eigendecomposition");
-            let tt_norm = eigs_tt
-                .iter()
-                .map(|value| value.abs())
-                .fold(0.0_f64, f64::max);
-            let tt_metric = ArrowMetric::Coordinate(&cache);
-            let kept_tt: f64 = eigs_tt
-                .iter()
-                .enumerate()
-                .filter(|&(index, l)| {
-                    let vbv = tt_metric
-                        .quadratic_form(vecs_tt.column(index))
-                        .expect("B quadratic form on the coordinate block");
-                    *l > sae_exact_a_direction_floor(total_t, tt_norm, vbv)
-                })
-                .map(|(_, l)| l.ln())
-                .sum();
-            assert!(
-                (log_a_tt - kept_tt).abs() <= 1.0e-9 * (1.0 + kept_tt.abs()),
-                "log|A_tt| kept-eigenvalue sum {log_a_tt} != oracle {kept_tt}"
             );
         } else {
             // A is non-PD. Under #2336 value-side E-attributability the classification
@@ -1269,7 +1204,7 @@ mod amortized_encoder_tests {
                  priced_log|A|={priced_log_a:.9e}"
             );
             if all_attributable {
-                let (log_a, _log_a_tt) = result.expect(
+                let log_a = result.expect(
                     "every sub-floor negative direction is ARD-clamp attributable, so the \
                      value path must PRICE the basin curvature instead of refusing",
                 );

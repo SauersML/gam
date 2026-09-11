@@ -57,7 +57,6 @@ fn frozen_exact_a_logdet(
     endpoint
         .exact_observed_information_log_dets(rho, target.view(), &cache)
         .ok()
-        .map(|(log_a, _)| log_a)
 }
 
 #[test]

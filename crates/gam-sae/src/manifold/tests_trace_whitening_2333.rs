@@ -191,7 +191,6 @@ fn softmax_trace_whitening_prefold_matches_dense_adjoint_2333() {
     );
     let solver = DeflatedArrowSolver::plain(&cache);
     let joint_inverse = term.materialize_joint_inverse(&cache, &solver).unwrap();
-    let coordinate_inverse = term.materialize_block_diag_t_inverse(&cache);
     let dense = |inverse: &Array2<f64>| {
         term.logdet_theta_adjoint_dense(
             &rho,
@@ -205,14 +204,9 @@ fn softmax_trace_whitening_prefold_matches_dense_adjoint_2333() {
         .unwrap()
     };
     let joint = term.logdet_theta_adjoint(&rho, &cache, &solver).unwrap();
-    let coordinate = term
-        .coordinate_block_logdet_theta_adjoint(&rho, &cache, EvidenceOperator::Majorizer, None)
-        .unwrap();
     let (joint_gap, joint_scale) = assert_adjoint_parity(&dense(&joint_inverse), &joint);
-    let (coordinate_gap, coordinate_scale) =
-        assert_adjoint_parity(&dense(&coordinate_inverse), &coordinate);
     eprintln!(
-        "#2333 live_rows={live_rows} joint_gap={joint_gap:e} joint_scale={joint_scale:e} coordinate_gap={coordinate_gap:e} coordinate_scale={coordinate_scale:e}"
+        "#2333 live_rows={live_rows} joint_gap={joint_gap:e} joint_scale={joint_scale:e}"
     );
     let repeated = term.logdet_theta_adjoint(&rho, &cache, &solver).unwrap();
     assert_eq!(joint.t, repeated.t);

@@ -295,10 +295,10 @@ fn priced_ard_direct_gradient_matches_fixed_state_value_2434() {
                     1.0e-6,
                 )
                 .expect("fixed-state perturbed cache must remain on the priced stratum");
-            let (log_a, log_a_tt) = candidate
+            let log_a = candidate
                 .exact_observed_information_log_dets(at_rho, target.view(), &at_cache)
                 .expect("fixed-state perturbed exact-A value");
-            0.5 * (log_a - log_a_tt)
+            0.5 * log_a
         };
 
     let converged_term = term;
