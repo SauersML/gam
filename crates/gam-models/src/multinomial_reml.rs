@@ -3105,6 +3105,10 @@ impl CustomFamily for MultinomialFamily {
         Ok(Some(axes))
     }
 
+    fn joint_jeffreys_information_third_directional_available(&self) -> bool {
+        true
+    }
+
     fn joint_jeffreys_information_third_directional_all_axes_with_specs(
         &self,
         block_states: &[ParameterBlockState],

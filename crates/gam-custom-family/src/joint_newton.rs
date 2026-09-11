@@ -1180,9 +1180,18 @@ pub fn custom_family_outer_derivatives<F: CustomFamily + ?Sized>(
     // exposes second-order calculus. Matrix-free Hessian support is a
     // representation capability used by the evaluator; it must not be hidden
     // from the outer optimizer by a cost-based first-order policy.
+    //
+    // An armed Jeffreys term is part of that calculus: its exact outer Hessian
+    // needs the family's third information derivative for the mode-response
+    // completion and the mixed H_Φ drift (`custom_family_outer_jeffreys_hphi_drift_batched`).
+    // Without it no exact curvature exists, and declaring one made every seed
+    // evaluation refuse at the completion instead of searching first-order.
+    let jeffreys_curvature_exact = !family.joint_jeffreys_term_required()
+        || family.joint_jeffreys_information_third_directional_available();
     let hessian = if options.use_outer_hessian
         && include_exact_newton_logdet_h(family, options)
         && policy.capability.has_hessian()
+        && jeffreys_curvature_exact
     {
         DeclaredHessianForm::Either
     } else {

@@ -1809,6 +1809,20 @@ pub trait CustomFamily {
         Ok(Some(axes))
     }
 
+    /// Whether this family implements
+    /// [`Self::joint_jeffreys_information_third_directional_all_axes_with_specs`]
+    /// exactly, i.e. returns `Some` from it.
+    ///
+    /// An armed Jeffreys objective's exact outer Hessian consumes that fifth
+    /// likelihood derivative twice: in the rho-rho mode-response completion and
+    /// in the mixed `D²H_Φ` drift. A family that cannot supply it cannot claim
+    /// exact outer curvature, so the outer planner must not declare an analytic
+    /// Hessian for it (the evaluator would refuse every trial point that asks
+    /// for one). Override to `true` exactly when the hook is implemented.
+    fn joint_jeffreys_information_third_directional_available(&self) -> bool {
+        false
+    }
+
     /// Third beta-directional derivative of the Jeffreys information, with
     /// two fixed directions and every coefficient axis as the third:
     /// `{D³H[u, v, e_a]}`. This is the fifth likelihood derivative needed to
@@ -1885,6 +1899,10 @@ pub trait CustomFamily {
     /// pass; otherwise the default `None` preserves the pairwise `H''`
     /// fallback through
     /// [`Self::joint_jeffreys_information_second_directional_derivative_with_specs`].
+    ///
+    /// `W` is any symmetric weight, not necessarily PSD: callers fold signed
+    /// gate and floor motion into it, so implementations must stay linear in
+    /// `W` and must not factorize it.
     fn joint_jeffreys_information_contracted_trace_hessian_with_specs(
         &self,
         block_states: &[ParameterBlockState],
