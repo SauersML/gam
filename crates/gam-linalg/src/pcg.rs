@@ -29,15 +29,15 @@ use ndarray::{Array1, ArrayView1, ArrayViewMut1, Zip};
 use rayon::prelude::*;
 use std::sync::Arc;
 
-/// Floor on the requested PCG relative tolerance. Asking for convergence tighter
-/// than this is below the achievable accuracy of the SPD energy minimization in
-/// `f64`, so we clamp the target to avoid iterating on numerical noise.
-pub const PCG_REL_TOL_FLOOR: f64 = 1e-12;
-
-/// Floor applied to each positive preconditioner diagonal entry before
-/// reciprocation. Exactly-zero entries are rejected as non-positive rather than
-/// being treated as numerical noise.
-pub const PCG_PRECONDITIONER_FLOOR: f64 = 1e-12;
+/// The smallest relative residual a `rows`-dimensional CG recurrence can resolve.
+///
+/// The residual is a `rows`-term accumulation, so two residuals that differ by
+/// less than `γ_rows` relative to the right-hand side differ by arithmetic, not
+/// by progress. A requested relative tolerance below this band is raised to it;
+/// the band belongs to the arithmetic, never to the caller's problem.
+fn attainable_relative_residual(rows: usize) -> f64 {
+    crate::roundoff::accumulation_growth(rows)
+}
 
 /// Per-iteration trace of the PCG recurrence, sufficient to reconstruct the
 /// Lanczos tridiagonal and hence Ritz-based condition estimates. Populated only
@@ -184,9 +184,10 @@ fn dot(a: &ArrayView1<f64>, b: &ArrayView1<f64>, reduction: DotReduction) -> f64
 ///
 /// Solves `A x = rhs` for SPD `A`, accessed only through `apply(v, out)` which
 /// must set `out <- A v`. The initial guess is `x = 0`. Convergence target is
-/// `‖r‖ ≤ max(rel_tol · ‖rhs‖, PCG_REL_TOL_FLOOR)`: a textbook RELATIVE
-/// residual criterion, floored absolutely at f64 noise scale so a near-zero
-/// rhs does not chase tolerances tighter than the machine can deliver.
+/// `‖r‖ ≤ max(rel_tol, γ_p) · ‖rhs‖`: a textbook RELATIVE residual criterion,
+/// with the relative target raised to the residual's own rounding band `γ_p`
+/// (see [`attainable_relative_residual`]) so it never chases progress the
+/// arithmetic cannot show. A zero rhs has the exact solution `x = 0`.
 /// Inexact-Newton callers (e.g. Eisenstat–Walker forcing for the joint
 /// PIRLS solver) rely on this relative contract: the historical
 /// `max(‖rhs‖, 1)` factor silently inflated the threshold to an absolute
@@ -195,9 +196,8 @@ fn dot(a: &ArrayView1<f64>, b: &ArrayView1<f64>, reduction: DotReduction) -> f64
 /// `η` and trapped the outer Newton loop in a fixed-point oscillation.
 ///
 /// * `precond_diag` — diagonal Jacobi preconditioner `M`; pass all-ones for an
-///   unpreconditioned solve. Entries are floored to
-///   [`PCG_PRECONDITIONER_FLOOR`] before reciprocation; a non-positive or
-///   non-finite entry is a contract violation reported as
+///   unpreconditioned solve. A non-positive or non-finite entry, or one whose
+///   reciprocal overflows, is a contract violation reported as
 ///   [`PcgStop::BadPreconditioner`].
 /// * `refresh_period` — recompute `r ← rhs − A x` every `refresh_period`
 ///   iterations to shed accumulated round-off; `0` disables refresh entirely
@@ -259,11 +259,10 @@ where
         };
     }
 
-    // Textbook PCG relative-residual criterion: ‖r‖ ≤ rel_tol · ‖rhs‖. The
-    // absolute floor at `PCG_REL_TOL_FLOOR` prevents a tiny but nonzero rhs
-    // from demanding sub-f64-precision accuracy (the early-exit above handles
-    // rhs_norm == 0 separately).
-    let tol = (rel_tol.max(PCG_REL_TOL_FLOOR) * rhs_norm).max(PCG_REL_TOL_FLOOR);
+    // Textbook PCG relative-residual criterion: ‖r‖ ≤ rel_tol · ‖rhs‖, with the
+    // relative target no tighter than the residual's rounding band (the
+    // early-exit above handles rhs_norm == 0).
+    let tol = rel_tol.max(attainable_relative_residual(p)) * rhs_norm;
 
     // Precompute reciprocal preconditioner once: z = inv_m * r per iteration.
     // SPD-PCG requires M ≻ 0; a non-positive/non-finite entry is a contract
@@ -275,7 +274,11 @@ where
             bad_diag = true;
             break;
         }
-        *slot = 1.0 / m.max(PCG_PRECONDITIONER_FLOOR);
+        *slot = 1.0 / m;
+        if !slot.is_finite() {
+            bad_diag = true;
+            break;
+        }
     }
     if bad_diag {
         return PcgCoreResult {
@@ -705,6 +708,7 @@ pub fn pcg_multi_core<B: PcgBlockBackend>(
     record_diagnostics: bool,
 ) -> Vec<PcgCoreResult> {
     let t = backend.columns();
+    let rows = backend.rows();
     let mut rhs_squared = vec![0.0f64; t];
     let mut residual_squared = vec![0.0f64; t];
     let mut rz = vec![0.0f64; t];
@@ -737,7 +741,11 @@ pub fn pcg_multi_core<B: PcgBlockBackend>(
             });
             continue;
         }
-        tol[c] = (rel_tol.max(PCG_REL_TOL_FLOOR) * b_norm).max(PCG_REL_TOL_FLOOR);
+        // Relative to the right-hand side; a zero rhs has no scale of its own,
+        // so the entering residual `B − A·X` (whose exact solution is `X = 0`)
+        // supplies it.
+        let residual_scale = if b_norm > 0.0 { b_norm } else { r_norm };
+        tol[c] = rel_tol.max(attainable_relative_residual(rows)) * residual_scale;
         if r_norm <= tol[c] {
             done[c] = Some(PcgCoreResult {
                 stop: PcgStop::Converged,

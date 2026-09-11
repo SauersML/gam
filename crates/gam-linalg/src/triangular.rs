@@ -24,12 +24,6 @@
 
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
 
-/// Diagonal magnitude below which a pivot in the guarded back-substitution is
-/// treated as a rank-deficient (zero) direction, yielding a zero draw component
-/// rather than a non-finite value. Chosen near `f64` working precision so that
-/// only genuinely degenerate conditional precisions are zeroed.
-const RANK_DEFICIENT_PIVOT_FLOOR: f64 = 1e-14;
-
 /// Validation strictness for [`cholesky_factor_in_place`].
 ///
 /// The historical call sites differed in how aggressively they rejected
@@ -135,8 +129,9 @@ pub fn back_substitution_lower_transpose<'l, 'y>(
 }
 
 /// Back-substitution against `Lᵀ x = rhs` into a caller-provided buffer, with a
-/// tiny-pivot floor: rows whose diagonal satisfies `|L[i,i]| <= 1e-14` set
-/// `x[i] = 0` rather than dividing.
+/// rank-deficient-pivot guard: rows whose diagonal is inside the factorization's
+/// rounding band, `|L[i,i]| <= p·ε·max_j |L[j,j]|`, set `x[i] = 0` rather than
+/// dividing.
 ///
 /// This is the Gaussian-draw form used by the precision-matrix samplers. For
 /// `Q = L Lᵀ`, a draw `x ~ N(0, Q⁻¹)` is obtained from `z ~ N(0, I)` via
@@ -157,6 +152,10 @@ pub fn back_substitution_lower_transpose_guarded_into(
     assert_eq!(l.nrows(), p);
     assert_eq!(l.ncols(), p);
     assert_eq!(out.len(), p);
+    // A pivot inside the factorization's rounding band is a rank-deficient
+    // direction: its draw component is zero, never a quotient of noise.
+    let pivot_scale = (0..p).fold(0.0_f64, |acc, i| acc.max(l[[i, i]].abs()));
+    let resolvable_pivot = p as f64 * f64::EPSILON * pivot_scale;
     // Solve Lᵀ x = rhs from the bottom row up. Row i of Lᵀ has nonzeros
     // at columns j ≥ i (= column i of L at rows j ≥ i), so
     //   rhs[i] = L[i,i] · x[i] + Σ_{j>i} L[j,i] · x[j].
@@ -166,7 +165,7 @@ pub fn back_substitution_lower_transpose_guarded_into(
             v -= l[[j, i]] * out[j];
         }
         let d = l[[i, i]];
-        out[i] = if d.abs() > RANK_DEFICIENT_PIVOT_FLOOR {
+        out[i] = if d.abs() > resolvable_pivot {
             v / d
         } else {
             0.0

@@ -1,7 +1,5 @@
 use super::*;
 
-const MARGINAL_SLOPE_Z_WEIGHTED_SD_FLOOR: f64 = 1e-12;
-
 fn validate_bernoulli_marginal_slope_z_column_variance(
     z_column: &str,
     z: ArrayView1<'_, f64>,
@@ -38,13 +36,17 @@ fn validate_bernoulli_marginal_slope_z_column_variance(
         .sum::<f64>()
         / weight_sum;
     let weighted_sd = var.sqrt();
-    if weighted_sd.is_finite() && weighted_sd > MARGINAL_SLOPE_Z_WEIGHTED_SD_FLOOR {
+    // A spread inside the weighted mean's own rounding band `γ_n·max|z|` is
+    // arithmetic, not variation: the score is numerically constant.
+    let magnitude = z.iter().fold(0.0_f64, |acc, &zi| acc.max(zi.abs()));
+    let spread_resolution = gam_linalg::roundoff::accumulation_growth(n) * magnitude;
+    if weighted_sd.is_finite() && weighted_sd > spread_resolution {
         return Ok(());
     }
 
     let mut sorted = z.to_vec();
     sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    sorted.dedup_by(|a, b| (*a - *b).abs() <= MARGINAL_SLOPE_Z_WEIGHTED_SD_FLOOR);
+    sorted.dedup_by(|a, b| (*a - *b).abs() <= spread_resolution);
     let unique_count = sorted.len();
     let value_summary = match sorted.as_slice() {
         [] => "no observed finite values".to_string(),
