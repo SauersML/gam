@@ -1553,6 +1553,191 @@ impl JointJeffreysPlan {
         self.gate_weight
     }
 
+    /// Whether β-motion of the conditioning gate or of the relative floor enters
+    /// the exact coefficient Hessian of `Φ` at this spectrum (see
+    /// [`JointJeffreysHessianMotion`]). `false` exactly where the frozen-policy
+    /// curvature `H_Φ` and its second-directional completion already are the
+    /// whole Hessian: an inactive or saturated gate, and a floor whose motion no
+    /// eigenvalue feels.
+    pub fn hessian_motion_active(&self) -> bool {
+        if !self.is_active() {
+            return false;
+        }
+        let (g1, g2) = conditioning_gate_weight_grad(self.lambda_min, self.lambda_max);
+        let (g11, g12, g22) = conditioning_gate_weight_hess(self.lambda_min, self.lambda_max);
+        if g1 != 0.0 || g2 != 0.0 || g11 != 0.0 || g12 != 0.0 || g22 != 0.0 {
+            return true;
+        }
+        self.floor_in_relative_regime
+            && self.evals.iter().any(|&lambda| {
+                jeffreys_antiderivative_floor_sensitivity(lambda, self.floor) != 0.0
+                    || jeffreys_antiderivative_floor_second_sensitivity(lambda, self.floor) != 0.0
+                    || floored_inverse_floor_sensitivity(lambda, self.floor) != 0.0
+            })
+    }
+
+    /// Gate and relative-floor motion part of the exact coefficient Hessian of
+    /// `Φ`, from the canonical first information derivatives
+    /// `hdots[a] = Hdot[e_a]` at this snapshot. The derivation is on
+    /// [`JointJeffreysHessianMotion`]; an inactive motion returns zeros.
+    pub fn hessian_motion(
+        &self,
+        hdots: &[Array2<f64>],
+    ) -> Result<JointJeffreysHessianMotion, String> {
+        let p = self.coefficient_dim();
+        if hdots.len() != p {
+            return Err(format!(
+                "joint Jeffreys Hessian motion: got {} canonical information derivatives, \
+                 expected {p}",
+                hdots.len()
+            ));
+        }
+        let mut motion = JointJeffreysHessianMotion {
+            extra_trace_weight: Array2::zeros((p, p)),
+            remainder: Array2::zeros((p, p)),
+            extra_reduced_weight: Array2::zeros((self.reduced_dim, self.reduced_dim)),
+        };
+        if !self.hessian_motion_active() {
+            return Ok(motion);
+        }
+        let m = self.reduced_dim;
+        let basis = self.z_j.dot(&self.evecs);
+        let mut reduced = Vec::with_capacity(p);
+        for (axis, hdot) in hdots.iter().enumerate() {
+            if hdot.dim() != (p, p) {
+                return Err(format!(
+                    "joint Jeffreys Hessian motion: Hdot[{axis}] shape {:?} != ({p}, {p})",
+                    hdot.dim()
+                ));
+            }
+            reduced.push(symmetric_basis_contraction(hdot.view(), basis.view()));
+        }
+        let gate = self.gate_weight;
+        let (g1, g2) = conditioning_gate_weight_grad(self.lambda_min, self.lambda_max);
+        let (g11, g12, g22) = conditioning_gate_weight_hess(self.lambda_min, self.lambda_max);
+        let rate = if self.floor_in_relative_regime {
+            REDUCED_INFO_RELATIVE_FLOOR
+        } else {
+            0.0
+        };
+        let mut ungated = 0.0_f64;
+        let mut floor_first = 0.0_f64;
+        let mut floor_second = 0.0_f64;
+        let mut inverse = Array1::<f64>::zeros(m);
+        let mut inverse_floor = Array1::<f64>::zeros(m);
+        for i in 0..m {
+            let lambda = self.evals[i];
+            ungated += jeffreys_antiderivative(lambda, self.floor);
+            floor_first += jeffreys_antiderivative_floor_sensitivity(lambda, self.floor);
+            floor_second += jeffreys_antiderivative_floor_second_sensitivity(lambda, self.floor);
+            inverse[i] = floored_inverse(lambda, self.floor);
+            inverse_floor[i] = floored_inverse_floor_sensitivity(lambda, self.floor);
+        }
+        ungated *= 0.5;
+        let (imin, imax) = (self.idx_min, self.idx_max);
+        let mut q_min = Array1::<f64>::zeros(p);
+        let mut q_max = Array1::<f64>::zeros(p);
+        let mut floor_trace = Array1::<f64>::zeros(p);
+        let mut grad_u = Array1::<f64>::zeros(p);
+        let mut grad_g = Array1::<f64>::zeros(p);
+        for a in 0..p {
+            let pa = &reduced[a];
+            q_min[a] = pa[[imin, imin]];
+            q_max[a] = pa[[imax, imax]];
+            let mut inverse_trace = 0.0_f64;
+            let mut floor_weighted = 0.0_f64;
+            for i in 0..m {
+                inverse_trace += inverse[i] * pa[[i, i]];
+                floor_weighted += inverse_floor[i] * pa[[i, i]];
+            }
+            floor_trace[a] = floor_weighted;
+            grad_u[a] = 0.5 * inverse_trace + 0.5 * floor_first * rate * q_max[a];
+            grad_g[a] = g1 * q_min[a] + g2 * q_max[a];
+        }
+        let spectral_scale = self.evals.iter().fold(1.0_f64, |acc, v| acc.max(v.abs()));
+        let tie_tolerance = 64.0 * f64::EPSILON * spectral_scale;
+        // `2 Σ_{j≠e} P̃_a[e,j] P̃_b[e,j] / (λ_e − λ_j)`: the first-derivative part
+        // of the extreme eigenvalue's second β-derivative. At a tie the extreme
+        // eigenvalue is not differentiable — the value path's first-order
+        // formula shares that stratum — and the tied partner contributes nothing.
+        let extreme_second_order = |extreme: usize| -> Array2<f64> {
+            let mut coefficient = Array1::<f64>::zeros(m);
+            for j in 0..m {
+                let gap = self.evals[extreme] - self.evals[j];
+                if j != extreme && gap.abs() > tie_tolerance {
+                    coefficient[j] = 2.0 / gap;
+                }
+            }
+            let mut out = Array2::<f64>::zeros((p, p));
+            for a in 0..p {
+                for b in a..p {
+                    let mut sum = 0.0_f64;
+                    for j in 0..m {
+                        if coefficient[j] != 0.0 {
+                            sum += coefficient[j] * reduced[a][[extreme, j]] * reduced[b][[extreme, j]];
+                        }
+                    }
+                    out[[a, b]] = sum;
+                    out[[b, a]] = sum;
+                }
+            }
+            out
+        };
+        for a in 0..p {
+            for b in 0..p {
+                let mut value = grad_g[a] * grad_u[b]
+                    + grad_u[a] * grad_g[b]
+                    + ungated
+                        * (g11 * q_min[a] * q_min[b]
+                            + g12 * (q_min[a] * q_max[b] + q_max[a] * q_min[b])
+                            + g22 * q_max[a] * q_max[b]);
+                if rate != 0.0 {
+                    value += gate
+                        * (0.5 * rate * (floor_trace[a] * q_max[b] + floor_trace[b] * q_max[a])
+                            + 0.5 * floor_second * rate * rate * q_max[a] * q_max[b]);
+                }
+                motion.remainder[[a, b]] = value;
+            }
+        }
+        let min_weight = ungated * g1;
+        let max_weight = ungated * g2 + 0.5 * gate * floor_first * rate;
+        if min_weight != 0.0 {
+            motion
+                .remainder
+                .scaled_add(min_weight, &extreme_second_order(imin));
+            let z_min = basis.column(imin);
+            for i in 0..p {
+                for j in 0..p {
+                    motion.extra_trace_weight[[i, j]] += min_weight * z_min[i] * z_min[j];
+                }
+            }
+            let v_min = self.evecs.column(imin);
+            for i in 0..m {
+                for j in 0..m {
+                    motion.extra_reduced_weight[[i, j]] += min_weight * v_min[i] * v_min[j];
+                }
+            }
+        }
+        if max_weight != 0.0 {
+            motion
+                .remainder
+                .scaled_add(max_weight, &extreme_second_order(imax));
+            let z_max = basis.column(imax);
+            for i in 0..p {
+                for j in 0..p {
+                    motion.extra_trace_weight[[i, j]] += max_weight * z_max[i] * z_max[j];
+                }
+            }
+            let v_max = self.evecs.column(imax);
+            for i in 0..m {
+                for j in 0..m {
+                    motion.extra_reduced_weight[[i, j]] += max_weight * v_max[i] * v_max[j];
+                }
+            }
+        }
+        Ok(motion)
+    }
+
     fn coefficient_dim(&self) -> usize {
         self.z_j.nrows()
     }
@@ -2274,6 +2459,35 @@ pub fn joint_jeffreys_second_order_completion<Dir2Fn>(
 where
     Dir2Fn: Fn(&Array1<f64>, &Array1<f64>) -> Result<Option<Array2<f64>>, String> + Sync,
 {
+    joint_jeffreys_pairwise_completion(h_joint, z_j, hessian_second_dir, None)
+}
+
+/// [`joint_jeffreys_second_order_completion`] completed with the conditioning-gate
+/// and relative-floor motion of [`JointJeffreysHessianMotion`] (gam#1082): the
+/// motion's H''-linear part rides in the same pairwise pass as the reduced weight
+/// `K + (2/G)·extra_reduced_weight`, and its first-derivative remainder is
+/// subtracted, so the result plus `H_Φ` is the exact coefficient Hessian of `−Φ`.
+pub fn joint_jeffreys_second_order_completion_with_motion<Dir2Fn>(
+    h_joint: ArrayView2<'_, f64>,
+    z_j: ArrayView2<'_, f64>,
+    hessian_second_dir: Dir2Fn,
+    motion: &JointJeffreysHessianMotion,
+) -> Result<Option<Array2<f64>>, String>
+where
+    Dir2Fn: Fn(&Array1<f64>, &Array1<f64>) -> Result<Option<Array2<f64>>, String> + Sync,
+{
+    joint_jeffreys_pairwise_completion(h_joint, z_j, hessian_second_dir, Some(motion))
+}
+
+fn joint_jeffreys_pairwise_completion<Dir2Fn>(
+    h_joint: ArrayView2<'_, f64>,
+    z_j: ArrayView2<'_, f64>,
+    hessian_second_dir: Dir2Fn,
+    motion: Option<&JointJeffreysHessianMotion>,
+) -> Result<Option<Array2<f64>>, String>
+where
+    Dir2Fn: Fn(&Array1<f64>, &Array1<f64>) -> Result<Option<Array2<f64>>, String> + Sync,
+{
     let p = h_joint.nrows();
     if h_joint.ncols() != p {
         return Err(format!(
@@ -2327,6 +2541,20 @@ where
         }
     }
 
+    let reduced_weight = match motion {
+        Some(motion) => {
+            if motion.extra_reduced_weight.dim() != (m, m) || motion.remainder.dim() != (p, p) {
+                return Err(format!(
+                    "joint_jeffreys_second_order_completion: motion shapes {:?}/{:?} do not match \
+                     span {m} and coefficients {p}",
+                    motion.extra_reduced_weight.dim(),
+                    motion.remainder.dim()
+                ));
+            }
+            &k_reduced + &(&motion.extra_reduced_weight * (2.0 / gate_weight))
+        }
+        None => k_reduced,
+    };
     let mut out = Array2::<f64>::zeros((p, p));
     // PARALLEL SECOND-DIRECTIONAL DERIVATIVES. Each upper-triangle pair `(a, b)`
     // needs one FULL-DATA mixed second-directional pass `H''[e_a, e_b]` — the
@@ -2379,15 +2607,68 @@ where
         let mut trace = 0.0_f64;
         for i in 0..m {
             for j in 0..m {
-                trace += k_reduced[[i, j]] * d_ab[[j, i]];
+                trace += reduced_weight[[i, j]] * d_ab[[j, i]];
             }
         }
-        let value = -0.5 * gate_weight * trace;
+        let value = match motion {
+            Some(motion) => -0.5 * gate_weight * trace - motion.remainder[[a, b]],
+            None => -0.5 * gate_weight * trace,
+        };
         out[[a, b]] = value;
         out[[b, a]] = value;
     }
     Ok(Some(out))
 }
+
+/// Conditioning-gate and relative-floor motion part of the exact coefficient
+/// Hessian of the gated Jeffreys value (gam#1082), prepared by
+/// [`JointJeffreysPlan::hessian_motion`].
+///
+/// With `Φ = G·U`, `U = ½ Σ_i g(λ_i; floor)`, `floor = REL·λ_max` on the relative
+/// branch and `P̃_a = Vᵀ Z_Jᵀ Hdot[e_a] Z_J V`, the exact Hessian is
+///
+/// ```text
+/// ∇²Φ[a,b] = G·U_ab + G_a·U_b + G_b·U_a + U·G_ab .
+/// ```
+///
+/// [`joint_jeffreys_term`]'s `H_Φ` and [`joint_jeffreys_second_order_completion`]
+/// carry `−G·(½ Σ_ij Ψ_ij P̃_a,ij P̃_b,ij + ½ Σ_i d_i H̃''_ab,ii)` with the gate and
+/// the floor held fixed. What they omit is linear in the second information
+/// derivative through `extra_trace_weight`, plus a first-derivative remainder:
+///
+/// ```text
+/// ∇²Φ − (frozen part) = ⟨extra_trace_weight, H''[e_a, e_b]⟩ + remainder[a,b]
+///
+/// extra_trace_weight = U·G₁·z_min z_minᵀ + (U·G₂ + ½·G·S_f·r)·z_max z_maxᵀ
+/// remainder = ∇G⊗∇U + ∇U⊗∇G
+///           + U·[G₁₁ q_min⊗q_min + G₁₂(q_min⊗q_max + q_max⊗q_min) + G₂₂ q_max⊗q_max]
+///           + U·G₁·E_min + (U·G₂ + ½·G·S_f·r)·E_max
+///           + G·[½·r·(w⊗q_max + q_max⊗w) + ½·S_ff·r²·q_max⊗q_max]
+/// ```
+///
+/// where `z_e = Z_J V e_e`, `q_e[a] = P̃_a[e,e]`, `w[a] = Σ_i ∂d_i/∂floor·P̃_a,ii`,
+/// `∇U[a] = ½ Σ_i d_i P̃_a,ii + ½·S_f·r·q_max[a]`, `∇G[a] = G₁·q_min[a] + G₂·q_max[a]`,
+/// `(G₁, G₂)` and `(G₁₁, G₁₂, G₂₂)` the gate's first and second partials in
+/// `(λ_min, λ_max)`, `S_f` and `S_ff` the first and second floor sensitivities of
+/// `Σ_i g`, `r = REL` on the relative floor branch (`0` otherwise), and
+/// `E_e[a,b] = 2 Σ_{j≠e} P̃_a[e,j]·P̃_b[e,j] / (λ_e − λ_j)` the first-derivative part
+/// of the extreme eigenvalue's second β-derivative.
+///
+/// The coefficient objective carries `−Φ`, so its exact Hessian contribution is
+/// `H_Φ + completion − ⟨extra_trace_weight, H''⟩ − remainder`. Both fields are
+/// exactly zero where [`JointJeffreysPlan::hessian_motion_active`] is `false`.
+#[derive(Clone, Debug)]
+pub struct JointJeffreysHessianMotion {
+    /// Ambient weight whose contraction with every `H''[e_a, e_b]` is the
+    /// motion's second-derivative-linear part.
+    pub extra_trace_weight: Array2<f64>,
+    /// The motion's first-derivative remainder, `p × p` and symmetric.
+    pub remainder: Array2<f64>,
+    /// The same H''-linear weight in the span coordinates of `Z_J` (`m × m`), for
+    /// a pairwise completion that contracts `Z_Jᵀ H''[e_a, e_b] Z_J` directly.
+    pub extra_reduced_weight: Array2<f64>,
+}
+
 
 /// Explicit (β-frozen) derivative `∂_ρ H_Φ|_β` of the gated joint-Jeffreys
 /// curvature along an OUTER hyperparameter `ρ` (e.g. a log-penalty `log λ_m` or a
@@ -2865,6 +3146,216 @@ where
 mod tests {
     use super::*;
     use ndarray::array;
+
+    /// Relative disagreement of the frozen-policy Jeffreys Hessian
+    /// (`H_Φ + completion`) and of the motion-completed one with central
+    /// differences of the value-path gradient, for an information `H(β)` with
+    /// closed-form first and second β-derivatives (gam#1082).
+    fn jeffreys_hessian_errors_1082<I, F, S>(
+        beta: &Array1<f64>,
+        information: I,
+        first: F,
+        second: S,
+    ) -> (bool, f64, f64)
+    where
+        I: Fn(&Array1<f64>) -> Array2<f64> + Sync,
+        F: Fn(&Array1<f64>, &Array1<f64>) -> Array2<f64> + Sync,
+        S: Fn(&Array1<f64>, &Array1<f64>, &Array1<f64>) -> Array2<f64> + Sync,
+    {
+        let p = beta.len();
+        let z = Array2::<f64>::eye(p);
+        let term = |b: &Array1<f64>| {
+            let h = information(b);
+            joint_jeffreys_term(h.view(), z.view(), |d: &Array1<f64>| Ok(Some(first(b, d))))
+                .expect("Jeffreys term")
+        };
+        let h = information(beta);
+        let plan = JointJeffreysPlan::prepare(h.view(), z.view()).expect("Jeffreys plan");
+        let (_, _, hphi) = term(beta);
+        let completion = joint_jeffreys_second_order_completion(
+            h.view(),
+            z.view(),
+            |u: &Array1<f64>, v: &Array1<f64>| Ok(Some(second(beta, u, v))),
+        )
+        .expect("completion")
+        .expect("completion present");
+        let hdots: Vec<Array2<f64>> = (0..p)
+            .map(|a| {
+                let mut axis = Array1::<f64>::zeros(p);
+                axis[a] = 1.0;
+                first(beta, &axis)
+            })
+            .collect();
+        let motion = plan.hessian_motion(&hdots).expect("Hessian motion");
+        let completed = joint_jeffreys_second_order_completion_with_motion(
+            h.view(),
+            z.view(),
+            |u: &Array1<f64>, v: &Array1<f64>| Ok(Some(second(beta, u, v))),
+            &motion,
+        )
+        .expect("motion-completed completion")
+        .expect("motion-completed completion present");
+        // The contracted-hook route carries the same motion as an ambient weight;
+        // it must be the span weight lifted through `Z_J`.
+        let lifted = z.dot(&motion.extra_reduced_weight).dot(&z.t());
+        let max_abs = |m: &Array2<f64>| m.iter().fold(0.0_f64, |acc, v| acc.max(v.abs()));
+        assert!(
+            max_abs(&(&lifted - &motion.extra_trace_weight))
+                <= 1e-12 * max_abs(&motion.extra_trace_weight).max(1.0),
+            "ambient and span motion weights disagree"
+        );
+        let frozen = &hphi + &completion;
+        let exact = &hphi + &completed;
+        let step = 1e-5;
+        let mut negative_hessian = Array2::<f64>::zeros((p, p));
+        for a in 0..p {
+            let mut offset = Array1::<f64>::zeros(p);
+            offset[a] = step;
+            let (_, plus, _) = term(&(beta + &offset));
+            let (_, minus, _) = term(&(beta - &offset));
+            negative_hessian
+                .column_mut(a)
+                .assign(&((&plus - &minus) / (-2.0 * step)));
+        }
+        let scale = max_abs(&negative_hessian).max(1e-12);
+        (
+            plan.hessian_motion_active(),
+            max_abs(&(&frozen - &negative_hessian)) / scale,
+            max_abs(&(&exact - &negative_hessian)) / scale,
+        )
+    }
+
+    /// gam#1082 negative control: a saturated gate (`λ_min` below the absolute knot,
+    /// the ratio clear of the relative band) over a spectrum no eigenvalue of which
+    /// sits below the relative floor or at the cap has no motion. The completion is
+    /// then exactly the frozen-policy one, which is what keeps families without an
+    /// all-axes information hook on today's path.
+    #[test]
+    fn jeffreys_hessian_motion_is_inactive_on_a_saturated_gate_above_the_floor_1082() {
+        let h = array![[1.0e-4, 0.0], [0.0, 1.0]];
+        let z = Array2::<f64>::eye(2);
+        let plan = JointJeffreysPlan::prepare(h.view(), z.view()).expect("Jeffreys plan");
+        assert!(plan.is_active(), "the saturated fixture must keep the term armed");
+        assert_eq!(plan.conditioning_gate_weight(), 1.0);
+        assert!(
+            !plan.hessian_motion_active(),
+            "a saturated gate above the floor must not activate the Hessian motion"
+        );
+    }
+
+    /// gam#1082: inside the conditioning gate's transition band `Φ = G·U` carries
+    /// `∇G⊗∇U + ∇U⊗∇G + U·∇²G`, which the frozen-policy curvature omits. A
+    /// Poisson-type information `c·Σ_k exp(x_kᵀβ) x_k x_kᵀ` with `c` placing
+    /// `λ_min` at 4 (inside the absolute band `[1, 16]`) must miss the
+    /// finite-difference Hessian without the motion and match it with it.
+    #[test]
+    fn jeffreys_hessian_motion_completes_the_gate_band_hessian_1082() {
+        let rows = array![
+            [1.0, 0.2, -0.3],
+            [1.0, -0.5, 0.4],
+            [1.0, 0.9, 0.1],
+            [1.0, -0.1, -0.8],
+            [1.0, 0.6, 0.7],
+            [1.0, -0.7, -0.2],
+        ];
+        let beta = array![0.1, -0.2, 0.3];
+        let raw = |b: &Array1<f64>, u: Option<&Array1<f64>>, v: Option<&Array1<f64>>| {
+            let mut h = Array2::<f64>::zeros((3, 3));
+            for x in rows.rows() {
+                let mut weight = x.dot(b).exp();
+                if let Some(u) = u {
+                    weight *= x.dot(u);
+                }
+                if let Some(v) = v {
+                    weight *= x.dot(v);
+                }
+                for i in 0..3 {
+                    for j in 0..3 {
+                        h[[i, j]] += weight * x[i] * x[j];
+                    }
+                }
+            }
+            h
+        };
+        let (evals, _) = raw(&beta, None, None)
+            .eigh(Side::Lower)
+            .expect("fixture spectrum");
+        let lambda_min = evals.iter().copied().fold(f64::INFINITY, f64::min);
+        let scale = 4.0 / lambda_min;
+        let (active, frozen_error, exact_error) = jeffreys_hessian_errors_1082(
+            &beta,
+            |b| raw(b, None, None).mapv(|v| scale * v),
+            |b, d| raw(b, Some(d), None).mapv(|v| scale * v),
+            |b, u, v| raw(b, Some(u), Some(v)).mapv(|v| scale * v),
+        );
+        assert!(active, "the fixture must sit inside the gate's transition band");
+        assert!(
+            frozen_error > 1e-3,
+            "positive control: the frozen-policy Hessian must miss the gate motion (rel {frozen_error:e})"
+        );
+        assert!(
+            exact_error < 1e-5,
+            "motion-completed Jeffreys Hessian vs finite differences: rel {exact_error:e} \
+             (frozen-policy rel {frozen_error:e})"
+        );
+    }
+
+    /// gam#1082: an eigenvalue below the relative floor `REL·λ_max` feels the
+    /// floor move with `λ_max(β)`. A third direction the data barely reach, with
+    /// its own β-dependence, sits far below that floor while the gate is
+    /// saturated, so only the floor's motion separates the frozen-policy Hessian
+    /// from the finite-difference one.
+    #[test]
+    fn jeffreys_hessian_motion_completes_the_moving_floor_hessian_1082() {
+        let rows = array![[1.0, 0.3], [1.0, -0.6], [1.0, 0.8], [1.0, -0.2], [1.0, 0.5]];
+        let beta = array![0.2, -0.1, 0.4];
+        let ghost = 1e-13;
+        let raw = |b: &Array1<f64>, u: Option<&Array1<f64>>, v: Option<&Array1<f64>>| {
+            let mut h = Array2::<f64>::zeros((3, 3));
+            for x in rows.rows() {
+                let mut weight = (x[0] * b[0] + x[1] * b[1]).exp();
+                if let Some(u) = u {
+                    weight *= x[0] * u[0] + x[1] * u[1];
+                }
+                if let Some(v) = v {
+                    weight *= x[0] * v[0] + x[1] * v[1];
+                }
+                for i in 0..2 {
+                    for j in 0..2 {
+                        h[[i, j]] += weight * x[i] * x[j];
+                    }
+                }
+            }
+            let mut tail = ghost * b[2].exp();
+            if let Some(u) = u {
+                tail *= u[2];
+            }
+            if let Some(v) = v {
+                tail *= v[2];
+            }
+            h[[2, 2]] += tail;
+            h
+        };
+        let (active, frozen_error, exact_error) = jeffreys_hessian_errors_1082(
+            &beta,
+            |b| raw(b, None, None),
+            |b, d| raw(b, Some(d), None),
+            |b, u, v| raw(b, Some(u), Some(v)),
+        );
+        assert!(
+            active,
+            "an eigenvalue below a relative floor must activate the floor motion"
+        );
+        assert!(
+            frozen_error > 1e-3,
+            "positive control: the frozen-policy Hessian must miss the floor motion (rel {frozen_error:e})"
+        );
+        assert!(
+            exact_error < 1e-4,
+            "motion-completed Jeffreys Hessian vs finite differences: rel {exact_error:e} \
+             (frozen-policy rel {frozen_error:e})"
+        );
+    }
 
     #[test]
     fn fused_ambient_eigenbasis_congruence_matches_two_stage_definition_2612() {

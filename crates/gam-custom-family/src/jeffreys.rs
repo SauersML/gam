@@ -635,10 +635,58 @@ pub(crate) fn custom_family_joint_jeffreys_second_order_completion<
             Ok(None)
         };
     };
+    // Gate and floor motion (gam#1082). `−½·G·⟨Z_J K Z_Jᵀ, H''⟩` is the whole
+    // second-directional remainder of `−∇²Φ` only while the conditioning gate is
+    // saturated and no eigenvalue feels the relative floor move. Inside the
+    // gate's transition band, or under a moving floor, `Φ = G·U` also carries
+    // `∇G⊗∇U + ∇U⊗∇G + U·∇²G` and the floor's own motion. The mode response is
+    // solved on this completion, so leaving those terms out makes `∂β̂/∂ρ` the
+    // response of a different objective. Measured on the quasi-separated
+    // multinomial repro (`multinomial_outer_derivatives_1082`): analytic-vs-FD
+    // outer gradient gaps of 3e-4 to 1.5e-2, independent of the FD step and of
+    // the inner tolerance, while the value-path Jeffreys gradient and the
+    // divided-difference drift were both finite-difference exact.
+    let motion = if assembly == JeffreysCompletionAssembly::Exact
+        || family.joint_jeffreys_information_contracted_trace_hessian_available()
+    {
+        let plan = gam_solve::estimate::reml::jeffreys_subspace::JointJeffreysPlan::prepare(
+            h_joint.view(),
+            z_joint.view(),
+        )?;
+        if plan.hessian_motion_active() {
+            let axes = family
+                .joint_jeffreys_information_directional_derivative_all_axes_with_specs(
+                    states, specs,
+                )?
+                .ok_or_else(|| {
+                    CustomFamilyError::trial_point(
+                        "active Jeffreys gate/floor motion requires exact first information \
+                         derivatives"
+                            .to_string(),
+                    )
+                })?;
+            Some(plan.hessian_motion(&axes)?)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    // The contracted hook is linear in its weight and the completion keeps the
+    // hook's `−½·G` convention, so the motion's H''-linear part rides in the same
+    // single pass as `(2/G)·extra_trace_weight`.
+    let hook_weight = match motion.as_ref() {
+        Some(motion) => {
+            let mut weight = trace_weight.clone();
+            weight.scaled_add(2.0 / gate_weight, &motion.extra_trace_weight);
+            weight
+        }
+        None => trace_weight,
+    };
     let completion = match family.joint_jeffreys_information_contracted_trace_hessian_with_specs(
         states,
         specs,
-        &trace_weight,
+        &hook_weight,
     )? {
         Some(mut contracted) => {
             if contracted.dim() != (p, p) {
@@ -648,18 +696,34 @@ pub(crate) fn custom_family_joint_jeffreys_second_order_completion<
                 )));
             }
             contracted.mapv_inplace(|value| -0.5 * gate_weight * value);
+            if let Some(motion) = motion.as_ref() {
+                contracted -= &motion.remainder;
+            }
             Some(contracted)
         }
         None if assembly == JeffreysCompletionAssembly::Exact => {
-            gam_solve::estimate::reml::jeffreys_subspace::joint_jeffreys_second_order_completion(
-                h_joint.view(),
-                z_joint.view(),
-                |u: &Array1<f64>, v: &Array1<f64>| {
-                    family.joint_jeffreys_information_second_directional_derivative_with_specs(
-                        states, specs, u, v,
-                    )
-                },
-            )?
+            let second_direction = |u: &Array1<f64>, v: &Array1<f64>| {
+                family.joint_jeffreys_information_second_directional_derivative_with_specs(
+                    states, specs, u, v,
+                )
+            };
+            match motion.as_ref() {
+                Some(motion) => {
+                    gam_solve::estimate::reml::jeffreys_subspace::joint_jeffreys_second_order_completion_with_motion(
+                        h_joint.view(),
+                        z_joint.view(),
+                        second_direction,
+                        motion,
+                    )?
+                }
+                None => {
+                    gam_solve::estimate::reml::jeffreys_subspace::joint_jeffreys_second_order_completion(
+                        h_joint.view(),
+                        z_joint.view(),
+                        second_direction,
+                    )?
+                }
+            }
         }
         None => None,
     };
