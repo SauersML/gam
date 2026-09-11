@@ -6047,6 +6047,54 @@ mod patterned_order2_perf_tests {
         gate.finish();
     }
 
+    /// Assert that a warm reused arena does no allocator work. After one warm row
+    /// and a `reset`, the arena's reserved size must not change at any later
+    /// `reset` or over any of 64 later rows. The arena grows only by adding a
+    /// chunk, its only allocator call, and the compaction in
+    /// `DynamicJetArena::reset` fires once, on the first reset.
+    fn assert_warm_arena_does_no_allocator_work(
+        order: usize,
+        row: impl Fn(&DynamicJetArena, f64) -> f64,
+    ) {
+        let mut arena = DynamicJetArena::new();
+        let mut checksum = row(&arena, 0.0);
+        arena.reset();
+        checksum += row(&arena, 1e-18);
+        let warm = arena.allocated_bytes();
+        assert!(warm > 0, "order {order}: the warm arena reserved nothing");
+        for index in 0..64usize {
+            arena.reset();
+            assert_eq!(
+                arena.allocated_bytes(),
+                warm,
+                "order {order}: allocator work at reset, the warm arena's reserved size changed \
+                 before row {index}"
+            );
+            checksum += row(&arena, (index + 2) as f64 * 1e-18);
+            assert_eq!(
+                arena.allocated_bytes(),
+                warm,
+                "order {order}: allocator work in row {index} of a warm arena"
+            );
+        }
+        assert!(checksum.is_finite(), "order {order}: non-finite checksum");
+    }
+
+    /// Positive control for `assert_warm_arena_does_no_allocator_work`: a row
+    /// whose allocation doubles on every call must be refused, so a passing count
+    /// means the warm arena really did no allocator work.
+    #[test]
+    #[should_panic(expected = "allocator work")]
+    fn warm_arena_count_refuses_a_row_that_grows_the_arena_932() {
+        let calls = std::cell::Cell::new(0u32);
+        assert_warm_arena_does_no_allocator_work(0, |arena, nudge| {
+            let len = 4096usize << calls.get();
+            calls.set(calls.get() + 1);
+            let slots = arena.alloc_slice_fill_with(len, |index| index as f64 + nudge);
+            slots[len - 1]
+        });
+    }
+
     /// #932 release speed gate for the runtime-width SLS link/time-wiggle kernel
     /// ([`SurvivalLsWiggleRowKernel`], primary width `KW = SLS_ROW_K + pw`). The
     /// three ungated production lowerings over `sls_row_nll_wiggle` — the order-2
@@ -6202,10 +6250,37 @@ mod patterned_order2_perf_tests {
             }
         }
 
+        // Arena reuse at orders 3 and 4 is asserted as an allocation count, in
+        // every profile, not timed. Timed, each order was a coin flip decided by
+        // per-process placement (the reused arena's one chunk lands at one
+        // address per process, the fresh arm's chunks wherever malloc places them
+        // each row), a larger effect than the saving itself: across fourteen runs
+        // the order-4 reused arm ranged 0.978–1.047 against a fresh arena per row
+        // with `wins` unanimous in both directions, and order 3 read 0.988, 1.005
+        // and 1.021 on three Speed Gates hosts.
+        assert_warm_arena_does_no_allocator_work(3, |arena, nudge| {
+            let mut pp = p;
+            pp[0] += nudge;
+            let vars = arena.alloc_slice_fill_with(KW, |a| {
+                DynamicOneSeed::seed_direction(pp[a], a, dir_u[a], KW, arena)
+            });
+            let out = sls_row_nll_wiggle(vars, &kernel, PW, &basis);
+            out.value() + out.contracted_third()[0]
+        });
+        assert_warm_arena_does_no_allocator_work(4, |arena, nudge| {
+            let mut pp = p;
+            pp[0] += nudge;
+            let vars = arena.alloc_slice_fill_with(KW, |a| {
+                DynamicTwoSeed::seed(pp[a], a, dir_u[a], dir_v[a], KW, arena)
+            });
+            let out = sls_row_nll_wiggle(vars, &kernel, PW, &basis);
+            out.value() + out.contracted_fourth()[0]
+        });
+
         // Speed contract, release profile only (`SpeedGate::open` documents
-        // why): the amortised reused arena (production) must beat a fresh arena
-        // per row where the instrument can resolve the saving, and must not be
-        // slower where it cannot. The nudge perturbs the first primary.
+        // why): at order 2 the amortised reused arena (production) must beat a
+        // fresh arena per row, where the instrument resolves the saving. The
+        // nudge perturbs the first primary.
         if cfg!(debug_assertions) {
             return;
         }
@@ -6237,80 +6312,6 @@ mod patterned_order2_perf_tests {
             },
         );
         gate.faster("order=2", &order2, "reused_arena", "fresh_arena");
-
-        let mut prod_arena3 = DynamicJetArena::new();
-        let order3 = paired_interleaved(
-            15,
-            iterations,
-            0x9320_D1_03,
-            |nudge| {
-                let mut pp = p;
-                pp[0] += nudge;
-                prod_arena3.reset();
-                let vars = prod_arena3.alloc_slice_fill_with(KW, |a| {
-                    DynamicOneSeed::seed_direction(pp[a], a, dir_u[a], KW, &prod_arena3)
-                });
-                let out = sls_row_nll_wiggle(vars, &kernel, PW, &basis);
-                out.value() + out.contracted_third()[0]
-            },
-            |nudge| {
-                let mut pp = p;
-                pp[0] += nudge;
-                let fresh = DynamicJetArena::new();
-                let vars = fresh.alloc_slice_fill_with(KW, |a| {
-                    DynamicOneSeed::seed_direction(pp[a], a, dir_u[a], KW, &fresh)
-                });
-                let out = sls_row_nll_wiggle(vars, &kernel, PW, &basis);
-                out.value() + out.contracted_third()[0]
-            },
-        );
-        gate.faster("order=3", &order3, "reused_arena", "fresh_arena");
-
-        // Order 4: the claim is that a warm reused arena does no allocator
-        // work, and that claim is countable, so it is asserted as a count,
-        // not timed. Timed, it was a coin flip: across fourteen runs the
-        // reused arm ranged 0.978–1.047 against a fresh arena per row, with
-        // `wins` unanimous in both directions — a per-process effect (the
-        // reused arena's one chunk lands at one address per process, the
-        // fresh arm's chunks wherever malloc places them each row, and
-        // cache-set placement decides a 1–2% margin at a 45–60 µs row) that
-        // is larger than the ~0.5 µs the policy saves. Orders 2 and 3 above
-        // keep the timing, where the saving is resolved.
-        //
-        // The arena grows only by adding a chunk, which is the only allocator
-        // call it makes; after one warm row its reserved size must not change
-        // over any later row, and `reset` must keep it (the compaction in
-        // `DynamicJetArena::reset` fires once, on the first reset).
-        let mut prod_arena4 = DynamicJetArena::new();
-        let row4 = |arena: &DynamicJetArena, nudge: f64| {
-            let mut pp = p;
-            pp[0] += nudge;
-            let vars = arena.alloc_slice_fill_with(KW, |a| {
-                DynamicTwoSeed::seed(pp[a], a, dir_u[a], dir_v[a], KW, arena)
-            });
-            let out = sls_row_nll_wiggle(vars, &kernel, PW, &basis);
-            out.value() + out.contracted_fourth()[0]
-        };
-        let mut checksum = row4(&prod_arena4, 0.0);
-        prod_arena4.reset();
-        checksum += row4(&prod_arena4, 1e-18);
-        let warm = prod_arena4.allocated_bytes();
-        assert!(warm > 0, "the warm arena reserved nothing");
-        for row in 0..64usize {
-            prod_arena4.reset();
-            assert_eq!(
-                prod_arena4.allocated_bytes(),
-                warm,
-                "reset changed the warm arena's reserved size before row {row}"
-            );
-            checksum += row4(&prod_arena4, (row + 2) as f64 * 1e-18);
-            assert_eq!(
-                prod_arena4.allocated_bytes(),
-                warm,
-                "row {row} of a warm arena reached the allocator"
-            );
-        }
-        assert!(checksum.is_finite());
         gate.finish();
     }
 }
