@@ -12,10 +12,11 @@
 //!
 //! The construction is the classical local-PCA atlas:
 //!
-//!   1. deterministic farthest-point CENTERS over the ambient rows (reusing
-//!      [`super::intrinsic_seed::farthest_point_landmarks`], the same greedy
-//!      coverage pattern the intrinsic seeder uses), so the patches tile the
-//!      manifold with sublinearly many charts;
+//!   1. deterministic farthest-point CENTERS over the ambient rows, greedy in a
+//!      metric normalized by each center's own local sample spacing (see
+//!      `occupancy_normalized_centers`), so the patches tile the manifold with
+//!      sublinearly many charts and each Voronoi cell holds about the mean
+//!      occupancy that the patch budget is a multiple of;
 //!   2. one PATCH per center — its nearest ambient rows, at most
 //!      `patch_size` of them — sized so neighboring patches OVERLAP (controlled by
 //!      [`LocalAtlasConfig`]). The neighborhood is the LARGEST prefix of the
@@ -207,6 +208,86 @@ fn patch_size_overlap_multiplier(intrinsic_dim: usize) -> f64 {
     PATCH_SIZE_OVERLAP_FLOOR.max(doubling)
 }
 
+/// Farthest-point patch centers in a metric normalized by each center's local
+/// sample spacing, so that every Voronoi cell holds about `occupancy_rank` rows.
+///
+/// [`LocalAtlasConfig::balanced`] denominates the patch budget in ROWS, a multiple
+/// of the mean cell occupancy `n / count`, and `patch_size_overlap_multiplier`
+/// derives that multiple from each patch reaching twice its own cell radius. Both
+/// are statements about a cell holding the MEAN occupancy. A plain farthest-point
+/// net equalizes cell AREA in the ambient metric instead, so on a non-uniformly
+/// sampled manifold the densely sampled cells hold several times the mean, a patch
+/// there reaches barely past its own cell, and the nerve loses intersections that
+/// neighboring patches genuinely share (#2280). On `swiss_roll(80, 16)`, whose
+/// along-roll spacing grows as `√(1 + t²)`, the four inner-tip centers carrying the
+/// spurious `b₁ = 1` class owned 33–63 rows against a mean of 17.8, and their
+/// patches reached 0.90–1.47 cell radii rather than 2.
+///
+/// The repair is to the net, not to the budget. Each chosen center measures squared
+/// distances in units of its own squared distance to its `occupancy_rank`-th nearest
+/// row, and the greedy step takes the row farthest from every center in those
+/// units. A center in a dense region is small in its own units and one in a sparse
+/// region is large, so centers crowd where rows crowd and each cell holds about
+/// `occupancy_rank` rows — the premise the row budget was derived under. Growing the
+/// budget of crowded cells instead is not equivalent: it pushes dense patches past
+/// small features (a spherical band's narrow rims) that the fixed budget keeps them
+/// inside.
+///
+/// Deterministic like the intrinsic seeder's farthest-point landmarks: row 0 first,
+/// first-wins ties, and a stop once every remaining row coincides with a center. A
+/// center with at least `occupancy_rank` coincident rows has no spacing to normalize
+/// by, so it covers exactly the rows it coincides with.
+fn occupancy_normalized_centers(
+    z: ArrayView2<'_, f64>,
+    count: usize,
+    occupancy_rank: usize,
+) -> Vec<usize> {
+    let n = z.nrows();
+    if n == 0 {
+        return Vec::new();
+    }
+    let target = count.max(1).min(n);
+    let rank = occupancy_rank.min(n - 1);
+    let mut normalized_nearest = vec![f64::INFINITY; n];
+    let mut chosen: Vec<usize> = Vec::with_capacity(target);
+    let mut next = 0usize;
+    loop {
+        chosen.push(next);
+        let distances: Vec<f64> = (0..n).map(|row| sq_distance(z, next, row)).collect();
+        let mut ordered = distances.clone();
+        ordered.select_nth_unstable_by(rank, f64::total_cmp);
+        let spacing = ordered[rank];
+        for (row, &distance) in distances.iter().enumerate() {
+            let normalized = if distance <= 0.0 {
+                0.0
+            } else if spacing > 0.0 {
+                distance / spacing
+            } else {
+                continue;
+            };
+            if normalized < normalized_nearest[row] {
+                normalized_nearest[row] = normalized;
+            }
+        }
+        if chosen.len() == target {
+            break;
+        }
+        let mut best = 0usize;
+        let mut best_distance = -1.0;
+        for (row, &value) in normalized_nearest.iter().enumerate() {
+            if value > best_distance {
+                best_distance = value;
+                best = row;
+            }
+        }
+        if best_distance <= 0.0 {
+            break;
+        }
+        next = best;
+    }
+    chosen
+}
+
 /// Minimum fraction of the ambient rows that certified charts must cover for the
 /// atlas to be built at all. On real, noisy activations a handful of centers can
 /// land on unchartable neighborhoods (a locally rank-deficient blob, a sampling
@@ -233,7 +314,8 @@ const MIN_ATLAS_ROW_COVERAGE: f64 = 0.5;
 pub struct LocalAtlasConfig {
     /// Target chart dimension `d` (the local-PCA rank).
     pub intrinsic_dim: usize,
-    /// Number of farthest-point patch centers.
+    /// Number of patch centers, placed farthest-point in the occupancy-normalized
+    /// metric so each cell holds about `n / patch_count` rows.
     pub patch_count: usize,
     /// Upper bound on the number of nearest rows in each patch (including its
     /// center). A patch that cannot certify a tangent chart at this size is shrunk
@@ -620,9 +702,10 @@ pub struct LocalAtlas {
 impl LocalAtlas {
     /// Construct the local-chart atlas from ambient rows `z` under `config`.
     ///
-    /// Pure, deterministic construction: farthest-point centers, nearest-row
-    /// patches, local-PCA charts (each certified injective or rejected with a
-    /// typed error), and orthogonal Procrustes transitions on every overlap.
+    /// Pure, deterministic construction: occupancy-normalized farthest-point
+    /// centers, nearest-row patches, local-PCA charts (each certified injective or
+    /// rejected with a typed error), and orthogonal Procrustes transitions on every
+    /// overlap.
     pub fn build(
         z: ArrayView2<'_, f64>,
         config: LocalAtlasConfig,
@@ -654,8 +737,11 @@ impl LocalAtlas {
 
         let membership_coords = intrinsic_geodesic_embedding(z, d)
             .map_err(|detail| LocalChartError::IntrinsicMetricFailure { detail })?;
-        // (1) deterministic farthest-point centers (reused intrinsic-seed machinery).
-        let centers = farthest_point_landmarks(z, config.patch_count.max(1).min(n));
+        // (1) deterministic farthest-point centers in the occupancy-normalized metric,
+        // so every cell holds about the mean occupancy `patch_size` is a multiple of.
+        let requested_centers = config.patch_count.max(1).min(n);
+        let centers =
+            occupancy_normalized_centers(z, requested_centers, n.div_ceil(requested_centers));
         // (2)+(3) one certified local-PCA chart per patch, on the largest
         // neighborhood that certifies (see `certified_neighborhood_chart`). A center
         // whose neighborhood cannot certify at any admissible size is DROPPED with its
@@ -1387,6 +1473,75 @@ mod tests {
     use crate::manifold::tests_topology_fixtures::{
         cylinder_strip, embedded_plane, mobius_strip, spherical_band, swiss_roll, torus,
     };
+
+    /// Rows owned by each center: nearest center, lowest index on a tie.
+    fn cell_occupancy(z: ArrayView2<'_, f64>, centers: &[usize]) -> Vec<usize> {
+        let mut occupancy = vec![0usize; centers.len()];
+        for row in 0..z.nrows() {
+            let mut owner = 0usize;
+            let mut nearest = f64::INFINITY;
+            for (slot, &center) in centers.iter().enumerate() {
+                let distance = sq_distance(z, center, row);
+                if distance < nearest {
+                    nearest = distance;
+                    owner = slot;
+                }
+            }
+            occupancy[owner] += 1;
+        }
+        occupancy
+    }
+
+    /// #2280 — the patch budget is a multiple of the MEAN cell occupancy, so the
+    /// centers must deliver cells that hold about the mean. `swiss_roll(80, 16)`'s
+    /// along-roll spacing grows as `√(1 + t²)`, so an ambient farthest-point net
+    /// crowds rows into the inner-tip cells; the occupancy-normalized net must not.
+    ///
+    /// Bar: no cell holds more than twice the mean occupancy. Under locally uniform
+    /// sampling a patch of `2^d = 4` mean occupancies then reaches at least `√2` of its
+    /// cell radii. The plain ambient net on the SAME fixture is the positive control:
+    /// it must fail the bar, or the fixture does not exercise the defect.
+    #[test]
+    fn patch_centers_hold_the_mean_occupancy_on_a_nonuniform_sample_2280() {
+        let z = swiss_roll(80, 16);
+        let n = z.nrows();
+        let config = LocalAtlasConfig::balanced(n, 2);
+        let mean = n as f64 / config.patch_count as f64;
+        let plain = cell_occupancy(
+            z.view(),
+            &farthest_point_landmarks(z.view(), config.patch_count),
+        );
+        let normalized = cell_occupancy(
+            z.view(),
+            &occupancy_normalized_centers(
+                z.view(),
+                config.patch_count,
+                n.div_ceil(config.patch_count),
+            ),
+        );
+        assert_eq!(plain.len(), config.patch_count, "the plain net must place every center");
+        assert_eq!(
+            normalized.len(),
+            config.patch_count,
+            "the normalized net must place every center"
+        );
+        let plain_max = plain.iter().copied().max().unwrap_or(0);
+        let normalized_max = normalized.iter().copied().max().unwrap_or(0);
+        eprintln!(
+            "#2280 cell occupancy on swiss_roll(80,16): mean={mean:.2} \
+             plain_max={plain_max} normalized_max={normalized_max}"
+        );
+        assert!(
+            plain_max as f64 > 2.0 * mean,
+            "positive control: the ambient net must crowd a cell past twice the mean \
+             ({plain_max} vs mean {mean:.2}), or this fixture does not exercise #2280"
+        );
+        assert!(
+            normalized_max as f64 <= 2.0 * mean,
+            "no occupancy-normalized cell may hold more than twice the mean \
+             ({normalized_max} vs mean {mean:.2})"
+        );
+    }
 
     /// The frame resolution is the tilt at which a neighborhood stops preferring its
     /// own fitted plane, and it is read off the certificate rather than chosen.

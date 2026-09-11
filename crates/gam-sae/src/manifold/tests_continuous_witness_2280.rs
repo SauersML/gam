@@ -1,8 +1,13 @@
 //! #2280: sampled witnesses for intersections missed by the membership nerve.
 //!
 //! The Sep-7 measurement localized the Swiss-roll membership nerve's spurious
-//! H1 class to patches {0, 18, 45, 48}. The fixture rows supply triangles
-//! `(0,18,45)` and `(0,45,48)`, but neither `(0,18,48)` nor `(18,45,48)`.
+//! H1 class to patches {0, 18, 45, 48} of the ambient farthest-point cover. The
+//! fixture rows supplied triangles `(0,18,45)` and `(0,45,48)`, but neither
+//! `(0,18,48)` nor `(18,45,48)`, although sampled surface points lay inside all
+//! three patch balls of each missing triple. Those inner-tip cells held 33–63
+//! rows against a mean occupancy of 17.8, so the row-denominated patch budget
+//! starved them. The atlas now places its centers in the occupancy-normalized
+//! metric (`local_charts::occupancy_normalized_centers`), and the two nerves agree.
 //!
 //! Extend each patch to the closed ambient ball through its farthest member,
 //! intersected with the analytic fixture surface: `U_i = B(c_i, r_i) ∩ M`.
@@ -11,19 +16,18 @@
 //! membership intersection, including boundary rows without a sqrt roundtrip.
 //! The production enumerator and Betti calculation compare the two predicates.
 //!
-//! A negative triple margin supplies a point inside all three balls and thus
-//! positive evidence of a continuous intersection missed by membership. The
-//! converse does not follow: a finite grid can miss intersections and uncovered
-//! regions between its points. Zero uncovered grid points is only sampled
-//! coverage, and the witness nerve's Betti numbers describe that finite nerve.
-//! These measurements neither certify a continuous cover nor choose a general
-//! production repair. A good cover requires every nonempty finite intersection
-//! to be contractible; sampled domain connectivity alone cannot establish that.
+//! Every membership simplex must co-fire on the grid (a shared row is a sheet
+//! point within every patch radius). The converse does not follow: a finite grid
+//! can miss intersections and uncovered regions between its points. Zero
+//! uncovered grid points is only sampled coverage, and the witness nerve's Betti
+//! numbers describe that finite nerve. These measurements do not certify a
+//! continuous cover. A good cover requires every nonempty finite intersection to
+//! be contractible; sampled domain connectivity alone cannot establish that.
 //!
-//! The Swiss-roll regression pins membership (1,1,0), witness (1,0,0), and both
-//! missing triples' negative margins. Torus and Möbius controls pin their known
-//! signatures. Connectivity is reported on the refinement lattice with the
-//! fixture's actual seam identifications, separately from the witness nerve.
+//! The Swiss-roll regression pins membership (1,0,0) and witness (1,0,0). Torus
+//! and Möbius controls pin their known signatures. Connectivity is reported on
+//! the refinement lattice with the fixture's actual seam identifications,
+//! separately from the witness nerve.
 
 use super::*;
 use crate::inference::atlas_nerve::SimplexInventory;
@@ -36,7 +40,7 @@ use std::collections::VecDeque;
 /// witness grid as per-point chart bitsets.
 struct WitnessCover {
     centers: Vec<usize>,
-    /// Patch radius `r_i` (for reporting and margin arithmetic).
+    /// Patch radius `r_i` (for reporting).
     radii: Vec<f64>,
     words: usize,
     /// `contains[p]` holds the membership bits of grid point `p` (`words`
@@ -127,26 +131,6 @@ impl WitnessCover {
             .iter()
             .map(|word| word.count_ones())
             .sum()
-    }
-
-    /// Signed margin of a grid point against one chart's ball:
-    /// `‖x − c‖ − r` (negative = inside the domain).
-    fn margin(
-        &self,
-        data: ArrayView2<'_, f64>,
-        grid: ArrayView2<'_, f64>,
-        point: usize,
-        chart: usize,
-    ) -> f64 {
-        let center = self.centers[chart];
-        let distance = (0..data.ncols())
-            .map(|column| {
-                let delta = grid[[point, column]] - data[[center, column]];
-                delta * delta
-            })
-            .sum::<f64>()
-            .sqrt();
-        distance - self.radii[chart]
     }
 }
 
@@ -366,38 +350,6 @@ fn check(
     }
 }
 
-/// Margin of the best witness-grid point against a chart triple: the smallest
-/// over grid points of the WORST ball margin, `min_p max_i (‖x_p − c_i‖ − r_i)`
-/// (negative = a sheet point exists inside all three domains). Reported for
-/// the two triples whose absent triangles carry the Sep-7 class, requiring the
-/// atlas to reproduce the named centers (rows 0, 143, 13, 131 for patches 0,
-/// 18, 45, 48 respectively).
-fn triple_margin(
-    witness: &WitnessCover,
-    data: &Array2<f64>,
-    grid: &Array2<f64>,
-    triple: [usize; 3],
-    expected_centers: [usize; 3],
-) -> f64 {
-    let actual = triple.map(|chart| witness.centers[chart]);
-    assert_eq!(
-        actual, expected_centers,
-        "triple {triple:?}: centers drifted"
-    );
-    let mut best = f64::INFINITY;
-    for point in 0..grid.nrows() {
-        let worst = triple
-            .iter()
-            .map(|&chart| witness.margin(data.view(), grid.view(), point, chart))
-            .fold(f64::NEG_INFINITY, f64::max);
-        best = best.min(worst);
-    }
-    eprintln!(
-        "#2280 witness: triple {triple:?} sampled margin {best:.4} (negative = nonempty intersection)"
-    );
-    best
-}
-
 #[test]
 fn torus_witness_nerve_reads_the_true_topology_2280() {
     let data = torus(60, 26, 2.0, 0.8);
@@ -461,39 +413,19 @@ fn swiss_roll_witness_fills_missing_membership_intersections_2280() {
     let membership = readout.membership_betti;
     assert_eq!(
         (membership.b0, membership.b1, membership.b2),
-        (1, 1, Some(0)),
-        "the diagnostic must reproduce the membership nerve's spurious class"
+        (1, 0, Some(0)),
+        "the occupancy-normalized cover's membership nerve must be the contractible sheet"
     );
     let sampled = readout.witness_betti;
     assert_eq!(
         (sampled.b0, sampled.b1, sampled.b2),
         (1, 0, Some(0)),
-        "the refined witness nerve must fill the spurious class"
+        "the refined witness nerve must read the contractible sheet"
     );
     assert_eq!(
         readout.uncovered, 0,
         "Swiss roll must cover all witness-grid points"
     );
-
-    for (triple, centers) in [([0, 18, 48], [0, 143, 131]), ([18, 45, 48], [143, 13, 131])] {
-        let margin = triple_margin(&witness, &data, &grid, triple, centers);
-        assert!(
-            margin < 0.0,
-            "{triple:?}: a strict interior witness must exist"
-        );
-        assert!(
-            witness.co_fires(&triple),
-            "{triple:?}: the witness predicate must admit the triple"
-        );
-        let mut shared = atlas.patches()[triple[0]].members.clone();
-        for &chart in &triple[1..] {
-            shared = sorted_intersection(&shared, &atlas.patches()[chart].members);
-        }
-        assert!(
-            shared.is_empty(),
-            "{triple:?}: fixture membership must miss this intersection"
-        );
-    }
 }
 
 #[test]
