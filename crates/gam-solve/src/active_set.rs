@@ -45,7 +45,9 @@ pub const ACTIVE_SET_WORKING_FACE_TOL: f64 = 1e-10;
 /// (working-set) gradient residual ‖∇L − Aᵀλ‖∞, either absolute or relative to
 /// `max(1, ‖∇L‖∞)`, must fall below this to certify a constrained stationary
 /// point. Matched against `ACTIVE_SET_KKT_COMPLEMENTARITY_TOL` so both KKT
-/// residual channels are certified at compatible scales.
+/// residual channels are certified at compatible scales. The metric projection
+/// compares only the part of that residual above its componentwise roundoff
+/// floor (`stationarity_roundoff_excess`, #1561).
 const ACTIVE_SET_KKT_STATIONARITY_TOL: f64 = 2e-6;
 
 /// Complementarity-slackness tolerance for the KKT acceptance gate:
@@ -3150,6 +3152,88 @@ pub(crate) fn kkt_dual_channel_violations(
     (dual_infeasible, complementarity_violated)
 }
 
+/// The part of the metric projection's stationarity residual above what its
+/// own operands can resolve.
+struct StationarityRoundoff {
+    /// `max_i max(|r_i| − floor_i, 0)`; infinite when a residual or a floor is
+    /// non-finite, so a non-finite residual is never certified.
+    excess: f64,
+    /// The coordinate carrying `excess`.
+    coordinate: usize,
+    /// That coordinate's roundoff floor.
+    floor: f64,
+}
+
+/// Componentwise roundoff floor of the stationarity residual
+/// `r = H·β − rhs − A_Aᵀμ`, and how far `r` rises above it.
+///
+/// Every `r_i` is a cancellation: `(Hβ)_i`, `rhs_i` and `(A_Aᵀμ)_i` are each as
+/// large as the products that form them while their sum is meant to vanish. The
+/// Wilkinson bound of `gam_linalg::roundoff` limits what the evaluation of `r_i`
+/// can deliver to
+///
+/// `floor_i = γ_k · (Σ_j |H_ij β_j| + |rhs_i| + Σ_k |A_ki μ_k|)`,
+///
+/// with `k = accumulation_depth`, the deepest rounding path the caller's
+/// evaluation of `r` actually took. This is the Oettli–Prager componentwise
+/// backward-error scale of the stationarity equation, and it also covers `β`'s
+/// own representability: one unit in the last place of `β_j` moves `r_i` by
+/// `|H_ij|·ulp(β_j) ≤ 2u·|H_ij β_j|`.
+///
+/// The solve-scale term `‖H_i‖₁·‖β‖∞` that `certify_active_equalities` adds is
+/// deliberately absent, because it is not componentwise. On the survival
+/// location-scale QP of #1561 the time block's first coefficient carries
+/// `H_00 = 4.289375e23` against `‖β‖∞ = 1.62`, so that term measured `6.96e23`
+/// and would have certified any residual up to about `1.8e9`. The refused
+/// residual there was `r_0 = −9.765625e-4 = −2⁻¹⁰`, exactly one unit in the last
+/// place of `(Hβ)_0 ≈ rhs_0 ≈ 5.566932e12`, against `floor_0 ≈ 2.8e-2`; a
+/// `2e-16` refinement of `β` moved it between that one unit and `1.5e-8`.
+fn stationarity_roundoff_excess(
+    hessian: &Array2<f64>,
+    rhs: &Array1<f64>,
+    beta: &Array1<f64>,
+    active_a: Option<&Array2<f64>>,
+    multipliers: &Array1<f64>,
+    residual: &Array1<f64>,
+    accumulation_depth: usize,
+) -> StationarityRoundoff {
+    let p = beta.len();
+    let m = active_a.map_or(0, |rows| rows.nrows());
+    let growth = gam_linalg::roundoff::accumulation_growth(accumulation_depth);
+    let mut worst = StationarityRoundoff {
+        excess: 0.0,
+        coordinate: 0,
+        floor: 0.0,
+    };
+    for coordinate in 0..p {
+        let mut magnitude = KahanSum::default();
+        for column in 0..p {
+            magnitude.add((hessian[[coordinate, column]] * beta[column]).abs());
+        }
+        magnitude.add(rhs[coordinate].abs());
+        if let Some(rows) = active_a {
+            for row in 0..m {
+                magnitude.add((rows[[row, coordinate]] * multipliers[row]).abs());
+            }
+        }
+        let floor = growth * magnitude.sum();
+        let value = residual[coordinate];
+        let excess = if value.is_finite() && floor.is_finite() {
+            (value.abs() - floor).max(0.0)
+        } else {
+            f64::INFINITY
+        };
+        if coordinate == 0 || excess > worst.excess {
+            worst = StationarityRoundoff {
+                excess,
+                coordinate,
+                floor,
+            };
+        }
+    }
+    worst
+}
+
 fn solve_operator_metric_projection_dual_active_set(
     hessian: &Array2<f64>,
     rhs: &Array1<f64>,
@@ -3495,8 +3579,8 @@ fn solve_operator_metric_projection_dual_active_set(
 
     let active_ids = active.clone();
     let gradient = hessian.dot(&candidate) - rhs;
-    let (stationarity, complementarity, dual_violation) = if active_ids.is_empty() {
-        (gradient_inf_norm(&gradient), 0.0, 0.0)
+    let (residual, complementarity, dual_violation) = if active_ids.is_empty() {
+        (gradient.clone(), 0.0, 0.0)
     } else {
         let rows = ops.gather_unit_rows(&active_ids)?;
         let residual = &gradient - &rows.a.t().dot(&refined_multipliers);
@@ -3512,15 +3596,43 @@ fn solve_operator_metric_projection_dual_active_set(
             .iter()
             .map(|multiplier| (-multiplier).max(0.0))
             .fold(0.0_f64, f64::max);
-        (
-            gradient_inf_norm(&residual),
-            complementarity,
-            dual_violation,
-        )
+        (residual, complementarity, dual_violation)
     };
+    let stationarity = gradient_inf_norm(&residual);
     let gradient_scale = gradient_inf_norm(&gradient).max(1.0);
-    if stationarity > ACTIVE_SET_KKT_STATIONARITY_TOL
+    // A residual that no evaluation of its own operands can resolve is not
+    // evidence against the face (#1561): only the part above that floor counts.
+    let roundoff = if stationarity > ACTIVE_SET_KKT_STATIONARITY_TOL
         && stationarity / gradient_scale > ACTIVE_SET_KKT_STATIONARITY_TOL
+    {
+        let rows = if active_ids.is_empty() {
+            None
+        } else {
+            Some(ops.gather_unit_rows(&active_ids)?)
+        };
+        // `residual` forms each `(Hβ)_i` as a length-`p` inner product and
+        // subtracts `rhs_i`, then subtracts the length-`m` inner product
+        // `(A_Aᵀμ)_i`. The deepest rounding path is a Hessian term's: `p + 1`
+        // with no active rows, `p + 2` with them, and a row term's is `m + 1`.
+        let accumulation_depth = match rows.as_ref() {
+            None => p.saturating_add(1),
+            Some(rows) => p.saturating_add(2).max(rows.a.nrows().saturating_add(1)),
+        };
+        Some(stationarity_roundoff_excess(
+            hessian,
+            rhs,
+            &candidate,
+            rows.as_ref().map(|rows| &rows.a),
+            &refined_multipliers,
+            &residual,
+            accumulation_depth,
+        ))
+    } else {
+        None
+    };
+    if let Some(roundoff) = roundoff
+        && roundoff.excess > ACTIVE_SET_KKT_STATIONARITY_TOL
+        && roundoff.excess / gradient_scale > ACTIVE_SET_KKT_STATIONARITY_TOL
     {
         // WHICH of the two things failed is not recoverable from `residual`
         // alone, and they need opposite repairs (#2592).
@@ -3578,10 +3690,13 @@ fn solve_operator_metric_projection_dual_active_set(
         return Err(EstimationError::ParameterConstraintViolation(format!(
             "operator metric projection failed stationarity certification: \
              residual={stationarity:.3e}, relative={:.3e}, active={}, transitions={transitions}, \
-             achievable={achievable_report} (best over all multipliers), gradient_scale={gradient_scale:.3e}; \
-             {verdict}",
+             achievable={achievable_report} (best over all multipliers), gradient_scale={gradient_scale:.3e}, \
+             beyond_roundoff={:.3e} (coordinate {}, roundoff floor {:.3e}); {verdict}",
             stationarity / gradient_scale,
             active_ids.len(),
+            roundoff.excess,
+            roundoff.coordinate,
+            roundoff.floor,
         )));
     }
     // The multipliers carry the gradient's units: `μ` solves `g − A_Aᵀ μ = 0`
@@ -3856,6 +3971,86 @@ pub fn solve_quadratic_with_linear_constraints(
 
 #[cfg(test)]
 mod tests {
+
+    /// The metric projection's stationarity is judged above its operands'
+    /// roundoff floor (#1561). The measured refusal, one unit in the last place
+    /// of `(Hβ)_0 ≈ rhs_0 ≈ 5.566932e12`, is certified. The same residual under
+    /// unit operands is not, a residual far above the floor at the same
+    /// operands is not, the active rows' products count toward the floor, and a
+    /// non-finite residual never certifies. With no active rows a length-2
+    /// inner product minus `rhs` is a depth-3 accumulation; one active row
+    /// deepens the Hessian terms' path to 4.
+    #[test]
+    fn stationarity_is_judged_above_its_operands_roundoff_floor_1561() {
+        use ndarray::array;
+        let no_rows = ndarray::Array1::<f64>::zeros(0);
+        let stiff = array![[4.289375e23, 0.0], [0.0, 1.0]];
+        let stiff_beta = array![5.566932e12 / 4.289375e23, 0.5];
+        let stiff_rhs = array![5.566932e12, 0.5];
+        let one_unit = array![-9.765625e-4, 0.0];
+        let measured = super::stationarity_roundoff_excess(
+            &stiff, &stiff_rhs, &stiff_beta, None, &no_rows, &one_unit, 3,
+        );
+        assert_eq!(
+            measured.excess, 0.0,
+            "one unit in the last place of 5.6e12 is roundoff (floor {:.3e})",
+            measured.floor
+        );
+
+        let unit = array![[1.0, 0.0], [0.0, 1.0]];
+        let unit_state = array![0.5, 0.5];
+        let at_unit_scale = super::stationarity_roundoff_excess(
+            &unit, &unit_state, &unit_state, None, &no_rows, &one_unit, 3,
+        );
+        assert!(
+            at_unit_scale.excess > super::ACTIVE_SET_KKT_STATIONARITY_TOL
+                && at_unit_scale.coordinate == 0,
+            "the same residual under unit operands is real: excess {:.3e} at {}",
+            at_unit_scale.excess,
+            at_unit_scale.coordinate
+        );
+
+        let far_above = super::stationarity_roundoff_excess(
+            &stiff, &stiff_rhs, &stiff_beta, None, &no_rows, &array![1.0, 0.0], 3,
+        );
+        assert!(
+            far_above.excess > 0.5 && far_above.coordinate == 0,
+            "a residual far above its floor is refused: excess {:.3e} over floor {:.3e}",
+            far_above.excess,
+            far_above.floor
+        );
+
+        // `(Hβ)_1 = 4e12` cancels against `(A_Aᵀμ)_1 = 4e12 − ½`: the floor is
+        // about 1.3e-3 from the Hessian and rhs terms alone and about 3.6e-3
+        // once the row product joins, so a 2.5e-3 residual separates them.
+        let tall_beta = array![0.5, 4.0e12];
+        let small_rhs = array![0.5, 0.5];
+        let rows = array![[0.0, 1.0]];
+        let multipliers = array![4.0e12 - 0.5];
+        let tangent_residual = array![0.0, 2.5e-3];
+        let with_rows = super::stationarity_roundoff_excess(
+            &unit, &small_rhs, &tall_beta, Some(&rows), &multipliers, &tangent_residual, 4,
+        );
+        let without_rows = super::stationarity_roundoff_excess(
+            &unit, &small_rhs, &tall_beta, None, &no_rows, &tangent_residual, 3,
+        );
+        assert!(
+            with_rows.excess == 0.0 && without_rows.excess > super::ACTIVE_SET_KKT_STATIONARITY_TOL,
+            "row products count toward the floor: with rows {:.3e} (floor {:.3e}), without {:.3e} (floor {:.3e})",
+            with_rows.excess,
+            with_rows.floor,
+            without_rows.excess,
+            without_rows.floor
+        );
+
+        let non_finite = super::stationarity_roundoff_excess(
+            &stiff, &stiff_rhs, &stiff_beta, None, &no_rows, &array![f64::NAN, 0.0], 3,
+        );
+        assert!(
+            non_finite.excess.is_infinite() && non_finite.coordinate == 0,
+            "a non-finite residual never certifies"
+        );
+    }
 
     /// The dual KKT channels are judged relative to the gradient scale, as the
     /// stationarity channel is (gam#2695, gam#2714): the measured refusal —
