@@ -3585,14 +3585,14 @@ pub fn spatial_term_supports_hyper_optimization(
         return false;
     }
 
-    // Duchon anisotropy η is SEEDED from geometry and ESTIMATED by REML
-    // (gam#2735). `auto_seed_aniso_contrasts` still supplies the starting
-    // contrasts from the knot-cloud spread on every Duchon basis build — that is
-    // a good seed, because it standardizes a genuinely elongated input cloud
-    // before the search begins. What it cannot do is finish the job: the knot
-    // cloud says where the inputs ARE, not which axis the RESPONSE varies along,
-    // so on an isotropic design it seeds noise and a frozen η is then simply
-    // wrong. `spatial_term_uses_per_axis_psi` enrolls the contrasts as outer ψ
+    // Duchon anisotropy η is a literal model coordinate and, where the per-axis
+    // derivative surface is derived, ESTIMATED by REML (gam#2735). The forward
+    // build centres the requested contrasts (`centered_aniso_contrasts`) and
+    // never replaces them, an all-zero vector included: knot-cloud seeding is an
+    // opt-in of the Matérn forward (`resolve_matern_forward_aniso`), and a Duchon
+    // η = 0 is simply the isotropic design, continuous with small non-zero
+    // contrasts. A frozen η is a guess about which axis the RESPONSE varies
+    // along, so `spatial_term_uses_per_axis_psi` enrolls the contrasts as outer ψ
     // coordinates wherever `duchon_spec_supports_axis_psi` certifies the
     // per-axis derivative surface; a pure Duchon (no κ) is one of the
     // configurations it declines, so that path is unchanged. Only an explicit

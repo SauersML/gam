@@ -4330,9 +4330,9 @@ fn promote_thin_plate_for_scale_dimensions(basis: &mut SmoothBasisSpec) {
         power: 0.0,
         nullspace_order,
         identifiability: spec.identifiability.clone(),
-        // All-zero geometry seed sentinel: `auto_seed_aniso_contrasts` resolves
-        // it from the (standardized) knot cloud, and the per-axis tension split
-        // engages on `aniso.is_some()`.
+        // An all-zero η: the Duchon forward keeps it literal
+        // (`centered_aniso_contrasts`), so the metric starts isotropic, and the
+        // per-axis tension split engages on `aniso.is_some()`.
         aniso_log_scales: Some(vec![0.0; d]),
         operator_penalties: DuchonOperatorPenaltySpec::default(),
         boundary: OneDimensionalBoundary::Open,

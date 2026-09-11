@@ -3990,10 +3990,10 @@ fn try_build_spatial_term_log_kappa_aniso_derivativeinfos(
             if spec_local.radial_reparam.is_none() {
                 spec_local.radial_reparam = radial_reparam.clone();
             }
-            // The realized anisotropy, not the requested one: the forward build
-            // resolves the all-zero sentinel into knot-cloud contrasts, and a
-            // derivative taken at the requested η would be the derivative of a
-            // design nobody shipped.
+            // The realized anisotropy: the forward build centres the requested η
+            // (`centered_aniso_contrasts`) and records the centred vector in the
+            // metadata, so the derivative is taken at the design that shipped
+            // rather than at an uncentred request.
             if let Some(resolved) = aniso_log_scales.as_ref() {
                 spec_local.aniso_log_scales = Some(resolved.clone());
             }

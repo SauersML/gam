@@ -354,15 +354,14 @@ fn build_iso_kappa_fixture(
                 identifiability: SpatialIdentifiability::default(),
                 // gam#2735 — an `"*_aniso*"` label asks for the per-axis η the
                 // hybrid Duchon now enrols as OUTER ψ coordinates. The
-                // contrasts are deliberately non-zero and unequal: an all-zero
-                // vector is the `auto_seed_aniso_contrasts` sentinel and would
-                // be replaced by knot-cloud geometry, which is a different
-                // (and here nearly symmetric) starting point.
+                // contrasts are deliberately non-zero and unequal, so the
+                // fixture starts away from the symmetric isotropic point
+                // η = 0, which the Duchon forward keeps literal.
                 aniso_log_scales: if label.contains("_scaledims") {
-                    // gam#979 — the CLI's `--scale-dims` sentinel: an all-zero
-                    // vector that the forward resolves into knot-cloud
-                    // contrasts, exactly what the large-scale marginal-slope
-                    // arms ship (32 per-axis ψ on two 16-D terms).
+                    // gam#979 — the CLI's `--scale-dims` configuration: an
+                    // all-zero η, kept literal by the Duchon forward (the
+                    // isotropic start), exactly what the large-scale
+                    // marginal-slope arms ship (32 per-axis ψ on two 16-D terms).
                     Some(vec![0.0; d])
                 } else if aniso {
                     Some((0..d).map(|a| 0.25 - 0.5 * a as f64).collect())
