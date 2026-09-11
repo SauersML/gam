@@ -190,7 +190,7 @@ pub fn latent_scores(model: &FittedModel, data: ndarray::ArrayView2<'_, f64>,
     Ok(data.column(*columns.get(name).ok_or_else(|| format!("missing score column '{name}'"))?).to_owned())
 }
 
-/// Fit a shared native CTN/outcome payload, or attach an externally fitted CTN.
+/// Reject conflicting score authorities before any stage is fitted.
 fn validate_chain_inputs(dataset: &EncodedDataset, config: &FitConfig) -> Result<(), String> {
     if config.z_column.is_some() || config.frozen_score || (config.ctn_stage1.is_some() && config.frozen_ctn.is_some()) {
         return Err("CTN owns the latent score; external z_column/frozen_score and competing transforms are invalid".into());
@@ -227,7 +227,12 @@ fn outcome_inputs(dataset: &EncodedDataset, config: &FitConfig, z: &Array1<f64>)
 pub fn structural_inputs(formula: &str, dataset: &EncodedDataset, config: &FitConfig)
     -> Result<(EncodedDataset, FitConfig), String> {
     validate_chain_inputs(dataset, config)?;
-    project(dataset, &required_fit_columns(formula, config)?)?;
+    let columns = dataset.column_map();
+    for name in required_fit_columns(formula, config)? {
+        if !columns.contains_key(&name) {
+            return Err(format!("missing CTN column '{name}'"));
+        }
+    }
     let z = if let Some(frozen) = config.frozen_ctn.as_ref() {
         let model = FittedModel::from_payload((*frozen.0).clone());
         model.validate_for_persistence().map_err(|error| error.to_string())?;
