@@ -167,6 +167,7 @@ mod warm_start;
 pub(crate) use self::block_spec::custom_family_block_role;
 pub use self::block_spec::validate_blockspecs;
 pub use self::block_spec::{
+    coefficient_label,
     CoefficientBlockSelector,
     CoefficientGroupSpec,
     CoefficientLabel,

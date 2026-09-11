@@ -4830,7 +4830,7 @@ pub fn linear_span_anchor(
         let frame_matrix = frame.frame().to_owned();
         let mut coordinates = residual.dot(&frame_matrix);
         coordinates.mapv_inplace(|v| v / gate);
-        let contribution = fast_abt(&coordinates, &frame_matrix).mapv(|v| gate * v);
+        let contribution = gam_linalg::faer_ndarray::fast_abt(&coordinates, &frame_matrix).mapv(|v| gate * v);
         reconstruction += &contribution;
         residual -= &contribution;
         atoms.push(LinearSpanAtomAnchor {

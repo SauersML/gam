@@ -55,7 +55,7 @@ pub use block::{
     BlockSparseFitError, block_gates, block_projections_row, block_sparse_dictionary_block_coords,
     block_sparse_dictionary_lift_block, block_sparse_dictionary_project_residual,
     block_sparse_dictionary_transform, coordinate_partition_frames, fit_block_sparse_dictionary,
-    fit_block_sparse_dictionary_with_seed, reconstruct_block_sparse_rows, route_row_blocks, row_loss,
+    fit_block_sparse_dictionary_with_seed, reconstruct_block_sparse_rows, route_row_blocks,
 };
 pub use block_chart::{
     BlockChartComposeConfig, BlockChartComposeResult, BlockChartRecord, BlockSeedManifest,

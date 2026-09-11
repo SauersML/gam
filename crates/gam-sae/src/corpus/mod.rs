@@ -109,4 +109,3 @@ pub use designed_target::{
     collect_designed_target, collect_designed_target_auto, collect_designed_target_from_harvest,
 };
 
-/// Mixed-precision fused kernels (read `f32`, accumulate `f64`).
