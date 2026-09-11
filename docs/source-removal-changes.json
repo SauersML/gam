@@ -833,5 +833,15 @@
     ],
     "reason": "#2469: CUT_LOCUS_EPS (1e-7) is the eigensolver band n*eps at the rotation cut locus; SYMMETRY_TOL (an absolute 1e-10) is the pullback rounding band gamma_{n^2}*max|S_ij|; AA1_DAMPING_FLOOR (an absolute 1e-12 on ||dr||^2) is the rounding band of the residual subtraction; ZERO_TOL (1e-12) was a test drop tolerance for integer fixtures with exact zeros, now 0.0 like the production caller.",
     "evidence": "Each constant was declared in the one file that uses it: crates/gam-geometry/src/manifold.rs (function-local), crates/gam-problem/src/joint_penalty.rs (associated), crates/gam-solve/src/pirls/reweight.rs (function-local), crates/gam-linalg/src/sparse_exact.rs (test module); all four files are edited here."
+  },
+  {
+    "base": "d012e3bd2050926ee0246652fd1b9e46d966afc1",
+    "items": [
+      "crates/gam-models/src/bms/mod.rs:const:BMS_VARIANCE_FLOOR",
+      "crates/gam-models/src/bms/mod.rs:const:EMPIRICAL_GRID_WEIGHT_EXHAUSTED_REL_TOL",
+      "crates/gam-models/src/vector_response.rs:const:MULTINOMIAL_SIMPLEX_TOL"
+    ],
+    "reason": "#2469: MULTINOMIAL_SIMPLEX_TOL (1e-9) is the row-sum rounding band gamma_K*sum_c y_c; EMPIRICAL_GRID_WEIGHT_EXHAUSTED_REL_TOL (1e-14) is the rounding band of the grid-compression subtractions; BMS_VARIANCE_FLOOR (1e-12 on an sd or a variance) is the weighted-mean spread band gamma_{n+1}*max|z|, or exact positivity for a supplied normalization.",
+    "evidence": "At the base, git grep finds MULTINOMIAL_SIMPLEX_TOL only in crates/gam-models/src/vector_response.rs, and BMS_VARIANCE_FLOOR and EMPIRICAL_GRID_WEIGHT_EXHAUSTED_REL_TOL only in crates/gam-models/src/bms/mod.rs, bms/empirical_measure_sensitivity.rs and bms/gradient_paths.rs; every use is replaced here."
   }
 ]

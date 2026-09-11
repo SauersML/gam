@@ -138,28 +138,24 @@ impl VectorResponseTarget {
     }
 }
 
-/// Relative tolerance on the per-row simplex constraint `Σ_c y_{n,c} = 1`.
-///
-/// The multinomial-logit log-likelihood `ℓ = Σ_c y_c log p_c` has the
-/// canonical residual gradient `y_a − p_a` and Fisher block
-/// `p_a δ_{ab} − p_a p_b` **only** when each target row is a probability
-/// vector (`y_c ≥ 0`, `Σ_c y_c = 1`). For a general row mass `s = Σ_c y_c`
-/// the true derivatives are `y_a − s p_a` and `s (p_a δ_{ab} − p_a p_b)`, so
-/// any row whose mass deviates from 1 makes the implemented gradient/Hessian
-/// disagree with the implemented objective. We therefore require simplex rows
-/// at every construction boundary and reject anything else, rather than
-/// silently fitting with inconsistent curvature. The tolerance absorbs only
-/// floating-point round-off in an otherwise-exact one-hot / label-smoothed
-/// row (e.g. a sum of `K` rationals), not genuine count or proportional data.
-pub(crate) const MULTINOMIAL_SIMPLEX_TOL: f64 = 1.0e-9;
-
 /// Validate that every row of a multinomial target `y ∈ ℝ^{N×K}` is a point on
 /// the probability simplex: `y_{n,c} ≥ 0` for all entries and
-/// `Σ_c y_{n,c} = 1` for every row (up to [`MULTINOMIAL_SIMPLEX_TOL`]). This
-/// is the precondition under which [`MultinomialLogitLikelihood`]'s residual
-/// gradient and Fisher block are the exact derivatives of its log-likelihood;
-/// see the constant's docs. Finiteness is checked first so the message points
-/// at the offending entry rather than at a NaN-poisoned row sum.
+/// `Σ_c y_{n,c} = 1` for every row, up to the rounding band `γ_K·Σ_c y_{n,c}`
+/// of the row's own `K`-term sum. This is the precondition under which
+/// [`MultinomialLogitLikelihood`]'s residual gradient and Fisher block are the
+/// exact derivatives of its log-likelihood.
+///
+/// The multinomial-logit log-likelihood `ℓ = Σ_c y_c log p_c` has the canonical
+/// residual gradient `y_a − p_a` and Fisher block `p_a δ_{ab} − p_a p_b` **only**
+/// when each target row is a probability vector. For a general row mass
+/// `s = Σ_c y_c` the true derivatives are `y_a − s p_a` and
+/// `s (p_a δ_{ab} − p_a p_b)`, so any row whose mass deviates from 1 makes the
+/// implemented gradient/Hessian disagree with the implemented objective. Simplex
+/// rows are therefore required at every construction boundary; the band admits
+/// only the round-off of an otherwise exact one-hot or label-smoothed row (a sum
+/// of `K` rationals), never genuine count or proportional data. Finiteness is
+/// checked first so the message points at the offending entry rather than at a
+/// NaN-poisoned row sum.
 pub(crate) fn validate_multinomial_simplex(
     y: ArrayView2<f64>,
     context: &str,
@@ -180,7 +176,8 @@ pub(crate) fn validate_multinomial_simplex(
             }
             row_sum += v;
         }
-        if (row_sum - 1.0).abs() > MULTINOMIAL_SIMPLEX_TOL {
+        // Every entry is non-negative, so `row_sum` is also the absolute sum.
+        if (row_sum - 1.0).abs() > gam_linalg::roundoff::accumulation_growth(k) * row_sum {
             crate::bail_invalid_estim!(
                 "{context}: multinomial target rows must sum to 1 (one-hot for \
                  hard labels, or a label-smoothed probability vector); row {row} \

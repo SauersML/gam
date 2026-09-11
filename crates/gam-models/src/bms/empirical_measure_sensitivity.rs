@@ -43,7 +43,7 @@
 //! ```
 //!
 //! (`∂μ/∂n_c = w_c` and, using `Σ_c w_c (n_c − μ) = 0`, `∂sd/∂n_c = w_c·x_c`.)
-//! On the `sd ≤ BMS_VARIANCE_FLOOR` branch the standardization is skipped, so
+//! On the branch where the spread sits inside its rounding band the standardization is skipped, so
 //! `M = I` and the `1/sd` factor is absent.
 //!
 //! `M` is a PROJECTION, and that bounds the whole channel: `M·1 = 0` and
@@ -76,7 +76,7 @@
 //! wrapper over it and every existing caller and the wire are untouched.
 
 use super::{
-    BMS_VARIANCE_FLOOR, EMPIRICAL_GRID_WEIGHT_EXHAUSTED_REL_TOL, EmpiricalZGrid, LatentMeasureKind,
+    EmpiricalZGrid, LatentMeasureKind,
 };
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
 
@@ -299,16 +299,19 @@ pub(crate) fn build_empirical_z_grid_with_alpha(
         // Allocation entries for the bin under construction. Held aside because
         // the emitted node index is only known once the bin is known to emit.
         let mut bin_alpha = Vec::<(usize, f64)>::new();
-        while need > EMPIRICAL_GRID_WEIGHT_EXHAUSTED_REL_TOL * bin_weight_target
-            && cursor < pairs.len()
-        {
+        // `need` loses one rounded subtraction per pair it takes and a pair's
+        // `remaining` one per bin it feeds: a residual inside that accumulation's
+        // band `γ·weight` is filled to working precision, so the cursor advances
+        // instead of spinning on round-off.
+        let need_band = gam_linalg::roundoff::accumulation_growth(pairs.len() + 1) * bin_weight_target;
+        while need > need_band && cursor < pairs.len() {
             let take = remaining.min(need);
             bin_sum += take * pairs[cursor].0;
             bin_weight += take;
             bin_alpha.push((pairs[cursor].2, take));
             need -= take;
             remaining -= take;
-            if remaining <= EMPIRICAL_GRID_WEIGHT_EXHAUSTED_REL_TOL * pairs[cursor].1 {
+            if remaining <= gam_linalg::roundoff::accumulation_growth(m + 1) * pairs[cursor].1 {
                 cursor += 1;
                 if cursor < pairs.len() {
                     remaining = pairs[cursor].1;
@@ -349,8 +352,9 @@ pub(crate) fn build_empirical_z_grid_with_alpha(
 }
 
 /// Center and scale the grid nodes to weighted mean 0 / weighted sd 1, and
-/// return the `(mean, sd)` the map used — `None` when the spread was at or below
-/// [`BMS_VARIANCE_FLOOR`] and the map was therefore skipped.
+/// return the `(mean, sd)` the map used — `None` when the spread sat inside the
+/// weighted mean's rounding band `γ_{n+1}·max|node|` and the map was therefore
+/// skipped.
 ///
 /// Returning the pair rather than `()` is what lets the sensitivity apply the
 /// `1/sd` factor without a second copy of the mean/sd formula that could drift
@@ -376,7 +380,10 @@ pub(crate) fn recenter_rescale_empirical_grid(
         .sum::<f64>()
         / total;
     let sd = var.sqrt();
-    if sd.is_finite() && sd > BMS_VARIANCE_FLOOR {
+    let magnitude = nodes.iter().fold(0.0_f64, |acc, node| acc.max(node.abs()));
+    if sd.is_finite()
+        && sd > gam_linalg::roundoff::accumulation_growth(nodes.len() + 1) * magnitude
+    {
         for node in nodes {
             *node = (*node - mean) / sd;
         }
@@ -393,17 +400,16 @@ pub(crate) fn recenter_rescale_empirical_grid(
 /// contributes its whole weight to that bin whatever order the sort chose — so
 /// the check is exactly "does a boundary land strictly inside a tie", not "are
 /// there ties". Boundaries are at `k·total/m` for `k = 1..m−1`; "strictly
-/// inside" is measured with the same relative tolerance the fill loop uses to
-/// decide a bin is exhausted, so a boundary that coincides with a row edge to
-/// within a few ulps counts as outside (which is what the fill loop does with
-/// it).
+/// inside" is measured with the same rounding band the fill loop uses to decide
+/// a bin is exhausted, so a boundary that coincides with a row edge to working
+/// precision counts as outside (which is what the fill loop does with it).
 fn detect_tie_straddle(
     pairs: &[(f64, f64, usize)],
     total_weight: f64,
     m: usize,
 ) -> Option<EmpiricalGridTieStraddle> {
     let bin_weight_target = total_weight / (m as f64);
-    let edge_tol = EMPIRICAL_GRID_WEIGHT_EXHAUSTED_REL_TOL * bin_weight_target;
+    let edge_tol = gam_linalg::roundoff::accumulation_growth(pairs.len() + 1) * bin_weight_target;
     let mut cumulative = 0.0_f64;
     let mut index = 0usize;
     while index < pairs.len() {

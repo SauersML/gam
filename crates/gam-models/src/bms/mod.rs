@@ -651,9 +651,9 @@ pub struct LatentZNormalization {
 
 impl LatentZNormalization {
     pub fn apply(&self, z: &Array1<f64>, context: &str) -> Result<Array1<f64>, String> {
-        if !(self.mean.is_finite() && self.sd.is_finite() && self.sd > BMS_VARIANCE_FLOOR) {
+        if !(self.mean.is_finite() && self.sd.is_finite() && self.sd > 0.0) {
             return Err(format!(
-                "{context} requires finite latent z normalization with sd > {BMS_VARIANCE_FLOOR:e}; got mean={} sd={}",
+                "{context} requires finite latent z normalization with sd > 0; got mean={} sd={}",
                 self.mean, self.sd
             ));
         }
@@ -2543,14 +2543,7 @@ pub(crate) fn weighted_tail_mass(
 // ---------------------------------------------------------------------------
 pub(super) const BMS_AUTO_SUBSAMPLE_PHASE1_BUDGET: usize = 12;
 pub(super) const BERNOULLI_LINK_PROBABILITY_EPS: f64 = 1e-12;
-pub(super) const BMS_VARIANCE_FLOOR: f64 = 1e-12;
 pub(super) const BMS_DERIV_TOL: f64 = 1e-8;
-/// Relative tolerance below which a residual weight is treated as exhausted in
-/// the equal-mass empirical-grid compression loop. Used both for the per-bin
-/// "need" remaining (relative to the target bin weight) and for the per-pair
-/// remainder (relative to that pair's weight), so a pair/bin that is filled to
-/// within a few ulps advances the cursor instead of spinning on round-off.
-pub(super) const EMPIRICAL_GRID_WEIGHT_EXHAUSTED_REL_TOL: f64 = 1e-14;
 /// Upper bound (and large-`n` default) for rows-per-chunk in the parallel
 /// row-accumulation phases.
 ///

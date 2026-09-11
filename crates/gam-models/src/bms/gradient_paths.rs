@@ -48,7 +48,12 @@ pub(crate) fn standardize_latent_z_with_policy(
         .sum::<f64>()
         / weight_sum;
     let sd = var.sqrt();
-    if !(sd.is_finite() && sd > BMS_VARIANCE_FLOOR) {
+    // A spread inside the weighted mean's rounding band `γ_{n+1}·max|z|` is arithmetic,
+    // not variation.
+    let z_magnitude = z.iter().fold(0.0_f64, |acc, value| acc.max(value.abs()));
+    if !(sd.is_finite()
+        && sd > gam_linalg::roundoff::accumulation_growth(z.len() + 1) * z_magnitude)
+    {
         return Err(format!(
             "{context} requires z with positive finite weighted standard deviation"
         ));
@@ -233,7 +238,12 @@ pub(super) fn pooled_probit_baseline(
     let mut beta0 = standard_normal_quantile(prevalence).map_err(|e| {
         format!("failed to initialize pooled bernoulli-marginal-slope pilot intercept: {e}")
     })?;
-    let mut beta1 = if z_var > BMS_VARIANCE_FLOOR {
+    // A `z` whose spread sits inside its mean's rounding band `γ_{n+1}·max|z|` has no
+    // slope to regress on.
+    let z_magnitude = z.iter().fold(0.0_f64, |acc, value| acc.max(value.abs()));
+    let mut beta1 = if z_var.sqrt()
+        > gam_linalg::roundoff::accumulation_growth(z.len() + 1) * z_magnitude
+    {
         yz_cov / z_var
     } else {
         0.0
