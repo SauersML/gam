@@ -166,7 +166,7 @@ pub(crate) fn build_transformation_normal_saved_model(
     fit_result: UnifiedFitResult,
     family: &gam::families::transformation_normal::TransformationNormalFamily,
     score_calibration: gam::inference::model::TransformationScoreCalibration,
-) -> SavedModel {
+) -> Result<SavedModel, String> {
     // Thin adapter over the shared core assembler; the CLI supplies per-feature
     // training ranges and no offset columns. See
     // `assemble_transformation_normal_payload`.
@@ -186,7 +186,7 @@ pub(crate) fn build_transformation_normal_saved_model(
             noise_offset_column: None,
         },
     );
-    SavedModel::from_payload(payload)
+    Ok(SavedModel::from_payload(payload?))
 }
 
 pub(crate) fn core_saved_fit_result(

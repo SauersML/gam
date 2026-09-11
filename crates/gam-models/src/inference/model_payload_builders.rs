@@ -944,7 +944,7 @@ pub struct TransformationNormalInputs<'a> {
 pub fn assemble_transformation_normal_payload(
     inputs: TransformationNormalInputs<'_>,
     source: SavedModelSourceMetadata,
-) -> FittedModelPayload {
+) -> Result<FittedModelPayload, String> {
     let TransformationNormalInputs {
         formula,
         data_schema,
@@ -953,6 +953,9 @@ pub fn assemble_transformation_normal_payload(
         family,
         score_calibration,
     } = inputs;
+
+    fit_result.require_posterior_mean("transformation-normal saved-model assembly")
+        .map_err(|error| error.to_string())?;
 
     let mut payload = FittedModelPayload::new(
         MODEL_PAYLOAD_VERSION,
@@ -994,7 +997,7 @@ pub fn assemble_transformation_normal_payload(
     payload.transformation_cone_carrier = Some(cone_carrier.iter().copied().collect());
     payload.transformation_score_calibration = Some(score_calibration);
     source.apply_to(&mut payload);
-    payload
+    Ok(payload)
 }
 
 /// Snapshot the direct-α CTN geometry (gam#2306) a saved model needs to replay
@@ -1988,7 +1991,7 @@ fn payload_for_transformation_normal(
     // Thin adapter over the shared core assembler; the FFI freezes the
     // covariate spec from its design and reads the offset column from the
     // FitConfig. See `assemble_transformation_normal_payload`.
-    Ok(assemble_transformation_normal_payload(
+    assemble_transformation_normal_payload(
         TransformationNormalInputs {
             formula,
             data_schema: dataset.schema.clone(),
@@ -2003,7 +2006,7 @@ fn payload_for_transformation_normal(
             offset_column: fit_config.offset_column.clone(),
             noise_offset_column: None,
         },
-    ))
+    )
 }
 
 fn payload_for_bernoulli_marginal_slope(

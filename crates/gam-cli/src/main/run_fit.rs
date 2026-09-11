@@ -1141,7 +1141,7 @@ pub(crate) fn run_fit_transformation_normal(
             solved.fit,
             &solved.family,
             solved.score_calibration,
-        );
+        )?;
         model.offset_column = args.offset_column.clone();
         model.noise_offset_column = args.noise_offset_column.clone();
         write_model_json(out, &model)?;

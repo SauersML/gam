@@ -385,6 +385,8 @@ impl SavedCtnChart {
             .ok_or_else(|| PredictInputError::MissingMetadata {
                 reason: "saved transformation-normal model missing unified fit".to_string(),
             })?;
+        fit_saved.require_posterior_mean("transformation-normal prediction")
+            .map_err(|error| PredictInputError::InvalidInput { reason: error.to_string() })?;
         let beta = &fit_saved.blocks[0].beta;
         if beta.len() != self.p_resp * p_cov {
             return Err(PredictInputError::DimensionMismatch {
