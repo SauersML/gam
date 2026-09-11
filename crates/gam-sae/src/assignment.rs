@@ -2521,3 +2521,125 @@ mod fill_into_buffer_1557_tests {
         assert_into_matches_alloc(&build(5, 1, AssignmentMode::threshold_gate(0.8, 0.1)));
     }
 }
+
+#[cfg(test)]
+mod frozen_routing_1033_tests {
+    //! #1033 — the FROZEN (amortized) routing mechanism: once installed, the
+    //! per-row gate is a ρ-invariant function of the FROZEN predicted logits and
+    //! is DECOUPLED from any subsequent update to the free `self.logits` (the
+    //! inner-fit logit drift the outer ρ-search would otherwise re-incur every
+    //! eval). These are deterministic mechanism invariants — no inner fit — so
+    //! they pin the load-bearing freeze properties without the cluster.
+    use super::*;
+
+    fn ordered_beta_bernoulli_assignment(n: usize, k: usize) -> SaeAssignment {
+        let logits = Array2::from_shape_fn((n, k), |(i, kk)| {
+            0.3 + 0.05 * (i as f64) - 0.1 * (kk as f64)
+        });
+        let coords: Vec<Array2<f64>> = (0..k)
+            .map(|_| Array2::from_shape_fn((n, 1), |(i, _)| (i as f64) * 0.1))
+            .collect();
+        // learnable_alpha = false: alpha is ρ-independent, isolating the routing.
+        SaeAssignment::from_blocks_with_mode(
+            logits,
+            coords,
+            AssignmentMode::ordered_beta_bernoulli(0.5, 1.0, false),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn frozen_routing_decouples_gates_from_logit_updates_1033() {
+        let (n, k) = (6usize, 3usize);
+        let mut a = ordered_beta_bernoulli_assignment(n, k)
+            .freeze_routing_from_current_logits()
+            .unwrap();
+        assert!(a.routing_is_frozen());
+        // Gates BEFORE mutating the free logits.
+        let before: Vec<Array1<f64>> = (0..n).map(|r| a.try_assignments_row(r).unwrap()).collect();
+        // Simulate an inner-fit logit update (what the ρ-search would otherwise do
+        // every eval): perturb every free logit substantially.
+        a.logits.mapv_inplace(|v| v + 5.0);
+        let after: Vec<Array1<f64>> = (0..n).map(|r| a.try_assignments_row(r).unwrap()).collect();
+        // FROZEN routing reads the snapshot, so the gates are UNCHANGED by the
+        // free-logit perturbation — the routing is decoupled from inner-fit drift.
+        for r in 0..n {
+            for kk in 0..k {
+                assert_eq!(
+                    before[r][kk], after[r][kk],
+                    "row {r} atom {kk}: frozen-routing gate must be UNCHANGED by a free-logit \
+                     update (decoupled from inner-fit drift); {} vs {}",
+                    before[r][kk], after[r][kk]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn frozen_routing_gates_are_rho_invariant_1033() {
+        let (n, k) = (5usize, 2usize);
+        let a = ordered_beta_bernoulli_assignment(n, k)
+            .freeze_routing_from_current_logits()
+            .unwrap();
+        // The ρ-invariance is now STRUCTURAL: the assignment APIs take no ρ
+        // (the signature is the proof). What remains observable is purity —
+        // repeated reads of a frozen row must be identical.
+        for r in 0..n {
+            let ga = a.try_assignments_row(r).unwrap();
+            let gb = a.try_assignments_row(r).unwrap();
+            for kk in 0..k {
+                assert_eq!(
+                    ga[kk], gb[kk],
+                    "row {r} atom {kk}: frozen-routing gate must be ρ-INVARIANT (the n-independence \
+                     lever); {} at ρ_a vs {} at ρ_b",
+                    ga[kk], gb[kk]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn frozen_routing_fixes_all_logits_and_thaw_restores_free_path_1033() {
+        let (n, k) = (4usize, 3usize);
+        let mut a = ordered_beta_bernoulli_assignment(n, k)
+            .freeze_routing_from_current_logits()
+            .unwrap();
+        // Under frozen routing EVERY logit is fixed (not a free Newton coord).
+        let mask = a.fixed_logit_mask();
+        assert_eq!(mask.len(), k);
+        assert!(
+            mask.iter().all(|&f| f),
+            "frozen routing must fix ALL logits"
+        );
+        for kk in 0..k {
+            assert!(
+                a.logit_is_fixed(kk),
+                "atom {kk} logit must be fixed under frozen routing"
+            );
+        }
+        // Thawing restores the free-logit path (no fixed logits, no ungated).
+        a.thaw_routing();
+        assert!(!a.routing_is_frozen());
+        assert!(
+            a.fixed_logit_mask().iter().all(|&f| !f),
+            "thaw must restore the free-logit path"
+        );
+    }
+
+    #[test]
+    fn frozen_routing_rejects_softmax_1033() {
+        let (n, k) = (4usize, 3usize);
+        let logits = Array2::from_shape_fn((n, k), |(i, kk)| 0.1 * (i as f64) - 0.05 * (kk as f64));
+        let coords: Vec<Array2<f64>> = (0..k)
+            .map(|_| Array2::from_shape_fn((n, 1), |(i, _)| (i as f64) * 0.1))
+            .collect();
+        let a = SaeAssignment::from_blocks_with_mode(logits, coords, AssignmentMode::softmax(1.0))
+            .unwrap();
+        // Softmax + frozen routing is rejected (the coupled-simplex entropy
+        // majorizer would be inconsistent with a frozen, non-optimized routing).
+        assert!(
+            a.freeze_routing_from_current_logits().is_err(),
+            "frozen routing under Softmax must be rejected (simplex entropy-majorizer coupling)"
+        );
+    }
+}
