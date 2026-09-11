@@ -7,17 +7,7 @@ use super::*;
 /// Same-piece rational identities avoid subtraction at repeated/nearby nodes.
 pub(super) fn inverse_difference(nodes: &[f64], floor: f64, floor_order: usize) -> f64 {
     let cap = floor.max(CONDITIONING_GATE_ABSOLUTE_CLEAR);
-    let piece = |x: f64| {
-        if x >= cap {
-            3
-        } else if x >= floor {
-            2
-        } else if x >= 0.0 {
-            1
-        } else {
-            0
-        }
-    };
+    let piece = |x: f64| inverse_kernel_piece(x, floor, cap);
     let branch = piece(nodes[0]);
     if nodes.iter().all(|&x| piece(x) == branch) {
         let sign = if nodes.len() % 2 == 1 { 1.0 } else { -1.0 };
@@ -84,7 +74,135 @@ pub(super) fn inverse_difference(nodes: &[f64], floor: f64, floor_order: usize) 
         / (sorted[last] - sorted[0])
 }
 
+/// Which smooth piece of the capped inverse holds `x`: saturated below zero,
+/// the floor plateau, the floored inverse, or the capped inverse.
+fn inverse_kernel_piece(x: f64, floor: f64, cap: f64) -> u8 {
+    if x >= cap {
+        3
+    } else if x >= floor {
+        2
+    } else if x >= 0.0 {
+        1
+    } else {
+        0
+    }
+}
+
+/// Divided differences of the capped inverse on one reduced spectrum, for every
+/// node set the Fréchet rows read.
+///
+/// Each `inverse_frechet_rows` call evaluates the same `[λ_i, λ_k, λ_j]` triples,
+/// and the second-order map reads `[λ_i, λ_k, λ_l, λ_j]` for all `m⁴` index tuples
+/// of a pair. Recomputing every one by sort-and-recurse was the largest self time
+/// of the survival marginal-slope outer Hessian (#979). The spectrum is fixed for a
+/// drift base, so pairs and triples are tabulated once in exactly the node order the
+/// rows ask for, and a four-node value is formed either from its own same-piece
+/// closed form or from the two sorted triples `inverse_difference` would recurse
+/// into — the same operations in the same order, so every value is unchanged.
+pub(super) struct InverseDividedDifferences {
+    m: usize,
+    floor: f64,
+    cap: f64,
+    evals: Vec<f64>,
+    pieces: Vec<u8>,
+    /// `pairs[order][i·m + j] = inverse_difference(&[λ_i, λ_j], floor, order)`.
+    pairs: [Vec<f64>; 3],
+    /// `triples[order][(i·m + k)·m + j] = inverse_difference(&[λ_i, λ_k, λ_j], floor, order)`.
+    triples: [Vec<f64>; 3],
+}
+
+impl InverseDividedDifferences {
+    pub(super) fn new(evals: &Array1<f64>, floor: f64) -> Self {
+        let values: Vec<f64> = evals.iter().copied().collect();
+        let m = values.len();
+        let cap = floor.max(CONDITIONING_GATE_ABSOLUTE_CLEAR);
+        let pieces = values
+            .iter()
+            .map(|&x| inverse_kernel_piece(x, floor, cap))
+            .collect();
+        let pairs = std::array::from_fn(|order| {
+            let mut table = Vec::with_capacity(m * m);
+            for &left in &values {
+                for &right in &values {
+                    table.push(inverse_difference(&[left, right], floor, order));
+                }
+            }
+            table
+        });
+        let triples = std::array::from_fn(|order| {
+            let mut table = Vec::with_capacity(m * m * m);
+            for &first in &values {
+                for &middle in &values {
+                    for &last in &values {
+                        table.push(inverse_difference(&[first, middle, last], floor, order));
+                    }
+                }
+            }
+            table
+        });
+        Self {
+            m,
+            floor,
+            cap,
+            evals: values,
+            pieces,
+            pairs,
+            triples,
+        }
+    }
+
+    fn triple(&self, order: usize, first: usize, middle: usize, last: usize) -> f64 {
+        self.triples[order][(first * self.m + middle) * self.m + last]
+    }
+
+    /// `inverse_difference(&[λ_a, λ_b, λ_c, λ_d], floor, 0)`.
+    fn quadruple(&self, nodes: [usize; 4]) -> f64 {
+        let branch = self.pieces[nodes[0]];
+        if nodes.iter().all(|&index| self.pieces[index] == branch) {
+            let [a, b, c, d] = nodes.map(|index| self.evals[index]);
+            let sign = -1.0;
+            return match branch {
+                3 => {
+                    let product = a.recip() * b.recip() * c.recip() * d.recip();
+                    let sum = a.recip() + b.recip() + c.recip() + d.recip();
+                    sign * self.cap * product * sum
+                }
+                2 => sign * (a.recip() * b.recip() * c.recip() * d.recip()),
+                1 => 0.0,
+                _ => {
+                    let mut product = 1.0;
+                    let mut s1 = 0.0;
+                    for x in [a, b, c, d] {
+                        let z = (self.floor - x).recip();
+                        product *= z;
+                        s1 += z;
+                    }
+                    self.floor * product * s1
+                }
+            };
+        }
+        let mut sorted = nodes;
+        for position in 1..4 {
+            let mut cursor = position;
+            while cursor > 0
+                && self.evals[sorted[cursor - 1]].total_cmp(&self.evals[sorted[cursor]])
+                    == std::cmp::Ordering::Greater
+            {
+                sorted.swap(cursor - 1, cursor);
+                cursor -= 1;
+            }
+        }
+        (self.triple(0, sorted[1], sorted[2], sorted[3]) - self.triple(0, sorted[0], sorted[1], sorted[2]))
+            / (self.evals[sorted[3]] - self.evals[sorted[0]])
+    }
+}
+
 impl JeffreysHphiDriftBase {
+    fn divided_differences(&self) -> &InverseDividedDifferences {
+        self.divided_differences
+            .get_or_init(|| InverseDividedDifferences::new(&self.evals, self.floor))
+    }
+
     /// Apply the derivative of the omitted true-Hessian completion to a
     /// coefficient direction. `axes` contains `H[v,e_a]` and `moving_axes`
     /// its derivative under `pert_h`. This contracts the fifth likelihood
@@ -198,6 +316,8 @@ impl JeffreysHphiDriftBase {
         floor_order: usize,
     ) -> Array2<f64> {
         let m = self.m;
+        let squared = m * m;
+        let divided = self.divided_differences();
         let mut out = Array2::zeros(rows.raw_dim());
         if directions.len() == 2 {
             // D³f[E,F,A] is linear in A. Assemble that linear map for one
@@ -208,25 +328,32 @@ impl JeffreysHphiDriftBase {
             // contraction and the spectral assembly costs only O(m^4).
             // A full m²-by-m² Loewner map is never allocated: the scratch
             // occupies m³ entries and is reused for each output row.
-            let e = directions[0];
-            let f = directions[1];
-            let mut weights = Array2::<f64>::zeros((m, m * m));
+            let e = directions[0].as_standard_layout();
+            let f = directions[1].as_standard_layout();
+            let e = e.as_slice().expect("standard-layout spectral direction");
+            let f = f.as_slice().expect("standard-layout spectral direction");
+            let mut weights = Array2::<f64>::zeros((m, squared));
             for i in 0..m {
                 weights.fill(0.0);
+                let w = weights
+                    .as_slice_mut()
+                    .expect("freshly allocated weights are contiguous");
                 for j in 0..m {
                     for k in 0..m {
                         for l in 0..m {
-                            let c = inverse_difference(
-                                &[self.evals[i], self.evals[k], self.evals[l], self.evals[j]],
-                                self.floor,
-                                floor_order,
-                            );
-                            weights[[j, l * m + j]] += c
-                                * (e[[i, k]] * f[[k, l]] + f[[i, k]] * e[[k, l]]);
-                            weights[[j, k * m + l]] += c
-                                * (e[[i, k]] * f[[l, j]] + f[[i, k]] * e[[l, j]]);
-                            weights[[j, i * m + k]] += c
-                                * (e[[k, l]] * f[[l, j]] + f[[k, l]] * e[[l, j]]);
+                            let c = if floor_order == 0 {
+                                divided.quadruple([i, k, l, j])
+                            } else {
+                                inverse_difference(
+                                    &[self.evals[i], self.evals[k], self.evals[l], self.evals[j]],
+                                    self.floor,
+                                    floor_order,
+                                )
+                            };
+                            let (ik, kl, lj) = (i * m + k, k * m + l, l * m + j);
+                            w[j * squared + l * m + j] += c * (e[ik] * f[kl] + f[ik] * e[kl]);
+                            w[j * squared + kl] += c * (e[ik] * f[lj] + f[ik] * e[lj]);
+                            w[j * squared + ik] += c * (e[kl] * f[lj] + f[kl] * e[lj]);
                         }
                     }
                 }
@@ -235,31 +362,32 @@ impl JeffreysHphiDriftBase {
             }
             return out;
         }
-        for i in 0..m {
-            for j in 0..m {
-                if directions.is_empty() {
-                    let c = inverse_difference(
-                        &[self.evals[i], self.evals[j]],
-                        self.floor,
-                        floor_order,
-                    );
-                    for a in 0..self.p {
-                        out[[a, i * m + j]] = c * rows[[a, i * m + j]];
-                    }
-                    continue;
+        let input = rows.as_standard_layout();
+        let input = input.as_slice().expect("standard-layout axis rows");
+        let output = out.as_slice_mut().expect("freshly allocated rows are contiguous");
+        if directions.is_empty() {
+            let table = &divided.pairs[floor_order];
+            for (target, source) in output.chunks_exact_mut(squared).zip(input.chunks_exact(squared)) {
+                for ((value, &coefficient), &entry) in
+                    target.iter_mut().zip(table.iter()).zip(source.iter())
+                {
+                    *value = coefficient * entry;
                 }
-                let e = directions[0];
-                for k in 0..m {
-                    let c = inverse_difference(
-                        &[self.evals[i], self.evals[k], self.evals[j]],
-                        self.floor,
-                        floor_order,
-                    );
-                    for a in 0..self.p {
-                        out[[a, i * m + j]] += c
-                            * (e[[i, k]] * rows[[a, k * m + j]]
-                                + rows[[a, i * m + k]] * e[[k, j]]);
+            }
+            return out;
+        }
+        let e = directions[0].as_standard_layout();
+        let e = e.as_slice().expect("standard-layout spectral direction");
+        let table = &divided.triples[floor_order];
+        for (target, source) in output.chunks_exact_mut(squared).zip(input.chunks_exact(squared)) {
+            for i in 0..m {
+                for j in 0..m {
+                    let mut value = 0.0;
+                    for k in 0..m {
+                        value += table[(i * m + k) * m + j]
+                            * (e[i * m + k] * source[k * m + j] + source[i * m + k] * e[k * m + j]);
                     }
+                    target[i * m + j] = value;
                 }
             }
         }
@@ -488,6 +616,46 @@ pub struct JeffreysDirectionFrame {
 mod tests {
     use super::*;
     use ndarray::array;
+
+    /// #979: the tabulated divided differences, including the four-node values
+    /// closed from sorted triples, are bit-identical to `inverse_difference` on the
+    /// same nodes, across all four pieces of the capped inverse and a repeated
+    /// eigenvalue.
+    #[test]
+    fn tabulated_divided_differences_match_inverse_difference_bitwise_979() {
+        let floor = 1e-3;
+        let evals = array![-0.3, 2e-4, 0.5, 0.5, 7.0, 40.0];
+        let table = InverseDividedDifferences::new(&evals, floor);
+        let m = evals.len();
+        let same = |left: f64, right: f64| left.to_bits() == right.to_bits();
+        for order in 0..3 {
+            for i in 0..m {
+                for j in 0..m {
+                    let direct = inverse_difference(&[evals[i], evals[j]], floor, order);
+                    assert!(same(table.pairs[order][i * m + j], direct), "pair ({i},{j}) order {order}");
+                    for k in 0..m {
+                        let direct = inverse_difference(&[evals[i], evals[k], evals[j]], floor, order);
+                        assert!(same(table.triple(order, i, k, j), direct), "triple ({i},{k},{j}) order {order}");
+                    }
+                }
+            }
+        }
+        for a in 0..m {
+            for b in 0..m {
+                for c in 0..m {
+                    for d in 0..m {
+                        let direct =
+                            inverse_difference(&[evals[a], evals[b], evals[c], evals[d]], floor, 0);
+                        let tabulated = table.quadruple([a, b, c, d]);
+                        assert!(
+                            same(tabulated, direct),
+                            "quadruple ({a},{b},{c},{d}): tabulated {tabulated} vs direct {direct}"
+                        );
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn mixed_jeffreys_drift_matches_first_drift_difference_979() {

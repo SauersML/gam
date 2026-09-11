@@ -2523,6 +2523,9 @@ pub struct JeffreysHphiDriftBase {
     a_rows: Array2<f64>,
     /// `vec(Ψ ∘ Ṽ_a)` (`p × m·m`).
     aw_rows: Array2<f64>,
+    /// Capped-inverse divided differences on `evals`, tabulated on first use by the
+    /// Fréchet rows of the drift derivatives.
+    divided_differences: std::sync::OnceLock<mixed::InverseDividedDifferences>,
 }
 
 /// Symmetric congruence `sym(Uᵀ A U)`.
@@ -2728,6 +2731,7 @@ impl JeffreysHphiDriftBase {
             idx_max,
             a_rows,
             aw_rows,
+            divided_differences: std::sync::OnceLock::new(),
         }))
     }
 
