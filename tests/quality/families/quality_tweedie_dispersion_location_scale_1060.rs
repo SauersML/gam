@@ -133,7 +133,7 @@ fn gam_tweedie_dispersion_location_scale_recovers_phi_surface() {
     let ncols = ds.headers.len();
 
     let cfg = FitConfig {
-        family: Some("tweedie".to_string()),
+        family: Some(format!("tweedie(p={P})")),
         noise_formula: Some("s(x, k=6)".to_string()),
         ..FitConfig::default()
     };

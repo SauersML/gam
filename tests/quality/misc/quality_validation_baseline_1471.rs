@@ -203,7 +203,7 @@ fn tweedie_log_smooth_recovers_truth_and_matches_mgcv() {
         let width = ds.headers.len();
 
         let cfg = FitConfig {
-            family: Some("tweedie".to_string()),
+            family: Some("tweedie(p=1.5)".to_string()),
             ..FitConfig::default()
         };
         // gam: matched basis (tp) + matched penalty model (double_penalty=false).

@@ -134,7 +134,7 @@ fn gam_tweedie_matches_statsmodels_power_variance() {
     let width = ds.headers.len();
 
     let cfg = FitConfig {
-        family: Some("tweedie".to_string()),
+        family: Some(format!("tweedie(p={p})")),
         ..FitConfig::default()
     };
     let result = fit_from_formula("y ~ s(x1, k=4) + s(x2, k=4) + linear(offset)", &ds, &cfg)
@@ -217,9 +217,10 @@ emit("eta", np.asarray(eta, dtype=float))
     let rel_eta = relative_l2(&gam_eta, sm_eta);
     let corr_eta = pearson(&gam_eta, sm_eta);
 
-    // The variance power the bare `family="tweedie"` fit ESTIMATED (#2026 profile
-    // likelihood). With the #2105 exact-series objective this recovers the true
-    // p = 1.5; the pre-#2105 saddlepoint objective biased it low (≈1.11 here).
+    // The variance power the fitted family carries. The fit names it explicitly,
+    // matching statsmodels' fixed `var_power=1.5`: a893d85bc removed the
+    // derivative-free profile that used to estimate it from a bare
+    // `family="tweedie"`, so this reads back the configured power.
     let p_hat = match fit
         .fit
         .likelihood_family
@@ -309,20 +310,13 @@ emit("eta", np.asarray(eta, dtype=float))
         "gam Tweedie mean does not recover truth: rmse(mu_gam,truth)={gam_err:.4} \
          exceeds noise floor sigma={noise_sigma:.4}"
     );
-    // (2) VARIANCE POWER RECOVERY (#2026 / #2105): a bare `family="tweedie"`
-    // ESTIMATES `p` by profile likelihood, and it must recover the true p = 1.5.
-    // This is the load-bearing correctness property — a wrong `p` miscalibrates
-    // `Var(Y|x) = φ μ^p` and every SE / observation interval. Before #2105 the
-    // profile used the saddlepoint density, which is exact only in the many-jumps
-    // limit and biased the maximizer LOW (p̂ ≈ 1.11 on this data ⇒ |err| ≈ 0.39);
-    // the exact-series objective recovers p̂ ≈ 1.5. This bound (0.15) fails on the
-    // pre-#2105 estimate and passes comfortably after.
-    assert!(
-        (p_hat - p).abs() < 0.15,
-        "bare tweedie did not recover the variance power: p̂={p_hat:.4} is {:.4} from \
-         the true p={p:.1} (tolerance 0.15). The pre-#2105 saddlepoint profile gave \
-         ≈1.11 (err ≈0.39); the exact-series profile must recover ≈1.5.",
-        (p_hat - p).abs()
+    // (2) The fitted family must carry exactly the configured power. Estimating
+    // `p` from a bare `family="tweedie"` was a derivative-free profile and was
+    // removed in a893d85bc, so there is no estimate to score here; both engines
+    // fit the same fixed-power model.
+    assert_eq!(
+        p_hat, p,
+        "the fitted Tweedie family must carry the configured power p={p}; got {p_hat}"
     );
     // (3) SIGNAL AGREEMENT WITH STATSMODELS (penalization-invariant): gam's fitted
     // log-mean must track the reference tool's on the SAME basis/data. Unlike a
@@ -585,7 +579,7 @@ fn gam_tweedie_matches_statsmodels_power_variance_on_real_data() {
 
     // ---- fit gam on TRAIN: numvisit ~ s(age) + linear(badh), Tweedie(log) --
     let cfg = FitConfig {
-        family: Some("tweedie".to_string()),
+        family: Some(format!("tweedie(p={p})")),
         ..FitConfig::default()
     };
     let result = fit_from_formula("numvisit ~ s(age) + linear(badh)", &train_ds, &cfg)

@@ -179,12 +179,15 @@ fn gam_matern_family_recovers_truth_across_nu() {
             fit.fit.edf_by_block().to_vec(),
             fit.fit.penalty_block_trace().to_vec(),
         );
+        // One metric per Matérn order: the aggregator keys an observation by
+        // (case, metric, reference), so every ν in this loop needs its own
+        // label or the second order's value conflicts with the first's.
         eprintln!(
             "{}",
             QualityPair::error(
                 "smooths",
                 "quality_vs_mgcv_matern_varying_nu",
-                "rmse_vs_truth",
+                format!("rmse_vs_truth_nu{nu}"),
                 gam_rmse,
                 "mgcv",
                 mgcv_rmse,

@@ -117,7 +117,7 @@ fn gam_tensor_te_2d_tweedie_matches_mgcv() {
     let z_idx = col["z"];
 
     let cfg = FitConfig {
-        family: Some("tweedie".to_string()),
+        family: Some(format!("tweedie(p={P})")),
         ..FitConfig::default()
     };
     let result = fit_from_formula("y ~ te(x, z, k=7)", &ds, &cfg).expect("gam tweedie te fit");
