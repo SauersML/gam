@@ -583,7 +583,9 @@ pub fn jacobi_eigh(a_in: &[f64], d: usize, vals: &mut [f64], vecs: &mut [f64]) -
 fn beta_eta_newton(h: &[f64], g: &[f64], d: usize) -> Option<(f64, f64, Vec<f64>)> {
     let mut vals = vec![0.0_f64; d];
     let mut vecs = vec![0.0_f64; d * d];
-    jacobi_eigh(h, d, &mut vals, &mut vecs);
+    if !jacobi_eigh(h, d, &mut vals, &mut vecs) {
+        return None;
+    }
     let mut lambda_min = f64::INFINITY;
     for &v in &vals {
         if v < lambda_min {

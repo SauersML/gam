@@ -2721,7 +2721,7 @@ impl BinomialLocationScaleWiggleFamily {
         double_penalty: bool,
     ) -> Result<(ParameterBlockInput, Array1<f64>), String> {
         let knots = Self::initializewiggle_knots_from_q(q_seed, degree, num_internal_knots)?;
-        let block = buildwiggle_block_input_from_knots(
+        let block = crate::wiggle::buildwiggle_block_input_from_knots(
             q_seed,
             &knots,
             degree,
@@ -3064,7 +3064,7 @@ impl BinomialLocationScaleWiggleFamily {
     pub fn block_effective_jacobian(
         specs: &[ParameterBlockSpec],
         block_idx: usize,
-    ) -> Result<Box<dyn BlockEffectiveJacobian>, String> {
+    ) -> Result<Box<dyn gam_problem::block_spec::BlockEffectiveJacobian>, String> {
         crate::block_layout::block_jacobian::AdditiveWiggleBlockLayout {
             family: "BinomialLocationScaleWiggleFamily",
             n_outputs: 2,

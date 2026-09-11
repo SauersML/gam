@@ -258,7 +258,7 @@ impl GaussianLocationScaleWiggleFamily {
     pub fn block_effective_jacobian(
         specs: &[ParameterBlockSpec],
         block_idx: usize,
-    ) -> Result<Box<dyn BlockEffectiveJacobian>, String> {
+    ) -> Result<Box<dyn gam_problem::block_spec::BlockEffectiveJacobian>, String> {
         crate::block_layout::block_jacobian::AdditiveWiggleBlockLayout {
             family: "GaussianLocationScaleWiggleFamily",
             n_outputs: 2,
