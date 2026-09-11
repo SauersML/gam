@@ -1,4 +1,4 @@
-## gamfit 0.1.268 (unreleased)
+## gamfit 0.1.268 (2026-09-11)
 
 - Existing CTN composition now lives in Rust, shared by the library, CLI and Python.
 - One native model stores a frozen external CTN or a full-training CTN alongside
