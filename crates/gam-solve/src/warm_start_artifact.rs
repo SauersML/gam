@@ -26,12 +26,6 @@ use serde::{Deserialize, Serialize};
 /// layout changes in a way that makes prior payloads unsafe to consume.
 pub const FIT_ARTIFACT_SCHEMA: u32 = 1;
 
-/// Saturation magnitude past which a copied ρ coordinate is considered
-/// pinned at the outer optimizer's box and is NOT transferred. Mirrors the
-/// persist-side gate in `families/custom_family/persistent_warm_start.rs` and the
-/// `[CACHE] hit-clamp` policy in `solver/outer_strategy.rs`.
-pub(crate) const RHO_SATURATION: f64 = 9.0;
-
 /// Structural role a term plays in the (possibly multi-channel) model.
 ///
 /// Derived from the block name / channel at capture time. The role is part

@@ -3,8 +3,8 @@
 //!
 //! This is the **ρ half** of the transfer (the marquee LOSO win): for each new
 //! term, if a parent term shares its [`TermIdentityKey`], copy the parent's
-//! converged log-smoothing parameters into the new ρ layout — clamped out of
-//! the saturated box. Unmatched / brand-new terms fall back to the new fit's
+//! converged log-smoothing parameters into the new ρ layout as they were
+//! certified. Unmatched / brand-new terms fall back to the new fit's
 //! penalty-label default. β always stays cold (zeros at the new reduced block
 //! widths, seeded by the caller); only ρ transfers.
 //!
@@ -15,18 +15,10 @@
 //! build returns an error and the caller cold-starts, so a misfired transfer
 //! can never fail a fit.
 
-use crate::warm_start_artifact::{
-    FitArtifact, FitDescriptor, RHO_SATURATION, TermIdentityKey, TransferProvenance,
-};
+use crate::warm_start_artifact::{FitArtifact, FitDescriptor, TermIdentityKey, TransferProvenance};
 use faer::Side;
-use gam_linalg::faer_ndarray::{FaerCholesky, fast_ata, fast_atb};
+use gam_linalg::faer_ndarray::{FaerEigh, fast_ata, fast_atb};
 use ndarray::{Array1, Array2};
-
-/// Magnitude past which a *projected* reduced-coordinate β is treated as a
-/// numerical blow-up and the block falls back to cold. A function-space warm
-/// start only seeds the inner Newton's starting iterate, so a wild seed is
-/// never a correctness hazard — but it is poor seed material, so we reject it.
-const PROJECTED_BETA_CLAMP: f64 = 1.0e6;
 
 /// Per-term context for the new (about-to-run) fit. Carries everything the
 /// transfer needs to lay ρ out in the new fit's coordinate system, plus the
@@ -73,7 +65,11 @@ pub struct TransferResult {
 /// Least-squares project a parent term's RAW β onto a new fold's reduced
 /// subspace via the new gauge lift `T : reduced → raw` (`β_raw = T · θ`):
 ///
-///   θ = argmin_θ ‖ T·θ − β_raw_parent ‖²  =  (TᵀT + εI)⁻¹ Tᵀ β_raw_parent.
+///   θ = argmin_θ ‖ T·θ − β_raw_parent ‖²,  minimum-norm along the directions
+///   `T` does not resolve,
+///
+/// i.e. the eigen-expansion of `TᵀT` restricted to the modes above the
+/// eigensolver's rounding band `γ_red·max λ`.
 ///
 /// This is the principled cross-fit coefficient-space transfer for the LOSO
 /// case: the RAW basis (block name, #centers/knots, nullspace order) is
@@ -84,8 +80,10 @@ pub struct TransferResult {
 /// reproduces the parent's fitted function in the new reduced coordinates.
 ///
 /// Returns `None` (cold fallback) on ANY anomaly — raw-width mismatch,
-/// non-finite input, factorization failure, non-finite or blown-up output —
-/// because a warm start can never error or distort a converged fit.
+/// non-finite input, decomposition failure, non-finite output — because a warm
+/// start can never error or distort a converged fit. A finite projection is
+/// admissible seed material however large: it only seeds the inner Newton,
+/// which globalizes from wherever it starts.
 fn project_raw_beta_to_reduced(
     t_block: &Array2<f64>,
     raw_beta_parent: &[f64],
@@ -101,51 +99,23 @@ fn project_raw_beta_to_reduced(
     if raw_beta_parent.iter().any(|v| !v.is_finite()) || t_block.iter().any(|v| !v.is_finite()) {
         return None;
     }
-    // Normal equations with a small relative ridge so the system is SPD even
-    // when `T` is rank-deficient in reduced space.
-    let mut gram = fast_ata(t_block); // TᵀT, shape (red, red)
-    let trace: f64 = (0..reduced_width).map(|i| gram[[i, i]]).sum();
-    let eps = (1.0e-8 * trace / (reduced_width as f64)).max(1.0e-12);
-    for i in 0..reduced_width {
-        gram[[i, i]] += eps;
-    }
+    let gram = fast_ata(t_block); // TᵀT, shape (red, red)
     let rhs_col = Array2::from_shape_vec((raw_rows, 1), raw_beta_parent.to_vec()).ok()?;
     let rhs = fast_atb(t_block, &rhs_col); // Tᵀ β_raw, shape (red, 1)
-    let rhs_vec = rhs.column(0).to_owned();
-    let factor = gram.cholesky(Side::Lower).ok()?;
-    let theta = factor.solvevec(&rhs_vec);
-    if theta.len() != reduced_width
-        || theta
-            .iter()
-            .any(|v| !v.is_finite() || v.abs() > PROJECTED_BETA_CLAMP)
-    {
+    let (evals, evecs) = gram.eigh(Side::Lower).ok()?;
+    let spectral_scale = evals.iter().fold(0.0_f64, |acc, value| acc.max(value.abs()));
+    let resolvable = gam_linalg::roundoff::accumulation_growth(reduced_width) * spectral_scale;
+    let mut theta = Array1::<f64>::zeros(reduced_width);
+    for (mode, &lambda) in evals.iter().enumerate() {
+        if lambda > resolvable {
+            let direction = evecs.column(mode);
+            theta.scaled_add(direction.dot(&rhs.column(0)) / lambda, &direction);
+        }
+    }
+    if theta.iter().any(|v| !v.is_finite()) {
         return None;
     }
     Some(theta)
-}
-
-/// Configuration knobs for the transfer. Defaults are the magic path; there
-/// are no user-facing flags.
-#[derive(Clone, Copy, Debug)]
-pub struct TransferConfig {
-    /// Magnitude past which a copied ρ coordinate is treated as pinned at the
-    /// optimizer box and is NOT transferred (the new default is used instead).
-    pub rho_saturation: f64,
-    /// Interior clamp magnitude applied to every transferred ρ coordinate, so
-    /// a near-saturated-but-finite parent value still seeds inside the box.
-    pub rho_interior_clamp: f64,
-}
-
-impl Default for TransferConfig {
-    fn default() -> Self {
-        Self {
-            rho_saturation: RHO_SATURATION,
-            // Clamp transferred coordinates to a comfortable interior; the
-            // outer optimizer expands back out if the data wants it. Mirrors
-            // the `[CACHE] hit-clamp` interior policy.
-            rho_interior_clamp: RHO_SATURATION - 1.0,
-        }
-    }
 }
 
 /// Errors that abort a transfer *build*. Callers treat any error as "use the
@@ -163,9 +133,10 @@ pub enum TransferError {
 ///
 /// Contract:
 ///   - ρ: per new term, if a parent term shares the [`TermIdentityKey`],
-///     copy its converged `rho_for_term` into the term's ρ slots, clamped
-///     into the interior and skipping any saturated parent coordinate;
-///     otherwise leave the new fit's default in those slots.
+///     copy its converged, finite `rho_for_term` into the term's ρ slots;
+///     otherwise leave the new fit's default in those slots. The copied ρ is a
+///     seed: the outer optimizer still runs to its own certificate on its own
+///     domain.
 ///   - β: per matched term, least-squares project the parent's RAW β onto this
 ///     fold's reduced subspace via the per-block gauge lift `T_b` (see
 ///     `project_raw_beta_to_reduced`). This delivers the cross-width LOSO
@@ -184,7 +155,6 @@ pub fn build_warm_start(
     new_terms: &[TermBuildContext],
     rho_default: &Array1<f64>,
     parent: &FitArtifact,
-    cfg: TransferConfig,
 ) -> Result<TransferResult, TransferError> {
     // Finite-guard the parent before reading any of its numbers.
     if !parent.is_usable() {
@@ -244,14 +214,7 @@ pub fn build_warm_start(
                 if !parent_rho.is_finite() {
                     continue;
                 }
-                // Saturation gate: a coordinate pinned at the optimizer box is
-                // poor seed material — leave the default in this slot.
-                if parent_rho.abs() >= cfg.rho_saturation {
-                    continue;
-                }
-                // Interior clamp: pull near-box-but-finite values inside.
-                let clamped = parent_rho.clamp(-cfg.rho_interior_clamp, cfg.rho_interior_clamp);
-                rho[*slot] = clamped;
+                rho[*slot] = parent_rho;
                 copied_any = true;
             }
         }
@@ -363,7 +326,6 @@ mod tests {
             &new_terms,
             &rho_default,
             &parent,
-            TransferConfig::default(),
         )
         .expect("transfer builds");
         assert_eq!(res.rho[0], 2.5, "matched term must inherit parent ρ");
@@ -389,7 +351,6 @@ mod tests {
             &new_terms,
             &rho_default,
             &parent,
-            TransferConfig::default(),
         )
         .expect("transfer builds");
         assert_eq!(res.rho[0], -1.3, "unmatched term keeps the new default ρ");
@@ -397,36 +358,16 @@ mod tests {
     }
 
     #[test]
-    fn saturated_parent_rho_not_copied() {
+    fn a_large_finite_parent_rho_is_copied_verbatim() {
         let id = block_id("s(x)");
-        // Parent ρ at the box: must NOT be copied.
+        // A converged parent ρ far from zero is the parent's certified optimum;
+        // it seeds the new fit as it is, with no box or interior clamp.
         let parent = parent_with(id, vec![12.0]);
         let new_terms = vec![rho_only_ctx(id, vec![0])];
         let rho_default = Array1::from_vec(vec![0.7]);
-        let res = build_warm_start(
-            &new_descriptor(id),
-            &new_terms,
-            &rho_default,
-            &parent,
-            TransferConfig::default(),
-        )
-        .expect("transfer builds");
-        assert_eq!(res.rho[0], 0.7, "saturated parent ρ must not be copied");
-        assert_eq!(res.provenance[0], TransferProvenance::Cold);
-    }
-
-    #[test]
-    fn near_box_parent_rho_is_interior_clamped() {
-        let id = block_id("s(x)");
-        // Finite but near the box (below saturation): copied, then clamped.
-        let parent = parent_with(id, vec![8.7]);
-        let new_terms = vec![rho_only_ctx(id, vec![0])];
-        let rho_default = Array1::from_vec(vec![0.0]);
-        let cfg = TransferConfig::default();
-        let res = build_warm_start(&new_descriptor(id), &new_terms, &rho_default, &parent, cfg)
+        let res = build_warm_start(&new_descriptor(id), &new_terms, &rho_default, &parent)
             .expect("transfer builds");
-        assert!(res.rho[0] <= cfg.rho_interior_clamp);
-        assert_eq!(res.rho[0], cfg.rho_interior_clamp);
+        assert_eq!(res.rho[0], 12.0, "a finite parent ρ is copied as certified");
         assert_eq!(res.provenance[0], TransferProvenance::RhoOnly);
     }
 
@@ -442,7 +383,6 @@ mod tests {
             &new_terms,
             &rho_default,
             &parent,
-            TransferConfig::default(),
         )
         .unwrap_err();
         assert_eq!(err, TransferError::ParentUnusable);
@@ -464,7 +404,6 @@ mod tests {
             &new_terms,
             &rho_default,
             &parent,
-            TransferConfig::default(),
         )
         .expect("transfer builds");
         assert_eq!(res.rho[0], 3.3, "matched slot warm-starts");
@@ -483,7 +422,6 @@ mod tests {
             &new_terms,
             &rho_default,
             &parent,
-            TransferConfig::default(),
         )
         .unwrap_err();
         assert_eq!(err, TransferError::DescriptorMismatch);
@@ -529,7 +467,6 @@ mod tests {
             &new_terms,
             &rho_default,
             &parent,
-            TransferConfig::default(),
         )
         .expect("transfer builds");
         assert_eq!(res.block_beta[0].len(), 3, "β must be at the reduced width");
@@ -558,7 +495,6 @@ mod tests {
             &new_terms,
             &rho_default,
             &parent,
-            TransferConfig::default(),
         )
         .expect("transfer builds");
         assert_eq!(
@@ -584,7 +520,6 @@ mod tests {
             &new_terms,
             &rho_default,
             &parent,
-            TransferConfig::default(),
         )
         .expect("transfer builds");
         assert_eq!(
@@ -615,7 +550,6 @@ mod tests {
             &new_terms,
             &rho_default,
             &parent,
-            TransferConfig::default(),
         )
         .unwrap_err();
         assert_eq!(err, TransferError::ParentUnusable);

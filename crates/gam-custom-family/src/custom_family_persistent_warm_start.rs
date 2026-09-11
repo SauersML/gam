@@ -24,7 +24,7 @@ use gam_solve::warm_start_artifact::{
     RowPopulationTag, SerializableBasisMeta, TermArtifact, TermIdentityKey, TermRole,
     TransferProvenance, term_identity_from_block,
 };
-use gam_solve::warm_start_transfer::{TermBuildContext, TransferConfig, build_warm_start};
+use gam_solve::warm_start_transfer::{TermBuildContext, build_warm_start};
 
 #[derive(Clone)]
 pub(crate) struct PersistentCustomFamilyCache {
@@ -253,7 +253,6 @@ pub(crate) fn consume_fit_artifact<F: CustomFamily + ?Sized>(
         &new_terms,
         rho_default,
         &parent,
-        TransferConfig::default(),
     ) {
         Ok(result) => {
             let n_rho = result
@@ -582,29 +581,6 @@ pub(crate) fn store_persistent_custom_family_warm_start(
             .any(|(beta, dim)| beta.len() != *dim || beta.iter().any(|v| !v.is_finite()))
         || warm_start.rho.iter().any(|v| !v.is_finite())
     {
-        return;
-    }
-    // Saturation gate: never persist ρ that hit the outer optimizer's
-    // box (|ρ_i| ≥ 9). Those iterates are either at a legitimate active
-    // bound or a non-converged intermediate; either way they make poor
-    // seed material because the load-side clamp pulls them back into
-    // the interior anyway (see `rho_optimizer.rs` `[CACHE] hit-clamp`).
-    const SATURATION_THRESHOLD: f64 = 9.0;
-    if warm_start
-        .rho
-        .iter()
-        .any(|&v| v.abs() >= SATURATION_THRESHOLD)
-    {
-        log::debug!(
-            "[warm-start-cache] skip persist custom-family key={} \
-             reason=rho-saturated threshold=±{:.1} rho_inf_norm={:.3e}",
-            key,
-            SATURATION_THRESHOLD,
-            warm_start
-                .rho
-                .iter()
-                .fold(0.0_f64, |acc, &v| acc.max(v.abs())),
-        );
         return;
     }
     let mut record =

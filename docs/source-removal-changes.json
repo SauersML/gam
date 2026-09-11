@@ -679,5 +679,19 @@
     ],
     "reason": "#2469: six hand floors of the location-scale survival solver. DYKSTRA_PROJECTION_TOL is the downstream feasibility gate the projection is certified against; DYKSTRA_ROW_DEGENERACY_FLOOR is an exactly-zero row normal; PSD_EIGENVALUE_REL_TOL and PSD_EIGENVALUE_ABS_FLOOR are the eigensolver band gamma_p*max|lambda|; REDUCED_AFT_OBJ_TOL_FLOOR is the caller inner_tol raised to the objective rounding band gamma_{n+p^2}*|ll|; STRUCTURAL_GUESS_AGE_FLOOR is replaced by declining the warm start at a zero exit age.",
     "evidence": "At the base, git grep finds these names only in location_scale/constants.rs, time_block.rs, moments.rs, truncated_moments.rs, family_solver.rs, fit.rs and tests.rs, every one of which this commit edits."
+  },
+  {
+    "base": "9f2291f555bd9a684ab8180f29e6e11651cd612c",
+    "items": [
+      "crates/gam-custom-family/src/custom_family_persistent_warm_start.rs:const:SATURATION_THRESHOLD",
+      "crates/gam-solve/src/warm_start_artifact.rs:const:RHO_SATURATION",
+      "crates/gam-solve/src/warm_start_transfer.rs:const:PROJECTED_BETA_CLAMP",
+      "crates/gam-solve/src/warm_start_transfer.rs:fn:default",
+      "crates/gam-solve/src/warm_start_transfer.rs:fn:near_box_parent_rho_is_interior_clamped",
+      "crates/gam-solve/src/warm_start_transfer.rs:fn:saturated_parent_rho_not_copied",
+      "crates/gam-solve/src/warm_start_transfer.rs:struct:TransferConfig"
+    ],
+    "reason": "#2469: the warm-start transfer box. TransferConfig (and its Default impl) carried a saturation threshold and an interior clamp that refused to copy a parent rho past |rho| = 9 and pulled near-box values inward; RHO_SATURATION and the persist-side SATURATION_THRESHOLD gate repeated the same box; PROJECTED_BETA_CLAMP clamped the projected beta at 1e6. A finite converged parent rho is now copied as certified and the beta projection is minimum-norm through the eigen-expansion of TtT above gamma_red*max(lambda). saturated_parent_rho_not_copied asserted the retired refusal and is restated as a_large_finite_parent_rho_is_copied_verbatim; near_box_parent_rho_is_interior_clamped asserted the retired clamp.",
+    "evidence": "At the base, git grep finds RHO_SATURATION only in warm_start_artifact.rs and warm_start_transfer.rs, TransferConfig only in warm_start_transfer.rs and custom_family_persistent_warm_start.rs, and the two private constants only in their own files; all three files are edited here, and build_warm_start takes the descriptor, terms, default rho and parent directly."
   }
 ]

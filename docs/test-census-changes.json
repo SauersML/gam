@@ -117,5 +117,15 @@
     "unit_test_decreases": {
       "crates/gam-solve": 2
     }
+  },
+  {
+    "base": "9f2291f555bd9a684ab8180f29e6e11651cd612c",
+    "reason": "#2469: near_box_parent_rho_is_interior_clamped asserted the interior clamp of the deleted warm-start transfer box; with a finite parent rho copied verbatim there is no clamp to test. saturated_parent_rho_not_copied is restated as a_large_finite_parent_rho_is_copied_verbatim, which pins the verbatim copy.",
+    "evidence": "The commit removes two #[test] functions from crates/gam-solve/src/warm_start_transfer.rs and adds one; no removed name carries an issue suffix.",
+    "removed_pins": {},
+    "test_count_decrease": 1,
+    "unit_test_decreases": {
+      "crates/gam-solve": 1
+    }
   }
 ]
