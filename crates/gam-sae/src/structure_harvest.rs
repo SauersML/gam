@@ -2204,13 +2204,14 @@ fn transplant_glued_coords(
 ///   (logit-sum on the active rows) and `b` is demoted. The retained atom's
 ///   product coordinates are initialized from the pair.
 /// * **Birth** appends a fresh atom whose decoder is seeded from the
-///   residual-factor direction `candidate` (passed in `birth_decoders`), routed
-///   at a small neutral mass so the refit can grow it if it is real.
+///   residual-factor birth `candidate` (passed in `births`), raced over that birth's
+///   residual image and routed at a small neutral mass so the refit can grow it if
+///   it is real.
 pub fn apply_structure_move(
     term: &SaeManifoldTerm,
     rho: &SaeManifoldRho,
     mv: &StructureMove,
-    birth_decoders: &[Array2<f64>],
+    births: &[ResidualFactorBirth],
 ) -> Result<(SaeManifoldTerm, SaeManifoldRho), String> {
     match mv {
         StructureMove::Death { atom } => {
@@ -2310,21 +2311,31 @@ pub fn apply_structure_move(
             Ok((child, child_rho))
         }
         StructureMove::Birth { candidate } => {
-            let decoder = birth_decoders.get(*candidate).ok_or_else(|| {
+            let birth = births.get(*candidate).ok_or_else(|| {
                 format!(
                     "apply_structure_move: birth candidate {candidate} out of range \
-                     ({} residual-factor decoders)",
-                    birth_decoders.len()
+                     ({} residual-factor births)",
+                    births.len()
                 )
             })?;
-            born_atom(term, rho, decoder.view())
+            born_atom(term, rho, birth.decoder.view(), birth.target.view())
         }
     }
 }
 
+/// A residual-factor birth (#2822): the flat `(m, p)` decoder seeded on atom 0's
+/// constant basis row, and the `(n, p)` residual image along that direction that the
+/// topology race adjudicates. The race needs the image, not the decoder: the decoder
+/// emits one direction on every row, which every candidate interpolates.
+#[derive(Clone, Debug)]
+pub struct ResidualFactorBirth {
+    pub decoder: Array2<f64>,
+    pub target: Array2<f64>,
+}
+
 /// A birth seed the seeded apply-move ([`apply_structure_move_seeded`])
-/// materializes. The residual-factor births carry only a flat decoder (the
-/// topology race in `born_atom` then adjudicates line vs circle vs …); a curl
+/// materializes. The residual-factor births carry a flat decoder and the residual
+/// image the topology race in `born_atom` adjudicates (line vs circle vs …); a curl
 /// birth (INTEGRATION_PLAN Phase 4) instead carries a fully-formed periodic
 /// circle — decoder, per-row phase, and gate — because a shattered centered
 /// circle leaves NO residual for the race to seed from, so the seed IS the
@@ -2332,9 +2343,9 @@ pub fn apply_structure_move(
 /// to adjudicate.
 #[derive(Clone, Debug)]
 pub enum BirthSeed {
-    /// A whitened residual-factor direction lifted to a flat `(m, p)` decoder;
-    /// born via the topology race (the legacy birth path).
-    ResidualFactor(Array2<f64>),
+    /// A whitened residual-factor direction lifted to a flat `(m, p)` decoder, with
+    /// its residual image; born via the topology race (the legacy birth path).
+    ResidualFactor(ResidualFactorBirth),
     /// A curl circle seed: periodic-harmonic `(m, p)` decoder (`m` odd, `>= 3`),
     /// its exact analytic geometry plan, per-row phase coordinate `(n, 1)`, and
     /// per-row own-presence gate (`n`).
@@ -2369,7 +2380,9 @@ pub fn apply_structure_move_seeded(
                 )
             })?;
             match seed {
-                BirthSeed::ResidualFactor(decoder) => born_atom(term, rho, decoder.view()),
+                BirthSeed::ResidualFactor(birth) => {
+                    born_atom(term, rho, birth.decoder.view(), birth.target.view())
+                }
                 BirthSeed::Circle {
                     geometry,
                     decoder,
@@ -6169,6 +6182,7 @@ fn born_atom(
     term: &SaeManifoldTerm,
     rho: &SaeManifoldRho,
     factor_dir: ArrayView2<'_, f64>,
+    birth_target: ArrayView2<'_, f64>,
 ) -> Result<(SaeManifoldTerm, SaeManifoldRho), String> {
     let k = term.k_atoms();
     if term.atoms.is_empty() {
@@ -6187,15 +6201,22 @@ fn born_atom(
             factor_dir.dim()
         ));
     }
+    let n_obs = term.n_obs();
+    if birth_target.dim() != (n_obs, p) {
+        return Err(format!(
+            "born_atom: residual-factor birth target must be ({n_obs}, {p}); got {:?}",
+            birth_target.dim()
+        ));
+    }
     let mut atoms = term.atoms.clone();
 
-    // The per-row birth target the topology race adjudicates: the residual-factor
-    // direction expressed as a reconstruction image over the template
-    // coordinates. A born atom seeded with `factor_dir` in the template basis
-    // would emit exactly `Y = Φ_template · factor_dir`; racing topologies asks
-    // which geometry parameterizes that image most parsimoniously.
+    // The per-row birth target the topology race adjudicates: the residual's image
+    // along the factor direction (#2822), which varies row by row. The decoder's own
+    // image `Φ_template · factor_dir` carries the direction on the constant basis row,
+    // so it is the same on every row and every candidate interpolates it; racing
+    // topologies asks which geometry parameterizes the residual's image most
+    // parsimoniously.
     let template_coords = term.assignment.coords[0].as_matrix();
-    let birth_target = template.basis_values.dot(&factor_dir); // (n, p)
     // Uniform per-row mass: at birth the routing is neutral (the atom does not yet
     // own any rows), so every row contributes equally to the topology evidence.
     let weights = Array1::<f64>::ones(birth_target.nrows());
@@ -6744,12 +6765,13 @@ pub fn run_structure_search_rounds(
         // test degenerated) is skipped — no fabricated evidence.
 
         // Pre-build the birth-SEED list ONCE per round: the residual-factor
-        // decoders first (indices `0..r`), then — when curl is enabled — the
+        // births first (indices `0..r`), then — when curl is enabled — the
         // race-ready circle seeds appended at `r..`, so the apply-move closure
         // inside the gate is a pure function of the candidate index. The two
         // channels share ONE index space via `StructureMove::Birth`.
-        let residual_decoders = build_birth_decoders(&term, residuals.view(), &harvest_params)?;
-        let mut birth_seeds: Vec<BirthSeed> = residual_decoders
+        let residual_births =
+            build_residual_factor_births(&term, residuals.view(), &harvest_params)?;
+        let mut birth_seeds: Vec<BirthSeed> = residual_births
             .into_iter()
             .map(BirthSeed::ResidualFactor)
             .collect();
@@ -6952,13 +6974,42 @@ pub fn run_structure_search_rounds(
     ))
 }
 
-/// Build the per-round residual-factor decoder list the birth apply-move indexes
-/// into: each factor direction lifted to a `(m, p)` decoder in atom 0's basis.
-fn build_birth_decoders(
+/// The residual image a residual-factor birth races over (#2822): the observed
+/// residual projected onto the factor direction `f`, row by row. Row `i` is
+/// `s_i · f` with `s_i = ⟨R_i, f⟩ / ⟨f, f⟩`, so the image varies exactly as the
+/// residual does along that direction. A decoder on the constant basis row emits
+/// the same direction on every row, a constant image every candidate interpolates.
+pub(crate) fn residual_factor_birth_target(
+    residuals: ArrayView2<'_, f64>,
+    direction: ArrayView1<'_, f64>,
+) -> Result<Array2<f64>, String> {
+    let (n, p) = residuals.dim();
+    if direction.len() != p {
+        return Err(format!(
+            "residual_factor_birth_target: direction must have length {p}; got {}",
+            direction.len()
+        ));
+    }
+    let energy = direction.dot(&direction);
+    if !(energy.is_finite() && energy > 0.0) {
+        return Err(format!(
+            "residual_factor_birth_target: direction energy must be finite and positive; got {energy}"
+        ));
+    }
+    let codes = residuals.dot(&direction);
+    Ok(Array2::from_shape_fn((n, p), |(row, out)| {
+        codes[row] * direction[out] / energy
+    }))
+}
+
+/// Build the per-round residual-factor births the birth apply-move indexes into:
+/// each factor direction lifted to a `(m, p)` decoder in atom 0's basis, paired with
+/// the residual image along that direction the topology race adjudicates.
+fn build_residual_factor_births(
     term: &SaeManifoldTerm,
     residuals: ArrayView2<'_, f64>,
     params: &HarvestParams,
-) -> Result<Vec<Array2<f64>>, String> {
+) -> Result<Vec<ResidualFactorBirth>, String> {
     let n = residuals.nrows();
     let p = residuals.ncols();
     if params.max_births == 0 || n == 0 || p == 0 {
@@ -6979,7 +7030,7 @@ fn build_birth_decoders(
         activity: activity.view(),
         max_factor_rank: max_rank,
     })
-    .map_err(|e| format!("build_birth_decoders: structured-residual fit failed: {e}"))?;
+    .map_err(|e| format!("build_residual_factor_births: structured-residual fit failed: {e}"))?;
     let factor = model.factor();
     let r = factor.ncols();
     let m = term.atoms[0].basis_size();
@@ -6987,15 +7038,23 @@ fn build_birth_decoders(
     // direction on the constant (first) basis row so the born atom emits the
     // residual-factor direction as a flat decoder the refit can then shape. This
     // is the WhitenedStructured residual subspace, not raw-Euclidean Λ.
-    let mut decoders = Vec::with_capacity(r);
+    let mut births = Vec::with_capacity(r);
     for j in 0..r {
         let mut decoder = Array2::<f64>::zeros((m, p));
         for out in 0..p {
             decoder[[0, out]] = factor[[out, j]];
         }
-        decoders.push(decoder);
+        let column = factor.column(j);
+        // A zero-energy column has no residual image; its slot stays so every
+        // candidate index remains the index of its factor column.
+        let target = if column.dot(&column) == 0.0 {
+            Array2::<f64>::zeros((n, p))
+        } else {
+            residual_factor_birth_target(residuals, column)?
+        };
+        births.push(ResidualFactorBirth { decoder, target });
     }
-    Ok(decoders)
+    Ok(births)
 }
 
 // ===========================================================================

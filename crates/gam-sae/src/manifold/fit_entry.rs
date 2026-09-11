@@ -1854,11 +1854,23 @@ fn run_sae_manifold_fit_on_target(request: SaeFitRequest) -> Result<SaeFitOutcom
                     for out in 0..p_out {
                         decoder[[0, out]] = dir[out];
                     }
+                    // The race adjudicates the refit term's residual image along the
+                    // promoted direction (#2822), from the same residual definition
+                    // `sae_structured_residual_model` fits.
+                    let mut residual = z.to_owned();
+                    residual -= &term.try_fitted_target_aware(z.view(), None)?;
+                    let target = structure_harvest::residual_factor_birth_target(
+                        residual.view(),
+                        dir.view(),
+                    )?;
                     let (grown_term, grown_rho) = structure_harvest::apply_structure_move(
                         &term,
                         &rho,
                         &StructureMove::Birth { candidate: 0 },
-                        std::slice::from_ref(&decoder),
+                        std::slice::from_ref(&structure_harvest::ResidualFactorBirth {
+                            decoder,
+                            target,
+                        }),
                     )?;
                     term = grown_term;
                     rho = grown_rho;

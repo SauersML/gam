@@ -1629,24 +1629,46 @@ fn apply_move_restructures_warm() {
     // Since the #977 topology RACE, a born atom no longer carries the raw
     // `factor_dir` coefficients verbatim: its topology is chosen by evidence
     // and its decoder is the winning basis's penalized least-squares fit to the
-    // birth target `Y = Φ_template · factor_dir` (so the raw coefficient
-    // `[[0,0]]` is shrunk by the fit ridge — `0.6999…`, not exactly `0.7`).
-    // The structural invariant the move must preserve is therefore
-    // RECONSTRUCTION PARITY, not coefficient identity: the born atom, evaluated
-    // on its own coordinates with its own (raced) basis, must reproduce the
-    // birth-target image to within the small fit ridge.
+    // birth target, the residual's image along the factor direction. The
+    // structural invariant the move must preserve is therefore RECONSTRUCTION
+    // PARITY, not coefficient identity: the born atom, evaluated on its own
+    // coordinates with its own (raced) basis, must reproduce the birth-target
+    // image to within the small fit ridge.
+    //
+    // #2822: the image varies row by row. A constant image (the decoder's direction
+    // on every row) is interpolated by every candidate and REML abstains on all of
+    // them. Here the residual along output 0 is the first harmonic of the chart plus a
+    // deterministic perturbation above the profiled residual's resolution, so the
+    // race ranks by evidence and the circle wins.
     let p = term.output_dim();
     let m = term.atoms[0].basis_size();
     let mut decoder = Array2::<f64>::zeros((m, p));
     decoder[[0, 0]] = 0.7;
-    let birth_target = term.atoms[0].basis_values.dot(&decoder); // Φ_template · factor_dir
+    let coords = term.assignment.coords[0].as_matrix();
+    let birth_target = Array2::<f64>::from_shape_fn((term.n_obs(), p), |(row, out)| {
+        if out == 0 {
+            let x = (row as f64 + 1.0) * 12.9898 + 78.233;
+            0.7 * (std::f64::consts::TAU * coords[[row, 0]]).cos()
+                + 1.0e-5 * (x.sin() * 43758.5453).sin()
+        } else {
+            0.0
+        }
+    });
     let (born, born_rho) = apply_structure_move(
         &term,
         &rho,
         &StructureMove::Birth { candidate: 0 },
-        &[decoder],
+        &[ResidualFactorBirth {
+            decoder,
+            target: birth_target.clone(),
+        }],
     )
     .unwrap();
+    assert!(
+        matches!(born.atoms[k0].basis_kind(), SaeAtomBasisKind::Periodic),
+        "a first-harmonic birth residual must win the circle topology by evidence; got {:?}",
+        born.atoms[k0].basis_kind()
+    );
     assert_eq!(born.k_atoms(), k0 + 1);
     assert_eq!(born_rho.log_ard.len(), k0 + 1);
     // ρ's per-atom smoothness vector must grow in step with K (the #1556
@@ -1696,16 +1718,31 @@ fn grown_atom_count_assembles_without_lambda_smooth_oob_357() {
         .assemble_arrow_schur_scaled(target.view(), &fissioned_rho, None, 1.0)
         .expect("post-fission assembly must not panic or error on the grown atom set");
 
-    // Birth grows K by one and must assemble too.
+    // Birth grows K by one and must assemble too. The birth target is the residual's
+    // image along output 0, varying row by row (#2822): the first harmonic of the
+    // chart plus a deterministic perturbation above the profiled residual's resolution.
     let p = term.output_dim();
     let m = term.atoms[0].basis_size();
     let mut decoder = Array2::<f64>::zeros((m, p));
     decoder[[0, 0]] = 0.5;
+    let coords = term.assignment.coords[0].as_matrix();
+    let birth_target = Array2::<f64>::from_shape_fn((term.n_obs(), p), |(row, out)| {
+        if out == 0 {
+            let x = (row as f64 + 1.0) * 12.9898 + 78.233;
+            0.5 * (std::f64::consts::TAU * coords[[row, 0]]).cos()
+                + 1.0e-5 * (x.sin() * 43758.5453).sin()
+        } else {
+            0.0
+        }
+    });
     let (born, born_rho) = apply_structure_move(
         &term,
         &rho,
         &StructureMove::Birth { candidate: 0 },
-        &[decoder],
+        &[ResidualFactorBirth {
+            decoder,
+            target: birth_target,
+        }],
     )
     .unwrap();
     assert_eq!(born_rho.log_lambda_smooth.len(), born.k_atoms());

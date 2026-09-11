@@ -859,7 +859,7 @@ struct BirthSeed {
 }
 
 enum BirthSeedKind {
-    ResidualFactor,
+    ResidualFactor(crate::structure_harvest::ResidualFactorBirth),
     Circle(CircleBirthSeed),
 }
 
@@ -883,7 +883,7 @@ struct CircleBirthSeed {
 impl BirthSeed {
     fn circle(&self) -> Option<&CircleBirthSeed> {
         match &self.kind {
-            BirthSeedKind::ResidualFactor => None,
+            BirthSeedKind::ResidualFactor(_) => None,
             BirthSeedKind::Circle(circle) => Some(circle),
         }
     }
@@ -1001,10 +1001,19 @@ fn top_factor_birth_decoder(
     // Genuine rank-1 shared factor: keep the historical row-0 (DC) seed + topology
     // race. (A degenerate 2-plane circle in this residual was already caught and
     // returned as a rank-2 circle seed by the #2109 mirror at the top of this fn.)
+    // The race adjudicates the residual's own image along that factor (#2822).
+    let target = crate::structure_harvest::residual_factor_birth_target(
+        residual,
+        factor.column(chosen),
+    )
+    .ok()?;
     Some(BirthSeed {
-        decoder,
+        decoder: decoder.clone(),
         energy,
-        kind: BirthSeedKind::ResidualFactor,
+        kind: BirthSeedKind::ResidualFactor(crate::structure_harvest::ResidualFactorBirth {
+            decoder,
+            target,
+        }),
     })
 }
 
@@ -1150,10 +1159,19 @@ fn residual_principal_birth_candidate(
     for j in 0..p {
         decoder[[0, j]] = amp * parts.evecs[[j, best]];
     }
+    // The race adjudicates the residual's own image along the seed direction (#2822).
+    let target = crate::structure_harvest::residual_factor_birth_target(
+        residual,
+        parts.evecs.column(best),
+    )
+    .ok()?;
     Some(BirthSeed {
-        decoder,
+        decoder: decoder.clone(),
         energy,
-        kind: BirthSeedKind::ResidualFactor,
+        kind: BirthSeedKind::ResidualFactor(crate::structure_harvest::ResidualFactorBirth {
+            decoder,
+            target,
+        }),
     })
 }
 
@@ -1574,11 +1592,11 @@ pub fn fit_stagewise(
                 circle.coords.clone(),
                 circle.gate.clone(),
             ),
-            BirthSeedKind::ResidualFactor => apply_structure_move(
+            BirthSeedKind::ResidualFactor(birth) => apply_structure_move(
                 &term,
                 &rho,
                 &StructureMove::Birth { candidate: 0 },
-                std::slice::from_ref(&seed.decoder),
+                std::slice::from_ref(birth),
             ),
         };
         let cand_a = born_move.and_then(|(mut cand_term, mut cand_rho)| {
@@ -2254,11 +2272,11 @@ fn race_birth_seed(
             circle.coords.clone(),
             circle.gate.clone(),
         ),
-        BirthSeedKind::ResidualFactor => apply_structure_move(
+        BirthSeedKind::ResidualFactor(birth) => apply_structure_move(
             term,
             rho,
             &StructureMove::Birth { candidate: 0 },
-            std::slice::from_ref(&seed.decoder),
+            std::slice::from_ref(birth),
         ),
     };
     let (mut cand_term, mut cand_rho) = born_move?;
@@ -2281,7 +2299,7 @@ fn race_birth_seed(
         BirthSeedKind::Circle(circle) => {
             (0..n).filter(|&row| circle.gate[row].is_finite()).collect()
         }
-        BirthSeedKind::ResidualFactor => (0..n).collect(),
+        BirthSeedKind::ResidualFactor(_) => (0..n).collect(),
     };
     // Output-dim support: the columns the born decoder actually writes. A circle in
     // an orthogonal ambient plane occupies only its 2 (cos/sin) output dims, so a
