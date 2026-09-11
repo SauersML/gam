@@ -6655,7 +6655,9 @@ extern "C" __global__ void arrow_sae_frame_diag_sub(
         if rhs_norm == 0.0 {
             return Ok((Array1::<f64>::zeros(k), ArrowPcgDiagnostics::default()));
         }
-        let tol = (relative_tolerance.max(0.0) * rhs_norm).max(1e-12);
+        // A residual below the attainable band `γ_k·‖rhs‖` of a `k`-term recurrence is
+        // not resolvable, so the requested relative tolerance is raised to it.
+        let tol = relative_tolerance.max(gam_linalg::roundoff::accumulation_growth(k)) * rhs_norm;
         let rhs_dev = stream
             .clone_htod(
                 rhs_beta
@@ -7104,7 +7106,9 @@ extern "C" __global__ void arrow_sae_frame_diag_sub(
         if rhs_norm == 0.0 {
             return Ok((Array1::<f64>::zeros(k), ArrowPcgDiagnostics::default()));
         }
-        let tol = (relative_tolerance.max(0.0) * rhs_norm).max(1e-12);
+        // A residual below the attainable band `γ_k·‖rhs‖` of a `k`-term recurrence is
+        // not resolvable, so the requested relative tolerance is raised to it.
+        let tol = relative_tolerance.max(gam_linalg::roundoff::accumulation_growth(k)) * rhs_norm;
         let rhs_dev = stream
             .clone_htod(
                 rhs_beta
@@ -7282,7 +7286,9 @@ extern "C" __global__ void arrow_sae_frame_diag_sub(
         if rhs_norm == 0.0 {
             return Ok((Array1::<f64>::zeros(k), ArrowPcgDiagnostics::default()));
         }
-        let tol = (relative_tolerance.max(0.0) * rhs_norm).max(1e-12);
+        // A residual below the attainable band `γ_k·‖rhs‖` of a `k`-term recurrence is
+        // not resolvable, so the requested relative tolerance is raised to it.
+        let tol = relative_tolerance.max(gam_linalg::roundoff::accumulation_growth(k)) * rhs_norm;
 
         // Device-resident PCG state. Only convergence scalars cross back during
         // the loop; x/r/z/p/Sp stay on CUDA until the final solution download.
@@ -7928,7 +7934,9 @@ mod tests {
         if rhs_norm == 0.0 {
             return Array1::<f64>::zeros(k);
         }
-        let tol = (relative_tolerance.max(0.0) * rhs_norm).max(1e-12);
+        // A residual below the attainable band `γ_k·‖rhs‖` of a `k`-term recurrence is
+        // not resolvable, so the requested relative tolerance is raised to it.
+        let tol = relative_tolerance.max(gam_linalg::roundoff::accumulation_growth(k)) * rhs_norm;
         let inv_diag: Vec<f64> = (0..k).map(|idx| 1.0 / s[[idx, idx]]).collect();
         let mut x = Array1::<f64>::zeros(k);
         let mut r = rhs.clone();
