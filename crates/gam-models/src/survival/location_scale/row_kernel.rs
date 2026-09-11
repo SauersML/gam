@@ -44,6 +44,20 @@ pub(crate) struct SurvivalExactRowKernel {
     pub(crate) d4_log_g: f64,
 }
 
+/// The fifth derivative of each residual-distribution stack the row kernel
+/// carries through the fourth, at the same indices and under the same
+/// derivative log-rescale: `−(log S)⁽⁵⁾` at the entry and exit indices, the
+/// log-density's fifth derivative at the exit index, and the guarded `log g`'s
+/// fifth derivative. Only the fifth-order row program reads them, so no
+/// lower-order path evaluates them (#2677).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct SlsFifthEntries {
+    pub(crate) ddddr0: f64,
+    pub(crate) ddddr1: f64,
+    pub(crate) d5logphi1: f64,
+    pub(crate) d5_log_g: f64,
+}
+
 /// Render a shared barrier-step refusal into the location-scale error
 /// vocabulary, preserving the distinction the shared rule draws: a width
 /// disagreement is a dimension fault, everything else is a statement about the
@@ -459,6 +473,41 @@ impl SurvivalLsRowKernel<'_> {
             .exact_row_kernel_rescaled(row, state, self.deriv_log_scale)?;
         Ok(kernel.map(|k| (p, k)))
     }
+
+    /// [`Self::row_nll_inputs_opt`] with each residual-distribution stack's
+    /// fifth derivative at the same predictor state. A link without a
+    /// closed-form fifth stack is an error: the family declares the fifth-order
+    /// channel unavailable for it, so no consumer reaches here.
+    fn row_nll_fifth_inputs_opt(
+        &self,
+        row: usize,
+    ) -> Result<Option<([f64; SLS_ROW_K], SurvivalExactRowKernel, SlsFifthEntries)>, String> {
+        let p = self.row_primary_values(row);
+        let state = self.family.row_predictor_state(
+            self.dynamic.h_entry[row],
+            self.dynamic.h_exit[row],
+            self.dynamic.hdot_exit[row],
+            self.dynamic.q_entry[row],
+            self.dynamic.q_exit[row],
+            self.dynamic.qdot_exit[row],
+        );
+        let fifth = SurvivalLocationScaleFamily::exact_row_kernel_fifth_from_parts(
+            &self.family.inverse_link,
+            self.family.derivative_guard,
+            &state,
+            self.deriv_log_scale,
+        )
+        .ok_or_else(|| {
+            format!(
+                "survival location-scale row {row}: the inverse link has no closed-form \
+                 fifth derivative stack"
+            )
+        })?;
+        let kernel = self
+            .family
+            .exact_row_kernel_rescaled(row, state, self.deriv_log_scale)?;
+        Ok(kernel.map(|k| (p, k, fifth)))
+    }
 }
 
 /// The survival location-scale row negative log-likelihood, written ONCE over a
@@ -544,7 +593,7 @@ impl SlsOuterPlan<5> {
 #[inline(always)]
 fn add_scaled_stack<const ORDER: usize>(
     target: &mut [f64; ORDER],
-    stack: [f64; 5],
+    stack: [f64; 6],
     scale: f64,
 ) {
     for i in 0..ORDER {
@@ -560,6 +609,28 @@ fn sls_outer_plan<const ORDER: usize>(
     kernel: &SurvivalExactRowKernel,
 ) -> SlsOuterPlan<ORDER> {
     assert!(ORDER <= 5);
+    // Through the fourth derivative no stack's sixth entry is read, so the
+    // accumulation is the fifth-order one with nothing in that entry.
+    sls_outer_plan_with_fifth(
+        kernel,
+        &SlsFifthEntries {
+            ddddr0: 0.0,
+            ddddr1: 0.0,
+            d5logphi1: 0.0,
+            d5_log_g: 0.0,
+        },
+    )
+}
+
+/// [`sls_outer_plan`] through the fifth derivative: the same accumulation in
+/// the same order, each stack's sixth entry read from `fifth`. The fifth-order
+/// row program is its only consumer.
+#[inline(always)]
+fn sls_outer_plan_with_fifth<const ORDER: usize>(
+    kernel: &SurvivalExactRowKernel,
+    fifth: &SlsFifthEntries,
+) -> SlsOuterPlan<ORDER> {
+    assert!(ORDER <= 6);
     let mut u0 = [0.0; ORDER];
     add_scaled_stack(
         &mut u0,
@@ -569,6 +640,7 @@ fn sls_outer_plan<const ORDER: usize>(
             -kernel.dr0,
             -kernel.ddr0,
             -kernel.dddr0,
+            -fifth.ddddr0,
         ],
         kernel.w,
     );
@@ -585,6 +657,7 @@ fn sls_outer_plan<const ORDER: usize>(
                 -kernel.dr1,
                 -kernel.ddr1,
                 -kernel.dddr1,
+                -fifth.ddddr1,
             ],
             -censored_weight,
         );
@@ -598,6 +671,7 @@ fn sls_outer_plan<const ORDER: usize>(
                 kernel.d2logphi1,
                 kernel.d3logphi1,
                 kernel.d4logphi1,
+                fifth.d5logphi1,
             ],
             -event_weight,
         );
@@ -612,6 +686,7 @@ fn sls_outer_plan<const ORDER: usize>(
                 kernel.d2_log_g,
                 kernel.d3_log_g,
                 kernel.d4_log_g,
+                fifth.d5_log_g,
             ],
             -event_weight,
         );
@@ -661,6 +736,12 @@ fn sls_program_exp_stack(value: f64) -> [f64; 5] {
     [exp; 5]
 }
 
+#[inline(always)]
+fn sls_program_exp_stack_fifth(value: f64) -> [f64; 6] {
+    let exp = value.exp();
+    [exp; 6]
+}
+
 row_program! {
     fn sls_row_program(
         h0,
@@ -677,24 +758,29 @@ row_program! {
         u0_second,
         u0_third,
         u0_fourth,
+        u0_fifth,
         u1_value,
         u1_first,
         u1_second,
         u1_third,
         u1_fourth,
+        u1_fifth,
         g_value,
         g_first,
         g_second,
         g_third,
-        g_fourth
+        g_fourth,
+        g_fifth
     )
-    emit [generic, order2, third, fourth];
+    emit [generic, order2, third, fourth, fifth_contracted];
     leaves {
-        exponential => sls_program_exp_stack => sls_program_exp_stack_cuda,
+        exponential => sls_program_exp_stack => sls_program_exp_stack_cuda => sls_program_exp_stack_fifth,
         // Each residual-distribution stack (`logS`, `logφ`, `log g`) is
         // supplied: the kernel builder evaluated it at the point the program
         // recomputes from the same parameters (`u0 = h0 + q0`, likewise `u1`,
-        // `g`), and an inactive slot never reaches the compose.
+        // `g`), and an inactive slot never reaches the compose. The sixth
+        // entry is read only by the fifth-order surface; every lower order
+        // is called with it zero (#2677).
         outer => supplied,
     }
     witnesses [];
@@ -710,7 +796,7 @@ row_program! {
         let g = add(hdot, mul(inv_sigma_exit, event_inner));
 
         let mut nll = zero();
-        if (u0_value != 0.0 || u0_first != 0.0 || u0_second != 0.0 || u0_third != 0.0 || u0_fourth != 0.0) {
+        if (u0_value != 0.0 || u0_first != 0.0 || u0_second != 0.0 || u0_third != 0.0 || u0_fourth != 0.0 || u0_fifth != 0.0) {
             nll = compose(
                 outer,
                 u0,
@@ -718,10 +804,11 @@ row_program! {
                 u0_first,
                 u0_second,
                 u0_third,
-                u0_fourth
+                u0_fourth,
+                u0_fifth
             );
         }
-        if (u1_value != 0.0 || u1_first != 0.0 || u1_second != 0.0 || u1_third != 0.0 || u1_fourth != 0.0) {
+        if (u1_value != 0.0 || u1_first != 0.0 || u1_second != 0.0 || u1_third != 0.0 || u1_fourth != 0.0 || u1_fifth != 0.0) {
             nll = add(
                 nll,
                 compose(
@@ -731,11 +818,12 @@ row_program! {
                     u1_first,
                     u1_second,
                     u1_third,
-                    u1_fourth
+                    u1_fourth,
+                    u1_fifth
                 )
             );
         }
-        if (g_value != 0.0 || g_first != 0.0 || g_second != 0.0 || g_third != 0.0 || g_fourth != 0.0) {
+        if (g_value != 0.0 || g_first != 0.0 || g_second != 0.0 || g_third != 0.0 || g_fourth != 0.0 || g_fifth != 0.0) {
             nll = add(
                 nll,
                 compose(
@@ -745,7 +833,8 @@ row_program! {
                     g_first,
                     g_second,
                     g_third,
-                    g_fourth
+                    g_fourth,
+                    g_fifth
                 )
             );
         }
@@ -775,8 +864,8 @@ pub(crate) fn sls_row_nll<S: JetScalar<SLS_ROW_K>>(
     let (u1, g) = sls_program_stacks(&plan);
     let (nll, []) = sls_row_program(
         &vars[0], &vars[1], &vars[2], &vars[3], &vars[4], &vars[5], &vars[6], &vars[7], &vars[8],
-        plan.u0[0], plan.u0[1], plan.u0[2], plan.u0[3], plan.u0[4], u1[0],
-        u1[1], u1[2], u1[3], u1[4], g[0], g[1], g[2], g[3], g[4],
+        plan.u0[0], plan.u0[1], plan.u0[2], plan.u0[3], plan.u0[4], 0.0, u1[0],
+        u1[1], u1[2], u1[3], u1[4], 0.0, g[0], g[1], g[2], g[3], g[4], 0.0,
     );
     Ok(nll)
 }
@@ -790,8 +879,8 @@ fn sls_row_vgh_generated(
     let (u1, g) = sls_program_stacks(&plan);
     let (value, gradient, hessian, []) = sls_row_program_order2(
         primary[0], primary[1], primary[2], primary[3], primary[4], primary[5], primary[6],
-        primary[7], primary[8], plan.u0[0], plan.u0[1], plan.u0[2], 0.0, 0.0,
-        u1[0], u1[1], u1[2], 0.0, 0.0, g[0], g[1], g[2], 0.0, 0.0,
+        primary[7], primary[8], plan.u0[0], plan.u0[1], plan.u0[2], 0.0, 0.0, 0.0,
+        u1[0], u1[1], u1[2], 0.0, 0.0, 0.0, g[0], g[1], g[2], 0.0, 0.0, 0.0,
     );
     (value, gradient, hessian)
 }
@@ -807,8 +896,8 @@ fn sls_row_third_generated(
     sls_row_program_third_contracted(
         primary[0], primary[1], primary[2], primary[3], primary[4], primary[5], primary[6],
         primary[7], primary[8], plan.u0[0], plan.u0[1], plan.u0[2], plan.u0[3],
-        plan.u0[4], u1[0], u1[1], u1[2], u1[3], u1[4], g[0], g[1], g[2], g[3],
-        g[4], direction,
+        plan.u0[4], 0.0, u1[0], u1[1], u1[2], u1[3], u1[4], 0.0, g[0], g[1], g[2], g[3],
+        g[4], 0.0, direction,
     )
 }
 
@@ -836,18 +925,69 @@ fn sls_row_fourth_generated(
         plan.u0[2],
         plan.u0[3],
         plan.u0[4],
+        0.0,
         u1[0],
         u1[1],
         u1[2],
         u1[3],
         u1[4],
+        0.0,
         g[0],
         g[1],
         g[2],
         g[3],
         g[4],
+        0.0,
         direction_u,
         direction_v,
+    )
+}
+
+/// `Σ_{cde} ℓ_{abcde} u_c v_d w_e`: the fifth-order lowering of the same
+/// canonical [`sls_row_program`], reading each residual-distribution stack
+/// through its fifth derivative (#2677).
+#[inline(always)]
+fn sls_row_fifth_generated(
+    primary: &[f64; SLS_ROW_K],
+    kernel: &SurvivalExactRowKernel,
+    fifth: &SlsFifthEntries,
+    direction_u: &[f64; SLS_ROW_K],
+    direction_v: &[f64; SLS_ROW_K],
+    direction_w: &[f64; SLS_ROW_K],
+) -> [[f64; SLS_ROW_K]; SLS_ROW_K] {
+    let plan = sls_outer_plan_with_fifth::<6>(kernel, fifth);
+    let (u1, g) = sls_program_stacks(&plan);
+    sls_row_program_fifth_contracted(
+        primary[0],
+        primary[1],
+        primary[2],
+        primary[3],
+        primary[4],
+        primary[5],
+        primary[6],
+        primary[7],
+        primary[8],
+        plan.u0[0],
+        plan.u0[1],
+        plan.u0[2],
+        plan.u0[3],
+        plan.u0[4],
+        plan.u0[5],
+        u1[0],
+        u1[1],
+        u1[2],
+        u1[3],
+        u1[4],
+        u1[5],
+        g[0],
+        g[1],
+        g[2],
+        g[3],
+        g[4],
+        g[5],
+        direction_u,
+        direction_v,
+        direction_w,
     )
 }
 
@@ -2300,6 +2440,29 @@ impl crate::row_kernel::RowKernel<SLS_ROW_K> for SurvivalLsRowKernel<'_> {
                 direction_v,
             )),
             None => Ok([[0.0; SLS_ROW_K]; SLS_ROW_K]),
+        }
+    }
+
+    fn row_fifth_contracted_all_axes(
+        &self,
+        row: usize,
+        direction_u: &[f64; SLS_ROW_K],
+        direction_v: &[f64; SLS_ROW_K],
+    ) -> Result<[[[f64; SLS_ROW_K]; SLS_ROW_K]; SLS_ROW_K], String> {
+        match self.row_nll_fifth_inputs_opt(row)? {
+            Some((primary, kernel, fifth)) => Ok(std::array::from_fn(|axis| {
+                let mut direction_w = [0.0; SLS_ROW_K];
+                direction_w[axis] = 1.0;
+                sls_row_fifth_generated(
+                    &primary,
+                    &kernel,
+                    &fifth,
+                    direction_u,
+                    direction_v,
+                    &direction_w,
+                )
+            })),
+            None => Ok([[[0.0; SLS_ROW_K]; SLS_ROW_K]; SLS_ROW_K]),
         }
     }
 
@@ -4675,6 +4838,97 @@ impl SurvivalLocationScaleFamily {
         }
     }
 
+    /// Whether every residual-distribution stack of this link has the closed
+    /// form [`Self::exact_row_kernel_fifth_from_parts`] extends through the
+    /// fifth derivative. The links served by the generic pdf-jet dispatch have
+    /// no certified fifth pdf derivative.
+    pub(crate) fn inverse_link_has_fifth_derivative_stacks(inverse_link: &InverseLink) -> bool {
+        matches!(
+            inverse_link,
+            InverseLink::Standard(
+                StandardLink::Probit
+                    | StandardLink::Logit
+                    | StandardLink::CLogLog
+                    | StandardLink::Identity
+            )
+        )
+    }
+
+    /// The fifth derivative of each residual-distribution stack at the indices
+    /// [`Self::exact_row_kernel_from_parts`] evaluates through the fourth, under
+    /// the same derivative log-rescale: `−(log S)⁽⁵⁾` at `u0` and `u1`, the
+    /// log-density's fifth derivative at `u1`, and the fifth derivative of the
+    /// guarded `log g`. `None` for a link without closed-form fifth stacks.
+    ///
+    /// Per link, continuing each fourth-order tower one step:
+    /// probit `ddddr = d⁵ log Φ(−u)`, `(log φ)⁽⁵⁾ = 0`; logit
+    /// `ddddr = w(1 − 2μ)(1 − 12w)`, `(log φ)⁽⁵⁾ = −2w(1 − 2μ)(1 − 12w)`;
+    /// cloglog `ddddr = e^{u − L}`, `(log f)⁽⁵⁾ = −e^{u − L}`; identity
+    /// `ddddr = 24/(1 − u)⁵`, `(log φ)⁽⁵⁾ = 0`. The guarded `log g` continues
+    /// `ln` above the guard (`24/g⁵`) and a quartic below it (`0`).
+    pub(crate) fn exact_row_kernel_fifth_from_parts(
+        inverse_link: &InverseLink,
+        derivative_guard: f64,
+        state: &SurvivalPredictorState,
+        deriv_log_scale: f64,
+    ) -> Option<SlsFifthEntries> {
+        let u0 = state.h0 + state.q0;
+        let u1 = state.h1 + state.q1;
+        let (ddddr0, ddddr1, d5logphi1) = match inverse_link {
+            InverseLink::Standard(StandardLink::Probit) => (
+                gam_math::probability::normal_logcdf_derivatives_through_fifth(-u0)[5],
+                gam_math::probability::normal_logcdf_derivatives_through_fifth(-u1)[5],
+                0.0,
+            ),
+            InverseLink::Standard(StandardLink::Logit) => {
+                let fifth = |eta: f64| {
+                    let mu = gam_solve::mixture_link::component_inverse_link_jet(
+                        gam_problem::LinkComponent::Logit,
+                        eta,
+                    )
+                    .mu;
+                    let w = mu * (1.0 - mu);
+                    w * (1.0 - 2.0 * mu) * (1.0 - 12.0 * w)
+                };
+                let exit = fifth(u1);
+                (fifth(u0), exit, -2.0 * exit)
+            }
+            InverseLink::Standard(StandardLink::CLogLog) => {
+                let exit = (u1 - deriv_log_scale).exp();
+                ((u0 - deriv_log_scale).exp(), exit, -exit)
+            }
+            InverseLink::Standard(StandardLink::Identity) => {
+                let fifth = |eta: f64| {
+                    let inv = (1.0 - eta).recip();
+                    24.0 * inv.powi(5)
+                };
+                (fifth(u0), fifth(u1), 0.0)
+            }
+            _ => return None,
+        };
+        // The same infinite-rate clamp the fourth-order builder applies before
+        // its guarded logarithm.
+        let g = if state.g == f64::INFINITY {
+            f64::MAX
+        } else if state.g == f64::NEG_INFINITY {
+            f64::MIN
+        } else {
+            state.g
+        };
+        let d5_log_g = if g >= derivative_guard {
+            let inv = g.recip();
+            24.0 * inv * inv * inv * inv * inv
+        } else {
+            0.0
+        };
+        Some(SlsFifthEntries {
+            ddddr0,
+            ddddr1,
+            d5logphi1,
+            d5_log_g,
+        })
+    }
+
     fn exact_row_kernel_from_parts(
         inverse_link: &InverseLink,
         derivative_guard: f64,
@@ -4933,6 +5187,123 @@ pub(crate) fn q_chain_derivs_scalar(eta_t: f64, eta_ls: f64) -> (f64, f64, f64, 
     let inv_sigma = exp_sigma_inverse_from_eta_scalar(eta_ls);
     let q = -safe_product(eta_t, inv_sigma);
     (-inv_sigma, -q, inv_sigma, q, -inv_sigma, -q)
+}
+
+#[cfg(test)]
+mod fifth_order_lowering_tests {
+    use super::*;
+
+    // `log S(u) = −e^{A u}`, `log φ(u) = −e^{B u} − C u²`, `log g`: every stack
+    // is closed-form at any index, so a kernel rebuilt at a moved primary point
+    // is exact and a difference of the fourth order isolates the fifth.
+    const A: f64 = 0.7;
+    const B: f64 = 0.4;
+    const C: f64 = 0.15;
+    const W: f64 = 1.27;
+
+    fn kernel_at(point: &[f64; SLS_ROW_K], d: f64) -> (SurvivalExactRowKernel, SlsFifthEntries) {
+        let [h0, h1, hdot, eta_t_exit, eta_t_entry, eta_t_deriv, eta_ls_exit, eta_ls_entry, eta_ls_deriv] =
+            *point;
+        let u0 = h0 - eta_t_entry * (-eta_ls_entry).exp();
+        let inv_sigma_exit = (-eta_ls_exit).exp();
+        let u1 = h1 - eta_t_exit * inv_sigma_exit;
+        let g = hdot + inv_sigma_exit * (eta_t_exit * eta_ls_deriv - eta_t_deriv);
+        let entry = (A * u0).exp();
+        let exit = (A * u1).exp();
+        let density = (B * u1).exp();
+        let inv_g = g.recip();
+        let kernel = SurvivalExactRowKernel {
+            w: W,
+            d,
+            log_s0: -entry,
+            r0: A * entry,
+            dr0: A.powi(2) * entry,
+            ddr0: A.powi(3) * entry,
+            dddr0: A.powi(4) * entry,
+            log_s1: -exit,
+            r1: A * exit,
+            dr1: A.powi(2) * exit,
+            ddr1: A.powi(3) * exit,
+            dddr1: A.powi(4) * exit,
+            logphi1: -density - C * u1 * u1,
+            dlogphi1: -B * density - 2.0 * C * u1,
+            d2logphi1: -B.powi(2) * density - 2.0 * C,
+            d3logphi1: -B.powi(3) * density,
+            d4logphi1: -B.powi(4) * density,
+            log_pdf1_minus_log_s0: -density - C * u1 * u1 + entry,
+            log_s1_minus_log_s0: -exit + entry,
+            log_g: g.ln(),
+            d_log_g: inv_g,
+            d2_log_g: -inv_g.powi(2),
+            d3_log_g: 2.0 * inv_g.powi(3),
+            d4_log_g: -6.0 * inv_g.powi(4),
+        };
+        let fifth = SlsFifthEntries {
+            ddddr0: A.powi(5) * entry,
+            ddddr1: A.powi(5) * exit,
+            d5logphi1: -B.powi(5) * density,
+            d5_log_g: 24.0 * inv_g.powi(5),
+        };
+        (kernel, fifth)
+    }
+
+    /// #2677: the generated fifth order is the directional derivative of the
+    /// generated fourth. Along `w`, a five-point difference of
+    /// `Σ ℓ_abcd u_c v_d` with the kernel rebuilt at each moved point reproduces
+    /// `Σ ℓ_abcde u_c v_d w_e` on censored, event and fractional rows, and the
+    /// lowering is symmetric in its three directions.
+    #[test]
+    fn sls_generated_fifth_is_the_directional_derivative_of_the_fourth_2677() {
+        let point: [f64; SLS_ROW_K] = [-0.37, 0.41, 1.31, 0.23, -0.18, 0.12, 0.09, -0.06, 0.07];
+        let dir_u: [f64; SLS_ROW_K] = [0.7, -1.3, 0.4, 0.6, -0.5, 0.9, -0.2, 0.3, -0.8];
+        let dir_v: [f64; SLS_ROW_K] = [-0.4, 0.6, 1.1, -0.2, 0.8, -0.7, 0.5, -0.9, 0.1];
+        let dir_w: [f64; SLS_ROW_K] = [0.3, 0.5, -0.6, -0.9, 0.2, 0.4, 0.8, -0.5, -0.3];
+        for d in [0.0, 1.0, 0.37] {
+            let (kernel, fifth) = kernel_at(&point, d);
+            let exact = sls_row_fifth_generated(&point, &kernel, &fifth, &dir_u, &dir_v, &dir_w);
+            let fourth_at = |t: f64| {
+                let moved: [f64; SLS_ROW_K] =
+                    std::array::from_fn(|axis| point[axis] + t * dir_w[axis]);
+                let (moved_kernel, _) = kernel_at(&moved, d);
+                sls_row_fourth_generated(&moved, &moved_kernel, &dir_u, &dir_v)
+            };
+            let h = 1.0e-3;
+            let (plus2, plus, minus, minus2) =
+                (fourth_at(2.0 * h), fourth_at(h), fourth_at(-h), fourth_at(-2.0 * h));
+            let mut largest = 0.0_f64;
+            for a in 0..SLS_ROW_K {
+                for b in 0..SLS_ROW_K {
+                    let difference = (-plus2[a][b] + 8.0 * plus[a][b] - 8.0 * minus[a][b]
+                        + minus2[a][b])
+                        / (12.0 * h);
+                    largest = largest.max(exact[a][b].abs());
+                    let band = 1.0e-6 * exact[a][b].abs().max(difference.abs()).max(1.0);
+                    assert!(
+                        (exact[a][b] - difference).abs() <= band,
+                        "d={d} fifth[{a}][{b}]: generated {:+.15e}, difference {difference:+.15e}",
+                        exact[a][b],
+                    );
+                }
+            }
+            assert!(
+                largest > 1.0e-2,
+                "d={d}: the fifth contraction is too small ({largest:.3e}) for the agreement \
+                 to say anything"
+            );
+            let rotated = sls_row_fifth_generated(&point, &kernel, &fifth, &dir_w, &dir_u, &dir_v);
+            for a in 0..SLS_ROW_K {
+                for b in 0..SLS_ROW_K {
+                    let band = 1.0e-11 * exact[a][b].abs().max(1.0);
+                    assert!(
+                        (exact[a][b] - rotated[a][b]).abs() <= band,
+                        "d={d} fifth[{a}][{b}] depends on the direction order: {:+.15e} vs {:+.15e}",
+                        exact[a][b],
+                        rotated[a][b],
+                    );
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]

@@ -120,6 +120,7 @@ struct EmissionSurfaces {
     third: bool,
     fourth: bool,
     fifth: bool,
+    fifth_contracted: bool,
     full: bool,
     witnesses: bool,
     cuda: bool,
@@ -134,13 +135,14 @@ impl EmissionSurfaces {
             "third" => &mut self.third,
             "fourth" => &mut self.fourth,
             "fifth" => &mut self.fifth,
+            "fifth_contracted" => &mut self.fifth_contracted,
             "full" => &mut self.full,
             "witnesses" => &mut self.witnesses,
             "cuda" => &mut self.cuda,
             _ => {
                 return Err(syn::Error::new_spanned(
                     surface,
-                    "row_program emission surface must be one of `generic`, `runtime`, `order2`, `third`, `fourth`, `fifth`, `full`, `witnesses`, or `cuda`",
+                    "row_program emission surface must be one of `generic`, `runtime`, `order2`, `third`, `fourth`, `fifth`, `fifth_contracted`, `full`, `witnesses`, or `cuda`",
                 ));
             }
         };
@@ -161,6 +163,7 @@ impl EmissionSurfaces {
             || self.third
             || self.fourth
             || self.fifth
+            || self.fifth_contracted
             || self.full
             || self.witnesses
             || self.cuda)
@@ -1473,12 +1476,41 @@ fn symbolic_expression(
     }
 }
 
+/// The contracted derivative order a directional lowering carries. Each
+/// order adds one nilpotent seed to the second-order symbolic jet: `u` for
+/// the third derivative, `v` (with `uv`) for the fourth, and `w` (with `uw`,
+/// `vw`, `uvw`) for the fifth, whose `uvw` channel's Hessian is
+/// `Σ ℓ_abcde u_c v_d w_e`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DirectionalOrder {
+    Third,
+    Fourth,
+    Fifth,
+}
+
+impl DirectionalOrder {
+    /// Whether the second seed `v` and its product `uv` are carried.
+    fn carries_v(self) -> bool {
+        matches!(self, Self::Fourth | Self::Fifth)
+    }
+
+    /// Whether the third seed `w` and its products `uw`, `vw`, `uvw` are
+    /// carried.
+    fn carries_w(self) -> bool {
+        matches!(self, Self::Fifth)
+    }
+}
+
 #[derive(Clone)]
 struct DirectionalJet {
     base: SymbolicJet,
     u: SymbolicJet,
     v: SymbolicJet,
     uv: SymbolicJet,
+    w: SymbolicJet,
+    uw: SymbolicJet,
+    vw: SymbolicJet,
+    uvw: SymbolicJet,
 }
 
 #[derive(Clone)]
@@ -1487,6 +1519,10 @@ struct DirectionalSupport {
     u: SymbolicSupport,
     v: SymbolicSupport,
     uv: SymbolicSupport,
+    w: SymbolicSupport,
+    uw: SymbolicSupport,
+    vw: SymbolicSupport,
+    uvw: SymbolicSupport,
 }
 
 impl DirectionalSupport {
@@ -1496,6 +1532,10 @@ impl DirectionalSupport {
             u: SymbolicSupport::empty(dimension),
             v: SymbolicSupport::empty(dimension),
             uv: SymbolicSupport::empty(dimension),
+            w: SymbolicSupport::empty(dimension),
+            uw: SymbolicSupport::empty(dimension),
+            vw: SymbolicSupport::empty(dimension),
+            uvw: SymbolicSupport::empty(dimension),
         }
     }
 
@@ -1504,6 +1544,10 @@ impl DirectionalSupport {
         self.u.include(&jet.u);
         self.v.include(&jet.v);
         self.uv.include(&jet.uv);
+        self.w.include(&jet.w);
+        self.uw.include(&jet.uw);
+        self.vw.include(&jet.vw);
+        self.uvw.include(&jet.uvw);
     }
 }
 
@@ -1514,19 +1558,31 @@ impl DirectionalJet {
             u: SymbolicJet::zero(dimension),
             v: SymbolicJet::zero(dimension),
             uv: SymbolicJet::zero(dimension),
+            w: SymbolicJet::zero(dimension),
+            uw: SymbolicJet::zero(dimension),
+            vw: SymbolicJet::zero(dimension),
+            uvw: SymbolicJet::zero(dimension),
         }
     }
 
-    fn primary(name: &str, axis: usize, dimension: usize, fourth: bool) -> Self {
+    fn primary(name: &str, axis: usize, dimension: usize, order: DirectionalOrder) -> Self {
         Self {
             base: SymbolicJet::primary(name, axis, dimension),
             u: SymbolicJet::constant(format!("direction_u[{axis}]"), dimension),
-            v: if fourth {
+            v: if order.carries_v() {
                 SymbolicJet::constant(format!("direction_v[{axis}]"), dimension)
             } else {
                 SymbolicJet::zero(dimension)
             },
             uv: SymbolicJet::zero(dimension),
+            w: if order.carries_w() {
+                SymbolicJet::constant(format!("direction_w[{axis}]"), dimension)
+            } else {
+                SymbolicJet::zero(dimension)
+            },
+            uw: SymbolicJet::zero(dimension),
+            vw: SymbolicJet::zero(dimension),
+            uvw: SymbolicJet::zero(dimension),
         }
     }
 
@@ -1543,6 +1599,10 @@ fn directional_add(left: DirectionalJet, right: DirectionalJet) -> DirectionalJe
         u: symbolic_add_jets(left.u, right.u),
         v: symbolic_add_jets(left.v, right.v),
         uv: symbolic_add_jets(left.uv, right.uv),
+        w: symbolic_add_jets(left.w, right.w),
+        uw: symbolic_add_jets(left.uw, right.uw),
+        vw: symbolic_add_jets(left.vw, right.vw),
+        uvw: symbolic_add_jets(left.uvw, right.uvw),
     }
 }
 
@@ -1552,6 +1612,10 @@ fn directional_negate(value: DirectionalJet) -> DirectionalJet {
         u: symbolic_negate_jet(value.u),
         v: symbolic_negate_jet(value.v),
         uv: symbolic_negate_jet(value.uv),
+        w: symbolic_negate_jet(value.w),
+        uw: symbolic_negate_jet(value.uw),
+        vw: symbolic_negate_jet(value.vw),
+        uvw: symbolic_negate_jet(value.uvw),
     }
 }
 
@@ -1561,25 +1625,31 @@ fn directional_scale(value: DirectionalJet, scalar: &str) -> DirectionalJet {
         u: symbolic_scale_jet(value.u, scalar),
         v: symbolic_scale_jet(value.v, scalar),
         uv: symbolic_scale_jet(value.uv, scalar),
+        w: symbolic_scale_jet(value.w, scalar),
+        uw: symbolic_scale_jet(value.uw, scalar),
+        vw: symbolic_scale_jet(value.vw, scalar),
+        uvw: symbolic_scale_jet(value.uvw, scalar),
     }
 }
 
+/// `left · right` channel by channel: the channel of a seed set `T` is the
+/// sum over every split `S ⊆ T` of `left_S · right_{T∖S}`.
 fn directional_multiply(
     left: DirectionalJet,
     right: DirectionalJet,
-    fourth: bool,
+    order: DirectionalOrder,
 ) -> DirectionalJet {
+    let dimension = left.base.gradient.len();
     let base = symbolic_multiply_jets(left.base.clone(), right.base.clone());
     let u = symbolic_add_jets(
         symbolic_multiply_jets(left.u.clone(), right.base.clone()),
         symbolic_multiply_jets(left.base.clone(), right.u.clone()),
     );
-    if !fourth {
+    if !order.carries_v() {
         return DirectionalJet {
             base,
             u,
-            v: SymbolicJet::zero(left.base.gradient.len()),
-            uv: SymbolicJet::zero(left.base.gradient.len()),
+            ..DirectionalJet::zero(dimension)
         };
     }
     let v = symbolic_add_jets(
@@ -1588,21 +1658,85 @@ fn directional_multiply(
     );
     let uv = symbolic_add_jets(
         symbolic_add_jets(
-            symbolic_multiply_jets(left.uv, right.base.clone()),
-            symbolic_multiply_jets(left.u, right.v),
+            symbolic_multiply_jets(left.uv.clone(), right.base.clone()),
+            symbolic_multiply_jets(left.u.clone(), right.v.clone()),
         ),
         symbolic_add_jets(
-            symbolic_multiply_jets(left.v, right.u),
-            symbolic_multiply_jets(left.base, right.uv),
+            symbolic_multiply_jets(left.v.clone(), right.u.clone()),
+            symbolic_multiply_jets(left.base.clone(), right.uv.clone()),
         ),
     );
-    DirectionalJet { base, u, v, uv }
+    if !order.carries_w() {
+        return DirectionalJet {
+            base,
+            u,
+            v,
+            uv,
+            ..DirectionalJet::zero(dimension)
+        };
+    }
+    let w = symbolic_add_jets(
+        symbolic_multiply_jets(left.w.clone(), right.base.clone()),
+        symbolic_multiply_jets(left.base.clone(), right.w.clone()),
+    );
+    let uw = symbolic_add_jets(
+        symbolic_add_jets(
+            symbolic_multiply_jets(left.uw.clone(), right.base.clone()),
+            symbolic_multiply_jets(left.u.clone(), right.w.clone()),
+        ),
+        symbolic_add_jets(
+            symbolic_multiply_jets(left.w.clone(), right.u.clone()),
+            symbolic_multiply_jets(left.base.clone(), right.uw.clone()),
+        ),
+    );
+    let vw = symbolic_add_jets(
+        symbolic_add_jets(
+            symbolic_multiply_jets(left.vw.clone(), right.base.clone()),
+            symbolic_multiply_jets(left.v.clone(), right.w.clone()),
+        ),
+        symbolic_add_jets(
+            symbolic_multiply_jets(left.w.clone(), right.v.clone()),
+            symbolic_multiply_jets(left.base.clone(), right.vw.clone()),
+        ),
+    );
+    let uvw = symbolic_add_jets(
+        symbolic_add_jets(
+            symbolic_add_jets(
+                symbolic_multiply_jets(left.uvw, right.base.clone()),
+                symbolic_multiply_jets(left.uv, right.w),
+            ),
+            symbolic_add_jets(
+                symbolic_multiply_jets(left.uw, right.v),
+                symbolic_multiply_jets(left.vw, right.u),
+            ),
+        ),
+        symbolic_add_jets(
+            symbolic_add_jets(
+                symbolic_multiply_jets(left.u, right.vw),
+                symbolic_multiply_jets(left.v, right.uw),
+            ),
+            symbolic_add_jets(
+                symbolic_multiply_jets(left.w, right.uv),
+                symbolic_multiply_jets(left.base, right.uvw),
+            ),
+        ),
+    );
+    DirectionalJet {
+        base,
+        u,
+        v,
+        uv,
+        w,
+        uw,
+        vw,
+        uvw,
+    }
 }
 
 fn materialize_directional(
     value: DirectionalJet,
     owner: &str,
-    fourth: bool,
+    order: DirectionalOrder,
     temporary_index: &mut usize,
     preludes: &mut Vec<String>,
 ) -> DirectionalJet {
@@ -1610,16 +1744,16 @@ fn materialize_directional(
     *temporary_index += 1;
     let support = value.support();
     let mut source = String::new();
-    push_directional_declaration(&mut source, "", &name, "", &value, &support, fourth);
+    push_directional_declaration(&mut source, "", &name, "", &value, &support, order);
     preludes.push(source);
-    directional_reference(&name, &support, value.base.gradient.len(), fourth)
+    directional_reference(&name, &support, value.base.gradient.len(), order)
 }
 
 struct DirectionalExpressionEnvironment<'a> {
     leaves: &'a [Leaf],
     constants: &'a HashSet<String>,
     dimension: usize,
-    fourth: bool,
+    order: DirectionalOrder,
 }
 
 /// An exact rational carried beside a dense Taylor coefficient's emitted
@@ -2240,7 +2374,7 @@ fn directional_expression(
     let leaves = environment.leaves;
     let constants = environment.constants;
     let dimension = environment.dimension;
-    let fourth = environment.fourth;
+    let order = environment.order;
     let mut child = |expression: &ProgramExpr| {
         directional_expression(
             expression,
@@ -2261,7 +2395,7 @@ fn directional_expression(
             Ok(materialize_directional(
                 value,
                 owner,
-                fourth,
+                order,
                 stack_index,
                 preludes,
             ))
@@ -2273,7 +2407,7 @@ fn directional_expression(
             Ok(materialize_directional(
                 value,
                 owner,
-                fourth,
+                order,
                 stack_index,
                 preludes,
             ))
@@ -2287,7 +2421,7 @@ fn directional_expression(
             Ok(materialize_directional(
                 value,
                 owner,
-                fourth,
+                order,
                 stack_index,
                 preludes,
             ))
@@ -2299,7 +2433,7 @@ fn directional_expression(
             Ok(materialize_directional(
                 value,
                 owner,
-                fourth,
+                order,
                 stack_index,
                 preludes,
             ))
@@ -2307,11 +2441,11 @@ fn directional_expression(
         ProgramExpr::Mul(left, right) => {
             let left = child(left)?;
             let right = child(right)?;
-            let value = directional_multiply(left, right, fourth);
+            let value = directional_multiply(left, right, order);
             Ok(materialize_directional(
                 value,
                 owner,
-                fourth,
+                order,
                 stack_index,
                 preludes,
             ))
@@ -2331,38 +2465,122 @@ fn directional_expression(
             for argument in arguments {
                 leaf_arguments.push(symbolic_scalar(argument, constants, SymbolicTarget::Rust)?);
             }
-            let application =
-                leaves[*leaf].rust_application_source(&input.base.value, &leaf_arguments);
+            // The fifth order reads the stack's sixth entry through the
+            // compose's third derivative jet, so it requires a certified
+            // six-entry leaf; the lower orders keep calling the order-four
+            // builder and pay nothing for it.
+            let application = if order.carries_w() {
+                leaves[*leaf].rust_application_source_at_order(
+                    &input.base.value,
+                    &leaf_arguments,
+                    5,
+                )?
+            } else {
+                leaves[*leaf].rust_application_source(&input.base.value, &leaf_arguments)
+            };
             preludes.push(format!("let {stack} = {application};"));
 
             let base = symbolic_compose_jet(input.base.clone(), &stack, 0);
             let first = symbolic_compose_jet(input.base.clone(), &stack, 1);
             let u = symbolic_multiply_jets(first.clone(), input.u.clone());
-            if !fourth {
+            if !order.carries_v() {
                 let value = DirectionalJet {
                     base,
                     u,
-                    v: SymbolicJet::zero(dimension),
-                    uv: SymbolicJet::zero(dimension),
+                    ..DirectionalJet::zero(dimension)
                 };
                 return Ok(materialize_directional(
                     value,
                     owner,
-                    fourth,
+                    order,
                     stack_index,
                     preludes,
                 ));
             }
             let v = symbolic_multiply_jets(first.clone(), input.v.clone());
-            let second = symbolic_compose_jet(input.base, &stack, 2);
+            let second = symbolic_compose_jet(input.base.clone(), &stack, 2);
             let uv = symbolic_add_jets(
-                symbolic_multiply_jets(symbolic_multiply_jets(second, input.u), input.v),
-                symbolic_multiply_jets(first, input.uv),
+                symbolic_multiply_jets(
+                    symbolic_multiply_jets(second.clone(), input.u.clone()),
+                    input.v.clone(),
+                ),
+                symbolic_multiply_jets(first.clone(), input.uv.clone()),
+            );
+            if !order.carries_w() {
+                return Ok(materialize_directional(
+                    DirectionalJet {
+                        base,
+                        u,
+                        v,
+                        uv,
+                        ..DirectionalJet::zero(dimension)
+                    },
+                    owner,
+                    order,
+                    stack_index,
+                    preludes,
+                ));
+            }
+            // Faà di Bruno over the set partitions of each seed set: a block
+            // of `k` seeds reads that block's channel of the input, and a
+            // partition into `j` blocks reads the stack's `j`th derivative jet.
+            let third = symbolic_compose_jet(input.base, &stack, 3);
+            let w = symbolic_multiply_jets(first.clone(), input.w.clone());
+            let uw = symbolic_add_jets(
+                symbolic_multiply_jets(
+                    symbolic_multiply_jets(second.clone(), input.u.clone()),
+                    input.w.clone(),
+                ),
+                symbolic_multiply_jets(first.clone(), input.uw.clone()),
+            );
+            let vw = symbolic_add_jets(
+                symbolic_multiply_jets(
+                    symbolic_multiply_jets(second.clone(), input.v.clone()),
+                    input.w.clone(),
+                ),
+                symbolic_multiply_jets(first.clone(), input.vw.clone()),
+            );
+            let uvw = symbolic_add_jets(
+                symbolic_add_jets(
+                    symbolic_multiply_jets(
+                        symbolic_multiply_jets(
+                            symbolic_multiply_jets(third, input.u.clone()),
+                            input.v.clone(),
+                        ),
+                        input.w.clone(),
+                    ),
+                    symbolic_add_jets(
+                        symbolic_add_jets(
+                            symbolic_multiply_jets(
+                                symbolic_multiply_jets(second.clone(), input.u.clone()),
+                                input.vw,
+                            ),
+                            symbolic_multiply_jets(
+                                symbolic_multiply_jets(second.clone(), input.v.clone()),
+                                input.uw,
+                            ),
+                        ),
+                        symbolic_multiply_jets(
+                            symbolic_multiply_jets(second, input.w),
+                            input.uv,
+                        ),
+                    ),
+                ),
+                symbolic_multiply_jets(first, input.uvw),
             );
             Ok(materialize_directional(
-                DirectionalJet { base, u, v, uv },
+                DirectionalJet {
+                    base,
+                    u,
+                    v,
+                    uv,
+                    w,
+                    uw,
+                    vw,
+                    uvw,
+                },
                 owner,
-                fourth,
+                order,
                 stack_index,
                 preludes,
             ))
@@ -3403,21 +3621,24 @@ fn directional_reference(
     name: &str,
     support: &DirectionalSupport,
     dimension: usize,
-    fourth: bool,
+    order: DirectionalOrder,
 ) -> DirectionalJet {
+    let carried = |carries: bool, component: &str, support: &SymbolicSupport| {
+        if carries {
+            SymbolicJet::reference(&directional_prefix(name, component), support, dimension)
+        } else {
+            SymbolicJet::zero(dimension)
+        }
+    };
     DirectionalJet {
         base: SymbolicJet::reference(&directional_prefix(name, "base"), &support.base, dimension),
         u: SymbolicJet::reference(&directional_prefix(name, "u"), &support.u, dimension),
-        v: if fourth {
-            SymbolicJet::reference(&directional_prefix(name, "vdir"), &support.v, dimension)
-        } else {
-            SymbolicJet::zero(dimension)
-        },
-        uv: if fourth {
-            SymbolicJet::reference(&directional_prefix(name, "uv"), &support.uv, dimension)
-        } else {
-            SymbolicJet::zero(dimension)
-        },
+        v: carried(order.carries_v(), "vdir", &support.v),
+        uv: carried(order.carries_v(), "uv", &support.uv),
+        w: carried(order.carries_w(), "wdir", &support.w),
+        uw: carried(order.carries_w(), "uw", &support.uw),
+        vw: carried(order.carries_w(), "vw", &support.vw),
+        uvw: carried(order.carries_w(), "uvw", &support.uvw),
     }
 }
 
@@ -3427,20 +3648,20 @@ fn directional_schedule(
     leaves: &[Leaf],
     statements: &[Statement],
     result: &ProgramExpr,
-    fourth: bool,
+    order: DirectionalOrder,
 ) -> Result<DirectionalSchedule> {
     let dimension = primaries.len();
     let expression_environment = DirectionalExpressionEnvironment {
         leaves,
         constants,
         dimension,
-        fourth,
+        order,
     };
     let mut bindings = HashMap::<String, DirectionalJet>::new();
     for (axis, primary) in primaries.iter().enumerate() {
         bindings.insert(
             primary.to_string(),
-            DirectionalJet::primary(&primary.to_string(), axis, dimension, fourth),
+            DirectionalJet::primary(&primary.to_string(), axis, dimension, order),
         );
     }
     let mut mutable_support = HashMap::<String, DirectionalSupport>::new();
@@ -3469,7 +3690,7 @@ fn directional_schedule(
                 }
                 bindings.insert(
                     name.to_string(),
-                    directional_reference(&name.to_string(), &support, dimension, fourth),
+                    directional_reference(&name.to_string(), &support, dimension, order),
                 );
                 directional_statements.push(DirectionalStatement::Local(DirectionalLocal {
                     name: name.to_string(),
@@ -3500,7 +3721,7 @@ fn directional_schedule(
                     support.include(&value);
                     bindings.insert(
                         target_name.to_string(),
-                        directional_reference(&target_name.to_string(), support, dimension, fourth),
+                        directional_reference(&target_name.to_string(), support, dimension, order),
                     );
                     directional_assignments.push(DirectionalAssignment {
                         target: target_name.to_string(),
@@ -3600,7 +3821,7 @@ fn push_directional_declaration(
     mutable: &str,
     value: &DirectionalJet,
     support: &DirectionalSupport,
-    fourth: bool,
+    order: DirectionalOrder,
 ) {
     push_symbolic_declaration(
         source,
@@ -3618,7 +3839,7 @@ fn push_directional_declaration(
         &value.u,
         &support.u,
     );
-    if fourth {
+    if order.carries_v() {
         push_symbolic_declaration(
             source,
             indentation,
@@ -3636,6 +3857,23 @@ fn push_directional_declaration(
             &support.uv,
         );
     }
+    if order.carries_w() {
+        for (component, channel, channel_support) in [
+            ("wdir", &value.w, &support.w),
+            ("uw", &value.uw, &support.uw),
+            ("vw", &value.vw, &support.vw),
+            ("uvw", &value.uvw, &support.uvw),
+        ] {
+            push_symbolic_declaration(
+                source,
+                indentation,
+                &directional_prefix(name, component),
+                mutable,
+                channel,
+                channel_support,
+            );
+        }
+    }
 }
 
 fn push_directional_assignment(
@@ -3644,7 +3882,7 @@ fn push_directional_assignment(
     name: &str,
     value: &DirectionalJet,
     support: &DirectionalSupport,
-    fourth: bool,
+    order: DirectionalOrder,
 ) {
     push_symbolic_assignment(
         source,
@@ -3660,7 +3898,7 @@ fn push_directional_assignment(
         &value.u,
         &support.u,
     );
-    if fourth {
+    if order.carries_v() {
         push_symbolic_assignment(
             source,
             indentation,
@@ -3675,6 +3913,22 @@ fn push_directional_assignment(
             &value.uv,
             &support.uv,
         );
+    }
+    if order.carries_w() {
+        for (component, channel, channel_support) in [
+            ("wdir", &value.w, &support.w),
+            ("uw", &value.uw, &support.uw),
+            ("vw", &value.vw, &support.vw),
+            ("uvw", &value.uvw, &support.uvw),
+        ] {
+            push_symbolic_assignment(
+                source,
+                indentation,
+                &directional_prefix(name, component),
+                channel,
+                channel_support,
+            );
+        }
     }
 }
 
@@ -4058,10 +4312,10 @@ fn rust_directional_body(
     leaves: &[Leaf],
     statements: &[Statement],
     result: &ProgramExpr,
-    fourth: bool,
+    order: DirectionalOrder,
 ) -> Result<syn::Block> {
     let dimension = primaries.len();
-    let schedule = directional_schedule(primaries, constants, leaves, statements, result, fourth)?;
+    let schedule = directional_schedule(primaries, constants, leaves, statements, result, order)?;
     let mut source = "{\n".to_string();
     for statement in &schedule.statements {
         match statement {
@@ -4088,7 +4342,7 @@ fn rust_directional_body(
                     mutable,
                     &local.value,
                     &support,
-                    fourth,
+                    order,
                 );
             }
             DirectionalStatement::If {
@@ -4108,7 +4362,7 @@ fn rust_directional_body(
                         &assignment.target,
                         &assignment.value,
                         support,
-                        fourth,
+                        order,
                     );
                 }
                 source.push_str("    }\n");
@@ -4116,10 +4370,10 @@ fn rust_directional_body(
         }
     }
     push_preludes(&mut source, &schedule.result_preludes, "    ");
-    let contracted = if fourth {
-        &schedule.result.uv
-    } else {
-        &schedule.result.u
+    let contracted = match order {
+        DirectionalOrder::Third => &schedule.result.u,
+        DirectionalOrder::Fourth => &schedule.result.uv,
+        DirectionalOrder::Fifth => &schedule.result.uvw,
     };
     source.push_str("    [\n");
     for axis in 0..dimension {
@@ -4139,12 +4393,16 @@ fn rust_directional_body(
         source.push_str("],\n");
     }
     source.push_str("    ]\n}\n");
-    let order = if fourth { "fourth" } else { "third" };
+    let order_name = match order {
+        DirectionalOrder::Third => "third",
+        DirectionalOrder::Fourth => "fourth",
+        DirectionalOrder::Fifth => "fifth",
+    };
     syn::parse_str(&source).map_err(|error| {
         syn::Error::new(
             error.span(),
             format!(
-                "failed to parse generated Rust {order}-order contracted row program: {error}\n{source}"
+                "failed to parse generated Rust {order_name}-order contracted row program: {error}\n{source}"
             ),
         )
     })
@@ -4761,7 +5019,7 @@ pub(crate) fn expand(input: Input) -> Result<TokenStream2> {
                 &leaves,
                 &statements,
                 &result,
-                false,
+                DirectionalOrder::Third,
             )?
         };
         let third_primaries = primary_parameters(&primaries, &quote!(#third_body));
@@ -4795,7 +5053,7 @@ pub(crate) fn expand(input: Input) -> Result<TokenStream2> {
                 &leaves,
                 &statements,
                 &result,
-                true,
+                DirectionalOrder::Fourth,
             )?
         };
         let fourth_primaries = primary_parameters(&primaries, &quote!(#fourth_body));
@@ -4830,6 +5088,36 @@ pub(crate) fn expand(input: Input) -> Result<TokenStream2> {
                 #(#constants: f64),*
             ) -> [[[[[f64; #dimension]; #dimension]; #dimension]; #dimension]; #dimension]
                 #fifth_body
+        }
+    } else {
+        quote!()
+    };
+
+    // The fifth derivative contracted along three directions, `Σ ℓ_abcde u_c
+    // v_d w_e`, lowered through the same directional algebra as the third and
+    // fourth with a third nilpotent seed. It is the wide-row surface a
+    // Jeffreys-augmented outer Hessian needs, where the full fifth tensor of
+    // `emit [fifth]` is only affordable for two primaries.
+    let fifth_contracted_function = if emissions.fifth_contracted {
+        let fifth_name = format_ident!("{}_fifth_contracted", name);
+        let fifth_body = rust_directional_body(
+            &primaries,
+            &constant_names,
+            &leaves,
+            &statements,
+            &result,
+            DirectionalOrder::Fifth,
+        )?;
+        let fifth_primaries = primary_parameters(&primaries, &quote!(#fifth_body));
+        quote! {
+            #[inline(always)]
+            #visibility fn #fifth_name(
+                #(#fifth_primaries: f64,)*
+                #(#constants: f64,)*
+                direction_u: &[f64; #dimension],
+                direction_v: &[f64; #dimension],
+                direction_w: &[f64; #dimension],
+            ) -> [[f64; #dimension]; #dimension] #fifth_body
         }
     } else {
         quote!()
@@ -4961,6 +5249,7 @@ pub(crate) fn expand(input: Input) -> Result<TokenStream2> {
         #third_function
         #fourth_function
         #fifth_function
+        #fifth_contracted_function
         #full_function
         #scalar_witness_function
         #cuda_constant
@@ -5123,6 +5412,51 @@ mod tests {
         assert!(error.to_string().contains("explicit six-entry leaf stack"));
     }
 
+    /// #2677: the wide-row fifth order is the directional lowering with a third
+    /// seed. It takes three directions, reads the leaf's sixth entry through
+    /// the certified order-five builder, and leaves the lower orders calling
+    /// the order-four builder with no third seed.
+    #[test]
+    fn fifth_contracted_surface_carries_a_third_seed_through_six_entry_leaves() {
+        let source = quote! {
+            fn wide_fifth(x, y, z; weight)
+            emit [fourth, fifth_contracted];
+            leaves { curve => curve_four => cuda_curve => curve_five }
+            witnesses [];
+            {
+                let product = mul(mul(x, y), z);
+                return scale(compose(curve, product), weight);
+            }
+        };
+        let fifth =
+            emitted_function(source.clone(), "wide_fifth_fifth_contracted").replace(' ', "");
+        assert!(
+            fifth.contains(
+                "direction_u:&[f64;3usize],direction_v:&[f64;3usize],direction_w:&[f64;3usize],"
+            ),
+            "{fifth}"
+        );
+        assert!(fifth.contains("curve_five"), "{fifth}");
+        assert!(!fifth.contains("curve_four"), "{fifth}");
+        assert!(fifth.contains("[5]"), "{fifth}");
+        assert!(fifth.contains("direction_w[2]"), "{fifth}");
+        let fourth = emitted_function(source, "wide_fifth_fourth_contracted").replace(' ', "");
+        assert!(fourth.contains("curve_four"), "{fourth}");
+        assert!(!fourth.contains("curve_five"), "{fourth}");
+        assert!(!fourth.contains("direction_w"), "{fourth}");
+
+        let missing = syn::parse2::<Input>(quote! {
+            fn missing_fifth_contracted(x, y, z;)
+            emit [fifth_contracted];
+            leaves { curve => curve_four => cuda_curve }
+            witnesses [];
+            { let product = mul(mul(x, y), z); return compose(curve, product); }
+        })
+        .unwrap();
+        let error = expand(missing).expect_err("a fifth derivative must not silently be zero");
+        assert!(error.to_string().contains("explicit six-entry leaf stack"));
+    }
+
     #[test]
     fn emission_surfaces_are_mandatory_nonempty_known_and_unique() {
         let missing = parse_error(quote! {
@@ -5151,7 +5485,7 @@ mod tests {
         });
         assert!(
             unknown.contains(
-                "must be one of `generic`, `runtime`, `order2`, `third`, `fourth`, `fifth`, `full`, `witnesses`, or `cuda`"
+                "must be one of `generic`, `runtime`, `order2`, `third`, `fourth`, `fifth`, `fifth_contracted`, `full`, `witnesses`, or `cuda`"
             )
         );
 

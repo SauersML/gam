@@ -1744,6 +1744,85 @@ fn survival_exact_newton_test_familywith_inverse_link(
     }
 }
 
+/// #2677: the all-axes third directional derivative of the observed
+/// information is the β-derivative of its second directional derivative. For
+/// every residual distribution with closed-form fifth stacks, a five-point
+/// difference of `I''[u, v]` along each coefficient axis reproduces
+/// `{I'''[u, v, e_a]}` built from the row program's fifth-order contraction,
+/// and the family declares that channel available.
+#[test]
+fn survival_ls_third_directional_all_axes_matches_difference_of_second_2677() {
+    use crate::custom_family::CustomFamily;
+    use crate::row_kernel::{RowSet, row_kernel_third_directional_derivative_all_axes};
+
+    let beta = [0.3, -0.4, 0.2];
+    let u = array![0.7, -0.5, 0.9];
+    let v = array![-0.4, 1.1, 0.6];
+    for distribution in [
+        ResidualDistribution::Gaussian,
+        ResidualDistribution::Gumbel,
+        ResidualDistribution::Logistic,
+    ] {
+        let family = survival_exact_newton_test_familywith_inverse_link(
+            residual_distribution_inverse_link(distribution),
+        );
+        assert!(
+            family.joint_jeffreys_information_third_directional_available(),
+            "{distribution:?}: a closed-form link must declare the third information derivative"
+        );
+        let states = survival_exact_newton_test_states(&family, beta[0], beta[1], beta[2]);
+        let dynamic = family
+            .build_dynamic_geometry(&states)
+            .expect("dynamic geometry");
+        let kernel = family.survival_ls_row_kernel_rescaled(&dynamic, 0.0);
+        let axes = row_kernel_third_directional_derivative_all_axes(
+            &kernel,
+            &RowSet::All,
+            u.as_slice().expect("contiguous u"),
+            v.as_slice().expect("contiguous v"),
+        )
+        .expect("third directional derivative");
+        assert_eq!(axes.len(), beta.len(), "{distribution:?}: one matrix per axis");
+        let second_at = |axis: usize, t: f64| {
+            let mut moved = beta;
+            moved[axis] += t;
+            let moved_states =
+                survival_exact_newton_test_states(&family, moved[0], moved[1], moved[2]);
+            family
+                .exact_newton_joint_hessian_second_directional_derivative_rescaled(
+                    &moved_states,
+                    &u,
+                    &v,
+                    0.0,
+                )
+                .expect("second directional derivative")
+                .expect("second directional derivative present")
+        };
+        let h = 1.0e-3;
+        let mut largest = 0.0_f64;
+        for axis in 0..beta.len() {
+            let difference = (-second_at(axis, 2.0 * h) + 8.0 * second_at(axis, h)
+                - 8.0 * second_at(axis, -h)
+                + second_at(axis, -2.0 * h))
+                / (12.0 * h);
+            for ((a, b), &want) in difference.indexed_iter() {
+                let got = axes[axis][[a, b]];
+                largest = largest.max(got.abs());
+                assert!(
+                    (got - want).abs() <= 1.0e-6 * (1.0 + want.abs().max(got.abs())),
+                    "{distribution:?} axis {axis} I'''[{a}][{b}]: generated {got:+.15e}, \
+                     difference {want:+.15e}"
+                );
+            }
+        }
+        assert!(
+            largest > 1.0e-3,
+            "{distribution:?}: the third information derivative is too small ({largest:.3e}) \
+             for the agreement to say anything"
+        );
+    }
+}
+
 fn sparse_survival_exact_newton_test_family() -> SurvivalLocationScaleFamily {
     let mut family = survival_exact_newton_test_family();
     family.x_threshold = sparse_design_from_dense(&array![[1.0], [0.4], [-0.6]]);

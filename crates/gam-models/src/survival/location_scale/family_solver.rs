@@ -1148,6 +1148,49 @@ impl CustomFamily for SurvivalLocationScaleFamily {
         )
     }
 
+    /// The fifth likelihood derivative lowers through `sls_row_program`'s
+    /// three-seed directional surface wherever every residual-distribution
+    /// stack has a closed-form fifth derivative. The link-wiggle runtime
+    /// lowering carries no fifth order, and neither do the links served by the
+    /// generic pdf-jet dispatch.
+    fn joint_jeffreys_information_third_directional_available(&self) -> bool {
+        self.row_kernel_directional_supported()
+            && Self::inverse_link_has_fifth_derivative_stacks(&self.inverse_link)
+    }
+
+    /// Third beta-directional derivative of the same unscaled observed
+    /// information returned by `joint_jeffreys_information_with_specs`, along
+    /// every canonical axis: `{I'''[u, v, e_a]}`. Each row's fifth-order
+    /// contraction with `(u, v)` is built once and pulled back per axis (#2677).
+    fn joint_jeffreys_information_third_directional_all_axes_with_specs(
+        &self,
+        block_states: &[ParameterBlockState],
+        specs: &[ParameterBlockSpec],
+        d_beta_u_flat: &Array1<f64>,
+        d_beta_v_flat: &Array1<f64>,
+    ) -> Result<Option<Vec<Array2<f64>>>, String> {
+        self.validate_joint_specs(
+            specs,
+            "SurvivalLocationScaleFamily joint Jeffreys third directional derivative",
+        )?;
+        if !self.joint_jeffreys_information_third_directional_available() {
+            return Ok(None);
+        }
+        let dynamic = self.build_dynamic_geometry(block_states)?;
+        let kernel = self.survival_ls_row_kernel_rescaled(&dynamic, 0.0);
+        crate::row_kernel::row_kernel_third_directional_derivative_all_axes(
+            &kernel,
+            &crate::row_kernel::RowSet::All,
+            d_beta_u_flat.as_slice().ok_or_else(|| {
+                "joint Jeffreys third directional u must be contiguous".to_string()
+            })?,
+            d_beta_v_flat.as_slice().ok_or_else(|| {
+                "joint Jeffreys third directional v must be contiguous".to_string()
+            })?,
+        )
+        .map(Some)
+    }
+
     fn exact_newton_joint_hessian_beta_dependent(&self) -> bool {
         true
     }

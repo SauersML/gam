@@ -266,6 +266,24 @@ pub trait RowKernel<const K: usize>: gam_math::jet_tower::RowProgram<K> + Send +
         gam_math::jet_tower::program_fourth_contracted(self, row, dir_u, dir_v)
     }
 
+    /// Fifth-order contracted derivative along every primary axis:
+    /// `∂⁵ℓ_i / (∂p_z ∂p_a ∂p_b ∂[dir_u] ∂[dir_v])`, indexed `[z][a][b]`.
+    ///
+    /// Returns the K×K×K tensor of fifth derivatives contracted with two
+    /// primary-space directions. Used for the third directional derivative of
+    /// the Hessian a Jeffreys-augmented REML outer Hessian reads. The default
+    /// declines: a kernel whose row program lowers no fifth order has no such
+    /// channel, and a family declaring the third information derivative
+    /// available must override it.
+    fn row_fifth_contracted_all_axes(
+        &self,
+        _row: usize,
+        _dir_u: &[f64; K],
+        _dir_v: &[f64; K],
+    ) -> Result<[[[f64; K]; K]; K], String> {
+        Err("row kernel lowers no fifth-order contracted derivative".to_string())
+    }
+
     /// Optional warm-up hook: triggers any per-row caches the kernel keeps for
     /// `row_third_contracted` / `row_fourth_contracted`. Called by
     /// [`RowKernelHessianWorkspace::new`] **before** the outer ext-coordinate
@@ -1217,6 +1235,78 @@ pub fn row_kernel_second_directional_derivative_all_axes<const K: usize>(
             })
         })
         .collect::<Result<Vec<_>, _>>()
+}
+
+/// Batched all-axes third directional derivative of the Hessian: with
+/// `d_beta_u` and `d_beta_v` fixed and the third direction sweeping every
+/// canonical axis `e_a`, return the `p` dense matrices
+/// `{H³dot[d_beta_u, d_beta_v, e_a]}_{a=0..p}`.
+///
+/// Each row's fifth-order derivative contracted with the fixed pair is built
+/// once through [`RowKernel::row_fifth_contracted_all_axes`]; every axis then
+/// contracts that tensor with the row Jacobian's column `J_i e_a` and pulls the
+/// K×K result back, so the row program runs once per row, not once per axis.
+/// Per-row contributions are HT-weighted.
+pub fn row_kernel_third_directional_derivative_all_axes<const K: usize>(
+    kern: &(impl RowKernel<K> + ?Sized + Sync),
+    rows: &RowSet,
+    d_beta_u: &[f64],
+    d_beta_v: &[f64],
+) -> Result<Vec<Array2<f64>>, String> {
+    let n = kern.n_rows();
+    let p = kern.n_coefficients();
+    if d_beta_u.len() != p || d_beta_v.len() != p {
+        return Err(format!(
+            "row_kernel_third_directional_derivative_all_axes: directions have {} / {} \
+             entries, expected {p}",
+            d_beta_u.len(),
+            d_beta_v.len(),
+        ));
+    }
+    kern.warm_up_directional_caches(EvalMode::ValueGradientHessian)?;
+    rows.par_try_reduce_fold(
+        n,
+        || vec![Array2::<f64>::zeros((p, p)); p],
+        |mut acc, row, w| -> Result<_, String> {
+            let dir_u = kern.jacobian_action(row, d_beta_u);
+            let dir_v = kern.jacobian_action(row, d_beta_v);
+            let fifth = kern.row_fifth_contracted_all_axes(row, &dir_u, &dir_v)?;
+            // The row Jacobian `J_i` (K × p), one transpose action per primary.
+            let mut jacobian = vec![0.0_f64; K * p];
+            let mut unit = [0.0_f64; K];
+            for (primary, jacobian_row) in jacobian.chunks_exact_mut(p).enumerate() {
+                unit[primary] = 1.0;
+                kern.jacobian_transpose_action(row, &unit, jacobian_row);
+                unit[primary] = 0.0;
+            }
+            for (axis, target) in acc.iter_mut().enumerate() {
+                let mut contracted = [[0.0_f64; K]; K];
+                let mut reached = false;
+                for (primary, slab) in fifth.iter().enumerate() {
+                    let weight = w * jacobian[primary * p + axis];
+                    if weight == 0.0 {
+                        continue;
+                    }
+                    reached = true;
+                    for a in 0..K {
+                        for b in 0..K {
+                            contracted[a][b] += weight * slab[a][b];
+                        }
+                    }
+                }
+                if reached {
+                    kern.add_pullback_hessian(row, &contracted, target);
+                }
+            }
+            Ok(acc)
+        },
+        |mut left, right| {
+            for (total, part) in left.iter_mut().zip(right) {
+                *total += &part;
+            }
+            Ok(left)
+        },
+    )
 }
 
 struct RowKernelDirectionalDerivativeOperator<const K: usize, T: RowKernel<K>> {
