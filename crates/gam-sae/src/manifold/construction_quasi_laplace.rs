@@ -4819,7 +4819,11 @@ impl SaeManifoldTerm {
                 .get(row)
                 .map(Vec::as_slice)
                 .unwrap_or(&[]);
-            if !dirs.is_empty() {
+            let spectrum = cache
+                .deflation_row_spectra
+                .get(row)
+                .and_then(Option::as_ref);
+            if Self::row_deflation_is_live(dirs, spectrum) {
                 let inv_vv = if fast_selected {
                     let (inv_vv, _inv_vbeta) = solver
                         .selected_inverse_row_blocks(row, &selected_beta_inv)
@@ -4851,10 +4855,6 @@ impl SaeManifoldTerm {
                 for s in 0..q {
                     d_mat[[s, s]] = d_diag[s];
                 }
-                let spectrum = cache
-                    .deflation_row_spectra
-                    .get(row)
-                    .and_then(Option::as_ref);
                 trace -= Self::deflation_block_correction(&inv_vv, &d_mat, dirs, spectrum);
             }
         }
@@ -5020,7 +5020,7 @@ impl SaeManifoldTerm {
             // unit-deflating a direction.  Its direction list is therefore empty,
             // but the stored raw/conditioned spectrum still owns a non-identity
             // Daleckii--Krein map and must differentiate it (#2515/#2336).
-            if spectrum.is_some() || !directions.is_empty() {
+            if Self::row_deflation_is_live(directions, spectrum) {
                 row_trace -=
                     Self::deflation_block_correction(&inverse, &derivative, directions, spectrum);
             }
@@ -5214,7 +5214,7 @@ impl SaeManifoldTerm {
                                 // creating a unit-deflated direction.  The
                                 // spectrum, not the null-direction list, is the
                                 // certificate that this derivative map is live.
-                                if spectrum.is_some() || !dirs.is_empty() {
+                                if Self::row_deflation_is_live(dirs, spectrum) {
                                     trace -= Self::deflation_block_correction(
                                         &inv_vv, &d_mat, dirs, spectrum,
                                     );
@@ -5248,7 +5248,7 @@ impl SaeManifoldTerm {
                         }
                     }
                 }
-                if spectrum.is_some() || !dirs.is_empty() {
+                if Self::row_deflation_is_live(dirs, spectrum) {
                     // Same Daleckii–Krein correction the dense sibling subtracts,
                     // against the same deflated `inv_vv` (#2712).
                     let mut d_mat = Array2::<f64>::zeros((q, q));
@@ -5328,6 +5328,19 @@ impl SaeManifoldTerm {
             }
         }
         acc
+    }
+
+    /// Whether a row's evidence factor installed a deflation map that every
+    /// rho/theta trace must differentiate (#2333/#2515/#2336): a recorded
+    /// spectrum, or a gauge-deflated direction. A clamp-basin classification
+    /// reprices the spectrum without unit-deflating any direction, so an empty
+    /// direction list is not evidence that the row's operator is the raw block.
+    /// Every `deflation_block_correction` consumer gates on this one predicate.
+    pub(crate) fn row_deflation_is_live(
+        dirs: &[Array1<f64>],
+        spectrum: Option<&RowDeflationSpectrum>,
+    ) -> bool {
+        spectrum.is_some() || !dirs.is_empty()
     }
 
     /// Fold the row's Daleckii–Krein deflation differential into the single
@@ -6495,6 +6508,7 @@ impl SaeManifoldTerm {
                 .deflation_row_spectra
                 .get(row)
                 .and_then(Option::as_ref);
+            let defl_live = Self::row_deflation_is_live(defl_dirs, defl_spectrum);
 
             // Record each active logit's column, global t-index, selected-inverse
             // diagonal, and per-slot Daleckii--Krein weight for a unit diagonal
@@ -6504,7 +6518,7 @@ impl SaeManifoldTerm {
                 for (pos, var) in jets.vars.iter().enumerate() {
                     if let SaeLocalRowVar::Logit { atom } = *var {
                         let raw_diag = inv_vv[[pos, pos]];
-                        let diag_deflation_weight = if defl_dirs.is_empty() {
+                        let diag_deflation_weight = if !defl_live {
                             0.0
                         } else {
                             let mut unit_diag = Array2::<f64>::zeros((q, q));
@@ -6604,7 +6618,7 @@ impl SaeManifoldTerm {
                         gamma += inv_vv[[b, a]] * dh;
                     }
                 }
-                if !defl_dirs.is_empty() {
+                if defl_live {
                     // The row factor/log-det operator is the spectrally
                     // conditioned `Φ(H_tt)`, while the local theta channels above
                     // assemble the raw row derivative `D`. Subtract
@@ -6666,7 +6680,7 @@ impl SaeManifoldTerm {
                         gamma += inv_vv[[b, a]] * dh;
                     }
                 }
-                if !defl_dirs.is_empty() {
+                if defl_live {
                     gamma -= Self::deflation_block_correction(
                         &inv_vv,
                         &dh_mat,
@@ -6945,6 +6959,7 @@ impl SaeManifoldTerm {
                 .deflation_row_spectra
                 .get(row)
                 .and_then(Option::as_ref);
+            let defl_live = Self::row_deflation_is_live(defl_dirs, defl_spectrum);
 
             // #2330 Patch D per-row residual context (#2515 port). `w_row_prior`
             // is bound below for the majorizer legs; the residual weighting is the
@@ -6973,7 +6988,7 @@ impl SaeManifoldTerm {
                         // Same per-slot Daleckii–Krein weight for a unit diagonal
                         // derivative the dense route records, so the shared-mass column
                         // pass below differentiates the same conditioned majorizer.
-                        let diag_deflation_weight = if defl_dirs.is_empty() {
+                        let diag_deflation_weight = if !defl_live {
                             0.0
                         } else {
                             let mut unit_diag = Array2::<f64>::zeros((q, q));
@@ -7054,7 +7069,7 @@ impl SaeManifoldTerm {
                 // per-slot derivative is retained as a matrix so the Daleckii–Krein
                 // correction can be applied to it after the loop; on a PD row the
                 // matrix stays `0×0` and nothing is allocated.
-                let mut deflated_base_dh_mat = if defl_dirs.is_empty() {
+                let mut deflated_base_dh_mat = if !defl_live {
                     Array2::<f64>::zeros((0, 0))
                 } else {
                     Array2::<f64>::zeros((q, q))
@@ -7153,13 +7168,13 @@ impl SaeManifoldTerm {
                                 _ => 0.0,
                             };
                         }
-                        if !defl_dirs.is_empty() {
+                        if defl_live {
                             deflated_base_dh_mat[[a, b]] = dh;
                         }
                         gamma += inv_vv[[b, a]] * dh;
                     }
                 }
-                if !defl_dirs.is_empty() {
+                if defl_live {
                     // The row factor / log-det operator is the spectrally conditioned
                     // `Φ(H_tt)`, while the channels above assemble the RAW row
                     // derivative `D`. Subtract `tr(inv_vv·(D − DΦ[D]))` so the
@@ -7218,7 +7233,7 @@ impl SaeManifoldTerm {
 
             for (w_beta_pos, w_channel) in border.iter().enumerate() {
                 let mut gamma = 0.0_f64;
-                let mut dh_mat = if defl_dirs.is_empty() {
+                let mut dh_mat = if !defl_live {
                     Array2::<f64>::zeros((0, 0))
                 } else {
                     Array2::<f64>::zeros((q, q))
@@ -7235,13 +7250,13 @@ impl SaeManifoldTerm {
                                 ctx, jets.vars[a], jets.vars[b], w_channel,
                             );
                         }
-                        if !defl_dirs.is_empty() {
+                        if defl_live {
                             dh_mat[[a, b]] = dh;
                         }
                         gamma += inv_vv[[b, a]] * dh;
                     }
                 }
-                if !defl_dirs.is_empty() {
+                if defl_live {
                     // The border channels differentiate the same conditioned t–t block,
                     // so they carry the same Daleckii–Krein correction (#2712).
                     gamma -= Self::deflation_block_correction(

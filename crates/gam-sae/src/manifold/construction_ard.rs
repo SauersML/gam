@@ -944,7 +944,7 @@ impl SaeManifoldTerm {
                 .get(row)
                 .and_then(Option::as_ref);
             // Per-row selected-inverse t-block, built once (only when deflated).
-            let inv_vv = if dirs.is_empty() {
+            let inv_vv = if !Self::row_deflation_is_live(dirs, spectrum) {
                 None
             } else {
                 let mut m = Array2::<f64>::zeros((q, q));
@@ -1093,7 +1093,7 @@ impl SaeManifoldTerm {
                 let prior = ArdAxisPrior::eval(alpha, t, periods[atom][axis]);
                 let curvature = row_weight * prior.log_precision_curvature(operator);
                 let mut trace = inverse[[slot, slot]] * curvature;
-                if !directions.is_empty() && curvature != 0.0 {
+                if Self::row_deflation_is_live(directions, spectrum) && curvature != 0.0 {
                     let mut derivative = Array2::<f64>::zeros((q, q));
                     derivative[[slot, slot]] = curvature;
                     trace -= Self::deflation_block_correction(
@@ -1254,7 +1254,7 @@ impl SaeManifoldTerm {
             // Correction for one local coordinate slot `s` with curvature `hess`,
             // identical to the dense sibling's `slot_correction`.
             let slot_correction = |s: usize, hess: f64| -> f64 {
-                if dirs.is_empty() || s >= q || hess == 0.0 {
+                if !Self::row_deflation_is_live(dirs, spectrum) || s >= q || hess == 0.0 {
                     return 0.0;
                 }
                 let mut d = Array2::<f64>::zeros((q, q));

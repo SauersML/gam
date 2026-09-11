@@ -2548,7 +2548,8 @@ impl SaeManifoldTerm {
                 .deflation_row_spectra
                 .get(row)
                 .and_then(Option::as_ref);
-            let inv_vv_block = if defl_dirs.is_empty() {
+            let defl_live = Self::row_deflation_is_live(defl_dirs, defl_spectrum);
+            let inv_vv_block = if !defl_live {
                 Array2::<f64>::zeros((0, 0))
             } else {
                 inv.slice(s![base..base + q, base..base + q]).to_owned()
@@ -2559,7 +2560,7 @@ impl SaeManifoldTerm {
                     SaeLocalRowVar::Coord { .. } => None,
                 };
                 let mut gamma = 0.0_f64;
-                let mut dh_mat = if defl_dirs.is_empty() {
+                let mut dh_mat = if !defl_live {
                     Array2::<f64>::zeros((0, 0))
                 } else {
                     Array2::<f64>::zeros((q, q))
@@ -2679,13 +2680,13 @@ impl SaeManifoldTerm {
                                 }
                             }
                         }
-                        if !defl_dirs.is_empty() {
+                        if defl_live {
                             dh_mat[[a, b]] = dh;
                         }
                         gamma += inv[[base + b, base + a]] * dh;
                     }
                 }
-                if !defl_dirs.is_empty() && !skip_deflation_dk {
+                if defl_live && !skip_deflation_dk {
                     gamma -= Self::deflation_block_correction(
                         &inv_vv_block,
                         &dh_mat,
@@ -2730,7 +2731,7 @@ impl SaeManifoldTerm {
             if want_data {
                 for (w_beta_pos, w_channel) in border.iter().enumerate() {
                     let mut gamma = 0.0_f64;
-                    let mut dh_mat = if defl_dirs.is_empty() {
+                    let mut dh_mat = if !defl_live {
                         Array2::<f64>::zeros((0, 0))
                     } else {
                         Array2::<f64>::zeros((q, q))
@@ -2747,13 +2748,13 @@ impl SaeManifoldTerm {
                                     ctx, jets.vars[a], jets.vars[b], w_channel,
                                 );
                             }
-                            if !defl_dirs.is_empty() {
+                            if defl_live {
                                 dh_mat[[a, b]] = dh;
                             }
                             gamma += inv[[base + b, base + a]] * dh;
                         }
                     }
-                    if !defl_dirs.is_empty() && !skip_deflation_dk {
+                    if defl_live && !skip_deflation_dk {
                         gamma -= Self::deflation_block_correction(
                             &inv_vv_block,
                             &dh_mat,
@@ -7086,3 +7087,7 @@ mod tests_damped_residual_path {
 #[cfg(test)]
 #[path = "tests_exact_a_probes_2828.rs"]
 mod tests_exact_a_probes_2828;
+
+#[cfg(test)]
+#[path = "tests_clamp_basin_deflation_2333.rs"]
+mod tests_clamp_basin_deflation_2333;
