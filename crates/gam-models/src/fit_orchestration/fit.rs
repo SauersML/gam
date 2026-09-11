@@ -530,7 +530,9 @@ mod standard_convergence_gate_tests {
     #[test]
     fn firth_retry_is_limited_to_separation_and_nonconvergence() {
         assert!(firth_can_rescue(&EstimationError::PirlsDidNotConverge {
-            max_iterations: 20,
+            iterations: 20,
+            budget: 20,
+            stop: "max iterations reached".to_string(),
             last_change: 1.0,
         }));
         assert!(firth_can_rescue(

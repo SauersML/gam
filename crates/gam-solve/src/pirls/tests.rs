@@ -3691,13 +3691,20 @@ mod root_cause_tests {
 
         match err {
             EstimationError::PirlsDidNotConverge {
-                max_iterations,
+                iterations,
+                budget,
+                stop,
                 last_change,
             } => {
                 assert!(
-                    max_iterations == options.max_iterations,
+                    budget == options.max_iterations,
                     "expected LM exhaustion to surface as PIRLS non-convergence with screening cap"
                 );
+                assert!(
+                    iterations <= budget,
+                    "a solve cannot report more iterations ({iterations}) than its budget ({budget})"
+                );
+                assert!(!stop.is_empty(), "the refusal must name why the solve stopped");
                 assert!(last_change.is_finite() && last_change > 0.0);
             }
             other => {
@@ -3794,10 +3801,17 @@ mod root_cause_tests {
 
         match err {
             EstimationError::PirlsDidNotConverge {
-                max_iterations,
+                iterations,
+                budget,
+                stop,
                 last_change,
             } => {
-                assert_eq!(max_iterations, options.max_iterations);
+                assert_eq!(budget, options.max_iterations);
+                assert!(
+                    iterations <= budget,
+                    "a solve cannot report more iterations ({iterations}) than its budget ({budget})"
+                );
+                assert!(!stop.is_empty(), "the refusal must name why the solve stopped");
                 assert!(last_change.is_finite() && last_change > 0.0);
             }
             other => panic!("expected PirlsDidNotConverge, got {other:?}"),

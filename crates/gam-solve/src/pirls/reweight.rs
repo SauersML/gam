@@ -675,10 +675,14 @@ where
     }
     fn lm_nonconvergence_error(
         options: &WorkingModelPirlsOptions,
+        iteration: usize,
         last_change: f64,
     ) -> EstimationError {
         EstimationError::PirlsDidNotConverge {
-            max_iterations: options.max_iterations,
+            iterations: iteration,
+            budget: options.max_iterations,
+            stop: "the Levenberg-Marquardt damping reached its bound without an acceptable step"
+                .to_string(),
             last_change,
         }
     }
@@ -1537,6 +1541,7 @@ where
                                         );
                                         return Err(lm_nonconvergence_error(
                                             options,
+                                            iter,
                                             constrained_stationarity_norm(
                                                 &state.gradient,
                                                 beta.as_ref(),
@@ -2294,6 +2299,7 @@ where
                         );
                         return Err(lm_nonconvergence_error(
                             options,
+                            iter,
                             constrained_stationarity_norm(
                                 &state.gradient,
                                 beta.as_ref(),
@@ -2430,7 +2436,9 @@ where
     }
 
     let mut state = final_state.ok_or(EstimationError::PirlsDidNotConverge {
-        max_iterations: options.max_iterations,
+        iterations,
+        budget: options.max_iterations,
+        stop: "no step was accepted".to_string(),
         last_change: lastgradient_norm,
     })?;
 

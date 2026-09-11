@@ -429,10 +429,18 @@ pub enum EstimationError {
     ParameterConstraintViolation(String),
 
     #[error(
-        "The P-IRLS inner loop did not converge within {max_iterations} iterations. Last gradient norm was {last_change:.6e}."
+        "The P-IRLS inner loop stopped without converging after {iterations} of {budget} iteration(s): {stop}. Last gradient norm was {last_change:.6e}."
     )]
     PirlsDidNotConverge {
-        max_iterations: usize,
+        /// Iterations the solve actually ran before it stopped. A solve that
+        /// quits on a numerical plateau after 2 steps must not read as one that
+        /// spent its whole budget (#2705, #1561).
+        iterations: usize,
+        /// The iteration budget in force for that solve: the configured cap, or
+        /// the scheduled/screening cap when one applied.
+        budget: usize,
+        /// Why the solve stopped without a convergence certificate.
+        stop: String,
         last_change: f64,
     },
 
@@ -1095,7 +1103,9 @@ mod trial_point_classification_tests {
                 row_index: 2,
             },
             EstimationError::PirlsDidNotConverge {
-                max_iterations: 40,
+                iterations: 40,
+                budget: 40,
+                stop: "max iterations reached".to_string(),
                 last_change: 1.0e-2,
             },
             // The fifth shape. The fixture carried four while the table it
@@ -1307,7 +1317,9 @@ mod tests {
     fn pirls_did_not_converge_is_retreat() {
         assert!(
             EstimationError::PirlsDidNotConverge {
-                max_iterations: 100,
+                iterations: 7,
+                budget: 100,
+                stop: "LM step search exhausted".to_string(),
                 last_change: 1e-3
             }
             .is_inner_solve_retreat()
@@ -1354,12 +1366,19 @@ mod tests {
     }
 
     #[test]
-    fn pirls_did_not_converge_mentions_max_iterations() {
+    fn pirls_did_not_converge_names_iterations_budget_and_stop() {
+        // A solve that stopped after 3 of 42 iterations on a plateau must say so,
+        // not claim to have spent the budget (#2705, #1561).
         let err = EstimationError::PirlsDidNotConverge {
-            max_iterations: 42,
+            iterations: 3,
+            budget: 42,
+            stop: "LM step search exhausted".to_string(),
             last_change: 0.001,
         };
-        assert!(err.to_string().contains("42"));
+        let message = err.to_string();
+        assert!(message.contains("after 3 of 42 iteration(s)"), "{message}");
+        assert!(message.contains("LM step search exhausted"), "{message}");
+        assert!(!message.contains("within 42 iterations"), "{message}");
     }
 
     #[test]

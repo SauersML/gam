@@ -6443,6 +6443,27 @@ impl<'a> RemlState<'a> {
         self.execute_pirls_if_needed_with_row_policy(rho, true)
     }
 
+    /// The inner P-IRLS iteration budget in force for one solve: the configured
+    /// budget, lowered to the seed-screening cap while screening applies one and
+    /// to the outer schedule's cap when one is set. One definition, read both
+    /// where the solve is configured and where its non-convergence is reported,
+    /// so a refusal never names a budget the solve was not actually given (#2705).
+    fn effective_inner_iteration_budget(
+        configured: usize,
+        screening_iteration_cap_applies: bool,
+        screening_cap: usize,
+        outer_cap: usize,
+    ) -> usize {
+        let mut budget = configured;
+        if screening_iteration_cap_applies {
+            budget = budget.min(screening_cap);
+        }
+        if outer_cap > 0 {
+            budget = budget.min(outer_cap);
+        }
+        budget
+    }
+
     fn execute_pirls_if_needed_with_row_policy(
         &self,
         rho: &Array1<f64>,
@@ -6570,12 +6591,12 @@ impl<'a> RemlState<'a> {
             let warm_start_ref = predicted_warm_start.as_ref().or(fallback_warm_start_ref);
             let mut pirls_config = self.config.as_pirls_config();
             let original_cap = pirls_config.max_iterations;
-            if screening_iteration_cap_applies {
-                pirls_config.max_iterations = pirls_config.max_iterations.min(screening_cap);
-            }
-            if outer_cap > 0 {
-                pirls_config.max_iterations = pirls_config.max_iterations.min(outer_cap);
-            }
+            pirls_config.max_iterations = Self::effective_inner_iteration_budget(
+                original_cap,
+                screening_iteration_cap_applies,
+                screening_cap,
+                outer_cap,
+            );
             if !in_screening && outer_cap == 0 {
                 // Full-fidelity samples must resolve the inner mode at the
                 // accuracy the outer derivative budget permits. Resetting the
@@ -7471,7 +7492,14 @@ impl<'a> RemlState<'a> {
                     self.clear_ift_quality_runtime_state();
                 }
                 Err(EstimationError::PirlsDidNotConverge {
-                    max_iterations: pirls_result.iteration,
+                    iterations: pirls_result.iteration,
+                    budget: Self::effective_inner_iteration_budget(
+                        self.config.max_iterations,
+                        screening_iteration_cap_applies,
+                        screening_cap,
+                        outer_cap,
+                    ),
+                    stop: kind.to_string(),
                     last_change: pirls_result.lastgradient_norm,
                 })
             }
@@ -7683,8 +7711,12 @@ impl<'a> RemlState<'a> {
             }),
             pirls::PirlsStatus::MaxIterationsReached
             | pirls::PirlsStatus::LmStepSearchExhausted => {
+                // The stateless cubature solve runs under the configured budget
+                // (no scheduled or screening cap), so that is the budget reported.
                 Err(EstimationError::PirlsDidNotConverge {
-                    max_iterations: pirls_result.iteration,
+                    iterations: pirls_result.iteration,
+                    budget: self.config.max_iterations,
+                    stop: format!("{:?}", pirls_result.status),
                     last_change: pirls_result.lastgradient_norm,
                 })
             }
