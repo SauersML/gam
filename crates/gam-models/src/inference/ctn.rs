@@ -191,7 +191,7 @@ pub fn latent_scores(model: &FittedModel, data: ndarray::ArrayView2<'_, f64>,
 }
 
 /// Fit a shared native CTN/outcome payload, or attach an externally fitted CTN.
-pub fn fit_chain(formula: String, dataset: &EncodedDataset, config: &FitConfig) -> Result<FittedModelPayload, String> {
+fn validate_chain_inputs(dataset: &EncodedDataset, config: &FitConfig) -> Result<(), String> {
     if config.z_column.is_some() || config.frozen_score || (config.ctn_stage1.is_some() && config.frozen_ctn.is_some()) {
         return Err("CTN owns the latent score; external z_column/frozen_score and competing transforms are invalid".into());
     }
@@ -200,6 +200,50 @@ pub fn fit_chain(formula: String, dataset: &EncodedDataset, config: &FitConfig) 
         return Err("CTN composition requires a marginal-slope outcome".into());
     }
     if dataset.headers.iter().any(|name| name == SCORE) { return Err("reserved CTN score column already exists".into()); }
+    Ok(())
+}
+
+fn outcome_inputs(dataset: &EncodedDataset, config: &FitConfig, z: &Array1<f64>) -> (EncodedDataset, FitConfig) {
+    let mut outcome_data = dataset.clone();
+    let p = dataset.values.ncols();
+    let mut values = Array2::zeros((dataset.values.nrows(), p + 1));
+    values.slice_mut(ndarray::s![.., ..p]).assign(&dataset.values);
+    values.column_mut(p).assign(z);
+    outcome_data.values = values;
+    outcome_data.headers.push(SCORE.into());
+    outcome_data.column_kinds.push(ColumnKindTag::Continuous);
+    outcome_data.schema.columns.push(SchemaColumn { name: SCORE.into(), kind: ColumnKindTag::Continuous, levels: vec![] });
+    let mut outcome_config = config.clone();
+    outcome_config.ctn_stage1 = None;
+    outcome_config.frozen_ctn = None;
+    outcome_config.z_column = Some(SCORE.into());
+    outcome_config.frozen_score = true;
+    (outcome_data, outcome_config)
+}
+
+/// Prepare structural validation without fitting a score distribution. Recipe
+/// folds and all source columns are checked; the placeholder only describes
+/// the generated score's column geometry and is never used for a fitted model.
+pub fn structural_inputs(formula: &str, dataset: &EncodedDataset, config: &FitConfig)
+    -> Result<(EncodedDataset, FitConfig), String> {
+    validate_chain_inputs(dataset, config)?;
+    project(dataset, &required_fit_columns(formula, config)?)?;
+    let z = if let Some(frozen) = config.frozen_ctn.as_ref() {
+        let model = FittedModel::from_payload((*frozen.0).clone());
+        model.validate_for_persistence().map_err(|error| error.to_string())?;
+        scores_from_schema(&model, dataset.values.view(), &dataset.column_map(), &dataset.schema)?
+    } else {
+        let recipe = config.ctn_stage1.as_ref().ok_or("missing CTN input")?;
+        crossfit_assignment(dataset, recipe)?;
+        let n = dataset.values.nrows();
+        Array1::from_iter((0..n).map(|i| (i as f64 + 0.5) / n as f64 - 0.5))
+    };
+    Ok(outcome_inputs(dataset, config, &z))
+}
+
+/// Fit a shared native CTN/outcome payload, or attach an externally fitted CTN.
+pub fn fit_chain(formula: String, dataset: &EncodedDataset, config: &FitConfig) -> Result<FittedModelPayload, String> {
+    validate_chain_inputs(dataset, config)?;
     let columns = dataset.column_map();
     let (transform, z, folds) = if let Some(frozen) = config.frozen_ctn.as_ref() {
         let model = FittedModel::from_payload((*frozen.0).clone());
@@ -233,20 +277,7 @@ pub fn fit_chain(formula: String, dataset: &EncodedDataset, config: &FitConfig) 
         (transform, z, Some(folds))
     };
     if !z.iter().all(|value| value.is_finite()) { return Err("CTN produced nonfinite scores".into()); }
-    let mut outcome_data = dataset.clone();
-    let p = dataset.values.ncols();
-    let mut values = Array2::zeros((dataset.values.nrows(), p + 1));
-    values.slice_mut(ndarray::s![.., ..p]).assign(&dataset.values);
-    values.column_mut(p).assign(&z);
-    outcome_data.values = values;
-    outcome_data.headers.push(SCORE.into());
-    outcome_data.column_kinds.push(ColumnKindTag::Continuous);
-    outcome_data.schema.columns.push(SchemaColumn { name: SCORE.into(), kind: ColumnKindTag::Continuous, levels: vec![] });
-    let mut outcome_config = config.clone();
-    outcome_config.ctn_stage1 = None;
-    outcome_config.frozen_ctn = None;
-    outcome_config.z_column = Some(SCORE.into());
-    outcome_config.frozen_score = true;
+    let (outcome_data, outcome_config) = outcome_inputs(dataset, config, &z);
     let mut payload = fit_formula_to_payload(formula, &outcome_data, &outcome_config).map_err(|error| error.to_string())?;
     payload.score_transform = Some(Box::new(transform));
     payload.score_crossfit_folds = folds;

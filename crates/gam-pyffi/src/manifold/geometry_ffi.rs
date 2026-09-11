@@ -7126,39 +7126,10 @@ fn validate_formula_dataset_json_impl(
     config_json: Option<&str>,
 ) -> Result<String, String> {
     let mut fit_config = parse_fit_config(config_json)?;
-    // Calibrated marginal-slope chain (#461): validation is purely structural and
-    // must stay cheap — it must NOT cross-fit Stage-1. When a CTN Stage-1 recipe
-    // is present, strip it and stand in a zero-valued placeholder dose column so
-    // the Stage-2 marginal-slope structure validates without any Stage-1 fit or
-    // cross-fit. The real fit produces `z` out-of-fold and needs no such column.
-    if fit_config.ctn_stage1.is_some() {
-        const VALIDATION_PLACEHOLDER_Z: &str = "__gam_validation_ctn_stage1_z";
-        fit_config.ctn_stage1 = None;
-        if dataset
-            .headers
-            .iter()
-            .any(|name| name == VALIDATION_PLACEHOLDER_Z)
-        {
-            return Err(format!(
-                "reserved validation column '{VALIDATION_PLACEHOLDER_Z}' already exists in the \
-                 input data; rename it before validating the calibrated chain"
-            ));
-        }
-        let n = dataset.values.nrows();
-        let old_cols = dataset.values.ncols();
-        let mut values = Array2::<f64>::zeros((n, old_cols + 1));
-        values.slice_mut(s![.., ..old_cols]).assign(&dataset.values);
-        dataset.values = values;
-        dataset.headers.push(VALIDATION_PLACEHOLDER_Z.to_string());
-        dataset
-            .column_kinds
-            .push(gam::data::ColumnKindTag::Continuous);
-        dataset.schema.columns.push(gam::data::SchemaColumn {
-            name: VALIDATION_PLACEHOLDER_Z.to_string(),
-            kind: gam::data::ColumnKindTag::Continuous,
-            levels: Vec::new(),
-        });
-        fit_config.z_column = Some(VALIDATION_PLACEHOLDER_Z.to_string());
+    if fit_config.ctn_stage1.is_some() || fit_config.frozen_ctn.is_some() {
+        (dataset, fit_config) = gam::inference::ctn::structural_inputs(
+            &formula, &dataset, &fit_config,
+        )?;
     }
     // Structural-only: validate must NOT fit. The survival baseline-θ resolution
     // (a real BFGS-over-`fit_model` inner fit for location-scale / latent modes)

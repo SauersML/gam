@@ -1670,7 +1670,6 @@ def validate_formula(
     FormulaValidation
         Structured validation diagnostics from the Rust parser/materializer.
     """
-    headers, rows, _table_kind = normalize_table(data)
     rust_config = dict(config or {})
     for key in (
         "response_geometry",
@@ -1713,6 +1712,10 @@ def validate_formula(
         config=rust_config or None,
     )
     try:
+        required_columns = None
+        if payload.get("ctn_stage1") is not None or payload.get("frozen_ctn") is not None:
+            required_columns = rust_module().ctn_required_fit_columns(formula, json.dumps(payload))
+        headers, rows, _table_kind = normalize_table(data, required_columns=required_columns)
         raw = rust_module().validate_formula_json(
             headers,
             rows,

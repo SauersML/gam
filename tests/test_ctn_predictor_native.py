@@ -13,6 +13,11 @@ def test_native_ctn_chain_save_load_and_batches(tmp_path):
                          "y": (rng.normal(size=n) < -.2 + .3 * x + .5 * z).astype(int),
                          "group": np.arange(n)})
     data["irrelevant_date"] = pd.Timestamp("2020-01-01")
+    gamfit.validate_formula(
+        data, "y ~ x", family="bernoulli-marginal-slope", slope_formula="1",
+        transformation_normal_stage1=gamfit.CtnStage1(
+            "pgs", "x", group_column="group", folds=2,
+            response_num_internal_knots=2))
     model = gamfit.fit(
         data, "y ~ x", family="bernoulli-marginal-slope", slope_formula="1",
         transformation_normal_stage1=gamfit.CtnStage1(
@@ -38,6 +43,9 @@ def test_native_ctn_chain_save_load_and_batches(tmp_path):
     np.testing.assert_allclose(manual, before, rtol=1e-8, atol=1e-10)
     assert transform_payload["score_transform"] is None
     transform = gamfit.loads(json.dumps({"model_type": "transformation-normal", "payload": transform_payload}).encode())
+    gamfit.validate_formula(
+        data, "y ~ x", family="bernoulli-marginal-slope", slope_formula="1",
+        transformation_normal_stage1=transform)
     attached = gamfit.fit(
         data, "y ~ x", family="bernoulli-marginal-slope", slope_formula="1",
         transformation_normal_stage1=transform,
