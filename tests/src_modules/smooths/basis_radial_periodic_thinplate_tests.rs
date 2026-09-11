@@ -2212,6 +2212,51 @@ fn periodic_hybrid_duchon_kernel_matches_spectral_sum_and_is_psd_2372() {
     }
 }
 
+/// The log-κ jet returned by `periodic_hybrid_duchon_kernel_psi_triplet` must be
+/// the exact ψ-derivatives (ψ = ln κ) of the periodized kernel value, so the
+/// forward design and its optimizer-facing derivative stay consistent
+/// (gam#2372). Central-difference oracle on the value.
+#[test]
+fn periodic_hybrid_duchon_psi_triplet_matchesfd_2372() {
+    let period = 1.0_f64;
+    let p_order = 1usize;
+    // Optimal step for a central 2nd difference is ~machine_eps^{1/4} ≈ 1e-4; a
+    // smaller step is rounding-dominated (the analytic derivatives are exact).
+    let eps = 1e-4_f64;
+    for &ls in &[0.25_f64, 0.5, 1.0] {
+        let kappa = 1.0 / ls;
+        let psi0 = kappa.ln();
+        for &s in &[1usize, 2] {
+            for &r in &[0.07_f64, 0.23, 0.41] {
+                let (value, d1, d2) =
+                    periodic_hybrid_duchon_kernel_psi_triplet(r, kappa, p_order, s, period).unwrap();
+                let val =
+                    |psi: f64| periodic_hybrid_duchon_kernel_value(r, psi.exp(), p_order, s, period)
+                        .unwrap();
+                let plus = val(psi0 + eps);
+                let minus = val(psi0 - eps);
+                let base = val(psi0);
+                assert!((value - base).abs() < 1e-12 * base.abs().max(1.0));
+                let fd1 = (plus - minus) / (2.0 * eps);
+                let fd2 = (plus - 2.0 * base + minus) / (eps * eps);
+                let scale1 = fd1.abs().max(base.abs()).max(1e-12);
+                let scale2 = fd2.abs().max(base.abs()).max(1e-12);
+                // The 1st central difference is clean (~1e-9); the 2nd is
+                // FD-noise limited, so it is only asked to catch a gross
+                // derivative error (a real bug is O(1) off, not O(1e-3)).
+                assert!(
+                    (d1 - fd1).abs() < 1e-6 * scale1,
+                    "dψ mismatch ls={ls} s={s} r={r}: analytic={d1:.6e} fd={fd1:.6e}"
+                );
+                assert!(
+                    (d2 - fd2).abs() < 3e-3 * scale2,
+                    "d²ψ mismatch ls={ls} s={s} r={r}: analytic={d2:.6e} fd={fd2:.6e}"
+                );
+            }
+        }
+    }
+}
+
 /// The end-to-end cyclic hybrid Duchon basis must build a PSD penalty (no
 /// `IndefinitePenalty` refusal) across the reachable length-scale range — a
 /// black-box guard against a regression of the cut-and-wrap indefiniteness
