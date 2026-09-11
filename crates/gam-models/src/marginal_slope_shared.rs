@@ -878,13 +878,6 @@ pub const AUTO_OUTER_WORK_BUDGET: u64 = 500_000_000;
 /// usable for BFGS Phase 1 progress when the family is very expensive.
 pub const AUTO_OUTER_MIN_K_FLOOR: usize = 1_000;
 
-/// L2 distance below which two outer ρ keys are treated as the *same* outer
-/// step (a line-search retry, not a fresh outer iteration). Well below any
-/// meaningful BFGS step on log-scale ρ, well above float-noise from cloning
-/// the ρ vector. Used to keep the phase-1 budget counting outer iterations
-/// rather than per-step function evaluations.
-const AUTO_OUTER_DISTINCT_STEP_L2_TOL: f64 = 1e-10;
-
 /// Reason the auto schedule chose the reported `K`. Used by the
 /// `[family auto-subsample]` log line so operators can tell whether the
 /// noise model, the work budget, the `MIN_K_FLOOR`, or `n` itself
@@ -1085,7 +1078,13 @@ pub fn maybe_install_auto_outer_subsample(
                     let d = a - b;
                     sq += d * d;
                 }
-                sq.sqrt() > AUTO_OUTER_DISTINCT_STEP_L2_TOL
+                // The phase-1 budget counts outer iterations, not evaluations: keys
+                // that differ only inside the distance's own rounding band `γ·‖ρ‖`
+                // are one outer step evaluated again.
+                let norm = outer_rho_key.iter().map(|v| v * v).sum::<f64>().sqrt();
+                sq.sqrt()
+                    > gam_linalg::roundoff::accumulation_growth(3 * outer_rho_key.len() + 1)
+                        * norm
             }
         };
         if new_step {

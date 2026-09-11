@@ -102,12 +102,12 @@ pub const PSI_GRAM_SKIP_PROJ_ATOL: f64 = 1.0e-7;
 /// Bisection budget for the rank-stable ψ-band edge search
 /// ([`PsiGramTensor::rank_stable_psi_floor`] / `_ceiling`). The band edge is a
 /// monotone crossing of the projector witness, so bisection converges to the
-/// true edge in `ceil(log2(span/atol))` steps — 64 caps any window to well
-/// below machine precision, and the relative `ATOL` break stops earlier in
-/// practice. Replaces the former fixed 96-node grid scan (SPEC: grid search is
-/// never allowed, #2054); each witness eval is O(k³), independent of n.
+/// true edge, and the loop stops once the bracket's ends are adjacent floats (no
+/// representable ψ lies strictly between them); 64 halvings reach that from any
+/// window of width at most `2¹²·|ψ|`. Replaces the former fixed 96-node grid scan
+/// (SPEC: grid search is never allowed, #2054); each witness eval is O(k³),
+/// independent of n.
 const PSI_BAND_BISECTION_ITERS: usize = 64;
-const PSI_BAND_BISECTION_ATOL: f64 = 1.0e-10;
 
 /// Slack on the symmetric eigensolver's backward-error bound, used to size the
 /// band-edge rank guard ([`PsiGramTensor::rank_guard_gap`]).
@@ -1357,10 +1357,10 @@ impl PsiGramTensor {
         // Invariant: `accepts(hi)` true, `accepts(lo)` false; the lower band edge
         // is the unique crossing in `(lo, hi]`. Return the lowest accepting ψ.
         for _ in 0..PSI_BAND_BISECTION_ITERS {
-            if hi - lo <= PSI_BAND_BISECTION_ATOL * (1.0 + hi.abs()) {
+            let mid = 0.5 * (lo + hi);
+            if !(lo < mid && mid < hi) {
                 break;
             }
-            let mid = 0.5 * (lo + hi);
             if accepts(mid) {
                 hi = mid;
             } else {
@@ -1421,10 +1421,10 @@ impl PsiGramTensor {
         // Invariant: `accepts(lo)` true, `accepts(hi)` false; the upper band edge
         // is the unique crossing in `[lo, hi)`. Return the highest accepting ψ.
         for _ in 0..PSI_BAND_BISECTION_ITERS {
-            if hi - lo <= PSI_BAND_BISECTION_ATOL * (1.0 + hi.abs()) {
+            let mid = 0.5 * (lo + hi);
+            if !(lo < mid && mid < hi) {
                 break;
             }
-            let mid = 0.5 * (lo + hi);
             if accepts(mid) {
                 lo = mid;
             } else {

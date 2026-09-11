@@ -1709,7 +1709,9 @@ pub fn monotone_survival_and_hazard_scores(
             j = grid.len() - 1;
         }
         let interval_idx = j.saturating_sub(1);
-        let (h_z, h2_int, hcum_z) = if (grid[j] - time).abs() <= GRID_COINCIDENCE_TOLERANCE {
+        // An event time on a grid point reads the prefix sums there; any other time
+        // adds its interval's correction, which reaches the same values continuously.
+        let (h_z, h2_int, hcum_z) = if grid[j] == time {
             (
                 haz[[row, interval_idx]],
                 haz_sq_prefix[[row, j]],
@@ -1735,11 +1737,6 @@ pub fn monotone_survival_and_hazard_scores(
         },
     )
 }
-
-/// An event time this close to a grid point is treated as landing exactly on
-/// it, so the score reads the prefix sums directly instead of adding a
-/// zero-width interval correction.
-const GRID_COINCIDENCE_TOLERANCE: f64 = 1.0e-12;
 
 /// Integrated IPCW Brier score (IBS) — the time-integrated [`ipcw_brier_score`],
 /// matching scikit-survival's `integrated_brier_score` and `pec`'s integrated

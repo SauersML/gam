@@ -778,5 +778,18 @@
     ],
     "reason": "#2469: AUTOCOVARIANCE_FLOOR (1e-16) floored split-chain variances in the ESS estimate, now a constant-to-working-precision test against the mean rounding band gamma_{n+1}*max|x|; AUGMENTED_MODE_DECREMENT_TOLERANCE (1e-10) stopped the multinomial predictive Newton solve, now at the log-posterior rounding band; OBJECTIVE_DECREASE_SLACK (an absolute 1e-12) padded the vector-GLM line-search acceptance, now the objective rounding band gamma*|f|.",
     "evidence": "At the base, git grep finds AUTOCOVARIANCE_FLOOR only in crates/gam-inference/src/hmc_io.rs, AUGMENTED_MODE_DECREMENT_TOLERANCE only in crates/gam-models/src/multinomial_predictive.rs, and OBJECTIVE_DECREASE_SLACK only in crates/gam-models/src/penalized_vector_glm.rs; each file is edited here."
+  },
+  {
+    "base": "df0a267a34abaee7ec946c8b0f3d51b89ba64727",
+    "items": [
+      "crates/gam-geometry/src/manifolds/constant_curvature.rs:const:MOBIUS_DENOM_EPS",
+      "crates/gam-identifiability/src/kernel.rs:const:AUX_LEVEL_DEDUP_TOL",
+      "crates/gam-models/src/marginal_slope_shared.rs:const:AUTO_OUTER_DISTINCT_STEP_L2_TOL",
+      "crates/gam-models/src/survival/predict.rs:const:GRID_COINCIDENCE_TOLERANCE",
+      "crates/gam-solve/src/psi_gram_tensor.rs:const:PSI_BAND_BISECTION_ATOL",
+      "crates/gam-terms/src/smooth_overrides.rs:const:MATERN_NU_HALF_INTEGER_TOL"
+    ],
+    "reason": "#2469: six declared tolerances. AUX_LEVEL_DEDUP_TOL (1e-12) is exact deduplication of integer-valued levels; MATERN_NU_HALF_INTEGER_TOL (1e-9) is equality with exactly representable half-integers; GRID_COINCIDENCE_TOLERANCE (1e-12) is exact coincidence, the interval branch being continuous at the grid point; PSI_BAND_BISECTION_ATOL (1e-10) is bisection to adjacent floats; MOBIUS_DENOM_EPS (1e-14) is the Mobius denominator rounding band; AUTO_OUTER_DISTINCT_STEP_L2_TOL (1e-10) is the rounding band of the key distance.",
+    "evidence": "At the base, git grep finds each name only in the one file that declares it (gam-identifiability kernel.rs, gam-terms smooth_overrides.rs, gam-models survival/predict.rs, gam-solve psi_gram_tensor.rs, gam-geometry manifolds/constant_curvature.rs, gam-models marginal_slope_shared.rs), and this commit replaces every use there."
   }
 ]

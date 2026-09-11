@@ -13,11 +13,6 @@ use ndarray::{Array2, ArrayView2, Axis};
 /// theorem is stated for); above it the column is treated as continuous.
 const AUX_DISCRETE_MAX_LEVELS: usize = 64;
 
-/// Absolute gap below which two aux values count as the same distinct level.
-/// Integer-valued aux data dedups exactly; this only guards float dust from
-/// the `round()` check above.
-const AUX_LEVEL_DEDUP_TOL: f64 = 1.0e-12;
-
 /// Scalar facts about the auxiliary covariate / latent pair feeding an iVAE.
 #[derive(Debug, Clone)]
 pub struct AuxRichnessMetrics {
@@ -98,7 +93,9 @@ pub fn aux_richness_metrics(aux: ArrayView2<f64>, latents: ArrayView2<f64>) -> A
                 let col = aux.column(j);
                 let mut sorted: Vec<f64> = col.iter().copied().collect();
                 sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-                sorted.dedup_by(|a, b| (*a - *b).abs() < AUX_LEVEL_DEDUP_TOL);
+                // A discrete column passed the integer check, so two samples of one
+                // level are the same float and distinct levels differ by at least 1.
+                sorted.dedup();
                 if sorted.len() > AUX_DISCRETE_MAX_LEVELS {
                     discrete = false;
                     break;

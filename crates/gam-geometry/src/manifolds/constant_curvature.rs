@@ -97,10 +97,6 @@ const T_SERIES_W_MAX: f64 = 0.25;
 /// truncation tail at the branch edge.
 const T_SERIES_TERMS: usize = 48;
 
-/// Möbius-addition denominators below this are treated as the κ > 0
-/// antipodal singularity (the one point the stereographic chart misses).
-const MOBIUS_DENOM_EPS: f64 = 1.0e-14;
-
 /// Derivative stacks `[f, f′, f″, f‴, f⁗]` (in `u`) of the entire
 /// functions `C(u)` and `S(u)`. Exact: series inside
 /// `CS_SERIES_U_MAX`, closed forms + the mutual recurrence outside.
@@ -804,7 +800,14 @@ impl ConstantCurvature {
         let xx = x.dot(&x);
         let yy = y.dot(&y);
         let denom = 1.0 - 2.0 * k * xy + k * k * xx * yy;
-        if denom.abs() <= MOBIUS_DENOM_EPS {
+        // Three rounded terms built from `d`-term dot products: a denominator inside
+        // that accumulation's rounding band is the κ > 0 antipodal singularity (the
+        // one point the stereographic chart misses) to working precision.
+        let denom_band = gam_linalg::roundoff::accumulation_band(
+            2 * x.len() + 3,
+            1.0 + (2.0 * k * xy).abs() + k * k * xx * yy,
+        );
+        if denom.abs() <= denom_band {
             return Err(GeometryError::Singular(
                 "Möbius addition at the κ>0 antipodal point",
             ));
@@ -1137,7 +1140,12 @@ impl RiemannianManifold for ConstantCurvature {
         let a = 1.0 - 2.0 * k * p - k * ss;
         let b = 1.0 + k * xx; // = gauge
         let denom = 1.0 - 2.0 * k * p + k * k * xx * ss;
-        if denom.abs() <= MOBIUS_DENOM_EPS {
+        // Same antipodal test as `mobius_add`: the denominator's rounding band.
+        let denom_band = gam_linalg::roundoff::accumulation_band(
+            2 * point.len() + 3,
+            1.0 + (2.0 * k * p).abs() + k * k * xx * ss,
+        );
+        if denom.abs() <= denom_band {
             return Err(GeometryError::Singular(
                 "Möbius addition at the κ>0 antipodal point",
             ));
