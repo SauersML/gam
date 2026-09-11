@@ -503,3 +503,147 @@ fn analytic_hessian_matches_fd_under_rank_deficient_penalty() {
     );
 }
 
+// -----------------------------------------------------------------------
+// Test 4: a weak-tail penalty sharing its range with a second penalty, at a large λ
+// -----------------------------------------------------------------------
+
+/// The eigenvalues of the weak-tail penalty, largest first. Ten decades wide, so
+/// the two smallest sit under the canonical penalty rank cut
+/// `dim · SPECTRAL_RANK_RELATIVE_TOLERANCE · max|ev|` = `10 · 1e-10 · 1` = 1e-9.
+const WEAK_TAIL_SPECTRUM: [f64; 10] = [1.0, 5e-5, 1e-6, 8e-8, 2e-8, 5e-9, 3e-9, 2e-9, 5e-10, 5e-11];
+
+/// n=60 Gaussian-identity problem: an intercept and one 10-column block penalized
+/// by TWO non-orthogonal components on the same range.
+///
+/// `s_tail = Q diag(WEAK_TAIL_SPECTRUM) Qᵀ` in a rotated orthonormal basis `Q`, and
+/// `s_mix` is a rank-2 penalty mixing the tail's weakest eigenvectors with its
+/// strongest, so the two components are not orthogonal. The columns are scaled
+/// so the likelihood curvature is about 0.8 per direction. At `λ_tail = e^19.5` the
+/// directions the rank cut calls null still carry penalty curvature
+/// `λ·5e-10 ≈ 0.15` and `λ·5e-11 ≈ 0.015`, which is not negligible against 0.8.
+///
+/// This is the shape of q1561-qa2's defect A: a survival transformation fit
+/// (Weibull by-factor) where the analytic ρ-gradient read −1.53e-2 on exactly one
+/// weak-tail block sharing its range with another block, while a central difference
+/// stable across four decades of h read +0.317.
+///
+/// This test holds the standard lane to one penalty for the value and the gradient
+/// where the rank cut drops directions. The survival lane's inner solve runs on the
+/// raw blocks rather than on the canonical roots, so this lane passing does not cover
+/// that one.
+fn build_gaussian_weak_tail_shared_range(
+    seed: u64,
+) -> (Array2<f64>, Array1<f64>, Array1<f64>, Vec<BlockwisePenalty>) {
+    let n = 60usize;
+    let k = WEAK_TAIL_SPECTRUM.len();
+    let p = 1 + k;
+    let column_scale = 0.2_f64;
+    let mut rng = StdRng::seed_from_u64(seed);
+
+    let mut x = Array2::<f64>::zeros((n, p));
+    for i in 0..n {
+        x[[i, 0]] = 1.0;
+        for j in 1..p {
+            x[[i, j]] = column_scale * rng.random_range(-1.0..1.0);
+        }
+    }
+    let mut beta = Array1::<f64>::zeros(p);
+    beta[0] = 0.3;
+    for j in 1..p {
+        beta[j] = 0.5 / (j as f64).sqrt();
+    }
+    let eta = x.dot(&beta);
+    let y = Array1::from_iter(eta.iter().map(|e| e + rng.random_range(-0.3..0.3)));
+    let w = Array1::<f64>::ones(n);
+
+    // A deterministic rotated orthonormal basis: Gram–Schmidt on a fixed
+    // pseudo-random matrix, so neither penalty is diagonal in the design's columns.
+    let mut q = Array2::<f64>::zeros((k, k));
+    for j in 0..k {
+        let mut column = Array1::from_iter((0..k).map(|_| rng.random_range(-1.0..1.0)));
+        for previous in 0..j {
+            let basis = q.column(previous).to_owned();
+            let projection = column.dot(&basis);
+            column.scaled_add(-projection, &basis);
+        }
+        let norm = column.dot(&column).sqrt();
+        column.mapv_inplace(|value| value / norm);
+        q.column_mut(j).assign(&column);
+    }
+
+    let mut s_tail = Array2::<f64>::zeros((k, k));
+    for (j, &eigenvalue) in WEAK_TAIL_SPECTRUM.iter().enumerate() {
+        let basis = q.column(j).to_owned();
+        for r in 0..k {
+            for c in 0..k {
+                s_tail[[r, c]] += eigenvalue * basis[r] * basis[c];
+            }
+        }
+    }
+
+    let inv_sqrt2 = std::f64::consts::FRAC_1_SQRT_2;
+    let v1 = (&q.column(k - 2) + &q.column(0)).mapv(|value| value * inv_sqrt2);
+    let v2 = (&q.column(k - 1) - &q.column(1)).mapv(|value| value * inv_sqrt2);
+    let mut s_mix = Array2::<f64>::zeros((k, k));
+    for r in 0..k {
+        for c in 0..k {
+            s_mix[[r, c]] = v1[r] * v1[c] + v2[r] * v2[c];
+        }
+    }
+
+    (
+        x,
+        y,
+        w,
+        vec![
+            BlockwisePenalty::new(1..p, s_tail),
+            BlockwisePenalty::new(1..p, s_mix),
+        ],
+    )
+}
+
+#[test]
+fn weak_tail_penalty_sharing_a_range_gradient_matches_finite_difference() {
+    // Non-vacuity: exactly two of the tail's eigenvalues must sit under the rank cut,
+    // or this fixture does not exercise the directions it exists for.
+    let cut = WEAK_TAIL_SPECTRUM.len() as f64
+        * 1e-10
+        * WEAK_TAIL_SPECTRUM.iter().fold(0.0_f64, |acc, v| acc.max(v.abs()));
+    let under_cut = WEAK_TAIL_SPECTRUM.iter().filter(|&&v| v <= cut).count();
+    assert_eq!(
+        under_cut, 2,
+        "fixture must put exactly two tail eigenvalues under the rank cut {cut:.3e}"
+    );
+
+    let (x, y, w, s_list) = build_gaussian_weak_tail_shared_range(29);
+    let offset = Array1::<f64>::zeros(y.len());
+    // Mathematical null dimensions: the tail penalty is full rank on its block,
+    // and the rank-2 mixing penalty leaves 8 of 10 directions unpenalized.
+    let opts = gaussian_opts(vec![0, 8]);
+
+    let rho = Array1::from(vec![19.5_f64, 0.0_f64]);
+    // Same step as Test 1. The inner tolerance 1e-12 bounds the difference quotient's
+    // noise near 1e-7; the relative bar 1e-3 is far above that and far below the
+    // O(1e-1) gap the q1561-qa2 receipt showed on the weak-tail coordinate.
+    let h = 1e-5_f64;
+    let analytic = grad_at(&y, &w, &x, &offset, &s_list, &opts, &rho);
+    let fd = fd_grad_centered(&y, &w, &x, &offset, &s_list, &opts, &rho, h);
+    let rel = max_rel_err_vec(&analytic, &fd, 1e-3);
+    eprintln!(
+        "[grad_fd weak-tail shared range] rho={:?} analytic={:?} fd={:?} rel={:.3e}",
+        rho.to_vec(),
+        analytic.to_vec(),
+        fd.to_vec(),
+        rel,
+    );
+    assert!(
+        rel < 1e-3,
+        "analytic ∇V disagrees with the central difference of V on a weak-tail penalty \
+         sharing its range with a second penalty (λ_tail = e^19.5): worst rel_err = {rel:.3e}, \
+         analytic={:?}, fd={:?}. The criterion's value sees the full penalty; its ρ-gradient must \
+         describe the same function.",
+        analytic.to_vec(),
+        fd.to_vec(),
+    );
+}
+
