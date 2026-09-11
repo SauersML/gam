@@ -3595,7 +3595,26 @@ pub fn check_map_uniqueness(
         g
     };
 
-    // Eigendecompose G = V diag(λ) V^T (symmetric).
+    // Equilibrate before taking the eigen floor. The null space of `JᵀWJ` does
+    // not depend on the units of a design column, but the floor below does:
+    // `eigh` resolves eigenvalues only to a few `ε·λ_max`, so one column in
+    // large units raises the floor above well-resolved curvature in every
+    // unit-scale column and calls it null. A latent-survival time block whose
+    // stacked derivative channel reaches 2.7e5 at a left-clipped time put
+    // λ_max at 5.4e12 and refused an eigenvalue of 9.1e-2, right after
+    // `rank(J_can) = p_red` had been certified on the same matrix (#1561).
+    // Scaling by the column norms `D = diag(G)^{-1/2}` makes the verdict
+    // invariant to those units, as the audit already is to penalty units. A
+    // column with no mass keeps unit scale, so it stays an exact null direction.
+    let col_scale: Array1<f64> = g
+        .diag()
+        .mapv(|gjj| if gjj > 0.0 { gjj.sqrt().recip() } else { 1.0 });
+    let mut g = g;
+    for ((i, j), value) in g.indexed_iter_mut() {
+        *value *= col_scale[i] * col_scale[j];
+    }
+
+    // Eigendecompose the equilibrated G = V diag(λ) V^T (symmetric).
     let (evals, evecs) = match g.eigh(Side::Lower) {
         Ok(pair) => pair,
         Err(e) => {
@@ -3636,19 +3655,25 @@ pub fn check_map_uniqueness(
     let pen_tol = null_tol * s_frob_sq.sqrt().max(1.0);
 
     for (dir_idx, (lam, evec_col)) in null_dirs.iter().enumerate() {
-        let n_vec = evecs.column(*evec_col);
+        // Back to the design's own units: `J·D·u = 0` means `J·(D·u) = 0`, and
+        // the penalty is in those units, so it is tested on unit `n = D·u`.
+        let mut n_vec: Array1<f64> = &evecs.column(*evec_col) * &col_scale;
+        let n_norm = n_vec.dot(&n_vec).sqrt();
+        if n_norm > 0.0 {
+            n_vec /= n_norm;
+        }
         // Compute n^T S n
-        let sn: Array1<f64> = s_joint.dot(&n_vec.to_owned());
+        let sn: Array1<f64> = s_joint.dot(&n_vec);
         let ntsn: f64 = n_vec.iter().zip(sn.iter()).map(|(ni, si)| ni * si).sum();
 
         if ntsn < pen_tol {
             // Find the dominant block: the block whose columns have the
             // largest cumulative squared component in n_vec.
-            let dominant_block =
-                dominant_block_for_direction(&n_vec.to_owned(), specs, col_offsets);
+            let dominant_block = dominant_block_for_direction(&n_vec, specs, col_offsets);
 
             let message = format!(
-                "MAP estimate is non-unique: null direction {} of J^T W J (eigenvalue {lam:.3e}) \
+                "MAP estimate is non-unique: null direction {} of J^T W J (equilibrated \
+                 eigenvalue {lam:.3e}) \
                  has n^T S n = {ntsn:.3e} < tolerance {pen_tol:.3e}; \
                  the MAP is flat along this direction (no likelihood curvature, no penalty \
                  curvature); dominant block: '{}'. \
@@ -3705,6 +3730,77 @@ mod tests {
             return ndarray::Array1::<f64>::zeros(n.max(1));
         }
         ndarray::Array1::linspace(-1.0, 1.0, n)
+    }
+
+    /// The MAP-uniqueness verdict must not depend on the units of one design
+    /// column. A latent-survival time block stacks a derivative channel whose
+    /// entries reach ~1e5 at a left-clipped time; on the raw Gram that column
+    /// raised the eigen floor above a direction with curvature ~1e-1 and refused
+    /// a unique MAP (#1561). Both arms run at every unit of the large column: a
+    /// weak but genuine direction is unique, and an exactly aliased pair with no
+    /// penalty on it still refuses, so equilibration cannot manufacture rank.
+    #[test]
+    fn map_uniqueness_verdict_is_invariant_to_design_column_units() {
+        let n = 40;
+        let t = linspace(n);
+        let unpenalized = Array2::<f64>::zeros((3, 3));
+        let col_offsets = [0usize, 3];
+        for scale in [1.0, 1e6, 1e-6] {
+            let mut design = Array2::<f64>::zeros((n, 3));
+            for i in 0..n {
+                design[[i, 0]] = scale * t[i];
+                design[[i, 1]] = 1.0;
+                design[[i, 2]] = if i % 2 == 0 { 1.05 } else { 0.95 };
+            }
+            // J has known rank 3 by the module's own RRQR convention.
+            let known_rank = rrqr_with_permutation(&design, default_rrqr_rank_alpha())
+                .unwrap()
+                .rank;
+            assert_eq!(known_rank, 3, "scale {scale:e}: fixture design must be full rank");
+            if scale == 1e6 {
+                // The regime this pins: the weak direction's Gram eigenvalue sits
+                // BETWEEN the singular-value cutoff squared (so J is full rank)
+                // and the raw eigen floor `α·ε·p·λ_max` (so the unequilibrated
+                // check called it null).
+                let (raw_evals, _) = design.t().dot(&design).eigh(Side::Lower).unwrap();
+                let raw_max = raw_evals.iter().copied().fold(0.0_f64, f64::max);
+                let raw_min = raw_evals.iter().copied().fold(f64::INFINITY, f64::min);
+                let alpha_eps = default_rrqr_rank_alpha() * f64::EPSILON;
+                let squared_floor = alpha_eps * 3.0 * raw_max;
+                let singular_cutoff = alpha_eps * (n as f64) * raw_max.sqrt();
+                assert!(
+                    singular_cutoff * singular_cutoff < raw_min && raw_min < squared_floor,
+                    "fixture no longer exercises the swallowed-curvature regime: min eigenvalue \
+                     {raw_min:.3e} not inside ({:.3e}, {squared_floor:.3e})",
+                    singular_cutoff * singular_cutoff
+                );
+            }
+            let specs = [spec_from_dense("time_transform", design.clone())];
+            let verdict = check_map_uniqueness(&design, &[], &unpenalized, &specs, &col_offsets);
+            assert!(
+                verdict.is_ok(),
+                "scale {scale:e}: a direction with resolvable curvature is not a null \
+                 direction: {}",
+                verdict.err().map(|error| error.message).unwrap_or_default()
+            );
+
+            let mut aliased = design.clone();
+            aliased.column_mut(2).fill(1.0);
+            let aliased_rank = rrqr_with_permutation(&aliased, default_rrqr_rank_alpha())
+                .unwrap()
+                .rank;
+            assert_eq!(aliased_rank, 2, "scale {scale:e}: aliased design must lose one rank");
+            let aliased_specs = [spec_from_dense("time_transform", aliased.clone())];
+            let error =
+                check_map_uniqueness(&aliased, &[], &unpenalized, &aliased_specs, &col_offsets)
+                    .expect_err("an exactly aliased, unpenalized pair must refuse at every scale");
+            assert!(
+                error.penalty_quadratic_form.abs() < 1e-8,
+                "scale {scale:e}: the refused direction must carry no penalty, got {:.3e}",
+                error.penalty_quadratic_form
+            );
+            assert_eq!(error.dominant_block, "time_transform");
+        }
     }
 
     #[test]
