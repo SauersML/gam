@@ -8,8 +8,8 @@
 //! period_end=s+2π)` for any `s` describes the identical wrap-around topology.
 //! The cyclic penalty `S = D'D` is built on the coefficient RING with
 //! wrap-around difference stencils, so it is circulant — no coefficient (hence no
-//! seam location) is privileged — and the uniform cyclic knot grid is a rigid
-//! rotation of itself under a shift of `period_start`. REML therefore selects one
+//! seam location) is privileged — and the uniform cyclic knot grid shifted by a
+//! whole knot spacing is the same grid relabelled. REML therefore selects one
 //! smoothing parameter for a penalty family that is symmetric under the seam
 //! shift, and the fitted curve as a function of the PHYSICAL angle must be a
 //! property of the data, not of which phase the user anchored the seam to.
@@ -19,12 +19,19 @@
 //! `te` margin order — RED). The seam/knot-phase anchor is exactly a
 //! frame-anchored choice the penalty could silently depend on (were the penalty
 //! NOT circulant, or were the knot grid anchored to the data range rather than
-//! rigidly rotated). It SHOULD be invariant by construction, so this test LOCKS
-//! THAT IN as a green guard.
+//! to the declared origin). A whole-knot seam shift SHOULD be invariant by
+//! construction, so this test LOCKS THAT IN as a green guard.
+//!
+//! A SUB-knot shift is deliberately not in the set. `cyclic_knot_anchor` anchors
+//! the knots at the declared `period_start`: translation equivariance (data and
+//! domain shifted together reproduce the design) and sub-knot seam invariance
+//! (origin re-declared for fixed data) are provably incompatible for any anchor
+//! that is a function of `(start, period)`, and production chose translation
+//! equivariance. For fixed data a sub-knot origin shift therefore spans a
+//! different function space by design.
 //!
 //! It fits the SAME physical periodic data under several `period_start` anchors
-//! (each a different fraction of a knot spacing around the loop, including a
-//! sub-knot rotation so the seam genuinely lands between knots), predicts every
+//! (whole multiples of the knot spacing of a pinned `k=8` basis), predicts every
 //! fit on a shared PHYSICAL angle grid through the public design + `predict_gam`
 //! path (exactly what a user sees), and asserts the curves agree to a tight
 //! fraction of the signal range — while a refit under the SAME anchor is
@@ -102,8 +109,10 @@ fn fit_and_predict(
     data: &gam::data::EncodedDataset,
     grid_angles: &[f64],
 ) -> Vec<f64> {
+    // `k=8` is pinned so the knot spacing the anchors are multiples of is the
+    // spacing the fit actually uses, independent of the data-driven default.
     let formula = format!(
-        "y ~ cyclic(theta, period_start={seam_start}, period_end={})",
+        "y ~ cyclic(theta, k=8, period_start={seam_start}, period_end={})",
         seam_start + TWO_PI
     );
     let cfg = FitConfig::default();
@@ -140,26 +149,24 @@ fn fit_and_predict(
 #[test]
 fn cyclic_smooth_fit_is_invariant_to_period_origin_1593() {
     // A correct seam-phase-invariant cyclic fit reproduces the curve to numerical
-    // precision: the penalty is circulant and the knot grid rigidly rotates with
-    // the seam, so two anchors fit the identical penalized objective up to
+    // precision: the penalty is circulant and a whole-knot seam shift relabels the
+    // same basis, so two such anchors fit the identical penalized objective up to
     // linear-algebra round-off. We hold a tight 1e-3 of the signal range — far
     // below the 2–6 % at which the order-DEPENDENT `te` fit drifts — so this is a
     // real (non-vacuous) guard and a regression that anchored the cyclic penalty
     // or knot grid to a privileged seam would trip it.
     const REL_TOL: f64 = 1.0e-3;
 
-    // Eight basis functions ⇒ knot spacing 2π/8. Anchors include a whole-knot
-    // shift (2π/8, where circulancy makes the rotation exact even for a
-    // grid-anchored penalty) AND sub-knot shifts (the seam lands BETWEEN knots),
-    // which only stay invariant if the knot grid truly rotates rigidly with the
-    // seam rather than re-snapping to the data range.
+    // Eight basis functions (pinned `k=8`) ⇒ knot spacing 2π/8. Every anchor is a
+    // whole multiple of that spacing; sub-knot anchors are excluded because the
+    // grid is anchored at the declared origin by design (see the module doc).
     let knot_spacing = TWO_PI / 8.0;
     let anchors = [
         0.0,
-        0.37 * knot_spacing,
         knot_spacing,
-        1.5 * knot_spacing,
-        2.8 * knot_spacing,
+        2.0 * knot_spacing,
+        3.0 * knot_spacing,
+        5.0 * knot_spacing,
     ];
 
     // A dense shared physical-angle grid spanning the whole circle.
@@ -227,7 +234,7 @@ fn cyclic_smooth_fit_is_invariant_to_period_origin_1593() {
         "cyclic(theta) fits DIFFERENT curves under different period-origin (seam) anchors: \
          worst max|Δμ̂| across seeds/anchors is {worst_rel:.3e} of the signal range \
          (seed {worst_seed}, anchor {worst_anchor:.4}, tol {REL_TOL:.0e}). The cyclic penalty is \
-         circulant and the uniform knot grid rotates rigidly with the seam, so the period origin \
+         circulant and a whole-knot seam shift relabels the same basis, so the period origin \
          is a pure gauge choice and the fitted periodic curve must be invariant to it \
          (#1593 gauge-invariance class). A drift here is a real seam-anchor dependence of the \
          #1549/#1587 family."
