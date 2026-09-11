@@ -1400,9 +1400,27 @@ pub(crate) fn try_tangent_projected_evaluate(
                     if let (true, true, Some(column)) = (diagonal, shaped, smallest) {
                         let direction = kernel.u_s.column(column);
                         let tangent_part = z.t().dot(&direction);
+                        // The value prices the log-determinant operator; the inner
+                        // certificate prices the stationarity curvature. Report both
+                        // spectra on the full space and on the face.
+                        let smallest_eigenvalue = |matrix: &Array2<f64>| {
+                            DenseSpectralOperator::from_symmetric(matrix).ok().map(|operator| {
+                                operator.raw_spectrum().iter().copied().fold(f64::INFINITY, f64::min)
+                            })
+                        };
+                        let value_full =
+                            solution.hessian_op.assemble_h_dense_for_tangent_projection().ok();
+                        let value_min = value_full.as_ref().and_then(|matrix| smallest_eigenvalue(matrix));
+                        let value_tangent_min = value_full
+                            .as_ref()
+                            .and_then(|matrix| smallest_eigenvalue(&z.t().dot(matrix).dot(&z)));
+                        let true_min = smallest_eigenvalue(&response_full);
+                        let true_tangent_min = smallest_eigenvalue(&z.t().dot(&response_full).dot(&z));
                         log::info!(
                             "[979-FACE-LOGDET] kept_rank={rank}/{} tangent_dim={} \
-                             sigma_min_kept={:.6e} normal_fraction={:.3e}",
+                             sigma_min_kept={:.6e} normal_fraction={:.3e} \
+                             value_min={value_min:?} value_tangent_min={value_tangent_min:?} \
+                             true_min={true_min:?} true_tangent_min={true_tangent_min:?}",
                             z.nrows(),
                             z.ncols(),
                             1.0 / inverse[[column, column]],
