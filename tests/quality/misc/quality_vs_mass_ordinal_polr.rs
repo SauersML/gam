@@ -8,13 +8,15 @@
 //!   * RMSE(gam class probs, TRUTH class probs) <= a principled absolute bar,
 //!   * RMSE(gam cumulative probs, TRUTH cumulative probs) <= a principled bar,
 //!   * |gam x2 slope - beta_x2_true| <= a principled absolute bar.
-//! `VGAM::vglm(family = sratio(parallel = TRUE))` — the mature, standard R
-//! reference for sequential/continuation-ratio ordinal models — is fit on the
-//! SAME data and DEMOTED to a baseline-to-match-or-beat: gam's error against the
-//! truth must be <= VGAM's error against the truth, times a small slack. We do
-//! NOT assert "gam matches VGAM's fitted output" — matching a peer tool's noisy
-//! fit is not a quality claim. The primary claim is that gam recovers the truth,
-//! and does so at least as accurately as the canonical ordinal tool.
+//! mgcv's REML fit of the SAME stacked stopping-ratio model (the identical frame
+//! and cyclic smooth) is DEMOTED to a baseline-to-match-or-beat: gam's error
+//! against the truth must be <= mgcv's error against the truth, times a small
+//! slack. We do NOT assert "gam matches mgcv's fitted output". Matching a peer
+//! tool's noisy fit is not a quality claim. The primary claim is that gam
+//! recovers the truth, at least as accurately as a mature REML smoother.
+//! (The real-data arm below keeps VGAM::sratio, whose predictor there is the
+//! same linear model gam fits. This synthetic arm needs a smoother, because
+//! g(x) must be learned from data.)
 //!
 //! gam has no bespoke "ordinal" family, but the **stopping-ratio** ordinal model
 //! is, *exactly*, a binomial-logit GAM on a stacked dataset — and this is an
@@ -274,62 +276,52 @@ fn gam_continuation_ratio_matches_vgam_sratio() {
     let gam_x2_slope: f64 =
         eta_hi.iter().zip(&eta_lo).map(|(h, l)| h - l).sum::<f64>() / (n_grid as f64);
 
-    // ---- fit the SAME stopping-ratio likelihood in R (VGAM::vglm) ----------
-    // Reference predictor: cyclic harmonics sin(x)+cos(x) (linear analogue of
-    // the cyclic-cubic smooth on one oscillation) + linear x2, with PARALLEL
-    // (shared) slopes across cutpoints — exactly the model gam fits. sratio()
-    // models logit P(Y = j | Y >= j), so its reported slope is on the same
-    // conditional-logit scale and with the same sign as gam's stacked binomial.
+    // ---- fit the SAME stopping-ratio model in R with mgcv (REML) -----------
+    // The reference fits the identical stacked binomial frame with the same
+    // cyclic smooth, `z ~ s(x, bs="cc") + x2 + thr2 + thr3`, choosing its
+    // smoothing parameter by REML. A comparison of smoothers needs a smoother on
+    // the other side. VGAM::vglm was handed the TRUE sin/cos form of g(x), and
+    // VGAM's own s() has no criterion-chosen smoothing (a fixed df, of which df=4
+    // happens to be the best of 2..8 on this truth), so neither is a baseline for
+    // a smooth that must learn g(x) from data.
     let r = run_r(
         &[
-            Column::new("x", &x),
-            Column::new("x2", &x2),
-            Column::new("y", &y),
+            Column::new("z", &sz),
+            Column::new("x", &sx),
+            Column::new("x2", &sx2),
+            Column::new("thr2", &sthr2),
+            Column::new("thr3", &sthr3),
         ],
         r#"
-        suppressPackageStartupMessages(library(VGAM))
-        # sratio() REQUIRES an ORDERED factor (it stop()s with "response should be
-        # ordinal---see ordered()" on a plain factor); the 1<2<3<4 tiers are ordered.
-        lev <- c(1, 2, 3, 4)
-        df$yf <- ordered(round(df$y), levels = lev)
-        df$sx <- sin(pi * df$x / 3)
-        df$cx <- cos(pi * df$x / 3)
-        # Stopping-ratio with parallel (shared) covariate slopes across cutpoints.
-        m <- vglm(yf ~ sx + cx + x2,
-                  family = sratio(link = "logitlink", parallel = TRUE),
-                  data = df)
+        suppressPackageStartupMessages(library(mgcv))
+        m <- gam(z ~ s(x, bs = "cc") + x2 + thr2 + thr3, family = binomial,
+                 data = df, method = "REML")
+        # Shared x2 slope on the conditional (stopping) logit scale.
+        emit("ref_x2", as.numeric(coef(m)["x2"]))
 
-        # Shared x2 slope on the conditional (stopping) logit scale. With
-        # parallel=TRUE the x2 coefficient is a single shared value.
-        cf <- coef(m)
-        emit("vgam_x2", as.numeric(cf["x2"]))
-
-        # Fitted class probabilities P(Y = j) on the SAME 40-pt x grid, x2 = 0.
+        # Stopping probabilities q_j on the SAME 40-pt x grid at x2 = 0, then the
+        # class and cumulative probabilities by the stopping-ratio chain rule.
         gx <- seq(-3, 3, length.out = 40)
-        nd <- data.frame(sx = sin(pi * gx / 3), cx = cos(pi * gx / 3), x2 = rep(0, length(gx)))
-        pc <- predict(m, newdata = nd, type = "response")  # n x J class probs
-        # Re-key columns by level NAME (not a hardcoded position) onto the full
-        # ordered level set, filling any class absent from the fit with 0, so a
-        # dropped empty level cannot make pc[,4] overrun ("subscript out of bounds").
-        pc <- as.matrix(pc)
-        # If VGAM returned an unnamed matrix, its columns are the present levels in
-        # ascending order; name them by the leading levels so the keyed fill works.
-        if (is.null(colnames(pc))) colnames(pc) <- as.character(lev[seq_len(ncol(pc))])
-        full <- matrix(0.0, nrow = nrow(pc), ncol = length(lev))
-        colnames(full) <- as.character(lev)
-        have <- intersect(colnames(pc), colnames(full))
-        full[, have] <- pc[, have, drop = FALSE]
-        emit("class1", as.numeric(full[, "1"]))
-        emit("class2", as.numeric(full[, "2"]))
-        emit("class3", as.numeric(full[, "3"]))
-        emit("class4", as.numeric(full[, "4"]))
-        emit("cum1", as.numeric(full[, "1"]))
-        emit("cum2", as.numeric(full[, "1"] + full[, "2"]))
-        emit("cum3", as.numeric(full[, "1"] + full[, "2"] + full[, "3"]))
+        q <- function(t2, t3) as.numeric(predict(
+          m, newdata = data.frame(x = gx, x2 = 0, thr2 = t2, thr3 = t3), type = "response"))
+        q1 <- q(0, 0)
+        q2 <- q(1, 0)
+        q3 <- q(1, 1)
+        c1 <- q1
+        c2 <- (1 - q1) * q2
+        c3 <- (1 - q1) * (1 - q2) * q3
+        c4 <- (1 - q1) * (1 - q2) * (1 - q3)
+        emit("class1", c1)
+        emit("class2", c2)
+        emit("class3", c3)
+        emit("class4", c4)
+        emit("cum1", c1)
+        emit("cum2", c1 + c2)
+        emit("cum3", c1 + c2 + c3)
         "#,
     );
 
-    let vgam_x2 = r.scalar("vgam_x2");
+    let ref_x2 = r.scalar("ref_x2");
     let ref_cum = [r.vector("cum1"), r.vector("cum2"), r.vector("cum3")];
     let ref_class = [
         r.vector("class1"),
@@ -338,10 +330,10 @@ fn gam_continuation_ratio_matches_vgam_sratio() {
         r.vector("class4"),
     ];
     for v in ref_cum.iter() {
-        assert_eq!(v.len(), n_grid, "VGAM cumulative grid length mismatch");
+        assert_eq!(v.len(), n_grid, "mgcv cumulative grid length mismatch");
     }
     for v in ref_class.iter() {
-        assert_eq!(v.len(), n_grid, "VGAM class grid length mismatch");
+        assert_eq!(v.len(), n_grid, "mgcv class grid length mismatch");
     }
 
     // ---- closed-form POPULATION TRUTH on the same grid (x2 = 0) ------------
@@ -384,24 +376,24 @@ fn gam_continuation_ratio_matches_vgam_sratio() {
     let gam_cum_rmse = rmse(&gam_cum_flat, &truth_cum_flat);
     let gam_x2_err = (gam_x2_slope - beta_x2_true).abs();
 
-    // ---- BASELINE TO MATCH-OR-BEAT: VGAM's error against the SAME truth ----
+    // ---- BASELINE TO MATCH-OR-BEAT: mgcv REML's error against the SAME truth --
     let ref_class_flat: Vec<f64> = ref_class.iter().flat_map(|v| v.iter().copied()).collect();
     let ref_cum_flat: Vec<f64> = ref_cum.iter().flat_map(|v| v.iter().copied()).collect();
-    let vgam_class_rmse = rmse(&ref_class_flat, &truth_class_flat);
-    let vgam_cum_rmse = rmse(&ref_cum_flat, &truth_cum_flat);
-    let vgam_x2_err = (vgam_x2 - beta_x2_true).abs();
+    let ref_class_rmse = rmse(&ref_class_flat, &truth_class_flat);
+    let ref_cum_rmse = rmse(&ref_cum_flat, &truth_cum_flat);
+    let ref_x2_err = (ref_x2 - beta_x2_true).abs();
 
-    // Context only (NOT a pass criterion): how close gam's fit lands to VGAM's.
+    // Context only (NOT a pass criterion): how close gam's fit lands to mgcv's.
     let class_rel_vs_ref = relative_l2(&gam_class_flat, &ref_class_flat);
 
     eprintln!(
         "ordinal stopping-ratio truth recovery: n={n} n_stack={n_stack} J=4 \
          gam_edf={gam_edf:.3} beta_x2_true={beta_x2_true:.4} \
-         class_rmse gam={gam_class_rmse:.4} vgam={vgam_class_rmse:.4} | \
-         cum_rmse gam={gam_cum_rmse:.4} vgam={vgam_cum_rmse:.4} | \
-         x2 gam={gam_x2_slope:.4} vgam={vgam_x2:.4} \
-         (err gam={gam_x2_err:.4} vgam={vgam_x2_err:.4}) | \
-         gam_vs_vgam_rel_l2(context only)={class_rel_vs_ref:.4}"
+         class_rmse gam={gam_class_rmse:.4} mgcv={ref_class_rmse:.4} | \
+         cum_rmse gam={gam_cum_rmse:.4} mgcv={ref_cum_rmse:.4} | \
+         x2 gam={gam_x2_slope:.4} mgcv={ref_x2:.4} \
+         (err gam={gam_x2_err:.4} mgcv={ref_x2_err:.4}) | \
+         gam_vs_mgcv_rel_l2(context only)={class_rel_vs_ref:.4}"
     );
     eprintln!(
         "{}",
@@ -410,8 +402,8 @@ fn gam_continuation_ratio_matches_vgam_sratio() {
             "quality_vs_mass_ordinal_polr::class",
             "class_rmse",
             gam_class_rmse,
-            "vgam",
-            vgam_class_rmse,
+            "mgcv",
+            ref_class_rmse,
         )
         .line()
     );
@@ -422,8 +414,8 @@ fn gam_continuation_ratio_matches_vgam_sratio() {
             "quality_vs_mass_ordinal_polr::cum",
             "cum_rmse",
             gam_cum_rmse,
-            "vgam",
-            vgam_cum_rmse,
+            "mgcv",
+            ref_cum_rmse,
         )
         .line()
     );
@@ -434,8 +426,8 @@ fn gam_continuation_ratio_matches_vgam_sratio() {
             "quality_vs_mass_ordinal_polr::x2_slope",
             "x2_slope_abs_err",
             gam_x2_err,
-            "vgam",
-            vgam_x2_err,
+            "mgcv",
+            ref_x2_err,
         )
         .line()
     );
@@ -463,22 +455,23 @@ fn gam_continuation_ratio_matches_vgam_sratio() {
     );
 
     // MATCH-OR-BEAT: against the SAME population truth, gam must be at least as
-    // accurate as the canonical ordinal tool (within a small slack). This is an
-    // ACCURACY comparison (error-to-truth), NOT a reproduce-the-reference claim.
+    // accurate as mgcv's REML fit of the identical stacked model (within a small
+    // slack). This is an ACCURACY comparison (error-to-truth), NOT a
+    // reproduce-the-reference claim.
     assert!(
-        gam_class_rmse <= vgam_class_rmse * 1.10,
-        "gam class probs less accurate than VGAM::sratio against truth: \
-         gam_rmse={gam_class_rmse:.4} vgam_rmse={vgam_class_rmse:.4}"
+        gam_class_rmse <= ref_class_rmse * 1.10,
+        "gam class probs less accurate than mgcv REML against truth: \
+         gam_rmse={gam_class_rmse:.4} mgcv_rmse={ref_class_rmse:.4}"
     );
     assert!(
-        gam_cum_rmse <= vgam_cum_rmse * 1.10,
-        "gam cumulative probs less accurate than VGAM::sratio against truth: \
-         gam_rmse={gam_cum_rmse:.4} vgam_rmse={vgam_cum_rmse:.4}"
+        gam_cum_rmse <= ref_cum_rmse * 1.10,
+        "gam cumulative probs less accurate than mgcv REML against truth: \
+         gam_rmse={gam_cum_rmse:.4} mgcv_rmse={ref_cum_rmse:.4}"
     );
     assert!(
-        gam_x2_err <= vgam_x2_err * 1.10 + 0.02,
-        "gam x2 slope less accurate than VGAM::sratio against truth: \
-         gam_err={gam_x2_err:.4} vgam_err={vgam_x2_err:.4}"
+        gam_x2_err <= ref_x2_err * 1.10 + 0.02,
+        "gam x2 slope less accurate than mgcv REML against truth: \
+         gam_err={gam_x2_err:.4} mgcv_err={ref_x2_err:.4}"
     );
 }
 
