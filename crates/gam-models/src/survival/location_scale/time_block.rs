@@ -293,14 +293,9 @@ pub(crate) fn structural_time_coefficient_lower_bounds(
     // the old derivative-only rule, so no already-bound column ever loses its
     // constraint.
     const VALUE_VARIATION_TOL: f64 = 1e-12;
-    // Diagnostics only: entries with magnitude in this open band are reported as
-    // "sub-tolerance nonzeros" to explain a missing structural lower bound. The
-    // lower edge separates genuine round-off from a hard zero; the upper edge is
-    // the derivative-activity tolerance above.
-    const SUBTOL_NONZERO_FLOOR: f64 = 1e-30;
-    // How many leading columns' max(|·|) to surface in the diagnostic message
-    // when no shape column is found.
-    const DIAGNOSTIC_COLUMN_PREVIEW: usize = 8;
+    // Diagnostics only: nonzero entries at or below the derivative-activity
+    // tolerance above are reported as "sub-tolerance nonzeros" to explain a
+    // missing structural lower bound. An exact zero is a hard zero, not round-off.
 
     let mut lower_bounds = Array1::from_elem(p, f64::NEG_INFINITY);
     let mut has_shape_column = false;
@@ -320,7 +315,7 @@ pub(crate) fn structural_time_coefficient_lower_bounds(
     // materialize as a single nrows×ncols dense buffer. `extract_column` is
     // O(n) for dense, O(nnz_j) for sparse, and O(matvec_n) for lazy operators
     // — the operator-form path the strict policy demands.
-    let mut col_maxes: Vec<(usize, f64)> = Vec::with_capacity(p.min(DIAGNOSTIC_COLUMN_PREVIEW));
+    let mut col_maxes: Vec<(usize, f64)> = Vec::new();
     let mut total_subtol_nonzeros = 0_usize;
     for col in 0..p {
         // Derivative pass: (1) integrity — the M-spline derivative basis must be
@@ -341,6 +336,7 @@ pub(crate) fn structural_time_coefficient_lower_bounds(
             ) }.into());
         }
         let mut col_max = 0.0_f64;
+        let mut col_subtol_nonzeros = 0_usize;
         let mut has_positive_support = false;
         for (row, &value) in column.iter().enumerate() {
             if !value.is_finite() {
@@ -360,8 +356,8 @@ pub(crate) fn structural_time_coefficient_lower_bounds(
             if abs_value > col_max {
                 col_max = abs_value;
             }
-            if abs_value > SUBTOL_NONZERO_FLOOR && abs_value <= DERIVATIVE_TOL {
-                total_subtol_nonzeros += 1;
+            if abs_value > 0.0 && abs_value <= DERIVATIVE_TOL {
+                col_subtol_nonzeros += 1;
             }
         }
 
@@ -395,7 +391,8 @@ pub(crate) fn structural_time_coefficient_lower_bounds(
             lower_bounds[col] = 0.0;
             has_shape_column = true;
         }
-        if col < DIAGNOSTIC_COLUMN_PREVIEW {
+        if col_subtol_nonzeros > 0 {
+            total_subtol_nonzeros += col_subtol_nonzeros;
             col_maxes.push((col, col_max));
         }
     }
@@ -427,20 +424,18 @@ pub(crate) fn structural_time_coefficient_lower_bounds(
         //    cell-moment construction, derivative formula, etc.).
         //
         // The two regimes differentiate by whether the design has any
-        // derivative entry whose magnitude exceeds 1e-30 but stays at or below
+        // derivative entry that is nonzero but stays at or below
         // `DERIVATIVE_TOL`. Regime 1 leaves the tail columns at exact
-        // zero (no entry passes 1e-30); regime 2 leaves residual
+        // zero; regime 2 leaves residual
         // float-scale entries from the upstream basis builder. We log
         // warn-level only in the surprising regime.
         if total_subtol_nonzeros > 0 {
             log::warn!(
-                "structural time coefficient bounds: no value-varying shape column on this candidate's time design ({} rows × {} cols, sub-tolerance derivative nonzero entries ({:.0e} < |v| ≤ {:.0e}): {}, first-{} col max(|.|): {:?}); skipping the structural lower-bound ridge — fit may converge to a non-monotone-in-time hazard",
+                "structural time coefficient bounds: no value-varying shape column on this candidate's time design ({} rows × {} cols, sub-tolerance derivative nonzero entries (0 < |v| ≤ {:.0e}): {}, max(|.|) of the columns carrying them: {:?}); skipping the structural lower-bound ridge — fit may converge to a non-monotone-in-time hazard",
                 nrows,
                 p,
-                SUBTOL_NONZERO_FLOOR,
                 DERIVATIVE_TOL,
                 total_subtol_nonzeros,
-                DIAGNOSTIC_COLUMN_PREVIEW,
                 col_maxes,
             );
         }

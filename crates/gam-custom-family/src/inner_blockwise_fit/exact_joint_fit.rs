@@ -363,11 +363,8 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
     // Verbose cadence for the inner joint-Newton log block. Boring cycles
     // (first-attempt accepts with no convergence event) emit ONE compact
     // one-liner instead of the 4-line pre-cycle/TR/cycle-summary/convergence
-    // block. Verbose cycles (first, last, every 20th, all rejections,
-    // convergence events) keep the full detail. JOINT_LOG_VERBOSE_PERIOD is
-    // tuned so a 200-cycle inner solve emits ~10 detailed waypoints plus
-    // 1 compact line per remaining cycle (~210 lines), down from ~800.
-    const JOINT_LOG_VERBOSE_PERIOD: usize = 50;
+    // block. Verbose cycles (first, last, all rejections, convergence events)
+    // keep the full detail.
     // Residual-stall detector for joint Newton. Distinct from the
     // blockwise loglik-frozen divergence detector lower in the file:
     // that one requires the log-likelihood to be unchanged for K
@@ -875,9 +872,7 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
                 }
             }
         }
-        let verbose_cycle = cycle == 0
-            || cycle + 1 == inner_max_cycles
-            || (cycle + 1) % JOINT_LOG_VERBOSE_PERIOD == 0;
+        let verbose_cycle = cycle == 0 || cycle + 1 == inner_max_cycles;
         // Pre-cycle header line removed: the post-cycle one-liner below
         // carries cycle/objective/Δobj/step/residual/time and on verbose
         // cadence the expanded convergence line additionally carries

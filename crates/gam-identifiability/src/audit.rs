@@ -140,10 +140,6 @@ const ALIAS_BOUNDARY_COSINE: f64 = 0.999;
 /// fails the moment anyone separates the two and so surfaces the change.
 const REPORT_FLOOR_NEAR_EXACT: f64 = ALIAS_BOUNDARY_COSINE;
 
-/// Estimated audit work (rows × blocks, or rows × total columns for the
-/// pairwise sweep) above which a periodic progress ticker is attached. Below
-/// this the audit completes fast enough that progress output is noise.
-const AUDIT_PROGRESS_TICKER_WORK_THRESHOLD: usize = 1_000_000;
 const CHANNEL_AWARE_ROW_CHUNK: usize = 4096;
 
 // The pure-data audit result structs (`BlockIdentity`, `AliasedPair`,
@@ -1400,9 +1396,9 @@ fn audit_identifiability_impl(
         }
         cnt.max(1)
     };
-    let pairwise_block_progress_ticker = (n.saturating_mul(p_total)
-        >= AUDIT_PROGRESS_TICKER_WORK_THRESHOLD)
-        .then(LoopProgress::default_interval);
+    // The ticker emits on wall time, so an audit that finishes before its first
+    // interval prints nothing; it needs no size gate in front of it.
+    let pairwise_block_progress_ticker = LoopProgress::default_interval();
     // The full joint Gram `G = Xᵀ·X` was already assembled once (before the joint
     // RRQR) and is reused here: every cross-block column dot product below is an
     // O(1) lookup `joint_gram[[ja, jb]]` instead of an O(n) scalar pass, so the
@@ -1499,13 +1495,11 @@ fn audit_identifiability_impl(
                     }
                 }
             }
-            if let Some(ticker) = pairwise_block_progress_ticker.as_ref() {
-                ticker.tick(1, |done, secs| {
-                    log::info!(
-                        "[STAGE] identifiability audit: pairwise overlap progress {done}/{n_block_pairs} block pairs in {secs:.1}s",
-                    );
-                });
-            }
+            pairwise_block_progress_ticker.tick(1, |done, secs| {
+                log::info!(
+                    "[STAGE] identifiability audit: pairwise overlap progress {done}/{n_block_pairs} block pairs in {secs:.1}s",
+                );
+            });
         }
     }
     log::info!(

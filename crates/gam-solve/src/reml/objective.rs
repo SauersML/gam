@@ -360,7 +360,6 @@ impl<'a> RemlState<'a> {
                 }
             }
 
-            const MIN_ACCEPTABLE_HESSIAN_EIGENVALUE: f64 = 1e-12;
             // Hot diagnostics walk the Hessian eigenspectrum and emit
             // ill-conditioning warnings. They are only meaningful for fully
             // converged inner modes — partial fits accepted from seed
@@ -389,7 +388,11 @@ impl<'a> RemlState<'a> {
                             ridge_used
                         );
                     }
-                    if !min_eig.is_finite() || min_eig <= MIN_ACCEPTABLE_HESSIAN_EIGENVALUE {
+                    // An eigenvalue inside the eigensolver's own rounding band
+                    // `p·ε·‖H‖₂` cannot be told apart from zero.
+                    let spectral_scale = eigs.iter().fold(0.0_f64, |acc, e| acc.max(e.abs()));
+                    let resolvable_floor = eigs.len() as f64 * f64::EPSILON * spectral_scale;
+                    if !min_eig.is_finite() || min_eig <= resolvable_floor {
                         let condition_number = symmetric_spectrum_condition_number(&pht_dense);
                         log::warn!(
                             "Penalized Hessian extremely ill-conditioned (cond={:.3e}); continuing with stabilized Hessian.",

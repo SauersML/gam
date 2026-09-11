@@ -17,7 +17,7 @@
 use ndarray::Array1;
 use std::collections::BTreeMap;
 use std::fmt;
-use std::sync::atomic::{AtomicI32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicI32, Ordering};
 
 // =============================================================================
 // Rate-Limited Diagnostic Output
@@ -25,20 +25,8 @@ use std::sync::atomic::{AtomicI32, AtomicUsize, Ordering};
 // These helpers prevent diagnostic spam while ensuring important messages are seen.
 // Pattern: show first occurrence, then every Nth occurrence, with count indicator.
 
-/// Rate-limited diagnostic for Hessian minimum eigenvalue warnings
+/// Decade of the last Hessian minimum eigenvalue the diagnostic emitted.
 pub static H_MIN_EIG_LOG_BUCKET: AtomicI32 = AtomicI32::new(i32::MIN);
-/// Count of `should_emit_h_min_eig_diag` invocations that have ever been
-/// considered for emission; used together with `H_MIN_EIG_LOG_BUCKET` to
-/// rate-limit one diagnostic per decade-magnitude bucket and per
-/// `MIN_EIG_DIAG_EVERY` repeats within the same bucket.
-pub static H_MIN_EIG_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
-/// Repeat period within a magnitude bucket for the Hessian-minimum-eigenvalue
-/// diagnostic: after the first emission for a bucket, every Nth subsequent
-/// invocation also emits.
-pub const MIN_EIG_DIAG_EVERY: usize = 200;
-/// Threshold below which a positive Hessian minimum eigenvalue is treated as
-/// nearly-singular and routed through the rate-limited diagnostic.
-pub const MIN_EIG_DIAG_THRESHOLD: f64 = 1e-4;
 
 /// Diagnostic formatter shared across the outer optimizer and the custom-family
 /// fitter: shows the `max_items` entries of `values` with largest absolute
@@ -63,27 +51,17 @@ pub fn format_top_abs(values: &Array1<f64>, label: &str, max_items: usize) -> St
 }
 
 /// Rate-limited check for Hessian minimum eigenvalue diagnostics.
-/// Returns true if this eigenvalue warrants a diagnostic message.
+///
+/// A non-positive or non-finite eigenvalue always warrants the message. A
+/// positive one warrants it when its decade differs from the last one emitted,
+/// so a fit reports each order of magnitude its curvature passes through once
+/// instead of once per evaluation.
 pub fn should_emit_h_min_eig_diag(min_eig: f64) -> bool {
     if !min_eig.is_finite() || min_eig <= 0.0 {
         return true;
     }
-    if min_eig >= MIN_EIG_DIAG_THRESHOLD {
-        return false;
-    }
-    let bucket = if min_eig.is_finite() && min_eig > 0.0 {
-        min_eig.log10().floor() as i32
-    } else {
-        i32::MIN
-    };
-    let last = H_MIN_EIG_LOG_BUCKET.load(Ordering::Relaxed);
-    let count = H_MIN_EIG_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
-    if bucket != last || count.is_multiple_of(MIN_EIG_DIAG_EVERY) {
-        H_MIN_EIG_LOG_BUCKET.store(bucket, Ordering::Relaxed);
-        true
-    } else {
-        false
-    }
+    let bucket = min_eig.log10().floor() as i32;
+    H_MIN_EIG_LOG_BUCKET.swap(bucket, Ordering::Relaxed) != bucket
 }
 
 // =============================================================================
