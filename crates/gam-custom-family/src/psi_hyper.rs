@@ -138,8 +138,8 @@ fn prepare_explicit_jeffreys_curvature_drifts<F: CustomFamily + Clone + Send + S
             >
     };
     let completion_psi: CompletionPsiAction = {
-        let (base, first, family, states, specs, layout, workspace) = (
-            base.clone(), first.clone(), family.clone(), states.clone(), specs.clone(), layout.clone(), workspace.clone(),
+        let (base, first, first_axes, family, states, specs, layout, workspace) = (
+            base.clone(), first.clone(), first_axes.clone(), family.clone(), states.clone(), specs.clone(), layout.clone(), workspace.clone(),
         );
         Arc::new(move |psi, v| {
             let h = first.get(psi).ok_or_else(|| CustomFamilyError::trial_point("Jeffreys completion psi index out of range"))?;
@@ -150,7 +150,18 @@ fn prepare_explicit_jeffreys_curvature_drifts<F: CustomFamily + Clone + Send + S
             } else {
                 family.exact_newton_joint_psihessian_second_directional_derivative_all_beta_axes(&states, &specs, &layout, psi, v)?
             }.ok_or_else(|| CustomFamilyError::trial_point("Jeffreys completion requires mixed third information derivatives"))?;
-            Ok(base.completion_drift_action(h, &axes, &moving)? * strength)
+            // #1082: where the conditioning gate or the relative floor moves, the
+            // completion carries their motion. Its psi-drift perturbs the coefficient-axis
+            // information derivatives by `d_psi Hdot[e_a]`.
+            let axes_psi = if base.hessian_motion_active() {
+                let psi_axes = first_axes.get(psi).ok_or_else(|| {
+                    CustomFamilyError::trial_point("Jeffreys completion psi axis derivatives out of range")
+                })?;
+                Some(base.rotate_axes(psi_axes)?)
+            } else {
+                None
+            };
+            Ok(base.completion_drift_action_from_rotated(v, h, &base.rotate_axes(&axes)?, axes_psi.as_ref(), &moving)? * strength)
         })
     };
     let beta_psi = Arc::new(
