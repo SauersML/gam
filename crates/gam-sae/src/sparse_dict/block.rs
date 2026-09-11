@@ -1632,7 +1632,13 @@ fn deflate_two_pass(values: &mut [f64], basis: &[Vec<f64>]) {
     }
 }
 
-/// Seed `G` block frames from centred observations without a corpus-wide search.
+/// Seed `G` block frames from observed rows without a corpus-wide search.
+///
+/// The rows are taken as observed, not centred. The block reconstruction is linear with
+/// no intercept (`x ≈ Σ_g D_gᵀ z_g`), so a frame must contain the row it is meant to
+/// reproduce. A centred row `x_i − μ` does not: when the rows sit in several subspaces with
+/// nonzero means, `μ` mixes every subspace's mean into every row, and each seeded frame
+/// straddles subspaces instead of lying on one (#2822).
 ///
 /// Atom `a` draws its row from its own stride window `[floor(a·N/K), floor((a+1)·N/K))`,
 /// so all selected rows are distinct whenever `K <= N` and no caller-supplied random
@@ -1655,22 +1661,8 @@ pub(super) fn data_row_frames(x: ArrayView2<'_, f32>, n_blocks: usize, b: usize)
     let p = x.ncols();
     let k = n_blocks * b;
     let mut decoder = coordinate_partition_frames(n_blocks, b, p);
-    let mut means = vec![0.0_f64; p];
-    for row in x.rows() {
-        for (mean, &value) in means.iter_mut().zip(row.iter()) {
-            *mean += value as f64;
-        }
-    }
-    for mean in &mut means {
-        *mean /= n as f64;
-    }
-    let centred_row = |row: usize| -> Vec<f64> {
-        x.row(row)
-            .iter()
-            .zip(means.iter())
-            .map(|(&value, &mean)| value as f64 - mean)
-            .collect()
-    };
+    let observed_row =
+        |row: usize| -> Vec<f64> { x.row(row).iter().map(|&value| value as f64).collect() };
     let energy = |values: &[f64]| values.iter().map(|value| value * value).sum::<f64>();
     let resolution = f32::EPSILON as f64 * (p.max(1) as f64).sqrt();
     // Orthonormal span of every direction seeded by completed blocks (at most `P`).
@@ -1688,9 +1680,9 @@ pub(super) fn data_row_frames(x: ArrayView2<'_, f32>, n_blocks: usize, b: usize)
             if seeded_span.len() + block_span.len() < p {
                 let mut best_score = 0.0_f64;
                 for row in stride_row..window_end.clamp(stride_row + 1, n) {
-                    let centred = centred_row(row);
-                    let input_energy = energy(&centred);
-                    let mut novel = centred.clone();
+                    let observed = observed_row(row);
+                    let input_energy = energy(&observed);
+                    let mut novel = observed.clone();
                     deflate_two_pass(&mut novel, &seeded_span);
                     deflate_two_pass(&mut novel, &block_span);
                     let novel_energy = energy(&novel);
@@ -1704,7 +1696,7 @@ pub(super) fn data_row_frames(x: ArrayView2<'_, f32>, n_blocks: usize, b: usize)
                     } else {
                         axes.iter()
                             .map(|direction| {
-                                let projection: f64 = centred
+                                let projection: f64 = observed
                                     .iter()
                                     .zip(direction.iter())
                                     .map(|(left, right)| left * right)
@@ -1720,7 +1712,7 @@ pub(super) fn data_row_frames(x: ArrayView2<'_, f32>, n_blocks: usize, b: usize)
                     }
                 }
             }
-            let mut candidate: Vec<f64> = centred_row(row_index);
+            let mut candidate: Vec<f64> = observed_row(row_index);
             let input_norm = energy(&candidate).sqrt();
             deflate_two_pass(&mut candidate, &axes);
             let norm = energy(&candidate).sqrt();
@@ -2348,7 +2340,7 @@ fn validate(x: ArrayView2<'_, f32>, config: &BlockSparseConfig) -> Result<(), Bl
 /// linear-dictionary request is a modeling choice admitted at ANY `K`, not a
 /// shape-derived demotion.
 ///
-/// Seeds from centred observations with [`BlockSeedPolicy::DataRows`].  The
+/// Seeds from observed rows with [`BlockSeedPolicy::DataRows`].  The
 /// `O(N·P + K·P)` seed remains data-placed at large `K`, without the serial
 /// `O(N·P·K)` farthest-point pass or dependence on later dead-block revival.
 pub fn fit_block_sparse_dictionary(
