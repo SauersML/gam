@@ -423,6 +423,7 @@ fn clean_fit_invariance_survival_lognormal() {
             FitResult::TransformationNormal(_) => "TransformationNormal",
             FitResult::SplineScan(_) => "SplineScan",
             FitResult::ResidualCascade(_) => "ResidualCascade",
+            FitResult::Ctn(_) => "Ctn",
         };
         let FitResult::SurvivalLocationScale(fit) = result else {
             panic!("expected SurvivalLocationScale, got {variant_dbg}");
