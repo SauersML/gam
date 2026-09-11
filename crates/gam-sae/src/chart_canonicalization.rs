@@ -2980,10 +2980,10 @@ pub fn sphere_chart_isometry_defect(
         //
         // NB: `cos(π/2)` is ~6.1e-17 in f64, not exactly 0, so an exactly-on-pole
         // row gives `r11 = cos²lat ≈ 3.7e-33` — finite and strictly positive. A
-        // bare `r11 > 0.0` therefore lets it through; floor against `POLE_COS2_FLOOR`
-        // (cos lat within ~1e-6 of a pole) so the singular row is honestly refused.
-        const POLE_COS2_FLOOR: f64 = 1e-12;
-        if !(r11.is_finite() && r11 > POLE_COS2_FLOOR) {
+        // bare `r11 > 0.0` therefore lets it through. `lat` is itself resolved only
+        // to `ε·|lat|` and `|cos|` has unit slope at a pole, so a `|cos lat|` inside
+        // that band cannot be told apart from the pole and the row is refused.
+        if !(r11.is_finite() && cos_lat.abs() > f64::EPSILON * lat.abs()) {
             return Ok(None);
         }
         let h = [g[0] / g_bar, g[1] / g_bar, g[2] / g_bar];

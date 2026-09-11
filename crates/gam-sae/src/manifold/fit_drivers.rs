@@ -74,14 +74,6 @@ impl InnerGlobalizationHint {
     }
 }
 
-/// Floor on the per-axis coordinate spread used to guard the ARD moment-match
-/// (`α' = α · spread_pre / spread_post`, F3). Below this the spread is
-/// numerically degenerate (a near-constant coordinate) and the ratio is
-/// meaningless, so the untransformed precision is stamped instead. Not a tuning
-/// knob — it only fences the division against a vanishing denominator at f64
-/// resolution.
-const ARD_SPREAD_FLOOR: f64 = 1.0e-12;
-
 /// Why one bounded joint-fit chunk returned. Ordinary fits may use the two
 /// heuristic exits; evidence is certified only by [`Self::NoStrictDecrease`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1446,8 +1438,9 @@ impl SaeManifoldTerm {
                         );
                         if sp_pre.is_finite()
                             && sp_post.is_finite()
-                            && sp_pre > ARD_SPREAD_FLOOR
-                            && sp_post > ARD_SPREAD_FLOOR
+                            && sp_pre > 0.0
+                            && sp_post > 0.0
+                            && (alpha * sp_pre / sp_post).is_finite()
                         {
                             alpha * sp_pre / sp_post
                         } else {

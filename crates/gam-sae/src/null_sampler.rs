@@ -254,17 +254,6 @@ impl CoactivationExceedance {
     }
 }
 
-/// Numerical floor guarding the exceedance division when a pair's null joint
-/// count has (essentially) zero spread. A pair the fixed margins PIN (no
-/// swappable configuration ever moves it — e.g. two columns locked together with
-/// no mixing room) has every replicate equal to the observed value, so its null
-/// mean equals the observation and the numerator is ~0: the ratio is a
-/// well-defined ~0 exceedance, not a spurious spike. The floor only prevents a
-/// literal divide-by-zero; it is deliberately tiny so a genuinely extreme pair
-/// (observed at the boundary of the fixed-margin polytope, tiny but non-zero
-/// spread) still reports a large exceedance rather than being clamped to noise.
-const NULL_SD_FLOOR: f64 = 1e-9;
-
 /// Estimate the per-pair co-activation exceedance of `codes` over the fixed-margin
 /// null, using `replicates` curveball replicates. The curveball mixing length is
 /// derived from the matrix (one sweep ≈ its number of ones) so there are no tuned
@@ -336,7 +325,9 @@ pub fn coactivation_exceedance(
             let idx = u * g + w;
             let var = m2[idx] / denom;
             let sd = var.max(0.0).sqrt();
-            z[idx] = if sd > NULL_SD_FLOOR {
+            // A pair the fixed margins pin repeats one integer count in every
+            // replicate, and the Welford update leaves its `m2` exactly zero.
+            z[idx] = if sd > 0.0 {
                 (obs[idx] - mean[idx]) / sd
             } else {
                 // Deterministic (pinned) null: no resolvable spread ⇒ no exceedance.
@@ -415,7 +406,7 @@ pub fn coactivation_exceedance_for_pairs(
     for pos in 0..m {
         let var = m2[pos] / denom;
         let sd = var.max(0.0).sqrt();
-        sparse_z[pos] = if sd > NULL_SD_FLOOR {
+        sparse_z[pos] = if sd > 0.0 {
             (obs[pos] - mean[pos]) / sd
         } else {
             0.0

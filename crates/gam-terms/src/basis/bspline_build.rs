@@ -1114,9 +1114,14 @@ fn bspline_geometric_constraint_rows(
     }
     let g_mean = g.mean().unwrap_or(0.0);
     let gvar = g.iter().map(|&x| (x - g_mean).powi(2)).sum::<f64>() / (k as f64);
-    let g_std = gvar.sqrt().max(1e-10);
+    let g_std = gvar.sqrt();
+    // Coincident abscissae leave a centred row of zeros, which the rank-revealing QR
+    // downstream already reads as rank-deficient; only a genuine spread rescales.
     for j in 0..k {
-        c_geom[[1, j]] = (c_geom[[1, j]] - g_mean) / g_std;
+        c_geom[[1, j]] -= g_mean;
+        if g_std > 0.0 {
+            c_geom[[1, j]] /= g_std;
+        }
     }
     Ok(c_geom)
 }

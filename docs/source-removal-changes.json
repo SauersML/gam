@@ -853,5 +853,19 @@
     ],
     "reason": "#2469: FEASIBILITY_TOL (1e-12) is the rounding band of the guard/offset subtraction; VALUE_VARIATION_TOL (1e-12) is the partition-of-unity rounding band gamma_p*max|value|; FIRTH_REDUCED_FISHER_RCOND_WARN (1e-10 against max(lambda_max, 1)) is the eigensolver band r*eps.",
     "evidence": "FEASIBILITY_TOL and VALUE_VARIATION_TOL were function-local in crates/gam-models/src/survival/location_scale/time_block.rs, and at the base git grep finds FIRTH_REDUCED_FISHER_RCOND_WARN only in crates/gam-solve/src/reml/firth.rs; both files are edited here."
+  },
+  {
+    "base": "ad227baa730ca91f06284a15a0211854c0b20c62",
+    "items": [
+      "crates/gam-sae/src/candidate_index.rs:const:DIRECTION_NORM_FLOOR",
+      "crates/gam-sae/src/chart_canonicalization.rs:const:POLE_COS2_FLOOR",
+      "crates/gam-sae/src/dictionary_artifact.rs:const:EPS",
+      "crates/gam-sae/src/eq4_description_length.rs:const:GATE_ACTIVE_THRESHOLD",
+      "crates/gam-sae/src/k_selection.rs:const:MIN_DENOM",
+      "crates/gam-sae/src/manifold/fit_drivers.rs:const:ARD_SPREAD_FLOOR",
+      "crates/gam-sae/src/null_sampler.rs:const:NULL_SD_FLOOR"
+    ],
+    "reason": "Retired arbitrary floor constants for #2469; each use became an exact limit, a rounding band from gam_linalg::roundoff, or a refusal.",
+    "evidence": "git grep on the landing tree finds no remaining reference to any retired name; MSI compile and test verification runs on the landed sha."
   }
 ]

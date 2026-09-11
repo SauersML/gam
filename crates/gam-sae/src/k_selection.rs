@@ -395,8 +395,9 @@ fn select_measured(curve: &EvVsKCurve, coding: &MeasuredCoding) -> KSelection {
     let pts = curve.points();
     let n = pts.len();
     for i in 1..n {
+        // `EvVsKCurve::new` admits only sorted, distinct `K >= 1`, so `dk >= 1`.
         let dk = (pts[i].k - pts[i - 1].k) as f64;
-        let marginal = (pts[i].ev - pts[i - 1].ev) / dk.max(MIN_DENOM);
+        let marginal = (pts[i].ev - pts[i - 1].ev) / dk;
         let threshold = coding.stop_threshold(pts[i].ev);
         if marginal < threshold {
             // Atom `i` failed to pay for its storage: stop growing. The accepted
@@ -463,7 +464,7 @@ fn select_kneedle(curve: &EvVsKCurve, config: &KSelectionConfig, span: f64) -> K
             k: curve.k_max(),
             ev: pts[n - 1].ev,
             flag: KSelectionFlag::Linear,
-            score: slope_spread / mean_slope.max(MIN_DENOM),
+            score: slope_spread / mean_slope,
         };
     }
 
@@ -475,7 +476,8 @@ fn select_kneedle(curve: &EvVsKCurve, config: &KSelectionConfig, span: f64) -> K
     // `knee_slope_fraction` of the initial slope (the saturation test).
     let k_first = pts[0].k as f64;
     let k_last = pts[n - 1].k as f64;
-    let k_range = (k_last - k_first).max(MIN_DENOM);
+    // A positive initial slope needs two samples at distinct `K`, so `k_range >= 1`.
+    let k_range = k_last - k_first;
 
     let mut best_idx = 0usize;
     let mut best_diff = f64::NEG_INFINITY;
@@ -528,7 +530,7 @@ fn select_mdl(curve: &EvVsKCurve, config: &KSelectionConfig) -> KSelection {
     let mut best_idx = 0usize;
     let mut best_obj = f64::NEG_INFINITY;
     for (i, p) in pts.iter().enumerate() {
-        let obj = p.ev - gamma * (p.k as f64 / k_max.max(MIN_DENOM));
+        let obj = p.ev - gamma * (p.k as f64 / k_max);
         if obj > best_obj {
             best_obj = obj;
             best_idx = i;
@@ -710,14 +712,21 @@ pub fn explained_variance(x: ArrayView2<'_, f64>, fitted: ArrayView2<'_, f64>) -
         .mean_axis(ndarray::Axis(0))
         .expect("non-empty input has means");
     let mut tss = 0.0;
+    let mut energy = 0.0;
     for row in 0..n {
         for col in 0..x.ncols() {
-            let c = x[[row, col]] - means[col];
+            let value = x[[row, col]];
+            let c = value - means[col];
             tss += c * c;
+            energy += value * value;
         }
     }
-    if tss <= MIN_DENOM {
-        if rss <= MIN_DENOM { 1.0 } else { 0.0 }
+    // A column mean over `n` rows is resolved to `γ_{n+1}·max|x|`, so a total sum of
+    // squares inside `γ_{n+1}²·Σx²` is the rounding residue of constant columns: the
+    // data carry no variance to explain.
+    let band = gam_linalg::roundoff::accumulation_growth(n + 1).powi(2) * energy;
+    if tss <= band {
+        if rss <= band { 1.0 } else { 0.0 }
     } else {
         1.0 - rss / tss
     }
@@ -726,9 +735,6 @@ pub fn explained_variance(x: ArrayView2<'_, f64>, fitted: ArrayView2<'_, f64>) -
 /// Relative slope spread below which an EV-vs-K curve is deemed straight
 /// (no curvature => no knee).
 const LINEARITY_SLOPE_REL_TOL: f64 = 0.05;
-
-/// Floor for denominators that could otherwise be zero.
-const MIN_DENOM: f64 = 1.0e-12;
 
 #[cfg(test)]
 mod k_selection_tests {

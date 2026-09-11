@@ -60,9 +60,6 @@ use crate::description_length::{selection_bits, weighted_reverse_water_filling};
 /// Standard fixed-distortion reporting points shared by every front-end.
 pub const DEFAULT_EQ4_R2_TARGETS: &[f64] = &[0.99, 0.95, 0.90, 0.80];
 
-/// The firing threshold above which a gate value counts as an active firing.
-const GATE_ACTIVE_THRESHOLD: f64 = 1e-10;
-
 /// The subsampling cap on the number of firing rows used to estimate an atom's
 /// per-firing coordinate spectrum. When an atom fires on more than this many
 /// rows, the rows are strided down to (at most) this count before the SVD.
@@ -309,7 +306,8 @@ where
     let mut total_active = 0.0_f64;
     for row in 0..n {
         for atom in 0..n_atoms {
-            if gate[[row, atom]] > GATE_ACTIVE_THRESHOLD {
+            // Any positive gate value is a firing.
+            if gate[[row, atom]] > 0.0 {
                 active_per_atom[atom] += 1.0;
                 total_active += 1.0;
             }
@@ -347,7 +345,7 @@ where
     for atom in 0..n_atoms {
         let code_dim = code_dims[atom] as usize;
         let rows: Vec<usize> = (0..n)
-            .filter(|&row| gate[[row, atom]] > GATE_ACTIVE_THRESHOLD)
+            .filter(|&row| gate[[row, atom]] > 0.0)
             .collect();
         if rows.len() < (code_dim + 1).max(4) {
             code_spectra.push(vec![0.0; code_dim]);

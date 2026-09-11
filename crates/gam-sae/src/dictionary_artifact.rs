@@ -11,8 +11,7 @@ use sha2::{Digest, Sha256};
 
 use crate::identifiability::{AtomTopology, FittedSaeManifold, residual_gauge};
 
-const HASH_VERSION: &[u8] = b"gam-sae-dictionary-artifact-v1";
-const EPS: f64 = 1.0e-12;
+const HASH_VERSION: &[u8] = b"gam-sae-dictionary-artifact-v2";
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct CanonicalAtomArtifact {
@@ -191,8 +190,10 @@ fn orient_in_place(block: &mut Array2<f64>) {
     }
 }
 
+/// Folds `-0.0` onto `+0.0`, so a reflected block hashes like its original; every
+/// other value hashes as its exact bits.
 fn canonical_zero(v: f64) -> f64 {
-    if v.abs() < EPS { 0.0 } else { v }
+    if v == 0.0 { 0.0 } else { v }
 }
 
 fn residual_finite_gauge(topology: &AtomTopology, chart_canonicalized: bool) -> String {
@@ -271,8 +272,14 @@ fn relative_frobenius_diff(a: ArrayView2<'_, f64>, b: ArrayView2<'_, f64>) -> f6
         .map(|(x, y)| (x - y) * (x - y))
         .sum::<f64>()
         .sqrt();
-    let den = a.iter().map(|v| v * v).sum::<f64>().sqrt().max(EPS);
-    num / den
+    let den = a.iter().map(|v| v * v).sum::<f64>().sqrt();
+    if den > 0.0 {
+        num / den
+    } else if num == 0.0 {
+        0.0
+    } else {
+        f64::INFINITY
+    }
 }
 
 fn hash_atoms(atoms: &[CanonicalAtomArtifact], cert: &str) -> String {

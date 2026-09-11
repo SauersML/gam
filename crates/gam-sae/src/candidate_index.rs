@@ -50,9 +50,6 @@ const INDEX_HYPERPLANE_SALT: u64 = 0x9E37_79B9_7F4A_7C15;
 /// Salt for the default random-projection sketch's projection matrix.
 const SKETCH_PROJECTION_SALT: u64 = 0xC2B2_AE3D_27D4_EB4F;
 
-/// Numerical floor below which a direction / column is treated as zero.
-const DIRECTION_NORM_FLOOR: f64 = 1e-12;
-
 /// Lower bound of the auto-derived per-row candidate budget `C` (#985). Below
 /// this the proposal set is too small for the solver's accepted active set to
 /// have headroom over the planted/active atom count.
@@ -379,7 +376,7 @@ impl AtomFrameSketch for RandomProjectionFrameSketch {
 
     fn alignment(&self, atom_id: usize, direction: ArrayView1<f64>) -> f64 {
         let dnorm = vec_norm(direction);
-        if dnorm < DIRECTION_NORM_FLOOR {
+        if dnorm == 0.0 {
             return 0.0;
         }
         let comp = self.in_range_component(atom_id, direction);
@@ -1076,7 +1073,8 @@ fn gaussian_projection(rows: usize, cols: usize, seed: u64) -> Array2<f64> {
     let mut m = Array2::<f64>::zeros((rows, cols));
     for r in 0..rows {
         for c in 0..cols {
-            let u1 = rng.random::<f64>().max(1e-16);
+            // `random` draws from [0, 1); its complement lies in (0, 1], where `ln` is finite.
+            let u1 = 1.0 - rng.random::<f64>();
             let u2 = rng.random::<f64>();
             m[(r, c)] = (-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos();
         }
@@ -1093,6 +1091,7 @@ fn orthonormal_frame(block: &Array2<f64>) -> Array2<f64> {
     let mut cols: Vec<Array1<f64>> = Vec::with_capacity(m);
     for j in 0..m {
         let mut v = block.column(j).to_owned();
+        let entering = vec_norm(v.view());
         for q in &cols {
             let proj: f64 = q.iter().zip(v.iter()).map(|(&a, &b)| a * b).sum();
             for (vi, &qi) in v.iter_mut().zip(q.iter()) {
@@ -1100,7 +1099,10 @@ fn orthonormal_frame(block: &Array2<f64>) -> Array2<f64> {
             }
         }
         let nrm = vec_norm(v.view());
-        if nrm > DIRECTION_NORM_FLOOR {
+        // A residual inside the rounding band of the `p`-term projections it went
+        // through is an artefact of the columns already kept, not a new direction.
+        let band = gam_linalg::roundoff::accumulation_growth(p * (cols.len() + 1)) * entering;
+        if nrm > band {
             for vi in v.iter_mut() {
                 *vi /= nrm;
             }
@@ -1133,7 +1135,7 @@ fn vec_norm(v: ArrayView1<f64>) -> f64 {
 #[inline]
 fn normalize_in_place(v: &mut Array1<f64>) {
     let n = vec_norm(v.view());
-    if n > DIRECTION_NORM_FLOOR {
+    if n > 0.0 {
         for x in v.iter_mut() {
             *x /= n;
         }
