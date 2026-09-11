@@ -161,10 +161,8 @@ pub use spec::*;
 pub use time_block::*;
 pub(crate) use truncated_moments::*;
 pub use wiggle_geometry::*;
-// `family_solver` carries the public effective-jacobian entry point
-// (`survival_location_scale_block_effective_jacobian`,
-// `SurvivalLocationScaleChannelHessian`) consumed via the
-// `gam::families::survival::location_scale::...` path, plus crate-internal
+// `family_solver` carries the public `SurvivalLocationScaleChannelHessian`
+// consumed via the `gam::families::survival::location_scale::...` path, plus crate-internal
 // joint-Newton workspaces. `pub use` flattens each item back to the module
 // root at its own declared visibility (`pub` stays public, `pub(crate)`
 // stays crate-internal), exactly as the pre-split monolith exposed them.
