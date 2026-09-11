@@ -1345,6 +1345,12 @@ impl<'a> RemlState<'a> {
         // The actual quadrature then uses spherical Gaussian nodes at sqrt(r),
         // and importance weights from the posterior density. Its two covariance
         // terms therefore integrate the same positive probability measure.
+        //
+        // Every refusal in this calibration is a statement about the UPGRADE: a
+        // node the criterion cannot calibrate, contain, or evaluate. The outer
+        // loop has already certified the fit and there is no trial left to
+        // refuse, so a refusal returns the first-order outcome with its reason.
+        let calibrated_nodes = (|| -> Result<Vec<CalibratedSigmaNode>, EstimationError> {
         let centre_cost = self.compute_rho_posterior_cost_uncharged(final_rho)?;
         if !centre_cost.is_finite() {
             return Err(EstimationError::TrialPointRefused {
@@ -1422,6 +1428,17 @@ impl<'a> RemlState<'a> {
                 });
             }
         }
+        Ok(nodes)
+        })();
+        let nodes = match calibrated_nodes {
+            Ok(nodes) => nodes,
+            Err(error) => {
+                return self.finalize_smoothing_outcome(first_order_numerical(
+                    first_order_correction,
+                    format!("smoothing cubature could not calibrate its nodes: {error}").into(),
+                ));
+            }
+        };
         // The Gaussian proposal density is equal at every spherical node.
         // Its constant cancels from the normalized importance weights. Shift
         // log weights before exponentiating so no high-density node overflows.
