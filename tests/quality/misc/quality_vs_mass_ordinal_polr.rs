@@ -40,15 +40,10 @@
 //! points and let cutpoint-specific intercepts (threshold dummies thr2, thr3,
 //! with j=1 the baseline) realize θ_2, θ_3. gam fits this stacked frame with
 //!     z ~ s(x, bs='cc') + x2 + thr2 + thr3
-//! and the SAME stopping-ratio likelihood is fit in R by VGAM. The data are
-//! synthesized from an exact stopping-ratio generative model so both engines are
-//! correctly specified.
-//!
-//! Because `VGAM::vglm` uses a *linear* predictor, the reference represents the
-//! periodic x-effect with the matching low-order cyclic harmonics sin(x)+cos(x)
-//! (the linear analogue of a cyclic-cubic smooth on a single oscillation), plus
-//! the shared linear x2. Identical data (a fixed-seed synthetic ordinal sample)
-//! is handed to both engines.
+//! and mgcv fits the identical stacked frame and cyclic smooth by REML. The data
+//! are synthesized from an exact stopping-ratio generative model, so both engines
+//! are correctly specified, and identical rows (a fixed-seed synthetic ordinal
+//! sample, stacked once) are handed to both.
 //!
 //! All comparisons are over a common x-grid spanning the data, against the
 //! closed-form population truth: per-level class probabilities P(Y = j),
@@ -73,8 +68,7 @@ use std::path::Path;
 /// [-3, 3] with period exactly 6, so g(-3) = g(3) = 0. This honors the seam
 /// continuity that a cyclic-cubic (`bs='cc'`) smooth imposes (f(min) = f(max)),
 /// making the cyclic basis the genuinely correct model — not an approximation
-/// fighting a boundary discontinuity. Its linear-model analogue (used by VGAM)
-/// is the first cyclic harmonic pair sin(pi x/3) + cos(pi x/3).
+/// fighting a boundary discontinuity.
 fn g_of_x(x: f64) -> f64 {
     0.9 * (std::f64::consts::PI * x / 3.0).sin()
 }
@@ -92,8 +86,8 @@ fn gam_continuation_ratio_matches_vgam_sratio() {
     // EXACT stopping-ratio generative model: at each cutpoint j the observation
     // "stops" (Y = j) with prob q_j = logit^{-1}(theta_j + g(x) + beta*x2),
     // otherwise it advances; reaching the last level if it never stops. This is
-    // precisely the model gam's stacked binomial and VGAM::sratio both fit, so
-    // both are correctly specified. Identical raw (x, x2, y) handed to both.
+    // precisely the stacked binomial model gam and mgcv both fit, so both are
+    // correctly specified. Identical stacked rows are handed to both.
     let n = 250usize;
     let beta_x2_true = 0.7;
     // Stopping-ratio cutpoint intercepts theta_j on the conditional-logit scale.
