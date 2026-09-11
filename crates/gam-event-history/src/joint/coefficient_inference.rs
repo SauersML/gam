@@ -3,6 +3,9 @@
 //! after the preceding optimization and independent assessment have finished.
 use super::*;
 use rand::Rng;
+#[path = "constant_rate_inference.rs"]
+mod constant_rates;
+pub use constant_rates::ConstantRatePosterior;
 
 #[derive(Clone, Debug, Default)]
 pub struct CoefficientInferenceOptions {
@@ -28,14 +31,14 @@ pub struct CoefficientRefinementRound {
 /// This is inference for a declared signature structure and supplied latent/
 /// reference banks. It does not select rank, establish null-boundary optima,
 /// prove importance-tail coverage, or supply a serialized forecasting model.
-pub struct JointCoefficientInference<'p, 'm> {
+struct SampledCoefficientInference<'p, 'm> {
     integral: JointCoefficientIntegral<'p, 'm>,
     evidence: JointCoefficientEvidence,
     log_strengths: Vec<f64>,
     rounds: Vec<CoefficientRefinementRound>,
 }
 
-impl JointCoefficientInference<'_, '_> {
+impl SampledCoefficientInference<'_, '_> {
     pub fn coefficient_mean(&self) -> &[f64] {
         self.evidence.coefficient_mean()
     }
@@ -50,6 +53,73 @@ impl JointCoefficientInference<'_, '_> {
     }
     pub fn rounds(&self) -> &[CoefficientRefinementRound] {
         &self.rounds
+    }
+}
+
+enum CoefficientLaw<'p, 'm> {
+    ConstantRates(ConstantRatePosterior),
+    Sampled(SampledCoefficientInference<'p, 'm>),
+}
+
+/// Converged coefficient inference. Constant rates use their exact Gamma
+/// law, including the empirical-Bayes zero-rate boundary. General models
+/// retain independently assessed importance draws. Posterior means remain
+/// the reporting target in both cases.
+pub struct JointCoefficientInference<'p, 'm> {
+    law: CoefficientLaw<'p, 'm>,
+}
+
+impl JointCoefficientInference<'_, '_> {
+    /// No finite log-coefficient mean exists at the point mass on zero rates.
+    /// Use `constant_rates().rate_mean()` for that physical-function limit.
+    pub fn coefficient_mean(&self) -> Option<&[f64]> {
+        match &self.law {
+            CoefficientLaw::ConstantRates(law) => law.log_rate_mean(),
+            CoefficientLaw::Sampled(law) => Some(law.coefficient_mean()),
+        }
+    }
+    pub fn coefficient_variance(&self) -> Option<&[f64]> {
+        match &self.law {
+            CoefficientLaw::ConstantRates(law) => law.log_rate_variance(),
+            CoefficientLaw::Sampled(law) => Some(law.evidence().coefficient_variance()),
+        }
+    }
+    pub fn log_evidence(&self) -> f64 {
+        match &self.law {
+            CoefficientLaw::ConstantRates(law) => law.log_evidence(),
+            CoefficientLaw::Sampled(law) => law.evidence().log_evidence(),
+        }
+    }
+    /// The zero-rate boundary has no finite log-strength chart coordinate.
+    pub fn log_strengths(&self) -> Option<&[f64]> {
+        match &self.law {
+            CoefficientLaw::ConstantRates(law) => law.log_strengths(),
+            CoefficientLaw::Sampled(law) => Some(law.log_strengths()),
+        }
+    }
+    pub fn constant_rates(&self) -> Option<&ConstantRatePosterior> {
+        match &self.law {
+            CoefficientLaw::ConstantRates(law) => Some(law),
+            CoefficientLaw::Sampled(_) => None,
+        }
+    }
+    pub fn sampled_evidence(&self) -> Option<&JointCoefficientEvidence> {
+        match &self.law {
+            CoefficientLaw::ConstantRates(_) => None,
+            CoefficientLaw::Sampled(law) => Some(law.evidence()),
+        }
+    }
+    pub fn draws(&self) -> Option<&[CoefficientImportanceDraw]> {
+        match &self.law {
+            CoefficientLaw::ConstantRates(_) => None,
+            CoefficientLaw::Sampled(law) => Some(law.draws()),
+        }
+    }
+    pub fn rounds(&self) -> &[CoefficientRefinementRound] {
+        match &self.law {
+            CoefficientLaw::ConstantRates(_) => &[],
+            CoefficientLaw::Sampled(law) => law.rounds(),
+        }
     }
 }
 
@@ -80,6 +150,29 @@ fn combined_workspace(
 }
 
 impl JointCohortIntegration<'_, '_> {
+    fn validate_coefficient_inference(
+        &self,
+        priors: &JointFunctionPriors<'_>,
+        initial_coefficients: &[f64],
+        initial_log_strengths: &[f64],
+        options: &CoefficientInferenceOptions,
+    ) -> Result<(usize, usize), EventHistoryError> {
+        options.strengths.validate()?;
+        let p = self.model.layout.width;
+        let h = priors.penalties().len();
+        if !priors.belongs_to(self.model)
+            || initial_log_strengths.len() != h
+            || initial_log_strengths.iter().any(|v| !v.is_finite())
+            || options.strengths.minimum_effective_samples >= usize::MAX as f64
+        {
+            return Err(invalid(
+                "coefficient inference requires matching priors and finite strength seeds/sample requirements",
+            ));
+        }
+        self.model.validate_parameters(initial_coefficients)?;
+        Ok((p, h))
+    }
+
     /// Fit a normalized defensive/local proposal, freeze fresh coefficient
     /// draws and their resolved normalized cohort likelihoods, optimize the
     /// coefficient-integrated evidence, then assess a separate fresh bank.
@@ -104,19 +197,56 @@ impl JointCohortIntegration<'_, '_> {
         options: &CoefficientInferenceOptions,
         rng: &mut R,
     ) -> Result<JointCoefficientInference<'p, 'm>, EventHistoryError> {
-        options.strengths.validate()?;
-        let p = self.model.layout.width;
-        let h = priors.penalties().len();
-        if !priors.belongs_to(self.model)
-            || initial_log_strengths.len() != h
-            || initial_log_strengths.iter().any(|v| !v.is_finite())
-            || options.strengths.minimum_effective_samples >= usize::MAX as f64
+        if self.model.spec.signatures == 0
+            && self.model.spec.baseline_columns == 1
+            && self.model.spec.measurements.is_empty()
+            && self.subjects.iter().all(|s| {
+                s.history
+                    .baseline_design
+                    .column(0)
+                    .iter()
+                    .all(|&x| x == 1.0)
+            })
         {
-            return Err(invalid(
-                "coefficient inference requires matching priors and finite strength seeds/sample requirements",
-            ));
+            self.validate_coefficient_inference(
+                priors,
+                initial_coefficients,
+                initial_log_strengths,
+                options,
+            )?;
+            return Ok(JointCoefficientInference {
+                law: CoefficientLaw::ConstantRates(self.infer_constant_rates(priors, options)?),
+            });
         }
-        self.model.validate_parameters(initial_coefficients)?;
+        Ok(JointCoefficientInference {
+            law: CoefficientLaw::Sampled(self.infer_sampled_coefficients(
+                priors,
+                initial_coefficients,
+                initial_log_strengths,
+                accuracy,
+                cohort_tolerance,
+                options,
+                rng,
+            )?),
+        })
+    }
+
+    fn infer_sampled_coefficients<'p, 'm, R: Rng + ?Sized>(
+        &self,
+        priors: &'p JointFunctionPriors<'m>,
+        initial_coefficients: &[f64],
+        initial_log_strengths: &[f64],
+        accuracy: &IntegrationAccuracy,
+        cohort_tolerance: &CohortScoreTolerance,
+        options: &CoefficientInferenceOptions,
+        rng: &mut R,
+    ) -> Result<SampledCoefficientInference<'p, 'm>, EventHistoryError> {
+        let (p, h) = self.validate_coefficient_inference(
+            priors,
+            initial_coefficients,
+            initial_log_strengths,
+            options,
+        )?;
         let mut samples = (options.strengths.minimum_effective_samples.ceil() as usize)
             .max(
                 p.checked_add(1)
@@ -173,7 +303,7 @@ impl JointCohortIntegration<'_, '_> {
                 resolution: report,
             });
             if accepted {
-                return Ok(JointCoefficientInference {
+                return Ok(SampledCoefficientInference {
                     integral: fitting,
                     evidence,
                     log_strengths: next_rho,
@@ -284,7 +414,7 @@ mod tests {
             ..CoefficientInferenceOptions::default()
         };
         let result = cohort
-            .infer_coefficients(
+            .infer_sampled_coefficients(
                 &priors,
                 &seed,
                 &[0.0],
@@ -343,7 +473,7 @@ mod tests {
         insufficient.pilot.memory_limit_bytes = 1;
         assert!(
             cohort
-                .infer_coefficients(
+                .infer_sampled_coefficients(
                     &priors,
                     &seed,
                     &[0.0],
@@ -356,7 +486,7 @@ mod tests {
         );
         assert!(
             cohort
-                .infer_coefficients(
+                .infer_sampled_coefficients(
                     &priors,
                     &seed,
                     &[f64::NAN],
@@ -371,7 +501,7 @@ mod tests {
         impossible.pilot.memory_limit_bytes = 256 << 10;
         impossible.strengths.log_evidence_tolerance = 1e-12;
         let error = cohort
-            .infer_coefficients(
+            .infer_sampled_coefficients(
                 &priors,
                 &seed,
                 &[0.0],
@@ -384,6 +514,48 @@ mod tests {
             .unwrap()
             .to_string();
         assert!(error.contains("memory budget"), "{error}");
+        let mut exact_rng = rng.clone();
+        let mut untouched_rng = rng.clone();
+        let exact = cohort
+            .infer_coefficients(
+                &priors,
+                &seed,
+                &[0.0],
+                &accuracy,
+                &tolerance,
+                &options,
+                &mut exact_rng,
+            )
+            .unwrap();
+        assert_eq!(
+            rand::RngExt::random::<u64>(&mut exact_rng),
+            rand::RngExt::random::<u64>(&mut untouched_rng)
+        );
+        assert!(exact.draws().is_none());
+        assert!(exact.sampled_evidence().is_none());
+        assert!(exact.rounds().is_empty());
+        let exact_rates = exact.constant_rates().unwrap();
+        assert!(!exact_rates.is_zero_rate());
+        assert_eq!(exact_rates.iterations(), 0);
+        assert!(exact_rates.gradient().abs() < 1e-12);
+        assert!((exact.log_strengths().unwrap()[0] + 7.0_f64.ln()).abs() < 1e-12);
+        assert!((exact_rates.rate_mean()[0] - 1.75).abs() < 1e-12);
+        assert!((exact_rates.rate_variance()[0] - 49.0 / 128.0).abs() < 1e-12);
+        assert!(
+            (exact.coefficient_mean().unwrap()[0] - (digamma8 - (32.0_f64 / 7.0).ln())).abs()
+                < 1e-12
+        );
+        assert_eq!(
+            exact.coefficient_variance().unwrap(),
+            exact_rates.log_rate_variance().unwrap()
+        );
+        let exact_log_evidence = (4.0_f64 / 7.0).ln()
+            + (1..=7).map(|n| (n as f64).ln()).sum::<f64>()
+            - 8.0 * (32.0_f64 / 7.0).ln();
+        assert!((exact.log_evidence() - exact_log_evidence).abs() < 1e-12);
+        let survival = exact_rates.no_event_probability(&[2.0]).unwrap();
+        assert!((survival - (16.0_f64 / 23.0).powi(8)).abs() < 1e-12);
+        assert!((survival - (-2.0_f64 * 1.75).exp()).abs() > 0.02);
         println!(
             "adaptive coefficient evidence: {} rounds, {} samples/bank, rho {} (exact {}), mean {} (exact {}), log evidence {} (exact {}); {:?}",
             result.rounds().len(),

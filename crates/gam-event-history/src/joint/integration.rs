@@ -181,6 +181,12 @@ struct AnalyticGaussian {
     observed_gene_log_density: f64,
 }
 
+impl JointIntegration<'_> {
+    pub(super) fn analytic_observed_genetic_log_density(&self) -> Option<f64> {
+        self.analytic.as_ref().map(|a| a.observed_gene_log_density)
+    }
+}
+
 impl JointLikelihood {
     pub(super) fn gaussian_observation_law(&self, h: &JointHistory) -> bool {
         self.spec.signatures == 0

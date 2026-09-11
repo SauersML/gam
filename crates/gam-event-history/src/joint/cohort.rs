@@ -12,9 +12,9 @@ pub use resolution::{CohortScoreTolerance, JointCohortResolutionReport, Resolved
 mod coefficients;
 pub use coefficients::{
     CoefficientImportanceDraw, CoefficientInferenceOptions, CoefficientRefinementRound,
-    EvidenceHessianProduct, JointCoefficientEvidence, JointCoefficientInference,
-    JointCoefficientIntegral, JointStrengthOptimum, StrengthOptimizationOptions,
-    StrengthResolutionReport,
+    ConstantRatePosterior, EvidenceHessianProduct, JointCoefficientEvidence,
+    JointCoefficientInference, JointCoefficientIntegral, JointStrengthOptimum,
+    StrengthOptimizationOptions, StrengthResolutionReport,
 };
 
 /// A fixed sampled objective. Subject banks must have independent importance

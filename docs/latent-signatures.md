@@ -502,7 +502,8 @@ underresolved or nonstationary results to fail.
 
 `JointCohortIntegration::infer_coefficients` connects proposal fitting,
 coefficient integration, strength optimization, and independent validation.
-Each round fits the guided proposal against the same normalized cohort
+For a constant-rate zero-signature model without measurement channels, it
+uses the exact route below. Otherwise each round fits the guided proposal against the same normalized cohort
 likelihood and function priors, draws a fresh fitting bank, caches its resolved
 likelihoods, and optimizes integrated evidence. Only then does it draw the
 separate validation bank. Acceptance requires the value, whitened strength
@@ -519,7 +520,7 @@ that budget returns an unresolved error. An inner likelihood error floor
 requires refinement of the subject/reference banks; drawing more coefficients
 cannot eliminate it. Optimizer and inner-integration failures propagate.
 
-The returned `JointCoefficientInference` owns the final fitting draws and
+For sampled inference, `JointCoefficientInference` owns the final fitting draws and
 their normalized proposal densities together with their posterior weights,
 means, evidence, learned strengths, and refinement reports. It never replaces
 posterior means with the proposal mode. The conjugate end-to-end test checks
@@ -530,9 +531,59 @@ rejection.
 These are conditional Monte Carlo error estimates, not confidence sequences
 for the sequential stopping rule or a proof of tail coverage. This driver
 handles interior strength inference for a declared structure and supplied
-latent/reference banks. Exact null boundaries, automatic rank selection,
+latent/reference banks. Null boundaries outside the constant-rate case, automatic rank selection,
 subject/reference re-anchoring, integrated forecasts, and a standalone model
 shared by Rust, Python, and the CLI still need implementation.
+
+### Exact constant-rate inference and the zero-rate boundary
+
+With zero signatures, a unit intercept as the only baseline column, and no
+measurement channels, the counting-process likelihood factorizes by mark:
+
+```text
+L(r) = p(observed genetics) product_d r_d^y_d exp(-E_d r_d).
+T r_d ~ Exponential(lambda), independently across marks at shared lambda.
+c = lambda T.
+p(data | lambda) = p(observed genetics)
+                  product_d c Gamma(y_d+1) / (E_d+c)^(y_d+1).
+r_d | data, lambda ~ Gamma(shape=y_d+1, rate=E_d+c).
+```
+
+`E_d` sums the supplied quadrature exposure while the subject is at risk for
+that mark. Once-only events stop their own exposure; prevalent once-only
+marks enter outside that risk set. Terminal events end the history. The
+genetic likelihood uses the same analytic marginal over missing scores as
+the subject integrator. `T` is precisely the frozen function prior's mean
+follow-up span, so this route integrates the same model as coefficient
+importance sampling.
+
+Each exposed mark contributes score `E_d/(E_d+c)-y_d*c/(E_d+c)` in log `c`
+and strictly negative curvature `-(y_d+1) E_d*c/(E_d+c)^2`. When events are
+observed with positive risk exposure, the total score changes from positive
+to negative, giving a unique evidence maximum. Equal exposed durations give
+`c = sum_d E_d / sum_d y_d` in closed form; differing exposures use analytic
+scores in `opt`, with a recomputed stationarity check and no search bounds.
+No events in an exposed cohort instead give the exact global boundary
+`c -> infinity`, with all rate posteriors concentrated at zero. An entirely
+unexposed cohort has unidentified evidence and returns an error; an event
+with zero supplied risk exposure has no finite optimum and is also rejected.
+
+`JointCoefficientInference::constant_rates` exposes the exact rate means,
+variances, and posterior no-event transform. The latter returns
+`product_d (1 + u_d/(E_d+c))^(-(y_d+1))` for requested nonnegative exposures
+`u_d`, integrating coefficient uncertainty rather than inserting mean rates.
+Finite log-rate means are `digamma(y_d+1)-log(E_d+c)` and variances are
+`trigamma(y_d+1)`. At the zero-rate boundary, finite log-coefficient moments
+and log-strength coordinates do not exist: their accessors return `None`,
+`is_zero_rate()` is true, physical rate means/variances are zero, and no-event
+probabilities are one. Sampled evidence and draws are absent on the analytic
+route, which consumes no coefficient RNG draws.
+
+Tests compare the sampled and automatic analytic routes, check the unequal
+risk-exposure optimum against its independent algebraic root, retain the
+observed genetic density with a missing correlated score, and change time
+units by factors of `1e100` and `1e-100`. These are model/numerical checks;
+they do not establish external calibration or complete signature selection.
 
 Training may use a structured variational approximation with local Gaussian
 state factors and temporal precision blocks, plus shared parameter factors.

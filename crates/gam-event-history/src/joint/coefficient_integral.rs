@@ -6,7 +6,8 @@ use super::*;
 #[path = "coefficient_inference.rs"]
 mod inference;
 pub use inference::{
-    CoefficientInferenceOptions, CoefficientRefinementRound, JointCoefficientInference,
+    CoefficientInferenceOptions, CoefficientRefinementRound, ConstantRatePosterior,
+    JointCoefficientInference,
 };
 #[path = "strength_fit.rs"]
 mod strength_fit;

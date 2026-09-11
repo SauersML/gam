@@ -403,6 +403,9 @@ impl JointLikelihood {
 }
 
 impl<'m> JointFunctionPriors<'m> {
+    pub(super) fn log_followup_scale(&self) -> f64 {
+        self.log_followup_scale
+    }
     pub(super) fn belongs_to(&self, model: &JointLikelihood) -> bool {
         std::ptr::eq(self.model, model)
     }
