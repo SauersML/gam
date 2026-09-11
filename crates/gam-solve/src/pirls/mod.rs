@@ -85,7 +85,9 @@ use pls_solver::solve_penalized_least_squares_implicit;
 pub use pls_solver::{GaussianFixedCache, GaussianFrozenRows, SparseXtwxPrecomputed};
 pub use sparse_system::{SparsePenalizedSystem, assemble_and_factor_sparse_penalized_system};
 
-pub use reweight::runworking_model_pirls;
+pub use reweight::{
+    ExactNewtonDecrementEvidence, exact_newton_decrement_evidence, runworking_model_pirls,
+};
 
 pub use state::array1_l2_norm;
 

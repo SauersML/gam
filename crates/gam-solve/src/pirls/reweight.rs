@@ -352,11 +352,23 @@ pub(crate) fn exact_face_newton_decrement_sq(
     options: &WorkingModelPirlsOptions,
 ) -> Option<f64> {
     let inequalities = polish_inequality_system(options)?;
+    exact_newton_decrement_sq_on_face(state, correction, beta, &inequalities)
+}
+
+/// [`exact_face_newton_decrement_sq`] for an explicit inequality system rather
+/// than the one a set of solve options induces, so a consumer holding the
+/// system itself measures the same face the solve certified on.
+fn exact_newton_decrement_sq_on_face(
+    state: &WorkingState,
+    correction: Option<&Array2<f64>>,
+    beta: &Array1<f64>,
+    inequalities: &gam_problem::LinearInequalityConstraints,
+) -> Option<f64> {
     let hessian = state.hessian.as_dense()?;
     if !state.gradient.iter().all(|v| v.is_finite()) || !hessian.iter().all(|v| v.is_finite()) {
         return None;
     }
-    let rows = crate::active_set::binding_constraint_rows(beta, &state.gradient, &inequalities)?;
+    let rows = crate::active_set::binding_constraint_rows(beta, &state.gradient, inequalities)?;
     let curvature = objective_curvature_for_direction(hessian, correction).ok()?;
     let direction = if rows.nrows() > 0 {
         active_face_newton_direction(&curvature, &state.gradient, &rows)?
@@ -366,6 +378,64 @@ pub(crate) fn exact_face_newton_decrement_sq(
     // `direction` is `−H⁻¹g` (on the face), so `gᵀH⁻¹g = −gᵀd`.
     let decrement_sq = -state.gradient.dot(&direction);
     (decrement_sq.is_finite() && decrement_sq >= 0.0).then_some(decrement_sq)
+}
+
+/// The exact-decrement half of the P-IRLS convergence certificate, measured on
+/// a fully evaluated state: the squared Newton decrement and the threshold it is
+/// certified against.
+#[derive(Clone, Copy, Debug)]
+pub struct ExactNewtonDecrementEvidence {
+    /// `gᵀH⁻¹g` on the objective curvature, restricted to the binding face when
+    /// the fit carries inequalities. `None` when that curvature does not
+    /// factorize or the state is non-finite: no decrement, so no certificate.
+    pub decrement_sq: Option<f64>,
+    /// Twice the penalized objective's rounding band at the same state: the
+    /// threshold P-IRLS certifies the decrement against.
+    pub threshold: f64,
+}
+
+impl ExactNewtonDecrementEvidence {
+    pub fn certifies(&self) -> bool {
+        self.decrement_sq
+            .is_some_and(|decrement_sq| decrement_sq <= self.threshold)
+    }
+}
+
+/// The exact-decrement certificate P-IRLS mints `Converged` under, next to strict
+/// KKT, in the loop and in the post-loop rescue alike. It is published so a
+/// consumer that must accept exactly what the inner solver certified can use the
+/// producer's own definitions rather than a re-derivation.
+///
+/// A consumer that re-checks only the gradient-norm half refuses modes the solve
+/// certified. When the penalized Hessian is stiff (a smoothing block railed at a
+/// large λ), the residual `g` can stay above every gradient band while `H⁻¹g`, the
+/// only step that could still move the objective, is already below its rounding
+/// band (#2705).
+///
+/// `inequalities` must be the system the solve ran under: per-coordinate lower
+/// bounds become their unit rows. `correction` is the model's
+/// [`WorkingModel::objective_hessian_matrix_correction`], and `dev_scale` its
+/// [`WorkingModel::penalized_deviance_scale`]. With no inequalities this is the
+/// assembled-Hessian decrement. A model that overrides
+/// [`WorkingModel::exact_unconstrained_decrement_sq`] certifies through that
+/// representation instead, and this function does not reach it.
+pub fn exact_newton_decrement_evidence(
+    state: &WorkingState,
+    beta: &Array1<f64>,
+    inequalities: Option<&gam_problem::LinearInequalityConstraints>,
+    correction: Option<&Array2<f64>>,
+    dev_scale: f64,
+) -> ExactNewtonDecrementEvidence {
+    let decrement_sq = match inequalities {
+        Some(inequalities) => {
+            exact_newton_decrement_sq_on_face(state, correction, beta, inequalities)
+        }
+        None => exact_newton_decrement_sq(state, correction),
+    };
+    ExactNewtonDecrementEvidence {
+        decrement_sq,
+        threshold: exact_newton_decrement_threshold(state, dev_scale),
+    }
 }
 
 /// Whether `beta` is primal-feasible for every inequality the fit carries, to

@@ -2827,19 +2827,52 @@ impl WorkingModelSurvival {
                 * penalty_gradient_inf;
             data_band + penalty_band
         };
+        // The inner certificate's other half. P-IRLS mints `Converged` under strict
+        // KKT OR an exact Newton decrement inside the objective's rounding band,
+        // and this gate re-checked only the gradient half. On a smoothing block
+        // railed at a large λ the penalized Hessian is stiff, so a residual the
+        // objective cannot act on stays above every gradient band. Measured on
+        // the #2705 fixture: ‖Pg‖ = 2.267e-6 (relative 8.061e-8 against 1e-8,
+        // band 1.747e-7) with gᵀH⁻¹g = 1.536e-13 against a threshold of
+        // 1.730e-10. The solve certified the mode, this gate refused it, and the
+        // whole fit was refused with it.
+        //
+        // The decrement is also what the envelope depends on. The Laplace mode's
+        // value error is ½·gᵀH⁻¹g, and each ρ-gradient error gᵀH⁻¹(λ_k S_k β) is
+        // at most √(gᵀH⁻¹g)·√((λ_k S_k β)ᵀH⁻¹(λ_k S_k β)), by Cauchy–Schwarz in the
+        // H⁻¹ inner product. Both are first order in the decrement, not in ‖g‖.
+        // The system and curvature are the ones the solve ran under: the
+        // monotonicity rows the projection above uses, and the model's own
+        // curvature correction and deviance scale.
+        let monotonicity_constraints = self.monotonicity_linear_constraints();
+        let decrement = gam_solve::pirls::exact_newton_decrement_evidence(
+            state,
+            beta,
+            monotonicity_constraints.as_ref(),
+            PirlsWorkingModel::objective_hessian_matrix_correction(self),
+            PirlsWorkingModel::penalized_deviance_scale(self)?,
+        );
         let stationary_to_resolution = projected_norm.is_finite()
             && (state.certifies_kkt(projected_norm, SURVIVAL_LAML_STATIONARITY_RELATIVE_TOL)
-                || projected_norm <= residual_rounding_band);
+                || projected_norm <= residual_rounding_band
+                || decrement.certifies());
         if !stationary_to_resolution {
+            let decrement_note = match decrement.decrement_sq {
+                Some(decrement_sq) => format!("{decrement_sq:.3e}"),
+                None => "unavailable (the face curvature did not factorize)".to_string(),
+            };
             return Err(EstimationError::TrialPointRefused {
                 reason: format!(
                     "survival LAML requires a stationary inner mode: projected KKT residual \
                      {projected_norm:.3e} (relative {:.3e}) is not certified by the inner \
                      solver's convergence test at tolerance \
-                     {SURVIVAL_LAML_STATIONARITY_RELATIVE_TOL:.3e} and sits above the \
-                     residual's own rounding band {residual_rounding_band:.3e}; a one-step \
-                     residual surrogate is not a differentiable substitute for the Laplace mode",
-                    state.relative_gradient_norm(projected_norm)
+                     {SURVIVAL_LAML_STATIONARITY_RELATIVE_TOL:.3e}, sits above the \
+                     residual's own rounding band {residual_rounding_band:.3e}, and its exact \
+                     Newton decrement gᵀH⁻¹g = {decrement_note} is above the objective's \
+                     rounding threshold {:.3e}; a one-step residual surrogate is not a \
+                     differentiable substitute for the Laplace mode",
+                    state.relative_gradient_norm(projected_norm),
+                    decrement.threshold,
                 ),
             });
         }
