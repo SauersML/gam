@@ -199,7 +199,8 @@ impl Family {
     fn config_family(self) -> Option<String> {
         match self {
             Family::Gaussian => Some("gaussian".to_string()),
-            Family::Tweedie => Some("tweedie".to_string()),
+            // An explicit power is required (a893d85bc); fit at the simulated one.
+            Family::Tweedie => Some(format!("tweedie(p={P_TWEEDIE})")),
         }
     }
     /// Map the linear predictor to the response-scale mean. Gaussian uses the

@@ -78,7 +78,6 @@ fn parenthesized_default_link_equals_bare_family() {
         ("gaussian(identity)", "gaussian"),
         ("binomial(logit)", "binomial"),
         ("beta(logit)", "beta"),
-        ("tweedie(log)", "tweedie"),
         ("negative_binomial(log)", "negative_binomial"),
     ] {
         let p = resolve(paren).unwrap_or_else(|e| panic!("{paren} must resolve: {e}"));
@@ -93,6 +92,33 @@ fn parenthesized_default_link_equals_bare_family() {
             "{paren} and {bare} must resolve to the same link"
         );
     }
+
+    // Tweedie carries its variance power in the same parentheses
+    // (`tweedie(p=1.5)`), so `tweedie(log)` cannot also name one and a bare
+    // `tweedie` names none. Since a893d85bc both refuse, identically, instead of
+    // resolving at a power nobody chose. The link-suffix spelling carries both.
+    let refusal = |name: &str| match resolve(name) {
+        Ok(_) => panic!("{name} names no variance power and must be refused"),
+        Err(error) => error,
+    };
+    assert_eq!(
+        refusal("tweedie(log)"),
+        refusal("tweedie"),
+        "tweedie(log) and tweedie must refuse with the same reason"
+    );
+    let suffixed = resolve("tweedie-log(p=1.5)")
+        .unwrap_or_else(|e| panic!("tweedie-log(p=1.5) must resolve: {e}"));
+    let explicit =
+        resolve("tweedie(p=1.5)").unwrap_or_else(|e| panic!("tweedie(p=1.5) must resolve: {e}"));
+    assert_eq!(
+        suffixed.response, explicit.response,
+        "tweedie-log(p=1.5) and tweedie(p=1.5) must resolve to the same response family"
+    );
+    assert_eq!(
+        suffixed.link.link_function(),
+        explicit.link.link_function(),
+        "tweedie-log(p=1.5) and tweedie(p=1.5) must resolve to the same link"
+    );
 }
 
 /// The link-changing parenthesized forms that already worked must keep working —
