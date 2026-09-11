@@ -1975,6 +1975,33 @@ impl<const P: usize, G: SlopeRowGeometry<P>> SurvivalMarginalSlopeRowKernel<P, G
         self.second_directional_derivative_all_axes_from_towers(d_beta_u, &towers)
     }
 
+    /// The all-axes second directional derivative along every direction of a
+    /// batch from ONE build of the row towers, which depend only on the
+    /// coefficient snapshot. Each direction's object is exactly what
+    /// [`Self::second_directional_derivative_all_axes_build_once`] returns for it.
+    pub(crate) fn second_directional_derivative_all_axes_each(
+        &self,
+        directions: &[&[f64]],
+        consume: &mut dyn FnMut(usize, Vec<Array2<f64>>) -> Result<(), String>,
+    ) -> Result<(), String> {
+        let p = self.n_coefficients();
+        if let Some(direction) = directions.iter().find(|direction| direction.len() != p) {
+            return Err(format!(
+                "survival marginal-slope batched second directional derivative: direction has {} \
+                 entries, expected {p}",
+                direction.len()
+            ));
+        }
+        let towers = self.build_row_towers()?;
+        for (index, direction) in directions.iter().enumerate() {
+            consume(
+                index,
+                self.second_directional_derivative_all_axes_from_towers(direction, &towers)?,
+            )?;
+        }
+        Ok(())
+    }
+
     /// gam#979 Jeffreys wide-p contracted-trace-Hessian for the rigid survival
     /// marginal-slope kernel: `∇²_β tr(W · H(β))` for a caller-supplied
     /// full-joint trace weight `W`. Binary twin of BMS's

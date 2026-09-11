@@ -983,49 +983,49 @@ pub(crate) fn custom_family_outer_jeffreys_hphi_drift_batched<
         // and second derivatives and across every subsequent operator apply,
         // not merely across directions in a single callback invocation.
         let base = prepare_first()?;
-        // Per direction: the only δ-dependent work — `pert_h = Hdot[δ]` and the
-        // `p` second-directional derivatives `H²dot[δ,e_a]` — reusing the base.
-        deltas
+        // Per direction, only `pert_h = Hdot[δ]` and the all-axes
+        // `{H²dot[δ,e_a]}` depend on δ. The all-axes objects of the whole batch come
+        // from ONE family request, so a family whose all-axes object contracts a
+        // per-snapshot row object builds that object once for the batch (#979).
+        let pert_hs = deltas
             .iter()
             .map(|delta| {
-                let pert_h =
-                    match family_owned
-                        .joint_jeffreys_information_directional_derivative_with_specs(
-                            &states_owned,
-                            &specs_owned,
-                            delta,
-                        )? {
-                        Some(hd) => hd,
-                        None => return Err(
-                            "active Jeffreys drift requires an exact first information derivative"
-                                .to_string(),
-                        ),
-                    };
-                // Batched all-axes second-directional object `{H²dot[δ,e_a]}` in
-                // ONE pass (BLAS-3 for the rigid family; the defining per-axis
-                // implementation for the rest). This collapses the dominant
-                // `p` independent full-data second-directional sweeps the
-                // per-axis closure used to run.
-                let pert_axis_matrices = family_owned
-                    .joint_jeffreys_information_second_directional_all_axes_with_specs(
+                family_owned
+                    .joint_jeffreys_information_directional_derivative_with_specs(
                         &states_owned,
                         &specs_owned,
                         delta,
                     )?
                     .ok_or_else(|| {
-                        "active Jeffreys drift requires exact second information derivatives"
+                        "active Jeffreys drift requires an exact first information derivative"
                             .to_string()
-                    })?;
-                base.perturbation_derivative_batched_axes(&pert_h, Some(pert_axis_matrices))
-                    .map(|mut derivative| {
-                        if strength != 1.0 {
-                            derivative *= strength;
-                        }
-                        Some(derivative)
                     })
             })
             .collect::<Result<Vec<_>, String>>()
-            .map_err(CustomFamilyError::trial_point)
+            .map_err(CustomFamilyError::trial_point)?;
+        let mut derivatives: Vec<Option<Array2<f64>>> = vec![None; deltas.len()];
+        let complete = family_owned
+            .joint_jeffreys_information_second_directional_all_axes_each_with_specs(
+                &states_owned,
+                &specs_owned,
+                deltas,
+                &mut |index, axes| {
+                    let mut derivative =
+                        base.perturbation_derivative_batched_axes(&pert_hs[index], Some(axes))?;
+                    if strength != 1.0 {
+                        derivative *= strength;
+                    }
+                    derivatives[index] = Some(derivative);
+                    Ok(())
+                },
+            )
+            .map_err(CustomFamilyError::trial_point)?;
+        if !complete {
+            return Err(CustomFamilyError::trial_point(
+                "active Jeffreys drift requires exact second information derivatives".to_string(),
+            ));
+        }
+        Ok(derivatives)
     });
     let second = Arc::new(move |pairs: &[(Array1<f64>, Array1<f64>)]| {
         if pairs.is_empty() {
@@ -1054,26 +1054,41 @@ pub(crate) fn custom_family_outer_jeffreys_hphi_drift_batched<
                 )
             })
             .collect();
-        let frames = distinct
+        let frame_perturbations = distinct
             .iter()
             .map(|direction| {
-                let h = family_second
+                family_second
                     .joint_jeffreys_information_directional_derivative_with_specs(
                         &states_second,
                         &specs_second,
                         direction,
                     )?
-                    .ok_or_else(|| missing("first information derivative"))?;
-                let axes = family_second
-                    .joint_jeffreys_information_second_directional_all_axes_with_specs(
-                        &states_second,
-                        &specs_second,
-                        direction,
-                    )?
-                    .ok_or_else(|| missing("second information derivatives"))?;
-                base.direction_frame(&h, &axes)
-                    .map_err(CustomFamilyError::trial_point)
+                    .ok_or_else(|| missing("first information derivative"))
             })
+            .collect::<Result<Vec<_>, CustomFamilyError>>()?;
+        // The distinct directions' all-axes objects come from one family request.
+        let frame_directions: Vec<Array1<f64>> =
+            distinct.iter().map(|direction| (*direction).clone()).collect();
+        let mut frame_slots = Vec::with_capacity(frame_directions.len());
+        frame_slots.resize_with(frame_directions.len(), || None);
+        let complete = family_second
+            .joint_jeffreys_information_second_directional_all_axes_each_with_specs(
+                &states_second,
+                &specs_second,
+                &frame_directions,
+                &mut |index, axes| {
+                    frame_slots[index] =
+                        Some(base.direction_frame(&frame_perturbations[index], &axes)?);
+                    Ok(())
+                },
+            )
+            .map_err(CustomFamilyError::trial_point)?;
+        if !complete {
+            return Err(missing("second information derivatives"));
+        }
+        let frames = frame_slots
+            .into_iter()
+            .map(|slot| slot.ok_or_else(|| missing("second information derivatives")))
             .collect::<Result<Vec<_>, CustomFamilyError>>()?;
         pairs
             .iter()

@@ -1809,6 +1809,36 @@ pub trait CustomFamily {
         Ok(Some(axes))
     }
 
+    /// [`Self::joint_jeffreys_information_second_directional_all_axes_with_specs`]
+    /// for every direction of a batch, handed to `consume(index, axes)` one
+    /// direction at a time so at most one all-axes object is alive. `Ok(false)`
+    /// means the family does not expose an exact second derivative on some axis.
+    ///
+    /// The Jeffreys drift asks for this object along many mode responses of one
+    /// coefficient snapshot. The default runs the single-direction hook for each;
+    /// a family whose all-axes object contracts a per-snapshot row object with
+    /// each direction (the rigid survival marginal-slope row towers) overrides it
+    /// to build that object once per batch (#979).
+    fn joint_jeffreys_information_second_directional_all_axes_each_with_specs(
+        &self,
+        block_states: &[ParameterBlockState],
+        specs: &[ParameterBlockSpec],
+        directions: &[Array1<f64>],
+        consume: &mut dyn FnMut(usize, Vec<Array2<f64>>) -> Result<(), String>,
+    ) -> Result<bool, String> {
+        for (index, direction) in directions.iter().enumerate() {
+            match self.joint_jeffreys_information_second_directional_all_axes_with_specs(
+                block_states,
+                specs,
+                direction,
+            )? {
+                Some(axes) => consume(index, axes)?,
+                None => return Ok(false),
+            }
+        }
+        Ok(true)
+    }
+
     /// Whether this family implements
     /// [`Self::joint_jeffreys_information_third_directional_all_axes_with_specs`]
     /// exactly, i.e. returns `Some` from it.

@@ -7580,6 +7580,83 @@ fn rigid_survival_all_axes_build_once_equals_per_axis_sweep_979() {
     }
 }
 
+/// #979: the batched all-axes second directional derivative builds the row
+/// towers once for a whole batch of directions. Each direction's object must be
+/// bit-identical to the single-direction build-once sweep, which rebuilds them.
+#[test]
+fn rigid_survival_second_all_axes_each_matches_single_direction_979() {
+    use crate::row_kernel::{RowKernel, RowSet, row_kernel_second_directional_derivative_all_axes};
+
+    let n = 120usize;
+    let z: Vec<f64> = (0..n).map(|r| ((r as f64) * 0.29).cos() * 0.9).collect();
+    let weights: Vec<f64> = (0..n).map(|r| 0.6 + 0.4 * ((r % 7) as f64) / 7.0).collect();
+    let event: Vec<f64> = (0..n).map(|r| ((r % 4 == 1) as u8) as f64).collect();
+    let marginal_design = Array2::from_shape_fn((n, 2), |(r, j)| {
+        0.25 + 0.06 * (r as f64).sin() + 0.08 * (j as f64)
+    });
+    let slope_design = Array2::from_shape_fn((n, 2), |(r, j)| {
+        0.12 - 0.05 * (r as f64).cos() + 0.07 * (j as f64)
+    });
+    let beta_marginal = Array1::from_vec(vec![0.14, -0.09]);
+    let beta_slope = Array1::from_vec(vec![-0.17, 0.11]);
+    let marginal_eta = marginal_design.dot(&beta_marginal);
+    let slope_eta = slope_design.dot(&beta_slope);
+    for frailty in [None, Some(0.55_f64)] {
+        let mut family = oracle_rigid_family(n, &z, &weights, &event, frailty);
+        family.marginal_design = DesignMatrix::from(marginal_design.clone());
+        family
+            .slope_layout
+            .replace_coefficient_design(DesignMatrix::from(slope_design.clone()));
+        let block_states = vec![
+            ParameterBlockState {
+                beta: array![0.65],
+                eta: Array1::zeros(n),
+            },
+            ParameterBlockState {
+                beta: beta_marginal.clone(),
+                eta: marginal_eta.clone(),
+            },
+            ParameterBlockState {
+                beta: beta_slope.clone(),
+                eta: slope_eta.clone(),
+            },
+        ];
+        let kernel =
+            SurvivalMarginalSlopeRowKernel::<STATIC_SLOPE_PRIMARIES, StaticSlopeGeometry>::new(
+                family,
+                block_states,
+            );
+        let p = RowKernel::n_coefficients(&kernel);
+        let directions: Vec<Vec<f64>> = (0..3)
+            .map(|d| (0..p).map(|a| 0.3 * ((a + 2 * d) as f64 * 0.7).sin() - 0.05 * d as f64).collect())
+            .collect();
+        let slices: Vec<&[f64]> = directions.iter().map(|direction| direction.as_slice()).collect();
+        let mut batched: Vec<Option<Vec<Array2<f64>>>> = vec![None; directions.len()];
+        kernel
+            .second_directional_derivative_all_axes_each(&slices, &mut |index, axes| {
+                batched[index] = Some(axes);
+                Ok(())
+            })
+            .expect("batched second directional derivative");
+        for (index, direction) in directions.iter().enumerate() {
+            let single = row_kernel_second_directional_derivative_all_axes(&kernel, &RowSet::All, direction)
+                .expect("single-direction second directional derivative");
+            let together = batched[index].as_ref().expect("every direction is consumed");
+            assert_eq!(together.len(), single.len());
+            assert!(
+                single.iter().any(|axis| axis.iter().any(|value| *value != 0.0)),
+                "frailty={frailty:?} direction={index}: the fixture must exercise a nonzero derivative"
+            );
+            for (axis, (left, right)) in together.iter().zip(&single).enumerate() {
+                assert!(
+                    left.iter().zip(right.iter()).all(|(a, b)| a.to_bits() == b.to_bits()),
+                    "frailty={frailty:?} direction={index} axis={axis}: batched differs from single"
+                );
+            }
+        }
+    }
+}
+
 /// gam#979 Jeffreys wide-p contracted-trace-Hessian FD verification (survival
 /// twin of the BMS gate `bernoulli_jeffreys_contracted_trace_hessian_matches_fd_of_trace`).
 ///

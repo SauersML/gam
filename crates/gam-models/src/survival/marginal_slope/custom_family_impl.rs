@@ -722,6 +722,52 @@ impl CustomFamily for SurvivalMarginalSlopeFamily {
         Ok(Some(axes))
     }
 
+    fn joint_jeffreys_information_second_directional_all_axes_each_with_specs(
+        &self,
+        block_states: &[ParameterBlockState],
+        specs: &[ParameterBlockSpec],
+        directions: &[Array1<f64>],
+        consume: &mut dyn FnMut(usize, Vec<Array2<f64>>) -> Result<(), String>,
+    ) -> Result<bool, String> {
+        if !self.outer_default_trustworthy_for_joint_hessian(specs)
+            && !self.joint_hessian_is_structurally_coupled(block_states)?
+        {
+            return Ok(false);
+        }
+        // Rigid path: the row towers depend only on the coefficient snapshot, so one
+        // build serves every direction of the batch (#979). The single-direction hook
+        // above reaches the same towers through the kernel's build-once override, so
+        // each direction's object is unchanged.
+        if !self.per_z_slope_active()
+            && !self.effective_flex_active(block_states)?
+            && !self.flex_timewiggle_active()
+        {
+            let slices = directions
+                .iter()
+                .map(|direction| direction.as_slice().ok_or("non-contiguous d_beta_u"))
+                .collect::<Result<Vec<_>, _>>()?;
+            return in_slope_frame!(self, P, Frame, {
+                let kern = SurvivalMarginalSlopeRowKernel::<P, Frame>::new(
+                    self.clone(),
+                    block_states.to_vec(),
+                );
+                kern.second_directional_derivative_all_axes_each(&slices, consume)?;
+                Ok(true)
+            });
+        }
+        for (index, direction) in directions.iter().enumerate() {
+            match self.joint_jeffreys_information_second_directional_all_axes_with_specs(
+                block_states,
+                specs,
+                direction,
+            )? {
+                Some(axes) => consume(index, axes)?,
+                None => return Ok(false),
+            }
+        }
+        Ok(true)
+    }
+
     fn joint_jeffreys_information_third_directional_available(&self) -> bool {
         // The row kernel's closed-form third information derivative covers the
         // rigid single-slope path only; the hook below returns `None` for a
