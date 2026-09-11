@@ -794,58 +794,52 @@ fn competing_risks_weibull_fit_is_reachable_1590() {
         2,
         "two competing causes must yield two coefficient blocks"
     );
-    // Layout per cause: [β0 = dead anchor-centered time constant, β1 = Weibull
-    // shape (slope on log t), β2 = covariate intercept (baseline level),
-    // β3 = age]. The data-generating cause-specific log-rates are
+    // Layout per cause: [β0 = Weibull shape (slope on log t), β1 = covariate
+    // intercept (baseline level), β2 = age]. The linear time basis is the single
+    // column `log t`: its former constant column was exactly confounded with the
+    // covariate intercept and is no longer built (#2301), so there is no dead
+    // coefficient left to pin. The data-generating cause-specific log-rates are
     // +0.25·(age−55)/10 for cause 1 and −0.20·(age−55)/10 for cause 2, i.e. the
     // raw-age coefficient is +0.025 for cause 1 and −0.020 for cause 2.
     let beta1 = &surv.fit.blocks[0].beta;
     let beta2 = &surv.fit.blocks[1].beta;
     assert_eq!(
         beta1.len(),
-        4,
-        "cause 1 must keep raw width 4 (no reduction)"
+        3,
+        "cause 1 must carry [shape, intercept, age] (#1590, #2301)"
     );
     assert_eq!(
         beta2.len(),
-        4,
-        "cause 2 must keep raw width 4 (no reduction)"
-    );
-    // The dead centered-constant coefficient is pinned to ~0 by the stabilization
-    // ridge rather than left at its arbitrary unidentified seed.
-    assert!(
-        beta1[0].abs() < 1e-3 && beta2[0].abs() < 1e-3,
-        "dead anchor-centered time constant β0 must be pinned to ~0, got {} and {}",
-        beta1[0],
-        beta2[0]
+        3,
+        "cause 2 must carry [shape, intercept, age] (#1590, #2301)"
     );
     // Shape recovered near 1 (exponential cause-specific hazards).
     for (c, b) in [beta1, beta2].iter().enumerate() {
         assert!(
-            b[1] > 0.5 && b[1] < 1.6,
-            "cause {} Weibull shape β1 must be ~1 for exponential data, got {}",
+            b[0] > 0.5 && b[0] < 1.6,
+            "cause {} Weibull shape β0 must be ~1 for exponential data, got {}",
             c + 1,
-            b[1]
+            b[0]
         );
     }
     // The qualitative cause-specific effect must be recovered: cause 1's hazard
     // RISES with age, cause 2's FALLS — opposite-signed age coefficients.
     assert!(
-        beta1[3] > 0.0,
+        beta1[2] > 0.0,
         "cause 1 age effect must be positive (hazard rises with age), got {}",
-        beta1[3]
+        beta1[2]
     );
     assert!(
-        beta2[3] < 0.0,
+        beta2[2] < 0.0,
         "cause 2 age effect must be negative (hazard falls with age), got {}",
-        beta2[3]
+        beta2[2]
     );
     // And the two causes must be genuinely DISTINCT fits, not a degenerate copy.
     assert!(
-        (beta1[3] - beta2[3]).abs() > 0.01,
+        (beta1[2] - beta2[2]).abs() > 0.01,
         "cause-specific age effects must differ (distinct fits), got {} vs {}",
-        beta1[3],
-        beta2[3]
+        beta1[2],
+        beta2[2]
     );
 }
 
