@@ -101,10 +101,6 @@ const MAX_BACKTRACKS: usize = 8;
 /// Per-step line-search contraction factor (halving).
 const LINE_SEARCH_SHRINK: f64 = 0.5;
 
-/// Slack on the "objective decreased" acceptance test, absorbing floating-point
-/// round-off so a step that is flat to machine precision is not rejected.
-const OBJECTIVE_DECREASE_SLACK: f64 = 1.0e-12;
-
 /// First-order optimality gate (gam#856) as a fraction of `1 + max_diag`: the
 /// unridged penalized gradient norm must fall below this curvature-scaled
 /// threshold before convergence is declared, certifying stationarity on the
@@ -1068,7 +1064,16 @@ pub fn fit_penalized_vector_glm<L: VectorLikelihood>(
                 let objective = evaluate_objective(&candidate, &mut eta_objective_scratch)?;
                 Ok(Some((objective, candidate)))
             },
-            |_, f| f.is_finite() && f <= last_objective + OBJECTIVE_DECREASE_SLACK,
+            // A trial is a decrease unless it rises beyond the objective's rounding
+            // band: `−ℓ + penalty` accumulates `n·(m+1)` row terms and `m·p²` penalty
+            // products, so a rise inside `γ·|f|` is arithmetic and a step flat to
+            // that resolution is not rejected.
+            |_, f| {
+                f.is_finite()
+                    && f <= last_objective
+                        + gam_linalg::roundoff::accumulation_growth(n_obs * (m + 1) + m * p * p)
+                            * last_objective.abs()
+            },
         )?;
         let Some(accepted) = accepted else {
             // Every candidate failed the descent certificate. Keep the last

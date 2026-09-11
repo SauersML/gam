@@ -127,11 +127,6 @@ impl From<HmcError> for String {
 /// chains where the autocorrelation tail is numerical noise.
 const MAX_AUTOCORRELATION_LAG: usize = 1000;
 
-/// Floor on the lag-0 autocovariance (chain variance) used as the denominator in
-/// the autocorrelation ratios, guarding against division by zero for a chain
-/// that is numerically constant.
-const AUTOCOVARIANCE_FLOOR: f64 = 1e-16;
-
 /// Compute split-chain R-hat and ESS using the Gelman-Rubin diagnostic.
 ///
 /// This is the standard split-chain formulation (no rank normalization).
@@ -184,10 +179,14 @@ pub(crate) fn compute_split_rhat_and_ess(samples: &Array3<f64>) -> (f64, f64) {
 
         let mut means = vec![0.0_f64; m];
         let mut gamma0 = vec![0.0_f64; m];
+        let mut informative = vec![false; m];
         for sc in 0..m {
             let mut sum = 0.0;
+            let mut magnitude = 0.0_f64;
             for t in 0..n {
-                sum += splitvalue(samples, n_chains, half, dim, sc, t);
+                let value = splitvalue(samples, n_chains, half, dim, sc, t);
+                sum += value;
+                magnitude = magnitude.max(value.abs());
             }
             let mean = sum / n as f64;
             means[sc] = mean;
@@ -196,7 +195,15 @@ pub(crate) fn compute_split_rhat_and_ess(samples: &Array3<f64>) -> (f64, f64) {
                 let d = splitvalue(samples, n_chains, half, dim, sc, t) - mean;
                 g0 += d * d;
             }
-            gamma0[sc] = (g0 / n as f64).max(AUTOCOVARIANCE_FLOOR);
+            gamma0[sc] = g0 / n as f64;
+            // A split chain whose deviations sit inside its mean's rounding band
+            // `γ_{n+1}·max|x|` is constant to working precision: it carries no
+            // autocorrelation, and dividing by its variance would read arithmetic.
+            informative[sc] = gamma0[sc].sqrt()
+                > gam_linalg::roundoff::accumulation_growth(n + 1) * magnitude;
+        }
+        if !informative.iter().any(|&flag| flag) {
+            return (m * n) as f64;
         }
 
         let max_lag = (n - 1).min(MAX_AUTOCORRELATION_LAG);
@@ -209,7 +216,7 @@ pub(crate) fn compute_split_rhat_and_ess(samples: &Array3<f64>) -> (f64, f64) {
                     continue;
                 }
                 let mut rho_l = 0.0;
-                for sc in 0..m {
+                for sc in (0..m).filter(|&sc| informative[sc]) {
                     let mu = means[sc];
                     let mut cov = 0.0;
                     let denom = (n - l) as f64;

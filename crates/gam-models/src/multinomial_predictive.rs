@@ -107,20 +107,6 @@ use ndarray::{Array1, Array2, Array3, ArrayView1, ArrayView2};
 /// useful than a number nobody can bound.
 pub const PREDICTIVE_MASS_DEFECT_TOLERANCE: f64 = 5.0e-2;
 
-/// Convergence target for the augmented-mode Newton solve, stated as the NEWTON
-/// DECREMENT `½ gᵀH⁻¹g` — the quadratic model's own bound on how much
-/// log-posterior is left to gain.
-///
-/// A gradient-norm target would be the wrong currency here twice over. It is
-/// not scale-free (the gradient of an `n`-row log-likelihood is `O(n)`, so the
-/// same threshold means different things on different fixtures), and it is not
-/// the quantity the answer depends on: every ratio this module publishes is
-/// `exp(L⁺ − L)`, so what has to be small is the residual error in `L`, which
-/// is exactly what the decrement bounds. At `1e-10` the ratio is converged to
-/// `1e-10` relative — five orders below the `1e-2` mass defect the estimator's
-/// own identity is checked at, so the solve is never the binding error.
-const AUGMENTED_MODE_DECREMENT_TOLERANCE: f64 = 1.0e-10;
-
 /// How far the base-mode polish may move the supplied coefficients, relative to
 /// their own largest magnitude, before the predictive refuses.
 ///
@@ -518,7 +504,16 @@ impl<'a> MultinomialPredictiveModel<'a> {
                     .zip(step.iter())
                     .map(|(g, s)| g * s)
                     .sum::<f64>();
-            if decrement <= AUGMENTED_MODE_DECREMENT_TOLERANCE {
+            // The stop is the Newton decrement, not a gradient norm: every ratio this
+            // module publishes is `exp(L⁺ − L)`, so the residual error in `L` is what
+            // has to vanish and the decrement bounds exactly that, while a gradient
+            // norm is `O(n)` and not the currency of the answer. `L` accumulates the
+            // weighted rows, the extra rows, `d²` quadratic-penalty and `d` tilt
+            // products; a predicted gain inside that accumulation's rounding band
+            // `γ·|L|` is one the objective cannot represent.
+            let terms = self.training_class_index.len() + extra.len() + d * d + d;
+            let objective_band = gam_linalg::roundoff::accumulation_growth(terms) * value.abs();
+            if decrement <= objective_band {
                 return Ok((theta, value, logdet));
             }
             let mut accepted = false;

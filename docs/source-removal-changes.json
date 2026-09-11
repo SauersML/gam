@@ -768,5 +768,15 @@
     ],
     "reason": "#2469: SMALL_MATRIX_SINGULAR_TOL (an absolute 1e-12 pivot) is the elimination band n*eps*max|a_ij|; SO3_ANGLE_FLOOR (1e-12) is replaced by the unnormalised Rodrigues formula with exact t = 0 limits; GEOM_R_EPS (1e-12) is the step-ratio rounding band gamma_{2*len+1}*r; GEOM_FACTOR_CAP (1e6) capped the extrapolation ladder below its own geometric-sum bound r/(1-r).",
     "evidence": "All four are private constants of crates/gam-terms/src/analytic_penalties/equivariant_penalty.rs and crates/gam-terms/src/dictionary.rs, used only in those files, both of which this commit edits."
+  },
+  {
+    "base": "c4cae7eb1d08383f038a24d56b9b0b6830e5f759",
+    "items": [
+      "crates/gam-inference/src/hmc_io.rs:const:AUTOCOVARIANCE_FLOOR",
+      "crates/gam-models/src/multinomial_predictive.rs:const:AUGMENTED_MODE_DECREMENT_TOLERANCE",
+      "crates/gam-models/src/penalized_vector_glm.rs:const:OBJECTIVE_DECREASE_SLACK"
+    ],
+    "reason": "#2469: AUTOCOVARIANCE_FLOOR (1e-16) floored split-chain variances in the ESS estimate, now a constant-to-working-precision test against the mean rounding band gamma_{n+1}*max|x|; AUGMENTED_MODE_DECREMENT_TOLERANCE (1e-10) stopped the multinomial predictive Newton solve, now at the log-posterior rounding band; OBJECTIVE_DECREASE_SLACK (an absolute 1e-12) padded the vector-GLM line-search acceptance, now the objective rounding band gamma*|f|.",
+    "evidence": "At the base, git grep finds AUTOCOVARIANCE_FLOOR only in crates/gam-inference/src/hmc_io.rs, AUGMENTED_MODE_DECREMENT_TOLERANCE only in crates/gam-models/src/multinomial_predictive.rs, and OBJECTIVE_DECREASE_SLACK only in crates/gam-models/src/penalized_vector_glm.rs; each file is edited here."
   }
 ]
