@@ -91,8 +91,10 @@
 //! 1. This module: the algebra + the program seam + the oracle.
 //! 2. Universal oracle: every hand-written `RowKernel` gains a CI test
 //!    asserting channel-by-channel agreement with a [`RowProgram`] written
-//!    once — see `verify_kernel_channels`. This alone would have caught
-//!    #736 at introduction.
+//!    once, through a comparator that refuses non-finite and corrupted
+//!    channels (for example `rigid_full_tower_matches_independent_algebra_932`
+//!    and `tensor_oracle_rejects_wrong_channels_and_nonfinite_values_932` in
+//!    gam-models). This alone would have caught #736 at introduction.
 //! 3. Derive every channel through [`program_row_kernel`],
 //!    [`program_third_contracted`], [`program_fourth_contracted`], or
 //!    [`program_full_tower`], selecting only the representation its consumer
@@ -1104,9 +1106,10 @@ pub fn digamma(x: f64) -> f64 {
 }
 
 /// Scalar trigamma ψ′(x) for x>0. Bit-identical to
-/// `trigamma_derivative_stack(x)[0]` (both use `polygamma_positive::<1>(x)`),
-/// but evaluates ONLY ψ′ — the four higher polygammas (orders 2–5) the
-/// `[f64; 5]` stack builds are discarded at a `[0]` consumer. Used by the
+/// `digamma_derivative_stack(x)[1]` and `ln_gamma_derivative_stack(x)[2]`
+/// (all use `polygamma_positive::<1>(x)`), but evaluates ONLY ψ′ — the other
+/// polygammas those `[f64; 5]` stacks build are discarded at a consumer that
+/// reads one element. Used by the
 /// dispersion-channel Fisher-information row kernels (NB2 `ψ′(θ)−ψ′(θ+μ)`, Beta
 /// `μψ′(μφ)−(1−μ)ψ′((1−μ)φ)`) which read the trigamma value alone.
 #[inline]
@@ -1970,10 +1973,10 @@ mod tests {
     /// boundary-velocity formulas:
     ///   z_u   = −(a_u + [u==g]·z) / b
     ///   z_uv  = −(a_uv + [u==g]·z_v + [v==g]·z_u) / b
-    /// This pins the bridge between `implicit_solve` and
-    /// `cell_moving_boundary_flux_tower`: the boundary jet that the production
-    /// flex path hand-codes (and dropped `z_uv` from) is exactly `∂²` of this
-    /// tower. K=3 reduced frame: slot 0 = a-axis carrier (an arbitrary smooth
+    /// A hand-coded boundary jet once dropped `z_uv`; that channel is exactly
+    /// `∂²` of this tower. The live moving-edge witness in gam-models is
+    /// `moving_edge_leibniz_tracks_boundary_flux_932`. K=3 reduced frame:
+    /// slot 0 = a-axis carrier (an arbitrary smooth
     /// a(θ) with nonzero a_u/a_uv), slot 1 = g (the slope), slot 2 unused.
     #[test]
     fn crossing_edge_tower_matches_handpath_velocity_formulas() {
@@ -1982,7 +1985,7 @@ mod tests {
         let g0 = 0.85_f64; // the slope value b (the g-primary IS the slope)
                            // Stand-in intercept tower a(θ): nonzero value, gradient, Hessian in the
                            // two live axes so a_u and a_uv are both exercised. (In production this
-                           // comes from implicit_solve; here we plant known derivatives.)
+                           // comes from `filtered_implicit_solve_scalar`; here we plant known derivatives.)
         let mut a = Tower4::<3>::constant(0.45);
         a.g[0] = 0.7;
         a.g[1] = -0.3;
@@ -2039,8 +2042,9 @@ mod tests {
     /// These are the `f_a`/`f_au`/`f_aa` constraint-jet boundary motions the
     /// production base path drops (and only adds in the dir twins, causing the
     /// #932 desync). Here `a` is independent (NOT yet substituted with a(θ)),
-    /// so `z_aa = 0` and there is no `a_uv` chain — `implicit_solve` introduces
-    /// that later. Pins the constant before the constraint-tower wiring.
+    /// so `z_aa = 0` and there is no `a_uv` chain — the implicit intercept solve
+    /// (`filtered_implicit_solve_scalar`) introduces that later. Pins the
+    /// constant before the constraint-tower wiring.
     #[test]
     fn crossing_edge_constraint_frame_matches_bare_velocity_constants() {
         const TAU: f64 = 1.3;
@@ -2169,7 +2173,7 @@ mod tests {
 #[cfg(test)]
 mod derivative_stack_tests {
     use super::*;
-    // ── ln_gamma_derivative_stack / digamma_derivative_stack / trigamma_derivative_stack ──
+    // ── ln_gamma_derivative_stack / digamma_derivative_stack ──
 
     #[test]
     fn ln_gamma_derivative_stack_known_values_at_1() {

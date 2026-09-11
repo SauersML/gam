@@ -9,7 +9,7 @@
 //! ([`crate::jet_tower::RowProgram`], the packed
 //! [`crate::jet_scalar::Order2`] / [`crate::jet_scalar::OneSeed`] /
 //! [`crate::jet_scalar::TwoSeed`] scalars, the dense [`crate::jet_tower::Tower4`],
-//! and the channel comparator [`crate::jet_tower::verify_kernel_channels`]), and
+//! and the one-program tower [`crate::jet_tower::program_full_tower`]), and
 //! the elementary Gaussian / Poisson oracles pin the `exp` / `ln` composition
 //! paths against external hand calculus.
 //!
