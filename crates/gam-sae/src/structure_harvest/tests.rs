@@ -594,6 +594,14 @@ fn select_torus_resolution_grows_past_default_over_harmonic_gap_2243() {
             target[[row, 1]] = a0.sin();
             target[[row, 2]] = (5.0 * a1).cos();
             target[[row, 3]] = (5.0 * a1).sin();
+            // #2822: a planted signal the selected order reproduces EXACTLY is an
+            // interpolation, and profiled Gaussian REML abstains on it by design (#2723).
+            // A deterministic perturbation above the profiled residual's resolution keeps
+            // the fit scoreable; its energy sits far below both R² bars.
+            for col in 0..4 {
+                let x = (row as f64 + 1.0) * 12.9898 + (col as f64 + 1.0) * 78.233;
+                target[[row, col]] += 0.02 * (x.sin() * 43758.5453).sin();
+            }
         }
     }
     let weights = Array1::<f64>::ones(n);
