@@ -306,6 +306,68 @@ pub(crate) fn floored_inverse_floor_sensitivity(lam: f64, floor: f64) -> f64 {
 }
 
 
+/// `∂²d/∂λ∂floor` on the branch of [`floored_inverse_floor_sensitivity`]: `−2/λ³` on
+/// a floor-bound top saturation (`d = floor/λ²`), `0` in the log window and inside
+/// the band (`d = 1/floor` there does not vary with `λ`), and
+/// `−(4·floor + 2λ)/(floor − λ)⁴` on the bottom saturation. A third-order channel
+/// of the moving relative floor in the Jeffreys motion drift (gam#1082).
+#[inline]
+pub(crate) fn floored_inverse_lambda_floor_sensitivity(lam: f64, floor: f64) -> f64 {
+    let cap = jeffreys_cap(floor);
+    if lam >= cap {
+        if cap > CONDITIONING_GATE_ABSOLUTE_CLEAR {
+            -2.0 / (lam * lam * lam)
+        } else {
+            0.0
+        }
+    } else if lam >= 0.0 {
+        0.0
+    } else {
+        let denom = floor - lam;
+        -(4.0 * floor + 2.0 * lam) / (denom * denom * denom * denom)
+    }
+}
+
+/// `∂²d/∂floor²` on the branch of [`floored_inverse_floor_sensitivity`]: `0` on the
+/// top saturation and in the log window, `2/floor³` inside the band, and
+/// `(2·floor + 4λ)/(floor − λ)⁴` on the bottom saturation (gam#1082).
+#[inline]
+pub(crate) fn floored_inverse_floor_second_sensitivity(lam: f64, floor: f64) -> f64 {
+    let cap = jeffreys_cap(floor);
+    if lam >= cap || lam >= floor {
+        0.0
+    } else if lam >= 0.0 {
+        2.0 / (floor * floor * floor)
+    } else {
+        let denom = floor - lam;
+        (2.0 * floor + 4.0 * lam) / (denom * denom * denom * denom)
+    }
+}
+
+/// `∂³g/∂floor³` on the branch of [`jeffreys_antiderivative_floor_second_sensitivity`]:
+/// `2/floor³` on a floor-bound top saturation (`0` on a gate-bound one), `0` in the
+/// log window, `2/floor³ − 6λ/floor⁴` inside the band, and `2/floor³ − 6λ/(floor − λ)⁴`
+/// on the bottom saturation (gam#1082).
+#[inline]
+pub(crate) fn jeffreys_antiderivative_floor_third_sensitivity(lam: f64, floor: f64) -> f64 {
+    let cap = jeffreys_cap(floor);
+    let floor_cubed = floor * floor * floor;
+    if lam >= cap {
+        if cap > CONDITIONING_GATE_ABSOLUTE_CLEAR {
+            2.0 / floor_cubed
+        } else {
+            0.0
+        }
+    } else if lam >= floor {
+        0.0
+    } else if lam >= 0.0 {
+        2.0 / floor_cubed - 6.0 * lam / (floor_cubed * floor)
+    } else {
+        let denom = floor - lam;
+        2.0 / floor_cubed - 6.0 * lam / (denom * denom * denom * denom)
+    }
+}
+
 /// Daleckii–Krein divided-difference matrix of the floored signed inverse on
 /// the reduced spectrum: `Ψ_ij = (d(λ_i) − d(λ_j)) / (λ_i − λ_j)` for
 /// well-separated pairs, with the confluent limit `Ψ_ii = d'(λ_i)` on the
@@ -592,6 +654,66 @@ pub(crate) fn conditioning_gate_weight_hess(lambda_min: f64, lambda_max: f64) ->
         let g_max_max =
             d2w_rel_dr2 * r_max * r_max + dw_rel_dr * (1.0 / (lambda_max * lambda_max * ln10));
         (g_mm, g_mm_max, g_max_max)
+    }
+}
+
+/// Third partials `(G₁₁₁, G₁₁₂, G₁₂₂, G₂₂₂)` of the conditioning gate weight in
+/// `(λ_min, λ_max)`: the companion of [`conditioning_gate_weight_hess`] that the
+/// β-drift of the gate motion inside the Jeffreys mode-response curvature needs
+/// (gam#1082). Same active-branch selection; zero on the saturated and degenerate
+/// branches, where `G` is locally constant.
+pub(crate) fn conditioning_gate_weight_third(
+    lambda_min: f64,
+    lambda_max: f64,
+) -> (f64, f64, f64, f64) {
+    if lambda_max <= 0.0 || !lambda_min.is_finite() {
+        return (0.0, 0.0, 0.0, 0.0);
+    }
+    // `ramp_down`'s value and first three derivatives on the open band:
+    // `d/dx = −6t(1−t)/span`, `d²/dx² = −6(1−2t)/span²`, `d³/dx³ = 12/span³`.
+    #[inline]
+    fn ramp_down_derivatives(x: f64, under: f64, clear: f64) -> (f64, f64, f64, f64) {
+        if x <= under || x >= clear {
+            let value = if x <= under { 1.0 } else { 0.0 };
+            return (value, 0.0, 0.0, 0.0);
+        }
+        let span = clear - under;
+        let t = (x - under) / span;
+        let value = 1.0 - t * t * (3.0 - 2.0 * t);
+        let d1 = -6.0 * t * (1.0 - t) / span;
+        let d2 = -6.0 * (1.0 - 2.0 * t) / (span * span);
+        let d3 = 12.0 / (span * span * span);
+        (value, d1, d2, d3)
+    }
+    let (w_abs, _, _, d3w_abs) = ramp_down_derivatives(
+        lambda_min,
+        CONDITIONING_GATE_ABSOLUTE,
+        CONDITIONING_GATE_ABSOLUTE_CLEAR,
+    );
+    let ratio = (lambda_min / lambda_max).max(f64::MIN_POSITIVE);
+    let (w_rel, d1w, d2w, d3w) = ramp_down_derivatives(
+        ratio.log10(),
+        CONDITIONING_GATE_RELATIVE.log10(),
+        CONDITIONING_GATE_RELATIVE_CLEAR.log10(),
+    );
+    if w_abs >= w_rel {
+        (d3w_abs, 0.0, 0.0, 0.0)
+    } else {
+        // `r = log₁₀(λ_min/λ_max)` has no mixed partials, so
+        // `G_ijk = w'''·r_i r_j r_k + w''·(r_ij r_k + r_ik r_j + r_jk r_i) + w'·r_ijk`.
+        let ln10 = std::f64::consts::LN_10;
+        let r_min = 1.0 / (lambda_min * ln10);
+        let r_max = -1.0 / (lambda_max * ln10);
+        let r_min_min = -1.0 / (lambda_min * lambda_min * ln10);
+        let r_max_max = 1.0 / (lambda_max * lambda_max * ln10);
+        let r_min_min_min = 2.0 / (lambda_min * lambda_min * lambda_min * ln10);
+        let r_max_max_max = -2.0 / (lambda_max * lambda_max * lambda_max * ln10);
+        (
+            d3w * r_min * r_min * r_min + 3.0 * d2w * r_min * r_min_min + d1w * r_min_min_min,
+            d3w * r_min * r_min * r_max + d2w * r_min_min * r_max,
+            d3w * r_min * r_max * r_max + d2w * r_min * r_max_max,
+            d3w * r_max * r_max * r_max + 3.0 * d2w * r_max * r_max_max + d1w * r_max_max_max,
+        )
     }
 }
 
@@ -2809,6 +2931,313 @@ pub struct JeffreysHphiDriftBase {
     divided_differences: std::sync::OnceLock<mixed::InverseDividedDifferences>,
 }
 
+impl JeffreysHphiDriftBase {
+    /// Whether the conditioning gate or the relative floor moves with β at this
+    /// snapshot — the rule of [`JointJeffreysPlan::hessian_motion_active`] on the same
+    /// spectrum, so the mode-response curvature and its drift arm together.
+    pub fn hessian_motion_active(&self) -> bool {
+        if self.m == 0 || self.gate_weight == 0.0 {
+            return false;
+        }
+        let (lambda_min, lambda_max) = (self.evals[self.idx_min], self.evals[self.idx_max]);
+        let (g1, g2) = conditioning_gate_weight_grad(lambda_min, lambda_max);
+        let (g11, g12, g22) = conditioning_gate_weight_hess(lambda_min, lambda_max);
+        if g1 != 0.0 || g2 != 0.0 || g11 != 0.0 || g12 != 0.0 || g22 != 0.0 {
+            return true;
+        }
+        self.floor_in_relative_regime
+            && self.evals.iter().any(|&lambda| {
+                jeffreys_antiderivative_floor_sensitivity(lambda, self.floor) != 0.0
+                    || jeffreys_antiderivative_floor_second_sensitivity(lambda, self.floor) != 0.0
+                    || floored_inverse_floor_sensitivity(lambda, self.floor) != 0.0
+            })
+    }
+
+    /// β-drift of the gate and relative-floor motion inside the Jeffreys
+    /// mode-response curvature, applied to a coefficient direction (gam#1082).
+    ///
+    /// [`JointJeffreysPlan::hessian_motion`] completes `−∇²Φ` with
+    /// `−M = −(⟨extra_trace_weight, H''⟩ + remainder)`, where with `Φ = G·U`
+    ///
+    /// ```text
+    /// M[a,b] = G_a U_b + U_a G_b + U·Q[a,b] + G·F[a,b] + c_min·λ_min,ab + c_max·λ_max,ab,
+    /// c_min = U·G₁,  c_max = U·G₂ + ½·G·S_f·r,
+    /// Q[a,b] = G₁₁ λ_min,a λ_min,b + G₁₂(λ_min,a λ_max,b + λ_max,a λ_min,b) + G₂₂ λ_max,a λ_max,b,
+    /// F[a,b] = ½·r·(w_a λ_max,b + w_b λ_max,a) + ½·S_ff·r²·λ_max,a λ_max,b .
+    /// ```
+    ///
+    /// The outer Hessian's second-order mode response reads `D_β(completion)[u]·v`, and
+    /// [`Self::completion_drift_action`] differentiates only the frozen-policy part.
+    /// This returns `D_u M[·, v]` by the product rule over every factor above; the
+    /// completion drift is the frozen action minus this. The extreme eigenvalues are
+    /// differentiated to third order:
+    ///
+    /// ```text
+    /// λ_e,avu = T̃_a[e,e] + D²λ_e[B̃_av, P̃_u] + D²λ_e[B̃_au, P̃_v] + D²λ_e[B̃_uv, P̃_a] + D³λ_e[P̃_a, P̃_v, P̃_u],
+    /// D²λ_e[X, Y] = 2 Σ_{j≠e} X[e,j]·Y[e,j] / (λ_e − λ_j),
+    /// D³λ_e[X, Y, Z] = Σ_{σ∈S₃} ( x̂_σ₁ᵀ Y_σ₂ x̂_σ₃ − X_σ₁[e,e]·(x̂_σ₂·x̂_σ₃) ),  x̂[j] = X[e,j]/(λ_e − λ_j),
+    /// ```
+    ///
+    /// where `P̃`, `B̃` and `T̃` are the first, second and third information derivatives
+    /// in the reduced eigenbasis. Inputs: `pert_h = H[u]`, `axes_v = {H²[v, e_a]}`,
+    /// `axes_u = {H²[u, e_a]}`, `moving_axes = {H³[u, v, e_a]}`. Zero where the motion is
+    /// inactive.
+    pub fn motion_drift_action(
+        &self,
+        v: &Array1<f64>,
+        pert_h: &Array2<f64>,
+        axes_v: &[Array2<f64>],
+        axes_u: &[Array2<f64>],
+        moving_axes: &[Array2<f64>],
+    ) -> Result<Array1<f64>, String> {
+        let (p, m) = (self.p, self.m);
+        if v.len() != p || pert_h.dim() != (p, p) {
+            return Err("Jeffreys motion drift direction dimension mismatch".into());
+        }
+        let mut result = Array1::<f64>::zeros(p);
+        if !self.hessian_motion_active() {
+            return Ok(result);
+        }
+        let (imin, imax) = (self.idx_min, self.idx_max);
+        let evals = &self.evals;
+        let floor = self.floor;
+        let gate = self.gate_weight;
+        let (lambda_min, lambda_max) = (evals[imin], evals[imax]);
+        let (g1, g2) = conditioning_gate_weight_grad(lambda_min, lambda_max);
+        let (g11, g12, g22) = conditioning_gate_weight_hess(lambda_min, lambda_max);
+        let (g111, g112, g122, g222) = conditioning_gate_weight_third(lambda_min, lambda_max);
+        let rate = if self.floor_in_relative_regime {
+            REDUCED_INFO_RELATIVE_FLOOR
+        } else {
+            0.0
+        };
+        let psi = floored_inverse_divided_differences(evals, floor);
+        let mut ungated = 0.0_f64;
+        let (mut s_f, mut s_ff, mut s_fff) = (0.0_f64, 0.0_f64, 0.0_f64);
+        let mut inverse = Array1::<f64>::zeros(m);
+        let mut inverse_floor = Array1::<f64>::zeros(m);
+        let mut inverse_lambda_floor = Array1::<f64>::zeros(m);
+        let mut inverse_floor_floor = Array1::<f64>::zeros(m);
+        for i in 0..m {
+            let lambda = evals[i];
+            ungated += jeffreys_antiderivative(lambda, floor);
+            s_f += jeffreys_antiderivative_floor_sensitivity(lambda, floor);
+            s_ff += jeffreys_antiderivative_floor_second_sensitivity(lambda, floor);
+            s_fff += jeffreys_antiderivative_floor_third_sensitivity(lambda, floor);
+            inverse[i] = floored_inverse(lambda, floor);
+            inverse_floor[i] = floored_inverse_floor_sensitivity(lambda, floor);
+            inverse_lambda_floor[i] = floored_inverse_lambda_floor_sensitivity(lambda, floor);
+            inverse_floor_floor[i] = floored_inverse_floor_second_sensitivity(lambda, floor);
+        }
+        ungated *= 0.5;
+        let spectral_scale = evals.iter().fold(1.0_f64, |acc, value| acc.max(value.abs()));
+        let tie_tolerance = 64.0 * f64::EPSILON * spectral_scale;
+        let gap_inverse = |e: usize, j: usize| -> f64 {
+            let gap = evals[e] - evals[j];
+            if j == e || gap.abs() <= tie_tolerance {
+                0.0
+            } else {
+                1.0 / gap
+            }
+        };
+        let second_v_rows = self.rotate_axis_rows(axes_v)?;
+        let second_u_rows = self.rotate_axis_rows(axes_u)?;
+        let third_rows = self.rotate_axis_rows(moving_axes)?;
+        let square =
+            |rows: &Array2<f64>, axis: usize| Array2::from_shape_fn((m, m), |(i, j)| rows[[axis, i * m + j]]);
+        let p_u = symmetric_basis_contraction(pert_h.view(), self.ambient_eigenbasis.view());
+        let mut p_v = Array2::<f64>::zeros((m, m));
+        let mut b_uv = Array2::<f64>::zeros((m, m));
+        for axis in 0..p {
+            if v[axis] != 0.0 {
+                p_v.scaled_add(v[axis], &square(&self.a_rows, axis));
+                b_uv.scaled_add(v[axis], &square(&second_u_rows, axis));
+            }
+        }
+        struct FirstOrder {
+            lambda_min: f64,
+            lambda_max: f64,
+            value: f64,
+            gate: f64,
+            floor_trace: f64,
+        }
+        let first = |x: &Array2<f64>| -> FirstOrder {
+            let mut inverse_trace = 0.0_f64;
+            let mut floor_trace = 0.0_f64;
+            for i in 0..m {
+                inverse_trace += inverse[i] * x[[i, i]];
+                floor_trace += inverse_floor[i] * x[[i, i]];
+            }
+            let (lmin, lmax) = (x[[imin, imin]], x[[imax, imax]]);
+            FirstOrder {
+                lambda_min: lmin,
+                lambda_max: lmax,
+                value: 0.5 * inverse_trace + 0.5 * s_f * rate * lmax,
+                gate: g1 * lmin + g2 * lmax,
+                floor_trace,
+            }
+        };
+        let d2_extreme = |e: usize, x: &Array2<f64>, y: &Array2<f64>| -> f64 {
+            let mut sum = 0.0_f64;
+            for j in 0..m {
+                let inv = gap_inverse(e, j);
+                if inv != 0.0 {
+                    sum += x[[e, j]] * y[[e, j]] * inv;
+                }
+            }
+            2.0 * sum
+        };
+        let second_extreme = |e: usize, x: &Array2<f64>, y: &Array2<f64>, b: &Array2<f64>| {
+            b[[e, e]] + d2_extreme(e, x, y)
+        };
+        let d3_extreme = |e: usize, factors: [&Array2<f64>; 3]| -> f64 {
+            let hats: Vec<Array1<f64>> = factors
+                .iter()
+                .map(|x| Array1::from_shape_fn(m, |j| x[[e, j]] * gap_inverse(e, j)))
+                .collect();
+            let mut sum = 0.0_f64;
+            for (outer, middle, last) in [(0usize, 1usize, 2usize), (0, 2, 1), (1, 0, 2), (1, 2, 0), (2, 0, 1), (2, 1, 0)] {
+                sum += hats[outer].dot(&factors[middle].dot(&hats[last]))
+                    - factors[outer][[e, e]] * hats[middle].dot(&hats[last]);
+            }
+            sum
+        };
+        let value_second = |x: &Array2<f64>,
+                            y: &Array2<f64>,
+                            b: &Array2<f64>,
+                            fx: &FirstOrder,
+                            fy: &FirstOrder,
+                            lambda_max_xy: f64|
+         -> f64 {
+            let mut divided = 0.0_f64;
+            let mut kernel = 0.0_f64;
+            let mut floor_cross = 0.0_f64;
+            for i in 0..m {
+                kernel += inverse[i] * b[[i, i]];
+                floor_cross += inverse_floor[i] * (x[[i, i]] * fy.lambda_max + y[[i, i]] * fx.lambda_max);
+                for j in 0..m {
+                    divided += psi[[i, j]] * x[[i, j]] * y[[i, j]];
+                }
+            }
+            0.5 * divided
+                + 0.5 * kernel
+                + 0.5 * rate * floor_cross
+                + 0.5 * s_ff * rate * rate * fx.lambda_max * fy.lambda_max
+                + 0.5 * s_f * rate * lambda_max_xy
+        };
+        let gate_second = |fx: &FirstOrder, fy: &FirstOrder, lambda_min_xy: f64, lambda_max_xy: f64| -> f64 {
+            g11 * fx.lambda_min * fy.lambda_min
+                + g12 * (fx.lambda_min * fy.lambda_max + fx.lambda_max * fy.lambda_min)
+                + g22 * fx.lambda_max * fy.lambda_max
+                + g1 * lambda_min_xy
+                + g2 * lambda_max_xy
+        };
+        let fu = first(&p_u);
+        let fv = first(&p_v);
+        let floor_moves = rate != 0.0;
+        // `D_u w_x = Σ_i (∂²d/∂λ∂f·λ_i,u + ∂²d/∂f²·f_u)·λ_i,x + Σ_i ∂d/∂f·λ_i,xu`.
+        let floor_trace_drift = |x: &Array2<f64>, b_xu: &Array2<f64>| -> f64 {
+            let mut sum = 0.0_f64;
+            for i in 0..m {
+                let lambda_xu = b_xu[[i, i]] + d2_extreme(i, x, &p_u);
+                sum += (inverse_lambda_floor[i] * p_u[[i, i]] + inverse_floor_floor[i] * rate * fu.lambda_max)
+                    * x[[i, i]]
+                    + inverse_floor[i] * lambda_xu;
+            }
+            sum
+        };
+        let lambda_min_vu = second_extreme(imin, &p_v, &p_u, &b_uv);
+        let lambda_max_vu = second_extreme(imax, &p_v, &p_u, &b_uv);
+        let value_vu = value_second(&p_v, &p_u, &b_uv, &fv, &fu, lambda_max_vu);
+        let gate_vu = gate_second(&fv, &fu, lambda_min_vu, lambda_max_vu);
+        let floor_trace_vu = if floor_moves {
+            floor_trace_drift(&p_v, &b_uv)
+        } else {
+            0.0
+        };
+        let s_f_drift = fu.floor_trace + s_ff * rate * fu.lambda_max;
+        let mut s_ff_drift = s_fff * rate * fu.lambda_max;
+        for i in 0..m {
+            s_ff_drift += inverse_floor_floor[i] * p_u[[i, i]];
+        }
+        let c_min = ungated * g1;
+        let c_max = ungated * g2 + 0.5 * gate * s_f * rate;
+        let c_min_drift = fu.value * g1 + ungated * (g11 * fu.lambda_min + g12 * fu.lambda_max);
+        let c_max_drift = fu.value * g2
+            + ungated * (g12 * fu.lambda_min + g22 * fu.lambda_max)
+            + 0.5 * fu.gate * s_f * rate
+            + 0.5 * gate * s_f_drift * rate;
+        for axis in 0..p {
+            let p_a = square(&self.a_rows, axis);
+            let b_av = square(&second_v_rows, axis);
+            let b_au = square(&second_u_rows, axis);
+            let t_a = square(&third_rows, axis);
+            let fa = first(&p_a);
+            let lambda_min_av = second_extreme(imin, &p_a, &p_v, &b_av);
+            let lambda_max_av = second_extreme(imax, &p_a, &p_v, &b_av);
+            let lambda_min_au = second_extreme(imin, &p_a, &p_u, &b_au);
+            let lambda_max_au = second_extreme(imax, &p_a, &p_u, &b_au);
+            let value_au = value_second(&p_a, &p_u, &b_au, &fa, &fu, lambda_max_au);
+            let gate_au = gate_second(&fa, &fu, lambda_min_au, lambda_max_au);
+            let third_extreme = |e: usize| {
+                t_a[[e, e]]
+                    + d2_extreme(e, &b_av, &p_u)
+                    + d2_extreme(e, &b_au, &p_v)
+                    + d2_extreme(e, &b_uv, &p_a)
+                    + d3_extreme(e, [&p_a, &p_v, &p_u])
+            };
+            let lambda_min_avu = third_extreme(imin);
+            let lambda_max_avu = third_extreme(imax);
+            let q = g11 * fa.lambda_min * fv.lambda_min
+                + g12 * (fa.lambda_min * fv.lambda_max + fa.lambda_max * fv.lambda_min)
+                + g22 * fa.lambda_max * fv.lambda_max;
+            let q_drift = (g111 * fu.lambda_min + g112 * fu.lambda_max) * fa.lambda_min * fv.lambda_min
+                + g11 * (lambda_min_au * fv.lambda_min + fa.lambda_min * lambda_min_vu)
+                + (g112 * fu.lambda_min + g122 * fu.lambda_max)
+                    * (fa.lambda_min * fv.lambda_max + fa.lambda_max * fv.lambda_min)
+                + g12
+                    * (lambda_min_au * fv.lambda_max
+                        + fa.lambda_min * lambda_max_vu
+                        + lambda_max_au * fv.lambda_min
+                        + fa.lambda_max * lambda_min_vu)
+                + (g122 * fu.lambda_min + g222 * fu.lambda_max) * fa.lambda_max * fv.lambda_max
+                + g22 * (lambda_max_au * fv.lambda_max + fa.lambda_max * lambda_max_vu);
+            let (floor_part, floor_drift) = if floor_moves {
+                let floor_trace_au = floor_trace_drift(&p_a, &b_au);
+                (
+                    0.5 * rate * (fa.floor_trace * fv.lambda_max + fv.floor_trace * fa.lambda_max)
+                        + 0.5 * s_ff * rate * rate * fa.lambda_max * fv.lambda_max,
+                    0.5 * rate
+                        * (floor_trace_au * fv.lambda_max
+                            + fa.floor_trace * lambda_max_vu
+                            + floor_trace_vu * fa.lambda_max
+                            + fv.floor_trace * lambda_max_au)
+                        + 0.5 * s_ff_drift * rate * rate * fa.lambda_max * fv.lambda_max
+                        + 0.5 * s_ff * rate * rate * (lambda_max_au * fv.lambda_max + fa.lambda_max * lambda_max_vu),
+                )
+            } else {
+                (0.0, 0.0)
+            };
+            result[axis] = c_min_drift * lambda_min_av
+                + c_min * lambda_min_avu
+                + c_max_drift * lambda_max_av
+                + c_max * lambda_max_avu
+                + gate_au * fv.value
+                + fa.gate * value_vu
+                + value_au * fv.gate
+                + fa.value * gate_vu
+                + fu.value * q
+                + ungated * q_drift
+                + fu.gate * floor_part
+                + gate * floor_drift;
+        }
+        if result.iter().any(|value| !value.is_finite()) {
+            return Err("Jeffreys motion drift produced a nonfinite response".into());
+        }
+        Ok(result)
+    }
+}
+
 /// Symmetric congruence `sym(Uᵀ A U)`.
 ///
 /// Jeffreys information derivatives are mathematically symmetric, but their
@@ -3223,6 +3652,182 @@ mod tests {
             max_abs(&(&frozen - &negative_hessian)) / scale,
             max_abs(&(&exact - &negative_hessian)) / scale,
         )
+    }
+
+    /// Relative disagreement of the mode-response curvature drift — without and with
+    /// the motion drift — against central differences of the motion-completed
+    /// curvature `H_Φ + completion` along `u`, applied to `v` (gam#1082). `first`,
+    /// `second` and `third` are the closed-form first, second and third β-derivatives
+    /// of the information.
+    fn jeffreys_curvature_drift_errors_1082<I, F, S, T>(
+        beta: &Array1<f64>,
+        information: I,
+        first: F,
+        second: S,
+        third: T,
+    ) -> (bool, f64, f64)
+    where
+        I: Fn(&Array1<f64>) -> Array2<f64> + Sync,
+        F: Fn(&Array1<f64>, &Array1<f64>) -> Array2<f64> + Sync,
+        S: Fn(&Array1<f64>, &Array1<f64>, &Array1<f64>) -> Array2<f64> + Sync,
+        T: Fn(&Array1<f64>, &Array1<f64>, &Array1<f64>, &Array1<f64>) -> Array2<f64> + Sync,
+    {
+        let p = beta.len();
+        let z = Array2::<f64>::eye(p);
+        let axis = |a: usize| {
+            let mut e = Array1::<f64>::zeros(p);
+            e[a] = 1.0;
+            e
+        };
+        let curvature = |b: &Array1<f64>| -> Array2<f64> {
+            let h = information(b);
+            let (_, _, hphi) =
+                joint_jeffreys_term(h.view(), z.view(), |d: &Array1<f64>| Ok(Some(first(b, d))))
+                    .expect("Jeffreys term");
+            let plan = JointJeffreysPlan::prepare(h.view(), z.view()).expect("Jeffreys plan");
+            let hdots: Vec<Array2<f64>> = (0..p).map(|a| first(b, &axis(a))).collect();
+            let motion = plan.hessian_motion(&hdots).expect("Hessian motion");
+            let completion = joint_jeffreys_second_order_completion_with_motion(
+                h.view(),
+                z.view(),
+                |x: &Array1<f64>, y: &Array1<f64>| Ok(Some(second(b, x, y))),
+                &motion,
+            )
+            .expect("completion")
+            .expect("completion present");
+            &hphi + &completion
+        };
+        let u = Array1::from_shape_fn(p, |i| ((i * 7 + 3) % 11) as f64 / 11.0 - 0.45);
+        let v = Array1::from_shape_fn(p, |i| ((i * 5 + 1) % 13) as f64 / 13.0 - 0.5);
+        let h = information(beta);
+        let hdots: Vec<Array2<f64>> = (0..p).map(|a| first(beta, &axis(a))).collect();
+        let base = JeffreysHphiDriftBase::prepare_with_axes(h.view(), z.view(), hdots)
+            .expect("drift base")
+            .expect("active drift base");
+        let pert_h = first(beta, &u);
+        let axes_u: Vec<Array2<f64>> = (0..p).map(|a| second(beta, &u, &axis(a))).collect();
+        let axes_v: Vec<Array2<f64>> = (0..p).map(|a| second(beta, &v, &axis(a))).collect();
+        let moving: Vec<Array2<f64>> = (0..p).map(|a| third(beta, &u, &v, &axis(a))).collect();
+        let hphi_drift = base
+            .perturbation_derivative_batched_axes(&pert_h, Some(axes_u.clone()))
+            .expect("H_Φ drift");
+        let frozen = hphi_drift.dot(&v)
+            + base
+                .completion_drift_action(&pert_h, &axes_v, &moving)
+                .expect("frozen completion drift");
+        let exact = &frozen
+            - &base
+                .motion_drift_action(&v, &pert_h, &axes_v, &axes_u, &moving)
+                .expect("motion drift");
+        let step = 1e-5;
+        let fd = (curvature(&(beta + &(&u * step))).dot(&v) - curvature(&(beta - &(&u * step))).dot(&v))
+            / (2.0 * step);
+        let max_abs = |x: &Array1<f64>| x.iter().fold(0.0_f64, |acc, value| acc.max(value.abs()));
+        let scale = max_abs(&fd).max(1e-12);
+        (
+            base.hessian_motion_active(),
+            max_abs(&(&frozen - &fd)) / scale,
+            max_abs(&(&exact - &fd)) / scale,
+        )
+    }
+
+    /// gam#1082: inside the gate's transition band the outer Hessian's mode response
+    /// reads the drift of the motion-completed curvature. The frozen-policy drift must
+    /// miss it; with the motion drift it matches central differences.
+    #[test]
+    fn jeffreys_motion_drift_completes_the_gate_band_curvature_drift_1082() {
+        let rows = array![
+            [1.0, 0.2, -0.3],
+            [1.0, -0.5, 0.4],
+            [1.0, 0.9, 0.1],
+            [1.0, -0.1, -0.8],
+            [1.0, 0.6, 0.7],
+            [1.0, -0.7, -0.2],
+        ];
+        let beta = array![0.1, -0.2, 0.3];
+        let raw = |b: &Array1<f64>, directions: &[&Array1<f64>]| {
+            let mut h = Array2::<f64>::zeros((3, 3));
+            for x in rows.rows() {
+                let mut weight = x.dot(b).exp();
+                for direction in directions {
+                    weight *= x.dot(*direction);
+                }
+                for i in 0..3 {
+                    for j in 0..3 {
+                        h[[i, j]] += weight * x[i] * x[j];
+                    }
+                }
+            }
+            h
+        };
+        let (evals, _) = raw(&beta, &[]).eigh(Side::Lower).expect("fixture spectrum");
+        let lambda_min = evals.iter().copied().fold(f64::INFINITY, f64::min);
+        let scale = 4.0 / lambda_min;
+        let (active, frozen_error, exact_error) = jeffreys_curvature_drift_errors_1082(
+            &beta,
+            |b| raw(b, &[]).mapv(|value| scale * value),
+            |b, d| raw(b, &[d]).mapv(|value| scale * value),
+            |b, x, y| raw(b, &[x, y]).mapv(|value| scale * value),
+            |b, x, y, w| raw(b, &[x, y, w]).mapv(|value| scale * value),
+        );
+        assert!(active, "the fixture must sit inside the gate's transition band");
+        assert!(
+            frozen_error > 1e-6 && frozen_error > 10.0 * exact_error,
+            "positive control: the frozen-policy drift must miss the motion drift \
+             (frozen rel {frozen_error:e}, motion-completed rel {exact_error:e})"
+        );
+        assert!(
+            exact_error < 1e-5,
+            "motion-completed curvature drift vs finite differences: rel {exact_error:e} \
+             (frozen rel {frozen_error:e})"
+        );
+    }
+
+    /// gam#1082: under a moving relative floor the drift of the completed curvature
+    /// carries the floor's third-order channels.
+    #[test]
+    fn jeffreys_motion_drift_completes_the_moving_floor_curvature_drift_1082() {
+        let rows = array![[1.0, 0.3], [1.0, -0.6], [1.0, 0.8], [1.0, -0.2], [1.0, 0.5]];
+        let beta = array![0.2, -0.1, 0.4];
+        let ghost = 1e-13;
+        let raw = |b: &Array1<f64>, directions: &[&Array1<f64>]| {
+            let mut h = Array2::<f64>::zeros((3, 3));
+            for x in rows.rows() {
+                let mut weight = (x[0] * b[0] + x[1] * b[1]).exp();
+                for direction in directions {
+                    weight *= x[0] * direction[0] + x[1] * direction[1];
+                }
+                for i in 0..2 {
+                    for j in 0..2 {
+                        h[[i, j]] += weight * x[i] * x[j];
+                    }
+                }
+            }
+            let mut tail = ghost * b[2].exp();
+            for direction in directions {
+                tail *= direction[2];
+            }
+            h[[2, 2]] += tail;
+            h
+        };
+        let (active, frozen_error, exact_error) = jeffreys_curvature_drift_errors_1082(
+            &beta,
+            |b| raw(b, &[]),
+            |b, d| raw(b, &[d]),
+            |b, x, y| raw(b, &[x, y]),
+            |b, x, y, w| raw(b, &[x, y, w]),
+        );
+        assert!(active, "a below-floor eigenvalue must activate the floor motion");
+        assert!(
+            frozen_error > 1e-6 && frozen_error > 10.0 * exact_error,
+            "positive control: the frozen-policy drift must miss the floor motion drift \
+             (frozen rel {frozen_error:e}, motion-completed rel {exact_error:e})"
+        );
+        assert!(
+            exact_error < 1e-4,
+            "motion-completed curvature drift vs finite differences: rel {exact_error:e} \
+             (frozen rel {frozen_error:e})"
+        );
     }
 
     /// gam#1082 negative control: a saturated gate (`λ_min` below the absolute knot,
@@ -4719,6 +5324,74 @@ mod tests {
                 "∂²G/∂λ_min∂λ_max desync at (λ_min={lmin}, λ_max={lmax}): fd={fd_mx} analytic={h_mx}"
             );
         }
+    }
+
+    #[test]
+    pub(crate) fn conditioning_gate_weight_third_matches_finite_difference_1082() {
+        // The four third partials against central differences of the (FD-validated)
+        // second partials, over the same absolute, relative and saturated configs.
+        let configs: [(f64, f64); 8] = [
+            (8.0, 1.0e9),
+            (4.0, 1.0e9),
+            (12.0, 1.0e9),
+            (100.0, 100.0 / 1.0e-7),
+            (0.05, 1.0e9),
+            (1.0e3, 1.0e3 / 1.0e-9),
+            // Absolute branch inside its band (the relative ramp is clear).
+            (8.0, 1.0e3),
+            (3.0, 50.0),
+        ];
+        let mut nonzero_configs = 0usize;
+        for &(lmin, lmax) in &configs {
+            let (t_mmm, t_mmx, t_mxx, t_xxx) = conditioning_gate_weight_third(lmin, lmax);
+            if t_mmm != 0.0 || t_mmx != 0.0 || t_mxx != 0.0 || t_xxx != 0.0 {
+                nonzero_configs += 1;
+            }
+            let hmin = 1e-6 * lmin.abs().max(1e-3);
+            let hmax = 1e-6 * lmax.abs().max(1e-3);
+            let checks = [
+                (
+                    "G111",
+                    t_mmm,
+                    (conditioning_gate_weight_hess(lmin + hmin, lmax).0
+                        - conditioning_gate_weight_hess(lmin - hmin, lmax).0)
+                        / (2.0 * hmin),
+                ),
+                (
+                    "G112",
+                    t_mmx,
+                    (conditioning_gate_weight_hess(lmin, lmax + hmax).0
+                        - conditioning_gate_weight_hess(lmin, lmax - hmax).0)
+                        / (2.0 * hmax),
+                ),
+                (
+                    "G122",
+                    t_mxx,
+                    (conditioning_gate_weight_hess(lmin, lmax + hmax).1
+                        - conditioning_gate_weight_hess(lmin, lmax - hmax).1)
+                        / (2.0 * hmax),
+                ),
+                (
+                    "G222",
+                    t_xxx,
+                    (conditioning_gate_weight_hess(lmin, lmax + hmax).2
+                        - conditioning_gate_weight_hess(lmin, lmax - hmax).2)
+                        / (2.0 * hmax),
+                ),
+            ];
+            for (label, analytic, fd) in checks {
+                assert!(
+                    (fd - analytic).abs() <= 1e-3 * analytic.abs().max(1.0),
+                    "{label} desync at (λ_min={lmin}, λ_max={lmax}): fd={fd} analytic={analytic}"
+                );
+            }
+        }
+        // The relative band (two configs) and the absolute band (two configs) must
+        // both be exercised with nonzero third partials; saturated ones are zero.
+        assert!(
+            nonzero_configs >= 4,
+            "only {nonzero_configs} configs reach a transition band"
+        );
     }
 
     #[test]
