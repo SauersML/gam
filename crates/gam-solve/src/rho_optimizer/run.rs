@@ -1428,16 +1428,6 @@ pub struct OuterResult {
     /// which lets the optimizer descend to the true PSD minimum exactly as an
     /// identical warm-started resume does by hand.
     pub saddle_escape_reseed: Option<Array1<f64>>,
-    /// What the criterion measured about this result's own analytic Hessian,
-    /// when the certificate adjudicated a disputed negative curvature (#2748).
-    ///
-    /// Set exactly where `SaddleAdjudication::Contradicted` is reached with a
-    /// determined ladder fit. It is a certified lower bound on `‖δH‖₂` for the
-    /// assembly — the measurement `gam_linalg::curvature_resolution`'s Law 2
-    /// requires and supplies no value for — and it exists on the result so the
-    /// downstream ρ-curvature gates judge by the same evidence this certificate
-    /// did instead of re-deciding from the matrix alone (#2428).
-    pub criterion_hessian_error: Option<CriterionCurvatureDisagreement>,
     /// Wrong-rail pull-back reseed point minted by a refused certification whose
     /// coordinate sits AT the ρ box bound but whose clean-band probes prove the
     /// objective DECREASES as the coordinate moves INWARD (#2392). The outer
@@ -1536,7 +1526,6 @@ impl OuterResult {
             rho_uncertainty_diagnostic: None,
             tail_snap_reseed: None,
             saddle_escape_reseed: None,
-            criterion_hessian_error: None,
             wrong_rail_reseed: None,
             active_set_reseed: None,
             cost_stall_probe_scale: None,
@@ -2168,74 +2157,6 @@ pub(crate) fn interior_curvature_floor_clearance(
     })
 }
 
-/// The **measured** disagreement between an analytic outer Hessian and the
-/// criterion it claims to be the curvature of, along one direction (#2748).
-///
-/// # Why this is a measurement of the MATRIX
-///
-/// For a unit direction `v`, `vᵀHv` and `d²/dα² V(θ̂ + αv)|₀` are the same
-/// number written two ways. Their difference is exactly zero in exact
-/// arithmetic, which is what makes it admissible as a
-/// [`gam_linalg::curvature_resolution::MeasuredHessianError`], and by Weyl
-/// `|vᵀ(δH)v| ≤ ‖δH‖₂`, so the difference is a certified LOWER BOUND on the
-/// assembly's own error. That is the *"how wrong is this matrix?"* quantity
-/// `curvature_resolution`'s Law 2 supplies no value for, and which every
-/// downstream ρ-curvature gate has been substituting an eigensolver's
-/// *"given this matrix, how wrong is σ?"* for.
-///
-/// # Why it is carried rather than consumed here
-///
-/// The outer certificate is not the only subsystem that judges this matrix's
-/// definiteness. `estimate::smoothing_correction::invert_identified_rho_hessian`
-/// judges it again, later, from the matrix alone — and #2428 is precisely the
-/// two reaching opposite verdicts on one matrix at one point. Handing the
-/// measurement forward is what stops the second site from re-deciding a
-/// question the first one measured.
-#[derive(Clone, Debug)]
-pub struct CriterionCurvatureDisagreement {
-    /// The unit direction probed, in the FULL outer coordinate vector.
-    ///
-    /// Carried so a consumer whose Hessian is a coordinate sub-block can check
-    /// that the direction lives inside its own block before reading the bound:
-    /// `‖δH‖₂` measured on a wider matrix does not bound a sub-block's error in
-    /// general, but a direction supported entirely on the sub-block does
-    /// measure exactly that sub-block.
-    pub direction: Array1<f64>,
-    /// `vᵀHv` as the analytic outer Hessian reported it — the number in dispute.
-    pub analytic_curvature: f64,
-    /// What the criterion's own symmetric probe ladder measured there.
-    pub ladder: gam_linalg::curvature_resolution::LadderCurvature,
-}
-
-impl CriterionCurvatureDisagreement {
-    /// The certified lower bound on `‖δH‖₂`, i.e. the disagreement net of the
-    /// ladder's own uncertainty. Exactly `0.0` when the two agree.
-    pub fn hessian_error_2norm(&self) -> f64 {
-        self.ladder.hessian_error_against(self.analytic_curvature)
-    }
-
-    /// The probed direction restricted to the leading `dimension` coordinates,
-    /// but only when every coordinate beyond them is exactly zero and the
-    /// restriction is still a unit vector to orthonormality round-off.
-    ///
-    /// Both conditions are required for the bound to transfer: the identity
-    /// `|vᵀ(δH)v| ≤ ‖δH‖₂` is about the sub-block's own `δH` only if `v` has no
-    /// component outside it, and the Rayleigh quotient is a curvature only if
-    /// `v` is normalised.
-    pub fn restricted_to_leading(&self, dimension: usize) -> Option<Array1<f64>> {
-        if dimension == 0 || self.direction.len() < dimension {
-            return None;
-        }
-        if self.direction.iter().skip(dimension).any(|value| *value != 0.0) {
-            return None;
-        }
-        let head = self.direction.slice(ndarray::s![..dimension]).to_owned();
-        let norm = head.dot(&head).sqrt();
-        let round_off = 64.0 * (self.direction.len() as f64) * f64::EPSILON;
-        ((norm - 1.0).abs() <= round_off).then_some(head)
-    }
-}
-
 /// What the CRITERION said about a Hessian's reported negative direction
 /// (#2357/#2155/#2612).
 ///
@@ -2270,11 +2191,6 @@ pub(crate) enum SaddleAdjudication {
         objective_resolution: f64,
         /// Best objective seen, against the baseline it had to beat.
         best_seen_cost: f64,
-        /// What the ladder MEASURED about the analytic Hessian, when it could
-        /// be determined (#2748). `None` is an absent measurement — the fit was
-        /// undetermined, or the baseline could not be restored — and must never
-        /// be read as a zero error.
-        criterion_curvature: Option<CriterionCurvatureDisagreement>,
     },
     /// The adjudication could not be run: no eigen-resolvable negative
     /// direction, nothing left to search after rails and invariance, an
@@ -2562,11 +2478,6 @@ fn adjudicate_negative_curvature(
     let mut eval_failed = 0usize;
     let mut nonfinite = 0usize;
     let mut best_seen_cost = f64::INFINITY;
-    // Every evaluation the descent search makes, kept so the ladder below can
-    // pair the two signs at a common step instead of paying for them twice
-    // (#2748). Recording costs nothing and changes no verdict: the loop's
-    // order, its break and its counters are untouched.
-    let mut evaluations: Vec<(f64, f64, f64)> = Vec::new();
     for sign in [primary_sign, -primary_sign] {
         for &alpha in escape_step_scales.iter() {
             let mut exact = rho.clone();
@@ -2579,17 +2490,9 @@ fn adjudicate_negative_curvature(
                 clamped_onto_rho += 1;
                 continue;
             }
-            // A PARTIALLY clamped trial is not `ρ ± αv` either, so it cannot
-            // enter the symmetric average — the second difference would be
-            // taken between two different directions. It still probes descent,
-            // which is what this loop is for, so only the ladder skips it.
-            let unclamped = outer_theta_bitwise_eq(&trial, &exact);
             probed += 1;
             match obj.eval_cost(&trial) {
                 Ok(cost) if cost.is_finite() => {
-                    if unclamped {
-                        evaluations.push((sign, alpha, cost));
-                    }
                     best_seen_cost = best_seen_cost.min(cost);
                     if cost < baseline_cost - strict_floor {
                         best = Some((cost, trial, sign, alpha));
@@ -2611,50 +2514,14 @@ fn adjudicate_negative_curvature(
             break;
         }
     }
-    // ── The ladder, extended until it can MEASURE rather than only falsify ──
-    //
-    // The loop above has just evaluated the criterion on both sides of `ρ̂`
-    // along `v`, which is a symmetric probe ladder — the exact instrument
-    // `gam_linalg::curvature_resolution`'s header says `ε_f` and `M₄` "come
-    // free from". It was being spent on one boolean and discarded.
-    //
-    // It is spent on the boolean because the falsifiability ladder stops at
-    // `α_min = sqrt(2·objective_resolution/|λ_min|)`, and when the claim is
-    // small that is `≥ 1` and the ladder is ONE rung. One rung cannot fit two
-    // parameters, so the extension below is not an optional refinement: without
-    // it there is no measurement at all. It runs only where the descent search
-    // has already failed, i.e. on the path that is about to hand a curvature
-    // verdict to a gate that would otherwise judge it against an eigensolver's
-    // backward error (#2748).
-    if best.is_none() {
-        LadderExtension {
-            rho,
-            direction: &direction,
-            lambda_min,
-            roundoff_floor,
-            smallest_escape_step: escape_step_scales.last().copied().unwrap_or(1.0),
-            bounds,
-            context,
-        }
-        .run(obj, &mut evaluations);
-    }
     // Restore the profiled inner state to the checkpoint ρ so the refusal path
     // that follows measures the checkpoint, not the last probe.
-    //
-    // Its RETURNED value is the ladder's baseline: `f(x)` has to come from the
-    // same instrument, in the same state, as `f(x ± αv)`, and any drift between
-    // this evaluation and the `baseline_cost` the caller passed in is part of
-    // the `ε_f` the ladder is measuring rather than something to hide from it.
-    let restored_baseline = match obj.eval_cost(rho) {
-        Ok(cost) => Some(cost),
-        Err(err) => {
-            log::warn!(
-                "[CERTIFICATE] {context}: failed to restore the objective to the checkpoint \
-                 after saddle-escape probing: {err}"
-            );
-            None
-        }
-    };
+    if let Err(err) = obj.eval_cost(rho) {
+        log::warn!(
+            "[CERTIFICATE] {context}: failed to restore the objective to the checkpoint \
+             after saddle-escape probing: {err}"
+        );
+    }
     if let Some((cost, _, sign, alpha)) = best {
         let descent = expand_confirmed_descent(
             obj,
@@ -2694,165 +2561,6 @@ fn adjudicate_negative_curvature(
             escape_step_scales.len(),
         ));
     }
-    // The ladder's verdict on the very number in dispute. `v` has unit norm in
-    // the outer coordinates, so `v'Hv` and `d²/dα² V(ρ̂+αv)|₀` are the same
-    // quantity computed two ways -- one analytically, one from the criterion's
-    // own values -- and their difference is exactly zero in exact arithmetic.
-    let criterion_curvature = restored_baseline.and_then(|baseline| {
-        let mut by_step: std::collections::BTreeMap<u64, (Option<f64>, Option<f64>)> =
-            std::collections::BTreeMap::new();
-        for &(sign, alpha, cost) in &evaluations {
-            let slot = by_step.entry(alpha.to_bits()).or_insert((None, None));
-            if sign > 0.0 {
-                slot.0 = Some(cost);
-            } else {
-                slot.1 = Some(cost);
-            }
-        }
-        let probes: Vec<gam_linalg::curvature_resolution::SymmetricProbe> = by_step
-            .into_iter()
-            .filter_map(|(bits, (forward, backward))| {
-                Some(gam_linalg::curvature_resolution::SymmetricProbe::new(
-                    f64::from_bits(bits),
-                    forward?,
-                    backward?,
-                ))
-            })
-            .collect();
-        gam_linalg::curvature_resolution::measure_symmetric_ladder(baseline, &probes).map(
-            |ladder| CriterionCurvatureDisagreement {
-                direction: direction.clone(),
-                analytic_curvature: lambda_min,
-                ladder,
-            },
-        )
-    });
-    // ── The escape declined on a BORROWED tolerance; the ladder measured the
-    // ── criterion's own, and it re-tests the descent against that ─────────
-    //
-    // The strict-decrease floor above is `objective_resolution` — the
-    // optimizer's DECLARED tolerance, `rel_cost_tolerance * |V|`. #2690's
-    // standing rule is that `eps_f` is a property of a fixture, measured on the
-    // fixture in hand, and never borrowed; a declared tolerance is the most
-    // borrowed quantity available. Measured on `papuan_oce4_matern_k24` the two
-    // are `2.178e-4` (declared) and `2.549e-11` (the ladder's) — SEVEN orders
-    // apart — and the descent the escape declined there was `~2.3e-7`, four
-    // orders above the criterion's actual noise. The claim was falsifiable all
-    // along; the floor could not see it.
-    //
-    // Three conditions, all measured on this fixture at this point, and the
-    // conjunction is what keeps this from being a looser escape:
-    //
-    //   1. the criterion's own curvature along `v` is NEGATIVE — the ladder
-    //      agrees with the matrix about the sign, rather than the matrix being
-    //      believed;
-    //   2. that curvature is RESOLVED by the ladder's own Law 1 floor
-    //      `(2/sqrt(3))*sqrt(eps_f*|M4|)` — the finest curvature ANY central
-    //      second difference of this criterion could reach — so the descent is
-    //      a property of the criterion and not of the ladder's noise;
-    //   3. some already-evaluated trial is lower than the baseline by more than
-    //      the ARITHMETIC's own `roundoff_floor`, which is all that is left to
-    //      check once (1) and (2) hold: a stationary point with a resolved
-    //      negative curvature descends, and the reseed only has to leave the
-    //      ridge for ARC to refine from where it lands.
-    //
-    // ⚠ (3) is deliberately NOT "some trial beat the measured `2*eps_f`".
-    // A criterion with evaluation error of amplitude `A` produces individual
-    // trials that dip to `-A` by luck, while the ladder's `eps_f` estimate is
-    // that amplitude's RMS over the rungs — so a single-trial test against
-    // `2*eps_f` accepts noise about as often as signal. The
-    // `unresolvable-well #2612` fixture demonstrates it: planted with an
-    // evaluation error of `5e-8` and a well only `3.1e-8` deep, one rung dips
-    // to `-7.6e-8` and beats `2*eps_f ~ 3.5e-8` while carrying no descent at
-    // all. Condition (2) is the one that decides it correctly there —
-    // `|c| = 1e-4` against a Law 1 floor of `1.07e-4`, unresolved — because a
-    // curvature is a property of the WHOLE ladder and averages the noise the
-    // way a single trial cannot.
-    //
-    // Where any of the three fails, nothing changes: on `geo_disease_matern`
-    // the measured curvature is POSITIVE (`+8.15e-5` against a claimed
-    // `-6.4e-6`), so (1) fails and the measurement flows on to the smoothing
-    // correction as a `||dH||_2` instead.
-    let measured_escape = criterion_curvature.as_ref().and_then(|measured| {
-        let curvature = measured.ladder.curvature;
-        if !(curvature < 0.0) {
-            return None;
-        }
-        if !measured
-            .ladder
-            .finite_difference_resolution()
-            .is_ok_and(|resolution| resolution.resolves(curvature))
-        {
-            return None;
-        }
-        let measured_floor = roundoff_floor;
-        if !(measured_floor.is_finite() && measured_floor > 0.0) {
-            return None;
-        }
-        let baseline = restored_baseline?;
-        let mut descent: Option<(f64, f64, f64)> = None;
-        for &(sign, alpha, cost) in &evaluations {
-            if cost < baseline - measured_floor
-                && descent.is_none_or(|(_, _, best): (f64, f64, f64)| cost < best)
-            {
-                descent = Some((sign, alpha, cost));
-            }
-        }
-        descent.map(|(sign, alpha, cost)| (sign, alpha, cost, measured_floor, baseline))
-    });
-    if let Some((sign, alpha, cost, measured_floor, baseline)) = measured_escape {
-        let descent = expand_confirmed_descent(
-            obj,
-            rho,
-            &direction,
-            LadderConfirmedStep {
-                sign,
-                alpha,
-                cost,
-                strict_floor: measured_floor,
-            },
-            bounds,
-            context,
-        );
-        let measured = criterion_curvature
-            .as_ref()
-            .expect("a measured escape implies a determined ladder");
-        log::info!(
-            "[CERTIFICATE] {context}: the criterion CONFIRMS the reported negative curvature              once its OWN evaluation error is measured rather than declared.              c_criterion={:.6e} (resolved against this fixture's Law 1 floor from the measured              eps_f={:.6e} and M4={:.6e}) against the analytic lambda_min={lambda_min:.6e}; a              trial at step {alpha:.3e} lowered the objective {baseline:.9e} -> {cost:.9e}, a              decrease of {:.6e} against the MEASURED floor {measured_floor:.6e} where the              DECLARED one was {objective_resolution:.6e}. Minting the negative-curvature              escape reseed the declared tolerance was hiding (#2748, #2690, #2357).",
-            measured.ladder.curvature,
-            measured.ladder.evaluation_error,
-            measured.ladder.fourth_derivative,
-            baseline - cost,
-        );
-        return SaddleAdjudication::Descended(descent.point);
-    }
-    match criterion_curvature.as_ref() {
-        Some(measured) => log::warn!(
-            "[CERTIFICATE] {context}: the criterion's OWN curvature along the disputed \
-             eigenvector, from the symmetric ladder this adjudication already runs: \
-             c_criterion={:.6e} +/- {:.6e} against the analytic lambda_min={lambda_min:.6e}, \
-             over {} rung(s); measured eps_f={:.6e} and M4={:.6e} give this fixture's Law 1 \
-             floor {} -- the finest curvature ANY central second difference of this criterion \
-             could resolve. Measured ||dH||_2 from the disagreement = {:.6e} (#2748, #2690).",
-            measured.ladder.curvature,
-            measured.ladder.curvature_uncertainty,
-            measured.ladder.rungs,
-            measured.ladder.evaluation_error,
-            measured.ladder.fourth_derivative,
-            measured
-                .ladder
-                .finite_difference_resolution()
-                .map(|resolution| format!("{resolution}"))
-                .unwrap_or_else(|error| format!("unavailable ({error})")),
-            measured.hessian_error_2norm(),
-        ),
-        None => log::info!(
-            "[CERTIFICATE] {context}: the symmetric ladder did not determine a fit (baseline \
-             restored: {}), so no criterion curvature and no measured ||dH||_2 are available \
-             here. An absent measurement stays absent (#2748).",
-            restored_baseline.is_some(),
-        ),
-    }
     log::warn!(
         "[CERTIFICATE] {context}: the criterion CONTRADICTS the reported negative curvature. \
          lambda_min={lambda_min:.6e} on the judged sub-block, and {probed} feasible trial(s) \
@@ -2874,7 +2582,6 @@ fn adjudicate_negative_curvature(
         predicted_at_smallest,
         objective_resolution,
         best_seen_cost,
-        criterion_curvature,
     }
 }
 
@@ -2895,8 +2602,8 @@ struct LadderConfirmedStep {
     alpha: f64,
     /// The objective there, in the ladder's instrument state.
     cost: f64,
-    /// The decrease the acceptance was strict against — the ladder's measured
-    /// evaluation floor at the confirming site, never a declared tolerance.
+    /// The decrease the acceptance was strict against: the criterion's
+    /// resolution, floored at the objective's own round-off.
     strict_floor: f64,
 }
 
@@ -3009,14 +2716,12 @@ fn max_feasible_step_along(
 /// # One evaluation is spent making the comparison honest
 ///
 /// The incumbent's cost came from the falsifiability ladder, which ran before
-/// the symmetric extension and before the checkpoint restore, so it was measured
-/// in a different profiled-inner state. Measured on the same fixture, the SAME
-/// point (`sign = −1, α = 1`) evaluated in the ladder and again afterwards
-/// differs by `3.1e-7` — larger than the descent being adjudicated — because the
-/// profiled criterion carries warm-start hysteresis well above the `ε_f` the
-/// symmetric ladder measures on itself. Re-evaluating the incumbent here puts
-/// the whole comparison chain in one instrument state, for the same reason
-/// `restored_baseline` is re-measured rather than reused.
+/// the checkpoint restore, so it was measured in a different profiled-inner
+/// state. Measured on the same fixture, the SAME point (`sign = −1, α = 1`)
+/// evaluated in the ladder and again afterwards differs by `3.1e-7` — larger
+/// than the descent being adjudicated — because the profiled criterion carries
+/// warm-start hysteresis. Re-evaluating the incumbent here puts the whole
+/// comparison chain in one instrument state.
 fn expand_confirmed_descent(
     obj: &mut dyn OuterObjective,
     rho: &Array1<f64>,
@@ -3131,146 +2836,6 @@ fn expand_confirmed_descent(
         );
     }
     best
-}
-
-/// Extend an adjudication's symmetric probe ladder until it can determine a
-/// curvature, not merely fail to falsify one (#2748).
-///
-/// # Why an extension is needed at all
-///
-/// The falsifiability ladder stops at
-/// `α_min = sqrt(2·objective_resolution/|λ_min|)`, which is the right place to
-/// stop *asking whether the claim descends*: below it the claim predicts less
-/// than the criterion can represent. But for a small claim that bound is `≥ 1`,
-/// so the ladder is a SINGLE rung — and one rung cannot fit the two parameters
-/// of `N(α) = c·α² + (M₄/12)·α⁴`. The falsification and the measurement need
-/// different ranges, and only one of them was being run.
-///
-/// # Where the extension ends, and why that is derived
-///
-/// The claim's own predicted numerator at step `α` is `|λ_min|·α²`. It stops
-/// being distinguishable from the objective's own arithmetic when it reaches
-/// `roundoff_floor = 16ε·max(1,|V|)` — the same floor the escape's strict
-/// decrease test uses — so
-///
-/// ```text
-///     α_end = sqrt(roundoff_floor / |λ_min|)
-/// ```
-///
-/// is where the ladder passes out of the signal and into the plateau. The
-/// plateau is not waste: it is exactly where `ε_f` is read off, per this
-/// module's `curvature_resolution` header, so the ladder runs TWO halvings past
-/// `α_end` — the smallest number of plateau rungs that makes the residual a
-/// scatter rather than a single point.
-///
-/// # Cost, and the refusal to hide it
-///
-/// Two objective evaluations per rung, on a path that has already failed to
-/// find a descent and is about to hand a curvature verdict to a gate that can
-/// abort the whole fit. `MAX_LADDER_RUNGS` bounds it for a pathological
-/// `λ_min`; when it binds, that is logged rather than silently truncating the
-/// range the measurement claims to cover.
-struct LadderExtension<'a> {
-    /// The certified point the ladder is centred on.
-    rho: &'a Array1<f64>,
-    /// Unit direction whose curvature is in dispute.
-    direction: &'a Array1<f64>,
-    /// The analytic claim, `v'Hv`, whose predicted numerator sets where the
-    /// ladder passes out of signal and into plateau.
-    lambda_min: f64,
-    /// `16 eps * max(1, |V|)`, the objective's own arithmetic floor.
-    roundoff_floor: f64,
-    /// Smallest step the falsifiability ladder already reached; the extension
-    /// starts one halving below it.
-    smallest_escape_step: f64,
-    /// The rho box; a clamped trial is not `rho +- alpha v` and cannot enter a
-    /// symmetric average.
-    bounds: &'a (Array1<f64>, Array1<f64>),
-    /// Diagnostic label of the calling certificate.
-    context: &'a str,
-}
-
-impl LadderExtension<'_> {
-    fn run(
-        &self,
-        obj: &mut dyn OuterObjective,
-        evaluations: &mut Vec<(f64, f64, f64)>,
-    ) {
-        let Self {
-            rho,
-            direction,
-            lambda_min,
-            roundoff_floor,
-            smallest_escape_step,
-            bounds,
-            context,
-        } = *self;
-        /// Rung budget. Not a statistical choice — the ladder's END is derived
-        /// above — but a bound on the evaluations a pathological `λ_min` could
-        /// ask for. Binding it is reported rather than silently truncating.
-        const MAX_LADDER_RUNGS: usize = 32;
-
-        let n = rho.len();
-        if !lambda_min.is_finite() || lambda_min == 0.0 || !roundoff_floor.is_finite() {
-            return;
-        }
-        let alpha_end = (roundoff_floor / lambda_min.abs()).sqrt();
-        let mut alpha = smallest_escape_step;
-        if !alpha.is_finite() || alpha <= 0.0 {
-            return;
-        }
-        let mut plateau_rungs = 0usize;
-        let mut added = 0usize;
-        let mut truncated = false;
-        loop {
-            alpha *= 0.5;
-            // `f64::EPSILON` is where halving stops changing `ρ + αv` at all — the
-            // same arithmetic limit the escape ladder uses.
-            if !(alpha > f64::EPSILON) {
-                break;
-            }
-            if alpha <= alpha_end {
-                plateau_rungs += 1;
-            }
-            if plateau_rungs > 2 {
-                break;
-            }
-            if added >= MAX_LADDER_RUNGS {
-                truncated = true;
-                break;
-            }
-            added += 1;
-            for sign in [1.0_f64, -1.0_f64] {
-                let mut trial = rho.clone();
-                for i in 0..n {
-                    trial[i] += sign * alpha * direction[i];
-                }
-                let projected = project_to_bounds(&trial, Some(bounds));
-                // Only an UNCLAMPED pair is `ρ ± αv`; a clamped one is a different
-                // direction and would corrupt the symmetric average rather than
-                // add to it.
-                if !outer_theta_bitwise_eq(&projected, &trial) {
-                    continue;
-                }
-                if let Ok(cost) = obj.eval_cost(&projected)
-                    && cost.is_finite()
-                {
-                    evaluations.push((sign, alpha, cost));
-                }
-            }
-        }
-        log::debug!(
-            "[CERTIFICATE] {context}: extended the symmetric ladder by {added} rung(s) \
-             ({} evaluations) down to alpha={alpha:.6e}, past the derived plateau entry \
-             alpha_end=sqrt(roundoff_floor/|lambda_min|)={alpha_end:.6e}{}",
-            2 * added,
-            if truncated {
-                format!(" -- TRUNCATED at the {MAX_LADDER_RUNGS}-rung budget, so the plateau may not have been reached")
-            } else {
-                String::new()
-            },
-        );
-    }
 }
 
 /// Second-order predicted objective decrease of a safeguarded Newton step at a
@@ -5687,17 +5252,7 @@ fn certify_outer_optimality_at_terminal_fidelity(
                 predicted_at_smallest,
                 objective_resolution,
                 best_seen_cost,
-                criterion_curvature,
             } => {
-                // #2748: the ladder's verdict on the analytic Hessian outlives
-                // this function. `invert_identified_rho_hessian` judges the SAME
-                // matrix at the SAME point later, and without this it does so
-                // against an eigensolver's backward error -- a bound on the
-                // decomposition, not on the assembly -- and refuses fits this
-                // certificate accepted. That is #2428, and carrying the
-                // measurement is what removes the asymmetry rather than
-                // widening either side's bar.
-                result.criterion_hessian_error = criterion_curvature;
                 log::info!(
                     "[CERTIFICATE] {context}: WITHDRAWING the curvature verdict — {probed} \
                      evaluated trial(s) down to step {smallest_step:.3e}, where the claim's own \

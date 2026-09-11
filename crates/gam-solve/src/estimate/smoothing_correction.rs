@@ -1810,12 +1810,10 @@ pub(crate) fn compute_smoothing_correction(
                     ),
                 );
             }
-            // #2748: whatever the OUTER certificate measured about this same
-            // matrix at this same point, by evaluating the criterion along the
-            // direction it disputed. It is the only component here that answers
-            // "how wrong is this matrix?"; the two above are exactly-zero
-            // identities of the assembly's bookkeeping and the eigensolver's
-            // component answers a different question entirely.
+            // #2748: whatever standard the OUTER certificate judged this same
+            // matrix at this same point against, so this gate does not re-decide
+            // a direction the certificate already cleared at a coarser
+            // resolution.
             components.extend_from_slice(caller_measured_hessian_error);
             components
         },

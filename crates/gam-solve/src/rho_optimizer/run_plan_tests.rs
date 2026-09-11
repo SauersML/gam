@@ -2535,9 +2535,9 @@ fn certify_four_spends_order_four_once_and_prices_the_curvature_against_the_crit
          look like a BFGS-approximation verdict (#2641): {provenance}"
     );
 
-    // #2612/#2748: the curvature verdict was withdrawn, and the ladder says by
-    // how much the declared Hessian was wrong. `1 + theta^2` has second
-    // derivative exactly `2`, so this is a planted number, not a recorded one.
+    // #2612: the declared `-1` is not the curvature of `1 + theta^2` (exactly
+    // `+2`), so the value search along its eigenvector finds no descent and the
+    // curvature verdict is withdrawn.
     let certificate = result
         .criterion_certificate
         .as_ref()
@@ -2550,20 +2550,6 @@ fn certify_four_spends_order_four_once_and_prices_the_curvature_against_the_crit
         "a Hessian that disagrees with its own criterion must have its curvature verdict \
          WITHDRAWN, not believed: {:?}",
         certificate.curvature
-    );
-    let measured = result
-        .criterion_hessian_error
-        .as_ref()
-        .expect("the adjudication's ladder must have measured this criterion");
-    assert!(
-        (measured.ladder.curvature - 2.0).abs() <= 1.0e-9,
-        "the ladder must recover d²/dtheta² of `1 + theta^2`, which is exactly 2: got {:.6e}",
-        measured.ladder.curvature
-    );
-    assert!(
-        (measured.hessian_error_2norm() - 3.0).abs() <= 1.0e-9,
-        "the declared `-1` against a true `+2` is a measured ||dH||_2 of exactly 3: got {:.6e}",
-        measured.hessian_error_2norm()
     );
     // Order four is spent once per TERMINAL CERTIFICATION, not once per
     // multistart candidate — that is the economics #2359 exists to protect, and
@@ -5837,10 +5823,7 @@ fn run_indefinite_analytic_seed_stays_on_arc_and_its_declared_curvature_is_measu
     // reported negative eigenvector, finds no descent anywhere in the claim's
     // falsifiable range, and WITHDRAWS the curvature verdict.
     //
-    // #2748 makes that a number instead of an argument. The adjudication's
-    // ladder measures `c_criterion = 0` against the declared `-1`, i.e. a
-    // measured `||dH||_2` of exactly `1` — the whole of the claim. There is no
-    // saddle here; there is a mock whose two lanes describe different functions,
+    // There is no saddle here; there is a mock whose two lanes describe different functions,
     // which is the same class of fixture defect the sibling bimodal objective
     // documents at length.
     //
@@ -5885,20 +5868,6 @@ fn run_indefinite_analytic_seed_stays_on_arc_and_its_declared_curvature_is_measu
         "the point really is stationary, which is what makes this a CURVATURE question \
          at all: {:?}",
         result.final_grad_norm
-    );
-    let measured = result
-        .criterion_hessian_error
-        .as_ref()
-        .expect("the adjudication's ladder must have measured this criterion");
-    assert_eq!(
-        measured.ladder.curvature, 0.0,
-        "an exactly constant criterion has exactly zero curvature"
-    );
-    assert!(
-        (measured.hessian_error_2norm() - 1.0).abs() <= 1.0e-12,
-        "a declared `-1` against a true `0` is a measured ||dH||_2 of exactly 1 — the \
-         whole of the claim: got {:.6e}",
-        measured.hessian_error_2norm()
     );
 }
 
