@@ -88,7 +88,7 @@ def steer_atom(
     fit: Any,
     atom_k: int,
     t_from: Any,
-    t_to: Any,
+    direction: Any,
     *,
     target_nats: float,
     patched_forward_kl: Any,
@@ -99,16 +99,19 @@ def steer_atom(
 ) -> dict[str, Any]:
     """Apply a measured target-KL chart move on one atom.
 
+    The move walks the atom's coordinate from ``t_from`` along ``direction`` at
+    the row's own intensity; the landing coordinate is returned as
+    ``plan["t_to"]``, and a dose the chart cannot produce is refused.
     ``patched_forward_kl(plan)`` must execute the supplied public steer plan and
     return a mapping with ``effective_delta`` (after model dtype conversion),
     ``exact_directional_nats`` (the local full-Fisher quadratic of that effective
     delta), ``measured_nats = KL(p_base || p_patched)`` for the same move, and
     ``certified_attainable_upper_nats``. Set the latter to ``None`` unless the
-    adapter can prove a global measured-KL upper bound over every non-negative
-    amplitude on this exact chord. The Rust solver validates the atomic
-    observation, expands through local decreases until it finds a genuine
-    sign-change bracket, and reports "unreachable" only from that global
-    certificate; an unresolved unbracketed solve is a distinct error.
+    adapter can prove a global measured-KL upper bound over every displacement
+    along this direction. The Rust solver validates the atomic observation,
+    expands through local decreases until it finds a genuine sign-change bracket,
+    and reports "unreachable" only from that global certificate; an unresolved
+    unbracketed solve is a distinct error.
     """
     plan = fit.steer_to_target(
         {
@@ -116,7 +119,7 @@ def steer_atom(
             "metric_row": int(metric_row),
             "target_nats": float(target_nats),
             "t_from": np.atleast_1d(np.asarray(t_from, dtype=float)),
-            "t_to": np.atleast_1d(np.asarray(t_to, dtype=float)),
+            "direction": np.atleast_1d(np.asarray(direction, dtype=float)),
             "tol_rel": float(tol_rel),
             "max_iter": int(max_probes),
             "readout_tol_rel": float(readout_tol_rel),

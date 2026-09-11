@@ -436,8 +436,12 @@ Call `converged_latents` when several outputs are needed; separate
 ## Steering and causal intervention
 
 `fit.steer_to_target(request, patched_forward_kl)` builds a **causal intervention
-plan** at a requested measured KL dose. The callback applies the supplied plan to
-the real downstream model and returns one atomic mapping:
+plan** at a requested measured KL dose. It moves one atom's coordinate along its
+chart, at the row's own fitted intensity, until the move carries the dose: the
+landing coordinate `t_to` is solved rather than requested, every move stays on the
+atom's decoded image, and a dose the chart cannot produce is refused with an error
+instead of being clamped. The callback applies the supplied plan to the real
+downstream model and returns one atomic mapping:
 
 ```python no-exec
 def patched_forward_kl(steer_plan):
@@ -446,7 +450,8 @@ def patched_forward_kl(steer_plan):
         "effective_delta": effective_delta,
         "exact_directional_nats": full_local_fisher_quadratic(effective_delta),
         "measured_nats": patched_forward_kl_nats(effective_delta),
-        # A finite value is a GLOBAL proof over all amplitudes, not a plateau guess.
+        # A finite value is a GLOBAL proof over every displacement along the
+        # direction, not a plateau guess.
         "certified_attainable_upper_nats": None,
     }
 ```
@@ -460,7 +465,7 @@ plan = fit.steer_to_target(
         "metric_row": 0,
         "target_nats": 0.05,
         "t_from": np.array([0.1]),
-        "t_to": np.array([0.4]),
+        "direction": np.array([1.0]),
         "tol_rel": 0.01,
         "max_iter": 12,
         "readout_tol_rel": 0.1,
@@ -468,23 +473,27 @@ plan = fit.steer_to_target(
     patched_forward_kl,
 )
 plan["delta"]             # exact (p,) activation-space move to apply
-plan["measured_nats"]     # patched-forward KL at the solved amplitude
+plan["t_to"]              # solved landing coordinate on the atom's chart
+plan["displacement"]      # how far along the direction the solve moved
+plan["measured_nats"]     # patched-forward KL at the solved coordinate
 plan["validation"]        # "applied_dose_probe"
-plan["readout_kl_radius"] # contiguous calibrated amplitude radius, or None
+plan["readout_kl_radius"] # contiguous calibrated displacement radius, or None
 plan["certified_attainable_upper_nats"] # global envelope certificate, or None
 plan["validity_radius"]   # chart-linearization radius, or None
 plan["off_manifold_norm"] # component of the move off the atom's local tangents (≈0 on-manifold)
 plan["metric_provenance"] # "OutputFisher" if a Fisher metric was installed, else "Euclidean"
 ```
 
-It answers "if I push token feature *k* along its manifold from here to there,
-what happens downstream, and how far can I trust that?" The move stays on the
-atom's fitted shape, while the patched forward—not a universal raw amplitude—
-certifies intervention strength. Target-dose solving requires an output-Fisher
-metric (`fisher_factors=` supplied to `sae_manifold_fit`) and fails explicitly
-when the target cannot be bracketed or resolved within the probe budget. Ordered
-amplitude expansion continues through isolated equal or decreasing KL probes: no
-finite collection of point observations proves a plateau. The dedicated
+It answers "if I push token feature *k* along its manifold in this direction until
+the downstream effect is this large, where does it land, and how far can I trust
+that?" The move stays on the atom's fitted shape at the row's own intensity, while
+the patched forward—not a universal raw amplitude—certifies intervention strength.
+Target-dose solving requires an output-Fisher metric (`fisher_factors=` supplied to
+`sae_manifold_fit`) and fails explicitly when the target cannot be bracketed or
+resolved within the probe budget, when the atom is not expressed at `metric_row`,
+or when the direction runs off the chart before the dose is reached. Ordered
+displacement expansion continues through isolated equal or decreasing KL probes:
+no finite collection of point observations proves a plateau. The dedicated
 "unreachable" error is emitted only when the callback supplies a certified global
 attainable-dose upper bound that lies below the request's accepted tolerance band.
 

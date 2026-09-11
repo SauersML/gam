@@ -3,7 +3,7 @@
 //! output KL with unit slope across edit directions, THROUGH a nontrivial
 //! Tier-0 per-column frame, and that the target-dose loop
 //! [`crate::inference::steering::steer_to_target_nats`] lands a requested nats
-//! dose in ~1 probe.
+//! dose by moving the row's coordinate along its chart.
 //!
 //! [`crate::inference::tests_dose_units_2249`] already pins the *units* of
 //! `fisher_mass` against the closed-form categorical Fisher with no term and no
@@ -26,8 +26,9 @@
 //!    — the confound the fix removes is real, not cosmetic.
 //! 3. **Target-dose loop**: [`steer_to_target_nats`] with an exact-KL probe
 //!    converges to a requested in-radius dose within tolerance in ≤ a couple of
-//!    probes and records a readout-KL radius; the probe-free closed-form seed
-//!    reproduces the target dose exactly in the quadratic regime.
+//!    probes and records a readout-KL radius; without a probe the exact
+//!    categorical Fisher dose of the move equals the target, and in both cases the
+//!    move is the chord to the solved coordinate at the row's own gate.
 //!
 //! The readout is the same closed-form categorical softmax the units test uses
 //! (logits = raw activation vector, identity Jacobian ⇒ the output-Fisher metric
@@ -393,58 +394,56 @@ mod tests {
         );
     }
 
-    /// #2263 — [`steer_to_target_nats`] lands a requested in-radius nats dose in a
-    /// couple of exact-KL probes, records a readout-KL radius, and its probe-free
-    /// closed-form seed reproduces the target dose exactly in the quadratic regime.
+    /// #2263 — [`steer_to_target_nats`] moves the row's coordinate along its chart to
+    /// land a requested in-radius nats dose. Without a probe the exact categorical
+    /// Fisher dose is solved to the representation limit; with an exact-KL probe the
+    /// dose lands in a couple of probes and a readout-KL radius is recorded. Either
+    /// way the move is the chord to the solved coordinate at the row's own gate,
+    /// checked against an independent decode rather than read back from the plan.
     #[test]
     fn target_dose_loop_lands_requested_nats() {
         let (term, metric, angles) = build_calibrated_term();
         let atom = &term.atoms[0];
         let tau = std::f64::consts::TAU;
         let scale = term.tier0_scale().expect("scale set").to_owned();
-
-        let row = 3usize;
-        let t_from = angles[row];
-        let t_to = (t_from + 0.02).rem_euclid(tau);
-        let z_from: Vec<f64> = {
-            let t_mat = Array2::from_shape_vec((1, 1), vec![t_from]).unwrap();
+        let raw_decode = |t: f64| -> Vec<f64> {
+            let t_mat = Array2::from_shape_vec((1, 1), vec![t]).unwrap();
             let g = atom.decode_at_coords(t_mat.view()).unwrap();
             (0..P_OUT).map(|j| scale[j] * g[[0, j]]).collect()
         };
+
+        let row = 3usize;
+        let t_from = [angles[row]];
+        let direction = [1.0];
+        let z_from = raw_decode(t_from[0]);
         let p_from = softmax(ArrayView1::from(&z_from));
 
-        // Unit-amplitude raw chord: dg_raw = g_raw(t_to) − g_raw(t_from).
-        let dg_raw: Vec<f64> = {
-            let t_mat = Array2::from_shape_vec((1, 1), vec![t_to]).unwrap();
-            let g = atom.decode_at_coords(t_mat.view()).unwrap();
-            (0..P_OUT)
-                .map(|j| scale[j] * g[[0, j]] - z_from[j])
-                .collect()
-        };
+        // The dose of a small forward chord sets the scale; ask for half of it so the
+        // solved move stays in-radius.
+        let small_step = 0.02;
+        let dg_raw: Vec<f64> = raw_decode((t_from[0] + small_step).rem_euclid(tau))
+            .iter()
+            .zip(&z_from)
+            .map(|(to, from)| to - from)
+            .collect();
         let unit_nats = 0.5 * categorical_quad_form(&p_from, &dg_raw);
         assert!(unit_nats > 0.0, "unit chord must carry Fisher mass");
-
-        // Target a fraction of the unit dose so the amplitude stays in-radius.
         let target_nats = 0.5 * unit_nats;
+        let request = || TargetDoseRequest {
+            atom_k: 0,
+            metric_row: row,
+            t_from: &t_from,
+            direction: &direction,
+            target_nats,
+            config: TargetDoseConfig::default(),
+        };
 
         let uncertified_metric = metric
             .clone()
             .with_fisher_factor_kind(FisherFactorKind::UncertifiedApproximation)
             .expect("downgrade factor status for refusal test");
-        let error = steer_to_target_nats(
-            &term,
-            &uncertified_metric,
-            TargetDoseRequest {
-                atom_k: 0,
-                metric_row: row,
-                t_from: &[t_from],
-                t_to: &[t_to],
-                target_nats,
-                config: TargetDoseConfig::default(),
-            },
-            None,
-        )
-        .expect_err("an uncertified factor cannot solve a full-KL target without a probe");
+        let error = steer_to_target_nats(&term, &uncertified_metric, request(), None)
+            .expect_err("an uncertified factor cannot solve a full-KL target without a probe");
         assert!(matches!(
             error,
             crate::inference::steering::TargetDoseError::FactorNeedsAppliedDoseProbe {
@@ -452,35 +451,43 @@ mod tests {
             }
         ));
 
-        // Probe-free closed-form seed: predicted_nats must equal the target
-        // exactly (a0² · unit_nats = q*).
-        let seed_plan = steer_to_target_nats(
-            &term,
-            &metric,
-            TargetDoseRequest {
-                atom_k: 0,
-                metric_row: row,
-                t_from: &[t_from],
-                t_to: &[t_to],
-                target_nats,
-                config: TargetDoseConfig::default(),
-            },
-            None,
-        )
-        .expect("closed-form seed");
-        assert!(
-            (seed_plan.steer.predicted_nats.expect("predicted dose") - target_nats).abs()
-                <= 1e-9 * target_nats,
-            "closed-form seed dose {} must equal target {target_nats}",
-            seed_plan.steer.predicted_nats.expect("predicted dose")
+        // Probe-free exact-factor solve: the categorical Fisher dose of the move must
+        // equal the target, and the move must be the chord to the solved coordinate.
+        let exact_plan =
+            steer_to_target_nats(&term, &metric, request(), None).expect("exact-factor solve");
+        let gate = term.assignment.try_assignments_row(row).expect("gate")[0];
+        let landed = exact_plan.steer.predicted_nats.expect("predicted dose");
+        let chord: Vec<f64> = raw_decode(exact_plan.steer.t_to[0])
+            .iter()
+            .zip(&z_from)
+            .map(|(to, from)| gate * (to - from))
+            .collect();
+        println!(
+            "[#2263 2249] exact solve: landed {landed:.12e} vs target {target_nats:.12e}, \
+             displacement {:.6e} (small step {small_step}), gate {gate}",
+            exact_plan.displacement
         );
-        let expect_a0 = (target_nats / unit_nats).sqrt();
         assert!(
-            (seed_plan.seed_amplitude - expect_a0).abs() <= 1e-9 * expect_a0,
-            "seed amplitude {} must be sqrt(q*/unit_nats) = {expect_a0}",
-            seed_plan.seed_amplitude
+            (landed - target_nats).abs() <= 1e-9 * target_nats,
+            "exact-factor dose {landed} must equal target {target_nats}"
         );
-        assert!(seed_plan.applied_probe.is_none());
+        assert_eq!(
+            exact_plan.steer.amplitude, gate,
+            "the move is written at the row's own gate"
+        );
+        for (j, (&applied, &expected)) in exact_plan.steer.delta.iter().zip(&chord).enumerate() {
+            assert!(
+                (applied - expected).abs()
+                    <= 4.0 * f64::EPSILON * applied.abs().max(expected.abs()),
+                "delta[{j}] = {applied} must be the chord to the solved t_to, {expected}"
+            );
+        }
+        assert!(
+            exact_plan.displacement > 0.0 && exact_plan.displacement < small_step,
+            "half the dose of a {small_step} chord needs a shorter forward move; got {}",
+            exact_plan.displacement
+        );
+        assert!(exact_plan.applied_probe.is_none());
 
         // Model-in-the-loop probe: exact categorical KL of the applied chord.
         let z_from_probe = z_from.clone();
@@ -500,20 +507,8 @@ mod tests {
                 certified_attainable_upper_nats: None,
             })
         };
-        let plan = steer_to_target_nats(
-            &term,
-            &metric,
-            TargetDoseRequest {
-                atom_k: 0,
-                metric_row: row,
-                t_from: &[t_from],
-                t_to: &[t_to],
-                target_nats,
-                config: TargetDoseConfig::default(),
-            },
-            Some(&mut probe),
-        )
-        .expect("target-dose loop with exact-KL probe");
+        let plan = steer_to_target_nats(&term, &metric, request(), Some(&mut probe))
+            .expect("target-dose loop with exact-KL probe");
 
         let measured = plan
             .applied_probe

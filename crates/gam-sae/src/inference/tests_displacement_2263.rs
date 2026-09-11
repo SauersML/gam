@@ -81,22 +81,29 @@
 //! amplitude scales position.~~ **That prediction is FALSE, and false by
 //! construction rather than by measurement** — it needed no run to refute.
 //!
-//! `steer_to_target_nats` destructures `t_from` / `t_to` out of its request once
-//! and passes them **unchanged** into every `steer_delta` call (the unit
-//! reference and the `plan_at` closure the secant drives). It never re-solves
+//! `steer_to_target_nats` destructured `t_from` / `t_to` out of its request once
+//! and passed them **unchanged** into every `steer_delta` call (the unit
+//! reference and the `plan_at` closure the secant drove). It never re-solved
 //! `t_to`. Since `steer_delta` is `delta = amplitude · (g(t_to) − g(t_from))`,
-//! the reachable set of every plan that API can return — seed or post-secant —
-//! is the ray `{a·dg : a > 0}` on the SAME chord. That is precisely the
+//! the reachable set of every plan that API could return — seed or post-secant —
+//! was the ray `{a·dg : a > 0}` on the SAME chord. That is precisely the
 //! one-parameter family the amplitude sweep above already traverses, under the
 //! change of variable `a₀ = sqrt(q* / unit_nats)`: the `alpha` column
-//! `{1,2,4,8,16}` IS the target-dose response at
+//! `{1,2,4,8,16}` WAS the target-dose response at
 //! `q* = {1,4,16,64,256}·unit_nats`.
 //!
-//! So the target-dose loop cannot repair the displacement. It selects `a` to
-//! land a requested DOSE, and the realized DISPLACEMENT is then `a·dg`, exact
-//! only at `a = 1`, i.e. only when `q*` happens to equal `unit_nats`. **Dose and
-//! displacement are two demands on one scalar**, which means a fix has to solve
-//! jointly for `(t_to, a)` rather than taking `t_to` literally.
+//! So the target-dose loop could not repair the displacement. It selected `a` to
+//! land a requested DOSE, and the realized DISPLACEMENT was then `a·dg`, exact
+//! only at `a = 1`, i.e. only when `q*` happened to equal `unit_nats`. **Dose and
+//! displacement were two demands on one scalar.**
+//!
+//! **Resolved by changing the contract.** `steer_to_target_nats` now takes a chart
+//! `direction` instead of `t_to`, writes the move at the row's own gate, and solves
+//! for how far to move, so `t_to` is an output and every returned move is a chord
+//! of the decoded image. A dose the chart cannot produce is refused with
+//! `ChartExtentExhausted` instead of being written off the image
+//! (`tests/sae/misc/steering_dosimetry.rs`,
+//! `target_dose_moves_the_coordinate_and_refuses_what_the_chart_cannot_produce_2263`).
 //!
 //! Credit: refuted by another lane reading the call graph at `669d59532`;
 //! verified here against `origin/main` before this note was written.

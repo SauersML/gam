@@ -1611,17 +1611,18 @@ fn steer_delta_with_metric_from_arrays(
     gam::terms::sae::manifold::run_sae_manifold_steer(request).map_err(py_value_error)
 }
 
-/// Rebuild the trained term from arrays and solve for the amplitude realizing a
-/// TARGET output-KL dose (gh#2263). Mirrors [`steer_delta_with_metric_from_arrays`]
-/// but drives the target-dose entry; the optional `probe` (a patched-forward KL
-/// callback) drives the closed-loop correction and the readout-KL radius.
+/// Rebuild the trained term from arrays and solve for the displacement along a
+/// chart direction realizing a TARGET output-KL dose (gh#2263). Mirrors
+/// [`steer_delta_with_metric_from_arrays`] but drives the target-dose entry; the
+/// optional `probe` (a patched-forward KL callback) drives the closed-loop
+/// correction and the readout-KL radius.
 struct SteerToTargetArraysRequest<'a> {
     atom_k: usize,
     metric_row: usize,
     target_nats: f64,
     config: gam::inference::steering::TargetDoseConfig,
     t_from: ndarray::ArrayView1<'a, f64>,
-    t_to: ndarray::ArrayView1<'a, f64>,
+    direction: ndarray::ArrayView1<'a, f64>,
     geometry_plans: &'a [SaeAtomGeometryPlan],
     decoder_blocks: &'a [ndarray::ArrayView2<'a, f64>],
     coords: &'a [ndarray::ArrayView2<'a, f64>],
@@ -1642,7 +1643,7 @@ struct ManifoldSteerToTargetRequest {
     metric_row: usize,
     target_nats: f64,
     t_from: Array1<f64>,
-    t_to: Array1<f64>,
+    direction: Array1<f64>,
     config: gam::inference::steering::TargetDoseConfig,
 }
 
@@ -1663,7 +1664,16 @@ impl ManifoldSteerToTargetRequest {
             .extract::<PyReadonlyArray1<'_, f64>>()?
             .as_array()
             .to_owned();
-        let t_to = required_steer_to_target_item(request, "t_to")?
+        // The landing coordinate is what a target-dose solve returns. A request
+        // that still names one would be read under the retired chord contract.
+        if request.get_item("t_to")?.is_some() {
+            return Err(py_value_error(
+                "ManifoldSaeCore.steer_to_target: 't_to' is solved, not requested; pass the \
+                 chart 'direction' to move along instead"
+                    .to_string(),
+            ));
+        }
+        let direction = required_steer_to_target_item(request, "direction")?
             .extract::<PyReadonlyArray1<'_, f64>>()?
             .as_array()
             .to_owned();
@@ -1672,7 +1682,7 @@ impl ManifoldSteerToTargetRequest {
             metric_row: required_steer_to_target_item(request, "metric_row")?.extract()?,
             target_nats: required_steer_to_target_item(request, "target_nats")?.extract()?,
             t_from,
-            t_to,
+            direction,
             config: gam::inference::steering::TargetDoseConfig {
                 tol_rel: required_steer_to_target_item(request, "tol_rel")?.extract()?,
                 max_iter: required_steer_to_target_item(request, "max_iter")?.extract()?,
@@ -1693,7 +1703,7 @@ fn steer_to_target_from_arrays(
         target_nats,
         config,
         t_from,
-        t_to,
+        direction,
         geometry_plans,
         decoder_blocks,
         coords,
@@ -1746,7 +1756,7 @@ fn steer_to_target_from_arrays(
         atom_k,
         metric_row,
         t_from: t_from.to_vec(),
-        t_to: t_to.to_vec(),
+        direction: direction.to_vec(),
         target_nats,
         config,
     };
@@ -1761,7 +1771,8 @@ fn target_dose_plan_to_pydict(
 ) -> PyResult<Py<PyDict>> {
     let gam::inference::steering::TargetDosePlan {
         target_nats,
-        seed_amplitude,
+        seed_displacement,
+        displacement,
         steer,
         applied_probe,
         iterations,
@@ -1773,7 +1784,8 @@ fn target_dose_plan_to_pydict(
     let out = steer_plan_to_pydict(py, steer)?;
     let bound = out.bind(py);
     bound.set_item("target_nats", target_nats)?;
-    bound.set_item("seed_amplitude", seed_amplitude)?;
+    bound.set_item("seed_displacement", seed_displacement)?;
+    bound.set_item("displacement", displacement)?;
     bound.set_item("iterations", iterations)?;
     bound.set_item("resident_metric_nats", resident_metric_nats)?;
     bound.set_item("resident_metric_nats_kind", resident_metric_nats_kind)?;

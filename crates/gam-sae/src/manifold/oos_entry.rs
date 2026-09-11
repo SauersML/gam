@@ -700,10 +700,11 @@ pub fn run_sae_manifold_steer(request: SaeSteerRequest) -> Result<SteerPlan, Str
     steer_delta(&term, metric, atom_k, metric_row, amplitude, &t_from, &t_to)
 }
 
-/// Fully owned request to solve for the amplitude realizing a TARGET output-KL
-/// dose (in nats) on atom `atom_k`'s chord (gh#2263 target-dose surface). Same
-/// frozen-dictionary rebuild as [`SaeSteerRequest`], with `amplitude` replaced by
-/// the requested `target_nats` and the closed-loop `config`.
+/// Fully owned request to solve for how far to move atom `atom_k`'s coordinate
+/// along a chart direction to realize a TARGET output-KL dose in nats (gh#2263
+/// target-dose surface). Same frozen-dictionary rebuild as [`SaeSteerRequest`],
+/// with `amplitude` replaced by the row's own fitted gate, `t_to` by a
+/// `direction`, and the requested `target_nats` and closed-loop `config` added.
 pub struct SaeSteerToTargetRequest {
     /// Persisted trained atoms (decoder + basis schema).
     pub atoms: Vec<SaeOosAtomSpec>,
@@ -727,19 +728,19 @@ pub struct SaeSteerToTargetRequest {
     pub metric_row: usize,
     /// Source on-manifold coordinate.
     pub t_from: Vec<f64>,
-    /// Target on-manifold coordinate (fixes the chord DIRECTION; the amplitude is solved).
-    pub t_to: Vec<f64>,
+    /// Chart direction to move along; the displacement and landing coordinate are solved.
+    pub direction: Vec<f64>,
     /// Requested output-KL dose in nats.
     pub target_nats: f64,
     /// Closed-loop correction tuning.
     pub config: TargetDoseConfig,
 }
 
-/// Solve for the amplitude that realizes `target_nats` on atom `atom_k`'s chord.
-/// The optional plan-aware probe drives the bracketed closed-loop correction and
-/// records exact directional local-Fisher and patched-forward measurements for
-/// the same effective delta; with `probe = None` the returned [`TargetDosePlan`]
-/// is the exact-factor-only closed-form seed.
+/// Solve for the displacement along `direction` that realizes `target_nats` on
+/// atom `atom_k`'s chart. The optional plan-aware probe drives the bracketed
+/// closed-loop correction and records exact directional local-Fisher and
+/// patched-forward measurements for the same effective delta; with `probe = None`
+/// the displacement is solved against the exact resident dose.
 pub fn run_sae_manifold_steer_to_target(
     request: SaeSteerToTargetRequest,
     probe: Option<&mut AppliedDoseProbe<'_>>,
@@ -756,7 +757,7 @@ pub fn run_sae_manifold_steer_to_target(
         atom_k,
         metric_row,
         t_from,
-        t_to,
+        direction,
         target_nats,
         config,
     } = request;
@@ -782,7 +783,7 @@ pub fn run_sae_manifold_steer_to_target(
             atom_k,
             metric_row,
             t_from: &t_from,
-            t_to: &t_to,
+            direction: &direction,
             target_nats,
             config,
         },

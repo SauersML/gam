@@ -61,10 +61,11 @@ def _model() -> ManifoldSAE:
 def _analytic_topology_model(
     geometry_plan: dict[str, object],
     basis_size: int,
+    atom_k: int = 0,
 ) -> ManifoldSAE:
-    """Replace atom zero with one exact analytic persisted topology.
+    """Replace one atom (atom zero by default) with an exact analytic topology.
 
-    The remaining two atoms keep the golden artifact's valid routing and Fisher
+    The remaining atoms keep the golden artifact's valid routing and Fisher
     state.  Only the persisted atom schema is changed, so these tests exercise
     the public model's frozen-state rebuild rather than any fit path.
     """
@@ -81,11 +82,11 @@ def _analytic_topology_model(
         for basis_row in range(basis_size)
     ]
 
-    payload["geometry_plans"][0] = geometry_plan
-    payload["coords"][0] = coords
-    payload["decoder_blocks"][0] = decoder
+    payload["geometry_plans"][atom_k] = geometry_plan
+    payload["coords"][atom_k] = coords
+    payload["decoder_blocks"][atom_k] = decoder
 
-    atom = payload["atoms"][0]
+    atom = payload["atoms"][atom_k]
     atom["active_dim"] = latent_dim
     atom["coords"] = coords
     atom["coords_u_arc"] = None
@@ -139,12 +140,28 @@ def test_steer_reuses_the_resident_metric() -> None:
     assert model.fisher_metric_build_count == 1
 
 
+# Target-dose requests use the golden artifact's linear atom 1. Its routing keeps
+# the top 2 of 3 atoms and atom 1 is inside that support at every row, so the move
+# is written at gate 1, and a linear chart's dose is exactly quadratic in the
+# displacement, so the first-order seed is exact.
+TARGET_ATOM = 1
+TARGET_T_FROM = np.array([0.2, 0.5], dtype=np.float64)
+TARGET_DIRECTION = np.array([1.0, 0.0], dtype=np.float64)
+
+
+def _unit_target_nats(model: ManifoldSAE) -> float:
+    """The dose of a 0.25 move along the target direction at gate 1."""
+    unit = model.steer(
+        TARGET_ATOM, 0, 1.0, TARGET_T_FROM, TARGET_T_FROM + 0.25 * TARGET_DIRECTION
+    )
+    return float(unit["predicted_nats"])
+
+
 def test_target_dose_probe_is_wired_through_the_public_model() -> None:
     model = _model()
-    t_from = np.array([0.0], dtype=np.float64)
-    t_to = np.array([0.25], dtype=np.float64)
-    unit = model.steer(0, 0, 1.0, t_from, t_to)
-    target = 0.5 * float(unit["predicted_nats"])
+    t_from = TARGET_T_FROM
+    direction = TARGET_DIRECTION
+    target = 0.5 * _unit_target_nats(model)
     probe_calls: list[dict[str, object]] = []
 
     def patched_forward_kl(steer_plan: dict[str, object]) -> dict[str, object]:
@@ -159,11 +176,11 @@ def test_target_dose_probe_is_wired_through_the_public_model() -> None:
 
     plan = model.steer_to_target(
         {
-            "atom_k": 0,
+            "atom_k": TARGET_ATOM,
             "metric_row": 0,
             "target_nats": target,
             "t_from": t_from,
-            "t_to": t_to,
+            "direction": direction,
             "tol_rel": 1.0e-12,
             "max_iter": 4,
             "readout_tol_rel": 0.1,
@@ -174,32 +191,74 @@ def test_target_dose_probe_is_wired_through_the_public_model() -> None:
     assert plan["validation"] == "applied_dose_probe"
     assert plan["iterations"] == 1
     assert len(probe_calls) == 1
-    assert probe_calls[0]["amplitude"] == plan["amplitude"]
+    assert probe_calls[0]["amplitude"] == plan["amplitude"] == 1.0
+    assert probe_calls[0]["t_to"] == plan["t_to"]
     assert plan["measured_nats"] == pytest.approx(target, rel=1.0e-12)
     assert plan["predicted_nats"] == pytest.approx(target, rel=1.0e-12)
     assert plan["predicted_nats_kind"] == "exact_directional"
     assert plan["resident_metric_nats_kind"] == "uncertified_approximation"
     assert plan["certified_attainable_upper_nats"] is None
+    # Half the dose of a quadratic chart is the 0.25 move shortened by sqrt(1/2).
+    assert plan["displacement"] == pytest.approx(0.25 * np.sqrt(0.5), rel=1.0e-12)
     np.testing.assert_allclose(
         plan["delta"],
-        model.steer(0, 0, plan["amplitude"], t_from, t_to)["delta"],
+        model.steer(
+            TARGET_ATOM,
+            0,
+            plan["amplitude"],
+            t_from,
+            np.asarray(plan["t_to"], dtype=np.float64),
+        )["delta"],
         rtol=0.0,
         atol=0.0,
     )
     assert model.fisher_metric_build_count == 1
 
 
+def test_target_dose_request_names_a_direction_not_a_landing_coordinate() -> None:
+    model = _model()
+    request = {
+        "atom_k": TARGET_ATOM,
+        "metric_row": 0,
+        "target_nats": 0.5 * _unit_target_nats(model),
+        "t_from": TARGET_T_FROM,
+        "t_to": TARGET_T_FROM + 0.25 * TARGET_DIRECTION,
+        "tol_rel": 1.0e-2,
+        "max_iter": 12,
+        "readout_tol_rel": 0.1,
+    }
+    with pytest.raises(ValueError, match="'t_to' is solved"):
+        model.steer_to_target(request)
+
+
+def test_target_dose_refuses_an_atom_outside_the_rows_support() -> None:
+    # Atom 0 has the smallest logit at every golden row, so the top-2 routing gives
+    # it gate 0: moving its coordinate cannot change the row, and no dose exists.
+    model = _model()
+    with pytest.raises(ValueError, match="zero fitted gate"):
+        model.steer_to_target(
+            {
+                "atom_k": 0,
+                "metric_row": 0,
+                "target_nats": 1.0e-3,
+                "t_from": np.array([0.1], dtype=np.float64),
+                "direction": np.array([1.0], dtype=np.float64),
+                "tol_rel": 1.0e-2,
+                "max_iter": 12,
+                "readout_tol_rel": 0.1,
+            }
+        )
+
+
 def test_target_dose_rejects_scalar_and_malformed_probe_results() -> None:
     model = _model()
-    t_from = np.array([0.0], dtype=np.float64)
-    t_to = np.array([0.25], dtype=np.float64)
-    target = 0.5 * float(model.steer(0, 0, 1.0, t_from, t_to)["predicted_nats"])
+    target = 0.5 * _unit_target_nats(model)
     request = {
-        "atom_k": 0,
+        "atom_k": TARGET_ATOM,
         "metric_row": 0,
         "target_nats": target,
-        "t_from": t_from,
-        "t_to": t_to,
+        "t_from": TARGET_T_FROM,
+        "direction": TARGET_DIRECTION,
         "tol_rel": 1.0e-12,
         "max_iter": 4,
         "readout_tol_rel": 0.1,
@@ -245,20 +304,15 @@ def test_target_dose_rejects_scalar_and_malformed_probe_results() -> None:
 
 def test_target_dose_local_decrease_does_not_claim_unreachable() -> None:
     model = _model()
-    t_from = np.array([0.0], dtype=np.float64)
-    t_to = np.array([0.25], dtype=np.float64)
-    unit_nats = float(model.steer(0, 0, 1.0, t_from, t_to)["predicted_nats"])
-    target = 0.5 * unit_nats
-    seed_amplitude = np.sqrt(target / unit_nats)
+    target = 0.5 * _unit_target_nats(model)
+    calls = 0
 
     def nonmonotone_probe(plan: dict[str, object]) -> dict[str, object]:
-        amplitude = float(plan["amplitude"])
-        if amplitude < 1.5 * seed_amplitude:
-            measured = 0.40 * target
-        elif amplitude < 3.0 * seed_amplitude:
-            measured = 0.38 * target
-        else:
-            measured = target
+        nonlocal calls
+        calls += 1
+        # Below the target, then lower still, then on it: a local decrease is only
+        # another point observation, so ordered expansion must keep going.
+        measured = {1: 0.40 * target, 2: 0.38 * target}.get(calls, target)
         return {
             "effective_delta": list(plan["delta"]),
             "exact_directional_nats": float(plan["predicted_nats"]),
@@ -268,11 +322,11 @@ def test_target_dose_local_decrease_does_not_claim_unreachable() -> None:
 
     plan = model.steer_to_target(
         {
-            "atom_k": 0,
+            "atom_k": TARGET_ATOM,
             "metric_row": 0,
             "target_nats": target,
-            "t_from": t_from,
-            "t_to": t_to,
+            "t_from": TARGET_T_FROM,
+            "direction": TARGET_DIRECTION,
             "tol_rel": 0.0,
             "max_iter": 3,
             "readout_tol_rel": 0.1,
@@ -285,16 +339,14 @@ def test_target_dose_local_decrease_does_not_claim_unreachable() -> None:
 
 def test_target_dose_unreachable_requires_a_global_envelope_certificate() -> None:
     model = _model()
-    t_from = np.array([0.0], dtype=np.float64)
-    t_to = np.array([0.25], dtype=np.float64)
-    target = 0.5 * float(model.steer(0, 0, 1.0, t_from, t_to)["predicted_nats"])
+    target = 0.5 * _unit_target_nats(model)
     observed = 0.25 * target
     request = {
-        "atom_k": 0,
+        "atom_k": TARGET_ATOM,
         "metric_row": 0,
         "target_nats": target,
-        "t_from": t_from,
-        "t_to": t_to,
+        "t_from": TARGET_T_FROM,
+        "direction": TARGET_DIRECTION,
         "tol_rel": 1.0e-12,
         "max_iter": 2,
         "readout_tol_rel": 0.1,
@@ -381,10 +433,12 @@ def test_public_mobius_steer_identifies_deck_twins() -> None:
 
 
 def test_public_target_dose_rebuilds_cylinder_metadata() -> None:
-    model = _analytic_topology_model(CYLINDER_PLAN, 6)
+    # The cylinder replaces atom 1, which the golden top-2 routing expresses at every
+    # row; target-dose moves are written at the row's own gate.
+    model = _analytic_topology_model(CYLINDER_PLAN, 6, atom_k=1)
     t_from = np.asarray([0.15, -0.2], dtype=np.float64)
     t_to = np.asarray([0.18, -0.1], dtype=np.float64)
-    unit = model.steer(0, 0, 1.0, t_from, t_to)
+    unit = model.steer(1, 0, 1.0, t_from, t_to)
     target = 0.5 * float(unit["predicted_nats"])
 
     def patched_forward_kl(steer_plan: dict[str, object]) -> dict[str, object]:
@@ -398,13 +452,13 @@ def test_public_target_dose_rebuilds_cylinder_metadata() -> None:
 
     plan = model.steer_to_target(
         {
-            "atom_k": 0,
+            "atom_k": 1,
             "metric_row": 0,
             "target_nats": target,
             "t_from": t_from,
-            "t_to": t_to,
+            "direction": t_to - t_from,
             "tol_rel": 1.0e-12,
-            "max_iter": 4,
+            "max_iter": 12,
             "readout_tol_rel": 0.1,
         },
         patched_forward_kl,

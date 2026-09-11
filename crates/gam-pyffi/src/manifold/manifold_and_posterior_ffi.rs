@@ -6078,21 +6078,21 @@ impl ManifoldSaeCore {
         steer_plan_to_pydict(py, plan)
     }
 
-    /// Target-dose steering (gh#2263): solve for the amplitude that lands a
-    /// requested output-KL dose on one atom chord, instead of asking the caller
-    /// for a meaningless raw amplitude. The required `request` mapping contains
-    /// `atom_k`, `metric_row`, `target_nats`, `t_from`, `t_to`, `tol_rel`,
-    /// `max_iter`, and `readout_tol_rel`. Returns the
-    /// closed-form seed `a0 = sqrt(2 q*/(dgᵀ M dg))` plus, when a plan-aware
-    /// `probe` is supplied, the closed-loop-corrected amplitude and one atomic
+    /// Target-dose steering (gh#2263): solve for how far to move one atom's
+    /// coordinate along a chart direction so the move lands a requested output-KL
+    /// dose. The move is written at the row's own fitted gate, so it stays a chord
+    /// of the atom's decoded image; the landing coordinate `t_to` is returned, never
+    /// requested. The required `request` mapping contains `atom_k`, `metric_row`,
+    /// `target_nats`, `t_from`, `direction`, `tol_rel`, `max_iter`, and
+    /// `readout_tol_rel`. Returns the plan with `seed_displacement` and the solved
+    /// `displacement` plus, when a plan-aware `probe` is supplied, one atomic
     /// observation mapping with `effective_delta`, `exact_directional_nats`,
-    /// `measured_nats`, and required optional
-    /// `certified_attainable_upper_nats`. The latter is `None` unless the callback
-    /// can prove a global upper bound for every non-negative amplitude on this
-    /// exact chord; pointwise plateaus are not certificates. The callback receives
-    /// the complete public steer-plan mapping, not a scalar amplitude, so it cannot
-    /// silently execute a different activation move. Reuses the
-    /// SAME frozen-dictionary rebuild as `steer`.
+    /// `measured_nats`, and required optional `certified_attainable_upper_nats`.
+    /// The latter is `None` unless the callback can prove a global upper bound over
+    /// every displacement along this direction; pointwise plateaus are not
+    /// certificates. The callback receives the complete public steer-plan mapping,
+    /// so it cannot silently execute a different activation move. Reuses the SAME
+    /// frozen-dictionary rebuild as `steer`.
     #[pyo3(signature = (request, probe = None))]
     fn steer_to_target<'py>(
         &self,
@@ -6105,7 +6105,7 @@ impl ManifoldSaeCore {
             metric_row,
             target_nats,
             t_from,
-            t_to,
+            direction,
             config,
         } = ManifoldSteerToTargetRequest::from_pydict(request)?;
         let inner = &self.inner;
@@ -6216,7 +6216,7 @@ impl ManifoldSaeCore {
                 target_nats,
                 config,
                 t_from: t_from.view(),
-                t_to: t_to.view(),
+                direction: direction.view(),
                 geometry_plans: &inner.geometry_plans,
                 decoder_blocks: &decoder_views,
                 coords: &coord_views,
