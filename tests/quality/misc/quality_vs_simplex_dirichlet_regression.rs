@@ -1112,7 +1112,9 @@ fn gam_dirichlet_regression_recovers_truth_on_real_data() {
     let log_y: Vec<Array1<f64>> = (0..K)
         .map(|k| Array1::from_iter(train_comp[k].iter().map(|&v| v.ln())))
         .collect();
-    let family = DirichletCommonFamily { log_y };
+    let family = DirichletCommonFamily {
+        log_y: log_y.clone(),
+    };
 
     let n_pen = penalties.len();
     let specs: Vec<ParameterBlockSpec> = (0..K)
@@ -1141,6 +1143,31 @@ fn gam_dirichlet_regression_recovers_truth_on_real_data() {
     // gam fitted η_k on the HELD-OUT rows (reconstruct from per-block β̂).
     let gam_eta_test: Vec<Vec<f64>> = (0..K)
         .map(|k| test_design.dot(&fit.block_states[k].beta).to_vec())
+        .collect();
+
+    // ---- tool-free floor: the train-fitted constant Dirichlet ---------------
+    // The same Dirichlet family on an intercept-only design (no covariate, no
+    // penalty) is the no-covariate model; a fit that uses t must predict the
+    // held-out compositions better than it.
+    let null_specs: Vec<ParameterBlockSpec> = (0..K)
+        .map(|k| ParameterBlockSpec {
+            name: format!("alpha{k}_constant"),
+            design: DesignMatrix::from(Array2::<f64>::ones((n_train, 1))),
+            offset: Array1::zeros(n_train),
+            penalties: Vec::new(),
+            nullspace_dims: Vec::new(),
+            initial_log_lambdas: Array1::zeros(0),
+            initial_beta: None,
+            gauge_priority: 100,
+            jacobian_callback: None,
+            stacked_design: None,
+            stacked_offset: None,
+        })
+        .collect();
+    let null_fit = fit_custom_family(&DirichletCommonFamily { log_y }, &null_specs, &options)
+        .expect("gam constant Dirichlet fit (skye)");
+    let null_eta_test: Vec<Vec<f64>> = (0..K)
+        .map(|k| vec![null_fit.block_states[k].beta[0]; n_test])
         .collect();
 
     // ---- DirichletReg: mature Dirichlet-regression reference, SAME data ----
@@ -1193,9 +1220,31 @@ fn gam_dirichlet_regression_recovers_truth_on_real_data() {
         })
         .collect();
 
-    // ---- objective metric: held-out Dirichlet NLL (truth unknown) ----------
+    // ---- objective metrics on the held-out rows (truth unknown) -------------
+    // Dirichlet NLL is a log-density, so it is signed; it gates against the
+    // constant-model floor and is printed for context. The emitted comparison
+    // is the non-negative held-out error of the closed mean composition against
+    // the observed test compositions, which stays finite for any coefficient
+    // vector (the unpenalized reference extrapolates with 21 coefficients on
+    // 17 training rows).
     let gam_test_nll = mean_dirichlet_nll(&gam_eta_test, &test_comp);
     let dr_test_nll = mean_dirichlet_nll(&dr_eta_test, &test_comp);
+    let null_test_nll = mean_dirichlet_nll(&null_eta_test, &test_comp);
+    let test_comp_flat: Vec<f64> = test_comp.iter().flatten().copied().collect();
+    let gam_comp_rmse = rmse(
+        &closed_means_stable(&gam_eta_test)
+            .into_iter()
+            .flatten()
+            .collect::<Vec<f64>>(),
+        &test_comp_flat,
+    );
+    let dr_comp_rmse = rmse(
+        &closed_means_stable(&dr_eta_test)
+            .into_iter()
+            .flatten()
+            .collect::<Vec<f64>>(),
+        &test_comp_flat,
+    );
 
     // Context only (NOT a pass gate): closeness of gam's vs DirichletReg's
     // held-out linear predictors, axis-stacked over the K parts.
@@ -1208,48 +1257,61 @@ fn gam_dirichlet_regression_recovers_truth_on_real_data() {
     let rel_eta_vs_dr = relative_l2(&gam_eta_flat, &dr_eta_flat);
 
     eprintln!(
-        "skye AFM held-out Dirichlet NLL: n_train={n_train} n_test={n_test} p={p_cols} | \
-         gam_nll={gam_test_nll:.4} dr_nll={dr_test_nll:.4} | \
+        "skye AFM held-out: n_train={n_train} n_test={n_test} p={p_cols} | \
+         Dirichlet NLL gam={gam_test_nll:.4} constant={null_test_nll:.4} dr={dr_test_nll:.4} | \
+         composition RMSE gam={gam_comp_rmse:.4} dr={dr_comp_rmse:.4} | \
          context rel_l2(eta) vs dr={rel_eta_vs_dr:.4}"
     );
     eprintln!(
         "{}",
         QualityPair::error(
             "misc",
-            "quality_vs_simplex_dirichlet_regression::holdout_nll",
-            "held_out_nll",
-            gam_test_nll,
+            "quality_vs_simplex_dirichlet_regression::holdout_composition",
+            "held_out_composition_rmse",
+            gam_comp_rmse,
             "DirichletReg",
-            dr_test_nll,
+            dr_comp_rmse,
         )
         .line()
     );
 
-    // ---- PRIMARY objective assertion: absolute held-out NLL bar ------------
-    // The Skye AFM composition is moderately concentrated (parts away from the
-    // simplex edges), so a competent Dirichlet fit attains a clearly negative
-    // mean held-out NLL (the log-density is positive once φ = Σα is appreciable).
-    // A flat, mis-concentrated, or broken coupled-block fit would push the NLL
-    // up toward / above zero. A mean held-out NLL below -3.0 is a genuine
-    // distributional-fit bar that a defect in the coupled K-block Dirichlet path
-    // would fail.
+    // ---- PRIMARY objective assertion: beat the no-covariate Dirichlet -------
+    // The Skye series moves along the magmatic differentiation index t, so a
+    // Dirichlet fit that uses t must assign the held-out compositions a higher
+    // mean log-density than the constant Dirichlet fitted to the same training
+    // rows. A broken coupled K-block fit, or one that ignores t, cannot.
     assert!(
-        gam_test_nll < -3.0,
-        "gam held-out Dirichlet NLL too high (poor distributional fit): \
-         {gam_test_nll:.4} (bar -3.0)"
+        gam_test_nll < null_test_nll,
+        "gam's smooth Dirichlet fit predicts the held-out compositions no better than the \
+         train-fitted constant Dirichlet: gam_nll={gam_test_nll:.4} constant_nll={null_test_nll:.4}"
     );
 
-    // ---- BASELINE (match-or-beat): no worse than DirichletReg held-out NLL --
-    // gam's penalized REML fit must be at least as good as the mature unpenalized
-    // DirichletReg ML fit on the same held-out rows, up to a 10% margin. NLL is
-    // negative here, so "no more than 10% worse" means not exceeding
-    // dr_nll + 0.10*|dr_nll|.
-    let dr_bar = dr_test_nll + 0.10 * dr_test_nll.abs();
+    // ---- BASELINE (match-or-beat): held-out composition error ---------------
+    // gam's penalized REML fit must predict the held-out mean compositions at
+    // least as accurately as the mature unpenalized DirichletReg ML fit on the
+    // same rows, up to a 10% margin.
     assert!(
-        gam_test_nll <= dr_bar,
-        "gam held-out Dirichlet NLL worse than DirichletReg baseline: \
-         gam={gam_test_nll:.4} > dr+10%={dr_bar:.4} (dr={dr_test_nll:.4})"
+        gam_comp_rmse <= dr_comp_rmse * 1.10,
+        "gam held-out composition error worse than DirichletReg baseline: \
+         gam={gam_comp_rmse:.4} > 1.10*dr={:.4} (dr={dr_comp_rmse:.4})",
+        dr_comp_rmse * 1.10
     );
+}
+
+/// Closed mean composition `μ_k = α_k / Σ_j α_j` from log-α predictors, as a
+/// softmax shifted by the row maximum so an extreme predictor stays finite
+/// instead of overflowing to `inf/inf`.
+fn closed_means_stable(eta: &[Vec<f64>]) -> Vec<Vec<f64>> {
+    let m = eta[0].len();
+    let mut mu = vec![vec![0.0; m]; K];
+    for i in 0..m {
+        let top = (0..K).map(|k| eta[k][i]).fold(f64::NEG_INFINITY, f64::max);
+        let denom: f64 = (0..K).map(|k| (eta[k][i] - top).exp()).sum();
+        for k in 0..K {
+            mu[k][i] = (eta[k][i] - top).exp() / denom;
+        }
+    }
+    mu
 }
 
 /// Real-data variant of `pspline_parts`: builds the shared `[1 | B_centered]`
