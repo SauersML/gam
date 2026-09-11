@@ -314,7 +314,7 @@ impl JointCoefficientEvidence {
     }
 
     /// Hessian of log coefficient evidence, with its conditional MC error.
-    /// H = E[H_conditional] + Cov(score_conditional). In particular, diagonal
+    /// `H = E[H_conditional] + Cov(score_conditional)`. In particular, diagonal
     /// conditional strength curvature does NOT imply diagonal evidence
     /// curvature. Work/storage are linear in samples times strengths.
     pub fn hessian_product(

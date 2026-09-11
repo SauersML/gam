@@ -1140,7 +1140,7 @@ pub struct EventHistorySpec {
     /// of. `None` centres the latent term on the stationary prior, so
     /// `exp(η⁰)` is the intensity averaged over everybody the cohort started
     /// with; `Some` centres it on the risk set at every age, so `exp(η⁰)` is
-    /// the incidence among those still at risk (see [`super::preserve`]).
+    /// the incidence among those still at risk (see `super::preserve`).
     pub reference: Option<ReferenceStrata>,
     /// Required maximum coarse/fine discrepancy in log reference moments
     /// and log risk masses, evaluated at the same coefficient state.

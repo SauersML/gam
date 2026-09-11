@@ -83,7 +83,7 @@ pub(crate) struct SubjectInputs<'a, S> {
     pub designs: Option<&'a [ArrayView2<'a, f64>]>,
     /// The risk-set normaliser `log M_d(t)` at every node, index
     /// `n * marks + d`. `None` centres on the stationary prior instead, the
-    /// constant `½|a_d|²` (see [`super::preserve`]).
+    /// constant `½|a_d|²` (see `super::preserve`).
     pub log_normaliser: Option<&'a [S]>,
 }
 
@@ -142,7 +142,7 @@ pub(crate) fn marginal_shift<S: JetField>(loadings_d: &[S], like: &S) -> S {
 /// normaliser that makes `exp(η⁰)` the intensity averaged over the declared
 /// population. Without one the population is the stationary prior and the
 /// normaliser is the constant `½|a_d|²`; with one it is the risk set's, and
-/// it is a function of time (see [`super::preserve`]).
+/// it is a function of time (see `super::preserve`).
 pub(crate) fn centred_baseline<S: JetField>(
     eta0: &S,
     loadings_d: &[S],
