@@ -410,6 +410,139 @@ fn a_route_that_declares_no_resolution_is_unchanged_2817() {
     assert!(published.is_none_or(|exit| !exit.converged));
 }
 
+/// The decrement is taken at the resolution its definiteness verdict was taken at.
+///
+/// A Hessian that factors at the arithmetic shift keeps its historical decrement
+/// at any resolution, so a near-flat positive direction still reads as descent. A
+/// negative eigenvalue below the criterion's curvature resolution has no factor at
+/// the arithmetic shift and a decrement at the resolution shift. A resolvable
+/// saddle factors at neither, and a zero resolution is the historical function.
+#[test]
+fn the_decrement_travels_with_the_resolution_its_verdict_was_taken_at_2817() {
+    let resolution = 2.0 * RESOLUTION_2817;
+    let near_flat = array![[1.0, 0.0], [0.0, 1.0e-9]];
+    let flat_residual = array![0.0, 1.0e-5];
+    assert_eq!(
+        crate::rho_optimizer::run::newton_predicted_decrease_at_resolution(
+            &near_flat,
+            &flat_residual,
+            resolution,
+        ),
+        newton_predicted_decrease(&near_flat, &flat_residual),
+        "a Hessian that factors at the arithmetic shift keeps its historical decrement"
+    );
+    let sub_resolution = array![[1.0, 0.0], [0.0, -1.0e-6]];
+    let stiff_residual = array![1.0e-3, 0.0];
+    assert!(
+        newton_predicted_decrease(&sub_resolution, &stiff_residual).is_none(),
+        "the fixture needs the arithmetic shift alone to find no factor"
+    );
+    assert!(
+        crate::rho_optimizer::run::newton_predicted_decrease_at_resolution(
+            &sub_resolution,
+            &stiff_residual,
+            0.0,
+        )
+        .is_none(),
+        "a zero resolution is the historical function"
+    );
+    let at_resolution = crate::rho_optimizer::run::newton_predicted_decrease_at_resolution(
+        &sub_resolution,
+        &stiff_residual,
+        resolution,
+    )
+    .expect("a sub-resolution negative eigenvalue factors at the resolution shift");
+    let expected = 0.5 * 1.0e-6 / (1.0 + resolution);
+    assert!(
+        (at_resolution - expected).abs() <= 1.0e-12 * expected,
+        "the decrement is ½·gᵀ(H + resolution·I)⁻¹g: got {at_resolution:.6e}, expected {expected:.6e}"
+    );
+    let saddle = array![[1.0, 0.0], [0.0, -1.0]];
+    assert!(
+        crate::rho_optimizer::run::newton_predicted_decrease_at_resolution(
+            &saddle,
+            &stiff_residual,
+            resolution,
+        )
+        .is_none(),
+        "a resolvable negative eigenvalue factors at neither shift"
+    );
+}
+
+/// The stop fires where its own verdict accepts (#2817 with #1082).
+///
+/// `λ = −1e-6` is resolvable by the arithmetic shift `√ε = 1.49e-8` but not by the
+/// criterion's curvature resolution `2·FLOOR_2817·(1 + |V|) = 2.002e-4`, so the
+/// bridge judges this reduced Hessian PSD. The residual [`STOP_GRAD_2817`] lies
+/// along the stiff direction, a Newton decrement of `8.45e-5`, inside the
+/// criterion's resolution `1.001e-4`, exactly as in the unit-curvature fixture
+/// above. Before the decrement travelled with the verdict, the shifted Cholesky
+/// found no factor, this exit returned nothing, and the guard kept escaping a
+/// stall its own verdict called stationary.
+#[test]
+fn a_sub_resolution_negative_eigenvalue_does_not_block_the_stationary_stop_2817() {
+    let hessian = array![[1.0, 0.0], [0.0, -1.0e-6]];
+    let gradient = array![STOP_GRAD_2817, 0.0];
+    let (lower, upper) = wide_box_2817(2);
+    assert_eq!(
+        reduced_hessian_psd_at_point(
+            &array![0.5, 0.5],
+            &gradient,
+            &hessian,
+            Some((&lower, &upper)),
+            2.0 * RESOLUTION_2817,
+        ),
+        Some(true),
+        "the fixture needs the negative eigenvalue below the criterion's curvature resolution"
+    );
+    assert!(
+        newton_predicted_decrease(&hessian, &gradient).is_none(),
+        "the fixture needs the arithmetic shift alone to find no factor"
+    );
+    let (outcomes, published) = drive_arc_oracle_2817(
+        array![0.5, 0.5],
+        flatlined_2817(gradient, ARC_COST_STALL_WINDOW + 3),
+        hessian,
+        wide_box_2817(2),
+        Some(FLOOR_2817),
+    );
+    assert_eq!(
+        outcomes.last().expect("ran").clone().err().as_deref(),
+        Some(ARC_CURVATURE_STATIONARY_SENTINEL),
+        "a flatlined stall whose decrement is inside the resolution, under a reduced \
+         Hessian PSD at that resolution, must end the stall: {outcomes:?}"
+    );
+    let published = published.expect("the halt publishes its point");
+    assert!(published.converged);
+}
+
+/// NEGATIVE CONTROL: the same sub-resolution negative eigenvalue, with the
+/// residual lying ALONG it. Its decrement at the resolution shift is
+/// `½·(1.3e-2)²/(2.002e-4 − 1e-6) ≈ 0.42`, four thousand times the criterion's
+/// resolution, so the search keeps moving. Taking the decrement at the larger
+/// shift errs toward continuing, never toward stopping.
+#[test]
+fn a_residual_along_a_sub_resolution_negative_direction_keeps_the_search_moving_2817() {
+    let hessian = array![[1.0, 0.0], [0.0, -1.0e-6]];
+    let gradient = array![0.0, STOP_GRAD_2817];
+    let (outcomes, published) = drive_arc_oracle_2817(
+        array![0.5, 0.5],
+        flatlined_2817(gradient, ARC_COST_STALL_WINDOW + 3),
+        hessian,
+        wide_box_2817(2),
+        Some(FLOOR_2817),
+    );
+    assert!(
+        outcomes.iter().all(|o| o.is_ok()),
+        "a residual whose Newton step along a sub-resolution negative direction buys \
+         thousands of resolutions must keep the search running: {outcomes:?}"
+    );
+    assert!(
+        published.is_none_or(|exit| !exit.converged),
+        "such a stall must never be published as converged"
+    );
+}
+
 // ─── the trajectory census (#2735) ───────────────────────────────────────────
 
 fn step_2817(iter: usize, step_norm: f64, radius: f64, actual: f64) -> StepInfo {

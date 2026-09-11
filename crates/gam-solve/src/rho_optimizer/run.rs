@@ -2894,6 +2894,35 @@ fn expand_confirmed_descent(
 /// resulting quadratic form is negative (which a PD factor rules out; retained
 /// as a roundoff guard).
 pub(crate) fn newton_predicted_decrease(hessian: &Array2<f64>, grad: &Array1<f64>) -> Option<f64> {
+    newton_predicted_decrease_at_resolution(hessian, grad, 0.0)
+}
+
+/// [`newton_predicted_decrease`] for a caller whose definiteness verdict was
+/// taken at a MEASURED curvature resolution (#2817, #1082).
+///
+/// The decrement is taken at the arithmetic shift wherever
+/// `H + √ε·max(max|H_jj|, 1)·I` factors, exactly as before. Only when it does not
+/// — a negative eigenvalue below that shift — is it taken at
+/// [`certificate_curvature_shift`]`(H, measured_resolution)`, the shift at which
+/// [`certificate_hessian_is_psd_at_resolution`] judged the matrix. The verdict and
+/// the operator its decrement is computed on have to be the same one. A caller
+/// that has declared the point PSD at the criterion's resolution, and then asks
+/// for the decrement on a matrix that cannot be factored at the far smaller
+/// arithmetic shift, gets `None` and can never stop at a point its own verdict
+/// accepts.
+///
+/// The arithmetic shift is tried first, not the resolution, because a larger
+/// shift shrinks every positive direction's share `g_i²/(λ_i + shift)`: a residual
+/// along a near-flat POSITIVE direction is real descent, and taking it at the
+/// resolution shift would read it as none. The larger shift can only overstate
+/// descent along a negative direction close to `−shift`, which errs toward
+/// continuing the search. A zero resolution is [`newton_predicted_decrease`] bit
+/// for bit.
+pub(crate) fn newton_predicted_decrease_at_resolution(
+    hessian: &Array2<f64>,
+    grad: &Array1<f64>,
+    measured_resolution: f64,
+) -> Option<f64> {
     let n = hessian.nrows();
     if n == 0 || hessian.ncols() != n || grad.len() != n {
         return None;
@@ -2901,8 +2930,27 @@ pub(crate) fn newton_predicted_decrease(hessian: &Array2<f64>, grad: &Array1<f64
     if hessian.iter().any(|v| !v.is_finite()) || grad.iter().any(|v| !v.is_finite()) {
         return None;
     }
-    let max_diag = (0..n).fold(0.0_f64, |acc, j| acc.max(hessian[[j, j]].abs()));
-    let shift = f64::EPSILON.sqrt() * max_diag.max(1.0);
+    let arithmetic_shift = certificate_curvature_shift(hessian, 0.0);
+    if let Some(decrease) = shifted_newton_predicted_decrease(hessian, grad, arithmetic_shift) {
+        return Some(decrease);
+    }
+    let resolution_shift = certificate_curvature_shift(hessian, measured_resolution);
+    if resolution_shift > arithmetic_shift {
+        shifted_newton_predicted_decrease(hessian, grad, resolution_shift)
+    } else {
+        None
+    }
+}
+
+/// `½·gᵀ(H + shift·I)⁻¹g` through a lower Cholesky factor, or `None` when the
+/// shifted matrix is not positive definite. Shapes and finiteness are checked by
+/// [`newton_predicted_decrease_at_resolution`].
+fn shifted_newton_predicted_decrease(
+    hessian: &Array2<f64>,
+    grad: &Array1<f64>,
+    shift: f64,
+) -> Option<f64> {
+    let n = hessian.nrows();
     // Lower Cholesky factor L of H + shift·I (same regularization the PSD probe
     // uses), computed in place.
     let mut l = hessian.clone();
@@ -4571,7 +4619,16 @@ fn certify_outer_optimality_at_terminal_fidelity(
     if let Some(hessian) = analytic_hessian
         .as_ref()
         .or(screening_bound_curvature.as_ref())
-        && let Some(predicted_decrease) = newton_predicted_decrease(hessian, &projected_gradient)
+        // At the criterion's curvature resolution, the same standard the ARC
+        // bridge's in-loop stop takes its decrement at (#2817). A negative
+        // eigenvalue below that resolution is withdrawn by the adjudication, not
+        // refused; before the decrement travelled with it, this rung found no
+        // factor there and certified strictly less than the loop had stopped on.
+        && let Some(predicted_decrease) = newton_predicted_decrease_at_resolution(
+            hessian,
+            &projected_gradient,
+            criterion_curvature_resolution(outer_rel_cost_floor(config), evaluation.cost),
+        )
         && predicted_decrease.is_finite()
         && predicted_decrease > 0.0
     {
@@ -8891,6 +8948,25 @@ pub(crate) fn outer_rel_cost_floor(config: &OuterConfig) -> f64 {
         .rel_cost_tolerance
         .unwrap_or(config.tolerance * 1.0e-2)
         .max(COST_STALL_REL_TOL_FLOOR)
+}
+
+/// The criterion's curvature resolution at a point of cost `cost`:
+/// `2·rel_cost_floor·(1 + |V|)` (#1082, #2817).
+///
+/// Along an eigenvector of `λ < 0` at a stationary point the quadratic model
+/// predicts the decrease `½|λ|α²`. The largest step the negative-curvature
+/// adjudication takes is one e-fold of `log λ` (`α = 1`), so a direction with
+/// `½|λ| ≤ rel_cost_floor·(1 + |V|)` predicts nothing the criterion can represent
+/// anywhere in the range that could falsify it. The bridge's definiteness
+/// verdict, the seed's verdict, and the decrement that both the in-loop stop and
+/// the certificate's curvature rung take all read this one number. `0.0` (the
+/// arithmetic shift alone) when the floor is unusable or the cost is not finite.
+pub(crate) fn criterion_curvature_resolution(rel_cost_floor: f64, cost: f64) -> f64 {
+    if rel_cost_floor.is_finite() && rel_cost_floor > 0.0 && cost.is_finite() {
+        2.0 * rel_cost_floor * (1.0 + cost.abs())
+    } else {
+        0.0
+    }
 }
 
 /// Whether a certify-last checkpoint reseed (#2273/#2374) exploited real descent.

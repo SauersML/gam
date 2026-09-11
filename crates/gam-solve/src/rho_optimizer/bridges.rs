@@ -2832,9 +2832,11 @@ impl OuterSecondOrderBridge<'_> {
     ///   still has a descent direction, fails it outright;
     /// * the Newton decrement `½·gᵀH⁻¹g` of the rail-projected gradient must be
     ///   finite and no larger than `floor·(1 + |V|)`. This calls
-    ///   [`newton_predicted_decrease`], the same function the certificate's rung
-    ///   calls, against the same tolerance, anchored at this point's own cost
-    ///   exactly as the certificate anchors it at the certified point's;
+    ///   `run::newton_predicted_decrease_at_resolution` at
+    ///   `run::criterion_curvature_resolution`, the same function at the same
+    ///   resolution the certificate's rung uses, against the same tolerance,
+    ///   anchored at this point's own cost exactly as the certificate anchors it
+    ///   at the certified point's;
     /// * the point must be the best feasible iterate the trajectory has
     ///   produced, so a trial step ARC was about to reject cannot end the run.
     ///
@@ -2859,7 +2861,16 @@ impl OuterSecondOrderBridge<'_> {
         let hessian = hessian?;
         let rail_bounds = self.cost_stall_bounds.as_ref().map(rail_relaxed_bounds);
         let projected = project_gradient_vector(x, gradient, rail_bounds.as_ref());
-        let decrement = super::run::newton_predicted_decrease(hessian, &projected)?;
+        // The decrement travels with the verdict (#2817, #1082). `hessian_psd` was
+        // judged at the criterion's curvature resolution, so a negative eigenvalue
+        // below that resolution is PSD by this point's own standard; taking the
+        // decrement at the arithmetic shift alone would find no factor, and this
+        // exit could never fire at a point its verdict already accepts.
+        let decrement = super::run::newton_predicted_decrease_at_resolution(
+            hessian,
+            &projected,
+            super::run::criterion_curvature_resolution(floor, cost),
+        )?;
         let tolerance = floor * (1.0 + cost.abs());
         if !decrement.is_finite() || decrement > tolerance {
             return None;
@@ -3041,17 +3052,15 @@ impl SecondOrderObjective for OuterSecondOrderBridge<'_> {
         // curvature the certificate would reject.
         let rail_bounds = self.cost_stall_bounds.as_ref().map(rail_relaxed_bounds);
         // #1082: judge definiteness at the criterion's curvature resolution
-        // `2·floor·(1 + |V|)` — the standard the terminal adjudication already
-        // applies — so negative curvature that no step in the adjudication's
-        // range can turn into a resolvable decrease stops reading as a strict
-        // saddle that the cost-stall guard must keep escaping from. No floor
-        // configured (or a non-finite cost) keeps the arithmetic shift alone.
-        let curvature_resolution = match self.curvature_stationary_floor {
-            Some(floor) if floor.is_finite() && floor > 0.0 && eval.cost.is_finite() => {
-                2.0 * floor * (1.0 + eval.cost.abs())
-            }
-            _ => 0.0,
-        };
+        // (`run::criterion_curvature_resolution`) — the standard the terminal
+        // adjudication already applies — so negative curvature that no step in
+        // the adjudication's range can turn into a resolvable decrease stops
+        // reading as a strict saddle that the cost-stall guard must keep escaping
+        // from. No floor configured (or a non-finite cost) keeps the arithmetic
+        // shift alone.
+        let curvature_resolution = self
+            .curvature_stationary_floor
+            .map_or(0.0, |floor| super::run::criterion_curvature_resolution(floor, eval.cost));
         let hessian_psd = hessian.as_ref().and_then(|dense| {
             reduced_hessian_psd_at_point(
                 x,
