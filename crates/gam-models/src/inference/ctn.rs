@@ -215,6 +215,8 @@ pub fn fit_chain(formula: String, dataset: &EncodedDataset, config: &FitConfig) 
         let stage = FitConfig { transformation_normal: true,
             transformation_normal_config: Some(recipe.config.clone()),
             weight_column: recipe.weight_column.clone(), offset_column: recipe.offset_column.clone(),
+            scale_dimensions: config.scale_dimensions,
+            spatial_optimization: config.spatial_optimization.clone(),
             persistent_warm_start_store: config.persistent_warm_start_store.clone(),
             ..FitConfig::default() };
         let stage_formula = format!("{} ~ {}", recipe.response_column, recipe.covariate_formula_rhs);

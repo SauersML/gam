@@ -276,7 +276,7 @@ class Model:
         ``linear_predictor`` / ``mean`` pair (#2785).
         """
         required = rust_module().required_model_columns(self._model_bytes, False)
-        if id_column is not None:
+        if required is not None and id_column is not None:
             required = sorted(set(required) | {id_column})
         headers, rows, table_kind = normalize_table(data, required_columns=required)
         row_ids = extract_row_ids(headers, rows, id_column)
@@ -363,8 +363,9 @@ class Model:
     ) -> Any:
         """Evaluate ``Phi^-1(F_hat(y|x))`` on labelled rows.
 
-        This method is defined only for conditional transformation-normal
-        models and requires both the fitted covariates and the observed
+        This method is defined for conditional transformation-normal models
+        and outcome models containing a saved CTN. It requires the CTN's
+        fitted covariates and the observed
         response column.  It is intentionally distinct from :meth:`predict`,
         whose CTM point estimate is the response-scale conditional mean
         ``E[Y|x]`` and therefore does not consume an observed response.

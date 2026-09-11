@@ -2016,8 +2016,13 @@ fn ctn_required_fit_columns(formula: String, config_json: String) -> PyResult<Ve
 }
 
 #[pyfunction]
-fn required_model_columns(model_bytes: Vec<u8>, observed_score: bool) -> PyResult<Vec<String>> {
+fn required_model_columns(model_bytes: Vec<u8>, observed_score: bool) -> PyResult<Option<Vec<String>>> {
     let mut model = load_model_impl(&model_bytes).map_err(|error| py_value_error(error.to_string()))?;
+    // Outcome models without an embedded CTN retain their existing table
+    // ingestion contract, including intercept-only row-count inputs.
+    if !observed_score && model.score_transform.is_none() {
+        return Ok(None);
+    }
     if observed_score {
         if let Some(transform) = model.score_transform.as_ref() {
             model = FittedModel::from_payload((**transform).clone());
@@ -2029,7 +2034,7 @@ fn required_model_columns(model_bytes: Vec<u8>, observed_score: bool) -> PyResul
             .ok_or_else(|| py_value_error("CTN requires a named observed response"))?;
         columns.insert(response);
     }
-    Ok(columns.into_iter().collect())
+    Ok(Some(columns.into_iter().collect()))
 }
 
 fn transformation_score_encoded_table_impl(

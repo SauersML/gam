@@ -726,7 +726,7 @@ def fit(
     weights: str | None = ...,
     persistent_warm_start_root: str | Path | None = ...,
     transformation_normal: bool | None = ...,
-    transformation_normal_stage1: CtnStage1 | Mapping[str, Any] | None = ...,
+    transformation_normal_stage1: Model | CtnStage1 | Mapping[str, Any] | None = ...,
     survival_likelihood: str | None = ...,
     survival_time_anchor: float | None = ...,
     baseline_target: str | None = ...,
@@ -771,7 +771,7 @@ def fit(
     weights: str | None = ...,
     persistent_warm_start_root: str | Path | None = ...,
     transformation_normal: bool | None = ...,
-    transformation_normal_stage1: CtnStage1 | Mapping[str, Any] | None = ...,
+    transformation_normal_stage1: Model | CtnStage1 | Mapping[str, Any] | None = ...,
     survival_likelihood: str | None = ...,
     survival_time_anchor: float | None = ...,
     baseline_target: str | None = ...,
@@ -815,7 +815,7 @@ def fit(
     weights: str | None = None,
     persistent_warm_start_root: str | Path | None = None,
     transformation_normal: bool | None = None,
-    transformation_normal_stage1: CtnStage1 | Mapping[str, Any] | None = None,
+    transformation_normal_stage1: Model | CtnStage1 | Mapping[str, Any] | None = None,
     survival_likelihood: str | None = None,
     survival_time_anchor: float | None = None,
     baseline_target: str | None = None,
@@ -900,7 +900,8 @@ def fit(
         Fit a conditional transformation-normal model (``h(Y|x) ~ N(0,1))``).
         Corresponds to ``--transformation-normal``.
     transformation_normal_stage1:
-        CTN recipe with explicit fold or group columns. Returns a
+        CTN recipe with explicit fold or group columns, or an already fitted
+        standalone CTN :class:`Model` to freeze without refitting. Returns a
         native :class:`Model` containing a full-training CTN and an
         ordinary marginal-slope outcome fitted on OOF transformed scores.
         Prediction replays the saved CTN on the raw score. No influence
@@ -1193,7 +1194,9 @@ def fit(
 
     required_columns = None
     if (transformation_normal_stage1 is not None or transformation_normal
-            or (config and ("ctn_stage1" in config or "frozen_ctn" in config))):
+            or family == "transformation-normal"
+            or (config and ("ctn_stage1" in config or "frozen_ctn" in config
+                            or config.get("transformation_normal")))):
         schema_config = {**(config or {}), "family": family, "slope_formula": slope_formula,
                          "noise_formula": noise_formula, "weights": weights, "offset": offset,
                          "noise_offset": noise_offset, "survival_likelihood": survival_likelihood}
@@ -1319,7 +1322,7 @@ def fit_array(
     weights: str | None = None,
     persistent_warm_start_root: str | Path | None = None,
     transformation_normal: bool | None = None,
-    transformation_normal_stage1: CtnStage1 | Mapping[str, Any] | None = None,
+    transformation_normal_stage1: Model | CtnStage1 | Mapping[str, Any] | None = None,
     survival_likelihood: str | None = None,
     survival_time_anchor: float | None = None,
     baseline_target: str | None = None,
@@ -1633,7 +1636,7 @@ def validate_formula(
     weights: str | None = None,
     persistent_warm_start_root: str | Path | None = None,
     transformation_normal: bool | None = None,
-    transformation_normal_stage1: CtnStage1 | Mapping[str, Any] | None = None,
+    transformation_normal_stage1: Model | CtnStage1 | Mapping[str, Any] | None = None,
     survival_likelihood: str | None = None,
     survival_time_anchor: float | None = None,
     baseline_target: str | None = None,
