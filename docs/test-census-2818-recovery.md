@@ -501,3 +501,46 @@ co-collapse #2027/#2132/#2082 checks, and nine outer-curvature invariance
 `test-census-2818-inventory.json`. A nearby test or closed issue is insufficient
 to retire any of them: each requires a comparison of the exercised current
 criterion, derivative, or acceptance decision and an executed replacement.
+
+## Closed-issue pins rebuilt on live APIs: #1463, #2561, #2598, #2548, #1017, #2676
+
+Landed in `5e1759ec9`. Ten historical identities deleted by `c0a21b554` are restored
+under their original names. The production contract behind each pin survived the
+sweep; what `d484a091a` removed was the convenience surface the pins called. Every
+fixture is built inside its test, and no deleted helper is restored. Two of the
+restored identities are among the nine #2676/#2748 outer-curvature invariance checks
+listed above.
+
+| Historical test identity | Live entry point and executed contract |
+| --- | --- |
+| `nb_dispersion_is_fitted_theta_hat_not_seed_1463` | `family_noise_parameter` with a struct-literal NB spec (`negative_binomial_log` was removed): estimated metadata yields the fitted theta, not the seed or the residual scale. |
+| `nb_dispersion_honors_user_fixed_theta_1463` | The same picker on a held-fixed spec returns the user theta verbatim and refuses estimated-theta metadata as inconsistent. |
+| `nb_dispersion_refuses_unfitted_scale_metadata_1463` | `Unspecified` scale metadata refuses with an unresolved-dispersion error. |
+| `curvature_evidence_serializes_as_the_legacy_optional_bool_2561` | `CurvatureEvidence`, and the certificate that publishes it under `hessian_psd`, serialize as null, true or false; every unmeasured state, including the later `CriterionContradicted`, reloads as `NotAvailable`. |
+| `an_unmeasured_curvature_is_not_the_same_answer_as_an_admissible_one_2561` | `OuterCriterionCertificate::curvature_verdict` reports unmeasured evidence as `Unevaluated`, never `Admissible`, and does not refuse it. `was_measured` was removed; `psd()` carries the check. |
+| `non_pd_schur_predicate_preserves_the_two_substring_conjunct_2598` | The value verdicts of `ArrowSchurError::is_non_pd_schur_complement` for all six variants. The surviving rendered-reader test pins the reader to the predicate, so it cannot see both drift together. |
+| `shared_block_diagonal_survives_dense_workspace_reclamation_2548` | `shared_block_diagonal` follows the installed operator on an empty-`hbb` system built with `new_with_per_row_dims_empty_hbb_and_htbeta_cols`. |
+| `build_dense_schur_direct_refuses_oversize_border_1017` | Both dense Schur builders refuse an 11.9 GiB border against the fixed 8 GiB budget before any allocation. |
+| `proportional_penalties_yield_the_exact_lambda_null_direction_2676` | `PenaltyMapInvariance` certifies one invariance along `(c, 0, -1)`, read through `theta_directions` at unit lambdas (`lambda_basis` was removed). |
+| `a_three_term_redundancy_no_pair_can_see_is_certified_2676` | A pairwise-invisible `A_2 = A_0 + A_1` certifies one invariance along `(1, 1, -1)/sqrt(3)`. |
+
+All ten historical bodies are byte-identical at `d484a091a^` and `c0a21b554^`. On MSI
+lane sw1, tree `40258a5e8` plus the ten pins, job 384866: `cargo test -p gam-solve --lib`
+with the seven gam-solve filters gave **7 passed, 0 failed, 1708 filtered out**;
+`cargo test -p gam --test glm owed_1463` gave **4 passed, 0 failed, 60 filtered out**,
+the three restored pins beside the one that survived; `cargo check --workspace --exclude
+gam-pyffi --all-targets` finished clean and the ban scanner passed. Log:
+`/scratch.global/sauer354/sw1-logs/verify.384866.log`.
+
+Mutation controls in job 387027 reproduce each named defect and revert it before
+the next step. Forcing the NB picker back to the construction seed turns
+`nb_dispersion_honors_user_fixed_theta_1463` and
+`nb_dispersion_is_fitted_theta_hat_not_seed_1463` red (2 passed, 2 failed). Deleting
+the `CurvatureEvidence` serde attribute, and letting `is_non_pd_schur_complement` and
+its rendered reader drift together to a bare `"not positive definite"` match, turns
+`curvature_evidence_serializes_as_the_legacy_optional_bool_2561` and
+`non_pd_schur_predicate_preserves_the_two_substring_conjunct_2598` red (2 passed,
+2 failed). Under that joint drift the surviving
+`rendered_verdict_matches_the_value_verdict_for_every_variant_2598` stays green, which
+is why the value-verdict pin had to come back. Log:
+`/scratch.global/sauer354/sw1-logs/mutate.387027.log`.
