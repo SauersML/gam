@@ -1,0 +1,63 @@
+name: Source change report
+
+# Read-only inventory for reviewing intentional API/test retirements. This
+# produces evidence, never edits a ledger or substitutes for the integrity gate.
+on:
+  workflow_dispatch:
+    inputs:
+      base_sha:
+        description: "Exact pre-change commit"
+        required: true
+      source_sha:
+        description: "Exact candidate commit"
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  report:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.source_sha }}
+          fetch-depth: 1
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Measure source changes without changing the acceptance ledger
+        env:
+          BASE_SHA: ${{ inputs.base_sha }}
+          SOURCE_SHA: ${{ inputs.source_sha }}
+        run: |
+          set -euo pipefail
+          [[ "$BASE_SHA" =~ ^[0-9a-f]{40}$ && "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          git fetch --no-tags --depth=1 origin "$BASE_SHA"
+          python - <<'PY'
+          import json, os, sys
+          from pathlib import Path
+          sys.path.insert(0, 'scripts')
+          import test_census as tests
+          import public_api_census as api
+          import source_removal_guard as source
+          root = Path.cwd()
+          base, head = os.environ['BASE_SHA'], os.environ['SOURCE_SHA']
+          before, after = tests.census(root, base, {}), tests.census(root, head, {})
+          old, new, words = source.changed_inventory(root, base, head)
+          result = {
+              'base': base, 'head': head,
+              'tests': tests.difference(before, after),
+              'before_floor': tests.floor_from(before),
+              'after_floor': tests.floor_from(after),
+              'source': source.removals(old, new, words),
+              'public_api': api.difference(api.census(root, base, {}), api.census(root, head, {})),
+          }
+          Path('source-change-report.json').write_text(json.dumps(result, indent=2) + '\n')
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: source-change-report
+          path: source-change-report.json
+          retention-days: 7
