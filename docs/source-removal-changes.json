@@ -537,10 +537,10 @@
     "evidence": "test.yml run 34624047829 at 994668d56: both removed tests failed with InvalidConfig \"Tweedie family requires an explicit variance power ...\". MSI lane v7 at 5ac3be42c with the restated file overlaid: cargo test -p gam --all-features --test glm -- families::issue_2026_tweedie_estimated_power: 2 passed, 0 failed. The #2818 source-removal guard run 34643272847 named exactly these four identities; the unit test count of tests/glm is unchanged (two tests out, two in, no pinned names)."
   },
   {
-    "reason" : "Historical acknowledgement for cb8dd972c, which committed the #2829 restoration from a shared index. #2829 applies docs/rust-library-surface.md's rule to the declarations d484a091a removed: a surviving exported type whose only producer was removed is either given its producer back or deleted. These carriers are deleted instead of restored: - crates/gam-sae/src/manifold/cofit_arrow.rs and crates/gam-sae/src/sparse_dict/cofit.rs kept only ArrowCofitConfig, ArrowCofitReport, CofitConfig, CofitRound and CofitReport (with two Default impls). Their bridges are retired: Tier2SupportFit documents itself as the replacement dense co-fit report, and tiered::fit_tiered carries the contracts. The budget refusal is pinned by insufficient_inner_budget_returns_error_instead_of_a_tiered_report_2023. - crates/gam-models/src/bms/gpu/device_pcg.rs held only DeviceResidentPcgInput and DeviceResidentPcgOutput, whose producer run_pcg_against_row_hessian_device was removed. - crates/gam-models/src/bms/alo_replay.rs: BernoulliMarginalSlopeAloRowInput and BernoulliMarginalSlopeAloRowGeometry had no producer or consumer after bernoulli_marginal_slope_alo_row_geometry was removed. gam-b6 agreed. - crates/gam-sae/src/gpu_kernels/resident_arrow.rs: ArrowBlocks (with an empty impl) and ArrowDirection had no producer or consumer. sae-perf agreed. - crates/gam-sae/src/structure_harvest.rs: GraphBirthCandidate lost its producer graph_birth_candidate_for_structure_search. sae-arch and sae-red agreed.",
-    "base" : "4891f95811ac9fab5deb2e8846fb6a1ea0a38b6a",
-    "evidence" : "- git grep -w at the landing base finds each identity only at its own definition, plus the re-export lines removed in the same commit. - The compile gate `cargo check --locked --workspace --all-targets` on MSI lane p2829 (tags b17 and g2) covers the landed tree. - docs/public-api-2829-disposition.tsv records every d484a091a identity's disposition.",
-    "items" : [
+    "reason": "Historical acknowledgement for cb8dd972c, which committed the #2829 restoration from a shared index. #2829 applies docs/rust-library-surface.md's rule to the declarations d484a091a removed: a surviving exported type whose only producer was removed is either given its producer back or deleted. These carriers are deleted instead of restored: - crates/gam-sae/src/manifold/cofit_arrow.rs and crates/gam-sae/src/sparse_dict/cofit.rs kept only ArrowCofitConfig, ArrowCofitReport, CofitConfig, CofitRound and CofitReport (with two Default impls). Their bridges are retired: Tier2SupportFit documents itself as the replacement dense co-fit report, and tiered::fit_tiered carries the contracts. The budget refusal is pinned by insufficient_inner_budget_returns_error_instead_of_a_tiered_report_2023. - crates/gam-models/src/bms/gpu/device_pcg.rs held only DeviceResidentPcgInput and DeviceResidentPcgOutput, whose producer run_pcg_against_row_hessian_device was removed. - crates/gam-models/src/bms/alo_replay.rs: BernoulliMarginalSlopeAloRowInput and BernoulliMarginalSlopeAloRowGeometry had no producer or consumer after bernoulli_marginal_slope_alo_row_geometry was removed. gam-b6 agreed. - crates/gam-sae/src/gpu_kernels/resident_arrow.rs: ArrowBlocks (with an empty impl) and ArrowDirection had no producer or consumer. sae-perf agreed. - crates/gam-sae/src/structure_harvest.rs: GraphBirthCandidate lost its producer graph_birth_candidate_for_structure_search. sae-arch and sae-red agreed.",
+    "base": "4891f95811ac9fab5deb2e8846fb6a1ea0a38b6a",
+    "evidence": "- git grep -w at the landing base finds each identity only at its own definition, plus the re-export lines removed in the same commit. - The compile gate `cargo check --locked --workspace --all-targets` on MSI lane p2829 (tags b17 and g2) covers the landed tree. - docs/public-api-2829-disposition.tsv records every d484a091a identity's disposition.",
+    "items": [
       "crates/gam-models/src/bms/alo_replay.rs:struct:BernoulliMarginalSlopeAloRowGeometry",
       "crates/gam-models/src/bms/alo_replay.rs:struct:BernoulliMarginalSlopeAloRowInput",
       "crates/gam-models/src/bms/gpu/device_pcg.rs:struct:DeviceResidentPcgInput",
@@ -556,5 +556,103 @@
       "crates/gam-sae/src/sparse_dict/cofit.rs:struct:CofitRound",
       "crates/gam-sae/src/structure_harvest.rs:struct:GraphBirthCandidate"
     ]
+  },
+  {
+    "base": "f39c03009b00b8589dda8c7cf7186014d802fa79",
+    "items": [
+      "crates/gam-solve/src/reml/gradient_hessian.rs:fn:hypergradient_adaptive_kkt_override",
+      "crates/gam-solve/src/reml/gradient_hessian.rs:fn:reset_hypergradient_budget_controller",
+      "crates/gam-solve/src/reml/gradient_hessian.rs:fn:reset_hypergradient_trace_telemetry",
+      "crates/gam-solve/src/reml/gradient_hessian.rs:fn:update_hypergradient_budget_after_outer_eval",
+      "crates/gam-solve/src/reml/state_caches.rs:const:HGB_HISTORY_CAP",
+      "crates/gam-solve/src/reml/state_caches.rs:const:HGB_INNER_FLOOR",
+      "crates/gam-solve/src/reml/state_caches.rs:const:HGB_LINEAR_FLOOR",
+      "crates/gam-solve/src/reml/state_caches.rs:const:HGB_MIN_PAIRS_FOR_SENSITIVITY",
+      "crates/gam-solve/src/reml/state_caches.rs:const:HGB_REGRESSION_RIDGE",
+      "crates/gam-solve/src/reml/state_caches.rs:const:HGB_SECANT_DRHO_MAX_SQUARED",
+      "crates/gam-solve/src/reml/state_caches.rs:const:HGB_SENS_FLOOR",
+      "crates/gam-solve/src/reml/state_caches.rs:const:HGB_SENS_STABILITY_RATIO",
+      "crates/gam-solve/src/reml/state_caches.rs:const:HGB_TARGET_FRACTION",
+      "crates/gam-solve/src/reml/state_caches.rs:const:HGB_TRACE_FLOOR",
+      "crates/gam-solve/src/reml/state_caches.rs:const:HGB_WARMUP_ITERS_MAX",
+      "crates/gam-solve/src/reml/state_caches.rs:const:HGB_WARMUP_ITERS_MIN",
+      "crates/gam-solve/src/reml/state_caches.rs:const:S_INNER_INIT",
+      "crates/gam-solve/src/reml/state_caches.rs:const:S_LINEAR_INIT",
+      "crates/gam-solve/src/reml/state_caches.rs:const:S_TRACE_INIT",
+      "crates/gam-solve/src/reml/state_caches.rs:fn:allocate_with_sensitivities",
+      "crates/gam-solve/src/reml/state_caches.rs:fn:estimate_energy_sensitivity",
+      "crates/gam-solve/src/reml/state_caches.rs:fn:estimate_trace_sensitivity",
+      "crates/gam-solve/src/reml/state_caches.rs:fn:l2_norm",
+      "crates/gam-solve/src/reml/state_caches.rs:fn:mean_positive",
+      "crates/gam-solve/src/reml/state_caches.rs:fn:previous_gradient_norm",
+      "crates/gam-solve/src/reml/state_caches.rs:fn:push",
+      "crates/gam-solve/src/reml/state_caches.rs:fn:reestimate_sensitivities",
+      "crates/gam-solve/src/reml/state_caches.rs:fn:secant_gradient_pairs",
+      "crates/gam-solve/src/reml/state_caches.rs:fn:sensitivities_stable",
+      "crates/gam-solve/src/reml/state_caches.rs:struct:HyperGradHistoryEntry",
+      "crates/gam-solve/src/reml/state_caches.rs:struct:HyperGradientBudget"
+    ],
+    "reason": "Historical acknowledgement for d24ac727b (#2469): the hyper-gradient budget controller was deleted whole. HyperGradientBudget, its HyperGradHistoryEntry history, the secant sensitivity estimators and helpers (allocate_with_sensitivities, estimate_energy_sensitivity, estimate_trace_sensitivity, reestimate_sensitivities, secant_gradient_pairs, sensitivities_stable, previous_gradient_norm, push, l2_norm, mean_positive) and the hand-picked HGB_* and S_*_INIT constants tuned inner, linear-solve and trace tolerances from a chosen target fraction, ridge, warm-up window and stability ratio. The gradient_hessian.rs entry points that fed and read it (reset_hypergradient_trace_telemetry, hypergradient_adaptive_kkt_override, update_hypergradient_budget_after_outer_eval) went with it; reset_hypergradient_budget_controller is now reset_hypergradient_runtime. The inner solve keeps its own tolerance schedule and the stochastic trace keeps the configured CG tolerance, so nothing replaces the controller.",
+    "evidence": "Test source integrity run 34645675627 at d24ac727b named exactly these 31 identities. MSI lane c9, waves 1-5 applied cumulatively on 5ac3be42c: cargo check --workspace --all-targets after each wave, 0 errors and 0 warnings (root ban scanner included), so no caller of a removed item remains. gam-solve --lib -- reml pirls loop_guard stochastic_trace dispersion over the stack: 588 passed, 2 failed, the same two gaussian_reml::perfect_fit_refusal_tests names that fail on the unpatched base."
+  },
+  {
+    "base": "d24ac727ba8e7c6ac642ec236c4008f46f8525b8",
+    "items": [
+      "crates/gam-custom-family/src/inner_blockwise_fit/exact_joint_fit.rs:const:JOINT_LOG_VERBOSE_PERIOD",
+      "crates/gam-identifiability/src/audit.rs:const:AUDIT_PROGRESS_TICKER_WORK_THRESHOLD",
+      "crates/gam-models/src/survival/location_scale/time_block.rs:const:DIAGNOSTIC_COLUMN_PREVIEW",
+      "crates/gam-models/src/survival/location_scale/time_block.rs:const:SUBTOL_NONZERO_FLOOR",
+      "crates/gam-problem/src/diagnostics.rs:const:MIN_EIG_DIAG_EVERY",
+      "crates/gam-problem/src/diagnostics.rs:const:MIN_EIG_DIAG_THRESHOLD",
+      "crates/gam-problem/src/diagnostics.rs:static:H_MIN_EIG_LOG_COUNT",
+      "crates/gam-solve/src/reml/objective.rs:const:MIN_ACCEPTABLE_HESSIAN_EIGENVALUE"
+    ],
+    "reason": "Historical acknowledgement for 3d5da890a (#2469): diagnostics gated on chosen magnitudes and counts. The joint-fit log period is replaced by logging the first and last cycle; the audit progress ticker is always attached instead of above a work threshold; the minimum-eigenvalue diagnostic logs when the decade bucket changes instead of every N calls above a threshold (the call-count static is gone); the acceptable-Hessian eigenvalue is the eigensolver's band p*eps*max|lambda|; the time-block sub-tolerance report counts exact nonzeros and lists every column carrying them instead of a floor and a preview length.",
+    "evidence": "Test source integrity run 34645751072 at 3d5da890a named exactly these 8 identities. MSI lane c9, waves 1-5 applied cumulatively on 5ac3be42c: cargo check --workspace --all-targets after each wave, 0 errors and 0 warnings (root ban scanner included), so no caller of a removed item remains. gam-problem --lib -- diagnostics: 10 passed, 0 failed."
+  },
+  {
+    "base": "f281d209c94084bed73e4113a0274d38c203bd5d",
+    "items": [
+      "crates/gam-linalg/src/pcg.rs:const:PCG_PRECONDITIONER_FLOOR",
+      "crates/gam-linalg/src/pcg.rs:const:PCG_REL_TOL_FLOOR",
+      "crates/gam-linalg/src/triangular.rs:const:RANK_DEFICIENT_PIVOT_FLOOR",
+      "crates/gam-models/src/fit_orchestration/materialize/marginal_slope.rs:const:MARGINAL_SLOPE_Z_WEIGHTED_SD_FLOOR"
+    ],
+    "reason": "Historical acknowledgement for 05acea5a5 (#2469): the PCG relative-tolerance floor is the residual's attainable band gamma_rows, the preconditioner floor is replaced by refusing a non-finite reciprocal as BadPreconditioner, the guarded back-substitution pivot floor is the factorization band p*eps*max|L_jj|, and the marginal-slope z spread floor is the weighted mean's band gamma_n*max|z|.",
+    "evidence": "Test source integrity run 34645891481 at 05acea5a5 named exactly these 4 identities. MSI lane c9, waves 1-5 applied cumulatively on 5ac3be42c: cargo check --workspace --all-targets after each wave, 0 errors and 0 warnings (root ban scanner included), so no caller of a removed item remains. gam-linalg --lib -- pcg triangular: 28 passed, 0 failed."
+  },
+  {
+    "base": "05acea5a5c5bcd20b34be6a16a0209298bce63ba",
+    "items": [
+      "crates/gam-solve/src/pirls/dispersion.rs:const:GAMMA_SHAPE_MAX",
+      "crates/gam-solve/src/pirls/dispersion.rs:const:GAMMA_SHAPE_MIN",
+      "crates/gam-solve/src/pirls/dispersion.rs:const:GAMMA_SHAPE_TARGET_TOL"
+    ],
+    "reason": "Historical acknowledgement for d2708daab (#2469): the Gamma shape MLE was bisected on a hand box [1e-8, 1e12] to a 1e-12 relative tolerance. ln(alpha) - psi(alpha) = target has exactly one root for a positive dispersion statistic, so it is bracketed by halving and doubling outward from the closed-form approximation and bisected until no representable midpoint remains; a statistic inside its own rounding band, a score inside its rounding band at the bracket, or a bracket leaving the representable range refuses.",
+    "evidence": "Test source integrity run 34646034274 at d2708daab named exactly these 3 identities. MSI lane c9, waves 1-5 applied cumulatively on 5ac3be42c: cargo check --workspace --all-targets after each wave, 0 errors and 0 warnings (root ban scanner included), so no caller of a removed item remains. cargo test --test glm over the stack: 50 passed, 11 failed, the identical failing names to the unpatched base."
+  },
+  {
+    "base": "d2708daabea30f322af147c61d371c2df9fee680",
+    "items": [
+      "crates/gam-solve/src/pirls/damping.rs:const:D2_EPS",
+      "crates/gam-solve/src/pirls/damping.rs:const:D2_MAX",
+      "crates/gam-solve/src/pirls/damping.rs:const:D2_MIN",
+      "crates/gam-solve/src/reml/gradient_hessian.rs:const:DEFAULT_LAMBDA_CEILING",
+      "crates/gam-solve/src/reml/gradient_hessian.rs:const:DEFAULT_LAMBDA_FLOOR",
+      "crates/gam-solve/src/reml/gradient_hessian.rs:const:HARD_FIT_LAMBDA_CEILING",
+      "crates/gam-solve/src/reml/gradient_hessian.rs:const:HARD_FIT_LAMBDA_FLOOR",
+      "crates/gam-solve/src/reml/gradient_hessian.rs:const:HARD_FIT_MIN_ITERS",
+      "crates/gam-solve/src/reml/gradient_hessian.rs:const:NEWTON_FRIENDLY_MAX_ITERS",
+      "crates/gam-solve/src/reml/gradient_hessian.rs:const:NEWTON_LAMBDA_CEILING",
+      "crates/gam-solve/src/reml/gradient_hessian.rs:const:NEWTON_LAMBDA_FLOOR",
+      "crates/gam-solve/src/reml/gradient_hessian.rs:fn:adaptive_lm_lambda_hint",
+      "crates/gam-solve/src/reml/objective.rs:fn:default_regime_matches_historical_static_clamp",
+      "crates/gam-solve/src/reml/objective.rs:fn:hard_fit_regime_preserves_heavy_damping_signal",
+      "crates/gam-solve/src/reml/objective.rs:fn:newton_friendly_regime_admits_floor_to_1e_minus_9",
+      "crates/gam-solve/src/reml/objective.rs:fn:no_feedback_yet_falls_through_to_cold_default",
+      "crates/gam-solve/src/reml/objective.rs:fn:pathological_cached_lambdas_fall_through_to_cold_default"
+    ],
+    "reason": "Historical acknowledgement for 7ff6dcf9a (#2469): the P-IRLS Levenberg-Marquardt damping window. The per-coordinate scale clamp D2_EPS/D2_MIN/D2_MAX is More's D^2 = diag(H) raised only to the diagonal's rounding band u*max|H_jj|. adaptive_lm_lambda_hint chose among three hand bands keyed on 2 and 10 iterations (NEWTON_*, HARD_FIT_*, DEFAULT_LAMBDA_*, NEWTON_FRIENDLY_MAX_ITERS, HARD_FIT_MIN_ITERS); it is now lm_lambda_warm_start_hint, which passes the damping the previous solve ended on through, clamped only into [u, 1/u]. The three regime tests asserted the retired bands and were deleted; the two cold-default tests are restated as *_falls_through_to_the_undamped_start, and a_recorded_damping_passes_through_unchanged pins the pass-through.",
+    "evidence": "Measured with scripts/source_removal_guard.py --base d2708daab --head 7ff6dcf9a on MSI: exactly these 17 identities (run 34646214849 stopped at the census floor before its guard step ran). MSI lane c9, waves 1-5 applied cumulatively on 5ac3be42c: cargo check --workspace --all-targets after each wave, 0 errors and 0 warnings (root ban scanner included), so no caller of a removed item remains. gam-solve --lib -- reml pirls loop_guard stochastic_trace dispersion over the stack: 588 passed, 2 failed, the same two names that fail on the unpatched base."
   }
 ]
