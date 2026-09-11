@@ -1213,7 +1213,11 @@ mod tests {
     #[test]
     fn geometry_plan_attachment_is_one_shot_and_gram_checked() {
         let geometry = SaeAtomGeometryPlan::projective_plane(1).unwrap();
-        let coords = Array2::from_shape_vec((1, 2), vec![0.2, 0.3]).unwrap();
+        // The projective-plane chart is the ambient unit vector: latent_dim 3.
+        let u = [0.48_f64, -0.60, 0.64];
+        let norm = (u[0] * u[0] + u[1] * u[1] + u[2] * u[2]).sqrt();
+        let coords =
+            Array2::from_shape_vec((1, 3), vec![u[0] / norm, u[1] / norm, u[2] / norm]).unwrap();
         let width = geometry.basis_size().unwrap();
         let spec = SaeOosAtomSpec::new(geometry.clone(), Array2::zeros((width, 1))).unwrap();
         let atom = build_oos_atom(0, &spec, coords.view(), 1).unwrap();
@@ -1346,7 +1350,8 @@ mod tests {
             .find("fn sae_manifold_predict_oos")
             .expect("OOS pyfunction exists");
         let rest = &source[start..];
-        let end = rest.find("/// (#1010)").expect("OOS pyfunction boundary");
+        // The binding ends at its own column-0 closing brace; nested blocks are indented.
+        let end = rest.find("\n}\n").expect("the OOS pyfunction body closes at column 0");
         let binding = &rest[..end];
         assert!(binding.contains("run_sae_manifold_oos"));
         assert!(!binding.contains("SaeOosRegularization::Scalar"));
