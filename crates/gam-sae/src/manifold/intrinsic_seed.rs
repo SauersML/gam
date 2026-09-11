@@ -701,10 +701,8 @@ mod tests {
             intrinsic_chart_embedding_axes(&SaeAtomBasisKind::ProjectivePlane, 2),
             3
         );
-        // `SaeAtomBasisKind::Linear` no longer exists; a flat chart kind takes the
-        // latent-dimension arm.
         assert_eq!(
-            intrinsic_chart_embedding_axes(&SaeAtomBasisKind::Duchon, 2),
+            intrinsic_chart_embedding_axes(&SaeAtomBasisKind::Linear, 2),
             2
         );
 
