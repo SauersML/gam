@@ -881,7 +881,7 @@ pub(crate) fn custom_family_outer_jeffreys_hphi_drift_batched<
             let h = family.joint_jeffreys_information_directional_derivative_with_specs(&states, &specs, u)?.ok_or_else(missing)?;
             let axes = family.joint_jeffreys_information_second_directional_all_axes_with_specs(&states, &specs, v)?.ok_or_else(missing)?;
             let moving = family.joint_jeffreys_information_third_directional_all_axes_with_specs(&states, &specs, u, v)?.ok_or_else(missing)?;
-            Ok(prepare()?.completion_drift_action(&h, axes, moving)? * strength)
+            Ok(prepare()?.completion_drift_action(&h, &axes, &moving)? * strength)
         })
     };
     let first = Arc::new(move |deltas: &[Array1<f64>]| {
@@ -946,23 +946,48 @@ pub(crate) fn custom_family_outer_jeffreys_hphi_drift_batched<
             ))
         };
         let base = prepare_base()?;
-        pairs
+        // #979: an outer Hessian over `k` coordinates batches `k(k+1)/2` pairs
+        // drawn from `k` mode responses. Each pair used to re-derive `H[u]`,
+        // `{H²[u,e_a]}` and their spectral rows for both of its directions, so
+        // the dense survival marginal-slope Hessian ran seven family sweeps where
+        // two suffice. Directions are matched by exact bit pattern (the batch
+        // carries clones of the same response vectors), never by tolerance, and
+        // the mixed third derivative stays per pair.
+        let mut distinct: Vec<&Array1<f64>> = Vec::new();
+        let pair_frames: Vec<(usize, usize)> = pairs
             .iter()
             .map(|(u, v)| {
-                let hu = family_second
+                (
+                    distinct_direction_slot(&mut distinct, u),
+                    distinct_direction_slot(&mut distinct, v),
+                )
+            })
+            .collect();
+        let frames = distinct
+            .iter()
+            .map(|direction| {
+                let h = family_second
                     .joint_jeffreys_information_directional_derivative_with_specs(
                         &states_second,
                         &specs_second,
-                        u,
+                        direction,
                     )?
                     .ok_or_else(|| missing("first information derivative"))?;
-                let hv = family_second
-                    .joint_jeffreys_information_directional_derivative_with_specs(
+                let axes = family_second
+                    .joint_jeffreys_information_second_directional_all_axes_with_specs(
                         &states_second,
                         &specs_second,
-                        v,
+                        direction,
                     )?
-                    .ok_or_else(|| missing("first information derivative"))?;
+                    .ok_or_else(|| missing("second information derivatives"))?;
+                base.direction_frame(&h, &axes)
+                    .map_err(CustomFamilyError::trial_point)
+            })
+            .collect::<Result<Vec<_>, CustomFamilyError>>()?;
+        pairs
+            .iter()
+            .zip(pair_frames)
+            .map(|((u, v), (frame_u, frame_v))| {
                 let huv = family_second
                     .joint_jeffreys_information_second_directional_derivative_with_specs(
                         &states_second,
@@ -971,20 +996,6 @@ pub(crate) fn custom_family_outer_jeffreys_hphi_drift_batched<
                         v,
                     )?
                     .ok_or_else(|| missing("second information derivative"))?;
-                let axes_u = family_second
-                    .joint_jeffreys_information_second_directional_all_axes_with_specs(
-                        &states_second,
-                        &specs_second,
-                        u,
-                    )?
-                    .ok_or_else(|| missing("second information derivatives"))?;
-                let axes_v = family_second
-                    .joint_jeffreys_information_second_directional_all_axes_with_specs(
-                        &states_second,
-                        &specs_second,
-                        v,
-                    )?
-                    .ok_or_else(|| missing("second information derivatives"))?;
                 let axes_uv = family_second
                     .joint_jeffreys_information_third_directional_all_axes_with_specs(
                         &states_second,
@@ -996,8 +1007,11 @@ pub(crate) fn custom_family_outer_jeffreys_hphi_drift_batched<
                         missing("third information derivatives (fifth likelihood derivatives)")
                     })?;
                 let mut derivative = base
-                    .mixed_perturbation_derivative_batched_axes(
-                        &hu, &hv, &huv, axes_u, axes_v, axes_uv,
+                    .mixed_perturbation_derivative_from_frames(
+                        &frames[frame_u],
+                        &frames[frame_v],
+                        &huv,
+                        &axes_uv,
                     )
                     .map_err(CustomFamilyError::trial_point)?;
                 derivative *= strength;
@@ -1006,4 +1020,26 @@ pub(crate) fn custom_family_outer_jeffreys_hphi_drift_batched<
             .collect::<Result<Vec<_>, CustomFamilyError>>()
     });
     Ok(Some(JeffreysHphiDriftBatchFn { first, second, completion_beta, completion_psi: None, response_scale: 1.0 }))
+}
+
+/// Index of `direction` among the distinct directions seen so far, by exact bit
+/// pattern; a new direction is appended.
+fn distinct_direction_slot<'a>(
+    distinct: &mut Vec<&'a Array1<f64>>,
+    direction: &'a Array1<f64>,
+) -> usize {
+    let same = |seen: &&Array1<f64>| {
+        seen.len() == direction.len()
+            && seen
+                .iter()
+                .zip(direction.iter())
+                .all(|(left, right)| left.to_bits() == right.to_bits())
+    };
+    match distinct.iter().position(same) {
+        Some(slot) => slot,
+        None => {
+            distinct.push(direction);
+            distinct.len() - 1
+        }
+    }
 }

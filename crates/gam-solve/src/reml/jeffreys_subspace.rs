@@ -2778,7 +2778,7 @@ impl JeffreysHphiDriftBase {
             }
             pert_hdots
         };
-        self.perturbation_derivative_from_axis_matrices(pert_h, pert_hdots)
+        self.perturbation_derivative_from_axis_matrices(pert_h, &pert_hdots)
     }
 
     /// Batched-axes variant of `Self::perturbation_derivative`: the caller
@@ -2809,7 +2809,7 @@ impl JeffreysHphiDriftBase {
                 pert_hdots.len()
             ));
         }
-        self.perturbation_derivative_from_axis_matrices(pert_h, pert_hdots)
+        self.perturbation_derivative_from_axis_matrices(pert_h, &pert_hdots)
     }
 
 }

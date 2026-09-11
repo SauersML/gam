@@ -118,14 +118,14 @@ fn prepare_explicit_jeffreys_curvature_drifts<F: CustomFamily + Clone + Send + S
                     }
                 }
                 let score = base.explicit_score_pair(&first[i], &h_alpha, mixed,
-                    first_axes[i].clone(), axes_alpha.clone(), axes_mixed.clone())? * strength;
+                    &first_axes[i], &axes_alpha, &axes_mixed)? * strength;
                 let mut result = base.mixed_perturbation_derivative_batched_axes(
                     &first[i],
                     &h_alpha,
                     mixed,
-                    first_axes[i].clone(),
-                    axes_alpha,
-                    axes_mixed,
+                    &first_axes[i],
+                    &axes_alpha,
+                    &axes_mixed,
                 )?;
                 result *= strength;
                 Ok((result, score))
@@ -150,7 +150,7 @@ fn prepare_explicit_jeffreys_curvature_drifts<F: CustomFamily + Clone + Send + S
             } else {
                 family.exact_newton_joint_psihessian_second_directional_derivative_all_beta_axes(&states, &specs, &layout, psi, v)?
             }.ok_or_else(|| CustomFamilyError::trial_point("Jeffreys completion requires mixed third information derivatives"))?;
-            Ok(base.completion_drift_action(h, axes, moving)? * strength)
+            Ok(base.completion_drift_action(h, &axes, &moving)? * strength)
         })
     };
     let beta_psi = Arc::new(
@@ -193,9 +193,9 @@ fn prepare_explicit_jeffreys_curvature_drifts<F: CustomFamily + Clone + Send + S
                 &first[psi],
                 &h_beta,
                 &mixed,
-                first_axes[psi].clone(),
-                axes_beta,
-                axes_mixed,
+                &first_axes[psi],
+                &axes_beta,
+                &axes_mixed,
             )?;
             result *= strength;
             Ok(result)

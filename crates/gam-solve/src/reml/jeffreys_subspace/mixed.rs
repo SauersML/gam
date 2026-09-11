@@ -92,8 +92,8 @@ impl JeffreysHphiDriftBase {
     pub fn completion_drift_action(
         &self,
         pert_h: &Array2<f64>,
-        axes: Vec<Array2<f64>>,
-        moving_axes: Vec<Array2<f64>>,
+        axes: &[Array2<f64>],
+        moving_axes: &[Array2<f64>],
     ) -> Result<Array1<f64>, String> {
         if pert_h.dim() != (self.p, self.p) {
             return Err("Jeffreys completion drift information dimension mismatch".into());
@@ -140,7 +140,7 @@ impl JeffreysHphiDriftBase {
     pub(super) fn perturbation_derivative_from_axis_matrices(
         &self,
         pert_h: &Array2<f64>,
-        pert_hdots: Vec<Array2<f64>>,
+        pert_hdots: &[Array2<f64>],
     ) -> Result<Array2<f64>, String> {
         if pert_h.dim() != (self.p, self.p) {
             return Err("Jeffreys drift information dimension mismatch".into());
@@ -172,7 +172,7 @@ impl JeffreysHphiDriftBase {
         Ok(result)
     }
 
-    pub(super) fn rotate_axis_rows(&self, axes: Vec<Array2<f64>>) -> Result<Array2<f64>, String> {
+    pub(super) fn rotate_axis_rows(&self, axes: &[Array2<f64>]) -> Result<Array2<f64>, String> {
         if axes.len() != self.p || axes.iter().any(|a| a.dim() != (self.p, self.p)) {
             return Err("Jeffreys mixed drift requires one full information derivative per coefficient axis".into());
         }
@@ -274,9 +274,9 @@ impl JeffreysHphiDriftBase {
         pert_u: &Array2<f64>,
         pert_v: &Array2<f64>,
         pert_uv: &Array2<f64>,
-        axes_u: Vec<Array2<f64>>,
-        axes_v: Vec<Array2<f64>>,
-        axes_uv: Vec<Array2<f64>>,
+        axes_u: &[Array2<f64>],
+        axes_v: &[Array2<f64>],
+        axes_uv: &[Array2<f64>],
     ) -> Result<Array2<f64>, String> {
         if [pert_u, pert_v, pert_uv]
             .iter()
@@ -284,25 +284,71 @@ impl JeffreysHphiDriftBase {
         {
             return Err("Jeffreys mixed drift information dimension mismatch".into());
         }
-        let cap = self.floor.max(CONDITIONING_GATE_ABSOLUTE_CLEAR);
-        for &value in &self.evals {
-            for knot in [0.0, self.floor, cap] {
-                let resolution = 16.0 * f64::EPSILON * value.abs().max(knot.abs());
-                if (value - knot).abs() <= resolution {
-                    return Err(
-                        "Jeffreys mixed drift is undefined at an inverse-kernel branch boundary"
-                            .into(),
-                    );
-                }
-            }
+        let u = self.direction_frame(pert_u, axes_u)?;
+        let v = self.direction_frame(pert_v, axes_v)?;
+        self.mixed_perturbation_derivative_from_frames(&u, &v, pert_uv, axes_uv)
+    }
+
+    /// Everything the mixed derivative reads from ONE direction: its rotated
+    /// information derivative, its rotated coefficient-axis derivatives, their
+    /// first Fréchet rows, and the gate and floor channels they drive. An outer
+    /// Hessian over `k` coordinates requests `k(k+1)/2` pairs drawn from `k`
+    /// mode responses, so a caller batching pairs builds one frame per distinct
+    /// direction and closes every pair from two frames.
+    pub fn direction_frame(
+        &self,
+        pert: &Array2<f64>,
+        axes: &[Array2<f64>],
+    ) -> Result<JeffreysDirectionFrame, String> {
+        if pert.dim() != (self.p, self.p) {
+            return Err("Jeffreys mixed drift information dimension mismatch".into());
         }
-        let rotate =
-            |h: &Array2<f64>| symmetric_basis_contraction(h.view(), self.ambient_eigenbasis.view());
-        let e = rotate(pert_u);
-        let f = rotate(pert_v);
-        let ef = rotate(pert_uv);
-        let au = self.rotate_axis_rows(axes_u)?;
-        let av = self.rotate_axis_rows(axes_v)?;
+        self.refuse_inverse_kernel_branch_boundary()?;
+        let e = symmetric_basis_contraction(pert.view(), self.ambient_eigenbasis.view());
+        let rows = self.rotate_axis_rows(axes)?;
+        let (g_min, g_max) =
+            conditioning_gate_weight_grad(self.evals[self.idx_min], self.evals[self.idx_max]);
+        let min = e[[self.idx_min, self.idx_min]];
+        let max = e[[self.idx_max, self.idx_max]];
+        let floor_scale = if self.moving_relative_floor() {
+            REDUCED_INFO_RELATIVE_FLOOR
+        } else {
+            0.0
+        };
+        let floor_motion = floor_scale * max;
+        let gate = g_min * min + g_max * max;
+        let mut first = self.first_frechet_rows(&self.a_rows, &e, floor_motion);
+        first += &self.inverse_frechet_rows(&rows, &[], 0);
+        let raw = (first.dot(&self.a_rows.t()) + self.aw_rows.dot(&rows.t())) * -0.5;
+        Ok(JeffreysDirectionFrame {
+            e,
+            rows,
+            first,
+            raw,
+            min,
+            max,
+            floor_motion,
+            gate,
+        })
+    }
+
+    /// `D² H_Φ[u,v]` closed from the two directions' frames. Only the pair's own
+    /// objects — `H_uv`, its coefficient-axis derivatives and the second-order
+    /// spectral rows — are formed here.
+    pub fn mixed_perturbation_derivative_from_frames(
+        &self,
+        u: &JeffreysDirectionFrame,
+        v: &JeffreysDirectionFrame,
+        pert_uv: &Array2<f64>,
+        axes_uv: &[Array2<f64>],
+    ) -> Result<Array2<f64>, String> {
+        if pert_uv.dim() != (self.p, self.p) {
+            return Err("Jeffreys mixed drift information dimension mismatch".into());
+        }
+        self.refuse_inverse_kernel_branch_boundary()?;
+        let e = &u.e;
+        let f = &v.e;
+        let ef = symmetric_basis_contraction(pert_uv.view(), self.ambient_eigenbasis.view());
         let auv = self.rotate_axis_rows(axes_uv)?;
         let a = &self.a_rows;
         let (g_min, g_max) =
@@ -331,73 +377,111 @@ impl JeffreysHphiDriftBase {
             Ok(result)
         };
         let min_uv = eigen_mixed(self.idx_min, g_min != 0.0)?;
-        let moving_floor = self.floor_in_relative_regime
-            && (self.evals.iter().any(|&x| x < self.floor)
-                || self.floor > CONDITIONING_GATE_ABSOLUTE_CLEAR);
+        let moving_floor = self.moving_relative_floor();
         let max_uv = eigen_mixed(self.idx_max, g_max != 0.0 || moving_floor)?;
-        let min_u = e[[self.idx_min, self.idx_min]];
-        let min_v = f[[self.idx_min, self.idx_min]];
-        let max_u = e[[self.idx_max, self.idx_max]];
-        let max_v = f[[self.idx_max, self.idx_max]];
         let floor_scale = if moving_floor {
             REDUCED_INFO_RELATIVE_FLOOR
         } else {
             0.0
         };
-        let floor_u = floor_scale * max_u;
-        let floor_v = floor_scale * max_v;
         let floor_uv = floor_scale * max_uv;
-        let gu = g_min * min_u + g_max * max_u;
-        let gv = g_min * min_v + g_max * max_v;
         let guv = g_min * min_uv
             + g_max * max_uv
-            + g_mm * min_u * min_v
-            + g_mx * (min_u * max_v + max_u * min_v)
-            + g_xx * max_u * max_v;
-        let first = |rows: &Array2<f64>, direction: &Array2<f64>, dfloor: f64| {
-            let mut out = self.inverse_frechet_rows(rows, &[direction], 0);
-            if dfloor != 0.0 {
-                out.scaled_add(dfloor, &self.inverse_frechet_rows(rows, &[], 1));
-            }
-            out
-        };
-        let mut wu = first(a, &e, floor_u);
-        wu += &self.inverse_frechet_rows(&au, &[], 0);
-        let mut wv = first(a, &f, floor_v);
-        wv += &self.inverse_frechet_rows(&av, &[], 0);
-        let mut wuv = self.inverse_frechet_rows(a, &[&e, &f], 0);
+            + g_mm * u.min * v.min
+            + g_mx * (u.min * v.max + u.max * v.min)
+            + g_xx * u.max * v.max;
+        let mut wuv = self.inverse_frechet_rows(a, &[e, f], 0);
         wuv += &self.inverse_frechet_rows(a, &[&ef], 0);
-        if floor_v != 0.0 {
-            wuv.scaled_add(floor_v, &self.inverse_frechet_rows(a, &[&e], 1));
+        if v.floor_motion != 0.0 {
+            wuv.scaled_add(v.floor_motion, &self.inverse_frechet_rows(a, &[e], 1));
         }
-        if floor_u != 0.0 {
-            wuv.scaled_add(floor_u, &self.inverse_frechet_rows(a, &[&f], 1));
+        if u.floor_motion != 0.0 {
+            wuv.scaled_add(u.floor_motion, &self.inverse_frechet_rows(a, &[f], 1));
         }
-        if floor_u * floor_v != 0.0 {
-            wuv.scaled_add(floor_u * floor_v, &self.inverse_frechet_rows(a, &[], 2));
+        if u.floor_motion * v.floor_motion != 0.0 {
+            wuv.scaled_add(
+                u.floor_motion * v.floor_motion,
+                &self.inverse_frechet_rows(a, &[], 2),
+            );
         }
         if floor_uv != 0.0 {
             wuv.scaled_add(floor_uv, &self.inverse_frechet_rows(a, &[], 1));
         }
-        wuv += &first(&av, &e, floor_u);
-        wuv += &first(&au, &f, floor_v);
+        wuv += &self.first_frechet_rows(&v.rows, e, u.floor_motion);
+        wuv += &self.first_frechet_rows(&u.rows, f, v.floor_motion);
         wuv += &self.inverse_frechet_rows(&auv, &[], 0);
         let w = &self.aw_rows;
         let raw = w.dot(&a.t()) * -0.5;
-        let raw_u = (wu.dot(&a.t()) + w.dot(&au.t())) * -0.5;
-        let raw_v = (wv.dot(&a.t()) + w.dot(&av.t())) * -0.5;
-        let mut result = (wuv.dot(&a.t()) + wu.dot(&av.t()) + wv.dot(&au.t()) + w.dot(&auv.t()))
+        let mut result = (wuv.dot(&a.t())
+            + u.first.dot(&v.rows.t())
+            + v.first.dot(&u.rows.t())
+            + w.dot(&auv.t()))
             * (-0.5 * self.gate_weight);
-        result.scaled_add(gu, &raw_v);
-        result.scaled_add(gv, &raw_u);
+        result.scaled_add(u.gate, &v.raw);
+        result.scaled_add(v.gate, &u.raw);
         result.scaled_add(guv, &raw);
         let mut result = result.as_standard_layout().to_owned();
         symmetrize_contiguous(&mut result);
-        if result.iter().any(|v| !v.is_finite()) {
+        if result.iter().any(|value| !value.is_finite()) {
             return Err("Jeffreys mixed drift produced nonfinite curvature".into());
         }
         Ok(result)
     }
+
+    /// `Df[A]` plus the relative-floor motion `dfloor · ∂_floor f[A]` along one
+    /// direction, for every axis row.
+    fn first_frechet_rows(
+        &self,
+        rows: &Array2<f64>,
+        direction: &Array2<f64>,
+        dfloor: f64,
+    ) -> Array2<f64> {
+        let mut out = self.inverse_frechet_rows(rows, &[direction], 0);
+        if dfloor != 0.0 {
+            out.scaled_add(dfloor, &self.inverse_frechet_rows(rows, &[], 1));
+        }
+        out
+    }
+
+    /// The relative spectral floor moves with the information along a direction.
+    fn moving_relative_floor(&self) -> bool {
+        self.floor_in_relative_regime
+            && (self.evals.iter().any(|&x| x < self.floor)
+                || self.floor > CONDITIONING_GATE_ABSOLUTE_CLEAR)
+    }
+
+    fn refuse_inverse_kernel_branch_boundary(&self) -> Result<(), String> {
+        let cap = self.floor.max(CONDITIONING_GATE_ABSOLUTE_CLEAR);
+        for &value in &self.evals {
+            for knot in [0.0, self.floor, cap] {
+                let resolution = 16.0 * f64::EPSILON * value.abs().max(knot.abs());
+                if (value - knot).abs() <= resolution {
+                    return Err(
+                        "Jeffreys mixed drift is undefined at an inverse-kernel branch boundary"
+                            .into(),
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// The per-direction half of `D² H_Φ[u,v]`; see
+/// [`JeffreysHphiDriftBase::direction_frame`].
+pub struct JeffreysDirectionFrame {
+    /// Rotated information derivative `Uᵀ H[u] U`.
+    e: Array2<f64>,
+    /// Rotated coefficient-axis derivatives `vec(Uᵀ H²[u,e_a] U)`.
+    rows: Array2<f64>,
+    /// First Fréchet rows of the capped inverse along `u`, floor motion included.
+    first: Array2<f64>,
+    /// `D H_Φ_raw[u]` before the gate weight.
+    raw: Array2<f64>,
+    min: f64,
+    max: f64,
+    floor_motion: f64,
+    gate: f64,
 }
 
 #[cfg(test)]
@@ -427,8 +511,8 @@ mod tests {
             let base = JeffreysHphiDriftBase::prepare_with_axes(h.view(), z.view(), axes.clone())
                 .unwrap()
                 .unwrap();
-            let completion_actual = base.completion_drift_action(&e, axes.clone(), au.clone()).unwrap();
-            let score = base.explicit_score_pair(&e, &f, &ef, au.clone(), av.clone(), auv.clone()).unwrap();
+            let completion_actual = base.completion_drift_action(&e, &axes, &au).unwrap();
+            let score = base.explicit_score_pair(&e, &f, &ef, &au, &av, &auv).unwrap();
             for axis in 0..3 {
                 let at = |t: f64| joint_jeffreys_phi_explicit_param_second_derivative(
                     (&h + &axes[axis]*t).view(), z.view(),
@@ -443,7 +527,7 @@ mod tests {
                 let at: Vec<_> = axes.iter().zip(&au).map(|(a, d)| a + &(d * t)).collect();
                 let point = JeffreysHphiDriftBase::prepare_with_axes(ht.view(), z.view(), at.clone())
                     .unwrap().unwrap();
-                let rows = point.rotate_axis_rows(at).unwrap();
+                let rows = point.rotate_axis_rows(&at).unwrap();
                 Array1::from_shape_fn(3, |a| {
                     -0.5 * point.gate_weight * (0..3).map(|i| {
                         floored_inverse(point.evals[i], point.floor) * rows[[a, i * 3 + i]]
@@ -462,9 +546,9 @@ mod tests {
                     &e,
                     &f,
                     &ef,
-                    au.clone(),
-                    av.clone(),
-                    auv.clone(),
+                    &au,
+                    &av,
+                    &auv,
                 )
                 .unwrap();
             let first_at = |t: f64| {
@@ -492,7 +576,7 @@ mod tests {
                 error / scale
             );
             let swapped = base
-                .mixed_perturbation_derivative_batched_axes(&f, &e, &ef, av, au, auv)
+                .mixed_perturbation_derivative_batched_axes(&f, &e, &ef, &av, &au, &auv)
                 .unwrap();
             assert!((&actual - &swapped).iter().all(|x| x.abs() < 1e-12 * scale));
         }

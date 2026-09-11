@@ -6238,6 +6238,39 @@ impl CustomFamily for BetaDependentJeffreysInformationFamily {
         // caller handed a well-formed one.
         Ok(Some(Self::information_second_axes(d_beta_u_flat).to_vec()))
     }
+
+    fn joint_jeffreys_information_second_directional_derivative_with_specs(
+        &self,
+        block_states: &[ParameterBlockState],
+        specs: &[ParameterBlockSpec],
+        d_beta_u_flat: &Array1<f64>,
+        d_beta_v_flat: &Array1<f64>,
+    ) -> Result<Option<Array2<f64>>, String> {
+        assert_states_finite(block_states, "beta-dependent Jeffreys mixed drift");
+        assert_specs_consistent(specs, "beta-dependent Jeffreys mixed drift");
+        let [axis0, axis1] = Self::information_second_axes(d_beta_u_flat);
+        Ok(Some(&axis0 * d_beta_v_flat[0] + &axis1 * d_beta_v_flat[1]))
+    }
+
+    fn joint_jeffreys_information_third_directional_all_axes_with_specs(
+        &self,
+        block_states: &[ParameterBlockState],
+        specs: &[ParameterBlockSpec],
+        d_beta_u_flat: &Array1<f64>,
+        d_beta_v_flat: &Array1<f64>,
+    ) -> Result<Option<Vec<Array2<f64>>>, String> {
+        assert_states_finite(block_states, "beta-dependent Jeffreys third drift");
+        assert_specs_consistent(specs, "beta-dependent Jeffreys third drift");
+        assert!(
+            d_beta_u_flat
+                .iter()
+                .chain(d_beta_v_flat.iter())
+                .all(|value| value.is_finite()),
+            "beta-dependent Jeffreys third drift: directions must be finite"
+        );
+        // `H` is quadratic in beta, so every third derivative vanishes.
+        Ok(Some(vec![Array2::zeros((2, 2)); 2]))
+    }
 }
 
 /// A trial point where the family cannot form its Jeffreys information is a
@@ -6366,6 +6399,47 @@ fn outer_jeffreys_hphi_drift_matches_a_central_difference_of_hphi_2765() {
                 analytic[[row, column]],
             );
         }
+    }
+}
+
+/// #979: the batched outer-Hessian Jeffreys drift builds one spectral frame per
+/// distinct mode response and closes every pair from two frames. Each pair's
+/// mixed drift must be bit-identical to that pair evaluated alone, where no
+/// frame is shared.
+#[test]
+fn batched_mixed_jeffreys_drift_matches_each_pair_alone_979() {
+    let family = BetaDependentJeffreysInformationFamily;
+    let specs = vec![jeffreys_seam_spec(2)];
+    let ranges = block_param_ranges(&specs);
+    let states = vec![jeffreys_seam_state(array![0.7, -0.4])];
+    let drift = custom_family_outer_jeffreys_hphi_drift_batched(&family, &states, &specs, &ranges)
+        .expect("Jeffreys drift construction")
+        .expect("an active Jeffreys geometry exposes a drift");
+    let responses = [array![0.35, 0.22], array![-0.18, 0.41], array![0.05, -0.3]];
+    let mut pairs = Vec::new();
+    for left in 0..responses.len() {
+        for right in left..responses.len() {
+            pairs.push((responses[left].clone(), responses[right].clone()));
+        }
+    }
+    let together = (drift.second)(&pairs).expect("batched mixed drift");
+    assert_eq!(together.len(), pairs.len());
+    for (pair, batched) in pairs.iter().zip(&together) {
+        let alone = (drift.second)(std::slice::from_ref(pair))
+            .expect("single-pair mixed drift")
+            .pop()
+            .expect("one pair yields one drift");
+        assert!(
+            batched.iter().any(|value| *value != 0.0),
+            "pair {pair:?}: the fixture must exercise a nonzero mixed drift"
+        );
+        assert!(
+            batched
+                .iter()
+                .zip(alone.iter())
+                .all(|(left, right)| left.to_bits() == right.to_bits()),
+            "pair {pair:?}: batched {batched:?} differs from alone {alone:?}"
+        );
     }
 }
 

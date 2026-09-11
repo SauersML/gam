@@ -120,7 +120,7 @@ impl JeffreysHphiDriftBase {
     /// ∂_beta ∂_u ∂_v Phi, including explicit motion of every information
     /// derivative, the conditioning gate, and the relative spectral floor.
     pub fn explicit_score_pair(&self, u: &Array2<f64>, v: &Array2<f64>, uv: &Array2<f64>,
-        axes_u: Vec<Array2<f64>>, axes_v: Vec<Array2<f64>>, axes_uv: Vec<Array2<f64>>) -> Result<Array1<f64>,String> {
+        axes_u: &[Array2<f64>], axes_v: &[Array2<f64>], axes_uv: &[Array2<f64>]) -> Result<Array1<f64>,String> {
         if [u,v,uv].iter().any(|x| x.dim() != (self.p,self.p)) {
             return Err("Jeffreys third scalar information dimension mismatch".into());
         }
