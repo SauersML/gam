@@ -80,11 +80,21 @@
 //!    ended; a parallel verdict channel in the process monitor would be
 //!    redundant global state.
 
-/// Damping ceiling for Madsen-style LM retries. Beyond this the proposed
-/// step is numerically a zero step — retrying cannot make progress, so the
-/// retry chain is declared dead. (Moved verbatim from reweight.rs, where it
-/// was a file-local convention; see module docs for why it must be shared.)
-pub const MADSEN_DAMPING_CAP: f64 = 1e12;
+/// Damping floor for Madsen-style LM loops: the unit roundoff.
+///
+/// The damping enters as `H_ii + λ·D_ii²` with `D² = diag(H)`, so a relative
+/// damping below `u` adds nothing the arithmetic can hold and the damped system
+/// IS the Newton system. No smaller value means anything; a larger floor would
+/// be a ridge nobody chose.
+pub const MADSEN_DAMPING_FLOOR: f64 = gam_linalg::roundoff::UNIT_ROUNDOFF;
+
+/// Damping ceiling for Madsen-style LM retries: the reciprocal unit roundoff.
+///
+/// The damped step `(H + λD²)⁻¹g` is `1/λ` of the Newton step along every
+/// coordinate once the damping dominates, so beyond `1/u` it is below the
+/// roundoff of the step it replaces — numerically a zero step. Retrying cannot
+/// make progress, so the retry chain is declared dead.
+pub const MADSEN_DAMPING_CAP: f64 = 1.0 / gam_linalg::roundoff::UNIT_ROUNDOFF;
 
 /// Is a damped retry still alive at this damping level?
 #[inline]
@@ -207,7 +217,7 @@ impl IterationBound {
 
 /// Initial damping multiplier on the first rejection of an iteration.
 /// Doubles on every further rejection (geometric escalation), reaching
-/// [`MADSEN_DAMPING_CAP`] from λ = 1 in ~12 rejections — the established
+/// [`MADSEN_DAMPING_CAP`] from [`MADSEN_DAMPING_FLOOR`] in 15 rejections — the established
 /// reweight.rs schedule, now owned here.
 pub const MADSEN_INITIAL_REJECT_FACTOR: f64 = 2.0;
 
@@ -441,7 +451,7 @@ mod tests {
         assert!(!madsen_can_retry(f64::INFINITY));
         assert!(madsen_retry_exhausted(1.0, 5, 5));
         assert!(madsen_retry_exhausted(f64::NAN, 0, 5));
-        assert!(madsen_retry_exhausted(1e13, 0, 5));
+        assert!(madsen_retry_exhausted(2.0 * MADSEN_DAMPING_CAP, 0, 5));
         assert!(!madsen_retry_exhausted(1.0, 4, 5));
     }
 

@@ -6742,38 +6742,18 @@ impl<'a> RemlState<'a> {
                 "frozen Beta precision",
                 |likelihood, value| likelihood.with_beta_phi_frozen_for_search(value),
             )?;
-            // Levenberg-Marquardt damping warm-start. Read the cached
-            // λ from the previous successful PIRLS solve at this
-            // surface (0 = no hint), and seed the inner solver. The
-            // PIRLS layer applies a final safety clamp (defense in
-            // depth); this layer pre-clamps adaptively based on the
-            // previous solve's halving history, plus a quality signal
-            // that the static clamp couldn't see.
-            //
-            // The principle: the cached λ encodes the curvature regime
-            // the previous fit settled into. A Newton-friendly fit
-            // (converged in ≤2 iters, no halving) leaves λ near the
-            // 1e-9 floor; the next fit at a nearby ρ is likely
-            // Newton-friendly too, so we allow the hint down to that
-            // floor. A hard fit (many iters, possibly hit cap) leaves
-            // λ in the heavy-damping regime; the next fit needs to
-            // preserve that signal, so we allow the hint up to ~1.0.
-            // The default (1-9 iters, converged) matches the historical
-            // static clamp [1e-6, 1e-3].
-            //
-            // Each regime keeps the cached value's geometry information;
-            // none of them throw it away. The Madsen rejection
-            // trajectory (commit d37626e6) handles "wrong starting λ"
-            // gracefully, so the cost of a slightly mis-tuned regime
-            // is just a few extra rejections — far less than the cost
-            // of throwing away the cache entirely.
+            // Levenberg-Marquardt damping warm-start: the λ the previous
+            // successful PIRLS solve at this surface ended on (0 = no hint).
+            // It encodes the curvature regime that solve settled into; PIRLS
+            // clamps it into the damping window its arithmetic resolves, and
+            // the Madsen rejection trajectory absorbs a start that is too small.
             let cached_lambda_bits = self.last_pirls_lm_lambda.load(Ordering::Relaxed);
             if cached_lambda_bits != 0 {
                 let cached_lambda = f64::from_bits(cached_lambda_bits);
                 let last_iters = self.last_inner_iters.load(Ordering::Relaxed);
                 let last_converged = self.last_inner_converged.load(Ordering::Relaxed);
                 pirls_config.initial_lm_lambda =
-                    adaptive_lm_lambda_hint(cached_lambda, last_iters, last_converged);
+                    lm_lambda_warm_start_hint(cached_lambda, last_iters, last_converged);
             }
             let adaptive_kkt_tolerance = if !in_screening {
                 if let Some(outer_grad_norm) = self.previous_outer_gradient_norm(&key_opt) {
@@ -8075,61 +8055,27 @@ pub(crate) const IFT_WARM_START_DRHO_EPS: f64 = 1e-12;
 /// drops the adaptive cap-margin signal.
 pub(crate) const IFT_RESIDUAL_NO_SIGNAL_BITS: u64 = 0x7ff8_0000_0000_0000;
 
-/// Adaptive clamp for the `initial_lm_lambda` warm-start hint passed
-/// from `execute_pirls_if_needed` into PIRLS. Selects one of three
-/// principled regimes based on the previous PIRLS solve's halving
-/// history:
+/// The LM damping the previous successful PIRLS solve at this surface ended
+/// on, as the `initial_lm_lambda` warm start for the next one.
 ///
-/// * Newton-friendly  (last_converged AND last_iters in 1..=2):
-///   well-conditioned local geometry; allow the cached λ down to the
-///   LM-internal floor. Range: [1e-9, 1e-3].
-/// * Hard fit  (NOT last_converged OR last_iters ≥ 10):
-///   previous solve hit the cap or needed many iters; preserve the
-///   heavy-damping signal up to gradient-descent. Range: [1e-3, 1.0].
-/// * Default  (everything else, incl. unset feedback):
-///   matches the historical static `[1e-6, 1e-3]` clamp.
-///
-/// Returns `None` for non-finite or non-positive `cached_lambda`,
-/// matching the historical contract that pathological cache entries
-/// fall through to the cold default. Also returns `None` if the
-/// caller hasn't recorded any feedback yet (`last_iters == 0` AND
-/// `!last_converged`) — that combination signals "no signal" via
-/// `clear_warm_start_adaptive_signals`, and the cold default is the
-/// safer choice than seeding from a stale-but-finite cache slot.
-pub(crate) fn adaptive_lm_lambda_hint(
+/// Returns `None` for a non-finite or non-positive `cached_lambda`, and when
+/// the caller has not recorded feedback yet (`last_iters == 0` AND
+/// `!last_converged`, the sentinel `clear_warm_start_adaptive_signals`
+/// writes): PIRLS then starts undamped. Otherwise the value passes through
+/// unchanged; PIRLS clamps it into the damping window the arithmetic resolves
+/// (`loop_guard::MADSEN_DAMPING_FLOOR ..= MADSEN_DAMPING_CAP`).
+pub(crate) fn lm_lambda_warm_start_hint(
     cached_lambda: f64,
     last_iters: usize,
     last_converged: bool,
 ) -> Option<f64> {
-    // Iteration-count boundaries that classify the previous PIRLS solve's
-    // conditioning regime.
-    const NEWTON_FRIENDLY_MAX_ITERS: usize = 2;
-    const HARD_FIT_MIN_ITERS: usize = 10;
-    // Per-regime adaptive clamp bands for the cached LM damping hint (see the
-    // doc comment): Newton-friendly relaxes down to the LM-internal floor, a
-    // hard fit preserves the heavy-damping signal up to gradient-descent, and
-    // the default reproduces the historical static `[1e-6, 1e-3]` clamp.
-    const NEWTON_LAMBDA_FLOOR: f64 = 1e-9;
-    const NEWTON_LAMBDA_CEILING: f64 = 1e-3;
-    const HARD_FIT_LAMBDA_FLOOR: f64 = 1e-3;
-    const HARD_FIT_LAMBDA_CEILING: f64 = 1.0;
-    const DEFAULT_LAMBDA_FLOOR: f64 = 1e-6;
-    const DEFAULT_LAMBDA_CEILING: f64 = 1e-3;
     if !cached_lambda.is_finite() || cached_lambda <= 0.0 {
         return None;
     }
     if last_iters == 0 && !last_converged {
         return None;
     }
-    let (floor, ceiling) =
-        if last_converged && (1..=NEWTON_FRIENDLY_MAX_ITERS).contains(&last_iters) {
-            (NEWTON_LAMBDA_FLOOR, NEWTON_LAMBDA_CEILING)
-        } else if !last_converged || last_iters >= HARD_FIT_MIN_ITERS {
-            (HARD_FIT_LAMBDA_FLOOR, HARD_FIT_LAMBDA_CEILING)
-        } else {
-            (DEFAULT_LAMBDA_FLOOR, DEFAULT_LAMBDA_CEILING)
-        };
-    Some(cached_lambda.clamp(floor, ceiling))
+    Some(cached_lambda)
 }
 
 pub(crate) fn predict_warm_start_beta_ift_inner_with_outcome(

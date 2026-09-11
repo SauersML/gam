@@ -3996,92 +3996,41 @@ mod tk_math_tests {
 }
 
 #[cfg(test)]
-mod adaptive_lm_lambda_tests {
-    use super::adaptive_lm_lambda_hint;
+mod lm_lambda_warm_start_tests {
+    use super::lm_lambda_warm_start_hint;
 
     #[test]
-    pub(crate) fn pathological_cached_lambdas_fall_through_to_cold_default() {
-        // Non-finite or non-positive cached values must return None so
-        // the cold default `1e-6` is used. Locks the historical
-        // contract that pathological cache slots can't poison the warm
-        // start.
-        assert_eq!(adaptive_lm_lambda_hint(f64::NAN, 5, true), None);
-        assert_eq!(adaptive_lm_lambda_hint(f64::INFINITY, 5, true), None);
-        assert_eq!(adaptive_lm_lambda_hint(0.0, 5, true), None);
-        assert_eq!(adaptive_lm_lambda_hint(-1e-3, 5, true), None);
+    pub(crate) fn pathological_cached_lambdas_fall_through_to_the_undamped_start() {
+        // Non-finite or non-positive cached values must return None so PIRLS
+        // starts undamped; a pathological cache slot cannot poison the start.
+        assert_eq!(lm_lambda_warm_start_hint(f64::NAN, 5, true), None);
+        assert_eq!(lm_lambda_warm_start_hint(f64::INFINITY, 5, true), None);
+        assert_eq!(lm_lambda_warm_start_hint(0.0, 5, true), None);
+        assert_eq!(lm_lambda_warm_start_hint(-1e-3, 5, true), None);
     }
 
     #[test]
-    pub(crate) fn no_feedback_yet_falls_through_to_cold_default() {
+    pub(crate) fn no_feedback_yet_falls_through_to_the_undamped_start() {
         // (last_iters == 0, last_converged == false) is the sentinel
-        // `clear_warm_start_adaptive_signals` writes — there's no
-        // feedback to drive an adaptive regime, so the cold default
-        // `1e-6` is preferred over a possibly-stale cache slot.
-        assert_eq!(adaptive_lm_lambda_hint(1e-5, 0, false), None);
+        // `clear_warm_start_adaptive_signals` writes — there is no previous
+        // solve whose damping could be reused.
+        assert_eq!(lm_lambda_warm_start_hint(1e-5, 0, false), None);
     }
 
     #[test]
-    pub(crate) fn newton_friendly_regime_admits_floor_to_1e_minus_9() {
-        // Previous fit converged in 1 iter — well-conditioned local
-        // geometry. The cached λ is allowed down to 1e-9 (the LM-
-        // internal floor) so the next fit can leverage the previous
-        // Newton-like trajectory.
-        assert_eq!(
-            adaptive_lm_lambda_hint(1e-9, 1, true),
-            Some(1e-9),
-            "cached λ at the LM floor must pass through unchanged"
-        );
-        assert_eq!(
-            adaptive_lm_lambda_hint(1e-12, 1, true),
-            Some(1e-9),
-            "below-floor cached λ clamped up to 1e-9"
-        );
-        assert_eq!(
-            adaptive_lm_lambda_hint(1e-2, 1, true),
-            Some(1e-3),
-            "above-ceiling cached λ clamped down to 1e-3 even in Newton-friendly regime"
-        );
-        // last_iters == 2 still counts as Newton-friendly.
-        assert_eq!(adaptive_lm_lambda_hint(1e-9, 2, true), Some(1e-9));
-    }
-
-    #[test]
-    pub(crate) fn hard_fit_regime_preserves_heavy_damping_signal() {
-        // Previous fit didn't converge OR took many iters — the cached
-        // λ is in the heavy-damping regime, and we want to preserve
-        // that signal up to gradient-descent (1.0).
-        assert_eq!(
-            adaptive_lm_lambda_hint(0.5, 12, true),
-            Some(0.5),
-            "heavy-damping cached λ passes through unchanged"
-        );
-        assert_eq!(
-            adaptive_lm_lambda_hint(2.0, 12, true),
-            Some(1.0),
-            "above-ceiling cached λ clamped to 1.0"
-        );
-        assert_eq!(
-            adaptive_lm_lambda_hint(1e-6, 12, true),
-            Some(1e-3),
-            "below-floor cached λ clamped up to 1e-3 in hard-fit regime"
-        );
-        // Non-converged (cap exhausted) path takes the same regime.
-        assert_eq!(adaptive_lm_lambda_hint(0.5, 5, false), Some(0.5));
-    }
-
-    #[test]
-    pub(crate) fn default_regime_matches_historical_static_clamp() {
-        // 1-9 iters AND converged — a "moderate" fit. The clamp is
-        // [1e-6, 1e-3], matching the historical static clamp before
-        // the adaptive layer was introduced. Locks behavior so a
-        // future commit can't silently widen the default range.
-        assert_eq!(adaptive_lm_lambda_hint(1e-5, 5, true), Some(1e-5));
-        assert_eq!(adaptive_lm_lambda_hint(1e-9, 5, true), Some(1e-6));
-        assert_eq!(adaptive_lm_lambda_hint(1e-1, 5, true), Some(1e-3));
-        // Boundary: last_iters=3 (above Newton-friendly cap of 2,
-        // below hard-fit floor of 10) goes to default.
-        assert_eq!(adaptive_lm_lambda_hint(1e-5, 3, true), Some(1e-5));
-        assert_eq!(adaptive_lm_lambda_hint(1e-5, 9, true), Some(1e-5));
+    pub(crate) fn a_recorded_damping_passes_through_unchanged() {
+        // The hint carries the previous solve's damping as it was; the only
+        // clamp is PIRLS's own arithmetic window, owned by `loop_guard`.
+        for &(lambda, iters, converged) in &[
+            (1e-12, 1, true),
+            (1e-9, 2, true),
+            (1e-5, 5, true),
+            (0.5, 12, true),
+            (2.0, 12, true),
+            (0.5, 5, false),
+        ] {
+            assert_eq!(lm_lambda_warm_start_hint(lambda, iters, converged), Some(lambda));
+        }
     }
 }
 

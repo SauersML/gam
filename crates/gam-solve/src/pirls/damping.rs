@@ -113,23 +113,21 @@ pub(super) fn update_scaled_diagonal_in_place(
 }
 
 /// Compute the per-coordinate LM damping scale D²[i] from the penalized
-/// Hessian diagonal. Uses `max(H_diag[i], ε)` clamped to `[D2_MIN, D2_MAX]`
-/// so that D² stays in a numerically safe range and is strictly positive.
+/// Hessian diagonal (Moré scaling).
 ///
-/// Using the full penalized-Hessian diagonal (X'WX + Sρ)_ii means D² reflects
-/// the actual curvature in each coordinate and is invariant to the choice of
-/// whether curvature comes from Fisher or observed information — we always
-/// clamp to the Fisher-curvature floor via `max(·, ε)`.
+/// `D²[i] = (X'WX + Sρ)_ii`, so the damping reflects the actual curvature in
+/// each coordinate and is invariant to rescaling a coefficient. A flat, negative
+/// or non-finite diagonal entry (observed information can carry one) is raised
+/// to the diagonal's own rounding band `u·max_j |H_jj|`, the smallest scale
+/// the arithmetic distinguishes from zero. A Hessian whose diagonal is all zero
+/// has no curvature scale at all and gets Levenberg's unscaled damping `λ·I`.
 pub(super) fn compute_lm_d2(h: &SymmetricMatrix) -> Array1<f64> {
-    const D2_EPS: f64 = 1e-8;
-    const D2_MIN: f64 = 1e-8;
-    const D2_MAX: f64 = 1e8;
     let p = h.nrows();
     let mut d2 = Array1::<f64>::zeros(p);
     match h {
         SymmetricMatrix::Dense(mat) => {
             for i in 0..p {
-                d2[i] = mat[[i, i]].max(D2_EPS).clamp(D2_MIN, D2_MAX);
+                d2[i] = mat[[i, i]];
             }
         }
         SymmetricMatrix::Sparse(mat) => {
@@ -146,9 +144,19 @@ pub(super) fn compute_lm_d2(h: &SymmetricMatrix) -> Array1<f64> {
                         break;
                     }
                 }
-                d2[col] = diag_val.max(D2_EPS).clamp(D2_MIN, D2_MAX);
+                d2[col] = diag_val;
             }
         }
     }
+    let scale = d2
+        .iter()
+        .filter(|value| value.is_finite())
+        .fold(0.0_f64, |acc, value| acc.max(value.abs()));
+    if !(scale > 0.0) {
+        d2.fill(1.0);
+        return d2;
+    }
+    let resolvable = gam_linalg::roundoff::UNIT_ROUNDOFF * scale;
+    d2.mapv_inplace(|value| if value.is_finite() { value.max(resolvable) } else { resolvable });
     d2
 }

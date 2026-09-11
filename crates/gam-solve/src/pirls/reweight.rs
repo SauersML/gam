@@ -24,7 +24,10 @@ use super::{
     update_scaled_diagonal_in_place,
 };
 use crate::estimate::EstimationError;
-use crate::loop_guard::{FlatStreak, IterationBound, LoopVerdict, RejectEscalator};
+use crate::loop_guard::{
+    FlatStreak, IterationBound, LoopVerdict, MADSEN_DAMPING_CAP, MADSEN_DAMPING_FLOOR,
+    RejectEscalator,
+};
 use faer::sparse::SparseColMat;
 use gam_linalg::sparse_exact::{
     factorize_sparse_spd, solve_sparse_spd_into, sparse_symmetric_upper_matvec_public,
@@ -799,27 +802,15 @@ where
         value
     };
 
-    // Initial Levenberg-Marquardt damping. Seeded from the caller's
-    // `initial_lm_lambda` hint when present, with a safety clamp into
-    // [1e-9, 1.0]:
-    //   * floor 1e-9 matches the LM-internal accept-side floor
-    //     (madsen_lm_accept_factor caps shrink at λ → λ/3, and the
-    //     post-multiply `.max(1e-9)` enforces this absolute lower bound),
-    //     so any positive cached value gets through unchanged.
-    //   * ceiling 1.0 covers the gradient-descent regime; values above
-    //     that are pathological (the MADSEN_DAMPING_CAP = 1e12 ceiling is the
-    //     LM exit condition, well above any sensible warm-start).
-    // The runtime layer (`solver/reml/runtime.rs::execute_pirls_if_needed`)
-    // applies an *adaptive* clamp before this one, narrowing the range
-    // based on the previous solve's halving history (Newton-friendly →
-    // [1e-9, 1e-3], default → [1e-6, 1e-3], hard-fit → [1e-3, 1.0]).
-    // This PIRLS clamp is defense in depth — it catches a pathological
-    // hint from any caller that bypasses the runtime adaptive layer.
-    // Cold default `1e-6` matches the original.
+    // Initial Levenberg-Marquardt damping. A caller's `initial_lm_lambda` hint
+    // (the damping a previous solve ended on) is clamped into the window the
+    // arithmetic resolves, `MADSEN_DAMPING_FLOOR ..= MADSEN_DAMPING_CAP`; with
+    // no hint the loop tries the undamped Newton step first and damps only
+    // when a step is rejected.
     let mut lambda = options
         .initial_lm_lambda
-        .map(|v| v.clamp(1e-9, 1.0))
-        .unwrap_or(1e-6);
+        .map(|v| v.clamp(MADSEN_DAMPING_FLOOR, MADSEN_DAMPING_CAP))
+        .unwrap_or(MADSEN_DAMPING_FLOOR);
     let lm_max_attempts = options.max_step_halving.max(1);
     // Convergence is decided by `WorkingState::certifies_kkt` /
     // `WorkingState::near_stationary_kkt`, which combine a dimension-based
@@ -1065,8 +1056,8 @@ where
         // diagonal so we can apply a delta update (loop_lambda - sparse_applied_lambda)
         // rather than rebuilding the regularized matrix each attempt.
         let mut sparse_applied_lambda = 0.0_f64;
-        // Per-coordinate LM damping scale: D²[i] = clamp(max(H_diag[i], ε),
-        // D2_MIN, D2_MAX). Held constant within an LM rejection cluster (only λ
+        // Per-coordinate LM damping scale: D²[i] = H_diag[i], raised to the
+        // diagonal's rounding band (`compute_lm_d2`). Held constant within an LM rejection cluster (only λ
         // varies); recomputed whenever state.hessian changes (Fisher fallback).
         // Using the full penalized-Hessian diagonal avoids the artificial
         // anisotropy that scalar λI introduces across basis/penalty/latent blocks
@@ -1698,7 +1689,8 @@ where
                         // Update Trust Region (Lambda) — Madsen-Nielsen-Tingleff
                         // smooth Marquardt update. See `madsen_lm_accept_factor`
                         // for the textbook derivation and canonical values.
-                        lambda = (loop_lambda * madsen_lm_accept_factor(rho)).max(1e-9);
+                        lambda =
+                            (loop_lambda * madsen_lm_accept_factor(rho)).max(MADSEN_DAMPING_FLOOR);
                         // Accepting commits the latent trial together with β,
                         // so there is no rejected snapshot left to restore.
                         commit_pending_arrow_latent(&mut pending_arrow_latent_restore);
@@ -2421,7 +2413,7 @@ where
         let total_iters = iterations.max(1) as f64;
         let convergence_rate = match initial_gradient_norm {
             Some(g0) if g0 > 0.0 && lastgradient_norm.is_finite() => {
-                let ratio = (lastgradient_norm / g0).max(1e-30);
+                let ratio = lastgradient_norm / g0;
                 ratio.powf(1.0 / total_iters)
             }
             _ => f64::NAN,
@@ -2447,7 +2439,7 @@ where
     // Convergence is certified by `certifies_kkt` / the Newton-decrement bound,
     // both of which are *relative* tests. For a Gaussian-identity (exactly
     // quadratic) problem they fire at the very first accepted LM step — while
-    // the cold-start damping `loop_lambda` (default 1e-6) is still folded into
+    // the damping `loop_lambda` the loop started from is still folded into
     // the solve. The accepted iterate therefore satisfies the *damped* normal
     // equations `(H + λ_lm·D²)β̂ = X'Wz`, not the bare `Hβ̂ = X'Wz`, leaving a
     // stationarity residual

@@ -147,7 +147,7 @@ mod linux_impl {
         pub initial_beta: ArrayView1<'a, f64>,
         /// LM ridge to seed the loop with. Mirrors
         /// `WorkingModelPirlsOptions::initial_lm_lambda` (defaulted to
-        /// `1e-6` when `None`).
+        /// `loop_guard::MADSEN_DAMPING_FLOOR`, the undamped start, when `None`).
         pub initial_lm_lambda: Option<f64>,
         /// Outer iteration cap.
         pub max_iterations: usize,
@@ -298,7 +298,9 @@ mod linux_impl {
         let mut loop_ws = pirls_gpu::allocate_pirls_loop_workspace(&shared, &ws)
             .map_err(EstimationError::InvalidInput)?;
 
-        let lm_ridge = input.initial_lm_lambda.unwrap_or(1e-6);
+        let lm_ridge = input
+            .initial_lm_lambda
+            .unwrap_or(crate::loop_guard::MADSEN_DAMPING_FLOOR);
         let likelihood_scale = match family {
             PirlsRowFamily::GammaLog => pirls_gpu::PirlsLoopLikelihoodScale::gamma_shape(
                 input
