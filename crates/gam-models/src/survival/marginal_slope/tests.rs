@@ -7552,6 +7552,31 @@ fn rigid_survival_all_axes_build_once_equals_per_axis_sweep_979() {
                  diverged from the per-axis sweep by {max_gap:e}"
             );
         }
+
+        // The fifth-order information path contracts its two fixed directions
+        // into a symmetric primary third tensor. Check the shared assembly
+        // against independent row pullbacks with nonconstant, signed tensors.
+        let tensors: Vec<[[[f64; 4]; 4]; 4]> = (0..n).map(|row| {
+            std::array::from_fn(|a| std::array::from_fn(|b| std::array::from_fn(|c| {
+                ((row + 3 * (a + b + c)) as f64 * 0.17).sin()
+            })))
+        }).collect();
+        let assembled = kernel.all_axes_primary_tensor_pullback(&tensors).unwrap();
+        for axis in 0..p {
+            let mut direction = vec![0.0; p];
+            direction[axis] = 1.0;
+            let mut expected = Array2::<f64>::zeros((p, p));
+            for row in 0..n {
+                let projected = kernel.jacobian_action(row, &direction);
+                let hessian = std::array::from_fn(|a| std::array::from_fn(|b| {
+                    (0..4).map(|c| tensors[row][a][b][c] * projected[c]).sum()
+                }));
+                kernel.add_pullback_hessian(row, &hessian, &mut expected);
+            }
+            let scale = expected.iter().fold(1.0_f64, |s, x| s.max(x.abs()));
+            assert!(assembled[axis].iter().zip(&expected)
+                .all(|(actual, expected)| (actual - expected).abs() < 2e-12 * scale));
+        }
     }
 }
 

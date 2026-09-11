@@ -1649,17 +1649,9 @@ impl<const P: usize, G: SlopeRowGeometry<P>> RowKernel<P>
     /// expensive (closed-form probit/log-pdf composition over four primaries),
     /// so this is the #979 inner-Newton Jeffreys/Firth hot path.
     ///
-    /// This override builds each row's `t3` tensor ONCE (the swept axis enters
-    /// only through the cheap primary projection `dir_a = Jᵢ·e_a` and the linear
-    /// `t3.third_contracted(dir_a)`), then closes every axis off that single
-    /// build. Crucially it reuses the kernel's OWN `jacobian_action`,
-    /// `Tower4::third_contracted`, and `add_pullback_hessian` in the EXACT SAME
-    /// `ARROW_ROW_CHUNK`-chunked reduction order as the generic per-axis path
-    /// (`par_try_reduce_fold(RowSet::All)`): the cached `t3[row]` is bit-for-bit
-    /// the tensor a fresh `program_full_tower(row)` would produce (a deterministic
-    /// pure function of the row), and every float op downstream is identical, so
-    /// axis `a` matches `row_kernel_directional_derivative(self, All, e_a)`
-    /// bit-for-bit. Only the redundant `(p−1)·n` tower rebuilds are removed.
+    /// Build each row's `t3` once and assemble the pullbacks as weighted Grams.
+    /// This preserves the derivatives, with floating-point reassociation of
+    /// the row sums checked against the scalar per-axis implementation.
     ///
     /// Claims only the full-data unit-weight `RowSet::All` case; otherwise
     /// returns `None` so the generic per-axis Horvitz-Thompson sweep runs.
@@ -1678,7 +1670,7 @@ impl<const P: usize, G: SlopeRowGeometry<P>> RowKernel<P>
         if !matches!(rows, crate::row_kernel::RowSet::All) {
             return None;
         }
-        Some(self.directional_derivative_all_axes_build_once(p))
+        Some(self.directional_derivative_all_axes_build_once())
     }
 
     /// Batched all-axes SECOND directional derivative of the joint Hessian for
@@ -1688,12 +1680,8 @@ impl<const P: usize, G: SlopeRowGeometry<P>> RowKernel<P>
     /// With `d_beta_u` fixed and the second direction sweeping every canonical
     /// axis, the generic per-axis path runs `p` full-data sweeps each evaluating
     /// the per-row two-seed program scalar through `row_fourth_contracted`.
-    /// This override builds each row's `t4` tensor and the fixed-direction
-    /// projection `dir_u = Jᵢ·u` ONCE, then closes every axis with the cheap
-    /// linear `t4.fourth_contracted(dir_u, dir_a)` and the kernel's own
-    /// `add_pullback_hessian`, in the SAME chunked reduction order as
-    /// `row_kernel_second_directional_derivative(self, All, u, e_a)` — bit-for-bit
-    /// identical, only the redundant tower rebuilds removed.
+    /// Contract each row's `t4` with the fixed direction once, then assemble
+    /// every swept axis through the same weighted-Gram path as first order.
     ///
     /// Claims only the full-data unit-weight `RowSet::All` case; otherwise `None`.
     fn second_directional_derivative_all_axes_dense_override(
@@ -1876,15 +1864,27 @@ impl<const P: usize, G: SlopeRowGeometry<P>> SurvivalMarginalSlopeRowKernel<P, G
     /// override docstring. Builds the per-row `t3` towers once, then for each
     /// canonical axis runs the identical chunked pullback reduction the generic
     /// per-axis sweep runs, reusing the cached tower instead of rebuilding it.
-    fn directional_derivative_all_axes_build_once(
-        &self,
-        p: usize,
-    ) -> Result<Vec<Array2<f64>>, String> {
+    fn directional_derivative_all_axes_build_once(&self) -> Result<Vec<Array2<f64>>, String> {
         // #1591: the consumer reads only `third_contracted` (a `t3` contraction),
         // so build the order-≤3 `Tower3<4>` per row — bit-identical on the read
         // channels to the dense `Tower4<4>` but without the discarded `t4` tensor.
         let towers = self.build_row_third_towers()?;
+        let tensors: Vec<_> = towers.into_iter().map(|tower| tower.t3).collect();
+        self.all_axes_primary_tensor_pullback(&tensors)
+    }
 
+    /// Pull back a symmetric primary third tensor along every coefficient axis.
+    /// Higher information derivatives first contract their fixed directions
+    /// into this tensor, so all orders share the same weighted-Gram assembly.
+    pub(super) fn all_axes_primary_tensor_pullback(
+        &self,
+        tensors: &[[[[f64; P]; P]; P]],
+    ) -> Result<Vec<Array2<f64>>, String> {
+        let p = self.n_coefficients();
+        let n = gam_math::jet_tower::RowProgram::n_rows(self);
+        if tensors.len() != n {
+            return Err("survival all-axes primary tensor row count mismatch".into());
+        }
         // This is a genuinely batched dense consumer: materialize the complete
         // row Jacobian J = J·I once through the kernel's structured BLAS-3
         // projection. The former axis loop called `jacobian_action` and
@@ -1906,7 +1906,6 @@ impl<const P: usize, G: SlopeRowGeometry<P>> SurvivalMarginalSlopeRowKernel<P, G
                 "survival marginal-slope all-axes derivative requires a dense J·I projection"
                     .to_string()
             })?;
-        let n = gam_math::jet_tower::RowProgram::n_rows(self);
         let expected = (n, P * p);
         if jacobians.dim() != expected {
             return Err(format!(
@@ -1942,7 +1941,7 @@ impl<const P: usize, G: SlopeRowGeometry<P>> SurvivalMarginalSlopeRowKernel<P, G
                         let weights = Array1::from_shape_fn(n, |row| {
                             let mut weight = 0.0;
                             for direction_primary in 0..P {
-                                weight += towers[row].t3[primary_left][primary_right]
+                                weight += tensors[row][primary_left][primary_right]
                                     [direction_primary]
                                     * jacobian_blocks[direction_primary][[row, axis]];
                             }
@@ -1964,32 +1963,28 @@ impl<const P: usize, G: SlopeRowGeometry<P>> SurvivalMarginalSlopeRowKernel<P, G
             .collect()
     }
 
-    /// gam#979 build-once all-axes SECOND directional derivative — see the trait
-    /// override docstring. Builds the per-row `t4` towers and the fixed-direction
-    /// projection once, then closes every axis from that single build in the
-    /// generic per-axis sweep's reduction order.
+    /// Contract the fixed direction once per row, then use the shared
+    /// weighted-Gram pullback for every swept coefficient axis.
     fn second_directional_derivative_all_axes_from_towers(
         &self,
         d_beta_u: &[f64],
         towers: &[SparseTower4<P, RIGID_LINEAR_MASK>],
     ) -> Result<Vec<Array2<f64>>, String> {
-        let p = self.n_coefficients();
-        (0..p)
-            .into_par_iter()
-            .map(|a| {
-                let mut axis = vec![0.0_f64; p];
-                axis[a] = 1.0;
-                gam_problem::with_nested_parallel(|| {
-                    self.chunked_pullback_reduce(p, |row, acc| {
-                        let dir_u = self.jacobian_action(row, d_beta_u);
-                        let dir_v = self.jacobian_action(row, &axis);
-                        let fourth = towers[row].fourth_contracted(&dir_u, &dir_v);
-                        self.add_pullback_hessian(row, &fourth, acc);
-                        Ok(())
+        let tensors: Vec<_> = towers
+            .iter()
+            .enumerate()
+            .map(|(row, tower)| {
+                let direction = self.jacobian_action(row, d_beta_u);
+                std::array::from_fn(|a| {
+                    std::array::from_fn(|b| {
+                        std::array::from_fn(|c| {
+                            (0..P).map(|d| tower.t4[a][b][d][c] * direction[d]).sum()
+                        })
                     })
                 })
             })
-            .collect()
+            .collect();
+        self.all_axes_primary_tensor_pullback(&tensors)
     }
 
     fn second_directional_derivative_all_axes_build_once(
