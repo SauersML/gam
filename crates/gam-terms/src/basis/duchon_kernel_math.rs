@@ -1019,13 +1019,13 @@ impl PolyharmonicBlockCoeff {
         let k_half = 0.5 * k_dim as f64;
         let power = 2.0 * m - k_dim as f64;
         // Log case: k_dim is even and `2m − k_dim` is a non-negative even
-        // integer (within ε). For fractional `m` this never fires; for
-        // integer `m` it matches the original integer modulo check exactly.
-        const LOG_EPS: f64 = 1e-12;
+        // integer, exactly. `m` is an integer or half-integer order, so the
+        // exponent is represented exactly and the test needs no slack; for
+        // fractional `m` it never fires.
         let two_m = 2.0 * m;
         let is_log_case = k_dim.is_multiple_of(2) && {
             let n_f = (power / 2.0).round();
-            n_f >= 0.0 && (n_f * 2.0 - power).abs() < LOG_EPS
+            n_f >= 0.0 && n_f * 2.0 == power
         };
         if is_log_case {
             let m_int = m.round() as i64;
@@ -1216,12 +1216,12 @@ pub(crate) fn polyharmonic_block_jet4(
     let k_half = 0.5 * k_dim as f64;
     let alpha = 2.0 * m - k_dim as f64;
     let alpha_i32 = exact_i32_exponent(alpha);
-    // Log case: k_dim even and `2m − k_dim` is a non-negative even integer
-    // (within ε). For fractional `m` this never fires.
-    const LOG_EPS: f64 = 1e-12;
+    // Log case: k_dim even and `2m − k_dim` is a non-negative even integer,
+    // exactly (the exponent is represented exactly). For fractional `m` this
+    // never fires.
     let is_log_case = k_dim.is_multiple_of(2) && {
         let n_f = (alpha / 2.0).round();
-        n_f >= 0.0 && (n_f * 2.0 - alpha).abs() < LOG_EPS
+        n_f >= 0.0 && n_f * 2.0 == alpha
     };
     if is_log_case {
         let m_int = m.round() as usize;

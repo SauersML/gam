@@ -9,7 +9,6 @@ const DEFAULT_TEMPERATURE: f64 = 0.25;
 const DEFAULT_CODE_RIDGE: f64 = 1.0e-8;
 const DEFAULT_TOLERANCE: f64 = 1.0e-7;
 const INACTIVE_LAMBDA: f64 = 1.0e30;
-const MIN_NORM2: f64 = 1.0e-24;
 
 // --- Safeguarded geometric acceleration of the atom trajectory (#2372). ---------
 // The alternating atom-sweep ↔ reroute map converges LINEARLY: near the solution
@@ -412,7 +411,7 @@ fn fit_multi_atom_dictionary(
             let final_score =
                 penalized_reconstruction_loss(x, fitted.view(), config.code_ridge, atoms.view());
             for atom_idx in 0..config.n_atoms {
-                if atoms.row(atom_idx).dot(&atoms.row(atom_idx)) > MIN_NORM2 {
+                if atoms.row(atom_idx).dot(&atoms.row(atom_idx)) > 0.0 {
                     reml_scores[atom_idx] = final_score;
                 }
             }
@@ -800,7 +799,7 @@ fn fit_one_atom_penalized_ls(
 ) -> Result<bool, String> {
     let code = assignments.column(atom_idx).to_owned();
     let code_norm2 = code.dot(&code);
-    if code_norm2 <= MIN_NORM2 {
+    if code_norm2 == 0.0 {
         // #1500: this atom's cluster is EMPTY (no rows routed to it by the
         // assignment step). Zeroing it here made the atom permanently DEAD — a
         // zero atom has zero similarity to every row, so `top_k_assignments`
@@ -815,18 +814,26 @@ fn fit_one_atom_penalized_ls(
         // yet, so EV is momentarily flat — converging now would strand it).
         let mut worst_row = 0usize;
         let mut worst_res2 = -1.0_f64;
+        let mut worst_energy = 0.0_f64;
         for row in 0..x.nrows() {
             let mut res2 = 0.0_f64;
+            let mut energy = 0.0_f64;
             for col in 0..x.ncols() {
                 let d = x[[row, col]] - fitted[[row, col]];
                 res2 += d * d;
+                energy += x[[row, col]] * x[[row, col]];
             }
             if res2 > worst_res2 {
                 worst_res2 = res2;
                 worst_row = row;
+                worst_energy = energy;
             }
         }
-        if worst_res2 <= MIN_NORM2 {
+        // A residual inside its row's rounding band `γ_p·‖x_row‖` is arithmetic:
+        // the row is reconstructed to the resolution the subtraction has.
+        let residual_band =
+            gam_linalg::roundoff::accumulation_growth(x.ncols()) * worst_energy.sqrt();
+        if worst_res2.sqrt() <= residual_band {
             // Every row is already fully reconstructed by the other atoms: there
             // is no unexplained direction to seed, so this atom is genuinely
             // redundant capacity. Leave it inactive (this is not the bug).
@@ -924,10 +931,18 @@ fn softmax_assignments(
     code_ridge: f64,
 ) -> Result<Array2<f64>, String> {
     let cross = x.dot(&atoms.t());
-    let atom_norm2 = atoms.map_axis(Axis(1), |row| row.dot(&row).max(MIN_NORM2));
+    // A zero atom states no direction: it has no similarity to any row and is
+    // never an assignment target.
+    let atom_norm2 = atoms.map_axis(Axis(1), |row| row.dot(&row));
     let mut assignments = Array2::<f64>::zeros((x.nrows(), atoms.nrows()));
     for row in 0..x.nrows() {
-        let active = top_indices_by_abs(cross.row(row), top_k);
+        let active: Vec<usize> = top_indices_by_abs(cross.row(row), top_k)
+            .into_iter()
+            .filter(|&atom_idx| atom_norm2[atom_idx] > 0.0)
+            .collect();
+        if active.is_empty() {
+            continue;
+        }
         let mut max_score = f64::NEG_INFINITY;
         for &atom_idx in &active {
             let score = cross[[row, atom_idx]].abs() / (atom_norm2[atom_idx].sqrt() * temperature);
@@ -1013,7 +1028,7 @@ fn normalize_atom_and_assignments(
     atom_idx: usize,
 ) {
     let norm = atoms.row(atom_idx).dot(&atoms.row(atom_idx)).sqrt();
-    if norm > MIN_NORM2.sqrt() {
+    if norm > 0.0 {
         atoms.row_mut(atom_idx).mapv_inplace(|value| value / norm);
         assignments
             .column_mut(atom_idx)
@@ -1040,7 +1055,7 @@ fn orient_vector(vector: &mut Array1<f64>) {
 
 fn first_nonzero_sign(row: ndarray::ArrayView1<'_, f64>) -> f64 {
     for &value in row {
-        if value.abs() > 1.0e-12 {
+        if value != 0.0 {
             return value.signum();
         }
     }
@@ -1049,7 +1064,7 @@ fn first_nonzero_sign(row: ndarray::ArrayView1<'_, f64>) -> f64 {
 
 fn normalize_row(mut row: ndarray::ArrayViewMut1<'_, f64>) {
     let norm = row.dot(&row).sqrt();
-    if norm > MIN_NORM2.sqrt() {
+    if norm > 0.0 {
         row.mapv_inplace(|value| value / norm);
     }
 }
@@ -1091,10 +1106,12 @@ fn squared_distance(a: ndarray::ArrayView1<'_, f64>, b: ndarray::ArrayView1<'_, 
 
 fn explained_variance(x: ArrayView2<'_, f64>, fitted: ArrayView2<'_, f64>) -> f64 {
     let mut rss = 0.0;
+    let mut energy = 0.0;
     for row in 0..x.nrows() {
         for col in 0..x.ncols() {
             let residual = x[[row, col]] - fitted[[row, col]];
             rss += residual * residual;
+            energy += x[[row, col]] * x[[row, col]];
         }
     }
     let means = x.mean_axis(Axis(0)).expect("non-empty input has means");
@@ -1105,8 +1122,13 @@ fn explained_variance(x: ArrayView2<'_, f64>, fitted: ArrayView2<'_, f64>) -> f6
             tss += centered * centered;
         }
     }
-    if tss <= MIN_NORM2 {
-        if rss <= MIN_NORM2 { 1.0 } else { 0.0 }
+    // Centered deviations and residuals are subtractions over `n·p` entries of
+    // magnitude up to `‖x‖_F`; sums of squares inside that accumulation's squared
+    // band carry no spread the arithmetic can show.
+    let band = gam_linalg::roundoff::accumulation_growth(x.nrows() * x.ncols()) * energy.sqrt();
+    let band2 = band * band;
+    if tss <= band2 {
+        if rss <= band2 { 1.0 } else { 0.0 }
     } else {
         1.0 - rss / tss
     }

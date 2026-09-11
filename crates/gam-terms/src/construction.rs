@@ -2904,6 +2904,7 @@ impl KroneckerReparamResult {
         let eigenvalue_views: Vec<ArrayView1<'_, f64>> =
             self.marginal_eigenvalues.iter().map(|m| m.view()).collect();
         let has_double = self.has_double_penalty && lambdas.len() > d;
+        let structural_zero_band = kronecker_structural_zero_band(&eigenvalue_views);
         let mut multi_idx = vec![0usize; d];
         let mut flat = 0usize;
         loop {
@@ -2914,6 +2915,7 @@ impl KroneckerReparamResult {
                 d,
                 has_double,
                 0.0,
+                structural_zero_band,
             );
             s[[flat, flat]] = sigma;
             flat += 1;
@@ -2973,6 +2975,8 @@ impl KroneckerReparamResult {
         let eigenvalue_views: Vec<ArrayView1<'_, f64>> =
             self.marginal_eigenvalues.iter().map(|m| m.view()).collect();
         let has_double = self.has_double_penalty && lambdas.len() > d;
+        let structural_zero_band = kronecker_structural_zero_band(&eigenvalue_views);
+        let penalized_zero_band = kronecker_penalized_zero_band(&eigenvalue_views, lambdas, d);
         let diag_vals: Vec<f64> = {
             let mut vals = Vec::with_capacity(p);
             let mut multi_idx = vec![0usize; d];
@@ -2984,8 +2988,9 @@ impl KroneckerReparamResult {
                     d,
                     has_double,
                     0.0,
+                    structural_zero_band,
                 );
-                vals.push(if sigma > 0.0 { sigma.sqrt() } else { 0.0 });
+                vals.push(if sigma > penalized_zero_band { sigma.sqrt() } else { 0.0 });
 
                 if kronecker_multi_index_advance(&mut multi_idx, &self.marginal_dims) {
                     break;
@@ -2993,11 +2998,11 @@ impl KroneckerReparamResult {
             }
             vals
         };
-        let rank = diag_vals.iter().filter(|&&v| v > 1e-12).count();
+        let rank = diag_vals.iter().filter(|&&v| v > 0.0).count();
         let mut e_transformed = Array2::<f64>::zeros((rank, p));
         let mut row = 0;
         for (j, &v) in diag_vals.iter().enumerate() {
-            if v > 1e-12 {
+            if v > 0.0 {
                 e_transformed[[row, j]] = v;
                 row += 1;
             }
@@ -3036,7 +3041,35 @@ impl KroneckerReparamResult {
 /// Shared implementation for `KroneckerPenaltySystem::logdet_and_derivatives`
 /// and `kronecker_reparameterization_engine`.  Iterates over the ∏q_j
 /// multi-index grid in O(d · ∏q_j) time with no O(p²) storage.
-const KRONECKER_STRUCTURAL_ZERO_TOL: f64 = 1e-12;
+fn kronecker_structural_zero_band(marginal_eigenvalues: &[ArrayView1<'_, f64>]) -> f64 {
+    // A λ-free eigenvalue sum inside the marginal eigensolvers' rounding bands
+    // `Σ_k γ_{q_k}·max|μ_k|` is zero to the resolution the marginal spectra have.
+    marginal_eigenvalues
+        .iter()
+        .map(|marginal| {
+            gam_linalg::roundoff::accumulation_growth(marginal.len())
+                * marginal.iter().fold(0.0_f64, |acc, value| acc.max(value.abs()))
+        })
+        .sum()
+}
+
+/// The same band with each marginal's contribution scaled by the smoothing
+/// parameter that multiplies it: a penalized joint eigenvalue `Σ_k λ_k·μ_k`
+/// inside it carries no resolvable penalty.
+fn kronecker_penalized_zero_band(
+    marginal_eigenvalues: &[ArrayView1<'_, f64>],
+    lambdas: &[f64],
+    d: usize,
+) -> f64 {
+    (0..d)
+        .map(|k| {
+            let marginal = &marginal_eigenvalues[k];
+            lambdas[k].abs()
+                * gam_linalg::roundoff::accumulation_growth(marginal.len())
+                * marginal.iter().fold(0.0_f64, |acc, value| acc.max(value.abs()))
+        })
+        .sum()
+}
 
 /// Per-cell Kronecker eigenvalue accumulation — the single source of truth for
 /// the #1172/#1185 tensor-penalty math.
@@ -3059,6 +3092,7 @@ fn kronecker_cell_sigma(
     d: usize,
     has_double_penalty: bool,
     objective_ridge: f64,
+    structural_zero_band: f64,
 ) -> (f64, f64, bool) {
     let mut sigma = 0.0;
     let mut structural_sigma = 0.0;
@@ -3067,11 +3101,11 @@ fn kronecker_cell_sigma(
         structural_sigma += marginal_eigenvalue;
         sigma += lambdas[k] * marginal_eigenvalue;
     }
-    let joint_null = structural_sigma <= KRONECKER_STRUCTURAL_ZERO_TOL;
+    let joint_null = structural_sigma <= structural_zero_band;
     if has_double_penalty && joint_null {
         sigma += lambdas[d];
     }
-    if structural_sigma > KRONECKER_STRUCTURAL_ZERO_TOL {
+    if structural_sigma > structural_zero_band {
         sigma += objective_ridge;
     }
     (sigma, structural_sigma, joint_null)
@@ -3108,7 +3142,8 @@ pub fn kronecker_logdet_and_derivatives(
     let mut logdet = 0.0;
     let mut grad = Array1::<f64>::zeros(n_pen);
     let mut hess = Array2::<f64>::zeros((n_pen, n_pen));
-    let tol = 1e-12;
+    let structural_zero_band = kronecker_structural_zero_band(marginal_eigenvalues);
+    let tol = kronecker_penalized_zero_band(marginal_eigenvalues, lambdas, d);
 
     let mut multi_idx = vec![0usize; d];
     loop {
@@ -3119,6 +3154,7 @@ pub fn kronecker_logdet_and_derivatives(
             d,
             has_double_penalty,
             objective_ridge,
+            structural_zero_band,
         );
 
         if sigma > tol {
