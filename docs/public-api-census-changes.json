@@ -1,5 +1,14 @@
 [
   {
+    "base": "4249f82e62ffb0949bed239248006e68994a3242",
+    "removed": {
+      "crates/gam-event-history/src/joint/category_prior.rs::oracle": 1,
+      "crates/gam-event-history/src/joint/structural_prior.rs::oracle": 1
+    },
+    "reason": "Move the two test-only AD reference functions into a shared private test module so sibling tests do not require exported test modules. No production API or equation is removed.",
+    "evidence": "function_prior_tests.rs contains the same oracle bodies as category_oracle and structural_oracle. Category, structural, and combined function-prior tests call these replacements; all original test cases remain."
+  },
+  {
     "base": "e29e4da1b4ca349ee734a01e630d988b1b9c127d",
     "removed": {
       "crates/gam-custom-family/src/tests/inner_solver_numerics.rs::strict_solve_spd_falls_back_to_eigen_floor_on_indefinite_matrix": 1,
