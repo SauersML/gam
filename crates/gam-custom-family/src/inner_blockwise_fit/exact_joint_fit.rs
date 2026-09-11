@@ -841,6 +841,38 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
                         }
                     }
                     refresh_all_block_etas(family, specs, &mut states)?;
+                    // The escape moved β, so everything the next cycle reads about
+                    // the current iterate must be reloaded at the escaped point,
+                    // exactly as after an accepted step. The next cycle takes its
+                    // gradient from `cached_joint_gradient`, its Hessian source from
+                    // `cached_joint_hessian_source`, and scores trial points against
+                    // `lastobjective`. Carrying the saddle's values offsets every
+                    // trust ratio by the escape's own objective change, so all
+                    // attempts measure the same increase while the step shrinks
+                    // to the radius floor (#1561).
+                    let (log_likelihood, gradient, eval, workspace) =
+                        load_joint_gradient_evaluation(
+                            family,
+                            specs,
+                            options,
+                            &states,
+                            joint_workspace_requested,
+                            None,
+                        )?;
+                    current_log_likelihood = log_likelihood;
+                    cached_joint_gradient = gradient;
+                    cached_eval = eval;
+                    cached_joint_workspace = workspace;
+                    cached_joint_hessian_source = None;
+                    current_penalty = total_quadratic_penalty(
+                        &states,
+                        &s_lambdas,
+                        ridge,
+                        options.ridge_policy,
+                        joint_bundle,
+                        Some(specs),
+                    );
+                    lastobjective = -current_log_likelihood + current_penalty;
                     saddle_escapes_used += 1;
                     previous_escape_lambda_min = Some(lambda_min);
                     log::info!(
