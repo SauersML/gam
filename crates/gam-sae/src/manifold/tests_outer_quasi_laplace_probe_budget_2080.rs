@@ -1278,22 +1278,30 @@ fn zz_measure_wide_p_criterion_cost_localizer_2080() {
         ta.run_joint_fit_arrow_schur(z.view(), &mut rho_a, None, 8, 0.04, 1.0e-6, 1.0e-6)
             .expect("inner solve");
         let dt_a = a0.elapsed().as_secs_f64();
+        // Report phase A as soon as it exists: the criterion below may refuse,
+        // and a trailing report would then discard the one phase that ran.
+        eprintln!("[#2080 localize] p={p:>3} beta_dim={beta_dim:>4} | inner_A={dt_a:8.3}s");
 
         // Full criterion (returns the converged undamped cache).
         let mut tb = term.clone();
         let f0 = std::time::Instant::now();
-        let (_cost, _loss, cache) = tb
-            .penalized_quasi_laplace_criterion_with_cache(
-                z.view(),
-                &rho,
-                None,
-                8,
-                0.04,
-                1.0e-6,
-                1.0e-6,
-            )
-            .expect("full criterion");
+        let criterion = tb.penalized_quasi_laplace_criterion_with_cache(
+            z.view(),
+            &rho,
+            None,
+            8,
+            0.04,
+            1.0e-6,
+            1.0e-6,
+        );
         let dt_full = f0.elapsed().as_secs_f64();
+        let (_cost, _loss, cache) = match criterion {
+            Ok(evaluated) => evaluated,
+            Err(refusal) => panic!(
+                "p={p}: the full criterion refused after {dt_full:.3}s (inner_A={dt_a:.3}s), so \
+                 phases M and E have no converged cache to time: {refusal}"
+            ),
+        };
         let total_t = cache.delta_t_len();
         let dim = total_t + cache.k;
 

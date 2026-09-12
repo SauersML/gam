@@ -191,6 +191,36 @@ impl GaugeOrbitDescent {
     }
 }
 
+/// What one [`SaeManifoldTerm::minimize_objective_along`] call measured (#2080).
+/// `alpha == 0` means no trial met sufficient decrease. Read it beside
+/// `finite_trials`: a trial whose step failed to apply, or whose objective was not
+/// finite, says nothing about the objective.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct ObjectiveLineMinimum {
+    /// Step at the smallest objective measured; `0` when no trial met sufficient
+    /// decrease.
+    pub(crate) alpha: f64,
+    /// Objective at `alpha` (the base value when `alpha == 0`).
+    pub(crate) value: f64,
+    /// Calls to `penalized_objective_total`, finite or not.
+    pub(crate) objective_evaluations: usize,
+    /// Trials whose step applied and whose objective was finite.
+    pub(crate) finite_trials: usize,
+    /// Trials whose step failed to apply or whose objective was unusable.
+    pub(crate) failed_trials: usize,
+    /// The first failed trial's reason, when there was one.
+    pub(crate) first_failure: Option<String>,
+}
+
+impl ObjectiveLineMinimum {
+    fn record_failure(&mut self, reason: String) {
+        self.failed_trials += 1;
+        if self.first_failure.is_none() {
+            self.first_failure = Some(reason);
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum EvidenceFixedPointGap {
     /// No clause failed: the pass recurred its entry state exactly.
@@ -2704,23 +2734,225 @@ impl SaeManifoldTerm {
     fn orthonormalized(candidates: impl Iterator<Item = Array1<f64>>) -> Vec<Array1<f64>> {
         let mut orthonormal: Vec<Array1<f64>> = Vec::new();
         for mut candidate in candidates {
+            let candidate_norm = candidate.dot(&candidate).sqrt();
             for basis in &orthonormal {
                 let coeff = candidate.dot(basis);
                 for i in 0..candidate.len() {
                     candidate[i] -= coeff * basis[i];
                 }
             }
-            let norm_sq = candidate.iter().map(|v| v * v).sum::<f64>();
-            if norm_sq <= 1.0e-24 || !norm_sq.is_finite() {
+            // A residual inside the roundoff of the projections that produced it
+            // is in the span already accumulated. Each of the `orthonormal.len()`
+            // passes and the final norm perturbs it by at most `γ_N·‖c‖`, with
+            // `γ_N = Nε/(1 − Nε)` over the `N` entries (Higham, Accuracy and
+            // Stability of Numerical Algorithms, Lemma 3.1). Normalizing a residual
+            // below that bound would mint a direction made of rounding noise.
+            let n_eps = candidate.len() as f64 * f64::EPSILON;
+            let roundoff = if n_eps < 1.0 {
+                (orthonormal.len() + 1) as f64 * (n_eps / (1.0 - n_eps)) * candidate_norm
+            } else {
+                f64::INFINITY
+            };
+            let norm = candidate.dot(&candidate).sqrt();
+            if !(norm.is_finite() && norm > roundoff) {
                 continue;
             }
-            let inv_norm = norm_sq.sqrt().recip();
+            let inv_norm = norm.recip();
             for v in candidate.iter_mut() {
                 *v *= inv_norm;
             }
             orthonormal.push(candidate);
         }
         orthonormal
+    }
+
+    /// #2080 — minimize the penalized objective along ONE normalized direction by
+    /// a sequential line search, instead of evaluating a grid of steps and keeping
+    /// the best (SPEC: grid search is never allowed).
+    ///
+    /// `slope = −φ′(0) > 0` is the exact first-order decrease rate of
+    /// `φ(α) = f(x + α·d̂)`. The steps live between two endpoints the state
+    /// supplies, not chosen constants:
+    ///
+    /// * the far end is [`Self::inner_iterate_scale`]: one step may not move the
+    ///   iterate further than the iterate's own magnitude, the same scale-free
+    ///   trust radius the Newton step clips against;
+    /// * the near end is `material_floor / slope`, below which the first-order
+    ///   model predicts less than the objective's resolution, so no shorter step
+    ///   could be committed even if it were exact.
+    ///
+    /// 1. Armijo backtracking from the far end finds the LONGEST step with
+    ///    sufficient decrease. A direction with tiny curvature and a live gradient
+    ///    needs a long step (#2762), and this is the globalization that starts
+    ///    long. Its trial count is the number of contractions between the two
+    ///    endpoints.
+    /// 2. From that step the search keeps contracting only while the objective
+    ///    still improves; the first trial that does not improve closes a bracket
+    ///    around the valley.
+    /// 3. Golden-section refinement shrinks the bracket to `√ε` relative width. A
+    ///    smooth minimum cannot be located more precisely from f64 values: near it
+    ///    `f` varies quadratically, so a displacement of `√ε·α` changes `f` by
+    ///    `ε`-level noise. That is an information bound, not an iteration count.
+    ///
+    /// Every trial restores `snapshot` bit-for-bit, so on return the state is the
+    /// snapshot's; the caller owns the commit law. A trial whose step fails to
+    /// apply or whose objective is not finite carries no information about the
+    /// objective, so it is counted and its first reason kept, never folded into a
+    /// zero decrease.
+    pub(crate) fn minimize_objective_along(
+        &mut self,
+        target: ArrayView2<'_, f64>,
+        rho: &SaeManifoldRho,
+        registry: Option<&AnalyticPenaltyRegistry>,
+        direction: ArrayView1<'_, f64>,
+        dense_len: usize,
+        base_objective: f64,
+        slope: f64,
+        material_floor: f64,
+        snapshot: &SaeManifoldMutableState,
+    ) -> Result<ObjectiveLineMinimum, String> {
+        let mut line = ObjectiveLineMinimum {
+            alpha: 0.0,
+            value: base_objective,
+            objective_evaluations: 0,
+            finite_trials: 0,
+            failed_trials: 0,
+            first_failure: None,
+        };
+        let far_alpha = self.inner_iterate_scale();
+        let near_alpha = material_floor / slope;
+        if !(base_objective.is_finite()
+            && slope.is_finite()
+            && slope > 0.0
+            && far_alpha.is_finite()
+            && near_alpha.is_finite()
+            && near_alpha > 0.0
+            && near_alpha <= far_alpha)
+        {
+            return Ok(line);
+        }
+        let trial_at =
+            |term: &mut Self, alpha: f64, line: &mut ObjectiveLineMinimum| -> Result<f64, String> {
+                let value = match term.apply_newton_step(
+                    direction.slice(s![..dense_len]),
+                    direction.slice(s![dense_len..]),
+                    alpha,
+                ) {
+                    Ok(()) => {
+                        line.objective_evaluations += 1;
+                        match term.penalized_objective_total(target, rho, registry, 1.0) {
+                            Ok(value) if value.is_finite() => Some(value),
+                            Ok(value) => {
+                                line.record_failure(format!(
+                                    "non-finite objective {value} at α={alpha:.3e}"
+                                ));
+                                None
+                            }
+                            Err(err) => {
+                                line.record_failure(format!("objective at α={alpha:.3e}: {err}"));
+                                None
+                            }
+                        }
+                    }
+                    Err(err) => {
+                        line.record_failure(format!("step at α={alpha:.3e}: {err}"));
+                        None
+                    }
+                };
+                term.restore_mutable_state(snapshot).map_err(|err| {
+                    format!(
+                        "SaeManifoldTerm::minimize_objective_along: restoring the pre-trial \
+                         state after the trial at α={alpha:.6e} failed: {err}"
+                    )
+                })?;
+                Ok(match value {
+                    Some(value) => {
+                        line.finite_trials += 1;
+                        value
+                    }
+                    None => f64::INFINITY,
+                })
+            };
+
+        // (1) Longest sufficient-decrease step from the trust radius.
+        let contraction = BacktrackConfig::default().contraction;
+        let mut max_steps = 1usize;
+        let mut shortest = far_alpha;
+        while shortest * contraction >= near_alpha {
+            shortest *= contraction;
+            max_steps += 1;
+        }
+        let cushion = opt::armijo_roundoff_cushion(base_objective);
+        let accepted = backtracking_line_search::<_, String>(
+            BacktrackConfig {
+                initial_step: far_alpha,
+                max_steps,
+                ..BacktrackConfig::default()
+            },
+            |alpha| {
+                trial_at(self, alpha, &mut line)
+                    .map(|value| value.is_finite().then_some((value, ())))
+            },
+            |alpha, value| {
+                value <= base_objective - SAE_MANIFOLD_ARMIJO_C1 * alpha * slope + cushion
+            },
+        )?;
+        let Some(accepted) = accepted else {
+            return Ok(line);
+        };
+
+        // (2) Contract while the objective still improves. The rejected trial
+        // before the accepted one, or the trust radius itself, bounds the valley
+        // from above.
+        let mut best_alpha = accepted.step;
+        let mut best_value = accepted.value;
+        let mut high = (best_alpha / contraction).min(far_alpha);
+        let mut low = best_alpha * contraction;
+        while low >= near_alpha {
+            let value = trial_at(self, low, &mut line)?;
+            if value < best_value {
+                high = best_alpha;
+                best_alpha = low;
+                best_value = value;
+                low = best_alpha * contraction;
+            } else {
+                break;
+            }
+        }
+
+        // (3) Golden-section refinement of [low, high] to the f64 information bound.
+        let golden_ratio_inverse = 0.5 * (5.0_f64.sqrt() - 1.0);
+        let resolution = f64::EPSILON.sqrt() * best_alpha;
+        let mut inner_low = high - golden_ratio_inverse * (high - low);
+        let mut inner_high = low + golden_ratio_inverse * (high - low);
+        let mut value_low = trial_at(self, inner_low, &mut line)?;
+        let mut value_high = trial_at(self, inner_high, &mut line)?;
+        while high - low > resolution {
+            if value_low <= value_high {
+                high = inner_high;
+                inner_high = inner_low;
+                value_high = value_low;
+                inner_low = high - golden_ratio_inverse * (high - low);
+                value_low = trial_at(self, inner_low, &mut line)?;
+            } else {
+                low = inner_low;
+                inner_low = inner_high;
+                value_low = value_high;
+                inner_high = low + golden_ratio_inverse * (high - low);
+                value_high = trial_at(self, inner_high, &mut line)?;
+            }
+        }
+        if value_low < best_value {
+            best_value = value_low;
+            best_alpha = inner_low;
+        }
+        if value_high < best_value {
+            best_value = value_high;
+            best_alpha = inner_high;
+        }
+        line.alpha = best_alpha;
+        line.value = best_value;
+        Ok(line)
     }
 
     /// #2762 — MINIMIZE the penalized objective over the span the LIKELIHOOD is
@@ -2785,8 +3017,9 @@ impl SaeManifoldTerm {
     ///
     /// # The line search, and why every bound in it is derived
     ///
-    /// Along `d̂ = −Π_V g/‖Π_V g‖` the objective is swept geometrically between
-    /// two ENDPOINTS THE STATE ITSELF SUPPLIES, not between chosen constants:
+    /// Each round minimizes `f` along `d̂ = −Π_V g/‖Π_V g‖` with
+    /// [`Self::minimize_objective_along`], a sequential line search between two
+    /// ENDPOINTS THE STATE ITSELF SUPPLIES, not chosen constants:
     ///
     /// * the far end is [`Self::inner_iterate_scale`] — one step may not move
     ///   the iterate further than the iterate's own magnitude, the same
@@ -2794,12 +3027,9 @@ impl SaeManifoldTerm {
     ///   same one the KKT tolerance is measured in;
     /// * the near end is `material_floor / ‖Π_V g‖`, below which the FIRST-ORDER
     ///   model itself predicts less than the objective's own resolution — so no
-    ///   shorter step could be committed even if it were exact. That is a proof
-    ///   that the sweep is complete, not a cap on it.
+    ///   shorter step could be committed even if it were exact.
     ///
-    /// The best bracket is then refined once by the parabola through
-    /// `(α/2, α, 2α)`, which is exact for a quadratic and is accepted only if it
-    /// measures better. A round commits only a decrease clearing the material
+    /// A round commits only a decrease clearing the material
     /// floor `SAE_MANIFOLD_INNER_OBJECTIVE_STALL_REL_TOL · (1 + |f|)` — the same
     /// floor the evidence lane's Armijo and proximal gates use — so a committed
     /// move is never the ε-harvest that makes an inner map non-idempotent, and
@@ -2885,109 +3115,25 @@ impl SaeManifoldTerm {
             }
             let material_floor =
                 SAE_MANIFOLD_INNER_OBJECTIVE_STALL_REL_TOL * (1.0 + base_objective.abs());
-            // Both ends of the sweep come from the state: the far end is the
-            // iterate's own magnitude, the near end is where the first-order
-            // model stops predicting a committable decrease.
-            let far_alpha = self.inner_iterate_scale();
-            let near_alpha = material_floor / slope;
-            if !(far_alpha.is_finite() && far_alpha > 0.0 && near_alpha.is_finite()) {
-                return Ok(outcome);
-            }
             let snapshot = self.snapshot_mutable_state();
-            let evaluate = |term: &mut Self, alpha: f64| -> Result<f64, String> {
-                if !(alpha.is_finite() && alpha > 0.0) {
-                    return Ok(f64::INFINITY);
-                }
-                let value = term
-                    .apply_newton_step(
-                        direction.slice(s![..dense_len]),
-                        direction.slice(s![dense_len..]),
-                        alpha,
-                    )
-                    .and_then(|()| term.penalized_objective_total(target, rho, registry, 1.0))
-                    .unwrap_or(f64::INFINITY);
-                term.restore_mutable_state(&snapshot).map_err(|err| {
-                    format!(
-                        "SaeManifoldTerm::descend_gauge_orbit: restoring the pre-round state \
-                         after the speculative trial at alpha={alpha:.6e} failed: {err}"
-                    )
-                })?;
-                Ok(if value.is_finite() {
-                    value
-                } else {
-                    f64::INFINITY
-                })
-            };
-
-            let mut best_alpha = 0.0_f64;
-            let mut best_value = base_objective;
-            let mut alpha = far_alpha;
-            while alpha >= near_alpha {
-                outcome.evaluations += 1;
-                let value = evaluate(self, alpha)?;
-                if value < best_value {
-                    best_value = value;
-                    best_alpha = alpha;
-                }
-                alpha *= 0.5;
-            }
-            if best_alpha > 0.0 {
-                // GOLDEN-SECTION REFINEMENT of the bracket the halving grid
-                // located, run to the limit of what f64 function VALUES can
-                // resolve.
-                //
-                // A grid minimum plus one parabolic step is not enough here, and
-                // the trail says so: with that refinement the block committed a
-                // decrease on 603 consecutive calls and `maxᵢ|gᵀvᵢ|` never fell
-                // below `1.33e-1` — the round kept leaving slope behind because
-                // it stopped at a grid point, so the next round re-descended the
-                // same trough. A block step that does not leave its block
-                // stationary is not a block step.
-                //
-                // The bracket is `[α/2, 2α]` around the grid minimum and shrinks
-                // by the golden ratio, which is the optimal derivative-free
-                // contraction. It stops at `√ε` RELATIVE width: a smooth
-                // function's minimum cannot be located more precisely than that
-                // from values alone (near the minimum `f` varies quadratically,
-                // so a displacement of `√ε·α` changes `f` by `ε`-level noise) —
-                // an information bound of the f64 evaluation, not a chosen
-                // iteration count.
-                const GOLDEN_RATIO_INVERSE: f64 = 0.618_033_988_749_894_9;
-                let mut low = best_alpha * 0.5;
-                let mut high = best_alpha * 2.0;
-                let resolution = f64::EPSILON.sqrt() * best_alpha;
-                let mut inner_low = high - GOLDEN_RATIO_INVERSE * (high - low);
-                let mut inner_high = low + GOLDEN_RATIO_INVERSE * (high - low);
-                let mut value_low = evaluate(self, inner_low)?;
-                let mut value_high = evaluate(self, inner_high)?;
-                outcome.evaluations += 2;
-                while high - low > resolution {
-                    if value_low <= value_high {
-                        high = inner_high;
-                        inner_high = inner_low;
-                        value_high = value_low;
-                        inner_low = high - GOLDEN_RATIO_INVERSE * (high - low);
-                        value_low = evaluate(self, inner_low)?;
-                    } else {
-                        low = inner_low;
-                        inner_low = inner_high;
-                        value_low = value_high;
-                        inner_high = low + GOLDEN_RATIO_INVERSE * (high - low);
-                        value_high = evaluate(self, inner_high)?;
-                    }
-                    outcome.evaluations += 1;
-                }
-                if value_low < best_value {
-                    best_value = value_low;
-                    best_alpha = inner_low;
-                }
-                if value_high < best_value {
-                    best_value = value_high;
-                    best_alpha = inner_high;
-                }
-            }
-
-            let trial_decrease = base_objective - best_value;
+            // One sequential line minimization along `d̂`, with the endpoints this
+            // block has always used (see [`Self::minimize_objective_along`]). It
+            // replaces a halving grid that evaluated every step between the two
+            // endpoints and kept the best (#2080, SPEC: grid search is never allowed).
+            let line = self.minimize_objective_along(
+                target,
+                rho,
+                registry,
+                direction.view(),
+                dense_len,
+                base_objective,
+                slope,
+                material_floor,
+                &snapshot,
+            )?;
+            outcome.evaluations += line.objective_evaluations;
+            let best_alpha = line.alpha;
+            let trial_decrease = base_objective - line.value;
             if !(best_alpha > 0.0 && trial_decrease > material_floor) {
                 self.restore_mutable_state(&snapshot)
                     .map_err(|err| format!("SaeManifoldTerm::descend_gauge_orbit: {err}"))?;

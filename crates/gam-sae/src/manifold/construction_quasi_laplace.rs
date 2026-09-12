@@ -2303,43 +2303,17 @@ impl SaeManifoldTerm {
             gradient[dense_len + index] = value;
         }
 
-        // Same span, same order, same Gram--Schmidt as the projection the gate
-        // reads, so what is measured here is exactly what is removed there.
-        let gauges = match (
-            self.dense_step_gauge_vectors(),
-            self.joint_decoder_beta_null_directions(lambda_smooth),
-            self.decoder_channel_null_directions(),
-        ) {
-            (Ok(chart), Ok(beta_null), Ok(channel_null)) => chart
+        // The block the mover descends (chart orbit, decoder β-null, decoder
+        // channel-null), from the SAME constructor and Gram--Schmidt the mover
+        // uses, so what is measured here is what the mover could have descended.
+        let orthonormal: Vec<Array1<f64>> = match self.likelihood_flat_block_basis(lambda_smooth)
+        {
+            Ok(basis) => basis
                 .into_iter()
-                .chain(beta_null)
-                .chain(channel_null)
-                .collect::<Vec<_>>(),
-            (Err(reason), _, _) | (_, Err(reason), _) | (_, _, Err(reason)) => {
-                return format!("orbit=unresolved(gauge basis: {reason})");
-            }
+                .filter(|vector| vector.len() == gradient.len())
+                .collect(),
+            Err(reason) => return format!("orbit=unresolved(gauge basis: {reason})"),
         };
-        let mut orthonormal: Vec<Array1<f64>> = Vec::new();
-        for mut gauge in gauges {
-            if gauge.len() != gradient.len() {
-                continue;
-            }
-            for basis in &orthonormal {
-                let coeff = gauge.dot(basis);
-                for index in 0..gauge.len() {
-                    gauge[index] -= coeff * basis[index];
-                }
-            }
-            let norm_sq = gauge.iter().map(|value| value * value).sum::<f64>();
-            if norm_sq <= 1.0e-24 || !norm_sq.is_finite() {
-                continue;
-            }
-            let inv_norm = norm_sq.sqrt().recip();
-            for value in gauge.iter_mut() {
-                *value *= inv_norm;
-            }
-            orthonormal.push(gauge);
-        }
         if orthonormal.is_empty() {
             return "orbit=empty(no direction removed)".to_string();
         }
@@ -2371,50 +2345,47 @@ impl SaeManifoldTerm {
             Ok(value) => value,
             Err(reason) => return format!("orbit=unresolved(objective: {reason})"),
         };
+        // Both probes run the mover's own line minimization, with its endpoints and
+        // commit floor, so a zero drop here means what it means there.
+        let material_floor =
+            SAE_MANIFOLD_INNER_OBJECTIVE_STALL_REL_TOL * (1.0 + base_objective.abs());
         let snapshot = self.snapshot_mutable_state();
-        let mut best_decrease = 0.0_f64;
-        let mut best_alpha = 0.0_f64;
-        let mut alpha = 1.0e-8_f64;
-        while alpha <= 1.0e3 {
-            let applied = self
-                .apply_newton_step(
-                    descent.slice(s![..dense_len]),
-                    descent.slice(s![dense_len..]),
-                    alpha,
-                )
-                .is_ok();
-            if applied
-                && let Ok(trial) = self.penalized_objective_total(target, rho, registry, 1.0)
-                && trial.is_finite()
-                && base_objective - trial > best_decrease
-            {
-                best_decrease = base_objective - trial;
-                best_alpha = alpha;
-            }
-            if self.restore_mutable_state(&snapshot).is_err() {
+        let orbit = match self.minimize_objective_along(
+            target,
+            rho,
+            registry,
+            descent.view(),
+            dense_len,
+            base_objective,
+            descent_norm,
+            material_floor,
+            &snapshot,
+        ) {
+            Ok(line) => line,
+            Err(reason) => {
                 return format!(
                     "orbit_dim={}, orbit_max_dderiv={max_derivative:.6e}, \
-                     orbit_descent=unresolved(restore failed at α={alpha:.3e})",
+                     orbit_descent=unresolved({reason})",
                     orthonormal.len(),
                 );
             }
-            alpha *= 10.0;
-        }
+        };
+        let best_decrease = base_objective - orbit.value;
         let relative = if base_objective.abs() > 0.0 {
             best_decrease / base_objective.abs()
         } else {
             f64::INFINITY
         };
 
-        // THE AMBIENT CONTROL, and it is the one that decides what this refusal
-        // means. `g ≠ 0` on a differentiable objective makes `−g/‖g‖` a descent
-        // direction, so if NO step along it lowers `penalized_objective_total`,
-        // the assembled gradient is not the gradient of the scalar the line
-        // search descends — an objective↔gradient desync — and no amount of
-        // solver work can close a gap the two functions disagree about. The
-        // analytic slope is reported beside the best objective drop the steps
-        // along `−g/‖g‖` achieve, so a desync reads as a steep claimed slope with
-        // no drop, without forming a derivative from objective values.
+        // THE AMBIENT CONTROL. `g ≠ 0` on a differentiable objective makes `−g/‖g‖`
+        // a descent direction, so if trials along it were evaluated and none met
+        // sufficient decrease of `penalized_objective_total`, the assembled gradient
+        // is not the gradient of the scalar the line search descends: an
+        // objective↔gradient desync. A zero drop reads that way only beside
+        // `finite_trials > 0`. A trial whose step failed to apply, or whose
+        // objective was not finite, carries no information about the objective, so
+        // those are counted and the first reason is named instead of being reported
+        // as the same zero (#2228).
         let mut steepest = gradient.clone();
         let steepest_norm = steepest.dot(&steepest).sqrt();
         let ambient = if steepest_norm.is_finite() && steepest_norm > 0.0 {
@@ -2422,43 +2393,42 @@ impl SaeManifoldTerm {
                 *value /= -steepest_norm;
             }
             let analytic_slope = gradient.dot(&steepest);
-            let mut ambient_best_drop = 0.0_f64;
-            let mut ambient_best_alpha = 0.0_f64;
-            let mut alpha = 1.0e-8_f64;
-            while alpha <= 1.0e3 {
-                let applied = self
-                    .apply_newton_step(
-                        steepest.slice(s![..dense_len]),
-                        steepest.slice(s![dense_len..]),
-                        alpha,
-                    )
-                    .is_ok();
-                if applied
-                    && let Ok(trial) = self.penalized_objective_total(target, rho, registry, 1.0)
-                {
-                    if trial.is_finite() && base_objective - trial > ambient_best_drop {
-                        ambient_best_drop = base_objective - trial;
-                        ambient_best_alpha = alpha;
-                    }
-                }
-                if self.restore_mutable_state(&snapshot).is_err() {
-                    break;
-                }
-                alpha *= 10.0;
+            match self.minimize_objective_along(
+                target,
+                rho,
+                registry,
+                steepest.view(),
+                dense_len,
+                base_objective,
+                steepest_norm,
+                material_floor,
+                &snapshot,
+            ) {
+                Ok(line) => format!(
+                    "ambient_slope={analytic_slope:.6e}, ambient_best_objective_drop={:.6e} \
+                     at α={:.3e} (finite_trials={}, failed_trials={}, first_failure={:?})",
+                    base_objective - line.value,
+                    line.alpha,
+                    line.finite_trials,
+                    line.failed_trials,
+                    line.first_failure,
+                ),
+                Err(reason) => format!("ambient=unresolved({reason})"),
             }
-            format!(
-                "ambient_slope={analytic_slope:.6e}, ambient_best_objective_drop={ambient_best_drop:.6e} \
-                 at α={ambient_best_alpha:.3e}"
-            )
         } else {
             "ambient=degenerate".to_string()
         };
 
         format!(
             "orbit_dim={}, orbit_max_dderiv={max_derivative:.6e}, \
-             orbit_best_objective_drop={best_decrease:.6e} at α={best_alpha:.3e} \
-             (objective {base_objective:.6e}, relative {relative:.6e}), {ambient}",
+             orbit_best_objective_drop={best_decrease:.6e} at α={:.3e} \
+             (objective {base_objective:.6e}, relative {relative:.6e}, finite_trials={}, \
+             failed_trials={}, first_failure={:?}), {ambient}",
             orthonormal.len(),
+            orbit.alpha,
+            orbit.finite_trials,
+            orbit.failed_trials,
+            orbit.first_failure,
         )
     }
 
