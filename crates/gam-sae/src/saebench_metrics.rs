@@ -455,7 +455,7 @@ pub fn dose_response_calibration(
         x2 += obs.weight * obs.predicted_nats * obs.predicted_nats;
         xy += obs.weight * obs.predicted_nats * obs.measured_nats;
         y2 += obs.weight * obs.measured_nats * obs.measured_nats;
-        if obs.arc_length > 0.0 {
+        if obs.arc_length != 0.0 {
             let rate = obs.measured_nats / (obs.arc_length * obs.arc_length);
             rate_w += obs.weight;
             rate_sum += obs.weight * rate;
@@ -465,7 +465,7 @@ pub fn dose_response_calibration(
         return Err("dose_response: non-zero predicted and measured nats are required".into());
     }
     if rate_w <= 0.0 {
-        return Err("dose_response: at least one positive arc_length is required".into());
+        return Err("dose_response: at least one non-zero arc_length is required".into());
     }
     let slope = xy / x2;
     let sse = observations.iter().fold(0.0, |acc, obs| {
@@ -474,7 +474,7 @@ pub fn dose_response_calibration(
     });
     let mean_rate = rate_sum / rate_w;
     let rate_var = observations.iter().fold(0.0, |acc, obs| {
-        if obs.arc_length > 0.0 {
+        if obs.arc_length != 0.0 {
             let residual = obs.measured_nats / (obs.arc_length * obs.arc_length) - mean_rate;
             acc + obs.weight * residual * residual
         } else {
@@ -594,10 +594,40 @@ where
     let mut s = 0.0;
     for (turns, weight) in values {
         let angle = std::f64::consts::TAU * turns;
-        c += weight * angle.cos();
-        s += weight * angle.sin();
+        let normalized_weight = weight / weight_sum;
+        c += normalized_weight * angle.cos();
+        s += normalized_weight * angle.sin();
     }
-    (c * c + s * s).sqrt() / weight_sum
+    c.hypot(s)
+}
+
+#[cfg(test)]
+mod phase_lock_tests {
+    use super::{DoseResponseObservation, dose_response_calibration, weighted_phase_lock};
+
+    #[test]
+    fn phase_lock_is_invariant_to_extreme_weight_units() {
+        for weight in [1.0e-200_f64, 1.0, 1.0e200] {
+            // Equal phases at 0 and pi/2 have resultant length 1/sqrt(2).
+            let lock = weighted_phase_lock([(0.0, weight), (0.25, weight)], 2.0 * weight);
+            assert!((lock - std::f64::consts::FRAC_1_SQRT_2).abs() < 1.0e-14);
+        }
+    }
+
+    #[test]
+    fn dose_response_includes_both_arc_directions() {
+        let observations = [-1.0_f64, -2.0].map(|arc_length| DoseResponseObservation {
+            arc_length,
+            predicted_nats: arc_length * arc_length,
+            measured_nats: 2.0 * arc_length * arc_length,
+            weight: 1.0,
+        });
+        let report = dose_response_calibration(&observations).expect("negative arc doses");
+        assert_eq!(report.slope_through_origin, 2.0);
+        assert_eq!(report.r2_through_origin, 1.0);
+        assert_eq!(report.mean_measured_nats_per_arc_squared, 2.0);
+        assert_eq!(report.cv_measured_nats_per_arc_squared, 0.0);
+    }
 }
 
 fn cholesky_lower(a: &[f64], d: usize) -> Result<Vec<f64>, String> {
