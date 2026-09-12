@@ -170,9 +170,14 @@ producer is not a substitute for an implemented public contract.
 
 #### Applying the rule once to every removed identity
 
-`d484a091a` removed 1,234 `(source path, function name)` declarations. The rule
-above was applied to each of them once, and every identity's disposition is
-recorded in [`public-api-2829-disposition.tsv`](public-api-2829-disposition.tsv).
+`d484a091a` removed 1,244 public function declarations under 1,219
+`(source path, function name)` identities, as `scripts/public_api_census.py`
+counts them. The rule above was applied to each identity once, and its
+disposition is recorded in
+[`public-api-2829-disposition.tsv`](public-api-2829-disposition.tsv). The ledger
+once also listed 15 declarations that `d484a091a` only moved within their own
+file, with the same count before and after; the census does not count a move
+as a removal, so those rows are gone.
 
 A removed item comes back when something that survived still depends on it:
 
@@ -189,12 +194,13 @@ dropped, and restored items the table above retires were removed again.
 
 | Disposition | Identities |
 | --- | --- |
-| Restored in place | 887 |
-| Defined elsewhere in the same crate | 17 |
+| Restored in place | 436 |
+| Defined elsewhere in the same crate | 14 |
 | Retired by the decisions above | 19 |
-| Retired: nothing that survived depends on it | 278 |
-| Retired by the owning work's own decision | 22 |
-| Deferred to the owner of an actively edited file | 11 |
+| Retired: nothing that survived depends on it | 288 |
+| Retired by the owning work's own decision | 27 |
+| Retired by a later deletion commit named in the row | 432 |
+| Absent while a surviving reference still names it (repair in progress) | 3 |
 
 Retired identities carry no compatibility obligation. Restoration is closed
 under calls: after the merges, no restored body calls a function the sweep
@@ -209,9 +215,17 @@ deleted instead of getting its producer back, with an entry in
 (`bms/alo_replay.rs`), `GraphBirthCandidate` (`structure_harvest.rs`), and
 `CertifiedLogSigmaCurvature` (`survival/latent/survival/log_sigma_curvature_certificate.rs`).
 
-The deferred identities live in files other active work owns (survival, jets,
-and the finite-set race scaffolding); those owners were given each surviving
-carrier and dangling reference. Steering retired its own carriers
+The 19 identities once deferred to active owners are resolved. Owners ruled on
+fifteen in landed work: jets retired its eight in `d9943add8` (named below),
+gam-4a ruled in `fe7c444af` (`calculate_crude_risk_quadrature`,
+`cause_specific_event_indicator`, `pooled_any_event_indicator`), and sae-arch in
+`71befe9f6` (the three finite-set race functions), with the graph-birth candidate
+retired together with its `GraphBirthCandidate` carrier. The other four have no
+surviving code or prose dependent and retire under the rule above: `cause_count`;
+`from_engine_inputs`, which forwarded `None` offsets to
+`from_engine_inputswith_offsets`; `evaluate_survival_lamlcost_and_gradient`; and
+`StructureSearchResult::from_rounds`, which forwarded to
+`from_rounds_with_predictions`. Steering retired its own carriers
 (`CoordinateSetResult`, `InterchangeResult`) and their deleted producers.
 Survival retired its own: the `CertifiedLogSigmaCurvature` carrier with its three
 deleted identities, and `survival_location_scale_block_effective_jacobian`, which
@@ -226,7 +240,35 @@ Jets also retired the eight identities deferred to it from `jet_tower.rs`
 (`cell_moving_boundary_flux_tower`, `compose_unary_single_slot`, `implicit_solve`,
 `moving_limit_boundary_tower`, `moving_limit_boundary_tower_theta_integrand`,
 `substitute_intercept`, `trigamma_derivative_stack`, `verify_kernel_channels`):
-nothing that survived defines or calls them.
+nothing that survived defines or calls them. `d484a091a` had only moved
+`normal_sf` and `student_t_sf` within `probability.rs`, so those two rows left
+the ledger with the other moved declarations.
+
+After the ledger refresh in `955897723`, deletion commits made under the user's
+directive removed 432 listed identities without updating their rows. Each
+such row now reads `retired-by-later-deletion:<commit>`, naming the commit whose
+own diff lowered that identity's census count (40 commits). Eleven of
+those commits had also landed no public API census acknowledgement; `5fe9454ab`
+backfilled them.
+
+Eight rows recorded a restoration the merge never delivered. Five have no
+surviving dependent and are retired: `digamma` in `jet_scalar.rs` and
+`Tower4::digamma`, `Tower4::trigamma`,
+`GaussianPcaPatchSummary::projector_variance_scale`, and
+`FrozenWeightGramTensor::frozen_weights`. Three are absent while a surviving
+reference still names them: comments cite `Tower4::compose_unary_with` and
+`ConstraintSet::row_column_support`, and the producer-less `RiemannianLBFGS`
+carrier outlived its `minimize`. Their repair rewords those comments and deletes
+the carrier. Among the rows once marked defined elsewhere, `row_loss` is retired
+because its only other definition is a private test helper, and the other
+definitions of `second_derivative_design` and `trivially_converged` were deleted
+later.
+
+These counts come from a per-row audit run on MSI. For every row it compares the
+census multiplicity at `d484a091a^`, `d484a091a`, the restoration commit
+`cb8dd972c`, the refresh and the head. It treats a `pub fn` inside a
+`#[cfg(test)]` item as outside the library, so `Tower4::third_contracted` and
+`fourth_contracted` read as retired.
 
 Three restorations were adapted rather than taken verbatim:
 
