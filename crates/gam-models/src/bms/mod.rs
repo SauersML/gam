@@ -11,8 +11,8 @@ use crate::custom_family::{
 use crate::exact_mode_branch::ExactCoefficientModeBranch;
 use crate::fit_orchestration::drivers::{
     ExactJointEfsEvaluation, ExactJointEvaluation, ExactJointHyperSetup, SpatialFitProvenance,
-    apply_spatial_anisotropy_pilot_initializer, build_term_collection_designs_and_freeze_joint,
-    optimize_spatial_length_scale_exact_joint, spatial_length_scale_term_indices,
+    build_term_collection_designs_and_freeze_joint, optimize_spatial_length_scale_exact_joint,
+    spatial_length_scale_term_indices,
 };
 use crate::marginal_slope_shared::{
     CoeffSupport, ObservedDenestedCellPartials, SparsePrimaryCoeffJetView, add_optional_matrix,
@@ -68,12 +68,6 @@ pub(crate) use alo_replay::{
 };
 pub use deviation_runtime::DeviationRuntime;
 pub use deviation_runtime::ParametricAnchorBlock;
-
-/// Above this size, FLEX spatial length-scale optimization uses the pilot
-/// geometry initializer and skips the iterative joint κ/ψ outer loop. This is
-/// a spatial-optimizer policy only; it must not gate exact outer Hessian
-/// capability or row-cell moment materialization.
-pub(crate) const BMS_FLEX_SPATIAL_OUTER_PILOT_ROW_THRESHOLD: usize = 50_000;
 
 #[derive(Clone, Debug)]
 pub struct DeviationBlockConfig {

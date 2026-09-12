@@ -3035,5 +3035,13 @@
     ],
     "reason": "Lead ruling on #2228: delete the automatic SAE fit checkpoint resume. SaeManifoldOuterObjective banked its term, logits and rho under std::env::temp_dir()/gam/sae_fit_checkpoint/v1/<sha256 of the target> on every material improvement, run_sae_manifold_fit and the crosscoder fit resumed a same-data file by default, and certify_outer_stage dropped a non-converged objective without cleanup. So a retry on the same data opened at a failed or censored run's incumbent: the outcome depended on filesystem history, not on the inputs (SPEC 13, 22, 25). No production caller supplies an explicit resume path, so the module goes rather than becoming an option. The checkpoint module's doc also quoted a SPEC sentence that SPEC.md does not contain.",
     "evidence": "Measured before this change: sae-fit job 390606 at f9a38e3e6, /scratch.global/sauer354/sw7-logs. m4_A_default.log starts cold; m4_A_info.log, same data and pin, starts with 'SAE fit checkpoint resume: installed banked incumbent from /tmp/gam/sae_fit_checkpoint/v1/cef820...primary.json (evals 55, best cost Some(203.96202953521788))', so two runs that looked log-level dependent never shared a start. Every removed item and test belongs to the retired bank/resume/remove path or its tests; the ledger counters used by tests_termination_2235 survive as a test-scoped counters(). Identities were enumerated with the guard's ITEM regex and test-scope rules over the base tree. The guard and censuses were not run before push (commit-after-every-edit directive); the integrity workflow checks the pushed sha. No compile or test run is claimed here."
+  },
+  {
+    "base": "6c7fe694a55505191886f3e522b1c8c2de54114f",
+    "items": [
+      "crates/gam-models/src/bms/mod.rs:const:BMS_FLEX_SPATIAL_OUTER_PILOT_ROW_THRESHOLD"
+    ],
+    "reason": "#2897: no row-count window may choose the binary marginal-slope estimator. BMS_FLEX_SPATIAL_OUTER_PILOT_ROW_THRESHOLD was such a window: at 50,000 rows it replaced REML/LAML selection of flex-spatial length scales with pilot geometry.",
+    "evidence": "At f2156a78e4c30b1bd4b815ca3ecc591df907d6c0, git grep -w over crates, tests, examples and bench found the constant only at its definition (bms/mod.rs:76) and in the branch this commit removes (block_specs.rs:2012). No replacement is needed: joint kappa/psi optimization now runs at every n whenever it is enabled."
   }
 ]

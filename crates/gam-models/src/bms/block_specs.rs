@@ -2008,35 +2008,6 @@ pub fn fit_bernoulli_marginal_slope_terms(
         );
         effective_kappa_options.enabled = false;
     }
-    let flex_spatial_pilot_path = (spec.score_warp.is_some() || spec.link_dev.is_some())
-        && spec.y.len() >= BMS_FLEX_SPATIAL_OUTER_PILOT_ROW_THRESHOLD
-        && effective_kappa_options.enabled;
-    if flex_spatial_pilot_path {
-        let marginal_terms = spatial_length_scale_term_indices(&spec.marginalspec);
-        let slope_terms = spatial_length_scale_term_indices(&spec.slopespec);
-        let marginal_updates = apply_spatial_anisotropy_pilot_initializer(
-            data_view,
-            &mut spec.marginalspec,
-            &marginal_terms,
-            effective_kappa_options.pilot_subsample_threshold,
-            &effective_kappa_options,
-        )
-        .map_err(|error| error.to_string())?;
-        let slope_updates = apply_spatial_anisotropy_pilot_initializer(
-            data_view,
-            &mut spec.slopespec,
-            &slope_terms,
-            effective_kappa_options.pilot_subsample_threshold,
-            &effective_kappa_options,
-        )
-        .map_err(|error| error.to_string())?;
-        effective_kappa_options.enabled = false;
-        log::info!(
-            "[BMS spatial] n={} flex=true pilot_geometry_updates={} iterative_spatial_outer=false reason=large-flex-spatial-pilot",
-            spec.y.len(),
-            marginal_updates + slope_updates,
-        );
-    }
     let (z_standardized, z_normalization) = standardize_latent_z_with_policy(
         &spec.z,
         &spec.weights,
