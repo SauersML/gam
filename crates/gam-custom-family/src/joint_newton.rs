@@ -1944,6 +1944,7 @@ pub(crate) fn update_joint_trust_region_radius(
     step_norm: f64,
     actual_reduction: f64,
     predicted_reduction: f64,
+    reduction_along_ray: f64,
     objective_scale: f64,
     objective_tol: f64,
     measured_resolution: f64,
@@ -1959,9 +1960,11 @@ pub(crate) fn update_joint_trust_region_radius(
     // rejection, the `×2` grow at a boundary that constrains a model-resolvable
     // decrease, the `[1e-12, 1e6]` clamp, and the `RejectFloor` promotion at the
     // floor are all reproduced by that controller. Geometry alone is not
-    // evidence for growth: when `predicted_reduction <= objective_tol`, the
-    // quadratic model says the entire constrained step is beneath the solver's
-    // own objective resolution. Treating that chord as a useful boundary hit
+    // evidence for growth: when `reduction_along_ray <= objective_tol`, the
+    // quadratic model says no larger step in this direction would buy a
+    // decrease above the solver's own objective resolution, and where the
+    // model is not certified convex that reading is `predicted_reduction`, the
+    // constrained step's own. Treating such a chord as a useful boundary hit
     // doubled the next chord and made transformation-normal walk away from its
     // best iterate (gam#2600). The gam#2637 override below is the other deliberate
     // specialization, and it only ever converts a rejection the controller could
@@ -2044,8 +2047,25 @@ pub(crate) fn update_joint_trust_region_radius(
     // prediction, so asking it whether the step was worth taking is asking a
     // question it cannot answer (gam#2612).
     let step_reached_boundary = joint_block_step_hit_trust_boundary(step_norm, old_radius);
+    // ... AND THE STANDARD IS READ ON THE RAY, NOT ON THE CHORD (gam#2714).
+    //
+    // `predicted_reduction` is the decrease at the step the region ALLOWED. On
+    // the boundary that step is the proposal cut to the radius, so its
+    // prediction shrinks with the radius, and "predicts less than
+    // `objective_tol` ⇒ do not grow" becomes "the radius is small ⇒ keep it
+    // small": a fixed point, entered once and then held for every remaining
+    // cycle while the gain ratio sits at one. The question the gam#2600
+    // damping asks is whether a LARGER region would let the model predict a
+    // decrease the solver calls significant, and that is `reduction_along_ray`
+    // — the model's decrease at its own minimum along the step's direction
+    // ([`joint_quadratic_reduction_along_ray`]). It is never below
+    // `predicted_reduction`, so this only ever lets a step grow that the old
+    // test held. Callers pass it only where the model is known convex, where
+    // the minimum exists and bounds what any radius could buy along that ray;
+    // everywhere else they pass `predicted_reduction` and the wine-arm
+    // behaviour above, measured on an indefinite Hessian, is byte-identical.
     let hit_boundary = step_reached_boundary
-        && (predicted_reduction > objective_tol || objective_unreadable_at_this_step);
+        && (reduction_along_ray > objective_tol || objective_unreadable_at_this_step);
     // THE NOISE FLOOR IS MEASURED WHEN IT CAN BE (gam#2612). The controller
     // sizes its floor as `|objective_scale| × noise_floor_rel`, so passing the
     // measured ABSOLUTE resolution as a ratio against the same scale makes its
@@ -5448,6 +5468,34 @@ pub(crate) fn joint_quadratic_predicted_reduction(
     delta: &Array1<f64>,
 ) -> f64 {
     rhs.dot(delta) - 0.5 * delta.dot(hpen_delta)
+}
+
+/// The quadratic model's decrease at its minimum along the ray through
+/// `delta`, when that minimum lies beyond `delta`; otherwise the decrease at
+/// `delta` itself.
+///
+/// Along `t·delta` the model decrease is `t·s − ½t²κ` with `s = rhs·delta`
+/// and `κ = delta·H·delta`. With `κ > 0` it peaks at `t* = s/κ` at `s²/(2κ)`.
+/// `t* > 1` means the step stopped short of the model's own minimum along its
+/// direction, so a larger region would buy exactly that much more predicted
+/// decrease — it is the trust-region growth decision's evidence, where the
+/// decrease AT `delta` is the gain ratio's (gam#2714). Scale-invariant in
+/// `delta`, so a chord truncated to the radius reads the same number as the
+/// full proposal it was cut from. With `κ ≤ 0` the ray has no minimum and
+/// with `t* ≤ 1` the step already reached it, and in both cases the decrease
+/// at `delta` is returned unchanged.
+pub(crate) fn joint_quadratic_reduction_along_ray(
+    rhs: &Array1<f64>,
+    hpen_delta: &Array1<f64>,
+    delta: &Array1<f64>,
+) -> f64 {
+    let slope = rhs.dot(delta);
+    let curvature = delta.dot(hpen_delta);
+    if curvature > 0.0 && slope > curvature {
+        slope * slope / (2.0 * curvature)
+    } else {
+        slope - 0.5 * curvature
+    }
 }
 
 pub(crate) fn joint_preconditioned_descent_delta(

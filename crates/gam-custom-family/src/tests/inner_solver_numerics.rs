@@ -551,6 +551,7 @@ pub(crate) fn joint_trust_region_takes_a_measured_decrease_the_model_cannot_reso
         STEP_NORM,
         MEASURED_ACTUAL,
         MEASURED_PREDICTED,
+        MEASURED_PREDICTED,
         OBJECTIVE_SCALE,
         OBJECTIVE_TOL,
         0.0,
@@ -577,6 +578,7 @@ pub(crate) fn joint_trust_region_takes_a_measured_decrease_the_model_cannot_reso
         STEP_NORM,
         MEASURED_ACTUAL,
         -1.0,
+        -1.0,
         OBJECTIVE_SCALE,
         OBJECTIVE_TOL,
         0.0,
@@ -599,6 +601,7 @@ pub(crate) fn joint_trust_region_takes_a_measured_decrease_the_model_cannot_reso
         STEP_NORM,
         -1.0e-3,
         MEASURED_PREDICTED,
+        MEASURED_PREDICTED,
         OBJECTIVE_SCALE,
         OBJECTIVE_TOL,
         0.0,
@@ -614,6 +617,7 @@ pub(crate) fn joint_trust_region_takes_a_measured_decrease_the_model_cannot_reso
     let resolvable = update_joint_trust_region_radius(
         OLD_RADIUS,
         STEP_NORM,
+        1.0e-3,
         1.0e-3,
         1.0e-3,
         OBJECTIVE_SCALE,
@@ -5075,20 +5079,20 @@ pub(crate) fn rowwise_kronecker_psi_row_chunks_are_window_consistent() {
 
 #[test]
 pub(crate) fn joint_trust_region_radius_update_accept_reject_logic() {
-    let accepted = update_joint_trust_region_radius(1.0, 1.0, 2.0, 2.0, 1.0, 1.0e-6, 0.0, false);
+    let accepted = update_joint_trust_region_radius(1.0, 1.0, 2.0, 2.0, 2.0, 1.0, 1.0e-6, 0.0, false);
     assert!(accepted.accepted);
     assert!((accepted.rho - 1.0).abs() < 1.0e-12);
     assert!((accepted.radius - 2.0).abs() < 1.0e-12);
     assert_eq!(accepted.decision.label(), "grow_at_boundary");
 
-    let rejected = update_joint_trust_region_radius(1.0, 0.5, -0.1, 2.0, 1.0, 1.0e-6, 0.0, false);
+    let rejected = update_joint_trust_region_radius(1.0, 0.5, -0.1, 2.0, 2.0, 1.0, 1.0e-6, 0.0, false);
     assert!(!rejected.accepted);
     assert!(rejected.rho < 0.0);
     assert!((rejected.radius - 0.25).abs() < 1.0e-12);
     assert_eq!(rejected.decision.label(), "shrink_reject");
 
     let rejected_inside_radius =
-        update_joint_trust_region_radius(1.0, 1.0e-3, -0.1, 2.0, 1.0, 1.0e-6, 0.0, false);
+        update_joint_trust_region_radius(1.0, 1.0e-3, -0.1, 2.0, 2.0, 1.0, 1.0e-6, 0.0, false);
     assert!(!rejected_inside_radius.accepted);
     assert!(
         rejected_inside_radius.radius < 1.0e-3,
@@ -5097,7 +5101,7 @@ pub(crate) fn joint_trust_region_radius_update_accept_reject_logic() {
     assert!((rejected_inside_radius.radius - 5.0e-4).abs() < 1.0e-12);
     assert_eq!(rejected_inside_radius.decision.label(), "shrink_reject");
 
-    let poor = update_joint_trust_region_radius(1.0, 0.5, 0.1, 1.0, 1.0, 1.0e-6, 0.0, false);
+    let poor = update_joint_trust_region_radius(1.0, 0.5, 0.1, 1.0, 1.0, 1.0, 1.0e-6, 0.0, false);
     assert!(poor.accepted);
     assert!((poor.rho - 0.1).abs() < 1.0e-12);
     assert!((poor.radius - 0.25).abs() < 1.0e-12);
@@ -5119,6 +5123,7 @@ pub(crate) fn joint_trust_region_growth_requires_predicted_decrease_above_object
         OLD_RADIUS,
         1.0e-2,
         0.5 * OBJECTIVE_TOL,
+        0.5 * OBJECTIVE_TOL,
         OBJECTIVE_SCALE,
         OBJECTIVE_TOL,
         0.0,
@@ -5131,6 +5136,7 @@ pub(crate) fn joint_trust_region_growth_requires_predicted_decrease_above_object
     let above_tolerance = update_joint_trust_region_radius(
         OLD_RADIUS,
         OLD_RADIUS,
+        2.0 * OBJECTIVE_TOL,
         2.0 * OBJECTIVE_TOL,
         2.0 * OBJECTIVE_TOL,
         OBJECTIVE_SCALE,
@@ -5147,6 +5153,7 @@ pub(crate) fn joint_trust_region_growth_requires_predicted_decrease_above_object
         OLD_RADIUS,
         -0.1,
         0.5 * OBJECTIVE_TOL,
+        0.5 * OBJECTIVE_TOL,
         OBJECTIVE_SCALE,
         OBJECTIVE_TOL,
         0.0,
@@ -5161,6 +5168,7 @@ pub(crate) fn joint_trust_region_growth_requires_predicted_decrease_above_object
         0.5 * OLD_RADIUS,
         2.0 * OBJECTIVE_TOL,
         2.0 * OBJECTIVE_TOL,
+        2.0 * OBJECTIVE_TOL,
         OBJECTIVE_SCALE,
         OBJECTIVE_TOL,
         0.0,
@@ -5169,6 +5177,140 @@ pub(crate) fn joint_trust_region_growth_requires_predicted_decrease_above_object
     assert!(non_boundary.accepted);
     assert_eq!(non_boundary.decision.label(), "hold_inside");
     assert_eq!(non_boundary.radius, OLD_RADIUS);
+}
+
+/// gam#2714: the growth test's evidence is the model's decrease at its own
+/// minimum along the step's ray. The minimum is scale-invariant in the step, so
+/// a chord cut from a Newton step reads the unconstrained model decrease however
+/// hard it was cut; a step already past that minimum, and a ray with no minimum,
+/// read the decrease at the step unchanged.
+#[test]
+pub(crate) fn the_ray_minimum_is_the_decrease_a_truncated_newton_chord_was_cut_from_2714() {
+    let hessian = ndarray::array![[4.0_f64, 1.0], [1.0, 3.0]];
+    let rhs = ndarray::array![1.0_f64, 2.0];
+    // H⁻¹·rhs = [1, 7]/11, so the unconstrained model decrease ½·rhs·H⁻¹·rhs is 15/22.
+    let newton = ndarray::array![1.0_f64 / 11.0, 7.0 / 11.0];
+    let newton_decrease = 15.0_f64 / 22.0;
+    assert!(
+        (hessian.dot(&newton) - &rhs).iter().all(|r| r.abs() <= 1.0e-14),
+        "the fixture's Newton step must solve its own system"
+    );
+
+    // Cut to 1/38, the proposal-to-chord ratio the veteran frailty solve held at
+    // cycle 49 (`|prop|∞ = 9.863e-2` served as `|δ|∞ = 2.589e-3`).
+    let alpha = 1.0_f64 / 38.0;
+    let chord = newton.mapv(|v| alpha * v);
+    let h_chord = hessian.dot(&chord);
+    let predicted = joint_quadratic_predicted_reduction(&rhs, &h_chord, &chord);
+    let along_ray = joint_quadratic_reduction_along_ray(&rhs, &h_chord, &chord);
+    assert!(
+        (along_ray - newton_decrease).abs() <= 1.0e-12 * newton_decrease,
+        "the ray minimum of a Newton chord is the unconstrained model decrease; got {along_ray:.17e}"
+    );
+    assert!(
+        (predicted - newton_decrease * (2.0 * alpha - alpha * alpha)).abs() <= 1.0e-12 * predicted,
+        "the chord's own prediction scales with the cut, which is what held the radius; got \
+         {predicted:.17e}"
+    );
+
+    // Past the minimum: twice the Newton step overshoots it.
+    let overshoot = newton.mapv(|v| 2.0 * v);
+    let h_overshoot = hessian.dot(&overshoot);
+    assert_eq!(
+        joint_quadratic_reduction_along_ray(&rhs, &h_overshoot, &overshoot),
+        joint_quadratic_predicted_reduction(&rhs, &h_overshoot, &overshoot),
+    );
+
+    // No minimum: negative curvature along the ray.
+    let indefinite = ndarray::array![[1.0_f64, 0.0], [0.0, -2.0]];
+    let descent = ndarray::array![0.0_f64, 1.0];
+    let h_descent = indefinite.dot(&descent);
+    assert_eq!(
+        joint_quadratic_reduction_along_ray(&descent, &h_descent, &descent),
+        joint_quadratic_predicted_reduction(&descent, &h_descent, &descent),
+    );
+}
+
+/// gam#2714: a chord cut to the trust radius predicts a decrease that shrinks
+/// with the radius, so growing only when THAT prediction clears the objective
+/// tolerance holds a small radius for good. Measured on the veteran frailty
+/// witness at `a51f93e39` (`sw4-logs/disc2_C.391105.log`), cycle 49: `ρ = 1.000`,
+/// `pred = +3.456e-4` against `objective_tol = 5.427e-4`, `r = 1.314e-2 (held)`,
+/// `|δ| = 1.451e-2`, `|prop|∞ = 9.863e-2` served as `|δ|∞ = 2.589e-3`. The
+/// radius and decision were the same every cycle to 79, and the solve exited on
+/// the stall guard at `best_residual_inf = 1.499e1` against `1.245e-5`.
+#[test]
+pub(crate) fn a_truncated_convex_chord_grows_the_region_its_own_prediction_would_hold_2714() {
+    const RADIUS: f64 = 1.314e-2;
+    const STEP_NORM: f64 = 1.451e-2;
+    const PREDICTED: f64 = 3.456e-4;
+    const OBJECTIVE: f64 = 5.417072e2;
+    let objective_tol = 1.0e-6 * (1.0 + OBJECTIVE);
+    // The chord is `α = |δ|∞/|prop|∞` of its proposal. On a convex model whose
+    // proposal is the Newton step, the chord predicts `2α − α²` of the
+    // unconstrained decrease, and that decrease is what the ray minimum reads.
+    let alpha = 2.589e-3 / 9.863e-2;
+    let along_ray = PREDICTED / (2.0 * alpha - alpha * alpha);
+    assert!(
+        PREDICTED <= objective_tol && along_ray > objective_tol,
+        "the fixture must straddle the tolerance: pred={PREDICTED:.3e} ray={along_ray:.3e} \
+         tol={objective_tol:.3e}"
+    );
+
+    let held = update_joint_trust_region_radius(
+        RADIUS,
+        STEP_NORM,
+        PREDICTED,
+        PREDICTED,
+        PREDICTED,
+        OBJECTIVE,
+        objective_tol,
+        0.0,
+        true,
+    );
+    assert!(held.accepted);
+    assert_eq!(
+        held.decision.label(),
+        "hold_inside",
+        "reading the chord's own prediction must reproduce the measured hold"
+    );
+    assert_eq!(held.radius, RADIUS);
+
+    let grown = update_joint_trust_region_radius(
+        RADIUS,
+        STEP_NORM,
+        PREDICTED,
+        PREDICTED,
+        along_ray,
+        OBJECTIVE,
+        objective_tol,
+        0.0,
+        true,
+    );
+    assert!(grown.accepted);
+    assert_eq!(grown.decision.label(), "grow_at_boundary");
+    assert!(
+        grown.radius > RADIUS,
+        "a boundary chord whose ray minimum clears the tolerance must enlarge the region; got \
+         {:.3e}",
+        grown.radius
+    );
+
+    // Interior: the same ray evidence buys nothing when the region did not
+    // choose the step length.
+    let interior = update_joint_trust_region_radius(
+        RADIUS,
+        0.5 * RADIUS,
+        PREDICTED,
+        PREDICTED,
+        along_ray,
+        OBJECTIVE,
+        objective_tol,
+        0.0,
+        true,
+    );
+    assert_eq!(interior.decision.label(), "hold_inside");
+    assert_eq!(interior.radius, RADIUS);
 }
 
 /// gam#979: the coupled marginal↔slope inner joint-Newton must NOT grind its
@@ -5198,7 +5340,7 @@ pub(crate) fn joint_newton_collapsed_trust_region_all_reject_exits_before_grindi
     let mut radius = 1.0_f64;
     for _ in 0..200 {
         let rejected =
-            update_joint_trust_region_radius(radius, 0.5 * radius, -1.0, 2.0, 1.0, 1.0e-6, 0.0, false);
+            update_joint_trust_region_radius(radius, 0.5 * radius, -1.0, 2.0, 2.0, 1.0, 1.0e-6, 0.0, false);
         assert!(
             !rejected.accepted,
             "a genuine objective increase must reject"
@@ -5210,7 +5352,7 @@ pub(crate) fn joint_newton_collapsed_trust_region_all_reject_exits_before_grindi
         "sustained rejection must collapse the radius to its absolute 1e-12 floor"
     );
     assert_eq!(
-        update_joint_trust_region_radius(radius, 0.5 * radius, -1.0, 2.0, 1.0, 1.0e-6, 0.0, false)
+        update_joint_trust_region_radius(radius, 0.5 * radius, -1.0, 2.0, 2.0, 1.0, 1.0e-6, 0.0, false)
             .decision
             .label(),
         "reject_floor",
@@ -5311,6 +5453,7 @@ pub(crate) fn joint_trust_region_noise_floor_accepts_round_off_negative_actual()
         0.05,
         actual,
         predicted,
+        predicted,
         objective_scale,
         objective_tol,
         0.0,
@@ -5337,6 +5480,7 @@ pub(crate) fn joint_trust_region_noise_floor_rejects_genuine_increase() {
         1.0,
         0.5,
         actual,
+        predicted,
         predicted,
         objective_scale,
         objective_tol,
@@ -5472,6 +5616,7 @@ pub(crate) fn the_runaway_step_is_rejected_once_its_resolution_claim_is_refused_
             8.376e2,  // ||delta|| there
             -8.049e8, // actual reduction: the objective got WORSE by 8.049e8
             1.609e8,  // predicted reduction
+            1.609e8,  // reduction along the ray: no convexity certificate
             objective_scale,
             objective_tol,
             measured_resolution,
@@ -5822,6 +5967,7 @@ pub(crate) fn a_boundary_step_below_the_model_noise_floor_grows_the_region_2612(
         radius,
         actual,
         predicted,
+        predicted,
         objective_scale,
         objective_tol,
         0.0,
@@ -5847,6 +5993,7 @@ pub(crate) fn a_boundary_step_below_the_model_noise_floor_grows_the_region_2612(
         0.1 * radius,
         actual,
         predicted,
+        predicted,
         objective_scale,
         objective_tol,
         0.0,
@@ -5868,6 +6015,7 @@ pub(crate) fn a_boundary_step_below_the_model_noise_floor_grows_the_region_2612(
         radius,
         radius,
         actual,
+        predicted,
         predicted,
         objective_scale,
         objective_tol,
@@ -5953,6 +6101,7 @@ pub(crate) fn the_joint_norm_is_what_lets_a_well_modelled_boundary_step_grow_261
         joint_norm,
         actual,
         predicted,
+        predicted,
         objective_scale,
         objective_tol,
         0.0,
@@ -5969,6 +6118,7 @@ pub(crate) fn the_joint_norm_is_what_lets_a_well_modelled_boundary_step_grow_261
         radius,
         two_equal_blocks_read,
         actual,
+        predicted,
         predicted,
         objective_scale,
         objective_tol,
@@ -6202,6 +6352,7 @@ pub(crate) fn joint_trust_region_rosenbrock_like_quadratic_is_armijo_safe() {
         0.25,
         step_norm,
         actual,
+        predicted,
         predicted,
         old_objective,
         objective_tol,

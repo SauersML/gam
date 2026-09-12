@@ -3783,6 +3783,9 @@ fn inner_blockwise_fit_for_product<F: CustomFamily + Clone + Send + Sync + 'stat
                 alpha_accepted * step_metric_norm,
                 actual_reduction,
                 predicted_reduction,
+                // Growth is judged on the step's own prediction, which leaves
+                // this route byte-identical (gam#2714).
+                predicted_reduction,
                 obj_before_block,
                 inner_tol * (1.0 + obj_before_block.abs()),
                 // The blockwise path takes ONE step per block per cycle rather

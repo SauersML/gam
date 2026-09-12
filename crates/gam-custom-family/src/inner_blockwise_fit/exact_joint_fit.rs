@@ -2481,6 +2481,14 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
                     objective_tol.max(objective_resolution_witness.measured()),
                 )
         });
+        // A spectrum with no resolvable negative direction certifies the model
+        // convex, and only a convex model has a minimum along every ray that
+        // bounds what a larger trust region could buy there. That is the
+        // growth test's evidence (gam#2714); without the certificate it reads
+        // the step's own prediction, as it did before.
+        let model_certified_convex = joint_spectrum
+            .as_ref()
+            .is_some_and(|spectrum| !spectrum.has_resolvable_negative_curvature());
         // Record THIS route's decision variables. The blockwise recorder
         // below is on a different loop: `55968a53c` instrumented only that
         // one, and the refusal then read `40 cycle(s) [no terminal
@@ -3514,6 +3522,11 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
             }
             let predicted_reduction =
                 joint_quadratic_predicted_reduction(&rhs, &hpen_delta, &trial_delta);
+            let reduction_along_ray = if model_certified_convex {
+                joint_quadratic_reduction_along_ray(&rhs, &hpen_delta, &trial_delta)
+            } else {
+                predicted_reduction
+            };
             let linearized_next_kkt_inf = hpen_delta
                 .iter()
                 .zip(rhs.iter())
@@ -3932,6 +3945,7 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
                 step_norm,
                 actual_reduction,
                 predicted_reduction,
+                reduction_along_ray,
                 old_objective,
                 objective_tol,
                 measured_objective_resolution,
@@ -4010,6 +4024,7 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
                             *block_step_norm,
                             actual_reduction,
                             predicted_reduction,
+                            reduction_along_ray,
                             old_objective,
                             objective_tol,
                             measured_objective_resolution,
@@ -4060,11 +4075,13 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
             // immediate instead of requiring step/radius arithmetic
             // in the reader's head.
             let tr_attempt_sig = format!(
-                "{:<9}  ρ={:+.3e}  Δobj={:+.3e}  pred={:+.3e}  {}  decision={:<22}  |δ|={:.3e}  |δ|∞={:.3e}  |prop|∞={:.3e}",
+                "{:<9}  ρ={:+.3e}  Δobj={:+.3e}  pred={:+.3e}  ray={:+.3e} convex={}  {}  decision={:<22}  |δ|={:.3e}  |δ|∞={:.3e}  |prop|∞={:.3e}",
                 phase,
                 trust_update.rho,
                 actual_reduction,
                 predicted_reduction,
+                reduction_along_ray,
+                model_certified_convex,
                 radius_field,
                 trust_update.decision.label(),
                 step_norm,
