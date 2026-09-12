@@ -1,5 +1,4 @@
 use crate::bms::{DeviationBlockConfig, LatentZCheckMode};
-use crate::survival::construction::SurvivalBaselineTarget;
 use gam_problem::{InverseLink, StandardLink};
 
 /// Calibration semantics for the latent score `z` consumed by marginal-slope
@@ -51,10 +50,3 @@ impl MarginalSlopeCalibrationProtocol {
     }
 
 }
-
-#[derive(Clone, Debug)]
-pub struct SurvivalMarginalSlopeProtocol {
-    pub marginal: MarginalSlopeCalibrationProtocol,
-    pub baseline_target: SurvivalBaselineTarget,
-}
-

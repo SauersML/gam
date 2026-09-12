@@ -308,16 +308,14 @@ pub mod smooth {
         fit_term_collection_with_coefficient_groups_and_penalty_block_gamma_priors,
         fit_term_collection_with_penalty_block_gamma_prior_callback,
         fit_term_collection_with_penalty_block_gamma_priors,
-        fit_term_collectionwith_spatial_length_scale_optimization, fixed_kappa_profiled_reml_score,
-        get_constant_curvature_kappa, smooth_term_lr_inference_forspec,
+        fit_term_collectionwith_spatial_length_scale_optimization, get_constant_curvature_kappa,
+        smooth_term_lr_inference_forspec,
     };
 }
 
 pub use families::custom_family;
 pub use families::gamlss;
-pub use families::protocol::{
-    LatentScoreSemantics, MarginalSlopeCalibrationProtocol, SurvivalMarginalSlopeProtocol,
-};
+pub use families::protocol::{LatentScoreSemantics, MarginalSlopeCalibrationProtocol};
 pub use families::transformation_normal;
 pub use gam_models::fit_orchestration::{
     BernoulliMarginalSlopeFitRequest, BinomialLocationScaleFitRequest,
@@ -329,10 +327,9 @@ pub use gam_models::fit_orchestration::{
     SurvivalLocationScaleFitRequest, SurvivalLocationScaleFitResult,
     SurvivalMarginalSlopeFitRequest, SurvivalTransformationFitRequest,
     SurvivalTransformationFitResult, SurvivalTransformationTermSpec,
-    TransformationNormalFitRequest, WorkflowError, constant_curvature_profiled_reml_scores,
-    fit_from_formula, fit_from_formula_with_notes, fit_model, fit_residual_cascade_from_formula,
-    fit_spline_scan_from_formula, is_binary_response, materialize, prepare_survival_time_stack,
-    residual_cascade_fast_path, resolve_family, resolve_offset_column, resolve_weight_column,
-    response_column_kind, spline_scan_fast_path,
+    TransformationNormalFitRequest, WorkflowError, fit_from_formula, fit_from_formula_with_notes,
+    fit_model, fit_residual_cascade_from_formula, fit_spline_scan_from_formula, is_binary_response,
+    materialize, prepare_survival_time_stack, residual_cascade_fast_path, resolve_family,
+    resolve_offset_column, resolve_weight_column, response_column_kind, spline_scan_fast_path,
 };
 pub use gpu::GpuDeviceInfo;

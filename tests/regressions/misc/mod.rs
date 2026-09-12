@@ -61,7 +61,6 @@ mod bms_covariance_declined_2718;
 mod bug_hunt_1680_near_collinear_additive_recovery;
 mod bug_hunt_2623_sampled_marginal_outer_gradient_frame;
 mod corrected_covariance_sigma_node_calibration_2728;
-mod fixed_kappa_profiled_reml_routes_production_2496;
 mod latent_aux_prior_normalizer_dimension;
 mod owed_1373;
 mod owed_1376;

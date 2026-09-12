@@ -2836,65 +2836,6 @@ mod sz_factor_smooth_recovery_tests {
     }
 }
 
-/// #1464 diagnostic entry point: evaluate the exact production fixed-κ
-/// profiled-REML criterion (`fixed_kappa_profiled_reml_score`) at a list of
-/// pinned κ values for the first constant-curvature term of `formula`,
-/// materialised from `data`/`config` exactly like [`fit_from_formula`]. The
-/// scorer runs a complete production fit independently at every pinned κ and
-/// returns `(κ, V_p(κ))` pairs.
-///
-/// This is a raw pinned-fit diagnostic, not the curvature estimand objective.
-/// Curvature point estimation, confidence intervals, and flatness inference use
-/// the separate continuously differentiable Gaussian REML curvature profile.
-/// Here κ-optimisation is disabled and each
-/// complete fit profiles only its smoothing parameters, so every returned score
-/// is the canonical negative log evidence of that independently pinned model.
-pub fn constant_curvature_profiled_reml_scores(
-    formula: &str,
-    data: &Dataset,
-    config: &FitConfig,
-    kappas: &[f64],
-) -> Result<Vec<(f64, f64)>, WorkflowError> {
-    let mat = materialize(formula, data, config)?;
-    let FitRequest::Standard(request) = mat.request else {
-        return Err(WorkflowError::IntegrationFailed {
-            reason: "constant_curvature_profiled_reml_scores: formula did not materialise to a \
-                     standard fit request"
-                .to_string(),
-        });
-    };
-    let term_idx =
-        *crate::fit_orchestration::drivers::constant_curvature_term_indices(&request.spec)
-            .first()
-            .ok_or_else(|| WorkflowError::IntegrationFailed {
-                reason:
-                    "constant_curvature_profiled_reml_scores: formula has no constant-curvature \
-                     curv() term"
-                        .to_string(),
-            })?;
-    let mut out = Vec::with_capacity(kappas.len());
-    for &kappa in kappas {
-        let score = crate::fit_orchestration::drivers::fixed_kappa_profiled_reml_score(
-            request.data.view(),
-            request.y.view(),
-            request.weights.view(),
-            request.offset.view(),
-            &request.spec,
-            term_idx,
-            kappa,
-            request.family.clone(),
-            &request.options,
-        )
-        .map_err(|e| WorkflowError::IntegrationFailed {
-            reason: format!(
-                "constant_curvature_profiled_reml_scores: fixed-κ fit at κ={kappa} failed: {e}"
-            ),
-        })?;
-        out.push((kappa, score));
-    }
-    Ok(out)
-}
-
 /// Formula-level library entry for the O(n log n) residual-cascade fast path
 /// (issue #1032).
 ///
