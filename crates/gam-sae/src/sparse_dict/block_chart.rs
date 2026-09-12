@@ -1314,52 +1314,56 @@ mod tests {
             "the ring must be selected by held-out BIC"
         );
 
-        // Rescale every coordinate by 10 (SSE ×100). Deviance-scale scoring must
+        // Rescale every coordinate by 16 (SSE ×256). Deviance-scale scoring must
         // leave the verdict and margin unchanged.
+        //
+        // The factor is a power of two, so the rescale is exact in f32, and every f64
+        // product, sum, quotient and even-power square root downstream scales exactly
+        // (no subnormal or overflow is reached): the whitening, its relative-ridge
+        // floor, the eigensolve, both predictors and every SSE scale by an exact
+        // power of two, and every deviance term is bit-identical. The evidence must
+        // therefore match to the bit. A factor that is not a power of two also rounds
+        // each f32 coordinate, and that perturbation can move where Geyer's initial
+        // positive sequence truncates inside `autocorr_ess`, a step change in
+        // `n_eff`: at 7ad913f69 a ×10 rescale moved the margin from 982.2667 to
+        // 983.2777 (census job 505903). That is sensitivity to input rounding, not
+        // scale dependence.
         let mut scaled = coords.clone();
-        scaled.mapv_inplace(|v| v * 10.0);
+        scaled.mapv_inplace(|v| v * 16.0);
         let big = crossfit_evidence(&scaled, &config).expect("evidence scaled");
 
         assert_eq!(
             base.selected_by_bic, big.selected_by_bic,
             "accept/reject verdict must be scale-invariant"
         );
-        // The deviance currency is scale-invariant in EXACT arithmetic — every
-        // dᵢ depends only on the ratio SSE_lin/SSE_chart and the telescoping
-        // eᵢ/(2 ŝ²) terms, all of which are unit-free. The residual divergence is
-        // pure floating-point: the upstream fit (whitening + relative-ridge
-        // regression on a ×10-rescaled Gram matrix) is only scale-EQUIVARIANT up
-        // to roundoff, and that ~ε accumulates through SSE → deviance → gain. On
-        // the ~3e3-magnitude margin/gain the gap is ~1e-4 absolute ≈ 4e-8
-        // relative — a few ×√ε, no summation reordering here makes it bit-exact.
-        // Assert a principled RELATIVE tolerance well above the roundoff floor
-        // (1e-6) yet far below any physically meaningful scale-dependence.
-        let scale_invariant =
-            |a: f64, b: f64| (a - b).abs() <= 1e-6 * a.abs().max(b.abs()).max(1.0);
-        assert!(
-            scale_invariant(base.margin, big.margin),
+        assert_eq!(
+            base.margin.to_bits(),
+            big.margin.to_bits(),
             "margin must be scale-invariant: {} vs {}",
             base.margin,
             big.margin
         );
-        assert!(
-            scale_invariant(base.deviance_gain, big.deviance_gain),
+        assert_eq!(
+            base.deviance_gain.to_bits(),
+            big.deviance_gain.to_bits(),
             "deviance gain must be scale-invariant: {} vs {}",
             base.deviance_gain,
             big.deviance_gain
         );
         assert!(
-            scale_invariant(base.ci_low, big.ci_low) && scale_invariant(base.ci_high, big.ci_high),
+            base.ci_low.to_bits() == big.ci_low.to_bits()
+                && base.ci_high.to_bits() == big.ci_high.to_bits(),
             "the deviance-scale CI must be scale-invariant"
         );
 
-        // Contrast: the OLD raw-SSE gain (linear_total − chart_total) scales by 100
-        // under ×10 — exactly the scale-dependence the deviance currency removes.
+        // Contrast: the OLD raw-SSE gain (linear_total − chart_total) scales by 256
+        // under ×16 — exactly the scale-dependence the deviance currency removes.
         let old_gain_base = base.linear_loss - base.chart_loss;
         let old_gain_big = big.linear_loss - big.chart_loss;
-        assert!(
-            (old_gain_big - 100.0 * old_gain_base).abs() < 1e-3 * old_gain_big.abs().max(1.0),
-            "raw SSE gain is scale-dependent (×100) — the currency the fix replaces"
+        assert_eq!(
+            old_gain_big.to_bits(),
+            (256.0 * old_gain_base).to_bits(),
+            "raw SSE gain is scale-dependent (×256) — the currency the fix replaces"
         );
     }
 }
