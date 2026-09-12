@@ -81,21 +81,23 @@ fn resolve_family_auto_count_picks_poisson_log() {
         "auto-inferred Poisson must use the canonical log link"
     );
 
-    // Integer counts arriving as f64 round-trips (CSV-style) must still detect.
-    let noisy_counts = array![0.0, 1.0 + 1e-12, 2.0 - 5e-10, 7.0, 3.0 + 1e-10];
+    // A value a rounding away from an integer is not a count. A decimal integer
+    // below 2^53 parses to itself exactly, so near-integers come from a
+    // continuous column and keep the conservative Gaussian default.
+    let near_integers = array![0.0, 1.0 + 1e-12, 2.0 - 5e-10, 7.0, 3.0 + 1e-10];
     let resolved = resolve_family(
         None,
         None,
         None,
-        noisy_counts.view(),
+        near_integers.view(),
         ResponseColumnKind::Numeric,
         "y",
     )
-    .expect("auto inference on near-integer counts should succeed");
+    .expect("auto inference on a numeric response should succeed");
     assert_eq!(
         resolved.response,
-        ResponseFamily::Poisson,
-        "near-integer counts within the round tolerance must auto-infer Poisson"
+        ResponseFamily::Gaussian,
+        "values that are not exactly integers must not auto-infer Poisson"
     );
 }
 

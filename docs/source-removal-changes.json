@@ -3057,5 +3057,13 @@
     ],
     "reason": "SPEC rules 23 and 6 (lead finding 2026-09-11): evaluate_blockwise_exact_newton switched at 512 coefficients from the row-kernel dense block pullback to evaluate_blockwise_exact_newton_sparse and evaluate_blockwise_exact_newton_mixed, which computed the same block Hessians in CSR storage through a second copy of the pullback and could not express a follow-up-varying slope. The dense route is now the one rigid route at every width.",
     "evidence": "At the base, git grep over crates/gam-models/src finds evaluate_blockwise_exact_newton_sparse and evaluate_blockwise_exact_newton_mixed only at their declarations and at the two call sites inside evaluate_blockwise_exact_newton in joint_eval.rs, both removed here; no test calls either function. Every other identity in this entry is declared inside one of those two function bodies."
+  },
+  {
+    "base": "0555454b7bee6249ae4d51021f7996436d748ce1",
+    "items": [
+      "crates/gam-spec/src/lib.rs:const:COUNT_INTEGER_TOL"
+    ],
+    "reason": "#2469: COUNT_INTEGER_TOL (1e-9) admitted values within 1e-9 of an integer as a Poisson count in infer_from_response. Its stated premise (CSV and integer-to-double round-trips accumulate ULP error) is false: a decimal integer below 2^53 parses to itself exactly, so a count is exactly an integer.",
+    "evidence": "At the base, git grep finds COUNT_INTEGER_TOL only in crates/gam-spec/src/lib.rs, which is edited here; the only test pinning the admission, tests/glm/families/magic_family_auto_poisson_count.rs, is restated in the same commit."
   }
 ]

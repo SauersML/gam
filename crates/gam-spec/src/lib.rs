@@ -975,28 +975,17 @@ impl ResponseFamily {
                 if binary {
                     return Ok(Self::Binomial);
                 }
-                // Count signature: every value finite, non-negative, and an
-                // exactly integer, with at least one value
-                // `>= 2` so it is not the (already-handled) binary case and not
-                // a degenerate all-zero column. A single fractional or negative
-                // value disqualifies the whole response, keeping continuous and
-                // signed data on the conservative Gaussian default.
-                // Integer WITHIN TOLERANCE, not exactly integer. A count that
-                // has been through a CSV round-trip reads back as `2.0 - 5e-10`,
-                // and exact equality disqualifies the whole vector, so the family
-                // silently resolves to Gaussian instead of Poisson.
-                //
-                // `COUNT_INTEGER_TOL` and this predicate were removed together by
-                // a sweeper commit that left the constant's doc comment behind,
-                // still describing the `1e-9` admission it no longer performed.
-                // The sibling classifier for the same signature in
-                // `materialize/family.rs` kept `<= 1e-9`, so the two had drifted
-                // into disagreeing about what a count is.
+                // Count signature: every value finite, non-negative, and exactly
+                // an integer, with at least one value `>= 2` so it is not the
+                // (already-handled) binary case and not a degenerate all-zero
+                // column. A single fractional or negative value disqualifies the
+                // whole response, keeping continuous and signed data on the
+                // conservative Gaussian default. A decimal integer below 2^53
+                // parses to itself exactly, so a value a rounding away from an
+                // integer did not come from an integer column.
                 let count = !y.is_empty()
-                    && y.iter().all(|v| {
-                        v.is_finite() && *v >= 0.0 && (*v - v.round()).abs() <= COUNT_INTEGER_TOL
-                    })
-                    && y.iter().any(|v| *v >= 2.0 - COUNT_INTEGER_TOL);
+                    && y.iter().all(|&v| v.is_finite() && v >= 0.0 && v == v.round())
+                    && y.iter().any(|&v| v >= 2.0);
                 if count {
                     Ok(Self::Poisson)
                 } else {
@@ -1079,16 +1068,6 @@ impl std::error::Error for ResponseSupportViolation {}
 /// response that varies below this floor without being exactly constant is
 /// rejected.
 pub const GAUSSIAN_MIN_SAMPLE_SD: f64 = 1.0e-10;
-
-/// Round tolerance for recognising an integer-valued (count) response.
-///
-/// `infer_from_response` classifies a numeric response as a Poisson count when
-/// every value is finite, non-negative, and within this window of its nearest
-/// non-negative integer. Count columns frequently arrive as `f64` round-trips
-/// of integers (CSV parse, integer→double promotion) that accumulate ULP-scale
-/// error; `1e-9` admits those without ever matching genuinely continuous data,
-/// whose fractional parts are O(1).
-pub const COUNT_INTEGER_TOL: f64 = 1.0e-9;
 
 /// Classifier for a [`ResponseDegeneracy`]. Each variant carries the family-
 /// specific evidence the caller needs to format a useful message without
