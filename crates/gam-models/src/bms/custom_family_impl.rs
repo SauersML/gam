@@ -1579,17 +1579,23 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
         parameter_block_specs_match_rows(specs, self.y.len())
     }
 
-    /// Force the matrix-free inner-Newton/PCG path for BMS flex at large-scale
-    /// scale, on top of the generic `use_joint_matrix_free_path` heuristic.
+    /// Request the matrix-free inner-Newton/PCG path for BMS flex, on top of
+    /// the generic `use_joint_matrix_free_path` heuristic.
     ///
-    /// At n≈195k with `linkwiggle()` / `slope_formula linkwiggle()`, dense
-    /// joint-H assembly streams every row through the expensive flex row
-    /// kernel and pays a BLAS-3 design-matrix gram per chunk on top — ~63s
-    /// per inner cycle. Each HVP reuses the row stream at near-gradient cost
-    /// (~3s), and PCG with the joint penalty preconditioner typically
-    /// converges in a handful of iters. The generic gate only fires for
-    /// `p >= 128`, but BMS-flex per-row work is heavy enough that the matrix-
-    /// free path wins well below that — drop the `p` floor for this family.
+    /// Without a pinned per-row primary Hessian cache, dense joint-H assembly
+    /// streams every row through the expensive flex row kernel and pays a
+    /// BLAS-3 design-matrix gram per chunk on top (~63s per inner cycle at
+    /// n≈195k with `linkwiggle()`). Each HVP reuses the row stream at
+    /// near-gradient cost (~3s), and PCG with the joint penalty preconditioner
+    /// typically converges in a handful of iters. The generic gate only fires
+    /// for `p >= 128`, but BMS-flex per-row work is heavy enough that the
+    /// matrix-free path wins well below that, so this family drops the `p`
+    /// floor.
+    ///
+    /// The request selects PCG only when the workspace serves an operator
+    /// source, which `matrix_free_inner_route` decides from the row-primary
+    /// cache plan. A pinned cache serves a dense source and keeps the dense
+    /// spectral solve. No row count chooses the route (gam#2900 row 6.10).
     fn prefers_matrix_free_inner_joint(
         &self,
         specs: &[ParameterBlockSpec],
@@ -1600,9 +1606,6 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
             "BernoulliMarginalSlopeFamily matrix-free inner-joint preference: \
              inconsistent parameter block specs"
         );
-        if self.y.len() < 16_384 {
-            return false;
-        }
         self.effective_flex_active(states).unwrap_or(false)
     }
 
@@ -2439,17 +2442,19 @@ impl BernoulliMarginalSlopeExactNewtonJointHessianWorkspace {
             .selected_device_dense_hessian_from_cache(&self.cache, operation)
     }
 
-    /// Matrix-free inner-Newton/CG route for BMS flex large-n.
+    /// Matrix-free inner-Newton/CG route for BMS flex.
     ///
-    /// Auto-selected when the workspace's per-row primary Hessian cache could
-    /// not be materialized (`n*r*r*8 > row_primary_cache_budget`). In that
-    /// regime the dense joint-H build streams all `n` rows and pays the full
-    /// flex row-kernel cost per chunk plus a BLAS-3 design-matrix gram on top;
-    /// at large-scale shape (n≈195k, p≈44) that pushes one dense build past 60s
-    /// while each HVP reuses the same row stream at ~gradient-pass cost (~3s).
-    /// PCG with the joint penalty preconditioner typically converges in a
-    /// handful of HVPs, so routing the inner solve through the operator path
-    /// beats per-cycle dense reassembly.
+    /// Auto-selected when the workspace's per-row primary Hessian cache is
+    /// tiled or could not be materialized (`decide_row_primary_hessian_cache`
+    /// declined it against the RAM budget). In that regime the dense joint-H
+    /// build streams all `n` rows and pays the full flex row-kernel cost per
+    /// chunk plus a BLAS-3 design-matrix gram on top; at large-scale shape
+    /// (n≈195k, p≈44) that pushes one dense build past 60s while each HVP
+    /// reuses the same row stream at ~gradient-pass cost (~3s). PCG with the
+    /// joint penalty preconditioner typically converges in a handful of HVPs,
+    /// so routing the inner solve through the operator path beats per-cycle
+    /// dense reassembly. Both costs scale with `n`, so the cache plan, not a
+    /// row count, chooses the route (gam#2900 row 6.10).
     pub(super) fn matrix_free_inner_route(&self) -> bool {
         if self.cache.row_primary_hessians.is_tiled() {
             return true;
@@ -2457,13 +2462,10 @@ impl BernoulliMarginalSlopeExactNewtonJointHessianWorkspace {
         if self.cache.row_primary_hessians.is_some() {
             return false;
         }
-        match self.family.effective_flex_active(&self.block_states) {
-            Ok(true) => {}
-            _ => return false,
-        }
-        // Tiny problems should still take the dense path: a single dense build
-        // is cheaper than CG bookkeeping when row counts are small.
-        self.family.y.len() >= 16_384
+        matches!(
+            self.family.effective_flex_active(&self.block_states),
+            Ok(true)
+        )
     }
 }
 
@@ -2487,9 +2489,10 @@ impl ExactNewtonJointHessianWorkspace for BernoulliMarginalSlopeExactNewtonJoint
             // build through `hessian_dense_forced`.
             if log_exact_work(self.family.y.len()) {
                 log::info!(
-                    "[BMS inner] route=matrix-free-CG n={} p={} primary_hessian_cache=false reason=flex+large-n",
+                    "[BMS inner] route=matrix-free-CG n={} p={} primary_hessian_cache_tiled={} reason=flex+row-primary-cache-not-pinned",
                     self.family.y.len(),
-                    self.cache.slices.total
+                    self.cache.slices.total,
+                    self.cache.row_primary_hessians.is_tiled()
                 );
             }
             return Ok(None);
