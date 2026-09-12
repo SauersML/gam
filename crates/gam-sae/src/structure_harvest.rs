@@ -1065,13 +1065,6 @@ pub struct HarvestReport {
 /// the value read per-atom by [`atom_axis_period`].
 const GLUE_DEFAULT_PERIOD: f64 = 1.0;
 
-/// Finite clamp on the seam log-e-value so a perfect (zero-residual) synthetic
-/// glue banks a large-but-finite certificate rather than `+∞` — the engine
-/// rejects non-finite triggers, and a banked e-value only needs to clear the
-/// ledger threshold `ln(1/α) ≈ 3`, not diverge. Kept well under `ln(f64::MAX)`
-/// so the ledger never overflows when it exponentiates the banked log-e.
-const GLUE_LOG_E_CLAMP: f64 = 50.0;
-
 /// A fitted seam transition between two d=1 charts A, B of one manifold under
 /// the unit-speed gauge: `t_A = sign · t_B + offset` (mod the `2π` period), with
 /// the seam equivalence e-value that certifies the two decoded charts coincide
@@ -1565,14 +1558,13 @@ fn seam_equivalence_log_e(
         let e_null = point_null_sq(points_a.row(i));
         log_e += norm_term - e_glue / (2.0 * band_sq) + e_null / (2.0 * pool_sq);
     }
+    // The ledger banks evidence in log space and the structure engine refuses a
+    // non-finite trigger, so a finite log e-value is banked as computed. A
+    // likelihood ratio that left the representable range certifies nothing.
     if !log_e.is_finite() {
-        log_e = if log_e < 0.0 {
-            -GLUE_LOG_E_CLAMP
-        } else {
-            GLUE_LOG_E_CLAMP
-        };
+        return None;
     }
-    Some(log_e.clamp(-GLUE_LOG_E_CLAMP, GLUE_LOG_E_CLAMP))
+    Some(log_e)
 }
 
 // ===========================================================================
