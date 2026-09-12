@@ -6416,13 +6416,10 @@ pub(crate) fn kkt_refusal_guidance_distinguishes_marginal_slope_coupling_from_po
 /// large-scale rank-deficient-H_pen failure mode — block-diagonal H with
 /// a fully degenerate third block and zero s_lambdas — must classify
 /// as `RankDeficientHPen` with nullity matching the structural rank
-/// deficiency. When `nullspace-lead`'s smooth-construction
-/// reparameterization lands and absorbs polynomial null spaces into
-/// the parametric block, the SAME fixture (rewritten with a
-/// full-rank reparameterized basis) should fit cleanly with no
-/// refusal. That follow-up half is wired below behind `#[ignore]`
-/// per the lead's note; the diagnosis half here is active so the
-/// canary fires today on the failure mode the rework targets.
+/// deficiency. The post-absorption half,
+/// `rank_deficient_hpen_canary_disappears_after_nullspace_absorption`,
+/// rewrites the SAME fixture with a full-rank reparameterized basis and
+/// requires that the rank-deficiency diagnosis no longer fires.
 #[test]
 pub(crate) fn rank_deficient_hpen_canary_fires_on_large_scale_shaped_failure() {
     let block_widths = [4usize, 4, 4];
@@ -6548,12 +6545,10 @@ pub(crate) fn rank_deficient_hpen_canary_fires_on_large_scale_shaped_failure() {
     );
 }
 
-/// Post-fix half of the canary: once `nullspace-lead`'s smooth
-/// reparameterization absorbs polynomial null spaces into the
-/// parametric block, the marginal-slope synthetic above (rewritten
-/// to use a full-rank reparameterized basis with the absorbed null
-/// columns moved into a separate identifiable block) should fit
-/// without any cert refusal.
+/// Post-absorption half of the canary: the marginal-slope synthetic
+/// above, rewritten to use a full-rank reparameterized basis with the
+/// absorbed polynomial null columns moved into a separate identifiable
+/// block, must no longer be diagnosed `RankDeficientHPen`.
 #[test]
 pub(crate) fn rank_deficient_hpen_canary_disappears_after_nullspace_absorption() {
     let block_widths = [4usize, 4, 4];

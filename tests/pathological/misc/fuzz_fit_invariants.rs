@@ -15,11 +15,10 @@
 //!   I6  SE ordering          — standard errors are finite and non-negative,
 //!                             so any symmetric interval lower ≤ mean ≤ upper.
 //!
-//! This file is a DISCOVERY net: it should stay green. Any case that trips an
-//! invariant is a bug — it gets minimized into its own dedicated regression
-//! test + a root-cause fix, and is then either fixed (so this stays green) or,
-//! if a deep fix is pending, captured in a `#[ignore]`d focused repro so this
-//! sweep does not block CI on a known-open ticket.
+//! This file is a DISCOVERY net. Any case that trips an invariant is a bug: it
+//! gets minimized into its own dedicated regression test and a root-cause fix.
+//! Until that fix lands, both this sweep and the focused test stay red; a
+//! known-open case is never ignored or excluded to keep the sweep green.
 //!
 //! Design choices that keep it CI-cheap and deterministic:
 //!   - n is small (8..40) — edge cases live at tiny n, and the 8 GB CI

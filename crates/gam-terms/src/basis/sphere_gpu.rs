@@ -1946,8 +1946,9 @@ mod sphere_gpu_tests {
     /// surface under test).
     ///
     /// Asserts max-absolute coefficient delta ≤ 1e-9 and max-absolute
-    /// fitted-value delta ≤ 1e-9. `#[ignore = "requires CUDA"]` so the
-    /// V100 bench runner unignores in their harness.
+    /// fitted-value delta ≤ 1e-9. Without a CUDA runtime it instead asserts
+    /// that the dispatch decision declines and the device kernel entry
+    /// refuses.
     #[test]
     fn sphere_gpu_end_to_end_fit_parity_vs_cpu_truncated() {
         use crate::basis::{

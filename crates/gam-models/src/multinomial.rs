@@ -5778,19 +5778,14 @@ mod reference_class_invariance_tests {
     }
 
     /// The quality arm's stride-3 penguins TRAIN split, materialized through the
-    /// production dataset loader. `None` when the checked-in CSV is unavailable.
-    fn penguins_stride3_train(td: &tempfile::TempDir) -> Option<gam_data::EncodedDataset> {
+    /// production dataset loader from the checked-in CSV.
+    fn penguins_stride3_train(td: &tempfile::TempDir) -> gam_data::EncodedDataset {
         const PENGUINS_CSV: &str = concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/../../bench/datasets/penguins.csv"
         );
-        let raw = match fs::read_to_string(PENGUINS_CSV) {
-            Ok(text) => text,
-            Err(err) => {
-                eprintln!("penguins CSV unavailable: {PENGUINS_CSV}: {err}");
-                return None;
-            }
-        };
+        let raw = fs::read_to_string(PENGUINS_CSV)
+            .unwrap_or_else(|err| panic!("read checked-in penguins CSV {PENGUINS_CSV}: {err}"));
         let mut lines = raw.lines();
         let header: Vec<&str> = lines
             .next()
@@ -5844,7 +5839,7 @@ mod reference_class_invariance_tests {
         .iter()
         .map(|s| s.to_string())
         .collect();
-        Some(load_dataset_projected(&path, &cols).expect("load penguins train"))
+        load_dataset_projected(&path, &cols).expect("load penguins train")
     }
 
     /// A deterministic two-covariate three-class dataset whose labels are DRAWN
@@ -5912,9 +5907,8 @@ mod reference_class_invariance_tests {
     /// question of the objective that was actually optimized.
     ///
     /// This prints both spectra at the same certified mode, on the same span, on
-    /// data drawn from a smooth softmax truth (nothing separates) and — when the
-    /// checked-in CSV is present — on the penguins witness, which genuinely is
-    /// quasi-separated. The two rows are the discriminator: the fix is only right
+    /// data drawn from a smooth softmax truth (nothing separates) and on the
+    /// checked-in penguins witness, which genuinely is quasi-separated. The two rows are the discriminator: the fix is only right
     /// if it disarms the first and leaves the second armed.
     ///
     /// Prints only; never asserts a bound.
@@ -5923,21 +5917,19 @@ mod reference_class_invariance_tests {
         let td = tempdir().expect("tempdir");
         let synthetic = softmax_drawn_two_covariate(td.path(), "arm2612", 600);
         let config = FitConfig::default();
-        let mut cases: Vec<(&str, gam_data::EncodedDataset, &str)> = vec![(
-            "synthetic softmax-drawn (nothing separates)",
-            synthetic,
-            "y ~ s(x1, k=6) + s(x2, k=6)",
-        )];
-        if let Some(train) = penguins_stride3_train(&td) {
-            cases.push((
+        let cases: Vec<(&str, gam_data::EncodedDataset, &str)> = vec![
+            (
+                "synthetic softmax-drawn (nothing separates)",
+                synthetic,
+                "y ~ s(x1, k=6) + s(x2, k=6)",
+            ),
+            (
                 "penguins stride-3 (the quasi-separated witness)",
-                train,
+                penguins_stride3_train(&td),
                 "species ~ s(bill_length_mm, k=10) + s(bill_depth_mm, k=10) \
                  + s(flipper_length_mm, k=10) + s(body_mass_g, k=10)",
-            ));
-        } else {
-            eprintln!("#2612 penguins arm SKIPPED: dataset unavailable");
-        }
+            ),
+        ];
 
         for (label, data, formula) in &cases {
             let request = MultinomialFitRequest {

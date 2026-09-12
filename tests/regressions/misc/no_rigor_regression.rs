@@ -30,9 +30,8 @@
 //!   * Hunks inside test code are ignored — tests legitimately assert on, and
 //!     sometimes relax, their own bounds.
 //!
-//! If git is unavailable (e.g. a tarball checkout) the test skips gracefully
-//! so local non-git runs pass; CI, which always has git, is the enforcement
-//! point.
+//! The detector needs git history. Without it (e.g. a tarball checkout) the
+//! test fails: a scan that could not run is not a pass.
 
 use std::collections::HashSet;
 use std::process::Command;
@@ -358,12 +357,10 @@ fn collect_findings() -> Option<Vec<Finding>> {
 
 #[test]
 pub(crate) fn no_silent_rigor_regression_in_recent_history() {
-    let findings = match collect_findings() {
-        Some(f) => f,
-        None => {
-            eprintln!("skipped: git unavailable");
-            return;
-        }
+    let Some(findings) = collect_findings() else {
+        panic!(
+            "rigor-regression scan could not read git history: git unavailable or no base ref"
+        );
     };
 
     let grandfathered: Vec<&Finding> = findings.iter().filter(|f| f.grandfathered).collect();

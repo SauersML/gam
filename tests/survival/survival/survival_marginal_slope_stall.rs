@@ -1,5 +1,6 @@
-//! Red test: reproduce the PIRLS joint-Newton residual-stall early-exit
-//! observed in production survival_marginal_slope fits at large scale.
+//! A survival marginal-slope fit at the production shape must converge. The
+//! PIRLS joint-Newton residual-stall early-exit observed in production
+//! survival_marginal_slope fits at large scale is the defect this reports.
 //!
 //! Production signature (n=195,780, p=33, 5/5 outer seeds failed):
 //!
@@ -19,18 +20,21 @@
 //! arbitrarily small fraction of their "fair" step and the time gradient
 //! stays large forever.
 //!
-//! This test induces the same regime on small synthetic data by:
-//!   * over-parameterising the time block (many internal knots over a
-//!     narrow age window),
-//!   * making the upper part of the time axis nearly event-free so
-//!     several time-basis columns carry almost no Fisher information,
-//!   * disabling the time smoothing prior (very small lambda) so that
-//!     prior is not what saves us.
+//! The fixture (`build_dataset`) reproduces the production frame shape and
+//! first-order column statistics at the production row count, fitted with
+//! the production PC-Duchon marginal and slope terms.
 //!
-//! Current expectation: this test FAILS — the outer optimizer rejects
-//! every seed because the inner joint-Newton stalls (residual-stall
-//! early-exit). When the bug is fixed (per-block / preconditioned
-//! anisotropic TR), the assertion `outer_converged == true` will pass.
+//! The contract is that `fit_from_formula` returns a fit. At this shape
+//! production instead aborts outer startup validation with
+//!
+//!   outer smoothing optimization failed after exhausting strategy fallbacks
+//!   ... no candidate seeds passed outer startup validation (custom family)
+//!   ... coupled exact-joint inner solve exited the joint Newton path before
+//!   convergence
+//!
+//! because the inner joint-Newton stalls on the time block (residual-stall
+//! early-exit). The hypothesised fix is a per-block / preconditioned
+//! anisotropic trust region.
 
 use csv::StringRecord;
 use gam::{FitConfig, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism};
@@ -223,12 +227,10 @@ fn build_dataset() -> gam::inference::data::EncodedDataset {
         .expect("encode synthetic survival marginal-slope dataset")
 }
 
-/// Reproduce the PIRLS joint-Newton residual-stall early-exit observed
-/// at large scale.  This test is currently expected to FAIL — assert
-/// `outer_converged == true`; the production code returns false because
-/// the inner joint-Newton stalls on the time block.
+/// The production-shape PC-Duchon survival marginal-slope fit must return a
+/// fit instead of aborting outer startup validation.
 #[test]
-fn survival_marginal_slope_stall_reproduces_residual_stall_early_exit() {
+fn survival_marginal_slope_pc_duchon_production_shape_fit_converges() {
     init();
 
     let data = build_dataset();
@@ -254,7 +256,7 @@ fn survival_marginal_slope_stall_reproduces_residual_stall_early_exit() {
     };
 
     eprintln!(
-        "[SURVIVAL-MGS-STALL] starting exact startup-failure repro: n={} formula={:?}",
+        "[SURVIVAL-MGS-STALL] starting production-shape fit: n={} formula={:?}",
         N, formula
     );
 
@@ -267,24 +269,7 @@ fn survival_marginal_slope_stall_reproduces_residual_stall_early_exit() {
         outcome.is_ok()
     );
 
-    let err = match outcome {
-        Ok(_) => panic!("expected exact startup validation failure"),
-        Err(err) => err,
-    };
-    let message = err.to_string();
-    assert!(
-        message.contains("outer smoothing optimization failed after exhausting strategy fallbacks"),
-        "missing outer fallback exhaustion error: {message}"
-    );
-    assert!(
-        message.contains("no candidate seeds passed outer startup validation (custom family)"),
-        "missing seed validation error: {message}"
-    );
-    assert!(
-        message.contains(
-            "coupled exact-joint inner solve exited the joint Newton path before convergence"
-        ),
-        "missing coupled exact-joint convergence error: {message}"
-    );
-    panic!("replicated exact production startup-validation error: {message}");
+    if let Err(err) = outcome {
+        panic!("survival marginal-slope PC-Duchon fit at n={N} failed instead of converging: {err}");
+    }
 }

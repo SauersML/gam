@@ -455,15 +455,12 @@ fn analytic_gradient_jacobian_is_symmetric_finite_difference_centered() {
 // Hessian is not exposed. The test that the task spec describes
 // (FD-vs-analytic Hessian comparison) cannot be written from the
 // integration-test boundary without first adding
-// `evaluate_externalhessian` to `src/solver/estimate.rs`. As a
-// best-effort oracle that EXERCISES the rank-deficient
-// (`penalty_subspace_trace` active) code path and will FAIL before
-// WS1a / PASS after, this test asserts gradient-Jacobian symmetry on
-// the same fixture used by the Gaussian rank-deficient test.
-//
-// Marked `#[ignore]` for now per the task spec: this is the WS1a
-// oracle and we expect it to flag a real failure before the WS1a fix
-// lands. Run with `cargo test -- --ignored`.
+// `evaluate_externalhessian` to `src/solver/estimate.rs`. As an oracle
+// that EXERCISES the rank-deficient (`penalty_subspace_trace` active)
+// code path, this test asserts gradient-Jacobian symmetry on the same
+// fixture used by the Gaussian rank-deficient test: an asymmetric FD
+// Jacobian means the analytic gradient and Hessian differentiate
+// different surfaces (the WS1a defect).
 
 #[test]
 fn analytic_hessian_matches_fd_under_rank_deficient_penalty() {
