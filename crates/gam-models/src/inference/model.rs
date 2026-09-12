@@ -2621,16 +2621,6 @@ impl SavedCompiledFlexBlock {
             BasisOptions::first_derivative().derivative_order,
         )
     }
-
-    pub fn second_derivative_design(
-        &self,
-        values: &Array1<f64>,
-    ) -> Result<Array2<f64>, FittedModelError> {
-        self.evaluate_span_polynomial_design(
-            values,
-            BasisOptions::second_derivative().derivative_order,
-        )
-    }
 }
 
 impl FittedFamily {

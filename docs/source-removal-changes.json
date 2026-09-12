@@ -1375,5 +1375,43 @@
     ],
     "reason": "user directive: delete all useless slop",
     "evidence": "git grep -nw at the base finds each name only at its own definition, in doc or comment prose, and in string labels; the error labels in kronecker.rs and dictionary.rs now name the functions that raise them. Pre-push lane job 422535 applied this patch over d33caf143 and ran cargo check --workspace --exclude gam-pyffi --all-targets (rc 0, Finished) and RUSTDOCFLAGS=\"-D warnings\" cargo doc -p gam-terms --no-deps (0 errors). docs/public-api-2829-disposition.tsv lists most of these as restored-in-place under #2829; the user directive supersedes that."
+  },
+  {
+    "base": "dc325f1909721be796d4a2cb468044329d09473a",
+    "items": [
+      "crates/gam-models/src/fit_orchestration/drivers/mod.rs:fn:trial_total_s",
+      "crates/gam-models/src/fit_orchestration/drivers/smooth_term_lr.rs:fn:selection_mean",
+      "crates/gam-models/src/fit_orchestration/drivers/smooth_term_lr.rs:fn:tail_probability",
+      "crates/gam-models/src/gpu_kernels/cubic_bspline_moments.rs:fn:binomial",
+      "crates/gam-models/src/gpu_kernels/cubic_bspline_moments.rs:fn:build_axis_tables_cpu",
+      "crates/gam-models/src/gpu_kernels/cubic_bspline_moments.rs:fn:dirichlet_ref_simplex",
+      "crates/gam-models/src/gpu_kernels/cubic_bspline_moments.rs:fn:fact_f64",
+      "crates/gam-models/src/gpu_kernels/cubic_bspline_moments.rs:fn:moment_1d_about",
+      "crates/gam-models/src/gpu_kernels/cubic_bspline_moments.rs:fn:moment_1d_gauss_legendre",
+      "crates/gam-models/src/gpu_kernels/cubic_bspline_moments.rs:fn:tetrahedral_geom_moment_cpu",
+      "crates/gam-models/src/inference/full_conformal.rs:fn:bernoulli_full_conformal",
+      "crates/gam-models/src/inference/full_conformal.rs:fn:discrete_full_conformal_exhaustive",
+      "crates/gam-models/src/inference/full_conformal.rs:fn:discrete_full_conformal_window",
+      "crates/gam-models/src/inference/full_conformal.rs:fn:discrete_walk",
+      "crates/gam-models/src/inference/full_conformal.rs:fn:drho_dz",
+      "crates/gam-models/src/inference/full_conformal.rs:fn:gaussian_reml_smoothing_response_matches_reselection",
+      "crates/gam-models/src/inference/full_conformal.rs:fn:honest_membership",
+      "crates/gam-models/src/inference/full_conformal.rs:fn:mean_sensitivity_to_rho",
+      "crates/gam-models/src/inference/full_conformal.rs:fn:penalized_laml_criterion",
+      "crates/gam-models/src/inference/full_conformal.rs:fn:scores",
+      "crates/gam-models/src/inference/full_conformal.rs:struct:DiscreteCandidate",
+      "crates/gam-models/src/inference/full_conformal.rs:struct:DiscreteFullConformalSet",
+      "crates/gam-models/src/inference/full_conformal.rs:trait:SymmetricAugmentedFit",
+      "crates/gam-models/src/inference/model.rs:fn:second_derivative_design",
+      "crates/gam-models/src/multinomial.rs:fn:coefficient_covariance_corrected",
+      "crates/gam-models/src/multinomial.rs:fn:logistic_normal_softmax_moments",
+      "crates/gam-models/src/multinomial.rs:fn:logistic_normal_softmax_moments_with_control",
+      "crates/gam-models/src/multinomial.rs:fn:predict_multinomial_formula_with_se_in_mode",
+      "crates/gam-models/src/vector_response.rs:fn:diag_precision",
+      "crates/gam-models/src/vector_response.rs:fn:from_target",
+      "crates/gam-models/src/wiggle.rs:fn:buildwiggle_block_input_from_seed"
+    ],
+    "reason": "user directive: delete all useless slop",
+    "evidence": "At dc325f190, git grep -nw over crates, src, tests, examples, bench and benches names every removed public item only at its own definition or in doc prose, and that prose is rewritten here. The private helpers binomial, fact_f64, dirichlet_ref_simplex and discrete_walk, and the discrete-arm types SymmetricAugmentedFit, DiscreteCandidate and DiscreteFullConformalSet, are read only by removed items (all file-local in cubic_bspline_moments.rs and full_conformal.rs). Tests keep their checks on production code: the #1101 covariance test calls integrate_multinomial_design_moments directly, the Lipschitz positive control samples the sensitivity with its own Cholesky, and the re-selection test keeps its stationarity assertion."
   }
 ]

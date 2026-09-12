@@ -93,20 +93,6 @@ pub const PROD_LEN: usize = 2 * DEGREE + 1; // 7
 /// Number of unordered active pairs per span (4 × 5 / 2 = 10).
 pub const PAIRS_PER_SPAN: usize = ACTIVE_PER_SPAN * (ACTIVE_PER_SPAN + 1) / 2; // 10
 
-/// Pascal's triangle row 0..=8 (sufficient for any α we care about in practice).
-/// Used to expand (L − m)^{ν − s} when m ≠ L in CPU code.
-fn binomial(n: usize, k: usize) -> f64 {
-    if k > n {
-        return 0.0;
-    }
-    let k = k.min(n - k);
-    let mut acc: f64 = 1.0;
-    for i in 0..k {
-        acc = acc * (n - i) as f64 / (i + 1) as f64;
-    }
-    acc
-}
-
 /// Lower-triangular row-major index into a symmetric 4×4 active-pair table.
 /// Returns the slot for the unordered pair (a, b) with 0 ≤ a, b < 4.
 #[inline]
@@ -256,35 +242,8 @@ pub fn convolve_basis_pair(
 // 1D closed-form moments
 // ────────────────────────────────────────────────────────────────────────
 
-/// Closed form for ∫_L^R (x − m)^ν · P(u) dx where P(u) = Σ_q c_q u^q and
-/// u = x − L. Section 1 expansion.
-///
-/// When `m == L` (cell-local moments, our default), the formula collapses to
-/// `Σ_q c_q · h^{q+ν+1} / (q + ν + 1)`.
-pub fn moment_1d_about(c: [f64; PROD_LEN], width: f64, nu: usize, m_minus_left: f64) -> f64 {
-    if !span_is_active(width) {
-        return 0.0;
-    }
-    let mut acc = 0.0;
-    let lm = -m_minus_left; // (L - m)
-    for s in 0..=nu {
-        let bin = binomial(nu, s);
-        // f64::powi(0) returns 1.0 for any base including 0.0, so the s=nu
-        // case lands correctly even when lm is zero (no special-case needed).
-        let lm_pow = lm.powi((nu - s) as i32);
-        // S_s = Σ_q c_q · h^{q+s+1} / (q + s + 1)
-        let mut ss = 0.0;
-        let mut h_pow = width.powi((s + 1) as i32);
-        for q in 0..PROD_LEN {
-            ss += c[q] * h_pow / ((q + s + 1) as f64);
-            h_pow *= width;
-        }
-        acc += bin * lm_pow * ss;
-    }
-    acc
-}
-
-/// Convenience: 1D moment about the cell's left endpoint (m = L). This is the
+/// Closed form for ∫_L^R (x − L)^ν · P(x − L) dx = `Σ_q c_q · h^{q+ν+1} / (q + ν + 1)`,
+/// the 1D moment about the cell's left endpoint (section 1 expansion). This is the
 /// integral the hot kernel evaluates per (cell, axis, pair, alpha) entry.
 #[inline]
 pub fn moment_1d_local(c: [f64; PROD_LEN], width: f64, nu: usize) -> f64 {
@@ -298,47 +257,6 @@ pub fn moment_1d_local(c: [f64; PROD_LEN], width: f64, nu: usize) -> f64 {
         h_pow *= width;
     }
     acc
-}
-
-// ────────────────────────────────────────────────────────────────────────
-// 20-point Gauss-Legendre reference (parity gate for the closed-form path)
-// ────────────────────────────────────────────────────────────────────────
-
-// Canonical 20-point Gauss-Legendre nodes/weights on [-1, 1] (Abramowitz &
-// Stegun 25.4), shared with the bivariate-normal cell integrator. The single
-// source of truth lives in `crate::cubic_cell_kernel`; this parity
-// gate references it so the two cubic-cell consumers can never silently drift.
-// 20 points integrate any polynomial of degree ≤ 39 exactly in finite
-// arithmetic — far more than our degree-≤ (6 + ν) integrand needs.
-use crate::cubic_cell_kernel::{GL20_NODES, GL20_WEIGHTS};
-
-/// Gauss-Legendre reference: ∫_L^R (x − m)^ν · P(x − L) dx with P given by the
-/// product-polynomial coefficient vector. Used solely as a parity gate.
-pub fn moment_1d_gauss_legendre(
-    c: [f64; PROD_LEN],
-    left: f64,
-    width: f64,
-    nu: usize,
-    m: f64,
-) -> f64 {
-    if !span_is_active(width) {
-        return 0.0;
-    }
-    let half = 0.5 * width;
-    let center = left + half;
-    let mut acc = 0.0;
-    for k in 0..20 {
-        let x = center + half * GL20_NODES[k];
-        let u = x - left;
-        // Horner on c[0..=6]
-        let mut p = c[PROD_LEN - 1];
-        for q in (0..PROD_LEN - 1).rev() {
-            p = p * u + c[q];
-        }
-        let mom = (x - m).powi(nu as i32);
-        acc += GL20_WEIGHTS[k] * mom * p;
-    }
-    acc * half
 }
 
 // ────────────────────────────────────────────────────────────────────────
@@ -491,37 +409,6 @@ impl CubicMomentSpec {
     pub fn n_alpha(&self) -> usize {
         self.alphas.len()
     }
-}
-
-/// Build the per-axis tables required for `spec` from a list of per-axis knot
-/// vectors. Returns one `AxisCubicMomentTables` per axis per *distinct*
-/// derivative signature actually requested by `spec`.
-pub fn build_axis_tables_cpu(
-    spec: &CubicMomentSpec,
-    knots_per_axis: &[Vec<f64>],
-) -> Vec<Vec<AxisCubicMomentTables>> {
-    assert_eq!(spec.d(), knots_per_axis.len(), "axis count mismatch");
-    let d = spec.d();
-    let mut out = Vec::with_capacity(d);
-    for axis in 0..d {
-        // Distinct (deriv_left[axis], deriv_right[axis]) pairs across all alphas.
-        let mut sigs: Vec<(u8, u8)> = (0..spec.n_alpha())
-            .map(|i| {
-                (
-                    spec.derivative_left[i][axis],
-                    spec.derivative_right[i][axis],
-                )
-            })
-            .collect();
-        sigs.sort_unstable();
-        sigs.dedup();
-        let mut axis_tables = Vec::with_capacity(sigs.len());
-        for (dl, dr) in sigs {
-            axis_tables.push(AxisCubicMomentTables::build(&knots_per_axis[axis], dl, dr));
-        }
-        out.push(axis_tables);
-    }
-    out
 }
 
 /// CPU reference: compute M_α^{ij}(c) for one tensor hex cell from the axis
@@ -937,7 +824,8 @@ impl HexCellTable {
 
 /// Build the alpha-major `[NALPHA, n_cells]` hex tensor moment table on the
 /// device. Per-axis tables must be supplied in a fixed (axis × derivative-sig)
-/// order matching `build_axis_tables_cpu`; the consumer picks one table per
+/// order — per axis, one table for each distinct derivative signature in
+/// ascending order; the consumer picks one table per
 /// alpha slot through `derivative_left` / `derivative_right` (the kernel
 /// itself is derivative-agnostic — derivative orders are baked into the
 /// product-poly coefficients of each axis table on the CPU).
@@ -1286,160 +1174,6 @@ struct TetMomentModuleKey {
     beta_hash: u64,
     alpha_hash: u64,
     layout_tag: u8,
-}
-
-/// Closed-form factorial for the Dirichlet integral on T_ref. Up to 20! is
-/// representable exactly in f64; we cap at 12 (geometric moment exponents
-/// only ever reach AMAX_GEOM ≈ 6 in production specs, so n_1+n_2+n_3+3 ≤ 9).
-#[inline]
-fn fact_f64(n: u32) -> f64 {
-    let mut acc = 1.0f64;
-    for k in 2..=n {
-        acc *= k as f64;
-    }
-    acc
-}
-
-/// Dirichlet integral over the reference 3-simplex.
-///
-///   ∫_{T_ref} u_1^{n1} u_2^{n2} u_3^{n3} du = n1!·n2!·n3! / (n1+n2+n3+3)!
-#[inline]
-fn dirichlet_ref_simplex(n1: u32, n2: u32, n3: u32) -> f64 {
-    fact_f64(n1) * fact_f64(n2) * fact_f64(n3) / fact_f64(n1 + n2 + n3 + 3)
-}
-
-/// CPU reference: geometric moment G_β(T) = ∫_T (x − c0)^β dx for one
-/// tetrahedron via the expansion described at the top of this section.
-/// Used by the parity test and as the canonical reference if a non-Linux
-/// host wants to evaluate the same quantity without a GPU.
-pub fn tetrahedral_geom_moment_cpu(
-    vertices: &[f64], // 4*D
-    cell_center: &[f64],
-    beta: &[u8],
-    d: usize,
-) -> f64 {
-    assert_eq!(vertices.len(), 4 * d);
-    assert_eq!(cell_center.len(), d);
-    assert_eq!(beta.len(), d);
-
-    // q[r] = v0[r] − c0[r], e[i][r] = v_{i+1}[r] − v0[r]
-    let mut q = vec![0.0f64; d];
-    let mut e = [vec![0.0f64; d], vec![0.0f64; d], vec![0.0f64; d]];
-    for r in 0..d {
-        q[r] = vertices[r] - cell_center[r];
-        for i in 0..3 {
-            e[i][r] = vertices[(i + 1) * d + r] - vertices[r];
-        }
-    }
-
-    // |det B| with B = [e1 | e2 | e3] (D×3). Only the D = 3 case has a
-    // unique determinant. For D > 3 we use the 3D Gram-determinant
-    // sqrt(det(BᵀB)) interpretation (i.e. 6·Vol of the 3-simplex embedded
-    // in R^D). For D = 2 we treat the third edge as zero-extended and
-    // fall back to a planar |det| with e3 ignored — but the entry point
-    // refuses D < 3 to keep the geometry well-posed.
-    assert!(d >= 3, "tetrahedral path requires D ≥ 3");
-    let det_b = if d == 3 {
-        let m = [
-            [e[0][0], e[1][0], e[2][0]],
-            [e[0][1], e[1][1], e[2][1]],
-            [e[0][2], e[1][2], e[2][2]],
-        ];
-        (m[0][0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1])
-            - m[0][1] * (m[1][0] * m[2][2] - m[1][2] * m[2][0])
-            + m[0][2] * (m[1][0] * m[2][1] - m[1][1] * m[2][0]))
-            .abs()
-    } else {
-        // sqrt(det(BᵀB))
-        let mut g = [[0.0f64; 3]; 3];
-        for i in 0..3 {
-            for j in 0..3 {
-                let mut acc = 0.0;
-                for r in 0..d {
-                    acc += e[i][r] * e[j][r];
-                }
-                g[i][j] = acc;
-            }
-        }
-        let det_g = g[0][0] * (g[1][1] * g[2][2] - g[1][2] * g[2][1])
-            - g[0][1] * (g[1][0] * g[2][2] - g[1][2] * g[2][0])
-            + g[0][2] * (g[1][0] * g[2][1] - g[1][1] * g[2][0]);
-        det_g.max(0.0).sqrt()
-    };
-
-    // For each axis r build the polynomial in (u_1, u_2, u_3) representing
-    // (q_r + e_{1,r} u_1 + e_{2,r} u_2 + e_{3,r} u_3)^{β_r} using the
-    // affine T_n recurrence T_β = T_{β-1} · (q + Σ_i e_i u_i). The
-    // polynomial is stored as a dense [n_max+1; 3] tensor over u_1, u_2, u_3
-    // exponents, capped at β_r along each axis.
-    //
-    // Per-axis polynomial size: (β_r + 1)^3 doubles. Then we multiply
-    // across axes into a global polynomial in (u_1, u_2, u_3) capped at
-    // (|β|, |β|, |β|) (loose but safe). Total: (|β|+1)^3 doubles, summed
-    // term-by-term via the Dirichlet integral.
-    let beta_total: u32 = beta.iter().map(|&v| v as u32).sum();
-    let n_max = beta_total as usize;
-    let stride = n_max + 1;
-    let size = stride * stride * stride;
-    // `poly[i + stride*(j + stride*k)] = coefficient of u_1^i u_2^j u_3^k`.
-    // Start with the unit polynomial 1.
-    let mut poly = vec![0.0f64; size];
-    poly[0] = 1.0;
-
-    for r in 0..d {
-        let br = beta[r] as u32;
-        if br == 0 {
-            continue;
-        }
-        let qr = q[r];
-        let e1 = e[0][r];
-        let e2 = e[1][r];
-        let e3 = e[2][r];
-        for _ in 0..br {
-            // poly := poly · (qr + e1·u_1 + e2·u_2 + e3·u_3). Shift-add
-            // pattern; we accumulate into a fresh buffer to avoid
-            // aliasing. Bounds: indices stay ≤ n_max by construction
-            // because total degree at most |β|.
-            let mut next = vec![0.0f64; size];
-            for k in 0..stride {
-                for j in 0..stride {
-                    for i in 0..stride {
-                        let v = poly[i + stride * (j + stride * k)];
-                        if v == 0.0 {
-                            continue;
-                        }
-                        next[i + stride * (j + stride * k)] += qr * v;
-                        if i + 1 < stride {
-                            next[(i + 1) + stride * (j + stride * k)] += e1 * v;
-                        }
-                        if j + 1 < stride {
-                            next[i + stride * ((j + 1) + stride * k)] += e2 * v;
-                        }
-                        if k + 1 < stride {
-                            next[i + stride * (j + stride * (k + 1))] += e3 * v;
-                        }
-                    }
-                }
-            }
-            poly = next;
-        }
-    }
-
-    // Integrate term-by-term against the Dirichlet kernel and scale by
-    // |det B| (the constant Jacobian).
-    let mut acc = 0.0f64;
-    for k in 0..stride {
-        for j in 0..stride {
-            for i in 0..stride {
-                let coeff = poly[i + stride * (j + stride * k)];
-                if coeff == 0.0 {
-                    continue;
-                }
-                acc += coeff * dirichlet_ref_simplex(i as u32, j as u32, k as u32);
-            }
-        }
-    }
-    acc * det_b
 }
 
 /// Generate NVRTC C++ source for the geometric-moment kernel. One thread =

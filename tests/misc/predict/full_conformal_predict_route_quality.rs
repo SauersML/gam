@@ -1,18 +1,7 @@
-//! End-to-end quality tests for the conformal prediction route (#942 / #1054).
+//! End-to-end quality tests for the conformal prediction route (#942 / #1054),
+//! asserted on OBJECTIVE coverage:
 //!
-//! Two regimes, two estimators, both asserted on OBJECTIVE coverage:
-//!
-//!   1. **Discrete / Bernoulli → the EXACT full-conformal engine.** This is the
-//!      regime where full conformal genuinely beats split: the response support
-//!      `{0, 1}` is finite, so the exact set is computed by enumeration (one
-//!      symmetric refit per candidate) and is a finite, informative subset of
-//!      the support with *finite-sample-exact* coverage `≥ 1 − α` — a guarantee
-//!      split conformal cannot match at small calibration n. The engine
-//!      (`bernoulli_full_conformal`) was implemented but unreachable before
-//!      #942/#1054; this test exercises it on a realistic intercept-logistic
-//!      fitting map and pins the distribution-free coverage theorem.
-//!
-//!   2. **Continuous / Gaussian → split conformal, scored on the PREDICTION
+//!   **Continuous / Gaussian → split conformal, scored on the PREDICTION
 //!      scale.** For a continuous Gaussian-identity fit the absolute-residual
 //!      full-conformal set is never bounded where split is not (both transition
 //!      at `n_cal = (1−α)/α`), so split — normalized by the predictive SE
@@ -20,7 +9,7 @@
 //!      finite-sample-valid tool. We assert it covers a fresh response at the
 //!      nominal level.
 //!
-//! Neither assertion is weakened relative to the original ticket: the
+//! No assertion is weakened relative to the original ticket: the
 //! finiteness/informativeness and the `≥ 1 − α` coverage bars are kept; they
 //! are pointed at the regime where the guarantee is mathematically achievable.
 
@@ -31,8 +20,6 @@ use ndarray::{Array1, Array2};
 use rand::SeedableRng;
 use rand::rngs::StdRng;
 use rand_distr::{Distribution, Normal, StudentT};
-
-// ───────────────────────── Bernoulli full conformal ─────────────────────────
 
 // ───────────────────────── Gaussian split conformal ─────────────────────────
 
@@ -56,8 +43,8 @@ fn true_mean(xi: f64) -> f64 {
 
 // ───────────────── Gaussian EXACT full conformal (#1098) ─────────────────────
 //
-// The arms above exercise the Bernoulli EXACT engine and the Gaussian SPLIT
-// calibrator, but NOT the continuous Gaussian-identity EXACT full-conformal
+// `conformal_coverage_quality.rs` exercises the Gaussian SPLIT calibrator,
+// but NOT the continuous Gaussian-identity EXACT full-conformal
 // engine `ExactFullConformalSubstrate` / `ExactGaussianFullConformal` that the
 // saved-model `predict(interval="full_conformal")` route (#1098) actually
 // invokes. That engine is the one with the strongest theorem: for a Gaussian

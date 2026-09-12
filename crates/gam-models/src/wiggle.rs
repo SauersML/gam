@@ -411,21 +411,6 @@ pub fn buildwiggle_block_input_from_orders(
     buildwiggle_block_input_from_canonical_penalties(seed, knots, degree, &canonical)
 }
 
-pub fn buildwiggle_block_input_from_seed(
-    seed: ArrayView1<'_, f64>,
-    cfg: &WiggleBlockConfig,
-) -> Result<(ParameterBlockInput, Array1<f64>), String> {
-    let knots = monotone_warp_knots_from_seed(seed, cfg.degree, cfg.num_internal_knots)?;
-    let block = buildwiggle_block_input_from_knots(
-        seed,
-        &knots,
-        cfg.degree,
-        cfg.penalty_order,
-        cfg.double_penalty,
-    )?;
-    Ok((block, knots))
-}
-
 pub(crate) fn monotone_wiggle_basis_from_knots(
     seed: ArrayView1<'_, f64>,
     knots: &Array1<f64>,

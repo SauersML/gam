@@ -1478,23 +1478,7 @@ impl SmoothLrSelectionReplay {
             conditional_sample,
         })
     }
-    /// `E[W(λ̂)]` under the replayed SELECTION law — the mean of the reference
-    /// this term's p-value is actually read from.
-    ///
-    /// It is published because it is the only quantity that makes the
-    /// construction checkable at the level of a moment. `ref_df = Σ_j w_j` is
-    /// the CONDITIONAL mean `E[W | λ̂]`, and under a null DGP the empirical mean
-    /// of `W` does NOT converge to it: `λ̂` is picked from the same data, so the
-    /// pairing is per-replicate and the unconditional means need not agree —
-    /// measured on this issue's own fixture at a ratio of `2.34`. Reading that
-    /// ratio as a defect is the mistake this thread made twice. What the
-    /// empirical mean IS comparable to is this number.
-    pub fn selection_mean(&self) -> f64 {
-        Self::mean(&self.selection_sample)
-    }
-
-    /// `E[W | λ̂]` on the SAME draws — the conditional law's mean, for the
-    /// paired comparison that shows what the selection did.
+    /// `E[W | λ̂]` — the conditional law's mean over its own draws.
     pub fn conditional_mean(&self) -> f64 {
         Self::mean(&self.conditional_sample)
     }
@@ -1746,7 +1730,7 @@ pub struct SmoothLrReferenceDf {
     /// The null spectrum itself, `w_j ∈ [0, 1]`, sorted descending — the whole
     /// reference on the [`SmoothLrReferenceSource::NullSpectrum`] lane. Empty on
     /// the two lanes that could not reach it, which is exactly the condition
-    /// under which `Self::tail_probability` falls back to the `(ν, g)` pair.
+    /// under which `Self::tail_probability_with_bound` falls back to the `(ν, g)` pair.
     pub weights: Vec<f64>,
     /// First spectral moment `Σ_j w_j = 2·tr(F_jj) − tr(F_jj²)` — Wood's `edf1`,
     /// and exactly the statistic's first-order null mean `E[W|λ]`. This is the
@@ -1932,7 +1916,16 @@ const SMOOTH_LR_TAIL_ROUNDOFF_FLOOR: f64 = 1e-13;
 const SMOOTH_LR_TAIL_COARSEST: f64 = 1e-3;
 
 impl SmoothLrReferenceDf {
-    /// `P(W > statistic)` under this reference.
+    /// The CONDITIONAL tail — the fixed-`λ` law alone, with the λ̂-selection
+    /// replay held out. This is the tail `Self::tail_probability_with_bound`
+    /// reports when nothing was selected, and it is the reference the replay
+    /// corrects.
+    pub fn conditional_tail_probability(&self, statistic: f64) -> f64 {
+        self.conditional_tail_with_bound(statistic).0
+    }
+
+    /// `P(W > statistic)` under this reference, with the certified absolute
+    /// bound the quadrature achieved on it.
     ///
     /// On the exact lane this is `P(Σ_j w_j χ²_1 > W)` by Imhof inversion; on the
     /// two surrogate lanes it is the two-moment `P(χ²_ν > W/g)`. Both are
@@ -1942,19 +1935,6 @@ impl SmoothLrReferenceDf {
     /// A non-finite statistic propagates as `NaN` rather than being scored: the
     /// LR statistic is `NaN` exactly when the null refit did not produce a finite
     /// log-likelihood, and there is no p-value for a test that was not run.
-    pub fn tail_probability(&self, statistic: f64) -> f64 {
-        self.tail_probability_with_bound(statistic).0
-    }
-
-    /// The CONDITIONAL tail — the fixed-`λ` law alone, with the λ̂-selection
-    /// replay held out. This is what `Self::tail_probability` returns when
-    /// nothing was selected, and it is the reference the replay corrects.
-    pub fn conditional_tail_probability(&self, statistic: f64) -> f64 {
-        self.conditional_tail_with_bound(statistic).0
-    }
-
-    /// `Self::tail_probability` with the certified absolute bound the
-    /// quadrature achieved on it.
     ///
     /// # How accurately the tail is resolved, and why that is derived
     ///
@@ -3339,7 +3319,7 @@ mod lr_null_reference_tests {
         assert_eq!(exact.weights.len(), q);
 
         // No `H⁻¹` (or no penalty): the moments off `F`, and NO weights — which
-        // is exactly the condition `tail_probability` switches on.
+        // is exactly the condition `tail_probability_with_bound` switches on.
         for degraded in [
             lr_null_reference(Some(&influence), None, Some(&penalty), &(0..q), 2.0, 1, 0.0, WINDOW, &[], &[]),
             lr_null_reference(
