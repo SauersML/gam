@@ -181,6 +181,7 @@ fn carve_weekday_month(
         phi_a: phi_a.view(),
         phi_b: phi_b.view(),
         coeffs: &fit.coeffs,
+        coeff_band: &fit.coeff_band,
         coeff_covariance: with_covariance.then_some(fit.coeff_covariance.as_slice()),
         joint_coeff_covariance: with_covariance.then_some(&joint),
         kernel_a: None,

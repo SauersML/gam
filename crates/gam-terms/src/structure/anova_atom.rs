@@ -301,6 +301,12 @@ pub struct TensorSurfaceFit {
     /// Residual degrees of freedom `n − edf` (the denominator d.f. for
     /// the `Estimated`-scale F branch).
     pub residual_df: f64,
+    /// Per response dimension, a bound on the absolute rounding error of every
+    /// entry of `coeffs[d]`, carried from the solve that produced them (see
+    /// [`fit_tensor_surface`]). [`carve`] reads it to decide whether an
+    /// interaction block is distinguishable from what an exactly additive
+    /// surface leaves after this solve.
+    pub coeff_band: Vec<f64>,
 }
 
 impl TensorSurfaceFit {
@@ -631,6 +637,50 @@ pub fn fit_tensor_surface(
         }
     }
     let beta = evecs.dot(&beta_rot); // mm × D
+    // #2822 — the coefficients' rounding band. The computed β̂ = V̂(Λ̂+λ)⁻¹V̂ᵀ(Xᵀy)
+    // solves a perturbed system: the Gram accumulation and the backward-stable
+    // eigensystem perturb XᵀX by E with ‖E‖₂ ≤ γₙ·‖|X|ᵀ|X|‖_F + `spectral_roundoff`,
+    // Xᵀy and its rotation V̂ᵀXᵀy carry their accumulation bands, the division is
+    // correctly rounded, and the final rotation V̂·β_rot accumulates M₁M₂ terms.
+    // Per output the forward error therefore satisfies
+    //   ‖Δβ‖₂ ≤ (‖E‖₂·‖β̂‖₂ + ‖band(Xᵀy)‖₂ + ‖band(V̂ᵀXᵀy)‖₂)/(d_min + λ)
+    //           + γ₂·‖β̂‖₂ + ‖band(V̂·β_rot)‖₂,
+    // which bounds every entry. The interaction coefficients of an exactly additive
+    // surface are zero only up to this band: the rotations mix O(‖β̂‖) magnitudes
+    // into every entry and cancel them there.
+    let n_growth = gam_linalg::roundoff::accumulation_growth(n);
+    let mm_growth = gam_linalg::roundoff::accumulation_growth(mm);
+    let division_growth = gam_linalg::roundoff::accumulation_growth(2);
+    let abs_x = x.mapv(f64::abs);
+    let abs_evecs = evecs.mapv(f64::abs);
+    let abs_gram = abs_x.t().dot(&abs_x);
+    let operator_band =
+        n_growth * abs_gram.iter().map(|v| v * v).sum::<f64>().sqrt() + spectral_roundoff;
+    let d_min = gram_modes.iter().copied().fold(f64::INFINITY, f64::min);
+    let conditioning = d_min + lambda;
+    let abs_xty_sums = abs_x.t().dot(&responses.mapv(f64::abs)); // mm × D
+    let abs_rotated_xty_sums = abs_evecs.t().dot(&xty.mapv(f64::abs)); // mm × D
+    let abs_rotation_sums = abs_evecs.dot(&beta_rot.mapv(f64::abs)); // mm × D
+    let column_norm = |matrix: &Array2<f64>, d: usize| -> f64 {
+        matrix.column(d).iter().map(|v| v * v).sum::<f64>().sqrt()
+    };
+    let mut coeff_band = Vec::with_capacity(d_dims);
+    for d in 0..d_dims {
+        let beta_norm = column_norm(&beta, d);
+        let solve_band = (operator_band * beta_norm
+            + n_growth * column_norm(&abs_xty_sums, d)
+            + mm_growth * column_norm(&abs_rotated_xty_sums, d))
+            / conditioning;
+        let band = solve_band
+            + division_growth * beta_norm
+            + mm_growth * column_norm(&abs_rotation_sums, d);
+        if !(band.is_finite() && band >= 0.0) {
+            return Err(format!(
+                "fit_tensor_surface: coefficient rounding band for response {d} is not finite ({band})"
+            ));
+        }
+        coeff_band.push(band);
+    }
     let fitted = x.dot(&beta); // n × D
     let mut residual_cross_cov = Array2::<f64>::zeros((d_dims, d_dims));
     for d in 0..d_dims {
@@ -675,6 +725,7 @@ pub fn fit_tensor_surface(
         lambda,
         edf,
         residual_df,
+        coeff_band,
     })
 }
 
@@ -718,6 +769,7 @@ impl FittedAtomCarveInput {
             phi_a: self.phi_a.view(),
             phi_b: self.phi_b.view(),
             coeffs: self.surface.coeffs.as_slice(),
+            coeff_band: self.surface.coeff_band.as_slice(),
             coeff_covariance: Some(self.surface.coeff_covariance.as_slice()),
             joint_coeff_covariance: Some(&self.joint_covariance),
             kernel_a: None,
@@ -944,6 +996,10 @@ pub struct CarveInput<'a> {
     pub phi_a: ArrayView2<'a, f64>,
     pub phi_b: ArrayView2<'a, f64>,
     pub coeffs: &'a [Array2<f64>],
+    /// Per output dim, the bound on the absolute rounding error of every entry of
+    /// `coeffs[d]` (e.g. [`TensorSurfaceFit::coeff_band`]); `0.0` for coefficients
+    /// handed over exactly. The numerical-additivity decision reads it.
+    pub coeff_band: &'a [f64],
     pub coeff_covariance: Option<&'a [Array2<f64>]>,
     /// Covariance of the dimension-major STACKED coefficient vector
     /// `[vec(C₀); vec(C₁); …]` (`D·M₁M₂` square, scale-included), e.g.
@@ -994,6 +1050,22 @@ pub fn carve(input: &CarveInput<'_>, alpha: f64) -> Result<CarveReport, String> 
             covs.len()
         ));
     }
+    if input.coeff_band.len() != input.coeffs.len() {
+        return Err(format!(
+            "carve: {} coefficient matrices but {} coefficient rounding bands",
+            input.coeffs.len(),
+            input.coeff_band.len()
+        ));
+    }
+    if let Some(band) = input
+        .coeff_band
+        .iter()
+        .find(|band| !(band.is_finite() && **band >= 0.0))
+    {
+        return Err(format!(
+            "carve: coefficient rounding band {band} is not finite and non-negative"
+        ));
+    }
     if !(alpha > 0.0 && alpha < 1.0) {
         return Err(format!("carve: alpha must be in (0,1), got {alpha}"));
     }
@@ -1031,8 +1103,20 @@ pub fn carve(input: &CarveInput<'_>, alpha: f64) -> Result<CarveReport, String> 
     let mut child_b: Vec<ChildDecoder> = Vec::with_capacity(input.coeffs.len());
     let mut binding_tests: Vec<Option<SmoothTestResult>> = Vec::with_capacity(input.coeffs.len());
     let mut interaction_energy = 0.0f64;
-    let mut interaction_abs_energy = 0.0f64;
+    // `Σ_n band_n²`: the energy an exactly additive surface can leave in the
+    // computed interaction block (see the numerical-additivity decision below).
+    let mut interaction_band_energy = 0.0f64;
     let mut centered_energy = 0.0f64;
+    let products_growth = gam_linalg::roundoff::accumulation_growth(m1 * m2 + m1 + m2);
+    let abs_row_sum = |basis: &Array2<f64>| -> Vec<f64> {
+        basis
+            .rows()
+            .into_iter()
+            .map(|row| row.iter().map(|value| value.abs()).sum())
+            .collect()
+    };
+    let abs_row_sum_a = abs_row_sum(&phi_a_c);
+    let abs_row_sum_b = abs_row_sum(&phi_b_c);
 
     for (dim, c) in input.coeffs.iter().enumerate() {
         if c.dim() != (m1, m2) {
@@ -1042,12 +1126,13 @@ pub fn carve(input: &CarveInput<'_>, alpha: f64) -> Result<CarveReport, String> 
             ));
         }
         let blocks = anova_blocks(c.view(), mean_a.view(), mean_b.view())?;
+        let coefficient_band = input.coeff_band[dim];
 
         // Interaction values on the sample: f₁₂(θ_n) = φ̃¹_n ᵀ C φ̃²_n,
         // computed as the row-wise dot of (Φ̃₁ C) with Φ̃₂.
         let phi_a_c_c = phi_a_c.dot(c);
         // `Σ_jk |φ̃¹_j|·|C_jk|·|φ̃²_k|`, the absolute sum each `f₁₂` is accumulated
-        // from: its rounding band bounds what an exactly additive surface leaves.
+        // from: the rounding band of the products and the centering.
         let abs_phi_a_c_c = phi_a_c.mapv(f64::abs).dot(&c.mapv(f64::abs));
         let main_a_vals = phi_a_c.dot(&blocks.main_a);
         let main_b_vals = phi_b_c.dot(&blocks.main_b);
@@ -1059,7 +1144,12 @@ pub fn carve(input: &CarveInput<'_>, alpha: f64) -> Result<CarveReport, String> 
                 f12_abs += abs_phi_a_c_c[[row, k]] * phi_b_c[[row, k]].abs();
             }
             interaction_energy += f12 * f12;
-            interaction_abs_energy += f12_abs * f12_abs;
+            // |computed f₁₂ − exact f₁₂| ≤ γ_ops·Σ|φ̃¹||C||φ̃²| + band_C·Σ|φ̃¹_n|·Σ|φ̃²_n|:
+            // the products' own rounding plus what the coefficients carry from the
+            // solve that produced them.
+            let row_band = products_growth * f12_abs
+                + coefficient_band * abs_row_sum_a[row] * abs_row_sum_b[row];
+            interaction_band_energy += row_band * row_band;
             let centered = main_a_vals[row] + main_b_vals[row] + f12;
             centered_energy += centered * centered;
         }
@@ -1130,12 +1220,14 @@ pub fn carve(input: &CarveInput<'_>, alpha: f64) -> Result<CarveReport, String> 
     // statistic becomes a 0/0 artifact that can read as overwhelmingly
     // significant (p ≈ 0). Below the floor the surface is additive by
     // construction, so no statistic counts as binding and the atom is free to
-    // fission. The roundoff floor is the squared rounding band
-    // `γ²·Σ_n (Σ_jk |φ̃¹_j||C_jk||φ̃²_k|)²` of the products and the centering that
-    // formed the interaction block; no finite-sample fit resolves anything inside it.
-    let interaction_band = gam_linalg::roundoff::accumulation_growth(m1 * m2 + m1 + m2);
-    let numerically_additive =
-        interaction_energy <= interaction_band * interaction_band * interaction_abs_energy;
+    // fission. The floor is `Σ_n band_n²`, where `band_n` bounds how far the
+    // computed `f₁₂(θ_n)` of an exactly additive surface can sit from zero: the
+    // rounding of the products and the centering, `γ_ops·Σ_jk |φ̃¹_j||C_jk||φ̃²_k|`,
+    // plus what each coefficient carries from its own solve (`coeff_band`). A
+    // fitted surface's interaction coefficients cancel O(‖C‖) magnitudes, so the
+    // products' band alone, denominated in those roundoff-sized coefficients,
+    // sat a whole solve backward error below the floor (#2822).
+    let numerically_additive = interaction_energy <= interaction_band_energy;
     let binding_proven = !numerically_additive && edge_p_value.is_some_and(|p| p <= alpha);
     let negligible = interaction_fraction <= FISSION_MAX_INTERACTION_FRACTION;
     let fission = if negligible && !binding_proven {
@@ -1421,6 +1513,7 @@ mod tests {
             phi_a: phi_a.view(),
             phi_b: phi_b.view(),
             coeffs: &[c],
+            coeff_band: &[0.0],
             coeff_covariance: Some(std::slice::from_ref(&cov)),
             joint_coeff_covariance: None,
             kernel_a: None,
@@ -1449,6 +1542,7 @@ mod tests {
             phi_a: phi_a.view(),
             phi_b: phi_b.view(),
             coeffs: &[c_add],
+            coeff_band: &[0.0],
             coeff_covariance: Some(std::slice::from_ref(&cov)),
             joint_coeff_covariance: None,
             kernel_a: None,
@@ -1488,6 +1582,7 @@ mod tests {
             phi_a: phi_a.view(),
             phi_b: phi_b.view(),
             coeffs: &[c],
+            coeff_band: &[0.0],
             coeff_covariance: Some(std::slice::from_ref(&cov)),
             joint_coeff_covariance: None,
             kernel_a: None,
@@ -1590,6 +1685,7 @@ mod tests {
             phi_a: phi_a.view(),
             phi_b: phi_b.view(),
             coeffs: &fit.coeffs,
+            coeff_band: &fit.coeff_band,
             coeff_covariance: Some(&fit.coeff_covariance),
             joint_coeff_covariance: Some(&joint),
             kernel_a: None,
@@ -1632,6 +1728,7 @@ mod tests {
             phi_a: phi_a.view(),
             phi_b: phi_b.view(),
             coeffs: &fit.coeffs,
+            coeff_band: &fit.coeff_band,
             coeff_covariance: None,
             joint_coeff_covariance: None,
             kernel_a: None,
