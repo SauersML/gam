@@ -20,13 +20,6 @@
 //!       assembly and per-row solve cost track `k_active`, not `K`. This is the
 //!       structural precondition for the `K = 100K` sparse-atom claim.
 //!
-//!   (c) **GPU ↔ CPU parity on the reduced joint step.** The on-device
-//!       Jacobi-CG reduced-β solve (`solve_reduced_beta_pcg`) must agree with
-//!       the host reduced solve (`solve_streaming_reduced_beta`) on the same
-//!       accumulated `S`/`rhs`. The test no-ops when no CUDA device is present
-//!       (`ArrowSchurGpuFailure::Unavailable`) so it stays green on CPU CI and
-//!       the macOS dev box, and asserts hard parity on a real device.
-//!
 //! No `let _`, no `#[allow(...)]`, no env vars, no `#[cfg(feature=...)]`, no new
 //! public knobs. Sizing fits comfortably in CI RAM.
 

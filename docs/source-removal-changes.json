@@ -1164,5 +1164,32 @@
     ],
     "reason": "User directive 2026-09-11: delete code only tests use and code nothing uses. gam-geometry GeodesicIntegrator (with integrate), ClosureFamily::design_jet, t_stacks, ConstantCurvature::jacobian_radial and conformal_dirichlet_penalty had no production caller; the integrator was exercised only by its own unit tests and one integration test.",
     "evidence": "Re-confirmed at the tip with git grep -nw over crates src tests examples bench benches. Removed with the integrator module's unit tests, both GeodesicIntegrator re-exports, the geometry_bug_hunt energy test, and the doc-only stub tests/manifolds/smooths/poincare_conformal_dirichlet_penalty.rs left by c0a21b554. Docs that linked the deleted items were rewritten. Gates pass base..head; MSI verification at the pushed sha follows."
+  },
+  {
+    "base": "f83e9aebaf810a9fc42be420e8b1158ebfbfd1dc",
+    "items": [
+      "crates/gam-solve/src/arrow_schur/rational_logdet.rs:fn:with_deflation",
+      "crates/gam-solve/src/arrow_schur/rational_logdet.rs:fn:with_two_sided_deflation",
+      "crates/gam-solve/src/arrow_schur/reduced_solve.rs:fn:arrow_precond_ladder_iteration_study",
+      "crates/gam-solve/src/arrow_schur/reduced_solve.rs:fn:rational_reduced_schur_directional",
+      "crates/gam-solve/src/arrow_schur/reduced_solve.rs:fn:solve_streaming_reduced_beta",
+      "crates/gam-solve/src/arrow_schur/reduced_solve.rs:struct:PrecondLadderRow",
+      "crates/gam-solve/src/arrow_schur/solve_options.rs:fn:sqrt_ba",
+      "crates/gam-solve/src/arrow_schur/solve_options.rs:fn:with_solve_precision_policy",
+      "crates/gam-solve/src/arrow_schur/solve_options.rs:fn:with_streaming_chunk_size",
+      "crates/gam-solve/src/arrow_schur/system.rs:fn:add_analytic_penalty_contributions",
+      "crates/gam-solve/src/arrow_schur/system.rs:fn:add_beta_penalty",
+      "crates/gam-solve/src/arrow_schur/system.rs:fn:add_ext_coord_penalty",
+      "crates/gam-solve/src/arrow_schur/system.rs:fn:add_ext_coord_penalty_gradient_only",
+      "crates/gam-solve/src/arrow_schur/system.rs:fn:exact_arrow_log_det",
+      "crates/gam-solve/src/arrow_schur/system.rs:fn:new_matrix_free_shared",
+      "crates/gam-solve/src/arrow_schur/system.rs:fn:new_with_empty_hbb_and_htbeta_cols",
+      "crates/gam-solve/src/arrow_schur/system.rs:fn:schur_inverse_apply_deflated",
+      "crates/gam-solve/src/arrow_schur/system.rs:fn:schur_inverse_block_deflated",
+      "crates/gam-solve/src/arrow_schur/system.rs:fn:solve_with_lm_escalation",
+      "crates/gam-solve/src/arrow_schur/system.rs:fn:take_accumulators"
+    ],
+    "reason": "user directive: delete all useless slop",
+    "evidence": "At d1b00c6b2, git grep -nw over crates, src, tests, examples, bench and benches found no reference to any removed item outside its own definition, doc prose and error-message prefixes rewritten in this commit, and the removed ranges, with every hit set unchanged since the bab62c696 scan. The three pub(crate) penalty helpers were called only from add_analytic_penalty_contributions, and PrecondLadderRow was produced only by arrow_precond_ladder_iteration_study. Extents and prose anchors are asserted against the push base; MSI compile, doc, guard and census verification run on the landed sha."
   }
 ]

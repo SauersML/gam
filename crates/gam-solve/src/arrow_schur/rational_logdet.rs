@@ -70,7 +70,8 @@ use gam_linalg::utils::{splitmix64, splitmix64_hash};
 /// EXACT for ANY orthonormal `Q`; the subspace iteration only steers `Q` toward
 /// the top space to reduce variance, it can never bias the estimate.
 ///
-/// The basis is FROZEN here (built once by `RationalLogdetPlan::with_deflation`
+/// The basis is FROZEN here (built once by
+/// `RationalLogdetPlan::with_two_sided_deflation_preconditioned`
 /// from the operator at the plan's ρ), NOT rebuilt per evaluation. This is what
 /// keeps value and gradient the SAME functional: with the estimated `term2`, the
 /// sum `term1 + term2` is `Q`-dependent, so a `Q` that moved with ρ would put an
@@ -105,7 +106,7 @@ pub struct RationalLogdetPlan {
     pub center: f64,
     /// Optional top-subspace (Hutch++) deflation. `None` (the default from
     /// [`Self::build`]) reproduces the bare-Hutchinson path bit-for-bit; set via
-    /// `Self::with_deflation`.
+    /// `Self::with_two_sided_deflation_preconditioned`.
     pub deflation: Option<DeflationSpec>,
 }
 
@@ -310,43 +311,23 @@ impl RationalLogdetPlan {
         })
     }
 
-    /// Attach top-subspace (Hutch++) deflation, FREEZING an orthonormal basis `Q`
-    /// of up to `rank` columns built now from `matvec` by `subspace_iters`
-    /// block-power steps (`Q ← orthonormalise(S·Q)`) from a `seed`-deterministic
-    /// Rademacher start. The frozen `Q` is reused for every subsequent
-    /// [`Self::evaluate`], so the surrogate stays one deterministic function of ρ
-    /// with the fixed-`Q` directional derivative as its EXACT gradient (see
-    /// [`DeflationSpec`]). Build this at the plan's ρ, from the same operator the
-    /// evaluations use. `rank = 0` (or a fully-collapsed block) yields the
-    /// bare-Hutchinson plan unchanged.
-    pub fn with_deflation(
-        mut self,
-        matvec: &(impl Fn(ArrayView1<f64>) -> Array1<f64> + Sync),
-        rank: usize,
-        subspace_iters: usize,
-        seed: u64,
-    ) -> Self {
-        let basis = build_deflation_basis(matvec, self.dim, rank, subspace_iters, seed);
-        self.deflation = (!basis.is_empty()).then_some(DeflationSpec { basis });
-        self
-    }
-
-    /// Attach TWO-SIDED spectral deflation: freeze an orthonormal basis `Q`
-    /// spanning BOTH the `top_rank` largest-λ directions (block power on `S`) and
-    /// the `bottom_rank` smallest-λ directions (inverse iteration on `S⁻¹`, matrix-
-    /// free via CG), merged and re-orthonormalised into one basis.
+    /// Attach TWO-SIDED spectral deflation with the same diagonal preconditioner
+    /// the evaluations use: freeze an orthonormal basis `Q` spanning BOTH the
+    /// `top_rank` largest-λ directions (block power on `S`) and the `bottom_rank`
+    /// smallest-λ directions (inverse iteration on `S⁻¹`, matrix-free via CG),
+    /// merged and re-orthonormalised into one basis.
     ///
     /// This is the wide-κ variance-reduction lever. The surrogate's Hutchinson bar
     /// is `√(2·‖offdiag(P·log(S/c)·P)‖_F²)` — purely off-diagonal, so a
     /// diagonal/scalar control variate buys NOTHING (Rademacher already resolves
     /// the diagonal exactly). The off-diagonal mass of `log(S/c)` is loaded
     /// SYMMETRICALLY onto the two spectral tails (`|log(λ/c)|` peaks at both
-    /// `λ_max` and `λ_min`), so the one-sided [`Self::with_deflation`] removes only
-    /// half of it and stalls near `½·lnκ`-scale error bars at wide κ. Peeling both
-    /// tails is a rank-`(top+bottom)` low-rank control variate whose deterministic
+    /// `λ_max` and `λ_min`), so top-only deflation removes only half of it and
+    /// stalls near `½·lnκ`-scale error bars at wide κ. Peeling both tails is a
+    /// rank-`(top+bottom)` low-rank control variate whose deterministic
     /// `tr(Qᵀ log(S/c) Q)` block (term1) is computed exactly and whose complement
     /// carries only the interior — small — off-diagonal mass. At EQUAL total rank
-    /// this cuts the wide-κ bar by ≈`√2`·(tail/interior ratio) over one-sided
+    /// this cuts the wide-κ bar by ≈`√2`·(tail/interior ratio) over top-only
     /// deflation; the decomposition stays EXACT for any orthonormal `Q`, so the
     /// value is never biased (only the bar shrinks). `top_rank = bottom_rank = 0`
     /// reduces to the bare-Hutchinson plan.
@@ -355,28 +336,6 @@ impl RationalLogdetPlan {
     /// it may be loose (an approximate bottom `Q` only relaxes the variance
     /// reduction, never biases the estimate). Build this once at the plan's ρ, from
     /// the same operator the evaluations use.
-    pub fn with_two_sided_deflation(
-        self,
-        matvec: &(impl Fn(ArrayView1<f64>) -> Array1<f64> + Sync),
-        top_rank: usize,
-        bottom_rank: usize,
-        subspace_iters: usize,
-        seed: u64,
-        cg: (f64, usize),
-    ) -> Option<Self> {
-        self.with_two_sided_deflation_preconditioned(
-            matvec,
-            &IDENTITY_SHIFT_PRECONDITIONER,
-            top_rank,
-            bottom_rank,
-            subspace_iters,
-            seed,
-            cg,
-        )
-    }
-
-    /// [`Self::with_two_sided_deflation`] with the same diagonal preconditioner
-    /// the evaluations use.
     ///
     /// The bottom-tail basis comes from INVERSE iteration — plain CG on the
     /// UNSHIFTED operator at full `κ` — which is the single worst-conditioned
@@ -1476,7 +1435,7 @@ fn build_deflation_basis(
 /// replaced by `S⁻¹` (applied matrix-free by plain CG through `matvec`), so the
 /// rounds `Q ← orthonormalise(S⁻¹·Q)` amplify the SMALLEST eigenvalues instead of
 /// the largest. This is the second arm of the two-sided control variate
-/// ([`RationalLogdetPlan::with_two_sided_deflation`]): the Hutchinson variance of
+/// ([`RationalLogdetPlan::with_two_sided_deflation_preconditioned`]): the Hutchinson variance of
 /// the surrogate rides on the off-diagonal Frobenius mass of `log(S/c)`, which a
 /// wide spectrum loads SYMMETRICALLY onto both tails (`log(λ_max/c) = +½lnκ` and
 /// `log(λ_min/c) = −½lnκ`), so peeling only the top leaves the entire bottom-tail
