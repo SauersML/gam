@@ -1846,12 +1846,10 @@ impl SaeManifoldTerm {
     ) -> Result<Vec<f64>, String> {
         self.assignment.validate_rho_domain(rho)?;
         let lam = rho.lambda_smooth_vec()?;
-        // Fixed noise floor R = residual variance (dispersion). Guard finite/positive.
-        let r_floor = if dispersion_r.is_finite() && dispersion_r > 0.0 {
-            dispersion_r
-        } else {
-            f64::MIN_POSITIVE
-        };
+        // Fixed noise floor R = residual variance (dispersion), as measured. A
+        // non-finite or negative dispersion is refused by
+        // `validate_rank_charge_problem` rather than replaced by a floor.
+        let r_floor = dispersion_r;
         let p_out = self.output_dim() as f64;
         let mut out = Vec::with_capacity(self.k_atoms());
         for k in 0..self.k_atoms() {
