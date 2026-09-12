@@ -4,9 +4,8 @@
 //! benchmark. It runs the real `SaeManifoldOuterObjective` through the shared
 //! `OuterProblem`, refuses to materialize a fitted model unless the outer
 //! optimizer reports convergence, and only then reports elapsed time. There is
-//! no wall-clock deadline, iteration-cap sweep, or grid
-//! search; work interrupted by a scheduler wall is preserved by the production
-//! SAE checkpoint/resume path owned by the objective.
+//! no wall-clock deadline, iteration-cap sweep, or grid search, and no state is
+//! read back from an earlier run: every invocation fits from its own inputs.
 //!
 //! The color arm has `N=180`, ambient output width `P=5120`, and a three-column
 //! periodic basis. Its full decoder therefore has `beta_dim=3*5120=15360`.
@@ -187,13 +186,8 @@ fn run() -> Result<(), String> {
     // A single explicit initial state: the optimizer moves continuously in rho;
     // no seed lattice or grid is evaluated.
     let rho_dim = initial_rho_flat.len();
-    let search_initial_rho = objective
-        .try_resume_from_checkpoint(rho_dim)
-        .map_err(|err| format!("full color checkpoint resume failed: {err}"))?
-        .map(Array1::from)
-        .unwrap_or(initial_rho_flat);
     let problem = OuterProblem::new(rho_dim)
-        .with_initial_rho(search_initial_rho)
+        .with_initial_rho(initial_rho_flat)
         .with_seed_config(SeedConfig {
             max_seeds: 1,
             seed_budget: 1,
@@ -217,9 +211,6 @@ fn run() -> Result<(), String> {
         .map_err(|err| format!("full color outer certificate rejected: {err}"))?;
 
     // Only consume/mint the fitted model after the convergence certificate.
-    // A successful fit no longer needs its wall-survival checkpoint; match the
-    // production front door's completion transaction before consuming state.
-    objective.remove_checkpoint();
     let fitted = objective
         .into_fitted()
         .map_err(|err| format!("full color fit finalization failed: {err}"))?;

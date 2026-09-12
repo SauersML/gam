@@ -429,9 +429,9 @@ impl SaeFitOutcome {
     }
 }
 
-/// Optimization phase that owns an SAE wall-survival checkpoint and convergence
-/// verdict. Structured phases include the configured pass count because their
-/// residual-metric damping `γ = pass / (total_passes + 1)` depends on it.
+/// Optimization phase that owns an SAE convergence verdict. Structured phases
+/// include the configured pass count because their residual-metric damping
+/// `γ = pass / (total_passes + 1)` depends on it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SaeFitStage {
     Primary,
@@ -440,17 +440,6 @@ pub enum SaeFitStage {
         pass: usize,
         total_passes: usize,
     },
-}
-
-impl SaeFitStage {
-    fn checkpoint_tag(self) -> String {
-        match self {
-            Self::Primary => "primary".to_string(),
-            Self::StructuredResidual { pass, total_passes } => {
-                format!("structured-residual-{pass}-of-{total_passes}")
-            }
-        }
-    }
 }
 
 impl std::fmt::Display for SaeFitStage {
@@ -548,27 +537,9 @@ impl std::error::Error for SaeFitError {
     }
 }
 
-/// Give each fit phase its own checkpoint address. The target/K fingerprint
-/// still verifies the payload; the phase tag prevents a structured-metric state
-/// from being installed into the primary Euclidean objective, and includes the
-/// total pass count because it determines the structured damping schedule.
-pub(crate) fn scope_outer_checkpoint_to_stage(
-    objective: &mut SaeManifoldOuterObjective,
-    stage: SaeFitStage,
-) {
-    let mut path =
-        super::checkpoint::SaeFitCheckpoint::default_store_path(&objective.checkpoint_fingerprint);
-    path.set_file_name(format!(
-        "{}.{}.json",
-        objective.checkpoint_fingerprint.content_hash,
-        stage.checkpoint_tag(),
-    ));
-    objective.checkpoint_path = path;
-}
-
 /// Ownership gate for fit-producing outer phases. The objective is returned
-/// only with a converged [`OuterResult`]; otherwise it is dropped without
-/// checkpoint cleanup and the complete verdict is retained in a typed error.
+/// only with a converged [`OuterResult`]; otherwise it is dropped and the
+/// complete verdict is retained in a typed error.
 pub(crate) fn certify_outer_stage(
     objective: SaeManifoldOuterObjective,
     stage: SaeFitStage,
@@ -700,16 +671,10 @@ fn fit_outer_stage_to_boundary(
         // after that canonicalization: retaining the pre-construction flat
         // vector would feed a stale old-K layout into the reduced objective.
         let rho_flat = objective.current_rho_flat();
-        scope_outer_checkpoint_to_stage(&mut objective, stage);
         objective.set_cancel_flag(Arc::clone(cancel_flag));
 
         let boundary = if run_outer_rho_search {
-            let search_init_rho = match objective.try_resume_from_checkpoint(rho_flat.len())? {
-                Some(banked) => ndarray::Array1::from(banked),
-                None => rho_flat,
-            };
-            let problem =
-                OuterProblem::new(search_init_rho.len()).with_initial_rho(search_init_rho);
+            let problem = OuterProblem::new(rho_flat.len()).with_initial_rho(rho_flat);
             match problem.run(&mut objective, "SAE manifold") {
                 Ok(result) if result.converged() => {
                     return certify_outer_stage(objective, stage, Ok(result))
@@ -799,7 +764,6 @@ fn fit_outer_stage_to_boundary(
         };
 
         let state = boundary.expect("each non-returning branch installs a boundary state");
-        objective.remove_checkpoint();
         match vanished_disposition(state, target, metric_provenance)? {
             SaeBoundaryDisposition::Restart {
                 term: reduced_term,
@@ -1641,10 +1605,6 @@ fn run_sae_manifold_fit_on_target(request: SaeFitRequest) -> Result<SaeFitOutcom
     // the fitted (smooth) decoder shape, independent of any top-k assignment
     // gate applied below.
     let mut shape_uncertainty = objective.decoder_shape_uncertainty()?;
-    // A converged fit is being minted: the wall-survival checkpoint has served
-    // its purpose (it must not warm-start a FUTURE fresh fit — that is
-    // `persistent_warm_start`'s job, with its own TTL/eviction discipline).
-    objective.remove_checkpoint();
     let fitted_result = objective.into_fitted().map_err(SaeFitError::Fit)?;
     let mut finalization_invalidated_shape_uncertainty =
         fitted_result.invalidates_pre_final_shape_uncertainty();
@@ -1760,7 +1720,6 @@ fn run_sae_manifold_fit_on_target(request: SaeFitRequest) -> Result<SaeFitOutcom
             // Refresh shape bands + fitted state from the FINAL pass objective
             // (decoder_shape_uncertainty must be read before `into_fitted`).
             shape_uncertainty = objective.decoder_shape_uncertainty()?;
-            objective.remove_checkpoint();
             let fitted_result = objective.into_fitted().map_err(SaeFitError::Fit)?;
             finalization_invalidated_shape_uncertainty =
                 fitted_result.invalidates_pre_final_shape_uncertainty();

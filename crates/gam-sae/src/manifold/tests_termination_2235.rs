@@ -1,5 +1,5 @@
 //! #2235 — a fit object exists only from a CONVERGED optimization. The local
-//! ledger is accounting/checkpoint telemetry only; convergence is decided by
+//! ledger is accounting telemetry only; convergence is decided by
 //! the shared outer optimizer's analytic certificate, never by a wall-clock or
 //! evaluation-count deadline.
 
@@ -87,7 +87,7 @@ fn ledger_tracks_material_objective_improvement_without_deciding_convergence() {
         ledger.record(40.0, Some(2.5e-3)),
         "a material objective descent is banked"
     );
-    let (evals, last_improvement, best) = ledger.checkpoint_counters();
+    let (evals, last_improvement, best) = ledger.counters();
     assert_eq!(evals, 4);
     assert_eq!(last_improvement, 4);
     assert_eq!(best, Some(40.0));

@@ -225,7 +225,6 @@ mod tests {
         objective
             .certify_outer_result(&result)
             .expect("native result must carry the shared stationarity certificate");
-        objective.remove_checkpoint();
         let fitted = objective.into_fitted().expect("certified native fit");
         (target, fitted.term, fitted.rho, pin, provenance)
     }

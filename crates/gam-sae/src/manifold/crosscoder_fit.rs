@@ -903,7 +903,6 @@ pub fn run_sae_crosscoder_fit(
         request.ridge_beta,
     )
     .with_crosscoder_blocks(p_x, block_dims.clone())?;
-    super::fit_entry::scope_outer_checkpoint_to_stage(&mut objective, SaeFitStage::Primary);
     objective.set_cancel_flag(cancel);
 
     // Pin faer to Par::Seq for the ENTIRE fit (outer ρ search / fixed-ρ solve,
@@ -924,12 +923,8 @@ pub fn run_sae_crosscoder_fit(
     let faer_sequential_whole_fit = gam_linalg::faer_ndarray::FaerSequentialScope::enter();
 
     let objective = if request.run_outer_rho_search {
-        let search_initial = match objective.try_resume_from_checkpoint(n_params)? {
-            Some(banked) => ndarray::Array1::from(banked),
-            None => initial_flat,
-        };
         let problem = OuterProblem::new(n_params)
-            .with_initial_rho(search_initial)
+            .with_initial_rho(initial_flat)
             .with_seed_config(SeedConfig {
                 max_seeds: 1,
                 seed_budget: 1,
@@ -941,7 +936,6 @@ pub fn run_sae_crosscoder_fit(
         objective.fit_at_fixed_rho(initial_flat.view())?;
         objective
     };
-    objective.remove_checkpoint();
     let fitted_result = objective.into_fitted()?;
     let mut term = fitted_result.term;
     let rho = fitted_result.rho;

@@ -66,8 +66,8 @@ pub struct AmortizedWarmStartTelemetry {
 ///   user's moral-hazard rule).
 /// * Convergence and non-convergence belong to the shared outer optimizer. This
 ///   application ledger never substitutes an evaluation-count or wall-clock
-///   deadline for the optimizer's analytic certificate. Wall survival is the
-///   checkpoint/resume lane's job (`persistent_warm_start`).
+///   deadline for the optimizer's analytic certificate, and nothing it records
+///   is read back by a later fit.
 #[derive(Debug, Clone)]
 pub(crate) struct OuterTerminationLedger {
     /// Total criterion evaluations across all lanes.
@@ -78,6 +78,14 @@ pub(crate) struct OuterTerminationLedger {
     best_cost: Option<f64>,
     /// Fit wall-clock start.
     wall_start: std::time::Instant,
+}
+
+#[cfg(test)]
+impl OuterTerminationLedger {
+    /// The ledger's three counters, for the accounting tests.
+    pub(crate) fn counters(&self) -> (u64, u64, Option<f64>) {
+        (self.evals, self.last_improvement_eval, self.best_cost)
+    }
 }
 
 impl OuterTerminationLedger {
@@ -91,7 +99,7 @@ impl OuterTerminationLedger {
     }
 
     /// Record one finite criterion value; returns `true` on a MATERIAL
-    /// improvement of the best cost (the caller's checkpoint-bank signal).
+    /// improvement of the best cost.
     ///
     /// This is the single point every outer criterion evaluation passes
     /// through, so it is also where the fit says where it has got to (#2472).
@@ -143,24 +151,6 @@ impl OuterTerminationLedger {
             self.best_cost.unwrap_or(cost),
         );
         improved
-    }
-
-    /// Resume accounting from a checkpoint. The wall clock restarts because it
-    /// is telemetry, never a solver deadline.
-    pub(crate) fn seed_from_checkpoint(
-        &mut self,
-        evals: u64,
-        last_improvement_eval: u64,
-        best_cost: Option<f64>,
-    ) {
-        self.evals = evals;
-        self.last_improvement_eval = last_improvement_eval.min(evals);
-        self.best_cost = best_cost.filter(|c| c.is_finite());
-    }
-
-    /// Snapshot the ledger counters for a checkpoint write.
-    pub(crate) fn checkpoint_counters(&self) -> (u64, u64, Option<f64>) {
-        (self.evals, self.last_improvement_eval, self.best_cost)
     }
 
     /// New multi-start seed: start its improvement telemetry at the current
@@ -784,14 +774,6 @@ pub struct SaeManifoldOuterObjective {
     /// amortized encoder before refining; that is an optimization action and is
     /// forbidden when the subject is the exact installed state.
     audit_installed_state: bool,
-    /// SPEC wall-survival: the full-`N` data fingerprint + content-addressed
-    /// store path for the fit checkpoint (see [`super::checkpoint`]). Computed
-    /// once at construction on the full-data target. Checkpoints are written
-    /// best-effort at every MATERIAL improvement of the outer best cost, and the
-    /// file is removed when a converged fit is minted (its purpose is wall
-    /// survival, not cross-fit caching — `persistent_warm_start` covers that).
-    pub(crate) checkpoint_fingerprint: super::checkpoint::SaeCheckpointFingerprint,
-    pub(crate) checkpoint_path: std::path::PathBuf,
     /// #2231 Inc-B (stage 1) — optional crosscoder block-relevance pricing. `None`
     /// for a plain SAE, in which case `apply_block_scaling`/`block_jacobian` both
     /// early-return and every lane is byte-identical to the historical path.
@@ -1070,13 +1052,7 @@ impl SaeManifoldOuterObjective {
             .as_ref()
             .map(AnalyticPenaltyRegistry::isometry_scalar_weights)
             .unwrap_or_default();
-        let term_k_atoms = term.k_atoms();
         let basin_member_capacity = basin_bundle_member_capacity(&term);
-        // SPEC wall-survival fingerprint on the full-data target.
-        let checkpoint_fingerprint =
-            super::checkpoint::SaeCheckpointFingerprint::of_target(target.view(), term_k_atoms);
-        let checkpoint_path =
-            super::checkpoint::SaeFitCheckpoint::default_store_path(&checkpoint_fingerprint);
         Self {
             term,
             baseline_term,
@@ -1104,8 +1080,6 @@ impl SaeManifoldOuterObjective {
             termination: OuterTerminationLedger::new(),
             fit_verdict: None,
             audit_installed_state: false,
-            checkpoint_fingerprint,
-            checkpoint_path,
             crosscoder_blocks: None,
             reactive_waypoint_checkpoint: None,
         }
@@ -1517,119 +1491,6 @@ impl SaeManifoldOuterObjective {
                 .map(|(&p_l, &r_tilde)| 0.5 * r_tilde - 0.5 * n * p_l as f64)
                 .collect(),
         ))
-    }
-
-    /// SPEC wall-survival: bank a resumable checkpoint at a MATERIAL improvement
-    /// of the outer best cost. Best-effort — a checkpoint write must never abort
-    /// a fit (the error is logged, not raised).
-    pub(crate) fn bank_checkpoint(&self, rho_flat: &Array1<f64>) {
-        let (evals, last_improvement_eval, best_cost) = self.termination.checkpoint_counters();
-        let rho_owned = rho_flat.to_vec();
-        // serde_json refuses non-finite floats, and the ledger's best cost is
-        // finite by construction (`record` skips non-finite values); sanitize
-        // the EV the same way so a degenerate probe can never wedge the write.
-        let incumbent_ev = self
-            .term
-            .dictionary_reconstruction_ev(self.target.view(), &self.current_rho)
-            .ok()
-            .filter(|ev| ev.is_finite())
-            .unwrap_or(-1.0);
-        let ckpt = super::checkpoint::SaeFitCheckpoint::capture(
-            &self.term,
-            &self.checkpoint_fingerprint,
-            &rho_owned,
-            super::checkpoint::SaeCheckpointLedger {
-                evals,
-                last_improvement_eval,
-                best_cost,
-            },
-            incumbent_ev,
-        );
-        if let Some(dir) = self.checkpoint_path.parent()
-            && let Err(e) = std::fs::create_dir_all(dir)
-        {
-            log::warn!("SAE fit checkpoint: create dir {}: {e}", dir.display());
-            return;
-        }
-        if let Err(e) = ckpt.save_atomic(&self.checkpoint_path) {
-            log::warn!("SAE fit checkpoint: {e}");
-        }
-    }
-
-    /// SPEC wall-survival: attempt to resume from a banked checkpoint for this
-    /// exact data fingerprint. On a verified hit, installs the banked incumbent
-    /// into the term (and the baseline term, so a multi-start `reset` re-opens
-    /// from the banked state rather than the cold seed), seeds the termination
-    /// ledger counters, and returns the banked outer ρ to open the search at.
-    /// Structural incompatibility or mutable-state install failure is logged and
-    /// the fit proceeds cold. A shape-compatible checkpoint whose rho violates
-    /// the objective's mathematical domain is different: it is a typed refusal,
-    /// because silently replacing that optimization state would conceal corrupt
-    /// outer coordinates.
-    pub fn try_resume_from_checkpoint(
-        &mut self,
-        expected_rho_len: usize,
-    ) -> Result<Option<Vec<f64>>, String> {
-        self.fit_verdict = None;
-        if !self.checkpoint_path.exists() {
-            return Ok(None);
-        }
-        let ckpt = match super::checkpoint::SaeFitCheckpoint::load(&self.checkpoint_path) {
-            Ok(c) => c,
-            Err(e) => {
-                log::warn!("SAE fit checkpoint resume: {e}; fitting cold");
-                return Ok(None);
-            }
-        };
-        if let Err(e) = ckpt.verify_compatible(&self.checkpoint_fingerprint, expected_rho_len) {
-            log::warn!("SAE fit checkpoint resume: {e}; fitting cold");
-            return Ok(None);
-        }
-        if let Err(e) = self
-            .baseline_rho
-            .from_flat(ArrayView1::from(ckpt.rho_flat.as_slice()))
-        {
-            return Err(format!(
-                "SAE fit checkpoint resume refused invalid rho payload: {e}"
-            ));
-        }
-        let install_result = ckpt.install_into(&mut self.term);
-        if install_result.is_ok()
-            && let Err(e) = ckpt.install_into(&mut self.baseline_term)
-        {
-            log::warn!("SAE fit checkpoint resume (baseline): {e}");
-        }
-        if let Err(e) = install_result {
-            log::warn!("SAE fit checkpoint resume: {e}; fitting cold");
-            return Ok(None);
-        }
-        self.termination.seed_from_checkpoint(
-            ckpt.ledger.evals,
-            ckpt.ledger.last_improvement_eval,
-            ckpt.ledger.best_cost,
-        );
-        log::warn!(
-            "SAE fit checkpoint resume: installed banked incumbent from {} \
-             (evals {}, best cost {:?}); the resumed search must still converge on its own",
-            self.checkpoint_path.display(),
-            ckpt.ledger.evals,
-            ckpt.ledger.best_cost,
-        );
-        Ok(Some(ckpt.rho_flat))
-    }
-
-    /// Remove the banked checkpoint after a CONVERGED fit is minted: its
-    /// purpose is wall survival of an in-flight optimization, not cross-fit
-    /// caching (`persistent_warm_start` covers that). Best-effort.
-    pub fn remove_checkpoint(&self) {
-        if self.checkpoint_path.exists()
-            && let Err(e) = std::fs::remove_file(&self.checkpoint_path)
-        {
-            log::warn!(
-                "SAE fit checkpoint: remove {}: {e}",
-                self.checkpoint_path.display()
-            );
-        }
     }
 
     /// #2138 — install a cooperative cancellation flag shared with the pyffi fit
@@ -3429,10 +3290,8 @@ impl OuterObjective for SaeManifoldOuterObjective {
                 if !cost.is_finite() {
                     return Ok(f64::INFINITY);
                 }
-                if self.reactive_waypoint_checkpoint.is_none()
-                    && self.record_search_criterion(cost, None)
-                {
-                    self.bank_checkpoint(rho);
+                if self.reactive_waypoint_checkpoint.is_none() {
+                    self.record_search_criterion(cost, None);
                 }
                 Ok(cost)
             }
@@ -3504,9 +3363,7 @@ impl OuterObjective for SaeManifoldOuterObjective {
             if !cost.is_finite() {
                 return Ok(OuterEval::infeasible(rho.len()));
             }
-            if self.record_search_criterion(cost, None) {
-                self.bank_checkpoint(rho);
-            }
+            self.record_search_criterion(cost, None);
             return Ok(OuterEval {
                 cost,
                 gradient: Array1::zeros(rho.len()),
@@ -3651,9 +3508,7 @@ impl OuterObjective for SaeManifoldOuterObjective {
         // differenced value path.
         self.current_rho = rho_state;
         self.last_loss = Some(evaluation.loss);
-        if self.record_search_criterion(cost, Some(gradient.dot(&gradient).sqrt())) {
-            self.bank_checkpoint(rho);
-        }
+        self.record_search_criterion(cost, Some(gradient.dot(&gradient).sqrt()));
         Ok(OuterEval {
             cost,
             gradient,
@@ -3739,10 +3594,8 @@ impl OuterObjective for SaeManifoldOuterObjective {
                 if !cost.is_finite() {
                     return Ok(OuterEval::infeasible(rho.len()));
                 }
-                if self.reactive_waypoint_checkpoint.is_none()
-                    && self.record_search_criterion(cost, None)
-                {
-                    self.bank_checkpoint(rho);
+                if self.reactive_waypoint_checkpoint.is_none() {
+                    self.record_search_criterion(cost, None);
                 }
                 Ok(OuterEval {
                     cost,
@@ -3773,9 +3626,7 @@ impl OuterObjective for SaeManifoldOuterObjective {
             .from_flat(rho.view())
             .map_err(EstimationError::InvalidInput)?;
         eval.cost += self.block_jacobian(&rho_state);
-        if self.record_search_criterion(eval.cost, None) {
-            self.bank_checkpoint(rho);
-        }
+        self.record_search_criterion(eval.cost, None);
         Ok(eval)
     }
 

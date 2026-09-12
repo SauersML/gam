@@ -173,7 +173,6 @@ mod behavior_isometry;
 mod certificate;
 mod chart_atlas;
 mod chart_degeneracy;
-mod checkpoint;
 mod construction;
 mod construction_ard;
 mod construction_arrow_schur_assembly;
@@ -486,9 +485,6 @@ mod tests_rho_structural_layout_2253;
 
 #[cfg(test)]
 mod tests_crosscoder_rho_2231;
-
-#[cfg(test)]
-mod tests_checkpoint_resume_wiring;
 
 #[cfg(test)]
 mod tests_crosscoder_block_fd_2231;

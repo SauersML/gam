@@ -1147,5 +1147,27 @@
     },
     "reason": "user directive: delete all useless slop and code only tests use",
     "evidence": "Measured on MSI by sw9 job 441280, over 01e3dfadc2bf12a8a79de7376d82d30a1a95d8e0 plus v2 of this batch (lane head 2801ca75e3cf8a0cb9d304772c259eaf8008bead). Reports: /scratch.global/sauer354/sw9-logs/fold1_guard.441280.log, fold1_census.441280.json and fold1_pubapi.441280.json. The pushed tree differs from v2 in one place only: an inline LatentZPolicy literal in tests/src_modules/misc/families_bms_identifiability_rigid_tests.rs, which adds and removes no declaration and no test. Replacements: tests that compared against the multinomial plug-in predictor now build a local softmax over training_design() times coefficients_active(). Integration tests and examples that used LatentZPolicy::exploratory_fit_weighted call gam_test_support::synthetic::exploratory_fit_weighted_latent_z_policy. integrate_logistic_normal_softmax_moments moves into a private #[cfg(test)] mod test_support. The GPU cubic B-spline moment module, bms_flex_row_hvp_multi_scratch_bytes_for_shape and their benches had no production caller."
+  },
+  {
+    "base": "468d299d259dbebaa3788816c35c93911636a2c7",
+    "removed": {
+      "crates/gam-sae/src/manifold/checkpoint.rs::array2_from_rows": 1,
+      "crates/gam-sae/src/manifold/checkpoint.rs::capture": 1,
+      "crates/gam-sae/src/manifold/checkpoint.rs::default_store_path": 1,
+      "crates/gam-sae/src/manifold/checkpoint.rs::install_into": 1,
+      "crates/gam-sae/src/manifold/checkpoint.rs::load": 1,
+      "crates/gam-sae/src/manifold/checkpoint.rs::of_target": 1,
+      "crates/gam-sae/src/manifold/checkpoint.rs::rows_of": 1,
+      "crates/gam-sae/src/manifold/checkpoint.rs::save_atomic": 1,
+      "crates/gam-sae/src/manifold/checkpoint.rs::verify_compatible": 1,
+      "crates/gam-sae/src/manifold/fit_entry.rs::scope_outer_checkpoint_to_stage": 1,
+      "crates/gam-sae/src/manifold/outer_objective.rs::bank_checkpoint": 1,
+      "crates/gam-sae/src/manifold/outer_objective.rs::checkpoint_counters": 1,
+      "crates/gam-sae/src/manifold/outer_objective.rs::remove_checkpoint": 1,
+      "crates/gam-sae/src/manifold/outer_objective.rs::seed_from_checkpoint": 1,
+      "crates/gam-sae/src/manifold/outer_objective.rs::try_resume_from_checkpoint": 1
+    },
+    "reason": "Lead ruling on #2228: delete the automatic SAE fit checkpoint resume. SaeManifoldOuterObjective banked its term, logits and rho under std::env::temp_dir()/gam/sae_fit_checkpoint/v1/<sha256 of the target> on every material improvement, run_sae_manifold_fit and the crosscoder fit resumed a same-data file by default, and certify_outer_stage dropped a non-converged objective without cleanup. So a retry on the same data opened at a failed or censored run's incumbent: the outcome depended on filesystem history, not on the inputs (SPEC 13, 22, 25). No production caller supplies an explicit resume path, so the module goes rather than becoming an option. The checkpoint module's doc also quoted a SPEC sentence that SPEC.md does not contain.",
+    "evidence": "Measured before this change: sae-fit job 390606 at f9a38e3e6, /scratch.global/sauer354/sw7-logs. m4_A_default.log starts cold; m4_A_info.log, same data and pin, starts with 'SAE fit checkpoint resume: installed banked incumbent from /tmp/gam/sae_fit_checkpoint/v1/cef820...primary.json (evals 55, best cost Some(203.96202953521788))', so two runs that looked log-level dependent never shared a start. Every removed item and test belongs to the retired bank/resume/remove path or its tests; the ledger counters used by tests_termination_2235 survive as a test-scoped counters(). Identities were enumerated with the guard's ITEM regex and test-scope rules over the base tree. The guard and censuses were not run before push (commit-after-every-edit directive); the integrity workflow checks the pushed sha. No compile or test run is claimed here."
   }
 ]
