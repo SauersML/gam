@@ -451,7 +451,7 @@ pub(crate) fn ordered_beta_bernoulli_k2_periodic_torus_recovers_signal_with_lsq_
     .unwrap();
     let mut term = SaeManifoldTerm::new(atoms, assignment).unwrap();
     // `lambda_sparse` is the ordered Beta--Bernoulli assignment-sparsity prior weight (now wired
-    // through `assignment_prior_grad_hdiag`'s ordered Beta--Bernoulli branch, #853). The
+    // through `assignment_prior_grad_hdiag_weighted`'s ordered Beta--Bernoulli branch, #853). The
     // Beta-Bernoulli BCE energy toward the self-referential empirical active
     // fraction has its global minimum at the all-off gate, so at the old
     // full weight (`log_lambda_sparse = 0 → λ = 1`) it overwhelmed the

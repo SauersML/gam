@@ -945,5 +945,31 @@
     ],
     "reason": "user directive: delete all useless slop",
     "evidence": "At 94410581a, git grep -nw over crates, src, tests, examples, bench and benches names terminal_marks, risk_set_centred and reference_grid only at their own definitions; the only other encode_level is a closure local to a test in crates/gam-models/src/inference/model.rs, and the only other specification is the helper fn in crates/gam-event-history/src/joint/reference_tests.rs or prose. No .name( or ::name( call of any of the five exists, and no test exercised them."
+  },
+  {
+    "base": "6a27cdf34b75f05fd21786186f53afac26fcef58",
+    "items": [
+      "crates/gam-sae/src/assignment.rs:fn:assignment_prior_grad_hdiag",
+      "crates/gam-sae/src/assignment.rs:fn:assignment_prior_log_strength_derivative",
+      "crates/gam-sae/src/assignment.rs:fn:assignment_prior_log_strength_hdiag",
+      "crates/gam-sae/src/assignment.rs:fn:assignment_prior_log_strength_target_mixed",
+      "crates/gam-sae/src/assignment.rs:fn:assignment_prior_value",
+      "crates/gam-sae/src/assignment.rs:fn:freeze_routing_from_current_logits",
+      "crates/gam-sae/src/assignment.rs:fn:freeze_routing_in_place",
+      "crates/gam-sae/src/assignment.rs:fn:from_argmax_owners",
+      "crates/gam-sae/src/assignment.rs:fn:ordered_beta_bernoulli_psd_majorizer_third_channels",
+      "crates/gam-sae/src/assignment.rs:fn:select_hybrid_atom_parameterization",
+      "crates/gam-sae/src/assignment.rs:fn:set_frozen_routing_in_place",
+      "crates/gam-sae/src/assignment.rs:fn:thaw_routing",
+      "crates/gam-sae/src/assignment.rs:fn:with_ungated",
+      "crates/gam-sae/src/assignment_state.rs:fn:apply_row_coord_step",
+      "crates/gam-sae/src/assignment_state.rs:fn:as_state",
+      "crates/gam-sae/src/assignment_state.rs:fn:atom_manifold",
+      "crates/gam-sae/src/assignment_state.rs:fn:from_full_support_state",
+      "crates/gam-sae/src/assignment_state.rs:fn:from_topk_support",
+      "crates/gam-sae/src/assignment_state.rs:fn:full_support"
+    ],
+    "reason": "user directive: delete all useless slop (only used by tests / unused)",
+    "evidence": "At 6a27cdf34, git grep -nw over crates, src, tests, examples, bench and benches found no production caller of any item: each is named only by its own definition, its own error strings, doc links or prose comments, and, for freeze_routing_from_current_logits, thaw_routing and from_topk_support, by tests. Those tests keep what they pin: the four #1033 frozen-routing tests now freeze through with_frozen_routing (None thaws), and support_parameter_certificate_survives_raw_global_refusal_2634 builds its state with from_topk_support_heterogeneous. The six unweighted prior wrappers only forwarded None to their _weighted forms. RoutingPredictor and from_blocks_with_mode were kept, because a production doc link and a bench name them. MSI verification (ban scanner, workspace --all-targets check, cargo doc -p gam-sae, guard and census) runs on the landed sha."
   }
 ]

@@ -5595,9 +5595,9 @@ impl SaeManifoldTerm {
         };
         // #Bug4: a FIXED logit (ungated atom, or every atom under frozen routing)
         // has its assembled `htt` diagonal entry ZEROED (see
-        // `assignment_prior_grad_hdiag`), so the θ-adjoint third derivative of that
+        // `assignment_prior_grad_hdiag_weighted`), so the θ-adjoint third derivative of that
         // zeroed entry must also be zero. Mirror the ordered Beta--Bernoulli channel zeroing in
-        // `ordered_beta_bernoulli_psd_majorizer_third_channels`. The ThresholdGate/ordered Beta--Bernoulli branches below are
+        // `ordered_beta_bernoulli_psd_majorizer_third_channels_weighted`. The ThresholdGate/ordered Beta--Bernoulli branches below are
         // both diagonal (`diag_atom == wrt_atom`), so masking on `wrt_atom` suffices.
         if self.assignment.logit_is_fixed(wrt_atom) {
             return 0.0;

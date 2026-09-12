@@ -20,8 +20,8 @@
 //!   dense engine aggregate and its ONLY constructor is
 //!   `SaeManifoldTerm::new(atoms, assignment: SaeAssignment)`, so naming that type
 //!   in the sparse lane FORCES a dense `N×K` assignment into existence — there is
-//!   no sparse in-core entry (that is the Stage 2 `SaeAssignmentState::from_topk_support`
-//!   seam on #2023). Without this needle the invariant could be re-broken by any
+//!   no sparse in-core entry (that is the Stage 2
+//!   `SaeAssignmentState::from_topk_support_heterogeneous` seam on #2023). Without this needle the invariant could be re-broken by any
 //!   new dense-engine caller, and the `SaeAssignment` needle would only catch it
 //!   at the last line. `crate::manifold::realised_rank_charge_dof` and friends are
 //!   deliberately NOT needles: they are pure helpers that build no routing state.

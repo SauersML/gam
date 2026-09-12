@@ -6900,11 +6900,11 @@ mod tests {
         let coordinates: Vec<Vec<f64>> = (0..rows)
             .map(|row| vec![if row % 2 == 0 { -10.0 } else { 10.0 }])
             .collect();
-        let state = SaeAssignmentState::from_topk_support(
+        let state = SaeAssignmentState::from_topk_support_heterogeneous(
             rows,
             1,
             1,
-            1,
+            vec![SaeAssignmentAtomSpec::euclidean(1)],
             vec![vec![0]; rows],
             vec![vec![1.0]; rows],
             coordinates,
