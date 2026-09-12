@@ -115,7 +115,6 @@ pub use gam_model_api::families::custom_family::{
     CustomFamily,
     FamilyEvaluation,
     OuterDerivativePilotSchedule,
-    exact_newton_outer_geometry_supports_second_order_solver,
 };
 pub use gam_problem::{
     AdditiveBlockJacobian,
@@ -172,7 +171,6 @@ pub(crate) use covariance::*;
 // (the `pub(crate) use covariance::*` glob above keeps them crate-internal).
 pub use covariance::{
     JOINT_MATRIX_FREE_MIN_DIM,
-    joint_exact_analytic_outer_hessian_available,
     projected_linear_constraint_stationarity_vector,
     use_joint_matrix_free_path,
 };

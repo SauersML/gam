@@ -1218,5 +1218,17 @@
     },
     "reason": "user directive: delete all useless slop (only used by tests / unused)",
     "evidence": "scripts/public_api_census.py on MSI lane sw2 (job 442340) over 8bd5765b0..the exact candidate tree measured exactly these 12 declarations, description_length.rs's test-only surface removed in this commit."
+  },
+  {
+    "base": "0e10ecbc736d96aa2b456eb784e78339a2da065a",
+    "removed": {
+      "crates/gam-custom-family/src/covariance.rs::joint_exact_analytic_outer_hessian_available": 1,
+      "crates/gam-identifiability/src/families/compiler.rs::p_compiled": 1,
+      "crates/gam-model-api/src/families/custom_family/options.rs::exact_newton_outer_geometry_supports_second_order_solver": 1,
+      "crates/gam-problem/src/block_spec.rs::natural_diagonal_checked": 1,
+      "crates/gam-problem/src/row_measure.rs::indices_and_weights": 1
+    },
+    "reason": "User directive 2026-09-11: delete code nothing uses. The --include-public rescan at 9c526d420 (MSI job 447458) found five bare pub items that nothing names, not even tests: gam-custom-family joint_exact_analytic_outer_hessian_available (a predicate that always returned true), gam-model-api exact_newton_outer_geometry_supports_second_order_solver, gam-identifiability CompiledMap::p_compiled, and gam-problem BlockWorkingSet::natural_diagonal_checked and RowMeasure::indices_and_weights.",
+    "evidence": "The scanner report /scratch.global/sauer354/sw1-logs/pp_rescan.json lists each item as unreferenced. At the base, single-name git greps over *.rs find each name only at its definition, in the gam-custom-family re-exports removed here, or in the gam-solve row_measure.rs module doc reworded here. p_compiled survives only as prose naming the compiled width."
   }
 ]

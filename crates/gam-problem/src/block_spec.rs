@@ -840,36 +840,6 @@ impl BlockWorkingSet {
             working_weights,
         })
     }
-
-    /// Construct an exact natural-coordinate diagonal working set with length
-    /// and finite-value invariants enforced at the type boundary.
-    #[inline]
-    pub fn natural_diagonal_checked(
-        score: Array1<f64>,
-        observed_curvature: Array1<f64>,
-    ) -> Result<Self, String> {
-        if score.len() != observed_curvature.len() {
-            return Err(format!(
-                "BlockWorkingSet::NaturalDiagonal length mismatch: score={}, observed_curvature={}",
-                score.len(),
-                observed_curvature.len(),
-            ));
-        }
-        if let Some((row, value)) = score
-            .iter()
-            .chain(observed_curvature.iter())
-            .enumerate()
-            .find(|(_, value)| !value.is_finite())
-        {
-            return Err(format!(
-                "BlockWorkingSet::NaturalDiagonal contains a non-finite value at flattened index {row}: {value}"
-            ));
-        }
-        Ok(Self::NaturalDiagonal {
-            score,
-            observed_curvature,
-        })
-    }
 }
 
 /// What a parameter block's COEFFICIENT COORDINATE is, as opposed to what its

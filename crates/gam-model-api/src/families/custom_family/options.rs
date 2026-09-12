@@ -537,16 +537,6 @@ pub fn block_offsets_from_specs(specs: &[ParameterBlockSpec]) -> Arc<[Range<usiz
 /// magnitude while still bounding pathological probes.
 pub const FIRST_ORDER_BFGS_LOGLAMBDA_STEP_CAP: f64 = 5.0;
 
-/// Report whether a family exposes the strict pseudo-Laplace geometry needed
-/// by the analytic second-order outer solver.
-///
-/// This query is infallible and does not evaluate the likelihood.
-pub fn exact_newton_outer_geometry_supports_second_order_solver<F: CustomFamily + ?Sized>(
-    family: &F,
-) -> bool {
-    family.exact_newton_outerobjective() == ExactNewtonOuterObjective::StrictPseudoLaplace
-}
-
 /// Stable public API for installing outer-score subsampling.
 #[derive(Clone)]
 pub struct BlockwiseFitOptions {

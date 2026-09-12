@@ -1561,11 +1561,6 @@ impl CompiledMap {
     pub fn p_raw(&self) -> usize {
         self.raw_from_compiled.nrows()
     }
-
-    /// Compiled (reduced) coefficient width (`p_compiled`).
-    pub fn p_compiled(&self) -> usize {
-        self.raw_from_compiled.ncols()
-    }
 }
 
 /// Per-block exact orthogonal reparameterisation of structural confounds.

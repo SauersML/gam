@@ -3261,5 +3261,17 @@
     ],
     "reason": "#2829: RiemannianLBFGS lost its only method (minimize) in d484a091a, which the disposition ledger keeps retired; the surviving configuration struct, its Default impl and its gam-geometry and gam re-exports configure nothing. SPEC rule 25: unnecessary options are deleted.",
     "evidence": "git grep -w RiemannianLBFGS at b8f4fd2dd6 over crates, src, tests, bench, examples, python and gamfit finds exactly four lines: the struct, its Default impl, and the gam-geometry lib.rs and root src/lib.rs re-exports. source_removal_guard.py (origin's copy) over b8f4fd2dd6..33a553b296, the code-only commit, refused exactly these items before this entry existed, and it verifies the final commit with the entry. Compile is covered by the lead's shared tip check (user directive: commit and push after every edit)."
+  },
+  {
+    "base": "0e10ecbc736d96aa2b456eb784e78339a2da065a",
+    "items": [
+      "crates/gam-custom-family/src/covariance.rs:fn:joint_exact_analytic_outer_hessian_available",
+      "crates/gam-identifiability/src/families/compiler.rs:fn:p_compiled",
+      "crates/gam-model-api/src/families/custom_family/options.rs:fn:exact_newton_outer_geometry_supports_second_order_solver",
+      "crates/gam-problem/src/block_spec.rs:fn:natural_diagonal_checked",
+      "crates/gam-problem/src/row_measure.rs:fn:indices_and_weights"
+    ],
+    "reason": "User directive 2026-09-11: delete code nothing uses. The --include-public rescan at 9c526d420 (MSI job 447458) found five bare pub items that nothing names, not even tests: gam-custom-family joint_exact_analytic_outer_hessian_available (a predicate that always returned true), gam-model-api exact_newton_outer_geometry_supports_second_order_solver, gam-identifiability CompiledMap::p_compiled, and gam-problem BlockWorkingSet::natural_diagonal_checked and RowMeasure::indices_and_weights.",
+    "evidence": "The scanner report /scratch.global/sauer354/sw1-logs/pp_rescan.json lists each item as unreferenced. At the base, single-name git greps over *.rs find each name only at its definition, in the gam-custom-family re-exports removed here, or in the gam-solve row_measure.rs module doc reworded here. p_compiled survives only as prose naming the compiled width."
   }
 ]

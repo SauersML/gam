@@ -1,7 +1,7 @@
 //! Row-subsample mask handle for trust-region invariant enforcement.
 //!
 //! The `RowSubsampleMask` data type and its pure data methods (`full_data`,
-//! `subsample`, `indices_and_weights`) have descended to `gam-problem` so
+//! `subsample`) have descended to `gam-problem` so
 //! lower tiers can consume the row measure without depending on `gam-solve`;
 //! they are re-exported here unchanged.
 //!
