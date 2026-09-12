@@ -64,7 +64,7 @@ def _ensure_binary() -> str:
         env={**os.environ, "CARGO_PROFILE_DEV_DEBUG": "0"},
     )
     if build.returncode != 0 or not os.path.exists(GAM_BIN):
-        pytest.skip(f"could not build release gam binary:\n{build.stderr[-2000:]}")
+        pytest.fail(f"could not build release gam binary:\n{build.stderr[-2000:]}")
     return GAM_BIN
 
 

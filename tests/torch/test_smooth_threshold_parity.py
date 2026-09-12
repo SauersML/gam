@@ -10,16 +10,13 @@ import numpy as np
 pytest: Any = importlib.import_module("pytest")
 torch = pytest.importorskip("torch")
 pytest.importorskip("gamfit.torch")
+pytest.importorskip("gamfit._rust")
 
 from gamfit.torch.penalties import SmoothThresholdPenalty, _SmoothThresholdFn  # noqa: E402
 
 
 def _rust_module() -> Any:
-    binding = importlib.import_module("gamfit._binding")
-    try:
-        return binding.rust_module()
-    except Exception as exc:
-        pytest.skip(f"compiled gamfit._rust extension unavailable: {exc}")
+    return importlib.import_module("gamfit._binding").rust_module()
 
 
 def _gate(z: torch.Tensor, tau: torch.Tensor, eps: float) -> torch.Tensor:

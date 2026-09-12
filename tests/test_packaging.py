@@ -128,7 +128,7 @@ LOAD_PATH_MODULES = (
     "gamfit/_select_topology.py",
     "gamfit/_sheaf.py",
     "gamfit/identifiability.py",
-    "gamfit/diagnostics.py",
+    "gamfit/diagnostics/__init__.py",
     "gamfit/manifolds.py",
     "gamfit/kernels.py",
 )
@@ -170,8 +170,7 @@ def _top_level_imports(path: Path) -> set[str]:
 def test_no_unconditional_heavy_optional_imports(relpath: str):
     """No load-path module may import a heavy optional dep at module scope."""
     path = REPO_ROOT / relpath
-    if not path.exists():
-        pytest.skip(f"{relpath} not present in this checkout")
+    assert path.exists(), f"load-path module {relpath} is missing; update LOAD_PATH_MODULES"
     imports = _top_level_imports(path)
     base_names = {_req_name(s) for s in _base_deps()}
     offenders = sorted(

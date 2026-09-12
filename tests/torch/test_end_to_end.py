@@ -2,22 +2,13 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
 from importlib import import_module
-from typing import Any, NoReturn, Protocol, TypeVar, cast
+from typing import NoReturn, Protocol, cast
 
 import numpy as np
 
-_T = TypeVar("_T", bound=Callable[..., Any])
-
-
-class _PytestMark(Protocol):
-    def skipif(self, condition: bool, *, reason: str) -> Callable[[_T], _T]: ...
-
 
 class _Pytest(Protocol):
-    mark: _PytestMark
-
     def skip(self, reason: str, *, allow_module_level: bool = False) -> NoReturn: ...
 
 
@@ -31,18 +22,16 @@ except ImportError:
     pytest.skip("torch dependency unavailable", allow_module_level=True)
 
 
-def _have_ffi(*names: str) -> bool:
+def _require_ffi(*names: str) -> None:
     from gamfit._binding import rust_module
 
     m = rust_module()
-    return all(hasattr(m, n) for n in names)
+    missing = [n for n in names if not hasattr(m, n)]
+    assert not missing, f"engine missing FFI export(s) {missing}"
 
 
-@pytest.mark.skipif(
-    not _have_ffi("fit_array", "predict_array"),
-    reason="engine missing fit_array/predict_array",
-)
 def test_from_fitted_inside_torch_module() -> None:
+    _require_ffi("fit_array", "predict_array")
     rng = np.random.default_rng(42)
     n, f = 80, 3
     X = rng.standard_normal((n, f))
@@ -80,12 +69,9 @@ def test_from_fitted_inside_torch_module() -> None:
     assert final_loss < initial_loss * 0.5, (initial_loss, final_loss)
 
 
-@pytest.mark.skipif(
-    not _have_ffi("bspline_basis", "gaussian_reml_fit"),
-    reason="engine missing bspline_basis / gaussian_reml_fit FFI",
-)
 def test_reml_gradients_flow_through_torch_loop() -> None:
     """Compose bspline_basis + gaussian_reml_fit and check autograd flows back to ``t``."""
+    _require_ffi("bspline_basis", "gaussian_reml_fit")
     rng = np.random.default_rng(7)
     n = 40
     t_np = np.sort(rng.uniform(0.05, 0.95, size=n))

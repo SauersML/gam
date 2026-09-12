@@ -105,10 +105,6 @@ def test_noncanonical_assignment_is_rejected() -> None:
         ManifoldSAE.from_dict(aliased)
 
 
-@pytest.mark.skipif(
-    not GOLDEN_COV.exists(),
-    reason="covariance-bearing fixture requires a built wheel to (re)generate",
-)
 def test_covariance_bearing_fixture_round_trips() -> None:
     golden = _load(GOLDEN_COV)
     # Atom 1 carries the compact per-channel covariance factor on disk.
