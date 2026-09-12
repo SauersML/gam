@@ -159,13 +159,13 @@ producer is not a substitute for an implemented public contract.
 | `fit_gam` | Maintain `gam::fit_model` / `gam::fit_from_formula` as the unified model front doors and `gam_solve::estimate::fit_gam_with_penalty_specs` as the explicit external-design API. The generic owned/borrowed design contract is exercised by `public_library_surface_2829.rs`. Recreating an alias that only supplies defaults is unnecessary. |
 | `canonicalize_for_identifiability` | Maintain `gam_identifiability::canonical::canonicalize_for_identifiability_with_operating_scalars`. `None` explicitly requests the zero-state audit; supplied scalars audit the actual family operating point. `canonical_recovery.rs` exercises this public route. |
 | `under_identified_subspace` | Maintain `gam_solve::estimate::reml::jeffreys_subspace::under_identified_subspace_in_metric`. The caller supplies the model's metric; an identity-metric convenience must not hide a coordinate convention. The public integration target tests both identity coordinates and congruent nonorthogonal coordinates. |
-| `arrow_log_det_from_cache` | The public `ArrowSchurCache::arrow_log_det` reads the recorded undamped criterion value. `compute_undamped_arrow_log_det` and `undamped_arrow_log_det_with_schur` own its construction. Do not duplicate this with an evidence-module accessor. |
+| `arrow_log_det_from_cache` | The public `ArrowFactorCache::arrow_log_det` reads the recorded undamped criterion value. `compute_undamped_arrow_log_det` and `undamped_arrow_log_det_with_schur` own its construction. Do not duplicate this with an evidence-module accessor. |
 | `matrix_free_arrow_evidence_log_det` | Maintain `matrix_free_arrow_evidence_log_det_surrogate`, with an explicit rational-lane state for a differentiable frozen criterion and `None` for value-only SLQ. Internal documentation now names this actual public entry point. |
 | `coordinate_block_log_det`, `criterion_as_atoms` | The current exact-A criterion assembles `log_det` and `log_det_tt` from the same observed information and uses `rank_adjusted_quasi_laplace_complexity`. The removed majorizer convenience is not the ranked coordinate term. Independent adjoint/criterion acceptance is tracked by #2333 and #2828. |
 | `Dual2::{seed_directional,from_channels,seed_inner,seed_outer}` | Maintain the public `Dual2` value/first/second fields, `constant`, `variable`, and `Dual22::channels`. The analytic polynomial channel-order test in `gam-math` verifies the actual representation; redundant setters and getter/setter roundtrips are not separate product behavior. |
 | `enable_outer_gradient_fd_capture` | Maintain `enable_outer_gradient_fd_capture_over_theta`; it arms the complete current diagnostic and owns its typed sink. Consumers now document that actual function. |
 | `triangle_cocycle_defect`, `triangle_sign_product` | Consumers compose the public `ChartTransition` rotations/signs. The restored `local_chart_recovery_tests.rs` independently checks the composition on plane, sphere-band, and Swiss-roll fixtures; no duplicate arithmetic wrapper is required. |
-| `LocalAtlas::co_collapse_candidates` | **Restored.** The exported `CoCollapseCandidate` report survived the sweep with no producer. The query is a pure function of the fitted atlas: well-conditioned transitions, mutual coverage `|shared| / min(patch sizes)`, and the Procrustes residual. The three historical #2280 pins (`co_collapse_flags_duplicate_charts_2280`, `co_collapse_thresholds_bracket_the_gate_2280`, `co_collapse_spares_healthy_swiss_roll_atlas_2280`) are restored beside it. |
+| `LocalAtlas::co_collapse_candidates` | **Restored, then deleted by `e6fd4251e`** together with `CoCollapseCandidate` and its three pins, because nothing in production queried it. As restored, The exported `CoCollapseCandidate` report survived the sweep with no producer. The query is a pure function of the fitted atlas: well-conditioned transitions, mutual coverage `|shared| / min(patch sizes)`, and the Procrustes residual. The three historical #2280 pins (`co_collapse_flags_duplicate_charts_2280`, `co_collapse_thresholds_bracket_the_gate_2280`, `co_collapse_spares_healthy_swiss_roll_atlas_2280`) are restored beside it. |
 | `cofit_block_and_curved`, `cofit_linear_via_arrow`, `cofit_composed_via_arrow` | **Retired, with their carriers.** `Tier2SupportFit` documents itself as the replacement for the former dense co-fit report, and `tiered::fit_tiered` is the route that mints curved fits. The live route's tests cover the historical contracts: match-or-beat against the pure-linear tier and a recurred fixed point with a certifying outer certificate (`tiered_curved_refinement_is_certified_and_records_promotions`, `tier2_branch_constructs_the_support_sparse_path`). The budget-refusal contract is now pinned on the live route by `insufficient_inner_budget_returns_error_instead_of_a_tiered_report_2023`. The producer-less `ArrowCofitConfig`, `ArrowCofitReport`, `CofitConfig`, `CofitReport` and `CofitRound` are deleted rather than kept as abandoned carriers. The composed-versus-A/B parity pin compared two retired implementations with each other and has no live subject. |
 
 #### Applying the rule once to every removed identity
@@ -194,12 +194,12 @@ dropped, and restored items the table above retires were removed again.
 
 | Disposition | Identities |
 | --- | --- |
-| Restored in place | 436 |
-| Defined elsewhere in the same crate | 14 |
+| Restored in place | 372 |
+| Defined elsewhere in the same crate | 13 |
 | Retired by the decisions above | 19 |
 | Retired: nothing that survived depends on it | 288 |
 | Retired by the owning work's own decision | 27 |
-| Retired by a later deletion commit named in the row | 432 |
+| Retired by a later deletion commit named in the row | 497 |
 | Absent while a surviving reference still names it (repair in progress) | 3 |
 
 Retired identities carry no compatibility obligation. Restoration is closed
@@ -245,9 +245,9 @@ nothing that survived defines or calls them. `d484a091a` had only moved
 the ledger with the other moved declarations.
 
 After the ledger refresh in `955897723`, deletion commits made under the user's
-directive removed 432 listed identities without updating their rows. Each
+directive removed 497 listed identities without updating their rows. Each
 such row now reads `retired-by-later-deletion:<commit>`, naming the commit whose
-own diff lowered that identity's census count (40 commits). Eleven of
+own diff lowered that identity's census count (45 commits). Eleven of
 those commits had also landed no public API census acknowledgement; `5fe9454ab`
 backfilled them.
 
