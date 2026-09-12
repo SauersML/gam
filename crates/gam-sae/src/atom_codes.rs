@@ -169,23 +169,11 @@ impl SparseAtomCode {
         self.active_mask.count_ones()
     }
 
-    /// Sum of active weights. For simplex-projected codes this should be ≈ 1.
-    pub fn active_weight_sum(&self) -> f64 {
-        self.active_mask.iter_ones().map(|k| self.weights[k]).sum()
-    }
-
     /// Set the weight for atom `k` and mark it active.
     pub fn assign(&mut self, k: usize, w: f64) {
         assert!(k < self.k_atoms());
         self.active_mask.set(k, true);
         self.weights[k] = w;
-    }
-
-    /// Deactivate atom `k` and zero its stored weight.
-    pub fn deactivate(&mut self, k: usize) {
-        assert!(k < self.k_atoms());
-        self.active_mask.set(k, false);
-        self.weights[k] = 0.0;
     }
 
     /// Materialize the *effective* weight vector (zeros at inactive indices)
@@ -240,21 +228,6 @@ impl SparseAtomCodes {
 
     pub fn iter_mut(&mut self) -> impl Iterator<Item = &mut SparseAtomCode> {
         self.codes.iter_mut()
-    }
-
-    /// Flatten weights into a single `(N, K)` array, with zeros where the
-    /// mask is unset. Allocates; intended for diagnostic / post-fit use.
-    pub fn weights_matrix(&self) -> ndarray::Array2<f64> {
-        let n = self.n_obs();
-        let k = self.k_atoms();
-        let mut out = ndarray::Array2::<f64>::zeros((n, k));
-        for n_idx in 0..n {
-            let code = &self.codes[n_idx];
-            for kk in code.active_mask.iter_ones() {
-                out[[n_idx, kk]] = code.weights[kk];
-            }
-        }
-        out
     }
 
     /// Co-activation statistics for one atom pair `(a, b)` — the #976
