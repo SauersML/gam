@@ -4,12 +4,11 @@
 //! The `Fingerprinter` doc comment states (verbatim):
 //!
 //! > Each `absorb_*` writes a short type-tag + length before the data, so
-//! > `absorb_f64(b"x", 0.5)` cannot collide with `absorb_bytes(b"x", <the 8
-//! > little-endian bytes of 0.5>)`.
+//! > values of different primitive types absorbed under one tag cannot
+//! > collide with `absorb_bytes` of the same payload.
 //!
-//! That promise is false. `absorb_f64(tag, v)` is implemented as
-//! `absorb_bytes(tag, &v.to_bits().to_le_bytes())` (src/warm_start/key.rs),
-//! and `absorb_str`/`absorb_u64` likewise forward to `absorb_bytes` with the
+//! That promise was false when this was filed: `absorb_str`/`absorb_u64`
+//! forwarded to `absorb_bytes` with the
 //! caller's tag and the raw payload. None of them writes a per-*type*
 //! discriminator — only the caller-supplied content tag and a length. So two
 //! values of *different primitive types* that share a tag and whose byte

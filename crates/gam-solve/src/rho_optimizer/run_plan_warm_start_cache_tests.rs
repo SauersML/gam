@@ -86,7 +86,7 @@ fn iterate_payload_round_trips_converged_outer_hessian() {
             kind: gam_runtime::warm_start::EntryKind::Checkpoint,
             written_unix_secs: 0,
         },
-        source: gam_runtime::warm_start::LoadSource::Preloaded,
+        source: gam_runtime::warm_start::LoadSource::Exact,
     };
     let CacheSeedDecision::Seed {
         hessian: decoded_h, ..
@@ -131,7 +131,7 @@ fn classify_extracts_beta_from_v2_payload() {
             kind: gam_runtime::warm_start::EntryKind::Checkpoint,
             written_unix_secs: 0,
         },
-        source: gam_runtime::warm_start::LoadSource::Preloaded,
+        source: gam_runtime::warm_start::LoadSource::Exact,
     };
     let CacheSeedDecision::Seed {
         beta: decoded_beta, ..
@@ -151,7 +151,7 @@ fn classify_extracts_beta_from_v2_payload() {
             kind: gam_runtime::warm_start::EntryKind::Checkpoint,
             written_unix_secs: 0,
         },
-        source: gam_runtime::warm_start::LoadSource::Preloaded,
+        source: gam_runtime::warm_start::LoadSource::Exact,
     };
     let CacheSeedDecision::Seed {
         beta: decoded_beta, ..
@@ -426,7 +426,7 @@ fn cache_entry_classifier_honors_finite_seeds_regardless_of_saturation() {
                 kind: gam_runtime::warm_start::EntryKind::Checkpoint,
                 written_unix_secs: 0,
             },
-            source: gam_runtime::warm_start::LoadSource::Preloaded,
+            source: gam_runtime::warm_start::LoadSource::Exact,
         };
 
         assert!(cache_entry_would_help_outer(&loaded, 2));
@@ -461,7 +461,7 @@ fn cache_entry_classifier_rejects_only_structural_failures() {
             kind: gam_runtime::warm_start::EntryKind::Checkpoint,
             written_unix_secs: 0,
         },
-        source: gam_runtime::warm_start::LoadSource::Preloaded,
+        source: gam_runtime::warm_start::LoadSource::Exact,
     };
     assert!(matches!(
         classify_cache_entry_for_outer(&loaded, 2),
@@ -482,7 +482,7 @@ fn cache_entry_classifier_rejects_only_structural_failures() {
             kind: gam_runtime::warm_start::EntryKind::Checkpoint,
             written_unix_secs: 0,
         },
-        source: gam_runtime::warm_start::LoadSource::Preloaded,
+        source: gam_runtime::warm_start::LoadSource::Exact,
     };
     assert!(matches!(
         classify_cache_entry_for_outer(&loaded, 3),

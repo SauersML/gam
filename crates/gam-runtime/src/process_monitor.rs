@@ -1,6 +1,6 @@
 //! Process-wide liveness monitor with per-thread scope stacks.
 //!
-//! Each heartbeat (≈once/minute) reports three things a user watching a long
+//! Each heartbeat (≈once/minute) reports two things a user watching a long
 //! compute log actually needs:
 //!   1. The currently-active operation — the label of the longest-running
 //!      instrumented scope on any thread and how long it has been running, so a
@@ -12,12 +12,9 @@
 //!      the old `active_threads` counter only ever saw the handful of threads
 //!      inside an instrumented `track_scope` (rayon workers are not) and so
 //!      reported a misleading `0`.
-//!   3. Progress — when a long scope registers a progress counter (via
-//!      `track_scope_with_progress`) the heartbeat surfaces `progress=a/b (X%)`.
 
 use std::cell::RefCell;
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -40,49 +37,10 @@ thread_local! {
     static THREAD_STACK: RefCell<ThreadStack> = RefCell::new(ThreadStack::new());
 }
 
-/// A shared progress counter a long-running scope can expose to the heartbeat.
-///
-/// A compute loop creates one via `track_scope_with_progress`, then bumps
-/// [`ScopeProgress::set`] / `ScopeProgress::inc` as it advances. The
-/// heartbeat reads the current/total atomically and surfaces a percentage in
-/// the active-scope line — no log-spam coupling between the loop and the
-/// monitor cadence.
-#[derive(Clone)]
-pub struct ScopeProgress {
-    inner: Arc<ProgressCounter>,
-}
-
-struct ProgressCounter {
-    current: AtomicU64,
-    total: AtomicU64,
-}
-
-impl ScopeProgress {
-    /// Record progress as `current` out of `total` units (e.g. rows processed
-    /// out of rows total). `total == 0` is treated as "total unknown".
-    pub fn set(&self, current: u64, total: u64) {
-        self.inner.current.store(current, Ordering::Relaxed);
-        self.inner.total.store(total, Ordering::Relaxed);
-    }
-
-    /// Advance the current count by one, leaving the total unchanged.
-    pub fn inc(&self) {
-        self.inner.current.fetch_add(1, Ordering::Relaxed);
-    }
-
-    fn snapshot(&self) -> (u64, u64) {
-        (
-            self.inner.current.load(Ordering::Relaxed),
-            self.inner.total.load(Ordering::Relaxed),
-        )
-    }
-}
-
 #[derive(Clone)]
 struct FrameSnapshot {
     label: String,
     entered: Instant,
-    progress: Option<ScopeProgress>,
 }
 
 struct ThreadSnapshot {
@@ -167,7 +125,6 @@ impl ProcessMonitorState {
             updated_ago: Duration,
             deepest_label: &'a str,
             deepest_age: Duration,
-            progress: Option<(u64, u64)>,
         }
         let mut phases: Vec<ThreadPhase<'_>> = Vec::with_capacity(threads.len());
         for (thread_id, thread) in threads.iter() {
@@ -178,22 +135,12 @@ impl ProcessMonitorState {
                 Some(name) => format!("{thread_id}/{name}"),
                 None => thread_id.clone(),
             };
-            // Surface the first progress counter found walking the stack from
-            // the innermost frame outward (the innermost reporting scope is the
-            // most specific "what is it doing right now").
-            let progress = thread
-                .stack
-                .iter()
-                .rev()
-                .find_map(|frame| frame.progress.as_ref())
-                .map(ScopeProgress::snapshot);
             phases.push(ThreadPhase {
                 thread_label,
                 depth: thread.stack.len(),
                 updated_ago: thread.updated.elapsed(),
                 deepest_label: deepest.label.as_str(),
                 deepest_age: deepest.entered.elapsed(),
-                progress,
             });
         }
         phases.sort_by(|a, b| b.deepest_age.cmp(&a.deepest_age));
@@ -202,22 +149,11 @@ impl ProcessMonitorState {
         // signal, and — front and center — the longest-running active scope so
         // a user instantly sees "what is it doing and for how long".
         let active = match phases.first() {
-            Some(phase) => {
-                let progress = match phase.progress {
-                    Some((cur, total)) if total > 0 => {
-                        let pct = (cur as f64 / total as f64) * 100.0;
-                        format!(" progress={cur}/{total} ({pct:.0}%)")
-                    }
-                    Some((cur, _)) => format!(" progress={cur}/?"),
-                    None => String::new(),
-                };
-                format!(
-                    " active={:?} for {}{}",
-                    phase.deepest_label,
-                    format_duration(phase.deepest_age),
-                    progress,
-                )
-            }
+            Some(phase) => format!(
+                " active={:?} for {}",
+                phase.deepest_label,
+                format_duration(phase.deepest_age),
+            ),
             None => " active=<idle>".to_string(),
         };
 
@@ -246,22 +182,13 @@ impl ProcessMonitorState {
 
         // Compact per-thread phase summary: deepest frame label + age, capped.
         for phase in phases.iter().take(PROCESS_MONITOR_MAX_PHASE_LINES) {
-            let progress = match phase.progress {
-                Some((cur, total)) if total > 0 => {
-                    let pct = (cur as f64 / total as f64) * 100.0;
-                    format!(" progress={cur}/{total} ({pct:.0}%)")
-                }
-                Some((cur, _)) => format!(" progress={cur}/?"),
-                None => String::new(),
-            };
             log::info!(
-                "[process-monitor] phase thread={} depth={} deepest={:?} in_frame={} updated_ago={}{}",
+                "[process-monitor] phase thread={} depth={} deepest={:?} in_frame={} updated_ago={}",
                 phase.thread_label,
                 phase.depth,
                 phase.deepest_label,
                 format_duration(phase.deepest_age),
                 format_duration(phase.updated_ago),
-                progress,
             );
         }
         if phases.len() > PROCESS_MONITOR_MAX_PHASE_LINES {
@@ -290,36 +217,16 @@ pub fn start() {
 }
 
 pub fn track_scope(label: impl Into<String>) -> ProcessScopeGuard {
-    push_scope(label.into(), None)
+    push_scope(label.into())
 }
 
-/// Open a tracked scope that also exposes a live progress counter to the
-/// heartbeat. The returned [`ScopeProgress`] is cheap to clone into worker
-/// closures; bump it as the loop advances and the heartbeat will surface
-/// `progress=a/b (X%)` on the active-scope line. The scope closes when the
-/// returned guard is dropped, exactly like [`track_scope`].
-pub fn track_scope_with_progress(
-    label: impl Into<String>,
-    total: u64,
-) -> (ProcessScopeGuard, ScopeProgress) {
-    let progress = ScopeProgress {
-        inner: Arc::new(ProgressCounter {
-            current: AtomicU64::new(0),
-            total: AtomicU64::new(total),
-        }),
-    };
-    let guard = push_scope(label.into(), Some(progress.clone()));
-    (guard, progress)
-}
-
-fn push_scope(label: String, progress: Option<ScopeProgress>) -> ProcessScopeGuard {
+fn push_scope(label: String) -> ProcessScopeGuard {
     let state = process_monitor();
     THREAD_STACK.with(|stack| {
         let mut stack = stack.borrow_mut();
         stack.stack.push(FrameSnapshot {
             label,
             entered: Instant::now(),
-            progress,
         });
         state.update_thread(&stack);
     });

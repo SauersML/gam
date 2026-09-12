@@ -247,20 +247,6 @@ impl std::fmt::Display for MemoryAvailability {
     }
 }
 
-/// Number of completed OS/cgroup availability probes in this process.
-///
-/// Every [`resample_memory_availability`] call opens and parses `/proc/meminfo`
-/// plus the four to five cgroup files behind `detect_cgroup_memory`, so this
-/// counter is a direct census of that syscall traffic. It exists so a planner
-/// can assert *in a test* that its budget decisions cost a bounded number of
-/// probes rather than one per unit of work (#2560).
-pub fn memory_availability_probe_count() -> u64 {
-    MEMORY_AVAILABILITY_PROBES.load(std::sync::atomic::Ordering::Relaxed)
-}
-
-static MEMORY_AVAILABILITY_PROBES: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
-
 /// Take a **fresh** reading of the OS and cgroup memory observations.
 ///
 /// This is a syscall-bearing probe, not an accessor: it refreshes `sysinfo`
@@ -281,7 +267,6 @@ pub fn resample_memory_availability() -> MemoryAvailability {
     let mut system = system.lock().expect("sysinfo system mutex poisoned");
     system.refresh_memory();
     let cgroup = detect_cgroup_memory();
-    MEMORY_AVAILABILITY_PROBES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     MemoryAvailability::from_observation(
         system.available_memory(),
         system.total_memory(),
@@ -819,16 +804,6 @@ impl ResourcePolicy {
             return Self::analytic_operator_required();
         }
         Self::default_library()
-    }
-
-    /// Permissive mode for small-data usage and tests. Admission still uses
-    /// the same process ledger; only the streaming chunk geometry differs.
-    pub fn permissive_small_data() -> Self {
-        let base = Self::default_library();
-        Self {
-            row_chunk_target_bytes: 64 * 1024 * 1024,
-            ..base
-        }
     }
 
     pub const fn material_policy(&self) -> MaterializationPolicy {

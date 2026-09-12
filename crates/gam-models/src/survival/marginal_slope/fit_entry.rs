@@ -1237,7 +1237,7 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
     // Running the rigid pilot in that regime is pure latency at large scale
     // (the log shows ~15s for n≈196k), and worse, it seeds β at ρ=0 while the
     // cached outer seed may be far from ρ=0. Do a non-consuming peek so the
-    // optimizer still receives the cached entry via `try_load`.
+    // optimizer still receives the cached entry via `try_load_with_source`.
     //
     // The peek must use the same validity criterion as the outer optimizer's
     // cache loader. A poisoned all-boundary checkpoint is not a usable seed:
