@@ -746,5 +746,232 @@
     },
     "reason": "User directive 2026-09-11: delete code only tests use and code nothing uses.\n- gam-test-support: TEST_SIZE_ALPHAS and dml_partial_linear_reference (with DmlPartialLinearReference) had no code use.\n- gam-geometry: nothing called exp_map_kappa_jet.\n- gam-problem: only unit tests called normalize_fisher_rao_blocks_pd, and FisherRaoDefiniteness existed only to select it.\n- gam-problem: pack_probe_factors was used only by its own unit tests and one gam-sae fixture, which now carries a private copy.\n- Measure collapse (lead-approved): production builds SeparableCellMeasure only through gam-pyffi's row_weighted. Only tests built IndexedCellSet, the StructuralCells and LikelihoodWeights enums, SeparableCellMeasure::{uniform, new, is_active, to_owned} or the owned measure types. Their one other consumer, crates/gam-models/src/indexed_natural.rs, has had no IndexedNaturalDiagonalProgram implementor since 5e967c204.",
     "evidence": "Candidates came from the restored src_items_used_only_by_tests scanner at 7bc19ed40 on MSI (job 432643), plus lead-approved proposals. Each was re-read at the base with word-matched single-name greps:\n- exp_map_kappa_jet and dml_partial_linear_reference are named only at their definitions, re-exports and prose.\n- normalize_fisher_rao_blocks_pd is called only in fisher_rao.rs tests.\n- FisherRaoDefiniteness appears only in fisher_rao.rs and two re-exports.\n- pack_probe_factors appears only in row_metric.rs, its re-export, and tests_behavioral_fisher_rung1.rs.\n- gam-pyffi's row_weighted is the only production producer of a measure.\n- IndexedCellSet is built only by from_cells in test fixtures.\n- indexed_natural.rs names its trait and fit entry only inside itself.\n- REFERENCE_ENV_MISSING was kept because reference.rs uses it through format-string captures.\n- binomial_multi.rs reads one weight per row. Its unit-weight fixtures (and three in penalized_vector_glm.rs) pass explicit row weights of 1.0, numerically identical to Uniform.\nPre-push on MSI over the exact candidate tree: workspace --all-targets check, cargo check -p gam-pyffi, a leftover-name grep, and the three gates."
+  },
+  {
+    "base": "846c51bff97241b73211bc2d5157802eb7c6ef2a",
+    "removed": {
+      "crates/gam-problem/src/diagnostics.rs::compute_dualridge_check": 1,
+      "crates/gam-problem/src/diagnostics.rs::compute_envelopeaudit": 1,
+      "crates/gam-problem/src/gauge.rs::extend_with_identity": 1,
+      "crates/gam-problem/src/gauge.rs::from_compiled_map": 1,
+      "crates/gam-problem/src/row_metric.rs::is_output_fisher_like": 1,
+      "crates/gam-problem/src/row_metric.rs::output_fisher_with_solver_floor": 1,
+      "crates/gam-problem/src/row_metric.rs::solver_floor": 1,
+      "crates/gam-problem/src/row_metric.rs::whiten_jacobian": 1,
+      "crates/gam-problem/src/topology_certificates.rs::verdict_of": 1,
+      "crates/gam-problem/src/types.rs::approximation_only": 1,
+      "crates/gam-problem/src/types.rs::explicit_prior": 1,
+      "crates/gam-problem/src/types.rs::from_passport": 1,
+      "crates/gam-problem/src/types.rs::is_placeholder": 1,
+      "crates/gam-problem/src/types.rs::laplace_hessian_delta": 1,
+      "crates/gam-problem/src/types.rs::laplace_hessian_ridge": 1,
+      "crates/gam-problem/src/types.rs::numerical_perturbation": 1,
+      "crates/gam-problem/src/types.rs::penalty_logdet_delta": 1,
+      "crates/gam-problem/src/types.rs::quadratic_delta": 1,
+      "crates/gam-problem/src/types.rs::solver_damping": 1,
+      "crates/gam-spec/src/lib.rs::binomial_cloglog": 1,
+      "crates/gam-spec/src/lib.rs::binomial_latent_cloglog": 1,
+      "crates/gam-spec/src/lib.rs::binomial_sas": 1,
+      "crates/gam-spec/src/lib.rs::negative_binomial_log": 1,
+      "crates/gam-spec/src/lib.rs::negative_binomial_log_fixed": 1,
+      "crates/gam-spec/src/lib.rs::resolved_gamma_log_shape": 1,
+      "crates/gam-spec/src/lib.rs::resolved_gamma_phi": 1,
+      "crates/gam-spec/src/lib.rs::resolved_tweedie_log_phi": 1
+    },
+    "reason": "Delete unused gam-problem and gam-spec items (#2469) (47c2319015)",
+    "evidence": "Backfilled under #2829: 47c2319015 removed these 27 public function declarations without a docs/public-api-census-changes.json acknowledgement, and no entry was keyed to its parent 846c51bff9. The removed map is scripts/public_api_census.py's own public_functions predicate over the .rs files 846c51bff9..47c2319015 changed; files the commit did not change count equally on both sides, so this is the census difference. Measured on MSI: /scratch.global/sauer354/pool/api2829/backfill.measured.json. The same method reproduces the landed maps for 368528959 (4) and b66b773539 (11) exactly (/scratch.global/sauer354/pool/api2829/backfill.control.json)."
+  },
+  {
+    "base": "dc325f1909721be796d4a2cb468044329d09473a",
+    "removed": {
+      "crates/gam-models/src/fit_orchestration/drivers/mod.rs::trial_total_s": 1,
+      "crates/gam-models/src/fit_orchestration/drivers/smooth_term_lr.rs::selection_mean": 1,
+      "crates/gam-models/src/fit_orchestration/drivers/smooth_term_lr.rs::tail_probability": 1,
+      "crates/gam-models/src/gpu_kernels/cubic_bspline_moments.rs::build_axis_tables_cpu": 1,
+      "crates/gam-models/src/gpu_kernels/cubic_bspline_moments.rs::moment_1d_about": 1,
+      "crates/gam-models/src/gpu_kernels/cubic_bspline_moments.rs::moment_1d_gauss_legendre": 1,
+      "crates/gam-models/src/gpu_kernels/cubic_bspline_moments.rs::tetrahedral_geom_moment_cpu": 1,
+      "crates/gam-models/src/inference/full_conformal.rs::bernoulli_full_conformal": 1,
+      "crates/gam-models/src/inference/full_conformal.rs::discrete_full_conformal_exhaustive": 1,
+      "crates/gam-models/src/inference/full_conformal.rs::discrete_full_conformal_window": 1,
+      "crates/gam-models/src/inference/full_conformal.rs::drho_dz": 1,
+      "crates/gam-models/src/inference/full_conformal.rs::honest_membership": 1,
+      "crates/gam-models/src/inference/full_conformal.rs::mean_sensitivity_to_rho": 1,
+      "crates/gam-models/src/inference/full_conformal.rs::penalized_laml_criterion": 1,
+      "crates/gam-models/src/inference/model.rs::second_derivative_design": 1,
+      "crates/gam-models/src/multinomial.rs::coefficient_covariance_corrected": 1,
+      "crates/gam-models/src/multinomial.rs::logistic_normal_softmax_moments": 1,
+      "crates/gam-models/src/multinomial.rs::logistic_normal_softmax_moments_with_control": 1,
+      "crates/gam-models/src/multinomial.rs::predict_multinomial_formula_with_se_in_mode": 1,
+      "crates/gam-models/src/vector_response.rs::diag_precision": 1,
+      "crates/gam-models/src/vector_response.rs::from_target": 1,
+      "crates/gam-models/src/wiggle.rs::buildwiggle_block_input_from_seed": 1
+    },
+    "reason": "Delete gam-models items nothing in production uses (418c732d2f)",
+    "evidence": "Backfilled under #2829: 418c732d2f removed these 22 public function declarations without a docs/public-api-census-changes.json acknowledgement, and no entry was keyed to its parent dc325f1909. The removed map is scripts/public_api_census.py's own public_functions predicate over the .rs files dc325f1909..418c732d2f changed; files the commit did not change count equally on both sides, so this is the census difference. Measured on MSI: /scratch.global/sauer354/pool/api2829/backfill.measured.json. The same method reproduces the landed maps for 368528959 (4) and b66b773539 (11) exactly (/scratch.global/sauer354/pool/api2829/backfill.control.json)."
+  },
+  {
+    "base": "f83e9aebaf810a9fc42be420e8b1158ebfbfd1dc",
+    "removed": {
+      "crates/gam-solve/src/arrow_schur/rational_logdet.rs::with_deflation": 1,
+      "crates/gam-solve/src/arrow_schur/rational_logdet.rs::with_two_sided_deflation": 1,
+      "crates/gam-solve/src/arrow_schur/reduced_solve.rs::arrow_precond_ladder_iteration_study": 1,
+      "crates/gam-solve/src/arrow_schur/reduced_solve.rs::rational_reduced_schur_directional": 1,
+      "crates/gam-solve/src/arrow_schur/reduced_solve.rs::solve_streaming_reduced_beta": 1,
+      "crates/gam-solve/src/arrow_schur/solve_options.rs::sqrt_ba": 1,
+      "crates/gam-solve/src/arrow_schur/solve_options.rs::with_solve_precision_policy": 1,
+      "crates/gam-solve/src/arrow_schur/solve_options.rs::with_streaming_chunk_size": 1,
+      "crates/gam-solve/src/arrow_schur/system.rs::add_analytic_penalty_contributions": 1,
+      "crates/gam-solve/src/arrow_schur/system.rs::add_beta_penalty": 1,
+      "crates/gam-solve/src/arrow_schur/system.rs::add_ext_coord_penalty": 1,
+      "crates/gam-solve/src/arrow_schur/system.rs::add_ext_coord_penalty_gradient_only": 1,
+      "crates/gam-solve/src/arrow_schur/system.rs::exact_arrow_log_det": 1,
+      "crates/gam-solve/src/arrow_schur/system.rs::new_matrix_free_shared": 1,
+      "crates/gam-solve/src/arrow_schur/system.rs::new_with_empty_hbb_and_htbeta_cols": 1,
+      "crates/gam-solve/src/arrow_schur/system.rs::schur_inverse_apply_deflated": 1,
+      "crates/gam-solve/src/arrow_schur/system.rs::schur_inverse_block_deflated": 1,
+      "crates/gam-solve/src/arrow_schur/system.rs::solve_with_lm_escalation": 1,
+      "crates/gam-solve/src/arrow_schur/system.rs::take_accumulators": 1
+    },
+    "reason": "Delete sixteen unreferenced arrow_schur entry points and what only they reached (e3b50feaf1)",
+    "evidence": "Backfilled under #2829: e3b50feaf1 removed these 19 public function declarations without a docs/public-api-census-changes.json acknowledgement, and no entry was keyed to its parent f83e9aebaf. The removed map is scripts/public_api_census.py's own public_functions predicate over the .rs files f83e9aebaf..e3b50feaf1 changed; files the commit did not change count equally on both sides, so this is the census difference. Measured on MSI: /scratch.global/sauer354/pool/api2829/backfill.measured.json. The same method reproduces the landed maps for 368528959 (4) and b66b773539 (11) exactly (/scratch.global/sauer354/pool/api2829/backfill.control.json)."
+  },
+  {
+    "base": "47c2319015f3f5a5995ced77bbd2f5ad1e45110e",
+    "removed": {
+      "crates/gam-gpu/src/encode_throughput.rs::cpu_oracle_normal_equations_solve": 1,
+      "crates/gam-gpu/src/encode_throughput.rs::encode_quality_metrics": 1,
+      "crates/gam-gpu/src/encode_throughput.rs::from_elapsed": 1,
+      "crates/gam-gpu/src/encode_throughput.rs::measure_resident_solve_throughput": 1,
+      "crates/gam-inference/src/functionals.rs::average_derivative_gaussian_identity": 1,
+      "crates/gam-inference/src/functionals.rs::average_derivative_gaussian_identity_with_sensitivity": 1,
+      "crates/gam-inference/src/functionals.rs::penalty_times_beta": 1,
+      "crates/gam-models/src/indexed_bernoulli.rs::fit_indexed_bernoulli_laml": 1,
+      "crates/gam-models/src/indexed_bernoulli.rs::link": 1,
+      "crates/gam-models/src/indexed_bernoulli.rs::new": 1,
+      "crates/gam-models/src/indexed_point_process.rs::fit_indexed_point_process_laml": 1,
+      "crates/gam-models/src/indexed_point_process.rs::new": 1,
+      "crates/gam-models/src/latent_coordinate.rs::axis_domains": 1,
+      "crates/gam-models/src/latent_coordinate.rs::certifies_stationarity": 1,
+      "crates/gam-models/src/latent_coordinate.rs::checkpoint": 1,
+      "crates/gam-models/src/latent_coordinate.rs::coordinates": 1,
+      "crates/gam-models/src/latent_coordinate.rs::latent_dimension": 1,
+      "crates/gam-models/src/latent_coordinate.rs::manifold": 1,
+      "crates/gam-models/src/latent_coordinate.rs::n_observations": 1,
+      "crates/gam-models/src/latent_coordinate.rs::new": 1,
+      "crates/gam-models/src/latent_coordinate.rs::optimize_latent_coordinates": 1,
+      "crates/gam-models/src/latent_coordinate.rs::restart_index": 1,
+      "crates/gam-models/src/latent_coordinate.rs::stationarity_evidence": 1,
+      "crates/gam-models/src/latent_coordinate.rs::stationarity_reference": 1,
+      "crates/gam-models/src/output_axis.rs::coefficient_width": 1,
+      "crates/gam-models/src/output_axis.rs::fixed": 1,
+      "crates/gam-models/src/output_axis.rs::independent": 1,
+      "crates/gam-models/src/output_axis.rs::n_outputs": 1,
+      "crates/gam-models/src/output_axis.rs::new": 1,
+      "crates/gam-models/src/output_axis.rs::parameter_blocks": 1,
+      "crates/gam-models/src/output_axis.rs::precision": 1,
+      "crates/gam-models/src/output_axis.rs::reason": 1,
+      "crates/gam-models/src/output_axis.rs::shared": 1,
+      "crates/gam-models/src/output_axis.rs::with_gauge_priority": 1,
+      "crates/gam-models/src/output_axis.rs::with_initial_coefficients": 1,
+      "crates/gam-models/src/output_axis.rs::with_offsets": 1,
+      "crates/gam-models/src/output_axis.rs::with_penalty": 1
+    },
+    "reason": "Delete production modules that only tests used (#2469) (5e967c2045)",
+    "evidence": "Backfilled under #2829: 5e967c2045 removed these 37 public function declarations without a docs/public-api-census-changes.json acknowledgement, and no entry was keyed to its parent 47c2319015. The removed map is scripts/public_api_census.py's own public_functions predicate over the .rs files 47c2319015..5e967c2045 changed; files the commit did not change count equally on both sides, so this is the census difference. Measured on MSI: /scratch.global/sauer354/pool/api2829/backfill.measured.json. The same method reproduces the landed maps for 368528959 (4) and b66b773539 (11) exactly (/scratch.global/sauer354/pool/api2829/backfill.control.json)."
+  },
+  {
+    "base": "48ee099d449adba3ae8d68e36d36ec8755996f98",
+    "removed": {
+      "crates/gam-identifiability/src/families/gpu.rs::compute_grams": 1,
+      "crates/gam-identifiability/src/families/gpu.rs::compute_grams_cublas": 1,
+      "crates/gam-identifiability/src/families/gpu.rs::compute_grams_fused": 1,
+      "crates/gam-identifiability/src/families/gpu.rs::packed_index": 1,
+      "crates/gam-identifiability/src/families/gpu.rs::try_new": 1,
+      "crates/gam-identifiability/src/families/gpu.rs::try_primary_state_gram_cuda": 1
+    },
+    "reason": "Delete the GPU gram path and apply_analytic_penalty that recent deletions left dead (c4c012c932)",
+    "evidence": "Backfilled under #2829: c4c012c932 removed these 6 public function declarations without a docs/public-api-census-changes.json acknowledgement, and no entry was keyed to its parent 48ee099d44. The removed map is scripts/public_api_census.py's own public_functions predicate over the .rs files 48ee099d44..c4c012c932 changed; files the commit did not change count equally on both sides, so this is the census difference. Measured on MSI: /scratch.global/sauer354/pool/api2829/backfill.measured.json. The same method reproduces the landed maps for 368528959 (4) and b66b773539 (11) exactly (/scratch.global/sauer354/pool/api2829/backfill.control.json)."
+  },
+  {
+    "base": "30b8deff8dd92356e8260d4bb829b2630fcb3ecb",
+    "removed": {
+      "crates/gam-models/src/bms/mod.rs::triple_penalty_default": 1,
+      "crates/gam-models/src/gamlss/binomial/wiggle.rs::initializewiggle_knots_from_q": 1,
+      "crates/gam-models/src/vector_response.rs::m": 1,
+      "crates/gam-models/src/vector_response.rs::n": 1,
+      "crates/gam-models/src/vector_response.rs::new": 1,
+      "crates/gam-models/src/vector_response.rs::with_row_weights": 1
+    },
+    "reason": "Delete unused vector targets and move test-only helpers into test support (7c185e2c51)",
+    "evidence": "Backfilled under #2829: 7c185e2c51 removed these 6 public function declarations without a docs/public-api-census-changes.json acknowledgement, and no entry was keyed to its parent 30b8deff8d. The removed map is scripts/public_api_census.py's own public_functions predicate over the .rs files 30b8deff8d..7c185e2c51 changed; files the commit did not change count equally on both sides, so this is the census difference. Measured on MSI: /scratch.global/sauer354/pool/api2829/backfill.measured.json. The same method reproduces the landed maps for 368528959 (4) and b66b773539 (11) exactly (/scratch.global/sauer354/pool/api2829/backfill.control.json)."
+  },
+  {
+    "base": "95168f48809405a5799bb90089ebe6a988c5379c",
+    "removed": {
+      "crates/gam-solve/src/arrow_schur/factorization.rs::analytic_penalty_row_hessian_fingerprint": 1,
+      "crates/gam-solve/src/arrow_schur/factorization.rs::cross_row_penalty_fingerprint": 1,
+      "crates/gam-solve/src/arrow_schur/system.rs::analytic_penalty_is_row_block_diagonal": 1
+    },
+    "reason": "Delete the penalty fingerprint helpers the arrow_schur deletion orphaned (0b5288b44e)",
+    "evidence": "Backfilled under #2829: 0b5288b44e removed these 3 public function declarations without a docs/public-api-census-changes.json acknowledgement, and no entry was keyed to its parent 95168f4880. The removed map is scripts/public_api_census.py's own public_functions predicate over the .rs files 95168f4880..0b5288b44e changed; files the commit did not change count equally on both sides, so this is the census difference. Measured on MSI: /scratch.global/sauer354/pool/api2829/backfill.measured.json. The same method reproduces the landed maps for 368528959 (4) and b66b773539 (11) exactly (/scratch.global/sauer354/pool/api2829/backfill.control.json)."
+  },
+  {
+    "base": "9f7dea1eef2f9f3272723cfe06ae3c858169f64a",
+    "removed": {
+      "crates/gam-linalg/src/curvature_resolution.rs::finite_difference": 1,
+      "crates/gam-linalg/src/curvature_resolution.rs::finite_difference_error_bound": 1,
+      "crates/gam-linalg/src/curvature_resolution.rs::finite_difference_resolution": 1,
+      "crates/gam-linalg/src/curvature_resolution.rs::hessian_error_against": 1,
+      "crates/gam-linalg/src/curvature_resolution.rs::measure_symmetric_ladder": 1,
+      "crates/gam-linalg/src/curvature_resolution.rs::new": 1,
+      "crates/gam-linalg/src/curvature_resolution.rs::numerator": 1,
+      "crates/gam-linalg/src/curvature_resolution.rs::optimal_step": 1,
+      "crates/gam-solve/src/rho_optimizer/run.rs::hessian_error_2norm": 1,
+      "crates/gam-solve/src/rho_optimizer/run.rs::restricted_to_leading": 1
+    },
+    "reason": "Remove the production finite-difference curvature ladder (#2627) (c9481ef606)",
+    "evidence": "Backfilled under #2829: c9481ef606 removed these 10 public function declarations without a docs/public-api-census-changes.json acknowledgement, and no entry was keyed to its parent 9f7dea1eef. The removed map is scripts/public_api_census.py's own public_functions predicate over the .rs files 9f7dea1eef..c9481ef606 changed; files the commit did not change count equally on both sides, so this is the census difference. Measured on MSI: /scratch.global/sauer354/pool/api2829/backfill.measured.json. The same method reproduces the landed maps for 368528959 (4) and b66b773539 (11) exactly (/scratch.global/sauer354/pool/api2829/backfill.control.json)."
+  },
+  {
+    "base": "dc97c1b68a37c4cbf93d41a6dd7789f554b7c6bd",
+    "removed": {
+      "crates/gam-inference/src/hmc_io.rs::compute_joint_logp_and_grad": 1
+    },
+    "reason": "fix(gam-inference): drop the caller-less test wrapper compute_joint_logp_and_grad (#2829) (26edfd6065)",
+    "evidence": "Backfilled under #2829: 26edfd6065 removed these 1 public function declarations without a docs/public-api-census-changes.json acknowledgement, and no entry was keyed to its parent dc97c1b68a. The removed map is scripts/public_api_census.py's own public_functions predicate over the .rs files dc97c1b68a..26edfd6065 changed; files the commit did not change count equally on both sides, so this is the census difference. Measured on MSI: /scratch.global/sauer354/pool/api2829/backfill.measured.json. The same method reproduces the landed maps for 368528959 (4) and b66b773539 (11) exactly (/scratch.global/sauer354/pool/api2829/backfill.control.json)."
+  },
+  {
+    "base": "c4c012c93228f4613f2641542c732fdbdd0deb48",
+    "removed": {
+      "crates/gam-solve/src/arrow_schur/rational_logdet.rs::conditioning_iteration_bound": 1,
+      "crates/gam-solve/src/arrow_schur/rational_logdet.rs::evaluate_preconditioned": 1,
+      "crates/gam-solve/src/arrow_schur/rational_logdet.rs::iterations": 1,
+      "crates/gam-solve/src/arrow_schur/rational_logdet.rs::krylov_condition_estimate": 1,
+      "crates/gam-solve/src/arrow_schur/rational_logdet.rs::lanczos_tridiagonal": 1,
+      "crates/gam-solve/src/arrow_schur/rational_logdet.rs::relative_residuals": 1,
+      "crates/gam-solve/src/arrow_schur/rational_logdet.rs::ritz_values": 1,
+      "crates/gam-solve/src/arrow_schur/rational_logdet.rs::shifted_pcg_traced": 1,
+      "crates/gam-solve/src/arrow_schur/reduced_solve.rs::is_non_pd_schur_complement": 1,
+      "crates/gam-solve/src/arrow_schur/reduced_solve.rs::ladder_concentration": 1,
+      "crates/gam-solve/src/arrow_schur/reduced_solve.rs::matrix_free_arrow_inverse_apply": 1,
+      "crates/gam-solve/src/arrow_schur/reduced_solve.rs::one_krylov_space_apply_budget": 1,
+      "crates/gam-solve/src/arrow_schur/reduced_solve.rs::reduced_schur_logdet_preconditioner_study": 1,
+      "crates/gam-solve/src/arrow_schur/reduced_solve.rs::reduced_schur_logdet_shift_ladder_profile": 1,
+      "crates/gam-solve/src/arrow_schur/reduced_solve.rs::reduced_schur_shifted_preconditioner_resident": 1,
+      "crates/gam-solve/src/arrow_schur/reduced_solve.rs::resident_schur_elimination_diagonal": 1,
+      "crates/gam-solve/src/arrow_schur/tests.rs::elimination_share_of_the_border_diagonal_is_fixture_dependent_2576": 1,
+      "crates/gam-solve/src/arrow_schur/tests.rs::resident_schur_elimination_diagonal_matches_operator_diagonal_2576": 1
+    },
+    "reason": "Delete the #2576 arrow_schur instruments that only tests reached (0b6aac49b0)",
+    "evidence": "Backfilled under #2829: 0b6aac49b0 removed these 18 public function declarations without a docs/public-api-census-changes.json acknowledgement, and no entry was keyed to its parent c4c012c932. The removed map is scripts/public_api_census.py's own public_functions predicate over the .rs files c4c012c932..0b6aac49b0 changed; files the commit did not change count equally on both sides, so this is the census difference. Measured on MSI: /scratch.global/sauer354/pool/api2829/backfill.measured.json. The same method reproduces the landed maps for 368528959 (4) and b66b773539 (11) exactly (/scratch.global/sauer354/pool/api2829/backfill.control.json)."
+  },
+  {
+    "base": "0b6aac49b0b0fdd362fa95270afbf4f88cd3b938",
+    "removed": {
+      "crates/gam-solve/src/arrow_schur/system.rs::apply_analytic_penalty": 1
+    },
+    "reason": "Land the four edited files c4c012c93 dropped, completing the dead-code fix-forward (aab60e36ac)",
+    "evidence": "Backfilled under #2829: aab60e36ac removed these 1 public function declarations without a docs/public-api-census-changes.json acknowledgement, and no entry was keyed to its parent 0b6aac49b0. The removed map is scripts/public_api_census.py's own public_functions predicate over the .rs files 0b6aac49b0..aab60e36ac changed; files the commit did not change count equally on both sides, so this is the census difference. Measured on MSI: /scratch.global/sauer354/pool/api2829/backfill.measured.json. The same method reproduces the landed maps for 368528959 (4) and b66b773539 (11) exactly (/scratch.global/sauer354/pool/api2829/backfill.control.json)."
   }
 ]
