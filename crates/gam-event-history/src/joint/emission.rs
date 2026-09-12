@@ -10,14 +10,15 @@ pub(super) fn softplus<S: JetField>(x: &S) -> S {
     } else {
         u.exp().ln_1p()
     };
-    let s = if u >= 0.0 {
-        1.0 / (1.0 + (-u).exp())
+    let tail = (-u.abs()).exp();
+    let small = tail / (1.0 + tail);
+    let (s, complement) = if u >= 0.0 {
+        (1.0 / (1.0 + tail), small)
     } else {
-        let e = u.exp();
-        e / (1.0 + e)
+        (small, 1.0 / (1.0 + tail))
     };
-    let d = s * (1.0 - s);
-    x.compose_unary([value, s, d, d * (1.0 - 2.0 * s), d * (1.0 - 6.0 * d)])
+    let d = s * complement;
+    x.compose_unary([value, s, d, d * (complement - s), d * (1.0 - 6.0 * d)])
 }
 
 pub(super) fn expm1<S: JetField>(x: &S) -> S {
@@ -340,6 +341,17 @@ pub(super) fn log_density<S: JetField>(
 mod tests {
     use super::*;
     use crate::scalar::Mixed;
+
+    #[test]
+    fn softplus_preserves_positive_tail_curvature() {
+        for value in [40.0_f64, 100.0, 700.0] {
+            let positive = softplus(&Mixed::seed(value, 1.0, 1.0));
+            let negative = softplus(&Mixed::seed(-value, 1.0, 1.0));
+            assert!(positive.uv > 0.0);
+            assert_eq!(positive.uv, negative.uv);
+            assert!((positive.uv / (-value).exp() - 1.0).abs() < 1.0e-14);
+        }
+    }
 
     fn compare(family: &MeasurementFamily, y: f64, eta: f64, shape: &[f64]) {
         let analytic = location_derivatives(family, y, eta, shape).unwrap();
