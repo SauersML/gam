@@ -144,7 +144,7 @@ jobs:
           # the streaming loop and exit 0. Turn `-e` OFF: per-test failures are
           # the expected, tolerated outcome here; we classify and stream them.
           set +e -u -o pipefail
-          pass=0; metricoff=0; gamerr=0; referr=0; testerr=0; bf=0
+          pass=0; metricoff=0; gamerr=0; referr=0; testerr=0; bf=0; timeouterr=0
           # REF_ERROR among comparators the job GUARANTEES are installed (the
           # install-reference-tools action hard-fails if mgcv/gamlss/survival do
           # not load). For those tests a lost reference is a genuine breakage, not the
@@ -198,6 +198,76 @@ jobs:
           if [ "$measured" -eq 1 ]; then
             printf '%s\n' "${tests[@]}" > "$OUT/quality_cases.txt"
           fi
+          # PER-CASE BOUND. SPEC permits deadlines in tests, and libtest has none per
+          # test, so one non-terminating case used to consume the whole job: run
+          # 34646487573 spent over 5 hours inside case 86/433
+          # (multinomial_recovers_decision_boundary_on_held_out_split) until GitHub's
+          # 6-hour job limit cancelled the run; 347 cases never executed and nothing
+          # was published. The bound is the one this repo already states for every
+          # test in `.config/nextest.toml`: the default profile's `slow-timeout`
+          # (period x terminate-after), the first `[[profile.default.overrides]]`
+          # exemption whose filter names the case, and `[profile.issue-1082]` for the
+          # #1082 acceptance binary. An override this runner cannot evaluate refuses
+          # the run instead of applying a bound nextest would not.
+          # Every case that has a binary to execute gets a bound, whether or not
+          # the other target enumerated: `measured` drops to 0 when EITHER binary is
+          # missing while the surviving target's cases still run below.
+          declare -A test_bound
+          for t in "${tests[@]}"; do
+            if [ -z "${test_binary[$t]}" ]; then
+              continue
+            elif [[ "${test_binary[$t]}" == */quality_1082-* ]]; then
+              printf 'quality_1082\t%s\n' "$t"
+            else
+              printf 'quality\t%s\n' "$t"
+            fi
+          done > "$OUT/quality_case_targets.tsv"
+          if ! python3 - "$OUT/quality_case_targets.tsv" > "$OUT/quality_case_bounds.tsv" <<'PY'
+          import re
+          import sys
+          import tomllib
+
+          with open(".config/nextest.toml", "rb") as handle:
+              profiles = tomllib.load(handle)["profile"]
+
+
+          def bound_seconds(timeout, where):
+              if not (isinstance(timeout, dict) and "period" in timeout and "terminate-after" in timeout):
+                  raise SystemExit(f"{where}: slow-timeout {timeout!r} has no terminate-after, so nextest never kills there")
+              period = re.fullmatch(r"(\d+)s", timeout["period"])
+              if period is None:
+                  raise SystemExit(f"{where}: period {timeout['period']!r} is not a whole number of seconds")
+              return int(period.group(1)) * int(timeout["terminate-after"])
+
+
+          default_bound = bound_seconds(profiles["default"]["slow-timeout"], "profile.default")
+          issue_1082_bound = bound_seconds(profiles["issue-1082"]["slow-timeout"], "profile.issue-1082")
+          overrides = []
+          for index, override in enumerate(profiles["default"].get("overrides", [])):
+              if "slow-timeout" not in override:
+                  continue
+              where = f"profile.default.overrides[{index}]"
+              pattern = re.fullmatch(r"test\(/(.*)/\)", override["filter"])
+              if pattern is None:
+                  raise SystemExit(f"{where}: filter {override['filter']!r} is not a test(/regex/) filter")
+              overrides.append((re.compile(pattern.group(1)), bound_seconds(override["slow-timeout"], where)))
+
+          with open(sys.argv[1]) as handle:
+              for line in handle:
+                  target, test = line.rstrip("\n").split("\t", 1)
+                  if target == "quality_1082":
+                      bound = issue_1082_bound
+                  else:
+                      bound = next((seconds for regex, seconds in overrides if regex.search(test)), default_bound)
+                  print(f"{test}\t{bound}")
+          PY
+          then
+            echo "::error::could not derive per-case bounds from .config/nextest.toml; refusing to run the suite unbounded"
+            exit 1
+          fi
+          while IFS=$'\t' read -r bounded_test bound_s; do
+            test_bound["$bounded_test"]="$bound_s"
+          done < "$OUT/quality_case_bounds.tsv"
           N=${#tests[@]}; i=0
           # Tab-separated, one header row, FULL (un-truncated) metric column so
           # every captured quality figure for every test is preserved verbatim.
@@ -221,6 +291,8 @@ jobs:
             echo "  (R/Python package, system lib, namespace, or its script) — not gam."
             echo "- \`TEST_ERROR\` — the test/harness setup is wrong (bad data, missing"
             echo "  fixture, mismatched column lengths) — fix the test, not gam."
+            echo "- \`TIMEOUT\` — the case ran past its per-test bound from"
+            echo "  \`.config/nextest.toml\` and was stopped before libtest reported (no verdict)."
             echo ""
             echo "Full per-test logs + an un-truncated metric TSV + a JSONL stream are"
             echo "in the \`quality-results\` artifact."
@@ -249,15 +321,12 @@ jobs:
               echo "no executable binary found for grouped quality target — the build step could not compile it" > "$log"
             else
               # Execute the pre-built binary directly — no cargo, no rebuild.
-              # Production convergence remains a mathematical certificate;
-              # the test harness also measures the issue's runtime contract.
-              run_prefix=()
-              if [[ "$bin" == */quality_1082-* ]]; then
-                # SPEC permits test deadlines. This population retains #1082's
-                # original 360-second acceptance budget.
-                run_prefix=(timeout 360s)
-              fi
-              "${run_prefix[@]}" "$bin" --exact "$t" --nocapture --test-threads=1 > "$log" 2>&1
+              # Production convergence remains a mathematical certificate; the
+              # harness bounds each case by its per-case bound derived above (the
+              # #1082 binary keeps its 360-second acceptance budget through
+              # `[profile.issue-1082]`). `timeout` signals the case's whole process
+              # group, so a comparator child the case spawned is stopped with it.
+              "timeout" "${test_bound[$t]}s" "$bin" --exact "$t" --nocapture --test-threads=1 > "$log" 2>&1
               rc=$?
             fi
             dur=$((SECONDS-start))
@@ -330,6 +399,14 @@ jobs:
               cause=build; reason=$(head -1 "$log"); bf=$((bf+1))
             elif [ "$rc" -eq 0 ]; then
               outcome=PASS; cause=ok; reason=""; pass=$((pass+1))
+            elif [ "$rc" -eq 124 ]; then
+              # `timeout` stopped the case at its per-case bound before libtest
+              # reported. No verdict exists, so a partial log's panic text or
+              # reference marker is not evidence of anything; the one known fact is
+              # that the case ran past the repo's own per-test hang threshold.
+              outcome=TIMEOUT; cause=per_test_bound
+              reason="exceeded the ${test_bound[$t]}s per-case bound from .config/nextest.toml"
+              timeouterr=$((timeouterr+1))
             elif [ -n "$refmarker" ]; then
               outcome=REF_ERROR; cause=reference_tool; reason="$refmarker"; referr=$((referr+1))
               # If the lost reference is one the job guarantees present, this REF_ERROR
@@ -453,9 +530,10 @@ jobs:
             echo "| REF_ERROR | $referr | reference tool failed or missing |"
             echo "| TEST_ERROR | $testerr | test/harness setup defect |"
             echo "| BUILDFAIL | $bf | did not compile |"
+            echo "| TIMEOUT | $timeouterr | stopped at its per-test bound (\`.config/nextest.toml\`) |"
             echo "| **total** | **$N** | |"
           } >> "$GITHUB_STEP_SUMMARY"
-          echo "pass=$pass metric_off=$metricoff gam_error=$gamerr ref_error=$referr test_error=$testerr build_fail=$bf (of $N)"
+          echo "pass=$pass metric_off=$metricoff gam_error=$gamerr ref_error=$referr test_error=$testerr build_fail=$bf timeout=$timeouterr (of $N)"
           # GATE the pipeline. The suite is the ONLY end-to-end measurement of gam
           # quality vs the mature standard tools; if it cannot go red, every quality
           # regression lands on main silently (the #1087 meta-bug). We ran ALL N
@@ -468,13 +546,14 @@ jobs:
           #   GAM_ERROR   gam fit crashed / refused / failed to converge
           #   TEST_ERROR  test/harness setup defect
           #   BUILDFAIL   did not compile
+          #   TIMEOUT     ran past its per-test bound; no verdict at all
           # NOT gated: REF_ERROR — the reference R/Python environment failed or is
           # missing (not a gam result; tracked separately, #1070/#1071). It is
           # reported below but never masks or triggers the gam-side gate.
-          gating=$((metricoff + gamerr + testerr + bf))
+          gating=$((metricoff + gamerr + testerr + bf + timeouterr))
           if [ "$gating" -gt 0 ]; then
             echo ""
-            echo "::error::Reference Quality Suite FAILED: ${gating} test(s) in gating buckets (METRIC_OFF=${metricoff} GAM_ERROR=${gamerr} TEST_ERROR=${testerr} BUILDFAIL=${bf}); REF_ERROR=${referr} not gated."
+            echo "::error::Reference Quality Suite FAILED: ${gating} test(s) in gating buckets (METRIC_OFF=${metricoff} GAM_ERROR=${gamerr} TEST_ERROR=${testerr} BUILDFAIL=${bf} TIMEOUT=${timeouterr}); REF_ERROR=${referr} not gated."
             echo "----- gating failures (outcome  test  reason) -----"
             # Reprint the offending rows from the TSV (skip header; field 2 = outcome).
             awk -F'\t' 'NR>1 && $2!="PASS" && $2!="REF_ERROR" {printf "  %-11s %s\n    %s\n", $2, $4, $10}' "$RES"
@@ -483,7 +562,7 @@ jobs:
               echo ""
               echo "### Gate: FAILED"
               echo ""
-              echo "${gating} test(s) in gating buckets (METRIC_OFF/GAM_ERROR/TEST_ERROR/BUILDFAIL)."
+              echo "${gating} test(s) in gating buckets (METRIC_OFF/GAM_ERROR/TEST_ERROR/BUILDFAIL/TIMEOUT)."
               echo "REF_ERROR (${referr}) is reference-environment, not gated."
             } >> "$GITHUB_STEP_SUMMARY"
             exit 1
