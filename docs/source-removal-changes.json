@@ -3822,5 +3822,22 @@
     ],
     "reason": "SPEC rule 5 (#2901 V14). fit_tensor_surface penalized the tensor coefficients (a ridge on vec(C)) instead of the surface. It now penalizes the surface's function mass over the code sample, whose REML weight has a closed form, so the certified log-λ search and its local KktKind boundary/stationary classifier are deleted with it.",
     "evidence": "KktKind here was a function-local enum inside fit_tensor_surface, used only by that function's search-certificate match, which this change removes. git grep -c -w KktKind at the base finds 7 lines each in crates/gam-terms/src/structure/anova_atom.rs, crates/gam-terms/src/grid_spline_2d.rs and crates/gam-solve/src/residual_cascade.rs. The other two files declare their own local KktKind and are unchanged. No other declaration is removed from anova_atom.rs and no public item is removed. Compile is covered by the lead's shared tip check."
+  },
+  {
+    "base": "2c98b1fcc44ecc1368d8928609526b6847ac62e9",
+    "items": [
+      "crates/gam-models/src/fit_orchestration/drivers/smooth_term_lr.rs:const:SHIPPED",
+      "crates/gam-models/src/fit_orchestration/drivers/smooth_term_lr.rs:const:SMOOTH_LR_SELECTION_GRID_BUDGET",
+      "crates/gam-models/src/fit_orchestration/drivers/smooth_term_lr.rs:const:SMOOTH_LR_SELECTION_LOG_STEP",
+      "crates/gam-models/src/fit_orchestration/drivers/smooth_term_lr.rs:const:SMOOTH_LR_SELECTION_MAX_SCALES",
+      "crates/gam-models/src/fit_orchestration/drivers/smooth_term_lr.rs:const:SMOOTH_LR_SELECTION_REFINE_FLOOR",
+      "crates/gam-models/src/fit_orchestration/drivers/smooth_term_lr.rs:const:SMOOTH_LR_SELECTION_REFINE_MAX_EVALUATIONS",
+      "crates/gam-models/src/fit_orchestration/drivers/smooth_term_lr.rs:fn:the_descent_reaches_a_grid_it_cannot_afford_2672",
+      "crates/gam-models/src/fit_orchestration/drivers/smooth_term_lr.rs:fn:zz_probe_multiscale_grid_budget_moves_the_selected_law_2672",
+      "crates/gam-models/src/fit_orchestration/drivers/smooth_term_lr.rs:struct:CommonScaleCriterion",
+      "crates/gam-models/src/fit_orchestration/drivers/smooth_term_lr.rs:struct:MultiscaleBudget"
+    ],
+    "reason": "SPEC rules 18, 19 and 22 (#2902): the smooth-term LR null replay's multi-scale lane now selects each draw's lambda-hat by a coordinatewise certified descent over exact axis slices (AxisSlice, select_draw). It no longer uses a 441-point bracket grid followed by a compass search capped at 96 evaluations that kept a capped draw's best point.",
+    "evidence": "At the base, git grep -n finds SMOOTH_LR_SELECTION_LOG_STEP, SMOOTH_LR_SELECTION_REFINE_FLOOR, SMOOTH_LR_SELECTION_REFINE_MAX_EVALUATIONS, SMOOTH_LR_SELECTION_MAX_SCALES, MultiscaleBudget and its SHIPPED constant only in crates/gam-models/src/fit_orchestration/drivers/smooth_term_lr.rs. SMOOTH_LR_SELECTION_GRID_BUDGET appears there and in one CHANGELOG.md sentence. They parameterized the bracket grid, the capped compass descent and the scale cut-off of SmoothLrSelectionReplay::generate_multiscale, and this change replaces all three. CommonScaleCriterion is renamed DiagonalCriterion because it now also carries an axis slice's Occam spectrum; its methods keep their names. the_descent_reaches_a_grid_it_cannot_afford_2672 and zz_probe_multiscale_grid_budget_moves_the_selected_law_2672 measured that grid budget against a 161x161 grid. No grid remains, so they are replaced by an_axis_slice_is_the_criterion_along_its_axis_2902 and multiscale_selection_is_a_coordinatewise_certified_minimum_2902. The item list applies source_removal_guard.py's ITEM regex by hand, and the guard was not run locally (user directive: no local runs). Compile is covered by the lead's shared tip check."
   }
 ]

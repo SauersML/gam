@@ -166,8 +166,8 @@ pub struct SmoothLrSelectionReplay {
     /// the fitted scale, ascending. `t = 1` is the fit.
     ///
     /// It is published on EVERY lane. The multi-scale lane used to leave it
-    /// empty — its samples come from a grid whose basis moves with `t`, so it
-    /// has no single diagonalizing spectrum to report *per grid point* — but the
+    /// empty — its draws select points whose basis moves with `t`, so it has no
+    /// single diagonalizing spectrum to report *per selected point* — but the
     /// FITTED point always has one, it is the object the whole replay is built
     /// on, and a consumer asking what was replayed is asking about that. An
     /// empty vector there was an accident of which lane ran, not a statement
@@ -217,114 +217,16 @@ impl PartialEq for SmoothLrSelectionReplay {
 /// common-scale lane.
 const SMOOTH_LR_SELECTION_DRAWS: usize = 4096;
 
-/// Resolution floor of the MULTI-SCALE lane's descent in `ln t`.
-///
-/// The common-scale lane no longer reads it: each of its draws selects the
-/// certified global minimum of a closed-form criterion. `0.05` in `ln t` is a 5%
-/// change in `λ`, which moves `w_k = 1 − (tν_k/(1+tν_k))²` by at most `0.025` in
-/// the worst direction. The multi-scale lane's grid bracket and capped compass
-/// descent are still a SPEC rule 18/19 violation (#2902, table row 4).
-const SMOOTH_LR_SELECTION_LOG_STEP: f64 = 0.05;
-
-/// Total points the multi-scale BRACKET may spend, whatever `m` is.
-///
-/// This grid does not have to RESOLVE the selection — the per-draw descent in
-/// [`SmoothLrSelectionReplay::generate_multiscale`] does that — it has to find
-/// the basin each draw's minimum lives in. That is what makes a budget on the
-/// total sane: each axis gets `budget^(1/m)` points, the cost stays independent
-/// of `m`, and what degrades with `m` is the bracket's reach rather than the
-/// answer's accuracy.
-///
-/// It used to be the whole selection, and it could not carry that: at `m = 2`
-/// this is 21 points per axis over a window the box opens to 60 wide, a spacing
-/// of `3.0` in `ln λ` against the `0.05` the one-dimensional lane commits to.
-/// Measured on a whitened bending+ridge pair at the separations a null-true
-/// smooth reaches, the law that grid generates is short of the converged one by
-/// `15%` in the mean and `23%` at `q95` — see the descent's own documentation
-/// for the table.
-///
-/// `121` reproduces the same answer once the descent runs (measured, same
-/// fixture, to `0.3%`); `441` is kept because the bracket's only remaining job
-/// is not to miss a basin, and at `0.07 s` per term it is not what the replay
-/// costs.
-const SMOOTH_LR_SELECTION_GRID_BUDGET: usize = 441;
-
 /// Draws for the multi-scale replay.
 ///
 /// Fewer than the one-dimensional path's, and the reason is arithmetic rather
-/// than a different accuracy target: a one-dimensional grid point costs `O(q)`
-/// per draw because the whole problem is diagonal there, and a multi-scale one
-/// costs `O(q²)` because it is not. At `q ≈ 11` and a `441`-point grid this is
-/// about `0.1 s` per term, and the standard error it leaves is measured and
-/// published per query — a coarser replay that says how coarse it is beats a
-/// finer one nobody can afford to run.
+/// than a different accuracy target: a common-scale draw is ONE certified 1-D
+/// search over a criterion diagonalized once per term, and a multi-scale draw is
+/// a sweep of them, each over an [`AxisSlice`] whose diagonalizing basis has to
+/// be re-derived at the draw's current point. The standard error it leaves is
+/// measured and published per query — a coarser replay that says how coarse it
+/// is beats a finer one nobody can afford to run.
 const SMOOTH_LR_MULTISCALE_DRAWS: usize = 2048;
-
-/// The finest `ln t` the multi-scale refinement resolves.
-///
-/// It is [`SMOOTH_LR_SELECTION_LOG_STEP`] — the same resolution the
-/// one-dimensional lane commits to, and for the same reason: `0.05` in `ln t`
-/// moves a weight `w_k = 1 − (tν_k/(1 + tν_k))²` by at most `0.025`. The
-/// multi-scale lane reaches it by descending rather than by gridding, because a
-/// grid at that step over the box the solver leaves a railed `λ̂` is `10²⁴`
-/// points per axis.
-const SMOOTH_LR_SELECTION_REFINE_FLOOR: f64 = SMOOTH_LR_SELECTION_LOG_STEP;
-
-/// Criterion evaluations one draw's refinement may spend.
-///
-/// A compass search that halves its step whenever a sweep fails needs
-/// `log2(coarse_step / floor)` failed sweeps — about `7` at the widest window
-/// the box allows — plus the accepted moves in between, at `2m` evaluations per
-/// sweep. `96` covers that with room for a descent that keeps moving, and
-/// bounds the refinement at roughly a fifth of what the coarse grid already
-/// costs per draw. A draw that hits the cap keeps the best point it reached:
-/// the refinement only ever LOWERS a draw's criterion, so the budget trades
-/// resolution for time and never correctness.
-const SMOOTH_LR_SELECTION_REFINE_MAX_EVALUATIONS: usize = 96;
-
-/// What the multi-scale replay may spend, and how finely it resolves the
-/// selection it is replaying.
-///
-/// It is a value rather than three constants read at the use site because the
-/// two halves trade against each other — a coarse bracket that is refined
-/// resolves better than a fine bracket that is not, at a fraction of the cost —
-/// and that trade is only arguable if it is measurable.
-/// [`MultiscaleBudget::SHIPPED`] is what production uses;
-/// `zz_probe_multiscale_grid_budget_moves_the_selected_law_2672` sweeps both
-/// halves against it.
-#[derive(Clone, Copy)]
-struct MultiscaleBudget {
-    /// Total points the bracketing grid may spend, whatever `m` is.
-    grid: usize,
-    /// Finest `ln t` the per-draw refinement resolves.
-    ///
-    /// `f64::INFINITY` turns the refinement off entirely, which is the arm the
-    /// probe measures the bracket alone at.
-    refine_floor: f64,
-    /// Criterion evaluations one draw's refinement may spend.
-    refine_evaluations: usize,
-}
-
-impl MultiscaleBudget {
-    const SHIPPED: Self = Self {
-        grid: SMOOTH_LR_SELECTION_GRID_BUDGET,
-        refine_floor: SMOOTH_LR_SELECTION_REFINE_FLOOR,
-        refine_evaluations: SMOOTH_LR_SELECTION_REFINE_MAX_EVALUATIONS,
-    };
-}
-
-/// Scales past which the budget above would leave fewer than five points per
-/// axis — a spacing of about `15` in `ln λ` over the solver's box.
-///
-/// What that number bounds is the BRACKET, not the resolution: the per-draw
-/// descent resolves `ln t` to `0.05` on however many axes it is given, so this
-/// cut-off is the point at which the grid can no longer be trusted to put a
-/// draw in the right BASIN — five nodes over a 60-wide window is a coin toss
-/// about which minimum the descent then walks into, and a descent started in
-/// the wrong basin is worse than an honest slice. A term with more scales than
-/// this falls back to the common-scale slice, and says so in its provenance
-/// rather than pretending to a replay it did not do.
-const SMOOTH_LR_SELECTION_MAX_SCALES: usize = 4;
 
 /// The term's penalty geometry in the basis the replay's criterion lives in:
 /// whitened by the Schur-complemented information and factored into ROOTS.
@@ -373,7 +275,7 @@ const SMOOTH_LR_SELECTION_MAX_SCALES: usize = 4;
 ///
 /// So the geometry is carried as `R_i` with `R_iᵀ R_i = Wᵀ S_i W` for the
 /// term's λ-FREE components, plus their `ρ̂_i` and the structural rank of their
-/// SUM. Everything the replay needs at a grid point — the eigenbasis, the
+/// SUM. Everything the replay needs at a point — the eigenbasis, the
 /// shares, the statistic's weights and the criterion's log-determinant — is then
 /// one thin SVD of the stacked scaled roots.
 ///
@@ -416,6 +318,12 @@ struct SelectionGeometry {
     /// its triangular factor a pseudo-determinant rather than an approximation
     /// to one.
     range_roots: Vec<Array2<f64>>,
+    /// `rank(Σ_{j≠i} Wᵀ S_j W)` for each component `i`, from the same UNIT
+    /// stacked roots and the same bar as `rank`. The other `rank −
+    /// complement_rank[i]` directions of `range(T)` are reached by component `i`
+    /// alone, and an [`AxisSlice`] prices them as exact linear terms rather than
+    /// asking a floating-point cosine whether it is zero.
+    complement_rank: Vec<usize>,
 }
 
 /// The criterion and the statistic at one `t`, WITHOUT an eigenbasis.
@@ -423,10 +331,10 @@ struct SelectionGeometry {
 /// # Why a second evaluator exists beside [`SelectionGeometry::at`]
 ///
 /// `at` returns the full eigensystem, which is the right object when every draw
-/// is asked about the same grid point: one `O(q³)` decomposition is amortized
-/// over thousands of `O(q²)` projections. The per-draw REFINEMENT inverts that
-/// ratio — one draw per point — and an eigendecomposition per draw per step is
-/// twenty times the arithmetic the answer needs, in allocations as much as in
+/// is asked about the same point: one `O(q³)` decomposition is amortized over
+/// thousands of `O(q²)` projections. The multi-scale lane inverts that ratio —
+/// each draw ends at its own selected point — and an eigendecomposition per draw
+/// is twenty times the arithmetic the answer needs, in allocations as much as in
 /// flops.
 ///
 /// Everything the replay reads at a point is available from two triangular
@@ -543,10 +451,8 @@ impl SelectionGeometry {
         let (_, unit_singular, unit_right) =
             gam_linalg::faer_ndarray::FaerSvd::svd(&unit, false, true).ok()?;
         let unit_largest = unit_singular.iter().copied().fold(0.0_f64, f64::max);
-        let rank = unit_singular
-            .iter()
-            .filter(|&&value| value > unit_largest * (dimension as f64) * f64::EPSILON * 100.0)
-            .count();
+        let bar = unit_largest * (dimension as f64) * f64::EPSILON * 100.0;
+        let rank = unit_singular.iter().filter(|&&value| value > bar).count();
         if rank == 0 {
             return None;
         }
@@ -566,6 +472,26 @@ impl SelectionGeometry {
         }
         let range_roots: Vec<Array2<f64>> =
             roots.iter().map(|root| root.dot(&range_basis)).collect();
+        // Which directions a component reaches alone is structural, so it is read
+        // off the λ-free roots once, at the bar that decided `rank`.
+        let mut complement_rank = Vec::with_capacity(roots.len());
+        for axis in 0..roots.len() {
+            let others: Vec<Array2<f64>> = roots
+                .iter()
+                .enumerate()
+                .filter(|&(component, _)| component != axis)
+                .map(|(_, root)| root.clone())
+                .collect();
+            let rows = others.iter().map(|root| root.nrows()).sum::<usize>();
+            if rows == 0 {
+                complement_rank.push(0);
+                continue;
+            }
+            let complement = stack_roots(&others, &vec![0.0; others.len()], rows.max(dimension));
+            let (_, singular, _) =
+                gam_linalg::faer_ndarray::FaerSvd::svd(&complement, false, false).ok()?;
+            complement_rank.push(singular.iter().filter(|&&value| value > bar).count());
+        }
         Some(Self {
             roots,
             log_lambda: log_lambda.to_vec(),
@@ -574,6 +500,7 @@ impl SelectionGeometry {
             stacked_rows: stacked_rows.max(dimension),
             range_basis,
             range_roots,
+            complement_rank,
         })
     }
 
@@ -838,6 +765,41 @@ fn householder_triangularize(matrix: &mut Array2<f64>, diagonal: &mut [f64]) -> 
     log_determinant.is_finite().then_some(log_determinant)
 }
 
+/// The thin orthonormal factor `Q` (`n × r`) of the reduction
+/// [`householder_triangularize`] left in `reduced`, so that `M = QR`.
+///
+/// The reflectors are still in place — column `j` from its diagonal cell down,
+/// the cell holding `x_j − α_j` — and `Q = H_0 ⋯ H_{r−1} [I; 0]` applies them in
+/// reverse. Forming `Q` this way keeps it orthonormal to working precision,
+/// which `M R⁻¹` would not once `R` carries the λ ratio.
+fn householder_thin_q(reduced: &Array2<f64>) -> Array2<f64> {
+    let (rows, columns) = reduced.dim();
+    let mut orthonormal = Array2::<f64>::zeros((rows, columns));
+    for index in 0..columns.min(rows) {
+        orthonormal[[index, index]] = 1.0;
+    }
+    for pivot in (0..columns).rev() {
+        let mut reflector_squared = 0.0_f64;
+        for row in pivot..rows {
+            reflector_squared += reduced[[row, pivot]] * reduced[[row, pivot]];
+        }
+        if reflector_squared <= 0.0 {
+            continue;
+        }
+        for column in 0..columns {
+            let mut inner = 0.0_f64;
+            for row in pivot..rows {
+                inner += reduced[[row, pivot]] * orthonormal[[row, column]];
+            }
+            let scale = 2.0 * inner / reflector_squared;
+            for row in pivot..rows {
+                orthonormal[[row, column]] -= scale * reduced[[row, pivot]];
+            }
+        }
+    }
+    orthonormal
+}
+
 /// `[√(e^{s_0}) R_0; √(e^{s_1}) R_1; …]`, zero-padded to `rows`.
 ///
 /// The scale is applied as `exp(s/2)` rather than as `sqrt(exp(s))` so a `λ̂` at
@@ -945,13 +907,14 @@ pub enum SmoothLrSelectionDecline {
     /// the solver's `ρ` box at once, so there was no `λ` it could have chosen
     /// instead.
     WindowClosed,
-    /// A grid point could not be evaluated, so the replay would have been taken
-    /// over a grid with a hole in it. Refused whole rather than sampled partial.
+    /// The fitted point `ln t = 0` could not be evaluated, so there is no
+    /// conditional arm to pair the selection with. Refused whole rather than
+    /// sampled partial.
     GridRefused,
     /// A draw's certified global minimization of its criterion could not resolve
-    /// the criterion's stationary structure, or the criterion was not evaluable
-    /// inside the window, so that draw has no selection. Refused whole rather
-    /// than sampled partial.
+    /// the criterion's stationary structure, the criterion was not evaluable
+    /// inside the window, or an axis slice of it could not be priced, so that
+    /// draw has no selection. Refused whole rather than sampled partial.
     SelectionUnresolved,
 }
 
@@ -969,35 +932,40 @@ impl SmoothLrSelectionDecline {
     }
 }
 
-/// One draw's COMMON-SCALE criterion in `u = ln t`, diagonal in the fitted
-/// eigenbasis `ν_j = eig T(1)`:
+/// One draw's criterion along ONE log-scale coordinate `u`, diagonal in a basis
+/// that does not move with `u`:
 ///
 /// ```text
-/// C(u) = Σ_j c_j² s_j(u) + Σ_j ln(1 + e^u ν_j) − r·u − Σ_{j<r} ln ν_j,
+/// C(u) = Σ_j c_j² s_j(u) + Σ_j ln(1 + e^u ν_j) − r·u − Σ_k ln(1 + e^u μ_k) − const,
 /// s_j(u) = e^u ν_j / (1 + e^u ν_j),
 /// ```
 ///
-/// with `c_j²` the draw's squared coordinates and `r` the structural rank (the
-/// log-determinant runs over EVERY direction: an unpenalized one has `ν = 0` and
-/// carries `ln 1 = 0`). With `g_j = s_j(1 − s_j)` every derivative is closed
-/// form,
+/// Both replay lanes select through it. On the COMMON-SCALE lane every scale
+/// moves together, `T(t) = t·T(1)`, so `ν_j = eig T(1)`, `c_j` are the draw's
+/// coordinates in that eigenbasis, `r` is the structural rank, `const` is
+/// `Σ_{j<r} ln ν_j` and there is no `μ` (the log-determinant runs over EVERY
+/// direction: an unpenalized one has `ν = 0` and carries `ln 1 = 0`). On an
+/// [`AxisSlice`] only one scale moves, and `μ` carries the directions that scale
+/// shares with the others through `log|T(u)|₊`. With `g = s(1 − s)` for either
+/// spectrum every derivative is closed form,
 ///
 /// ```text
-/// C′ = Σ_j c_j² g_j + Σ_j s_j − r,
-/// C″ = Σ_j c_j² g_j(1 − 2s_j) + Σ_j g_j,
-/// C‴ = Σ_j c_j² g_j(1 − 6s_j + 6s_j²) + Σ_j g_j(1 − 2s_j),
+/// C′ = Σ_j c_j² g_j + Σ_j s_j − r − Σ_k s_k(μ),
+/// C″ = Σ_j c_j² g_j(1 − 2s_j) + Σ_j g_j − Σ_k g_k(μ),
+/// C‴ = Σ_j c_j² g_j(1 − 6s_j + 6s_j²) + Σ_j g_j(1 − 2s_j) − Σ_k g_k(μ)(1 − 2s_k(μ)),
 /// ```
 ///
-/// and every `s_j` increases with `u`, so a cell's derivative and curvature ranges
+/// and every share increases with `u`, so a cell's derivative and curvature ranges
 /// follow from its two endpoint shares and the stationary points of the share
 /// polynomials (`g` peaks at `s = ½`, `g(1 − 2s)` is extremal at
-/// `s = (3 ∓ √3)/6`). That is what lets the replay take each draw's selection as
-/// the certified global minimum of its criterion over the window,
-/// through [`gam_math::score_opt::maximize_score_1d`].
-struct CommonScaleCriterion<'a> {
+/// `s = (3 ∓ √3)/6`). That is what lets the replay take each selection as the
+/// certified global minimum of its criterion over the window, through
+/// [`gam_math::score_opt::maximize_score_1d`].
+struct DiagonalCriterion<'a> {
     squares: &'a [f64],
     generalized: &'a [f64],
     rank: usize,
+    occam: &'a [f64],
     constant: f64,
 }
 
@@ -1015,7 +983,7 @@ fn share_polynomial_range(lo: f64, hi: f64, f: impl Fn(f64) -> f64, stationary: 
     range
 }
 
-impl CommonScaleCriterion<'_> {
+impl DiagonalCriterion<'_> {
     /// `[C, C′, C″, C‴]` at `u`, and the forward-error band of `C` (Higham's
     /// accumulation bound over its summands). `None` when `e^u ν_j` overflows.
     fn jet(&self, log_t: f64) -> Option<([f64; 4], f64)> {
@@ -1042,7 +1010,24 @@ impl CommonScaleCriterion<'_> {
             third += square * spread * (1.0 - 6.0 * share + 6.0 * share * share)
                 + spread * (1.0 - 2.0 * share);
         }
-        let band = gam_linalg::roundoff::accumulation_band(4 * self.squares.len() + 2, magnitude);
+        for &mu in self.occam {
+            let scaled = t * mu;
+            if !scaled.is_finite() {
+                return None;
+            }
+            let share = scaled / (1.0 + scaled);
+            let spread = share * (1.0 - share);
+            let log_term = scaled.ln_1p();
+            value -= log_term;
+            magnitude += log_term.abs();
+            first -= share;
+            second -= spread;
+            third -= spread * (1.0 - 2.0 * share);
+        }
+        let band = gam_linalg::roundoff::accumulation_band(
+            4 * self.squares.len() + 3 * self.occam.len() + 2,
+            magnitude,
+        );
         Some(([value, first, second, third], band))
     }
 
@@ -1086,7 +1071,25 @@ impl CommonScaleCriterion<'_> {
             first_magnitude += square * spread_hi.abs().max(spread_lo.abs()) + share_hi.abs();
             second_magnitude += square * skew_hi.abs().max(skew_lo.abs()) + spread_hi.abs();
         }
-        let terms = 4 * self.squares.len() + 1;
+        // The Occam spectrum enters with a MINUS sign, so its share range
+        // subtracts crosswise: its largest share lowers the derivative's floor.
+        for &mu in self.occam {
+            let (scaled_a, scaled_b) = (t_a * mu, t_b * mu);
+            if !(scaled_a.is_finite() && scaled_b.is_finite()) {
+                return None;
+            }
+            let share_lo = scaled_a / (1.0 + scaled_a);
+            let share_hi = scaled_b / (1.0 + scaled_b);
+            let (spread_lo, spread_hi) =
+                share_polynomial_range(share_lo, share_hi, |s| s * (1.0 - s), &spread_stationary);
+            first_lo -= share_hi;
+            first_hi -= share_lo;
+            second_lo -= spread_hi;
+            second_hi -= spread_lo;
+            first_magnitude += share_hi.abs();
+            second_magnitude += spread_hi.abs().max(spread_lo.abs());
+        }
+        let terms = 4 * self.squares.len() + 3 * self.occam.len() + 1;
         let first_band = gam_linalg::roundoff::accumulation_band(terms, first_magnitude);
         let second_band = gam_linalg::roundoff::accumulation_band(terms, second_magnitude);
         Some((
@@ -1170,6 +1173,210 @@ impl CommonScaleCriterion<'_> {
     }
 }
 
+/// One draw's multi-scale criterion along ONE scale's coordinate, with every
+/// other scale held at the draw's current point, in the diagonal form
+/// [`DiagonalCriterion`] certifies.
+///
+/// # The slice is exact, not a local model
+///
+/// In the range basis, with `u` the moving coordinate,
+/// `C(u) = B + e^u A`, `A = λ̂_i Uᵀ S̃_i U` and `B` the other scales at their
+/// current `t_j`. The criterion is `vᵀDv + log|I + C| − log|C|` with
+/// `D = (I + C)⁻¹C` (see [`SelectionFactor`]), and each half diagonalizes in `u`:
+///
+/// * **Data and `log|I + C|`.** `I + B = LLᵀ` and `L⁻¹AL⁻ᵀ = V diag(ν) Vᵀ`, so
+///   `I + C(u) = LV(I + e^u ν)VᵀLᵀ`. With `h = VᵀL⁻¹v`,
+///   `vᵀDv = const + Σ_j h_j² s_j(u)` and
+///   `log|I + C(u)| = log|I + B| + Σ_j ln(1 + e^u ν_j)`. This half is benign in the
+///   sense [`SelectionFactor`] documents, so `I + B` is assembled and `ν` is read
+///   off the singular values of `L⁻¹(A's root)ᵀ`.
+/// * **`log|C|₊`.** Here the conditioning is the whole problem (#2644), so it is
+///   taken from the stacked scaled ROOTS at the current point `x = u_i`,
+///   `M = [B's roots; e^{x/2}·A's root] = QR`, never from an assembled sum. With
+///   `Q = [Q_B; Q_A]` orthonormal, `C(u) = Rᵀ(Q_BᵀQ_B + e^{u−x} Q_AᵀQ_A)R`, and
+///   `Q_BᵀQ_B + Q_AᵀQ_A = I` gives the two blocks common eigenvectors with
+///   eigenvalues `c_k²` and `s_k² = 1 − c_k²` — the cosine–sine decomposition of
+///   `Q`. So `log|C(u)| = log|C(x)| + Σ_k ln(c_k² + e^{u−x} s_k²)`: a direction
+///   with `c = 0` only `A` reaches and contributes `u` exactly (it is counted into
+///   `r`), one with `s = 0` contributes nothing, and every other one is
+///   `ln c_k² + ln(1 + e^u μ_k)` with `μ_k = e^{−x} s_k²/c_k²`.
+///
+/// `c_k` and `s_k` are the singular values of their own blocks, paired by order
+/// (cosines ascending against sines descending), and of each pair the SMALLER
+/// member is the one read from its block: a singular value carries an absolute
+/// error of `ε‖Q‖ = ε`, so the small member keeps digits that `1 − (large)²` would
+/// not. Which directions have `c = 0` is not decided by that arithmetic: it is
+/// `rank − complement_rank[i]`, read once per term off the λ-free roots.
+struct AxisSlice {
+    /// `h_j²`, the draw's squared coordinates in `A`'s basis against `I + B`.
+    squares: Vec<f64>,
+    /// `ν_j`, the spectrum of `A` against `I + B`.
+    generalized: Vec<f64>,
+    /// Directions of `range(C)` only `A` reaches.
+    rank: usize,
+    /// `μ_k`, the directions `A` shares with `B`.
+    occam: Vec<f64>,
+}
+
+impl AxisSlice {
+    /// The slice of the criterion along scale `axis` through `log_t`, for the draw
+    /// whose coordinates in the range basis are `coordinates`. `None` when a
+    /// factorization refuses or a scale overflows: the point cannot be priced.
+    fn new(
+        geometry: &SelectionGeometry,
+        log_t: &[f64],
+        axis: usize,
+        coordinates: &[f64],
+    ) -> Option<Self> {
+        let rank = geometry.rank;
+        if log_t.len() != geometry.range_roots.len()
+            || axis >= log_t.len()
+            || coordinates.len() != rank
+        {
+            return None;
+        }
+        let mut hessian = Array2::<f64>::eye(rank);
+        let mut other_rows = 0usize;
+        for (component, root) in geometry.range_roots.iter().enumerate() {
+            if component == axis {
+                continue;
+            }
+            let scale = (geometry.log_lambda[component] + log_t[component]).exp();
+            if !scale.is_finite() {
+                return None;
+            }
+            hessian.scaled_add(scale, &root.t().dot(root));
+            other_rows += root.nrows();
+        }
+        let lower = gam_linalg::triangular::cholesky_factor_in_place(
+            hessian.view(),
+            gam_linalg::triangular::CholeskyGuard::FiniteStrict,
+        )?;
+        let own_scale = (0.5 * geometry.log_lambda[axis]).exp();
+        if !own_scale.is_finite() {
+            return None;
+        }
+        let own = geometry.range_roots[axis].mapv(|value| own_scale * value);
+        let own_rows = own.nrows();
+        let mut squares = Vec::with_capacity(own_rows);
+        let mut generalized = Vec::with_capacity(own_rows);
+        if own_rows > 0 {
+            let whitened =
+                gam_linalg::triangular::forward_substitution_lower_matrix(&lower, own.t());
+            let mapped =
+                gam_linalg::triangular::forward_substitution_lower_vector(&lower, coordinates);
+            let (left, singular, _) =
+                gam_linalg::faer_ndarray::FaerSvd::svd(&whitened, true, false).ok()?;
+            let left = left?;
+            for (mode, &sigma) in singular.iter().enumerate() {
+                if !(sigma.is_finite() && sigma >= 0.0) {
+                    return None;
+                }
+                let projection = left.column(mode).dot(&mapped);
+                squares.push(projection * projection);
+                generalized.push(sigma * sigma);
+            }
+        }
+
+        let stacked_rows = other_rows + own_rows;
+        if stacked_rows < rank {
+            return None;
+        }
+        let mut stacked = Array2::<f64>::zeros((stacked_rows, rank));
+        let mut offset = 0usize;
+        for (component, root) in geometry.range_roots.iter().enumerate() {
+            if component == axis {
+                continue;
+            }
+            let scale = (0.5 * (geometry.log_lambda[component] + log_t[component])).exp();
+            stacked
+                .slice_mut(ndarray::s![offset..offset + root.nrows(), ..])
+                .assign(&root.mapv(|value| scale * value));
+            offset += root.nrows();
+        }
+        let current = (0.5 * log_t[axis]).exp();
+        if !current.is_finite() {
+            return None;
+        }
+        stacked
+            .slice_mut(ndarray::s![offset.., ..])
+            .assign(&own.mapv(|value| current * value));
+        let mut diagonal = vec![0.0_f64; rank];
+        householder_triangularize(&mut stacked, &mut diagonal)?;
+        let orthonormal = householder_thin_q(&stacked);
+        let mut sines = if own_rows > 0 {
+            gam_linalg::faer_ndarray::FaerSvd::svd(
+                &orthonormal.slice(ndarray::s![other_rows.., ..]),
+                false,
+                false,
+            )
+            .ok()?
+            .1
+            .to_vec()
+        } else {
+            Vec::new()
+        };
+        let mut cosines = if other_rows > 0 {
+            gam_linalg::faer_ndarray::FaerSvd::svd(
+                &orthonormal.slice(ndarray::s![..other_rows, ..]),
+                false,
+                false,
+            )
+            .ok()?
+            .1
+            .to_vec()
+        } else {
+            Vec::new()
+        };
+        sines.sort_by(|a, b| b.total_cmp(a));
+        sines.resize(rank, 0.0);
+        cosines.sort_by(|a, b| a.total_cmp(b));
+        let mut paired_cosines = vec![0.0_f64; rank.saturating_sub(cosines.len())];
+        paired_cosines.extend(cosines);
+
+        let reached_alone = rank.checked_sub(geometry.complement_rank[axis])?;
+        let mut linear = reached_alone;
+        let mut occam = Vec::with_capacity(rank - reached_alone);
+        let inverse_current = (-log_t[axis]).exp();
+        for mode in reached_alone..rank {
+            let (sine, cosine) = (sines[mode], paired_cosines[mode]);
+            let (sine_squared, cosine_squared) = if sine <= cosine {
+                (sine * sine, 1.0 - sine * sine)
+            } else {
+                (1.0 - cosine * cosine, cosine * cosine)
+            };
+            if !(sine_squared > 0.0) {
+                continue;
+            }
+            if !(cosine_squared > 0.0) {
+                linear += 1;
+                continue;
+            }
+            let scaled = inverse_current * sine_squared / cosine_squared;
+            if !scaled.is_finite() {
+                return None;
+            }
+            occam.push(scaled);
+        }
+        Some(Self {
+            squares,
+            generalized,
+            rank: linear,
+            occam,
+        })
+    }
+
+    fn criterion(&self) -> DiagonalCriterion<'_> {
+        DiagonalCriterion {
+            squares: &self.squares,
+            generalized: &self.generalized,
+            rank: self.rank,
+            occam: &self.occam,
+            constant: 0.0,
+        }
+    }
+}
+
 /// The λ̂-selection replay, or the named reason there is none.
 ///
 /// This is an enum rather than an `Option` so that a consumer cannot read
@@ -1238,8 +1445,8 @@ impl SmoothLrSelectionReplay {
         )
     }
 
-    /// Dispatch: a term selecting `m` scales inside the budget gets the
-    /// `m`-dimensional replay; anything else gets the common-scale slice.
+    /// Dispatch: a term selecting `m ≥ 2` scales gets the `m`-dimensional
+    /// replay; a single scale gets the common-scale lane.
     fn from_geometry(
         geometry: &SelectionGeometry,
         log_scale_windows: &[(f64, f64)],
@@ -1251,14 +1458,8 @@ impl SmoothLrSelectionReplay {
                 SmoothLrSelectionDecline::NoPenaltyComponents,
             );
         }
-        let scales = geometry.roots.len();
-        if (2..=SMOOTH_LR_SELECTION_MAX_SCALES).contains(&scales) {
-            return match Self::generate_multiscale(
-                geometry,
-                log_scale_windows,
-                multiscale_draws,
-                MultiscaleBudget::SHIPPED,
-            ) {
+        if geometry.roots.len() >= 2 {
+            return match Self::generate_multiscale(geometry, log_scale_windows, multiscale_draws) {
                 Ok(replay) => SmoothLrSelection::Replayed(replay),
                 // A closed multi-scale window is not the end of the story: the
                 // common-scale slice intersects the same windows and declines
@@ -1276,13 +1477,13 @@ impl SmoothLrSelectionReplay {
 
     /// The COMMON-SCALE replay: every scale moved together, `t_i ≡ t`.
     ///
-    /// This is the whole selection when the term has one penalty, and it is the
-    /// honest fallback when it has more scales than
-    /// [`SMOOTH_LR_SELECTION_MAX_SCALES`].
+    /// This is the whole selection when the term has one penalty, and the
+    /// dispatcher's fallback when a multi-scale term has no open window of its
+    /// own to replay.
     ///
     /// Under a common scale `T(t) = t·T(1)`, so the eigenBASIS does not move and
     /// each draw's criterion is diagonal in one decomposition, with closed-form
-    /// derivatives of every order ([`CommonScaleCriterion`]). The
+    /// derivatives of every order ([`DiagonalCriterion`]). The
     /// log-determinant is exact in closed form for the same reason —
     /// `log|T(t)|₊ = rank·ln t + log|T(1)|₊` — so the only quantity that has to
     /// be priced carefully is the `t`-free constant, and it is, through the
@@ -1335,10 +1536,11 @@ impl SmoothLrSelectionReplay {
         let mut conditional_sample = vec![0.0_f64; draws];
         for draw in 0..draws {
             stream.fill_chi_square_ones(&mut squares);
-            let criterion = CommonScaleCriterion {
+            let criterion = DiagonalCriterion {
                 squares: &squares,
                 generalized: &generalized,
                 rank: geometry.rank,
+                occam: &[],
                 constant,
             };
             let Ok(selected) = criterion.select(low, high) else {
@@ -1373,7 +1575,7 @@ impl SmoothLrSelectionReplay {
     ///   replay, both scales         .0440   .0120   .0080   .0040
     /// ```
     ///
-    /// so the term's own `m` scales are gridded independently here. The absolute
+    /// so the term's own `m` scales are each selected here. The absolute
     /// numbers in that table are from a harness whose own outer optimizer is a
     /// Nelder–Mead on a flat two-dimensional REML surface and are not to be read
     /// as calibration figures; the ORDERING is what it establishes, and the
@@ -1383,263 +1585,150 @@ impl SmoothLrSelectionReplay {
     /// Each axis carries its OWN window. The reachable set for scale `i` is its
     /// #2812 resolvability interval translated to the fitted point,
     /// `ln t_i ∈ [lo_i − ρ̂_i, hi_i − ρ̂_i]`, and those `m` intervals are only equal
-    /// when the `m` components' spectra and fitted scales are. Handing this grid the
-    /// COMMON-shift intersection — which is what it used to receive — truncates
-    /// every axis to the narrowest one and empties the whole replay as soon as
-    /// one `λ̂` rails, which for a null-true double-penalty smooth is the normal
-    /// state and not a corner case.
+    /// when the `m` components' spectra and fitted scales are. Handing the
+    /// selection the COMMON-shift intersection — which is what it used to receive —
+    /// truncates every axis to the narrowest one and empties the whole replay as
+    /// soon as one `λ̂` rails, which for a null-true double-penalty smooth is the
+    /// normal state and not a corner case.
     ///
-    /// # The grid is a BRACKET, and the selection is a DESCENT
+    /// # Each draw's selection is a coordinatewise CERTIFIED descent
     ///
-    /// `SMOOTH_LR_SELECTION_GRID_BUDGET^(1/m)` points per axis is a bounded cost
-    /// and an unbounded error. At `m = 2` it is 21 points over a window the box
-    /// opens to 60 wide — `3.0` in `ln λ` — while the fit whose selection this
-    /// replays had a continuum, and the one-dimensional lane next door commits
-    /// to `0.05`. A grid that cannot find the criterion's minimum returns a law
-    /// that is selected LESS than the statistic it is the reference for, and
-    /// that error has one sign: it under-disperses, so the tail it is read at is
-    /// too thin and the test over-rejects. Measured on a whitened bending+ridge
-    /// pair at the `ρ̂` separations a null-true `s(z)` reaches, 2048 draws:
+    /// No basis diagonalizes `m` penalties against the information at once, but
+    /// one scale at a time does: with every other scale held at the draw's current
+    /// point, the criterion along scale `i` is exactly an [`AxisSlice`], and its
+    /// certified global minimum over that axis's window comes from the same
+    /// [`DiagonalCriterion`] search the common-scale lane uses. See
+    /// [`Self::select_draw`] for the sweep and why it terminates without a budget.
     ///
-    /// ```text
-    /// arm             grid  per_axis  spacing   E[W(t̂)]      sd      q95    wall
-    /// grid only        441     21      3.000     2.1334   2.9094   7.1898   0.10s
-    /// grid only       1681     41      1.500     2.4212   3.3266   9.4427   0.38s
-    /// grid only       6561     81      0.750     2.4928   3.3656   9.2994   1.48s
-    /// grid only      25921    161      0.375     2.5192   3.3783   9.3892   5.80s
-    /// grid + descent   441     21      3.000     2.5258   3.3779   9.3278   0.50s
-    /// grid + descent   121     11      6.000     2.5258   3.3779   9.3278   0.52s
-    /// ```
-    ///
-    /// The shipped budget was `15%` short in the mean and `23%` short at `q95`,
-    /// which is where `α = 0.05` is read. Sixty times the grid does not fix it —
-    /// `25921` points is still `0.375` — because the grid is the wrong
-    /// instrument. Each draw now DESCENDS the criterion from its own bracket
-    /// node, by a compass search that halves its step whenever a sweep fails,
-    /// down to the same `0.05` floor the diagonal lane uses. That reproduces the
-    /// `161²` law to `0.3%` from a bracket of 121 points, i.e. by making the
-    /// grid smaller rather than larger.
-    ///
-    /// Past [`SMOOTH_LR_SELECTION_MAX_SCALES`] scales the bracket would be four
-    /// points per axis, which is not a bracket, and the common-scale slice is
-    /// used instead.
+    /// This replaces a `441`-point bracket grid followed by a compass descent
+    /// capped at `96` criterion evaluations per draw, which kept the best point a
+    /// capped draw had reached (#2902: SPEC rules 18, 19 and 22). A draw whose
+    /// slice cannot be priced or certified declines the whole replay rather than
+    /// being sampled partially.
     fn generate_multiscale(
         geometry: &SelectionGeometry,
         log_scale_windows: &[(f64, f64)],
         draws: usize,
-        budget: MultiscaleBudget,
     ) -> Result<Self, SmoothLrSelectionDecline> {
         let scales = geometry.roots.len();
-        if scales < 2 || scales > SMOOTH_LR_SELECTION_MAX_SCALES {
+        if scales < 2 {
             return Err(SmoothLrSelectionDecline::GeometryRefused);
         }
         if log_scale_windows.len() != scales {
             return Err(SmoothLrSelectionDecline::NoPenaltyComponents);
         }
-        // One axis per scale, budgeted so the total point count does not grow
-        // with `m`. A scale whose own window is empty — its `λ̂` railed against
-        // both walls at once — contributes a single node at the fitted point
-        // rather than sinking the whole replay.
-        let per_axis = ((budget.grid as f64).powf(1.0 / scales as f64).floor() as usize).max(2);
-        let mut axes = Vec::<Vec<f64>>::with_capacity(scales);
+        // A scale whose own window is empty — its `λ̂` railed against both walls
+        // at once — stays at the fitted point rather than sinking the replay.
         let mut movable = 0usize;
         for &(low, high) in log_scale_windows {
             if !(low.is_finite() && high.is_finite()) {
                 return Err(SmoothLrSelectionDecline::WindowClosed);
             }
-            if high <= low {
-                axes.push(vec![0.0]);
-                continue;
+            if high > low {
+                movable += 1;
             }
-            movable += 1;
-            axes.push(
-                (0..per_axis)
-                    .map(|step| low + (high - low) * (step as f64) / ((per_axis - 1) as f64))
-                    .collect(),
-            );
         }
         if movable == 0 {
             return Err(SmoothLrSelectionDecline::WindowClosed);
         }
-
-        // The grid gets ONE extra point: the fitted `λ̂` itself, `ln t_i = 0` on
-        // every axis. It has to be there twice over. The selection must be able
-        // to choose the scale the fit chose — for the observed data it IS that
-        // scale, by construction — and the control variate's conditional arm has
-        // to be read AT it, not at whichever node happens to be nearest. With
-        // `441^(1/2) = 21` points over a span of `35` the nearest node can be
-        // `0.9` away in `ln λ`, a factor of 2.4, and the "conditional" sample
-        // would then be a different law from the one whose tail the shift is
-        // added to.
-        let points = axes.iter().map(|axis| axis.len()).product::<usize>() + 1;
-        let fitted_index = points - 1;
-
-        // The grid is STREAMED rather than materialized, and every draw is
-        // projected through one grid point at a time with a single matrix
-        // product.
-        //
-        // The arithmetic is identical — `draws × points × q²` either way — but
-        // the shape is not. The per-draw loop it replaces read
-        // `basis[[row, column]]` with `row` innermost, i.e. a strided,
-        // bounds-checked walk down a column, `draws × q²` times per point; this
-        // is one `(draws × q)·(q × q)` `dot` per point followed by a contiguous
-        // row reduction. It also drops the `points × q × q` of stored bases,
-        // which at `441` points and `q = 11` was the bulk of the replay's
-        // footprint.
+        let zero = vec![0.0_f64; scales];
+        // The control variate's conditional arm is read AT the fitted `λ̂`,
+        // `ln t = 0` on every axis, through the fitted eigensystem.
+        let fitted = geometry
+            .at(&zero)
+            .ok_or(SmoothLrSelectionDecline::GridRefused)?;
         let dimension = geometry.dimension;
-        let mut normals = Array2::<f64>::zeros((draws, dimension));
-        let mut row = vec![0.0_f64; dimension];
+        let mut factor = SelectionFactor::new(geometry);
         let mut stream = SelectionDrawStream::new(dimension, draws);
-        for draw in 0..draws {
-            stream.fill_normals(&mut row);
-            for column in 0..dimension {
-                normals[[draw, column]] = row[column];
-            }
-        }
-
-        let mut best_criterion = vec![f64::INFINITY; draws];
+        let mut draw = vec![0.0_f64; dimension];
+        let mut coordinates = vec![0.0_f64; geometry.rank];
+        let mut selected = vec![0.0_f64; scales];
         let mut selection_sample = vec![0.0_f64; draws];
         let mut conditional_sample = vec![0.0_f64; draws];
-        // Where each draw's own selection landed on the coarse grid — the
-        // bracket the refinement below descends from. One `m`-vector per draw.
-        let mut best_log_t = vec![0.0_f64; draws * scales];
-        let mut generalized = Vec::new();
-        let mut log_t = vec![0.0_f64; scales];
-        for point in 0..points {
-            let mut remainder = point;
-            for (scale, axis) in axes.iter().enumerate() {
-                log_t[scale] = if point == fitted_index {
-                    0.0
-                } else {
-                    let step = remainder % axis.len();
-                    remainder /= axis.len();
-                    axis[step]
-                };
-            }
-            let evaluated = geometry
-                .at(&log_t)
-                .ok_or(SmoothLrSelectionDecline::GridRefused)?;
-            if point == fitted_index {
-                generalized = ascending(evaluated.eigenvalues.clone());
-            }
-            let projected = normals.dot(&evaluated.basis);
-            for draw in 0..draws {
-                let coordinates = projected.row(draw);
-                let mut criterion = evaluated.offset;
-                let mut statistic = 0.0_f64;
-                for column in 0..dimension {
-                    let square = coordinates[column] * coordinates[column];
-                    criterion += square * evaluated.shares[column];
-                    statistic += square * evaluated.weights[column];
+        for index in 0..draws {
+            stream.fill_normals(&mut draw);
+            let mut norm_squared = 0.0_f64;
+            let mut conditional = 0.0_f64;
+            for column in 0..dimension {
+                norm_squared += draw[column] * draw[column];
+                let mut projection = 0.0_f64;
+                for row in 0..dimension {
+                    projection += draw[row] * fitted.basis[[row, column]];
                 }
-                if criterion < best_criterion[draw] {
-                    best_criterion[draw] = criterion;
-                    selection_sample[draw] = statistic;
-                    best_log_t[draw * scales..(draw + 1) * scales].copy_from_slice(&log_t);
-                }
-                if point == fitted_index {
-                    conditional_sample[draw] = statistic;
-                }
+                conditional += projection * projection * fitted.weights[column];
             }
+            conditional_sample[index] = conditional;
+            for column in 0..geometry.rank {
+                let mut projection = 0.0_f64;
+                for row in 0..dimension {
+                    projection += draw[row] * geometry.range_basis[[row, column]];
+                }
+                coordinates[column] = projection;
+            }
+            Self::select_draw(geometry, log_scale_windows, &coordinates, &mut selected)?;
+            if !factor.refactor(geometry, &selected) {
+                return Err(SmoothLrSelectionDecline::SelectionUnresolved);
+            }
+            selection_sample[index] = factor.score(&coordinates, norm_squared).1;
         }
-
-        // THE GRID IS A BRACKET, NOT THE SELECTION. Every draw now descends the
-        // criterion from its own coarse node, which is what makes the replayed
-        // `λ̂` the same KIND of object as the fitted one.
-        let coarse_step: Vec<f64> = axes
-            .iter()
-            .zip(log_scale_windows.iter())
-            .map(|(axis, &(low, high))| {
-                if axis.len() < 2 {
-                    0.0
-                } else {
-                    // HALF the grid spacing, because a full step lands on the
-                    // neighbouring node — a point the grid has already scored
-                    // and this draw has already rejected. The first sweep would
-                    // be four guaranteed misses.
-                    0.5 * (high - low) / (axis.len() - 1) as f64
-                }
-            })
-            .collect();
-        if coarse_step.iter().any(|&size| size > budget.refine_floor) {
-            // The draw's coordinates in the range basis, and the squared norm
-            // of the whole draw — both `t`-free, so both are formed once.
-            let range_coordinates = normals.dot(&geometry.range_basis);
-            let mut factor = SelectionFactor::new(geometry);
-            let mut trial = vec![0.0_f64; scales];
-            let mut coordinates = vec![0.0_f64; geometry.rank];
-            for draw in 0..draws {
-                let norm_squared = normals
-                    .row(draw)
-                    .iter()
-                    .map(|value| value * value)
-                    .sum::<f64>();
-                for column in 0..geometry.rank {
-                    coordinates[column] = range_coordinates[[draw, column]];
-                }
-                let current = &mut best_log_t[draw * scales..(draw + 1) * scales];
-                // The baseline is re-read THROUGH THE REFINEMENT'S OWN
-                // arithmetic. The grid priced this same point with the eigen
-                // route; the two agree to roundoff, and comparing a trial
-                // against the other route's rounding would accept or reject
-                // moves on `1e-16`.
-                if !factor.refactor(geometry, current) {
-                    continue;
-                }
-                let (mut value, mut statistic) = factor.score(&coordinates, norm_squared);
-                let mut step = coarse_step.clone();
-                let mut evaluations = 0usize;
-                while evaluations < budget.refine_evaluations
-                    && step.iter().any(|&size| size > budget.refine_floor)
-                {
-                    let mut improved = false;
-                    for scale in 0..scales {
-                        if !(step[scale] > budget.refine_floor) {
-                            continue;
-                        }
-                        let (low, high) = log_scale_windows[scale];
-                        for direction in [-1.0_f64, 1.0] {
-                            let moved = (current[scale] + direction * step[scale]).clamp(low, high);
-                            if moved == current[scale] {
-                                continue;
-                            }
-                            trial.copy_from_slice(current);
-                            trial[scale] = moved;
-                            if !factor.refactor(geometry, &trial) {
-                                continue;
-                            }
-                            evaluations += 1;
-                            let (criterion, moved_statistic) =
-                                factor.score(&coordinates, norm_squared);
-                            if criterion < value {
-                                value = criterion;
-                                statistic = moved_statistic;
-                                current[scale] = moved;
-                                improved = true;
-                            }
-                            if evaluations >= budget.refine_evaluations {
-                                break;
-                            }
-                        }
-                        if evaluations >= budget.refine_evaluations {
-                            break;
-                        }
-                    }
-                    if !improved {
-                        for size in step.iter_mut() {
-                            *size *= 0.5;
-                        }
-                    }
-                }
-                selection_sample[draw] = statistic;
-            }
-        }
-
         Ok(Self {
-            generalized,
+            generalized: ascending(fitted.eigenvalues),
             selection_sample,
             conditional_sample,
         })
+    }
+
+    /// One draw's multi-scale selection, written into `selected`.
+    ///
+    /// The draw starts at the fitted point, clamped into each open window, and
+    /// sweeps the open axes in order. An axis moves to the certified global
+    /// minimum of its [`AxisSlice`] only when that lowers the slice's criterion by
+    /// more than both points' forward-error bands, so a move is never a rounding
+    /// artefact. The descent stops at the first sweep that moves nothing: every
+    /// axis is then at its own global minimum through the point, which is a
+    /// stationary point of the box-constrained criterion. Every accepted move
+    /// lowers a criterion that is bounded below on the box by more than its own
+    /// rounding, so the sweep terminates without an iteration budget.
+    fn select_draw(
+        geometry: &SelectionGeometry,
+        log_scale_windows: &[(f64, f64)],
+        coordinates: &[f64],
+        selected: &mut [f64],
+    ) -> Result<(), SmoothLrSelectionDecline> {
+        if selected.len() != log_scale_windows.len() {
+            return Err(SmoothLrSelectionDecline::NoPenaltyComponents);
+        }
+        for (slot, &(low, high)) in selected.iter_mut().zip(log_scale_windows) {
+            *slot = if high > low { 0.0_f64.clamp(low, high) } else { 0.0 };
+        }
+        loop {
+            let mut moved = false;
+            for (axis, &(low, high)) in log_scale_windows.iter().enumerate() {
+                if !(high > low) {
+                    continue;
+                }
+                let slice = AxisSlice::new(geometry, selected, axis, coordinates)
+                    .ok_or(SmoothLrSelectionDecline::SelectionUnresolved)?;
+                let criterion = slice.criterion();
+                let candidate = criterion
+                    .select(low, high)
+                    .map_err(|_| SmoothLrSelectionDecline::SelectionUnresolved)?;
+                let (
+                    Some(([at_candidate, ..], candidate_band)),
+                    Some(([at_incumbent, ..], incumbent_band)),
+                ) = (criterion.jet(candidate), criterion.jet(selected[axis]))
+                else {
+                    return Err(SmoothLrSelectionDecline::SelectionUnresolved);
+                };
+                if at_candidate < at_incumbent - (candidate_band + incumbent_band) {
+                    selected[axis] = candidate;
+                    moved = true;
+                }
+            }
+            if !moved {
+                return Ok(());
+            }
+        }
     }
     /// `E[W | λ̂]` — the conditional law's mean over its own draws.
     pub fn conditional_mean(&self) -> f64 {
@@ -3622,11 +3711,9 @@ mod profiled_scale_reference_tests {
 #[cfg(test)]
 mod selection_replay_tests {
     use super::{
-        CommonScaleCriterion, MultiscaleBudget, SMOOTH_LR_SELECTION_DRAWS,
-        SMOOTH_LR_SELECTION_GRID_BUDGET, SMOOTH_LR_SELECTION_MAX_SCALES,
-        SMOOTH_LR_SELECTION_REFINE_FLOOR, SMOOTH_LR_SELECTION_REFINE_MAX_EVALUATIONS,
+        AxisSlice, DiagonalCriterion, SMOOTH_LR_SELECTION_DRAWS, SelectionDrawStream,
         SelectionFactor, SelectionGeometry, SmoothLrSelection, SmoothLrSelectionDecline,
-        SmoothLrSelectionReplay,
+        SmoothLrSelectionReplay, split_mix64,
     };
     use ndarray::Array2;
 
@@ -3636,18 +3723,22 @@ mod selection_replay_tests {
         vec![0.3_f64, 1.0, 4.0, 20.0, 120.0, 900.0]
     }
 
-    /// The common-scale criterion's closed-form jet against central differences
-    /// of itself, its cell ranges against interior point derivatives, and the
-    /// certified selection a value-local minimum no sampled point undercuts.
+    /// The diagonal criterion's closed-form jet against central differences of
+    /// itself, its cell ranges against interior point derivatives, and the
+    /// certified selection a value-local minimum no sampled point undercuts. It
+    /// carries an Occam spectrum, as an axis slice does, so shares of both signs
+    /// are exercised.
     #[test]
     fn common_scale_criterion_jet_enclosure_and_selection_agree_2902() {
         let generalized = spectrum();
         let squares = [1.7_f64, 0.2, 3.1, 0.05, 2.2, 0.9];
+        let occam = [0.08_f64, 35.0];
         let constant: f64 = generalized.iter().map(|nu| nu.ln()).sum();
-        let criterion = CommonScaleCriterion {
+        let criterion = DiagonalCriterion {
             squares: &squares,
             generalized: &generalized,
-            rank: generalized.len(),
+            rank: generalized.len() - occam.len(),
+            occam: &occam,
             constant,
         };
         let jet = |u: f64| criterion.jet(u).expect("evaluable jet").0;
@@ -3862,7 +3953,7 @@ mod selection_replay_tests {
     /// nothing it can do that the diagonal path cannot do faster), so the
     /// agreement is checked by handing it the SAME penalty split in two halves:
     /// `S = ½S + ½S` selects two scales whose sum is the one scale, so the
-    /// two-dimensional grid contains the one-dimensional family along its
+    /// two-dimensional box contains the one-dimensional family along its
     /// diagonal and the two references must land on the same law.
     #[test]
     fn a_split_penalty_reproduces_the_single_scale_law() {
@@ -3880,7 +3971,6 @@ mod selection_replay_tests {
             &split_geometry,
             &[(-6.0, 6.0), (-6.0, 6.0)],
             2048,
-            MultiscaleBudget::SHIPPED,
         )
         .expect("multiscale replay");
         // With `information = I` the generalized eigenvalues ARE the penalty's
@@ -3907,8 +3997,8 @@ mod selection_replay_tests {
         );
         assert!(
             (split_selected - single_selected).abs() <= 0.25 * single_selected.abs().max(1.0),
-            "the two paths disagree on the SELECTED law by more than the coarser \
-             grid can explain: {split_selected} vs {single_selected}"
+            "the two paths disagree on the SELECTED law by more than Monte-Carlo \
+             error can explain: {split_selected} vs {single_selected}"
         );
         // Both lanes publish the same generalized spectrum, because it is a
         // property of the term and not of which grid was affordable.
@@ -3944,35 +4034,24 @@ mod selection_replay_tests {
                 &single,
                 &[(-6.0, 6.0)],
                 256,
-                MultiscaleBudget::SHIPPED,
             )
             .is_err()
         );
-        // More scales than the grid budget can resolve: declines rather than
-        // gridding five axes at four points each — and the dispatcher then hands
-        // the term the common-scale slice rather than nothing.
-        let many = vec![penalty.clone(); SMOOTH_LR_SELECTION_MAX_SCALES + 1];
-        let windows = vec![(-6.0, 6.0); SMOOTH_LR_SELECTION_MAX_SCALES + 1];
-        let crowded = SelectionGeometry::whiten(
-            &information,
-            &many,
-            &vec![0.0; SMOOTH_LR_SELECTION_MAX_SCALES + 1],
-        )
-        .expect("crowded geometry");
+        // Five scales: no bracket budget caps the axes any more, so the
+        // multi-scale lane serves every one of them.
+        let many = vec![penalty.clone(); 5];
+        let windows = vec![(-6.0, 6.0); 5];
+        let crowded = SelectionGeometry::whiten(&information, &many, &[0.0; 5])
+            .expect("crowded geometry");
         assert!(
-            SmoothLrSelectionReplay::generate_multiscale(
-                &crowded,
-                &windows,
-                256,
-                MultiscaleBudget::SHIPPED,
-            )
-            .is_err()
+            SmoothLrSelectionReplay::generate_multiscale(&crowded, &windows, 256).is_ok(),
+            "a term with five scales is replayed over all five"
         );
         assert!(
             SmoothLrSelectionReplay::from_geometry(&crowded, &windows, 256, 256)
                 .replay()
                 .is_some(),
-            "a term with more scales than the grid budget still gets the common-scale slice"
+            "a term with five scales still gets a replay"
         );
         // Every window closed: nothing to select on any axis.
         let pair = SelectionGeometry::whiten(
@@ -3986,7 +4065,6 @@ mod selection_replay_tests {
                 &pair,
                 &[(1.0, 1.0), (2.0, 2.0)],
                 256,
-                MultiscaleBudget::SHIPPED,
             ) == Err(SmoothLrSelectionDecline::WindowClosed)
         );
         // But ONE open axis is still a selection, and used to be discarded with
@@ -3996,7 +4074,6 @@ mod selection_replay_tests {
                 &pair,
                 &[(1.0, 1.0), (-6.0, 6.0)],
                 256,
-                MultiscaleBudget::SHIPPED,
             )
             .is_ok(),
             "a scale whose own window is open must still be replayed when a \
@@ -4064,7 +4141,6 @@ mod selection_replay_tests {
                 &geometry,
                 &[(-36.0, 24.0), (-21.0, 39.0)],
                 512,
-                MultiscaleBudget::SHIPPED,
             )
             .expect("multiscale replay")
         };
@@ -4076,15 +4152,14 @@ mod selection_replay_tests {
         }
     }
 
-    /// #2672: the refinement's evaluator and the grid's are the SAME function.
+    /// #2672: the eigen route and the factor route are the SAME function.
     ///
-    /// The bracket prices a point through the eigensystem of `T(t)` and the
-    /// refinement prices it through two triangular factorizations, because one
-    /// amortizes over draws and the other cannot. They are two routes to one
-    /// number, and the refinement compares its trials against a baseline the
-    /// bracket produced — so a discrepancy between them is not a rounding
-    /// difference, it is a search descending one function while reporting
-    /// another's value.
+    /// The multi-scale lane prices its conditional arm through the eigensystem of
+    /// `T(t)` and each draw's selected statistic through two triangular
+    /// factorizations, because one amortizes over draws and the other cannot.
+    /// They are two routes to one number, and the control variate subtracts one
+    /// from the other — so a discrepancy between them is not a rounding
+    /// difference, it is a shift read between two different functions.
     ///
     /// Checked on a DENSE information with two dense components at separations
     /// up to the box's own width, which is where the two routes' conditioning
@@ -4159,110 +4234,105 @@ mod selection_replay_tests {
         }
     }
 
-    /// #2672: the shipped multi-scale replay reaches the law a grid it cannot
-    /// afford reaches — and the bracket alone does not.
-    ///
-    /// This is the contract the descent exists for, and it is stated as a
-    /// CONTRAST so it cannot pass by both arms drifting together: the reference
-    /// is a `161 × 161` grid (spacing `0.375`, `5.8 s` per term — sixty times
-    /// the shipped budget's cost and still coarser than the descent's floor),
-    /// and the two arms scored against it are the shipped one and the bracket
-    /// with the descent switched off, which is what shipped before.
-    ///
-    /// Both halves have to hold. Without the second, a descent that did nothing
-    /// would pass as soon as the reference grid stopped moving; without the
-    /// first, the test would only be saying that a fine grid differs from a
-    /// coarse one, which nobody disputes.
-    #[test]
-    fn the_descent_reaches_a_grid_it_cannot_afford_2672() {
-        let q = 6;
+    /// A dense information with two dense components, a bending-style one and a
+    /// ridge, and one fixed draw: the fixture on which the multi-scale criterion's
+    /// scales couple.
+    fn dense_pair() -> (Array2<f64>, Array2<f64>, Array2<f64>, Vec<f64>) {
+        let q = 7;
+        let mixing = Array2::from_shape_fn((q, q), |(row, column)| {
+            let a = row as f64 + 1.0;
+            let b = column as f64 + 1.0;
+            ((a * 0.7 + b * 1.3).sin() + 0.25 * (a * b).cos()) / (1.0 + 0.1 * a * b)
+        });
+        let information = mixing.dot(&mixing.t()) + Array2::<f64>::eye(q) * 0.5;
         let mut bending = Array2::<f64>::zeros((q, q));
-        let mut ridge = Array2::<f64>::zeros((q, q));
-        for index in 0..q {
-            if index < 4 {
-                bending[[index, index]] = 1.0 + index as f64;
-            } else {
-                ridge[[index, index]] = 1.0;
-            }
+        for index in 0..q - 2 {
+            bending[[index, index]] = 1.0;
+            bending[[index, index + 1]] = -0.5;
+            bending[[index + 1, index]] = -0.5;
         }
-        let geometry = SelectionGeometry::whiten(
-            &Array2::eye(q),
-            &[bending, ridge],
-            &[12.0, -12.0],
-        )
-        .expect("geometry");
-        let windows = [(-42.0, 18.0), (-18.0, 42.0)];
-        let law = |budget: MultiscaleBudget| {
-            let replay =
-                SmoothLrSelectionReplay::generate_multiscale(&geometry, &windows, 2048, budget)
-                    .expect("multiscale replay");
-            let draws = replay.selection_sample.len() as f64;
-            let mean = replay.selection_sample.iter().sum::<f64>() / draws;
-            let mut sorted = replay.selection_sample.clone();
-            sorted.sort_by(|a, b| a.partial_cmp(b).expect("finite"));
-            let upper = sorted[((0.95 * draws) as usize).min(sorted.len() - 1)];
-            (mean, upper)
-        };
-        // The reference: a grid nobody can afford per term, with no descent.
-        let (reference_mean, reference_upper) = law(MultiscaleBudget {
-            grid: 25_921,
-            refine_floor: f64::INFINITY,
-            refine_evaluations: 0,
-        });
-        let (shipped_mean, shipped_upper) = law(MultiscaleBudget::SHIPPED);
-        let (bracket_mean, bracket_upper) = law(MultiscaleBudget {
-            grid: SMOOTH_LR_SELECTION_GRID_BUDGET,
-            refine_floor: f64::INFINITY,
-            refine_evaluations: 0,
-        });
-        eprintln!(
-            "[2672 descent] reference (161²) mean={reference_mean:.4} q95={reference_upper:.4}  \
-             shipped mean={shipped_mean:.4} q95={shipped_upper:.4}  \
-             bracket-only mean={bracket_mean:.4} q95={bracket_upper:.4}"
-        );
-        assert!(
-            (shipped_mean - reference_mean).abs() <= 0.03 * reference_mean.abs(),
-            "the shipped replay's selected law has mean {shipped_mean} against the \
-             unaffordable grid's {reference_mean}"
-        );
-        assert!(
-            (shipped_upper - reference_upper).abs() <= 0.03 * reference_upper.abs(),
-            "the shipped replay's selected law has q95 {shipped_upper} against the \
-             unaffordable grid's {reference_upper} — and q95 is where α = 0.05 is read"
-        );
-        // And the arm the descent replaced misses, in the direction that
-        // over-rejects: a less-selected law is a thinner upper tail.
-        assert!(
-            bracket_upper < 0.9 * reference_upper,
-            "the bracket alone reached q95 {bracket_upper} against {reference_upper}; if \
-             the grid on its own is now accurate, this test is no longer measuring the \
-             defect it was written for and the descent's cost needs re-arguing"
-        );
-        assert!(
-            bracket_mean < reference_mean,
-            "a coarser selection cannot select MORE: bracket-only mean {bracket_mean} \
-             against {reference_mean}"
-        );
+        let bending = mixing.dot(&bending.dot(&mixing.t()));
+        let bending = bending.dot(&bending.t());
+        let ridge = mixing.dot(&mixing.t());
+        let draw = (0..q)
+            .map(|index| ((index as f64 + 1.0) * 0.9).sin() + 0.3)
+            .collect();
+        (information, bending, ridge, draw)
     }
 
-    /// PROBE (#2672, not a contract): what the multi-scale grid's BUDGET costs
-    /// the law it generates.
+    /// A draw's coordinates in the geometry's range basis.
+    fn range_coordinates(geometry: &SelectionGeometry, draw: &[f64]) -> Vec<f64> {
+        (0..geometry.rank)
+            .map(|column| {
+                (0..geometry.dimension)
+                    .map(|row| draw[row] * geometry.range_basis[[row, column]])
+                    .sum()
+            })
+            .collect()
+    }
+
+    /// #2902: an axis slice is the multi-scale criterion along its axis, exactly.
     ///
-    /// The one-dimensional lane grids `ln t` at a fixed `0.05`; the
-    /// multi-scale one spends a fixed TOTAL of `441` points, which at `m = 2`
-    /// over the box the solver leaves a railed `λ̂` is a spacing of about `3` in
-    /// `ln λ` — sixty times coarser. The replay's whole job is to reproduce a
-    /// selection the fit made with a continuum available, so a grid that cannot
-    /// resolve the criterion's minimum generates a law that is selected LESS
-    /// than the statistic it is the reference for. This prints the selected
-    /// law's mean, spread and upper tail against budget so the size of that
-    /// gap is a measurement rather than an assumption.
+    /// The slice prices `log|I + C|` from an assembled `I + B` and `log|C|₊` from
+    /// the cosine–sine decomposition of the stacked roots, so it is checked
+    /// against [`SelectionFactor`]'s route on a dense information with two dense
+    /// components, at separations up to the box's width: every change of the
+    /// slice's value along its axis must be the same change of the criterion.
     #[test]
-    fn zz_probe_multiscale_grid_budget_moves_the_selected_law_2672() {
+    fn an_axis_slice_is_the_criterion_along_its_axis_2902() {
+        let (information, bending, ridge, draw) = dense_pair();
+        let norm_squared: f64 = draw.iter().map(|value| value * value).sum();
+        for separation in [0.0_f64, 18.0, 40.0] {
+            let geometry = SelectionGeometry::whiten(
+                &information,
+                &[bending.clone(), ridge.clone()],
+                &[0.5 * separation, -0.5 * separation],
+            )
+            .expect("geometry");
+            let coordinates = range_coordinates(&geometry, &draw);
+            let mut factor = SelectionFactor::new(&geometry);
+            for point in [[0.0_f64, 0.0], [-2.5, 1.75], [3.0, -4.0]] {
+                for axis in 0..2 {
+                    let slice = AxisSlice::new(&geometry, &point[..], axis, &coordinates)
+                        .expect("an axis slice at a priced point");
+                    let criterion = slice.criterion();
+                    let slice_anchor = criterion.jet(point[axis]).expect("slice jet").0[0];
+                    assert!(factor.refactor(&geometry, &point[..]));
+                    let anchor = factor.score(&coordinates, norm_squared).0;
+                    for offset in [-9.0_f64, -1.5, 2.0, 6.0] {
+                        let mut moved = point;
+                        moved[axis] += offset;
+                        let slice_value = criterion.jet(moved[axis]).expect("slice jet").0[0];
+                        assert!(factor.refactor(&geometry, &moved[..]));
+                        let value = factor.score(&coordinates, norm_squared).0;
+                        let slice_change = slice_value - slice_anchor;
+                        let change = value - anchor;
+                        assert!(
+                            (slice_change - change).abs()
+                                <= 1e-7 * (1.0 + value.abs().max(anchor.abs())),
+                            "separation {separation}, point {point:?}, axis {axis}, offset \
+                             {offset}: the slice moves by {slice_change}, the criterion by {change}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// #2902: each draw's multi-scale selection is the criterion's minimum along
+    /// every axis through it, and on a separable pair over the whole box.
+    ///
+    /// This is the claim [`SmoothLrSelectionReplay::select_draw`] makes, checked
+    /// through the canonical evaluator at points the descent never visited. On the
+    /// SEPARABLE pair — unit information, a bending penalty on four directions and
+    /// a ridge on the other two, at the separation a null-true smooth reaches — the
+    /// criterion is a sum of one function per scale, so a coordinatewise minimum is
+    /// the global one and no probe anywhere in the box may undercut it. On the
+    /// COUPLED dense pair only probes along each axis through the selection are
+    /// held to it, which is what a coordinatewise minimum is.
+    #[test]
+    fn multiscale_selection_is_a_coordinatewise_certified_minimum_2902() {
         let q = 6;
-        // The default `s(z)` shape: a bending penalty over the wiggly
-        // directions and a null-space ridge over the rest, fitted at the
-        // separation a null-true smooth actually reaches (`λ₁` up, `λ₂` down).
         let mut bending = Array2::<f64>::zeros((q, q));
         let mut ridge = Array2::<f64>::zeros((q, q));
         for index in 0..q {
@@ -4272,78 +4342,72 @@ mod selection_replay_tests {
                 ridge[[index, index]] = 1.0;
             }
         }
-        for separation in [0.0_f64, 24.0, 42.0] {
-            let (rho_one, rho_two) = (0.5 * separation, -0.5 * separation);
-            let geometry = SelectionGeometry::whiten(
-                &Array2::eye(q),
-                &[bending.clone(), ridge.clone()],
-                &[rho_one, rho_two],
-            )
-            .expect("geometry");
-            let windows = [
-                (-30.0 - rho_one, 30.0 - rho_one),
-                (-30.0 - rho_two, 30.0 - rho_two),
-            ];
-            eprintln!(
-                "[zz2672-grid] separation={separation}  window0={:?} window1={:?}",
-                windows[0], windows[1]
-            );
-            // Two axes, and they trade against each other: `grid` is the
-            // BRACKET the draws start from and `refine_floor` is how far each
-            // draw then descends. `INFINITY` is the shipped-before arm — the
-            // bracket alone, with no descent.
-            let arms: [(usize, f64, &str); 6] = [
-                (441, f64::INFINITY, "grid only"),
-                (1681, f64::INFINITY, "grid only"),
-                (6561, f64::INFINITY, "grid only"),
-                (25921, f64::INFINITY, "grid only"),
-                (441, SMOOTH_LR_SELECTION_REFINE_FLOOR, "grid + refine"),
-                (121, SMOOTH_LR_SELECTION_REFINE_FLOOR, "grid + refine"),
-            ];
-            for (grid, refine_floor, label) in arms {
-                let budget = MultiscaleBudget {
-                    grid,
-                    refine_floor,
-                    refine_evaluations: SMOOTH_LR_SELECTION_REFINE_MAX_EVALUATIONS,
-                };
-                let started = std::time::Instant::now();
-                let replay = SmoothLrSelectionReplay::generate_multiscale(
-                    &geometry, &windows, 2048, budget,
+        let separable =
+            SelectionGeometry::whiten(&Array2::eye(q), &[bending, ridge], &[12.0, -12.0])
+                .expect("separable geometry");
+        let (information, dense_bending, dense_ridge, _) = dense_pair();
+        let coupled = SelectionGeometry::whiten(
+            &information,
+            &[dense_bending, dense_ridge],
+            &[9.0, -9.0],
+        )
+        .expect("coupled geometry");
+        let windows = [(-42.0_f64, 18.0_f64), (-18.0, 42.0)];
+        let mut state = 0x2902_0004_u64;
+        let mut uniform = move || {
+            state = split_mix64(state);
+            (state >> 11) as f64 / (1u64 << 53) as f64
+        };
+        for (label, geometry, whole_box) in [
+            ("separable", &separable, true),
+            ("coupled", &coupled, false),
+        ] {
+            let mut factor = SelectionFactor::new(geometry);
+            let mut stream = SelectionDrawStream::new(geometry.dimension, 48);
+            let mut draw = vec![0.0_f64; geometry.dimension];
+            let mut selected = vec![0.0_f64; 2];
+            for index in 0..48 {
+                stream.fill_normals(&mut draw);
+                let norm_squared: f64 = draw.iter().map(|value| value * value).sum();
+                let coordinates = range_coordinates(geometry, &draw);
+                SmoothLrSelectionReplay::select_draw(
+                    geometry,
+                    &windows,
+                    &coordinates,
+                    &mut selected,
                 )
-                .expect("multiscale replay");
-                let elapsed = started.elapsed().as_secs_f64();
-                let per_axis = (grid as f64).powf(0.5).floor() as usize;
-                let draws = replay.selection_sample.len() as f64;
-                let mean = replay.selection_sample.iter().sum::<f64>() / draws;
-                let variance = replay
-                    .selection_sample
-                    .iter()
-                    .map(|value| (value - mean) * (value - mean))
-                    .sum::<f64>()
-                    / draws;
-                let conditional_mean = replay.conditional_sample.iter().sum::<f64>() / draws;
-                let upper = |quantile: f64| {
-                    let mut sorted = replay.selection_sample.clone();
-                    sorted.sort_by(|a, b| a.partial_cmp(b).expect("finite"));
-                    sorted[((quantile * draws) as usize).min(sorted.len() - 1)]
+                .expect("a certified multi-scale selection");
+                let mut value_at = |point: &[f64]| {
+                    assert!(
+                        factor.refactor(geometry, point),
+                        "{label}: the evaluator refused the probe {point:?}"
+                    );
+                    factor.score(&coordinates, norm_squared).0
                 };
-                eprintln!(
-                    "[zz2672-grid]   {label:<13} grid={grid:>6} per_axis={per_axis:>3} \
-                     spacing={:>6.3}  E[W(t-hat)]={mean:.4} sd={:.4} \
-                     q95={:.4} q99={:.4}  (E[W|t-hat]={conditional_mean:.4})  {elapsed:.2}s",
-                    (windows[0].1 - windows[0].0) / (per_axis as f64 - 1.0),
-                    variance.sqrt(),
-                    upper(0.95),
-                    upper(0.99),
-                );
+                let at_selected = value_at(selected.as_slice());
+                let tolerance = 1e-8 * (1.0 + at_selected.abs());
+                let mut probes: Vec<[f64; 2]> = vec![[0.0, 0.0]];
+                for _ in 0..24 {
+                    let along = [
+                        windows[0].0 + (windows[0].1 - windows[0].0) * uniform(),
+                        windows[1].0 + (windows[1].1 - windows[1].0) * uniform(),
+                    ];
+                    probes.push([along[0], selected[1]]);
+                    probes.push([selected[0], along[1]]);
+                    if whole_box {
+                        probes.push(along);
+                    }
+                }
+                for probe in probes {
+                    let at_probe = value_at(&probe[..]);
+                    assert!(
+                        at_selected <= at_probe + tolerance,
+                        "{label} draw {index}: the selection {selected:?} (V={at_selected}) is \
+                         undercut at {probe:?} (V={at_probe})"
+                    );
+                }
             }
         }
-        eprintln!(
-            "[zz2672-grid] read: the selected law is generated by MINIMISING the \
-             criterion over the grid, so a finer grid can only lower each draw's \
-             criterion. A mean/tail that keeps moving as the budget rises is the \
-             shipped budget failing to reproduce the selection the fit made."
-        );
     }
 
     /// #2672: the criterion's log-determinant is priced from the stacked scaled
