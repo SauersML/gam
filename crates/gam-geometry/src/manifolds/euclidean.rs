@@ -1,8 +1,7 @@
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
 
 use crate::manifold::{
-    GEOMETRY_EPS, GeometryError, GeometryResult, RiemannianManifold, check_len, dot, identity,
-    zero_christoffel,
+    GeometryError, GeometryResult, RiemannianManifold, check_len, dot, identity, zero_christoffel,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -105,12 +104,17 @@ impl RiemannianManifold for EuclideanManifold {
         }
         // Flat space has R ≡ 0, so K = 0 on any *nondegenerate* plane. But the
         // value 0/0 is undefined when the pair spans no plane: the squared
-        // parallelogram area ‖u‖²‖v‖² − ⟨u,v⟩² must be nonzero.
+        // parallelogram area ‖u‖²‖v‖² − ⟨u,v⟩² must be resolvably nonzero. It
+        // cancels exactly on a collinear pair; the three `dim`-term inner products,
+        // two products and one subtraction round it by at most
+        // `γ_{2·dim+2}·(uu·vv + uv²)`, and an area inside that band spans no plane.
         let uu = dot(tangent_pair.0, tangent_pair.0);
         let vv = dot(tangent_pair.1, tangent_pair.1);
         let uv = dot(tangent_pair.0, tangent_pair.1);
         let area_sq = uu * vv - uv * uv;
-        if !area_sq.is_finite() || area_sq <= GEOMETRY_EPS {
+        let area_band =
+            gam_linalg::roundoff::accumulation_growth(2 * self.dim + 2) * (uu * vv + uv * uv);
+        if !area_sq.is_finite() || area_sq <= area_band {
             return Err(GeometryError::Singular(
                 "sectional curvature undefined for collinear/degenerate tangent pair",
             ));
