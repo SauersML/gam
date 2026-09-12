@@ -10,10 +10,9 @@ pub(crate) struct Cli {
     pub(crate) command: Command,
 
     /// Solver log verbosity: `off|error|warn|info|debug|trace`. Defaults to the
-    /// quiet `warn` level (#1688) — pass `--log-level info` or `-v` to opt back
-    /// into the full per-iteration solver trace (`[OUTER …]`, `[KAPPA-PHASE …]`,
-    /// etc.). Unrecognized levels are rejected by the argument parser.
-    /// `--log-level` wins over `-v`/`-q` when both are present.
+    /// quiet `warn` level (#1688) — pass `--log-level info` to opt back into the
+    /// full per-iteration solver trace (`[OUTER …]`, `[KAPPA-PHASE …]`, etc.).
+    /// Unrecognized levels are rejected by the argument parser.
     #[arg(
         long,
         global = true,
@@ -21,21 +20,6 @@ pub(crate) struct Cli {
         value_parser = parse_log_level_cli
     )]
     pub(crate) log_level: Option<log::LevelFilter>,
-
-    /// Increase solver log verbosity. Repeat for more detail: `-v` = info,
-    /// `-vv` = debug, `-vvv` = trace.
-    #[arg(short = 'v', long = "verbose", global = true, action = ArgAction::Count)]
-    pub(crate) verbose: u8,
-
-    /// Quiet solver logs completely (`off`) unless `--log-level` is provided.
-    #[arg(
-        short = 'q',
-        long = "quiet",
-        global = true,
-        action = ArgAction::SetTrue,
-        conflicts_with = "verbose"
-    )]
-    pub(crate) quiet: bool,
 }
 
 #[derive(Subcommand, Debug)]

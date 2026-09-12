@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import json
 import math
-import warnings
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterator, Literal, Sequence, cast
@@ -1492,22 +1491,6 @@ class Model:
         )
         return math.exp(log_ratio)
 
-    def bayes_factor_vs(self, other: "Model") -> float:
-        """Deprecated spelling of :meth:`evidence_ratio_vs`.
-
-        The value was never a Bayes factor -- it is the Akaike evidence ratio
-        ``exp(-dAIC/2)`` -- so the name misdescribed it. Emits a
-        ``DeprecationWarning`` and returns exactly what
-        :meth:`evidence_ratio_vs` returns.
-        """
-        warnings.warn(
-            "Model.bayes_factor_vs is the Akaike evidence ratio exp(-dAIC/2), not a "
-            "Bayes factor; use Model.evidence_ratio_vs",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-        return self.evidence_ratio_vs(other)
-
     def _model_class_from_payload(self) -> str:
         return rust_module().saved_model_predict_class_name(self._model_bytes)
 
@@ -1728,14 +1711,6 @@ class MultinomialModel:
             mean_upper=out["mean_upper"],
             level=level,
         )
-
-    def std_error(self, data: Any) -> Any:
-        """Delta-method per-class probability standard errors for new rows.
-
-        Returns an ``(N, K)`` numpy array column-aligned with :attr:`classes_`.
-        Equivalent to ``predict(data, interval='confidence').std_error``.
-        """
-        return self.predict(data, interval="confidence").std_error
 
     def posterior_predict(
         self,

@@ -55,16 +55,14 @@ def test_circle_exp_returns_tensor_with_grad_through_v() -> None:
 
 def test_circle_cylinder_ambient_dim_matches_rust_source_of_truth() -> None:
     """Regression for issue #397: the Python descriptor's documented contract
-    and its cached ``_ambient_dim`` must agree with the Rust manifold, which
-    uses the 1-D angle parameterization (ambient == intrinsic). Following the
-    old ``R^2`` "unit 2-vector" docstring raised a hard ``GamError``."""
+    must agree with the Rust manifold, which uses the 1-D angle
+    parameterization (ambient == intrinsic). Following the old ``R^2``
+    "unit 2-vector" docstring raised a hard ``GamError``."""
     from gamfit.manifolds import CylinderManifold
 
     circle = ManifoldCircle()
-    # Rust-backed property and the cached fallback must agree, and both == 1.
+    # The dimension is read from the Rust manifold; there is no Python cache.
     assert circle.ambient_dim == 1
-    assert circle._ambient_dim == 1
-    assert circle.ambient_dim == circle._ambient_dim
     # The numpy path exercises the Rust manifold directly: the 1-D angle form
     # must succeed and wrap correctly.
     out = circle.exp(np.array([0.5]), np.array([0.1]))
@@ -74,8 +72,6 @@ def test_circle_cylinder_ambient_dim_matches_rust_source_of_truth() -> None:
     for open_dim in (0, 1, 3):
         cyl = CylinderManifold(open_dim)
         assert cyl.ambient_dim == 1 + open_dim
-        assert cyl._ambient_dim == 1 + open_dim
-        assert cyl.ambient_dim == cyl._ambient_dim
         # A point is [theta, x_1, ..., x_k] of width 1 + open_dim.
         p = np.zeros(1 + open_dim, dtype=np.float64)
         v = np.zeros(1 + open_dim, dtype=np.float64)

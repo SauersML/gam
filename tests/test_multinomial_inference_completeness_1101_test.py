@@ -67,15 +67,6 @@ def test_confidence_interval_returns_sane_bounds() -> None:
     assert np.allclose(mean.sum(axis=1), 1.0, atol=1e-6)
 
 
-def test_std_error_alias_matches_interval() -> None:
-    model, df = _fit()
-    se_direct = np.asarray(model.std_error(df), dtype=float)
-    se_interval = np.asarray(
-        model.predict(df, interval="confidence").std_error, dtype=float
-    )
-    assert np.allclose(se_direct, se_interval)
-
-
 def test_smooth_significance_table_is_populated() -> None:
     model, _ = _fit()
     sig = model.smooth_significance()

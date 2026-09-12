@@ -79,20 +79,6 @@ def test_bayes_factor_vs_agrees_with_compare_models_winner() -> None:
     assert loser.evidence_ratio_vs(winner) < 1.0
 
 
-def test_bayes_factor_vs_is_a_deprecated_alias_of_evidence_ratio_vs() -> None:
-    # The quantity is the Akaike evidence ratio exp(-dAIC/2), not a Bayes
-    # factor (no prior is integrated over), so the old name misdescribed it.
-    # It survives as a deprecated alias that returns the identical value.
-    import warnings
-
-    m_sx, m_null = _fit_pair()
-    with warnings.catch_warnings(record=True) as caught:
-        warnings.simplefilter("always")
-        legacy = m_sx.bayes_factor_vs(m_null)
-    assert any(issubclass(w.category, DeprecationWarning) for w in caught)
-    assert legacy == m_sx.evidence_ratio_vs(m_null)
-
-
 def test_evidence_ratio_vs_of_model_against_itself_is_one() -> None:
     # Edge case: identical fits are indistinguishable, so the Bayes factor is
     # exactly 1 (log BF = score - score = 0). Guards against an off-by-sign or

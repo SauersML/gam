@@ -61,9 +61,9 @@ def test_gaussian_reference_honours_uncertainty_flag(tmp_path):
     no_uncertainty = tmp_path / "gaussian-no.csv"
     yes_uncertainty = tmp_path / "gaussian-yes.csv"
 
-    run_gam("fit", gaussian, "y ~ s(x)", "--family", "gaussian", "--out", model, "-q")
-    run_gam("predict", model, gaussian, "--out", no_uncertainty, "-q")
-    run_gam("predict", model, gaussian, "--out", yes_uncertainty, "--uncertainty", "-q")
+    run_gam("fit", gaussian, "y ~ s(x)", "--family", "gaussian", "--out", model)
+    run_gam("predict", model, gaussian, "--out", no_uncertainty)
+    run_gam("predict", model, gaussian, "--out", yes_uncertainty, "--uncertainty")
 
     assert header(no_uncertainty) == _POINT_COLUMNS
     assert header(yes_uncertainty) == _POINT_COLUMNS + _BAND_COLUMNS
@@ -74,8 +74,8 @@ def test_poisson_predict_without_uncertainty_must_not_emit_band_columns(tmp_path
     model = tmp_path / "poisson.gam"
     no_uncertainty = tmp_path / "poisson-no.csv"
 
-    run_gam("fit", poisson, "y ~ s(x)", "--family", "poisson-log", "--out", model, "-q")
-    run_gam("predict", model, poisson, "--out", no_uncertainty, "-q")
+    run_gam("fit", poisson, "y ~ s(x)", "--family", "poisson-log", "--out", model)
+    run_gam("predict", model, poisson, "--out", no_uncertainty)
 
     assert header(no_uncertainty) == _POINT_COLUMNS
 
@@ -86,9 +86,9 @@ def test_uncertainty_flag_is_not_a_noop_for_poisson(tmp_path):
     no_uncertainty = tmp_path / "poisson-no.csv"
     yes_uncertainty = tmp_path / "poisson-yes.csv"
 
-    run_gam("fit", poisson, "y ~ s(x)", "--family", "poisson-log", "--out", model, "-q")
-    run_gam("predict", model, poisson, "--out", no_uncertainty, "-q")
-    run_gam("predict", model, poisson, "--out", yes_uncertainty, "--uncertainty", "-q")
+    run_gam("fit", poisson, "y ~ s(x)", "--family", "poisson-log", "--out", model)
+    run_gam("predict", model, poisson, "--out", no_uncertainty)
+    run_gam("predict", model, poisson, "--out", yes_uncertainty, "--uncertainty")
 
     assert header(no_uncertainty) == _POINT_COLUMNS
     assert header(yes_uncertainty) == _POINT_COLUMNS + _BAND_COLUMNS

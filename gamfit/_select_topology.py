@@ -585,7 +585,7 @@ def _default_topology_candidate(name: str, feature_dim: int) -> _Candidate:
     if name == "circle":
         return _Candidate("circle", topology.Circle(name="theta"))
     if name == "sphere":
-        return _Candidate("sphere", topology.Sphere(dim=2, name="omega"))
+        return _Candidate("sphere", topology.Sphere(name="omega"))
     if name == "torus":
         return _Candidate("torus", topology.Torus(n_knots=(12, 12), name="theta_phi"))
     if name == "cylinder":
@@ -1054,24 +1054,6 @@ class TopologyAutoSelector:
         self.score_scale = _normalize_selector_score_scale(score_scale)
         self.latent = latent
 
-    def with_candidates(
-        self,
-        candidates: Sequence[str | Smooth | tuple[str, Smooth]] | None,
-    ) -> "TopologyAutoSelector":
-        """Set candidate topologies and return ``self`` for fluent chaining."""
-        self.candidates = candidates
-        return self
-
-    def with_score_scale(self, score_scale: TopologyScoreScale) -> "TopologyAutoSelector":
-        """Set the TK score scale and return ``self``."""
-        self.score_scale = _normalize_selector_score_scale(score_scale)
-        return self
-
-    def for_latent(self, latent: str) -> "TopologyAutoSelector":
-        """Select which latent block name this selector should rank."""
-        self.latent = str(latent)
-        return self
-
     def fit(
         self,
         data: Any,
@@ -1089,8 +1071,7 @@ class TopologyAutoSelector:
             Fit inputs passed to :func:`gamfit.fit`.
         latents:
             Mapping containing the latent block to retopologize. If more than
-            one latent is present, configure ``latent=...`` or call
-            :meth:`for_latent`.
+            one latent is present, configure ``latent=...``.
         penalties:
             Analytic penalties forwarded to each candidate fit.
         **fit_kwargs:
@@ -1186,8 +1167,6 @@ class TopologyAutoSelector:
             winner=ranked[int(ranking["winner_index"])],
             failures=failures,
         )
-
-    select = fit
 
 
 def _single_latent(

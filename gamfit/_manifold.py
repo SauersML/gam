@@ -161,23 +161,13 @@ class _RustManifold(ManifoldDescriptor):
 
     @property
     def dimension(self) -> int:
-        """Intrinsic dimension. Routes through Rust when the extension
-        exposes ``manifold_dimension``; otherwise falls back to the
-        descriptor's locally cached ``_dim`` (set by each subclass at
-        construction). The Rust path is the canonical source of truth."""
-        fn = getattr(_rust_module(), "manifold_dimension", None)
-        if fn is not None:
-            return int(fn(self.manifold_json))
-        return int(self._dim)
+        """Intrinsic dimension, from the Rust ``RiemannianManifold``."""
+        return int(_rust_module().manifold_dimension(self.manifold_json))
 
     @property
     def ambient_dim(self) -> int:
-        """Ambient embedding dimension. Same Rust-first / Python-fallback
-        pattern as :attr:`dimension`."""
-        fn = getattr(_rust_module(), "manifold_ambient_dimension", None)
-        if fn is not None:
-            return int(fn(self.manifold_json))
-        return int(getattr(self, "_ambient_dim", self._dim))
+        """Ambient embedding dimension, from the Rust ``RiemannianManifold``."""
+        return int(_rust_module().manifold_ambient_dimension(self.manifold_json))
 
     def exp(self, p: Any, v: Any) -> Any:
         torch_mod = _maybe_import_torch()
@@ -223,8 +213,6 @@ class Euclidean(_RustManifold):
         if int(dim) <= 0:
             raise ValueError("Euclidean.dim must be > 0")
         self.json = {"kind": "euclidean", "dim": int(dim)}
-        self._dim = int(dim)
-        self._ambient_dim = int(dim)
 
     def __repr__(self) -> str:
         return f"Euclidean(dim={self.json['dim']})"
@@ -245,8 +233,6 @@ class Circle(_RustManifold):
 
     def __init__(self) -> None:
         self.json = {"kind": "circle"}
-        self._dim = 1
-        self._ambient_dim = 1
 
     def __repr__(self) -> str:
         return "Circle()"
@@ -260,8 +246,6 @@ class Sphere(_RustManifold):
         if int(intrinsic_dim) < 1:
             raise ValueError("Sphere.intrinsic_dim must be >= 1")
         self.json = {"kind": "sphere", "intrinsic_dim": int(intrinsic_dim)}
-        self._dim = int(intrinsic_dim)
-        self._ambient_dim = int(intrinsic_dim) + 1
 
     def __repr__(self) -> str:
         return f"Sphere(intrinsic_dim={self.json['intrinsic_dim']})"
@@ -274,8 +258,6 @@ class Torus(_RustManifold):
         if int(dim) < 1:
             raise ValueError("Torus.dim must be >= 1")
         self.json = {"kind": "torus", "d": int(dim)}
-        self._dim = int(dim)
-        self._ambient_dim = int(dim)
 
     def __repr__(self) -> str:
         return f"Torus(dim={self.json['d']})"
@@ -298,9 +280,6 @@ class CylinderManifold(_RustManifold):
             parts.append({"kind": "euclidean", "dim": int(open_dim)})
         self.json = {"kind": "product", "parts": parts}
         self._open = int(open_dim)
-        self._dim = 1 + int(open_dim)
-        # Circle angle (1) + Euclidean(open_dim); matches Rust product ambient.
-        self._ambient_dim = 1 + int(open_dim)
 
     def __repr__(self) -> str:
         return f"CylinderManifold(open_dim={self._open})"
@@ -336,8 +315,6 @@ class Grassmann(_RustManifold):
         self.json = {"kind": "grassmann", "k": k_i, "n": n_i}
         self._k = k_i
         self._n = n_i
-        self._dim = k_i * (n_i - k_i)
-        self._ambient_dim = n_i * k_i
 
     def __repr__(self) -> str:
         return f"Grassmann(k={self._k}, n={self._n})"
@@ -371,8 +348,6 @@ class Stiefel(_RustManifold):
         self.json = {"kind": "stiefel", "k": k_i, "n": n_i}
         self._k = k_i
         self._n = n_i
-        self._dim = n_i * k_i - k_i * (k_i + 1) // 2
-        self._ambient_dim = n_i * k_i
 
     def __repr__(self) -> str:
         return f"Stiefel(k={self._k}, n={self._n})"
@@ -400,8 +375,6 @@ class Spd(_RustManifold):
             raise ValueError(f"Spd requires n >= 1; got n={n_i}")
         self.json = {"kind": "spd", "n": n_i}
         self._n = n_i
-        self._dim = n_i * (n_i + 1) // 2
-        self._ambient_dim = n_i * n_i
 
     def __repr__(self) -> str:
         return f"Spd(n={self._n})"

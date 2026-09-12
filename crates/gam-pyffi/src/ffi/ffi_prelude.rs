@@ -195,7 +195,7 @@ pub(crate) use pyo3::IntoPyObjectExt;
 
 pub(crate) type PyObject = pyo3::Py<pyo3::PyAny>;
 
-pub(crate) use pyo3::exceptions::{PyNotImplementedError, PyTypeError, PyValueError};
+pub(crate) use pyo3::exceptions::{PyTypeError, PyValueError};
 
 pub(crate) use pyo3::prelude::*;
 

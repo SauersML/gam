@@ -332,7 +332,7 @@ def _build_fit_payload(
         # shapes already match the documents (BTreeMap<String, JsonValue> and
         # Vec<JsonValue>); only the key names were wrong.
         "latent_coordinates": normalized_latents,
-        "analytic_penalties": _normalize_penalties(penalties, normalized_latents),
+        "analytic_penalties": _normalize_penalties(penalties),
         "smooth_descriptors": _normalize_smooths(smooths),
     }
     for key, value in kwarg_items.items():
@@ -452,7 +452,6 @@ def _normalize_smooths(
 
 def _normalize_penalties(
     penalties: Sequence[Any] | None,
-    latents: Mapping[str, Any] | None,
 ) -> list[dict[str, Any]] | None:
     if penalties is None:
         return None
@@ -460,7 +459,6 @@ def _normalize_penalties(
         raise TypeError("penalties must be a sequence of analytic penalty wrappers")
     from .smooth import Smooth as _Smooth
 
-    latent_names = list((latents or {}).keys())
     out: list[dict[str, Any]] = []
     for index, penalty in enumerate(penalties):
         if isinstance(penalty, _Smooth):
@@ -488,24 +486,6 @@ def _normalize_penalties(
         else:
             raise TypeError(
                 f"penalties[{index}] must expose to_rust_descriptor() or be a mapping"
-            )
-        target = descriptor.get("target")
-        if isinstance(target, int):
-            if target < 0 or target >= len(latent_names):
-                raise ValueError(
-                    f"penalties[{index}] targets latent index {target}, "
-                    f"but latents has {len(latent_names)} block(s)"
-                )
-            descriptor["target"] = latent_names[target]
-        elif isinstance(target, str):
-            if target not in (latents or {}):
-                raise ValueError(
-                    f"penalties[{index}] targets latent block {target!r}, "
-                    "which is not present in latents"
-                )
-        else:
-            raise TypeError(
-                f"penalties[{index}] target must be a latent block name or index"
             )
         out.append(_jsonable_array(descriptor))
     return out
@@ -1044,8 +1024,8 @@ def fit(
         coordinate matrix and optimizes it jointly with the REML parameters.
     penalties:
         Analytic penalty wrappers such as :class:`gamfit.OrthogonalityPenalty`
-        or :class:`gamfit.ARDPenalty`, targeted at latent block names or
-        indices declared in ``latents``. The Rust-backed public wrappers also
+        or :class:`gamfit.ARDPenalty`, targeted at latent block names declared
+        in ``latents``. The Rust-backed public wrappers also
         include the SAE/assignment family
         (:class:`gamfit.SoftmaxAssignmentSparsityPenalty`,
         :class:`gamfit.OrderedBetaBernoulliPenalty`,
@@ -1260,8 +1240,8 @@ def fit(
     # underlying Rust entry is a dedicated formula→design→REML path that
     # bypasses the workflow.rs `FitRequest::Standard` materialiser. The Rust
     # `fit_penalized_multinomial_formula` driver runs the outer REML/LAML loop
-    # to select an independent smoothing parameter per (class, term); the
-    # `init_lambda` argument below is only the warm-start seed.
+    # to select an independent smoothing parameter per (class, term), from the
+    # same `MultinomialFitRequest::new` defaults the CLI uses.
     family_canonical = str(family).lower().replace("_", "-") if family is not None else "auto"
     if family_canonical in {
         "multinomial",
@@ -1277,9 +1257,6 @@ def fit(
                     rows,
                     formula,
                     json.dumps(payload),
-                    1.0,   # init_lambda — warm-start seed; λ is REML-selected in Rust.
-                    50,    # max_iter
-                    1.0e-7,  # tol
                 )
             )
         except Exception as exc:
@@ -2100,18 +2077,6 @@ def sphere_basis(
         raise ValueError(f"n_centers must be positive, got {n_centers}")
     if penalty_order_i not in (1, 2, 3, 4):
         raise ValueError("penalty_order must be one of 1, 2, 3, or 4")
-    lat = pts_np[:, 0]
-    if radians:
-        bound = float(np.pi / 2.0)
-        if np.any(lat < -bound - 1e-9) or np.any(lat > bound + 1e-9):
-            raise ValueError(
-                "sphere_basis: latitude (radians) must lie in [-π/2, π/2]"
-            )
-    else:
-        if np.any(lat < -90.0 - 1e-9) or np.any(lat > 90.0 + 1e-9):
-            raise ValueError(
-                "sphere_basis: latitude (degrees) must lie in [-90, 90]"
-            )
     try:
         design, penalty = rust_module().sphere_basis(
             pts_np,
@@ -2171,18 +2136,6 @@ def sphere_basis_jet(
         raise ValueError(f"n_centers must be positive, got {n_centers}")
     if penalty_order_i not in (1, 2, 3, 4):
         raise ValueError("penalty_order must be one of 1, 2, 3, or 4")
-    lat = pts_np[:, 0]
-    if radians:
-        bound = float(np.pi / 2.0)
-        if np.any(lat < -bound - 1e-9) or np.any(lat > bound + 1e-9):
-            raise ValueError(
-                "sphere_basis_jet: latitude (radians) must lie in [-π/2, π/2]"
-            )
-    else:
-        if np.any(lat < -90.0 - 1e-9) or np.any(lat > 90.0 + 1e-9):
-            raise ValueError(
-                "sphere_basis_jet: latitude (degrees) must lie in [-90, 90]"
-            )
     try:
         jet = rust_module().sphere_basis_jet(
             pts_np,
@@ -2629,7 +2582,6 @@ def _resolve_position_basis_inputs(
     knots_or_centers: Any,
     penalty: Any | None,
     *,
-    basis: str | None,
     basis_order: int | None,
     periodic: bool,
     period: float | None = None,
@@ -2647,9 +2599,7 @@ def _resolve_position_basis_inputs(
     """
     import numpy as np
 
-    display_kind = str(
-        basis if basis is not None else basis_kind if basis_kind is not None else "bspline"
-    )
+    display_kind = str(basis_kind if basis_kind is not None else "bspline")
     effective_kind, order, _ = _normalize_position_basis(display_kind, basis_order)
     t_np = _numeric_vector(t, "t")
     kind_norm = str(display_kind).strip().lower().replace("_", "").replace("-", "")
@@ -2743,7 +2693,6 @@ def gaussian_reml_fit_positions(
     knots_or_centers: Any = None,
     penalty: Any | None = None,
     *,
-    basis: str | None = None,
     basis_order: int | None = None,
     periodic: bool = False,
     period: float | None = None,
@@ -2767,7 +2716,6 @@ def gaussian_reml_fit_positions(
             basis_kind,
             knots_or_centers,
             penalty,
-            basis=basis,
             basis_order=basis_order,
             periodic=periodic,
             period=period,
@@ -2808,7 +2756,6 @@ def gaussian_reml_fit_positions_backward(
     knots_or_centers: Any = None,
     penalty: Any | None = None,
     *,
-    basis: str | None = None,
     grad_lambda: float = 0.0,
     grad_coefficients: Any | None = None,
     grad_fitted: Any | None = None,
@@ -2834,7 +2781,6 @@ def gaussian_reml_fit_positions_backward(
             basis_kind,
             knots_or_centers,
             penalty,
-            basis=basis,
             basis_order=basis_order,
             periodic=periodic,
             period=period,
@@ -2876,7 +2822,6 @@ def gaussian_reml_fit_positions_batched(
     knots_or_centers: Any = None,
     penalty: Any | None = None,
     *,
-    basis: str | None = None,
     basis_order: int | None = None,
     periodic: bool = False,
     period: float | None = None,
@@ -2899,7 +2844,6 @@ def gaussian_reml_fit_positions_batched(
             basis_kind,
             knots_or_centers,
             penalty,
-            basis=basis,
             basis_order=basis_order,
             periodic=periodic,
             period=period,
@@ -2942,7 +2886,6 @@ def gaussian_reml_fit_positions_batched_backward(
     knots_or_centers: Any = None,
     penalty: Any | None = None,
     *,
-    basis: str | None = None,
     grad_lambda: Any | None = None,
     grad_coefficients: Any | None = None,
     grad_fitted: Any | None = None,
@@ -2970,7 +2913,6 @@ def gaussian_reml_fit_positions_batched_backward(
             basis_kind,
             knots_or_centers,
             penalty,
-            basis=basis,
             basis_order=basis_order,
             periodic=periodic,
             period=period,
@@ -3491,12 +3433,8 @@ def glm_reml_fit_latent_backward(
     aux_family: str = "ridge",
     aux_strength: float | str | None = None,
     dim_selection_log_precision: Any | None = None,
-    basis_kind: str = "duchon",
 ) -> dict[str, Any]:
     """Return the analytic Duchon latent gradient for ``glm_reml_fit_latent``.
-
-    The ``basis_kind`` argument is accepted for signature symmetry, but this
-    low-level GLM backward path currently implements only ``"duchon"``.
 
     ``fisher_w`` is the scalar-response Fisher-block override: a dense
     ``(N, 1, 1)`` ``float64`` per-row diagonal replacement of the analytic
@@ -3534,7 +3472,6 @@ def glm_reml_fit_latent_backward(
             None if tweedie_p is None else float(tweedie_p),
             None if negbin_theta is None else float(negbin_theta),
             None if beta_phi is None else float(beta_phi),
-            str(basis_kind),
         )
     except Exception as exc:
         raise map_exception(exc) from exc

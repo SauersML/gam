@@ -951,7 +951,6 @@ fn glm_reml_fit_latent<'py>(
     tweedie_p = None,
     negbin_theta = None,
     beta_phi = None,
-    basis_kind = "duchon".to_string(),
 ))]
 fn glm_reml_fit_latent_backward<'py>(
     py: Python<'py>,
@@ -974,7 +973,6 @@ fn glm_reml_fit_latent_backward<'py>(
     tweedie_p: Option<f64>,
     negbin_theta: Option<f64>,
     beta_phi: Option<f64>,
-    basis_kind: String,
 ) -> PyResult<Py<PyDict>> {
     let family = latent_family_spec(&family, tweedie_p, negbin_theta, beta_phi)?;
     let aux_family = match aux_family.to_ascii_lowercase().as_str() {
@@ -986,12 +984,6 @@ fn glm_reml_fit_latent_backward<'py>(
             )));
         }
     };
-    let basis_kind_normalized = latent_basis_kind(&basis_kind).map_err(py_value_error)?;
-    if basis_kind_normalized != "duchon" {
-        return Err(PyNotImplementedError::new_err(format!(
-            "glm_reml_fit_latent_backward currently builds only Duchon latent designs; derivative hook exists for {basis_kind_normalized:?}"
-        )));
-    }
     let dim_selection_precision = dim_selection_log_precision
         .as_ref()
         .map(|values| ValidatedDimSelectionPrecisions::new(values.as_array(), latent_dim))

@@ -1067,9 +1067,6 @@ use gam::families::multinomial::MultinomialModelEnvelope;
     rows,
     formula,
     config_json = None,
-    init_lambda = 1.0,
-    max_iter = 50,
-    tol = 1.0e-7,
 ))]
 fn fit_multinomial_formula_pyfunc<'py>(
     py: Python<'py>,
@@ -1077,9 +1074,6 @@ fn fit_multinomial_formula_pyfunc<'py>(
     rows: PyRef<'py, PyEncodedTable>,
     formula: String,
     config_json: Option<String>,
-    init_lambda: f64,
-    max_iter: usize,
-    tol: f64,
 ) -> PyResult<Py<PyBytes>> {
     rows.require_headers(&headers).map_err(py_value_error)?;
     let dataset = rows.dataset.clone();
@@ -1087,18 +1081,14 @@ fn fit_multinomial_formula_pyfunc<'py>(
         let fit_config = gam::config_resolve::parse_fit_config_json(config_json.as_deref())
             .map_err(py_value_error)?;
         // Typed engine path: `EstimationError` → matching `gamfit.*Error`
-        // subclass via `estimation_error_to_pyerr` (issue #343).
+        // subclass via `estimation_error_to_pyerr` (issue #343). The request
+        // carries the same defaults the CLI's `run_fit_multinomial` uses.
         let saved = gam::families::multinomial::fit_penalized_multinomial_formula(
-            &gam::families::multinomial::MultinomialFitRequest {
-                init_lambda,
-                max_iter,
-                tol,
-                ..gam::families::multinomial::MultinomialFitRequest::new(
-                    &dataset,
-                    &formula,
-                    &fit_config,
-                )
-            },
+            &gam::families::multinomial::MultinomialFitRequest::new(
+                &dataset,
+                &formula,
+                &fit_config,
+            ),
         )
         .map_err(estimation_error_to_pyerr)?;
         MultinomialModelEnvelope::new(saved)

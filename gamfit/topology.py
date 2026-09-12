@@ -51,8 +51,6 @@ def _make_topology(
         return spec
 
     if kind == "sphere":
-        if int(opts["dim"]) != 2:
-            raise ValueError("topology.Sphere supports dim=2 latitude/longitude inputs")
         spec = _SphereSmooth(
             n_centers=int(opts["n_knots"]),
             penalty_order=int(opts["penalty_order"]),
@@ -151,7 +149,6 @@ def Sphere(
     name: str | None = None,
     n_knots: int = 20,
     *,
-    dim: int = 2,
     penalty_order: int = 2,
     kernel: str = "sobolev",
     radians: bool = False,
@@ -162,19 +159,13 @@ def Sphere(
     """Spherical topology for latitude/longitude style inputs.
 
     Use for directions on ``S^2`` represented as ``(N, 2)`` coordinates.
-    ``dim`` remains part of the public signature but must be ``2``.
 
     Returns
     -------
     Smooth
         Spherical smooth descriptor.
-
-    Raises
-    ------
-    ValueError
-        If ``dim`` is not ``2``.
     """
-    return _make_topology("sphere", name=name, n_knots=n_knots, dim=dim, penalty_order=penalty_order, kernel=kernel, radians=radians, by=by, double_penalty=double_penalty, shape_constraint=shape_constraint)
+    return _make_topology("sphere", name=name, n_knots=n_knots, penalty_order=penalty_order, kernel=kernel, radians=radians, by=by, double_penalty=double_penalty, shape_constraint=shape_constraint)
 
 
 def EuclideanPatch(

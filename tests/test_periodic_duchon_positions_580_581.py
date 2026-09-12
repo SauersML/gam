@@ -95,7 +95,7 @@ def test_periodic_duchon_fit_positions_runs_and_is_psd(period: float | None) -> 
     """
     t, y = _circle_truth()
     out = gamfit.gaussian_reml_fit_positions(
-        t, y, basis="duchon", basis_order=2, periodic=True, period=period
+        t, y, basis_kind="duchon", basis_order=2, periodic=True, period=period
     )
     assert out.get("status") == "ok", f"fit did not converge for period={period}: {out.get('status')}"
     assert np.all(np.isfinite(np.asarray(out["fitted"]))), "fitted values must be finite"
@@ -118,7 +118,7 @@ def test_periodic_duchon_recovers_periodic_truth(period: float | None) -> None:
     """
     t, y = _circle_truth(n=600, embed_dim=16, seed=3)
     out = gamfit.gaussian_reml_fit_positions(
-        t, y, basis="duchon", basis_order=2, periodic=True, period=period
+        t, y, basis_kind="duchon", basis_order=2, periodic=True, period=period
     )
     assert out.get("status") == "ok"
     fitted = np.asarray(out["fitted"], dtype=float)
@@ -315,7 +315,7 @@ def test_batched_positions_accepts_torch_row_offsets() -> None:
     y = torch.tensor(y_np)
 
     ref = gamfit.gaussian_reml_fit_positions_batched(
-        t, y, np.array([0, n, 2 * n], dtype=np.uintp), basis="duchon", basis_order=2
+        t, y, np.array([0, n, 2 * n], dtype=np.uintp), basis_kind="duchon", basis_order=2
     )
     for row_offsets in (
         torch.tensor([0, n, 2 * n]),
@@ -323,7 +323,7 @@ def test_batched_positions_accepts_torch_row_offsets() -> None:
         [0, n, 2 * n],
     ):
         out = gamfit.gaussian_reml_fit_positions_batched(
-            t, y, row_offsets, basis="duchon", basis_order=2
+            t, y, row_offsets, basis_kind="duchon", basis_order=2
         )
         assert np.asarray(out["fitted"]).shape == (2 * n, 1)
         np.testing.assert_allclose(
@@ -340,5 +340,5 @@ def test_batched_positions_rejects_fractional_row_offsets() -> None:
     y = torch.randn(2 * n, 1)
     with pytest.raises((TypeError, ValueError)):
         gamfit.gaussian_reml_fit_positions_batched(
-            t, y, np.array([0.0, 1.5 * n, 2.0 * n]), basis="duchon", basis_order=2
+            t, y, np.array([0.0, 1.5 * n, 2.0 * n]), basis_kind="duchon", basis_order=2
         )

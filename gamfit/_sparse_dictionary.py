@@ -74,15 +74,12 @@ def _block_transform(
     p = decoder.shape[1]
     if x.shape[1] != p:
         raise ValueError(f"X must have P={p} columns; got {x.shape[1]}")
-    b = int(block_size)
-    g_blocks = decoder.shape[0] // b
-    k = max(1, min(int(block_topk), g_blocks))
     blocks, gates, codes = rust_module().block_sparse_dictionary_transform_ffi(
         np.ascontiguousarray(x, dtype=np.float32),
         np.ascontiguousarray(decoder, dtype=np.float32),
         float(gamma),
-        int(b),
-        int(k),
+        int(block_size),
+        int(block_topk),
         int(block_tile),
     )
     return (
@@ -218,12 +215,10 @@ class SparseDictionaryFit:
             raise ValueError(
                 f"X must have P={self.decoder.shape[1]} columns; got {x.shape[1]}"
             )
-        s = self.active if active is None else int(active)
-        s = max(1, min(s, self.decoder.shape[0]))
         payload = rust_module().sparse_dictionary_transform_ffi(
             np.ascontiguousarray(x, dtype=np.float32),
             np.ascontiguousarray(self.decoder, dtype=np.float32),
-            int(s),
+            int(self.active if active is None else active),
             code_ridge=float(self.convergence.selected_rho),
             score_mode=str(score_mode),
         )
@@ -284,12 +279,10 @@ class SparseDictStreamArtifact:
             raise ValueError(
                 f"X must have P={self.decoder.shape[1]} columns; got {x.shape[1]}"
             )
-        s = self.active if active is None else int(active)
-        s = max(1, min(s, self.decoder.shape[0]))
         payload = rust_module().sparse_dictionary_transform_ffi(
             np.ascontiguousarray(x, dtype=np.float32),
             np.ascontiguousarray(self.decoder, dtype=np.float32),
-            int(s),
+            int(self.active if active is None else active),
             score_mode=str(score_mode),
         )
         data = dict(payload)
@@ -775,7 +768,6 @@ def block_sparse_dictionary_fit(
     *,
     block_size: int = 2,
     block_topk: int = 1,
-    grassmann: bool = True,
     max_epochs: int = 30,
     minibatch: int = 512,
     block_tile: int = 1024,
@@ -802,10 +794,6 @@ def block_sparse_dictionary_fit(
         exceed ``P``.
     block_topk:
         Block routing budget ``k`` (blocks allowed to fire per row).
-    grassmann:
-        Block frames are Grassmann/Stiefel-constrained (column-orthonormal).
-        This lane is always frame-constrained; ``grassmann=False`` is rejected
-        (use :func:`sparse_dictionary_fit` for an unconstrained atom dictionary).
     max_epochs, minibatch, block_tile:
         Streaming / tiling controls (peak routing working set is
         ``minibatch x (block_tile*b)``, never ``N x K``).
@@ -813,12 +801,6 @@ def block_sparse_dictionary_fit(
         Frame-refresh ridge, AuxK dead-block revival budget, optional nested
         prefix loss ladder, and the full-alternation stopping tolerance.
     """
-    if not grassmann:
-        raise ValueError(
-            "block_sparse_dictionary_fit is always Grassmann/Stiefel-constrained; "
-            "pass grassmann=True (or use sparse_dictionary_fit for an unconstrained "
-            "atom dictionary)"
-        )
     x = _as_2d_f32(X, "X")
     if block_size > x.shape[1]:
         raise ValueError(

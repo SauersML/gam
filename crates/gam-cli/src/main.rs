@@ -309,15 +309,6 @@ fn run() -> CliResult<()> {
     // level, so initialization cannot reinterpret or guess at the request.
     match cli.log_level {
         Some(level) => gam::progress_log::init_logging_at(level),
-        None if cli.quiet => gam::progress_log::init_logging_at(log::LevelFilter::Off),
-        None if cli.verbose > 0 => {
-            let level = match cli.verbose {
-                1 => log::LevelFilter::Info,
-                2 => log::LevelFilter::Debug,
-                _ => log::LevelFilter::Trace,
-            };
-            gam::progress_log::init_logging_at(level);
-        }
         None => gam::progress_log::init_logging(),
     }
     // #2738 — a SETTING and a CAPACITY are not enough; report the policy too.

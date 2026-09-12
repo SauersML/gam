@@ -38,7 +38,7 @@ APIs such as a matrix kernel.
 
 ## CLI command and flag inventory
 
-Global flags are `--log-level`, `--verbose`/`-v`, and `--quiet`/`-q`.
+The one global flag is `--log-level`.
 
 | Command | Arguments and flags |
 |---|---|
