@@ -35,9 +35,8 @@ pub fn erfc(x: f64) -> f64 {
 // transcendentals (`erfc`/`exp`/`log`) where the kernel calls the device
 // `erfc`/`exp`/`log`. Both sides are the SunOS *msun* double-precision
 // implementations, so the host oracle matches the device to within ~1 ULP per
-// transcendental (issue #1175 items 4–5). This mirrors the #1017
-// `emulate_certified_encode_row` pattern: a CPU emulator that is BOTH the
-// fallback and the exactness oracle a device launch is pinned to.
+// transcendental (issue #1175 items 4–5). The mirror is a CPU emulator that is
+// BOTH the fallback and the exactness oracle a device launch is pinned to.
 //
 // Correctness *without a GPU* (CPU-verifiable): the test harness below asserts
 // (a) these constants are bit-identical to the literals in the kernel source

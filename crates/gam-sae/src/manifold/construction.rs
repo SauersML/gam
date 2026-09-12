@@ -1099,7 +1099,7 @@ impl SaeManifoldTerm {
     }
 
     /// Install the fitted reconstruction dispersion used by
-    /// `dictionary_incoherence_report`. This is a pure diagnostic scalar and
+    /// `dictionary_incoherence_report_with_dispersion`. This is a pure diagnostic scalar and
     /// does not feed any loss, criterion, penalty, or optimizer state.
     pub fn set_certificate_dispersion(&mut self, dispersion: f64) -> Result<(), String> {
         if !dispersion.is_finite() || dispersion <= 0.0 {
@@ -2031,14 +2031,13 @@ impl SaeManifoldTerm {
             (0..self.k_atoms()).map(|_| None).collect()
         };
         // ONE entry point for both branches (#2757). The pin used to route
-        // through `residual_gauge_exact`, which rebuilds the curvature root from
+        // through an exact-gauge entry that rebuilt the curvature root from
         // the model's retained per-row Jacobian blocks — an object a factor of
         // `p` denser than the data it holds. Both branches now stream the same
         // structured curvature, with the pin's rows carried alongside the
         // output-coordinate blocks, so `jacobian_rows` has no production
-        // producer at all. The general `residual_gauge` / `residual_gauge_exact`
-        // path remains for callers that hand-build a model whose Jacobian is not
-        // frame-structured.
+        // producer at all. The general `residual_gauge` path remains for callers
+        // that hand-build a model whose Jacobian is not frame-structured.
         let residual_gauge = match curvature_source {
             ResidualGaugeCurvatureSource::Stored(curvature) => {
                 crate::identifiability::residual_gauge_exact_from_curvature(

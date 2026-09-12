@@ -1,21 +1,14 @@
 //! Kantorovich-certified encode atlas (issue #1010).
 //!
-//! Two arms:
-//!
-//! 1. **Planted single-circle, analytically-known basin boundary.** One
-//!    periodic atom whose decoder traces the unit circle `m(t) = (cos 2πt,
-//!    sin 2πt)`. Encoding a target `x = m(t*)` is the Newton problem
-//!    `min_t ½‖x − m(t)‖²`. The Newton basin of the true root `t*` is the open
-//!    half-circle around it; the basin BOUNDARY is the antipode `t* + ½`, where
-//!    the gradient vanishes but the curvature flips sign (a local maximum, not a
-//!    minimum). A start near `t*` must certify (`h ≤ ½`) and converge to the
-//!    true coordinate; a start near the antipode must FLAG (`h > ½` or singular
-//!    curvature), never silently converge to the wrong root.
-//!
-//! 2. **Throughput-shaped batched path** (the #988 consumer). A many-row batch
-//!    through [`EncodeAtlas::certified_encode_batch`]; we assert correctness
-//!    (certified rows recover the planted coordinate, uncertified count is
-//!    honest) — not wall-time.
+//! **Planted single-circle, analytically-known basin boundary.** One periodic
+//! atom whose decoder traces the unit circle `m(t) = (cos 2πt, sin 2πt)`.
+//! Encoding a target `x = m(t*)` is the Newton problem `min_t ½‖x − m(t)‖²`.
+//! The Newton basin of the true root `t*` is the open half-circle around it; the
+//! basin BOUNDARY is the antipode `t* + ½`, where the gradient vanishes but the
+//! curvature flips sign (a local maximum, not a minimum). A start near `t*` must
+//! certify (`h ≤ ½`) and converge to the true coordinate; a start near the
+//! antipode must FLAG (`h > ½` or singular curvature), never silently converge
+//! to the wrong root.
 
 use std::f64::consts::TAU;
 use std::sync::Arc;

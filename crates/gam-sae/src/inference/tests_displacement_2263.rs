@@ -13,8 +13,8 @@
 //!
 //! 1. the **chart round trip** — read `t_from`, write `t_to`, re-encode the
 //!    edited row, compare. Entirely ours: a coordinate write composes
-//!    [`EncodeAtlas::certified_encode_row`] with [`steer_delta`], and no model
-//!    participates;
+//!    [`EncodeAtlas::certified_encode_row_with_objective`] with [`steer_delta`], and no
+//!    model participates;
 //! 2. the **behavioral readout** — which month the LLM then says. Not ours.
 //!
 //! The issue's "+1..+6 → +8" is measured on (2), so it cannot be reproduced

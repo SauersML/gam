@@ -3346,7 +3346,7 @@ fn residual_gauge_exact_inputs(
 ) -> Result<(Vec<bool>, Vec<GeneratorVerdict>), String> {
     if views.len() != model.atoms.len() || penalty_ops.len() != model.atoms.len() {
         return Err(format!(
-            "residual_gauge_exact: views ({}) and penalty_ops ({}) must align with atoms ({})",
+            "residual_gauge_exact_inputs: views ({}) and penalty_ops ({}) must align with atoms ({})",
             views.len(),
             penalty_ops.len(),
             model.atoms.len()
