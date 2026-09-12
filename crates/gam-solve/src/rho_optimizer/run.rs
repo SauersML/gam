@@ -9294,7 +9294,7 @@ pub(crate) fn run_fixed_point_outer_solver(
     let recurrent_incumbent_exit = Arc::new(Mutex::new(None));
     let evaluated_inner_seed = Arc::new(Mutex::new(None));
     let mut objective = OuterFixedPointBridge {
-        obj,
+        obj: &mut *obj,
         layout,
         barrier_config,
         fixed_point_tolerance: config.tolerance,
@@ -9351,21 +9351,25 @@ pub(crate) fn run_fixed_point_outer_solver(
         Arc::clone(&evaluated_inner_seed),
         the_plan,
     );
-    let mut optimizer = FixedPoint::new(seed.clone(), objective)
-        // Seed validation already paid the complete EFS inner solve. Reuse that
-        // exact sample so iteration zero neither repeats the expensive solve nor
-        // mistakes two evaluations at the identical rho for recurrent incumbent
-        // evidence (#2241).
-        .with_initial_sample(seed.clone(), seed_sample)
-        .with_bounds(bounds)
-        .with_tolerance(tol)
-        .with_max_iterations(max_iter);
-    match optimizer.run() {
+    // The driver owns the bridge, and the bridge borrows `obj`; scoping the
+    // driver releases that borrow so a step stop can be judged on `obj` below.
+    let outcome = {
+        let mut optimizer = FixedPoint::new(seed.clone(), objective)
+            // Seed validation already paid the complete EFS inner solve. Reuse that
+            // exact sample so iteration zero neither repeats the expensive solve nor
+            // mistakes two evaluations at the identical rho for recurrent incumbent
+            // evidence (#2241).
+            .with_initial_sample(seed.clone(), seed_sample)
+            .with_bounds(bounds)
+            .with_tolerance(tol)
+            .with_max_iterations(max_iter);
+        optimizer.run()
+    };
+    match outcome {
         Ok(sol) => {
             let mut result = solution_into_outer_result(sol, true, the_plan);
             // Stamp the model-state fixed-point stop when the bridge published
-            // one; `None` means the walk stopped through the ordinary
-            // step-norm test instead.
+            // one. Analytic screening corroborates that claim downstream.
             if let Some(consecutive_restores) =
                 recurrent_incumbent_exit.lock().ok().and_then(|slot| *slot)
             {
@@ -9374,8 +9378,64 @@ pub(crate) fn run_fixed_point_outer_solver(
                         consecutive_restores,
                     }),
                 };
+                return Ok(result);
             }
-            Ok(result)
+            // Every other stop is a step-norm test: the map proposed a step below
+            // `config.tolerance`, through the bridge's per-coordinate test or opt's
+            // L2 test. A small step is not stationarity. The EFS update is a ratio
+            // of traces whose ZERO is the stationarity equation, but its magnitude
+            // is not denominated in the gradient the certificate bounds. On an SAE
+            // manifold fit (sw7-logs/m4_A_info.log) the walk stopped after 7m32s and
+            // screening then refused the point at |Pg| = 2.010 against a band of
+            // 9.699e-5. The seed was abandoned there, and the refuted checkpoint
+            // reached the analytic-gradient plan only after every remaining seed
+            // had stopped the same way.
+            //
+            // So the stop is judged here, by the screening certificate the plan
+            // applies to every claim, while this incumbent can still be continued.
+            match certify_outer_optimality_with_fidelity(
+                obj,
+                config,
+                context,
+                &mut result,
+                CertificationFidelity::Screening,
+            ) {
+                Ok(certificate) => {
+                    result.criterion_certificate = Some(certificate);
+                    Ok(result)
+                }
+                // The analytic-gradient BFGS plan that `automatic_fallback_attempts`
+                // declares for this capability continues the exact incumbent, which
+                // is the point the refused stop left in place.
+                Err(refusal)
+                    if config.fallback_policy == FallbackPolicy::Automatic
+                        && obj.capability().gradient == Derivative::Analytic =>
+                {
+                    log::info!(
+                        "[OUTER] {context}: {label} step-norm stop after {} iteration(s) at \
+                         cost={:.6e} is not stationary; continuing the incumbent with the \
+                         analytic-gradient plan: {refusal}",
+                        result.iterations,
+                        result.final_value,
+                    );
+                    let checkpoint = incumbent
+                        .lock()
+                        .expect("fixed-point incumbent publication lock poisoned")
+                        .clone();
+                    Err(FixedPointOuterRunError::IterationRejected(
+                        FixedPointContinuationRequest {
+                            checkpoint,
+                            refusal: ObjectiveEvalError::recoverable_from(refusal),
+                        },
+                    ))
+                }
+                // No declared continuation: the refused point is a resumable
+                // checkpoint, not a candidate.
+                Err(_) => {
+                    result.termination = OuterTermination::Exhausted;
+                    Ok(result)
+                }
+            }
         }
         Err(FixedPointError::MaxIterationsReached { last_solution }) => {
             let step_norm = last_solution.final_step_norm.expect(
