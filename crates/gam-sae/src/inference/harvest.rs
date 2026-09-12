@@ -43,7 +43,7 @@
 //! from the tier — the same #973 honesty discipline, applied to the metric's
 //! estimation roles instead of the likelihood.
 
-use gam_problem::{MetricProvenance, RowMetric};
+use gam_problem::RowMetric;
 use gam_solve::row_sampling_measure::{RowSamplingMeasure, per_row_fisher_mass};
 
 /// The Fisher-bearing tier: which corpus rows carry factors, and the metric
@@ -75,20 +75,10 @@ pub struct TieredHarvest {
 }
 
 impl TieredHarvest {
-    /// Tier 1 only: a corpus harvested without Fisher factors. Every metric
-    /// consumer takes its no-harvest path; [`Self::corpus_measure`] is exactly
-    /// uniform. Never an error: absence is a valid, first-class state.
-    pub fn activations_only(n_rows: usize) -> Self {
-        Self {
-            n_rows,
-            fisher: None,
-        }
-    }
-
     /// Attach a Fisher tier: `tier_rows` are the corpus rows that carry
     /// factors (strictly ascending, in range), `inclusion[t]` the design
     /// inclusion probability of `tier_rows[t]` (all `1.0` for an unweighted
-    /// tier — see [`Self::with_unweighted_tier`]), and `metric` the
+    /// tier), and `metric` the
     /// [`RowMetric`] built over exactly those rows in that order.
     pub fn with_designed_tier(
         n_rows: usize,
@@ -141,27 +131,9 @@ impl TieredHarvest {
         })
     }
 
-    /// Convenience: a Fisher tier whose membership was not importance-designed
-    /// (e.g. an exhaustive small-corpus harvest, where the tier IS the corpus,
-    /// or a fixed audit slice). All inclusion probabilities are `1.0`, so
-    /// lifted estimates apply no correction.
-    pub fn with_unweighted_tier(
-        n_rows: usize,
-        tier_rows: Vec<usize>,
-        metric: RowMetric,
-    ) -> Result<Self, String> {
-        let inclusion = vec![1.0; tier_rows.len()];
-        Self::with_designed_tier(n_rows, tier_rows, inclusion, metric)
-    }
-
     /// Total corpus rows (tier 1).
     pub fn n_rows(&self) -> usize {
         self.n_rows
-    }
-
-    /// Whether a Fisher tier exists at all.
-    pub fn has_fisher_tier(&self) -> bool {
-        self.fisher.is_some()
     }
 
     /// Fraction of corpus rows carrying factors (`0.0` with no tier).
@@ -170,40 +142,6 @@ impl TieredHarvest {
             (Some(t), n) if n > 0 => t.rows.len() as f64 / n as f64,
             _ => 0.0,
         }
-    }
-
-    /// The corpus rows of the Fisher tier (ascending), empty with no tier.
-    pub fn tier_rows(&self) -> &[usize] {
-        self.fisher.as_ref().map_or(&[], |t| &t.rows)
-    }
-
-    /// The tier metric — `None` when no Fisher tier exists. **Indexed by tier
-    /// row**: row `t` of the returned metric is corpus row
-    /// `self.tier_rows()[t]`. Consumers serving the gauge/lens roles iterate
-    /// the tier, not the corpus; that is the whole point of the shape.
-    pub fn tier_metric(&self) -> Option<&RowMetric> {
-        self.fisher.as_ref().map(|t| &t.metric)
-    }
-
-    /// Provenance of the tier metric, `None` with no tier. A consumer that
-    /// certifies "which inner product produced this report" (#980 Object 4)
-    /// reads this together with [`Self::coverage`].
-    pub fn tier_provenance(&self) -> Option<MetricProvenance> {
-        self.fisher.as_ref().map(|t| t.metric.provenance())
-    }
-
-    /// Map a corpus row to its tier row, or `None` if the row carries no
-    /// factors. O(log tier) binary search; never an error and never a
-    /// fabricated factor — `None` IS the graceful-absence answer every metric
-    /// consumer must accept.
-    pub fn tier_row_for(&self, corpus_row: usize) -> Option<usize> {
-        let tier = self.fisher.as_ref()?;
-        tier.rows.binary_search(&corpus_row).ok()
-    }
-
-    /// Whether a specific corpus row carries Fisher factors.
-    pub fn has_factors(&self, corpus_row: usize) -> bool {
-        self.tier_row_for(corpus_row).is_some()
     }
 
     /// Lift the tier's Fisher masses to a full-corpus enrichment measure
@@ -251,21 +189,6 @@ impl TieredHarvest {
             masses[r] = corrected[t];
         }
         RowSamplingMeasure::from_masses(tier.metric.provenance(), masses)
-    }
-
-    /// Plan the **next** harvest's Fisher tier: a designed subsample of
-    /// `budget` corpus rows drawn from this harvest's lifted measure
-    /// (uniform on a first harvest with no tier — cold start is just the
-    /// degenerate design). Returns the design (rows ascending + inclusion
-    /// weights as `1/π` likelihood weights); the caller harvests factors for
-    /// exactly those rows and builds the next [`TieredHarvest`] with
-    /// `inclusion[t] = 1 / likelihood_weights[t]`.
-    pub fn plan_next_tier(
-        &self,
-        budget: usize,
-        seed: u64,
-    ) -> gam_solve::row_sampling_measure::DesignedRowSample {
-        self.corpus_measure().designed_subsample(budget, seed)
     }
 }
 
