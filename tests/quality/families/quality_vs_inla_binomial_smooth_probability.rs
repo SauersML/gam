@@ -22,6 +22,13 @@
 //! reproduces INLA's fitted output — only that gam is at least as close to the
 //! GROUND TRUTH.
 //!
+//! PAIRED over draws, not one draw (#2395). Either engine's RMSE against the
+//! truth depends on which Bernoulli draw it fit, so one draw's ratio conflates
+//! the draw with the engine. Both engines fit the SAME `K_SEEDS` draws, and the
+//! decision is `assert_paired_match_or_beat`, which compares them draw by draw
+//! so the common noise cancels, and additionally requires that gam not be
+//! RESOLVED worse across draws.
+//!
 //! Calibration (uncertainty, secondary, against truth): gam's delta-method
 //! posterior SD on the probability scale must give honest coverage. We check
 //! that the +/- 2 SD band around gam's fitted probability covers `p_true` for
@@ -39,11 +46,11 @@
 //!
 //! Data. The Haberman breast-cancer study (`bench/datasets/haberman.csv`,
 //! n = 306). The smooth covariate is patient **age** at operation; the binary
-//! response is the synthetic censoring indicator drawn from `p_true(age)` plus a
-//! fixed-seed Bernoulli draw. The *same* {age, y} pair is handed to BOTH engines
-//! (gam reads them from the encoded dataset; INLA reads the identical columns),
-//! so there is zero data-encoding skew and both are scored against the identical
-//! `p_true`.
+//! response is a synthetic indicator drawn from `p_true(age)`, once for each of
+//! `K_SEEDS` fixed seeds. Every draw's {age, y} columns are handed to BOTH
+//! engines (gam reads them from the encoded dataset; INLA reads the identical
+//! columns), so there is zero data-encoding skew and both are scored against the
+//! identical `p_true`.
 //!
 //! Both engines fit `y ~ s(age)` (gam: thin-plate `s(x, bs='tp')`; INLA:
 //! `f(age, model="rw2", scale.model=TRUE)`, the canonical INLA penalized smooth),
@@ -54,7 +61,8 @@ use gam::predict::standard::StandardPredictor;
 use gam::predict::{PosteriorMeanOptions, PredictInput, PredictableModel};
 use gam::smooth::build_term_collection_design;
 use gam::test_support::reference::{
-    Column, QualityPair, r_package_available, relative_l2, rmse, run_r,
+    Column, PairedFoldComparison, QualityPair, assert_paired_match_or_beat, r_package_available,
+    relative_l2, rmse, run_r,
 };
 use gam::types::{InverseLink, LikelihoodSpec, ResponseFamily, StandardLink};
 use gam::{
@@ -129,46 +137,16 @@ fn haberman_ages() -> Vec<f64> {
     ages
 }
 
-#[test]
-fn gam_binomial_smooth_recovers_true_probability() {
-    init_parallelism();
+/// Paired Bernoulli draws per panel. See the "PAIRED over draws" note above.
+const K_SEEDS: usize = 25;
+/// Seed of the first draw: the single draw the unpaired version of this test used.
+const FIRST_SEED: u64 = 20260529;
 
-    // ---- identical data for both engines ----------------------------------
-    // Covariate: real patient age. Response: synthetic binary censoring
-    // indicator drawn from the KNOWN smooth latent probability p_true(age),
-    //   eta_true(age) = 1.4*sin((age-30)/13) - 0.9,  p_true = logit^{-1}(eta),
-    // then y ~ Bernoulli(p_true) with a fixed seed. The exact {age, y} pair
-    // below is what BOTH gam and INLA receive, and p_true is the ground truth
-    // both are scored against.
-    let ages = haberman_ages();
+/// One draw's gam fit `y ~ s(age)`, binomial/logit by REML: the posterior-mean
+/// probability and its delta-method posterior SD at the training ages, and the
+/// fit's total EDF.
+fn gam_probability_and_sd(ages: &[f64], y: &[f64]) -> (Vec<f64>, Vec<f64>, f64) {
     let n = ages.len();
-    let mut rng = StdRng::seed_from_u64(20260529);
-    let u01 = Uniform::new(0.0_f64, 1.0).expect("uniform [0,1]");
-    let mut y = Vec::with_capacity(n);
-    let mut truth = Vec::with_capacity(n);
-    for &age in &ages {
-        let p = p_true(age);
-        truth.push(p);
-        let draw = if u01.sample(&mut rng) < p { 1.0 } else { 0.0 };
-        y.push(draw);
-    }
-    // Sanity: the response must be a genuine two-class signal, not degenerate.
-    let n_pos: usize = y.iter().filter(|&&v| v > 0.5).count();
-    assert!(
-        n_pos > 30 && n_pos < n - 30,
-        "synthetic binary response is degenerate: {n_pos}/{n} positive"
-    );
-    // The latent probability must carry real signal: a meaningful spread is what
-    // makes "recover the curve" a non-trivial claim and sets the accuracy scale.
-    let p_min = truth.iter().cloned().fold(f64::INFINITY, f64::min);
-    let p_max = truth.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
-    let signal_range = p_max - p_min;
-    assert!(
-        signal_range > 0.3,
-        "latent probability signal too flat to test recovery: range={signal_range:.3}"
-    );
-
-    // ---- fit with gam: y ~ s(age, bs='tp'), binomial/logit, REML ----------
     let headers: Vec<String> = ["age", "y"].into_iter().map(String::from).collect();
     let mut rows = Vec::with_capacity(n);
     for i in 0..n {
@@ -246,22 +224,59 @@ fn gam_binomial_smooth_recovers_true_probability() {
         let p = invlogit(gam_eta[i]);
         gam_prob_sd.push(p * (1.0 - p) * sd_eta);
     }
+    (gam_prob, gam_prob_sd, gam_edf)
+}
 
-    // ---- PRIMARY objective metric: gam recovers the TRUE probability ------
-    let gam_rmse_truth = rmse(&gam_prob, &truth);
+#[test]
+fn gam_binomial_smooth_recovers_true_probability() {
+    init_parallelism();
 
-    // ---- fit the SAME data with R-INLA (baseline to match-or-beat) --------
-    // INLA's canonical penalized smooth for a 1-D covariate is a second-order
-    // random walk f(x, model="rw2", scale.model=TRUE). We score INLA's fitted
-    // probability against the SAME ground-truth p_true; INLA is the incumbent
-    // accuracy bar, not a target gam must reproduce.
-    if !r_package_available("INLA") {
-        // R-INLA absent: drop the match-or-beat arm but still enforce every
-        // tool-free, gam-side claim on the ground truth p_true, recomputed here
-        // from the pre-run_r values (gam_prob/gam_prob_sd + truth) with the
-        // identical formulas and thresholds used below.
-        let truth_bar = 0.25 * signal_range;
-        let mut covered = 0usize;
+    // ---- identical data for both engines, one draw per seed ---------------
+    // Covariate: real patient age. Response: a synthetic binary indicator
+    // drawn from the KNOWN smooth latent probability p_true(age),
+    //   eta_true(age) = 1.4*sin((age-30)/13) - 0.9,  p_true = logit^{-1}(eta),
+    // then y ~ Bernoulli(p_true) once per seed. Every draw's {age, y} pair is
+    // what BOTH gam and INLA receive, and p_true is the ground truth both are
+    // scored against.
+    let ages = haberman_ages();
+    let n = ages.len();
+    let truth: Vec<f64> = ages.iter().map(|&age| p_true(age)).collect();
+    // The latent probability must carry real signal: a meaningful spread is what
+    // makes "recover the curve" a non-trivial claim and sets the accuracy scale.
+    let p_min = truth.iter().cloned().fold(f64::INFINITY, f64::min);
+    let p_max = truth.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+    let signal_range = p_max - p_min;
+    assert!(
+        signal_range > 0.3,
+        "latent probability signal too flat to test recovery: range={signal_range:.3}"
+    );
+
+    // ---- gam on every draw, and the long-format data the reference replays -
+    let u01 = Uniform::new(0.0_f64, 1.0).expect("uniform [0,1]");
+    let mut gam_rmses = Vec::with_capacity(K_SEEDS);
+    let mut gam_edf_total = 0.0;
+    let mut covered = 0usize;
+    let mut long_seed = Vec::with_capacity(K_SEEDS * n);
+    let mut long_age = Vec::with_capacity(K_SEEDS * n);
+    let mut long_y = Vec::with_capacity(K_SEEDS * n);
+    for k in 0..K_SEEDS {
+        let seed = FIRST_SEED + k as u64;
+        let mut rng = StdRng::seed_from_u64(seed);
+        let y: Vec<f64> = truth
+            .iter()
+            .map(|&p| if u01.sample(&mut rng) < p { 1.0 } else { 0.0 })
+            .collect();
+        // Sanity: each draw must be a genuine two-class signal, not degenerate.
+        let n_pos = y.iter().filter(|&&v| v > 0.5).count();
+        assert!(
+            n_pos > 30 && n_pos < n - 30,
+            "synthetic binary response of seed {seed} is degenerate: {n_pos}/{n} positive"
+        );
+
+        let (gam_prob, gam_prob_sd, gam_edf) = gam_probability_and_sd(&ages, &y);
+        gam_rmses.push(rmse(&gam_prob, &truth));
+        gam_edf_total += gam_edf;
+        // Coverage of p_true by gam's +/- 2 SD probability band, pooled over draws.
         for i in 0..n {
             let lo = gam_prob[i] - 2.0 * gam_prob_sd[i];
             let hi = gam_prob[i] + 2.0 * gam_prob_sd[i];
@@ -269,127 +284,143 @@ fn gam_binomial_smooth_recovers_true_probability() {
                 covered += 1;
             }
         }
-        let coverage = covered as f64 / n as f64;
+        for i in 0..n {
+            long_seed.push(seed as f64);
+            long_age.push(ages[i]);
+            long_y.push(y[i]);
+        }
+    }
+    let coverage = covered as f64 / (K_SEEDS * n) as f64;
+    let gam_edf_mean = gam_edf_total / K_SEEDS as f64;
+    let gam_rmse_mean = gam_rmses.iter().sum::<f64>() / K_SEEDS as f64;
+
+    // TRUTH RECOVERY bar, shared by both branches below. gam's fitted
+    // probability must reconstruct the generating curve to a small fraction of
+    // the probability signal's own range. With ~300 Bernoulli points the
+    // irreducible per-point sampling wobble is O(sqrt(p(1-p)/local_n)); a
+    // well-smoothed fit averages it out, so RMSE against the smooth truth should
+    // sit far below the signal spread. 25% of the signal range is a
+    // generous-but-real bar: a fit that ignored age and predicted the grand mean
+    // would land near the signal's own RMS spread (~30-40% of range), so 25%
+    // genuinely demands the curve be recovered, while staying loose enough to
+    // absorb honest Bernoulli noise.
+    let truth_bar = 0.25 * signal_range;
+
+    // ---- fit the SAME draws with R-INLA (baseline to match-or-beat) --------
+    // INLA's canonical penalized smooth for a 1-D covariate is a second-order
+    // random walk f(x, model="rw2", scale.model=TRUE). We score INLA's fitted
+    // probability against the SAME ground-truth p_true; INLA is the incumbent
+    // accuracy bar, not a target gam must reproduce.
+    if !r_package_available("INLA") {
+        // R-INLA absent: drop the match-or-beat arm but still enforce every
+        // tool-free, gam-side claim on the ground truth p_true, with the
+        // identical thresholds used below.
         eprintln!(
             "R-INLA unavailable — asserting gam's tool-free absolute quality only \
-             (skipping match-or-beat arm): RMSE_to_truth={gam_rmse_truth:.4} \
-             (bound {truth_bar:.4})  +/-2SD coverage of p_true={coverage:.3} (floor 0.80)"
+             (skipping match-or-beat arm): K={K_SEEDS} fold-mean \
+             RMSE_to_truth={gam_rmse_mean:.4} (bound {truth_bar:.4})  \
+             pooled +/-2SD coverage of p_true={coverage:.3} (floor 0.80)"
         );
         assert!(
-            gam_rmse_truth < truth_bar,
+            gam_rmse_mean < truth_bar,
             "gam failed to recover the true probability curve: \
-             RMSE_to_truth={gam_rmse_truth:.4} (bound {truth_bar:.4} = 0.25*signal_range)"
+             fold-mean RMSE_to_truth={gam_rmse_mean:.4} (bound {truth_bar:.4} = 0.25*signal_range)"
         );
         assert!(
             coverage >= 0.80,
             "gam's +/-2SD probability band under-covers the true curve: \
-             coverage={coverage:.3} (floor 0.80)"
+             pooled coverage={coverage:.3} (floor 0.80)"
         );
         return;
     }
     let r = run_r(
-        &[Column::new("age", &ages), Column::new("y", &y)],
+        &[
+            Column::new("seed", &long_seed),
+            Column::new("age", &long_age),
+            Column::new("y", &long_y),
+        ],
         r#"
         suppressPackageStartupMessages(library(INLA))
-        # rw2 requires an integer location index; group identical ages so the
-        # random walk is defined on the sorted unique-age grid, then map each
-        # observation back to its grid node. This is the standard INLA recipe
-        # for a smooth effect of a continuous covariate.
-        df$ageidx <- as.integer(factor(df$age, levels = sort(unique(df$age))))
-        m <- inla(
-            y ~ -1 + f(ageidx, model = "rw2", scale.model = TRUE,
-                       constr = TRUE) + 1,
-            family = "binomial",
-            data = df,
-            Ntrials = rep(1, nrow(df)),
-            control.predictor = list(compute = TRUE, link = 1),
-            control.compute = list(config = TRUE)
-        )
-        fv <- m$summary.fitted.values
-        emit("prob", as.numeric(fv$mean[seq_len(nrow(df))]))
+        prob_all <- c()
+        for (s in sort(unique(df$seed))) {
+            d <- df[df$seed == s, c("age", "y")]
+            # rw2 requires an integer location index; group identical ages so the
+            # random walk is defined on the sorted unique-age grid, then map each
+            # observation back to its grid node. This is the standard INLA recipe
+            # for a smooth effect of a continuous covariate.
+            d$ageidx <- as.integer(factor(d$age, levels = sort(unique(d$age))))
+            m <- inla(
+                y ~ -1 + f(ageidx, model = "rw2", scale.model = TRUE,
+                           constr = TRUE) + 1,
+                family = "binomial",
+                data = d,
+                Ntrials = rep(1, nrow(d)),
+                control.predictor = list(compute = TRUE, link = 1),
+                control.compute = list(config = TRUE)
+            )
+            prob_all <- c(prob_all,
+                as.numeric(m$summary.fitted.values$mean[seq_len(nrow(d))]))
+        }
+        emit("prob", prob_all)
         "#,
     );
-    let inla_prob = r.vector("prob");
+    let inla_prob_flat = r.vector("prob");
     assert_eq!(
-        inla_prob.len(),
-        n,
-        "INLA fitted-probability length mismatch"
+        inla_prob_flat.len(),
+        K_SEEDS * n,
+        "INLA fitted-probability panel length mismatch"
     );
-    let inla_rmse_truth = rmse(inla_prob, &truth);
+    let inla_rmses: Vec<f64> = (0..K_SEEDS)
+        .map(|k| rmse(&inla_prob_flat[k * n..(k + 1) * n], &truth))
+        .collect();
 
-    // Empirical coverage of p_true by gam's +/- 2 SD probability band.
-    let mut covered = 0usize;
-    for i in 0..n {
-        let lo = gam_prob[i] - 2.0 * gam_prob_sd[i];
-        let hi = gam_prob[i] + 2.0 * gam_prob_sd[i];
-        if truth[i] >= lo && truth[i] <= hi {
-            covered += 1;
-        }
-    }
-    let coverage = covered as f64 / n as f64;
-
-    // Context only (NOT a pass criterion): how close the two fits happen to be.
-    let rel_prob_vs_inla = relative_l2(&gam_prob, inla_prob);
-
+    // ---- paired panel: same draw, same bytes, draw by draw ----------------
+    let panel = PairedFoldComparison::new(&gam_rmses, &inla_rmses, true);
     eprintln!(
-        "haberman s(age) binomial/logit  n={n}  pos={n_pos}  gam_edf={gam_edf:.3}  \
-         signal_range={signal_range:.3}\n  \
-         RMSE_to_truth: gam={gam_rmse_truth:.4}  inla={inla_rmse_truth:.4}  \
-         (gam/inla={:.3})\n  \
-         +/-2SD coverage of p_true (gam)={coverage:.3}  \
-         [context only] rel_l2(gam,inla)={rel_prob_vs_inla:.4}",
-        gam_rmse_truth / inla_rmse_truth.max(1e-12)
+        "haberman s(age) binomial/logit K={K_SEEDS}-seed paired: n={n} \
+         signal_range={signal_range:.3} mean_gam_edf={gam_edf_mean:.3}\n  \
+         fold-mean RMSE_to_truth: gam={:.4}  inla={:.4}\n  \
+         pooled +/-2SD coverage of p_true (gam)={coverage:.3}",
+        panel.gam_mean, panel.reference_mean,
     );
+    eprintln!("{}", panel.report("inla_binomial::prob"));
     eprintln!(
         "{}",
-        QualityPair::error(
+        QualityPair::paired(
             "families",
             "quality_vs_inla_binomial_smooth_probability",
             "prob_rmse_to_truth",
-            gam_rmse_truth,
             "inla",
-            inla_rmse_truth,
+            &panel,
         )
         .line()
     );
 
-    // ---- principled, un-weakened objective bounds -------------------------
-    // (1) TRUTH RECOVERY (primary). gam's fitted probability must reconstruct
-    // the generating curve to a small fraction of the probability signal's own
-    // range. With ~300 Bernoulli points the irreducible per-point sampling
-    // wobble is O(sqrt(p(1-p)/local_n)); a well-smoothed fit averages it out, so
-    // RMSE against the smooth truth should sit far below the signal spread. 25%
-    // of the signal range is a generous-but-real bar: a fit that ignored age and
-    // predicted the grand mean would land near the signal's own RMS spread
-    // (~30-40% of range), so 25% genuinely demands the curve be recovered, while
-    // staying loose enough to absorb honest Bernoulli noise.
-    let truth_bar = 0.25 * signal_range;
+    // (1) TRUTH RECOVERY (primary), on the fold mean.
     assert!(
-        gam_rmse_truth < truth_bar,
+        panel.gam_mean < truth_bar,
         "gam failed to recover the true probability curve: \
-         RMSE_to_truth={gam_rmse_truth:.4} (bound {truth_bar:.4} = 0.25*signal_range)"
+         fold-mean RMSE_to_truth={:.4} (bound {truth_bar:.4} = 0.25*signal_range)",
+        panel.gam_mean
     );
 
-    // (2) MATCH-OR-BEAT INLA on accuracy. gam may not be meaningfully less
-    // accurate than the incumbent at recovering the same ground truth.
-    assert!(
-        gam_rmse_truth <= inla_rmse_truth * 1.10,
-        "gam less accurate than INLA at recovering the truth: \
-         gam_RMSE={gam_rmse_truth:.4} > 1.10*inla_RMSE={:.4}",
-        inla_rmse_truth * 1.10
-    );
+    // (2) MATCH-OR-BEAT INLA on accuracy, paired across the K shared draws: gam
+    // may not be meaningfully less accurate than the incumbent at recovering the
+    // same ground truth, nor resolved worse across draws.
+    assert_paired_match_or_beat("inla_binomial::prob", &panel, 1.10);
 
     // (3) CALIBRATION against truth. gam's reported probability-scale
     // uncertainty must not be anti-conservatively narrow: a +/- 2 SD band
     // (nominal ~95% for a Gaussian latent posterior) should cover the TRUE curve
-    // for a large majority of points. We require >= 0.80 empirical coverage — a
-    // one-sided floor that catches a posterior SD collapsed too tight to be
-    // honest, without penalizing the legitimate slack of a smooth fit at a true
-    // curve (the band is around the fit, which itself tracks the truth).
+    // for a large majority of points. We require >= 0.80 empirical coverage,
+    // pooled over the draws — a one-sided floor that catches a posterior SD
+    // collapsed too tight to be honest, without penalizing the legitimate slack
+    // of a smooth fit at a true curve (the band is around the fit, which itself
+    // tracks the truth).
     assert!(
         coverage >= 0.80,
         "gam's +/-2SD probability band under-covers the true curve: \
-         coverage={coverage:.3} (floor 0.80)"
+         pooled coverage={coverage:.3} (floor 0.80)"
     );
 }
 
