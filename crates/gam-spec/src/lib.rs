@@ -843,8 +843,8 @@ impl ResponseFamily {
                 if y.is_empty() {
                     return Ok(());
                 }
-                let all_zeros = y.iter().all(|&yi| (yi - 0.0).abs() < BINOMIAL_BINARY_TOL);
-                let all_ones = y.iter().all(|&yi| (yi - 1.0).abs() < BINOMIAL_BINARY_TOL);
+                let all_zeros = y.iter().all(|&yi| yi == 0.0);
+                let all_ones = y.iter().all(|&yi| yi == 1.0);
                 let kind = if all_zeros {
                     ResponseDegeneracyKind::BinomialAllZeros
                 } else if all_ones {
@@ -971,12 +971,7 @@ impl ResponseFamily {
             }),
             ResponseColumnKind::Binary => Ok(Self::Binomial),
             ResponseColumnKind::Numeric => {
-                let binary = !y.is_empty()
-                    && y.iter().all(|v| {
-                        v.is_finite()
-                            && ((*v - 0.0).abs() < BINOMIAL_BINARY_TOL
-                                || (*v - 1.0).abs() < BINOMIAL_BINARY_TOL)
-                    });
+                let binary = !y.is_empty() && y.iter().all(|&v| v == 0.0 || v == 1.0);
                 if binary {
                     return Ok(Self::Binomial);
                 }
@@ -1065,18 +1060,6 @@ impl std::fmt::Display for ResponseSupportViolation {
 
 impl std::error::Error for ResponseSupportViolation {}
 
-/// Absolute tolerance for the exact-`{0, 1}` test that defines the scalar
-/// Bernoulli (`Binomial`) response support.
-///
-/// The scalar `Binomial` family carries no per-row trial count, so its
-/// log-likelihood is the Bernoulli/soft-label cross-entropy
-/// `ℓ(η) = y·η − log(1 + eη)`, which is unbounded above for `y ∉ {0, 1}`.
-/// Both the auto-inference (`infer_from_response`) and degeneracy
-/// (`validate_response_degeneracy`) paths classify a value as binary by the
-/// same `1e-12` window; the support check shares this single threshold so the
-/// three layers agree on exactly which responses are admissible.
-pub const BINOMIAL_BINARY_TOL: f64 = 1.0e-12;
-
 /// Minimum admissible sample standard deviation for a `Gaussian` response.
 ///
 /// A response whose two-pass, mean-centred sample sd is at or below this
@@ -1101,11 +1084,10 @@ pub const GAUSSIAN_MIN_SAMPLE_SD: f64 = 1.0e-10;
 ///
 /// `infer_from_response` classifies a numeric response as a Poisson count when
 /// every value is finite, non-negative, and within this window of its nearest
-/// non-negative integer. The threshold is looser than [`BINOMIAL_BINARY_TOL`]
-/// because count columns frequently arrive as `f64` round-trips of integers
-/// (CSV parse, integer→double promotion) that accumulate ULP-scale error well
-/// above `1e-12`; `1e-9` admits those without ever matching genuinely
-/// continuous data, whose fractional parts are O(1).
+/// non-negative integer. Count columns frequently arrive as `f64` round-trips
+/// of integers (CSV parse, integer→double promotion) that accumulate ULP-scale
+/// error; `1e-9` admits those without ever matching genuinely continuous data,
+/// whose fractional parts are O(1).
 pub const COUNT_INTEGER_TOL: f64 = 1.0e-9;
 
 /// Classifier for a [`ResponseDegeneracy`]. Each variant carries the family-
@@ -3391,6 +3373,31 @@ mod tests {
         let y = arr1(&[-1.0_f64, 0.0, 1.0]);
         let result = ResponseFamily::infer_from_response(y.view(), ResponseColumnKind::Numeric);
         assert!(matches!(result, Ok(ResponseFamily::Gaussian)));
+    }
+
+    #[test]
+    fn infer_numeric_value_one_ulp_below_one_is_not_binary() {
+        let y = arr1(&[0.0_f64, 1.0 - f64::EPSILON / 2.0]);
+        let result = ResponseFamily::infer_from_response(y.view(), ResponseColumnKind::Numeric);
+        assert!(matches!(result, Ok(ResponseFamily::Gaussian)));
+    }
+
+    #[test]
+    fn binomial_response_one_ulp_from_all_ones_is_not_saturated() {
+        let saturated = arr1(&[1.0_f64, 1.0, 1.0]);
+        assert!(matches!(
+            ResponseFamily::Binomial.validate_response_degeneracy(saturated.view()),
+            Err(ResponseDegeneracy {
+                kind: ResponseDegeneracyKind::BinomialAllOnes,
+                ..
+            })
+        ));
+        let soft = arr1(&[1.0_f64, 1.0 - f64::EPSILON / 2.0, 1.0]);
+        assert!(
+            ResponseFamily::Binomial
+                .validate_response_degeneracy(soft.view())
+                .is_ok()
+        );
     }
 
     // -----------------------------------------------------------------------

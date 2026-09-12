@@ -74,15 +74,6 @@ const SCALE_DESIGN_TARGET_CHUNK_BYTES: usize =
 // damping), so noise in the primary span is recovered exactly. This is the
 // primary safety net.
 const SCALE_PROJECTION_REPLAY_RCOND_FLOOR: f64 = 1e-8;
-// Optional tighter cap on coefficient amplification, used only when the
-// design is so well-conditioned that even the worst retained direction would
-// not amplify a unit prediction row beyond this multiple. For natural smooth
-// bases (cond ≈ 100–1000) this cap is dominated by the rcond floor and has no
-// effect; it kicks in only for nearly-orthogonal designs where one could
-// otherwise tighten the cutoff without losing real signal. Setting this much
-// smaller than `1 / RCOND_FLOOR` would discard real signal from moderately
-// conditioned bases and is intentionally avoided.
-const SCALE_PROJECTION_LEVERAGE_AMPLIFICATION: f64 = 1.0e8;
 // Above this many materialized entries (rows × noise columns) the scale-deviation
 // operator routes its normal-equation solve through matrix-free PCG instead of
 // forming a dense `XᵀWX`. The dense path costs `O(n · p²)` time and `O(p²)`
@@ -564,11 +555,9 @@ fn build_weighted_primary_design(
 /// Pick the squared singular-value cutoff for the replay solve.
 ///
 /// Retained directions use the exact inverse `1 / sigma_k`; directions at or
-/// below `sqrt(alpha)` are dropped. We want the worst-case prediction-row
-/// leverage amplification — a unit-norm new row transformed by the saved
-/// coefficients — to be at most `SCALE_PROJECTION_LEVERAGE_AMPLIFICATION`
+/// below `sqrt(alpha) = RCOND_FLOOR · sigma_max` are dropped, so no retained
+/// direction amplifies a unit-norm prediction row by more than `1 / RCOND_FLOOR`
 /// times what a sigma_max-scale direction sees in the un-regularized solve.
-/// The rcond floor supplies the minimum cutoff for numerical conditioning.
 fn choose_scale_projection_ridge_alpha(singular: &[f64]) -> f64 {
     if singular.is_empty() {
         return 0.0;
@@ -577,8 +566,7 @@ fn choose_scale_projection_ridge_alpha(singular: &[f64]) -> f64 {
     if !sigma_max.is_finite() || sigma_max <= 0.0 {
         return 0.0;
     }
-    let derived_tol = sigma_max / SCALE_PROJECTION_LEVERAGE_AMPLIFICATION;
-    let truncation_tol = derived_tol.max(SCALE_PROJECTION_REPLAY_RCOND_FLOOR * sigma_max);
+    let truncation_tol = SCALE_PROJECTION_REPLAY_RCOND_FLOOR * sigma_max;
     truncation_tol * truncation_tol
 }
 
@@ -621,7 +609,7 @@ fn solve_scale_projection(
     }
     // Truncated SVD with leverage-bound cutoff: directions resolved well
     // enough to keep coefficient amplification under
-    // SCALE_PROJECTION_LEVERAGE_AMPLIFICATION are inverted exactly (no
+    // `1 / SCALE_PROJECTION_REPLAY_RCOND_FLOOR` are inverted exactly (no
     // damping on the dominant components), and weaker directions are
     // dropped. The primary design is fixed across any single replay, so no
     // threshold-crossings occur within a call: the projection is a linear
@@ -983,9 +971,8 @@ mod tests {
 
     #[test]
     fn choose_scale_projection_ridge_alpha_scales_with_sigma_max() {
-        // Truncation tolerance is `RCOND_FLOOR * sigma_max` whenever the
-        // leverage cap is looser (which it always is for the default 1e8
-        // value), so alpha = (RCOND_FLOOR * sigma_max)^2.
+        // Truncation tolerance is `RCOND_FLOOR * sigma_max`, so
+        // alpha = (RCOND_FLOOR * sigma_max)^2.
         let alpha_unit = choose_scale_projection_ridge_alpha(&[1.0, 0.5, 1e-6]);
         let expected_unit = SCALE_PROJECTION_REPLAY_RCOND_FLOOR.powi(2);
         assert!(alpha_unit > 0.0);

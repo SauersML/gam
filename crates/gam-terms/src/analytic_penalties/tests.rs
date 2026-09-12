@@ -677,6 +677,40 @@ fn parametric_row_precision_domains_distinguish_log_strengths_from_raw_coordinat
     );
 }
 
+/// The conditional precision is `λ = α + β·r²` exactly. At a small `α` with an
+/// underflowed `β` it is `α` itself, and the log-α coordinate of the ρ-gradient
+/// at `t = 0` is `−½` per row, the derivative of `−½·ln λ` in `ln α`.
+#[test]
+fn parametric_row_precision_is_the_stated_precision_with_nothing_added() {
+    let log_alpha = -40.0_f64;
+    let weight = 1.7;
+    let penalty = ParametricRowPrecisionPriorPenalty::new(
+        PsiSlice::full(4, Some(2)),
+        array![[0.0_f64], [1.0]],
+        array![log_alpha, 0.0],
+        array![-800.0_f64, -0.5],
+        array![[0.0_f64], [0.5]],
+        weight,
+        2,
+        false,
+    )
+    .unwrap();
+    let rho = Array1::<f64>::zeros(6);
+    let t = Array1::<f64>::zeros(4);
+
+    let diag = penalty.diag_target(t.view(), rho.view());
+    for n in 0..2 {
+        assert_eq!(diag[n * 2], weight * log_alpha.exp());
+    }
+
+    let grad = penalty.grad_rho(t.view(), rho.view());
+    assert!(
+        (grad[0] + 1.0).abs() <= gam_linalg::roundoff::accumulation_growth(4),
+        "log-alpha gradient at t = 0 must be -1 over two rows, got {}",
+        grad[0]
+    );
+}
+
 #[test]
 fn sparsity_learnable_smoothing_has_one_structural_coordinate() {
     assert!(

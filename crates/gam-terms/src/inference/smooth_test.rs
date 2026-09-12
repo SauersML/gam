@@ -350,7 +350,7 @@ fn reference_df(influence: Option<&Array2<f64>>, start: usize, end: usize) -> Op
     let tr = (0..f_block.nrows()).map(|i| f_block[[i, i]]).sum::<f64>();
     let tr2 = f_block.dot(&f_block).diag().sum();
     if tr.is_finite() && tr2.is_finite() && tr > 0.0 && tr2 > 0.0 {
-        Some((tr * tr / tr2).max(1e-12))
+        Some(tr * tr / tr2)
     } else {
         None
     }

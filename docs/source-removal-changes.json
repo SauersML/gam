@@ -2858,5 +2858,15 @@
     ],
     "reason": "user directive: delete all useless slop",
     "evidence": "Batch B8, from gam-e0's measured inventory: crate-level src/amortized_encoder.rs goes whole. MSI git grep -F -w found no consumer for any of its pub items outside the file; its one user was manifold/amortized_routing.rs, which cbe5f218d removed. lib.rs loses `pub mod amortized_encoder;`. SaeManifoldTerm::amortized_encode_fitted, a wrapper nothing calls, is removed; amortized_encode_target stays live via amortized_encoder_consistency and warm_start_latents_from_amortized_encoder. Compile evidence, MSI job 440633 on lane sw8: these same changes, applied over main 57409ec77 as lane commit d26792868, passed `cargo check --workspace --exclude gam-pyffi --all-targets --keep-going` with rc 0 and no diagnostics (deny(warnings) intact), `cargo doc -p gam-sae --no-deps` with 0 errors, and the ban scanner with rc 0. This commit applies them over a later main, whose upstream delta since then adds no use of any name removed here. It is pushed at once under the user's commit-after-every-edit directive and checked at the pushed sha afterwards. scripts/source_removal_guard.py listed exactly these 28 identities, and the census and difference functions of scripts/test_census.py and scripts/public_api_census.py measured the test and public-function deltas this commit acknowledges."
+  },
+  {
+    "base": "8259118692780d5bb3121972edd8fe5f3cdd02c0",
+    "items": [
+      "crates/gam-model-kernels/src/scale_design.rs:const:SCALE_PROJECTION_LEVERAGE_AMPLIFICATION",
+      "crates/gam-spec/src/lib.rs:const:BINOMIAL_BINARY_TOL",
+      "crates/gam-terms/src/analytic_penalties/penalty_trait.rs:const:MIN_CONDITIONAL_PRECISION"
+    ],
+    "reason": "#2469: MIN_CONDITIONAL_PRECISION (1e-12) was added to the row-precision prior's lambda = alpha + beta*r^2, which is already positive (alpha = exp(rho) on the log-strength domain, beta*r^2 >= 0); BINOMIAL_BINARY_TOL (1e-12) admitted values near 0 or 1 as binary, now exact membership; SCALE_PROJECTION_LEVERAGE_AMPLIFICATION (1e8) was 1/RCOND_FLOOR written a second time, so max(sigma_max/1e8, RCOND_FLOOR*sigma_max) is RCOND_FLOOR*sigma_max.",
+    "evidence": "At the base, git grep finds MIN_CONDITIONAL_PRECISION only in crates/gam-terms/src/analytic_penalties/penalty_trait.rs and row_precision.rs, BINOMIAL_BINARY_TOL only in crates/gam-spec/src/lib.rs, and SCALE_PROJECTION_LEVERAGE_AMPLIFICATION only in crates/gam-model-kernels/src/scale_design.rs; every one of those files is edited here and no use remains."
   }
 ]

@@ -945,9 +945,11 @@ impl ParametricRowPrecisionPriorPenalty {
     }
 
     fn lambda_at(&self, n: usize, k: usize, rho: ArrayView1<'_, f64>) -> f64 {
+        // `α = exp(ρ)` on the log-strength domain is positive and `β·r² ≥ 0`, so
+        // the conditional precision is positive with nothing added to it.
         let alpha = validated_exp_log_strength(self.active_log_alpha(k, rho));
         let beta = gam_linalg::utils::stable_softplus(self.active_raw_beta(k, rho));
-        MIN_CONDITIONAL_PRECISION + alpha + beta * self.dist2(n, k, rho)
+        alpha + beta * self.dist2(n, k, rho)
     }
 
     fn dist2(&self, n: usize, k: usize, rho: ArrayView1<'_, f64>) -> f64 {
@@ -1131,9 +1133,9 @@ impl AnalyticPenalty for ParametricRowPrecisionPriorPenalty {
                 let tk = t[[n, k]];
                 let sq = tk * tk;
                 let r2 = self.dist2(n, k, rho);
-                // Same floored λ as `lambda_at`/`value`, so this gradient is the
-                // exact derivative of the evaluated energy (no value↔grad drift).
-                let lambda = MIN_CONDITIONAL_PRECISION + alpha + beta * r2;
+                // Same λ as `lambda_at`/`value`, so this gradient is the exact
+                // derivative of the evaluated energy (no value↔grad drift).
+                let lambda = alpha + beta * r2;
                 let precision_score = 0.5 * weight * sq - 0.5 / lambda;
                 grad_weight_direct += 0.5 * weight * lambda * sq;
                 grad_alpha_direct += precision_score;
