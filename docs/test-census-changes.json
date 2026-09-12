@@ -142,5 +142,17 @@
       "crates/gam-linalg": 5,
       "crates/gam-solve": 3
     }
+  },
+  {
+    "base": "df144abcf64ad8c7cc55d3aa59e9f6f8db3655fa",
+    "reason": "Historical acknowledgement for 65c63d9df (#2668): the quasi-Laplace complexity now charges the joint log-det, 1/2 log|A| + rank charge, instead of 1/2 (log|A| - log|A_tt|) + rank charge. Subtracting the coordinate block removed the only place the ARD precision entered the complexity, while loss.ard kept its -1/2 n log(alpha) normalizer, so V fell linearly in log alpha on a collapsing axis. With the coordinate block gone, `coordinate_block_logdet_theta_adjoint` and every coordinate-only gradient leg were deleted, and threshold_gate_coordinate_block_theta_adjoint_matches_finite_difference_2500, which differenced that helper, had nothing left to measure.",
+    "evidence": "Measured on MSI with scripts/test_census.py --base df144abcf --head 65c63d9df: 1 fewer test, removed pin threshold_gate_coordinate_block_theta_adjoint_matches_finite_difference_2500, unit decrease crates/gam-sae 1. Test source integrity then reported the floor shortfall {\"issues/2500\": [6, 5]} (run 34653782173 at 9ce7d7d1e, and on MSI at bab62c696). The remaining #2500 pins in crates/gam-sae/src/manifold/tests_sparse_curvature_operator_2500.rs still gate the joint route: threshold_gate_dense_exact_a_sparse_logdet_trace_matches_finite_difference_2500, threshold_gate_sparse_operator_is_the_installed_exact_a_derivative_2500, dense_theta_adjoint_is_not_interchangeable_for_a_threshold_gate_2500, deflation_map_applies_to_every_row_local_curvature_coordinate_2500 and threshold_gate_outer_solve_is_not_aborted_by_an_unmodelled_sparse_operator_2500. docs/test-census-floor.json is regenerated from main's tip in the same change.",
+    "removed_pins": {
+      "threshold_gate_coordinate_block_theta_adjoint_matches_finite_difference_2500": 1
+    },
+    "test_count_decrease": 1,
+    "unit_test_decreases": {
+      "crates/gam-sae": 1
+    }
   }
 ]
