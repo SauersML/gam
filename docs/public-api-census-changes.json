@@ -1360,5 +1360,14 @@
     },
     "reason": "MISSION relaunch item 4 and the user's directive to delete useless public API: encode_grad_hess was a pub wrapper over the crate-internal encode_grad_hess_core with no product caller, and description_length::score with the Featurizer methods m, residual, selection_bits_combinatorial and selection_bits_charged served only a test helper. No gam-cli, gam-pyffi, python, examples or other-crate production code uses them.",
     "evidence": "At the base, git grep -w over crates, src, tests, examples, bench and gamfit finds encode_grad_hess only in encode.rs (declaration, one encode_fix_tests call and prose) and sae_contract_probe_tests.rs; score, m, residual, selection_bits_charged and selection_bits_combinatorial as description_length items only in description_length.rs and description_length_tests.rs. Both field tests now call encode_grad_hess_core with EncodeObjective::euclidean(). Salvaged from scratchpad/sae-red/b8.patch (pin c75156782)."
+  },
+  {
+    "base": "cf4a2938b3924d9b0b29c9d6d081b4a404cf8ad1",
+    "removed": {
+      "crates/gam-models/src/gamlss/binomial/kernel.rs::binomial_location_scale_nll_generic": 1,
+      "crates/gam-models/src/gamlss/binomial/kernel.rs::binomial_location_scale_nll_gradient": 1
+    },
+    "reason": "#932: these pub(crate) entry points were the generic-scalar statement of the binomial location-scale row NLL and its Order1 gradient; the row is now declared once by binomial_ls_row_program, and binomial_location_scale_row_score / binomial_location_scale_row_hessian read its emitted order-2 surface.",
+    "evidence": "At the base, git grep -w finds both names only in crates/gam-models/src/gamlss/binomial/kernel.rs, gamlss/binomial/location_scale.rs (two gradient callers, now binomial_location_scale_row_score) and gamlss/test_support.rs (the tower oracle, now binomial_location_scale_nll_in_predictors). Salvaged from scratchpad/landing1.patch."
   }
 ]

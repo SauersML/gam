@@ -3632,5 +3632,21 @@
     ],
     "reason": "User directive, delete all slop and code only used in tests: encode::EncodeResult lost its last producer when the batch encoders were deleted, and only its Certificate impl (the claim/evidence/verdict declarations removed from gam-sae certificate_impls.rs) and one integration test built it; encode::encode_grad_hess was a pub wrapper over encode_grad_hess_core with no production caller; description_length::Featurizer was constructed only by the test helper feat, so Featurizer, ScoreRow, score and the Featurizer methods m, residual, selection_bits_combinatorial and selection_bits_charged were reachable only from score_uses_reverse_water_filling_for_total_distortion. The tests that exercised only these items go with them; the two encode field tests now call encode_grad_hess_core with EncodeObjective::euclidean(), which the core documents as bit-identical.",
     "evidence": "At the base, git grep -w over crates, src, tests, examples, bench and gamfit finds EncodeResult only in encode.rs, gam-sae certificate_impls.rs, tests/identifiability/misc/certificate_ledger_unified.rs and module prose in gam-inference, gam-problem and gam-solve; encode_grad_hess only in encode.rs and sae_contract_probe_tests.rs; Featurizer, the gam-sae ScoreRow, score, selection_bits_charged and selection_bits_combinatorial only in description_length.rs, description_length_tests.rs and eq4_description_length.rs prose (gam-solve evidence.rs ScoreRow is a different type; bench/*.py mention a Featurizer concept in comments only). Salvaged from the unpushed overnight swarm patch scratchpad/sae-red/b8.patch (pin c75156782), which the shared working tree held byte-for-byte."
+  },
+  {
+    "base": "cf4a2938b3924d9b0b29c9d6d081b4a404cf8ad1",
+    "items": [
+      "crates/gam-models/src/gamlss/binomial/kernel.rs:fn:assert_bits",
+      "crates/gam-models/src/gamlss/binomial/kernel.rs:fn:binomial_location_scale_nll_generic",
+      "crates/gam-models/src/gamlss/binomial/kernel.rs:fn:binomial_location_scale_nll_generic_from_core_row",
+      "crates/gam-models/src/gamlss/binomial/kernel.rs:fn:binomial_location_scale_nll_gradient",
+      "crates/gam-models/src/gamlss/binomial/kernel.rs:fn:binomial_ls_directional_fourth_batch",
+      "crates/gam-models/src/gamlss/binomial/kernel.rs:fn:binomial_ls_directional_third_batch",
+      "crates/gam-models/src/gamlss/binomial/kernel.rs:fn:core_row_eta",
+      "crates/gam-models/src/gamlss/binomial/kernel.rs:fn:measure_gradient_order1_vs_tower4_932",
+      "crates/gam-models/src/gamlss/binomial/kernel.rs:fn:simd_directional_coefficients_match_scalar_per_row_to_bits"
+    ],
+    "reason": "#932: the binomial location-scale observed row derivatives are emitted from one row_program declaration (binomial_ls_row_program). The generic JetScalar NLL, its Order1 gradient instantiation, the SIMD OneSeedBatch/TwoSeedBatch directional copies with their core_row_eta seeding, and the SIMD-versus-scalar bit-identity test with its helpers (binomial_location_scale_nll_generic_from_core_row, assert_bits) are replaced, not restored. measure_gradient_order1_vs_tower4_932 is renamed measure_row_score_vs_tower4_932 against the emitted score, and row_program_oracle_tests pins every emitted surface against the independent predictor-coordinate Tower4 oracle.",
+    "evidence": "At the base, git grep -w over crates, src, tests, examples, benches, bench and gamfit finds each removed name only in crates/gam-models/src/gamlss/binomial/kernel.rs, gamlss/binomial/location_scale.rs (the replaced gradient callers) and gamlss/test_support.rs (the tower oracle, now spelled independently as binomial_location_scale_nll_in_predictors); outside the code only the historical docs/test-census-2818-inventory.json names measure_gradient_order1_vs_tower4_932. Salvaged from the unpushed overnight swarm patch scratchpad/landing1.patch, which the shared working tree held byte-for-byte."
   }
 ]

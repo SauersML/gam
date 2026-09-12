@@ -10,9 +10,12 @@
 use gam_math::jet_scalar::JetScalar;
 use gam_problem::InverseLink;
 
-/// Dense all-channel binomial location-scale oracle shared by the packed
-/// scalar unit tests and the family-level behavior tests. Production consumers
-/// instantiate only the derivative order they read.
+/// Dense all-channel binomial location-scale oracle shared by the row-program
+/// pins and the family-level behavior tests. It spells the row NLL in predictor
+/// coordinates — `q = −η_t·e^{−η_ls}` through the algebra's own `exp`, then one
+/// composition with the q-space stack `[−ℓ, m1, m2, m3, m4]` — so it shares
+/// neither the local-coordinate map nor the lowering of the production
+/// `binomial_ls_row_program`.
 #[inline]
 pub(crate) fn binomial_location_scale_nll_tower(
     y: f64,
@@ -29,7 +32,7 @@ pub(crate) fn binomial_location_scale_nll_tower(
 ) -> Result<gam_math::jet_tower::Tower4<2>, String> {
     use gam_math::jet_tower::Tower4;
 
-    super::binomial_location_scale_nll_generic::<Tower4<2>>(
+    binomial_location_scale_nll_in_predictors::<Tower4<2>>(
         y,
         weight,
         eta_t,
@@ -41,9 +44,39 @@ pub(crate) fn binomial_location_scale_nll_tower(
         d3mu_dq3,
         link_kind,
         include_fourth,
-        true,
-        |x, axis| Tower4::<2>::variable(x, axis),
     )
+}
+
+#[inline]
+fn binomial_location_scale_nll_in_predictors<S: JetScalar<2>>(
+    y: f64,
+    weight: f64,
+    eta_t: f64,
+    eta_ls: f64,
+    q_value: f64,
+    mu: f64,
+    dmu_dq: f64,
+    d2mu_dq2: f64,
+    d3mu_dq3: f64,
+    link_kind: &InverseLink,
+    include_fourth: bool,
+) -> Result<S, String> {
+    let q = S::variable(eta_t, 0)
+        .neg()
+        .mul(&S::variable(eta_ls, 1).scale(-1.0).exp());
+    let neg_ll =
+        -super::binomial_location_scale_log_likelihood(y, weight, q_value, link_kind, mu)?;
+    let (m1, m2, m3) = super::binomial_neglog_q_derivatives_dispatch(
+        y, weight, q_value, mu, dmu_dq, d2mu_dq2, d3mu_dq3, link_kind,
+    );
+    let m4 = if include_fourth {
+        super::binomial_neglog_q_fourth_derivative_dispatch(
+            y, weight, q_value, mu, dmu_dq, d2mu_dq2, d3mu_dq3, link_kind,
+        )?
+    } else {
+        0.0
+    };
+    Ok(q.compose_unary([neg_ll, m1, m2, m3, m4]))
 }
 
 /// Tweedie compound Poisson–Gamma row NLL written ONCE over a generic

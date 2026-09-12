@@ -8,6 +8,7 @@
 //! sides from optimizing with their consumer. The nudge and output fold keep
 //! the complete requested computation live in the paired timing harness.
 
+mod binomial_ls_codegen_perf;
 mod cause_specific_codegen_perf;
 mod gaussian_codegen_perf;
 mod rigid_bms_codegen_perf;

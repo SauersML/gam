@@ -157,28 +157,25 @@ impl BinomialLocationScaleFamily {
         let y_slice = self.y.as_slice().expect("y must be contiguous");
         let w_slice = self.weights.as_slice().expect("weights must be contiguous");
         let q0_slice = core.q0.as_slice().expect("q0 must be contiguous");
-        let eta_t_slice = eta_t.as_slice().expect("eta_t must be contiguous");
-        let eta_ls_slice = eta_ls.as_slice().expect("eta_ls must be contiguous");
         let link_kind = &self.link_kind;
-        let gradient_pairs: Result<Vec<(f64, f64)>, String> = (0..n)
+        let gradient_pairs: Vec<(f64, f64)> = (0..n)
             .into_par_iter()
             .map(|i| {
-                let gradient = binomial_location_scale_nll_gradient(
+                let score = binomial_location_scale_row_score(
                     y_slice[i],
                     w_slice[i],
-                    eta_t_slice[i],
-                    eta_ls_slice[i],
                     q0_slice[i],
+                    core.sigma[i].recip(),
                     core.mu[i],
                     core.dmu_dq[i],
                     core.d2mu_dq2[i],
                     core.d3mu_dq3[i],
                     link_kind,
-                )?;
-                Ok((-gradient[0], -gradient[1]))
+                );
+                (-score[0], -score[1])
             })
             .collect();
-        for (i, (g_t, g_ls)) in gradient_pairs?.into_iter().enumerate() {
+        for (i, (g_t, g_ls)) in gradient_pairs.into_iter().enumerate() {
             grad_eta_t_v[i] = g_t;
             grad_eta_ls_v[i] = g_ls;
         }
@@ -701,7 +698,8 @@ impl BinomialLocationScaleFamily {
     }
 
     /// Compute the rowwise joint curvature coefficients (D_tt, D_tl, D_ll)
-    /// shared by the dense joint Hessian path and the matrix-free workspace.
+    /// shared by the dense joint Hessian path and the matrix-free workspace:
+    /// the Hessian channel of the emitted `binomial_ls_row_program` surface.
     pub(crate) fn exact_newton_joint_hessian_row_coefficients(
         &self,
         block_states: &[ParameterBlockState],
@@ -732,10 +730,6 @@ impl BinomialLocationScaleFamily {
         let w_slice = self.weights.as_slice().expect("weights must be contiguous");
         let q0_slice = core.q0.as_slice().expect("q0 must be contiguous");
         let sigma_slice = core.sigma.as_slice().expect("sigma must be contiguous");
-        let dsigma_slice = core
-            .dsigma_deta
-            .as_slice()
-            .expect("dsigma_deta must be contiguous");
         let mu_slice = core.mu.as_slice().expect("mu must be contiguous");
         let dmu_slice = core.dmu_dq.as_slice().expect("dmu_dq must be contiguous");
         let d2mu_slice = core
@@ -753,22 +747,20 @@ impl BinomialLocationScaleFamily {
             .zip(coeff_ll.par_iter_mut())
             .enumerate()
             .for_each(|(i, ((c_tt, c_tl), c_ll))| {
-                let q = q0_slice[i];
-                let r = 1.0 / sigma_slice[i];
-                let kappa = dsigma_slice[i] / sigma_slice[i];
-                let (m1, m2, _) = binomial_neglog_q_derivatives_dispatch(
+                let hessian = binomial_location_scale_row_hessian(
                     y_slice[i],
                     w_slice[i],
-                    q,
+                    q0_slice[i],
+                    sigma_slice[i].recip(),
                     mu_slice[i],
                     dmu_slice[i],
                     d2mu_slice[i],
                     d3mu_slice[i],
                     link_kind,
                 );
-                *c_tt = m2 * r * r;
-                *c_tl = kappa * r * (m1 + q * m2);
-                *c_ll = kappa * kappa * q * (m1 + q * m2);
+                *c_tt = hessian[0][0];
+                *c_tl = hessian[0][1];
+                *c_ll = hessian[1][1];
             });
         Ok((
             Array1::from_vec(coeff_tt),
@@ -1190,46 +1182,26 @@ impl BinomialLocationScaleFamily {
         //
         //   q_psi = -r .* z_t - q .* z_ls.
         //
-        // Rowwise scalar derivatives of the negative Bernoulli-probit loss are
+        // Every rowwise object below is a surface of the one declared row
+        // program `binomial_ls_row_program`, evaluated with the row's q-space
+        // loss derivatives `a = dF/dq, b = d²F/dq², c = d³F/dq³`:
         //
-        //   a = dF/dq,
-        //   b = d²F/dq²,
-        //   c = d³F/dq³.
-        //
-        // Predictor-space score pieces:
-        //
-        //   r_t  = dF/deta_t  = -a r,
-        //   r_ls = dF/deta_ls = -a q.
-        //
-        // Their explicit psi derivatives at fixed beta are
-        //
-        //   d_psi r_t  = -b q_psi r + a r z_ls,
-        //   d_psi r_ls = -(a + q b) q_psi.
+        //   r = (r_t, r_ls)          = the score channel,
+        //   h = (h_tt, h_tl, h_ll)   = the Hessian channel,
+        //   d_psi r = h · z,           z = (z_t, z_ls),
+        //   d_psi h = the third contraction along z.
         //
         // Hence the exact joint score derivative is
         //
         //   g_psi
         //   = [ X_{t,psi}^T r_t  + X_t^T d_psi r_t,
-        //       X_{ls,psi}^T r_ls + X_ls^T d_psi r_ls ].
+        //       X_{ls,psi}^T r_ls + X_ls^T d_psi r_ls ],
         //
-        // The exact envelope term is
+        // the exact envelope term is
         //
-        //   V_psi^explicit = r_t^T z_t + r_ls^T z_ls.
+        //   V_psi^explicit = r_t^T z_t + r_ls^T z_ls,
         //
-        // For the Laplace trace we also need the explicit Hessian drift. The
-        // joint exact Hessian has block coefficients
-        //
-        //   h_tt = b r²,
-        //   h_tl = r (a + q b),
-        //   h_ll = q (a + q b),
-        //
-        // so differentiating those coefficients at fixed beta gives
-        //
-        //   d_psi h_tt = r² (c q_psi - 2 b z_ls),
-        //   d_psi h_tl = r [ (2 b + c q) q_psi - (a + q b) z_ls ],
-        //   d_psi h_ll = (a + 3 q b + q² c) q_psi.
-        //
-        // The full joint explicit Hessian drift is then
+        // and the full joint explicit Hessian drift is
         //
         //   H_tt,psi
         //   = X_{t,psi}^T diag(h_tt) X_t
@@ -1293,10 +1265,6 @@ impl BinomialLocationScaleFamily {
         let w_p = self.weights.as_slice().expect("weights must be contiguous");
         let q0_p = core.q0.as_slice().expect("q0 must be contiguous");
         let sigma_p = core.sigma.as_slice().expect("sigma must be contiguous");
-        let dsigma_p = core
-            .dsigma_deta
-            .as_slice()
-            .expect("dsigma_deta must be contiguous");
         let mu_p = core.mu.as_slice().expect("mu must be contiguous");
         let dmu_p = core.dmu_dq.as_slice().expect("dmu_dq must be contiguous");
         let d2mu_p = core
@@ -1314,10 +1282,7 @@ impl BinomialLocationScaleFamily {
             .into_par_iter()
             .map(|i| {
                 let q = q0_p[i];
-                let r = 1.0 / sigma_p[i];
-                let s = dsigma_p[i] / sigma_p[i];
-                let sz = s * z_ls_p[i];
-                let q_psi = -r * z_t_p[i] - q * sz;
+                let inv_sigma = sigma_p[i].recip();
                 let (a, b, c) = binomial_neglog_q_derivatives_dispatch(
                     y_p[i],
                     w_p[i],
@@ -1328,20 +1293,24 @@ impl BinomialLocationScaleFamily {
                     d3mu_p[i],
                     link_kind_p,
                 );
-                let r_t = -a * r;
-                let r_ls = -a * q * s;
+                let z = [z_t_p[i], z_ls_p[i]];
+                let (_, score, hessian, []) =
+                    binomial_ls_row_program_order2(0.0, 0.0, q, inv_sigma, 0.0, a, b, 0.0, 0.0);
+                let drift = binomial_ls_row_program_third_contracted(
+                    0.0, 0.0, q, inv_sigma, 0.0, a, b, c, 0.0, &z,
+                );
                 PsiTermsRow {
-                    r_t,
-                    r_ls,
-                    dr_t: -b * q_psi * r + a * r * sz,
-                    dr_ls: -(a + q * b) * q_psi,
-                    h_tt: b * r * r,
-                    h_tl: r * (a + q * b),
-                    h_ll: q * (a + q * b),
-                    dh_tt: r * r * (c * q_psi - 2.0 * b * sz),
-                    dh_tl: r * ((2.0 * b + c * q) * q_psi - (a + q * b) * sz),
-                    dh_ll: (a + 3.0 * q * b + q * q * c) * q_psi,
-                    obj: r_t * z_t_p[i] + r_ls * z_ls_p[i],
+                    r_t: score[0],
+                    r_ls: score[1],
+                    dr_t: hessian[0][0] * z[0] + hessian[0][1] * z[1],
+                    dr_ls: hessian[1][0] * z[0] + hessian[1][1] * z[1],
+                    h_tt: hessian[0][0],
+                    h_tl: hessian[0][1],
+                    h_ll: hessian[1][1],
+                    dh_tt: drift[0][0],
+                    dh_tl: drift[0][1],
+                    dh_ll: drift[1][1],
+                    obj: score[0] * z[0] + score[1] * z[1],
                 }
             })
             .collect();
@@ -1561,24 +1530,14 @@ impl BinomialLocationScaleFamily {
         //   g_ab = [ X_{t,ab}^T r_t + X_{t,a}^T d_b r_t + X_{t,b}^T d_a r_t + X_t^T d_ab r_t,
         //            X_{ls,ab}^T r_ls + X_{ls,a}^T d_b r_ls + X_{ls,b}^T d_a r_ls + X_ls^T d_ab r_ls ],
         //
-        // where
+        // where every rowwise object is a surface of the one declared row
+        // program `binomial_ls_row_program`, with `z_a = (z_t,a, z_ls,a)` and
+        // likewise `z_b`, `z_ab`:
         //
-        //   r_t  = -a r,
-        //   r_ls = -a q,
-        //
-        //   d_a r_t  = -b q_a r + a r z_ls,a,
-        //   d_a r_ls = -(a + q b) q_a,
-        //
-        //   d_ab r_t
-        //   = r[
-        //       -c q_a q_b - b q_ab
-        //       + b(q_a z_ls,b + q_b z_ls,a)
-        //       - a z_ls,a z_ls,b
-        //       + a z_ls,ab
-        //     ],
-        //
-        //   d_ab r_ls
-        //   = -[(2b + q c) q_a q_b + (a + q b) q_ab].
+        //   r = (r_t, r_ls)  = the score channel,
+        //   d_a r            = h · z_a,
+        //   d_ab r           = h · z_ab + T3[z_a] · z_b,
+        //   a q_ab + b q_a q_b = r · z_ab + z_a · h · z_b.
         //
         // The exact Hessian psi/psi drift comes from the second derivatives of
         // the joint Hessian coefficients. In the notation of the unified outer
@@ -1616,33 +1575,11 @@ impl BinomialLocationScaleFamily {
         // the total profiled/Laplace Hessian drift is assembled generically in
         // custom_family.rs after the joint solves.
         //
-        // Concretely, the rowwise coefficient identities below are
+        // Concretely, the rowwise coefficients below are the program's Hessian
+        // channel `h = (h_tt, h_tl, h_ll)`, its third contractions
+        // `d_a h = T3[z_a]`, and
         //
-        //   h_tt = b r²,
-        //   h_tl = r(a + q b),
-        //   h_ll = q(a + q b),
-        //
-        // namely
-        //
-        //   d_ab h_tt
-        //   = r²[
-        //       d q_a q_b + c q_ab
-        //       - 2c(q_b z_ls,a + q_a z_ls,b)
-        //       + 4b z_ls,a z_ls,b
-        //       - 2b z_ls,ab
-        //     ],
-        //
-        //   d_ab h_tl
-        //   = r[
-        //       ((3c + q d) q_b) q_a
-        //       + (2b + q c) q_ab
-        //       - (2b + q c)(q_b z_ls,a + q_a z_ls,b)
-        //       + (a + q b)(z_ls,a z_ls,b - z_ls,ab)
-        //     ],
-        //
-        //   d_ab h_ll
-        //   = (4b + 5q c + q² d) q_a q_b
-        //     + (a + 3q b + q² c) q_ab.
+        //   d_ab h = T4[z_a, z_b] + T3[z_ab].
         //
         // Differentiating X^T diag(h) X twice then gives the explicit joint
         // psi/psi Hessian blocks.
@@ -1733,12 +1670,7 @@ impl BinomialLocationScaleFamily {
             .into_par_iter()
             .map(|row| {
                 let q = q_p[row];
-                let r = 1.0 / sigma_p[row];
-                let q_i = -r * z_t_i[row] - q * z_ls_i[row];
-                let q_j = -r * z_t_j[row] - q * z_ls_j[row];
-                let q_ij = -r * z_t_ab[row]
-                    + r * (z_t_i[row] * z_ls_j[row] + z_t_j[row] * z_ls_i[row])
-                    + q * (z_ls_i[row] * z_ls_j[row] - z_ls_ab[row]);
+                let inv_sigma = sigma_p[row].recip();
                 let (a, b, c) = binomial_neglog_q_derivatives_dispatch(
                     y_p[row],
                     w_p[row],
@@ -1759,43 +1691,58 @@ impl BinomialLocationScaleFamily {
                     d3mu_p[row],
                     link_kind_p,
                 )?;
-                let u = a + q * b;
-                let u_i = (2.0 * b + q * c) * q_i;
-                let u_j = (2.0 * b + q * c) * q_j;
+                let z_i = [z_t_i[row], z_ls_i[row]];
+                let z_j = [z_t_j[row], z_ls_j[row]];
+                let z_ab = [z_t_ab[row], z_ls_ab[row]];
+                let (_, score, hessian, []) =
+                    binomial_ls_row_program_order2(0.0, 0.0, q, inv_sigma, 0.0, a, b, 0.0, 0.0);
+                let drift_i = binomial_ls_row_program_third_contracted(
+                    0.0, 0.0, q, inv_sigma, 0.0, a, b, c, 0.0, &z_i,
+                );
+                let drift_j = binomial_ls_row_program_third_contracted(
+                    0.0, 0.0, q, inv_sigma, 0.0, a, b, c, 0.0, &z_j,
+                );
+                let drift_ab = binomial_ls_row_program_third_contracted(
+                    0.0, 0.0, q, inv_sigma, 0.0, a, b, c, 0.0, &z_ab,
+                );
+                let drift_ij = binomial_ls_row_program_fourth_contracted(
+                    0.0, 0.0, q, inv_sigma, 0.0, a, b, c, d, &z_i, &z_j,
+                );
+                let apply = |matrix: &[[f64; 2]; 2], vector: &[f64; 2]| {
+                    [
+                        matrix[0][0] * vector[0] + matrix[0][1] * vector[1],
+                        matrix[1][0] * vector[0] + matrix[1][1] * vector[1],
+                    ]
+                };
+                let dr_i = apply(&hessian, &z_i);
+                let dr_j = apply(&hessian, &z_j);
+                let dr_ab = apply(&hessian, &z_ab);
+                let drift_i_along_j = apply(&drift_i, &z_j);
                 Ok(PsiSecondRow {
-                    r_t: -a * r,
-                    r_ls: -a * q,
-                    dr_t_i: -b * q_i * r + a * r * z_ls_i[row],
-                    dr_t_j: -b * q_j * r + a * r * z_ls_j[row],
-                    dr_ls_i: -u * q_i,
-                    dr_ls_j: -u * q_j,
-                    d2r_t: r
-                        * (-c * q_i * q_j - b * q_ij + b * (q_i * z_ls_j[row] + q_j * z_ls_i[row])
-                            - a * z_ls_i[row] * z_ls_j[row]
-                            + a * z_ls_ab[row]),
-                    d2r_ls: -((2.0 * b + q * c) * q_i * q_j + u * q_ij),
-                    h_tt: b * r * r,
-                    h_tl: r * u,
-                    h_ll: q * u,
-                    dh_tt_i: r * r * (c * q_i - 2.0 * b * z_ls_i[row]),
-                    dh_tt_j: r * r * (c * q_j - 2.0 * b * z_ls_j[row]),
-                    dh_tl_i: r * (u_i - u * z_ls_i[row]),
-                    dh_tl_j: r * (u_j - u * z_ls_j[row]),
-                    dh_ll_i: (a + 3.0 * q * b + q * q * c) * q_i,
-                    dh_ll_j: (a + 3.0 * q * b + q * q * c) * q_j,
-                    d2h_tt: r
-                        * r
-                        * (d * q_i * q_j + c * q_ij
-                            - 2.0 * c * (q_j * z_ls_i[row] + q_i * z_ls_j[row])
-                            + 4.0 * b * z_ls_i[row] * z_ls_j[row]
-                            - 2.0 * b * z_ls_ab[row]),
-                    d2h_tl: r
-                        * (((3.0 * c + q * d) * q_j) * q_i + (2.0 * b + q * c) * q_ij
-                            - (2.0 * b + q * c) * (q_j * z_ls_i[row] + q_i * z_ls_j[row])
-                            + u * (z_ls_i[row] * z_ls_j[row] - z_ls_ab[row])),
-                    d2h_ll: (4.0 * b + 5.0 * q * c + q * q * d) * q_i * q_j
-                        + (a + 3.0 * q * b + q * q * c) * q_ij,
-                    objective: a * q_ij + b * q_i * q_j,
+                    r_t: score[0],
+                    r_ls: score[1],
+                    dr_t_i: dr_i[0],
+                    dr_t_j: dr_j[0],
+                    dr_ls_i: dr_i[1],
+                    dr_ls_j: dr_j[1],
+                    d2r_t: dr_ab[0] + drift_i_along_j[0],
+                    d2r_ls: dr_ab[1] + drift_i_along_j[1],
+                    h_tt: hessian[0][0],
+                    h_tl: hessian[0][1],
+                    h_ll: hessian[1][1],
+                    dh_tt_i: drift_i[0][0],
+                    dh_tt_j: drift_j[0][0],
+                    dh_tl_i: drift_i[0][1],
+                    dh_tl_j: drift_j[0][1],
+                    dh_ll_i: drift_i[1][1],
+                    dh_ll_j: drift_j[1][1],
+                    d2h_tt: drift_ij[0][0] + drift_ab[0][0],
+                    d2h_tl: drift_ij[0][1] + drift_ab[0][1],
+                    d2h_ll: drift_ij[1][1] + drift_ab[1][1],
+                    objective: score[0] * z_ab[0]
+                        + score[1] * z_ab[1]
+                        + z_i[0] * dr_j[0]
+                        + z_i[1] * dr_j[1],
                 })
             })
             .collect();
@@ -2006,37 +1953,16 @@ impl BinomialLocationScaleFamily {
         // realized-penalty piece S_{psi_a} itself; this family hook contributes
         // only the exact likelihood-side T_a[beta_j].
         //
-        // With
-        //   du   = D_beta q[u]   = -r xi_t - q xi_ls,
-        //   q_a  = q_{psi_a}     = -r z_t,a - q z_ls,a,
-        //   q_au = D_beta q_a[u] = r z_t,a xi_ls - du z_ls,a,
-        //
-        // the directional derivatives of the first-order Hessian-drift
-        // coefficients are the mixed specializations of the exact psi/psi
-        // formulas with z_ls,ab = 0 and q_ab = q_au:
-        //
-        //   D_u(d_a h_tt)
-        //   = r²[
-        //       d du q_a + c q_au
-        //       - 2c(q_a xi_ls + du z_ls,a)
-        //       + 4b xi_ls z_ls,a
-        //     ],
-        //
-        //   D_u(d_a h_tl)
-        //   = r[
-        //       ((3c + q d) q_a) du
-        //       + (2b + q c) q_au
-        //       - (2b + q c)(q_a xi_ls + du z_ls,a)
-        //       + (a + q b) xi_ls z_ls,a
-        //     ],
-        //
-        //   D_u(d_a h_ll)
-        //   = (4b + 5q c + q² d) du q_a
-        //     + (a + 3q b + q² c) q_au.
-        //
-        // Since X_t, X_ls, X_{t,psi_a}, X_{ls,psi_a} are all beta-independent
-        // here, the full matrix contraction is obtained by replacing the row
-        // coefficient arrays in H_{psi_a} by their directional derivatives.
+        // The directional derivatives of the first-order Hessian-drift
+        // coefficients are surfaces of the one declared row program
+        // `binomial_ls_row_program`: its third contraction along `u`'s
+        // predictor perturbation `xi = (X_t u_t, X_ls u_ls)` moves `h`, and its
+        // fourth contraction along `(xi, z_a)` moves `d_a h`, where
+        // `z_a = (z_t,a, z_ls,a)` is psi_a's realized predictor drift at fixed
+        // beta. Since X_t, X_ls, X_{t,psi_a}, X_{ls,psi_a} are all
+        // beta-independent here, the full matrix contraction is obtained by
+        // replacing the row coefficient arrays in H_{psi_a} by their
+        // directional derivatives.
         let mut dh_tt_u = Array1::<f64>::zeros(n);
         let mut dh_tl_u = Array1::<f64>::zeros(n);
         let mut dh_ll_u = Array1::<f64>::zeros(n);
@@ -2045,13 +1971,7 @@ impl BinomialLocationScaleFamily {
         let mut h_ll_u = Array1::<f64>::zeros(n);
         for row in 0..n {
             let q = core.q0[row];
-            let r = 1.0 / core.sigma[row];
-            let s = core.dsigma_deta[row] / core.sigma[row];
-            let xi_ls_s = s * xi_ls[row];
-            let z_ls_psi_s = s * dir_a.z_ls_psi[row];
-            let du = -r * xi_t[row] - q * xi_ls_s;
-            let q_a = -r * dir_a.z_primary_psi[row] - q * z_ls_psi_s;
-            let q_au = r * dir_a.z_primary_psi[row] * xi_ls_s - du * z_ls_psi_s;
+            let inv_sigma = core.sigma[row].recip();
             let (a, b, c) = binomial_neglog_q_derivatives_dispatch(
                 self.y[row],
                 self.weights[row],
@@ -2072,20 +1992,20 @@ impl BinomialLocationScaleFamily {
                 core.d3mu_dq3[row],
                 &self.link_kind,
             )?;
-            let u = a + q * b;
-            h_tt_u[row] = r * r * (c * du - 2.0 * b * xi_ls_s);
-            h_tl_u[row] = r * ((2.0 * b + q * c) * du - u * xi_ls_s);
-            h_ll_u[row] = (a + 3.0 * q * b + q * q * c) * du;
-            dh_tt_u[row] = r
-                * r
-                * (d * du * q_a + c * q_au - 2.0 * c * (q_a * xi_ls_s + du * z_ls_psi_s)
-                    + 4.0 * b * xi_ls_s * z_ls_psi_s);
-            dh_tl_u[row] = r
-                * (((3.0 * c + q * d) * q_a) * du + (2.0 * b + q * c) * q_au
-                    - (2.0 * b + q * c) * (q_a * xi_ls_s + du * z_ls_psi_s)
-                    + u * xi_ls_s * z_ls_psi_s);
-            dh_ll_u[row] = (4.0 * b + 5.0 * q * c + q * q * d) * du * q_a
-                + (a + 3.0 * q * b + q * q * c) * q_au;
+            let xi = [xi_t[row], xi_ls[row]];
+            let z_a = [dir_a.z_primary_psi[row], dir_a.z_ls_psi[row]];
+            let hessian_u = binomial_ls_row_program_third_contracted(
+                0.0, 0.0, q, inv_sigma, 0.0, a, b, c, 0.0, &xi,
+            );
+            let drift_u = binomial_ls_row_program_fourth_contracted(
+                0.0, 0.0, q, inv_sigma, 0.0, a, b, c, d, &xi, &z_a,
+            );
+            h_tt_u[row] = hessian_u[0][0];
+            h_tl_u[row] = hessian_u[0][1];
+            h_ll_u[row] = hessian_u[1][1];
+            dh_tt_u[row] = drift_u[0][0];
+            dh_tl_u[row] = drift_u[0][1];
+            dh_ll_u[row] = drift_u[1][1];
         }
 
         let tt_block = weighted_crossprod_psi_maps(
@@ -2288,28 +2208,25 @@ impl CustomFamily for BinomialLocationScaleFamily {
         let y_slice_e = self.y.as_slice().expect("y must be contiguous");
         let w_slice_e = self.weights.as_slice().expect("weights must be contiguous");
         let q0_slice_e = core.q0.as_slice().expect("q0 must be contiguous");
-        let eta_t_slice_e = eta_t.as_slice().expect("eta_t must be contiguous");
-        let eta_ls_slice_e = eta_ls.as_slice().expect("eta_ls must be contiguous");
         let link_kind_e = &self.link_kind;
-        let gradient_pairs: Result<Vec<(f64, f64)>, String> = (0..n)
+        let gradient_pairs: Vec<(f64, f64)> = (0..n)
             .into_par_iter()
             .map(|i| {
-                let gradient = binomial_location_scale_nll_gradient(
+                let score = binomial_location_scale_row_score(
                     y_slice_e[i],
                     w_slice_e[i],
-                    eta_t_slice_e[i],
-                    eta_ls_slice_e[i],
                     q0_slice_e[i],
+                    core.sigma[i].recip(),
                     core.mu[i],
                     core.dmu_dq[i],
                     core.d2mu_dq2[i],
                     core.d3mu_dq3[i],
                     link_kind_e,
-                )?;
-                Ok((-gradient[0], -gradient[1]))
+                );
+                (-score[0], -score[1])
             })
             .collect();
-        for (i, (g_t, g_ls)) in gradient_pairs?.into_iter().enumerate() {
+        for (i, (g_t, g_ls)) in gradient_pairs.into_iter().enumerate() {
             grad_eta_t_v[i] = g_t;
             grad_eta_ls_v[i] = g_ls;
         }

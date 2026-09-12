@@ -144,26 +144,25 @@ pub(crate) fn assert_rel_close(label: &str, actual: f64, expected: f64, tol: f64
 }
 
 /// #932: the production binomial location-scale JOINT Hessian assembler must
-/// equal the single-sourced `binomial_location_scale_nll_tower`.
+/// equal the independent `binomial_location_scale_nll_tower`.
 ///
 /// `binomial_nonwiggle_tower_matches_hand_witness_channels` pins the *tower*
 /// against a *test* hand witness, and the operator-workspace tests pin the
 /// lazy operator against the dense `exact_newton_joint_hessian_from_designs`.
-/// But NOTHING pinned the production assembler's own row coefficients
-/// (`exact_newton_joint_hessian_row_coefficients`: `coeff_tt = m2 r²`,
-/// `coeff_tl = κ r (m1 + q m2)`, `coeff_ll = κ² q (m1 + q m2)`, with the q-chain
-/// `q = −η_t·e^{−η_ls}` and `κ = σ'(η_ls)/σ`) to the single-source tower. A
-/// typo in those coefficients (a dropped `q m2`, a wrong `κ` power — the #736
-/// cross-term genus) would slip past both existing oracles.
+/// This pins the production assembler's own row coefficients
+/// (`exact_newton_joint_hessian_row_coefficients`, the order-2 surface of
+/// `binomial_ls_row_program`, which writes the q-map `q = −η_t·e^{−η_ls}` in
+/// local coordinates around the row) to the tower, which spells the row NLL
+/// separately in predictor coordinates. A wrong coefficient (a dropped `q m2`,
+/// a sign in the cross block — the #736 cross-term genus) would slip past both
+/// other oracles.
 ///
-/// This closes the gap. For a multi-column non-wiggle fixture, the production
+/// For a multi-column non-wiggle fixture, the production
 /// `exact_newton_joint_hessian_from_designs` joint matrix is compared, at
 /// ~1e-9, to the joint Hessian assembled by pulling the per-row `Tower4<2>`
 /// curvature `tower.h` (in (η_t, η_ls)) through the same designs:
-/// `H = Σ_i [X_t; X_ls]_iᵀ · tower.h_i · [X_t; X_ls]_i`. Independent arithmetic
-/// (the tower differentiates one expression by Leibniz; the production builds
-/// the coefficients by hand), so agreement is a correctness proof of the hand
-/// assembler — across probit / logit / cloglog.
+/// `H = Σ_i [X_t; X_ls]_iᵀ · tower.h_i · [X_t; X_ls]_i`, across probit /
+/// logit / cloglog.
 #[test]
 pub(crate) fn binomial_location_scale_joint_hessian_matches_single_sourced_tower_932() {
     let n = 7usize;
@@ -205,7 +204,7 @@ pub(crate) fn binomial_location_scale_joint_hessian_matches_single_sourced_tower
             },
         ];
 
-        // Production hand-assembled joint Hessian (the path under audit).
+        // Production joint Hessian (the path under audit).
         let h_prod = family
             .exact_newton_joint_hessian_from_designs(&states, &xt, &xls)
             .expect("production joint Hessian")
