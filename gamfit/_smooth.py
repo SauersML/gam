@@ -93,12 +93,6 @@ class Smooth(BasisDescriptor):
                 f"got {type(penalty).__name__}"
             )
 
-        # Compatibility check already done above via
-        # :func:`_check_manifold_basis_compatibility`, which delegates to the
-        # Rust validator with a soft ``input_dim`` fallback. Touching
-        # ``latent.dimension`` here would force the Rust manifold-dim oracle
-        # to be present in every wheel.
-
         self.latent = latent
         self.basis = basis
         self.penalty = penalty
@@ -241,9 +235,9 @@ def _default_basis_for(latent: ManifoldDescriptor) -> BasisDescriptor:
     from ._manifold import Circle, Torus
     from ._basis_descriptors import PeriodicHarmonic
     if isinstance(latent, Circle):
-        return PeriodicHarmonic(harmonics=3)
+        return PeriodicHarmonic()
     if isinstance(latent, Torus) and latent.dimension == 1:
-        return PeriodicHarmonic(harmonics=3)
+        return PeriodicHarmonic()
     raise ValueError(
         f"Smooth: no default basis is registered for latent="
         f"{type(latent).__name__}(dim={latent.dimension}); pass `basis=...` explicitly."
@@ -253,33 +247,15 @@ def _default_basis_for(latent: ManifoldDescriptor) -> BasisDescriptor:
 def _check_manifold_basis_compatibility(
     latent: ManifoldDescriptor, basis: BasisDescriptor
 ) -> None:
-    """Eager compatibility check between a manifold and a basis.
+    """Refuse a basis whose input dimension differs from the latent manifold's.
 
-    Marshals manifold + basis kind tags to the Rust validator when the local
-    extension exposes one; falls back to a soft ``input_dim`` match otherwise.
-    All policy lives in Rust (see ``crates/gam-pyffi`` ``validate_smooth_composition``).
+    ``latent.dimension`` is the Rust manifold-dimension oracle. A basis that
+    publishes no ``input_dim`` is not checked here.
     """
-    latent_kind = None
-    if hasattr(latent, "to_json"):
-        latent_kind = str(latent.to_json().get("kind", ""))
-    basis_kind = None
-    if hasattr(basis, "to_dict"):
-        basis_kind = str(basis.to_dict().get("kind", ""))
-    if latent_kind and basis_kind:
-        from ._binding import rust_module
-        validator = getattr(rust_module(), "validate_smooth_composition", None)
-        if validator is not None:
-            validator(latent_kind, basis_kind)
-            return
     expected = _basis_input_dim(basis)
     if expected is None:
         return
-    try:
-        latent_dim = int(latent.dimension)
-    except AttributeError:
-        # Rust dimension oracle not yet exposed by the local extension; the
-        # Rust core will reject incompatible specs again at fit time.
-        return
+    latent_dim = int(latent.dimension)
     if expected != latent_dim:
         raise ValueError(
             f"Smooth: latent={type(latent).__name__}(dim={latent_dim}) is "

@@ -20,9 +20,6 @@ from ._penalties import _validate_weight, ScalarWeightSchedule
 GroupName = Literal["SO2", "SO3", "R1", "Trivial"]
 AuxName = Literal["HSV", "RGB", "LCh"]
 
-GROUP_DIM = {"SO2": 1, "SO3": 3, "R1": 1, "Trivial": 0}
-GROUP_REP_DIM = {"SO2": 2, "SO3": 3, "R1": 1, "Trivial": 1}
-
 
 def _scalar_weight(weight: float | ScalarWeightSchedule, name: str) -> float:
     # allow-list (a): FFI input validation.
@@ -108,19 +105,12 @@ class LieAtom(Smooth):
     """
     group: GroupName = "SO2"
     n_atoms: int = 64
-    d_per_atom: int = 2
     bandwidth_init: float = 0.0
 
     # LieAtom is a config carrier for the additive Lie-decoder layer; it
     # does not carry its own basis-evaluator surface (the Rust decoder
     # consumes the dataclass directly). Empty set is the honest contract.
     SUPPORTED_BACKENDS: ClassVar[frozenset[str]] = frozenset()
-
-    def __post_init__(self) -> None:
-        expected = GROUP_REP_DIM[self.group]
-        # allow-list (e): dataclass typed config normalization.
-        if self.d_per_atom != expected:
-            self.d_per_atom = expected
 
 
 # ---------------------------------------------------------------------------
@@ -206,13 +196,12 @@ def equivariant_smooth(
     group: GroupName = "SO2",
     aux: AuxName | None = "HSV",
     n_atoms: int = 128,
-    d_per_atom: int = 2,
     weight: float = 1.0,
     ard_weight: float = 1e-3,
     name: str = "lie",
 ) -> tuple[LieAtom, EquivariantPenalty, GaugeCompanion | None]:
     """Construct (LieAtom, EquivariantPenalty[, GaugeCompanion]) in one call."""
-    atom = LieAtom(name=name, group=group, n_atoms=n_atoms, d_per_atom=d_per_atom)
+    atom = LieAtom(name=name, group=group, n_atoms=n_atoms)
     pen = EquivariantPenalty(target=name, weight=weight, ard_weight=ard_weight, group=group)
     gc = (
         lambda: None,
@@ -222,7 +211,7 @@ def equivariant_smooth(
 
 
 __all__ = [
-    "GroupName", "GROUP_DIM", "GROUP_REP_DIM",
+    "GroupName",
     "rho", "rho_so2", "rho_so2_jvp", "rho_so3", "rho_so3_jvp",
     "LieAtom", "EquivariantPenalty",
     "GaugeCompanion", "gauge_companion",
