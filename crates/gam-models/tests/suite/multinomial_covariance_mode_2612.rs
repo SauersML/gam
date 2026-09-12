@@ -10,13 +10,12 @@
 //! or a bad centre look like. These assertions separate them:
 //!
 //!   1. the correction SURVIVES the fit (it is `Some`, symmetric, PSD-diagonal),
-//!   2. `V_c = V_cond + C` exactly, so the two published matrices cannot drift,
-//!   3. the correction REACHES the response scale — the corrected band is
+//!   2. the correction REACHES the response scale — the corrected band is
 //!      strictly wider than the conditional one, which is the step that was
 //!      missing and that a stored-but-unused matrix would not produce,
-//!   4. the factorised `gᵀ C g` kernel equals the literal `d`-dimensional
+//!   3. the factorised `gᵀ C g` kernel equals the literal `d`-dimensional
 //!      contraction assembled entry by entry, and
-//!   5. asking for a correction a model does not carry is an ERROR, never a
+//!   4. asking for a correction a model does not carry is an ERROR, never a
 //!      silent downgrade to the narrower band.
 
 use csv::StringRecord;
@@ -199,6 +198,92 @@ fn the_correction_reaches_the_response_scale_and_widens_the_band_2612() {
         worst_relative < 1e-8,
         "the factorised response-scale correction disagrees with the literal \
          gᵀCg contraction by relative {worst_relative:e}"
+    );
+}
+
+#[test]
+fn the_multinomial_fit_retains_the_rho_uncertainty_correction_2612() {
+    let model = fit_smooth_three_class(11);
+
+    let correction = model.smoothing_correction().expect(
+        "a converged REML fit with outer ρ curvature must retain the correction; \
+                 its absence is exactly the defect #2612 names",
+    );
+    let conditional = model
+        .coefficient_covariance()
+        .expect("conditional covariance");
+    assert_eq!(
+        correction.dim(),
+        conditional.dim(),
+        "the correction and the conditional covariance must live in the same frame"
+    );
+
+    // Symmetry and a non-negative diagonal: `C = J V_ρ Jᵀ` with `V_ρ` PSD, so a
+    // negative variance on any coordinate would mean the assembly, not the
+    // model.
+    let d = conditional.nrows();
+    let scale = correction
+        .iter()
+        .fold(0.0_f64, |acc, value| acc.max(value.abs()))
+        .max(f64::MIN_POSITIVE);
+    for i in 0..d {
+        assert!(
+            correction[[i, i]] >= -1e-12 * scale,
+            "smoothing correction has a negative variance at coordinate {i}: {}",
+            correction[[i, i]]
+        );
+        for j in 0..d {
+            assert!(
+                (correction[[i, j]] - correction[[j, i]]).abs() <= 1e-10 * scale,
+                "smoothing correction is not symmetric at ({i}, {j}): {} vs {}",
+                correction[[i, j]],
+                correction[[j, i]],
+            );
+        }
+    }
+
+    // The correction is not the zero matrix. A zero correction would make the
+    // response-scale widening gate vacuously true while reproducing the defect
+    // exactly.
+    assert!(
+        correction.iter().any(|value| value.abs() > 0.0),
+        "the retained correction is identically zero, so the corrected and \
+         conditional definitions cannot differ and this gate proves nothing"
+    );
+}
+
+#[test]
+fn a_requested_correction_a_model_does_not_carry_is_an_error_2612() {
+    let mut model = fit_smooth_three_class(11);
+    let x = model.training_design().expect("training design");
+
+    // Strip the correction, exactly as a fit whose outer solve retained no ρ
+    // curvature would arrive.
+    model.smoothing_correction_flat = None;
+    assert!(
+        model.smoothing_correction().is_none(),
+        "stripping the payload must strip the accessor"
+    );
+
+    let refused = model.predict_probabilities_with_se_in_mode(
+        x.view(),
+        InferenceCovarianceMode::SmoothingCorrected,
+    );
+    assert!(
+        refused.is_err(),
+        "SmoothingCorrected on a model with no correction must REFUSE; silently \
+         serving the conditional band is how a caller ends up with a narrower \
+         interval than it asked for and no way to know"
+    );
+
+    // ... and the conditional definition still works, and announces itself.
+    let (_, _, source) = model
+        .predict_probabilities_with_se_and_source(x.view())
+        .expect("the conditional band is still publishable");
+    assert_eq!(
+        source,
+        InferenceCovarianceMode::Conditional,
+        "a model without a correction must report the definition it actually used"
     );
 }
 
