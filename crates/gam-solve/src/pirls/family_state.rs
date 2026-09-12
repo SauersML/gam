@@ -187,6 +187,18 @@ pub(crate) fn bernoulli_geometry_from_jet(
             d: 0.0,
         });
     }
+    // A positive-weight Bernoulli row's response is a proportion in [0, 1]. The
+    // device row kernel (`gpu_kernels::pirls_row::bernoulli_response`) refuses any
+    // other response under this label, and the host path must agree: `z` below is
+    // finite for any finite `y`, so a response outside [0, 1] would fit silently.
+    if !(y.is_finite() && (0.0..=1.0).contains(&y)) {
+        return Err(EstimationError::pirls_row_geometry_unrepresentable(
+            row,
+            "binomial response",
+            eta,
+            y,
+        ));
+    }
     // Variance carried through the stable complement: `v = mu * (1 - mu)` with the
     // exact tail complement rather than `1.0 - mu`.
     let v = mu * omm;
