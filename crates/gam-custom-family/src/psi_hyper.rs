@@ -526,6 +526,82 @@ pub fn build_psi_hyper_coords<F: CustomFamily + Clone + Send + Sync + 'static>(
         _ => None,
     };
 
+    // Both explicit-ψ Jeffreys terms read `∂_ψH_info` and the mixed trace weights it
+    // prepares. When every axis's first-order terms are already batched in memory, form
+    // them once here; the axis loop reads them.
+    let batched_explicit_jeffreys: Option<(
+        Vec<Array2<f64>>,
+        Vec<gam_solve::estimate::reml::jeffreys_subspace::JointJeffreysExplicitMixedTraceWeights>,
+    )> = match (
+        batched_terms.as_ref(),
+        jeffreys_plan.as_ref(),
+        jeffreys_hphi_base.as_ref(),
+    ) {
+        (Some(terms), Some(plan), Some(_)) => {
+            let infos: Vec<Array2<f64>> = terms
+                .iter()
+                .filter_map(|axis_terms| {
+                    if let Some(op) = axis_terms.hessian_psi_operator.as_ref() {
+                        Some(op.mul_mat(&Array2::<f64>::eye(total)))
+                    } else if axis_terms.hessian_psi.dim() == (total, total) {
+                        Some(axis_terms.hessian_psi.clone())
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            if infos.len() == total_axes {
+                let weights = infos
+                    .iter()
+                    .map(|info| plan.explicit_param_mixed_trace_weights(info))
+                    .collect::<Result<Vec<_>, String>>()?;
+                Some((infos, weights))
+            } else {
+                None
+            }
+        }
+        _ => None,
+    };
+
+    // gam#979: a workspace that contracts every axis's coefficient-axis tensor
+    // `{∂_ψHdot[e_a]}` on its two information slots in one row pass serves both
+    // explicit-ψ Jeffreys terms without forming any axis tensor. The score correction
+    // reads `⟨mixed_information, ∂_ψHdot[e_a]⟩`, and the curvature drift reads
+    // `⟨∂_ψHdot[e_a], K_b⟩` against the drift base's ambient kernels.
+    let contracted_explicit_jeffreys: Option<Vec<(Array2<f64>, Array1<f64>)>> = match (
+        psi_workspace.as_ref(),
+        batched_explicit_jeffreys.as_ref(),
+        jeffreys_hphi_base.as_ref(),
+    ) {
+        (Some(workspace), Some((_, weights)), Some(base)) => {
+            let mixed_weights: Vec<Array2<f64>> = weights
+                .iter()
+                .map(|prepared| prepared.mixed_information.clone())
+                .collect();
+            match workspace
+                .hessian_all_beta_axes_contractions(&|| base.ambient_axis_kernels(), &mixed_weights)?
+            {
+                Some(contractions)
+                    if contractions.len() == total_axes
+                        && contractions.iter().all(|(kernel, mixed)| {
+                            kernel.dim() == (total, total) && mixed.len() == total
+                        }) =>
+                {
+                    Some(contractions)
+                }
+                Some(contractions) => {
+                    return Err(CustomFamilyError::trial_point(format!(
+                        "custom-family hyper workspace returned {} explicit Jeffreys axis \
+                         contractions of the wrong shape for layout length {total_axes}",
+                        contractions.len()
+                    )));
+                }
+                None => None,
+            }
+        }
+        _ => None,
+    };
+
     for psi_global in 0..total_axes {
         let axis = hyper_layout.axis(psi_global).ok_or_else(|| {
             CustomFamilyError::trial_point(format!("missing typed hyper axis {psi_global}"))
@@ -600,7 +676,9 @@ pub fn build_psi_hyper_coords<F: CustomFamily + Clone + Send + Sync + 'static>(
         // materialized once and reused for BOTH the VALUE gradient term `−∂_ψΦ`
         // (here) and the Hessian β-coupling term `−∂_β∂_ψΦ` (the score below).
         let firth_pert_info: Option<Array2<f64>> =
-            if jeffreys_hphi_ctx.is_some() && jeffreys_info_depends_on_psi {
+            if let Some((infos, _)) = batched_explicit_jeffreys.as_ref() {
+                Some(infos[psi_global].clone())
+            } else if jeffreys_hphi_ctx.is_some() && jeffreys_info_depends_on_psi {
                 if let Some(op) = psi_terms.hessian_psi_operator.as_ref() {
                     Some(op.mul_mat(&ndarray::Array2::<f64>::eye(total)))
                 } else if psi_terms.hessian_psi.nrows() == total
@@ -639,7 +717,10 @@ pub fn build_psi_hyper_coords<F: CustomFamily + Clone + Send + Sync + 'static>(
         // it (gam#979: this loop used to materialize each axis with its own row
         // sweep, 58 s per gradient on the rigid marginal-slope arm).
         let firth_pert_axis_derivatives: Option<Vec<Array2<f64>>> =
-            if jeffreys_hphi_ctx.is_some() && firth_pert_info.is_some() {
+            if contracted_explicit_jeffreys.is_none()
+                && jeffreys_hphi_ctx.is_some()
+                && firth_pert_info.is_some()
+            {
                 materialize_authoritative_psi_hessian_directional_derivatives_all_beta_axes(
                     family,
                     synced_states,
@@ -653,7 +734,31 @@ pub fn build_psi_hyper_coords<F: CustomFamily + Clone + Send + Sync + 'static>(
                 None
             };
         if let (Some(plan), Some(pert_info)) = (jeffreys_plan.as_ref(), firth_pert_info.as_ref()) {
-            if let (Some(base_axes), Some(pert_axes)) = (
+            if let (Some(contractions), Some((_, weights)), Some(base_axes)) = (
+                contracted_explicit_jeffreys.as_ref(),
+                batched_explicit_jeffreys.as_ref(),
+                jeffreys_base_axis_derivatives.as_ref(),
+            ) {
+                // `weights.contract(Hdot[e_a], ∂_ψHdot[e_a])`, with its mixed half read
+                // from the workspace's contraction of the axis tensor.
+                let weights = &weights[psi_global];
+                let mixed = &contractions[psi_global].1;
+                for (a_idx, hdot_a) in base_axes.iter().enumerate() {
+                    let beta_term = weights
+                        .beta_information
+                        .iter()
+                        .zip(hdot_a.iter())
+                        .map(|(&weight, &value)| weight * value)
+                        .sum::<f64>();
+                    let phi_psi_beta_a = beta_term + mixed[a_idx];
+                    if !phi_psi_beta_a.is_finite() {
+                        return Err(CustomFamilyError::trial_point(
+                            "joint Jeffreys explicit mixed contraction produced a non-finite value",
+                        ));
+                    }
+                    g[a_idx] -= phi_psi_beta_a;
+                }
+            } else if let (Some(base_axes), Some(pert_axes)) = (
                 jeffreys_base_axis_derivatives.as_ref(),
                 firth_pert_axis_derivatives.as_ref(),
             ) {
@@ -771,12 +876,18 @@ pub fn build_psi_hyper_coords<F: CustomFamily + Clone + Send + Sync + 'static>(
                 .filter(|_| jeffreys_info_depends_on_psi),
             firth_pert_info.as_ref(),
         ) {
-            match jeffreys_hphi_base.as_ref() {
-                Some(base) => Some(base.perturbation_derivative_batched_axes(
+            match (jeffreys_hphi_base.as_ref(), contracted_explicit_jeffreys.as_ref()) {
+                (Some(base), Some(contractions)) => Some(
+                    base.perturbation_derivative_from_axis_contractions(
+                        pert_info,
+                        &contractions[psi_global].0,
+                    )?,
+                ),
+                (Some(base), None) => Some(base.perturbation_derivative_batched_axes(
                     pert_info,
                     firth_pert_axis_derivatives,
                 )?),
-                None => Some(
+                (None, _) => Some(
                     gam_solve::estimate::reml::jeffreys_subspace::joint_jeffreys_hphi_explicit_param_derivative(
                         h_joint.view(),
                         z_j.view(),

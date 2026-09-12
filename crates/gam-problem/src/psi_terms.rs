@@ -162,6 +162,23 @@ pub trait ExactNewtonJointPsiWorkspace: Send + Sync {
         per_axis_psi_hessian_directional_derivatives(self, psi_index, total)
     }
 
+    /// Contract every ψ axis's coefficient-axis tensor `{∂_ψ Hdot[e_a]}_a`, the matrices
+    /// [`Self::hessian_directional_derivatives_all_beta_axes`] materializes, on its two
+    /// information slots in one pass, without forming it. For ψ axis `i` the result holds
+    /// `(kernel_contractions, mixed_contractions)` with
+    /// `kernel_contractions[[a, b]] = ⟨∂_ψᵢ Hdot[e_a], K_b⟩` and
+    /// `mixed_contractions[a] = ⟨∂_ψᵢ Hdot[e_a], mixed_weights[i]⟩`. The symmetric
+    /// kernels `K_b` come from `kernels`, which only a workspace that runs the pass calls,
+    /// and every weight is symmetric. `None` means this workspace has no such pass and the
+    /// caller materializes the tensors instead.
+    fn hessian_all_beta_axes_contractions(
+        &self,
+        _kernels: &dyn Fn() -> Vec<Array2<f64>>,
+        _mixed_weights: &[Array2<f64>],
+    ) -> Result<Option<Vec<(Array2<f64>, Array1<f64>)>>, String> {
+        Ok(None)
+    }
+
     /// {D_beta_axis D_beta_direction D_psi H}, under this workspace's row measure.
     fn hessian_second_directional_derivative_all_beta_axes(
         &self,
