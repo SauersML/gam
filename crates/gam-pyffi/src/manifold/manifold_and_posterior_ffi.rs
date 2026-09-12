@@ -3456,14 +3456,13 @@ fn periodic_bspline_basis_dense_via_spec(
 /// `order`, on the closed parameter circle `domain = (left, right)` with
 /// `num_basis` cyclic control points.
 ///
-/// `order == 0` returns the periodic value basis (the partition of unity);
-/// `order == 1` returns the exact closed-form first derivative by squeezing
-/// the `(N, K, 1)` jet from `periodic_bspline_first_derivative_nd` — the same
-/// jet `basis_with_jet` and the latent periodic-curve fits rely
-/// on, so the dense matrix and the modelling path agree to machine precision.
-/// Because the value basis is a partition of unity, each derivative row sums
-/// to ~0. Orders ≥ 2 have no exposed periodic jet and are rejected with a
-/// precise message rather than the old blanket "no longer exposed" error.
+/// `order == 0` returns the periodic value basis (the partition of unity).
+/// `1 <= order <= degree` squeezes the exact closed-form `(N, K, 1)` jet from
+/// `periodic_bspline_derivative_nd`; at `order == 1` that is the jet
+/// `basis_with_jet` and the latent periodic-curve fits rely on, so the dense
+/// matrix and the modelling path agree to machine precision. Because the value
+/// basis is a partition of unity, each derivative row sums to ~0. The core
+/// refuses `order > degree`.
 fn periodic_bspline_derivative_dense(
     t: ArrayView1<'_, f64>,
     domain: (f64, f64),
@@ -3471,23 +3470,13 @@ fn periodic_bspline_derivative_dense(
     num_basis: usize,
     order: usize,
 ) -> Result<Array2<f64>, String> {
-    match order {
-        0 => periodic_bspline_basis_dense_via_spec(t, domain, degree, num_basis),
-        1 => {
-            let coords = column_array(t);
-            let jet =
-                periodic_bspline_first_derivative_nd(coords.view(), domain, degree, num_basis)
-                    .map_err(|err| {
-                        format!("failed to evaluate periodic B-spline derivative: {err}")
-                    })?;
-            Ok(jet.index_axis_move(Axis(2), 0))
-        }
-        _ => Err(format!(
-            "periodic B-spline derivative is available in closed form for order 0 (value) \
-             and order 1 (first derivative); order={order} (second and higher derivatives) \
-             is not exposed for the periodic cyclic basis"
-        )),
+    if order == 0 {
+        return periodic_bspline_basis_dense_via_spec(t, domain, degree, num_basis);
     }
+    let coords = column_array(t);
+    let jet = periodic_bspline_derivative_nd(coords.view(), domain, degree, num_basis, order)
+        .map_err(|err| format!("failed to evaluate periodic B-spline derivative: {err}"))?;
+    Ok(jet.index_axis_move(Axis(2), 0))
 }
 
 fn bspline_basis_impl(

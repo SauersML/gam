@@ -114,20 +114,35 @@ def test_periodic_derivative_is_genuinely_periodic_at_seam() -> None:
     np.testing.assert_allclose(d_at_t, d_at_t_plus_period, atol=1e-10)
 
 
-def test_periodic_second_derivative_rejected_with_precise_message() -> None:
-    """Orders >= 2 have no exposed periodic jet: error must say so precisely.
+def test_periodic_second_derivative_matches_central_differences() -> None:
+    """order=2 is the exact periodic second derivative.
 
-    The old code rejected order=1 too (the bug). The fix must keep rejecting
-    order>=2 but with a message that names the real limitation, not the stale
-    "no longer exposed" blanket.
+    It equals the central difference of the order-1 derivative away from the
+    knots, and each row sums to ~0 because the value basis is a partition of
+    unity.
     """
+    knots = np.linspace(0.0, 1.0, 9)  # K = 8, knots at multiples of 1/8
+    t = np.linspace(0.02, 0.98, 40)  # no sample within 5e-3 of a knot
+    second = gamfit.bspline_basis_derivative(t, knots, degree=3, order=2, periodic=True)
+    assert second.shape == (40, 8)
+    assert np.all(np.isfinite(second))
+
+    h = 1e-6
+    fd = (
+        gamfit.bspline_basis_derivative(t + h, knots, degree=3, order=1, periodic=True)
+        - gamfit.bspline_basis_derivative(t - h, knots, degree=3, order=1, periodic=True)
+    ) / (2 * h)
+    np.testing.assert_allclose(second, fd, atol=1e-5)
+    np.testing.assert_allclose(second.sum(axis=1), 0.0, atol=1e-8)
+
+
+def test_periodic_derivative_above_degree_rejected() -> None:
+    """A degree-p periodic spline has no derivative above order p; the error names the order."""
     knots = np.linspace(0.0, 1.0, 9)
     t = np.linspace(0.05, 0.95, 10)
     with pytest.raises(Exception) as excinfo:
-        gamfit.bspline_basis_derivative(t, knots, degree=3, order=2, periodic=True)
-    msg = str(excinfo.value).lower()
-    assert "no longer exposed" not in msg
-    assert "order" in msg
+        gamfit.bspline_basis_derivative(t, knots, degree=1, order=2, periodic=True)
+    assert "order" in str(excinfo.value).lower()
 
 
 def test_nonperiodic_derivative_unaffected() -> None:

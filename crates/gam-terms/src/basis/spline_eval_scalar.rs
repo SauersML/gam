@@ -202,17 +202,26 @@ pub(crate) fn fill_periodic_bspline_unnormalized_value_row(
     rowsum
 }
 
+/// Fill `row` with the `order`-th derivative of the unnormalized periodic
+/// cardinal B-spline row at `u` and return that derivative's row sum.
+///
+/// On the cardinal lattice `dʳ/dxʳ M_p(x) = Σ_{j=0}^{r} (−1)ʲ C(r, j)
+/// M_{p−r}(x − j)`; dividing by `hʳ` gives the derivative in `u`. Callers
+/// guarantee `1 <= order <= degree`.
 pub(crate) fn fill_periodic_bspline_unnormalized_derivative_row(
     u: f64,
     origin: f64,
     period: f64,
     degree: usize,
+    order: usize,
     row: &mut [f64],
 ) -> f64 {
     let m = row.len();
     let m_f = m as f64;
     let h = period / m_f;
     let tau = wrap_periodic_phase(u, origin, period) / h;
+    let lattice_scale = h.powi(order as i32);
+    let reduced_degree = degree - order;
     let mut rowsum_derivative = 0.0_f64;
     for (col, value_slot) in row.iter_mut().enumerate() {
         let base = tau - col as f64;
@@ -221,10 +230,20 @@ pub(crate) fn fill_periodic_bspline_unnormalized_derivative_row(
         let mut value = 0.0_f64;
         for k in k_min..=k_max {
             let x_arg = base + (k as f64) * m_f;
-            value += cardinal_bspline_value(x_arg, degree - 1)
-                - cardinal_bspline_value(x_arg - 1.0, degree - 1);
+            let mut stencil = 0.0_f64;
+            let mut binomial = 1.0_f64;
+            for j in 0..=order {
+                let term = binomial * cardinal_bspline_value(x_arg - j as f64, reduced_degree);
+                if j % 2 == 0 {
+                    stencil += term;
+                } else {
+                    stencil -= term;
+                }
+                binomial = binomial * (order - j) as f64 / (j + 1) as f64;
+            }
+            value += stencil;
         }
-        let derivative = value / h;
+        let derivative = value / lattice_scale;
         *value_slot = derivative;
         rowsum_derivative += derivative;
     }

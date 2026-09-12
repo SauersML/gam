@@ -23,73 +23,114 @@ use super::*;
 /// while the slopes remain structurally (non-zero) penalized.
 pub(crate) const DUCHON_AFFINE_NATIVE_RIDGE_REL: f64 = 1.490_116_119_384_765_6e-8;
 
-/// N-D periodic-cyclic-B-spline first-derivative jet `∂Φ̃/∂t` per row.
-///
-/// One-dimensional periodic B-spline basis (one latent axis). `t` is the
-/// `(n_rows, 1)` latent matrix; each row evaluates a length-`num_basis`
-/// derivative stencil w.r.t. the scalar latent coordinate. The result is
-/// `(n_rows, num_basis, 1)`. This is the derivative of the row-normalized
-/// design returned by [`build_periodic_bspline_basis_1d`]. The raw
-/// derivative formula `B'_i(x) = (B_{i,k−1}(x) − B_{i+1,k−1}(x)) / h` is
-/// evaluated alongside the unnormalized basis row `Φ`; the returned row uses
-/// the quotient rule for `Φ̃ = Φ / S`, where `S = Σ_j Φ_j`.
+/// N-D periodic-cyclic-B-spline first-derivative jet `∂Φ̃/∂t` per row: the
+/// `order = 1` case of [`periodic_bspline_derivative_nd`].
 pub fn periodic_bspline_first_derivative_nd(
     t: ArrayView2<'_, f64>,
     data_range: (f64, f64),
     degree: usize,
     num_basis: usize,
 ) -> Result<Array3<f64>, BasisError> {
+    periodic_bspline_derivative_nd(t, data_range, degree, num_basis, 1)
+}
+
+/// N-D periodic-cyclic-B-spline input-location derivative jet `∂ʳΦ̃/∂tʳ` per
+/// row.
+///
+/// One-dimensional periodic B-spline basis (one latent axis). `t` is the
+/// `(n_rows, 1)` latent matrix; each row evaluates a length-`num_basis`
+/// derivative stencil w.r.t. the scalar latent coordinate. The result is
+/// `(n_rows, num_basis, 1)`: the `order`-th derivative of the row-normalized
+/// design returned by [`build_periodic_bspline_basis_1d`], for
+/// `1 <= order <= degree`. The raw derivatives `Φ⁽ⁿ⁾` of the unnormalized row
+/// and `S⁽ⁿ⁾` of its sum `S = Σ_j Φ_j` come from the cardinal difference
+/// formula, and `Φ̃ = Φ / S` is differentiated by Leibniz on `Φ = Φ̃ S`:
+/// `Φ̃⁽ⁿ⁾ = (Φ⁽ⁿ⁾ − Σ_{k<n} C(n, k) Φ̃⁽ᵏ⁾ S⁽ⁿ⁻ᵏ⁾) / S`.
+pub fn periodic_bspline_derivative_nd(
+    t: ArrayView2<'_, f64>,
+    data_range: (f64, f64),
+    degree: usize,
+    num_basis: usize,
+    order: usize,
+) -> Result<Array3<f64>, BasisError> {
     if t.ncols() != 1 {
         crate::bail_invalid_basis!(
-            "periodic_bspline_first_derivative_nd: t must have exactly 1 column; got {}",
+            "periodic_bspline_derivative_nd: t must have exactly 1 column; got {}",
             t.ncols()
         );
     }
     if degree == 0 {
-        crate::bail_invalid_basis!("periodic_bspline_first_derivative_nd requires degree >= 1");
+        crate::bail_invalid_basis!("periodic_bspline_derivative_nd requires degree >= 1");
+    }
+    if order == 0 || order > degree {
+        crate::bail_invalid_basis!(
+            "periodic_bspline_derivative_nd requires 1 <= order <= degree (got order={order}, degree={degree})"
+        );
     }
     if num_basis < degree + 1 {
         crate::bail_invalid_basis!(
-            "periodic_bspline_first_derivative_nd requires num_basis >= degree + 1 (got num_basis={num_basis}, degree={degree})"
+            "periodic_bspline_derivative_nd requires num_basis >= degree + 1 (got num_basis={num_basis}, degree={degree})"
         );
     }
     let (start, end) = data_range;
     if !(start.is_finite() && end.is_finite()) || end <= start {
         crate::bail_invalid_basis!(
-            "periodic_bspline_first_derivative_nd: data_range must be finite and ordered, got {data_range:?}"
+            "periodic_bspline_derivative_nd: data_range must be finite and ordered, got {data_range:?}"
         );
     }
     let period = end - start;
     let n_rows = t.nrows();
     let t_col = t.column(0);
 
-    let mut phi = vec![0.0_f64; num_basis];
-    let mut dphi = vec![0.0_f64; num_basis];
+    // raw[n] = Φ⁽ⁿ⁾, raw_sums[n] = S⁽ⁿ⁾ and normalized[n] = Φ̃⁽ⁿ⁾ for n = 0..=order.
+    let mut raw = vec![vec![0.0_f64; num_basis]; order + 1];
+    let mut raw_sums = vec![0.0_f64; order + 1];
+    let mut normalized = vec![vec![0.0_f64; num_basis]; order + 1];
     let mut out = Array3::<f64>::zeros((n_rows, num_basis, 1));
     for row in 0..n_rows {
         let xi = t_col[row];
         if !xi.is_finite() {
             crate::bail_invalid_basis!(
-                "periodic_bspline_first_derivative_nd: non-finite latent at row {row}"
+                "periodic_bspline_derivative_nd: non-finite latent at row {row}"
             );
         }
         let rowsum =
-            fill_periodic_bspline_unnormalized_value_row(xi, start, period, degree, &mut phi);
+            fill_periodic_bspline_unnormalized_value_row(xi, start, period, degree, &mut raw[0]);
         if !rowsum.is_finite() || rowsum <= 0.0 {
             crate::bail_invalid_basis!(
-                "periodic_bspline_first_derivative_nd: non-positive rowsum at row {row}: {rowsum}"
+                "periodic_bspline_derivative_nd: non-positive rowsum at row {row}: {rowsum}"
             );
         }
-        let rowsum_derivative =
-            fill_periodic_bspline_unnormalized_derivative_row(xi, start, period, degree, &mut dphi);
-        if !rowsum_derivative.is_finite() {
-            crate::bail_invalid_basis!(
-                "periodic_bspline_first_derivative_nd: non-finite rowsum derivative at row {row}: {rowsum_derivative}"
+        raw_sums[0] = rowsum;
+        for n in 1..=order {
+            let rowsum_derivative = fill_periodic_bspline_unnormalized_derivative_row(
+                xi,
+                start,
+                period,
+                degree,
+                n,
+                &mut raw[n],
             );
+            if !rowsum_derivative.is_finite() {
+                crate::bail_invalid_basis!(
+                    "periodic_bspline_derivative_nd: non-finite order-{n} rowsum derivative at row {row}: {rowsum_derivative}"
+                );
+            }
+            raw_sums[n] = rowsum_derivative;
         }
-        let rowsum_squared = rowsum * rowsum;
+        for n in 0..=order {
+            for i in 0..num_basis {
+                let mut numerator = raw[n][i];
+                let mut binomial = 1.0_f64;
+                for k in 0..n {
+                    numerator -= binomial * normalized[k][i] * raw_sums[n - k];
+                    binomial = binomial * (n - k) as f64 / (k + 1) as f64;
+                }
+                normalized[n][i] = numerator / rowsum;
+            }
+        }
         for i in 0..num_basis {
-            out[[row, i, 0]] = dphi[i] / rowsum - phi[i] * rowsum_derivative / rowsum_squared;
+            out[[row, i, 0]] = normalized[order][i];
         }
     }
     Ok(out)

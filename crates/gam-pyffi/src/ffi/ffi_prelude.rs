@@ -116,7 +116,8 @@ pub(crate) use gam::terms::basis::{
     duchon_pure_kernel_amplification, duchon_radial_first_derivative_nd,
     duchon_sae_atom_basis_with_jet,
     evaluate_bspline_basis_scalar, matern_input_location_hessian_nd, matern_input_location_jet_nd,
-    matern_radial_first_derivative_nd, periodic_bspline_first_derivative_nd,
+    matern_radial_first_derivative_nd, periodic_bspline_derivative_nd,
+    periodic_bspline_first_derivative_nd,
     resolve_duchon_orders, select_spherical_farthest_point_centers, sphere_first_derivative_nd,
     spherical_spline_design_jet,
 };
