@@ -2682,9 +2682,10 @@ pub fn build_smooth_basis(
             }
             // A periodic cubic spline has no free endpoint behaviour to spend
             // degrees of freedom on: the wrap constraint removes the ordinary
-            // boundary wiggle, and the cyclic second-difference penalty leaves
-            // only the constant direction (handled by the smooth
-            // identifiability constraint).  An over-rich default would give
+            // boundary wiggle, and the harmonic cyclic roughness leaves only the
+            // constant (removed by the smooth identifiability constraint) and the
+            // fundamental harmonic (shrunk by its own null-function ridge)
+            // unpenalized.  An over-rich default would give
             // small binomial/continuation-ratio fits a large penalized nuisance
             // space whose REML/LAML optimum is driven by finite-sample Bernoulli
             // noise rather than the low-frequency periodic signal.  Cap the
