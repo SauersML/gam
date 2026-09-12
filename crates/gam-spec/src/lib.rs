@@ -1588,24 +1588,6 @@ impl LikelihoodSpec {
         )
     }
 
-    #[inline]
-    pub const fn binomial_cloglog() -> Self {
-        Self::new(
-            ResponseFamily::Binomial,
-            InverseLink::Standard(StandardLink::CLogLog),
-        )
-    }
-
-    #[inline]
-    pub const fn binomial_latent_cloglog(state: LatentCLogLogState) -> Self {
-        Self::new(ResponseFamily::Binomial, InverseLink::LatentCLogLog(state))
-    }
-
-    #[inline]
-    pub const fn binomial_sas(state: SasLinkState) -> Self {
-        Self::new(ResponseFamily::Binomial, InverseLink::Sas(state))
-    }
-
 
     #[inline]
     pub fn binomial_mixture(state: MixtureLinkState) -> Self {
@@ -1624,32 +1606,6 @@ impl LikelihoodSpec {
     pub const fn tweedie_log(p: f64) -> Self {
         Self::new(
             ResponseFamily::Tweedie { p },
-            InverseLink::Standard(StandardLink::Log),
-        )
-    }
-
-    /// Estimated-theta NB spec: `theta` is the seed, refined by the inner
-    /// solver (#802 default).
-    #[inline]
-    pub const fn negative_binomial_log(theta: f64) -> Self {
-        Self::new(
-            ResponseFamily::NegativeBinomial {
-                theta,
-                theta_fixed: false,
-            },
-            InverseLink::Standard(StandardLink::Log),
-        )
-    }
-
-    /// Fixed-theta NB spec: the fit holds `theta` at exactly this value
-    /// (`--negative-binomial-theta`, issue #983).
-    #[inline]
-    pub const fn negative_binomial_log_fixed(theta: f64) -> Self {
-        Self::new(
-            ResponseFamily::NegativeBinomial {
-                theta,
-                theta_fixed: true,
-            },
             InverseLink::Standard(StandardLink::Log),
         )
     }
@@ -2616,23 +2572,8 @@ impl GlmLikelihoodSpec {
     }
 
     #[inline]
-    pub fn resolved_gamma_log_shape(&self) -> Result<f64, InvalidLikelihoodScale> {
-        self.resolved_scale()?.gamma_log_shape()
-    }
-
-    #[inline]
-    pub fn resolved_gamma_phi(&self) -> Result<f64, InvalidLikelihoodScale> {
-        self.resolved_scale()?.gamma_phi()
-    }
-
-    #[inline]
     pub fn resolved_tweedie_phi(&self) -> Result<f64, InvalidLikelihoodScale> {
         self.resolved_scale()?.tweedie_phi()
-    }
-
-    #[inline]
-    pub fn resolved_tweedie_log_phi(&self) -> Result<f64, InvalidLikelihoodScale> {
-        self.resolved_scale()?.tweedie_log_phi()
     }
 
     #[inline]

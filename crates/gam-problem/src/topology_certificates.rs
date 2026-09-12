@@ -235,15 +235,6 @@ impl CertificateLedger {
         }
     }
 
-    /// The verdict for a claim id, or [`Verdict::Unavailable`] if the fit never
-    /// recorded it — the absence of a certificate is "no claim", never a pass.
-    pub fn verdict_of(&self, claim_id: &str) -> Verdict {
-        self.entries
-            .get(claim_id)
-            .map(|e| e.verdict)
-            .unwrap_or(Verdict::Unavailable)
-    }
-
     /// All recorded entries in stable (claim-id) order.
     pub fn entries(&self) -> impl Iterator<Item = &LedgerEntry> {
         self.entries.values()

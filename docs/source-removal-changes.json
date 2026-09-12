@@ -1430,5 +1430,39 @@
     ],
     "reason": "user directive: delete all useless slop",
     "evidence": "e3b50feaf removed add_analytic_penalty_contributions, the only writer of ArrowSchurSystem::cross_row_penalties; at the push base every constructor initialises it empty and nothing pushes to it, so the cross-row matrix-free PCG route (solve_arrow_newton_step_cross_row, arrow_cross_row_matvec, its ArrowBlockDiagInverse preconditioner with cholesky_solve_lower, dot2, apply_cross_row_penalty_hessian, CrossRowLatentPenalty) was unreachable. git grep -nw finds no production user of any removed item outside the route; the three removed tests exercised only the route. MSI compile, doc, guard and census verification run on the landed sha."
+  },
+  {
+    "base": "846c51bff97241b73211bc2d5157802eb7c6ef2a",
+    "items": [
+      "crates/gam-problem/src/diagnostics.rs:fn:compute_dualridge_check",
+      "crates/gam-problem/src/diagnostics.rs:fn:compute_envelopeaudit",
+      "crates/gam-problem/src/gauge.rs:fn:extend_with_identity",
+      "crates/gam-problem/src/gauge.rs:fn:from_compiled_map",
+      "crates/gam-problem/src/row_metric.rs:fn:is_output_fisher_like",
+      "crates/gam-problem/src/row_metric.rs:fn:output_fisher_with_solver_floor",
+      "crates/gam-problem/src/row_metric.rs:fn:solver_floor",
+      "crates/gam-problem/src/row_metric.rs:fn:whiten_jacobian",
+      "crates/gam-problem/src/topology_certificates.rs:fn:verdict_of",
+      "crates/gam-problem/src/types.rs:fn:approximation_only",
+      "crates/gam-problem/src/types.rs:fn:explicit_prior",
+      "crates/gam-problem/src/types.rs:fn:from_passport",
+      "crates/gam-problem/src/types.rs:fn:is_placeholder",
+      "crates/gam-problem/src/types.rs:fn:laplace_hessian_delta",
+      "crates/gam-problem/src/types.rs:fn:laplace_hessian_ridge",
+      "crates/gam-problem/src/types.rs:fn:numerical_perturbation",
+      "crates/gam-problem/src/types.rs:fn:penalty_logdet_delta",
+      "crates/gam-problem/src/types.rs:fn:quadratic_delta",
+      "crates/gam-problem/src/types.rs:fn:solver_damping",
+      "crates/gam-spec/src/lib.rs:fn:binomial_cloglog",
+      "crates/gam-spec/src/lib.rs:fn:binomial_latent_cloglog",
+      "crates/gam-spec/src/lib.rs:fn:binomial_sas",
+      "crates/gam-spec/src/lib.rs:fn:negative_binomial_log",
+      "crates/gam-spec/src/lib.rs:fn:negative_binomial_log_fixed",
+      "crates/gam-spec/src/lib.rs:fn:resolved_gamma_log_shape",
+      "crates/gam-spec/src/lib.rs:fn:resolved_gamma_phi",
+      "crates/gam-spec/src/lib.rs:fn:resolved_tweedie_log_phi"
+    ],
+    "reason": "Deleted gam-problem and gam-spec items with no caller anywhere in the workspace, gamfit or benches (#2469 unused-code sweep).",
+    "evidence": "No reference to any deleted item outside its own definition. MSI cargo check --workspace --all-targets at b66a7d04e with this patch applied: rc 0, 0 errors, 0 warnings (job 421918). Guard items (27) measured on MSI (job 423156)."
   }
 ]

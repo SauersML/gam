@@ -404,31 +404,6 @@ impl RowMetric {
         )
     }
 
-    /// Like [`Self::output_fisher`] but with a **solver-only** Tikhonov floor
-    /// `δ ≥ 0`. The floor is recorded for solver helpers only; every
-    /// criterion-facing method (`quad_form`, `whiten_residual`, `fisher_mass`)
-    /// ignores it (#747 discipline), so the evidence criterion is `δ`-free.
-    pub fn output_fisher_with_solver_floor(
-        u: Arc<Array2<f64>>,
-        p: usize,
-        rank: usize,
-        solver_delta: f64,
-    ) -> Result<Self, String> {
-        if !(solver_delta.is_finite() && solver_delta >= 0.0) {
-            return Err(format!(
-                "RowMetric::output_fisher_with_solver_floor: solver_delta must be finite and \
-                 non-negative; got {solver_delta}"
-            ));
-        }
-        Self::from_factors(
-            MetricProvenance::OutputFisher { rank },
-            u,
-            p,
-            rank,
-            solver_delta,
-        )
-    }
-
     /// Structured-residual whitening from supplied per-row precision factors.
     ///
     /// `u` carries the per-row factor stack `U_n ∈ ℝ^{p × rank}` (row-major flat)
@@ -682,22 +657,6 @@ impl RowMetric {
         !matches!(self.provenance, MetricProvenance::Euclidean)
     }
 
-    /// Whether this metric is an **output-Fisher gauge** — either the
-    /// same-position [`MetricProvenance::OutputFisher`] or the downstream
-    /// [`MetricProvenance::OutputFisherDownstream`] (#980). The two share every
-    /// consumer behavior (Sym(F) separation under the gauge, two-lens coupling,
-    /// steering geometry, enrichment); they differ only in the *scientific*
-    /// reading of what behavioral coupling means (same-position vs
-    /// forward-looking). Consumers that gate on "is this an output-Fisher
-    /// pullback" should use this predicate rather than matching one variant, so
-    /// the downstream metric rides the identical path.
-    pub fn is_output_fisher_like(&self) -> bool {
-        matches!(
-            self.provenance,
-            MetricProvenance::OutputFisher { .. } | MetricProvenance::OutputFisherDownstream { .. }
-        )
-    }
-
     /// Number of rows the metric is defined over.
     pub fn n_rows(&self) -> usize {
         self.n_rows
@@ -893,53 +852,12 @@ impl RowMetric {
         }
     }
 
-    /// Whiten a per-row Jacobian `J_n ∈ ℝ^{p × d}` (row-major flat,
-    /// `J_n[i, a] = j_row[i * d + a]`) into `M_n = U_nᵀ J_n ∈ ℝ^{rank × d}` so
-    /// that `M_nᵀ M_n = J_nᵀ (U_n U_nᵀ) J_n = J_nᵀ W_n J_n` is the pullback
-    /// **without** any `p × p` intermediate. Euclidean returns `J_n` reshaped to
-    /// `(p, d)` (the identity whitening). Solver `δ` is not applied (criterion
-    /// face).
-    pub fn whiten_jacobian(&self, row: usize, j_row: &[f64], d: usize) -> Array2<f64> {
-        match &self.factors {
-            None => {
-                let mut out = Array2::<f64>::zeros((self.p, d));
-                for i in 0..self.p {
-                    for a in 0..d {
-                        out[[i, a]] = j_row[i * d + a];
-                    }
-                }
-                out
-            }
-            Some(u) => {
-                let mut m = Array2::<f64>::zeros((self.rank, d));
-                for k in 0..self.rank {
-                    for a in 0..d {
-                        let mut acc = 0.0;
-                        for i in 0..self.p {
-                            acc += u[[row, i * self.rank + k]] * j_row[i * d + a];
-                        }
-                        m[[k, a]] = acc;
-                    }
-                }
-                m
-            }
-        }
-    }
-
     /// Fisher mass of a per-row output vector `x_n ∈ ℝ^p`: the scalar
     /// `x_nᵀ M_n x_n` (alias of [`Self::quad_form`] read as an information mass
     /// rather than a residual square). Factored, never `p × p`, `δ`-free.
     #[inline]
     pub fn fisher_mass(&self, row: usize, x: ArrayView1<'_, f64>) -> f64 {
         self.quad_form(row, x)
-    }
-
-    /// The **solver-only** Tikhonov floor `δ` (#747). Returned for internal
-    /// solver helpers that need `U_n U_nᵀ + δ I` to be invertible; by contract
-    /// no caller may fold this into a criterion-facing quantity. Always `0` for
-    /// Euclidean and for factored metrics built without an explicit floor.
-    pub fn solver_floor(&self) -> f64 {
-        self.solver_delta
     }
 
     /// The gauge view of this metric: the
