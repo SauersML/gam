@@ -1245,27 +1245,36 @@
     }
 
     #[test]
-    fn latent_family_planner_keeps_outer_hessian_at_large_n() {
+    fn latent_family_planner_declares_no_outer_hessian_without_exact_jeffreys_curvature() {
         use crate::custom_family::custom_family_outer_derivatives;
         use gam_problem::{DeclaredHessianForm, Derivative};
 
+        // Both latent families arm the Jeffreys term and neither implements the
+        // third information derivative. An armed term's exact outer Hessian needs
+        // that derivative (the mode-response completion and the mixed H_Φ drift),
+        // so since 98f431392 the planner declares no Hessian for them at any n,
+        // and the fit searches first-order instead of refusing every trial point.
         let options = BlockwiseFitOptions::default();
         let large_n = 50_001;
 
         let survival = learnable_sigma_test_family();
+        assert!(survival.joint_jeffreys_term_required());
+        assert!(!survival.joint_jeffreys_information_third_directional_available());
         let survival_specs =
             latent_test_specs(large_n, &[("time", 2), ("mean", 2), ("log_sigma", 1)]);
         let (surv_grad, surv_hess) =
             custom_family_outer_derivatives(&survival, &survival_specs, &options);
         assert_eq!(surv_grad, Derivative::Analytic);
-        assert_eq!(surv_hess, DeclaredHessianForm::Either);
+        assert_eq!(surv_hess, DeclaredHessianForm::Unavailable);
 
         let binary = fixed_sigma_binary_test_family();
+        assert!(binary.joint_jeffreys_term_required());
+        assert!(!binary.joint_jeffreys_information_third_directional_available());
         let binary_specs = latent_test_specs(large_n, &[("time", 2), ("mean", 2)]);
         let (bin_grad, bin_hess) =
             custom_family_outer_derivatives(&binary, &binary_specs, &options);
         assert_eq!(bin_grad, Derivative::Analytic);
-        assert_eq!(bin_hess, DeclaredHessianForm::Either);
+        assert_eq!(bin_hess, DeclaredHessianForm::Unavailable);
     }
 
     #[test]
