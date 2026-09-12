@@ -374,8 +374,7 @@ fn build_iso_kappa_fixture(
                 // gam#1718), so the benchmark's terms carry the Primary penalty
                 // only; `_noops` fixtures mirror that. Without the `_noops`
                 // token the fixture keeps mass + tension, which is what makes
-                // the operator-penalty jets observable — and what declines
-                // per-axis ψ at 16-D (`duchon_spec_supports_axis_psi`).
+                // the operator-penalty jets observable.
                 operator_penalties: if label.contains("_noops") {
                     DuchonOperatorPenaltySpec::all_disabled()
                 } else {

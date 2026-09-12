@@ -697,16 +697,13 @@ pub(crate) fn duchon_p_from_nullspace_order(order: DuchonNullspaceOrder) -> usiz
 ///   own chart, and no per-axis route through it exists;
 /// * a term with no per-axis contrasts to learn (`d ≤ 1`, or η absent / the
 ///   wrong length);
-/// * a spec whose ACTIVE operator penalty routes through the **closed-form
-///   Lebesgue block**, which replaces the collocation Gram on the value side
-///   and whose ψ-derivative is derived only for the isotropic direction.
-///   Enrolling one of those would ship a block whose value and gradient came
-///   from two different constructions.
+/// * a fractional spectral power, which never reaches the partial-fraction jets.
 ///
-/// The closed-form check sweeps every null-space order the realized build could
-/// degrade to (`duchon_effective_nullspace_order` only ever reduces), because
-/// the predicate is asked here — before centers exist — and a spec that becomes
-/// unsupported only after degradation must not be enrolled.
+/// The operator penalties do not enter it. `duchon_operator_penalty_candidates`
+/// builds mass, tension and stiffness with the isotropic metric, the closed-form
+/// Lebesgue blocks included, so they move with ψ only through `κ`, and
+/// `build_duchon_operator_penalty_psi_derivatives_in_directions` ships their
+/// per-axis jets as the isotropic jets scaled by `1/d` and `1/d²`.
 pub fn duchon_spec_supports_axis_psi(spec: &DuchonBasisSpec, dim: usize) -> bool {
     if dim <= 1 || spec.length_scale.is_none() || spec.periodic.is_some() {
         return false;
@@ -715,43 +712,7 @@ pub fn duchon_spec_supports_axis_psi(spec: &DuchonBasisSpec, dim: usize) -> bool
         Some(eta) if eta.len() == dim => {}
         _ => return false,
     }
-    let s_order = spec.power_as_usize() as f64;
-    if s_order != spec.power {
-        // The partial-fraction jets require an integer spectral power; the
-        // fractional path never reaches the ψ-derivative surface at all.
-        return false;
-    }
-    let requested_p = duchon_p_from_nullspace_order(spec.nullspace_order);
-    let tension_requested = matches!(
-        spec.operator_penalties.tension,
-        OperatorPenaltySpec::Active { .. }
-    );
-    let stiffness_requested = matches!(
-        spec.operator_penalties.stiffness,
-        OperatorPenaltySpec::Active { .. }
-    );
-    for p_order in 1..=requested_p.max(1) {
-        let two_pps = 2.0 * (p_order as f64 + spec.power);
-        // Mirror the builder's auto-disable: a penalty the kernel is too rough
-        // to admit is never assembled, so it cannot reach the closed form.
-        let tension_active = tension_requested && two_pps > dim as f64 + 1.0;
-        let stiffness_active = stiffness_requested && two_pps > dim as f64 + 2.0;
-        if tension_active
-            && crate::basis::duchon_closed_form_operator_penalty_converges(
-                1, p_order, s_order, dim,
-            )
-        {
-            return false;
-        }
-        if stiffness_active
-            && crate::basis::duchon_closed_form_operator_penalty_converges(
-                2, p_order, s_order, dim,
-            )
-        {
-            return false;
-        }
-    }
-    true
+    spec.power_as_usize() as f64 == spec.power
 }
 
 /// Returns the effective Duchon null-space order, auto-degrading when the

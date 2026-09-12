@@ -2345,8 +2345,12 @@ pub fn build_duchon_operator_penalty_psi_derivatives_in_directions(
     // penalty whenever the UV+IR+precondition predicate holds, independent of
     // the polynomial nullspace order. Polynomial columns are zero-padded in
     // the closed-form block because they are the unpenalized Duchon nullspace.
+    // The closed-form block takes the same isotropic metric `aniso` as the
+    // collocation operators above, because the value does:
+    // `duchon_operator_penalty_candidates` hands `operator_penalty_candidates_closed_form`
+    // `aniso_log_scales = None`. Differentiating it at the spec's η instead
+    // differentiated a block the design never carries (gam#2735).
     let kappa = duchon_inverse_length_scale(length_scale, "sphere Duchon operator penalty")?;
-    let aniso = spec.aniso_log_scales.as_deref();
     if duchon_closed_form_operator_penalty_converges(1, p_order, s_order as f64, d) {
         let (cf_s, cf_s_psi, cf_s_psi_psi) = closed_form_psi_derivatives_in_total_basis(
             centers,
