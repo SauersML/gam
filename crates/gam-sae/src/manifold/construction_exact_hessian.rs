@@ -5192,14 +5192,6 @@ impl SaeManifoldTerm {
         cache: &ArrowFactorCache,
         a_pinv: &Array2<f64>,
     ) -> Result<f64, String> {
-        if self.assignment.effective_alpha_is_learnable() {
-            return Err(
-                "dense_exact_a_ordered_bb_sparse_trace: learnable-α ordered-Beta–Bernoulli \
-                 ∂A/∂ρ_sparse (nonlinear concentration derivative) is not yet modelled; refusing \
-                 rather than emitting a wrong sparse ½log|A| trace"
-                    .to_string(),
-            );
-        }
         let k_atoms = self.k_atoms();
         let n = self.n_obs();
         let row_weights = self.row_loss_weights.as_deref();
@@ -5232,6 +5224,42 @@ impl SaeManifoldTerm {
             rho,
             row_weights,
         )?;
+        if self.assignment.effective_alpha_is_learnable() {
+            // A learnable concentration makes `ρ_sparse = log(α/α_base)` move only the
+            // Beta shapes `a_k` (the prior weight stays one), so on the logit block
+            // `∂A/∂ρ_sparse` is the concentration derivative of the EXACT prior Hessian:
+            // `B` and `ΔC` split one operator and their majorizer parts cancel. Per atom
+            // column that derivative is `∂S'_k/∂ρ·u uᵀ + diag(∂S_k/∂ρ·w_i·curv_i)` with
+            // `u = w·J` (`z_jac`), and `hdiag` already holds its full diagonal
+            // `∂S'_k/∂ρ·u_i² + ∂S_k/∂ρ·w_i·curv_i`. The trace is one rank-one quadratic
+            // form per column plus the row-local part of the diagonal.
+            let ch = channels.as_ref().ok_or_else(|| {
+                "dense_exact_a_ordered_bb_sparse_trace: a learnable concentration needs the \
+                 ordered Beta--Bernoulli prior channels"
+                    .to_string()
+            })?;
+            let mut tr_joint = 0.0_f64;
+            for atom in 0..k_atoms {
+                let mass_curvature = ch.mass_hessian_log_alpha_derivative[atom];
+                let mut quadratic = 0.0_f64;
+                for irow in 0..n {
+                    let Some(gi) = logit_gindex[irow][atom] else {
+                        continue;
+                    };
+                    let islot = irow * k_atoms + atom;
+                    let ui = ch.z_jac[islot];
+                    tr_joint += a_pinv[[gi, gi]] * (hdiag[islot] - mass_curvature * ui * ui);
+                    for jrow in 0..n {
+                        let Some(gj) = logit_gindex[jrow][atom] else {
+                            continue;
+                        };
+                        quadratic += a_pinv[[gi, gj]] * ui * ch.z_jac[jrow * k_atoms + atom];
+                    }
+                }
+                tr_joint += mass_curvature * quadratic;
+            }
+            return Ok(0.5 * tr_joint);
+        }
         if let Some(ch) = channels.as_ref() {
             for row in 0..n {
                 for atom in 0..k_atoms {
@@ -5658,6 +5686,104 @@ mod test_support {
             assert!(
                 (fd - expected).abs() <= 1.0e-7 * (1.0 + expected.abs()),
                 "weighted={weighted}: analytic={expected:e}, fd={fd:e}"
+            );
+        }
+    }
+
+    /// #2822 — with a learnable concentration `ρ_sparse = log(α/α_base)`, the sparse
+    /// ½log|A| trace contracts the concentration derivative of the exact prior Hessian.
+    /// The reference reads the exact Hessian's columns off the existing HVP remainder
+    /// plus its majorizer diagonal, differentiates them centrally in `ρ_sparse` at a
+    /// fixed state, and contracts against an arbitrary symmetric matrix: the trace is
+    /// linear in `A⁺`, so this isolates the channel algebra from the pseudo-inverse.
+    #[test]
+    fn ordered_bb_learnable_alpha_sparse_trace_matches_exact_prior_hessian_difference_2822() {
+        for weighted in [false, true] {
+            let (mut term, target, rho) =
+                crate::manifold::tests_logdet_adjoint_780::obb_patchd_fixture(0.01, -1.0);
+            let super::AssignmentMode::OrderedBetaBernoulli {
+                temperature, alpha, ..
+            } = term.assignment.mode
+            else {
+                panic!("the patch-D fixture is an ordered Beta--Bernoulli term");
+            };
+            term.assignment.mode =
+                super::AssignmentMode::ordered_beta_bernoulli(temperature, alpha, true);
+            assert!(term.assignment.effective_alpha_is_learnable());
+            if weighted {
+                term.set_row_loss_weights(
+                    (0..term.n_obs())
+                        .map(|row| 0.5 + (row % 4) as f64 * 0.25)
+                        .collect(),
+                )
+                .expect("positive design weights");
+            }
+            let system = term
+                .assemble_arrow_schur(target.view(), &rho, None)
+                .expect("learnable-concentration OBB assembly");
+            let (_, _, cache) = super::solve_arrow_newton_step_with_options(
+                &system,
+                1.0e-6,
+                1.0e-6,
+                &super::ArrowSolveOptions::direct(),
+            )
+            .expect("Newton metric");
+            let mut sites = Vec::new();
+            for row in 0..term.n_obs() {
+                for (local, var) in term
+                    .row_vars_for_cache_row(row, &cache)
+                    .expect("cache row layout")
+                    .iter()
+                    .enumerate()
+                {
+                    if let super::SaeLocalRowVar::Logit { atom } = *var {
+                        sites.push((row * term.k_atoms() + atom, cache.row_offsets[row] + local));
+                    }
+                }
+            }
+            let dim = cache.delta_t_len() + cache.k;
+            let weight = ndarray::Array2::from_shape_fn((dim, dim), |(i, j)| {
+                ((i + j + 1) as f64 * 0.17).cos() + if i == j { 2.0 } else { 0.0 }
+            });
+            let analytic = term
+                .dense_exact_a_ordered_bb_sparse_trace(&rho, &cache, &weight)
+                .expect("learnable-concentration sparse trace");
+            let contraction = |moved: &super::SaeManifoldRho| {
+                let channels = super::ordered_beta_bernoulli_psd_majorizer_third_channels_weighted(
+                    &term.assignment,
+                    moved,
+                    term.row_loss_weights.as_deref(),
+                )
+                .expect("perturbed channels")
+                .expect("OBB family");
+                let mut unit = Array1::zeros(term.assignment.logits.len());
+                let mut trace = 0.0;
+                for &(flat_col, global_col) in &sites {
+                    unit[flat_col] = 1.0;
+                    let mut column = crate::assignment::ordered_beta_bernoulli_exact_hessian_minus_majorizer_hvp_weighted(
+                        &term.assignment, moved, term.row_loss_weights.as_deref(), unit.view(),
+                    ).expect("existing exact HVP remainder");
+                    unit[flat_col] = 0.0;
+                    column[flat_col] += channels.diagonal_term[flat_col].max(0.0);
+                    for &(flat_row, global_row) in &sites {
+                        trace += weight[[global_row, global_col]] * column[flat_row];
+                    }
+                }
+                0.5 * trace
+            };
+            let h = 1.0e-5;
+            let mut plus = rho.clone();
+            let mut minus = rho.clone();
+            plus.log_lambda_sparse += h;
+            minus.log_lambda_sparse -= h;
+            let fd = (contraction(&plus) - contraction(&minus)) / (2.0 * h);
+            assert!(
+                analytic.is_finite() && analytic != 0.0,
+                "weighted={weighted}: the concentration channel must carry signal; analytic={analytic:e}"
+            );
+            assert!(
+                (fd - analytic).abs() <= 1.0e-7 * (1.0 + analytic.abs()),
+                "weighted={weighted}: analytic={analytic:e}, fd={fd:e}"
             );
         }
     }
