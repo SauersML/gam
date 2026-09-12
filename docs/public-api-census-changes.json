@@ -1330,5 +1330,22 @@
     },
     "reason": "#2829 public-surface rule (docs/rust-library-surface.md, 6e5362f23): a pub item that no product uses is deleted. spd_frechet_mean and pairwise_reduce_chunked are restored-in-place identities with no product user. StreamingPairwise::{new, push, extend_from_slice, finish} lose their only production caller with pairwise_reduce_chunked, and one test was their only other user.",
     "evidence": "restored_consumers_2829.py at d8f6ef9be (MSI job 527977, /scratch.global/sauer354/pool/api2829/consumers.d8f6ef9be98996b5c98bd08667aa4fe121561e8f.rows.tsv) scores spd_frechet_mean and pairwise_reduce_chunked as unreferenced. At the base, git grep -w spd_frechet_mean over crates, src, tests and examples finds only its declaration, gam-geometry's two pub use lines, and two comments in response_geometry.rs. git grep -w StreamingPairwise finds pairwise_reduce.rs (declaration, impl, the call inside pairwise_reduce_chunked and the test streaming_one_at_a_time_matches_whole_slice), plus doc comments and one rustdoc link in gam-solve's streaming_border.rs. That file keeps its own entry-wise cascade and now describes it without naming the deleted type."
+  },
+  {
+    "base": "fe9438c25ff165ebac6b69f04c7311bd2281883f",
+    "removed": {
+      "crates/gam-gpu/src/numerics_host.rs::erfcx_nonnegative": 1,
+      "crates/gam-gpu/src/numerics_host.rs::log_ndtr": 1,
+      "crates/gam-gpu/src/numerics_host.rs::log_ndtr_and_mills": 1,
+      "crates/gam-gpu/src/numerics_host.rs::log_ndtr_mills_curvature": 1,
+      "crates/gam-linalg/src/matrix/symmetric.rs::addridge": 1,
+      "crates/gam-linalg/src/matrix/symmetric.rs::max_abs_diag": 1,
+      "crates/gam-linalg/src/utils.rs::addridge": 1,
+      "crates/gam-linalg/src/utils.rs::max_abs_diag": 1,
+      "crates/gam-math/src/probability.rs::weighted_chi_square_sf_to_tolerance": 1,
+      "crates/gam-math/src/probability.rs::weighted_chi_square_sf_with_bound": 1
+    },
+    "reason": "#2829 public-surface rule (docs/rust-library-surface.md, 6e5362f23): a pub item that no product uses is deleted. These ten restored-in-place identities have no user in gam-cli, gam-pyffi or Python, examples/, another crate's production code, or any test.",
+    "evidence": "restored_consumers_2829.py at d8f6ef9be (MSI job 527977, /scratch.global/sauer354/pool/api2829/consumers.d8f6ef9be98996b5c98bd08667aa4fe121561e8f.rows.tsv) scores log_ndtr, log_ndtr_mills_curvature and weighted_chi_square_sf_with_bound as unreferenced. It scores the two addridge and two max_abs_diag rows as consumed_unexplained, only because each name has a second definition in the same crate. At the base, git grep -w over crates, src, tests and examples finds these results. The four numerics_host.rs names appear elsewhere only as C function names inside the CUDA source strings of numerics_device.rs and bms/gpu/row.rs, and in doc comments. erfcx_nonnegative and log_ndtr_and_mills had no Rust caller outside the deleted oracle functions. addridge and max_abs_diag appear only at their declarations, a string, empty test-section header comments, and one gam-solve comment. weighted_chi_square_sf_to_tolerance's one call was inside weighted_chi_square_sf_with_bound. gam-models' smooth_term_lr.rs calls the surviving signed_weighted_chi_square_sf_to_tolerance."
   }
 ]

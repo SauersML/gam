@@ -1550,7 +1550,7 @@ pub(crate) fn fit_model_for_fixed_rho_with_adaptive_kkt<'a, X: Into<DesignMatrix
         // So `penalized_hessian` ALREADY carries δ and this seam must not add
         // it a second time.
         //
-        // This used to be `penalized_hessian.addridge(ridge_used)`. It was
+        // This used to add `ridge_used` to `penalized_hessian` a second time. It was
         // masked, not correct: the sparse branch reported `ridge_used = 0.0`
         // while handing back a matrix that carried δ = 1e-8 (its assembler
         // closure rewrote a requested 0 into `FIXED_STABILIZATION_RIDGE`), so

@@ -3593,5 +3593,22 @@
     ],
     "reason": "#2469: CERT_REL_SLACK (1e-4) widened the derived unit threshold of the dual certificate, so rows with 1 < eta <= 1.0001 were counted as certified although they are genuine improving births. A row exactly at the tie eta = 1 is decided by rounding either way, so the threshold is now 1. LAMBDA_FLOOR (f32::EPSILON) floored the implied lambda so that an empty support gave a large finite ratio. The implied lambda is the weakest live mass, so an empty support is the limit lambda -> 0, and dual_ratio returns infinity for a positive dual value and 0 for a zero one.",
     "evidence": "git grep -n CERT_REL_SLACK at the base finds its declaration and one use in assemble_report. git grep -n LAMBDA_FLOOR in crates/gam-sae/src finds its declaration and five uses, all in crates/gam-sae/src/dual_certificate.rs (harmonic_dual_birth_eta, sparse_route_dual_certificate, block_route_dual_certificate_scaled). chart_canonicalization.rs has a different LM_LAMBDA_FLOOR. Both consts were private to the file. Consumers of the report (gam-pyffi sae_spectral_ffi.rs, tests/test_sae_spectral_facade_smoke.py, tests/test_audit_sae_facade.py) read frac_certified in [0, 1], four quantiles and at most max_candidates births, and each still holds with an infinite ratio. Nothing here was compiled or run locally (user directive); compile is covered by the lead's shared tip check."
+  },
+  {
+    "base": "fe9438c25ff165ebac6b69f04c7311bd2281883f",
+    "items": [
+      "crates/gam-gpu/src/numerics_host.rs:fn:erfcx_nonnegative",
+      "crates/gam-gpu/src/numerics_host.rs:fn:log_ndtr",
+      "crates/gam-gpu/src/numerics_host.rs:fn:log_ndtr_and_mills",
+      "crates/gam-gpu/src/numerics_host.rs:fn:log_ndtr_mills_curvature",
+      "crates/gam-linalg/src/matrix/symmetric.rs:fn:addridge",
+      "crates/gam-linalg/src/matrix/symmetric.rs:fn:max_abs_diag",
+      "crates/gam-linalg/src/utils.rs:fn:addridge",
+      "crates/gam-linalg/src/utils.rs:fn:max_abs_diag",
+      "crates/gam-math/src/probability.rs:fn:weighted_chi_square_sf_to_tolerance",
+      "crates/gam-math/src/probability.rs:fn:weighted_chi_square_sf_with_bound"
+    ],
+    "reason": "#2829 public-surface rule. No product or test uses the host probit oracle in numerics_host.rs (erfcx_nonnegative, log_ndtr, log_ndtr_and_mills, log_ndtr_mills_curvature). The same holds for SymmetricMatrix::addridge and max_abs_diag, the free utils::addridge and max_abs_diag, and the non-negative chi-square wrappers weighted_chi_square_sf_with_bound and weighted_chi_square_sf_to_tolerance.",
+    "evidence": "numerics_host.rs keeps erfc, which gam-solve's pirls_row.rs:824 calls in production. Its probit parity tests still audit the CUDA kernel source: constants against kernel literals, msun-only transcendentals, and erfc symmetry. The five probit constants those tests pin moved into the test module, so their declarations survive in the same file. The Imhof method and oscillatory truncation derivation from weighted_chi_square_sf_with_bound's doc now sit on signed_weighted_chi_square_sf_to_tolerance, and the four intra-doc links to the deleted wrapper are reworded. symmetric.rs's Triplet, SparseColMat and add_sparse_symmetric_upper are still used in production at lines 170-632. The empty test-section headers are gone, and pirls/loop_driver.rs:1553 describes the removed call without naming it. The item list applies source_removal_guard.py's ITEM regex by hand. Compile is covered by the lead's shared tip check."
   }
 ]

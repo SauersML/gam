@@ -199,33 +199,6 @@ impl SymmetricMatrix {
         }
     }
 
-    pub fn addridge(&self, ridge: f64) -> Result<Self, String> {
-        if ridge == 0.0 {
-            return Ok(self.clone());
-        }
-        match self {
-            Self::Dense(mat) => {
-                let mut out = mat.clone();
-                for i in 0..out.nrows() {
-                    out[[i, i]] += ridge;
-                }
-                Ok(Self::Dense(out))
-            }
-            Self::Sparse(mat) => {
-                let n = mat.nrows();
-                let mut trip = Vec::with_capacity(n);
-                for i in 0..n {
-                    trip.push(Triplet::new(i, i, ridge));
-                }
-                let diagonal = SparseColMat::<usize, f64>::try_new_from_triplets(n, n, &trip)
-                    .map_err(|_| {
-                        "SymmetricMatrix::addridge failed to assemble sparse diagonal".to_string()
-                    })?;
-                Ok(Self::Sparse(add_sparse_symmetric_upper(mat, &diagonal)?))
-            }
-        }
-    }
-
     pub fn nrows(&self) -> usize {
         match self {
             Self::Dense(m) => m.nrows(),
@@ -262,32 +235,6 @@ impl SymmetricMatrix {
                     }
                 }
                 out
-            }
-        }
-    }
-
-    /// Maximum absolute value on the diagonal.
-    pub fn max_abs_diag(&self) -> f64 {
-        match self {
-            Self::Dense(mat) => {
-                let n = mat.nrows().min(mat.ncols());
-                (0..n).map(|i| mat[[i, i]].abs()).fold(0.0_f64, f64::max)
-            }
-            Self::Sparse(mat) => {
-                let (symbolic, values) = mat.parts();
-                let col_ptr = symbolic.col_ptr();
-                let row_idx = symbolic.row_idx();
-                let mut max_val = 0.0_f64;
-                for col in 0..mat.ncols() {
-                    let start = col_ptr[col];
-                    let end = col_ptr[col + 1];
-                    for idx in start..end {
-                        if row_idx[idx] == col {
-                            max_val = max_val.max(values[idx].abs());
-                        }
-                    }
-                }
-                max_val
             }
         }
     }
@@ -719,8 +666,6 @@ mod tests {
         assert!(a.add(&b).is_err());
     }
 
-    // ── addridge ──────────────────────────────────────────────────────────────
-
     // ── dot ───────────────────────────────────────────────────────────────────
 
     #[test]
@@ -742,8 +687,6 @@ mod tests {
         assert!((y[0] - 3.0).abs() < 1e-14);
         assert!((y[1] - 6.0).abs() < 1e-14);
     }
-
-    // ── max_abs_diag ──────────────────────────────────────────────────────────
 
     #[test]
     fn raw_symmetric_gram_rejects_smallest_nonfinite_row_before_sparse_assembly() {

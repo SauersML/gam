@@ -854,16 +854,6 @@ impl StableSolver {
     }
 }
 
-pub fn max_abs_diag(matrix: &Array2<f64>) -> f64 {
-    matrix
-        .diag()
-        .iter()
-        .copied()
-        .map(f64::abs)
-        .fold(0.0, f64::max)
-        .max(1.0)
-}
-
 pub fn row_mismatch_message(
     y_len: usize,
     w_len: usize,
@@ -959,18 +949,6 @@ pub fn symmetric_extremes(matrix: &Array2<f64>) -> Option<(f64, f64)> {
             .fold(f64::NEG_INFINITY, |acc, &value| acc.max(value));
         Some((min, max))
     })
-}
-
-pub fn addridge(matrix: &Array2<f64>, ridge: f64) -> Array2<f64> {
-    if ridge <= 0.0 {
-        return matrix.clone();
-    }
-    let mut regularized = matrix.clone();
-    let n = regularized.nrows();
-    for i in 0..n {
-        regularized[[i, i]] += ridge;
-    }
-    regularized
 }
 
 pub fn boundary_hit_step_fraction(
@@ -2056,14 +2034,6 @@ mod pure_fn_tests {
     fn inf_norm_mixed_signs() {
         assert_eq!(inf_norm([-5.0_f64, 2.0, -3.0]), 5.0);
     }
-
-    // -----------------------------------------------------------------------
-    // max_abs_diag
-    // -----------------------------------------------------------------------
-
-    // -----------------------------------------------------------------------
-    // addridge
-    // -----------------------------------------------------------------------
 
     // -----------------------------------------------------------------------
     // row_mismatch_message / predict_gam_dimension_mismatch_message

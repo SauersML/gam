@@ -3,8 +3,7 @@
 //!
 //! The CUDA kernels emit their own NVRTC-visible numerics (see
 //! [`crate::numerics_device`]); this module is the matching **host** side
-//! used by the CPU parity oracles (`bms_flex_row`'s test oracle) and the
-//! CPU reference path (`pirls_row`'s probit CDF). Keeping a single definition
+//! used by the CPU reference path (`pirls_row`'s probit CDF). Keeping a single definition
 //! here means the host `erfc` cannot drift between backends.
 
 /// Complementary error function `erfc(x) = 1 − erf(x)` evaluated on the host.
@@ -25,189 +24,28 @@ pub fn erfc(x: f64) -> f64 {
     libm::erfc(x)
 }
 
-// ── Host oracle for the shared device probit numerics (issue #1175) ──────────
-//
-// The functions below are the CPU-side, device-free mirror of the CUDA source
-// in [`crate::numerics_device::PROBIT_NUMERICS_CU`]. They are written
-// LINE-FOR-LINE against that kernel source — the SAME branch structure, the
-// SAME asymptotic `erfcx` polynomial, and the SAME constants — differing only
-// in that they call the host `libm`
-// transcendentals (`erfc`/`exp`/`log`) where the kernel calls the device
-// `erfc`/`exp`/`log`. Both sides are the SunOS *msun* double-precision
-// implementations, so the host oracle matches the device to within ~1 ULP per
-// transcendental (issue #1175 items 4–5). The mirror is a CPU emulator that is
-// BOTH the fallback and the exactness oracle a device launch is pinned to.
-//
-// Correctness *without a GPU* (CPU-verifiable): the test harness below asserts
-// (a) these constants are bit-identical to the literals in the kernel source
-// (the "constants cannot drift" lock, #1175 item 4), (b) the kernel source uses
-// only msun transcendentals and no fast-math intrinsics (transcendental-parity
-// intent), and (c) the host oracle satisfies the defining probit identities to
-// a stated ULP bound. Confirming a *device launch* reproduces this oracle to
-// round-off still needs CUDA hardware.
-
-/// `1/√(2π)`, matching `INV_SQRT_2PI` in the kernel source bit-for-bit.
-pub const INV_SQRT_2PI: f64 = 0.3989422804014327;
-/// `√2`, matching `SQRT_2` in the kernel source bit-for-bit.
-pub const SQRT_2: f64 = 1.4142135623730951;
-/// `ln(2)`, matching `LN_2` in the kernel source bit-for-bit.
-pub const LN_2: f64 = 0.6931471805599453;
-/// `1/√π`, matching `inv_sqrt_pi` in the kernel source bit-for-bit.
-pub const INV_SQRT_PI: f64 = 0.5641895835477563;
-/// `√(2/π)`, matching `sqrt_2_over_pi` in the kernel source bit-for-bit.
-pub const SQRT_2_OVER_PI: f64 = 0.7978845608028654;
-
-/// Scaled complementary error function `erfcx(x) = exp(x²)·erfc(x)` for `x ≥ 0`,
-/// the host oracle for the device `erfcx_nonnegative`. Returns `0.0` at `+∞`;
-/// negative inputs and `NaN` return `NaN` because they violate the restricted
-/// domain. For `0 ≤ x < 26` evaluates `exp(x²)·erfc(x)` directly; beyond that
-/// it switches to the same six-correction asymptotic expansion as the kernel.
-///
-/// The direct branch carries `x²` exactly. Rounding the square perturbs it by
-/// a relative `ε/2`, and `exp` converts a relative perturbation of its ARGUMENT
-/// into `x²` times that in its RESULT — `5.7e-14` at the top of the branch,
-/// against the `3e-16` the asymptotic branch already delivers, so the seam at
-/// `26` was a 190x step DOWN in error into the interval every probit consumer
-/// lives in. `mul_add` is the IEEE fused operation, matching the kernel's
-/// explicit `fma` call, which `--fmad=false` does not touch (it disables
-/// CONTRACTION of a separate `a*b+c`). See `gam_math::probability` for the
-/// measurements; this branch is its line-for-line device-side twin.
-pub fn erfcx_nonnegative(x: f64) -> f64 {
-    if x.is_nan() || x < 0.0 {
-        return f64::NAN;
-    }
-    if x == f64::INFINITY {
-        return 0.0;
-    }
-    if x < 26.0 {
-        let hi = x * x;
-        let lo = x.mul_add(x, -hi);
-        let head = libm::exp(hi) * erfc(x);
-        return head.mul_add(lo, head);
-    }
-    let inv = 1.0 / x;
-    let inv2 = inv * inv;
-    let poly = 1.0
-        + inv2
-            * (-0.5
-                + inv2
-                    * (0.75
-                        + inv2
-                            * (-1.875 + inv2 * (6.5625 + inv2 * (-29.53125 + inv2 * 162.421875)))));
-    inv * poly * INV_SQRT_PI
-}
-
-/// `log Φ(x)` for the standard normal CDF, the host oracle for the device
-/// `log_ndtr`. For `x < 0` uses the `erfcx` representation
-/// `log Φ(x) = −u² + log(½·erfcx(u))`, `u = −x/√2`, keeping digits into the
-/// deep left tail; for `x ≥ 0` uses `log1p(−½·erfc(x/√2))`, retaining the
-/// negative tail after the CDF rounds to one. Propagates `±∞`/`NaN` exactly as
-/// the device path does.
-pub fn log_ndtr(x: f64) -> f64 {
-    if x == f64::INFINITY {
-        return 0.0;
-    }
-    if x == f64::NEG_INFINITY {
-        return f64::NEG_INFINITY;
-    }
-    if x.is_nan() {
-        return x;
-    }
-    if x < 0.0 {
-        let u = -x / SQRT_2;
-        let ex = erfcx_nonnegative(u);
-        -u * u + libm::log(ex) - LN_2
-    } else {
-        let upper_tail = 0.5 * erfc(x / SQRT_2);
-        libm::log1p(-upper_tail)
-    }
-}
-
-/// Joint `(log Φ(x), Mills ratio φ(x)/Φ(x))`, the host oracle for the device
-/// `log_ndtr_and_mills`. The `x < 0` branch computes the Mills ratio as
-/// `√(2/π)/erfcx(u)`, which stays finite even when `Φ(x)` underflows; the
-/// `x ≥ 0` branch forms `pdf/cdf` directly. Boundary values mirror the kernel:
-/// `(+0, +0)` at `+∞`, `(−∞, +∞)` at `−∞`, `(NaN, NaN)` at `NaN`.
-pub fn log_ndtr_and_mills(x: f64) -> (f64, f64) {
-    if x == f64::INFINITY {
-        return (0.0, 0.0);
-    }
-    if x == f64::NEG_INFINITY {
-        return (f64::NEG_INFINITY, f64::INFINITY);
-    }
-    if x.is_nan() {
-        return (x, x);
-    }
-    if x < 0.0 {
-        let u = -x / SQRT_2;
-        let ex = erfcx_nonnegative(u);
-        let log_cdf = -u * u + libm::log(ex) - LN_2;
-        let lambda = SQRT_2_OVER_PI / ex;
-        (log_cdf, lambda)
-    } else {
-        let upper_tail = 0.5 * erfc(x / SQRT_2);
-        let cdf = 1.0 - upper_tail;
-        // Same exact-square correction as `erfcx_nonnegative`. `x` is finite
-        // and non-negative here, so the residual is always a finite number.
-        let xx = x * x;
-        let pdf = INV_SQRT_2PI * libm::exp(-0.5 * xx);
-        let pdf = pdf.mul_add(-0.5 * x.mul_add(x, -xx), pdf);
-        let log_cdf = libm::log1p(-upper_tail);
-        let lambda = pdf / cdf;
-        (log_cdf, lambda)
-    }
-}
-
-/// Joint `(log Φ(x), φ(x)/Φ(x), −d²log Φ(x)/dx²)` host oracle.
-///
-/// The curvature's deep-left branch differentiates the same 32-level Laplace
-/// continued fraction as the CPU model kernel, retaining its unit limit without
-/// subtracting the nearly equal `x` and Mills ratio. The CUDA source mirrors
-/// this operation order; host/device transcendental channels are ULP-close,
-/// while the rational curvature branch is operation-for-operation identical
-/// when device FMA contraction is disabled.
-pub fn log_ndtr_mills_curvature(x: f64) -> (f64, f64, f64) {
-    let (log_cdf, lambda) = log_ndtr_and_mills(x);
-    if x.is_nan() {
-        return (log_cdf, lambda, x);
-    }
-    if x.is_infinite() {
-        return (
-            log_cdf,
-            lambda,
-            if x.is_sign_positive() { 0.0 } else { 1.0 },
-        );
-    }
-    let curvature = if x <= -4.0 {
-        let t = -x;
-        let mut q = 0.0;
-        let mut q_first = 0.0;
-        for n in (1..=32).rev() {
-            let denominator = t + q;
-            let value = f64::from(n) / denominator;
-            q_first = -value * (1.0 + q_first) / denominator;
-            q = value;
-        }
-        1.0 + q_first
-    } else {
-        lambda * (x + lambda)
-    };
-    (log_cdf, lambda, curvature)
-}
-
 #[cfg(test)]
 mod probit_parity_tests {
     //! CPU-verifiable floating-point-order & transcendental parity harness for
     //! the shared probit numerics (issue #1175). Everything here runs without a
-    //! GPU: it pins the host oracle constants to the kernel-source literals,
-    //! audits the kernel source for msun-only transcendentals (no fast-math),
-    //! and checks the host oracle against the defining probit identities within
-    //! stated ULP bounds. A *device* reproducing this oracle to round-off still
-    //! requires CUDA hardware and is asserted by the on-device parity gates.
+    //! GPU: it pins the probit constants to the kernel-source literals, audits
+    //! the kernel source for msun-only transcendentals (no fast-math), and checks
+    //! the host `erfc` symmetry within a stated ULP bound.
     use super::*;
     use crate::numerics_device::PROBIT_NUMERICS_CU;
 
     const EPS: f64 = f64::EPSILON; // 2.220446049250313e-16
+
+    /// `1/√(2π)`, matching `INV_SQRT_2PI` in the kernel source bit-for-bit.
+    const INV_SQRT_2PI: f64 = 0.3989422804014327;
+    /// `√2`, matching `SQRT_2` in the kernel source bit-for-bit.
+    const SQRT_2: f64 = 1.4142135623730951;
+    /// `ln(2)`, matching `LN_2` in the kernel source bit-for-bit.
+    const LN_2: f64 = 0.6931471805599453;
+    /// `1/√π`, matching `inv_sqrt_pi` in the kernel source bit-for-bit.
+    const INV_SQRT_PI: f64 = 0.5641895835477563;
+    /// `√(2/π)`, matching `sqrt_2_over_pi` in the kernel source bit-for-bit.
+    const SQRT_2_OVER_PI: f64 = 0.7978845608028654;
 
     /// Relative error of `got` vs `want`, expressed in ULP of `want`.
     fn ulp(got: f64, want: f64) -> f64 {
@@ -238,8 +76,8 @@ mod probit_parity_tests {
             .unwrap_or_else(|e| panic!("failed to parse literal after {needle:?}: {e}"))
     }
 
-    /// #1175 item 4 pattern ("constants cannot drift"): every constant the host
-    /// oracle uses is bit-identical to the literal baked into the kernel source.
+    /// #1175 item 4 pattern ("constants cannot drift"): every probit constant is
+    /// bit-identical to the literal baked into the kernel source.
     /// A one-bit edit on either side fails this immediately.
     #[test]
     fn host_constants_match_kernel_source_bit_for_bit() {

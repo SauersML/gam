@@ -335,126 +335,12 @@ pub fn chi_square_sf(statistic: f64, degrees_of_freedom: f64) -> f64 {
     gamma_ur(half_df, 0.5 * statistic)
 }
 
-/// Survival probability `P(Σ_j w_j Z_j² > statistic)` for independent standard
-/// normals `Z_j` and non-negative weights `w`.
-///
-/// This is the exact null law of every quadratic form `u'Au` in a standard
-/// normal vector — `w` being the eigenvalues of the symmetric part of `A` — and
-/// it is the reference distribution a *penalized* likelihood-ratio statistic is
-/// actually drawn from. Only the degenerate all-weights-equal case reduces to a
-/// (scaled) χ²; matching a χ² to the mean `Σ w_j` alone leaves the reference
-/// over-dispersed whenever the weights differ, because `Var = 2Σ w_j²` while the
-/// mean-matched χ² carries `2 Σ w_j`, and `Σ w_j² ≤ (max_j w_j)·Σ w_j`.
-///
-/// # Method
-///
-/// Imhof's (1961) exact inversion of the characteristic function, in the central
-/// one-degree-of-freedom-per-weight form:
-///
-/// ```text
-/// P(Q > x) = 1/2 + (1/π) ∫_0^∞ sin θ(u) / (u ρ(u)) du,
-/// θ(u) = ½ Σ_j arctan(w_j u) − ½ x u,
-/// ρ(u) = Π_j (1 + w_j² u²)^{1/4}.
-/// ```
-///
-/// The integrand is bounded (`sin θ(u)/u → (Σ w_j − x)/2` as `u → 0`) and is
-/// integrated on panels of one full oscillation of the `−xu/2` phase with a
-/// fixed 16-node Gauss–Legendre rule, which is exact for the amplitude to well
-/// past the resolution of the phase.
-///
-/// # Truncation, and why the bound is the oscillatory one
-///
-/// The naive tail bound `∫_U^∞ du/(u ρ(u))` decays only like `U^{-m/2}` in the
-/// number `m` of weights that are *active* at `U` (i.e. `w_j U ≳ 1`), which is
-/// useless when one weight dominates. The integrand is an oscillation, though:
-/// once `φ'(u) = ½ Σ_j w_j/(1 + w_j²u²)` has fallen below `x/4`, the phase
-/// `θ` is strictly decreasing with `|θ'| ≥ x/4`, so substituting the phase as
-/// the integration variable turns the tail into `∫ G(t) sin(θ(U) − t) dt` with
-/// `G` positive and decreasing from `G(0) ≤ 4/(x U ρ(U))`. The alternating
-/// half-period sum of such an integral is bounded by `4 G(0)`, giving
-///
-/// ```text
-/// |tail(U)| ≤ 16 / (x · U · ρ(U)),
-/// ```
-///
-/// which is the stopping rule. This is a bound on the answer, not a guess about
-/// it: the loop runs until the bound is under [`WEIGHTED_CHI_SQUARE_TOLERANCE`],
-/// and `ρ` is non-decreasing so it always terminates.
-///
-/// # Exact special cases
-///
-/// * no positive weight — `Q ≡ 0`;
-/// * all positive weights bit-identical — `Q = w χ²_q` exactly, so the
-///   incomplete-gamma path is both faster and more accurate than any quadrature
-///   (this also covers the single-weight and the classical unpenalized
-///   `w ≡ 1 ⇒ χ²_q` cases).
-///
-/// Returns the survival probability together with the certified absolute bound on
-/// its own truncation error, so a consumer (or a test) can see the accuracy rather
-/// than trust it. The value is `NaN` if any weight is negative or non-finite, or if
-/// `statistic` is `NaN`.
-///
-/// The bound is `0.0` on the exact closed-form branches. On the Imhof branch it
-/// is `16/(x·U·ρ(U))` at the truncation point `U` actually reached, which is at
-/// or below [`WEIGHTED_CHI_SQUARE_TOLERANCE`] unless the panel backstop
-/// [`IMHOF_MAX_PANELS`] bound first.
-pub fn weighted_chi_square_sf_with_bound(weights: &[f64], statistic: f64) -> (f64, f64) {
-    weighted_chi_square_sf_to_tolerance(weights, statistic, WEIGHTED_CHI_SQUARE_TOLERANCE)
-}
-
-/// [`weighted_chi_square_sf_with_bound`] at a caller-chosen absolute accuracy.
-///
-/// # Why this is a parameter and not a constant
-///
-/// The truncation point `U` needed for a bound `ε` grows like `ε^{-2/(2+m)}` in
-/// the number `m` of weights *active* there, and the panel count like `U·x/4π`.
-/// With one dominant weight over a tail of small ones — which is the shape of a
-/// shrunk penalized smooth, not a corner case — `m = 1` over the whole useful
-/// range and the cost is `ε^{-2/3}`. Measured on `w = 1 − p²` for
-/// `p = (0, 10⁻³, 10⁻⁵, 10⁻⁷, 10⁻⁹)` at `x = 3Σw`:
-///
-/// ```text
-/// ε = 1e-11    467,919 panels   1.73 s
-/// ε = 1e-9      74,433 panels   237 ms
-/// ε = 1e-7      10,519 panels    46 ms
-/// ```
-///
-/// with the three answers agreeing to `1.0e-9` absolute — i.e. the certified
-/// bound is two orders pessimistic, and the top row buys nothing but time. A
-/// caller that knows what its answer is *for* can say so, and one that does not
-/// still gets [`WEIGHTED_CHI_SQUARE_TOLERANCE`] through the entry point above.
-///
-/// A non-positive or non-finite `absolute_tolerance` is treated as
-/// [`WEIGHTED_CHI_SQUARE_TOLERANCE`]: the contract is "at least this accurate",
-/// and a caller that asks for nonsense gets the strictest answer rather than the
-/// loosest. The returned bound is always the one actually achieved, which may be
-/// tighter than requested (the sweep stops at a panel boundary) or looser (the
-/// [`IMHOF_MAX_PANELS`] backstop bound first).
-pub fn weighted_chi_square_sf_to_tolerance(
-    weights: &[f64],
-    statistic: f64,
-    absolute_tolerance: f64,
-) -> (f64, f64) {
-    let mut terms = Vec::with_capacity(weights.len());
-    for &weight in weights {
-        if !weight.is_finite() || weight < 0.0 {
-            return (f64::NAN, f64::NAN);
-        }
-        terms.push(WeightedChiSquareTerm {
-            weight,
-            degrees_of_freedom: 1.0,
-        });
-    }
-    signed_weighted_chi_square_sf_to_tolerance(&terms, statistic, absolute_tolerance)
-}
-
 /// One `λ_j · χ²_{h_j}` term of a linear combination of independent
 /// chi-squares, with the weight's SIGN and the term's degrees of freedom both
 /// carried explicitly.
 ///
-/// Two things separate this from the `&[f64]` weight list
-/// [`weighted_chi_square_sf_with_bound`] takes, and each of them is a distribution the
-/// one-degree-of-freedom non-negative form cannot express:
+/// Two things separate this from a plain list of non-negative one-degree-of-freedom
+/// weights, and each of them is a distribution that form cannot express:
 ///
 /// * **A negative weight makes a RATIO a tail.** `P(A/B > t)` for independent
 ///   non-negative `A`, `B` is `P(A − tB > 0)`, so every F-shaped reference —
@@ -483,9 +369,8 @@ pub struct WeightedChiSquareTerm {
 ///
 /// # Method
 ///
-/// Imhof's (1961) inversion in its general central form, of which the
-/// non-negative unit-`h` case documented on [`weighted_chi_square_sf_with_bound`] is the
-/// specialization:
+/// Imhof's (1961) exact inversion of the characteristic function in its general
+/// central form:
 ///
 /// ```text
 /// P(Q > x) = 1/2 + (1/π) ∫_0^∞ sin θ(u) / (u ρ(u)) du,
@@ -496,10 +381,29 @@ pub struct WeightedChiSquareTerm {
 /// Nothing in the derivation asks `λ_j > 0` — `arctan` is odd and `λ²` is even,
 /// so a negative weight simply turns its part of the phase the other way.
 ///
+/// # The oscillatory truncation bound
+///
+/// For non-negative one-degree-of-freedom weights `w_j`:
+///
+/// The naive tail bound `∫_U^∞ du/(u ρ(u))` decays only like `U^{-m/2}` in the
+/// number `m` of weights that are *active* at `U` (i.e. `w_j U ≳ 1`), which is
+/// useless when one weight dominates. The integrand is an oscillation, though:
+/// once `φ'(u) = ½ Σ_j w_j/(1 + w_j²u²)` has fallen below `x/4`, the phase
+/// `θ` is strictly decreasing with `|θ'| ≥ x/4`, so substituting the phase as
+/// the integration variable turns the tail into `∫ G(t) sin(θ(U) − t) dt` with
+/// `G` positive and decreasing from `G(0) ≤ 4/(x U ρ(U))`. The alternating
+/// half-period sum of such an integral is bounded by `4 G(0)`, giving
+///
+/// ```text
+/// |tail(U)| ≤ 16 / (x · U · ρ(U)),
+/// ```
+///
+/// which is one of the two stopping rules below. "Phase monotonicity, generalized"
+/// extends its slope condition to signed weights.
+///
 /// # Two truncation bounds, because one of them stops working at `x = 0`
 ///
-/// The oscillatory bound `16/(x·U·ρ(U))` documented on
-/// [`weighted_chi_square_sf_with_bound`] divides by `x`, and the ratio references this
+/// The oscillatory bound `16/(x·U·ρ(U))` above divides by `x`, and the ratio references this
 /// signed form exists for are evaluated at exactly `x = 0`, where the phase
 /// stops turning at all: `θ(u) → (π/4)·Σ_j h_j·sgn(λ_j)`, a constant. There is
 /// no oscillation left to cancel, so the alternating-series argument yields
@@ -595,10 +499,12 @@ pub fn signed_weighted_chi_square_sf_to_tolerance(
     imhof_survival(&active, statistic, tolerance)
 }
 
-/// Default absolute accuracy [`weighted_chi_square_sf_with_bound`] certifies on its Imhof
-/// truncation. It is four orders below the smallest probability any consumer
-/// of a survival function resolves in practice and eleven below one, so the
-/// truncation is never the term that limits a reported tail.
+/// Default absolute accuracy of the Imhof truncation, which
+/// [`signed_weighted_chi_square_sf_to_tolerance`] applies when the requested
+/// tolerance is not finite and positive. It is four orders below the smallest
+/// probability any consumer of a survival function resolves in practice and
+/// eleven below one, so the truncation is never the term that limits a reported
+/// tail.
 pub const WEIGHTED_CHI_SQUARE_TOLERANCE: f64 = 1e-11;
 
 /// Gauss-Legendre nodes and weights on `[-1, 1]`, 16 points. A 16-node rule is

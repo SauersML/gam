@@ -41,10 +41,10 @@ crates/gam-gpu/src/encode_throughput.rs	from_elapsed	retired-by-later-deletion:5
 crates/gam-gpu/src/encode_throughput.rs	measure_resident_solve_throughput	retired-by-later-deletion:5e967c2045
 crates/gam-gpu/src/memory.rs	from_array	retired-no-surviving-dependent
 crates/gam-gpu/src/mod.rs	cuda_backend_status	retired-by-later-deletion:5d498d0e9d
-crates/gam-gpu/src/numerics_host.rs	erfcx_nonnegative	restored-in-place
-crates/gam-gpu/src/numerics_host.rs	log_ndtr	restored-in-place
-crates/gam-gpu/src/numerics_host.rs	log_ndtr_and_mills	restored-in-place
-crates/gam-gpu/src/numerics_host.rs	log_ndtr_mills_curvature	restored-in-place
+crates/gam-gpu/src/numerics_host.rs	erfcx_nonnegative	retired-no-product-user
+crates/gam-gpu/src/numerics_host.rs	log_ndtr	retired-no-product-user
+crates/gam-gpu/src/numerics_host.rs	log_ndtr_and_mills	retired-no-product-user
+crates/gam-gpu/src/numerics_host.rs	log_ndtr_mills_curvature	retired-no-product-user
 crates/gam-gpu/src/policy.rs	arrow_border_solve_plan	retired-by-later-deletion:5d498d0e9d
 crates/gam-gpu/src/policy.rs	from_device_measurement	retired-by-later-deletion:228b6aeb05
 crates/gam-gpu/src/policy.rs	from_device_measurement_against	retired-by-later-deletion:228b6aeb05
@@ -119,8 +119,8 @@ crates/gam-linalg/src/matrix/mod.rs	solve_system_matrix_free_pcg	retired-by-late
 crates/gam-linalg/src/matrix/mod.rs	solve_system_matrix_free_pcg_with_info	retired-by-later-deletion:b66b773539
 crates/gam-linalg/src/matrix/mod.rs	try_to_dense_arc_with_policy	restored-in-place
 crates/gam-linalg/src/matrix/mod.rs	x_original	restored-in-place
-crates/gam-linalg/src/matrix/symmetric.rs	addridge	restored-in-place
-crates/gam-linalg/src/matrix/symmetric.rs	max_abs_diag	restored-in-place
+crates/gam-linalg/src/matrix/symmetric.rs	addridge	retired-no-product-user
+crates/gam-linalg/src/matrix/symmetric.rs	max_abs_diag	retired-no-product-user
 crates/gam-linalg/src/matrix/symmetric.rs	xt_diag_x_psd	retired-by-later-deletion:b66b773539
 crates/gam-linalg/src/matrix/weights.rs	as_psd	retired-by-later-deletion:b66b773539
 crates/gam-linalg/src/matrix/weights.rs	from_array	restored-in-place
@@ -135,8 +135,8 @@ crates/gam-linalg/src/sparse_exact.rs	dense_to_sparse	retired-by-later-deletion:
 crates/gam-linalg/src/sparse_exact.rs	factor_nnz	restored-in-place
 crates/gam-linalg/src/sparse_exact.rs	trace_product_sparse	retired-by-later-deletion:b66b773539
 crates/gam-linalg/src/utils.rs	absolute_cutoff	restored-in-place
-crates/gam-linalg/src/utils.rs	addridge	restored-in-place
-crates/gam-linalg/src/utils.rs	max_abs_diag	restored-in-place
+crates/gam-linalg/src/utils.rs	addridge	retired-no-product-user
+crates/gam-linalg/src/utils.rs	max_abs_diag	retired-no-product-user
 crates/gam-linalg/src/utils.rs	max_eigenvalue	restored-in-place
 crates/gam-linalg/src/utils.rs	pseudoinverse	restored-in-place
 crates/gam-linalg/src/utils.rs	relative_cutoff	restored-in-place
@@ -169,8 +169,8 @@ crates/gam-math/src/probability.rs	cone_boundary_log_factor	retired-by-later-del
 crates/gam-math/src/probability.rs	cone_boundary_log_factor_and_derivatives	retired-by-later-deletion:3685289591
 crates/gam-math/src/probability.rs	signed_weighted_chi_square_sf	retired-by-later-deletion:3685289591
 crates/gam-math/src/probability.rs	weighted_chi_square_sf	retired-by-later-deletion:3685289591
-crates/gam-math/src/probability.rs	weighted_chi_square_sf_to_tolerance	restored-in-place
-crates/gam-math/src/probability.rs	weighted_chi_square_sf_with_bound	restored-in-place
+crates/gam-math/src/probability.rs	weighted_chi_square_sf_to_tolerance	retired-no-product-user
+crates/gam-math/src/probability.rs	weighted_chi_square_sf_with_bound	retired-no-product-user
 crates/gam-math/src/score_opt.rs	maximize	retired-no-surviving-dependent
 crates/gam-model-api/src/families/custom_family/options.rs	default_coefficient_gradient_cost	retired-by-later-deletion:94410581a7
 crates/gam-model-kernels/src/cubic_cell_kernel.rs	build_denested_partition_cells	restored-in-place
