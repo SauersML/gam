@@ -3434,5 +3434,17 @@
     ],
     "reason": "#2469: SEED_FEASIBILITY_TOL (1e-9) was a picked tolerance, declared twice as a function-local const, for certifying the strict-interior seed. The dense site allowed -1e-9 on equality-pair rows and 0.5*margin - 1e-9 on one-sided rows; the operator site allowed 0.5*ACTIVE_SET_INTERIOR_SEED_MARGIN - 1e-9. The QP that produces the seed guarantees a scaled violation of at most ACTIVE_SET_PRIMAL_FEASIBILITY_TOL on the margin-shifted rows (the contract documented on solve_strictly_convex_quadratic_with_constraint_set_dual). Both certificates now check exactly what that contract implies: slack >= margin - ACTIVE_SET_PRIMAL_FEASIBILITY_TOL on shifted rows and slack >= -ACTIVE_SET_PRIMAL_FEASIBILITY_TOL on unshifted equality-pair rows. That removes both the picked 1e-9 and the picked factor 0.5.",
     "evidence": "git grep -n SEED_FEASIBILITY_TOL over *.rs on base finds five lines, all in crates/gam-solve/src/active_set.rs production code: declarations at :1227 (project_point_strictly_into_feasible_cone) and :2792 (project_point_strictly_into_feasible_constraint_set), uses at :1231, :1233 and :2795. No other file or test names it. The existing seed tests in active_set.rs (:4413 min_slack >= 0.5*ACTIVE_SET_INTERIOR_SEED_MARGIN, :4454 >= 0.4*margin, :5607 and :5789 >= 0.5*margin - 1e-9) assert bounds below the new certificate's margin - 1e-8, so any seed the new certificate returns also satisfies them. Not compiled or run locally (user directive); compile is covered by the lead's shared tip check."
+  },
+  {
+    "base": "d8f6ef9be98996b5c98bd08667aa4fe121561e8f",
+    "items": [
+      "crates/gam-sae/src/identifiability.rs:enum:RidgeRemlWeight",
+      "crates/gam-sae/src/identifiability.rs:fn:ridge_reml_select_weight",
+      "crates/gam-sae/src/identifiability.rs:fn:ridge_reml_weight_matches_one_direction_stationary_solution",
+      "crates/gam-sae/src/identifiability.rs:fn:ridge_reml_weight_recovers_exact_full_shrinkage_boundary",
+      "crates/gam-sae/src/identifiability.rs:fn:score"
+    ],
+    "reason": "SPEC rule 5 (#2901 V15). The soft-L2 partial-supervision map penalized the map coefficients (a ridge on A), which is not a functional of the fitted block T A. It now penalizes the function mass λ‖T A‖², whose REML weight has a closed form. The certified log-λ search over the coefficient-ridge profile therefore has no caller, so ridge_reml_select_weight, RidgeRemlWeight with its score method, and their two unit tests are deleted.",
+    "evidence": "At the base, git grep -l ridge_reml_select_weight outside the generated tools/codebase-city bundle finds crates/gam-sae/src/identifiability.rs and two doc comments in crates/gam-math/src/score_opt.rs, which this change rewrites. git grep -l RidgeRemlWeight finds only identifiability.rs. The only production caller was the PartialSupervisionSupMethod::SoftL2 branch of partial_supervision_solve, which is replaced here. RidgeRemlWeight::score had no caller. Both deleted tests call only ridge_reml_select_weight. The item list applies source_removal_guard.py's ITEM regex and occurrence rule to the removed hunks by hand: three public declarations and two test-scoped fns, and no private declaration is removed. Compile is covered by the lead's shared tip check."
   }
 ]

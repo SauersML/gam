@@ -1,10 +1,11 @@
 """Partial-supervision gauge-fix example — thin Python wrapper around the
 Rust ``gam::identifiability::sae::partial_supervision_solve`` primitive.
 
-All numerical linear algebra (Procrustes / anchor / soft-L2 ridge / QR
-orthogonalization) lives in Rust; this module only handles argument
-marshaling, shape validation that doesn't duplicate the Rust checks, and
-result wrapping into the :class:`PartialSupervisionFit` dataclass.
+All numerical linear algebra (Procrustes / anchor / soft-L2 function-mass
+shrinkage / orthogonal-complement projection) lives in Rust; this module
+only handles argument marshaling, shape validation that doesn't duplicate
+the Rust checks, and result wrapping into the :class:`PartialSupervisionFit`
+dataclass.
 
 Color-specific auxiliaries (HSV/RGB/LCh) reuse the existing
 :class:`gamfit.GaugeCompanion` scorer; its loss is also a Rust pyfunction
@@ -45,11 +46,13 @@ class PartialSupervisionFit:
     free_constraint : str | None
         Echoes the ``free_constraint`` argument used.
     selected_weight : float | None
-        REML-selected soft-L2 weight (only set for ``soft_l2``).
+        Function-mass shrinkage weight λ selected by the Gaussian marginal
+        likelihood (only set for ``soft_l2``). ``inf`` when the evidence
+        selects the null map ``map_A = 0``.
     map_R : (d_supervised, d_supervised) ndarray | None
         Procrustes rotation. ``None`` for the other methods.
     map_A : ndarray | None
-        Affine slope (anchor) or ridge map (soft_l2). ``None`` for
+        Affine slope (anchor) or shrinkage map (soft_l2). ``None`` for
         procrustes.
     map_b : ndarray | None
         Anchor affine intercept. ``None`` for the other methods.
@@ -125,7 +128,8 @@ class PartialSupervisionFit:
         # orthogonalization stays in one place. We re-pass the (already
         # aligned) sup slice as both `t_sup` and `aux`; with method
         # "procrustes" and that input the SVD step returns R=I and leaves
-        # T_sup_new unchanged, while the free-block QR projection runs.
+        # T_sup_new unchanged, while the free-block orthogonal-complement
+        # projection runs.
         if self.free_constraint == "orthogonal_to_sup" and d_free > 0:
             result = rust_module().partial_supervision_solve(
                 np.ascontiguousarray(T_sup_new),

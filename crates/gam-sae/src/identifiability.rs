@@ -93,9 +93,6 @@ use faer::Side;
 use gam_linalg::faer_ndarray::{
     FaerCholesky, FaerEigh, FaerSvd, default_rrqr_rank_alpha, rrqr_with_permutation,
 };
-use gam_math::score_opt::{
-    AffineRemlProfile, ScoreOptimumLocation, certified_exp_representative, certified_ln_positive,
-};
 use gam_problem::{MetricProvenance, RowMetric};
 use gam_terms::inference::structure_evidence::{StructureCertificate, StructureLedger};
 use ndarray::{Array1, Array2, Array3, Array4, ArrayView1, ArrayView2, s};
@@ -389,251 +386,6 @@ pub fn identifiable_factor_log_evidence(
     Ok(-0.5 * observations * (residual_sum_squares / observations).ln() - 0.5 * penalty)
 }
 
-/// Outcome of the continuous shared-λ ridge REML weight selection.
-///
-/// The REML criterion (σ² profiled out, no unpenalized fixed effect) for the
-/// multi-response ridge map `A_λ = (G + λI)⁻¹ Tᵀaux` is
-///
-/// ```text
-/// reml(λ) = nq · ln(S(λ)/(nq)) + q Σ_r ln(1 + γ_r/λ),
-/// S(λ)    = ‖aux‖_F² − Σ_r m_r / (γ_r + λ),
-/// ```
-///
-/// with `γ_r` the eigenvalues of `G = TᵀT` and `m_r` the per-eigenvector
-/// signal energies and `q` the number of response columns. `Interior` carries a certified stationary minimiser
-/// (`|d reml/d log λ| ≤ tol` with positive curvature); `FullShrinkage` is the
-/// exact λ → ∞ boundary optimum (`A = 0`), which
-/// the evidence prefers when the auxiliary signal does not support any
-/// alignment (empirical-Bayes null recovery).
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum RidgeRemlWeight {
-    Interior { lambda: f64, score: f64 },
-    FullShrinkage { score: f64 },
-}
-
-impl RidgeRemlWeight {
-    pub fn score(&self) -> f64 {
-        match self {
-            RidgeRemlWeight::Interior { score, .. } => *score,
-            RidgeRemlWeight::FullShrinkage { score } => *score,
-        }
-    }
-}
-
-/// Continuous REML selection of the shared ridge weight λ.
-///
-/// Optimises `reml(λ)` (see [`RidgeRemlWeight`]) over ρ = ln λ with the
-/// analytic first and second derivatives
-///
-/// ```text
-/// S₁ = dS/dρ  = λ Σ m_r/(γ_r+λ)²
-/// S₂ = d²S/dρ² = S₁ − 2λ² Σ m_r/(γ_r+λ)³
-/// L₁ = dL/dρ  = −Σ γ_r/(γ_r+λ),   L₂ = λ Σ γ_r/(γ_r+λ)²
-/// g  = nq·S₁/S + qL₁,             g′ = nq·(S₂S − S₁²)/S² + qL₂
-/// ```
-///
-/// The analytic score/gradient oracle is searched over the complete
-/// representable log-λ domain by adaptive stationary-interval isolation and
-/// safeguarded derivative-root refinement. Every certified interior minimum
-/// competes with the exact λ → ∞ boundary, which wins ties. Directions with
-/// `γ_r = 0` are exact null directions of
-/// `G` (`‖T v_r‖² = 0` forces `m_r = (T v_r)ᵀaux = 0` in exact arithmetic)
-/// and drop from every sum.
-///
-/// Non-convergence or failure to certify stationarity is a typed error, never a
-/// degraded answer.
-pub fn ridge_reml_select_weight(
-    eigvals: &[f64],
-    signal_energy: &[f64],
-    aux_norm_sq: f64,
-    n_obs: usize,
-    n_responses: usize,
-) -> Result<RidgeRemlWeight, String> {
-    if eigvals.len() != signal_energy.len() {
-        return Err(format!(
-            "ridge_reml_select_weight: eigvals len {} != signal_energy len {}",
-            eigvals.len(),
-            signal_energy.len()
-        ));
-    }
-    if !(aux_norm_sq.is_finite() && aux_norm_sq > 0.0) {
-        return Err(format!(
-            "ridge_reml_select_weight: aux_norm_sq must be finite positive, got {aux_norm_sq}"
-        ));
-    }
-    if n_obs == 0 {
-        return Err("ridge_reml_select_weight: n_obs must be > 0".to_string());
-    }
-    if n_responses == 0 {
-        return Err("ridge_reml_select_weight: n_responses must be > 0".to_string());
-    }
-    for (&g, &m) in eigvals.iter().zip(signal_energy) {
-        if !g.is_finite() || !m.is_finite() || m < 0.0 {
-            return Err(format!(
-                "ridge_reml_select_weight: non-finite or invalid (γ={g}, m={m}) pair"
-            ));
-        }
-    }
-    let response_multiplicity = n_responses as f64;
-    let scalar_observations = (n_obs as f64) * response_multiplicity;
-    let gamma_max = eigvals.iter().cloned().fold(0.0_f64, f64::max);
-    let spectral_scale = eigvals
-        .iter()
-        .map(|value| value.abs())
-        .fold(0.0_f64, f64::max);
-    // Exact-arithmetic null directions of G carry zero signal energy. Resolve
-    // numerical rank at the eigensolver's dimension-scaled roundoff and reject
-    // a materially indefinite "Gram" spectrum rather than silently dropping it.
-    let rank_resolution = f64::EPSILON * eigvals.len().max(1) as f64 * spectral_scale;
-    for (&g, &m) in eigvals.iter().zip(signal_energy) {
-        if g < -rank_resolution {
-            return Err(format!(
-                "ridge_reml_select_weight: Gram spectrum is materially negative ({g})"
-            ));
-        }
-        if g <= rank_resolution && m > rank_resolution * aux_norm_sq {
-            return Err(format!(
-                "ridge_reml_select_weight: numerical Gram-null direction carries signal \
-                 energy {m}; sufficient statistics are inconsistent"
-            ));
-        }
-    }
-    let pairs: Vec<(f64, f64)> = eigvals
-        .iter()
-        .zip(signal_energy)
-        .filter(|&(&g, _)| g > rank_resolution)
-        // Work in u = λ/γ_max so every retained spectral abscissa lies in
-        // (0, 1].  This keeps the score and its derivatives finite across the
-        // complete representable log-domain even for ill-scaled Gram matrices.
-        .map(|(&g, &m)| (g / gamma_max, m / gamma_max))
-        .collect();
-    let boundary_score_enclosure = certified_ln_positive(aux_norm_sq)
-        .ok_or_else(|| {
-            "ridge_reml_select_weight: could not enclose the full-shrinkage response log"
-                .to_string()
-        })?
-        .sub(certified_ln_positive(scalar_observations).ok_or_else(|| {
-            "ridge_reml_select_weight: could not enclose the observation-count log".to_string()
-        })?)
-        .scale(scalar_observations);
-    let boundary_score = boundary_score_enclosure.lo
-        + 0.5 * (boundary_score_enclosure.hi - boundary_score_enclosure.lo);
-    if pairs.is_empty() {
-        // G = 0: the ridge map is identically zero for every λ.
-        return Ok(RidgeRemlWeight::FullShrinkage {
-            score: boundary_score,
-        });
-    }
-
-    // `AffineRemlProfile` already owns the certified scalar REML search:
-    // analytic value/gradient/curvature jets plus outward-rounded derivative
-    // enclosures on every interval.  Duplicate each spectral direction once
-    // per response while retaining one pooled residual.  This makes its score
-    // exactly
-    //
-    //   -1/2 { nq log(S/(nq)) + q sum_r log(1 + gamma_r/lambda) },
-    //
-    // i.e. minus one half of the criterion documented above.  It is not an
-    // approximation and introduces no lattice of candidate weights.
-    let repeated_modes = pairs.len().saturating_mul(n_responses);
-    let mut gram_modes = Vec::with_capacity(repeated_modes);
-    let penalty_modes = vec![1.0_f64; repeated_modes];
-    let mut projected_rhs_squared = Vec::with_capacity(repeated_modes);
-    for _ in 0..n_responses {
-        for &(g, m) in &pairs {
-            gram_modes.push(g);
-            projected_rhs_squared.push(m / response_multiplicity);
-        }
-    }
-    let response_energy = [aux_norm_sq];
-    let profile = AffineRemlProfile::new(
-        &gram_modes,
-        &penalty_modes,
-        &projected_rhs_squared,
-        &response_energy,
-        scalar_observations,
-        repeated_modes,
-        0.0,
-    )
-    .map_err(|error| format!("ridge_reml_select_weight: {error}"))?;
-
-    // Search the complete finite log(λ/γ_max) domain. The exact λ=∞
-    // empirical-Bayes null is compared separately below, so it is never
-    // represented by an arbitrary large finite weight.
-    let rho_lo = certified_ln_positive(f64::MIN_POSITIVE)
-        .ok_or_else(|| {
-            "ridge_reml_select_weight: could not enclose the finite-domain lower bound".to_string()
-        })?
-        .lo;
-    let rho_hi = certified_ln_positive(f64::MAX / 2.0)
-        .ok_or_else(|| {
-            "ridge_reml_select_weight: could not enclose the finite-domain upper bound".to_string()
-        })?
-        .hi;
-    let rho_tolerance = f64::EPSILON.sqrt();
-    let search = profile
-        .maximize_value_ordered(rho_lo, rho_hi, rho_tolerance)
-        .map_err(|error| format!("ridge_reml_select_weight: {error}"))?;
-    let optimum = search.optimum;
-    let score = -2.0 * optimum.value;
-    let finite_criterion = search.value_certificate.maximum.scale(-2.0);
-    // Empirical-Bayes null recovery is the conservative decision: a finite
-    // weight is admitted only when its exact-real criterion interval lies
-    // strictly below the exact full-shrinkage interval. Overlap is numerical
-    // non-identifiability, so the exact null wins without an epsilon heuristic.
-    if finite_criterion.hi >= boundary_score_enclosure.lo {
-        return Ok(RidgeRemlWeight::FullShrinkage {
-            score: boundary_score,
-        });
-    }
-    if search.value_certificate.maximum_excess > search.value_certificate.comparison_resolution {
-        return Err(format!(
-            "ridge_reml_select_weight: finite REML candidates are not globally ordered \
-             (maximum excess {}, comparison resolution {})",
-            search.value_certificate.maximum_excess, search.value_certificate.comparison_resolution
-        ));
-    }
-    if search.location == ScoreOptimumLocation::LowerBoundary {
-        return Err(
-            "ridge_reml_select_weight: REML is unbounded at the λ → 0 interpolation \
-             boundary; no converged Gaussian evidence fit exists"
-                .to_string(),
-        );
-    }
-    let ScoreOptimumLocation::Stationary(index) = search.location else {
-        return Err(format!(
-            "ridge_reml_select_weight: finite REML optimum is value-resolved but not an \
-             isolated stationary point ({:?})",
-            search.location
-        ));
-    };
-    let stationary = search.stationary_points.get(index).ok_or_else(|| {
-        "ridge_reml_select_weight: optimizer returned an invalid stationary index".to_string()
-    })?;
-    let kkt = profile
-        .enclose(stationary.bracket.lo, stationary.bracket.hi)
-        .map_err(|error| format!("ridge_reml_select_weight: {error}"))?;
-    if !(kkt.derivative.contains_zero() && kkt.curvature.hi < 0.0) {
-        return Err(format!(
-            "ridge_reml_select_weight: exact-real interior maximum KKT certificate failed \
-             on {:?}: {kkt:?}",
-            stationary.bracket
-        ));
-    }
-    let relative_lambda = certified_exp_representative(optimum.x).ok_or_else(|| {
-        "ridge_reml_select_weight: could not construct the certified finite REML representative"
-            .to_string()
-    })?;
-    let lambda = gamma_max * relative_lambda;
-    if !(lambda.is_finite() && lambda > 0.0) {
-        return Err(format!(
-            "ridge_reml_select_weight: selected finite REML weight is not representable \
-             after restoring the Gram scale ({gamma_max} * {relative_lambda})"
-        ));
-    }
-    Ok(RidgeRemlWeight::Interior { lambda, score })
-}
-
 /// Column-centred thin-SVD scores: returns the leading `k` columns of
 /// `U Σ` for the centred predictor matrix `X − mean(X, axis=0)`.
 ///
@@ -690,14 +442,18 @@ pub enum PartialSupervisionSupMethod {
     Procrustes,
     /// Affine least-squares pinned to `anchor_idx`.
     Anchor,
-    /// Ridge map `A_λ = (TᵀT + λI)⁻¹ Tᵀaux` with REML-selected λ.
+    /// Function-mass shrinkage map `A_λ = T⁺aux/(1 + λ)`, the posterior mean
+    /// under the penalty `λ‖T A‖_F²` on the fitted block, with λ selected by
+    /// REML in closed form (`∞`, the null map, when the evidence supports no
+    /// alignment).
     SoftL2,
 }
 
 /// Free-block decorrelation rule.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PartialSupervisionFreeConstraint {
-    /// QR-based projection onto the orthogonal complement of `col(T_sup)`.
+    /// Projection onto the orthogonal complement of the aligned supervised
+    /// block's column space.
     OrthogonalToSup,
     /// No projection.
     None,
@@ -726,9 +482,10 @@ pub struct PartialSupervisionResult {
 /// Library-level partial-supervision gauge-fix solver.
 ///
 /// Solves the supervised-block alignment problem and applies the chosen
-/// free-block decorrelation rule. Pure numerical linear algebra: SVD,
-/// symmetric eigendecomposition (`Side::Lower`), and thin QR are routed
-/// through the faer bridge in `gam_linalg::faer_ndarray`.
+/// free-block decorrelation rule. Pure numerical linear algebra: the
+/// Procrustes rotation, the anchor pseudo-inverse, the soft-L2 shrinkage map
+/// and the orthogonal-complement projection each take one SVD through the faer
+/// bridge in `gam_linalg::faer_ndarray`.
 ///
 /// This is the single Rust source-of-math for the gauge-fix step; it is
 /// language-agnostic so the CLI, R, and Julia bindings can reuse it
@@ -855,65 +612,92 @@ pub fn partial_supervision_solve(
             map_b = Some(b_vec);
         }
         PartialSupervisionSupMethod::SoftL2 => {
-            // Symmetric eigendecomposition of G = T_supᵀ T_sup.
-            let g = t_sup.t().dot(&t_sup);
-            let (eigvals, eigvecs) = g
-                .eigh(Side::Lower)
-                .map_err(|e| format!("partial_supervision_solve: eigh on Gram failed: {e}"))?;
-            let rhs = t_sup.t().dot(&aux);
-            let ut_aux = eigvecs.t().dot(&rhs);
-            // Per-eigenvector signal energy m_r = ‖row_r(Vᵀ Tᵀaux)‖²; the
-            // multi-response RSS at weight λ is then
-            //   S(λ) = ‖aux‖_F² − Σ_r m_r/(γ_r+λ)
-            // with γ_r the eigenvalues of G = TᵀT (`eigvals`).
-            let m_row: Array1<f64> = Array1::from_vec(
-                (0..d_sup)
-                    .map(|r| (0..d_sup).map(|c| ut_aux[[r, c]] * ut_aux[[r, c]]).sum())
-                    .collect(),
-            );
-            // Select λ by REML, never GCV. The ridge map is the linear mixed
-            // model aux_j = T β_j + ε with β_j ~ N(0, σ²/λ I), ε ~ N(0, σ² I)
-            // applied to each of the d columns sharing λ. The map carries no
-            // unpenalized fixed effect, so REML coincides with the marginal
-            // likelihood, whose profile (σ² concentrated out) criterion to
-            // MINIMIZE is
-            //   reml(λ) = nd·log(S(λ)/(nd)) + d·Σ_r log(1 + γ_r/λ),
-            // the exact analogue of the smoothing-parameter REML used
-            // everywhere else in gam.
-            let selection = ridge_reml_select_weight(
-                eigvals.as_slice().ok_or_else(|| {
-                    "partial_supervision_solve: eigenspectrum is not contiguous".to_string()
-                })?,
-                m_row.as_slice().ok_or_else(|| {
-                    "partial_supervision_solve: signal energies are not contiguous".to_string()
-                })?,
-                aux_norm_sq,
-                n,
-                d_sup,
-            )?;
-            match selection {
-                RidgeRemlWeight::Interior { lambda, .. } => {
-                    // Build A_λ = (G + λI)⁻¹ Tᵀaux at the certified stationary
-                    // REML weight.
-                    let denom: Array1<f64> = eigvals.mapv(|v| v + lambda);
-                    let mut a_eig = Array2::<f64>::zeros((d_sup, d_sup));
-                    for r in 0..d_sup {
+            // The penalty is on the fitted function, never on the map
+            // coefficients. Every response column aux_c = T a_c + ε, ε ~ N(0, σ²I),
+            // shares one weight λ on the function mass λ‖T a_c‖²/σ², so the prior
+            // on the fitted values is T a_c ~ N(0, (σ²/λ) P) with P the projector
+            // onto col(T). The criterion, λ and the fit are unchanged by any
+            // reparameterization T → T M; the map moves to M⁻¹ A.
+            //
+            // With B = ‖P aux‖_F², RSS = ‖aux − P aux‖_F², r = rank T and
+            // q = d_sup, the posterior mean is A_λ = T⁺aux/(1 + λ). The map has no
+            // unpenalized fixed effect, so REML is the marginal likelihood; with
+            // σ² profiled out and w = λ/(1 + λ) ∈ (0, 1] the criterion to MINIMIZE
+            // is
+            //   nq·log(RSS + w·B) − q·r·log(w).
+            // Its w-derivative has the sign of (n − r)·B·w − r·RSS, which is
+            // increasing in w, so the unique minimizer is w = r·RSS/((n − r)·B):
+            //   λ = r·RSS/((n − r)·B − r·RSS),   A_λ = (1 − w)·T⁺aux.
+            // When (n − r)·B ≤ r·RSS the minimizer is the boundary w = 1, the
+            // exact null map. No search, no grid and no tolerance is involved.
+            let (u_opt, sigma, vt_opt) = t_sup
+                .svd(true, true)
+                .map_err(|e| format!("partial_supervision_solve: soft-L2 SVD failed: {e}"))?;
+            let u = u_opt
+                .ok_or_else(|| "partial_supervision_solve: soft-L2 SVD lacked U".to_string())?;
+            let vt = vt_opt
+                .ok_or_else(|| "partial_supervision_solve: soft-L2 SVD lacked Vᵀ".to_string())?;
+            // Rank at the anchor map's numpy.linalg.lstsq rcond policy.
+            let leading = sigma.iter().cloned().fold(0.0_f64, f64::max);
+            let cutoff = leading * f64::EPSILON * (n.max(d_sup) as f64);
+            let range: Vec<usize> = (0..sigma.len()).filter(|&k| sigma[k] > cutoff).collect();
+            let rank = range.len();
+            if rank >= n {
+                return Err(format!(
+                    "partial_supervision_solve: soft-L2 needs rank(T_sup) < n so the \
+                     evidence has residual degrees of freedom (rank {rank}, n {n})"
+                ));
+            }
+            // coords[i, c] = u_kᵀ aux_c on the retained left singular vectors.
+            let mut coords = Array2::<f64>::zeros((rank, d_sup));
+            let mut residual = aux.to_owned();
+            for (i, &k) in range.iter().enumerate() {
+                for c in 0..d_sup {
+                    let mut coord = 0.0_f64;
+                    for row in 0..n {
+                        coord += u[[row, k]] * aux[[row, c]];
+                    }
+                    coords[[i, c]] = coord;
+                    for row in 0..n {
+                        residual[[row, c]] -= u[[row, k]] * coord;
+                    }
+                }
+            }
+            let explained: f64 = coords.iter().map(|x| x * x).sum();
+            // RSS from the residual itself, not ‖aux‖² − B, so a near-exact fit
+            // keeps its digits.
+            let rss: f64 = residual.iter().map(|x| x * x).sum();
+            if !(explained.is_finite() && rss.is_finite()) {
+                return Err(format!(
+                    "partial_supervision_solve: soft-L2 sufficient statistics are not finite \
+                     (explained {explained}, residual {rss})"
+                ));
+            }
+            let residual_dof = (n - rank) as f64;
+            let rank_f = rank as f64;
+            let excess = residual_dof * explained - rank_f * rss;
+            if excess <= 0.0 {
+                // Exact empirical-Bayes null boundary: λ = ∞ and A = 0.
+                // IEEE infinity is the faithful scalar representation of that
+                // boundary in the public result; no finite proxy is substituted.
+                map_a = Some(Array2::<f64>::zeros((d_sup, d_sup)));
+                selected_weight = Some(f64::INFINITY);
+            } else {
+                // 1 − w = excess/((n − r)·B); A = (1 − w)·V Σ⁻¹ coords.
+                let shrinkage = excess / (residual_dof * explained);
+                let mut map = Array2::<f64>::zeros((d_sup, d_sup));
+                for (i, &k) in range.iter().enumerate() {
+                    let scale = shrinkage / sigma[k];
+                    for j in 0..d_sup {
+                        let direction = vt[[k, j]] * scale;
                         for c in 0..d_sup {
-                            a_eig[[r, c]] = ut_aux[[r, c]] / denom[r];
+                            map[[j, c]] += direction * coords[[i, c]];
                         }
                     }
-                    let best_a = eigvecs.dot(&a_eig);
-                    t_sup_aligned = t_sup.dot(&best_a);
-                    map_a = Some(best_a);
-                    selected_weight = Some(lambda);
                 }
-                RidgeRemlWeight::FullShrinkage { .. } => {
-                    // Exact empirical-Bayes null boundary: λ = ∞ and A = 0.
-                    // IEEE infinity is the faithful scalar representation of that
-                    // boundary in the public result; no finite proxy is substituted.
-                    map_a = Some(Array2::<f64>::zeros((d_sup, d_sup)));
-                    selected_weight = Some(f64::INFINITY);
-                }
+                t_sup_aligned = t_sup.dot(&map);
+                map_a = Some(map);
+                selected_weight = Some(rank_f * rss / excess);
             }
         }
     }
@@ -4517,52 +4301,93 @@ mod tests {
     }
 
     #[test]
-    fn ridge_reml_weight_matches_one_direction_stationary_solution() {
-        // For one eigendirection the stationarity equation has the closed form
-        // λ̂ = γ(γA-m)/(nm-γA).  Here γ=2, A=10, m=8, n=5,
-        // hence λ̂=1.2.  The response multiplicity cancels analytically.
-        let selected = ridge_reml_select_weight(&[2.0], &[8.0], 10.0, 5, 3).unwrap();
-        match selected {
-            RidgeRemlWeight::Interior { lambda, score } => {
-                // The tolerance is the SEARCH'S OWN LOCATION CONTRACT, not a
-                // number that happened to hold. `maximize_value_ordered`
-                // certifies a stationary point's location to the requested
-                // resolution in `rho = log(lambda/gamma_max)` and returns an
-                // evaluated SAMPLE from that bracket — not the bracket's
-                // midpoint, and not a polished root — so the reachable accuracy
-                // is `|lambda - lambda_hat| <= lambda_hat * expm1(sqrt(eps))`,
-                // here 1.79e-8.
-                //
-                // The `1.0e-9` this used to ask for is 18x inside that, and was
-                // never a property of the code: measured, this search returns
-                // `lambda = 1.2000000050078` from a stationary bracket 1.13e-8
-                // wide, an offset of 4.17e-9 in rho against a requested
-                // 1.49e-8. It is not an enclosure-quality question either —
-                // `gam_math::score_opt`'s
-                // `the_located_optimum_is_enclosure_independent_and_accurate_to_the_contract`
-                // runs this exact profile under both the natural and the centred
-                // interval extension and gets the same abscissa to the last bit.
-                // A caller needing more has to polish the root against the
-                // analytic stationarity condition, which this one does not.
-                let tolerance = 1.2 * f64::EPSILON.sqrt().exp_m1();
-                assert!(
-                    (lambda - 1.2).abs() <= tolerance,
-                    "lambda={lambda}, off by {} against the search's location contract \
-                     {tolerance:e}",
-                    (lambda - 1.2).abs()
-                );
-                assert!(score.is_finite());
-            }
-            RidgeRemlWeight::FullShrinkage { .. } => {
-                panic!("the planted signal has an interior REML optimum")
-            }
+    fn partial_supervision_softl2_shrinks_by_the_closed_form_evidence_optimum() {
+        // T = 1₄ and aux = (2, 1, 1, 0): B = ‖P aux‖² = 4, RSS = 2, r = 1, n = 4.
+        // F = (B/r)/(RSS/(n − r)) = 6, so λ = r·RSS/((n − r)·B − r·RSS) = 1/5
+        // and the posterior mean shrinks the least-squares slope 1 by
+        // 1/(1 + λ) = 5/6.
+        let t_sup = array![[1.0_f64], [1.0], [1.0], [1.0]];
+        let aux = array![[2.0_f64], [1.0], [1.0], [0.0]];
+        let t_free = Array2::<f64>::zeros((4, 0));
+        let result = partial_supervision_solve(
+            t_sup.view(),
+            aux.view(),
+            t_free.view(),
+            PartialSupervisionSupMethod::SoftL2,
+            &[],
+            PartialSupervisionFreeConstraint::None,
+        )
+        .expect("soft-L2 solve with residual degrees of freedom should succeed");
+        // Every statistic is a sum of four O(1) terms from one SVD of a 4 × 1
+        // column, so the closed form holds to a few dozen ulps.
+        let tolerance = 64.0 * f64::EPSILON;
+        let lambda = result.selected_weight.unwrap();
+        assert!((lambda - 0.2).abs() <= tolerance, "lambda={lambda}");
+        let map = result.map_a.unwrap();
+        assert!((map[[0, 0]] - 5.0 / 6.0).abs() <= tolerance, "map={map:?}");
+        for &value in result.t_supervised.iter() {
+            assert!(
+                (value - 5.0 / 6.0).abs() <= tolerance,
+                "t_supervised={value}"
+            );
         }
     }
 
     #[test]
-    fn ridge_reml_weight_recovers_exact_full_shrinkage_boundary() {
-        let selected = ridge_reml_select_weight(&[2.0], &[1.0], 10.0, 5, 2).unwrap();
-        assert!(matches!(selected, RidgeRemlWeight::FullShrinkage { .. }));
+    fn partial_supervision_softl2_penalizes_the_function_not_the_map_coefficients() {
+        // A coefficient ridge ‖A‖² changes when the supervised columns are
+        // mixed, T → T·M. The function-mass penalty does not: λ and the fitted
+        // block are unchanged, and the map moves to M⁻¹·A.
+        let t_sup = array![
+            [1.0_f64, 0.2],
+            [0.3, 1.1],
+            [0.9, 1.0],
+            [-1.2, 0.8],
+            [0.4, -0.6],
+            [0.1, 0.5],
+        ];
+        let aux = array![
+            [1.1_f64, -0.1],
+            [0.2, 0.9],
+            [1.3, 0.8],
+            [-0.7, 1.2],
+            [0.6, -0.2],
+            [-0.3, 0.4],
+        ];
+        let mixing = array![[2.0_f64, 1.0], [0.0, 3.0]];
+        let mixing_inverse = array![[0.5_f64, -1.0 / 6.0], [0.0, 1.0 / 3.0]];
+        let t_mixed = t_sup.dot(&mixing);
+        let t_free = Array2::<f64>::zeros((6, 0));
+        let solve = |t: &Array2<f64>| {
+            partial_supervision_solve(
+                t.view(),
+                aux.view(),
+                t_free.view(),
+                PartialSupervisionSupMethod::SoftL2,
+                &[],
+                PartialSupervisionFreeConstraint::None,
+            )
+            .expect("soft-L2 solve should succeed")
+        };
+        let original = solve(&t_sup);
+        let mixed = solve(&t_mixed);
+        let close =
+            |a: f64, b: f64| (a - b).abs() <= f64::EPSILON.sqrt() * a.abs().max(b.abs()).max(1.0);
+        let lambda = original.selected_weight.unwrap();
+        let lambda_mixed = mixed.selected_weight.unwrap();
+        assert!(lambda.is_finite() && lambda > 0.0, "lambda={lambda}");
+        assert!(
+            close(lambda, lambda_mixed),
+            "λ moved under T → T·M: {lambda} vs {lambda_mixed}"
+        );
+        for (&a, &b) in original.t_supervised.iter().zip(mixed.t_supervised.iter()) {
+            assert!(close(a, b), "fitted block moved under T → T·M: {a} vs {b}");
+        }
+        let transported = mixing_inverse.dot(&original.map_a.unwrap());
+        let mixed_map = mixed.map_a.unwrap();
+        for (&a, &b) in transported.iter().zip(mixed_map.iter()) {
+            assert!(close(a, b), "map(T·M) is not M⁻¹·map(T): {a} vs {b}");
+        }
     }
 
     #[test]

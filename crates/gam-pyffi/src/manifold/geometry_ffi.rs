@@ -5652,10 +5652,9 @@ fn identifiable_factor_log_evidence(
 /// Single-call FFI for the supervised + free latent-block gauge fix used by
 /// `gamfit.examples.partial_supervision` (and reusable from the CLI / R /
 /// Julia bindings). All linear-algebra work — orthogonal Procrustes via
-/// SVD, anchor least-squares via SVD pseudo-inverse, soft-L2 ridge map via
-/// symmetric eigendecomposition with certified continuous REML, and the orthogonal-
-/// complement projection via thin QR — runs in Rust through the faer
-/// bridge.
+/// SVD, anchor least-squares via SVD pseudo-inverse, the soft-L2 function-mass
+/// shrinkage map via SVD with its closed-form REML weight, and the orthogonal-
+/// complement projection via SVD — runs in Rust through the faer bridge.
 ///
 /// Parameters
 /// ----------
@@ -8306,8 +8305,8 @@ fn resolve_nuts_config(model: &FittedModel, options: PySampleOptions) -> NutsCon
         n_samples: options.samples.unwrap_or(adaptive.n_samples),
         nwarmup: options.warmup.unwrap_or(adaptive.nwarmup),
         n_chains: options.chains.unwrap_or(adaptive.n_chains),
-        target_accept: options.target_accept.unwrap_or(adaptive.target_accept),
         seed: options.seed.unwrap_or(adaptive.seed),
+        ..adaptive
     }
 }
 

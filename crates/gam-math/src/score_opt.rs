@@ -5731,10 +5731,10 @@ mod tests {
     /// Two claims, and the second is the one that catches misuse.
     ///
     /// Tightening an enclosure changes which cells the search visits, so it
-    /// could in principle move the point it returns. On the profile
-    /// `gam_sae::identifiability::ridge_reml_select_weight` builds for its
-    /// one-eigendirection closed-form fixture it does not: both oracles return
-    /// the same abscissa to the last bit, from the same stationary bracket. That
+    /// could in principle move the point it returns. On a one-eigendirection
+    /// ridge REML profile with a closed-form optimum it does not: both oracles
+    /// return the same abscissa to the last bit, from the same stationary
+    /// bracket. That
     /// is worth pinning, because a caller comparing the returned `lambda` to a
     /// closed form cannot tell "the enclosure moved the answer" from "the
     /// enclosure was always allowed to".
@@ -5815,9 +5815,9 @@ mod tests {
     /// Two shapes, because they pull in opposite directions: the cascade profile
     /// on its own 40.6-wide domain, where the natural extension cannot finish at
     /// all, and a well-conditioned profile on the FULL representable log-lambda
-    /// domain (`ln(MIN_POSITIVE)` to `ln(MAX/2)`, 1417 wide) — which is what
-    /// `gam_sae::identifiability::ridge_reml_select_weight` searches, and the
-    /// case where a search that already succeeded cheaply could only get slower.
+    /// domain (`ln(MIN_POSITIVE)` to `ln(MAX/2)`, 1417 wide) — which a search
+    /// with no prior scale for lambda has to cover, and the case where a search
+    /// that already succeeded cheaply could only get slower.
     #[test]
     fn zz_measure_centred_enclosure_search_cost() {
         let (grams, penalties, projected, energies) = cascade_profile_parts();
@@ -5843,8 +5843,8 @@ mod tests {
             // case centring could only make SLOWER, since there are no cells
             // left for it to remove.
             ("cascade/narrow-around-the-optimum", -3.0, 0.0),
-            // The full representable log-lambda domain, 1417 wide, which is what
-            // `gam_sae::identifiability::ridge_reml_select_weight` searches.
+            // The full representable log-lambda domain, 1417 wide, which a
+            // search with no prior scale for lambda has to cover.
             ("cascade/full-representable-domain", full_lo, full_hi),
         ];
 

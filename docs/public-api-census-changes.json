@@ -1277,5 +1277,14 @@
     },
     "reason": "SPEC rule 1 (#2901 V2): Order2Graph is reverse-mode AD with zero consumers, and its public methods go with it.",
     "evidence": "The explicit pub fn declarations in crates/gam-math/src/order2_graph.rs are Order2GraphWorkspace::new and ::reset, Order2Graph::lower_into, and into_order2 in the file's cfg(test) test_support module. That is public_api_census.py's public_functions predicate over the deleted file. At the base, git grep -w finds no use of Order2Graph or Order2GraphWorkspace outside the file and its pub mod line."
+  },
+  {
+    "base": "d8f6ef9be98996b5c98bd08667aa4fe121561e8f",
+    "removed": {
+      "crates/gam-sae/src/identifiability.rs::ridge_reml_select_weight": 1,
+      "crates/gam-sae/src/identifiability.rs::score": 1
+    },
+    "reason": "SPEC rule 5 (#2901 V15). The soft-L2 partial-supervision map now penalizes the function mass and takes its REML weight in closed form, so the coefficient-ridge weight searcher ridge_reml_select_weight and RidgeRemlWeight::score lose their only caller and are deleted.",
+    "evidence": "public_api_census.py's public_functions predicate over the removed hunks of crates/gam-sae/src/identifiability.rs yields ridge_reml_select_weight and RidgeRemlWeight::score. At the base, each is the file's only pub fn of that name. No other file loses a pub fn: crates/gam-math/src/score_opt.rs, crates/gam-pyffi/src/manifold/geometry_ffi.rs and gamfit/examples/partial_supervision.py change only in comments."
   }
 ]
