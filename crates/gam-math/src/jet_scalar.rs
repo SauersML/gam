@@ -410,6 +410,29 @@ pub trait JetScalar<const K: usize>: crate::nested_dual::JetField + Copy {
         )
     }
 
+    /// `addend + Σ_i lefts[i] · f_i(right)` from certified derivative stacks,
+    /// with ONE shared composition point — the const-dimension form of
+    /// [`RuntimeJetScalar::weighted_compose_sum`]. The default is exactly the
+    /// composition and multiply-add loop it names; a scalar that overrides it
+    /// writes its output channels once.
+    fn weighted_compose_sum(
+        lefts: &[Self],
+        right: &Self,
+        derivative_stacks: &[[f64; 5]],
+        addend: &Self,
+    ) -> Self {
+        assert_eq!(
+            lefts.len(),
+            derivative_stacks.len(),
+            "weighted compose sum needs one derivative stack per left factor"
+        );
+        let mut sum = *addend;
+        for (left, stack) in lefts.iter().zip(derivative_stacks) {
+            sum = left.multiply_add(&right.compose_unary(*stack), &sum);
+        }
+        sum
+    }
+
     /// Sum unary compositions directly from certified derivative stacks.
     fn composed_sum(inputs: &[Self], derivative_stacks: &[[f64; 5]]) -> Self {
         composed_sum_default(
@@ -1157,6 +1180,22 @@ impl<'arena, S: JetScalar<K>, const K: usize> RuntimeJetScalar<'arena> for Fixed
     fn multiply_add(&self, right: &Self, addend: &Self) -> Self {
         Self {
             inner: self.inner.multiply_add(&right.inner, &addend.inner),
+        }
+    }
+
+    #[inline(always)]
+    fn weighted_compose_sum(
+        lefts: &[Self],
+        right: &Self,
+        derivative_stacks: &[[f64; 5]],
+        addend: &Self,
+    ) -> Self {
+        // SAFETY: `FixedRuntimeJet<S, K>` is `repr(transparent)` over its sole
+        // non-zero-sized `S` field, so the shared slice has identical element
+        // layout, alignment, provenance, length, and lifetime after the cast.
+        let inner = unsafe { std::slice::from_raw_parts(lefts.as_ptr().cast::<S>(), lefts.len()) };
+        Self {
+            inner: S::weighted_compose_sum(inner, &right.inner, derivative_stacks, &addend.inner),
         }
     }
 
@@ -3823,6 +3862,23 @@ impl<const K: usize> JetScalar<K> for Order2<K> {
     }
 
     #[inline(always)]
+    fn weighted_compose_sum(
+        lefts: &[Self],
+        right: &Self,
+        derivative_stacks: &[[f64; 5]],
+        addend: &Self,
+    ) -> Self {
+        Order2(tower2_weighted_compose_sum(
+            lefts.len(),
+            |term| &lefts[term].0,
+            &right.0,
+            derivative_stacks,
+            0,
+            &addend.0,
+        ))
+    }
+
+    #[inline(always)]
     fn affine_compose(
         &self,
         input_scale: f64,
@@ -4764,6 +4820,264 @@ impl<const K: usize> JetScalar<K> for OneSeed<K> {
         OneSeed {
             base: Order2::variable(x, axis),
             eps: Order2::constant(0.0),
+        }
+    }
+
+    // Fused lowerings (#932). Each override writes the ε⁰ and ε¹ blocks once.
+    // The trait defaults stream the same algebra through chains of complete
+    // `2·(1 + K + K²)`-channel temporaries, which is what the fixed-width BMS
+    // FLEX third jet paid per calibration node while its runtime opponent ran
+    // fused kernels.
+
+    #[inline(always)]
+    fn linear_combination(inputs: &[Self], weights: &[f64]) -> Self {
+        assert_eq!(inputs.len(), weights.len());
+        let mut base = crate::jet_tower::Tower2::<K>::zero();
+        let mut eps = crate::jet_tower::Tower2::<K>::zero();
+        for (input, &weight) in inputs.iter().zip(weights) {
+            base.v += input.base.0.v * weight;
+            eps.v += input.eps.0.v * weight;
+            for i in 0..K {
+                base.g[i] += input.base.0.g[i] * weight;
+                eps.g[i] += input.eps.0.g[i] * weight;
+                for j in i..K {
+                    base.h[i][j] += input.base.0.h[i][j] * weight;
+                    eps.h[i][j] += input.eps.0.h[i][j] * weight;
+                }
+            }
+        }
+        mirror_upper_hessian(&mut base);
+        mirror_upper_hessian(&mut eps);
+        OneSeed {
+            base: Order2(base),
+            eps: Order2(eps),
+        }
+    }
+
+    #[inline(always)]
+    fn multiply_add(&self, right: &Self, addend: &Self) -> Self {
+        // (l + ε l′)(r + ε r′) + (a + ε a′) with ε² = 0: the ε part is
+        // l·r′ + l′·r + a′.
+        let lb = &self.base.0;
+        let le = &self.eps.0;
+        let rb = &right.base.0;
+        let re = &right.eps.0;
+        let ae = &addend.eps.0;
+        let mut eps = crate::jet_tower::Tower2::<K>::zero();
+        eps.v = lb.v * re.v + le.v * rb.v + ae.v;
+        for i in 0..K {
+            eps.g[i] =
+                lb.v * re.g[i] + lb.g[i] * re.v + le.v * rb.g[i] + le.g[i] * rb.v + ae.g[i];
+            for j in i..K {
+                let channel = lb.v * re.h[i][j]
+                    + lb.g[i] * re.g[j]
+                    + lb.g[j] * re.g[i]
+                    + lb.h[i][j] * re.v
+                    + le.v * rb.h[i][j]
+                    + le.g[i] * rb.g[j]
+                    + le.g[j] * rb.g[i]
+                    + le.h[i][j] * rb.v
+                    + ae.h[i][j];
+                eps.h[i][j] = channel;
+                eps.h[j][i] = channel;
+            }
+        }
+        OneSeed {
+            base: self.base.multiply_add(&right.base, &addend.base),
+            eps: Order2(eps),
+        }
+    }
+
+    #[inline(always)]
+    fn affine_compose(
+        &self,
+        input_scale: f64,
+        input_shift: f64,
+        derivative_stack: [f64; 5],
+    ) -> Self {
+        assert!(input_shift.is_finite(), "affine input shift must be finite");
+        let mut base = crate::jet_tower::Tower2::<K>::zero();
+        let mut eps = crate::jet_tower::Tower2::<K>::zero();
+        one_seed_add_scaled_composition(&mut base, &mut eps, self, &derivative_stack, input_scale);
+        mirror_upper_hessian(&mut base);
+        mirror_upper_hessian(&mut eps);
+        OneSeed {
+            base: Order2(base),
+            eps: Order2(eps),
+        }
+    }
+
+    #[inline(always)]
+    fn affine_composed_sum(
+        inputs: &[Self],
+        input_scales: &[f64],
+        derivative_stacks: &[[f64; 5]],
+    ) -> Self {
+        assert_eq!(inputs.len(), input_scales.len());
+        assert_eq!(inputs.len(), derivative_stacks.len());
+        let mut base = crate::jet_tower::Tower2::<K>::zero();
+        let mut eps = crate::jet_tower::Tower2::<K>::zero();
+        for ((input, &input_scale), stack) in inputs.iter().zip(input_scales).zip(derivative_stacks)
+        {
+            one_seed_add_scaled_composition(&mut base, &mut eps, input, stack, input_scale);
+        }
+        mirror_upper_hessian(&mut base);
+        mirror_upper_hessian(&mut eps);
+        OneSeed {
+            base: Order2(base),
+            eps: Order2(eps),
+        }
+    }
+
+    #[inline(always)]
+    fn composed_sum(inputs: &[Self], derivative_stacks: &[[f64; 5]]) -> Self {
+        assert_eq!(inputs.len(), derivative_stacks.len());
+        let mut base = crate::jet_tower::Tower2::<K>::zero();
+        let mut eps = crate::jet_tower::Tower2::<K>::zero();
+        for (input, stack) in inputs.iter().zip(derivative_stacks) {
+            one_seed_add_scaled_composition(&mut base, &mut eps, input, stack, 1.0);
+        }
+        mirror_upper_hessian(&mut base);
+        mirror_upper_hessian(&mut eps);
+        OneSeed {
+            base: Order2(base),
+            eps: Order2(eps),
+        }
+    }
+
+    #[inline(always)]
+    fn weighted_compose_sum(
+        lefts: &[Self],
+        right: &Self,
+        derivative_stacks: &[[f64; 5]],
+        addend: &Self,
+    ) -> Self {
+        // `f_i(R + ε R′) = f_i(R) + ε f_i′(R)·R′`, so the ε part of
+        // `addend + Σ_i L_i·f_i(R)` is
+        // `(Σ_i L_i·f_i′(R))·R′ + Σ_i L_i′·f_i(R) + addend′`: three order-two
+        // weighted sums at the one composition point and one product.
+        let terms = lefts.len();
+        let base = tower2_weighted_compose_sum(
+            terms,
+            |term| &lefts[term].base.0,
+            &right.base.0,
+            derivative_stacks,
+            0,
+            &addend.base.0,
+        );
+        let carried = tower2_weighted_compose_sum(
+            terms,
+            |term| &lefts[term].eps.0,
+            &right.base.0,
+            derivative_stacks,
+            0,
+            &addend.eps.0,
+        );
+        let derivative = tower2_weighted_compose_sum(
+            terms,
+            |term| &lefts[term].base.0,
+            &right.base.0,
+            derivative_stacks,
+            1,
+            &crate::jet_tower::Tower2::<K>::zero(),
+        );
+        OneSeed {
+            base: Order2(base),
+            eps: Order2(derivative).multiply_add(&right.eps, &Order2(carried)),
+        }
+    }
+}
+
+/// `addend + Σ_i left(i)·f_i(right)` over order-two channels, reading each
+/// `f_i`'s derivative stack from entry `order` (`0` for `f_i`, `1` for `f_i′`).
+/// The `right`-dependent coefficients collapse to two scalars and one
+/// gradient-shaped accumulator, so the output block is written once.
+#[inline(always)]
+fn tower2_weighted_compose_sum<'a, const K: usize>(
+    terms: usize,
+    left: impl Fn(usize) -> &'a crate::jet_tower::Tower2<K>,
+    right: &crate::jet_tower::Tower2<K>,
+    derivative_stacks: &[[f64; 5]],
+    order: usize,
+    addend: &crate::jet_tower::Tower2<K>,
+) -> crate::jet_tower::Tower2<K> {
+    assert_eq!(
+        terms,
+        derivative_stacks.len(),
+        "weighted compose sum needs one derivative stack per left factor"
+    );
+    let mut out = *addend;
+    let mut right_first = 0.0;
+    let mut right_second = 0.0;
+    let mut left_first = [0.0; K];
+    for term in 0..terms {
+        let factor = left(term);
+        let stack = &derivative_stacks[term];
+        let (value, first, second) = (stack[order], stack[order + 1], stack[order + 2]);
+        out.v += factor.v * value;
+        right_first += factor.v * first;
+        right_second += factor.v * second;
+        for i in 0..K {
+            out.g[i] += value * factor.g[i];
+            left_first[i] += first * factor.g[i];
+            for j in i..K {
+                out.h[i][j] += value * factor.h[i][j];
+            }
+        }
+    }
+    for i in 0..K {
+        out.g[i] += right_first * right.g[i];
+        for j in i..K {
+            let channel = out.h[i][j]
+                + right_first * right.h[i][j]
+                + right_second * right.g[i] * right.g[j]
+                + left_first[i] * right.g[j]
+                + left_first[j] * right.g[i];
+            out.h[i][j] = channel;
+            out.h[j][i] = channel;
+        }
+    }
+    out
+}
+
+/// Add `f(input_scale·input)` into accumulating ε⁰ / ε¹ blocks, upper Hessian
+/// triangles only. `derivative_stack` holds `f` and its derivatives at the
+/// scaled input's value; the ε¹ block is `f′(u)·input_scale·input.eps` through
+/// the order-two chain rule, the channels `OneSeed::compose_unary` writes.
+#[inline(always)]
+fn one_seed_add_scaled_composition<const K: usize>(
+    base: &mut crate::jet_tower::Tower2<K>,
+    eps: &mut crate::jet_tower::Tower2<K>,
+    input: &OneSeed<K>,
+    derivative_stack: &[f64; 5],
+    input_scale: f64,
+) {
+    let first = derivative_stack[1] * input_scale;
+    let second = derivative_stack[2] * input_scale * input_scale;
+    let third = derivative_stack[3] * input_scale * input_scale * input_scale;
+    let b = &input.base.0;
+    let e = &input.eps.0;
+    base.v += derivative_stack[0];
+    eps.v += first * e.v;
+    for i in 0..K {
+        base.g[i] += first * b.g[i];
+        eps.g[i] += second * b.g[i] * e.v + first * e.g[i];
+        for j in i..K {
+            base.h[i][j] += first * b.h[i][j] + second * b.g[i] * b.g[j];
+            eps.h[i][j] += first * e.h[i][j]
+                + second * (b.g[i] * e.g[j] + b.g[j] * e.g[i] + b.h[i][j] * e.v)
+                + third * b.g[i] * b.g[j] * e.v;
+        }
+    }
+}
+
+/// Copy the upper Hessian triangle an accumulating lowering wrote into the
+/// lower triangle.
+#[inline(always)]
+fn mirror_upper_hessian<const K: usize>(tower: &mut crate::jet_tower::Tower2<K>) {
+    for i in 0..K {
+        for j in i + 1..K {
+            tower.h[j][i] = tower.h[i][j];
         }
     }
 }
@@ -7798,5 +8112,221 @@ mod dynamic_batch_fused_979_tests {
             .zip(&last)
             .fold(0.0f64, |worst, (left, right)| worst.max((left - right).abs()));
         assert!(separation > 1e-6, "lane separation {separation:.3e}");
+    }
+}
+
+#[cfg(test)]
+mod one_seed_fused_932_tests {
+    //! The fused `OneSeed` lowerings, and the order-two weighted compose sum,
+    //! against the field programs they replace (#932).
+    //!
+    //! Every reference is written with the unfused field operations (`mul`,
+    //! `add`, `scale`, `compose_unary`), so it shares no lowering with the
+    //! override under test. The two sum the same terms in a different order and
+    //! agree to rounding. The operands are compositions of dense mixtures, so
+    //! every ε Hessian channel is live and an override that drops a chain-rule
+    //! term fails here instead of passing on a zero channel.
+    use super::{JetScalar, OneSeed, Order2};
+    use crate::nested_dual::JetField;
+
+    const K: usize = 5;
+    const TERMS: usize = 4;
+
+    fn stacks() -> [[f64; 5]; TERMS] {
+        [
+            [0.31, 0.62, -0.24, 0.11, -0.05],
+            [-0.17, 0.45, 0.33, -0.28, 0.09],
+            [0.52, -0.38, 0.19, 0.07, -0.13],
+            [0.28, 0.71, -0.46, 0.22, 0.04],
+        ]
+    }
+
+    /// A mixture of every seeded primary, so its gradient is dense.
+    fn mixture(vars: &[OneSeed<K>; K], salt: usize) -> OneSeed<K> {
+        vars.iter()
+            .enumerate()
+            .fold(OneSeed::constant(0.1 * salt as f64), |sum, (axis, var)| {
+                let weight = 0.3 + 0.17 * ((axis + salt) % K) as f64 - 0.05 * salt as f64;
+                sum.add(&var.scale(weight))
+            })
+    }
+
+    fn operands() -> (Vec<OneSeed<K>>, OneSeed<K>, OneSeed<K>) {
+        let vars: [OneSeed<K>; K] = std::array::from_fn(|axis| {
+            OneSeed::seed_direction(0.35 - 0.11 * axis as f64, axis, 0.6 - 0.17 * axis as f64)
+        });
+        let right = mixture(&vars, 0)
+            .compose_unary([0.9, -0.5, 0.27, -0.14, 0.06])
+            .mul(&mixture(&vars, 1))
+            .add(&mixture(&vars, 2).compose_unary([0.4, 0.3, -0.21, 0.12, -0.04]));
+        let lefts = (0..TERMS)
+            .map(|term| {
+                mixture(&vars, term)
+                    .compose_unary([0.2, 0.8, -0.3, 0.15, -0.07])
+                    .mul(&mixture(&vars, term + 1))
+                    .scale(0.4 + 0.23 * term as f64)
+            })
+            .collect();
+        let addend = mixture(&vars, 3)
+            .mul(&mixture(&vars, 4))
+            .compose_unary([-0.6, 0.35, 0.44, -0.18, 0.05]);
+        (lefts, right, addend)
+    }
+
+    fn order2_channels(x: &Order2<K>) -> Vec<f64> {
+        let mut out = vec![x.0.v];
+        out.extend_from_slice(&x.0.g);
+        for row in &x.0.h {
+            out.extend_from_slice(row);
+        }
+        out
+    }
+
+    /// Channel-by-channel agreement to rounding, and the live channels a
+    /// dropped term would zero. `hessian_offset` is where the ε Hessian (or,
+    /// for an order-two scalar, the Hessian) starts.
+    fn assert_agrees(label: &str, fused: &[f64], reference: &[f64], hessian_offset: usize) {
+        assert_eq!(fused.len(), reference.len());
+        for (index, (&got, &want)) in fused.iter().zip(reference).enumerate() {
+            let tolerance = 1.0e-13 * got.abs().max(want.abs()).max(1.0);
+            assert!(
+                (got - want).abs() <= tolerance,
+                "{label}: channel {index} fused {got:+.17e} vs field program {want:+.17e}"
+            );
+        }
+        let hessian = &fused[hessian_offset..hessian_offset + K * K];
+        let live = hessian.iter().filter(|channel| channel.abs() > 1.0e-9).count();
+        assert_eq!(
+            live,
+            K * K,
+            "{label}: every Hessian channel under test must be live: {hessian:?}"
+        );
+    }
+
+    fn assert_one_seed_agrees(label: &str, fused: &OneSeed<K>, reference: &OneSeed<K>) {
+        let channels = |x: &OneSeed<K>| {
+            let mut out = order2_channels(&x.base);
+            out.extend(order2_channels(&x.eps));
+            out
+        };
+        assert_agrees(
+            label,
+            &channels(fused),
+            &channels(reference),
+            2 * (1 + K) + K * K,
+        );
+    }
+
+    #[test]
+    fn fused_linear_combination_and_multiply_add_match_the_field_programs_932() {
+        let (lefts, right, addend) = operands();
+        let weights = [0.7, -1.3, 0.25, 2.1];
+        let reference = lefts
+            .iter()
+            .zip(weights)
+            .fold(OneSeed::constant(0.0), |sum, (input, weight)| {
+                sum.add(&input.scale(weight))
+            });
+        assert_one_seed_agrees(
+            "linear_combination",
+            &OneSeed::linear_combination(&lefts, &weights),
+            &reference,
+        );
+        for (term, left) in lefts.iter().enumerate() {
+            assert_one_seed_agrees(
+                &format!("multiply_add[{term}]"),
+                &left.multiply_add(&right, &addend),
+                &left.mul(&right).add(&addend),
+            );
+        }
+    }
+
+    #[test]
+    fn fused_compositions_match_scale_shift_compose_932() {
+        let (lefts, right, _addend) = operands();
+        let derivative_stacks = stacks();
+        let scales = [1.7, -0.6, 0.35, 2.2];
+        let scaled_composition = |input: &OneSeed<K>, scale: f64, shift: f64, stack: [f64; 5]| {
+            input
+                .scale(scale)
+                .add(&OneSeed::constant(shift))
+                .compose_unary(stack)
+        };
+        assert_one_seed_agrees(
+            "affine_compose",
+            &right.affine_compose(1.7, -0.3, derivative_stacks[0]),
+            &scaled_composition(&right, 1.7, -0.3, derivative_stacks[0]),
+        );
+        let composed = lefts
+            .iter()
+            .zip(derivative_stacks)
+            .fold(OneSeed::constant(0.0), |sum, (input, stack)| {
+                sum.add(&input.compose_unary(stack))
+            });
+        assert_one_seed_agrees(
+            "composed_sum",
+            &OneSeed::composed_sum(&lefts, &derivative_stacks),
+            &composed,
+        );
+        let affine = lefts
+            .iter()
+            .zip(scales)
+            .zip(derivative_stacks)
+            .fold(OneSeed::constant(0.0), |sum, ((input, scale), stack)| {
+                sum.add(&scaled_composition(input, scale, 0.0, stack))
+            });
+        assert_one_seed_agrees(
+            "affine_composed_sum",
+            &OneSeed::affine_composed_sum(&lefts, &scales, &derivative_stacks),
+            &affine,
+        );
+    }
+
+    #[test]
+    fn fused_weighted_compose_sum_matches_the_product_loop_932() {
+        let (lefts, right, addend) = operands();
+        let derivative_stacks = stacks();
+        let looped = |terms: usize| {
+            lefts[..terms]
+                .iter()
+                .zip(derivative_stacks)
+                .fold(addend, |sum, (left, stack)| {
+                    left.mul(&right.compose_unary(stack)).add(&sum)
+                })
+        };
+        assert_one_seed_agrees(
+            "weighted_compose_sum",
+            &OneSeed::weighted_compose_sum(&lefts, &right, &derivative_stacks, &addend),
+            &looped(TERMS),
+        );
+        // One term, and no terms: the edges an accumulator started from the
+        // wrong value would get wrong.
+        assert_one_seed_agrees(
+            "weighted_compose_sum single",
+            &OneSeed::weighted_compose_sum(&lefts[..1], &right, &derivative_stacks[..1], &addend),
+            &looped(1),
+        );
+        assert_one_seed_agrees(
+            "weighted_compose_sum empty",
+            &OneSeed::weighted_compose_sum(&[], &right, &[], &addend),
+            &addend,
+        );
+
+        // The order-two lowering on the ε⁰ parts alone.
+        let bases: Vec<Order2<K>> = lefts.iter().map(|left| left.base).collect();
+        let fused =
+            Order2::weighted_compose_sum(&bases, &right.base, &derivative_stacks, &addend.base);
+        let reference = bases
+            .iter()
+            .zip(derivative_stacks)
+            .fold(addend.base, |sum, (left, stack)| {
+                left.mul(&right.base.compose_unary(stack)).add(&sum)
+            });
+        assert_agrees(
+            "order2 weighted_compose_sum",
+            &order2_channels(&fused),
+            &order2_channels(&reference),
+            1 + K,
+        );
     }
 }
