@@ -2461,17 +2461,6 @@ fn no_whitelisted_smooth_option_is_accepted_and_inert() {
             // in the solver's rho vector and deliberately leaves each term's
             // basis untouched.
             (_, "id") => Some("shares a smoothing parameter; does not touch the basis"),
-            // A centered cyclic basis has no free null space for the
-            // double-penalty ridge to shrink: the cyclic wiggliness
-            // penalty's only null direction is the constant, the periodic
-            // sum-to-zero chart removes exactly that, and the ridge is
-            // dropped as an identically zero block (#874). So there is no
-            // second penalty for the flag to switch off. It becomes live
-            // again under `identifiability='none'`, which is a different
-            // baseline and is covered by the cyclic ridge tests.
-            ("cyclic", "double_penalty") => {
-                Some("no null space survives the periodic sum-to-zero chart (#874)")
-            }
             // The Matérn cold build ships the ridge candidate unconditionally
             // and lets the bootstrap-κ spectral test decide at FIT time
             // whether it survives, pinning the outcome into the frozen

@@ -174,46 +174,72 @@ pub fn build_bspline_basis_1d(
             );
         }
         let knots = cyclic_uniform_knot_vector(start, end, spec.degree, num_basis);
-        let s_bend_raw = ConstructiveQuadratic::from_energy_factor(
-            cyclic_bspline_derivative_penalty_factor(
-                spec.degree,
-                num_basis,
-                end - start,
-                spec.penalty_order,
+        // A periodic function has no linear trend: the smoothest periodic
+        // functions are the constant and the fundamental harmonic. Roughness of
+        // order `m ≥ 2` is therefore the HARMONIC cyclic roughness
+        // `∮(f^{(m)} + ω²(f − f̄)^{(m−2)})²` (see
+        // `cyclic_bspline_harmonic_penalty_factor`), which leaves exactly
+        // `{1, sin ωθ, cos ωθ}` unpenalized, the way `∫(f'')²` leaves `{1, x}`
+        // unpenalized on an open interval. The plain derivative roughness
+        // `∮(f^{(m)})²` charges the fundamental, so a single λ cannot keep a
+        // strong low-frequency cycle without also admitting its higher
+        // harmonics. Order `m = 1` has no real harmonic analogue and keeps
+        // `∮(f')²`, whose only null direction is the constant.
+        //
+        // The harmonic null space is DECLARED as a structural frame rather than
+        // measured: the fundamental's representer on the spline chart carries
+        // alias energy at frequencies `1 ± K, 1 ± 2K, …`, small but above any
+        // rank cutoff, and the double-penalty rebuild must not read that alias
+        // energy as curvature (#2445).
+        let harmonic_null_frame = (spec.penalty_order >= 2)
+            .then(|| cyclic_harmonic_null_frame(num_basis))
+            .transpose()?;
+        let s_bend_raw = match &harmonic_null_frame {
+            Some(frame) => ConstructiveQuadratic::from_energy_factor(
+                cyclic_bspline_harmonic_penalty_factor(
+                    spec.degree,
+                    num_basis,
+                    end - start,
+                    spec.penalty_order,
+                )?,
+                "cyclic B-spline harmonic roughness",
+            )?
+            .with_structural_null_frame(
+                frame.clone(),
+                "cyclic harmonic roughness structural null declaration",
             )?,
-            "cyclic B-spline roughness",
-        )?;
-        // A cyclic derivative penalty has a single null direction — the constant
-        // vector. Under the periodic sum-to-zero identifiability constraint (the
-        // default) that direction is removed wholesale, so the
-        // null-space-shrinkage ("double") ridge — by construction the projector
-        // onto exactly that constant eigenvector — becomes `Tᵀ(z·zᵀ)T = 0` in
-        // the constrained chart: an identically zero penalty block carrying its
-        // own smoothing parameter. A zero block contributes nothing to the REML
-        // cost or penalty log-determinant, so its log-λ coordinate is completely
-        // unidentified, the outer Hessian is singular along it, and the outer
-        // loop cannot certify a step (#874). mgcv's `bs="cc"` is a SINGLE-penalty
-        // smooth for the same reason.
+            None => ConstructiveQuadratic::from_energy_factor(
+                cyclic_bspline_derivative_penalty_factor(
+                    spec.degree,
+                    num_basis,
+                    end - start,
+                    spec.penalty_order,
+                )?,
+                "cyclic B-spline roughness",
+            )?,
+        };
+        // The null-space-shrinkage ("double") ridge charges the null component
+        // its own smoothing parameter, so REML can still recover the null. The
+        // candidate set is assembled exactly like every other 1-D basis, and
+        // `rebuild_double_penalty_nullspace_in_constrained_chart` rebuilds the
+        // ridge on the null directions that survive the identifiability chart.
+        // Under the periodic sum-to-zero constraint (the default) the centering
+        // removes one direction: the fundamental survives for the harmonic
+        // roughness, so the ridge keeps rank 2 and an identified λ; for `m = 1`
+        // nothing survives, the ridge collapses to `ConstructiveQuadratic::zero`,
+        // and `filter_penalty_candidates` drops it as
+        // `PenaltyDropReason::ZeroMatrix`. A zero block contributes nothing to
+        // the REML cost or penalty log-determinant, so its log-λ coordinate would
+        // be completely unidentified and the outer loop could not certify a step
+        // (#874).
         //
-        // That argument is a statement about the *constrained* chart, not about
-        // the cyclic basis, so it is enforced where it is true rather than by
-        // suppressing the ridge unconditionally: the candidate set is assembled
-        // exactly like every other 1-D basis, and
-        // `rebuild_double_penalty_nullspace_in_constrained_chart` collapses the
-        // ridge to `ConstructiveQuadratic::zero` whenever the constrained
-        // primary has no null space left, after which `filter_penalty_candidates`
-        // drops it as `PenaltyDropReason::ZeroMatrix`. Under sum-to-zero the
-        // cyclic smooth therefore still ships exactly one penalty and one λ, as
-        // #874 requires.
-        //
-        // The unconditional suppression was not merely redundant, it was wrong
-        // for `identifiability='none'`: there the constant direction SURVIVES
-        // into the design, is exactly aliased with the global intercept, and —
-        // with no ridge to penalize it — the pre-fit rank audit refused the model
-        // ("rank 1 < 2 unpenalized columns"). With the ridge restored the
-        // constant is a penalized direction, the unpenalized block is the
-        // intercept alone, and an uncentered cyclic smooth fits the same way an
-        // uncentered open one does (#2783).
+        // Under `identifiability='none'` the constant direction SURVIVES into the
+        // design, is exactly aliased with the global intercept, and — with no
+        // ridge to penalize it — the pre-fit rank audit refused the model
+        // ("rank 1 < 2 unpenalized columns"). With the ridge the constant is a
+        // penalized direction, the unpenalized block is the intercept alone, and
+        // an uncentered cyclic smooth fits the same way an uncentered open one
+        // does (#2783).
         //
         // Frobenius-normalize the cyclic wiggliness penalty (recording the norm
         // in `normalization_scale`) so its smoothing parameter `λ` is on the same
@@ -237,9 +263,13 @@ pub fn build_bspline_basis_1d(
             // one period, so the penalized quantity is `∫(null component of f)²`
             // and is invariant to how the cyclic basis happens to be scaled.
             let gram = periodic_bspline_function_gram(start, end, spec.degree, num_basis)?;
-            if let Some(shrinkage) =
-                function_space_nullspace_shrinkage(s_bend_raw.dense(), &gram)?
-            {
+            let shrinkage = match &harmonic_null_frame {
+                // The declared frame IS the null space; a rank test on the
+                // harmonic roughness would keep only the constant.
+                Some(frame) => Some(function_space_subspace_trend_ridge(frame, &gram)?),
+                None => function_space_nullspace_shrinkage(s_bend_raw.dense(), &gram)?,
+            };
+            if let Some(shrinkage) = shrinkage {
                 let (ridge_norm, ridge_scale) = normalize_penalty(&shrinkage);
                 penalties_raw.push(PenaltyCandidate {
                     matrix: ConstructiveQuadratic::try_from_dense_psd(

@@ -3653,16 +3653,13 @@ fn test_periodic_bspline_with_sum_to_zero_keeps_wrapped_rows_equal() {
     for sum in col_sums.iter() {
         assert_abs_diff_eq!(*sum, 0.0, epsilon = 1e-10);
     }
-    // Cyclic basis must emit a single wiggliness penalty even when
-    // `double_penalty=true`: the cyclic difference penalty has a single
-    // null direction (the constant) which the periodic sum-to-zero
-    // identifiability constraint removes wholesale, so the
-    // null-space-shrinkage projector reduces to `Tᵀ(z·zᵀ)T = 0` — an
-    // identically zero penalty carrying its own smoothing parameter
-    // would leave that λ unidentified and prevent outer-REML termination
-    // (see #874 / the comment in `build_bspline_basis_1d`'s cyclic arm).
-    // Match mgcv `bs="cc"`, which is likewise a single-penalty smooth.
-    assert_eq!(built.active_penalties.len(), 1);
+    // A centered cyclic basis with `double_penalty=true` ships the harmonic
+    // roughness and its null-function ridge. The sum-to-zero centering removes
+    // the constant, but the fundamental harmonic survives in the constrained
+    // chart, so the ridge keeps rank 2 and an identified smoothing parameter;
+    // only a ridge with no surviving null direction is dropped (see #874 / the
+    // comment in `build_bspline_basis_1d`'s cyclic arm).
+    assert_eq!(built.active_penalties.len(), 2);
 }
 
 #[test]

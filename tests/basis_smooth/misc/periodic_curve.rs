@@ -102,16 +102,18 @@ fn periodic_bspline_terms_build_with_cyclic_penalty_and_formula_alias() {
     };
     let design = build_term_collection_design(data.view(), &spec).unwrap();
     assert_eq!(design.smooth.terms.len(), 1);
-    // Without centering the constant function survives. Its function-space
-    // ridge must remain separate from roughness (#2783); dropping it would
-    // leave an unpenalized alias of the global intercept.
+    // Without centering the constant function survives. The harmonic cyclic
+    // roughness leaves the constant and the fundamental harmonic unpenalized,
+    // and their function-space ridge must remain separate from roughness
+    // (#2783); dropping it would leave an unpenalized alias of the global
+    // intercept.
     let penalties = &design.smooth.terms[0].active_penalties;
     assert_eq!(penalties.len(), 2);
     let roughness = penalties
         .iter()
         .find(|penalty| matches!(penalty.info.source, gam::terms::basis::PenaltySource::Primary))
         .expect("cyclic roughness penalty");
-    let constant = penalties
+    let null_ridge = penalties
         .iter()
         .find(|penalty| {
             matches!(
@@ -119,19 +121,42 @@ fn periodic_bspline_terms_build_with_cyclic_penalty_and_formula_alias() {
                 gam::terms::basis::PenaltySource::DoublePenaltyNullspace
             )
         })
-        .expect("surviving constant-function penalty");
+        .expect("surviving null-function penalty");
+    // The constant is annihilated exactly. The fundamental's spline representer
+    // keeps a little alias energy, so the MEASURED nullity is the constant alone
+    // while the ridge spans the declared {1, sin, cos} frame.
     assert_eq!(roughness.nullity, 1);
-    assert_eq!(constant.nullity, constant.matrix.ncols() - 1);
+    assert_eq!(null_ridge.nullity, null_ridge.matrix.ncols() - 3);
     let ones = ndarray::Array1::ones(roughness.matrix.ncols());
     assert!(
         roughness.matrix.dot(&ones).iter().all(|value| value.abs() < 1e-12)
     );
-    assert!(ones.dot(&constant.matrix.dot(&ones)) > 0.0);
+    assert!(ones.dot(&null_ridge.matrix.dot(&ones)) > 0.0);
+    // Positive control for the harmonic seminorm: the discrete frequency-one mode
+    // (the representer of sin θ) costs a vanishing fraction of the frequency-two
+    // mode. The plain derivative roughness `∮(f'')²` charges them 1 : 16 up to
+    // the basis's attenuation, far above this bar.
+    let mode = |frequency: f64| {
+        ndarray::Array1::from_shape_fn(roughness.matrix.ncols(), |a| {
+            (2.0 * std::f64::consts::PI * frequency * a as f64 / roughness.matrix.ncols() as f64)
+                .sin()
+        })
+    };
+    let rayleigh = |v: &ndarray::Array1<f64>| v.dot(&roughness.matrix.dot(v)) / v.dot(v);
+    let (fundamental, second) = (mode(1.0), mode(2.0));
+    assert!(
+        rayleigh(&fundamental) < 1e-3 * rayleigh(&second),
+        "harmonic roughness must not charge the fundamental: {} vs second harmonic {}",
+        rayleigh(&fundamental),
+        rayleigh(&second)
+    );
 
-    // Centering removes exactly that constant direction. The resulting cyclic
-    // smooth must have one full-rank penalty and no unidentified second lambda
-    // (#874). Test the constraint explicitly instead of assuming that periodic
-    // knots override the caller's identifiability choice.
+    // Centering removes the constant direction. The fundamental survives the
+    // centering, so the cyclic smooth keeps a rank-2 null-function ridge with an
+    // identified second lambda on top of a numerically full-rank roughness; only
+    // a ridge with NO surviving null direction would carry an unidentified
+    // lambda (#874). Test the constraint explicitly instead of assuming that
+    // periodic knots override the caller's identifiability choice.
     let SmoothBasisSpec::BSpline1D { spec: basis_spec, .. } = &mut spec.smooth_terms[0].basis
     else {
         panic!("expected the declared B-spline basis");
@@ -139,12 +164,26 @@ fn periodic_bspline_terms_build_with_cyclic_penalty_and_formula_alias() {
     basis_spec.identifiability = BSplineIdentifiability::WeightedSumToZero { weights: None };
     let centered = build_term_collection_design(data.view(), &spec).unwrap();
     let centered_penalties = &centered.smooth.terms[0].active_penalties;
-    assert_eq!(centered_penalties.len(), 1);
-    assert_eq!(centered_penalties[0].nullity, 0);
+    assert_eq!(centered_penalties.len(), 2);
+    let centered_roughness = centered_penalties
+        .iter()
+        .find(|penalty| matches!(penalty.info.source, gam::terms::basis::PenaltySource::Primary))
+        .expect("centered cyclic roughness penalty");
+    let centered_ridge = centered_penalties
+        .iter()
+        .find(|penalty| {
+            matches!(
+                penalty.info.source,
+                gam::terms::basis::PenaltySource::DoublePenaltyNullspace
+            )
+        })
+        .expect("centered fundamental-harmonic ridge");
+    assert_eq!(centered_roughness.nullity, 0);
     assert_eq!(
-        centered_penalties[0].matrix.ncols(),
+        centered_roughness.matrix.ncols(),
         roughness.matrix.ncols() - 1
     );
+    assert_eq!(centered_ridge.info.effective_rank, 2);
 
     let built = build_bspline_basis_1d(
         x.view(),

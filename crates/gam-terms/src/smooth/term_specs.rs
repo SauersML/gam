@@ -6208,8 +6208,27 @@ pub fn build_tensor_bspline_basis(
         };
         marginal_sparse.push(sparse_view);
         marginal_designs.push(dense_marginal);
-        marginal_penalties.push(
-            built
+        // A periodic margin carries the plain derivative roughness `∮(f^{(m)})²`,
+        // not the harmonic roughness the 1-D builder ships for a cyclic smooth.
+        // The harmonic seminorm's null space includes the fundamental harmonic
+        // as a DECLARED structural frame; the Kronecker assembly below measures
+        // each margin's null space from its matrix and carries no frame into its
+        // functional-ANOVA null ridges, so a harmonic margin would leave every
+        // fundamental ⊗ null interaction charged only the spline's alias energy,
+        // with no ridge to shrink it.
+        let marginal_penalty = match marginal_periodic {
+            Some((_, period, num_basis)) => {
+                crate::basis::normalize_penalty(
+                    &crate::basis::cyclic_bspline_derivative_penalty_matrix(
+                        effective_degree,
+                        num_basis,
+                        period,
+                        marginal_unconstrained.penalty_order,
+                    )?,
+                )
+                .0
+            }
+            None => built
                 .active_penalties
                 .first()
                 .ok_or_else(|| {
@@ -6219,7 +6238,8 @@ pub fn build_tensor_bspline_basis(
                 })?
                 .matrix
                 .clone(),
-        );
+        };
+        marginal_penalties.push(marginal_penalty);
         built.active_penalties.first().ok_or_else(|| {
             BasisError::InvalidInput(format!(
                 "internal TensorBSpline error at dim {dim}: missing marginal nullspace dim"

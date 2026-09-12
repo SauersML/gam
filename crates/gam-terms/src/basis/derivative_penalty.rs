@@ -315,29 +315,7 @@ fn cyclic_unit_energy_factor(
     period: f64,
     order: usize,
 ) -> Result<Array2<f64>, BasisError> {
-    if degree < 1 {
-        return Err(BasisError::InvalidDegree(degree));
-    }
-    if num_basis <= degree {
-        crate::bail_invalid_basis!(
-            "cyclic roughness penalty requires more basis functions ({num_basis}) than degree ({degree})"
-        );
-    }
-    if !period.is_finite() || period <= 0.0 {
-        crate::bail_invalid_basis!(
-            "cyclic roughness penalty requires a finite positive period, got {period}"
-        );
-    }
-    if order == 0 || order >= num_basis {
-        return Err(BasisError::InvalidPenaltyOrder { order, num_basis });
-    }
-    if order > degree {
-        return Err(BasisError::InsufficientDegreeForDerivative {
-            degree,
-            derivative_order: order,
-            minimum_degree: order,
-        });
-    }
+    validate_cyclic_roughness(degree, num_basis, period, order)?;
 
     // The wrapped basis is `B_a(θ) = Σ_k C(θ/h − a − k·num_basis)` for the
     // cardinal degree-`p` B-spline `C`. Realize it as the OPEN uniform basis on
@@ -364,6 +342,171 @@ fn cyclic_unit_energy_factor(
         num_basis,
         |col| col % num_basis,
     )
+}
+
+/// Validate a cyclic roughness request: more wrapped translates than the
+/// degree, a finite positive period, and an order `1 ≤ m ≤ degree` below the
+/// basis size.
+fn validate_cyclic_roughness(
+    degree: usize,
+    num_basis: usize,
+    period: f64,
+    order: usize,
+) -> Result<(), BasisError> {
+    if degree < 1 {
+        return Err(BasisError::InvalidDegree(degree));
+    }
+    if num_basis <= degree {
+        crate::bail_invalid_basis!(
+            "cyclic roughness penalty requires more basis functions ({num_basis}) than degree ({degree})"
+        );
+    }
+    if !period.is_finite() || period <= 0.0 {
+        crate::bail_invalid_basis!(
+            "cyclic roughness penalty requires a finite positive period, got {period}"
+        );
+    }
+    if order == 0 || order >= num_basis {
+        return Err(BasisError::InvalidPenaltyOrder { order, num_basis });
+    }
+    if order > degree {
+        return Err(BasisError::InsufficientDegreeForDerivative {
+            degree,
+            derivative_order: order,
+            minimum_degree: order,
+        });
+    }
+    Ok(())
+}
+
+/// Constructive energy factor for the exact cyclic HARMONIC roughness over one
+/// full period,
+///
+/// ```text
+/// J_m(f) = ∮ ( f^{(m)}(θ) + ω² (f − f̄)^{(m−2)}(θ) )² dθ,   ω = 2π / period,  m ≥ 2,
+/// ```
+///
+/// where `f̄` is the mean of `f` over the period. The mean enters only at
+/// `m = 2`, where `(f − f̄)^{(0)} = f − f̄`; for `m ≥ 3` the derivative already
+/// annihilates constants. The operator `D^{m−2}(D² + ω²)` on mean-removed
+/// functions annihilates exactly `{1, sin ωθ, cos ωθ}`. For
+/// `f = Σ_k c_k e^{ikωθ}`,
+///
+/// ```text
+/// J_m(f) = period · ω^{2m} Σ_{k≠0} k^{2(m−2)} (k² − 1)² |c_k|²,
+/// ```
+///
+/// against `period · ω^{2m} Σ_k k^{2m} |c_k|²` for the derivative roughness
+/// [`cyclic_bspline_derivative_penalty_factor`]: the two agree asymptotically
+/// in `k` and differ in not charging the fundamental harmonic, which on the
+/// circle plays the part the linear trend plays on an open interval.
+///
+/// Assembly is exact up to roundoff: on each span the lower-order term is a
+/// polynomial of degree `p − m + 2`, so the integrand has degree `2(p − m + 2)`
+/// and `p − m + 3` Gauss–Legendre points integrate it exactly. Every wrapped
+/// translate integrates to the knot spacing, so `f̄ = Σ_a β_a / num_basis` in
+/// the unit-period coordinate. Under `θ = a + period·u` the operator scales as
+/// `period^{−m}`, so the exact covariance is the derivative roughness's
+/// `S_θ = period^{1−2m} S_u`.
+pub(crate) fn cyclic_bspline_harmonic_penalty_factor(
+    degree: usize,
+    num_basis: usize,
+    period: f64,
+    order: usize,
+) -> Result<Array2<f64>, BasisError> {
+    validate_cyclic_roughness(degree, num_basis, period, order)?;
+    if order < 2 {
+        return Err(BasisError::InvalidPenaltyOrder { order, num_basis });
+    }
+    // Unit-period coordinate on the extended open knot line, folded modulo
+    // `num_basis`, exactly as in `cyclic_unit_energy_factor`.
+    let knots = cyclic_uniform_knot_vector(0.0, 1.0, degree, num_basis);
+    let num_basis_extended = knots.len() - degree - 1;
+    let omega_squared = (2.0 * std::f64::consts::PI).powi(2);
+    let mean_weight = 1.0 / num_basis as f64;
+    let quad_points = degree - order + 3;
+    let (nodes, weights) = gauss_legendre(quad_points);
+    let mut factor = Array2::<f64>::zeros((num_basis * quad_points, num_basis));
+    let mut highest = vec![0.0_f64; num_basis_extended];
+    let mut lower = vec![0.0_f64; num_basis_extended];
+    let mut workspace = BsplineDerivativeWorkspace::new();
+    let mut scratch = SplineScratch::new(degree);
+    for (span, k) in (degree..degree + num_basis).enumerate() {
+        let mid = 0.5 * (knots[k] + knots[k + 1]);
+        let half = 0.5 * (knots[k + 1] - knots[k]);
+        for (node_index, (node, weight)) in nodes.iter().zip(weights.iter()).enumerate() {
+            let x = mid + half * node;
+            evaluate_bspline_derivative_recurrence_into(
+                order,
+                x,
+                knots.view(),
+                degree,
+                &mut highest,
+                &mut workspace,
+                0,
+            )?;
+            if order == 2 {
+                evaluate_bspline_basis_scalar(x, knots.view(), degree, &mut lower, &mut scratch)?;
+            } else {
+                evaluate_bspline_derivative_recurrence_into(
+                    order - 2,
+                    x,
+                    knots.view(),
+                    degree,
+                    &mut lower,
+                    &mut workspace,
+                    0,
+                )?;
+            }
+            let root_weight = (weight * half).sqrt();
+            let row = span * quad_points + node_index;
+            for i in k - degree..=k {
+                factor[[row, i % num_basis]] +=
+                    root_weight * (highest[i] + omega_squared * lower[i]);
+            }
+            if order == 2 {
+                // `− ω² f̄`: the mean is a functional of the whole coefficient
+                // vector, so it charges every translate equally.
+                let mean_term = root_weight * omega_squared * mean_weight;
+                factor.row_mut(row).mapv_inplace(|value| value - mean_term);
+            }
+        }
+    }
+    rescale_derivative_factor(&mut factor, period, order)?;
+    Ok(factor)
+}
+
+/// Orthonormal structural null frame `{1, sin ωθ, cos ωθ}` of
+/// [`cyclic_bspline_harmonic_penalty_factor`] in the chart of `num_basis`
+/// wrapped uniform translates.
+///
+/// Translating θ by one knot spacing permutes the translates cyclically and
+/// commutes with the harmonic operator and with the mean, so the roughness
+/// Gram, the function Gram and every other translation-invariant quadratic of
+/// this basis are circulant. The representers of the constant and of the
+/// fundamental harmonics therefore span exactly the discrete frequency-zero and
+/// frequency-one modes `1, sin(2πa/K), cos(2πa/K)`. The operator annihilates the
+/// continuous harmonics; their spline representers keep alias energy at
+/// frequencies `1 ± K, 1 ± 2K, …`, which vanishes as the basis is refined.
+pub(crate) fn cyclic_harmonic_null_frame(num_basis: usize) -> Result<Array2<f64>, BasisError> {
+    // A frequency-one mode needs at least three translates to be distinct from
+    // its own alias.
+    if num_basis < 3 {
+        crate::bail_invalid_basis!(
+            "cyclic harmonic null frame requires at least 3 basis functions, got {num_basis}"
+        );
+    }
+    let k = num_basis as f64;
+    let constant = k.recip().sqrt();
+    let harmonic = (2.0 / k).sqrt();
+    let mut frame = Array2::<f64>::zeros((num_basis, 3));
+    for a in 0..num_basis {
+        let phase = 2.0 * std::f64::consts::PI * a as f64 / k;
+        frame[[a, 0]] = constant;
+        frame[[a, 1]] = harmonic * phase.sin();
+        frame[[a, 2]] = harmonic * phase.cos();
+    }
+    Ok(frame)
 }
 
 /// Maps the open spline's modeling interval to `[0, 1]`. Assembly in this
