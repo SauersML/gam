@@ -553,9 +553,11 @@ pub(crate) fn fit_survival_location_scale_terms(
             }
         }
     }
-    // Warm-start: inject converged ρ seeds from a previous fit if supplied. The values are
-    // clamped to the outer ρ bounds (±12) so that "dead" coordinates returned at extremes
-    // by a prior fit don't crowd the optimizer's box bound on the next probe.
+    // Warm-start: inject converged ρ seeds from a previous fit if supplied. The carried
+    // strengths are seeds, not bounds: the joint setup and `run_plan` project every seed
+    // onto the coordinate's derived domain (#2812), so no private box is applied here.
+    // A converged fit's log strength is finite; a non-finite carry is refused rather than
+    // silently replaced by the default seed.
     if layout.k_threshold > 0
         && let Some(seed) = spec.initial_threshold_log_lambdas.as_ref()
     {
@@ -569,13 +571,17 @@ pub(crate) fn fit_survival_location_scale_terms(
             }
             .into());
         }
-        let range = layout.threshold_range();
-        let mut slice = rho0.slice_mut(s![range.start..range.end]);
-        for (dst, src) in slice.iter_mut().zip(seed.iter()) {
-            if src.is_finite() {
-                *dst = src.clamp(-12.0, 12.0);
+        if let Some(bad) = seed.iter().position(|value| !value.is_finite()) {
+            return Err(SurvivalLocationScaleError::InvalidConfiguration {
+                reason: format!(
+                    "survival threshold initial_log_lambdas[{bad}] is non-finite ({})",
+                    seed[bad]
+                ),
             }
+            .into());
         }
+        let range = layout.threshold_range();
+        rho0.slice_mut(s![range.start..range.end]).assign(seed);
     }
     if layout.k_log_sigma > 0
         && let Some(seed) = spec.initial_log_sigma_log_lambdas.as_ref()
@@ -590,13 +596,17 @@ pub(crate) fn fit_survival_location_scale_terms(
             }
             .into());
         }
-        let range = layout.log_sigma_range();
-        let mut slice = rho0.slice_mut(s![range.start..range.end]);
-        for (dst, src) in slice.iter_mut().zip(seed.iter()) {
-            if src.is_finite() {
-                *dst = src.clamp(-12.0, 12.0);
+        if let Some(bad) = seed.iter().position(|value| !value.is_finite()) {
+            return Err(SurvivalLocationScaleError::InvalidConfiguration {
+                reason: format!(
+                    "survival log_sigma initial_log_lambdas[{bad}] is non-finite ({})",
+                    seed[bad]
+                ),
             }
+            .into());
         }
+        let range = layout.log_sigma_range();
+        rho0.slice_mut(s![range.start..range.end]).assign(seed);
     }
     if layout.k_wiggle > 0 {
         let range = layout.wiggle_range();
