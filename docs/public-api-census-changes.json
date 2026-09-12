@@ -1450,5 +1450,14 @@
     },
     "reason": "prune-api-b product-use sweep (#2899). The public functions GradientDiagnosticReport::new and ::summary and the new/get pairs of the unused PenaltyIdx, BasisIdx and RowIdx newtypes are removed together with their types, which no product, test or benchmark uses.",
     "evidence": "scripts/public_api_census.py over a probe commit carrying the same code removals on base 0077b5773, run on MSI acn112 with python3.12 (/scratch.global/sauer354/pool/prune-api-b/sliceA.census.out), reports exactly diagnostics.rs::new 1, diagnostics.rs::summary 1, types.rs::get 3 and types.rs::new 3. At the base git grep -w finds GradientDiagnosticReport, PenaltyIdx, BasisIdx and RowIdx only inside the deleted spans of their own files."
+  },
+  {
+    "base": "cfdc1907ef77806f6d68f96855f9368e10008a0d",
+    "removed": {
+      "crates/gam-models/src/marginal_slope_shared.rs::target_k": 1,
+      "crates/gam-models/src/marginal_slope_shared.rs::target_k_detailed": 1
+    },
+    "reason": "#2897, SPEC rule 25. AutoOuterSubsampleOptions exposed min_k, target_fraction, seed and min_k_floor as pub options that no production code sets; only the per-K work cost is family-specific. Its methods target_k and target_k_detailed are replaced by the free function auto_outer_target_k(n, outer_work_per_k_unit) over private constants holding the unchanged values.",
+    "evidence": "At main with marginal_slope_shared.rs blob c4c0bed6d, a git grep over the whole tree for calls of .target_k( and .target_k_detailed( finds them only in marginal_slope_shared.rs (target_k itself, auto_outer_score_subsample and maybe_install_auto_outer_subsample) and in root tests h1a and h1b of tests/regressions/misc/subsample_k_cap_and_audit.rs, which now call auto_outer_target_k. No gam-cli, gam-pyffi, python or examples code calls either method."
   }
 ]

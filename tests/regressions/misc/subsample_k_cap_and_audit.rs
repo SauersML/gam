@@ -3,7 +3,7 @@
 //! Pinned mechanism (validated via multiple orthogonal lines):
 //!
 //!   * `marginal_slope_shared.rs:maybe_install_auto_outer_subsample`
-//!     used to construct `AutoOuterSubsampleOptions::default()` and
+//!     used to build its subsample options from the defaults and
 //!     discard the `outer_work_per_k_unit` argument. At large-scale n the
 //!     noise-only rule then picked K ≈ 0.10·n = 19_661, ~9× larger
 //!     than the survival family's intended K ≈ 2_000. The first outer
@@ -22,8 +22,8 @@
 //! K-cap multiplier mechanism quantitatively.
 
 use gam::families::marginal_slope_shared::{
-    AUTO_OUTER_MIN_K_FLOOR, AUTO_OUTER_WORK_BUDGET, AutoOuterCapReason, AutoOuterSubsampleOptions,
-    auto_outer_score_subsample, maybe_install_auto_outer_subsample,
+    AUTO_OUTER_MIN_K_FLOOR, AUTO_OUTER_WORK_BUDGET, AutoOuterCapReason, auto_outer_score_subsample,
+    auto_outer_target_k, maybe_install_auto_outer_subsample,
 };
 use gam::identifiability::audit::audit_identifiability;
 use ndarray::{Array1, Array2};
@@ -35,14 +35,12 @@ const LARGE_SCALE_N: usize = 195_780;
 const SURVIVAL_WORK_PER_K_UNIT: u64 = 250_000;
 const OBSERVED_K_IN_RUN: usize = 19_661;
 
-// -------- H1: AutoOuterSubsampleOptions::target_k_detailed math --------
+// -------- H1: auto_outer_target_k math --------
 
 #[test]
 fn h1a_target_k_with_default_work_per_k_picks_noise_rule() {
-    let opts = AutoOuterSubsampleOptions::default();
-    let choice = opts
-        .target_k_detailed(LARGE_SCALE_N)
-        .expect("large-scale n should auto-subsample");
+    let choice =
+        auto_outer_target_k(LARGE_SCALE_N, 1).expect("large-scale n should auto-subsample");
     assert_eq!(
         choice.cap_reason,
         AutoOuterCapReason::Noise,
@@ -59,14 +57,8 @@ fn h1a_target_k_with_default_work_per_k_picks_noise_rule() {
 
 #[test]
 fn h1b_target_k_with_survival_work_per_k_picks_work_rule() {
-    // Hypothetical: if the survival 250_000 reached target_k_detailed via
-    // a non-default options instance, the cap would bind to ~2_000.
-    let opts = AutoOuterSubsampleOptions {
-        outer_work_per_k_unit: SURVIVAL_WORK_PER_K_UNIT,
-        ..AutoOuterSubsampleOptions::default()
-    };
-    let choice = opts
-        .target_k_detailed(LARGE_SCALE_N)
+    // The survival per-K cost 250_000 binds the work cap at ~2_000.
+    let choice = auto_outer_target_k(LARGE_SCALE_N, SURVIVAL_WORK_PER_K_UNIT)
         .expect("large-scale n should auto-subsample");
     let expected_k_work = (AUTO_OUTER_WORK_BUDGET / SURVIVAL_WORK_PER_K_UNIT) as usize;
     assert_eq!(
@@ -93,14 +85,14 @@ fn h1b_target_k_with_survival_work_per_k_picks_work_rule() {
 #[test]
 fn h1c_maybe_install_honors_outer_work_per_k_unit_argument() {
     // Regression guard for the K-cap bypass at marginal_slope_shared.rs:1109.
-    // Pre-fix: the function constructed `AutoOuterSubsampleOptions::default()`
+    // Pre-fix: the function built its subsample options from the defaults
     // and discarded the `outer_work_per_k_unit` argument, so the work-budget
     // cap never bound; the noise-only rule picked K ≈ 0.10·n (≈ 19_661 at
     // large-scale n=195_780) instead of the survival family's intended K ≈ 2_000.
     // That ~9× inflation drove the observed 8h large-scale hang (exit 137).
     //
-    // Post-fix: the function threads `outer_work_per_k_unit` into the options
-    // it constructs, so the cap binds and K lands near 2_000.
+    // Post-fix: the function passes `outer_work_per_k_unit` to the target-K
+    // rule, so the cap binds and K lands near 2_000.
     let z: Vec<f64> = (0..LARGE_SCALE_N)
         .map(|i| (i as f64) / (LARGE_SCALE_N as f64))
         .collect();
@@ -162,20 +154,15 @@ fn h1c_maybe_install_honors_outer_work_per_k_unit_argument() {
 
 #[test]
 fn h1d_direct_capped_options_do_produce_small_k() {
-    // Independent line of evidence: when the *function* internals are
-    // bypassed and the cap is built into the options directly, the
-    // mask comes out small. This proves the cap mechanism itself works,
-    // so the bug is specifically in `maybe_install_auto_outer_subsample`
-    // constructing default options at line 1109.
+    // Independent line of evidence: when the per-K cost goes straight to
+    // `auto_outer_score_subsample`, bypassing
+    // `maybe_install_auto_outer_subsample`, the mask comes out small. This
+    // proves the cap mechanism itself works independently of the installer.
     let z: Vec<f64> = (0..LARGE_SCALE_N)
         .map(|i| (i as f64) / (LARGE_SCALE_N as f64))
         .collect();
     let stratum: Vec<u8> = (0..LARGE_SCALE_N).map(|i| (i & 1) as u8).collect();
-    let capped = AutoOuterSubsampleOptions {
-        outer_work_per_k_unit: SURVIVAL_WORK_PER_K_UNIT,
-        ..AutoOuterSubsampleOptions::default()
-    };
-    let mask = auto_outer_score_subsample(&z, Some(&stratum), &capped)
+    let mask = auto_outer_score_subsample(&z, Some(&stratum), SURVIVAL_WORK_PER_K_UNIT)
         .expect("capped subsample should still install at large-scale n");
     let k = mask.len();
     let expected_work_capped_k = (AUTO_OUTER_WORK_BUDGET / SURVIVAL_WORK_PER_K_UNIT) as usize;
@@ -212,16 +199,11 @@ fn h3a_uncapped_vs_capped_subsample_size_ratio_is_about_10x() {
         .collect();
     let stratum: Vec<u8> = (0..LARGE_SCALE_N).map(|i| (i & 1) as u8).collect();
 
-    let uncapped = AutoOuterSubsampleOptions::default();
-    let k_uncapped = auto_outer_score_subsample(&z, Some(&stratum), &uncapped)
+    let k_uncapped = auto_outer_score_subsample(&z, Some(&stratum), 1)
         .expect("uncapped default still installs at large-scale n")
         .len();
 
-    let capped = AutoOuterSubsampleOptions {
-        outer_work_per_k_unit: SURVIVAL_WORK_PER_K_UNIT,
-        ..AutoOuterSubsampleOptions::default()
-    };
-    let k_capped = auto_outer_score_subsample(&z, Some(&stratum), &capped)
+    let k_capped = auto_outer_score_subsample(&z, Some(&stratum), SURVIVAL_WORK_PER_K_UNIT)
         .expect("capped install at large-scale n")
         .len();
 

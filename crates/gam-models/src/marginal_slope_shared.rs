@@ -5,7 +5,7 @@
 //!
 //! At large scale (n ≥ tens of thousands) the outer rho-gradient is
 //! a sum-over-rows trace whose per-row cost is dominated by the cubic
-//! cell-moment kernel. The pieces here — [`AutoOuterSubsampleOptions`],
+//! cell-moment kernel. The pieces here — [`auto_outer_target_k`],
 //! [`auto_outer_score_subsample`], [`maybe_install_auto_outer_subsample`],
 //! and [`build_outer_score_subsample`] — implement a stratified
 //! Horvitz–Thompson estimator that replaces the full row sum with an
@@ -795,7 +795,7 @@ const fn splitmix64(state: &mut u64) -> u64 {
     gam_linalg::utils::splitmix64(state)
 }
 
-/// Configuration for the automatic outer-score subsampler.
+/// Noise floor on the automatic outer-score subsample size `K`.
 ///
 /// At large scale (n ≥ tens of thousands) the marginal-slope outer
 /// rho-gradient computes a sum-over-rows trace
@@ -818,50 +818,20 @@ const fn splitmix64(state: &mut u64) -> u64 {
 /// `σ(T̂)/T ≈ (1/√K) · √(1 − K/N) · cv_within`
 /// where `cv_within` is the within-stratum coefficient of variation.
 ///
-/// The defaults are tuned so that the relative gradient-noise σ stays
-/// below ≈ 1 % across realistic `n` ∈ [30 000, 300 000+], assuming
-/// `cv_within ≲ 1` (which holds for marginal-slope contributions
-/// because the z-decile stratification absorbs the dominant
-/// inhomogeneity).
-#[derive(Clone, Debug)]
-pub struct AutoOuterSubsampleOptions {
-    /// Floor on `K`, so the relative gradient noise stays bounded
-    /// even when the target fraction would round to a smaller `K`.
-    /// `K = max(min_k, round(n · target_fraction))`. Default 10 000
-    /// gives `σ/T ≤ 1 %` for cv_within ≤ 1 whenever this noise target, not
-    /// the work budget, sets `K`.
-    pub min_k: usize,
-    /// Target ratio `K / n` once `n ≫ min_k`. Default 0.10.
-    pub target_fraction: f64,
-    /// RNG seed for stratified mask construction. Default
-    /// `0xA075_8AMP_LE_5UB5` (deterministic across runs at the same
-    /// `n`, so CRN holds across BFGS iterations).
-    pub seed: u64,
-    /// Family-supplied **per-unit-of-K** outer-derivative work cost.
-    ///
-    /// Despite the historical name, this is *not* a per-row quantity.
-    /// It is `predicted_outer_gradient_work / K` evaluated at the
-    /// family's reference operating point — i.e. how many work units
-    /// each additional row in the K-subsample contributes summed over
-    /// all n. The auto schedule caps `K` by
-    /// `K_work = AUTO_OUTER_WORK_BUDGET / outer_work_per_k_unit`,
-    /// guaranteeing a single outer evaluation never exceeds
-    /// [`AUTO_OUTER_WORK_BUDGET`] work units regardless of the
-    /// noise-only target. Default `1` (no effective work cap beyond
-    /// `K ≤ n`); families with measurable per-K cost (survival
-    /// marginal-slope, BMS) overwrite at the call site.
-    ///
-    /// Calibration recipe: from a profiled run,
-    ///     outer_work_per_k_unit = predicted_gradient_work / K.
-    /// For the large-scale survival marginal-slope reference
-    /// (predicted_gradient_work ≈ 4.33×10⁹ at K=19_661), this gives
-    /// ~220_000; we use 250_000 as a conservative upper bound. With
-    /// `AUTO_OUTER_WORK_BUDGET = 5×10⁸` that caps K at ~2_000.
-    pub outer_work_per_k_unit: u64,
-    /// Absolute floor on the chosen K after the noise/work caps are combined.
-    /// Default [`AUTO_OUTER_MIN_K_FLOOR`].
-    pub min_k_floor: usize,
-}
+/// The noise target `K = max(AUTO_OUTER_MIN_K, round(n · AUTO_OUTER_TARGET_FRACTION))`
+/// keeps the relative gradient-noise σ below ≈ 1 % across realistic
+/// `n` ∈ [30 000, 300 000+], assuming `cv_within ≲ 1` (which holds for
+/// marginal-slope contributions because the z-decile stratification absorbs
+/// the dominant inhomogeneity). 10 000 gives `σ/T ≤ 1 %` for cv_within ≤ 1
+/// whenever this noise target, not the work budget, sets `K`.
+const AUTO_OUTER_MIN_K: usize = 10_000;
+
+/// Target ratio `K / n` of the noise rule once `n ≫ AUTO_OUTER_MIN_K`.
+const AUTO_OUTER_TARGET_FRACTION: f64 = 0.10;
+
+/// Seed of the stratified mask. One fixed seed makes the mask deterministic at
+/// a given `n`, so common random numbers hold across outer iterations.
+const AUTO_OUTER_SUBSAMPLE_SEED: u64 = 0xA075_8A8B_1ED5_5B5C;
 
 /// Half-billion outer-derivative work units per evaluation. Picked so the
 /// rigid survival marginal-slope pilot Newton cycle (which previously ran
@@ -899,19 +869,7 @@ impl AutoOuterCapReason {
     }
 }
 
-impl Default for AutoOuterSubsampleOptions {
-    fn default() -> Self {
-        Self {
-            min_k: 10_000,
-            target_fraction: 0.10,
-            seed: 0xA075_8A8B_1ED5_5B5C,
-            outer_work_per_k_unit: 1,
-            min_k_floor: AUTO_OUTER_MIN_K_FLOOR,
-        }
-    }
-}
-
-/// Outcome of [`AutoOuterSubsampleOptions::target_k_detailed`]: the
+/// Outcome of [`auto_outer_target_k`]: the
 /// chosen `K`, the underlying noise-only choice, the work-budget cap,
 /// and which constraint won.
 #[derive(Clone, Copy, Debug)]
@@ -922,56 +880,62 @@ pub struct AutoOuterKChoice {
     pub cap_reason: AutoOuterCapReason,
 }
 
-impl AutoOuterSubsampleOptions {
-    /// Compute the K that this configuration would pick for a given n.
-    /// Returns `None` when the combined noise, work and floor rule would keep
-    /// every row (caller should not subsample).
-    pub fn target_k(&self, n: usize) -> Option<usize> {
-        self.target_k_detailed(n).map(|choice| choice.k)
+/// The automatic outer-score subsample size for `n` rows, with the noise-only
+/// `K`, the work-budget cap, and which constraint set the final value.
+/// [`maybe_install_auto_outer_subsample`] reports the `cap_reason` in the
+/// auto-subsample log line.
+///
+/// Only the per-K work cost is family-specific. `outer_work_per_k_unit` is
+/// *not* a per-row quantity: it is `predicted_outer_gradient_work / K` at the
+/// family's reference operating point, i.e. how many work units each
+/// additional row in the K-subsample contributes summed over all n. The cap
+/// `K_work = AUTO_OUTER_WORK_BUDGET / outer_work_per_k_unit` guarantees a
+/// single outer evaluation never exceeds [`AUTO_OUTER_WORK_BUDGET`] work
+/// units regardless of the noise-only target. A cost of 1 leaves no effective
+/// work cap beyond `K ≤ n`.
+///
+/// Calibration recipe: from a profiled run,
+///     outer_work_per_k_unit = predicted_gradient_work / K.
+/// For the large-scale survival marginal-slope reference
+/// (predicted_gradient_work ≈ 4.33×10⁹ at K=19_661), this gives
+/// ~220_000; that family uses 250_000 as a conservative upper bound. With
+/// `AUTO_OUTER_WORK_BUDGET = 5×10⁸` that caps K at ~2_000.
+///
+/// Returns `None` when the combined noise, work and floor rule would keep
+/// every row (the caller should not subsample).
+pub fn auto_outer_target_k(n: usize, outer_work_per_k_unit: u64) -> Option<AutoOuterKChoice> {
+    let k_noise_raw = ((n as f64) * AUTO_OUTER_TARGET_FRACTION).round() as usize;
+    let k_noise = k_noise_raw.max(AUTO_OUTER_MIN_K);
+    let work_per_k = outer_work_per_k_unit.max(1);
+    let k_work_u64 = AUTO_OUTER_WORK_BUDGET / work_per_k;
+    let k_work = usize::try_from(k_work_u64).unwrap_or(usize::MAX);
+    // Combine noise + work + n + floor in a single comparison so we
+    // can attribute the binding constraint exactly once.
+    let mut k = k_noise.min(k_work);
+    let mut cap_reason = if k_work < k_noise {
+        AutoOuterCapReason::Work
+    } else {
+        AutoOuterCapReason::Noise
+    };
+    if k < AUTO_OUTER_MIN_K_FLOOR {
+        k = AUTO_OUTER_MIN_K_FLOOR;
+        cap_reason = AutoOuterCapReason::Floor;
     }
-
-    /// Same as `target_k` but also reports the noise-only `K`, the
-    /// work-budget cap, and which constraint set the final value. Used by
-    /// [`maybe_install_auto_outer_subsample`] to surface a `cap_reason`
-    /// in the auto-subsample log line.
-    pub fn target_k_detailed(&self, n: usize) -> Option<AutoOuterKChoice> {
-        let k_noise_raw = ((n as f64) * self.target_fraction).round() as usize;
-        let k_noise = k_noise_raw.max(self.min_k);
-        // Work-budget cap. `outer_work_per_k_unit == 1` is the
-        // default-1-work-unit signal that the family has not measured
-        // its per-K cost, in which case the work cap is `WORK_BUDGET`
-        // and typically dominated by `n`.
-        let work_per_k = self.outer_work_per_k_unit.max(1);
-        let k_work_u64 = AUTO_OUTER_WORK_BUDGET / work_per_k;
-        let k_work = usize::try_from(k_work_u64).unwrap_or(usize::MAX);
-        // Combine noise + work + n + floor in a single comparison so we
-        // can attribute the binding constraint exactly once.
-        let mut k = k_noise.min(k_work);
-        let mut cap_reason = if k_work < k_noise {
-            AutoOuterCapReason::Work
-        } else {
-            AutoOuterCapReason::Noise
-        };
-        if k < self.min_k_floor {
-            k = self.min_k_floor;
-            cap_reason = AutoOuterCapReason::Floor;
-        }
-        if k > n {
-            k = n;
-            cap_reason = AutoOuterCapReason::NFull;
-        }
-        if k >= n {
-            // Borderline: the auto schedule would cover the whole
-            // dataset. Subsampling buys nothing.
-            return None;
-        }
-        Some(AutoOuterKChoice {
-            k,
-            k_noise,
-            k_work,
-            cap_reason,
-        })
+    if k > n {
+        k = n;
+        cap_reason = AutoOuterCapReason::NFull;
     }
+    if k >= n {
+        // Borderline: the auto schedule would cover the whole
+        // dataset. Subsampling buys nothing.
+        return None;
+    }
+    Some(AutoOuterKChoice {
+        k,
+        k_noise,
+        k_work,
+        cap_reason,
+    })
 }
 
 /// Build a stratified outer-score subsample automatically from problem
@@ -985,14 +949,15 @@ impl AutoOuterSubsampleOptions {
 ///
 /// The returned mask carries proper Horvitz–Thompson weights so that
 /// `Σ_{i ∈ mask} weight_i · row_i` is an unbiased estimate of the
-/// full row sum.
+/// full row sum. `outer_work_per_k_unit` is the family's per-K work cost
+/// (see [`auto_outer_target_k`]).
 pub fn auto_outer_score_subsample(
     z: &[f64],
     stratum_secondary: Option<&[u8]>,
-    options: &AutoOuterSubsampleOptions,
+    outer_work_per_k_unit: u64,
 ) -> Option<OuterScoreSubsample> {
     let n = z.len();
-    let k = options.target_k(n)?;
+    let k = auto_outer_target_k(n, outer_work_per_k_unit)?.k;
     let secondary_storage;
     let secondary: &[u8] = if let Some(s) = stratum_secondary {
         if s.len() != n {
@@ -1004,7 +969,12 @@ pub fn auto_outer_score_subsample(
         secondary_storage = vec![0u8; n];
         &secondary_storage
     };
-    Some(build_outer_score_subsample(z, secondary, k, options.seed))
+    Some(build_outer_score_subsample(
+        z,
+        secondary,
+        k,
+        AUTO_OUTER_SUBSAMPLE_SEED,
+    ))
 }
 
 /// Two-phase auto-subsample guard shared across marginal-slope families.
@@ -1051,13 +1021,9 @@ pub fn maybe_install_auto_outer_subsample(
     // small-n no-op here would otherwise force a redundant second optimization.
     // Only the family's measured per-K work cost is family-specific. The noise
     // target, the floor and the no-benefit rule (`K ≥ n` keeps every row) are
-    // the shared defaults, so no caller can switch the row measure or its
+    // shared constants, so no caller can switch the row measure or its
     // budgets at a row-count window (#2897).
-    let auto_options = AutoOuterSubsampleOptions {
-        outer_work_per_k_unit: outer_work_per_k_unit.max(1),
-        ..AutoOuterSubsampleOptions::default()
-    };
-    let choice = auto_options.target_k_detailed(z.len())?;
+    let choice = auto_outer_target_k(z.len(), outer_work_per_k_unit)?;
     let phase_idx = {
         let mut guard = last_rho
             .lock()
@@ -1114,7 +1080,7 @@ pub fn maybe_install_auto_outer_subsample(
         }
         return None;
     }
-    let mask = auto_outer_score_subsample(z, stratum_secondary, &auto_options)?;
+    let mask = auto_outer_score_subsample(z, stratum_secondary, outer_work_per_k_unit)?;
     let n_full = mask.n_full;
     let k = mask.len();
     log::info!(
@@ -1984,10 +1950,9 @@ mod tests {
     fn auto_outer_score_subsample_skips_small_problems() {
         let n = 1000;
         let z: Vec<f64> = (0..n).map(|i| i as f64).collect();
-        let opts = AutoOuterSubsampleOptions::default();
         assert!(
-            auto_outer_score_subsample(&z, None, &opts).is_none(),
-            "n={n}: the noise target K = min_k keeps every row, so nothing is subsampled"
+            auto_outer_score_subsample(&z, None, 1).is_none(),
+            "n={n}: the noise target K = AUTO_OUTER_MIN_K keeps every row, so nothing is subsampled"
         );
     }
 
@@ -1995,10 +1960,9 @@ mod tests {
     fn auto_outer_score_subsample_returns_target_k_above_threshold() {
         let n = 60_000;
         let z: Vec<f64> = (0..n).map(|i| (i as f64).sin()).collect();
-        let opts = AutoOuterSubsampleOptions::default();
-        let mask = auto_outer_score_subsample(&z, None, &opts)
-            .expect("n=60000 should auto-subsample with default options");
-        // Default target_fraction=0.10 and min_k=10000 → K = max(10000, 6000) = 10000.
+        let mask = auto_outer_score_subsample(&z, None, 1)
+            .expect("n=60000 should auto-subsample without a work cap");
+        // AUTO_OUTER_TARGET_FRACTION=0.10 and AUTO_OUTER_MIN_K=10000 → K = max(10000, 6000) = 10000.
         assert_eq!(mask.n_full, n);
         assert!(
             mask.len() >= 9_900 && mask.len() <= 10_200,
@@ -2115,13 +2079,9 @@ mod tests {
             .map(|i| ((i as f64) / n as f64) * 2.0 - 1.0)
             .collect();
         let stratum: Vec<u8> = (0..n).map(|i| if i % 3 == 0 { 1 } else { 0 }).collect();
-        let opts = AutoOuterSubsampleOptions {
-            seed: 0xC0FFEE,
-            ..AutoOuterSubsampleOptions::default()
-        };
         let t: Vec<f64> = z.iter().map(|zi| zi * zi + 1.0).collect();
         let exact: f64 = t.iter().sum();
-        let mask = auto_outer_score_subsample(&z, Some(&stratum), &opts)
+        let mask = auto_outer_score_subsample(&z, Some(&stratum), 1)
             .expect("n=50000 should auto-subsample");
         let estimate: f64 = mask.rows.iter().map(|r| r.weight * t[r.index]).sum();
         // Predicted standard error: σ ≈ (1/√K) · √(1 − K/N) · cv · |T|.
