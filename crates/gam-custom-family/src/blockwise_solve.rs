@@ -2415,6 +2415,40 @@ pub(crate) fn strict_solve_spd_with_lm_continuation(
     )
 }
 
+/// Eigenpairs of a Laplace precision `M = H + S_λ (+ H_Φ)` that its generalized
+/// log-determinant `log|M|₊` sums and its pseudo-inverse `M⁺` spans.
+///
+/// `log|M|₊` may drop only `ker(M) = ker(H) ∩ ker(S_λ)`. A precision that a
+/// strict, unjittered Cholesky certifies positive definite has no such
+/// direction, so every eigenpair is kept and `log|M|₊` is the ordinary `log|M|`
+/// (the certificate #2888 uses for posterior inverses). The relative cutoff
+/// `positive_eigenvalue_threshold` is `100·p·ε·max σ`, so one stiff direction
+/// lifts it above genuine curvature. On the #1569 survival location-scale
+/// fixture (job 445401) `max σ = 7.788e16` put it at `4.5e4`: the
+/// pseudo-determinant kept between 1 and 15 of 26 eigenvalues while the
+/// smallest was `0.013`–`0.5`, and each eigenvalue crossing the cutoff moves
+/// `½·log|M|₊` by `½·ln 4.5e4 ≈ 5.4` with no counterpart in the trace gradient
+/// (#2695). Only a precision the certificate refuses, singular or indefinite,
+/// falls back to that cutoff.
+pub(crate) fn laplace_precision_kept_eigenpairs(
+    precision: &Array2<f64>,
+    eigenvalues: &[f64],
+) -> Vec<usize> {
+    let certified_positive_definite = eigenvalues.iter().all(|&eigenvalue| eigenvalue > 0.0)
+        && gam_linalg::utils::certified_spd_factorize(
+            precision,
+            "Laplace precision log-determinant",
+        )
+        .is_ok();
+    if certified_positive_definite {
+        return (0..eigenvalues.len()).collect();
+    }
+    let threshold = positive_eigenvalue_threshold(eigenvalues);
+    (0..eigenvalues.len())
+        .filter(|&index| eigenvalues[index] > threshold)
+        .collect()
+}
+
 /// Exact pseudo-Laplace log-determinant `log|H + S_λ|` of the REML/LAML
 /// objective, computed from the eigenspectrum with **no δ-ridge** so the value
 /// stays on the same objective as the analytic gradient `tr((H+S_λ)⁻¹ ·)`
@@ -2434,12 +2468,12 @@ pub(crate) fn strict_solve_spd_with_lm_continuation(
 ///   (a non-stationary inner β or a mis-signed curvature block); rejecting it
 ///   tells the outer optimizer to step back, instead of masking it with a
 ///   biased finite number;
-/// - sum `Σ_{λ > tol} log λ` — the exact pseudo-logdet on the positive
-///   eigenspace, which is `C∞` in ρ because the positive eigenspace of a PSD
-///   `S(ρ)=Σ e^{ρ_k} S_k` is structurally fixed. A near-zero band `[−tol, tol]`
-///   (a structural null space) is simply not in `range` and contributes no
-///   term, matching the projected `tr` derivative; a near-singular-but-positive
-///   curvature is accepted exactly as the historical Cholesky strict path did.
+/// - sum `log λ` over the eigenpairs [`laplace_precision_kept_eigenpairs`]
+///   keeps: all of them when a strict Cholesky certifies the matrix positive
+///   definite, otherwise those above the relative cutoff. A structural null
+///   space contributes no term, matching the projected `tr` derivative; a
+///   near-singular-but-positive curvature is accepted exactly as the
+///   historical Cholesky strict path did.
 pub(crate) fn strict_exact_pseudo_logdet(
     matrix: &Array2<f64>,
     accumulation_depth: usize,
@@ -2462,9 +2496,9 @@ pub(crate) fn strict_exact_pseudo_logdet(
     // `−neg_tol` is a genuine negative curvature (non-stationary β / mis-signed
     // block) and is rejected, not masked (gam#748).
     let neg_tol = (10.0 * eps_np * max_abs_eval).max(100.0 * eps);
-    // POSITIVE-eigenspace inclusion cutoff for the pseudo-logdet sum. This MUST
-    // be byte-identical to the cutoff the analytic REML gradient's trace kernel
-    // uses (`positive_eigenvalue_threshold`, the `range(H+Sλ)` Moore–Penrose
+    // POSITIVE-eigenspace inclusion for the pseudo-logdet sum. This MUST be the
+    // same kept set the analytic REML gradient's trace kernel uses
+    // (`laplace_precision_kept_eigenpairs`, the `range(H+Sλ)` Moore–Penrose
     // pinv drop in `joint_penalty_subspace_trace_parts`), or the LAML VALUE
     // `½ log|H+Sλ|₊` and its analytic GRADIENT `½ tr((H+Sλ)⁺ ∂Sλ)` are evaluated
     // over DIFFERENT subspaces and describe DIFFERENT objectives — the "mixing
@@ -2478,13 +2512,11 @@ pub(crate) fn strict_exact_pseudo_logdet(
     // the gradient kernel, so the analytic outer gradient is the derivative of a
     // different objective than the value. ARC's predicted descent then never
     // matches the actual objective change and the outer optimizer freezes
-    // (constant ‖g‖, stuck cost — gam#808). Sharing the kernel's threshold here
-    // removes the desync at the source; both are `C∞` in ρ (the positive
-    // eigenspace of a PSD-shifted Hessian is structurally fixed).
+    // (constant ‖g‖, stuck cost — gam#808). Sharing the kernel's rule here
+    // removes the desync at the source.
     let evals_slice = evals.as_slice().ok_or_else(|| {
         "strict pseudo-laplace logdet: the eigenvalue array is not contiguous".to_string()
     })?;
-    let pos_tol = positive_eigenvalue_threshold(evals_slice);
     if evals.iter().any(|&ev| ev < -neg_tol) {
         let min_eval = evals.iter().copied().fold(f64::INFINITY, f64::min);
         let below = evals.iter().filter(|&&ev| ev < -neg_tol).count();
@@ -2496,11 +2528,9 @@ pub(crate) fn strict_exact_pseudo_logdet(
             ),
         });
     }
-    Ok(evals
-        .iter()
-        .copied()
-        .filter(|&ev| ev > pos_tol)
-        .map(f64::ln)
+    Ok(laplace_precision_kept_eigenpairs(&sym, evals_slice)
+        .into_iter()
+        .map(|index| evals[index].ln())
         .sum())
 }
 

@@ -473,6 +473,33 @@ pub(crate) fn joint_penalty_subspace_trace_matches_projected_logdet_derivative()
 }
 
 #[test]
+pub(crate) fn joint_penalty_subspace_logdet_keeps_weak_curvature_beside_a_stiff_direction_2695() {
+    // One stiff direction lifts the relative cutoff `100·p·ε·max σ` to 6.7e3,
+    // far above the two weak but genuine curvatures beside it. `M` is positive
+    // definite, so `log|M|₊` is the ordinary log-determinant, the kernel spans
+    // all of it, and the strict value route prices the same number (#2695).
+    let ranges = vec![(0, 3)];
+    let penalties = vec![array![[0.0, 0.0, 0.0], [0.0, 0.5, 0.0], [0.0, 0.0, 0.0]]];
+    let h = array![[1.0e17, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 0.0, 0.25]];
+    let (logdet, kernel) = joint_penalty_subspace_trace_parts(
+        &JointHessianSource::Dense(h.clone()),
+        &ranges,
+        &penalties,
+        3,
+        0.0,
+        None,
+        None,
+    )
+    .expect("projection parts build");
+    let kernel = kernel.expect("a positive-definite precision has a kernel");
+    assert_eq!(kernel.u_s.ncols(), 3);
+    let expected = 1.0e17_f64.ln() + 0.5_f64.ln() + 0.25_f64.ln();
+    assert_relative_eq!(logdet, expected, epsilon = 1e-10);
+    let strict = strict_exact_pseudo_logdet(&(&h + &penalties[0]), 3).expect("strict logdet");
+    assert_relative_eq!(strict, expected, epsilon = 1e-10);
+}
+
+#[test]
 pub(crate) fn joint_outer_gradient_uses_projected_trace_for_rank_deficient_penalty() {
     let ranges = vec![(0, 3)];
     let rho = array![0.0];

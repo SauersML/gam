@@ -2105,17 +2105,14 @@ pub(crate) fn joint_penalty_subspace_trace_parts(
     let m_slice = m_evals
         .as_slice()
         .expect("eigh returns an owned standard-layout eigenvalue vector");
-    let m_threshold = positive_eigenvalue_threshold(m_slice);
-    let logdet = exact_pseudo_logdet(m_slice, m_threshold);
+    let kept = laplace_precision_kept_eigenpairs(&m, m_slice);
+    let logdet: f64 = kept.iter().map(|&eig_idx| m_evals[eig_idx].ln()).sum();
     // Full Moore–Penrose pseudo-inverse `M⁺` (drop ker(H+Sλ)) in spectral
     // form: kept eigenvectors as the kernel basis, diag(1/σ) as the reduced
     // kernel. In this basis `h_proj_inverse = (U_Mᵀ M U_M)⁻¹ = diag(1/σ)`
     // exactly, so every `PenaltySubspaceTrace` consumer evaluates the one
     // true `tr(M⁺ ·)` / `M⁺`-bilinear — exact for penalty-supported AND
     // null(Sλ)-leaking drifts alike (#901).
-    let kept: Vec<usize> = (0..total)
-        .filter(|&eig_idx| m_evals[eig_idx] > m_threshold)
-        .collect();
     if kept.is_empty() {
         return Ok((0.0, None));
     }

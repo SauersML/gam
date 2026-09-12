@@ -60,7 +60,6 @@ pub(crate) use gam_solve::estimate::reml::reml_outer_engine::{
     compute_block_penalty_logdet_derivs,
     compute_efs_update,
     compute_hybrid_efs_update,
-    exact_pseudo_logdet,
     hessian_factorization_geometric_scale,
     positive_eigenvalue_threshold,
 };
