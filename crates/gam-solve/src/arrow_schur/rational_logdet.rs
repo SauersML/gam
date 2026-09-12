@@ -1581,4 +1581,60 @@ mod tests {
         assert_eq!(iterations, 2);
     }
 
+    #[test]
+    fn injected_shifted_solver_preserves_value_and_derivative_authority_2515() {
+        let diagonal = array![0.4, 2.0, 9.0];
+        let matvec = |v: ArrayView1<f64>| &diagonal * &v;
+        let plan = RationalLogdetPlan::build(3, 3, 2515, 0.4, 9.0, 1.0e-9)
+            .expect("frozen rational plan");
+
+        let cg = plan
+            .evaluate(&matvec, 1.0e-13, 128)
+            .expect("plain-CG evaluation");
+        let injected = plan
+            .evaluate_with_shifted_solver(&|shift, rhs, _| {
+                Some((
+                    Array1::from_iter(
+                        rhs.iter()
+                            .enumerate()
+                            .map(|(index, value)| value / (diagonal[index] + shift)),
+                    ),
+                    0,
+                ))
+            })
+            .expect("injected exact shifted solves");
+
+        let value_scale = cg.estimate.abs().max(injected.estimate.abs()).max(1.0);
+        assert!(
+            (cg.estimate - injected.estimate).abs() <= 1.0e-10 * value_scale,
+            "changing only the shifted solver changed the frozen rational value: \
+             cg={:.17e}, injected={:.17e}",
+            cg.estimate,
+            injected.estimate
+        );
+        assert!(cg.cg_iterations > 0, "plain CG must report actual work");
+        assert_eq!(
+            injected.cg_iterations, 0,
+            "the caller's solve accounting must be preserved"
+        );
+
+        let direction = array![0.2, -0.3, 0.7];
+        let dmatvec = |v: ArrayView1<f64>| &direction * &v;
+        let cg_derivative = plan
+            .directional_derivative(&cg, &dmatvec)
+            .expect("CG derivative");
+        let injected_derivative = plan
+            .directional_derivative(&injected, &dmatvec)
+            .expect("injected derivative");
+        let derivative_scale = cg_derivative
+            .abs()
+            .max(injected_derivative.abs())
+            .max(1.0);
+        assert!(
+            (cg_derivative - injected_derivative).abs() <= 1.0e-10 * derivative_scale,
+            "changing only the shifted solver changed the derivative of the frozen \
+             rational value: cg={cg_derivative:.17e}, \
+             injected={injected_derivative:.17e}"
+        );
+    }
 }
