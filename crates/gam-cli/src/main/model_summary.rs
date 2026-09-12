@@ -182,7 +182,7 @@ pub(crate) fn build_model_summary(
 /// Rebuild `Vb` from a saved fit that persisted only the penalized Hessian.
 ///
 /// The two CLI entry points below both need this fallback, and both used to
-/// hand-roll it as `from_factorized_hessian(H)` — which is `φ = 1` and *no*
+/// hand-roll it as `from_factorized_hessian_scaled(H, 1.0)` — which is `φ = 1` and *no*
 /// constrained correction. That is not `Vb` for either of the two reasons the
 /// library's own fallback (`gam-predict`'s `conditional_prediction_backend`)
 /// handles:

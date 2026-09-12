@@ -90,27 +90,12 @@ pub struct AffineDesign {
     /// Covariances in exactly `coefficient_frame`; definitions are never
     /// silently substituted when one is unavailable.
     pub covariances: AffineCovariances,
-    /// Relationship of `∂η/∂β` to `matrix`; read it through
-    /// `AffineDesign::eta_gradient_matrix`.
+    /// Relationship of `∂η/∂β` to `matrix`. The operator that pairs with
+    /// `covariances` (`Var(η) = G · V · Gᵀ`) is `matrix` for
+    /// `AffineEtaGradient::Design` and the stored gradient for
+    /// `AffineEtaGradient::Distinct`; for a fitted link wiggle the value
+    /// operator's Mean block is missing the warp slope `dq/dq0`.
     pub eta_gradient: AffineEtaGradient,
-}
-
-impl AffineDesign {
-    /// `∂η/∂β` at the fitted coefficients, in exactly `coefficient_frame`.
-    ///
-    /// This — not [`AffineDesign::matrix`] — is the operator that pairs with
-    /// `covariances`: `Var(η) = G · V · Gᵀ`, and a coefficient contrast `c`
-    /// moves the fitted predictor by `G · c`.  For a predictor that is linear
-    /// in its coefficients the two coincide; for a fitted link wiggle the
-    /// value operator's Mean block is missing the warp slope `dq/dq0`, so
-    /// using it for variance would silently disagree with the standard errors
-    /// `predict` reports.
-    pub fn eta_gradient_matrix(&self) -> &DesignMatrix {
-        match &self.eta_gradient {
-            AffineEtaGradient::Design => &self.matrix,
-            AffineEtaGradient::Distinct(gradient) => gradient,
-        }
-    }
 }
 
 fn fitted_covariances(fit: &gam_solve::estimate::UnifiedFitResult) -> AffineCovariances {
@@ -267,9 +252,9 @@ pub fn affine_design_unavailable_reason(model: &FittedModel) -> Result<Option<St
 ///
 /// The returned value operator satisfies `offset + matrix·β̂ == η̂` exactly, but
 /// for a link-wiggle fit it is NOT `∂η/∂β`: the warp index itself moves with
-/// the Mean coefficients. Variance and contrast math must use
-/// `AffineDesign::eta_gradient_matrix`, which is built by the same authority
-/// the predict standard-error path uses.
+/// the Mean coefficients. Variance and contrast math must use the operator that
+/// `AffineDesign::eta_gradient` names, which is built by the same authority the
+/// predict standard-error path uses.
 pub fn fitted_standard_affine_design(
     model: &FittedModel,
     input: &PredictInput,

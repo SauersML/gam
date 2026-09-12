@@ -72,8 +72,8 @@
 //! Either way the predict path consumes `q̂` through the opt-in
 //! `conformal_level` field on
 //! `gam_predict::PredictUncertaintyOptions`, which calls
-//! `ConformalCalibrator::apply_to_uncertainty_result` to overwrite the
-//! model-based response-scale bounds with the conformal ones.
+//! `ConformalCalibrator::calibrated_interval` to replace the model-based
+//! response-scale bounds with the conformal ones.
 //!
 //! # Response scale vs. link scale
 //!
@@ -98,7 +98,6 @@
 //! about `Y` directly rather than relying on a delta-method linearization that
 //! the coverage proof does not need.
 
-use crate::PredictUncertaintyResult;
 use crate::interval_policy::ResponseBounds;
 use gam_math::quantile::order_statistic;
 use gam_models::family_runtime::FamilyStrategy;
@@ -259,7 +258,7 @@ impl ConformalCalibrator {
     /// derived from the model's own predict-time response-scale standard error
     /// `s_i = s(x_cal_i)` — the SAME scale source and transform applied at test
     /// time by
-    /// `Self::apply_to_uncertainty_result`. With those scores the exact
+    /// `Self::calibrated_interval`. With those scores the exact
     /// order-statistic multiplier `q̂` gives finite-sample marginal coverage
     /// `P(Y ∈ μ̂(x) ± q̂·s_eff(x)) ≥ 1 − α` (Vovk et al.; Romano, Patterson &
     /// Candès 2019), provided the calibration and test points are exchangeable
@@ -389,24 +388,6 @@ impl ConformalCalibrator {
             upper[i] = bounds.clamp_value(mean[i] + half);
         }
         Ok((lower, upper))
-    }
-
-    /// Overwrite the response-scale bounds of a model-based
-    /// [`PredictUncertaintyResult`] with the conformal interval, using the
-    /// result's own `mean` and `mean_standard_error` (the same response-scale
-    /// SE source the calibration scales came from). This is the real
-    /// predict-path application: the model-based point/SE are kept, only the
-    /// `mean_lower` / `mean_upper` bounds become the conformal ones.
-    pub fn apply_to_uncertainty_result(
-        &self,
-        result: &mut PredictUncertaintyResult,
-        bounds: ResponseBounds,
-    ) -> Result<(), EstimationError> {
-        let (lower, upper) =
-            self.calibrated_interval(&result.mean, &result.mean_standard_error, bounds)?;
-        result.mean_lower = lower;
-        result.mean_upper = upper;
-        Ok(())
     }
 }
 

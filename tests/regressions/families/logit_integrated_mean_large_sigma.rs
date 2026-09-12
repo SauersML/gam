@@ -5,7 +5,7 @@
 //! integral. The scalar dispatcher routes large-sigma cases through a
 //! Monahan-Stefanski probit approximation (mode `ControlledAsymptotic`) whose
 //! error is ~1e-1 in absolute terms — far outside any reasonable tolerance for
-//! a function used by `predict_gam_posterior_mean` on binomial-logit models.
+//! a function used by posterior-mean prediction on binomial-logit models.
 //!
 //! Reference: dense composite-Simpson quadrature over +/-18 sigma. The
 //! reference is independently validated (FD of the mean matches the analytic

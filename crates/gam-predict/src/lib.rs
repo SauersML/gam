@@ -465,19 +465,6 @@ impl ObservationScaleHints {
         Self::from_likelihood_scale(fit.likelihood_scale.clone())
     }
 
-    pub fn with_phi(phi: f64) -> Self {
-        Self {
-            observation_phi: positive_finite(Some(phi)),
-            observation_theta: None,
-        }
-    }
-
-    pub fn with_theta(theta: f64) -> Self {
-        Self {
-            observation_phi: None,
-            observation_theta: positive_finite(Some(theta)),
-        }
-    }
 }
 
 fn positive_finite(value: Option<f64>) -> Option<f64> {
@@ -2081,29 +2068,6 @@ where
 ///
 /// For nonlinear links, returns E[g^{-1}(eta_tilde)] where eta_tilde ~ N(eta_hat, se_eta^2).
 /// For Gaussian identity, this equals the standard plug-in mean.
-pub fn predict_gam_posterior_mean<X>(
-    x: X,
-    beta: ArrayView1<'_, f64>,
-    offset: ArrayView1<'_, f64>,
-    family: LikelihoodSpec,
-    covariance: ArrayView2<'_, f64>,
-) -> Result<PredictPosteriorMeanResult, EstimationError>
-where
-    X: Into<DesignMatrix>,
-{
-    let x = x.into();
-    let backend = PredictionCovarianceBackend::from_dense(covariance.view());
-    let strategy = strategy_for_spec(&family);
-    predict_gam_posterior_mean_from_backend(
-        x,
-        beta,
-        offset,
-        &backend,
-        &strategy,
-        "predict_gam_posterior_mean",
-    )
-}
-
 pub fn predict_gam_posterior_meanwith_backend<X>(
     x: X,
     beta: ArrayView1<'_, f64>,
@@ -2123,34 +2087,6 @@ where
         backend,
         &strategy,
         "predict_gam_posterior_meanwith_backend",
-    )
-}
-
-/// Nonlinear posterior-mean prediction with link-state support for SAS/mixture families.
-///
-/// This mirrors `predict_gam_posterior_mean`, but also uses `fit` metadata for
-/// link families that require extra state (`BinomialSas`, `BinomialMixture`).
-pub fn predict_gam_posterior_meanwith_fit<X>(
-    x: X,
-    beta: ArrayView1<'_, f64>,
-    offset: ArrayView1<'_, f64>,
-    family: LikelihoodSpec,
-    covariance: ArrayView2<'_, f64>,
-    fit: &UnifiedFitResult,
-) -> Result<PredictPosteriorMeanResult, EstimationError>
-where
-    X: Into<DesignMatrix>,
-{
-    let x = x.into();
-    let backend = PredictionCovarianceBackend::from_dense(covariance.view());
-    let strategy = strategy_from_fit(&family, fit)?;
-    predict_gam_posterior_mean_from_backend(
-        x,
-        beta,
-        offset,
-        &backend,
-        &strategy,
-        "predict_gam_posterior_meanwith_fit",
     )
 }
 
@@ -3363,15 +3299,6 @@ where
             .zip(response_var.iter())
             .map(|(&se, &var)| (se.powi(2) + var).sqrt()),
     ))
-}
-
-/// Coefficient-level uncertainty and confidence intervals.
-pub fn coefficient_uncertainty(
-    fit: &UnifiedFitResult,
-    confidence_level: f64,
-    covariance_mode: InferenceCovarianceMode,
-) -> Result<CoefficientUncertaintyResult, EstimationError> {
-    coefficient_uncertaintywith_mode(fit, confidence_level, covariance_mode)
 }
 
 /// Coefficient-level uncertainty and confidence intervals with explicit covariance mode.

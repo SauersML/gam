@@ -2273,7 +2273,7 @@ fn nonlinear_saved_model_with_hessian_only_remains_persistable_and_predictable()
 /// that matters: the ambient `1/2` is 2.75× the truncated variance, so an
 /// interval built from it is far too wide and its lower endpoint crosses the
 /// very wall the fit was constrained by. Before the fix
-/// `covariance_from_model` built its backend with `from_factorized_hessian`,
+/// `covariance_from_model` built its backend from the bare factorized Hessian,
 /// which passes no correction, and returned exactly the ambient `0.5`.
 #[test]
 fn hessian_only_saved_model_reports_the_truncated_covariance_on_an_active_face() {
