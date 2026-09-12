@@ -1404,16 +1404,30 @@ pub(crate) fn try_tangent_projected_evaluate(
                         // certificate prices the stationarity curvature. Report both
                         // spectra on the full space and on the face.
                         let smallest_eigenvalue = |matrix: &Array2<f64>| {
-                            DenseSpectralOperator::from_symmetric(matrix).ok().map(|operator| {
-                                operator.raw_spectrum().iter().copied().fold(f64::INFINITY, f64::min)
-                            })
+                            match DenseSpectralOperator::from_symmetric(matrix) {
+                                Ok(operator) => Some(
+                                    operator.raw_spectrum().iter().copied().fold(f64::INFINITY, f64::min),
+                                ),
+                                Err(error) => {
+                                    log::info!("[979-FACE-LOGDET] spectrum unavailable: {error}");
+                                    None
+                                }
+                            }
                         };
-                        let value_full =
-                            solution.hessian_op.assemble_h_dense_for_tangent_projection().ok();
-                        let value_min = value_full.as_ref().and_then(|matrix| smallest_eigenvalue(matrix));
-                        let value_tangent_min = value_full
-                            .as_ref()
-                            .and_then(|matrix| smallest_eigenvalue(&z.t().dot(matrix).dot(&z)));
+                        let (value_min, value_tangent_min) =
+                            match solution.hessian_op.assemble_h_dense_for_tangent_projection() {
+                                Ok(matrix) => (
+                                    smallest_eigenvalue(&matrix),
+                                    smallest_eigenvalue(&z.t().dot(&matrix).dot(&z)),
+                                ),
+                                Err(error) => {
+                                    log::info!(
+                                        "[979-FACE-LOGDET] log-determinant operator has no dense \
+                                         assembly: {error}"
+                                    );
+                                    (None, None)
+                                }
+                            };
                         let true_min = smallest_eigenvalue(&response_full);
                         let true_tangent_min = smallest_eigenvalue(&z.t().dot(&response_full).dot(&z));
                         log::info!(
