@@ -2443,29 +2443,6 @@ impl crate::row_kernel::RowKernel<SLS_ROW_K> for SurvivalLsRowKernel<'_> {
         }
     }
 
-    fn row_fifth_contracted_all_axes(
-        &self,
-        row: usize,
-        direction_u: &[f64; SLS_ROW_K],
-        direction_v: &[f64; SLS_ROW_K],
-    ) -> Result<[[[f64; SLS_ROW_K]; SLS_ROW_K]; SLS_ROW_K], String> {
-        match self.row_nll_fifth_inputs_opt(row)? {
-            Some((primary, kernel, fifth)) => Ok(std::array::from_fn(|axis| {
-                let mut direction_w = [0.0; SLS_ROW_K];
-                direction_w[axis] = 1.0;
-                sls_row_fifth_generated(
-                    &primary,
-                    &kernel,
-                    &fifth,
-                    direction_u,
-                    direction_v,
-                    &direction_w,
-                )
-            })),
-            None => Ok([[[0.0; SLS_ROW_K]; SLS_ROW_K]; SLS_ROW_K]),
-        }
-    }
-
     fn jacobian_action(&self, row: usize, d_beta: &[f64]) -> [f64; SLS_ROW_K] {
         let d_beta = ndarray::ArrayView1::from(d_beta);
         let d_time = d_beta.slice(s![self.offsets[0]..self.offsets[1]]);
@@ -2712,6 +2689,31 @@ impl crate::row_kernel::RowKernel<SLS_ROW_K> for SurvivalLsRowKernel<'_> {
                 })
                 .collect::<Result<Vec<_>, String>>()
         })())
+    }
+}
+
+impl crate::row_kernel::RowKernelFifth<SLS_ROW_K> for SurvivalLsRowKernel<'_> {
+    fn row_fifth_contracted_all_axes(
+        &self,
+        row: usize,
+        direction_u: &[f64; SLS_ROW_K],
+        direction_v: &[f64; SLS_ROW_K],
+    ) -> Result<[[[f64; SLS_ROW_K]; SLS_ROW_K]; SLS_ROW_K], String> {
+        match self.row_nll_fifth_inputs_opt(row)? {
+            Some((primary, kernel, fifth)) => Ok(std::array::from_fn(|axis| {
+                let mut direction_w = [0.0; SLS_ROW_K];
+                direction_w[axis] = 1.0;
+                sls_row_fifth_generated(
+                    &primary,
+                    &kernel,
+                    &fifth,
+                    direction_u,
+                    direction_v,
+                    &direction_w,
+                )
+            })),
+            None => Ok([[[0.0; SLS_ROW_K]; SLS_ROW_K]; SLS_ROW_K]),
+        }
     }
 }
 

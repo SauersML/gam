@@ -266,24 +266,6 @@ pub trait RowKernel<const K: usize>: gam_math::jet_tower::RowProgram<K> + Send +
         gam_math::jet_tower::program_fourth_contracted(self, row, dir_u, dir_v)
     }
 
-    /// Fifth-order contracted derivative along every primary axis:
-    /// `∂⁵ℓ_i / (∂p_z ∂p_a ∂p_b ∂[dir_u] ∂[dir_v])`, indexed `[z][a][b]`.
-    ///
-    /// Returns the K×K×K tensor of fifth derivatives contracted with two
-    /// primary-space directions. Used for the third directional derivative of
-    /// the Hessian a Jeffreys-augmented REML outer Hessian reads. The default
-    /// declines: a kernel whose row program lowers no fifth order has no such
-    /// channel, and a family declaring the third information derivative
-    /// available must override it.
-    fn row_fifth_contracted_all_axes(
-        &self,
-        _row: usize,
-        _dir_u: &[f64; K],
-        _dir_v: &[f64; K],
-    ) -> Result<[[[f64; K]; K]; K], String> {
-        Err("row kernel lowers no fifth-order contracted derivative".to_string())
-    }
-
     /// Optional warm-up hook: triggers any per-row caches the kernel keeps for
     /// `row_third_contracted` / `row_fourth_contracted`. Called by
     /// [`RowKernelHessianWorkspace::new`] **before** the outer ext-coordinate
@@ -1237,18 +1219,38 @@ pub fn row_kernel_second_directional_derivative_all_axes<const K: usize>(
         .collect::<Result<Vec<_>, _>>()
 }
 
+/// A row kernel whose row program lowers the fifth order.
+///
+/// Only a family that declares the third information derivative available has
+/// this channel. It is therefore a separate capability, not a declining default
+/// on [`RowKernel`].
+pub trait RowKernelFifth<const K: usize>: RowKernel<K> {
+    /// Fifth-order contracted derivative along every primary axis:
+    /// `∂⁵ℓ_i / (∂p_z ∂p_a ∂p_b ∂[dir_u] ∂[dir_v])`, indexed `[z][a][b]`.
+    ///
+    /// Returns the K×K×K tensor of fifth derivatives contracted with two
+    /// primary-space directions. Used for the third directional derivative of
+    /// the Hessian a Jeffreys-augmented REML outer Hessian reads.
+    fn row_fifth_contracted_all_axes(
+        &self,
+        row: usize,
+        dir_u: &[f64; K],
+        dir_v: &[f64; K],
+    ) -> Result<[[[f64; K]; K]; K], String>;
+}
+
 /// Batched all-axes third directional derivative of the Hessian: with
 /// `d_beta_u` and `d_beta_v` fixed and the third direction sweeping every
 /// canonical axis `e_a`, return the `p` dense matrices
 /// `{H³dot[d_beta_u, d_beta_v, e_a]}_{a=0..p}`.
 ///
 /// Each row's fifth-order derivative contracted with the fixed pair is built
-/// once through [`RowKernel::row_fifth_contracted_all_axes`]; every axis then
+/// once through [`RowKernelFifth::row_fifth_contracted_all_axes`]; every axis then
 /// contracts that tensor with the row Jacobian's column `J_i e_a` and pulls the
 /// K×K result back, so the row program runs once per row, not once per axis.
 /// Per-row contributions are HT-weighted.
 pub fn row_kernel_third_directional_derivative_all_axes<const K: usize>(
-    kern: &(impl RowKernel<K> + ?Sized + Sync),
+    kern: &(impl RowKernelFifth<K> + ?Sized + Sync),
     rows: &RowSet,
     d_beta_u: &[f64],
     d_beta_v: &[f64],
