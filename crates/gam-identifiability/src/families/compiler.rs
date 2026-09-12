@@ -1583,23 +1583,6 @@ impl CompiledMap {
     pub fn p_compiled(&self) -> usize {
         self.raw_from_compiled.ncols()
     }
-
-    /// The rows of `T` belonging to raw block `b` (`T[raw_block_ranges[b], :]`,
-    /// shape `p_b_raw × p_compiled`). A raw-block penalty `S_b` acts only on
-    /// these raw columns, so the penalty's reduced-coordinate form depends on
-    /// `T` only through this slice.
-    fn raw_block_rows(&self, block_idx: usize) -> Result<Array2<f64>, String> {
-        let range = self.raw_block_ranges.get(block_idx).ok_or_else(|| {
-            format!(
-                "CompiledMap::raw_block_rows: block {block_idx} out of range {}",
-                self.raw_block_ranges.len()
-            )
-        })?;
-        Ok(self
-            .raw_from_compiled
-            .slice(s![range.start..range.end, ..])
-            .to_owned())
-    }
 }
 
 /// Per-block exact orthogonal reparameterisation of structural confounds.

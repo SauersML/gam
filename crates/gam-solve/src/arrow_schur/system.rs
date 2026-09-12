@@ -1724,56 +1724,6 @@ impl StreamingArrowSchur {
     }
 }
 
-pub(crate) fn apply_analytic_penalty<S, G, D, P, H>(
-    penalty: &AnalyticPenaltyKind,
-    target: ArrayView1<'_, f64>,
-    rho_local: ArrayView1<'_, f64>,
-    expected_target_len: usize,
-    hvp_columns: usize,
-    scatter_target: &mut S,
-    mut grad_scatter: G,
-    mut diag_scatter: D,
-    seed_hvp_probe: P,
-    mut hvp_column_scatter: H,
-) where
-    G: FnMut(&mut S, usize, f64),
-    D: FnMut(&mut S, usize, f64),
-    P: Fn(usize, &mut Array1<f64>),
-    H: for<'a> FnMut(&mut S, usize, ArrayView1<'a, f64>),
-{
-    assert_eq!(target.len(), expected_target_len);
-
-    let grad = penalty.grad_target(target, rho_local);
-    for index in 0..expected_target_len {
-        grad_scatter(scatter_target, index, grad[index]);
-    }
-
-    // The scattered curvature lands in the arrow-Schur `H_tt` / `H_ββ` blocks,
-    // which are Cholesky-factored (with LM ridge escalation) as the Newton /
-    // PIRLS curvature operator and must therefore stay PSD. Nonconvex
-    // sparsifiers (log sparsity, JumpReLU) have an *indefinite* exact Hessian
-    // that would destroy that positive-definiteness, so we scatter the PSD
-    // majorizer here — never the exact `hessian_diag` / `hvp`. For convex
-    // penalties the majorizer equals the exact Hessian (the trait default
-    // delegates), so this is exact for them. Exact-derivative consumers (the
-    // outer objective Hessian) use `hessian_diag` / `hvp` directly elsewhere.
-    if let Some(diag) = penalty.psd_majorizer_diag(target, rho_local) {
-        assert_eq!(diag.len(), expected_target_len);
-        for index in 0..expected_target_len {
-            diag_scatter(scatter_target, index, diag[index]);
-        }
-        return;
-    }
-
-    let mut probe = Array1::<f64>::zeros(expected_target_len);
-    for column in 0..hvp_columns {
-        probe.fill(0.0);
-        seed_hvp_probe(column, &mut probe);
-        let hv = penalty.psd_majorizer_hvp(target, rho_local, probe.view());
-        hvp_column_scatter(scatter_target, column, hv.view());
-    }
-}
-
 /// Per-row + Schur Cholesky factor cache produced by
 /// [`solve_arrow_newton_step_with_options`]. Consumed downstream by the IFT warm-start
 /// predictor in `crate::persistent_warm_start`: when the outer

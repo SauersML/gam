@@ -1737,7 +1737,6 @@
   {
     "base": "48ee099d449adba3ae8d68e36d36ec8755996f98",
     "items": [
-      "crates/gam-identifiability/src/families/compiler.rs:fn:raw_block_rows",
       "crates/gam-identifiability/src/families/gpu.rs:const:CHANNELS",
       "crates/gam-identifiability/src/families/gpu.rs:const:PACKED_LEN",
       "crates/gam-identifiability/src/families/gpu.rs:fn:assign_block",
@@ -1765,11 +1764,10 @@
       "crates/gam-identifiability/src/families/gpu_kernel.rs:const:KERNEL_SRC",
       "crates/gam-identifiability/src/families/gpu_kernel.rs:const:TILE_A",
       "crates/gam-identifiability/src/families/gpu_kernel.rs:const:TILE_B",
-      "crates/gam-identifiability/src/families/gpu_kernel.rs:fn:kernel_src_declares_expected_symbol",
-      "crates/gam-solve/src/arrow_schur/system.rs:fn:apply_analytic_penalty"
+      "crates/gam-identifiability/src/families/gpu_kernel.rs:fn:kernel_src_declares_expected_symbol"
     ],
     "reason": "Fix-forward for main's compile break. 0904dd2a2 (gam-identifiability) deleted build_primary_grams_gpu_or_cpu, the only production caller of families::gpu::try_primary_state_gram_cuda, which left the whole GPU gram path in families/gpu.rs and families/gpu_kernel.rs and CompiledMap::raw_block_rows unreferenced. e3b50feaf (gam-solve) deleted add_analytic_penalty_contributions, the only caller of apply_analytic_penalty, and 0b5288b44 removed its sibling helpers but not it. Under warnings = deny every orphan is a build error. Both modules are deleted with their mod lines and tests, along with raw_block_rows, apply_analytic_penalty and the prelude import only it used.",
-    "evidence": "MSI job 422887 at a5a7b96ba: cargo check --workspace --exclude gam-pyffi --all-targets rc 101, 19 dead-code errors in gam-identifiability (GramBundle, CHANNELS, PACKED_LEN, packed_index, try_primary_state_gram_cuda, WorkspaceInner and its methods, weighted_gemm, plain_gemm, from_col_major, assign_block, symmetrise, KERNEL_NAME, TILE_A, TILE_B, KERNEL_SRC, raw_block_rows) plus 4 in gam-solve arrow_schur. Pre-push candidate over 5e967c204 (job 424523): the same check rc 0 in 1m42s. Guard and census over 5e967c204..bccd377e7 (lane-local candidate) list exactly these guarded identities and a loss of the four in-file tests of the deleted modules; no issue-pinned test is removed."
+    "evidence": "MSI job 422887 at a5a7b96ba: cargo check --workspace --exclude gam-pyffi --all-targets rc 101, 19 dead-code errors in gam-identifiability (GramBundle, CHANNELS, PACKED_LEN, packed_index, try_primary_state_gram_cuda, WorkspaceInner and its methods, weighted_gemm, plain_gemm, from_col_major, assign_block, symmetrise, KERNEL_NAME, TILE_A, TILE_B, KERNEL_SRC, raw_block_rows) plus 4 in gam-solve arrow_schur. Pre-push candidate over 5e967c204 (job 424523): the same check rc 0 in 1m42s. Guard and census over 5e967c204..bccd377e7 (lane-local candidate) list exactly these guarded identities and a loss of the four in-file tests of the deleted modules; no issue-pinned test is removed. Correction: c4c012c93 itself removed only the 28 gpu.rs/gpu_kernel.rs identities; a zsh `$VAR:l` modifier in the landing script dropped the four edited files from its index, so raw_block_rows and apply_analytic_penalty are removed, and acknowledged, in the follow-up push."
   },
   {
     "base": "c4c012c93228f4613f2641542c732fdbdd0deb48",
@@ -1810,5 +1808,14 @@
     ],
     "reason": "user directive: delete all useless slop",
     "evidence": "Every removed production item was named only by tests or by other removed items at the push base: the #2576 preconditioner study, shift-ladder profile and their carriers, the shifted-PCG trace machinery only the profile consumed, the resident exact-diagonal instrument and its preconditioner (whose only caller was the study), evaluate_preconditioned (called only from the study), matrix_free_arrow_inverse_apply and is_non_pd_schur_complement (tests only). Items are the guard's own inventory of this push's changed files; the live rendered-verdict pin keeps a test-local value oracle. MSI compile, doc, guard and census verification run on the landed sha."
+  },
+  {
+    "base": "0b6aac49b0b0fdd362fa95270afbf4f88cd3b938",
+    "items": [
+      "crates/gam-identifiability/src/families/compiler.rs:fn:raw_block_rows",
+      "crates/gam-solve/src/arrow_schur/system.rs:fn:apply_analytic_penalty"
+    ],
+    "reason": "Completes the fix-forward for main's compile break. c4c012c93 deleted families/gpu.rs and gpu_kernel.rs and recorded the ledger, but its landing script dropped the four edited files. families/mod.rs still declared both modules (file not found), and raw_block_rows and apply_analytic_penalty were still dead. This push lands those four files: the mod lines, raw_block_rows, apply_analytic_penalty and the prelude import only it used.",
+    "evidence": "The four blobs are byte-identical (md5) to the candidate that compiled workspace-wide over 5e967c204 (MSI job 424523, rc 0); none of those paths changed between 48ee099d4 and this base. The two identities are the guard's own output for that candidate."
   }
 ]
