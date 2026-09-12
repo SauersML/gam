@@ -1,21 +1,21 @@
-//! #2023 acceptance measurement at K=2000, unblocked by the #2275 best-effort
-//! completion path.
+//! #2023 acceptance measurement at K=2000.
 //!
-//! Before #2275, `fit_tiered` hard-errored when Tier-1's frame fixed point did not
-//! certify — which it never does at `K ≫ intrinsic-rank` — so this measurement was
-//! impossible (Tier-2 never ran). With the best-effort path Tier-1 returns its best
-//! fixed point with an OPEN certificate and Tier-2 runs on its residual, so we can
-//! finally report the three #2023 acceptance numbers at scale:
+//! Fits the linear bulk alone and the full tiered cadence on one planted corpus. Tier-1
+//! returns a certified frame fixed point, or its best fixed point with `certified =
+//! false` once the captured-fraction plateau holds (#2275), and refuses otherwise. A
+//! returned Tier-1 hands its residual to Tier-2, so the harness reports the three #2023
+//! acceptance numbers at scale:
 //!
 //! 1. **Certificate contents** — `frame_residual` vs `tolerance`,
 //!    how many of the `K` blocks stayed live (settled) vs fell dead.
 //! 2. **Held-out EV (Tier-1)** — fit the linear bulk on train, transform the held-out
 //!    split through the frozen decoder, reconstruct, and score EV against the shared
 //!    Tier-0 mean. This is the honest generalisation number (the Tier-1 lane has an
-//!    out-of-sample transform; the Tier-2 co-fit is in-sample, so its delta below is
-//!    reported in-sample and labelled as such).
-//! 3. **Tier-2-adds-EV** — in-sample composed EV (Tier-1 + curved co-fit on the
-//!    Tier-1 residual) minus the Tier-1-only EV on the same training corpus.
+//!    out-of-sample transform; the Tier-2 curved refinement is in-sample, so its delta
+//!    below is reported in-sample and labelled as such).
+//! 3. **Tier-2-adds-EV** — in-sample composed EV (Tier-1 + the curved support-sparse
+//!    refinement on the Tier-1 residual) minus the Tier-1-only EV on the same training
+//!    corpus.
 //!
 //! The corpus is a deterministic planted mixture of a linear bulk plus many curved
 //! (circle) factors — more circles than the block-TopK budget can host as full 2-D
@@ -53,8 +53,8 @@ impl Args {
 
 fn parse_args() -> Result<Args, String> {
     // Defaults: K = 1000 blocks x b=2 = 2000 atoms, block-TopK 8 (== 16 active scalar
-    // coords, the #2023 K=2000 comparison budget). N_train modest so the co-fit's
-    // chart compose over block pairs stays a moderate one-off runtime.
+    // coords, the #2023 K=2000 comparison budget). N_train modest so the curved
+    // Tier-2 refinement stays a moderate one-off runtime.
     let mut a = Args {
         train_rows: 8_192,
         test_rows: 2_048,
@@ -253,7 +253,7 @@ fn run() -> Result<(), String> {
         ev_t1_in, ev_t1_heldout
     );
 
-    // --- Tiered (Tier-1 + Tier-2 curved co-fit on the residual) ---
+    // --- Tiered (Tier-1 + Tier-2 curved support-sparse refinement on the residual) ---
     let mut tiered = TieredFitConfig::tiered(args.n_blocks, args.block_size);
     tiered.tier1_seed = TieredSeedPolicy::Auto;
     tiered.tier1.block_topk = args.block_topk;

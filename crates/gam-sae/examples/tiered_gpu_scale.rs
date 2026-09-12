@@ -3,7 +3,7 @@
 //!
 //! `scale_k` drives the STREAMING block-sparse lane directly; this harness drives
 //! the composed [`fit_tiered`] spine (Tier-0 mean → Tier-1 block-sparse bulk →
-//! optional Tier-2 curved co-fit) so the Tier-1 router is exercised through the
+//! optional Tier-2 curved support-sparse refinement) so the Tier-1 router is exercised through the
 //! same GPU dispatch a real tiered fit uses. The dispatch honours the
 //! process-wide [`gam_gpu::GpuPolicy`] this harness sets:
 //!
@@ -29,14 +29,10 @@
 //! # Seeding at high `K`
 //!
 //! [`fit_tiered`]'s Tier-1 seeds its `K` frames per the `TieredSeedPolicy` on the
-//! config (default `Auto`): below the serial farthest-point budget it uses the
-//! data-aware `O(N·P·K)` seed, and once that pass would dominate — as it does at
-//! the `K≈1e4` default width here — it switches to the cheap `O(K·b)`
-//! coordinate-partition seed (the same seed the streaming lane
-//! `examples/scale_k.rs` uses via `new_with_decoder`). So the serial seed is no
-//! longer the scaling wall: raise `--rows` toward the #2023 `N=1e5` target and the
-//! GPU route, not the seed pass, dominates the wall time. Device admission still
-//! depends on `minibatch·K` (not `N`), so routing engages at `K≈1e4` at any `N`.
+//! config. The default `Auto` is the linear-cost data-row seed at every width, so the
+//! serial farthest-point pass never runs unless a caller forces it, and `--rows` can be
+//! raised toward the #2023 `N=1e5` target. Device admission depends on `minibatch·K`
+//! (not `N`), so routing engages at `K≈1e4` at any `N`.
 
 use gam_sae::tiered::{TieredFitConfig, fit_tiered};
 use ndarray::Array2;
