@@ -2697,7 +2697,7 @@ pub(crate) fn run_outer_with_plan(
                         ));
                         continue 'seed_attempts;
                     }
-                    Err(FixedPointOuterRunError::IterationRejected(request)) => {
+                    Err(FixedPointOuterRunError::IterationRejected(mut request)) => {
                         log::warn!(
                             "[OUTER] {context}: EFS trial refused after {} finite iteration(s) \
                              at cost={:.6e}; continuing the exact incumbent with the \
@@ -2706,6 +2706,9 @@ pub(crate) fn run_outer_with_plan(
                             request.checkpoint.sample.value,
                             request.refusal,
                         );
+                        // The attempt's earlier seeds spent iterations too (#2817).
+                        request.checkpoint.iterations =
+                            request.checkpoint.iterations.saturating_add(spent_seed_iterations);
                         return Ok(PlanRunOutcome::FixedPointContinuationRequested(request));
                     }
                     Err(FixedPointOuterRunError::ImmediateFallback(request)) => {
@@ -2746,7 +2749,7 @@ pub(crate) fn run_outer_with_plan(
                         ));
                         continue 'seed_attempts;
                     }
-                    Err(FixedPointOuterRunError::IterationRejected(request)) => {
+                    Err(FixedPointOuterRunError::IterationRejected(mut request)) => {
                         log::warn!(
                             "[OUTER] {context}: HybridEFS trial refused after {} finite \
                              iteration(s) at cost={:.6e}; continuing the exact incumbent \
@@ -2755,6 +2758,9 @@ pub(crate) fn run_outer_with_plan(
                             request.checkpoint.sample.value,
                             request.refusal,
                         );
+                        // The attempt's earlier seeds spent iterations too (#2817).
+                        request.checkpoint.iterations =
+                            request.checkpoint.iterations.saturating_add(spent_seed_iterations);
                         return Ok(PlanRunOutcome::FixedPointContinuationRequested(request));
                     }
                     Err(FixedPointOuterRunError::ImmediateFallback(request)) => {

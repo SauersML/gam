@@ -8266,7 +8266,8 @@ pub(crate) fn run_outer_uncertified(
             attempt_config.seed_config.seed_budget = 1;
             log::info!(
                 "[OUTER] {context}: resuming {the_plan} first from the last finite {:?} \
-                 incumbent after {} iteration(s): cost={:.6e}, |step|={:.3e}, inner_beta={}",
+                 incumbent after {} iteration(s) of its plan attempt: cost={:.6e}, \
+                 |step|={:.3e}, inner_beta={}",
                 checkpoint.plan_used.solver,
                 checkpoint.iterations,
                 checkpoint.sample.value,
@@ -8359,8 +8360,8 @@ pub(crate) fn run_outer_uncertified(
                         .is_some_and(|next| matches!(plan(next).solver, Solver::Bfgs));
                     if !has_bfgs_fallback {
                         return Err(EstimationError::RemlOptimizationFailed(format!(
-                            "{context}: {:?} refused a trial after {} finite iteration(s) \
-                             at rho={} (cost={:.6e}), but no analytic-gradient BFGS \
+                            "{context}: {:?} refused a trial after {} iteration(s) of its \
+                             plan attempt at rho={} (cost={:.6e}), but no analytic-gradient BFGS \
                              continuation is declared: {}",
                             request.checkpoint.plan_used.solver,
                             request.checkpoint.iterations,
@@ -9142,7 +9143,8 @@ pub(crate) enum FixedPointOuterRunError {
 /// it does not return its still-finite incumbent on `ObjectiveFailed`.  This
 /// carrier preserves the exact optimizer state needed to continue with a
 /// different algorithm: outer point, criterion, proposed fixed-point step,
-/// fixed-point status, completed iteration count, plan, and the matching inner
+/// fixed-point status, the iterations its plan attempt completed (every seed the
+/// attempt started, this walk included), plan, and the matching inner
 /// coefficient state when the EFS producer supplied one.
 #[derive(Clone, Debug)]
 pub(crate) struct FixedPointContinuationCheckpoint {
