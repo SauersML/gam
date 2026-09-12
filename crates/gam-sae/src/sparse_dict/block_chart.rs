@@ -944,7 +944,7 @@ fn fit_whitening(coords: &Array2<f32>, ridge: f64) -> Result<Whitening, String> 
     for v in &mut cov {
         *v /= denom;
     }
-    let (vals, eigvec) = jacobi_eigh(cov, d)?;
+    let (vals, eigvec) = symmetric_eigh(cov, d)?;
     let max_eval = vals.iter().copied().fold(0.0, f64::max);
     if !(ridge.is_finite() && ridge >= 0.0) {
         return Err(format!(
@@ -1022,7 +1022,7 @@ fn pca_reconstruct(
     for v in &mut cov {
         *v /= denom;
     }
-    let (vals, eigvec) = jacobi_eigh(cov, d)?;
+    let (vals, eigvec) = symmetric_eigh(cov, d)?;
     let mut order = (0..d).collect::<Vec<_>>();
     order.sort_by(|&a, &b| {
         vals[b]
@@ -1049,59 +1049,19 @@ fn pca_reconstruct(
 }
 
 
-pub(crate) fn jacobi_eigh(mut a: Vec<f64>, n: usize) -> Result<(Vec<f64>, Vec<f64>), String> {
+/// Symmetric eigendecomposition of the row-major `n × n` matrix `a` through the
+/// workspace owner. Returns the eigenvalues and the eigenvectors as row-major
+/// columns: `vecs[j * n + k]` is component `j` of eigenvector `k`.
+pub(crate) fn symmetric_eigh(a: Vec<f64>, n: usize) -> Result<(Vec<f64>, Vec<f64>), String> {
+    use gam_linalg::faer_ndarray::FaerEigh;
     if a.len() != n * n {
-        return Err("jacobi_eigh: matrix length mismatch".to_string());
+        return Err("symmetric_eigh: matrix length mismatch".to_string());
     }
-    let mut v = vec![0.0; n * n];
-    for i in 0..n {
-        v[i * n + i] = 1.0;
-    }
-    for _ in 0..(64 * n.max(1) * n.max(1)) {
-        let mut p = 0usize;
-        let mut q = 0usize;
-        let mut max_off = 0.0;
-        for i in 0..n {
-            for j in (i + 1)..n {
-                let val = a[i * n + j].abs();
-                if val > max_off {
-                    max_off = val;
-                    p = i;
-                    q = j;
-                }
-            }
-        }
-        if max_off <= 1.0e-12 {
-            break;
-        }
-        let app = a[p * n + p];
-        let aqq = a[q * n + q];
-        let apq = a[p * n + q];
-        let tau = (aqq - app) / (2.0 * apq);
-        let t = tau.signum() / (tau.abs() + (1.0 + tau * tau).sqrt());
-        let c = 1.0 / (1.0 + t * t).sqrt();
-        let s = t * c;
-        for k in 0..n {
-            let akp = a[k * n + p];
-            let akq = a[k * n + q];
-            a[k * n + p] = c * akp - s * akq;
-            a[k * n + q] = s * akp + c * akq;
-        }
-        for k in 0..n {
-            let apk = a[p * n + k];
-            let aqk = a[q * n + k];
-            a[p * n + k] = c * apk - s * aqk;
-            a[q * n + k] = s * apk + c * aqk;
-        }
-        for k in 0..n {
-            let vkp = v[k * n + p];
-            let vkq = v[k * n + q];
-            v[k * n + p] = c * vkp - s * vkq;
-            v[k * n + q] = s * vkp + c * vkq;
-        }
-    }
-    let vals = (0..n).map(|i| a[i * n + i]).collect::<Vec<_>>();
-    Ok((vals, v))
+    let matrix = Array2::from_shape_vec((n, n), a).map_err(|error| error.to_string())?;
+    let (vals, vecs) = matrix
+        .eigh(faer::Side::Lower)
+        .map_err(|error| format!("symmetric_eigh: {error:?}"))?;
+    Ok((vals.to_vec(), vecs.iter().copied().collect()))
 }
 
 fn pair_score(z0: &Array2<f32>, z1: &Array2<f32>) -> Result<f64, String> {
@@ -1229,7 +1189,7 @@ fn coordinate_spectrum(coords: &Array2<f32>) -> Result<Vec<f64>, String> {
     for v in &mut cov {
         *v /= denom;
     }
-    let (vals, _) = jacobi_eigh(cov, d)?;
+    let (vals, _) = symmetric_eigh(cov, d)?;
     let mut spectrum = vals.into_iter().map(|v| v.max(0.0)).collect::<Vec<_>>();
     spectrum.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
     Ok(spectrum)

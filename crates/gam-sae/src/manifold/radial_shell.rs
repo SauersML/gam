@@ -23,9 +23,12 @@ pub(crate) fn radial_predict(train: &Array2<f64>, eval: &Array2<f64>) -> Array2<
         for j in 0..d {
             norm += eval[[i, j]] * eval[[i, j]];
         }
-        norm = norm.sqrt().max(1.0e-12);
-        for j in 0..d {
-            out[[i, j]] = radius * eval[[i, j]] / norm;
+        let norm = norm.sqrt();
+        // A zero row has no direction to project onto the shell; it stays zero.
+        if norm > 0.0 {
+            for j in 0..d {
+                out[[i, j]] = radius * eval[[i, j]] / norm;
+            }
         }
     }
     out
@@ -39,4 +42,24 @@ pub(crate) fn row_sse(a: &Array2<f64>, b: &Array2<f64>, row: usize) -> f64 {
         s += d * d;
     }
     s
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every nonzero row lands on the shell, however small; a zero row has no
+    /// direction and stays zero. A norm floor used to leave the small row far
+    /// inside the shell.
+    #[test]
+    fn radial_predict_projects_small_rows_onto_the_shell() {
+        let train = ndarray::array![[3.0, 4.0]];
+        let tiny = 2.0_f64.powi(-60);
+        let eval = ndarray::array![[3.0 * tiny, 4.0 * tiny], [0.0, 0.0]];
+        let out = radial_predict(&train, &eval);
+        assert_eq!(out[[0, 0]], 3.0);
+        assert_eq!(out[[0, 1]], 4.0);
+        assert_eq!(out[[1, 0]], 0.0);
+        assert_eq!(out[[1, 1]], 0.0);
+    }
 }

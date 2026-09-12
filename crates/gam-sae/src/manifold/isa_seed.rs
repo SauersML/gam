@@ -388,18 +388,22 @@ fn lcg_normal(state: &mut u64) -> f64 {
 pub(crate) fn orthonormalize2(w: &mut Array2<f64>) -> bool {
     let d = w.nrows();
     let n0: f64 = (0..d).map(|i| w[[i, 0]] * w[[i, 0]]).sum::<f64>().sqrt();
-    if !(n0 > 1e-12) {
+    if !(n0 > 0.0) {
         return false;
     }
     for i in 0..d {
         w[[i, 0]] /= n0;
     }
+    let original_n1: f64 = (0..d).map(|i| w[[i, 1]] * w[[i, 1]]).sum::<f64>().sqrt();
     let dot: f64 = (0..d).map(|i| w[[i, 0]] * w[[i, 1]]).sum();
     for i in 0..d {
         w[[i, 1]] -= dot * w[[i, 0]];
     }
     let n1: f64 = (0..d).map(|i| w[[i, 1]] * w[[i, 1]]).sum::<f64>().sqrt();
-    if !(n1 > 1e-12) {
+    // Normalizing the first column and removing it commit `3d + 1` roundings, so
+    // a residual inside that band of the second column's norm is parallel to the
+    // first to working precision.
+    if !(n1 > gam_linalg::roundoff::accumulation_growth(3 * d + 1) * original_n1) {
         return false;
     }
     for i in 0..d {
@@ -874,6 +878,10 @@ fn jacobi_init_state(
         let mut state = 0x2111_15A0_u64 ^ ((init as u64) << 32) ^ residual_rows as u64;
         let mut g = Array2::<f64>::from_shape_fn((r, r), |_| lcg_normal(&mut state));
         for c in 0..r {
+            let original: f64 = (0..r)
+                .map(|row| g[[row, c]] * g[[row, c]])
+                .sum::<f64>()
+                .sqrt();
             for prev in 0..c {
                 let mut dot = 0.0;
                 for row in 0..r {
@@ -889,7 +897,10 @@ fn jacobi_init_state(
                 nrm += g[[row, c]] * g[[row, c]];
             }
             let nrm = nrm.sqrt();
-            if nrm > 1e-12 {
+            // Removing `c` normalized columns commits `3r + 2` roundings per
+            // column, so a residual inside that band of the column's own norm is
+            // a column in the span of the previous ones to working precision.
+            if nrm > gam_linalg::roundoff::accumulation_growth(c * (3 * r + 2)) * original {
                 for row in 0..r {
                     g[[row, c]] /= nrm;
                 }
@@ -1193,6 +1204,22 @@ pub fn isa_deflationary_producer(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Rank deficiency is decided within the rounding band of the projection, not
+    /// by an absolute norm: two independent columns at `2⁻⁵⁰` scale still span a
+    /// plane, and a column parallel to the first is still refused.
+    #[test]
+    fn orthonormalize2_decides_rank_at_any_scale() {
+        let tiny = 2.0_f64.powi(-50);
+        let mut plane = ndarray::array![[1.0, 0.0], [1.0, 1.0], [0.0, 1.0]].mapv(|v| v * tiny);
+        assert!(orthonormalize2(&mut plane));
+        let dot: f64 = (0..3).map(|i| plane[[i, 0]] * plane[[i, 1]]).sum();
+        let n1: f64 = (0..3).map(|i| plane[[i, 1]] * plane[[i, 1]]).sum();
+        assert!(dot.abs() <= gam_linalg::roundoff::accumulation_growth(10));
+        assert!((n1 - 1.0).abs() <= gam_linalg::roundoff::accumulation_growth(10));
+        let mut parallel = ndarray::array![[1.0, 2.0], [1.0, 2.0], [0.0, 0.0]];
+        assert!(!orthonormalize2(&mut parallel));
+    }
 
     fn lcg_uniform(state: &mut u64) -> f64 {
         *state = state

@@ -623,6 +623,7 @@ fn fit_mass_weighted_line(
     // contributes ≈ nothing, exactly as in the joint loss.
     let mut w_sum = 0.0_f64;
     let mut t_bar = 0.0_f64;
+    let mut weighted_energy = 0.0_f64;
     for i in 0..n {
         let a = assign[i];
         if !(a.is_finite() && a >= 0.0) {
@@ -631,6 +632,7 @@ fn fit_mass_weighted_line(
         let w = a * a;
         w_sum += w;
         t_bar += w * coords[i];
+        weighted_energy += w * coords[i] * coords[i];
     }
     if !(w_sum > 0.0) {
         return Err(AtomCandidateRefusal::Unadjudicable);
@@ -649,7 +651,9 @@ fn fit_mass_weighted_line(
     // rank-1 "chord-through-the-arc" co-collapse). This is the SOLE refusal the
     // hybrid split rescues: the caller recovers a fresh linear image from the
     // residual's top direction. Every OTHER refusal is `Unadjudicable`.
-    if !(s_tt > 1e-12 * (1.0 + t_bar * t_bar)) {
+    // The weighted mean is resolved to `γ_{3n+1}·max|t|`, so a spread inside
+    // `γ_{3n+1}²·Σ w t²` is the rounding residue of a single point.
+    if !(s_tt > gam_linalg::roundoff::accumulation_growth(3 * n + 1).powi(2) * weighted_energy) {
         return Err(AtomCandidateRefusal::CoordinateCollapse);
     }
 
@@ -991,13 +995,16 @@ fn build_collapse_rescue_linear_image(
         mv.mapv_inplace(|x| x / vnorm);
         let cos = mv.dot(&v).abs();
         v = mv;
-        if cos > 1.0 - 1e-12 {
+        // Two unit vectors whose dot product sits inside its own rounding band
+        // `γ_p` of 1 are the same direction to working precision.
+        if 1.0 - cos <= gam_linalg::roundoff::accumulation_growth(p) {
             break;
         }
     }
     // Fresh per-row codes `uᵢ = yᵢ·v` and the weighted line fit against them.
     let mut u = Array1::<f64>::zeros(n);
     let mut t_bar = 0.0_f64;
+    let mut weighted_energy = 0.0_f64;
     for i in 0..n {
         let mut proj = 0.0_f64;
         for j in 0..p {
@@ -1005,6 +1012,7 @@ fn build_collapse_rescue_linear_image(
         }
         u[i] = proj;
         t_bar += assign[i] * assign[i] * proj;
+        weighted_energy += assign[i] * assign[i] * proj * proj;
     }
     t_bar /= w_sum;
     let mut s_tt = 0.0_f64;
@@ -1012,7 +1020,9 @@ fn build_collapse_rescue_linear_image(
         let dt = u[i] - t_bar;
         s_tt += assign[i] * assign[i] * dt * dt;
     }
-    if !(s_tt > 1e-12 * (1.0 + t_bar * t_bar)) {
+    // Each code is a `p`-term projection before the weighted centering, so a
+    // spread inside `γ_{p+3n+1}²·Σ w u²` is the rounding residue of one point.
+    if !(s_tt > gam_linalg::roundoff::accumulation_growth(p + 3 * n + 1).powi(2) * weighted_energy) {
         return None;
     }
     let mut b0 = Array1::<f64>::zeros(p);
@@ -1536,6 +1546,28 @@ where
 mod tests {
     use super::*;
     use std::f64::consts::PI;
+
+    /// A coordinate collapses to a single point only within the rounding residue
+    /// of its own centering, whatever its scale. At `2⁻³⁰` scale the spread is far
+    /// above that residue and the line fit proceeds; an absolute spread floor
+    /// reported it as a collapse. A genuinely constant coordinate still collapses.
+    #[test]
+    fn coordinate_collapse_is_scale_free() {
+        let n = 6;
+        let assign = Array1::<f64>::ones(n);
+        let mut y = Array2::<f64>::zeros((n, 2));
+        for row in 0..n {
+            y[[row, 0]] = row as f64;
+            y[[row, 1]] = 1.0;
+        }
+        let spread = Array1::from_iter((0..n).map(|row| row as f64 * 2.0_f64.powi(-30)));
+        assert!(fit_mass_weighted_line(spread.view(), assign.view(), y.view()).is_ok());
+        let constant = Array1::from_elem(n, 0.3);
+        assert!(matches!(
+            fit_mass_weighted_line(constant.view(), assign.view(), y.view()),
+            Err(AtomCandidateRefusal::CoordinateCollapse)
+        ));
+    }
 
     #[test]
     fn envelope_ratio_is_one_at_topm_linear_ceiling() {

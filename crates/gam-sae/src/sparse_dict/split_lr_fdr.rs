@@ -86,7 +86,7 @@
 use gam_terms::inference::structure_evidence::e_benjamini_hochberg;
 use ndarray::Array2;
 
-use super::block_chart::jacobi_eigh;
+use super::block_chart::symmetric_eigh;
 
 /// The FDR-controlled discovery certificate for one screened candidate family.
 #[derive(Clone, Debug)]
@@ -265,7 +265,7 @@ fn fit_ppca1(coords: &Array2<f64>, rows: &[usize], ridge: f64) -> Result<Ppca1, 
     for v in &mut cov {
         *v /= n as f64;
     }
-    let (vals, vecs) = jacobi_eigh(cov, q)?;
+    let (vals, vecs) = symmetric_eigh(cov, q)?;
     let mut order: Vec<usize> = (0..q).collect();
     order.sort_by(|&a, &b| {
         vals[b]
@@ -359,7 +359,7 @@ fn fit_ring(coords: &Array2<f64>, rows: &[usize], ridge: f64) -> Ring {
     for v in &mut cov {
         *v /= n as f64;
     }
-    let (vals, vecs) = match jacobi_eigh(cov, q) {
+    let (vals, vecs) = match symmetric_eigh(cov, q) {
         Ok(pair) => pair,
         Err(_) => (vec![0.0; q], identity_flat(q)),
     };
