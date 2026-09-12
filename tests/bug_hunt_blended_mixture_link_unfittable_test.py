@@ -28,24 +28,19 @@ threads the parsed components into ``mixture_link`` (and sets
 
 What this test guards
 ---------------------
-This test guards the WIRING fix, NOT full joint-solver convergence. After the
-fix the Python path no longer raises ``BinomialMixture requires mixture_link
-specification`` — it now reaches the same joint mixture solver the CLI reaches.
+The full contract of a blended-link fit on clean logit data:
 
-The joint mixture/SAS link solve is independently fragile (it can fail outer
-startup with "observed Hessian curvature is not positive finite" / "no candidate
-seeds passed outer startup validation"); making it converge is tracked as deeper
-solver work. So this test asserts EXACTLY the wiring contract:
+  * the Python path reaches the joint mixture solver instead of raising
+    ``BinomialMixture requires mixture_link specification`` (the wiring);
+  * the joint solve converges; and
+  * the fit recovers the signal (``corr(pred, true_p) > 0.95``).
 
-  * if the fit SUCCEEDS, we additionally require it to recover the signal
-    (``corr(pred, true_p) > 0.95``) — a genuine full-fix assertion; but
-  * the fit must, at minimum, NOT fail with the wiring-guard message. A
-    downstream solver/convergence failure is an ACCEPTED outcome here because it
-    proves the wiring guard was cleared and the solver was actually entered.
-
-If the wiring regresses (``mixture_link`` left ``None`` again), the immediate
-``BinomialMixture requires mixture_link specification`` abort returns and this
-test fails.
+A wiring regression and a solver failure fail with distinct messages. The joint
+mixture/SAS link solve has failed outer startup here ("observed Hessian
+curvature is not positive finite" / "no candidate seeds passed outer startup
+validation"). On this data each component fits trivially, so such a failure is
+an engine defect, and this test reports it red rather than skipping (SPEC: a
+failing test always indicates problematic behavior; no XFAIL).
 """
 
 from __future__ import annotations
@@ -61,9 +56,8 @@ pytest.importorskip("gamfit._rust")
 import gamfit
 
 # The wiring-guard message that must NOT appear once the Python path populates
-# FitOptions.mixture_link. Matching on this exact substring is what makes the
-# test a precise regression guard for the wiring fix rather than for the (still
-# fragile) downstream joint solve.
+# FitOptions.mixture_link. Matching on this exact substring tells a wiring
+# regression apart from a downstream joint-solve failure.
 _WIRING_GUARD_MSG = "BinomialMixture requires mixture_link specification"
 
 
@@ -95,19 +89,15 @@ def test_blended_mixture_link_reaches_solver_not_wiring_abort() -> None:
             "materializer must thread the components into mixture_link (parity "
             f"with the CLI). Full error: {msg}"
         )
-        # Reaching here means the wiring guard was cleared and the solver was
-        # entered; a downstream joint-solve / convergence failure is an accepted
-        # outcome for THIS test (it guards the wiring, not convergence). Document
-        # it loudly via skip so the parity fix is not mistaken for a full fix.
-        pytest.skip(
-            "wiring fix verified: blended-link fit reached the joint mixture "
-            "solver (no wiring abort). The joint solve itself did not converge "
-            f"on this data — deeper solver work, tracked separately: {msg}"
-        )
+        raise AssertionError(
+            "blended(logit, probit) fit reached the joint mixture solver but the "
+            "joint solve failed on clean logit data, where each component fits "
+            f"trivially: {msg}"
+        ) from exc
 
-    # Full-fix path: if the joint solve DID converge, hold it to recovering the
-    # signal. A clean logit signal under a logit/probit blend must track the true
-    # probabilities closely.
+    # The joint solve converged: hold it to recovering the signal. A clean logit
+    # signal under a logit/probit blend must track the true probabilities
+    # closely.
     pred = np.asarray(model.predict(df), dtype=float).reshape(-1)
     true_p = df["true_p"].to_numpy(dtype=float)
     corr = float(np.corrcoef(pred, true_p)[0, 1])

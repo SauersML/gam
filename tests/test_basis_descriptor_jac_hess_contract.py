@@ -232,10 +232,7 @@ def test_jacobian_contract_matches_fd_or_raises_notimplemented(name: str) -> Non
 
     RED for #233 (cylinder/torus) and #234 (duchon).
     """
-    try:
-        spec, coords = BUILDERS[name]()
-    except Exception as exc:  # construction issues are out-of-scope
-        pytest.skip(f"could not build {name}: {exc}")
+    spec, coords = BUILDERS[name]()
     _check_jacobian(spec, coords)
 
 
@@ -245,10 +242,7 @@ def test_hessian_contract_finite_or_raises_notimplemented(name: str) -> None:
 
     RED for #230 (bspline/matern).
     """
-    try:
-        spec, coords = BUILDERS[name]()
-    except Exception as exc:
-        pytest.skip(f"could not build {name}: {exc}")
+    spec, coords = BUILDERS[name]()
     _check_hessian(spec, coords)
 
 

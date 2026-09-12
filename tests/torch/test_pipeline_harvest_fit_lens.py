@@ -23,21 +23,14 @@ of #980:
   per-atom lens reports finite ``presence`` (> 0 for an active atom) *and* a
   finite ``coupling`` (the behavioral output-Fisher axis is available); the
   Euclidean run reports ``coupling`` as ``NaN`` (not available, not zero).
-* **Steering dosimetry (when reachable).** If a steer entry point is exposed
-  from the fitted payload, the path-integrated KL dose is checked against the
-  synthetic model's analytic KL. The steering primitive
-  (``gam::inference::steering::steer_delta``) is currently **Rust-only with no
-  FFI/Python surface**, so that arm is skeletoned and marked
-  ``xfail``-pending-FFI; see :func:`test_steer_dosimetry_against_analytic_kl`.
+* **Steering dosimetry.** The fitted model's ``steer`` entry point
+  (``ManifoldSAE.steer`` → ``gam-pyffi::sae_steer_delta``) drives the planted
+  atom a small latent step, and the endpoint output-Fisher dose is checked
+  against the synthetic model's analytic KL; see
+  :func:`test_steer_dosimetry_against_analytic_kl`.
 
-Run status (authored 2026-06-09, Actor D): torch is not installed in this
-environment and the installed gam extension predates the ``fisher_factors``
-parameter of ``sae_manifold_fit_minimal`` (it raises ``TypeError: ... got an
-unexpected keyword argument 'fisher_factors'``). These tests were therefore
-**authored by inspection** against the documented post-rebuild API; they are
-gated behind ``pytest.importorskip`` for torch + gamfit and will execute once
-Actor A's rebuilt extension lands. The harvest portion is exercised standalone
-by the sibling ``test_harvest.py`` (which passes).
+torch and gamfit are required (``pytest.importorskip``). The harvest portion is
+also exercised standalone by the sibling ``test_harvest.py``.
 
 Fixed seeds throughout; no clock entropy.
 """
@@ -436,7 +429,7 @@ def test_steer_dosimetry_against_analytic_kl(
 
 
 # ---------------------------------------------------------------------------
-# 5. #981 replicate-agreement skeleton — gated on Actor A's K=2 fixture
+# 5. #981 replicate agreement up to the residual gauge
 # ---------------------------------------------------------------------------
 #
 # Two replicate fits of the SAME data under two different seeds must agree
@@ -451,27 +444,14 @@ def test_steer_dosimetry_against_analytic_kl(
 #     reconstruction ``fitted`` (a gauge invariant) must match, while the raw
 #     latent coordinates may differ by the reported reparametrization.
 #
-# This is gated OFF until Actor A's K=2 fixture actually recovers structure: a
-# replicate-agreement assertion is only meaningful once both fits converge to
-# the same manifold (otherwise "agreement up to symmetry" is vacuous noise).
-# Flip ``_REPLICATE_FIXTURE_READY`` to True (and drop the skip) once that lands.
-
-_REPLICATE_FIXTURE_READY = False
+# The planted fixture is a single clean circle, so a fit that does not recover
+# it for both seeds is itself the defect this test reports (SPEC: no XFAIL).
 
 
-@pytest.mark.skipif(
-    not _REPLICATE_FIXTURE_READY,
-    reason=(
-        "#981 replicate-agreement: enable once Actor A's K=2 fixture recovers "
-        "structure. Two seeds must agree EXACTLY up to the reported residual "
-        "gauge group_signature and only up to that named symmetry; this is "
-        "vacuous until the fit actually recovers the planted manifold."
-    ),
-)
 def test_replicate_agreement_up_to_residual_gauge(planted_X: np.ndarray) -> None:
     """#981: two seeds agree exactly up to the reported residual-gauge group.
 
-    SKELETON. Fit the same data twice under two seeds and assert:
+    Fit the same data twice under two seeds and assert:
 
     1. ``group_signature`` equality — the two replicates report the *same*
        residual-gauge group (identical order-independent signature string);
@@ -497,6 +477,5 @@ def test_replicate_agreement_up_to_residual_gauge(planted_X: np.ndarray) -> None
     )
 
     # (2) Gauge-invariant reconstruction agrees across replicates; the raw
-    # coordinates are allowed to differ by exactly the reported symmetry. Once
-    # the K=2 fixture recovers structure this becomes a tight tolerance.
+    # coordinates are allowed to differ by exactly the reported symmetry.
     np.testing.assert_allclose(fit_a.fitted, fit_b.fitted, rtol=0.0, atol=1e-6)

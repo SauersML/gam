@@ -91,25 +91,19 @@ def test_sphere_basis_size_then_evaluate_consistent():
 
 
 def test_sphere_explicit_centers_round_trip_if_supported():
-    """If the API supports explicit centers, they must be respected and
-    must decouple basis size from eval row count. If the API does not
-    yet support ``centers=``, this test is skipped — but once supported,
-    it locks in the contract."""
-    try:
-        spec = gamfit.Sphere(n_centers=10)
-    except TypeError:
-        pytest.skip("Sphere does not yet support explicit-centers ctor")
-
-    explicit = getattr(spec, "centers", None)
-    if explicit is None:
-        pytest.skip(
-            "Sphere does not yet expose stored centers; once it does, "
-            "this test must lock in n_rows-independence."
-        )
-
+    """Explicit ``centers=`` are stored verbatim and decouple basis size from
+    eval row count: 10 supplied centers evaluated on 3 rows give a 3-row raw
+    design with one column per center (``basis_size + 1``, the sum-to-zero
+    constraint removing one), with no row-count requirement."""
     rng = np.random.default_rng(3)
+    centers = np.column_stack(
+        [rng.uniform(-60.0, 60.0, size=10), rng.uniform(-180.0, 180.0, size=10)]
+    )
+    spec = gamfit.Sphere(centers=centers)
+    np.testing.assert_array_equal(np.asarray(spec.centers, dtype=np.float64), centers)
+    assert spec.basis_size == 9
+
     lat = rng.uniform(-60.0, 60.0, size=3)  # far fewer rows than centers
     lon = rng.uniform(-180.0, 180.0, size=3)
     design = np.asarray(spec.evaluate(lat, lon, backend="numpy"))
-    assert design.shape[0] == 3
-    assert design.shape[1] >= 10
+    assert design.shape == (3, spec.basis_size + 1)
