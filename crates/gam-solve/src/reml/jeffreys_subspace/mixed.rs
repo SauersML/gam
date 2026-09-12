@@ -390,18 +390,38 @@ impl JeffreysHphiDriftBase {
         let e = directions[0].as_standard_layout();
         let e = e.as_slice().expect("standard-layout spectral direction");
         let table = &divided.triples[floor_order];
-        for (target, source) in output.chunks_exact_mut(squared).zip(input.chunks_exact(squared)) {
-            for i in 0..m {
-                for j in 0..m {
-                    let mut value = 0.0;
+        // `D²f[E, A]_ij = Σ_k T_ikj (E_ik A_kj + A_ik E_kj)` for every axis row `A`.
+        // Each row writes only its own output chunk, so the rows fan over rayon
+        // with no cross-row reduction. Inside a row the loop order is (i, k, j):
+        // for a fixed (i, k) the j sweep reads three contiguous rows and
+        // vectorizes. Every output entry still starts at 0.0 and adds its k terms
+        // in increasing k with the same operands, so each value is bit-identical
+        // to the strided (i, j, k) scalar loop this replaces, the largest
+        // drift-base self time on the rigid marginal-slope ψ gradient (#979).
+        use rayon::iter::{IndexedParallelIterator, ParallelIterator};
+        use rayon::slice::{ParallelSlice, ParallelSliceMut};
+        let rows_per_task = (1usize << 15).div_ceil(squared.saturating_mul(m)).max(1);
+        output
+            .par_chunks_exact_mut(squared)
+            .zip(input.par_chunks_exact(squared))
+            .with_min_len(rows_per_task)
+            .for_each(|(target, source)| {
+                for i in 0..m {
+                    let table_i = &table[i * squared..(i + 1) * squared];
+                    let target_i = &mut target[i * m..(i + 1) * m];
                     for k in 0..m {
-                        value += table[(i * m + k) * m + j]
-                            * (e[i * m + k] * source[k * m + j] + source[i * m + k] * e[k * m + j]);
+                        let (e_ik, source_ik) = (e[i * m + k], source[i * m + k]);
+                        for (((value, &coefficient), &source_kj), &e_kj) in target_i
+                            .iter_mut()
+                            .zip(&table_i[k * m..(k + 1) * m])
+                            .zip(&source[k * m..(k + 1) * m])
+                            .zip(&e[k * m..(k + 1) * m])
+                        {
+                            *value += coefficient * (e_ik * source_kj + source_ik * e_kj);
+                        }
                     }
-                    target[i * m + j] = value;
                 }
-            }
-        }
+            });
         out
     }
 
