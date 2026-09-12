@@ -3015,7 +3015,7 @@ pub(crate) fn fill_periodic_duchon_kernel_psi_matrices(
 ) -> Result<(Array2<f64>, Array2<f64>, Array2<f64>), BasisError> {
     let n = rows.nrows();
     let k = centers.nrows();
-    let kappa = 1.0 / length_scale.max(1e-300);
+    let kappa = duchon_inverse_length_scale(length_scale, "periodic Duchon psi kernel")?;
     let mut kernel = Array2::<f64>::zeros((n, k));
     let mut kernel_psi = Array2::<f64>::zeros((n, k));
     let mut kernel_psi_psi = Array2::<f64>::zeros((n, k));
@@ -3083,7 +3083,8 @@ pub(crate) fn build_periodic_duchon_basis_log_kappa_derivativeswithworkspace(
     // partial-fraction expansion uses). Validating the raw fractional power
     // would desync the well-posedness gate from the realized kernel.
     validate_duchon_kernel_orders(Some(length_scale), p_order, s_order as f64, 1)?;
-    let coeffs = duchon_partial_fraction_coeffs(p_order, s_order, 1.0 / length_scale.max(1e-300));
+    let kappa = duchon_inverse_length_scale(length_scale, "periodic Duchon psi derivatives")?;
+    let coeffs = duchon_partial_fraction_coeffs(p_order, s_order, kappa);
     let z_kernel = kernel_constraint_nullspace(
         centers.view(),
         effective_nullspace_order,
