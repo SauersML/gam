@@ -58,33 +58,74 @@ fn horner_polynomial(x: f64, coeffs: &[f64]) -> f64 {
     coeffs.iter().rev().fold(0.0, |acc, &c| acc * x + c)
 }
 
-/// Evaluate `(Σ_k coeffs[k]·x^k) · exp(−x)` without overflow.  For moderate
-/// `x ≤ 600` uses Horner + `exp(−x)` directly; for very large `x` rewrites
-/// `xᵈ · exp(−x) = exp(d·ln x − x)` and runs Horner in `1/x`, which keeps
-/// both the polynomial sum and its multiplier inside double range.  Returns
-/// `0.0` for non-finite `x` or empty `coeffs`.
+/// Evaluate `(Σ_k coeffs[k]·x^k) · exp(−x)` without overflowing an
+/// intermediate polynomial or underflowing its exponential factor. Ordinary
+/// inputs use Horner directly; extreme inputs carry Horner's signed magnitude
+/// in log space and include `exp(-x)` before the final exponentiation.
+/// Empty polynomials are zero; NaN inputs propagate, and infinite arguments
+/// use the polynomial's limiting sign.
 #[inline]
 pub fn stable_polynomial_times_exp_neg(x: f64, coeffs: &[f64]) -> f64 {
-    if coeffs.is_empty() || !x.is_finite() {
+    if coeffs.is_empty() {
         return 0.0;
     }
-    // Below this argument `(-x).exp()` is still well-resolved, so the direct
-    // Horner-times-exp form is both accurate and cheapest. Above it the factor
-    // underflows toward zero and we switch to the convergent asymptotic tail
-    // series to retain the leading significant digits.
-    const DIRECT_EXP_SWITCH: f64 = 600.0;
-    if x <= DIRECT_EXP_SWITCH {
-        return horner_polynomial(x, coeffs) * (-x).exp();
+    if x.is_nan() {
+        return f64::NAN;
+    }
+    if x.is_infinite() {
+        if coeffs.iter().any(|c| !c.is_finite()) {
+            return f64::NAN;
+        }
+        let Some(degree) = coeffs.iter().rposition(|&c| c != 0.0) else {
+            return 0.0;
+        };
+        let sign = coeffs[degree].signum();
+        return if x.is_sign_positive() {
+            0.0_f64.copysign(sign)
+        } else {
+            f64::INFINITY.copysign(if degree % 2 == 0 { sign } else { -sign })
+        };
+    }
+    if x == 0.0 {
+        return coeffs[0];
+    }
+    if x <= 600.0 {
+        let polynomial = horner_polynomial(x, coeffs);
+        let exponential = (-x).exp();
+        if polynomial.is_finite() && exponential.is_finite() {
+            return polynomial * exponential;
+        }
     }
 
-    let inv_x = x.recip();
-    let mut tail = 0.0;
-    for &c in coeffs {
-        tail = tail * inv_x + c;
+    let log_x = x.abs().ln();
+    let mut sign = 0.0_f64;
+    let mut log_abs = f64::NEG_INFINITY;
+    for &coefficient in coeffs.iter().rev() {
+        if !coefficient.is_finite() {
+            return f64::NAN;
+        }
+        log_abs += log_x;
+        sign *= x.signum();
+        if coefficient == 0.0 {
+            continue;
+        }
+        let log_coefficient = coefficient.abs().ln();
+        if sign == 0.0 {
+            sign = coefficient.signum();
+            log_abs = log_coefficient;
+        } else if sign == coefficient.signum() {
+            log_abs = logaddexp(log_abs, log_coefficient);
+        } else if log_abs == log_coefficient {
+            sign = 0.0;
+            log_abs = f64::NEG_INFINITY;
+        } else if log_abs > log_coefficient {
+            log_abs += log_abs_one_minus_exp(log_coefficient - log_abs);
+        } else {
+            sign = coefficient.signum();
+            log_abs = log_coefficient + log_abs_one_minus_exp(log_abs - log_coefficient);
+        }
     }
-    let degree = (coeffs.len() - 1) as f64;
-    let scale = (degree * x.ln() - x).exp();
-    scale * tail
+    sign * (log_abs - x).exp()
 }
 
 /// Argument at which the modified-Bessel evaluation switches from the ascending
@@ -2065,16 +2106,36 @@ mod tests {
     }
 
     #[test]
-    fn poly_exp_nonfinite_x_returns_zero() {
+    fn poly_exp_nonfinite_x_uses_mathematical_limits() {
         assert_eq!(
             stable_polynomial_times_exp_neg(f64::INFINITY, &[1.0, 2.0]),
             0.0
         );
         assert_eq!(
             stable_polynomial_times_exp_neg(f64::NEG_INFINITY, &[1.0, 2.0]),
-            0.0
+            f64::NEG_INFINITY
         );
-        assert_eq!(stable_polynomial_times_exp_neg(f64::NAN, &[1.0]), 0.0);
+        assert!(stable_polynomial_times_exp_neg(f64::NAN, &[1.0]).is_nan());
+        assert_eq!(stable_polynomial_times_exp_neg(f64::NEG_INFINITY, &[1.0]), f64::INFINITY);
+    }
+
+    #[test]
+    fn poly_exp_retains_products_with_unrepresentable_factors() {
+        for (x, coefficients, log_expected) in [
+            (800.0_f64, vec![1e308], 1e308_f64.ln() - 800.0),
+            (100.0, vec![0.0, 1e308], 1e308_f64.ln() + 100.0_f64.ln() - 100.0),
+            (-800.0, vec![1e-308], 1e-308_f64.ln() + 800.0),
+            (750.0, vec![0.0, 0.0, 0.0, 0.0, 0.0, -1.0], 5.0 * 750.0_f64.ln() - 750.0),
+        ] {
+            let actual = stable_polynomial_times_exp_neg(x, &coefficients);
+            assert!(actual.is_finite() && actual != 0.0);
+            assert!((actual.abs().ln() - log_expected).abs() < 2e-12);
+        }
+        assert_eq!(stable_polynomial_times_exp_neg(800.0, &[0.0, 0.0]), 0.0);
+        let mut coefficients = vec![1e308];
+        coefficients.resize(1000, 0.0);
+        let actual = stable_polynomial_times_exp_neg(800.0, &coefficients);
+        assert!((actual.ln() - (1e308_f64.ln() - 800.0)).abs() < 1e-12);
     }
 
     #[test]
