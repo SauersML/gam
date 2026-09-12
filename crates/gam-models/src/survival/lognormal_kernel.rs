@@ -97,12 +97,22 @@ impl FrailtyScale {
         }
     }
 
-    /// Exact log-sigma coordinate and declared finite chart domain for a
-    /// learned scale. Fixed scales have no optimizer coordinate.
+    /// Exact log-sigma coordinate and its derived finite domain for a learned
+    /// scale. Fixed scales have no optimizer coordinate.
+    ///
+    /// The domain is `ln(1/√ε)` e-folds either side of the seed, the gradient
+    /// resolution every derived ρ-domain edge sits at
+    /// (`gam_problem::log_gradient_resolution`, #2812). It replaces a
+    /// hand-supplied `[-12, 6]` box that was not centred on the seed
+    /// (SPEC rule 20).
     pub(crate) fn learned_log_sigma_coordinate(self) -> Option<(f64, f64, f64)> {
         match self {
             Self::Fixed { .. } => None,
-            Self::Learned { initial_sigma } => Some((initial_sigma.ln(), -12.0, 6.0)),
+            Self::Learned { initial_sigma } => {
+                let seed = initial_sigma.ln();
+                let e_folds = -gam_problem::log_gradient_resolution();
+                Some((seed, seed - e_folds, seed + e_folds))
+            }
         }
     }
 }
@@ -1510,6 +1520,27 @@ impl LatentSurvivalRowJet {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A learned frailty scale's optimizer domain is derived from the gradient
+    /// resolution around its seed (SPEC rule 20), and a fixed scale owns no
+    /// coordinate.
+    #[test]
+    fn a_learned_frailty_scale_derives_its_log_sigma_domain_from_the_gradient_resolution() {
+        let e_folds = -gam_problem::log_gradient_resolution();
+        for initial_sigma in [0.25_f64, 1.0, 3.0] {
+            let (seed, lower, upper) = FrailtyScale::Learned { initial_sigma }
+                .learned_log_sigma_coordinate()
+                .expect("a learned scale owns a log-sigma coordinate");
+            assert_eq!(seed, initial_sigma.ln());
+            assert_eq!(lower, seed - e_folds);
+            assert_eq!(upper, seed + e_folds);
+        }
+        assert!(
+            FrailtyScale::Fixed { sigma: 1.0 }
+                .learned_log_sigma_coordinate()
+                .is_none()
+        );
+    }
 
     /// #2610: the reformulation is an IDENTITY, so where the differenced form is
     /// trustworthy the two must agree to near machine epsilon.

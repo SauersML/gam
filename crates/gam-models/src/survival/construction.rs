@@ -3601,8 +3601,8 @@ impl SurvivalMarginalSlopeFrozenOffsetChart {
                     "survival marginal-slope frozen offset chart requires a nonlinear baseline",
                 )
             })?;
-        let lower_theta = initial_geometry.theta.mapv(|value| value - 6.0);
-        let upper_theta = initial_geometry.theta.mapv(|value| value + 6.0);
+        let (lower_theta, upper_theta) =
+            Self::derived_theta_domain(initial_config.target, &initial_geometry.theta, age_exit)?;
         Ok(Self {
             age_entry: age_entry.clone(),
             age_exit: age_exit.clone(),
@@ -3625,12 +3625,61 @@ impl SurvivalMarginalSlopeFrozenOffsetChart {
         &self.initial_theta
     }
 
-    /// Declared finite domain of this frozen nonlinear chart. These are the
-    /// same coordinate bounds used by the legacy standalone baseline solver,
-    /// now owned by the chart so a joint solver and its terminal certificate
-    /// cannot silently choose a different domain.
+    /// Finite domain of this frozen nonlinear chart, derived at construction by
+    /// `derived_theta_domain` and owned by the chart so a joint solver and its
+    /// terminal certificate cannot silently choose a different domain.
     pub fn theta_bounds(&self) -> (&Array1<f64>, &Array1<f64>) {
         (&self.lower_theta, &self.upper_theta)
+    }
+
+    /// The range each chart coordinate can move while the criterion still
+    /// resolves it, centred on the data-matched seed.
+    ///
+    /// Every coordinate gets the same number of e-folds either side of its seed:
+    /// `ln(1/√ε)`, the gradient resolution every derived ρ-domain edge sits at
+    /// (`gam_problem::log_gradient_resolution`, #2812). A log-scale coordinate
+    /// (Weibull scale and shape, Gompertz rate, the Makeham term) moves its
+    /// quantity by one e-fold per unit, so its interval is `seed ± ln(1/√ε)`.
+    /// The Gompertz shape enters the hazard as `exp(shape·t)`, so the same
+    /// number of e-folds at the oldest observed exit age is `ln(1/√ε) / max t`.
+    /// This replaces a hand-supplied `seed ± 6` box (SPEC rule 20); the
+    /// standalone baseline optimizer dropped the same box in #2670.
+    fn derived_theta_domain(
+        target: SurvivalBaselineTarget,
+        seed: &Array1<f64>,
+        age_exit: &Array1<f64>,
+    ) -> Result<(Array1<f64>, Array1<f64>), String> {
+        let e_folds = -gam_problem::log_gradient_resolution();
+        let oldest_exit = age_exit.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        let shape_radius = || {
+            if oldest_exit.is_finite() && oldest_exit > 0.0 {
+                Ok(e_folds / oldest_exit)
+            } else {
+                Err(format!(
+                    "survival marginal-slope Gompertz chart domain needs a positive finite exit age, got {oldest_exit}"
+                ))
+            }
+        };
+        let radius = match target {
+            SurvivalBaselineTarget::Linear => {
+                return Err(
+                    "survival marginal-slope linear baseline has no chart coordinates".to_string(),
+                );
+            }
+            SurvivalBaselineTarget::Weibull => Array1::from_vec(vec![e_folds, e_folds]),
+            SurvivalBaselineTarget::Gompertz => Array1::from_vec(vec![e_folds, shape_radius()?]),
+            SurvivalBaselineTarget::GompertzMakeham => {
+                Array1::from_vec(vec![e_folds, shape_radius()?, e_folds])
+            }
+        };
+        if radius.len() != seed.len() {
+            return Err(format!(
+                "survival marginal-slope chart domain has {} radii for a {}-coordinate seed",
+                radius.len(),
+                seed.len()
+            ));
+        }
+        Ok((seed - &radius, seed + &radius))
     }
 
     pub fn evaluate(
@@ -5235,6 +5284,71 @@ mod tests {
                     "chart axis {axis}: asked for {want:?}, recorded {got:?} — a chart must \
                      record the coordinate it was ASKED to realize, because the family's \
                      manifest check is bitwise"
+                );
+            }
+        }
+    }
+
+    /// The frozen chart's domain is derived from the gradient resolution, not
+    /// handed in (SPEC rule 20): `ln(1/√ε)` e-folds either side of the seed on
+    /// every log-scale coordinate, and the same e-folds at the oldest exit age
+    /// on the Gompertz shape.
+    #[test]
+    fn a_frozen_baseline_chart_derives_its_domain_from_the_gradient_resolution() {
+        let e_folds = -gam_problem::log_gradient_resolution();
+        let age_entry = array![0.0, 0.75, 2.0];
+        let age_exit = array![1.5, 3.0, 5.5];
+        let cases = [
+            (
+                SurvivalBaselineConfig {
+                    target: SurvivalBaselineTarget::Weibull,
+                    scale: Some(2.0),
+                    shape: Some(1.3),
+                    rate: None,
+                    makeham: None,
+                },
+                vec![e_folds, e_folds],
+            ),
+            (
+                SurvivalBaselineConfig {
+                    target: SurvivalBaselineTarget::GompertzMakeham,
+                    scale: None,
+                    shape: Some(0.04),
+                    rate: Some(0.013),
+                    makeham: Some(0.002),
+                },
+                vec![e_folds, e_folds / 5.5, e_folds],
+            ),
+        ];
+        for (config, radii) in cases {
+            let baseline =
+                build_survival_marginal_slope_baseline_geometry(&age_entry, &age_exit, &config)
+                    .expect("initial baseline geometry")
+                    .expect("a nonlinear chart");
+            let chart = SurvivalMarginalSlopeFrozenOffsetChart::new(
+                &age_entry,
+                &age_exit,
+                &config,
+                &baseline.offset_entry,
+                &baseline.offset_exit,
+                &baseline.derivative_offset_exit,
+            )
+            .expect("freeze the chart");
+            let seed = chart.initial_theta();
+            let (lower, upper) = chart.theta_bounds();
+            assert_eq!(seed.len(), radii.len(), "chart coordinate count");
+            for axis in 0..seed.len() {
+                assert_eq!(
+                    lower[axis],
+                    seed[axis] - radii[axis],
+                    "lower edge of chart axis {axis} of {}",
+                    seed.len()
+                );
+                assert_eq!(
+                    upper[axis],
+                    seed[axis] + radii[axis],
+                    "upper edge of chart axis {axis} of {}",
+                    seed.len()
                 );
             }
         }
