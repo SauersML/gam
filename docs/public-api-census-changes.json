@@ -1417,5 +1417,13 @@
     },
     "reason": "SPEC rule 2 (#2901 V3): the production outer-gradient finite-difference audit is deleted, and with it its arming API, its record accessors and the evaluator publication channels only it read. The runner lends an armed test an analytic OuterSeedProbe instead.",
     "evidence": "public_api_census.py's public_functions predicate over crates/gam-solve/src/estimate/outer_eval_capture.rs at the base and after the change yields these 22 removed pub or pub(crate) fns. No other changed file under crates/ or src/ loses a pub fn. Their consumers at the base were the #2765 gate (rewritten onto observe_next_outer_seed), the two examples/probe_2765_* programs (deleted), the deleted run_plan.rs audit, and publication sites in estimate/joint_hyper.rs and reml_outer_engine/objective.rs that are removed here. outer_gradient_audit_capture_armed is renamed outer_seed_capture_armed."
+  },
+  {
+    "base": "321903df8c9bbe0338c9b048b7e39c1953afd3a9",
+    "removed": {
+      "crates/gam-terms/src/decoders/skip_transcoder.rs::skip_transcoder_reml_metrics": 1
+    },
+    "reason": "#2469 and the delete-useless-public-API rule: skip_transcoder_reml_metrics had no product user. Its only caller was a pyffi shim that gamfit never calls (gamfit/torch/skip_transcoder.py scores its own profile), and it carried a 1e-8 activation threshold and a 1e-12 floor on the residual variance. The function, its module and the shim are deleted.",
+    "evidence": "public_api_census.py's public_functions predicate over this diff's removed hunks yields one pub fn, crates/gam-terms/src/decoders/skip_transcoder.rs::skip_transcoder_reml_metrics. The deleted pyffi shim of the same name is private. At the base, git grep reml_metrics over gamfit and tests finds nothing."
   }
 ]

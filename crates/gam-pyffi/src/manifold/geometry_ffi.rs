@@ -5043,7 +5043,6 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
         module
     )?)?;
     module.add_function(wrap_pyfunction!(gaussian_reml_score, module)?)?;
-    module.add_function(wrap_pyfunction!(skip_transcoder_reml_metrics, module)?)?;
     module.add_function(wrap_pyfunction!(tierney_kadane_normalized_score, module)?)?;
     module.add_function(wrap_pyfunction!(torch_smooth_dispatch_key, module)?)?;
     module.add_function(wrap_pyfunction!(assemble_candidate_formula, module)?)?;

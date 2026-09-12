@@ -158,10 +158,6 @@ pub(crate) use gam::terms::sae::manifold::{
     sae_fitted_atom_plans,
 };
 
-pub(crate) use gam::terms::decoders::skip_transcoder::{
-    SkipTranscoderRemlInputs, skip_transcoder_reml_metrics as skip_transcoder_reml_metrics_core,
-};
-
 pub(crate) use gam::terms::smooth::BlockwisePenalty;
 
 pub(crate) use gam::terms::basis::matern_gradient::{
