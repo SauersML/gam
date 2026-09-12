@@ -5033,4 +5033,91 @@ fn spatial_aniso_joint_large_psi_dim_reserves_exact_curvature_for_terminal_mint_
         gam_solve::rho_optimizer::HessianSource::Analytic
     );
 }
+
+/// #2433: the incremental realizer must replay a RAW pre-assembly spec in the
+/// chart the authoritative emitted design uses. The constructor freezes the
+/// caller's spec against that design once, before the first κ proposal;
+/// otherwise the first update rebuilds the source term in its obsolete chart
+/// and collides with the blocks collection-level identifiability retained.
+#[test]
+fn incremental_realizer_replays_raw_duchon_spec_in_emitted_chart_2433() {
+    // The 1-D Duchon fixture the `duchon_probit_*` mechanism pins shared,
+    // reduced to the pieces this pin reads.
+    let n = 80usize;
+    let data = Array2::<f64>::from_shape_fn((n, 1), |(i, _)| i as f64 / (n as f64 - 1.0));
+    let active = || OperatorPenaltySpec::Active {
+        initial_log_lambda: 0.0,
+        prior: None,
+    };
+    let raw = TermCollectionSpec {
+        linear_terms: vec![],
+        random_effect_terms: vec![],
+        smooth_terms: vec![SmoothTermSpec {
+            frozen_parametric_residualization: None,
+            name: "duchon_1d".to_string(),
+            basis: SmoothBasisSpec::Duchon {
+                feature_cols: vec![0],
+                spec: DuchonBasisSpec {
+                    radial_reparam: None,
+                    periodic: None,
+                    center_strategy: CenterStrategy::FarthestPoint { num_centers: 8 },
+                    length_scale: Some(1.0),
+                    power: 1.0,
+                    nullspace_order: DuchonNullspaceOrder::Linear,
+                    identifiability: SpatialIdentifiability::default(),
+                    aniso_log_scales: None,
+                    operator_penalties: DuchonOperatorPenaltySpec {
+                        mass: active(),
+                        tension: active(),
+                        stiffness: active(),
+                    },
+                    boundary: OneDimensionalBoundary::Open,
+                },
+                input_scale: None,
+            },
+            shape: ShapeConstraint::None,
+            joint_null_rotation: None,
+        }],
+    };
+    let design = build_term_collection_design(data.view(), &raw)
+        .unwrap_or_else(|e| panic!("raw design failed: {e:?}"));
+    let frozen = freeze_term_collection_from_design(&raw, &design)
+        .unwrap_or_else(|e| panic!("freeze failed: {e:?}"));
+    let frozen_design = build_term_collection_design(data.view(), &frozen)
+        .unwrap_or_else(|e| panic!("frozen design failed: {e:?}"));
+
+    let mut realizer = FrozenTermCollectionIncrementalRealizer::new(
+        data.view(),
+        raw,
+        frozen_design.clone(),
+    )
+    .unwrap_or_else(|e| panic!("raw-spec realizer construction failed: {e:?}"));
+
+    // The constructor must freeze the caller's pre-assembly spec against the
+    // authoritative design before the first κ proposal. Otherwise this update
+    // rebuilds the source term's five-block chart and collides with the four
+    // blocks retained by collection-level identifiability.
+    let replay_spec = realizer.spec().clone();
+    let spatial_terms = spatial_length_scale_term_indices(&replay_spec);
+    let updated_log_kappa = SpatialLogKappaCoords::new_with_dims(array![0.2], vec![1]);
+    let updated_spec = updated_log_kappa
+        .apply_tospec(&replay_spec, &spatial_terms)
+        .unwrap_or_else(|e| panic!("updated frozen replay spec failed: {e:?}"));
+    realizer
+        .apply_log_kappa(&updated_log_kappa, &spatial_terms)
+        .unwrap_or_else(|e| panic!("first raw-spec κ replay failed: {e:?}"));
+
+    let rebuilt = build_term_collection_design(data.view(), &updated_spec)
+        .unwrap_or_else(|e| panic!("full frozen-chart rebuild failed: {e:?}"));
+    assert_term_collection_designs_match(
+        realizer.design(),
+        &rebuilt,
+        "raw-spec incremental replay",
+    );
+    assert_eq!(
+        realizer.design().penalties.len(),
+        frozen_design.penalties.len(),
+        "κ replay must preserve the authoritative emitted penalty topology",
+    );
+}
 }
