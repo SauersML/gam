@@ -22,19 +22,22 @@ pub fn closure(points: ArrayView2<'_, f64>) -> Result<Array2<f64>, String> {
     let (n, d) = points.dim();
     let mut out = Array2::<f64>::zeros((n, d));
     for row in 0..n {
-        let mut total = 0.0_f64;
+        let mut scale = 0.0_f64;
         for col in 0..d {
             let v = points[[row, col]];
             if v < 0.0 {
                 return Err("simplex values must be non-negative".to_string());
             }
-            total += v;
+            scale = scale.max(v);
         }
-        if total <= 0.0 {
+        if scale <= 0.0 {
             return Err("simplex rows must have positive total mass".to_string());
         }
+        // Closure is homogeneous of degree zero. Scaling first keeps a finite
+        // positive row normalizable even when its unscaled sum overflows.
+        let total = points.row(row).iter().map(|v| v / scale).sum::<f64>();
         for col in 0..d {
-            out[[row, col]] = points[[row, col]] / total;
+            out[[row, col]] = (points[[row, col]] / scale) / total;
         }
     }
     Ok(out)
@@ -53,14 +56,13 @@ pub fn simplex_frechet_mean(
     points: ArrayView2<'_, f64>,
     weights: Option<ArrayView1<'_, f64>>,
 ) -> Result<Vec<f64>, String> {
-    let comp = closure(points)?;
-    require_positive(comp.view(), "simplex Fr\u{e9}chet mean")?;
-    let (n, d) = comp.dim();
+    let coords = clr(points)?;
+    let (n, d) = coords.dim();
     let w = normalize_weights(n, weights)?;
     let mut mean_log = vec![0.0_f64; d];
     for row in 0..n {
         for col in 0..d {
-            mean_log[col] += w[row] * comp[[row, col]].ln();
+            mean_log[col] += w[row] * coords[[row, col]];
         }
     }
     let mut max_v = f64::NEG_INFINITY;
@@ -115,14 +117,16 @@ fn resolve_reference(reference: isize, d: usize) -> usize {
 /// Centered log-ratio coordinates: `clr(x)_j = ln x_j - mean_k ln x_k` after
 /// closure. Requires strictly positive compositions.
 pub fn clr(values: ArrayView2<'_, f64>) -> Result<Array2<f64>, String> {
-    let comp = closure(values)?;
-    require_positive(comp.view(), "CLR coordinates")?;
-    let (n, d) = comp.dim();
+    validate_simplex_array(values)?;
+    require_positive(values, "CLR coordinates")?;
+    let (n, d) = values.dim();
     let mut out = Array2::<f64>::zeros((n, d));
     for row in 0..n {
         let mut sum_log = 0.0_f64;
         for col in 0..d {
-            let lg = comp[[row, col]].ln();
+            // The closure's common log normalizer cancels under centering.
+            // Taking logs first also preserves parts that underflow on closure.
+            let lg = values[[row, col]].ln();
             out[[row, col]] = lg;
             sum_log += lg;
         }
@@ -138,19 +142,19 @@ pub fn clr(values: ArrayView2<'_, f64>) -> Result<Array2<f64>, String> {
 /// ln x_ref` for `j != ref`, yielding `(d-1)` columns. Requires strictly
 /// positive compositions.
 pub fn alr(values: ArrayView2<'_, f64>, reference: isize) -> Result<Array2<f64>, String> {
-    let comp = closure(values)?;
-    require_positive(comp.view(), "ALR coordinates")?;
-    let (n, d) = comp.dim();
+    validate_simplex_array(values)?;
+    require_positive(values, "ALR coordinates")?;
+    let (n, d) = values.dim();
     let ref_idx = resolve_reference(reference, d);
     let mut out = Array2::<f64>::zeros((n, d - 1));
     for row in 0..n {
-        let log_ref = comp[[row, ref_idx]].ln();
+        let log_ref = values[[row, ref_idx]].ln();
         let mut k = 0usize;
         for col in 0..d {
             if col == ref_idx {
                 continue;
             }
-            out[[row, k]] = comp[[row, col]].ln() - log_ref;
+            out[[row, k]] = values[[row, col]].ln() - log_ref;
             k += 1;
         }
     }
@@ -205,14 +209,12 @@ pub fn simplex_log_map(
     coord: SimplexCoord,
     reference: isize,
 ) -> Result<Array2<f64>, String> {
-    let comp = closure(values)?;
     let base2 = Array2::from_shape_fn((1, base.len()), |(_, j)| base[j]);
-    let base_comp = closure(base2.view())?;
-    if comp.ncols() != base_comp.ncols() {
+    validate_simplex_array(values)?;
+    validate_simplex_array(base2.view())?;
+    if values.ncols() != base.len() {
         return Err("simplex values and base point have different dimensions".to_string());
     }
-    require_positive(comp.view(), "simplex log map")?;
-    require_positive(base_comp.view(), "simplex log map")?;
     match coord {
         SimplexCoord::Clr => {
             let values_clr = clr(values)?;
@@ -250,8 +252,9 @@ pub fn simplex_exp_map(
     reference: isize,
 ) -> Result<Array2<f64>, String> {
     let base2 = Array2::from_shape_fn((1, base.len()), |(_, j)| base[j]);
-    let base_comp = closure(base2.view())?;
-    let d = base_comp.ncols();
+    validate_simplex_array(base2.view())?;
+    require_positive(base2.view(), "simplex exp map")?;
+    let d = base.len();
     if let Some(((row, col), value)) = tangent.indexed_iter().find(|(_, v)| !v.is_finite()) {
         return Err(format!(
             "simplex exp map tangent must contain only finite values; got {value} at ({row}, {col})"
@@ -262,13 +265,12 @@ pub fn simplex_exp_map(
             if tangent.ncols() != d {
                 return Err("CLR tangent dimension must equal simplex dimension".to_string());
             }
-            require_positive(base_comp.view(), "simplex exp map")?;
             let n = tangent.nrows();
             let mut out = Array2::<f64>::zeros((n, d));
             for row in 0..n {
                 let mut max_v = f64::NEG_INFINITY;
                 for col in 0..d {
-                    let lg = base_comp[[0, col]].ln() + tangent[[row, col]];
+                    let lg = base[col].ln() + tangent[[row, col]];
                     out[[row, col]] = lg;
                     if lg > max_v {
                         max_v = lg;
@@ -390,6 +392,54 @@ mod tests {
         let c = closure(m.view()).unwrap();
         assert!((c[[0, 0]] - 0.5).abs() < 1e-14);
         assert!((c[[0, 1]] - 0.5).abs() < 1e-14);
+    }
+
+    #[test]
+    fn closure_is_scale_invariant_when_the_row_sum_overflows() {
+        let m = array![[f64::MAX, f64::MAX], [f64::MAX, 0.5 * f64::MAX]];
+        let c = closure(m.view()).unwrap();
+        assert_eq!(c[[0, 0]], 0.5);
+        assert_eq!(c[[0, 1]], 0.5);
+        assert!((c[[1, 0]] - 2.0 / 3.0).abs() < f64::EPSILON);
+        assert!((c[[1, 1]] - 1.0 / 3.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn log_ratios_preserve_positive_parts_that_underflow_under_closure() {
+        let m = array![[1.0e-300_f64, 1.0e300]];
+        let expected = 300.0 * 10.0_f64.ln();
+        let centered = clr(m.view()).unwrap();
+        assert!((centered[[0, 0]] + expected).abs() < 2.0e-13);
+        assert!((centered[[0, 1]] - expected).abs() < 2.0e-13);
+        let additive = alr(m.view(), 1).unwrap();
+        assert!((additive[[0, 0]] + 2.0 * expected).abs() < 4.0e-13);
+    }
+
+    #[test]
+    fn frechet_mean_preserves_extreme_compositions_and_weight_scale() {
+        // Componentwise geometric means are both one, so their closure is
+        // uniform even though closing each input loses one positive part.
+        let m = array![[1.0e-300_f64, 1.0e300], [1.0e300, 1.0e-300]];
+        let weights = array![f64::MAX, f64::MAX];
+        let mean = simplex_frechet_mean(m.view(), Some(weights.view())).unwrap();
+        assert_eq!(mean, vec![0.5, 0.5]);
+
+        let unequal = array![[0.8_f64, 0.2], [0.6, 0.4]];
+        let mean = simplex_frechet_mean(unequal.view(), Some(weights.view())).unwrap();
+        let expected = 6.0_f64.sqrt() / (6.0_f64.sqrt() + 1.0);
+        assert!((mean[0] - expected).abs() < 2.0 * f64::EPSILON);
+    }
+
+    #[test]
+    fn simplex_log_exp_uses_logarithmic_base_without_closure_underflow() {
+        let base = array![1.0e-300_f64, 1.0e300];
+        let point = array![[0.5_f64, 0.5]];
+        for coord in [SimplexCoord::Clr, SimplexCoord::Alr] {
+            let tangent = simplex_log_map(point.view(), base.view(), coord, 1).unwrap();
+            let recovered = simplex_exp_map(tangent.view(), base.view(), coord, 1).unwrap();
+            assert!((recovered[[0, 0]] - 0.5).abs() < 1.0e-13);
+            assert!((recovered[[0, 1]] - 0.5).abs() < 1.0e-13);
+        }
     }
 
     #[test]
