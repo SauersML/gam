@@ -1454,8 +1454,8 @@ fn sae_manifold_certify_external<'py>(
 /// from `fisher_factors` (the same shard the fit used), and calls `steer_delta`
 /// to drive atom `atom_k` from `t_from` to `t_to`. It returns the
 /// [`gam::inference::steering::SteerPlan`] fields as a dict: the activation-space
-/// `delta`, the path-integrated `predicted_nats` dose, the `validity_radius`,
-/// the `off_manifold_norm` self-check, and the `metric_provenance`.
+/// `delta`, the endpoint `predicted_nats` dose, the `off_manifold_norm`
+/// self-check, and the `metric_provenance`.
 ///
 /// The term rebuild mirrors [`sae_manifold_predict_oos`] (same plan/evaluator
 /// machinery), but where `predict_oos` runs the frozen-decoder Newton solve on a
@@ -1465,7 +1465,7 @@ fn sae_manifold_certify_external<'py>(
 /// routing logits) so the per-atom amplitude / measured-row selection inside
 /// `steer_delta` sees the fitted assignments. `fisher_factors` is the `(n, p, r)`
 /// harvest shard `U`; its presence installs `RowMetric::OutputFisher` (and makes
-/// `predicted_nats` / `validity_radius` available), exactly as in the fit.
+/// `predicted_nats` available), exactly as in the fit.
 /// Owned-array core of the steering primitive (#2091): the full per-atom basis
 /// rebuild + trained-latent seeding + optional output-Fisher metric install +
 /// `steer_delta` call, on borrowed ndarray views instead of `PyReadonlyArray`.
@@ -1842,7 +1842,6 @@ fn steer_plan_to_pydict(
         "fisher_mass_residual_fraction",
         plan.fisher_mass_residual_fraction,
     )?;
-    out.set_item("validity_radius", plan.validity_radius)?;
     out.set_item("off_manifold_norm", plan.off_manifold_norm)?;
     out.set_item("metric_provenance", provenance_str)?;
     Ok(out.unbind())

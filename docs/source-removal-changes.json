@@ -3144,5 +3144,19 @@
     ],
     "reason": "user directive: delete unnecessary code; the inner stall branch no longer consults the gate-norm continuation certificate (#2283, #2267)",
     "evidence": "stall_polish_progress.rs had exactly one production consumer: the objective-stall branch of penalized_quasi_laplace_criterion, which this commit stops consulting. After #2861 the terminal polish commits objective descent that raises ‖g‖, and the gate-frontier verdict refused later polishes on plateaus the first polish had lowered the objective to. On the #2283 documented cell (sw7 m10 442014, pin 2f844874e, /scratch.global/sauer354/sw7-logs/m10/a_BASE_C2283.txt) it returned 6 NonContracting verdicts and both completed probes stalled at ‖g‖ 0.401 and 0.466. With the verdict not consulted and the trajectory stop removed, the same cell converged both probes to 1.40e-8 and 1.74e-8 (a_P12_C2283.txt). The eight identities are source_removal_guard.py's own refusal over 9d289eb63 -> a private-index candidate holding only this change (/scratch.global/sauer354/pool/sae-fit/m12/cand/srg.err). The module's two unit tests exercised only the deleted certificate."
+  },
+  {
+    "base": "4735a7d2a0653f78a38a6e71984291f83402e9a8",
+    "items": [
+      "crates/gam-sae/src/inference/steering.rs:const:STEER_VALIDITY_STEPS",
+      "crates/gam-sae/src/inference/steering.rs:const:VALIDITY_DIVERGENCE_FRACTION",
+      "crates/gam-sae/src/inference/steering.rs:fn:path_coordinate",
+      "crates/gam-sae/src/inference/steering.rs:fn:validity_radius",
+      "crates/gam-sae/src/inference/steering.rs:struct:SteerContext",
+      "tests/sae/misc/steering_dosimetry.rs:fn:predicted_nats_match_analytic_kl_within_validity_radius",
+      "tests/sae/misc/steering_dosimetry.rs:fn:predicted_nats_remain_endpoint_kl_beyond_validity_radius"
+    ],
+    "reason": "SPEC rules 23 and 25 (#2263): SteerPlan::validity_radius was defined by two hand-chosen constants, a 64-point tau scan and a 10% divergence band. No production code read it, and predicted_nats already prices the exact applied move at any length.",
+    "evidence": "Items measured by sw9 job 448227: the source-removal guard over 3bb12aea801c015a03ddb6d4582929043eb5e54b plus this patch, log /scratch.global/sauer354/sw9-logs/steera_guard.448227.log. At that base, git grep finds validity_radius only in steering.rs, pyffi's steer dict, docs/manifold-sae.md, CHANGELOG history and the tests edited here. The renamed dosimetry tests keep their assertions on predicted_nats, delta and off_manifold_norm. The Tier-0 rescale test replaces its radius assertion with an off_manifold_norm bound."
   }
 ]

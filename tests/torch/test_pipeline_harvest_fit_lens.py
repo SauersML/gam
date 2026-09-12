@@ -362,8 +362,7 @@ def test_steer_dosimetry_against_analytic_kl(
     3. The SteerPlan's ``predicted_nats`` (endpoint Fisher quadratic) must
        match the analytic KL of the synthetic head between those two activations
        to second order: small move ⇒ ``predicted_nats ≈ KL`` within a relative
-       tolerance; ``off_manifold_norm ≈ 0``; ``validity_radius`` ≥ the move
-       length.
+       tolerance; ``off_manifold_norm ≈ 0``.
 
     The synthetic ``_LinearHead`` makes the output distribution at an activation
     ``x`` exactly ``softmax(W x)``, so the *true* behavioral effect of the move is
@@ -393,14 +392,11 @@ def test_steer_dosimetry_against_analytic_kl(
         t_from=t_from,
         t_to=t_to,
     )
-    # Geometry self-checks: the move stays on the learned surface, the dose is
-    # measured through OutputFisher, and the linearization is trusted past the
-    # move length.
+    # Geometry self-checks: the move stays on the learned surface and the dose is
+    # measured through OutputFisher.
     assert plan["metric_provenance"] == "OutputFisher"
     assert plan["predicted_nats"] is not None
     assert plan["off_manifold_norm"] == pytest.approx(0.0, abs=1e-6)
-    move_len = float(np.linalg.norm(np.asarray(t_to) - np.asarray(t_from)))
-    assert float(plan["validity_radius"]) >= move_len - 1e-9
 
     # Dosimetry ground truth: reconstruct the synthetic head weight W from the
     # same fixed seed the harvest fixture used (rng default_rng(7)), so the

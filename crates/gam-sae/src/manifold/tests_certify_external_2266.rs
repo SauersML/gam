@@ -89,7 +89,7 @@ mod tests {
         // certify entry's term is fully steer_delta-capable afterward — a
         // rank-1 factor is enough to make the metric carry "behavior"
         // (`MetricProvenance::OutputFisher`), which is the ONLY thing
-        // `validity_radius`/`predicted_nats` gate on (see
+        // `predicted_nats` gates on (see
         // `steering::metric_carries_behavior`); no closed-form-only state is
         // required beyond the fitted term + this metric.
         let p_out = target.ncols();
@@ -282,16 +282,10 @@ mod tests {
             "steer_delta must run on a certify-external term paired with a behavioral metric",
         );
         assert!(
-            plan.validity_radius.is_some(),
-            "validity_radius must be Some for a certify-external term + behavioral metric — \
+            plan.predicted_nats.is_some(),
+            "predicted_nats must be Some for a certify-external term + behavioral metric — \
              #2266's dosimetry contract needs the term + metric steer_delta reads, not a native \
              closed-form solve"
         );
-        let radius = plan.validity_radius.expect("checked above");
-        assert!(
-            radius.is_finite() && radius > 0.0,
-            "validity_radius must be a finite positive latent step length; got {radius}"
-        );
-        assert!(plan.predicted_nats.is_some());
     }
 }

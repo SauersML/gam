@@ -25,8 +25,7 @@
 //!
 //! The canonical dosimetry is the endpoint quadratic form itself, so the
 //! reported `predicted_nats` must match `KL_analytic` for both small and large
-//! moves. The separate `validity_radius` still flags where the local
-//! initial-tangent approximation stops matching that exact chord dose.
+//! moves.
 //!
 //! Off-manifold component: `δ` is a chord of the decoder circle, so it lies in
 //! the local tangent line at `t_from` up to curvature; the reported
@@ -129,7 +128,7 @@ fn planted_circle(t0: f64) -> (SaeManifoldTerm, RowMetric) {
 }
 
 #[test]
-fn predicted_nats_match_analytic_kl_within_validity_radius() {
+fn predicted_nats_match_analytic_kl_for_a_small_step() {
     let t0 = 0.0;
     let (term, metric) = planted_circle(t0);
 
@@ -171,26 +170,16 @@ fn predicted_nats_match_analytic_kl_within_validity_radius() {
         "off-manifold residual {:.3e} must be ~0 vs move {move_norm:.3e}",
         plan.off_manifold_norm
     );
-
-    // The validity radius is reported and, for a step this small, covers the
-    // whole move (linearization trusted to t_to).
-    let vr = plan.validity_radius.expect("validity radius available");
-    println!("validity_radius={vr:.5e} full_move={delta:.5e}");
-    assert!(
-        (vr - delta).abs() < 1e-9,
-        "tiny step must be fully within validity radius: vr={vr:.5e}, move={delta:.5e}"
-    );
 }
 
 #[test]
-fn predicted_nats_remain_endpoint_kl_beyond_validity_radius() {
+fn predicted_nats_remain_endpoint_kl_for_a_quarter_turn() {
     let t0 = 0.0;
     let (term, metric) = planted_circle(t0);
 
     // A LARGE latent step (a quarter turn): the arc has curved far from the
     // initial tangent, but the canonical prediction still prices the exact
-    // applied endpoint chord. The validity radius must fall strictly inside the
-    // requested move.
+    // applied endpoint chord.
     let delta = 0.25_f64; // quarter circle
     let plan = steer_delta(&term, &metric, 0, 0, 1.0, &[t0], &[t0 + delta]).expect("plan");
 
@@ -204,22 +193,13 @@ fn predicted_nats_remain_endpoint_kl_beyond_validity_radius() {
         (nats - kl).abs() / kl < 1e-12,
         "endpoint dose {nats:.6} must match the closed-form chord KL {kl:.6}"
     );
-
-    // The validity radius must flag the breakdown: strictly inside the full move.
-    let vr = plan.validity_radius.expect("vr");
-    println!("validity_radius={vr:.5} full_move={delta:.5}");
-    assert!(
-        vr < delta - 1e-9,
-        "validity radius {vr:.5} must fall strictly inside the over-long move {delta:.5}"
-    );
-    assert!(vr > 0.0, "validity radius must be positive, got {vr}");
 }
 
 #[test]
 fn euclidean_metric_yields_geometry_but_no_dose() {
     // A Euclidean (no-behavior) metric: the activation-space delta and the
-    // off-manifold guard are still produced, but the behavioral dose and
-    // validity radius are *not available* (None), not zero.
+    // off-manifold guard are still produced, but the behavioral dose is *not
+    // available* (None), not zero.
     let t0 = 0.1;
     let (term, _fisher) = planted_circle(t0);
     let p = term.output_dim();
@@ -232,10 +212,6 @@ fn euclidean_metric_yields_geometry_but_no_dose() {
     assert!(
         plan.predicted_nats.is_none(),
         "no behavioral axis ⇒ dose unavailable"
-    );
-    assert!(
-        plan.validity_radius.is_none(),
-        "no dose ⇒ no validity radius"
     );
 
     // The geometry is still there: a nonzero on-manifold move and a ~0
@@ -378,7 +354,7 @@ fn planted_circle_tier0_scaled(t0: f64, scale: [f64; 2]) -> (SaeManifoldTerm, Ro
 /// #2249.
 ///
 /// This test plants the SAME closed-form circle oracle as
-/// [`predicted_nats_match_analytic_kl_within_validity_radius`], but with the
+/// [`predicted_nats_match_analytic_kl_for_a_small_step`], but with the
 /// decoder installed in a Tier-0-scaled internal frame (`σ = [2.0, 0.5]`,
 /// deliberately asymmetric so a missed per-column correction cannot cancel).
 /// With the fix engaged, `steer_delta` un-scales the decoded chord/tangents
@@ -405,7 +381,7 @@ fn predicted_nats_survive_tier0_frame_rescale_2249() {
         "tier0 scale must round-trip through the setter"
     );
 
-    // Same small step as the unscaled fixture's within-radius test.
+    // Same small step as the unscaled fixture's small-step test.
     let delta = 0.01_f64;
     let plan = steer_delta(&term, &metric, 0, 0, 1.0, &[t0], &[t0 + delta]).expect("plan");
 
@@ -445,15 +421,20 @@ fn predicted_nats_survive_tier0_frame_rescale_2249() {
          (#2249, ace3b9af3) is not engaged or not correct"
     );
 
-    // The validity radius must also be reported in RAW units (a σ-mis-scaled
-    // tangent would report a systematically wrong radius even when the
-    // endpoint dose above happened to be checked at a different δ).
-    let vr = plan.validity_radius.expect("validity radius available");
-    println!("tier0-scaled validity_radius={vr:.5e} full_move={delta:.5e}");
+    // The decoder tangents must be in RAW units too. The chord above is already
+    // checked in raw units, and on the planted circle it is parallel to the raw
+    // midpoint tangent. A σ-mis-scaled tangent turns about 0.75·π·δ radians away
+    // from it for σ = [2, 0.5], leaving a residual far above this bar.
+    let move_norm = plan.delta.iter().map(|&v| v * v).sum::<f64>().sqrt();
+    println!(
+        "tier0-scaled off_manifold_norm={:.3e} move_norm={move_norm:.3e}",
+        plan.off_manifold_norm
+    );
     assert!(
-        (vr - delta).abs() < 1e-9,
-        "tiny step must be fully within validity radius under Tier-0 rescaling: \
-         vr={vr:.5e}, move={delta:.5e}"
+        plan.off_manifold_norm < 1e-3 * move_norm,
+        "off-manifold residual {:.3e} must be ~0 vs move {move_norm:.3e} under Tier-0 \
+         rescaling; a mis-scaled tangent turns off the raw chord",
+        plan.off_manifold_norm
     );
 }
 
@@ -546,10 +527,6 @@ fn target_dose_exact_factor_lands_the_dose_on_the_chart() {
     assert!(plan.applied_probe.is_none());
     assert_eq!(plan.iterations, 0);
     assert!(plan.readout_kl_radius.is_none());
-    assert!(
-        plan.steer.validity_radius.is_some(),
-        "chart radius must be reported"
-    );
 }
 
 /// gh#2263 target-dose API — with an EXACT-quadratic patched forward the closed

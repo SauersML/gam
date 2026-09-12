@@ -36,15 +36,6 @@
 //! they price different objects and therefore cannot be calibrated against the
 //! patched-forward endpoint KL by construction (#2249).
 //!
-//! # Validity radius — where local linearization stops being trusted
-//!
-//! A consumer must know *how far* the move can be trusted as a linear push. The
-//! **validity radius** is the latent step size at which the exact chord dose
-//! diverges from the initial-tangent quadratic prediction by more than
-//! `VALIDITY_DIVERGENCE_FRACTION`. Beyond it the surface has curved enough that
-//! the endpoint chord no longer represents the move. We **report** it; we do not
-//! silently clip to it.
-//!
 //! # Off-manifold guard
 //!
 //! `δ` is, by construction, a chord of the decoder curve, so it should lie in the
@@ -73,17 +64,6 @@ use crate::basis::SaeBasisEvaluator;
 use crate::chart_canonicalization::{CanonicalChartTopology, chart_arclength_coordinates};
 use crate::manifold::{LatentManifold, SaeManifoldAtom, SaeManifoldTerm};
 use gam_problem::{FisherFactorKind, MetricProvenance, RowMetric};
-
-/// Number of sub-steps the latent path `[t_from, t_to]` is integrated over for
-/// the dosimetry path integral. The decoder curve is smooth, so a modest
-/// midpoint-rule grid resolves the arc; fixed (no clock / no adaptivity) so the
-/// reported dose is deterministic.
-const STEER_VALIDITY_STEPS: usize = 64;
-
-/// The fraction by which the exact chord dose may diverge from the
-/// initial-tangent quadratic prediction before the move is declared past its
-/// validity radius.
-const VALIDITY_DIVERGENCE_FRACTION: f64 = 0.1;
 
 /// Scientific status of the quadratic dose relative to the full output Fisher.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -142,13 +122,6 @@ pub struct SteerPlan {
     pub fisher_mass_residual: Option<f64>,
     /// `residual / (captured + residual)`, when audited.
     pub fisher_mass_residual_fraction: Option<f64>,
-    /// **VALIDITY RADIUS**: the latent step size (Euclidean norm of the move from
-    /// `t_from`) at which the exact chord dose first diverges from the
-    /// initial-tangent quadratic prediction by more than
-    /// `VALIDITY_DIVERGENCE_FRACTION`. Equals the full move length when the
-    /// linearization is trusted all the way to `t_to`. `None` under a no-behavior
-    /// metric (there is no dose to validate).
-    pub validity_radius: Option<f64>,
     /// **OFF-MANIFOLD GUARD**: the norm of `δ`'s component outside the span of
     /// the atom's local decoder tangents `∂g_k/∂t` at `t_from`. `≈ 0` by
     /// construction (the move is a chord of the curve); a large value flags a
@@ -188,22 +161,6 @@ fn shortest_coordinate_delta(
     Ok(delta)
 }
 
-fn path_coordinate(
-    from: &[f64],
-    delta: &[f64],
-    periods: &[Option<f64>],
-    fraction: f64,
-) -> Vec<f64> {
-    from.iter()
-        .zip(delta.iter())
-        .zip(periods.iter())
-        .map(|((&start, &step), &period)| {
-            let value = start + fraction * step;
-            period.map_or(value, |p| value.rem_euclid(p))
-        })
-        .collect()
-}
-
 /// Build a [`SteerPlan`] for driving atom `atom_k` from `t_from` to `t_to`.
 ///
 /// `model` is the fitted term (read only); `metric` is the per-row output-Fisher
@@ -216,7 +173,7 @@ fn path_coordinate(
 /// [`crate::manifold::SaeBasisEvaluator`] (arbitrary-`t` evaluation
 /// requires one), or the metric dimensions do not match the term. Under a
 /// Euclidean (no-behavior) metric the geometry is still produced but
-/// `predicted_nats` / `validity_radius` degrade to `None`.
+/// `predicted_nats` degrades to `None`.
 pub fn steer_delta(
     model: &SaeManifoldTerm,
     metric: &RowMetric,
@@ -329,24 +286,8 @@ pub fn steer_delta(
     let off_manifold_norm = off_manifold_residual_norm(&tangents, delta.view());
 
     // --- dosimetry: exact applied-delta Fisher endpoint KL ------------------
-    let (predicted_nats, validity_radius) = if !behavior_available {
-        (None, None)
-    } else {
-        let ctx = SteerContext {
-            atom,
-            scale: tier0_scale,
-            metric,
-            row: metric_row,
-            p,
-            d,
-            amplitude,
-            coordinate_delta: &coordinate_delta,
-            periods: &periods,
-        };
-        let dose = 0.5 * metric.fisher_mass(metric_row, delta.view());
-        let radius = validity_radius(&ctx, t_from)?;
-        (Some(dose), Some(radius))
-    };
+    let predicted_nats =
+        behavior_available.then(|| 0.5 * metric.fisher_mass(metric_row, delta.view()));
 
     Ok(SteerPlan {
         atom: atom_k,
@@ -361,7 +302,6 @@ pub fn steer_delta(
         fisher_mass_captured,
         fisher_mass_residual,
         fisher_mass_residual_fraction,
-        validity_radius,
         off_manifold_norm,
         metric_provenance: provenance,
     })
@@ -1331,96 +1271,6 @@ fn solve_spd_small(gram: &Array2<f64>, rhs: &Array1<f64>) -> Array1<f64> {
         x[i] = sum / l[[i, i]];
     }
     x
-}
-
-/// The fixed geometry of one steering query, bundled so the dose integrator and
-/// its helpers take a single context rather than a long argument list.
-struct SteerContext<'a> {
-    atom: &'a SaeManifoldAtom,
-    /// Tier-0 column scale of the owning term, when standardization /
-    /// equilibration is installed: decodes must be un-scaled back to raw
-    /// activation units before they meet the (always raw-frame) row metric.
-    scale: Option<&'a Array1<f64>>,
-    metric: &'a RowMetric,
-    /// The row whose per-row metric the dose is measured through.
-    row: usize,
-    /// Output dimension `p`.
-    p: usize,
-    /// Latent dimension `d`.
-    d: usize,
-    /// Amplitude `a` the move is scaled by.
-    amplitude: f64,
-    coordinate_delta: &'a [f64],
-    periods: &'a [Option<f64>],
-}
-
-/// The validity radius: the latent step length (Euclidean distance from
-/// `t_from`) at which **local linearization stops being trusted**.
-///
-/// Linearizing the steering move means predicting the output effect of a prefix
-/// step `τ·Δt` from the initial tangent alone: the first-order output move is
-/// `δ_lin(τ) = a · (∂g/∂t|_{t_from}) · (τ Δt)`, whose output-Fisher KL is the
-/// quadratic form `½ ‖δ_lin(τ)‖²_M = τ² · ½ a² ‖∂g/∂t·Δt‖²_M`. The **true**
-/// effect of that prefix is the chord quadratic form of the *actual* curved
-/// output move `½ a² ‖g(t_from + τΔt) − g(t_from)‖²_M`.
-///
-/// The radius is the chord length `τ* · ‖Δt‖` at the first prefix `τ*` where the
-/// true chord KL diverges from the linear prediction by more than
-/// [`VALIDITY_DIVERGENCE_FRACTION`] (relative to the linear prediction). This is
-/// pure surface curvature: on a flat decoder the two agree for every `τ` and the
-/// radius is the whole move. If the metric kills the tangent (no linear effect to
-/// validate), the move is trusted to its full length.
-fn validity_radius(ctx: &SteerContext<'_>, t_from: &[f64]) -> Result<f64, String> {
-    let d = ctx.d;
-    let p = ctx.p;
-    let full_len: f64 = ctx
-        .coordinate_delta
-        .iter()
-        .map(|d| d * d)
-        .sum::<f64>()
-        .sqrt();
-    if full_len == 0.0 {
-        return Ok(0.0);
-    }
-    let dt = ctx.coordinate_delta;
-    let amp = ctx.amplitude;
-
-    // Initial-tangent linear output move per unit τ: v0 = (∂g/∂t|_{t_from}) Δt.
-    let tang0 = decode_tangents_at(ctx.atom, t_from, ctx.scale)?;
-    let mut v0 = Array1::<f64>::zeros(p);
-    for i in 0..p {
-        let mut acc = 0.0_f64;
-        for a in 0..d {
-            acc += tang0[[i, a]] * dt[a];
-        }
-        v0[i] = acc;
-    }
-    // ½ a² ‖v0‖²_M — the per-τ² linear KL coefficient.
-    let lin_coeff = 0.5 * amp * amp * ctx.metric.fisher_mass(ctx.row, v0.view());
-    // No linear effect to validate against ⇒ trust the full move.
-    if !(lin_coeff > 0.0) {
-        return Ok(full_len);
-    }
-
-    let g_from = decode_at(ctx.atom, t_from, ctx.scale)?;
-    let steps = STEER_VALIDITY_STEPS;
-    for s in 0..steps {
-        let tau = (s as f64 + 1.0) / steps as f64;
-        let t_mid = path_coordinate(t_from, dt, ctx.periods, tau);
-        let g_tau = decode_at(ctx.atom, &t_mid, ctx.scale)?;
-        let mut chord = Array1::<f64>::zeros(p);
-        for i in 0..p {
-            chord[i] = amp * (g_tau[i] - g_from[i]);
-        }
-        // True chord KL of the prefix, and the linear prediction τ²·lin_coeff.
-        let chord_kl = 0.5 * ctx.metric.fisher_mass(ctx.row, chord.view());
-        let lin_kl = tau * tau * lin_coeff;
-        let rel = (chord_kl - lin_kl).abs() / lin_kl;
-        if rel > VALIDITY_DIVERGENCE_FRACTION {
-            return Ok(tau * full_len);
-        }
-    }
-    Ok(full_len)
 }
 
 /// One dose sample on a collateral-damage curve (gam#2234 E2, the intrinsic

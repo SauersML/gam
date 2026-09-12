@@ -479,7 +479,6 @@ plan["measured_nats"]     # patched-forward KL at the solved coordinate
 plan["validation"]        # "applied_dose_probe"
 plan["readout_kl_radius"] # contiguous calibrated displacement radius, or None
 plan["certified_attainable_upper_nats"] # global envelope certificate, or None
-plan["validity_radius"]   # chart-linearization radius, or None
 plan["off_manifold_norm"] # component of the move off the atom's local tangents (≈0 on-manifold)
 plan["metric_provenance"] # "OutputFisher" if a Fisher metric was installed, else "Euclidean"
 ```
