@@ -157,7 +157,6 @@ fn zz_planted_circle_plain_engine_stall_diagnostic_2234() {
         1.0e-6,
         1.0e-6,
     );
-    objective.remove_checkpoint();
     let problem = OuterProblem::new(n_params)
         .with_initial_rho(initial_flat.clone())
         .with_seed_config(SeedConfig {
