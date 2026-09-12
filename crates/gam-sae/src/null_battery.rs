@@ -2254,6 +2254,7 @@ fn standardized_lognormal_radial(excess_kurtosis: f64, rng: &mut StdRng) -> f64 
 /// multiplier whose rank-1 lattice covers the square most uniformly, so the
 /// planted cloud spreads over the torus instead of tracing a thin knot.
 fn coprime_winding(n: usize) -> usize {
+    // `(√5 − 1)/2 = 1/φ`, the golden-ratio conjugate.
     let nearest = (n as f64 * (5.0_f64.sqrt() - 1.0) / 2.0).round() as usize;
     let mut offset = 0usize;
     loop {
