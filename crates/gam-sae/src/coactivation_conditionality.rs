@@ -15,7 +15,6 @@
 //! the bottom of the module. They are not part of the conditionality metric.
 
 use crate::null_battery::ClaimNullCalibration;
-use gam_solve::row_sampling_measure::{DesignedRowSample, MeasureProvenance, RowSamplingMeasure};
 use gam_terms::basis::{BasisOptions, Dense, KnotSource, create_basis};
 use ndarray::{Array1, ArrayView2};
 use std::collections::BTreeMap;
@@ -124,56 +123,6 @@ pub struct ResidualGateActivities {
     pub residual_j: Vec<f64>,
     pub active_i: Vec<bool>,
     pub active_j: Vec<bool>,
-}
-
-/// Evaluate partition-free conditionality on a deterministic designed subsample
-/// from a [`RowSamplingMeasure`].
-pub fn estimate_from_measure(
-    gate_i: &[f64],
-    gate_j: &[f64],
-    continuous_context: &[f64],
-    diagnostic_labels: Option<&[usize]>,
-    measure: &RowSamplingMeasure,
-    budget: usize,
-    seed: u64,
-    config: VaryingCoefficientConfig,
-) -> Result<CoactivationConditionality, String> {
-    if measure.n_rows() != gate_i.len() {
-        return Err(format!(
-            "estimate_from_measure: measure has {} rows, gates have {}",
-            measure.n_rows(),
-            gate_i.len()
-        ));
-    }
-    let sample = measure.designed_subsample(budget, seed);
-    estimate_from_designed_sample(
-        gate_i,
-        gate_j,
-        continuous_context,
-        diagnostic_labels,
-        &sample,
-        config,
-    )
-}
-
-/// Evaluate partition-free conditionality on an already-drawn designed sample.
-pub fn estimate_from_designed_sample(
-    gate_i: &[f64],
-    gate_j: &[f64],
-    continuous_context: &[f64],
-    diagnostic_labels: Option<&[usize]>,
-    sample: &DesignedRowSample,
-    config: VaryingCoefficientConfig,
-) -> Result<CoactivationConditionality, String> {
-    estimate_on_rows(
-        gate_i,
-        gate_j,
-        continuous_context,
-        diagnostic_labels,
-        &sample.rows,
-        &sample.likelihood_weights,
-        config,
-    )
 }
 
 /// Evaluate partition-free conditionality on explicit selected rows and per-row
@@ -494,52 +443,6 @@ pub fn residual_gate_activities(
         active_i,
         active_j,
     })
-}
-
-/// Deterministic residual-cluster labels from explicit centroids. These labels
-/// are naming diagnostics only; they never define conditionality.
-pub fn derive_residual_cluster_labels(
-    residuals: ArrayView2<'_, f64>,
-    centroids: ArrayView2<'_, f64>,
-) -> Result<Vec<usize>, String> {
-    let (n, p) = residuals.dim();
-    let (k, cp) = centroids.dim();
-    if p != cp {
-        return Err(format!(
-            "derive_residual_cluster_labels: residual width {p} != centroid width {cp}"
-        ));
-    }
-    if k == 0 {
-        return Err("derive_residual_cluster_labels: need at least one centroid".to_string());
-    }
-    let mut labels = Vec::with_capacity(n);
-    for row in 0..n {
-        let mut best = 0usize;
-        let mut best_dist = f64::INFINITY;
-        for c in 0..k {
-            let mut dist = 0.0;
-            for col in 0..p {
-                let d = residuals[[row, col]] - centroids[[c, col]];
-                dist += d * d;
-            }
-            if dist < best_dist {
-                best_dist = dist;
-                best = c;
-            }
-        }
-        labels.push(best);
-    }
-    Ok(labels)
-}
-
-/// Convenience full-pass sample for tests and exact in-memory callers.
-pub fn full_pass_rows(n: usize) -> DesignedRowSample {
-    DesignedRowSample {
-        provenance: MeasureProvenance::Uniform,
-        rows: (0..n).collect(),
-        likelihood_weights: vec![1.0; n],
-        expected_size: n as f64,
-    }
 }
 
 fn validate_partition_free_inputs(

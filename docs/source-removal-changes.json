@@ -1417,7 +1417,14 @@
   {
     "base": "36bf99559b084974eedd1298d5a8a31af2ec4349",
     "items": [
+      "crates/gam-solve/src/arrow_schur/newton_step.rs:const:CHUNK",
+      "crates/gam-solve/src/arrow_schur/newton_step.rs:const:CROSS_ROW_CG_ABS_TOL",
+      "crates/gam-solve/src/arrow_schur/newton_step.rs:const:CROSS_ROW_CG_ITER_MULTIPLE",
+      "crates/gam-solve/src/arrow_schur/newton_step.rs:const:CROSS_ROW_CG_MIN_ITER_BUDGET",
+      "crates/gam-solve/src/arrow_schur/newton_step.rs:const:CROSS_ROW_CG_REL_TOL",
+      "crates/gam-solve/src/arrow_schur/newton_step.rs:fn:apply",
       "crates/gam-solve/src/arrow_schur/newton_step.rs:fn:arrow_cross_row_matvec",
+      "crates/gam-solve/src/arrow_schur/newton_step.rs:fn:build",
       "crates/gam-solve/src/arrow_schur/newton_step.rs:fn:cholesky_solve_lower",
       "crates/gam-solve/src/arrow_schur/newton_step.rs:fn:dot2",
       "crates/gam-solve/src/arrow_schur/newton_step.rs:fn:solve_arrow_newton_step_cross_row",
@@ -1613,5 +1620,29 @@
     ],
     "reason": "Deleted production modules no production code used (#2469 test-only sweep): gam-inference functionals; gam-models output_axis, indexed_bernoulli, indexed_point_process and latent_coordinate with their two LAML integration tests; gam-gpu encode_throughput with its measured-throughput test. The removed tests exercised only the deleted surface.",
     "evidence": "No production reference to any deleted module path or item outside the deleted files and their own tests. MSI cargo check --workspace --all-targets at b66a7d04e with the patch applied: rc 0, 0 errors, 0 warnings (job 421918). Guard items (142) and census delta measured on MSI (job 423156)."
+  },
+  {
+    "base": "2c756f482912080766a47bdd96321d9fe5019693",
+    "items": [
+      "crates/gam-sae/src/atom_codes.rs:fn:active_weight_sum",
+      "crates/gam-sae/src/atom_codes.rs:fn:deactivate",
+      "crates/gam-sae/src/atom_codes.rs:fn:weights_matrix",
+      "crates/gam-sae/src/coactivation_conditionality.rs:fn:derive_residual_cluster_labels",
+      "crates/gam-sae/src/coactivation_conditionality.rs:fn:estimate_from_designed_sample",
+      "crates/gam-sae/src/coactivation_conditionality.rs:fn:estimate_from_measure",
+      "crates/gam-sae/src/coactivation_conditionality.rs:fn:full_pass_rows",
+      "crates/gam-sae/src/inference/contracts.rs:fn:compose_with_trace",
+      "crates/gam-sae/src/inference/contracts.rs:fn:from_transport",
+      "crates/gam-sae/src/inference/contracts.rs:fn:holonomy_from_transports",
+      "crates/gam-sae/src/inference/contracts.rs:fn:validate",
+      "crates/gam-sae/src/null_sampler.rs:fn:accumulate",
+      "crates/gam-sae/src/null_sampler.rs:fn:coactivation_exceedance",
+      "crates/gam-sae/src/null_sampler.rs:fn:excess_z",
+      "crates/gam-sae/src/null_sampler.rs:fn:idx",
+      "crates/gam-sae/src/null_sampler.rs:fn:n_obs",
+      "crates/gam-sae/src/null_sampler.rs:struct:CoactivationExceedance"
+    ],
+    "reason": "user directive: delete all useless slop (only used by tests / unused)",
+    "evidence": "At 2c756f482, git grep -nw over crates, src, tests, examples, bench and benches found no caller of any listed item: each is named only by its own definition, its own error strings, doc links or prose. The cascade removals were reachable only through deleted items: estimate_from_designed_sample (called only by estimate_from_measure), Contract::validate (called only by compose_with_trace), CurveballSampler::accumulate (called only by coactivation_exceedance), and CoactivationExceedance with its idx and n_obs methods (returned only by coactivation_exceedance); the CurveballSampler.n_atoms field only accumulate read went with them. No test called any item. MSI verification (ban scanner, workspace --all-targets check, cargo doc -p gam-sae, guard and census) runs on the landed sha."
   }
 ]
