@@ -136,15 +136,22 @@ fn note_started_seed(
     }
 }
 
-/// A one-shot reseed retry returns its own outcome, and that checkpoint knows only
-/// the reseed's starts. Fold in the seeds the enclosing attempt already started,
-/// so an ARC budget retry built from the checkpoint cannot replay them (#2817).
-fn with_enclosing_started_seed_points(
+/// A one-shot reseed retry returns its own outcome, and that outcome knows only
+/// the reseed's starts. Fold in what the enclosing attempt already spent: the
+/// seeds it started, so an ARC budget retry built from the checkpoint cannot
+/// replay them, and their iterations, so the total covers every start (#2817).
+fn with_enclosing_attempt_ledger(
     outcome: PlanRunOutcome,
     started_seed_points: &[Array1<f64>],
+    spent_seed_iterations: usize,
 ) -> PlanRunOutcome {
     match outcome {
+        PlanRunOutcome::Converged(mut result) => {
+            result.iterations = result.iterations.saturating_add(spent_seed_iterations);
+            PlanRunOutcome::Converged(result)
+        }
         PlanRunOutcome::Exhausted(mut checkpoint) => {
+            checkpoint.iterations = checkpoint.iterations.saturating_add(spent_seed_iterations);
             for point in started_seed_points {
                 if !checkpoint.started_seed_points.contains(point) {
                     checkpoint.started_seed_points.push(point.clone());
@@ -1644,6 +1651,11 @@ pub(crate) fn run_outer_with_plan(
     // The seed points behind `started_seeds`, recorded by `note_started_seed` and
     // handed to an exhausted checkpoint for the ARC budget retry (#2817).
     let mut started_seed_points: Vec<Array1<f64>> = Vec::new();
+    // Iterations spent by every seed this attempt started. `OuterResult.iterations`
+    // is the total across solver starts, but a seed's result knows only its own
+    // run, so a sweep whose earlier seeds exhausted their budgets used to read as
+    // one short run (#2817).
+    let mut spent_seed_iterations: usize = 0;
     // Set to `Some(key)` when every observed rejection so far carries
     // the same genuinely structural `(KktRefusalDiagnosis,
     // carrying_block)` pair AND we've seen at least
@@ -2756,7 +2768,9 @@ pub(crate) fn run_outer_with_plan(
                                     let mut result = outer_result_with_gradient_norm(
                                         best.rho,
                                         best.value,
-                                        best.iterations,
+                                        // The run spent its whole budget; `best.iterations`
+                                        // is only the index of the iterate adopted here.
+                                        last_solution.iterations,
                                         Some(best.grad_norm),
                                         false,
                                         *the_plan,
@@ -3650,6 +3664,7 @@ pub(crate) fn run_outer_with_plan(
                     candidate.final_value,
                     candidate.solver_claimed_convergence(),
                 );
+                spent_seed_iterations = spent_seed_iterations.saturating_add(candidate.iterations);
                 if !candidate.solver_claimed_convergence() {
                     // #2748 — record the point BEFORE the checkpoint consumes
                     // the candidate. An exhausted iterate is resumable work and
@@ -3873,6 +3888,9 @@ pub(crate) fn run_outer_with_plan(
 
     if let Some(certified) = best {
         let mut result = certified.into_result();
+        // Certification attaches a certificate and changes no count, so the
+        // winner's total is the ledger, its own run included.
+        result.iterations = spent_seed_iterations;
         result.refused_seed_points =
             certificate_refused_seed_points(&seed_rejections, &seeds, &budget_exhausted_seed_points);
         // NO mint audit here (#2359). Every candidate above was screened at
@@ -3959,7 +3977,11 @@ pub(crate) fn run_outer_with_plan(
         obj.reset();
         match run_outer_with_plan(obj, &retry_config, context, cap, the_plan, false) {
             Ok(outcome) => {
-                return Ok(with_enclosing_started_seed_points(outcome, &started_seed_points));
+                return Ok(with_enclosing_attempt_ledger(
+                    outcome,
+                    &started_seed_points,
+                    spent_seed_iterations,
+                ));
             }
             Err(retry_error) => {
                 log::warn!(
@@ -3992,7 +4014,11 @@ pub(crate) fn run_outer_with_plan(
         obj.reset();
         match run_outer_with_plan(obj, &retry_config, context, cap, the_plan, false) {
             Ok(outcome) => {
-                return Ok(with_enclosing_started_seed_points(outcome, &started_seed_points));
+                return Ok(with_enclosing_attempt_ledger(
+                    outcome,
+                    &started_seed_points,
+                    spent_seed_iterations,
+                ));
             }
             Err(retry_error) => {
                 log::warn!(
@@ -4007,6 +4033,8 @@ pub(crate) fn run_outer_with_plan(
         checkpoint.refused_seed_points =
             certificate_refused_seed_points(&seed_rejections, &seeds, &budget_exhausted_seed_points);
         checkpoint.started_seed_points = started_seed_points;
+        // Every started seed's iterations, this checkpoint's own included.
+        checkpoint.iterations = spent_seed_iterations;
         return Ok(PlanRunOutcome::Exhausted(checkpoint));
     }
 
