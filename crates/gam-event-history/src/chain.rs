@@ -433,27 +433,44 @@ pub(crate) struct AtomTransition<S> {
     pub d2phi: S,
 }
 
-/// Beyond this `κ`, `e^{-κ}` is below the smallest subnormal `f64`, so `φ`
-/// is exactly zero and every quantity derived from the transition is exactly
-/// constant; holding `κ` there keeps `κ φ` from becoming `∞ · 0`.
-const KAPPA_SATURATION: f64 = 745.0;
-
 impl<S: JetField> AtomTransition<S> {
     pub fn new(kappa: &S) -> Self {
-        let saturated;
-        let kappa = if kappa.value() >= KAPPA_SATURATION {
-            saturated = kappa.constant_like(KAPPA_SATURATION);
-            &saturated
-        } else {
-            kappa
-        };
         let k = kappa.value();
+        if k == f64::INFINITY {
+            return Self {
+                phi: kappa.constant_like(0.0),
+                innovation: kappa.constant_like(1.0),
+                dphi: kappa.constant_like(0.0),
+                d2phi: kappa.constant_like(0.0),
+            };
+        }
         let e = (-k).exp();
         let one_minus_phi = kappa.compose_unary([-(-k).exp_m1(), e, -e, e, -e]);
-        let phi = one_minus_phi.neg().add(&kappa.constant_like(1.0));
+        // Reconstructing phi as 1-(1-exp(-k)) rounds it to zero near k=38,
+        // even though its value and derivatives remain representable.
+        let phi = kappa.compose_unary([e, -e, e, -e, e]);
         let innovation = one_minus_phi.mul(&add_real(&phi, 1.0));
-        let dphi = kappa.mul(&phi).neg();
-        let d2phi = kappa.mul(&phi).mul(&add_real(kappa, -1.0));
+        // Keep k*exp(-k) and k²*exp(-k) representable even after exp(-k)
+        // underflows. Their derivative stacks follow from Leibniz's rule.
+        let (p1, p2) = if k <= 1.0 {
+            (k * e, k * k * e)
+        } else {
+            ((k.ln() - k).exp(), (2.0 * k.ln() - k).exp())
+        };
+        let dphi = kappa.compose_unary([
+            -p1,
+            p1 - e,
+            2.0 * e - p1,
+            p1 - 3.0 * e,
+            4.0 * e - p1,
+        ]);
+        let d2phi = kappa.compose_unary([
+            p2 - p1,
+            -p2 + 3.0 * p1 - e,
+            p2 - 5.0 * p1 + 4.0 * e,
+            -p2 + 7.0 * p1 - 9.0 * e,
+            p2 - 9.0 * p1 + 16.0 * e,
+        ]);
         Self {
             phi,
             innovation,
