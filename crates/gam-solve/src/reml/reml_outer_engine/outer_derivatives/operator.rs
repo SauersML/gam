@@ -746,6 +746,25 @@ impl gam_problem::HessianOperator for UnifiedHessianOperator {
         self.coords.len()
     }
 
+    /// On the Gaussian kernel every output row is a contraction of the K×K
+    /// tables `build_outer_hessian_operator` precomputed (`pair_a`, `pair_ld_s`,
+    /// `g_dot_v`, `base_h2`, `m_pair_trace`, `cross_trace`) with no per-apply
+    /// trace correction, so probing the K basis directions costs K² table
+    /// entries and no design pass. The planner then hands a small exact Hessian
+    /// to a solver that factors it rather than to truncated matrix-free CG
+    /// (#2735). A contracted ψψ hook runs a family row pass per apply, and the
+    /// scalar-GLM and callback kernels trace per apply, so those stay
+    /// matrix-free.
+    fn materialization(&self) -> opt::HessianMaterialization {
+        if matches!(self.kernel, OuterHessianDerivativeKernel::Gaussian)
+            && self.contracted_psi.is_none()
+        {
+            opt::HessianMaterialization::Explicit
+        } else {
+            opt::HessianMaterialization::Unavailable
+        }
+    }
+
     /// Zero-alloc override for the inner-CG hot path.
     ///
     /// Results are written directly into the caller-supplied `out` buffer via
