@@ -95,10 +95,7 @@ pub struct RhoMixtureNode {
 /// Gaussians, with the posterior moment summary of `ρ` itself.
 ///
 /// The conditional Gaussian at each node is exactly what the engine already
-/// produces at fixed `ρ`; this struct owns the node locations and weights, and
-/// `mixture_coefficient_covariance` (monolith `inference::rho_posterior`)
-/// assembles the mixture-corrected coefficient covariance from per-node
-/// conditionals supplied by the caller.
+/// produces at fixed `ρ`; this struct owns the node locations and weights.
 #[derive(Debug, Clone)]
 pub struct RhoPosteriorMixture {
     /// Quadrature nodes with normalized weights (weights sum to 1).

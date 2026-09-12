@@ -51,7 +51,6 @@
 
 use gam_solve::estimate::EstimationError;
 use gam_solve::psis::pareto_smooth_weights;
-use gam_solve::rho_optimizer::OuterObjective;
 use ndarray::{Array1, Array2};
 
 // The `ρ`-posterior certificate/escalation DATA types were contract-downed to
@@ -94,30 +93,6 @@ impl gam_problem::rho_posterior::RhoPosteriorEscalator for HmcIoRhoPosteriorEsca
     ) -> RhoPosteriorEscalation {
         escalate_rho_posterior(rho_hat, outer_hessian, criterion, criterion_and_grad)
     }
-}
-
-/// One deterministic Tier-1 quadrature node for `π(ρ|y)`.
-#[derive(Debug, Clone)]
-pub struct RhoQuadratureNode {
-    /// Smoothing parameters at this node.
-    pub rho: Array1<f64>,
-    /// Normalized node probability after reweighting the Gaussian proposal by the
-    /// exact profiled criterion.
-    pub weight: f64,
-    /// Normalized log node probability.
-    pub log_weight: f64,
-    /// Exact profiled criterion value at the node.
-    pub cost: f64,
-    /// Exact profiled outer gradient at the node.
-    pub gradient: Array1<f64>,
-}
-
-/// Tier-1 higher-order Laplace/quadrature approximation to `π(ρ|y)`.
-#[derive(Debug, Clone)]
-pub struct RhoQuadratureMixture {
-    pub nodes: Vec<RhoQuadratureNode>,
-    pub effective_sample_size: f64,
-    pub max_gradient_norm: f64,
 }
 
 /// Largest `K` for which the Tier-1 Gauss-Hermite product grid is affordable
@@ -405,47 +380,6 @@ where
     Ok((nodes, ess))
 }
 
-/// Tier-1 deterministic higher-order Laplace quadrature over `ρ`, the
-/// `OuterObjective` form.
-///
-/// The input Hessian defines the local Gaussian proposal around `rho_hat`; each
-/// Gauss-Hermite node is reweighted by the exact profiled criterion,
-/// `exp(-V(ρ_node) + V(ρ_hat) + 0.5 ||z||²)`, and stores the exact profiled
-/// gradient from `OuterObjective::eval`.
-pub fn rho_posterior_tier1_quadrature(
-    objective: &mut dyn OuterObjective,
-    rho_hat: &Array1<f64>,
-    outer_hessian: &Array2<f64>,
-    nodes_per_axis: usize,
-) -> Result<RhoQuadratureMixture, EstimationError> {
-    let cost_hat = objective.eval_cost(rho_hat)?;
-    let (core_nodes, effective_sample_size) =
-        quadrature_nodes_core(rho_hat, outer_hessian, nodes_per_axis, cost_hat, |rho| {
-            let eval = objective.eval(rho)?;
-            Ok(Some((eval.cost, Some(eval.gradient))))
-        })?;
-    let k = rho_hat.len();
-    let mut nodes = Vec::with_capacity(core_nodes.len());
-    let mut max_gradient_norm = 0.0_f64;
-    for node in core_nodes {
-        let gradient = node.gradient.unwrap_or_else(|| Array1::zeros(k));
-        let grad_norm = gradient.iter().map(|g| g * g).sum::<f64>().sqrt();
-        max_gradient_norm = max_gradient_norm.max(grad_norm);
-        nodes.push(RhoQuadratureNode {
-            rho: node.rho,
-            weight: node.weight,
-            log_weight: node.log_weight,
-            cost: node.cost,
-            gradient,
-        });
-    }
-    Ok(RhoQuadratureMixture {
-        nodes,
-        effective_sample_size,
-        max_gradient_norm,
-    })
-}
-
 /// Posterior moments of a normalized discrete mixture over `ρ`.
 fn mixture_moments(nodes: &[RhoMixtureNode], k: usize) -> (Array1<f64>, Array2<f64>) {
     let mut mean = Array1::<f64>::zeros(k);
@@ -515,95 +449,6 @@ where
         mean,
         covariance,
         effective_sample_size,
-    })
-}
-
-/// Mixture-corrected coefficient posterior moments (law of total
-/// variance/expectation over the `ρ` mixture). See
-/// [`mixture_coefficient_covariance`].
-#[derive(Debug, Clone)]
-pub struct MixtureCoefficientCovariance {
-    /// Mixture posterior mean `β̄ = Σ_m w_m β̂(ρ_m)`.
-    pub beta_bar: Array1<f64>,
-    /// `Vβ_marginal = Σ_m w_m [Vb(ρ_m) + (β̂(ρ_m)−β̄)(β̂(ρ_m)−β̄)ᵀ]`.
-    pub covariance: Array2<f64>,
-}
-
-/// Assemble the mixture-corrected coefficient covariance from a Tier-1 mixture:
-///
-/// `Vβ_marginal = Σ_m w_m [Vb(ρ_m) + (β̂(ρ_m)−β̄)(β̂(ρ_m)−β̄)ᵀ]`,
-/// `β̄ = Σ_m w_m β̂(ρ_m)`
-///
-/// — the law of total expectation/variance over the discrete `π(ρ|y)` mixture,
-/// where each node's conditional is the Gaussian `N(β̂(ρ_m), Vb(ρ_m))` the
-/// engine already produces at fixed `ρ`.
-///
-/// * `conditional` — supplies `(β̂(ρ_m), Vb(ρ_m))` for a node's `ρ_m`. The
-///   caller holding the fit implements this as ONE WARM INNER PROFILE SOLVE per
-///   node (the same inner solve the node's criterion evaluation already ran,
-///   re-run warm-started, plus the conditional covariance assembly); evaluate
-///   nodes in the order given (nearest-to-`ρ̂` first in the GH enumeration) to
-///   keep warm starts effective. Nodes with zero weight are skipped and never
-///   passed to the closure.
-///
-/// When all mixture weight concentrates at `ρ̂`, the spread term vanishes and
-/// the result reduces to `Vb(ρ̂)` exactly.
-pub fn mixture_coefficient_covariance<G>(
-    mixture: &RhoPosteriorMixture,
-    mut conditional: G,
-) -> Result<MixtureCoefficientCovariance, EstimationError>
-where
-    G: FnMut(&Array1<f64>) -> Result<(Array1<f64>, Array2<f64>), EstimationError>,
-{
-    let mut conditionals: Vec<(f64, Array1<f64>, Array2<f64>)> = Vec::new();
-    let mut total_weight = 0.0;
-    for node in &mixture.nodes {
-        if node.weight <= 0.0 {
-            continue;
-        }
-        let (beta, vb) = conditional(&node.rho)?;
-        if vb.nrows() != beta.len() || vb.ncols() != beta.len() {
-            return Err(EstimationError::RemlOptimizationFailed(format!(
-                "mixture_coefficient_covariance: Vb shape {:?} does not match beta length {}",
-                vb.dim(),
-                beta.len()
-            )));
-        }
-        if let Some((_, first_beta, _)) = conditionals.first()
-            && first_beta.len() != beta.len()
-        {
-            return Err(EstimationError::RemlOptimizationFailed(
-                "mixture_coefficient_covariance: inconsistent beta length across nodes".to_string(),
-            ));
-        }
-        total_weight += node.weight;
-        conditionals.push((node.weight, beta, vb));
-    }
-    if conditionals.is_empty() || !(total_weight.is_finite() && total_weight > 0.0) {
-        return Err(EstimationError::RemlOptimizationFailed(
-            "mixture_coefficient_covariance: no positive-weight nodes".to_string(),
-        ));
-    }
-    let p = conditionals[0].1.len();
-    let mut beta_bar = Array1::<f64>::zeros(p);
-    for (weight, beta, _) in &conditionals {
-        for i in 0..p {
-            beta_bar[i] += (weight / total_weight) * beta[i];
-        }
-    }
-    let mut covariance = Array2::<f64>::zeros((p, p));
-    for (weight, beta, vb) in &conditionals {
-        let w = weight / total_weight;
-        for i in 0..p {
-            let di = beta[i] - beta_bar[i];
-            for j in 0..p {
-                covariance[[i, j]] += w * (vb[[i, j]] + di * (beta[j] - beta_bar[j]));
-            }
-        }
-    }
-    Ok(MixtureCoefficientCovariance {
-        beta_bar,
-        covariance,
     })
 }
 
