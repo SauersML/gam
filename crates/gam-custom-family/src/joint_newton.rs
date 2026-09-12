@@ -5708,31 +5708,10 @@ pub(crate) fn constrained_stationary_certificate_decision(
 /// genuine active-constraint multiplier, not an H-null defect) and
 /// `linearized_rel ≥ 0.5` (the feasible Newton step leaves the residual, so it is
 /// constraint-normal multiplier mass, not resolvable descent) before accepting.
-pub(crate) fn constrained_numerical_fixed_point_reached(
-    objective_change: f64,
-    objective_floor: f64,
-    scalar_model_relerr: f64,
-    accepted_step_inf: f64,
-    step_tol: f64,
-) -> bool {
-    constrained_numerical_fixed_point_failures(
-        objective_change,
-        objective_floor,
-        scalar_model_relerr,
-        accepted_step_inf,
-        step_tol,
-    )
-    .is_empty()
-}
-
-/// Largest relative error of the scalar Newton model at which the constrained
-/// fixed-point certificate still treats that model as exact.
-pub(crate) const CONSTRAINED_FIXED_POINT_MODEL_RELERR_BOUND: f64 = 1e-3;
-
-/// The conditions of [`constrained_numerical_fixed_point_reached`] that fail,
-/// each with its value and bound. Empty exactly when the fixed point is reached,
-/// so the predicate and the refusal message cannot disagree about which
-/// condition decided.
+///
+/// Returns the conditions that fail, each with its value and bound. The fixed
+/// point is reached exactly when the list is empty, so the certificate and its
+/// refusal message cannot disagree about which condition decided.
 pub(crate) fn constrained_numerical_fixed_point_failures(
     objective_change: f64,
     objective_floor: f64,
@@ -5765,6 +5744,10 @@ pub(crate) fn constrained_numerical_fixed_point_failures(
     }
     failures
 }
+
+/// Largest relative error of the scalar Newton model at which the constrained
+/// fixed-point certificate still treats that model as exact.
+pub(crate) const CONSTRAINED_FIXED_POINT_MODEL_RELERR_BOUND: f64 = 1e-3;
 
 /// The acceptance conditions of the constrained fixed-point certificate that
 /// declined the iterate: the numerical fixed-point failures, or, once those all
@@ -5914,7 +5897,22 @@ mod penalized_hessian_rank_tests {
 
 #[cfg(test)]
 mod constrained_numerical_fixed_point_tests {
-    use super::constrained_numerical_fixed_point_reached;
+    fn constrained_numerical_fixed_point_reached(
+        objective_change: f64,
+        objective_floor: f64,
+        scalar_model_relerr: f64,
+        accepted_step_inf: f64,
+        step_tol: f64,
+    ) -> bool {
+        super::constrained_numerical_fixed_point_failures(
+            objective_change,
+            objective_floor,
+            scalar_model_relerr,
+            accepted_step_inf,
+            step_tol,
+        )
+        .is_empty()
+    }
 
     // Reproduces the gam#2358 gaussian/binomial location-scale monotone-wiggle
     // seed numerics: the OBJECTIVE has reached its machine-eps floor with an exact
