@@ -263,6 +263,458 @@ impl JeffreysHphiDriftBase {
         Ok(result)
     }
 
+    /// `D_w` of [`Self::completion_drift_action`] along a second coefficient direction,
+    /// with `u` and `v` held fixed (gam#2894): the frozen-policy half of
+    /// `D² completion[u, w]·v`. The frozen completion is `−½·g·⟨K, H²[v, e_a]⟩`, so
+    ///
+    /// ```text
+    /// −½[ g_uw⟨K,A⟩ + g_u⟨K_w,A⟩ + g_w⟨K_u,A⟩ + g⟨K_uw,A⟩
+    ///     + g_u⟨K,T_vw⟩ + g_w⟨K,T_uv⟩ + g⟨K_u,T_vw⟩ + g⟨K_w,T_uv⟩ + g⟨K,Q⟩ ]
+    /// ```
+    ///
+    /// with `A = H²[v,e_a]`, `T_uv = H³[u,v,e_a]`, `T_vw = H³[v,w,e_a]`,
+    /// `Q = H⁴[u,v,w,e_a]` in the base eigenbasis, `⟨K,X⟩ = Σ_i f(λ_i)·X_ii`, and `K_u`,
+    /// `K_uw` the first and second Fréchet derivatives of the capped inverse, floor
+    /// motion included. The gate/floor motion drift is not part of this half.
+    pub fn completion_second_drift_frozen(
+        &self,
+        pert_u: &Array2<f64>,
+        pert_w: &Array2<f64>,
+        pert_uw: &Array2<f64>,
+        axes_v: &[Array2<f64>],
+        moving_uv: &[Array2<f64>],
+        moving_vw: &[Array2<f64>],
+        fourth_uvw: &[Array2<f64>],
+    ) -> Result<Array1<f64>, String> {
+        if [pert_u, pert_w, pert_uw].iter().any(|h| h.dim() != (self.p, self.p)) {
+            return Err("Jeffreys completion second drift information dimension mismatch".into());
+        }
+        self.refuse_inverse_kernel_branch_boundary()?;
+        let basis = self.ambient_eigenbasis.view();
+        let e_u = symmetric_basis_contraction(pert_u.view(), basis);
+        let e_w = symmetric_basis_contraction(pert_w.view(), basis);
+        let e_uw = symmetric_basis_contraction(pert_uw.view(), basis);
+        let a = self.rotate_axis_rows(axes_v)?;
+        let t_uv = self.rotate_axis_rows(moving_uv)?;
+        let t_vw = self.rotate_axis_rows(moving_vw)?;
+        let q = self.rotate_axis_rows(fourth_uvw)?;
+        let (m, p) = (self.m, self.p);
+        let FrozenSecondDriftWeights {
+            gate_u: g_u,
+            gate_w: g_w,
+            gate_uw: g_uw,
+            kernel,
+            weight_u,
+            weight_w,
+            weight_uw,
+        } = self.frozen_second_drift_weights(&e_u, &e_w, &e_uw);
+        let g = self.gate_weight;
+        let contract_diagonal = |rows: &Array2<f64>, axis: usize| {
+            (0..m).map(|i| kernel[i] * rows[[axis, i * m + i]]).sum::<f64>()
+        };
+        let contract_full = |weight: &Array2<f64>, rows: &Array2<f64>, axis: usize| {
+            let mut sum = 0.0_f64;
+            for i in 0..m {
+                for j in 0..m {
+                    sum += weight[[i, j]] * rows[[axis, i * m + j]];
+                }
+            }
+            sum
+        };
+        let mut result = Array1::<f64>::zeros(p);
+        for axis in 0..p {
+            let k_a = contract_diagonal(&a, axis);
+            let k_t_uv = contract_diagonal(&t_uv, axis);
+            let k_t_vw = contract_diagonal(&t_vw, axis);
+            let k_q = contract_diagonal(&q, axis);
+            let ku_a = contract_full(&weight_u, &a, axis);
+            let kw_a = contract_full(&weight_w, &a, axis);
+            let kuw_a = contract_full(&weight_uw, &a, axis);
+            let ku_t_vw = contract_full(&weight_u, &t_vw, axis);
+            let kw_t_uv = contract_full(&weight_w, &t_uv, axis);
+            result[axis] = -0.5
+                * (g_uw * k_a
+                    + g_u * kw_a
+                    + g_w * ku_a
+                    + g * kuw_a
+                    + g_u * k_t_vw
+                    + g_w * k_t_uv
+                    + g * ku_t_vw
+                    + g * kw_t_uv
+                    + g * k_q);
+        }
+        if result.iter().any(|v| !v.is_finite()) {
+            return Err("Jeffreys completion second drift produced a nonfinite response".into());
+        }
+        Ok(result)
+    }
+
+    /// The gate and floor channels along `u`, `w` and `(u, w)`, and the first and second
+    /// Fréchet weights of the capped inverse in the base eigenbasis: everything the frozen
+    /// second completion drift reads from two directions (gam#2894).
+    fn frozen_second_drift_weights(
+        &self,
+        e_u: &Array2<f64>,
+        e_w: &Array2<f64>,
+        e_uw: &Array2<f64>,
+    ) -> FrozenSecondDriftWeights {
+        let m = self.m;
+        let (imin, imax) = (self.idx_min, self.idx_max);
+        let spectral_scale = self.evals.iter().fold(1.0_f64, |acc, value| acc.max(value.abs()));
+        let tie_tolerance = 64.0 * f64::EPSILON * spectral_scale;
+        let second_extreme = |e: usize| {
+            e_uw[[e, e]] + simple_eigenvalue_second_form(&self.evals, tie_tolerance, e, e_u, e_w)
+        };
+        let (lmin_u, lmax_u) = (e_u[[imin, imin]], e_u[[imax, imax]]);
+        let (lmin_w, lmax_w) = (e_w[[imin, imin]], e_w[[imax, imax]]);
+        let (lmin_uw, lmax_uw) = (second_extreme(imin), second_extreme(imax));
+        let (g1, g2) = conditioning_gate_weight_grad(self.evals[imin], self.evals[imax]);
+        let (g11, g12, g22) = conditioning_gate_weight_hess(self.evals[imin], self.evals[imax]);
+        let gate_u = g1 * lmin_u + g2 * lmax_u;
+        let gate_w = g1 * lmin_w + g2 * lmax_w;
+        let gate_uw = g11 * lmin_u * lmin_w
+            + g12 * (lmin_u * lmax_w + lmax_u * lmin_w)
+            + g22 * lmax_u * lmax_w
+            + g1 * lmin_uw
+            + g2 * lmax_uw;
+        let rate = if self.floor_in_relative_regime {
+            REDUCED_INFO_RELATIVE_FLOOR
+        } else {
+            0.0
+        };
+        let (floor_u, floor_w, floor_uw) = (rate * lmax_u, rate * lmax_w, rate * lmax_uw);
+        let divided = self.divided_differences();
+        let kernel: Vec<f64> = (0..m).map(|i| inverse_difference(&[self.evals[i]], self.floor, 0)).collect();
+        let kernel_floor: Vec<f64> =
+            (0..m).map(|i| inverse_difference(&[self.evals[i]], self.floor, 1)).collect();
+        let kernel_floor_floor: Vec<f64> =
+            (0..m).map(|i| inverse_difference(&[self.evals[i]], self.floor, 2)).collect();
+        // `D²f[E_u, E_w]_ij + Df[E_uw]_ij + floor channels`: the spectral weights the second
+        // Fréchet contraction reads, formed once for every axis.
+        let mut weight_uw = Array2::<f64>::zeros((m, m));
+        let mut weight_u = Array2::<f64>::zeros((m, m));
+        let mut weight_w = Array2::<f64>::zeros((m, m));
+        for i in 0..m {
+            for j in 0..m {
+                let pair = divided.pairs[0][i * m + j];
+                let pair_floor = divided.pairs[1][i * m + j];
+                let mut second = pair * e_uw[[i, j]]
+                    + pair_floor * (floor_u * e_w[[i, j]] + floor_w * e_u[[i, j]]);
+                for k in 0..m {
+                    second += divided.triple(0, i, k, j)
+                        * (e_u[[i, k]] * e_w[[k, j]] + e_w[[i, k]] * e_u[[k, j]]);
+                }
+                weight_uw[[i, j]] = second;
+                weight_u[[i, j]] = pair * e_u[[i, j]];
+                weight_w[[i, j]] = pair * e_w[[i, j]];
+            }
+            weight_uw[[i, i]] += floor_u * floor_w * kernel_floor_floor[i] + floor_uw * kernel_floor[i];
+            weight_u[[i, i]] += floor_u * kernel_floor[i];
+            weight_w[[i, i]] += floor_w * kernel_floor[i];
+        }
+        FrozenSecondDriftWeights {
+            gate_u,
+            gate_w,
+            gate_uw,
+            kernel,
+            weight_u,
+            weight_w,
+            weight_uw,
+        }
+    }
+
+    /// The frozen-policy half of `D² completion[u, w]` as a matrix (gam#2894):
+    ///
+    /// ```text
+    /// CTH(W₀₀) + CTH_w(W₀ᵤ) + CTH_u(W₁w) + CTH_uw(W₁₁),
+    /// W₀₀ = −½(G_uw K + G_u K_w + G_w K_u + G K_uw),   W₀ᵤ = −½(G_u K + G K_u),
+    /// W₁w = −½(G_w K + G K_w),                          W₁₁ = −½ G K,
+    /// ```
+    ///
+    /// `CTH_x(W)_ab = ⟨W, D_x H''[e_a, e_b]⟩`, contractions supplied by the caller. Every
+    /// column is [`Self::completion_second_drift_frozen`] along that axis.
+    pub fn frozen_completion_second_drift_matrix(
+        &self,
+        pert_u: &Array2<f64>,
+        pert_w: &Array2<f64>,
+        pert_uw: &Array2<f64>,
+        contracted: &dyn Fn(&Array2<f64>) -> Result<Array2<f64>, String>,
+        contracted_along_u: &dyn Fn(&Array2<f64>) -> Result<Array2<f64>, String>,
+        contracted_along_w: &dyn Fn(&Array2<f64>) -> Result<Array2<f64>, String>,
+        contracted_along_uw: &dyn Fn(&Array2<f64>) -> Result<Array2<f64>, String>,
+    ) -> Result<Array2<f64>, String> {
+        if [pert_u, pert_w, pert_uw].iter().any(|h| h.dim() != (self.p, self.p)) {
+            return Err("Jeffreys frozen completion second drift matrix dimension mismatch".into());
+        }
+        self.refuse_inverse_kernel_branch_boundary()?;
+        let basis = &self.ambient_eigenbasis;
+        let e_u = symmetric_basis_contraction(pert_u.view(), basis.view());
+        let e_w = symmetric_basis_contraction(pert_w.view(), basis.view());
+        let e_uw = symmetric_basis_contraction(pert_uw.view(), basis.view());
+        let FrozenSecondDriftWeights {
+            gate_u,
+            gate_w,
+            gate_uw,
+            kernel,
+            weight_u,
+            weight_w,
+            weight_uw,
+        } = self.frozen_second_drift_weights(&e_u, &e_w, &e_uw);
+        let g = self.gate_weight;
+        let ambient = |reduced: &Array2<f64>| basis.dot(reduced).dot(&basis.t());
+        let kernel = ambient(&Array2::from_diag(&Array1::from_vec(kernel)));
+        let kernel_u = ambient(&weight_u);
+        let kernel_w = ambient(&weight_w);
+        let kernel_uw = ambient(&weight_uw);
+        let now = (&kernel * gate_uw + &kernel_w * gate_u + &kernel_u * gate_w + &kernel_uw * g) * -0.5;
+        let along_w = (&kernel * gate_u + &kernel_u * g) * -0.5;
+        let along_u = (&kernel * gate_w + &kernel_w * g) * -0.5;
+        let along_uw = &kernel * (-0.5 * g);
+        let mut result = contracted(&now)?
+            + contracted_along_w(&along_w)?
+            + contracted_along_u(&along_u)?
+            + contracted_along_uw(&along_uw)?;
+        symmetrize_contiguous(&mut result);
+        if result.iter().any(|value| !value.is_finite()) {
+            return Err("Jeffreys frozen completion second drift matrix produced nonfinite curvature".into());
+        }
+        Ok(result)
+    }
+
+    /// The first β-drift of the complete second-order completion as a matrix,
+    /// `D_u completion` (gam#2894). With `completion = −½·G·CTH(K) − CTH(E) − R`, where
+    /// `CTH(W)_ab = ⟨W, H''[e_a, e_b]⟩`, `K` the capped inverse on the Jeffreys span and
+    /// `(E, R)` the gate/floor motion of [`JointJeffreysHessianMotion`],
+    ///
+    /// ```text
+    /// D_u completion = CTH(W₀) + CTH_u(W₁) − D_u R,
+    /// W₀ = −½·G_u·K − ½·G·K_u − D_u E,    W₁ = −½·G·K − E,
+    /// ```
+    ///
+    /// `CTH_u(W)_ab = ⟨W, H'''[u, e_a, e_b]⟩`. The two contractions are the caller's (a
+    /// family's contracted-trace hooks); everything spectral is formed here from
+    /// `H[u]` and the rotated `{H''[u, e_a]}`. Every column is the motion-completed
+    /// [`Self::completion_drift_action_from_rotated`] along that axis.
+    pub fn completion_drift_matrix(
+        &self,
+        pert_u: &Array2<f64>,
+        second_u: &JeffreysRotatedAxes,
+        contracted: &dyn Fn(&Array2<f64>) -> Result<Array2<f64>, String>,
+        contracted_along_u: &dyn Fn(&Array2<f64>) -> Result<Array2<f64>, String>,
+    ) -> Result<Array2<f64>, String> {
+        let (p, m) = (self.p, self.m);
+        if pert_u.dim() != (p, p) || second_u.rows.dim() != (p, m * m) {
+            return Err("Jeffreys completion drift matrix dimension mismatch".into());
+        }
+        let basis = &self.ambient_eigenbasis;
+        let e_u = symmetric_basis_contraction(pert_u.view(), basis.view());
+        let b_u = &second_u.rows;
+        let a_rows = &self.a_rows;
+        let (imin, imax) = (self.idx_min, self.idx_max);
+        let evals = &self.evals;
+        let floor = self.floor;
+        let gate = self.gate_weight;
+        let spectral_scale = evals.iter().fold(1.0_f64, |acc, value| acc.max(value.abs()));
+        let tie_tolerance = 64.0 * f64::EPSILON * spectral_scale;
+        let rate = if self.floor_in_relative_regime {
+            REDUCED_INFO_RELATIVE_FLOOR
+        } else {
+            0.0
+        };
+        let (lambda_min, lambda_max) = (evals[imin], evals[imax]);
+        let (g1, g2) = conditioning_gate_weight_grad(lambda_min, lambda_max);
+        let divided = self.divided_differences();
+        let inverse: Vec<f64> = (0..m).map(|i| floored_inverse(evals[i], floor)).collect();
+        let inverse_floor: Vec<f64> =
+            (0..m).map(|i| floored_inverse_floor_sensitivity(evals[i], floor)).collect();
+        let lambda_min_u = e_u[[imin, imin]];
+        let lambda_max_u = e_u[[imax, imax]];
+        let gate_u = g1 * lambda_min_u + g2 * lambda_max_u;
+        let floor_u = rate * lambda_max_u;
+        let ambient = |reduced: &Array2<f64>| basis.dot(reduced).dot(&basis.t());
+        let kernel = ambient(&Array2::from_diag(&Array1::from_vec(inverse.clone())));
+        let mut kernel_u_reduced = Array2::<f64>::zeros((m, m));
+        for i in 0..m {
+            for j in 0..m {
+                kernel_u_reduced[[i, j]] = divided.pairs[0][i * m + j] * e_u[[i, j]];
+            }
+            kernel_u_reduced[[i, i]] += floor_u * inverse_floor[i];
+        }
+        let kernel_u = ambient(&kernel_u_reduced);
+        let mut weight_now = &kernel * (-0.5 * gate_u) + &kernel_u * (-0.5 * gate);
+        let mut weight_along_u = &kernel * (-0.5 * gate);
+        let motion = self.hessian_motion_active();
+        let mut remainder_drift = Array2::<f64>::zeros((p, p));
+        if motion {
+            let (g11, g12, g22) = conditioning_gate_weight_hess(lambda_min, lambda_max);
+            let (g111, g112, g122, g222) = conditioning_gate_weight_third(lambda_min, lambda_max);
+            let mut ungated = 0.0_f64;
+            let (mut s_f, mut s_ff, mut s_fff) = (0.0_f64, 0.0_f64, 0.0_f64);
+            let mut inverse_lambda_floor = vec![0.0_f64; m];
+            let mut inverse_floor_floor = vec![0.0_f64; m];
+            for i in 0..m {
+                let lambda = evals[i];
+                ungated += jeffreys_antiderivative(lambda, floor);
+                s_f += jeffreys_antiderivative_floor_sensitivity(lambda, floor);
+                s_ff += jeffreys_antiderivative_floor_second_sensitivity(lambda, floor);
+                s_fff += jeffreys_antiderivative_floor_third_sensitivity(lambda, floor);
+                inverse_lambda_floor[i] = floored_inverse_lambda_floor_sensitivity(lambda, floor);
+                inverse_floor_floor[i] = floored_inverse_floor_second_sensitivity(lambda, floor);
+            }
+            ungated *= 0.5;
+            let value_u = 0.5 * (0..m).map(|i| inverse[i] * e_u[[i, i]]).sum::<f64>()
+                + 0.5 * s_f * rate * lambda_max_u;
+            let floor_trace_u = (0..m).map(|i| inverse_floor[i] * e_u[[i, i]]).sum::<f64>();
+            let s_f_u = floor_trace_u + s_ff * rate * lambda_max_u;
+            let s_ff_u = s_fff * rate * lambda_max_u
+                + (0..m).map(|i| inverse_floor_floor[i] * e_u[[i, i]]).sum::<f64>();
+            // Extreme weights of `E` and their drift.
+            let omega_min = ungated * g1;
+            let omega_max = ungated * g2 + 0.5 * gate * s_f * rate;
+            let omega_min_u = value_u * g1 + ungated * (g11 * lambda_min_u + g12 * lambda_max_u);
+            let omega_max_u = value_u * g2
+                + ungated * (g12 * lambda_min_u + g22 * lambda_max_u)
+                + 0.5 * rate * (gate_u * s_f + gate * s_f_u);
+            let gap = |e: usize, j: usize| simple_eigenvalue_gap_inverse(evals, tie_tolerance, e, j);
+            let eigenvector_drift = |e: usize| {
+                let reduced = Array1::from_shape_fn(m, |j| e_u[[j, e]] * gap(e, j));
+                basis.dot(&reduced)
+            };
+            let outer = |x: &Array1<f64>, y: &Array1<f64>| {
+                Array2::from_shape_fn((x.len(), y.len()), |(i, j)| x[i] * y[j])
+            };
+            let mut extreme_weight = Array2::<f64>::zeros((p, p));
+            let mut extreme_weight_u = Array2::<f64>::zeros((p, p));
+            for (e, omega, omega_u) in [(imin, omega_min, omega_min_u), (imax, omega_max, omega_max_u)] {
+                let z = basis.column(e).to_owned();
+                let z_u = eigenvector_drift(e);
+                extreme_weight.scaled_add(omega, &outer(&z, &z));
+                extreme_weight_u.scaled_add(omega_u, &outer(&z, &z));
+                extreme_weight_u.scaled_add(omega, &(outer(&z_u, &z) + outer(&z, &z_u)));
+            }
+            weight_now -= &extreme_weight_u;
+            weight_along_u -= &extreme_weight;
+            // Axis objects of `R` and their drift along u.
+            let row_entry = |rows: &Array2<f64>, a: usize, i: usize, j: usize| rows[[a, i * m + j]];
+            let q_min = Array1::from_shape_fn(p, |a| row_entry(a_rows, a, imin, imin));
+            let q_max = Array1::from_shape_fn(p, |a| row_entry(a_rows, a, imax, imax));
+            let floor_trace =
+                Array1::from_shape_fn(p, |a| (0..m).map(|i| inverse_floor[i] * row_entry(a_rows, a, i, i)).sum::<f64>());
+            let grad_u = Array1::from_shape_fn(p, |a| {
+                0.5 * (0..m).map(|i| inverse[i] * row_entry(a_rows, a, i, i)).sum::<f64>()
+                    + 0.5 * s_f * rate * q_max[a]
+            });
+            let grad_g = &q_min * g1 + &q_max * g2;
+            // `λ_i,au = B̃_au[i,i] + D²λ_i[P̃_a, e_u]` for every eigenvalue.
+            let lambda_au = |i: usize, a: usize| {
+                let mut sum = row_entry(b_u, a, i, i);
+                for j in 0..m {
+                    let inv = gap(i, j);
+                    if inv != 0.0 {
+                        sum += 2.0 * row_entry(a_rows, a, i, j) * e_u[[i, j]] * inv;
+                    }
+                }
+                sum
+            };
+            let lambda_min_au = Array1::from_shape_fn(p, |a| lambda_au(imin, a));
+            let lambda_max_au = Array1::from_shape_fn(p, |a| lambda_au(imax, a));
+            let divided_u = self.aw_rows.dot(&Array1::from_iter(e_u.iter().copied()));
+            let value_au = Array1::from_shape_fn(p, |a| {
+                let mut kernel_trace = 0.0_f64;
+                let mut floor_cross = 0.0_f64;
+                for i in 0..m {
+                    kernel_trace += inverse[i] * row_entry(b_u, a, i, i);
+                    floor_cross += inverse_floor[i]
+                        * (row_entry(a_rows, a, i, i) * lambda_max_u + e_u[[i, i]] * q_max[a]);
+                }
+                0.5 * divided_u[a]
+                    + 0.5 * kernel_trace
+                    + 0.5 * rate * floor_cross
+                    + 0.5 * s_ff * rate * rate * q_max[a] * lambda_max_u
+                    + 0.5 * s_f * rate * lambda_max_au[a]
+            });
+            let gate_au = Array1::from_shape_fn(p, |a| {
+                g11 * q_min[a] * lambda_min_u
+                    + g12 * (q_min[a] * lambda_max_u + q_max[a] * lambda_min_u)
+                    + g22 * q_max[a] * lambda_max_u
+                    + g1 * lambda_min_au[a]
+                    + g2 * lambda_max_au[a]
+            });
+            remainder_drift += &(outer(&gate_au, &grad_u)
+                + outer(&grad_g, &value_au)
+                + outer(&value_au, &grad_g)
+                + outer(&grad_u, &gate_au));
+            let quadratic = |x_min: &Array1<f64>, x_max: &Array1<f64>, y_min: &Array1<f64>, y_max: &Array1<f64>| {
+                outer(x_min, y_min) * g11
+                    + (outer(x_min, y_max) + outer(x_max, y_min)) * g12
+                    + outer(x_max, y_max) * g22
+            };
+            let q2 = quadratic(&q_min, &q_max, &q_min, &q_max);
+            let q2_u = outer(&q_min, &q_min) * (g111 * lambda_min_u + g112 * lambda_max_u)
+                + (outer(&q_min, &q_max) + outer(&q_max, &q_min)) * (g112 * lambda_min_u + g122 * lambda_max_u)
+                + outer(&q_max, &q_max) * (g122 * lambda_min_u + g222 * lambda_max_u)
+                + quadratic(&lambda_min_au, &lambda_max_au, &q_min, &q_max)
+                + quadratic(&q_min, &q_max, &lambda_min_au, &lambda_max_au);
+            remainder_drift.scaled_add(value_u, &q2);
+            remainder_drift.scaled_add(ungated, &q2_u);
+            if rate != 0.0 {
+                let floor_trace_au = Array1::from_shape_fn(p, |a| {
+                    (0..m)
+                        .map(|i| {
+                            (inverse_lambda_floor[i] * e_u[[i, i]] + inverse_floor_floor[i] * floor_u)
+                                * row_entry(a_rows, a, i, i)
+                                + inverse_floor[i] * lambda_au(i, a)
+                        })
+                        .sum::<f64>()
+                });
+                let floor_part = (outer(&floor_trace, &q_max) + outer(&q_max, &floor_trace)) * (0.5 * rate)
+                    + outer(&q_max, &q_max) * (0.5 * s_ff * rate * rate);
+                let floor_part_u = (outer(&floor_trace_au, &q_max)
+                    + outer(&floor_trace, &lambda_max_au)
+                    + outer(&lambda_max_au, &floor_trace)
+                    + outer(&q_max, &floor_trace_au))
+                    * (0.5 * rate)
+                    + outer(&q_max, &q_max) * (0.5 * s_ff_u * rate * rate)
+                    + (outer(&lambda_max_au, &q_max) + outer(&q_max, &lambda_max_au)) * (0.5 * s_ff * rate * rate);
+                remainder_drift.scaled_add(gate_u, &floor_part);
+                remainder_drift.scaled_add(gate, &floor_part_u);
+            }
+            // `ω_e·E_e` with `E_e[a,b] = D²λ_e[P̃_a, P̃_b]`, and its drift
+            // `D²λ_e[B̃_au, P̃_b] + D²λ_e[P̃_a, B̃_bu] + D³λ_e[P̃_a, P̃_b, e_u]`.
+            for (e, omega, omega_u) in [(imin, omega_min, omega_min_u), (imax, omega_max, omega_max_u)] {
+                let gi = Array1::from_shape_fn(m, |j| gap(e, j));
+                let x = Array2::from_shape_fn((p, m), |(a, j)| row_entry(a_rows, a, e, j));
+                let y = Array2::from_shape_fn((p, m), |(a, j)| row_entry(b_u, a, e, j));
+                let doubled = Array2::from_diag(&gi.mapv(|value| 2.0 * value));
+                let extreme_second = x.dot(&doubled).dot(&x.t());
+                let x_hat = Array2::from_shape_fn((p, m), |(a, j)| x[[a, j]] * gi[j]);
+                let c_hat = Array1::from_shape_fn(m, |j| e_u[[e, j]] * gi[j]);
+                let v = Array2::from_shape_fn((p, m), |(a, i)| {
+                    (0..m).map(|k| row_entry(a_rows, a, i, k) * c_hat[k]).sum::<f64>()
+                });
+                let s = x_hat.dot(&c_hat);
+                let q_e = Array1::from_shape_fn(p, |a| row_entry(a_rows, a, e, e));
+                let third = (x_hat.dot(&v.t()) + v.dot(&x_hat.t())) * 2.0
+                    + x_hat.dot(&e_u).dot(&x_hat.t()) * 2.0
+                    - (outer(&q_e, &s) + outer(&s, &q_e)) * 2.0
+                    - x_hat.dot(&x_hat.t()) * (2.0 * e_u[[e, e]]);
+                let extreme_second_u = y.dot(&doubled).dot(&x.t()) + x.dot(&doubled).dot(&y.t()) + third;
+                remainder_drift.scaled_add(omega_u, &extreme_second);
+                remainder_drift.scaled_add(omega, &extreme_second_u);
+            }
+        }
+        let mut result = contracted(&weight_now)? + contracted_along_u(&weight_along_u)?;
+        if motion {
+            result -= &remainder_drift;
+        }
+        let mut result = result.as_standard_layout().to_owned();
+        symmetrize_contiguous(&mut result);
+        if result.iter().any(|value| !value.is_finite()) {
+            return Err("Jeffreys completion drift matrix produced nonfinite curvature".into());
+        }
+        Ok(result)
+    }
+
     /// Differentiate the spectral matrix function in the fixed base frame.
     /// Divided differences include eigenvector motion without dividing by
     /// eigenvalue gaps, so repeated interior eigenvalues need no special case.
@@ -624,6 +1076,23 @@ impl JeffreysHphiDriftBase {
         }
         Ok(())
     }
+}
+
+/// Gate and floor channels along two directions and the capped inverse's first and second
+/// Fréchet weights in the base eigenbasis; see
+/// [`JeffreysHphiDriftBase::frozen_second_drift_weights`].
+struct FrozenSecondDriftWeights {
+    gate_u: f64,
+    gate_w: f64,
+    gate_uw: f64,
+    /// `f(λ_i)` of the capped inverse.
+    kernel: Vec<f64>,
+    /// `Df[E_u]` plus the floor channel along `u`.
+    weight_u: Array2<f64>,
+    /// `Df[E_w]` plus the floor channel along `w`.
+    weight_w: Array2<f64>,
+    /// `D²f[E_u, E_w] + Df[E_uw]` plus the floor channels along `(u, w)`.
+    weight_uw: Array2<f64>,
 }
 
 /// The per-direction half of `D² H_Φ[u,v]`; see
