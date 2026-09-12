@@ -83,14 +83,6 @@ use super::intrinsic_seed::intrinsic_geodesic_embedding;
 #[path = "local_chart_recovery_tests.rs"]
 mod recovered_transition_tests;
 
-/// The `d`-th captured singular value must exceed this fraction of the leading
-/// singular value for the patch to count as a genuine `d`-dimensional chart.
-/// Below it the neighborhood spans fewer than `d` directions and the local-PCA
-/// frame's `d`-th axis is numerical noise; the patch is rejected rather than
-/// given a rank-deficient frame. `1e-8` sits well above the f64 SVD noise on a
-/// normalized block and far below any axis carrying real neighborhood spread.
-const CHART_RANK_FLOOR_FRAC: f64 = 1.0e-8;
-
 /// A chart is injective on its neighborhood iff no two distinct rows project to
 /// the same coordinate. The orthogonal split
 /// `‖x_p − x_q‖² = ‖c_p − c_q‖² + ‖r_p − r_q‖²` makes the projected squared
@@ -102,15 +94,6 @@ const CHART_RANK_FLOOR_FRAC: f64 = 1.0e-8;
 /// stretch is surfaced on [`ChartCertificate::min_projection_stretch`] for
 /// consumers that want a sharper geometric threshold.
 const CHART_INJECTIVITY_FLOOR_FRAC: f64 = 1.0e-6;
-
-/// A transition's Procrustes ALIGNMENT is well posed only when the cross-covariance
-/// `M = C_to C_fromᵀ` is well conditioned: its smallest singular value clears this
-/// fraction of its largest. A near-singular `M` means the shared support does not
-/// span all `d` chart directions, so the rotation that best fits the overlap point
-/// cloud is ambiguous in the unspanned direction. Such an edge is retained as
-/// geometry but marked [`TransitionConditioning::Degenerate`] and kept out of the
-/// sign cocycle, mirroring the analytic-vs-fitted split in [`super::chart_atlas`].
-const TRANSITION_CONDITION_FLOOR_FRAC: f64 = 1.0e-6;
 
 /// The angular resolution of one chart frame, returned as a SINE, derived from the
 /// patch's own captured-variance certificate. Not a tolerance and not a knob.
@@ -1128,7 +1111,13 @@ fn build_local_chart(
     }
     let leading = svals[0];
     let smallest_captured = svals[d - 1];
-    if !(leading > 0.0) || smallest_captured <= CHART_RANK_FLOOR_FRAC * leading {
+    // Numerical rank of the centered `m × p` block. A backward-stable SVD returns the
+    // exact singular values of a block within `max(m, p)·ε·σ₁` of this one, so by
+    // Weyl's inequality a `σ_d` at or below that tolerance cannot be told apart from an
+    // exactly rank-deficient neighborhood: the patch spans fewer than `d` directions,
+    // its frame's `d`-th axis is roundoff, and it is rejected rather than given one.
+    let rank_tolerance = leading * (m.max(p) as f64) * f64::EPSILON;
+    if !(leading > 0.0) || smallest_captured <= rank_tolerance {
         return Err(LocalChartError::DegeneratePatch {
             center,
             intrinsic_dim: d,
@@ -1363,7 +1352,18 @@ fn build_transition(
             }
             let leading = sv.first().copied().unwrap_or(0.0);
             let smallest = sv.get(d - 1).copied().unwrap_or(0.0);
-            let well_posed = leading > 0.0 && smallest > TRANSITION_CONDITION_FLOOR_FRAC * leading;
+            // The Procrustes ALIGNMENT is well posed only when `M = C_to C_fromᵀ` has
+            // full numerical rank; otherwise the shared support does not span all `d`
+            // chart directions and the fitted rotation is undetermined in the unspanned
+            // one. Each entry of `M` sums `s` products, and on an overlap the two charts
+            // genuinely share `C_to ≈ R·C_from`, so `σ₁(M) ≈ ‖C_to‖₂‖C_from‖₂` and the
+            // accumulated error is at most `s·ε·σ₁`; the `d × d` SVD adds `d·ε·σ₁`. Below
+            // `max(s, d)·ε·σ₁` the smallest direction is roundoff. Such an edge is kept
+            // as geometry but marked [`TransitionConditioning::Degenerate`] and held out
+            // of the sign cocycle, mirroring the analytic-vs-fitted split in
+            // [`super::chart_atlas`].
+            let rank_tolerance = leading * (s.max(d) as f64) * f64::EPSILON;
+            let well_posed = leading > 0.0 && smallest > rank_tolerance;
             let conditioning = if well_posed && frame_nondegenerate {
                 TransitionConditioning::WellConditioned
             } else {
