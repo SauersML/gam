@@ -844,10 +844,12 @@ pub(crate) fn spectral_map_symmetric(
 /// eigenproblem at the small dimension `k`; the two products that carry the
 /// large ambient dimension `n` (`YᵀY` and `U = Y V Σ⁻¹`) are GPU-dispatched.
 ///
-/// A numerically-zero singular value (`σ ≤ GEOMETRY_EPS`) leaves the
-/// corresponding `U` column zero rather than dividing through, which is what the
-/// Grassmann/Stiefel geodesic needs (a zero singular value is a vanishing
-/// principal angle); a caller requiring full rank inspects `σ` itself.
+/// A numerically-zero singular value leaves the corresponding `U` column zero
+/// rather than dividing through, which is what the Grassmann/Stiefel geodesic
+/// needs (a zero singular value is a vanishing principal angle); a caller
+/// requiring full rank inspects `σ` itself. The Gram's eigensolve is backward
+/// stable to `k·ε·max λ`, so a direction whose Gram eigenvalue lies inside that
+/// band has no resolved singular value.
 pub(crate) fn thin_svd_gram(
     y: &Array2<f64>,
 ) -> GeometryResult<(Array2<f64>, Array1<f64>, Array2<f64>)> {
@@ -856,11 +858,13 @@ pub(crate) fn thin_svd_gram(
     let gram = fast_atb(y, y);
     let (evals, v) = symmetric_eigen(&gram)?;
     let yv = fast_ab(y, &v);
+    let eigensolve_band =
+        k as f64 * f64::EPSILON * evals.iter().fold(0.0_f64, |acc, value| acc.max(value.abs()));
     let mut sigma = Array1::<f64>::zeros(k);
     let mut u = Array2::<f64>::zeros((n, k));
     for j in 0..k {
         sigma[j] = evals[j].max(0.0).sqrt();
-        if sigma[j] > GEOMETRY_EPS {
+        if evals[j] > eigensolve_band {
             let inv_sigma = 1.0 / sigma[j];
             for i in 0..n {
                 u[[i, j]] = yv[[i, j]] * inv_sigma;
