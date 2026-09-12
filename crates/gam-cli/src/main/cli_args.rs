@@ -169,14 +169,6 @@ pub(crate) struct CrosscoderArgs {
     #[arg(long, value_parser = parse_positive_usize_cli)]
     pub(crate) transport_grid_resolution: Option<usize>,
 
-    /// Classify transport-law gaps using this caller-chosen tolerance.
-    #[arg(
-        long,
-        value_parser = parse_nonnegative_f64_cli,
-        requires = "transport_grid_resolution"
-    )]
-    pub(crate) law_gap_tolerance: Option<f64>,
-
     /// GAM-SAE-owned wire report JSON output path.
     #[arg(long, value_name = "REPORT.json")]
     pub(crate) out: PathBuf,

@@ -89,7 +89,6 @@ fn olmo_l18_l19_pair_crosscoder_fits_with_measured_drift() {
     let wire = report
         .wire_report(SaeCrosscoderEvaluationConfig {
             transport_grid_resolution: Some(64),
-            law_gap_tolerance: Some(0.05),
         })
         .expect("wire report on the real pair");
     assert_eq!(wire.layout.anchor_dim, 64);
@@ -97,82 +96,37 @@ fn olmo_l18_l19_pair_crosscoder_fits_with_measured_drift() {
     assert_eq!(wire.transport.len(), 4, "one anchor->block report per atom");
     // OBJECTIVE transport-law measurement on the REAL L18 -> L19 pair (#2234).
     //
-    // Derivation from the #2231 Inc-D crosscoder + transport-law contract
-    // (`transport_law.rs`):
-    //
-    //  * ON-MANIFOLD, NOT NOISE (asserted): the empirical transport t -> t' of
-    //    every atom must be captured by a SMOOTH few-harmonic map to at least a
-    //    MAJORITY of its circular variance. `smooth_r2` is exactly that circular
-    //    R^2 (the alternative hypothesis). The synthetic nonlinear arm holds
-    //    `smooth_r2 > 0.9` for a clean planted reparam; > 0.5 (more signal than
-    //    noise) is the honest real-data floor. Measured: {0.969, 0.993, 0.671,
-    //    0.963}.
-    //
-    //  * THE PHASE-TRANSPORT LAW ITSELF IS MEASURED BUT **NOT** ASSERTED TRUE.
-    //    The law (transport is a PURE phase shift, `law_gap = smooth_r2 -
-    //    phase_r2 <= tol`) does NOT hold on real OLMo L18/L19 at K=4: `law_holds`
-    //    is `Some(false)` for all four atoms (measured `law_gap` = {0.378, 0.053,
-    //    1.312, 0.270}; the best atom, 0.053, sits just above the 0.05 tolerance;
-    //    atom 2's `phase_r2` is even negative, -0.641). This is a genuine
-    //    NEGATIVE RESULT (see #2234): the atoms live on smooth manifolds but
-    //    their layer-to-layer transport is not a clean phase shift. Asserting
-    //    `law_holds == true` here would be a known-red XFAIL in disguise, so we
-    //    assert the honest structural invariants with teeth instead.
-    let mut best_law_gap = f64::INFINITY;
+    // The phase-shift law (transport `t -> s·t + φ`, `transport_law.rs`) is
+    // MEASURED here but NOT asserted to hold on every atom: it does not on real
+    // OLMo L18/L19 at K=4 (atom 2's `phase_r2` measured -0.641). That is a
+    // genuine NEGATIVE RESULT (see #2234): layer-to-layer transport is not a
+    // clean phase shift for every atom, and asserting it would be a known-red
+    // XFAIL in disguise. The invariants with teeth are that every atom's
+    // measurement is defined over the requested grid, and that the most
+    // phase-like atom explains a strong majority of its transport with a pure
+    // phase shift (measured phase_r2 = 0.940; the recovered phase is a near
+    // half-turn, φ ≈ ±0.49, for every atom).
     let mut best_phase_r2 = f64::NEG_INFINITY;
     for transport in &wire.transport {
-        // The law verdict must be DEFINED on every atom: finite diagnostics and
-        // a materialized verdict (the wire config requested a gap tolerance).
         assert!(
-            transport.phase_r2.is_finite()
-                && transport.smooth_r2.is_finite()
-                && transport.law_gap.is_finite(),
-            "atom {}: transport-law diagnostics must be finite \
-             (phase_r2 = {}, smooth_r2 = {}, law_gap = {})",
+            transport.phase_r2.is_finite(),
+            "atom {}: phase-law circular R^2 must be finite, got {}",
             transport.atom,
-            transport.phase_r2,
-            transport.smooth_r2,
-            transport.law_gap
+            transport.phase_r2
         );
-        assert!(
-            transport.law_holds.is_some(),
-            "atom {}: law verdict must materialize when a gap tolerance is configured",
+        assert_eq!(
+            transport.transport_grid.len(),
+            64,
+            "atom {}: one transport sample per requested grid point",
             transport.atom
         );
-        // Structural nesting invariant: the smooth alternative NESTS the phase
-        // law, so `smooth_r2 >= phase_r2` up to the chordal-metric roundoff (a
-        // small negative `law_gap` is honest numerics per `transport_law.rs`; a
-        // large negative gap would mean the measurement is broken).
         assert!(
-            transport.law_gap > -1e-6,
-            "atom {}: smooth alternative must nest the phase law (law_gap = {})",
-            transport.atom,
-            transport.law_gap
+            transport.deviation_locus.is_some(),
+            "atom {}: a non-empty grid must name the phase law's worst locus",
+            transport.atom
         );
-        // OBJECTIVE: the atom is on-manifold, not noise.
-        assert!(
-            transport.smooth_r2 > 0.5,
-            "atom {}: transport must be a genuine smooth map; smooth_r2 = {} <= 0.5 \
-             would be noise, not manifold structure",
-            transport.atom,
-            transport.smooth_r2
-        );
-        best_law_gap = best_law_gap.min(transport.law_gap);
         best_phase_r2 = best_phase_r2.max(transport.phase_r2);
     }
-    // The phase-transport law is PARTIALLY present (not clean): at least the
-    // best atom is on the LINEAR side of the synthetic linear/nonlinear boundary.
-    // The synthetic planted-NONLINEAR fixture clears `law_gap > 5 * 0.02 = 0.10`;
-    // the best real atom must sit BELOW that boundary (measured 0.053), and the
-    // most phase-like atom must explain a strong majority of its transport with a
-    // pure phase shift (measured phase_r2 = 0.940 — the recovered phase is a near
-    // half-turn, φ ≈ ±0.49, for every atom).
-    assert!(
-        best_law_gap < 0.10,
-        "the phase law should be at least partially present: best-atom law_gap = {} \
-         (>= 0.10 would mean even the best atom is as nonlinear as the planted reparam)",
-        best_law_gap
-    );
     assert!(
         best_phase_r2 > 0.8,
         "at least one atom's transport should be strongly phase-like: best phase_r2 = {}",

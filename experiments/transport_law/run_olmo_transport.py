@@ -2,8 +2,8 @@
 
 Thesis under test ("Binding is transport", crates/gam-sae/src/manifold/mod.rs):
 a curved (circle) atom shared across two layers transports LINEARLY as a phase
-shift ``t ↦ ±t + φ``; a significant nonlinear (extra-harmonic) component in the
-empirical transport map refutes the linear law for that atom.
+shift ``t ↦ ±t + φ``; a phase-shift circular R² short of 1 is empirical transport
+the linear law leaves unexplained for that atom, located by its deviation locus.
 
 Pipeline
 --------
@@ -13,10 +13,10 @@ Pipeline
    honest per-layer decoders `B^(L)`, `B^(L+1)` through the unified outer-REML
    engine (``gamfit.sae_crosscoder_fit``).
 3. For each fitted circle atom, measure the empirical anchor→block transport map
-   and its phase-shift-law verdict (``measure_atom_transport`` in
-   ``crates/gam-sae/src/manifold/transport_law.rs``): phase_r2 vs smooth_r2, the
-   honest-units drift `δ_k`, and the principal angles between the two layer
-   images.
+   and its phase-shift-law fit (``measure_atom_transport_between`` in
+   ``crates/gam-sae/src/manifold/transport_law.rs``): phase_r2 and the deviation
+   locus, the honest-units drift `δ_k`, and the principal angles between the two
+   layer images.
 
 Data (see the OLMo-3-32B activation dataset; 64 layers, hidden D=5120)
 ---------------------------------------------------------------------
@@ -82,8 +82,6 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--n-harmonics", type=int, default=3, help="Fourier order per circle atom")
     ap.add_argument("--grid-resolution", type=int, default=512, help="chart grid points over [0,1)")
     ap.add_argument("--inner-max-iter", type=int, default=80, help="inner arrow-Schur iterations")
-    ap.add_argument("--law-gap-tolerance", type=float, default=0.05,
-                    help="maximum smooth-minus-phase circular R2 gap for the phase law verdict")
     ap.add_argument("--out", required=True, help="output directory for the JSON report")
     args = ap.parse_args(argv)
 
@@ -103,7 +101,6 @@ def main(argv: list[str] | None = None) -> int:
         "ridge_beta": 1e-6,
         "n_harmonics": args.n_harmonics,
         "grid_resolution": args.grid_resolution,
-        "law_gap_tolerance": args.law_gap_tolerance,
     }
     model = sae_crosscoder_fit(
         anchor,
@@ -115,7 +112,6 @@ def main(argv: list[str] | None = None) -> int:
         ridge_ext_coord=1e-6,
         ridge_beta=1e-6,
         transport_grid_resolution=args.grid_resolution,
-        law_gap_tolerance=args.law_gap_tolerance,
     )
     fit = model.to_dict()
     reports = list(fit["transport"])
@@ -138,15 +134,22 @@ def main(argv: list[str] | None = None) -> int:
             indent=2,
         )
 
-    # Summarize the law verdict across atoms.
-    held = sum(1 for r in reports if r.get("law_holds"))
-    gaps = [float(r["law_gap"]) for r in reports if np.isfinite(r.get("law_gap", np.nan))]
+    # Summarize the phase-shift fit across atoms (serde writes a NaN R2 as null).
+    fits = [
+        (int(r["atom"]), float(r["phase_r2"]))
+        for r in reports
+        if r.get("phase_r2") is not None and np.isfinite(float(r["phase_r2"]))
+    ]
     print(f"wrote {out_path}", flush=True)
-    print(
-        f"phase-shift LAW holds for {held}/{len(reports)} atoms; "
-        f"median smooth−phase gap = {np.median(gaps) if gaps else float('nan'):.4f}",
-        flush=True,
-    )
+    if fits:
+        best_atom, best_r2 = max(fits, key=lambda fit: fit[1])
+        print(
+            f"phase-shift R2 finite for {len(fits)}/{len(reports)} atoms; "
+            f"median = {np.median([r2 for _, r2 in fits]):.4f}; best atom {best_atom} = {best_r2:.4f}",
+            flush=True,
+        )
+    else:
+        print(f"phase-shift R2 finite for 0/{len(reports)} atoms", flush=True)
     return 0
 
 

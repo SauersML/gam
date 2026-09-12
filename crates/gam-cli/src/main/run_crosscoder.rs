@@ -125,7 +125,6 @@ pub(crate) fn run_crosscoder(args: CrosscoderArgs) -> CliResult<()> {
     let wire = fit
         .wire_report(SaeCrosscoderEvaluationConfig {
             transport_grid_resolution: args.transport_grid_resolution,
-            law_gap_tolerance: args.law_gap_tolerance,
         })
         .map_err(CliError::from)?;
     write_wire_report(&args.out, &wire)?;
@@ -173,28 +172,6 @@ mod tests {
         assert_eq!(args.block.len(), 1);
         assert!(args.random_state.is_none());
         assert!(args.transport_grid_resolution.is_none());
-        assert!(args.law_gap_tolerance.is_none());
-    }
-
-    #[test]
-    fn transport_tolerance_requires_a_grid() {
-        let result = Cli::try_parse_from([
-            "gam",
-            "crosscoder",
-            "--anchor",
-            "anchor=anchor.npy",
-            "--block",
-            "layer-1=layer1.npy",
-            "--atoms",
-            "4",
-            "--harmonics",
-            "3",
-            "--law-gap-tolerance",
-            "0.1",
-            "--out",
-            "report.json",
-        ]);
-        assert!(result.is_err());
     }
 
     #[test]
@@ -207,7 +184,6 @@ mod tests {
             "--anchor <LABEL=FILE>",
             "--block <LABEL=FILE>",
             "--transport-grid-resolution",
-            "--law-gap-tolerance",
             "--out <REPORT.json>",
         ] {
             assert!(help.contains(required), "missing {required:?} in:\n{help}");

@@ -474,7 +474,7 @@ mod manifold_sae_payload_serde_tests {
                 "labels": ["L13", "L14"],
                 "log_lambda_block": [-0.25, 0.5],
                 "drift": {"status": "measured", "mean_drift": 0.2, "steps": []},
-                "transport": [{"atom": 0, "law_gap": 0.01}]
+                "transport": [{"atom": 0, "phase_r2": 0.94}]
             }),
         );
         let raw = serde_json::to_string(&payload).unwrap();

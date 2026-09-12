@@ -203,11 +203,10 @@ pub struct SaeCrosscoderAutoFitRequest {
 
 /// Optional scientific measurements to materialize from a completed fit.
 /// Transport is not run implicitly: its grid resolution is a caller-owned
-/// experimental resolution, and its law threshold is an optional claim rule.
+/// experimental resolution.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct SaeCrosscoderEvaluationConfig {
     pub transport_grid_resolution: Option<usize>,
-    pub law_gap_tolerance: Option<f64>,
 }
 
 /// Honest-unit reconstruction and per-atom decoders for one fitted layer. The
@@ -318,9 +317,6 @@ pub struct SaeCrosscoderWireTransport {
     pub n_harmonics: usize,
     pub phase_shift: (f64, f64),
     pub phase_r2: f64,
-    pub smooth_r2: f64,
-    pub law_gap: f64,
-    pub law_holds: Option<bool>,
     pub deviation_locus: Option<f64>,
     pub drift: f64,
     pub principal_angles: Vec<f64>,
@@ -663,19 +659,6 @@ impl SaeCrosscoderFitReport {
         &self,
         evaluation: SaeCrosscoderEvaluationConfig,
     ) -> Result<SaeCrosscoderWireReport, String> {
-        if let Some(tolerance) = evaluation.law_gap_tolerance {
-            if !tolerance.is_finite() || tolerance < 0.0 {
-                return Err(format!(
-                    "SaeCrosscoderEvaluationConfig: law_gap_tolerance must be finite and non-negative; got {tolerance}"
-                ));
-            }
-            if evaluation.transport_grid_resolution.is_none() {
-                return Err(
-                    "SaeCrosscoderEvaluationConfig: law_gap_tolerance requires a transport grid"
-                        .to_string(),
-                );
-            }
-        }
         let anchor_label = self
             .layers
             .first()
@@ -759,11 +742,6 @@ impl SaeCrosscoderFitReport {
                         n_harmonics: measured.n_harmonics,
                         phase_shift: measured.phase_shift,
                         phase_r2: measured.phase_r2,
-                        smooth_r2: measured.smooth_r2,
-                        law_gap: measured.law_gap(),
-                        law_holds: evaluation
-                            .law_gap_tolerance
-                            .map(|tolerance| measured.law_holds(tolerance)),
                         deviation_locus: measured.deviation_locus(),
                         drift: measured.drift,
                         principal_angles: measured.principal_angles,

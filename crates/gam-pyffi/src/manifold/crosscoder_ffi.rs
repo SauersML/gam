@@ -111,7 +111,6 @@ impl ManifoldCrosscoderCore {
     ridge_beta = None,
     random_state = None,
     transport_grid_resolution = None,
-    law_gap_tolerance = None,
 ))]
 fn sae_crosscoder_fit<'py>(
     py: Python<'py>,
@@ -129,7 +128,6 @@ fn sae_crosscoder_fit<'py>(
     ridge_beta: Option<f64>,
     random_state: Option<u64>,
     transport_grid_resolution: Option<usize>,
-    law_gap_tolerance: Option<f64>,
 ) -> PyResult<Py<ManifoldCrosscoderCore>> {
     use gam::terms::sae::manifold::{
         SaeCrosscoderAutoFitOverrides, SaeCrosscoderAutoFitRequest, SaeCrosscoderEvaluationConfig,
@@ -171,7 +169,6 @@ fn sae_crosscoder_fit<'py>(
     let wire = inner
         .wire_report(SaeCrosscoderEvaluationConfig {
             transport_grid_resolution,
-            law_gap_tolerance,
         })
         .map_err(py_value_error)?;
     Py::new(

@@ -37,24 +37,22 @@
 //! On the unit circle (chart period `1`, [`LatentManifold::Circle`]) the natural
 //! squared error between two coordinates `a, b` is the chordal
 //! `c(a,b) = 1 − cos(2π(a − b))` (half the squared chord; `0` iff `a ≡ b`,
-//! period-correct with no unwrapping). We report two nested circular
-//! coefficients of determination `R² = 1 − SS_res/SS_tot`, both against the same
-//! circular-mean baseline `SS_tot = Σ_g c(t'_g, t̄')`:
+//! period-correct with no unwrapping). The report carries the circular
+//! coefficient of determination `R² = 1 − SS_res/SS_tot` of the **phase-shift
+//! model** `t' = s·t + φ`, `s ∈ {+1, −1}` — the LAW — against the circular-mean
+//! baseline `SS_tot = Σ_g c(t'_g, t̄')`. The optimal `φ` at fixed `s` is the
+//! circular mean of `u_g = t'_g − s·t_g`, which maximizes
+//! `Σ_g cos(2π(u_g − φ)) = |Σ_g e^{i 2π u_g}|`; `s` is chosen for the larger
+//! resultant, and `SS_res = G − |Σ_g e^{i 2π u_g}|`.
 //!
-//! * **phase-shift model** `t' = s·t + φ`, `s ∈ {+1, −1}` — the LAW. The optimal
-//!   `φ` at fixed `s` is the circular mean of `u_g = t'_g − s·t_g`, which
-//!   maximizes `Σ_g cos(2π(u_g − φ)) = |Σ_g e^{i 2π u_g}|`; `s` is chosen for the
-//!   larger resultant. `SS_res = G − |Σ_g e^{i 2π u_g}|`.
-//! * **smooth-map model** `t' = s·t + f(t)` — the alternative hypothesis, with
-//!   `f` a Fourier series in `t` to the atom's OWN harmonic order (constant plus
-//!   `H = (M−1)/2` harmonics). The constant term subsumes the phase model, so the
-//!   extra harmonics are exactly the nonlinear content the phase law forbids.
-//!
-//! **Verdict.** `phase_r2 ≈ smooth_r2` (small [`AtomTransportReport::law_gap`])
-//! ⇒ transport IS a phase shift, the law holds, the extra harmonics buy nothing.
-//! A significant gap ⇒ nonlinear transport;
-//! [`AtomTransportReport::deviation_locus`] reports the chart location where the
-//! phase model deviates most (the interesting locus).
+//! `phase_r2 = 1` exactly when transport is a phase shift at every reported
+//! sample (`NaN` when every transported coordinate coincides, a degenerate
+//! baseline); its shortfall is the chordal residual the law leaves unexplained,
+//! and [`AtomTransportReport::deviation_locus`] reports the chart location where
+//! the phase model deviates most (the interesting locus). No smooth-map
+//! alternative is fitted and no verdict threshold is applied: the alternative's
+//! Fourier order and a gap tolerance would both be tuning constants that no
+//! measured transport identifies.
 //!
 //! # Drift statistics (gam#2231 §3)
 //!
@@ -78,7 +76,8 @@ pub enum CrosscoderLayer {
     Block(usize),
 }
 
-/// map of one circle atom, the phase-shift law test, and the drift statistics.
+/// The empirical transport map of one circle atom, the phase-shift law fit, and
+/// the drift statistics.
 #[derive(Clone, Debug)]
 pub struct AtomTransportReport {
     /// The atom index this report is for.
@@ -90,9 +89,7 @@ pub struct AtomTransportReport {
     /// Number of source chart samples reported over `[0, 1)`.  Target
     /// coordinates are solved continuously and do not inherit this resolution.
     pub grid_resolution: usize,
-    /// The atom's harmonic order `H = (M − 1)/2`. The smooth-map ALTERNATIVE
-    /// fits at order `2H + 1` (the empirical transport between order-H curves
-    /// generically carries harmonics above `H`; see the call-site note).
+    /// The atom's harmonic order `H = (M − 1)/2`.
     pub n_harmonics: usize,
     /// The best phase-shift model `t' = s·t + φ`: `(s, φ)` with `s ∈ {+1, −1}`
     /// and `φ` in chart units, wrapped to `[−½, ½)`.
@@ -100,20 +97,11 @@ pub struct AtomTransportReport {
     /// Circular `R²` of the phase-shift fit (`1 − SS_res/SS_tot`). The LAW's
     /// goodness of fit; `≈ 1` when transport is a pure phase shift.
     pub phase_r2: f64,
-    /// Circular `R²` of the smooth-map alternative (phase shift plus `H`
-    /// harmonics of φ̂-centered drift). Nests the law by construction (its
-    /// constant term rides on the phase model's circular mean), so it sits
-    /// `≥ phase_r2` up to the least-squares/chordal metric mismatch on the
-    /// residual harmonics; a (small) negative `law_gap` is honest numerics,
-    /// not a clamp. Note the alternative's Fourier order is capped at the
-    /// atom's own `H`: the empirical map between two order-`H` curves can
-    /// carry harmonics above `H`, so this alternative is CONSERVATIVE — it can
-    /// under-detect nonlinearity, never over-detect it.
-    pub smooth_r2: f64,
     /// Honest-units decoder drift `δ_k = ‖B_tgt − B_src‖_F /
     /// √(‖B_src‖_F · ‖B_tgt‖_F)` (gam#2231 §3). `NaN` if either decoder is
-    /// numerically dead (Frobenius norm ≤ 1e−12 of the larger layer's norm),
-    /// so a shrunk-out layer cannot manufacture a divergent drift ratio.
+    /// numerically dead (Frobenius norm at or below `max(M, p)·ε` of the larger
+    /// layer's norm), so a shrunk-out layer cannot manufacture a divergent drift
+    /// ratio.
     pub drift: f64,
     /// Principal angles (radians, ascending) between the two layer images — the
     /// row spaces of the honest decoders in `ℝ^p`. Length `max(rank_src,
@@ -126,20 +114,6 @@ pub struct AtomTransportReport {
 }
 
 impl AtomTransportReport {
-    /// `smooth_r2 − phase_r2`: how much circular fit the nonlinear harmonics buy
-    /// over the phase-shift law. Small ⇒ the law holds; large ⇒ nonlinear
-    /// transport.
-    pub fn law_gap(&self) -> f64 {
-        self.smooth_r2 - self.phase_r2
-    }
-
-    /// The law verdict at a caller-chosen gap tolerance: `true` when the extra
-    /// harmonics buy less than `gap_tol` of circular `R²` (transport is a phase
-    /// shift) and the phase fit is finite.
-    pub fn law_holds(&self, gap_tol: f64) -> bool {
-        self.phase_r2.is_finite() && self.smooth_r2.is_finite() && self.law_gap() <= gap_tol
-    }
-
     /// The chart location `t_g` where the phase-shift model deviates most from
     /// the empirical transport (the largest chordal residual). `None` for an
     /// empty grid. This is the "interesting locus" where linear transport breaks.
@@ -224,24 +198,11 @@ pub fn measure_atom_transport_between(
         return Err("measure_atom_transport_between: grid_resolution must be positive".to_string());
     }
 
-    // Reporting density and diagnostic-fit density are independent.  The
-    // caller may deliberately request a very coarse report, while the smooth
-    // alternative still needs more source evaluations than coefficients.  Use
-    // the smallest multiple of the requested density that identifies the fit;
-    // this keeps every requested report point exactly on the diagnostic grid.
-    let alt_harmonics = (2 * n_harmonics + 1).max(grid_resolution / 16);
-    let smooth_coefficient_count = 2 * alt_harmonics + 1;
-    let required_fit_samples = smooth_coefficient_count + 1;
-    let diagnostic_multiplier = required_fit_samples.div_ceil(grid_resolution).max(1);
-    let diagnostic_resolution = grid_resolution
-        .checked_mul(diagnostic_multiplier)
-        .ok_or_else(|| "measure_atom_transport_between: diagnostic grid size overflow".to_string())?;
-
-    // Evaluate the standard full-width harmonic basis on the diagnostic SOURCE
-    // grid.  These samples do not serve as target candidates.
+    // Evaluate the standard full-width harmonic basis on the SOURCE grid.
+    // These samples do not serve as target candidates.
     let basis = ChartBasisKind::Periodic { n_harmonics };
-    let grid = Array2::<f64>::from_shape_fn((diagnostic_resolution, 1), |(g, _)| {
-        g as f64 / diagnostic_resolution as f64
+    let grid = Array2::<f64>::from_shape_fn((grid_resolution, 1), |(g, _)| {
+        g as f64 / grid_resolution as f64
     });
     if basis.width() != m {
         return Err(format!(
@@ -249,9 +210,9 @@ pub fn measure_atom_transport_between(
             basis.width()
         ));
     }
-    let mut phi_grid = Array2::<f64>::zeros((diagnostic_resolution, m));
+    let mut phi_grid = Array2::<f64>::zeros((grid_resolution, m));
     let mut phi = vec![0.0; m];
-    for g in 0..diagnostic_resolution {
+    for g in 0..grid_resolution {
         basis.eval_into(grid[[g, 0]], &mut phi);
         for column in 0..m {
             phi_grid[[g, column]] = phi[column];
@@ -268,7 +229,7 @@ pub fn measure_atom_transport_between(
     // companion-eigenvalue projections are embarrassingly parallel.
     let linear_all = source_image.dot(&b_tgt.t()); // G × M
     use rayon::prelude::*;
-    let tprime: Vec<f64> = (0..diagnostic_resolution)
+    let tprime: Vec<f64> = (0..grid_resolution)
         .into_par_iter()
         .map(|g| {
             let linear = linear_all.row(g);
@@ -283,32 +244,13 @@ pub fn measure_atom_transport_between(
             Ok(projection.coordinate)
         })
         .collect::<Result<Vec<f64>, String>>()?;
-    let t_arr: Vec<f64> = (0..diagnostic_resolution)
-        .map(|g| g as f64 / diagnostic_resolution as f64)
+    let t_arr: Vec<f64> = (0..grid_resolution)
+        .map(|g| g as f64 / grid_resolution as f64)
         .collect();
-    let transport_grid: Vec<(f64, f64)> = (0..grid_resolution)
-        .map(|g| {
-            let diagnostic_index = g * diagnostic_multiplier;
-            (t_arr[diagnostic_index], tprime[diagnostic_index])
-        })
-        .collect();
+    let transport_grid: Vec<(f64, f64)> =
+        t_arr.iter().copied().zip(tprime.iter().copied()).collect();
 
-    // The smooth ALTERNATIVE's Fourier order is deliberately HIGHER than the
-    // atom's own H: the empirical transport t ↦ t'(t) between two order-H
-    // curves is a projection argmin and generically carries harmonics ABOVE H
-    // (composition/inversion of trigonometric polynomials is not order-H), so
-    // capping the alternative at H under-detects nonlinearity — measured
-    // 2026-07-10 on the planted θ' = θ + a·sinθ arm: the recovered drift needs
-    // ~2H harmonics for R² 0.86 vs 0.72 at H. `2H + 1` keeps the detector a
-    // low-order smooth model (K = 4H + 3 coefficients ≪ grid_resolution, which
-    // the guard above already enforces at the STRICTER alternative order) while
-    // removing the conservative bias the 2026-07-10 audit flagged.
-    // Grid-proportional detector order: the drift spectrum of a composed /
-    // inverted trigonometric map decays slowly (measured on the planted
-    // θ+0.8·sinθ arm: R² 0.86 at H=11, 0.90 at H=16, 0.95 at H=31), so the
-    // alternative uses the larger of the curve-derived 2H+1 and grid/16 —
-    // still ≥8× oversampled (K = 2·alt+1 coefficients vs grid points).
-    let (phase_shift, phase_r2, smooth_r2) = fit_transport_law(&t_arr, &tprime, alt_harmonics);
+    let (phase_shift, phase_r2) = fit_transport_law(&t_arr, &tprime);
     let drift = decoder_drift(&b_src, &b_tgt);
     let principal_angles = principal_angles_between_images(&b_src, &b_tgt)?;
 
@@ -320,7 +262,6 @@ pub fn measure_atom_transport_between(
         n_harmonics,
         phase_shift,
         phase_r2,
-        smooth_r2,
         drift,
         principal_angles,
         transport_grid,
@@ -353,14 +294,13 @@ pub(crate) fn honest_layer_decoder(
     }
 }
 
-/// Fit the phase-shift law and the smooth-map alternative to a period-1 circular
-/// transport `t ↦ t'`. Returns `((s, φ), phase_r2, smooth_r2)`.
+/// Fit the phase-shift law to a period-1 circular transport `t ↦ t'`. Returns
+/// `((s, φ), phase_r2)`.
 ///
-/// Both `R²` share the circular-mean baseline `SS_tot = G − |Σ e^{i2π t'_g}|`.
-/// The phase model's optimal `φ` at fixed `s` is `circmean(t'_g − s·t_g)`; `s` is
-/// chosen for the larger resultant. The smooth model regresses the wrapped drift
-/// `t'_g − s·t_g` on a constant plus `n_harmonics` Fourier harmonics of `t_g`.
-fn fit_transport_law(t: &[f64], tprime: &[f64], n_harmonics: usize) -> ((f64, f64), f64, f64) {
+/// `R²` uses the circular-mean baseline `SS_tot = G − |Σ e^{i2π t'_g}|`. The
+/// optimal `φ` at fixed `s` is `circmean(t'_g − s·t_g)`; `s` is chosen for the
+/// larger resultant.
+fn fit_transport_law(t: &[f64], tprime: &[f64]) -> ((f64, f64), f64) {
     let two_pi = std::f64::consts::TAU;
     let g = t.len();
     let gf = g as f64;
@@ -395,77 +335,7 @@ fn fit_transport_law(t: &[f64], tprime: &[f64], n_harmonics: usize) -> ((f64, f6
         }
     }
     let phase_r2 = circular_r2(ss_tot, best_ss_res);
-
-    // Smooth-map alternative: t' = s·t + φ̂ + f(t), f a Fourier series (constant
-    // + n_harmonics harmonics) of t fit by least squares to the φ̂-CENTERED
-    // wrapped drift d_g = wrap(t'_g − s·t_g − φ̂). Centering by the phase
-    // model's circular mean is load-bearing: when the true offset sits near the
-    // wrap boundary ±½, the UNcentered wrapped drift is a ±½ square-wave-like
-    // discontinuous signal whose Fourier LS fit is garbage — the smooth R²
-    // then craters below the phase R² and a genuinely nonlinear transport
-    // would read as "law holds". Centered, the drift is small and continuous,
-    // and the zero-function f reproduces the phase model exactly, so the
-    // alternative nests the law by construction (no clamp needed — a small
-    // negative gap is honest LS/chordal metric mismatch, and a smooth model
-    // that fails to beat the phase model IS the law holding).
-    let smooth_r2 = fit_smooth_alternative(t, tprime, best_s, best_phi, n_harmonics, ss_tot)
-        .unwrap_or(phase_r2);
-
-    ((best_s, best_phi), phase_r2, smooth_r2)
-}
-
-/// Least-squares Fourier fit of the φ-centered wrapped transport drift; returns
-/// the smooth model's circular `R²`, or `None` if the normal equations are
-/// singular (then the caller falls back to the phase `R²`).
-fn fit_smooth_alternative(
-    t: &[f64],
-    tprime: &[f64],
-    s: f64,
-    phi: f64,
-    n_harmonics: usize,
-    ss_tot: f64,
-) -> Option<f64> {
-    let two_pi = std::f64::consts::TAU;
-    let k = 2 * n_harmonics + 1;
-
-    // Design matrix D (G × K): [1, sin2πt, cos2πt, …, sin2πHt, cos2πHt].
-    let design = |ti: f64| -> Vec<f64> {
-        let mut row = Vec::with_capacity(k);
-        row.push(1.0);
-        for h in 1..=n_harmonics {
-            let a = two_pi * h as f64 * ti;
-            row.push(a.sin());
-            row.push(a.cos());
-        }
-        row
-    };
-
-    // Normal equations DᵀD c = Dᵀ d with d_g the wrapped drift.
-    let mut dtd = Array2::<f64>::zeros((k, k));
-    let mut dtb = Array1::<f64>::zeros(k);
-    for (&ti, &tpi) in t.iter().zip(tprime.iter()) {
-        let row = design(ti);
-        // φ-centered drift: small and continuous when the law nearly holds,
-        // even for offsets at the wrap boundary ±½.
-        let d = wrap_half(tpi - s * ti - phi);
-        for i in 0..k {
-            dtb[i] += row[i] * d;
-            for j in 0..k {
-                dtd[[i, j]] += row[i] * row[j];
-            }
-        }
-    }
-    let coeffs = solve_spd(&dtd, &dtb)?;
-
-    // Residual SS under the fitted smooth map, chordal on the circle.
-    let mut ss_res = 0.0_f64;
-    for (&ti, &tpi) in t.iter().zip(tprime.iter()) {
-        let row = design(ti);
-        let f: f64 = row.iter().zip(coeffs.iter()).map(|(&r, &c)| r * c).sum();
-        let pred = s * ti + phi + f;
-        ss_res += 1.0 - (two_pi * (tpi - pred)).cos();
-    }
-    Some(circular_r2(ss_tot, ss_res))
+    ((best_s, best_phi), phase_r2)
 }
 
 /// `1 − SS_res/SS_tot`, guarding a degenerate (all-equal responses) baseline.
@@ -485,15 +355,16 @@ fn wrap_half(x: f64) -> f64 {
 
 /// Honest-units decoder drift `δ = ‖B_tgt − B_src‖_F / √(‖B_src‖_F · ‖B_tgt‖_F)`
 /// (gam#2231 §3). `NaN` if either decoder is numerically dead — Frobenius norm
-/// ≤ 1e−12 of the LARGER layer's norm (a relative gate, matching the rank
-/// threshold used for principal angles). The exact-zero guard alone let a
+/// at or below `max(M, p)·ε` of the LARGER layer's norm, the same
+/// `σ_max·max(M,p)·ε` numerical-rank convention `orthonormal_row_basis` uses,
+/// applied at the joint scale. The exact-zero guard alone let a
 /// shrunk-out-but-not-bitwise-zero layer (‖B‖ ~ 1e−30) blow the geometric-mean
 /// denominator up to δ ~ 1e13 and hijack `most_drifting_atom`.
 pub(crate) fn decoder_drift(b_src: &Array2<f64>, b_tgt: &Array2<f64>) -> f64 {
     let fro = |a: &Array2<f64>| a.iter().map(|&v| v * v).sum::<f64>().sqrt();
     let ns = fro(b_src);
     let nt = fro(b_tgt);
-    let dead = 1e-12 * ns.max(nt);
+    let dead = ns.max(nt) * (b_src.nrows().max(b_src.ncols()) as f64) * f64::EPSILON;
     if ns > dead && nt > dead {
         let diff: f64 = b_src
             .iter()
@@ -550,46 +421,4 @@ fn orthonormal_row_basis(b: &Array2<f64>) -> Result<Array2<f64>, String> {
     let tol = smax * (b.nrows().max(b.ncols()) as f64) * f64::EPSILON;
     let rank = svals.iter().filter(|&&s| s > tol).count();
     Ok(vt.slice(s![0..rank, ..]).to_owned())
-}
-
-/// Solve the small SPD system `A c = b` (`A` `K × K`) by dense Cholesky. Returns
-/// `None` when `A` is not numerically positive definite (a singular design).
-fn solve_spd(a: &Array2<f64>, b: &Array1<f64>) -> Option<Array1<f64>> {
-    let k = a.nrows();
-    let mut l = Array2::<f64>::zeros((k, k));
-    for i in 0..k {
-        for j in 0..=i {
-            let mut sum = a[[i, j]];
-            for p in 0..j {
-                sum -= l[[i, p]] * l[[j, p]];
-            }
-            if i == j {
-                if !(sum > 0.0) {
-                    return None;
-                }
-                l[[i, j]] = sum.sqrt();
-            } else {
-                l[[i, j]] = sum / l[[j, j]];
-            }
-        }
-    }
-    // Forward solve L y = b.
-    let mut y = Array1::<f64>::zeros(k);
-    for i in 0..k {
-        let mut sum = b[i];
-        for p in 0..i {
-            sum -= l[[i, p]] * y[p];
-        }
-        y[i] = sum / l[[i, i]];
-    }
-    // Back solve Lᵀ c = y.
-    let mut c = Array1::<f64>::zeros(k);
-    for i in (0..k).rev() {
-        let mut sum = y[i];
-        for p in (i + 1)..k {
-            sum -= l[[p, i]] * c[p];
-        }
-        c[i] = sum / l[[i, i]];
-    }
-    Some(c)
 }

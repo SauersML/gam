@@ -1369,5 +1369,14 @@
     },
     "reason": "#932: these pub(crate) entry points were the generic-scalar statement of the binomial location-scale row NLL and its Order1 gradient; the row is now declared once by binomial_ls_row_program, and binomial_location_scale_row_score / binomial_location_scale_row_hessian read its emitted order-2 surface.",
     "evidence": "At the base, git grep -w finds both names only in crates/gam-models/src/gamlss/binomial/kernel.rs, gamlss/binomial/location_scale.rs (two gradient callers, now binomial_location_scale_row_score) and gamlss/test_support.rs (the tower oracle, now binomial_location_scale_nll_in_predictors). Salvaged from scratchpad/landing1.patch."
+  },
+  {
+    "base": "ad41db44910c5f12c7edee05dde1a6fd3f977b2c",
+    "removed": {
+      "crates/gam-sae/src/manifold/transport_law.rs::law_gap": 1,
+      "crates/gam-sae/src/manifold/transport_law.rs::law_holds": 1
+    },
+    "reason": "SPEC rules 23 and 25 (#2234). AtomTransportReport::law_gap and ::law_holds read a smooth-map alternative whose Fourier order max(2H+1, grid_resolution/16) was hand-set and tied to the caller's reporting density, plus a caller-chosen gap tolerance. No measured transport identifies either constant, so the alternative and both methods are deleted. phase_r2 and deviation_locus remain the transport report.",
+    "evidence": "public_api_census.py's public_functions predicate over the removed hunks of crates/gam-sae/src/manifold/transport_law.rs yields law_gap and law_holds, each the file's only pub fn of that name. At the base their only callers are the wire report in crates/gam-sae/src/manifold/crosscoder_fit.rs and the olmo acceptance test in tests_crosscoder_olmo.rs, both changed here. No other file in this change loses a pub fn."
   }
 ]
