@@ -4,7 +4,8 @@
 //! Jacobian sparsity, and manifold-SAE anchor coverage. Rust, Python, and CLI
 //! layers turn those facts into user-facing reports.
 
-use ndarray::{Array2, ArrayView2, Axis};
+use gam_linalg::faer_ndarray::FaerSvd;
+use ndarray::{Array2, ArrayView2};
 
 /// Maximum distinct values per aux column for it to count as "discrete".
 ///
@@ -43,8 +44,8 @@ pub struct AuxRichnessMetrics {
 ///
 /// `aux` is `(N, aux_dim)`; `latents` is `(N, latent_dim)`. The empirical
 /// Jacobian is the linear-regression slope ``B`` of ``Z ~ A`` (centred). For
-/// a non-linear iVAE encoder this is a first-order surrogate; a deficient
-/// rank here forecloses identifiability regardless of nonlinear postproc.
+/// a non-linear iVAE encoder this is a first-order diagnostic; deficient
+/// linear-regression rank alone does not establish nonlinear nonidentifiability.
 pub fn aux_richness_metrics(aux: ArrayView2<f64>, latents: ArrayView2<f64>) -> AuxRichnessMetrics {
     let (n, aux_dim) = aux.dim();
     let (n_z, latent_dim) = latents.dim();
@@ -65,15 +66,8 @@ pub fn aux_richness_metrics(aux: ArrayView2<f64>, latents: ArrayView2<f64>) -> A
     if aux_observed && n >= 1 {
         for j in 0..aux_dim {
             let col = aux.column(j);
-            // sample std (population formula — exact zero iff constant).
-            let mean: f64 = col.sum() / n as f64;
-            let mut var = 0.0_f64;
-            for &v in col.iter() {
-                let d = v - mean;
-                var += d * d;
-            }
-            var /= n as f64;
-            if var <= 1.0e-24 {
+            // Constancy is an equality property, independent of the units.
+            if col.iter().all(|&value| value == col[0]) {
                 constant_columns.push(j);
             }
         }
@@ -104,11 +98,15 @@ pub fn aux_richness_metrics(aux: ArrayView2<f64>, latents: ArrayView2<f64>) -> A
         }
         if discrete {
             // Joint distinct rows.
-            let mut keys: Vec<Vec<i64>> = Vec::with_capacity(n);
+            let mut keys: Vec<Vec<u64>> = Vec::with_capacity(n);
             for i in 0..n {
                 let mut row = Vec::with_capacity(aux_dim);
                 for j in 0..aux_dim {
-                    row.push(aux[[i, j]].round() as i64);
+                    // All entries are finite integer-valued floats, but they
+                    // need not fit in i64. Preserve their distinct identities
+                    // while identifying the two floating-point zero signs.
+                    let value = aux[[i, j]];
+                    row.push(if value == 0.0 { 0 } else { value.to_bits() });
                 }
                 keys.push(row);
             }
@@ -128,28 +126,17 @@ pub fn aux_richness_metrics(aux: ArrayView2<f64>, latents: ArrayView2<f64>) -> A
     let mut jacobian_rank: usize = usize::MAX;
     let z_finite = latents.iter().all(|v| v.is_finite());
     if aux_observed && z_finite && n >= need_rows && aux_dim >= 1 && latent_dim >= 1 {
-        // Centre A and Z.
-        let mut a_c = aux.to_owned();
-        let mut z_c = latents.to_owned();
-        let a_mean = a_c
-            .mean_axis(Axis(0))
-            .expect("the n >= need_rows >= 1 guard above rules out an empty axis");
-        let z_mean = z_c
-            .mean_axis(Axis(0))
-            .expect("the n >= need_rows >= 1 guard above rules out an empty axis");
-        for mut row in a_c.rows_mut() {
-            row -= &a_mean;
-        }
-        for mut row in z_c.rows_mut() {
-            row -= &z_mean;
-        }
-        // Solve B = (Aᵀ A)^{+} Aᵀ Z via SVD on (Aᵀ A) — small (aux_dim x aux_dim).
-        let ata = a_c.t().dot(&a_c);
-        let atz = a_c.t().dot(&z_c);
-        // A rank the eigendecomposition cannot deliver (a non-finite Gram) is
+        // Invertible column rescaling preserves regression rank. Work with
+        // centered unit-norm columns so changing aux/latent measurement units
+        // cannot underflow the Gram or erase a direction below an absolute floor.
+        let a_c = centered_unit_columns(aux);
+        let z_c = centered_unit_columns(latents);
+        // Solve B = A^{+} Z directly: normal equations would square the
+        // condition number and lose identifiable near-collinear directions.
+        // A rank the decomposition cannot deliver is
         // reported as "not estimated" — the state this struct already models —
         // rather than as a number read off an unconverged sweep.
-        if let Ok(b_hat) = pinv_solve(ata.view(), atz.view())
+        if let Ok(b_hat) = pinv_solve(a_c.view(), z_c.view())
             && let Ok(rank) = matrix_rank(b_hat.view(), 1.0e-8)
         {
             jacobian_rank = rank;
@@ -171,63 +158,57 @@ pub fn aux_richness_metrics(aux: ArrayView2<f64>, latents: ArrayView2<f64>) -> A
     }
 }
 
-/// Moore-Penrose pseudo-inverse times rhs via SVD. Stable for the small
-/// `(aux_dim x aux_dim)` normal-equation matrices encountered here. Tolerance
-/// is `1e-12 * max_singular_value`.
+fn centered_unit_columns(matrix: ArrayView2<f64>) -> Array2<f64> {
+    let mut centered = matrix.to_owned();
+    let n = matrix.nrows() as f64;
+    for mut column in centered.columns_mut() {
+        let scale = column.iter().fold(0.0_f64, |s, &v| s.max(v.abs()));
+        if scale == 0.0 {
+            continue;
+        }
+        column.mapv_inplace(|value| value / scale);
+        let mean = column.iter().sum::<f64>() / n;
+        column.mapv_inplace(|value| value - mean);
+        let norm = column.iter().fold(0.0_f64, |norm, &v| norm.hypot(v));
+        if norm > 0.0 {
+            column.mapv_inplace(|value| value / norm);
+        }
+    }
+    centered
+}
+
+/// Moore-Penrose pseudo-inverse times rhs via the thin SVD of the design.
 fn pinv_solve(a: ArrayView2<f64>, b: ArrayView2<f64>) -> Result<Array2<f64>, String> {
     let (m, n) = a.dim();
-    assert_eq!(m, n, "pinv_solve expects a square normal-equation matrix");
-    // Symmetric eigen-decomposition via Jacobi (matrices are small, < 64x64
-    // in any realistic identifiability check — Jacobi is robust and avoids
-    // pulling in a heavier dependency for this code path).
-    let (eigvals, eigvecs) = symmetric_eigen_lower(a)?;
-    let max_abs = eigvals.iter().fold(0.0_f64, |acc, &v| acc.max(v.abs()));
-    let tol = 1.0e-12 * max_abs.max(1.0);
-    // Build A^+ = V diag(1/λ_i if |λ_i|>tol else 0) Vᵀ.
-    let k = eigvals.len();
-    let mut inv_diag = vec![0.0_f64; k];
-    for i in 0..k {
-        if eigvals[i].abs() > tol {
-            inv_diag[i] = 1.0 / eigvals[i];
+    let (u, singular_values, vt) = a
+        .svd(true, true)
+        .map_err(|error| format!("identifiability regression SVD: {error}"))?;
+    let u = u.expect("requested left singular vectors");
+    let vt = vt.expect("requested right singular vectors");
+    let max_singular = singular_values.iter().copied().fold(0.0_f64, f64::max);
+    let tol = f64::EPSILON * m.max(n) as f64 * max_singular;
+    let mut projected = u.t().dot(&b);
+    for (i, &sigma) in singular_values.iter().enumerate() {
+        for j in 0..projected.ncols() {
+            projected[[i, j]] = if sigma > tol {
+                projected[[i, j]] / sigma
+            } else {
+                0.0
+            };
         }
     }
-    // A^+ b  =  V D Vᵀ b  where D = diag(inv_diag).
-    let vtb = eigvecs.t().dot(&b);
-    let mut dvtb = vtb.clone();
-    for i in 0..k {
-        let scale = inv_diag[i];
-        for j in 0..dvtb.ncols() {
-            dvtb[[i, j]] *= scale;
-        }
-    }
-    Ok(eigvecs.dot(&dvtb))
+    Ok(vt.t().dot(&projected))
 }
 
-/// Jacobi rotation eigen-decomposition for small symmetric matrices.
-/// Returns `(eigenvalues, eigenvectors)` with `A = V diag(λ) Vᵀ`.
-/// Self-adjoint eigendecomposition through the workspace's one owner
-/// (`gam_linalg::faer_ndarray::FaerEigh`), reading the lower triangle. It
-/// replaced a private Jacobi sweep whose `JACOBI_MAX_SWEEPS = 200`
-/// exhaustion returned an unconverged spectrum silently (#2470, #2469).
-fn symmetric_eigen_lower(a: ArrayView2<f64>) -> Result<(Vec<f64>, Array2<f64>), String> {
-    let (values, vectors) = gam_linalg::faer_ndarray::FaerEigh::eigh(&a, faer::Side::Lower)
-        .map_err(|error| format!("identifiability eigendecomposition: {error}"))?;
-    Ok((values.to_vec(), vectors))
-}
-
-/// Numeric rank of `m` via its singular values (computed as
-/// `sqrt(eig(MᵀM))`). `tol` is absolute; entries with singular value
+/// Numeric rank of `m` via its singular values. Forming `MᵀM` would square
+/// its condition number and erase resolvable directions. `tol` is absolute;
+/// entries with singular value
 /// `<= tol` are considered zero.
 fn matrix_rank(m: ArrayView2<f64>, tol: f64) -> Result<usize, String> {
-    let gram = m.t().dot(&m);
-    let (eigvals, _) = symmetric_eigen_lower(gram.view())?;
-    let mut rank = 0usize;
-    for &lam in eigvals.iter() {
-        if lam.max(0.0).sqrt() > tol {
-            rank += 1;
-        }
-    }
-    Ok(rank)
+    let (_, singular_values, _) = m
+        .svd(false, false)
+        .map_err(|error| format!("identifiability singular values: {error}"))?;
+    Ok(singular_values.iter().filter(|&&value| value > tol).count())
 }
 
 /// Scalar facts about decoder Jacobian sparsity.
@@ -337,18 +318,23 @@ fn anchor_consistency_metrics(
     let mut n_anchors = 0_usize;
     for i in 0..n {
         let row = assignments.row(i);
-        let mut mass = 0.0_f64;
         let mut max_val = 0.0_f64;
         let mut max_j = 0_usize;
         for j in 0..k {
             let a = row[j].abs();
-            mass += a;
             if a > max_val {
                 max_val = a;
                 max_j = j;
             }
         }
-        if mass > 0.0 && max_val / mass >= anchor_dominance {
+        // The normalized L1 mass is bounded by the number of atoms. Summing
+        // raw magnitudes first can overflow and turn a valid anchor into zero.
+        let scaled_mass = if max_val > 0.0 {
+            row.iter().map(|value| value.abs() / max_val).sum::<f64>()
+        } else {
+            f64::INFINITY
+        };
+        if 1.0 / scaled_mass >= anchor_dominance {
             n_anchors += 1;
             anchors_per_atom[max_j] += 1;
         }
@@ -609,6 +595,53 @@ mod tests {
         let m = aux_richness_metrics(aux.view(), lat.view());
         assert!(!m.aux_observed);
         assert_eq!(m.n_nonfinite_aux, 1);
+    }
+
+    #[test]
+    fn aux_regression_rank_and_constancy_are_invariant_to_units() {
+        let base = array![[1.0, 0.0], [-1.0, 0.0], [0.0, 1.0], [0.0, -1.0]];
+        for (aux_scale, latent_scale) in [(1e-200, 1e200), (1e200, 1e-200)] {
+            let aux = &base * aux_scale;
+            let latents = &base * latent_scale;
+            let metrics = aux_richness_metrics(aux.view(), latents.view());
+            assert!(metrics.constant_columns.is_empty());
+            assert!(metrics.jacobian_rank_estimated);
+            assert_eq!(metrics.jacobian_rank, 2);
+        }
+    }
+
+    #[test]
+    fn discrete_aux_levels_preserve_integer_floats_outside_i64() {
+        let aux = array![[1e20], [2e20], [3e20]];
+        let metrics = aux_richness_metrics(aux.view(), aux.view());
+        assert!(metrics.aux_is_discrete);
+        assert_eq!(metrics.n_distinct_levels, 3);
+        let zeros = array![[0.0], [-0.0]];
+        assert_eq!(aux_richness_metrics(zeros.view(), zeros.view()).n_distinct_levels, 1);
+    }
+
+    #[test]
+    fn matrix_rank_preserves_directions_lost_by_normal_equations() {
+        let matrix = array![[1.0, 1.0], [1.0, 1.0 + 1e-9]];
+        assert_eq!(matrix_rank(matrix.view(), 1e-12).expect("SVD rank"), 2);
+    }
+
+    #[test]
+    fn auxiliary_regression_preserves_near_collinear_identifiable_directions() {
+        let aux = array![[1.0, 1.0], [-1.0, -1.0], [0.0, 1e-9], [0.0, -1e-9]];
+        let metrics = aux_richness_metrics(aux.view(), aux.view());
+        assert!(metrics.jacobian_rank_estimated);
+        assert_eq!(metrics.jacobian_rank, 2);
+    }
+
+    #[test]
+    fn anchor_counts_are_invariant_to_overflowing_raw_l1_mass() {
+        let unit = array![[1.0, 0.5], [0.5, 1.0]];
+        let scaled = &unit * f64::MAX;
+        let expected = anchor_consistency_metrics(unit.view(), 0.6);
+        let actual = anchor_consistency_metrics(scaled.view(), 0.6);
+        assert_eq!(actual.n_anchors, 2);
+        assert_eq!(actual.anchors_per_atom, expected.anchors_per_atom);
     }
 
     #[test]
