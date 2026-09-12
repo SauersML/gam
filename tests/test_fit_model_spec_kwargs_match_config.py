@@ -1,22 +1,16 @@
-"""First-class ``fit()`` model-spec kwargs must match the ``config={...}`` escape hatch.
+"""A ``fit()`` model-spec field has one spelling: its dedicated keyword.
 
-These fields (``noise_formula``, ``noise_offset``, ``flexible_link``,
-``survival_time_anchor``, ``persistent_warm_start_root``) are genuine
-model-spec parameters fully wired through the
-FFI/core; promoting them to dedicated ``fit()`` kwargs is pure CLI<->Python parity.
-``survival_time_anchor`` joined them in #2631, where the anchor rule was collapsed to
-one function and the override had to become model configuration rather than a CLI flag. This test pins two properties:
+``config={...}`` carries only request fields without a dedicated keyword (for
+example ``outer_max_iter`` or ``group_metadata``). A ``config`` key that
+duplicates a keyword used to be silently overridden by the keyword, or silently
+taken when the keyword was left ``None``; it is now refused, naming the keyword
+to use. This test pins three properties:
 
-1. Passing a value via the dedicated kwarg assembles the *exact same* Rust config
-   payload as passing it via ``config={...}`` (the previously documented escape hatch),
-   so existing ``config=`` users see no behavior change.
-2. The kwarg and the ``config=`` dict do not clobber each other: a dedicated kwarg wins
-   over the same ``config`` key (mirroring ``firth``/``scale_dimensions``), and when the
-   kwarg is left ``None`` a value supplied via ``config=`` survives untouched.
-
-The optional Rust-backed arm fits a Gaussian location-scale model both ways and asserts
-the fitted predictions are bit-identical, i.e. the kwarg really does produce the same
-location-scale (GAMLSS) fit as the escape hatch.
+1. Each dedicated keyword sets its request key, and unset keywords emit no key.
+2. Every ``config`` spelling of a keyword is refused, including the Rust request
+   names of ``latents`` / ``penalties`` / ``smooths`` / ``transformation_normal_stage1``
+   and the response-geometry keywords.
+3. A ``config`` key with no dedicated keyword passes through unchanged.
 """
 
 from __future__ import annotations
@@ -72,64 +66,56 @@ def _payload(**overrides: typing.Any) -> dict[str, typing.Any]:
 
 
 @pytest.mark.parametrize(
-    ("kwarg", "value", "config_key"),
+    ("kwarg", "value"),
     [
-        ("noise_formula", "s(x)", "noise_formula"),
-        ("negative_binomial_theta", 2.5, "negative_binomial_theta"),
-        ("expectile_tau", 0.9, "expectile_tau"),
-        ("noise_offset", "logvar", "noise_offset"),
-        ("flexible_link", True, "flexible_link"),
-        ("survival_time_anchor", 25.0, "survival_time_anchor"),
-        (
-            "persistent_warm_start_root",
-            "warm-start-fixture",
-            "persistent_warm_start_root",
-        ),
+        ("noise_formula", "s(x)"),
+        ("negative_binomial_theta", 2.5),
+        ("expectile_tau", 0.9),
+        ("noise_offset", "logvar"),
+        ("flexible_link", True),
+        ("survival_time_anchor", 25.0),
+        ("persistent_warm_start_root", "warm-start-fixture"),
     ],
 )
-def test_model_spec_kwarg_matches_config_escape_hatch(
-    kwarg: str, value: typing.Any, config_key: str
-) -> None:
-    via_kwarg = _payload(**{kwarg: value})
-    via_config = _payload(config={config_key: value})
-
-    assert via_kwarg.get(config_key) == value, (
-        f"fit(..., {kwarg}=...) must set the {config_key!r} config key"
-    )
-    assert via_kwarg == via_config, (
-        f"fit(..., {kwarg}=...) must assemble the identical Rust payload as "
-        f"config={{{config_key!r}: ...}}"
-    )
+def test_model_spec_kwarg_sets_its_request_key(kwarg: str, value: typing.Any) -> None:
+    assert _payload(**{kwarg: value}).get(kwarg) == value
 
 
-def test_kwarg_left_none_does_not_override_config_value() -> None:
-    # Leaving the dedicated kwarg as its None default must not stomp a value the
-    # user passed through the escape hatch.
-    payload = _payload(config={"noise_formula": "s(z)", "flexible_link": True})
-    assert payload["noise_formula"] == "s(z)"
-    assert payload["flexible_link"] is True
+@pytest.mark.parametrize(
+    ("config_key", "keyword"),
+    [
+        ("noise_formula", "noise_formula"),
+        ("flexible_link", "flexible_link"),
+        ("persistent_warm_start_root", "persistent_warm_start_root"),
+        ("family", "family"),
+        ("offset", "offset"),
+        ("weights", "weights"),
+        ("latent_coordinates", "latents"),
+        ("analytic_penalties", "penalties"),
+        ("smooth_descriptors", "smooths"),
+        ("ctn_stage1", "transformation_normal_stage1"),
+        ("response_geometry", "response_geometry"),
+    ],
+)
+def test_config_spelling_of_a_keyword_is_refused(config_key: str, keyword: str) -> None:
+    with pytest.raises(ValueError, match=rf"duplicates the {keyword}= keyword"):
+        _payload(config={config_key: "value"})
 
 
-def test_dedicated_kwarg_wins_over_conflicting_config_key() -> None:
-    # When both are supplied, the dedicated kwarg wins (same rule as firth et al.).
-    payload = _payload(noise_formula="s(x)", config={"noise_formula": "s(other)"})
-    assert payload["noise_formula"] == "s(x)"
+def test_config_key_without_a_keyword_passes_through() -> None:
+    payload = _payload(config={"outer_max_iter": 12, "group_metadata": {"g": {}}})
+    assert payload["outer_max_iter"] == 12
+    assert payload["group_metadata"] == {"g": {}}
 
 
 def test_persistent_warm_start_path_is_serialized_exactly() -> None:
     from pathlib import Path
 
     root = Path("caller-owned") / ".." / "warm-root"
-    via_kwarg = _payload(persistent_warm_start_root=root)
-    via_config = _payload(config={"persistent_warm_start_root": root})
-
-    assert via_kwarg == via_config
-    assert via_kwarg["persistent_warm_start_root"] == str(root)
+    assert _payload(persistent_warm_start_root=root)["persistent_warm_start_root"] == str(root)
 
 
 def test_unset_model_spec_kwargs_emit_no_config_keys() -> None:
-    # No spurious keys when the user touches none of the three (no behavior change
-    # for callers that never used these fields).
     payload = _payload()
     for key in (
         "noise_formula",
@@ -141,76 +127,7 @@ def test_unset_model_spec_kwargs_emit_no_config_keys() -> None:
         assert key not in payload
 
 
-def _location_scale_training_frame() -> typing.Any:
-    np = pytest.importorskip("numpy")
-    rng = np.random.default_rng(7)
-    n = 200
-    x = np.linspace(-2.0, 2.0, n)
-    # Heteroscedastic Gaussian: both mean and log-scale vary smoothly with x.
-    mean = 0.7 * x
-    scale = np.exp(0.3 + 0.25 * np.sin(x))
-    y = mean + scale * rng.standard_normal(n)
-    return {"y": y.tolist(), "x": x.tolist()}
-
-
-def test_rust_location_scale_fit_kwarg_matches_config() -> None:
-    pytest.importorskip("gamfit._rust")
-    np = pytest.importorskip("numpy")
-
-    data = _location_scale_training_frame()
-
-    via_kwarg = gamfit.fit(
-        data,
-        "y ~ s(x)",
-        family="gaussian",
-        noise_formula="s(x)",
-    )
-    via_config = gamfit.fit(
-        data,
-        "y ~ s(x)",
-        family="gaussian",
-        config={"noise_formula": "s(x)"},
-    )
-
-    pred_kwarg = np.asarray(via_kwarg.predict(data), dtype=float)
-    pred_config = np.asarray(via_config.predict(data), dtype=float)
-    np.testing.assert_allclose(
-        pred_kwarg,
-        pred_config,
-        rtol=0.0,
-        atol=0.0,
-        err_msg=(
-            "noise_formula kwarg must produce the identical location-scale fit "
-            "as passing it through config={...}"
-        ),
-    )
-
-
-def test_rust_flexible_link_fit_kwarg_matches_config() -> None:
-    pytest.importorskip("gamfit._rust")
-    np = pytest.importorskip("numpy")
-
-    rng = np.random.default_rng(11)
-    n = 300
-    x = np.linspace(-3.0, 3.0, n)
-    p = 1.0 / (1.0 + np.exp(-(0.4 + 1.1 * x)))
-    y = (rng.uniform(size=n) < p).astype(float)
-    data = {"y": y.tolist(), "x": x.tolist()}
-
-    via_kwarg = gamfit.fit(data, "y ~ s(x)", family="bernoulli", flexible_link=True)
-    via_config = gamfit.fit(
-        data, "y ~ s(x)", family="bernoulli", config={"flexible_link": True}
-    )
-
-    pred_kwarg = np.asarray(via_kwarg.predict(data), dtype=float)
-    pred_config = np.asarray(via_config.predict(data), dtype=float)
-    np.testing.assert_allclose(
-        pred_kwarg,
-        pred_config,
-        rtol=0.0,
-        atol=0.0,
-        err_msg=(
-            "flexible_link kwarg must produce the identical fit as passing it "
-            "through config={...}"
-        ),
-    )
+def test_fit_refuses_config_spelling_before_fitting() -> None:
+    data = {"y": [0.1, 0.4, 0.2, 0.9, 0.5, 0.7], "x": [0.0, 1.0, 2.0, 3.0, 4.0, 5.0]}
+    with pytest.raises(ValueError, match=r"duplicates the noise_formula= keyword"):
+        gamfit.fit(data, "y ~ x", family="gaussian", config={"noise_formula": "x"})

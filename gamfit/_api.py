@@ -335,8 +335,29 @@ def _build_fit_payload(
         if value is not None:
             payload[key] = value
     if config:
+        # A request field with a dedicated keyword has exactly one spelling.
+        keyword_for = {key: key for key in kwarg_items}
+        keyword_for.update(
+            family="family",
+            offset="offset",
+            weights="weights",
+            ctn_stage1="transformation_normal_stage1",
+            frozen_ctn="transformation_normal_stage1",
+            latent_coordinates="latents",
+            analytic_penalties="penalties",
+            smooth_descriptors="smooths",
+            response_geometry="response_geometry",
+            response_columns="response_columns",
+            response_coordinates="response_coordinates",
+            response_reference="response_reference",
+        )
         for key, value in config.items():
-            payload.setdefault(key, _jsonable_array(value))
+            if key in keyword_for:
+                raise ValueError(
+                    f"config[{key!r}] duplicates the {keyword_for[key]}= keyword; "
+                    "pass the keyword instead"
+                )
+            payload[key] = _jsonable_array(value)
     return payload
 
 
@@ -857,10 +878,10 @@ def fit(
             gamfit.fit(df, "y ~ s(x)",
                        constraints={"s(x)": "monotone_increasing"})
     config:
-        Escape-hatch dict of extra pipeline keys. Any key already set via a
-        dedicated kwarg wins over the same key in ``config``. Standard formula
-        fits also accept ``outer_max_iter`` as a positive integer cap on outer
-        smoothing-parameter iterations.
+        Request fields that have no dedicated keyword, such as
+        ``outer_max_iter`` (a positive integer cap on outer
+        smoothing-parameter iterations) or ``group_metadata``. A key that
+        duplicates a dedicated keyword is refused.
     latents:
         Mapping from formula symbol to :class:`gamfit.LatentCoord`. This is
         the standard fit API surface for per-row latent coordinates. The Rust
@@ -937,20 +958,6 @@ def fit(
             )
         except Exception as exc:
             raise map_exception(exc) from exc
-    if config:
-        if response_geometry is None and config.get("response_geometry") is not None:
-            response_geometry = str(config["response_geometry"])
-        if response_columns is None and config.get("response_columns") is not None:
-            raw_columns = config["response_columns"]
-            if isinstance(raw_columns, (str, bytes)):
-                raise ValueError(
-                    "response_columns must be a sequence of column names, not a string"
-                )
-            response_columns = tuple(str(name) for name in raw_columns)
-        if response_coordinates is None and config.get("response_coordinates") is not None:
-            response_coordinates = str(config["response_coordinates"])
-        if response_reference is None and config.get("response_reference") is not None:
-            response_reference = int(config["response_reference"])
 
     if response_geometry is not None:
         if response_columns is None:
@@ -982,20 +989,6 @@ def fit(
             if arg_val is not None:
                 raise ValueError(f"{arg_name} is not supported with response_geometry")
 
-        nested_config = dict(config or {})
-        if persistent_warm_start_root is not None:
-            nested_config["persistent_warm_start_root"] = str(
-                persistent_warm_start_root
-            )
-        # Geometry is handled by the Python wrapper; scalar coordinate fits keep
-        # using the ordinary Rust standard-GAM path.
-        for key in (
-            "response_geometry",
-            "response_columns",
-            "response_coordinates",
-            "response_reference",
-        ):
-            nested_config.pop(key, None)
         return fit_response_geometry(
             fit,
             data,
@@ -1005,6 +998,7 @@ def fit(
             coordinates=response_coordinates,
             reference=-1 if response_reference is None else int(response_reference),
             weights=weights,
+            persistent_warm_start_root=persistent_warm_start_root,
             fisher_rao_w=fisher_rao_w,
             scale_dimensions=scale_dimensions,
             firth=firth,
@@ -1013,17 +1007,10 @@ def fit(
             penalties=penalties,
             smooths=smooths,
             constraints=constraints,
-            config=nested_config or None,
+            config=config,
         )
 
     rust_config = dict(config or {})
-    for key in (
-        "response_geometry",
-        "response_columns",
-        "response_coordinates",
-        "response_reference",
-    ):
-        rust_config.pop(key, None)
     payload = _build_fit_payload(
         family=family,
         negative_binomial_theta=negative_binomial_theta,
@@ -1480,13 +1467,6 @@ def validate_formula(
         Structured validation diagnostics from the Rust parser/materializer.
     """
     rust_config = dict(config or {})
-    for key in (
-        "response_geometry",
-        "response_columns",
-        "response_coordinates",
-        "response_reference",
-    ):
-        rust_config.pop(key, None)
     payload = _build_fit_payload(
         family=family,
         negative_binomial_theta=negative_binomial_theta,

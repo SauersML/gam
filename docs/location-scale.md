@@ -21,13 +21,13 @@ Use it when:
 
 ## Specifying the scale submodel
 
-The scale formula is passed via the `noise_formula` key in `config`:
+The scale formula is the `noise_formula=` keyword:
 
 ```python
 gamfit.fit(
     df,
     "y ~ s(x1) + s(x2)",
-    config={"noise_formula": "s(x1)"},
+    noise_formula="s(x1)",
 )
 ```
 
@@ -55,7 +55,7 @@ gamfit.fit(
     df,
     "Surv(entry, exit, event) ~ s(age) + bmi",
     survival_likelihood="location-scale",
-    config={"noise_formula": "s(age)"},
+    noise_formula="s(age)",
 )
 ```
 

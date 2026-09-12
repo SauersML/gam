@@ -67,6 +67,6 @@ def test_default_governor_admits_small_gaussian_location_scale_fit(
         gaussian,
         "y ~ smooth(x)",
         family="gaussian",
-        config={"noise_formula": "smooth(x)"},
+        noise_formula="smooth(x)",
     )
     _assert_finite_training_prediction(model, gaussian)

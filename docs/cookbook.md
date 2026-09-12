@@ -268,9 +268,8 @@ gamfit.fit(
 )
 ```
 
-`noise_formula=` is a first-class `fit` keyword. (It can also be passed via
-`config={"noise_formula": ...}`, but the dedicated keyword wins over the same
-key in `config`.)
+`noise_formula=` is a first-class `fit` keyword; `config=` refuses the same
+key.
 
 ## Pass through an identifier column
 
