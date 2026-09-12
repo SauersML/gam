@@ -251,18 +251,27 @@ fn try_build_spatial_term_log_kappa_derivative(
             gauge.constraint_block.view(),
         )
         .map_err(EstimationError::from)?;
+        // The scalar builders return dense jets beside the implicit operator, so
+        // the dense jets take the same projection whether or not an operator is
+        // present. Leaving them unprojected beside a projected operator carried a
+        // second, wrong design derivative: on the gam#2895 Matérn fixture it
+        // differed from central differences of the realized design by rel 6.67,
+        // against 5.6e-7 once projected (MSI job 434079).
+        if local_x_psi.nrows() > 0 {
+            projector
+                .project_matrix_in_place(&mut local_x_psi)
+                .map_err(EstimationError::from)?;
+        }
+        if local_x_psi_psi.nrows() > 0 {
+            projector
+                .project_matrix_in_place(&mut local_x_psi_psi)
+                .map_err(EstimationError::from)?;
+        }
         if let Some(op) = implicit_operator.take() {
             implicit_operator = Some(
                 op.with_fixed_row_space_projection(projector)
                     .map_err(EstimationError::from)?,
             );
-        } else {
-            projector
-                .project_matrix_in_place(&mut local_x_psi)
-                .map_err(EstimationError::from)?;
-            projector
-                .project_matrix_in_place(&mut local_x_psi_psi)
-                .map_err(EstimationError::from)?;
         }
     }
     let implicit_operator = implicit_operator.map(std::sync::Arc::new);
