@@ -69,7 +69,6 @@ pub mod model_types {
 pub mod inference;
 
 pub mod fit_orchestration;
-pub mod latent_coordinate;
 pub mod protocol;
 pub mod response_geometry;
 
@@ -83,9 +82,7 @@ pub(crate) mod exact_mode_branch;
 pub mod family_runtime;
 pub(crate) mod fnv1a;
 pub mod gamlss;
-pub mod indexed_bernoulli;
 pub mod indexed_natural;
-pub mod indexed_point_process;
 pub mod joint_penalty;
 pub(crate) mod location_scale_engine;
 pub mod marginal_slope_orthogonal;
@@ -96,7 +93,6 @@ pub mod multinomial_predictive;
 pub(crate) mod multinomial_reml;
 pub use multinomial_reml::{MultinomialFamily, MultinomialLogitRowProgram};
 pub mod outer_subsample;
-pub mod output_axis;
 pub mod parameter_block;
 pub mod penalized_vector_glm;
 pub(crate) mod row_kernel;

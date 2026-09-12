@@ -207,5 +207,17 @@
     "unit_test_decreases": {
       "crates/gam-solve": 3
     }
+  },
+  {
+    "base": "47c2319015f3f5a5995ced77bbd2f5ad1e45110e",
+    "reason": "Deleted production modules no production code used (#2469 test-only sweep): gam-inference functionals; gam-models output_axis, indexed_bernoulli, indexed_point_process and latent_coordinate with their two LAML integration tests; gam-gpu encode_throughput with its measured-throughput test. The removed tests exercised only the deleted surface.",
+    "evidence": "No production reference to any deleted module path or item outside the deleted files and their own tests. MSI cargo check --workspace --all-targets at b66a7d04e with the patch applied: rc 0, 0 errors, 0 warnings (job 421918). Guard items (142) and census delta measured on MSI (job 423156).",
+    "test_count_decrease": 22,
+    "removed_pins": {},
+    "unit_test_decreases": {
+      "crates/gam-gpu": 3,
+      "crates/gam-inference": 3,
+      "crates/gam-models": 16
+    }
   }
 ]

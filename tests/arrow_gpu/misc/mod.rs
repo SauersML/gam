@@ -2,7 +2,6 @@ mod arrow_schur_block_solve_matches_dense_identity;
 mod arrow_schur_complement_matches_dense_reference;
 mod arrow_schur_inertia_matches_sylvester_law;
 mod arrow_schur_mixed_precision;
-mod gpu_encode_throughput_measured_1412;
 mod owed_1017_gpu;
 mod owed_1412;
 mod owed_1551_sae_direct_device_engage;

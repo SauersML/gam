@@ -20,7 +20,6 @@ pub use gam_sae::inference::checkpoint_dynamics;
 pub mod difference_smooth;
 pub mod effects;
 pub mod fisher_rao;
-pub mod functionals;
 pub use gam_sae::inference::harvest;
 pub use gam_terms::inference::higher_order;
 pub mod hmc_io;

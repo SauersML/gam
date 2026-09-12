@@ -652,10 +652,10 @@ pub enum EncodeDecisionBlocked {
     /// device at all (a CPU rate cannot substitute — that was the #1412 defect).
     NoDevice,
     /// A device is present but there is no device-resident *exact-encode* kernel,
-    /// so the FULL per-row encode cannot be measured on the device. (The resident
-    /// normal-equations solve in [`crate::encode_throughput`] is only ONE
-    /// component of the encode, not the encode; a component measurement cannot
-    /// decide the encode surrogate question — #988.)
+    /// so the FULL per-row encode cannot be measured on the device. (A resident
+    /// normal-equations solve is only ONE component of the encode, not the
+    /// encode; a component measurement cannot decide the encode surrogate
+    /// question — #988.)
     NoDeviceEncodeKernel,
     /// A device is present and a measurement was attempted, but the device path
     /// did not engage (false routing) — refused rather than reported as a pass.
