@@ -141,57 +141,6 @@ path = "issue-1082.xml"
 filter = 'test(/hifreq_tensor_k(8|10)/)'
 slow-timeout = { period = "600s", terminate-after = 4 }
 
-# gam#2539: the SAE device-resident PARITY probe is legitimately slow on a
-# GPU-less runner and was being SIGKILLed before its assertion ran — the same
-# lost-coverage failure the hifreq and survival exemptions above address.
-#
-# Measured standalone on a dedicated node:
-#   outer_sequence_reuses_frame_and_matches_independent -> PASS in 397.782s
-# It exceeds the 300s SLOW period, and under the parallel load of a full
-# gam-solve run it crosses the 600s SIGKILL, so the whole-crate sweep reported it
-# as TIMEOUT while it is in fact CORRECT. The cost is structural, not a hang:
-# `DeviceResidentArrowShape::color_arm` is `n=180, p=5120, d=2`, the parity
-# harness does a DENSE reference factorisation at that border (~p^3/3 flops) for
-# each step of a 3-step outer sequence, and on a machine with no GPU the
-# "device-resident" side falls back to host code too, so the work is done twice.
-#
-# 1200s gives ~3x the measured standalone runtime, which covers the parallel-load
-# case without weakening the cap into uselessness.
-#
-# Its sibling `moving_ridge_takes_no_host_rebuild_and_matches_independent_2539`
-# is deliberately NOT exempted here. It has never been observed to finish, and
-# three attempts to raise its ceiling all re-measured the 600s default instead of
-# changing it, so whether it terminates at all is still unmeasured. Exempting it
-# on the assumption that it is merely slow would convert an unknown into 3600s of
-# burned wall-clock per run. It stays at the default cap until a run with an
-# actually-applied longer budget says otherwise.
-[[profile.default.overrides]]
-filter = 'test(/sae_resident::tests::outer_sequence_reuses_frame_and_matches_independent/)'
-slow-timeout = { period = "600s", terminate-after = 2 }
-
-# gam#2539: its sibling, now MEASURED rather than assumed.
-#
-# `moving_ridge_takes_no_host_rebuild_and_matches_independent_2539` PASSES in
-# 1695.698s standalone. It was left at the default cap when the exemption above
-# landed, because at that point it had never been observed to finish and three
-# attempts to raise its ceiling had all silently re-measured the 600s default
-# (the cap lives in this file, not in `NEXTEST_*` env vars). A run with an
-# actually-applied 3600s ceiling settled it: correct, and 4.26x slower than the
-# sibling above.
-#
-# The extra cost is consistent with what the test is built to detect. It seeds
-# `initial_ridge_t/beta = 1.0e-3` so that `ridge x lm_shrink` is a NEW positive
-# ridge on every accept — the key misses each iteration by construction, which is
-# precisely the host-rebuild path the assertion checks does not occur. So the
-# runtime is the fixture doing its job, not a stall.
-#
-# 3600s is ~2.1x the measured standalone runtime, which covers the parallel-load
-# case (under a full gam-solve run it was killed at 600s while alone it needs
-# ~1700s).
-[[profile.default.overrides]]
-filter = 'test(/sae_resident::tests::moving_ridge_takes_no_host_rebuild_and_matches_independent_2539/)'
-slow-timeout = { period = "600s", terminate-after = 6 }
-
 # Two survival integration probes carry a per-test wall-clock that exceeds the
 # default 600s SIGKILL by construction, so at the default budget nextest kills
 # them BEFORE their assertion runs — turning a designed verdict into an opaque
@@ -398,94 +347,45 @@ default-filter = 'package(gam-sae) and not test(/(^|::)zz/) and test(/^manifold:
 # a budget here: whether they belong in the default profile at all is a separate
 # question from a mis-measured ceiling.
 
-# gam#2668: a WALL-CLOCK assertion cannot share the machine.
+# ── `inner_fit_core_scaling`: a gate whose two arms want different numbers of
+#    cores runs alone ───────────────────────────────────────────────────────────
 #
-# `misc::large_scale_dense_regression_guard::large_scale_dense_logit_regression_guard`
-# asserts `elapsed < 30.0` to catch "many tens of seconds when the inner loop
-# grinds". Measured on MSI acn145, same lane, same warm target, `-j1`:
+# The test asserts `effective = t_nested / t_serial > clamp(cores/2, 1.25, 2.0)`.
+# The serial-context arm fans out over the whole Rayon pool, and the nesting guard
+# holds the nested arm serial. Tests running beside it hurt the two arms
+# UNEQUALLY: they hurt the pool-wide arm ~`cores` times harder, so contention
+# drives the ratio toward 1 with the solver untouched. Measured on one node, same
+# 4 cores, back to back:
 #
-#   standalone, f233578cd (nothing else running)           10.546s   PASS
-#   standalone, eacbe8a95 (same lane/node, later main)      2.077s   PASS
+#     idle           2.91x  3.43x     -> pass
+#     4 spinners     1.94x  2.30x     -> 1.94 FAILS the 2.0 floor
 #
-# -- so the fit is FIVE TIMES FASTER on current main than at the commit the
-# loaded runs below were measured against, from perf work I did not make. The
-# 32.490s below was parallel load, not a regression: an isolated A/B in one lane
-# clears every commit involved.
-#
-# and inside the full 494-test `regressions` sweep, at three commits:
-#
-#   SWEEP  (f233578cd, n39)                                24.408s   PASS
-#   PSD4   (f233578cd, cn1066)                             29.540s   PASS   <- 0.46s of margin
-#   POST   (25e58a020, cn1059)                             32.490s   FAIL
-#
-# So parallel load inflated this fit by roughly 3x, and the baseline-to-baseline
-# spread (5.1s) is LARGER than the step that tipped it over (3.0s). The guard was
-# measuring the machine, not the fit.
-#
-# It is NOT currently failing -- at 2.077s standalone there is ~14x headroom, so
-# even a 3x load penalty passes comfortably. This override is here because that
-# margin is not something the test controls: it moved 10.5s -> 2.1s on unrelated
-# perf work and can move back, and when it is marginal the failure is
-# unattributable to any commit (see the three loaded numbers above, whose
-# same-commit spread exceeds the step that tipped it over). Reserving the slots
-# removes the load term permanently, so the assertion measures the fit.
-#
-# Raising the threshold is not the fix. The regression it exists to catch is
-# "many tens of seconds", which is the same order as the load inflation — so any
-# threshold that tolerates a loaded run also tolerates the regression.
-#
-# `threads-required = "num-test-threads"` reserves every slot for the duration,
-# so the test runs alone and `elapsed` measures the fit. The cost is bounded and
-# small: one ~10s test that cannot overlap, against a target whose slowest single
-# tests already run for 20-49 minutes. The companion assertion
-# `outer_iterations <= 50` two lines above stays as the load-independent guard.
-[[profile.default.overrides]]
-filter = 'test(/large_scale_dense_logit_regression_guard/)'
-threads-required = 'num-test-threads'
-
-# ── `inner_fit_core_scaling`: the same defect as the guard above, and the same
-#    fix, on a gate whose two arms want DIFFERENT numbers of cores ─────────────
-#
-# The test asserts `effective = t_nested / t_serial > clamp(cores/2, 1.25, 2.0)`,
-# where the serial-context arm fans out over the whole Rayon pool and the nested
-# arm is held serial by the nesting guard. Load therefore hurts the two arms
-# UNEQUALLY — it hurts the pool-wide arm ~`cores` times harder — so contention
-# drives the ratio toward 1 with the solver untouched.
-#
-# THE ROW-PARALLEL PATH IS HEALTHY. One dedicated allocation per width, three
-# reps each, `RAYON_NUM_THREADS` pinned to the cgroup:
+# On dedicated allocations the ratio tracks the core count at every width:
 #
 #     2 cores   1.58x 1.61x 1.64x        8 cores   4.73x 4.95x 5.23x
 #     4 cores   3.06x 3.47x 3.61x       16 cores   8.76x 8.81x 8.83x
 #                                       32 cores  10.72x 11.29x 11.59x
 #
-# `effective` tracks the pool width at every width, and 4 cores clears the 2.0
-# floor with ~1.7x margin. The reported CI failure is `1.74x` on a 4-core runner.
+# NORMALIZING THE BAR DOES NOT WORK. Dividing by the speedup an embarrassingly
+# parallel kernel gets right now, and requiring a fixed fraction of it, was
+# implemented and failed in BOTH directions. Sampled once, the headroom on four
+# saturated cores bounced 2.36x/1.28x/2.81x, and at the 1.28x sample a genuinely
+# SERIAL solve scores 1.0/1.28 = 0.78 and PASSES. Taking the max over five reps
+# fixes that, and then the loaded runs score 0.44 and 0.52 against a 0.5 bar.
+# Timings taken minutes apart, on a machine whose load moves on that timescale,
+# cannot be normalized after the fact. Reserving the slots removes the load term
+# instead.
 #
-# THE CONTENDED ARM REPRODUCES IT, same node, same 4 cores, back to back:
+# THE FILTER NAMES THE MODULE PATH. Since the integration tests were folded into
+# the `suite` binary (b13822e18), the test is named
+# `inner_fit_core_scaling::inner_fit_core_scaling`, and the previous
+# `test(/^inner_fit_core_scaling$/)` matched nothing, so this override was inert.
 #
-#     idle           2.91x  3.43x     -> pass
-#     4 spinners     1.94x  2.30x     -> 1.94 FAILS the 2.0 floor
-#
-# so the failure is the runner's spare capacity, not the code.
-#
-# NORMALIZING THE BAR DOES NOT WORK, AND THIS IS THE PART WORTH KEEPING. The
-# obvious repair is to divide by the parallel speedup the machine is delivering
-# right now, measured on an embarrassingly parallel kernel, and require a fixed
-# fraction of it. Implemented and measured, it fails in BOTH directions: sampled
-# once, the observed headroom on four saturated cores bounced 2.36x/1.28x/2.81x,
-# and at the 1.28x sample a genuinely SERIAL solve would score 1.0/1.28 = 0.78
-# and PASS — a false green. Taking the max over five reps fixes that, and then
-# the loaded runs score 0.44 and 0.52 against a 0.5 bar — red again. The two
-# quantities are measured minutes apart on a machine whose load moves on that
-# timescale, so no normalization of non-simultaneous timings can separate them.
-#
-# Reserving the slots is the only repair that makes the measurement mean what it
-# says. Cost is one ~16s test that cannot overlap. Raising the floor is excluded
-# for the same reason as the guard above: the regression this exists to catch is
-# "the row loop went serial" (effective -> 1.0), which is the same order as the
-# load penalty, so any floor that tolerates a loaded run also tolerates the
-# regression.
+# The scheduled CI shards run `--test-threads 1`, so every test there already
+# runs alone and this override changes nothing. The CI red (1.78x against a 2.00
+# floor on a 4-thread pool) came from the floor counting SMT threads as cores on
+# 2-core, 4-thread runners. The test now takes `cores` from the physical cores
+# in its CPU affinity.
 [[profile.default.overrides]]
-filter = 'test(/^inner_fit_core_scaling$/)'
+filter = 'test(=inner_fit_core_scaling::inner_fit_core_scaling)'
 threads-required = 'num-test-threads'
