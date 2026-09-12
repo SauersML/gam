@@ -7302,23 +7302,26 @@ fn curl_candidates(
     let n = term.assignment.logits.nrows();
     let p = term.output_dim();
 
-    // Ambient noise scale for the RD screen: RMS reconstruction residual, floored
-    // off zero (a perfectly-shattered circle leaves ~no residual, which is
-    // exactly why it was invisible — the floor keeps the per-row coding gain
-    // ½·ln(3R̂²/(π²σ²)) finite and large).
-    let mut sse = 0.0_f64;
-    let mut cnt = 0usize;
-    for r in 0..residuals.nrows() {
-        for j in 0..residuals.ncols() {
-            sse += residuals[[r, j]] * residuals[[r, j]];
-            cnt += 1;
-        }
+    // Ambient noise scale for the RD screen: the per-coordinate RMS reconstruction
+    // residual. A perfectly shattered circle leaves almost no residual, which is
+    // exactly why it was invisible, and at an exact reconstruction the residual is
+    // roundoff: `target − fitted` resolves nothing below `ε` per unit of the
+    // reconstruction's own RMS. That resolution is the smallest σ the residual can
+    // state, and it keeps the per-row coding gain ½·ln(3R̂²/(π²σ²)) finite where the
+    // measured RMS has fallen below it.
+    if residuals.dim() != (n, p) {
+        return Err(format!(
+            "curl_candidates: residuals must be ({n}, {p}) for this term; got {:?}",
+            residuals.dim()
+        ));
     }
-    let sigma = if cnt > 0 {
-        (sse / cnt as f64).sqrt().max(1e-9)
-    } else {
-        1e-9
-    };
+    let sse: f64 = residuals.iter().map(|value| value * value).sum();
+    let rms_residual = (sse / (n * p) as f64).sqrt();
+    let fitted = term
+        .try_fitted()
+        .map_err(|error| format!("curl_candidates: the term's reconstruction failed: {error}"))?;
+    let rms_fitted = (fitted.iter().map(|value| value * value).sum::<f64>() / (n * p) as f64).sqrt();
+    let sigma = rms_residual.max(f64::EPSILON * rms_fitted);
 
     let census_frames: Vec<crate::manifold::AtomFrame<'_>> = frames
         .iter()
@@ -7372,12 +7375,13 @@ fn curl_candidates(
         // Lift the co-firing phases + own-presence gate to the full row set.
         let mut phase_coords = Array2::<f64>::zeros((n, 1));
         let mut gate = vec![f64::NEG_INFINITY; n];
-        // Own-presence gate logit: the per-row coding gain ½·ln(3R̂²/(π²σ²)),
-        // floored at 0.5 nats so a barely-paying circle still opens its gate for
-        // the race to adjudicate. The gain carries the circle shape constant
-        // −ln(π/√3) ≈ −0.595 nats/row, so the floor binds for R̂ ≲ 3.3σ (the
-        // radius where the gain reaches 0.5).
-        let own = pair.verdict.gain_nats_per_row.max(0.5);
+        // Own-presence gate logit: the per-row coding gain ½·ln(3R̂²/(π²σ²)), the
+        // log-odds per row that the circle describes the row more compactly than the
+        // flat pair. A raced pair carries accepted geometry, which the census grants
+        // only when the rate–distortion screen pays (`R̂ > σ·π/√3`, exactly where this
+        // gain crosses zero), so the gate is strictly positive and opens for the race
+        // to adjudicate at the strength the evidence states.
+        let own = pair.verdict.gain_nats_per_row;
         for (idx, &r) in plane.rows.iter().enumerate() {
             phase_coords[[r, 0]] = seed_circle.theta_turns[idx];
             gate[r] = own;

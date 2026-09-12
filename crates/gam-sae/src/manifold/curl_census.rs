@@ -263,7 +263,9 @@ fn circle_delta_charge_nats(harmonics: usize, n_eff: f64) -> f64 {
 /// `sigma` is the per-coordinate RMS of the dictionary's own reconstruction
 /// residual — the noise floor the rate–distortion screen measures the ring radius
 /// against. It is the caller's to compute because only the caller knows what its
-/// dictionary reconstructs; both callers compute the same quantity the same way.
+/// dictionary reconstructs; the fitted-term harvest (`structure_harvest`'s
+/// `curl_candidates`) floors it at the residual's numerical resolution, `ε` per unit
+/// of the reconstruction's RMS, so an exact reconstruction still states a σ.
 pub fn census_shattered_circles(
     frames: &[AtomFrame<'_>],
     n_rows: usize,
