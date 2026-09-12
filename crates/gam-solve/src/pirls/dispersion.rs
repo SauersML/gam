@@ -55,7 +55,36 @@ fn certified_pairs_sum(
 
 #[inline]
 pub(crate) fn gamma_shape_score(shape: f64, target: f64) -> f64 {
-    shape.ln() - digamma(shape) - target
+    let log_minus_digamma = if shape >= 32.0 {
+        // ln(a)-psi(a) = 1/(2a)+1/(12a²)-1/(120a⁴)+... .
+        // Subtracting the two logarithmic-size values loses the entire
+        // score at large a. The first omitted term here is O(a^-12),
+        // below one ulp of the result throughout this branch.
+        let inv = shape.recip();
+        let inv2 = inv * inv;
+        0.5 * inv
+            + inv2
+                * (1.0 / 12.0
+                    + inv2
+                        * (-1.0 / 120.0
+                            + inv2 * (1.0 / 252.0 + inv2 * (-1.0 / 240.0 + inv2 / 132.0))))
+    } else {
+        shape.ln() - digamma(shape)
+    };
+    log_minus_digamma - target
+}
+
+#[inline]
+fn gamma_shape_statistic(response: f64, mean: f64) -> f64 {
+    let relative_residual = (response - mean) / mean;
+    if relative_residual.abs() <= 0.5 {
+        // r-ln(r)-1 = d-ln(1+d), d=(y-mu)/mu. The subtraction
+        // y-mu preserves nearby represented responses before division.
+        -gam_math::special::log1p_minus_x(relative_residual)
+    } else {
+        // The log ratio remains finite when y/mu underflows to zero.
+        gam_math::special::expm1_minus_x(response.ln() - mean.ln())
+    }
 }
 
 pub(crate) fn estimate_gamma_shape_from_eta(
@@ -74,8 +103,7 @@ pub(crate) fn estimate_gamma_shape_from_eta(
             if !(y[i].is_finite() && y[i] > 0.0) {
                 return Err(EstimationError::pirls_row_geometry_unrepresentable(i, "Gamma response", eta[i], y[i]));
             }
-            let ratio = y[i] / means[i];
-            let target = ratio - ratio.ln() - 1.0;
+            let target = gamma_shape_statistic(y[i], means[i]);
             let contribution = wi * target;
             if !(target.is_finite() && target >= 0.0 && contribution.is_finite()) {
                 return Err(EstimationError::pirls_row_geometry_unrepresentable(
@@ -93,29 +121,11 @@ pub(crate) fn estimate_gamma_shape_from_eta(
         crate::bail_invalid_estim!("Gamma shape profiling requires positive total prior weight");
     }
     let target = weighted_target / total_weight;
-    // Each row's term `r − ln r − 1` is formed with three rounded operations over
-    // a cancelling sum of magnitude `r + |ln r| + 1`, and the terms are reduced
-    // pairwise. A statistic inside that accumulation's rounding band is zero
-    // dispersion to the resolution this arithmetic has: the shape MLE is `+∞`
-    // and there is no finite estimate to return.
-    let magnitude_rows: Vec<Result<(f64, f64), EstimationError>> = (0..eta.len())
-        .into_par_iter()
-        .map(|i| {
-            let wi = priorweights[i];
-            if wi == 0.0 {
-                return Ok((0.0, 0.0));
-            }
-            let ratio = y[i] / means[i];
-            Ok((wi * (ratio + ratio.ln().abs() + 1.0), 0.0))
-        })
-        .collect();
-    let (weighted_magnitude, _) = certified_pairs_sum(magnitude_rows)?;
-    let reduction_depth = 3 + (usize::BITS - eta.len().leading_zeros()) as usize;
-    let target_band =
-        gam_linalg::roundoff::accumulation_band(reduction_depth, weighted_magnitude) / total_weight;
-    if !(target.is_finite() && target > target_band) {
+    // Every row is now a nonnegative, cancellation-free statistic. A small
+    // positive value is real dispersion; only zero has no finite shape MLE.
+    if !(target.is_finite() && target > 0.0) {
         crate::bail_invalid_estim!(
-            "Gamma shape MLE is not finite: the dispersion statistic {target:?} is inside its rounding band {target_band:?}"
+            "Gamma shape MLE is not finite: the dispersion statistic is {target:?}"
         );
     }
 
@@ -123,8 +133,15 @@ pub(crate) fn estimate_gamma_shape_from_eta(
     // positive statistic the score has exactly one root. Bracket it by halving
     // and doubling outward from the closed-form approximation; the only way out
     // of either walk is the representable range itself.
-    let discriminant = (target - 3.0) * (target - 3.0) + 24.0 * target;
-    let approx = ((3.0 - target) + discriminant.sqrt()) / (12.0 * target);
+    let approx = if target < 3.0 {
+        let delta = 3.0 - target;
+        (delta + (delta * delta + 24.0 * target).sqrt()) / 12.0 / target
+    } else {
+        // Rationalize the numerator and divide the radical by target:
+        // 2/(sqrt(t²+18t+9)+t-3). Neither t² nor 12t is formed.
+        let inv = target.recip();
+        (2.0 * inv) / ((1.0 + 18.0 * inv + 9.0 * inv * inv).sqrt() + 1.0 - 3.0 * inv)
+    };
     if !(approx.is_finite() && approx > 0.0) {
         crate::bail_invalid_estim!(
             "Gamma shape approximation is not representable (profile target={target:?}, approximation={approx:?})"
@@ -141,22 +158,12 @@ pub(crate) fn estimate_gamma_shape_from_eta(
         }
     }
     while gamma_shape_score(hi, target) > 0.0 {
-        hi *= 2.0;
-        if !hi.is_finite() {
+        if hi == f64::MAX {
             crate::bail_invalid_estim!(
                 "Gamma shape MLE exceeds the representable range (profile target={target:?})"
             );
         }
-    }
-    // The score is a cancelling difference of `ln α` and `ψ(α)`. Once the
-    // statistic is inside that difference's rounding band at the bracket, the
-    // root's position is set by arithmetic, not by the data.
-    let score_band =
-        gam_linalg::roundoff::accumulation_band(2, hi.ln().abs() + digamma(hi).abs() + target);
-    if target <= score_band {
-        crate::bail_invalid_estim!(
-            "Gamma shape MLE is not resolvable: the dispersion statistic {target:?} is inside the shape score's rounding band {score_band:?} at shape {hi:?}"
-        );
+        hi = if hi <= 0.5 * f64::MAX { 2.0 * hi } else { f64::MAX };
     }
     // Bisect until no representable shape lies strictly inside the bracket.
     loop {
@@ -254,14 +261,16 @@ pub(crate) fn estimate_tweedie_phi_from_eta(
             if !(y[i].is_finite() && y[i] >= 0.0) {
                 return Err(EstimationError::pirls_row_geometry_unrepresentable(i, "Tweedie response", eta[i], y[i]));
             }
-            let variance = means[i].powf(p);
             let resid = y[i] - means[i];
-            let statistic = wi * resid * resid / variance;
-            if !(variance.is_finite()
-                && variance > 0.0
-                && statistic.is_finite()
-                && statistic >= 0.0)
-            {
+            // Form the complete Pearson term before exponentiating. Both
+            // residual² and mu^p may exceed the float range while their
+            // weighted ratio remains finite and informative.
+            let statistic = if resid == 0.0 {
+                0.0
+            } else {
+                (wi.ln() + 2.0 * resid.abs().ln() - p * means[i].ln()).exp()
+            };
+            if !(statistic.is_finite() && statistic >= 0.0) {
                 return Err(EstimationError::pirls_row_geometry_unrepresentable(
                     i,
                     "Tweedie dispersion statistic",
@@ -283,6 +292,69 @@ pub(crate) fn estimate_tweedie_phi_from_eta(
         Ok(phi)
     } else {
         crate::bail_invalid_estim!("Tweedie dispersion estimate is invalid: {phi:?}")
+    }
+}
+
+#[cfg(test)]
+mod gamma_tweedie_profile_math_tests {
+    use super::*;
+
+    #[test]
+    fn gamma_statistic_retains_near_unit_ratios_and_underflowed_ratios() {
+        for response in [1.0_f64 - 1.0e-8, 1.0 + 1.0e-8] {
+            let delta = response - 1.0;
+            let expected = 0.5 * delta * delta - delta.powi(3) / 3.0;
+            let actual = gamma_shape_statistic(response, 1.0);
+            assert!(actual > 0.0);
+            assert!((actual / expected - 1.0).abs() < 1.0e-14);
+        }
+        let target = gamma_shape_statistic(1.0e-300, 1.0e300);
+        assert!((target - (600.0 * std::f64::consts::LN_10 - 1.0)).abs() < 1.0e-12);
+        assert_eq!(gamma_shape_statistic(1.0, 1.0), 0.0);
+    }
+
+    #[test]
+    fn gamma_shape_score_retains_large_shape_information() {
+        for shape in [1.0e16_f64, 1.0e200, f64::MAX] {
+            let score = gamma_shape_score(shape, 0.0);
+            assert!(score > 0.0);
+            assert!((score / (0.5 / shape) - 1.0).abs() < 1.0e-14);
+        }
+    }
+
+    #[test]
+    fn gamma_profile_fits_small_nonzero_dispersion_and_large_targets() {
+        let y = Array1::from(vec![1.0 - 1.0e-8, 1.0 + 1.0e-8]);
+        let eta = Array1::zeros(2);
+        let weights = Array1::ones(2);
+        let shape = estimate_gamma_shape_from_eta(y.view(), &eta, weights.view())
+            .expect("a nonzero dispersion has a finite Gamma shape");
+        let mean_square = 0.5 * ((y[0] - 1.0).powi(2) + (y[1] - 1.0).powi(2));
+        assert!((shape * mean_square - 1.0).abs() < 1.0e-7);
+        let target = 0.5 * (gamma_shape_statistic(y[0], 1.0) + gamma_shape_statistic(y[1], 1.0));
+        assert!(gamma_shape_score(0.99 * shape, target) > 0.0);
+        assert!(gamma_shape_score(1.01 * shape, target) < 0.0);
+
+        let large_y = Array1::from(vec![1.0e200]);
+        let shape = estimate_gamma_shape_from_eta(large_y.view(), &Array1::zeros(1), Array1::ones(1).view())
+            .expect("a large profile target has a small finite Gamma shape");
+        assert!((shape * large_y[0] - 1.0).abs() < 1.0e-12);
+
+        assert!(estimate_gamma_shape_from_eta(Array1::ones(2).view(), &eta, weights.view()).is_err());
+    }
+
+    #[test]
+    fn tweedie_pearson_statistic_preserves_representable_extreme_ratios() {
+        for log_mean in [-600.0_f64, 600.0] {
+            let y = Array1::zeros(1);
+            let eta = Array1::from(vec![log_mean]);
+            let weights = Array1::ones(1);
+            let phi = estimate_tweedie_phi_from_eta(y.view(), &eta, weights.view(), 1.5)
+                .expect("Pearson ratio is representable despite overflowed squared terms");
+            // With y=0, (y-mu)^2/mu^p = mu^(2-p).
+            let expected = (0.5 * log_mean).exp();
+            assert!((phi / expected - 1.0).abs() < 1.0e-12);
+        }
     }
 }
 
