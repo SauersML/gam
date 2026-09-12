@@ -643,6 +643,147 @@ enum SparseLogitCurvature {
     CrossRowOwnedElsewhere,
 }
 
+/// #2731 — the residual-curvature half of `ΔC` at ONE state, contracted once
+/// instead of once per apply.
+///
+/// Legs (1a) and (1b) of [`SaeManifoldTerm::apply_exact_hessian_minus_b_prepared`]
+/// are `⟨r_n, ∂²f_ab⟩` and `⟨r_n, ∂²f_aβ⟩`: the metric-applied row residual
+/// against the row's second and mixed jets. Both factors belong to the state;
+/// only the direction they multiply changes from one apply to the next. The
+/// per-apply form rebuilt every row's packed jet buffer
+/// (`q·p + q²·p + n_β·p + 2·q·n_β·p` doubles, allocated zeroed) and contracted
+/// it again on every probe. On #2731's `p = 2048, charts = 32` cell that buffer
+/// is ~24 MB per row, for each of 256 rows, for each of the 290 probes of one
+/// dense materialization; job 391502 read 700–827 ms per apply on one core.
+///
+/// Held per row: `q × q` and `q × n_β` doubles, the order of the `H_tβ` block
+/// the factor cache already holds for that row. Empty under a softmax gate,
+/// whose resident contracted kernel never materializes the packed channels. A
+/// plan is valid for exactly the state it was built from; the callers hold
+/// `&self` across the applies they share it with, which is the proof.
+pub(crate) struct PreparedResidualCurvatureRows {
+    rows: Vec<PreparedResidualCurvatureRow>,
+    /// `border_channels_for_cache(cache)[β].index`, in border order.
+    border_indices: Vec<usize>,
+}
+
+struct PreparedResidualCurvatureRow {
+    vars: Vec<SaeLocalRowVar>,
+    /// `⟨r, ∂²f_ab⟩`, row-major `q × q`.
+    residual_tt: Vec<f64>,
+    /// `⟨r, ∂²f_aβ⟩`, row-major `q × n_β`.
+    residual_tbeta: Vec<f64>,
+}
+
+impl SaeManifoldTerm {
+    /// Contract the residual-curvature legs of `ΔC` at this state. The row
+    /// residual and the row program's jets are read exactly as the per-apply
+    /// form read them — same row order, same jet window, same `sae_dot` — so an
+    /// apply against the plan is bit-identical to one that re-derived them.
+    pub(crate) fn prepare_residual_curvature_rows(
+        &self,
+        target: ArrayView2<'_, f64>,
+        cache: &ArrowFactorCache,
+    ) -> Result<PreparedResidualCurvatureRows, String> {
+        if matches!(self.assignment.mode, AssignmentMode::Softmax { .. }) {
+            return Ok(PreparedResidualCurvatureRows {
+                rows: Vec::new(),
+                border_indices: Vec::new(),
+            });
+        }
+        let p = self.output_dim();
+        let n = self.n_obs();
+        let k_atoms = self.k_atoms();
+        let second_jets = self.atom_second_jets()?;
+        let border = self.border_channels_for_cache(cache)?;
+        let n_border = border.len();
+        let row_loss_w = self.row_loss_weights.as_deref();
+        let whitens = self
+            .row_metric
+            .as_ref()
+            .is_some_and(|metric| metric.whitens_likelihood());
+        let mut decoded = vec![0.0_f64; p];
+        let mut fitted = Array1::<f64>::zeros(p);
+        let mut error = Array1::<f64>::zeros(p);
+        let mut assignments = Array1::<f64>::zeros(k_atoms);
+        // #932 complete schedule: non-softmax gates use their distinct dynamic
+        // row program through the bounded look-ahead window.
+        let mut jet_window: std::collections::VecDeque<SaeRowJets> =
+            std::collections::VecDeque::new();
+        let mut jet_window_next = 0usize;
+        let mut rows = Vec::with_capacity(n);
+        for row in 0..n {
+            let q = cache.row_dims[row];
+            let a_scratch = assignments.as_slice_mut().expect("contiguous scratch");
+            self.assignment.try_assignments_row_into(row, a_scratch)?;
+            if jet_window.is_empty() {
+                jet_window_next = self.refill_jet_window(
+                    jet_window_next,
+                    cache,
+                    &second_jets,
+                    &border,
+                    &mut jet_window,
+                )?;
+            }
+            let jets = jet_window
+                .pop_front()
+                .expect("jet window must be non-empty");
+            let sqrt_row_w = row_loss_w.map_or(1.0, |w| w[row].sqrt());
+
+            // √w-scaled metric-applied per-row residual `error_metric = √w·M_n r_n`
+            // (the SAME object the assembly's β-tier gradient contracts). The
+            // data-fit `½ r_nᵀ M_n r_n` has residual curvature `Σ (M_n r_n)·∂²f`,
+            // so this is exactly the residual contracted against the raw `∂²f`
+            // jets. `M_n = I` on the isotropic path ⇒ `error_metric = √w·r`.
+            fitted.fill(0.0);
+            let active_atoms = self
+                .last_row_layout
+                .as_ref()
+                .map(|layout| layout.active_atoms[row].as_slice());
+            for k in 0..k_atoms {
+                if active_atoms.is_some_and(|active| active.binary_search(&k).is_err()) {
+                    continue;
+                }
+                self.atoms[k].fill_decoded_row(row, &mut decoded);
+                let a_k = assignments[k];
+                for out_col in 0..p {
+                    fitted[out_col] += a_k * decoded[out_col];
+                }
+            }
+            for out_col in 0..p {
+                error[out_col] = sqrt_row_w * (fitted[out_col] - target[[row, out_col]]);
+            }
+            let error_metric: Vec<f64> = match self.row_metric.as_ref() {
+                Some(metric) if whitens => metric.apply_metric_row(row, error.view()),
+                _ => error.to_vec(),
+            };
+
+            let mut residual_tt = vec![0.0_f64; q * q];
+            for a in 0..q {
+                for b in 0..q {
+                    residual_tt[a * q + b] = sae_dot(&error_metric, jets.second(a, b));
+                }
+            }
+            let mut residual_tbeta = vec![0.0_f64; q * n_border];
+            for a in 0..q {
+                for beta_pos in 0..n_border {
+                    residual_tbeta[a * n_border + beta_pos] =
+                        sae_dot(&error_metric, jets.beta_deriv(a, beta_pos));
+                }
+            }
+            rows.push(PreparedResidualCurvatureRow {
+                vars: jets.vars,
+                residual_tt,
+                residual_tbeta,
+            });
+        }
+        Ok(PreparedResidualCurvatureRows {
+            rows,
+            border_indices: border.iter().map(|channel| channel.index).collect(),
+        })
+    }
+}
+
 impl SaeManifoldTerm {
     /// #2500 — the ONE authority for `∂H_tt/∂ρ_sparse` on the free-logit slots.
     /// See [`SparseLogitCurvature`] for why this exists and what each outcome
@@ -815,6 +956,10 @@ impl SaeManifoldTerm {
     /// it once here instead of once per apply. Measured on a 10-atom, `p = 16`,
     /// `n = 60` fixture with every pair near-collinear: 2.79 ms of a 15.19 ms
     /// apply.
+    ///
+    /// #2731 — the residual-curvature legs are the same kind of object and take
+    /// the same treatment: `residual` is
+    /// [`Self::prepare_residual_curvature_rows`] at this state.
     pub(crate) fn apply_exact_hessian_minus_b_prepared(
         &self,
         rho: &SaeManifoldRho,
@@ -822,14 +967,13 @@ impl SaeManifoldTerm {
         cache: &ArrowFactorCache,
         v: &SaeArrowVector,
         prepared: &PreparedDecoderPriorBetaCurvature,
+        residual: &PreparedResidualCurvatureRows,
     ) -> Result<SaeArrowVector, String> {
         self.assignment.validate_rho_domain(rho)?;
         let p = self.output_dim();
         let n = self.n_obs();
         let k_atoms = self.k_atoms();
         let total_t = cache.delta_t_len();
-        let second_jets = self.atom_second_jets()?;
-        let border = self.border_channels_for_cache(cache)?;
         let row_loss_w = self.row_loss_weights.as_deref();
         let ard_axis_periods: Vec<Vec<Option<f64>>> = self
             .assignment
@@ -899,6 +1043,11 @@ impl SaeManifoldTerm {
             _ => None,
         };
         if matches!(self.assignment.mode, AssignmentMode::Softmax { .. }) {
+            // The resident contracted kernel below reads the raw jets per apply and
+            // never materializes the packed channels, so a softmax gate has no
+            // residual plan to share (`residual` is empty for it).
+            let second_jets = self.atom_second_jets()?;
+            let border = self.border_channels_for_cache(cache)?;
             // #2304 resident path for the residual-curvature blocks (1a)+(1b):
             // the raw second/mixed jets are contracted on device (when the plan
             // admits it) against the metric-applied √w-scaled residual and the
@@ -1039,62 +1188,37 @@ impl SaeManifoldTerm {
             }
             return Ok(out);
         }
-        // #932 complete schedule: non-softmax gates use their distinct dynamic
-        // row program through the bounded look-ahead window.
-        let mut jet_window: std::collections::VecDeque<SaeRowJets> =
-            std::collections::VecDeque::new();
-        let mut jet_window_next = 0usize;
+        // #932 complete schedule, #2731 contracted once per state: the row
+        // program's jets and the row residual were read by
+        // `Self::prepare_residual_curvature_rows`; only the direction is read here.
+        if residual.rows.len() != n || residual.border_indices.len() != cache.k {
+            return Err(format!(
+                "apply_exact_hessian_minus_b: residual-curvature plan has {} rows and {} border \
+                 channels, but this state has {n} rows and border width {}; a plan is valid only \
+                 for the state it was prepared from",
+                residual.rows.len(),
+                residual.border_indices.len(),
+                cache.k,
+            ));
+        }
+        let border_indices = residual.border_indices.as_slice();
+        let n_border = border_indices.len();
         for row in 0..n {
             let q = cache.row_dims[row];
             let base = cache.row_offsets[row];
-            let a_scratch = assignments.as_slice_mut().expect("contiguous scratch");
-            self.assignment.try_assignments_row_into(row, a_scratch)?;
-            if jet_window.is_empty() {
-                jet_window_next = self.refill_jet_window(
-                    jet_window_next,
-                    cache,
-                    &second_jets,
-                    &border,
-                    &mut jet_window,
-                )?;
+            let row_plan = &residual.rows[row];
+            if row_plan.vars.len() != q {
+                return Err(format!(
+                    "apply_exact_hessian_minus_b: row {row} was prepared with {} primaries, but \
+                     the cache row has {q}",
+                    row_plan.vars.len(),
+                ));
             }
-            let jets = jet_window
-                .pop_front()
-                .expect("jet window must be non-empty");
-            let sqrt_row_w = row_loss_w.map_or(1.0, |w| w[row].sqrt());
-
-            // √w-scaled metric-applied per-row residual `error_metric = √w·M_n r_n`
-            // (the SAME object the assembly's β-tier gradient contracts). The
-            // data-fit `½ r_nᵀ M_n r_n` has residual curvature `Σ (M_n r_n)·∂²f`,
-            // so this is exactly the residual contracted against the raw `∂²f`
-            // jets. `M_n = I` on the isotropic path ⇒ `error_metric = √w·r`.
-            fitted.fill(0.0);
-            let active_atoms = self
-                .last_row_layout
-                .as_ref()
-                .map(|layout| layout.active_atoms[row].as_slice());
-            for k in 0..k_atoms {
-                if active_atoms.is_some_and(|active| active.binary_search(&k).is_err()) {
-                    continue;
-                }
-                self.atoms[k].fill_decoded_row(row, &mut decoded);
-                let a_k = assignments[k];
-                for out_col in 0..p {
-                    fitted[out_col] += a_k * decoded[out_col];
-                }
-            }
-            for out_col in 0..p {
-                error[out_col] = sqrt_row_w * (fitted[out_col] - target[[row, out_col]]);
-            }
-            let error_metric: Vec<f64> = match self.row_metric.as_ref() {
-                Some(metric) if whitens => metric.apply_metric_row(row, error.view()),
-                _ => error.to_vec(),
-            };
 
             // Local t-slice of `v` for this row.
             let v_t: Vec<f64> = (0..q).map(|c| v.t[base + c]).collect();
             if let Some(direction) = ordered_logit_direction.as_mut() {
-                for (local, var) in jets.vars.iter().enumerate() {
+                for (local, var) in row_plan.vars.iter().enumerate() {
                     if let SaeLocalRowVar::Logit { atom } = *var {
                         direction[row * k_atoms + atom] = v_t[local];
                     }
@@ -1105,7 +1229,7 @@ impl SaeManifoldTerm {
             for a in 0..q {
                 let mut acc = 0.0_f64;
                 for b in 0..q {
-                    let r_ab = sae_dot(&error_metric, jets.second(a, b));
+                    let r_ab = row_plan.residual_tt[a * q + b];
                     acc += r_ab * v_t[b];
                 }
                 out.t[base + a] += acc;
@@ -1113,11 +1237,11 @@ impl SaeManifoldTerm {
             // (1b) residual curvature, t–β and β–t: ΔC_tβ[a,β] = ⟨r, ∂²f_aβ⟩.
             //      `jets.beta_deriv[a][β]` = ∂(∂f/∂β_β)/∂θ_a (the mixed second jet).
             for a in 0..q {
-                for (beta_pos, channel) in border.iter().enumerate() {
-                    let r_ab = sae_dot(&error_metric, jets.beta_deriv(a, beta_pos));
+                for (beta_pos, &index) in border_indices.iter().enumerate() {
+                    let r_ab = row_plan.residual_tbeta[a * n_border + beta_pos];
                     // t row picks up β leg of v; β row picks up t leg of v.
-                    out.t[base + a] += r_ab * v.beta[channel.index];
-                    out.beta[channel.index] += r_ab * v_t[a];
+                    out.t[base + a] += r_ab * v.beta[index];
+                    out.beta[index] += r_ab * v_t[a];
                 }
             }
 
@@ -1135,7 +1259,7 @@ impl SaeManifoldTerm {
             // `psd_majorizer_hess + negative_hessian_remainder == V''` bit-for-bit).
             // The prior is weighted directly, not through the √w data-jet seam.
             let w_row = row_loss_w.map_or(1.0, |w| w[row]);
-            for (a, va) in jets.vars.iter().enumerate() {
+            for (a, va) in row_plan.vars.iter().enumerate() {
                 let SaeLocalRowVar::Coord { atom, axis } = *va else {
                     continue;
                 };
@@ -1161,7 +1285,7 @@ impl SaeManifoldTerm {
             // remainder is already design-weighted and fixed-logit masked by the
             // producer, exactly as the majorizer is.
             if let Some(remainder) = threshold_gate_remainder.as_ref() {
-                for (a, va) in jets.vars.iter().enumerate() {
+                for (a, va) in row_plan.vars.iter().enumerate() {
                     let SaeLocalRowVar::Logit { atom } = *va else {
                         continue;
                     };
@@ -1466,19 +1590,9 @@ impl SaeManifoldTerm {
     /// #1418: matrix-free apply of the EXACT stationarity Jacobian `A = ∇²_θθ L`:
     /// `A v = B_raw v + ΔC v`, the raw objective-majorizer apply
     /// ([`apply_raw_cached_arrow_hessian`]) plus the matrix-free dropped-curvature
-    /// correction `ΔC = A − B` (`Self::apply_exact_hessian_minus_b`).
-    fn apply_exact_hessian(
-        &self,
-        rho: &SaeManifoldRho,
-        target: ArrayView2<'_, f64>,
-        cache: &ArrowFactorCache,
-        v: &SaeArrowVector,
-    ) -> Result<SaeArrowVector, String> {
-        let prepared = self.prepare_decoder_prior_beta_curvature(1.0);
-        self.apply_exact_hessian_prepared(rho, target, cache, v, &prepared)
-    }
-
-    /// [`Self::apply_exact_hessian`] against a β-tier plan prepared once.
+    /// correction `ΔC = A − B` (`Self::apply_exact_hessian_minus_b_prepared`),
+    /// against the β-tier plan and the residual-curvature rows prepared once for
+    /// this state (#2828, #2731).
     fn apply_exact_hessian_prepared(
         &self,
         rho: &SaeManifoldRho,
@@ -1486,6 +1600,7 @@ impl SaeManifoldTerm {
         cache: &ArrowFactorCache,
         v: &SaeArrowVector,
         prepared: &PreparedDecoderPriorBetaCurvature,
+        residual: &PreparedResidualCurvatureRows,
     ) -> Result<SaeArrowVector, String> {
         // #2515 — the cache factors the conditioned evidence majorizer
         // `Phi(B_raw)`.  That conditioning is a solve/log-determinant policy, not
@@ -1494,7 +1609,8 @@ impl SaeManifoldTerm {
         // builds `Phi(B_raw + ΔC)`.  Recover B_raw first so both routes classify
         // the one statistical operator `A_raw = B_raw + ΔC`.
         let b_v = apply_raw_cached_arrow_hessian(cache, v.t.view(), v.beta.view())?;
-        let dc_v = self.apply_exact_hessian_minus_b_prepared(rho, target, cache, v, prepared)?;
+        let dc_v =
+            self.apply_exact_hessian_minus_b_prepared(rho, target, cache, v, prepared, residual)?;
         Ok(SaeArrowVector {
             t: &b_v.t + &dc_v.t,
             beta: &b_v.beta + &dc_v.beta,
@@ -1534,12 +1650,14 @@ impl SaeManifoldTerm {
         system: &ArrowSchurSystem,
         vector: &SaeArrowVector,
         prepared: &PreparedDecoderPriorBetaCurvature,
+        residual: &PreparedResidualCurvatureRows,
     ) -> Result<SaeArrowVector, String> {
         let (base_t, base_beta) =
             matrix_free_arrow_operator_apply(system, cache, vector.t.view(), vector.beta.view())
                 .map_err(|error| format!("matrix-free evidence operator: {error}"))?;
-        let correction =
-            self.apply_exact_hessian_minus_b_prepared(rho, target, cache, vector, prepared)?;
+        let correction = self.apply_exact_hessian_minus_b_prepared(
+            rho, target, cache, vector, prepared, residual,
+        )?;
         let mut out = SaeArrowVector {
             t: &base_t + &correction.t,
             beta: &base_beta + &correction.beta,
@@ -1583,11 +1701,13 @@ impl SaeManifoldTerm {
             .map_err(|error| format!("matrix-free evidence operator: {error}"))?;
             Ok(SaeArrowVector { t, beta })
         };
-        // #2828 — one plan for the whole Krylov solve, not one per iteration.
+        // #2828/#2731 — one plan of each kind for the whole Krylov solve, not one
+        // per iteration.
         let prepared = self.prepare_decoder_prior_beta_curvature(1.0);
+        let residual = self.prepare_residual_curvature_rows(target, cache)?;
         let apply_a = |vector: &SaeArrowVector| -> Result<SaeArrowVector, String> {
             self.apply_exact_hessian_matrix_free_prepared(
-                rho, target, cache, system, vector, &prepared,
+                rho, target, cache, system, vector, &prepared, &residual,
             )
         };
         // Classify ordinary A Ritz directions with the dense route's floor
@@ -4513,8 +4633,9 @@ impl SaeManifoldTerm {
     }
 
     /// #2267 — price ONE step of the dense exact-stationarity route BEFORE paying
-    /// for it, by timing a single `apply_exact_hessian` and multiplying by the
-    /// column count the materialization will perform.
+    /// for it, by timing what the materialization will perform: its per-state
+    /// plans once, and one planned apply times its `slots + k` probes (#2731; the
+    /// column loop the numbers below were measured on performed `dim` applies).
     ///
     /// This is a FORECAST, not a bar. It exists because the two candidate
     /// denominations for a size predicate on this route were both unsupported:
@@ -4558,8 +4679,13 @@ impl SaeManifoldTerm {
         } else {
             return Ok((0, std::time::Duration::ZERO));
         }
+        let prepare_started = std::time::Instant::now();
+        let prepared = self.prepare_decoder_prior_beta_curvature(1.0);
+        let residual = self.prepare_residual_curvature_rows(target, cache)?;
+        let prepare_elapsed = prepare_started.elapsed();
         let probe_started = std::time::Instant::now();
-        let probe = self.apply_exact_hessian(rho, target, cache, &unit)?;
+        let probe =
+            self.apply_exact_hessian_prepared(rho, target, cache, &unit, &prepared, &residual)?;
         let per_apply = probe_started.elapsed();
         // The probe column is a real column of the operator this route is about
         // to build `dim` of. If it is already non-finite, the forecast is
@@ -4575,7 +4701,17 @@ impl SaeManifoldTerm {
                     .to_string(),
             );
         }
-        Ok((dim, per_apply.saturating_mul(dim.max(1) as u32)))
+        // The probe count `materialize_exact_hessian_dense` performs: one probe per
+        // coordinate slot of the widest row, one per border column.
+        let slots = (0..cache.n_rows())
+            .map(|row| cache.row_offsets[row + 1] - cache.row_offsets[row])
+            .max()
+            .unwrap_or(0);
+        let probes = slots + k;
+        Ok((
+            dim,
+            prepare_elapsed + per_apply.saturating_mul(probes.max(1) as u32),
+        ))
     }
 
     /// PATH C / #2330 — dense symmetric materialization of the EXACT stationarity
@@ -4653,6 +4789,9 @@ impl SaeManifoldTerm {
         let build_started = std::time::Instant::now();
         // #2828 — one β-tier decoder-prior plan for all `slots + k` probes.
         let prepared = self.prepare_decoder_prior_beta_curvature(1.0);
+        // #2731 — and one residual-curvature plan: the row jets and residual are
+        // contracted here once, where every probe used to rebuild them.
+        let residual = self.prepare_residual_curvature_rows(target, cache)?;
         let mut a = Array2::<f64>::zeros((dim, dim));
         let mut unit = SaeArrowVector {
             t: Array1::<f64>::zeros(total_t),
@@ -4666,7 +4805,9 @@ impl SaeManifoldTerm {
                     unit.t[start + slot] = 1.0;
                 }
             }
-            let mut av = self.apply_exact_hessian_prepared(rho, target, cache, &unit, &prepared)?;
+            let mut av = self.apply_exact_hessian_prepared(
+                rho, target, cache, &unit, &prepared, &residual,
+            )?;
             for (coefficient, carrier) in &mass_carriers {
                 let projection = carrier
                     .iter()
@@ -4697,7 +4838,9 @@ impl SaeManifoldTerm {
         for j in 0..k {
             unit.beta.fill(0.0);
             unit.beta[j] = 1.0;
-            let av = self.apply_exact_hessian_prepared(rho, target, cache, &unit, &prepared)?;
+            let av = self.apply_exact_hessian_prepared(
+                rho, target, cache, &unit, &prepared, &residual,
+            )?;
             let col = total_t + j;
             for i in 0..total_t {
                 a[[i, col]] = av.t[i];
@@ -6818,6 +6961,7 @@ mod column_loop_oracle_tests {
             // this oracle and the probe assembly it checks pay the same per-apply
             // cost and their timings stay comparable.
             let prepared = self.prepare_decoder_prior_beta_curvature(1.0);
+            let residual = self.prepare_residual_curvature_rows(target, cache)?;
             let mut a = Array2::<f64>::zeros((dim, dim));
             let mut unit = SaeArrowVector {
                 t: Array1::<f64>::zeros(total_t),
@@ -6829,7 +6973,9 @@ mod column_loop_oracle_tests {
                 } else {
                     unit.beta[col - total_t] = 1.0;
                 }
-                let av = self.apply_exact_hessian_prepared(rho, target, cache, &unit, &prepared)?;
+                let av = self.apply_exact_hessian_prepared(
+                    rho, target, cache, &unit, &prepared, &residual,
+                )?;
                 if col < total_t {
                     unit.t[col] = 0.0;
                 } else {
@@ -6874,6 +7020,17 @@ mod tests_exact_hessian_apply_wrappers {
     use super::*;
 
     impl SaeManifoldTerm {
+        pub(crate) fn apply_exact_hessian(
+            &self,
+            rho: &SaeManifoldRho,
+            target: ArrayView2<'_, f64>,
+            cache: &ArrowFactorCache,
+            v: &SaeArrowVector,
+        ) -> Result<SaeArrowVector, String> {
+            let prepared = self.prepare_decoder_prior_beta_curvature(1.0);
+            let residual = self.prepare_residual_curvature_rows(target, cache)?;
+            self.apply_exact_hessian_prepared(rho, target, cache, v, &prepared, &residual)
+        }
         pub(crate) fn apply_exact_hessian_minus_b(
             &self,
             rho: &SaeManifoldRho,
@@ -6882,7 +7039,8 @@ mod tests_exact_hessian_apply_wrappers {
             v: &SaeArrowVector,
         ) -> Result<SaeArrowVector, String> {
             let prepared = self.prepare_decoder_prior_beta_curvature(1.0);
-            self.apply_exact_hessian_minus_b_prepared(rho, target, cache, v, &prepared)
+            let residual = self.prepare_residual_curvature_rows(target, cache)?;
+            self.apply_exact_hessian_minus_b_prepared(rho, target, cache, v, &prepared, &residual)
         }
         pub(crate) fn apply_exact_hessian_matrix_free(
             &self,
@@ -6893,7 +7051,10 @@ mod tests_exact_hessian_apply_wrappers {
             vector: &SaeArrowVector,
         ) -> Result<SaeArrowVector, String> {
             let prepared = self.prepare_decoder_prior_beta_curvature(1.0);
-            self.apply_exact_hessian_matrix_free_prepared(rho, target, cache, system, vector, &prepared)
+            let residual = self.prepare_residual_curvature_rows(target, cache)?;
+            self.apply_exact_hessian_matrix_free_prepared(
+                rho, target, cache, system, vector, &prepared, &residual,
+            )
         }
     }
 }
@@ -6997,3 +7158,7 @@ mod tests_exact_a_probes_2828;
 #[cfg(test)]
 #[path = "tests_clamp_basin_deflation_2333.rs"]
 mod tests_clamp_basin_deflation_2333;
+
+#[cfg(test)]
+#[path = "tests_residual_curvature_rows_2731.rs"]
+mod tests_residual_curvature_rows_2731;
