@@ -1,8 +1,6 @@
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, s};
 
-use crate::manifold::{
-    GEOMETRY_EPS, GeometryError, GeometryResult, RiemannianManifold, check_len, quad_form,
-};
+use crate::manifold::{GeometryError, GeometryResult, RiemannianManifold, check_len, quad_form};
 
 pub struct ProductManifold {
     components: Vec<Box<dyn RiemannianManifold>>,
@@ -255,7 +253,12 @@ impl RiemannianManifold for ProductManifold {
             // zero, and calling the factor's `sectional_curvature` on a
             // degenerate plane may legitimately error (e.g. SPD), so a zero
             // contribution must not be allowed to abort the product as a whole.
-            if gram_r > GEOMETRY_EPS {
+            // Each quadratic form under `g_r` is `m²` three-factor products and
+            // their sum, so the cancelling area rounds by at most
+            // `γ_{6m²+3}·(uu·vv + uv²)`; an area inside that band spans no plane.
+            let gram_band = gam_linalg::roundoff::accumulation_growth(6 * m * m + 3)
+                * (uu_r * vv_r + uv_r * uv_r);
+            if gram_r > gram_band {
                 let k_r =
                     component.sectional_curvature(point.slice(s![off..off + m]), (u_r, v_r))?;
                 numerator += k_r * gram_r;
@@ -266,7 +269,11 @@ impl RiemannianManifold for ProductManifold {
             off += m;
         }
         let denom = uu_total * vv_total - uv_total * uv_total;
-        if denom <= GEOMETRY_EPS {
+        // The totals sum the factors' quadratic forms, at most `3·off²` roundings
+        // each, so the cancelling total area rounds by `γ_{6·off²+3}·(uu·vv + uv²)`.
+        let denom_band = gam_linalg::roundoff::accumulation_growth(6 * off * off + 3)
+            * (uu_total * vv_total + uv_total * uv_total);
+        if denom <= denom_band {
             return Err(GeometryError::Singular(
                 "Product sectional curvature plane is degenerate",
             ));
@@ -607,8 +614,9 @@ mod curvature_tests {
     /// its sectional curvature is always exactly zero, independent of either
     /// factor's own curvature. Both per-factor Gram terms are individually
     /// degenerate here (`U` has zero Euclidean part, `V` has zero sphere
-    /// part), exercising the `gram_r > GEOMETRY_EPS` skip branch that keeps a
-    /// degenerate single-factor plane from aborting the whole product via
+    /// part), exercising the skip branch (a factor area inside its rounding
+    /// band) that keeps a degenerate single-factor plane from aborting the whole
+    /// product via
     /// that factor's own `sectional_curvature` (which SPD, e.g., would
     /// refuse to evaluate on a degenerate plane).
     #[test]
