@@ -702,21 +702,9 @@ impl<'a> RemlState<'a> {
         };
 
         if let Some(z) = free_basis_opt.as_ref() {
+            // No problem-scale gate: the inner solve carries Φ whenever Firth is
+            // requested, so the projected outer basis must too (#825, #2900).
             let x_projected = pirls_result.x_transformed.to_dense().dot(z);
-            if !super::firth_problem_scale_allows(x_projected.nrows(), x_projected.ncols()) {
-                log::info!(
-                    "disabling Firth bias reduction for projected outer basis (n={}, p={}, n*p={}, n*p^2={}): \
-                     exact Firth operator is small-model-only",
-                    x_projected.nrows(),
-                    x_projected.ncols(),
-                    x_projected.nrows().saturating_mul(x_projected.ncols()),
-                    x_projected
-                        .nrows()
-                        .saturating_mul(x_projected.ncols())
-                        .saturating_mul(x_projected.ncols()),
-                );
-                return Ok(None);
-            }
             return Ok(Some(std::sync::Arc::new(
                 Self::build_firth_dense_operator_for_link(
                     &jeffreys_link,

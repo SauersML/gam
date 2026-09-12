@@ -226,10 +226,10 @@ impl<'a> RemlState<'a> {
     }
 
     pub(crate) fn firth_tk_exact_hessian_scale_allows(n_obs: usize, p_coeff: usize) -> bool {
-        // Separate from `firth_problem_scale_allows`, which gates the O(n·p²)
-        // dense Firth operator used by the inner solve and gradient.  The exact
-        // TK Hessian-only path is O(n²·p) after the #1575 matvec hoist and needs
-        // its own budget.
+        // Separate from `firth_problem_scale_allows`, which gates the whole
+        // Tierney-Kadane refinement (its gradient's O(n²·p) row-pair term). The
+        // exact TK Hessian-only path is O(n²·p) after the #1575 matvec hoist and
+        // needs its own budget.
         const FIRTH_TK_EXACT_HESSIAN_MAX_ROW_PAIR_WORK: usize = 10_000_000;
         n_obs.saturating_mul(n_obs).saturating_mul(p_coeff)
             <= FIRTH_TK_EXACT_HESSIAN_MAX_ROW_PAIR_WORK
@@ -1915,23 +1915,20 @@ impl<'a> RemlState<'a> {
             })
         };
 
-        // The outer Firth gate (`firth_problem_scale_allows`) disables the dense
-        // Firth operator at the same problem scale that makes the TK refinement's
-        // dense calculus infeasible. When that gate trips, the inner PIRLS solve
-        // logs `jeffreys_logdet=none` and falls back to plain Laplace REML, and
-        // both `bundle.firth_dense_operator` and `bundle.firth_dense_operator_original`
-        // are `None`. The TK refinement is a higher-order correction on top of the
-        // Firth/Jeffreys-augmented Laplace expansion; without the operator it has
-        // nothing to refine. Mirror the gate here so large-model fits omit a
-        // correction whose underlying Jeffreys operator was not assembled.
+        // The Jeffreys operator itself is built at every problem scale (the inner
+        // P-IRLS and the outer eval bundles both carry Φ whenever Firth is
+        // requested). Only this Tierney-Kadane refinement is still omitted above
+        // `firth_problem_scale_allows`, because its gradient carries an O(n²·p)
+        // row-pair term (`tk_gradient_from_shared`), and that size switch is
+        // still open under #2900. The omission is consistent within one
+        // evaluation: value, gradient and Hessian all drop the refinement
+        // together.
         //
-        // The Firth gate is strictly tighter than the TK dense-work caps used by
-        // the non-Gaussianity audit (`TK_MAX_*`): `firth_problem_scale_allows`
-        // already bounds `n ≤ FIRTH_MAX_OBSERVATIONS (20_000)`,
-        // `p ≤ FIRTH_MAX_COEFFICIENTS (256)` and `n·p ≤ FIRTH_MAX_LINEAR_WORK (2e6)`,
-        // each of which is below the corresponding TK cap. Passing this gate
-        // therefore guarantees the dense calculus below is affordable, so no
-        // separate TK size check is needed here.
+        // The gate is strictly tighter than the TK dense-work caps used by the
+        // non-Gaussianity audit (`TK_MAX_*`): `firth_problem_scale_allows` bounds
+        // `n ≤ FIRTH_MAX_OBSERVATIONS (20_000)`, `p ≤ FIRTH_MAX_COEFFICIENTS (256)`
+        // and `n·p ≤ FIRTH_MAX_LINEAR_WORK (2e6)`, each below the corresponding TK
+        // cap, so passing it guarantees the dense calculus below is affordable.
         let n_x = self.x().nrows();
         let p_x = self.x().ncols();
         if !super::firth_problem_scale_allows(n_x, p_x) {
@@ -6145,67 +6142,60 @@ impl<'a> RemlState<'a> {
         let (mut h_total, ridge_passport) = self.effectivehessian(pirls_result.as_ref())?;
         let mut firth_dense_operator: Option<Arc<FirthDenseOperator>> = None;
         if let Some(jeffreys_link) = reml_robust_jeffreys_link(&self.config) {
-            let firth_n = pirls_result.x_transformed.nrows();
-            let firth_p = pirls_result.x_transformed.ncols();
-            if !super::firth_problem_scale_allows(firth_n, firth_p) {
-                log::info!(
-                    "disabling Firth bias reduction for large model (n={}, p={}, n*p={}, n*p^2={}): \
-                     exact Firth operator is small-model-only",
-                    firth_n,
-                    firth_p,
-                    firth_n.saturating_mul(firth_p),
-                    firth_n.saturating_mul(firth_p).saturating_mul(firth_p),
-                );
-            } else {
-                let x_dense = pirls_result
+            // Built at every problem scale: the inner P-IRLS arms the Jeffreys
+            // penalty whenever Firth is requested (`firth_active` in
+            // `loop_driver`), so the outer value, gradient and IFT Jacobian must
+            // carry the same Φ at every n and p or they differentiate a
+            // different objective than the mode the inner solve converged on
+            // (#825, #2900).
+            let x_dense = pirls_result
                 .x_transformed
                 .try_to_dense_arc(
                     "dense REML eval bundle requires dense transformed design for Firth operator",
                 )
                 .map_err(EstimationError::InvalidInput)?;
-                let firth_build_start = std::time::Instant::now();
-                let firth_op = Arc::new(Self::build_firth_dense_operator_for_link(
-                    &jeffreys_link,
-                    x_dense.as_ref(),
-                    &pirls_result.final_eta.to_owned(),
-                    self.weights,
-                )?);
-                log::debug!(
-                    "[Firth-op] build n={} p={} r={} half_logdet={:.3e} elapsed={:.3}s",
-                    firth_op.x_dense.nrows(),
-                    firth_op.x_dense.ncols(),
-                    firth_op.k_reduced.nrows(),
-                    firth_op.half_log_det,
-                    firth_build_start.elapsed().as_secs_f64(),
-                );
-                // Firth-adjusted inner Jacobian for implicit differentiation:
-                //   H_total = Xᵀ W X + S - H_φ,
-                //   H_φ     = ∇²_β Φ
-                //          = 0.5 [ Xᵀ diag(w'' ⊙ h) X - Bᵀ P B ].
-                // This keeps B_k/B_{kl} solves on the same objective surface as
-                // the Firth-augmented stationarity system.
-                //
-                // Conceptually Φ is the identifiable-subspace Jeffreys term
-                // obtained by evaluating W on a canonical orthonormal basis of
-                // the transformed design column space. The hphi block below is
-                // therefore the curvature of that basis-invariant penalty,
-                // represented in the current transformed basis.
-                let mut weighted_xtdx = Array2::<f64>::zeros((0, 0));
-                let diag_term = Self::xt_diag_x_dense_into(
-                    &firth_op.x_dense,
-                    &(&firth_op.w2 * &firth_op.h_diag),
-                    &mut weighted_xtdx,
-                );
-                let bpb = gam_linalg::faer_ndarray::fast_atb(&firth_op.b_base, &firth_op.p_b_base);
-                let mut hphi = 0.5 * (diag_term - bpb);
-                // Numerical symmetry guard.
-                gam_linalg::matrix::symmetrize_in_place(&mut hphi);
-                // Keep tiny numerical noise from making the solve surface less stable.
-                if hphi.iter().all(|v| v.is_finite()) {
-                    h_total -= &hphi;
-                }
-                firth_dense_operator = Some(firth_op);
-            } // else (not too large for Firth)
+            let firth_build_start = std::time::Instant::now();
+            let firth_op = Arc::new(Self::build_firth_dense_operator_for_link(
+                &jeffreys_link,
+                x_dense.as_ref(),
+                &pirls_result.final_eta.to_owned(),
+                self.weights,
+            )?);
+            log::debug!(
+                "[Firth-op] build n={} p={} r={} half_logdet={:.3e} elapsed={:.3}s",
+                firth_op.x_dense.nrows(),
+                firth_op.x_dense.ncols(),
+                firth_op.k_reduced.nrows(),
+                firth_op.half_log_det,
+                firth_build_start.elapsed().as_secs_f64(),
+            );
+            // Firth-adjusted inner Jacobian for implicit differentiation:
+            //   H_total = Xᵀ W X + S - H_φ,
+            //   H_φ     = ∇²_β Φ
+            //          = 0.5 [ Xᵀ diag(w'' ⊙ h) X - Bᵀ P B ].
+            // This keeps B_k/B_{kl} solves on the same objective surface as
+            // the Firth-augmented stationarity system.
+            //
+            // Conceptually Φ is the identifiable-subspace Jeffreys term
+            // obtained by evaluating W on a canonical orthonormal basis of
+            // the transformed design column space. The hphi block below is
+            // therefore the curvature of that basis-invariant penalty,
+            // represented in the current transformed basis.
+            let mut weighted_xtdx = Array2::<f64>::zeros((0, 0));
+            let diag_term = Self::xt_diag_x_dense_into(
+                &firth_op.x_dense,
+                &(&firth_op.w2 * &firth_op.h_diag),
+                &mut weighted_xtdx,
+            );
+            let bpb = gam_linalg::faer_ndarray::fast_atb(&firth_op.b_base, &firth_op.p_b_base);
+            let mut hphi = 0.5 * (diag_term - bpb);
+            // Numerical symmetry guard.
+            gam_linalg::matrix::symmetrize_in_place(&mut hphi);
+            // Keep tiny numerical noise from making the solve surface less stable.
+            if hphi.iter().all(|v| v.is_finite()) {
+                h_total -= &hphi;
+            }
+            firth_dense_operator = Some(firth_op);
         }
 
         // Add log-barrier Hessian diagonal for monotonicity-constrained coefficients.
@@ -6332,35 +6322,21 @@ impl<'a> RemlState<'a> {
         let logdet_s_pos = penalty_logdet.value();
         let (det1_values, _) =
             penalty_logdet.rho_derivatives_from_penalties(&applied_penalties, lambdas_slice);
+        // Built at every problem scale, for the same reason as the dense bundle:
+        // the inner solve carries Φ whenever Firth is requested (#825, #2900).
         let firth_dense_operator_original = if let Some(jeffreys_link) =
             reml_robust_jeffreys_link(&self.config)
         {
-            let firth_n = self.x().nrows();
-            let firth_p = self.x().ncols();
-            if !super::firth_problem_scale_allows(firth_n, firth_p) {
-                log::info!(
-                    "disabling Firth bias reduction for large model (n={}, p={}, n*p={}, n*p^2={}): \
-                     exact Firth operator is small-model-only",
-                    firth_n,
-                    firth_p,
-                    firth_n.saturating_mul(firth_p),
-                    firth_n.saturating_mul(firth_p).saturating_mul(firth_p),
-                );
-                None
-            } else {
-                let x_dense = self
-                    .x()
-                    .try_to_dense_arc(
-                        "sparse exact REML runtime requires dense design for Firth operator",
-                    )
-                    .map_err(EstimationError::InvalidInput)?;
-                Some(Arc::new(Self::build_firth_dense_operator_for_link(
-                    &jeffreys_link,
-                    x_dense.as_ref(),
-                    &pirls_result.final_eta.to_owned(),
-                    self.weights,
-                )?))
-            }
+            let x_dense = self
+                .x()
+                .try_to_dense_arc("sparse exact REML runtime requires dense design for Firth operator")
+                .map_err(EstimationError::InvalidInput)?;
+            Some(Arc::new(Self::build_firth_dense_operator_for_link(
+                &jeffreys_link,
+                x_dense.as_ref(),
+                &pirls_result.final_eta.to_owned(),
+                self.weights,
+            )?))
         } else {
             None
         };
