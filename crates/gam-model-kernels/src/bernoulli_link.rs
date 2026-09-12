@@ -147,28 +147,55 @@ fn cloglog_natural_jet(eta: f64) -> BernoulliNaturalJet {
         };
     }
     let mu = -(-x).exp_m1();
-    let log_mu = if x < 0.5 {
-        eta + (mu / x).ln()
+    let log_mu_jet = if x <= 0.01 {
+        // log(1-exp(-x)) = log(x) - x/2 + x²/24 - x⁴/2880
+        //                       + x⁶/181440 + O(x⁸).
+        // Applying d/deta = x d/dx multiplies each x^k term by k.
+        // The direct formula 1-x-x/expm1(x) loses this curvature when
+        // x is small. At this cutoff the omitted fourth derivative is
+        // less than 4.3e-20.
+        let p1 = -0.5 * x;
+        let p2 = x * x / 24.0;
+        let p4 = -x.powi(4) / 2880.0;
+        let p6 = x.powi(6) / 181440.0;
+        [
+            eta + p1 + p2 + p4 + p6,
+            1.0 + p1 + 2.0 * p2 + 4.0 * p4 + 6.0 * p6,
+            p1 + 4.0 * p2 + 16.0 * p4 + 36.0 * p6,
+            p1 + 8.0 * p2 + 64.0 * p4 + 216.0 * p6,
+            p1 + 16.0 * p2 + 256.0 * p4 + 1296.0 * p6,
+        ]
+    } else if x < 1.0 {
+        let log_mu = eta + (mu / x).ln();
+        let h = x / x.exp_m1();
+        let a = 1.0 - x - h;
+        let b = a * a - x - h * a;
+        let b_derivative =
+            -x * (2.0 * a + 1.0 - h) - 3.0 * h * a * a + h * h * a;
+        [log_mu, h, h * a, h * b, h * (a * b + b_derivative)]
     } else {
-        mu.ln()
+        // Sum the geometric-series derivative factors with x^j exp(-x)
+        // formed in log space. This preserves representable derivatives
+        // after exp(-x) underflows and avoids 0 * infinity at large x.
+        let q = (-x).exp();
+        let inv = 1.0 / mu;
+        let p1 = (eta - x).exp() * inv;
+        let p2 = (2.0 * eta - x).exp() * inv.powi(2);
+        let p3 = (3.0 * eta - x).exp() * (1.0 + q) * inv.powi(3);
+        let p4 = (4.0 * eta - x).exp() * (1.0 + 4.0 * q + q * q) * inv.powi(4);
+        [
+            (-q).ln_1p(),
+            p1,
+            p1 - p2,
+            p1 - 3.0 * p2 + p3,
+            p1 - 7.0 * p2 + 6.0 * p3 - p4,
+        ]
     };
-    let h = if x < 1.0 {
-        x / x.exp_m1()
-    } else {
-        let exp_neg_x = (-x).exp();
-        x * exp_neg_x / (1.0 - exp_neg_x)
-    };
-    let a = 1.0 - x - h;
-    let d2_log_mu = h * a;
-    let b = a * a - x - h * a;
-    let d3_log_mu = h * b;
-    let b_derivative = -x * (2.0 * a + 1.0 - h) - 3.0 * h * a * a + h * h * a;
-    let d4_log_mu = h * (a * b + b_derivative);
     BernoulliNaturalJet {
         mu,
-        log_mu: [log_mu, h, d2_log_mu, d3_log_mu, d4_log_mu],
+        log_mu: log_mu_jet,
         log_one_minus_mu: [-x, -x, -x, -x, -x],
-        log_fisher: 2.0 * eta - x - log_mu,
+        log_fisher: 2.0 * eta - x - log_mu_jet[0],
     }
 }
 
@@ -206,6 +233,11 @@ fn cauchit_natural_jet(eta: f64) -> BernoulliNaturalJet {
     } else {
         (0.5, 0.5)
     };
+    let (log_mu, log_one_minus_mu) = if eta >= 0.0 {
+        ((-one_minus_mu).ln_1p(), one_minus_mu.ln())
+    } else {
+        (mu.ln(), (-mu).ln_1p())
+    };
     let abs_eta = eta.abs();
     let log_one_plus_eta_sq = if abs_eta <= f64::MAX.sqrt() {
         (eta * eta).ln_1p()
@@ -227,8 +259,8 @@ fn cauchit_natural_jet(eta: f64) -> BernoulliNaturalJet {
     };
     let d3_over_d1 = inv_one_plus_sq * (6.0 * (eta * ratio) - 2.0 * inv_one_plus_sq);
     let d4_over_d1 = 24.0 * ratio * (inv_one_plus_sq * inv_one_plus_sq - ratio * ratio);
-    let d1_over_mu = (log_d1 - mu.ln()).exp();
-    let d1_over_q = (log_d1 - one_minus_mu.ln()).exp();
+    let d1_over_mu = (log_d1 - log_mu).exp();
+    let d1_over_q = (log_d1 - log_one_minus_mu).exp();
     let left_d2_ratio = d2_over_d1 * d1_over_mu;
     let right_d2_ratio = d2_over_d1 * d1_over_q;
     let left_d3_ratio = d3_over_d1 * d1_over_mu;
@@ -238,7 +270,7 @@ fn cauchit_natural_jet(eta: f64) -> BernoulliNaturalJet {
     BernoulliNaturalJet {
         mu,
         log_mu: [
-            mu.ln(),
+            log_mu,
             d1_over_mu,
             left_d2_ratio - d1_over_mu * d1_over_mu,
             left_d3_ratio - 3.0 * d1_over_mu * left_d2_ratio + 2.0 * d1_over_mu.powi(3),
@@ -249,7 +281,7 @@ fn cauchit_natural_jet(eta: f64) -> BernoulliNaturalJet {
                 - 6.0 * d1_over_mu.powi(4),
         ],
         log_one_minus_mu: [
-            one_minus_mu.ln(),
+            log_one_minus_mu,
             -d1_over_q,
             -right_d2_ratio - d1_over_q * d1_over_q,
             -right_d3_ratio - 3.0 * d1_over_q * right_d2_ratio - 2.0 * d1_over_q.powi(3),
@@ -259,7 +291,7 @@ fn cauchit_natural_jet(eta: f64) -> BernoulliNaturalJet {
                 - 12.0 * d1_over_q * d1_over_q * right_d2_ratio
                 - 6.0 * d1_over_q.powi(4),
         ],
-        log_fisher: 2.0 * log_d1 - mu.ln() - one_minus_mu.ln(),
+        log_fisher: 2.0 * log_d1 - log_mu - log_one_minus_mu,
     }
 }
 
@@ -416,6 +448,48 @@ mod tests {
             assert_eq!(left.log_mu[0], right.log_one_minus_mu[0]);
             assert_eq!(left.log_one_minus_mu[0], right.log_mu[0]);
             assert_eq!(left.log_fisher, right.log_fisher);
+        }
+    }
+
+    #[test]
+    fn cloglog_tail_derivatives_keep_representable_curvature() {
+        let negative = cloglog_natural_jet(-40.0);
+        let leading = -0.5 * (-40.0_f64).exp();
+        for derivative in &negative.log_mu[2..] {
+            assert!((derivative / leading - 1.0).abs() < 1.0e-14);
+        }
+
+        let positive = cloglog_natural_jet(40.0_f64.ln());
+        assert!(positive.log_mu[0] < 0.0);
+        assert!((positive.log_mu[0] / -(-40.0_f64).exp() - 1.0).abs() < 1.0e-13);
+
+        // exp(-750) is zero in f64, but x^4 exp(-x) is representable.
+        let eta = 750.0_f64.ln();
+        let x = eta.exp();
+        let underflow = cloglog_natural_jet(eta);
+        let expected_fourth = -(4.0 * eta - x).exp()
+            * (1.0 - 6.0 / x + 7.0 / (x * x) - 1.0 / x.powi(3));
+        assert!(underflow.log_mu[2] < 0.0);
+        assert!(underflow.log_mu[3] > 0.0);
+        assert!((underflow.log_mu[4] / expected_fourth - 1.0).abs() < 1.0e-7);
+
+        for eta in [400.0, 709.0] {
+            let saturated = cloglog_natural_jet(eta);
+            assert_eq!(saturated.log_mu, [0.0; 5]);
+            assert!(saturated.log_one_minus_mu.iter().all(|value| value.is_finite()));
+        }
+    }
+
+    #[test]
+    fn cauchit_keeps_log_probability_after_probability_rounds_to_one() {
+        for eta in [1.0e20_f64, 1.0e100] {
+            let positive = cauchit_natural_jet(eta);
+            let negative = cauchit_natural_jet(-eta);
+            let leading = -eta.recip() / std::f64::consts::PI;
+            assert_eq!(positive.mu, 1.0);
+            assert!(positive.log_mu[0] < 0.0);
+            assert!((positive.log_mu[0] / leading - 1.0).abs() < 1.0e-14);
+            assert_eq!(positive.log_mu[0], negative.log_one_minus_mu[0]);
         }
     }
 
