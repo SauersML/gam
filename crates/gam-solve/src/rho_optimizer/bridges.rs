@@ -3920,15 +3920,14 @@ pub(crate) fn project_to_bounds(
 /// behavior on a planner/runtime mismatch is to surface it loudly so
 /// the seed loop can either retry, demote the plan, or fail the seed.
 ///
-/// Operator Hessians that *are* cheaply materializable (the operator's
-/// `materialization` reports `Explicit` / `BatchedHvp` and the
-/// dimension is below `materialize_operator_max_dim`) are converted to
-/// dense in-place so dense ARC can run an exact factorization. Operator
-/// Hessians that are NOT cheaply materializable should never arrive
-/// here: the seed loop routes those to `run_operator_trust_region`
-/// before constructing the bridge. Reaching this branch on the analytic
-/// route means the runtime contradicted the seed-time decision, which
-/// is the same kind of mismatch we treat as fatal.
+/// Operator Hessians whose `materialization` is available (`Explicit`,
+/// `BatchedHvp` or `RepeatedHvp`) and whose dimension is at most
+/// `materialize_operator_max_dim` are converted to dense in place so dense
+/// ARC can run an exact factorization. The seed loop sends every other
+/// operator Hessian to `opt::MatrixFreeTrustRegion` before a bridge
+/// exists, so reaching this branch with one on the analytic route means
+/// the runtime contradicted the seed-time decision, which is the same
+/// kind of mismatch we treat as fatal.
 ///
 /// For `HessianSource::BfgsApprox`, `EfsFixedPoint`, and
 /// `HybridEfsFixedPoint` we deliberately return `None`: those routes do

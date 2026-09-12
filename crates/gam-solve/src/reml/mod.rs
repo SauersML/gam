@@ -191,8 +191,9 @@ impl TauTauHessianPolicy {
     /// — the unified evaluator's `prefer_outer_hessian_operator(n, p, k)`
     /// selects the matrix-free `HessianValue::Operator` representation in
     /// exactly the regimes where the dense cache would be unaffordable, and
-    /// the planner routes operator returns through `run_operator_trust_region`
-    /// (or basis-probes them when `dim ≤ OUTER_HVP_MATERIALIZE_MAX_DIM`).
+    /// the planner densifies operator returns whose materialization is
+    /// available (`dim ≤ OUTER_HVP_MATERIALIZE_MAX_DIM`) and routes the rest
+    /// through `opt::MatrixFreeTrustRegion`.
     /// Forcing gradient-only would have prevented the operator representation
     /// from ever being requested, defeating that routing; hence the
     /// `implicit_multidim_duchon` and cost-bytes clauses are deliberately
