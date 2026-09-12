@@ -695,7 +695,7 @@ fn hifreq_tensor_k10() -> Result<(), String> {
 //       #2392 family).
 // This prints the converged fit's log_lambdas / edf_by_block / edf_total / reml so
 // the reader can read the discriminator directly. zz_measure discipline: numbers
-// eprintln'd, NO assertion (the k8 arm already asserts the collapse either way).
+// eprintln'd; a refused or non-standard fit panics instead of returning green (SPEC 16).
 // The name contains `hifreq_tensor_k8` so it inherits the dedicated slow-timeout
 // override in `.config/nextest.toml` (the k8 fit is minutes-long, p=kb²=400).
 #[test]
@@ -708,14 +708,10 @@ fn zz_measure_hifreq_tensor_k8_lambda_readout() {
     };
     let result = match fit_from_formula(&formula, &data, &cfg) {
         Ok(r) => r,
-        Err(e) => {
-            eprintln!("[zz:hifreq_k8] fit refused (no minted optimum): {e}");
-            return;
-        }
+        Err(e) => panic!("[zz:hifreq_k8] fit refused (no minted optimum): {e}"),
     };
     let FitResult::Standard(fit) = result else {
-        eprintln!("[zz:hifreq_k8] unexpected non-standard fit result");
-        return;
+        panic!("[zz:hifreq_k8] unexpected non-standard fit result");
     };
     let log_lambdas: Vec<f64> = fit
         .fit
@@ -795,7 +791,8 @@ fn zz_measure_hifreq_tensor_k8_lambda_readout() {
 // exhausts the focused lane's 600s execution budget mid-fit, so that number needs
 // the nightly slow-timeout lane rather than a dispatch.
 //
-// zz_measure discipline: numbers eprintln'd, NO assertion. The name contains
+// zz_measure discipline: numbers eprintln'd; a refused or non-standard fit panics
+// instead of returning green (SPEC 16). The name contains
 // `hifreq_tensor_k10` so it inherits the dedicated slow-timeout override in
 // `.config/nextest.toml`.
 struct SeedCostLogger;
@@ -845,14 +842,10 @@ fn zz_measure_hifreq_tensor_k10_seed_costs() {
     eprintln!("[zz:2607] fitting hifreq_tensor k=10 (n_train={n_train} sigma={sigma:.3})");
     let result = match fit_from_formula(&formula, &data, &cfg) {
         Ok(r) => r,
-        Err(e) => {
-            eprintln!("[zz:2607] fit refused (no minted optimum): {e}");
-            return;
-        }
+        Err(e) => panic!("[zz:2607] fit refused (no minted optimum): {e}"),
     };
     let FitResult::Standard(fit) = result else {
-        eprintln!("[zz:2607] unexpected non-standard fit result");
-        return;
+        panic!("[zz:2607] unexpected non-standard fit result");
     };
     let log_lambdas: Vec<f64> = fit
         .fit

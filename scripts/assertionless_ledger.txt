@@ -21,5 +21,3 @@ crates/gam-models/tests/suite/probe_2695_warp_smoothness.rs::probe_2695_warp_bas
 crates/gam-solve/src/residual_cascade.rs::zz_measure_cascade_width_by_level_count_2546
 crates/gam-terms/tests/suite/probe_2761_penalty_topology.rs::probe_basis_level_topology_versus_range
 crates/gam-terms/tests/suite/probe_ispline_boundary_2705.rs::probe_ispline_pair_at_the_boundary_knots_2705
-tests/quality/misc/fit_quality_stress.rs::zz_measure_hifreq_tensor_k10_seed_costs
-tests/quality/misc/fit_quality_stress.rs::zz_measure_hifreq_tensor_k8_lambda_readout
