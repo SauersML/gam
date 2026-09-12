@@ -3367,6 +3367,12 @@ impl OuterStepCensus {
         }
     }
 
+    /// Every step `opt` completed, accepted or rejected: the run's iteration
+    /// count. A cost-stall exit publishes only its accepted iterates.
+    pub(crate) fn steps_taken(&self) -> usize {
+        self.data.lock().map_or(0, |data| data.accepted + data.rejected)
+    }
+
     /// One line for the run summary, or `None` when nothing was observed (no
     /// step was ever taken, or no observer was installed).
     pub(crate) fn describe(&self) -> Option<String> {

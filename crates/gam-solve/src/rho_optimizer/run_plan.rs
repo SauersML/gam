@@ -1913,7 +1913,9 @@ pub(crate) fn run_outer_with_plan(
                                     let mut result = outer_result_with_gradient_norm(
                                         exit.rho,
                                         exit.value,
-                                        exit.iterations,
+                                        // The exit counts accepted iterates only; the
+                                        // run also spent its rejected steps (#2817).
+                                        exit.iterations.max(arc_census.steps_taken()),
                                         Some(exit.grad_norm),
                                         false,
                                         *the_plan,
@@ -1960,7 +1962,7 @@ pub(crate) fn run_outer_with_plan(
                                     let mut result = outer_result_with_gradient_norm(
                                         exit.rho,
                                         exit.value,
-                                        exit.iterations,
+                                        exit.iterations.max(arc_census.steps_taken()),
                                         Some(exit.grad_norm),
                                         exit.converged,
                                         *the_plan,
