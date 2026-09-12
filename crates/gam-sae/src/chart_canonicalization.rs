@@ -3028,10 +3028,14 @@ pub fn d1_atom_fitted_turning(
             continue;
         }
         any_moving = true;
-        // Wedge norm² = ‖γ'‖²‖γ''‖² − ⟨γ',γ''⟩² (Lagrange identity); clamp tiny
-        // negative round-off to 0 before the sqrt.
+        // Wedge norm² = ‖γ'‖²‖γ''‖² − ⟨γ',γ''⟩² (Lagrange identity). `n1`, `n2`
+        // and `dot` are `p`-term inner products, each rounding by at most `γ_p`
+        // of its absolute sum, and `Σ|γ'_j γ''_j| ≤ √(n1·n2)`, so each product
+        // carries `γ_{2p+1}·n1·n2` and the difference `γ_{4p+4}·n1·n2`. A wedge
+        // inside that band is numerical zero.
         let raw_wedge_sq = n1 * n2 - dot * dot;
-        let roundoff_floor = 64.0 * f64::EPSILON * (n1 * n2).abs().max(dot.abs() * dot.abs());
+        let roundoff_floor =
+            gam_linalg::roundoff::accumulation_growth(4 * p + 4) * (n1 * n2).max(dot * dot);
         let wedge_sq = if raw_wedge_sq <= roundoff_floor {
             0.0
         } else {
