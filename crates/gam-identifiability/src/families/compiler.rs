@@ -68,7 +68,7 @@ pub trait RowJacobianOperator: Send + Sync {
     /// channel-major to `(n_rows·K × ncols)`.
     ///
     /// This is the representation the identifiability *compiler*
-    /// (`compile_with_dual_metric`) actually consumes — it residualises and
+    /// (`compile_with_dual_metric_protected`) actually consumes — it residualises and
     /// eigendecomposes Grams of `W`, and never indexes the per-row `(n, p, K)`
     /// tensor element-wise. Requesting the scaled design directly lets an
     /// operator with a structured / streaming form supply it without
@@ -156,7 +156,7 @@ pub trait RowHessian: Send + Sync {
 }
 
 /// Identity row metric: `K^S_i = I_K` for every row. Default structural
-/// metric for `compile_with_dual_metric`. Decoupling the
+/// metric for `compile_with_dual_metric_protected`. Decoupling the
 /// "which directions are real structural columns" decision from a
 /// possibly rank-deficient pilot curvature `H` prevents the compiler from
 /// wrongly dropping columns whose curvature happens to be zero at the
@@ -381,21 +381,12 @@ pub fn compile_protected(
 /// When `row_structural` and `row_hess` represent the same metric (e.g.
 /// `compile()` with an identity row Hessian on both sides), the two
 /// passes collapse to the single-metric loop.
-pub fn compile_with_dual_metric(
-    operators: &[Arc<dyn RowJacobianOperator>],
-    row_hess: &dyn RowHessian,
-    row_structural: &dyn RowHessian,
-    ordering: &[BlockOrder],
-) -> Result<CompiledBlocks, CompilerError> {
-    compile_with_dual_metric_protected(operators, row_hess, row_structural, ordering, &[])
-}
-
-/// Variant of [`compile_with_dual_metric`] that keeps designated blocks at full
-/// raw width (see [`compile_protected`] / [`compile_from_raw_grams_protected`]
-/// for the motivation). `protected[b] == true` replaces block `b`'s structural
-/// and curvature eigenspace drops with identity, so the block emerges at full
-/// raw width while still anchoring later blocks. `protected` may be shorter
-/// than `ordering`; an empty slice reproduces `compile_with_dual_metric`.
+///
+/// `protected[b] == true` replaces block `b`'s structural and curvature
+/// eigenspace drops with identity, so the block emerges at full raw width
+/// while still anchoring later blocks (see [`compile_protected`] /
+/// [`compile_from_raw_grams_protected`] for the motivation). `protected` may
+/// be shorter than `ordering`; an empty slice protects nothing.
 pub fn compile_with_dual_metric_protected(
     operators: &[Arc<dyn RowJacobianOperator>],
     row_hess: &dyn RowHessian,
@@ -1291,73 +1282,6 @@ pub fn build_raw_grams_structural(
     gram
 }
 
-/// Build the primary-state curvature Gram `K^H` and structural Gram `K^S`
-/// for a block decomposition, preferring the device (GPU) path when
-/// available and falling back to the CPU closed-form builders otherwise.
-///
-/// The GPU path is only attempted for survival-family geometry
-/// (`K = CHANNELS = 4`) — that is the case the GPU kernel
-/// (`crate::families::gpu::try_primary_state_gram_cuda`)
-/// is specialised for via the packed-symmetric `n × 10` weight layout.
-/// For any other `K` the CPU builders are used unconditionally.
-///
-/// Returns `(gram_h, gram_struct)` with the same shape and semantics as
-/// [`build_raw_grams_from_channel_blocks`] + [`build_raw_grams_structural`].
-pub fn build_primary_grams_gpu_or_cpu(
-    channel_blocks: &PrimaryChannelBlocks,
-    row_hess: &dyn RowHessian,
-    raw_block_ranges: &[std::ops::Range<usize>],
-) -> Result<(Array2<f64>, Array2<f64>), CompilerError> {
-    let k = row_hess.k();
-    if k == crate::families::gpu::CHANNELS {
-        let gpu_blocks: Vec<Vec<Option<Array2<f64>>>> = channel_blocks
-            .blocks
-            .iter()
-            .map(|slots| slots.iter().cloned().collect())
-            .collect();
-        if let Some(h_packed) = pack_row_hessian_symmetric(row_hess) {
-            if let Some(bundle) = crate::families::gpu::try_primary_state_gram_cuda(
-                &gpu_blocks,
-                &h_packed,
-                raw_block_ranges,
-            )
-            .map_err(|error| CompilerError::GpuFailure(error.to_string()))?
-            {
-                log::info!("[identifiability_compile] gram path = gpu");
-                return Ok((bundle.gram_h, bundle.gram_struct));
-            }
-        }
-    }
-    log::info!("[identifiability_compile] gram path = cpu");
-    let gram_h = build_raw_grams_from_channel_blocks(channel_blocks, row_hess, raw_block_ranges)?;
-    let gram_struct = build_raw_grams_structural(channel_blocks, raw_block_ranges);
-    Ok((gram_h, gram_struct))
-}
-
-/// Pack a per-row symmetric `K = 4` Hessian into the `n × 10`
-/// upper-triangular row-major layout consumed by the GPU kernel
-/// (`packed_index(c, d)` for `c ≤ d`). Returns `None` when `K != 4`.
-fn pack_row_hessian_symmetric(row_hess: &dyn RowHessian) -> Option<Array2<f64>> {
-    use crate::families::gpu::{CHANNELS, PACKED_LEN, packed_index};
-    if row_hess.k() != CHANNELS {
-        return None;
-    }
-    let n = row_hess.nrows();
-    let h_full = row_hess.evaluate_full();
-    if h_full.shape() != [n, CHANNELS, CHANNELS] {
-        return None;
-    }
-    let mut packed = Array2::<f64>::zeros((n, PACKED_LEN));
-    for i in 0..n {
-        for c in 0..CHANNELS {
-            for d in c..CHANNELS {
-                packed[[i, packed_index(c, d)]] = h_full[[i, c, d]];
-            }
-        }
-    }
-    Some(packed)
-}
-
 /// Closed-form Gram-based compile output: a single `p_raw × p_compiled`
 /// reparam matrix `T` mapping compiled coordinates back to raw width.
 /// `T · θ` lifts a fitted compiled-width β back to raw width; predict-time
@@ -1660,41 +1584,6 @@ impl CompiledMap {
         self.raw_from_compiled.ncols()
     }
 
-    /// Reparameterise a raw design into compiled coordinates:
-    /// `X_compiled = X_raw · T` (`n × p_compiled`). Because the lift is
-    /// `β_raw = T β_compiled`, the compiled design predicts identically to the
-    /// raw design on every compiled coefficient: `X_compiled · θ = X_raw · (T θ)`.
-    /// Families that build directly in reduced coordinates feed this compiled
-    /// design (and the [`reduce_penalties_with_map`] penalties) to the solver;
-    /// the rank-deficient raw basis never reaches Newton.
-    pub fn reduce_design(&self, raw_design: &Array2<f64>) -> Result<Array2<f64>, String> {
-        if raw_design.ncols() != self.p_raw() {
-            return Err(format!(
-                "CompiledMap::reduce_design: raw_design has {} columns, expected p_raw {}",
-                raw_design.ncols(),
-                self.p_raw()
-            ));
-        }
-        Ok(fast_ab(raw_design, &self.raw_from_compiled))
-    }
-
-    /// Lift a fitted compiled-width coefficient vector back to raw width:
-    /// `β_raw = T · β_compiled`. This is the exact inverse direction of the
-    /// quotient reduction — the reduced coordinates are what Newton/REML
-    /// operate in, and this map carries the final estimate (and any linear
-    /// functional of it) back to the original parameterisation so reported
-    /// coefficients and predictions match the raw design.
-    pub fn lift_coefficients(&self, beta_compiled: &Array1<f64>) -> Result<Array1<f64>, String> {
-        if beta_compiled.len() != self.p_compiled() {
-            return Err(format!(
-                "CompiledMap::lift_coefficients: beta_compiled len {} != p_compiled {}",
-                beta_compiled.len(),
-                self.p_compiled()
-            ));
-        }
-        Ok(self.raw_from_compiled.dot(beta_compiled))
-    }
-
     /// The rows of `T` belonging to raw block `b` (`T[raw_block_ranges[b], :]`,
     /// shape `p_b_raw × p_compiled`). A raw-block penalty `S_b` acts only on
     /// these raw columns, so the penalty's reduced-coordinate form depends on
@@ -1711,73 +1600,6 @@ impl CompiledMap {
             .slice(s![range.start..range.end, ..])
             .to_owned())
     }
-}
-
-/// Transform a per-block raw-width penalty into the compiled (reduced)
-/// coordinate frame defined by `map`.
-///
-/// `raw_penalties[b]` is the penalty matrix `S_b` acting on raw block `b`
-/// (shape `p_b_raw × p_b_raw`), or `None` for an unpenalised block. The
-/// returned `reduced[b]` is the **full** `(p_compiled × p_compiled)` penalty
-/// `Tᵀ Ŝ_b T`, where `Ŝ_b` embeds `S_b` into the `p_raw × p_raw` zero matrix
-/// at block `b`'s position. Because `Ŝ_b` is zero outside block `b`'s rows and
-/// columns, this equals `T_bᵀ S_b T_b` with `T_b = T[raw_block_ranges[b], :]`,
-/// so the reduced penalty is computed from the block's lift rows alone — no
-/// dense `p_raw × p_raw` embedding is materialised.
-///
-/// Exactness: for any compiled coefficient `θ` with raw lift `β = T θ`, the raw
-/// penalty energy `βᵀ Ŝ_b β = (T θ)ᵀ Ŝ_b (T θ) = θᵀ (Tᵀ Ŝ_b T) θ`, so the
-/// reduced penalty reproduces the raw penalty energy on every lifted point.
-/// A compiled block that absorbed to zero width simply contributes a zero
-/// column range; its raw penalty (if any) projects onto the surviving
-/// compiled directions through `T_b`, never lost.
-pub fn reduce_penalties_with_map(
-    map: &CompiledMap,
-    raw_penalties: &[Option<Array2<f64>>],
-) -> Result<Vec<Option<Array2<f64>>>, String> {
-    if raw_penalties.len() != map.raw_block_ranges.len() {
-        return Err(format!(
-            "reduce_penalties_with_map: raw_penalties ({}) != blocks ({})",
-            raw_penalties.len(),
-            map.raw_block_ranges.len()
-        ));
-    }
-    let p_compiled = map.p_compiled();
-    let mut reduced: Vec<Option<Array2<f64>>> = Vec::with_capacity(raw_penalties.len());
-    for (block_idx, raw_penalty) in raw_penalties.iter().enumerate() {
-        let Some(s_b) = raw_penalty.as_ref() else {
-            reduced.push(None);
-            continue;
-        };
-        let p_b_raw = map.raw_block_ranges[block_idx].len();
-        if s_b.shape() != [p_b_raw, p_b_raw] {
-            return Err(format!(
-                "reduce_penalties_with_map: block {block_idx} penalty shape {:?} != [{p_b_raw}, {p_b_raw}]",
-                s_b.shape()
-            ));
-        }
-        // T_b = T[raw rows of block b, :]  (p_b_raw × p_compiled)
-        let t_b = map.raw_block_rows(block_idx)?;
-        // S_compiled = T_bᵀ S_b T_b  (p_compiled × p_compiled)
-        let s_t_b = fast_ab(s_b, &t_b); // (p_b_raw × p_compiled)
-        let s_compiled_raw = fast_atb(&t_b, &s_t_b); // (p_compiled × p_compiled)
-        let mut s_compiled = symmetrise(&s_compiled_raw);
-        if s_compiled.shape() != [p_compiled, p_compiled] {
-            return Err(format!(
-                "reduce_penalties_with_map: block {block_idx} reduced penalty shape {:?} != [{p_compiled}, {p_compiled}]",
-                s_compiled.shape()
-            ));
-        }
-        for v in s_compiled.iter_mut() {
-            if !v.is_finite() {
-                return Err(format!(
-                    "reduce_penalties_with_map: block {block_idx} reduced penalty has non-finite entry"
-                ));
-            }
-        }
-        reduced.push(Some(s_compiled));
-    }
-    Ok(reduced)
 }
 
 /// Per-block exact orthogonal reparameterisation of structural confounds.

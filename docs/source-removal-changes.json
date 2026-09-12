@@ -1100,5 +1100,18 @@
     ],
     "reason": "user directive: delete all useless slop",
     "evidence": "At d1b00c6b2, git grep -nw over crates, src, tests, examples, bench and benches found only each item's own definition, doc comments, or its own error label; no caller and no named re-export in the facade or gam-pyffi. The wrapped implementations remain. MSI verification (ban scanner, workspace --all-targets check, cargo doc -p gam-predict) runs on the landed sha."
+  },
+  {
+    "base": "d33caf143c4c3a61d1ab0d3776a595286a87250d",
+    "items": [
+      "crates/gam-identifiability/src/families/compiler.rs:fn:build_primary_grams_gpu_or_cpu",
+      "crates/gam-identifiability/src/families/compiler.rs:fn:compile_with_dual_metric",
+      "crates/gam-identifiability/src/families/compiler.rs:fn:lift_coefficients",
+      "crates/gam-identifiability/src/families/compiler.rs:fn:pack_row_hessian_symmetric",
+      "crates/gam-identifiability/src/families/compiler.rs:fn:reduce_design",
+      "crates/gam-identifiability/src/families/compiler.rs:fn:reduce_penalties_with_map"
+    ],
+    "reason": "User directive 2026-09-11: delete code only tests use and code nothing uses. Five gam-identifiability compiler functions (compile_with_dual_metric, build_primary_grams_gpu_or_cpu, CompiledMap::reduce_design, CompiledMap::lift_coefficients, reduce_penalties_with_map) had no caller anywhere; pack_row_hessian_symmetric was called only by build_primary_grams_gpu_or_cpu.",
+    "evidence": "Re-confirmed at the tip with git grep -nw over crates src tests examples bench benches: hits were definitions, error strings inside their own bodies, and prose. compile_with_dual_metric was a thin wrapper over compile_with_dual_metric_protected, which keeps its algorithm doc. Gates pass base..head; MSI verification at the pushed sha follows."
   }
 ]
