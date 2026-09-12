@@ -605,14 +605,20 @@ impl SurvivalMarginalSlopeFamily {
             None,
         )
     }
-    /// Fully exact second directional derivative D²H[d,e] for timewiggle-only.
-    /// Differentiates DH[e] along d analytically using m₂–m₅ scalars.
+    /// Fully exact second directional derivative D²H[d,e] for a time wiggle, with or
+    /// without the flexible score/link warps. Differentiates DH[e] along d analytically
+    /// using m₂–m₅ scalars.
     ///
     /// D²H[d,e] = J^T Ψ J  +  Σ γ_r K_r
     ///   + Σ bilinear(W_k, left_k, right_k)  for k in {T_e×dJ_d, T_d×dJ_e, H×d²J, H×dJ_d×dJ_e}
     ///   + dK cross-terms: (Hu_d)·dK_e + (Hu_e)·dK_d + f·d²K
     ///
     /// where Ψ = Q[u_d,u_e] + T[du_e/dd], γ = T_d·u_e + H·du_e/dd.
+    ///
+    /// With a score warp or link deviation the primaries carry the flex coordinates:
+    /// `H`, `T` and `Q` are the flex primary derivatives, and those coordinates are
+    /// identity-mapped, so `dJ`, `d²J` and `dK` keep q rows only while `J^T Ψ J` and
+    /// every `dJ^T W J` term also reach the identity blocks (gam#2893).
     pub(crate) fn exact_newton_joint_hessiansecond_directional_derivative_timewiggle(
         &self,
         block_states: &[ParameterBlockState],
@@ -633,6 +639,12 @@ impl SurvivalMarginalSlopeFamily {
         let dv_g = d_v.slice(s![slices.slope.clone()]);
         let beta_time = &block_states[0].beta;
         let beta_tw = beta_time.slice(s![time_tail.clone()]);
+        let flex_primary = self
+            .effective_flex_active(block_states)?
+            .then(|| flex_primary_slices(self));
+        let identity_blocks = flex_primary
+            .as_ref()
+            .map_or_else(Vec::new, |primary| flex_identity_block_pairs(primary, &slices));
 
         let result = gam_linalg::pairwise_reduce::par_deterministic_try_block_fold(
             self.n,
@@ -640,35 +652,66 @@ impl SurvivalMarginalSlopeFamily {
                 let mut acc = Array2::<f64>::zeros((p_total, p_total));
                 for row in range {
                     let q_geom = self.row_dynamic_q_geometry(row, block_states)?;
-                    let (_, f_pi, h_pi) =
-                        self.compute_row_primary_gradient_hessian_uncached(row, block_states)?;
+                    let (f_pi, h_pi, ud, ue, t_d, t_e, q_de) = if let Some(primary) =
+                        flex_primary.as_ref()
+                    {
+                        let (_, f_pi, h_pi) = self.compute_row_flex_primary_gradient_hessian_exact(
+                            row,
+                            block_states,
+                            &q_geom,
+                            primary,
+                        )?;
+                        let ud = self.row_primary_direction_from_flat_dynamic_with_q_geometry(
+                            row,
+                            block_states,
+                            &slices,
+                            &q_geom,
+                            d_u,
+                        )?;
+                        let ue = self.row_primary_direction_from_flat_dynamic_with_q_geometry(
+                            row,
+                            block_states,
+                            &slices,
+                            &q_geom,
+                            d_v,
+                        )?;
+                        let t_d = self.row_flex_primary_third_contracted_exact(row, block_states, &ud)?;
+                        let t_e = self.row_flex_primary_third_contracted_exact(row, block_states, &ue)?;
+                        let q_de =
+                            self.row_flex_primary_fourth_contracted_exact(row, block_states, &ud, &ue)?;
+                        (f_pi, h_pi, ud, ue, t_d, t_e, q_de)
+                    } else {
+                        let (_, f_pi, h_pi) =
+                            self.compute_row_primary_gradient_hessian_uncached(row, block_states)?;
 
-                    // Primary directions
-                    let ud = Array1::from_vec(vec![
-                        q_geom.dq0_time.dot(&du_t) + q_geom.dq0_marginal.dot(&du_m),
-                        q_geom.dq1_time.dot(&du_t) + q_geom.dq1_marginal.dot(&du_m),
-                        q_geom.dqd1_time.dot(&du_t) + q_geom.dqd1_marginal.dot(&du_m),
-                        self.slope_layout
-                            .coefficient_design()
-                            .dot_row_view(row, du_g),
-                    ]);
-                    let ue = Array1::from_vec(vec![
-                        q_geom.dq0_time.dot(&dv_t) + q_geom.dq0_marginal.dot(&dv_m),
-                        q_geom.dq1_time.dot(&dv_t) + q_geom.dq1_marginal.dot(&dv_m),
-                        q_geom.dqd1_time.dot(&dv_t) + q_geom.dqd1_marginal.dot(&dv_m),
-                        self.slope_layout
-                            .coefficient_design()
-                            .dot_row_view(row, dv_g),
-                    ]);
+                        // Primary directions
+                        let ud = Array1::from_vec(vec![
+                            q_geom.dq0_time.dot(&du_t) + q_geom.dq0_marginal.dot(&du_m),
+                            q_geom.dq1_time.dot(&du_t) + q_geom.dq1_marginal.dot(&du_m),
+                            q_geom.dqd1_time.dot(&du_t) + q_geom.dqd1_marginal.dot(&du_m),
+                            self.slope_layout
+                                .coefficient_design()
+                                .dot_row_view(row, du_g),
+                        ]);
+                        let ue = Array1::from_vec(vec![
+                            q_geom.dq0_time.dot(&dv_t) + q_geom.dq0_marginal.dot(&dv_m),
+                            q_geom.dq1_time.dot(&dv_t) + q_geom.dq1_marginal.dot(&dv_m),
+                            q_geom.dqd1_time.dot(&dv_t) + q_geom.dqd1_marginal.dot(&dv_m),
+                            self.slope_layout
+                                .coefficient_design()
+                                .dot_row_view(row, dv_g),
+                        ]);
 
-                    let t_d = self.row_primary_third_contracted(row, block_states, ud.view())?;
-                    let t_e = self.row_primary_third_contracted(row, block_states, ue.view())?;
-                    let q_de = self.row_primary_fourth_contracted(
-                        row,
-                        block_states,
-                        ud.view(),
-                        ue.view(),
-                    )?;
+                        let t_d = self.row_primary_third_contracted(row, block_states, ud.view())?;
+                        let t_e = self.row_primary_third_contracted(row, block_states, ue.view())?;
+                        let q_de = self.row_primary_fourth_contracted(
+                            row,
+                            block_states,
+                            ud.view(),
+                            ue.view(),
+                        )?;
+                        (f_pi, h_pi, ud, ue, t_d, t_e, q_de)
+                    };
                     let h_ud = h_pi.dot(&ud);
                     let h_ue = h_pi.dot(&ue);
 
@@ -748,23 +791,32 @@ impl SurvivalMarginalSlopeFamily {
                             v[1] += m2_ex * dh1d * mr[a] * dv_m[a];
                             v[2] += (m3_ex * dh1d * dr * mr[a] + m2_ex * ddrd * mr[a]) * dv_m[a];
                         }
-                        // v[3] = 0 (slope J is constant)
-                        Array1::from_vec(v.to_vec())
+                        // v[3] = 0 (slope J is constant), and the identity-mapped flex
+                        // coordinates have a constant J as well.
+                        let mut due_d = Array1::<f64>::zeros(h_pi.nrows());
+                        for (index, value) in v.iter().enumerate() {
+                            due_d[index] = *value;
+                        }
+                        due_d
                     };
 
                     // Ψ = Q[ud,ue] + T[due_d]
-                    let t_due =
-                        self.row_primary_third_contracted(row, block_states, due_d.view())?;
+                    let t_due = if flex_primary.is_some() {
+                        self.row_flex_primary_third_contracted_exact(row, block_states, &due_d)?
+                    } else {
+                        self.row_primary_third_contracted(row, block_states, due_d.view())?
+                    };
                     let psi = &q_de + &t_due;
 
                     // γ = T_d·ue + H·due_d
                     let gamma = &t_d.dot(&ue) + &h_pi.dot(&due_d);
 
                     // ── Term A: J^T Ψ J + γ·K ─────────────────────────
-                    self.accumulate_dynamic_q_core_hessian(
+                    self.accumulate_directional_joint_hessian_row(
                         row,
                         &slices,
                         &q_geom,
+                        &identity_blocks,
                         gamma.view(),
                         psi.view(),
                         &mut acc,
@@ -829,6 +881,14 @@ impl SurvivalMarginalSlopeFamily {
                                     acc[[slices.marginal.start + b, slices.time.start + a]] += v;
                                 }
                             }
+                        };
+                    }
+
+                    // `dJ` has q rows only, while `J` also carries the slope design and
+                    // the identity-mapped flex coordinates: a `dJ^T W J` term reaches
+                    // those columns and a `dJ^T W dJ` term does not.
+                    macro_rules! accum_j_cross {
+                        ($w:expr, $lt:expr, $lm:expr) => {
                             for a in 0..p_time {
                                 let mut w2 = 0.0;
                                 for qu in 0..3 {
@@ -851,6 +911,28 @@ impl SurvivalMarginalSlopeFamily {
                                         v;
                                     acc[[slices.slope.start + b, slices.marginal.start + a]] +=
                                         v;
+                                }
+                            }
+                            for (primary_range, joint_range) in identity_blocks.iter() {
+                                for local in 0..primary_range.len() {
+                                    let primary_idx = primary_range.start + local;
+                                    let joint_idx = joint_range.start + local;
+                                    for a in 0..p_time {
+                                        let mut w2 = 0.0;
+                                        for qu in 0..3 {
+                                            w2 += $w[[qu, primary_idx]] * $lt[qu][a];
+                                        }
+                                        acc[[slices.time.start + a, joint_idx]] += w2;
+                                        acc[[joint_idx, slices.time.start + a]] += w2;
+                                    }
+                                    for a in 0..p_marginal {
+                                        let mut w2 = 0.0;
+                                        for qu in 0..3 {
+                                            w2 += $w[[qu, primary_idx]] * $lm[qu][a];
+                                        }
+                                        acc[[slices.marginal.start + a, joint_idx]] += w2;
+                                        acc[[joint_idx, slices.marginal.start + a]] += w2;
+                                    }
                                 }
                             }
                         };
@@ -943,11 +1025,15 @@ impl SurvivalMarginalSlopeFamily {
                     // ── Term B: bilinear cross-terms ────────────────────
                     // (dJ_d)^T T_e J + J^T T_e (dJ_d) — differentiated from Term 1
                     accum_bilinear!(t_e, djd_t, djd_m, jt_s, jm_s);
+                    accum_j_cross!(t_e, djd_t, djd_m);
                     // (dJ_e)^T T_d J + J^T T_d (dJ_e) — symmetry partner
                     accum_bilinear!(t_d, dje_t, dje_m, jt_s, jm_s);
+                    accum_j_cross!(t_d, dje_t, dje_m);
                     // (d²J)^T H J + J^T H (d²J) — from Term 2
                     accum_bilinear!(h_pi, d2j_t, d2j_m, jt_s, jm_s);
-                    // (dJ_d)^T H (dJ_e) + (dJ_e)^T H (dJ_d) — from Term 2
+                    accum_j_cross!(h_pi, d2j_t, d2j_m);
+                    // (dJ_d)^T H (dJ_e) + (dJ_e)^T H (dJ_d) — from Term 2. Neither factor
+                    // has a slope or flex row, so this term stays in the time/marginal blocks.
                     accum_bilinear!(h_pi, djd_t, djd_m, dje_t, dje_m);
 
                     // ── Term C: dK cross-terms ──────────────────────────
