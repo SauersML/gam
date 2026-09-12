@@ -3524,5 +3524,15 @@
     ],
     "reason": "#2469: DEFAULT_RECONSTRUCTED_SMOOTH_LAMBDA (1e-2) was a picked smoothing strength. The saved-survival sampler's penalty reconstruction attached it as time_build.smooth_lambda.unwrap_or(1e-2) to every time and baseline-timewiggle penalty block. After the reconstruction, the function refuses when the saved fit's lambda vector does not cover exactly those blocks, then overwrites every block's lambda with the saved fitted value. The 1e-2 therefore never reached the sampler, and neither did the earlier per-wiggle override loop. The reconstruction now collects (matrix, range, nullspace_dim) specs, keeps the refusal, and builds each PenaltyBlock only from its saved fitted lambda. No placeholder lambda exists at any point.",
     "evidence": "git grep -n DEFAULT_RECONSTRUCTED_SMOOTH_LAMBDA over the base finds three lines, all in crates/gam-inference/src/sample.rs production code: the declaration at :229 and the two uses at :1487 (time blocks) and :1539 (baseline-timewiggle blocks). No other file or test names it. On base, :1566 refuses fit_saved.lambdas.len() != penalty_blocks.len(), and :1575-1577 then assigns block.lambda = lam for every block, before PenaltyBlocks::new at :1578. Not compiled or run locally (user directive); compile is covered by the lead's shared tip check."
+  },
+  {
+    "base": "c76cd40dabe71ae3728e579e430abd9f81156230",
+    "items": [
+      "crates/gam-solve/src/pirls/curvature.rs:fn:observed_weight_binomial_logit_from_jet",
+      "crates/gam-solve/src/pirls/curvature.rs:fn:observed_weight_gaussian_inverse",
+      "crates/gam-solve/src/pirls/curvature.rs:fn:observed_weight_gaussian_log"
+    ],
+    "reason": "#932 GLM row-derivative census. observed_weight_dispatch has one production caller, compute_observed_hessian_curvature_arrays_into, which asserts supports_observed_hessian_curvature_for_likelihood: Gamma (any link), negative binomial under the log link, and the non-canonical Binomial links (Probit, CLogLog, LogLog, Cauchit, SAS, BetaLogistic, Mixture). The Gaussian-log, Gaussian-inverse and Binomial-logit arms were unreachable, so they and their helpers observed_weight_gaussian_log, observed_weight_gaussian_inverse and observed_weight_binomial_logit_from_jet are deleted. WeightLink shrinks to {Log, Other}, and the dispatch drops its eta parameter, which only the Gaussian-inverse arm read.",
+    "evidence": "At the base, git grep finds each deleted helper only at its declaration and its dispatch arm in crates/gam-solve/src/pirls/curvature.rs. WeightLink::Identity, Logit and Inverse appear only in curvature.rs (weight_link_for_inverse_link and the deleted arms). observed_weight_dispatch has six call sites after this change: curvature.rs (production), two in firth_noncanonical_curvature_2273_tests.rs (WeightLink::Other), and three in pirls/tests.rs (the Gamma overflow pin and the two new Dual3 pins). All pass the nine remaining arguments. The item list is source_removal_guard.py's ITEM rule over the removed hunks: three declarations with pub or pub(crate) visibility, and no private declaration is removed. Compile is covered by the lead's shared tip check."
   }
 ]

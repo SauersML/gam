@@ -2784,8 +2784,7 @@ impl<'a> RemlState<'a> {
     /// saturation handling).
     ///
     /// For non-canonical Bernoulli links (Probit, CLogLog, SAS,
-    /// BetaLogistic, Mixture) and non-Bernoulli families with
-    /// non-trivial observed corrections we use the analytic
+    /// BetaLogistic, Mixture) we use the analytic
     /// [`pirls::e_obs_from_jets`] formula. It expresses
     ///   ∂³W_obs/∂η³ = W_F''' + h₃ T₁ + 3 h₂ T₂ + 3 h₁ T₃ − (y−μ) T₄
     /// where T = h₁/(φV), T_k = ∂^k T/∂η^k, and W_F = h₁ T. Everything
@@ -2837,9 +2836,10 @@ impl<'a> RemlState<'a> {
             return Ok((c_array, d_array, e_array));
         }
 
-        // General observed-information path for non-canonical Bernoulli
-        // links and other GLM families that support the observed Hessian
-        // surface (Probit, CLogLog, SAS, BetaLogistic, Mixture, GammaLog).
+        // General observed-information path for the non-canonical Bernoulli
+        // links (Probit, CLogLog, SAS, BetaLogistic, Mixture). Its only caller
+        // is the Tierney-Kadane correction, armed for Firth-penalized binomial
+        // fits (`reml_jeffreys_supported_link`).
         let likelihood = &pirls_result.likelihood;
         let weight_family = pirls::weight_family_for_glm_likelihood(likelihood)?;
         let phi = reml_fixed_glm_dispersion(likelihood)?;
@@ -2863,7 +2863,7 @@ impl<'a> RemlState<'a> {
                 mu.len(),
             );
         }
-        // Noncanonical / GammaLog observed-information path: each row's
+        // Noncanonical observed-information path: each row's
         // e_i depends only on (eta[i], mu[i], priorweights[i], y[i], dmu/d2/d3
         // jets at row i, and the inverse-link's higher-order pdf derivatives
         // evaluated at the exact eta). No carrier crosses rows. Compute into an

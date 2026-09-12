@@ -2357,6 +2357,109 @@ mod tests {
         }
     }
 
+    /// `(W, ∂W/∂η, ∂²W/∂η²)` of a closed-form observed weight against the Dual3
+    /// derivatives of the observed information written from the log-likelihood,
+    /// `W(η) = −∂²ℓ/∂η²`. The dispatch specializations are a separate derivation
+    /// of the same tower; this pins every channel to rounding (#932).
+    fn assert_observed_tower_matches_dual3(
+        label: &str,
+        dispatched: (f64, f64, f64),
+        weight_of_eta: impl Fn(num_dual::Dual3_64) -> num_dual::Dual3_64,
+        eta: f64,
+    ) {
+        let (w, c, d, _) = num_dual::third_derivative(|x| weight_of_eta(x), eta);
+        for (channel, closed, reference) in [
+            ("W", dispatched.0, w),
+            ("dW/deta", dispatched.1, c),
+            ("d2W/deta2", dispatched.2, d),
+        ] {
+            let scale = closed.abs().max(reference.abs());
+            assert!(
+                closed.is_finite() && (closed - reference).abs() <= 1.0e-12 * scale,
+                "{label} {channel} at eta={eta}: closed form {closed:+.17e} vs Dual3 {reference:+.17e}"
+            );
+        }
+        assert!(
+            dispatched.1 != 0.0 && dispatched.2 != 0.0,
+            "{label} at eta={eta}: the derivative channels must be live, got {dispatched:?}"
+        );
+    }
+
+    #[test]
+    fn negative_binomial_log_observed_curvature_matches_dual3_932() {
+        use num_dual::DualNum;
+        let prior_weight = 1.3;
+        for theta in [0.7_f64, 4.5] {
+            for y in [0.0_f64, 3.0, 17.0] {
+                for eta in [-2.0_f64, 0.3, 1.7, 5.0] {
+                    let mu = eta.exp();
+                    let jet = MixtureInverseLinkJet {
+                        mu,
+                        d1: mu,
+                        d2: mu,
+                        d3: mu,
+                    };
+                    let dispatched = observed_weight_dispatch(
+                        WeightFamily::NegativeBinomial { theta },
+                        WeightLink::Log,
+                        y,
+                        mu,
+                        1.0 - mu,
+                        1.0,
+                        prior_weight,
+                        jet,
+                        mu,
+                    );
+                    // −∂²ℓ/∂η² for ℓ = y·η − (y+θ)·log(e^η + θ) is (y+θ)·θ·e^η/(e^η+θ)².
+                    assert_observed_tower_matches_dual3(
+                        &format!("NB2 log theta={theta} y={y}"),
+                        dispatched,
+                        |x| {
+                            let mu = x.exp();
+                            (mu * theta) / ((mu + theta) * (mu + theta)) * (prior_weight * (y + theta))
+                        },
+                        eta,
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn gamma_log_observed_curvature_matches_dual3_932() {
+        use num_dual::DualNum;
+        let (phi, prior_weight) = (0.4_f64, 1.75_f64);
+        for y in [0.3_f64, 2.1] {
+            for eta in [-3.0_f64, 0.2, 4.0] {
+                let mu = eta.exp();
+                let jet = MixtureInverseLinkJet {
+                    mu,
+                    d1: mu,
+                    d2: mu,
+                    d3: mu,
+                };
+                let dispatched = observed_weight_dispatch(
+                    WeightFamily::Gamma,
+                    WeightLink::Log,
+                    y,
+                    mu,
+                    1.0 - mu,
+                    phi,
+                    prior_weight,
+                    jet,
+                    mu,
+                );
+                // −∂²ℓ/∂η² for ℓ = −(y·e^{−η} + η)/φ is y·e^{−η}/φ.
+                assert_observed_tower_matches_dual3(
+                    &format!("Gamma log y={y}"),
+                    dispatched,
+                    |x| (-x).exp() * (prior_weight * y / phi),
+                    eta,
+                );
+            }
+        }
+    }
+
     #[test]
     pub(crate) fn gamma_log_observed_curvature_dispatch_avoids_generic_overflow() {
         let y = 1.25;
@@ -2390,7 +2493,6 @@ mod tests {
         let (w_obs, c_obs, d_obs) = observed_weight_dispatch(
             WeightFamily::Gamma,
             WeightLink::Log,
-            eta,
             y,
             mu,
             1.0 - mu,

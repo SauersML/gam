@@ -299,10 +299,10 @@ pub fn weight_family_for_glm_likelihood(
 #[inline]
 pub(crate) fn weight_link_for_inverse_link(inverse_link: &InverseLink) -> WeightLink {
     match inverse_link {
-        InverseLink::Standard(StandardLink::Identity) => WeightLink::Identity,
         InverseLink::Standard(StandardLink::Log) => WeightLink::Log,
-        InverseLink::Standard(StandardLink::Logit) => WeightLink::Logit,
-        InverseLink::Standard(StandardLink::Probit)
+        InverseLink::Standard(StandardLink::Identity)
+        | InverseLink::Standard(StandardLink::Logit)
+        | InverseLink::Standard(StandardLink::Probit)
         | InverseLink::Standard(StandardLink::CLogLog)
         | InverseLink::Standard(StandardLink::LogLog)
         | InverseLink::Standard(StandardLink::Cauchit)
@@ -423,7 +423,6 @@ pub(crate) fn compute_observed_hessian_curvature_arrays_into(
             let (w_obs, c_obs, d_obs) = observed_weight_dispatch(
                 weight_family,
                 weight_link,
-                eta_used,
                 y[i],
                 jet.mu,
                 one_minus_mu,
@@ -699,50 +698,9 @@ pub fn e_obs_from_jets(
     pw * e_obs
 }
 
-// Direct (closed-form) observed-information weights for specific family-link
-// combinations.  These avoid the overhead of the generic noncanonical formula
-// when the algebra simplifies.
-
-/// Gaussian family with log link: y ~ N(μ, φ), μ = exp(η).
-///
-/// Returns `(w_obs, c_obs, d_obs)` pre-multiplied by the prior weight `pw`.
-///
-/// ```text
-/// w_obs = ω μ(2μ − y) / φ
-/// c_obs = ω μ(4μ − y) / φ
-/// d_obs = ω μ(8μ − y) / φ
-/// ```
-#[inline]
-pub fn observed_weight_gaussian_log(y: f64, mu: f64, phi: f64, pw: f64) -> (f64, f64, f64) {
-    let inv_phi = pw / phi;
-    let w = inv_phi * mu * (2.0 * mu - y);
-    let c = inv_phi * mu * (4.0 * mu - y);
-    let d = inv_phi * mu * (8.0 * mu - y);
-    (w, c, d)
-}
-
-/// Gaussian family with inverse link: y ~ N(μ, φ), μ = 1/η.
-///
-/// Returns `(w_obs, c_obs, d_obs)` pre-multiplied by the prior weight `pw`.
-///
-/// ```text
-/// w_obs = ω (3 − 2ηy) / (φ η⁴)
-/// c_obs = 6ω (ηy − 2) / (φ η⁵)
-/// d_obs = 12ω (5 − 2ηy) / (φ η⁶)
-/// ```
-#[inline]
-pub fn observed_weight_gaussian_inverse(y: f64, eta: f64, phi: f64, pw: f64) -> (f64, f64, f64) {
-    let eta2 = eta * eta;
-    let eta4 = eta2 * eta2;
-    let eta5 = eta4 * eta;
-    let eta6 = eta4 * eta2;
-    let ey = eta * y;
-    let inv_phi = pw / phi;
-    let w = inv_phi * (3.0 - 2.0 * ey) / eta4;
-    let c = inv_phi * 6.0 * (ey - 2.0) / eta5;
-    let d = inv_phi * 12.0 * (5.0 - 2.0 * ey) / eta6;
-    (w, c, d)
-}
+// Closed-form observed-information weights for the log-link Gamma and
+// negative-binomial pairs: algebraically identical to the generic tower, but
+// free of its large-η intermediates (each item states its algebra).
 
 /// Gamma family with log link: `V(μ)=μ²`, `μ=exp(η)`.
 ///
@@ -789,16 +747,6 @@ pub fn observed_weight_negative_binomial_log(
     (w, c, d)
 }
 
-#[inline]
-pub(crate) fn observed_weight_binomial_logit_from_jet(
-    n_trials: f64,
-    jet: MixtureInverseLinkJet,
-    pw: f64,
-) -> (f64, f64, f64) {
-    let scale = pw * n_trials;
-    (scale * jet.d1, scale * jet.d2, scale * jet.d3)
-}
-
 /// Family tag for the observed-information weight dispatch.
 ///
 /// This is a simplified family tag that identifies the variance function,
@@ -821,10 +769,7 @@ pub enum WeightFamily {
 /// specializations in [`observed_weight_dispatch`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WeightLink {
-    Identity,
     Log,
-    Logit,
-    Inverse,
     /// Any other link — falls back to the generic noncanonical formula.
     Other,
 }
@@ -887,7 +832,6 @@ pub fn bernoulli_pair_residual(family: WeightFamily, y: f64, mu: f64, one_minus_
 pub fn observed_weight_dispatch(
     family: WeightFamily,
     link: WeightLink,
-    eta: f64,
     y: f64,
     mu: f64,
     one_minus_mu: f64,
@@ -897,20 +841,11 @@ pub fn observed_weight_dispatch(
     h4: f64,
 ) -> (f64, f64, f64) {
     match (family, link) {
-        (WeightFamily::Gaussian, WeightLink::Log) => {
-            observed_weight_gaussian_log(y, mu, phi, prior_weight)
-        }
-        (WeightFamily::Gaussian, WeightLink::Inverse) => {
-            observed_weight_gaussian_inverse(y, eta, phi, prior_weight)
-        }
         (WeightFamily::Gamma, WeightLink::Log) => {
             observed_weight_gamma_log(y, mu, phi, prior_weight)
         }
         (WeightFamily::NegativeBinomial { theta }, WeightLink::Log) => {
             observed_weight_negative_binomial_log(y, mu, theta, prior_weight)
-        }
-        (WeightFamily::Binomial, WeightLink::Logit) => {
-            observed_weight_binomial_logit_from_jet(1.0, jet, prior_weight)
         }
         _ => {
             // Generic noncanonical path via the full variance-function jet.

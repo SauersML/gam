@@ -1307,5 +1307,15 @@
     },
     "reason": "#2829 public-surface rule (docs/rust-library-surface.md, 6e5362f23): a pub item that no product uses is deleted. These six restored-in-place identities have no user in gam-cli, gam-pyffi or Python, examples/, or another crate's production code, and no test calls them either.",
     "evidence": "restored_consumers_2829.py at d8f6ef9be (MSI job 527977, /scratch.global/sauer354/pool/api2829/consumers.d8f6ef9be98996b5c98bd08667aa4fe121561e8f.rows.tsv) scores conductance_penalty_jet, design_coord_kappa_derivative, build_raw_grams_from_channel_blocks, build_raw_grams_structural and certifies_finite as unreferenced. It scores boundary_conductance as production_same_crate, and that one production line (closure_family.rs:346) is inside conductance_penalty_jet. At the base, git grep -w over crates, src, tests, examples, python and bench finds each name only at its own declaration, its own body, and gam-geometry's lib.rs pub use line."
+  },
+  {
+    "base": "c76cd40dabe71ae3728e579e430abd9f81156230",
+    "removed": {
+      "crates/gam-solve/src/pirls/curvature.rs::observed_weight_binomial_logit_from_jet": 1,
+      "crates/gam-solve/src/pirls/curvature.rs::observed_weight_gaussian_inverse": 1,
+      "crates/gam-solve/src/pirls/curvature.rs::observed_weight_gaussian_log": 1
+    },
+    "reason": "#932 GLM row-derivative census. observed_weight_dispatch's only production caller, compute_observed_hessian_curvature_arrays_into, admits observed curvature only for Gamma, log-link negative binomial and the non-canonical Binomial links (supports_observed_hessian_curvature_for_likelihood). The Gaussian-log, Gaussian-inverse and Binomial-logit specializations were unreachable and are deleted with their dispatch arms.",
+    "evidence": "public_api_census.py's public_functions predicate over the removed hunks of crates/gam-solve/src/pirls/curvature.rs yields observed_weight_gaussian_log and observed_weight_gaussian_inverse (pub) and observed_weight_binomial_logit_from_jet (pub(crate)). At the base, git grep finds none of the three outside that file. No other file loses a pub fn: pirls/tests.rs and firth_noncanonical_curvature_2273_tests.rs change only call arguments and add tests, and reml/gradient_hessian.rs changes only comments."
   }
 ]

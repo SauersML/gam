@@ -297,7 +297,6 @@ fn noncanonical_observed_tower_evaluates_on_a_saturated_row_2273() {
         let zero = observed_weight_dispatch(
             WeightFamily::Binomial,
             WeightLink::Other,
-            eta,
             0.0,
             jet.mu,
             one_minus_mu,
@@ -336,7 +335,6 @@ fn noncanonical_observed_tower_evaluates_on_a_saturated_row_2273() {
         let one = observed_weight_dispatch(
             WeightFamily::Binomial,
             WeightLink::Other,
-            eta,
             1.0,
             jet.mu,
             one_minus_mu,
