@@ -1098,17 +1098,6 @@ impl CustomFamilyWarmStart {
         self.inner.block_beta.get(block_idx).map(|beta| beta.view())
     }
 
-    /// Number of active inequality-constraint rows per parameter block at the
-    /// mode this warm start carries (`0` for a block with no active set).
-    /// Diagnostic: lets a gate report whether a probe sits on a constraint face.
-    pub fn active_constraint_rows(&self) -> Vec<usize> {
-        self.inner
-            .active_sets
-            .iter()
-            .map(|set| set.as_ref().map_or(0, Vec::len))
-            .collect()
-    }
-
     /// Build a warm-start payload from a flat cached β and the per-block
     /// coefficient widths. The returned warm-start carries a zero `rho`
     /// (the outer cache will overwrite it on the next eval) and empty

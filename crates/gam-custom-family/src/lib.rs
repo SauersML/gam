@@ -2,9 +2,8 @@
 //!
 //! The carrier is split into real submodules, each a single defensible concern:
 //!
-//! - `block_spec`       — the coefficient group/label/prior data model plus the
-//!   fit-level blockspec validator and the block-role heuristic. The block
-//!   data-model types (`ParameterBlockSpec`, `ParameterBlockState`, …), the
+//! - `block_spec`       — the fit-level blockspec validator and the block-role
+//!   heuristic. The block data-model types (`ParameterBlockSpec`, `ParameterBlockState`, …), the
 //!   `CustomFamilyError`, the `PenaltyMatrix` carrier, and the
 //!   internal-consistency validator now live in `gam-problem` (#1521); the
 //!   `CustomFamily` trait, fit options, and ψ design-derivative operators live in
@@ -21,7 +20,6 @@
 //! - `covariance`       — joint covariance/geometry + stationarity/KKT residuals.
 //! - `fit`              — the public fit entry points + result assembly.
 //! - `penalty_labels`   — penalty-label layout + labeled log-λ (de)aggregation.
-//! - `coefficient_groups` — coefficient-group realization.
 //! - `custom_family_persistent_warm_start` — the persistent warm-start cache
 //!   (hosted at crate root since #1521; re-exported into the prelude here).
 //!
@@ -149,7 +147,6 @@ mod custom_family_persistent_warm_start;
 mod assembly;
 mod block_spec;
 mod blockwise_solve;
-mod coefficient_groups;
 mod covariance;
 mod fit;
 mod inner_blockwise_fit;
@@ -166,16 +163,7 @@ mod warm_start;
 // pub(crate) stays pub(crate)) so the prior flat-namespace API is unchanged.
 pub(crate) use self::block_spec::custom_family_block_role;
 pub use self::block_spec::validate_blockspecs;
-pub use self::block_spec::{
-    coefficient_label,
-    CoefficientBlockSelector,
-    CoefficientGroupSpec,
-    CoefficientLabel,
-    RealizedCoefficientGroup,
-    RealizedCoefficientGroupSpecs,
-};
 pub use assembly::*;
-pub use coefficient_groups::*;
 pub(crate) use blockwise_solve::*;
 pub(crate) use covariance::*;
 // Two covariance helpers are part of the public flat-namespace API consumed by

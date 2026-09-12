@@ -229,5 +229,25 @@
     "unit_test_decreases": {
       "crates/gam-inference": 3
     }
+  },
+  {
+    "base": "d338606307c351ac4ef8244244ef6c5af3ad051c",
+    "reason": "User directive 2026-09-11: delete code only tests use and code nothing uses. gam-custom-family realize_coefficient_groups_for_custom_family (with its coefficient_groups module), the two outer-criterion diagnostic evaluators and CustomFamilyWarmStart::active_constraint_rows had no production caller, and the coefficient-group types the realizer consumed and produced were left with no consumer.",
+    "evidence": "Re-confirmed at the tip with git grep -nw over crates src tests examples bench benches. gam-models and tests/inference/misc import gam-terms' own CoefficientGroupSpec (gam::smooth), which stays. Removed with the three #2315 realizer unit tests, the #2612 outer-gradient FD suite test restored in 21390b321 (its only subject was evaluate_labeled_outer_criterion_for_diagnostics) and one diagnostic eprintln in kappa_exact_joint_fd_tests.rs. Gates pass base..head; MSI verification at the pushed sha follows.",
+    "test_count_decrease": 8,
+    "removed_pins": {
+      "coefficient_group_labels_cannot_reclassify_base_penalties_2315": 1,
+      "jeffreys_armed_outer_gradient_matches_central_differences_2612": 1,
+      "jeffreys_armed_outer_hessian_agrees_on_the_curvature_verdict_2612": 1,
+      "multi_block_group_priors_follow_realized_penalty_order_2315": 1,
+      "the_jeffreys_term_is_live_on_this_fixture_2612": 1,
+      "tied_and_fixed_base_penalties_use_optimizer_coordinate_priors_2315": 1,
+      "unbiased_outer_gradient_matches_central_differences_2612": 1,
+      "unbiased_outer_hessian_matches_the_gradient_jacobian_2612": 1
+    },
+    "unit_test_decreases": {
+      "crates/gam-custom-family": 3,
+      "crates/gam-models": 5
+    }
   }
 ]
