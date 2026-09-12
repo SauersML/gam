@@ -1399,6 +1399,6 @@ mod selected_cuda_gram_tests {
             "add_weighted_design_grams_from_chunks(",
             2,
         );
-        assert_call_sites_propagate_result(axis_source, "add_weighted_chunk_gram(", 6);
+        assert_call_sites_propagate_result(axis_source, "add_weighted_chunk_gram(", 4);
     }
 }
