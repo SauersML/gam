@@ -249,6 +249,9 @@ struct ReducedMoreSorensenStep {
     delta: Array1<f64>,
     alternate_hard_case_delta: Option<Array1<f64>>,
     trust_shift: f64,
+    /// The spectrum's negative-curvature resolution; a shift at or below it is a
+    /// within-resolution convexification rather than a boundary multiplier.
+    curvature_resolution: f64,
     hard_case: bool,
     exact_positive_curvature: bool,
     minimum_shifted_curvature: f64,
@@ -404,6 +407,7 @@ fn generalized_trust_region_reduced_step(
         delta,
         alternate_hard_case_delta,
         trust_shift,
+        curvature_resolution: trust_step.trust_region_curvature_resolution,
         hard_case: trust_step.trust_region_hard_case,
         exact_positive_curvature,
         minimum_shifted_curvature,
@@ -760,6 +764,7 @@ fn certified_reduced_face_candidate(
     struct PhysicalFaceStep {
         deltas: Vec<Array1<f64>>,
         trust_shift: f64,
+        curvature_resolution: f64,
         hard_case: bool,
         exact_positive_curvature: bool,
         minimum_shifted_curvature: f64,
@@ -1072,6 +1077,7 @@ fn certified_reduced_face_candidate(
             PhysicalFaceStep {
                 deltas,
                 trust_shift: reduced_step.trust_shift,
+                curvature_resolution: reduced_step.curvature_resolution,
                 hard_case: reduced_step.hard_case,
                 exact_positive_curvature: reduced_step.exact_positive_curvature,
                 minimum_shifted_curvature: reduced_step.minimum_shifted_curvature,
@@ -1084,6 +1090,7 @@ fn certified_reduced_face_candidate(
             PhysicalFaceStep {
                 deltas: vec![delta_particular],
                 trust_shift: 0.0,
+                curvature_resolution: 0.0,
                 hard_case: false,
                 exact_positive_curvature: true,
                 minimum_shifted_curvature: f64::INFINITY,
@@ -1281,14 +1288,24 @@ fn certified_reduced_face_candidate(
             * (p.max(1) as f64)
             * trust_radius.abs().max(trust_norm.abs()).max(1.0);
         let trust_feasible = trust_norm <= trust_radius + trust_tolerance;
-        let trust_complementary =
-            face_step.trust_shift == 0.0 || (trust_norm - trust_radius).abs() <= trust_tolerance;
+        // Complementarity at the curvature resolution the step solver declined at.
+        // When its hard case declines to fill along an unresolvable negative pole,
+        // it returns the minimum-norm base at `λ_lo = −γ_min`: an interior step with
+        // a positive shift no larger than that resolution. The shift perturbs the
+        // model within resolution into a convex one whose interior Newton step this
+        // is, so it is not a boundary multiplier. Exact zero refused such a step on
+        // the 3-D CTN κ gate (trust_shift=4.978800e-8 for an interior
+        // metric_norm=8.794692e-3 against radius=3.164101e-2, MSI job 440833).
+        let trust_complementary = face_step.trust_shift <= face_step.curvature_resolution
+            || (trust_norm - trust_radius).abs() <= trust_tolerance;
         if !trust_norm.is_finite() || !trust_feasible || !trust_complementary {
             return Err(CustomFamilyError::trial_point(format!(
                 "physical reduced-face trust-ball KKT failed \
                  (metric_norm={trust_norm:.6e}, radius={trust_radius:.6e}, \
-                 trust_shift={:.6e}, tolerance={trust_tolerance:.6e})",
+                 trust_shift={:.6e}, curvature_resolution={:.6e}, \
+                 tolerance={trust_tolerance:.6e})",
                 face_step.trust_shift,
+                face_step.curvature_resolution,
             )));
         }
 

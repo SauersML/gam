@@ -3326,6 +3326,13 @@ pub(crate) struct JointSpectralNewtonStep {
     /// Whether the trust-region solution required the singular hard-case
     /// component in the minimum eigenspace.
     pub(crate) trust_region_hard_case: bool,
+    /// The curvature below which the solver treats negative curvature as
+    /// unresolvable ([`WhitenedHessianSpectrum::negative_curvature_fill_bar`]).
+    /// When the hard case declines to fill along such a pole, the step is the
+    /// minimum-norm base at `λ = −γ_min`: inside the ball, with a shift no larger
+    /// than this. A shift at or below it is a within-resolution convexification,
+    /// not a boundary multiplier.
+    pub(crate) trust_region_curvature_resolution: f64,
     pub(crate) range_rhs_inf: f64,
     pub(crate) null_rhs_inf: f64,
     pub(crate) lambda_max_abs: f64,
@@ -3620,6 +3627,19 @@ pub(crate) mod whitened_spectrum {
             }
         }
 
+        /// The curvature below which a negative pole is not worth travelling along:
+        /// `rank_tol` times the median identified curvature, floored at the
+        /// eigensolver resolution. The hard case fills to the boundary only past
+        /// it, and a step reports it as its curvature resolution.
+        pub(crate) fn negative_curvature_fill_bar(&self) -> f64 {
+            if self.lambda_max_abs > 0.0 {
+                let relative_tol = self.null_cutoff / self.lambda_max_abs;
+                (relative_tol * self.median_identified_curvature()).max(self.numerical_floor)
+            } else {
+                self.numerical_floor
+            }
+        }
+
         /// `‖η(λ)‖²_2 = Σ_{identified k} c_k² / (γ_k + λ)²` — the squared `D`-metric
         /// norm of the trial step as a function of the Levenberg shift `λ`. Only
         /// identified (above-`null_cutoff`) modes participate; the null space carries
@@ -3829,6 +3849,7 @@ pub(crate) mod whitened_spectrum {
                 delta,
                 trust_region_shift: Some(lambda),
                 trust_region_hard_case: extra_min_mode.is_some(),
+                trust_region_curvature_resolution: self.negative_curvature_fill_bar(),
                 range_rhs_inf,
                 null_rhs_inf,
                 lambda_max_abs: self.lambda_max_abs,
@@ -4004,13 +4025,7 @@ pub(crate) mod whitened_spectrum {
                 // `null_cutoff / lambda_max_abs` recovers `rank_tol` exactly
                 // (they differ only when the floor clamps, which the `.max`
                 // below reapplies), so no new constant is introduced.
-                let fill_bar = if self.lambda_max_abs > 0.0 {
-                    let relative_tol = self.null_cutoff / self.lambda_max_abs;
-                    (relative_tol * self.median_identified_curvature())
-                        .max(self.numerical_floor)
-                } else {
-                    self.numerical_floor
-                };
+                let fill_bar = self.negative_curvature_fill_bar();
                 if let Some(k_min) = k_min_witness
                     && gamma_min_id < -fill_bar
                 {
@@ -4133,6 +4148,7 @@ pub(crate) mod whitened_spectrum {
                 delta,
                 trust_region_shift: None,
                 trust_region_hard_case: false,
+                trust_region_curvature_resolution: self.negative_curvature_fill_bar(),
                 range_rhs_inf,
                 null_rhs_inf,
                 lambda_max_abs: self.lambda_max_abs,
@@ -4545,6 +4561,46 @@ mod trust_region_subproblem_tests {
             (norm_real - radius).abs() <= 1.0e-6 * radius,
             "a resolvably negative pole must still fill to the boundary; \
              norm={norm_real} against r={radius}"
+        );
+    }
+
+    /// gam#979 (3-D CTN κ gate): when the hard case declines the fill, the step is
+    /// the minimum-norm base at `λ_lo = −γ_min`, inside the ball with a positive
+    /// shift. That shift is a within-resolution convexification, not a boundary
+    /// multiplier, and the step publishes the resolution it declined at so a
+    /// constrained caller can judge complementarity there. A resolvably negative
+    /// pole's shift stays above that resolution.
+    #[test]
+    pub(crate) fn declined_hard_case_fill_publishes_its_curvature_resolution_979() {
+        let rhs = array![1.0, 0.0];
+        let d = array![1.0, 1.0];
+        let radius = 1.0e3;
+        let h = array![[1.0, 0.0], [0.0, -1.0e-12]];
+        let spec = WhitenedHessianSpectrum::decompose(&h, &rhs, &d, KKT_REFUSAL_RANK_TOL).unwrap();
+        let step = spec.trust_region_step(radius);
+        let shift = step.trust_region_shift.expect("trust-region solution");
+        let norm = step.delta.dot(&step.delta).sqrt();
+        assert!(
+            shift > 0.0 && norm < radius,
+            "the declined fill is an interior step with a positive shift: shift={shift:e}, \
+             norm={norm}"
+        );
+        assert!(
+            shift <= step.trust_region_curvature_resolution,
+            "the declined fill's shift {shift:e} exceeds the curvature resolution it declined at \
+             {:e}",
+            step.trust_region_curvature_resolution
+        );
+
+        let h_real = array![[1.0, 0.0], [0.0, -1.0e-2]];
+        let spec_real =
+            WhitenedHessianSpectrum::decompose(&h_real, &rhs, &d, KKT_REFUSAL_RANK_TOL).unwrap();
+        let step_real = spec_real.trust_region_step(radius);
+        let shift_real = step_real.trust_region_shift.expect("trust-region solution");
+        assert!(
+            shift_real > step_real.trust_region_curvature_resolution,
+            "a resolvably negative pole's shift {shift_real:e} must stay above the resolution {:e}",
+            step_real.trust_region_curvature_resolution
         );
     }
 
