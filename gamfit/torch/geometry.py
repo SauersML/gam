@@ -173,23 +173,20 @@ def inverse_alr(coords: torch.Tensor, *, reference: int = -1) -> torch.Tensor:
     )
 
 
-def ilr(values: torch.Tensor, *, reference: int = -1) -> torch.Tensor:
+def ilr(values: torch.Tensor) -> torch.Tensor:
     """Isometric log-ratio coordinates for positive compositions.
 
     ILR maps a ``d``-part composition to ``d-1`` Euclidean coordinates that are
     isometric to Aitchison geometry: Euclidean distance in ILR space equals
-    Aitchison distance on the simplex. The ``reference`` argument is accepted for
-    a uniform call signature with :func:`alr` but is unused — the Helmert basis
-    is canonical and reference-free.
+    Aitchison distance on the simplex. The Helmert basis is canonical and
+    reference-free.
     """
-    del reference  # Helmert ILR basis is reference-free; kept for signature parity.
     v = _as_matrix(values, label="simplex values")
     return from_numpy_like(_rust().response_geometry_ilr(to_numpy_f64(v)), v)
 
 
-def inverse_ilr(coords: torch.Tensor, *, reference: int = -1) -> torch.Tensor:
+def inverse_ilr(coords: torch.Tensor) -> torch.Tensor:
     """Map ILR coordinates back to the simplex."""
-    del reference  # Helmert ILR basis is reference-free; kept for signature parity.
     z = _as_matrix(coords, label="ILR coordinates")
     return from_numpy_like(_rust().response_geometry_inverse_ilr(to_numpy_f64(z)), z)
 

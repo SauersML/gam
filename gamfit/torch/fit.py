@@ -373,19 +373,6 @@ def _build_design_penalty(
             )
         if not torch.isfinite(points).all():
             raise ValueError("Sphere: points contains NaN/Inf")
-        lat = points[:, 0]
-        if radians:
-            import math
-            bound = math.pi / 2.0
-            if (lat.min().item() < -bound - 1e-9) or (lat.max().item() > bound + 1e-9):
-                raise ValueError(
-                    "Sphere(radians=True): latitude must lie in [-π/2, π/2]"
-                )
-        else:
-            if (lat.min().item() < -90.0 - 1e-9) or (lat.max().item() > 90.0 + 1e-9):
-                raise ValueError(
-                    "Sphere(radians=False): latitude must lie in [-90, 90]"
-                )
         design, penalty = sphere_basis(
             points,
             n_centers=n_centers,
@@ -572,42 +559,6 @@ def _build_design_penalty(
         )
         return design, penalty
 
-    expected_smooth_type = {
-        "duchon": "Duchon",
-        "bspline": "BSpline",
-        "sphere": "Sphere",
-        "periodic_spline_curve": "PeriodicSplineCurve",
-        "pca": "Pca",
-    }.get(entry)
-    if expected_smooth_type is not None:
-        raise NotImplementedError(
-            f"torch fit dispatch returned {entry!r} for {type(smooth).__name__}, "
-            f"but that branch requires {expected_smooth_type}; the dispatch key "
-            "and Smooth subclass are inconsistent"
-        )
-
-    # Recognised-but-not-yet-wired entries: the Rust dispatch registers every
-    # `gamfit.torch`-exported Smooth subclass (single source of truth). Every
-    # currently-exported kind now has a tensor design/penalty backend wired on
-    # the torch path; this guard remains so that a future Rust enum variant
-    # added without a matching torch branch raises a consistent
-    # NotImplementedError-shape rather than falling through silently.
-    unwired_entries: dict[str, str] = {}
-    if entry in unwired_entries:
-        kind_name = unwired_entries[entry]
-        raise NotImplementedError(
-            f"{kind_name} is recognised by the torch dispatch but its "
-            "design/penalty tensor backend is not yet wired into "
-            "gamfit.torch.fit; needs a Rust PyO3 binding for the underlying "
-            "basis + penalty. Currently supported on the torch path: "
-            "Duchon (any d for basis; d=1 for penalty), BSpline (d=1), "
-            "TensorBSpline (te), Matern (kernel-Gram penalty), "
-            "Sphere (S²), PeriodicSplineCurve, Pca, Categorical."
-        )
-
-    # Defensive raise: the Rust dispatch already rejected unknown specs
-    # above. Reaching here means the Rust enumeration grew a new variant
-    # without a matching torch branch, so raise to make the gap visible.
     raise NotImplementedError(
         f"torch fit dispatch returned {entry!r} but no matching branch is "
         f"wired for {type(smooth).__name__}"

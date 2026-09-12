@@ -97,16 +97,13 @@ def test_sphere_metric_is_symmetric_psd() -> None:
         assert (eigvals >= -1e-10).all()
 
 
-def test_fourier_evaluate_matches_periodic_harmonic() -> None:
-    fourier = gamfit.Fourier(harmonics=3)
-    ph = gamfit.PeriodicHarmonic(num_basis=7)
+def test_periodic_harmonic_evaluate_width_and_callable_surface() -> None:
+    ph = gamfit.PeriodicHarmonic(harmonics=3)
     theta = torch.linspace(0.0, 2.0 * math.pi, 32, dtype=torch.float64)
-    phi_a = fourier.evaluate(theta)
-    phi_b = ph.evaluate(theta)
-    assert phi_a.shape == (32, 7)
-    assert torch.allclose(phi_a, phi_b, atol=1e-14)
+    phi = ph.evaluate(theta)
+    assert phi.shape == (32, 7)
     # Callable surface
-    assert torch.allclose(fourier(theta), phi_a, atol=1e-14)
+    assert torch.allclose(ph(theta), phi, atol=1e-14)
 
 
 def test_penalty_composition_hvp_is_sum_of_parts() -> None:
@@ -125,10 +122,10 @@ def test_penalty_composition_hvp_is_sum_of_parts() -> None:
     assert torch.allclose(hv_c, hv_a + hv_b, atol=1e-10)
 
 
-def test_smooth_compose_circle_fourier_evaluate_matches_basis() -> None:
+def test_smooth_compose_circle_periodic_harmonic_evaluate_matches_basis() -> None:
     sm = gamfit.Smooth(
         latent=ManifoldCircle(),
-        basis=gamfit.Fourier(harmonics=3),
+        basis=gamfit.PeriodicHarmonic(harmonics=3),
         penalty=gamfit.ARDPenalty(weight=0.1),
     )
     theta = torch.linspace(0.0, 2.0 * math.pi, 16, dtype=torch.float64)
@@ -157,18 +154,18 @@ def test_basis_jacobian_evaluates_descriptor_once() -> None:
 
 
 def test_smooth_dim_mismatch_raises_eagerly() -> None:
-    # Sphere has dimension=2; Fourier(harmonics=3) has input_dim=1.
+    # Sphere has dimension=2; PeriodicHarmonic(harmonics=3) has input_dim=1.
     with pytest.raises(ValueError, match="incompatible|input_dim|dimension"):
         gamfit.Smooth(
             latent=ManifoldSphere(intrinsic_dim=2),
-            basis=gamfit.Fourier(harmonics=3),
+            basis=gamfit.PeriodicHarmonic(harmonics=3),
         )
 
 
 def test_smooth_to_dict_roundtrip() -> None:
     sm = gamfit.Smooth(
         latent=ManifoldCircle(),
-        basis=gamfit.Fourier(harmonics=3),
+        basis=gamfit.PeriodicHarmonic(harmonics=3),
         name="phase",
     )
     d = sm.to_dict()

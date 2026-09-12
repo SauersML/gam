@@ -6487,27 +6487,7 @@ fn block_sparse_dictionary_seed_manifest_ffi<'py>(
     block_seed_manifest_to_py(py, &manifest)
 }
 
-#[pyfunction(signature = (
-    x,
-    decoder,
-    blocks,
-    codes,
-    gamma,
-    block_size,
-    block_topk,
-    residual_target = true,
-    min_firings = 64,
-    max_blocks = 256,
-    crossfit_folds = 2,
-    min_effect = 0.0,
-    whitening_ridge = 1.0e-8,
-    pair_screen = true,
-    pair_top_blocks = 64,
-    max_pairs = 128,
-    pair_min_cofirings = 64,
-    pair_min_score = 0.20,
-    block_tile = 1024
-))]
+#[pyfunction(signature = (x, decoder, blocks, codes, gamma, block_size, block_topk))]
 fn block_coordinate_chart_compose_ffi<'py>(
     py: Python<'py>,
     x: PyReadonlyArray2<'py, f32>,
@@ -6517,39 +6497,18 @@ fn block_coordinate_chart_compose_ffi<'py>(
     gamma: f32,
     block_size: usize,
     block_topk: usize,
-    residual_target: bool,
-    min_firings: usize,
-    max_blocks: usize,
-    crossfit_folds: usize,
-    min_effect: f64,
-    whitening_ridge: f64,
-    pair_screen: bool,
-    pair_top_blocks: usize,
-    max_pairs: usize,
-    pair_min_cofirings: usize,
-    pair_min_score: f64,
-    block_tile: usize,
 ) -> PyResult<Py<PyDict>> {
     let x_values = x.as_array().to_owned();
     let decoder_values = decoder.as_array().to_owned();
     let block_values = blocks.as_array().to_owned();
     let code_values = codes.as_array().to_owned();
+    // The fitted dictionary supplies the geometry; every composition policy
+    // value is the library's `BlockChartComposeConfig::default()`.
     let config = BlockChartComposeConfig {
         block_size,
         block_topk,
         gamma,
-        residual_target,
-        min_firings,
-        max_blocks,
-        crossfit_folds,
-        min_effect,
-        whitening_ridge,
-        pair_screen,
-        pair_top_blocks,
-        max_pairs,
-        pair_min_cofirings,
-        pair_min_score,
-        block_tile,
+        ..BlockChartComposeConfig::default()
     };
     let result = detach_py_result(py, "block_coordinate_chart_compose", move || {
         compose_block_coordinate_charts(

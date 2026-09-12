@@ -289,16 +289,6 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--block-tile", type=int, default=512)
     ap.add_argument("--frame-ridge", type=float, default=1.0e-9)
     ap.add_argument("--tolerance", type=float, default=1.0e-5)
-    ap.add_argument("--min-firings", type=int, default=32)
-    ap.add_argument("--max-chart-blocks", type=int, default=256)
-    ap.add_argument("--crossfit-folds", type=int, default=2)
-    ap.add_argument("--alpha", type=float, default=0.10)
-    ap.add_argument("--whitening-ridge", type=float, default=1.0e-8)
-    ap.add_argument("--pair-screen", action="store_true")
-    ap.add_argument("--pair-top-blocks", type=int, default=64)
-    ap.add_argument("--max-pairs", type=int, default=128)
-    ap.add_argument("--pair-min-cofirings", type=int, default=64)
-    ap.add_argument("--pair-min-score", type=float, default=0.20)
     return ap.parse_args()
 
 
@@ -321,12 +311,6 @@ def main() -> None:
         "block_tile": int(args.block_tile),
         "frame_ridge": float(args.frame_ridge),
         "tolerance": float(args.tolerance),
-        "min_firings": int(args.min_firings),
-        "max_chart_blocks": int(args.max_chart_blocks),
-        "crossfit_folds": int(args.crossfit_folds),
-        "alpha": float(args.alpha),
-        "whitening_ridge": float(args.whitening_ridge),
-        "pair_screen": bool(args.pair_screen),
     }
     payload = {
         "experiment": "gemma_wall_closure_real_block_chart_post_pos0_peel",

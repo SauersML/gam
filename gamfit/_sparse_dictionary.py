@@ -711,29 +711,12 @@ class BlockSparseDictionaryFit:
             )
         )
 
-    def compose_block_charts(
-        self,
-        X: Any,
-        *,
-        residual_target: bool = True,
-        min_firings: int = 64,
-        max_blocks: int = 256,
-        crossfit_folds: int = 2,
-        alpha: float = 0.10,
-        min_effect: float = 0.0,
-        whitening_ridge: float = 1.0e-8,
-        pair_screen: bool = True,
-        pair_top_blocks: int = 64,
-        max_pairs: int = 128,
-        pair_min_cofirings: int = 64,
-        pair_min_score: float = 0.20,
-        block_tile: int = 1024,
-    ) -> dict[str, Any]:
+    def compose_block_charts(self, X: Any) -> dict[str, Any]:
         """Compose Rust-owned block-coordinate charts over this T1 dictionary.
 
-        Python only marshals arrays and configuration. Projection, whitening,
-        held-out evidence, e-BH selection, pair screening, and reconstruction are
-        computed by the Rust core.
+        Python only marshals arrays. Projection, whitening, held-out evidence,
+        e-BH selection, pair screening, reconstruction and every composition
+        policy value are owned by the Rust core.
         """
         x = _as_2d_f32(X, "X")
         return dict(
@@ -745,19 +728,6 @@ class BlockSparseDictionaryFit:
                 float(self.gamma),
                 int(self.block_size),
                 int(self.block_topk),
-                residual_target=bool(residual_target),
-                min_firings=int(min_firings),
-                max_blocks=int(max_blocks),
-                crossfit_folds=int(crossfit_folds),
-                alpha=float(alpha),
-                min_effect=float(min_effect),
-                whitening_ridge=float(whitening_ridge),
-                pair_screen=bool(pair_screen),
-                pair_top_blocks=int(pair_top_blocks),
-                max_pairs=int(max_pairs),
-                pair_min_cofirings=int(pair_min_cofirings),
-                pair_min_score=float(pair_min_score),
-                block_tile=int(block_tile),
             )
         )
 

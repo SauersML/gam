@@ -102,13 +102,6 @@ def test_swap_loss_as_training_objective() -> None:
     assert losses[-1] < losses[0]
 
 
-def test_unknown_swap_mode_raises() -> None:
-    from gamfit import InterchangeSwapDecoder
-
-    with pytest.raises(ValueError, match="unknown swap_mode"):
-        InterchangeSwapDecoder(D=4, F=3, swap_mode="not_a_mode")
-
-
 def test_mismatched_z_shapes_raise() -> None:
     dec = _make_decoder()
     z_a = torch.randn(4, dec.F)

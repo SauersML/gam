@@ -227,10 +227,6 @@ class Circle(_RustManifold):
     intrinsic dimensions are therefore both ``1`` — there is no ``R^2``
     unit-vector embedding. All math from ``gam::geometry::Circle``."""
 
-    # Composition contract: ``gamfit._smooth`` reads this when deciding
-    # whether a manifold-basis pair is allowed.
-    compatible_bases = frozenset({"PeriodicHarmonic", "Fourier"})
-
     def __init__(self) -> None:
         self.json = {"kind": "circle"}
 

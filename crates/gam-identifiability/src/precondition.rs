@@ -10,14 +10,6 @@ use serde::{Deserialize, Serialize};
 
 use gam_linalg::faer_ndarray::FaerSvd;
 
-/// Below this std the aux column is "constant" (Khemakhem 2107.10098 Thm. 1
-/// — a constant column carries zero conditioning information).
-pub const DEFAULT_IVAE_AUX_VAR_FLOOR: f64 = 1.0e-9;
-
-/// Tolerance used by the truncated-SVD rank routine for the aux column-rank
-/// check (Khemakhem 2107.10098 §3 parametric-richness assumption).
-pub const DEFAULT_IVAE_AUX_RANK_RTOL: f64 = 1.0e-8;
-
 /// Khemakhem 2107.10098 §3: encoder must be "non-trivially nonlinear" — bare
 /// linear (1 affine layer) does not satisfy the universal-approximation
 /// argument that pushes identifiability through the encoder.
@@ -41,10 +33,11 @@ pub const DEFAULT_RANDPROJ_VAR_WARN: f64 = 1.0e3;
 
 /// Tunable thresholds — every field has a paper-backed default and can be
 /// overridden per call (constructor kwargs in Python, struct literal here).
+/// The iVAE aux checks carry no threshold: a column is constant, and a
+/// direction absent, exactly when the arithmetic that measures it cannot
+/// resolve it (see `constant_columns` and `matrix_rank`).
 #[derive(Debug, Clone, Copy, Deserialize, Serialize)]
 pub struct Thresholds {
-    pub ivae_aux_var_floor: f64,
-    pub ivae_aux_rank_rtol: f64,
     pub ivae_min_encoder_layers: i64,
     pub mech_sparsity_fraction: f64,
     pub mech_sparsity_zero_tol: f64,
@@ -55,8 +48,6 @@ pub struct Thresholds {
 impl Default for Thresholds {
     fn default() -> Self {
         Self {
-            ivae_aux_var_floor: DEFAULT_IVAE_AUX_VAR_FLOOR,
-            ivae_aux_rank_rtol: DEFAULT_IVAE_AUX_RANK_RTOL,
             ivae_min_encoder_layers: DEFAULT_IVAE_MIN_ENCODER_LAYERS,
             mech_sparsity_fraction: DEFAULT_MECH_SPARSITY_FRACTION,
             mech_sparsity_zero_tol: DEFAULT_MECH_SPARSITY_ZERO_TOL,
@@ -169,9 +160,28 @@ fn column_var(mat: ArrayView2<f64>) -> Vec<f64> {
     column_std(mat).into_iter().map(|s| s * s).collect()
 }
 
-/// Tolerance-based rank via faer SVD: count singular values larger than
-/// `rtol * max_singular_value`.
-fn matrix_rank(mat: ArrayView2<f64>, rtol: f64) -> Result<usize, String> {
+/// Indices of the columns whose centered sum of squares lies inside the rounding
+/// band of the centering itself, `γ_{n+1}²·Σx²`. That is the residue a constant
+/// column leaves once its mean is subtracted, so such a column carries no
+/// variation the arithmetic can attest to, at any scale of the covariate.
+fn constant_columns(mat: ArrayView2<f64>) -> Vec<usize> {
+    let n = mat.nrows();
+    let growth = gam_linalg::roundoff::accumulation_growth(n + 1);
+    mat.axis_iter(Axis(1))
+        .enumerate()
+        .filter(|(_, col)| {
+            let mean = col.sum() / n as f64;
+            let centered: f64 = col.iter().map(|v| (v - mean) * (v - mean)).sum();
+            let raw: f64 = col.iter().map(|v| v * v).sum();
+            centered <= growth * growth * raw
+        })
+        .map(|(index, _)| index)
+        .collect()
+}
+
+/// Numerical rank via faer SVD: the singular values above the decomposition's
+/// backward-error band `max(n, p)·ε·σ_max`.
+fn matrix_rank(mat: ArrayView2<f64>) -> Result<usize, String> {
     if mat.nrows() == 0 || mat.ncols() == 0 {
         return Ok(0);
     }
@@ -184,7 +194,7 @@ fn matrix_rank(mat: ArrayView2<f64>, rtol: f64) -> Result<usize, String> {
     if smax <= 0.0 {
         return Ok(0);
     }
-    let cutoff = smax * rtol;
+    let cutoff = (mat.nrows().max(mat.ncols()) as f64) * f64::EPSILON * smax;
     Ok(sigma.iter().filter(|s| **s > cutoff).count())
 }
 
@@ -235,24 +245,18 @@ pub fn check_ivae(summary: &FitSummary, thr: &Thresholds) -> TheoremResult {
         "aux_min_std".to_string(),
         if stds.is_empty() { 0.0 } else { min_std },
     );
-    if stds.is_empty() || stds.iter().any(|s| *s <= thr.ivae_aux_var_floor) {
-        let zeros: Vec<usize> = stds
-            .iter()
-            .enumerate()
-            .filter(|(_, s)| **s <= thr.ivae_aux_var_floor)
-            .map(|(i, _)| i)
-            .collect();
+    let constant = constant_columns(aux.view());
+    if stds.is_empty() || !constant.is_empty() {
         issues.push(format!(
             "iVAE identifiability requires auxiliary covariate variation; \
-             aux axes {zeros:?} are constant across observations (min std \
-             {min_std:.3e} <= {:.0e}); Khemakhem 2107.10098 Thm. 1 \
-             conditioning rank is zero.",
-            thr.ivae_aux_var_floor,
+             aux axes {constant:?} are constant across observations to the \
+             resolution of their own centering (min std {min_std:.3e}); \
+             Khemakhem 2107.10098 Thm. 1 conditioning rank is zero.",
         ));
         status = status.worse(TheoremStatus::Fail);
     }
 
-    let rank = match matrix_rank(aux.view(), thr.ivae_aux_rank_rtol) {
+    let rank = match matrix_rank(aux.view()) {
         Ok(r) => r,
         Err(e) => {
             return TheoremResult {
@@ -416,7 +420,7 @@ pub fn check_mechanism_sparsity(summary: &FitSummary, thr: &Thresholds) -> Theor
     };
     metric.insert("decoder_zero_fraction".to_string(), zero_fraction);
 
-    let rank = match matrix_rank(free_cols.view(), 1.0e-8) {
+    let rank = match matrix_rank(free_cols.view()) {
         Ok(r) => r,
         Err(e) => {
             return TheoremResult {
@@ -655,6 +659,18 @@ mod tests {
             ivae.metric.get("aux_min_std").copied().unwrap_or(f64::NAN),
             0.0
         );
+    }
+
+    /// A covariate measured in small units still varies: constancy is decided by
+    /// the rounding residue of the column's own centering, not by an absolute
+    /// std floor, so an aux column at 1e-12 scale is identified (#2469).
+    #[test]
+    fn small_scale_varying_aux_passes_ivae() {
+        let mut summary = passing_ivae_summary();
+        summary.aux = Some(vec![vec![1.0e-12], vec![2.0e-12], vec![3.0e-12], vec![4.0e-12]]);
+        let result = check_ivae(&summary, &Thresholds::default());
+        assert_eq!(result.status, TheoremStatus::Pass, "reason: {}", result.reason);
+        assert_eq!(result.metric.get("aux_column_rank").copied(), Some(1.0));
     }
 
     #[test]

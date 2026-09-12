@@ -12,7 +12,7 @@ itself never raises; it imports jax lazily on first use of any helper.
 
 from __future__ import annotations
 
-from typing import Any, Callable
+from typing import Any
 
 import numpy as np
 
@@ -31,7 +31,7 @@ def to_numpy_f64(value: Any) -> np.ndarray:
 
     The autograd graph is *not* preserved — callers that need a
     differentiable path must wrap the Rust call in a
-    :class:`jax.custom_vjp` (see :func:`wrap_value_grad`).
+    :class:`jax.custom_vjp`.
     """
     return _to_numpy_f64(value)
 
@@ -74,65 +74,8 @@ def stack_coords(coords: list[Any] | tuple[Any, ...]) -> Any:
     )
 
 
-def wrap_value_grad(
-    fwd_numpy: Callable[..., np.ndarray],
-    vjp_numpy: Callable[..., np.ndarray],
-    *,
-    out_shape: tuple[int, ...],
-) -> Callable[..., Any]:
-    """Build a ``jax.custom_vjp`` around a numpy forward + numpy VJP.
-
-    ``fwd_numpy(x_np)`` must return the primal output as a NumPy array of
-    shape ``out_shape`` and dtype float64. ``vjp_numpy(x_np, grad_out_np)``
-    must return ``∂L/∂x`` shaped like ``x``.
-
-    The forward dispatches through :func:`jax.pure_callback`, which is
-    transparent to ``jit`` and ``vmap`` (the callback runs once per
-    batched element when traced inside ``vmap``; for fused-batch behavior
-    use the Rust pyfunction directly outside ``vmap``).
-    """
-    jax, jnp = _jax()
-
-    out_dtype = jnp.float64
-
-    @jax.custom_vjp
-    def fwd(x: Any) -> Any:
-        spec = jax.ShapeDtypeStruct(out_shape, out_dtype)
-
-        def _host(x_arr: Any) -> np.ndarray:
-            x_np = np.asarray(x_arr, dtype=np.float64)
-            return np.ascontiguousarray(
-                np.asarray(fwd_numpy(x_np), dtype=np.float64)
-            )
-
-        return jax.pure_callback(_host, spec, x)
-
-    def fwd_fwd(x: Any) -> tuple[Any, Any]:
-        return fwd(x), x
-
-    def fwd_bwd(res: Any, grad_out: Any) -> tuple[Any]:
-        x = res
-        in_shape = x.shape
-        spec_in = jax.ShapeDtypeStruct(in_shape, out_dtype)
-
-        def _host_vjp(args: Any) -> np.ndarray:
-            x_arr, g_arr = args
-            x_np = np.asarray(x_arr, dtype=np.float64)
-            g_np = np.asarray(g_arr, dtype=np.float64)
-            return np.ascontiguousarray(
-                np.asarray(vjp_numpy(x_np, g_np), dtype=np.float64)
-            )
-
-        gx = jax.pure_callback(_host_vjp, spec_in, (x, grad_out))
-        return (gx,)
-
-    fwd.defvjp(fwd_fwd, fwd_bwd)
-    return fwd
-
-
 __all__ = [
     "to_numpy_f64",
     "from_numpy_like",
     "stack_coords",
-    "wrap_value_grad",
 ]

@@ -175,10 +175,6 @@ class _RustPenaltyDescriptor(PenaltyDescriptor):
         # supplies the real shape when the registry is materialized.
         return self._descriptor(1, 1)
 
-    def to_dict(self) -> dict[str, Any]:
-        """Plain-dict serialization (alias of ``to_rust_descriptor``)."""
-        return self.to_rust_descriptor()
-
     def hvp(self, t: Any, v: Any) -> Any:
         """Hessian-vector product ``H · v`` in the frame shared by ``t`` and ``v``.
 

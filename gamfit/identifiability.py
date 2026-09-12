@@ -62,17 +62,6 @@ __all__ = [
 # Numerical thresholds. Each one is tied to a paper citation; the rationale
 # is documented inline so reviewers can re-derive the choice. None of these
 # are exposed as CLI flags — they are constructor-overridable defaults only.
-_IVAE_AUX_VAR_FLOOR = 1.0e-9
-# Khemakhem 2107.10098 Thm. 1 requires aux to take at least ``2k + 1``
-# distinct values for k-dim latent — we use std > floor as the operational
-# proxy because the parametric prior family used here is Gaussian (T(z) = z),
-# i.e. ``k = 1`` per aux column, so the rank-1 column-variation requirement
-# reduces to "this column is not constant".
-_IVAE_AUX_RANK_RTOL = 1.0e-8
-# Khemakhem 2107.10098 §3 requires the auxiliary statistic to be of rank
-# ``>= n_supervised`` (the "sufficient parametric variation" assumption).
-# For Gaussian iVAE with the canonical sufficient statistic, "rank" of the
-# aux design matrix collapses to the column rank of ``aux`` itself.
 _IVAE_MIN_ENCODER_LAYERS = 2
 # Khemakhem 2107.10098 §3: encoder must be "non-trivially nonlinear" — a
 # bare Linear (1 affine layer) does not satisfy the universal-approximation
@@ -293,8 +282,6 @@ def _gather_fit_summary(
             int(ground_truth_dim) if ground_truth_dim is not None else None
         ),
         "thresholds": {
-            "ivae_aux_var_floor": float(thresholds["ivae_aux_var_floor"]),
-            "ivae_aux_rank_rtol": float(thresholds["ivae_aux_rank_rtol"]),
             "ivae_min_encoder_layers": int(
                 thresholds["ivae_min_encoder_layers"]
             ),
@@ -316,8 +303,6 @@ def check(
     *,
     aux: Any = None,
     ground_truth_dim: int | None = None,
-    aux_var_floor: float = _IVAE_AUX_VAR_FLOOR,
-    aux_rank_rtol: float = _IVAE_AUX_RANK_RTOL,
     min_encoder_layers: int = _IVAE_MIN_ENCODER_LAYERS,
     mech_sparsity_zero_tol: float = _MECH_SPARSITY_ZERO_TOL,
     mech_sparsity_fraction: float = _MECH_SPARSITY_FRACTION,
@@ -349,15 +334,14 @@ def check(
     ground_truth_dim : int, optional
         Ground-truth latent dim from a simulator. Enables the
         ``state_dim >= ground_truth_dim`` precondition.
-    aux_var_floor, aux_rank_rtol, min_encoder_layers,
-    mech_sparsity_zero_tol, mech_sparsity_fraction, activation_var_warn,
-    activation_var_ceiling : float / int
-        Numerical thresholds overriding the paper-cited defaults.
+    min_encoder_layers, mech_sparsity_zero_tol, mech_sparsity_fraction,
+    activation_var_warn, activation_var_ceiling : float / int
+        Thresholds overriding the paper-cited defaults. Whether an aux column
+        is constant, and the aux column rank, are decided by the resolution of
+        the arithmetic that measures them and take no threshold.
     """
 
     thresholds: dict[str, float | int] = {
-        "ivae_aux_var_floor": float(aux_var_floor),
-        "ivae_aux_rank_rtol": float(aux_rank_rtol),
         "ivae_min_encoder_layers": int(min_encoder_layers),
         "mech_sparsity_fraction": float(mech_sparsity_fraction),
         "mech_sparsity_zero_tol": float(mech_sparsity_zero_tol),

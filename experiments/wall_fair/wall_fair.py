@@ -57,11 +57,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--block-tile", type=int, default=512)
     parser.add_argument("--frame-ridge", type=float, default=1.0e-9)
     parser.add_argument("--tolerance", type=float, default=1.0e-5)
-    parser.add_argument("--min-firings", type=int, default=32)
-    parser.add_argument("--max-chart-blocks", type=int, default=256)
-    parser.add_argument("--crossfit-folds", type=int, default=2)
-    parser.add_argument("--alpha", type=float, default=0.10)
-    parser.add_argument("--whitening-ridge", type=float, default=1.0e-8)
     return parser.parse_args()
 
 
@@ -223,17 +218,7 @@ def fit_stratum(
     flat = fit_block_dictionary(xs, flat_blocks, args)
     flat_floor = energy_floor(xs, flat.fitted)
     curved = fit_block_dictionary(xs, curved_blocks, args)
-    composed = curved.compose_block_charts(
-        xs,
-        residual_target=True,
-        min_firings=int(args.min_firings),
-        max_blocks=int(args.max_chart_blocks),
-        crossfit_folds=int(args.crossfit_folds),
-        alpha=float(args.alpha),
-        min_effect=0.0,
-        whitening_ridge=float(args.whitening_ridge),
-        pair_screen=False,
-    )
+    composed = curved.compose_block_charts(xs)
     curved_recon = np.ascontiguousarray(composed["reconstructed"], dtype=np.float32)
     curved_floor = energy_floor(xs, curved_recon)
     correction = curved_recon - curved.fitted
@@ -448,12 +433,6 @@ def main() -> None:
         "block_tile": int(args.block_tile),
         "frame_ridge": float(args.frame_ridge),
         "tolerance": float(args.tolerance),
-        "min_firings": int(args.min_firings),
-        "max_chart_blocks": int(args.max_chart_blocks),
-        "crossfit_folds": int(args.crossfit_folds),
-        "alpha": float(args.alpha),
-        "whitening_ridge": float(args.whitening_ridge),
-        "pair_screen": False,
     }
     payload = {
         "experiment": "wall_fair",

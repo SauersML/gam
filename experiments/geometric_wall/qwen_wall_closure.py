@@ -55,16 +55,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--block-tile", type=int, default=512)
     parser.add_argument("--frame-ridge", type=float, default=1.0e-9)
     parser.add_argument("--tolerance", type=float, default=1.0e-5)
-    parser.add_argument("--min-firings", type=int, default=32)
-    parser.add_argument("--max-chart-blocks", type=int, default=256)
-    parser.add_argument("--crossfit-folds", type=int, default=2)
-    parser.add_argument("--alpha", type=float, default=0.10)
-    parser.add_argument("--whitening-ridge", type=float, default=1.0e-8)
-    parser.add_argument("--pair-screen", action="store_true")
-    parser.add_argument("--pair-top-blocks", type=int, default=64)
-    parser.add_argument("--max-pairs", type=int, default=128)
-    parser.add_argument("--pair-min-cofirings", type=int, default=64)
-    parser.add_argument("--pair-min-score", type=float, default=0.20)
     return parser.parse_args()
 
 
@@ -231,12 +221,6 @@ def main() -> None:
         "block_tile": int(args.block_tile),
         "frame_ridge": float(args.frame_ridge),
         "tolerance": float(args.tolerance),
-        "min_firings": int(args.min_firings),
-        "max_chart_blocks": int(args.max_chart_blocks),
-        "crossfit_folds": int(args.crossfit_folds),
-        "alpha": float(args.alpha),
-        "whitening_ridge": float(args.whitening_ridge),
-        "pair_screen": bool(args.pair_screen),
     }
     payload = {
         "experiment": "qwen_wall_closure_real_block_chart_post_pos0_peel",

@@ -18,7 +18,7 @@ its own parameter space so it has something to transplant.
 """
 from __future__ import annotations
 
-from typing import Any, Final
+from typing import Any
 
 import numpy as np
 import torch
@@ -27,21 +27,10 @@ from torch import nn
 from .._binding import rust_module
 
 
-_VALID_SWAP_MODES: Final[frozenset[str]] = frozenset({"scalar_mask"})
-
-
 def _as_f64_cpu(t: torch.Tensor) -> np.ndarray:
     # Move host first, then cast: a fused ``.to(dtype=float64, device="cpu")``
     # forces the float64 cast on the source device, which MPS cannot do.
     return np.ascontiguousarray(t.detach().cpu().to(dtype=torch.float64).numpy())
-
-
-def _as_f64_2d(t: torch.Tensor) -> np.ndarray:
-    return _as_f64_cpu(t)
-
-
-def _as_f64_1d(t: torch.Tensor) -> np.ndarray:
-    return _as_f64_cpu(t)
 
 
 def _as_bool_1d(t: torch.Tensor) -> np.ndarray:
@@ -64,10 +53,10 @@ class _InterchangeDecodeFn(torch.autograd.Function):
         bias: torch.Tensor | None,
     ) -> torch.Tensor:
         rm = rust_module()
-        z_np = _as_f64_2d(z)
-        w_np = _as_f64_2d(weights)
-        g_np = _as_f64_1d(gate)
-        b_np = None if bias is None else _as_f64_1d(bias)
+        z_np = _as_f64_cpu(z)
+        w_np = _as_f64_cpu(weights)
+        g_np = _as_f64_cpu(gate)
+        b_np = None if bias is None else _as_f64_cpu(bias)
         out_np = np.asarray(rm.interchange_decode_forward(z_np, w_np, g_np, b_np))
         ctx.save_for_backward(z, weights, gate)
         ctx.has_bias = bias is not None
@@ -85,10 +74,10 @@ class _InterchangeDecodeFn(torch.autograd.Function):
         z, weights, gate = ctx.saved_tensors
         rm = rust_module()
         grad_z_np, grad_w_np, grad_g_np, grad_b_np = rm.interchange_decode_backward(
-            _as_f64_2d(z),
-            _as_f64_2d(weights),
-            _as_f64_1d(gate),
-            _as_f64_2d(grad_out),
+            _as_f64_cpu(z),
+            _as_f64_cpu(weights),
+            _as_f64_cpu(gate),
+            _as_f64_cpu(grad_out),
             bool(ctx.has_bias),
         )
         grad_z = _from_numpy_like(np.asarray(grad_z_np), z)
@@ -118,12 +107,12 @@ class _InterchangeSwapFn(torch.autograd.Function):
         rm = rust_module()
         out_np = np.asarray(
             rm.interchange_swap_forward(
-                _as_f64_2d(z_a),
-                _as_f64_2d(z_b),
+                _as_f64_cpu(z_a),
+                _as_f64_cpu(z_b),
                 _as_bool_1d(mask),
-                _as_f64_2d(weights),
-                _as_f64_1d(gate),
-                None if bias is None else _as_f64_1d(bias),
+                _as_f64_cpu(weights),
+                _as_f64_cpu(gate),
+                None if bias is None else _as_f64_cpu(bias),
             )
         )
         ctx.save_for_backward(z_a, z_b, mask, weights, gate)
@@ -150,12 +139,12 @@ class _InterchangeSwapFn(torch.autograd.Function):
             grad_g_np,
             grad_b_np,
         ) = rm.interchange_swap_backward(
-            _as_f64_2d(z_a),
-            _as_f64_2d(z_b),
+            _as_f64_cpu(z_a),
+            _as_f64_cpu(z_b),
             _as_bool_1d(mask),
-            _as_f64_2d(weights),
-            _as_f64_1d(gate),
-            _as_f64_2d(grad_out),
+            _as_f64_cpu(weights),
+            _as_f64_cpu(gate),
+            _as_f64_cpu(grad_out),
             bool(ctx.has_bias),
         )
         grad_za = _from_numpy_like(np.asarray(grad_za_np), z_a)
@@ -197,10 +186,6 @@ class InterchangeSwapDecoder(nn.Module):
         Output (reconstruction) width.
     F:
         Latent / atom width.
-    swap_mode:
-        Only ``'scalar_mask'`` is currently supported. The argument
-        stays in the signature so richer composition rules can extend
-        later without breaking callers.
 
     Examples
     --------
@@ -219,7 +204,6 @@ class InterchangeSwapDecoder(nn.Module):
         self,
         D: int,
         F: int,
-        swap_mode: str = "scalar_mask",
         *,
         bias: bool = True,
         init_scale: float = 0.02,
@@ -235,15 +219,9 @@ class InterchangeSwapDecoder(nn.Module):
             raise ValueError("D and F must be positive")
         if init_scale <= 0.0:
             raise ValueError("init_scale must be > 0")
-        if swap_mode not in _VALID_SWAP_MODES:
-            raise ValueError(
-                f"unknown swap_mode {swap_mode!r}; "
-                f"supported: {sorted(_VALID_SWAP_MODES)}"
-            )
 
         self.D = int(D)
         self.F = int(F)
-        self.swap_mode = swap_mode
 
         self.W_dec = nn.Parameter(torch.empty(self.D, self.F, device=device, dtype=dtype))
         # Gate initialised to 1.0 so a freshly-built decoder behaves like a
@@ -312,9 +290,6 @@ class InterchangeSwapDecoder(nn.Module):
                 f"atom_mask must be 1-D of length F={self.F}, "
                 f"got shape {tuple(atom_mask.shape)}"
             )
-        if self.swap_mode != "scalar_mask":
-            # Enforced in __init__; this guards against post-construction mutation.
-            raise ValueError(f"unsupported swap_mode {self.swap_mode!r}")
         return _InterchangeSwapFn.apply(
             z_a, z_b, atom_mask, self.W_dec, self.gate, self.bias
         )

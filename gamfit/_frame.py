@@ -54,7 +54,7 @@ JAX frame::
 from __future__ import annotations
 
 from enum import Enum
-from typing import Any, Iterable
+from typing import Any
 
 
 class Frame(str, Enum):
@@ -67,9 +67,6 @@ class Frame(str, Enum):
     NUMPY = "numpy"
     TORCH = "torch"
     JAX = "jax"
-
-
-_FRAME_VALUES = frozenset(f.value for f in Frame)
 
 
 def _module_frame(obj: Any) -> Frame | None:
@@ -134,23 +131,6 @@ def detect_frame(*arrays: Any) -> Frame:
                 f"conflict: {type(arr).__name__})"
             )
     return seen if seen is not None else Frame.NUMPY
-
-
-def normalize(frame: Frame | str | None, *arrays: Any) -> Frame:
-    """Resolve an explicit ``frame`` argument or auto-detect.
-
-    An explicit ``frame=`` string / enum overrides detection. Passing
-    ``None`` triggers :func:`detect_frame`.
-    """
-    if frame is None:
-        return detect_frame(*arrays)
-    if isinstance(frame, Frame):
-        return frame
-    if not isinstance(frame, str) or frame not in _FRAME_VALUES:
-        raise ValueError(
-            f"unknown frame {frame!r}; expected one of {sorted(_FRAME_VALUES)}"
-        )
-    return Frame(frame)
 
 
 def to_numpy(value: Any) -> Any:
@@ -222,33 +202,11 @@ def import_jax() -> tuple[Any, Any]:
         ) from exc
 
 
-def assert_same_frame(*arrays: Any) -> Frame:
-    """Detect the frame and raise :class:`TypeError` on mixed-frame inputs.
-
-    Wrapper around :func:`detect_frame` with a single clear name for the
-    public consumer-facing contract: "inputs must be in the same frame".
-    """
-    return detect_frame(*arrays)
-
-
-def iter_array_likes(values: Iterable[Any]) -> list[Any]:
-    """Collect plausible array-like inputs (filtering ``None``).
-
-    Tiny helper used by primitives that accept a variadic ``*coords`` and
-    want to feed it directly to :func:`detect_frame` without re-spelling
-    the filter.
-    """
-    return [v for v in values if v is not None]
-
-
 __all__ = [
     "Frame",
     "detect_frame",
-    "normalize",
     "to_numpy",
     "from_numpy",
     "import_torch",
     "import_jax",
-    "assert_same_frame",
-    "iter_array_likes",
 ]

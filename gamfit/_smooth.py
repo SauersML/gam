@@ -51,7 +51,7 @@ class Smooth(BasisDescriptor):
     >>> import gamfit
     >>> sm = gamfit.Smooth(
     ...     latent=gamfit.Circle(),
-    ...     basis=gamfit.Fourier(harmonics=3),
+    ...     basis=gamfit.PeriodicHarmonic(harmonics=3),
     ...     penalty=gamfit.ARDPenalty(0.1),
     ... )
     >>> phi = sm.evaluate(torch.linspace(0.0, 6.28, 64))   # (64, 7)
@@ -295,8 +295,8 @@ def _penalty_to_dict(penalty: PenaltyDescriptor) -> dict[str, Any]:
             "kind": "composite",
             "parts": [_penalty_to_dict(p) for p in penalty.parts],
         }
-    if hasattr(penalty, "to_dict"):
-        return penalty.to_dict()  # type: ignore[no-any-return]
+    if hasattr(penalty, "to_rust_descriptor"):
+        return penalty.to_rust_descriptor()  # type: ignore[no-any-return]
     return {"kind": type(penalty).__name__, "repr": repr(penalty)}
 
 

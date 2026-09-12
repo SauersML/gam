@@ -1,8 +1,5 @@
 from __future__ import annotations
 
-import difflib
-import functools
-import inspect
 import json
 import math
 import re
@@ -555,28 +552,6 @@ def _group_terms_from_formula(formula: str) -> list[str]:
     return [m.group(1).strip() for m in re.finditer(r"\bgroup\s*\(\s*([^)]+?)\s*\)", formula)]
 
 
-def _normalize_groups_config(rust_config: dict[str, Any]) -> None:
-    """Translate the ``config["groups"]`` list sugar into ``group_metadata``.
-
-    ``groups`` is a list of ``{"name": ..., "metadata": ...}`` entries (one
-    per group level); the Rust core only understands the ``group_metadata``
-    dict keyed by group name, so merge here before the payload is built.
-    """
-    groups = rust_config.pop("groups", None)
-    if groups is None:
-        return
-    if not isinstance(groups, Sequence) or isinstance(groups, (str, bytes)):
-        raise TypeError("config['groups'] must be a sequence of {'name', 'metadata'} entries")
-    metadata_by_name: dict[str, Any] = dict(rust_config.get("group_metadata") or {})
-    for entry in groups:
-        if not isinstance(entry, Mapping) or "name" not in entry:
-            raise ValueError("each config['groups'] entry needs a 'name'")
-        if "metadata" in entry and entry["metadata"] is not None:
-            metadata_by_name[str(entry["name"])] = entry["metadata"]
-    if metadata_by_name:
-        rust_config["group_metadata"] = metadata_by_name
-
-
 def _resolve_precision_hyperpriors(
     value: Any | None,
     formula: str,
@@ -645,53 +620,6 @@ def _normalize_fisher_rao_w(value: Any, *, n_rows: int, dim: int) -> Any:
         )
     except Exception as exc:
         raise map_exception(exc) from exc
-
-
-_KWARG_TYPO_PATTERN = re.compile(r"unexpected keyword argument [\"']([^\"']+)[\"']")
-
-
-def _suggest_kwarg_typo(fn: Any) -> Any:
-    """Decorator: turn ``TypeError("...unexpected keyword argument 'X'...")``
-    into the same TypeError with a ``Did you mean 'Y'?`` hint appended.
-
-    Python 3.13 already adds these hints natively (PEP 657), but earlier
-    Python versions (3.10 - 3.12) raise a bare TypeError; this wrapper
-    backfills the hint uniformly so callers on any supported Python see the
-    same actionable message for case typos like ``formuLa=`` / ``Familiy=``
-    / ``Offset=`` against a long-keyword-list API (~25 kwargs). (issue #306)
-    """
-    sig = inspect.signature(fn)
-    known = frozenset(
-        name
-        for name, param in sig.parameters.items()
-        if param.kind
-        in (
-            inspect.Parameter.KEYWORD_ONLY,
-            inspect.Parameter.POSITIONAL_OR_KEYWORD,
-        )
-    )
-
-    @functools.wraps(fn)
-    def wrapper(*args: Any, **kwargs: Any) -> Any:
-        try:
-            return fn(*args, **kwargs)
-        except TypeError as exc:
-            message = str(exc)
-            if "Did you mean" in message:
-                raise
-            match = _KWARG_TYPO_PATTERN.search(message)
-            if match is None:
-                raise
-            bad = match.group(1)
-            if bad in known:
-                raise
-            suggestions = difflib.get_close_matches(bad, known, n=1, cutoff=0.6)
-            if not suggestions:
-                raise
-            enriched = TypeError(f"{message}. Did you mean {suggestions[0]!r}?")
-            raise enriched from exc.__cause__
-
-    return wrapper
 
 
 @overload
@@ -1180,7 +1108,6 @@ def fit(
         "response_reference",
     ):
         rust_config.pop(key, None)
-    _normalize_groups_config(rust_config)
     payload = _build_fit_payload(
         family=family,
         negative_binomial_theta=negative_binomial_theta,
@@ -4334,54 +4261,3 @@ def _numeric_tensor3(values: Any, label: str) -> Any:
         raise ValueError(f"{label} must contain only finite values")
     return arr
 
-
-# ---------------------------------------------------------------------------
-# Kwarg-typo "Did you mean" hint, applied once from a single registry.
-# ---------------------------------------------------------------------------
-#
-# Issue #306: ``fit()`` / ``fit_array()`` / ``validate_formula()`` expose ~25
-# keyword arguments each. Case typos like ``formuLa=`` / ``Familiy=`` /
-# ``Offset=`` produce a bare ``TypeError`` with no spelling hint on Python
-# < 3.13 (Python 3.13 adds these natively via PEP 657).
-#
-# The principled fix is *one* registry of "kwarg-validated public entry
-# points" and *one* place that wraps them. Adding a new public entry point
-# means adding its name to ``_KWARG_VALIDATED_ENTRY_POINTS`` and nothing
-# else — no per-function ``@_suggest_kwarg_typo`` decoration to remember to
-# stamp on the new definition. Removing the wrapping from a function means
-# removing the name from the registry; there is no second source of truth.
-#
-# The registry holds *names* rather than function references so resolution
-# happens against the final, post-overload, post-definition binding in
-# ``globals()``. (``fit`` has ``@overload`` stubs; the wrappable target is
-# the concrete implementation that ends up bound to the name.)
-
-_KWARG_VALIDATED_ENTRY_POINTS: tuple[str, ...] = (
-    "fit",
-    "fit_array",
-    "validate_formula",
-)
-
-
-def _install_kwarg_typo_hints() -> None:
-    """Wrap every entry point in ``_KWARG_VALIDATED_ENTRY_POINTS`` once.
-
-    Each wrapper is closed over the function's signature at install time,
-    so the known-keyword set is captured exactly once and reused on every
-    call. The wrapper is otherwise a no-op: it observes the call, catches a
-    ``TypeError`` matching the "unexpected keyword argument" shape, and
-    re-raises the same error with an appended ``. Did you mean 'Y'?`` hint.
-    """
-    module_globals = globals()
-    for name in _KWARG_VALIDATED_ENTRY_POINTS:
-        target = module_globals.get(name)
-        if target is None:
-            raise RuntimeError(
-                f"_KWARG_VALIDATED_ENTRY_POINTS lists {name!r} but no such "
-                f"function is defined in gamfit._api; remove it from the "
-                f"registry or define the function."
-            )
-        module_globals[name] = _suggest_kwarg_typo(target)
-
-
-_install_kwarg_typo_hints()

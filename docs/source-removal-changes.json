@@ -3408,5 +3408,14 @@
     ],
     "reason": "SPEC rule 1 (#2901 V2): autodiff is never used outside of tests, and the only exception for our own code is exact forward-mode AD verified to match or surpass hand-derived speed. Order2Graph is reverse-mode AD (a tape whose single reverse sweep computes node adjoints), so no exception covers it. Nothing uses it, so it is deleted rather than converted.",
     "evidence": "At the base, git grep -w for order2_graph, Order2Graph and Order2GraphWorkspace finds only the file itself, its pub mod order2_graph declaration in crates/gam-math/src/lib.rs (removed here), a sha256 manifest under bench/measurements and the generated tools/codebase-city bundle. The six #[test]s in the file exercise only the graph. The item list applies source_removal_guard.py's ITEM regex and occurrence rule to the deleted file by hand. Public and test-scoped identities are guarded outright. Every remaining private name occurs at least twice in *.rs at the base: add, sub, neg, default, constant_like, compose_unary, composed_sum and with_value occur once in the file but 8 to 5281 times tree-wide, and the rest occur 2 to 256 times in the file itself. So all 79 identities are guarded. Compile is covered by the lead's shared tip check."
+  },
+  {
+    "base": "b2681f66e00b5e71e4b034eb8db8309e977aaa21",
+    "items": [
+      "crates/gam-identifiability/src/precondition.rs:const:DEFAULT_IVAE_AUX_RANK_RTOL",
+      "crates/gam-identifiability/src/precondition.rs:const:DEFAULT_IVAE_AUX_VAR_FLOOR"
+    ],
+    "reason": "SPEC rule 25, #2899. check_ivae judged aux constancy against an absolute std floor (1e-9) and counted aux rank against a fixed SVD rtol (1e-8). Both were tunable Thresholds fields, and the gamfit.identifiability keyword arguments aux_var_floor and aux_rank_rtol exposed them. An absolute floor calls a covariate measured in small units constant (#2469). A column is now constant when its centered sum of squares lies inside the rounding band of its own centering, and the rank counts singular values above max(n, p)·ε·σ_max. Neither check takes a threshold, so the two Thresholds fields, their default consts and the two Python keyword arguments are deleted.",
+    "evidence": "git grep at b2681f66e over crates, src, tests and docs finds DEFAULT_IVAE_AUX_VAR_FLOOR and DEFAULT_IVAE_AUX_RANK_RTOL only at their definitions and in Thresholds::default, both in precondition.rs. The fields ivae_aux_var_floor and ivae_aux_rank_rtol are read in Rust only in precondition.rs. Their only other producer was the thresholds payload in gamfit/identifiability.py, which changes in the same commit. The new unit test small_scale_varying_aux_passes_ivae checks that a 1e-12-scale aux column passes. This entry was written from those greps; the landed sha gets the lead's shared tip check."
   }
 ]

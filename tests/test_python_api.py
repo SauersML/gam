@@ -278,16 +278,7 @@ def test_group_metadata_roundtrips_through_saved_model(tmp_path: pathlib.Path) -
         },
     }
 
-    model = gamfit.fit(
-        rows,
-        "y ~ group(g)",
-        config={
-            "groups": [
-                {"name": group_name, "metadata": group_metadata}
-                for group_name, group_metadata in metadata.items()
-            ]
-        },
-    )
+    model = gamfit.fit(rows, "y ~ group(g)", config={"group_metadata": metadata})
 
     path = tmp_path / "group_metadata.gam"
     model.save(path)

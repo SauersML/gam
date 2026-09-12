@@ -282,21 +282,7 @@ def fit_stratum(
     flat = fit_block_dictionary(xs, flat_blocks, args)
     flat_floor = energy_floor(xs, flat.fitted)
     curved = fit_block_dictionary(xs, curved_blocks, args)
-    composed = curved.compose_block_charts(
-        xs,
-        residual_target=True,
-        min_firings=int(args.min_firings),
-        max_blocks=int(args.max_chart_blocks),
-        crossfit_folds=int(args.crossfit_folds),
-        alpha=float(args.alpha),
-        min_effect=0.0,
-        whitening_ridge=float(args.whitening_ridge),
-        pair_screen=bool(args.pair_screen),
-        pair_top_blocks=int(args.pair_top_blocks),
-        max_pairs=int(args.max_pairs),
-        pair_min_cofirings=int(args.pair_min_cofirings),
-        pair_min_score=float(args.pair_min_score),
-    )
+    composed = curved.compose_block_charts(xs)
     curved_recon = np.ascontiguousarray(composed["reconstructed"], dtype=np.float32)
     curved_floor = energy_floor(xs, curved_recon)
     correction = curved_recon - curved.fitted

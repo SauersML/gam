@@ -1,10 +1,9 @@
 """Callable basis descriptors implementing :class:`BasisDescriptor`.
 
-The basis math lives in Rust: :class:`PeriodicHarmonic` (and its alias
-:class:`Fourier`) evaluates the trig columns via ``periodic_harmonic_basis``
-and routes ``jacobian`` through ``periodic_harmonic_basis_derivative``. The
-Python layer is glue — input coercion, autograd wrapping, and the
-``BasisDescriptor`` protocol.
+The basis math lives in Rust: :class:`PeriodicHarmonic` evaluates the trig
+columns via ``periodic_harmonic_basis`` and routes ``jacobian`` through
+``periodic_harmonic_basis_derivative``. The Python layer is glue — input
+coercion, autograd wrapping, and the ``BasisDescriptor`` protocol.
 
 Torch interop: when ``t`` is a torch tensor we wrap the Rust call in a
 :class:`torch.autograd.Function` so gradients flow back through ``t`` via
@@ -73,16 +72,10 @@ class PeriodicHarmonic(BasisDescriptor):
 
         ``[1, cos(θ), sin(θ), cos(2θ), sin(2θ), …, cos(Hθ), sin(Hθ)]``.
 
-    ``theta`` is interpreted in radians. Alias: :class:`Fourier`.
+    ``theta`` is interpreted in radians.
     """
 
-    def __init__(self, harmonics: int = 3, *, num_basis: int | None = None) -> None:
-        if num_basis is not None:
-            if int(num_basis) < 1 or int(num_basis) % 2 == 0:
-                raise ValueError(
-                    "PeriodicHarmonic.num_basis must be a positive odd integer (2H+1)"
-                )
-            harmonics = (int(num_basis) - 1) // 2
+    def __init__(self, harmonics: int = 3) -> None:
         if int(harmonics) < 0:
             raise ValueError("PeriodicHarmonic.harmonics must be >= 0")
         self.harmonics = int(harmonics)
@@ -135,8 +128,4 @@ def _maybe_import_torch() -> Any:
         return None
 
 
-# Alias requested by the protocol spec.
-Fourier = PeriodicHarmonic
-
-
-__all__ = ["PeriodicHarmonic", "Fourier"]
+__all__ = ["PeriodicHarmonic"]

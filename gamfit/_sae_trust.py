@@ -24,7 +24,7 @@ _ATOM_DIAGNOSTIC_KEYS = (
 )
 
 
-def coerce_sae_trust_diagnostics(
+def sae_trust_diagnostics(
     payload: Mapping[str, Any],
 ) -> dict[str, Any]:
     """Validate and normalize the ``payload["diagnostics"]`` trust block.
@@ -95,11 +95,6 @@ def coerce_sae_trust_diagnostics(
     }
 
 
-def sae_trust_diagnostics(payload: Mapping[str, Any]) -> dict[str, Any]:
-    """Public spelling for :func:`coerce_sae_trust_diagnostics`."""
-    return coerce_sae_trust_diagnostics(payload)
-
-
 def atom_trust_scores(diagnostics: Mapping[str, Any]) -> np.ndarray:
     """Return the validated per-atom trust score vector from diagnostics."""
     trust = np.asarray(diagnostics["atom_trust"], dtype=float)
@@ -110,6 +105,5 @@ def atom_trust_scores(diagnostics: Mapping[str, Any]) -> np.ndarray:
 
 __all__ = [
     "atom_trust_scores",
-    "coerce_sae_trust_diagnostics",
     "sae_trust_diagnostics",
 ]
