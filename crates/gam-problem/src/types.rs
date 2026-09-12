@@ -617,77 +617,11 @@ impl std::fmt::Display for SmoothTermIdx {
     }
 }
 
-/// Index into the canonical penalty list `&[CanonicalPenalty]` — equivalently,
-/// the position of a smoothing parameter in the ρ / λ vector.
-///
-/// Penalty/ρ indices are not interchangeable with `SmoothTermIdx` (a smooth
-/// term can carry multiple canonical penalties — e.g. tensor-product double
-/// penalties — and structural penalties don't correspond to any smooth term).
-/// Keeping them as separate newtypes makes the historical bug pattern
-/// "indexed `rho` with a smooth-term ordinal" impossible to express.
-#[repr(transparent)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
-pub struct PenaltyIdx(usize);
-
-impl PenaltyIdx {
-    #[inline]
-    pub const fn new(idx: usize) -> Self {
-        Self(idx)
-    }
-
-    #[inline]
-    pub const fn get(self) -> usize {
-        self.0
-    }
-}
-
-impl std::fmt::Display for PenaltyIdx {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.0)
-    }
-}
-
-/// Index into a single smooth term's set of basis functions — i.e. the `k`
-/// in "the k-th basis function `B_k(x)` of this term".
-///
-/// Distinct from:
-///   * [`SmoothTermIdx`] — selects *which* smooth term in the spec.
-///   * [`PenaltyIdx`]    — selects *which* ρ/λ entry / canonical penalty.
-///   * A design-matrix column index — which lives in the *combined* layout
-///     after intercept/parametric blocks and per-term offsets are applied;
-///     a `BasisIdx` is term-local, a column index is model-global.
-///
-/// Keeping this as its own `#[repr(transparent)]` newtype makes the
-/// historically-easy confusion "indexed a global column slice with a
-/// term-local basis ordinal" (or vice versa) a compile error.
-#[repr(transparent)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
-pub struct BasisIdx(usize);
-
-impl BasisIdx {
-    #[inline]
-    pub const fn new(idx: usize) -> Self {
-        Self(idx)
-    }
-
-    #[inline]
-    pub const fn get(self) -> usize {
-        self.0
-    }
-}
-
-impl std::fmt::Display for BasisIdx {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.0)
-    }
-}
-
 /// Index into the user-facing design matrix `data: Array2<f64>` — i.e. the
 /// position of a covariate column in the raw input frame, *before* any
 /// per-family basis expansion or intercept/parametric layout is applied.
 ///
 /// Distinct from:
-///   * [`BasisIdx`] — term-local basis-function ordinal `k` of `B_k(x)`.
 ///   * [`SmoothTermIdx`] — position in `TermCollectionSpec::smooth_terms`.
 ///   * A coefficient-vector offset `β[i]` — spans the combined design after
 ///     expansion, which is much wider than the user-facing data matrix.
@@ -711,35 +645,6 @@ impl ColIdx {
 }
 
 impl std::fmt::Display for ColIdx {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.0)
-    }
-}
-
-/// Index of an observation (row) in the user-facing data frame / design
-/// matrix — i.e. the `i` in "the i-th observation".
-///
-/// Distinct from every column-type index in this module ([`ColIdx`],
-/// [`BasisIdx`], [`SmoothTermIdx`], [`PenaltyIdx`]) and from coefficient
-/// offsets. Keeping rows behind their own `#[repr(transparent)]` newtype
-/// makes the classic `data[[col, row]]` transposition a compile error.
-#[repr(transparent)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
-pub struct RowIdx(usize);
-
-impl RowIdx {
-    #[inline]
-    pub const fn new(idx: usize) -> Self {
-        Self(idx)
-    }
-
-    #[inline]
-    pub const fn get(self) -> usize {
-        self.0
-    }
-}
-
-impl std::fmt::Display for RowIdx {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.0)
     }

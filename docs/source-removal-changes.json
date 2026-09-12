@@ -3782,5 +3782,27 @@
     ],
     "reason": "#2899 public API sweep of gam-sae (prune-api-d): a public item stays only when a product root uses it (gam-cli, gam-pyffi, gamfit, examples/, or another crate's production code). These items have no production consumer in any crate and are deleted with the test code that only exercised them. RoutingPredictor and OutputBlock::with_log_lambda have no user anywhere. CrossModelTransportReport::o2_defect was named by one assertion in its own unit test, which is dropped; the test keeps its class, winding, phase, isometry and verdict assertions. GrassmannFrame::from_orthonormal was used by one #2521 test, which now builds the same frame through the crate's production GrassmannFrame::from_oriented. The stratum-local birth screen (manifold/stratum_births.rs: StratumLocalPick, dominant_energy_fraction, effective_sample_size, min_effective_rows_for_birth, stratum_local_birth_residual and its unit tests) has no production caller, so the whole module goes, and with it its only consumer of corpus::stratify_row_energies and RowStratum.",
     "evidence": "At f32e348d2, git grep -n -w over crates, src, tests, examples, bench and gamfit finds RoutingPredictor and with_log_lambda only at their declarations. o2_defect appears only at its declaration, at the assertion in cross_model_transport.rs's recovers_cross_model_rotation_reflection, and as a JSON key string in crates/gam-sae/examples/behavioral_curvature_map.rs, which is not a call. from_orthonormal appears only in frames.rs and crates/gam-sae/src/manifold/tests.rs:1459. StratumLocalPick, dominant_energy_fraction, min_effective_rows_for_birth and stratum_local_birth_residual appear only inside stratum_births.rs, which is declared by a private `mod stratum_births;` and glob re-exported from manifold/mod.rs. stratify_row_energies and RowStratum appear only in residual_stratify.rs, the corpus/mod.rs re-export and stratum_births.rs. The prune-api-d census at 3ef484e06, which reuses the lexers of scripts/source_removal_guard.py and scripts/src_items_used_only_by_tests.py, reports zero production consumers for each item in any crate. sturges_stratum_cap and EnergyExponentHistogram::bin_of keep production callers in residual_stratify.rs (:411, :190, :259). The #2521 test passes an orthonormal 6x1 frame with gauge [1.0], for which from_orthonormal only validated its input and returned from_oriented. Not compiled locally (user directive). Compile is covered by the lead's shared tip check."
+  },
+  {
+    "base": "7cffe40862b6a1c980a675aaa98dff5f656c661a",
+    "items": [
+      "crates/gam-problem/src/diagnostics.rs:fn:default",
+      "crates/gam-problem/src/diagnostics.rs:fn:fmt",
+      "crates/gam-problem/src/diagnostics.rs:fn:new",
+      "crates/gam-problem/src/diagnostics.rs:fn:summary",
+      "crates/gam-problem/src/diagnostics.rs:struct:DiagnosticConfig",
+      "crates/gam-problem/src/diagnostics.rs:struct:DualRidgeResult",
+      "crates/gam-problem/src/diagnostics.rs:struct:EnvelopeAudit",
+      "crates/gam-problem/src/diagnostics.rs:struct:GradientDiagnosticReport",
+      "crates/gam-problem/src/diagnostics.rs:struct:SpectralBleedResult",
+      "crates/gam-problem/src/types.rs:fn:fmt",
+      "crates/gam-problem/src/types.rs:fn:get",
+      "crates/gam-problem/src/types.rs:fn:new",
+      "crates/gam-problem/src/types.rs:struct:BasisIdx",
+      "crates/gam-problem/src/types.rs:struct:PenaltyIdx",
+      "crates/gam-problem/src/types.rs:struct:RowIdx"
+    ],
+    "reason": "prune-api-b product-use sweep (#2899). gam-problem diagnostics.rs declared five gradient-diagnostic report carriers (DiagnosticConfig, EnvelopeAudit, SpectralBleedResult, DualRidgeResult, GradientDiagnosticReport) whose producers, the KKT audit, spectral-bleed trace and dual-ridge check, no longer exist; nothing constructs or reads them, so they are deleted with the Default impl, three Display impls and GradientDiagnosticReport::new/summary. types.rs declared the index newtypes PenaltyIdx, BasisIdx and RowIdx, which no code uses; they are deleted with their new/get/Display. The diagnostics.rs module doc now lists what the module holds, and the ColIdx doc drops its BasisIdx link.",
+    "evidence": "At the base, git grep -w over crates, src, tests, examples, bench, gamfit, experiments, tools and scripts finds DiagnosticConfig (2), EnvelopeAudit (3), SpectralBleedResult (3), DualRidgeResult (3) and GradientDiagnosticReport (2) only in diagnostics.rs, and PenaltyIdx (5), BasisIdx (6) and RowIdx (3) only in types.rs, every hit inside the deleted declarations, impls and rustdoc lines; no test names any of them and docs/ does not mention them. The item list is the refusal of scripts/source_removal_guard.py over a probe commit carrying the same code removals on base 0077b5773, run on MSI acn112 with python3.12 over lane sw0c objects (/scratch.global/sauer354/pool/prune-api-b/sliceA.guard.out). fn:default and fn:fmt are the trait-impl methods of the deleted types; types.rs keeps its other new/get/fmt declarations. The prune-api-b census at 11a52ed5f (comments and literals stripped, test scope excluded) classifies all eight types DELETE with no production or test reference."
   }
 ]

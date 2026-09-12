@@ -1439,5 +1439,16 @@
     },
     "reason": "#2899 public API sweep of gam-sae (prune-api-d): public functions with no product user are deleted. They are OutputBlock::with_log_lambda, CrossModelTransportReport::o2_defect and GrassmannFrame::from_orthonormal, plus the stratum-local birth screen manifold/stratum_births.rs with corpus::stratify_row_energies, whose only consumer was that screen.",
     "evidence": "At f32e348d2, git grep -n -w over crates, src, tests, examples, bench and gamfit finds no production caller of any removed function in any crate. with_log_lambda has no caller at all. o2_defect is called only by one unit-test assertion, which is dropped. from_orthonormal is called only by crates/gam-sae/src/manifold/tests.rs:1459, which now calls from_oriented. dominant_energy_fraction, min_effective_rows_for_birth and stratum_local_birth_residual are called only inside stratum_births.rs. stratify_row_energies is called only by stratum_births.rs. The removed map is public_api_census.py's census difference over this change, computed on MSI."
+  },
+  {
+    "base": "7cffe40862b6a1c980a675aaa98dff5f656c661a",
+    "removed": {
+      "crates/gam-problem/src/diagnostics.rs::new": 1,
+      "crates/gam-problem/src/diagnostics.rs::summary": 1,
+      "crates/gam-problem/src/types.rs::get": 3,
+      "crates/gam-problem/src/types.rs::new": 3
+    },
+    "reason": "prune-api-b product-use sweep (#2899). The public functions GradientDiagnosticReport::new and ::summary and the new/get pairs of the unused PenaltyIdx, BasisIdx and RowIdx newtypes are removed together with their types, which no product, test or benchmark uses.",
+    "evidence": "scripts/public_api_census.py over a probe commit carrying the same code removals on base 0077b5773, run on MSI acn112 with python3.12 (/scratch.global/sauer354/pool/prune-api-b/sliceA.census.out), reports exactly diagnostics.rs::new 1, diagnostics.rs::summary 1, types.rs::get 3 and types.rs::new 3. At the base git grep -w finds GradientDiagnosticReport, PenaltyIdx, BasisIdx and RowIdx only inside the deleted spans of their own files."
   }
 ]

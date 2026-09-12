@@ -1,22 +1,14 @@
-//! Analytic diagnostic helpers for LAML/REML optimization.
+//! Analytic diagnostic helpers for LAML/REML optimization and prediction.
 //!
 //! Production diagnostics inspect analytic invariants only. Runtime fitting,
 //! prediction, and diagnostic APIs must consume quantities the optimizer
-//! already computes. This module implements diagnostic strategies that identify
-//! root causes of gradient pathologies from those analytic quantities:
-//!
-//! 1. KKT Audit (Envelope Theorem Check): Detects violations of the stationarity
-//!    assumption used in implicit differentiation.
-//!
-//! 2. Spectral Bleed Trace: Detects when truncated eigenspace corrections are
-//!    inconsistent with the penalty's energy in that subspace.
-//!
-//! 3. Dual-Ridge Consistency Check: Verifies that the ridge used by the inner
-//!    solver (PIRLS) matches what the outer gradient calculation assumes.
+//! already computes. This module holds the rate-limited Hessian eigenvalue
+//! message, the coefficient formatter shared by the outer optimizer and the
+//! custom-family fitter, predictive accuracy and calibration metrics, and the
+//! classification of a custom-family KKT certificate refusal.
 
 use ndarray::Array1;
 use std::collections::BTreeMap;
-use std::fmt;
 use std::sync::atomic::{AtomicI32, Ordering};
 
 // =============================================================================
@@ -62,97 +54,6 @@ pub fn should_emit_h_min_eig_diag(min_eig: f64) -> bool {
     }
     let bucket = min_eig.log10().floor() as i32;
     H_MIN_EIG_LOG_BUCKET.swap(bucket, Ordering::Relaxed) != bucket
-}
-
-// =============================================================================
-// Formatting Utilities for Diagnostic Output
-// =============================================================================
-
-/// Configuration for gradient diagnostics
-#[derive(Clone, Debug)]
-pub struct DiagnosticConfig {
-    /// Tolerance for KKT residual norm (envelope theorem violation)
-    pub kkt_tolerance: f64,
-    /// Relative error threshold for flagging issues
-    pub rel_error_threshold: f64,
-    /// Whether to emit warnings to stderr
-    pub emitwarnings: bool,
-}
-
-impl Default for DiagnosticConfig {
-    fn default() -> Self {
-        Self {
-            kkt_tolerance: 1e-4,
-            rel_error_threshold: 0.1,
-            emitwarnings: true,
-        }
-    }
-}
-
-/// Result of envelope theorem (KKT) audit
-#[derive(Clone, Debug)]
-pub struct EnvelopeAudit {
-    /// Norm of the inner KKT residual ∇_β L(β*, ρ)
-    pub kkt_residual_norm: f64,
-    /// Ridge used by the inner solver
-    pub innerridge: f64,
-    /// Ridge assumed by the outer gradient calculation
-    pub outerridge: f64,
-    /// Whether the envelope theorem is violated
-    pub isviolated: bool,
-    /// Human-readable diagnostic message
-    pub message: String,
-}
-
-impl fmt::Display for EnvelopeAudit {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.message)
-    }
-}
-
-/// Result of spectral bleed trace diagnostic
-#[derive(Clone, Debug)]
-pub struct SpectralBleedResult {
-    pub penalty_k: usize,
-    /// Energy of penalty S_k in the truncated subspace: trace(U_⊥' S_k U_⊥)
-    pub truncated_energy: f64,
-    /// Correction term actually applied in the gradient
-    pub applied_correction: f64,
-    /// Whether there's a spectral bleed issue
-    pub has_bleed: bool,
-    /// Human-readable diagnostic message
-    pub message: String,
-}
-
-impl fmt::Display for SpectralBleedResult {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.message)
-    }
-}
-
-/// Result of dual-ridge consistency check
-#[derive(Clone, Debug)]
-pub struct DualRidgeResult {
-    /// Ridge used during P-IRLS optimization
-    pub pirlsridge: f64,
-    /// Ridge used in LAML cost function
-    pub costridge: f64,
-    /// Ridge used in gradient calculation
-    pub gradientridge: f64,
-    /// Effective ridge impact: ||ridge * β||
-    pub ridge_impact: f64,
-    /// Phantom penalty contribution: 0.5 * ridge * ||β||²
-    pub phantom_penalty: f64,
-    /// Whether there's a ridge mismatch
-    pub has_mismatch: bool,
-    /// Human-readable diagnostic message
-    pub message: String,
-}
-
-impl fmt::Display for DualRidgeResult {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.message)
-    }
 }
 
 /// Residual diagnostics for observed values and predicted means.
@@ -685,53 +586,6 @@ pub fn diagnostics_from_predictions(
         r_squared,
         residuals,
     })
-}
-
-/// Complete diagnostic report for a gradient evaluation
-#[derive(Clone, Debug, Default)]
-pub struct GradientDiagnosticReport {
-    /// Envelope theorem audit results
-    pub envelopeaudit: Option<EnvelopeAudit>,
-    /// Spectral bleed results for each penalty
-    pub spectral_bleed: Vec<SpectralBleedResult>,
-    /// Dual-ridge consistency result
-    pub dualridge: Option<DualRidgeResult>,
-}
-
-impl GradientDiagnosticReport {
-    /// Create an empty report
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Generate a summary string of all issues found
-    pub fn summary(&self) -> String {
-        let mut lines = Vec::new();
-
-        if let Some(ref audit) = self.envelopeaudit
-            && audit.isviolated
-        {
-            lines.push(format!("[DIAG] {}", audit));
-        }
-
-        for bleed in &self.spectral_bleed {
-            if bleed.has_bleed {
-                lines.push(format!("[DIAG] {}", bleed));
-            }
-        }
-
-        if let Some(ref ridge) = self.dualridge
-            && ridge.has_mismatch
-        {
-            lines.push(format!("[DIAG] {}", ridge));
-        }
-
-        if lines.is_empty() {
-            "No gradient diagnostic issues detected.".to_string()
-        } else {
-            lines.join("\n")
-        }
-    }
 }
 
 /// Three-way classification of why the cert refused, computed from the
