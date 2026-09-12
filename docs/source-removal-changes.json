@@ -1332,5 +1332,15 @@
     ],
     "reason": "user directive: delete all useless slop (only used by tests / unused)",
     "evidence": "At 93c197c95, git grep -nw over crates, src, tests, examples, bench and benches found no caller of any item: each is named only by its own definition, its own error strings, doc links or prose (one integration-test module doc and two manifold/construction.rs comments). The cascade items were reachable only through deleted ones: atom_transport_ladder_reports, fit_atom_transport_ladder_report, canonical_coords_for_transport, ATOM_TRANSPORT_LADDER_PARALLEL_MIN and AtomTransportLadderInput only through dictionary_report_with_transport_ladders, and FrameInnerRotationGauge::from_ranks with frame_inner_rotation_dim only through with_frame_inner_rotation. DictionaryReport.transport_ladders and AtomTransportLadderReport stay, because the report field names them. No test called any item. MSI verification (ban scanner, workspace --all-targets check, cargo doc -p gam-sae, guard and census) runs on the landed sha."
+  },
+  {
+    "base": "95168f48809405a5799bb90089ebe6a988c5379c",
+    "items": [
+      "crates/gam-solve/src/arrow_schur/factorization.rs:fn:analytic_penalty_row_hessian_fingerprint",
+      "crates/gam-solve/src/arrow_schur/factorization.rs:fn:cross_row_penalty_fingerprint",
+      "crates/gam-solve/src/arrow_schur/system.rs:fn:analytic_penalty_is_row_block_diagonal"
+    ],
+    "reason": "user directive: delete all useless slop",
+    "evidence": "At e3b50feaf, git grep -nw names analytic_penalty_row_hessian_fingerprint and cross_row_penalty_fingerprint only at their own definitions: each had one caller, inside add_analytic_penalty_contributions, which e3b50feaf removed. analytic_penalty_is_row_block_diagonal was called only from analytic_penalty_row_hessian_fingerprint. All three are pub(crate), so they are dead code under the workspace deny-warnings build. MSI compile, doc, guard and census verification run on the landed sha."
   }
 ]

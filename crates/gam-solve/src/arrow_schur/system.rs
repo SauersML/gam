@@ -1852,10 +1852,6 @@ pub(crate) fn apply_analytic_penalty<S, G, D, P, H>(
     }
 }
 
-pub(crate) fn analytic_penalty_is_row_block_diagonal(penalty: &AnalyticPenaltyKind) -> bool {
-    penalty.is_row_block_diagonal()
-}
-
 /// Per-row + Schur Cholesky factor cache produced by
 /// [`solve_arrow_newton_step_with_options`]. Consumed downstream by the IFT warm-start
 /// predictor in `crate::persistent_warm_start`: when the outer
