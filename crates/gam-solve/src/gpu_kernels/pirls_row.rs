@@ -1578,7 +1578,11 @@ __device__ __forceinline__ double logistic(double x) {
 }
 
 __device__ __forceinline__ double bernoulli_kl_from_logits(double a, double b) {
+    if (isnan(a) || isnan(b)) return NAN;
     if (a == b) return 0.0;
+    if (a == -INFINITY) return softplus(b);
+    if (a == INFINITY) return softplus(-b);
+    if (isinf(b)) return INFINITY;
     double h = b - a;
     if (fabs(h) <= 0.5) {
         double p = a <= 0.0 ? logistic(a) : logistic(-a);
@@ -1587,12 +1591,13 @@ __device__ __forceinline__ double bernoulli_kl_from_logits(double a, double b) {
         double x = p * em1;
         return log1p_minus_x(x) + p * expm1_minus_x(local_h);
     }
-    if (a <= 0.0) {
-        double p = logistic(a);
-        return p * (a - b) + softplus(b) - softplus(a);
-    }
-    double q = logistic(-a);
-    return q * (b - a) + softplus(-b) - softplus(-a);
+    double reference = a <= 0.0 ? a : -a;
+    double target = a <= 0.0 ? b : -b;
+    double half_exp = exp(0.5 * reference);
+    double weighted_reference = (reference * half_exp) * half_exp;
+    double weighted_target = (target * half_exp) * half_exp;
+    return (weighted_reference - weighted_target) / (1.0 + half_exp * half_exp)
+        + softplus(target) - softplus(reference);
 }
 
 __device__ __forceinline__ double bd0(double x, double m) {
@@ -1603,7 +1608,7 @@ __device__ __forceinline__ double bd0(double x, double m) {
     if (fabs(x - m) / hi < 0.2) {
         double v = ((x - m) / hi) / (1.0 + lo / hi);
         double sum = (x - m) * v;
-        double term = 2.0 * x * v;
+        double term = 2.0 * (x * v);
         double v2 = v * v;
         double denominator = 3.0;
         for (;;) {
