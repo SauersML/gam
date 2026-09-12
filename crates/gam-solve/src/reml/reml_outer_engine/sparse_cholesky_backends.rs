@@ -1704,8 +1704,12 @@ pub fn penalty_matrix_root(s: &Array2<f64>) -> Result<Array2<f64>, String> {
         .eigh(Side::Lower)
         .map_err(|e| format!("penalty_matrix_root eigendecomposition failed: {e}"))?;
 
+    // The eigensolve's own rounding band `n·ε·λmax`, with no absolute floor:
+    // `cS` has the rank of `S` for every `c > 0`, and a penalty whose largest
+    // eigenvalue sits below a fixed floor keeps its range instead of losing
+    // every row (#2469). `n ≥ 1` here because `n == 0` returned above.
     let max_ev = eigenvalues.iter().copied().fold(0.0_f64, f64::max);
-    let tol = (n.max(1) as f64) * f64::EPSILON * max_ev.max(1e-12);
+    let tol = (n as f64) * f64::EPSILON * max_ev;
 
     let active: Vec<usize> = eigenvalues
         .iter()
