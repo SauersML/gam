@@ -94,13 +94,18 @@ pub(crate) struct SparsePenaltyPattern {
 }
 
 impl SparsePenaltyPattern {
-    pub(crate) fn from_dense_upper(matrix: &Array2<f64>, tol: f64) -> Self {
+    /// Every nonzero upper-triangle entry of the penalty. The triplets are both
+    /// the symbolic structure and the values `assemble_upper` adds into `H`, so
+    /// an entry is dropped only when it is exactly zero: a small entry is still a
+    /// penalty contribution the assembled Hessian has to carry, and a non-finite
+    /// one reaches the factorization instead of vanishing.
+    pub(crate) fn from_dense_upper(matrix: &Array2<f64>) -> Self {
         let p = matrix.nrows().min(matrix.ncols());
         let mut upper_triplets = Vec::new();
         for col in 0..p {
             for row in 0..=col {
                 let value = matrix[[row, col]];
-                if value.abs() > tol {
+                if value != 0.0 {
                     upper_triplets.push((row, col, value));
                 }
             }
@@ -403,4 +408,25 @@ pub fn assemble_and_factor_sparse_penalized_system(
         factor,
         logdet_h,
     })
+}
+
+#[cfg(test)]
+mod penalty_pattern_tests {
+    use super::*;
+    use ndarray::array;
+
+    /// A penalty entry is part of the assembled Hessian however small it is, so
+    /// the pattern keeps every nonzero upper-triangle entry and only exact zeros
+    /// are absent. The former `|v| > 1e-12` cut dropped a small-λ penalty's
+    /// entries from `H` outright (#2469).
+    #[test]
+    fn pattern_keeps_every_nonzero_penalty_entry() {
+        let penalty = array![[2.0, 1.0e-13, 0.0], [1.0e-13, 1.0e-14, 0.0], [0.0, 0.0, 0.0]];
+        let pattern = SparsePenaltyPattern::from_dense_upper(&penalty);
+        assert_eq!(
+            pattern.upper_triplets,
+            vec![(0, 0, 2.0), (0, 1, 1.0e-13), (1, 1, 1.0e-14)]
+        );
+        assert_eq!(pattern.nnz_upper, 3);
+    }
 }

@@ -125,7 +125,7 @@ impl PirlsWorkspace {
         x: &SparseColMat<usize, f64>,
         s_lambda: &Array2<f64>,
     ) -> Result<(), EstimationError> {
-        let penalty_pattern = SparsePenaltyPattern::from_dense_upper(s_lambda, 1e-12);
+        let penalty_pattern = SparsePenaltyPattern::from_dense_upper(s_lambda);
         let rebuild = match self.sparse_penalized_system_cache.as_ref() {
             Some(cache) => !cache.matches(x, &penalty_pattern),
             None => true,
