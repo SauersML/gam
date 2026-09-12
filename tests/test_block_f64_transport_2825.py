@@ -52,7 +52,7 @@ def test_stream_certificate_preserves_corpus_provenance_when_routing_a_sample_28
     rows = _rows()
     stream = gamfit.BlockSparseDictStream(
         rows, 1, block_size=2, block_topk=1, max_epochs=16,
-        minibatch=2, block_tile=1, frame_ridge=0.0, aux_k=0, tolerance=1e-10)
+        minibatch=2, block_tile=1, aux_k=0, tolerance=1e-10)
     terminal = None
     for _ in range(16):
         stream.partial_fit(rows[:2])

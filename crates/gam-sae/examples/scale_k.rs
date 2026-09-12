@@ -25,7 +25,6 @@ struct Args {
     minibatch: usize,
     block_tile: usize,
     pc_iters: usize,
-    frame_ridge: f64,
     tolerance: f64,
     aux_k: usize,
     raw_ok: bool,
@@ -143,7 +142,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     cfg.max_epochs = args.epochs;
     cfg.minibatch = args.minibatch;
     cfg.block_tile = args.block_tile;
-    cfg.frame_ridge = args.frame_ridge;
     cfg.tolerance = args.tolerance;
     cfg.aux_k = args.aux_k;
 
@@ -221,7 +219,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "cg_rate_bound_base": cg_rate_bound_base,
                 "cg_relative_residual": solve.cg_relative_residual,
                 "cg_residual_stop": solve.cg_residual_stop,
-                "stopping_rule": "relative normal-equation residual <= frame_ridge rank-charge floor",
+                "stopping_rule": "EV, gamma and frame residuals <= tolerance with no pending birth or frame trial",
                 "minibatch_admission": "refresh atom k only when n_k >= (z_alpha*sigma/(a_bar_k*margin_k))^2; otherwise accumulate",
             },
             "shards": shard_reports.len(),
@@ -418,7 +416,6 @@ fn parse_args() -> Result<Args, String> {
         minibatch: 128,
         block_tile: 1024,
         pc_iters: 3,
-        frame_ridge: 1.0e-9, // reporting-only: demo default frame ridge for the scaling example.
         tolerance: 1.0e-5,   // reporting-only: demo default convergence tolerance.
         aux_k: 0,
         raw_ok: false,
@@ -456,7 +453,6 @@ fn parse_args() -> Result<Args, String> {
             "--minibatch" => args.minibatch = parse_usize(value, key)?,
             "--block-tile" => args.block_tile = parse_usize(value, key)?,
             "--pc-iters" => args.pc_iters = parse_usize(value, key)?,
-            "--frame-ridge" => args.frame_ridge = parse_f64(value, key)?,
             "--tolerance" => args.tolerance = parse_f64(value, key)?,
             "--aux-k" => args.aux_k = parse_usize(value, key)?,
             "--n-peeled" => args.n_peeled = parse_usize(value, key)?,

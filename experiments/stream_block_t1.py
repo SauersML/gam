@@ -118,7 +118,6 @@ def stream_block_t1(args: argparse.Namespace) -> dict:
         max_epochs=args.max_epochs,
         minibatch=args.minibatch,
         block_tile=args.block_tile,
-        frame_ridge=args.frame_ridge,
         aux_k=args.aux_k,
         tolerance=args.tolerance,
     )
@@ -180,7 +179,6 @@ def build_parser() -> argparse.ArgumentParser:
     blk.add_argument("--batch", type=int, default=65536, help="rows per streamed shard/batch")
     blk.add_argument("--minibatch", type=int, default=512)
     blk.add_argument("--block-tile", type=int, default=1024)
-    blk.add_argument("--frame-ridge", type=float, default=1.0e-9)
     blk.add_argument("--tolerance", type=float, default=1.0e-6)
     blk.add_argument("--n-basis-chart", type=int, default=4)
 

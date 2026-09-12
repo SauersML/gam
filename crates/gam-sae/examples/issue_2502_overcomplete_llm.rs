@@ -294,7 +294,6 @@ struct Args {
     minibatch: usize,
     block_tile: usize,
     tolerance: f64,
-    frame_ridge: f64,
     aux_k: usize,
     rows: usize,
     eval_rows: usize,
@@ -396,7 +395,6 @@ fn parse_args() -> Result<Args, String> {
         minibatch: 8192,
         block_tile: 1024,
         tolerance: 1.0e-4,
-        frame_ridge: 1.0e-9,
         aux_k: 0,
         rows: usize::MAX,
         eval_rows: usize::MAX,
@@ -445,9 +443,6 @@ fn parse_args() -> Result<Args, String> {
             }
             "--tolerance" => {
                 a.tolerance = value.parse().map_err(|e| format!("--tolerance: {e}"))?
-            }
-            "--frame-ridge" => {
-                a.frame_ridge = value.parse().map_err(|e| format!("--frame-ridge: {e}"))?
             }
             "--aux-k" => a.aux_k = value.parse().map_err(|e| format!("--aux-k: {e}"))?,
             "--rows" => a.rows = value.parse().map_err(|e| format!("--rows: {e}"))?,
@@ -584,7 +579,6 @@ fn main() -> Result<(), String> {
     cfg.minibatch = args.minibatch;
     cfg.block_tile = args.block_tile;
     cfg.tolerance = args.tolerance;
-    cfg.frame_ridge = args.frame_ridge;
     cfg.aux_k = args.aux_k;
 
     let reload = !args.load_decoder.as_os_str().is_empty();

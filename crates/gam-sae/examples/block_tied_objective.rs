@@ -21,9 +21,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut config = BlockSparseConfig::new(2, 1);
     config.block_topk = 2;
     config.minibatch = x.nrows();
-    config.frame_ridge = 0.0;
     config.aux_k = 0;
     let mut state = BlockSparseStreamState::new_with_decoder(decoder.clone(), &config)?;
+    // The frame step searches along a direction a pass has measured, so the first
+    // pass only measures and the proposal forms on the second.
+    state.partial_fit(x.view())?;
+    state.end_epoch()?;
     state.partial_fit(x.view())?;
     let first = state.end_epoch()?;
     let proposal = state.decoder().mapv(f64::from);

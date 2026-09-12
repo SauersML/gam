@@ -6786,7 +6786,6 @@ impl BlockSparseDictStream {
         max_epochs = 30,
         minibatch = 512,
         block_tile = 1024,
-        frame_ridge = 1.0e-9,
         aux_k = 0,
         tolerance = 1.0e-6
     ))]
@@ -6799,11 +6798,11 @@ impl BlockSparseDictStream {
         max_epochs: usize,
         minibatch: usize,
         block_tile: usize,
-        frame_ridge: f64,
         aux_k: usize,
         tolerance: f64,
     ) -> PyResult<Self> {
         let seed_values = seed.as_array().to_owned();
+        // The streaming lane reads no frame ridge; that field keeps its default.
         let config = BlockSparseConfig {
             n_blocks,
             block_size,
@@ -6811,10 +6810,10 @@ impl BlockSparseDictStream {
             max_epochs,
             minibatch,
             block_tile,
-            frame_ridge,
             aux_k,
             matryoshka_prefix: false,
             tolerance,
+            ..BlockSparseConfig::default()
         };
         let inner = py
             .detach(|| BlockSparseStreamState::new(seed_values.view(), &config))
