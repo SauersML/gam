@@ -1680,73 +1680,31 @@ impl ParameterBlockUpdater for ExactNewtonBlockUpdater<'_> {
             // right-hand side; without it the step is distorted, which can trap
             // exact-Newton block updates on nonconvex blocks such as survival
             // `log_sigma`.
-            let delta = if use_exact_newton_strict_spd(ctx.family) {
-                // Strict-mode Newton step uses the LM δ-ridge continuation:
-                // a single near-zero eigenvalue from numerical noise in
-                // H_β should not bounce the entire seed evaluation. The
-                // bare strict_solve_spd contract is preserved (still used
-                // by other paths and the existing test
-                // `pseudo_laplace_path_skips_eigendecomposition_avoiding_nan_crash`);
-                // here we pay an O(p³) extra Cholesky attempt when needed
-                // to keep adaptive optimization moving.
-                let (step, lm_stats) =
-                    strict_solve_spd_with_lm_continuation(&lhs_dense, &rhs_step)?;
-                if lm_stats.escalations > 0 {
-                    log::debug!(
-                        "[strict-spd-lm] block={} ({}): δ-ridge continuation succeeded \
-                         after {} escalation(s) at δ={:.3e}",
-                        ctx.block_idx,
-                        ctx.spec.name,
-                        lm_stats.escalations,
-                        lm_stats.delta_used,
-                    );
-                }
-                step
-            } else {
-                // Non-strict (RidgedQuadraticReml) families share the strict
-                // path's LM δ-ridge continuation. For a nonconvex block whose
-                // likelihood Hessian H_β is INDEFINITE away from the optimum —
-                // e.g. the squared-coefficient SCOP transformation-normal tensor
-                // over a smooth covariate, where the I(y)⊗b(x) columns are
-                // strongly collinear — the previous `solve_spd_systemwith_policy`
-                // (ridge-retry + pinv-positive-part) returns a valid but
-                // poorly-scaled descent step that crawls and hits the inner
-                // cycle cap. The eigenvalue-floored LM continuation produces a
-                // well-scaled Newton step on exactly those indefinite /
-                // ill-conditioned systems. It is a STRICT SUPERSET of the plain
-                // solve: when H_β + S is SPD and well-conditioned it reduces to
-                // the same Cholesky step (zero escalations), only escalating the
-                // floor when the system is genuinely indefinite — so
-                // well-behaved families see no behaviour change. Internal to the
-                // solve; β is recovered in the raw basis, so dimensionality /
-                // identifiability are untouched.
-                let step = match strict_solve_spd_with_lm_continuation(&lhs_dense, &rhs_step) {
-                    Ok((step, lm_stats)) => {
-                        if lm_stats.escalations > 0 {
-                            log::debug!(
-                                "[joint-Newton/lm] block={} ({}): non-strict δ-ridge continuation \
-                                 succeeded after {} escalation(s) at δ={:.3e}",
-                                ctx.block_idx,
-                                ctx.spec.name,
-                                lm_stats.escalations,
-                                lm_stats.delta_used,
-                            );
-                        }
-                        step
-                    }
-                    // Final guard: only if the LM continuation itself fails to
-                    // produce a finite step do we fall back to the diagonal-
-                    // scaled steepest-descent direction (always finite when the
-                    // gradient is finite).
-                    Err(_) => (0..lhs_dense.nrows())
-                        .map(|i| {
-                            let d = lhs_dense[[i, i]].abs().max(1e-8);
-                            rhs_step[i] / d
-                        })
-                        .collect(),
-                };
-                step
-            };
+            // Every family takes the Newton step through the LM δ-ridge
+            // continuation. A near-zero eigenvalue from numerical noise in H_β
+            // must not bounce the seed evaluation, and for a nonconvex block
+            // whose likelihood Hessian is indefinite away from the optimum (the
+            // squared-coefficient SCOP transformation-normal tensor over a
+            // smooth covariate, whose I(y)⊗b(x) columns are strongly collinear)
+            // the continuation gives a well-scaled Newton step where a
+            // ridge-retry solve crawls to the inner cycle cap. On an SPD,
+            // well-conditioned H_β + S it is the plain Cholesky step with zero
+            // escalations. It ends in the Moore–Penrose solve on the resolved
+            // positive eigenspace, so it fails only when that eigendecomposition
+            // fails on a non-finite system; the failure is returned, not traded
+            // for a diagonally scaled steepest-descent step. β is recovered in
+            // the raw basis, so dimensionality and identifiability are untouched.
+            let (delta, lm_stats) = strict_solve_spd_with_lm_continuation(&lhs_dense, &rhs_step)?;
+            if lm_stats.escalations > 0 {
+                log::debug!(
+                    "[block-newton/lm] block={} ({}): δ-ridge continuation succeeded \
+                     after {} escalation(s) at δ={:.3e}",
+                    ctx.block_idx,
+                    ctx.spec.name,
+                    lm_stats.escalations,
+                    lm_stats.delta_used,
+                );
+            }
             let beta = &ctx.states[ctx.block_idx].beta + &delta;
             Ok(BlockUpdateResult {
                 beta_new_raw: beta,
