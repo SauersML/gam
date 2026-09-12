@@ -28,8 +28,13 @@
 //!
 //! BASELINE TO MATCH-OR-BEAT: an independent R reference forms the SAME marginal
 //! likelihood by 128-node Gauss-Hermite quadrature of `E[g(U)]` under
-//! `N(0,sigma^2)` (`statmod::gauss.quad.prob`) and maximizes it over `sigma` with
-//! `optimize`, yielding `sigma_hat_r`. Both engines see byte-identical
+//! `N(0,sigma^2)` (`statmod::gauss.quad.prob`) and maximizes it over `log sigma`
+//! by unbounded `nlm` with its analytic gradient and Hessian, yielding
+//! `sigma_hat_r`. The search has no box, so the test asserts the reference
+//! optimum is interior: `nlm` reports a probable solution, the observed
+//! information is positive, and the Newton step still available from R's point
+//! moves `sigma` by less than the additive tolerance of the comparison below.
+//! Both engines see byte-identical
 //! `(M, h_0, event)` data. We additionally assert gam's recovery error is no
 //! worse than R's, `|sigma_hat_gam - sigma_true| <= |sigma_hat_r - sigma_true|
 //! * 1.10 + 1e-3` — gam matches or beats the mature quadrature on ACCURACY of
@@ -190,6 +195,10 @@ fn lognormal_hazard_multiplier_kernel_recovers_frailty_variance() {
     const SIGMA_TRUE: f64 = 0.5;
     const BASELINE_SLOPE: f64 = 0.1; // H_0(t) = 0.1 * t  =>  h_0(t) = 0.1
     const TAU: f64 = 8.0; // administrative censoring horizon
+    // Additive tolerance, in sigma, for the residual quadrature/optimizer
+    // disagreement between gam and the R reference near their shared optimum.
+    // The reference optimum's own remaining Newton step must also lie within it.
+    const REFERENCE_AGREEMENT_TOLERANCE: f64 = 1e-3;
 
     let mut rng = SplitMix64::new(42);
     let mut events = Vec::with_capacity(N_TOTAL);
@@ -277,9 +286,12 @@ fn lognormal_hazard_multiplier_kernel_recovers_frailty_variance() {
     // For each row, integrate the conditional row likelihood over U~N(0,sigma^2):
     //   censored: L = E[exp(-M*exp(U))]
     //   event   : L = h_0 * E[exp(U) * exp(-M*exp(U))]
-    // statmod::gauss.quad.prob(dist="normal") supplies the (node,weight) rule for
-    // E[g(U)] under N(0,sigma); 128 nodes drives the quadrature error to ~1e-13.
-    // `optimize` then maximizes the total log-likelihood over sigma.
+    // statmod::gauss.quad.prob(dist="normal") supplies the standard-normal
+    // (node, weight) rule; U = sigma * node, so one rule serves every sigma, and 128
+    // nodes drives the quadrature error to ~1e-13. `nlm` then minimizes the negative
+    // log-likelihood over log sigma with no box, from gam's own start (sigma = 1),
+    // with the analytic gradient and Hessian, and the score and observed
+    // information at its optimum feed the interiority check below.
     let cols = [Column::new("M", &cum_hazard), Column::new("event", &events)];
     let r = run_r(
         &cols,
@@ -287,41 +299,51 @@ fn lognormal_hazard_multiplier_kernel_recovers_frailty_variance() {
         suppressPackageStartupMessages(library(statmod))
         h0 <- 0.1
         M  <- df$M
-        ev <- df$event
-        is_ev <- ev > 0.5
-        negloglik <- function(sigma) {
-            gq <- gauss.quad.prob(128, dist = "normal", mu = 0, sigma = sigma)
-            nodes <- gq$nodes
-            wts <- gq$weights
-            # E[g(U)] for every row, fully VECTORIZED: the old per-row R `for`
-            # loop (one `exp(-M[i]*enodes)` allocation + reduction per row, per
-            # `optimize` step) was the dominant wall-clock cost of this baseline
-            # at N_TOTAL rows x 128 nodes x ~40 optimize evaluations. Replace it
-            # with a single (rows x nodes) matrix evaluated once per sigma:
-            #   base[i,j] = exp(-M[i] * exp(node_j)).
-            # The per-row L is then a single weighted matrix-vector contraction
-            # over nodes, with the event/censored cases differing only by the
-            # extra `enodes` factor. Identical math, identical likelihood — only
-            # the loop is gone.
-            enodes <- exp(nodes)
-            # base: outer over rows (M) and nodes (enodes); R recycles M down the
-            # columns, so each column j is exp(-M * enodes[j]).
-            base <- exp(-outer(M, enodes))          # rows x nodes
-            # censored rows: L = sum_j w_j base[i,j]      => base %*% wts
-            # event   rows: L = h0 * sum_j w_j enodes[j] base[i,j]
-            #                                            => h0 * base %*% (wts*enodes)
-            L_cens <- as.numeric(base %*% wts)
-            L_ev   <- h0 * as.numeric(base %*% (wts * enodes))
-            Lrow   <- ifelse(is_ev, L_ev, L_cens)
-            -sum(log(Lrow))
+        is_ev <- df$event > 0.5
+        gq <- gauss.quad.prob(128, dist = "normal")
+        # Every row's E[g(U)] and its first two log-sigma derivatives are weighted
+        # contractions over the (rows x nodes) matrix base[i,j] = exp(-M[i] e^u_j),
+        # u_j = sigma * node_j, d u_j / d log sigma = u_j. Censored rows integrate
+        # g = base, event rows g = h0 e^u base.
+        row_moments <- function(log_sigma) {
+            w <- gq$weights
+            u <- exp(log_sigma) * gq$nodes
+            eu <- exp(u)
+            base <- exp(-outer(M, eu))
+            c1 <- function(v) as.numeric(base %*% v)
+            wue <- w * u * eu
+            L <- ifelse(is_ev, h0 * c1(w * eu), c1(w))
+            dL <- ifelse(is_ev, h0 * (c1(wue) - M * c1(wue * eu)), -M * c1(wue))
+            d2L <- ifelse(
+                is_ev,
+                h0 * (c1(w * u^2 * eu) - 3 * M * c1(w * u^2 * eu^2) + M^2 * c1(w * u^2 * eu^3)
+                      + c1(wue) - M * c1(wue * eu)),
+                M^2 * c1(w * u^2 * eu^2) - M * c1(w * u^2 * eu) - M * c1(wue))
+            list(L = L, dL = dL, d2L = d2L)
         }
-        opt <- optimize(negloglik, interval = c(0.05, 3.0), tol = 1e-8)
-        emit("sigma_hat", opt$minimum)
-        emit("loglik", -opt$objective)
+        negloglik <- function(log_sigma) {
+            m <- row_moments(log_sigma)
+            value <- -sum(log(m$L))
+            attr(value, "gradient") <- -sum(m$dL / m$L)
+            attr(value, "hessian") <- -sum(m$d2L / m$L - (m$dL / m$L)^2)
+            value
+        }
+        fit <- nlm(negloglik, 0)
+        at_optimum <- negloglik(fit$estimate)
+        emit("sigma_hat", exp(fit$estimate))
+        emit("loglik", -fit$minimum)
+        emit("nlm_code", fit$code)
+        emit("score_log_sigma", attr(at_optimum, "gradient"))
+        emit("information_log_sigma", attr(at_optimum, "hessian"))
         "#,
     );
     let sigma_hat_r = r.scalar("sigma_hat");
     let r_loglik = r.scalar("loglik");
+    let r_nlm_code = r.scalar("nlm_code") as usize;
+    let r_score = r.scalar("score_log_sigma");
+    let r_information = r.scalar("information_log_sigma");
+    // The Newton step still available from R's optimum, expressed in sigma.
+    let r_newton_displacement = sigma_hat_r * (r_score / r_information).abs();
 
     // gam's log-likelihood at its own optimum, for context.
     let (gam_loglik_at_opt, _, _) = gam_logsigma_jet(
@@ -340,7 +362,9 @@ fn lognormal_hazard_multiplier_kernel_recovers_frailty_variance() {
          sigma_hat_gam={sigma_hat_gam:.6} sigma_hat_r={sigma_hat_r:.6} \
          se_sigma={se_sigma:.6} err_gam={err_gam:.3e} err_r={err_r:.3e} \
          last_loglik={last_loglik:.6} gam_loglik_at_opt={gam_loglik_at_opt:.6} \
-         r_loglik={r_loglik:.6}"
+         r_loglik={r_loglik:.6} r_nlm_code={r_nlm_code} \
+         r_score_log_sigma={r_score:.3e} r_information_log_sigma={r_information:.3e} \
+         r_newton_displacement={r_newton_displacement:.3e}"
     );
 
     // ---- PRIMARY objective assertion: gam recovers the true frailty variance --
@@ -355,13 +379,39 @@ fn lognormal_hazard_multiplier_kernel_recovers_frailty_variance() {
          bar={recovery_bar:.3e} (se_sigma={se_sigma:.3e})"
     );
 
+    // ---- the R reference optimum must be interior ----------------------------
+    // The reference search has no box, so its optimum is a valid baseline only if
+    // it is stationary: `nlm` reports a probable solution (code 1, relative gradient
+    // near zero, or code 2, successive iterates within tolerance), the
+    // log-likelihood is concave in log sigma there, and the Newton step still
+    // available moves sigma by less than the tolerance the comparison below
+    // already grants to optimizer disagreement. Concavity is not redundant: a
+    // quasi-Newton search from sigma = 1 runs to the flat no-frailty asymptote
+    // sigma -> 0, reports success, and has a vanishing step there.
+    assert!(
+        matches!(r_nlm_code, 1 | 2),
+        "R nlm on log sigma did not reach a probable solution: code={r_nlm_code}"
+    );
+    assert!(
+        r_information > 0.0,
+        "R reference log-likelihood is not concave at its optimum: \
+         information={r_information:.3e} (sigma_hat_r={sigma_hat_r:.6})"
+    );
+    assert!(
+        r_newton_displacement <= REFERENCE_AGREEMENT_TOLERANCE,
+        "R reference optimum is not interior: score={r_score:.3e} \
+         information={r_information:.3e} Newton displacement in sigma \
+         {r_newton_displacement:.3e} > {REFERENCE_AGREEMENT_TOLERANCE:.0e} \
+         (sigma_hat_r={sigma_hat_r:.6})"
+    );
+
     // ---- match-or-beat the mature quadrature on recovery ACCURACY ------------
     // Both maximize the EXACT frailty-integrated likelihood on identical data, so
     // their MLEs should coincide to quadrature precision; gam must be no less
-    // accurate than R at recovering the truth. The additive 1e-3 absorbs the
-    // residual quadrature/optimizer disagreement near the (shared) optimum.
+    // accurate than R at recovering the truth. REFERENCE_AGREEMENT_TOLERANCE absorbs
+    // the residual quadrature/optimizer disagreement near the (shared) optimum.
     assert!(
-        err_gam <= err_r * 1.10 + 1e-3,
+        err_gam <= err_r * 1.10 + REFERENCE_AGREEMENT_TOLERANCE,
         "gam recovered the frailty variance less accurately than the R \
          Gauss-Hermite MLE baseline: err_gam={err_gam:.3e} err_r={err_r:.3e} \
          (sigma_hat_gam={sigma_hat_gam:.6} sigma_hat_r={sigma_hat_r:.6})"
