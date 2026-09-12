@@ -33,7 +33,10 @@
 //! replaying the corpus. The simultaneous polar updates majorize the tied-code
 //! reconstruction loss with supports held fixed, differentiating both the frame
 //! and its projection code. A data-derived spectral shift makes each surrogate
-//! positive semidefinite without storing a feature covariance matrix. Rerouting
+//! positive semidefinite without storing a feature covariance matrix. After an
+//! accepted trial each block instead steps along its tangent gradient by the
+//! secant curvature measured between the two passes, and falls back to the
+//! majorizer when that curvature is not positive. Rerouting
 //! on the next pass can change supports and is measured separately. One-shot
 //! uses sequential block updates; the streaming trajectory is different.
 //!
@@ -51,7 +54,7 @@ use super::block::{
     route_and_code_all, stable_rank_symmetric,
 };
 use super::block_frame::{
-    STORED_FRAME_RESOLUTION, polar_tied_frame_step, stored_projector_distance,
+    FrameSecant, STORED_FRAME_RESOLUTION, secant_tied_frame_step, stored_projector_distance,
 };
 use super::residual_reservoir::ResidualReservoir;
 use super::update::{DEAD_DENOM, DecoderSolveStats};
@@ -310,6 +313,10 @@ struct PendingFrameTrial {
     baseline_rows: usize,
     baseline_usage: Vec<usize>,
     baseline_second: Vec<Array2<f64>>,
+    /// One secant pair per block from the step that formed `proposed_decoder`,
+    /// handed to the next frame step once the trial commits. `None` for a
+    /// bisected midpoint, whose step is not the one the pairs describe.
+    secant: Option<Vec<FrameSecant>>,
 }
 
 /// Resumable state for a streaming block-sparse fit. Construct with [`Self::new`]
@@ -850,6 +857,9 @@ impl BlockSparseStreamState {
             tss += self.col_sumsq[c] - self.col_sum[c] * self.col_sum[c] / n;
         }
         let mut rejected_frame = false;
+        // The committed proposal's baseline frames and secant pairs, for this
+        // epoch's frame step.
+        let mut secant_history: Option<(Array2<f32>, Vec<FrameSecant>)> = None;
         if let Some(mut trial) = self.pending_frame.take() {
             if trial.baseline_rows != self.row_count {
                 return Err(format!(
@@ -892,9 +902,12 @@ impl BlockSparseStreamState {
                         baseline_second: (0..self.g)
                             .map(|_| Array2::<f64>::zeros((b, b)))
                             .collect(),
+                        secant: None,
                     });
                 }
                 rejected_frame = true;
+            } else if let Some(secant) = trial.secant.take() {
+                secant_history = Some((std::mem::take(&mut trial.baseline_decoder), secant));
             }
         }
         // Resolve a staged residual-row birth against the exact full-pass
@@ -948,6 +961,7 @@ impl BlockSparseStreamState {
         let mut frame_binding_block_rows = 0usize;
         let mut frame_blocks_above_tolerance = None;
         let frame_bar = self.config.tolerance.max(STORED_FRAME_RESOLUTION);
+        let mut proposal_secants: Option<Vec<FrameSecant>> = None;
         if !rejected_birth && !rejected_frame {
             // (γ) closed-form shared scalar from the accumulated least-squares.
             self.gamma = if self.gamma_den == 0.0 {
@@ -980,7 +994,7 @@ impl BlockSparseStreamState {
             // Each task owns one proposal and its moments. Pin nested faer
             // factorizations to sequential while the existing Rayon pool fans
             // out over blocks; otherwise a nested solver barrier can deadlock.
-            let outcomes: Vec<Result<f64, String>> = with_faer_sequential(|| {
+            let outcomes: Vec<Result<(f64, FrameSecant), String>> = with_faer_sequential(|| {
                 self.coupling
                     .par_iter_mut()
                     .zip(self.second.par_iter_mut())
@@ -993,7 +1007,7 @@ impl BlockSparseStreamState {
                     .map(|(gg, ((moment, second), mut proposal))| {
                         second.mapv_inplace(|value| value * gamma * gamma);
                         if self.usage[gg] == 0 {
-                            return Ok(0.0);
+                            return Ok((0.0, FrameSecant::default()));
                         }
                         // For U = Dᵀ, P = UUᵀ and fixed supports, the bound
                         // ||Σ ΔP_g x||² <= k Σ ||ΔP_g x||² gives the surrogate
@@ -1005,6 +1019,9 @@ impl BlockSparseStreamState {
                         // Grassmann manifold. Polar(B U) increases tr(UᵀB U)
                         // by maximizing its tangent linear lower bound, hence
                         // decreases the actual tied loss at fixed supports.
+                        // When the committed trial left a secant pair, the
+                        // step is sized by the measured curvature instead
+                        // (`secant_tied_frame_step`).
                         let data_scale = 2.0 * gamma - self.k as f64 * gamma * gamma;
                         let shift = (-data_scale).max(0.0) * self.data_energy[gg]
                             + gamma * gamma * self.negative_bound[gg]
@@ -1015,12 +1032,19 @@ impl BlockSparseStreamState {
                                     + gamma * gamma * moment[[c, rr]];
                             }
                         }
-                        polar_tied_frame_step(
+                        let previous = secant_history.as_ref().map(|(baseline, secants)| {
+                            (
+                                baseline.slice(ndarray::s![gg * b..(gg + 1) * b, ..]),
+                                secants[gg],
+                            )
+                        });
+                        secant_tied_frame_step(
                             self.decoder.slice(ndarray::s![gg * b..(gg + 1) * b, ..]),
                             moment.view_mut(),
                             second.view(),
                             (self.k - 1) as f64,
                             shift,
+                            previous,
                             proposal.view_mut(),
                         )
                         .map_err(|error| format!("BlockSparseStream polar block {gg}: {error}"))
@@ -1029,7 +1053,12 @@ impl BlockSparseStreamState {
             });
             // Indexed collection preserves the first failing block's identity
             // even if worker completion order changes.
-            let gradient = outcomes.into_iter().collect::<Result<Vec<f64>, String>>()?;
+            let (gradient, secants): (Vec<f64>, Vec<FrameSecant>) = outcomes
+                .into_iter()
+                .collect::<Result<Vec<(f64, FrameSecant)>, String>>()?
+                .into_iter()
+                .unzip();
+            proposal_secants = Some(secants);
             let displacement = (0..self.g)
                 .into_par_iter()
                 .map(|block| {
@@ -1110,6 +1139,7 @@ impl BlockSparseStreamState {
                     baseline_rows: 0,
                     baseline_usage: vec![0; self.g],
                     baseline_second: (0..self.g).map(|_| Array2::<f64>::zeros((b, b))).collect(),
+                    secant: proposal_secants.take(),
                 });
             }
         }
