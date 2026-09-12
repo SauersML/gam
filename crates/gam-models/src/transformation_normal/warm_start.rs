@@ -58,8 +58,17 @@ pub(crate) fn compute_warm_start(
     let mut target_h = Array1::<f64>::zeros(n);
     let mut target_hp = Array1::<f64>::zeros(n);
     for i in 0..n {
-        let tau = ws.scale[i].max(WARMSTART_INV_SCALE_FLOOR);
+        let tau = ws.scale[i];
         let inv_tau = 1.0 / tau;
+        if !(tau > 0.0 && tau.is_finite() && inv_tau.is_finite()) {
+            return Err(TransformationNormalError::InvalidInput {
+                reason: format!(
+                    "transformation warm start scale at row {i} is {tau:e}; the affine seed \
+                     needs a positive finite scale with a representable reciprocal"
+                ),
+            }
+            .into());
+        }
         target_h[i] = (response[i] - ws.location[i]) * inv_tau - offset[i];
         target_hp[i] = inv_tau;
     }
@@ -197,13 +206,26 @@ pub(crate) fn estimate_default_warm_start(
         }
         .into());
     }
-    let global_scale = (weighted_ss / weight_sum)
-        .sqrt()
-        .max(WARMSTART_GLOBAL_SCALE_FLOOR);
-    let residual_floor = global_scale * WARMSTART_RESIDUAL_REL_FLOOR + WARMSTART_RESIDUAL_ABS_FLOOR;
+    let global_scale = (weighted_ss / weight_sum).sqrt();
+    if !(global_scale > 0.0) {
+        return Err(TransformationNormalError::DesignDegenerate {
+            reason: "transformation warm start: the response has no residual variation about \
+                     its projected location, so there is no scale to seed"
+                .to_string(),
+        }
+        .into());
+    }
+    // `ln|y − μ| − E[ln|Z|]` estimates `ln τ` row by row. An exactly zero residual
+    // has no log-magnitude and takes the pooled `ln τ̄` instead.
+    let log_global_scale = global_scale.ln();
     let log_scale_target =
         Array1::from_iter(response.iter().zip(location.iter()).map(|(&y, &mu)| {
-            (y - mu).abs().max(residual_floor).ln() - STANDARD_NORMAL_MEAN_LOG_ABS
+            let residual = (y - mu).abs();
+            if residual > 0.0 {
+                residual.ln() - STANDARD_NORMAL_MEAN_LOG_ABS
+            } else {
+                log_global_scale
+            }
         }));
     let beta_log_scale = solve_penalizedweighted_projection(
         covariate_design,
@@ -216,7 +238,20 @@ pub(crate) fn estimate_default_warm_start(
     )?;
     let scale = covariate_design
         .matrixvectormultiply(&beta_log_scale)
-        .mapv(|eta| eta.exp().max(residual_floor));
+        .mapv(f64::exp);
+    if let Some((row, &value)) = scale
+        .iter()
+        .enumerate()
+        .find(|(_, value)| !(**value > 0.0 && value.is_finite()))
+    {
+        return Err(TransformationNormalError::NonFinite {
+            reason: format!(
+                "transformation warm start log-scale seed at row {row} exponentiates to \
+                 {value:e}, which is not a positive finite scale"
+            ),
+        }
+        .into());
+    }
 
     Ok(TransformationWarmStart { location, scale })
 }

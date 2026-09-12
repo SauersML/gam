@@ -127,28 +127,6 @@ pub(crate) const CTN_INNER_MAX_CYCLES_PER_DIM: usize = 2;
 
 pub(crate) const CTN_INNER_MAX_CYCLES_CEILING: usize = 400;
 
-/// Floor on the warm-start global residual scale `sqrt(weighted_ss / Σw)`.
-/// Guards the degenerate near-perfect-fit case (residuals collapse to numerical
-/// zero) so the per-residual `residual_floor` below — and the subsequent
-/// `ln(|y−μ|)` log-scale target — stay finite. Well below any real response
-/// spread, so it never perturbs a genuine fit.
-pub(crate) const WARMSTART_GLOBAL_SCALE_FLOOR: f64 = 1e-6;
-
-/// Per-residual floor used to form the log-scale warm-start target
-/// `ln(|y−μ|) − E[ln|N(0,1)|]`. Built as `global_scale · WARMSTART_RESIDUAL_REL_FLOOR
-/// + WARMSTART_RESIDUAL_ABS_FLOOR`: the relative term keeps an exactly-fit point
-/// (|y−μ| = 0) from sending `ln(0) → −∞` at 1/1000 of the data scale, and the
-/// absolute term backstops the case where `global_scale` itself sits at its floor.
-pub(crate) const WARMSTART_RESIDUAL_REL_FLOOR: f64 = 1e-3;
-
-pub(crate) const WARMSTART_RESIDUAL_ABS_FLOOR: f64 = 1e-12;
-
-/// Floor on a per-row warm-start scale τ before forming `1/τ` when building the
-/// affine transformation seed targets. A degenerate τ = 0 (a collapsed warm-start
-/// scale block) would otherwise produce a non-finite reciprocal; the floor sits
-/// far below any meaningful scale so it only fires on the degenerate path.
-pub(crate) const WARMSTART_INV_SCALE_FLOOR: f64 = 1e-12;
-
 /// Ridge stabilization floor for the penalized least-squares projections that
 /// produce the default warm-start location and log-scale coefficients. These
 /// seeds only need to land in the right basin (the outer solver refines them),

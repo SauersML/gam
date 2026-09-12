@@ -3746,5 +3746,16 @@
     ],
     "reason": "#2469 and the delete-useless-public-API rule: gam-terms' skip_transcoder_reml_metrics and its pyffi shim have no product user. gamfit's skip transcoder (gamfit/torch/skip_transcoder.py) scores its profile itself and never calls the shim, and nothing in gam-cli, examples, tests or another crate calls either function. The function carried two arbitrary constants, a 1e-8 activation threshold that decided which atoms counted as active and a 1e-12 floor that turned a perfect reconstruction's -infinity profile score into a finite one. The module, its two carrier structs, the shim, the shim's only helper require_finite_matrix, the prelude re-export, the module registration and the build_info capability name are deleted together.",
     "evidence": "git grep 'skip_transcoder_reml\\|SkipTranscoderReml' at the base over the whole tree, bench/gha_results excluded, finds only crates/gam-terms/src/decoders/skip_transcoder.rs, the ffi_prelude.rs re-export, the geometry_ffi.rs add_function line, the model_ffi.rs capability string and shim. git grep reml_metrics over gamfit and tests finds nothing. require_finite_matrix occurs 7 times at the base, all in model_ffi.rs: its declaration and six calls inside the deleted shim. The item list applies source_removal_guard.py's ITEM regex by hand. Not compiled or run locally (user directive); compile is covered by the lead's shared tip check."
+  },
+  {
+    "base": "7ebbacd3d2dd67748cfb34e7cfdd8878398eab06",
+    "items": [
+      "crates/gam-models/src/transformation_normal/config.rs:const:WARMSTART_GLOBAL_SCALE_FLOOR",
+      "crates/gam-models/src/transformation_normal/config.rs:const:WARMSTART_INV_SCALE_FLOOR",
+      "crates/gam-models/src/transformation_normal/config.rs:const:WARMSTART_RESIDUAL_ABS_FLOOR",
+      "crates/gam-models/src/transformation_normal/config.rs:const:WARMSTART_RESIDUAL_REL_FLOOR"
+    ],
+    "reason": "#2469. The transformation-normal warm start floored the residual RMS at 1e-6, each |y - μ| at 1e-3·RMS + 1e-12 before ln, exp(η) at that residual floor, and τ at 1e-12 before 1/τ. The seed now refuses a response with no residual variation, gives an exactly zero residual the pooled ln τ̄, and refuses a scale that is not positive and finite or whose reciprocal is not representable. So the four floor constants have no remaining user.",
+    "evidence": "At the base, git grep -n -w finds each of WARMSTART_GLOBAL_SCALE_FLOOR, WARMSTART_RESIDUAL_REL_FLOOR, WARMSTART_RESIDUAL_ABS_FLOOR and WARMSTART_INV_SCALE_FLOOR only at its declaration and doc comments in crates/gam-models/src/transformation_normal/config.rs, and at its use in crates/gam-models/src/transformation_normal/warm_start.rs (lines 61, 202 and 203). This change replaces those uses. All four are pub(crate), production-scoped and declared once, and no test names them. The item list applies source_removal_guard.py's ITEM regex and occurrence rule by hand. Compile is covered by the lead's shared tip check."
   }
 ]
