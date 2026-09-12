@@ -1085,5 +1085,20 @@
     ],
     "reason": "user directive: delete all useless slop",
     "evidence": "Batch A of the crates/gam-sae/src/manifold share. git grep -nw over crates, src, tests, examples, bench and benches found no production reference to any removed item. The 26 listed in the bare-pub-inclusive src_items_used_only_by_tests.py report at bab62c696 were re-checked at the tip, where their reference sets are unchanged; they are named only by their own definitions, error strings and doc comments, and vetoes_birth_into also by two assertions in terracini's aggregator test, which are removed with it. The rest are what those deletions leave named by nothing outside their own file: AffineChartTransition; graph_atom.rs's LearnedGraphAtom, GraphSpectralBasis, NystromSpectralEvaluator and SpectralGraphRaceCandidate chain with GraphEdge, GraphTopologyReadout, GraphStructureSelection and the coactivation and rank-charge helpers (GraphCompressionKind and GraphCompressionReport stay, for atlas_topology, atlas_nerve and gam-pyffi); pair_phase.rs's phase screen, fuse-race and phase-circuit code (ebh_reject stays, for curl_census and its test); and terracini's three private sparse-code helpers. Lane sw8 job 421914 applied the change over 8e3de85af: cargo check -p gam-sae --all-targets failed only on an unused ArrayView2 import in terracini.rs, fixed in the landed change, and scripts/source_removal_guard.py listed exactly these 107 identities. No test function is removed. MSI verification at the landed sha (ban scanner, workspace --all-targets check, cargo doc -p gam-sae --no-deps, guard and census) follows."
+  },
+  {
+    "base": "fea430c0c45c5f04a70bd18410d47f8ab7197dac",
+    "items": [
+      "crates/gam-predict/src/affine_design.rs:fn:eta_gradient_matrix",
+      "crates/gam-predict/src/conformal.rs:fn:apply_to_uncertainty_result",
+      "crates/gam-predict/src/lib.rs:fn:coefficient_uncertainty",
+      "crates/gam-predict/src/lib.rs:fn:predict_gam_posterior_mean",
+      "crates/gam-predict/src/lib.rs:fn:predict_gam_posterior_meanwith_fit",
+      "crates/gam-predict/src/lib.rs:fn:with_phi",
+      "crates/gam-predict/src/lib.rs:fn:with_theta",
+      "crates/gam-predict/src/linalg.rs:fn:from_factorized_hessian"
+    ],
+    "reason": "user directive: delete all useless slop",
+    "evidence": "At d1b00c6b2, git grep -nw over crates, src, tests, examples, bench and benches found only each item's own definition, doc comments, or its own error label; no caller and no named re-export in the facade or gam-pyffi. The wrapped implementations remain. MSI verification (ban scanner, workspace --all-targets check, cargo doc -p gam-predict) runs on the landed sha."
   }
 ]
