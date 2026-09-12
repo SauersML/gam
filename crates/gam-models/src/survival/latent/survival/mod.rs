@@ -5389,6 +5389,145 @@ impl LatentSurvivalFamily {
         require_finite_likelihood_matrix(&acc.hessian, "second directional Hessian derivative")?;
         Ok(acc.hessian)
     }
+
+    /// `∇²_β tr(W · H(β))` for a symmetric trace weight `W`, in ONE row pass
+    /// (#2714).
+    ///
+    /// The exact Jeffreys completion otherwise contracts `W` against `p(p+1)/2`
+    /// full-data passes `H''[e_a, e_b]`, and every pass rebuilds every row's
+    /// kernel bundles. The contraction only needs each row's primary
+    /// coordinates:
+    ///
+    /// ```text
+    ///   Σ_cd W_cd H''[e_a, e_b]_cd = Σ_i w_i · x_aᵀ M_i x_b,
+    ///   M_i = Σ_γδ Wp_i[γ, δ] · F_i(e_γ, e_δ),   Wp_i = X_i W X_iᵀ,
+    /// ```
+    ///
+    /// where `F_i(u, v)` is the row's contracted fourth
+    /// ([`latent_survival_row_primary_fourth_contracted`]) and `X_i` its primary
+    /// Jacobian. `F_i` is symmetric in `(u, v)`, so the sum runs over the upper
+    /// triangle with the off-diagonal weight doubled: at most 21 row jets per row,
+    /// independent of `p`. Linear in `W` and never factorizes it, so a signed
+    /// weight carrying gate or floor motion is admitted as the trait requires.
+    fn jeffreys_information_contracted_trace_hessian_dense(
+        &self,
+        block_states: &[ParameterBlockState],
+        weight: &Array2<f64>,
+    ) -> Result<Array2<f64>, String> {
+        let weights = ValidatedLikelihoodWeights::new(&self.weights, "latent-survival")
+            .map_err(String::from)?;
+        let (q_entry, q_exit, qdot_exit, mu) = self.split_time_eta(block_states)?;
+        let q_right = self.time_q_right(block_states)?;
+        let sigma = self.latent_sd(block_states)?;
+        let slices = self.joint_slices();
+        let total = slices.total;
+        if weight.dim() != (total, total) {
+            return Err(format!(
+                "latent survival contracted trace Hessian: weight shape {:?}, expected ({total}, {total})",
+                weight.dim()
+            ));
+        }
+        let include_log_sigma = slices.log_sigma.is_some();
+        let live_primaries = if include_log_sigma {
+            LATENT_SURVIVAL_PRIMARY_DIM
+        } else {
+            LATENT_SURVIVAL_PRIMARY_LOG_SIGMA
+        };
+        let primary_axis = |axis: usize| {
+            let mut unit = Array1::<f64>::zeros(LATENT_SURVIVAL_PRIMARY_DIM);
+            unit[axis] = 1.0;
+            unit
+        };
+        let acc = deterministic_latent_survival_row_reduction(
+            self.event_target.len(),
+            || LatentSurvivalDenseHessianAccum {
+                hessian: Array2::<f64>::zeros((total, total)),
+            },
+            |row_idx, acc| {
+                let wi = weights.at(row_idx);
+                if wi == 0.0 {
+                    return Ok(());
+                }
+                let row = self.build_row_at(
+                    row_idx,
+                    q_entry[row_idx],
+                    q_exit[row_idx],
+                    qdot_exit[row_idx],
+                    q_right[row_idx],
+                )?;
+                let point = LatentSurvivalPrimaryPoint {
+                    q_entry: q_entry[row_idx],
+                    q_exit: q_exit[row_idx],
+                    qdot_exit: qdot_exit[row_idx],
+                    q_right: q_right[row_idx],
+                    mu: mu[row_idx],
+                    sigma,
+                };
+                // Wp[γ, δ] = x_γᵀ W x_δ with x_δ = X_iᵀ e_δ.
+                let mut primary_weight =
+                    Array2::<f64>::zeros((LATENT_SURVIVAL_PRIMARY_DIM, LATENT_SURVIVAL_PRIMARY_DIM));
+                for delta in 0..live_primaries {
+                    let mut x_delta = Array1::<f64>::zeros(total);
+                    self.add_pullback_primary_gradient(
+                        &mut x_delta,
+                        row_idx,
+                        &slices,
+                        &primary_axis(delta),
+                        1.0,
+                    )?;
+                    let weighted_column = self.row_primary_direction_from_flat(
+                        row_idx,
+                        &slices,
+                        &weight.dot(&x_delta),
+                    );
+                    for gamma in 0..live_primaries {
+                        primary_weight[[gamma, delta]] = weighted_column[gamma];
+                    }
+                }
+                let mut contracted =
+                    Array2::<f64>::zeros((LATENT_SURVIVAL_PRIMARY_DIM, LATENT_SURVIVAL_PRIMARY_DIM));
+                for gamma in 0..live_primaries {
+                    for delta in gamma..live_primaries {
+                        let pair_weight = if gamma == delta {
+                            primary_weight[[gamma, gamma]]
+                        } else {
+                            primary_weight[[gamma, delta]] + primary_weight[[delta, gamma]]
+                        };
+                        if pair_weight == 0.0 {
+                            continue;
+                        }
+                        let fourth = latent_survival_row_primary_fourth_contracted(
+                            &self.quadctx,
+                            &row,
+                            point,
+                            &primary_axis(gamma),
+                            &primary_axis(delta),
+                            include_log_sigma,
+                        )?;
+                        contracted.scaled_add(pair_weight, &fourth);
+                    }
+                }
+                let weighted_contracted = checked_weighted_row_matrix(
+                    wi,
+                    &contracted,
+                    row_idx,
+                    "contracted trace fourth",
+                )?;
+                self.add_pullback_primary_hessian(
+                    &mut acc.hessian,
+                    row_idx,
+                    &slices,
+                    &weighted_contracted,
+                )?;
+                Ok(())
+            },
+            |total_acc, chunk_acc| {
+                total_acc.hessian += &chunk_acc.hessian;
+            },
+        )?;
+        require_finite_likelihood_matrix(&acc.hessian, "contracted trace Hessian")?;
+        Ok(acc.hessian)
+    }
 }
 
 fn log_kernel_ratio(

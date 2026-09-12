@@ -1694,6 +1694,70 @@
         assert!(max_relative_array2(&d2h_a, &d2h_a.t().to_owned()) < 1e-12);
     }
 
+    /// #2714: the one-pass Jeffreys completion hook is the object the pairwise
+    /// fallback assembles, `C[a, b] = Σ_cd W_cd H''[e_a, e_b]_cd`, on a fixture
+    /// with exact-event and right-censored rows and a learned scale.
+    #[test]
+    fn latent_survival_contracted_trace_hessian_matches_pairwise_contraction_2714() {
+        let family = survival_stress_test_family(24);
+        let beta = survival_stress_test_joint_beta();
+        let states = latent_survival_states_from_joint_beta(&family, &beta);
+        let total = family.joint_slices().total;
+        assert!(family.joint_jeffreys_information_contracted_trace_hessian_available());
+        // Signed and indefinite: callers fold gate and floor motion into W, so a
+        // weight that happened to be PSD would not exercise the contract.
+        let weight = Array2::from_shape_fn((total, total), |(i, j)| {
+            ((1 + i + 2 * j) as f64).sin() + ((1 + j + 2 * i) as f64).sin()
+        });
+
+        let pairwise_start = std::time::Instant::now();
+        let mut pairwise = Array2::<f64>::zeros((total, total));
+        for a in 0..total {
+            for b in a..total {
+                let mut axis_a = Array1::<f64>::zeros(total);
+                axis_a[a] = 1.0;
+                let mut axis_b = Array1::<f64>::zeros(total);
+                axis_b[b] = 1.0;
+                let h2 = family
+                    .exact_newton_joint_hessian_second_directional_derivative_dense(
+                        &states, &axis_a, &axis_b,
+                    )
+                    .expect("pairwise joint d2H evaluation");
+                let contracted = (&weight * &h2).sum();
+                pairwise[[a, b]] = contracted;
+                pairwise[[b, a]] = contracted;
+            }
+        }
+        let pairwise_elapsed = pairwise_start.elapsed();
+
+        let one_pass_start = std::time::Instant::now();
+        let one_pass = family
+            .jeffreys_information_contracted_trace_hessian_dense(&states, &weight)
+            .expect("one-pass contracted trace Hessian");
+        let one_pass_elapsed = one_pass_start.elapsed();
+
+        let scale = pairwise.iter().fold(0.0_f64, |acc, value| acc.max(value.abs()));
+        let max_abs_diff = one_pass
+            .iter()
+            .zip(pairwise.iter())
+            .fold(0.0_f64, |acc, (left, right)| acc.max((left - right).abs()));
+        eprintln!(
+            "[2714] contracted trace Hessian: p={total} scale={scale:.6e} max_abs_diff={max_abs_diff:.3e} \
+             pairwise={:.3}ms one_pass={:.3}ms",
+            pairwise_elapsed.as_secs_f64() * 1e3,
+            one_pass_elapsed.as_secs_f64() * 1e3,
+        );
+        assert!(
+            scale > 1e-3,
+            "the pairwise contraction is too small to grade an agreement against: scale={scale:.3e}"
+        );
+        assert!(
+            max_abs_diff <= 1e-10 * scale,
+            "one-pass contracted trace Hessian disagrees with the pairwise contraction: \
+             max_abs_diff={max_abs_diff:.3e} against scale={scale:.3e}"
+        );
+    }
+
     #[test]
     fn latent_survival_exact_joint_dh_matches_hessian_fd() {
         let family = learnable_sigma_test_family();

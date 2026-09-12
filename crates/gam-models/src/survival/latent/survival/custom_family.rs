@@ -319,6 +319,30 @@ impl CustomFamily for LatentSurvivalFamily {
         .map(Some)
     }
 
+    /// One-pass Jeffreys completion (#2714). The latent-survival Jeffreys
+    /// information is the observed joint Hessian (trait default), so the
+    /// contracted second derivative is `∇²_β tr(W · H(β))`, the object the
+    /// pairwise `H''[e_a, e_b]` fallback assembles in `p(p+1)/2` full-data
+    /// passes. Gated exactly as that fallback's delegate is.
+    fn joint_jeffreys_information_contracted_trace_hessian_with_specs(
+        &self,
+        block_states: &[ParameterBlockState],
+        specs: &[ParameterBlockSpec],
+        weight: &Array2<f64>,
+    ) -> Result<Option<Array2<f64>>, String> {
+        if !self.outer_default_trustworthy_for_joint_hessian(specs)
+            && !self.joint_hessian_is_structurally_coupled(block_states)?
+        {
+            return Ok(None);
+        }
+        self.jeffreys_information_contracted_trace_hessian_dense(block_states, weight)
+            .map(Some)
+    }
+
+    fn joint_jeffreys_information_contracted_trace_hessian_available(&self) -> bool {
+        true
+    }
+
     fn requires_joint_outer_hyper_path(&self) -> bool {
         true
     }
