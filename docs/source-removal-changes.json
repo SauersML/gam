@@ -1417,7 +1417,14 @@
   {
     "base": "36bf99559b084974eedd1298d5a8a31af2ec4349",
     "items": [
+      "crates/gam-solve/src/arrow_schur/newton_step.rs:const:CHUNK",
+      "crates/gam-solve/src/arrow_schur/newton_step.rs:const:CROSS_ROW_CG_ABS_TOL",
+      "crates/gam-solve/src/arrow_schur/newton_step.rs:const:CROSS_ROW_CG_ITER_MULTIPLE",
+      "crates/gam-solve/src/arrow_schur/newton_step.rs:const:CROSS_ROW_CG_MIN_ITER_BUDGET",
+      "crates/gam-solve/src/arrow_schur/newton_step.rs:const:CROSS_ROW_CG_REL_TOL",
+      "crates/gam-solve/src/arrow_schur/newton_step.rs:fn:apply",
       "crates/gam-solve/src/arrow_schur/newton_step.rs:fn:arrow_cross_row_matvec",
+      "crates/gam-solve/src/arrow_schur/newton_step.rs:fn:build",
       "crates/gam-solve/src/arrow_schur/newton_step.rs:fn:cholesky_solve_lower",
       "crates/gam-solve/src/arrow_schur/newton_step.rs:fn:dot2",
       "crates/gam-solve/src/arrow_schur/newton_step.rs:fn:solve_arrow_newton_step_cross_row",
