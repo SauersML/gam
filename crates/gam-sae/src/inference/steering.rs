@@ -822,8 +822,11 @@ fn chart_extent(manifold: &LatentManifold, t_from: &[f64], u: &[f64]) -> Result<
 /// only while the chord is linear in `s`, and correctly scaled only because the
 /// tangents and the metric share the raw activation frame (gh#2249, `ace3b9af3`).
 /// The solve expands `s` in increasing order from the seed until two observations
-/// bracket the target, then resolves the bracket with a secant step that falls
-/// back to bisection whenever the bracket fails to halve. A local decrease is only
+/// bracket the target, then resolves the bracket by false position with the
+/// Illinois weighting: an endpoint retained twice in a row has its residual halved
+/// for the next secant, so a stale endpoint is pulled in and the bracket shrinks
+/// superlinearly from both sides. A secant that is not strictly inside the bracket
+/// falls back to bisection. A local decrease is only
 /// another point observation, so expansion continues through it, but never past
 /// the chart's extent along the direction (`chart_extent`): past an interval
 /// boundary the retraction would clamp, and past a full turn the points repeat.
@@ -1055,14 +1058,21 @@ pub fn steer_to_target_nats(
         (hi_s, hi_nats, hi_plan, hi_applied) = (next_s, next_nats, next_plan, next_applied);
     }
 
-    // Resolve the bracket. A secant step that fails to halve the bracket is
-    // followed by bisection, so the bracket contracts geometrically however the
-    // observations curve.
-    let mut halve = false;
+    // Resolve the bracket by false position with the Illinois weighting. Plain false
+    // position keeps re-using a far endpoint whenever the root sits next to the
+    // other one, so the bracket shrinks from one side only and a tight tolerance
+    // runs out of probes. Halving the residual of an endpoint each time it is
+    // retained twice in a row pulls it in, which restores superlinear convergence
+    // with the bracket still guaranteed.
+    let mut lo_weight = 1.0_f64;
+    let mut hi_weight = 1.0_f64;
+    // `Some(true)`: the lower endpoint moved last. `Some(false)`: the upper one did.
+    let mut lower_moved_last: Option<bool> = None;
     loop {
-        let width = hi_s - lo_s;
-        let secant = hi_s - (hi_nats - target_nats) * width / (hi_nats - lo_nats);
-        let candidate = if !halve && secant.is_finite() && secant > lo_s && secant < hi_s {
+        let lo_residual = lo_weight * (lo_nats - target_nats);
+        let hi_residual = hi_weight * (hi_nats - target_nats);
+        let secant = hi_s - hi_residual * (hi_s - lo_s) / (hi_residual - lo_residual);
+        let candidate = if secant.is_finite() && secant > lo_s && secant < hi_s {
             secant
         } else {
             0.5 * (lo_s + hi_s)
@@ -1094,10 +1104,19 @@ pub fn steer_to_target_nats(
         }
         if nats < target_nats {
             (lo_s, lo_nats, lo_plan, lo_applied) = (candidate, nats, plan, applied);
+            lo_weight = 1.0;
+            if lower_moved_last == Some(true) {
+                hi_weight *= 0.5;
+            }
+            lower_moved_last = Some(true);
         } else {
             (hi_s, hi_nats, hi_plan, hi_applied) = (candidate, nats, plan, applied);
+            hi_weight = 1.0;
+            if lower_moved_last == Some(false) {
+                lo_weight *= 0.5;
+            }
+            lower_moved_last = Some(false);
         }
-        halve = hi_s - lo_s > 0.5 * width;
     }
     Err(TargetDoseError::BracketResolutionExhausted {
         target_nats,
