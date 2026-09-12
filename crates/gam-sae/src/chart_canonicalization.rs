@@ -158,6 +158,7 @@
 
 use faer::Side as FaerSide;
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
+use rayon::prelude::*;
 
 use crate::manifold::{SaeBasisEvaluator, solve_design_least_squares};
 use gam_linalg::faer_ndarray::{FaerCholesky, fast_ab, fast_ata, fast_atb};
@@ -218,6 +219,15 @@ pub struct UnitSpeedReparameterization {
 
 /// Decoder-curve speed `‖Φ'(u) B‖₂` for each evaluated coordinate row, from
 /// the basis jet `(rows, m, 1)` and the decoder `(m, p)`.
+///
+/// #2731 — the rows are independent, so they run on the Rayon pool, and each
+/// decoder row is read as one contiguous slice instead of `m · p` indexed
+/// reads. A row's speed is still the same sequence of floating-point
+/// operations (the tangent accumulates the decoder rows in basis order, the
+/// square-sum runs in output order), so every speed is bit-identical to the
+/// serial loop. On the `2·ARC_LENGTH_GRID_CELLS + 1`-node Simpson grid at
+/// `p = 2048` this function was 29.6% of the self time in a 30 s perf window of
+/// the `charts = 8` fit (job 448182).
 pub(crate) fn curve_speeds(
     jet: &ndarray::Array3<f64>,
     decoder: ArrayView2<'_, f64>,
@@ -235,24 +245,31 @@ pub(crate) fn curve_speeds(
         ));
     }
     let p = decoder.ncols();
-    let mut speeds = Vec::with_capacity(rows);
-    let mut tangent = vec![0.0_f64; p];
-    for row in 0..rows {
-        for slot in tangent.iter_mut() {
-            *slot = 0.0;
-        }
-        for bm in 0..m {
-            let dphi = jet[[row, bm, 0]];
-            if dphi == 0.0 {
-                continue;
-            }
-            for (j, slot) in tangent.iter_mut().enumerate() {
-                *slot += dphi * decoder[[bm, j]];
-            }
-        }
-        speeds.push(tangent.iter().map(|v| v * v).sum::<f64>().sqrt());
-    }
-    Ok(speeds)
+    let decoder = decoder.as_standard_layout();
+    let decoder = decoder
+        .as_slice()
+        .expect("a standard-layout array is contiguous");
+    Ok((0..rows)
+        .into_par_iter()
+        .map_init(
+            || vec![0.0_f64; p],
+            |tangent, row| {
+                tangent.fill(0.0);
+                for bm in 0..m {
+                    let dphi = jet[[row, bm, 0]];
+                    if dphi == 0.0 {
+                        continue;
+                    }
+                    for (slot, &coefficient) in
+                        tangent.iter_mut().zip(&decoder[bm * p..(bm + 1) * p])
+                    {
+                        *slot += dphi * coefficient;
+                    }
+                }
+                tangent.iter().map(|v| v * v).sum::<f64>().sqrt()
+            },
+        )
+        .collect())
 }
 
 /// Exact integral of the cell-local quadratic speed interpolant (through the
