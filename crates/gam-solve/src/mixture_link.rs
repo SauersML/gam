@@ -189,6 +189,64 @@ fn canonicalize_jet(mut jet: InverseLinkJet) -> InverseLinkJet {
 }
 
 #[inline]
+fn cauchit_mean(eta: f64) -> f64 {
+    // Keep the same arithmetic as the public vector inverse link. Reciprocal
+    // reflection preserves the small CDF that 1/2 + atan(eta)/pi cancels away.
+    if eta < -1.0 {
+        (-eta.recip()).atan() / std::f64::consts::PI
+    } else if eta > 1.0 {
+        1.0 - eta.recip().atan() / std::f64::consts::PI
+    } else {
+        0.5 + eta.atan() / std::f64::consts::PI
+    }
+}
+
+#[inline]
+fn cauchit_rational_factors(eta: f64) -> (f64, f64) {
+    // q = 1/(1+eta^2), r = eta/(1+eta^2). Both are bounded, including
+    // at infinite eta, so derivatives need no overflowing denominator powers.
+    if eta.abs() > 1.0 {
+        let inv = eta.recip();
+        let inv2 = inv * inv;
+        let den = 1.0 + inv2;
+        (inv2 / den, inv / den)
+    } else {
+        let q = (1.0 + eta * eta).recip();
+        (q, eta * q)
+    }
+}
+
+#[inline]
+fn cauchit_inverse_link_jet(eta: f64) -> InverseLinkJet {
+    let (q, r) = cauchit_rational_factors(eta);
+    let d1 = q / std::f64::consts::PI;
+    InverseLinkJet {
+        mu: cauchit_mean(eta),
+        d1,
+        d2: (-2.0 * r) * d1,
+        d3: (6.0 * r * r - 2.0 * q * q) * d1,
+    }
+}
+
+#[inline]
+fn cauchit_inverse_link_d4(eta: f64) -> f64 {
+    let (q, r) = cauchit_rational_factors(eta);
+    // 24 eta (1-eta^2) / [pi (1+eta^2)^4]. Apply the coefficient
+    // before the final small product to preserve representable subnormals.
+    canonicalzero((24.0 * r * (q * q - r * r)) * (q / std::f64::consts::PI))
+}
+
+#[inline]
+fn cauchit_inverse_link_d5(eta: f64) -> f64 {
+    let (q, r) = cauchit_rational_factors(eta);
+    let q2 = q * q;
+    let r2 = r * r;
+    // 24(1-10eta^2+5eta^4) / [pi (1+eta^2)^5].
+    canonicalzero((24.0 * q2 * q2 - 240.0 * q2 * r2 + 120.0 * r2 * r2)
+        * (q / std::f64::consts::PI))
+}
+
+#[inline]
 pub fn logit_inverse_link_jet5(eta: f64) -> LogitJet5 {
     if eta.is_nan() {
         return LogitJet5 {
@@ -270,6 +328,26 @@ pub fn logit_inverse_link_jet5(eta: f64) -> LogitJet5 {
     }
 }
 
+/// Multiply a degree-at-most-four Hermite factor by the normal density.
+/// A subnormal density can regain representable digits after multiplication;
+/// include the factor before exponentiation in that tail.
+#[inline]
+fn probit_density_product(x: f64, density: f64, polynomial: f64) -> f64 {
+    if density >= f64::MIN_POSITIVE {
+        return polynomial * density;
+    }
+    if x.abs() > 40.0 {
+        // Even the fourth-degree factor times phi(40) is below half the
+        // smallest subnormal. Larger finite arguments also round to zero.
+        return 0.0;
+    }
+    if polynomial == 0.0 {
+        return 0.0;
+    }
+    polynomial.signum()
+        * (polynomial.abs().ln() - 0.5 * x * x - 0.918_938_533_204_672_7).exp()
+}
+
 #[inline]
 fn probit_jet(eta: f64) -> InverseLinkJet {
     // Exact probit semantics:
@@ -308,19 +386,11 @@ fn probit_jet(eta: f64) -> InverseLinkJet {
     }
     let x = eta;
     let phi = normal_pdf(x);
-    if phi == 0.0 {
-        return InverseLinkJet {
-            mu: normal_cdf(x),
-            d1: 0.0,
-            d2: 0.0,
-            d3: 0.0,
-        };
-    }
     InverseLinkJet {
         mu: normal_cdf(x),
         d1: phi,
-        d2: -x * phi,
-        d3: (x * x - 1.0) * phi,
+        d2: probit_density_product(x, phi, -x),
+        d3: probit_density_product(x, phi, x * x - 1.0),
     }
 }
 
@@ -337,10 +407,7 @@ fn probit_pdfthird_derivative(eta: f64) -> f64 {
     }
     let x = eta;
     let phi = normal_pdf(x);
-    if phi == 0.0 {
-        return 0.0;
-    }
-    canonicalzero(-(x * x * x - 3.0 * x) * phi)
+    canonicalzero(probit_density_product(x, phi, -(x * x * x - 3.0 * x)))
 }
 
 #[inline]
@@ -354,10 +421,7 @@ fn probit_pdffourth_derivative(eta: f64) -> f64 {
     }
     let x = eta;
     let phi = normal_pdf(x);
-    if phi == 0.0 {
-        return 0.0;
-    }
-    canonicalzero((x * x * x * x - 6.0 * x * x + 3.0) * phi)
+    canonicalzero(probit_density_product(x, phi, x * x * x * x - 6.0 * x * x + 3.0))
 }
 
 /// Multiply two 5-term truncated Taylor series (coefficients `a_k = g^(k)/k!`,
@@ -402,11 +466,10 @@ fn taylor5_inv(a: &[f64; 5]) -> [f64; 5] {
 /// `logit_inverse_link_jet5`'s `d1..d5` byte-for-byte so the existing Firth
 /// logit path is numerically unchanged.
 ///
-/// Noncanonical Bernoulli links use the same truncated Taylor-series quotient:
-/// assemble the inverse-link jet through `mu^(5)`, square the `mu'` series, and
-/// divide by the Bernoulli variance series `mu(1-mu)`. As the variance
-/// denominator saturates to zero in either tail, the weight and all derivatives
-/// saturate to zero, matching the inverse-link jet convention.
+/// Noncanonical Bernoulli links use normalized Taylor series with unit constant
+/// terms and a separately evaluated log weight. Direct complementary tails
+/// retain variance information after the reported mean rounds to an endpoint;
+/// each derivative is rescaled separately, including when W itself underflows.
 pub(crate) fn fisher_weight_jet5(link: StandardLink, eta: f64) -> (f64, f64, f64, f64, f64) {
     match link {
         StandardLink::Logit => {
@@ -443,10 +506,225 @@ pub(crate) fn fisher_weight_jet5_for_inverse_link(
 
 #[inline]
 fn component_fisher_weight_jet5(component: LinkComponent, eta: f64) -> (f64, f64, f64, f64, f64) {
-    let jet = component_inverse_link_jet(component, eta);
-    let d4 = component_inverse_link_pdfthird_derivative(component, eta);
-    let d5 = component_inverse_link_pdffourth_derivative(component, eta);
-    fisher_weight_jet5_from_inverse_link_derivatives(jet.mu, jet.d1, jet.d2, jet.d3, d4, d5)
+    match component {
+        LinkComponent::Logit => {
+            let jet = logit_inverse_link_jet5(eta);
+            (jet.d1, jet.d2, jet.d3, jet.d4, jet.d5)
+        }
+        LinkComponent::Probit => probit_fisher_weight_jet5(eta),
+        LinkComponent::CLogLog => cloglog_fisher_weight_jet5(eta),
+        LinkComponent::LogLog => {
+            let (w, d1, d2, d3, d4) = cloglog_fisher_weight_jet5(-eta);
+            (w, -d1, d2, -d3, d4)
+        }
+        LinkComponent::Cauchit => {
+            if eta.is_nan() {
+                return (f64::NAN, f64::NAN, f64::NAN, f64::NAN, f64::NAN);
+            }
+            if !eta.is_finite() {
+                return (0.0, 0.0, 0.0, 0.0, 0.0);
+            }
+            let p = cauchit_mean(eta);
+            let q = cauchit_mean(-eta);
+            let (a, b) = cauchit_rational_factors(eta);
+            let a2 = a * a;
+            let b2 = b * b;
+            let density_ratios = [
+                1.0,
+                -2.0 * b,
+                6.0 * b2 - 2.0 * a2,
+                24.0 * b * (a2 - b2),
+                24.0 * a2 * a2 - 240.0 * a2 * b2 + 120.0 * b2 * b2,
+            ];
+            let log_density = -std::f64::consts::PI.ln() - 2.0 * eta.hypot(1.0).ln();
+            normalized_fisher_weight_jet5(
+                2.0 * log_density - p.ln() - q.ln(),
+                density_ratios,
+                (log_density - p.ln()).exp(),
+                (log_density - q.ln()).exp(),
+            )
+        }
+    }
+}
+
+/// Form the Taylor quotient after dividing each of f=mu', p=mu and q=1-mu
+/// by its own value. The ratios stay representable when f² or p*q do not.
+fn normalized_fisher_weight_jet5(
+    log_weight: f64,
+    density_ratios: [f64; 5],
+    density_over_p: f64,
+    density_over_q: f64,
+) -> (f64, f64, f64, f64, f64) {
+    let factorial = [1.0_f64, 1.0, 2.0, 6.0, 24.0];
+    let mut f = [1.0; 5];
+    let mut p = [1.0; 5];
+    let mut q = [1.0; 5];
+    for k in 1..5 {
+        f[k] = density_ratios[k] / factorial[k];
+        p[k] = density_over_p * density_ratios[k - 1] / factorial[k];
+        q[k] = -density_over_q * density_ratios[k - 1] / factorial[k];
+    }
+    let normalized = taylor5_mul(
+        &taylor5_mul(&f, &f),
+        &taylor5_inv(&taylor5_mul(&p, &q)),
+    );
+    let mut derivatives = [0.0; 5];
+    for k in 0..5 {
+        let multiplier = normalized[k] * factorial[k];
+        if multiplier != 0.0 {
+            derivatives[k] = multiplier.signum() * (log_weight + multiplier.abs().ln()).exp();
+        }
+    }
+    (derivatives[0], derivatives[1], derivatives[2], derivatives[3], derivatives[4])
+}
+
+fn cloglog_fisher_weight_jet5(eta: f64) -> (f64, f64, f64, f64, f64) {
+    if eta.is_nan() {
+        return (f64::NAN, f64::NAN, f64::NAN, f64::NAN, f64::NAN);
+    }
+    let a = eta.exp();
+    if (-a).exp() == 0.0 {
+        // W=a² sum_{m>=1} exp(-m*a). Once exp(-a) underflows, every
+        // m>=2 contribution to orders 0..4 is also below representability.
+        // Evaluate the m=1 polynomials in log scale: a derivative can still
+        // be representable when both exp(-a) and W have rounded to zero.
+        let eval = |coefficients: &[f64]| stable_nonnegative_poly_times_exp_neg(a, coefficients);
+        return (
+            eval(&[0.0, 0.0, 1.0]),
+            eval(&[0.0, 0.0, 2.0, -1.0]),
+            eval(&[0.0, 0.0, 4.0, -5.0, 1.0]),
+            eval(&[0.0, 0.0, 8.0, -19.0, 9.0, -1.0]),
+            eval(&[0.0, 0.0, 16.0, -65.0, 55.0, -14.0, 1.0]),
+        );
+    }
+    let a2 = a * a;
+    let density_ratios = [
+        1.0,
+        1.0 - a,
+        1.0 - 3.0 * a + a2,
+        1.0 - 7.0 * a + 6.0 * a2 - a2 * a,
+        1.0 - 15.0 * a + 25.0 * a2 - 10.0 * a2 * a + a2 * a2,
+    ];
+    // W=a/exprel(a), f/p=1/exprel(a), f/q=a. These expressions also
+    // retain the exact small-a limit without dividing two subnormal tails.
+    let log_exprel = gam_math::special::log_exprel(a);
+    normalized_fisher_weight_jet5(
+        eta - log_exprel,
+        density_ratios,
+        (-log_exprel).exp(),
+        a,
+    )
+}
+
+#[cfg(test)]
+mod fisher_tail_tests {
+    use super::*;
+
+    fn entries(jet: (f64, f64, f64, f64, f64)) -> [f64; 5] {
+        [jet.0, jet.1, jet.2, jet.3, jet.4]
+    }
+
+    #[test]
+    fn cauchit_fisher_derivatives_survive_rounded_endpoint_means() {
+        // W(x)~1/(pi*x³). At these x the relative correction is below one ulp,
+        // so derivatives have coefficients [1,-3,12,-60,360]/(pi*x^(3+k)).
+        let coefficients = [1.0, -3.0, 12.0, -60.0, 360.0];
+        for x in [1e20_f64, 1e100] {
+            let positive = entries(component_fisher_weight_jet5(LinkComponent::Cauchit, x));
+            let negative = entries(component_fisher_weight_jet5(LinkComponent::Cauchit, -x));
+            for k in 0..5 {
+                let expected = coefficients[k] / std::f64::consts::PI * x.recip().powi(k as i32 + 3);
+                if expected == 0.0 {
+                    assert_eq!(positive[k], 0.0);
+                    assert_eq!(negative[k], 0.0);
+                } else {
+                    assert!((positive[k] / expected - 1.0).abs() < 3e-12);
+                    let reflected = if k % 2 == 0 { expected } else { -expected };
+                    assert!((negative[k] / reflected - 1.0).abs() < 3e-12);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn cloglog_fisher_keeps_derivatives_after_the_weight_underflows() {
+        for a in [750.0_f64, 780.0] {
+            let eta = a.ln();
+            let a = eta.exp();
+            let jet = entries(component_fisher_weight_jet5(LinkComponent::CLogLog, eta));
+            let reflected = entries(component_fisher_weight_jet5(LinkComponent::LogLog, -eta));
+            let expected_weight = (2.0 * a.ln() - a).exp();
+            let expected_fourth = (6.0 * a.ln() - a
+                + (-14.0 / a + 55.0 / a.powi(2) - 65.0 / a.powi(3)
+                    + 16.0 / a.powi(4)).ln_1p()).exp();
+            let ulp = f64::from_bits(1);
+            assert!((jet[0] - expected_weight).abs() <= 2.0 * ulp);
+            assert!((jet[4] - expected_fourth).abs() <= expected_fourth * 1e-12 + 2.0 * ulp);
+            assert!(jet[4] > 0.0);
+            if a > 770.0 {
+                assert_eq!(jet[0], 0.0);
+            }
+            for k in 0..5 {
+                assert_eq!(reflected[k], if k % 2 == 0 { jet[k] } else { -jet[k] });
+            }
+        }
+    }
+
+    #[test]
+    fn probit_fisher_does_not_square_a_tiny_density_before_division() {
+        let x = 30.0;
+        let density = normal_pdf(x);
+        let expected = density * (density / normal_cdf(-x)) / normal_cdf(x);
+        let actual = probit_fisher_weight_jet5(x).0;
+        assert!(actual > 0.0);
+        assert!((actual / expected - 1.0).abs() < 1e-12);
+        let jet = probit_fisher_weight_jet5(39.0);
+        assert_eq!(jet.0, 0.0);
+        assert!(jet.4 > 0.0, "the fourth derivative remains representable at eta=39");
+    }
+
+    #[test]
+    fn probit_fisher_tail_jets_match_high_precision_reference_values() {
+        // Independently differentiated at 100 decimal digits on MSI, using
+        // the exact binary64 arguments and direct erfc probabilities.
+        let cases: [(f64, [f64; 5]); 3] = [
+            (30.0, [
+                4.425_839_702_671_741e-195,
+                -1.326_279_891_235_266e-193,
+                3.969_997_786_076_700_5e-192,
+                -1.187_023_436_924_559e-190,
+                3.545_199_141_911_902_5e-189,
+            ]),
+            (38.6, [
+                4.436_957_158_657_313e-323,
+                -1.711_517_530_278_145_3e-321,
+                6.597_589_692_438_285e-320,
+                -2.541_537_363_017_449_5e-318,
+                9.783_952_718_564_348e-317,
+            ]),
+            (39.0, [0.0, 0.0, 0.0, 0.0, 1.873_718_168_939_258_4e-323]),
+        ];
+        for (eta, expected) in cases {
+            let actual = entries(probit_fisher_weight_jet5(eta));
+            for k in 0..5 {
+                let tolerance = expected[k].abs() * 3e-12 + 2.0 * f64::from_bits(1);
+                assert!(
+                    (actual[k] - expected[k]).abs() <= tolerance,
+                    "eta={eta}, derivative={k}: {} vs {}",
+                    actual[k], expected[k],
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn noncanonical_fisher_jets_have_finite_limits_at_huge_finite_eta() {
+        for component in [LinkComponent::Cauchit, LinkComponent::CLogLog, LinkComponent::LogLog, LinkComponent::Probit] {
+            for eta in [-f64::MAX, f64::MAX] {
+                assert!(entries(component_fisher_weight_jet5(component, eta)).iter().all(|&v| v == 0.0));
+            }
+        }
+    }
 }
 
 #[inline]
@@ -505,48 +783,30 @@ fn probit_fisher_weight_jet5(eta: f64) -> (f64, f64, f64, f64, f64) {
         return (0.0, 0.0, 0.0, 0.0, 0.0);
     }
     let x = eta;
-    let p = normal_cdf(x);
-    // Compute the complement directly via Phi(-x) rather than `1 - Phi(x)`:
-    // in the positive tail `Phi(x)` rounds to 1.0 and `1 - Phi(x)` cancels to
-    // zero, whereas `Phi(-x)` retains the accurate (tiny) tail mass.
-    let q = normal_cdf(-x);
-    let phi = normal_pdf(x);
-    // Saturated tail: the denominator Phi(1-Phi) has underflowed to zero (or
-    // would divide by zero); the working weight and all derivatives go to zero.
-    if !(p > 0.0) || !(q > 0.0) || p * q <= 0.0 {
+    let x2 = x * x;
+    let x4 = x2 * x2;
+    // Protect the normalized Hermite arithmetic only at |x|>1e76, where
+    // exp(-x²/2) times every polynomial through the required order rounds zero.
+    if x4 > f64::MAX / 256.0 {
         return (0.0, 0.0, 0.0, 0.0, 0.0);
     }
-    // Gaussian derivative ladder: phi^(k) for k = 0..=4 using phi' = -x phi.
-    let phi1 = -x * phi;
-    let phi2 = (x * x - 1.0) * phi;
-    let phi3 = -(x * x * x - 3.0 * x) * phi;
-    let phi4 = (x * x * x * x - 6.0 * x * x + 3.0) * phi;
-    // Derivative arrays (d^k/deta^k) for f = phi, p = Phi, q = 1 - Phi.
-    // p^(0) = Phi, p^(k>=1) = phi^(k-1); q is the negated complement.
-    let f_d = [phi, phi1, phi2, phi3, phi4];
-    let p_d = [p, phi, phi1, phi2, phi3];
-    let q_d = [q, -phi, -phi1, -phi2, -phi3];
-    // Convert derivative arrays to Taylor coefficients a_k = g^(k)/k!.
-    let factorial = [1.0_f64, 1.0, 2.0, 6.0, 24.0];
-    let mut f_t = [0.0_f64; 5];
-    let mut p_t = [0.0_f64; 5];
-    let mut q_t = [0.0_f64; 5];
-    for k in 0..5 {
-        let inv_fact = 1.0 / factorial[k];
-        f_t[k] = f_d[k] * inv_fact;
-        p_t[k] = p_d[k] * inv_fact;
-        q_t[k] = q_d[k] * inv_fact;
-    }
-    let num_t = taylor5_mul(&f_t, &f_t);
-    let den_t = taylor5_mul(&p_t, &q_t);
-    let w_t = taylor5_mul(&num_t, &taylor5_inv(&den_t));
-    // Back to derivatives W^(k) = w_t[k] * k!.
-    (
-        canonicalzero(w_t[0] * factorial[0]),
-        canonicalzero(w_t[1] * factorial[1]),
-        canonicalzero(w_t[2] * factorial[2]),
-        canonicalzero(w_t[3] * factorial[3]),
-        canonicalzero(w_t[4] * factorial[4]),
+    let (log_p, density_over_p) =
+        gam_math::probability::signed_probit_logcdf_and_mills_ratio(x);
+    let (log_q, density_over_q) =
+        gam_math::probability::signed_probit_logcdf_and_mills_ratio(-x);
+    let log_density = -0.5 * x2 - 0.5 * (2.0 * std::f64::consts::PI).ln();
+    // Pair the density with the SMALL-tail Mills ratio, avoiding cancellation
+    // between two nearly equal negative log-density terms.
+    let log_weight = if x >= 0.0 {
+        log_density + density_over_q.ln() - log_p
+    } else {
+        log_density + density_over_p.ln() - log_q
+    };
+    normalized_fisher_weight_jet5(
+        log_weight,
+        [1.0, -x, x2 - 1.0, -x * (x2 - 3.0), x4 - 6.0 * x2 + 3.0],
+        density_over_p,
+        density_over_q,
     )
 }
 
@@ -604,23 +864,7 @@ fn component_inverse_link_pdfthird_derivative(component: LinkComponent, eta: f64
                 &[0.0, -1.0, 7.0, -6.0, 1.0],
             ))
         }
-        LinkComponent::Cauchit => {
-            // Cauchit link:
-            //   mu = 1/2 + atan(eta)/pi,
-            //   d1 = 1 / [pi (1+eta²)].
-            //
-            // Differentiating three more times gives
-            //
-            //   d4 = 24 eta (1-eta²) / [pi (1+eta²)^4].
-            if eta.is_nan() {
-                return f64::NAN;
-            }
-            if !eta.is_finite() {
-                return 0.0;
-            }
-            let denom = 1.0 + eta * eta;
-            24.0 * eta * (1.0 - eta * eta) / (std::f64::consts::PI * denom.powi(4))
-        }
+        LinkComponent::Cauchit => cauchit_inverse_link_d4(eta),
     }
 }
 
@@ -665,18 +909,7 @@ fn component_inverse_link_pdffourth_derivative(component: LinkComponent, eta: f6
                 &[0.0, 1.0, -15.0, 25.0, -10.0, 1.0],
             ))
         }
-        LinkComponent::Cauchit => {
-            // d5 = 24(1 - 10eta^2 + 5eta^4) / [pi * (1+eta^2)^5]
-            if eta.is_nan() {
-                return f64::NAN;
-            }
-            if !eta.is_finite() {
-                return 0.0;
-            }
-            let e2 = eta * eta;
-            let denom = 1.0 + e2;
-            24.0 * (1.0 - 10.0 * e2 + 5.0 * e2 * e2) / (std::f64::consts::PI * denom.powi(5))
-        }
+        LinkComponent::Cauchit => cauchit_inverse_link_d5(eta),
     }
 }
 
@@ -1083,38 +1316,7 @@ pub fn component_inverse_link_jet(component: LinkComponent, eta: f64) -> Inverse
                 d3: stable_nonnegative_poly_times_exp_neg(r, &[0.0, 1.0, -3.0, 1.0]),
             }
         }
-        LinkComponent::Cauchit => {
-            if eta.is_nan() {
-                return InverseLinkJet {
-                    mu: f64::NAN,
-                    d1: f64::NAN,
-                    d2: f64::NAN,
-                    d3: f64::NAN,
-                };
-            }
-            let den = 1.0 + eta * eta;
-            let d1 = if eta.is_finite() {
-                1.0 / (std::f64::consts::PI * den)
-            } else {
-                0.0
-            };
-            let d2 = if eta.is_finite() {
-                -2.0 * eta / (std::f64::consts::PI * den * den)
-            } else {
-                0.0
-            };
-            let d3 = if eta.is_finite() {
-                (6.0 * eta * eta - 2.0) / (std::f64::consts::PI * den * den * den)
-            } else {
-                0.0
-            };
-            InverseLinkJet {
-                mu: 0.5 + eta.atan() / std::f64::consts::PI,
-                d1,
-                d2,
-                d3,
-            }
-        }
+        LinkComponent::Cauchit => cauchit_inverse_link_jet(eta),
     })
 }
 
@@ -1409,20 +1611,7 @@ fn standard_link_complement(link: StandardLink, eta: f64, mu: f64) -> f64 {
                 if !r.is_finite() { 1.0 } else { -(-r).exp_m1() }
             }
         }
-        StandardLink::Cauchit => {
-            // mu = 1/2 + atan(eta)/pi  =>  1 - mu = 1/2 - atan(eta)/pi. For eta > 0
-            // this cancels toward zero; atan(1/eta) = pi/2 - atan(eta) exactly, so
-            // 1 - mu = atan(1/eta)/pi with no loss.
-            if eta.is_nan() {
-                f64::NAN
-            } else if !eta.is_finite() {
-                if eta > 0.0 { 0.0 } else { 1.0 }
-            } else if eta > 0.0 {
-                (1.0 / eta).atan() / std::f64::consts::PI
-            } else {
-                0.5 - eta.atan() / std::f64::consts::PI
-            }
-        }
+        StandardLink::Cauchit => cauchit_mean(-eta),
         // Logit carries its own tail complement on the canonical path; identity
         // and log are not Bernoulli-variance links. The naive complement is
         // exact enough for these here.
@@ -1643,16 +1832,8 @@ fn component_inverse_link_mu_d1(component: LinkComponent, eta: f64) -> (f64, f64
             )
         }
         LinkComponent::Cauchit => {
-            if eta.is_nan() {
-                return (f64::NAN, f64::NAN);
-            }
-            let den = 1.0 + eta * eta;
-            let d1 = if eta.is_finite() {
-                1.0 / (std::f64::consts::PI * den)
-            } else {
-                0.0
-            };
-            (0.5 + eta.atan() / std::f64::consts::PI, canonicalzero(d1))
+            let (q, _) = cauchit_rational_factors(eta);
+            (cauchit_mean(eta), q / std::f64::consts::PI)
         }
     }
 }
@@ -3076,6 +3257,77 @@ pub fn sas_inverse_link_jetwith_param_partials(
 mod tests {
     use super::*;
     use gam_problem::{InverseLink, LikelihoodSpec, LinkComponent, MixtureLinkSpec, SasLinkState};
+
+    #[test]
+    fn cauchit_derivatives_preserve_representable_extreme_tails() {
+        // At these eta values the denominator powers in the unscaled formulas
+        // overflow, although every listed derivative remains representable.
+        let cases = [
+            (1_u32, 1.0e150_f64, 1.0),
+            (1, 1.0e155, 1.0),
+            (2, 1.0e100, -2.0),
+            (3, 1.0e80, 6.0),
+            (4, 1.0e64, -24.0),
+            (5, 1.0e52, 120.0),
+        ];
+        for (order, eta, coefficient) in cases {
+            // The leading tail derivative is (-1)^(order-1) order! /
+            // (pi eta^(order+1)); corrections here are far below one ulp.
+            let expected = (0..=order)
+                .fold(coefficient / std::f64::consts::PI, |value, _| value / eta);
+            for sign in [-1.0, 1.0] {
+                let x = sign * eta;
+                let jet = component_inverse_link_jet(LinkComponent::Cauchit, x);
+                let actual = match order {
+                    1 => jet.d1,
+                    2 => jet.d2,
+                    3 => jet.d3,
+                    4 => component_inverse_link_pdfthird_derivative(LinkComponent::Cauchit, x),
+                    5 => component_inverse_link_pdffourth_derivative(LinkComponent::Cauchit, x),
+                    _ => unreachable!(),
+                };
+                let expected = if order % 2 == 0 { sign * expected } else { expected };
+                assert!(actual.is_finite() && actual != 0.0, "order={order}, eta={x}: {actual}");
+                let tolerance = 4.0 * f64::from_bits(1) + 3.0e-14 * expected.abs();
+                assert!((actual - expected).abs() <= tolerance,
+                    "order={order}, eta={x}: actual={actual}, expected={expected}");
+            }
+        }
+    }
+
+    #[test]
+    fn cauchit_mean_fast_path_and_complement_share_exact_tail_arithmetic() {
+        for eta in [
+            -f64::MAX, -1.0e150, -5.0, -1.0, -0.5, 0.0, 0.5, 1.0, 5.0,
+            1.0e150, f64::MAX,
+        ] {
+            let jet = component_inverse_link_jet(LinkComponent::Cauchit, eta);
+            let fast = component_inverse_link_mu_d1(LinkComponent::Cauchit, eta);
+            assert_eq!(fast, (jet.mu, jet.d1));
+            let complement = standard_link_complement(StandardLink::Cauchit, eta, jet.mu);
+            assert_eq!(complement, component_inverse_link_jet(LinkComponent::Cauchit, -eta).mu);
+            assert!(jet.mu.is_finite() && complement.is_finite());
+            if eta < 0.0 {
+                assert!(jet.mu > 0.0, "representable lower tail at {eta}");
+            } else {
+                assert!(complement > 0.0, "representable upper tail at {eta}");
+            }
+            assert!(jet.d1.is_finite() && jet.d2.is_finite() && jet.d3.is_finite());
+            assert!(component_inverse_link_pdfthird_derivative(LinkComponent::Cauchit, eta).is_finite());
+            assert!(component_inverse_link_pdffourth_derivative(LinkComponent::Cauchit, eta).is_finite());
+        }
+        for eta in [f64::NEG_INFINITY, f64::INFINITY] {
+            let jet = component_inverse_link_jet(LinkComponent::Cauchit, eta);
+            assert_eq!(jet.mu, if eta > 0.0 { 1.0 } else { 0.0 });
+            assert_eq!((jet.d1, jet.d2, jet.d3), (0.0, 0.0, 0.0));
+            assert_eq!(component_inverse_link_pdfthird_derivative(LinkComponent::Cauchit, eta), 0.0);
+            assert_eq!(component_inverse_link_pdffourth_derivative(LinkComponent::Cauchit, eta), 0.0);
+        }
+        let nan = component_inverse_link_jet(LinkComponent::Cauchit, f64::NAN);
+        assert!(nan.mu.is_nan() && nan.d1.is_nan() && nan.d2.is_nan() && nan.d3.is_nan());
+        assert!(component_inverse_link_pdfthird_derivative(LinkComponent::Cauchit, f64::NAN).is_nan());
+        assert!(component_inverse_link_pdffourth_derivative(LinkComponent::Cauchit, f64::NAN).is_nan());
+    }
 
     fn assert_finite_eta_domain_error(
         error: EstimationError,
@@ -4642,5 +4894,32 @@ mod tests {
             "loglog d5 should equal exp(-r) * (r - 15r^2 + 25r^3 - 10r^4 + r^5) at eta={eta}; got {d5} vs {expected}"
         );
         assert!(d5 > 0.0, "loglog d5 should be positive at eta=0; got {d5}");
+    }
+}
+
+#[cfg(test)]
+mod probit_density_tail_tests {
+    use super::*;
+
+    #[test]
+    fn probit_derivatives_survive_underflow_of_the_unweighted_density() {
+        for x in [-38.6_f64, 38.6] {
+            assert_eq!(normal_pdf(x), 0.0);
+            let jet = probit_jet(x);
+            let actual = [jet.d2, jet.d3, probit_pdfthird_derivative(x), probit_pdffourth_derivative(x)];
+            let factors = [-x, x * x - 1.0, -x * (x * x - 3.0), x.powi(4) - 6.0 * x * x + 3.0];
+            for (&derivative, &factor) in actual.iter().zip(&factors) {
+                let expected = factor.signum()
+                    * ((factor.abs() / std::f64::consts::TAU.sqrt()).ln() - x * (0.5 * x)).exp();
+                assert!(derivative != 0.0 && derivative.is_finite());
+                assert!((derivative - expected).abs() <= f64::from_bits(2));
+            }
+        }
+        for x in [-f64::MAX, f64::MAX] {
+            let jet = probit_jet(x);
+            assert_eq!([jet.d1, jet.d2, jet.d3], [0.0; 3]);
+            assert_eq!(probit_pdfthird_derivative(x), 0.0);
+            assert_eq!(probit_pdffourth_derivative(x), 0.0);
+        }
     }
 }
