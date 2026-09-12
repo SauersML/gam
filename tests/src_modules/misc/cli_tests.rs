@@ -8146,15 +8146,15 @@ fn probit_location_scalewiggle_posterior_mean_matches_mc_in_largevariance_regime
     );
 }
 
-// TEMPORARY gam#2695 probe — a linkwiggle fit whose warp is genuinely ON.
-#[test]
-fn probe_2695_live_warp() {
+/// gam#2695: a log-logistic AFT truth fitted with a GAUSSIAN location-scale
+/// link. The monotone link warp is the only block that can absorb the
+/// difference, so a linkwiggle fit must converge and save its warp block.
+/// Degree 0 (no linkwiggle) is the fixture's positive control. One test per
+/// degree, so one degree's failure or runtime cannot hide another's verdict.
+fn fit_survival_location_scale_live_warp_2695(degree: usize, internal_knots: usize) {
     gam_runtime::test_support::install_diagnostic_logger();
     let dir = tempdir().unwrap_or_else(|e| panic!("{} failed: {:?}", "tempdir", e));
     let csv_path = dir.path().join("live_warp.csv");
-    // A log-logistic AFT truth fitted with a GAUSSIAN location-scale link: the
-    // monotone link warp is the only block that can absorb the difference, so
-    // it is driven away from zero rather than shrunk to it.
     let mut rows = String::from("entry,exit,event,x\n");
     let n = 240usize;
     for i in 0..n {
@@ -8166,72 +8166,77 @@ fn probe_2695_live_warp() {
         rows.push_str(&format!("0,{t:.6},{event},{x:.6}\n"));
     }
     std::fs::write(&csv_path, rows).unwrap_or_else(|e| panic!("{} failed: {:?}", "write csv", e));
-    for (degree, knots) in [(0usize, 0usize), (2, 3), (3, 4), (4, 4)] {
-        let out_path = dir.path().join(format!("live_warp_{degree}.model.json"));
-        let result = super::run_survival(SurvivalArgs {
-            data: csv_path.clone(),
-            entry: Some("entry".to_string()),
-            exit: "exit".to_string(),
-            event: "event".to_string(),
-            formula: if degree == 0 {
-                "1 + x".to_string()
-            } else {
-                format!("1 + x + linkwiggle(degree={degree}, internal_knots={knots})")
-            },
-            predict_noise: None,
-            survival_likelihood: "location-scale".to_string(),
-            survival_distribution: "gaussian".to_string(),
-            link: None,
-            mixture_rho: None,
-            sas_init: None,
-            beta_logistic_init: None,
-            survival_time_anchor: None,
-            baseline_target: "linear".to_string(),
-            baseline_scale: None,
-            baseline_shape: None,
-            baseline_rate: None,
-            baseline_makeham: None,
-            time_basis: "ispline".to_string(),
-            time_degree: 3,
-            time_num_internal_knots: 6,
-            threshold_time_k: None,
-            threshold_time_degree: 3,
-            sigma_time_k: None,
-            sigma_time_degree: 3,
-            slope_time_k: None,
-            slope_time_degree: 3,
-            scale_dimensions: false,
-            out: Some(out_path.clone()),
-            slope_formula: None,
-            z_column: None,
-            weights_column: None,
-            offset_column: None,
-            noise_offset_column: None,
-            frailty_kind: None,
-            frailty_sd: None,
-            hazard_loading: None,
-            persistent_warm_start_store: None,
-        });
-        match result {
-            Ok(_) => {
-                let saved = SavedModel::load_from_path(&out_path).expect("load");
-                let beta_w = saved.beta_link_wiggle.clone().unwrap_or_default();
-                let amp = beta_w.iter().fold(0.0_f64, |a, b| a.max(b.abs()));
-                println!(
-                    "[2695-LIVE] degree={degree} FIT OK  max|beta_w|={amp:.6e} p_w={}",
-                    beta_w.len()
-                );
-            }
-            Err(e) => {
-                let rejects: Vec<String> = e
-                    .match_indices("rejects [model,likelihood,objective,feasibility]")
-                    .map(|(i, _)| e[i..(i + 70).min(e.len())].to_string())
-                    .collect();
-                println!(
-                    "[2695-LIVE] degree={degree} FAILED; reject buckets: {:?}",
-                    rejects
-                );
-            }
-        }
+    let out_path = dir.path().join(format!("live_warp_{degree}.model.json"));
+    super::run_survival(SurvivalArgs {
+        data: csv_path.clone(),
+        entry: Some("entry".to_string()),
+        exit: "exit".to_string(),
+        event: "event".to_string(),
+        formula: if degree == 0 {
+            "1 + x".to_string()
+        } else {
+            format!("1 + x + linkwiggle(degree={degree}, internal_knots={internal_knots})")
+        },
+        predict_noise: None,
+        survival_likelihood: "location-scale".to_string(),
+        survival_distribution: "gaussian".to_string(),
+        link: None,
+        mixture_rho: None,
+        sas_init: None,
+        beta_logistic_init: None,
+        survival_time_anchor: None,
+        baseline_target: "linear".to_string(),
+        baseline_scale: None,
+        baseline_shape: None,
+        baseline_rate: None,
+        baseline_makeham: None,
+        time_basis: "ispline".to_string(),
+        time_degree: 3,
+        time_num_internal_knots: 6,
+        threshold_time_k: None,
+        threshold_time_degree: 3,
+        sigma_time_k: None,
+        sigma_time_degree: 3,
+        slope_time_k: None,
+        slope_time_degree: 3,
+        scale_dimensions: false,
+        out: Some(out_path.clone()),
+        slope_formula: None,
+        z_column: None,
+        weights_column: None,
+        offset_column: None,
+        noise_offset_column: None,
+        frailty_kind: None,
+        frailty_sd: None,
+        hazard_loading: None,
+        persistent_warm_start_store: None,
+    })
+    .unwrap_or_else(|e| panic!("degree={degree} survival location-scale fit failed: {e}"));
+    let saved = SavedModel::load_from_path(&out_path).expect("load saved live-warp model");
+    let warp_width = saved.beta_link_wiggle.as_ref().map_or(0, |beta| beta.len());
+    if degree == 0 {
+        assert_eq!(warp_width, 0, "a fit without linkwiggle saved a warp block");
+    } else {
+        assert!(warp_width > 0, "degree={degree} linkwiggle fit saved no warp coefficients");
     }
+}
+
+#[test]
+fn survival_location_scale_live_warp_fits_without_linkwiggle_2695() {
+    fit_survival_location_scale_live_warp_2695(0, 0);
+}
+
+#[test]
+fn survival_location_scale_live_warp_fits_linkwiggle_degree2_2695() {
+    fit_survival_location_scale_live_warp_2695(2, 3);
+}
+
+#[test]
+fn survival_location_scale_live_warp_fits_linkwiggle_degree3_2695() {
+    fit_survival_location_scale_live_warp_2695(3, 4);
+}
+
+#[test]
+fn survival_location_scale_live_warp_fits_linkwiggle_degree4_2695() {
+    fit_survival_location_scale_live_warp_2695(4, 4);
 }
