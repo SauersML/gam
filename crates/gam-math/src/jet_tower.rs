@@ -1484,23 +1484,6 @@ pub fn program_full_tower<const K: usize, P: RowProgram<K> + ?Sized>(
 
 // ── The oracle ───────────────────────────────────────────────────────
 
-/// One row's worth of hand-written kernel outputs, as claimed by a
-/// `RowKernel` implementation, packaged for verification against the
-/// tower truth. Plain data (no trait coupling) so any kernel — whatever
-/// its visibility — can be audited from its own test module.
-pub struct KernelChannels<const K: usize> {
-    /// Claimed `(nll, ∇, H)` from `row_kernel`.
-    pub value: f64,
-    /// Claimed gradient.
-    pub gradient: [f64; K],
-    /// Claimed Hessian.
-    pub hessian: [[f64; K]; K],
-    /// Claimed `row_third_contracted(dir)` outputs as `(dir, claim)` pairs.
-    pub third: Vec<([f64; K], [[f64; K]; K])>,
-    /// Claimed `row_fourth_contracted(u, v)` outputs as `(u, v, claim)`.
-    pub fourth: Vec<([f64; K], [f64; K], [[f64; K]; K])>,
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

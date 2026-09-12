@@ -867,5 +867,17 @@
     ],
     "reason": "Retired arbitrary floor constants for #2469; each use became an exact limit, a rounding band from gam_linalg::roundoff, or a refusal.",
     "evidence": "git grep on the landing tree finds no remaining reference to any retired name; MSI compile and test verification runs on the landed sha."
+  },
+  {
+    "base": "7465420c033aaafc419d8a8c982c5b7345dbccec",
+    "items": [
+      "crates/gam-math/src/jet_tower.rs:struct:KernelChannels",
+      "crates/gam-math/src/probability.rs:fn:cone_boundary_log_factor",
+      "crates/gam-math/src/probability.rs:fn:cone_boundary_log_factor_and_derivatives",
+      "crates/gam-math/src/probability.rs:fn:signed_weighted_chi_square_sf",
+      "crates/gam-math/src/probability.rs:fn:weighted_chi_square_sf"
+    ],
+    "reason": "user directive: delete all useless slop",
+    "evidence": "git grep -nw at the base finds each name only at its own definition and in doc prose. The two chi-square wrappers forward to weighted_chi_square_sf_with_bound and signed_weighted_chi_square_sf_to_tolerance, which production (smooth_term_lr.rs) calls; their documentation moved onto those entry points. cone_boundary_log_factor was referenced only by cone_boundary_log_factor_and_derivatives. KernelChannels is constructed nowhere."
   }
 ]

@@ -147,7 +147,7 @@ pub enum SmoothLrReferenceSource {
 /// # The Monte-Carlo error is removed where it would matter
 ///
 /// The replay is a simulation, so its tail is an estimate. The conditional tail
-/// is NOT — `gam_math::probability::weighted_chi_square_sf` evaluates it by
+/// is NOT — `gam_math::probability::signed_weighted_chi_square_sf_to_tolerance` evaluates it by
 /// inversion. The two are strongly dependent (the same draws, differing only in
 /// whether `t` is selected or held at one), so the replay reports the
 /// DIFFERENCE and adds it to the exact conditional value:
@@ -1694,7 +1694,8 @@ fn split_mix64(state: u64) -> u64 {
 /// figures). It opens in the middle, at moderate shrinkage, which is exactly
 /// where a smooth term carrying real signal sits. Nothing about the statistic requires that
 /// trade: the weights are the parameters of an exactly invertible
-/// characteristic function, and `gam_math::probability::weighted_chi_square_sf`
+/// characteristic function, and
+/// `gam_math::probability::signed_weighted_chi_square_sf_to_tolerance`
 /// inverts it (Imhof) with a *returned* truncation bound of `1e-11` — eight
 /// orders below the smallest tail any of the numbers above resolves. So the
 /// reference is `P(Σ_j w_j χ²_1 > W)` itself, and the `(ν, g)` pair survives only
