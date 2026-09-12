@@ -164,5 +164,15 @@
     "unit_test_decreases": {
       "crates/gam-data": 1
     }
+  },
+  {
+    "base": "d33caf143c4c3a61d1ab0d3776a595286a87250d",
+    "reason": "user directive: delete all useless slop",
+    "evidence": "The two gam-model-kernels unit tests removed (cell_moment_fingerprint_exact_cache_matches_current_evaluator, fuzzy_cell_moment_fingerprint_error_scales_with_epsilon) existed only to exercise cell_moment_cache_key, which only tests and the deleted cell_moment_dedup_large_scale_shape bench named; production evaluates cell moments without that key. Re-confirmed with git grep -nw over crates src tests examples bench benches. source_removal_guard and test_census pass base..head; MSI verification at the pushed sha follows.",
+    "removed_pins": {},
+    "test_count_decrease": 2,
+    "unit_test_decreases": {
+      "crates/gam-model-kernels": 2
+    }
   }
 ]

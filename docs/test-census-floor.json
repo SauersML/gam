@@ -1,5 +1,5 @@
 {
-  "generated_from": "315c5fa8990d269aa22e5a28029f6a5f34bd3206",
+  "generated_from": "9709850b01468302f974ed116183a1843e958015",
   "units": {
     "crates/gam-cli": 27,
     "crates/gam-config": 18,
@@ -13,7 +13,7 @@
     "crates/gam-linalg": 282,
     "crates/gam-math": 258,
     "crates/gam-model-api": 10,
-    "crates/gam-model-kernels": 90,
+    "crates/gam-model-kernels": 88,
     "crates/gam-models": 1430,
     "crates/gam-predict": 105,
     "crates/gam-problem": 356,
