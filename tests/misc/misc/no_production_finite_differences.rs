@@ -113,16 +113,6 @@ const SANCTIONED_FD_FILES: &[&str] = &[
     "crates/gam-solve/src/inference/certificate_impls.rs", // serialises the audit certificate
     "crates/gam-report/src/lib.rs",        // reports the audit certificate
     "crates/gam-cli/src/main/run_sample_generate_report.rs",
-    // #2566 log-sigma curvature certificate -- NOT the latent-survival fit math.
-    // `latent_survival_log_sigma_curvature_certified` differences the analytic
-    // GRADIENT with a Richardson authority purely to MEASURE the error on the
-    // curvature it returns; the production value comes from the analytic jet and
-    // the authority never feeds it. It is a separate entry point costing ~8 extra
-    // row evaluations, deliberately NOT reached from
-    // `latent_survival_row_primary_gradient_hessian`, which every fit row uses and
-    // which stays fully covered by the ban. Carved out of the 6,300-line parent
-    // for exactly that reason.
-    "crates/gam-models/src/survival/latent/survival/log_sigma_curvature_certificate.rs", // copies certificate fields into the report
 ];
 
 /// The root crate `src` plus every `crates/*/src`, in stable sorted order. This

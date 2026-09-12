@@ -52,17 +52,15 @@
 //!    interior / boundary / near-degenerate ρ.
 //!
 //! 3. The SURVIVAL LAML objective
-//!    (`WorkingModelSurvival::unified_lamlobjective_and_rhogradient`),
-//!    was reached through the public
-//!    `evaluate_survival_lamlcost_and_gradient(rho, β₀)` shim, which d484a091a retired, so no survival arm runs today. That shim
-//!    re-converges the inner survival mode internally (set `λ = exp(ρ)` on
-//!    the active blocks → constrained inner PIRLS → `update_state` →
-//!    unified survival LAML at the re-fitted `β̂(ρ)`), so FD-checking `∇V`
-//!    by varying ρ alone is now possible — the survival counterpart of the
-//!    GLM path's `evaluate_externalgradient` value+gradient surface. The
-//!    survival LAML `½ log|H|` term is genuinely ρ-coupled through the
-//!    re-fitted mode, so its value↔gradient consistency is checked across
-//!    interior / ridge-floor (large-λ) boundary / near-degenerate ρ.
+//!    (`WorkingModelSurvival::unified_lamlobjective_and_rhogradient`) has NO
+//!    arm from this boundary. It used to be reached through the public
+//!    `evaluate_survival_lamlcost_and_gradient(rho, β₀)` shim, which
+//!    re-converged the inner survival mode at each ρ and returned the LAML
+//!    value with its analytic ρ-gradient. d484a091a retired that shim as a
+//!    function no production artifact links, and c0a21b554 removed the gates
+//!    that called it, so no survival value↔gradient loop runs here. The
+//!    survival LAML derivative machinery at large λ is still certified against
+//!    a textbook erfc-LAML scalar in `survival_laml_erfc_oracle_931`.
 //!
 //! # Objective NOT covered from this boundary (documented, not skipped)
 //!
@@ -999,29 +997,25 @@ fn custom_family_lamlobjective_gradient_consistent_at_large_lambda_boundary() {
 // Objective 3: SURVIVAL LAML objective
 // ======================================================================
 //
-// The retired (d484a091a) `WorkingModelSurvival::evaluate_survival_lamlcost_and_gradient(rho, β₀)`
+// NO survival arm runs from this boundary. The retired (d484a091a)
+// `WorkingModelSurvival::evaluate_survival_lamlcost_and_gradient(rho, β₀)`
 // re-converged the inner survival mode at the given ρ (set λ = exp(ρ) on
 // the active penalty blocks → constrained inner PIRLS → `update_state` →
-// the unified survival LAML at the re-fitted β̂(ρ)) and returns the LAML
-// VALUE and its analytic ρ-GRADIENT together. We FD-check `gradient`
-// against the centered difference of `value` across the same regimes the
-// GLM/custom gates use. Because the shim re-fits the inner mode at each
-// ρ±h, the FD is a true total derivative of V(ρ) — the survival closure
-// of the universal gate.
-
-// --- Regime R0: interior ρ (baseline) ----------------------------------
-
-// --- Regime R1: ridge/floor (large-λ) boundary -------------------------
+// the unified survival LAML at the re-fitted β̂(ρ)) and returned the LAML
+// VALUE and its analytic ρ-GRADIENT together, and the gates here FD-checked
+// `gradient` against the centered difference of `value` across the same
+// regimes the GLM/custom gates use. c0a21b554 removed those gates with the
+// shim. What follows is kept as the record of what that loop measured, so a
+// survival arm rebuilt on a live production entry point starts from it.
 //
-// Large ρ ⇒ λ = exp(ρ) huge: the penalized time-covariate deviation is
-// driven hard toward zero and the smallest effective curvature is pinned
-// against the penalty, the survival analogue of the GLM shrinkage-floor /
-// custom large-λ boundary. The unified survival LAML must keep its value
-// and ρ-gradient consistent there.
+// Large-λ record (the former Regime R1). Large ρ ⇒ λ = exp(ρ) huge: the
+// penalized time-covariate deviation is driven hard toward zero and the
+// smallest effective curvature is pinned against the penalty, the survival
+// analogue of the GLM shrinkage-floor / custom large-λ boundary.
 //
-// ρ≥6 is DELIBERATELY EXCLUDED from this self-FD loop because the finite
-// difference of the *value* surface is structurally unsound there, while the
-// analytic gradient is provably correct. This was established by isolating the
+// ρ≥6 was EXCLUDED from that self-FD loop because the finite difference of
+// the *value* surface is structurally unsound there, while the analytic
+// gradient is correct. This was established by isolating the
 // LAML value into its terms (V = −ℓ + ½β'Sβ + ½log|H| − ½log|λS|) and finite-
 // differencing each at the re-converged mode (rnorm ~ 2e-11, deterministic):
 //
@@ -1044,11 +1038,9 @@ fn custom_family_lamlobjective_gradient_consistent_at_large_lambda_boundary() {
 // Independently, the same LAML-derivative machinery is certified to rel < 2e-5
 // against a textbook erfc-LAML scalar on a well-conditioned (unconstrained,
 // Hessian condition < 100) probit fixture in `survival_laml_erfc_oracle_931`.
-// That oracle is the large-λ objective↔gradient consistency gate. Here we keep
-// the largest-λ point at which the value's FD still clears the cancellation
-// floor (ρ=4), whose FD is sound.
-
-// --- Regime R2: near-degenerate eigenvalue pair (Daleckii–Krein) -------
+// That oracle is the live large-λ objective↔gradient consistency gate. The
+// former loop kept ρ=4 as its largest-λ point, the last one at which the
+// value's FD still cleared the cancellation floor.
 
 // ======================================================================
 // Objective 4: SAE-manifold reconstruction objective under an

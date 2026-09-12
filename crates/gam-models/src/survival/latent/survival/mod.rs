@@ -2090,11 +2090,6 @@ struct LatentKernelPrimaryState {
 ///
 /// Keeping these coupled channels together prevents boundary reordering and
 /// cross-row mean/scale mismatches when selecting a derivative backend.
-/// Public because `latent_survival_log_sigma_curvature_certified` takes it: a
-/// certificate a caller cannot invoke is not an export. Widening this was the API
-/// decision that function deferred, and the compiler was right to force it —
-/// `pub(crate)` made the whole certificate dead code, which is the build saying
-/// "this has no consumer" rather than a lint to route around (#2566).
 #[derive(Clone, Copy, Debug)]
 pub struct LatentSurvivalPrimaryPoint {
     pub q_entry: f64,
@@ -4011,9 +4006,10 @@ fn latent_survival_interval_numerator_jet<const K: usize, B: LatentPrimaryJetBac
 ///
 /// **Usable to `log σ ≈ 5.4` on this fixture.** Beyond it there is no correct
 /// value to return, so a consumer needing a definite Hessian must refuse rather
-/// than scale its tolerance. The discriminator to refuse ON already exists — the
-/// gate's Richardson construction reads `0.853` at `log σ = 4` against `109.765`
-/// at `log σ = 6` — and exporting it is #2566's remaining work. A genuine repair
+/// than scale its tolerance. No discriminator to refuse on exists today: the
+/// independent Richardson authority that measured this boundary (it read `0.853`
+/// at `log σ = 4` against `109.765` at `log σ = 6`) was removed as unconsumed
+/// (d484a091a), together with the certificate type it filled. A genuine repair
 /// needs the cumulant formed without the cancelling difference, which is a
 /// reformulation rather than a tolerance.
 fn latent_survival_row_primary_gradient_hessian(
@@ -7119,13 +7115,6 @@ type LatentBinaryHessianWorkspace = LatentHessianWorkspace<LatentBinaryFamily>;
 /// `CustomFamily` for both latent families. Lexically split out (#2601)
 /// when this file hit the 10,000-line ceiling; see `survival/custom_family.rs`.
 mod custom_family;
-
-/// The #2566 `log sigma` curvature certificate and its independent authority.
-/// Split out so the tracked scanner exemption covers the certificate machinery
-/// rather than this whole file, which is the fit math and must stay covered.
-mod log_sigma_curvature_certificate;
-
-pub use log_sigma_curvature_certificate::CertifiedLogSigmaCurvature;
 
 #[cfg(test)]
 mod tests;
