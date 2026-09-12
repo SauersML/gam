@@ -1658,6 +1658,30 @@ fn arena_square<'arena>(
     })
 }
 
+/// `total += first · input.h + second · input.g ⊗ input.g`, one row at a time.
+///
+/// Each entry receives `first·h_ab + (second·g_a)·g_b`, the value a per-entry
+/// loop evaluating `first * h[ab] + second * g[a] * g[b]` adds, so a composed
+/// sum that calls this once per input matches that loop to the bit while its
+/// inner loop runs over whole rows (gam#2892).
+#[inline(always)]
+fn add_first_second_hessian(total: &mut [f64], input: &DynamicOrder2<'_>, first: f64, second: f64) {
+    let n = input.g.len();
+    if n == 0 {
+        return;
+    }
+    for ((total_row, h_row), &g_a) in total
+        .chunks_exact_mut(n)
+        .zip(input.h.chunks_exact(n))
+        .zip(input.g)
+    {
+        let scaled = second * g_a;
+        for ((entry, &h_ab), &g_b) in total_row.iter_mut().zip(h_row).zip(input.g) {
+            *entry += first * h_ab + scaled * g_b;
+        }
+    }
+}
+
 impl<'arena> DynamicOrder2<'arena> {
     /// `Σ_k scales[k] · lefts[k] · rights[k]` in one pass over the result.
     ///
@@ -1900,26 +1924,22 @@ impl<'arena> RuntimeJetScalar<'arena> for DynamicOrder2<'arena> {
         for stack in derivative_stacks {
             value += stack[0];
         }
-        let gradient = arena_vector(arena, dimension, |i| {
-            let mut total = 0.0;
-            for ((input, &input_scale), stack) in
-                inputs.iter().zip(input_scales).zip(derivative_stacks)
-            {
-                total += stack[1] * input_scale * input.g[i];
+        // One input at a time over whole channels, in the per-entry term order
+        // of a loop over the inputs inside each entry (gam#2892).
+        let gradient = arena.zeros(dimension);
+        let hessian = arena.zeros(dimension * dimension);
+        for ((input, &input_scale), stack) in inputs.iter().zip(input_scales).zip(derivative_stacks) {
+            let gradient_scale = stack[1] * input_scale;
+            for (total, &channel) in gradient.iter_mut().zip(input.g) {
+                *total += gradient_scale * channel;
             }
-            total
-        });
-        let hessian = arena_square(arena, dimension, |i, j, ij| {
-            let mut total = 0.0;
-            for ((input, &input_scale), stack) in
-                inputs.iter().zip(input_scales).zip(derivative_stacks)
-            {
-                let first = stack[1] * input_scale;
-                let second = stack[2] * input_scale * input_scale;
-                total += first * input.h[ij] + second * input.g[i] * input.g[j];
-            }
-            total
-        });
+            add_first_second_hessian(
+                hessian,
+                input,
+                stack[1] * input_scale,
+                stack[2] * input_scale * input_scale,
+            );
+        }
         Self {
             arena,
             v: value,
@@ -2065,20 +2085,17 @@ impl<'arena> RuntimeJetScalar<'arena> for DynamicOrder2<'arena> {
         for stack in derivative_stacks {
             value += stack[0];
         }
-        let gradient = arena_vector(arena, dimension, |i| {
-            let mut total = 0.0;
-            for (input, stack) in inputs.iter().zip(derivative_stacks) {
-                total += stack[1] * input.g[i];
+        // One input at a time over whole channels, adding the terms to each
+        // entry in the same order as a per-entry loop over the inputs, so the
+        // result is bit-identical to it but the inner loops vectorize.
+        let gradient = arena.zeros(dimension);
+        let hessian = arena.zeros(dimension * dimension);
+        for (input, stack) in inputs.iter().zip(derivative_stacks) {
+            for (total, &channel) in gradient.iter_mut().zip(input.g) {
+                *total += stack[1] * channel;
             }
-            total
-        });
-        let hessian = arena_square(arena, dimension, |i, j, ij| {
-            let mut total = 0.0;
-            for (input, stack) in inputs.iter().zip(derivative_stacks) {
-                total += stack[1] * input.h[ij] + stack[2] * input.g[i] * input.g[j];
-            }
-            total
-        });
+            add_first_second_hessian(hessian, input, stack[1], stack[2]);
+        }
         Self {
             arena,
             v: value,
@@ -2105,20 +2122,18 @@ impl<'arena> RuntimeJetScalar<'arena> for DynamicOrder2<'arena> {
         for (input, &weight) in inputs.iter().zip(weights) {
             value += input.v * weight;
         }
-        let gradient = arena_vector(arena, dimension, |i| {
-            let mut total = 0.0;
-            for (input, &weight) in inputs.iter().zip(weights) {
-                total += input.g[i] * weight;
+        // Same per-entry term order as a loop over the inputs inside each
+        // entry, one vectorizable pass per input (gam#2892).
+        let gradient = arena.zeros(dimension);
+        let hessian = arena.zeros(dimension * dimension);
+        for (input, &weight) in inputs.iter().zip(weights) {
+            for (total, &channel) in gradient.iter_mut().zip(input.g) {
+                *total += channel * weight;
             }
-            total
-        });
-        let hessian = arena_square(arena, dimension, |_, _, ij| {
-            let mut total = 0.0;
-            for (input, &weight) in inputs.iter().zip(weights) {
-                total += input.h[ij] * weight;
+            for (total, &channel) in hessian.iter_mut().zip(input.h) {
+                *total += channel * weight;
             }
-            total
-        });
+        }
         Self {
             arena,
             v: value,
@@ -2228,9 +2243,17 @@ impl<'arena> RuntimeJetScalar<'arena> for DynamicOrder2<'arena> {
     /// ```
     ///
     /// so the `R`-dependent coefficients collapse into two scalars, `Σ L_i.v·s1_i`
-    /// and `Σ L_i.v·s2_i`, that multiply `R.h` and `R.g⊗R.g` ONCE. The default
-    /// walks the same algebra through `2N` intermediate jets, each of which
-    /// allocates and streams its own `n²` block; this writes one.
+    /// and `Σ L_i.v·s2_i`, that multiply `R.h` and `R.g⊗R.g` ONCE. The cross
+    /// terms collapse the same way: `Σ_i s1_i·(L_i.g_a·R.g_b + R.g_a·L_i.g_b)` is
+    /// `L1_a·R.g_b + R.g_a·L1_b` with `L1 = Σ_i s1_i·L_i.g`. The default walks
+    /// the same algebra through `2N` intermediate jets, each of which allocates
+    /// and streams its own `n²` block; this writes one.
+    ///
+    /// The per-left sums run one left at a time over whole channels. Reading
+    /// every left inside the `(a, b)` loop instead does `O(N·n²)` scattered,
+    /// bounds-checked reads that do not vectorize, and on the flexible
+    /// marginal-slope arm (`n = 19`) that loop was 47% of the fit's samples
+    /// (gam#2892).
     #[inline]
     fn weighted_compose_sum(
         lefts: &[Self],
@@ -2257,23 +2280,27 @@ impl<'arena> RuntimeJetScalar<'arena> for DynamicOrder2<'arena> {
             right_first += left.v * stack[1];
             right_second += left.v * stack[2];
         }
-        let g = arena_vector(arena, n, |a| {
-            let mut channel = addend.g[a] + right_first * right.g[a];
-            for (left, stack) in lefts.iter().zip(derivative_stacks) {
-                channel += stack[0] * left.g[a];
+        let g = arena_vector(arena, n, |a| addend.g[a] + right_first * right.g[a]);
+        let left_first = arena.zeros(n);
+        for (left, stack) in lefts.iter().zip(derivative_stacks) {
+            for ((channel, first), &left_g) in g.iter_mut().zip(left_first.iter_mut()).zip(left.g) {
+                *channel += stack[0] * left_g;
+                *first += stack[1] * left_g;
             }
-            channel
-        });
+        }
+        let left_first: &[f64] = left_first;
         let h = arena_square(arena, n, |a, b, ab| {
-            let mut channel = addend.h[ab]
+            addend.h[ab]
                 + right_first * right.h[ab]
-                + right_second * right.g[a] * right.g[b];
-            for (left, stack) in lefts.iter().zip(derivative_stacks) {
-                channel += stack[1] * (left.g[a] * right.g[b] + right.g[a] * left.g[b])
-                    + stack[0] * left.h[ab];
-            }
-            channel
+                + right_second * right.g[a] * right.g[b]
+                + left_first[a] * right.g[b]
+                + right.g[a] * left_first[b]
         });
+        for (left, stack) in lefts.iter().zip(derivative_stacks) {
+            for (channel, &left_h) in h.iter_mut().zip(left.h) {
+                *channel += stack[0] * left_h;
+            }
+        }
         Self {
             arena,
             v: value,
