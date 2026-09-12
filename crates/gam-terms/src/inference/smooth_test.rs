@@ -287,7 +287,9 @@ fn whiten_to_fitted_space(
     if max_ev <= 0.0 {
         return None;
     }
-    let tol = max_ev * 1e-10;
+    // A Gram eigenvalue inside the symmetric eigensolve's backward-error band
+    // `k·ε·max|μ|` cannot be told from zero; those modes are the null space.
+    let tol = k as f64 * f64::EPSILON * max_ev;
     let rows: Vec<usize> = (0..evals.len()).filter(|&i| evals[i] > tol).collect();
     if rows.is_empty() {
         return None;
@@ -309,11 +311,12 @@ fn whiten_to_fitted_space(
 }
 
 /// Returns the rank-`rank` truncated Wald quadratic together with the number of
-/// covariance directions (eigenmodes above the relative tolerance) that were
-/// actually summed into it. The `used` count is the *effective rank of the
-/// statistic*: it can fall below `rank` when the covariance subblock is itself
-/// rank-deficient. Callers fold it into the χ² reference degrees of freedom so
-/// the tail probability is never evaluated against a degenerate ~0 d.f.
+/// covariance directions (eigenmodes above the eigensolver's rounding band)
+/// that were actually summed into it. The `used` count is the *effective rank of
+/// the statistic*: it can fall below `rank` when the covariance subblock is
+/// itself rank-deficient. Callers fold it into the χ² reference degrees of
+/// freedom so the tail probability is never evaluated against a degenerate
+/// ~0 d.f.
 fn truncated_quadratic(beta: &Array1<f64>, cov: &Array2<f64>, rank: usize) -> Option<(f64, usize)> {
     if beta.is_empty() || cov.nrows() != beta.len() || cov.ncols() != beta.len() || rank == 0 {
         return None;
@@ -321,11 +324,13 @@ fn truncated_quadratic(beta: &Array1<f64>, cov: &Array2<f64>, rank: usize) -> Op
     let (evals, evecs) = cov.to_owned().eigh(faer::Side::Lower).ok()?;
     let mut order: Vec<usize> = (0..evals.len()).collect();
     order.sort_by(|&a, &b| evals[b].total_cmp(&evals[a]));
-    let tol = evals
+    // A covariance eigenvalue inside the eigensolve's backward-error band
+    // `k·ε·max|λ|` cannot be told from zero, so it has no inverse to sum.
+    let max_abs_eigenvalue = evals
         .iter()
         .copied()
-        .fold(0.0_f64, |acc, v| acc.max(v.abs()))
-        * 1e-10;
+        .fold(0.0_f64, |acc, v| acc.max(v.abs()));
+    let tol = evals.len() as f64 * f64::EPSILON * max_abs_eigenvalue;
     let mut q = 0.0;
     let mut used = 0usize;
     for idx in order {
@@ -681,5 +686,32 @@ mod tests {
         assert!((out.ref_df - 1.0).abs() < 1e-9, "ref_df={}", out.ref_df);
         assert!(out.statistic.is_finite() && out.statistic > 0.0);
         assert!((0.0..=1.0).contains(&out.p_value));
+    }
+
+    /// A Gram mode far below `1e-10` of the largest but above the eigensolver's
+    /// rounding band is a real fitted direction and stays in the whitened frame.
+    #[test]
+    fn whitening_keeps_a_resolved_small_gram_mode() {
+        let beta = array![1.0, 1.0];
+        let cov = array![[0.5, 0.0], [0.0, 0.5]];
+        let gram = array![[1.0, 0.0], [0.0, 1e-12]];
+        let (_, cov_w) = whiten_to_fitted_space(&beta, &cov, &gram).expect("whitened frame");
+        assert_eq!(cov_w.nrows(), 2, "the 1e-12 Gram mode is resolved");
+    }
+
+    /// A covariance mode between the eigensolver's rounding band and `1e-10` of
+    /// the largest is resolved, so its projection enters the Wald quadratic.
+    #[test]
+    fn truncated_quadratic_sums_a_resolved_small_covariance_mode() {
+        let beta = array![0.0, 1e-6];
+        let cov = array![[1.0, 0.0], [0.0, 1e-12]];
+        let (q, used) = truncated_quadratic(&beta, &cov, 2).expect("wald quadratic");
+        assert_eq!(used, 2, "the 1e-12 covariance mode is resolved");
+        // (1e-6)² / 1e-12 = 1 up to the rounding of the two literals, the square
+        // and the division.
+        assert!(
+            (q - 1.0).abs() <= gam_linalg::roundoff::accumulation_growth(5),
+            "q={q}"
+        );
     }
 }
