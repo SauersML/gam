@@ -33,8 +33,6 @@ struct PySampleOptions {
     warmup: Option<usize>,
     /// Number of parallel chains.
     chains: Option<usize>,
-    /// Target HMC acceptance rate (0, 1).
-    target_accept: Option<f64>,
     /// RNG seed for deterministic chain initialisation.
     seed: Option<u64>,
 }
@@ -2280,7 +2278,6 @@ fn build_sample_payload_json(
     samples: Option<i64>,
     warmup: Option<i64>,
     chains: Option<i64>,
-    target_accept: Option<f64>,
     seed: Option<i64>,
 ) -> PyResult<String> {
     let mut payload = serde_json::Map::new();
@@ -2292,14 +2289,6 @@ fn build_sample_payload_json(
     }
     if let Some(value) = chains {
         payload.insert("chains".to_string(), serde_json::Value::from(value));
-    }
-    if let Some(value) = target_accept {
-        let number = serde_json::Number::from_f64(value)
-            .ok_or_else(|| py_value_error("target_accept must be finite".to_string()))?;
-        payload.insert(
-            "target_accept".to_string(),
-            serde_json::Value::Number(number),
-        );
     }
     if let Some(value) = seed {
         payload.insert("seed".to_string(), serde_json::Value::from(value));

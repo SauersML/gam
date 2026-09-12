@@ -34,7 +34,6 @@ model.sample(
     samples: int | None = None,
     warmup:  int | None = None,
     chains:  int | None = None,
-    target_accept: float | None = None,
     seed:    int | None = None,
 ) -> PosteriorSamples
 ```
@@ -45,7 +44,6 @@ model.sample(
 | `samples` | derived from coefficient count | Post-warmup draws per chain. |
 | `warmup` | matches `samples` | Warmup iterations per chain (discarded). |
 | `chains` | `2` if `p <= 50`, else `4` | Independent chains. |
-| `target_accept` | `0.9` | NUTS step-size adaptation target acceptance; NUTS paths require it to lie in `(0, 1)`. The sampler floors it to `0.90` (dim ≤ 50) or `0.92` (dim > 50) and caps it at `0.95` via `robust_target_accept`, so a requested value outside that band is clamped. Ignored by the Laplace and Polya-Gamma Gibbs paths. |
 | `seed` | `42` | RNG seed consumed by the sampler. |
 
 Total returned draws are `chains * samples`.
@@ -290,8 +288,7 @@ uses the R-hat threshold only. If a NUTS run looks unhealthy:
 
 1. Set `seed=` to retry from a different initialisation.
 2. Increase `warmup` and `samples`.
-3. Raise `target_accept` (e.g. `0.92` or `0.95`).
-4. Inspect `posterior.plot_trace(...)`.
+3. Inspect `posterior.plot_trace(...)`.
 
 ## Default sampling parameters
 
@@ -303,10 +300,10 @@ from the coefficient count `p`:
 | `n_chains` | `2` if `p <= 50`, else `4`. |
 | `n_samples` | `clamp(floor(100 * p * (1 + 2 * max(1, sqrt(p))) * 1.5), 500, 10_000)`. |
 | `n_warmup` | Same as `n_samples`. |
-| `target_accept` | `0.9`. |
+| `target_accept` | `0.9`, not user-settable; `robust_target_accept` floors it by dimension and caps it. |
 | `seed` | `42` unless `seed=` is passed. |
 
-Every keyword on `Model.sample` overrides the corresponding default.
+Every keyword on `Model.sample`, and the matching `gam sample` flag, overrides the corresponding default.
 
 ## Recipes
 

@@ -57,10 +57,10 @@ def test_penalty_specs_sampling_survival_and_diagnostics_regressions():
         for v in np.linspace(-1.0, 1.0, 16)
     ]
     model = fit(rows, "y ~ x")
-    cfg = dict(samples=20, warmup=10, chains=1, target_accept=0.8, seed=123)
+    cfg = dict(samples=20, warmup=10, chains=1, seed=123)
     py_draws = model.sample(rows, **cfg)
     options_json = ffi.build_sample_payload_json(
-        cfg["samples"], cfg["warmup"], cfg["chains"], cfg["target_accept"], cfg["seed"]
+        cfg["samples"], cfg["warmup"], cfg["chains"], cfg["seed"]
     )
     # #1512: ffi.sample_table now takes the normalized STRING-cell table that
     # Model.sample() builds via normalize_table (rows: list[list[str]]), not raw
