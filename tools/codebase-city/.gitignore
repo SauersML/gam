@@ -40,3 +40,6 @@ next-env.d.ts
 /.wrangler/
 /outputs/
 /work/
+
+# build output of `vite build --config vite.city.config.ts` (npm run dev/build/test)
+/public/city-runtime/
