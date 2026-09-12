@@ -4217,8 +4217,48 @@ impl SaeManifoldTerm {
             total_t,
             |v| ArrowMetric::Joint(cache).quadratic_form(v),
             "joint",
+            None,
         )?;
         Ok(joint_pricing.log_det)
+    }
+
+    /// #2080 — the refused basin directions of the pricing
+    /// [`Self::exact_observed_information_log_dets`] performs: unit vectors in the
+    /// joint `(t, β)` cache layout, each with its basin curvature, most negative
+    /// first, and empty when the basin prices. The evidence root reads them only
+    /// after a refusal, to descend the saddle before it concludes the state has no
+    /// Laplace normaliser.
+    pub(crate) fn exact_a_saddle_directions(
+        &self,
+        rho: &SaeManifoldRho,
+        target: ArrayView2<'_, f64>,
+        cache: &ArrowFactorCache,
+    ) -> Result<Vec<(Array1<f64>, f64)>, SaeCriterionError> {
+        let total_t = cache.delta_t_len();
+        let a = self.materialize_exact_hessian_dense(rho, target, cache)?;
+        let e_diag = self.materialize_ard_concave_clamp_diagonal(rho, cache)?;
+        let e_beta = self.decoder_prior_majorizer_gap_border(cache)?;
+        let joint = Self::exact_hessian_spectral_block(
+            a,
+            &e_diag,
+            e_beta.as_ref(),
+            total_t,
+            ArrowMetric::Joint(cache),
+        )?;
+        let mut directions = Vec::new();
+        let verdict = Self::classify_exact_hessian_basin(
+            &joint,
+            &e_diag,
+            e_beta.as_ref(),
+            total_t,
+            |v| ArrowMetric::Joint(cache).quadratic_form(v),
+            "joint",
+            Some(&mut directions),
+        );
+        match verdict {
+            Ok(_) | Err(SaeCriterionError::IndefiniteObservedInformation { .. }) => Ok(directions),
+            Err(err) => Err(err),
+        }
     }
 
     /// Build a cluster-stable eigensystem and the shared absolute null floor for
@@ -4328,6 +4368,11 @@ impl SaeManifoldTerm {
     /// derivative adds the positive inverse and the response of V. Only
     /// negative/complement spectral gaps enter that response; rotations inside
     /// the negative subspace cancel in the determinant.
+    ///
+    /// A basin direction with `μ < −floor` refuses the block. With
+    /// `refused_directions` present, every such direction is pushed with its
+    /// `μ` (most negative first) before the refusal is returned, so a caller can
+    /// descend the saddle rather than only learn that one exists (#2080).
     fn classify_exact_hessian_basin(
         block: &ExactHessianSpectralBlock,
         e_diag: &Array1<f64>,
@@ -4335,6 +4380,7 @@ impl SaeManifoldTerm {
         total_t: usize,
         metric: impl Fn(ArrayView1<'_, f64>) -> Result<f64, String>,
         label: &'static str,
+        mut refused_directions: Option<&mut Vec<(Array1<f64>, f64)>>,
     ) -> Result<ExactHessianBasin, SaeCriterionError> {
         let dim = block.eigenvalues.len();
         if block.eigenvectors.dim() != (dim, dim) || total_t > dim || e_diag.len() < total_t {
@@ -4424,6 +4470,7 @@ impl SaeManifoldTerm {
                     .fold(0.0_f64, f64::max)
             });
         let mut inverse_values = Array1::<f64>::zeros(q);
+        let mut refused = false;
         for (i, &mu) in basin_values.iter().enumerate() {
             let vector = basin_vectors.column(i);
             let metric_scale = metric(vector)?;
@@ -4437,13 +4484,21 @@ impl SaeManifoldTerm {
                 log::warn!(
                     "SAE exact-A basin refusal: block={label}, mode={i}, curvature={mu:e}, floor={floor:e}"
                 );
-                return Err(SaeCriterionError::IndefiniteObservedInformation { block: label });
+                let Some(directions) = refused_directions.as_mut() else {
+                    return Err(SaeCriterionError::IndefiniteObservedInformation { block: label });
+                };
+                directions.push((vector.to_owned(), mu));
+                refused = true;
+                continue;
             }
             if mu <= floor {
                 continue;
             }
             log_det += mu.ln();
             inverse_values[i] = 1.0 / mu;
+        }
+        if refused {
+            return Err(SaeCriterionError::IndefiniteObservedInformation { block: label });
         }
         Ok(ExactHessianBasin {
             log_det,
@@ -4466,8 +4521,9 @@ impl SaeManifoldTerm {
         metric: impl Fn(ArrayView1<'_, f64>) -> Result<f64, String>,
         label: &'static str,
     ) -> Result<ExactHessianPricing, SaeCriterionError> {
-        let basin =
-            Self::classify_exact_hessian_basin(block, e_diag, e_beta, total_t, metric, label)?;
+        let basin = Self::classify_exact_hessian_basin(
+            block, e_diag, e_beta, total_t, metric, label, None,
+        )?;
         Self::exact_hessian_basin_differential(block, e_diag, e_beta, total_t, &basin)
     }
 
@@ -5985,6 +6041,7 @@ mod test_support {
             e.len(),
             |v| Ok(v.dot(&v)),
             "fixture",
+            None,
         )?;
         let differential = super::SaeManifoldTerm::exact_hessian_basin_differential(
             &block,
@@ -6026,6 +6083,7 @@ mod test_support {
                 2,
                 |v| Ok(v.dot(&v)),
                 "rotated fixture",
+                None,
             )
             .expect("same negative subspace");
             let priced = super::SaeManifoldTerm::exact_hessian_basin_differential(

@@ -389,35 +389,83 @@ impl SaeManifoldTerm {
             .with_gpu_policy(self.gpu_policy)
             .with_newton_schur_tikhonov(gam_solve::arrow_schur::SPECTRAL_DEFLATION_REL_FLOOR)
             .with_evidence_unit_deflation(gam_solve::arrow_schur::SPECTRAL_DEFLATION_REL_FLOOR);
-        let cache = self.converge_inner_for_undamped_logdet(
-            target,
-            rho,
-            &mut rho_fixed,
-            registry,
-            inner_max_iter,
-            learning_rate,
-            ridge_ext_coord,
-            ridge_beta,
-            &mut loss,
-            &mut criterion_fixed_point,
-            &options,
-            refine_progress_extension,
-        )?;
-        self.record_criterion_gauge_deflation_count(
-            cache.gauge_deflated_directions,
-            refine_progress_extension,
-        )?;
-        loss.criterion_gauge_deflated_directions = cache.gauge_deflated_directions;
-        // #2330 Phase-2: rank the EXACT observed-information Laplace term ½log|A|
-        // (A = B + ΔC = ∇²_θθ L), not the majorizer surrogate ½log|B|. One
-        // eigendecomposition yields the joint log|A|, applying the shared PD
-        // floor; an indefinite A (a majorizer saddle) returns the typed
-        // IndefiniteObservedInformation refusal, which makes saddle-ρ
-        // probe-infeasible (+inf) so the outer search steers away. There is no
-        // accepted-lane saddle escape to wait for: 6a5ca5d84 measured it
-        // structurally non-viable (the refine lane returns to the same A-saddle),
-        // so a saddle ρ stays infeasible (#2336).
-        let log_det = self.exact_observed_information_log_dets(rho, target, &cache)?;
+        // #2080 — the evidence root is converged, priced and, where `A` refuses on
+        // resolved negative basin curvature, descended and converged again, all in
+        // ONE gate-frozen scope, so every objective value compared below belongs to
+        // the same objective (#2228 Zeno ratchet).
+        let gates_were_frozen = self.freeze_collapse_prevention_gates();
+        let evidence_root = loop {
+            let cache = match self.converge_inner_for_undamped_logdet_gate_frozen(
+                target,
+                rho,
+                &mut rho_fixed,
+                registry,
+                inner_max_iter,
+                learning_rate,
+                ridge_ext_coord,
+                ridge_beta,
+                &mut loss,
+                &mut criterion_fixed_point,
+                &options,
+                refine_progress_extension,
+            ) {
+                Ok(cache) => cache,
+                Err(err) => break Err(SaeCriterionError::from(err)),
+            };
+            if let Err(err) = self.record_criterion_gauge_deflation_count(
+                cache.gauge_deflated_directions,
+                refine_progress_extension,
+            ) {
+                break Err(SaeCriterionError::from(err));
+            }
+            loss.criterion_gauge_deflated_directions = cache.gauge_deflated_directions;
+            // #2330 Phase-2: rank the EXACT observed-information Laplace term ½log|A|
+            // (A = B + ΔC = ∇²_θθ L), not the majorizer surrogate ½log|B|. One
+            // eigendecomposition yields the joint log|A|, applying the shared PD
+            // floor. An indefinite A the concave clamps do not explain is a saddle,
+            // not a mode, and ½log|A| is not a Laplace normaliser there.
+            //
+            // A saddle is descended before it is refused. Pool job 507123 read the
+            // refused directions on the #2080 wide-p fixture as gate logits (logit
+            // share ≥ 0.9999999 on the 28 modes read, of 121 logged) with vᵀBv within
+            // 5e-4 of 1 on all but one: the unit stiffness the evidence factor
+            // substitutes where the majorizer has no curvature. At a saturated gate,
+            // per-coordinate stationarity leaves the exact curvature along the logit
+            // at about g_ℓ/τ (derived, not measured): a sub-tolerance slope toward
+            // switching the gate on, which needs a long step that no Newton, MM or
+            // damped-residual mover takes. #2336's refuted escape stepped to the line
+            // minimum and re-converged under RE-frozen gates, climbing above the
+            // saddle. Here the objective stays frozen and a descent commits only above
+            // the material floor, so the walk strictly descends one objective and
+            // ends. A saddle no refused direction can descend keeps the typed refusal,
+            // which the outer search reads as an infeasible ρ.
+            match self.exact_observed_information_log_dets(rho, target, &cache) {
+                Ok(log_det) => break Ok((cache, log_det)),
+                Err(err @ SaeCriterionError::IndefiniteObservedInformation { .. })
+                    if inner_max_iter > 0 =>
+                {
+                    let saddle_directions =
+                        match self.exact_a_saddle_directions(rho, target, &cache) {
+                            Ok(directions) => directions,
+                            Err(direction_err) => break Err(direction_err),
+                        };
+                    match self.descend_exact_a_saddle(
+                        target,
+                        rho,
+                        registry,
+                        &cache,
+                        &saddle_directions,
+                    ) {
+                        Ok(true) => criterion_fixed_point = false,
+                        Ok(false) => break Err(err),
+                        Err(descent_err) => break Err(SaeCriterionError::from(descent_err)),
+                    }
+                }
+                Err(err) => break Err(err),
+            }
+        };
+        self.streaming_gates_frozen = gates_were_frozen;
+        let (cache, log_det) = evidence_root?;
 
         // 3. Smoothing-penalty Occam term `−½·Σ_k r_k·rank(S_k)·log λ_smooth`
         //    plus the profiled-frame evidence-dimension correction
@@ -763,6 +811,144 @@ impl SaeManifoldTerm {
         );
         self.streaming_gates_frozen = gates_were_frozen;
         out
+    }
+
+    /// #2080 — descend one refused exact-A saddle at the evidence root.
+    ///
+    /// `directions` are [`Self::exact_a_saddle_directions`]: unit vectors in the
+    /// joint `(t, β)` cache layout, each with its basin curvature `μ < −floor`.
+    /// Each is turned downhill (`gᵀd ≤ 0`) and the penalized objective is minimized
+    /// along it by [`Self::minimize_objective_along`] with the curvature term `−μ`,
+    /// so a direction whose decrease is second-order (`slope ≈ 0` at a KKT point)
+    /// is searched from the step at which `½·|μ|·α²` reaches the material floor.
+    ///
+    /// The first direction whose committed, re-evaluated decrease clears
+    /// `SAE_MANIFOLD_INNER_OBJECTIVE_STALL_REL_TOL · (1 + |f|)`, the floor every
+    /// inner mover commits against, is kept and `true` is returned; the caller
+    /// converges again from there. Every commit lowers one gate-frozen objective by
+    /// more than that floor, so repeated descents end. `false` means no refused
+    /// direction realizes a material decrease, and the state is as it was found.
+    fn descend_exact_a_saddle(
+        &mut self,
+        target: ArrayView2<'_, f64>,
+        rho: &SaeManifoldRho,
+        registry: Option<&AnalyticPenaltyRegistry>,
+        cache: &ArrowFactorCache,
+        directions: &[(Array1<f64>, f64)],
+    ) -> Result<bool, String> {
+        let total_t = cache.delta_t_len();
+        let system = self.assemble_arrow_schur(target, rho, registry)?;
+        let mut gradient = Array1::<f64>::zeros(total_t + cache.k);
+        let mut offset = 0usize;
+        for row in &system.rows {
+            if offset + row.gt.len() > total_t {
+                break;
+            }
+            for (axis, &value) in row.gt.iter().enumerate() {
+                gradient[offset + axis] = value;
+            }
+            offset += row.gt.len();
+        }
+        if offset != total_t || system.gb.len() != cache.k {
+            return Err(format!(
+                "SaeManifoldTerm::descend_exact_a_saddle: the assembled gradient has {offset} row \
+                 coordinates and border width {}, but the evidence cache has {total_t} and {}",
+                system.gb.len(),
+                cache.k,
+            ));
+        }
+        for (index, &value) in system.gb.iter().enumerate() {
+            gradient[total_t + index] = value;
+        }
+        drop(system);
+        let base_objective = self.penalized_objective_total(target, rho, registry, 1.0)?;
+        if !base_objective.is_finite() {
+            return Ok(false);
+        }
+        let material_floor =
+            SAE_MANIFOLD_INNER_OBJECTIVE_STALL_REL_TOL * (1.0 + base_objective.abs());
+        for (vector, curvature) in directions {
+            if vector.len() != gradient.len() {
+                return Err(format!(
+                    "SaeManifoldTerm::descend_exact_a_saddle: direction length {} != joint \
+                     dimension {}",
+                    vector.len(),
+                    gradient.len(),
+                ));
+            }
+            let along = gradient.dot(vector);
+            let direction = if along > 0.0 { -vector } else { vector.clone() };
+            let slope = along.abs();
+            let snapshot = self.snapshot_mutable_state();
+            let line = self.minimize_objective_along(
+                target,
+                rho,
+                registry,
+                direction.view(),
+                total_t,
+                base_objective,
+                slope,
+                -*curvature,
+                material_floor,
+                &snapshot,
+            )?;
+            if !(line.alpha > 0.0 && base_objective - line.value > material_floor) {
+                continue;
+            }
+            if let Err(err) = self.apply_newton_step(
+                direction.slice(s![..total_t]),
+                direction.slice(s![total_t..]),
+                line.alpha,
+            ) {
+                self.restore_mutable_state(&snapshot).map_err(|restore_err| {
+                    format!(
+                        "SaeManifoldTerm::descend_exact_a_saddle: committed step application \
+                         failed ({err}); restoring the pre-descent state also failed \
+                         ({restore_err})"
+                    )
+                })?;
+                return Err(format!(
+                    "SaeManifoldTerm::descend_exact_a_saddle: committed step application: {err}"
+                ));
+            }
+            let committed = match self.penalized_objective_total(target, rho, registry, 1.0) {
+                Ok(value) => value,
+                Err(err) => {
+                    self.restore_mutable_state(&snapshot).map_err(|restore_err| {
+                        format!(
+                            "SaeManifoldTerm::descend_exact_a_saddle: committed objective \
+                             evaluation failed ({err}); restoring the pre-descent state also \
+                             failed ({restore_err})"
+                        )
+                    })?;
+                    return Err(format!(
+                        "SaeManifoldTerm::descend_exact_a_saddle: committed objective \
+                         evaluation: {err}"
+                    ));
+                }
+            };
+            let decrease = base_objective - committed;
+            if !(committed.is_finite() && decrease > material_floor) {
+                self.restore_mutable_state(&snapshot)
+                    .map_err(|err| format!("SaeManifoldTerm::descend_exact_a_saddle: {err}"))?;
+                continue;
+            }
+            log::info!(
+                "[SAE-SADDLE] descended a refused exact-A direction: basin curvature \
+                 {curvature:.6e}, slope {slope:.6e}, α={:.6e}, objective \
+                 {base_objective:.10e} → {committed:.10e} (decrease {decrease:.6e}, floor \
+                 {material_floor:.6e}, {} objective evaluations)",
+                line.alpha,
+                line.objective_evaluations,
+            );
+            return Ok(true);
+        }
+        log::info!(
+            "[SAE-SADDLE] none of {} refused exact-A direction(s) realizes a decrease above \
+             the material floor {material_floor:.6e}; the saddle stays refused",
+            directions.len(),
+        );
+        Ok(false)
     }
 
     fn converge_inner_for_undamped_logdet_gate_frozen(
@@ -2347,6 +2533,7 @@ impl SaeManifoldTerm {
             dense_len,
             base_objective,
             descent_norm,
+            0.0,
             material_floor,
             &snapshot,
         ) {
@@ -2390,6 +2577,7 @@ impl SaeManifoldTerm {
                 dense_len,
                 base_objective,
                 steepest_norm,
+                0.0,
                 material_floor,
                 &snapshot,
             ) {

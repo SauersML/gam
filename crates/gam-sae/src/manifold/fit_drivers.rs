@@ -2840,16 +2840,22 @@ impl SaeManifoldTerm {
     /// a sequential line search, instead of evaluating a grid of steps and keeping
     /// the best (SPEC: grid search is never allowed).
     ///
-    /// `slope = −φ′(0) > 0` is the exact first-order decrease rate of
-    /// `φ(α) = f(x + α·d̂)`. The steps live between two endpoints the state
-    /// supplies, not chosen constants:
+    /// `slope = −φ′(0) ≥ 0` is the exact first-order decrease rate of
+    /// `φ(α) = f(x + α·d̂)`, and `negative_curvature = max(−φ″(0), 0)` is the
+    /// second-order one where the objective curves down along `d̂`. A refused
+    /// exact-A saddle direction at a KKT point has `slope ≈ 0` and carries its
+    /// decrease in that term (#2080). The local model is
+    /// `m(α) = α·slope + ½·negative_curvature·α²`, and sufficient decrease is
+    /// `c₁·m(α)`, the curvilinear Armijo condition. The steps live between two
+    /// endpoints the state supplies, not chosen constants:
     ///
     /// * the far end is [`Self::inner_iterate_scale`]: one step may not move the
     ///   iterate further than the iterate's own magnitude, the same scale-free
     ///   trust radius the Newton step clips against;
-    /// * the near end is `material_floor / slope`, below which the first-order
-    ///   model predicts less than the objective's resolution, so no shorter step
-    ///   could be committed even if it were exact.
+    /// * the near end is the step at which `m(α)` reaches `material_floor`, below
+    ///   which the model predicts less than the objective's resolution, so no
+    ///   shorter step could be committed even if it were exact. With no negative
+    ///   curvature it is `material_floor / slope`.
     ///
     /// 1. Armijo backtracking from the far end finds the LONGEST step with
     ///    sufficient decrease. A direction with tiny curvature and a live gradient
@@ -2878,6 +2884,7 @@ impl SaeManifoldTerm {
         dense_len: usize,
         base_objective: f64,
         slope: f64,
+        negative_curvature: f64,
         material_floor: f64,
         snapshot: &SaeManifoldMutableState,
     ) -> Result<ObjectiveLineMinimum, String> {
@@ -2890,10 +2897,21 @@ impl SaeManifoldTerm {
             first_failure: None,
         };
         let far_alpha = self.inner_iterate_scale();
-        let near_alpha = material_floor / slope;
+        if !(negative_curvature.is_finite() && negative_curvature >= 0.0) {
+            return Ok(line);
+        }
+        // The positive root of `m(α) = material_floor`, in the form that does not
+        // cancel when `slope` dominates.
+        let near_alpha = if negative_curvature == 0.0 {
+            material_floor / slope
+        } else {
+            2.0 * material_floor
+                / (slope + (slope * slope + 2.0 * negative_curvature * material_floor).sqrt())
+        };
         if !(base_objective.is_finite()
             && slope.is_finite()
-            && slope > 0.0
+            && slope >= 0.0
+            && (slope > 0.0 || negative_curvature > 0.0)
             && far_alpha.is_finite()
             && near_alpha.is_finite()
             && near_alpha > 0.0
@@ -2964,7 +2982,9 @@ impl SaeManifoldTerm {
                     .map(|value| value.is_finite().then_some((value, ())))
             },
             |alpha, value| {
-                value <= base_objective - SAE_MANIFOLD_ARMIJO_C1 * alpha * slope + cushion
+                let sufficient = SAE_MANIFOLD_ARMIJO_C1 * alpha * slope
+                    + SAE_MANIFOLD_ARMIJO_C1 * 0.5 * negative_curvature * alpha * alpha;
+                value <= base_objective - sufficient + cushion
             },
         )?;
         let Some(accepted) = accepted else {
@@ -3216,6 +3236,7 @@ impl SaeManifoldTerm {
                 dense_len,
                 base_objective,
                 slope,
+                0.0,
                 material_floor,
                 &snapshot,
             )?;
