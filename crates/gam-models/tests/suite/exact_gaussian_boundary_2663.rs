@@ -105,7 +105,10 @@ fn exact_smooth_and_tensor_plane_use_their_mixed_penalty_faces_2663() {
 
     let plane = exact_plane_dataset();
     let plane_fit = standard(fit_from_formula("y ~ te(x, z)", &plane, &config).expect("plane fit"));
-    // The two tensor curvature penalties jointly leave the complete bilinear
-    // null model {1, x, z, xz}; EDF is model dimension, not nonzero beta count.
-    assert_exact_boundary(&plane_fit, &plane, 4.0);
+    // The two tensor curvature penalties jointly leave the bilinear null model
+    // {1, x, z, xz}, and each functional-ANOVA block of that null carries its own
+    // ridge (6e65fa523). The plane has no x·z term, so REML sends the xz ridge to
+    // its infinite face and keeps the x and z trends: EDF is the model dimension
+    // {1, x, z}, not the nonzero beta count.
+    assert_exact_boundary(&plane_fit, &plane, 3.0);
 }
