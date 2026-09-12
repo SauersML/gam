@@ -1029,7 +1029,7 @@ fn glm_reml_fit_latent_backward<'py>(
     let q = beta_t.len();
     let p = design.ncols();
     let jet = latent_input_location_jet(
-        basis_kind_normalized,
+        "duchon",
         t_mat.view(),
         centers.as_array(),
         m,
