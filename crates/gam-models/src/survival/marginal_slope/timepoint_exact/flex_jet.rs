@@ -4017,10 +4017,9 @@ mod moment_engine_tests {
     // ── §B moment engine: the de-nested cell moments over a FlexJet ─────────────
     //
     // #932 Item 2 (doc §D). The per-cell moments `M_n = ∫_{z_L}^{z_R} z^n e^{−q(z)} dz`
-    // (sextic `q`, no closed antiderivative) satisfy the SAME raising recurrence the
-    // numeric `cubic_cell_kernel::reduce_sextic_moments` uses —
+    // (sextic `q`, no closed antiderivative) satisfy the raising recurrence
     //   `M_{n+5} = (n·M_{n−1} − Σ_{j=0}^{4} d[j]·M_{n+j} − b_n) / d[5]`,
-    // with `d = q'(z)` coefficients (`sextic_qprime_coefficients`) and boundary term
+    // with `d = q'(z)` coefficients and boundary term
     // `b_n = z_R^n e^{−q(z_R)} − z_L^n e^{−q(z_L)}` — so it ports to ANY `FlexJet`
     // scalar verbatim. Carrying the cell coefficients `c0..c3` and the (moving) edges
     // `z_L,z_R` as jets propagates the moments' θ-derivatives mechanically: the

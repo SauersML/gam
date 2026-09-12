@@ -938,93 +938,6 @@ impl DenestedCubicCell {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub struct CellMomentFingerprint {
-    pub hash: u64,
-    bins: [u64; 6],
-}
-
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub struct CellMomentCacheKey {
-    pub fingerprint: CellMomentFingerprint,
-    pub max_degree: usize,
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
-pub struct CellMomentDedupStats {
-    pub lookups: u64,
-    pub hits: u64,
-    pub misses: u64,
-}
-
-impl CellMomentDedupStats {
-    #[inline]
-    pub fn hit_rate(self) -> f64 {
-        if self.lookups == 0 {
-            0.0
-        } else {
-            self.hits as f64 / self.lookups as f64
-        }
-    }
-}
-
-#[inline]
-fn splitmix64(x: u64) -> u64 {
-    gam_linalg::utils::splitmix64_hash(x)
-}
-
-#[inline]
-fn mix_fingerprint_words(words: &[u64]) -> u64 {
-    let mut h = 0xcbf2_9ce4_8422_2325u64;
-    for &word in words {
-        h ^= splitmix64(word);
-        h = h.wrapping_mul(0x100_0000_01b3);
-    }
-    h
-}
-
-#[inline]
-fn quantized_cell_word(x: f64, epsilon: f64) -> u64 {
-    if epsilon == 0.0 || !epsilon.is_finite() || epsilon < 0.0 || !x.is_finite() {
-        return x.to_bits();
-    }
-    (x / epsilon).round().to_bits()
-}
-
-/// Returns a deterministic geometric fingerprint for a de-nested cubic cell.
-///
-/// With `epsilon == 0.0`, each coordinate is represented by its exact IEEE-754
-/// bit pattern, so equal fingerprints imply bit-equal `(left, right, c0, c1,
-/// c2, c3)` tuples.  With `epsilon > 0`, finite coordinates are binned to the
-/// nearest multiple of `epsilon`; callers should treat this as an approximate
-/// cache key and validate the resulting model error for their data.
-pub fn cell_moment_fingerprint(cell: DenestedCubicCell, epsilon: f64) -> CellMomentFingerprint {
-    let bins = [
-        quantized_cell_word(cell.left, epsilon),
-        quantized_cell_word(cell.right, epsilon),
-        quantized_cell_word(cell.c0, epsilon),
-        quantized_cell_word(cell.c1, epsilon),
-        quantized_cell_word(cell.c2, epsilon),
-        quantized_cell_word(cell.c3, epsilon),
-    ];
-    CellMomentFingerprint {
-        hash: mix_fingerprint_words(&bins),
-        bins,
-    }
-}
-
-#[inline]
-pub fn cell_moment_cache_key(
-    cell: DenestedCubicCell,
-    max_degree: usize,
-    epsilon: f64,
-) -> CellMomentCacheKey {
-    CellMomentCacheKey {
-        fingerprint: cell_moment_fingerprint(cell, epsilon),
-        max_degree,
-    }
-}
-
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct DenestedPartitionCell {
     pub cell: DenestedCubicCell,
@@ -1237,8 +1150,6 @@ impl TailCellMomentCache {
 
 static TAIL_CELL_MOMENT_CACHE: std::sync::OnceLock<TailCellMomentCache> =
     std::sync::OnceLock::new();
-static TAIL_CELL_MOMENT_CACHE_ENABLED: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(true);
 
 fn tail_cell_moment_cache() -> &'static TailCellMomentCache {
     TAIL_CELL_MOMENT_CACHE.get_or_init(TailCellMomentCache::default)
@@ -1269,10 +1180,6 @@ fn tail_cell_cache_key(
         }),
         _ => None,
     }
-}
-
-pub fn set_tail_cell_moment_cache_enabled(enabled: bool) {
-    TAIL_CELL_MOMENT_CACHE_ENABLED.store(enabled, std::sync::atomic::Ordering::Relaxed);
 }
 
 pub fn reset_tail_cell_moment_cache() {
@@ -1500,64 +1407,6 @@ impl ResidentBytes for CellDerivativeMomentState {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct CellMomentStateRef<'a> {
-    pub branch: ExactCellBranch,
-    pub value: f64,
-    pub moments: &'a [f64],
-}
-
-#[derive(Clone, Debug)]
-pub struct CellMomentScratch {
-    moments: Vec<f64>,
-}
-
-impl Default for CellMomentScratch {
-    fn default() -> Self {
-        // Pre-size to the codebase's max moment degree so steady-state
-        // `prepare_moments` calls never reallocate. Calls with `len`
-        // exceeding this still reserve lazily.
-        Self {
-            moments: Vec::with_capacity(MAX_AFFINE_ANCHOR_DEGREE + 1),
-        }
-    }
-}
-
-impl CellMomentScratch {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    pub fn with_capacity(max_degree: usize) -> Self {
-        Self {
-            moments: Vec::with_capacity(max_degree + 1),
-        }
-    }
-
-    #[inline]
-    fn prepare_moments(&mut self, len: usize) -> &mut [f64] {
-        if self.moments.capacity() < len {
-            CELL_MOMENT_REALLOCS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            self.moments.reserve(len - self.moments.capacity());
-        }
-        // Grow monotonically: shorter requests should not truncate the backing
-        // storage and then zero the old tail when a later request grows again.
-        // Only the active prefix is scratch for this evaluation.
-        if self.moments.len() < len {
-            self.moments.resize(len, 0.0);
-        }
-        let out = &mut self.moments[..len];
-        out.fill(0.0);
-        out
-    }
-}
-
-/// Counter for moment-buffer reallocations in `prepare_moments`. Production
-/// code increments this on every buffer growth; the test mod inspects it to
-/// assert the steady-state hot loop allocates exactly once per row buffer.
-pub(crate) static CELL_MOMENT_REALLOCS: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
-
 /// Canonical 20-point Gauss–Legendre nodes on [-1, 1] (Abramowitz & Stegun
 /// 25.4), tabulated to f64 precision. Used here for the Drezner–Wesolowsky
 /// bivariate normal CDF representation — 20 points give >30-digit accuracy for
@@ -1664,214 +1513,12 @@ pub fn interval_probe_point(left: f64, right: f64) -> Result<f64, String> {
 }
 
 #[inline]
-pub fn quartic_qprime_coefficients(c0: f64, c1: f64, c2: f64) -> [f64; 4] {
-    [
-        c0 * c1,
-        1.0 + c1 * c1 + 2.0 * c0 * c2,
-        3.0 * c1 * c2,
-        2.0 * c2 * c2,
-    ]
-}
-
-#[inline]
-pub fn sextic_qprime_coefficients(c0: f64, c1: f64, c2: f64, c3: f64) -> [f64; 6] {
-    [
-        c0 * c1,
-        1.0 + c1 * c1 + 2.0 * c0 * c2,
-        3.0 * c0 * c3 + 3.0 * c1 * c2,
-        4.0 * c1 * c3 + 2.0 * c2 * c2,
-        5.0 * c2 * c3,
-        3.0 * c3 * c3,
-    ]
-}
-
-/// Boundary term `right^n · exp(−q(right)) − left^n · exp(−q(left))` used by
-/// the moment recurrences. Takes precomputed `left^n` and `right^n` so callers
-/// can roll the powers across a recurrence — each iteration becomes one
-/// multiply instead of a fresh `powi(n)`.
-#[inline]
-fn moment_boundary_term_with_powers(
-    cell: DenestedCubicCell,
-    left_pow_n: f64,
-    right_pow_n: f64,
-) -> f64 {
-    let left_term = if cell.left.is_infinite() {
-        0.0
-    } else {
-        left_pow_n * (-cell.q(cell.left)).exp()
-    };
-    let right_term = if cell.right.is_infinite() {
-        0.0
-    } else {
-        right_pow_n * (-cell.q(cell.right)).exp()
-    };
-    right_term - left_term
-}
-
-#[inline]
-fn base_moments_match_direct(base: &[f64], direct: &[f64]) -> bool {
-    base.iter()
-        .zip(direct.iter())
-        .all(|(&lhs, &rhs)| (lhs - rhs).abs() <= 1e-10 * (1.0 + lhs.abs().max(rhs.abs())))
-}
-
-#[inline]
-fn direct_non_affine_moments_if_base_matches(
-    cell: DenestedCubicCell,
-    base: &[f64],
-    max_degree: usize,
-) -> Option<Vec<f64>> {
-    if !cell.left.is_finite() || !cell.right.is_finite() {
-        return None;
-    }
-    // When the supplied base moments are the actual moments of this fixed
-    // finite cell, prefer the same quadrature-backed evaluator used by the
-    // public non-affine moment path.  The algebraic raising recurrence is kept
-    // below for callers that intentionally pass symbolic or otherwise
-    // non-cell-consistent bases, but repeatedly dividing by the quartic/sextic
-    // leading coefficient can amplify harmless base-roundoff into high-order
-    // moment error.
-    let (moments, _) = evaluate_non_affine_cell_simd::<false>(cell, max_degree);
-    if base_moments_match_direct(base, &moments) {
-        Some(moments.into_vec())
-    } else {
-        None
-    }
-}
-
-pub fn reduce_quartic_moments(
-    cell: DenestedCubicCell,
-    base_m0_m2: [f64; 3],
-    max_degree: usize,
-) -> Result<Vec<f64>, String> {
-    if max_degree <= 2 {
-        return Ok(base_m0_m2[..=max_degree].to_vec());
-    }
-    if let Some(moments) = direct_non_affine_moments_if_base_matches(cell, &base_m0_m2, max_degree)
-    {
-        return Ok(moments);
-    }
-    let d = quartic_qprime_coefficients(cell.c0, cell.c1, cell.c2);
-    let lead = d[3];
-    if !lead.is_finite() || lead.abs() <= 1e-18 {
-        return Err(CubicCellKernelError::invalid_cell_shape(format!(
-            "quartic moment reduction requires nonzero leading coefficient, got {lead:.3e}"
-        ))
-        .into());
-    }
-    let mut moments = vec![0.0; max_degree + 1];
-    moments[0] = base_m0_m2[0];
-    moments[1] = base_m0_m2[1];
-    moments[2] = base_m0_m2[2];
-    // Roll left^n / right^n across the recurrence rather than calling
-    // `powi(n)` each iteration. Skip the multiply when an endpoint is
-    // infinite — the boundary helper ignores the power in that case, and
-    // ∞·0 would produce a NaN we'd then have to mask off anyway.
-    let left_finite = cell.left.is_finite();
-    let right_finite = cell.right.is_finite();
-    let mut left_pow_n = if left_finite { 1.0 } else { 0.0 };
-    let mut right_pow_n = if right_finite { 1.0 } else { 0.0 };
-    for n in 0..=(max_degree - 3) {
-        let b_n = moment_boundary_term_with_powers(cell, left_pow_n, right_pow_n);
-        let mut numer = if n == 0 {
-            0.0
-        } else {
-            (n as f64) * moments[n - 1]
-        };
-        for j in 0..=2 {
-            numer -= d[j] * moments[n + j];
-        }
-        numer -= b_n;
-        moments[n + 3] = numer / lead;
-        if left_finite {
-            left_pow_n *= cell.left;
-        }
-        if right_finite {
-            right_pow_n *= cell.right;
-        }
-    }
-    Ok(moments)
-}
-
-pub fn reduce_sextic_moments(
-    cell: DenestedCubicCell,
-    base_m0_m4: [f64; 5],
-    max_degree: usize,
-) -> Result<Vec<f64>, String> {
-    if max_degree <= 4 {
-        return Ok(base_m0_m4[..=max_degree].to_vec());
-    }
-    if let Some(moments) = direct_non_affine_moments_if_base_matches(cell, &base_m0_m4, max_degree)
-    {
-        return Ok(moments);
-    }
-    let d = sextic_qprime_coefficients(cell.c0, cell.c1, cell.c2, cell.c3);
-    let lead = d[5];
-    if !lead.is_finite() {
-        return Err(CubicCellKernelError::invalid_cell_shape(format!(
-            "sextic moment reduction encountered non-finite leading coefficient: {lead:.3e}"
-        ))
-        .into());
-    }
-    let recurrence_scale = d[..5]
-        .iter()
-        .fold(1.0_f64, |scale, coefficient| scale.max(coefficient.abs()));
-    if lead.abs() <= f64::EPSILON * recurrence_scale {
-        // Dividing the recurrence by an unresolved leading coefficient is
-        // ill-conditioned. Preserve the exact cubic and use the canonical
-        // fixed-rule transport; lowering its degree would change the model.
-        return evaluate_non_affine_cell_state(cell, ExactCellBranch::Sextic, max_degree)
-            .map(|state| state.moments.into_vec());
-    }
-    let mut moments = vec![0.0; max_degree + 1];
-    for (idx, value) in base_m0_m4.into_iter().enumerate() {
-        moments[idx] = value;
-    }
-    let left_finite = cell.left.is_finite();
-    let right_finite = cell.right.is_finite();
-    let mut left_pow_n = if left_finite { 1.0 } else { 0.0 };
-    let mut right_pow_n = if right_finite { 1.0 } else { 0.0 };
-    for n in 0..=(max_degree - 5) {
-        let b_n = moment_boundary_term_with_powers(cell, left_pow_n, right_pow_n);
-        let mut numer = if n == 0 {
-            0.0
-        } else {
-            (n as f64) * moments[n - 1]
-        };
-        for j in 0..=4 {
-            numer -= d[j] * moments[n + j];
-        }
-        numer -= b_n;
-        moments[n + 5] = numer / lead;
-        if left_finite {
-            left_pow_n *= cell.left;
-        }
-        if right_finite {
-            right_pow_n *= cell.right;
-        }
-    }
-    Ok(moments)
-}
-
-#[inline]
 pub fn cell_first_derivative_from_moments(
     derivative_coefficients: &[f64],
     moments: &[f64],
 ) -> Result<f64, String> {
     let value = moment_dot_with_coefficients(derivative_coefficients, moments, "first derivative")?;
     Ok(value * INV_TWO_PI)
-}
-
-/// Maximum moment index (i.e. `max_degree` passed to
-/// `evaluate_cell_moments`) required to evaluate
-/// `cell_first_derivative_from_moments(derivative_coefficients, moments)`.
-///
-/// Callers must request at least `cell_first_derivative_required_max_degree(
-/// derivative_coefficients)` so the moment dot is well-defined; #321 was
-/// caused by hardcoding a smaller value at one call site.
-#[inline]
-pub fn cell_first_derivative_required_max_degree(derivative_coefficients: &[f64]) -> usize {
-    derivative_coefficients.len().saturating_sub(1)
 }
 
 /// Maximum moment index required by `cell_second_derivative_from_moments`.
@@ -1893,16 +1540,6 @@ pub fn cell_second_derivative_required_max_degree(
         + first_coefficients_s.len().saturating_sub(1)
         + 3;
     second_degree.max(product_degree)
-}
-
-#[inline]
-pub fn cell_polynomial_integral_from_moments(
-    polynomial_coefficients: &[f64],
-    moments: &[f64],
-    label: &str,
-) -> Result<f64, String> {
-    let value = moment_dot_with_coefficients(polynomial_coefficients, moments, label)?;
-    Ok(value * INV_TWO_PI)
 }
 
 #[inline]
@@ -1947,97 +1584,6 @@ pub fn cell_second_derivative_from_moments(
         eta_term = eta_rs[k].mul_add(moments[k], eta_term);
     }
     Ok((second_term - eta_term) * INV_TWO_PI)
-}
-
-/// Pointwise value of the cell second-derivative integrand
-/// `(∂²/∂r∂s) exp(-q(z))/2π` at a single `z`, evaluated from the SAME
-/// `(r, s, rs)` coefficient polynomials the moment reduction
-/// [`cell_second_derivative_from_moments`] integrates:
-///
-/// ```text
-///   F_rs(z) = ( c_rs(z) - η(z)·c_r(z)·c_s(z) ) · exp(-q(z)) · 1/2π ,
-/// ```
-///
-/// with `c_•(z) = Σ_k coeff_•[k]·zᵏ`, `η(z)` the cell cubic, and
-/// `q(z) = ½(z² + η(z)²)`. This is the integrand whose `[cell.left,
-/// cell.right]` integral the from-moments form returns — needed for the
-/// Leibniz boundary term when a cell edge (a link-knot crossing
-/// `z=(τ-a)/b`) moves with a parameter (the slope `b`): the directional
-/// derivative of `∫_{z_L}^{z_R} F_rs dz` picks up
-/// `F_rs(z_R)·z_R'(dir) - F_rs(z_L)·z_L'(dir)` on top of the fixed-domain
-/// part. Coefficient sign convention matches the simpson reference
-/// (`numeric_ab`): pass the ACTUAL derivative-coefficient polynomials
-/// `∂c/∂r` etc. (not the negated `neg_dc_d•` the moment path consumes).
-#[inline]
-pub fn cell_second_derivative_boundary_integrand(
-    cell: DenestedCubicCell,
-    first_coefficients_r: &[f64],
-    first_coefficients_s: &[f64],
-    second_coefficients_rs: &[f64],
-    z: f64,
-) -> f64 {
-    let eta = cell.eta(z);
-    let c_r = poly_eval_at(first_coefficients_r, z);
-    let c_s = poly_eval_at(first_coefficients_s, z);
-    let c_rs = poly_eval_at(second_coefficients_rs, z);
-    (c_rs - eta * c_r * c_s) * (-cell.q(z)).exp() * INV_TWO_PI
-}
-
-/// Pointwise value of the cell third-derivative integrand
-/// `(∂³/∂r∂s∂t) exp(-q(z))/2π` at a single `z`, evaluated from the same
-/// `(r, s, t, rs, rt, st, rst)` coefficient polynomials that
-/// [`cell_third_derivative_from_moments`] integrates:
-///
-/// ```text
-/// F_rst(z) = (
-///     c_rst(z)
-///   - η(z)·(c_rs(z)c_t(z) + c_rt(z)c_s(z) + c_st(z)c_r(z))
-///   + (η(z)² - 1)·c_r(z)c_s(z)c_t(z)
-/// ) · exp(-q(z)) · 1/2π .
-/// ```
-///
-/// This is the boundary value for differentiating an already-third-order
-/// fixed-domain integral with respect to a moving edge. The sign convention is
-/// intentionally identical to [`cell_third_derivative_from_moments`]: callers
-/// must pass the coefficient slices in the convention of the integral they are
-/// differentiating. In particular, survival/probit paths that integrate the
-/// jointly negated cell and coefficient slices must evaluate this boundary
-/// integrand with the same joint negation; evaluating an un-negated boundary for
-/// a negated fixed-domain integral flips the sign of this odd-order integrand.
-#[inline]
-pub fn cell_third_derivative_boundary_integrand(
-    cell: DenestedCubicCell,
-    first_coefficients_r: &[f64],
-    first_coefficients_s: &[f64],
-    first_coefficients_t: &[f64],
-    second_coefficients_rs: &[f64],
-    second_coefficients_rt: &[f64],
-    second_coefficients_st: &[f64],
-    third_coefficients_rst: &[f64],
-    z: f64,
-) -> f64 {
-    let eta = cell.eta(z);
-    let c_r = poly_eval_at(first_coefficients_r, z);
-    let c_s = poly_eval_at(first_coefficients_s, z);
-    let c_t = poly_eval_at(first_coefficients_t, z);
-    let c_rs = poly_eval_at(second_coefficients_rs, z);
-    let c_rt = poly_eval_at(second_coefficients_rt, z);
-    let c_st = poly_eval_at(second_coefficients_st, z);
-    let c_rst = poly_eval_at(third_coefficients_rst, z);
-    let amplitude =
-        c_rst - eta * (c_rs * c_t + c_rt * c_s + c_st * c_r) + (eta * eta - 1.0) * c_r * c_s * c_t;
-    amplitude * (-cell.q(z)).exp() * INV_TWO_PI
-}
-
-
-/// Horner evaluation of `Σ_k coefficients[k]·zᵏ`.
-#[inline]
-fn poly_eval_at(coefficients: &[f64], z: f64) -> f64 {
-    let mut acc = 0.0_f64;
-    for &c in coefficients.iter().rev() {
-        acc = acc.mul_add(z, c);
-    }
-    acc
 }
 
 #[inline]
@@ -3921,9 +3467,6 @@ pub fn evaluate_cell_moments(
     cell: DenestedCubicCell,
     max_degree: usize,
 ) -> Result<CellMomentState, String> {
-    if !TAIL_CELL_MOMENT_CACHE_ENABLED.load(std::sync::atomic::Ordering::Relaxed) {
-        return evaluate_cell_moments_uncached(cell, max_degree);
-    }
     tail_cell_moment_cache().evaluate(cell, max_degree)
 }
 
@@ -4115,27 +3658,6 @@ pub fn evaluate_cell_derivative_moments_cached(
     }
     cache.insert(key, entry);
     Ok(Arc::try_unwrap(shared).unwrap_or_else(|a| (*a).clone()))
-}
-
-/// Scratch-backed variant of [`evaluate_cell_moments`].
-///
-/// Reuses the supplied [`CellMomentScratch`] for the returned moments slice,
-/// so repeated calls with the same scratch (and a sufficient initial capacity)
-/// avoid per-call `Vec` allocations on the hot inner-PIRLS row-intercept
-/// solver path. Internal transport allocations are unchanged.
-pub fn evaluate_cell_moments_with_scratch<'a>(
-    cell: DenestedCubicCell,
-    max_degree: usize,
-    scratch: &'a mut CellMomentScratch,
-) -> Result<CellMomentStateRef<'a>, String> {
-    let state = evaluate_cell_moments(cell, max_degree)?;
-    let out = scratch.prepare_moments(max_degree + 1);
-    out.copy_from_slice(&state.moments);
-    Ok(CellMomentStateRef {
-        branch: state.branch,
-        value: state.value,
-        moments: out,
-    })
 }
 
 #[cfg(test)]
@@ -6983,90 +6505,6 @@ mod tests {
         assert!(misses > 0, "expected cold LRU misses");
     }
 
-    #[test]
-    fn cell_moment_fingerprint_exact_cache_matches_current_evaluator() {
-        let cells = [
-            DenestedCubicCell {
-                left: -1.75,
-                right: -0.25,
-                c0: 0.15,
-                c1: -0.35,
-                c2: 0.08,
-                c3: -0.015,
-            },
-            DenestedCubicCell {
-                left: -0.5,
-                right: 0.8,
-                c0: -0.2,
-                c1: 0.45,
-                c2: -0.12,
-                c3: 0.025,
-            },
-            DenestedCubicCell {
-                left: 0.1,
-                right: 1.6,
-                c0: 0.05,
-                c1: 0.2,
-                c2: 0.03,
-                c3: 0.004,
-            },
-        ];
-        let mut cache = std::collections::HashMap::new();
-        for max_degree in [0usize, 3, 4, 9, 16] {
-            for cell in cells {
-                let baseline = evaluate_cell_moments(cell, max_degree).expect("baseline moments");
-                let key = cell_moment_cache_key(cell, max_degree, 0.0);
-                let cached = cache.entry(key).or_insert_with(|| {
-                    evaluate_cell_moments(cell, max_degree).expect("cached moments")
-                });
-                assert_eq!(baseline.branch, cached.branch);
-                assert_eq!(baseline.value.to_bits(), cached.value.to_bits());
-                assert_eq!(baseline.moments.len(), cached.moments.len());
-                for (lhs, rhs) in baseline.moments.iter().zip(cached.moments.iter()) {
-                    assert_eq!(lhs.to_bits(), rhs.to_bits());
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn fuzzy_cell_moment_fingerprint_error_scales_with_epsilon() {
-        for epsilon in [1e-8, 1e-6] {
-            let base = DenestedCubicCell {
-                left: -1.25,
-                right: 1.1,
-                c0: 0.1,
-                c1: -0.25,
-                c2: 0.04,
-                c3: -0.006,
-            };
-            let perturbed = DenestedCubicCell {
-                left: base.left + 0.001 * epsilon,
-                right: base.right - 0.001 * epsilon,
-                c0: base.c0 + 0.001 * epsilon,
-                c1: base.c1 - 0.001 * epsilon,
-                c2: base.c2 + 0.001 * epsilon,
-                c3: base.c3 - 0.001 * epsilon,
-            };
-            assert_eq!(
-                cell_moment_cache_key(base, 9, epsilon),
-                cell_moment_cache_key(perturbed, 9, epsilon)
-            );
-            let lhs = evaluate_cell_moments(base, 9).expect("base moments");
-            let rhs = evaluate_cell_moments(perturbed, 9).expect("perturbed moments");
-            let max_rel = lhs
-                .moments
-                .iter()
-                .zip(rhs.moments.iter())
-                .map(|(a, b)| (a - b).abs() / a.abs().max(b.abs()).max(1.0))
-                .fold(0.0_f64, f64::max);
-            assert!(
-                max_rel <= 10.0 * epsilon,
-                "epsilon={epsilon:.1e} max_rel={max_rel:.3e}"
-            );
-        }
-    }
-
     /// Locks in numerical equivalence of the optimized
     /// `evaluate_non_affine_cell_state` against an inline reference
     /// implementation that mirrors the prior pre-fold structure
@@ -7331,7 +6769,7 @@ mod tests {
     //       C²-link knot — its third coefficient slice carries `c_rst ∝ 6·α₃`,
     //       and `α₃` (the spline's third `z`-derivative) is the one piece a C²
     //       cubic spline leaves discontinuous. So the jump is real and the
-    //       `cell_third_derivative_boundary_integrand` flux formula is exact
+    //       third-derivative boundary integrand's flux formula is exact
     //       (verified by FD of a direct ∂/∂edge of the third-integral sum —
     //       a FOURTH-order scenario that pins the integrand, not the tower).
     //

@@ -1,9 +1,8 @@
-use gam::families::cubic_cell_kernel::{DenestedCubicCell, LocalSpanCubic, affine_anchor_moment_vector, evaluate_cell_moments, global_cubic_from_local, reset_tail_cell_moment_cache, set_tail_cell_moment_cache_enabled, tail_cell_moment_cache_stats};
+use gam::families::cubic_cell_kernel::{DenestedCubicCell, LocalSpanCubic, affine_anchor_moment_vector, evaluate_cell_moments, global_cubic_from_local, reset_tail_cell_moment_cache, tail_cell_moment_cache_stats};
 use std::sync::{Arc, Barrier};
 
 #[test]
 fn bug_tail_cell_cache_second_thread_waits_for_first_computation() {
-    set_tail_cell_moment_cache_enabled(true);
     reset_tail_cell_moment_cache();
     let cell = DenestedCubicCell {
         left: f64::NEG_INFINITY,

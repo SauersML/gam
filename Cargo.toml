@@ -185,11 +185,6 @@ path = "bench/cargo_benches/cell_moment_lru_large_scale_shape.rs"
 harness = false
 
 [[bench]]
-name = "tail_cell_memo_large_scale_shape"
-path = "bench/cargo_benches/tail_cell_memo_large_scale_shape.rs"
-harness = false
-
-[[bench]]
 name = "trust_region_line_search"
 path = "bench/cargo_benches/trust_region_line_search.rs"
 harness = false
@@ -202,11 +197,6 @@ harness = false
 [[bench]]
 name = "joint_line_search_speculative"
 path = "bench/cargo_benches/joint_line_search_speculative.rs"
-harness = false
-
-[[bench]]
-name = "cell_moment_dedup_large_scale_shape"
-path = "bench/cargo_benches/cell_moment_dedup_large_scale_shape.rs"
 harness = false
 
 [[bench]]
