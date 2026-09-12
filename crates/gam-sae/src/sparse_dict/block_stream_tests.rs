@@ -143,6 +143,11 @@ fn parallel_stream_moments_match_dense_reference_across_batches_and_shards() {
     let baseline_residual = x.mapv(f64::from) - &total * baseline_gamma as f64;
     let expected_rss = residual.iter().map(|v| v * v).sum::<f64>();
     let expected_baseline_rss = baseline_residual.iter().map(|v| v * v).sum::<f64>();
+    // Nonzero search rows for every block, so the accumulated operator is checked
+    // on the search columns as well as on the frame columns.
+    let searched = Array2::from_shape_fn((12, 4), |(row, feature)| {
+        ((row * 3 + feature * 5 + 1) as f32 * 0.29).cos()
+    });
     for threads in [1, 4] {
         let pool = rayon::ThreadPoolBuilder::new()
             .num_threads(threads)
@@ -158,6 +163,7 @@ fn parallel_stream_moments_match_dense_reference_across_batches_and_shards() {
                     let mut state =
                         BlockSparseStreamState::new_with_decoder(decoder.clone(), &config).unwrap();
                     state.gamma = gamma;
+                    state.search_directions = searched.clone();
                     state.pending_birth = Some(super::PendingBlockBirth {
                         block: 0,
                         baseline_decoder: decoder.clone(),
@@ -195,21 +201,23 @@ fn parallel_stream_moments_match_dense_reference_across_batches_and_shards() {
                         );
                         let v = &own * 3.0 - &total;
                         let x64 = x.mapv(f64::from);
-                        let frame = decoder
-                            .slice(ndarray::s![block * 2..(block + 1) * 2, ..])
-                            .mapv(f64::from);
-                        let expected_coupling = (x64.t().dot(&v) + v.t().dot(&x64)).dot(&frame.t());
-                        let expected_energy = x64.iter().map(|v| v * v).sum::<f64>();
-                        let expected_bound = x64
-                            .outer_iter()
-                            .zip(v.outer_iter())
-                            .map(|(x, v)| {
-                                (x.dot(&x).sqrt() * v.dot(&v).sqrt() - x.dot(&v)).max(0.0)
-                            })
-                            .sum::<f64>();
-                        assert!((state.data_energy[block] - expected_energy).abs() < 1e-11);
-                        assert!((state.negative_bound[block] - expected_bound).abs() < 1e-11);
-                        let expected_data = x.mapv(f64::from).t().dot(&w);
+                        let subspace = ndarray::concatenate(
+                            ndarray::Axis(0),
+                            &[
+                                decoder
+                                    .slice(ndarray::s![block * 2..(block + 1) * 2, ..])
+                                    .mapv(f64::from)
+                                    .view(),
+                                searched
+                                    .slice(ndarray::s![block * 4..(block + 1) * 4, ..])
+                                    .mapv(f64::from)
+                                    .view(),
+                            ],
+                        )
+                        .unwrap();
+                        let expected_coupling =
+                            (x64.t().dot(&v) + v.t().dot(&x64)).dot(&subspace.t());
+                        let expected_data = x64.t().dot(&x64).dot(&subspace.t());
                         let expected_second = w.t().dot(&w);
                         for (got, expected) in [
                             (&state.coupling[block], expected_coupling),
@@ -220,6 +228,7 @@ fn parallel_stream_moments_match_dense_reference_across_batches_and_shards() {
                                 expected_second * (baseline_gamma as f64).powi(2),
                             ),
                         ] {
+                            assert_eq!(got.dim(), expected.dim());
                             assert!(
                                 got.iter()
                                     .zip(expected.iter())
@@ -273,6 +282,18 @@ fn frame_refresh_uses_the_new_gamma_and_descends_from_any_initial_scale_2825() {
         for gamma in [0.2, 1.0, 2.0] {
             let mut state =
                 BlockSparseStreamState::new_with_decoder(decoder.clone(), &config).unwrap();
+            state.gamma = gamma;
+            for row in x.outer_iter() {
+                state
+                    .partial_fit(row.insert_axis(ndarray::Axis(0)))
+                    .unwrap();
+            }
+            // The frame step searches along directions a pass has measured, so the
+            // first epoch measures the gradient and leaves the frames in place.
+            assert!(!state.end_epoch().unwrap().converged);
+            assert_eq!(state.decoder, decoder);
+            // The step itself forms on the next pass, started from the same initial
+            // scale again.
             state.gamma = gamma;
             for row in x.outer_iter() {
                 state
@@ -344,6 +365,10 @@ fn tied_frame_update_descends_on_the_frozen_code_ascent_witness_2825() {
         let residual = &x64 - x64.dot(&d.t()).dot(&d) * gamma as f64;
         residual.iter().map(|v| v * v).sum::<f64>()
     };
+    // The first pass only measures the search direction.
+    state.partial_fit(x.view()).unwrap();
+    assert!(!state.end_epoch().unwrap().converged);
+    assert_eq!(state.decoder, decoder);
     state.partial_fit(x.view()).unwrap();
     let first = state.end_epoch().unwrap();
     let proposal = state.decoder.clone();
@@ -384,8 +409,9 @@ fn tied_projector_moments_match_actual_loss_directional_derivatives() {
             let frame = d.slice(ndarray::s![block * 2..(block + 1) * 2, ..]);
             let raw = Array2::from_shape_fn((2, 4), |(i, j)| ((i * 5 + j + 1) as f64).cos());
             let tangent = &raw - raw.dot(&frame.t()).dot(&frame);
-            let moment =
-                &state.data_cross[block] * data_scale + &state.coupling[block] * (gamma * gamma);
+            // The frame's own columns; the rest are the search columns.
+            let moment = &state.data_cross[block].slice(ndarray::s![.., ..2]) * data_scale
+                + &state.coupling[block].slice(ndarray::s![.., ..2]) * (gamma * gamma);
             let analytic = -2.0
                 * moment
                     .iter()
@@ -469,7 +495,6 @@ fn parallel_stream_rejects_selected_duplicate_birth_using_complete_baseline() {
     config.block_topk = 1;
     config.minibatch = 5;
     config.aux_k = 1;
-    config.frame_ridge = 0.0;
     let mut state = BlockSparseStreamState::new_with_decoder(candidate, &config).unwrap();
     state.pending_birth = Some(super::PendingBlockBirth {
         block: 0,
@@ -501,11 +526,11 @@ fn parallel_stream_rejects_selected_duplicate_birth_using_complete_baseline() {
 }
 
 #[test]
-fn a_large_spectral_shift_cannot_certify_a_nonstationary_frame() {
-    let (x, decoder, mut config) = coupled_fixture();
-    // Force a proposal below f32 resolution while leaving the actual tied
-    // objective unchanged. The gradient certificate must see through it.
-    config.frame_ridge = 1e20;
+fn a_frame_step_without_search_directions_cannot_certify_a_nonstationary_frame() {
+    let (x, decoder, config) = coupled_fixture();
+    // A state without search directions cannot move its frames while the actual
+    // tied objective still has a gradient. The gradient certificate must see
+    // through the zero displacement.
     let mut first = BlockSparseStreamState::new_with_decoder(decoder.clone(), &config).unwrap();
     first.partial_fit(x.view()).unwrap();
     let measured = first.end_epoch().unwrap();
@@ -730,7 +755,8 @@ fn tied_row_moment_kernel_is_bit_identical_to_the_indexed_loop_2826() {
     // `[[c, axis]]` loop to a two-pass slice kernel for speed only. The moments
     // feed the frame step, its stationarity certificate and the paired frame
     // trials, so the kernel must perform the old loop's floating-point
-    // operations in the same order: bit equality, not a tolerance.
+    // operations in the same order: bit equality, not a tolerance. The search
+    // columns ride alongside and must leave the frame columns' operations alone.
     let mut bits = 0x2826_u64;
     let mut draw = move || {
         bits = bits
@@ -748,11 +774,16 @@ fn tied_row_moment_kernel_is_bit_identical_to_the_indexed_loop_2826() {
         let codes = Array2::from_shape_fn((entries, b), |_| 3.0 * draw());
         let sums = Array2::from_shape_fn((entries, p), |_| 2.0 * draw());
         let frame: Vec<f64> = decoder.iter().map(|&value| f64::from(value)).collect();
+        let searched = Array2::from_shape_fn((2 * b, p), |_| draw() as f32);
+        let directions: Vec<f64> = searched.iter().map(|&value| f64::from(value)).collect();
 
         let mut coupling = vec![0.0_f64; p * b];
         let mut data_cross = vec![0.0_f64; p * b];
+        let mut searched_coupling = vec![0.0_f64; p * 3 * b];
+        let mut searched_data = vec![0.0_f64; p * 3 * b];
         let mut v = vec![0.0_f64; p];
-        let mut v_coordinates = vec![0.0_f64; b];
+        let mut coordinates = vec![0.0_f64; b];
+        let mut searched_coordinates = vec![0.0_f64; 5 * b];
         let mut reference_coupling = Array2::<f64>::zeros((p, b));
         let mut reference_data = Array2::<f64>::zeros((p, b));
         let mut merged_coupling = Array2::<f64>::zeros((p, b));
@@ -761,24 +792,34 @@ fn tied_row_moment_kernel_is_bit_identical_to_the_indexed_loop_2826() {
             let sum = sums.row(entry).to_vec();
             let xi = rows.row(entry);
             assert_ne!(xi.strides()[0], 1, "the fixture must exercise a strided row");
-            let (x_norm_sq, v_norm_sq, x_dot_v) = super::accumulate_tied_row_moments(
+            super::accumulate_tied_row_moments(
                 &frame,
+                &[],
                 &w,
                 xi,
                 &sum,
                 k as f64,
                 &mut v,
-                &mut v_coordinates,
+                &mut coordinates,
                 &mut coupling,
                 &mut data_cross,
+            );
+            super::accumulate_tied_row_moments(
+                &frame,
+                &directions,
+                &w,
+                xi,
+                &sum,
+                k as f64,
+                &mut v,
+                &mut searched_coordinates,
+                &mut searched_coupling,
+                &mut searched_data,
             );
 
             // The loop as it stood before the kernel, with
             // `decoder[[block * b + axis, c]]` narrowed to this one block's rows.
             let mut reference_v_coordinates = vec![0.0; b];
-            let mut reference_x_norm_sq = 0.0;
-            let mut reference_v_norm_sq = 0.0;
-            let mut reference_x_dot_v = 0.0;
             for c in 0..p {
                 let mut own = 0.0;
                 for (axis, &weight) in w.iter().enumerate() {
@@ -786,9 +827,6 @@ fn tied_row_moment_kernel_is_bit_identical_to_the_indexed_loop_2826() {
                 }
                 let value = k as f64 * own - sum[c];
                 let x = xi[c] as f64;
-                reference_x_norm_sq += x * x;
-                reference_v_norm_sq += value * value;
-                reference_x_dot_v += x * value;
                 for (axis, &weight) in w.iter().enumerate() {
                     reference_coupling[[c, axis]] += value * weight;
                     reference_data[[c, axis]] += x * weight;
@@ -814,23 +852,22 @@ fn tied_row_moment_kernel_is_bit_identical_to_the_indexed_loop_2826() {
                         value * weight + xi[c] as f64 * reference_v_coordinates[axis];
                 }
             }
-            for (got, expected, name) in [
-                (x_norm_sq, reference_x_norm_sq, "x_norm_sq"),
-                (v_norm_sq, reference_v_norm_sq, "v_norm_sq"),
-                (x_dot_v, reference_x_dot_v, "x_dot_v"),
-            ] {
-                assert_eq!(
-                    got.to_bits(),
-                    expected.to_bits(),
-                    "{name} differs at entry {entry} (b={b}, p={p}, k={k}): {got:e} vs {expected:e}"
-                );
-            }
         }
         for c in 0..p {
             for axis in 0..b {
                 for (got, expected, name) in [
                     (coupling[c * b + axis], reference_coupling[[c, axis]], "coupling"),
                     (data_cross[c * b + axis], reference_data[[c, axis]], "data_cross"),
+                    (
+                        searched_coupling[c * 3 * b + axis],
+                        reference_coupling[[c, axis]],
+                        "searched coupling",
+                    ),
+                    (
+                        searched_data[c * 3 * b + axis],
+                        reference_data[[c, axis]],
+                        "searched data_cross",
+                    ),
                 ] {
                     assert_eq!(
                         got.to_bits(),

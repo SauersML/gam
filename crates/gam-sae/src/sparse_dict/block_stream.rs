@@ -16,7 +16,7 @@
 //! ```
 //!
 //! All heavy state lives here, native-side: the warm-started block frames, the
-//! epoch's accumulated per-block projector moments (`M_g`, `P×b`), the streaming γ
+//! epoch's accumulated per-block projector moments (`M_g`, `P×3b`), the streaming γ
 //! numerator/denominator, per-block usage + within-block code second moments (for
 //! the utilisation / stable-rank report), the streaming TSS/RSS moments, and the
 //! worst-reconstructed-row reservoir feeding AuxK dead-block birth proposals. A shard
@@ -30,15 +30,15 @@
 //! them and its cross-moment / γ / moment contributions are summed (all additive),
 //! so shard boundaries do not change the accumulated problem. Gamma-free data
 //! and overlap moments let the frame step use the newly fitted γ without
-//! replaying the corpus. The simultaneous polar updates majorize the tied-code
-//! reconstruction loss with supports held fixed, differentiating both the frame
-//! and its projection code. A data-derived spectral shift makes each surrogate
-//! positive semidefinite without storing a feature covariance matrix. After an
-//! accepted trial each block instead steps along its tangent gradient by the
-//! secant curvature measured between the two passes, and falls back to the
-//! majorizer when that curvature is not positive. Rerouting
-//! on the next pass can change supports and is measured separately. One-shot
-//! uses sequential block updates; the streaming trajectory is different.
+//! replaying the corpus. With supports held fixed, a per-block Rayleigh surrogate
+//! majorizes the simultaneous tied-code reconstruction loss, differentiating both
+//! the frame and its projection code. Each pass accumulates the surrogate's
+//! operator on the frame and on the two search directions the previous step
+//! left, and the frame step takes each block's top Ritz vectors on their span:
+//! block LOBPCG with its residual one pass behind, with no spectral shift and no
+//! step length. Rerouting on the next pass can change supports and is measured
+//! separately. One-shot uses sequential block updates; the streaming trajectory
+//! is different.
 //!
 //! EV describes the pass's measured frames with their profiled γ. Proposed frames
 //! remain an uncertified checkpoint until a paired pass reroutes both proposal
@@ -53,9 +53,7 @@ use super::block::{
     RowBlockCode, block_birth_evidence_margin, gram_schmidt_rows, relative_scalar_change,
     route_and_code_all, stable_rank_symmetric,
 };
-use super::block_frame::{
-    FrameSecant, STORED_FRAME_RESOLUTION, secant_tied_frame_step, stored_projector_distance,
-};
+use super::block_frame::{STORED_FRAME_RESOLUTION, ritz_tied_frame_step, stored_projector_distance};
 use super::residual_reservoir::ResidualReservoir;
 use super::update::{DEAD_DENOM, DecoderSolveStats};
 use gam_linalg::faer_ndarray::with_faer_sequential;
@@ -134,55 +132,64 @@ fn block_row_postings(codes: &[RowBlockCode], blocks: usize) -> Vec<Vec<(usize, 
     postings
 }
 
-/// One selected row's contribution to its block's tied projector moments:
-/// `coupling += v wᵀ + x (U v)ᵀ` and `data_cross += x wᵀ`, where
-/// `v = k P_g x - Σ_h P_h x` is formed from the row's code `w` and its
-/// gamma-free reconstruction `sum`. Returns `(‖x‖², ‖v‖², xᵀv)` for the block's
-/// data energy and negative-curvature bound.
+/// One selected row's contribution to its block's tied projector moments over
+/// `W = [U, D]`: `coupling += v (Wᵀx)ᵀ + x (Wᵀv)ᵀ` and `data_cross += x (Wᵀx)ᵀ`,
+/// where `v = k P_g x - Σ_h P_h x` is formed from the row's code `w = Uᵀx` and its
+/// gamma-free reconstruction `sum`.
 ///
-/// `frame` is the block's `b` directions in f64, row-major (`frame[axis * p + c]`);
-/// `coupling` and `data_cross` are the block's `P×b` moments, row-major
-/// (`[c * b + axis]`); `v` (length `P`) and `v_coordinates` (length `b`) are
-/// caller-owned scratch. Every accumulator receives the same floating-point
-/// operations in the same order as the per-element `[[c, axis]]` loop this kernel
-/// replaced, so the moments are bit-identical to it (#2826).
+/// `frame` holds the block's `b` directions and `directions` its `d` search rows,
+/// both f64 and row-major (`frame[axis * p + c]`); `d` may be zero. `coupling` and
+/// `data_cross` are the block's `P×m` moments, row-major (`[c * m + column]`) with
+/// `m ≥ b + d`, and only their first `b + d` columns are written. `v` (length `P`)
+/// and `coordinates` (length `b + 2d`) are caller-owned scratch. The frame columns
+/// receive the same floating-point operations in the same order as the
+/// per-element `[[c, axis]]` loop this kernel replaced, so they are bit-identical
+/// to it (#2826).
 fn accumulate_tied_row_moments(
     frame: &[f64],
+    directions: &[f64],
     w: &[f64],
     xi: ArrayView1<'_, f32>,
     sum: &[f64],
     k: f64,
     v: &mut [f64],
-    v_coordinates: &mut [f64],
+    coordinates: &mut [f64],
     coupling: &mut [f64],
     data_cross: &mut [f64],
-) -> (f64, f64, f64) {
+) {
     let b = w.len();
     let p = sum.len();
-    v_coordinates.fill(0.0);
-    let mut x_norm_sq = 0.0;
-    let mut v_norm_sq = 0.0;
-    let mut x_dot_v = 0.0;
-    // Pass 1: v, the three scalar reductions and U v, each summed in `c` order.
+    let searched = directions.len() / p;
+    let columns = coupling.len() / p;
+    coordinates.fill(0.0);
+    // `v_coordinates` holds Wᵀv over all `b + d` columns; `x_coordinates` holds Dᵀx.
+    let (v_coordinates, x_coordinates) = coordinates.split_at_mut(b + searched);
+    // Pass 1: v, then U v and the search projections, each summed in `c` order.
     for (c, ((value, &x), &total)) in v.iter_mut().zip(xi.iter()).zip(sum).enumerate() {
         let mut own = 0.0;
         for (axis, &weight) in w.iter().enumerate() {
             own += weight * frame[axis * p + c];
         }
         *value = k * own - total;
-        let x = x as f64;
-        x_norm_sq += x * x;
-        v_norm_sq += *value * *value;
-        x_dot_v += x * *value;
-        for (axis, coordinate) in v_coordinates.iter_mut().enumerate() {
+        for (axis, coordinate) in v_coordinates[..b].iter_mut().enumerate() {
             *coordinate += frame[axis * p + c] * *value;
         }
+        let x = x as f64;
+        for (row, (v_coordinate, x_coordinate)) in v_coordinates[b..]
+            .iter_mut()
+            .zip(x_coordinates.iter_mut())
+            .enumerate()
+        {
+            let direction = directions[row * p + c];
+            *v_coordinate += direction * *value;
+            *x_coordinate += direction * x;
+        }
     }
-    // Pass 2: each coupling entry takes `v w` and then `x (U v)` as two separate
-    // additions, exactly as the two loops it replaced did.
+    // Pass 2: each frame coupling entry takes `v w` and then `x (U v)` as two
+    // separate additions, exactly as the two loops it replaced did.
     for (((coupling_row, data_row), &value), &x) in coupling
-        .chunks_exact_mut(b)
-        .zip(data_cross.chunks_exact_mut(b))
+        .chunks_exact_mut(columns)
+        .zip(data_cross.chunks_exact_mut(columns))
         .zip(v.iter())
         .zip(xi.iter())
     {
@@ -192,8 +199,13 @@ fn accumulate_tied_row_moments(
             data_row[axis] += x * weight;
             coupling_row[axis] += x * v_coordinates[axis];
         }
+        for (row, &projection) in x_coordinates.iter().enumerate() {
+            let column = b + row;
+            coupling_row[column] += value * projection;
+            data_row[column] += x * projection;
+            coupling_row[column] += x * v_coordinates[column];
+        }
     }
-    (x_norm_sq, v_norm_sq, x_dot_v)
 }
 
 fn profiled_scalar(old_gamma: f32, rss: f64, numerator: f64, denominator: f64) -> (f32, f64) {
@@ -253,8 +265,9 @@ pub struct BlockEpochStats {
     /// Relative displacement from the pass's gamma to its conditional optimum.
     pub gamma_residual: f64,
     /// Maximum of relative projector displacement and normalized tangent
-    /// gradient at that same gamma. The gradient excludes the spectral shift,
-    /// so a conservative step cannot manufacture a stationarity certificate.
+    /// gradient at that same gamma. The gradient is read at the measured frames
+    /// and does not depend on the step, so a short step cannot manufacture a
+    /// stationarity certificate.
     pub frame_residual: f64,
     /// The projector half of [`Self::frame_residual`]: the largest relative
     /// displacement between a block's measured frame and its proposal
@@ -277,10 +290,10 @@ pub struct BlockEpochStats {
     pub converged: bool,
     /// Epochs completed so far (this one inclusive).
     pub epoch: usize,
-    /// Solve certificate placeholder. The block lane refreshes its small `b×b`
-    /// frames by an exact polar step (no matrix-free CG/percolation solve), so this
-    /// carries the default (zeroed) certificate; the CG/percolation stats are the
-    /// atom/dict lane's ([`super::update::DecoderSolveStats`]).
+    /// Solve certificate placeholder. The streaming block lane refreshes its frames
+    /// by a dense Rayleigh–Ritz step on `3b`-column subspaces (no matrix-free
+    /// CG/percolation solve), so this carries the default (zeroed) certificate; the
+    /// CG/percolation stats are the atom/dict lane's ([`super::update::DecoderSolveStats`]).
     pub decoder_solve_stats: DecoderSolveStats,
 }
 
@@ -313,10 +326,6 @@ struct PendingFrameTrial {
     baseline_rows: usize,
     baseline_usage: Vec<usize>,
     baseline_second: Vec<Array2<f64>>,
-    /// One secant pair per block from the step that formed `proposed_decoder`,
-    /// handed to the next frame step once the trial commits. `None` for a
-    /// bisected midpoint, whose step is not the one the pairs describe.
-    secant: Option<Vec<FrameSecant>>,
 }
 
 /// Resumable state for a streaming block-sparse fit. Construct with [`Self::new`]
@@ -334,10 +343,8 @@ pub struct BlockSparseStreamState {
 
     // ---- accumulators reset at each end_epoch (frozen frames/γ used to fill) ----
     second: Vec<Array2<f64>>,   // gamma-free projection second moment (b×b)
-    coupling: Vec<Array2<f64>>, // (XᵀV + VᵀX)U, V = k X P_g - total projection
-    data_cross: Vec<Array2<f64>>, // data × projection (P×b)
-    data_energy: Vec<f64>,      // selected-row sum of ||x||²
-    negative_bound: Vec<f64>,   // sum of ||x|| ||v|| - xᵀv bounds negative curvature
+    coupling: Vec<Array2<f64>>, // (XᵀV + VᵀX)W, V = k X P_g - total projection (P×3b)
+    data_cross: Vec<Array2<f64>>, // XᵀX W, W = [U, R, P] (P×3b)
     usage: Vec<usize>,
     alive_count: usize,
     gamma_num: f64,
@@ -370,6 +377,10 @@ pub struct BlockSparseStreamState {
     last_rows: usize,
     pending_birth: Option<PendingBlockBirth>,
     pending_frame: Option<PendingFrameTrial>,
+    // Search rows `[R, P]` per block (`G·2b × P`) left by the last frame step: the
+    // Ritz residual and the part of the old frame outside its proposal. The next
+    // pass accumulates the surrogate's operator on them alongside U.
+    search_directions: Array2<f32>,
 }
 
 /// Per-block honest-charge ledger over the last closed epoch, as parallel
@@ -443,10 +454,8 @@ impl BlockSparseStreamState {
             decoder,
             gamma: 1.0,
             second: (0..g).map(|_| Array2::<f64>::zeros((b, b))).collect(),
-            coupling: (0..g).map(|_| Array2::<f64>::zeros((p, b))).collect(),
-            data_cross: (0..g).map(|_| Array2::<f64>::zeros((p, b))).collect(),
-            data_energy: vec![0.0; g],
-            negative_bound: vec![0.0; g],
+            coupling: (0..g).map(|_| Array2::<f64>::zeros((p, 3 * b))).collect(),
+            data_cross: (0..g).map(|_| Array2::<f64>::zeros((p, 3 * b))).collect(),
             usage: vec![0; g],
             alive_count: 0,
             gamma_num: 0.0,
@@ -473,6 +482,7 @@ impl BlockSparseStreamState {
             last_rows: 0,
             pending_birth: None,
             pending_frame: None,
+            search_directions: Array2::<f32>::zeros((g * 2 * b, p)),
         })
     }
 
@@ -520,10 +530,8 @@ impl BlockSparseStreamState {
             decoder,
             gamma: 1.0,
             second: (0..g).map(|_| Array2::<f64>::zeros((b, b))).collect(),
-            coupling: (0..g).map(|_| Array2::<f64>::zeros((p, b))).collect(),
-            data_cross: (0..g).map(|_| Array2::<f64>::zeros((p, b))).collect(),
-            data_energy: vec![0.0; g],
-            negative_bound: vec![0.0; g],
+            coupling: (0..g).map(|_| Array2::<f64>::zeros((p, 3 * b))).collect(),
+            data_cross: (0..g).map(|_| Array2::<f64>::zeros((p, 3 * b))).collect(),
             usage: vec![0; g],
             alive_count: 0,
             gamma_num: 0.0,
@@ -550,6 +558,7 @@ impl BlockSparseStreamState {
             last_rows: 0,
             pending_birth: None,
             pending_frame: None,
+            search_directions: Array2::<f32>::zeros((g * 2 * b, p)),
         })
     }
 
@@ -683,15 +692,10 @@ impl BlockSparseStreamState {
                 .zip(self.data_cross.par_iter_mut())
                 .zip(self.second.par_iter_mut())
                 .zip(self.usage.par_iter_mut())
-                .zip(self.data_energy.par_iter_mut())
-                .zip(self.negative_bound.par_iter_mut())
                 .zip(postings.par_iter())
                 .enumerate()
                 .for_each(
-                    |(
-                        block,
-                        ((((((coupling, data_cross), second), usage), energy), bound), entries),
-                    )| {
+                    |(block, ((((coupling, data_cross), second), usage), entries))| {
                         // An unselected block has nothing to accumulate, and its
                         // usage below adds zero.
                         if entries.is_empty() {
@@ -705,6 +709,16 @@ impl BlockSparseStreamState {
                             .iter()
                             .map(|&value| f64::from(value))
                             .collect();
+                        // Before a block's first frame step its search rows are
+                        // zero and would add only zeros, so they are skipped.
+                        let searched = self
+                            .search_directions
+                            .slice(ndarray::s![block * 2 * b..(block + 1) * 2 * b, ..]);
+                        let directions: Vec<f64> = if searched.iter().all(|&value| value == 0.0) {
+                            Vec::new()
+                        } else {
+                            searched.iter().map(|&value| f64::from(value)).collect()
+                        };
                         // Both moments are allocated by `Array2::zeros` and only
                         // mutated in place, so they stay in standard layout.
                         let coupling = coupling
@@ -714,22 +728,21 @@ impl BlockSparseStreamState {
                             .as_slice_mut()
                             .expect("block data moments are standard layout");
                         let mut v = vec![0.0; p];
-                        let mut v_coordinates = vec![0.0; b];
+                        let mut coordinates = vec![0.0; b + 2 * (directions.len() / p)];
                         for &(row, slot) in entries {
                             let w = &codes[row].projections[slot * b..(slot + 1) * b];
-                            let (x_norm_sq, v_norm_sq, x_dot_v) = accumulate_tied_row_moments(
+                            accumulate_tied_row_moments(
                                 &frame,
+                                &directions,
                                 w,
                                 rows.row(row),
                                 &projected[row].sum,
                                 self.k as f64,
                                 &mut v,
-                                &mut v_coordinates,
+                                &mut coordinates,
                                 coupling,
                                 data_cross,
                             );
-                            *energy += x_norm_sq;
-                            *bound += (x_norm_sq.sqrt() * v_norm_sq.sqrt() - x_dot_v).max(0.0);
                             for left in 0..b {
                                 for right in 0..b {
                                     second[[left, right]] += w[left] * w[right];
@@ -857,9 +870,6 @@ impl BlockSparseStreamState {
             tss += self.col_sumsq[c] - self.col_sum[c] * self.col_sum[c] / n;
         }
         let mut rejected_frame = false;
-        // The committed proposal's baseline frames and secant pairs, for this
-        // epoch's frame step.
-        let mut secant_history: Option<(Array2<f32>, Vec<FrameSecant>)> = None;
         if let Some(mut trial) = self.pending_frame.take() {
             if trial.baseline_rows != self.row_count {
                 return Err(format!(
@@ -902,12 +912,9 @@ impl BlockSparseStreamState {
                         baseline_second: (0..self.g)
                             .map(|_| Array2::<f64>::zeros((b, b)))
                             .collect(),
-                        secant: None,
                     });
                 }
                 rejected_frame = true;
-            } else if let Some(secant) = trial.secant.take() {
-                secant_history = Some((std::mem::take(&mut trial.baseline_decoder), secant));
             }
         }
         // Resolve a staged residual-row birth against the exact full-pass
@@ -961,7 +968,6 @@ impl BlockSparseStreamState {
         let mut frame_binding_block_rows = 0usize;
         let mut frame_blocks_above_tolerance = None;
         let frame_bar = self.config.tolerance.max(STORED_FRAME_RESOLUTION);
-        let mut proposal_secants: Option<Vec<FrameSecant>> = None;
         if !rejected_birth && !rejected_frame {
             // (γ) closed-form shared scalar from the accumulated least-squares.
             self.gamma = if self.gamma_den == 0.0 {
@@ -989,12 +995,12 @@ impl BlockSparseStreamState {
             self.rss = rss.max(0.0);
             // Form the frame proposal at the NEW gamma. Its moments use the
             // same frozen directions and routing as the scalar fit, with no
-            // corpus replay and no old-gamma cross term left in the polar step.
-            let ridge = self.config.frame_ridge;
+            // corpus replay and no old-gamma cross term left in the frame step.
+            let mut next_directions = Array2::<f32>::zeros((self.g * 2 * b, p));
             // Each task owns one proposal and its moments. Pin nested faer
             // factorizations to sequential while the existing Rayon pool fans
             // out over blocks; otherwise a nested solver barrier can deadlock.
-            let outcomes: Vec<Result<(f64, FrameSecant), String>> = with_faer_sequential(|| {
+            let outcomes: Vec<Result<f64, String>> = with_faer_sequential(|| {
                 self.coupling
                     .par_iter_mut()
                     .zip(self.second.par_iter_mut())
@@ -1003,62 +1009,48 @@ impl BlockSparseStreamState {
                             .axis_chunks_iter_mut(Axis(0), b)
                             .into_par_iter(),
                     )
+                    .zip(
+                        next_directions
+                            .axis_chunks_iter_mut(Axis(0), 2 * b)
+                            .into_par_iter(),
+                    )
                     .enumerate()
-                    .map(|(gg, ((moment, second), mut proposal))| {
+                    .map(|(gg, (((moment, second), mut proposal), mut directions))| {
                         second.mapv_inplace(|value| value * gamma * gamma);
                         if self.usage[gg] == 0 {
-                            return Ok((0.0, FrameSecant::default()));
+                            return Ok(0.0);
                         }
                         // For U = Dᵀ, P = UUᵀ and fixed supports, the bound
                         // ||Σ ΔP_g x||² <= k Σ ||ΔP_g x||² gives the surrogate
                         // -tr(U_newᵀ H U_new), where
-                        // H = (2γ-kγ²)XᵀX + γ²(XᵀV+VᵀX).
-                        // Only H U is needed. The smallest eigenvalue of each
-                        // xvᵀ+vxᵀ is xᵀv-||x|| ||v||, so this shift makes
-                        // B=H+shift I PSD. Its trace shift is constant on the
-                        // Grassmann manifold. Polar(B U) increases tr(UᵀB U)
-                        // by maximizing its tangent linear lower bound, hence
-                        // decreases the actual tied loss at fixed supports.
-                        // When the committed trial left a secant pair, the
-                        // step is sized by the measured curvature instead
-                        // (`secant_tied_frame_step`).
+                        // H = (2γ-kγ²)XᵀX + γ²(XᵀV+VᵀX), tight at the stored
+                        // frame. The pass accumulated H·[U, R, P] without γ, and
+                        // the top Ritz vectors of H on that span lower the actual
+                        // tied loss at fixed supports whenever they move.
                         let data_scale = 2.0 * gamma - self.k as f64 * gamma * gamma;
-                        let shift = (-data_scale).max(0.0) * self.data_energy[gg]
-                            + gamma * gamma * self.negative_bound[gg]
-                            + ridge;
-                        for rr in 0..b {
-                            for c in 0..p {
-                                moment[[c, rr]] = data_scale * self.data_cross[gg][[c, rr]]
-                                    + gamma * gamma * moment[[c, rr]];
-                            }
-                        }
-                        let previous = secant_history.as_ref().map(|(baseline, secants)| {
-                            (
-                                baseline.slice(ndarray::s![gg * b..(gg + 1) * b, ..]),
-                                secants[gg],
-                            )
+                        moment.zip_mut_with(&self.data_cross[gg], |coupling, &data| {
+                            *coupling = data_scale * data + gamma * gamma * *coupling;
                         });
-                        secant_tied_frame_step(
+                        ritz_tied_frame_step(
                             self.decoder.slice(ndarray::s![gg * b..(gg + 1) * b, ..]),
-                            moment.view_mut(),
+                            self.search_directions
+                                .slice(ndarray::s![gg * 2 * b..(gg + 1) * 2 * b, ..]),
+                            moment.view(),
                             second.view(),
                             (self.k - 1) as f64,
-                            shift,
-                            previous,
                             proposal.view_mut(),
+                            directions.view_mut(),
                         )
-                        .map_err(|error| format!("BlockSparseStream polar block {gg}: {error}"))
+                        .map_err(|error| format!("BlockSparseStream frame block {gg}: {error}"))
                     })
                     .collect()
             });
             // Indexed collection preserves the first failing block's identity
             // even if worker completion order changes.
-            let (gradient, secants): (Vec<f64>, Vec<FrameSecant>) = outcomes
+            let gradient = outcomes
                 .into_iter()
-                .collect::<Result<Vec<(f64, FrameSecant)>, String>>()?
-                .into_iter()
-                .unzip();
-            proposal_secants = Some(secants);
+                .collect::<Result<Vec<f64>, String>>()?;
+            self.search_directions = next_directions;
             let displacement = (0..self.g)
                 .into_par_iter()
                 .map(|block| {
@@ -1102,7 +1094,7 @@ impl BlockSparseStreamState {
                 &self.col_sumsq,
             ),
         );
-        // The block lane's exact polar frames carry no matrix-free CG/percolation
+        // The block lane's Rayleigh–Ritz frames carry no matrix-free CG/percolation
         // certificate (that solver serves the atom/dict lane); report a default.
         let decoder_solve_stats = DecoderSolveStats::default();
 
@@ -1139,7 +1131,6 @@ impl BlockSparseStreamState {
                     baseline_rows: 0,
                     baseline_usage: vec![0; self.g],
                     baseline_second: (0..self.g).map(|_| Array2::<f64>::zeros((b, b))).collect(),
-                    secant: proposal_secants.take(),
                 });
             }
         }
@@ -1249,8 +1240,6 @@ impl BlockSparseStreamState {
         for moment in &mut self.data_cross {
             moment.fill(0.0);
         }
-        self.data_energy.fill(0.0);
-        self.negative_bound.fill(0.0);
         for u in self.usage.iter_mut() {
             *u = 0;
         }
@@ -1420,9 +1409,9 @@ pub struct BlockSparseStreamArtifact {
     pub epochs: usize,
     /// EV of these exact frames and gamma on the final epoch's corpus.
     pub explained_variance: f64,
-    /// Solve certificate placeholder (default/zeroed): the block lane refreshes its
-    /// small `b×b` frames by an exact polar step, not the matrix-free CG/percolation
-    /// solver that serves the atom/dict lane.
+    /// Solve certificate placeholder (default/zeroed): the streaming block lane
+    /// refreshes its frames by a dense Rayleigh–Ritz step, not the matrix-free
+    /// CG/percolation solver that serves the atom/dict lane.
     pub decoder_solve_stats: DecoderSolveStats,
 }
 
@@ -1438,9 +1427,6 @@ fn validate_config(config: &BlockSparseConfig) -> Result<(), String> {
     }
     if config.max_epochs == 0 {
         return Err("BlockSparseStream requires max_epochs >= 1".to_string());
-    }
-    if !(config.frame_ridge.is_finite() && config.frame_ridge >= 0.0) {
-        return Err("BlockSparseStream frame_ridge must be finite and non-negative".to_string());
     }
     if !config.tolerance.is_finite() {
         return Err("BlockSparseStream tolerance must be finite".to_string());
