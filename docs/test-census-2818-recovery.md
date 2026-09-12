@@ -544,3 +544,41 @@ its rendered reader drift together to a bare `"not positive definite"` match, tu
 `rendered_verdict_matches_the_value_verdict_for_every_variant_2598` stays green, which
 is why the value-verdict pin had to come back. Log:
 `/scratch.global/sauer354/sw1-logs/mutate.387027.log`.
+
+## Restored single-source checks: #932 and #2647, September 11
+
+Six tests that `c0a21b554` removed are restored from `c0a21b554^`. Each one
+exercises production code on main, and each was run on MSI at a sha containing
+its landing commit. The restorations came out of a census of the 23 absent
+`*_932` pins: for each pin, whether its subject is still production code with
+no remaining test reference. Every helper those pins called was test-local, so
+a list of missing helper names says nothing about whether a pin can be restored.
+
+| Historical test identity | Recovery evidence |
+| --- | --- |
+| `joint_penalized_hessian_is_nonsingular_where_the_likelihood_alone_is_not_2647` | Restored in `crates/gam-models/src/gamlss/tests_2647_gauge.rs` by `6c1cfb4ae`. MSI job 393230 at `6c1cfb4ae` ran it with the next two tests: **3 passed, 0 failed, 0 ignored, 1541 filtered out**, 1.37 s. |
+| `binomial_location_scalewiggle_termswith_matern_spatial_blocks_fit_finitely` | Restored in `crates/gam-models/src/gamlss/tests_wiggle_ls.rs` by `6c1cfb4ae`. It is the reproducer that the wiggle family's opt-out from full-span Firth/Jeffreys cites. Same job. |
+| `binomial_location_scalewiggle_optimum_is_budget_independent_2647` | Restored in `tests_wiggle_ls.rs` by `6c1cfb4ae`. Same job. |
+| `binomial_wiggle_joint_hessian_reduces_to_nonwiggle_at_zero_betaw_932` | Restored in `tests_wiggle_ls.rs` by `b49097172`. MSI job 400179 at `ec8e01cfb`, which contains `b49097172` and the `information_third.rs` compile repair, ran it with the next test: **2 passed, 0 failed, 0 ignored, 1545 filtered out**, 0.18 s. |
+| `release_measure_binomial_q_tower3_prune_vs_tower4_932` | Restored in `crates/gam-models/src/gamlss/binomial_q_derivs.rs` by `b49097172`. Its doc now says the prune is not measurably slower, matching the `not_slower` cell it records. Same job: the bit-identity arm ran, and the timing cell runs only in release. |
+| `softmax_beta_border_gate_derivative_matches_quad_and_fd_across_tails_932` | Restored in `crates/gam-sae/src/row_jet_program.rs` by `6dd1aa4a4`, together with its test-local `SaeOrder2RowProgramSource` impl, with the fixture nested inside the test. It is the only test on main that references `SoftmaxMoment::gate_first`. MSI job 400815 at `6dd1aa4a4`: **1 passed, 0 failed**, 576 comparisons, maximum f64 condition fraction 4.563e-1, maximum quad five-point condition fraction 3.750e-3. |
+
+Not restored, with the reason each stays absent:
+
+- `release_measure_binomial_q_order4_faa_top_vs_strongest_hand_932`: its
+  "production" arm calls a test-only projection inside `mod oracle_tests`, so
+  the gate would time test code.
+- `nested_dual2_channels_from_channels_roundtrip_932`: recorded under Nested
+  derivative algebra above.
+- `compiled_graph_schedule_matches_all_backends_every_width_932`,
+  `dynamic_schedule_boundary_k14_matches_strongest_hand_vgh_932` and
+  `runtime_vector_row_program_matches_strongest_hand_mixed_score_vgh_932`: their
+  subject was the test-local `rigid_vector_row_nll`, and production runs
+  through `rigid_feature_runtime_nll`.
+- The five `bms/cell_moment_assembly.rs` pins: the `empirical_rigid_*_closed_form`
+  production functions keep 3 to 6 test references each, and the canonical-flex
+  pins compared test-local witnesses.
+- The four `bms/gpu/row.rs` pins and `measure_device_vgh_end_to_end_932`: they
+  are device-only and cannot run on CPU lanes.
+- The two `flex_jet.rs` pins and the other three `row_jet_program.rs` pins:
+  their subjects either still have test references or have no production caller.
