@@ -17,7 +17,6 @@ pub mod coactivation_conditionality;
 pub mod corpus;
 pub mod criterion_atoms;
 pub mod description_length;
-pub mod dictionary_artifact;
 mod discrete_fourier;
 pub mod dual_certificate;
 pub mod effect_weight;

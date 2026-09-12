@@ -61,7 +61,7 @@
 //!    caller to the existing exact multi-start solve. No approximation enters
 //!    silently.
 
-use ndarray::{Array1, Array2, ArrayView1, ArrayView2, Axis};
+use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
 use opt::constants::{ARMIJO_C1, BACKTRACK_CONTRACTION};
 use opt::{AcceptedStep, BacktrackConfig, backtracking_line_search};
 
@@ -75,15 +75,6 @@ use faer::Side;
 /// iteration is guaranteed to converge quadratically into the unique root in
 /// the certified ball; at or above it the start is uncertified.
 pub const KANTOROVICH_THRESHOLD: f64 = 0.5;
-
-/// Row count at or above which the corpus-rate amortized-encode batch
-/// (`EncodeAtlas::amortized_encode_batch`) fans its
-/// per-row encodes out over rayon. Below this the per-row Newton + chart
-/// routing is cheap enough that the fan-out overhead does not pay; matched to
-/// the same order as the arrow-Schur `SCHUR_MATVEC_PARALLEL_ROW_MIN` gate so
-/// short batches inside an outer atom-level fan-out stay sequential.
-pub(crate) const ENCODE_BATCH_PARALLEL_ROW_MIN: usize = 256;
-
 
 /// Newton refinement convergence floor. Once a refinement step's length `‖δ‖`
 /// falls below this (relative to the coordinate scale `1 + ‖t‖`), the iterate has
@@ -645,17 +636,6 @@ impl JointEncodeResult {
             coords,
             converged,
             unconverged_count,
-        }
-    }
-}
-
-impl EncodeResult {
-    pub(crate) fn from_rows(coords: Array2<f64>, certified: Vec<bool>) -> Self {
-        let encode_uncertified_count = certified.iter().filter(|c| !**c).count();
-        Self {
-            coords,
-            certified,
-            encode_uncertified_count,
         }
     }
 }
@@ -2259,25 +2239,8 @@ impl EncodeAtlas {
     /// returns the encoded coordinate with its certificate. An uncertified start
     /// (no chart, no distilled Jacobian, non-positive amplitude, or `h > ½`)
     /// flags the row for the exact multi-start caller.
-    pub fn certified_encode_row(
-        &self,
-        atom: &SaeManifoldAtom,
-        atom_index: usize,
-        x: ArrayView1<'_, f64>,
-        amplitude: f64,
-    ) -> Result<(Array1<f64>, RowCertificate), String> {
-        // The bare Euclidean, prior-free objective — bit-identical to the metric-
-        // free certified encode.
-        self.certified_encode_row_with_objective(
-            atom,
-            atom_index,
-            x,
-            amplitude,
-            &EncodeObjective::euclidean(),
-        )
-    }
-
-    /// [`Self::certified_encode_row`] against the TRUE encode objective (F3): the
+    ///
+    /// The encode is taken against the TRUE encode objective (F3): the
     /// Newton–Kantorovich certificate is computed under the fit's per-row output
     /// metric and latent coordinate prior ([`EncodeObjective`]), so the certified
     /// root is the minimizer of the SAME generalized-least-squares-plus-prior
@@ -2523,24 +2486,8 @@ impl EncodeAtlas {
     /// without letting the exact probe reuse the distilled warm start it is
     /// auditing. A chart without a distilled Jacobian (singular Gauss–Newton
     /// block) flags the row.
-    pub fn amortized_encode_row(
-        &self,
-        atom: &SaeManifoldAtom,
-        atom_index: usize,
-        x: ArrayView1<'_, f64>,
-        amplitude: f64,
-    ) -> Result<(Array1<f64>, RowCertificate), String> {
-        // Euclidean, prior-free objective — bit-identical to the metric-free path.
-        self.amortized_encode_row_with_objective(
-            atom,
-            atom_index,
-            x,
-            amplitude,
-            &EncodeObjective::euclidean(),
-        )
-    }
-
-    /// [`Self::amortized_encode_row`] against the TRUE encode objective (F3): the
+    ///
+    /// The encode is taken against the TRUE encode objective (F3): the
     /// distilled predictor's warm start is Euclidean (its `A₁` is the Euclidean
     /// Gauss–Newton block), but BOTH Kantorovich probes certify under the supplied
     /// metric + prior objective, with the chart Lipschitz taken as the objective's
@@ -2649,69 +2596,6 @@ impl EncodeAtlas {
         // `distilled_probe_tolerance` gate above (which already reads `final_cert`
         // via `kantorovich_root_radius`). `initial_cert` is a stale earlier iterate.
         Ok((amortized_probe.coord, amortized_probe.final_cert))
-    }
-
-    /// Batched amortized (distilled) encode over many rows against one atom
-    /// (#1026 ladder item 3, corpus-rate). Each row uses the closed-form
-    /// per-chart Jacobian predictor and carries its own Kantorovich certificate;
-    /// uncertified rows are flagged in [`EncodeResult::encode_uncertified_count`]
-    /// for the exact multi-start fallback. Row-independent against the frozen
-    /// dictionary, so the batch fans out over rows (deterministic row-order
-    /// assembly, bit-identical run-to-run), staying sequential inside a rayon
-    /// worker to avoid nested oversubscription.
-    pub fn amortized_encode_batch(
-        &self,
-        atom: &SaeManifoldAtom,
-        atom_index: usize,
-        targets: ArrayView2<'_, f64>,
-        amplitudes: ArrayView1<'_, f64>,
-    ) -> Result<EncodeResult, String> {
-        let n = targets.nrows();
-        if amplitudes.len() != n {
-            return Err(format!(
-                "amortized_encode_batch: amplitudes len {} != rows {n}",
-                amplitudes.len()
-            ));
-        }
-        let d = atom.latent_dim();
-        let encode_rows =
-            |range: std::ops::Range<usize>| -> Result<Vec<(Array1<f64>, bool)>, String> {
-                range
-                    .map(|row| {
-                        let (t, cert) = self.amortized_encode_row(
-                            atom,
-                            atom_index,
-                            targets.row(row),
-                            amplitudes[row],
-                        )?;
-                        Ok((t, cert.certified()))
-                    })
-                    .collect()
-            };
-        let rows: Vec<(Array1<f64>, bool)> =
-            if n >= ENCODE_BATCH_PARALLEL_ROW_MIN && rayon::current_thread_index().is_none() {
-                use rayon::prelude::*;
-                const CHUNK: usize = 256;
-                let n_chunks = n.div_ceil(CHUNK);
-                let chunked: Vec<Vec<(Array1<f64>, bool)>> = (0..n_chunks)
-                    .into_par_iter()
-                    .map(|c| {
-                        let start = c * CHUNK;
-                        let end = (start + CHUNK).min(n);
-                        encode_rows(start..end)
-                    })
-                    .collect::<Result<_, _>>()?;
-                chunked.into_iter().flatten().collect()
-            } else {
-                encode_rows(0..n)?
-            };
-        let mut coords = Array2::<f64>::zeros((n, d));
-        let mut certified = Vec::with_capacity(n);
-        for (row, (t, cert)) in rows.into_iter().enumerate() {
-            coords.row_mut(row).assign(&t);
-            certified.push(cert);
-        }
-        Ok(EncodeResult::from_rows(coords, certified))
     }
 }
 
@@ -3333,197 +3217,6 @@ pub(crate) fn chart_nominal_radius(atom: &SaeManifoldAtom, resolution: usize) ->
             1.0 / (resolution.max(2) as f64)
         }
     }
-}
-
-
-/// Per-atom ambient tangents at the given coords: for atom `k` and row `i`, the
-/// `d_k × p` matrix whose axis-`a` row is `∂m_k/∂t_a = (∂Φ/∂t_a)·B_k`, the image
-/// tangent the joint Hessian couples through. `None` for an atom with no basis
-/// evaluator (its coordinate is not differentiable, so it carries no coupling).
-fn atom_row_tangents(
-    atom: &SaeManifoldAtom,
-    coords: ArrayView2<'_, f64>,
-) -> Result<Option<Vec<Array2<f64>>>, String> {
-    let Some(evaluator) = atom.basis_evaluator.as_ref() else {
-        return Ok(None);
-    };
-    let n = coords.nrows();
-    let d = atom.latent_dim();
-    let p = atom.output_dim();
-    let (_phi, jet) = evaluator.evaluate(coords)?; // jet: (n, M, d)
-    let m = jet.shape()[1];
-    let b = atom.decoder_coefficients(); // (M, p)
-    let mut out = Vec::with_capacity(n);
-    for row in 0..n {
-        let mut tan = Array2::<f64>::zeros((d, p));
-        for axis in 0..d {
-            for out_col in 0..p {
-                let mut acc = 0.0;
-                for basis_col in 0..m {
-                    acc += jet[[row, basis_col, axis]] * b[[basis_col, out_col]];
-                }
-                tan[[axis, out_col]] = acc;
-            }
-        }
-        out.push(tan);
-    }
-    Ok(Some(out))
-}
-
-/// Smallest eigenvalue of the symmetric `d × d` Gauss–Newton curvature block
-/// `z² · T Tᵀ` (`T` is `d × p`). `d = 1` is the scalar fast path; general `d`
-/// uses a symmetric eigensolve.
-fn min_curvature_eigenvalue(tan: &Array2<f64>, z: f64) -> Result<f64, String> {
-    let d = tan.nrows();
-    if d == 0 {
-        return Ok(0.0);
-    }
-    let z2 = z * z;
-    if d == 1 {
-        let row = tan.row(0);
-        return Ok(z2 * row.dot(&row));
-    }
-    let mut gram = Array2::<f64>::zeros((d, d));
-    for a in 0..d {
-        for bx in 0..d {
-            gram[[a, bx]] = z2 * tan.row(a).dot(&tan.row(bx));
-        }
-    }
-    let (evals, _vecs) = gram
-        .eigh(faer::Side::Lower)
-        .map_err(|e| format!("min_curvature_eigenvalue: eigh failed: {e:?}"))?;
-    Ok(evals.iter().copied().fold(f64::INFINITY, f64::min))
-}
-
-/// Frobenius norm of the cross-coupling block `z_k z_j · T_k T_jᵀ`
-/// (`T_k` is `d_k × p`, `T_j` is `d_j × p`). Frobenius upper-bounds the operator
-/// norm, so a dominance decision made against it is SOUND.
-fn cross_block_frobenius(tan_k: &Array2<f64>, tan_j: &Array2<f64>, zk: f64, zj: f64) -> f64 {
-    let mut acc = 0.0;
-    for a in 0..tan_k.nrows() {
-        for bx in 0..tan_j.nrows() {
-            let dot = tan_k.row(a).dot(&tan_j.row(bx));
-            acc += dot * dot;
-        }
-    }
-    (zk * zj).abs() * acc.sqrt()
-}
-
-/// The JOINT (multi-atom) encode-fallback fraction: the share of rows whose
-/// per-row joint reconstruction problem across CO-ACTIVE atoms is NOT covered by
-/// the composition of the per-atom certificates, so the row genuinely needs the
-/// exact multi-start solve (reviewer condition #3 — the honest encode-tax cost
-/// multiplier at scale).
-///
-/// The per-atom Kantorovich certificate certifies each atom's coordinate encode
-/// IN ISOLATION — a block-diagonal view of the joint Hessian. The joint problem
-/// couples co-active atoms through the off-diagonal blocks
-/// `H_kj = z_k z_j J_k(t_k)ᵀ J_j(t_j)` (tangent-image inner products). When an
-/// atom's own curvature block fails to dominate its coupling to the rest —
-/// Gershgorin: `λ_min(H_kk) ≤ Σ_{j≠k} ‖H_kj‖` — the block-diagonal certificate
-/// no longer implies a joint root, a second basin can open, and the row must go
-/// to multi-start. This fraction GROWS with atom-image similarity and
-/// co-activation: no per-atom certificate covers the joint problem.
-///
-/// The curvature block uses the Gauss–Newton form `z_k² J_kᵀ J_k` (exact for
-/// flat/linear atoms, where the residual-curvature term vanishes identically);
-/// the off-diagonal is measured in Frobenius norm, which upper-bounds the
-/// operator norm, so a row DECLARED dominant is genuinely dominant and the
-/// fraction never under-reports the multi-start need. Rows with fewer than two
-/// co-active atoms have no cross blocks and are never counted as fallbacks.
-///
-/// `amplitude_floor` is the mass above which an atom counts as co-active; pass a
-/// small positive value (a domain threshold on the assignment mass, not a solver
-/// knob).
-pub fn joint_encode_fallback_fraction(
-    atoms: &[SaeManifoldAtom],
-    coords: &[Array2<f64>],
-    amplitudes: ArrayView2<'_, f64>,
-    amplitude_floor: f64,
-) -> Result<f64, String> {
-    let k_atoms = atoms.len();
-    let (n, amp_k) = amplitudes.dim();
-    if amp_k != k_atoms {
-        return Err(format!(
-            "joint_encode_fallback_fraction: amplitudes have {amp_k} cols but {k_atoms} atoms"
-        ));
-    }
-    if coords.len() != k_atoms {
-        return Err(format!(
-            "joint_encode_fallback_fraction: {} coord blocks but {k_atoms} atoms",
-            coords.len()
-        ));
-    }
-    if n == 0 || k_atoms == 0 {
-        return Ok(0.0);
-    }
-    // F5 — FILTER BEFORE MATERIALIZE: the dense form built the full `n × K`
-    // tangent tensor (`atom_row_tangents` over every atom, all N rows) BEFORE the
-    // per-row activity filter, which OOMs at `K = 32k` even though each row couples
-    // only through its co-active atoms. Cross-coupling exists only among a row's
-    // co-active, differentiable atoms (`z > floor`), so materialize just that row's
-    // active tangents, lazily, per row. `atom_row_tangents` is row-wise, so the
-    // single-row slice is bit-identical to the batched evaluate the dense path
-    // indexed — the fallback fraction is unchanged; only the peak allocation drops
-    // from `O(n·K·d·p)` to the max active-set size per row.
-    for (atom_idx, coord) in coords.iter().enumerate() {
-        if coord.nrows() != n {
-            return Err(format!(
-                "joint_encode_fallback_fraction: coord block {atom_idx} has {} rows, expected {n}",
-                coord.nrows()
-            ));
-        }
-    }
-    let mut fallback_rows = 0usize;
-    for row in 0..n {
-        // Gather this row's co-active, differentiable atoms (evaluator-less atoms
-        // carry no coupling — same `is_some()` predicate the dense path applied via
-        // `tangents[k].is_some()`).
-        let active: Vec<usize> = (0..k_atoms)
-            .filter(|&k| {
-                amplitudes[[row, k]] > amplitude_floor && atoms[k].basis_evaluator.is_some()
-            })
-            .collect();
-        if active.len() < 2 {
-            continue; // no cross blocks: the per-atom certificate composes trivially
-        }
-        // Materialize ONLY this row's active tangents (one `d × p` block per active
-        // atom), never the dense tensor. An atom that unexpectedly yields no tangent
-        // (evaluator present but non-differentiable) simply drops out of the coupling,
-        // exactly as a `None` block did in the dense path.
-        let mut tans: Vec<Array2<f64>> = Vec::with_capacity(active.len());
-        let mut zs: Vec<f64> = Vec::with_capacity(active.len());
-        for &k in &active {
-            let coord_row = coords[k].row(row).insert_axis(Axis(0)); // (1, d)
-            if let Some(mut block) = atom_row_tangents(&atoms[k], coord_row)? {
-                tans.push(block.pop().expect("single-row tangents carry one block"));
-                zs.push(amplitudes[[row, k]]);
-            }
-        }
-        if tans.len() < 2 {
-            continue;
-        }
-        let mut row_needs_multistart = false;
-        for (ki, tan_k) in tans.iter().enumerate() {
-            let zk = zs[ki];
-            let lam_min = min_curvature_eigenvalue(tan_k, zk)?;
-            let mut coupling = 0.0;
-            for (ji, tan_j) in tans.iter().enumerate() {
-                if ji == ki {
-                    continue;
-                }
-                coupling += cross_block_frobenius(tan_k, tan_j, zk, zs[ji]);
-            }
-            if lam_min <= coupling {
-                row_needs_multistart = true;
-                break;
-            }
-        }
-        if row_needs_multistart {
-            fallback_rows += 1;
-        }
-    }
-    Ok(fallback_rows as f64 / n as f64)
 }
 
 #[cfg(test)]

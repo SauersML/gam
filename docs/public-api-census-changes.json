@@ -695,5 +695,19 @@
     },
     "reason": "user directive: delete all useless slop (only used by tests / unused)",
     "evidence": "Backfilled: fb2a87bc8 (sae-red gam-sae deletion batch 6c (sae_encode_resident device-encode cluster), pushed over feed7fd08) removed these public functions and landed its docs/source-removal-changes.json entry but omitted this acknowledgement. scripts/public_api_census.py, run by CI's Test source integrity census job on fb2a87bc8 (run 34668182385), measured exactly these 9 declarations."
+  },
+  {
+    "base": "01e3dfadc2bf12a8a79de7376d82d30a1a95d8e0",
+    "removed": {
+      "crates/gam-sae/src/dictionary_artifact.rs::canonical_dictionary_artifact": 1,
+      "crates/gam-sae/src/dictionary_artifact.rs::diff_dictionaries": 1,
+      "crates/gam-sae/src/encode.rs::amortized_encode_batch": 1,
+      "crates/gam-sae/src/encode.rs::amortized_encode_row": 1,
+      "crates/gam-sae/src/encode.rs::certified_encode_row": 1,
+      "crates/gam-sae/src/encode.rs::from_rows": 1,
+      "crates/gam-sae/src/encode.rs::joint_encode_fallback_fraction": 1
+    },
+    "reason": "user directive: delete all useless slop (only used by tests / unused)",
+    "evidence": "scripts/public_api_census.py on MSI lane sw2 (job 439803) over 7d3b11307..the exact candidate tree measured exactly these 7 declarations: dictionary_artifact's canonical_dictionary_artifact and diff_dictionaries, and encode.rs's joint_encode_fallback_fraction, certified_encode_row, amortized_encode_row, amortized_encode_batch and EncodeResult::from_rows, none with a production caller."
   }
 ]

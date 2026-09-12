@@ -319,5 +319,15 @@
     "unit_test_decreases": {
       "crates/gam-gpu": 4
     }
+  },
+  {
+    "base": "01e3dfadc2bf12a8a79de7376d82d30a1a95d8e0",
+    "reason": "user directive: delete all useless slop (only used by tests / unused)",
+    "evidence": "The three removed tests (canonical_hash_ignores_atom_order_scale_and_reflection, diff_flags_unmatched_atoms_at_equal_count, diff_localizes_decoder_row_perturbation) exercised only the deleted dictionary_artifact module and carried no issue pin. scripts/test_census.py on MSI lane sw2 measured 10426 -> 10423 tests, units/crates/gam-sae 1381 -> 1378, no pin loss (job 439803 over 7d3b11307..candidate, re-measured by job 440586 over 522d46c0f..candidate after origin's floor moved); docs/test-census-floor.json in this commit is --update-floor output from the 522d46c0f candidate.",
+    "test_count_decrease": 3,
+    "removed_pins": {},
+    "unit_test_decreases": {
+      "crates/gam-sae": 3
+    }
   }
 ]
