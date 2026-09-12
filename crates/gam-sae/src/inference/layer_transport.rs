@@ -15,11 +15,11 @@
 //! 1. **Topology compatibility** — does `h` preserve the chart topology
 //!    (circle→circle degree-±1 covering, i.e. a homeomorphism of `S¹`) or
 //!    break it (circle→arcs, folds)? For circle charts the winding **degree**
-//!    is estimated by maximizing the circular concentration (mean resultant
-//!    length) of the de-wound residual `θ_to − d·θ_from` over candidate
-//!    degrees `d ∈ {−2,−1,0,1,2}` — for a transport whose smooth residual
-//!    stays inside half a turn this is the circular-correlation-maximizing
-//!    degree, and it is exact in the noiseless limit. A fold check on a dense
+//!    is read off the pairs themselves: order the rows by source angle, walk
+//!    the closed loop once, and sum each target-angle step wrapped into
+//!    `(−π, π]`. A closed loop's steps sum to an exact multiple of `2π`, and
+//!    that multiple is the degree whenever neighbouring rows move the target
+//!    by less than half a turn — no candidate set, no bound on `|d|`. A fold check on a dense
 //!    grid (`sign(d)·h′(t) > 0` everywhere) separates genuine degree-±1
 //!    covers from degree-±1 maps with local back-tracking.
 //! 2. **Isometry defect** — `∫ (|h′| − 1)² dP̂` under the empirical data
@@ -86,8 +86,6 @@ const MAX_PERIODIC_BASIS: usize = 20;
 /// Open-interval internal-knot bounds.
 const MIN_OPEN_INTERNAL_KNOTS: usize = 4;
 const MAX_OPEN_INTERNAL_KNOTS: usize = 12;
-/// Candidate winding degrees scanned by the circular-concentration estimator.
-const DEGREE_CANDIDATES: [i32; 5] = [-2, -1, 0, 1, 2];
 /// Dense grid used for the fold / orientation check of `h′`.
 const FOLD_CHECK_GRID: usize = 512;
 /// Default evaluation grid for the composition-law defect.
@@ -1009,30 +1007,27 @@ pub fn fit_transport_map(
         Array1<f64>,
     ) = match (topology_from, topology_to) {
         (ChartTopology::Circle, ChartTopology::Circle) => {
-            // Winding degree by circular concentration: over candidate
-            // degrees d, the de-wound residual r_i(d) = θ_to − d·θ_from is
-            // tightest (largest mean resultant length R_d) at the true
-            // degree whenever the smooth residual stays inside half a turn.
-            // This is the circular-correlation-maximizing degree estimate
-            // the issue specifies, in resultant form.
-            let mut best_degree = DEGREE_CANDIDATES[0];
-            let mut best_r = f64::NEG_INFINITY;
-            for &d in DEGREE_CANDIDATES.iter() {
-                let residual: Vec<f64> = (0..n)
-                    .map(|i| coords_to[i] - f64::from(d) * coords_from[i])
-                    .collect();
-                let r = resultant_length(&residual);
-                if r > best_r {
-                    best_r = r;
-                    best_degree = d;
-                }
+            // Winding degree read off the pairs: order the rows by source
+            // angle and walk the closed loop once, summing each target-angle
+            // step wrapped into (−π, π]. The steps of a closed loop sum to an
+            // exact multiple of 2π, so rounding only absorbs roundoff, and the
+            // multiple is the degree whenever neighbouring rows move the target
+            // by less than half a turn (the sampling condition the unwrapped
+            // response below already needs). No candidate set bounds |d|.
+            let mut order: Vec<usize> = (0..n).collect();
+            order.sort_by(|&a, &b| wrap_tau(coords_from[a]).total_cmp(&wrap_tau(coords_from[b])));
+            let mut turn = 0.0_f64;
+            for k in 0..n {
+                turn += wrap_pi(coords_to[order[(k + 1) % n]] - coords_to[order[k]]);
             }
+            let degree = (turn / TAU).round() as i32;
             let residual: Vec<f64> = (0..n)
-                .map(|i| coords_to[i] - f64::from(best_degree) * coords_from[i])
+                .map(|i| coords_to[i] - f64::from(degree) * coords_from[i])
                 .collect();
+            let concentration = resultant_length(&residual);
             let mu = circular_mean(&residual);
             let response = Array1::from_iter(residual.iter().map(|&r| wrap_pi(r - mu)));
-            (Some(best_degree), Some(best_r), mu, response)
+            (Some(degree), Some(concentration), mu, response)
         }
         (_, ChartTopology::Circle) => {
             // Interval domain, circular target: the domain is contractible so
@@ -1908,6 +1903,24 @@ mod invert_tests {
             let d = wrap_pi(back[i] - probe[i]).abs();
             assert!(d < 1e-5, "probe={} back={} d={}", probe[i], back[i], d);
         }
+    }
+
+    /// A degree-3 map lies outside any hand-picked candidate box such as
+    /// `{−2,…,2}`, which could only return a wrong degree for it. The closed-loop
+    /// walk reads the winding off the pairs, so it needs no box.
+    #[test]
+    fn winding_degree_three_is_read_from_the_closed_loop_walk() {
+        let n = 128;
+        let from: Array1<f64> = Array1::from_iter((0..n).map(|i| TAU * i as f64 / n as f64));
+        let to: Array1<f64> = from.mapv(|t| wrap_tau(3.0 * t + 0.4 + 0.1 * t.sin()));
+        let ft = fit_transport_map(
+            from.view(),
+            to.view(),
+            ChartTopology::Circle,
+            ChartTopology::Circle,
+        )
+        .expect("fit");
+        assert_eq!(ft.degree, Some(3), "expected winding degree 3, got {:?}", ft.degree);
     }
 
     #[test]
