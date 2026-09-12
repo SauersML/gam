@@ -106,61 +106,6 @@ fn prefix_sum_counts(counts: &[usize]) -> Vec<usize> {
     col_ptr
 }
 
-fn fill_dense_to_sparse_columns(
-    matrix: &Array2<f64>,
-    tol: f64,
-    col_start: usize,
-    col_end: usize,
-    col_ptr: &[usize],
-    row_idx: &mut [usize],
-    values: &mut [f64],
-) {
-    if col_end - col_start <= PARALLEL_SPARSE_FILL_COLUMN_THRESHOLD {
-        let base = col_ptr[col_start];
-        for col in col_start..col_end {
-            let mut write = col_ptr[col] - base;
-            for row in 0..matrix.nrows() {
-                let value = matrix[[row, col]];
-                if value.abs() > tol {
-                    row_idx[write] = row;
-                    values[write] = value;
-                    write += 1;
-                }
-            }
-        }
-        return;
-    }
-
-    let mid = col_start + (col_end - col_start) / 2;
-    let split = col_ptr[mid] - col_ptr[col_start];
-    let (left_rows, right_rows) = row_idx.split_at_mut(split);
-    let (left_values, right_values) = values.split_at_mut(split);
-    rayon::join(
-        || {
-            fill_dense_to_sparse_columns(
-                matrix,
-                tol,
-                col_start,
-                mid,
-                col_ptr,
-                left_rows,
-                left_values,
-            );
-        },
-        || {
-            fill_dense_to_sparse_columns(
-                matrix,
-                tol,
-                mid,
-                col_end,
-                col_ptr,
-                right_rows,
-                right_values,
-            );
-        },
-    );
-}
-
 fn fill_dense_symmetric_upper_columns(
     matrix: &Array2<f64>,
     tol: f64,
