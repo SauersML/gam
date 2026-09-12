@@ -1417,27 +1417,54 @@ impl SaeManifoldTerm {
             ));
         }
         let mut gap = Array2::<f64>::zeros((k, k));
-        let mut unit = Array1::<f64>::zeros(k);
         let prepared = self.prepare_decoder_prior_beta_curvature(1.0);
-        for col in 0..k {
-            unit.fill(0.0);
-            unit[col] = 1.0;
-            let column = if framed {
-                let lifted = projection.lift_border_vec(unit.view());
-                let delta = self.decoder_prior_exact_minus_majorizer_beta_hvp_prepared(
-                    &prepared,
-                    lifted.view(),
-                )?;
-                projection.project_border_vec(delta.view())
-            } else {
-                self.decoder_prior_exact_minus_majorizer_beta_hvp_prepared(&prepared, unit.view())?
-            };
-            // `E = B − A` and the β leg of `A − B` is `column`, so `E` is its
-            // negation.
-            for row in 0..k {
-                gap[[row, col]] = -column[row];
+        // #2731 — every column is an independent apply against the plan prepared
+        // above, so the columns run on the rayon pool in batches of the pool width
+        // and are written serially in column order: `gap` is bit-identical to the
+        // one-column-at-a-time loop, and the first failing column's error is the one
+        // returned. Job 510613 read ~84 s per polish step between `operator BUILT`
+        // and a 0.106 s eigendecomposition at `p = 2048, charts = 32` (`k = 288`) on
+        // one core, the order of 288 applies at the border probes' ~296 ms each.
+        use rayon::prelude::*;
+        let pool_threads = rayon::current_num_threads().max(1);
+        let build_started = std::time::Instant::now();
+        for batch_start in (0..k).step_by(pool_threads) {
+            let batch_end = (batch_start + pool_threads).min(k);
+            let columns: Vec<Result<Array1<f64>, String>> = (batch_start..batch_end)
+                .into_par_iter()
+                .map(|col| -> Result<Array1<f64>, String> {
+                    let mut unit = Array1::<f64>::zeros(k);
+                    unit[col] = 1.0;
+                    if framed {
+                        let lifted = projection.lift_border_vec(unit.view());
+                        let delta = self.decoder_prior_exact_minus_majorizer_beta_hvp_prepared(
+                            &prepared,
+                            lifted.view(),
+                        )?;
+                        Ok(projection.project_border_vec(delta.view()))
+                    } else {
+                        self.decoder_prior_exact_minus_majorizer_beta_hvp_prepared(
+                            &prepared,
+                            unit.view(),
+                        )
+                    }
+                })
+                .collect();
+            for (offset, column) in columns.into_iter().enumerate() {
+                let column = column?;
+                let col = batch_start + offset;
+                // `E = B − A` and the β leg of `A − B` is `column`, so `E` is its
+                // negation.
+                for row in 0..k {
+                    gap[[row, col]] = -column[row];
+                }
             }
         }
+        log::info!(
+            "[SAE-EXACT-DENSE] decoder-prior majorizer gap border BUILT: k={k}, {k} applies on \
+             {pool_threads} pool threads in {:.3} s",
+            build_started.elapsed().as_secs_f64(),
+        );
         if gap.iter().all(|&value| value == 0.0) {
             return Ok(None);
         }
