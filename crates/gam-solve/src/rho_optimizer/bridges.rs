@@ -4601,6 +4601,10 @@ pub(crate) fn stop_reason_from(reason: TerminationReason) -> OperatorTrustRegion
             OperatorTrustRegionStopReason::RejectFloor
         }
         TerminationReason::IterationBudget { .. } => OperatorTrustRegionStopReason::IterationBudget,
+        // The fixed-point map proposed a small step. That is not a stationarity
+        // test, so it is not `Converged`: `run_fixed_point_outer_solver` judges
+        // the stop with the screening certificate (#2817).
+        TerminationReason::StepNormTolerance { .. } => OperatorTrustRegionStopReason::StepNormStall,
         // A stop the solver stands behind: it applied a test and the test
         // passed. Not a trust-region event, so it reports as converged.
         TerminationReason::GradientTolerance { .. }
@@ -4611,7 +4615,6 @@ pub(crate) fn stop_reason_from(reason: TerminationReason) -> OperatorTrustRegion
         // model's interior Newton decrement fell below the tolerance THIS
         // crate handed it — the certificate's own test, applied online.
         | TerminationReason::ModelDecrementTolerance { .. }
-        | TerminationReason::StepNormTolerance { .. }
         | TerminationReason::FixedPointRequestedStop { .. } => {
             OperatorTrustRegionStopReason::Converged
         }

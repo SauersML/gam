@@ -7466,6 +7466,14 @@ pub enum OperatorTrustRegionStopReason {
     /// [`Self::IterationBudget`] because "ran out of budget" and "could not
     /// take a step" call for different repairs.
     SolverFailure,
+    /// The fixed-point map proposed a step below its step-norm threshold.
+    ///
+    /// A small step is not stationarity: on an EFS penalty coordinate the update
+    /// is a ratio of traces, not the gradient the certificate bounds. This used
+    /// to map to [`Self::Converged`]. `run_fixed_point_outer_solver` judges the
+    /// stop with the screening certificate instead, so this label records which
+    /// test fired and never stands for convergence (#2817).
+    StepNormStall,
 }
 
 /// Run the outer smoothing-parameter optimization.
