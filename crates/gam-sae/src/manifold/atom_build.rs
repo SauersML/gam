@@ -302,13 +302,14 @@ pub fn sae_build_atom_plans(
                 // A Duchon atom's curvature penalty degrades (and ultimately
                 // fails its D2 collocation) when the center count does not
                 // exceed the polynomial nullspace dimension of its resolved
-                // order. Pick enough centers to clear that dimension with a
-                // margin (so a positive-rank kernel block survives), bounded
-                // above by `n_obs` and the dense cap. The Euclidean patch
+                // order. The identifiability floor `nullspace + d + 1` clears that
+                // dimension, so a positive-rank kernel block survives, and it is
+                // the same floor the discovery race prices a Duchon sheet at. It is
+                // bounded above by `n_obs` and the dense cap. The Euclidean patch
                 // ignores centers, so this lower bound is harmless there.
                 let duchon_m = sae_duchon_atom_m(d);
                 let poly_nullspace_dim = duchon_nullspace_dimension(d, duchon_m.saturating_sub(1));
-                let center_floor = (poly_nullspace_dim + d + 1).max(8);
+                let center_floor = poly_nullspace_dim + d + 1;
                 let center_ceiling = center_floor.max(32);
                 let lo = center_floor.min(n_obs);
                 let hi = center_ceiling.min(n_obs);
