@@ -1934,5 +1934,18 @@
     ],
     "reason": "user directive: delete all useless slop",
     "evidence": "git grep -nw at the base finds each name only at its own definition, in doc or comment prose, and in string labels inside its own body. The same commit deletes the private helpers, constants and imports that only these items used: pair_component_cells with PAIR_COMPONENT_MIN_CELLS and PAIR_COMPONENT_MAX_CELLS, cumulative_exp and second_cumulative_exp, the BlockwisePenalty re-export, and five imports. The items are source_removal_guard.py's own list from lane stage job 429443, taken over a lane-local commit of this patch on the same base.\nThe same stage job compile-checked this patch together with the next batch (cargo check -p gam-terms/-p gam-sae --all-targets, and the workspace with --keep-going). The only errors were a later-batch import of a deleted private helper and gam-sae's vec_norm in candidate_index.rs, which that patch does not touch. cargo doc -p gam-terms and -p gam-sae had 0 errors."
+  },
+  {
+    "base": "843e0fc200da077c1cb3687af03c3cf410281cf7",
+    "items": [
+      "crates/gam-inference/src/hmc_io.rs:fn:binomial_link_terms",
+      "crates/gam-inference/src/hmc_io.rs:fn:first_non_finite",
+      "crates/gam-inference/src/hmc_io.rs:fn:joint_binomial_logp_grad_and_link_grad",
+      "crates/gam-inference/src/hmc_io.rs:fn:joint_family_logp_and_grad",
+      "crates/gam-inference/src/hmc_io.rs:fn:log_terms_from_mu_and_dmu",
+      "crates/gam-inference/src/hmc_io.rs:struct:BinomialLinkTerms"
+    ],
+    "reason": "user directive: delete all useless slop",
+    "evidence": "d33860630 deleted run_joint_beta_rho_sampling and its span; an MSI token scan over every tracked source at 5a69c5f0a found first_non_finite, BinomialLinkTerms, log_terms_from_mu_and_dmu, binomial_link_terms, joint_binomial_logp_grad_and_link_grad, joint_family_logp_and_grad and the joint_family_logp_grad_and_link_grad that reached them named only inside the deleted region, while exact_glm_logp_and_grad_into and exact_glm_logp_and_grad_for_likelihood_into remain live through NutsPosterior. source_removal_guard over 5a69c5f0a plus this patch named exactly these items; public_api_census found no public function removed and test_census verified. MSI verification (ban scanner, workspace --all-targets check, cargo doc -p gam-inference --no-deps, lib tests) runs on the landed sha."
   }
 ]
