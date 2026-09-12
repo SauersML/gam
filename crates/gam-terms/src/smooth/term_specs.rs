@@ -6287,14 +6287,34 @@ pub fn build_tensor_bspline_basis(
             // still the tensor of the marginal polynomial null spaces: the one
             // the tensor double penalty (built after the identifiability chart)
             // shrinks, never the already-penalized interaction range.
+            //
+            // Each other margin's Gram is divided by its own domain measure
+            // `1ᵀ G_j 1 = ∫ (Σ_i b_i)²`, the margin's length for a partition-of-unity
+            // basis, so the other margins enter as an average over their domains.
+            // A raw Gram would carry margin `j`'s length unit into margin `dim`'s λ
+            // (#2315 scale law), and a Frobenius normalizer would carry its basis
+            // size instead. The physical integral's scale moves into
+            // `normalization_scale`.
+            let mut gram_measures = Vec::<f64>::with_capacity(marginal_function_grams.len());
+            for (j, gram) in marginal_function_grams.iter().enumerate() {
+                let measure = gram.sum();
+                if !(measure.is_finite() && measure > 0.0) {
+                    crate::bail_invalid_basis!(
+                        "internal TensorBSpline error at dim {j}: function Gram measure {measure} is not positive and finite"
+                    );
+                }
+                gram_measures.push(measure);
+            }
             for dim in 0..normalized_marginal_penalties.len() {
                 let mut s_dim = Array2::<f64>::eye(1);
                 let mut factors = Vec::<Array2<f64>>::with_capacity(marginalnum_basis.len());
+                let mut other_measures = 1.0_f64;
                 for (j, gram) in marginal_function_grams.iter().enumerate() {
                     let factor = if j == dim {
                         normalized_marginal_penalties[j].0.clone()
                     } else {
-                        gram.clone()
+                        other_measures *= gram_measures[j];
+                        gram.mapv(|value| value / gram_measures[j])
                     };
                     factors.push(factor.clone());
                     s_dim = kronecker_product(&s_dim, &factor);
@@ -6305,7 +6325,7 @@ pub fn build_tensor_bspline_basis(
                         "tensor marginal penalty",
                     )?,
                     source: PenaltySource::TensorMarginal { dim },
-                    normalization_scale: normalized_marginal_penalties[dim].1,
+                    normalization_scale: normalized_marginal_penalties[dim].1 * other_measures,
                     kronecker_factors: Some(factors),
                     op: None,
                 });
