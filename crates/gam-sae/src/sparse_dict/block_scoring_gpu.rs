@@ -305,7 +305,7 @@ pub fn route_blocks_cpu(
 /// `(blocks[m,k], gates[m,k], projections[m,k,b])`. Each row lists its admitted
 /// blocks in admission order with their routed gates and γ-free projections,
 /// padded with block 0 and zeros. On the device's own shortlists the device
-/// coder ([`route_and_code_blocks`]) must reproduce it to the bit.
+/// coder (`route_and_code_blocks`) must reproduce it to the bit.
 #[must_use]
 pub fn code_block_shortlists_cpu(
     rows: ArrayView2<'_, f32>,
@@ -563,7 +563,7 @@ pub(super) fn route_and_code_blocks(
     }
 }
 
-/// [`route_and_code_blocks`] packed to fixed width like
+/// `route_and_code_blocks` packed to fixed width like
 /// [`code_block_shortlists_cpu`], with the path that ran. This is the entry the
 /// device parity gate drives with an explicit policy.
 #[cfg(target_os = "linux")]
