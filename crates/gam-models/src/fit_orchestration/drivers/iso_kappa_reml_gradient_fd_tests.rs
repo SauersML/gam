@@ -3504,4 +3504,183 @@ fn duchon_hybrid_psi_components_match_fd_order0_power9_16d() {
     assert_duchon_psi_components("duchon_gaussian_order0_power9_16d_centers24", 1700);
 }
 
+/// gam#2895 acceptance: on the PRODUCTION spatial κ route at the Matérn monotone
+/// fixture's θ0, the analytic ∂V/∂ψ agrees with central differences of the route's
+/// own value, and its negation does not.
+///
+/// θ0 and the route are production's rather than a re-assembly:
+/// `spatial_kappa_incumbent`, `exact_joint_spatial_seed`,
+/// `exact_joint_spatial_inputs` and `prepare_exact_joint_spatial_route` are the
+/// calls `fit_term_collectionwith_spatial_length_scale_optimization` makes. So the
+/// gradient is `eval_full` and the differences are `eval_cost` of one context.
+/// Before b8e85910a re-derived the Matérn triplet in the collection chart, the
+/// design's tension block was amplified truncation, and at this θ0 the analytic
+/// slope was −14.08 against differences of +3.24 (MSI job 399027).
+///
+/// The reference is a Richardson extrapolation of central differences at h and
+/// 2h. The bar is four times its disagreement with the extrapolation at 2h and 4h,
+/// the difference's own measured error, plus 1e-9 of the slope for a
+/// coincidentally small disagreement. The negated control is only decisive when
+/// the differences resolve the slope, so that is asserted first.
+#[test]
+fn production_kappa_route_psi_gradient_matches_its_value_2895() {
+    let n = 60usize;
+    let d = 2usize;
+    let mut data = Array2::<f64>::zeros((n, d));
+    let mut y = Array1::<f64>::zeros(n);
+    for i in 0..n {
+        let x0 = i as f64 / (n as f64 - 1.0);
+        let x1 = (i as f64 * 0.17).sin();
+        data[[i, 0]] = x0;
+        data[[i, 1]] = x1;
+        y[i] = (3.0 * x0).cos() + 0.35 * x1;
+    }
+    let weights = Array1::<f64>::ones(n);
+    let offset = Array1::<f64>::zeros(n);
+    // The spec, fit options and κ options of
+    // `spatial_length_scale_optimization_monotone_improves_or_keeps_score_for_matern`.
+    let spec = TermCollectionSpec {
+        linear_terms: vec![],
+        random_effect_terms: vec![],
+        smooth_terms: vec![SmoothTermSpec {
+            frozen_parametric_residualization: None,
+            name: "matern".to_string(),
+            basis: SmoothBasisSpec::Matern {
+                feature_cols: vec![0, 1],
+                spec: MaternBasisSpec {
+                    periodic: None,
+                    center_strategy: CenterStrategy::FarthestPoint { num_centers: 12 },
+                    length_scale: gam_terms::basis::MaternLengthScale::fixed(12.0),
+                    nu: MaternNu::FiveHalves,
+                    include_intercept: false,
+                    double_penalty: true,
+                    identifiability: MaternIdentifiability::CenterSumToZero,
+                    aniso_log_scales: None,
+                },
+                input_scale: None,
+            },
+            shape: ShapeConstraint::None,
+            joint_null_rotation: None,
+        }],
+    };
+    let fit_opts = FitOptions {
+        max_iter: 40,
+        ..FitOptions::default()
+    };
+    let kappa_options = SpatialLengthScaleOptimizationOptions {
+        max_outer_iter: 16,
+        rel_tol: 1e-5,
+        pilot_subsample_threshold: 0,
+        ..SpatialLengthScaleOptimizationOptions::default()
+    };
+    let family = LikelihoodSpec::gaussian_identity();
+    let SpatialKappaIncumbent::Joint {
+        resolvedspec,
+        best,
+        spatial_terms,
+        ..
+    } = spatial_kappa_incumbent(
+        data.view(),
+        y.view(),
+        weights.view(),
+        offset.view(),
+        &spec,
+        &family,
+        &fit_opts,
+        &kappa_options,
+    )
+    .unwrap_or_else(|e| panic!("incumbent failed: {e:?}"))
+    else {
+        panic!("the monotone Matérn fixture enrolls a spatial coordinate");
+    };
+    let seed = exact_joint_spatial_seed(
+        data.view(),
+        &resolvedspec,
+        &best,
+        &kappa_options,
+        &spatial_terms,
+    )
+    .unwrap_or_else(|e| panic!("seed failed: {e:?}"));
+    assert_eq!(
+        seed.theta0.len(),
+        seed.rho_dim + 1,
+        "the fixture has exactly one isotropic psi coordinate"
+    );
+    let inputs = exact_joint_spatial_inputs(
+        seed.kind.label(),
+        y.view(),
+        weights.view(),
+        offset.view(),
+        &best.design,
+        &family,
+        &fit_opts,
+    )
+    .unwrap_or_else(|e| panic!("route inputs failed: {e:?}"));
+    let mut route = prepare_exact_joint_spatial_route(
+        seed.kind,
+        data.view(),
+        inputs.response(y.view()),
+        weights.view(),
+        inputs.offset.view(),
+        &inputs.external_opts,
+        &resolvedspec,
+        &best.design,
+        &family,
+        &fit_opts,
+        &spatial_terms,
+        &seed.dims_per_term,
+        &seed.theta0,
+        &seed.lower,
+        &seed.upper,
+        seed.rho_dim,
+    )
+    .unwrap_or_else(|e| panic!("route preparation failed: {e:?}"));
+    let psi = seed.rho_dim;
+    let (_, gradient, _) = route
+        .ctx
+        .eval_full(
+            &seed.theta0,
+            gam_solve::rho_optimizer::OuterEvalOrder::ValueAndGradient,
+            route.analytic_outer_hessian_available,
+        )
+        .unwrap_or_else(|e| panic!("analytic evaluation failed: {e:?}"));
+    let analytic = gradient[psi];
+    let mut cost_at = |shift: f64| -> f64 {
+        let mut theta = seed.theta0.clone();
+        theta[psi] += shift;
+        route
+            .ctx
+            .eval_cost(&theta)
+            .unwrap_or_else(|e| panic!("value at psi shift {shift:e} failed: {e:?}"))
+    };
+    let h = 1e-3_f64;
+    let central = [h, 2.0 * h, 4.0 * h].map(|step| (cost_at(step) - cost_at(-step)) / (2.0 * step));
+    let reference = (4.0 * central[0] - central[1]) / 3.0;
+    let coarse = (4.0 * central[1] - central[2]) / 3.0;
+    let bar = 4.0 * (reference - coarse).abs() + 1.0e-9 * analytic.abs().max(reference.abs());
+    eprintln!(
+        "[#2895 gate] theta0={:?} analytic={analytic:+.10e} central={central:?} \
+         reference={reference:+.10e} coarse={coarse:+.10e} bar={bar:.3e}",
+        seed.theta0.to_vec()
+    );
+    assert!(
+        reference.abs() > bar,
+        "the differences do not resolve the slope (|reference|={:.3e} <= bar={bar:.3e}), so \
+         neither the gate nor its negated control decides anything",
+        reference.abs()
+    );
+    assert!(
+        (analytic - reference).abs() <= bar,
+        "production's analytic dV/dpsi {analytic:+.10e} disagrees with differences of its own \
+         value {reference:+.10e} (gap {:.3e} > measured difference bar {bar:.3e})",
+        (analytic - reference).abs()
+    );
+    assert!(
+        (-analytic - reference).abs() > bar,
+        "the negated slope {:+.10e} also passes the bar {bar:.3e}, so the gate cannot tell a \
+         sign error",
+        -analytic
+    );
+}
+
 }

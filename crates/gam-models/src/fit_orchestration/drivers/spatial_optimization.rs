@@ -2312,184 +2312,15 @@ fn try_exact_joint_spatial_length_scale_optimization(
         );
     }
 
-    let rho_dim = best.fit.lambdas.len();
-
-    // #1464 used to widen the over-smoothing side of a hand `±12` box to the
-    // engine's `±30` rail when a constant-curvature `curv()` term was present,
-    // because that kernel's REML optimum at the +κ side is a large smoothing
-    // λ. The joint ρ domain is now derived per coordinate from the term's own
-    // spectrum (`joint_rho_resolvability_domain`, #2812), so that basin is
-    // inside the domain whenever the data resolve it, for every term alike.
-
-    // Compute per-term dimensionality for anisotropic terms.
-    let dims_per_term = spatial_dims_per_term(resolvedspec, spatial_terms);
-    let use_aniso = has_aniso_terms(resolvedspec, spatial_terms);
-
-    // Build initial ψ values and bounds, using aniso-aware constructors
-    // when any term has d > 1 axes. Bounds are tied to each term's center
-    // geometry (r_min, r_max) so κ cannot saturate at an upper bound that
-    // has no relationship to the data's distance scale.
-    let log_kappa0 = if use_aniso {
-        SpatialLogKappaCoords::from_length_scales_aniso(resolvedspec, spatial_terms, kappa_options)
-    } else {
-        SpatialLogKappaCoords::from_length_scales(resolvedspec, spatial_terms, kappa_options)
-    };
-    // If the user/spec did not set a length_scale, re-seed ψ at the midpoint
-    // of the data-derived window instead of the arbitrary options fallback.
-    let mut log_kappa0 = log_kappa0
-        .reseed_from_data(data, resolvedspec, spatial_terms, kappa_options)
-        .map_err(EstimationError::BasisError)?;
-    // Constant curvature is selected once, continuously, before the baseline
-    // fit. The full joint solve therefore profiles only nuisance ρ (and any
-    // non-curvature spatial coordinates) at that certified κ. User-pinned and
-    // estimated values share the same fixed-coordinate treatment, including κ=0.
+    let ExactJointSpatialSeed {
+        kind,
+        rho_dim,
+        dims_per_term,
+        theta0,
+        lower,
+        upper,
+    } = exact_joint_spatial_seed(data, resolvedspec, best, kappa_options, spatial_terms)?;
     let has_constant_curvature_term = !constant_curvature_term_indices(resolvedspec).is_empty();
-    let mut cc_profiled_values: Vec<(usize, f64)> = Vec::new();
-    if has_constant_curvature_term {
-        for (slot, &term_idx) in spatial_terms.iter().enumerate() {
-            if constant_curvature_term_spec(resolvedspec, term_idx).is_none() {
-                continue;
-            }
-            let kappa = get_constant_curvature_kappa(resolvedspec, term_idx)
-                .expect("constant-curvature term exposes its kappa");
-            log_kappa0.set_scalar_slot(slot, kappa);
-            cc_profiled_values.push((slot, kappa));
-        }
-    }
-    let log_kappa_lower = if use_aniso {
-        SpatialLogKappaCoords::lower_bounds_aniso_from_data(
-            data,
-            resolvedspec,
-            spatial_terms,
-            &dims_per_term,
-            kappa_options,
-        )
-    } else {
-        SpatialLogKappaCoords::lower_bounds_from_data(
-            data,
-            resolvedspec,
-            spatial_terms,
-            kappa_options,
-        )
-    }
-    .map_err(EstimationError::BasisError)?;
-    let log_kappa_upper = if use_aniso {
-        SpatialLogKappaCoords::upper_bounds_aniso_from_data(
-            data,
-            resolvedspec,
-            spatial_terms,
-            &dims_per_term,
-            kappa_options,
-        )
-    } else {
-        SpatialLogKappaCoords::upper_bounds_from_data(
-            data,
-            resolvedspec,
-            spatial_terms,
-            kappa_options,
-        )
-    }
-    .map_err(EstimationError::BasisError)?;
-    let mut log_kappa_lower = log_kappa_lower;
-    let mut log_kappa_upper = log_kappa_upper;
-    for &(slot, kappa) in &cc_profiled_values {
-        log_kappa_lower.set_scalar_slot(slot, kappa);
-        log_kappa_upper.set_scalar_slot(slot, kappa);
-        log::info!("[spatial-kappa] slot {slot}: profiling rho at certified kappa={kappa}");
-    }
-    // Project seed onto data-derived bounds; spec.length_scale is a hint,
-    // not a hard constraint. BFGS requires theta0 ∈ [lower, upper].
-    // `{lower,upper}_bounds*_from_data` build the SEARCH box, which already
-    // contains the incumbent length scale (#2454), so this projection now only
-    // fires when the caller's own `min/max_length_scale` excludes the seed.
-    let log_kappa0 = log_kappa0.clamp_to_bounds(&log_kappa_lower, &log_kappa_upper);
-
-    // #2726: ASSERT the `AT THE SAME POINT theta0` premise instead of stating it
-    // in prose. The monotonicity certificate below grades this route's criterion
-    // at θ0 against `fit_score(&best.fit)`, the scalar-ρ incumbent — a comparison
-    // that only means anything if the ψ half of θ0 is the ψ `best` was realized
-    // at. It was not: the seed constructors projected `length_scale` onto the
-    // caller's window while `best` was fit from the raw value, so the two routes
-    // sat `ln 10` apart and the refusal reported a criterion defect for a
-    // feasible-set mismatch. `resolvedspec` is frozen from `best.design`, so its
-    // `length_scale` IS the incumbent's realized scale; the projection now
-    // happens once upstream, before `best` is fit, which makes this check pass by
-    // construction and makes any future reintroduction of a second projection
-    // site fail here instead of twelve orders of magnitude downstream.
-    for (slot, &term_idx) in spatial_terms.iter().enumerate() {
-        if constant_curvature_term_spec(resolvedspec, term_idx).is_some()
-            || measure_jet_term_spec(resolvedspec, term_idx).is_some()
-        {
-            continue;
-        }
-        let Some(incumbent) = get_spatial_length_scale(resolvedspec, term_idx) else {
-            // No explicit incumbent scale: `reseed_from_data` owns this seed and
-            // there is no realized ψ for it to be equal to.
-            continue;
-        };
-        if !(incumbent.is_finite() && incumbent > 0.0) {
-            continue;
-        }
-        let psi_incumbent = -incumbent.ln();
-        let axes = log_kappa0.term_slice(slot);
-        if axes.is_empty() {
-            continue;
-        }
-        let psi_bar = axes.iter().sum::<f64>() / axes.len() as f64;
-        // Forward-error bound for the arithmetic actually performed: the d-term
-        // mean above (η_a are centered, so ψ̄ is exact for a scalar axis and
-        // accumulates only summation roundoff otherwise), plus one rounding for
-        // the box projection, which can move the seed to the nearest
-        // representable edge when the incumbent sits exactly on a face. Not a
-        // tolerance knob — the failure it guards against is a whole projection
-        // step, `ln 10` in the measured case, some 5e14x above this bound.
-        let max_abs_axis = axes.iter().fold(0.0_f64, |acc, v| acc.max(v.abs()));
-        let mean_roundoff =
-            (axes.len() as f64 + 1.0) * f64::EPSILON * (max_abs_axis + psi_incumbent.abs());
-        if (psi_bar - psi_incumbent).abs() > mean_roundoff {
-            return Err(EstimationError::RemlOptimizationFailed(format!(
-                "exact joint spatial optimization would grade its criterion at a psi the \
-                 scalar-rho incumbent was never realized at (term {term_idx}): \
-                 seed_psi_bar={psi_bar:.17e}, incumbent_psi={psi_incumbent:.17e}, \
-                 delta={:.6e}, incumbent_length_scale={incumbent:.17e}, \
-                 window=[{:.6e}, {:.6e}]. theta0 is not shared, so the monotonicity \
-                 certificate below would compare two different functions (#2726).",
-                psi_bar - psi_incumbent,
-                kappa_options.min_length_scale,
-                kappa_options.max_length_scale,
-            )));
-        }
-    }
-
-    // The joint ρ domain is derived from the incumbent's own design and
-    // penalties (#2812): this route hands its θ box straight to the joint
-    // optimizer, so the derivation happens here rather than in the
-    // multi-block driver. The setup itself carries only the seed.
-    let rho_seed = best.fit.lambdas.mapv(f64::ln);
-    let setup = ExactJointHyperSetup::new(rho_seed, log_kappa0, log_kappa_lower, log_kappa_upper);
-
-    let mut theta0 = setup.theta0();
-    let mut lower = setup.lower();
-    let mut upper = setup.upper();
-    {
-        let (rho_lower, rho_upper) =
-            joint_rho_resolvability_domain(&best.design.design, &best.design.penalties, rho_dim);
-        for k in 0..rho_dim {
-            lower[k] = rho_lower[k];
-            upper[k] = rho_upper[k];
-            theta0[k] = if theta0[k].is_finite() {
-                theta0[k].clamp(rho_lower[k], rho_upper[k])
-            } else {
-                0.5 * (rho_lower[k] + rho_upper[k])
-            };
-        }
-        log::info!(
-            "[spatial-kappa] joint rho domain per coordinate: lower={:?} upper={:?} seed={:?}",
-            rho_lower.iter().map(|v| (v * 1e3).round() / 1e3).collect::<Vec<_>>(),
-            rho_upper.iter().map(|v| (v * 1e3).round() / 1e3).collect::<Vec<_>>(),
-            theta0.iter().take(rho_dim).map(|v| (v * 1e3).round() / 1e3).collect::<Vec<_>>(),
-        );
-    }
 
     // ───────────────────────────────────────────────────────────────────────
     //  Both coordinate kinds drive the SAME exact joint optimizer
@@ -2502,11 +2333,6 @@ fn try_exact_joint_spatial_length_scale_optimization(
     //  term, isotropic one log-κ per term. `outer_strategy` handles the
     //  centralized degradation path when the analytic Hessian is unavailable.
     // ───────────────────────────────────────────────────────────────────────
-    let kind = if use_aniso {
-        SpatialHyperKind::Anisotropic
-    } else {
-        SpatialHyperKind::Isotropic
-    };
     let (theta_star, joint_final_value, joint_seed_value, kappa_timing) = run_exact_joint_spatial_optimization(
         kind,
         data,
@@ -2767,6 +2593,218 @@ fn try_exact_joint_spatial_length_scale_optimization(
     Ok(JointSpatialKappaOutcome::Optimized(Box::new(
         optimized_result,
     )))
+}
+
+/// The joint [ρ, ψ] route's seed and search box, derived from the scalar-ρ
+/// incumbent: its log strengths and length scales, projected into their derived
+/// domains.
+struct ExactJointSpatialSeed {
+    kind: SpatialHyperKind,
+    rho_dim: usize,
+    dims_per_term: Vec<usize>,
+    theta0: Array1<f64>,
+    lower: Array1<f64>,
+    upper: Array1<f64>,
+}
+
+fn exact_joint_spatial_seed(
+    data: ArrayView2<'_, f64>,
+    resolvedspec: &TermCollectionSpec,
+    best: &FittedTermCollection,
+    kappa_options: &SpatialLengthScaleOptimizationOptions,
+    spatial_terms: &[usize],
+) -> Result<ExactJointSpatialSeed, EstimationError> {
+    let rho_dim = best.fit.lambdas.len();
+
+    // #1464 used to widen the over-smoothing side of a hand `±12` box to the
+    // engine's `±30` rail when a constant-curvature `curv()` term was present,
+    // because that kernel's REML optimum at the +κ side is a large smoothing
+    // λ. The joint ρ domain is now derived per coordinate from the term's own
+    // spectrum (`joint_rho_resolvability_domain`, #2812), so that basin is
+    // inside the domain whenever the data resolve it, for every term alike.
+
+    // Compute per-term dimensionality for anisotropic terms.
+    let dims_per_term = spatial_dims_per_term(resolvedspec, spatial_terms);
+    let use_aniso = has_aniso_terms(resolvedspec, spatial_terms);
+
+    // Build initial ψ values and bounds, using aniso-aware constructors
+    // when any term has d > 1 axes. Bounds are tied to each term's center
+    // geometry (r_min, r_max) so κ cannot saturate at an upper bound that
+    // has no relationship to the data's distance scale.
+    let log_kappa0 = if use_aniso {
+        SpatialLogKappaCoords::from_length_scales_aniso(resolvedspec, spatial_terms, kappa_options)
+    } else {
+        SpatialLogKappaCoords::from_length_scales(resolvedspec, spatial_terms, kappa_options)
+    };
+    // If the user/spec did not set a length_scale, re-seed ψ at the midpoint
+    // of the data-derived window instead of the arbitrary options fallback.
+    let mut log_kappa0 = log_kappa0
+        .reseed_from_data(data, resolvedspec, spatial_terms, kappa_options)
+        .map_err(EstimationError::BasisError)?;
+    // Constant curvature is selected once, continuously, before the baseline
+    // fit. The full joint solve therefore profiles only nuisance ρ (and any
+    // non-curvature spatial coordinates) at that certified κ. User-pinned and
+    // estimated values share the same fixed-coordinate treatment, including κ=0.
+    let has_constant_curvature_term = !constant_curvature_term_indices(resolvedspec).is_empty();
+    let mut cc_profiled_values: Vec<(usize, f64)> = Vec::new();
+    if has_constant_curvature_term {
+        for (slot, &term_idx) in spatial_terms.iter().enumerate() {
+            if constant_curvature_term_spec(resolvedspec, term_idx).is_none() {
+                continue;
+            }
+            let kappa = get_constant_curvature_kappa(resolvedspec, term_idx)
+                .expect("constant-curvature term exposes its kappa");
+            log_kappa0.set_scalar_slot(slot, kappa);
+            cc_profiled_values.push((slot, kappa));
+        }
+    }
+    let log_kappa_lower = if use_aniso {
+        SpatialLogKappaCoords::lower_bounds_aniso_from_data(
+            data,
+            resolvedspec,
+            spatial_terms,
+            &dims_per_term,
+            kappa_options,
+        )
+    } else {
+        SpatialLogKappaCoords::lower_bounds_from_data(
+            data,
+            resolvedspec,
+            spatial_terms,
+            kappa_options,
+        )
+    }
+    .map_err(EstimationError::BasisError)?;
+    let log_kappa_upper = if use_aniso {
+        SpatialLogKappaCoords::upper_bounds_aniso_from_data(
+            data,
+            resolvedspec,
+            spatial_terms,
+            &dims_per_term,
+            kappa_options,
+        )
+    } else {
+        SpatialLogKappaCoords::upper_bounds_from_data(
+            data,
+            resolvedspec,
+            spatial_terms,
+            kappa_options,
+        )
+    }
+    .map_err(EstimationError::BasisError)?;
+    let mut log_kappa_lower = log_kappa_lower;
+    let mut log_kappa_upper = log_kappa_upper;
+    for &(slot, kappa) in &cc_profiled_values {
+        log_kappa_lower.set_scalar_slot(slot, kappa);
+        log_kappa_upper.set_scalar_slot(slot, kappa);
+        log::info!("[spatial-kappa] slot {slot}: profiling rho at certified kappa={kappa}");
+    }
+    // Project seed onto data-derived bounds; spec.length_scale is a hint,
+    // not a hard constraint. BFGS requires theta0 ∈ [lower, upper].
+    // `{lower,upper}_bounds*_from_data` build the SEARCH box, which already
+    // contains the incumbent length scale (#2454), so this projection now only
+    // fires when the caller's own `min/max_length_scale` excludes the seed.
+    let log_kappa0 = log_kappa0.clamp_to_bounds(&log_kappa_lower, &log_kappa_upper);
+
+    // #2726: ASSERT the `AT THE SAME POINT theta0` premise instead of stating it
+    // in prose. The monotonicity certificate below grades this route's criterion
+    // at θ0 against `fit_score(&best.fit)`, the scalar-ρ incumbent — a comparison
+    // that only means anything if the ψ half of θ0 is the ψ `best` was realized
+    // at. It was not: the seed constructors projected `length_scale` onto the
+    // caller's window while `best` was fit from the raw value, so the two routes
+    // sat `ln 10` apart and the refusal reported a criterion defect for a
+    // feasible-set mismatch. `resolvedspec` is frozen from `best.design`, so its
+    // `length_scale` IS the incumbent's realized scale; the projection now
+    // happens once upstream, before `best` is fit, which makes this check pass by
+    // construction and makes any future reintroduction of a second projection
+    // site fail here instead of twelve orders of magnitude downstream.
+    for (slot, &term_idx) in spatial_terms.iter().enumerate() {
+        if constant_curvature_term_spec(resolvedspec, term_idx).is_some()
+            || measure_jet_term_spec(resolvedspec, term_idx).is_some()
+        {
+            continue;
+        }
+        let Some(incumbent) = get_spatial_length_scale(resolvedspec, term_idx) else {
+            // No explicit incumbent scale: `reseed_from_data` owns this seed and
+            // there is no realized ψ for it to be equal to.
+            continue;
+        };
+        if !(incumbent.is_finite() && incumbent > 0.0) {
+            continue;
+        }
+        let psi_incumbent = -incumbent.ln();
+        let axes = log_kappa0.term_slice(slot);
+        if axes.is_empty() {
+            continue;
+        }
+        let psi_bar = axes.iter().sum::<f64>() / axes.len() as f64;
+        // Forward-error bound for the arithmetic actually performed: the d-term
+        // mean above (η_a are centered, so ψ̄ is exact for a scalar axis and
+        // accumulates only summation roundoff otherwise), plus one rounding for
+        // the box projection, which can move the seed to the nearest
+        // representable edge when the incumbent sits exactly on a face. Not a
+        // tolerance knob — the failure it guards against is a whole projection
+        // step, `ln 10` in the measured case, some 5e14x above this bound.
+        let max_abs_axis = axes.iter().fold(0.0_f64, |acc, v| acc.max(v.abs()));
+        let mean_roundoff =
+            (axes.len() as f64 + 1.0) * f64::EPSILON * (max_abs_axis + psi_incumbent.abs());
+        if (psi_bar - psi_incumbent).abs() > mean_roundoff {
+            return Err(EstimationError::RemlOptimizationFailed(format!(
+                "exact joint spatial optimization would grade its criterion at a psi the \
+                 scalar-rho incumbent was never realized at (term {term_idx}): \
+                 seed_psi_bar={psi_bar:.17e}, incumbent_psi={psi_incumbent:.17e}, \
+                 delta={:.6e}, incumbent_length_scale={incumbent:.17e}, \
+                 window=[{:.6e}, {:.6e}]. theta0 is not shared, so the monotonicity \
+                 certificate below would compare two different functions (#2726).",
+                psi_bar - psi_incumbent,
+                kappa_options.min_length_scale,
+                kappa_options.max_length_scale,
+            )));
+        }
+    }
+
+    // The joint ρ domain is derived from the incumbent's own design and
+    // penalties (#2812): this route hands its θ box straight to the joint
+    // optimizer, so the derivation happens here rather than in the
+    // multi-block driver. The setup itself carries only the seed.
+    let rho_seed = best.fit.lambdas.mapv(f64::ln);
+    let setup = ExactJointHyperSetup::new(rho_seed, log_kappa0, log_kappa_lower, log_kappa_upper);
+
+    let mut theta0 = setup.theta0();
+    let mut lower = setup.lower();
+    let mut upper = setup.upper();
+    {
+        let (rho_lower, rho_upper) =
+            joint_rho_resolvability_domain(&best.design.design, &best.design.penalties, rho_dim);
+        for k in 0..rho_dim {
+            lower[k] = rho_lower[k];
+            upper[k] = rho_upper[k];
+            theta0[k] = if theta0[k].is_finite() {
+                theta0[k].clamp(rho_lower[k], rho_upper[k])
+            } else {
+                0.5 * (rho_lower[k] + rho_upper[k])
+            };
+        }
+        log::info!(
+            "[spatial-kappa] joint rho domain per coordinate: lower={:?} upper={:?} seed={:?}",
+            rho_lower.iter().map(|v| (v * 1e3).round() / 1e3).collect::<Vec<_>>(),
+            rho_upper.iter().map(|v| (v * 1e3).round() / 1e3).collect::<Vec<_>>(),
+            theta0.iter().take(rho_dim).map(|v| (v * 1e3).round() / 1e3).collect::<Vec<_>>(),
+        );
+    }
+    let kind = if use_aniso {
+        SpatialHyperKind::Anisotropic
+    } else {
+        SpatialHyperKind::Isotropic
+    };
+    Ok(ExactJointSpatialSeed {
+        kind,
+        rho_dim,
+        dims_per_term,
+        theta0,
+        lower,
+        upper,
+    })
 }
 
 /// Coordinate kind for the exact joint spatial hyperparameter optimizer.
@@ -3697,11 +3735,8 @@ fn run_exact_joint_spatial_optimization(
     kappa_options: &SpatialLengthScaleOptimizationOptions,
 ) -> Result<(Array1<f64>, f64, f64, SpatialLengthScaleOptimizationTiming), EstimationError> {
     let label = kind.label();
-    let effective_offset = baseline_design
-        .compose_offset(offset, "spatial joint fit")
-        .map_err(EstimationError::BasisError)?;
-    let offset = effective_offset.view();
-    let external_opts = external_opts_for_design(&family, baseline_design, options);
+    let inputs =
+        exact_joint_spatial_inputs(label, y, weights, offset, baseline_design, &family, options)?;
     // #2671: condition the response through the SAME gate and the SAME
     // arithmetic the scalar-ρ route uses before it builds its `RemlState`
     // (#1000 centering / #1127 scaling). This route used to hand `y` to
@@ -3735,367 +3770,37 @@ fn run_exact_joint_spatial_optimization(
     // and the `z = y − offset` vector the certified ψ-Gram tensor is built from.
     // A partial application would pair an n-free fast path with a differently
     // conditioned slow path.
-    let joint_conditioned_y = gam_solve::estimate::gaussian_identity_outer_response_conditioning(
-        &baseline_design.design,
-        &baseline_design.penalties,
-        &external_opts,
-        y,
-        weights,
-        offset,
-    )?;
-    if joint_conditioned_y.is_some() {
-        log::info!(
-            "[{label}] outer response conditioned for the joint [rho, psi] search (#2671): the \
-             criterion is now formed in the same coordinates as the scalar-rho route it is \
-             graded against"
-        );
-    }
-    let y = joint_conditioned_y
-        .as_ref()
-        .map_or(y, |conditioned| conditioned.view());
-    // Use bounds and design metadata for validation.
-    assert!(
-        lower.len() == theta0.len() && upper.len() == theta0.len(),
-        "spatial hyperparameter bounds must match theta length: lower_len={}, upper_len={}, theta_len={}",
-        lower.len(),
-        upper.len(),
-        theta0.len()
-    );
-    assert!(
-        baseline_design.smooth.terms.len() >= spatial_terms.len(),
-        "baseline design must have at least one smooth term per spatial term: baseline_terms={}, spatial_terms={}",
-        baseline_design.smooth.terms.len(),
-        spatial_terms.len()
-    );
+    let y = inputs.response(y);
+    let offset = inputs.offset.view();
     use gam_problem::{DeclaredHessianForm, Derivative, OuterEval};
     use gam_solve::rho_optimizer::OuterEvalOrder;
 
     let theta_dim = theta0.len();
-    // Directional-coordinate dimension: psi-per-axis (anisotropic) or
-    // kappa-per-term (isotropic). The numerics below are identical either way.
     let coord_dim = theta_dim - rho_dim;
-    // Capability records the exact Hessian even though #2359 reserves it for
-    // the terminal certificate. Search uses the analytic gradient and therefore
-    // stops at the third-order family channel; minting alone consumes the
-    // fourth-order spatial contractions.
-    let analytic_outer_hessian_available =
-        exact_joint_spatial_outer_hessian_available(&family, baseline_design);
-    if !analytic_outer_hessian_available {
-        log::info!(
-            "[{label}] analytic outer Hessian unavailable for family/design; routing without second-order geometry (coord_dim={coord_dim})"
-        );
-    }
-    // #1033: set when the n-free Gaussian ψ-lane arms below. It keeps the SEARCH
-    // gradient-only — the outer Hessian curvature slab `B_j` is irreducibly
-    // n-dependent, so a `ValueGradientHessian` eval forces the O(n) design
-    // re-realization and an in-window κ-trial must never issue one. It also
-    // disables the EFS/HybridEFS fixed-point lane, whose trace Gram
-    // `tr(H⁻¹ B_d H⁻¹ B_e)` realizes the same slab.
-    //
-    // It no longer suppresses the DECLARED Hessian (gam#2760). Declaring
-    // `Unavailable` never was what routed the search to BFGS —
-    // `with_prefer_gradient_only(true)` is — and erasing the declaration cost
-    // the mint the one terminal curvature evaluation #2359 reserves for it,
-    // together with every certificate rung that reads curvature. See the
-    // `DeclaredHessianForm` argument at the `exact_joint_multistart_outer_problem`
-    // call below.
-    let mut suppress_outer_hessian_for_nfree = false;
-
-    log::trace!(
-        "[{}] starting analytic optimization: rho_dim={}, coord_dim={}, dims_per_term={:?}",
-        label,
-        rho_dim,
-        coord_dim,
-        dims_per_term,
-    );
-
-    let mut ctx = SpatialJointContext {
-        data,
-        rho_dim,
+    let PreparedExactJointSpatialRoute {
+        mut ctx,
+        analytic_outer_hessian_available,
+        suppress_outer_hessian_for_nfree,
+        psi_rank_stable_floor,
+        psi_rank_stable_ceiling,
+    } = prepare_exact_joint_spatial_route(
         kind,
-        value_realization_failures: 0,
-        value_evaluation_failures: 0,
-        nfree_polish_boundary: None,
-        cache: SingleBlockExactJointDesignCache::new_with_policy(
-            data,
-            resolvedspec.clone(),
-            baseline_design.clone(),
-            spatial_terms.to_vec(),
-            rho_dim,
-            dims_per_term.to_vec(),
-            &options.resource_policy,
-        )
-        .map_err(EstimationError::InvalidInput)?,
-        evaluator: gam_solve::estimate::ExternalJointHyperEvaluator::new(
-            y,
-            weights,
-            &baseline_design.design,
-            offset,
-            &baseline_design.penalties,
-            &external_opts,
-            label,
-        )?,
-        frozen_glm_inputs: if coord_dim == 1 && frozen_glm_tensor_eligible_family(&family) {
-            Some(SpatialFrozenGlmInputs {
-                y: y.to_owned(),
-                weights: weights.to_owned(),
-                offset: offset.to_owned(),
-                family: family.clone(),
-            })
-        } else {
-            None
-        },
-        frozen_glm_psi_bounds: if coord_dim == 1 && frozen_glm_tensor_eligible_family(&family) {
-            Some((lower[rho_dim], upper[rho_dim]))
-        } else {
-            None
-        },
-        frozen_glm_tensor: None,
-        frozen_glm_tensor_attempted: false,
-        frozen_glm_weight_memo: None,
-    };
-
-    // #1033b: single isotropic design-moving coordinate on a Gaussian-identity
-    // fit — build the certified Chebyshev-in-ψ Gram tensor ONCE over the
-    // optimizer's ψ window and hand it to the evaluator. Every in-window trial
-    // then receives its Gaussian sufficient statistics (XᵀWX(ψ), XᵀW(y−offset),
-    // (y−offset)ᵀW(y−offset)) assembled n-free instead of paying the per-trial
-    // O(n·p²) Gram re-stream after the design rebuild. The realizer closure
-    // returns the RAW realized design; the evaluator threads it through its
-    // own (fixed, ψ-invariant) parametric column conditioning so the tensor
-    // lives in the same frame as the streamed Gram. Certification failure,
-    // off-window trials, or any other ineligibility silently keep the exact
-    // streamed path (same numbers, the tensor is certified to
-    // PSI_GRAM_SPOT_RTOL against the exact rebuild).
-    // #1033 (rank-stable κ-floor): set to the lowest ψ at which the certified
-    // tensor's conditioned Gram holds maximal numerical rank. Below it the
-    // reduced basis collapses/rotates and the design-realization skip is SOUNDLY
-    // refused (→ O(n) reset_surface); the κ window floor `ln(2/r_max)` lands
-    // inside that degenerate sliver and DRIFTS with n through the sample-std
-    // standardization, so n=2000's line search re-enters the slow lane while
-    // n=1000's does not. Lifting the optimizer's lower bound to this n-FREE
-    // (k-space) floor keeps every in-window trial on the fast path for all n,
-    // and only excludes over-smoothed length scales the `2/r_max` geometry floor
-    // already meant to exclude (the κ-optimum lives well above it).
-    let mut psi_rank_stable_floor: Option<f64> = None;
-    // #1033 (rank-stable κ-ceiling): symmetric twin of the floor. The conditioned
-    // Gram is rank-deficient at the HIGH window edge too (the longest-frequency
-    // radial mode goes collinear), so a line-search overshoot above the maximal-
-    // rank band soundly refuses the design-realization skip → O(n) reset_surface,
-    // and the deficient pinning ψ it records makes the NEXT in-band trial reset a
-    // second time. Clamping the optimizer's UPPER bound to this n-free k-space
-    // ceiling keeps every trial inside the band. The κ-optimum lives well inside
-    // it, so the clamp only excludes over-fit (too-short) length scales.
-    let mut psi_rank_stable_ceiling: Option<f64> = None;
-    let nfree_penalty_capable =
-        coord_dim == 1 && family.is_gaussian_identity() && ctx.cache.supports_nfree_penalty_rekey();
-    if nfree_penalty_capable {
-        let psi_lo = lower[rho_dim];
-        let psi_hi = upper[rho_dim];
-        let z = Array1::from_iter(y.iter().zip(offset.iter()).map(|(yi, oi)| yi - oi));
-        let theta_probe_base = theta0.clone();
-        // Disjoint mutable borrows of `cache` (in the realizer) and
-        // `evaluator` (the build target) — both fields of `ctx`.
-        let SpatialJointContext {
-            cache, evaluator, ..
-        } = &mut ctx;
-        let attached = evaluator.build_and_set_psi_gram_tensor(
-            |psi| {
-                let mut theta_probe = theta_probe_base.clone();
-                theta_probe[rho_dim] = psi;
-                cache.ensure_theta(&theta_probe).map_err(|e| e.to_string())?;
-                Ok(cache.design().design.clone())
-            },
-            weights,
-            z.view(),
-            psi_lo,
-            psi_hi,
-        );
-        if attached {
-            log::info!(
-                "[{label}] certified ψ-gram tensor over [{psi_lo:.3}, {psi_hi:.3}]: \
-                 in-window trials assemble Gaussian sufficient statistics n-free"
-            );
-            // #1033: read the n-free rank-stable κ-floor off the k-space tensor.
-            // Only lift INTO the window (never below psi_lo, never above the seed
-            // ψ — the seed is the geometric-mean midpoint and is well clear of the
-            // degenerate band), so the optimizer never starts outside its bounds.
-            let psi_anchor = theta0[rho_dim];
-            // #2448: the band search and the skip witness both decide on the
-            // anchor's range projector, so its Davis–Kahan bar is what says whether
-            // an edge that came back AT the anchor means "the band is that narrow"
-            // or "the instrument could not resolve the question and everything
-            // soundly refused". Read once and log it alongside the edge.
-            let psi_projector_bar = evaluator.psi_gram_projector_error_bar(psi_anchor);
-            // One bisection, not two: each `rank_stable_psi_floor` call is a
-            // 64-step search with an O(k³) eigendecomposition per step.
-            let psi_rank_stable_floor_raw = evaluator.psi_gram_rank_stable_floor(psi_anchor);
-            psi_rank_stable_floor = psi_rank_stable_floor_raw
-                .filter(|&f| f.is_finite() && f > psi_lo && f < psi_anchor);
-            log::info!(
-                "[KAPPA-PHASE-FLOOR] n_rows={} psi_lo={psi_lo:.6} psi_anchor={psi_anchor:.6} \
-                 rank_stable_floor={psi_rank_stable_floor_raw:?} lifted={} \
-                 projector_error_bar={psi_projector_bar:?}",
-                data.nrows(),
-                psi_rank_stable_floor.is_some(),
-            );
-            if let Some(floor) = psi_rank_stable_floor {
-                log::info!(
-                    "[{label}] rank-stable κ-floor ψ_floor={floor:.6} > window floor \
-                     ψ_lo={psi_lo:.6}: lifting the optimizer lower bound to keep every \
-                     in-window trial on the n-free design-realization skip (#1033). The \
-                     conditioned Gram is rank-deficient below ψ_floor (longest-length-scale \
-                     radial mode collapses into the nullspace), where the skip is soundly \
-                     refused. The SEARCH is n-free — O(iters·k³) off the k-space tensor, \
-                     zero row access — but the EDGE IS NOT AN n-INVARIANT CONSTANT of the \
-                     design (#2408): the tensor is built from n rows, so its Gram is an \
-                     O(1/n) relative perturbation of the continuum Gram, which moves the \
-                     rank margin additively and displaces this root by \
-                     sup|δ margin| / inf|d margin/dψ|. A steep cliff pins it to machine \
-                     precision; a grazing crossing does not. Treat it as a clamp carrying \
-                     that transport bound, not as the n-independent answer."
-                );
-            }
-            // #1033: read the n-free rank-stable κ-CEILING (symmetric twin of the
-            // floor). Only clamp INTO the window (strictly below psi_hi, strictly
-            // above the seed ψ — the seed is the geometric-mean midpoint, well
-            // inside the maximal-rank band), so the optimizer never starts outside
-            // its bounds. This is the fix for the n=16000 fast-ladder resets: the
-            // line search overshot to ψ≈1.0 (rank 11→10 at the high edge), tripping
-            // two O(n) reset_surface calls; clamping the upper bound keeps the
-            // search inside the band where the n-free skip stays sound.
-            let psi_rank_stable_ceiling_raw = evaluator.psi_gram_rank_stable_ceiling(psi_anchor);
-            psi_rank_stable_ceiling = psi_rank_stable_ceiling_raw
-                .filter(|&c| c.is_finite() && c < psi_hi && c > psi_anchor);
-            log::info!(
-                "[KAPPA-PHASE-CEIL] n_rows={} psi_hi={psi_hi:.6} psi_anchor={psi_anchor:.6} \
-                 rank_stable_ceiling={psi_rank_stable_ceiling_raw:?} clamped={} \
-                 projector_error_bar={psi_projector_bar:?}",
-                data.nrows(),
-                psi_rank_stable_ceiling.is_some(),
-            );
-            if let Some(ceiling) = psi_rank_stable_ceiling {
-                log::info!(
-                    "[{label}] rank-stable κ-ceiling ψ_ceil={ceiling:.6} < window ceiling \
-                     ψ_hi={psi_hi:.6}: clamping the optimizer upper bound to keep every \
-                     in-window trial on the n-free design-realization skip (#1033). The \
-                     conditioned Gram is rank-deficient above ψ_ceil (longest-frequency \
-                     radial mode goes collinear), where the skip is soundly refused; a \
-                     line-search overshoot there trips the O(n) reset_surface lane (and the \
-                     deficient pinning ψ it records resets the next in-band trial too)."
-                );
-            }
-            // #2448: when the anchor's range projector is not resolved to the
-            // subspace tolerance, `reduced_basis_equal` refuses EVERY non-trivial
-            // pair, so both band edges collapse onto the anchor and get filtered
-            // out above — indistinguishable in the log from "the band already
-            // covers the window". It is not the same thing at all: the n-free
-            // design-realization skip is dead for the whole fit and every trial
-            // falls to the O(n) exact path. Say so once, loudly, so the resulting
-            // wall-clock is attributable to the geometry rather than mysterious.
-            if let Some(bar) = psi_projector_bar
-                && bar > gam_solve::psi_gram_tensor::PSI_GRAM_SKIP_PROJ_ATOL
-            {
-                log::warn!(
-                    "[{label}] ψ-gram range projector at the anchor ψ={psi_anchor:.6} is \
-                     UNRESOLVED: Davis–Kahan bar {bar:.3e} exceeds the {:.3e} subspace \
-                     tolerance the design-revision skip gates on (#2448). The conditioned \
-                     Gram has no kept/dropped eigen-gap wide enough to decide subspace \
-                     identity at double precision here — its spectrum decays smoothly \
-                     through the rank cutoff instead of cliffing — so the skip witness \
-                     soundly refuses every trial and the n-free fast path will not fire \
-                     at all. Results are unaffected (the exact O(n) path runs); the cost \
-                     is the fast path. The lever is the geometry (basis size / centers) \
-                     or the rank cutoff, not this clamp.",
-                    gam_solve::psi_gram_tensor::PSI_GRAM_SKIP_PROJ_ATOL
-                );
-            }
-            let gradient_covers_full_window = evaluator.psi_gram_tensor_covers_gradient(psi_lo)
-                && evaluator.psi_gram_tensor_covers_gradient(psi_hi);
-            if gradient_covers_full_window {
-                log::info!(
-                    "[{label}] certified ψ-gram tensor gradient lane covers the full \
-                     optimizer window [{psi_lo:.3}, {psi_hi:.3}]"
-                );
-            } else {
-                log::info!(
-                    "[{label}] ψ-gram tensor value lane certified, but the gradient lane \
-                     does not cover the full optimizer window [{psi_lo:.3}, {psi_hi:.3}]; \
-                     keeping exact streamed kappa routing"
-                );
-            }
-            // #1033 penalty lane: ψ also moves the penalty `S(ψ)` (the
-            // Duchon/ThinPlate Hilbert scale is an analytic function of the
-            // length-scale, built from the FROZEN basis CENTERS — not the data
-            // rows). The design-revision fast path that the Gram tensor enables
-            // SKIPS `reset_surface`, the only place the canonical penalty surface
-            // is rebuilt; without re-keying, the inner solve would pair
-            // `XᵀWX(ψ_new)` with the stale `S(ψ_old)` and converge to the wrong
-            // β̂ / κ-optimum. Rather than interpolate `S(ψ)`, the fast path rebuilds
-            // it EXACTLY and n-free per trial from the frozen geometry via
-            // `cache.canonical_penalties_at(theta)` (the SAME
-            // `canonicalize_penalty_specs` pipeline the slow `reset_surface` runs).
-            // Here we only DECLARE the capability to the evaluator; the per-trial
-            // staging happens in `eval_full` / `eval_cost`. The skip is enabled
-            // exactly when the single spatial term's frozen metadata
-            // (Duchon/ThinPlate) admits the exact rebuild. Matérn deliberately
-            // does not enter this block: mixing tensor value probes with exact
-            // streamed gradients/Hessians changed its selected κ enough to miss
-            // the truth-recovery quality gate, so Matérn stays on one exact
-            // streamed objective for value, gradient, and Hessian.
-            evaluator.set_supports_nfree_penalty_rekey(true);
-            log::info!(
-                "[{label}] exact n-free ψ-penalty re-key enabled over [{psi_lo:.3}, \
-                 {psi_hi:.3}]: in-window fast-path trials rebuild S(ψ) n-free from frozen \
-                 geometry (no reset_surface)"
-            );
-        } else {
-            log::info!(
-                "[{label}] ψ-gram tensor did not certify over [{psi_lo:.3}, {psi_hi:.3}]; \
-                 keeping the exact per-trial path"
-            );
-        }
-        // #1033 (n-independent outer loop): with the n-free Gaussian lane fully
-        // armed (Gram tensor attached + exact n-free penalty re-key), the design-
-        // realization skip serves the criterion AND the ψ-gradient `(a_j, g_j)`
-        // n-free for every in-window trial — but ONLY a `ValueAndGradient` eval
-        // takes that skip. A `ValueGradientHessian` eval sets `allow_second_order`,
-        // which forces `ensure_theta` → `reset_surface` (the O(n) design re-
-        // realization) because the outer Hessian curvature `B_j` is the exact
-        // n-dependent slab. So second-order outer steps are the LAST O(n) per-trial
-        // cost in the κ search, and they make the outer loop scale with n. Route
-        // gradient-only here: the spatial length-scale objective is smooth and the
-        // budget policy already establishes that gradient-only quasi-Newton
-        // converges to the same optimum strictly cheaper per eval past the pair-
-        // Hessian budget — and with the tensor, the realized Hessian is the only
-        // remaining expensive operation, so the same argument applies for ANY n
-        // once the lane is armed. This keeps every in-window κ-trial on the n-free
-        // `ValueAndGradient` skip, delivering the n-independent outer loop. The
-        // exact second-order geometry is preserved whenever the lane is NOT armed
-        // for gradient-only routing (non-Gaussian, multi-term, Matérn, or an
-        // uncertified window), where it still pays O(n) per Hessian but keeps the
-        // quality-sensitive exact second-order path.
-        if attached
-            && evaluator.psi_gram_tensor_covers_gradient(psi_lo)
-            && evaluator.psi_gram_tensor_covers_gradient(psi_hi)
-            && evaluator.supports_nfree_penalty_rekey()
-            && cache.supports_nfree_gradient_only_routing()
-        {
-            suppress_outer_hessian_for_nfree = true;
-            log::info!(
-                "[{label}] n-free Gaussian ψ-lane armed; routing the SEARCH gradient-only \
-                 (BFGS, fixed-point lane off) so no in-window κ-trial realizes the O(n) \
-                 second-order slab — n-independent outer loop (#1033). The terminal \
-                 certificate keeps its one exact curvature evaluation (gam#2760)."
-            );
-        }
-    } else if coord_dim == 1 && family.is_gaussian_identity() {
-        log::info!(
-            "[{label}] exact n-free ψ-penalty re-key unavailable; skipping ψ-gram tensor \
-             attachment so value, gradient, and Hessian remain on the same exact streamed \
-             objective"
-        );
-    }
+        data,
+        y,
+        weights,
+        offset,
+        &inputs.external_opts,
+        resolvedspec,
+        baseline_design,
+        &family,
+        options,
+        spatial_terms,
+        dims_per_term,
+        theta0,
+        lower,
+        upper,
+        rho_dim,
+    )?;
 
     // Priming is part of search, so it must stop at the order-three gradient
     // lane. The only `ValueGradientHessian` request belongs to the mint audit.
@@ -4624,6 +4329,441 @@ fn run_exact_joint_spatial_optimization(
     // happens later in apply_tospec.
     let theta_star = result.rho;
     Ok((theta_star, result.final_value, seed_value, timing))
+}
+
+/// The joint [ρ, ψ] route's owned inputs: the composed offset, the search
+/// response conditioned through the scalar-ρ route's gate (#2671), and the
+/// evaluator options.
+struct ExactJointSpatialInputs {
+    offset: Array1<f64>,
+    conditioned_y: Option<Array1<f64>>,
+    external_opts: ExternalOptimOptions,
+}
+
+impl ExactJointSpatialInputs {
+    /// The response the search evaluates: the conditioned one when the gate
+    /// conditioned it, otherwise the caller's.
+    fn response<'a>(&'a self, y: ArrayView1<'a, f64>) -> ArrayView1<'a, f64> {
+        self.conditioned_y
+            .as_ref()
+            .map_or(y, |conditioned| conditioned.view())
+    }
+}
+
+fn exact_joint_spatial_inputs(
+    label: &str,
+    y: ArrayView1<'_, f64>,
+    weights: ArrayView1<'_, f64>,
+    offset: ArrayView1<'_, f64>,
+    baseline_design: &TermCollectionDesign,
+    family: &LikelihoodSpec,
+    options: &FitOptions,
+) -> Result<ExactJointSpatialInputs, EstimationError> {
+    let offset = baseline_design
+        .compose_offset(offset, "spatial joint fit")
+        .map_err(EstimationError::BasisError)?;
+    let external_opts = external_opts_for_design(family, baseline_design, options);
+    let conditioned_y = gam_solve::estimate::gaussian_identity_outer_response_conditioning(
+        &baseline_design.design,
+        &baseline_design.penalties,
+        &external_opts,
+        y,
+        weights,
+        offset.view(),
+    )?;
+    if conditioned_y.is_some() {
+        log::info!(
+            "[{label}] outer response conditioned for the joint [rho, psi] search (#2671): the \
+             criterion is now formed in the same coordinates as the scalar-rho route it is \
+             graded against"
+        );
+    }
+    Ok(ExactJointSpatialInputs {
+        offset,
+        conditioned_y,
+        external_opts,
+    })
+}
+
+/// The joint [ρ, ψ] route as the search receives it: the evaluation context with
+/// any certified ψ-Gram lane attached, and the routing facts the search reads.
+/// `y` is the search response from [`ExactJointSpatialInputs::response`] and
+/// `offset` its composed offset.
+struct PreparedExactJointSpatialRoute<'d> {
+    ctx: SpatialJointContext<'d>,
+    analytic_outer_hessian_available: bool,
+    suppress_outer_hessian_for_nfree: bool,
+    psi_rank_stable_floor: Option<f64>,
+    psi_rank_stable_ceiling: Option<f64>,
+}
+
+fn prepare_exact_joint_spatial_route<'d>(
+    kind: SpatialHyperKind,
+    data: ArrayView2<'d, f64>,
+    y: ArrayView1<'d, f64>,
+    weights: ArrayView1<'d, f64>,
+    offset: ArrayView1<'_, f64>,
+    external_opts: &ExternalOptimOptions,
+    resolvedspec: &TermCollectionSpec,
+    baseline_design: &TermCollectionDesign,
+    family: &LikelihoodSpec,
+    options: &FitOptions,
+    spatial_terms: &[usize],
+    dims_per_term: &[usize],
+    theta0: &Array1<f64>,
+    lower: &Array1<f64>,
+    upper: &Array1<f64>,
+    rho_dim: usize,
+) -> Result<PreparedExactJointSpatialRoute<'d>, EstimationError> {
+    let label = kind.label();
+    // Use bounds and design metadata for validation.
+    assert!(
+        lower.len() == theta0.len() && upper.len() == theta0.len(),
+        "spatial hyperparameter bounds must match theta length: lower_len={}, upper_len={}, theta_len={}",
+        lower.len(),
+        upper.len(),
+        theta0.len()
+    );
+    assert!(
+        baseline_design.smooth.terms.len() >= spatial_terms.len(),
+        "baseline design must have at least one smooth term per spatial term: baseline_terms={}, spatial_terms={}",
+        baseline_design.smooth.terms.len(),
+        spatial_terms.len()
+    );
+
+    let theta_dim = theta0.len();
+    // Directional-coordinate dimension: psi-per-axis (anisotropic) or
+    // kappa-per-term (isotropic). The numerics below are identical either way.
+    let coord_dim = theta_dim - rho_dim;
+    // Capability records the exact Hessian even though #2359 reserves it for
+    // the terminal certificate. Search uses the analytic gradient and therefore
+    // stops at the third-order family channel; minting alone consumes the
+    // fourth-order spatial contractions.
+    let analytic_outer_hessian_available =
+        exact_joint_spatial_outer_hessian_available(&family, baseline_design);
+    if !analytic_outer_hessian_available {
+        log::info!(
+            "[{label}] analytic outer Hessian unavailable for family/design; routing without second-order geometry (coord_dim={coord_dim})"
+        );
+    }
+    // #1033: set when the n-free Gaussian ψ-lane arms below. It keeps the SEARCH
+    // gradient-only — the outer Hessian curvature slab `B_j` is irreducibly
+    // n-dependent, so a `ValueGradientHessian` eval forces the O(n) design
+    // re-realization and an in-window κ-trial must never issue one. It also
+    // disables the EFS/HybridEFS fixed-point lane, whose trace Gram
+    // `tr(H⁻¹ B_d H⁻¹ B_e)` realizes the same slab.
+    //
+    // It no longer suppresses the DECLARED Hessian (gam#2760). Declaring
+    // `Unavailable` never was what routed the search to BFGS —
+    // `with_prefer_gradient_only(true)` is — and erasing the declaration cost
+    // the mint the one terminal curvature evaluation #2359 reserves for it,
+    // together with every certificate rung that reads curvature. See the
+    // `DeclaredHessianForm` argument at the `exact_joint_multistart_outer_problem`
+    // call below.
+    let mut suppress_outer_hessian_for_nfree = false;
+
+    log::trace!(
+        "[{}] starting analytic optimization: rho_dim={}, coord_dim={}, dims_per_term={:?}",
+        label,
+        rho_dim,
+        coord_dim,
+        dims_per_term,
+    );
+
+    let mut ctx = SpatialJointContext {
+        data,
+        rho_dim,
+        kind,
+        value_realization_failures: 0,
+        value_evaluation_failures: 0,
+        nfree_polish_boundary: None,
+        cache: SingleBlockExactJointDesignCache::new_with_policy(
+            data,
+            resolvedspec.clone(),
+            baseline_design.clone(),
+            spatial_terms.to_vec(),
+            rho_dim,
+            dims_per_term.to_vec(),
+            &options.resource_policy,
+        )
+        .map_err(EstimationError::InvalidInput)?,
+        evaluator: gam_solve::estimate::ExternalJointHyperEvaluator::new(
+            y,
+            weights,
+            &baseline_design.design,
+            offset,
+            &baseline_design.penalties,
+            &external_opts,
+            label,
+        )?,
+        frozen_glm_inputs: if coord_dim == 1 && frozen_glm_tensor_eligible_family(&family) {
+            Some(SpatialFrozenGlmInputs {
+                y: y.to_owned(),
+                weights: weights.to_owned(),
+                offset: offset.to_owned(),
+                family: family.clone(),
+            })
+        } else {
+            None
+        },
+        frozen_glm_psi_bounds: if coord_dim == 1 && frozen_glm_tensor_eligible_family(&family) {
+            Some((lower[rho_dim], upper[rho_dim]))
+        } else {
+            None
+        },
+        frozen_glm_tensor: None,
+        frozen_glm_tensor_attempted: false,
+        frozen_glm_weight_memo: None,
+    };
+
+    // #1033b: single isotropic design-moving coordinate on a Gaussian-identity
+    // fit — build the certified Chebyshev-in-ψ Gram tensor ONCE over the
+    // optimizer's ψ window and hand it to the evaluator. Every in-window trial
+    // then receives its Gaussian sufficient statistics (XᵀWX(ψ), XᵀW(y−offset),
+    // (y−offset)ᵀW(y−offset)) assembled n-free instead of paying the per-trial
+    // O(n·p²) Gram re-stream after the design rebuild. The realizer closure
+    // returns the RAW realized design; the evaluator threads it through its
+    // own (fixed, ψ-invariant) parametric column conditioning so the tensor
+    // lives in the same frame as the streamed Gram. Certification failure,
+    // off-window trials, or any other ineligibility silently keep the exact
+    // streamed path (same numbers, the tensor is certified to
+    // PSI_GRAM_SPOT_RTOL against the exact rebuild).
+    // #1033 (rank-stable κ-floor): set to the lowest ψ at which the certified
+    // tensor's conditioned Gram holds maximal numerical rank. Below it the
+    // reduced basis collapses/rotates and the design-realization skip is SOUNDLY
+    // refused (→ O(n) reset_surface); the κ window floor `ln(2/r_max)` lands
+    // inside that degenerate sliver and DRIFTS with n through the sample-std
+    // standardization, so n=2000's line search re-enters the slow lane while
+    // n=1000's does not. Lifting the optimizer's lower bound to this n-FREE
+    // (k-space) floor keeps every in-window trial on the fast path for all n,
+    // and only excludes over-smoothed length scales the `2/r_max` geometry floor
+    // already meant to exclude (the κ-optimum lives well above it).
+    let mut psi_rank_stable_floor: Option<f64> = None;
+    // #1033 (rank-stable κ-ceiling): symmetric twin of the floor. The conditioned
+    // Gram is rank-deficient at the HIGH window edge too (the longest-frequency
+    // radial mode goes collinear), so a line-search overshoot above the maximal-
+    // rank band soundly refuses the design-realization skip → O(n) reset_surface,
+    // and the deficient pinning ψ it records makes the NEXT in-band trial reset a
+    // second time. Clamping the optimizer's UPPER bound to this n-free k-space
+    // ceiling keeps every trial inside the band. The κ-optimum lives well inside
+    // it, so the clamp only excludes over-fit (too-short) length scales.
+    let mut psi_rank_stable_ceiling: Option<f64> = None;
+    let nfree_penalty_capable =
+        coord_dim == 1 && family.is_gaussian_identity() && ctx.cache.supports_nfree_penalty_rekey();
+    if nfree_penalty_capable {
+        let psi_lo = lower[rho_dim];
+        let psi_hi = upper[rho_dim];
+        let z = Array1::from_iter(y.iter().zip(offset.iter()).map(|(yi, oi)| yi - oi));
+        let theta_probe_base = theta0.clone();
+        // Disjoint mutable borrows of `cache` (in the realizer) and
+        // `evaluator` (the build target) — both fields of `ctx`.
+        let SpatialJointContext {
+            cache, evaluator, ..
+        } = &mut ctx;
+        let attached = evaluator.build_and_set_psi_gram_tensor(
+            |psi| {
+                let mut theta_probe = theta_probe_base.clone();
+                theta_probe[rho_dim] = psi;
+                cache.ensure_theta(&theta_probe).map_err(|e| e.to_string())?;
+                Ok(cache.design().design.clone())
+            },
+            weights,
+            z.view(),
+            psi_lo,
+            psi_hi,
+        );
+        if attached {
+            log::info!(
+                "[{label}] certified ψ-gram tensor over [{psi_lo:.3}, {psi_hi:.3}]: \
+                 in-window trials assemble Gaussian sufficient statistics n-free"
+            );
+            // #1033: read the n-free rank-stable κ-floor off the k-space tensor.
+            // Only lift INTO the window (never below psi_lo, never above the seed
+            // ψ — the seed is the geometric-mean midpoint and is well clear of the
+            // degenerate band), so the optimizer never starts outside its bounds.
+            let psi_anchor = theta0[rho_dim];
+            // #2448: the band search and the skip witness both decide on the
+            // anchor's range projector, so its Davis–Kahan bar is what says whether
+            // an edge that came back AT the anchor means "the band is that narrow"
+            // or "the instrument could not resolve the question and everything
+            // soundly refused". Read once and log it alongside the edge.
+            let psi_projector_bar = evaluator.psi_gram_projector_error_bar(psi_anchor);
+            // One bisection, not two: each `rank_stable_psi_floor` call is a
+            // 64-step search with an O(k³) eigendecomposition per step.
+            let psi_rank_stable_floor_raw = evaluator.psi_gram_rank_stable_floor(psi_anchor);
+            psi_rank_stable_floor = psi_rank_stable_floor_raw
+                .filter(|&f| f.is_finite() && f > psi_lo && f < psi_anchor);
+            log::info!(
+                "[KAPPA-PHASE-FLOOR] n_rows={} psi_lo={psi_lo:.6} psi_anchor={psi_anchor:.6} \
+                 rank_stable_floor={psi_rank_stable_floor_raw:?} lifted={} \
+                 projector_error_bar={psi_projector_bar:?}",
+                data.nrows(),
+                psi_rank_stable_floor.is_some(),
+            );
+            if let Some(floor) = psi_rank_stable_floor {
+                log::info!(
+                    "[{label}] rank-stable κ-floor ψ_floor={floor:.6} > window floor \
+                     ψ_lo={psi_lo:.6}: lifting the optimizer lower bound to keep every \
+                     in-window trial on the n-free design-realization skip (#1033). The \
+                     conditioned Gram is rank-deficient below ψ_floor (longest-length-scale \
+                     radial mode collapses into the nullspace), where the skip is soundly \
+                     refused. The SEARCH is n-free — O(iters·k³) off the k-space tensor, \
+                     zero row access — but the EDGE IS NOT AN n-INVARIANT CONSTANT of the \
+                     design (#2408): the tensor is built from n rows, so its Gram is an \
+                     O(1/n) relative perturbation of the continuum Gram, which moves the \
+                     rank margin additively and displaces this root by \
+                     sup|δ margin| / inf|d margin/dψ|. A steep cliff pins it to machine \
+                     precision; a grazing crossing does not. Treat it as a clamp carrying \
+                     that transport bound, not as the n-independent answer."
+                );
+            }
+            // #1033: read the n-free rank-stable κ-CEILING (symmetric twin of the
+            // floor). Only clamp INTO the window (strictly below psi_hi, strictly
+            // above the seed ψ — the seed is the geometric-mean midpoint, well
+            // inside the maximal-rank band), so the optimizer never starts outside
+            // its bounds. This is the fix for the n=16000 fast-ladder resets: the
+            // line search overshot to ψ≈1.0 (rank 11→10 at the high edge), tripping
+            // two O(n) reset_surface calls; clamping the upper bound keeps the
+            // search inside the band where the n-free skip stays sound.
+            let psi_rank_stable_ceiling_raw = evaluator.psi_gram_rank_stable_ceiling(psi_anchor);
+            psi_rank_stable_ceiling = psi_rank_stable_ceiling_raw
+                .filter(|&c| c.is_finite() && c < psi_hi && c > psi_anchor);
+            log::info!(
+                "[KAPPA-PHASE-CEIL] n_rows={} psi_hi={psi_hi:.6} psi_anchor={psi_anchor:.6} \
+                 rank_stable_ceiling={psi_rank_stable_ceiling_raw:?} clamped={} \
+                 projector_error_bar={psi_projector_bar:?}",
+                data.nrows(),
+                psi_rank_stable_ceiling.is_some(),
+            );
+            if let Some(ceiling) = psi_rank_stable_ceiling {
+                log::info!(
+                    "[{label}] rank-stable κ-ceiling ψ_ceil={ceiling:.6} < window ceiling \
+                     ψ_hi={psi_hi:.6}: clamping the optimizer upper bound to keep every \
+                     in-window trial on the n-free design-realization skip (#1033). The \
+                     conditioned Gram is rank-deficient above ψ_ceil (longest-frequency \
+                     radial mode goes collinear), where the skip is soundly refused; a \
+                     line-search overshoot there trips the O(n) reset_surface lane (and the \
+                     deficient pinning ψ it records resets the next in-band trial too)."
+                );
+            }
+            // #2448: when the anchor's range projector is not resolved to the
+            // subspace tolerance, `reduced_basis_equal` refuses EVERY non-trivial
+            // pair, so both band edges collapse onto the anchor and get filtered
+            // out above — indistinguishable in the log from "the band already
+            // covers the window". It is not the same thing at all: the n-free
+            // design-realization skip is dead for the whole fit and every trial
+            // falls to the O(n) exact path. Say so once, loudly, so the resulting
+            // wall-clock is attributable to the geometry rather than mysterious.
+            if let Some(bar) = psi_projector_bar
+                && bar > gam_solve::psi_gram_tensor::PSI_GRAM_SKIP_PROJ_ATOL
+            {
+                log::warn!(
+                    "[{label}] ψ-gram range projector at the anchor ψ={psi_anchor:.6} is \
+                     UNRESOLVED: Davis–Kahan bar {bar:.3e} exceeds the {:.3e} subspace \
+                     tolerance the design-revision skip gates on (#2448). The conditioned \
+                     Gram has no kept/dropped eigen-gap wide enough to decide subspace \
+                     identity at double precision here — its spectrum decays smoothly \
+                     through the rank cutoff instead of cliffing — so the skip witness \
+                     soundly refuses every trial and the n-free fast path will not fire \
+                     at all. Results are unaffected (the exact O(n) path runs); the cost \
+                     is the fast path. The lever is the geometry (basis size / centers) \
+                     or the rank cutoff, not this clamp.",
+                    gam_solve::psi_gram_tensor::PSI_GRAM_SKIP_PROJ_ATOL
+                );
+            }
+            let gradient_covers_full_window = evaluator.psi_gram_tensor_covers_gradient(psi_lo)
+                && evaluator.psi_gram_tensor_covers_gradient(psi_hi);
+            if gradient_covers_full_window {
+                log::info!(
+                    "[{label}] certified ψ-gram tensor gradient lane covers the full \
+                     optimizer window [{psi_lo:.3}, {psi_hi:.3}]"
+                );
+            } else {
+                log::info!(
+                    "[{label}] ψ-gram tensor value lane certified, but the gradient lane \
+                     does not cover the full optimizer window [{psi_lo:.3}, {psi_hi:.3}]; \
+                     keeping exact streamed kappa routing"
+                );
+            }
+            // #1033 penalty lane: ψ also moves the penalty `S(ψ)` (the
+            // Duchon/ThinPlate Hilbert scale is an analytic function of the
+            // length-scale, built from the FROZEN basis CENTERS — not the data
+            // rows). The design-revision fast path that the Gram tensor enables
+            // SKIPS `reset_surface`, the only place the canonical penalty surface
+            // is rebuilt; without re-keying, the inner solve would pair
+            // `XᵀWX(ψ_new)` with the stale `S(ψ_old)` and converge to the wrong
+            // β̂ / κ-optimum. Rather than interpolate `S(ψ)`, the fast path rebuilds
+            // it EXACTLY and n-free per trial from the frozen geometry via
+            // `cache.canonical_penalties_at(theta)` (the SAME
+            // `canonicalize_penalty_specs` pipeline the slow `reset_surface` runs).
+            // Here we only DECLARE the capability to the evaluator; the per-trial
+            // staging happens in `eval_full` / `eval_cost`. The skip is enabled
+            // exactly when the single spatial term's frozen metadata
+            // (Duchon/ThinPlate) admits the exact rebuild. Matérn deliberately
+            // does not enter this block: mixing tensor value probes with exact
+            // streamed gradients/Hessians changed its selected κ enough to miss
+            // the truth-recovery quality gate, so Matérn stays on one exact
+            // streamed objective for value, gradient, and Hessian.
+            evaluator.set_supports_nfree_penalty_rekey(true);
+            log::info!(
+                "[{label}] exact n-free ψ-penalty re-key enabled over [{psi_lo:.3}, \
+                 {psi_hi:.3}]: in-window fast-path trials rebuild S(ψ) n-free from frozen \
+                 geometry (no reset_surface)"
+            );
+        } else {
+            log::info!(
+                "[{label}] ψ-gram tensor did not certify over [{psi_lo:.3}, {psi_hi:.3}]; \
+                 keeping the exact per-trial path"
+            );
+        }
+        // #1033 (n-independent outer loop): with the n-free Gaussian lane fully
+        // armed (Gram tensor attached + exact n-free penalty re-key), the design-
+        // realization skip serves the criterion AND the ψ-gradient `(a_j, g_j)`
+        // n-free for every in-window trial — but ONLY a `ValueAndGradient` eval
+        // takes that skip. A `ValueGradientHessian` eval sets `allow_second_order`,
+        // which forces `ensure_theta` → `reset_surface` (the O(n) design re-
+        // realization) because the outer Hessian curvature `B_j` is the exact
+        // n-dependent slab. So second-order outer steps are the LAST O(n) per-trial
+        // cost in the κ search, and they make the outer loop scale with n. Route
+        // gradient-only here: the spatial length-scale objective is smooth and the
+        // budget policy already establishes that gradient-only quasi-Newton
+        // converges to the same optimum strictly cheaper per eval past the pair-
+        // Hessian budget — and with the tensor, the realized Hessian is the only
+        // remaining expensive operation, so the same argument applies for ANY n
+        // once the lane is armed. This keeps every in-window κ-trial on the n-free
+        // `ValueAndGradient` skip, delivering the n-independent outer loop. The
+        // exact second-order geometry is preserved whenever the lane is NOT armed
+        // for gradient-only routing (non-Gaussian, multi-term, Matérn, or an
+        // uncertified window), where it still pays O(n) per Hessian but keeps the
+        // quality-sensitive exact second-order path.
+        if attached
+            && evaluator.psi_gram_tensor_covers_gradient(psi_lo)
+            && evaluator.psi_gram_tensor_covers_gradient(psi_hi)
+            && evaluator.supports_nfree_penalty_rekey()
+            && cache.supports_nfree_gradient_only_routing()
+        {
+            suppress_outer_hessian_for_nfree = true;
+            log::info!(
+                "[{label}] n-free Gaussian ψ-lane armed; routing the SEARCH gradient-only \
+                 (BFGS, fixed-point lane off) so no in-window κ-trial realizes the O(n) \
+                 second-order slab — n-independent outer loop (#1033). The terminal \
+                 certificate keeps its one exact curvature evaluation (gam#2760)."
+            );
+        }
+    } else if coord_dim == 1 && family.is_gaussian_identity() {
+        log::info!(
+            "[{label}] exact n-free ψ-penalty re-key unavailable; skipping ψ-gram tensor \
+             attachment so value, gradient, and Hessian remain on the same exact streamed \
+             objective"
+        );
+    }
+    Ok(PreparedExactJointSpatialRoute {
+        ctx,
+        analytic_outer_hessian_available,
+        suppress_outer_hessian_for_nfree,
+        psi_rank_stable_floor,
+        psi_rank_stable_ceiling,
+    })
 }
 
 /// Apply a length scale to a single `SmoothTermSpec` (independent of any
@@ -8797,6 +8937,153 @@ pub fn fit_term_collectionwith_spatial_length_scale_optimization(
     // Any eligible spatial smooth participates in this outer solve. If an
     // eligible spatial basis does not expose derivative information, that is
     // now a hard error.
+    let (resolvedspec, best, spatial_terms, initial_score) = match spatial_kappa_incumbent(
+        data,
+        y.view(),
+        weights.view(),
+        offset.view(),
+        spec,
+        &family,
+        options,
+        kappa_options,
+    )? {
+        SpatialKappaIncumbent::Final(fitted) => return Ok(fitted),
+        SpatialKappaIncumbent::Joint {
+            resolvedspec,
+            best,
+            spatial_terms,
+            initial_score,
+        } => (resolvedspec, best, spatial_terms, initial_score),
+    };
+    let exact_joint = match try_exact_joint_spatial_length_scale_optimization(
+        data,
+        y.view(),
+        weights.view(),
+        offset.view(),
+        &resolvedspec,
+        &best,
+        family.clone(),
+        options,
+        kappa_options,
+        &spatial_terms,
+    )? {
+        JointSpatialKappaOutcome::Optimized(optimized) => *optimized,
+        JointSpatialKappaOutcome::DeclinedKeepIncumbent {
+            baseline_score,
+            optimized_score,
+        } => {
+            // The route ran, graded its own candidate against the shipped
+            // score and declined it. Shipping the incumbent is what the
+            // decline MEANS -- its own log line promises exactly that -- so
+            // the fit continues at the incumbent κ, which is the same thing
+            // that happens when there is no eligible spatial term at all
+            // (the branch above). It is not an unavailability, and turning it
+            // into one killed fits the route had just decided were fine
+            // (#2748).
+            log::info!(
+                "[spatial-kappa] joint kappa optimization DECLINED its own candidate                  (incumbent={baseline_score:.12e}, candidate={optimized_score:.12e},                  regression={:.3e}); shipping the incumbent scalar-route fit at the                  incumbent κ, which is what the decline means. Not an unavailability.",
+                optimized_score - baseline_score,
+            );
+            let fitted = fit_term_collection_forspecwith_heuristic_lambdas(
+                data,
+                y.view(),
+                weights.view(),
+                offset.view(),
+                &resolvedspec,
+                best.fit.lambdas.as_slice(),
+                family,
+                options,
+            )?;
+            return Ok(FittedTermCollectionWithSpec {
+                fit: fitted.fit,
+                design: fitted.design,
+                resolvedspec,
+                kappa_timing: None,
+            });
+        }
+        JointSpatialKappaOutcome::Unavailable => {
+            return Err(EstimationError::RemlOptimizationFailed(
+                "spatial kappa optimization is unavailable for one or more eligible spatial                  terms"
+                    .to_string(),
+            ));
+        }
+    };
+    let exact_joint = require_available_spatial_optimization_result(Ok(Some(exact_joint)))?;
+    let exact_score = fit_score(&exact_joint.fit);
+
+    // Keep whichever of the two SCORED fits is better (#2748). κ optimization
+    // is a refinement of a fit that already exists, so "the refinement did not
+    // improve on the incumbent" is an argument for shipping the incumbent, not
+    // for destroying it — which is what this site did, on a bar of
+    // `max(1e-6, |score|·1e-8)`, until `geo_disease_eas_matern_k6` lost all
+    // four of its non-flexible benchmark lanes to a `1.267594e3 → 1.267595e3`
+    // regression. It is also exactly the conclusion the sibling
+    // `DeclinedKeepIncumbent` arm above reaches when the joint route grades its
+    // own candidate one level in; two graders of one comparison must not reach
+    // opposite responses.
+    //
+    // An `argmin` over two measured numbers needs no tolerance and admits no
+    // drift argument: it cannot ship something worse than what it was handed.
+    // A tie goes to the candidate, because the refinement is what was asked
+    // for and a tied score means the two fits are equally supported.
+    if exact_score.is_finite() && exact_score <= initial_score {
+        log_spatial_aniso_scales(&exact_joint.resolvedspec);
+        return Ok(exact_joint);
+    }
+    log::info!(
+        "[spatial-kappa] the optimized-κ fit scores {exact_score:.12e} against the incumbent's \
+         {initial_score:.12e} (regression {:.3e}); shipping the INCUMBENT, which is the better \
+         of the two fits this call has in hand. A refinement that does not improve on the fit \
+         it refines is not a reason to have no fit (#2748).",
+        exact_score - initial_score,
+    );
+    let fitted = fit_term_collection_forspecwith_heuristic_lambdas(
+        data,
+        y.view(),
+        weights.view(),
+        offset.view(),
+        &resolvedspec,
+        best.fit.lambdas.as_slice(),
+        family,
+        options,
+    )?;
+    Ok(FittedTermCollectionWithSpec {
+        fit: fitted.fit,
+        design: fitted.design,
+        resolvedspec,
+        kappa_timing: None,
+    })
+}
+
+/// What the spatial length-scale pipeline hands the joint κ route: a fit that
+/// needs no joint route, or the scalar-ρ incumbent the route refines.
+enum SpatialKappaIncumbent {
+    /// κ optimization is disabled, or no spatial coordinate is left to optimize.
+    Final(FittedTermCollectionWithSpec),
+    /// The frozen spec, its scalar-ρ fit, the spatial terms the joint route
+    /// enrolls, and that fit's score.
+    Joint {
+        resolvedspec: TermCollectionSpec,
+        best: FittedTermCollection,
+        spatial_terms: Vec<usize>,
+        initial_score: f64,
+    },
+}
+
+/// The spatial length-scale pipeline up to the joint κ route: the length-scale
+/// projection, the anisotropy and curvature seeds, the scalar-ρ baseline fit,
+/// the freeze and the Matérn range basin. The gam#2895 gradient gate starts the
+/// route from here as well, so it grades the route at production's own θ0.
+fn spatial_kappa_incumbent(
+    data: ArrayView2<'_, f64>,
+    y: ArrayView1<'_, f64>,
+    weights: ArrayView1<'_, f64>,
+    offset: ArrayView1<'_, f64>,
+    spec: &TermCollectionSpec,
+    family: &LikelihoodSpec,
+    options: &FitOptions,
+    kappa_options: &SpatialLengthScaleOptimizationOptions,
+) -> Result<SpatialKappaIncumbent, EstimationError> {
     let mut resolvedspec = spec.clone();
     let n = data.nrows();
     if !(y.len() == n && weights.len() == n && offset.len() == n) {
@@ -8825,16 +9112,16 @@ pub fn fit_term_collectionwith_spatial_length_scale_optimization(
             weights.view(),
             offset.view(),
             &resolvedspec,
-            family,
+            family.clone(),
             options,
         )?;
         let resolvedspec = freeze_term_collection_from_design(&resolvedspec, &out.design)?;
-        return Ok(FittedTermCollectionWithSpec {
+        return Ok(SpatialKappaIncumbent::Final(FittedTermCollectionWithSpec {
             fit: out.fit,
             design: out.design,
             resolvedspec,
             kappa_timing: None,
-        });
+        }));
     }
     if kappa_options.max_outer_iter == 0 {
         crate::bail_invalid_estim!("spatial kappa optimization requires max_outer_iter >= 1");
@@ -9052,15 +9339,15 @@ pub fn fit_term_collectionwith_spatial_length_scale_optimization(
             offset.view(),
             &resolvedspec,
             best.fit.lambdas.as_slice(),
-            family,
+            family.clone(),
             options,
         )?;
-        return Ok(FittedTermCollectionWithSpec {
+        return Ok(SpatialKappaIncumbent::Final(FittedTermCollectionWithSpec {
             fit: fitted.fit,
             design: fitted.design,
             resolvedspec,
             kappa_timing: None,
-        });
+        }));
     }
     let initial_score = fit_score(&best.fit);
     if !initial_score.is_finite() {
@@ -9068,103 +9355,11 @@ pub fn fit_term_collectionwith_spatial_length_scale_optimization(
             "spatial kappa optimization received a non-finite initial profiled score"
         );
     }
-    let exact_joint = match try_exact_joint_spatial_length_scale_optimization(
-        data,
-        y.view(),
-        weights.view(),
-        offset.view(),
-        &resolvedspec,
-        &best,
-        family.clone(),
-        options,
-        kappa_options,
-        &spatial_terms,
-    )? {
-        JointSpatialKappaOutcome::Optimized(optimized) => *optimized,
-        JointSpatialKappaOutcome::DeclinedKeepIncumbent {
-            baseline_score,
-            optimized_score,
-        } => {
-            // The route ran, graded its own candidate against the shipped
-            // score and declined it. Shipping the incumbent is what the
-            // decline MEANS -- its own log line promises exactly that -- so
-            // the fit continues at the incumbent κ, which is the same thing
-            // that happens when there is no eligible spatial term at all
-            // (the branch above). It is not an unavailability, and turning it
-            // into one killed fits the route had just decided were fine
-            // (#2748).
-            log::info!(
-                "[spatial-kappa] joint kappa optimization DECLINED its own candidate                  (incumbent={baseline_score:.12e}, candidate={optimized_score:.12e},                  regression={:.3e}); shipping the incumbent scalar-route fit at the                  incumbent κ, which is what the decline means. Not an unavailability.",
-                optimized_score - baseline_score,
-            );
-            let fitted = fit_term_collection_forspecwith_heuristic_lambdas(
-                data,
-                y.view(),
-                weights.view(),
-                offset.view(),
-                &resolvedspec,
-                best.fit.lambdas.as_slice(),
-                family,
-                options,
-            )?;
-            return Ok(FittedTermCollectionWithSpec {
-                fit: fitted.fit,
-                design: fitted.design,
-                resolvedspec,
-                kappa_timing: None,
-            });
-        }
-        JointSpatialKappaOutcome::Unavailable => {
-            return Err(EstimationError::RemlOptimizationFailed(
-                "spatial kappa optimization is unavailable for one or more eligible spatial                  terms"
-                    .to_string(),
-            ));
-        }
-    };
-    let exact_joint = require_available_spatial_optimization_result(Ok(Some(exact_joint)))?;
-    let exact_score = fit_score(&exact_joint.fit);
-
-    // Keep whichever of the two SCORED fits is better (#2748). κ optimization
-    // is a refinement of a fit that already exists, so "the refinement did not
-    // improve on the incumbent" is an argument for shipping the incumbent, not
-    // for destroying it — which is what this site did, on a bar of
-    // `max(1e-6, |score|·1e-8)`, until `geo_disease_eas_matern_k6` lost all
-    // four of its non-flexible benchmark lanes to a `1.267594e3 → 1.267595e3`
-    // regression. It is also exactly the conclusion the sibling
-    // `DeclinedKeepIncumbent` arm above reaches when the joint route grades its
-    // own candidate one level in; two graders of one comparison must not reach
-    // opposite responses.
-    //
-    // An `argmin` over two measured numbers needs no tolerance and admits no
-    // drift argument: it cannot ship something worse than what it was handed.
-    // A tie goes to the candidate, because the refinement is what was asked
-    // for and a tied score means the two fits are equally supported.
-    if exact_score.is_finite() && exact_score <= initial_score {
-        log_spatial_aniso_scales(&exact_joint.resolvedspec);
-        return Ok(exact_joint);
-    }
-    log::info!(
-        "[spatial-kappa] the optimized-κ fit scores {exact_score:.12e} against the incumbent's \
-         {initial_score:.12e} (regression {:.3e}); shipping the INCUMBENT, which is the better \
-         of the two fits this call has in hand. A refinement that does not improve on the fit \
-         it refines is not a reason to have no fit (#2748).",
-        exact_score - initial_score,
-    );
-    let fitted = fit_term_collection_forspecwith_heuristic_lambdas(
-        data,
-        y.view(),
-        weights.view(),
-        offset.view(),
-        &resolvedspec,
-        best.fit.lambdas.as_slice(),
-        family,
-        options,
-    )?;
-    Ok(FittedTermCollectionWithSpec {
-        fit: fitted.fit,
-        design: fitted.design,
+    Ok(SpatialKappaIncumbent::Joint {
         resolvedspec,
-        kappa_timing: None,
+        best,
+        spatial_terms,
+        initial_score,
     })
 }
 
