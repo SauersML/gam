@@ -1,10 +1,10 @@
 {
-  "generated_from": "d1b00c6b21da3844f0de2fea42c670390a60a122",
+  "generated_from": "315c5fa8990d269aa22e5a28029f6a5f34bd3206",
   "units": {
     "crates/gam-cli": 27,
     "crates/gam-config": 18,
     "crates/gam-custom-family": 289,
-    "crates/gam-data": 48,
+    "crates/gam-data": 47,
     "crates/gam-event-history": 121,
     "crates/gam-geometry": 272,
     "crates/gam-gpu": 76,
@@ -24,7 +24,7 @@
     "crates/gam-sae": 1390,
     "crates/gam-solve": 1762,
     "crates/gam-spec": 77,
-    "crates/gam-terms": 703,
+    "crates/gam-terms": 707,
     "crates/gam-test-support": 23,
     "src": 1,
     "tests/arrow_gpu": 29,

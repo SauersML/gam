@@ -154,5 +154,15 @@
     "unit_test_decreases": {
       "crates/gam-sae": 1
     }
+  },
+  {
+    "base": "b66b773539570a06e7c238eafe15a107e66e06cf",
+    "reason": "User directive 2026-09-11: delete source items only tests use, and code nothing uses. gam-model-api default_coefficient_gradient_cost was named only by its definition and prose; gam-data infer_and_encode_column_major had no production caller (gam-pyffi included).",
+    "evidence": "Re-confirmed at the tip with git grep -nw over crates src tests examples bench benches. Removed with the one gam-data unit test that only exercised it, the typed-frame parity step of tests/misc/misc/owed_cli_categorical_roles.rs and that file's now-unused column_values helper. Gates test_census, source_removal_guard and public_api_census pass base..head; MSI verification at the pushed sha follows.",
+    "test_count_decrease": 1,
+    "removed_pins": {},
+    "unit_test_decreases": {
+      "crates/gam-data": 1
+    }
   }
 ]

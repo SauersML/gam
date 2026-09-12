@@ -407,8 +407,9 @@ pub trait CustomFamily {
     /// genuinely has no analytic outer Hessian and the planner must use a
     /// first-order optimizer.
     ///
-    /// The default returns `coefficient_hessian_cost / 2` (see
-    /// `default_coefficient_gradient_cost`). Families whose gradient
+    /// The default returns `coefficient_hessian_cost / 2`: the first-order
+    /// path runs the same inner solve but skips the pairwise Hessian assembly
+    /// and the inner derivative solves. Families whose gradient
     /// assembly differs structurally should override; in particular,
     /// joint-coupled families that override `coefficient_hessian_cost` to
     /// `joint_coupled_coefficient_hessian_cost(n, specs)` automatically

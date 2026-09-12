@@ -9,8 +9,7 @@
 //! `gamfit.fit` (the in-process Python path) generalized strictly better than
 //! the `gam` CLI binary on identical data/model across every seed. Root cause:
 //! a typed Python frame stamps a categorical-dtype column with
-//! `CATEGORICAL_CELL_SENTINEL`, so the column-major inferer
-//! (`infer_and_encode_column_major`) forces it to a factor even when its labels
+//! `CATEGORICAL_CELL_SENTINEL`, which forces it to a factor even when its labels
 //! parse as numbers ("0","1","2"). An untyped CSV cannot carry that sentinel,
 //! so the delimited inferer demoted a numeric-coded grouping column to a single
 //! `Continuous` ramp — a strictly lower-capacity design than the factor the
@@ -21,18 +20,14 @@
 //! `load_dataset_projected_with_categorical_roles`. This test asserts:
 //!
 //! 1. With `region` in the categorical-role set, the CSV loader encodes it as a
-//!    `Categorical` factor with sorted numeric-string levels — byte-identical
-//!    kind/levels/codes to the typed-frame (Python) sentinel path.
+//!    `Categorical` factor with sorted numeric-string levels.
 //! 2. The continuous covariate `age` (an integer column NOT in any categorical
 //!    role) stays `Continuous` — the critical safety property: `s(age)` is not
 //!    wrongly factorized.
 //! 3. The default value-based loader (empty role set) still classifies a
 //!    numeric `region` as `Continuous`, so the fix is opt-in by role.
 
-use gam::inference::data::{
-    CATEGORICAL_CELL_SENTINEL, infer_and_encode_column_major, load_dataset_projected,
-    load_dataset_projected_with_categorical_roles,
-};
+use gam::inference::data::{load_dataset_projected, load_dataset_projected_with_categorical_roles};
 use gam::inference::model::ColumnKindTag;
 use std::collections::HashSet;
 use std::io::Write;
@@ -62,15 +57,6 @@ fn schema_column<'a>(
         .iter()
         .find(|c| c.name == name)
         .unwrap_or_else(|| panic!("column '{name}' missing from schema"))
-}
-
-fn column_values(ds: &gam::inference::data::EncodedDataset, name: &str) -> Vec<f64> {
-    let idx = ds
-        .headers
-        .iter()
-        .position(|h| h == name)
-        .unwrap_or_else(|| panic!("column '{name}' missing from headers"));
-    ds.values.column(idx).to_vec()
 }
 
 #[test]
@@ -117,32 +103,7 @@ fn cli_numeric_coded_group_column_forced_to_factor_matches_python_and_keeps_cont
         "an integer covariate NOT in a categorical role must stay continuous (s(age) must not be factorized)"
     );
 
-    // ---- (2) Python typed-frame parity: the column-major inferer with the
-    // categorical sentinel must produce the SAME kind, levels, and codes.
-    let region_cells_raw = ["2", "0", "1", "3", "2", "0"];
-    let sentinel_cells: Vec<String> = region_cells_raw
-        .iter()
-        .map(|c| format!("{CATEGORICAL_CELL_SENTINEL}{c}"))
-        .collect();
-    let sentinel_refs: Vec<&str> = sentinel_cells.iter().map(String::as_str).collect();
-    let (py_schema, py_codes) =
-        infer_and_encode_column_major("region", &sentinel_refs, 2).expect("typed-frame encode");
-    assert_eq!(
-        py_schema.kind,
-        ColumnKindTag::Categorical,
-        "sanity: typed-frame sentinel path encodes region as a factor"
-    );
-    assert_eq!(
-        region.levels, py_schema.levels,
-        "CLI forced-categorical levels must match the Python typed-frame levels"
-    );
-    assert_eq!(
-        column_values(&forced, "region"),
-        py_codes,
-        "CLI forced-categorical level codes must match the Python typed-frame codes exactly"
-    );
-
-    // ---- (3) Default value-based load (no roles): region is Continuous, which
+    // ---- (2) Default value-based load (no roles): region is Continuous, which
     // is exactly the pre-fix CLI behavior — proving the fix is opt-in by role.
     let inferred = load_dataset_projected(&path, &requested).expect("default CSV load");
     assert_eq!(
