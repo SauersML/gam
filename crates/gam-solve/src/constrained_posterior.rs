@@ -6543,7 +6543,7 @@ mod projection_law_2446_tests {
     /// do not carry.
     ///
     /// The reference folds the tangent into the functional analytically-in-form
-    /// (`g(x) = E_t[f(x + s·t)]`, a 1-D Gaussian Simpson) and then integrates
+    /// (`g(x) = E_t[f(x + s·t)]`, a 1-D Gauss-Hermite rule) and then integrates
     /// `g` against the exact truncated density by the SAME tensor Simpson rule
     /// the #2446 test uses. Neither half calls the cubature under test.
     ///
@@ -6673,16 +6673,25 @@ mod projection_law_2446_tests {
             .sum::<f64>();
 
         // (c) accuracy against a reference built from the density.
+        //
+        // The tangent fold `g(x) = E_t[f(x + s·t)]` is a Gaussian expectation of
+        // a logistic, which is analytic in the strip `|Im t| < π/s`, so a
+        // Gauss-Hermite rule converges geometrically and 64 nodes leave the fold
+        // at roundoff. The tensor Simpson below evaluates the fold at 2001² points,
+        // so a 4001-point Simpson fold made the reference 1.6e10 integrand
+        // evaluations: 412s for this test in a 12-thread nextest run.
+        let hermite =
+            gam_math::quadrature::gauss_hermite_rule(64).expect("64-node Gauss-Hermite rule");
         let convolved = |x: f64| -> f64 {
-            simpson(
-                x - 12.0 * tangent_sd,
-                x + 12.0 * tangent_sd,
-                4001,
-                |value| {
-                    let z = (value - x) / tangent_sd;
-                    (-0.5 * z * z).exp() * integrand(value)
-                },
-            ) / (tangent_sd * (2.0 * std::f64::consts::PI).sqrt())
+            hermite
+                .nodes
+                .iter()
+                .zip(&hermite.weights)
+                .map(|(&node, &weight)| {
+                    weight * integrand(x + tangent_sd * std::f64::consts::SQRT_2 * node)
+                })
+                .sum::<f64>()
+                / std::f64::consts::PI.sqrt()
         };
         let reference = exact_orthant_expectation_of(&center, &ambient, &contrast, convolved);
 
