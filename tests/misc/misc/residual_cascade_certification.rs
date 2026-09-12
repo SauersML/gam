@@ -694,3 +694,77 @@ fn cascade_state_rejects_corruption() {
     );
 }
 
+/// #2503/#2513 — past the certified-spectrum budget, the diagnostic criterion
+/// must reach the hard λ values without solving `A = X'WX + λD`, while automatic
+/// REML must still refuse until its independent stochastic determinant has an
+/// exact-real value/derivative enclosure.
+///
+/// The original #2503 defect was a pair of PCG solves at every λ. At the lower
+/// domain endpoint the multilevel Wendland frame is redundant across scales and
+/// the system is numerically singular. The β-seeded quadrature removes those
+/// solves from point evaluation. That is a useful capability, but it is not the
+/// #2513 proof: a converged residual quadrature does not enclose the separate
+/// fixed-probe SLQ log-determinant, so it cannot certify score signs, stationary
+/// roots, or global candidate ordering.
+///
+/// This gate keeps those two claims separate: every representative point of the
+/// declared domain remains evaluable, then the same design returns the typed
+/// proof refusal rather than promoting point accuracy into an automatic fit.
+#[test]
+fn past_cap_point_criterion_is_solve_free_but_auto_reml_needs_exact_proof_2503_2513() {
+    let n = 800;
+    let (axes, y, w) = sample(2, n, 0.1, 0x1032_0043);
+    let xs = axis_refs(&axes);
+    // Level 8 is where this shape's `4^level` column growth crosses
+    // `CERTIFIED_SPECTRUM_MAX` — past the width whose Schur reduction fits its
+    // memory budget, so there is no λ-independent spectrum to enclose the score
+    // with. The level this gate needs has moved twice, and both moves were a
+    // budget separating from something it had been conflated with:
+    //
+    //   * level 6 (m = 2134) sat past the gate while the gate WAS the
+    //     `DENSE_GRAM_MAX = 1536` Gram cache; #2546 separated the cache budget
+    //     from the proof budget and level 6 certified;
+    //   * level 7 (m = 7390) sat past the 2896-column proof budget while that
+    //     budget was spent holding an eigenvector matrix and a full `m × m`
+    //     Gram the criterion never reads; #2758 took the residency to one packed
+    //     triangle, the derived cap went to 10362, and level 7 certifies.
+    //
+    // At level 7 the design now refuses for a DIFFERENT and equally typed
+    // reason — 7387 penalized modes against 797 identifiable directions, so the
+    // profiled residual interpolates and the score is flat by rank deficiency —
+    // which is the identifiability frontier's subject, not this one's. The width
+    // is not asserted against a literal here: the refusal below carries the
+    // budget it was compared against, and that is the honest comparison.
+    let design = ResidualCascadeDesign::build(&xs, &y, &w, &[1.0, 1.0], 2.0, 8).expect("build");
+
+    let (lo, hi) = design.log_lambda_domain().expect("spectrum-derived domain");
+    assert!(
+        lo < -25.0,
+        "premise: the domain must reach the ill-conditioned end this issue is about (lo = {lo})"
+    );
+    for log_lambda in [lo, lo + 1e-9, 0.5 * (lo + hi), hi] {
+        let value = design
+            .criterion(log_lambda)
+            .unwrap_or_else(|error| panic!("criterion at log lambda {log_lambda}: {error}"));
+        assert!(
+            value.is_finite(),
+            "non-finite criterion at log lambda {log_lambda}"
+        );
+    }
+
+    let refusal = match design.fit_reml() {
+        Err(error) => error,
+        Ok(_) => panic!("point-evaluable SLQ must not escape as an exact-real REML fit"),
+    };
+    assert!(
+        matches!(
+            refusal,
+            ResidualCascadeError::RemlScoreProofUnavailable {
+                columns,
+                certified_spectrum_max,
+            } if columns == design.num_coeffs() && columns > certified_spectrum_max
+        ),
+        "the wrong refusal for a design past the certified spectrum budget: {refusal}"
+    );
+}
+
