@@ -973,5 +973,14 @@
     },
     "reason": "Land the four edited files c4c012c93 dropped, completing the dead-code fix-forward (aab60e36ac)",
     "evidence": "Backfilled under #2829: aab60e36ac removed these 1 public function declarations without a docs/public-api-census-changes.json acknowledgement, and no entry was keyed to its parent 0b6aac49b0. The removed map is scripts/public_api_census.py's own public_functions predicate over the .rs files 0b6aac49b0..aab60e36ac changed; files the commit did not change count equally on both sides, so this is the census difference. Measured on MSI: /scratch.global/sauer354/pool/api2829/backfill.measured.json. The same method reproduces the landed maps for 368528959 (4) and b66b773539 (11) exactly (/scratch.global/sauer354/pool/api2829/backfill.control.json)."
+  },
+  {
+    "base": "5fe9454ab2aa7b600c0167a9aac5ec62eb83a48f",
+    "removed": {
+      "crates/gam-terms/src/basis/closed_form_penalty.rs::duchon_small_chi_riesz_series_value": 1,
+      "crates/gam-terms/src/basis/closed_form_penalty.rs::isotropic_duchon_penalty": 1
+    },
+    "reason": "user directive: delete all useless slop",
+    "evidence": "scripts/public_api_census.py on MSI over 8bd5765b0 -> the M5 lane commit (job 442200, /scratch.global/sauer354/sw5-logs/stageM5.442200.pubapi.txt) measured exactly this removed map. The same tree compiles with every workspace target."
   }
 ]

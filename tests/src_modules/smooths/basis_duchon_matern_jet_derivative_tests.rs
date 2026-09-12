@@ -1181,9 +1181,97 @@ fn overlap_vs_no_overlap_diag_differs_by_2q_sum() {
 // Closed-form Riesz / Matérn / hybrid Duchon kernel tests
 // ----------------------------------------------------------------------
 
-use super::closed_form_penalty::{
-    bessel_k, isotropic_duchon_penalty, matern_kernel_value, riesz_kernel_value,
-};
+use super::closed_form_penalty::{bessel_k, matern_kernel_value, riesz_kernel_value};
+
+// Hybrid isotropic Duchon evaluation, test-local: the partial-fraction and
+// finite-part Riesz oracle these kernel tests compare production against.
+fn duchon_small_chi_riesz_series_value(
+    d: usize,
+    a: usize,
+    b: usize,
+    kappa: f64,
+    r: f64,
+) -> f64 {
+    super::closed_form_penalty::duchon_small_chi_riesz_series_radial_derivatives(d, a, b, kappa, r, 0, 0)[0]
+}
+
+/// Hybrid isotropic Duchon penalty
+/// g_q^iso(R; m, s, κ) = F^{-1}{1/(ρ^{2(2m-q)} (κ² + ρ²)^{2s})}(R).
+///
+/// This returns the canonical constrained Duchon representative: polynomial
+/// nullspace components are quotiented out, and the small-κR chart evaluates
+/// the matching finite-part Riesz series directly. The ordinary
+/// partial-fraction Green's function and this representative differ by
+/// nullspace terms in low-dimensional singular regimes, but the constrained
+/// fit only sees this representative. Value, radial derivatives, and κ
+/// partials all use the same chart switch, so production never mixes a
+/// stable value formula with cancelled derivative formulas.
+///
+/// Edge cases:
+/// - s = 0: g_q^iso(R) = R_{2m-q}^d(R) (no Matérn factor).
+/// - κ = 0, s ≥ 1: g_q^iso(R) = R_{2m+2s-q}^d(R) (Riesz pure).
+/// - General: small-κR finite-part Riesz series or, outside that chart,
+///   partial-fraction decomposition with a = 2m - q, b = 2s.
+///
+/// Requires a := 2m - q ≥ 1.
+fn isotropic_duchon_penalty(q: usize, d: usize, m: usize, s: f64, kappa: f64, r: f64) -> f64 {
+    assert!(2 * m >= q + 1, "isotropic_duchon_penalty: need 2m - q ≥ 1");
+    assert!(
+        s.is_finite() && s >= 0.0,
+        "isotropic_duchon_penalty: s must be finite and ≥ 0, got {s}"
+    );
+    let a = 2 * m - q;
+
+    if s == 0.0 {
+        return riesz_kernel_value(d, a as f64, r);
+    }
+    if kappa == 0.0 {
+        // Pure-Riesz scale-free: fractional `s` rides directly into
+        // the kernel via `j = a + 2s`. No partial-fraction expansion
+        // needed (that path is for the hybrid Matérn-blend regime
+        // below).
+        return riesz_kernel_value(d, a as f64 + 2.0 * s, r);
+    }
+
+    // Hybrid Matérn-blend (κ > 0) uses the partial-fraction
+    // expansion with integer `b = 2s`. Fractional `s` is not yet
+    // supported on this branch — its expansion uses integer
+    // binomials and powers of `κ²` that have no clean fractional
+    // generalisation. Reject up front rather than silently
+    // truncating.
+    assert!(
+        s.fract() == 0.0,
+        "isotropic_duchon_penalty: hybrid Matérn (κ > 0) requires integer s, got {s}"
+    );
+    let s_int = s as usize;
+    let b = 2 * s_int;
+    if super::closed_form_penalty::use_duchon_small_chi_riesz_series(kappa, r) {
+        return duchon_small_chi_riesz_series_value(d, a, b, kappa, r);
+    }
+
+    let kappa_sq = kappa * kappa;
+
+    // A_j = (-1)^{a-j} · C(a+b-j-1, a-j) · κ^{-2(a+b-j)}, j = 1..a
+    let mut sum = gam_linalg::utils::KahanSum::default();
+    for j in 1..=a {
+        let sign = if (a - j).is_multiple_of(2) { 1.0 } else { -1.0 };
+        let binom = gam_math::special::binomial_coefficient_f64(a + b - j - 1, a - j);
+        let coeff = sign * binom * kappa_sq.powi(-((a + b - j) as i32));
+        let term = coeff * riesz_kernel_value(d, j as f64, r);
+        sum.add(term);
+    }
+
+    // B_ℓ = (-1)^a · C(a+b-ℓ-1, b-ℓ) · κ^{-2(a+b-ℓ)}, ℓ = 1..b
+    let sign_a = if a.is_multiple_of(2) { 1.0 } else { -1.0 };
+    for ell in 1..=b {
+        let binom = gam_math::special::binomial_coefficient_f64(a + b - ell - 1, b - ell);
+        let coeff = sign_a * binom * kappa_sq.powi(-((a + b - ell) as i32));
+        let term = coeff * matern_kernel_value(d, ell, kappa, r);
+        sum.add(term);
+    }
+
+    sum.sum()
+}
 
 #[test]
 fn test_riesz_d3_j1() {
@@ -1504,7 +1592,6 @@ fn test_isotropic_hybrid_partial_fraction() {
 
 #[test]
 fn test_schoenberg_isotropic_agrees_with_partial_fraction() {
-    use super::closed_form_penalty::isotropic_duchon_penalty;
 
     // `isotropic_duchon_penalty` is the separately q-loaded
     // Riesz-Matérn partial-fraction representative. This test checks that
@@ -1886,9 +1973,7 @@ fn test_matern_satisfies_helmholtz() {
 
 #[test]
 fn test_isotropic_duchon_satisfies_partial_fraction_identity() {
-    use super::closed_form_penalty::{
-        isotropic_duchon_penalty, matern_kernel_value, riesz_kernel_value,
-    };
+    use super::closed_form_penalty::{matern_kernel_value, riesz_kernel_value};
     let d = 3usize;
     let m = 2usize;
     let s = 2usize;
@@ -1930,7 +2015,7 @@ fn test_isotropic_duchon_satisfies_partial_fraction_identity() {
 
 #[test]
 fn test_isotropic_duchon_kappa_to_zero_limit() {
-    use super::closed_form_penalty::{isotropic_duchon_penalty, riesz_kernel_value};
+    use super::closed_form_penalty::riesz_kernel_value;
     // For positive κ,
     //   ĝ_κ(ρ) = 1 / (ρ^{2a}(κ²+ρ²)^b),  a = 2m-q, b = 2s.
     // The pointwise κ→0 limit equals the pure Riesz representative only
@@ -1969,7 +2054,7 @@ fn test_isotropic_duchon_kappa_to_zero_limit() {
 
 #[test]
 fn test_isotropic_duchon_kappa_to_zero_ir_divergence_is_quotiented_by_finite_part() {
-    use super::closed_form_penalty::{isotropic_duchon_penalty, riesz_kernel_value};
+    use super::closed_form_penalty::riesz_kernel_value;
 
     // Same (m,s,q) as the convergent test but d=5. Now a=1,b=4 and
     // d-2a-2b = -5, so the ordinary low-frequency positive-κ Green's
@@ -2009,7 +2094,7 @@ fn test_isotropic_duchon_kappa_to_zero_ir_divergence_is_quotiented_by_finite_par
 #[test]
 fn test_small_kappa_finite_part_chart_is_shared_by_value_radial_and_kappa_partials() {
     use super::closed_form_penalty::{
-        isotropic_duchon_penalty, radial_derivatives_of_isotropic_duchon,
+        radial_derivatives_of_isotropic_duchon,
         radial_derivatives_of_isotropic_duchon_kappa_partial,
         radial_derivatives_of_isotropic_duchon_kappa_partial2,
     };
@@ -2138,7 +2223,7 @@ fn test_small_kappa_finite_part_chart_is_shared_by_value_radial_and_kappa_partia
 
 #[test]
 fn test_even_log_riesz_small_kappa_uses_full_taylor_series() {
-    use super::closed_form_penalty::{isotropic_duchon_penalty, riesz_kernel_value};
+    use super::closed_form_penalty::riesz_kernel_value;
 
     // Even-dimensional log-Riesz case: d/2 <= N = 2m - q + 2s.
     // This used to return only the leading R_N term under cancellation.
@@ -2298,7 +2383,6 @@ fn isotropic_radial_laplacian_power_from_q0(
 fn test_value_against_completely_independent_brute_force() {
     // (d=3, m=1, s=2, κ=1, q=1) — UV 12>5 ✓, IR 5>4 ✓, 2m-q=1 ✓.
     // f̂(ρ) = 1 / (ρ² (1+ρ²)^4) — both ends integrable in d=3 sin form.
-    use super::closed_form_penalty::isotropic_duchon_penalty;
     let q = 1usize;
     let d = 3usize;
     let m = 1usize;
@@ -2363,9 +2447,7 @@ fn test_radial_form_isotropic_limit_matches_radial_laplacian_chain() {
 
 #[test]
 fn test_radial_derivatives_match_finite_differences() {
-    use super::closed_form_penalty::{
-        isotropic_duchon_penalty, radial_derivatives_of_isotropic_duchon,
-    };
+    use super::closed_form_penalty::radial_derivatives_of_isotropic_duchon;
 
     // (d=3, m=2, s=1, κ=1.5) — 2m=4, plenty of derivatives.
     let d = 3usize;
@@ -2660,7 +2742,6 @@ fn test_radial_form_uniform_eta_uses_exact_isotropic_metric_identity() {
 
 #[test]
 fn test_letter_b_taylor_matches_partial_fraction_in_overlap() {
-    use super::closed_form_penalty::isotropic_duchon_penalty;
 
     let cases: &[(usize, usize, usize, usize, f64, f64)] = &[
         (3, 1, 2, 1, 0.5, 1.0),

@@ -1,5 +1,5 @@
 //! Criterion benchmarks for the closed-form anisotropic Duchon pair-block,
-//! its FD-derivative bundle, the isotropic kernel evaluation paths, and
+//! its FD-derivative bundle, the anisotropic radial kernel, and
 //! ClosedFormPenaltyOperator matvec.
 //!
 //! Targets the hot paths optimised by:
@@ -22,9 +22,7 @@
 //!   pair_block_bundle/single_pair_q2  baseline ~ 30-60 µs (FD path)
 //!                                     analytic target ~  5-12 µs
 //!
-//!   isotropic_duchon_penalty/partial_fraction_typical  ~200-500 ns / call
-//!   isotropic_duchon_penalty/small_r_regime            ~100-300 ns / call
-//!   isotropic_duchon_penalty/anisotropic_radial_d8_eta0 ~  1- 4 µs / call
+//!   anisotropic_duchon_penalty_radial/anisotropic_radial_d8_eta0 ~  1- 4 µs / call
 //!
 //!   operator_matvec/200    baseline ~  50-100 µs
 //!   operator_matvec/500    baseline ~ 300-600 µs
@@ -51,8 +49,7 @@ use gam::terms::basis::ClosedFormPenaltyOperator;
 use gam::terms::basis::{
     closed_form_anisotropic_pair_block,
     closed_form_penalty::{
-        anisotropic_duchon_penalty_radial, isotropic_duchon_penalty,
-        pair_block_radial_with_j_second_derivatives,
+        anisotropic_duchon_penalty_radial, pair_block_radial_with_j_second_derivatives,
     },
 };
 
@@ -137,40 +134,9 @@ fn bench_pair_block_bundle(c: &mut Criterion) {
     group.finish();
 }
 
-fn bench_isotropic_kernel(c: &mut Criterion) {
-    let mut group = c.benchmark_group("isotropic_duchon_penalty");
+fn bench_anisotropic_radial_kernel(c: &mut Criterion) {
+    let mut group = c.benchmark_group("anisotropic_duchon_penalty_radial");
     group.sample_size(50);
-
-    // Generic regime: typical R, partial-fraction expansion expected.
-    group.bench_function("partial_fraction_typical", |b| {
-        b.iter(|| {
-            let v = isotropic_duchon_penalty(
-                /* q = */ 2,
-                D_TYPICAL,
-                M_TYPICAL,
-                S_TYPICAL as f64,
-                KAPPA_TYPICAL,
-                /* r = */ 0.4,
-            );
-            black_box(v)
-        })
-    });
-
-    // Small-R / small-κ regime: exercises Taylor / ₁F₂ branch where it
-    // engages (decided internally by the function's regime heuristics).
-    group.bench_function("small_r_regime", |b| {
-        b.iter(|| {
-            let v = isotropic_duchon_penalty(
-                /* q = */ 2,
-                D_TYPICAL,
-                M_TYPICAL,
-                S_TYPICAL as f64,
-                /* kappa = */ 0.05,
-                /* r = */ 1e-4,
-            );
-            black_box(v)
-        })
-    });
 
     // Touches the SIMD `aniso_invariants_with_powers` loop with d=8 + the
     // radial-derivative chain (Riesz powi / Matérn powi paths).
@@ -348,7 +314,7 @@ criterion_group!(
     benches,
     bench_pair_block_assembly,
     bench_pair_block_bundle,
-    bench_isotropic_kernel,
+    bench_anisotropic_radial_kernel,
     bench_operator_matvec,
     bench_hessian_solve_dense_vs_implicit,
 );
