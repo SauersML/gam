@@ -1,7 +1,9 @@
 {
   "shard_outcome_schema": "benchmark-shard-outcome/v1",
-  "shard_outcomes_seen": 0,
-  "censored_scenarios": [],
+  "shard_outcomes_seen": 3,
+  "censored_scenarios": [
+    "icu_survival_los"
+  ],
   "errored_scenarios": [],
   "unreported_scenarios": [
     "bone_gamair",
@@ -83,10 +85,7 @@
     "geo_subpop16_tp_k24",
     "geo_subpop16_tp_k6",
     "haberman_5yr",
-    "heart_failure_survival",
     "horse_colic",
-    "icu_survival_death",
-    "icu_survival_los",
     "lidar_semipar",
     "medium",
     "papuan_oce4_duchon_k12",
@@ -195,9 +194,7 @@
     "geo_subpop16_tp_k24",
     "geo_subpop16_tp_k6",
     "haberman_5yr",
-    "heart_failure_survival",
     "horse_colic",
-    "icu_survival_death",
     "icu_survival_los",
     "lidar_semipar",
     "medium",
@@ -236,7 +233,7 @@
     "full_suite_required": true
   },
   "configured_scenario_count": 110,
-  "observed_scenario_count": 0,
+  "observed_scenario_count": 2,
   "missing_scenarios": [
     "bone_gamair",
     "cirrhosis_survival",
@@ -317,9 +314,7 @@
     "geo_subpop16_tp_k24",
     "geo_subpop16_tp_k6",
     "haberman_5yr",
-    "heart_failure_survival",
     "horse_colic",
-    "icu_survival_death",
     "icu_survival_los",
     "lidar_semipar",
     "medium",
