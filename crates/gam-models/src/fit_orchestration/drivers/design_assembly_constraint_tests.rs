@@ -22,7 +22,7 @@ mod design_assembly_constraint_tests {
     // and `MaternIdentifiability` already arrive via `super::*` (the drivers'
     // explicit `gam_terms::basis` import), so re-listing them here would collide
     // (E0252); every other name is pulled in explicitly.
-    use gam_terms::basis::{BSplineBasisSpec, BSplineBoundaryConditions, BSplineIdentifiability, BSplineKnotSpec, DuchonBasisSpec, DuchonNullspaceOrder, DuchonOperatorPenaltySpec, MaternBasisSpec, MaternNu, OneDimensionalBoundary, SpatialIdentifiability, SphericalSplineBasisSpec, ThinPlateBasisSpec, build_bspline_basis_1d};
+    use gam_terms::basis::{BSplineBasisSpec, BSplineBoundaryConditions, BSplineIdentifiability, BSplineKnotSpec, DuchonBasisSpec, DuchonNullspaceOrder, DuchonOperatorPenaltySpec, OperatorPenaltySpec, MaternBasisSpec, MaternNu, OneDimensionalBoundary, SpatialIdentifiability, SphericalSplineBasisSpec, ThinPlateBasisSpec, build_bspline_basis_1d};
     use gam_model_api::OuterEvalOrder;
     use ndarray::array;
     use rand::RngExt as _;
@@ -2737,7 +2737,20 @@ fn exact_spatial_joint_engine_aniso_iso_parity_1d() {
                     nullspace_order: DuchonNullspaceOrder::Linear,
                     identifiability: SpatialIdentifiability::default(),
                     aniso_log_scales: None,
-                    operator_penalties: DuchonOperatorPenaltySpec::all_active(),
+                    operator_penalties: DuchonOperatorPenaltySpec {
+                        mass: OperatorPenaltySpec::Active {
+                            initial_log_lambda: 0.0,
+                            prior: None,
+                        },
+                        tension: OperatorPenaltySpec::Active {
+                            initial_log_lambda: 0.0,
+                            prior: None,
+                        },
+                        stiffness: OperatorPenaltySpec::Active {
+                            initial_log_lambda: 0.0,
+                            prior: None,
+                        },
+                    },
                     boundary: OneDimensionalBoundary::Open,
                 },
                 input_scale: None,
@@ -2909,7 +2922,20 @@ fn psi_gram_tensor_lane_matches_streamed_reml_cost_and_gradient() {
                     nullspace_order: DuchonNullspaceOrder::Linear,
                     identifiability: SpatialIdentifiability::default(),
                     aniso_log_scales: None,
-                    operator_penalties: DuchonOperatorPenaltySpec::all_active(),
+                    operator_penalties: DuchonOperatorPenaltySpec {
+                        mass: OperatorPenaltySpec::Active {
+                            initial_log_lambda: 0.0,
+                            prior: None,
+                        },
+                        tension: OperatorPenaltySpec::Active {
+                            initial_log_lambda: 0.0,
+                            prior: None,
+                        },
+                        stiffness: OperatorPenaltySpec::Active {
+                            initial_log_lambda: 0.0,
+                            prior: None,
+                        },
+                    },
                     boundary: OneDimensionalBoundary::Open,
                 },
                 input_scale: None,
@@ -3262,7 +3288,20 @@ fn psi_gram_tensor_e2e_kappa_optimum_matches_streamed() {
                     nullspace_order: DuchonNullspaceOrder::Linear,
                     identifiability: SpatialIdentifiability::default(),
                     aniso_log_scales: None,
-                    operator_penalties: DuchonOperatorPenaltySpec::all_active(),
+                    operator_penalties: DuchonOperatorPenaltySpec {
+                        mass: OperatorPenaltySpec::Active {
+                            initial_log_lambda: 0.0,
+                            prior: None,
+                        },
+                        tension: OperatorPenaltySpec::Active {
+                            initial_log_lambda: 0.0,
+                            prior: None,
+                        },
+                        stiffness: OperatorPenaltySpec::Active {
+                            initial_log_lambda: 0.0,
+                            prior: None,
+                        },
+                    },
                     boundary: OneDimensionalBoundary::Open,
                 },
                 // PRODUCTION geometry: `None` lets the 1-D axis auto-standardize

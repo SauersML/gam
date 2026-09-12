@@ -30,7 +30,7 @@
 use gam::{
     FitRequest, FitResult, StandardFitRequest,
     basis::{
-        CenterStrategy, DuchonBasisSpec, DuchonNullspaceOrder, DuchonOperatorPenaltySpec,
+        CenterStrategy, DuchonBasisSpec, DuchonNullspaceOrder, DuchonOperatorPenaltySpec, OperatorPenaltySpec,
         OneDimensionalBoundary, SpatialIdentifiability,
     },
     estimate::FitOptions,
@@ -102,7 +102,20 @@ fn spec_1d(aniso: bool) -> TermCollectionSpec {
                     // case); Some(_) routes the per-axis (anisotropic) optimizer
                     // even for a single axis — the discriminator under test.
                     aniso_log_scales: if aniso { Some(vec![0.0]) } else { None },
-                    operator_penalties: DuchonOperatorPenaltySpec::all_active(),
+                    operator_penalties: DuchonOperatorPenaltySpec {
+                        mass: OperatorPenaltySpec::Active {
+                            initial_log_lambda: 0.0,
+                            prior: None,
+                        },
+                        tension: OperatorPenaltySpec::Active {
+                            initial_log_lambda: 0.0,
+                            prior: None,
+                        },
+                        stiffness: OperatorPenaltySpec::Active {
+                            initial_log_lambda: 0.0,
+                            prior: None,
+                        },
+                    },
                     boundary: OneDimensionalBoundary::Open,
                 },
                 // PRODUCTION geometry: None lets the 1-D axis auto-standardize

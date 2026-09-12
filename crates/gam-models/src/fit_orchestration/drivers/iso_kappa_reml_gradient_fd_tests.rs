@@ -33,7 +33,7 @@ mod iso_kappa_reml_gradient_fd_tests {
     use super::*;
     use super::test_support::SingleBlockExactJointDesignCacheTestExt;
     use gam_terms::basis::{
-        DuchonBasisSpec, DuchonNullspaceOrder, DuchonOperatorPenaltySpec, MaternBasisSpec, MaternNu,
+        DuchonBasisSpec, DuchonNullspaceOrder, DuchonOperatorPenaltySpec, OperatorPenaltySpec, MaternBasisSpec, MaternNu,
         OneDimensionalBoundary, SpatialIdentifiability,
     };
     use gam_test_support::FdDerivativeJudgement;
@@ -1416,7 +1416,20 @@ fn build_duchon_probit_setup() -> DuchonProbitSetup {
                     nullspace_order: DuchonNullspaceOrder::Linear,
                     identifiability: SpatialIdentifiability::default(),
                     aniso_log_scales: None,
-                    operator_penalties: DuchonOperatorPenaltySpec::all_active(),
+                    operator_penalties: DuchonOperatorPenaltySpec {
+                        mass: OperatorPenaltySpec::Active {
+                            initial_log_lambda: 0.0,
+                            prior: None,
+                        },
+                        tension: OperatorPenaltySpec::Active {
+                            initial_log_lambda: 0.0,
+                            prior: None,
+                        },
+                        stiffness: OperatorPenaltySpec::Active {
+                            initial_log_lambda: 0.0,
+                            prior: None,
+                        },
+                    },
                     boundary: OneDimensionalBoundary::Open,
                 },
                 input_scale: None,

@@ -17,7 +17,7 @@
 //! Report-only.
 
 use gam::basis::{
-    CenterStrategy, DuchonBasisSpec, DuchonNullspaceOrder, DuchonOperatorPenaltySpec,
+    CenterStrategy, DuchonBasisSpec, DuchonNullspaceOrder, DuchonOperatorPenaltySpec, OperatorPenaltySpec,
     OneDimensionalBoundary, SpatialIdentifiability,
 };
 use gam::smooth::{ShapeConstraint, SmoothBasisSpec, SmoothTermSpec, TermCollectionSpec};
@@ -49,7 +49,20 @@ fn term_spec(length_scale: f64) -> SmoothTermSpec {
                 nullspace_order: DuchonNullspaceOrder::Linear,
                 identifiability: SpatialIdentifiability::default(),
                 aniso_log_scales: None,
-                operator_penalties: DuchonOperatorPenaltySpec::all_active(),
+                operator_penalties: DuchonOperatorPenaltySpec {
+                    mass: OperatorPenaltySpec::Active {
+                        initial_log_lambda: 0.0,
+                        prior: None,
+                    },
+                    tension: OperatorPenaltySpec::Active {
+                        initial_log_lambda: 0.0,
+                        prior: None,
+                    },
+                    stiffness: OperatorPenaltySpec::Active {
+                        initial_log_lambda: 0.0,
+                        prior: None,
+                    },
+                },
                 boundary: OneDimensionalBoundary::Open,
             },
             input_scale: None,

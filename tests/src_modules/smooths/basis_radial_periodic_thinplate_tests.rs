@@ -4095,8 +4095,7 @@ fn test_pure_duchon_candidate_factory_falls_back_to_collocation_in_divergent_reg
     // to be active. `DuchonOperatorPenaltySpec::default()` deliberately
     // disables stiffness (`Primary` is the exact, superior curvature), so
     // this factory-level test of the divergent-regime fallback drives the
-    // factory with `all_active()` — the all-three-dials spec used by the
-    // Matérn collocation overlay.
+    // factory with all three dials active.
     use ndarray::Array2 as A2;
     let k = 16usize;
     let d = 3usize;
@@ -4133,7 +4132,20 @@ fn test_pure_duchon_candidate_factory_falls_back_to_collocation_in_divergent_reg
         &d2,
         // Synthetic un-amplified blocks: identity chart (gam#979).
         1.0,
-        &DuchonOperatorPenaltySpec::all_active(),
+        &DuchonOperatorPenaltySpec {
+            mass: OperatorPenaltySpec::Active {
+                initial_log_lambda: 0.0,
+                prior: None,
+            },
+            tension: OperatorPenaltySpec::Active {
+                initial_log_lambda: 0.0,
+                prior: None,
+            },
+            stiffness: OperatorPenaltySpec::Active {
+                initial_log_lambda: 0.0,
+                prior: None,
+            },
+        },
         p_order,
         s_order as f64,
         None,

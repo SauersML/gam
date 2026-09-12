@@ -44,7 +44,7 @@
 use gam::{
     FitRequest, FitResult, StandardFitRequest,
     basis::{
-        CenterStrategy, DuchonBasisSpec, DuchonNullspaceOrder, DuchonOperatorPenaltySpec,
+        CenterStrategy, DuchonBasisSpec, DuchonNullspaceOrder, DuchonOperatorPenaltySpec, OperatorPenaltySpec,
         OneDimensionalBoundary, SpatialIdentifiability,
     },
     estimate::FitOptions,
@@ -110,7 +110,20 @@ fn spec_1d(length_scale: f64) -> TermCollectionSpec {
                     nullspace_order: DuchonNullspaceOrder::Linear,
                     identifiability: SpatialIdentifiability::default(),
                     aniso_log_scales: None,
-                    operator_penalties: DuchonOperatorPenaltySpec::all_active(),
+                    operator_penalties: DuchonOperatorPenaltySpec {
+                        mass: OperatorPenaltySpec::Active {
+                            initial_log_lambda: 0.0,
+                            prior: None,
+                        },
+                        tension: OperatorPenaltySpec::Active {
+                            initial_log_lambda: 0.0,
+                            prior: None,
+                        },
+                        stiffness: OperatorPenaltySpec::Active {
+                            initial_log_lambda: 0.0,
+                            prior: None,
+                        },
+                    },
                     boundary: OneDimensionalBoundary::Open,
                 },
                 input_scale: None,

@@ -1264,8 +1264,8 @@ impl Default for DuchonOperatorPenaltySpec {
         // data-support sample. REML deselects any the data don't support (SPEC:
         // recover the null by default, opt INTO overfitting). Stiffness (`D2`)
         // stays off — `Primary` is the exact, superior curvature. (The Matérn
-        // collocation overlay builds its own `all_active()`; SAE atoms, which
-        // ship only `Primary`, use `all_disabled()`.)
+        // collocation overlay picks its dials with `matern_for_smoothness`; SAE
+        // atoms, which ship only `Primary`, use `all_disabled()`.)
         Self {
             mass: OperatorPenaltySpec::Active {
                 initial_log_lambda: 0.0,
@@ -1281,25 +1281,11 @@ impl Default for DuchonOperatorPenaltySpec {
 }
 
 impl DuchonOperatorPenaltySpec {
-
     pub fn all_disabled() -> Self {
         Self {
             mass: OperatorPenaltySpec::Disabled,
             tension: OperatorPenaltySpec::Disabled,
             stiffness: OperatorPenaltySpec::Disabled,
-        }
-    }
-
-    /// All three operator dials active — used by the Matérn collocation overlay.
-    pub fn all_active() -> Self {
-        let active = || OperatorPenaltySpec::Active {
-            initial_log_lambda: 0.0,
-            prior: None,
-        };
-        Self {
-            mass: active(),
-            tension: active(),
-            stiffness: active(),
         }
     }
 

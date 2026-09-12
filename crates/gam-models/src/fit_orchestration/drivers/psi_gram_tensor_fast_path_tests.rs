@@ -33,7 +33,7 @@ mod psi_gram_tensor_fast_path_tests {
     use super::*;
     use super::test_support::SingleBlockExactJointDesignCacheTestExt;
     use gam_terms::basis::{
-        CenterStrategy, DuchonBasisSpec, DuchonNullspaceOrder, DuchonOperatorPenaltySpec,
+        CenterStrategy, DuchonBasisSpec, DuchonNullspaceOrder, DuchonOperatorPenaltySpec, OperatorPenaltySpec,
         OneDimensionalBoundary, SpatialIdentifiability,
     };
     use ndarray::{Array1, Array2, s};
@@ -84,7 +84,20 @@ fn psi_gram_tensor_fast_path_skips_n_row_lane_and_matches_streamed() {
                     nullspace_order: DuchonNullspaceOrder::Linear,
                     identifiability: SpatialIdentifiability::default(),
                     aniso_log_scales: None,
-                    operator_penalties: DuchonOperatorPenaltySpec::all_active(),
+                    operator_penalties: DuchonOperatorPenaltySpec {
+                        mass: OperatorPenaltySpec::Active {
+                            initial_log_lambda: 0.0,
+                            prior: None,
+                        },
+                        tension: OperatorPenaltySpec::Active {
+                            initial_log_lambda: 0.0,
+                            prior: None,
+                        },
+                        stiffness: OperatorPenaltySpec::Active {
+                            initial_log_lambda: 0.0,
+                            prior: None,
+                        },
+                    },
                     boundary: OneDimensionalBoundary::Open,
                 },
                 // PRODUCTION geometry: `None` lets the 1-D axis auto-standardize

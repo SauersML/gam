@@ -709,5 +709,13 @@
     },
     "reason": "user directive: delete all useless slop (only used by tests / unused)",
     "evidence": "scripts/public_api_census.py on MSI lane sw2 (job 439803) over 7d3b11307..the exact candidate tree measured exactly these 7 declarations: dictionary_artifact's canonical_dictionary_artifact and diff_dictionaries, and encode.rs's joint_encode_fallback_fraction, certified_encode_row, amortized_encode_row, amortized_encode_batch and EncodeResult::from_rows, none with a production caller."
+  },
+  {
+    "base": "f9c7329d5ffb92870fdaa7d8116d30031bc341e8",
+    "removed": {
+      "crates/gam-terms/src/basis/types.rs::all_active": 1
+    },
+    "reason": "user directive: delete all useless slop",
+    "evidence": "scripts/public_api_census.py on MSI over 57409ec77 -> the M6 lane commit (job 440611, /scratch.global/sauer354/sw5-logs/stageM6.440611.pubapi.txt) measured exactly this removed map. The same tree compiles with every workspace target."
   }
 ]

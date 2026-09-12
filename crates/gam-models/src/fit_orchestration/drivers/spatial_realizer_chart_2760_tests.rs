@@ -19,7 +19,7 @@ mod spatial_realizer_chart_2760_tests {
     use super::*;
     use super::test_support::SingleBlockExactJointDesignCacheTestExt;
     use gam_terms::basis::{
-        DuchonBasisSpec, DuchonNullspaceOrder, DuchonOperatorPenaltySpec, MaternBasisSpec, MaternNu,
+        DuchonBasisSpec, DuchonNullspaceOrder, DuchonOperatorPenaltySpec, OperatorPenaltySpec, MaternBasisSpec, MaternNu,
         OneDimensionalBoundary, SpatialIdentifiability,
     };
     use ndarray::{Array1, Array2, s};
@@ -55,7 +55,20 @@ mod spatial_realizer_chart_2760_tests {
                         nullspace_order: DuchonNullspaceOrder::Linear,
                         identifiability: SpatialIdentifiability::default(),
                         aniso_log_scales: None,
-                        operator_penalties: DuchonOperatorPenaltySpec::all_active(),
+                        operator_penalties: DuchonOperatorPenaltySpec {
+                            mass: OperatorPenaltySpec::Active {
+                                initial_log_lambda: 0.0,
+                                prior: None,
+                            },
+                            tension: OperatorPenaltySpec::Active {
+                                initial_log_lambda: 0.0,
+                                prior: None,
+                            },
+                            stiffness: OperatorPenaltySpec::Active {
+                                initial_log_lambda: 0.0,
+                                prior: None,
+                            },
+                        },
                         boundary: OneDimensionalBoundary::Open,
                     },
                     input_scale: None,
