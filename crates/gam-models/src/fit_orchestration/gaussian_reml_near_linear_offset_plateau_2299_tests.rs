@@ -99,9 +99,12 @@ fn fit_near_linear_with_offset(n: usize, seed: u64) -> Result<StandardFitResult,
 /// `ĉ = −e^{ρ}·∂V/∂ρ` is constant on a finite-difference-clean run, and proves
 /// both the remaining criterion improvement (`value_gap = |∂V/∂ρ|`) and the
 /// remaining coefficient travel to the rail limit are below tolerance. The fit
-/// then converges via the typed `OuterStationarityCertificate::AsymptoteRail`
-/// (not the untyped `lambdas_railed` flag), and the truth being the null-space
-/// (linear) fit, the estimator is the honest answer.
+/// then converges on a typed certificate (not the untyped `lambdas_railed` flag),
+/// and the truth being the null-space (linear) fit, the estimator is the honest
+/// answer. Which variant is minted depends on where the outer loop stops:
+/// `AnalyticGradient` once the whole projected gradient, railed coordinate
+/// included, is inside the bound, and `AsymptoteRail` only for a railed
+/// coordinate whose gradient stays above the bound all the way to the rail.
 #[test]
 fn near_linear_offset_fit_converges_railed_off_the_infinite_smoothing_plateau_2299() {
     use gam_solve::estimate::OuterStationarityCertificate;
@@ -121,59 +124,55 @@ fn near_linear_offset_fit_converges_railed_off_the_infinite_smoothing_plateau_22
         result.fit.outer_iterations,
     );
 
-    // The stationarity certificate is the TYPED asymptote rail, not the generic
-    // gradient/criterion-flat verdict: the railed coordinate is positively
-    // certified on its confirmed tail.
+    // The stationarity certificate is typed, not the generic `lambdas_railed` flag.
+    // A whole projected gradient inside the bound certifies every coordinate, the
+    // railed bending penalty included, as `AnalyticGradient`. `AsymptoteRail` is
+    // minted only when a railed coordinate's gradient stays above the bound all the
+    // way to the rail, and that coordinate must then be certified on its confirmed
+    // tail. At 7ad913f69 this fixture stopped at |Pg| = 4.03e-6 against a bound of
+    // 1.21e-5 and minted `AnalyticGradient`.
     let certificate = result
         .fit
         .convergence_evidence()
         .outer_certificate()
         .expect("#2299: a smoothing-optimized fit carries an analytic outer certificate");
-    let rails = match &certificate.stationarity {
-        OuterStationarityCertificate::AsymptoteRail {
-            interior_projected_grad_norm,
-            bound,
-            rails,
-            ..
-        } => {
-            assert!(
-                interior_projected_grad_norm.is_finite() && interior_projected_grad_norm <= bound,
-                "#2299: the interior (non-railed) projected gradient {interior_projected_grad_norm} \
-                 must be stationary within the bound {bound}",
-            );
-            rails.clone()
-        }
-        other => panic!(
-            "#2299/#2348: expected a typed AsymptoteRail stationarity certificate, got {other:?}"
-        ),
-    };
+    let projected = certificate.stationarity.projected_norm();
+    let bound = certificate.stationarity.bound();
     assert!(
-        !rails.is_empty(),
-        "#2299: the AsymptoteRail certificate must carry at least one certified rail",
+        projected.is_finite() && projected <= bound,
+        "#2299: the certified projected gradient {projected} must be stationary within the \
+         bound {bound}: {:?}",
+        certificate.stationarity,
     );
-    for rail in &rails {
+    if let OuterStationarityCertificate::AsymptoteRail { rails, .. } = &certificate.stationarity {
         assert!(
-            rail.tail_constant.is_finite() && rail.tail_constant > 0.0,
-            "#2299: rail #{} must carry a positive pencil constant ĉ, got {}",
-            rail.index,
-            rail.tail_constant,
+            !rails.is_empty(),
+            "#2299: the AsymptoteRail certificate must carry at least one certified rail",
         );
-        // The remaining criterion improvement to the rail (|∂V/∂ρ|) is below the
-        // outer tolerance scale — the criterion has reached its asymptote.
-        assert!(
-            rail.value_gap.is_finite() && rail.value_gap < 1.0e-2,
-            "#2299: rail #{} value_gap must be below tolerance, got {}",
-            rail.index,
-            rail.value_gap,
-        );
-        // The fitted coefficients have reached the rail limit: the bounded
-        // remaining travel is a negligible fraction of the coefficient scale.
-        assert!(
-            rail.estimand_travel_bound.is_finite() && rail.estimand_travel_bound < 1.0e-2,
-            "#2299: rail #{} estimand_travel_bound must be below tolerance, got {}",
-            rail.index,
-            rail.estimand_travel_bound,
-        );
+        for rail in rails {
+            assert!(
+                rail.tail_constant.is_finite() && rail.tail_constant > 0.0,
+                "#2299: rail #{} must carry a positive pencil constant ĉ, got {}",
+                rail.index,
+                rail.tail_constant,
+            );
+            // The remaining criterion improvement to the rail (|∂V/∂ρ|) is below the
+            // outer tolerance scale — the criterion has reached its asymptote.
+            assert!(
+                rail.value_gap.is_finite() && rail.value_gap < 1.0e-2,
+                "#2299: rail #{} value_gap must be below tolerance, got {}",
+                rail.index,
+                rail.value_gap,
+            );
+            // The fitted coefficients have reached the rail limit: the bounded
+            // remaining travel is a negligible fraction of the coefficient scale.
+            assert!(
+                rail.estimand_travel_bound.is_finite() && rail.estimand_travel_bound < 1.0e-2,
+                "#2299: rail #{} estimand_travel_bound must be below tolerance, got {}",
+                rail.index,
+                rail.estimand_travel_bound,
+            );
+        }
     }
 
     // The truth lives in the polynomial null space `{1, x}`, so the range-space EDF
