@@ -222,12 +222,6 @@ fn likelihood_spec_for_saved_model(model: &SavedModel) -> Result<LikelihoodSpec,
     Ok(model.likelihood())
 }
 
-/// Default smoothing strength `λ` applied to a reconstructed penalty block when
-/// the saved model carries no fitted `smooth_lambda`. A mild penalty: enough to
-/// regularize the reconstructed-for-prediction design without materially
-/// reshaping the saved fit. Fitted lambdas, when present, always override this.
-const DEFAULT_RECONSTRUCTED_SMOOTH_LAMBDA: f64 = 1e-2;
-
 #[inline]
 const fn splitmix64(x: u64) -> u64 {
     gam_linalg::utils::splitmix64_hash(x)
@@ -1477,24 +1471,23 @@ fn sample_survival(
     // The final assembly now owns every covariate column needed by sampling.
     // Release the rebuilt term collection before allocating model-owned copies.
     drop(cov_design);
-    let mut penalty_blocks: Vec<PenaltyBlock> = Vec::new();
+    // Each reconstructed penalty is (matrix, coefficient range, nullspace
+    // dimension). Its λ comes only from the saved fit, attached below once the
+    // saved λ vector is known to cover exactly these blocks.
+    let mut penalty_specs = Vec::new();
     for (idx, s) in time_build.penalties.iter().enumerate() {
         if s.nrows() == p_time && s.ncols() == p_time {
-            penalty_blocks.push(PenaltyBlock {
-                matrix: s.clone(),
-                lambda: time_build
-                    .smooth_lambda
-                    .unwrap_or(DEFAULT_RECONSTRUCTED_SMOOTH_LAMBDA),
-                range: 0..p_time,
-                nullspace_dim: time_build.nullspace_dims.get(idx).copied().unwrap_or(0),
-            });
+            penalty_specs.push((
+                s.clone(),
+                0..p_time,
+                time_build.nullspace_dims.get(idx).copied().unwrap_or(0),
+            ));
         }
     }
     let fit_saved = fit_result_from_saved_model_for_prediction(model)?;
     if let Some((_, exit_w, _)) = saved_timewiggle.as_ref() {
         let start = p_time;
         let end = start + exit_w.ncols();
-        let wiggle_lambda_offset = penalty_blocks.len();
         let wiggle_cfg = saved_baseline_timewiggle_spec(model)?.ok_or_else(|| {
             "saved baseline-timewiggle model missing baseline-timewiggle metadata".to_string()
         })?;
@@ -1532,22 +1525,11 @@ fn sample_survival(
                 | gam_solve::estimate::PenaltySpec::DenseWithMean { matrix: m, .. } => m,
             };
             if s.nrows() == exit_w.ncols() && s.ncols() == exit_w.ncols() {
-                penalty_blocks.push(PenaltyBlock {
-                    matrix: s.clone(),
-                    lambda: time_build
-                        .smooth_lambda
-                        .unwrap_or(DEFAULT_RECONSTRUCTED_SMOOTH_LAMBDA),
-                    range: start..end,
-                    nullspace_dim: block.nullspace_dims.get(widx).copied().unwrap_or(0),
-                });
-            }
-        }
-        for (local_idx, block_penalty) in penalty_blocks[wiggle_lambda_offset..]
-            .iter_mut()
-            .enumerate()
-        {
-            if let Some(&lam) = fit_saved.lambdas.get(wiggle_lambda_offset + local_idx) {
-                block_penalty.lambda = lam;
+                penalty_specs.push((
+                    s.clone(),
+                    start..end,
+                    block.nullspace_dims.get(widx).copied().unwrap_or(0),
+                ));
             }
         }
     }
@@ -1563,18 +1545,25 @@ fn sample_survival(
     // penalty set — e.g. a model saved before #2670 carries a trailing
     // fixed-λ coefficient ridge that no longer exists — and silently assigning
     // by index would sample from a penalty the fit never used. Refuse; refit.
-    if fit_saved.lambdas.len() != penalty_blocks.len() {
+    if fit_saved.lambdas.len() != penalty_specs.len() {
         return Err(format!(
             "saved survival model carries {} smoothing parameter(s) for {} reconstructed \
              penalty block(s); the saved penalty set does not match the current survival \
              objective (a fixed-λ coefficient ridge is no longer part of it, #2670). Refit.",
             fit_saved.lambdas.len(),
-            penalty_blocks.len()
+            penalty_specs.len()
         ));
     }
-    for (block, &lam) in penalty_blocks.iter_mut().zip(fit_saved.lambdas.iter()) {
-        block.lambda = lam;
-    }
+    let penalty_blocks: Vec<PenaltyBlock> = penalty_specs
+        .into_iter()
+        .zip(fit_saved.lambdas.iter())
+        .map(|((matrix, range, nullspace_dim), &lambda)| PenaltyBlock {
+            matrix,
+            lambda,
+            range,
+            nullspace_dim,
+        })
+        .collect();
     let penalties = PenaltyBlocks::new(penalty_blocks);
     let survivalspec = match model
         .survivalspec

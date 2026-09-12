@@ -3516,5 +3516,13 @@
     ],
     "reason": "SPEC rule 2 (#2901 V16). The transformation-normal observation band estimated each ladder node's slope dy/dz by PCHIP secant differences of the tabulated quantiles, which is a finite-difference derivative of a function the model holds. The ladder now carries the exact slopes 1/h' that CtnTransformTable::invert_with_slope reads off the interpolant it inverts, so the two private secant/slope estimators are deleted.",
     "evidence": "At the base, git grep -w over *.rs finds ladder_secant and ladder_slope only in crates/gam-predict/src/transformation_normal.rs: their declarations, their uses in each other and in ladder_quantile, and one use in the band_ladder_does_not_clamp_past_its_own_ends_2600 test. This change rewrites every one of those uses. Both are private, and each is guarded because its name occurs more than once at the base. No public item is removed. Compile is covered by the lead's shared tip check."
+  },
+  {
+    "base": "172ce1d2c90613c6ca7a4ede04dc08813941d9ae",
+    "items": [
+      "crates/gam-inference/src/sample.rs:const:DEFAULT_RECONSTRUCTED_SMOOTH_LAMBDA"
+    ],
+    "reason": "#2469: DEFAULT_RECONSTRUCTED_SMOOTH_LAMBDA (1e-2) was a picked smoothing strength. The saved-survival sampler's penalty reconstruction attached it as time_build.smooth_lambda.unwrap_or(1e-2) to every time and baseline-timewiggle penalty block. After the reconstruction, the function refuses when the saved fit's lambda vector does not cover exactly those blocks, then overwrites every block's lambda with the saved fitted value. The 1e-2 therefore never reached the sampler, and neither did the earlier per-wiggle override loop. The reconstruction now collects (matrix, range, nullspace_dim) specs, keeps the refusal, and builds each PenaltyBlock only from its saved fitted lambda. No placeholder lambda exists at any point.",
+    "evidence": "git grep -n DEFAULT_RECONSTRUCTED_SMOOTH_LAMBDA over the base finds three lines, all in crates/gam-inference/src/sample.rs production code: the declaration at :229 and the two uses at :1487 (time blocks) and :1539 (baseline-timewiggle blocks). No other file or test names it. On base, :1566 refuses fit_saved.lambdas.len() != penalty_blocks.len(), and :1575-1577 then assigns block.lambda = lam for every block, before PenaltyBlocks::new at :1578. Not compiled or run locally (user directive); compile is covered by the lead's shared tip check."
   }
 ]
