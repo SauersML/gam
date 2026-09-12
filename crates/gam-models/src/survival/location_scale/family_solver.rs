@@ -1148,6 +1148,49 @@ impl CustomFamily for SurvivalLocationScaleFamily {
         )
     }
 
+    /// `∇²_β tr(W · I(β))` for the unscaled observed information: the same
+    /// fourth-order row contraction that
+    /// [`Self::joint_jeffreys_information_second_directional_derivative_with_specs`]
+    /// pulls back one direction pair at a time, contracted with `W` over every
+    /// coefficient pair in a single row fold. Without it the exact Jeffreys
+    /// completion assembles `p(p+1)/2` full-data `I''[e_a, e_b]` passes on every
+    /// armed inner-Newton endgame cycle, and the outer mode response never receives
+    /// the completion at all (#2668, #2106). The link-wiggle runtime lowering has no
+    /// fixed-width row kernel and keeps the pairwise route.
+    fn joint_jeffreys_information_contracted_trace_hessian_with_specs(
+        &self,
+        block_states: &[ParameterBlockState],
+        specs: &[ParameterBlockSpec],
+        weight: &Array2<f64>,
+    ) -> Result<Option<Array2<f64>>, String> {
+        self.validate_joint_specs(
+            specs,
+            "SurvivalLocationScaleFamily joint Jeffreys contracted trace Hessian",
+        )?;
+        crate::block_layout::block_count::validate_block_count::<SurvivalLocationScaleError>(
+            "SurvivalLocationScaleFamily joint Jeffreys contracted trace Hessian",
+            self.expected_blocks(),
+            block_states.len(),
+        )?;
+        if !self.row_kernel_directional_supported() {
+            return Ok(None);
+        }
+        let dynamic = self.build_dynamic_geometry(block_states)?;
+        let kernel = self.survival_ls_row_kernel_rescaled(&dynamic, 0.0);
+        crate::row_kernel::row_kernel_contracted_trace_hessian(
+            &kernel,
+            &crate::row_kernel::RowSet::All,
+            weight,
+        )
+        .map(Some)
+    }
+
+    /// The fused contraction exists exactly where the fixed-width row kernel
+    /// supplies the second directional derivative it contracts.
+    fn joint_jeffreys_information_contracted_trace_hessian_available(&self) -> bool {
+        self.row_kernel_directional_supported()
+    }
+
     /// The fifth likelihood derivative lowers through `sls_row_program`'s
     /// three-seed directional surface wherever every residual-distribution
     /// stack has a closed-form fifth derivative. The link-wiggle runtime

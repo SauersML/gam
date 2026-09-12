@@ -1219,6 +1219,85 @@ pub fn row_kernel_second_directional_derivative_all_axes<const K: usize>(
         .collect::<Result<Vec<_>, _>>()
 }
 
+/// Contracted second derivative of the Hessian against a fixed coefficient-space
+/// weight: `∇²_β tr(W · H(β))`, whose `(c, d)` entry is `tr(W · H''[e_c, e_d])`.
+///
+/// [`row_kernel_second_directional_derivative`] builds
+/// `H''[u, v] = Σᵢ Jᵢᵀ T4ᵢ[Jᵢu, Jᵢv] Jᵢ` from the row's fourth-order contraction
+/// through the row Jacobian. Contracting with `W` gives
+/// `tr(W · H''[e_c, e_d]) = Σᵢ ⟨wᵢ, T4ᵢ[Jᵢe_c, Jᵢe_d]⟩` with `wᵢ = Jᵢ W Jᵢᵀ`, and the
+/// full symmetry of the fourth derivative turns every row into one pullback
+/// `Jᵢᵀ Mᵢ Jᵢ` with `Mᵢ = Σ_{a,b} wᵢ[a][b] · T4ᵢ[e_a, e_b]`. The fold therefore
+/// contracts `K(K+1)/2` unit primary pairs per row and pulls back ONE K×K matrix,
+/// where assembling the same matrix from `H''[e_c, e_d]` costs `p(p+1)/2` full-data
+/// passes with a pullback on every row of each. The result is linear in `W`, and
+/// `W` is never factorized, so signed (and non-symmetric) weights are exact.
+/// Per-row contributions are HT-weighted.
+pub fn row_kernel_contracted_trace_hessian<const K: usize>(
+    kern: &(impl RowKernel<K> + ?Sized),
+    rows: &RowSet,
+    weight: &Array2<f64>,
+) -> Result<Array2<f64>, String> {
+    let n = kern.n_rows();
+    let p = kern.n_coefficients();
+    if weight.dim() != (p, p) {
+        return Err(format!(
+            "row_kernel_contracted_trace_hessian: weight shape {:?}, expected ({p}, {p})",
+            weight.dim(),
+        ));
+    }
+    // The contraction reads the fourth-derivative cache: full outer-Hessian priming.
+    kern.warm_up_directional_caches(EvalMode::ValueGradientHessian)?;
+    rows.par_try_reduce_fold(
+        n,
+        || Array2::<f64>::zeros((p, p)),
+        |mut acc, row, w| -> Result<_, String> {
+            // The row Jacobian `J_i` (K × p), one transpose action per primary.
+            let mut jacobian = vec![0.0_f64; K * p];
+            let mut unit = [0.0_f64; K];
+            for (primary, jacobian_row) in jacobian.chunks_exact_mut(p).enumerate() {
+                unit[primary] = 1.0;
+                kern.jacobian_transpose_action(row, &unit, jacobian_row);
+                unit[primary] = 0.0;
+            }
+            let jacobian = Array2::from_shape_vec((K, p), jacobian)
+                .map_err(|error| format!("row_kernel_contracted_trace_hessian: {error}"))?;
+            let row_weight = jacobian.dot(weight).dot(&jacobian.t());
+            let mut contracted = [[0.0_f64; K]; K];
+            let mut direction_a = [0.0_f64; K];
+            let mut direction_b = [0.0_f64; K];
+            for a in 0..K {
+                direction_a[a] = 1.0;
+                for b in a..K {
+                    // `T4ᵢ[e_a, e_b] = T4ᵢ[e_b, e_a]`, so the off-diagonal pair carries
+                    // both entries of `wᵢ`.
+                    let pair_weight = if a == b {
+                        row_weight[[a, a]]
+                    } else {
+                        row_weight[[a, b]] + row_weight[[b, a]]
+                    };
+                    if pair_weight == 0.0 {
+                        continue;
+                    }
+                    direction_b[b] = 1.0;
+                    let fourth = kern.row_fourth_contracted(row, &direction_a, &direction_b)?;
+                    direction_b[b] = 0.0;
+                    let scale = w * pair_weight;
+                    for x in 0..K {
+                        for y in 0..K {
+                            contracted[x][y] += scale * fourth[x][y];
+                        }
+                    }
+                }
+                direction_a[a] = 0.0;
+            }
+            kern.add_pullback_hessian(row, &contracted, &mut acc);
+            Ok(acc)
+        },
+        |a, b| Ok(a + b),
+    )
+}
+
 /// A row kernel whose row program lowers the fifth order.
 ///
 /// Only a family that declares the third information derivative available has

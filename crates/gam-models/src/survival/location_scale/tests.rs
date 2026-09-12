@@ -1823,6 +1823,71 @@ fn survival_ls_third_directional_all_axes_matches_difference_of_second_2677() {
     }
 }
 
+/// #2668/#2106: the fused Jeffreys contracted trace Hessian is exactly the pairwise
+/// contraction it replaces. Every entry `[∇²_β tr(W · I)][c][d]` must equal
+/// `tr(W · I''[e_c, e_d])` assembled from the family's own second directional
+/// derivative, for each closed-form residual distribution. The weight is signed
+/// and not symmetric, so the linear-in-`W` claim is exercised on the case a
+/// factorizing implementation would get wrong, and the family advertises the
+/// hook on the non-wiggle row kernel.
+#[test]
+fn survival_ls_contracted_trace_hessian_matches_pairwise_second_directional_2668() {
+    use crate::custom_family::CustomFamily;
+    use crate::row_kernel::{RowSet, row_kernel_contracted_trace_hessian};
+
+    let weight = array![[0.9, -0.3, 0.45], [0.2, -1.1, 0.35], [-0.6, 0.25, 0.7]];
+    let p = weight.nrows();
+    for distribution in [
+        ResidualDistribution::Gaussian,
+        ResidualDistribution::Gumbel,
+        ResidualDistribution::Logistic,
+    ] {
+        let family = survival_exact_newton_test_familywith_inverse_link(
+            residual_distribution_inverse_link(distribution),
+        );
+        assert!(
+            family.joint_jeffreys_information_contracted_trace_hessian_available(),
+            "{distribution:?}: the non-wiggle row kernel must advertise the fused contraction"
+        );
+        let states = survival_exact_newton_test_states(&family, 0.3, -0.4, 0.2);
+        let dynamic = family
+            .build_dynamic_geometry(&states)
+            .expect("dynamic geometry");
+        let kernel = family.survival_ls_row_kernel_rescaled(&dynamic, 0.0);
+        let fused = row_kernel_contracted_trace_hessian(&kernel, &RowSet::All, &weight)
+            .expect("contracted trace Hessian");
+        assert_eq!(fused.dim(), (p, p), "{distribution:?}: one p×p matrix");
+        let mut largest = 0.0_f64;
+        for c in 0..p {
+            for d in 0..p {
+                let mut e_c = Array1::<f64>::zeros(p);
+                e_c[c] = 1.0;
+                let mut e_d = Array1::<f64>::zeros(p);
+                e_d[d] = 1.0;
+                let second = family
+                    .exact_newton_joint_hessian_second_directional_derivative_rescaled(
+                        &states, &e_c, &e_d, 0.0,
+                    )
+                    .expect("second directional derivative")
+                    .expect("second directional derivative present");
+                // tr(W · H) = Σ_ab W[a][b] · H[b][a].
+                let want = (&weight * &second.t()).sum();
+                let got = fused[[c, d]];
+                largest = largest.max(want.abs());
+                assert!(
+                    (got - want).abs() <= 1.0e-10 * (1.0 + want.abs().max(got.abs())),
+                    "{distribution:?} [{c}][{d}]: fused {got:+.15e}, pairwise {want:+.15e}"
+                );
+            }
+        }
+        assert!(
+            largest > 1.0e-3,
+            "{distribution:?}: the contracted second derivative is too small ({largest:.3e}) \
+             for the agreement to say anything"
+        );
+    }
+}
+
 fn sparse_survival_exact_newton_test_family() -> SurvivalLocationScaleFamily {
     let mut family = survival_exact_newton_test_family();
     family.x_threshold = sparse_design_from_dense(&array![[1.0], [0.4], [-0.6]]);
