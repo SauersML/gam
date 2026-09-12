@@ -376,11 +376,7 @@ def _candidate_scenarios(
         for model_type in model_types:
             if model_type is None:
                 continue
-            try:
-                sc = _materialize_scenario(cfg, seed=seed_start + offset, model_type=model_type)
-            except Exception as exc:
-                print(f"  [skip] {cfg.get('name', '?')}: {exc}", flush=True)
-                continue
+            sc = _materialize_scenario(cfg, seed=seed_start + offset, model_type=model_type)
             if sc is not None:
                 out.append(sc)
     return out
