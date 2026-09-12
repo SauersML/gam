@@ -219,8 +219,8 @@ pub fn is_binary_response(y: ArrayView1<'_, f64>) -> bool {
     if y.is_empty() {
         return false;
     }
-    y.iter()
-        .all(|v| (*v - 0.0).abs() < 1e-12 || (*v - 1.0).abs() < 1e-12)
+    // Exact membership: a value near 0 or 1 is not an outcome.
+    y.iter().all(|&v| v == 0.0 || v == 1.0)
 }
 
 /// Verify that the dataset has at least as many rows as the smooth terms in
@@ -268,4 +268,20 @@ pub(super) fn check_smooth_capacity(
              smaller basis via `s(x, k=3)`."
         ),
     })
+}
+
+#[cfg(test)]
+mod binary_response_tests {
+    use super::is_binary_response;
+    use ndarray::{Array1, array};
+
+    #[test]
+    fn only_exact_outcomes_make_a_binary_response() {
+        assert!(is_binary_response(array![0.0, 1.0, 1.0, -0.0].view()));
+        // A value one part in 1e13 from an outcome is not an outcome.
+        assert!(!is_binary_response(array![0.0, 1.0 - 1.0e-13, 1.0].view()));
+        assert!(!is_binary_response(array![1.0e-13, 1.0].view()));
+        assert!(!is_binary_response(array![0.0, f64::NAN].view()));
+        assert!(!is_binary_response(Array1::<f64>::zeros(0).view()));
+    }
 }

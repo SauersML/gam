@@ -1299,8 +1299,10 @@ fn validate_bounded_observation_inputs(
         let valid = match &family.response {
             ResponseFamily::Gaussian => yi.is_finite(),
             ResponseFamily::Binomial => yi.is_finite() && (0.0..=1.0).contains(&yi),
+            // A count is an exact non-negative integer: a value near one is not a
+            // count, and the likelihood would read the value it carries.
             ResponseFamily::Poisson | ResponseFamily::NegativeBinomial { .. } => {
-                yi.is_finite() && yi >= 0.0 && (yi - yi.round()).abs() <= 1e-9
+                yi.is_finite() && yi >= 0.0 && yi == yi.round()
             }
             ResponseFamily::Tweedie { .. } => yi.is_finite() && yi >= 0.0,
             ResponseFamily::Gamma => yi.is_finite() && yi > 0.0,

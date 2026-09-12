@@ -616,7 +616,7 @@ pub fn resolve_family(
                 ),
                 LinkFunction::Log => {
                     if y.iter()
-                        .all(|&yi| yi.is_finite() && yi >= 0.0 && (yi - yi.round()).abs() <= 1e-9)
+                        .all(|&yi| yi.is_finite() && yi >= 0.0 && yi == yi.round())
                     {
                         LikelihoodSpec::new(
                             ResponseFamily::Poisson,
