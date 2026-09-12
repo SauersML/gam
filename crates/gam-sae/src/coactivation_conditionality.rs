@@ -16,16 +16,12 @@
 
 use crate::null_battery::ClaimNullCalibration;
 use gam_terms::basis::{BasisOptions, Dense, KnotSource, create_basis};
-use ndarray::{Array1, ArrayView2};
+use ndarray::{Array1, Array2, ArrayView2};
 use std::collections::BTreeMap;
 
 const DEFAULT_SPLINE_DEGREE: usize = 3;
 const DEFAULT_INTERNAL_KNOTS: usize = 5;
 const DEFAULT_PENALTY_ORDER: usize = 1;
-const BRACKET_EXPANSION_LIMIT: usize = 48;
-const BRENT_ITERATION_LIMIT: usize = 96;
-const BRENT_REL_TOL: f64 = 1.0e-8;
-const MIN_RESIDUAL_DF: f64 = 1.0;
 
 /// Configuration for the native varying-coefficient GAM conditionality fit.
 #[derive(Clone, Copy, Debug)]
@@ -576,25 +572,9 @@ fn fit_varying_coefficient_gam(
         }
     }
     let y: Vec<f64> = rows.iter().map(|&row| gate_j[row]).collect();
-    let fit_for_log_lambda = |log_lambda: f64| -> Result<PenalizedFit, String> {
-        penalized_gaussian_fit(
-            &design,
-            &y,
-            likelihood_weights,
-            &penalty,
-            penalty_rank,
-            log_lambda,
-        )
-    };
-    let selected_log_smoothing = minimize_reml_log_smoothing(fit_for_log_lambda)?;
-    let final_fit = penalized_gaussian_fit(
-        &design,
-        &y,
-        likelihood_weights,
-        &penalty,
-        penalty_rank,
-        selected_log_smoothing,
-    )?;
+    let reml = GaussianRemlProblem::new(&design, &y, likelihood_weights, &penalty, penalty_rank)?;
+    let selected_log_smoothing = reml.select_log_smoothing()?;
+    let final_fit = reml.fit(selected_log_smoothing)?;
     let mut coefficients = vec![0.0_f64; beta_cols];
     coefficients.copy_from_slice(&final_fit.coef[1..]);
     let mut beta_at_rows = Vec::with_capacity(n);
@@ -647,144 +627,252 @@ struct PenalizedFit {
     effective_degrees: f64,
 }
 
-fn penalized_gaussian_fit(
-    design: &[Vec<f64>],
-    y: &[f64],
-    weights: &[f64],
-    penalty: &[Vec<f64>],
+/// The profiled Gaussian REML criterion of the varying-coefficient GAM in
+/// `ρ = log λ`:
+///
+/// `V(ρ) = log|A| − r·ρ + ν·log P`,  `A = XᵀWX + λS`,  `P = yᵀWy − bᵀA⁻¹b`,
+///
+/// with `b = XᵀWy`, `P` the penalized residual sum of squares at `β̂ = A⁻¹b`,
+/// `r = rank S`, and `ν = Σw − (p − r)` the residual degrees of freedom (the
+/// likelihood mass less the unpenalized null space). The scale is profiled out.
+/// The weighted sufficient statistics are accumulated once, so an evaluation
+/// costs `O(p³)` in the coefficient dimension alone.
+struct GaussianRemlProblem<'a> {
+    xtwx: Vec<Vec<f64>>,
+    xtwy: Vec<f64>,
+    ywy: f64,
+    penalty: &'a [Vec<f64>],
     penalty_rank: usize,
-    log_lambda: f64,
-) -> Result<PenalizedFit, String> {
-    let n = design.len();
-    let p = design
-        .first()
-        .map(|row| row.len())
-        .ok_or_else(|| "penalized_gaussian_fit: empty design".to_string())?;
-    let lambda = gam_problem::checked_exp_log_strength(log_lambda)
-        .map_err(|error| format!("penalized Gaussian coactivation fit: {error}"))?;
-    let mut xtwx = vec![vec![0.0_f64; p]; p];
-    let mut xtwy = vec![0.0_f64; p];
-    let mut ywy = 0.0_f64;
-    for row in 0..n {
-        let w = weights[row];
-        let yy = y[row];
-        ywy += w * yy * yy;
-        for a in 0..p {
-            let xa = design[row][a];
-            xtwy[a] += w * xa * yy;
-            for b in 0..p {
-                xtwx[a][b] += w * xa * design[row][b];
+    residual_df: f64,
+}
+
+/// The penalized solve at one `ρ`, shared by the criterion value, its
+/// derivatives and the reported fit.
+struct GaussianRemlSolve {
+    lambda: f64,
+    factor: Vec<Vec<f64>>,
+    coef: Vec<f64>,
+    penalized_rss: f64,
+    value: f64,
+}
+
+impl<'a> GaussianRemlProblem<'a> {
+    fn new(
+        design: &[Vec<f64>],
+        y: &[f64],
+        weights: &[f64],
+        penalty: &'a [Vec<f64>],
+        penalty_rank: usize,
+    ) -> Result<Self, String> {
+        let p = design
+            .first()
+            .map(|row| row.len())
+            .ok_or_else(|| "coactivation REML: empty design".to_string())?;
+        let mut xtwx = vec![vec![0.0_f64; p]; p];
+        let mut xtwy = vec![0.0_f64; p];
+        let mut ywy = 0.0_f64;
+        for (row, values) in design.iter().enumerate() {
+            let w = weights[row];
+            let yy = y[row];
+            ywy += w * yy * yy;
+            for a in 0..p {
+                let xa = values[a];
+                xtwy[a] += w * xa * yy;
+                for b in 0..p {
+                    xtwx[a][b] += w * xa * values[b];
+                }
             }
         }
+        // Frequency/HT weights define the likelihood mass represented by this
+        // sample. The residual degrees of freedom must live on that same measure;
+        // using the selected row count mixed a full-corpus weighted SSE with
+        // selected-sample df and changed the criterion under a common weight scale.
+        let likelihood_mass: f64 = weights.iter().sum();
+        let null_dimension = p - penalty_rank;
+        let residual_df = likelihood_mass - null_dimension as f64;
+        if !(residual_df.is_finite() && residual_df > 0.0) {
+            return Err(format!(
+                "coactivation REML: likelihood mass {likelihood_mass} does not exceed the \
+                 {null_dimension} unpenalized coefficients, so the profiled criterion has no \
+                 residual degrees of freedom"
+            ));
+        }
+        Ok(Self {
+            xtwx,
+            xtwy,
+            ywy,
+            penalty,
+            penalty_rank,
+            residual_df,
+        })
     }
-    let mut a = xtwx.clone();
-    for r in 0..p {
+
+    fn solve(&self, log_lambda: f64) -> Result<GaussianRemlSolve, String> {
+        let p = self.xtwy.len();
+        let lambda = gam_problem::checked_exp_log_strength(log_lambda)
+            .map_err(|error| format!("coactivation REML: {error}"))?;
+        let mut a = self.xtwx.clone();
+        for r in 0..p {
+            for c in 0..p {
+                a[r][c] += lambda * self.penalty[r][c];
+            }
+        }
+        let factor = cholesky_decompose(&a)?;
+        let coef = cholesky_solve(&factor, &self.xtwy);
+        let penalized_rss = self.ywy - dot(&self.xtwy, &coef);
+        if !(penalized_rss.is_finite() && penalized_rss > 0.0) {
+            return Err(format!(
+                "coactivation REML: penalized residual sum of squares {penalized_rss} at \
+                 log λ = {log_lambda} is not positive: the sample is fit exactly and the \
+                 profiled criterion is unbounded"
+            ));
+        }
+        let value = cholesky_logdet(&factor) - self.penalty_rank as f64 * log_lambda
+            + self.residual_df * penalized_rss.ln();
+        Ok(GaussianRemlSolve {
+            lambda,
+            factor,
+            coef,
+            penalized_rss,
+            value,
+        })
+    }
+
+    /// `(V, V′, V″)` at `ρ`, in closed form. With `M = A⁻¹S`, `q = β̂ᵀSβ̂`,
+    /// `s = β̂ᵀSA⁻¹Sβ̂`, `dβ̂/dρ = −λA⁻¹Sβ̂` and the envelope identity
+    /// `dP/dρ = λq`:
+    ///
+    /// `V′ = λ·tr M − r + ν·λq/P`,
+    /// `V″ = λ·tr M − λ²·tr(M²) + ν·(λq/P − 2λ²s/P − (λq/P)²)`.
+    fn jet(&self, log_lambda: f64) -> Result<(f64, f64, f64), String> {
+        let solve = self.solve(log_lambda)?;
+        let p = self.xtwy.len();
+        let mut inverse_penalty = vec![vec![0.0_f64; p]; p];
+        let mut column = vec![0.0_f64; p];
         for c in 0..p {
-            a[r][c] += lambda * penalty[r][c];
+            for r in 0..p {
+                column[r] = self.penalty[r][c];
+            }
+            let solved = cholesky_solve(&solve.factor, &column);
+            for r in 0..p {
+                inverse_penalty[r][c] = solved[r];
+            }
         }
-    }
-    let factor = cholesky_decompose(&a)?;
-    let coef = cholesky_solve(&factor, &xtwy);
-    let xty_beta = dot(&xtwy, &coef);
-    let penalty_energy = quadratic_form(&coef, penalty);
-    let sse = (ywy - 2.0 * xty_beta + quadratic_form_matrix(&coef, &xtwx)).max(0.0);
-    let penalized_sse = (sse + lambda * penalty_energy).max(f64::MIN_POSITIVE);
-    let mut effective_degrees = 0.0_f64;
-    for col in 0..p {
-        let mut rhs = vec![0.0_f64; p];
-        for row in 0..p {
-            rhs[row] = xtwx[row][col];
+        let trace = (0..p).map(|i| inverse_penalty[i][i]).sum::<f64>();
+        let mut trace_square = 0.0_f64;
+        for i in 0..p {
+            for j in 0..p {
+                trace_square += inverse_penalty[i][j] * inverse_penalty[j][i];
+            }
         }
-        let solved = cholesky_solve(&factor, &rhs);
-        effective_degrees += solved[col];
+        let penalty_beta: Vec<f64> = self
+            .penalty
+            .iter()
+            .map(|row| dot(row, &solve.coef))
+            .collect();
+        let penalty_energy = dot(&solve.coef, &penalty_beta);
+        let penalty_curvature = dot(
+            &penalty_beta,
+            &cholesky_solve(&solve.factor, &penalty_beta),
+        );
+        let lambda = solve.lambda;
+        let energy_share = lambda * penalty_energy / solve.penalized_rss;
+        let gradient =
+            lambda * trace - self.penalty_rank as f64 + self.residual_df * energy_share;
+        let hessian = lambda * trace - lambda * lambda * trace_square
+            + self.residual_df
+                * (energy_share
+                    - 2.0 * lambda * lambda * penalty_curvature / solve.penalized_rss
+                    - energy_share * energy_share);
+        Ok((solve.value, gradient, hessian))
     }
-    // Frequency/HT weights define the likelihood mass represented by this
-    // sample. The residual degrees of freedom must live on that same measure;
-    // using the selected row count mixed a full-corpus weighted SSE with
-    // selected-sample df and changed the criterion under a common weight scale.
-    let likelihood_mass: f64 = weights.iter().sum();
-    let df = (likelihood_mass - effective_degrees).max(MIN_RESIDUAL_DF);
-    let logdet = cholesky_logdet(&factor);
-    let reml_score = logdet - penalty_rank as f64 * log_lambda + df * (penalized_sse / df).ln();
-    Ok(PenalizedFit {
-        coef,
-        reml_score,
-        effective_degrees,
-    })
-}
 
-fn minimize_reml_log_smoothing<F>(mut evaluate: F) -> Result<f64, String>
-where
-    F: FnMut(f64) -> Result<PenalizedFit, String>,
-{
-    let mut center = 0.0_f64;
-    let mut step = 1.0_f64;
-    let mut f_center = evaluate(center)?.reml_score;
-    let mut left = center - step;
-    let mut right = center + step;
-    let mut f_left = evaluate(left)?.reml_score;
-    let mut f_right = evaluate(right)?.reml_score;
-    for _iteration in 0..BRACKET_EXPANSION_LIMIT {
-        if f_left >= f_center && f_right >= f_center {
-            return golden_section_minimize(&mut evaluate, left, right);
+    fn fit(&self, log_lambda: f64) -> Result<PenalizedFit, String> {
+        let solve = self.solve(log_lambda)?;
+        let p = self.xtwy.len();
+        let mut effective_degrees = 0.0_f64;
+        let mut column = vec![0.0_f64; p];
+        for c in 0..p {
+            for r in 0..p {
+                column[r] = self.xtwx[r][c];
+            }
+            effective_degrees += cholesky_solve(&solve.factor, &column)[c];
         }
-        if f_left < f_center {
-            right = center;
-            center = left;
-            f_center = f_left;
-            step *= 2.0;
-            left = center - step;
-            f_left = evaluate(left)?.reml_score;
-            f_right = evaluate(right)?.reml_score;
-        } else {
-            left = center;
-            center = right;
-            f_center = f_right;
-            step *= 2.0;
-            right = center + step;
-            f_right = evaluate(right)?.reml_score;
-            f_left = evaluate(left)?.reml_score;
-        }
+        Ok(PenalizedFit {
+            coef: solve.coef,
+            reml_score: solve.value,
+            effective_degrees,
+        })
     }
-    golden_section_minimize(&mut evaluate, left, right)
-}
 
-fn golden_section_minimize<F>(
-    evaluate: &mut F,
-    mut left: f64,
-    mut right: f64,
-) -> Result<f64, String>
-where
-    F: FnMut(f64) -> Result<PenalizedFit, String>,
-{
-    // inv_phi = (sqrt(5) - 1)/2, the reciprocal golden ratio 1/phi; golden-section
-    // search shrinks the bracket by this factor each step so the two interior
-    // probes can be reused across iterations.
-    let inv_phi = (5.0_f64.sqrt() - 1.0) * 0.5;
-    let mut c = right - inv_phi * (right - left);
-    let mut d = left + inv_phi * (right - left);
-    let mut f_c = evaluate(c)?.reml_score;
-    let mut f_d = evaluate(d)?.reml_score;
-    for _iteration in 0..BRENT_ITERATION_LIMIT {
-        let scale = 1.0 + left.abs().max(right.abs());
-        if (right - left).abs() <= BRENT_REL_TOL * scale {
-            break;
+    /// Select `ρ̂` with the workspace's outer engine on the analytic `V′`, `V″`.
+    ///
+    /// The domain is the term's own resolvability interval (#2812): the
+    /// generalized eigenvalues `γ_j` of `XᵀWX` against `S` on the penalty range
+    /// give `[ln(√ε·γ_min), ln(γ_max/√ε)]`, past whose faces the criterion's
+    /// gradient is under its own round-off, so a railed `ρ̂` is a structural
+    /// result (the coefficient is constant, or unpenalized, to working
+    /// precision). The single start is the interval's midpoint. A search the
+    /// engine cannot certify is an error, never a returned `λ`.
+    fn select_log_smoothing(&self) -> Result<f64, String> {
+        use gam_solve::estimate::{EstimationError, rho_domain};
+        use gam_solve::rho_optimizer::{
+            DeclaredHessianForm, Derivative, HessianValue, OuterEval, OuterProblem,
+        };
+        let p = self.xtwy.len();
+        let gram = Array2::from_shape_fn((p, p), |(r, c)| self.xtwx[r][c]);
+        let penalty = Array2::from_shape_fn((p, p), |(r, c)| self.penalty[r][c]);
+        let interval = rho_domain::penalty_range_gammas_from_gram(&gram, &penalty)
+            .as_deref()
+            .and_then(rho_domain::resolvability_interval)
+            .ok_or_else(|| {
+                "coactivation REML: no penalized direction carries data curvature, so the \
+                 varying coefficient's smoothing parameter is not identified"
+                    .to_string()
+            })?;
+        let (lower, upper) = rho_domain::coordinate_domain(Some(interval), None);
+        let problem = OuterProblem::new(1)
+            .with_gradient(Derivative::Analytic)
+            .with_hessian(DeclaredHessianForm::Dense)
+            .with_bounds(Array1::from_vec(vec![lower]), Array1::from_vec(vec![upper]))
+            .with_initial_rho(Array1::from_vec(vec![0.5 * (lower + upper)]))
+            .with_seed_config(gam_solve::seeding::SeedConfig {
+                max_seeds: 1,
+                seed_budget: 1,
+                ..Default::default()
+            });
+        // A trial ρ whose penalized system cannot be factored or whose criterion
+        // is unbounded is a property of that trial, so the search retreats from it.
+        let refuse = |reason: String| EstimationError::TrialPointRefused { reason };
+        let mut objective = problem.build_objective(
+            (),
+            |_: &mut (), rho: &Array1<f64>| {
+                self.solve(rho[0]).map(|solve| solve.value).map_err(refuse)
+            },
+            |_: &mut (), rho: &Array1<f64>| {
+                let (cost, gradient, hessian) = self.jet(rho[0]).map_err(refuse)?;
+                Ok(OuterEval {
+                    cost,
+                    gradient: Array1::from_vec(vec![gradient]),
+                    hessian: HessianValue::Dense(Array2::from_elem((1, 1), hessian)),
+                    inner_beta_hint: None,
+                })
+            },
+            None::<fn(&mut ())>,
+            None::<fn(&mut (), &Array1<f64>) -> Result<gam_problem::EfsEval, EstimationError>>,
+        );
+        let result = problem
+            .run(&mut objective, "coactivation varying-coefficient REML")
+            .map_err(|error| format!("coactivation REML: smoothing selection failed: {error}"))?;
+        if !result.converged() {
+            return Err(format!(
+                "coactivation REML: the outer search stopped at log λ = {} without a \
+                 convergence certificate",
+                result.rho[0]
+            ));
         }
-        if f_c <= f_d {
-            right = d;
-            d = c;
-            f_d = f_c;
-            c = right - inv_phi * (right - left);
-            f_c = evaluate(c)?.reml_score;
-        } else {
-            left = c;
-            c = d;
-            f_c = f_d;
-            d = left + inv_phi * (right - left);
-            f_d = evaluate(d)?.reml_score;
-        }
+        Ok(result.rho[0])
     }
-    Ok(0.5 * (left + right))
 }
 
 fn difference_penalty(width: usize, order: usize) -> Result<Vec<Vec<f64>>, String> {
@@ -1064,6 +1152,72 @@ fn quadratic_form_matrix(x: &[f64], a: &[Vec<f64>]) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The closed-form REML jet against central differences of its own value
+    /// and gradient, and the engine's selection a local minimum of the value.
+    #[test]
+    fn varying_coefficient_reml_jet_matches_central_differences_2902() {
+        let n = 300usize;
+        let mut state = 0x2902_2902_u64;
+        let mut unit = move || {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (state >> 11) as f64 / (1u64 << 53) as f64
+        };
+        let mut design = Vec::with_capacity(n);
+        let mut y = Vec::with_capacity(n);
+        for _ in 0..n {
+            let x = 2.0 * unit() - 1.0;
+            let gate = 0.5 + unit();
+            let noise = unit() - 0.5;
+            design.push(vec![1.0, gate, gate * x, gate * x * x]);
+            y.push((1.0 + 0.5 * x) * gate + 0.3 * noise);
+        }
+        let weights = vec![1.0_f64; n];
+        let beta_penalty = difference_penalty(3, 1).expect("first-difference penalty");
+        let mut penalty = vec![vec![0.0_f64; 4]; 4];
+        for r in 0..3 {
+            for c in 0..3 {
+                penalty[r + 1][c + 1] = beta_penalty[r][c];
+            }
+        }
+        let problem =
+            GaussianRemlProblem::new(&design, &y, &weights, &penalty, 2).expect("REML problem");
+        let step = 1.0e-5;
+        for rho in [-3.0_f64, 0.0, 4.0] {
+            let (value, gradient, hessian) = problem.jet(rho).expect("jet");
+            assert_eq!(
+                value.to_bits(),
+                problem.solve(rho).expect("solve").value.to_bits()
+            );
+            let (value_up, gradient_up, _) = problem.jet(rho + step).expect("jet up");
+            let (value_down, gradient_down, _) = problem.jet(rho - step).expect("jet down");
+            let gradient_fd = (value_up - value_down) / (2.0 * step);
+            let hessian_fd = (gradient_up - gradient_down) / (2.0 * step);
+            assert!(
+                (gradient - gradient_fd).abs() <= 1.0e-5 * (1.0 + gradient.abs()),
+                "rho={rho}: V' {gradient} vs central difference {gradient_fd}"
+            );
+            assert!(
+                (hessian - hessian_fd).abs() <= 1.0e-5 * (1.0 + hessian.abs()),
+                "rho={rho}: V'' {hessian} vs central difference {hessian_fd}"
+            );
+        }
+        let selected = problem
+            .select_log_smoothing()
+            .expect("certified selection");
+        let selected_value = problem.solve(selected).expect("solve at selection").value;
+        for offset in [-1.0e-2_f64, 1.0e-2] {
+            let neighbour = problem.solve(selected + offset).expect("solve at neighbour");
+            assert!(
+                selected_value <= neighbour.value,
+                "selected log λ {selected} (V={selected_value}) is beaten at offset {offset} \
+                 (V={})",
+                neighbour.value
+            );
+        }
+    }
 
     #[test]
     fn robustness_radius_matches_direct_adversarial_reweighting_search() {
