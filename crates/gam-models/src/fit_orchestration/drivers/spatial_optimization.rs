@@ -2264,6 +2264,9 @@ enum JointSpatialKappaOutcome {
     DeclinedKeepIncumbent {
         baseline_score: f64,
         optimized_score: f64,
+        /// The κ trial's own timing. The route ran, so its cost is reported
+        /// whichever fit ships.
+        kappa_timing: SpatialLengthScaleOptimizationTiming,
     },
     /// The joint route could not be built for these terms at all.
     Unavailable,
@@ -2573,6 +2576,7 @@ fn try_exact_joint_spatial_length_scale_optimization(
         return Ok(JointSpatialKappaOutcome::DeclinedKeepIncumbent {
             baseline_score,
             optimized_score,
+            kappa_timing,
         });
     }
 
@@ -8974,6 +8978,7 @@ pub fn fit_term_collectionwith_spatial_length_scale_optimization(
         JointSpatialKappaOutcome::DeclinedKeepIncumbent {
             baseline_score,
             optimized_score,
+            kappa_timing,
         } => {
             // The route ran, graded its own candidate against the shipped
             // score and declined it. Shipping the incumbent is what the
@@ -9001,7 +9006,7 @@ pub fn fit_term_collectionwith_spatial_length_scale_optimization(
                 fit: fitted.fit,
                 design: fitted.design,
                 resolvedspec,
-                kappa_timing: None,
+                kappa_timing: Some(kappa_timing),
             });
         }
         JointSpatialKappaOutcome::Unavailable => {
@@ -9054,7 +9059,7 @@ pub fn fit_term_collectionwith_spatial_length_scale_optimization(
         fit: fitted.fit,
         design: fitted.design,
         resolvedspec,
-        kappa_timing: None,
+        kappa_timing: exact_joint.kappa_timing,
     })
 }
 
