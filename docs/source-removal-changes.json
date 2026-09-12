@@ -3231,5 +3231,26 @@
     ],
     "reason": "SPEC rules 18 and 22: the BLASSO harmonic dual supremum is taken from the trigonometric polynomial's exact stationary set, not a sampled grid with a capped polish",
     "evidence": "harmonic_dual_argmax took the argmax of a 4H-node grid and polished it with at most 64 Newton steps, keeping the grid node when the polish did not converge. Its only caller, harmonic_dual_birth_eta (reached from the sparse_dict/coordinate.rs harmonic lanes), now reads the supremum from crate::sparse_dict::harmonic_argmax over the same (c_h, s_h) coefficients: every stationary point of the degree-H polynomial isolated through its Chebyshev eliminant, the complete candidate set of a global maximum. harmonic_dual_derivative and harmonic_dual_second_derivative were called only by harmonic_dual_argmax. source_removal_guard.py over this landing's base..candidate blocks exactly these three items and passes with this entry."
+  },
+  {
+    "base": "d70ae015bf5840e209f66214a17f5397fb6cd323",
+    "items": [
+      "crates/gam-sae/src/sparse_dict/block.rs:fn:route_block_minibatch_dispatch"
+    ],
+    "reason": "#2826: a device-routed block minibatch is now coded on the device, so the per-minibatch dispatch returns finished codes; route_block_minibatch_dispatch (which returned only shortlists) became route_and_code_minibatch",
+    "evidence": "440cefbc7 replaced its only caller, route_and_code_all in crates/gam-sae/src/sparse_dict/block.rs, with route_and_code_minibatch, which routes through block_scoring_gpu::route_and_code_blocks on Linux under a non-Off policy and through route_block_minibatch plus code_routed_rows otherwise. scripts/source_removal_guard.py over d70ae015b..440cefbc7 names exactly this one item (production_occurrences 2: its definition and that call). The change was pushed unbuilt under the push-every-edit directive; the gam-sae block tests and the device bit-parity gate run in MSI pool job 448152 at 440cefbc7."
+  },
+  {
+    "base": "7e6a8ee739e711f8bd182af8865210a853b09135",
+    "items": [
+      "crates/gam-gpu/src/policy.rs:const:MATVEC_OFFLOAD_FLOPS_MIN",
+      "crates/gam-gpu/src/policy.rs:const:THIN_CURVE_MATVEC_OFFLOAD_FLOPS_MIN",
+      "crates/gam-gpu/src/policy.rs:fn:admission_lower_bound_undercounts_actual_work",
+      "crates/gam-gpu/src/policy.rs:fn:admission_work_lower_bound",
+      "crates/gam-gpu/src/policy.rs:fn:admits_llm_shape_with_one_cg_iter",
+      "crates/gam-gpu/src/policy.rs:fn:admits_thin_curve_atoms_at_realistic_scale"
+    ],
+    "reason": "SPEC rule 23: the reduced-Schur matvec offload floors were literals; the gate now admits at the device-calibrated dense launch crossover, so the two constants, the lower-bound work model and the tests that pinned them are retired",
+    "evidence": "da14e6ec0: MATVEC_OFFLOAD_FLOPS_MIN and THIN_CURVE_MATVEC_OFFLOAD_FLOPS_MIN had no source reference outside crates/gam-gpu/src/policy.rs (guard production_occurrences 0; the comments naming them in repro_2535.rs, arrow_schur/tests.rs and tests_device_engage_1783.rs were updated in the same commit). admission_work_lower_bound was called only by reduced_schur_matvec_should_offload and its own test, and is replaced by reduced_schur_matvec_solve_flops (the true cg_iters*n*(4dk+d^2) work). The three removed tests pinned the retired floors and model; reduced_schur_matvec_offload_tests now carries thin_curve_atoms_are_eligible_and_decided_by_the_calibrated_floor, any_policy_predicate_bounds_every_policy and solve_flops_count_both_cross_block_gemvs_and_the_row_solve, so the test count is unchanged (scripts/test_census.py over 7e6a8ee73..da14e6ec0 verifies with no loss). scripts/source_removal_guard.py over the same range names exactly these six items. The named tests run in MSI pool job 450777 on an A100."
   }
 ]
