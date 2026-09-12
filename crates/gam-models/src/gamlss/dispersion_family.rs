@@ -1905,9 +1905,28 @@ pub(crate) struct DispersionGlmLocationScaleTermBuilder {
     pub(crate) noise_offset: Array1<f64>,
 }
 
-/// Warm start for a dispersion location-scale fit: project a link-transformed
-/// response onto the mean block and seed the log-precision block at a constant
-/// (precision ≈ 1) baseline. The block-cyclic IRLS then refines both jointly.
+/// Warm start for a dispersion location-scale fit: each channel's target is the
+/// iteratively reweighted least-squares working response of its link, projected
+/// onto the channel's block; the block-cyclic IRLS then refines both jointly.
+///
+/// Mean. The working response `g(m) + (y − m)·g'(m)` evaluated at the saturated
+/// fit `m = y` is the link transform `g(y)` itself. For the logit mean that covers
+/// every admissible response (`0 < y < 1`), and for the log mean every positive
+/// response. A zero count, where `m = y` lies outside the log link's domain, takes
+/// the working response at the pooled mean `μ̄` instead, `ln μ̄ + (0 − μ̄)/μ̄`. No
+/// response needs a floor or a clamp.
+///
+/// Precision. Smyth's double GLM: `dᵢ` is the moment statistic whose expectation is
+/// the member's dispersion `ϕ` at the seeded mean (`e²/μ²` Gamma, `(e² − μ)/μ²`
+/// negative binomial, `e²/μ^p` Tweedie), pooled to `ϕ̄`, and the log-link working
+/// response `ln ϕ̄ + (dᵢ − ϕ̄)/ϕ̄` is negated onto the log-precision scale. It is
+/// linear in `dᵢ`, so a row whose excess moment is zero or negative gives a finite
+/// target rather than a pole, and no box is needed; a pooled dispersion that is not
+/// positive leaves the precision with no finite seed and is refused. Beta's mean
+/// and precision scores are not Fisher-orthogonal, so an outlying row near 0 or 1
+/// would pull the coupled mean before the joint likelihood settles; it keeps a
+/// constant seed at the pooled moment's precision (`e²/(μ(1 − μ))` estimates
+/// `1/(1 + φ)`), refused outside `0 < ϕ̄ < 1`.
 pub(crate) fn dispersion_location_scale_warm_start(
     kind: DispersionFamilyKind,
     y: &Array1<f64>,
@@ -1918,18 +1937,55 @@ pub(crate) fn dispersion_location_scale_warm_start(
     disp_beta_hint: Option<&Array1<f64>>,
 ) -> Result<(Array1<f64>, Array1<f64>), String> {
     let ridge_floor = 1e-10;
+    let tag = kind.family_tag();
+    // Rows with zero prior weight are exempt from the support check, so they enter
+    // no moment, and their targets take the pooled value so they stay finite.
+    let mut weight_sum = 0.0_f64;
+    let mut weighted_response = 0.0_f64;
+    for (&yi, &wi) in y.iter().zip(weights.iter()) {
+        if wi > 0.0 {
+            weight_sum += wi;
+            weighted_response += wi * yi;
+        }
+    }
+    if !(weight_sum > 0.0) {
+        return Err(format!(
+            "{tag}: the warm start needs positive total prior weight; got {weight_sum}"
+        ));
+    }
+    let pooled_mean = weighted_response / weight_sum;
     let mean_beta = if let Some(beta) = mean_beta_hint {
         beta.clone()
     } else {
-        let target = Array1::from_shape_fn(y.len(), |i| {
-            if kind.mean_is_logit() {
-                let yi = y[i].clamp(1e-3, 1.0 - 1e-3);
-                (yi / (1.0 - yi)).ln()
-            } else {
-                // log mean link; the +0.1 keeps zero counts finite.
-                (y[i].max(0.0) + 0.1).ln()
+        let target = if kind.mean_is_logit() {
+            let pooled_logit = (pooled_mean / (1.0 - pooled_mean)).ln();
+            Array1::from_shape_fn(y.len(), |i| {
+                if weights[i] > 0.0 {
+                    (y[i] / (1.0 - y[i])).ln()
+                } else {
+                    pooled_logit
+                }
+            })
+        } else {
+            if !(pooled_mean > 0.0) {
+                return Err(format!(
+                    "{tag}: the weighted mean response is {pooled_mean}, so the log mean has no \
+                     finite seed"
+                ));
             }
-        });
+            let log_pooled_mean = pooled_mean.ln();
+            // The working response at the pooled mean for a zero count.
+            let zero_count_target = log_pooled_mean + (0.0 - pooled_mean) / pooled_mean;
+            Array1::from_shape_fn(y.len(), |i| {
+                if !(weights[i] > 0.0) {
+                    log_pooled_mean
+                } else if y[i] > 0.0 {
+                    y[i].ln()
+                } else {
+                    zero_count_target
+                }
+            })
+        };
         solve_penalizedweighted_projection(
             &mean_block.design,
             &mean_block.offset,
@@ -1943,24 +1999,65 @@ pub(crate) fn dispersion_location_scale_warm_start(
     let disp_beta = if let Some(beta) = disp_beta_hint {
         beta.clone()
     } else {
-        // Seed the precision block from a smoothed method-of-moments surface
-        // rather than the old flat η_d=0 constant.  A single observation cannot
-        // identify its own variance, but for the Fisher-orthogonal dispersion
-        // members the residual-squared moment contains the correct first-order
-        // signal:
-        //
-        //   Gamma:   Var(Y)=μ²/ν              ⇒ log ν     ≈ log(μ²/e²)
-        //   NB2:     Var(Y)=μ+μ²/θ            ⇒ log θ     ≈ log(μ²/(e²-μ))
-        //   Tweedie: Var(Y)=φ μ^p, η_d=log1/φ ⇒ η_d       ≈ log(μ^p/e²)
-        //
-        // The targets are deliberately conservative (finite residual floor,
-        // precision cap, and no fixture-specific constants): they only give the
-        // block-cyclic likelihood solve a correctly-signed non-flat starting
-        // surface, while the final estimate is still the penalized joint MLE.
         let mean_eta = mean_block.design.apply(&mean_beta) + &mean_block.offset;
-        let target = Array1::from_shape_fn(y.len(), |i| {
-            dispersion_moment_log_precision_seed(kind, y[i], mean_eta[i])
-        });
+        let mut moment = Array1::<f64>::zeros(y.len());
+        let mut weighted_moment = 0.0_f64;
+        for i in 0..y.len() {
+            if !(weights[i] > 0.0) {
+                continue;
+            }
+            let mu = if kind.mean_is_logit() {
+                gam_linalg::utils::stable_logistic(mean_eta[i])
+            } else {
+                mean_eta[i].exp()
+            };
+            let e2 = (y[i] - mu) * (y[i] - mu);
+            let d = match kind {
+                DispersionFamilyKind::NegativeBinomial => (e2 - mu) / (mu * mu),
+                DispersionFamilyKind::Gamma => e2 / (mu * mu),
+                DispersionFamilyKind::Tweedie { p } => e2 / mu.powf(p),
+                DispersionFamilyKind::Beta => e2 / (mu * (1.0 - mu)),
+            };
+            if !d.is_finite() {
+                return Err(format!(
+                    "{tag}: the dispersion moment is not representable at row {i} (seeded mean \
+                     {mu:e}, response {})",
+                    y[i]
+                ));
+            }
+            moment[i] = d;
+            weighted_moment += weights[i] * d;
+        }
+        let pooled_dispersion = weighted_moment / weight_sum;
+        let target = match kind {
+            DispersionFamilyKind::Beta => {
+                if !(pooled_dispersion > 0.0 && pooled_dispersion < 1.0) {
+                    return Err(format!(
+                        "{tag}: the pooled moment e²/(μ(1 − μ)) about the seeded mean is \
+                         {pooled_dispersion}, outside (0, 1), so the Beta precision has no \
+                         finite seed"
+                    ));
+                }
+                Array1::from_elem(y.len(), (1.0 / pooled_dispersion - 1.0).ln())
+            }
+            _ => {
+                if !(pooled_dispersion > 0.0) {
+                    return Err(format!(
+                        "{tag}: the pooled dispersion moment about the seeded mean is \
+                         {pooled_dispersion}; with no variance beyond the member's variance \
+                         function the precision has no finite seed"
+                    ));
+                }
+                let log_pooled = pooled_dispersion.ln();
+                Array1::from_shape_fn(y.len(), |i| {
+                    if weights[i] > 0.0 {
+                        -(log_pooled + (moment[i] - pooled_dispersion) / pooled_dispersion)
+                    } else {
+                        -log_pooled
+                    }
+                })
+            }
+        };
         solve_penalizedweighted_projection(
             &disp_block.design,
             &disp_block.offset,
@@ -1972,81 +2069,6 @@ pub(crate) fn dispersion_location_scale_warm_start(
         )?
     };
     Ok((mean_beta, disp_beta))
-}
-
-#[inline]
-fn dispersion_moment_log_precision_seed(kind: DispersionFamilyKind, yi: f64, eta_mu: f64) -> f64 {
-    const LOG_PRECISION_FLOOR: f64 = -10.0;
-    const LOG_PRECISION_CEILING: f64 = 10.0;
-    let em = eta_mu;
-    let raw = match kind {
-        DispersionFamilyKind::Beta => {
-            // Beta's mean and precision scores are not Fisher-orthogonal in
-            // the (logit μ, log φ) parameterization.  Per-row residual moments
-            // therefore make a poor block-cyclic seed: an outlying y near 0/1
-            // can imply a near-zero φ and pull the coupled mean block onto the
-            // boundary before the joint likelihood has had a chance to settle.
-            // Keep the neutral precision seed for this one coupled member; the
-            // exact Beta cross-Hessian below still drives the joint solve and
-            // covariance with the coherent two-block likelihood geometry.
-            0.0
-        }
-        DispersionFamilyKind::Gamma => {
-            let mu = em.exp().max(1e-12);
-            let e2 = (yi - mu).powi(2).max(1e-8 * mu * mu);
-            (mu * mu / e2).max(1e-6).ln()
-        }
-        DispersionFamilyKind::NegativeBinomial => {
-            let mu = em.exp().max(1e-12);
-            let e2 = (yi - mu).powi(2);
-            // `theta_hat_row = mu^2/(e^2 - mu)` inverts a statistic whose
-            // sampling distribution STRADDLES ZERO, so the denominator has a
-            // pole inside the range the data can produce. The signal is
-            // `E[e^2 - mu] = mu^2/theta`; the noise on the same quantity is
-            // `sd[e^2] = sqrt(mu + 2 mu^2)` (Poisson-limit fourth central
-            // moment `mu + 3 mu^2`, less `(mu + mu^2)^2`'s leading `mu^2`),
-            // i.e. `~ sqrt(2) * mu`. Signal-to-noise is `~ (mu/theta)/sqrt(2)`,
-            // well under one for every `theta >~ mu`, so a large fraction of
-            // rows come out with a NEGATIVE excess carrying no information
-            // about theta at all.
-            //
-            // The old relative guard `1e-6 * (mu + mu^2)` is not a floor on
-            // anything measurable: it sits six orders of magnitude BELOW that
-            // noise, so a negative row lands on it and seeds
-            // `log theta = ln(1e6 * mu/(1 + mu)) -> ~13.8`, which
-            // `LOG_PRECISION_CEILING` then clamps to +10 -- `theta = 22026`,
-            // numerically Poisson -- for every such row. Measured: 49% of rows
-            // on the #1119 NB fixture and 61% on the generate fixture seeded at
-            // that cap. (The fraction is regime-dependent, not a fixed half:
-            // `e^2 <= mu` is `|y - mu| <= sqrt(mu)`, whose probability falls as
-            // the overdispersion grows. Both measurements are large.)
-            //
-            // The Gamma/Beta/Tweedie siblings cannot reach this state, which is
-            // why the NB arms are the only red ones in two different files
-            // whose siblings are all green: Gamma floors `e^2` itself at
-            // `1e-8 mu^2`, so saturating needs `|y - mu| <= 1e-4 mu`; Tweedie
-            // likewise floors `e^2`, and has the `y = 0` atom besides; Beta
-            // deliberately seeds a flat 0.0. Only NB floors a SIGNED
-            // difference, and only a signed difference has a pole.
-            //
-            // So floor the denominator at the statistic's own sampling
-            // resolution. The resulting cap `theta_seed <= mu^2/sqrt(mu + 2
-            // mu^2) ~ mu/sqrt(2)` errs toward MORE overdispersion -- the
-            // direction in which the log-theta Fisher information is largest
-            // (see `nb_log_precision_fisher_jensen`) -- so the block-cyclic
-            // solve still gets a usable gradient and can climb back out. Do not
-            // "simplify" this to a relative floor: the quantity being floored
-            // is not small, it is NOISE, and a relative floor cannot know that.
-            let excess = (e2 - mu).max((mu + 2.0 * mu * mu).sqrt());
-            (mu * mu / excess).max(1e-6).ln()
-        }
-        DispersionFamilyKind::Tweedie { p } => {
-            let mu = em.exp().max(1e-12);
-            let e2 = (yi - mu).powi(2).max(1e-8 * mu.powf(p));
-            (mu.powf(p) / e2).max(1e-6).ln()
-        }
-    };
-    raw.clamp(LOG_PRECISION_FLOOR, LOG_PRECISION_CEILING)
 }
 
 impl LocationScaleFamilyBuilder for DispersionGlmLocationScaleTermBuilder {
