@@ -42,7 +42,7 @@ The one global flag is `--log-level`.
 
 | Command | Arguments and flags |
 |---|---|
-| `fit` | `DATA`, `FORMULA`; `--request`, `--ctn-stage1`, `--precision-hyperpriors`, `--latent-coordinates`, `--analytic-penalties`, `--smooth-descriptors`, `--predict-noise`, `--slope-formula`, `--z-column`, `--weights-column`, `--offset-column`, `--noise-offset-column`, `--frailty-kind`, `--frailty-sd`, `--hazard-loading`, `--transformation-normal`, `--firth`, `--family`, `--negative-binomial-theta`, `--expectile-tau`, `--survival-likelihood`, `--survival-time-anchor`, baseline and time-basis controls, `--scale-dimensions`, `--precompute-conformal`, `--inference`, `--persistent-warm-start-root`, `--out` |
+| `fit` | `DATA`, `FORMULA`; `--request`, `--ctn-stage1`, `--precision-hyperpriors`, `--latent-coordinates`, `--analytic-penalties`, `--smooth-descriptors`, `--predict-noise`, `--slope-formula`, `--z-column`, `--weights-column`, `--offset-column`, `--noise-offset-column`, `--frailty-kind`, `--frailty-sd`, `--hazard-loading`, `--transformation-normal`, `--firth`, `--family`, `--negative-binomial-theta`, `--expectile-tau`, `--survival-likelihood`, baseline and time-basis controls, `--scale-dimensions`, `--precompute-conformal`, `--inference`, `--persistent-warm-start-root`, `--out` |
 | `predict` | `MODEL NEW_DATA --out`; offset/noise-offset/ID, `--uncertainty`, `--level`, `--covariance-mode` |
 | `transformation-score` | `MODEL LABELLED_DATA --out`; offset and ID columns |
 | `diagnose` | `MODEL DATA [--alo]` |

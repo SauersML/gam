@@ -122,10 +122,6 @@ fn fit_request_document_from_fit_args(
         // `None` (flag unset) flows through so the Surv() seam resolves the one
         // canonical default; `Some(mode)` is the explicit request (#2301).
         survival_likelihood: args.survival_likelihood.clone(),
-        // The baseline time-basis anchor is part of the scientific model
-        // configuration this document is supposed to carry in full — the flag
-        // declares a conflict with `--request` on exactly that premise (#2631).
-        survival_time_anchor: args.survival_time_anchor,
         threshold_time_k: args.threshold_time_k,
         time_basis: Some(args.time_basis.clone()),
         transformation_normal: args.transformation_normal.then_some(true),
@@ -1803,8 +1799,7 @@ pub(crate) fn validate_fit_args_preflight(
                 "--family royston-parmar requires a Surv(entry, exit, event) response".to_string(),
             );
         }
-        if args.survival_time_anchor.is_some()
-            || fit_config.baseline_scale.is_some()
+        if fit_config.baseline_scale.is_some()
             || fit_config.baseline_shape.is_some()
             || fit_config.baseline_rate.is_some()
             || fit_config.baseline_makeham.is_some()

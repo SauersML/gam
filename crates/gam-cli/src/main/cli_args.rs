@@ -204,7 +204,6 @@ pub(crate) struct FitArgs {
             "negative_binomial_theta",
             "expectile_tau",
             "survival_likelihood",
-            "survival_time_anchor",
             "baseline_target",
             "baseline_scale",
             "baseline_shape",
@@ -315,12 +314,6 @@ pub(crate) struct FitArgs {
     /// transformation for Surv() formulas.
     #[arg(long = "survival-likelihood", value_parser = crate::config_resolve::parse_survival_likelihood_cli)]
     pub(crate) survival_likelihood: Option<String>,
-    /// Centering anchor for the baseline time basis, in the data's own time
-    /// units. Honored by every survival likelihood. Omit to let the fit choose:
-    /// the robust interior median exit for marginal-slope and for any genuinely
-    /// left-truncated dataset, the earliest entry age otherwise.
-    #[arg(long = "survival-time-anchor", value_parser = parse_nonnegative_f64_cli)]
-    pub(crate) survival_time_anchor: Option<f64>,
     /// Baseline target for transformation survival mode.
     #[arg(long = "baseline-target", default_value = "linear", value_parser = crate::config_resolve::parse_baseline_target_cli)]
     pub(crate) baseline_target: String,

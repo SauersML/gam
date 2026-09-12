@@ -177,10 +177,8 @@ pub struct FitRequestConfigDocument {
     /// exit for marginal-slope and for any genuinely left-truncated dataset
     /// (#751/#1790), the earliest entry age otherwise.
     ///
-    /// The CLI's `--survival-time-anchor` declares a conflict with `--request` on
-    /// the premise that this document carries the complete scientific model
-    /// configuration; until #2631 the document had no field for it, so the
-    /// premise was false.
+    /// Until #2631 this document had no field for the anchor, so a complete
+    /// request could not carry it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub survival_time_anchor: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]

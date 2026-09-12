@@ -2086,7 +2086,7 @@ pub fn predict_survival(
     // earliest entry, i.e. the time origin, where `I_k(left) = 0` exactly and
     // the shift is zero. It appears the moment the anchor moves — on any
     // genuinely left-truncated dataset, which takes the robust interior anchor
-    // by rule (#751/#1790/#2631), and on any explicit `--survival-time-anchor`.
+    // by rule (#751/#1790/#2631), and on any explicit `survival_time_anchor`.
     //
     // Measured on a 1200-row `Surv(entry, exit, event) ~ s(x)` fit with hazard
     // `0.4·exp(0.9x)` (gam#2705): the same data fitted at anchor `1e-7` and at

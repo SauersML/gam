@@ -72,7 +72,6 @@ gam fit train.csv 'Surv(entry, exit, event) ~ s(age) + bmi' \
 | `--time-basis ispline|none` | Structural survival time basis. `linear` and `bspline` are rejected by the CLI. |
 | `--threshold-time-k N`, `--sigma-time-k N` | Enable time-varying threshold or scale tensor blocks. |
 | `--slope-time-k N` | Let the marginal-slope effect vary along follow-up: tensors the slope design against a B-spline margin in `log(time)`. |
-| `--survival-time-anchor VALUE` | Centering anchor for the baseline time basis, in the data's own time units, honored by every survival likelihood. Omit it to let the fit choose: the robust interior median exit for `marginal-slope` and for any genuinely left-truncated dataset (any row entering above the time origin), the earliest entry age otherwise. Re-centering is an exact affine reparameterization of the baseline offset, so this picks the frame the smoothing selection sees, not the model. Also settable as `survival_time_anchor` in a `--request` document and as `survival_time_anchor=` in `gamfit.fit`. |
 | `--slope-formula RHS`, `--z-column COLUMN` | Marginal-slope score-effect model. |
 | `--frailty-kind gaussian-shift|hazard-multiplier`, `--frailty-sd VALUE`, `--hazard-loading full|loaded-vs-unloaded` | Frailty controls. |
 
