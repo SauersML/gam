@@ -896,16 +896,16 @@ fn standing_sparse_null_calibration(
         summaries: vec![null_summary],
     };
     // Spike-in power: plant a synthetic circle into the real audit residuals and
-    // measure the default block-chart/topology detector's recovery rate at the
-    // requested false-positive operating point. Bootstrapping the empirical
-    // residual rows keeps the real post-fit covariance and tails in the loop.
+    // measure how often the default detector's statistic clears its null
+    // quantile at the requested false-positive operating point. Bootstrapping the
+    // empirical residual rows keeps the real post-fit covariance and tails in the loop.
     let mut roc_config = nb::SpikeInRocConfig::circle(
         vec![0.0, cfg.spikein_snr],
         cfg.spikein_trials,
         cfg.null_seed,
+        vec![cfg.spikein_false_positive_rate],
     );
     roc_config.noise_mode = nb::SpikeInNoiseMode::EmpiricalResidualBootstrap;
-    roc_config.fpr_levels = vec![cfg.spikein_false_positive_rate];
     let roc = nb::default_spike_in_roc_curve(residuals_f64, &roc_config)?;
     let report = nb::calibrated_roc_claim_report(
         "audit_sae.topology_atlas_nerve",

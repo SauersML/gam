@@ -50,14 +50,6 @@ const HADAMARD_PERMUTATION_SEED_DOMAIN: u64 = 0x4841_4441_5045_524D;
 const HADAMARD_SIGN_SEED_DOMAIN: u64 = 0x4841_4441_5349_474E;
 const PER_DIMENSION_SHUFFLE_SEED_DOMAIN: u64 = 0x5045_5244_494D_5348;
 
-/// Constant-factor slack on a first-order roundoff bound. The call sites already
-/// carry the explicit `n * eps` term (`p * eps * trace` for the symmetric
-/// eigendecomposition's backward error; `m * eps / (1 - m * eps)` for a
-/// length-`m` accumulation); this is the `O(1)` factor in front of it. A bound
-/// multiplier, never a tuning knob -- enlarging it widens an acceptance
-/// envelope, it does not change any estimate.
-const ROUNDOFF_BOUND_SLACK: f64 = 64.0;
-
 /// Direction of the claim statistic under the null.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Tail {
@@ -274,13 +266,6 @@ impl SpikeInShape {
             SpikeInShape::Torus => 4,
         }
     }
-
-    fn expected_betti(self) -> (usize, usize, usize) {
-        match self {
-            SpikeInShape::Circle => (1, 1, 0),
-            SpikeInShape::Torus => (1, 2, 1),
-        }
-    }
 }
 
 /// How trial noise is drawn before a synthetic topology is injected.
@@ -311,27 +296,17 @@ pub struct SpikeInRocConfig {
 }
 
 impl SpikeInRocConfig {
-    pub fn circle(snrs: Vec<f64>, trials: usize, seed: u64) -> Self {
+    /// Circle spike-in against phase-randomized residual noise, reported at the
+    /// caller's false-positive rates: the operating points belong to the claim
+    /// being calibrated, not to the harness.
+    pub fn circle(snrs: Vec<f64>, trials: usize, seed: u64, fpr_levels: Vec<f64>) -> Self {
         Self {
             shape: SpikeInShape::Circle,
             snrs,
             trials,
             seed,
-            // reporting-only: FPR operating points at which spike-in ROC TPR is reported.
-            fpr_levels: vec![0.01, 0.05, 0.10],
+            fpr_levels,
             noise_mode: SpikeInNoiseMode::PhaseRandomizedResidual,
-        }
-    }
-
-    pub fn torus(snrs: Vec<f64>, trials: usize, seed: u64) -> Self {
-        Self {
-            shape: SpikeInShape::Torus,
-            snrs,
-            trials,
-            seed,
-            // reporting-only: FPR operating points at which spike-in ROC TPR is reported.
-            fpr_levels: vec![0.01, 0.05, 0.10],
-            noise_mode: SpikeInNoiseMode::EmpiricalResidualBootstrap,
         }
     }
 }
@@ -346,31 +321,13 @@ pub struct ResidualMomentSpec {
     pub excess_kurtosis: f64,
 }
 
-/// Block-chart promotion plus topology-audit verdict for one detection run.
+/// Detector statistic for one detection run. It carries no verdict of its own:
+/// a run is a detection only against null draws of the same statistic, in
+/// [`spike_in_roc_curve`].
 #[derive(Clone, Debug)]
 pub struct DetectionPipelineReport {
     pub shape: SpikeInShape,
     pub statistic: f64,
-    pub promoted: bool,
-    pub topology: TopologyAuditReport,
-    pub detected: bool,
-}
-
-/// Lightweight topology audit payload carried by spike-in ROC points. The
-/// measured Betti numbers are the detector's auditable claim for the supplied
-/// residual matrix, not a latched topology label.
-#[derive(Clone, Debug)]
-pub struct TopologyAuditReport {
-    pub expected_betti0: usize,
-    pub expected_betti1: usize,
-    pub expected_betti2: usize,
-    pub measured_betti0: usize,
-    pub measured_betti1: usize,
-    pub measured_betti2: usize,
-    pub rank_energy: f64,
-    pub spectral_balance: f64,
-    pub residual_tail_energy: f64,
-    pub accepted: bool,
 }
 
 /// One ROC operating point at a fixed false-positive-rate threshold.
@@ -387,8 +344,6 @@ pub struct SpikeInRocPoint {
     pub snr: f64,
     pub trials: usize,
     pub mean_stat: f64,
-    pub promoted_fraction: f64,
-    pub topology_accept_fraction: f64,
     pub roc: Vec<SpikeInRocThreshold>,
 }
 
@@ -1558,28 +1513,36 @@ fn stable_population_moments(data: ArrayView2<'_, f64>) -> Result<StablePopulati
 }
 
 /// Certify that a symmetric covariance eigenspectrum is positive semidefinite
-/// up to the backward error of its eigendecomposition. A negative eigenvalue
-/// no larger than `64 * p * eps * trace` in magnitude is numerical zero; a
-/// value beyond that scale-relative envelope is a material indefiniteness and
-/// must not be silently projected into a different covariance.
+/// up to the error its computation can have introduced. By Weyl's inequality a
+/// PSD matrix perturbed by `E` has no eigenvalue below `−‖E‖₂`, and two
+/// perturbations reach the spectrum: the entrywise rounding of the matrix
+/// itself, bounded in Frobenius norm by `formation_band` (counted by the caller
+/// at the site that builds the matrix), and the symmetric eigensolver's backward
+/// error `p·ε·max|λ̂|`. A negative eigenvalue inside their sum is numerical
+/// zero; one beyond it is material indefiniteness and must not be silently
+/// projected into a different covariance.
 fn certified_covariance_spectrum(
     eigenvalues: ArrayView1<'_, f64>,
-    covariance_trace: f64,
+    formation_band: f64,
 ) -> Result<Vec<f64>, String> {
-    if !covariance_trace.is_finite() || covariance_trace < 0.0 {
+    if !formation_band.is_finite() || formation_band < 0.0 {
         return Err(format!(
-            "covariance trace must be finite and non-negative; got {covariance_trace}"
+            "covariance formation band must be finite and non-negative; got {formation_band}"
         ));
     }
-    let tolerance =
-        ROUNDOFF_BOUND_SLACK * eigenvalues.len() as f64 * f64::EPSILON * covariance_trace;
-    let mut certified = Vec::with_capacity(eigenvalues.len());
+    let mut largest_magnitude = 0.0_f64;
     for (axis, &eigenvalue) in eigenvalues.iter().enumerate() {
         if !eigenvalue.is_finite() {
             return Err(format!(
                 "covariance eigenvalue {axis} is non-finite: {eigenvalue}"
             ));
         }
+        largest_magnitude = largest_magnitude.max(eigenvalue.abs());
+    }
+    let tolerance =
+        eigenvalues.len() as f64 * f64::EPSILON * largest_magnitude + formation_band;
+    let mut certified = Vec::with_capacity(eigenvalues.len());
+    for (axis, &eigenvalue) in eigenvalues.iter().enumerate() {
         if eigenvalue < -tolerance {
             return Err(format!(
                 "covariance is materially indefinite: eigenvalue {axis}={eigenvalue:.6e} is below the numerical PSD tolerance -{tolerance:.6e}"
@@ -1626,7 +1589,15 @@ pub fn covariance_matched_gaussian_null(
     let (eigenvalues, eigenvectors) = normalized_covariance.eigh(Side::Lower).map_err(|error| {
         format!("covariance-matched Gaussian eigendecomposition failed: {error}")
     })?;
-    let eigenvalues = certified_covariance_spectrum(eigenvalues.view(), normalized_trace)?;
+    // Each normalized entry is a compensated sum of products `x_l·x_r` of unit-
+    // chart residuals (one rounding each), folded with its correction, divided
+    // by `n`, restored through the two factors of `balanced_finite_product` and
+    // divided by `covariance_scale`: six roundings on top of the compensated
+    // sum's own. Rounding the residuals themselves perturbs no Gram structure.
+    // The entry error is that band on `Σ|x_l x_r| ≤ √(C_ll C_rr)`, so its
+    // Frobenius norm is the same band on the trace.
+    let formation_band = gam_linalg::roundoff::compensated_band(6, normalized_trace);
+    let eigenvalues = certified_covariance_spectrum(eigenvalues.view(), formation_band)?;
     let covariance_root_scale = covariance_scale.sqrt();
 
     let mut rng = StdRng::seed_from_u64(seed);
@@ -1897,8 +1868,9 @@ pub fn inject_spike(
     }
 }
 
-/// Default detector used by the calibration harness: a block-chart promotion
-/// gate followed by a topology audit for the requested planted shape.
+/// Default detector used by the calibration harness: the planted shape's
+/// statistic, the frequency-1 harmonic score for a circle and the leading
+/// four-plane energy fraction for a torus.
 pub fn default_spike_in_detection_pipeline(
     data: ArrayView2<'_, f64>,
     shape: SpikeInShape,
@@ -1911,46 +1883,17 @@ pub fn default_spike_in_detection_pipeline(
             data.ncols()
         ));
     }
-    let (eigenvalues, total_energy) = centered_covariance_spectrum(data, rank + 1)?;
     let statistic = match shape {
         SpikeInShape::Circle => harmonic_circle_detector_stat(data)?,
-        SpikeInShape::Torus => {
-            let rank_sum = eigenvalues.iter().take(rank).sum::<f64>();
-            if total_energy > 0.0 {
-                certify_unit_interval(
-                    rank_sum / total_energy,
-                    data.ncols().saturating_mul(128),
-                    "torus rank-energy fraction",
-                )?
-            } else {
-                0.0
-            }
-        }
+        SpikeInShape::Torus => leading_energy_fraction(data, rank)?,
     };
-    // reporting-only: heuristic promotion floors on the shape detector statistic;
-    // they gate the reported promote/hold verdict, not any estimated quantity.
-    let promotion_floor = match shape {
-        SpikeInShape::Circle => 0.10, // reporting-only
-        SpikeInShape::Torus => 0.55,  // reporting-only
-    };
-    let promoted = statistic >= promotion_floor;
-    let topology = match shape {
-        SpikeInShape::Circle => circle_topology_audit_from_harmonic_stat(statistic, &eigenvalues),
-        SpikeInShape::Torus => topology_audit_from_spectrum(shape, statistic, &eigenvalues),
-    };
-    let detected = promoted && topology.accepted;
-    Ok(DetectionPipelineReport {
-        shape,
-        statistic,
-        promoted,
-        topology,
-        detected,
-    })
+    Ok(DetectionPipelineReport { shape, statistic })
 }
 
 /// Run the spike-in ROC calibration on residual noise with a caller-supplied
-/// detector. The detector should execute the same block-chart promotion and
-/// topology audit used by the production claim.
+/// detector. The detector should compute the statistic the production claim
+/// reports; a trial is a detection at a false-positive rate exactly when its
+/// statistic exceeds the null quantile at that rate.
 pub fn spike_in_roc_curve<F>(
     residual_noise: ArrayView2<'_, f64>,
     config: &SpikeInRocConfig,
@@ -1988,20 +1931,12 @@ where
     for &snr in &config.snrs {
         let mut reports = Vec::with_capacity(config.trials);
         let mut stat_sum = 0.0_f64;
-        let mut promoted = 0usize;
-        let mut topology_accepted = 0usize;
         for trial in 0..config.trials {
             let trial_seed = mix_seed(config.seed, 0, trial as u64);
             let noise = draw_spike_in_noise(residual_noise, config.noise_mode, trial_seed)?;
             let spiked = inject_spike(noise.view(), config.shape, snr, trial_seed ^ 0x5F1E_51A5)?;
             let report = detector(spiked.view())?;
             require_finite(report.statistic, "spike-in detection statistic")?;
-            if report.promoted {
-                promoted += 1;
-            }
-            if report.topology.accepted {
-                topology_accepted += 1;
-            }
             stat_sum += report.statistic;
             reports.push(report);
         }
@@ -2009,9 +1944,7 @@ where
         for &(fpr, threshold) in &thresholds {
             let hits = reports
                 .iter()
-                .filter(|report| {
-                    report.promoted && report.topology.accepted && report.statistic > threshold
-                })
+                .filter(|report| report.statistic > threshold)
                 .count();
             roc.push(SpikeInRocThreshold {
                 false_positive_rate: fpr,
@@ -2023,15 +1956,13 @@ where
             snr,
             trials: config.trials,
             mean_stat: stat_sum / config.trials as f64,
-            promoted_fraction: promoted as f64 / config.trials as f64,
-            topology_accept_fraction: topology_accepted as f64 / config.trials as f64,
             roc,
         });
     }
     Ok(curve)
 }
 
-/// Convenience wrapper for the default block-chart/topology detector.
+/// Convenience wrapper for [`default_spike_in_detection_pipeline`].
 pub fn default_spike_in_roc_curve(
     residual_noise: ArrayView2<'_, f64>,
     config: &SpikeInRocConfig,
@@ -2135,7 +2066,7 @@ pub fn harmonic_circle_detector_stat(data: ArrayView2<'_, f64>) -> Result<f64, S
         return Ok(0.0);
     }
 
-    let mut total_plane_energy = ScaledSumSquares::default();
+    let mut scores = Array2::<f64>::zeros((n, plane.len()));
     let mut plane_cos = vec![0.0_f64; plane.len()];
     let mut plane_sin = vec![0.0_f64; plane.len()];
     for i in 0..n {
@@ -2147,28 +2078,34 @@ pub fn harmonic_circle_detector_stat(data: ArrayView2<'_, f64>) -> Result<f64, S
             for j in 0..p {
                 score += centered[[i, j]] * direction[j];
             }
-            total_plane_energy.add(score)?;
+            scores[[i, axis]] = score;
             plane_cos[axis] += score * c;
             plane_sin[axis] += score * s;
         }
     }
-    if total_plane_energy.scale == 0.0 {
-        return Ok(0.0);
-    }
 
-    let mut coefficient_energy = ScaledSumSquares::default();
-    for &value in plane_cos.iter().chain(plane_sin.iter()) {
-        coefficient_energy.add(value)?;
+    // For `n ≥ 3` the frequency-1 cosine and sine are orthogonal with squared
+    // norm `n/2`, so each axis splits into its harmonic projection, of energy
+    // `(2/n)(a² + b²)`, and a residual orthogonal to it. Scoring the fraction
+    // as fit over fit-plus-residual keeps it inside `[0, 1]` by construction.
+    let harmonic_weight = 2.0 / n as f64;
+    let coefficient_weight = harmonic_weight.sqrt();
+    let mut fit_energy = ScaledSumSquares::default();
+    for axis in 0..plane.len() {
+        fit_energy.add(coefficient_weight * plane_cos[axis])?;
+        fit_energy.add(coefficient_weight * plane_sin[axis])?;
     }
-    let scale_ratio = coefficient_energy.scale / total_plane_energy.scale;
-    let normalized_scale_ratio = scale_ratio * (2.0 / n as f64).sqrt();
-    let harmonic_fraction = certify_unit_interval(
-        normalized_scale_ratio
-            * normalized_scale_ratio
-            * (coefficient_energy.scaled_sum / total_plane_energy.scaled_sum),
-        n.saturating_mul(p).saturating_mul(32),
-        "harmonic-circle Fourier energy fraction",
-    )?;
+    let mut residual_energy = ScaledSumSquares::default();
+    for i in 0..n {
+        let theta = 2.0 * PI * i as f64 / n as f64;
+        let c = theta.cos();
+        let s = theta.sin();
+        for axis in 0..plane.len() {
+            let harmonic = harmonic_weight * (plane_cos[axis] * c + plane_sin[axis] * s);
+            residual_energy.add(scores[[i, axis]] - harmonic)?;
+        }
+    }
+    let harmonic_fraction = energy_fraction(fit_energy, residual_energy);
     let circle_balance = quadrature_balance(&plane_cos, &plane_sin)?;
     Ok(harmonic_fraction * circle_balance)
 }
@@ -2233,117 +2170,36 @@ fn roc_thresholds(
     Ok(thresholds)
 }
 
-fn circle_topology_audit_from_harmonic_stat(
-    statistic: f64,
-    eigenvalues: &[f64],
-) -> TopologyAuditReport {
-    let expected = SpikeInShape::Circle.expected_betti();
-    let leading = eigenvalues.first().copied().unwrap_or(0.0).max(0.0);
-    let second = eigenvalues.get(1).copied().unwrap_or(0.0).max(0.0);
-    let tail = eigenvalues.get(2).copied().unwrap_or(0.0).max(0.0);
-    let spectral_balance = nonnegative_ratio(second, leading);
-    let residual_tail_energy = nonnegative_ratio(tail, second);
-    let accepted = statistic >= 0.10; // reporting-only: heuristic acceptance floor for the reported Betti verdict.
-    let measured = if accepted { expected } else { (1, 0, 0) };
-    TopologyAuditReport {
-        expected_betti0: expected.0,
-        expected_betti1: expected.1,
-        expected_betti2: expected.2,
-        measured_betti0: measured.0,
-        measured_betti1: measured.1,
-        measured_betti2: measured.2,
-        rank_energy: statistic,
-        spectral_balance,
-        residual_tail_energy,
-        accepted,
-    }
-}
+/// Fraction of the centered energy carried by the leading `rank` principal axes
+/// of the unit-chart covariance Gram. The Gram's trace is the total energy, so
+/// the fraction is `top / (top + tail)` over its certified spectrum; both sums
+/// are of nonnegative eigenvalues, so it lies in `[0, 1]` exactly.
+fn leading_energy_fraction(data: ArrayView2<'_, f64>, rank: usize) -> Result<f64, String> {
+    use faer::Side;
+    use gam_linalg::faer_ndarray::FaerEigh;
 
-fn topology_audit_from_spectrum(
-    shape: SpikeInShape,
-    rank_energy: f64,
-    eigenvalues: &[f64],
-) -> TopologyAuditReport {
-    let rank = shape.signal_rank();
-    let expected = shape.expected_betti();
-    let leading = eigenvalues.first().copied().unwrap_or(0.0).max(0.0);
-    let rank_tail = eigenvalues.get(rank).copied().unwrap_or(0.0).max(0.0);
-    let weakest_signal = eigenvalues
-        .get(rank.saturating_sub(1))
-        .copied()
-        .unwrap_or(0.0)
-        .max(0.0);
-    let spectral_balance = nonnegative_ratio(weakest_signal, leading);
-    let residual_tail_energy = nonnegative_ratio(rank_tail, weakest_signal);
-    // reporting-only: heuristic spectral operating points gating the reported
-    // topology-audit verdict; not derived and not used as numeric estimates.
-    let accepted = match shape {
-        SpikeInShape::Circle => {
-            // reporting-only
-            rank_energy >= 0.45 && spectral_balance >= 0.25 && residual_tail_energy <= 0.75
-        }
-        SpikeInShape::Torus => {
-            // reporting-only
-            rank_energy >= 0.55 && spectral_balance >= 0.12 && residual_tail_energy <= 0.80
-        }
-    };
-    let measured = if accepted { expected } else { (1, 0, 0) };
-    TopologyAuditReport {
-        expected_betti0: expected.0,
-        expected_betti1: expected.1,
-        expected_betti2: expected.2,
-        measured_betti0: measured.0,
-        measured_betti1: measured.1,
-        measured_betti2: measured.2,
-        rank_energy,
-        spectral_balance,
-        residual_tail_energy,
-        accepted,
-    }
-}
-
-/// Leading eigenvalues and total energy of the centered covariance Gram in a
-/// shared unit chart. Both quantities carry the same omitted physical scale,
-/// which cancels in every detector ratio.
-fn centered_covariance_spectrum(
-    data: ArrayView2<'_, f64>,
-    count: usize,
-) -> Result<(Vec<f64>, f64), String> {
-    validate_matrix(data, "leading covariance eigenvalue input")?;
     let centered = centered_unit_chart(data)?;
-    let mut total_accumulator = ScaledSumSquares::default();
-    for &value in &centered {
-        total_accumulator.add(value)?;
-    }
-    let total = if total_accumulator.scale == 0.0 {
-        0.0
-    } else {
-        total_accumulator.scale * total_accumulator.scale * total_accumulator.scaled_sum
-    };
-    if !total.is_finite() {
-        return Err("unit-chart centered energy is not representable".to_string());
-    }
-    if count == 0 || total == 0.0 {
-        return Ok((Vec::new(), total));
-    }
-    let mut cov = centered.t().dot(&centered);
-    if cov.iter().any(|value| !value.is_finite()) {
+    let gram = centered.t().dot(&centered);
+    if gram.iter().any(|value| !value.is_finite()) {
         return Err("unit-chart covariance Gram is non-finite".to_string());
     }
-    let mut eigenvalues = Vec::with_capacity(count.min(cov.nrows()));
-    for idx in 0..count.min(cov.nrows()) {
-        let seed = mix_seed(0x5151_0000, idx as u64, cov.nrows() as u64);
-        let v = dominant_eigenvector(cov.view(), seed)?;
-        let mv = cov.dot(&v);
-        let lambda = v.dot(&mv).max(0.0);
-        eigenvalues.push(lambda);
-        for i in 0..cov.nrows() {
-            for j in 0..cov.ncols() {
-                cov[[i, j]] -= lambda * v[i] * v[j];
-            }
-        }
+    let trace = gram.diag().sum();
+    let (eigenvalues, _) = gram.eigh(Side::Lower).map_err(|error| {
+        format!("unit-chart covariance eigendecomposition failed: {error}")
+    })?;
+    // Each Gram entry is an `n`-term inner product of unit-chart columns, so to
+    // first order its rounding is `γ_n` on `Σ|x_l x_r| ≤ √(C_ll C_rr)`, and the
+    // Frobenius norm of the formation error is that band on the trace.
+    let formation_band = gam_linalg::roundoff::accumulation_band(data.nrows(), trace);
+    let spectrum = certified_covariance_spectrum(eigenvalues.view(), formation_band)?;
+    // The eigensolver returns the spectrum in ascending order.
+    let split = spectrum.len().saturating_sub(rank);
+    let tail: f64 = spectrum[..split].iter().sum();
+    let top: f64 = spectrum[split..].iter().sum();
+    if top == 0.0 {
+        return Ok(0.0);
     }
-    Ok((eigenvalues, total))
+    Ok(top / (top + tail))
 }
 
 fn cholesky_lower(matrix: ArrayView2<'_, f64>) -> Result<Array2<f64>, String> {
@@ -2378,13 +2234,13 @@ fn cholesky_lower(matrix: ArrayView2<'_, f64>) -> Result<Array2<f64>, String> {
 }
 
 fn standardized_lognormal_radial(excess_kurtosis: f64, rng: &mut StdRng) -> f64 {
-    if excess_kurtosis <= f64::MIN_POSITIVE {
+    if excess_kurtosis == 0.0 {
         1.0
     } else {
-        // Moment match: for a unit-mean log-normal radius exp(sigma*z - sigma^2/2),
-        // the excess kurtosis is a monotone function of sigma^2; this inverts its
-        // leading term, so sigma^2 = ln(1 + excess_kurtosis/3)/4 reproduces the
-        // requested tail weight (the /3 and /4 are the leading kurtosis coefficients).
+        // Moment match: the radius `R = exp(σz − σ²)` has `E[R²] = 1`, so it keeps
+        // the covariance, and `E[R⁴] = exp(4σ²)`, so a Gaussian coordinate scaled
+        // by it has kurtosis `3·exp(4σ²)`. Inverting gives
+        // `σ² = ln(1 + excess_kurtosis/3)/4` exactly.
         let sigma2 = (1.0 + excess_kurtosis / 3.0).ln() / 4.0;
         let sigma = sigma2.sqrt();
         let z = standard_normal(rng);
@@ -2392,15 +2248,26 @@ fn standardized_lognormal_radial(excess_kurtosis: f64, rng: &mut StdRng) -> f64 
     }
 }
 
+/// Winding of the planted torus's second angle: the integer coprime to `n`
+/// nearest `n/φ`, the Fibonacci-lattice multiplier. Coprimality makes the
+/// second angle visit each of the `n` phases once, and the golden ratio is the
+/// multiplier whose rank-1 lattice covers the square most uniformly, so the
+/// planted cloud spreads over the torus instead of tracing a thin knot.
 fn coprime_winding(n: usize) -> usize {
-    let mut winding = 3usize.min(n.saturating_sub(1).max(1));
-    while gcd(winding, n) != 1 {
-        winding += 1;
-        if winding >= n {
-            return 1;
+    let nearest = (n as f64 * (5.0_f64.sqrt() - 1.0) / 2.0).round() as usize;
+    let mut offset = 0usize;
+    loop {
+        let above = nearest + offset;
+        if above < n && gcd(above, n) == 1 {
+            return above;
         }
+        // Descending, the search reaches the winding 1, coprime to every `n`.
+        let below = nearest.saturating_sub(offset).max(1);
+        if gcd(below, n) == 1 {
+            return below;
+        }
+        offset += 1;
     }
-    winding
 }
 
 fn gcd(mut a: usize, mut b: usize) -> usize {
@@ -2458,15 +2325,13 @@ fn quadrature_balance(cos_coeff: &[f64], sin_coeff: &[f64]) -> Result<f64, Strin
     }
     let mut aa = 0.0_f64;
     let mut bb = 0.0_f64;
+    let mut ab = 0.0_f64;
     for (&c, &s) in cos_coeff.iter().zip(sin_coeff.iter()) {
         let c = c / scale;
         let s = s / scale;
         aa += c * c;
         bb += s * s;
-    }
-    let trace = aa + bb;
-    if trace == 0.0 {
-        return Ok(0.0);
+        ab += c * s;
     }
     // Lagrange's identity evaluates the Gram determinant as a sum of squares,
     // avoiding the catastrophic `aa*bb - ab^2` subtraction near collinearity.
@@ -2478,44 +2343,28 @@ fn quadrature_balance(cos_coeff: &[f64], sin_coeff: &[f64]) -> Result<f64, Strin
             determinant += cross * cross;
         }
     }
-    certify_unit_interval(
-        2.0 * determinant.sqrt() / trace,
-        cos_coeff.len().saturating_mul(32),
-        "harmonic quadrature balance",
-    )
+    // The balance `2√det/tr` of the quadrature Gram is the geometric over the
+    // arithmetic mean of its two eigenvalues. Since
+    // `tr² = 4·det + (aa − bb)² + (2ab)²`, it is `√(4·det / (4·det + imbalance))`
+    // over two nonnegative sums, which lies in `[0, 1]` exactly.
+    let four_determinant = 4.0 * determinant;
+    let imbalance = (aa - bb) * (aa - bb) + (2.0 * ab) * (2.0 * ab);
+    Ok((four_determinant / (four_determinant + imbalance)).sqrt())
 }
 
-fn nonnegative_ratio(numerator: f64, denominator: f64) -> f64 {
-    if denominator > 0.0 {
-        numerator / denominator
-    } else if numerator == 0.0 {
-        0.0
-    } else {
-        f64::INFINITY
+/// Fraction `part / (part + rest)` of two sums of squares, compared in the
+/// larger of their scales. Both terms are nonnegative, so the quotient lies in
+/// `[0, 1]` exactly; no energy at all is no fraction.
+fn energy_fraction(part: ScaledSumSquares, rest: ScaledSumSquares) -> f64 {
+    let scale = part.scale.max(rest.scale);
+    if scale == 0.0 {
+        return 0.0;
     }
-}
-
-/// Project a theoretically unit-interval quantity only inside a forward-error
-/// envelope derived from the number of accumulated floating-point terms.
-/// Values outside that envelope are a broken invariant, not something a clamp
-/// may conceal.
-fn certify_unit_interval(value: f64, term_count: usize, name: &str) -> Result<f64, String> {
-    if !value.is_finite() {
-        return Err(format!("{name} is non-finite: {value}"));
-    }
-    let accumulated = term_count.max(1) as f64 * (0.5 * f64::EPSILON);
-    if accumulated >= 0.25 {
-        return Err(format!(
-            "{name} cannot be certified at float64 precision for {term_count} accumulated terms"
-        ));
-    }
-    let tolerance = ROUNDOFF_BOUND_SLACK * accumulated / (1.0 - accumulated);
-    if value < -tolerance || value > 1.0 + tolerance {
-        return Err(format!(
-            "{name} left [0, 1] beyond its {tolerance:.3e} roundoff envelope: {value}"
-        ));
-    }
-    Ok(value.clamp(0.0, 1.0))
+    let part_ratio = part.scale / scale;
+    let rest_ratio = rest.scale / scale;
+    let part = part_ratio * part_ratio * part.scaled_sum;
+    let rest = rest_ratio * rest_ratio * rest.scaled_sum;
+    part / (part + rest)
 }
 
 fn validate_matrix(data: ArrayView2<'_, f64>, name: &str) -> Result<(), String> {
@@ -2665,7 +2514,9 @@ fn random_orthogonal(p: usize, seed: u64) -> Result<Array2<f64>, String> {
 }
 
 fn standard_normal(rng: &mut StdRng) -> f64 {
-    let u1: f64 = rng.random_range(f64::MIN_POSITIVE..1.0);
+    // `1 − U[0, 1)` lies in `(0, 1]` exactly (Sterbenz for draws above one half),
+    // so the logarithm is finite without flooring the draw.
+    let u1: f64 = 1.0 - rng.random_range(0.0..1.0);
     let u2: f64 = rng.random_range(0.0..1.0);
     (-2.0 * u1.ln()).sqrt() * (2.0 * PI * u2).cos()
 }
@@ -2817,36 +2668,6 @@ fn balanced_finite_product(first: f64, second: f64, third: f64, name: &str) -> R
         return Err(format!("{name} is not representable in float64"));
     }
     Ok(if negative { -magnitude } else { magnitude })
-}
-
-fn dominant_eigenvector(matrix: ArrayView2<'_, f64>, seed: u64) -> Result<Array1<f64>, String> {
-    if matrix.nrows() != matrix.ncols() {
-        return Err("dominant eigenvector requires a square matrix".to_string());
-    }
-    let p = matrix.nrows();
-    let mut rng = StdRng::seed_from_u64(seed);
-    let mut v = Array1::<f64>::zeros(p);
-    for i in 0..p {
-        v[i] = standard_normal(&mut rng);
-    }
-    normalize(&mut v);
-    for _iter in 0..64 {
-        let mut next = matrix.dot(&v);
-        let norm = next.iter().map(|x| x * x).sum::<f64>().sqrt();
-        if norm <= f64::MIN_POSITIVE {
-            return Ok(v);
-        }
-        next.mapv_inplace(|x| x / norm);
-        v = next;
-    }
-    Ok(v)
-}
-
-fn normalize(v: &mut Array1<f64>) {
-    let norm = v.iter().map(|x| x * x).sum::<f64>().sqrt();
-    if norm > f64::MIN_POSITIVE {
-        v.mapv_inplace(|x| x / norm);
-    }
 }
 
 #[cfg(test)]
@@ -3615,37 +3436,42 @@ mod tests {
 
     #[test]
     fn covariance_psd_certificate_rejects_material_negative_spectrum() {
-        let trace = 3.0_f64;
         let dimension = 3usize;
-        let tolerance = 64.0 * dimension as f64 * f64::EPSILON * trace;
-        let roundoff = ndarray::array![-0.5 * tolerance, 1.0, 2.0];
-        let certified = certified_covariance_spectrum(roundoff.view(), trace).unwrap();
-        assert_eq!(certified[0], 0.0);
-        assert_eq!(certified[1..], [1.0, 2.0]);
+        let largest = 2.0_f64;
+        // The zero band charges only the eigensolver's backward error; the
+        // nonzero band sits far above it, so each arm fails if its term is lost.
+        for formation_band in [0.0_f64, 1.0e-10] {
+            let tolerance = dimension as f64 * f64::EPSILON * largest + formation_band;
+            let roundoff = ndarray::array![-0.5 * tolerance, 1.0, largest];
+            let certified =
+                certified_covariance_spectrum(roundoff.view(), formation_band).unwrap();
+            assert_eq!(certified[0], 0.0);
+            assert_eq!(certified[1..], [1.0, largest]);
 
-        let indefinite = ndarray::array![-2.0 * tolerance, 1.0, 2.0];
-        let error = certified_covariance_spectrum(indefinite.view(), trace)
-            .expect_err("material indefiniteness must not be silently projected");
-        assert!(error.contains("materially indefinite"), "{error}");
+            let indefinite = ndarray::array![-2.0 * tolerance, 1.0, largest];
+            let error = certified_covariance_spectrum(indefinite.view(), formation_band)
+                .expect_err("material indefiniteness must not be silently projected");
+            assert!(error.contains("materially indefinite"), "{error}");
 
-        let scale_squared = 1.0e-18_f64;
-        let scaled = roundoff.mapv(|value| scale_squared * value);
-        let scaled_certified =
-            certified_covariance_spectrum(scaled.view(), scale_squared * trace).unwrap();
-        for axis in 0..dimension {
-            assert_eq!(
-                scaled_certified[axis],
-                scale_squared * certified[axis],
-                "PSD certificate must commute with covariance scaling"
-            );
+            let scale_squared = 1.0e-18_f64;
+            let scaled = roundoff.mapv(|value| scale_squared * value);
+            let scaled_certified =
+                certified_covariance_spectrum(scaled.view(), scale_squared * formation_band)
+                    .unwrap();
+            for axis in 0..dimension {
+                assert_eq!(
+                    scaled_certified[axis],
+                    scale_squared * certified[axis],
+                    "PSD certificate must commute with covariance scaling"
+                );
+            }
         }
     }
 
     #[test]
     fn spike_in_roc_power_rises_monotonically_and_null_stays_quiet() {
         let noise = noise_fixture(128, 12, 1234);
-        let mut config = SpikeInRocConfig::circle(vec![0.0, 1.0, 2.0], 16, 91);
-        config.fpr_levels = vec![0.05];
+        let config = SpikeInRocConfig::circle(vec![0.0, 1.0, 2.0], 16, 91, vec![0.05]);
         let curve = default_spike_in_roc_curve(noise.view(), &config).expect("spike-in ROC curve");
         let power: Vec<f64> = curve
             .iter()
@@ -3682,18 +3508,32 @@ mod tests {
     }
 
     #[test]
-    fn torus_spike_in_detection_reports_expected_betti_payload() {
+    fn torus_spike_in_power_rises_above_its_calibrated_null() {
         let noise = noise_fixture(128, 10, 4321);
-        let spiked = inject_torus_spike(noise.view(), 2.0, 88).expect("torus injection should run");
-        let report = default_spike_in_detection_pipeline(spiked.view(), SpikeInShape::Torus)
-            .expect("torus detector should run");
+        let config = SpikeInRocConfig {
+            shape: SpikeInShape::Torus,
+            snrs: vec![0.0, 2.0],
+            trials: 16,
+            seed: 88,
+            fpr_levels: vec![0.05],
+            noise_mode: SpikeInNoiseMode::EmpiricalResidualBootstrap,
+        };
+        let curve =
+            default_spike_in_roc_curve(noise.view(), &config).expect("torus spike-in ROC curve");
+        for point in &curve {
+            assert!(
+                (0.0..=1.0).contains(&point.mean_stat),
+                "the leading-energy fraction must lie in [0, 1]: {curve:?}"
+            );
+        }
         assert!(
-            report.detected,
-            "high-SNR torus should be detected: {report:?}"
+            curve[0].roc[0].true_positive_rate <= 0.125,
+            "pure-null torus row should stay near zero detection power: {curve:?}"
         );
-        assert_eq!(report.topology.measured_betti0, 1);
-        assert_eq!(report.topology.measured_betti1, 2);
-        assert_eq!(report.topology.measured_betti2, 1);
+        assert!(
+            curve[1].roc[0].true_positive_rate >= 0.80,
+            "high-SNR torus should clear its calibrated null quantile: {curve:?}"
+        );
     }
 
     fn noise_fixture(n: usize, p: usize, seed: u64) -> Array2<f64> {

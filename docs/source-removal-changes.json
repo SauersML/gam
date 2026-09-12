@@ -3473,5 +3473,24 @@
     ],
     "reason": "#2469. The dispersion location-scale warm start seeded each row's log precision through dispersion_moment_log_precision_seed. It floored the seeded mean at 1e-12, the squared residual at 1e-8·μ² (1e-8·μ^p for Tweedie), the precision ratio at 1e-6 and the NB excess at its sampling resolution, then boxed the result to [LOG_PRECISION_FLOOR, LOG_PRECISION_CEILING] = [-10, 10]. The seed is now Smyth's double-GLM log-link working response at the pooled dispersion, which is linear in the per-row moment, so no row needs a floor and no box is needed, and a pooled moment with no finite seed is refused. The helper and its two function-local constants have no other caller.",
     "evidence": "At the base, git grep -n -w dispersion_moment_log_precision_seed finds only its declaration and its single call inside dispersion_location_scale_warm_start (crates/gam-models/src/gamlss/dispersion_family.rs), which this change replaces. git grep -w LOG_PRECISION_FLOOR finds only its declaration and the helper's final clamp. LOG_PRECISION_CEILING also appears in one comment inside the helper. All three are private, production-scoped and declared once. The item list applies source_removal_guard.py's ITEM regex and occurrence rule by hand. Compile is covered by the lead's shared tip check."
+  },
+  {
+    "base": "3ef484e06275808467f178fe7b1f7e39152987e2",
+    "items": [
+      "crates/gam-sae/src/null_battery.rs:const:ROUNDOFF_BOUND_SLACK",
+      "crates/gam-sae/src/null_battery.rs:fn:centered_covariance_spectrum",
+      "crates/gam-sae/src/null_battery.rs:fn:certify_unit_interval",
+      "crates/gam-sae/src/null_battery.rs:fn:circle_topology_audit_from_harmonic_stat",
+      "crates/gam-sae/src/null_battery.rs:fn:dominant_eigenvector",
+      "crates/gam-sae/src/null_battery.rs:fn:expected_betti",
+      "crates/gam-sae/src/null_battery.rs:fn:nonnegative_ratio",
+      "crates/gam-sae/src/null_battery.rs:fn:normalize",
+      "crates/gam-sae/src/null_battery.rs:fn:topology_audit_from_spectrum",
+      "crates/gam-sae/src/null_battery.rs:fn:torus",
+      "crates/gam-sae/src/null_battery.rs:fn:torus_spike_in_detection_reports_expected_betti_payload",
+      "crates/gam-sae/src/null_battery.rs:struct:TopologyAuditReport"
+    ],
+    "reason": "#2469: the spike-in detector's promote/hold and Betti-audit verdicts came from picked reporting floors (circle 0.10; torus 0.55; spectral 0.45/0.25/0.75 and 0.55/0.12/0.80), and its roundoff checks multiplied a first-order bound by ROUNDOFF_BOUND_SLACK = 64. A spike-in trial is now a detection exactly when its statistic exceeds the null quantile at the caller's false-positive rate, so the floors go, along with TopologyAuditReport, the payload built from them (circle_topology_audit_from_harmonic_stat, topology_audit_from_spectrum, expected_betti). The torus statistic reads the leading-four energy fraction off the certified FaerEigh spectrum, replacing a seeded 64-step power iteration (centered_covariance_spectrum, dominant_eigenvector, normalize). The harmonic fraction and the quadrature balance are formed as part/(part+rest) of nonnegative sums, so they lie in [0, 1] by construction, and certify_unit_interval and nonnegative_ratio go. The PSD certificate's tolerance is the eigensolver backward error p*eps*max|lambda| plus the formation band the caller counts. SpikeInRocConfig::torus hard-coded FPR levels and had no caller. The torus Betti-payload test asserted the deleted payload; it is restated as torus_spike_in_power_rises_above_its_calibrated_null.",
+    "evidence": "git grep -c -w at the base over *.rs: ROUNDOFF_BOUND_SLACK, circle_topology_audit_from_harmonic_stat, topology_audit_from_spectrum, centered_covariance_spectrum, nonnegative_ratio, certify_unit_interval, dominant_eigenvector, TopologyAuditReport and torus_spike_in_detection_reports_expected_betti_payload each occur only in crates/gam-sae/src/null_battery.rs. expected_betti and normalize also name other items elsewhere in the tree (fields and locals in persistence.rs, sparse_audit.rs, gam-pyffi and others; a normalize in about 40 files). The deleted ones were a private SpikeInShape method and a private module fn, visible only inside null_battery.rs, so their callers, the topology audits and dominant_eigenvector, were all in that file and are deleted with them. Outside null_battery.rs, git grep SpikeInRocConfig finds only crates/gam-sae/src/inference/sparse_audit.rs:902, a circle call that now passes its fpr_levels, and git grep 'torus(' finds no call of SpikeInRocConfig::torus. The removed report fields (promoted, topology, detected, promoted_fraction, topology_accept_fraction) have no reader outside the file. Nothing here was compiled or run locally (user directive): compile is covered by the lead's shared tip check, and behaviour by a gam-sae null_battery test job on the landed sha."
   }
 ]

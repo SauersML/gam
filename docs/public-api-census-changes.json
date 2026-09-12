@@ -1286,5 +1286,13 @@
     },
     "reason": "SPEC rule 5 (#2901 V15). The soft-L2 partial-supervision map now penalizes the function mass and takes its REML weight in closed form, so the coefficient-ridge weight searcher ridge_reml_select_weight and RidgeRemlWeight::score lose their only caller and are deleted.",
     "evidence": "public_api_census.py's public_functions predicate over the removed hunks of crates/gam-sae/src/identifiability.rs yields ridge_reml_select_weight and RidgeRemlWeight::score. At the base, each is the file's only pub fn of that name. No other file loses a pub fn: crates/gam-math/src/score_opt.rs, crates/gam-pyffi/src/manifold/geometry_ffi.rs and gamfit/examples/partial_supervision.py change only in comments."
+  },
+  {
+    "base": "3ef484e06275808467f178fe7b1f7e39152987e2",
+    "removed": {
+      "crates/gam-sae/src/null_battery.rs::torus": 1
+    },
+    "reason": "#2469: SpikeInRocConfig::torus hard-coded its reporting FPR levels (0.01, 0.05, 0.10) and had no caller. The surviving circle constructor takes the caller's fpr_levels. Its one production caller, crates/gam-sae/src/inference/sparse_audit.rs, already set them to the audit's configured false-positive rate.",
+    "evidence": "Outside crates/gam-sae/src/null_battery.rs, git grep SpikeInRocConfig at the base finds only crates/gam-sae/src/inference/sparse_audit.rs:902, a circle call. git grep 'torus(' over *.rs and *.py finds no call of SpikeInRocConfig::torus. This removed map is public_api_census.py's public_functions predicate applied to this diff: one pub fn declaration is removed."
   }
 ]
