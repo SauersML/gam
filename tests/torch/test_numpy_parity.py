@@ -25,8 +25,7 @@ except ImportError:
 def _require_ffi(name: str) -> None:
     from gamfit._binding import rust_module
 
-    if not hasattr(rust_module(), name):
-        pytest.skip(f"engine missing FFI export `{name}`")
+    assert hasattr(rust_module(), name), f"engine missing FFI export `{name}`"
 
 
 def _tensor(arr: Any, **kw: Any) -> torch.Tensor:
@@ -57,7 +56,8 @@ def test_bspline_basis_derivative_parity() -> None:
 
 
 def test_duchon_basis_parity() -> None:
-    _require_ffi("duchon_basis_1d")
+    _require_ffi("duchon_basis")
+    _require_ffi("duchon_basis_with_jets")
     rng = np.random.default_rng(2)
     t = rng.uniform(0.0, 1.0, size=20)
     centers = np.linspace(0.0, 1.0, 6)

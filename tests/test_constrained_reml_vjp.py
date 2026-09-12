@@ -32,8 +32,9 @@ from gamfit.torch._reml import gaussian_reml_fit_with_constraints  # noqa: E402
 def _require_ffi() -> None:
     from gamfit._binding import rust_module
 
-    if not hasattr(rust_module(), "gaussian_reml_fit_with_constraints_forward"):
-        pytest.skip("engine missing FFI export `gaussian_reml_fit_with_constraints_*`")
+    assert hasattr(rust_module(), "gaussian_reml_fit_with_constraints_forward"), (
+        "engine missing FFI export `gaussian_reml_fit_with_constraints_forward`"
+    )
 
 
 # float64 gradcheck defaults: principled, not weakened. The closed-form

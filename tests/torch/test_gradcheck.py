@@ -22,8 +22,7 @@ except ImportError as exc:
 def _require_ffi(name: str) -> None:
     from gamfit._binding import rust_module
 
-    if not hasattr(rust_module(), name):
-        raise SkipTest(f"engine missing FFI export `{name}`")
+    assert hasattr(rust_module(), name), f"engine missing FFI export `{name}`"
 
 
 # Conservative tolerances: f64 throughout, but the underlying solves are
@@ -60,7 +59,7 @@ def test_bspline_basis_gradcheck() -> None:
 
 
 def test_duchon_basis_gradcheck() -> None:
-    _require_ffi("duchon_basis_1d")
+    _require_ffi("duchon_basis_with_jets")
     rng = np.random.default_rng(12)
     t = torch.tensor(
         rng.uniform(0.05, 0.95, size=8), dtype=torch.float64, requires_grad=True

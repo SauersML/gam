@@ -12,8 +12,7 @@ gt = pytest.importorskip("gamfit.torch")
 def _require_ffi(name: str) -> None:
     from gamfit._binding import rust_module
 
-    if not hasattr(rust_module(), name):
-        pytest.skip(f"engine missing FFI export `{name}`")
+    assert hasattr(rust_module(), name), f"engine missing FFI export `{name}`"
 
 
 def _orthogonal_designs(
