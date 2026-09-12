@@ -861,15 +861,6 @@ impl SaeManifoldTerm {
         // +inf, so nothing is silently accepted.
         let mut polish_escalations = 0usize;
         const POLISH_ESCALATION_ANTI_RUNAWAY_CAP: usize = 2;
-        // #2653 — repeated STALL-branch polish is governed by what the former
-        // ordinal cap was trying to approximate: contraction of either
-        // accepted KKT currency. A raw count of eight retired the production
-        // K=1 circle tail while both raw and quotient residuals were still
-        // falling. The certificate advances only when one Pareto frontier
-        // moves beyond floating-point resolution, so it admits every useful
-        // ninth-or-later rescue while a repeated plateau still terminates.
-        let mut stall_polish_progress =
-            super::stall_polish_progress::StallPolishProgressCertificate::new(f64::EPSILON.sqrt());
         const CERTIFICATE_ESCALATION_PROGRESS: f64 = 0.7;
         const CERTIFICATE_ESCALATION_ANTI_RUNAWAY_CAP: usize = 8;
         // #1051 — objective-stagnation convergence. On an ill-conditioned
@@ -1374,15 +1365,13 @@ impl SaeManifoldTerm {
                     // budget WITHOUT three stalled+idempotent rounds (measured
                     // tier-0: ‖g‖ = 8.0e-5 against a 6.1e-5 band after 128,
                     // one Newton step from the band) refused here without the
-                    // phase ever running. Try it before refusing: a committed
-                    // step strictly contracts ‖g‖ OR the exact Newton decrement
-                    // (the accept test is `obj_ok && (grad_ok || decrement_ok)`;
-                    // its no-contraction bail exits cheaply on genuinely
-                    // hopeless states), and on progress the loop resumes with
-                    // fresh accounting — the
-                    // loop-top KKT gate and the idempotence certificate remain
-                    // the sole acceptance authority, exactly as at the stall
-                    // branch.
+                    // phase ever running. Try it before refusing: every committed
+                    // step is an Armijo decrease of the penalized objective
+                    // (#2861), the phase bails cheaply at the first step no
+                    // damping buys a decrease for, and on progress the loop
+                    // resumes with fresh accounting — the loop-top KKT gate and
+                    // the idempotence certificate remain the sole acceptance
+                    // authority, exactly as at the stall branch.
                     if terminal_newton_polish_armed
                         && polish_escalations < POLISH_ESCALATION_ANTI_RUNAWAY_CAP
                     {
@@ -1796,15 +1785,19 @@ impl SaeManifoldTerm {
                     if predicted_relative_decrease <= SAE_MANIFOLD_INNER_OBJECTIVE_STALL_REL_TOL {
                         return Ok(stationary_cache);
                     }
-                    let progress_verdict = stall_polish_progress.observe(
-                        stationary_grad_norm,
-                        stationary_quotient_grad_norm,
-                        grad_tolerance,
-                    );
-                    stall_polish_permitted = progress_verdict.permits_continuation();
-                    log::debug!(
-                        "SAE inner stall-polish continuation certificate: {progress_verdict:?}"
-                    );
+                    // #2267/#2283 — permitted at every armed plateau. What re-arms
+                    // the polish is a materially descending refine round (the stall
+                    // streak's `else` below), i.e. progress in the penalized objective,
+                    // which is the currency the polish commits in since #2861. The
+                    // gate-norm frontier certificate this replaces (#2653) additionally
+                    // required the plateau's ‖g‖ to set a new low, while descent along a
+                    // resolved negative-curvature mode generally RAISES ‖g‖, so it
+                    // refused the second polish on a plateau the first polish had
+                    // lowered the objective to. Termination does not rest on a frontier:
+                    // invoking the polish disarms it, only material objective descent
+                    // re-arms it, and every refine round spends the iteration budget
+                    // the loop-top budget branch bounds.
+                    stall_polish_permitted = true;
                     // Otherwise: a flat objective round is only a convergence
                     // shortcut when a certificate is stationary. Keep using the
                     // deterministic refinement budget: either later rounds reach
@@ -1819,10 +1812,10 @@ impl SaeManifoldTerm {
                 // #2228 Stage-2 — the objective has stalled but the KKT gate is
                 // unmet: this is exactly the linear-rate crawl regime where the
                 // MM/GN phase needs ~10³ more iterations it does not have. Hand
-                // the iterate to the exact-Hessian terminal Newton phase; a
-                // committed step strictly contracts ‖g‖ or the exact Newton
-                // decrement, so the refine loop resumes with fresh progress
-                // instead of refusing. The phase
+                // the iterate to the exact-Hessian terminal Newton phase; every
+                // committed step is an Armijo decrease of the penalized objective
+                // (#2861), so the refine loop resumes from a strictly lower
+                // objective instead of refusing. The phase
                 // mints nothing — acceptance stays with the loop-top KKT gate
                 // and the idempotence certificate (the state moved, so
                 // `criterion_fixed_point` is cleared and one evidence re-entry
@@ -1837,23 +1830,17 @@ impl SaeManifoldTerm {
                         grad_tolerance,
                         objective_scale,
                         options,
-                        // Anti-runaway cap ONLY — the polish's acceptance gate
-                        // requires strict contraction of ‖g‖ OR of the exact
-                        // Newton decrement λ² per step, and its bail fires the
-                        // first step that contracts NEITHER, so the loop
-                        // terminates numerically on its own. The termination
-                        // therefore rests on the decrement arm wherever raw ‖g‖
-                        // is non-monotone, which is exactly the indefinite /
-                        // stiff regime this phase exists for; reading this
-                        // sentence as a single-currency ‖g‖ contract is wrong,
-                        // and gam#2715 read the resulting trace as a defect in
-                        // the gate rather than as the design it is. Measured
-                        // (tier-0 fixtures, host lane): at 12 the polish
-                        // silently expired at ‖g‖ = 6.48e-5 against a 6.11e-5
-                        // band — refused 1.07× from convergence purely by cap.
-                        // Near the marginally-indefinite root the quotient
-                        // GMRES steps contract slower than pure quadratic, so
-                        // the cap must not impersonate a convergence bound.
+                        // Anti-runaway cap ONLY — every committed step is an
+                        // Armijo decrease of the penalized objective (#2861), and
+                        // the phase bails at the first step no damping on its
+                        // ladder buys a decrease for, so the cap bounds only a
+                        // phase that keeps buying resolvable decreases. Measured
+                        // (tier-0 fixtures, host lane): at 12 the polish silently
+                        // expired at ‖g‖ = 6.48e-5 against a 6.11e-5 band —
+                        // refused 1.07× from convergence purely by cap. Near the
+                        // marginally-indefinite root the steps contract slower than
+                        // pure quadratic, so the cap must not impersonate a
+                        // convergence bound.
                         64,
                         &mut best_seen,
                     )? {
@@ -2851,30 +2838,17 @@ impl SaeManifoldTerm {
             };
             made_progress = true;
             let gate_norm = quotient_grad_norm;
-            // #2762 — SPEND THE BUDGET ONLY WHILE THE PHASE IS ON TRACK TO FINISH.
-            //
-            // A step here costs one dense eigendecomposition of `A` — measured
-            // 13.4 s at `dim = 519` on the `zz2015` witness, against 0.14 s of
-            // assembly and 0.28 s for the whole damping ladder. The step COUNT
-            // is therefore the entire cost of this phase, and a fixed cap prices
-            // every entry at the worst case.
-            //
-            // The gate this phase is trying to reach bounds
-            // `min(‖g‖, ‖Π⊥null g‖)`, so that is the quantity to extrapolate,
-            // and it is read off the system the accepted trial already
-            // assembled — the test costs nothing and fires one whole
-            // eigendecomposition earlier than it could at the next loop top. At
-            // the contraction the step actually delivered, the band is
-            // `ln(tol/gate)/ln(contraction)` steps away; if that exceeds the
-            // steps left, this phase cannot finish on its current trajectory and
-            // every further step is one it will not be paid for. Measured on
-            // `zz2015`: steps 1-4 take `‖g‖ 14.54 → 0.724`, and steps 5-64 buy
-            // 15% for 60 x 13.4 s.
-            //
-            // Stopping here is neither a refusal nor final. The merit is
-            // monotone, so everything gained is kept; `made_progress` is already
-            // true, so the refine loop takes another window and may re-arm this
-            // phase, and the trajectory is re-measured from scratch when it does.
+            // The committed step bought an Armijo decrease of the penalized
+            // objective. Nothing below extrapolates the gate norm to decide whether
+            // to take the next one (#2267/#2283): the phase's currency is the
+            // objective, and along a resolved negative-curvature mode the gate is not
+            // monotone across accepted steps. On the #2283 documented cell one call's
+            // gate went 4.42e-1 → 3.16 → 13.6 → 7.44 → 13.0 → 10.9 → 6.88 → 23.3 →
+            // 6.01 → 6.48 → 5.76 while the objective fell by 2.4, and reading step
+            // 10's one-step contraction (0.889) as a rate put the band 80.7 steps
+            // away and ended the phase. A one-step ratio of a non-monotone sequence
+            // is not a rate. The phase ends at the band, when no damping buys an
+            // Armijo decrease, at a bail, or at `max_steps`.
             if let Some(system) = accepted.system.as_ref() {
                 let after_sq = Self::system_grad_norm_sq(system);
                 let after_gate =
@@ -2888,38 +2862,6 @@ impl SaeManifoldTerm {
                         step + 1,
                     );
                     return Ok(true);
-                }
-                let contraction = if gate_norm > 0.0 {
-                    after_gate / gate_norm
-                } else {
-                    f64::INFINITY
-                };
-                // #2267/#2283 — only a step that CONTRACTED the gate defines a rate
-                // to extrapolate. The step is accepted on Armijo decrease of the
-                // penalized objective (#2861), and on a resolved negative-curvature
-                // mode that descent generally RAISES the gate norm. Measured on the
-                // #2283 documented cell and the #2267 TopK surrogate (pin f9a38e3e6,
-                // sw7 job 431241): all 12 polish calls accepted step 1 with the gate
-                // norm rising 3.3x to 42.7x, and the extrapolation read each as "the
-                // band is infinitely far" and ended the phase after that one step,
-                // in exactly the regime the objective-currency step exists for. A
-                // step that did not contract the gate predicts nothing about when
-                // the band is reached, so it cannot justify stopping: the phase keeps
-                // descending the objective, bounded by `max_steps` and by the
-                // damping ladder refusing once no Armijo decrease is left.
-                if contraction < 1.0 {
-                    let remaining = (max_steps - step - 1) as f64;
-                    let projected_steps = (grad_tolerance / after_gate).ln() / contraction.ln();
-                    if !(projected_steps <= remaining) {
-                        log::debug!(
-                            "terminal Newton: stopping on trajectory, not on budget — step {} \
-                             contracted the gate norm by {contraction:.6e} ({gate_norm:.6e} → \
-                             {after_gate:.6e}), which puts the {grad_tolerance:.6e} band \
-                             {projected_steps:.1} steps away against {remaining:.0} remaining",
-                            step + 1,
-                        );
-                        break;
-                    }
                 }
             }
             // Walk back toward the undamped Newton step: a damping under

@@ -3129,5 +3129,20 @@
     ],
     "reason": "#2668 row 19 (d70ae015b): the SAE EFS ARD proposal now steps ln(1 − 2·g/(α·E)) from the complete analytic criterion gradient, which already carries the exact von-Mises normalizer on a periodic axis. von_mises_ard_precision, the periodic-axis correction of the old Gaussian MacKay root, has no caller left, and SPEC rule 25 deletes unused options rather than keeping them.",
     "evidence": "At base 6a78b8dad, git grep -n -w von_mises_ard_precision over *.rs finds five occurrences, all in crates/gam-sae/src/manifold/outer_objective.rs: the declaration (:3086), the per-atom and shared ARD call sites in efs_step_with_certificate (:2904, :2969), and two comments (:2867, :2876), all rewritten in d70ae015b. No test names it. The integrity run on d70ae015b (run 34670949262, job 103492072637) reports exactly this one guarded removal. Nothing was compiled or run before push (commit-after-every-edit directive)."
+  },
+  {
+    "base": "cdf3f41ed68187ac16ef3dd495a6ca13dc28df95",
+    "items": [
+      "crates/gam-sae/src/manifold/stall_polish_progress.rs:enum:StallPolishProgressVerdict",
+      "crates/gam-sae/src/manifold/stall_polish_progress.rs:fn:contracting_kkt_tail_remains_eligible_after_eight_plateaus_2653",
+      "crates/gam-sae/src/manifold/stall_polish_progress.rs:fn:either_kkt_currency_can_pay_but_a_repeated_frontier_cannot_2653",
+      "crates/gam-sae/src/manifold/stall_polish_progress.rs:fn:materially_contracts",
+      "crates/gam-sae/src/manifold/stall_polish_progress.rs:fn:new",
+      "crates/gam-sae/src/manifold/stall_polish_progress.rs:fn:observe",
+      "crates/gam-sae/src/manifold/stall_polish_progress.rs:fn:permits_continuation",
+      "crates/gam-sae/src/manifold/stall_polish_progress.rs:struct:StallPolishProgressCertificate"
+    ],
+    "reason": "user directive: delete unnecessary code; the inner stall branch no longer consults the gate-norm continuation certificate (#2283, #2267)",
+    "evidence": "stall_polish_progress.rs had exactly one production consumer: the objective-stall branch of penalized_quasi_laplace_criterion, which this commit stops consulting. After #2861 the terminal polish commits objective descent that raises ‖g‖, and the gate-frontier verdict refused later polishes on plateaus the first polish had lowered the objective to. On the #2283 documented cell (sw7 m10 442014, pin 2f844874e, /scratch.global/sauer354/sw7-logs/m10/a_BASE_C2283.txt) it returned 6 NonContracting verdicts and both completed probes stalled at ‖g‖ 0.401 and 0.466. With the verdict not consulted and the trajectory stop removed, the same cell converged both probes to 1.40e-8 and 1.74e-8 (a_P12_C2283.txt). The eight identities are source_removal_guard.py's own refusal over 9d289eb63 -> a private-index candidate holding only this change (/scratch.global/sauer354/pool/sae-fit/m12/cand/srg.err). The module's two unit tests exercised only the deleted certificate."
   }
 ]

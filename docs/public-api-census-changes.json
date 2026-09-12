@@ -1189,5 +1189,15 @@
     },
     "reason": "user directive: delete all useless slop (only used by tests / unused)",
     "evidence": "EncodeDeploymentDecision's three public constructors (from_device_measurement, from_device_measurement_against, blocked) had no caller after fb2a87bc8 removed gam-sae's device-encode throughput measurement; git grep at 3bb12aea8 finds none."
+  },
+  {
+    "base": "cdf3f41ed68187ac16ef3dd495a6ca13dc28df95",
+    "removed": {
+      "crates/gam-sae/src/manifold/stall_polish_progress.rs::new": 1,
+      "crates/gam-sae/src/manifold/stall_polish_progress.rs::observe": 1,
+      "crates/gam-sae/src/manifold/stall_polish_progress.rs::permits_continuation": 1
+    },
+    "reason": "user directive: delete unnecessary code; the inner stall branch no longer consults the gate-norm continuation certificate (#2283, #2267)",
+    "evidence": "public_api_census.py over 9d289eb63 -> a private-index candidate holding only this change measured exactly this removed map (/scratch.global/sauer354/pool/sae-fit/m12/cand/pa.err). StallPolishProgressCertificate::new, observe and StallPolishProgressVerdict::permits_continuation were called only by the stall branch this commit changes."
   }
 ]

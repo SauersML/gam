@@ -217,7 +217,6 @@ mod row_layout;
 mod schedule;
 mod seed_routing;
 mod shape_uncertainty;
-mod stall_polish_progress;
 mod steering;
 mod stratum_births;
 mod streamed_frame_curvature;

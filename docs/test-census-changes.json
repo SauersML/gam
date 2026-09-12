@@ -426,5 +426,18 @@
       "the_data_row_rule_is_opt_in_so_the_default_is_still_a_pc_reseed_2023": 1
     },
     "unit_test_decreases": {}
+  },
+  {
+    "base": "cdf3f41ed68187ac16ef3dd495a6ca13dc28df95",
+    "reason": "user directive: delete unnecessary code; the inner stall branch no longer consults the gate-norm continuation certificate (#2283, #2267)",
+    "evidence": "The two removed tests (contracting_kkt_tail_remains_eligible_after_eight_plateaus_2653, either_kkt_currency_can_pay_but_a_repeated_frontier_cannot_2653) exercised only the deleted StallPolishProgressCertificate. test_census.py over 9d289eb63 -> a private-index candidate holding only this change measured 10370 -> 10368 tests, units/crates/gam-sae 1327 -> 1325, and issue-2653 pins 10 -> 8 (/scratch.global/sauer354/pool/sae-fit/m12/cand/tc.out). The other #2653 pins in tests.rs, arrow_solver.rs and construction_tests.rs remain. docs/test-census-floor.json lowers issues/2653 by exactly these two.",
+    "test_count_decrease": 2,
+    "removed_pins": {
+      "contracting_kkt_tail_remains_eligible_after_eight_plateaus_2653": 1,
+      "either_kkt_currency_can_pay_but_a_repeated_frontier_cannot_2653": 1
+    },
+    "unit_test_decreases": {
+      "crates/gam-sae": 2
+    }
   }
 ]
