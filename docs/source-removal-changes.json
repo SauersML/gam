@@ -3199,5 +3199,27 @@
     ],
     "reason": "43fe7d9de removed the function's only callers, leaving an identity helper that nothing calls. Under deny(warnings) it stopped the gam-models lib build.",
     "evidence": "rustc reports \"associated function `exact_newton_observed_information_from_objective_hessian` is never used\" at bms/cell_moment_assembly.rs:2670 (sw9 job 449193 at 47b5682d6, verify1_suite.449193.log). The sw9 rescan job 449231 at e04851dab lists it as unreferenced. The function body was `objective_hessian` returned unchanged, so no replacement is needed."
+  },
+  {
+    "base": "95cbadf0f4f9c74d95913895a2be104b3b4d4af7",
+    "items": [
+      "crates/gam-sae/src/coactivation_conditionality.rs:const:BRACKET_EXPANSION_LIMIT",
+      "crates/gam-sae/src/coactivation_conditionality.rs:const:BRENT_ITERATION_LIMIT",
+      "crates/gam-sae/src/coactivation_conditionality.rs:const:BRENT_REL_TOL",
+      "crates/gam-sae/src/coactivation_conditionality.rs:const:MIN_RESIDUAL_DF",
+      "crates/gam-sae/src/coactivation_conditionality.rs:fn:golden_section_minimize",
+      "crates/gam-sae/src/coactivation_conditionality.rs:fn:minimize_reml_log_smoothing",
+      "crates/gam-sae/src/coactivation_conditionality.rs:fn:penalized_gaussian_fit"
+    ],
+    "reason": "SPEC rules 19 and 22: the value-only golden-section REML smoothing search is replaced by exact-derivative selection with a convergence certificate",
+    "evidence": "661f43d2a replaced minimize_reml_log_smoothing (bracket expansion plus golden_section_minimize on REML values, returning the midpoint of an unbracketed interval once BRACKET_EXPANSION_LIMIT ran out) and penalized_gaussian_fit (df = sum(w) - edf behind MIN_RESIDUAL_DF) with GaussianRemlProblem::{new, solve, jet, fit, select_log_smoothing}: profiled Gaussian REML with closed-form first and second derivatives, selected by OuterProblem over the #2812 resolvability interval. BRENT_ITERATION_LIMIT and BRENT_REL_TOL were read only by golden_section_minimize. Every listed item occurred only in coactivation_conditionality.rs, at its declaration and in-file call sites (Test source integrity run 34671398985 at 661f43d2a lists exactly these seven). New unit test varying_coefficient_reml_jet_matches_central_differences_2902. Pool gate job 448206 compiles ff6a77d39, which contains this change."
+  },
+  {
+    "base": "4e47eed5a2c90dd3ea395b6e511d2c390c4934fc",
+    "items": [
+      "crates/gam-sae/src/spectrometer.rs:fn:golden_section_min"
+    ],
+    "reason": "SPEC rule 19: the spectrometer noise-floor profile no longer uses a value-only golden-section search",
+    "evidence": "ff6a77d39 replaced golden_section_min (golden-section contraction of RSS(sigma^2) values over [0, L_min)) with profile_noise_floor: closed-form dRSS/dsigma^2 = 2 r^T u and d2RSS/dsigma^2^2 = 2 |P_perp u|^2 - 2 sum r_i u_i^2, minimized by OuterProblem with its certificate. Its only call site was fit_scaling_law in the same file (source_removal_guard.py over 4e47eed5a..ff6a77d39 blocks exactly this item, production_occurrences 2). The existing scaling_law_recovers_planted_power_law_with_floor and flat_losses_flag_floor_saturation tests pin the behaviour; pool gate job 448206 runs them at ff6a77d39."
   }
 ]
