@@ -4,6 +4,3 @@
 
 pub mod bernoulli;
 pub mod compiler;
-pub(crate) mod gpu;
-#[cfg(target_os = "linux")]
-pub(crate) mod gpu_kernel;

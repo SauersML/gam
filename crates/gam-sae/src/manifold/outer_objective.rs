@@ -428,8 +428,8 @@ impl ProbeRefusalKind {
         // beside the wording it reads: `ArrowSchurError` owns both the
         // rendering and this reader, and its own
         // `rendered_verdict_matches_the_value_verdict_for_every_variant_2598`
-        // pins the rendered reader to the value predicate
-        // (`is_non_pd_schur_complement`) for every variant. Nothing about the
+        // pins the rendered reader to the value-level verdict for every variant.
+        // Nothing about the
         // classification changes; what changes is that a reword can no longer
         // land without failing a test.
         //

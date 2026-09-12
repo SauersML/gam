@@ -91,5 +91,25 @@
     },
     "reason": "User directive 2026-09-11: delete code only tests use and code nothing uses. gam-geometry GeodesicIntegrator (with integrate), ClosureFamily::design_jet, t_stacks, ConstantCurvature::jacobian_radial and conformal_dirichlet_penalty had no production caller; the integrator was exercised only by its own unit tests and one integration test.",
     "evidence": "Re-confirmed at the tip with git grep -nw over crates src tests examples bench benches. Removed with the integrator module's unit tests, both GeodesicIntegrator re-exports, the geometry_bug_hunt energy test, and the doc-only stub tests/manifolds/smooths/poincare_conformal_dirichlet_penalty.rs left by c0a21b554. Docs that linked the deleted items were rewritten. Gates pass base..head; MSI verification at the pushed sha follows."
+  },
+  {
+    "base": "d338606307c351ac4ef8244244ef6c5af3ad051c",
+    "removed": {
+      "crates/gam-custom-family/src/block_spec.rs::by_block_name": 1,
+      "crates/gam-custom-family/src/block_spec.rs::coefficient_label": 1,
+      "crates/gam-custom-family/src/block_spec.rs::new": 1,
+      "crates/gam-custom-family/src/block_spec.rs::with_parent": 1,
+      "crates/gam-custom-family/src/block_spec.rs::with_prior": 1,
+      "crates/gam-custom-family/src/coefficient_groups.rs::coefficient_group_block_index": 1,
+      "crates/gam-custom-family/src/coefficient_groups.rs::expand_custom_group_base_prior": 1,
+      "crates/gam-custom-family/src/coefficient_groups.rs::realize_coefficient_groups_for_custom_family": 1,
+      "crates/gam-custom-family/src/coefficient_groups.rs::validate_group_rho_prior_coordinate": 1,
+      "crates/gam-custom-family/src/coefficient_groups.rs::validate_penalized_complexity_prior": 1,
+      "crates/gam-custom-family/src/fit.rs::evaluate_labeled_outer_criterion_for_diagnostics": 1,
+      "crates/gam-custom-family/src/fit.rs::evaluate_rho_outer_criterion_for_diagnostics": 1,
+      "crates/gam-custom-family/src/warm_start.rs::active_constraint_rows": 1
+    },
+    "reason": "User directive 2026-09-11: delete code only tests use and code nothing uses. gam-custom-family realize_coefficient_groups_for_custom_family (with its coefficient_groups module), the two outer-criterion diagnostic evaluators and CustomFamilyWarmStart::active_constraint_rows had no production caller, and the coefficient-group types the realizer consumed and produced were left with no consumer.",
+    "evidence": "Re-confirmed at the tip with git grep -nw over crates src tests examples bench benches. gam-models and tests/inference/misc import gam-terms' own CoefficientGroupSpec (gam::smooth), which stays. Removed with the three #2315 realizer unit tests, the #2612 outer-gradient FD suite test restored in 21390b321 (its only subject was evaluate_labeled_outer_criterion_for_diagnostics) and one diagnostic eprintln in kappa_exact_joint_fd_tests.rs. Gates pass base..head; MSI verification at the pushed sha follows."
   }
 ]

@@ -467,44 +467,6 @@ impl RationalLogdetPlan {
         )
     }
 
-    /// The PER-SHIFT baseline: one preconditioned CG per quadrature node, walked
-    /// from the largest shift down with warm starts.
-    ///
-    /// This is what the evidence lane ran before #2576's measurement, and it is
-    /// retained as the measurement's control arm — [`super::reduced_schur_logdet_shift_ladder_profile`]
-    /// takes its per-node breakdown, and the family evaluator is required to
-    /// agree with it on the value. It is not the production route: rebuilding a
-    /// Krylov space per node pays `node_count` times for a subspace that does not
-    /// depend on the shift at all (see [`Self::evaluate`]).
-    ///
-    /// The plan is the STATISTICAL functional — probes, quadrature nodes,
-    /// deflation basis — and the shifted inverse is the NUMERICAL means of
-    /// evaluating it. A preconditioner changes only the second, so the value
-    /// this returns is the same function of the operator that
-    /// [`Self::evaluate`] returns, converged to the same certified residual,
-    /// and its `Self::directional_derivative` is still that value's exact
-    /// gradient.
-    pub fn evaluate_preconditioned(
-        &self,
-        matvec: &(impl Fn(ArrayView1<f64>) -> Array1<f64> + Sync),
-        preconditioner: &ShiftedDiagonalPreconditioner,
-        cg_rel_tol: f64,
-        cg_max_iters: usize,
-    ) -> Option<RationalLogdetEval> {
-        let solve = |shift: f64, rhs: &Array1<f64>, warm: &Array1<f64>| {
-            shifted_pcg(
-                matvec,
-                preconditioner,
-                shift,
-                rhs,
-                warm,
-                cg_rel_tol,
-                cg_max_iters,
-            )
-        };
-        self.evaluate_with_shifted_solver(&solve)
-    }
-
     /// Evaluate this frozen rational functional with a caller-owned shifted
     /// linear solver.
     ///
@@ -874,11 +836,8 @@ fn shifted_pcg(
     rel_tol: f64,
     max_iters: usize,
 ) -> Option<(Array1<f64>, usize)> {
-    // The production solve keeps no steps, so it passes no recorder — and it
-    // runs the SAME non-generic core the recording entry point runs, not a
-    // second monomorphization of it. There is exactly ONE shifted-solve
-    // implementation and one convergence certificate; the trace cannot describe
-    // a different iteration from the one that produced the value.
+    // One non-generic shifted-solve core carries the single convergence
+    // certificate every caller relies on.
     shifted_pcg_core(
         matvec,
         preconditioner,
@@ -887,300 +846,7 @@ fn shifted_pcg(
         y0,
         rel_tol,
         max_iters,
-        None,
     )
-}
-
-/// One recorded step of the shifted-PCG recurrence: the residual entering the
-/// step and the two CG scalars that step produced.
-///
-/// These three numbers are everything the #2576 diagnosis needs. `residual_norm`
-/// is the convergence curve; `(alpha, beta)` are the CG coefficients, from which
-/// the Lanczos tridiagonal of the PRECONDITIONED shifted operator — and hence
-/// its Ritz spectrum and condition estimate — follow exactly, at no extra
-/// matvec.
-#[derive(Clone, Copy, Debug)]
-pub struct ShiftedPcgStep {
-    /// `‖r_j‖` (recursive CG residual) entering the step.
-    pub residual_norm: f64,
-    /// CG step length `α_j = rᵀz / pᵀAp`.
-    pub alpha: f64,
-    /// CG direction weight `β_j = r_{j+1}ᵀz_{j+1} / rᵀz`.
-    pub beta: f64,
-    /// True when the reliable-residual replacement restarted the recurrence
-    /// immediately before this step. The CG↔Lanczos identity holds only within a
-    /// restart-free run, so a trace reads its tridiagonal off the longest such
-    /// segment.
-    pub restarted: bool,
-}
-
-/// The convergence history of one shifted-PCG solve.
-///
-/// #2576's headline evidence was that loosening the CG tolerance by four orders
-/// of magnitude did not shorten the solve, which is consistent with two opposite
-/// situations — a solve stagnating at its cap, and a solve converging so fast
-/// that the last four decades cost a handful of iterations. Those need opposite
-/// repairs, and nothing in this crate could tell them apart, because the solve
-/// reported only a total iteration count. This records the curve itself.
-#[derive(Clone, Debug, Default)]
-pub struct ShiftedPcgTrace {
-    /// The shift `t` this solve ran at.
-    pub shift: f64,
-    /// `‖b‖`, the denominator of every relative residual below.
-    pub rhs_norm: f64,
-    /// The requested relative-residual target.
-    pub rel_tol: f64,
-    /// One entry per step actually taken.
-    pub steps: Vec<ShiftedPcgStep>,
-    /// True when the solve returned a certified iterate (`shifted_pcg` returning
-    /// `Some`); false when it refused (cap exhaustion or breakdown).
-    pub certified: bool,
-}
-
-impl ShiftedPcgTrace {
-    /// Iterations taken.
-    #[must_use]
-    pub fn iterations(&self) -> usize {
-        self.steps.len()
-    }
-
-    /// The relative residual curve `‖r_j‖/‖b‖`, one point per step.
-    #[must_use]
-    pub fn relative_residuals(&self) -> Vec<f64> {
-        let scale = 1.0 / self.rhs_norm.max(f64::MIN_POSITIVE);
-        self.steps
-            .iter()
-            .map(|step| step.residual_norm * scale)
-            .collect()
-    }
-
-    /// The half-open step range `[start, end)` of the longest restart-free run,
-    /// which is the only segment over which the CG coefficients are the Lanczos
-    /// coefficients of one Krylov space.
-    fn unrestarted_segment(&self) -> (usize, usize) {
-        let mut best = (0usize, 0usize);
-        let mut start = 0usize;
-        for (index, step) in self.steps.iter().enumerate() {
-            if step.restarted && index > start {
-                if index - start > best.1 - best.0 {
-                    best = (start, index);
-                }
-                start = index;
-            }
-        }
-        if self.steps.len() - start > best.1 - best.0 {
-            best = (start, self.steps.len());
-        }
-        best
-    }
-
-    /// The symmetric tridiagonal `T_m` of the preconditioned shifted operator
-    /// `M⁻¹(S + tI)` restricted to the Krylov space the solve built, as
-    /// `(diagonal, off-diagonal)`.
-    ///
-    /// CG is Lanczos in disguise: with the step scalars `α_j`, `β_j` of a
-    /// restart-free run,
-    ///
-    /// ```text
-    /// T[j,j]   = 1/α_j + β_{j-1}/α_{j-1}   (β_{-1} = 0)
-    /// T[j,j+1] = √β_j / α_j
-    /// ```
-    ///
-    /// so the spectrum estimate below costs no matvec at all — it is read off
-    /// numbers the solve already produced. The eigenvalues of `T_m` are the Ritz
-    /// values, and they bracket the part of the spectrum CG has resolved.
-    #[must_use]
-    pub fn lanczos_tridiagonal(&self) -> (Vec<f64>, Vec<f64>) {
-        let (start, end) = self.unrestarted_segment();
-        let steps = &self.steps[start..end];
-        let mut diagonal = Vec::with_capacity(steps.len());
-        let mut off_diagonal = Vec::with_capacity(steps.len().saturating_sub(1));
-        for (j, step) in steps.iter().enumerate() {
-            if !(step.alpha.is_finite() && step.alpha > 0.0) {
-                break;
-            }
-            let previous = if j == 0 {
-                0.0
-            } else {
-                let earlier = &steps[j - 1];
-                if !(earlier.alpha.is_finite() && earlier.alpha > 0.0 && earlier.beta >= 0.0) {
-                    break;
-                }
-                earlier.beta / earlier.alpha
-            };
-            diagonal.push(1.0 / step.alpha + previous);
-            if j + 1 < steps.len() && step.beta >= 0.0 {
-                off_diagonal.push(step.beta.sqrt() / step.alpha);
-            }
-        }
-        off_diagonal.truncate(diagonal.len().saturating_sub(1));
-        (diagonal, off_diagonal)
-    }
-
-    /// The `count` Ritz values spread evenly through the resolved spectrum,
-    /// ascending, plus both extremes. Empty when the solve took no usable step.
-    #[must_use]
-    pub fn ritz_values(&self, count: usize) -> Vec<f64> {
-        let (diagonal, off_diagonal) = self.lanczos_tridiagonal();
-        let m = diagonal.len();
-        if m == 0 {
-            return Vec::new();
-        }
-        let wanted = count.max(2).min(m);
-        (0..wanted)
-            .map(|slot| {
-                let index = if wanted == 1 {
-                    0
-                } else {
-                    (slot * (m - 1)) / (wanted - 1)
-                };
-                tridiagonal_eigenvalue(&diagonal, &off_diagonal, index)
-            })
-            .collect()
-    }
-
-    /// `θ_max/θ_min` over the Ritz values — the condition number of the
-    /// preconditioned shifted operator RESTRICTED to the Krylov space the solve
-    /// explored. This is a lower bound on `κ` of the full operator, and it is the
-    /// conditioning that actually governs this solve's convergence rate, since CG
-    /// only ever sees the spectrum its own Krylov space resolves.
-    #[must_use]
-    pub fn krylov_condition_estimate(&self) -> Option<f64> {
-        let (diagonal, off_diagonal) = self.lanczos_tridiagonal();
-        let m = diagonal.len();
-        if m == 0 {
-            return None;
-        }
-        let low = tridiagonal_eigenvalue(&diagonal, &off_diagonal, 0);
-        let high = tridiagonal_eigenvalue(&diagonal, &off_diagonal, m - 1);
-        (low.is_finite() && low > 0.0 && high.is_finite()).then(|| high / low)
-    }
-
-    /// Iterations the standard CG bound needs to cut the ENERGY norm of the
-    /// error by `rel_tol` at the observed Krylov conditioning:
-    ///
-    /// ```text
-    /// ‖e_j‖_A ≤ 2·((√κ−1)/(√κ+1))^j·‖e_0‖_A   ⟹   j ≥ ½·√κ·ln(2/rel_tol)
-    /// ```
-    ///
-    /// The solve's own stopping test is on the relative RESIDUAL, whose bound
-    /// carries an extra `√κ` inside the logarithm, so this is not an upper bound
-    /// on that quantity in general — it is the operator's own conditioning
-    /// expressed in iterations, which is what an acceptance should be denominated
-    /// in rather than a hard-coded count. What makes it a gate is that the
-    /// per-shift ladder MISSES it by a wide margin and a one-Krylov-space
-    /// evaluator meets it; both directions are measured, not assumed.
-    #[must_use]
-    pub fn conditioning_iteration_bound(&self) -> Option<f64> {
-        let kappa = self.krylov_condition_estimate()?;
-        (kappa >= 1.0).then(|| 0.5 * kappa.sqrt() * (2.0 / self.rel_tol).ln())
-    }
-}
-
-/// Number of eigenvalues of the symmetric tridiagonal `(diagonal, off_diagonal)`
-/// strictly below `x`, by the Sturm/LDLᵀ sign count. Exact in exact arithmetic
-/// and monotone in `x` in floating point, which is what makes the bisection
-/// below terminate on the right eigenvalue.
-fn tridiagonal_sturm_count(diagonal: &[f64], off_diagonal: &[f64], x: f64) -> usize {
-    let mut count = 0usize;
-    let mut pivot = diagonal[0] - x;
-    if pivot < 0.0 {
-        count += 1;
-    }
-    for index in 1..diagonal.len() {
-        let e = off_diagonal[index - 1];
-        // A zero pivot splits the sequence; the standard remedy is to replace it
-        // by a quantity of the same sign and negligible magnitude, which leaves
-        // the count correct and the recurrence finite.
-        if pivot == 0.0 {
-            pivot = -f64::EPSILON * (e.abs() + diagonal[index].abs() + 1.0);
-        }
-        pivot = diagonal[index] - x - e * e / pivot;
-        if pivot < 0.0 {
-            count += 1;
-        }
-    }
-    count
-}
-
-/// The `index`-th smallest eigenvalue of a symmetric tridiagonal, by bisection
-/// on the Sturm count inside the Gershgorin bracket. `O(m)` per bisection step
-/// and no dense eigensolver, so a trace thousands of steps long is still cheap
-/// to interrogate.
-fn tridiagonal_eigenvalue(diagonal: &[f64], off_diagonal: &[f64], index: usize) -> f64 {
-    let m = diagonal.len();
-    if m == 0 {
-        return f64::NAN;
-    }
-    let mut lo = f64::INFINITY;
-    let mut hi = f64::NEG_INFINITY;
-    for (row, &d) in diagonal.iter().enumerate() {
-        let radius = off_diagonal.get(row).copied().unwrap_or(0.0).abs()
-            + row
-                .checked_sub(1)
-                .and_then(|prev| off_diagonal.get(prev).copied())
-                .unwrap_or(0.0)
-                .abs();
-        lo = lo.min(d - radius);
-        hi = hi.max(d + radius);
-    }
-    if !(lo.is_finite() && hi.is_finite()) {
-        return f64::NAN;
-    }
-    // Widen by one ulp-scale so the endpoints are strictly outside the spectrum.
-    let pad = f64::EPSILON * (lo.abs() + hi.abs()).max(1.0);
-    let (mut lo, mut hi) = (lo - pad, hi + pad);
-    // Bisection to the floating-point resolution of the bracket: each step halves
-    // the interval, so this terminates in at most the exponent range of f64.
-    for _ in 0..200 {
-        let mid = 0.5 * (lo + hi);
-        if !(mid > lo && mid < hi) {
-            break;
-        }
-        if tridiagonal_sturm_count(diagonal, off_diagonal, mid) > index {
-            hi = mid;
-        } else {
-            lo = mid;
-        }
-    }
-    0.5 * (lo + hi)
-}
-
-/// `shifted_pcg` with the recurrence recorded. The two share one body, so the
-/// trace is of the production iteration, not of a reimplementation of it.
-pub(crate) fn shifted_pcg_traced(
-    matvec: &(impl Fn(ArrayView1<f64>) -> Array1<f64> + Sync),
-    preconditioner: &ShiftedDiagonalPreconditioner,
-    t: f64,
-    b: &Array1<f64>,
-    y0: &Array1<f64>,
-    rel_tol: f64,
-    max_iters: usize,
-) -> (Option<(Array1<f64>, usize)>, ShiftedPcgTrace) {
-    let mut trace = ShiftedPcgTrace {
-        shift: t,
-        rhs_norm: b.dot(b).sqrt(),
-        rel_tol,
-        steps: Vec::new(),
-        certified: false,
-    };
-    let outcome = {
-        let steps = &mut trace.steps;
-        let mut record = |step: ShiftedPcgStep| steps.push(step);
-        let record: Option<&mut dyn FnMut(ShiftedPcgStep)> = Some(&mut record);
-        shifted_pcg_core(
-            matvec,
-            preconditioner,
-            t,
-            b,
-            y0,
-            rel_tol,
-            max_iters,
-            record,
-        )
-    };
-    trace.certified = outcome.is_some();
-    (outcome, trace)
 }
 
 fn shifted_pcg_core(
@@ -1191,7 +857,6 @@ fn shifted_pcg_core(
     y0: &Array1<f64>,
     rel_tol: f64,
     max_iters: usize,
-    mut record: Option<&mut dyn FnMut(ShiftedPcgStep)>,
 ) -> Option<(Array1<f64>, usize)> {
     if !(rel_tol.is_finite() && rel_tol > 0.0) {
         return None;
@@ -1218,7 +883,6 @@ fn shifted_pcg_core(
     let tol = rel_tol * b_norm;
     let mut iters = 0usize;
     let mut observed_operator_norm = 0.0_f64;
-    let mut restarted = false;
     loop {
         if residual_norm_sq.sqrt() <= tol {
             // Recursive CG residuals lose their equality to `b - A y` through
@@ -1271,7 +935,6 @@ fn shifted_pcg_core(
                 return None;
             }
             p = z.clone();
-            restarted = true;
         }
         if iters >= max_iters {
             return None;
@@ -1299,7 +962,6 @@ fn shifted_pcg_core(
         let alpha = rs / denom;
         y.scaled_add(alpha, &p);
         r.scaled_add(-alpha, &ap);
-        let residual_norm_before = residual_norm_sq.sqrt();
         residual_norm_sq = r.dot(&r);
         z = preconditioner.apply(&r, t);
         let rs_new = r.dot(&z);
@@ -1307,15 +969,6 @@ fn shifted_pcg_core(
             return None;
         }
         let beta = rs_new / rs;
-        if let Some(record) = record.as_deref_mut() {
-            record(ShiftedPcgStep {
-                residual_norm: residual_norm_before,
-                alpha,
-                beta,
-                restarted,
-            });
-        }
-        restarted = false;
         p = &z + &(&p * beta);
         rs = rs_new;
         iters += 1;

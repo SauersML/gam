@@ -229,5 +229,51 @@
     "unit_test_decreases": {
       "crates/gam-inference": 3
     }
+  },
+  {
+    "base": "d338606307c351ac4ef8244244ef6c5af3ad051c",
+    "reason": "User directive 2026-09-11: delete code only tests use and code nothing uses. gam-custom-family realize_coefficient_groups_for_custom_family (with its coefficient_groups module), the two outer-criterion diagnostic evaluators and CustomFamilyWarmStart::active_constraint_rows had no production caller, and the coefficient-group types the realizer consumed and produced were left with no consumer.",
+    "evidence": "Re-confirmed at the tip with git grep -nw over crates src tests examples bench benches. gam-models and tests/inference/misc import gam-terms' own CoefficientGroupSpec (gam::smooth), which stays. Removed with the three #2315 realizer unit tests, the #2612 outer-gradient FD suite test restored in 21390b321 (its only subject was evaluate_labeled_outer_criterion_for_diagnostics) and one diagnostic eprintln in kappa_exact_joint_fd_tests.rs. Gates pass base..head; MSI verification at the pushed sha follows.",
+    "test_count_decrease": 8,
+    "removed_pins": {
+      "coefficient_group_labels_cannot_reclassify_base_penalties_2315": 1,
+      "jeffreys_armed_outer_gradient_matches_central_differences_2612": 1,
+      "jeffreys_armed_outer_hessian_agrees_on_the_curvature_verdict_2612": 1,
+      "multi_block_group_priors_follow_realized_penalty_order_2315": 1,
+      "the_jeffreys_term_is_live_on_this_fixture_2612": 1,
+      "tied_and_fixed_base_penalties_use_optimizer_coordinate_priors_2315": 1,
+      "unbiased_outer_gradient_matches_central_differences_2612": 1,
+      "unbiased_outer_hessian_matches_the_gradient_jacobian_2612": 1
+    },
+    "unit_test_decreases": {
+      "crates/gam-custom-family": 3,
+      "crates/gam-models": 5
+    }
+  },
+  {
+    "base": "48ee099d449adba3ae8d68e36d36ec8755996f98",
+    "reason": "Fix-forward for main's compile break. 0904dd2a2 (gam-identifiability) deleted build_primary_grams_gpu_or_cpu, the only production caller of families::gpu::try_primary_state_gram_cuda, which left the whole GPU gram path in families/gpu.rs and families/gpu_kernel.rs and CompiledMap::raw_block_rows unreferenced. e3b50feaf (gam-solve) deleted add_analytic_penalty_contributions, the only caller of apply_analytic_penalty, and 0b5288b44 removed its sibling helpers but not it. Under warnings = deny every orphan is a build error. Both modules are deleted with their mod lines and tests, along with raw_block_rows, apply_analytic_penalty and the prelude import only it used.",
+    "evidence": "MSI job 422887 at a5a7b96ba: cargo check --workspace --exclude gam-pyffi --all-targets rc 101, 19 dead-code errors in gam-identifiability (GramBundle, CHANNELS, PACKED_LEN, packed_index, try_primary_state_gram_cuda, WorkspaceInner and its methods, weighted_gemm, plain_gemm, from_col_major, assign_block, symmetrise, KERNEL_NAME, TILE_A, TILE_B, KERNEL_SRC, raw_block_rows) plus 4 in gam-solve arrow_schur. Pre-push candidate over 5e967c204 (job 424523): the same check rc 0 in 1m42s. Guard and census over 5e967c204..bccd377e7 (lane-local candidate) list exactly these guarded identities and a loss of the four in-file tests of the deleted modules; no issue-pinned test is removed.",
+    "removed_pins": {},
+    "test_count_decrease": 4,
+    "unit_test_decreases": {
+      "crates/gam-identifiability": 4
+    }
+  },
+  {
+    "base": "c4c012c93228f4613f2641542c732fdbdd0deb48",
+    "reason": "user directive: delete all useless slop, including code only tests use and the tests that exist only for it. The retired gam-solve tests exercised only removed instruments: the #2576 shift-ladder profile and its trace (shift_ladder_residual_curve_and_ritz_spectrum_2576, evidence_logdet_ladder_costs_one_krylov_space_per_probe_2576, from the never-compiled tests_logdet_krylov_2576.rs), the preconditioner study (evidence_logdet_preconditioner_cuts_iterations_without_moving_log_det), the resident exact-diagonal instrument (resident_schur_elimination_diagonal_matches_operator_diagonal_2576, elimination_share_of_the_border_diagonal_is_fixture_dependent_2576), and the value predicate is_non_pd_schur_complement (non_pd_schur_predicate_preserves_the_two_substring_conjunct_2598).",
+    "evidence": "The same commit deletes reduced_schur_logdet_shift_ladder_profile, reduced_schur_logdet_preconditioner_study, resident_schur_elimination_diagonal, reduced_schur_shifted_preconditioner_resident and is_non_pd_schur_complement from crates/gam-solve/src/arrow_schur/reduced_solve.rs and ShiftedPcgTrace from rational_logdet.rs. The production reader rendered_is_non_pd_schur_complement keeps its pin rendered_verdict_matches_the_value_verdict_for_every_variant_2598 through a test-local value oracle, and matrix_free_arrow_operator_apply keeps its dense-cache pin, renamed matrix_free_full_arrow_apply_matches_dense_cache.",
+    "test_count_decrease": 6,
+    "removed_pins": {
+      "elimination_share_of_the_border_diagonal_is_fixture_dependent_2576": 1,
+      "evidence_logdet_ladder_costs_one_krylov_space_per_probe_2576": 1,
+      "non_pd_schur_predicate_preserves_the_two_substring_conjunct_2598": 1,
+      "resident_schur_elimination_diagonal_matches_operator_diagonal_2576": 1,
+      "shift_ladder_residual_curve_and_ritz_spectrum_2576": 1
+    },
+    "unit_test_decreases": {
+      "crates/gam-solve": 6
+    }
   }
 ]

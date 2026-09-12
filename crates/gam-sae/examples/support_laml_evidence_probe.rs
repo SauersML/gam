@@ -5,8 +5,7 @@
 //! ρ-derivatives. Before #2576 that number could not be produced at all on a
 //! CPU-only host, and the lane reported nothing about what it spent. This
 //! harness assembles the SAME arrow system the criterion assembles and then
-//! prints what the frozen rational surrogate costs and produces: the
-//! preconditioner study's per-tier iteration counts, and a ladder of
+//! prints what the frozen rational surrogate costs and produces: a ladder of
 //! deflation-rank targets showing which are reachable at this width and what
 //! each costs.
 //!
@@ -21,9 +20,8 @@ use gam_sae::manifold::{
     build_sae_support_term_seed, resolve_support_auto_atoms, sae_support_effective_atom_dims,
 };
 use gam_solve::arrow_schur::{
-    ArrowSolveOptions, BatchedBlockSolver, CpuBatchedBlockSolver, SurrogateLaneConfig,
-    SurrogateLaneState,
-    matrix_free_arrow_evidence_log_det_surrogate, reduced_schur_logdet_preconditioner_study,
+    ArrowSolveOptions, SurrogateLaneConfig, SurrogateLaneState,
+    matrix_free_arrow_evidence_log_det_surrogate,
 };
 use ndarray::{Array2, Axis};
 use std::time::Instant;
@@ -135,42 +133,7 @@ fn main() -> Result<(), String> {
         println!("shared-block diagonal: min {lo:.4e} max {hi:.4e} spread {:.1e}", hi / lo);
     }
 
-    let backend = CpuBatchedBlockSolver;
     let options = ArrowSolveOptions::inexact_pcg().with_positive_definite_evidence();
-    let htt = backend
-        .factor_blocks(&system.rows, 0.0, system.d, false)
-        .map_err(|e| format!("row factorization: {e}"))?;
-
-    // A/B on ONE operator through the evidence lane's own study seam.
-    //
-    // Mutating the system to get an unpreconditioned arm does not work, and it
-    // is worth recording why. Clearing `hbb_diag` alone leaves the
-    // preconditioner fully supplied: `set_shared_beta_operator` also installs a
-    // `MatvecDiagPenaltyOp` in `penalty_op` carrying the same diagonal, and
-    // `penalty_diagonal_add` reads THAT first. Clearing `penalty_op` as well
-    // destroys the operator instead: the shared-block apply then falls back to
-    // the dense `hbb`, which is empty on a matrix-free system, so `S` loses its
-    // `H_bb` term entirely and turns negative definite — the power iteration
-    // refuses in 0.1s. The only honest A/B holds the system fixed and varies
-    // ONLY the preconditioner, which is what the study seam does.
-    match reduced_schur_logdet_preconditioner_study(
-        &system, &htt, 0.0, &backend, 8, 0xC0FFEE, 1.0e-8, 40, 1.0e-8, 20_000,
-    ) {
-        Some(rows) => {
-            for row in rows {
-                println!(
-                    "{:<24?}: log|S| = {:+.6e}  std_err {:.3e} (rel {:.2e})  cg_iters {}",
-                    row.preconditioner,
-                    row.log_det,
-                    row.std_err,
-                    row.std_err / (row.log_det.abs() + 1.0),
-                    row.cg_iterations,
-                );
-            }
-        }
-        None => println!("preconditioner study: REFUSED"),
-    }
-
     // Derived-rank lane at a ladder of relative error-bar targets: how much
     // deflation each target actually costs, and which ones are reachable at all.
     for target_rel in [1.0e-2_f64, 1.0e-3, 1.0e-4, 1.0e-6, 1.0e-9] {

@@ -361,9 +361,6 @@ fn ctn_kappa_fd_driver(
         let analytic =
             fixture.evaluate(theta, &options, None, gam_problem::EvalMode::ValueAndGradient);
         let anchor = analytic.result.warm_start.clone();
-        // Which probes sit on an active monotonicity face (gam#979 diagnostic).
-        let active_rows: Vec<usize> = anchor.active_constraint_rows();
-        eprintln!("[{label} {probe}] ACTIVE constraint rows per block={active_rows:?}");
         let cost_an = analytic.result.objective;
         let grad_an = analytic.result.gradient.clone();
         assert!(cost_an.is_finite(), "{label} {probe}: analytic cost not finite");
