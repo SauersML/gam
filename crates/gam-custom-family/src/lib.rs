@@ -57,7 +57,7 @@ pub(crate) use gam_solve::estimate::reml::reml_outer_engine::{
     StochasticTraceState,
     active_constraint_face_geometry,
     active_constraint_tangent_geometry,
-    compute_block_penalty_logdet_derivs_with_prior_factors,
+    compute_block_penalty_logdet_derivs,
     compute_efs_update,
     compute_hybrid_efs_update,
     exact_pseudo_logdet,

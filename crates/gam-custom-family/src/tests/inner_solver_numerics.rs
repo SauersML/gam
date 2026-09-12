@@ -684,7 +684,6 @@ pub(crate) fn objective_includes_solverridge_quadratic_term() {
         persistent_warm_start_store: None,
         cache_mirror_sessions: Vec::new(),
         joint_penalties: None,
-        independent_prior_factor_labels: Vec::new(),
         screen_initial_rho: true,
     };
 
@@ -740,7 +739,6 @@ pub(crate) fn inner_block_accepts_penalty_improving_step_even_if_loglik_drops() 
         persistent_warm_start_store: None,
         cache_mirror_sessions: Vec::new(),
         joint_penalties: None,
-        independent_prior_factor_labels: Vec::new(),
         screen_initial_rho: true,
     };
     let per_block_log_lambdas = vec![array![10.0_f64.ln()]];
@@ -799,7 +797,6 @@ pub(crate) fn exact_newton_backtracking_descent_includes_explicit_ridge() {
         persistent_warm_start_store: None,
         cache_mirror_sessions: Vec::new(),
         joint_penalties: None,
-        independent_prior_factor_labels: Vec::new(),
         screen_initial_rho: true,
     };
     let inner = inner_blockwise_fit(&family, &[spec], &[Array1::zeros(0)], &options, None)

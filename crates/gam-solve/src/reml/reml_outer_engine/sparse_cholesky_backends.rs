@@ -1748,12 +1748,31 @@ pub fn compute_block_penalty_logdet_derivs(
     per_block_penalties: &[&[Array2<f64>]],
     ridge: f64,
 ) -> Result<PenaltyLogdetDerivs, String> {
-    compute_block_penalty_logdet_derivs_with_prior_factors(
-        per_block_rho,
-        per_block_penalties,
-        None,
-        ridge,
-    )
+    if per_block_rho.len() != per_block_penalties.len() {
+        return Err(format!(
+            "penalty-logdet received {} rho blocks and {} penalty blocks",
+            per_block_rho.len(),
+            per_block_penalties.len()
+        ));
+    }
+    let key = BlockPenaltyGeometryKey::new(per_block_penalties);
+    let geometry = BLOCK_PENALTY_LOGDET_GEOMETRY.with(|slot| {
+        slot.borrow()
+            .as_ref()
+            .filter(|(cached_key, _)| cached_key == &key)
+            .map(|(_, geometry)| std::sync::Arc::clone(geometry))
+    });
+    let geometry = match geometry {
+        Some(geometry) => geometry,
+        None => {
+            let geometry = std::sync::Arc::new(BlockPenaltyLogdetGeometry::new(per_block_penalties)?);
+            BLOCK_PENALTY_LOGDET_GEOMETRY.with(|slot| {
+                *slot.borrow_mut() = Some((key, std::sync::Arc::clone(&geometry)));
+            });
+            geometry
+        }
+    };
+    geometry.evaluate(per_block_rho, ridge)
 }
 
 /// Immutable, λ-independent geometry of one fixed collection of PSD penalty
@@ -2078,11 +2097,10 @@ struct DensePenaltyGeometryKey {
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct BlockPenaltyGeometryKey {
     blocks: Vec<Vec<DensePenaltyGeometryKey>>,
-    prior_factor_masks: Vec<Vec<bool>>,
 }
 
 impl BlockPenaltyGeometryKey {
-    fn new(per_block_penalties: &[&[Array2<f64>]], prior_factor_masks: &[Vec<bool>]) -> Self {
+    fn new(per_block_penalties: &[&[Array2<f64>]]) -> Self {
         Self {
             blocks: per_block_penalties
                 .iter()
@@ -2097,21 +2115,14 @@ impl BlockPenaltyGeometryKey {
                         .collect()
                 })
                 .collect(),
-            prior_factor_masks: prior_factor_masks.to_vec(),
         }
     }
 }
 
 #[derive(Debug)]
-struct PenaltyLogdetGroupGeometry {
-    coordinate_indices: Vec<usize>,
-    geometry: FixedPenaltyLogdetGeometry,
-}
-
-#[derive(Debug)]
 struct PenaltyLogdetBlockGeometry {
     coordinate_count: usize,
-    groups: Vec<PenaltyLogdetGroupGeometry>,
+    geometry: Option<FixedPenaltyLogdetGeometry>,
 }
 
 #[derive(Debug)]
@@ -2120,48 +2131,20 @@ struct BlockPenaltyLogdetGeometry {
 }
 
 impl BlockPenaltyLogdetGeometry {
-    fn new(
-        per_block_penalties: &[&[Array2<f64>]],
-        prior_factor_masks: &[Vec<bool>],
-    ) -> Result<Self, String> {
+    fn new(per_block_penalties: &[&[Array2<f64>]]) -> Result<Self, String> {
         let mut blocks = Vec::with_capacity(per_block_penalties.len());
         for (block_index, penalties) in per_block_penalties.iter().enumerate() {
-            let mask = &prior_factor_masks[block_index];
-            let coalesced_indices: Vec<usize> = mask
-                .iter()
-                .enumerate()
-                .filter_map(|(index, &is_factor)| (!is_factor).then_some(index))
-                .collect();
-            let mut groups = Vec::new();
-            if !coalesced_indices.is_empty() {
-                let components: Vec<Array2<f64>> = coalesced_indices
-                    .iter()
-                    .map(|&index| penalties[index].clone())
-                    .collect();
-                groups.push(PenaltyLogdetGroupGeometry {
-                    coordinate_indices: coalesced_indices,
-                    geometry: FixedPenaltyLogdetGeometry::new(&components)
+            let geometry = if penalties.is_empty() {
+                None
+            } else {
+                Some(
+                    FixedPenaltyLogdetGeometry::new(penalties)
                         .map_err(|error| format!("penalty-logdet block {block_index}: {error}"))?,
-                });
-            }
-            for (index, &is_factor) in mask.iter().enumerate() {
-                if is_factor {
-                    groups.push(PenaltyLogdetGroupGeometry {
-                        coordinate_indices: vec![index],
-                        geometry: FixedPenaltyLogdetGeometry::new(std::slice::from_ref(
-                            &penalties[index],
-                        ))
-                        .map_err(|error| {
-                            format!(
-                                "penalty-logdet block {block_index} prior factor {index}: {error}"
-                            )
-                        })?,
-                    });
-                }
-            }
+                )
+            };
             blocks.push(PenaltyLogdetBlockGeometry {
                 coordinate_count: penalties.len(),
-                groups,
+                geometry,
             });
         }
         Ok(Self { blocks })
@@ -2207,27 +2190,16 @@ impl BlockPenaltyLogdetGeometry {
             }
             let lambdas = gam_problem::checked_exp_log_strengths(rho.iter().copied())
                 .map_err(|error| format!("penalty-logdet block {block_index}: {error}"))?;
-            let mut value = 0.0;
-            let mut first = Array1::<f64>::zeros(block.coordinate_count);
-            let mut second = Array2::<f64>::zeros((block.coordinate_count, block.coordinate_count));
-            for group in &block.groups {
-                let group_lambdas: Vec<f64> = group
-                    .coordinate_indices
-                    .iter()
-                    .map(|&index| lambdas[index])
-                    .collect();
-                let (group_value, group_first, group_second) = group
-                    .geometry
-                    .evaluate(&group_lambdas, ridge)
-                    .map_err(|error| format!("penalty-logdet block {block_index}: {error}"))?;
-                value += group_value;
-                for (local_k, &global_k) in group.coordinate_indices.iter().enumerate() {
-                    first[global_k] = group_first[local_k];
-                    for (local_l, &global_l) in group.coordinate_indices.iter().enumerate() {
-                        second[[global_k, global_l]] = group_second[[local_k, local_l]];
-                    }
-                }
-            }
+            let (value, first, second) = match &block.geometry {
+                Some(geometry) => geometry
+                    .evaluate(&lambdas, ridge)
+                    .map_err(|error| format!("penalty-logdet block {block_index}: {error}"))?,
+                None => (
+                    0.0,
+                    Array1::<f64>::zeros(block.coordinate_count),
+                    Array2::<f64>::zeros((block.coordinate_count, block.coordinate_count)),
+                ),
+            };
             Ok(BlockResult {
                 offset: offsets[block_index],
                 value,
@@ -2278,89 +2250,6 @@ std::thread_local! {
     static BLOCK_PENALTY_LOGDET_GEOMETRY:
         std::cell::RefCell<Option<(BlockPenaltyGeometryKey, std::sync::Arc<BlockPenaltyLogdetGeometry>)>>
         = const { std::cell::RefCell::new(None) };
-}
-
-/// `compute_block_penalty_logdet_derivs` with per-penalty prior-factor
-/// structure.
-///
-/// `prior_factor_mask[b][k] == true` declares block `b`'s penalty `k` an
-/// INDEPENDENT Gaussian prior factor rather than an additive piece of one
-/// smooth prior. The evidence normalizer of one Gaussian with precision
-/// `Σ_k λ_k S_k` is the coalesced `log|Σ_k λ_k S_k|₊` (the default, and the
-/// correct convention for multi-penalty smooths), but a PRODUCT of
-/// independent factors `∏_k N(0, (λ_k S_k)⁻¹)` contributes
-///
-/// ```text
-/// Σ_k log|λ_k S_k|₊ = Σ_k ( rank(S_k)·ρ_k + log|S_k|₊ ),
-/// ```
-///
-/// which differs from the coalesced form exactly when factors overlap: two
-/// factors with precision λ on one scalar coefficient carry
-/// `λ^{1/2}·λ^{1/2} = λ`, while coalescing their quadratics into `2λβ²` and
-/// taking one normalizer yields `(2λ)^{1/2}` — losing `½ log λ` from the
-/// outer ρ-posterior (hierarchical coefficient groups, audit finding 40).
-/// Each masked penalty therefore becomes its own singleton pseudo-logdet
-/// block; unmasked penalties within the block coalesce as before. `None`
-/// masks (or an all-false mask) reproduce the coalesced behaviour exactly.
-pub fn compute_block_penalty_logdet_derivs_with_prior_factors(
-    per_block_rho: &[Array1<f64>],
-    per_block_penalties: &[&[Array2<f64>]],
-    prior_factor_mask: Option<&[Vec<bool>]>,
-    ridge: f64,
-) -> Result<PenaltyLogdetDerivs, String> {
-    if per_block_rho.len() != per_block_penalties.len() {
-        return Err(format!(
-            "penalty-logdet received {} rho blocks and {} penalty blocks",
-            per_block_rho.len(),
-            per_block_penalties.len()
-        ));
-    }
-    let masks = match prior_factor_mask {
-        Some(masks) => {
-            if masks.len() != per_block_penalties.len() {
-                return Err(format!(
-                    "penalty-logdet received {} prior-factor masks for {} penalty blocks",
-                    masks.len(),
-                    per_block_penalties.len()
-                ));
-            }
-            for (block, (mask, penalties)) in masks.iter().zip(per_block_penalties).enumerate() {
-                if mask.len() != penalties.len() {
-                    return Err(format!(
-                        "penalty-logdet block {block} has {} penalties but {} prior-factor flags",
-                        penalties.len(),
-                        mask.len()
-                    ));
-                }
-            }
-            masks.to_vec()
-        }
-        None => per_block_penalties
-            .iter()
-            .map(|penalties| vec![false; penalties.len()])
-            .collect(),
-    };
-    let key = BlockPenaltyGeometryKey::new(per_block_penalties, &masks);
-    let geometry = BLOCK_PENALTY_LOGDET_GEOMETRY.with(|slot| {
-        slot.borrow()
-            .as_ref()
-            .filter(|(cached_key, _)| cached_key == &key)
-            .map(|(_, geometry)| std::sync::Arc::clone(geometry))
-    });
-    let geometry = match geometry {
-        Some(geometry) => geometry,
-        None => {
-            let geometry = std::sync::Arc::new(BlockPenaltyLogdetGeometry::new(
-                per_block_penalties,
-                &masks,
-            )?);
-            BLOCK_PENALTY_LOGDET_GEOMETRY.with(|slot| {
-                *slot.borrow_mut() = Some((key, std::sync::Arc::clone(&geometry)));
-            });
-            geometry
-        }
-    };
-    geometry.evaluate(per_block_rho, ridge)
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

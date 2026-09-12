@@ -111,5 +111,13 @@
     },
     "reason": "User directive 2026-09-11: delete code only tests use and code nothing uses. gam-custom-family realize_coefficient_groups_for_custom_family (with its coefficient_groups module), the two outer-criterion diagnostic evaluators and CustomFamilyWarmStart::active_constraint_rows had no production caller, and the coefficient-group types the realizer consumed and produced were left with no consumer.",
     "evidence": "Re-confirmed at the tip with git grep -nw over crates src tests examples bench benches. gam-models and tests/inference/misc import gam-terms' own CoefficientGroupSpec (gam::smooth), which stays. Removed with the three #2315 realizer unit tests, the #2612 outer-gradient FD suite test restored in 21390b321 (its only subject was evaluate_labeled_outer_criterion_for_diagnostics) and one diagnostic eprintln in kappa_exact_joint_fd_tests.rs. Gates pass base..head; MSI verification at the pushed sha follows."
+  },
+  {
+    "base": "aa4199edbfdca0dce0e6df4d8bdd261ca0395b84",
+    "removed": {
+      "crates/gam-solve/src/reml/reml_outer_engine/sparse_cholesky_backends.rs::compute_block_penalty_logdet_derivs_with_prior_factors": 1
+    },
+    "reason": "User directive 2026-09-11: delete code only tests use and code nothing uses. BlockwiseFitOptions::independent_prior_factor_labels had no producer left once realize_coefficient_groups_for_custom_family was deleted in 48f48f910: the default and every test literal set it empty, so the prior-factor mask route (compute_block_penalty_logdet_derivs_with_prior_factors and its per-factor geometry groups) only ever ran with all-false masks.",
+    "evidence": "Re-confirmed at the tip with git grep -nw over crates src tests examples bench benches: independent_prior_factor_labels was assigned only Vec::new() (the options default and four gam-custom-family test literals) and read only by the assembly.rs mask branch; compute_block_penalty_logdet_derivs_with_prior_factors was called only with that mask and with None. With all-false masks every block had one coalesced group over all its penalties in order, which compute_block_penalty_logdet_derivs now evaluates directly, so the logdet value and derivatives are unchanged. Gates pass base..head; MSI verification at the pushed sha follows."
   }
 ]

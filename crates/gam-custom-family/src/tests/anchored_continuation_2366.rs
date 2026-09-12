@@ -423,7 +423,6 @@ fn double_well_options() -> BlockwiseFitOptions {
         persistent_warm_start_store: None,
         cache_mirror_sessions: Vec::new(),
         joint_penalties: None,
-        independent_prior_factor_labels: Vec::new(),
         screen_initial_rho: false,
     }
 }
