@@ -39,6 +39,24 @@ pub struct RiddersConfig {
     pub rungs: usize,
 }
 
+/// Powers present in the stencil's truncation-error expansion.
+#[derive(Clone, Copy, Debug)]
+pub enum StencilErrorPowers {
+    /// A symmetric central stencil has errors in `h², h⁴, h⁶, ...`.
+    Even,
+    /// A three-point one-sided stencil has errors in `h², h³, h⁴, ...`.
+    Consecutive,
+}
+
+impl StencilErrorPowers {
+    fn exponent(self, stage: usize) -> usize {
+        match self {
+            Self::Even => 2 * stage,
+            Self::Consecutive => stage + 1,
+        }
+    }
+}
+
 impl Default for RiddersConfig {
     fn default() -> Self {
         Self {
@@ -77,8 +95,8 @@ pub struct FdDerivative {
     pub uncertainty: f64,
     /// The ladder step whose column produced `value`.
     pub step: f64,
-    /// Truncation order of the accepted extrapolant: `2` is a raw central
-    /// difference, `4` one Richardson stage, `6` two, and so on.
+    /// Truncation order of the accepted extrapolant. Central stencils advance
+    /// `2, 4, 6, ...`; three-point one-sided stencils advance `2, 3, 4, ...`.
     pub order: usize,
     /// The raw central differences `(h, D(h))`, coarsest first — kept so a
     /// diagnostic can print the law the gap follows without re-running.
@@ -169,7 +187,11 @@ pub fn ridders_derivative<F>(mut f: F, config: RiddersConfig) -> FdDerivative
 where
     F: FnMut(f64) -> f64,
 {
-    ridders_from_stencil(|h| (f(h) - f(-h)) / (2.0 * h), config)
+    ridders_from_stencil(
+        |h| (f(h) - f(-h)) / (2.0 * h),
+        config,
+        StencilErrorPowers::Even,
+    )
 }
 
 /// [`ridders_derivative`] over an arbitrary `O(h²)` derivative stencil.
@@ -182,12 +204,16 @@ where
 /// self-certification as an interior one instead of being differenced once at a
 /// guessed step and reported as fact.
 ///
-/// The Neville recurrence below cancels `h²`, then `h⁴`, and so on, so it is
-/// valid for any stencil whose error expansion is in even powers of `h`. A
-/// stencil with an `O(h)` term would need ratio `r` rather than `r²` per stage;
-/// passing one here silently under-cancels, which the uncertainty estimate then
-/// reports as poor agreement rather than hiding.
-pub fn ridders_from_stencil<F>(mut stencil: F, config: RiddersConfig) -> FdDerivative
+/// `error_powers` must match the expansion: central differences have only even
+/// powers, while the three-point one-sided rules have all powers starting at
+/// two. Having the same leading `O(h²)` error does not make their higher
+/// extrapolation stages interchangeable. Stencils with an `O(h)` term are not
+/// supported.
+pub fn ridders_from_stencil<F>(
+    mut stencil: F,
+    config: RiddersConfig,
+    error_powers: StencilErrorPowers,
+) -> FdDerivative
 where
     F: FnMut(f64) -> f64,
 {
@@ -207,8 +233,8 @@ where
         "ridders_derivative: need at least 4 rungs"
     );
 
-    // `tableau[i][j]` is the order-`2(j+1)` extrapolant built from rungs
-    // `i-j ..= i`. Column 0 is the raw stencil value at step `h_i`.
+    // `tableau[i][j]` cancels the first j error powers using rungs `i-j ..= i`.
+    // Column 0 is the raw stencil value at step `h_i`.
     let mut tableau: Vec<Vec<f64>> = Vec::with_capacity(config.rungs);
     let mut ladder: Vec<(f64, f64)> = Vec::with_capacity(config.rungs);
     let mut best = FdDerivative {
@@ -219,6 +245,10 @@ where
         ladder: Vec::new(),
     };
     let ratio_sq = config.shrink * config.shrink;
+    let factor_step = match error_powers {
+        StencilErrorPowers::Even => ratio_sq,
+        StencilErrorPowers::Consecutive => config.shrink,
+    };
 
     let mut h = config.initial_step;
     for i in 0..config.rungs {
@@ -227,7 +257,7 @@ where
         let mut row = vec![d];
         if i > 0 {
             // Neville across the ladder: each stage removes the leading
-            // even power of `h` still present in its two parents.
+            // power of `h` still present in its two parents.
             let mut factor = ratio_sq;
             for j in 1..=i {
                 let left = row[j - 1];
@@ -283,10 +313,10 @@ where
                         best.value = extrapolant;
                         best.uncertainty = error;
                         best.step = h;
-                        best.order = 2 * (j + 1);
+                        best.order = error_powers.exponent(j + 1);
                     }
                 }
-                factor *= ratio_sq;
+                factor *= factor_step;
             }
         }
         tableau.push(row);
@@ -296,3 +326,33 @@ where
     best
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn one_sided_extrapolation_cancels_odd_error_powers() {
+        // f'(0)=1, but its forward three-point derivative is
+        // D(h)=1-2h²-6h³. The second stage must cancel h³, not h⁴.
+        let f = |t: f64| t + t.powi(3) + t.powi(4);
+        let measured = ridders_from_stencil(
+            |h| (4.0 * f(h) - f(2.0 * h)) / (2.0 * h),
+            RiddersConfig { initial_step: 1.0, shrink: 2.0, rungs: 6 },
+            StencilErrorPowers::Consecutive,
+        );
+        assert_eq!(measured.value, 1.0);
+        assert_eq!(measured.uncertainty, 0.0);
+        assert!(measured.order >= 4);
+    }
+
+    #[test]
+    fn central_extrapolation_cancels_even_error_powers() {
+        let measured = ridders_derivative(
+            |t| t + t.powi(3) + t.powi(5),
+            RiddersConfig { initial_step: 1.0, shrink: 2.0, rungs: 6 },
+        );
+        assert_eq!(measured.value, 1.0);
+        assert_eq!(measured.uncertainty, 0.0);
+        assert!(measured.order >= 6);
+    }
+}

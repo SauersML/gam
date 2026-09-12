@@ -662,6 +662,7 @@ fn difference_theta_coordinate(
                 shrink: ladder_shrink,
                 rungs: ladder_rungs,
             },
+            gam_linalg::numeric_derivative::StencilErrorPowers::Even,
         );
         if let Some(error) = fd_error.take() {
             return Err(error);
@@ -709,9 +710,9 @@ fn difference_theta_coordinate(
         })
     } else if right_room >= left_room && right_room > 0.0 {
         // Pinned against the LOWER face: only the forward three-point rule
-        // is evaluable. Its error is `O(h²)` like the central difference,
-        // so the same ladder certifies it (`ridders_certifies_a_one_sided_
-        // stencil`). The coarsest rung must fit `2h` inside the room.
+        // is evaluable. Its error starts at h² but also contains h³, so its
+        // extrapolation cancels consecutive powers. The coarsest rung must
+        // fit `2h` inside the room.
         let measured = gam_linalg::numeric_derivative::ridders_from_stencil(
             |h| {
                 (-3.0 * analytic_cost + 4.0 * probe(h, &mut *obj, &mut fd_error)
@@ -723,6 +724,7 @@ fn difference_theta_coordinate(
                 shrink: ladder_shrink,
                 rungs: ladder_rungs,
             },
+            gam_linalg::numeric_derivative::StencilErrorPowers::Consecutive,
         );
         if let Some(error) = fd_error.take() {
             return Err(error);
@@ -787,6 +789,7 @@ fn difference_theta_coordinate(
                 shrink: ladder_shrink,
                 rungs: ladder_rungs,
             },
+            gam_linalg::numeric_derivative::StencilErrorPowers::Consecutive,
         );
         if let Some(error) = fd_error.take() {
             return Err(error);
