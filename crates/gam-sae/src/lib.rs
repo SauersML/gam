@@ -8,7 +8,6 @@ pub mod atom_codes;
 pub mod atom_schema;
 pub mod attention_kernel;
 pub mod basis;
-pub mod candidate_index;
 pub mod certificate_impls;
 pub mod chart_canonicalization;
 pub mod chart_coordinate_solve;

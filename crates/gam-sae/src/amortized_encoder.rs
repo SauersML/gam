@@ -837,34 +837,11 @@ impl LearnedAmortizedEncoder {
     /// far the predicted code sits from an exact code in coordinate, gate, and
     /// amplitude space. `exact_*` are the exact solver's solution on the SAME
     /// held-out rows the `predicted` code was produced for.
-    pub fn error_stats(
-        predicted: &AmortizedCode,
-        exact_logits: ArrayView2<'_, f64>,
-        exact_coords: &[Array2<f64>],
-        exact_amplitudes: ArrayView2<'_, f64>,
-        activity_floor: f64,
-    ) -> Result<AmortizationErrorStats, String> {
-        let coord_periods: Vec<AxisPeriods> = predicted
-            .coords
-            .iter()
-            .map(|c| vec![None; c.ncols()])
-            .collect();
-        Self::error_stats_wrapped(
-            predicted,
-            exact_logits,
-            exact_coords,
-            exact_amplitudes,
-            &coord_periods,
-            activity_floor,
-        )
-    }
-
-    /// Wrap-aware amortization-gap statistics: identical to [`Self::error_stats`]
-    /// except each per-axis coordinate error is WRAPPED by the axis period before
+    ///
+    /// Each per-axis coordinate error is WRAPPED by the axis period before
     /// it is squared or quantiled — `err = min(|Δ| mod P, P − (|Δ| mod P))` — so a
     /// `t̂ = 0.98` against `t = 0.02` on a unit circle scores `0.04`, not `0.96`.
-    /// A `None` axis is scored on the raw magnitude, so passing all-`None`
-    /// reproduces [`Self::error_stats`] bit-for-bit. `coord_periods` carries one
+    /// A `None` axis is scored on the raw magnitude. `coord_periods` carries one
     /// [`AxisPeriods`] per atom (length = that atom's latent dim), the same
     /// structural periodicity the encoder was fit with.
     pub fn error_stats_wrapped(

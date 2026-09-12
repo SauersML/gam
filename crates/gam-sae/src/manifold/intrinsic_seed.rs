@@ -192,8 +192,8 @@ pub(crate) fn deterministic_knn_graph(z: ArrayView2<'_, f64>, k: usize) -> Vec<V
 
 /// Deterministic farthest-point landmark selection over the ambient rows: seed
 /// from row 0, then repeatedly add the row maximally far (in Euclidean distance)
-/// from the chosen set, first-wins on ties. The same coverage-maximizing greedy
-/// pattern as `encode::data_driven_chart_centers`, reproducible run-to-run.
+/// from the chosen set, first-wins on ties: coverage-maximizing and reproducible
+/// run-to-run.
 pub(crate) fn farthest_point_landmarks(z: ArrayView2<'_, f64>, count: usize) -> Vec<usize> {
     let n = z.nrows();
     if n == 0 {

@@ -802,8 +802,8 @@ fn amortized_warm_start(
     Some(t_hat)
 }
 
-/// Reconstruction error `‖x − z·m(t)‖`. Mirror of
-/// [`crate::encode::encode_reconstruction_error`].
+/// Reconstruction error `‖x − z·m(t)‖`. Mirror of the Euclidean
+/// `crate::encode::encode_reconstruction_error_core`.
 fn recon_error(
     dev: &EncodeAtomDevice,
     t: &[f64],
