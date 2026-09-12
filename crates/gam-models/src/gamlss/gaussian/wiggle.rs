@@ -246,7 +246,7 @@ impl GaussianLocationScaleWiggleFamily {
         Ok(None)
     }
 
-    /// Build the [`BlockEffectiveJacobian`] for block `block_idx`.
+    /// Build the [`BlockEffectiveJacobian`](gam_problem::block_spec::BlockEffectiveJacobian) for block `block_idx`.
     ///
     /// The wiggle block (block 2) modulates the inverse link nonlinearly and
     /// does not contribute a linear additive term to any output η; its

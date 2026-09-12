@@ -888,7 +888,7 @@ impl GaussianLocationScaleFamily {
         )
     }
 
-    /// Build the [`BlockEffectiveJacobian`] for block `block_idx` given the
+    /// Build the [`BlockEffectiveJacobian`](gam_problem::block_spec::BlockEffectiveJacobian) for block `block_idx` given the
     /// realised block specs.  Returns an [`AdditiveBlockJacobian`] encoding the
     /// linear map η_r\[i\] = X_r\[i,:\] · β_r:
     ///

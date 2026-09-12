@@ -583,7 +583,7 @@ impl BinomialMeanWiggleFamily {
         ))))
     }
 
-    /// Build the [`BlockEffectiveJacobian`] for block `block_idx`.
+    /// Build the [`BlockEffectiveJacobian`](gam_problem::block_spec::BlockEffectiveJacobian) for block `block_idx`.
     ///
     /// `BinomialMeanWiggle` has a single location output (n_outputs = 1):
     /// - block 0 (eta):    output 0 = design rows

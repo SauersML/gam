@@ -2124,7 +2124,7 @@ impl BinomialLocationScaleFamily {
         Ok(out)
     }
 
-    /// Build the [`BlockEffectiveJacobian`] for block `block_idx`.
+    /// Build the [`BlockEffectiveJacobian`](gam_problem::block_spec::BlockEffectiveJacobian) for block `block_idx`.
     ///
     /// The two-output map is (η_threshold, η_log_sigma):
     /// - block 0 (threshold):  output 0 = design rows, output 1 = zeros
