@@ -19,6 +19,21 @@
 //! gate stream is never downloaded: only the final `(block, gate)` shortlists
 //! (`m × k`) cross PCIe — the same shortlist-only discipline the atom lane keeps.
 //!
+//! # Coding on the device (#2826)
+//!
+//! A pass also needs each row's codes: the support admitted from its shortlist by
+//! descent in the tied loss, and the γ-free projections of the admitted blocks
+//! (`super::block::code_row`). On the host that coder re-reads every shortlisted
+//! atom and, in every admission round, dots the running reconstruction against
+//! each remaining candidate: `O(k²·b·P)` f64 work per row, done after the device
+//! has already finished its route and sits idle. [`route_and_code_blocks`] runs
+//! the same coder on the device instead (`sparse_dict_block_code`, below), right
+//! after the fold, reading the resident rows, decoder and shortlists. Only the
+//! admitted blocks, their gates and their projections (`m × k × b`) are
+//! downloaded. The kernel performs the host coder's operations in the same order
+//! with separately rounded f64 arithmetic, so its codes equal the host coder's on
+//! the same shortlists to the bit ([`code_block_shortlists_cpu`] is that oracle).
+//!
 //! # Precision of the gate (why f32 on the device is sufficient)
 //!
 //! The gate is `gate_g = sqrt(Σ_{r<b} z_{g,r}²)` over only `b ∈ {2,3,4}` terms.
@@ -41,9 +56,11 @@
 //! consumer can observe. The selection-level equivalence to the CPU path is the
 //! contract (SPEC 20); the bit-identity is a bonus the shared arithmetic gives.
 
-use ndarray::{ArrayView1, ArrayView2};
+use ndarray::{Array2, Array3, ArrayView1, ArrayView2};
 
-use super::block::{block_gates, block_projections_row, route_row_blocks};
+use super::block::{
+    RowBlockCode, block_gates, block_projections_row, code_routed_rows, route_row_blocks,
+};
 
 /// Which path produced a block route. Returned by the fail-loud entry point so
 /// callers (and the parity test) can ASSERT the device engaged rather than
@@ -93,6 +110,137 @@ void sparse_dict_block_gate(
     acc = __fadd_rn(acc, __fmul_rn(v, v));
   }
   gates[(long long)row * (long long)n_blocks + (long long)block] = sqrtf(acc);
+}
+"#;
+
+/// The device block coder. One thread per row repeats `super::block::code_row` on
+/// that row's resident shortlist: the orphan decision of
+/// `super::block::code_routed_rows`, the γ-free candidate coordinates
+/// `w_h = U_h x`, then support admission by descent in the tied loss, where round
+/// one is unconditional and every later round admits the candidate with the most
+/// negative `ΔL_h(S) = −(2γ−γ²) c_h + 2γ² (m · y_h)`, stopping when none lowers
+/// the loss. Every accumulation runs in the host coder's order with separately
+/// rounded f64 operations (the shared NVRTC options pin `--fmad=false`), so the
+/// admitted blocks, their gates and their projections equal the host coder's to
+/// the bit.
+///
+/// The kernel is appended to the score/fold source, so it shares that source's
+/// `PP` and `EMPTY_TOP_ATOM` definitions. `candidates`, `coordinates` and
+/// `reconstruction` are per-row scratch; `counts[row]` is the number of admitted
+/// blocks, and output slots past it are left zero for the host to pad.
+#[cfg(target_os = "linux")]
+pub const BLOCK_CODE_KERNEL_SOURCE: &str = r#"
+extern "C" __global__
+void sparse_dict_block_code(
+    const float* __restrict__ rows,               // [n_rows * PP] row-major
+    const float* __restrict__ decoder,            // [(n_blocks*b) * PP] row-major
+    const unsigned int* __restrict__ top_blocks,  // [n_rows * active] (gate desc, block asc)
+    const float* __restrict__ top_gates,          // [n_rows * active]
+    int n_rows,
+    int active,
+    int k,
+    int b,
+    float gamma,
+    float projection_roundoff,
+    int* __restrict__ candidates,                 // [n_rows * active] scratch
+    double* __restrict__ coordinates,             // [n_rows * active * b] scratch
+    double* __restrict__ reconstruction,          // [n_rows * PP] scratch
+    int* __restrict__ counts,                     // [n_rows]
+    unsigned int* __restrict__ out_blocks,        // [n_rows * active]
+    float* __restrict__ out_gates,                // [n_rows * active]
+    double* __restrict__ out_projections)         // [n_rows * active * b]
+{
+  const long long row = (long long)blockIdx.x * (long long)blockDim.x + (long long)threadIdx.x;
+  if (row >= (long long)n_rows) return;
+  const long long x0 = row * (long long)PP;
+  const long long s0 = row * (long long)active;
+  counts[row] = 0;
+
+  // Orphan decision: the row norm accumulated in f64 in ascending c, rounded to
+  // f32, times the host's projection roundoff. An orphan row keeps no block.
+  double energy = 0.0;
+  for (int c = 0; c < PP; ++c) {
+    const double v = (double)rows[x0 + c];
+    energy = energy + v * v;
+  }
+  const float floor_gate = (float)sqrt(energy) * projection_roundoff;
+  const float best_gate = (top_blocks[s0] != EMPTY_TOP_ATOM) ? top_gates[s0] : 0.0f;
+  if (best_gate < floor_gate) return;
+
+  // Candidate coordinates in routed order. An empty slot or a zero gate is an
+  // absent firing, not a candidate.
+  int n_candidates = 0;
+  for (int j = 0; j < active; ++j) {
+    const unsigned int block = top_blocks[s0 + j];
+    if (block == EMPTY_TOP_ATOM || top_gates[s0 + j] == 0.0f) continue;
+    const long long w0 = (s0 + (long long)n_candidates) * (long long)b;
+    for (int r = 0; r < b; ++r) {
+      const long long a0 = ((long long)block * (long long)b + (long long)r) * (long long)PP;
+      double projection = 0.0;
+      for (int c = 0; c < PP; ++c) {
+        projection = projection + (double)rows[x0 + c] * (double)decoder[a0 + c];
+      }
+      coordinates[w0 + r] = projection;
+    }
+    candidates[s0 + n_candidates] = j;
+    ++n_candidates;
+  }
+
+  // Greedy admission against the γ-free reconstruction m of the admitted set.
+  for (int c = 0; c < PP; ++c) reconstruction[x0 + c] = 0.0;
+  const double g = (double)gamma;
+  const double admission_scale = 2.0 * g - g * g;
+  int admitted = 0;
+  for (int admission_round = 0; admission_round < k; ++admission_round) {
+    const int unconditional = (admission_round == 0);
+    int best = -1;
+    double best_gain = 0.0;
+    for (int i = 0; i < n_candidates; ++i) {
+      const int slot = candidates[s0 + i];
+      if (slot < 0) continue;
+      const unsigned int block = top_blocks[s0 + slot];
+      const long long w0 = (s0 + (long long)i) * (long long)b;
+      double own = 0.0;
+      double overlap = 0.0;
+      for (int r = 0; r < b; ++r) {
+        const double coordinate = coordinates[w0 + r];
+        own = own + coordinate * coordinate;
+        const long long a0 = ((long long)block * (long long)b + (long long)r) * (long long)PP;
+        double projected = 0.0;
+        for (int c = 0; c < PP; ++c) {
+          projected = projected + reconstruction[x0 + c] * (double)decoder[a0 + c];
+        }
+        overlap = overlap + projected * coordinate;
+      }
+      const double gain = (unconditional && admission_scale <= 0.0)
+          ? -own
+          : -admission_scale * own + 2.0 * g * g * overlap;
+      if ((unconditional || gain < 0.0) && (best < 0 || gain < best_gain)) {
+        best = i;
+        best_gain = gain;
+      }
+    }
+    if (best < 0) break;
+    const int slot = candidates[s0 + best];
+    candidates[s0 + best] = -1;
+    const unsigned int block = top_blocks[s0 + slot];
+    out_blocks[s0 + admitted] = block;
+    out_gates[s0 + admitted] = top_gates[s0 + slot];
+    const long long w0 = (s0 + (long long)best) * (long long)b;
+    const long long o0 = (s0 + (long long)admitted) * (long long)b;
+    for (int r = 0; r < b; ++r) {
+      const double coordinate = coordinates[w0 + r];
+      out_projections[o0 + r] = coordinate;
+      if (coordinate != 0.0) {
+        const long long a0 = ((long long)block * (long long)b + (long long)r) * (long long)PP;
+        for (int c = 0; c < PP; ++c) {
+          reconstruction[x0 + c] = reconstruction[x0 + c] + coordinate * (double)decoder[a0 + c];
+        }
+      }
+    }
+    ++admitted;
+  }
+  counts[row] = admitted;
 }
 "#;
 
@@ -152,6 +300,56 @@ pub fn route_blocks_cpu(
         .collect()
 }
 
+/// CPU oracle for the block coder: code each row's given `(block, gate)`
+/// shortlist exactly as a CPU-routed pass does, packed to width `k` as
+/// `(blocks[m,k], gates[m,k], projections[m,k,b])`. Each row lists its admitted
+/// blocks in admission order with their routed gates and γ-free projections,
+/// padded with block 0 and zeros. On the device's own shortlists the device
+/// coder ([`route_and_code_blocks`]) must reproduce it to the bit.
+#[must_use]
+pub fn code_block_shortlists_cpu(
+    rows: ArrayView2<'_, f32>,
+    decoder: ArrayView2<'_, f32>,
+    gamma: f32,
+    b: usize,
+    k: usize,
+    shortlists: Vec<Vec<(u32, f32)>>,
+) -> (Array2<u32>, Array2<f32>, Array3<f64>) {
+    assert_eq!(
+        shortlists.len(),
+        rows.nrows(),
+        "code_block_shortlists_cpu needs one shortlist per row"
+    );
+    pack_row_codes(
+        &code_routed_rows(rows, decoder, gamma, b, k, shortlists),
+        k,
+        b,
+    )
+}
+
+/// Fixed-width `(blocks, gates, projections)` arrays from per-row codes, each
+/// already padded to width `k`.
+fn pack_row_codes(
+    codes: &[RowBlockCode],
+    k: usize,
+    b: usize,
+) -> (Array2<u32>, Array2<f32>, Array3<f64>) {
+    let n = codes.len();
+    let mut blocks = Array2::<u32>::zeros((n, k));
+    let mut gates = Array2::<f32>::zeros((n, k));
+    let mut projections = Array3::<f64>::zeros((n, k, b));
+    for (i, code) in codes.iter().enumerate() {
+        for j in 0..k {
+            blocks[[i, j]] = code.blocks[j];
+            gates[[i, j]] = code.gates[j];
+            for r in 0..b {
+                projections[[i, j, r]] = code.projections[j * b + r];
+            }
+        }
+    }
+    (blocks, gates, projections)
+}
+
 /// Minimum gate-block element count (`n_rows · K`, `K = G·b`) below which the
 /// device launch is not worth its fixed cost. The GEMM cost is set by the `K`
 /// atom-columns of `z`, so admission uses the same `n_rows × K` score-element
@@ -165,40 +363,62 @@ pub const DEVICE_BLOCK_GATE_MIN_ELEMS: usize = gam_gpu::DEFAULT_DICTIONARY_SCORE
 #[cfg(target_os = "linux")]
 const GPU_BLOCK_ROUTE_TILE_ELEMS: usize = gam_gpu::DEFAULT_DICTIONARY_SCORE_TILE_ELEMS;
 
+/// Block count `G = K / b` of a decoder with `K` rows.
 #[cfg(target_os = "linux")]
-pub fn route_blocks_required(
-    rows: ArrayView2<'_, f32>,
-    decoder: ArrayView2<'_, f32>,
-    b: usize,
-    k: usize,
-    mode: gam_gpu::GpuPolicy,
-) -> Result<(Vec<Vec<(u32, f32)>>, BlockRoutePath, usize), gam_gpu::GpuError> {
-    use gam_gpu::GpuPolicy;
-
-    let m = rows.nrows();
-    let krows = decoder.nrows();
+fn block_count(krows: usize, b: usize) -> Result<usize, gam_gpu::GpuError> {
     if b == 0 || krows == 0 || krows % b != 0 {
         return Err(gam_gpu::gpu_err!(
             "block-gate route: decoder K={krows} rows not a positive multiple of block_size b={b}"
         ));
     }
-    let g = krows / b;
-    let active = k.max(1).min(g.max(1));
+    Ok(krows / b)
+}
 
-    // Production CPU fallback: the blocked-GEMM router — the same top-`k`
-    // support as the scalar oracle (`route_blocks_cpu`, which stays as the
-    // device parity reference) but ~2 orders of magnitude faster. Under the
-    // default `Auto` policy every below-break-even minibatch and every
-    // CUDA-less Linux host lands here, so this closure IS the hot CPU path
-    // (#2242: the scalar per-row oracle was burning 75% of block-lane cycles).
+/// Production CPU router for one minibatch: the blocked-GEMM router — the same
+/// top-`k` support as the scalar oracle (`route_blocks_cpu`, which stays as the
+/// device parity reference) but ~2 orders of magnitude faster. Under the default
+/// `Auto` policy every below-break-even minibatch and every CUDA-less Linux host
+/// lands here, so this IS the hot CPU path (#2242: the scalar per-row oracle was
+/// burning 75% of block-lane cycles).
+#[cfg(target_os = "linux")]
+fn cpu_block_route(
+    rows: ArrayView2<'_, f32>,
+    decoder: ArrayView2<'_, f32>,
+    g: usize,
+    b: usize,
+    active: usize,
+) -> Vec<Vec<(u32, f32)>> {
     let cpu_tile_blocks =
         (GPU_BLOCK_ROUTE_TILE_ELEMS / (rows.nrows().max(1) * b.max(1))).clamp(1, g.max(1));
-    let cpu_route =
-        || super::block::route_block_minibatch(rows, decoder, g, b, active, cpu_tile_blocks);
+    super::block::route_block_minibatch(rows, decoder, g, b, active, cpu_tile_blocks)
+}
+
+/// Where one minibatch's block route runs.
+#[cfg(target_os = "linux")]
+enum BlockRouteAdmission {
+    Cpu,
+    /// On the device, walking `G` in launches of `tile_blocks` blocks.
+    Device { tile_blocks: usize },
+}
+
+/// Decide where one minibatch routes under `mode`. `Off` always takes the CPU.
+/// `Auto` takes the device when the shape clears break-even and a CUDA runtime
+/// resolves, and reports why when it declines. `Required` refuses every decline.
+#[cfg(target_os = "linux")]
+fn admit_block_route(
+    rows: ArrayView2<'_, f32>,
+    decoder: ArrayView2<'_, f32>,
+    g: usize,
+    b: usize,
+    mode: gam_gpu::GpuPolicy,
+) -> Result<BlockRouteAdmission, gam_gpu::GpuError> {
+    use gam_gpu::GpuPolicy;
 
     if mode == GpuPolicy::Off {
-        return Ok((cpu_route(), BlockRoutePath::Cpu, 0));
+        return Ok(BlockRouteAdmission::Cpu);
     }
+    let m = rows.nrows();
+    let krows = decoder.nrows();
 
     // Admission on the GEMM work `m × K` (K = G·b): that is what justifies the
     // launch. The launches themselves are G-tiled so buffers never grow with G.
@@ -219,8 +439,8 @@ pub fn route_blocks_required(
             ));
         }
         gam_gpu::engagement::note_route_engagement(
-        "gam-sae sparse_dict block-gate router",
-        "falling back to CPU",
+            "gam-sae sparse_dict block-gate router",
+            "falling back to CPU",
             false,
             &format!(
                 "block {m}x{krows} = {} elems below the device launch break-even \
@@ -228,10 +448,10 @@ pub fn route_blocks_required(
                 m.saturating_mul(krows)
             ),
         );
-        return Ok((cpu_route(), BlockRoutePath::Cpu, 0));
+        return Ok(BlockRouteAdmission::Cpu);
     }
     if m == 0 || g == 0 {
-        return Ok((cpu_route(), BlockRoutePath::Cpu, 0));
+        return Ok(BlockRouteAdmission::Cpu);
     }
 
     let runtime = if mode == GpuPolicy::Required {
@@ -241,28 +461,122 @@ pub fn route_blocks_required(
     };
     if runtime.is_none() {
         gam_gpu::engagement::note_route_engagement(
-        "gam-sae sparse_dict block-gate router",
-        "falling back to CPU",
-        false, "Auto admission found no CUDA device");
-        return Ok((cpu_route(), BlockRoutePath::Cpu, 0));
+            "gam-sae sparse_dict block-gate router",
+            "falling back to CPU",
+            false,
+            "Auto admission found no CUDA device",
+        );
+        return Ok(BlockRouteAdmission::Cpu);
     }
 
     // Blocks per launch: bound the per-launch `z` block `m × (tile_blocks·b)` to
     // GPU_BLOCK_ROUTE_TILE_ELEMS, at least one block, never more than G.
     let tile_blocks = (plan.tile_items / b.max(1)).clamp(1, g);
+    Ok(BlockRouteAdmission::Device { tile_blocks })
+}
 
-    let out = device::route_blocks_device(rows, decoder, b, g, active, tile_blocks)?;
+#[cfg(target_os = "linux")]
+fn note_device_route_engaged(
+    rows: ArrayView2<'_, f32>,
+    decoder: ArrayView2<'_, f32>,
+    tile_blocks: usize,
+    active: usize,
+    coded_on_device: bool,
+) {
     gam_gpu::engagement::note_route_engagement(
         "gam-sae sparse_dict block-gate router",
         "falling back to CPU",
         true,
-        &format!("block {m}x{krows}, tile_blocks={tile_blocks}, active={active}"),
+        &format!(
+            "block {}x{}, tile_blocks={tile_blocks}, active={active}, \
+             coded_on_device={coded_on_device}",
+            rows.nrows(),
+            decoder.nrows()
+        ),
     );
-    Ok((
-        out.selections,
-        BlockRoutePath::Device,
-        out.device_dtoh_bytes,
-    ))
+}
+
+#[cfg(target_os = "linux")]
+pub fn route_blocks_required(
+    rows: ArrayView2<'_, f32>,
+    decoder: ArrayView2<'_, f32>,
+    b: usize,
+    k: usize,
+    mode: gam_gpu::GpuPolicy,
+) -> Result<(Vec<Vec<(u32, f32)>>, BlockRoutePath, usize), gam_gpu::GpuError> {
+    let g = block_count(decoder.nrows(), b)?;
+    let active = k.max(1).min(g.max(1));
+    match admit_block_route(rows, decoder, g, b, mode)? {
+        BlockRouteAdmission::Cpu => Ok((
+            cpu_block_route(rows, decoder, g, b, active),
+            BlockRoutePath::Cpu,
+            0,
+        )),
+        BlockRouteAdmission::Device { tile_blocks } => {
+            let out = device::route_blocks_device(rows, decoder, b, g, active, tile_blocks)?;
+            note_device_route_engaged(rows, decoder, tile_blocks, active, false);
+            Ok((
+                out.selections,
+                BlockRoutePath::Device,
+                out.device_dtoh_bytes,
+            ))
+        }
+    }
+}
+
+/// Route and code one minibatch under `mode`, returning each row's codes padded
+/// to width `k`. A device route codes on the device ([`BLOCK_CODE_KERNEL_SOURCE`]);
+/// a CPU route codes on the host (`super::block::code_routed_rows`).
+#[cfg(target_os = "linux")]
+pub(super) fn route_and_code_blocks(
+    rows: ArrayView2<'_, f32>,
+    decoder: ArrayView2<'_, f32>,
+    gamma: f32,
+    b: usize,
+    k: usize,
+    mode: gam_gpu::GpuPolicy,
+) -> Result<(Vec<RowBlockCode>, BlockRoutePath), gam_gpu::GpuError> {
+    let g = block_count(decoder.nrows(), b)?;
+    let active = k.max(1).min(g.max(1));
+    match admit_block_route(rows, decoder, g, b, mode)? {
+        BlockRouteAdmission::Cpu => {
+            let routed = cpu_block_route(rows, decoder, g, b, active);
+            Ok((
+                code_routed_rows(rows, decoder, gamma, b, k, routed),
+                BlockRoutePath::Cpu,
+            ))
+        }
+        BlockRouteAdmission::Device { tile_blocks } => {
+            let codes = device::route_and_code_blocks_device(
+                rows,
+                decoder,
+                gamma,
+                b,
+                g,
+                active,
+                k,
+                tile_blocks,
+            )?;
+            note_device_route_engaged(rows, decoder, tile_blocks, active, true);
+            Ok((codes, BlockRoutePath::Device))
+        }
+    }
+}
+
+/// [`route_and_code_blocks`] packed to fixed width like
+/// [`code_block_shortlists_cpu`], with the path that ran. This is the entry the
+/// device parity gate drives with an explicit policy.
+#[cfg(target_os = "linux")]
+pub fn route_and_code_blocks_required(
+    rows: ArrayView2<'_, f32>,
+    decoder: ArrayView2<'_, f32>,
+    gamma: f32,
+    b: usize,
+    k: usize,
+    mode: gam_gpu::GpuPolicy,
+) -> Result<((Array2<u32>, Array2<f32>, Array3<f64>), BlockRoutePath), gam_gpu::GpuError> {
+    let (codes, path) = route_and_code_blocks(rows, decoder, gamma, b, k, mode)?;
+    Ok((pack_row_codes(&codes, k, b), path))
 }
 
 #[cfg(target_os = "linux")]
@@ -272,8 +586,9 @@ mod device {
     use ndarray::ArrayView2;
     use std::sync::Arc;
 
-    use cudarc::driver::{CudaModule, LaunchConfig, PushKernelArg};
+    use cudarc::driver::{CudaModule, CudaSlice, CudaStream, LaunchConfig, PushKernelArg};
 
+    use super::super::block::{RowBlockCode, code_routed_rows, orphan_projection_roundoff};
     use super::super::score_router_backend::ScoreRouterBackend as Backend;
 
     static BACKEND: CachedBackend<Backend> = CachedBackend::new();
@@ -284,12 +599,14 @@ mod device {
 
     /// Combined NVRTC source: the atom lane's bit-exact score GEMM + top-`s` fold
     /// ([`super::super::scoring_gpu::score_block_kernel_source`], which bakes `PP`)
-    /// plus this lane's ℓ₂-gate epilogue ([`super::BLOCK_GATE_KERNEL_SOURCE`]).
+    /// plus this lane's ℓ₂-gate epilogue ([`super::BLOCK_GATE_KERNEL_SOURCE`]) and
+    /// block coder ([`super::BLOCK_CODE_KERNEL_SOURCE`]).
     fn combined_kernel_source(p: usize) -> String {
         format!(
-            "{}\n{}",
+            "{}\n{}\n{}",
             super::super::scoring_gpu::score_block_kernel_source(p),
-            super::BLOCK_GATE_KERNEL_SOURCE
+            super::BLOCK_GATE_KERNEL_SOURCE,
+            super::BLOCK_CODE_KERNEL_SOURCE
         )
     }
 
@@ -313,6 +630,21 @@ mod device {
     pub(super) struct BlockRouteDeviceOutput {
         pub(super) selections: Vec<Vec<(u32, f32)>>,
         pub(super) device_dtoh_bytes: usize,
+    }
+
+    /// A routed minibatch still on the device: the resident rows and decoder and
+    /// each row's folded `(block, gate)` shortlist, sorted by `(gate desc, block
+    /// asc)` with empty slots at the tail.
+    struct ResidentRoute {
+        module: Arc<CudaModule>,
+        stream: Arc<CudaStream>,
+        rows_dev: CudaSlice<f32>,
+        decoder_dev: CudaSlice<f32>,
+        top_blocks_dev: CudaSlice<u32>,
+        top_gates_dev: CudaSlice<f32>,
+        m: usize,
+        p: usize,
+        active: usize,
     }
 
     fn fold_shared_bytes(
@@ -347,19 +679,20 @@ mod device {
         })
     }
 
-    /// Route a whole minibatch's blocks on the device: rows and the whole decoder
-    /// stay resident; per block-tile one score GEMM forms `z` (`m × tile_blocks·b`),
-    /// the gate epilogue reduces it to `m × tile_blocks` gates, and the resident
-    /// top-`k` fold folds those into per-row `(block, gate)` shortlists. Only the
-    /// final `m × k` shortlists cross PCIe.
-    pub(super) fn route_blocks_device(
+    /// Route a whole minibatch's blocks on the device and leave the result there:
+    /// rows and the whole decoder stay resident; per block-tile one score GEMM
+    /// forms `z` (`m × tile_blocks·b`), the gate epilogue reduces it to
+    /// `m × tile_blocks` gates, and the resident top-`k` fold folds those into
+    /// per-row `(block, gate)` shortlists. `None` for a shape with no rows,
+    /// blocks or features, where every shortlist is empty.
+    fn route_resident(
         rows: ArrayView2<'_, f32>,
         decoder: ArrayView2<'_, f32>,
         b: usize,
         n_blocks: usize,
         active: usize,
         tile_blocks: usize,
-    ) -> Result<BlockRouteDeviceOutput, GpuError> {
+    ) -> Result<Option<ResidentRoute>, GpuError> {
         let m = rows.nrows();
         let p = rows.ncols();
         let krows = decoder.nrows();
@@ -375,10 +708,7 @@ mod device {
             ));
         }
         if m == 0 || n_blocks == 0 || p == 0 {
-            return Ok(BlockRouteDeviceOutput {
-                selections: vec![Vec::new(); m],
-                device_dtoh_bytes: 0,
-            });
+            return Ok(None);
         }
         let active = active.max(1).min(n_blocks);
         if n_blocks > u32::MAX as usize {
@@ -577,13 +907,44 @@ mod device {
             }
         }
 
+        Ok(Some(ResidentRoute {
+            module,
+            stream,
+            rows_dev,
+            decoder_dev,
+            top_blocks_dev,
+            top_gates_dev,
+            m,
+            p,
+            active,
+        }))
+    }
+
+    /// Route a whole minibatch's blocks on the device ([`route_resident`]) and
+    /// download only the final `m × k` shortlists.
+    pub(super) fn route_blocks_device(
+        rows: ArrayView2<'_, f32>,
+        decoder: ArrayView2<'_, f32>,
+        b: usize,
+        n_blocks: usize,
+        active: usize,
+        tile_blocks: usize,
+    ) -> Result<BlockRouteDeviceOutput, GpuError> {
+        let Some(route) = route_resident(rows, decoder, b, n_blocks, active, tile_blocks)? else {
+            return Ok(BlockRouteDeviceOutput {
+                selections: vec![Vec::new(); rows.nrows()],
+                device_dtoh_bytes: 0,
+            });
+        };
+        let (m, active, stream) = (route.m, route.active, &route.stream);
+
         let mut top_blocks = vec![0u32; m * active];
         let mut top_gates = vec![0.0f32; m * active];
         stream
-            .memcpy_dtoh(&top_blocks_dev, &mut top_blocks)
+            .memcpy_dtoh(&route.top_blocks_dev, &mut top_blocks)
             .gpu_ctx("sparse_dict block-gate dtoh blocks")?;
         stream
-            .memcpy_dtoh(&top_gates_dev, &mut top_gates)
+            .memcpy_dtoh(&route.top_gates_dev, &mut top_gates)
             .gpu_ctx("sparse_dict block-gate dtoh gates")?;
         stream
             .synchronize()
@@ -608,16 +969,186 @@ mod device {
                 .saturating_mul(std::mem::size_of::<u32>() + std::mem::size_of::<f32>()),
         })
     }
+
+    /// Route a whole minibatch on the device ([`route_resident`]), then code every
+    /// row there with [`super::BLOCK_CODE_KERNEL_SOURCE`] against the resident rows,
+    /// decoder and shortlists. Only each row's admitted blocks, gates and γ-free
+    /// projections are downloaded; the host forms the γ-scaled codes and pads to
+    /// width `k` exactly as `super::super::block::code_row` does.
+    pub(super) fn route_and_code_blocks_device(
+        rows: ArrayView2<'_, f32>,
+        decoder: ArrayView2<'_, f32>,
+        gamma: f32,
+        b: usize,
+        n_blocks: usize,
+        active: usize,
+        k: usize,
+        tile_blocks: usize,
+    ) -> Result<Vec<RowBlockCode>, GpuError> {
+        let Some(route) = route_resident(rows, decoder, b, n_blocks, active, tile_blocks)? else {
+            return Ok(code_routed_rows(
+                rows,
+                decoder,
+                gamma,
+                b,
+                k,
+                vec![Vec::new(); rows.nrows()],
+            ));
+        };
+        let ResidentRoute {
+            module,
+            stream,
+            rows_dev,
+            decoder_dev,
+            top_blocks_dev,
+            top_gates_dev,
+            m,
+            p,
+            active,
+        } = route;
+
+        let code_func = module
+            .load_function("sparse_dict_block_code")
+            .gpu_ctx("sparse_dict block-code load_function")?;
+        let m_i32 =
+            i32::try_from(m).map_err(|_| gam_gpu::gpu_err!("block-code m={m} overflows i32"))?;
+        let active_i32 = i32::try_from(active)
+            .map_err(|_| gam_gpu::gpu_err!("block-code active={active} overflows i32"))?;
+        let k_i32 =
+            i32::try_from(k).map_err(|_| gam_gpu::gpu_err!("block-code k={k} overflows i32"))?;
+        let b_i32 =
+            i32::try_from(b).map_err(|_| gam_gpu::gpu_err!("block-code b={b} overflows i32"))?;
+        let roundoff = orphan_projection_roundoff(p, b);
+        let slots = m * active;
+        let coefficients = slots
+            .checked_mul(b)
+            .ok_or_else(|| gam_gpu::gpu_err!("block-code m*active*b overflows usize"))?;
+
+        let mut candidates_dev = stream
+            .alloc_zeros::<i32>(slots)
+            .gpu_ctx("sparse_dict block-code alloc candidates")?;
+        let mut coordinates_dev = stream
+            .alloc_zeros::<f64>(coefficients)
+            .gpu_ctx("sparse_dict block-code alloc coordinates")?;
+        let mut reconstruction_dev = stream
+            .alloc_zeros::<f64>(m * p)
+            .gpu_ctx("sparse_dict block-code alloc reconstruction")?;
+        let mut counts_dev = stream
+            .alloc_zeros::<i32>(m)
+            .gpu_ctx("sparse_dict block-code alloc counts")?;
+        let mut out_blocks_dev = stream
+            .alloc_zeros::<u32>(slots)
+            .gpu_ctx("sparse_dict block-code alloc blocks")?;
+        let mut out_gates_dev = stream
+            .alloc_zeros::<f32>(slots)
+            .gpu_ctx("sparse_dict block-code alloc gates")?;
+        let mut out_projections_dev = stream
+            .alloc_zeros::<f64>(coefficients)
+            .gpu_ctx("sparse_dict block-code alloc projections")?;
+
+        // One thread per row, launched at the gate epilogue's block width.
+        let code_cfg = LaunchConfig {
+            grid_dim: (
+                u32::try_from(m.div_ceil(GATE_KERNEL_THREADS as usize))
+                    .map_err(|_| gam_gpu::gpu_err!("block-code grid overflow"))?,
+                1,
+                1,
+            ),
+            block_dim: (GATE_KERNEL_THREADS, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut code = stream.launch_builder(&code_func);
+        code.arg(&rows_dev)
+            .arg(&decoder_dev)
+            .arg(&top_blocks_dev)
+            .arg(&top_gates_dev)
+            .arg(&m_i32)
+            .arg(&active_i32)
+            .arg(&k_i32)
+            .arg(&b_i32)
+            .arg(&gamma)
+            .arg(&roundoff)
+            .arg(&mut candidates_dev)
+            .arg(&mut coordinates_dev)
+            .arg(&mut reconstruction_dev)
+            .arg(&mut counts_dev)
+            .arg(&mut out_blocks_dev)
+            .arg(&mut out_gates_dev)
+            .arg(&mut out_projections_dev);
+        // SAFETY: one thread per row within m. Each thread reads its own row, the
+        // resident decoder and its own m*active shortlist slots, and writes only its
+        // own candidate, coordinate, reconstruction, count and output ranges, all
+        // cudarc-checked allocations of the sizes the kernel indexes.
+        unsafe { code.launch(code_cfg) }.gpu_ctx("sparse_dict block-code launch")?;
+
+        let mut counts = vec![0i32; m];
+        let mut out_blocks = vec![0u32; slots];
+        let mut out_gates = vec![0.0f32; slots];
+        let mut out_projections = vec![0.0f64; coefficients];
+        stream
+            .memcpy_dtoh(&counts_dev, &mut counts)
+            .gpu_ctx("sparse_dict block-code dtoh counts")?;
+        stream
+            .memcpy_dtoh(&out_blocks_dev, &mut out_blocks)
+            .gpu_ctx("sparse_dict block-code dtoh blocks")?;
+        stream
+            .memcpy_dtoh(&out_gates_dev, &mut out_gates)
+            .gpu_ctx("sparse_dict block-code dtoh gates")?;
+        stream
+            .memcpy_dtoh(&out_projections_dev, &mut out_projections)
+            .gpu_ctx("sparse_dict block-code dtoh projections")?;
+        stream
+            .synchronize()
+            .gpu_ctx("sparse_dict block-code synchronize")?;
+
+        let gamma64 = gamma as f64;
+        let admissible = active.min(k);
+        let mut codes = Vec::with_capacity(m);
+        for (r, &count) in counts.iter().enumerate() {
+            let admitted = usize::try_from(count)
+                .ok()
+                .filter(|&admitted| admitted <= admissible)
+                .ok_or_else(|| {
+                    gam_gpu::gpu_err!(
+                        "sparse_dict block-code row {r} returned admitted count {count}, outside \
+                         0..={admissible}"
+                    )
+                })?;
+            let mut blocks = Vec::with_capacity(k);
+            let mut gates = Vec::with_capacity(k);
+            let mut code_values = Vec::with_capacity(k * b);
+            let mut projections = Vec::with_capacity(k * b);
+            for slot in r * active..r * active + admitted {
+                blocks.push(out_blocks[slot]);
+                gates.push(out_gates[slot]);
+                for &coordinate in &out_projections[slot * b..(slot + 1) * b] {
+                    projections.push(coordinate);
+                    code_values.push((gamma64 * coordinate) as f32);
+                }
+            }
+            while blocks.len() < k {
+                blocks.push(0);
+                gates.push(0.0);
+                for _ in 0..b {
+                    code_values.push(0.0);
+                    projections.push(0.0);
+                }
+            }
+            codes.push(RowBlockCode {
+                blocks,
+                gates,
+                codes: code_values,
+                projections,
+            });
+        }
+        Ok(codes)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use ndarray::Array2;
-
-    // Both callers are `cfg(target_os = "linux")` device-parity tests, so this
-    // admission helper is dead off-Linux and `-D dead-code` rejects the test
-    // target there (a wheel-blocking break class). Gate it with its callers.
 
     /// Deterministic fp32 fixture: `n_rows × p` rows and a `G·b × p` decoder whose
     /// blocks are orthonormalised so the gate `‖x D_gᵀ‖₂` is a genuine subspace

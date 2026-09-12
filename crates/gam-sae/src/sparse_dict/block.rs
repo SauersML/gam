@@ -571,6 +571,13 @@ pub(super) fn route_block_minibatch(
     selectors.into_iter().map(TopSSelector::finish).collect()
 }
 
+/// Roundoff of one row's `P·b` gamma-free projection sums, relative to the row
+/// norm. `orphan_gate_floor` prices a row's best gate against it, and the device
+/// coder receives the same value, so both reach the identical orphan decision.
+pub(super) fn orphan_projection_roundoff(p: usize, b: usize) -> f32 {
+    ((p.max(1) * b.max(1)) as f32).sqrt() * f32::EPSILON
+}
+
 fn orphan_gate_floor(row: ArrayView1<'_, f32>, b: usize) -> f32 {
     let row_norm = row
         .iter()
@@ -580,8 +587,7 @@ fn orphan_gate_floor(row: ArrayView1<'_, f32>, b: usize) -> f32 {
         })
         .sum::<f64>()
         .sqrt() as f32;
-    let projection_roundoff = ((row.len().max(1) * b.max(1)) as f32).sqrt() * f32::EPSILON;
-    row_norm * projection_roundoff
+    row_norm * orphan_projection_roundoff(row.len(), b)
 }
 
 /// Encode + route the whole corpus in minibatches. For each row: shortlist by the
@@ -606,29 +612,45 @@ pub(super) fn route_and_code_all(
     while start < n {
         let end = (start + batch).min(n);
         let mb = x.slice(ndarray::s![start..end, ..]);
-        let routed = route_block_minibatch_dispatch(mb, decoder, n_blocks, b, k, block_tile)?;
-        let mut coded: Vec<RowBlockCode> = mb
-            .axis_iter(Axis(0))
-            .into_par_iter()
-            .zip(routed.into_par_iter())
-            .map(|(row, shortlist)| {
-                let best_gate = shortlist.first().map(|entry| entry.1).unwrap_or(0.0);
-                if best_gate < orphan_gate_floor(row, b) {
-                    code_row(row, decoder, gamma, b, k, &[])
-                } else {
-                    code_row(row, decoder, gamma, b, k, &shortlist)
-                }
-            })
-            .collect();
+        let mut coded = route_and_code_minibatch(mb, decoder, gamma, n_blocks, b, k, block_tile)?;
         out.append(&mut coded);
         start = end;
     }
     Ok(out)
 }
 
-/// Route one minibatch's blocks, dispatching to the CUDA block-gate router when a
-/// GPU policy asks for it and a CUDA runtime is actually present, and
-/// to the CPU router ([`route_block_minibatch`]) otherwise.
+/// Code one minibatch's routed shortlists on the host. Each row admits its
+/// support by descent in the tied loss (`code_row`); a row whose best gate falls
+/// below its projection roundoff (`orphan_gate_floor`) keeps no block.
+pub(super) fn code_routed_rows(
+    mb: ArrayView2<'_, f32>,
+    decoder: ArrayView2<'_, f32>,
+    gamma: f32,
+    b: usize,
+    k: usize,
+    routed: Vec<Vec<(u32, f32)>>,
+) -> Vec<RowBlockCode> {
+    mb.axis_iter(Axis(0))
+        .into_par_iter()
+        .zip(routed.into_par_iter())
+        .map(|(row, shortlist)| {
+            let best_gate = shortlist.first().map(|entry| entry.1).unwrap_or(0.0);
+            if best_gate < orphan_gate_floor(row, b) {
+                code_row(row, decoder, gamma, b, k, &[])
+            } else {
+                code_row(row, decoder, gamma, b, k, &shortlist)
+            }
+        })
+        .collect()
+}
+
+/// Route and code one minibatch. When a GPU policy asks for the device and a
+/// CUDA runtime is present, the CUDA block router routes the rows and then codes
+/// them on the device, beside the rows, decoder and shortlists it already holds.
+/// The host receives finished codes instead of recomputing every shortlisted
+/// projection and admission overlap, which was the dominant host cost of a
+/// device-routed pass (#2826). Otherwise the CPU router ([`route_block_minibatch`])
+/// and the host coder ([`code_routed_rows`]) run.
 ///
 /// The dispatch honours the process-wide [`gam_gpu::GpuPolicy`]. `Off` always
 /// takes the exact CPU router. `Auto` uses the device when admitted and falls
@@ -637,22 +659,23 @@ pub(super) fn route_and_code_all(
 /// and a below-break-even shape. The device route carries the #2227
 /// bounded-progress checkpoints, so a device stall surfaces as a tile-attributed
 /// error instead of a silent hang.
-fn route_block_minibatch_dispatch(
+fn route_and_code_minibatch(
     mb: ArrayView2<'_, f32>,
     decoder: ArrayView2<'_, f32>,
+    gamma: f32,
     n_blocks: usize,
     b: usize,
     k: usize,
     block_tile: usize,
-) -> Result<Vec<Vec<(u32, f32)>>, String> {
+) -> Result<Vec<RowBlockCode>, String> {
     #[cfg(target_os = "linux")]
     {
         let policy = gam_gpu::global_policy();
         if policy != gam_gpu::GpuPolicy::Off {
-            let (selections, _path, _dtoh) =
-                super::block_scoring_gpu::route_blocks_required(mb, decoder, b, k, policy)
+            let (codes, _path) =
+                super::block_scoring_gpu::route_and_code_blocks(mb, decoder, gamma, b, k, policy)
                     .map_err(|err| err.to_string())?;
-            return Ok(selections);
+            return Ok(codes);
         }
     }
     #[cfg(not(target_os = "linux"))]
@@ -662,9 +685,8 @@ fn route_block_minibatch_dispatch(
                 .to_string(),
         );
     }
-    Ok(route_block_minibatch(
-        mb, decoder, n_blocks, b, k, block_tile,
-    ))
+    let routed = route_block_minibatch(mb, decoder, n_blocks, b, k, block_tile);
+    Ok(code_routed_rows(mb, decoder, gamma, b, k, routed))
 }
 
 /// Fixed-width sparse code for one row from its `(block, gate)` shortlist: the

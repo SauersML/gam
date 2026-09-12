@@ -64,10 +64,13 @@ pub use block_chart::{
     compose_block_coordinate_charts,
 };
 pub use block_scoring_gpu::{
-    BlockRoutePath, block_gate_block_cpu, block_gate_row_cpu, route_blocks_cpu,
+    BlockRoutePath, block_gate_block_cpu, block_gate_row_cpu, code_block_shortlists_cpu,
+    route_blocks_cpu,
 };
 #[cfg(target_os = "linux")]
-pub use block_scoring_gpu::{DEVICE_BLOCK_GATE_MIN_ELEMS, route_blocks_required};
+pub use block_scoring_gpu::{
+    DEVICE_BLOCK_GATE_MIN_ELEMS, route_and_code_blocks_required, route_blocks_required,
+};
 pub use block_stream::{
     BlockEpochStats, BlockShardStats, BlockSparseStreamArtifact, BlockSparseStreamState,
 };

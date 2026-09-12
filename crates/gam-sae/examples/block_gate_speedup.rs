@@ -1,9 +1,61 @@
 #[cfg(target_os = "linux")]
 use gam_sae::sparse_dict::{
-    BlockRoutePath, DEVICE_BLOCK_GATE_MIN_ELEMS, route_blocks_cpu, route_blocks_required,
+    BlockRoutePath, DEVICE_BLOCK_GATE_MIN_ELEMS, code_block_shortlists_cpu,
+    route_and_code_blocks_required, route_blocks_cpu, route_blocks_required,
 };
 #[cfg(target_os = "linux")]
-use ndarray::Array2;
+use ndarray::{Array2, Array3};
+
+/// Fixed-width block codes: admitted blocks, their gates and γ-free projections.
+#[cfg(target_os = "linux")]
+type BlockCodes = (Array2<u32>, Array2<f32>, Array3<f64>);
+
+/// The first slot where two fixed-width codings differ in any bit, or `None`
+/// when blocks, gates and projections are all bit-identical.
+#[cfg(target_os = "linux")]
+fn first_code_mismatch(device: &BlockCodes, host: &BlockCodes) -> Option<String> {
+    let (device_blocks, device_gates, device_projections) = device;
+    let (host_blocks, host_gates, host_projections) = host;
+    if device_projections.dim() != host_projections.dim() {
+        return Some(format!(
+            "shape differs device={:?} host={:?}",
+            device_projections.dim(),
+            host_projections.dim()
+        ));
+    }
+    let (rows, width, b) = host_projections.dim();
+    for row in 0..rows {
+        for slot in 0..width {
+            if device_blocks[[row, slot]] != host_blocks[[row, slot]] {
+                return Some(format!(
+                    "row {row} slot {slot}: admitted block differs device={} host={}",
+                    device_blocks[[row, slot]],
+                    host_blocks[[row, slot]]
+                ));
+            }
+            if device_gates[[row, slot]].to_bits() != host_gates[[row, slot]].to_bits() {
+                return Some(format!(
+                    "row {row} slot {slot}: gate differs device={:e} host={:e}",
+                    device_gates[[row, slot]],
+                    host_gates[[row, slot]]
+                ));
+            }
+            for axis in 0..b {
+                let (device_value, host_value) = (
+                    device_projections[[row, slot, axis]],
+                    host_projections[[row, slot, axis]],
+                );
+                if device_value.to_bits() != host_value.to_bits() {
+                    return Some(format!(
+                        "row {row} slot {slot} axis {axis}: projection differs \
+                         device={device_value:e} host={host_value:e}"
+                    ));
+                }
+            }
+        }
+    }
+    None
+}
 use std::process::ExitCode;
 #[cfg(target_os = "linux")]
 use std::time::Instant;
@@ -158,6 +210,82 @@ fn run() -> Result<(), String> {
         "[block-gate speedup] m={m} G={g} b={b} k={k} P={p} K={krows}: CPU {cpu_secs:.4}s device {device_secs:.4}s speedup {:.1}x dtoh={dtoh}B",
         cpu_secs / device_secs.max(1.0e-9)
     );
+
+    // #2826: a device route also codes each row on the device. On the device's
+    // own shortlists those codes must equal the host coder's to the bit: the
+    // admitted blocks and their order, the gates and the γ-free projections.
+    // Row 0 is zeroed so a row with no candidate is exercised, and γ = 2.5 makes
+    // every admission after the unconditional first one raise the tied loss.
+    let mut coded_rows = rows.clone();
+    coded_rows.row_mut(0).fill(0.0);
+    let (shortlists, shortlist_path, _) = route_blocks_required(
+        coded_rows.view(),
+        decoder.view(),
+        b,
+        k,
+        gam_gpu::GpuPolicy::Required,
+    )
+    .map_err(|error| format!("GpuPolicy::Required route of the coding fixture failed: {error}"))?;
+    if shortlist_path != BlockRoutePath::Device {
+        return Err(format!(
+            "coding fixture route returned {shortlist_path:?}, expected Device"
+        ));
+    }
+    for gamma in [0.75f32, 2.5] {
+        let device_start = Instant::now();
+        let (device_codes, device_path) = route_and_code_blocks_required(
+            coded_rows.view(),
+            decoder.view(),
+            gamma,
+            b,
+            k,
+            gam_gpu::GpuPolicy::Required,
+        )
+        .map_err(|error| format!("GpuPolicy::Required route and code failed (gamma={gamma}): {error}"))?;
+        let device_secs = device_start.elapsed().as_secs_f64();
+        if device_path != BlockRoutePath::Device {
+            return Err(format!(
+                "GpuPolicy::Required route and code returned {device_path:?}, expected Device"
+            ));
+        }
+        let host_start = Instant::now();
+        let host_codes = code_block_shortlists_cpu(
+            coded_rows.view(),
+            decoder.view(),
+            gamma,
+            b,
+            k,
+            shortlists.clone(),
+        );
+        let host_secs = host_start.elapsed().as_secs_f64();
+        if let Some(mismatch) = first_code_mismatch(&device_codes, &host_codes) {
+            return Err(format!("device coding (gamma={gamma}) differs from host coding: {mismatch}"));
+        }
+        // Positive control: the comparison must see a one-bit change in a single
+        // admitted projection.
+        let mut perturbed = host_codes.clone();
+        let admitted_slot = (0..m)
+            .flat_map(|row| (0..k).map(move |slot| (row, slot)))
+            .find(|&(row, slot)| perturbed.1[[row, slot]] != 0.0)
+            .ok_or_else(|| format!("gamma={gamma}: host coding admitted no block"))?;
+        let value = &mut perturbed.2[[admitted_slot.0, admitted_slot.1, 0]];
+        *value = f64::from_bits(value.to_bits() ^ 1);
+        if first_code_mismatch(&device_codes, &perturbed).is_none() {
+            return Err(format!(
+                "positive control failed: a one-bit projection change at {admitted_slot:?} was not detected"
+            ));
+        }
+        let admitted = host_codes.1.iter().filter(|&&gate| gate != 0.0).count();
+        let empty_rows = (0..m)
+            .filter(|&row| host_codes.1.row(row).iter().all(|&gate| gate == 0.0))
+            .count();
+        println!(
+            "[block-gate speedup] device coding gamma={gamma}: {m} rows bit-identical to host \
+             coding on the device shortlists ({admitted} admitted blocks, {empty_rows} rows with \
+             none; one-bit positive control detected); device route+code {device_secs:.4}s, \
+             host code {host_secs:.4}s"
+        );
+    }
     Ok(())
 }
 
