@@ -611,7 +611,8 @@ fn multinomial_formula_penalized_separation_evidence(
     //
     // **The span** — *where does that prior belong?* — is a statement about the
     // fit's ARITHMETIC at the smoothing it selected. Measured at the penguins
-    // stride-4 unbiased mode:
+    // stride-4 unbiased mode (#2612), while the formula path still carried a λ
+    // floor:
     //
     // ```text
     //   ker(S_lambda):            2 of 74 directions, lambda_min(H+S_lambda) = 1.9e-3
@@ -620,7 +621,8 @@ fn multinomial_formula_penalized_separation_evidence(
     //
     // The worst-bounded direction — five orders below one observation-equivalent
     // — is NOT in the kernel. It is a `range(S)` direction whose selected λ railed
-    // at `MULTINOMIAL_FORMULA_PRIOR_PSEUDO_OBS = 8e-4` pseudo-observations, so the
+    // at the floor the formula path then carried (8e-4 pseudo-observations; the
+    // floor and its constant were deleted in 14e1ce6d8), so the
     // claim that backs the kernel ("on `range(S)` the model already carries a
     // proper prior") is true in name and false in magnitude. Left unarmed the
     // coefficient runs to `|η|∞ ≈ 45` and the posterior-mean predictive refuses to

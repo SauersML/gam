@@ -10,9 +10,10 @@
 //!
 //! The geometry is the one the penguins arm is in, reduced to its smallest
 //! honest form: a binary logit on data that separate except for a thin flipped
-//! band, with the same nearly-flat wall the multinomial formula path puts on its
-//! penalty-null directions (`MULTINOMIAL_FORMULA_PRIOR_PSEUDO_OBS · I₁ · n_ref/n_c
-//! = 2.173913043e-4`). There `W = diag(p) − ppᵀ → 0` on almost every row, so the
+//! band, under a nearly-flat proper penalty `WALL = 2.173913043e-4`: the λ floor
+//! the multinomial formula path carried at this class balance (8e-4
+//! pseudo-observations `· I₁ · n_ref/n_c`) until 14e1ce6d8 deleted it. There
+//! `W = diag(p) − ppᵀ → 0` on almost every row, so the
 //! likelihood is flat toward more separation and steep away from it and the
 //! posterior is strongly skewed — the regime in which integrating a SYMMETRIC
 //! Gaussian puts half its mass where the likelihood has already excluded the
@@ -21,7 +22,8 @@
 use gam_models::multinomial_predictive::MultinomialPredictiveModel;
 use ndarray::{Array1, Array2};
 
-/// The multinomial formula path's own λ wall on this class balance.
+/// A nearly-flat proper penalty: the λ floor the multinomial formula path carried
+/// at this class balance until 14e1ce6d8 deleted it.
 const WALL: f64 = 2.173913043e-4;
 
 const N_TRAIN: usize = 200;
