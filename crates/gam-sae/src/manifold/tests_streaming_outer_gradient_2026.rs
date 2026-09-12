@@ -479,10 +479,19 @@ fn fixed_point_certificate_covers_non_ordered_beta_bernoulli_exact_gradient() {
         )
     };
 
+    // A refused startup evaluation names its reason only in `efs_step`'s warn line.
+    gam_runtime::test_support::install_diagnostic_logger();
     let (mut iteration_objective, rho) = make_objective();
     let iteration = iteration_objective
         .eval_efs(&rho)
         .expect("non-ordered Beta--Bernoulli EFS startup evaluation");
+    assert!(
+        iteration.cost.is_finite(),
+        "the startup evaluation was refused before any gradient block was reached \
+         (cost={}); the refusal reason is the `SAE EFS evaluation refused` warn line above, \
+         NOT a missing assignment-strength gradient",
+        iteration.cost,
+    );
     let gradient = iteration
         .psi_gradient
         .as_ref()
@@ -536,38 +545,23 @@ fn fixed_point_certificate_covers_ordered_beta_bernoulli_complete_gradient() {
         )
     };
 
+    // A refused startup evaluation names its reason only in `efs_step`'s warn line.
+    gam_runtime::test_support::install_diagnostic_logger();
     let (mut iteration_objective, rho) = make_objective();
     let iteration = iteration_objective
         .eval_efs(&rho)
         .expect("ordered Beta--Bernoulli EFS startup evaluation");
-    // #2330: `psi_gradient: None` has TWO producers, and they mean opposite things.
-    // The assignment-strength block at `outer_objective.rs:3219` leaves it `None`
-    // when the coordinate is structurally absent, which is what this assertion is
-    // about. But `infeasible_evaluation` (`outer_objective.rs:3079`) ALSO returns
-    // `psi_gradient: None`, together with `cost = INFINITY`, when the evaluation was
-    // refused outright.
-    //
-    // The refusal reason is NOT lost where it is produced: `infeasible_evaluation`
-    // embeds it in every coordinate certificate as `fixed-point evidence
-    // unavailable: {reason}`, and `efs_step_with_certificate` returns those
-    // certificates alongside the eval. It is lost one caller later, at
-    // `outer_objective.rs:3033`:
-    //
-    //     self.efs_step_with_certificate(rho_flat)
-    //         .map(|(evaluation, _)| evaluation)
-    //
-    // The `_` is the certificate vector. `eval_efs` is built on `efs_step`, so this
-    // test can only ever see the reasonless `EfsEval`. Recovering the reason here
-    // does not need a new field on `EfsEval` (26 construction sites) — it needs a
-    // caller that keeps the certificates.
-    //
-    // Until then, separate the two producers on the observable that distinguishes
-    // them, so an infeasible evaluation is not reported as a missing gradient block.
+    // #2330: `psi_gradient: None` has two producers that mean opposite things. The
+    // assignment-strength block leaves it `None` when the coordinate is structurally
+    // absent, and `infeasible_evaluation` returns it with `cost = INFINITY` when the
+    // evaluation was refused. Separate them on the cost, so a refusal (named by
+    // `efs_step`'s `SAE EFS evaluation refused` warn line) is not reported as a
+    // missing gradient block.
     assert!(
         iteration.cost.is_finite(),
         "the evaluation was refused before any gradient block was reached \
-         (cost={}); this is an infeasibility whose reason string was dropped by \
-         `infeasible_evaluation`, NOT a missing learnable-concentration gradient",
+         (cost={}); the refusal reason is the `SAE EFS evaluation refused` warn line above, \
+         NOT a missing learnable-concentration gradient",
         iteration.cost,
     );
     let gradient = iteration
