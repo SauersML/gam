@@ -1964,10 +1964,11 @@ impl SaeManifoldOuterObjective {
             // must read `+∞` and steer back into the PD region rather than abort the
             // whole fit. #2330 Phase-2a made `½log|A|` the ranked value, which is
             // what made this reachable — the majorizer `B` was PD by construction and
-            // could never trip it. Escaping the saddle is the ACCEPTED lane's job
-            // (the #2336 terminal escape, upstream in the criterion); by the time a
-            // refusal surfaces here the escape is already exhausted, and a probe must
-            // stay probe-infeasible rather than grind.
+            // could never trip it. #2336 refuted a terminal saddle escape: a descent step
+            // along the negative direction re-converges to the same saddle. The criterion
+            // prices directions its bounded ARD concave clamp explains (λ + vᵀEv ≥ −floor)
+            // and refuses only a genuine saddle, so a probe here stays infeasible rather
+            // than grind.
             Err(err @ SaeCriterionError::IndefiniteObservedInformation { .. }) => {
                 self.probe_telemetry.record_refusal_kind(&err.to_string());
                 log::debug!("SAE criterion mapped indefinite-A refusal to +inf: {err}");
@@ -2503,10 +2504,11 @@ impl SaeManifoldOuterObjective {
             // must read `+∞` and steer back into the PD region rather than abort the
             // whole fit. #2330 Phase-2a made `½log|A|` the ranked value, which is
             // what made this reachable — the majorizer `B` was PD by construction and
-            // could never trip it. Escaping the saddle is the ACCEPTED lane's job
-            // (the #2336 terminal escape, upstream in the criterion); by the time a
-            // refusal surfaces here the escape is already exhausted, and a probe must
-            // stay probe-infeasible rather than grind.
+            // could never trip it. #2336 refuted a terminal saddle escape: a descent step
+            // along the negative direction re-converges to the same saddle. The criterion
+            // prices directions its bounded ARD concave clamp explains (λ + vᵀEv ≥ −floor)
+            // and refuses only a genuine saddle, so a probe here stays infeasible rather
+            // than grind.
             Err(err @ SaeCriterionError::IndefiniteObservedInformation { .. }) => {
                 self.probe_telemetry.record_refusal_kind(&err.to_string());
                 log::debug!("SAE criterion mapped indefinite-A refusal to +inf: {err}");
@@ -3441,10 +3443,11 @@ impl OuterObjective for SaeManifoldOuterObjective {
                 // must read `+∞` and steer back into the PD region rather than abort the
                 // whole fit. #2330 Phase-2a made `½log|A|` the ranked value, which is
                 // what made this reachable — the majorizer `B` was PD by construction and
-                // could never trip it. Escaping the saddle is the ACCEPTED lane's job
-                // (the #2336 terminal escape, upstream in the criterion); by the time a
-                // refusal surfaces here the escape is already exhausted, and a probe must
-                // stay probe-infeasible rather than grind.
+                // could never trip it. #2336 refuted a terminal saddle escape: a descent step
+                // along the negative direction re-converges to the same saddle. The criterion
+                // prices directions its bounded ARD concave clamp explains (λ + vᵀEv ≥ −floor)
+                // and refuses only a genuine saddle, so a probe here stays infeasible rather
+                // than grind.
                 Err(err @ SaeCriterionError::IndefiniteObservedInformation { .. }) => {
                     self.probe_telemetry.record_refusal_kind(&err.to_string());
                     log::debug!("SAE criterion mapped indefinite-A refusal to +inf: {err}");
