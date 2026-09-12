@@ -21,6 +21,12 @@ rayon = "1.12.0"
 serde = { version = "1.0.228", features = ["derive"] }
 thiserror = "2.0.18"
 
+[features]
+# Test-only affordances for downstream crates' test builds: the projected-factor
+# cache's subscriber wait. Enabled only through a `[dev-dependencies]` entry, so
+# no production build carries it.
+test-support = []
+
 [dev-dependencies]
 serde_json = { version = "1.0.149", features = ["float_roundtrip"] }
 

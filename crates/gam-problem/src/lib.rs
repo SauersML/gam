@@ -504,6 +504,9 @@ pub(crate) struct ProjectedFactorInProgress {
     pub(crate) state: Mutex<Option<ProjectedFactorInProgressState>>,
     pub(crate) ready: Condvar,
     pub(crate) waiter_count: std::sync::atomic::AtomicUsize,
+    /// Notified when a waiter subscribes; read only by the test-only
+    /// [`ProjectedFactorCache::wait_for_subscriber`].
+    #[cfg(feature = "test-support")]
     pub(crate) subscriber_arrived: (Mutex<()>, Condvar),
 }
 
@@ -567,6 +570,7 @@ impl ProjectedFactorCache {
                     state: Mutex::new(None),
                     ready: Condvar::new(),
                     waiter_count: std::sync::atomic::AtomicUsize::new(0),
+                    #[cfg(feature = "test-support")]
                     subscriber_arrived: (Mutex::new(()), Condvar::new()),
                 });
                 inner.in_progress.insert(key, marker.clone());
@@ -580,12 +584,15 @@ impl ProjectedFactorCache {
                 marker
                     .waiter_count
                     .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-                let (lock, cv) = &marker.subscriber_arrived;
-                drop(
-                    lock.lock()
-                        .expect("subscriber-arrived notification lock poisoned"),
-                );
-                cv.notify_all();
+                #[cfg(feature = "test-support")]
+                {
+                    let (lock, cv) = &marker.subscriber_arrived;
+                    drop(
+                        lock.lock()
+                            .expect("subscriber-arrived notification lock poisoned"),
+                    );
+                    cv.notify_all();
+                }
                 let mut guard = marker
                     .state
                     .lock()
@@ -717,6 +724,12 @@ impl ProjectedFactorCache {
     /// exposing it as a method keeps those fields encapsulated while still
     /// letting downstream tests deterministically order producer/consumer
     /// interleavings.
+    ///
+    /// Compiled only with the `test-support` feature, which only
+    /// `[dev-dependencies]` entries enable: its deadline belongs to a test, never
+    /// to a production code path (SPEC: wall-clock deadlines are allowed only in
+    /// tests).
+    #[cfg(feature = "test-support")]
     pub fn wait_for_subscriber(
         &self,
         key: ProjectedFactorKey,
