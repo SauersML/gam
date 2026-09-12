@@ -62,6 +62,46 @@ pub enum JointNewtonTerminalReason {
     ConstrainedFixedPointDeclined {
         condition: ConstrainedFixedPointCondition,
     },
+    /// The joint Hessian source carried a non-finite entry at `cycle`, after
+    /// the solve had moved β (gam#1088), so the penalized Hessian and its
+    /// spectrum are degenerate and no certificate exists at this iterate.
+    NonFiniteCurvature { cycle: usize },
+    /// The inner state went non-finite (the gam#554 divergence guard). The
+    /// three values are carried as they stood, so the message names which of
+    /// them diverged.
+    NonFiniteInnerState {
+        residual: f64,
+        objective: f64,
+        log_likelihood: f64,
+    },
+    /// The certificate-candidate conditions routed the iterate to the KKT
+    /// refusal and no constrained fixed-point condition declined it, so the
+    /// refusal report's own classification is the reason (the #2695 1569 seed
+    /// that read `cycle budget` at cycle 48 of 200 left here as
+    /// `rank_deficient_H_pen`).
+    KktCertificateRefused {
+        diagnosis: crate::diagnostics::KktRefusalDiagnosis,
+    },
+    /// The residual stopped improving while the accepted steps were clipped by
+    /// the trust region, and the accepted step descended no ray a penalty
+    /// strength could close.
+    ResidualStall {
+        residual: f64,
+        residual_tol: f64,
+        best_residual: f64,
+        cycles_without_improvement: usize,
+        accepted_step_inf: f64,
+        trust_radius: f64,
+    },
+    /// The residual stayed flat with every accepted step strictly inside the
+    /// trust region and no acceptance certificate satisfied, and the accepted
+    /// step descended no ray a penalty strength could close.
+    FlatResidualStall {
+        residual: f64,
+        residual_tol: f64,
+        best_residual: f64,
+        cycles_without_improvement: usize,
+    },
 }
 
 /// One acceptance condition of the custom-family joint Newton's constrained
@@ -213,6 +253,57 @@ impl std::fmt::Display for JointNewtonTerminalReason {
             Self::ConstrainedFixedPointDeclined { condition } => write!(
                 f,
                 "the constrained fixed-point certificate declined: {condition}"
+            ),
+            Self::NonFiniteCurvature { cycle } => write!(
+                f,
+                "non-finite curvature at cycle {cycle}: the joint Hessian source carries a \
+                 non-finite entry, so no certificate exists at this iterate"
+            ),
+            Self::NonFiniteInnerState {
+                residual,
+                objective,
+                log_likelihood,
+            } => {
+                let diverged: Vec<String> = [
+                    ("stationarity residual", *residual),
+                    ("objective", *objective),
+                    ("log-likelihood", *log_likelihood),
+                ]
+                .into_iter()
+                .filter(|(_, value)| !value.is_finite())
+                .map(|(name, value)| format!("{name}={value}"))
+                .collect();
+                write!(f, "non-finite inner state: {}", diverged.join(", "))
+            }
+            Self::KktCertificateRefused { diagnosis } => write!(
+                f,
+                "the KKT certificate refused the iterate: {}",
+                diagnosis.as_str()
+            ),
+            Self::ResidualStall {
+                residual,
+                residual_tol,
+                best_residual,
+                cycles_without_improvement,
+                accepted_step_inf,
+                trust_radius,
+            } => write!(
+                f,
+                "residual {residual:.6e} (tol {residual_tol:.6e}) stopped improving for \
+                 {cycles_without_improvement} cycles with the accepted steps clipped by the \
+                 trust region (accepted_step_inf={accepted_step_inf:.3e}, \
+                 trust_radius={trust_radius:.3e}); best residual {best_residual:.6e}"
+            ),
+            Self::FlatResidualStall {
+                residual,
+                residual_tol,
+                best_residual,
+                cycles_without_improvement,
+            } => write!(
+                f,
+                "residual {residual:.6e} (tol {residual_tol:.6e}) stayed flat for \
+                 {cycles_without_improvement} cycles with every step inside the trust region \
+                 and no acceptance certificate satisfied; best residual {best_residual:.6e}"
             ),
         }
     }
@@ -958,6 +1049,97 @@ mod tests {
             reason: "singular".to_string(),
         };
         assert_eq!(err.to_string(), "singular");
+    }
+
+    #[test]
+    fn every_non_converged_joint_newton_exit_names_its_reason_2695() {
+        // The #2695 1569 seed-4 shape: the KKT refusal at cycle 47 of 200
+        // (`diagnosis: rank_deficient_H_pen`) reached the outer as
+        // `termination=cycle budget`, a budget it never exhausted.
+        let refused = CustomFamilyError::InnerSolveNotConverged {
+            cycles: 48,
+            terminal: Some(InnerConvergenceTerminalState::JointNewton {
+                cycle: 47,
+                stationarity_residual: 3.807134e2,
+                residual_tol: 2.790772e-3,
+                stationarity_scale: 2.790772e8,
+                step_inf: 2.090760e-1,
+                step_tol: 1.203860e-10,
+                resolvable_negative_curvature: false,
+                best_stationarity_residual: 2.079474e0,
+                cycles_since_best_residual: 29,
+                termination_reason: JointNewtonTerminalReason::KktCertificateRefused {
+                    diagnosis: crate::diagnostics::KktRefusalDiagnosis::RankDeficientHPen,
+                },
+            }),
+            kkt_residual: None,
+            kkt_tol: None,
+            theta_dim: 5,
+            rho_dim: 5,
+            psi_dim: 0,
+        };
+        let msg = refused.to_string();
+        assert!(
+            msg.contains("the KKT certificate refused the iterate: rank_deficient_H_pen"),
+            "the refusal must name its diagnosis: {msg}"
+        );
+        assert!(
+            !msg.contains("cycle budget"),
+            "a refusal at cycle 47 of 200 must not claim the budget: {msg}"
+        );
+
+        let labelled = [
+            (
+                JointNewtonTerminalReason::NonFiniteCurvature { cycle: 12 },
+                "non-finite curvature at cycle 12",
+            ),
+            (
+                JointNewtonTerminalReason::NonFiniteInnerState {
+                    residual: f64::NAN,
+                    objective: 4.0e1,
+                    log_likelihood: f64::NEG_INFINITY,
+                },
+                "non-finite inner state: stationarity residual=NaN, log-likelihood=-inf",
+            ),
+            (
+                JointNewtonTerminalReason::ResidualStall {
+                    residual: 1.034e1,
+                    residual_tol: 5.427e-4,
+                    best_residual: 1.499e1,
+                    cycles_without_improvement: 78,
+                    accepted_step_inf: 2.601e-3,
+                    trust_radius: 1.314e-2,
+                },
+                "stopped improving for 78 cycles with the accepted steps clipped by the trust region",
+            ),
+            (
+                JointNewtonTerminalReason::FlatResidualStall {
+                    residual: 2.623726e1,
+                    residual_tol: 2.790772e-3,
+                    best_residual: 1.845416e-1,
+                    cycles_without_improvement: 22,
+                },
+                "stayed flat for 22 cycles with every step inside the trust region",
+            ),
+        ];
+        for (reason, label) in labelled {
+            let text = reason.to_string();
+            assert!(text.contains(label), "expected `{label}` in: {text}");
+            assert!(!text.contains("cycle budget"), "{text}");
+        }
+        // The finite value is not reported as diverged.
+        let partial = JointNewtonTerminalReason::NonFiniteInnerState {
+            residual: f64::INFINITY,
+            objective: 4.0e1,
+            log_likelihood: -2.5e1,
+        }
+        .to_string();
+        assert!(
+            partial.contains("stationarity residual=inf") && !partial.contains("objective="),
+            "{partial}"
+        );
+        // Negative control: the exit that really exhausted the budget still says so.
+        assert_eq!(JointNewtonTerminalReason::CycleBudget.to_string(), "cycle budget");
     }
 }
 
