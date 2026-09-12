@@ -1540,6 +1540,7 @@ __device__ __forceinline__ double softplus(double x) {
 }
 
 __device__ __forceinline__ double expm1_minus_x(double x) {
+    if (!isfinite(x)) return fabs(x);
     if (fabs(x) > 0.5) return expm1(x) - x;
     double term = 0.5 * x * x;
     double sum = term;
@@ -1554,6 +1555,7 @@ __device__ __forceinline__ double expm1_minus_x(double x) {
 }
 
 __device__ __forceinline__ double log1p_minus_x(double x) {
+    if (isnan(x) || x == INFINITY) return -x;
     if (fabs(x) > 0.5) return log1p(x) - x;
     double power = x * x;
     double sign = -1.0;
