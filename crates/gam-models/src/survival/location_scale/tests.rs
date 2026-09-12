@@ -1888,6 +1888,60 @@ fn survival_ls_contracted_trace_hessian_matches_pairwise_second_directional_2668
     }
 }
 
+/// #2668/#2106: the batched all-axes second directional derivative that the Jeffreys
+/// drift consumes is the per-axis hook, not an approximation of it. The dispatcher
+/// builds the geometry once and runs the same row fold per axis, so every matrix
+/// must equal `I''[u, e_a]` from the per-axis hook exactly, for each closed-form
+/// residual distribution.
+#[test]
+fn survival_ls_all_axes_second_directional_is_the_per_axis_hook_2668() {
+    use crate::row_kernel::{RowSet, row_kernel_second_directional_derivative_all_axes};
+
+    let u = array![0.7, -0.5, 0.9];
+    for distribution in [
+        ResidualDistribution::Gaussian,
+        ResidualDistribution::Gumbel,
+        ResidualDistribution::Logistic,
+    ] {
+        let family = survival_exact_newton_test_familywith_inverse_link(
+            residual_distribution_inverse_link(distribution),
+        );
+        let states = survival_exact_newton_test_states(&family, 0.3, -0.4, 0.2);
+        let dynamic = family
+            .build_dynamic_geometry(&states)
+            .expect("dynamic geometry");
+        let kernel = family.survival_ls_row_kernel_rescaled(&dynamic, 0.0);
+        let batched = row_kernel_second_directional_derivative_all_axes(
+            &kernel,
+            &RowSet::All,
+            u.as_slice().expect("contiguous u"),
+        )
+        .expect("all-axes second directional derivative");
+        let p = u.len();
+        assert_eq!(batched.len(), p, "{distribution:?}: one matrix per axis");
+        let mut largest = 0.0_f64;
+        for (axis, matrix) in batched.iter().enumerate() {
+            let mut e_a = Array1::<f64>::zeros(p);
+            e_a[axis] = 1.0;
+            let per_axis = family
+                .exact_newton_joint_hessian_second_directional_derivative_rescaled(
+                    &states, &u, &e_a, 0.0,
+                )
+                .expect("per-axis second directional derivative")
+                .expect("per-axis second directional derivative present");
+            largest = largest.max(per_axis.iter().fold(0.0_f64, |acc, v| acc.max(v.abs())));
+            assert_eq!(
+                matrix, &per_axis,
+                "{distribution:?} axis {axis}: the batched matrix must be the per-axis hook's"
+            );
+        }
+        assert!(
+            largest > 1.0e-3,
+            "{distribution:?}: I''[u, e_a] is too small ({largest:.3e}) for equality to say anything"
+        );
+    }
+}
+
 fn sparse_survival_exact_newton_test_family() -> SurvivalLocationScaleFamily {
     let mut family = survival_exact_newton_test_family();
     family.x_threshold = sparse_design_from_dense(&array![[1.0], [0.4], [-0.6]]);

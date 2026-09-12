@@ -1148,6 +1148,69 @@ impl CustomFamily for SurvivalLocationScaleFamily {
         )
     }
 
+    /// All-axes `I''[u, e_a]` along one mode response `u`. The Jeffreys `H_Φ`
+    /// drift asks for this object once per outer mode-response direction. The
+    /// trait default calls the per-axis hook `p` times, and every call rebuilds
+    /// the dynamic geometry and folds all rows serially. On the non-wiggle row
+    /// kernel the geometry and kernel are built once and the `p` axes go through
+    /// `row_kernel_second_directional_derivative_all_axes`: each axis is the same
+    /// `row_kernel_second_directional_derivative` fold the per-axis hook runs, so
+    /// the matrices are bit-identical (#2668, #2106). The link-wiggle lowering has
+    /// no fixed-width row kernel and keeps the per-axis loop.
+    fn joint_jeffreys_information_second_directional_all_axes_with_specs(
+        &self,
+        block_states: &[ParameterBlockState],
+        specs: &[ParameterBlockSpec],
+        d_beta_u_flat: &Array1<f64>,
+    ) -> Result<Option<Vec<Array2<f64>>>, String> {
+        self.validate_joint_specs(
+            specs,
+            "SurvivalLocationScaleFamily joint Jeffreys all-axes second directional derivative",
+        )?;
+        let p_total = specs.iter().map(|spec| spec.design.ncols()).sum::<usize>();
+        if d_beta_u_flat.len() != p_total {
+            return Err(SurvivalLocationScaleError::DimensionMismatch {
+                reason: format!(
+                    "joint Jeffreys all-axes second directional derivative: direction has {} entries, expected {p_total}",
+                    d_beta_u_flat.len(),
+                ),
+            }
+            .into());
+        }
+        if !self.row_kernel_directional_supported() {
+            let mut axes = Vec::with_capacity(p_total);
+            for a in 0..p_total {
+                let mut axis = Array1::<f64>::zeros(p_total);
+                axis[a] = 1.0;
+                match self.exact_newton_joint_hessian_second_directional_derivative_rescaled(
+                    block_states,
+                    d_beta_u_flat,
+                    &axis,
+                    0.0,
+                )? {
+                    Some(matrix) => axes.push(matrix),
+                    None => return Ok(None),
+                }
+            }
+            return Ok(Some(axes));
+        }
+        crate::block_layout::block_count::validate_block_count::<SurvivalLocationScaleError>(
+            "SurvivalLocationScaleFamily joint Jeffreys all-axes second directional derivative",
+            self.expected_blocks(),
+            block_states.len(),
+        )?;
+        let dynamic = self.build_dynamic_geometry(block_states)?;
+        let kernel = self.survival_ls_row_kernel_rescaled(&dynamic, 0.0);
+        crate::row_kernel::row_kernel_second_directional_derivative_all_axes(
+            &kernel,
+            &crate::row_kernel::RowSet::All,
+            d_beta_u_flat.as_slice().ok_or_else(|| {
+                "joint Jeffreys all-axes second directional u must be contiguous".to_string()
+            })?,
+        )
+        .map(Some)
+    }
+
     /// `∇²_β tr(W · I(β))` for the unscaled observed information: the same
     /// fourth-order row contraction that
     /// [`Self::joint_jeffreys_information_second_directional_derivative_with_specs`]
