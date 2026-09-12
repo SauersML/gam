@@ -106,8 +106,7 @@ use super::{
     ActivePenalty, BasisBuildResult, BasisError, BasisMetadata, BasisPsiDerivativeBundle,
     BasisPsiDerivativeResult, BasisPsiSecondDerivativeResult, CenterStrategy, CenterStrategyKind,
     ConstructiveQuadratic, PenaltyCandidate, PenaltySource, center_strategy_kind,
-    filter_penalty_candidates, normalize_penalty, select_centers_by_strategy,
-    weighted_coefficient_sum_to_zero_transform,
+    filter_penalty_candidates, select_centers_by_strategy, weighted_coefficient_sum_to_zero_transform,
 };
 
 /// Realized-design identifiability policy for the constant-curvature smooth.
@@ -182,7 +181,8 @@ pub struct ConstantCurvatureBasisSpec {
     /// mistaken for a user pin on the next fit.
     #[serde(default)]
     pub length_scale_fixed: bool,
-    /// Add the ridge-like shrinkage penalty alongside the RKHS Gram penalty.
+    /// Add a whole-function shrinkage penalty, the function mass at the centers
+    /// `Σ_c f(c)²`, alongside the RKHS Gram penalty, with its own λ.
     pub double_penalty: bool,
     /// Realized-design identifiability policy (see type docs).
     #[serde(default)]
@@ -832,22 +832,27 @@ pub fn build_constant_curvature_basis(
         op: None,
     }];
     if spec.double_penalty {
-        // #1531: the primary here is the RKHS kernel Gram zᵀKz, which is
-        // strictly PD / full-rank on distinct centers. It has no unpenalized
-        // function subspace, so an explicit second shrinkage coordinate must
-        // target the whole coefficient chart. The full identity is therefore
-        // intentional for this basis rather than a null-space penalty.
+        // #1531: the primary here is the RKHS kernel Gram zᵀKz, strictly PD /
+        // full-rank on distinct centers, so there is no unpenalized function
+        // subspace and the second shrinkage coordinate targets the whole
+        // function. SPEC rule 5 puts that penalty on the function, not on the
+        // coefficients: the ridge is the function mass at the centers,
+        // `Σ_c f(c)² = βᵀ(K_CC z)ᵀ(K_CC z)β`, the same center-quadrature metric the
+        // thin-plate double penalty uses, where `‖β‖²` would depend on how the
+        // kernel chart happens to be parameterized. It ships raw
+        // (`normalization_scale = 1`) like the primary, so its ψ-jets in
+        // [`build_constant_curvature_basis_psi_derivatives`] carry no quotient rule.
         // The regression test `constant_curvature_gram_is_full_rank_so_identity_is_the_only_double_penalty`
-        // locks the full-rank fact that justifies this branch.
-        let ridge = Array2::<f64>::eye(design.ncols());
-        let (ridge_norm, c_ridge) = normalize_penalty(&ridge);
+        // locks the full-rank fact that justifies a whole-function ridge.
+        let center_design = gauge.restrict_design(&raw_penalty);
+        let function_mass = symmetrize(&center_design.t().dot(&center_design));
         candidates.push(PenaltyCandidate {
             matrix: ConstructiveQuadratic::try_from_dense_psd(
-                ridge_norm,
-                "constant-curvature whole-function ridge",
+                function_mass,
+                "constant-curvature whole-function mass ridge",
             )?,
             source: PenaltySource::DoublePenaltyNullspace,
-            normalization_scale: c_ridge,
+            normalization_scale: 1.0,
             kronecker_factors: None,
             op: None,
         });
@@ -1055,23 +1060,22 @@ pub(crate) fn symmetrize(m: &Array2<f64>) -> Array2<f64> {
     gam_linalg::matrix::symmetrize(m)
 }
 
-/// Map a single primary-penalty κ-derivative onto the active penalty list by
-/// source — the constant-curvature analogue of the Matérn double-penalty
-/// derivative selector. The RKHS Gram is the only κ-moving penalty; the
-/// double-penalty ridge `I` is κ-independent, so its derivative is exactly
-/// zero. Any other source would mean the basis grew a penalty whose κ-movement
-/// is unaccounted for, so we refuse loudly rather than silently drop a term.
+/// Map one ψ-derivative of the primary penalty and of the whole-function ridge
+/// onto the active penalty list by source — the constant-curvature analogue of
+/// the Matérn double-penalty derivative selector. Both penalties move with ψ:
+/// the RKHS Gram `zᵀK(C,C)z` and the center function mass `(K(C,C)z)ᵀ(K(C,C)z)`.
+/// Any other source would mean the basis grew a penalty whose ψ-movement is
+/// unaccounted for, so we refuse loudly rather than silently drop a term.
 pub(crate) fn active_constant_curvature_penalty_derivatives(
     penalties: &[ActivePenalty],
     primary_derivative: &Array2<f64>,
+    ridge_derivative: &Array2<f64>,
 ) -> Result<Vec<Array2<f64>>, BasisError> {
     penalties
         .iter()
         .map(|penalty| match &penalty.info.source {
             PenaltySource::Primary => Ok(primary_derivative.clone()),
-            PenaltySource::DoublePenaltyNullspace => {
-                Ok(Array2::<f64>::zeros(primary_derivative.raw_dim()))
-            }
+            PenaltySource::DoublePenaltyNullspace => Ok(ridge_derivative.clone()),
             other => Err(BasisError::InvalidInput(format!(
                 "unexpected constant-curvature penalty source in κ-derivative path: {other:?}"
             ))),
@@ -1082,12 +1086,12 @@ pub(crate) fn active_constant_curvature_penalty_derivatives(
 /// Design and penalty jets of the realized constant-curvature smooth in BOTH
 /// outer coordinates, `ψ = (κ, η)` with `η = ln ℓ` (gam#2747).
 ///
-/// The realized construction is `X = K(data,C)·z`, `S = symm(zᵀK(C,C)z)` with
-/// `z` and the centers ψ-FIXED, so every block below is the corresponding
-/// kernel jet pushed through the same two ψ-fixed linear maps. The RKHS penalty
-/// ships raw (`normalization_scale = 1`), so no normalization quotient rule
-/// participates; the double-penalty ridge `I` is ψ-independent and its
-/// derivative blocks are exactly zero.
+/// The realized construction is `X = K(data,C)·z`, `S = symm(zᵀK(C,C)z)` and,
+/// with `double_penalty`, the ridge `R = symm((K(C,C)z)ᵀ(K(C,C)z))`, all with `z`
+/// and the centers ψ-FIXED, so every block below is the corresponding kernel jet
+/// pushed through the same ψ-fixed linear maps (the ridge by the product rule).
+/// Both penalties ship raw (`normalization_scale = 1`), so no normalization
+/// quotient rule participates.
 #[derive(Clone, Debug)]
 pub struct ConstantCurvaturePsiJets {
     /// `∂X/∂κ`.
@@ -1183,14 +1187,34 @@ pub fn build_constant_curvature_basis_psi_derivatives(
         length_scale,
     )?;
 
-    // Align each primary-penalty derivative with the realized active penalty
-    // list (primary always; ridge only when double_penalty, and ψ-independent).
+    // Align each penalty derivative with the realized active penalty list
+    // (primary always; the function-mass ridge only when double_penalty).
     // Rebuild the realized basis once to read `penaltyinfo`.
     let base = build_constant_curvature_basis(data, spec)?;
-    let penalty_block = |raw: &Array2<f64>| -> Result<Vec<Array2<f64>>, BasisError> {
-        let restricted = symmetrize(&gauge.restrict_penalty(raw));
-        active_constant_curvature_penalty_derivatives(&base.active_penalties, &restricted)
+    let penalty_block =
+        |raw: &Array2<f64>, ridge: &Array2<f64>| -> Result<Vec<Array2<f64>>, BasisError> {
+            let restricted = symmetrize(&gauge.restrict_penalty(raw));
+            active_constant_curvature_penalty_derivatives(&base.active_penalties, &restricted, ridge)
+        };
+
+    // Ridge ψ-jets: `R = symm(AᵀA)` with `A = K(C,C)·z`, so by the product rule
+    // `∂R = cross(∂A, A)` and `∂²R = cross(∂²A, A) + cross(∂A, ∂'A)`, where
+    // `cross(U, V) = UᵀV + VᵀU` is exactly symmetric like the value.
+    let cross = |u: &Array2<f64>, v: &Array2<f64>| -> Array2<f64> {
+        let product = u.t().dot(v);
+        &product + &product.t()
     };
+    let center_design = gauge.restrict_design(&cc.value);
+    let center_kappa = gauge.restrict_design(&cc.d_kappa);
+    let center_eta = gauge.restrict_design(&cc.d_eta);
+    let ridge_kappa = cross(&center_kappa, &center_design);
+    let ridge_eta = cross(&center_eta, &center_design);
+    let ridge_kappa2 = &cross(&gauge.restrict_design(&cc.d_kappa2), &center_design)
+        + &cross(&center_kappa, &center_kappa);
+    let ridge_kappa_eta = &cross(&gauge.restrict_design(&cc.d_kappa_eta), &center_design)
+        + &cross(&center_kappa, &center_eta);
+    let ridge_eta2 = &cross(&gauge.restrict_design(&cc.d_eta2), &center_design)
+        + &cross(&center_eta, &center_eta);
 
     Ok(ConstantCurvaturePsiJets {
         design_kappa: gauge.restrict_design(&dc.d_kappa),
@@ -1198,11 +1222,11 @@ pub fn build_constant_curvature_basis_psi_derivatives(
         design_kappa2: gauge.restrict_design(&dc.d_kappa2),
         design_kappa_eta: gauge.restrict_design(&dc.d_kappa_eta),
         design_eta2: gauge.restrict_design(&dc.d_eta2),
-        penalties_kappa: penalty_block(&cc.d_kappa)?,
-        penalties_eta: penalty_block(&cc.d_eta)?,
-        penalties_kappa2: penalty_block(&cc.d_kappa2)?,
-        penalties_kappa_eta: penalty_block(&cc.d_kappa_eta)?,
-        penalties_eta2: penalty_block(&cc.d_eta2)?,
+        penalties_kappa: penalty_block(&cc.d_kappa, &ridge_kappa)?,
+        penalties_eta: penalty_block(&cc.d_eta, &ridge_eta)?,
+        penalties_kappa2: penalty_block(&cc.d_kappa2, &ridge_kappa2)?,
+        penalties_kappa_eta: penalty_block(&cc.d_kappa_eta, &ridge_kappa_eta)?,
+        penalties_eta2: penalty_block(&cc.d_eta2, &ridge_eta2)?,
     })
 }
 
@@ -1232,6 +1256,7 @@ pub fn build_constant_curvature_basis_kappa_derivatives(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::basis::normalize_penalty;
     use gam_linalg::faer_ndarray::FaerEigh;
 
     // Diagnostic (#1059 follow-up): show that a κ-FROZEN chart-scale length
@@ -1693,6 +1718,133 @@ mod tests {
                 "constant-curvature Gram must be full-rank PD at κ={kappa}: \
                  min eig {min:e}, max eig {max:e}"
             );
+        }
+    }
+
+    /// #2901 (SPEC rule 5): with `double_penalty` the second penalty is the center
+    /// function mass `(K(C,C)z)ᵀ(K(C,C)z)`, not a coefficient identity, and its
+    /// ψ-jets are product-rule blocks rather than zeros. Gate both against the
+    /// realized value path: the realized ridge equals that mass, every first-order
+    /// block matches a central difference of the realized ridge in κ and in
+    /// `η = ln ℓ`, and every second-order block matches a central difference of the
+    /// analytic first-order blocks. Finite differences are sanctioned in tests.
+    #[test]
+    fn constant_curvature_function_mass_ridge_psi_jets_match_central_differences() {
+        let centers = ndarray::array![
+            [0.10, 0.05],
+            [-0.20, 0.15],
+            [0.30, -0.10],
+            [-0.05, -0.25],
+            [0.22, 0.20],
+            [-0.30, -0.05],
+            [0.05, 0.30],
+            [-0.15, 0.10],
+        ];
+        let data = ndarray::array![
+            [0.12, -0.08],
+            [-0.18, 0.22],
+            [0.27, 0.11],
+            [-0.09, -0.19],
+            [0.02, 0.26],
+            [-0.28, 0.04],
+            [0.16, -0.21],
+            [-0.11, 0.13],
+            [0.24, -0.02],
+            [-0.04, 0.08],
+        ];
+        let spec_at = |kappa: f64, eta: f64| ConstantCurvatureBasisSpec {
+            center_strategy: CenterStrategy::UserProvided(centers.clone()),
+            kappa,
+            kappa_fixed: true,
+            length_scale: eta.exp(),
+            length_scale_fixed: true,
+            double_penalty: true,
+            identifiability: ConstantCurvatureIdentifiability::CenterSumToZero,
+        };
+        let ridge_slot = |penalties: &[ActivePenalty]| -> usize {
+            penalties
+                .iter()
+                .position(|penalty| {
+                    matches!(penalty.info.source, PenaltySource::DoublePenaltyNullspace)
+                })
+                .expect("double_penalty realizes the whole-function ridge")
+        };
+        let realized_ridge = |kappa: f64, eta: f64| -> Array2<f64> {
+            let basis = build_constant_curvature_basis(data.view(), &spec_at(kappa, eta))
+                .expect("fixture points are inside every probed κ chart");
+            basis.active_penalties[ridge_slot(&basis.active_penalties)]
+                .matrix
+                .clone()
+        };
+        let jets_at = |kappa: f64, eta: f64| -> ConstantCurvaturePsiJets {
+            build_constant_curvature_basis_psi_derivatives(data.view(), &spec_at(kappa, eta))
+                .expect("fixture points are inside every probed κ chart")
+        };
+        let relative_gap = |analytic: &Array2<f64>, measured: &Array2<f64>| -> f64 {
+            let scale = measured
+                .iter()
+                .fold(0.0_f64, |acc, value| acc.max(value.abs()))
+                .max(1e-12);
+            let gap = analytic
+                .iter()
+                .zip(measured.iter())
+                .fold(0.0_f64, |acc, (a, m)| acc.max((a - m).abs()));
+            gap / scale
+        };
+        let eta0 = realized_constant_curvature_length_scale(centers.view(), 0.0)
+            .expect("fixture centers span a positive pairwise distance")
+            .ln();
+        let z = weighted_coefficient_sum_to_zero_transform(Array1::<f64>::ones(centers.nrows()).view())
+            .expect("fixture weights are positive, so the sum-to-zero transform exists");
+        let h = 1e-5;
+
+        for &kappa in &[-0.8_f64, 0.0, 0.7] {
+            // (a) The realized ridge is the function mass at the centers.
+            let kernel = constant_curvature_kernel_matrix(centers.view(), centers.view(), kappa, eta0.exp())
+                .expect("fixture centers are distinct and the length scale is positive");
+            let center_design = kernel.dot(&z);
+            let mass = center_design.t().dot(&center_design);
+            let realized = realized_ridge(kappa, eta0);
+            let gap = relative_gap(&realized, &mass);
+            assert!(
+                gap <= 1e-10,
+                "κ={kappa}: realized ridge must be (K(C,C)z)ᵀ(K(C,C)z); max relative gap {gap:e}"
+            );
+
+            let jets = jets_at(kappa, eta0);
+            let slot = ridge_slot(&build_constant_curvature_basis(data.view(), &spec_at(kappa, eta0))
+                .expect("fixture points are inside every probed κ chart")
+                .active_penalties);
+
+            // (b) First-order blocks against central differences of the realized ridge.
+            let fd_kappa = (&realized_ridge(kappa + h, eta0) - &realized_ridge(kappa - h, eta0)) / (2.0 * h);
+            let fd_eta = (&realized_ridge(kappa, eta0 + h) - &realized_ridge(kappa, eta0 - h)) / (2.0 * h);
+            for (label, analytic, measured) in [
+                ("∂R/∂κ", &jets.penalties_kappa[slot], &fd_kappa),
+                ("∂R/∂η", &jets.penalties_eta[slot], &fd_eta),
+            ] {
+                let gap = relative_gap(analytic, measured);
+                assert!(gap <= 1e-6, "κ={kappa}: {label} analytic vs central difference, max relative gap {gap:e}");
+            }
+
+            // (c) Second-order blocks against central differences of the analytic first-order blocks.
+            let fd_kappa2 = (&jets_at(kappa + h, eta0).penalties_kappa[slot]
+                - &jets_at(kappa - h, eta0).penalties_kappa[slot])
+                / (2.0 * h);
+            let fd_kappa_eta = (&jets_at(kappa, eta0 + h).penalties_kappa[slot]
+                - &jets_at(kappa, eta0 - h).penalties_kappa[slot])
+                / (2.0 * h);
+            let fd_eta2 = (&jets_at(kappa, eta0 + h).penalties_eta[slot]
+                - &jets_at(kappa, eta0 - h).penalties_eta[slot])
+                / (2.0 * h);
+            for (label, analytic, measured) in [
+                ("∂²R/∂κ²", &jets.penalties_kappa2[slot], &fd_kappa2),
+                ("∂²R/∂κ∂η", &jets.penalties_kappa_eta[slot], &fd_kappa_eta),
+                ("∂²R/∂η²", &jets.penalties_eta2[slot], &fd_eta2),
+            ] {
+                let gap = relative_gap(analytic, measured);
+                assert!(gap <= 1e-5, "κ={kappa}: {label} analytic vs central difference, max relative gap {gap:e}");
+            }
         }
     }
 
