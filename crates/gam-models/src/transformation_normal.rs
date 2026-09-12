@@ -43,6 +43,7 @@ pub(crate) use crate::custom_family::{
     evaluate_custom_family_joint_hyper_best_mode_shared, fit_custom_family,
     fit_custom_family_fixed_log_lambdas_from_mode_selection,
     fit_custom_family_user_fixed_log_lambdas_from_mode_selection,
+    upgrade_custom_family_joint_hyper_mode_shared,
 };
 pub(crate) use crate::fit_orchestration::drivers::{
     ExactJointEfsEvaluation, ExactJointEvaluation, ExactJointHyperSetup, SpatialFitProvenance,

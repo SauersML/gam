@@ -656,7 +656,7 @@ pub fn fit_transformation_normal(
          designs: &[TermCollectionDesign],
          eval_mode,
          row_set,
-         _| {
+         owned_value_mode| {
             let rho = theta.slice(s![..joint_setup.rho_dim()]).to_owned();
             let hyper_values = theta.slice(s![joint_setup.rho_dim()..]).to_owned();
             ensure_exact_geometry(&specs[0], &designs[0], &rho, &hyper_values)?;
@@ -664,90 +664,87 @@ pub fn fit_transformation_normal(
             let geometry = cache_ref
                 .as_mut()
                 .ok_or_else(|| "missing transformation exact geometry cache".to_string())?;
-            let warm_starts = exact_mode_candidates(eval_mode, &rho);
-            let competing_modes = warm_starts.len() > 1;
             // `row_set` is the outer driver's authoritative measure. Rebuild
             // the family-facing option on every evaluation so a pilot mask
             // cannot survive the driver's rotation back to full data.
             let eval_options =
                 crate::outer_subsample::exact_outer_options_for_row_set(&options, row_set);
-            let carried = evaluate_custom_family_joint_hyper_best_mode_shared(
-                &geometry.family,
-                &geometry.blocks,
-                &eval_options,
-                &rho,
-                Arc::clone(&geometry.hyper_layout),
-                &warm_starts,
-                eval_mode,
-            );
-            // The carried anchor is the accepted iterate's mode, certified on
-            // THAT iterate's covariate design. A trial whose log κ has moved far
-            // enough rebuilds the Duchon design, and the same coefficients can
-            // then give h' ≤ 0 on some rows (direct-alpha SCOP: h' = Σ M_k(y)·α_k(x)
-            // with α_k = X_cov·β_k), so the anchor is infeasible at this θ before
-            // any inner step is taken. Refusing the trial there refuses a point
-            // whose inner problem has a feasible optimum: on the large-scale
-            // smoke cohort every later seed and both saddle-escape reseeds died
-            // this way (`h' has non-positive values`, min −4.05) and the fit
-            // failed. The family's own construction has constant positive shape
-            // rows, so it is monotone on every design; the profile at this θ
-            // starts from it instead. Only the anchored case re-profiles: a
-            // refused cold profile is final, and wherever the anchor is feasible
-            // it stays the only start (#2765).
-            let selection = match carried {
-                Err(error)
-                    if error.is_trial_point_infeasible()
-                        && warm_starts.iter().any(Option::is_some) =>
-                {
-                    log::info!(
-                        "[transformation-normal] carried coefficient mode is infeasible at this trial point; re-profiling from the family's monotone construction: {error}"
-                    );
-                    evaluate_custom_family_joint_hyper_best_mode_shared(
-                        &geometry.family,
-                        &geometry.blocks,
-                        &eval_options,
-                        &rho,
-                        Arc::clone(&geometry.hyper_layout),
-                        &[None],
-                        eval_mode,
-                    )
-                }
-                other => other,
-            }
-            .map_err(|e| format!("transformation exact joint mode profile: {e}"))?;
-            for (candidate_idx, rejection) in selection.rejected_candidates.iter().enumerate() {
-                if let Some(rejection) = rejection {
-                    log::warn!(
-                        "[transformation-normal] rejected exact coefficient-mode candidate mode_candidate={candidate_idx}: {rejection}"
-                    );
-                }
-            }
-            if competing_modes {
-                for (candidate_idx, objective) in selection.screened_objectives.iter().enumerate() {
-                    if let Some(objective) = objective {
-                        let source = if candidate_idx == 0 {
-                            "cold"
-                        } else {
-                            "carried"
-                        };
+            // When the driver asks for derivatives at the θ of a value-only
+            // evaluation (a line search's accepted step), it hands over that
+            // evaluation's converged mode. The mode already is the profile's
+            // minimiser at θ, so derivatives are assembled on it rather than
+            // re-solving from the anchor. Discarding it re-ran the identical
+            // inner solve: at n = 320 000 eval calls 89 and 90 of large_scale
+            // run 34666040783 each spent 414 s on the same 22-cycle solve.
+            let selection = if let Some(value_selection) = owned_value_mode {
+                log::info!(
+                    "[transformation-normal] upgrading the owned value-only coefficient mode at identical theta; skipping the coefficient re-solve"
+                );
+                upgrade_custom_family_joint_hyper_mode_shared(
+                    &geometry.family,
+                    &geometry.blocks,
+                    &eval_options,
+                    &rho,
+                    Arc::clone(&geometry.hyper_layout),
+                    value_selection,
+                    eval_mode,
+                )
+                .map_err(|e| format!("transformation exact joint mode upgrade: {e}"))?
+            } else {
+                let warm_starts = exact_mode_candidates(eval_mode, &rho);
+                let carried = evaluate_custom_family_joint_hyper_best_mode_shared(
+                    &geometry.family,
+                    &geometry.blocks,
+                    &eval_options,
+                    &rho,
+                    Arc::clone(&geometry.hyper_layout),
+                    &warm_starts,
+                    eval_mode,
+                );
+                // The carried anchor is the accepted iterate's mode, certified on
+                // THAT iterate's covariate design. A trial whose log κ has moved far
+                // enough rebuilds the Duchon design, and the same coefficients can
+                // then give h' ≤ 0 on some rows (direct-alpha SCOP: h' = Σ M_k(y)·α_k(x)
+                // with α_k = X_cov·β_k), so the anchor is infeasible at this θ before
+                // any inner step is taken. Refusing the trial there refuses a point
+                // whose inner problem has a feasible optimum: on the large-scale
+                // smoke cohort every later seed and both saddle-escape reseeds died
+                // this way (`h' has non-positive values`, min −4.05) and the fit
+                // failed. The family's own construction has constant positive shape
+                // rows, so it is monotone on every design; the profile at this θ
+                // starts from it instead. Only the anchored case re-profiles: a
+                // refused cold profile is final, and wherever the anchor is feasible
+                // it stays the only start (#2765).
+                let selection = match carried {
+                    Err(error)
+                        if error.is_trial_point_infeasible()
+                            && warm_starts.iter().any(Option::is_some) =>
+                    {
                         log::info!(
-                            "[transformation-normal] exact coefficient-mode screen source={} objective={:.16e}",
-                            source,
-                            objective,
+                            "[transformation-normal] carried coefficient mode is infeasible at this trial point; re-profiling from the family's monotone construction: {error}"
+                        );
+                        evaluate_custom_family_joint_hyper_best_mode_shared(
+                            &geometry.family,
+                            &geometry.blocks,
+                            &eval_options,
+                            &rho,
+                            Arc::clone(&geometry.hyper_layout),
+                            &[None],
+                            eval_mode,
+                        )
+                    }
+                    other => other,
+                }
+                .map_err(|e| format!("transformation exact joint mode profile: {e}"))?;
+                for (candidate_idx, rejection) in selection.rejected_candidates.iter().enumerate() {
+                    if let Some(rejection) = rejection {
+                        log::warn!(
+                            "[transformation-normal] rejected exact coefficient-mode candidate mode_candidate={candidate_idx}: {rejection}"
                         );
                     }
                 }
-                let selected_source = if selection.selected_candidate == 0 {
-                    "cold"
-                } else {
-                    "carried"
-                };
-                log::info!(
-                    "[transformation-normal] selected exact coefficient mode source={} objective={:.16e}",
-                    selected_source,
-                    selection.result.objective,
-                );
-            }
+                selection
+            };
             let objective = selection.result.objective;
             let gradient = selection.result.gradient.clone();
             let outer_hessian = selection.result.outer_hessian.clone();
