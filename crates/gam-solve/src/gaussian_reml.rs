@@ -1984,8 +1984,9 @@ fn block_penalty_rank_logdet(
             condition_number: f64::INFINITY,
         })?
         .0;
-    let max_abs = eigs.iter().fold(0.0_f64, |m, &v| m.max(v.abs()));
-    let tol = (EIGEN_REL_TOL * max_abs).max(1.0e-14);
+    // The range predicate every other consumer of a penalty spectrum uses
+    // (#2740), so rank, nullity and log-determinant are invariant under S -> c S.
+    let tol = penalty_range_tolerance(eigs.view());
     let mut rank = 0_usize;
     let mut logdet = 0.0;
     for eig in eigs.iter().copied() {
