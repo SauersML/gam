@@ -47,10 +47,12 @@
 
 use super::BlockSparseConfig;
 use super::block::{
-    RowBlockCode, block_birth_evidence_margin, frame_fixed_point_residual, gram_schmidt_rows,
-    relative_scalar_change, route_and_code_all, stable_rank_symmetric,
+    RowBlockCode, block_birth_evidence_margin, gram_schmidt_rows, relative_scalar_change,
+    route_and_code_all, stable_rank_symmetric,
 };
-use super::block_frame::polar_tied_frame_step;
+use super::block_frame::{
+    STORED_FRAME_RESOLUTION, polar_tied_frame_step, stored_projector_distance,
+};
 use super::residual_reservoir::ResidualReservoir;
 use super::update::{DEAD_DENOM, DecoderSolveStats};
 use gam_linalg::faer_ndarray::with_faer_sequential;
@@ -251,6 +253,22 @@ pub struct BlockEpochStats {
     /// gradient at that same gamma. The gradient excludes the spectral shift,
     /// so a conservative step cannot manufacture a stationarity certificate.
     pub frame_residual: f64,
+    /// The projector half of [`Self::frame_residual`]: the largest relative
+    /// displacement between a block's measured frame and its proposal
+    /// (`f64::INFINITY` when no frame step was formed this epoch).
+    pub frame_displacement_residual: f64,
+    /// The gradient half of [`Self::frame_residual`]: the largest normalized
+    /// tangent gradient over blocks (`f64::INFINITY` when no frame step was formed).
+    pub frame_gradient_residual: f64,
+    /// The block whose own residual is [`Self::frame_residual`], lowest index on
+    /// ties; `None` when no frame step was formed this epoch.
+    pub frame_binding_block: Option<usize>,
+    /// Rows routed to [`Self::frame_binding_block`] this pass (`0` when it is `None`).
+    pub frame_binding_block_rows: usize,
+    /// Blocks whose own residual exceeds the bar `converged` is tested against,
+    /// `tolerance.max(STORED_FRAME_RESOLUTION)`; `None` when no frame step was
+    /// formed. It tells one slow block apart from a broadly unconverged dictionary.
+    pub frame_blocks_above_tolerance: Option<usize>,
     /// Whether EV, gamma and frame-projector residuals meet the tolerance,
     /// with no accepted or pending block birth.
     pub converged: bool,
@@ -924,6 +942,12 @@ impl BlockSparseStreamState {
         let mut candidate_decoder = self.decoder.clone();
         let mut gamma_residual = f64::INFINITY;
         let mut frame_residual = f64::INFINITY;
+        let mut frame_displacement_residual = f64::INFINITY;
+        let mut frame_gradient_residual = f64::INFINITY;
+        let mut frame_binding_block = None;
+        let mut frame_binding_block_rows = 0usize;
+        let mut frame_blocks_above_tolerance = None;
+        let frame_bar = self.config.tolerance.max(STORED_FRAME_RESOLUTION);
         if !rejected_birth && !rejected_frame {
             // (γ) closed-form shared scalar from the accumulated least-squares.
             self.gamma = if self.gamma_den == 0.0 {
@@ -1005,17 +1029,40 @@ impl BlockSparseStreamState {
             });
             // Indexed collection preserves the first failing block's identity
             // even if worker completion order changes.
-            let mut gradient_residual = 0.0_f64;
-            for outcome in outcomes {
-                gradient_residual = gradient_residual.max(outcome?);
+            let gradient = outcomes.into_iter().collect::<Result<Vec<f64>, String>>()?;
+            let displacement = (0..self.g)
+                .into_par_iter()
+                .map(|block| {
+                    stored_projector_distance(
+                        self.decoder.slice(ndarray::s![block * b..(block + 1) * b, ..]),
+                        candidate_decoder.slice(ndarray::s![block * b..(block + 1) * b, ..]),
+                    )
+                    .map_err(|error| format!("frame projector block {block}: {error}"))
+                })
+                .collect::<Result<Vec<f64>, String>>()?;
+            frame_displacement_residual = displacement.iter().copied().fold(0.0_f64, f64::max);
+            frame_gradient_residual = gradient.iter().copied().fold(0.0_f64, f64::max);
+            frame_residual = frame_displacement_residual.max(frame_gradient_residual);
+            // Name the block that sets the certificate and count the blocks above the
+            // same bar, so one slow block and a broadly unconverged dictionary differ.
+            let mut binding: Option<(usize, f64)> = None;
+            let mut above = 0usize;
+            for (block, (&moved, &tangent)) in displacement.iter().zip(&gradient).enumerate() {
+                let residual = moved.max(tangent);
+                let binds = match binding {
+                    Some((_, best)) => residual > best,
+                    None => true,
+                };
+                if binds {
+                    binding = Some((block, residual));
+                }
+                if residual > frame_bar {
+                    above += 1;
+                }
             }
-            frame_residual = frame_fixed_point_residual(
-                self.decoder.view(),
-                candidate_decoder.view(),
-                self.g,
-                b,
-            )?
-            .max(gradient_residual);
+            frame_binding_block = binding.map(|(block, _)| block);
+            frame_binding_block_rows = binding.map_or(0, |(block, _)| self.usage[block]);
+            frame_blocks_above_tolerance = Some(above);
         }
         let ev = crate::k_selection::explained_variance_within_band(
             self.rss,
@@ -1044,11 +1091,7 @@ impl BlockSparseStreamState {
             && accepted_births == 0
             && improve.abs() <= self.config.tolerance
             && gamma_residual <= self.config.tolerance
-            && frame_residual
-                <= self
-                    .config
-                    .tolerance
-                    .max(super::block_frame::STORED_FRAME_RESOLUTION)
+            && frame_residual <= frame_bar
             && self.epochs_run > 0;
         // Certify the frames actually measured in this pass, together with
         // their profiled gamma. A frame proposal needs the next pass before
@@ -1104,6 +1147,11 @@ impl BlockSparseStreamState {
             gamma: self.gamma,
             gamma_residual,
             frame_residual,
+            frame_displacement_residual,
+            frame_gradient_residual,
+            frame_binding_block,
+            frame_binding_block_rows,
+            frame_blocks_above_tolerance,
             converged,
             epoch,
             decoder_solve_stats,

@@ -619,7 +619,8 @@ fn main() -> Result<(), String> {
         last_ev = stats.explained_variance;
         println!(
             "[a5] arm={} epoch {}/{} train_ev={:.6} gamma={:.6} dead={} accepted_births={} \
-             elapsed={:.1}s",
+             gamma_residual={:.3e} frame_residual={:.3e} displacement={:.3e} gradient={:.3e} \
+             binding_block={:?} binding_rows={} blocks_above_tolerance={:?} elapsed={:.1}s",
             args.arm,
             epoch + 1,
             args.epochs,
@@ -627,6 +628,13 @@ fn main() -> Result<(), String> {
             stats.gamma,
             stats.dead,
             stats.accepted_births,
+            stats.gamma_residual,
+            stats.frame_residual,
+            stats.frame_displacement_residual,
+            stats.frame_gradient_residual,
+            stats.frame_binding_block,
+            stats.frame_binding_block_rows,
+            stats.frame_blocks_above_tolerance,
             started.elapsed().as_secs_f64(),
         );
         epoch_rows.push(json!({
@@ -635,6 +643,13 @@ fn main() -> Result<(), String> {
             "gamma": stats.gamma,
             "dead": stats.dead,
             "accepted_births": stats.accepted_births,
+            "gamma_residual": stats.gamma_residual,
+            "frame_residual": stats.frame_residual,
+            "frame_displacement_residual": stats.frame_displacement_residual,
+            "frame_gradient_residual": stats.frame_gradient_residual,
+            "frame_binding_block": stats.frame_binding_block,
+            "frame_binding_block_rows": stats.frame_binding_block_rows,
+            "frame_blocks_above_tolerance": stats.frame_blocks_above_tolerance,
             "converged": stats.converged,
             "seconds": started.elapsed().as_secs_f64(),
         }));
