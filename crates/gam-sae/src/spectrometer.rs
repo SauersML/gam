@@ -53,14 +53,13 @@
 //! `log K`) whose only nuisance is the noise floor `σ²`; `σ²` is *profiled out*
 //! (variable projection): for any candidate `σ²` the slope/intercept are the
 //! closed-form ordinary-least-squares solution, leaving a smooth one-dimensional
-//! objective in `σ²` alone. That 1-D profile is minimized by golden-section
-//! bracketing **until the float grid leaves no interior point** (not a fixed sweep
-//! count, not a chosen tolerance and not a wall-clock budget), over the *derived*
-//! bracket `σ² ∈ [0, min_k L_k)`: a noise
-//! variance is non-negative and the plateau cannot exceed the smallest achieved
-//! loss. No finite differences are used (the regression and its standard errors
-//! are closed form); the golden ratio and the reporting confidence quantile are
-//! mathematical constants, not tuned knobs.
+//! objective in `σ²` alone. That profile's first and second derivatives are closed
+//! form (the envelope identity of variable projection), and the workspace's outer
+//! engine minimizes it on them, with its convergence certificate, over the
+//! *derived* domain `σ² ∈ [0, min_k L_k)`: a noise variance is non-negative and the
+//! plateau cannot exceed the smallest achieved loss. No finite differences and no
+//! value-only search are used; the reporting confidence quantile is a
+//! distributional constant, not a tuned knob.
 //!
 //! # High-`K` finite-sample bias, and the stable window (derived, not tuned)
 //!
@@ -495,21 +494,7 @@ fn fit_scaling_law(rungs: &[(usize, f64)]) -> Result<ScalingLaw, String> {
         );
     }
 
-    // The plateau cannot exceed the smallest achieved loss; a variance floor is
-    // non-negative. This DERIVED bracket [0, L_min) is the golden-section domain.
-    let l_min = losses.iter().cloned().fold(f64::INFINITY, f64::min);
-    // Keep the upper end strictly below L_min so the smallest excess stays positive
-    // (log-defined): the largest float below it leaves every excess at least one ulp.
-    let hi = l_min.next_down();
-    let lo = 0.0f64;
-
-    let objective = |sigma2: f64| -> f64 {
-        match ols_log_excess(&losses, &t, t_bar, stt, sigma2) {
-            Some(fit) => fit.rss,
-            None => f64::INFINITY,
-        }
-    };
-    let sigma2 = golden_section_min(objective, lo, hi);
+    let sigma2 = profile_noise_floor(&losses, &t, t_bar, stt)?;
 
     let fit = ols_log_excess(&losses, &t, t_bar, stt, sigma2)
         .ok_or_else(|| "fit_scaling_law: profiled σ² left an undefined log-excess".to_string())?;
@@ -517,7 +502,7 @@ fn fit_scaling_law(rungs: &[(usize, f64)]) -> Result<ScalingLaw, String> {
 
     // Standard error of the OLS slope: s² = RSS/(n−3), SE(m) = sqrt(s² / Stt).
     // The fitted model is L_k = σ² + c·K^m — THREE parameters, with σ² profiled
-    // out by the golden section over the SAME rungs (variable projection), so
+    // out over the SAME rungs (variable projection), so
     // the residual degrees of freedom are n−3, not n−2. With n−2 an nrung=3
     // exact fit (RSS≈0 by construction) would report a finite ~0 SE and an
     // unsaturated floor from 3 points fitting 3 parameters.
@@ -548,36 +533,110 @@ fn fit_scaling_law(rungs: &[(usize, f64)]) -> Result<ScalingLaw, String> {
     })
 }
 
-/// Minimize a unimodal 1-D function on `[lo, hi]` by golden-section bracketing,
-/// contracting until no two representable interior points remain strictly inside
-/// the bracket. Every step strictly shrinks the bracket, so the float grid ends the
-/// loop. Returns the bracket midpoint.
-fn golden_section_min<F: FnMut(f64) -> f64>(mut f: F, mut lo: f64, mut hi: f64) -> f64 {
-    // Inverse golden ratio 1/φ = (√5 − 1)/2.
-    let inv_phi = (5.0f64.sqrt() - 1.0) / 2.0;
-    if !(hi > lo) {
-        return lo;
+/// Profile out the noise floor: minimize `RSS(σ²)` of the log-excess regression
+/// over its derived domain `σ² ∈ [0, L_min)`.
+///
+/// With `e_i = L_i − σ²`, `y_i = ln e_i`, `u_i = dy_i/dσ² = −1/e_i`, `r = P⊥y` the
+/// OLS residual on the `(1, log K)` design and `P⊥u` the residual of `u` on the
+/// same design, `RSS = yᵀP⊥y` gives
+///
+/// `dRSS/dσ² = 2·rᵀu`,  `d²RSS/dσ²² = 2·‖P⊥u‖² − 2·Σ r_i·u_i²`
+///
+/// (`du_i/dσ² = −u_i²`). The search runs in the scale-free coordinate
+/// `s = σ²/L_min ∈ [0, 1]` through the workspace's outer engine, with a single
+/// start and its mandatory certificate. At `s = 1` the smallest excess vanishes,
+/// so a trial there is refused rather than priced. A search the engine cannot
+/// certify is an error, never a returned floor.
+fn profile_noise_floor(losses: &[f64], t: &[f64], t_bar: f64, stt: f64) -> Result<f64, String> {
+    use gam_solve::estimate::EstimationError;
+    use gam_solve::rho_optimizer::{
+        DeclaredHessianForm, Derivative, HessianValue, OuterEval, OuterProblem,
+    };
+    use ndarray::{Array1, Array2};
+
+    let l_min = losses.iter().cloned().fold(f64::INFINITY, f64::min);
+    if !(l_min > 0.0) {
+        return Err(format!(
+            "fit_scaling_law: the smallest rung loss {l_min} leaves no positive excess, so \
+             the noise floor has no domain"
+        ));
     }
-    let mut c = hi - inv_phi * (hi - lo);
-    let mut d = lo + inv_phi * (hi - lo);
-    let mut fc = f(c);
-    let mut fd = f(d);
-    while lo < c && c < d && d < hi {
-        if fc < fd {
-            hi = d;
-            d = c;
-            fd = fc;
-            c = hi - inv_phi * (hi - lo);
-            fc = f(c);
-        } else {
-            lo = c;
-            c = d;
-            fc = fd;
-            d = lo + inv_phi * (hi - lo);
-            fd = f(d);
+    let nrung = losses.len();
+    let residual_on_design = |values: &[f64]| -> Vec<f64> {
+        let mean = values.iter().sum::<f64>() / nrung as f64;
+        let slope = t
+            .iter()
+            .zip(values)
+            .map(|(&ti, &vi)| (ti - t_bar) * vi)
+            .sum::<f64>()
+            / stt;
+        values
+            .iter()
+            .zip(t)
+            .map(|(&vi, &ti)| vi - mean - slope * (ti - t_bar))
+            .collect()
+    };
+    let jet = |s: f64| -> Result<(f64, f64, f64), String> {
+        let sigma2 = s * l_min;
+        let mut y = Vec::with_capacity(nrung);
+        let mut u = Vec::with_capacity(nrung);
+        for &loss in losses {
+            let excess = loss - sigma2;
+            if !(excess > 0.0) {
+                return Err(format!(
+                    "noise floor σ² = {sigma2} leaves a non-positive excess {excess}"
+                ));
+            }
+            y.push(excess.ln());
+            u.push(-1.0 / excess);
         }
+        let r = residual_on_design(&y);
+        let u_perp = residual_on_design(&u);
+        let rss = r.iter().map(|value| value * value).sum::<f64>();
+        let gradient = 2.0 * r.iter().zip(&u).map(|(&ri, &ui)| ri * ui).sum::<f64>();
+        let hessian = 2.0 * u_perp.iter().map(|value| value * value).sum::<f64>()
+            - 2.0 * r.iter().zip(&u).map(|(&ri, &ui)| ri * ui * ui).sum::<f64>();
+        // Chain rule into `s = σ²/L_min`.
+        Ok((rss, gradient * l_min, hessian * l_min * l_min))
+    };
+
+    let problem = OuterProblem::new(1)
+        .with_gradient(Derivative::Analytic)
+        .with_hessian(DeclaredHessianForm::Dense)
+        .with_bounds(Array1::from_vec(vec![0.0]), Array1::from_vec(vec![1.0]))
+        .with_initial_rho(Array1::from_vec(vec![0.5]))
+        .with_seed_config(gam_solve::seeding::SeedConfig {
+            max_seeds: 1,
+            seed_budget: 1,
+            ..Default::default()
+        });
+    let refuse = |reason: String| EstimationError::TrialPointRefused { reason };
+    let mut objective = problem.build_objective(
+        (),
+        |_: &mut (), s: &Array1<f64>| jet(s[0]).map(|(rss, _, _)| rss).map_err(refuse),
+        |_: &mut (), s: &Array1<f64>| {
+            let (cost, gradient, hessian) = jet(s[0]).map_err(refuse)?;
+            Ok(OuterEval {
+                cost,
+                gradient: Array1::from_vec(vec![gradient]),
+                hessian: HessianValue::Dense(Array2::from_elem((1, 1), hessian)),
+                inner_beta_hint: None,
+            })
+        },
+        None::<fn(&mut ())>,
+        None::<fn(&mut (), &Array1<f64>) -> Result<gam_problem::EfsEval, EstimationError>>,
+    );
+    let result = problem
+        .run(&mut objective, "spectrometer noise-floor profile")
+        .map_err(|error| format!("fit_scaling_law: noise-floor profile failed: {error}"))?;
+    if !result.converged() {
+        return Err(format!(
+            "fit_scaling_law: the noise-floor profile stopped at σ²/L_min = {} without a \
+             convergence certificate",
+            result.rho[0]
+        ));
     }
-    0.5 * (lo + hi)
+    Ok(result.rho[0] * l_min)
 }
 
 #[cfg(test)]
