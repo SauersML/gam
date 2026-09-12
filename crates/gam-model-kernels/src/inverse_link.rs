@@ -63,18 +63,22 @@ pub fn apply_inverse_link_vec(eta: &[f64], family_kind: &str) -> Result<Vec<f64>
                 // extreme-value link). Matches the canonical solver kernel
                 // `component_inverse_link_jet(LogLog, ·)` exactly. As η → −∞,
                 // exp(−η) overflows and μ → 0; as η → +∞, exp(−η) → 0 and μ → 1.
-                // Guard the intermediate overflow so the deep-negative tail returns
-                // the exact 0.0 limit instead of exp(−∞) → NaN cascades.
-                let r = (-e).exp();
-                out.push(if r.is_finite() { (-r).exp() } else { 0.0 });
+                // exp(-infinity) already gives the exact zero limit, while a
+                // NaN predictor must remain NaN.
+                out.push((-(-e).exp()).exp());
             }
         }
         "cauchit" => {
             for &e in eta {
-                // μ = ½ + atan(η)/π: the inverse standard-Cauchy CDF. Matches the
-                // canonical solver kernel `component_inverse_link_jet(Cauchit, ·)`.
-                // atan saturates at ±π/2 for η = ±∞, giving μ = 1 / 0 at the limits.
-                out.push(0.5 + e.atan() / std::f64::consts::PI);
+                // Reflect atan through the reciprocal in the tails: subtracting
+                // atan(|eta|)/pi from 1/2 discards representable small CDFs.
+                out.push(if e < -1.0 {
+                    (-e.recip()).atan() / std::f64::consts::PI
+                } else if e > 1.0 {
+                    1.0 - e.recip().atan() / std::f64::consts::PI
+                } else {
+                    0.5 + e.atan() / std::f64::consts::PI
+                });
             }
         }
         "log" => {
@@ -170,6 +174,28 @@ mod tests {
         InverseLink, LatentCLogLogState, LinkComponent, MixtureLinkSpec, StandardLink,
     };
     use gam_solve::mixture_link::inverse_link_mu_d1_for_inverse_link;
+
+    #[test]
+    fn public_cauchit_preserves_finite_negative_tail_probabilities() {
+        for eta in [-1.0e8_f64, -1.0e20, -f64::MAX] {
+            let value = apply_inverse_link_vec(&[eta], "cauchit").expect("cauchit")[0];
+            assert!(value > 0.0);
+            // F(-x) ~ 1/(pi*x); the relative correction is at most 1/(3*x²).
+            assert!((value * -eta * std::f64::consts::PI - 1.0).abs() < 2.0e-14);
+        }
+    }
+
+    #[test]
+    fn public_loglog_preserves_nan_and_infinite_limits() {
+        let values = apply_inverse_link_vec(
+            &[f64::NAN, f64::NEG_INFINITY, f64::INFINITY],
+            "loglog",
+        )
+        .expect("loglog");
+        assert!(values[0].is_nan());
+        assert_eq!(values[1], 0.0);
+        assert_eq!(values[2], 1.0);
+    }
 
     /// The public log inverse link is exact `exp(eta)` on the unrestricted IEEE
     /// surface, including finite inputs outside the shared solver jet's declared
