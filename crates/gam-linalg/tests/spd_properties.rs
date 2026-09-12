@@ -145,4 +145,24 @@ proptest! {
         let bound = infinity_norm(&expected) * amplified / (1.0 - amplified);
         prop_assert!(error <= bound, "error {error:e} exceeded derived bound {bound:e}");
     }
+
+    #[test]
+    fn strict_spd_acceptance_is_invariant_to_diagonal_scaling(
+        (matrix, _) in spd_case(),
+        exponents in prop::collection::vec(-8i32..=8, MAX_DIMENSION),
+    ) {
+        // D·A·D has pivots D_j²·pivot_j(A) and diagonal D_j²·A_jj, so every
+        // pivot's ratio to its own row's diagonal, the only quantity the
+        // componentwise backward error lets a roundoff band grade, is unchanged.
+        // Both strict factorizations accept A, so they must accept D·A·D; a band
+        // graded against the largest diagonal refuses it once the scales spread.
+        let n = matrix.nrows();
+        let scaled = Array2::from_shape_fn((n, n), |(row, column)| {
+            matrix[[row, column]] * 10.0f64.powi(exponents[row] + exponents[column])
+        });
+        prop_assert!(SymmetricMatrix::Dense(matrix.clone()).factorize_spd().is_ok());
+        prop_assert!(SymmetricMatrix::Dense(scaled.clone()).factorize_spd().is_ok());
+        let sparse = dense_to_sparse_symmetric_upper(&scaled, 0.0).unwrap();
+        prop_assert!(factorize_sparse_spd_strict(&sparse).is_ok());
+    }
 }

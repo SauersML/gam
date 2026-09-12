@@ -278,19 +278,23 @@ pub fn factorize_sparse_spd_strict(
         }
     })?;
     let simplicial = factorize_simplicial_canonical_upper(h_upper)?;
-    let largest_diagonal = (0..h_upper.ncols())
-        .filter_map(|column| {
-            (col_ptr[column]..col_ptr[column + 1])
-                .find(|&index| row_idx[index] == column)
-                .map(|index| values[index])
-        })
-        .fold(0.0_f64, f64::max);
     // Each Schur-complement pivot forms a length-n dot product and subtracts
-    // it: at most 2n rounded operations, hence Wilkinson's gamma_(2n).
-    let pivot_band = crate::roundoff::accumulation_growth(2 * h_upper.ncols()) * largest_diagonal;
-    if (0..simplicial.n).any(|column| {
-        let diagonal = simplicial.l_values[simplicial.l_col_ptr[column]];
-        diagonal * diagonal <= pivot_band
+    // it: at most 2n rounded operations, hence Wilkinson's gamma_(2n). The
+    // backward error is componentwise, so a pivot is roundoff only relative to
+    // its OWN row's diagonal (see `SymmetricMatrix::factorize_spd`). `L` factors
+    // the AMD-permuted matrix: original row `r` is permuted pivot `perm_inv[r]`.
+    let mut own_diagonal = vec![0.0_f64; simplicial.n];
+    for column in 0..h_upper.ncols() {
+        if let Some(index) =
+            (col_ptr[column]..col_ptr[column + 1]).find(|&index| row_idx[index] == column)
+        {
+            own_diagonal[simplicial.perm_inv[column]] = values[index];
+        }
+    }
+    let gamma = crate::roundoff::accumulation_growth(2 * h_upper.ncols());
+    if (0..simplicial.n).any(|permuted| {
+        let pivot = simplicial.l_values[simplicial.l_col_ptr[permuted]];
+        pivot * pivot <= gamma * own_diagonal[permuted]
     }) {
         return Err(LinalgError::ModelIsIllConditioned {
             condition_number: f64::INFINITY,

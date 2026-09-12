@@ -111,20 +111,29 @@ impl SymmetricMatrix {
                 let factor = matrix.cholesky(faer::Side::Lower).map_err(|error| {
                     format!("Dense SymmetricMatrix strict SPD factorization failed: {error}")
                 })?;
-                let largest_diagonal = matrix.diag().iter().copied().fold(0.0_f64, f64::max);
                 // A Cholesky pivot is a dot product followed by a subtraction:
                 // at most 2n rounded operations, hence Wilkinson's gamma_(2n).
-                let pivot_band =
-                    crate::roundoff::accumulation_growth(2 * matrix.nrows()) * largest_diagonal;
-                if factor
+                // The computed factor's backward error is componentwise,
+                // |ΔA| ≤ gamma_(2n)·|L̂||L̂ᵀ| (Higham, Accuracy and Stability of
+                // Numerical Algorithms, Thm 10.6), and the j-th diagonal of
+                // |L̂||L̂ᵀ| is row j's own A_jj. Pivot j is therefore
+                // indistinguishable from zero exactly when L̂_jj² ≤ gamma·A_jj.
+                // Grading every pivot against the LARGEST diagonal instead
+                // refuses well-posed matrices whose rows differ in scale: one
+                // heavily penalized row makes the O(1) pivot of an unpenalized
+                // row look like roundoff.
+                let gamma = crate::roundoff::accumulation_growth(2 * matrix.nrows());
+                if let Some(row) = factor
                     .diag()
                     .iter()
                     .copied()
-                    .any(|diagonal| diagonal * diagonal <= pivot_band)
+                    .zip(matrix.diag().iter().copied())
+                    .position(|(pivot, own_diagonal)| pivot * pivot <= gamma * own_diagonal)
                 {
                     return Err(format!(
-                        "Dense SymmetricMatrix strict SPD factorization found a Cholesky pivot \
-                         inside its derived roundoff band {pivot_band:e}"
+                        "Dense SymmetricMatrix strict SPD factorization found Cholesky pivot \
+                         {row} inside its derived roundoff band {:e}",
+                        gamma * matrix[[row, row]]
                     ));
                 }
                 Ok(Box::new(factor) as Box<dyn FactorizedSystem>)
@@ -630,6 +639,19 @@ mod tests {
 
     fn dense2x2() -> SymmetricMatrix {
         SymmetricMatrix::Dense(array![[1.0_f64, 2.0], [2.0, 4.0]])
+    }
+
+    // ── strict SPD roundoff band ──────────────────────────────────────────────
+
+    #[test]
+    fn strict_spd_band_grades_each_pivot_against_its_own_row() {
+        // diag(1e16, 1) is exactly representable and factors exactly. Graded
+        // against the largest diagonal, gamma_(4)·1e16 exceeds the second pivot
+        // 1, so the matrix was refused as numerically singular.
+        let badly_scaled = SymmetricMatrix::Dense(array![[1.0e16_f64, 0.0], [0.0, 1.0]]);
+        assert!(badly_scaled.factorize_spd().is_ok());
+        // Control: `dense2x2` has the exact null vector (2, -1) and stays refused.
+        assert!(dense2x2().factorize_spd().is_err());
     }
 
     // ── variant dispatch ──────────────────────────────────────────────────────
