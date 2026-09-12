@@ -3282,5 +3282,15 @@
     ],
     "reason": "SPEC rule 18: profile_ci_from_grid was a grid-argmin profile CI with no caller (#2902 search audit, #2829 ledger); the private chi2_1_quantile in closure_family.rs had no other caller.",
     "evidence": "git grep -w profile_ci_from_grid at 21738986e0 finds only its definition and its re-export; chi2_1_quantile in closure_family.rs was called only by it (curvature_estimand.rs defines and uses its own). source_removal_guard.py (origin's copy) over 21738986e0..e9e394c362, the code-only commit, refused exactly these items before this entry existed, and it verifies the final commit with the entry. Compile is covered by the lead's shared tip check."
+  },
+  {
+    "base": "7b5799bf6fa542ddb1534b1e8d528eaa58d9b38c",
+    "items": [
+      "crates/gam-problem/src/lib.rs:fn:wait_for_subscriber",
+      "crates/gam-solve/src/reml/reml_outer_engine/tests.rs:fn:projected_factor_cache_wait_for_subscriber",
+      "crates/gam-solve/src/reml/reml_outer_engine/tests.rs:fn:projected_factor_cache_waiters_wake_when_producer_panics"
+    ],
+    "reason": "The root build.rs ban scanner forbids #[cfg(feature = ...)]. e527fb897 put ProjectedFactorCache::wait_for_subscriber and its subscriber condvar behind a gam-problem `test-support` feature, so every root gam build aborted. That wait, and the waiter counter it read, existed only for one gam-solve test, so both are deleted from production code. The test moved to crates/gam-problem/src/projected_factor_cache_tests.rs, the crate that owns the cache. There it detects a subscribed consumer through the in-progress slot's Arc handle count.",
+    "evidence": "git grep at 7b5799bf6 over crates finds wait_for_subscriber only at its definition, in its doc comments, and in the gam-solve helper projected_factor_cache_wait_for_subscriber. That helper's only caller is the moved test. waiter_count and subscriber_arrived appear only in gam-problem lib.rs. The `test-support` feature was enabled only by the crates/gam-solve/Cargo.toml dev-dependency that this change removes. The moved test keeps its name, its producer-panic scenario, its join and recovery assertions, and its 5 s subscription deadline. This entry was written from those greps; the landed sha gets the lead's shared tip check."
   }
 ]

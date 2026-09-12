@@ -62,6 +62,8 @@ pub mod serde_finite;
 // traits so gam-solve can call up-tier work (NUTS sampling, topology verdicts)
 // without a back-edge into gam-inference/gam-sae; computation stays UP.
 pub mod laplace_sampler_contract;
+#[cfg(test)]
+mod projected_factor_cache_tests;
 mod seeding;
 pub mod solver_contract;
 // Fixtures that build `ParameterBlockSpec`s live with the type they build, so
@@ -503,11 +505,6 @@ pub(crate) struct ProjectedFactorCacheInner {
 pub(crate) struct ProjectedFactorInProgress {
     pub(crate) state: Mutex<Option<ProjectedFactorInProgressState>>,
     pub(crate) ready: Condvar,
-    pub(crate) waiter_count: std::sync::atomic::AtomicUsize,
-    /// Notified when a waiter subscribes; read only by the test-only
-    /// [`ProjectedFactorCache::wait_for_subscriber`].
-    #[cfg(feature = "test-support")]
-    pub(crate) subscriber_arrived: (Mutex<()>, Condvar),
 }
 
 pub(crate) enum ProjectedFactorInProgressState {
@@ -569,9 +566,6 @@ impl ProjectedFactorCache {
                 let marker = Arc::new(ProjectedFactorInProgress {
                     state: Mutex::new(None),
                     ready: Condvar::new(),
-                    waiter_count: std::sync::atomic::AtomicUsize::new(0),
-                    #[cfg(feature = "test-support")]
-                    subscriber_arrived: (Mutex::new(()), Condvar::new()),
                 });
                 inner.in_progress.insert(key, marker.clone());
                 CacheLookup::Compute(marker)
@@ -581,31 +575,16 @@ impl ProjectedFactorCache {
         match lookup {
             CacheLookup::Hit(value) => value,
             CacheLookup::Wait(marker) => {
-                marker
-                    .waiter_count
-                    .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-                #[cfg(feature = "test-support")]
-                {
-                    let (lock, cv) = &marker.subscriber_arrived;
-                    drop(
-                        lock.lock()
-                            .expect("subscriber-arrived notification lock poisoned"),
-                    );
-                    cv.notify_all();
-                }
                 let mut guard = marker
                     .state
                     .lock()
                     .expect("projected factor in-progress lock poisoned");
-                let result = loop {
+                loop {
                     match guard.as_ref() {
                         Some(ProjectedFactorInProgressState::Ready(value)) => {
                             break value.clone();
                         }
                         Some(ProjectedFactorInProgressState::Failed) => {
-                            marker
-                                .waiter_count
-                                .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
                             reml_contract_panic("projected factor cache producer panicked")
                         }
                         None => {
@@ -615,11 +594,7 @@ impl ProjectedFactorCache {
                                 .expect("projected factor in-progress wait poisoned");
                         }
                     }
-                };
-                marker
-                    .waiter_count
-                    .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
-                result
+                }
             }
             CacheLookup::Compute(marker) => {
                 let computed = match catch_unwind(AssertUnwindSafe(|| Arc::new(compute()))) {
@@ -712,76 +687,6 @@ impl ProjectedFactorCache {
 
     pub fn is_empty(&self) -> bool {
         self.len() == 0
-    }
-
-    /// Test/diagnostic affordance: block until a consumer has subscribed to the
-    /// in-progress slot for `key` (i.e. is waiting on the producer), or until
-    /// `timeout` elapses. Returns `true` if a subscriber arrived, `false` if the
-    /// key has no in-progress slot or the wait timed out.
-    ///
-    /// This lives on the cache because it reaches into the per-key subscriber
-    /// condvar and waiter counter, which are private synchronization internals;
-    /// exposing it as a method keeps those fields encapsulated while still
-    /// letting downstream tests deterministically order producer/consumer
-    /// interleavings.
-    ///
-    /// Compiled only with the `test-support` feature, which only
-    /// `[dev-dependencies]` entries enable: its deadline belongs to a test, never
-    /// to a production code path (SPEC: wall-clock deadlines are allowed only in
-    /// tests).
-    #[cfg(feature = "test-support")]
-    pub fn wait_for_subscriber(
-        &self,
-        key: ProjectedFactorKey,
-        timeout: std::time::Duration,
-    ) -> bool {
-        let marker = {
-            let inner = self
-                .inner
-                .lock()
-                .expect("projected factor cache lock poisoned");
-            let Some(m) = inner.in_progress.get(&key) else {
-                return false;
-            };
-            Arc::clone(m)
-        };
-        if marker
-            .waiter_count
-            .load(std::sync::atomic::Ordering::Acquire)
-            > 0
-        {
-            return true;
-        }
-        let (lock, cv) = &marker.subscriber_arrived;
-        let mut guard = lock
-            .lock()
-            .expect("subscriber-arrived notification lock poisoned");
-        let deadline = std::time::Instant::now() + timeout;
-        loop {
-            if marker
-                .waiter_count
-                .load(std::sync::atomic::Ordering::Acquire)
-                > 0
-            {
-                return true;
-            }
-            let now = std::time::Instant::now();
-            if now >= deadline {
-                return false;
-            }
-            let (next_guard, result) = cv
-                .wait_timeout(guard, deadline - now)
-                .expect("subscriber-arrived wait poisoned");
-            guard = next_guard;
-            if result.timed_out()
-                && marker
-                    .waiter_count
-                    .load(std::sync::atomic::Ordering::Acquire)
-                    == 0
-            {
-                return false;
-            }
-        }
     }
 }
 

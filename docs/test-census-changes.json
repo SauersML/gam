@@ -449,5 +449,15 @@
     "unit_test_decreases": {
       "crates/gam-sae": 11
     }
+  },
+  {
+    "base": "7b5799bf6fa542ddb1534b1e8d528eaa58d9b38c",
+    "reason": "The root build.rs ban scanner forbids feature gating. The gam-problem `test-support` feature existed only so this gam-solve test could reach the projected-factor cache's private subscriber wait. The test moved into gam-problem, the crate that owns the cache.",
+    "evidence": "projected_factor_cache_waiters_wake_when_producer_panics moved from crates/gam-solve/src/reml/reml_outer_engine/tests.rs to crates/gam-problem/src/projected_factor_cache_tests.rs under the same name, so the workspace total is unchanged and no pin is lost. On MSI, origin's test_census.census at 7b5799bf6 measured 1771 tests in unit crates/gam-solve and 350 in crates/gam-problem, against floors of 1753 and 346. Both units stay above their floors after the move, so docs/test-census-floor.json is unchanged.",
+    "test_count_decrease": 0,
+    "removed_pins": {},
+    "unit_test_decreases": {
+      "crates/gam-solve": 1
+    }
   }
 ]

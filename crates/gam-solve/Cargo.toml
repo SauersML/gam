@@ -39,9 +39,6 @@ approx = "0.5.1"
 # `log::` stream (line-search verdicts, trust-radius moves, stall exits), which
 # is otherwise dropped on the floor because the test harness installs no logger.
 env_logger = "0.11.11"
-# `reml_outer_engine` tests order producer/consumer interleavings on the
-# projected-factor cache through its test-only subscriber wait.
-gam-problem = { path = "../gam-problem", version = "=0.3.157", features = ["test-support"] }
 # Test-only utilities used by the in-crate `#[cfg(test)]` suites carved out of
 # the root `gam` crate (#1521): `num-dual` for the autodiff jet cross-checks in
 # `reml::objective` tests, `rand` for deterministic synthetic designs, and

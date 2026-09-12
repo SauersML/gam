@@ -2,7 +2,7 @@
 //! outer-derivative policy + order selection, coefficient cost models, and the
 //! argument-validation asserts shared by the solver entry points.
 
-use crate::families::custom_family::family_trait::{CustomFamily, OuterEvalContext};
+use crate::families::custom_family::family_trait::OuterEvalContext;
 use crate::families::custom_family::psi_design::{
     CustomFamilyHyperLayout, ExactNewtonJointHessianWorkspace,
 };

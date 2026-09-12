@@ -1238,5 +1238,15 @@
     },
     "reason": "SPEC rule 18 (grid search is never allowed): profile_ci_from_grid took γ̂ as the argmin of a caller-supplied grid; found by the #2902 search audit, retired in the #2829 ledger.",
     "evidence": "git grep -w profile_ci_from_grid at 21738986e0 over crates, src, tests, bench, examples, python and gamfit finds only its definition and the gam-geometry lib.rs re-export, so nothing calls it. This removed map is public_api_census.py's own public_functions predicate (origin's copy) over the two changed files 21738986e0..e9e394c362, and its check_change accepts this entry."
+  },
+  {
+    "base": "7b5799bf6fa542ddb1534b1e8d528eaa58d9b38c",
+    "removed": {
+      "crates/gam-problem/src/lib.rs::wait_for_subscriber": 1,
+      "crates/gam-solve/src/reml/reml_outer_engine/tests.rs::projected_factor_cache_wait_for_subscriber": 1,
+      "crates/gam-solve/src/reml/reml_outer_engine/tests.rs::projected_factor_cache_waiters_wake_when_producer_panics": 1
+    },
+    "reason": "The root build.rs ban scanner forbids #[cfg(feature = ...)]. e527fb897 put ProjectedFactorCache::wait_for_subscriber behind a gam-problem `test-support` feature, so every root gam build aborted. The wait existed only for one gam-solve test. It is deleted, and the test moved into gam-problem, the crate that owns the cache, as a private test function.",
+    "evidence": "git grep at 7b5799bf6 over crates finds wait_for_subscriber only at its definition, in its doc comments, and in the gam-solve helper projected_factor_cache_wait_for_subscriber, whose only caller is the moved test. The feature was enabled only by the crates/gam-solve/Cargo.toml dev-dependency that this change removes. The test's new home is crates/gam-problem/src/projected_factor_cache_tests.rs."
   }
 ]
