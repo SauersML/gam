@@ -4,10 +4,11 @@
 //! the tangent-coordinate residuals as a 1-D vector (a shared isotropic scale
 //! per row), a single 2-D `(dim, dim)` matrix (shared across all rows), or a
 //! full 3-D `(n_rows, dim, dim)` stack. This broadcasts any of those to the
-//! canonical per-row block form and validates finiteness, per-row symmetry, and
-//! positive semidefiniteness. A precision metric induces the squared residual
-//! `rᵀ W r`, which must be non-negative for every residual `r`; that holds iff
-//! each block is PSD (all eigenvalues `≥ 0`). Symmetry plus a non-negative
+//! canonical per-row block form, keeps each block's symmetric part, and
+//! validates finiteness and positive semidefiniteness. A precision metric
+//! induces the squared residual `rᵀ W r`, which sees only the symmetric part of
+//! `W` and must be non-negative for every residual `r`; that holds iff each
+//! symmetric block is PSD (all eigenvalues `≥ 0`). Symmetry plus a non-negative
 //! diagonal is **not** sufficient — e.g. `[[1, 2], [2, 1]]` is symmetric with a
 //! non-negative diagonal yet `z = (1, −1)` gives `zᵀ W z = −2 < 0`. Single
 //! source of truth shared by the `response_geometry_normalize_fisher_rao` FFI
@@ -15,7 +16,7 @@
 
 use faer::Side;
 use gam_linalg::faer_ndarray::FaerEigh;
-use ndarray::{Array2, Array3, ArrayViewD, IxDyn};
+use ndarray::{Array3, ArrayViewD, IxDyn};
 
 /// Broadcast and validate a Fisher–Rao weight array into `(n_rows, dim, dim)`
 /// **positive-semidefinite** precision blocks (the general metric API). Accepts
@@ -84,14 +85,16 @@ pub fn normalize_fisher_rao_blocks(
         }
         _ => return Err("fisher_rao_w must be a 1-D, 2-D, or 3-D numeric array".to_string()),
     };
+    // Only the symmetric part of a block enters the squared residual `rᵀ W r`,
+    // so that part is the metric: each block is replaced by `½(W + Wᵀ)` before
+    // it is validated and returned.
+    let mut out = out;
     for row in 0..n_rows {
         for r in 0..dim {
-            for c in 0..dim {
-                let a = out[[row, r, c]];
-                let b = out[[row, c, r]];
-                if (a - b).abs() > 1.0e-10 * (1.0 + a.abs() + b.abs()) {
-                    return Err("fisher_rao_w must be symmetric in every row block".to_string());
-                }
+            for c in (r + 1)..dim {
+                let average = 0.5 * (out[[row, r, c]] + out[[row, c, r]]);
+                out[[row, r, c]] = average;
+                out[[row, c, r]] = average;
             }
             if out[[row, r, r]] < 0.0 {
                 return Err("fisher_rao_w diagonal entries must be non-negative".to_string());
@@ -104,33 +107,22 @@ pub fn normalize_fisher_rao_blocks(
 
 /// Validate that a single symmetric `(dim, dim)` precision block is positive
 /// semidefinite by checking its eigenvalue spectrum, so that the induced squared
-/// residual `rᵀ W r` is never negative. The threshold
-/// is relative to the block's spectral scale (its largest eigenvalue magnitude)
-/// so that the check is invariant to the units of the metric.
+/// residual `rᵀ W r` is never negative. A negative eigenvalue is roundoff only
+/// while it lies inside the symmetric eigensolve's backward-error band
+/// `dim·ε·max|λ|`, which carries the units of the metric and is zero for a zero
+/// block.
 fn validate_block_psd(block: ndarray::ArrayView2<'_, f64>, row: usize) -> Result<(), String> {
     if block.nrows() == 0 {
         return Ok(());
     }
-    // Symmetrize before the eigensolve so the spectrum is exactly real; the
-    // off-diagonals already match to within the symmetry tolerance checked above.
-    let mut symmetric = Array2::<f64>::zeros((block.nrows(), block.ncols()));
-    for i in 0..block.nrows() {
-        for j in 0..block.ncols() {
-            symmetric[[i, j]] = 0.5 * (block[[i, j]] + block[[j, i]]);
-        }
-    }
-    let (eigenvalues, _) = symmetric.eigh(Side::Lower).map_err(|err| {
+    let (eigenvalues, _) = block.to_owned().eigh(Side::Lower).map_err(|err| {
         format!("fisher_rao_w row {row} eigendecomposition for definiteness check failed: {err}")
     })?;
     let spectral_scale = eigenvalues
         .iter()
-        .fold(0.0_f64, |acc, &value| acc.max(value.abs()))
-        .max(1.0);
+        .fold(0.0_f64, |acc, &value| acc.max(value.abs()));
     let min_eigenvalue = eigenvalues.iter().copied().fold(f64::INFINITY, f64::min);
-    // Relative spectral tolerance: a block is treated as PSD when its smallest
-    // eigenvalue is no more negative than this fraction of its spectral scale,
-    // absorbing the rounding of the symmetric eigensolve.
-    let tol = 1.0e-10 * spectral_scale;
+    let tol = block.nrows() as f64 * f64::EPSILON * spectral_scale;
     if min_eigenvalue < -tol {
         return Err(format!(
             "fisher_rao_w row {row} must be positive semidefinite (a precision metric \
@@ -230,5 +222,34 @@ mod tests {
         let err = normalize_fisher_rao_blocks(block.view().into_dyn(), 4, 2)
             .expect_err("a (3, 2) matrix is not a valid (2, 2) shared block");
         assert!(err.contains("shape"), "unexpected error message: {err}");
+    }
+
+    #[test]
+    fn small_scale_indefinite_block_is_rejected_at_its_own_scale() {
+        // The indefinite [[1, 2], [2, 1]] in units a trillion times smaller:
+        // eigenvalues {3e-12, -1e-12}. A tolerance floored at unit spectral
+        // scale (1e-10) accepted it as positive semidefinite.
+        let block = block_2x2([[1.0e-12, 2.0e-12], [2.0e-12, 1.0e-12]]);
+        let err = normalize_fisher_rao_blocks(block.view().into_dyn(), 2, 2)
+            .expect_err("an indefinite block is indefinite in every unit");
+        assert!(
+            err.contains("positive semidefinite"),
+            "unexpected error message: {err}"
+        );
+    }
+
+    #[test]
+    fn only_the_symmetric_part_of_a_block_is_the_metric() {
+        // [[2, 3], [-1, 2]] induces the same rᵀ W r as its symmetric part
+        // [[2, 1], [1, 2]] (eigenvalues {1, 3}), and that part is what returns.
+        let block = block_2x2([[2.0, 3.0], [-1.0, 2.0]]);
+        let out = normalize_fisher_rao_blocks(block.view().into_dyn(), 2, 2)
+            .expect("a block whose symmetric part is PSD is a valid metric");
+        for row in 0..2 {
+            assert_eq!(out[[row, 0, 1]], 1.0);
+            assert_eq!(out[[row, 1, 0]], 1.0);
+            assert_eq!(out[[row, 0, 0]], 2.0);
+            assert_eq!(out[[row, 1, 1]], 2.0);
+        }
     }
 }
