@@ -205,9 +205,16 @@ pub(crate) fn topology_curved_seed_initial_coords(
             }
         }
         dists.sort_by(|a, b| a.0.total_cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
-        let scale = dists[k.saturating_sub(1)].0.max(1.0e-24);
+        let scale = dists[k.saturating_sub(1)].0;
         for &(dist2, ib) in dists.iter().take(k) {
-            let wij = (-dist2 / scale).exp().max(1.0e-12);
+            // Every taken neighbour lies within the k-th distance `scale`, so its
+            // heat-kernel weight is at least `e⁻¹`. A zero `scale` means every
+            // taken neighbour coincides with the row, which is weight one.
+            let wij = if scale > 0.0 {
+                (-dist2 / scale).exp()
+            } else {
+                1.0
+            };
             if wij > w[[ia, ib]] {
                 w[[ia, ib]] = wij;
             }
@@ -271,11 +278,19 @@ pub(crate) fn topology_curved_seed_initial_coords(
             }
         }
         // Store the inverse-distance weights directly; the normalizing sum is
-        // fn-independent too.
-        *neighbors = best
-            .into_iter()
-            .map(|(d, i)| (1.0 / d.max(1.0e-24), i))
+        // fn-independent too. A neighbour whose inverse distance is not finite
+        // coincides with the row: in the limit it carries all the weight, shared
+        // equally with any other coincident neighbour.
+        let coincident: Vec<(f64, usize)> = best
+            .iter()
+            .filter(|&&(d, _)| !(1.0 / d).is_finite())
+            .map(|&(_, i)| (1.0, i))
             .collect();
+        *neighbors = if coincident.is_empty() {
+            best.into_iter().map(|(d, i)| (1.0 / d, i)).collect()
+        } else {
+            coincident
+        };
     }
     let interp = |sample_values: &Array1<f64>, row: usize| -> f64 {
         let pos = pos_of_row[row];

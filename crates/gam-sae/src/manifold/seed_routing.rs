@@ -158,10 +158,14 @@ pub fn sae_output_energy_cluster_labels(z: ArrayView2<'_, f64>, k_atoms: usize) 
             energy += value * value;
         }
         row_energy[row] = energy;
-        let denom = energy.max(1.0e-12);
+        // A zero row has no energy composition to cluster on.
         for col in 0..p_out {
             let value = z[[row, col]];
-            features[[row, col]] = value * value / denom;
+            features[[row, col]] = if energy > 0.0 {
+                value * value / energy
+            } else {
+                0.0
+            };
         }
     }
 

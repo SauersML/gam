@@ -72,11 +72,7 @@ impl SaeManifoldTerm {
         for row in 0..n_obs {
             for atom_idx in 0..k_atoms {
                 self.atoms[atom_idx].fill_decoded_row(row, &mut decoded[atom_idx]);
-                norm_sq[atom_idx] = decoded[atom_idx]
-                    .iter()
-                    .map(|v| v * v)
-                    .sum::<f64>()
-                    .max(1.0e-12);
+                norm_sq[atom_idx] = decoded[atom_idx].iter().map(|v| v * v).sum::<f64>();
                 gates[atom_idx] = 0.0;
             }
             fitted.fill(0.0);
@@ -92,7 +88,12 @@ impl SaeManifoldTerm {
                         numerator += g_row[out_col] * residual_without_atom;
                     }
                     let upper = 1.0 - numerical_tol;
-                    let new_gate = (numerator / norm_sq[atom_idx]).clamp(0.0, upper);
+                    // An atom that decodes to zero on this row explains none of it.
+                    let new_gate = if norm_sq[atom_idx] > 0.0 {
+                        (numerator / norm_sq[atom_idx]).clamp(0.0, upper)
+                    } else {
+                        0.0
+                    };
                     max_change = max_change.max((new_gate - old_gate).abs());
                     if new_gate != old_gate {
                         let delta = new_gate - old_gate;
