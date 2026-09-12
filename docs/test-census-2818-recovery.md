@@ -251,12 +251,13 @@ transition and observed-orientability evidence is not a closed-sphere homology
 or calibrated population-topology certificate. These tests also do not prove
 atlas recognition, held-out unrolling quality or MDL promotion.
 
-The other three #2280 identities are restored in `local_charts.rs` together with
-the `LocalAtlas::co_collapse_candidates` query they exercise (#2829):
+The other three #2280 identities were restored in `local_charts.rs` together
+with the `LocalAtlas::co_collapse_candidates` query they exercise (#2829):
 `co_collapse_flags_duplicate_charts_2280`,
 `co_collapse_thresholds_bracket_the_gate_2280`, and
-`co_collapse_spares_healthy_swiss_roll_atlas_2280`. The exported
-`CoCollapseCandidate` report had survived the sweep with no producer.
+`co_collapse_spares_healthy_swiss_roll_atlas_2280`. `e6fd4251e` then deleted the
+query, its `CoCollapseCandidate` report and all three pins, because nothing but
+those pins queried it.
 
 Executed source blobs:
 
@@ -459,7 +460,7 @@ immutable commit census or evidence that those declarations executed.
 | `softmax_trace_whitening_prefold_matches_dense_adjoint_2333` and the four later deflation-fold checks | `construction_row_jet_logdet_channels::tests_trace_whitening_2333` exercises the live Trace consumer and production deflation contraction. | **5 passed in 0.05 seconds.** The first consumer run correctly failed its branch-activation assertion because the cold fixture had no spectral deflation. The revised state has one exactly saturated softmax row, which supplies a genuine null logit direction; the other rows retain both live atoms. The consumer records one spectrally deflated row. |
 | `fully_degenerate_cluster_diagonalizes_direct_e_diag_2267`, `nearly_degenerate_distinct_spectrum_preserves_eigenpairs_2515` | `exact_pencil::pencil_tests`, reached through production pencil pricing. | The original helper-only tests moved to determinant/gradient and eigenpair checks on the actual production pencil. The obsolete `cluster_stable_eigh` helper was removed. These are explicit contract moves, not disappearance based on private symbol reachability. |
 | Five historical cofit #2023 pins | Active `tiered::fit_tiered` versus the former `cofit_arrow` and `sparse_dict::cofit` bridges. | **Retired with their subject (#2829).** `fit_tiered` carries the contracts on the live route: match-or-beat against the pure-linear tier and a recurred, certified fixed point are asserted by `tiered_curved_refinement_is_certified_and_records_promotions`, and the budget refusal by `insufficient_inner_budget_returns_error_instead_of_a_tiered_report_2023`. The producer-less cofit configuration/report types are deleted. |
-| Three co-collapse #2280 pins | `LocalAtlas::co_collapse_candidates`. | **Restored (#2829)** with the query itself; the surviving `CoCollapseCandidate` report is its output. |
+| Three co-collapse #2280 pins | Former `LocalAtlas::co_collapse_candidates`. | **Retired with their subject (#2829).** Restored with the query, then deleted by `e6fd4251e` together with the query and its `CoCollapseCandidate` report, because nothing but these pins queried it. |
 | Solved-mode response #2765 and terminal exact-curvature scheduling #979 | Current survival marginal-slope mode response and spatial outer driver. | **Unresolved.** A doc-comment-only historical test file is not coverage; local Hessian derivatives do not establish a fitted mode's response, and an outer-Hessian check does not establish terminal scheduling. |
 
 The four Trace fold checks passed within a **12-test run: 10 passed, 2 failed**,
