@@ -497,10 +497,6 @@ const CLOGLOG_GAMMA_H_REF: f64 = 0.01;
 // This is intentionally looser than full machine epsilon so the node-count
 // heuristic stays practical in the central moderate/large-sigma regime.
 const CLOGLOG_CC_TOL: f64 = 1e-12;
-// If the Bernstein-ellipse-based node request exceeds this cap, the backend
-// yields to the exact Gamma reference rather than turning one hard case into a
-// slow quadrature sweep.
-const CLOGLOG_CC_NODE_CAP: usize = 1025;
 // Gamma uses a fixed composite Simpson rule on [0, T] with this many samples.
 // CC only wins if its requested node count stays comfortably below that fixed
 // complex-arithmetic workload.
@@ -511,10 +507,6 @@ const CLOGLOG_GAMMA_SAMPLE_COUNT: usize =
 // than this threshold. Keep the threshold conservative until benchmarks say
 // otherwise.
 const CLOGLOG_CC_PREFER_THRESHOLD: usize = CLOGLOG_GAMMA_SAMPLE_COUNT / 3;
-// Keep a modest floor so the mapped cosine rule is never asked to represent the
-// integrand with an undersized stencil even when the heuristic requests very
-// few nodes.
-const CLOGLOG_CC_MIN_N: usize = 17;
 
 impl QuadratureContext {
     pub fn new() -> Self {
@@ -653,7 +645,19 @@ fn compute_clenshaw_curtis_n(n: usize) -> ClenshawCurtisRule {
     ClenshawCurtisRule { nodes, weights }
 }
 
-fn cloglog_cc_required_nodes(mu: f64, sigma: f64, tol: f64) -> Result<usize, EstimationError> {
+/// Truncation half-width `A` and node count of the Clenshaw-Curtis rule whose
+/// tail and quadrature remainders certify the cloglog survival integral to `tol`.
+#[derive(Clone, Copy, Debug)]
+struct CloglogCcSize {
+    half_width: f64,
+    nodes: usize,
+}
+
+fn cloglog_cc_required_nodes(
+    mu: f64,
+    sigma: f64,
+    tol: f64,
+) -> Result<CloglogCcSize, EstimationError> {
     if !(mu.is_finite() && sigma.is_finite() && sigma > 0.0 && tol.is_finite() && tol > 0.0) {
         crate::bail_invalid_estim!(
             "CC cloglog backend requires finite mu, positive sigma, and positive tolerance"
@@ -661,17 +665,26 @@ fn cloglog_cc_required_nodes(mu: f64, sigma: f64, tol: f64) -> Result<usize, Est
         );
     }
 
-    // This mirrors the node-count logic used by the actual CC evaluator, but
-    // exposes it as a cheap routing estimate so we can decide whether the
-    // bounded real-line cosine grid is likely to beat the fixed-work complex
-    // Gamma backend before paying to evaluate either one.
-    // `tol > 0` was validated at entry; the tail probability only needs its
-    // upper cap so the quantile stays in the tail.
-    let p_tail = (tol / 8.0).min(0.25);
-    let a = gam_math::probability::standard_normal_quantile(p_tail)
+    // This is the node-count logic of the actual CC evaluator, exposed as a
+    // cheap routing estimate so we can decide whether the bounded real-line
+    // cosine grid is likely to beat the fixed-work complex Gamma backend before
+    // paying to evaluate either one.
+    //
+    // The tail slice `2Φ(-A) ≤ tol/4` fixes `A = -Φ⁻¹(tol/8)`, and `[-A, A]` is
+    // an interval only while that quantile is negative, i.e. `tol/8 < 1/2`. A
+    // tolerance outside that range is refused, not floored onto a half-width
+    // it did not ask for (#2469).
+    let a = gam_math::probability::standard_normal_quantile(tol / 8.0)
         .map(|z| -z)
-        .unwrap_or(8.0)
-        .max(1.0);
+        .map_err(|err| {
+            EstimationError::InvalidInput(format!("CC cloglog backend tail truncation: {err}"))
+        })?;
+    if !(a > 0.0) {
+        return Err(EstimationError::InvalidInput(format!(
+            "CC cloglog backend needs tol/8 below one half for a positive truncation \
+             half-width, got tol={tol}"
+        )));
+    }
 
     let ay = a * sigma;
     let y = if ay > 0.0 {
@@ -679,21 +692,34 @@ fn cloglog_cc_required_nodes(mu: f64, sigma: f64, tol: f64) -> Result<usize, Est
     } else {
         1.0
     };
-    let rho = y + (1.0 + y * y).sqrt();
-    let m_s = (0.5 * (a * y) * (a * y)).exp() / (2.0 * std::f64::consts::PI).sqrt();
-    let eps_quad = tol / 4.0;
-    let numer = ((8.0 * a * m_s) / ((rho - 1.0).max(1e-12) * eps_quad)).max(1.0);
-    let denom = rho.ln();
-    if !denom.is_finite() || denom <= 0.0 {
+    // `ρ = y + √(1+y²)`, so `ρ - 1 = y + y²/(1 + √(1+y²))` and `ln ρ = asinh y`,
+    // both positive for every `y > 0` without forming `ρ - 1` by cancellation.
+    // A `y` that underflowed to zero leaves no ellipse and is refused.
+    let rho_minus_one = y + y * y / (1.0 + (1.0 + y * y).sqrt());
+    let log_rho = y.asinh();
+    if !(log_rho > 0.0) {
         crate::bail_invalid_estim!("CC cloglog backend ellipse bound became degenerate");
     }
+    let m_s = (0.5 * (a * y) * (a * y)).exp() / (2.0 * std::f64::consts::PI).sqrt();
+    let eps_quad = tol / 4.0;
+    let numer = ((8.0 * a * m_s) / (rho_minus_one * eps_quad)).max(1.0);
 
-    let mut n = (1.0 + numer.ln() / denom).ceil() as usize;
-    n = n.max(CLOGLOG_CC_MIN_N);
-    if n.is_multiple_of(2) {
-        n += 1;
+    // The remainder bound falls as `n` grows, so the certified count is the
+    // smallest `n` with `ρ^(n-1) ≥ numer`; a bound that is not finite names no
+    // rule. Three points is the smallest odd rule `compute_clenshaw_curtis_n`
+    // builds, and it meets any request below it.
+    let requested = 1.0 + numer.ln() / log_rho;
+    if !requested.is_finite() {
+        crate::bail_invalid_estim!("CC cloglog backend node bound is not finite");
     }
-    Ok(n)
+    let mut nodes = (requested.ceil() as usize).max(3);
+    if nodes.is_multiple_of(2) {
+        nodes += 1;
+    }
+    Ok(CloglogCcSize {
+        half_width: a,
+        nodes,
+    })
 }
 
 #[inline]
@@ -704,7 +730,7 @@ fn cloglog_should_prefer_cc(mu: f64, sigma: f64, tol: f64) -> bool {
     // broad or numerically awkward cases continue to use the exact
     // Mellin-Barnes/Gamma representation.
     match cloglog_cc_required_nodes(mu, sigma, tol) {
-        Ok(n) => n <= CLOGLOG_CC_PREFER_THRESHOLD,
+        Ok(size) => size.nodes <= CLOGLOG_CC_PREFER_THRESHOLD,
         Err(_) => false,
     }
 }
@@ -2645,19 +2671,16 @@ fn cloglog_survival_cc(
     // So this backend is still computing the exact same scalar object as the
     // Gamma/Mellin-Barnes path below; it just works on the real integral rather
     // than the Bromwich contour representation.
-    // `tol > 0` was validated at entry; the tail probability only needs its
-    // upper cap so the quantile stays in the tail.
-    let p_tail = (tol / 8.0).min(0.25);
-    let a = gam_math::probability::standard_normal_quantile(p_tail)
-        .map(|z| -z)
-        .unwrap_or(8.0)
-        .max(1.0);
-    let n = cloglog_cc_required_nodes(mu, sigma, tol)?;
-    if n > CLOGLOG_CC_NODE_CAP {
+    let size = cloglog_cc_required_nodes(mu, sigma, tol)?;
+    // CC is evaluated only where the router prefers it: the preference
+    // threshold is the one size gate, so no second, larger cap exists to
+    // disagree with it (#2469).
+    if size.nodes > CLOGLOG_CC_PREFER_THRESHOLD {
         crate::bail_invalid_estim!("CC cloglog backend requires too many nodes");
     }
+    let a = size.half_width;
 
-    let rule = ctx.clenshaw_curtis_n(n);
+    let rule = ctx.clenshaw_curtis_n(size.nodes);
     let inv_sqrt_2pi = 1.0 / (2.0 * std::f64::consts::PI).sqrt();
     let mut sum = 0.0_f64;
     let mut c = 0.0_f64;
