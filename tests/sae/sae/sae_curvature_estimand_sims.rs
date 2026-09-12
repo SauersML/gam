@@ -431,8 +431,9 @@ fn response_curvature_kappa_hat_is_unit_covariant_under_rescaling() {
 /// onto the spherical cap. The estimator must NOT silently report `κ̂ = ci_hi` as
 /// an interior point estimate: it must flag `railed_at_resolution_limit = true`,
 /// and the scale-FREE invariant `κ̂·r²` must be near the cap's dimensionless
-/// sentinel `(0.9π)²` (the cloud-fills-the-sphere limit), NOT a tiny number that
-/// would falsely read "flat". This is the exact OLMo behaviour we want made
+/// sentinel `π²` (the cloud-fills-the-sphere limit: the estimator keeps
+/// `√κ·ρ_max < π` to f64 resolution, with no fractional margin), NOT a tiny number
+/// that would falsely read "flat". This is the exact OLMo behaviour we want made
 /// honest: a tight near-spherical cloud reports "curvature exceeds chart-
 /// resolvable range at this scale", never a silent rail.
 ///
@@ -477,9 +478,9 @@ fn response_curvature_flags_rail_on_high_curvature_relative_to_spread() {
     );
 
     // (b) The scale-FREE invariant κ̂·r² sits near the cloud-fills-the-sphere
-    // sentinel (0.9π)² ≈ 8.0 — the cloud genuinely fills the sphere; it does NOT
+    // sentinel π² ≈ 9.87 — the cloud genuinely fills the sphere; it does NOT
     // read as flat (which a scale-dependent tiny-r² reading could falsely suggest).
-    let sentinel = (0.9 * std::f64::consts::PI).powi(2);
+    let sentinel = std::f64::consts::PI.powi(2);
     assert!(
         fit.kappa_r2 > 0.5 * sentinel,
         "scale-free κ̂·r²={:.3} should be near the fill-the-sphere sentinel {:.3}, \
@@ -518,19 +519,13 @@ fn response_curvature_flags_rail_on_high_curvature_relative_to_spread() {
 
 /// Recover the chart-validity / conjugate-radius bracket the estimator uses, so
 /// the recovery test's "interior, not railed" check is against the SAME bounds
-/// the golden-section search ran inside. `response_kappa_bounds` is private, so
-/// we reconstruct its two endpoints from the same public quantities: the lower
-/// (hyperbolic) bound `−0.999/max‖yᵢ‖²` from the chart origin, and the upper
-/// (spherical conjugate) cap `(0.9π / (2·max‖yᵢ−μ‖))²` from the centroid.
+/// the search ran inside. `response_kappa_bounds` is private, so we reconstruct
+/// its two endpoints from the same public quantity, the centroid-relative spread
+/// `s² = max‖yᵢ−μ‖²`, each one `√ε` relative step inside its open boundary: the
+/// lower (hyperbolic) bound `−(1−√ε)/s²` and the upper (spherical conjugate) cap
+/// `((1−√ε)·π / (2s))²`.
 fn bracket_via_criterion(values: ndarray::ArrayView2<'_, f64>) -> (f64, f64) {
     let (n_rows, dim) = values.dim();
-    let mut r2_max = 0.0_f64;
-    for row in values.outer_iter() {
-        let r2 = row.dot(&row);
-        if r2 > r2_max {
-            r2_max = r2;
-        }
-    }
     let mut centroid = Array1::<f64>::zeros(dim.max(1));
     if n_rows > 0 && dim > 0 {
         for row in values.outer_iter() {
@@ -546,18 +541,15 @@ fn bracket_via_criterion(values: ndarray::ArrayView2<'_, f64>) -> (f64, f64) {
             s2_max = r2;
         }
     }
-    let kappa_min = if r2_max > 0.0 {
-        -0.999 / r2_max
-    } else {
-        -1.0e6
-    };
-    let kappa_max = if s2_max > 0.0 {
-        let rho_max = 2.0 * s2_max.sqrt();
-        let edge = 0.9 * std::f64::consts::PI / rho_max;
-        edge * edge
-    } else {
-        1.0e6
-    };
+    assert!(
+        s2_max > 0.0,
+        "the κ bracket needs a non-degenerate cloud: max ‖y−μ‖²={s2_max}"
+    );
+    let open_boundary = 1.0 - f64::EPSILON.sqrt();
+    let kappa_min = -open_boundary / s2_max;
+    let rho_max = 2.0 * s2_max.sqrt();
+    let edge = open_boundary * std::f64::consts::PI / rho_max;
+    let kappa_max = edge * edge;
     // Sanity: the bracket must enclose the criterion's evaluable region — probe
     // both endpoints so a future change to the bound formula that desyncs from
     // the estimator's own bracket fails loudly here rather than silently

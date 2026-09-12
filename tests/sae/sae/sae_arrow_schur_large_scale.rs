@@ -49,6 +49,21 @@ fn build_fixture(
     p_out: usize,
     mode: AssignmentMode,
 ) -> Fixture {
+    build_fixture_with_decoder_scale(k_atoms, basis_size, latent_dim, n_obs, p_out, mode, 1.0)
+}
+
+/// [`build_fixture`] with every decoder multiplied by `decoder_scale`. The draw
+/// sequence is unchanged, so `decoder_scale = 1.0` reproduces `build_fixture`
+/// bit for bit and only the decoders move with the scale.
+fn build_fixture_with_decoder_scale(
+    k_atoms: usize,
+    basis_size: usize,
+    latent_dim: usize,
+    n_obs: usize,
+    p_out: usize,
+    mode: AssignmentMode,
+    decoder_scale: f64,
+) -> Fixture {
     let m = basis_size;
     let d = latent_dim;
     let n = n_obs;
@@ -67,7 +82,7 @@ fn build_fixture(
     for _k in 0..k_atoms {
         let phi = Array2::from_shape_fn((n, m), |_| lcg_f64(&mut rng) * 0.1);
         let jet = Array3::from_shape_fn((n, m, d), |_| lcg_f64(&mut rng) * 0.01);
-        let decoder = Array2::from_shape_fn((m, p), |_| lcg_f64(&mut rng) * 0.3);
+        let decoder = Array2::from_shape_fn((m, p), |_| lcg_f64(&mut rng) * 0.3 * decoder_scale);
         let mut smooth = Array2::<f64>::zeros((m, m));
         for i in 0..m {
             // Diagonal-dominant → PD.
@@ -328,12 +343,23 @@ fn hbb_shape_matches_beta_dim() {
 // Block-diagonal data-fit β-Hessian reduction must match the dense reference.
 //
 // The data-fit Gauss-Newton β-Hessian `Jβᵀ Jβ` is block-diagonal across the
-// `p` output channels and identical per channel, so the assembler now stores
-// it as a single `(M_total × M_total)` block `G` installed as `G ⊗ I_p`
-// (a `KroneckerPenaltyOp`) inside the composite penalty operator, rather than
-// materialising the dense `(K·M·p)²` `sys.hbb`. This test pins that the
-// structured operator's dense form exactly reproduces the dense reference
-// (data-fit GN + decoder smoothness), assembled independently here.
+// `p` output channels and identical per channel, so the assembler stores it as
+// a single `(M_total × M_total)` block `G` installed as `G ⊗ I_p`
+// (`SparseBlockKroneckerPenaltyOp`) inside the composite penalty operator,
+// rather than materialising the dense `(K·M·p)²` `sys.hbb`. This test pins that
+// the structured operator's data-fit + decoder-smoothness part exactly
+// reproduces the dense reference assembled independently here.
+//
+// The composite also carries the decoder priors' curvature majorizers: the
+// separation barrier (#1038/#1610/#2731), the amplitude barrier (#2343) and the
+// collinearity-gated repulsion (#1026/#2828). Each prices normalized decoder
+// shapes against the live decoder energy, so its β-curvature is homogeneous of
+// degree −2 in a global decoder scale `s`, while the data-fit GN (routing mass
+// times basis values) and `λS` do not involve the decoders. The fixture is
+// assembled at `s = 1, 2, 3` and read as `op(s) = R + s⁻²·C`: scales 1 and 2
+// give `R = (4·op(2) − op(1))/3` and `C = 4·(op(1) − op(2))/3`, `R` must equal
+// the dense reference, and scale 3 must reproduce `R + C/9`, which checks the
+// scaling law instead of assuming it.
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -412,15 +438,52 @@ fn data_fit_beta_hessian_kronecker_matches_dense_reference() {
         (beta_dim, beta_dim),
         "penalty op dense shape mismatch"
     );
-    let mut max_abs = 0.0_f64;
-    for a in 0..beta_dim {
-        for b in 0..beta_dim {
-            max_abs = max_abs.max((actual[[a, b]] - reference[[a, b]]).abs());
-        }
-    }
+
+    let penalty_op_at_decoder_scale = |decoder_scale: f64| -> Array2<f64> {
+        let mut scaled = build_fixture_with_decoder_scale(
+            k_atoms,
+            m,
+            d,
+            n,
+            p,
+            AssignmentMode::softmax(1.0),
+            decoder_scale,
+        );
+        scaled
+            .term
+            .assemble_arrow_schur(scaled.target.view(), &scaled.rho, None)
+            .unwrap_or_else(|e| {
+                panic!("assemble_arrow_schur at decoder scale {decoder_scale} failed: {e}")
+            })
+            .effective_penalty_op()
+            .to_dense()
+    };
+    let op_2 = penalty_op_at_decoder_scale(2.0);
+    let op_3 = penalty_op_at_decoder_scale(3.0);
+    let data_fit_and_smoothness = (&op_2 * 4.0 - &actual) / 3.0;
+    let decoder_prior_curvature = (&actual - &op_2) * (4.0 / 3.0);
+    let predicted_op_3 = &data_fit_and_smoothness + &(&decoder_prior_curvature / 9.0);
+
+    let max_abs_gap = |left: &Array2<f64>, right: &Array2<f64>| -> f64 {
+        left.iter()
+            .zip(right.iter())
+            .fold(0.0_f64, |acc, (l, r)| acc.max((l - r).abs()))
+    };
+    let reference_gap = max_abs_gap(&data_fit_and_smoothness, &reference);
+    let scaling_gap = max_abs_gap(&op_3, &predicted_op_3);
+    let prior_curvature_size = decoder_prior_curvature
+        .iter()
+        .fold(0.0_f64, |acc, v| acc.max(v.abs()));
     assert!(
-        max_abs < 1e-9,
-        "structured penalty op dense form deviates from dense reference: max|Δ|={max_abs:.3e}"
+        reference_gap < 1e-9,
+        "structured penalty op's decoder-scale-invariant part deviates from the dense data-fit + \
+         smoothness reference: max|Δ|={reference_gap:.3e} (decoder-prior curvature \
+         max|C|={prior_curvature_size:.3e})"
+    );
+    assert!(
+        scaling_gap < 1e-9,
+        "decoder-prior curvature is not homogeneous of degree −2 in the decoder scale: \
+         max|op(3) − (R + C/9)|={scaling_gap:.3e} (max|C|={prior_curvature_size:.3e})"
     );
 }
 

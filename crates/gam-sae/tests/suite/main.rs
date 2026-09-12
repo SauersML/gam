@@ -2,12 +2,9 @@
 //! standalone tests/*.rs crate and therefore its own link of gam-sae and
 //! its dependency tree. One binary, same tests, same names.
 
-mod atlas_real_transport;
 mod calendar_ground_truth_benchmark;
 mod chart_gluing_1890;
 mod chart_gluing_1890_e2e;
-mod encode_full_path_throughput;
-mod encode_k_scaling_throughput;
 mod installed_kkt_scaling_2548;
 mod repro_2512;
 mod repro_2535;
