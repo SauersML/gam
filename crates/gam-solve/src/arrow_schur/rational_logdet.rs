@@ -1372,10 +1372,17 @@ fn solve_family_block(
     node_count: usize,
     vectors: &[Array1<f64>],
 ) -> Option<(Vec<Vec<Array1<f64>>>, usize)> {
+    use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
+    // #2576 — each right-hand side is an independent family solve of one frozen
+    // operator, so they run on the rayon pool. The per-vector results are then
+    // assembled in input order, so `solves` and `total` are bit-identical to the
+    // one-vector-at-a-time loop.
+    let families: Vec<Option<(Vec<Array1<f64>>, usize)>> =
+        vectors.par_iter().map(|rhs| solve(rhs)).collect();
     let mut solves: Vec<Vec<Array1<f64>>> = vec![Vec::with_capacity(vectors.len()); node_count];
     let mut total = 0usize;
-    for rhs in vectors {
-        let (per_node, applies) = solve(rhs)?;
+    for (rhs, family) in vectors.iter().zip(families) {
+        let (per_node, applies) = family?;
         if per_node.len() != node_count {
             return None;
         }
