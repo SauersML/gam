@@ -337,16 +337,7 @@ fn check_plan_against_per_apply(
 fn residual_curvature_plan_equals_the_per_apply_form_on_threshold_gate_strata_2731() {
     let mut live = (false, false);
     for straddle in [false, true] {
-        let (term, mut target, rho) = threshold_gate_tiny_fixture(straddle);
-        // The fixture draws its target from the state it returns, so at this frozen
-        // anchor every row residual is round-off, the contractions are round-off, and
-        // a relative 1e-6 change to one is absorbed by the O(1) ARD and threshold
-        // remainders: job 448182 saw the mutation arm leave the apply bit-identical
-        // at straddle=false. A fixed offset the frozen state does not interpolate
-        // gives both legs a residual of order 0.05.
-        for ((row, col), value) in target.indexed_iter_mut() {
-            *value += ((row * 5 + col * 3) % 7) as f64 / 70.0 - 0.04;
-        }
+        let (term, target, rho) = threshold_gate_tiny_fixture(straddle);
         let mut anchor = term.clone();
         let (_value, _loss, cache) = anchor
             .penalized_quasi_laplace_criterion_with_cache(
@@ -360,10 +351,25 @@ fn residual_curvature_plan_equals_the_per_apply_form_on_threshold_gate_strata_27
             )
             .expect("threshold-gate fixed-theta cache");
         anchor.streaming_gates_frozen = true;
+        // The fixture draws its target from the state it returns, so against that
+        // target every row residual is round-off, the contractions are round-off, and
+        // a relative 1e-6 change to one is absorbed by the O(1) ARD and threshold
+        // remainders: job 448182 saw the mutation arm leave the apply bit-identical
+        // at straddle=false. The two arms therefore read a fixed offset of the target
+        // that the frozen state does not interpolate, which gives both legs a residual
+        // of order 0.05. The cache stays factored at the interpolated target: the
+        // criterion's observed information reads the residual, and job 510613 saw the
+        // offset target refuse there as `IndefiniteObservedInformation`. Both arms
+        // read the same target and the same cache, so the comparison does not depend
+        // on which target the cache was factored at.
+        let mut probe_target = target.clone();
+        for ((row, col), value) in probe_target.indexed_iter_mut() {
+            *value += ((row * 5 + col * 3) % 7) as f64 / 70.0 - 0.04;
+        }
         let arm = check_plan_against_per_apply(
             &format!("threshold gate straddle={straddle}"),
             &anchor,
-            target.view(),
+            probe_target.view(),
             &rho,
             &cache,
         );
