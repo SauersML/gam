@@ -32,17 +32,16 @@ use gam_linalg::matrix::DesignMatrix;
 use gam_linalg::triangular::back_substitution_lower_transpose_guarded_into;
 use gam_problem::types::{
     GlmLikelihoodSpec, InverseLink, LikelihoodScaleMetadata, LikelihoodSpec,
-    ResolvedLikelihoodScale, ResponseFamily, RhoPrior, StandardLink, is_valid_tweedie_power,
+    ResolvedLikelihoodScale, ResponseFamily, StandardLink, is_valid_tweedie_power,
 };
 use gam_solve::estimate::reml::FirthDenseOperator;
 use gam_solve::estimate::{UnifiedFitResult, validate_explicit_dense_hessian_for_whitening};
 use gam_solve::model_types::InferenceCovarianceMode;
-use gam_solve::mixture_link::{InverseLinkKernel, softmax_last_fixedzero};
 use general_mcmc::generic_hmc::HamiltonianTarget;
 pub use general_mcmc::generic_nuts::NUTSMassMatrixConfig;
 use general_mcmc::generic_nuts::{GenericNUTS, MassMatrixAdaptation};
 use ndarray::{Array1, Array2, Array3, ArrayView1, ArrayView2, Axis, s};
-use rand::rngs::StdRng;
+use rand::{RngExt, SeedableRng, rngs::StdRng};
 use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
 use std::fmt;
