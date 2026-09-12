@@ -3121,5 +3121,13 @@
     ],
     "reason": "SPEC rule 23: derive the rational surrogate's spectral bracket instead of a fixed power-iteration count (#2576)",
     "evidence": "Backfilled: ad53212ec replaced SurrogateLaneConfig::cg_max_iters with the reduced-Schur span k and deleted SAE_SURROGATE_LANE_CG_MAX_ITERS without its acknowledgement. source_removal_guard on MSI over 8bd5765b0..ad53212ec measured exactly these items."
+  },
+  {
+    "base": "6a78b8dad7acb5606b79a9719afbd7a7368d28e3",
+    "items": [
+      "crates/gam-sae/src/manifold/outer_objective.rs:fn:von_mises_ard_precision"
+    ],
+    "reason": "#2668 row 19 (d70ae015b): the SAE EFS ARD proposal now steps ln(1 − 2·g/(α·E)) from the complete analytic criterion gradient, which already carries the exact von-Mises normalizer on a periodic axis. von_mises_ard_precision, the periodic-axis correction of the old Gaussian MacKay root, has no caller left, and SPEC rule 25 deletes unused options rather than keeping them.",
+    "evidence": "At base 6a78b8dad, git grep -n -w von_mises_ard_precision over *.rs finds five occurrences, all in crates/gam-sae/src/manifold/outer_objective.rs: the declaration (:3086), the per-atom and shared ARD call sites in efs_step_with_certificate (:2904, :2969), and two comments (:2867, :2876), all rewritten in d70ae015b. No test names it. The integrity run on d70ae015b (run 34670949262, job 103492072637) reports exactly this one guarded removal. Nothing was compiled or run before push (commit-after-every-edit directive)."
   }
 ]
