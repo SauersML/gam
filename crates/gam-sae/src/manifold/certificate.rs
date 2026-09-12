@@ -338,20 +338,6 @@ pub struct SaeAtomTrustDiagnostics {
 }
 
 /// Build the empirical curved-dictionary certificate quantities from a fitted
-/// term and its Gaussian reconstruction dispersion.
-///
-/// This reports only computable theorem-side inputs. It intentionally has no
-/// global-optimality verdict: the threshold function relating these inputs is
-/// future theory (#1008).
-pub fn dictionary_incoherence_report(term: &SaeManifoldTerm) -> Result<CertificateInputs, String> {
-    let dispersion = term.certificate_dispersion.ok_or_else(|| {
-        "dictionary_incoherence_report: fitted reconstruction dispersion is unavailable".to_string()
-    })?;
-    let fitted = term.try_fitted()?;
-    dictionary_incoherence_report_with_dispersion(term, dispersion, fitted.view())
-}
-
-/// Build the empirical curved-dictionary certificate quantities from a fitted
 /// term and an explicit Gaussian reconstruction dispersion.
 ///
 /// This is where the theory's abstract quantities get measured off the
@@ -370,12 +356,12 @@ pub fn dictionary_incoherence_report_with_dispersion(
 ) -> Result<CertificateInputs, String> {
     if !dispersion.is_finite() || dispersion <= 0.0 {
         return Err(format!(
-            "dictionary_incoherence_report: dispersion must be finite and positive, got {dispersion}"
+            "dictionary_incoherence_report_with_dispersion: dispersion must be finite and positive, got {dispersion}"
         ));
     }
     if fitted.dim() != (term.n_obs(), term.output_dim()) {
         return Err(format!(
-            "dictionary_incoherence_report: fitted {:?} != ({}, {})",
+            "dictionary_incoherence_report_with_dispersion: fitted {:?} != ({}, {})",
             fitted.dim(),
             term.n_obs(),
             term.output_dim()

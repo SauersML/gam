@@ -864,12 +864,6 @@ pub(crate) fn dtm_vietoris_rips_persistence(
     PersistenceDiagram { h0, h1, h2 }
 }
 
-/// Exact DTM-weighted Vietoris–Rips persistent homology up to H₁ (needs
-/// 2-simplices to kill loops).
-pub fn vietoris_rips_persistence(points: ArrayView2<'_, f64>) -> PersistenceDiagram {
-    dtm_vietoris_rips_persistence(points, None, 1)
-}
-
 /// A simplex in the filtration, identified by the colex rank of its vertex set
 /// within its own dimension, carrying its filtration value.
 ///
@@ -1548,10 +1542,6 @@ impl AtlasNerveReport {
     /// Whether the nerve recovers a single circle `S¹` (one component, one loop).
     pub fn is_circle(&self) -> bool {
         self.n_components == 1 && self.b1 == 1
-    }
-    /// Whether the nerve recovers a single arc / path (one component, no loop).
-    pub fn is_arc(&self) -> bool {
-        self.n_components == 1 && self.b1 == 0 && self.max_vertex_degree <= 2
     }
 }
 

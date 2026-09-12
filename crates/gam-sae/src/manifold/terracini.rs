@@ -56,7 +56,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use gam_linalg::faer_ndarray::FaerEigh;
 use gam_solve::row_sampling_measure::RowSamplingMeasure;
-use ndarray::{Array1, Array2, ArrayView2};
+use ndarray::{Array1, Array2};
 
 use faer::Side;
 
@@ -456,18 +456,6 @@ pub struct TerraciniReport {
 }
 
 impl TerraciniReport {
-    /// Veto consult: is there a flagged clique that is a subset of `pattern`
-    /// (i.e. a birth joining `pattern` would sit on a collided clique)? Only
-    /// meaningful in `Veto` mode; in any other mode this always returns `false`.
-    pub fn vetoes_birth_into(&self, pattern: &[usize]) -> bool {
-        if self.mode != TerraciniMode::Veto {
-            return false;
-        }
-        let set: std::collections::BTreeSet<usize> = pattern.iter().copied().collect();
-        self.flagged_cliques
-            .iter()
-            .any(|fc| fc.pattern.iter().all(|a| set.contains(a)))
-    }
 }
 
 /// Bounded-state aggregator over sampled parse certificates.
@@ -532,10 +520,6 @@ impl TerraciniAggregator {
                 attribution_risk: cert.attribution_risk,
             });
         }
-    }
-
-    fn note_row(&mut self) {
-        self.n_rows += 1;
     }
 
     /// Finalize into a worst-first report.
@@ -741,132 +725,6 @@ pub fn designed_reservoir_rows_for_coverage(
     Ok(selected.into_iter().collect())
 }
 
-fn sparse_rows_with_patterns(
-    indices: ArrayView2<'_, u32>,
-    codes: ArrayView2<'_, f32>,
-    k_atoms: usize,
-) -> Result<Vec<(usize, Vec<usize>)>, String> {
-    if indices.dim() != codes.dim() {
-        return Err(format!(
-            "sparse_rows_with_patterns: indices shape {:?} != codes shape {:?}",
-            indices.dim(),
-            codes.dim()
-        ));
-    }
-    let mut rows = Vec::new();
-    for row in 0..indices.nrows() {
-        let mut atoms = BTreeSet::new();
-        for slot in 0..indices.ncols() {
-            let code = codes[[row, slot]];
-            if code == 0.0 {
-                continue;
-            }
-            let atom = indices[[row, slot]] as usize;
-            if atom >= k_atoms {
-                return Err(format!(
-                    "sparse_rows_with_patterns: atom index {atom} out of range 0..{k_atoms}"
-                ));
-            }
-            atoms.insert(atom);
-        }
-        if atoms.len() >= 2 {
-            rows.push((row, atoms.into_iter().collect()));
-        }
-    }
-    Ok(rows)
-}
-
-fn sparse_code_amplitude(
-    indices: ArrayView2<'_, u32>,
-    codes: ArrayView2<'_, f32>,
-    row: usize,
-    atom: usize,
-) -> f64 {
-    let mut amplitude = 0.0_f64;
-    for slot in 0..indices.ncols() {
-        if indices[[row, slot]] as usize == atom {
-            amplitude += codes[[row, slot]] as f64;
-        }
-    }
-    amplitude
-}
-
-
-/// Reservoir-sized Terracini scan from the canonical sparse-code state.
-///
-/// `indices/codes` are the sparse `N×s` routing state. Certification first
-/// gathers a designed, per-atom-covered row reservoir and then evaluates only
-/// those rows, with amplitudes read from the sparse code slots. No dense `N×K`
-/// assignment matrix or `N×P` curved-prediction cache is constructed.
-pub fn terracini_scan_sparse_codes(
-    term: &SaeManifoldTerm,
-    indices: ArrayView2<'_, u32>,
-    codes: ArrayView2<'_, f32>,
-    measure: Option<&RowSamplingMeasure>,
-    seed: u64,
-    cfg: &TerraciniConfig,
-) -> Result<TerraciniReport, String> {
-    if cfg.mode == TerraciniMode::Off {
-        return Ok(TerraciniAggregator::new(cfg.flag_margin, cfg.reservoir_cap, cfg.mode).finish());
-    }
-    if indices.nrows() != term.n_obs() {
-        return Err(format!(
-            "terracini_scan_sparse_codes: sparse codes have {} rows but term has {}",
-            indices.nrows(),
-            term.n_obs()
-        ));
-    }
-    let rows_with_patterns = sparse_rows_with_patterns(indices, codes, term.k_atoms())?;
-    let cap = cfg
-        .reservoir_rows_per_atom
-        .saturating_mul(term.k_atoms())
-        .min(rows_with_patterns.len());
-    let rows = designed_reservoir_rows_for_coverage(
-        &rows_with_patterns,
-        measure,
-        cfg.reservoir_rows_per_atom,
-        cap,
-        seed,
-    )?;
-    let selected: BTreeSet<usize> = rows.into_iter().collect();
-    let mut agg = TerraciniAggregator::new(cfg.flag_margin, cfg.reservoir_cap, cfg.mode);
-    for (row, pattern) in rows_with_patterns {
-        if !selected.contains(&row) {
-            continue;
-        }
-        agg.note_row();
-        let blocks: Vec<ParseBlock> = pattern
-            .iter()
-            .map(|&k| {
-                parse_block_from_term(term, k, row, sparse_code_amplitude(indices, codes, row, k))
-            })
-            .collect();
-        if cfg.pair_pass {
-            for i in 0..blocks.len() {
-                for j in (i + 1)..blocks.len() {
-                    if let Ok(cert) = parse_certificate(
-                        &[blocks[i].clone(), blocks[j].clone()],
-                        cfg.noise_var,
-                        cfg.ridge,
-                    ) {
-                        agg.record_pair(
-                            blocks[i].atom,
-                            blocks[j].atom,
-                            cert.margin,
-                            cert.amplification,
-                        );
-                    }
-                }
-            }
-        }
-        if pattern.len() <= cfg.max_clique_atoms {
-            if let Ok(cert) = parse_certificate(&blocks, cfg.noise_var, cfg.ridge) {
-                agg.record_clique(row, &cert);
-            }
-        }
-    }
-    Ok(agg.finish())
-}
 
 #[cfg(test)]
 mod tests {
@@ -1056,9 +914,6 @@ mod tests {
         assert!(report.atoms[0].min_margin < report.atoms[3].min_margin);
         assert!(!report.flagged_cliques.is_empty());
         assert_eq!(report.flagged_cliques[0].pattern, vec![2, 3]);
-        // Veto fires for a birth joining the collided clique, not the benign one.
-        assert!(report.vetoes_birth_into(&[2, 3]));
-        assert!(!report.vetoes_birth_into(&[0, 1]));
     }
 
     #[test]

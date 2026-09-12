@@ -258,18 +258,6 @@ pub fn watson_u2_uniform(u: &[f64]) -> WatsonUniformity {
     }
 }
 
-/// Watson's `U²` uniformity of the fitted coordinates against the atom's
-/// invariant (uniform) measure, per `d = 1` topology: a circle wraps modulo its
-/// period; an interval is normalized by its fitted coordinate range. Returns
-/// `None` (statistic undefined) for fewer than two coordinates, a non-finite
-/// coordinate, a non-positive period, or a collapsed interval range.
-pub fn coordinate_uniformity(
-    coords: ArrayView1<'_, f64>,
-    topology: &CanonicalChartTopology,
-) -> Option<WatsonUniformity> {
-    coordinate_uniformity_impl(coords, None, topology)
-}
-
 pub fn coordinate_uniformity_weighted(
     coords: ArrayView1<'_, f64>,
     support: &SupportMeasure,
@@ -483,7 +471,7 @@ impl OccupancyLaw {
 
 /// Classify the occupancy law of coordinates already folded onto the unit circle
 /// `u ∈ [0, 1)` (a circle wraps modulo its period; an interval is range
-/// normalized — both handled by [`coordinate_uniformity`]'s mapping) by a BIC
+/// normalized — both handled by [`coordinate_uniformity_weighted`]'s mapping) by a BIC
 /// comparison across the fixed model-class enumeration `{uniform, one wrapped
 /// Gaussian, k-anchor wrapped-Gaussian mixture for k on the anchor ladder}`. The
 /// class with the lowest BIC (= highest rank-aware quasi-Laplace score) is the law:
@@ -500,18 +488,14 @@ pub fn classify_occupancy_weighted(u: &[f64], weights: ArrayView1<'_, f64>) -> O
     classify_occupancy_weighted_impl(u, weights, true)
 }
 
-/// Occupancy law for an INTERVAL (non-wrapping) coordinate `u ∈ [0, 1]`: the same
-/// evidence race, but on the LINE rather than the circle, so the extreme values
-/// `0` and `1` are NOT cyclically adjacent. Use this for interval-topology
-/// coordinates (a birth PCA seed, a bounded latent) where a circular fold would
-/// wrongly merge a linear finite set's first and last anchors and misread a
-/// range-filling uniform coordinate as non-uniform. `classify_occupancy` is the
-/// circular counterpart for genuinely cyclic (circle-chart) coordinates.
-pub fn classify_occupancy_interval(u: &[f64]) -> OccupancyLaw {
-    classify_occupancy_impl(u, false)
-}
-
-/// Weighted interval counterpart of [`classify_occupancy_interval`].
+/// Occupancy law for an INTERVAL (non-wrapping) coordinate `u ∈ [0, 1]` with
+/// per-row weights: the same evidence race, but on the LINE rather than the
+/// circle, so the extreme values `0` and `1` are NOT cyclically adjacent. Use
+/// this for interval-topology coordinates (a birth PCA seed, a bounded latent)
+/// where a circular fold would wrongly merge a linear finite set's first and
+/// last anchors and misread a range-filling uniform coordinate as non-uniform.
+/// [`classify_occupancy_weighted`] is the circular counterpart for genuinely
+/// cyclic (circle-chart) coordinates.
 pub fn classify_occupancy_interval_weighted(
     u: &[f64],
     weights: ArrayView1<'_, f64>,
@@ -1493,7 +1477,7 @@ impl SaeManifoldTerm {
     ///
     /// It prices the arc-length defect — a PURE parameterization property measured
     /// on a uniform latent grid — rather than the raw-coordinate Watson `U²`
-    /// occupancy statistic ([`coordinate_uniformity`]). The two are NOT
+    /// occupancy statistic ([`coordinate_uniformity_weighted`]). The two are NOT
     /// interchangeable for seed selection (the F2 split): Watson `U²` conflates
     /// data occupancy with chart honesty, so a WARPED chart that spreads a
     /// genuinely clustered coordinate into a uniform-looking raw distribution reads

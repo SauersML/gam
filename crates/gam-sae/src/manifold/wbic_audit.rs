@@ -211,35 +211,3 @@ pub fn recon_spectrum(
     })
 }
 
-/// One row of the WBIC-vs-rank-charge audit table.
-#[derive(Clone, Debug)]
-pub struct AuditRow {
-    /// Human name of the synthetic population.
-    pub name: String,
-    /// Rows the atom was fit on.
-    pub n: usize,
-    /// Integer count of directions above the MP reconstruction-rank edge.
-    pub mp_reconstruction_rank: usize,
-    /// Integer rank the production criterion actually charges, including #2258
-    /// alive-below-edge promotion.
-    pub production_chargeable_rank: usize,
-    /// WBIC tempered soft count.
-    pub rank_soft: f64,
-    /// Graded effective basis count.
-    pub basis_edf: f64,
-    /// Theoretical hard-MP reconstruction-rank charge
-    /// `½·rank_mp·basis_edf·log N_eff`.
-    pub mp_reconstruction_rank_charge: f64,
-    /// Actual production rank / BIC charge
-    /// `½·rank_chargeable·basis_edf·log N_eff`.
-    pub production_charge: f64,
-    /// WBIC / singular charge `½·rank_soft·basis_edf·log N_eff`.
-    pub wbic_charge: f64,
-    /// Signed `production_charge − wbic_charge`; no universal ordering is
-    /// assumed near the MP edge.
-    pub production_minus_wbic: f64,
-    /// `production_minus_wbic / production_charge` (`NaN` if production charge
-    /// is zero).
-    pub production_delta_fraction: f64,
-}
-

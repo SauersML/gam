@@ -158,34 +158,8 @@ impl AtomTransportReport {
     }
 }
 
-/// Measure the empirical anchor→first-block transport of one circle atom and
-/// test the phase-shift law. See the module header for the full definition.
-///
-/// `term` must hold the fitted atom (with an installed periodic basis evaluator);
-/// `layout` supplies the anchor width, the block column ranges, and the per-block
-/// `√λ_ℓ` unscaling (pass the layout the fit installed, or one built with
-/// [`CrosscoderLayout::from_blocks`]). `grid_resolution` is the number of source
-/// samples reported over `[0, 1)`; it controls diagnostic sampling, not the
-/// continuous target-coordinate solve. Requires `layout.num_blocks() ≥ 1`.
-pub fn measure_atom_transport(
-    term: &SaeManifoldTerm,
-    layout: &CrosscoderLayout,
-    atom: usize,
-    grid_resolution: usize,
-) -> Result<AtomTransportReport, String> {
-    measure_atom_transport_between(
-        term,
-        layout,
-        atom,
-        CrosscoderLayer::Anchor,
-        CrosscoderLayer::Block(0),
-        grid_resolution,
-    )
-}
-
 /// Measure the empirical transport of one circle atom between two explicit
-/// crosscoder layers (source image projected onto the target image). The
-/// two-layer entry point `measure_atom_transport` is the anchor→`Block(0)` case.
+/// crosscoder layers (source image projected onto the target image).
 pub fn measure_atom_transport_between(
     term: &SaeManifoldTerm,
     layout: &CrosscoderLayout,
@@ -196,13 +170,13 @@ pub fn measure_atom_transport_between(
 ) -> Result<AtomTransportReport, String> {
     if atom >= term.atoms.len() {
         return Err(format!(
-            "measure_atom_transport: atom index {atom} out of range (K = {})",
+            "measure_atom_transport_between: atom index {atom} out of range (K = {})",
             term.atoms.len()
         ));
     }
     if layout.total_dim() != term.output_dim() {
         return Err(format!(
-            "measure_atom_transport: layout total width {} != term output_dim {} (the layout \
+            "measure_atom_transport_between: layout total width {} != term output_dim {} (the layout \
              must describe this term's augmented columns)",
             layout.total_dim(),
             term.output_dim()
@@ -211,20 +185,20 @@ pub fn measure_atom_transport_between(
     let atom_ref = &term.atoms[atom];
     if atom_ref.latent_dim() != 1 {
         return Err(format!(
-            "measure_atom_transport: the phase-shift law is defined for a 1-D circle atom; atom \
+            "measure_atom_transport_between: the phase-shift law is defined for a 1-D circle atom; atom \
              {atom} has latent_dim {}",
             atom_ref.latent_dim()
         ));
     }
     if atom_ref.basis_kind() != &SaeAtomBasisKind::Periodic {
         return Err(format!(
-            "measure_atom_transport: atom {atom} must use the standard periodic harmonic basis, got {:?}",
+            "measure_atom_transport_between: atom {atom} must use the standard periodic harmonic basis, got {:?}",
             atom_ref.basis_kind()
         ));
     }
     if atom_ref.homotopy_eta != 1.0 {
         return Err(format!(
-            "measure_atom_transport: atom {atom} is at homotopy eta {}, not the fitted eta = 1 endpoint",
+            "measure_atom_transport_between: atom {atom} is at homotopy eta {}, not the fitted eta = 1 endpoint",
             atom_ref.homotopy_eta
         ));
     }
@@ -237,7 +211,7 @@ pub fn measure_atom_transport_between(
     let b_tgt = honest_layer_decoder(&physical_decoder, layout, target)?;
     if b_src.ncols() != b_tgt.ncols() {
         return Err(format!(
-            "measure_atom_transport: source ambient width {} != target ambient width {} — the \
+            "measure_atom_transport_between: source ambient width {} != target ambient width {} — the \
              nearest-point transport needs both layer images in one ambient space (a crosscoder \
              shares the residual-stream dimension across layers)",
             b_src.ncols(),
@@ -248,7 +222,7 @@ pub fn measure_atom_transport_between(
     let m = physical_decoder.nrows();
     let n_harmonics = m.saturating_sub(1) / 2;
     if grid_resolution == 0 {
-        return Err("measure_atom_transport: grid_resolution must be positive".to_string());
+        return Err("measure_atom_transport_between: grid_resolution must be positive".to_string());
     }
 
     // Reporting density and diagnostic-fit density are independent.  The
@@ -262,7 +236,7 @@ pub fn measure_atom_transport_between(
     let diagnostic_multiplier = required_fit_samples.div_ceil(grid_resolution).max(1);
     let diagnostic_resolution = grid_resolution
         .checked_mul(diagnostic_multiplier)
-        .ok_or_else(|| "measure_atom_transport: diagnostic grid size overflow".to_string())?;
+        .ok_or_else(|| "measure_atom_transport_between: diagnostic grid size overflow".to_string())?;
 
     // Evaluate the standard full-width harmonic basis on the diagnostic SOURCE
     // grid.  These samples do not serve as target candidates.
@@ -272,7 +246,7 @@ pub fn measure_atom_transport_between(
     });
     if basis.width() != m {
         return Err(format!(
-            "measure_atom_transport: periodic basis width {} != physical decoder width {m}",
+            "measure_atom_transport_between: periodic basis width {} != physical decoder width {m}",
             basis.width()
         ));
     }
@@ -301,11 +275,11 @@ pub fn measure_atom_transport_between(
             let linear = linear_all.row(g);
             let projection = target_extrema
                 .minimize_squared_distance(linear.as_slice().ok_or_else(|| {
-                    "measure_atom_transport: target linear coefficients are not contiguous"
+                    "measure_atom_transport_between: target linear coefficients are not contiguous"
                         .to_string()
                 })?)
                 .map_err(|error| {
-                    format!("measure_atom_transport: source sample {g} target projection: {error}")
+                    format!("measure_atom_transport_between: source sample {g} target projection: {error}")
                 })?;
             Ok(projection.coordinate)
         })
@@ -368,7 +342,7 @@ pub(crate) fn honest_layer_decoder(
         CrosscoderLayer::Block(l) => {
             if l >= layout.num_blocks() {
                 return Err(format!(
-                    "measure_atom_transport: block index ℓ={l} out of range (L−1 = {})",
+                    "measure_atom_transport_between: block index ℓ={l} out of range (L−1 = {})",
                     layout.num_blocks()
                 ));
             }
