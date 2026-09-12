@@ -8175,6 +8175,11 @@ where
                 ctx.staged_pilot_active = false;
                 true
             })
+            // The runner asks this before installing the pilot's terminal
+            // state, which the transition above then discards.
+            .with_sampled_pilot(|ctx: &&mut NBlockExactJointState<'_, Mode>| {
+                ctx.staged_pilot_active
+            })
             // Declare the terminal evaluation order, which is what makes this
             // objective OWN its terminal coefficient mode.
             //

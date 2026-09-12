@@ -359,6 +359,14 @@ pub trait OuterObjective {
         false
     }
 
+    /// Whether the objective still evaluates on the sampled measure of an
+    /// approximate derivative pilot, the state [`Self::begin_exact_polish`]
+    /// leaves. An objective answering `true` promises that nothing installed
+    /// on that measure outlives the transition.
+    fn sampled_pilot_active(&self) -> bool {
+        false
+    }
+
     /// Seed the inner-solver iterate before the first eval, e.g. when the
     /// outer-iterate cache restored a `(ρ, β)` pair from a prior run, or
     /// when a typed reactive continuation path forwards
@@ -560,6 +568,18 @@ pub trait OuterObjective {
             "[OUTER] finalize: re-installing best rho into the objective (solver {:?})",
             plan.solver
         );
+        if self.sampled_pilot_active() {
+            // `begin_exact_polish` discards whatever is installed on the pilot
+            // measure, and the exact stage installs its own state from this
+            // checkpoint. Installing here spent an order-four evaluation nobody
+            // reads: 428.7 s at n = 320 000 in large_scale run 34666040783
+            // (#2896), recomputed at the same theta by the certificate.
+            log::info!(
+                "[OUTER] finalize: skipping terminal installation on the sampled pilot \
+                 measure; the exact stage re-installs from this checkpoint"
+            );
+            return Ok(());
+        }
         let order = self.terminal_eval_order().or(match plan.solver {
             Solver::Efs | Solver::HybridEfs => None,
             Solver::Bfgs => Some(OuterEvalOrder::ValueAndGradient),
@@ -1084,6 +1104,10 @@ impl<'a> OuterObjective for CheckpointingObjective<'a> {
     fn begin_exact_polish(&mut self) -> bool {
         self.inner.begin_exact_polish()
     }
+
+    fn sampled_pilot_active(&self) -> bool {
+        self.inner.sampled_pilot_active()
+    }
 }
 
 /// Closure-based adapter for [`OuterObjective`].
@@ -1120,6 +1144,9 @@ pub struct ClosureObjective<
     /// Optional single-shot transition from an approximate derivative pilot to
     /// the exact objective measure.
     pub(crate) exact_polish_fn: Option<Box<dyn FnMut(&mut S) -> bool>>,
+    /// Optional query: whether the objective still evaluates on the sampled
+    /// pilot measure `exact_polish_fn` leaves.
+    pub(crate) sampled_pilot_fn: Option<Box<dyn Fn(&S) -> bool>>,
     /// Optional analytic λ→∞ rail-face limit hook (#2348 Inc 5). Installed by
     /// objectives whose criterion has an exact closed-form limit at an
     /// infinite-smoothing face; `None` means the outer certificate falls back
@@ -1397,6 +1424,12 @@ where
             .as_mut()
             .is_some_and(|transition| transition(&mut self.state))
     }
+
+    fn sampled_pilot_active(&self) -> bool {
+        self.sampled_pilot_fn
+            .as_ref()
+            .is_some_and(|active| active(&self.state))
+    }
 }
 
 impl<S, Fc, Fe, Fr, Fefs, Feo, Fsp, Fseed> ClosureObjective<S, Fc, Fe, Fr, Fefs, Feo, Fsp, Fseed> {
@@ -1405,6 +1438,16 @@ impl<S, Fc, Fe, Fr, Fefs, Feo, Fsp, Fseed> ClosureObjective<S, Fc, Fe, Fr, Fefs,
         Fpolish: FnMut(&mut S) -> bool + 'static,
     {
         self.exact_polish_fn = Some(Box::new(transition));
+        self
+    }
+
+    /// Report whether the objective still evaluates on its sampled pilot
+    /// measure, so the runner skips terminal installation there.
+    pub fn with_sampled_pilot<Fpilot>(mut self, active: Fpilot) -> Self
+    where
+        Fpilot: Fn(&S) -> bool + 'static,
+    {
+        self.sampled_pilot_fn = Some(Box::new(active));
         self
     }
 
@@ -1505,6 +1548,7 @@ where
             efs_fn: self.efs_fn,
             fixed_point_certificate_fn: self.fixed_point_certificate_fn,
             exact_polish_fn: self.exact_polish_fn,
+            sampled_pilot_fn: self.sampled_pilot_fn,
             rail_face_limit_fn: self.rail_face_limit_fn,
             soft_rho_guard_gradient_fn: self.soft_rho_guard_gradient_fn,
             criterion_invariance_fn: self.criterion_invariance_fn,
@@ -1962,6 +2006,10 @@ impl<'a> OuterObjective for CanonicalizedObjective<'a> {
 
     fn begin_exact_polish(&mut self) -> bool {
         self.inner.begin_exact_polish()
+    }
+
+    fn sampled_pilot_active(&self) -> bool {
+        self.inner.sampled_pilot_active()
     }
 
     fn seed_inner_state(&mut self, beta: &Array1<f64>) -> Result<SeedOutcome, EstimationError> {
