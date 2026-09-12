@@ -71,7 +71,9 @@ fn add_spde_manifold_seeds(
         let l0 = vals[0].exp();
         let l1 = vals[1].exp();
         let l2 = vals[2].exp();
-        if l0.is_finite() && l1.is_finite() && l2.is_finite() && l0 > 1e-12 && l2 > 1e-12 {
+        // `r` divides by `l0·l2`, so the inversion needs both strictly positive;
+        // an `exp` that underflowed to zero is the only way either can fail.
+        if l0.is_finite() && l1.is_finite() && l2.is_finite() && l0 > 0.0 && l2 > 0.0 {
             let r = (l1 * l1) / (l0 * l2);
             if r > 2.0 {
                 let nu = r / (r - 2.0);
@@ -79,8 +81,13 @@ fn add_spde_manifold_seeds(
                 if nu.is_finite() && nu > 1.0 && kappa2.is_finite() && kappa2 > 0.0 {
                     let log_kappa = 0.5 * kappa2.ln();
                     let c2 = 0.5 * nu * (nu - 1.0);
-                    if c2.is_finite() && c2 > 0.0 {
-                        let log_tau = (l2 / (c2 * kappa2.powf(nu - 2.0))).max(1e-12).ln();
+                    // A `tau` that under- or overflows has no logarithm to seed
+                    // from, so the data-informed anchor is skipped rather than
+                    // pinned at a floored `ln(1e-12)` nobody chose (#2469).
+                    if c2.is_finite()
+                        && c2 > 0.0
+                        && let Some(log_tau) = safe_ln_pos(l2 / (c2 * kappa2.powf(nu - 2.0)))
+                    {
                         let local_nu = [nu, (nu - 0.3).max(1.05), nu + 0.3];
                         let local_tau = [log_tau, log_tau - 1.0, log_tau + 1.0];
                         let local_kappa = [log_kappa, log_kappa - 0.5, log_kappa + 0.5];
