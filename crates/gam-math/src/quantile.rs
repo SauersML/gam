@@ -1,7 +1,7 @@
 /// Linear-interpolation quantile matching numpy.quantile default (method='linear').
 pub fn quantile_from_sorted(sorted: &[f64], q: f64) -> f64 {
     let n = sorted.len();
-    if n == 0 {
+    if n == 0 || q.is_nan() {
         return f64::NAN;
     }
     if n == 1 {
@@ -11,7 +11,23 @@ pub fn quantile_from_sorted(sorted: &[f64], q: f64) -> f64 {
     let lo = pos.floor() as usize;
     let hi = (lo + 1).min(n - 1);
     let frac = pos - lo as f64;
-    sorted[lo] * (1.0 - frac) + sorted[hi] * frac
+    let lower = sorted[lo];
+    let upper = sorted[hi];
+    if frac == 0.0 || lower == upper {
+        return lower;
+    }
+    if lower.is_finite() && upper.is_finite() && lower.is_sign_positive() == upper.is_sign_positive() {
+        // Same-sign subtraction cannot overflow, and interpolation in the
+        // difference preserves subnormal observations without rounding both
+        // weighted endpoints separately to zero.
+        if frac <= 0.5 {
+            (upper - lower).mul_add(frac, lower)
+        } else {
+            (lower - upper).mul_add(1.0 - frac, upper)
+        }
+    } else {
+        lower * (1.0 - frac) + upper * frac
+    }
 }
 
 /// Exact 1-based order statistic from an already sorted slice.
@@ -40,6 +56,32 @@ pub fn order_statistic(values: &[f64], rank: usize) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn quantile_preserves_observed_endpoints_with_infinite_neighbors() {
+        let values = [f64::NEG_INFINITY, 2.0, f64::INFINITY];
+        assert_eq!(quantile_from_sorted(&values, 0.0), f64::NEG_INFINITY);
+        assert_eq!(quantile_from_sorted(&values, 0.5), 2.0);
+        assert_eq!(quantile_from_sorted(&values, 1.0), f64::INFINITY);
+        for value in [f64::NEG_INFINITY, f64::INFINITY, f64::from_bits(1)] {
+            assert_eq!(quantile_from_sorted(&[value, value], 0.5), value);
+        }
+    }
+
+    #[test]
+    fn quantile_interpolation_preserves_extreme_finite_values() {
+        let unit = f64::from_bits(1);
+        assert_eq!(quantile_from_sorted(&[unit, 2.0 * unit], 0.5), 2.0 * unit);
+        assert_eq!(quantile_from_sorted(&[-2.0 * unit, -unit], 0.5), -2.0 * unit);
+        assert_eq!(quantile_from_sorted(&[-f64::MAX, f64::MAX], 0.5), 0.0);
+        assert_eq!(quantile_from_sorted(&[f64::MAX, f64::MAX], 0.3), f64::MAX);
+    }
+
+    #[test]
+    fn quantile_nan_probability_is_invalid_even_for_a_single_observation() {
+        assert!(quantile_from_sorted(&[7.0], f64::NAN).is_nan());
+        assert!(quantile_from_sorted(&[7.0, 8.0], f64::NAN).is_nan());
+    }
 
     // ── quantile_from_sorted ───────────────────────────────────────────────
 
