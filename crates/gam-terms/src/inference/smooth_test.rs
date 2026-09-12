@@ -707,11 +707,16 @@ mod tests {
         let cov = array![[1.0, 0.0], [0.0, 1e-12]];
         let (q, used) = truncated_quadratic(&beta, &cov, 2).expect("wald quadratic");
         assert_eq!(used, 2, "the 1e-12 covariance mode is resolved");
-        // (1e-6)² / 1e-12 = 1 up to the rounding of the two literals, the square
-        // and the division.
+        // The eigensolve returns each eigenvalue within its backward-error band
+        // `n·ε·max|λ|`, so the small mode is known only to `band / 1e-12` relative
+        // and `(1e-6)² / λ̂` carries that error on top of rounding the two literals,
+        // the square and the division. Dropping the mode would give q = 0 instead.
+        let small_mode = cov[[1, 1]];
+        let band = cov.nrows() as f64 * f64::EPSILON * cov[[0, 0]];
         assert!(
-            (q - 1.0).abs() <= gam_linalg::roundoff::accumulation_growth(5),
-            "q={q}"
+            (q - 1.0).abs()
+                <= band / (small_mode - band) + gam_linalg::roundoff::accumulation_growth(5),
+            "q={q} band={band:e}"
         );
     }
 }
