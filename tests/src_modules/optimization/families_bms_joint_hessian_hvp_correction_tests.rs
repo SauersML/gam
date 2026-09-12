@@ -1590,8 +1590,8 @@ fn auto_outer_subsample_two_phase_converges_to_full_data_optimum() {
     // fall through to Phase 2 (full data). We verify both bookkeeping
     // properties without needing to actually drive a fit.
     //
-    // n = 35_000 sits above `AutoOuterSubsampleOptions::default()
-    // .min_n_for_auto = 30_000`, so `auto_outer_score_subsample`
+    // n = 35_000 exceeds the K the default noise target picks (`min_k =
+    // 10_000`), so `auto_outer_score_subsample`
     // would actually return `Some(mask)` if invoked — i.e. the
     // Phase-1 branch reaches the mask-installing arm and the
     // log::info! lines fire. Specs/derivative_blocks are empty so

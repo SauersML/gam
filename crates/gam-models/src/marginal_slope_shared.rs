@@ -825,13 +825,11 @@ const fn splitmix64(state: &mut u64) -> u64 {
 /// inhomogeneity).
 #[derive(Clone, Debug)]
 pub struct AutoOuterSubsampleOptions {
-    /// Below this `n`, the auto-subsampler always returns `None` (use
-    /// full data). Default 30 000.
-    pub min_n_for_auto: usize,
     /// Floor on `K`, so the relative gradient noise stays bounded
     /// even when the target fraction would round to a smaller `K`.
     /// `K = max(min_k, round(n · target_fraction))`. Default 10 000
-    /// gives `σ/T ≤ 1 %` for cv_within ≤ 1 and any `n ≥ min_n_for_auto`.
+    /// gives `σ/T ≤ 1 %` for cv_within ≤ 1 whenever this noise target, not
+    /// the work budget, sets `K`.
     pub min_k: usize,
     /// Target ratio `K / n` once `n ≫ min_k`. Default 0.10.
     pub target_fraction: f64,
@@ -904,7 +902,6 @@ impl AutoOuterCapReason {
 impl Default for AutoOuterSubsampleOptions {
     fn default() -> Self {
         Self {
-            min_n_for_auto: 30_000,
             min_k: 10_000,
             target_fraction: 0.10,
             seed: 0xA075_8A8B_1ED5_5B5C,
@@ -927,7 +924,8 @@ pub struct AutoOuterKChoice {
 
 impl AutoOuterSubsampleOptions {
     /// Compute the K that this configuration would pick for a given n.
-    /// Returns `None` if `n < min_n_for_auto` (caller should not subsample).
+    /// Returns `None` when the combined noise, work and floor rule would keep
+    /// every row (caller should not subsample).
     pub fn target_k(&self, n: usize) -> Option<usize> {
         self.target_k_detailed(n).map(|choice| choice.k)
     }
@@ -937,9 +935,6 @@ impl AutoOuterSubsampleOptions {
     /// [`maybe_install_auto_outer_subsample`] to surface a `cap_reason`
     /// in the auto-subsample log line.
     pub fn target_k_detailed(&self, n: usize) -> Option<AutoOuterKChoice> {
-        if n < self.min_n_for_auto {
-            return None;
-        }
         let k_noise_raw = ((n as f64) * self.target_fraction).round() as usize;
         let k_noise = k_noise_raw.max(self.min_k);
         // Work-budget cap. `outer_work_per_k_unit == 1` is the
@@ -1046,9 +1041,6 @@ pub fn maybe_install_auto_outer_subsample(
     phase1_budget: usize,
     family_label: &'static str,
     outer_work_per_k_unit: u64,
-    min_n_for_auto: usize,
-    min_k: usize,
-    min_k_floor: usize,
 ) -> Option<crate::custom_family::BlockwiseFitOptions> {
     if options.outer_score_subsample.is_some() || !options.auto_outer_subsample {
         return None;
@@ -1057,10 +1049,11 @@ pub fn maybe_install_auto_outer_subsample(
     // advancing the pilot counter.  The exact-polish lifecycle treats a zero
     // counter as proof that no approximate derivative measure ran; counting a
     // small-n no-op here would otherwise force a redundant second optimization.
+    // Only the family's measured per-K work cost is family-specific. The noise
+    // target, the floor and the no-benefit rule (`K ≥ n` keeps every row) are
+    // the shared defaults, so no caller can switch the row measure or its
+    // budgets at a row-count window (#2897).
     let auto_options = AutoOuterSubsampleOptions {
-        min_n_for_auto,
-        min_k,
-        min_k_floor,
         outer_work_per_k_unit: outer_work_per_k_unit.max(1),
         ..AutoOuterSubsampleOptions::default()
     };
@@ -1994,7 +1987,7 @@ mod tests {
         let opts = AutoOuterSubsampleOptions::default();
         assert!(
             auto_outer_score_subsample(&z, None, &opts).is_none(),
-            "n={n} below default min_n_for_auto=30000 should not subsample"
+            "n={n}: the noise target K = min_k keeps every row, so nothing is subsampled"
         );
     }
 
@@ -2044,9 +2037,6 @@ mod tests {
                 phase_budget,
                 "test-small",
                 1,
-                30_000,
-                10_000,
-                1_000,
             )
             .is_none()
         );
@@ -2072,9 +2062,6 @@ mod tests {
                 phase_budget,
                 "test-large",
                 1,
-                30_000,
-                10_000,
-                1_000,
             )
             .is_some()
         );
@@ -2110,9 +2097,6 @@ mod tests {
                 phase_budget,
                 "test-large",
                 1,
-                30_000,
-                10_000,
-                1_000,
             )
             .is_none(),
             "the first exact-polish evaluation at the pilot checkpoint must use full data",
