@@ -1102,7 +1102,7 @@
     "evidence": "At d1b00c6b2, git grep -nw over crates, src, tests, examples, bench and benches found only each item's own definition, doc comments, or its own error label; no caller and no named re-export in the facade or gam-pyffi. The wrapped implementations remain. MSI verification (ban scanner, workspace --all-targets check, cargo doc -p gam-predict) runs on the landed sha."
   },
   {
-    "base": "d33caf143c4c3a61d1ab0d3776a595286a87250d",
+    "base": "00735c57ef14174aa03fa006c28f1232052dbb1b",
     "items": [
       "crates/gam-model-kernels/src/cubic_cell_kernel.rs:fn:base_moments_match_direct",
       "crates/gam-model-kernels/src/cubic_cell_kernel.rs:fn:cell_first_derivative_required_max_degree",
