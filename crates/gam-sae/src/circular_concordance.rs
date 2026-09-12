@@ -99,8 +99,8 @@ pub fn circular_concordance(
     let mut sin = vec![vec![0.0; n_rows]; n_replicates];
     for replicate in 0..n_replicates {
         for row in 0..n_rows {
-            let phase =
-                std::f64::consts::TAU * coordinates[[replicate, row]].rem_euclid(period) / period;
+            let phase = std::f64::consts::TAU
+                * (coordinates[[replicate, row]].rem_euclid(period) / period);
             let (sin_phase, cos_phase) = phase.sin_cos();
             sin[replicate][row] = sin_phase;
             cos[replicate][row] = cos_phase;
@@ -186,6 +186,21 @@ pub fn circular_concordance(
 mod tests {
     use super::*;
     use ndarray::Array2;
+
+    #[test]
+    fn circular_concordance_is_invariant_to_extreme_period_units() {
+        for period in [1.0e-320_f64, 1.0, 1.0e308] {
+            let coordinates = Array2::from_shape_fn((2, 4), |(_, row)| {
+                period * (row as f64 / 4.0)
+            });
+            let report = circular_concordance(coordinates.view(), period).expect("report");
+            assert!(report.coverage.iter().all(|entry| entry.well_posed));
+            for entry in &report.coverage {
+                assert!((entry.isotropic_coverage - 1.0).abs() < 1.0e-14);
+            }
+            assert!((report.mean_aligned_score.unwrap() - 1.0).abs() < 1.0e-14);
+        }
+    }
 
     #[test]
     fn quotient_recovers_rotation_and_reflection_without_accepting_collapse() {
