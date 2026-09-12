@@ -3091,5 +3091,19 @@
     ],
     "reason": "user directive: delete all useless slop (only used by tests / unused)",
     "evidence": "The only consumer of these policy.rs items was gam-sae's device-resident certified encode (sae_encode_resident.rs measure_device_encode_throughput), removed by fb2a87bc8. At origin/main 3bb12aea8, git grep -nw over crates, src, tests, examples, bench and benches finds EncodeDeploymentDecision, EncodeDecisionBlocked, from_device_measurement and GPU_THROUGHPUT_TARGET_ROWS_PER_SEC only inside policy.rs's own definitions and docs, and no test calls them."
+  },
+  {
+    "base": "97704ba512397a33901c3827eaf9fd03406597f8",
+    "items": [
+      "crates/gam-identifiability/src/families/compiler.rs:fn:compiled_block_ranges",
+      "crates/gam-identifiability/src/families/compiler.rs:fn:raw_block_ranges",
+      "crates/gam-identifiability/src/families/compiler.rs:fn:raw_from_compiled",
+      "crates/gam-problem/src/gauge.rs:fn:compiled_block_ranges",
+      "crates/gam-problem/src/gauge.rs:fn:raw_block_ranges",
+      "crates/gam-problem/src/gauge.rs:fn:raw_from_compiled",
+      "crates/gam-problem/src/gauge.rs:trait:CompiledBlockMap"
+    ],
+    "reason": "User directive 2026-09-11: delete code nothing uses. gam-problem gauge::CompiledBlockMap existed so Gauge::from_compiled_map could read a compiled identifiability map; that method was deleted in 47c231901, none of the trait's methods is called anywhere, and the trait, its gam-identifiability impl and gam-solve's re-export of the name are removed.",
+    "evidence": "Word-matched single-name git grep at the base: CompiledBlockMap appears only at the trait definition, the gam-identifiability impl, the gam-solve re-export and prose. The method-call patterns .raw_from_compiled(, .raw_block_ranges( and .compiled_block_ranges( match nothing; production reads the CompiledMap fields directly. Pre-push on MSI over the exact candidate tree: workspace --all-targets check, cargo check -p gam-pyffi, a leftover-name grep, and the three gates."
   }
 ]

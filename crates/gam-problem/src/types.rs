@@ -151,8 +151,7 @@ impl From<RidgePassport> for RidgePassportWire {
 //
 // `RidgePassport` above already encodes the inclusion-flag matrix for the
 // PIRLS Laplace ridge specifically; this ledger is the broader sibling for
-// every declared solver, approximation, and model ridge, so a downstream consumer can ask
-// `ledger.quadratic_delta()` rather than rediscovering the policy. The three
+// every declared solver, approximation, and model ridge. The three
 // inclusion bits were lifted into the `StabilizationKind` discriminant so the
 // (kind, inclusion-flags) invariant is enforced statically — heterogeneous
 // combinations like "ExplicitPrior with quadratic excluded" no longer typecheck.

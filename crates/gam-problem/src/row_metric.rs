@@ -203,7 +203,7 @@ pub enum MetricProvenance {
     /// positions the residual stream at `n` reaches. It is provenance-generic:
     /// it whitens nothing (`Self::whitens_likelihood` is `false`, like
     /// [`MetricProvenance::OutputFisher`]) and drives the gauge / lens /
-    /// enrichment unchanged (`Self::is_output_fisher_like`). The lens/gauge
+    /// enrichment unchanged. The lens/gauge
     /// machinery consumes it identically; only the *scientific* reading
     /// changes — dormant-feature detection becomes forward-looking (a feature
     /// driving far-future tokens now registers behavioral coupling that the
@@ -216,8 +216,8 @@ pub enum MetricProvenance {
     /// `vᵢ = J_nᵀ F_n^{1/2} uᵢ`, and `probes = s` the number of random probes
     /// (the factor rank).
     ///
-    /// This is the *only* `RowMetric::is_output_fisher_like`-adjacent
-    /// provenance for which [`RowMetric::whitens_likelihood`] is `true`: the
+    /// This is the *only* output-Fisher provenance for which
+    /// [`RowMetric::whitens_likelihood`] is `true`: the
     /// data-fit sums `½ eᵀ G_n e = ½ ‖U_nᵀ e‖²` (nats) instead of `½‖e‖²`. It is
     /// distinct from [`Self::OutputFisher`] precisely because the choice to let
     /// the metric enter the *loss* (rather than only the gauge) is deliberate and
@@ -365,8 +365,7 @@ impl RowMetric {
     /// factor layout is identical to [`Self::output_fisher`]; only the
     /// provenance tag (and hence the scientific reading) differs. Whitens
     /// nothing, drives the gauge / lens / enrichment exactly as the
-    /// same-position metric does — the consuming machinery is provenance-generic
-    /// (see `Self::is_output_fisher_like`).
+    /// same-position metric does — the consuming machinery is provenance-generic.
     pub fn output_fisher_downstream(
         u: Arc<Array2<f64>>,
         p: usize,

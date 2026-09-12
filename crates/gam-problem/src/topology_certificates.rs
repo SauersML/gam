@@ -203,7 +203,7 @@ pub struct LedgerEntry {
 /// replaces the scattered per-feature payload keys.
 ///
 /// The ledger never fabricates a verdict: a claim that was not evaluated simply
-/// is absent (queried as [`Verdict::Unavailable`] via `Self::verdict_of`).
+/// is absent.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct CertificateLedger {
     entries: BTreeMap<&'static str, LedgerEntry>,
