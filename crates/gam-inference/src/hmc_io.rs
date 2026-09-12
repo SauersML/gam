@@ -3414,7 +3414,22 @@ fn draw_logit_pg1_omega(
         seed: PgSeed(seed),
     })?;
     out.assign(&draws);
-    out.mapv_inplace(|v| v.max(1.0e-12));
+    // A Pólya-Gamma draw lies in (0, ∞) by its law, and ω enters the Gibbs
+    // precision only as a row weight, so ω = 0 is an admissible zero-precision
+    // row. A non-finite or negative draw is a sampler defect, refused here.
+    if let Some((row, &value)) = out
+        .iter()
+        .enumerate()
+        .find(|(_, v)| !(v.is_finite() && **v >= 0.0))
+    {
+        return Err(HmcError::SamplingFailed {
+            reason: format!(
+                "draw_logit_pg1_omega: Pólya-Gamma draw {value} at row {row} is not a finite \
+                 non-negative weight"
+            ),
+        }
+        .into());
+    }
     Ok(())
 }
 
