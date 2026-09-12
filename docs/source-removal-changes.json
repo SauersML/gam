@@ -2092,5 +2092,21 @@
     ],
     "reason": "user directive: delete all useless slop (only used by tests / unused)",
     "evidence": "At 728caa9b1, git grep -nw over crates, src, tests, examples, bench and benches found no caller of error_stats in amortized_encoder.rs (the all-None wrapper over error_stats_wrapped, which stays and now carries the doc), of canonical_chart_coordinates or canonical_chart_raw_coordinates in inference/steering.rs (CanonicalChart::read, invert and advance stay because canonical_chart_steps uses them), or of any item of gpu_kernels/resident_arrow.rs: ResidentRowJetHandle had no constructor anywhere, and ArrowCurvature, ArrowScore, ARROW_REDUCTION_LEAF_ROWS and RESIDENT_ARROW_KERNEL_SOURCE were named only inside that file, whose only other reference was its mod declaration in gpu_kernels/mod.rs, now removed; the listed fmt, deterministic, path and residual_scale are that file's own impl methods. The module had no tests and no test called any item. A zero-use sweep of private items over tip..probe found nothing newly dead, and the test census shows no test loss. MSI verification (ban scanner, workspace --all-targets check, cargo doc -p gam-sae, guard and census) runs on the landed sha."
+  },
+  {
+    "base": "30b8deff8dd92356e8260d4bb829b2630fcb3ecb",
+    "items": [
+      "crates/gam-event-history/src/joint.rs:fn:activity",
+      "crates/gam-models/src/bms/mod.rs:fn:triple_penalty_default",
+      "crates/gam-models/src/gamlss/binomial/wiggle.rs:fn:initializewiggle_knots_from_q",
+      "crates/gam-models/src/vector_response.rs:enum:VectorNoise",
+      "crates/gam-models/src/vector_response.rs:fn:m",
+      "crates/gam-models/src/vector_response.rs:fn:n",
+      "crates/gam-models/src/vector_response.rs:fn:new",
+      "crates/gam-models/src/vector_response.rs:fn:with_row_weights",
+      "crates/gam-models/src/vector_response.rs:struct:VectorResponseTarget"
+    ],
+    "reason": "user directive: delete all useless slop",
+    "evidence": "At 7bc19ed40, git grep -nw over crates, src, tests, examples, bench and benches found:\n- VectorNoise and VectorResponseTarget (with new, with_row_weights, n and m) are named only in vector_response.rs and in the gam-models re-export removed here.\n- triple_penalty_default is named only by tests/test_support/misc/margslope_flex_equivalence.rs, which now calls Default.\n- initializewiggle_knots_from_q is named only by buildwiggle_block_input, which moves into wiggle.rs's #[cfg(test)] mod test_support and calls gam_terms::basis::initializewiggle_knots_from_seed directly.\n- The private JointLikelihood::activity has one caller, log_relative_activity, which moves into joint.rs's test_support with the call inlined.\nThe warm workspace --all-targets check passed on the exact patched tree before this push: lane sw9, job 432905, tree 2e3bbda9d, including the build.rs ban scanner."
   }
 ]

@@ -283,19 +283,6 @@ pub enum SurvivalLikelihoodMode {
     LatentBinary,
 }
 
-/// Every survival likelihood mode, for the cross-mode contracts that must hold
-/// for all of them (e.g. the one time-basis anchor rule). Kept exhaustive by
-/// `survival_likelihood_modes_is_exhaustive`, which dispatches on the enum so a
-/// new variant fails to compile until it is listed here.
-pub const SURVIVAL_LIKELIHOOD_MODES: [SurvivalLikelihoodMode; 6] = [
-    SurvivalLikelihoodMode::Transformation,
-    SurvivalLikelihoodMode::Weibull,
-    SurvivalLikelihoodMode::LocationScale,
-    SurvivalLikelihoodMode::MarginalSlope,
-    SurvivalLikelihoodMode::Latent,
-    SurvivalLikelihoodMode::LatentBinary,
-];
-
 pub struct SurvivalTimeWiggleBuild {
     pub penalties: Vec<Array2<f64>>,
     pub nullspace_dims: Vec<usize>,
@@ -4484,7 +4471,20 @@ fn finish_time_varying_survival_covariate_template(
 
 #[cfg(test)]
 mod tests {
-    use super::{SURVIVAL_LIKELIHOOD_MODES, SURVIVAL_TIME_FLOOR, SurvivalBaselineConfig, SurvivalBaselineTarget, SurvivalLikelihoodMode, SurvivalMarginalSlopeFrozenOffsetChart, SurvivalTimeBasisConfig, baseline_chain_rule_gradient, baseline_offset_theta_partials, build_survival_marginal_slope_baseline_geometry, build_survival_marginal_slope_baseline_offsets, build_survival_time_basis, build_survival_timewiggle_from_baseline, evaluate_survival_baseline, evaluate_survival_marginal_slope_baseline, fitted_weibull_baseline_from_linear_time_beta, gompertz_cumulative_shape_derivative, gompertz_cumulative_shape_second_derivative, gompertz_hazard_components, marginal_slope_baseline_chain_rule_gradient, marginal_slope_baseline_offset_theta_partials, resolve_survival_time_anchor_for_mode, survival_baseline_config_from_theta, survival_baseline_theta_from_config, survival_data_is_left_truncated, survival_earliest_entry_time_anchor, survival_robust_interior_time_anchor, validate_survival_time_anchor_override};
+    /// Every survival likelihood mode, for the cross-mode contracts that must hold
+    /// for all of them (e.g. the one time-basis anchor rule). Kept exhaustive by
+    /// `survival_likelihood_modes_is_exhaustive`, which dispatches on the enum so a
+    /// new variant fails to compile until it is listed here.
+    const SURVIVAL_LIKELIHOOD_MODES: [SurvivalLikelihoodMode; 6] = [
+        SurvivalLikelihoodMode::Transformation,
+        SurvivalLikelihoodMode::Weibull,
+        SurvivalLikelihoodMode::LocationScale,
+        SurvivalLikelihoodMode::MarginalSlope,
+        SurvivalLikelihoodMode::Latent,
+        SurvivalLikelihoodMode::LatentBinary,
+    ];
+
+    use super::{SURVIVAL_TIME_FLOOR,SurvivalBaselineConfig, SurvivalBaselineTarget, SurvivalLikelihoodMode, SurvivalMarginalSlopeFrozenOffsetChart, SurvivalTimeBasisConfig, baseline_chain_rule_gradient, baseline_offset_theta_partials, build_survival_marginal_slope_baseline_geometry, build_survival_marginal_slope_baseline_offsets, build_survival_time_basis, build_survival_timewiggle_from_baseline, evaluate_survival_baseline, evaluate_survival_marginal_slope_baseline, fitted_weibull_baseline_from_linear_time_beta, gompertz_cumulative_shape_derivative, gompertz_cumulative_shape_second_derivative, gompertz_hazard_components, marginal_slope_baseline_chain_rule_gradient, marginal_slope_baseline_offset_theta_partials, resolve_survival_time_anchor_for_mode, survival_baseline_config_from_theta, survival_baseline_theta_from_config, survival_data_is_left_truncated, survival_earliest_entry_time_anchor, survival_robust_interior_time_anchor, validate_survival_time_anchor_override};
     use super::optimize_survival_baseline_config_with_gradient_only;
     use super::{
         center_survival_time_designs_at_anchor, evaluate_survival_time_basis_row,

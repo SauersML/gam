@@ -371,28 +371,6 @@ impl JointLikelihood {
         Ok(())
     }
 
-    /// Log of a positive sum of signature activities, with a positive
-    /// background. Computed entirely in the log domain, including weights.
-    pub fn log_relative_activity<S: JetField>(
-        &self,
-        theta: &[S],
-        mark: usize,
-        state: &[S],
-    ) -> Result<S, EventHistoryError> {
-        self.validate_parameters(theta)?;
-        if mark >= self.spec.marks.len()
-            || state.len() != self.spec.signatures
-            || state.iter().any(|x| !x.value().is_finite())
-        {
-            return Err(invalid("invalid mark or state for the signature decoder"));
-        }
-        Ok(self.activity(theta, mark, state))
-    }
-
-    fn activity<S: JetField>(&self, theta: &[S], mark: usize, state: &[S]) -> S {
-        decoder::PreparedDecoder::new(self, theta).activity(mark, state)
-    }
-
     fn mean<S: JetField>(
         &self,
         theta: &[S],
@@ -584,6 +562,31 @@ impl JointLikelihood {
             return Err(numerical("non-finite joint path log density"));
         }
         Ok(result)
+    }
+}
+
+#[cfg(test)]
+mod test_support {
+    use super::*;
+
+    impl JointLikelihood {
+        /// Log of a positive sum of signature activities, with a positive
+        /// background. Computed entirely in the log domain, including weights.
+        pub(crate) fn log_relative_activity<S: JetField>(
+            &self,
+            theta: &[S],
+            mark: usize,
+            state: &[S],
+        ) -> Result<S, EventHistoryError> {
+            self.validate_parameters(theta)?;
+            if mark >= self.spec.marks.len()
+                || state.len() != self.spec.signatures
+                || state.iter().any(|x| !x.value().is_finite())
+            {
+                return Err(invalid("invalid mark or state for the signature decoder"));
+            }
+            Ok(super::decoder::PreparedDecoder::new(self, theta).activity(mark, state))
+        }
     }
 }
 

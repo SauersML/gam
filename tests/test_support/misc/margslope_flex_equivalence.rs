@@ -166,7 +166,7 @@ pub fn build_large_scale_shape_problem(n: usize) -> LargeScaleShapeProblem {
             age_smooth(LARGE_SCALE_SHAPE_PC_DIM, "age_entry_std_slope"),
         ],
     };
-    let dev_cfg = DeviationBlockConfig::triple_penalty_default();
+    let dev_cfg = DeviationBlockConfig::default();
     LargeScaleShapeProblem {
         data,
         spec: BernoulliMarginalSlopeTermSpec {

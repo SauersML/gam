@@ -714,14 +714,6 @@ impl BinomialLocationScaleWiggleFamily {
         Ok((n, eta_t, eta_ls, etaw))
     }
 
-    pub fn initializewiggle_knots_from_q(
-        q_seed: ArrayView1<'_, f64>,
-        degree: usize,
-        num_internal_knots: usize,
-    ) -> Result<Array1<f64>, String> {
-        gam_terms::basis::initializewiggle_knots_from_seed(q_seed, degree, num_internal_knots)
-    }
-
     pub(crate) fn wiggle_basiswith_options(
         &self,
         q0: ArrayView1<'_, f64>,
@@ -2711,26 +2703,6 @@ impl BinomialLocationScaleWiggleFamily {
         Ok(out)
     }
 
-    /// Build a turnkey wiggle block from a q-seed vector and knot settings.
-    /// Returns both the block input and the generated knot vector.
-    pub fn buildwiggle_block_input(
-        q_seed: ArrayView1<'_, f64>,
-        degree: usize,
-        num_internal_knots: usize,
-        penalty_order: usize,
-        double_penalty: bool,
-    ) -> Result<(ParameterBlockInput, Array1<f64>), String> {
-        let knots = Self::initializewiggle_knots_from_q(q_seed, degree, num_internal_knots)?;
-        let block = crate::wiggle::buildwiggle_block_input_from_knots(
-            q_seed,
-            &knots,
-            degree,
-            penalty_order,
-            double_penalty,
-        )?;
-        Ok((block, knots))
-    }
-
     /// Lower the canonical runtime-width row program to the eight structured
     /// order-two coefficient channels consumed by dense and matrix-free paths.
     /// The order-2 row program of one batch: the core and the wiggle bases
@@ -3241,5 +3213,33 @@ impl BinomialLocationScaleWiggleFamily {
             ],
             self.y.len(),
         ))))
+    }
+}
+
+#[cfg(test)]
+mod test_support {
+    use super::*;
+
+    impl BinomialLocationScaleWiggleFamily {
+        /// Build a turnkey wiggle block from a q-seed vector and knot settings.
+        /// Returns both the block input and the generated knot vector.
+        pub(crate) fn buildwiggle_block_input(
+            q_seed: ArrayView1<'_, f64>,
+            degree: usize,
+            num_internal_knots: usize,
+            penalty_order: usize,
+            double_penalty: bool,
+        ) -> Result<(ParameterBlockInput, Array1<f64>), String> {
+            let knots =
+                gam_terms::basis::initializewiggle_knots_from_seed(q_seed, degree, num_internal_knots)?;
+            let block = crate::wiggle::buildwiggle_block_input_from_knots(
+                q_seed,
+                &knots,
+                degree,
+                penalty_order,
+                double_penalty,
+            )?;
+            Ok((block, knots))
+        }
     }
 }

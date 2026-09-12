@@ -21,64 +21,6 @@ use crate::model_types::EstimationError;
 use crate::multinomial_reml::{MultinomialLogitRowProgram, multinomial_logit_probabilities_into};
 use ndarray::{Array1, Array2, Array3, ArrayView2};
 
-/// Per-output noise model for a vector response.
-///
-/// `LowRank` stores the symmetric structured precision
-/// `W = diag(diag) + U Uᵀ`, with `factor` holding `U`. The vector likelihood
-/// consumes the owned arrays directly; PIRLS low-rank Gram assembly is handled
-/// by `gam_linalg::low_rank_weight::LowRankWeight` and
-/// `gam_solve::pirls`.
-#[derive(Clone, Debug)]
-pub enum VectorNoise {
-    /// Shared σ across all M outputs: Σ = σ² I_M.
-    Isotropic(f64),
-    /// Per-output σ_m: Σ = diag(σ_m²).
-    Diagonal(Array1<f64>),
-    /// Symmetric structured form `W = diag(diag) + factor · factorᵀ`.
-    LowRank {
-        diag: Array1<f64>,
-        factor: Array2<f64>,
-    },
-}
-
-/// Vector-valued response target.
-///
-/// `y` is `(N, M)`; `row_weights` (if present) is length `N` and scales the
-/// per-row contribution to the likelihood (e.g. observation weights from a
-/// re-sampling or inverse-probability scheme).
-#[derive(Clone, Debug)]
-pub struct VectorResponseTarget {
-    /// shape (N, M) — N rows × M output dimensions.
-    pub y: Array2<f64>,
-    /// per-output noise (or shared scalar).
-    pub noise: VectorNoise,
-    /// optional row weights (N,).
-    pub row_weights: Option<Array1<f64>>,
-}
-
-impl VectorResponseTarget {
-    pub fn new(y: Array2<f64>, noise: VectorNoise) -> Self {
-        Self {
-            y,
-            noise,
-            row_weights: None,
-        }
-    }
-
-    pub fn with_row_weights(mut self, w: Array1<f64>) -> Result<Self, EstimationError> {
-        validate_row_weights(&w, self.y.nrows())?;
-        self.row_weights = Some(w);
-        Ok(self)
-    }
-
-    pub fn n(&self) -> usize {
-        self.y.nrows()
-    }
-    pub fn m(&self) -> usize {
-        self.y.ncols()
-    }
-}
-
 /// Validate that every row of a multinomial target `y ∈ ℝ^{N×K}` is a point on
 /// the probability simplex: `y_{n,c} ≥ 0` for all entries and
 /// `Σ_c y_{n,c} = 1` for every row, up to the rounding band `γ_K·Σ_c y_{n,c}`
