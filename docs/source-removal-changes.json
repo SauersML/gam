@@ -3191,5 +3191,13 @@
     ],
     "reason": "user directive: delete all useless slop (only used by tests / unused)",
     "evidence": "At 8bd5765b0 the listed description_length.rs items had no production caller (gam-e0's measured inventory, re-confirmed with in-file greps and single-name git greps): they were named only by their definitions, docs and the listed tests, and bar_birth_threshold_nats was called only by bar_supports_birth. The 11 listed test functions exercised only them, and tiling_codes was only the tiling test's fixture. Two mixed tests keep their live assertions with the helper values inlined. MSI job 442340, exact candidate tree: cargo check --workspace --exclude gam-pyffi --all-targets --keep-going rc 0 with 0 error lines; cargo doc -p gam-sae 0 errors / 0 warnings; the remaining 19 description_length tests pass. These items are that job's guard output over 8bd5765b0..candidate."
+  },
+  {
+    "base": "45110a27c1ae0e44466c9999f69ee0d15c197740",
+    "items": [
+      "crates/gam-models/src/bms/cell_moment_assembly.rs:fn:exact_newton_observed_information_from_objective_hessian"
+    ],
+    "reason": "43fe7d9de removed the function's only callers, leaving an identity helper that nothing calls. Under deny(warnings) it stopped the gam-models lib build.",
+    "evidence": "rustc reports \"associated function `exact_newton_observed_information_from_objective_hessian` is never used\" at bms/cell_moment_assembly.rs:2670 (sw9 job 449193 at 47b5682d6, verify1_suite.449193.log). The sw9 rescan job 449231 at e04851dab lists it as unreferenced. The function body was `objective_hessian` returned unchanged, so no replacement is needed."
   }
 ]

@@ -2667,13 +2667,6 @@ impl BernoulliMarginalSlopeFamily {
     }
 
     #[inline]
-    pub(super) fn exact_newton_observed_information_from_objective_hessian(
-        objective_hessian: Array2<f64>,
-    ) -> Array2<f64> {
-        objective_hessian
-    }
-
-    #[inline]
     pub(super) fn score_block_index(&self) -> Option<usize> {
         self.score_warp.as_ref().map(|_| 2)
     }

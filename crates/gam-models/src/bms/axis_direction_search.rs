@@ -2,7 +2,6 @@ use super::exact_eval_cache::*;
 use super::family::*;
 use super::gradient_paths::*;
 use super::hessian_paths::*;
-use super::row_kernel::*;
 use super::*;
 use crate::gpu_kernels::row_hessian_ops;
 
