@@ -679,6 +679,64 @@ pub(super) fn assert_term_collection_designs_match(
     }
 }
 
+/// The design a collection-gauged term realizes at a moved ψ, spelled without
+/// the realizer. A frozen spec's rebuild at ψ is `X(ψ)·Q·T0 − C·R(ψ₀)`: it replays
+/// the row-space correction derived at the reference ψ₀, which is the
+/// non-orthogonal pair #2747 retired. `T0`, `Q` and `C` are ψ-independent and
+/// `R` is re-derived at every realization (#2747, #2760), so the realized block
+/// is `P_C·X(ψ)·Q·T0`. Projecting the rebuild off `C` removes the stale correction
+/// (`P_C·C = 0`) and leaves exactly that block.
+fn frozen_rebuild_in_collection_gauge(
+    rebuilt: &TermCollectionDesign,
+    collection: &TermCollectionDesign,
+    term_idx: usize,
+    label: &str,
+) -> TermCollectionDesign {
+    let gauge = collection.smooth.terms[term_idx]
+        .collection_gauge
+        .as_ref()
+        .unwrap_or_else(|| {
+            panic!("{label}: the collection decided no gauge for term {term_idx}, so this pin exercises nothing")
+        });
+    let range = orthonormal_column_range(&gauge.constraint_block);
+    let smooth_start = rebuilt.design.ncols() - rebuilt.smooth.total_smooth_cols();
+    let coeff_range = rebuilt.smooth.terms[term_idx].coeff_range.clone();
+    let columns = (smooth_start + coeff_range.start)..(smooth_start + coeff_range.end);
+    let mut dense = rebuilt.design.to_dense();
+    let block = dense.slice(s![.., columns.clone()]).to_owned();
+    let projected = &block - &range.dot(&range.t().dot(&block));
+    dense.slice_mut(s![.., columns]).assign(&projected);
+    let mut reference = rebuilt.clone();
+    reference.design = DesignMatrix::from(dense);
+    reference
+}
+
+/// Orthonormal basis of the column space of `c` by twice-iterated Gram-Schmidt.
+/// A column whose residual is within `n·ε` of its own norm is dependent.
+fn orthonormal_column_range(c: &Array2<f64>) -> Array2<f64> {
+    let n = c.nrows();
+    let mut basis: Vec<Array1<f64>> = Vec::with_capacity(c.ncols());
+    for column in c.columns() {
+        let original_norm = column.dot(&column).sqrt();
+        let mut v = column.to_owned();
+        for _ in 0..2 {
+            for q in &basis {
+                let coefficient = q.dot(&v);
+                v.scaled_add(-coefficient, q);
+            }
+        }
+        let norm = v.dot(&v).sqrt();
+        if norm > n as f64 * f64::EPSILON * original_norm {
+            basis.push(v / norm);
+        }
+    }
+    let mut range = Array2::<f64>::zeros((n, basis.len()));
+    for (j, q) in basis.iter().enumerate() {
+        range.column_mut(j).assign(q);
+    }
+    range
+}
+
 #[test]
 fn freeze_term_collection_handles_thin_plate_auto_promotion_to_duchon() {
     // Reproducer for the freezer falling into its catch-all "smooth
@@ -3676,19 +3734,21 @@ fn incremental_frozen_realizer_matches_unified_full_rebuild() {
 
     let base_design = build_term_collection_design(data.view(), &spec).unwrap_or_else(|e| panic!("{} failed: {:?}", "base design", e));
     let frozen = freeze_term_collection_from_design(&spec, &base_design).unwrap_or_else(|e| panic!("{} failed: {:?}", "freeze", e));
-    let frozen_design = build_term_collection_design(data.view(), &frozen).unwrap_or_else(|e| panic!("{} failed: {:?}", "frozen design", e));
     let spatial_terms = spatial_length_scale_term_indices(&frozen);
     assert_eq!(spatial_terms, vec![0]);
 
-    let smooth_start = frozen_design.design.ncols() - frozen_design.smooth.total_smooth_cols();
-    let fixed_before = frozen_design.design.clone();
-    let nonspatial_range = frozen_design.smooth.terms[1].coeff_range.clone();
+    // The joint spatial route builds its realizers from the frozen spec and the
+    // COLLECTION design, which carries the collection gauge the realizer places
+    // every rebuild into (#2747, #2760).
+    let smooth_start = base_design.design.ncols() - base_design.smooth.total_smooth_cols();
+    let fixed_before = base_design.design.clone();
+    let nonspatial_range = base_design.smooth.terms[1].coeff_range.clone();
     let full_nonspatial_range =
         (smooth_start + nonspatial_range.start)..(smooth_start + nonspatial_range.end);
     let mut realizer = FrozenTermCollectionIncrementalRealizer::new(
         data.view(),
         frozen.clone(),
-        frozen_design.clone(),
+        base_design.clone(),
     )
     .unwrap_or_else(|e| panic!("{} failed: {:?}", "incremental realizer", e));
 
@@ -3700,11 +3760,13 @@ fn incremental_frozen_realizer_matches_unified_full_rebuild() {
         .apply_log_kappa(&updated_log_kappa, &spatial_terms)
         .unwrap_or_else(|e| panic!("{} failed: {:?}", "incremental update", e));
     let rebuilt = build_term_collection_design(data.view(), &updated_spec).unwrap_or_else(|e| panic!("{} failed: {:?}", "rebuilt design", e));
+    let reference =
+        frozen_rebuild_in_collection_gauge(&rebuilt, &base_design, spatial_terms[0], "incremental realizer");
 
-    assert_term_collection_designs_match(realizer.design(), &rebuilt, "incremental realizer");
+    assert_term_collection_designs_match(realizer.design(), &reference, "incremental realizer");
 
-    let linear_range = frozen_design.linear_ranges[0].1.clone();
-    let random_range = frozen_design.random_effect_ranges[0].1.clone();
+    let linear_range = base_design.linear_ranges[0].1.clone();
+    let random_range = base_design.random_effect_ranges[0].1.clone();
     let fixed_before_dense = fixed_before.to_dense();
     let updated_full_dense = realizer.design().design.to_dense();
     let linear_diff = max_abs_diff_matrix(
@@ -3727,7 +3789,7 @@ fn incremental_frozen_realizer_matches_unified_full_rebuild() {
             .slice(s![.., full_nonspatial_range.clone()])
             .to_owned(),
     );
-    let spatial_range = frozen_design.smooth.terms[0].coeff_range.clone();
+    let spatial_range = base_design.smooth.terms[0].coeff_range.clone();
     let full_spatial_range =
         (smooth_start + spatial_range.start)..(smooth_start + spatial_range.end);
     let spatial_change = max_abs_diff_matrix(
@@ -3887,9 +3949,15 @@ fn two_block_exact_joint_design_cache_clears_memo_on_theta_change() {
         build_term_collection_design(data.view(), &mean_updated).unwrap_or_else(|e| panic!("{} failed: {:?}", "mean rebuilt", e));
     let noise_rebuilt =
         build_term_collection_design(data.view(), &noise_updated).unwrap_or_else(|e| panic!("{} failed: {:?}", "noise rebuilt", e));
+    // Each frozen rebuild replays its reference ψ's row-space correction; its
+    // projection off that collection's gauge is the block the cache re-derives.
+    let mean_reference =
+        frozen_rebuild_in_collection_gauge(&mean_rebuilt, &mean_design, mean_terms[0], "mean cache");
+    let noise_reference =
+        frozen_rebuild_in_collection_gauge(&noise_rebuilt, &noise_design, noise_terms[0], "noise cache");
     let cache_designs = cache.designs();
-    assert_term_collection_designs_match(cache_designs[0], &mean_rebuilt, "mean cache");
-    assert_term_collection_designs_match(cache_designs[1], &noise_rebuilt, "noise cache");
+    assert_term_collection_designs_match(cache_designs[0], &mean_reference, "mean cache");
+    assert_term_collection_designs_match(cache_designs[1], &noise_reference, "noise cache");
 }
 
 #[test]
@@ -3992,7 +4060,9 @@ fn single_block_exact_joint_design_cache_clears_memo_on_theta_change() {
         .apply_tospec(&frozen, &spatial_terms)
         .unwrap_or_else(|e| panic!("{} failed: {:?}", "updated spec", e));
     let rebuilt = build_term_collection_design(data.view(), &updated_spec).unwrap_or_else(|e| panic!("{} failed: {:?}", "rebuilt design", e));
-    assert_term_collection_designs_match(cache.design(), &rebuilt, "single-block cache");
+    let reference =
+        frozen_rebuild_in_collection_gauge(&rebuilt, &design, spatial_terms[0], "single-block cache");
+    assert_term_collection_designs_match(cache.design(), &reference, "single-block cache");
 }
 
 #[test]
