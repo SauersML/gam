@@ -324,6 +324,12 @@ fn fixed_legal_rho_envelope_value_is_stable_across_re_evaluation() {
     let scalar_contract = OuterObjective::reactive_domain_scalar_contract(&objective)
         .expect("reactive scalar contract construction must succeed")
         .expect("dense K=2 objective must advertise a reactive scalar entry");
+    // Placing the entry is a full-state transaction: `continuation_path.rs` opens it
+    // before installing the entry scalars, and the objective refuses an entry
+    // placement outside one. The direct evaluation opens the same transaction the
+    // runner does.
+    OuterObjective::begin_reactive_domain_waypoint(&mut objective)
+        .expect("the objective must open a reactive waypoint transaction");
     OuterObjective::install_reactive_domain_scalar_state(&mut objective, scalar_contract.entry())
         .expect("objective must install its own legal scalar entry");
 
