@@ -266,7 +266,7 @@ impl ExactGaussianFullConformal {
         if s_lambda.nrows() != p || s_lambda.ncols() != p || x_star.len() != p {
             return Err("full conformal: column-count mismatch".to_string());
         }
-        if prior_weights.iter().any(|&w| (w - 1.0).abs() > 1e-12) {
+        if prior_weights.iter().any(|&w| w != 1.0) {
             return Err(
                 "full conformal requires unit prior weights: a reweighted training row is \
                  not exchangeable with the test row, so the finite-sample coverage proof \
@@ -1717,7 +1717,7 @@ impl<'a> GlmHomotopyFullConformal<'a> {
         if s_lambda.nrows() != p || s_lambda.ncols() != p || x_star.len() != p {
             return Err("glm homotopy: column-count mismatch".to_string());
         }
-        if prior_weights.iter().any(|&w| (w - 1.0).abs() > 1e-12) {
+        if prior_weights.iter().any(|&w| w != 1.0) {
             return Err(
                 "glm homotopy full conformal requires unit prior weights: a reweighted \
                  training row is not exchangeable with the test row, so the finite-sample \
@@ -2390,7 +2390,7 @@ pub fn gaussian_jackknife_plus(
     if s_lambda.nrows() != p || s_lambda.ncols() != p || x_star.len() != p {
         return Err("gaussian jackknife+: column-count mismatch".to_string());
     }
-    if prior_weights.iter().any(|&w| (w - 1.0).abs() > 1e-12) {
+    if prior_weights.iter().any(|&w| w != 1.0) {
         return Err(
             "gaussian jackknife+ requires unit prior weights: a reweighted training row \
              is not exchangeable with the test row, so the finite-sample coverage proof \
@@ -2480,7 +2480,7 @@ impl GaussianJackknifePlusStats {
         if s_lambda.nrows() != p || s_lambda.ncols() != p {
             return Err("gaussian jackknife+ stats: column-count mismatch".to_string());
         }
-        if prior_weights.iter().any(|&w| (w - 1.0).abs() > 1e-12) {
+        if prior_weights.iter().any(|&w| w != 1.0) {
             return Err(
                 "gaussian jackknife+ requires unit prior weights: a reweighted training row \
                  is not exchangeable with the test row, so the finite-sample coverage proof \
@@ -2514,7 +2514,7 @@ impl GaussianJackknifePlusStats {
         if y.len() != n || prior_weights.len() != n {
             return Err("gaussian jackknife+ stats: row-count mismatch".to_string());
         }
-        if prior_weights.iter().any(|&w| (w - 1.0).abs() > 1e-12) {
+        if prior_weights.iter().any(|&w| w != 1.0) {
             return Err(
                 "gaussian jackknife+ requires unit prior weights: a reweighted training row \
                  is not exchangeable with the test row, so the finite-sample coverage proof \
@@ -2690,7 +2690,7 @@ impl ExactFullConformalSubstrate {
         if m.nrows() != p || m.ncols() != p {
             return Err("exact full conformal substrate: normal-matrix shape mismatch".to_string());
         }
-        if prior_weights.iter().any(|&w| (w - 1.0).abs() > 1e-12) {
+        if prior_weights.iter().any(|&w| w != 1.0) {
             return Err(
                 "exact full conformal requires unit prior weights: a reweighted training row \
                  is not exchangeable with the test row, so the finite-sample coverage proof \
@@ -3311,6 +3311,52 @@ mod tests {
                 oracle_glm_membership(&x, &yb, &x_star, c.z, alpha, &beta_ref, &mean_b);
             assert_eq!(c.member, member_ref);
         }
+    }
+
+    /// Exchangeability needs weights that ARE one, not weights near one. A
+    /// tolerance test `|w − 1| > tol` is also false for NaN, so it admitted a
+    /// weight that is not a number as unity; the exact comparison refuses both.
+    #[test]
+    fn full_conformal_admits_only_exact_unit_prior_weights() {
+        let n = 6usize;
+        let p = 2usize;
+        let mut x = Array2::<f64>::zeros((n, p));
+        let mut y = Array1::<f64>::zeros(n);
+        for i in 0..n {
+            x[[i, 0]] = 1.0;
+            x[[i, 1]] = i as f64;
+            y[i] = (i % 3) as f64;
+        }
+        let s = Array2::<f64>::eye(p);
+        let x_star = cosine_row(p, 0.37);
+        for not_one in [1.0 + 1.0e-13, f64::NAN] {
+            let mut weights = Array1::<f64>::ones(n);
+            weights[2] = not_one;
+            let error = GlmHomotopyFullConformal::new(
+                CanonicalGlmFamily::PoissonLog,
+                &x,
+                &y,
+                &weights,
+                &s,
+                &x_star,
+            )
+            .err()
+            .expect("a prior weight that is not exactly one must be refused");
+            assert!(error.contains("unit prior weights"), "{error}");
+        }
+        // Non-vacuity: exact unit weights are admitted.
+        let weights = Array1::<f64>::ones(n);
+        assert!(
+            GlmHomotopyFullConformal::new(
+                CanonicalGlmFamily::PoissonLog,
+                &x,
+                &y,
+                &weights,
+                &s,
+                &x_star,
+            )
+            .is_ok()
+        );
     }
 
     /// (#1192) A benign UNPENALIZED Poisson fixture must produce a valid
