@@ -110,6 +110,32 @@ pub(crate) const fn sae_exact_stationarity_resident_bytes(dim: usize) -> usize {
     sae_exact_stationarity_block_bytes(dim).saturating_mul(SAE_EXACT_STATIONARITY_LIVE_DIM_BLOCKS)
 }
 
+/// Whether the exact stationarity route's resident blocks at `dim` fit the carried
+/// host reading. ONE predicate: [`sae_streaming_plan_from_budget`] asks it at the
+/// shape-derived bound, and the terminal exact-Newton polish asks it at the EXACT
+/// `(cache.delta_t_len(), cache.k)` dimension before it materializes (#2283), so
+/// the admission and the allocation cannot disagree about which matrix fits.
+pub(crate) const fn sae_exact_stationarity_admitted(
+    dim: usize,
+    process_available_bytes: usize,
+) -> bool {
+    let resident_bytes = sae_exact_stationarity_resident_bytes(dim);
+    // Denominated in the HOST budget, deliberately, and not in the
+    // possibly-device-derived `in_core_budget_bytes` the plan is handed: every
+    // block enumerated above is a host `Array2<f64>` handed to a host LAPACK
+    // symmetric eigendecomposition. There is no device arm of this route, so a
+    // pooled device budget is the wrong ceiling for it. The figure derives from
+    // the ONE carried host reading (#2532), so this stays a pure function of
+    // `(dim, carried reading)` and never resamples ambient memory.
+    let host_budget = sae_host_in_core_budget_from_available(process_available_bytes);
+    // Same starved-box relaxation as the direct plan (#1026): a working set too
+    // small to OOM a box that reports it available is admitted even when the
+    // headroom-reserved budget has underflowed to ~0.
+    let fits_tiny = resident_bytes <= SAE_DIRECT_ALWAYS_ADMIT_BYTES
+        && resident_bytes <= process_available_bytes;
+    resident_bytes <= host_budget || fits_tiny
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SaeStreamingPlan {
     pub streaming: bool,
@@ -238,21 +264,10 @@ pub(crate) fn sae_streaming_plan_from_budget(
         border_dim,
     );
     let exact_stationarity_bytes = sae_exact_stationarity_resident_bytes(exact_stationarity_dim);
-    // Denominated in the HOST budget, deliberately, and not in the
-    // possibly-device-derived `in_core_budget_bytes` this function is handed:
-    // every block enumerated above is a host `Array2<f64>` handed to a host
-    // LAPACK symmetric eigendecomposition. There is no device arm of this route,
-    // so a pooled device budget is the wrong ceiling for it. Both figures derive
-    // from the ONE carried host reading (#2532), so this stays a pure function
-    // of `(shape, carried reading)` and never resamples ambient memory.
-    let host_budget_for_exact = sae_host_in_core_budget_from_available(process_available_bytes);
-    // Same starved-box relaxation as the direct plan (#1026): a working set too
-    // small to OOM a box that reports it available is admitted even when the
-    // headroom-reserved budget has underflowed to ~0.
-    let exact_stationarity_fits_tiny = exact_stationarity_bytes <= SAE_DIRECT_ALWAYS_ADMIT_BYTES
-        && exact_stationarity_bytes <= process_available_bytes;
+    // The host-budget admission the terminal polish also asks, at its exact
+    // dimension (#2283); here at the shape-derived bound.
     let exact_stationarity_admitted =
-        exact_stationarity_bytes <= host_budget_for_exact || exact_stationarity_fits_tiny;
+        sae_exact_stationarity_admitted(exact_stationarity_dim, process_available_bytes);
     // Matrix-free streaming bounds its peak to the chunk, row-cross and border
     // workspaces, but it is still a real allocation. Admit it against the same
     // authoritative process budget: a genuine zero means exhausted memory,
@@ -1098,6 +1113,45 @@ mod exact_stationarity_admission_tests {
             "a few-KiB exact route must survive a collapsed budget on a box that reports \
              {available} bytes available (#1026)"
         );
+    }
+
+    /// #2283 — the terminal exact-Newton polish asks this ledger at the EXACT
+    /// dimension it would build, and both criterion routes reach the polish. On one
+    /// host reading, the geometry #2731 reports for job 391502 (`n = 256`,
+    /// `p = 2048`, 32 charts: `dim = 800` = 512 coordinates + 288 border) must be
+    /// admitted, and the #2283 production cell (96 000 training rows × 2 active
+    /// charts, same 288 border) must be refused, or the polish allocates that
+    /// geometry at its first plateau. The plan's flag must be the same predicate at
+    /// its bound, not a second formula.
+    #[test]
+    fn the_polish_predicate_admits_the_measured_cell_and_refuses_the_production_cell_2283() {
+        let available = 64 * 1024 * 1024 * 1024usize;
+        let border = 288;
+        let measured = sae_exact_stationarity_dim(256 * 2, border);
+        let production = sae_exact_stationarity_dim(96_000 * 2, border);
+        assert_eq!(measured, 800, "the #2731 charts=32 geometry is dim 800");
+        assert!(
+            sae_exact_stationarity_admitted(measured, available),
+            "the measured charts=32 geometry ({} B resident) must be admitted on a 64 GiB \
+             reading, or the gate declines a polish that fits",
+            sae_exact_stationarity_resident_bytes(measured)
+        );
+        assert!(
+            !sae_exact_stationarity_admitted(production, available),
+            "the #2283 production geometry (dim {production}, {} B resident) was admitted \
+             against a {} B budget",
+            sae_exact_stationarity_resident_bytes(production),
+            sae_host_in_core_budget_from_available(available)
+        );
+        for reading in [0usize, 200 * 1024 * 1024, available, usize::MAX / 4] {
+            let plan = plan_at(reading);
+            assert_eq!(
+                plan.exact_stationarity_admitted,
+                sae_exact_stationarity_admitted(plan.estimated_exact_stationarity_dim, reading),
+                "the plan's exact-route verdict at a {reading}-byte reading is not the shared \
+                 predicate at its bound"
+            );
+        }
     }
 }
 

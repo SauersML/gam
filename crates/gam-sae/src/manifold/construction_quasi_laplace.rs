@@ -2630,6 +2630,29 @@ impl SaeManifoldTerm {
                 step + 1,
             );
             let cache = factor.cache;
+            // #2283 — ask whether this step's dense geometry fits BEFORE paying for
+            // it. `materialize_exact_stationarity_geometry` below holds `dim × dim`
+            // host blocks with `dim = coords + border`, and the coordinate block grows
+            // with ROWS: the #2283 cell's 96 000 training rows with 2 active circle
+            // charts each give 192 000 coordinates before the border. Both criterion
+            // routes reach this phase through `converge_inner_for_undamped_logdet`, and
+            // the log-determinant and ρ-adjoint already route away from the dense lane
+            // on #2724's ledger; this phase never asked it, so a streaming-routed fit
+            // allocated the blocks at its first plateau. Ask the SAME predicate at the
+            // EXACT dimension this step would build. Declining is "no step", which both
+            // callers already handle.
+            let exact_dim = sae_exact_stationarity_dim(cache.delta_t_len(), cache.k);
+            if !sae_exact_stationarity_admitted(exact_dim, self.host_available_bytes) {
+                log::info!(
+                    "[SAE-NEWTON] step {}/{max_steps} declined: the exact stationarity \
+                     geometry at dim={exact_dim} needs {} resident bytes, which the carried \
+                     host reading of {} bytes does not admit",
+                    step + 1,
+                    sae_exact_stationarity_resident_bytes(exact_dim),
+                    self.host_available_bytes,
+                );
+                break;
+            }
             // #2267 — FORECAST the dense exact-stationarity step before entering it,
             // and state it next to the two quantities any bar would be denominated
             // against: the assemble this step already paid, and the time this polish
