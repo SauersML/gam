@@ -15,8 +15,8 @@
 //!
 //! ## Composition with the existing signed-Gram API
 //!
-//! The diagonal part `D` flows through the existing `xt_diag_x_signed` /
-//! `xt_diag_x_psd` kernels exactly as before, so the rank-0 specialisation
+//! The diagonal part `D` flows through the existing `xt_diag_x_signed` kernel
+//! exactly as before, so the rank-0 specialisation
 //! coincides with the legacy diagonal path. The low-rank correction adds
 //! `(XᵀU)(VᵀX)` — a `p × p` outer product of two tall-skinny matrices —
 //! computed in `O(n · p · r)` and *never* materialising an `n × n` weight.

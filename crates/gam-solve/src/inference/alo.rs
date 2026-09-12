@@ -998,10 +998,7 @@ pub struct AloInput<'a> {
     pub penalized_hessian: &'a Array2<f64>,
     /// Hessian-side IRLS weights W_H at convergence (n). Sign-honest: for
     /// non-canonical links the observed-information diagonal can have negative
-    /// entries, so the typed [`SignedWeightsView`] is the contract here. PSD
-    /// callers needing to promote (e.g. the canonical-link case where the
-    /// caller has discharged W_H ≥ 0 algebraically) can route through
-    /// `SignedWeightsView::as_psd()` at the consumer.
+    /// entries, so the typed [`SignedWeightsView`] is the contract here.
     pub hessian_weights: SignedWeightsView<'a>,
     /// Score-side IRLS weights W_S paired with `working_response` (n).
     /// PSD-by-construction: the score-side Fisher weights `h'²/(φ V(μ)) ≥ 0`.

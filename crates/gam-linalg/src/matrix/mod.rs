@@ -4028,7 +4028,7 @@ pub trait LinearOperator {
     ) -> Result<(Array1<f64>, PcgSolveInfo), String> {
         if rhs.len() != self.ncols() {
             return Err(format!(
-                "solve_system_matrix_free_pcg rhs dimension mismatch: rhs length {} != ncols {}",
+                "matrix-free PCG solve rhs dimension mismatch: rhs length {} != ncols {}",
                 rhs.len(),
                 self.ncols()
             ));
@@ -4040,7 +4040,7 @@ pub trait LinearOperator {
             && (pen.nrows() != self.ncols() || pen.ncols() != self.ncols())
         {
             return Err(format!(
-                "solve_system_matrix_free_pcg penalty shape mismatch: got {}x{}, expected {}x{}",
+                "matrix-free PCG solve penalty shape mismatch: got {}x{}, expected {}x{}",
                 pen.nrows(),
                 pen.ncols(),
                 self.ncols(),
@@ -5986,43 +5986,6 @@ impl DesignMatrix {
             ridge_floor,
             ridge_policy,
         )
-    }
-
-    pub fn solve_system_matrix_free_pcg(
-        &self,
-        weights: &Array1<f64>,
-        rhs: &Array1<f64>,
-        penalty: Option<&Array2<f64>>,
-        ridge_floor: f64,
-    ) -> Result<Array1<f64>, String> {
-        <Self as LinearOperator>::solve_system_matrix_free_pcg_try(
-            self,
-            weights,
-            rhs,
-            penalty,
-            ridge_floor,
-        )
-    }
-
-    pub fn solve_system_matrix_free_pcg_with_info(
-        &self,
-        weights: &Array1<f64>,
-        rhs: &Array1<f64>,
-        penalty: Option<&Array2<f64>>,
-        ridge_floor: f64,
-    ) -> Result<(Array1<f64>, PcgSolveInfo), String> {
-        <Self as LinearOperator>::solve_system_matrix_free_pcg_with_info_try(
-            self,
-            weights,
-            rhs,
-            penalty,
-            ridge_floor,
-        )
-    }
-
-    pub fn should_use_matrix_free_pcg(&self) -> bool {
-        <Self as LinearOperator>::uses_matrix_free_pcg(self)
-            && self.ncols() >= MATRIX_FREE_PCG_MIN_P
     }
 
     pub fn factorize_system(

@@ -904,5 +904,23 @@
     ],
     "reason": "user directive: delete all useless slop",
     "evidence": "At d1b00c6b2, git grep -nw over crates, src, tests, examples, bench and benches found only each item's own definition, doc comments, or in-function error strings; nothing calls any of them. Cascade items were reachable only through the deleted ones. MSI verification (ban scanner, workspace --all-targets check, cargo doc -p gam-runtime, guard and census) runs on the landed sha."
+  },
+  {
+    "base": "8bd188841b66ce26af1c8cbc77fed4f3174d4832",
+    "items": [
+      "crates/gam-linalg/src/decision.rs:fn:newton_decrement_enclosure",
+      "crates/gam-linalg/src/decision.rs:fn:rounding_floor_with_depth",
+      "crates/gam-linalg/src/matrix/mod.rs:fn:should_use_matrix_free_pcg",
+      "crates/gam-linalg/src/matrix/mod.rs:fn:solve_system_matrix_free_pcg",
+      "crates/gam-linalg/src/matrix/mod.rs:fn:solve_system_matrix_free_pcg_with_info",
+      "crates/gam-linalg/src/matrix/symmetric.rs:fn:xt_diag_x_psd",
+      "crates/gam-linalg/src/matrix/weights.rs:fn:as_psd",
+      "crates/gam-linalg/src/matrix/weights.rs:fn:view_signed",
+      "crates/gam-linalg/src/pairwise_reduce.rs:fn:pairwise_sum_chunked",
+      "crates/gam-linalg/src/sparse_exact.rs:fn:dense_to_sparse",
+      "crates/gam-linalg/src/sparse_exact.rs:fn:trace_product_sparse"
+    ],
+    "reason": "user directive: delete all useless slop",
+    "evidence": "git grep -nw at the base finds each name only at its own definition, in doc or comment prose, and in two error-string labels. The three DesignMatrix PCG wrappers forwarded to LinearOperator methods that remain. No private helper, type or constant loses its last reference, and a per-file control finds no import newly unused."
   }
 ]

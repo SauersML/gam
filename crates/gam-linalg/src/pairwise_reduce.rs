@@ -291,15 +291,6 @@ where
     acc.finish()
 }
 
-/// Streaming `f64` pairwise sum over an iterator of chunks. Bit-identical to
-/// [`pairwise_sum`] over the concatenation of all chunks.
-pub fn pairwise_sum_chunked<'a, I>(chunks: I) -> f64
-where
-    I: IntoIterator<Item = &'a [f64]>,
-{
-    pairwise_reduce_chunked(chunks, |a, b| a + b, 0.0)
-}
-
 /// Parallel, bit-reproducible pairwise map-reduce over the index range
 /// `0..n`.
 ///

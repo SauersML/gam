@@ -13,11 +13,8 @@
 //!   kernels (`weighted_crossprod_dense_view`, `dense_diag_gram_view`,
 //!   `sparse_csr_weighted_xtwx_*`) accept only this view, so the `assert!`
 //!   that previously fired inside the kernels migrates entirely to
-//!   `PsdWeights::try_new`. PSD callers either go through this constructor,
-//!   `from_view_unchecked` (audited site, recorded reason), or
-//!   `SignedWeightsView::as_psd` (consolidating the few scan sites that
-//!   still need to ask the question at runtime — e.g. PIRLS step
-//!   acceptance).
+//!   `PsdWeights::try_new`. PSD callers either go through this constructor or
+//!   `from_view_unchecked` (audited site, recorded reason).
 //! * `FiniteSignedWeightsView<'_>` is the universal weighted-operator view:
 //!   negative entries are retained, while one deterministic scan rejects the
 //!   first nonfinite row before a Gram/Hessian kernel can mutate output.
@@ -126,15 +123,6 @@ impl<'a> SignedWeightsView<'a> {
     pub fn as_slice(&self) -> Option<&[f64]> {
         self.0.as_slice()
     }
-
-    /// Attempt to promote a signed view to a PSD view. Performs one linear
-    /// sign-scan; consolidates the runtime check at the few sites that still
-    /// need to ask the question (e.g. PIRLS step acceptance, where the same
-    /// scan was previously inlined as `weights.iter().any(|&w| w < 0.0)`).
-    #[inline]
-    pub fn as_psd(self) -> Option<PsdWeightsView<'a>> {
-        PsdWeightsView::try_new(self.0).ok()
-    }
 }
 
 #[derive(Copy, Clone)]
@@ -228,8 +216,7 @@ impl<'a> PsdWeightsView<'a> {
 /// otherwise leak as untyped `Arc<Array1<f64>>`.
 ///
 /// The newtype derefs to `Array1<f64>` so existing arithmetic like
-/// `&*self.w_diag * &x_v` is unchanged. `view_signed()` produces the
-/// borrowed function-boundary view when a kernel is called.
+/// `&*self.w_diag * &x_v` is unchanged.
 #[derive(Clone)]
 #[repr(transparent)]
 pub struct SignedWeightsArc(Arc<Array1<f64>>);
@@ -246,13 +233,6 @@ impl SignedWeightsArc {
     #[inline]
     pub fn from_array(array: Array1<f64>) -> Self {
         Self(Arc::new(array))
-    }
-
-    /// Borrow as an unvalidated function-boundary [`SignedWeightsView`] for
-    /// row-geometry consumers that perform their own joint certificate.
-    #[inline]
-    pub fn view_signed(&self) -> SignedWeightsView<'_> {
-        SignedWeightsView::from_array(self.0.as_ref())
     }
 
     /// Inner `Arc<Array1<f64>>` for sites that genuinely need the shared

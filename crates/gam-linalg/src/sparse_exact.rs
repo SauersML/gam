@@ -47,39 +47,6 @@ impl SparseExactFactor {
     }
 }
 
-pub fn dense_to_sparse(
-    matrix: &Array2<f64>,
-    tol: f64,
-) -> Result<SparseColMat<usize, f64>, LinalgError> {
-    let nrows = matrix.nrows();
-    let ncols = matrix.ncols();
-    // Direct column-major CSC construction.  Three-pass: count nnz per
-    // column in parallel, perform the prefix sum serially, then fill each
-    // deterministic column slice in parallel.  Columns are still traversed
-    // in order and rows are written in ascending order within each column,
-    // preserving the same canonical CSC ordering as the previous serial
-    // implementation without requiring a triplet sort/dedup pass.
-    let counts: Vec<usize> = (0..ncols)
-        .into_par_iter()
-        .map(|col| {
-            let mut count = 0usize;
-            for row in 0..nrows {
-                if matrix[[row, col]].abs() > tol {
-                    count += 1;
-                }
-            }
-            count
-        })
-        .collect();
-    let col_ptr = prefix_sum_counts(&counts);
-    let nnz = col_ptr[ncols];
-    let mut row_idx = vec![0usize; nnz];
-    let mut values = vec![0.0; nnz];
-    fill_dense_to_sparse_columns(matrix, tol, 0, ncols, &col_ptr, &mut row_idx, &mut values);
-    let symbolic = SymbolicSparseColMat::<usize>::new_checked(nrows, ncols, col_ptr, None, row_idx);
-    Ok(SparseColMat::<usize, f64>::new(symbolic, values))
-}
-
 /// Convert a dense symmetric matrix to sparse CSC storing only the upper triangle.
 ///
 /// This encoding is required by sparse SPD routines in this module that interpret
@@ -1241,67 +1208,6 @@ impl TakahashiInverse {
         }
         out
     }
-
-    /// tr(H⁻¹ S) where S is given as sparse CSC, symmetric in either upper-
-    /// triangle-only or full (both triangles stored) format.
-    ///
-    /// The algorithm iterates over the upper triangle of S (entries with
-    /// row ≤ col), doubles off-diagonals, and skips lower-triangle entries.
-    /// This is correct for both storage conventions:
-    ///
-    /// - **Upper-triangle-only** (for example, solver-owned sparse penalty blocks):
-    ///   every off-diagonal pair has exactly one stored entry with row < col,
-    ///   which we double.
-    ///
-    /// - **Full symmetric** (from `dense_to_sparse`): each off-diagonal pair
-    ///   has entries at both (i,j) and (j,i).  We process only the row < col
-    ///   entry and double it; the row > col mirror is skipped.  The diagonal
-    ///   is stored once and counted once.
-    ///
-    /// In both cases: tr(Z S) = Σ_diag Z\[i,i\] S\[i,i\] + 2 Σ_{i<j} Z\[i,j\] S\[i,j\].
-    pub fn trace_product_sparse(&self, s: &SparseColMat<usize, f64>) -> f64 {
-        let (symbolic, values) = s.parts();
-        let s_col_ptr = symbolic.col_ptr();
-        let s_row_idx = symbolic.row_idx();
-        // tr(Z S) = Σ_diag Z[i,i] S[i,i] + 2 Σ_{i<j} Z[i,j] S[i,j]. Each column's
-        // contribution is independent of every other column's, so the expensive
-        // per-column work (`self.get` — on-demand exact-inverse-column solves,
-        // `Mutex`-guarded via `exact_columns`, so concurrent lookups including
-        // cache misses are sound) fans across rayon. But the FINAL reduction must
-        // NOT be a rayon `.sum()`: that folds partials in a work-stealing tree
-        // order, so the low-order bits of `tr(ZS)` would vary with thread count /
-        // scheduling — and this value feeds the REML gradient / EDF, so that drift
-        // makes fits non-reproducible across machines with different core counts.
-        // Collect the per-column partials in column order (`collect()` on an
-        // indexed parallel iterator preserves order) and sum them SERIALLY, so
-        // the result is bit-identical regardless of the thread pool — matching the
-        // index-ordered-serial-reduction idiom the Firth outer-Hessian paths use.
-        // (Parallelization first landed for #759 in b7879667b, lost in the
-        // gam-linalg crate-extraction refactor a80fe6943, restored here.)
-        let per_column: Vec<f64> = (0..s.ncols())
-            .into_par_iter()
-            .map(|col| {
-                let col_start = s_col_ptr[col];
-                let col_end = s_col_ptr[col + 1];
-                let mut partial = 0.0;
-                for idx in col_start..col_end {
-                    let row = s_row_idx[idx];
-                    if row > col {
-                        continue; // skip lower triangle (handled via its mirror)
-                    }
-                    let val = values[idx];
-                    let z_ij = self.get(row, col);
-                    if row == col {
-                        partial += z_ij * val;
-                    } else {
-                        partial += 2.0 * z_ij * val;
-                    }
-                }
-                partial
-            })
-            .collect();
-        per_column.iter().sum()
-    }
 }
 
 #[cfg(test)]
@@ -1321,8 +1227,6 @@ mod tests {
             (a - b).abs()
         );
     }
-
-    // ── dense_to_sparse ───────────────────────────────────────────────────
 
     // ── dense_to_sparse_symmetric_upper ───────────────────────────────────
 
@@ -1498,8 +1402,6 @@ mod tests {
         let existing = factorize_sparse_spd(&h_sparse).unwrap();
         approx_eq(existing.logdet, logdet_dense, 1e-10);
     }
-
-    // ── trace_product_sparse (rayon parallel reduction, #759) ─────────────────
 
     // ── solve_sparse_spdmulti / solve_sparse_spdmulti_rows ───────────────────
 

@@ -3,7 +3,7 @@
 
 use super::*;
 
-// - The diagonal part flows through `xt_diag_x_signed` / `xt_diag_x_psd`
+// - The diagonal part flows through `xt_diag_x_signed`
 //   exactly as before. When `LowRankWeight::is_rank_zero()` the path is
 //   bit-identical to the legacy diagonal flow.
 // - The low-rank correction is `(XᵀU)(VᵀX)`, a `p × p` outer product of

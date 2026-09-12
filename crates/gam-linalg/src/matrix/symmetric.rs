@@ -351,12 +351,9 @@ impl SymmetricMatrix {
 /// `weighted_crossprod_dense_rows`, `dense_diag_gram_view`) clip / assert
 /// nonneg, and none of them is reachable from this entry.
 ///
-/// Callers in PIRLS should select `_signed` for observed-Hessian / Newton
-/// curvature assembly and `_psd` for Fisher-scoring updates where the working
-/// weights are guaranteed nonneg. The sign character is now encoded in the
-/// argument types: `xt_diag_x_signed` takes a `FiniteSignedWeightsView<'_>` and
-/// `xt_diag_x_psd` takes a `PsdWeightsView<'_>`; both perform a deterministic
-/// one-time certificate at their construction site.
+/// The sign character is encoded in the argument type: `xt_diag_x_signed` takes a
+/// `FiniteSignedWeightsView<'_>`, which performs a deterministic one-time
+/// certificate at its construction site.
 pub fn xt_diag_x_signed(
     design: &DesignMatrix,
     diag: FiniteSignedWeightsView<'_>,
@@ -455,19 +452,6 @@ pub fn symmetrization_defect_2norm(matrix: &Array2<f64>) -> f64 {
             .sqrt(),
         Err(_) => 0.0,
     }
-}
-
-/// PSD-precondition Gram: `XᵀWX` with `w ≥ 0`.
-///
-/// Use for Fisher-scoring / canonical-link IRLS, where the working weights are
-/// guaranteed nonneg by construction. The `w ≥ 0` precondition is discharged
-/// at the `PsdWeightsView::try_new` constructor; the kernel below performs no
-/// further scan. Numeric path is identical to `xt_diag_x_signed`.
-pub fn xt_diag_x_psd(
-    design: &DesignMatrix,
-    diag: PsdWeightsView<'_>,
-) -> Result<SymmetricMatrix, String> {
-    xt_diag_x_symmetric(design, &diag.view().to_owned())
 }
 
 pub fn xt_diag_x_symmetric(
