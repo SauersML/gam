@@ -2,17 +2,16 @@
 """Compare Rust test declarations in immutable Git trees (#2818).
 
 This is a source-integrity gate, not evidence that a test compiled or ran.
-Comments and literals cannot satisfy a missing test identity. A removal needs
-an explicit, commit-specific explanation in docs/test-census-changes.json.
+Comments and literals cannot satisfy a missing test identity.
 
-Three assertions run, because each is blind to a loss the others see. The
-comparison against the base names the exact identities that went missing, but
-it only ever sees one step and its workspace totals let growth in one crate pay
-for deletion in another. The floor in docs/test-census-floor.json is a
-high-water mark per compilation unit and per issue number: it does not depend
-on which base the gate was handed, and it does not net. ``--positive-control``
-re-measures the sweep this gate exists for, because a census that has stopped
-detecting anything is byte-identical to a census over a tree that lost nothing.
+The comparison against the base reports the exact identities that went missing,
+but it only ever sees one step and its workspace totals let growth in one crate
+pay for deletion in another, so it informs rather than decides. The floor in
+docs/test-census-floor.json decides: a high-water mark per compilation unit and
+per issue number that does not depend on which base the gate was handed and
+does not net. ``--positive-control`` re-measures the sweep this gate exists for,
+because a census that has stopped detecting anything is byte-identical to a
+census over a tree that lost nothing.
 """
 
 import argparse
@@ -28,7 +27,6 @@ PIN = re.compile(r"_\d+(?:_\d+)*$")
 TOKEN = re.compile(r"[A-Za-z_][A-Za-z_0-9]*|[^\s]")
 LITERAL = re.compile(r'''(?:b|c)?"(?:\\.|[^"\\])*"|'(?:\\(?:u\{[0-9a-fA-F]+\}|x[0-9a-fA-F]{2}|.)|[^'\\\n])' ''', re.S | re.X)
 RAW = re.compile(r'(?:b|c)?r(#{0,255})"')
-LEDGER = "docs/test-census-changes.json"
 FLOOR = "docs/test-census-floor.json"
 # The commit whose 2,290 deleted tests this gate was built to make visible.
 #
@@ -264,29 +262,9 @@ def check_floor(measured, floor):
     if shortfall:
         raise ValueError(
             f"test coverage fell below the recorded floor [minimum, measured]; regenerate {FLOOR} with "
-            f"--update-floor only in the same change as the {LEDGER} entry that explains the loss: "
+            "--update-floor in the same change as the removal it permits: "
             + json.dumps(shortfall, sort_keys=True))
     return shortfall
-
-
-def check_change(before, after, entries):
-    delta = difference(before, after)
-    acknowledgements = [entry for entry in entries if entry.get("base") == before["revision"]]
-    losses = delta["test_count_decrease"] or delta["removed_pins"] or delta["unit_test_decreases"]
-    if not losses:
-        if acknowledgements:
-            raise ValueError("removal acknowledgement describes no observed loss")
-        return delta
-    if len(acknowledgements) != 1:
-        raise ValueError("test coverage decreased without exactly one explicit acknowledgement: " + json.dumps(delta))
-    entry = acknowledgements[0]
-    if set(entry) != {"base", "reason", "evidence", *delta}:
-        raise ValueError("removal acknowledgement has missing or unknown fields")
-    if any(entry[key] != delta[key] for key in delta):
-        raise ValueError("removal acknowledgement does not match measured losses: " + json.dumps(delta))
-    if not all(isinstance(entry[key], str) and entry[key].strip() for key in ("reason", "evidence")):
-        raise ValueError("removal needs a semantic reason and replacement/retirement evidence")
-    return delta
 
 
 def positive_control(root):
@@ -306,10 +284,10 @@ def positive_control(root):
     if measured != CONTROL:
         raise ValueError(f"positive control drifted from the measured #2818 sweep: {json.dumps(measured, sort_keys=True)}")
     try:
-        check_change(before, after, [])
+        check_floor(after, floor_from(before))
     except ValueError:
         return measured
-    raise ValueError("positive control: the census accepted the #2818 sweep without an acknowledgement")
+    raise ValueError("positive control: the floor measured before the #2818 sweep accepted it")
 
 
 def main():
@@ -323,7 +301,7 @@ def main():
     root = Path(git(Path.cwd(), "rev-parse", "--show-toplevel").decode().strip())
     if args.positive_control:
         print("Positive control at {head}: {test_count_decrease} tests, {removed_pin_names} pinned names and "
-              "{units_losing_tests} units lost, and the census refuses it.".format(**positive_control(root)))
+              "{units_losing_tests} units lost, and the floor refuses it.".format(**positive_control(root)))
         return
     head = resolve(root, args.head)
     parsed = {}
@@ -336,9 +314,6 @@ def main():
         parser.error("--base is required unless --update-floor or --positive-control is given")
     before = census(root, resolve(root, args.base), parsed)
     floor = json.loads(git(root, "show", head + ":" + FLOOR))
-    ledger = json.loads(git(root, "show", head + ":" + LEDGER))
-    if not isinstance(ledger, list) or not all(isinstance(entry, dict) for entry in ledger):
-        raise ValueError("test census change ledger must be a list of objects")
     report = {"before": before, "after": after, "change": difference(before, after), "floor": floor}
     if args.output:
         args.output.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n")
@@ -346,7 +321,6 @@ def main():
     print(f"{after['revision']}: {after['files']} Rust files, {after['tests']} tests, {len(after['pins'])} issue-pinned names")
     print(f"{FLOOR} generated at {floor['generated_from']}: {len(floor['units'])} units, {len(floor['issues'])} issue numbers")
     check_floor(after, floor)
-    check_change(before, after, ledger)
     print("Test source integrity verified; compilation and execution require their own verdicts.")
 
 

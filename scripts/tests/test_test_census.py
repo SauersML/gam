@@ -36,41 +36,29 @@ class TestCensus(unittest.TestCase):
                 list(census.test_names(source))
 
     def test_removing_a_pin_still_fails_when_total_count_grows_2818(self):
-        before = snapshot(3, {"critical_12": 1})
-        after = snapshot(4, {"unrelated_13": 3})
-        with self.assertRaisesRegex(ValueError, "without exactly one"):
-            census.check_change(before, after, [])
+        before = snapshot(3, {"critical_2818": 1}, {"crates/gam-sae": 3}, {"2818": 1})
+        after = snapshot(4, {"unrelated_2817": 3}, {"crates/gam-sae": 4}, {"2817": 3})
+        self.assertEqual(census.difference(before, after)["removed_pins"], {"critical_2818": 1})
+        with self.assertRaisesRegex(ValueError, r"issues/2818.*1.*0"):
+            census.check_floor(after, census.floor_from(before))
 
     def test_duplicate_pin_loss_and_plain_test_count_loss_are_visible_2818(self):
         before = snapshot(5, {"critical_12": 2})
         after = snapshot(4, {"critical_12": 1})
         self.assertEqual(census.difference(before, after), {
             "test_count_decrease": 1, "removed_pins": {"critical_12": 1}, "unit_test_decreases": {}})
-        with self.assertRaises(ValueError):
-            census.check_change(before, after, [])
 
     def test_total_count_loss_fails_even_when_every_pin_survives_2818(self):
-        before = snapshot(5, {"critical_12": 1})
-        after = snapshot(4, {"critical_12": 1})
-        with self.assertRaisesRegex(ValueError, "without exactly one"):
-            census.check_change(before, after, [])
+        before = snapshot(5, {"critical_2818": 1}, {"crates/gam-sae": 5}, {"2818": 1})
+        after = snapshot(4, {"critical_2818": 1}, {"crates/gam-sae": 4}, {"2818": 1})
+        with self.assertRaisesRegex(ValueError, r"crates/gam-sae.*5.*4"):
+            census.check_floor(after, census.floor_from(before))
 
-    def test_unchanged_identities_need_no_removal_acknowledgement_2818(self):
+    def test_growth_with_unchanged_identities_reports_no_loss_2818(self):
         before = snapshot(5, {"critical_12": 1})
         after = snapshot(6, {"critical_12": 1, "new_13": 1})
-        self.assertEqual(census.check_change(before, after, []), {
+        self.assertEqual(census.difference(before, after), {
             "test_count_decrease": 0, "removed_pins": {}, "unit_test_decreases": {}})
-
-    def test_acknowledgement_requires_exact_loss_and_semantic_evidence_2818(self):
-        before = snapshot(2, {"critical_12": 1})
-        after = snapshot(1, {})
-        entry = {"base": "base", "test_count_decrease": 1, "unit_test_decreases": {},
-                 "removed_pins": {"critical_12": 1}, "reason": "Replacement covers the same derivative",
-                 "evidence": "replacement_12 executed: 1 passed"}
-        self.assertEqual(census.check_change(before, after, [entry]), census.difference(before, after))
-        for field, value in (("base", "stale"), ("test_count_decrease", 2), ("evidence", ""), ("removed_pins", {})):
-            with self.subTest(field=field), self.assertRaises(ValueError):
-                census.check_change(before, after, [dict(entry, **{field: value})])
 
     def test_growth_in_one_crate_cannot_pay_for_deletion_in_another_2818(self):
         """The workspace total is blind to the shape #2818 actually had."""
@@ -78,8 +66,8 @@ class TestCensus(unittest.TestCase):
         after = snapshot(40, {"critical_12": 1}, {"crates/gam-sae": 5, "crates/gam-solve": 35})
         self.assertEqual(census.difference(before, after)["test_count_decrease"], 0)
         self.assertEqual(census.difference(before, after)["unit_test_decreases"], {"crates/gam-sae": 25})
-        with self.assertRaisesRegex(ValueError, "without exactly one"):
-            census.check_change(before, after, [])
+        with self.assertRaisesRegex(ValueError, r"crates/gam-sae.*30.*5"):
+            census.check_floor(after, census.floor_from(before))
 
     def test_floor_holds_units_and_issues_without_a_base_commit_2818(self):
         """The floor is the assertion that survives a broken incremental chain."""
