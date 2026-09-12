@@ -896,8 +896,20 @@ pub fn bd0(x: f64, m: f64) -> f64 {
 /// event so the reference probability never rounds to one.
 #[inline]
 pub fn bernoulli_kl_from_logits(a: f64, b: f64) -> f64 {
+    if a.is_nan() || b.is_nan() {
+        return f64::NAN;
+    }
     if a == b {
         return 0.0;
+    }
+    if a == f64::NEG_INFINITY {
+        return softplus(b);
+    }
+    if a == f64::INFINITY {
+        return softplus(-b);
+    }
+    if b.is_infinite() {
+        return f64::INFINITY;
     }
     let h = b - a;
     if h.abs() <= 0.5 {
@@ -913,13 +925,15 @@ pub fn bernoulli_kl_from_logits(a: f64, b: f64) -> f64 {
         let x = p * em1;
         return log1p_minus_x(x) + p * expm1_minus_x(local_h);
     }
-    if a <= 0.0 {
-        let p = logistic(a);
-        p * (a - b) + softplus(b) - softplus(a)
-    } else {
-        let q = logistic(-a);
-        q * (b - a) + softplus(-b) - softplus(-a)
-    }
+    let (reference, target) = if a <= 0.0 { (a, b) } else { (-a, -b) };
+    // Weight each logit before subtracting: target-reference can overflow.
+    // Split exp(reference) in half so a tiny probability is not rounded to
+    // zero before multiplication by a large logit revives a finite KL.
+    let half_exp = (0.5 * reference).exp();
+    let weighted_reference = (reference * half_exp) * half_exp;
+    let weighted_target = (target * half_exp) * half_exp;
+    (weighted_reference - weighted_target) / (1.0 + half_exp * half_exp)
+        + softplus(target) - softplus(reference)
 }
 
 // ---------------------------------------------------------------------------
@@ -1082,6 +1096,9 @@ mod exponential_family_kernel_tests {
             let direct = x * (x / m).ln() + m - x;
             assert!((bd0(x, m) - direct).abs() <= 16.0 * f64::EPSILON * direct.abs().max(1.0));
         }
+        let large = bd0(1e308, 1.1e308);
+        let expected = 1e307 * bd0(10.0, 11.0);
+        assert!((large / expected - 1.0).abs() < 3e-14);
     }
 
     #[test]
@@ -1091,6 +1108,30 @@ mod exponential_family_kernel_tests {
             let q = logistic(b);
             let direct = xlogy(p, p / q) + xlogy(1.0 - p, (1.0 - p) / (1.0 - q));
             assert!((bernoulli_kl_from_logits(a, b) - direct).abs() <= 1.0e-13);
+        }
+    }
+
+    #[test]
+    fn bernoulli_kl_retains_finite_extreme_logit_divergences() {
+        for sign in [-1.0, 1.0] {
+            assert_eq!(bernoulli_kl_from_logits(sign * f64::MAX, -sign * f64::MAX), f64::MAX);
+            let got = bernoulli_kl_from_logits(-sign * 1000.0, -sign * 1e308);
+            assert!(got > 0.0 && got.is_finite());
+            // The omitted terms are smaller by more than 300 decimal orders.
+            let expected_log = -1000.0 + 1e308_f64.ln();
+            assert!((got.ln() - expected_log).abs() < 2e-13);
+        }
+    }
+
+    #[test]
+    fn bernoulli_kl_respects_deterministic_distribution_limits() {
+        for a in [f64::NEG_INFINITY, f64::INFINITY] {
+            assert_eq!(bernoulli_kl_from_logits(a, a), 0.0);
+            assert_eq!(bernoulli_kl_from_logits(a, -a), f64::INFINITY);
+            assert_eq!(bernoulli_kl_from_logits(a, 0.0), std::f64::consts::LN_2);
+            assert_eq!(bernoulli_kl_from_logits(1000.0, a), f64::INFINITY);
+            assert!(bernoulli_kl_from_logits(a, f64::NAN).is_nan());
+            assert!(bernoulli_kl_from_logits(f64::NAN, a).is_nan());
         }
     }
 
