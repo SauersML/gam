@@ -155,7 +155,6 @@ fn support_laml_measured_quadrature_tolerance(
         seed,
         ceiling,
         shared.cg_rel_tol,
-        system.k,
     )
     .ok_or_else(|| {
         outer_error(format!(

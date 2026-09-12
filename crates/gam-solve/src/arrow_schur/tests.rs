@@ -4294,7 +4294,6 @@ fn rational_reduced_schur_log_det_matches_dense_evidence() {
         seed,
         1e-9, // rel_tol (quadrature)
         1e-11,
-        20_000,
     )
     .expect("rational surrogate must evaluate for the SPD fixture");
     let rel = (eval.estimate - exact_logdet).abs() / exact_logdet.abs();
@@ -4321,7 +4320,6 @@ fn rational_reduced_schur_log_det_matches_dense_evidence() {
         seed,
         1e-9,
         1e-11,
-        20_000,
     )
     .expect("rational surrogate must re-evaluate");
     assert_eq!(
@@ -4375,7 +4373,6 @@ fn rational_reduced_schur_plan_derived_deflates_to_target() {
         seed,
         1e-9,
         1e-11,
-        20_000,
         0,
         4,
         0.0,
@@ -4419,7 +4416,6 @@ fn rational_reduced_schur_plan_derived_deflates_to_target() {
         seed,
         1e-9,
         1e-11,
-        20_000,
         k, // deflation_max_rank: resource ceiling with headroom to certify 0.1×bare
         6, // subspace_iters
         target_rel,
@@ -4458,7 +4454,6 @@ fn rational_reduced_schur_plan_derived_deflates_to_target() {
         seed,
         1e-9,
         1e-11,
-        20_000,
         1,
         2,
         0.0,

@@ -104,6 +104,10 @@ pub struct RationalLogdetPlan {
     pub log_center: f64,
     /// The bracket centre `c = √(λ_min·λ_max)` itself.
     pub center: f64,
+    /// Lower end `λ_min` of the spectral bracket the window was sized from.
+    pub lambda_min: f64,
+    /// Upper end `λ_max` of the spectral bracket the window was sized from.
+    pub lambda_max: f64,
     /// Optional top-subspace (Hutch++) deflation. `None` (the default from
     /// [`Self::build`]) reproduces the bare-Hutchinson path bit-for-bit; set via
     /// `Self::with_two_sided_deflation_preconditioned`.
@@ -307,8 +311,43 @@ impl RationalLogdetPlan {
             nodes,
             log_center: c.ln(),
             center: c,
+            lambda_min,
+            lambda_max,
             deflation: None,
         })
+    }
+
+    /// Iteration budget for one conjugate-gradient solve of `(S + shift·I)` on
+    /// this plan's operator, preconditioned by `preconditioner`, to relative
+    /// residual `cg_rel_tol`.
+    ///
+    /// The budget is the Chebyshev bound at the shifted system's condition
+    /// number, not the algebraic span `dim`. A restart-free recurrence exhausts
+    /// its `dim`-dimensional Krylov space in `dim` steps only in exact
+    /// arithmetic. In f64 its basis loses orthogonality and convergence is
+    /// delayed past `dim`, while the interval bound still holds (Greenbaum,
+    /// "Behavior of slightly perturbed Lanczos and conjugate-gradient
+    /// recurrences", 1989). A `dim` cap refused exactly the narrow borders where
+    /// that delay is largest relative to `dim`: the #2023 Tier-2 witnesses and
+    /// the pair-chart fit at border 24.
+    ///
+    /// The condition number reads the plan's own bracket. On a
+    /// positive-semidefinite `S` the shifted spectrum is bounded below by
+    /// `shift`, and the unshifted one by the bracket's `λ_min`; its upper end is
+    /// `λ_max + shift`. The Jacobi preconditioner widens the bound by its own
+    /// spread, because the spectrum of `M⁻¹(S + tI)` lies in
+    /// `[λ_min(S + tI)/max(M), λ_max(S + tI)/min(M)]`. A solve that does not
+    /// certify within this budget has left the spectrum the plan was built for.
+    pub(crate) fn cg_iteration_bound(
+        &self,
+        preconditioner: &ShiftedDiagonalPreconditioner,
+        shift: f64,
+        cg_rel_tol: f64,
+    ) -> Option<usize> {
+        let lower = if shift > 0.0 { shift } else { self.lambda_min };
+        let condition =
+            (self.lambda_max + shift) / lower * preconditioner.condition_number(shift);
+        conjugate_gradient_iteration_bound(condition, cg_rel_tol)
     }
 
     /// Attach TWO-SIDED spectral deflation with the same diagonal preconditioner
@@ -800,6 +839,28 @@ impl ShiftedDiagonalPreconditioner {
         self.diagonal.is_none()
     }
 
+    /// Spread `max(d + t) / min(d + t)` of the shifted diagonal: the factor by
+    /// which this preconditioner can widen a system's condition number. `1` for
+    /// the identity.
+    fn condition_number(&self, shift: f64) -> f64 {
+        match &self.diagonal {
+            Some(diagonal) => {
+                let (smallest, largest) = diagonal.iter().fold(
+                    (f64::INFINITY, 0.0_f64),
+                    |(smallest, largest), &value| {
+                        (smallest.min(value + shift), largest.max(value + shift))
+                    },
+                );
+                if smallest.is_finite() && smallest > 0.0 {
+                    largest / smallest
+                } else {
+                    1.0
+                }
+            }
+            None => 1.0,
+        }
+    }
+
     fn apply(&self, residual: &Array1<f64>, shift: f64) -> Array1<f64> {
         match &self.diagonal {
             Some(diagonal) => {
@@ -821,6 +882,33 @@ impl ShiftedDiagonalPreconditioner {
             None => residual.clone(),
         }
     }
+}
+
+/// Iterations within which conjugate gradients reduces the residual of a
+/// symmetric positive-definite system of condition number at most `condition`
+/// by the factor `rel_tol` relative to its starting residual: the smallest `j`
+/// with `2√κ·((√κ − 1)/(√κ + 1))^j <= rel_tol`.
+///
+/// The energy-norm bound `‖e_j‖_A <= 2((√κ − 1)/(√κ + 1))^j ‖e_0‖_A` becomes a
+/// residual bound through `‖r‖₂ <= √λ_max ‖e‖_A` and `‖e‖_A <= ‖r‖₂/√λ_min`,
+/// which is the extra `√κ`. The contraction is evaluated as
+/// `ln((√κ + 1)/(√κ − 1)) = 2·atanh(1/√κ)`, which stays accurate at large `κ`
+/// where the ratio itself rounds to one. `None` for a non-finite or
+/// non-positive condition number or tolerance.
+fn conjugate_gradient_iteration_bound(condition: f64, rel_tol: f64) -> Option<usize> {
+    if !(condition.is_finite() && condition > 0.0 && rel_tol.is_finite() && rel_tol > 0.0) {
+        return None;
+    }
+    let root = condition.max(1.0).sqrt();
+    let reduction = (2.0 * root / rel_tol).ln();
+    if reduction <= 0.0 {
+        return Some(1);
+    }
+    let contraction = 2.0 * (1.0 / root).atanh();
+    let steps = (reduction / contraction).ceil();
+    // `as` saturates, so an astronomically ill-conditioned system gets the
+    // largest representable budget rather than a wrapped one.
+    Some((steps as usize).max(1))
 }
 
 /// Preconditioned shifted CG. Identical certificate, restart policy and

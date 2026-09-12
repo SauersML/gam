@@ -2432,7 +2432,6 @@ fn matrix_free_arrow_evidence_log_det_surrogate_core(
                         cfg.seed,
                         cfg.rel_tol,
                         cfg.cg_rel_tol,
-                        dim,
                         cfg.deflation_max_rank,
                         cfg.deflation_subspace_iters,
                         cfg.deflation_target_std_err_rel,
@@ -2514,17 +2513,36 @@ fn matrix_free_arrow_evidence_log_det_surrogate_core(
                 // time. Subsequent ρ values evaluate the frozen plan normally.
                 let eval = match entry_evaluation.take() {
                     Some(eval) => eval,
-                    None => plan
-                        .evaluate_family_preconditioned(
+                    None => {
+                        let seed_shift = plan
+                            .nodes
+                            .iter()
+                            .map(|(t, _)| *t)
+                            .fold(f64::INFINITY, f64::min);
+                        let cg_budget = plan
+                            .cg_iteration_bound(&precond, seed_shift, state.cfg.cg_rel_tol)
+                            .ok_or_else(|| ArrowSchurError::SchurFactorFailed {
+                                reason: format!(
+                                    "rational log-det surrogate has no finite conjugate-gradient \
+                                     iteration bound at seed shift {seed_shift:.6e} on bracket \
+                                     [{:.6e}, {:.6e}] (reduced Schur dim {dim})",
+                                    plan.lambda_min, plan.lambda_max
+                                ),
+                            })?;
+                        plan.evaluate_family_preconditioned(
                             &matvec,
                             &precond,
                             state.cfg.cg_rel_tol,
-                            dim,
+                            cg_budget,
                         )
                         .ok_or_else(|| ArrowSchurError::SchurFactorFailed {
-                            reason: "rational log-det surrogate evaluation returned non-finite"
-                                .to_string(),
-                        })?,
+                            reason: format!(
+                                "rational log-det surrogate evaluation refused: a shifted-CG \
+                                 solve broke down or did not certify within its Chebyshev \
+                                 iteration bound of {cg_budget} (reduced Schur dim {dim})"
+                            ),
+                        })?
+                    }
                 };
                 let estimate = eval.estimate;
                 let derivative_bundle = if want_logdet_derivative {
@@ -2539,6 +2557,16 @@ fn matrix_free_arrow_evidence_log_det_surrogate_core(
                     None
                 };
                 let bundle = if want_bundle {
+                    let cg_budget = plan
+                        .cg_iteration_bound(&precond, 0.0, state.cfg.cg_rel_tol)
+                        .ok_or_else(|| ArrowSchurError::SchurFactorFailed {
+                            reason: format!(
+                                "rational surrogate inverse-probe bundle has no finite \
+                                 conjugate-gradient iteration bound on bracket [{:.6e}, {:.6e}] \
+                                 (reduced Schur dim {dim})",
+                                plan.lambda_min, plan.lambda_max
+                            ),
+                        })?;
                     let (sinv, cg_report) = reduced_schur_inverse_probe_solves(
                         evidence_system,
                         &htt_factors,
@@ -2549,7 +2577,7 @@ fn matrix_free_arrow_evidence_log_det_surrogate_core(
                         &plan.probes,
                         state.warm_inverse_probes.as_deref(),
                         state.cfg.cg_rel_tol,
-                        dim,
+                        cg_budget,
                     )
                     .ok_or_else(|| ArrowSchurError::SchurFactorFailed {
                         reason: "rational surrogate inverse-probe bundle solve failed".to_string(),
@@ -2967,12 +2995,13 @@ pub fn reduced_schur_negative_curvature<B: BatchedBlockSolver + Sync>(
 /// bare SLQ value re-opened (a stochastic value paired with the analytic exact
 /// gradient) is closed by construction, not by tolerance tuning.
 ///
-/// The spectral bracket is estimated matrix-free: `λ_max` by power iteration
-/// ([`reduced_schur_lambda_max`]), `λ_min` from the deflation-floor convention
-/// `SPECTRAL_DEFLATION_REL_FLOOR·λ_max` (the operative lower bound of the
-/// unit-deflated spectrum). Deterministic for a fixed
-/// `(sys, htt_factors, ρ_β, resident, num_probes, seed, rel_tol,
-/// cg_rel_tol, cg_max_iters)`.
+/// The spectral bracket is estimated matrix-free: `λ_max` as a certified Lanczos
+/// upper bracket ([`reduced_schur_lambda_max`]), `λ_min` from the deflation-floor
+/// convention `SPECTRAL_DEFLATION_REL_FLOOR·λ_max` (the operative lower bound of
+/// the unit-deflated spectrum). Every shifted solve's iteration budget is the
+/// plan's Chebyshev bound (`RationalLogdetPlan::cg_iteration_bound`), not a
+/// caller constant. Deterministic for a fixed
+/// `(sys, htt_factors, ρ_β, resident, num_probes, seed, rel_tol, cg_rel_tol)`.
 ///
 /// `None` when `k == 0`, the bracket estimate is degenerate, the plan cannot be
 /// built, or a shifted CG solve breaks down on a non-finite operator.
@@ -2987,7 +3016,6 @@ pub fn rational_reduced_schur_log_det<B: BatchedBlockSolver + Sync>(
     seed: u64,
     rel_tol: f64,
     cg_rel_tol: f64,
-    cg_max_iters: usize,
 ) -> Option<(RationalLogdetPlan, RationalLogdetEval)> {
     let k = sys.k;
     if k == 0 {
@@ -3021,7 +3049,13 @@ pub fn rational_reduced_schur_log_det<B: BatchedBlockSolver + Sync>(
     // #2576: the exact diag(S) is reachable from `resident` and measured NOT to
     // reduce iterations — see the refutation note at the surrogate-core call site.
     let precond = reduced_schur_shifted_preconditioner(sys, ridge_beta);
-    let eval = plan.evaluate_family_preconditioned(&matvec, &precond, cg_rel_tol, cg_max_iters)?;
+    let seed_shift = plan
+        .nodes
+        .iter()
+        .map(|(t, _)| *t)
+        .fold(f64::INFINITY, f64::min);
+    let cg_budget = plan.cg_iteration_bound(&precond, seed_shift, cg_rel_tol)?;
+    let eval = plan.evaluate_family_preconditioned(&matvec, &precond, cg_rel_tol, cg_budget)?;
     Some((plan, eval))
 }
 
@@ -3069,7 +3103,6 @@ pub fn rational_reduced_schur_plan_derived<B: BatchedBlockSolver + Sync>(
     seed: u64,
     rel_tol: f64,
     cg_rel_tol: f64,
-    cg_max_iters: usize,
     deflation_max_rank: usize,
     deflation_subspace_iters: usize,
     deflation_target_std_err_rel: f64,
@@ -3200,18 +3233,28 @@ pub fn rational_reduced_schur_plan_derived<B: BatchedBlockSolver + Sync>(
             }
         }
     }
+    let cg_budget = base_plan
+        .cg_iteration_bound(&precond, seed_shift, cg_rel_tol)
+        .ok_or_else(|| {
+            format!(
+                "no finite conjugate-gradient iteration bound at seed shift {seed_shift:.6e} on \
+                 the bracket [{lambda_min:.6e}, {lambda_max:.6e}] at cg_rel_tol \
+                 {cg_rel_tol:.3e} (reduced Schur dim {k})"
+            )
+        })?;
     let pilot = base_plan
-        .evaluate_family_preconditioned(&matvec, &precond, cg_rel_tol, cg_max_iters)
+        .evaluate_family_preconditioned(&matvec, &precond, cg_rel_tol, cg_budget)
         .ok_or_else(|| {
             format!(
                 "rank-0 pilot solve broke down: the shifted-CG family did not return a finite \
                  solution on the bracket [{lambda_min:.6e}, {lambda_max:.6e}] at cg_rel_tol \
-                 {cg_rel_tol:.3e}, cg_max_iters {cg_max_iters} (reduced Schur dim {k}). The \
-                 seed system's own budget is min(cg_max_iters, dim) = {} iterations. The \
+                 {cg_rel_tol:.3e} within its Chebyshev iteration bound of {cg_budget} (reduced \
+                 Schur dim {k}). The seed system's own budget is min(bound, dim) = {} \
+                 iterations. The \
                  one-sided definiteness probe above did not fire, so this is either an \
                  indefiniteness those probes missed or a genuine loss of accuracy; the \
                  `[rational-logdet] shifted-CG seed breakdown` line says which.",
-                cg_max_iters.min(k.max(1))
+                cg_budget.min(k.max(1))
             )
         })?;
     if deflation_max_rank == 0 {
@@ -3239,6 +3282,15 @@ pub fn rational_reduced_schur_plan_derived<B: BatchedBlockSolver + Sync>(
     // carrying an unrelated fixed knob: √tol is strictly looser while still
     // converging as the bottom-tail builder now requires.
     let basis_cg_rel_tol = cg_rel_tol.sqrt();
+    let basis_cg_budget = base_plan
+        .cg_iteration_bound(&precond, 0.0, basis_cg_rel_tol)
+        .ok_or_else(|| {
+            format!(
+                "no finite conjugate-gradient iteration bound for the inverse-iteration basis on \
+                 the bracket [{lambda_min:.6e}, {lambda_max:.6e}] at cg_rel_tol \
+                 {basis_cg_rel_tol:.3e} (reduced Schur dim {k})"
+            )
+        })?;
     loop {
         let r = rank.min(cap);
         // Split the peel budget across BOTH spectral tails at equal total rank:
@@ -3260,7 +3312,7 @@ pub fn rational_reduced_schur_plan_derived<B: BatchedBlockSolver + Sync>(
             r / 2,
             deflation_subspace_iters,
             seed,
-            (basis_cg_rel_tol, cg_max_iters),
+            (basis_cg_rel_tol, basis_cg_budget),
         )
         .ok_or_else(|| {
             format!(
@@ -3271,7 +3323,7 @@ pub fn rational_reduced_schur_plan_derived<B: BatchedBlockSolver + Sync>(
             )
         })?;
         let eval = plan
-            .evaluate_family_preconditioned(&matvec, &precond, cg_rel_tol, cg_max_iters)
+            .evaluate_family_preconditioned(&matvec, &precond, cg_rel_tol, cg_budget)
             .ok_or_else(|| {
                 format!(
                     "deflated solve broke down at rank {r}: the shifted-CG family did not return \
