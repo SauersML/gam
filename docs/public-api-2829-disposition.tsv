@@ -825,7 +825,7 @@ crates/gam-sae/src/sparse_dict/scoring.rs	route_row	retired-by-later-deletion:fb
 crates/gam-sae/src/sparse_dict/update.rs	linear_block_reml_stats	retired-no-surviving-dependent
 crates/gam-sae/src/structure_harvest.rs	finite_set_candidate_for_birth	retired-by-owner:sae-arch
 crates/gam-sae/src/structure_harvest.rs	finite_set_race_enrolled	retired-by-owner:sae-arch
-crates/gam-sae/src/structure_harvest.rs	from_rounds	retired-no-surviving-dependent
+crates/gam-sae/src/structure_harvest.rs	from_rounds	retired-by-owner:sae-arch/sae-red
 crates/gam-sae/src/structure_harvest.rs	graph_birth_candidate_for_structure_search	retired-by-owner:sae-arch/sae-red
 crates/gam-sae/src/structure_harvest.rs	set_finite_set_race_enrolled	retired-by-owner:sae-arch
 crates/gam-sae/src/tiered/mod.rs	explained_variance_vs_mean	retired-by-later-deletion:00735c57ef

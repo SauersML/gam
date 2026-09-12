@@ -197,8 +197,8 @@ dropped, and restored items the table above retires were removed again.
 | Restored in place | 360 |
 | Defined elsewhere in the same crate | 13 |
 | Retired by the decisions above | 19 |
-| Retired: nothing that survived depends on it | 288 |
-| Retired by the owning work's own decision | 27 |
+| Retired: nothing that survived depends on it | 287 |
+| Retired by the owning work's own decision | 28 |
 | Retired by a later deletion commit named in the row | 509 |
 | Absent while a surviving reference still names it (repair in progress) | 3 |
 
@@ -216,16 +216,16 @@ deleted instead of getting its producer back, with an entry in
 `CertifiedLogSigmaCurvature` (`survival/latent/survival/log_sigma_curvature_certificate.rs`).
 
 The 19 identities once deferred to active owners are resolved. Owners ruled on
-fifteen in landed work: jets retired its eight in `d9943add8` (named below),
-gam-4a ruled in `fe7c444af` (`calculate_crude_risk_quadrature`,
-`cause_specific_event_indicator`, `pooled_any_event_indicator`), and sae-arch in
-`71befe9f6` (the three finite-set race functions), with the graph-birth candidate
-retired together with its `GraphBirthCandidate` carrier. The other four have no
-surviving code or prose dependent and retire under the rule above: `cause_count`;
-`from_engine_inputs`, which forwarded `None` offsets to
-`from_engine_inputswith_offsets`; `evaluate_survival_lamlcost_and_gradient`; and
+sixteen: jets retired its eight in `d9943add8` (named below), gam-4a ruled in
+`fe7c444af` (`calculate_crude_risk_quadrature`, `cause_specific_event_indicator`,
+`pooled_any_event_indicator`), sae-arch in `71befe9f6` (the three finite-set race
+functions) with the graph-birth candidate retired together with its
+`GraphBirthCandidate` carrier, and sae-arch and sae-red retired
 `StructureSearchResult::from_rounds`, which forwarded to
-`from_rounds_with_predictions`. Steering retired its own carriers
+`from_rounds_with_predictions`. The other three have no surviving code or prose
+dependent and retire under the rule above: `cause_count`; `from_engine_inputs`,
+which forwarded `None` offsets to `from_engine_inputswith_offsets`; and
+`evaluate_survival_lamlcost_and_gradient`. Steering retired its own carriers
 (`CoordinateSetResult`, `InterchangeResult`) and their deleted producers.
 Survival retired its own: the `CertifiedLogSigmaCurvature` carrier with its three
 deleted identities, and `survival_location_scale_block_effective_jacobian`, which
