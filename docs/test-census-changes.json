@@ -275,5 +275,15 @@
     "unit_test_decreases": {
       "crates/gam-solve": 6
     }
+  },
+  {
+    "base": "018cbca91fb9bec06d90998d81560e40d218315f",
+    "reason": "User directive 2026-09-11: delete code only tests use and code nothing uses. gam-problem OwnedCellValues (the whole enum with its dense, by_row, by_output, constant and constant_with_overrides constructors and accessors) had no consumer outside its own unit tests; OwnedSeparableCellMeasure::try_for_each_active was called only by its unit test, and IndexedCellSet::row_outputs only by that visitor and one test's assertions.",
+    "evidence": "Re-confirmed at the tip with git grep -nw over crates src tests examples bench benches: OwnedCellValues was named only in indexed_response.rs and the gam-problem lib.rs re-export, and try_for_each_active and row_outputs had no caller outside indexed_response.rs. Removed with the four unit tests that exercised them and three row_outputs assertions in sparse_inclusion_and_exclusion_preserve_structural_geometry, whose remaining assertions are unchanged. Gates pass base..head; MSI verification at the pushed sha follows.",
+    "test_count_decrease": 4,
+    "removed_pins": {},
+    "unit_test_decreases": {
+      "crates/gam-problem": 4
+    }
   }
 ]

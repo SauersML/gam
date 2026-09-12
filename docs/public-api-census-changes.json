@@ -197,5 +197,22 @@
     },
     "reason": "user directive: delete all useless slop",
     "evidence": "Backfilled: d33860630 (the gam-inference slop deletion) removed these public functions and landed its source-removal and test-census entries but omitted this acknowledgement. scripts/public_api_census.py on MSI over 10ac599e4..d33860630 measured exactly this removed map. Each function was re-confirmed with git grep -nw at the tip before deletion as unreferenced, reachable only through other deleted items, or named only by tests that existed to exercise it."
+  },
+  {
+    "base": "018cbca91fb9bec06d90998d81560e40d218315f",
+    "removed": {
+      "crates/gam-problem/src/indexed_response.rs::by_output": 1,
+      "crates/gam-problem/src/indexed_response.rs::by_row": 1,
+      "crates/gam-problem/src/indexed_response.rs::constant": 1,
+      "crates/gam-problem/src/indexed_response.rs::constant_with_overrides": 1,
+      "crates/gam-problem/src/indexed_response.rs::dense": 1,
+      "crates/gam-problem/src/indexed_response.rs::n_outputs": 1,
+      "crates/gam-problem/src/indexed_response.rs::n_rows": 1,
+      "crates/gam-problem/src/indexed_response.rs::row_outputs": 1,
+      "crates/gam-problem/src/indexed_response.rs::try_for_each_active": 1,
+      "crates/gam-problem/src/indexed_response.rs::value": 1
+    },
+    "reason": "User directive 2026-09-11: delete code only tests use and code nothing uses. gam-problem OwnedCellValues (the whole enum with its dense, by_row, by_output, constant and constant_with_overrides constructors and accessors) had no consumer outside its own unit tests; OwnedSeparableCellMeasure::try_for_each_active was called only by its unit test, and IndexedCellSet::row_outputs only by that visitor and one test's assertions.",
+    "evidence": "Re-confirmed at the tip with git grep -nw over crates src tests examples bench benches: OwnedCellValues was named only in indexed_response.rs and the gam-problem lib.rs re-export, and try_for_each_active and row_outputs had no caller outside indexed_response.rs. Removed with the four unit tests that exercised them and three row_outputs assertions in sparse_inclusion_and_exclusion_preserve_structural_geometry, whose remaining assertions are unchanged. Gates pass base..head; MSI verification at the pushed sha follows."
   }
 ]

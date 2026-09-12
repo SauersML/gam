@@ -1,5 +1,5 @@
 {
-  "generated_from": "c7bb1b8fdfcadfb9ea050ce8603626e16c273ea6",
+  "generated_from": "b37d98d521708d3a16ef883cf2c4557ff91d8edd",
   "units": {
     "crates/gam-cli": 27,
     "crates/gam-config": 18,
@@ -16,7 +16,7 @@
     "crates/gam-model-kernels": 88,
     "crates/gam-models": 1409,
     "crates/gam-predict": 105,
-    "crates/gam-problem": 356,
+    "crates/gam-problem": 352,
     "crates/gam-pyffi": 126,
     "crates/gam-report": 42,
     "crates/gam-row-macros": 40,
