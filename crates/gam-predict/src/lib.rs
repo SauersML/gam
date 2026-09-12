@@ -552,9 +552,6 @@ fn linear_predictorvariance_from_backend(
     Ok(local[0][0].mapv(|v| v.max(0.0)))
 }
 
-const POSTERIOR_MEAN_VARIANCE_TOL: f64 = 1e-10;
-const POSTERIOR_MEAN_CROSS_TOL: f64 = 1e-10;
-
 /// Saturation bound on the standardized survival argument `q0 = -η_t / σ`. When
 /// `σ` underflows toward its floor, the ratio can blow up to a non-finite value
 /// that poisons the downstream inverse-link jet; clamping to a large finite
@@ -782,6 +779,16 @@ fn padded_design_standard_errors_from_backend(
     })
 }
 
+/// Posterior mean of `integrand(η₀, η₁)` under `N(mu, cov)`, integrated over
+/// every direction in which `cov` carries variance.
+///
+/// The 2-D rule runs exactly when its Cholesky factor exists without jitter:
+/// the pivots `a` and `b − (c/√a)²` of `cov = [[a, c], [c, b]]`, formed as
+/// `cholesky_static` forms them, are both positive. Any other `cov` is rank one
+/// in floating point or indefinite, and the nearest positive semidefinite
+/// covariance keeps only its major eigenpair: variance `m + r` with
+/// `m = (a + b)/2` and `r = hypot((a − b)/2, c)`, along the major eigenvector.
+/// A covariance with no positive eigenvalue is a point mass.
 fn projected_bivariate_posterior_mean_result<F>(
     quadctx: &gam_solve::quadrature::QuadratureContext,
     mu: [f64; 2],
@@ -791,30 +798,44 @@ fn projected_bivariate_posterior_mean_result<F>(
 where
     F: Fn(f64, f64) -> Result<f64, EstimationError>,
 {
-    let var0 = cov[0][0].max(0.0);
-    let var1 = cov[1][1].max(0.0);
-    let cov01 = cov[0][1];
-
-    if var0 <= POSTERIOR_MEAN_VARIANCE_TOL && var1 <= POSTERIOR_MEAN_VARIANCE_TOL {
+    if !cov.iter().flatten().all(|entry| entry.is_finite()) {
+        return Err(EstimationError::InvalidInput(format!(
+            "posterior mean requires a finite linear-predictor covariance; got {cov:?}"
+        )));
+    }
+    let (a, b, c) = (cov[0][0], cov[1][1], cov[1][0]);
+    if a > 0.0 {
+        let below = c / a.sqrt();
+        if b - below * below > 0.0 {
+            return gam_solve::quadrature::normal_expectation_2d_adaptive_result(
+                quadctx, mu, cov, integrand,
+            );
+        }
+    }
+    let half_difference = 0.5 * a - 0.5 * b;
+    let radius = half_difference.hypot(c);
+    let major = 0.5 * a + 0.5 * b + radius;
+    if major <= 0.0 {
         return integrand(mu[0], mu[1]);
     }
-    if var0 <= POSTERIOR_MEAN_VARIANCE_TOL && cov01.abs() <= POSTERIOR_MEAN_CROSS_TOL {
-        return gam_solve::quadrature::normal_expectation_nd_adaptive_result::<
-            1,
-            _,
-            _,
-            EstimationError,
-        >(quadctx, [mu[1]], [[var1]], 21, |x| integrand(mu[0], x[0]));
-    }
-    if var1 <= POSTERIOR_MEAN_VARIANCE_TOL && cov01.abs() <= POSTERIOR_MEAN_CROSS_TOL {
-        return gam_solve::quadrature::normal_expectation_nd_adaptive_result::<
-            1,
-            _,
-            _,
-            EstimationError,
-        >(quadctx, [mu[0]], [[var0]], 21, |x| integrand(x[0], mu[1]));
-    }
-    gam_solve::quadrature::normal_expectation_2d_adaptive_result(quadctx, mu, cov, integrand)
+    // The major eigenvector is `(r + h, c)` or `(c, r − h)` with `h = (a − b)/2`;
+    // take whichever adds rather than cancels. It is nonzero here: `r + h = 0`
+    // with `h ≥ 0` forces `h = c = 0`, so `a = b = m > 0` and both pivots were
+    // positive.
+    let (u0, u1) = if half_difference >= 0.0 {
+        (radius + half_difference, c)
+    } else {
+        (c, radius - half_difference)
+    };
+    let length = u0.hypot(u1);
+    let axis = [u0 / length, u1 / length];
+    gam_solve::quadrature::normal_expectation_nd_adaptive_result::<1, _, _, EstimationError>(
+        quadctx,
+        [0.0],
+        [[major]],
+        21,
+        |t| integrand(mu[0] + axis[0] * t[0], mu[1] + axis[1] * t[0]),
+    )
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
