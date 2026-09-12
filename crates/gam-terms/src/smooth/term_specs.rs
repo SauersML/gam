@@ -6135,28 +6135,24 @@ pub fn build_tensor_bspline_basis(
                 ..
             } => {
                 let effective_degree = degree.unwrap_or(marginal_unconstrained.degree);
-                let gram = if spec.double_penalty {
-                    Some(match periodic {
-                        Some((start, period, num_basis)) => {
-                            crate::basis::periodic_bspline_function_gram(
-                                start,
-                                start + period,
-                                effective_degree,
-                                num_basis,
-                            )?
-                        }
-                        None => crate::basis::bspline_function_gram(&knots, effective_degree)?,
-                    })
-                } else {
-                    None
+                // Every tensor penalty integrates over this margin's functions,
+                // so its function Gram `∫ b(t) b(t)ᵀ dt` is needed whether or not
+                // the null-function ridges are requested (#1561, SPEC rule 5).
+                let gram = match periodic {
+                    Some((start, period, num_basis)) => {
+                        crate::basis::periodic_bspline_function_gram(
+                            start,
+                            start + period,
+                            effective_degree,
+                            num_basis,
+                        )?
+                    }
+                    None => crate::basis::bspline_function_gram(&knots, effective_degree)?,
                 };
                 (knots, false, effective_degree, gram, periodic)
             }
             BasisMetadata::CubicRegression1D { knots, .. } => {
-                let gram = spec
-                    .double_penalty
-                    .then(|| crate::basis::cubic_regression_function_gram(&knots))
-                    .transpose()?;
+                let gram = crate::basis::cubic_regression_function_gram(&knots)?;
                 (knots, true, marginalspec.degree, gram, None)
             }
             _ => {
@@ -6181,16 +6177,14 @@ pub fn build_tensor_bspline_basis(
             }
             _ => knots,
         };
-        if let Some(function_gram) = function_gram {
-            if function_gram.dim() != (built.design.ncols(), built.design.ncols()) {
-                crate::bail_dim_basis!(
-                    "internal TensorBSpline error at dim {dim}: function Gram is {:?}, basis has {} columns",
-                    function_gram.dim(),
-                    built.design.ncols()
-                );
-            }
-            marginal_function_grams.push(function_gram);
+        if function_gram.dim() != (built.design.ncols(), built.design.ncols()) {
+            crate::bail_dim_basis!(
+                "internal TensorBSpline error at dim {dim}: function Gram is {:?}, basis has {} columns",
+                function_gram.dim(),
+                built.design.ncols()
+            );
         }
+        marginal_function_grams.push(function_gram);
         marginal_knots.push(metadata_knots);
         marginal_is_cr_flags.push(marginal_is_cr);
         marginal_degrees.push(effective_degree);
@@ -6273,38 +6267,37 @@ pub fn build_tensor_bspline_basis(
         .iter()
         .map(normalize_penalty_in_constrained_space)
         .collect();
-    if spec.double_penalty && marginal_function_grams.len() != marginalnum_basis.len() {
+    if marginal_function_grams.len() != marginalnum_basis.len() {
         crate::bail_dim_basis!(
-            "TensorBSpline double penalty requires one function Gram per margin; got {} for {} margins",
+            "TensorBSpline requires one function Gram per margin; got {} for {} margins",
             marginal_function_grams.len(),
             marginalnum_basis.len()
         );
     }
-    let mut kronecker_marginal_penalties =
-        Vec::<Array2<f64>>::with_capacity(normalized_marginal_penalties.len());
 
     match spec.penalty_decomposition {
         TensorBSplinePenaltyDecomposition::MarginalKroneckerSum => {
-            // Accumulate the Kronecker-sum of the per-margin penalties,
-            // `Σ_dim S_dim`, whose null space is exactly the *joint* null space
-            // of all marginal penalties — the tensor of marginal polynomial
-            // null spaces. The tensor double penalty (built after the
-            // identifiability chart) shrinks only this joint null, never the
-            // already-penalized interaction range.
+            // Margin `dim`'s roughness is integrated over the other margins'
+            // functions. For `f = Σ β (B_0 ⊗ … ⊗ B_{d-1})`,
+            // `∫ (∂ᵐ_dim f)² = βᵀ (G_0 ⊗ … ⊗ S_dim ⊗ … ⊗ G_{d-1}) β`, where `G_j`
+            // is margin `j`'s function Gram. `S_dim ⊗ I` would measure the other
+            // margins by their coefficients, and agrees with the integral only
+            // where those bases are Gram-orthonormal (#1561, SPEC rule 5). Every
+            // `G_j` is positive definite, so the joint null space of the sum is
+            // still the tensor of the marginal polynomial null spaces: the one
+            // the tensor double penalty (built after the identifiability chart)
+            // shrinks, never the already-penalized interaction range.
             for dim in 0..normalized_marginal_penalties.len() {
                 let mut s_dim = Array2::<f64>::eye(1);
                 let mut factors = Vec::<Array2<f64>>::with_capacity(marginalnum_basis.len());
-                for (j, &qj) in marginalnum_basis.iter().enumerate() {
+                for (j, gram) in marginal_function_grams.iter().enumerate() {
                     let factor = if j == dim {
                         normalized_marginal_penalties[j].0.clone()
                     } else {
-                        Array2::<f64>::eye(qj)
+                        gram.clone()
                     };
                     factors.push(factor.clone());
                     s_dim = kronecker_product(&s_dim, &factor);
-                }
-                if dim == kronecker_marginal_penalties.len() {
-                    kronecker_marginal_penalties.push(normalized_marginal_penalties[dim].0.clone());
                 }
                 candidates.push(PenaltyCandidate {
                     matrix: ConstructiveQuadratic::try_from_dense_psd(
@@ -6547,27 +6540,14 @@ pub fn build_tensor_bspline_basis(
             is_cr: marginal_is_cr_flags,
             identifiability_transform: z_opt,
         },
-        // The current Kronecker runtime diagonalizes only the marginal
-        // roughness operators and represents its optional joint-null block as
-        // a Euclidean selector. A function-space ridge generally does not
-        // commute with those marginals, so advertising it as factored would
+        // The Kronecker runtime diagonalizes each margin's roughness operator in
+        // its Euclidean eigenbasis, so the penalty it solves is `S_dim ⊗ I`. The
+        // canonical blocks above are `S_dim ⊗ G_others`, which no orthonormal
+        // marginal eigenbasis diagonalizes; advertising them as factored would
         // make PIRLS and REML solve a different objective. Keep the exact
-        // canonical matrices whenever null recovery is active.
-        kronecker_factored: if !spec.double_penalty
-            && matches!(spec.identifiability, TensorBSplineIdentifiability::None)
-            && matches!(
-                spec.penalty_decomposition,
-                TensorBSplinePenaltyDecomposition::MarginalKroneckerSum
-            ) {
-            Some(KroneckerFactoredBasis::new(
-                marginal_designs,
-                kronecker_marginal_penalties,
-                marginalnum_basis.clone(),
-                spec.double_penalty,
-            ))
-        } else {
-            None
-        },
+        // canonical matrices until that runtime carries the marginal function
+        // Grams (#1561).
+        kronecker_factored: None,
     })
 }
 
