@@ -589,7 +589,7 @@ impl<const K: usize, const LIN: u32> gam_math::nested_dual::JetField for SparseT
 }
 
 /// Contract a `Tower3` third tensor with one primary-space direction —
-/// `out[a][b] = Σ_c t3[a][b][c]·dir[c]` — exactly [`Tower4::third_contracted`]'s
+/// `out[a][b] = Σ_c t3[a][b][c]·dir[c]` — exactly `Tower4::third_contracted`'s
 /// arithmetic (same accumulation order), used by the build-once first-directional
 /// path on the pruned [`SparseTower3`] towers.
 #[inline]

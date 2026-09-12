@@ -1,5 +1,5 @@
 {
-  "generated_from": "b37d98d521708d3a16ef883cf2c4557ff91d8edd",
+  "generated_from": "416b02b39efc80709795c3fd30e2db991be1d345",
   "units": {
     "crates/gam-cli": 27,
     "crates/gam-config": 18,
@@ -10,8 +10,8 @@
     "crates/gam-gpu": 73,
     "crates/gam-identifiability": 72,
     "crates/gam-inference": 131,
-    "crates/gam-linalg": 282,
-    "crates/gam-math": 258,
+    "crates/gam-linalg": 280,
+    "crates/gam-math": 257,
     "crates/gam-model-api": 10,
     "crates/gam-model-kernels": 88,
     "crates/gam-models": 1409,
@@ -49,7 +49,7 @@
     "tests/quality_1082": 0,
     "tests/regressions": 510,
     "tests/sae": 127,
-    "tests/src_modules": 540,
+    "tests/src_modules": 537,
     "tests/survival": 80,
     "tests/test_support": 0,
     "tests/thread_count_reproducibility": 4

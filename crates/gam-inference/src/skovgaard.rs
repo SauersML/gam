@@ -825,11 +825,11 @@ mod tests {
         let r = res.r;
         let u = res.u; // canonical ⇒ u = (θ̂−θ₀)√ĵ, the Wald root
         // Our r* right-tail P(X ≥ x) = Φ(−r*).
-        let p_rstar = gam_math::probability::normal_sf(res.r_star);
+        let p_rstar = gam_math::probability::normal_cdf(-res.r_star);
         // Lugannani–Rice tail from the same (r, u).
         let p_lr =
-            gam_math::probability::normal_sf(r) - normal_pdf(r) * (1.0 / r - 1.0 / u);
-        let p_first = gam_math::probability::normal_sf(r);
+            gam_math::probability::normal_cdf(-r) - normal_pdf(r) * (1.0 / r - 1.0 / u);
+        let p_first = gam_math::probability::normal_cdf(-r);
         (p_rstar, p_lr, p_first)
     }
 

@@ -522,7 +522,7 @@ impl SurvivalLsRowKernel<'_> {
 ///   (2.8 KiB/row, the `RowKernel::row_fourth_contracted` path).
 ///
 /// The value/gradient/Hessian consumer lowers the same three scalar indices
-/// `(u0,u1,g)` through [`MappedOrder2Accumulator`]. Each index is differentiated
+/// `(u0,u1,g)` through one axis-mapped order-two scatter. Each index is differentiated
 /// in its natural 3/3/5-dimensional support and scattered through a literal
 /// axis map, so no dense 9×9 intermediates or runtime dependency masks survive.
 ///
@@ -5649,7 +5649,109 @@ mod patterned_order2_perf_tests {
         (value, gradient, hessian)
     }
     use super::*;
-    use gam_math::jet_scalar::MappedOrder2Accumulator;
+
+    /// Test-local axis-mapped order-two scatter: the exact Faà di Bruno
+    /// composition `g[a_i] += f' q_i`, `H[a_i,a_j] += f' q_ij + f'' q_i q_j` of one
+    /// low-dimensional atom into the global `K` channels. [`sls_row_vgh_compiled`]
+    /// lowers through this copy, not through the production Hessian-pair scatter,
+    /// so its comparison against `dense` stays independent of production.
+    #[derive(Clone, Copy, Debug)]
+    struct MappedOrder2Accumulator<const K: usize> {
+        value: f64,
+        gradient: [f64; K],
+        hessian: [[f64; K]; K],
+    }
+
+    impl<const K: usize> MappedOrder2Accumulator<K> {
+        fn zero() -> Self {
+            Self {
+                value: 0.0,
+                gradient: [0.0; K],
+                hessian: [[0.0; K]; K],
+            }
+        }
+
+        /// Scatter `f(atom)` through an injective local-to-global axis map.
+        #[inline(always)]
+        fn add_composed<const N: usize, const H: usize, A: Order2AtomChannels<N>>(
+            &mut self,
+            atom: &A,
+            axes: [usize; N],
+            derivatives: [f64; 3],
+            value_add: bool,
+            gradient_add: [bool; N],
+            hessian_add: [bool; H],
+        ) {
+            assert!(H == N * (N + 1) / 2, "invalid mapped Hessian write shape");
+            assert!(N <= 128 && H <= 128, "mapped atom sparsity mask overflow");
+            assert!(
+                axes.iter().all(|&axis| axis < K),
+                "mapped atom axis must be within the global primary dimension"
+            );
+            assert!(
+                axes.iter()
+                    .enumerate()
+                    .all(|(i, axis)| !axes[..i].contains(axis)),
+                "mapped atom axes must be injective"
+            );
+
+            if value_add {
+                self.value += derivatives[0];
+            } else {
+                self.value = derivatives[0];
+            }
+            let mut packed = 0;
+            for local_i in 0..N {
+                let global_i = axes[local_i];
+                if A::GRADIENT_BITS & (1u128 << local_i) != 0 {
+                    let channel = derivatives[1] * atom.gradient_at(local_i);
+                    if gradient_add[local_i] {
+                        self.gradient[global_i] += channel;
+                    } else {
+                        self.gradient[global_i] = channel;
+                    }
+                }
+                for local_j in local_i..N {
+                    let global_j = axes[local_j];
+                    let inner_live = A::HESSIAN_BITS & (1u128 << packed) != 0;
+                    let outer_live = A::GRADIENT_BITS & (1u128 << local_i) != 0
+                        && A::GRADIENT_BITS & (1u128 << local_j) != 0;
+                    let channel = if inner_live {
+                        let inner = derivatives[1] * atom.hessian_at(local_i, local_j);
+                        if outer_live {
+                            inner
+                                + derivatives[2]
+                                    * atom.gradient_at(local_i)
+                                    * atom.gradient_at(local_j)
+                        } else {
+                            inner
+                        }
+                    } else if outer_live {
+                        derivatives[2] * atom.gradient_at(local_i) * atom.gradient_at(local_j)
+                    } else {
+                        packed += 1;
+                        continue;
+                    };
+                    if hessian_add[packed] {
+                        self.hessian[global_i][global_j] += channel;
+                        if global_i != global_j {
+                            self.hessian[global_j][global_i] += channel;
+                        }
+                    } else {
+                        self.hessian[global_i][global_j] = channel;
+                        if global_i != global_j {
+                            self.hessian[global_j][global_i] = channel;
+                        }
+                    }
+                    packed += 1;
+                }
+            }
+        }
+
+        fn into_channels(self) -> (f64, [f64; K], [[f64; K]; K]) {
+            (self.value, self.gradient, self.hessian)
+        }
+    }
 
     // Ahead-of-time sparse jet lowering of `sls_row_nll` for the V/G/H
     // channels — the mechanical oracle/racer the release cell measures
@@ -5890,7 +5992,16 @@ mod patterned_order2_perf_tests {
         let t4_vars: [Tower4<SLS_ROW_K>; SLS_ROW_K] =
             std::array::from_fn(|a| Tower4::variable(p[a], a));
         let dense4 = sls_row_nll(&t4_vars, &kernel).expect("dense Tower4");
-        let dense_fourth = dense4.fourth_contracted(&dir_u, &dir_v);
+        let mut dense_fourth = [[0.0; SLS_ROW_K]; SLS_ROW_K];
+        for a in 0..SLS_ROW_K {
+            for b in 0..SLS_ROW_K {
+                for c in 0..SLS_ROW_K {
+                    for d in 0..SLS_ROW_K {
+                        dense_fourth[a][b] += dense4.t4[a][b][c][d] * dir_u[c] * dir_v[d];
+                    }
+                }
+            }
+        }
         for a in 0..SLS_ROW_K {
             for b in 0..SLS_ROW_K {
                 let mut dense_third_ab = 0.0;

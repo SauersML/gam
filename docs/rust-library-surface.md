@@ -189,11 +189,11 @@ dropped, and restored items the table above retires were removed again.
 
 | Disposition | Identities |
 | --- | --- |
-| Restored in place | 894 |
+| Restored in place | 887 |
 | Defined elsewhere in the same crate | 17 |
 | Retired by the decisions above | 19 |
 | Retired: nothing that survived depends on it | 278 |
-| Retired by the owning work's own decision | 7 |
+| Retired by the owning work's own decision | 14 |
 | Deferred to the owner of an actively edited file | 19 |
 
 Retired identities carry no compatibility obligation. Restoration is closed
@@ -216,6 +216,12 @@ carrier and dangling reference. Steering retired its own carriers
 Survival retired its own: the `CertifiedLogSigmaCurvature` carrier with its three
 deleted identities, and `survival_location_scale_block_effective_jacobian`, which
 nothing that survived calls.
+Jets retired seven restored identities that only tests used: `normal_sf` and
+`student_t_sf` (`probability.rs`) and `fit_grid_spline_2d` (`grid_spline_2d.rs`)
+are deleted; `FdDerivative::judge` and `ladder_report` (`numeric_derivative.rs`)
+moved into `gam_test_support::FdDerivativeJudgement`; and `Tower4::third_contracted`
+and `fourth_contracted` (`jet_tower.rs`) moved into that file's `#[cfg(test)]`
+module.
 
 Three restorations were adapted rather than taken verbatim:
 

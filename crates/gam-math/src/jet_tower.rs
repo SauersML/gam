@@ -435,58 +435,6 @@ impl<const K: usize> Tower4<K> {
     pub fn ln_gamma(&self) -> Self {
         self.compose_unary(ln_gamma_derivative_stack(self.v))
     }
-
-    /// Contract `t3` with one primary-space direction:
-    /// `out[a][b] = Σ_c t3[a][b][c] · dir[c]` — exactly the
-    /// `row_third_contracted` shape.
-    ///
-    /// The output is symmetric in `(a, b)`: `t3` is fully index-symmetric, so
-    /// `t3[a][b][c] == t3[b][a][c]` and the `Σ_c` contraction gives
-    /// `out[a][b] == out[b][a]` term-for-term, in the same `c` order. We compute
-    /// only the upper triangle `a ≤ b` (the inner contraction is unchanged and
-    /// stays contiguous/vectorisable) and mirror into the lower triangle — this
-    /// is BIT-IDENTICAL to the full `a, b ∈ 0..K` nest while doing ~2× fewer
-    /// inner contractions, with no dense scatter (the mirror is a `K × K` copy).
-    pub fn third_contracted(&self, dir: &[f64; K]) -> [[f64; K]; K] {
-        let mut out = [[0.0; K]; K];
-        for a in 0..K {
-            for b in a..K {
-                let mut acc = 0.0;
-                for c in 0..K {
-                    acc += self.t3[a][b][c] * dir[c];
-                }
-                out[a][b] = acc;
-                out[b][a] = acc;
-            }
-        }
-        out
-    }
-
-    /// Contract `t4` with two primary-space directions:
-    /// `out[a][b] = Σ_{c,d} t4[a][b][c][d] · u[c] · v[d]` — exactly the
-    /// `row_fourth_contracted` shape.
-    ///
-    /// As in [`Self::third_contracted`], the output is symmetric in `(i, j)`
-    /// (`t4[j][i][k][l] == t4[i][j][k][l]`, contracted in the same `(k, l)`
-    /// order), so the upper triangle `i ≤ j` is computed and mirrored —
-    /// BIT-IDENTICAL to the full nest, ~2× fewer inner `Σ_{k,l}` contractions,
-    /// and the inner double loop stays the original contiguous/vectorisable form.
-    pub fn fourth_contracted(&self, u: &[f64; K], w: &[f64; K]) -> [[f64; K]; K] {
-        let mut out = [[0.0; K]; K];
-        for i in 0..K {
-            for j in i..K {
-                let mut acc = 0.0;
-                for k in 0..K {
-                    for l in 0..K {
-                        acc += self.t4[i][j][k][l] * u[k] * w[l];
-                    }
-                }
-                out[i][j] = acc;
-                out[j][i] = acc;
-            }
-        }
-        out
-    }
 }
 
 impl<const K: usize> jet_algebra::JetAlgebra<5> for Tower4<K> {
@@ -1483,6 +1431,65 @@ pub fn program_full_tower<const K: usize, P: RowProgram<K> + ?Sized>(
 }
 
 // ── The oracle ───────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod test_support {
+    use super::*;
+
+    impl<const K: usize> Tower4<K> {
+        /// Contract `t3` with one primary-space direction:
+        /// `out[a][b] = Σ_c t3[a][b][c] · dir[c]` — exactly the
+        /// `row_third_contracted` shape.
+        ///
+        /// The output is symmetric in `(a, b)`: `t3` is fully index-symmetric, so
+        /// `t3[a][b][c] == t3[b][a][c]` and the `Σ_c` contraction gives
+        /// `out[a][b] == out[b][a]` term-for-term, in the same `c` order. We compute
+        /// only the upper triangle `a ≤ b` (the inner contraction is unchanged and
+        /// stays contiguous/vectorisable) and mirror into the lower triangle — this
+        /// is BIT-IDENTICAL to the full `a, b ∈ 0..K` nest while doing ~2× fewer
+        /// inner contractions, with no dense scatter (the mirror is a `K × K` copy).
+        pub fn third_contracted(&self, dir: &[f64; K]) -> [[f64; K]; K] {
+            let mut out = [[0.0; K]; K];
+            for a in 0..K {
+                for b in a..K {
+                    let mut acc = 0.0;
+                    for c in 0..K {
+                        acc += self.t3[a][b][c] * dir[c];
+                    }
+                    out[a][b] = acc;
+                    out[b][a] = acc;
+                }
+            }
+            out
+        }
+
+        /// Contract `t4` with two primary-space directions:
+        /// `out[a][b] = Σ_{c,d} t4[a][b][c][d] · u[c] · v[d]` — exactly the
+        /// `row_fourth_contracted` shape.
+        ///
+        /// As in [`Self::third_contracted`], the output is symmetric in `(i, j)`
+        /// (`t4[j][i][k][l] == t4[i][j][k][l]`, contracted in the same `(k, l)`
+        /// order), so the upper triangle `i ≤ j` is computed and mirrored —
+        /// BIT-IDENTICAL to the full nest, ~2× fewer inner `Σ_{k,l}` contractions,
+        /// and the inner double loop stays the original contiguous/vectorisable form.
+        pub fn fourth_contracted(&self, u: &[f64; K], w: &[f64; K]) -> [[f64; K]; K] {
+            let mut out = [[0.0; K]; K];
+            for i in 0..K {
+                for j in i..K {
+                    let mut acc = 0.0;
+                    for k in 0..K {
+                        for l in 0..K {
+                            acc += self.t4[i][j][k][l] * u[k] * w[l];
+                        }
+                    }
+                    out[i][j] = acc;
+                    out[j][i] = acc;
+                }
+            }
+            out
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {

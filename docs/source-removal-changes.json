@@ -2152,5 +2152,38 @@
     ],
     "reason": "user directive: delete all useless slop (only used by tests / unused)",
     "evidence": "With this change applied at e55b3e35e, a grep of the tree found no reference to EncodeAtomDevice, EncodeChartDevice, DeviceRowCertificate, DeviceEncodeRow, emulate_certified_encode_row, emulate_certified_encode_batch, ENCODE_KERNEL_SOURCE, encode_kernel_source, EncodePath, sae_certified_encode_batch, sae_certified_encode_device, DeviceEncodeThroughput, measure_device_encode_throughput or from_atom_atlas outside a prose comment in gam-gpu/src/numerics_host.rs; the DEVICE_ROW_THRESHOLD left in gam-models is that crate's own private const. The private items listed (the emulator's basis, Newton, certificate, routing and scratch helpers and the linux CUDA backend) were reachable only from those. jacobi_eigh, JACOBI_MAX_SWEEPS, jacobi_off_diagonal_band_coefficient_squared and their test stay, since gam-pyffi calls jacobi_eigh by this path. Pre-push gate on MSI, job 435710: cargo check --workspace --exclude gam-pyffi --all-targets --keep-going rc 0 at e55b3e35e and rc 0 on the exact candidate tree; cargo doc -p gam-sae with 0 errors and 0 warnings; the retained test passes; the test census reports no loss; these items are the guard's own output over e55b3e35e..candidate. Commits between e55b3e35e and the landing tip touch no gam-sae file."
+  },
+  {
+    "base": "0367fa300456f3a2ec5ef4c22c9b349e1c8fa27d",
+    "items": [
+      "crates/gam-linalg/src/curvature_resolution.rs:fn:resolves",
+      "crates/gam-linalg/src/curvature_resolution.rs:fn:resolves_has_a_witness_on_both_sides",
+      "crates/gam-linalg/src/numeric_derivative.rs:fn:judge",
+      "crates/gam-linalg/src/numeric_derivative.rs:fn:ladder_report",
+      "crates/gam-linalg/src/test_support/fd_checker.rs:fn:directional_central_diff",
+      "crates/gam-linalg/src/test_support/fd_checker.rs:fn:quadratic_gradient_and_directional_match_closed_form",
+      "crates/gam-linalg/src/test_support/fd_checker.rs:fn:verify_gradient_vs_fd",
+      "crates/gam-linalg/src/test_support/fd_checker.rs:fn:verify_rejects_wrong_gradient",
+      "crates/gam-math/examples/special_audit_dump.rs:fn:emit",
+      "crates/gam-math/examples/special_audit_dump.rs:fn:geometric_grid",
+      "crates/gam-math/examples/special_audit_dump.rs:fn:linear_grid",
+      "crates/gam-math/examples/special_audit_dump.rs:fn:main",
+      "crates/gam-math/src/probability.rs:fn:normal_sf",
+      "crates/gam-math/src/probability.rs:fn:normal_sf_keeps_the_upper_tail_that_one_minus_the_cdf_destroys",
+      "crates/gam-math/src/probability.rs:fn:student_t_sf",
+      "crates/gam-math/src/special.rs:fn:gauss_lobatto",
+      "crates/gam-math/src/special.rs:fn:gauss_lobatto_includes_its_endpoints_and_is_exact_to_two_n_minus_three",
+      "crates/gam-terms/src/basis/closed_form_penalty.rs:fn:aniso_invariants",
+      "crates/gam-terms/src/basis/closed_form_penalty.rs:fn:aniso_invariants_scalar",
+      "crates/gam-terms/src/basis/closed_form_penalty.rs:fn:aniso_invariants_simd",
+      "crates/gam-terms/src/basis/matern_kernel.rs:fn:closed_form_aniso_psi_derivatives_in_total_basis",
+      "crates/gam-terms/src/basis/matern_kernel.rs:fn:closed_form_matern_pair_block",
+      "crates/gam-terms/src/grid_spline_2d.rs:fn:fit_grid_spline_2d",
+      "tests/src_modules/smooths/basis_radial_periodic_thinplate_tests.rs:fn:test_matern_closed_form_gates_when_divergent",
+      "tests/src_modules/smooths/basis_radial_periodic_thinplate_tests.rs:fn:test_matern_closed_form_matches_collocation",
+      "tests/src_modules/smooths/basis_radial_periodic_thinplate_tests.rs:fn:test_matern_closed_form_q1_q2_psd_and_finite"
+    ],
+    "reason": "user directive: delete all useless slop",
+    "evidence": "Lane job 433840 applied the four batch patches over 7bc19ed40 in order and compiled that exact tree: ban_scanner.sh 0; cargo check --workspace --exclude gam-pyffi --all-targets --keep-going finished with no errors; cargo check -p <crate> --all-targets 0 for gam-terms, gam-linalg, gam-test-support, gam-math, gam-inference and gam-models; RUSTDOCFLAGS=\"-D warnings\" cargo doc -p <crate> --no-deps 0 errors for each of those crates. That workspace build over every target is the re-confirmation that no production, example, bench or test code outside these edits names a deleted item. The items are source_removal_guard.py's own list from lane job 435701, taken over 7bc19ed40 -> one lane-local commit of all four patches (26 items, equal to the sum of the four per-batch guard lists in job 433840). Before the push, the working copy of all 24 files carried exactly the staged change lines. The only upstream change to those files since 7bc19ed40 is 30774c868's doc comment in tests/src_modules/smooths/basis_duchon_matern_jet_derivative_tests.rs, which lies outside these hunks."
   }
 ]

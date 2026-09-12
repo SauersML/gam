@@ -23,6 +23,7 @@
 
 use super::*;
 use gam_linalg::test_support::fd_checker::{FdVerdict, RiddersConfig, ridders_derivative};
+use gam_test_support::FdDerivativeJudgement;
 use gam_terms::basis::{
     CenterStrategy, DuchonBasisSpec, DuchonNullspaceOrder, DuchonOperatorPenaltySpec,
     OneDimensionalBoundary, SpatialIdentifiability,

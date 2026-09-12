@@ -2534,38 +2534,18 @@ fn singular_convergent_derivative_builders_use_analytic_self_pair() {
         0,
         None,
     );
-    let (aniso_value, _, _, _) = closed_form_aniso_psi_derivatives_in_total_basis(
-        centers.view(),
-        q,
-        m,
-        s,
-        kappa,
-        Some(&eta),
-        None,
-        0,
-        None,
-    );
 
     for i in 0..centers.nrows() {
         for j in 0..centers.nrows() {
             let denom = value[[i, j]]
                 .abs()
                 .max(psi_value[[i, j]].abs())
-                .max(aniso_value[[i, j]].abs())
                 .max(1e-300);
             assert!(
                 (psi_value[[i, j]] - value[[i, j]]).abs() / denom < 1e-12,
-                "log-kappa derivative builder value must match analytic pair matrix at ({i},{j}): value={:.16e} psi_value={:.16e} aniso_value={:.16e}",
+                "log-kappa derivative builder value must match analytic pair matrix at ({i},{j}): value={:.16e} psi_value={:.16e}",
                 value[[i, j]],
                 psi_value[[i, j]],
-                aniso_value[[i, j]]
-            );
-            assert!(
-                (aniso_value[[i, j]] - value[[i, j]]).abs() / denom < 1e-12,
-                "eta derivative builder value must match analytic pair matrix at ({i},{j}): value={:.16e} psi_value={:.16e} aniso_value={:.16e}",
-                value[[i, j]],
-                psi_value[[i, j]],
-                aniso_value[[i, j]]
             );
         }
     }
@@ -3128,10 +3108,17 @@ fn assert_pair_block_bundle_fully_fd_gated<F>(
 #[test]
 fn test_pair_block_derivative_branch_matrix_is_fully_fd_gated_2315() {
     use super::closed_form_penalty::{
-        analytic_self_pair_bundle, aniso_invariants, hybrid_self_pair_bundle_odd_d,
+        AnisoMetricPowers, analytic_self_pair_bundle, aniso_invariants_with_powers,
+        hybrid_self_pair_bundle_odd_d,
         pair_block_radial_with_j_second_derivatives, schoenberg_self_pair_bundle,
         schwinger_radial_is_convergent, use_duchon_small_chi_riesz_series,
     };
+
+    // The axis-rescaled lag length R and anisotropy traces the radial form reads,
+    // built from the same metric powers the production chart dispatch uses.
+    fn aniso_invariants(eta: &[f64], r: &[f64]) -> (f64, f64, f64, f64, f64) {
+        aniso_invariants_with_powers(&AnisoMetricPowers::new(eta), r)
+    }
 
     // Zero lag has two independent analytic implementations. Exercise every
     // q match arm in convergent odd/even Schoenberg regimes and in the

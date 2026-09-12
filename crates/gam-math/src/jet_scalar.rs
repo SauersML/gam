@@ -4030,37 +4030,6 @@ impl<const K: usize> crate::nested_dual::JetField for Order2<K> {
     }
 }
 
-/// Static lowering target for a sum of composed, low-dimensional row atoms.
-///
-/// A row likelihood often depends on a large global primary vector only through
-/// a few small independent indices.  Evaluating the whole expression in an
-/// `Order2<K>` then pays dense `K²` arithmetic at every intermediate; carrying
-/// runtime dependency masks replaces that arithmetic with branches and bit
-/// scans.  This accumulator provides the ahead-of-time alternative: evaluate
-/// each index once in its natural local dimension `N`, then scatter the exact
-/// second-order composition into the global `K` channels through a fixed axis
-/// map.  The family still owns only its scalar index expression and certified
-/// unary derivative stack; this type owns the universal chain rule.
-///
-/// For an atom `q(x_local)` and outer stack `[f(q), f'(q), f''(q)]`, the lowered
-/// channels are
-///
-/// ```text
-/// g[a_i]       += f' q_i
-/// H[a_i, a_j] += f' q_ij + f'' q_i q_j.
-/// ```
-///
-/// Only the local upper triangle is evaluated, then mirrored into the global
-/// symmetric output.  With literal `axes` and fixed `N`, LLVM unrolls this into
-/// straight-line arithmetic: no dependency masks, sparse-pair lookups, or jet
-/// temporaries survive into the generated schedule.
-#[derive(Clone, Copy, Debug)]
-pub struct MappedOrder2Accumulator<const K: usize> {
-    value: f64,
-    gradient: [f64; K],
-    hessian: [[f64; K]; K],
-}
-
 /// Compile-time-symbolic value/gradient/Hessian of one local row atom.
 ///
 /// The Hessian stores only its upper triangle, in row-major triangular order.
@@ -4125,10 +4094,10 @@ impl<const N: usize, const H: usize, const G: u128, const Q: u128> StaticOrder2A
     }
 }
 
-/// Order-two channel reader accepted by [`MappedOrder2Accumulator`].
+/// Order-two channel reader for one composed low-dimensional row atom.
 ///
 /// Both ordinary forward jets and build-time-symbolic atoms implement this
-/// interface. The accumulator owns the only global scatter/chain rule.
+/// interface, so one axis-mapped scatter owns the global chain rule for both.
 pub trait Order2AtomChannels<const N: usize> {
     /// Structurally live local gradient channels.
     const GRADIENT_BITS: u128;
@@ -4180,106 +4149,6 @@ const fn low_mask(channels: usize) -> u128 {
     }
 }
 
-impl<const K: usize> MappedOrder2Accumulator<K> {
-    /// Empty additive accumulator.
-    #[inline(always)]
-    #[must_use]
-    pub fn zero() -> Self {
-        Self {
-            value: 0.0,
-            gradient: [0.0; K],
-            hessian: [[0.0; K]; K],
-        }
-    }
-
-    /// Scatter `f(atom)` using the exact order-two Faà di Bruno rule.
-    ///
-    /// `axes[i]` maps local derivative axis `i` to its global primary axis. The
-    /// map must be injective. Repeated axes describe a non-injective linear
-    /// pullback whose identified cross terms need multiplicity that this simple
-    /// scatter deliberately does not represent.
-    #[inline(always)]
-    pub fn add_composed<const N: usize, const H: usize, A: Order2AtomChannels<N>>(
-        &mut self,
-        atom: &A,
-        axes: [usize; N],
-        derivatives: [f64; 3],
-        value_add: bool,
-        gradient_add: [bool; N],
-        hessian_add: [bool; H],
-    ) {
-        assert!(H == N * (N + 1) / 2, "invalid mapped Hessian write shape");
-        assert!(N <= 128 && H <= 128, "mapped atom sparsity mask overflow");
-        assert!(
-            axes.iter().all(|&axis| axis < K),
-            "mapped atom axis must be within the global primary dimension"
-        );
-        assert!(
-            axes.iter()
-                .enumerate()
-                .all(|(i, axis)| !axes[..i].contains(axis)),
-            "mapped atom axes must be injective"
-        );
-
-        if value_add {
-            self.value += derivatives[0];
-        } else {
-            self.value = derivatives[0];
-        }
-        let mut packed = 0;
-        for local_i in 0..N {
-            let global_i = axes[local_i];
-            if A::GRADIENT_BITS & (1u128 << local_i) != 0 {
-                let channel = derivatives[1] * atom.gradient_at(local_i);
-                if gradient_add[local_i] {
-                    self.gradient[global_i] += channel;
-                } else {
-                    self.gradient[global_i] = channel;
-                }
-            }
-            for local_j in local_i..N {
-                let global_j = axes[local_j];
-                let inner_live = A::HESSIAN_BITS & (1u128 << packed) != 0;
-                let outer_live = A::GRADIENT_BITS & (1u128 << local_i) != 0
-                    && A::GRADIENT_BITS & (1u128 << local_j) != 0;
-                let channel = if inner_live {
-                    let inner = derivatives[1] * atom.hessian_at(local_i, local_j);
-                    if outer_live {
-                        inner
-                            + derivatives[2] * atom.gradient_at(local_i) * atom.gradient_at(local_j)
-                    } else {
-                        inner
-                    }
-                } else if outer_live {
-                    derivatives[2] * atom.gradient_at(local_i) * atom.gradient_at(local_j)
-                } else {
-                    packed += 1;
-                    continue;
-                };
-                if hessian_add[packed] {
-                    self.hessian[global_i][global_j] += channel;
-                    if global_i != global_j {
-                        self.hessian[global_j][global_i] += channel;
-                    }
-                } else {
-                    self.hessian[global_i][global_j] = channel;
-                    if global_i != global_j {
-                        self.hessian[global_j][global_i] = channel;
-                    }
-                }
-                packed += 1;
-            }
-        }
-    }
-
-    /// Finish the lowering in the standard row-kernel channel layout.
-    #[inline(always)]
-    #[must_use]
-    pub fn into_channels(self) -> (f64, [f64; K], [[f64; K]; K]) {
-        (self.value, self.gradient, self.hessian)
-    }
-}
-
 /// One inner scalar in a runtime-width additive order-two composition.
 ///
 /// Implementors expose only the inner gradient and Hessian. The corresponding
@@ -4302,8 +4171,7 @@ pub trait DynamicOrder2Term {
 
 /// Allocation-minimal runtime-width lowering of an additive order-two program.
 ///
-/// This is the dynamic-width sibling of [`MappedOrder2Accumulator`]. A caller
-/// first reduces its mathematical row program to a scalar value plus `N`
+/// A caller first reduces its mathematical row program to a scalar value plus `N`
 /// independent composed sources. This accumulator then performs the universal
 /// chain rule
 ///
@@ -5780,10 +5648,147 @@ impl<const K: usize> crate::nested_dual::JetField for crate::jet_tower::Tower4<K
 }
 
 #[cfg(test)]
+mod test_support {
+    use super::*;
+
+    /// Static lowering target for a sum of composed, low-dimensional row atoms.
+    ///
+    /// A row likelihood often depends on a large global primary vector only through
+    /// a few small independent indices.  Evaluating the whole expression in an
+    /// `Order2<K>` then pays dense `K²` arithmetic at every intermediate; carrying
+    /// runtime dependency masks replaces that arithmetic with branches and bit
+    /// scans.  This accumulator provides the ahead-of-time alternative: evaluate
+    /// each index once in its natural local dimension `N`, then scatter the exact
+    /// second-order composition into the global `K` channels through a fixed axis
+    /// map.  The family still owns only its scalar index expression and certified
+    /// unary derivative stack; this type owns the universal chain rule.
+    ///
+    /// For an atom `q(x_local)` and outer stack `[f(q), f'(q), f''(q)]`, the lowered
+    /// channels are
+    ///
+    /// ```text
+    /// g[a_i]       += f' q_i
+    /// H[a_i, a_j] += f' q_ij + f'' q_i q_j.
+    /// ```
+    ///
+    /// Only the local upper triangle is evaluated, then mirrored into the global
+    /// symmetric output.  With literal `axes` and fixed `N`, LLVM unrolls this into
+    /// straight-line arithmetic: no dependency masks, sparse-pair lookups, or jet
+    /// temporaries survive into the generated schedule.
+    #[derive(Clone, Copy, Debug)]
+    pub struct MappedOrder2Accumulator<const K: usize> {
+        value: f64,
+        gradient: [f64; K],
+        hessian: [[f64; K]; K],
+    }
+
+    impl<const K: usize> MappedOrder2Accumulator<K> {
+        /// Empty additive accumulator.
+        #[inline(always)]
+        #[must_use]
+        pub fn zero() -> Self {
+            Self {
+                value: 0.0,
+                gradient: [0.0; K],
+                hessian: [[0.0; K]; K],
+            }
+        }
+
+        /// Scatter `f(atom)` using the exact order-two Faà di Bruno rule.
+        ///
+        /// `axes[i]` maps local derivative axis `i` to its global primary axis. The
+        /// map must be injective. Repeated axes describe a non-injective linear
+        /// pullback whose identified cross terms need multiplicity that this simple
+        /// scatter deliberately does not represent.
+        #[inline(always)]
+        pub fn add_composed<const N: usize, const H: usize, A: Order2AtomChannels<N>>(
+            &mut self,
+            atom: &A,
+            axes: [usize; N],
+            derivatives: [f64; 3],
+            value_add: bool,
+            gradient_add: [bool; N],
+            hessian_add: [bool; H],
+        ) {
+            assert!(H == N * (N + 1) / 2, "invalid mapped Hessian write shape");
+            assert!(N <= 128 && H <= 128, "mapped atom sparsity mask overflow");
+            assert!(
+                axes.iter().all(|&axis| axis < K),
+                "mapped atom axis must be within the global primary dimension"
+            );
+            assert!(
+                axes.iter()
+                    .enumerate()
+                    .all(|(i, axis)| !axes[..i].contains(axis)),
+                "mapped atom axes must be injective"
+            );
+
+            if value_add {
+                self.value += derivatives[0];
+            } else {
+                self.value = derivatives[0];
+            }
+            let mut packed = 0;
+            for local_i in 0..N {
+                let global_i = axes[local_i];
+                if A::GRADIENT_BITS & (1u128 << local_i) != 0 {
+                    let channel = derivatives[1] * atom.gradient_at(local_i);
+                    if gradient_add[local_i] {
+                        self.gradient[global_i] += channel;
+                    } else {
+                        self.gradient[global_i] = channel;
+                    }
+                }
+                for local_j in local_i..N {
+                    let global_j = axes[local_j];
+                    let inner_live = A::HESSIAN_BITS & (1u128 << packed) != 0;
+                    let outer_live = A::GRADIENT_BITS & (1u128 << local_i) != 0
+                        && A::GRADIENT_BITS & (1u128 << local_j) != 0;
+                    let channel = if inner_live {
+                        let inner = derivatives[1] * atom.hessian_at(local_i, local_j);
+                        if outer_live {
+                            inner
+                                + derivatives[2] * atom.gradient_at(local_i) * atom.gradient_at(local_j)
+                        } else {
+                            inner
+                        }
+                    } else if outer_live {
+                        derivatives[2] * atom.gradient_at(local_i) * atom.gradient_at(local_j)
+                    } else {
+                        packed += 1;
+                        continue;
+                    };
+                    if hessian_add[packed] {
+                        self.hessian[global_i][global_j] += channel;
+                        if global_i != global_j {
+                            self.hessian[global_j][global_i] += channel;
+                        }
+                    } else {
+                        self.hessian[global_i][global_j] = channel;
+                        if global_i != global_j {
+                            self.hessian[global_j][global_i] = channel;
+                        }
+                    }
+                    packed += 1;
+                }
+            }
+        }
+
+        /// Finish the lowering in the standard row-kernel channel layout.
+        #[inline(always)]
+        #[must_use]
+        pub fn into_channels(self) -> (f64, [f64; K], [[f64; K]; K]) {
+            (self.value, self.gradient, self.hessian)
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::jet_tower::{RowProgram, Tower4, program_full_tower};
     use crate::nested_dual::JetField;
+    use super::test_support::MappedOrder2Accumulator;
 
     #[test]
     fn runtime_fused_product_composition_preserves_tower4_channels() {

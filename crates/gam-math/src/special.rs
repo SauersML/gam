@@ -679,75 +679,6 @@ pub fn gauss_legendre(n: usize) -> (Vec<f64>, Vec<f64>) {
     (nodes, weights)
 }
 
-/// Gauss-Lobatto nodes and weights on `[-1, 1]`, ascending, for `n >= 2`.
-///
-/// The closed sibling of [`gauss_legendre`]: the two endpoints are nodes,
-/// and the `n - 2` interior nodes are the roots of `P'_{n-1}`, with
-///
-/// ```text
-/// w_endpoint = 2 / (n (n − 1)),      w_i = 2 / (n (n − 1) P_{n−1}(x_i)²).
-/// ```
-///
-/// It integrates polynomials of degree `2n − 3` exactly, two degrees short
-/// of the open rule of the same size, which buys the property the open rule
-/// cannot have: a quantity known to matter AT a segment boundary is a node
-/// of the rule rather than a point the rule steps over. An event time in a
-/// counting process is exactly that — the intensity is read there, so the
-/// compensator must be integrated with the same instant carrying weight.
-///
-/// The interior roots come from the Chebyshev-Lobatto starting points
-/// `cos(π i / (n − 1))` by Newton on `P'_{n−1}`, whose second derivative is
-/// taken from Legendre's equation, `(1 − x²)P'' = 2xP' − m(m + 1)P`.
-pub fn gauss_lobatto(n: usize) -> (Vec<f64>, Vec<f64>) {
-    assert!(n >= 2, "a Gauss-Lobatto rule needs at least the two endpoints");
-    let m = n - 1;
-    // `(P_m, P_m', P_m'')` by Bonnet's recurrence and Legendre's equation.
-    let legendre = |x: f64| -> (f64, f64, f64) {
-        let mut p1 = 1.0_f64;
-        let mut p2 = 0.0_f64;
-        for j in 0..m {
-            let p3 = p2;
-            p2 = p1;
-            p1 = ((2.0 * j as f64 + 1.0) * x * p2 - j as f64 * p3) / (j as f64 + 1.0);
-        }
-        if (1.0 - x * x).abs() < f64::EPSILON {
-            // At the endpoints `P_m' = ±m(m+1)/2` and the second derivative
-            // is finite too, but neither is needed there: the endpoints are
-            // nodes by construction, never Newton targets.
-            return (p1, 0.0, 0.0);
-        }
-        let derivative = m as f64 * (x * p1 - p2) / (x * x - 1.0);
-        let second = (2.0 * x * derivative - (m * (m + 1)) as f64 * p1) / (1.0 - x * x);
-        (p1, derivative, second)
-    };
-    let endpoint_weight = 2.0 / (n * m) as f64;
-    let mut nodes = Vec::with_capacity(n);
-    let mut weights = Vec::with_capacity(n);
-    nodes.push(-1.0);
-    weights.push(endpoint_weight);
-    for i in 1..m {
-        let mut x = (std::f64::consts::PI * i as f64 / m as f64).cos();
-        for _ in 0..200 {
-            let (_, derivative, second) = legendre(x);
-            let previous = x;
-            x = previous - derivative / second;
-            if (x - previous).abs() < 1e-15 {
-                break;
-            }
-        }
-        let (value, _, _) = legendre(x);
-        nodes.push(x);
-        weights.push(endpoint_weight / (value * value));
-    }
-    nodes.push(1.0);
-    weights.push(endpoint_weight);
-    let mut order: Vec<usize> = (0..n).collect();
-    order.sort_by(|&a, &b| nodes[a].total_cmp(&nodes[b]));
-    let sorted_nodes: Vec<f64> = order.iter().map(|&i| nodes[i]).collect();
-    let sorted_weights: Vec<f64> = order.iter().map(|&i| weights[i]).collect();
-    (sorted_nodes, sorted_weights)
-}
-
 // ---------------------------------------------------------------------------
 // Exponential-family scalar kernels.
 //
@@ -1108,30 +1039,6 @@ mod exponential_family_kernel_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn gauss_lobatto_includes_its_endpoints_and_is_exact_to_two_n_minus_three() {
-        for n in 2..=12 {
-            let (nodes, weights) = gauss_lobatto(n);
-            assert_eq!(nodes.len(), n);
-            assert!((nodes[0] + 1.0).abs() < 1e-15 && (nodes[n - 1] - 1.0).abs() < 1e-15);
-            assert!(nodes.windows(2).all(|w| w[1] > w[0]), "nodes not ascending: {nodes:?}");
-            assert!(weights.iter().all(|w| *w > 0.0), "weights {weights:?}");
-            // Exact for every monomial up to degree 2n - 3.
-            for degree in 0..=(2 * n - 3) {
-                let quadrature: f64 = nodes
-                    .iter()
-                    .zip(weights.iter())
-                    .map(|(x, w)| w * x.powi(degree as i32))
-                    .sum();
-                let exact = if degree % 2 == 1 { 0.0 } else { 2.0 / (degree as f64 + 1.0) };
-                assert!(
-                    (quadrature - exact).abs() < 1e-12 * (1.0 + exact.abs()),
-                    "n={n} degree={degree}: {quadrature} vs {exact}"
-                );
-            }
-        }
-    }
 
     #[test]
     fn centered_bessel_log_is_finite_and_derivative_consistent() {

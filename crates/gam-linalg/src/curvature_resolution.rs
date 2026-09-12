@@ -263,15 +263,6 @@ impl CurvatureResolution {
     pub fn resolution(&self) -> f64 {
         self.resolution
     }
-
-    /// Whether a measured curvature is resolved by the route that produced it,
-    /// i.e. `|curvature| > resolution`.
-    ///
-    /// A non-finite curvature is never resolved: it carries no magnitude to
-    /// compare.
-    pub fn resolves(&self, curvature: f64) -> bool {
-        curvature.is_finite() && curvature.abs() > self.resolution
-    }
 }
 
 impl std::fmt::Display for CurvatureResolution {
@@ -292,25 +283,6 @@ impl std::fmt::Display for CurvatureResolution {
 mod tests {
     use super::*;
 
-    /// `resolves` fires in both directions on the numbers that motivated the
-    /// issue, so the predicate is a discriminator rather than a constant.
-    #[test]
-    fn resolves_has_a_witness_on_both_sides() {
-        let resolved = CurvatureResolution::analytic_weyl(9.0e-8).expect("resolution");
-        assert!(
-            resolved.resolves(-3.199e-5),
-            "an eigenvalue far above ||dH||_2 must be resolved"
-        );
-        assert!(
-            !resolved.resolves(-8.0e-9),
-            "an eigenvalue below ||dH||_2 must NOT be resolved"
-        );
-        assert!(
-            !resolved.resolves(f64::NAN),
-            "a non-finite curvature carries no magnitude and cannot be resolved"
-        );
-    }
-
     /// No negative or `NaN` `‖δH‖₂`: every refusal is a refusal rather than a
     /// substituted constant.
     #[test]
@@ -330,8 +302,8 @@ mod tests {
         );
         assert_eq!(
             CurvatureResolution::analytic_weyl(f64::INFINITY)
-                .map(|resolution| resolution.resolves(1.0e300)),
-            Ok(false),
+                .map(|resolution| resolution.resolution() >= 1.0e300),
+            Ok(true),
             "an infinite ||dH||_2 is the honest statement that nothing is resolvable"
         );
     }

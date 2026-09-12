@@ -14,8 +14,8 @@ use std::cell::UnsafeCell;
 use std::mem::MaybeUninit;
 
 use crate::jet_scalar::{
-    aggregate_shared_source_derivatives, canonical_shared_source_schedule, Order2,
-    RuntimeJetScalar, SymmetricQuadraticCoefficients,
+    aggregate_shared_source_derivatives, canonical_shared_source_schedule, RuntimeJetScalar,
+    SymmetricQuadraticCoefficients,
 };
 
 #[derive(Clone, Copy, Debug)]
@@ -182,29 +182,6 @@ trait HessianSink<const K: usize> {
     fn reset(&mut self);
     fn add_upper(&mut self, row: usize, column: usize, value: f64);
     fn reflect_upper(&mut self);
-}
-
-struct ArrayHessianSink<'a, const K: usize>(&'a mut [[f64; K]; K]);
-
-impl<const K: usize> HessianSink<K> for ArrayHessianSink<'_, K> {
-    #[inline(always)]
-    fn reset(&mut self) {
-        // `into_order2` is the sole constructor and supplies `Tower2::zero()`.
-    }
-
-    #[inline(always)]
-    fn add_upper(&mut self, row: usize, column: usize, value: f64) {
-        self.0[row][column] += value;
-    }
-
-    #[inline(always)]
-    fn reflect_upper(&mut self) {
-        for row in 0..K {
-            for column in row + 1..K {
-                self.0[column][row] = self.0[row][column];
-            }
-        }
-    }
 }
 
 struct RowMajorHessianSink<'a, const K: usize>(&'a mut [f64]);
@@ -532,17 +509,6 @@ pub struct Order2Graph<'arena, const K: usize> {
 }
 
 impl<'arena, const K: usize> Order2Graph<'arena, K> {
-    /// Lower this scalar output to the ordinary packed order-2 channels.
-    #[must_use]
-    pub fn into_order2(self) -> Order2<K> {
-        let mut out = crate::jet_tower::Tower2::zero();
-        let mut hessian = ArrayHessianSink(&mut out.h);
-        out.v = self
-            .workspace
-            .lower_into(self.node, &mut out.g, &mut hessian);
-        Order2(out)
-    }
-
     /// Lower into caller-owned gradient and row-major Hessian storage.
     ///
     /// Both slices are completely overwritten, including structurally-zero
@@ -1289,9 +1255,51 @@ impl<'arena, const K: usize> RuntimeJetScalar<'arena> for Order2Graph<'arena, K>
 }
 
 #[cfg(test)]
+mod test_support {
+    use super::*;
+    use crate::jet_scalar::Order2;
+
+    struct ArrayHessianSink<'a, const K: usize>(&'a mut [[f64; K]; K]);
+
+    impl<const K: usize> HessianSink<K> for ArrayHessianSink<'_, K> {
+        #[inline(always)]
+        fn reset(&mut self) {
+            // `into_order2` is the sole constructor and supplies `Tower2::zero()`.
+        }
+
+        #[inline(always)]
+        fn add_upper(&mut self, row: usize, column: usize, value: f64) {
+            self.0[row][column] += value;
+        }
+
+        #[inline(always)]
+        fn reflect_upper(&mut self) {
+            for row in 0..K {
+                for column in row + 1..K {
+                    self.0[column][row] = self.0[row][column];
+                }
+            }
+        }
+    }
+
+    impl<'arena, const K: usize> Order2Graph<'arena, K> {
+        /// Lower this scalar output to the ordinary packed order-2 channels.
+        #[must_use]
+        pub fn into_order2(self) -> Order2<K> {
+            let mut out = crate::jet_tower::Tower2::zero();
+            let mut hessian = ArrayHessianSink(&mut out.h);
+            out.v = self
+                .workspace
+                .lower_into(self.node, &mut out.g, &mut hessian);
+            Order2(out)
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
-    use crate::jet_scalar::{FixedRuntimeJet, JetScalar};
+    use crate::jet_scalar::{FixedRuntimeJet, JetScalar, Order2};
     use crate::nested_dual::JetField;
     use std::cell::Cell;
 

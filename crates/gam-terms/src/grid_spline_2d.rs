@@ -1264,18 +1264,6 @@ impl GridSpline2dFit {
     }
 }
 
-/// Build the streaming design and fit with REML-selected λ.
-pub fn fit_grid_spline_2d(
-    x1: &[f64],
-    x2: &[f64],
-    y: &[f64],
-    w: &[f64],
-    k: usize,
-    metric: [f64; 2],
-) -> Result<GridSpline2dFit, String> {
-    GridSpline2dDesign::build(x1, x2, y, w, k, metric)?.fit_reml()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1391,7 +1379,7 @@ mod tests {
         // A dense grid with n > p = (k+3)² so the fit is well-posed: this test
         // exercises `from_state` corruption rejection, not the small-n regime,
         // so the fit must succeed first (n=18 ≪ p=81 left the penalized design
-        // rank-deficient and `fit_grid_spline_2d` refused before any assertion).
+        // rank-deficient and `GridSpline2dDesign::fit_reml` refused before any assertion).
         let side = 12usize;
         let mut x1 = Vec::new();
         let mut x2 = Vec::new();
@@ -1405,7 +1393,7 @@ mod tests {
         // The response must carry genuine curvature: a purely affine `a + b`
         // lies entirely in the penalty NULL SPACE (the spline reproduces it
         // exactly at any λ), so the penalized residual is identically zero and
-        // `fit_grid_spline_2d` correctly refuses with "degenerate penalized
+        // `GridSpline2dDesign::fit_reml` correctly refuses with "degenerate penalized
         // residual 0" — there is no variance to estimate. Add a smooth
         // non-null-space (curved) component so the penalized fit leaves a
         // positive residual and the REML criterion is well-posed; this test is
@@ -1417,7 +1405,9 @@ mod tests {
             .map(|(&a, &b)| a + b + (3.0 * a).sin() * (2.5 * b).cos())
             .collect();
         let w = vec![1.0_f64; n];
-        let fit = fit_grid_spline_2d(&x1, &x2, &y, &w, k, [1.0, 1.0]).expect("fit");
+        let fit = GridSpline2dDesign::build(&x1, &x2, &y, &w, k, [1.0, 1.0])
+            .and_then(|design| design.fit_reml())
+            .expect("fit");
 
         let good = fit.to_state();
         let mut bad = good.clone();

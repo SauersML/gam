@@ -36,6 +36,7 @@ mod iso_kappa_reml_gradient_fd_tests {
         DuchonBasisSpec, DuchonNullspaceOrder, DuchonOperatorPenaltySpec, MaternBasisSpec, MaternNu,
         OneDimensionalBoundary, SpatialIdentifiability,
     };
+    use gam_test_support::FdDerivativeJudgement;
     use ndarray::{Array1, Array2, s};
 
 /// gam#2735 — the PER-AXIS ψ gate, and the reason it lives beside the

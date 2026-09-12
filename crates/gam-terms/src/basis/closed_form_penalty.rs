@@ -1890,16 +1890,6 @@ pub(crate) fn anisotropic_laplacian_of_radial_second(
     part_u1sq + part_s1u1 + part_s1sq + part_u2 + part_s2
 }
 
-/// Anisotropic invariants used by the radial form:
-///   R  = √(Σ b_k r_k²)         (length of axis-rescaled lag)
-///   s_p = Σ b_k^p, p ∈ {1, 2}   (anisotropy traces)
-///   u_p = Σ b_k^{p+1} r_k², p ∈ {1, 2}
-/// where b_k = exp(-2 η_k).
-pub(crate) fn aniso_invariants(eta: &[f64], r: &[f64]) -> (f64, f64, f64, f64, f64) {
-    let powers = AnisoMetricPowers::new(eta);
-    aniso_invariants_with_powers(&powers, r)
-}
-
 pub(crate) fn aniso_invariants_with_powers(
     powers: &AnisoMetricPowers,
     r: &[f64],
@@ -1982,38 +1972,6 @@ pub(crate) fn aniso_invariants_with_powers(
     }
 
     (r2.sqrt(), s1, s2, u1, u2)
-}
-
-/// Scalar reference implementation of `aniso_invariants` used as a
-/// baseline in the SIMD pair-block benchmark. Returns (R, s_1, s_2,
-/// u_1, u_2) with no `wide::f64x4` lane parallelism. Numerically
-/// identical to the SIMD path up to floating-point summation order
-/// (lane reductions vs sequential).
-pub fn aniso_invariants_scalar(eta: &[f64], r: &[f64]) -> (f64, f64, f64, f64, f64) {
-    assert_eq!(eta.len(), r.len());
-    let mut s1 = 0.0_f64;
-    let mut s2 = 0.0_f64;
-    let mut r2 = 0.0_f64;
-    let mut u1 = 0.0_f64;
-    let mut u2 = 0.0_f64;
-    for k in 0..eta.len() {
-        let b = (-2.0 * eta[k]).exp();
-        let b2 = b * b;
-        let rk2 = r[k] * r[k];
-        s1 += b;
-        s2 += b2;
-        r2 += b * rk2;
-        u1 += b2 * rk2;
-        u2 += b2 * b * rk2;
-    }
-    (r2.sqrt(), s1, s2, u1, u2)
-}
-
-/// SIMD path of `aniso_invariants` exposed under a stable name for the
-/// pair-block SIMD-vs-scalar benchmark. Forwards to the private
-/// implementation used in production hot paths.
-pub fn aniso_invariants_simd(eta: &[f64], r: &[f64]) -> (f64, f64, f64, f64, f64) {
-    aniso_invariants(eta, r)
 }
 
 /// κ-partial of `radial_derivatives_of_isotropic_duchon`: returns

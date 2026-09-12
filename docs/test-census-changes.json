@@ -285,5 +285,17 @@
     "unit_test_decreases": {
       "crates/gam-problem": 4
     }
+  },
+  {
+    "base": "0367fa300456f3a2ec5ef4c22c9b349e1c8fa27d",
+    "reason": "user directive: delete all useless slop. The six removed tests existed only to exercise items this commit deletes.",
+    "evidence": "test_census.py over 7bc19ed40 -> the all-four lane commit (job 435701): 6 tests removed, no issue-pinned test removed. tests/src_modules (3): test_matern_closed_form_matches_collocation, test_matern_closed_form_q1_q2_psd_and_finite and test_matern_closed_form_gates_when_divergent in tests/src_modules/smooths/basis_radial_periodic_thinplate_tests.rs, which existed only to exercise the deleted closed_form_matern_pair_block. crates/gam-linalg (2): resolves_has_a_witness_on_both_sides (curvature_resolution.rs), which existed only for the deleted CurvatureResolution::resolves, and verify_rejects_wrong_gradient (test_support/fd_checker.rs), which existed only for the deleted verify_gradient_vs_fd. crates/gam-math (1): the one test of the deleted gauss_lobatto in special.rs. Tests that moved with their subjects (the MappedOrder2Accumulator tests, the Tower4 contraction tests, the FD judgement tests) are still counted. The same lane tree compiles with all targets (job 433840).",
+    "removed_pins": {},
+    "test_count_decrease": 6,
+    "unit_test_decreases": {
+      "crates/gam-linalg": 2,
+      "crates/gam-math": 1,
+      "tests/src_modules": 3
+    }
   }
 ]

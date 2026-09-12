@@ -276,17 +276,6 @@ pub fn normal_cdf(x: f64) -> f64 {
     0.5 * erfc(-x / std::f64::consts::SQRT_2)
 }
 
-/// Standard normal survival probability `P(Z > x)`.
-///
-/// This is evaluated as `½·erfc(x/√2)`, not as `1 − Φ(x)`. The latter loses
-/// relative accuracy as soon as `Φ(x)` approaches one and becomes identically
-/// zero for every representable `x` above roughly `8.3`, while the direct
-/// complementary form retains the full representable tail.
-#[inline]
-pub fn normal_sf(x: f64) -> f64 {
-    0.5 * erfc(x / std::f64::consts::SQRT_2)
-}
-
 /// Two-sided standard-normal probability `P(|Z| ≥ |z|)`.
 ///
 /// The exact symmetric identity is `erfc(|z|/√2)`. Evaluating that identity
@@ -322,21 +311,6 @@ pub fn student_t_two_sided_probability(t: f64, degrees_of_freedom: f64) -> f64 {
     let log_t_squared_over_df = 2.0 * t.abs().ln() - degrees_of_freedom.ln();
     let log_x = log_reciprocal_one_plus_exp(log_t_squared_over_df);
     regularized_beta_lower_from_log_x(log_x, half_df, 0.5)
-}
-
-/// Student-t survival probability `P(T_ν > t)`.
-///
-/// The small tail is always obtained from
-/// [`student_t_two_sided_probability`]. For negative `t`, subtracting its
-/// half-tail from one constructs the large probability, where subtraction is
-/// well conditioned.
-pub fn student_t_sf(t: f64, degrees_of_freedom: f64) -> f64 {
-    let two_sided = student_t_two_sided_probability(t, degrees_of_freedom);
-    if t < 0.0 {
-        1.0 - 0.5 * two_sided
-    } else {
-        0.5 * two_sided
-    }
 }
 
 /// Chi-squared survival probability `P(X_ν > statistic)`.
@@ -1791,12 +1765,6 @@ mod tests {
         // cancellation. Bar is 5x the worst measured.
         let bar = 1.0e-11;
         for (nu, t, want) in ROWS {
-            let got = student_t_sf(t, nu);
-            let rel = ((got - want) / want).abs();
-            assert!(
-                rel <= bar,
-                "student_t_sf({t}, {nu}) = {got:e}, want {want:e}, relative {rel:e} > {bar:e}"
-            );
             let got_two_sided = student_t_two_sided_probability(t, nu);
             let two_sided_rel = ((got_two_sided - 2.0 * want) / (2.0 * want)).abs();
             assert!(
@@ -1805,43 +1773,29 @@ mod tests {
                  want {:e}, relative {two_sided_rel:e} > {bar:e}",
                 2.0 * want
             );
-            // The reflection. `1 - want` is O(1), so its own absolute error of
-            // one ulp is a relative error of one ulp -- which is exactly why
-            // reflecting is safe here and reconstructing the small tail is not.
-            let lower = student_t_sf(-t, nu);
-            assert!(
-                (lower - (1.0 - want)).abs() <= 2.0 * f64::EPSILON,
-                "student_t_sf({}, {nu}) = {lower}, want {}",
-                -t,
-                1.0 - want
-            );
         }
-        // Symmetry at the median, and the degenerate arguments.
-        for nu in [1.0_f64, 5.0, 1e4] {
-            assert!(
-                (student_t_sf(0.0, nu) - 0.5).abs() <= f64::EPSILON,
-                "median at nu = {nu}"
-            );
-        }
-        assert!(student_t_sf(1.0, 0.0).is_nan(), "nu = 0 is not a t");
+        // The degenerate arguments.
         assert!(
-            student_t_sf(1.0, f64::INFINITY).is_nan(),
+            student_t_two_sided_probability(1.0, 0.0).is_nan(),
+            "nu = 0 is not a t"
+        );
+        assert!(
+            student_t_two_sided_probability(1.0, f64::INFINITY).is_nan(),
             "nu = inf is not a t"
         );
-        assert_eq!(student_t_sf(f64::INFINITY, 5.0), 0.0, "tail beyond +inf");
         assert_eq!(
-            student_t_sf(f64::NEG_INFINITY, 5.0),
-            1.0,
-            "tail beyond -inf"
+            student_t_two_sided_probability(f64::INFINITY, 5.0),
+            0.0,
+            "tail beyond +inf"
         );
     }
 
     #[test]
-    fn normal_sf_keeps_the_upper_tail_that_one_minus_the_cdf_destroys() {
+    fn normal_tail_keeps_what_one_minus_the_cdf_destroys() {
         // `Φ(x)` rounds to exactly 1.0 once its upper tail drops below half an
         // ulp of one, so `1 - normal_cdf(x)` returns exactly zero from x ~ 8.3 up
-        // and is already 7% high at x = 8. `normal_sf` computes the tail rather
-        // than reconstructing it. References are correctly rounded doubles from a
+        // and is already 7% high at x = 8. `normal_two_sided_probability` computes
+        // the tail rather than reconstructing it. References are correctly rounded doubles from a
         // 60-dps `erfc(x/√2)/2`.
         //
         // Bar: `x * x * eps`, which is derived rather than chosen. Forming the
@@ -1871,12 +1825,6 @@ mod tests {
         ];
         for (x, want) in ROWS {
             let bar = (x * x + 2.0) * f64::EPSILON;
-            let got = normal_sf(x);
-            let rel = ((got - want) / want).abs();
-            assert!(
-                rel <= bar,
-                "normal_sf({x}) = {got:e}, want {want:e}, relative {rel:e} > {bar:e}"
-            );
             let got_two_sided = normal_two_sided_probability(x);
             let two_sided_rel = ((got_two_sided - 2.0 * want) / (2.0 * want)).abs();
             assert!(
@@ -1898,9 +1846,13 @@ mod tests {
         // Complementarity holds wherever the sum is representable, and the
         // symmetry that makes a two-sided p-value a single call.
         for x in [-3.0_f64, -0.25, 0.0, 0.25, 3.0] {
-            let sum = normal_sf(x) + normal_cdf(x);
-            assert!((sum - 1.0).abs() <= 2.0 * f64::EPSILON, "sf + cdf = {sum}");
-            assert_eq!(normal_sf(-x), normal_cdf(x), "sf(-x) != cdf(x) at {x}");
+            let sum = normal_cdf(-x) + normal_cdf(x);
+            assert!((sum - 1.0).abs() <= 2.0 * f64::EPSILON, "cdf(-x) + cdf(x) = {sum}");
+            assert_eq!(
+                normal_two_sided_probability(-x),
+                normal_two_sided_probability(x),
+                "two-sided probability is not symmetric at {x}"
+            );
         }
     }
 
@@ -1942,13 +1894,7 @@ mod tests {
 
     #[test]
     fn distribution_survival_primitives_define_boundaries_and_identities() {
-        assert_eq!(normal_sf(f64::INFINITY), 0.0);
-        assert_eq!(normal_sf(f64::NEG_INFINITY), 1.0);
-        assert!(normal_sf(f64::NAN).is_nan());
-
         assert_eq!(student_t_two_sided_probability(0.0, 7.0), 1.0);
-        assert_eq!(student_t_sf(0.0, 7.0), 0.5);
-        assert!(student_t_sf(f64::NAN, 7.0).is_nan());
 
         assert_eq!(chi_square_sf(0.0, 3.0), 1.0);
         assert_eq!(chi_square_sf(f64::INFINITY, 3.0), 0.0);

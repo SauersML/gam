@@ -128,8 +128,8 @@ crates/gam-linalg/src/matrix/weights.rs	as_psd	restored-in-place
 crates/gam-linalg/src/matrix/weights.rs	from_array	restored-in-place
 crates/gam-linalg/src/matrix/weights.rs	view_signed	restored-in-place
 crates/gam-linalg/src/numeric_derivative.rs	agreement_bound	restored-in-place
-crates/gam-linalg/src/numeric_derivative.rs	judge	restored-in-place
-crates/gam-linalg/src/numeric_derivative.rs	ladder_report	restored-in-place
+crates/gam-linalg/src/numeric_derivative.rs	judge	retired-by-owner:jets
+crates/gam-linalg/src/numeric_derivative.rs	ladder_report	retired-by-owner:jets
 crates/gam-linalg/src/packed_symmetric_spectrum.rs	packed_upper_index	retired-no-surviving-dependent
 crates/gam-linalg/src/pairwise_reduce.rs	pairwise_reduce_chunked	restored-in-place
 crates/gam-linalg/src/pairwise_reduce.rs	pairwise_sum_chunked	restored-in-place
@@ -152,12 +152,12 @@ crates/gam-math/src/jet_tower.rs	cell_moving_boundary_flux_tower	deferred-to-own
 crates/gam-math/src/jet_tower.rs	compose_unary_single_slot	deferred-to-owner:jets
 crates/gam-math/src/jet_tower.rs	compose_unary_with	restored-in-place
 crates/gam-math/src/jet_tower.rs	digamma	restored-in-place
-crates/gam-math/src/jet_tower.rs	fourth_contracted	restored-in-place
+crates/gam-math/src/jet_tower.rs	fourth_contracted	retired-by-owner:jets
 crates/gam-math/src/jet_tower.rs	implicit_solve	deferred-to-owner:jets
 crates/gam-math/src/jet_tower.rs	moving_limit_boundary_tower	deferred-to-owner:jets
 crates/gam-math/src/jet_tower.rs	moving_limit_boundary_tower_theta_integrand	deferred-to-owner:jets
 crates/gam-math/src/jet_tower.rs	substitute_intercept	deferred-to-owner:jets
-crates/gam-math/src/jet_tower.rs	third_contracted	restored-in-place
+crates/gam-math/src/jet_tower.rs	third_contracted	retired-by-owner:jets
 crates/gam-math/src/jet_tower.rs	trigamma	restored-in-place
 crates/gam-math/src/jet_tower.rs	trigamma_derivative_stack	deferred-to-owner:jets
 crates/gam-math/src/jet_tower.rs	verify_kernel_channels	deferred-to-owner:jets
@@ -169,9 +169,9 @@ crates/gam-math/src/paired_timing.rs	not_slower	restored-in-place
 crates/gam-math/src/paired_timing.rs	paired_interleaved	restored-in-place
 crates/gam-math/src/probability.rs	cone_boundary_log_factor	restored-in-place
 crates/gam-math/src/probability.rs	cone_boundary_log_factor_and_derivatives	restored-in-place
-crates/gam-math/src/probability.rs	normal_sf	restored-in-place
+crates/gam-math/src/probability.rs	normal_sf	retired-by-owner:jets
 crates/gam-math/src/probability.rs	signed_weighted_chi_square_sf	restored-in-place
-crates/gam-math/src/probability.rs	student_t_sf	restored-in-place
+crates/gam-math/src/probability.rs	student_t_sf	retired-by-owner:jets
 crates/gam-math/src/probability.rs	weighted_chi_square_sf	restored-in-place
 crates/gam-math/src/probability.rs	weighted_chi_square_sf_to_tolerance	restored-in-place
 crates/gam-math/src/probability.rs	weighted_chi_square_sf_with_bound	restored-in-place
@@ -1196,7 +1196,7 @@ crates/gam-terms/src/geometry.rs	signed_distance	retired-no-surviving-dependent
 crates/gam-terms/src/grid_spline_2d.rs	axis_basis	restored-in-place
 crates/gam-terms/src/grid_spline_2d.rs	basis_per_axis	restored-in-place
 crates/gam-terms/src/grid_spline_2d.rs	fit_at	restored-in-place
-crates/gam-terms/src/grid_spline_2d.rs	fit_grid_spline_2d	restored-in-place
+crates/gam-terms/src/grid_spline_2d.rs	fit_grid_spline_2d	retired-by-owner:jets
 crates/gam-terms/src/grid_spline_2d.rs	fit_grid_spline_2d_at	restored-in-place
 crates/gam-terms/src/grid_spline_2d.rs	fit_reml	restored-in-place
 crates/gam-terms/src/grid_spline_2d.rs	from_state	restored-in-place
