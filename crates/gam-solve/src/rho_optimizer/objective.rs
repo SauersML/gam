@@ -1821,23 +1821,113 @@ impl<'a> CanonicalizedObjective<'a> {
         if eval.gradient.len() == self.perm.len() {
             eval.gradient = permute_to_canonical(&eval.gradient, &self.perm);
         }
-        eval.hessian = match eval.hessian {
-            HessianValue::Dense(h)
-                if h.nrows() == self.perm.len() && h.ncols() == self.perm.len() =>
-            {
-                let mut hc = Array2::<f64>::zeros((self.perm.len(), self.perm.len()));
-                for (a, &ia) in self.perm.iter().enumerate() {
-                    for (b, &ib) in self.perm.iter().enumerate() {
-                        hc[[a, b]] = h[[ia, ib]];
-                    }
-                }
-                HessianValue::Dense(hc)
-            }
-            other => other,
-        };
+        eval.hessian = hessian_to_canonical(eval.hessian, &self.perm);
         // `inner_beta_hint` is in the coefficient basis (not ρ-coordinate
         // order), so it is forwarded unchanged.
         eval
+    }
+}
+
+/// Reorder a native-layout dense Hessian into canonical order:
+/// `out[a, b] = native[perm[a], perm[b]]`.
+fn permute_dense_to_canonical(native: &Array2<f64>, perm: &[usize]) -> Array2<f64> {
+    let mut hc = Array2::<f64>::zeros((perm.len(), perm.len()));
+    for (a, &ia) in perm.iter().enumerate() {
+        for (b, &ib) in perm.iter().enumerate() {
+            hc[[a, b]] = native[[ia, ib]];
+        }
+    }
+    hc
+}
+
+/// Reorder a native-order outer Hessian into canonical order, whichever form it
+/// arrives in.
+///
+/// The optimizer pairs this Hessian with the canonical gradient. A dense
+/// Hessian is permuted entrywise; an operator Hessian is wrapped so every
+/// product and densification runs in the same canonical layout. An operator
+/// passed through in native order paired one coordinate's curvature with
+/// another's gradient in every trust-region and ARC step (#2735).
+fn hessian_to_canonical(hessian: HessianValue, perm: &[usize]) -> HessianValue {
+    match hessian {
+        HessianValue::Dense(h) if h.nrows() == perm.len() && h.ncols() == perm.len() => {
+            HessianValue::Dense(permute_dense_to_canonical(&h, perm))
+        }
+        HessianValue::Operator(op) if op.dim() == perm.len() => {
+            HessianValue::Operator(Arc::new(CanonicalHessianOperator {
+                native: op,
+                perm: perm.to_vec(),
+            }))
+        }
+        other => other,
+    }
+}
+
+/// A native-order Hessian operator presented in canonical coordinate order:
+/// `perm[c]` is the native coordinate at canonical slot `c`, so this operator
+/// is `H_canon[a, b] = H_native[perm[a], perm[b]]`.
+struct CanonicalHessianOperator {
+    native: Arc<dyn HessianOperator>,
+    perm: Vec<usize>,
+}
+
+impl CanonicalHessianOperator {
+    fn length_error(&self, what: &str, got: usize) -> ObjectiveEvalError {
+        ObjectiveEvalError::fatal(format!(
+            "canonical outer Hessian {what} has length {got}, expected {}",
+            self.perm.len()
+        ))
+    }
+}
+
+impl HessianOperator for CanonicalHessianOperator {
+    fn dim(&self) -> usize {
+        self.perm.len()
+    }
+
+    fn apply_into(&self, v: &Array1<f64>, out: &mut Array1<f64>) -> Result<(), ObjectiveEvalError> {
+        if v.len() != self.perm.len() {
+            return Err(self.length_error("input", v.len()));
+        }
+        if out.len() != self.perm.len() {
+            return Err(self.length_error("output", out.len()));
+        }
+        let native_out = self.native.apply(&permute_to_native(v, &self.perm))?;
+        for (c, &i) in self.perm.iter().enumerate() {
+            out[c] = native_out[i];
+        }
+        Ok(())
+    }
+
+    fn apply_mat(&self, factor: ArrayView2<'_, f64>) -> Result<Array2<f64>, ObjectiveEvalError> {
+        if factor.nrows() != self.perm.len() {
+            return Err(self.length_error("factor column", factor.nrows()));
+        }
+        let mut native_factor = Array2::<f64>::zeros(factor.dim());
+        for (c, &i) in self.perm.iter().enumerate() {
+            native_factor.row_mut(i).assign(&factor.row(c));
+        }
+        let native_out = self.native.apply_mat(native_factor.view())?;
+        if native_out.nrows() != self.perm.len() {
+            return Err(self.length_error("product column", native_out.nrows()));
+        }
+        let mut out = Array2::<f64>::zeros(native_out.dim());
+        for (c, &i) in self.perm.iter().enumerate() {
+            out.row_mut(c).assign(&native_out.row(i));
+        }
+        Ok(out)
+    }
+
+    fn materialization(&self) -> HessianMaterialization {
+        self.native.materialization()
+    }
+
+    fn materialize_dense(&self) -> Result<Array2<f64>, ObjectiveEvalError> {
+        let native = self.native.materialize_dense()?;
+        if native.nrows() != self.perm.len() || native.ncols() != self.perm.len() {
+            return Err(self.length_error("densified side", native.nrows().max(native.ncols())));
+        }
+        Ok(permute_dense_to_canonical(&native, &self.perm))
     }
 }
 
@@ -2076,6 +2166,75 @@ impl<'a> OuterObjective for CanonicalizedObjective<'a> {
         // problems route through the host BFGS/ARC path (where the permutation
         // is honored) rather than the device driver.
         None
+    }
+}
+
+#[cfg(test)]
+mod canonical_hessian_order_tests {
+    use super::*;
+    use ndarray::array;
+
+    struct NativeDenseOperator {
+        matrix: Array2<f64>,
+    }
+
+    impl HessianOperator for NativeDenseOperator {
+        fn dim(&self) -> usize {
+            self.matrix.nrows()
+        }
+
+        fn apply_into(
+            &self,
+            v: &Array1<f64>,
+            out: &mut Array1<f64>,
+        ) -> Result<(), ObjectiveEvalError> {
+            out.assign(&self.matrix.dot(v));
+            Ok(())
+        }
+    }
+
+    /// #2735: the canonicalized objective hands the optimizer a canonical
+    /// gradient, so an operator Hessian must reach it in the same order a dense
+    /// Hessian does — through single products, batched products, and
+    /// densification. Every entry is a small dyadic rational, so the products
+    /// are exact in any summation order and the comparisons are bitwise.
+    #[test]
+    fn operator_hessian_reaches_canonical_order_like_the_dense_hessian() {
+        let native = array![
+            [4.0, 0.5, -1.0, 0.25],
+            [0.5, 9.0, 2.0, -0.75],
+            [-1.0, 2.0, 16.0, 1.5],
+            [0.25, -0.75, 1.5, 25.0],
+        ];
+        let perm = canonical_permutation(&[30, 10, 40, 20]).expect("keys out of canonical order");
+        let dense = match hessian_to_canonical(HessianValue::Dense(native.clone()), &perm) {
+            HessianValue::Dense(h) => h,
+            _ => panic!("a dense Hessian must stay dense"),
+        };
+        for (a, &ia) in perm.iter().enumerate() {
+            for (b, &ib) in perm.iter().enumerate() {
+                assert_eq!(dense[[a, b]], native[[ia, ib]]);
+            }
+        }
+        let operator = match hessian_to_canonical(
+            HessianValue::Operator(Arc::new(NativeDenseOperator { matrix: native })),
+            &perm,
+        ) {
+            HessianValue::Operator(op) => op,
+            _ => panic!("an operator Hessian must stay an operator"),
+        };
+        let probe = array![1.0, -2.0, 0.5, 3.0];
+        assert_eq!(operator.apply(&probe).expect("canonical product"), dense.dot(&probe));
+        assert_eq!(
+            operator
+                .apply_mat(dense.view())
+                .expect("canonical batched product"),
+            dense.dot(&dense)
+        );
+        assert_eq!(
+            operator.materialize_dense().expect("canonical densification"),
+            dense
+        );
     }
 }
 
