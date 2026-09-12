@@ -194,12 +194,12 @@ dropped, and restored items the table above retires were removed again.
 
 | Disposition | Identities |
 | --- | --- |
-| Restored in place | 372 |
+| Restored in place | 360 |
 | Defined elsewhere in the same crate | 13 |
 | Retired by the decisions above | 19 |
 | Retired: nothing that survived depends on it | 288 |
 | Retired by the owning work's own decision | 27 |
-| Retired by a later deletion commit named in the row | 497 |
+| Retired by a later deletion commit named in the row | 509 |
 | Absent while a surviving reference still names it (repair in progress) | 3 |
 
 Retired identities carry no compatibility obligation. Restoration is closed
@@ -245,9 +245,9 @@ nothing that survived defines or calls them. `d484a091a` had only moved
 the ledger with the other moved declarations.
 
 After the ledger refresh in `955897723`, deletion commits made under the user's
-directive removed 497 listed identities without updating their rows. Each
+directive removed 509 listed identities without updating their rows. Each
 such row now reads `retired-by-later-deletion:<commit>`, naming the commit whose
-own diff lowered that identity's census count (45 commits). Eleven of
+own diff lowered that identity's census count (46 commits). Eleven of
 those commits had also landed no public API census acknowledgement; `5fe9454ab`
 backfilled them.
 
