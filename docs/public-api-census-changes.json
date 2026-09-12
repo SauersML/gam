@@ -1248,5 +1248,23 @@
     },
     "reason": "The root build.rs ban scanner forbids #[cfg(feature = ...)]. e527fb897 put ProjectedFactorCache::wait_for_subscriber behind a gam-problem `test-support` feature, so every root gam build aborted. The wait existed only for one gam-solve test. It is deleted, and the test moved into gam-problem, the crate that owns the cache, as a private test function.",
     "evidence": "git grep at 7b5799bf6 over crates finds wait_for_subscriber only at its definition, in its doc comments, and in the gam-solve helper projected_factor_cache_wait_for_subscriber, whose only caller is the moved test. The feature was enabled only by the crates/gam-solve/Cargo.toml dev-dependency that this change removes. The test's new home is crates/gam-problem/src/projected_factor_cache_tests.rs."
+  },
+  {
+    "base": "64477b191089cffafa5aaae139de34ea8e0fc73e",
+    "removed": {
+      "crates/gam-solve/src/reml/mod.rs::exact_tau_tau_hessian_policy_with_firth": 1,
+      "crates/gam-solve/src/reml/mod.rs::has_implicit_multidim_duchon": 1,
+      "crates/gam-solve/src/reml/mod.rs::has_penaltysecond_pair_at": 1,
+      "crates/gam-solve/src/reml/mod.rs::penalty_first_component_count": 1,
+      "crates/gam-solve/src/reml/mod.rs::prefer_gradient_only": 1,
+      "crates/gam-solve/src/reml/mod.rs::tau_tau_hessian_policy_does_not_force_gradient_only_for_implicit_multidim_duchon": 1,
+      "crates/gam-solve/src/reml/mod.rs::tau_tau_hessian_policy_does_not_force_gradient_only_when_cache_budget_is_exceeded": 1,
+      "crates/gam-solve/src/reml/mod.rs::tau_tau_hessian_policy_prefers_gradient_only_for_firth_pair_gap": 1,
+      "crates/gam-solve/src/reml/mod.rs::tau_tau_hessian_policy_prefers_gradient_only_for_implicit_tau": 1,
+      "crates/gam-solve/src/reml/mod.rs::total_bytes": 1,
+      "crates/gam-solve/src/reml/mod.rs::with_penaltysecond_partner_indices": 1
+    },
+    "reason": "SPEC rule 25 (unnecessary options are deleted), #2898. The firth_pair_terms_unavailable downgrade in the tau-tau Hessian policy was hardcoded false at both production call sites, so it never fired. Its policy, byte plans, the DirectionalHyperParam helpers only the plan read, the penaltysecond_partner_indices setter and the tests pinning the policy had no other consumer. No replacement is needed: exact tau-tau Hessian requests reach the unified evaluator unmodified, as they already did.",
+    "evidence": "git grep over crates at 5b2452012 finds exact_tau_tau_hessian_policy_with_firth called only from reml/hyper.rs and estimate/joint_hyper.rs, each with firth_pair_terms_unavailable = false. prefer_gradient_only and total_bytes in reml/mod.rs are called only from those warn blocks. has_implicit_multidim_duchon, penalty_first_component_count and has_penaltysecond_pair_at are called only from the policy constructor. with_penaltysecond_partner_indices is called only at spatial_optimization.rs:1285, which this change removes. The four tests call only the deleted policy. This removed map lists every pub/pub(crate) fn this change deletes from reml/mod.rs, which is the scope of public_api_census.py's public_functions predicate."
   }
 ]

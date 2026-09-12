@@ -1179,7 +1179,6 @@ fn spatial_log_kappa_hyper_dirs_frominfo_list(
             .collect::<Vec<_>>();
         let mut ssecond_components = vec![None; log_kappa_dim];
         ssecond_components[i] = Some(s2_components);
-        let mut penaltysecond_partner_indices: Option<Vec<usize>> = None;
         let penaltysecond_component_provider =
             if let (Some(provider), Some(gid)) = (aniso_cross_penalty_provider, aniso_group_id) {
                 let group_indices = group_indices_map.get(&gid).cloned().unwrap_or_default();
@@ -1193,13 +1192,6 @@ fn spatial_log_kappa_hyper_dirs_frominfo_list(
                                 i, gid
                             ))
                         })?;
-                penaltysecond_partner_indices = Some(
-                    group_indices
-                        .iter()
-                        .copied()
-                        .filter(|&idx| idx != i)
-                        .collect(),
-                );
                 let penalty_indices_inner = penalty_indices.clone();
                 let global_range_inner = global_range.clone();
                 let total_p_inner = total_p;
@@ -1280,9 +1272,6 @@ fn spatial_log_kappa_hyper_dirs_frominfo_list(
         .not_penalty_like();
         if let Some(provider) = penaltysecond_component_provider {
             dir = dir.with_penaltysecond_component_provider(provider);
-        }
-        if let Some(partner_indices) = penaltysecond_partner_indices {
-            dir = dir.with_penaltysecond_partner_indices(partner_indices);
         }
         hyper_dirs.push(dir);
     }

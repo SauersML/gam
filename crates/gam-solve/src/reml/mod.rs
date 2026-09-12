@@ -35,7 +35,6 @@ mod trace;
 
 pub(crate) use sparse_exact_penalty::sparse_penalty_block_count_from_canonical;
 
-pub(crate) const EXACT_TAU_TAU_HESSIAN_DENSE_CACHE_BUDGET_BYTES: usize = 512 * 1024 * 1024;
 pub(crate) const FIRTH_MAX_OBSERVATIONS: usize = 20_000;
 pub(crate) const FIRTH_MAX_COEFFICIENTS: usize = 256;
 pub(crate) const FIRTH_MAX_LINEAR_WORK: usize = 2_000_000;
@@ -143,186 +142,6 @@ pub(crate) struct IftWarmStartCache {
     pub lambda_s_beta_blocks: Option<Vec<ndarray::Array1<f64>>>,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) struct TauTauPlanEstimate {
-    pub(crate) dense_x_bytes: usize,
-    pub(crate) first_order_tau_bytes: usize,
-    pub(crate) second_order_tau_bytes: usize,
-    pub(crate) penalty_first_bytes: usize,
-    pub(crate) penalty_pair_bytes: usize,
-    pub(crate) rho_tau_penalty_bytes: usize,
-    pub(crate) vector_cache_bytes: usize,
-    pub(crate) weighted_scratch_bytes: usize,
-}
-
-impl TauTauPlanEstimate {
-    pub(crate) fn total_bytes(self) -> usize {
-        self.dense_x_bytes
-            .saturating_add(self.first_order_tau_bytes)
-            .saturating_add(self.second_order_tau_bytes)
-            .saturating_add(self.penalty_first_bytes)
-            .saturating_add(self.penalty_pair_bytes)
-            .saturating_add(self.rho_tau_penalty_bytes)
-            .saturating_add(self.vector_cache_bytes)
-            .saturating_add(self.weighted_scratch_bytes)
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct TauTauHessianPolicy {
-    pub(crate) any_has_implicit: bool,
-    pub(crate) implicit_multidim_duchon: bool,
-    pub(crate) estimated_dense_tau_cache_bytes: usize,
-    pub(crate) gradient_plan: TauTauPlanEstimate,
-    pub(crate) hessian_plan: TauTauPlanEstimate,
-    pub(crate) budget_bytes: usize,
-    pub(crate) firth_pair_terms_unavailable: bool,
-}
-
-impl TauTauHessianPolicy {
-    /// True when the τ-τ exact-Hessian path cannot be assembled at all and the
-    /// eval must fall back to value-and-gradient mode (forcing
-    /// `HessianValue::Unavailable`).
-    ///
-    /// This is the *only* remaining capability gate: the previous
-    /// implementation also forced gradient-only when the design used implicit
-    /// multi-dim Duchon storage or when the dense τ-cache plan would exceed
-    /// the budget.  Both of those are now *cost* gates, not capability gates
-    /// — the unified evaluator's `prefer_outer_hessian_operator(n, p, k)`
-    /// selects the matrix-free `HessianValue::Operator` representation in
-    /// exactly the regimes where the dense cache would be unaffordable, and
-    /// the planner densifies operator returns whose materialization is
-    /// available (`dim ≤ OUTER_HVP_MATERIALIZE_MAX_DIM`) and routes the rest
-    /// through `opt::MatrixFreeTrustRegion`.
-    /// Forcing gradient-only would have prevented the operator representation
-    /// from ever being requested, defeating that routing; hence the
-    /// `implicit_multidim_duchon` and cost-bytes clauses are deliberately
-    /// gone.
-    ///
-    /// Firth-pair-terms-unavailability remains a capability gate: when the
-    /// Firth-aware derivative provider cannot produce the τ-τ pair
-    /// corrections at all, no representation choice can substitute.  At every
-    /// production call site this flag is hardcoded `false` (the
-    /// `hphi_tau_tau_partial_apply` + `d_beta_hphi_tau_partial_apply`
-    /// primitives now cover the gap), so this method effectively returns
-    /// `false` in production.  We retain the field and method signature
-    /// unchanged so future Firth corner cases have a single, surfaced place
-    /// to land.
-    pub(crate) fn prefer_gradient_only(self) -> bool {
-        self.firth_pair_terms_unavailable
-    }
-}
-
-pub(crate) fn exact_tau_tau_hessian_policy_with_firth(
-    n_obs: usize,
-    p_coeff: usize,
-    hyper_dirs: &[DirectionalHyperParam],
-    firth_pair_terms_unavailable: bool,
-) -> TauTauHessianPolicy {
-    let f64_bytes = std::mem::size_of::<f64>();
-    let dense_matrix_bytes =
-        |rows: usize, cols: usize| -> usize { rows.saturating_mul(cols).saturating_mul(f64_bytes) };
-    let dense_design_bytes = dense_matrix_bytes(n_obs, p_coeff);
-    let dense_penalty_bytes = dense_matrix_bytes(p_coeff, p_coeff);
-    let psi_dim = hyper_dirs.len();
-    let implicit_n_axes = hyper_dirs
-        .iter()
-        .find_map(DirectionalHyperParam::implicit_axis_count_hint)
-        .unwrap_or(0);
-    let gradient_uses_implicit_design = hyper_dirs
-        .iter()
-        .any(DirectionalHyperParam::has_implicit_operator)
-        && gam_terms::basis::should_use_implicit_operators_with_policy(
-            n_obs,
-            p_coeff,
-            implicit_n_axes,
-            &gam_runtime::resource::ResourcePolicy::default_library(),
-        );
-    let dense_first_order_count = hyper_dirs
-        .iter()
-        .filter(|dir| !dir.has_implicit_operator())
-        .count();
-    let first_penalty_component_count = hyper_dirs
-        .iter()
-        .map(DirectionalHyperParam::penalty_first_component_count)
-        .sum::<usize>();
-
-    let mut dense_second_order_count = 0usize;
-    let mut penalty_pair_count = 0usize;
-    for i in 0..psi_dim {
-        for j in i..psi_dim {
-            if hyper_dirs[i]
-                .x_tau_tau_entry_at(j)
-                .or_else(|| hyper_dirs[j].x_tau_tau_entry_at(i))
-                .is_some_and(|entry| !entry.uses_implicit_storage())
-            {
-                dense_second_order_count += if i == j { 1 } else { 2 };
-            }
-            if hyper_dirs[i].has_penaltysecond_pair_at(j)
-                || hyper_dirs[j].has_penaltysecond_pair_at(i)
-            {
-                penalty_pair_count += if i == j { 1 } else { 2 };
-            }
-        }
-    }
-
-    let gradient_dense_first_order_count = if gradient_uses_implicit_design {
-        dense_first_order_count
-    } else {
-        psi_dim
-    };
-    let gradient_needs_dense_x =
-        firth_pair_terms_unavailable || gradient_dense_first_order_count > 0;
-    let gradient_plan = TauTauPlanEstimate {
-        dense_x_bytes: if gradient_needs_dense_x {
-            dense_design_bytes
-        } else {
-            0
-        },
-        first_order_tau_bytes: if gradient_dense_first_order_count > 0 {
-            dense_design_bytes
-        } else {
-            0
-        },
-        second_order_tau_bytes: 0,
-        penalty_first_bytes: psi_dim.saturating_mul(dense_penalty_bytes),
-        penalty_pair_bytes: 0,
-        rho_tau_penalty_bytes: 0,
-        vector_cache_bytes: n_obs.saturating_mul(f64_bytes),
-        weighted_scratch_bytes: dense_penalty_bytes,
-    };
-    let hessian_plan = TauTauPlanEstimate {
-        dense_x_bytes: if psi_dim > 0 { dense_design_bytes } else { 0 },
-        first_order_tau_bytes: dense_first_order_count.saturating_mul(dense_design_bytes),
-        second_order_tau_bytes: dense_second_order_count.saturating_mul(dense_design_bytes),
-        penalty_first_bytes: psi_dim.saturating_mul(dense_penalty_bytes),
-        penalty_pair_bytes: penalty_pair_count.saturating_mul(dense_penalty_bytes),
-        rho_tau_penalty_bytes: first_penalty_component_count
-            .saturating_mul(2)
-            .saturating_mul(dense_penalty_bytes),
-        vector_cache_bytes: psi_dim.saturating_mul(n_obs).saturating_mul(f64_bytes),
-        weighted_scratch_bytes: dense_penalty_bytes,
-    };
-    let any_has_implicit = hyper_dirs
-        .iter()
-        .any(DirectionalHyperParam::has_implicit_operator);
-    let implicit_multidim_duchon = hyper_dirs
-        .iter()
-        .any(DirectionalHyperParam::has_implicit_multidim_duchon);
-    let estimated_dense_tau_cache_bytes = hessian_plan
-        .first_order_tau_bytes
-        .saturating_add(hessian_plan.second_order_tau_bytes);
-    TauTauHessianPolicy {
-        any_has_implicit,
-        implicit_multidim_duchon,
-        estimated_dense_tau_cache_bytes,
-        gradient_plan,
-        hessian_plan,
-        budget_bytes: EXACT_TAU_TAU_HESSIAN_DENSE_CACHE_BUDGET_BYTES,
-        firth_pair_terms_unavailable: firth_pair_terms_unavailable && !hyper_dirs.is_empty(),
-    }
-}
-
 pub(crate) fn firth_problem_scale_allows(n_obs: usize, p_coeff: usize) -> bool {
     let linear_work = n_obs.saturating_mul(p_coeff);
     let quadratic_work = linear_work.saturating_mul(p_coeff);
@@ -348,7 +167,7 @@ mod tests {
         GlmLikelihoodSpec, InverseLink, LikelihoodSpec, ResponseFamily, StandardLink,
     };
     use gam_problem::{HessianValue, OuterEval};
-    use gam_terms::basis::{ImplicitDesignPsiDerivative, RadialScalarKind};
+    use gam_terms::basis::ImplicitDesignPsiDerivative;
     use ndarray::{Array1, Array2, array, s};
     use std::sync::Arc;
 
@@ -432,123 +251,6 @@ mod tests {
         assert!(super::firth_problem_scale_allows(2_000, 200));
         assert!(!super::firth_problem_scale_allows(4_800, 241));
         assert!(!super::firth_problem_scale_allows(4_800, 433));
-    }
-
-    #[test]
-    pub(crate) fn tau_tau_hessian_policy_prefers_gradient_only_for_implicit_tau() {
-        let operator = ImplicitDesignPsiDerivative::new(
-            array![1.0, 2.0, 3.0, 4.0],
-            array![0.5, -1.0, 1.5, 2.0],
-            array![0.1, 0.2, 0.3, 0.4],
-            array![[1.0, 0.2], [0.5, 0.1], [1.5, 0.3], [2.0, 0.4]],
-            None,
-            None,
-            2,
-            2,
-            1,
-            2,
-        );
-        let dir = DirectionalHyperParam::new_compact(
-            HyperDesignDerivative::from_implicit(
-                Arc::new(operator),
-                ImplicitDerivLevel::First(0),
-                1..4,
-                5,
-            ),
-            Vec::new(),
-            None,
-            None,
-        )
-        .expect("implicit directional hyperparam");
-        let policy = super::exact_tau_tau_hessian_policy_with_firth(10, 5, &[dir], false);
-        assert!(policy.any_has_implicit);
-        assert_eq!(
-            policy.gradient_plan.dense_x_bytes,
-            10 * 5 * std::mem::size_of::<f64>()
-        );
-        assert!(!policy.prefer_gradient_only());
-    }
-
-    #[test]
-    pub(crate) fn tau_tau_hessian_policy_does_not_force_gradient_only_for_implicit_multidim_duchon()
-    {
-        // Multi-dim Duchon implicit storage used to force gradient-only,
-        // because the τ-cache materialization plan was infeasible.  The
-        // unified evaluator now elects the matrix-free
-        // `HessianValue::Operator` representation in this regime via
-        // `prefer_outer_hessian_operator`, so the planner can route to the
-        // operator trust-region (or basis-probe to dense for small K) — the
-        // capability is preserved and gradient-only must NOT engage.
-        let operator = ImplicitDesignPsiDerivative::new_streaming(
-            Arc::new(array![[0.0, 0.0], [1.0, 0.2]]),
-            Arc::new(array![[0.0, 0.0], [1.0, 1.0]]),
-            vec![0.0, 0.0],
-            RadialScalarKind::PureDuchon {
-                block_order: 1,
-                p_order: 0,
-                s_order: 0,
-                dim: 2,
-            },
-            None,
-            None,
-            0,
-        );
-        let dir = DirectionalHyperParam::new_compact(
-            HyperDesignDerivative::from_implicit(
-                Arc::new(operator),
-                ImplicitDerivLevel::First(0),
-                0..2,
-                2,
-            ),
-            Vec::new(),
-            None,
-            None,
-        )
-        .expect("implicit duchon directional hyperparam");
-        let policy = super::exact_tau_tau_hessian_policy_with_firth(10, 5, &[dir], false);
-        assert!(policy.any_has_implicit);
-        assert!(policy.implicit_multidim_duchon);
-        assert!(!policy.prefer_gradient_only());
-    }
-
-    #[test]
-    pub(crate) fn tau_tau_hessian_policy_does_not_force_gradient_only_when_cache_budget_is_exceeded()
-     {
-        // The dense τ-cache plan exceeds the budget, but cost is no longer a
-        // capability gate: the eval-side selects the matrix-free operator
-        // representation in exactly this regime, and the planner routes
-        // accordingly.  `prefer_gradient_only` must NOT force `Unavailable`
-        // here.
-        let dirs = (0..16)
-            .map(|_| {
-                DirectionalHyperParam::new_compact(
-                    HyperDesignDerivative::from(Array2::<f64>::zeros((2, 2))),
-                    Vec::new(),
-                    None,
-                    None,
-                )
-                .expect("dense directional hyperparam")
-            })
-            .collect::<Vec<_>>();
-        let policy = super::exact_tau_tau_hessian_policy_with_firth(320_000, 71, &dirs, false);
-        assert!(!policy.any_has_implicit);
-        assert!(policy.hessian_plan.total_bytes() > policy.budget_bytes);
-        assert!(policy.hessian_plan.total_bytes() > policy.gradient_plan.total_bytes());
-        assert!(!policy.prefer_gradient_only());
-    }
-
-    #[test]
-    pub(crate) fn tau_tau_hessian_policy_prefers_gradient_only_for_firth_pair_gap() {
-        let dir = DirectionalHyperParam::new_compact(
-            HyperDesignDerivative::from(Array2::<f64>::zeros((2, 2))),
-            Vec::new(),
-            None,
-            None,
-        )
-        .expect("dense directional hyperparam");
-        let policy = super::exact_tau_tau_hessian_policy_with_firth(10, 5, &[dir], true);
-        assert!(policy.firth_pair_terms_unavailable);
-        assert!(policy.prefer_gradient_only());
     }
 
     /// Common shape for the design-motion + penalty-motion REML test fixtures
@@ -4690,7 +4392,6 @@ pub struct DirectionalHyperParam {
                 + 'static,
         >,
     >,
-    pub(crate) penaltysecond_partner_indices: Option<std::sync::Arc<[usize]>>,
     /// Whether this coordinate is penalty-like (B_i = ∂H/∂τ_i is PSD).
     /// True for τ (penalty scaling) coordinates; false for ψ (design-moving,
     /// anisotropic length-scale) coordinates. Controls EFS eligibility.
@@ -4767,7 +4468,6 @@ impl DirectionalHyperParam {
             x_tau_tau_original,
             penaltysecond_components,
             penaltysecond_component_provider: None,
-            penaltysecond_partner_indices: None,
             is_penalty_like,
         })
     }
@@ -4789,11 +4489,6 @@ impl DirectionalHyperParam {
         >,
     ) -> Self {
         self.penaltysecond_component_provider = Some(provider);
-        self
-    }
-
-    pub fn with_penaltysecond_partner_indices(mut self, partners: Vec<usize>) -> Self {
-        self.penaltysecond_partner_indices = Some(std::sync::Arc::from(partners));
         self
     }
 
@@ -4820,11 +4515,6 @@ impl DirectionalHyperParam {
     /// first-derivative level.
     pub(crate) fn has_implicit_operator(&self) -> bool {
         self.x_tau_original.uses_implicit_storage()
-    }
-
-    pub(crate) fn has_implicit_multidim_duchon(&self) -> bool {
-        self.implicit_first_axis_info()
-            .is_some_and(|(op, _)| op.n_axes() > 1 && op.is_duchon_family())
     }
 
     /// Extract the implicit design derivative operator and axis, if available.
@@ -4898,21 +4588,6 @@ impl DirectionalHyperParam {
         &self,
     ) -> Option<&[Option<Vec<PenaltyDerivativeComponent>>]> {
         self.penaltysecond_components.as_deref()
-    }
-
-    pub(crate) fn penalty_first_component_count(&self) -> usize {
-        self.penalty_first_components.len()
-    }
-
-    pub(crate) fn has_penaltysecond_pair_at(&self, j: usize) -> bool {
-        self.penaltysecond_components
-            .as_ref()
-            .and_then(|rows| rows.get(j))
-            .is_some_and(Option::is_some)
-            || self
-                .penaltysecond_partner_indices
-                .as_ref()
-                .is_some_and(|partners| partners.contains(&j))
     }
 }
 

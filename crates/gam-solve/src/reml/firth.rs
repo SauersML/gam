@@ -1667,8 +1667,8 @@ impl FirthDenseOperator {
     //   Hooking this primitive up through a FixedDriftDerivFn (returning
     //   DriftDerivResult::Dense of this p×p β-v action) is exactly what
     //   lets build_tau_hyper_coords pass a non-None fixed_drift_deriv
-    //   closure into the unified evaluator, closing the approximation gap
-    //   that firth_pair_terms_unavailable currently tracks.
+    //   closure into the unified evaluator
+    //   (`build_tau_fixed_drift_deriv_original_basis`).
     //
     // DERIVATION (β-derivative of each τ-partial term in direction v)
     //

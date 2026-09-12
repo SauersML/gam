@@ -1183,40 +1183,7 @@ impl<'a> RemlState<'a> {
                 order,
                 crate::rho_optimizer::OuterEvalOrder::ValueGradientHessian
             );
-            // Firth pair Hessian terms are now available via Primitive A
-            // (hphi_tau_tau_partial_apply) and Primitive B
-            // (d_beta_hphi_tau_partial_apply); the policy no longer needs to
-            // auto-downgrade to gradient-only for the Firth+Logit pair gap.
-            let firth_pair_terms_unavailable = false;
-            let tau_tau_policy = super::exact_tau_tau_hessian_policy_with_firth(
-                self.x().nrows(),
-                self.x().ncols(),
-                hyper_dirs,
-                firth_pair_terms_unavailable,
-            );
-            let downgrade_exact_tau_tau =
-                requested_hessian && tau_tau_policy.prefer_gradient_only();
-            if downgrade_exact_tau_tau {
-                log::warn!(
-                    "[OUTER] disabling exact tau Hessian; using gradient-only outer eval \
-                     (n={}, p={}, psi_dim={}, implicit_tau={}, implicit_multidim_duchon={}, firth_pair_gap={}, dense_tau_cache={:.1} MiB, gradient_plan={:.1} MiB, exact_hessian_plan={:.1} MiB, budget={:.1} MiB)",
-                    self.x().nrows(),
-                    self.x().ncols(),
-                    hyper_dirs.len(),
-                    tau_tau_policy.any_has_implicit,
-                    tau_tau_policy.implicit_multidim_duchon,
-                    tau_tau_policy.firth_pair_terms_unavailable,
-                    tau_tau_policy.estimated_dense_tau_cache_bytes as f64 / (1024.0 * 1024.0),
-                    tau_tau_policy.gradient_plan.total_bytes() as f64 / (1024.0 * 1024.0),
-                    tau_tau_policy.hessian_plan.total_bytes() as f64 / (1024.0 * 1024.0),
-                    tau_tau_policy.budget_bytes as f64 / (1024.0 * 1024.0),
-                );
-            }
-            let eval_mode = match if downgrade_exact_tau_tau {
-                crate::rho_optimizer::OuterEvalOrder::ValueAndGradient
-            } else {
-                order
-            } {
+            let eval_mode = match order {
                 crate::rho_optimizer::OuterEvalOrder::Value => {
                     super::reml_outer_engine::EvalMode::ValueOnly
                 }
@@ -1243,7 +1210,7 @@ impl<'a> RemlState<'a> {
             Ok((
                 cost,
                 grad,
-                if requested_hessian && !downgrade_exact_tau_tau {
+                if requested_hessian {
                     result.hessian
                 } else {
                     gam_problem::HessianValue::Unavailable

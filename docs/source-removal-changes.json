@@ -3301,5 +3301,26 @@
     ],
     "reason": "#2469: both constants were size decisions nobody derived. CLOGLOG_CC_MIN_N (17) floored the certified Bernstein-ellipse node count of the cloglog Clenshaw-Curtis rule; the remainder bound only falls as n grows, so the bound's own count is kept and the only lower limit left is the construction minimum (three points, the smallest odd rule compute_clenshaw_curtis_n builds). CLOGLOG_CC_NODE_CAP (1025) was a second size gate above CLOGLOG_CC_PREFER_THRESHOLD (800), so two numbers answered one question; cloglog_survival_cc now refuses at the router's own threshold. The same commit replaces the (rho-1).max(1e-12) floor with the cancellation-free y + y^2/(1+sqrt(1+y^2)) and ln(rho) with asinh(y), and replaces the tail quantile's unwrap_or(8.0), max(1.0) and min(0.25) with a refusal outside tol/8 < 1/2, the exact range where [-A, A] has positive width.",
     "evidence": "git grep -n over crates/gam-solve/src at a75acbb06 finds CLOGLOG_CC_MIN_N only at quadrature.rs:517 (declaration) and :692 (the floor), and CLOGLOG_CC_NODE_CAP only at :503 (declaration) and :2656 (the cap). Both are private to quadrature.rs. The production calls of cloglog_survival_cc (:2211, :2355, :2356) each sit behind cloglog_should_prefer_cc (:2210, :2352, :2353), so the 1025 cap could not bind above the 800 threshold. The one direct test call (:6154) uses (mu=-0.2, sigma=0.8), which the preference test at :5451 already routes to CC. By hand at the only production tolerance 1e-12 (A about 7.33), the bound is smallest near ellipse height y=0.92, about 67.3 nodes, giving 69 after rounding up to odd, so the floor of 17 never bound. The same hand evaluation gives 657 nodes at (0, 2.0) and 1679 at (0, 5.0), on the same sides of 800 that the preference tests at :5456 and :5461 assert. Not compiled or run locally (user directive); compile is covered by the lead's shared tip check."
+  },
+  {
+    "base": "64477b191089cffafa5aaae139de34ea8e0fc73e",
+    "items": [
+      "crates/gam-solve/src/reml/mod.rs:const:EXACT_TAU_TAU_HESSIAN_DENSE_CACHE_BUDGET_BYTES",
+      "crates/gam-solve/src/reml/mod.rs:fn:exact_tau_tau_hessian_policy_with_firth",
+      "crates/gam-solve/src/reml/mod.rs:fn:has_implicit_multidim_duchon",
+      "crates/gam-solve/src/reml/mod.rs:fn:has_penaltysecond_pair_at",
+      "crates/gam-solve/src/reml/mod.rs:fn:penalty_first_component_count",
+      "crates/gam-solve/src/reml/mod.rs:fn:prefer_gradient_only",
+      "crates/gam-solve/src/reml/mod.rs:fn:tau_tau_hessian_policy_does_not_force_gradient_only_for_implicit_multidim_duchon",
+      "crates/gam-solve/src/reml/mod.rs:fn:tau_tau_hessian_policy_does_not_force_gradient_only_when_cache_budget_is_exceeded",
+      "crates/gam-solve/src/reml/mod.rs:fn:tau_tau_hessian_policy_prefers_gradient_only_for_firth_pair_gap",
+      "crates/gam-solve/src/reml/mod.rs:fn:tau_tau_hessian_policy_prefers_gradient_only_for_implicit_tau",
+      "crates/gam-solve/src/reml/mod.rs:fn:total_bytes",
+      "crates/gam-solve/src/reml/mod.rs:fn:with_penaltysecond_partner_indices",
+      "crates/gam-solve/src/reml/mod.rs:struct:TauTauHessianPolicy",
+      "crates/gam-solve/src/reml/mod.rs:struct:TauTauPlanEstimate"
+    ],
+    "reason": "SPEC rule 25 (unnecessary options are deleted), #2898. Both production call sites of exact_tau_tau_hessian_policy_with_firth hardcoded firth_pair_terms_unavailable = false, so TauTauHessianPolicy::prefer_gradient_only() always returned false. The downgrade of a ValueGradientHessian request to a gradient-only tau-tau eval could never fire. TauTauPlanEstimate and the 512 MiB budget constant fed only that never-firing warn log. Deleting the option removes their only consumers, then the DirectionalHyperParam helpers read only by the plan. has_penaltysecond_pair_at was the only reader of penaltysecond_partner_indices, so the field, its public setter and the spatial_optimization.rs computation feeding it go too. The four tau_tau_hessian_policy_* tests pinned only the deleted policy. Exact tau-tau Hessian requests now reach the unified evaluator unmodified, as they already did on every run.",
+    "evidence": "git grep over crates at 5b2452012 finds exact_tau_tau_hessian_policy_with_firth called only at reml/hyper.rs:1191 and estimate/joint_hyper.rs:1254, each after `let firth_pair_terms_unavailable = false`. The only `true` argument was in the test tau_tau_hessian_policy_prefers_gradient_only_for_firth_pair_gap. TauTauHessianPolicy, TauTauPlanEstimate and EXACT_TAU_TAU_HESSIAN_DENSE_CACHE_BUDGET_BYTES appear only in reml/mod.rs and in those two warn blocks. has_implicit_multidim_duchon, penalty_first_component_count and has_penaltysecond_pair_at are called only inside exact_tau_tau_hessian_policy_with_firth. penaltysecond_partner_indices is read only in has_penaltysecond_pair_at, and with_penaltysecond_partner_indices is called only at spatial_optimization.rs:1285. firth_problem_scale_allows and the hyper.rs callers of implicit_axis_count_hint, has_implicit_operator, x_tau_tau_entry_at and uses_implicit_storage are kept. Compile is covered by the lead's shared tip check."
   }
 ]

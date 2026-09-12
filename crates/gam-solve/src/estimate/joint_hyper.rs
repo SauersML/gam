@@ -1243,42 +1243,6 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
         order: crate::rho_optimizer::OuterEvalOrder,
         design_revision: Option<u64>,
     ) -> Result<(f64, Array1<f64>, gam_problem::HessianValue), EstimationError> {
-        let order = if matches!(
-            order,
-            crate::rho_optimizer::OuterEvalOrder::ValueGradientHessian
-        ) {
-            // Firth pair Hessian terms are now available via Primitive A +
-            // Primitive B in the reduced Firth dense operator; the tau-tau
-            // policy no longer needs the Firth+Logit gap downgrade.
-            let firth_pair_terms_unavailable = false;
-            let tau_tau_policy = crate::estimate::reml::exact_tau_tau_hessian_policy_with_firth(
-                x.nrows(),
-                x.ncols(),
-                &hyper_dirs,
-                firth_pair_terms_unavailable,
-            );
-            if tau_tau_policy.prefer_gradient_only() {
-                log::warn!(
-                    "[OUTER] disabling exact tau Hessian before conditioning; using gradient-only outer eval \
-                     (n={}, p={}, psi_dim={}, implicit_tau={}, implicit_multidim_duchon={}, firth_pair_gap={}, dense_tau_cache={:.1} MiB, gradient_plan={:.1} MiB, exact_hessian_plan={:.1} MiB, budget={:.1} MiB)",
-                    x.nrows(),
-                    x.ncols(),
-                    hyper_dirs.len(),
-                    tau_tau_policy.any_has_implicit,
-                    tau_tau_policy.implicit_multidim_duchon,
-                    tau_tau_policy.firth_pair_terms_unavailable,
-                    tau_tau_policy.estimated_dense_tau_cache_bytes as f64 / (1024.0 * 1024.0),
-                    tau_tau_policy.gradient_plan.total_bytes() as f64 / (1024.0 * 1024.0),
-                    tau_tau_policy.hessian_plan.total_bytes() as f64 / (1024.0 * 1024.0),
-                    tau_tau_policy.budget_bytes as f64 / (1024.0 * 1024.0),
-                );
-                crate::rho_optimizer::OuterEvalOrder::ValueAndGradient
-            } else {
-                order
-            }
-        } else {
-            order
-        };
         let hyper_dirs = self.prepare_eval_state(
             x,
             s_list,
