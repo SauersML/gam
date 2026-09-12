@@ -272,17 +272,17 @@ impl CustomFamily for SurvivalMarginalSlopeFamily {
         true
     }
 
+    /// The dense joint Hessian at every coefficient width. The row-kernel
+    /// workspace already serves this same matrix at any width in one row pass
+    /// (`RowKernelHessianWorkspace::hessian_dense`), so a width cutoff here
+    /// removed the default Jeffreys information, the joint polish and the dense
+    /// finiteness check above that width while the workspace kept supplying the
+    /// Jeffreys step: the trust region then scored `Φ = 0` against a step built
+    /// with `∇Φ` and `H_Φ`.
     fn exact_newton_joint_hessian(
         &self,
         block_states: &[ParameterBlockState],
     ) -> Result<Option<Array2<f64>>, String> {
-        let total = block_states
-            .iter()
-            .map(|state| state.beta.len())
-            .sum::<usize>();
-        if total >= 512 {
-            return Ok(None);
-        }
         if self.per_z_slope_active() {
             return Ok(Some(
                 self.evaluate_exact_newton_joint_dense_per_z(block_states)?

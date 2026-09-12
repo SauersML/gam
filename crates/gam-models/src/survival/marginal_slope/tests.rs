@@ -9072,3 +9072,42 @@ fn release_measure_rigid_contracted_towers_vs_generic_tower_932() {
         gate.finish();
     }
 }
+
+/// The dense joint Hessian, and the default Jeffreys information built on it,
+/// exist at every coefficient width. A retired `total >= 512` cutoff returned
+/// `None` from `exact_newton_joint_hessian` while the row-kernel workspace kept
+/// serving the same matrix, so above 512 columns the Jeffreys value path scored
+/// `Φ = 0` against a step built from the workspace's Jeffreys term.
+#[test]
+fn joint_hessian_and_jeffreys_information_exist_above_512_columns() {
+    let n = 6;
+    let width = 520;
+    let mut family = make_closed_form_test_family(n);
+    let columns = Array2::from_shape_fn((n, width), |(row, column)| {
+        ((row * 7 + column * 3) % 11) as f64 / 11.0 - 0.5
+    });
+    family.design_entry = DesignMatrix::from(columns.clone());
+    family.design_exit = DesignMatrix::from(columns.clone());
+    family.design_derivative_exit = DesignMatrix::from(columns);
+    // Zero time coefficients leave q0, q1 and qd1 on their offsets, which the
+    // closed-form fixture keeps admissible, while the time designs still carry
+    // `width` columns of row curvature.
+    let mut block_states = closed_form_block_states(&family, 0.3);
+    block_states[0].beta = Array1::zeros(width);
+    let specs = vec![dummy_blockspec(width), dummy_blockspec(0), dummy_blockspec(0)];
+
+    let hessian = family
+        .exact_newton_joint_hessian(&block_states)
+        .expect("joint Hessian evaluation")
+        .expect("a dense joint Hessian above 512 columns");
+    assert_eq!(hessian.dim(), (width, width));
+    assert!(
+        hessian.iter().any(|value| *value != 0.0),
+        "the time designs carry row curvature, so the joint Hessian cannot be zero"
+    );
+    let information = family
+        .joint_jeffreys_information_with_specs(&block_states, &specs)
+        .expect("Jeffreys information evaluation")
+        .expect("the default Jeffreys information above 512 columns");
+    assert_eq!(information, hessian);
+}
