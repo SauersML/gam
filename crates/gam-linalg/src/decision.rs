@@ -499,15 +499,6 @@ pub fn projector_error_bar(gap: f64, backward_error: f64) -> f64 {
     backward_error / separation
 }
 
-/// A rigorous two-sided enclosure `[lower, upper]` of a scalar quantity.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct DecrementEnclosure {
-    /// Certified lower bound.
-    pub lower: f64,
-    /// Certified upper bound.
-    pub upper: f64,
-}
-
 /// A running sum that also carries the data needed to certify its own rounding
 /// floor: the accumulated value, the sum of magnitudes, and the term count.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]

@@ -832,26 +832,6 @@ pub fn log1p_minus_x(x: f64) -> f64 {
     }
 }
 
-/// The relative exponential `exprel(x) = (e^x − 1) / x`, equal to `1` at
-/// `x = 0` and summed as a series for `|x| ≤ 1/2`.
-#[inline]
-pub fn exprel(x: f64) -> f64 {
-    if x.is_nan() || x == f64::INFINITY {
-        return x;
-    }
-    if x > 700.0 {
-        // Divide before the second multiplication: exp(x) can overflow
-        // while exp(x)/x is still representable. The omitted 1/x is far
-        // below one ulp in this branch.
-        let half_exp = (0.5 * x).exp();
-        return (half_exp / x) * half_exp;
-    }
-    if x.abs() > 0.5 {
-        return x.exp_m1() / x;
-    }
-    1.0 + exprel_minus_one_small(x)
-}
-
 /// The nonconstant Taylor terms of exprel for finite `|x| <= 1/2`.
 /// Keeping the leading one out of the sum lets log_exprel use log1p
 /// without erasing its first-order term near zero.
@@ -1066,26 +1046,10 @@ mod exponential_family_kernel_tests {
     }
 
     #[test]
-    fn exprel_remains_finite_after_the_unscaled_exponential_overflows() {
-        for x in [710.0_f64, 712.0, 716.0] {
-            let got = exprel(x);
-            assert!(got.is_finite() && got > 0.0, "x={x}: {got}");
-            assert!((got.ln() - log_exprel(x)).abs() < 2e-13);
-            // exprel(x) = exp(x/2) * (exprel(x/2) + exprel(-x/2)) / 2.
-            let half = x * 0.5;
-            let expected = half.exp() * (0.5 * exprel(half) + 0.5 * exprel(-half));
-            assert!((got / expected - 1.0).abs() < 4.0 * f64::EPSILON);
-        }
-        assert_eq!(exprel(717.0), f64::INFINITY);
-    }
-
-    #[test]
     fn exponential_family_kernels_have_correct_infinite_limits() {
         assert_eq!(expm1_minus_x(f64::INFINITY), f64::INFINITY);
         assert_eq!(expm1_minus_x(f64::NEG_INFINITY), f64::INFINITY);
         assert_eq!(log1p_minus_x(f64::INFINITY), f64::NEG_INFINITY);
-        assert_eq!(exprel(f64::INFINITY), f64::INFINITY);
-        assert_eq!(exprel(f64::NEG_INFINITY), 0.0);
         assert_eq!(log_exprel(f64::INFINITY), f64::INFINITY);
         assert_eq!(log_exprel(f64::NEG_INFINITY), f64::NEG_INFINITY);
         assert_eq!(logaddexp(f64::INFINITY, f64::INFINITY), f64::INFINITY);
@@ -1095,7 +1059,6 @@ mod exponential_family_kernel_tests {
     fn exponential_family_kernels_propagate_nan() {
         assert!(expm1_minus_x(f64::NAN).is_nan());
         assert!(log1p_minus_x(f64::NAN).is_nan());
-        assert!(exprel(f64::NAN).is_nan());
         assert!(log_exprel(f64::NAN).is_nan());
         for x in [0.0, f64::INFINITY, f64::NEG_INFINITY] {
             assert!(logaddexp(f64::NAN, x).is_nan());
@@ -1118,7 +1081,6 @@ mod exponential_family_kernel_tests {
         for &x in &[-0.75_f64, 0.6, 1.5] {
             assert!((expm1_minus_x(x) - (x.exp_m1() - x)).abs() <= 8.0 * f64::EPSILON);
             assert!((log1p_minus_x(x) - (x.ln_1p() - x)).abs() <= 8.0 * f64::EPSILON);
-            assert!((exprel(x) - x.exp_m1() / x).abs() <= 8.0 * f64::EPSILON);
             assert!((log_exprel(x) - (x.exp_m1() / x).ln()).abs() <= 8.0 * f64::EPSILON);
         }
         // The series branch keeps relative accuracy where the naive form

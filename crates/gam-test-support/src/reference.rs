@@ -878,8 +878,7 @@ pub fn design_diagnostics(
     design: &gam_linalg::matrix::DesignMatrix,
 ) -> Result<DesignDiagnostics, String> {
     use gam_linalg::faer_ndarray::FaerSvd;
-    let dense = design
-        .try_to_dense_by_chunks_budgeted("quality diagnostics design SVD", 256 * 1024 * 1024)?;
+    let dense = design.try_to_dense_by_chunks("quality diagnostics design SVD")?;
     let (_u, s, _vt) = dense.svd(false, false).map_err(|e| e.to_string())?;
     let sigma_max = s.iter().copied().fold(0.0, f64::max);
     let tol = (design.nrows().max(design.ncols()) as f64) * f64::EPSILON * sigma_max.max(1.0);

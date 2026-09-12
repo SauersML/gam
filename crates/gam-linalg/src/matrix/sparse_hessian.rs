@@ -143,12 +143,6 @@ impl Clone for SparseHessianAccumulator {
 impl SparseHessianAccumulator {
     // ── pattern builders ─────────────────────────────────────────────
 
-    /// Build the symbolic upper-triangle pattern of `X^T X` from a single
-    /// sparse CSR design matrix.
-    pub fn from_single_csr(csr: &SparseRowMat<usize, f64>, dim: usize) -> Self {
-        Self::from_multi_csr(&[csr], dim)
-    }
-
     /// Build the symbolic upper-triangle pattern of the block Hessian produced
     /// by multiple sparse CSR designs that share the same column space.
     pub fn from_multi_csr(csrs: &[&SparseRowMat<usize, f64>], dim: usize) -> Self {
@@ -293,7 +287,7 @@ mod tests {
         )
         .expect("sparse column matrix");
         let csr = sparse.to_row_major().expect("csr conversion");
-        let accumulator = SparseHessianAccumulator::from_single_csr(&csr, 3);
+        let accumulator = SparseHessianAccumulator::from_multi_csr(&[&csr], 3);
 
         assert_eq!(accumulator.sym.col_ptrs, vec![0, 1, 3, 6]);
         assert_eq!(accumulator.sym.row_indices, vec![0, 0, 1, 0, 1, 2]);

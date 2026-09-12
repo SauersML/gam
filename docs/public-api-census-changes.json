@@ -1378,5 +1378,15 @@
     },
     "reason": "SPEC rules 23 and 25 (#2234). AtomTransportReport::law_gap and ::law_holds read a smooth-map alternative whose Fourier order max(2H+1, grid_resolution/16) was hand-set and tied to the caller's reporting density, plus a caller-chosen gap tolerance. No measured transport identifies either constant, so the alternative and both methods are deleted. phase_r2 and deviation_locus remain the transport report.",
     "evidence": "public_api_census.py's public_functions predicate over the removed hunks of crates/gam-sae/src/manifold/transport_law.rs yields law_gap and law_holds, each the file's only pub fn of that name. At the base their only callers are the wire report in crates/gam-sae/src/manifold/crosscoder_fit.rs and the olmo acceptance test in tests_crosscoder_olmo.rs, both changed here. No other file in this change loses a pub fn."
+  },
+  {
+    "base": "885afe974f58d872a94a1be5033c1f235a622baf",
+    "removed": {
+      "crates/gam-linalg/src/matrix/mod.rs::try_to_dense_by_chunks_budgeted": 1,
+      "crates/gam-linalg/src/matrix/sparse_hessian.rs::from_single_csr": 1,
+      "crates/gam-math/src/special.rs::exprel": 1
+    },
+    "reason": "#2899 group-A public-surface sweep, under the #2829 rule in docs/rust-library-surface.md: a pub fn that no product uses is deleted. try_to_dense_by_chunks_budgeted (only caller: the gam-test-support design_diagnostics helper, now on try_to_dense_by_chunks), SparseHessianAccumulator::from_single_csr (a wrapper over from_multi_csr that only its own test called, rewritten against from_multi_csr) and gam_math::special::exprel (only special.rs tests called it; log_exprel survives).",
+    "evidence": "public_api_census.py --base fe9438c25 --head 141ae3682 reports exactly these three identities (/scratch.global/sauer354/pool/prune-api-a/slice1.census.json). At fe9438c25, git grep -n -w finds no product caller for any of them, and the prune-api-a token census at ac3c0b807 agrees (/scratch.global/sauer354/pool/prune-api-a/census_ac3c0b8.tsv)."
   }
 ]
