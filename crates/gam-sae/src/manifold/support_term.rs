@@ -1228,21 +1228,33 @@ impl SaeSupportSparseTerm {
             let kappa = std::f64::consts::TAU / period;
             let mut sine = 0.0_f64;
             let mut cosine = 0.0_f64;
+            let mut sine_absolute = 0.0_f64;
+            let mut cosine_absolute = 0.0_f64;
             for &(row, slot) in &self.atom_rows[atom_index] {
                 let phase = kappa * self.assignment.coords_for_slot(row, slot)[0];
                 let (sin, cos) = phase.sin_cos();
                 sine += sin;
                 cosine += cos;
+                sine_absolute += sin.abs();
+                cosine_absolute += cos.abs();
             }
             let resultant = sine.hypot(cosine);
-            let count = self.atom_rows[atom_index].len() as f64;
-            if resultant <= f64::EPSILON * count {
+            // Each phasor term is formed by one product and one `sin_cos`, the
+            // terms are summed naively over the atom's rows, and `hypot` rounds
+            // once more, so the resultant is uncertain by at most `γ_{rows+2}` of
+            // the components' absolute sums.
+            let rows = self.atom_rows[atom_index].len();
+            let resultant_band = gam_linalg::roundoff::accumulation_growth(rows + 2)
+                * sine_absolute.hypot(cosine_absolute);
+            if resultant <= resultant_band {
                 // The profiled prior is phase-invariant when the circular
                 // resultant vanishes, so no origin is statistically selected.
                 continue;
             }
             let shift = sine.atan2(cosine) / kappa;
-            if shift.abs() <= f64::EPSILON * period {
+            // A perturbation of the resultant by its band turns its direction by
+            // at most band/length, so a shift inside that angle is numerical zero.
+            if shift.abs() <= (resultant_band / resultant) / kappa {
                 continue;
             }
 
@@ -1278,8 +1290,12 @@ impl SaeSupportSparseTerm {
             }
             let old_energy = old_energy.sum();
             let new_energy = new_energy.sum();
-            let energy_scale = 1.0 + old_energy.abs().max(new_energy.abs());
-            let resolution = 512.0 * f64::EPSILON * count * energy_scale;
+            // A prior term costs at most eight roundings to form (the shift, `κ`,
+            // `κ·t`, the half-angle sine and its square, `κ²`, `α/κ²` and the
+            // product). A compensated sum's band carries no row count, and the
+            // subtraction rounds once more.
+            let resolution =
+                gam_linalg::roundoff::compensated_band(9, old_energy.abs() + new_energy.abs());
             if !(old_energy - new_energy > resolution) {
                 continue;
             }
