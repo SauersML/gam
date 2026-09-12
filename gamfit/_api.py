@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import math
-import re
 from dataclasses import dataclass
 from collections.abc import Mapping, Sequence
 from pathlib import Path
@@ -18,7 +17,7 @@ from ._exceptions import map_exception
 from ._model import Model
 from ._reml_common import check_forward_state, coerce_grad_payload
 from ._response_geometry import ResponseGeometryModel, fit_response_geometry
-from ._tables import CATEGORICAL_CELL_SENTINEL, normalize_table
+from ._tables import normalize_table
 from ._validation import FormulaValidation
 from ._warnings import emit_inference_warnings
 
@@ -517,89 +516,6 @@ def _normalize_aux_strength(value: Any) -> float | None:
             return None
         raise ValueError(f"aux_strength string value must be 'auto', got {value!r}")
     return float(value)
-
-
-def _normalize_precision_pair(value: Any, label: str) -> list[float]:
-    if isinstance(value, dict):
-        shape = value.get("shape")
-        rate = value.get("rate")
-    else:
-        try:
-            shape, rate = value
-        except Exception as exc:  # pragma: no cover - defensive shape guard
-            raise ValueError(
-                f"precision_hyperpriors[{label!r}] must be (shape, rate)"
-            ) from exc
-    if shape is None:
-        raise ValueError(f"precision_hyperpriors[{label!r}] needs a shape value")
-    if rate is None:
-        raise ValueError(f"precision_hyperpriors[{label!r}] needs a rate value")
-    shape_f = float(shape)
-    rate_f = float(rate)
-    if (
-        not math.isfinite(shape_f)
-        or not math.isfinite(rate_f)
-        or shape_f <= 0.0
-        or rate_f < 0.0
-    ):
-        raise ValueError(
-            f"precision_hyperpriors[{label!r}] needs finite shape > 0 and finite rate >= 0"
-        )
-    return [shape_f, rate_f]
-
-
-def _group_terms_from_formula(formula: str) -> list[str]:
-    return [m.group(1).strip() for m in re.finditer(r"\bgroup\s*\(\s*([^)]+?)\s*\)", formula)]
-
-
-def _resolve_precision_hyperpriors(
-    value: Any | None,
-    formula: str,
-    headers: list[str],
-    rows: list[list[str]],
-    group_metadata: Any | None = None,
-) -> Any | None:
-    if value is None:
-        return None
-    if callable(value):
-        out: dict[str, list[float]] = {}
-        metadata_by_label = group_metadata if isinstance(group_metadata, dict) else {}
-        labels: list[str] = []
-        for label in _group_terms_from_formula(formula):
-            if label not in labels:
-                labels.append(label)
-        for label in metadata_by_label:
-            if str(label) not in labels:
-                labels.append(str(label))
-        for label in labels:
-            levels: list[str] = []
-            if label in headers:
-                col = headers.index(label)
-                # Strip the categorical sentinel before it reaches user code.
-                # `normalize_table` prefixes every genuinely-categorical cell
-                # with CATEGORICAL_CELL_SENTINEL so the Rust side can tell a
-                # category from a numeric-looking string; Rust strips it, but
-                # this path reads the raw rows and was handing the user's
-                # precision-hyperprior callback level names like "\x00alpha".
-                levels = sorted(
-                    {row[col].removeprefix(CATEGORICAL_CELL_SENTINEL) for row in rows}
-                )
-            pair = value(
-                {
-                    "label": label,
-                    "term": label,
-                    "column": label,
-                    "levels": levels,
-                    "n_coefficients": len(levels),
-                    "metadata": metadata_by_label.get(label),
-                    "group_metadata": metadata_by_label.get(label),
-                }
-            )
-            out[label] = _normalize_precision_pair(pair, label)
-        return out
-    if isinstance(value, dict):
-        return {str(k): _normalize_precision_pair(v, str(k)) for k, v in value.items()}
-    return value
 
 
 def _normalize_fisher_rao_w(value: Any, *, n_rows: int, dim: int) -> Any:
@@ -1135,7 +1051,7 @@ def fit(
         noise_formula=noise_formula,
         noise_offset=noise_offset,
         flexible_link=flexible_link,
-        precision_hyperpriors=None,
+        precision_hyperpriors=precision_hyperpriors,
         latents=latents,
         penalties=penalties,
         smooths=smooths,
@@ -1151,11 +1067,6 @@ def fit(
         required_columns = rust_module().ctn_required_fit_columns(formula, json.dumps(payload))
     headers, rows, table_kind = normalize_table(data, required_columns=required_columns)
     payload["training_table_kind"] = table_kind
-    resolved_precision_hyperpriors = _resolve_precision_hyperpriors(
-        precision_hyperpriors, formula, headers, rows, rust_config.get("group_metadata")
-    )
-    if resolved_precision_hyperpriors is not None:
-        payload["precision_hyperpriors"] = resolved_precision_hyperpriors
 
     # ── Vector-response (multinomial-logit) dispatch (#328). ──────────────
     # The scalar `fit_table` payload pipeline is parameterised by a single
@@ -1280,9 +1191,6 @@ def fit_array(
     # (always "numpy" for the array entry point) so the predict-time
     # output-container fallback round-trips through save/load (#394).
     rust_config["training_table_kind"] = "numpy"
-    resolved_precision_hyperpriors = _resolve_precision_hyperpriors(
-        precision_hyperpriors, formula, [], [], rust_config.get("group_metadata")
-    )
     payload = _build_fit_payload(
         family=family,
         negative_binomial_theta=negative_binomial_theta,
@@ -1310,7 +1218,7 @@ def fit_array(
         noise_formula=noise_formula,
         noise_offset=noise_offset,
         flexible_link=flexible_link,
-        precision_hyperpriors=resolved_precision_hyperpriors,
+        precision_hyperpriors=precision_hyperpriors,
         latents=latents,
         penalties=penalties,
         smooths=smooths,

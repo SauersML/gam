@@ -1,8 +1,8 @@
 """Hard-scenario tests for Model.extend_with_group + precision_hyperpriors.
 
-Exercises post-fit deployment-time random-effect-level extension at
-``gamfit/_model.py:1675`` together with the ``precision_hyperpriors``
-fit-time callable path at ``gamfit/_api.py:141``.
+Exercises post-fit deployment-time random-effect-level extension together
+with the fit-time ``precision_hyperpriors`` map, which the Rust request
+document validates.
 
 Assertions are intentionally strict: public-API gaps should fail loudly rather
 than being masked as expected failures.
@@ -217,112 +217,35 @@ def test_precision_hyperpriors_dict_path_accepts_known_label() -> None:
 
 
 # ---------------------------------------------------------------------------
-# 6. precision_hyperpriors callable path
+# 6. Out-of-range hyperpriors are refused by the Rust request validator
 # ---------------------------------------------------------------------------
 
 
-def test_precision_hyperpriors_callable_is_invoked_with_documented_keys() -> None:
-    captured: list[dict[str, Any]] = []
-
-    def cb(ctx: dict[str, Any]) -> tuple[float, float]:
-        captured.append(dict(ctx))
-        return (2.0, 1.0)
-
-    gamfit.fit(
-        _training_frame(),
-        "y ~ x + group(g)",
-        precision_hyperpriors=cb,
-    )
-
-    # The callable is invoked once per group label parsed from the
-    # formula (see gamfit/_api.py:141 _resolve_precision_hyperpriors).
-    assert len(captured) == 1
-    ctx = captured[0]
-    expected_keys = {
-        "label",
-        "term",
-        "column",
-        "levels",
-        "n_coefficients",
-        "metadata",
-        "group_metadata",
-    }
-    assert set(ctx.keys()) == expected_keys
-    assert ctx["label"] == "g"
-    assert ctx["term"] == "g"
-    assert ctx["column"] == "g"
-    assert sorted(ctx["levels"]) == ["alpha", "beta", "gamma"]
-    assert ctx["n_coefficients"] == 3
-
-
-def test_precision_hyperpriors_callable_pair_dict_form_accepted() -> None:
-    def cb(_ctx: dict[str, Any]) -> dict[str, float]:
-        return {"shape": 3.0, "rate": 0.5}
-
+def test_precision_hyperpriors_object_form_accepted() -> None:
     model = gamfit.fit(
         _training_frame(),
         "y ~ x + group(g)",
-        precision_hyperpriors=cb,
+        precision_hyperpriors={"g": {"shape": 3.0, "rate": 0.5}},
     )
     eta = _predict_eta(model, [{"x": 0.0, "g": "alpha"}])
     assert np.all(np.isfinite(eta))
 
 
-def test_precision_hyperpriors_callable_changes_fitted_lambda() -> None:
-    strong = gamfit.fit(
-        _training_frame(),
-        "y ~ x + group(g)",
-        precision_hyperpriors=lambda _ctx: (5000.0, 1.0),
-    )
-    weak = gamfit.fit(
-        _training_frame(),
-        "y ~ x + group(g)",
-        precision_hyperpriors=lambda _ctx: (1.0, 0.0),
-    )
-    rows = [{"x": 0.0, "g": lvl} for lvl in ("alpha", "beta", "gamma")]
-    eta_strong = _predict_eta(strong, rows)
-    eta_weak = _predict_eta(weak, rows)
-    assert float(np.std(eta_strong)) < float(np.std(eta_weak))
-
-
-# ---------------------------------------------------------------------------
-# 7. Bad return values from the callable are rejected
-# ---------------------------------------------------------------------------
-
-
-def test_precision_hyperpriors_callable_returning_garbage_is_rejected() -> None:
-    def cb(_ctx: dict[str, Any]) -> Any:
-        return "not a (shape, rate) tuple"
-
-    with pytest.raises(Exception):
+def test_precision_hyperpriors_negative_shape_is_rejected() -> None:
+    with pytest.raises(gamfit.GamError, match=r"shape must be finite and > 0"):
         gamfit.fit(
             _training_frame(),
             "y ~ x + group(g)",
-            precision_hyperpriors=cb,
+            precision_hyperpriors={"g": (-1.0, 1.0)},
         )
 
 
-def test_precision_hyperpriors_callable_returning_negative_shape_is_rejected() -> None:
-    def cb(_ctx: dict[str, Any]) -> tuple[float, float]:
-        return (-1.0, 1.0)
-
-    with pytest.raises(Exception):
+def test_precision_hyperpriors_negative_rate_is_rejected() -> None:
+    with pytest.raises(gamfit.GamError, match=r"rate must be finite and >= 0"):
         gamfit.fit(
             _training_frame(),
             "y ~ x + group(g)",
-            precision_hyperpriors=cb,
-        )
-
-
-def test_precision_hyperpriors_callable_returning_nonfinite_is_rejected() -> None:
-    def cb(_ctx: dict[str, Any]) -> tuple[float, float]:
-        return (float("inf"), 1.0)
-
-    with pytest.raises(Exception):
-        gamfit.fit(
-            _training_frame(),
-            "y ~ x + group(g)",
-            precision_hyperpriors=cb,
+            precision_hyperpriors={"g": (2.0, -1.0)},
         )
 
 
