@@ -197,16 +197,23 @@ dropped, and restored items the table above retires were removed again.
 
 | Disposition | Identities |
 | --- | --- |
-| Restored in place | 357 |
+| Restored in place | 351 |
 | Defined elsewhere in the same crate | 13 |
 | Retired by the decisions above | 19 |
 | Retired: nothing that survived depends on it | 290 |
 | Retired by the owning work's own decision | 29 |
 | Retired by a later deletion commit named in the row | 511 |
+| Retired: no product uses it | 6 |
 
 Retired identities carry no compatibility obligation. Restoration is closed
 under calls: after the merges, no restored body calls a function the sweep
 removed.
+
+The public-surface rule then applies to every restored identity. One that no
+product uses is deleted, or narrowed to `pub(crate)` when production code in
+its own crate uses it. A row deleted under that rule reads
+`retired-no-product-user`, and its commit carries the census and source-removal
+records.
 
 Where a file's owner judged a producer superseded, the surviving carrier was
 deleted instead of getting its producer back, with an entry in

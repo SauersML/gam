@@ -12,12 +12,12 @@ crates/gam-custom-family/src/coefficient_groups.rs	validate_group_rho_prior_coor
 crates/gam-custom-family/src/coefficient_groups.rs	validate_penalized_complexity_prior	retired-by-later-deletion:48f48f9108
 crates/gam-custom-family/src/fit.rs	evaluate_labeled_outer_criterion_for_diagnostics	retired-by-later-deletion:48f48f9108
 crates/gam-custom-family/src/fit.rs	evaluate_rho_outer_criterion_for_diagnostics	retired-by-later-deletion:48f48f9108
-crates/gam-geometry/src/closure_family.rs	boundary_conductance	restored-in-place
-crates/gam-geometry/src/closure_family.rs	conductance_penalty_jet	restored-in-place
+crates/gam-geometry/src/closure_family.rs	boundary_conductance	retired-no-product-user
+crates/gam-geometry/src/closure_family.rs	conductance_penalty_jet	retired-no-product-user
 crates/gam-geometry/src/closure_family.rs	design_jet	retired-by-later-deletion:f83e9aebaf
 crates/gam-geometry/src/closure_family.rs	profile_ci_from_grid	retired-by-owner:spec-search
 crates/gam-geometry/src/closure_family.rs	row_jet	restored-in-place
-crates/gam-geometry/src/curvature_estimand.rs	design_coord_kappa_derivative	restored-in-place
+crates/gam-geometry/src/curvature_estimand.rs	design_coord_kappa_derivative	retired-no-product-user
 crates/gam-geometry/src/curvature_estimand.rs	is_interior	restored-in-place
 crates/gam-geometry/src/curvature_estimand.rs	is_railed	restored-in-place
 crates/gam-geometry/src/manifolds/constant_curvature.rs	distance_batch	restored-in-place
@@ -65,8 +65,8 @@ crates/gam-gpu/src/test_gate.rs	skipped_for_absent_device	retired-by-later-delet
 crates/gam-identifiability/src/canonical.rs	canonicalize_for_identifiability	retired-by-decision
 crates/gam-identifiability/src/families/bernoulli.rs	from_eta_pilot	retired-no-surviving-dependent
 crates/gam-identifiability/src/families/compiler.rs	build_primary_grams_gpu_or_cpu	retired-by-later-deletion:0904dd2a25
-crates/gam-identifiability/src/families/compiler.rs	build_raw_grams_from_channel_blocks	restored-in-place
-crates/gam-identifiability/src/families/compiler.rs	build_raw_grams_structural	restored-in-place
+crates/gam-identifiability/src/families/compiler.rs	build_raw_grams_from_channel_blocks	retired-no-product-user
+crates/gam-identifiability/src/families/compiler.rs	build_raw_grams_structural	retired-no-product-user
 crates/gam-identifiability/src/families/compiler.rs	compile_with_dual_metric	retired-by-later-deletion:0904dd2a25
 crates/gam-identifiability/src/families/compiler.rs	lift_coefficients	retired-by-later-deletion:0904dd2a25
 crates/gam-identifiability/src/families/compiler.rs	p_compiled	retired-by-later-deletion:b74e2559ed
@@ -231,7 +231,7 @@ crates/gam-models/src/gpu_kernels/cubic_bspline_moments.rs	moment_1d_gauss_legen
 crates/gam-models/src/gpu_kernels/cubic_bspline_moments.rs	tetrahedral_geom_moment_cpu	retired-by-later-deletion:418c732d2f
 crates/gam-models/src/gpu_kernels/cubic_bspline_moments.rs	try_device_tetrahedral_moments	retired-by-later-deletion:f2156a78e4
 crates/gam-models/src/inference/full_conformal.rs	bernoulli_full_conformal	retired-by-later-deletion:418c732d2f
-crates/gam-models/src/inference/full_conformal.rs	certifies_finite	restored-in-place
+crates/gam-models/src/inference/full_conformal.rs	certifies_finite	retired-no-product-user
 crates/gam-models/src/inference/full_conformal.rs	discrete_full_conformal_exhaustive	retired-by-later-deletion:418c732d2f
 crates/gam-models/src/inference/full_conformal.rs	discrete_full_conformal_window	retired-by-later-deletion:418c732d2f
 crates/gam-models/src/inference/full_conformal.rs	gaussian_jackknife_plus	restored-in-place

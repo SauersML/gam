@@ -15,12 +15,10 @@ pub use manifolds::{
     sphere, stiefel, torus,
 };
 
-pub use closure_family::{
-    ClosureFamily, ClosureProfileCi, boundary_conductance, conductance_penalty_jet,
-};
+pub use closure_family::{ClosureFamily, ClosureProfileCi};
 pub use curvature_estimand::{
-    CurvatureVerdict, DesignCoordKappaJet, FlatnessTest, KappaEstimateSupport, KappaProfileCi,
-    design_coord_kappa_derivative, flatness_lr_test, profile_ci_walk, wald_half_width,
+    CurvatureVerdict, FlatnessTest, KappaEstimateSupport, KappaProfileCi, flatness_lr_test,
+    profile_ci_walk, wald_half_width,
 };
 pub use latent_seed::laplacian_eigenmap_coords;
 pub use manifold::{GeometryError, GeometryResult, ManifoldSpec, RiemannianManifold};

@@ -5,10 +5,7 @@
 //! `ConstantCurvature` chart are landed and
 //! FD-gated. This module turns the fitted curvature `κ̂` from "we chose
 //! hyperbolic space" into a reported estimate with a confidence interval and a
-//! likelihood-ratio test of flatness — and exposes the κ-derivative of the
-//! design-moving geometry quantity (geodesic normal coordinates) as the clean
-//! seam the outer ψ-channel calls when κ joins the LAML/REML optimisation as one
-//! signed design-moving coordinate.
+//! likelihood-ratio test of flatness.
 //!
 //! ## What lives here vs. what the caller supplies
 //!
@@ -22,36 +19,21 @@
 //! ```
 //!
 //! and this module does the purely statistical work on top of it: the
-//! profile-likelihood CI walk, the interior-point κ=0 LR test, and the
-//! geometry-side κ-derivative API. None of the routines here re-enter the inner
-//! fit; they only evaluate the `V_p` the caller provides.
+//! profile-likelihood CI walk and the interior-point κ=0 LR test. None of the
+//! routines here re-enter the inner fit; they only evaluate the `V_p` the caller
+//! provides.
 //!
-//! ## The `smooth.rs` seam (documented, not edited)
+//! ## The design seam
 //!
 //! When `ConstantCurvature` becomes a smooth term, its design block `X(κ)` is
 //! built from geodesic normal coordinates `log_{x̄}(yᵢ)` of the latent points
 //! about a base `x̄` (the intrinsic-S² Wahba smooth is the structural template).
 //! The single quantity whose κ-movement the outer gradient consumes is therefore
-//! `∂ log_{x̄}(y)/∂κ` (and `∂²/∂κ²` for the exact Wald curvature). The seam is:
-//!
-//! * In `terms/smooth.rs`, wherever the constant-curvature smooth builds its
-//!   design from `manifold.log_map(x̄, yᵢ)` (the per-row normal coordinates),
-//!   the ψ-channel variant must instead call
-//!   `design_coord_kappa_derivative` to obtain the *same* coordinates together
-//!   with their `∂/∂κ` and `∂²/∂κ²`. That triple feeds the outer assembly's
-//!   ext-coord channel exactly as the Matérn-κ basis hyper-derivatives do
-//!   (hyper.rs ext-coords → unified outer assembly, with `∂S/∂κ` handled by the
-//!   penalty ψ-derivatives). κ then optimises as one more signed ψ-coordinate;
-//!   no new outer machinery is introduced — this module only provides the
-//!   geometry-side derivative the seam reads.
-//!
-//! The API here is intentionally allocation-light and stateless so the seam can
-//! call it per row inside the design build without owning any outer state.
-
-use ndarray::{Array1, ArrayView1};
-
-use super::manifold::GeometryResult;
-use crate::manifolds::constant_curvature::{ConstantCurvature, log_map_kappa_jet};
+//! `∂ log_{x̄}(y)/∂κ` (and `∂²/∂κ²` for the exact Wald curvature). The κ-jet
+//! `log_map_kappa_jet` returns that coordinate with both κ-derivatives, and the
+//! triple feeds the outer assembly's ext-coord channel as the Matérn-κ basis
+//! hyper-derivatives do. κ then optimises as one more signed ψ-coordinate; no
+//! new outer machinery is introduced.
 
 use super::closure_family::inv_std_normal;
 
@@ -474,43 +456,6 @@ where
     })
 }
 
-/// The design-moving geometry quantity and its κ-derivatives, for one latent
-/// row — the clean API the `smooth.rs` ψ-channel seam calls.
-///
-/// The constant-curvature smooth's design is built from geodesic normal
-/// coordinates `coord = log_{base}(point)`. This returns that vector together
-/// with `∂coord/∂κ` and `∂²coord/∂κ²` (exact, from `log_map_kappa_jet`), which
-/// the outer assembly's ext-coord channel consumes when κ moves as a ψ-coordinate.
-#[derive(Clone, Debug)]
-pub struct DesignCoordKappaJet {
-    /// The normal coordinate `log_{base}(point)` at the current κ.
-    pub coord: Array1<f64>,
-    /// `∂coord/∂κ`.
-    pub d_kappa: Array1<f64>,
-    /// `∂²coord/∂κ²`.
-    pub d_kappa2: Array1<f64>,
-}
-
-/// Geodesic normal coordinate `log_{base}(point)` and its `∂/∂κ`, `∂²/∂κ²` on
-/// the constant-curvature chart — the per-row design quantity whose κ-movement
-/// the outer ψ-channel consumes (see the module-level `smooth.rs` seam note).
-///
-/// This is a thin, allocation-light adapter over [`log_map_kappa_jet`] so the
-/// seam has a single, intent-named entry point and does not re-derive which
-/// geometric quantity moves the design.
-pub fn design_coord_kappa_derivative(
-    manifold: &ConstantCurvature,
-    base: ArrayView1<'_, f64>,
-    point: ArrayView1<'_, f64>,
-) -> GeometryResult<DesignCoordKappaJet> {
-    let (coord, d_kappa, d_kappa2) = log_map_kappa_jet(manifold, base, point)?;
-    Ok(DesignCoordKappaJet {
-        coord,
-        d_kappa,
-        d_kappa2,
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -704,12 +649,4 @@ mod tests {
             previous = p;
         }
     }
-
-    // The κ-derivative API must echo `log_map_kappa_jet` exactly (it is a thin,
-    // intent-named adapter) and the derivatives must match a central finite
-    // difference of the value channel in κ.
-
-    // Near the flat point κ=0 the adapter must still agree with the FD of the
-    // value (the Taylor branch boundary of the underlying jet).
-
 }

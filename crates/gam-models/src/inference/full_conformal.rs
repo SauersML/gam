@@ -2271,14 +2271,6 @@ pub struct JackknifePlusInterval {
     pub n: usize,
 }
 
-impl JackknifePlusInterval {
-    /// Whether both endpoints are finite (enough points to certify the
-    /// requested level).
-    pub fn certifies_finite(&self) -> bool {
-        self.lo.is_finite() && self.hi.is_finite()
-    }
-}
-
 /// The jackknife+ interval assembly of Barber et al. (2021), exact order
 /// statistics:
 ///

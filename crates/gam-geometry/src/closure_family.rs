@@ -315,41 +315,6 @@ fn seed_lanes(gamma: f64, u4: &[f64; 4]) -> (f64x4, f64x4, f64x4, f64x4) {
     )
 }
 
-/// The smooth penalty closure-coefficient `c(γ)` for the boundary-conductance
-/// MVP `S(γ) = S_open + c(γ)·S_wrap`, with `c(0)=0, c(1)=1`, and its γ-jet.
-///
-/// A monotone `C²` interpolant that is flat through second order at both
-/// endpoints (so a box-constrained closure Hessian agrees with the constant
-/// extension outside `[0, 1]`): the quintic smootherstep
-/// `c(γ) = 6γ⁵ − 15γ⁴ + 10γ³`. Returns `(c, c′, c″)`.
-pub fn boundary_conductance(gamma: f64) -> (f64, f64, f64) {
-    let g = gamma.clamp(0.0, 1.0);
-    let one_minus_g = 1.0 - g;
-    let c = g * g * g * (10.0 + g * (-15.0 + 6.0 * g));
-    let cp = 30.0 * g * g * one_minus_g * one_minus_g;
-    let cpp = 60.0 * g * one_minus_g * (1.0 - 2.0 * g);
-    (c, cp, cpp)
-}
-
-/// The boundary-conductance penalty `S(γ) = S_open + c(γ)·S_wrap` and its
-/// first/second γ-derivatives, given the open and wrap penalty pieces.
-///
-/// `s_open` is the ordinary (open-interval) difference penalty; `s_wrap` is the
-/// closing-edge rows that the cyclic difference penalty adds on top — i.e.
-/// `S_circle = S_open + S_wrap`. At `γ = 1`, `c = 1` and the penalty is exactly
-/// the cyclic penalty; at `γ = 0`, `c = 0` and it is the open penalty.
-pub fn conductance_penalty_jet(
-    s_open: &Array2<f64>,
-    s_wrap: &Array2<f64>,
-    gamma: f64,
-) -> (Array2<f64>, Array2<f64>, Array2<f64>) {
-    let (c, cp, cpp) = boundary_conductance(gamma);
-    let s = s_open + &(s_wrap * c);
-    let ds = s_wrap * cp;
-    let dds = s_wrap * cpp;
-    (s, ds, dds)
-}
-
 /// A profile-likelihood interval for the closure parameter.
 ///
 /// `gamma_hat` is the profile minimiser of `V(γ) = V(θ̂(γ), γ)`; `ci_lo/ci_hi`

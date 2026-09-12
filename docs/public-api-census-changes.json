@@ -1294,5 +1294,18 @@
     },
     "reason": "#2469: SpikeInRocConfig::torus hard-coded its reporting FPR levels (0.01, 0.05, 0.10) and had no caller. The surviving circle constructor takes the caller's fpr_levels. Its one production caller, crates/gam-sae/src/inference/sparse_audit.rs, already set them to the audit's configured false-positive rate.",
     "evidence": "Outside crates/gam-sae/src/null_battery.rs, git grep SpikeInRocConfig at the base finds only crates/gam-sae/src/inference/sparse_audit.rs:902, a circle call. git grep 'torus(' over *.rs and *.py finds no call of SpikeInRocConfig::torus. This removed map is public_api_census.py's public_functions predicate applied to this diff: one pub fn declaration is removed."
+  },
+  {
+    "base": "fe919657d3b3381f82be9addc5b71d0deed9baa9",
+    "removed": {
+      "crates/gam-geometry/src/closure_family.rs::boundary_conductance": 1,
+      "crates/gam-geometry/src/closure_family.rs::conductance_penalty_jet": 1,
+      "crates/gam-geometry/src/curvature_estimand.rs::design_coord_kappa_derivative": 1,
+      "crates/gam-identifiability/src/families/compiler.rs::build_raw_grams_from_channel_blocks": 1,
+      "crates/gam-identifiability/src/families/compiler.rs::build_raw_grams_structural": 1,
+      "crates/gam-models/src/inference/full_conformal.rs::certifies_finite": 1
+    },
+    "reason": "#2829 public-surface rule (docs/rust-library-surface.md, 6e5362f23): a pub item that no product uses is deleted. These six restored-in-place identities have no user in gam-cli, gam-pyffi or Python, examples/, or another crate's production code, and no test calls them either.",
+    "evidence": "restored_consumers_2829.py at d8f6ef9be (MSI job 527977, /scratch.global/sauer354/pool/api2829/consumers.d8f6ef9be98996b5c98bd08667aa4fe121561e8f.rows.tsv) scores conductance_penalty_jet, design_coord_kappa_derivative, build_raw_grams_from_channel_blocks, build_raw_grams_structural and certifies_finite as unreferenced. It scores boundary_conductance as production_same_crate, and that one production line (closure_family.rs:346) is inside conductance_penalty_jet. At the base, git grep -w over crates, src, tests, examples, python and bench finds each name only at its own declaration, its own body, and gam-geometry's lib.rs pub use line."
   }
 ]
