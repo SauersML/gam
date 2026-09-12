@@ -630,12 +630,15 @@ pub struct KernelSumTerm {
 ///
 /// The two routes have opposite error behaviour in `dv`: the direct difference
 /// carries relative error `ε/|dv|`, the expansion `~dv³/24` from its first
-/// dropped order. They cross at `dv⁴ ≈ 24ε`, i.e. `dv ≈ 8e-4`. `1e-4` sits
-/// safely on the expansion's side of that crossing (`4e-14` expansion error
-/// against `2e-12` for the difference) and leaves every pair a runtime row
-/// actually forms — interval widths of order the observation scale — on the
-/// unchanged numerical path.
-const ANALYTIC_LOG_MASS_GAP_THRESHOLD: f64 = 1e-4;
+/// dropped order. The switch belongs where they cross, `dv⁴ = 24ε`: below the
+/// crossing the expansion is the more accurate route and above it the difference
+/// is, so any other switch point hands a band of pairs to the worse route. The
+/// crossing is `(24ε)^{1/4} ≈ 2.7e-4`, where both routes carry `≈ 8.2e-13`
+/// relative error, and it leaves every pair a runtime row actually forms —
+/// interval widths of order the observation scale — on the numerical path.
+fn analytic_log_mass_gap_threshold() -> f64 {
+    (24.0 * f64::EPSILON).sqrt().sqrt()
+}
 
 /// Derivatives of `log(Σ_j a_j · K_{k_j, m_j}(μ, σ))` with respect to μ.
 ///
@@ -737,7 +740,7 @@ impl LogKernelSumJet {
     ///
     /// Returns `None` unless the pair shares its rung, both masses are
     /// strictly positive, and `|dv|` is inside
-    /// [`ANALYTIC_LOG_MASS_GAP_THRESHOLD`]; outside that range the direct
+    /// [`analytic_log_mass_gap_threshold`]; outside that range the direct
     /// difference is both valid and more accurate and the caller must use it.
     ///
     /// LIMIT: the coefficient half, `ln|a₁| − ln|a₀|`, is still a numerical
@@ -754,7 +757,7 @@ impl LogKernelSumJet {
             return None;
         }
         let dv = ((t1.m - t0.m) / t0.m).ln_1p();
-        if !dv.is_finite() || dv.abs() > ANALYTIC_LOG_MASS_GAP_THRESHOLD {
+        if !dv.is_finite() || dv.abs() > analytic_log_mass_gap_threshold() {
             return None;
         }
         let kf = t0.k as f64;
@@ -1789,6 +1792,29 @@ mod tests {
             "score={}, fd={fd_score}",
             jet.score
         );
+    }
+
+    /// The analytic/numerical switch is the error balance of the two routes, not
+    /// a margin beside it: at the threshold the expansion's first dropped order
+    /// `dv³/24` equals the direct difference's `ε/dv`.
+    #[test]
+    fn analytic_log_mass_gap_threshold_is_the_routes_error_balance() {
+        let dv = analytic_log_mass_gap_threshold();
+        let expansion = dv.powi(3) / 24.0;
+        let difference = f64::EPSILON / dv;
+        // Eleven rounded operations reach the ratio: the two square roots, whose
+        // 1.5u the fourth power multiplies to 6u, the cube's two products, and
+        // three divisions.
+        let band = gam_linalg::roundoff::accumulation_growth(11);
+        assert!(
+            (expansion / difference - 1.0).abs() <= band,
+            "threshold {dv:e}: expansion error {expansion:e}, difference error {difference:e}"
+        );
+        // Non-vacuity: the two routes' errors genuinely cross there.
+        let below = 0.5 * dv;
+        assert!(below.powi(3) / 24.0 < f64::EPSILON / below);
+        let above = 2.0 * dv;
+        assert!(above.powi(3) / 24.0 > f64::EPSILON / above);
     }
 
     /// #2277 hardening: a NARROW interval-censored window (S(L) ≈ S(R)) must
