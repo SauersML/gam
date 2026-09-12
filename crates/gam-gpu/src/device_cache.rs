@@ -3,77 +3,24 @@
 //!
 //! Before this module existed, each device backend (`bms_flex`,
 //! `survival_flex`, `polya_gamma`, `reml_trace`, ...) carried its own
-//! near-identical copy of two patterns:
-//!
-//!   1. A power-of-two bucketed free list of reusable f64 device slices
-//!      (the per-backend `DeviceArena`).
-//!   2. A `OnceLock<Result<{module: Arc<CudaModule>}, GpuError>>` that
-//!      NVRTC-compiled one source string the first time the backend
-//!      dispatched and cached the resulting module for the process lifetime.
-//!
-//! Both are now provided here so every cudarc backend points at the same
-//! implementation. The migration is atomic: no per-backend `DeviceArena`
-//! type, no per-backend ad-hoc OnceLock, no transitional shim.
+//! near-identical `OnceLock<Result<{module: Arc<CudaModule>}, GpuError>>` that
+//! NVRTC-compiled one source string the first time the backend dispatched and
+//! cached the resulting module for the process lifetime. That cache is now
+//! provided here so every cudarc backend points at the same implementation: no
+//! per-backend ad-hoc OnceLock, no transitional shim.
 
 #[cfg(target_os = "linux")]
-pub use linux::{DeviceArena, KeyedPtxModuleCache, PtxModuleCache, compile_ptx_arch};
+pub use linux::{KeyedPtxModuleCache, PtxModuleCache, compile_ptx_arch};
 
 #[cfg(target_os = "linux")]
 mod linux {
     use super::super::gpu_error::GpuError;
     use crate::gpu_error::GpuResultExt;
-    use cudarc::driver::{CudaContext, CudaModule, CudaSlice, CudaStream};
+    use cudarc::driver::{CudaContext, CudaModule};
     use cudarc::nvrtc::{CompileOptions, compile_ptx_with_opts};
     use std::collections::HashMap;
     use std::path::Path;
     use std::sync::{Arc, Mutex};
-
-    /// Power-of-two bucketed free list of f64 device slices.
-    ///
-    /// Allocations round the requested element count up to the next
-    /// `usize::next_power_of_two`. On drop the slab is handed back to the
-    /// arena under the same bucket via [`DeviceArena::release`]. Held under
-    /// a `Mutex` by every backend that uses it because large-scale fits
-    /// dispatch from multiple rayon workers; the mutex is only held during
-    /// `alloc` / `release`, never across kernel launches.
-    #[derive(Default)]
-    pub struct DeviceArena {
-        free: HashMap<usize, Vec<CudaSlice<f64>>>,
-    }
-
-    impl DeviceArena {
-        #[inline]
-        pub fn bucket_of(elements: usize) -> usize {
-            elements.max(1).next_power_of_two()
-        }
-
-        /// Allocate a device slice of at least `elements` f64s. Returns the
-        /// bucket size actually allocated so the caller can release into the
-        /// same bucket on drop. `label` is woven into the error message if
-        /// the underlying `alloc_zeros` fails so failures stay attributable
-        /// to the originating backend (matching the pre-extraction wording).
-        pub fn alloc(
-            &mut self,
-            stream: &Arc<CudaStream>,
-            elements: usize,
-            label: &'static str,
-        ) -> Result<(usize, CudaSlice<f64>), GpuError> {
-            let bucket = Self::bucket_of(elements);
-            if let Some(bucket_vec) = self.free.get_mut(&bucket)
-                && let Some(slot) = bucket_vec.pop()
-            {
-                return Ok((bucket, slot));
-            }
-            let fresh = stream
-                .alloc_zeros::<f64>(bucket)
-                .gpu_ctx_with(|err| format!("{label} arena alloc_zeros<{bucket}>: {err}"))?;
-            Ok((bucket, fresh))
-        }
-
-        pub fn release(&mut self, bucket: usize, slab: CudaSlice<f64>) {
-            self.free.entry(bucket).or_default().push(slab);
-        }
-    }
 
     /// Process-wide NVRTC module cache for a single PTX source string.
     ///

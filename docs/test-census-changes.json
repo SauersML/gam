@@ -309,5 +309,15 @@
       "tests/quality": 1,
       "crates/gam-model-kernels": 4
     }
+  },
+  {
+    "base": "22a0896e0e9488541552f1f31abb32c6ac298049",
+    "reason": "user directive: delete all useless slop and code only tests use; lead rulings: delete DeviceArena alloc/release and the arena field, move GPU test-gate helpers into test scope",
+    "evidence": "The four gam-gpu unit tests an_absent_device_is_counted_not_silent_2422, the_skip_marker_is_one_greppable_string_2422, the_gate_has_no_third_silent_outcome_2422 and the_gate_projects_to_an_option_only_at_the_call_site_2422 move unchanged with the gate into the tests/arrow_gpu binary. test_census on MSI over 5d498d0e9 plus this patch measured 10431 tests before and after and no removed pins; only the crates/gam-gpu unit loses these four.",
+    "removed_pins": {},
+    "test_count_decrease": 0,
+    "unit_test_decreases": {
+      "crates/gam-gpu": 4
+    }
   }
 ]

@@ -7,7 +7,7 @@
     "crates/gam-data": 47,
     "crates/gam-event-history": 121,
     "crates/gam-geometry": 267,
-    "crates/gam-gpu": 73,
+    "crates/gam-gpu": 69,
     "crates/gam-identifiability": 72,
     "crates/gam-inference": 131,
     "crates/gam-linalg": 280,

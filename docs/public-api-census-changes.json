@@ -478,5 +478,19 @@
     },
     "reason": "user directive: delete all useless slop",
     "evidence": "Backfilled: 7d3b11307 (jets' combined gam-terms, gam-linalg and gam-math slop deletion) removed these public functions and landed its source-removal entry but omitted this acknowledgement. scripts/public_api_census.py on MSI over 0367fa300..7d3b11307 measured exactly this removed map (/scratch.global/sauer354/sw5-logs/S8.pubapi.txt)."
+  },
+  {
+    "base": "22a0896e0e9488541552f1f31abb32c6ac298049",
+    "removed": {
+      "crates/gam-gpu/src/device_cache.rs::alloc": 1,
+      "crates/gam-gpu/src/device_cache.rs::bucket_of": 1,
+      "crates/gam-gpu/src/device_cache.rs::release": 1,
+      "crates/gam-gpu/src/test_gate.rs::assert_absent_device_was_counted": 1,
+      "crates/gam-gpu/src/test_gate.rs::gpu_for_test": 1,
+      "crates/gam-gpu/src/test_gate.rs::runtime": 1,
+      "crates/gam-gpu/src/test_gate.rs::skipped_for_absent_device": 1
+    },
+    "reason": "user directive: delete all useless slop and code only tests use; lead rulings: delete DeviceArena alloc/release and the arena field, move GPU test-gate helpers into test scope",
+    "evidence": "DeviceArena: scripts/public_api_census.py on MSI over 5d498d0e9 plus this patch measured exactly this removed map. DeviceArena::alloc, release and bucket_of had no callers in production, test, example or bench code. Test gate: scripts/public_api_census.py on MSI over 5d498d0e9 plus this patch measured exactly this removed map. The functions survive unchanged in tests/common/gpu/gpu_gate.rs, where their only callers, the arrow_gpu tests and the gate's own self-tests, now reach them."
   }
 ]

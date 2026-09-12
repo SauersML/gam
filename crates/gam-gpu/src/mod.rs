@@ -33,9 +33,6 @@ pub mod policy;
 pub mod pool;
 pub mod profile;
 pub mod solver;
-/// One gate for every GPU-conditional test (#2422); `pub` because the tests
-/// that need it live in other crates.
-pub mod test_gate;
 
 // Domain-specific GPU kernels are isolated from the infrastructure modules.
 pub mod kernels;

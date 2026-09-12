@@ -6,7 +6,7 @@
 //! The whole file is `#![cfg(target_os = "linux")]`, so on the macOS dev box it
 //! compiles to nothing; on a Linux host without a CUDA runtime every test skips
 //! through `skip_without_cuda!`, whose skip is COUNTED against
-//! `gam::gpu::test_gate` and announced with the shared `SKIPPED(no-cuda):`
+//! `crate::gpu_gate` and announced with the shared `SKIPPED(no-cuda):`
 //! marker (#2422) — so the always-on CI suite stays green without seven tests
 //! reporting `ok` for verifying nothing. On `gam-gpu-1` (V100), the tests
 //! cover the full pipeline:
@@ -47,7 +47,7 @@ use ndarray::Array2;
 /// site misses.
 ///
 /// Two things changed. The skip now goes through
-/// `gam::gpu::test_gate::gpu_for_test`, so it increments the process-wide skip
+/// `crate::gpu_gate::gpu_for_test`, so it increments the process-wide skip
 /// counter, prints the single greppable `SKIPPED(no-cuda):` marker a CI ledger
 /// can scrape, and — via `assert_absent_device_was_counted` — executes a real
 /// assertion instead of returning with none, which is the whole of #2422. It
@@ -60,11 +60,11 @@ use ndarray::Array2;
 /// build. It read as non-Linux coverage while being unreachable text.
 macro_rules! skip_without_cuda {
     ($label:expr) => {{
-        let skips_before = gam::gpu::test_gate::skipped_for_absent_device();
-        match gam::gpu::test_gate::gpu_for_test($label) {
-            gam::gpu::test_gate::GpuTestGate::Ready(_) => {}
-            gam::gpu::test_gate::GpuTestGate::AbsentDevice => {
-                gam::gpu::test_gate::assert_absent_device_was_counted(skips_before);
+        let skips_before = crate::gpu_gate::skipped_for_absent_device();
+        match crate::gpu_gate::gpu_for_test($label) {
+            crate::gpu_gate::GpuTestGate::Ready(_) => {}
+            crate::gpu_gate::GpuTestGate::AbsentDevice => {
+                crate::gpu_gate::assert_absent_device_was_counted(skips_before);
                 return;
             }
         }
