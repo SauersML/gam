@@ -2354,10 +2354,6 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
         );
     }
 
-    // Declare the derivatives selected by the family's capability/work policy
-    // and let the outer planner use that curvature during search. Forcing every
-    // family into gradient-only search discarded affordable exact Hessians and
-    // repeatedly restarted BFGS at cost stalls in the multinomial fit (#1082).
     use gam_problem::OuterEval;
     use gam_solve::model_types::EstimationError;
     use gam_solve::rho_optimizer::{OuterEvalOrder, OuterProblem};
@@ -2555,6 +2551,18 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
         .with_stuck_stall_cold_reeval_signal(Arc::clone(&outer_force_cold))
         .with_gradient(cap_gradient)
         .with_hessian(hessian)
+        // #2359's optimize-3/certify-4 lifecycle (#2898). The exact Hessian stays
+        // declared, and the terminal mint requests `ValueGradientHessian` from
+        // that declaration whatever the search plan is. The search itself runs
+        // BFGS on the exact analytic gradient, so the order-five Jeffreys
+        // curvature (D²H_Φ, the completion pair correction, the third information
+        // derivative) is priced once at the certificate instead of on every ARC
+        // trial, rejected trials included. At 2f844874e on survival
+        // marginal-slope 160×6, ARC search took 178.2 s to V=264.68231024 with 11
+        // strict-saddle windows, and order five was 59-60% of that time;
+        // gradient-only search took 19.6 s to V=264.68203561 and minted (6,0,0)
+        // with λ_min=1.68e-4.
+        .with_prefer_gradient_only(true)
         // The mode-selection consumer below requires a certified local minimum,
         // not merely a stationary point whose raw negative curvature was cleared
         // by the generic gradient-residue floor. Declare that requirement before
