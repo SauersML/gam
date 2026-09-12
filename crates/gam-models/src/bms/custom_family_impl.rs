@@ -3521,7 +3521,7 @@ impl BernoulliMarginalSlopeFamily {
             const TARGET_BYTES: usize = gam_runtime::resource::LIBRARY_ROW_CHUNK_TARGET_BYTES;
             let panels = 4usize;
             let width = rank + n_dirs;
-            (TARGET_BYTES / (panels * width.max(1) * 8)).max(512).min(n)
+            (TARGET_BYTES / (panels * width.max(1) * 8)).max(1).min(n)
         };
         let factor_m = factor.slice(s![slices.marginal.clone(), ..]);
         let factor_g = factor.slice(s![slices.slope.clone(), ..]);

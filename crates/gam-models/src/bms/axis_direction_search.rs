@@ -1340,6 +1340,22 @@ impl BernoulliMarginalSlopeFamily {
         // materialization by keeping one accumulator per ψ axis in the
         // rayon fold.
         let weighted_rows = cache.outer_weighted_rows_cached(options, n);
+        // Rows per hoisted ψ block. Each hoisted row carries one design row per
+        // axis, so the block is the library row-chunk budget divided by those
+        // bytes, and never less than one row.
+        let psi_row_bytes = axes
+            .iter()
+            .map(|axis| {
+                std::mem::size_of::<f64>()
+                    * if axis.block_idx == 0 {
+                        slices.marginal.len()
+                    } else {
+                        slices.slope.len()
+                    }
+            })
+            .sum::<usize>();
+        let psi_row_block =
+            (gam_runtime::resource::LIBRARY_ROW_CHUNK_TARGET_BYTES / psi_row_bytes.max(1)).max(1);
         let make_acc = || -> Vec<(f64, Array1<f64>, BernoulliBlockHessianAccumulator)> {
             (0..k)
                 .map(|_| {
@@ -1367,10 +1383,9 @@ impl BernoulliMarginalSlopeFamily {
                 // for the whole block instead runs the same rows through the
                 // same kernel at a shape the GEMM can actually use (gam#979).
                 //
-                // Blocked, so the hoisted rows stay bounded no matter how the
-                // fold sizes the range it hands us.
-                const PSI_ROW_BLOCK: usize = 512;
-                for block in weighted_rows[index_range].chunks(PSI_ROW_BLOCK) {
+                // Blocked, so the hoisted rows stay within the row-chunk budget no
+                // matter how the fold sizes the range it hands us.
+                for block in weighted_rows[index_range].chunks(psi_row_block) {
                     // The hoist is only valid when the block's rows ARE the
                     // contiguous span `start..start + len`: an outer-score
                     // subsample hands this fold an arbitrary row set, and there
