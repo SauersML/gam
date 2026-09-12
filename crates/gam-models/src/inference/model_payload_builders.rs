@@ -2706,6 +2706,7 @@ fn payload_for_latent_survival(
         lat_result.resolvedspec,
         lat_result.design,
         Some(lat_result.latent_sd),
+        lat_result.baseline_config,
         true,
         time_basis,
     )
@@ -2728,6 +2729,7 @@ fn payload_for_latent_binary(
         lat_result.resolvedspec,
         lat_result.design,
         None,
+        lat_result.baseline_config,
         false,
         time_basis,
     )
@@ -2742,11 +2744,14 @@ fn payload_for_latent_window(
     resolvedspec: TermCollectionSpec,
     cov_design: TermCollectionDesign,
     learned_latent_sd: Option<f64>,
+    // The baseline the fit's time offsets were realized from, carried on the
+    // fit result. Re-parsing `FitConfig` here saved the user's seed instead of
+    // the fitted baseline, and failed outright when scale/shape were unset
+    // (#2714).
+    baseline_cfg: crate::survival::construction::SurvivalBaselineConfig,
     is_survival: bool,
     time_basis: Option<SavedSurvivalTimeBasis>,
 ) -> Result<FittedModelPayload, String> {
-    use crate::survival::construction::parse_survival_baseline_config;
-
     // Carried from the materialization that produced this fit, not re-derived
     // (#2470) — see `payload_for_survival_location_scale` for the anchor
     // divergence this closes.
@@ -2758,13 +2763,6 @@ fn payload_for_latent_window(
     })?;
     let (entryname, exitname, eventname) = parse_surv_response(&parsed.response)?
         .ok_or_else(|| "latent survival/binary FFI requires Surv(...) response".to_string())?;
-    let baseline_cfg = parse_survival_baseline_config(
-        &fit_config.baseline_target,
-        fit_config.baseline_scale,
-        fit_config.baseline_shape,
-        fit_config.baseline_rate,
-        fit_config.baseline_makeham,
-    )?;
 
     // For latent survival, splice the fitted latent_sd into the persisted
     // HazardMultiplier frailty (mirrors CLI behaviour at main.rs:5541).

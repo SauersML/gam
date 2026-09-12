@@ -31,6 +31,7 @@ use crate::probability::{
 };
 use crate::quadrature::{IntegratedExpectationMode, QuadratureContext};
 use crate::sigma_link::{exp_sigma_eta_for_sigma_scalar, exp_sigma_from_eta_scalar};
+use crate::survival::construction::SurvivalBaselineConfig;
 use crate::survival::latent::interval::{
     LatentFrailtyResolution, LatentIntervalModel, LatentIntervalRowView,
     validate_latent_interval_inputs,
@@ -283,6 +284,10 @@ pub struct LatentSurvivalTermSpec {
     /// workflow's baseline-θ probes). `None`, or a length that does not match
     /// the mean design's penalties, starts at zero.
     pub initial_mean_log_lambdas: Option<Array1<f64>>,
+    /// The parametric baseline the time block's offsets were realized from.
+    /// The fit result carries it to every consumer that rebuilds those offsets
+    /// at new ages, so the saved model cannot disagree with the fit (#2714).
+    pub baseline_config: SurvivalBaselineConfig,
 }
 
 pub struct LatentSurvivalTermFitResult {
@@ -290,6 +295,9 @@ pub struct LatentSurvivalTermFitResult {
     pub design: TermCollectionDesign,
     pub resolvedspec: TermCollectionSpec,
     pub latent_sd: f64,
+    /// The baseline whose offsets this fit's time coefficients were estimated
+    /// against; the saved model persists exactly this configuration.
+    pub baseline_config: SurvivalBaselineConfig,
     /// Per-row residuals of the unpenalized NLL w.r.t. the additive baseline
     /// time-block offsets `(entry, exit, derivative)` at the converged β̂.
     /// Contracted against `baseline_offset_theta_partials` by
@@ -310,12 +318,18 @@ pub struct LatentBinaryTermSpec {
     pub unloaded_mass_exit: Array1<f64>,
     pub meanspec: TermCollectionSpec,
     pub mean_offset: Array1<f64>,
+    /// The parametric baseline the time block's offsets were realized from
+    /// (see [`LatentSurvivalTermSpec::baseline_config`]).
+    pub baseline_config: SurvivalBaselineConfig,
 }
 
 pub struct LatentBinaryTermFitResult {
     pub fit: UnifiedFitResult,
     pub design: TermCollectionDesign,
     pub resolvedspec: TermCollectionSpec,
+    /// The baseline whose offsets this fit's time coefficients were estimated
+    /// against; the saved model persists exactly this configuration.
+    pub baseline_config: SurvivalBaselineConfig,
     /// Per-row residuals of the unpenalized NLL w.r.t. the additive baseline
     /// time-block offsets `(entry, exit)` at the converged β̂ (the derivative
     /// channel is identically zero for the binary deployment likelihood).
@@ -816,6 +830,7 @@ pub fn fit_latent_survival_terms(
         design: mean_design,
         resolvedspec,
         latent_sd,
+        baseline_config: spec.baseline_config,
         baseline_offset_residuals,
     })
 }
@@ -861,6 +876,7 @@ pub fn fit_latent_binary_terms(
         fit,
         design: mean_design,
         resolvedspec,
+        baseline_config: spec.baseline_config,
         baseline_offset_residuals,
     })
 }

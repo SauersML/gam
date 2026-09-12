@@ -1087,6 +1087,7 @@ pub(crate) fn materialize_survival<'a>(
                     meanspec: termspec.clone(),
                     mean_offset: threshold_offset.clone(),
                     initial_mean_log_lambdas: carried_mean_log_lambdas,
+                    baseline_config: candidate.clone(),
                 },
                 frailty: config.frailty.clone(),
                 options: BlockwiseFitOptions {
@@ -1149,6 +1150,7 @@ pub(crate) fn materialize_survival<'a>(
                     unloaded_mass_exit: prepared.unloaded_mass_exit,
                     meanspec: termspec.clone(),
                     mean_offset: threshold_offset.clone(),
+                    baseline_config: candidate.clone(),
                 },
                 frailty: config.frailty.clone(),
                 options: BlockwiseFitOptions {

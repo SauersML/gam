@@ -919,6 +919,17 @@
             meanspec: empty_meanspec(),
             mean_offset: Array1::zeros(n),
             initial_mean_log_lambdas: None,
+            baseline_config: validation_baseline_config(),
+        }
+    }
+
+    fn validation_baseline_config() -> SurvivalBaselineConfig {
+        SurvivalBaselineConfig {
+            target: crate::survival::construction::SurvivalBaselineTarget::Weibull,
+            scale: Some(1.0),
+            shape: Some(1.0),
+            rate: None,
+            makeham: None,
         }
     }
 
@@ -959,6 +970,7 @@
             unloaded_mass_exit: Array1::from_elem(n, 0.05),
             meanspec: empty_meanspec(),
             mean_offset: Array1::zeros(n),
+            baseline_config: validation_baseline_config(),
         }
     }
 

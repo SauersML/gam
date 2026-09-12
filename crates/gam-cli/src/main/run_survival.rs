@@ -1204,7 +1204,7 @@ pub(crate) fn run_survival(args: SurvivalArgs) -> Result<(), String> {
             }
         };
         let build_survival_request =
-            |prepared: PreparedSurvivalTimeStack| LatentSurvivalFitRequest {
+            |candidate: &SurvivalBaselineConfig, prepared: PreparedSurvivalTimeStack| LatentSurvivalFitRequest {
                 data: ds.values.view(),
                 spec: gam::families::survival::latent::LatentSurvivalTermSpec {
                     age_entry: age_entry.clone(),
@@ -1222,11 +1222,13 @@ pub(crate) fn run_survival(args: SurvivalArgs) -> Result<(), String> {
                     meanspec: termspec.clone(),
                     mean_offset: threshold_offset.clone(),
                     initial_mean_log_lambdas: None,
+                    baseline_config: candidate.clone(),
                 },
                 frailty: frailty.clone(),
                 options: options.clone(),
             };
-        let build_binary_request = |prepared: PreparedSurvivalTimeStack| LatentBinaryFitRequest {
+        let build_binary_request = |candidate: &SurvivalBaselineConfig,
+                                    prepared: PreparedSurvivalTimeStack| LatentBinaryFitRequest {
             data: ds.values.view(),
             spec: gam::families::survival::latent::LatentBinaryTermSpec {
                 age_entry: age_entry.clone(),
@@ -1239,6 +1241,7 @@ pub(crate) fn run_survival(args: SurvivalArgs) -> Result<(), String> {
                 unloaded_mass_exit: prepared.unloaded_mass_exit.clone(),
                 meanspec: termspec.clone(),
                 mean_offset: threshold_offset.clone(),
+                baseline_config: candidate.clone(),
             },
             frailty: frailty.clone(),
             options: options.clone(),
@@ -1286,7 +1289,7 @@ pub(crate) fn run_survival(args: SurvivalArgs) -> Result<(), String> {
                     )?;
                     let (log_likelihood, stable_penalty_term, residuals) = match likelihood_mode {
                         SurvivalLikelihoodMode::Latent => match fit_model(
-                            FitRequest::LatentSurvival(build_survival_request(prepared)),
+                            FitRequest::LatentSurvival(build_survival_request(candidate, prepared)),
                         ) {
                             Ok(FitResult::LatentSurvival(result)) => (
                                 result.fit.log_likelihood,
@@ -1302,7 +1305,7 @@ pub(crate) fn run_survival(args: SurvivalArgs) -> Result<(), String> {
                             Err(e) => return Err(format!("latent survival fit failed: {e}")),
                         },
                         SurvivalLikelihoodMode::LatentBinary => match fit_model(
-                            FitRequest::LatentBinary(build_binary_request(prepared)),
+                            FitRequest::LatentBinary(build_binary_request(candidate, prepared)),
                         ) {
                             Ok(FitResult::LatentBinary(result)) => (
                                 result.fit.log_likelihood,
@@ -1368,7 +1371,10 @@ pub(crate) fn run_survival(args: SurvivalArgs) -> Result<(), String> {
         )?;
         let (fit, learned_latent_sd) = match likelihood_mode {
             SurvivalLikelihoodMode::Latent => {
-                match fit_model(FitRequest::LatentSurvival(build_survival_request(prepared))) {
+                match fit_model(FitRequest::LatentSurvival(build_survival_request(
+                    &baseline_cfg,
+                    prepared,
+                ))) {
                     Ok(FitResult::LatentSurvival(result)) => (result.fit, Some(result.latent_sd)),
                     Ok(_) => {
                         return Err(
@@ -1380,7 +1386,7 @@ pub(crate) fn run_survival(args: SurvivalArgs) -> Result<(), String> {
                 }
             }
             SurvivalLikelihoodMode::LatentBinary => {
-                match fit_model(FitRequest::LatentBinary(build_binary_request(prepared))) {
+                match fit_model(FitRequest::LatentBinary(build_binary_request(&baseline_cfg, prepared))) {
                     Ok(FitResult::LatentBinary(result)) => (result.fit, None),
                     Ok(_) => {
                         return Err(
