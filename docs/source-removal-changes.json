@@ -3576,5 +3576,13 @@
     ],
     "reason": "SPEC rule 9, #2899 row P15. Three copies parsed a formula's response column, and they disagreed. gamfit._tables.response_column_name and sklearn_response_column_name refused any response with a character other than [A-Za-z0-9_], while the pyffi response_column_name split at the first '~' and accepted any left-hand side not starting with 'Surv('. The CLI and gam-models resolve the response as parse_formula(formula).response. The single owner is now gam-terms formula_response_column: the grammar's trimmed response expression, or None when the formula does not parse or the response is a Surv(...)/SurvInterval(...) call. pyffi's response_column_name delegates to it and is exported as a pyfunction for Model.response_name. sklearn_fit_metadata calls it directly, so the sklearn copy and the Python copy are deleted.",
     "evidence": "At the base, git grep -w sklearn_response_column_name over the whole tree finds it only in crates/gam-pyffi/src/sklearn/sklearn_metadata.rs: its declaration, its two uses in sklearn_fit_metadata (both replaced here) and the module doc (rewritten here). No parent module re-imports it. The item is pub(crate), so the guard treats it as public. The pyffi fn response_column_name keeps its declaration in manifold_and_posterior_ffi.rs, so its identity count is unchanged. Compile is covered by the lead's shared tip check; nothing was built locally."
+  },
+  {
+    "base": "5cedfa38df58eaa03ea4307b91551e0dbf690d8b",
+    "items": [
+      "crates/gam-models/src/multinomial_posterior.rs:const:SUMMATION_ROUNDOFF_MULTIPLIER"
+    ],
+    "reason": "#2469. normalize_by_mass accepted a multinomial posterior rule whose computed mass missed one by the caller's absolute tolerance plus SUMMATION_ROUNDOFF_MULTIPLIER·ε·max(Σ|w|, 1), an undocumented 16 with an absolute floor. The mass is a compensated sum of the formed weights, so the envelope is now gam_linalg::roundoff::compensated_band over the roundings that form each weight and normalize each one-dimensional rule (product_rule_roundings), and the constant has no other user.",
+    "evidence": "At the base, git grep -n -w SUMMATION_ROUNDOFF_MULTIPLIER finds only its declaration and its single use in normalize_by_mass (crates/gam-models/src/multinomial_posterior.rs), which this change replaces. It is private, production-scoped and declared once. The item list applies source_removal_guard.py's ITEM regex and occurrence rule by hand. Compile is covered by the lead's shared tip check."
   }
 ]

@@ -31,9 +31,6 @@ use std::collections::BTreeMap;
 /// zero.
 const PSD_BACKWARD_ERROR_MULTIPLIER: f64 = 16.0;
 
-/// Floating-point summation envelope for the signed Smolyak combination.
-const SUMMATION_ROUNDOFF_MULTIPLIER: f64 = 16.0;
-
 /// Explicit accuracy and work controls for multinomial posterior integration.
 ///
 /// The production default is explicit through [`Default`] and is carried by
@@ -890,6 +887,7 @@ impl<'a> ThreeClassConditionalIntegrand<'a> {
             &mut raw_moments,
             mass,
             absolute_weight_sum,
+            product_rule_roundings(0, 1, rule.weights.len()),
             absolute_tolerance,
             &format!(
                 "conditioned three-class rule with {} nodes",
@@ -1056,10 +1054,17 @@ impl<'a> RowIntegrand<'a> {
         workspace.stream_axes(0, &axes, 1.0)?;
         let (mut raw_moments, mass, absolute_weight_sum) = workspace.accumulator.finish();
         let node_counts: Vec<usize> = orders.iter().map(|order| 2 * order - 1).collect();
+        let maximum_rule_nodes = node_counts.iter().copied().max().unwrap_or(0);
         normalize_by_mass(
             &mut raw_moments,
             mass,
             absolute_weight_sum,
+            // `stream_axes` starts from 1.0, so its first product is exact.
+            product_rule_roundings(
+                axes.len().saturating_sub(1),
+                axes.len(),
+                maximum_rule_nodes,
+            ),
             absolute_tolerance,
             &format!("tensor rule with node counts {node_counts:?}"),
         )?;
@@ -1152,12 +1157,32 @@ fn tensor_node_count(orders: &[usize]) -> Result<usize, EstimationError> {
     Ok(count)
 }
 
+/// Roundings between a product rule's formed weights and an exact unit mass,
+/// as the `formation_roundings` of [`gam_linalg::roundoff::compensated_band`].
+///
+/// Each weight is formed by `products` rounded multiplications. Each of the
+/// `dimensions` one-dimensional rules was normalized by a naive sum of at most
+/// `maximum_rule_nodes` weights and one division, which leaves its mass within
+/// `γ_{n−1} + u ≈ n·u` of one, so a tensor of them has mass within
+/// `dimensions·n·u` of one. A signed Smolyak combination scales that defect by
+/// `Σ|coefficient|`, which is at most `Σ|w|` because every tensor's weights are
+/// positive, so each rounding counts once per unit of `Σ|w|`.
+fn product_rule_roundings(products: usize, dimensions: usize, maximum_rule_nodes: usize) -> usize {
+    products + dimensions * maximum_rule_nodes
+}
+
 /// Divide accumulated moments by the rule's own total weight, after checking
 /// that the rule integrates the constant function to one.
+///
+/// The mass is a compensated sum of the formed weights, so outside
+/// `absolute_tolerance` its distance from one is only rounding:
+/// `compensated_band(formation_roundings, Σ|w|)`, with the count from
+/// [`product_rule_roundings`].
 fn normalize_by_mass(
     raw_moments: &mut [f64],
     mass: f64,
     absolute_weight_sum: f64,
+    formation_roundings: usize,
     absolute_tolerance: f64,
     context: &str,
 ) -> Result<(), EstimationError> {
@@ -1168,7 +1193,7 @@ fn normalize_by_mass(
     }
     let mass_error = (mass - 1.0).abs();
     let summation_envelope =
-        SUMMATION_ROUNDOFF_MULTIPLIER * f64::EPSILON * absolute_weight_sum.max(1.0);
+        gam_linalg::roundoff::compensated_band(formation_roundings, absolute_weight_sum);
     if mass_error > absolute_tolerance + summation_envelope {
         return Err(EstimationError::InvalidInput(format!(
             "multinomial posterior {context} failed constant-function exactness: total weight {mass:.17e}, error {mass_error:.6e}, allowed {:.6e}",
@@ -1564,10 +1589,19 @@ fn evaluate_smolyak_level(
     }
 
     let (mut raw_moments, mass, absolute_weight_sum) = workspace.accumulator.finish();
+    // A composition's indices are at most `level + 1`, so it reads `rules[..=level]`.
+    let maximum_rule_nodes = rules
+        .iter()
+        .take(level + 1)
+        .map(|rule| rule.nodes.len())
+        .max()
+        .unwrap_or(0);
     normalize_by_mass(
         &mut raw_moments,
         mass,
         absolute_weight_sum,
+        // Each weight is the combination coefficient times one weight per direction.
+        product_rule_roundings(rank, rank, maximum_rule_nodes),
         absolute_tolerance,
         &format!("Smolyak level {level}"),
     )?;
