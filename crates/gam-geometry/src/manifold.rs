@@ -667,6 +667,12 @@ pub(crate) fn qr_thin(a: &Array2<f64>) -> (Array2<f64>, Array2<f64>) {
     let mut r = Array2::<f64>::zeros((k, k));
     for j in 0..k {
         let mut v = a.column(j).to_owned();
+        // `j` projections (an `n`-term inner product and `n` subtractions each)
+        // and the residual's `n`-term norm round at most by this growth factor
+        // times the column's own norm; a residual inside it is the column lying
+        // in the span of the accepted columns.
+        let rounding = gam_linalg::roundoff::accumulation_growth(n * (2 * j + 1));
+        let column_band = rounding * norm(v.view());
         for i in 0..j {
             let qi = q.column(i);
             let rij = dot(qi, v.view());
@@ -676,7 +682,7 @@ pub(crate) fn qr_thin(a: &Array2<f64>) -> (Array2<f64>, Array2<f64>) {
             }
         }
         let nrm = norm(v.view());
-        if nrm > GEOMETRY_EPS {
+        if nrm > column_band {
             r[[j, j]] = nrm;
             for row in 0..n {
                 q[[row, j]] = v[row] / nrm;
@@ -701,7 +707,9 @@ pub(crate) fn qr_thin(a: &Array2<f64>) -> (Array2<f64>, Array2<f64>) {
                     }
                 }
                 let fnrm = norm(f.view());
-                if fnrm > GEOMETRY_EPS {
+                // The same `j` projections of a unit axis: the growth factor
+                // alone is the band.
+                if fnrm > rounding {
                     for row in 0..n {
                         q[[row, j]] = f[row] / fnrm;
                     }
