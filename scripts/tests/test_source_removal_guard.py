@@ -1,5 +1,6 @@
 import importlib.util
 from pathlib import Path
+import re
 import subprocess
 import tempfile
 import unittest
@@ -143,6 +144,25 @@ class SourceRemovalGuard(unittest.TestCase):
             before, after, words = guard.changed_inventory(root, base, head)
             self.assertEqual(words["orphan"], 1, "the declaration itself is the only occurrence")
             self.assertEqual(guard.removals(before, after, words), [])
+
+    def test_inline_format_captures_are_uses_but_escaped_braces_are_text_2818(self):
+        source = ('pub const REFERENCE_ENV_MISSING: &str = "REFERENCE_ENV_MISSING";\n'
+                  'fn report(tool: &str) -> String {\n'
+                  '    format!("{REFERENCE_ENV_MISSING}:{tool}: not installed, see {{literal}}")\n'
+                  '}\n'
+                  'fn padded(width: usize) -> String {\n'
+                  '    format!(r#"{:>width$} {{literal}}"#, 1)\n'
+                  '}\n')
+        clean = guard.strip_comments_and_literals(source)
+        self.assertEqual(clean.count("\n"), source.count("\n"), "line numbers must survive stripping")
+        lines = clean.splitlines()
+        self.assertEqual(re.findall(r"\w+", lines[0]).count("REFERENCE_ENV_MISSING"), 1,
+                         "a plain string holding the name is text, not a use")
+        self.assertIn("REFERENCE_ENV_MISSING", re.findall(r"\w+", lines[2]), "a `{name}` capture is a use")
+        self.assertIn("tool", re.findall(r"\w+", lines[2]))
+        self.assertIn("width", re.findall(r"\w+", lines[5]), "a `name$` width inside a spec is a use")
+        self.assertNotIn("literal", clean, "an escaped `{{...}}` is text, not a capture")
+        self.assertNotIn("installed", clean, "the rest of the literal stays blank")
 
 
 if __name__ == "__main__":

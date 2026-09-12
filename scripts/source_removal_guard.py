@@ -61,6 +61,25 @@ CHARACTER = re.compile(r"'(?:\\(?:u\{[0-9a-fA-F]+\}|x[0-9a-fA-F]{2}|.)|[^'\\\n])
 # `*_tests`, so an out-of-line module file with that stem is test scope as a whole
 # even though it carries no attribute of its own.
 TEST_MODULE_STEM = re.compile(r"tests|test_support|tests_\w+|\w+_tests")
+# Rust 2021 resolves a string literal's inline format captures as uses: `{name}`, `{name:…}`,
+# and a `name$` width or precision inside the spec. `{{` is an escaped brace, not a capture.
+FORMAT_CAPTURE = re.compile(r"\{\{|\{([A-Za-z_][A-Za-z_0-9]*)?(:[^{}]*)?\}")
+SPEC_ARGUMENT = re.compile(r"([A-Za-z_][A-Za-z_0-9]*)\$")
+
+
+def keep_format_captures(literal):
+    """Blank a string literal except the identifiers its inline format captures name."""
+    out = list(re.sub(r"[^\n]", " ", literal))
+    for capture in FORMAT_CAPTURE.finditer(literal):
+        if capture.group() == "{{":
+            continue
+        spans = [capture.span(1)] if capture.group(1) else []
+        if capture.group(2):
+            spans += [(capture.start(2) + name.start(1), capture.start(2) + name.end(1))
+                      for name in SPEC_ARGUMENT.finditer(capture.group(2))]
+        for begin, end in spans:
+            out[begin:end] = literal[begin:end]
+    return "".join(out)
 
 
 def strip_comments_and_literals(source):
@@ -68,6 +87,8 @@ def strip_comments_and_literals(source):
 
     Treating every `'` as a quote blanked everything from `&'static str` to the
     next apostrophe in the file, so declarations after a lifetime went uninventoried.
+    A string literal keeps its inline format captures as code: blanking
+    `"{REFERENCE_ENV_MISSING}:{tool}"` made a constant used only there look unreferenced.
     """
     out, position = [], 0
     while True:
@@ -105,7 +126,8 @@ def strip_comments_and_literals(source):
                 position = start.end()
                 continue
             end = character.end()
-        out.append(re.sub(r"[^\n]", " ", source[start.start():end]))
+        text = source[start.start():end]
+        out.append(keep_format_captures(text) if token.endswith('"') else re.sub(r"[^\n]", " ", text))
         position = end
 
 
