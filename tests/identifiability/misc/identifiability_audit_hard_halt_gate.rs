@@ -223,20 +223,31 @@ fn cross_block_alias_with_distinct_priorities_is_not_fatal() {
     let x: ndarray::Array1<f64> =
         ndarray::Array1::from_iter((0..n).map(|i| -1.0 + 2.0 * i as f64 / (n as f64 - 1.0)));
 
-    // time_surface: 12 columns — Legendre-like polynomial basis up to degree 11.
+    // time_surface: 12 columns — Chebyshev T_0..T_11 of the row's own time
+    // covariate, which is a different covariate from the marginal feature `x`.
+    // A monomial basis in `x` itself to degree 11 numerically spans the
+    // low-frequency marginal sines (and `z·sin`), so the joint design had
+    // σ_min/σ_max ≈ 2e-17, below the audit's pivot bar
+    // `100·ε·max(m, n)·|R₁₁|`: the z-scaled "full rank" premise below was
+    // unattainable by any sound numerical rank test, and the audit correctly
+    // reported rank 22 of 33.
+    let time_covariate: ndarray::Array1<f64> =
+        ndarray::Array1::from_iter((0..n).map(|i| -1.0 + 2.0 * ((i * 83) % 199) as f64 / 198.0));
     let mut time = ndarray::Array2::<f64>::zeros((n, 12));
     for i in 0..n {
+        let t = time_covariate[i];
         time[[i, 0]] = 1.0;
-        for deg in 1usize..12 {
-            time[[i, deg]] = x[i].powi(deg as i32);
+        time[[i, 1]] = t;
+        for deg in 2usize..12 {
+            time[[i, deg]] = 2.0 * t * time[[i, deg - 1]] - time[[i, deg - 2]];
         }
     }
 
-    // marginal_surface: 11 columns — Duchon-PC-like smooth basis.
+    // marginal_surface: 11 columns — a whole-period Fourier smooth basis in `x`.
     let mut marginal = ndarray::Array2::<f64>::zeros((n, 11));
     for i in 0..n {
         for k in 0..11 {
-            marginal[[i, k]] = ((k as f64 + 1.0) * x[i]).sin();
+            marginal[[i, k]] = ((k as f64 + 1.0) * std::f64::consts::PI * x[i]).sin();
         }
     }
 
@@ -247,7 +258,7 @@ fn cross_block_alias_with_distinct_priorities_is_not_fatal() {
     let mut slope = ndarray::Array2::<f64>::zeros((n, 10));
     for i in 0..n {
         for k in 0..10 {
-            slope[[i, k]] = ((k as f64 + 1.0) * x[i]).sin();
+            slope[[i, k]] = ((k as f64 + 1.0) * std::f64::consts::PI * x[i]).sin();
         }
     }
 
