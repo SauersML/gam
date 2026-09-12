@@ -95,11 +95,13 @@ fn bound_decoder(m: usize, p: usize) -> Array2<f64> {
     b
 }
 
-/// Build a real 2-atom torus SAE term. Atom 0 (the parent) is a genuine `d = 2`
+/// Build a real 3-atom torus SAE term. Atom 0 (the parent) is a genuine `d = 2`
 /// torus PRODUCT atom carrying `parent_decoder`; atom 1 (the child) is a second
 /// torus atom whose routing support nests strictly inside atom 0's, so the
 /// harvest's absorption-asymmetry audit flags atom 0 for fission — and the
-/// within-atom carve then runs on atom 0's own fitted decoder/covariance.
+/// within-atom carve then runs on atom 0's own fitted decoder/covariance. Atom 2
+/// (the background) owns the rows neither of the others routes; see the routing
+/// comment for why the audit needs it.
 fn nested_torus_term(parent_decoder: Array2<f64>) -> (SaeManifoldTerm, SaeManifoldRho, usize) {
     let coords = torus_coords();
     let evaluator = Arc::new(TorusHarmonicEvaluator::new(2, N_HARMONICS).unwrap());
@@ -134,20 +136,40 @@ fn nested_torus_term(parent_decoder: Array2<f64>) -> (SaeManifoldTerm, SaeManifo
         .with_basis_evaluator(evaluator.clone() as Arc<dyn SaeBasisEvaluator>)
     };
 
+    // Background decoder: a third column footprint, so the background atom is a
+    // valid atom that reconstructs something of its own.
+    let mut background_decoder = Array2::<f64>::zeros((m * m, p));
+    for d in 0..p {
+        background_decoder[[2, d]] = 0.25 - 0.1 * d as f64;
+        background_decoder[[2 * m, d]] = 0.35 + 0.05 * d as f64;
+    }
+
     let atoms = vec![
         make_atom("torus_parent", parent_decoder),
         make_atom("torus_child", child_decoder),
+        make_atom("torus_background", background_decoder),
     ];
 
     // Routing: parent active on rows ≡ 0 mod 2 PLUS rows ≡ 1 mod 4; child active
     // only on rows ≡ 0 mod 4 — strictly nested in the parent's support, so
     // P(parent|child) = 1, P(child|parent) < 1 ⇒ absorption asymmetry on atom 0.
-    let mut logits = Array2::<f64>::zeros((N, 2));
+    //
+    // The harvest proposes the fission audit only when the pair co-fires above the
+    // fixed-margin curveball null (#976), which keeps every row's and every atom's
+    // activation count. With two atoms that null cannot move the pair's joint count
+    // (it is the number of rows where both fire), so its spread is zero, the
+    // exceedance is 0 and the audit never runs; and a softmax row with both logits
+    // off routes half its mass to each atom, which made the parent fire on every
+    // row. The background atom owns rows ≡ 3 mod 4, so the parent's support is a
+    // proper subset and the null has room to place the child's co-firing elsewhere.
+    let mut logits = Array2::<f64>::zeros((N, 3));
     for row in 0..N {
         let parent = row % 2 == 0 || row % 4 == 1;
         let child = row % 4 == 0;
+        let background = row % 4 == 3;
         logits[[row, 0]] = if parent { ON } else { OFF };
         logits[[row, 1]] = if child { ON } else { OFF };
+        logits[[row, 2]] = if background { ON } else { OFF };
     }
 
     let manifold = LatentManifold::Product(vec![
@@ -156,14 +178,14 @@ fn nested_torus_term(parent_decoder: Array2<f64>) -> (SaeManifoldTerm, SaeManifo
     ]);
     let assignment = SaeAssignment::from_blocks_with_mode_and_manifolds(
         logits,
-        vec![coords.clone(), coords.clone()],
-        vec![manifold.clone(), manifold],
+        vec![coords.clone(), coords.clone(), coords.clone()],
+        vec![manifold.clone(), manifold.clone(), manifold],
         AssignmentMode::softmax(1.0),
     )
     .unwrap();
 
     let term = SaeManifoldTerm::new(atoms, assignment).unwrap();
-    let rho = SaeManifoldRho::new(0.0, 0.0, vec![Array1::<f64>::zeros(2); 2]);
+    let rho = SaeManifoldRho::new(0.0, 0.0, vec![Array1::<f64>::zeros(2); 3]);
     (term, rho, m)
 }
 
