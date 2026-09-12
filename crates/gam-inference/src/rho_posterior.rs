@@ -181,7 +181,7 @@ fn whitening_factor_from_outer_hessian(outer_hessian: &Array2<f64>) -> Result<Ar
             l_inv[[i, j]] = r_inv[[j, i]];
         }
     }
-    Some(l_inv)
+    Ok(l_inv)
 }
 
 /// Gauss-Hermite rules for the STANDARD NORMAL weight (probabilists'
