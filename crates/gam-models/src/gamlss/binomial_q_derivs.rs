@@ -425,9 +425,10 @@ pub(super) fn cloglog_stable_h(z: f64) -> f64 {
     // is stable across the full range because:
     //   - For z near 0: expm1(z) is accurate, so z/expm1(z) is fine.
     //   - For large z: r = e^{-z} -> 0, making h -> 0 as well.
-    if z.abs() < 1e-12 {
-        // Taylor: h = 1 - z/2 + z^2/12 - z^4/720 + ...
-        return 1.0 - z * 0.5 + z * z / 12.0;
+    // The quotient is `0/0` only at `z = 0` itself; every nonzero `z` gets an
+    // accurate `expm1`, so the limit is taken exactly there and nowhere else.
+    if z == 0.0 {
+        return 1.0;
     }
     let expm1_z = z.exp_m1();
     if expm1_z.is_infinite() {
@@ -629,6 +630,23 @@ fn binomial_neglog_q_fourth_derivative_closed_form_dispatch(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `h(z) = z/expm1(z)` is `0/0` only at `z = 0`: the limit is exact there, and
+    /// any nonzero argument, however small, is the quotient itself, which
+    /// `expm1`'s accuracy keeps on the series `1 − z/2 + z²/12`.
+    #[test]
+    fn cloglog_stable_h_takes_its_limit_only_at_zero() {
+        assert_eq!(cloglog_stable_h(0.0), 1.0);
+        assert_eq!(cloglog_stable_h(-0.0), 1.0);
+        // `expm1`'s one-ulp accuracy counts as two roundings, the division as one,
+        // and the series' subtraction and addition as two more.
+        let band = gam_linalg::roundoff::accumulation_growth(5);
+        for z in [1.0e-300, -1.0e-300, 1.0e-13, -1.0e-13, 1.0e-9, -1.0e-9] {
+            let h = cloglog_stable_h(z);
+            let series = 1.0 - 0.5 * z + z * z / 12.0;
+            assert!((h - series).abs() <= band, "z={z:e}: h={h:e}, series={series:e}");
+        }
+    }
 
     #[test]
     fn probit_closed_form_preserves_separated_and_compatible_tail_limits() {

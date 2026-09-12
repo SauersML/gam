@@ -553,7 +553,10 @@ pub fn sampleobservations<R: rand::Rng + ?Sized>(
                 }
             }
             let mut y = Array1::<f64>::zeros(spec.mean.len());
-            if (*p - 1.0).abs() <= 1.0e-12 {
+            // The compound-Poisson sampler below divides by `p − 1` and takes
+            // `ln(2 − p)`, so its two limits are separate distributions exactly at
+            // `p = 1` and `p = 2`; every other admissible `p` is sampled as written.
+            if *p == 1.0 {
                 for i in 0..y.len() {
                     let phi_i = phi[i];
                     let mu = spec.mean[i];
@@ -580,7 +583,7 @@ pub fn sampleobservations<R: rand::Rng + ?Sized>(
                 }
                 return Ok(y);
             }
-            if (*p - 2.0).abs() <= 1.0e-12 {
+            if *p == 2.0 {
                 for i in 0..y.len() {
                     let phi_i = phi[i];
                     let mu = spec.mean[i];
