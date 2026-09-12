@@ -1857,5 +1857,25 @@
     ],
     "reason": "User directive 2026-09-11: delete code only tests use and code nothing uses. BlockwiseFitOptions::independent_prior_factor_labels had no producer left once realize_coefficient_groups_for_custom_family was deleted in 48f48f910: the default and every test literal set it empty, so the prior-factor mask route (compute_block_penalty_logdet_derivs_with_prior_factors and its per-factor geometry groups) only ever ran with all-false masks.",
     "evidence": "Re-confirmed at the tip with git grep -nw over crates src tests examples bench benches: independent_prior_factor_labels was assigned only Vec::new() (the options default and four gam-custom-family test literals) and read only by the assembly.rs mask branch; compute_block_penalty_logdet_derivs_with_prior_factors was called only with that mask and with None. With all-false masks every block had one coalesced group over all its penalties in order, which compute_block_penalty_logdet_derivs now evaluates directly, so the logdet value and derivatives are unchanged. Gates pass base..head; MSI verification at the pushed sha follows."
+  },
+  {
+    "base": "a9378698342bdc33d190e311d6199ec240a21845",
+    "items": [
+      "crates/gam-sae/src/null_battery.rs:fn:architecture_matched_random_weight_null",
+      "crates/gam-sae/src/null_battery.rs:fn:first_two_energy_fraction",
+      "crates/gam-sae/src/null_battery.rs:fn:first_two_ordered_circle_stat",
+      "crates/gam-sae/src/null_battery.rs:fn:kind_seed",
+      "crates/gam-sae/src/null_battery.rs:fn:matched_spectrum_gaussian_null",
+      "crates/gam-sae/src/null_battery.rs:fn:random_rotation_null",
+      "crates/gam-sae/src/null_battery.rs:fn:run_null_battery",
+      "crates/gam-sae/src/null_battery.rs:fn:scaled_square_ratio",
+      "crates/gam-sae/src/null_battery.rs:fn:stable_column_sd",
+      "crates/gam-sae/src/null_battery.rs:fn:standing",
+      "crates/gam-sae/src/null_battery.rs:fn:token_shuffle_null",
+      "crates/gam-sae/src/null_battery.rs:fn:top_two_energy_fraction",
+      "crates/gam-sae/src/null_battery.rs:struct:NullBatteryConfig"
+    ],
+    "reason": "user directive: delete all useless slop (only used by tests / unused)",
+    "evidence": "At a93786983, git grep -nw over crates, src, tests, examples, bench and benches found no caller of NullBatteryConfig, standing, run_null_battery, first_two_ordered_circle_stat, first_two_energy_fraction or top_two_energy_fraction: each is named only by its own definition, error strings or doc prose. The rest were reachable only through them: random_rotation_null, token_shuffle_null, matched_spectrum_gaussian_null and architecture_matched_random_weight_null (called only by run_null_battery; no pyffi, example or test caller), kind_seed (only run_null_battery), scaled_square_ratio (only first_two_energy_fraction) and stable_column_sd (only matched_spectrum_gaussian_null and architecture_matched_random_weight_null). NullKind and its variants, NullBatteryReport (sparse_audit), NullSummary, summarize_null_distribution, per_dimension_shuffle_null, covariance_exact_hadamard_null, covariance_matched_gaussian_null (pyffi) and random_orthogonal (inject_circle_spike, inject_torus_spike) stay. No test called any item. MSI verification (ban scanner, workspace --all-targets check, cargo doc -p gam-sae, guard and census) runs on the landed sha."
   }
 ]
