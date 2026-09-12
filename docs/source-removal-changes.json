@@ -2073,5 +2073,24 @@
     ],
     "reason": "user directive: delete all useless slop (only used by tests / unused)",
     "evidence": "At 6dd504979, git grep -nw over crates, src, tests, examples, bench and benches found no caller of EncodeAtlas::certified_encode_with_index, amortized_encode_with_index, amortized_encode_with_index_fast, amortized_reconstruct_with_index_fast, certified_encode_batch, encode_atom_with_fallback_telemetry or build_data_driven, of the FallbackTelemetry accessors, or of encode_reconstruction_error: each was named only by its definition, error strings or doc prose. The rest were reachable only through them: amortized_reconstruct_batch_fast (called only by amortized_reconstruct_with_index_fast), amortized_encode_batch_fast (only by amortized_reconstruct_batch_fast), amortized_predict_row and CANDIDATE_ROUTING_MIN_ALIGNMENT (only the index-routed paths), FallbackTelemetry with total and accumulate (only encode_atom_with_fallback_telemetry), data_driven_chart_centers and coord_dist_sq (only build_data_driven; manifold/intrinsic_seed.rs named the former only in a doc comment, now reworded), and the local CHUNK consts and ChartPredictor struct inside the removed bodies. The index-routed encode paths were the only consumers of the candidate_index module, so the whole module (SaeCandidateIndex, IndexConfig, Proposal, ExactRoute, AtomFrameSketch, auto_candidate_budget, brute_force_best_atom and their private helpers; it had no tests) goes with its mod declaration. Kept because they have live callers: amortized_encode_batch and ENCODE_BATCH_PARALLEL_ROW_MIN, amplitude_scaled_center_dist (nearest_chart, select_nearest_charts_topk), build_atom_atlas_from_centers, latent_axis_period. A zero-use sweep of private and pub(crate) items over tip..probe (positive control: over b30862c09..aa4199edb it flags vec_norm) found no newly dead item, and the test census shows no test loss. MSI verification (ban scanner, workspace --all-targets check, cargo doc -p gam-sae, guard and census) runs on the landed sha."
+  },
+  {
+    "base": "728caa9b19faae0c3c8522b08c62f67b4e5b03b2",
+    "items": [
+      "crates/gam-sae/src/amortized_encoder.rs:fn:error_stats",
+      "crates/gam-sae/src/gpu_kernels/resident_arrow.rs:const:ARROW_REDUCTION_LEAF_ROWS",
+      "crates/gam-sae/src/gpu_kernels/resident_arrow.rs:const:RESIDENT_ARROW_KERNEL_SOURCE",
+      "crates/gam-sae/src/gpu_kernels/resident_arrow.rs:enum:ArrowCurvature",
+      "crates/gam-sae/src/gpu_kernels/resident_arrow.rs:fn:deterministic",
+      "crates/gam-sae/src/gpu_kernels/resident_arrow.rs:fn:fmt",
+      "crates/gam-sae/src/gpu_kernels/resident_arrow.rs:fn:path",
+      "crates/gam-sae/src/gpu_kernels/resident_arrow.rs:fn:residual_scale",
+      "crates/gam-sae/src/gpu_kernels/resident_arrow.rs:struct:ArrowScore",
+      "crates/gam-sae/src/gpu_kernels/resident_arrow.rs:struct:ResidentRowJetHandle",
+      "crates/gam-sae/src/inference/steering.rs:fn:canonical_chart_coordinates",
+      "crates/gam-sae/src/inference/steering.rs:fn:canonical_chart_raw_coordinates"
+    ],
+    "reason": "user directive: delete all useless slop (only used by tests / unused)",
+    "evidence": "At 728caa9b1, git grep -nw over crates, src, tests, examples, bench and benches found no caller of error_stats in amortized_encoder.rs (the all-None wrapper over error_stats_wrapped, which stays and now carries the doc), of canonical_chart_coordinates or canonical_chart_raw_coordinates in inference/steering.rs (CanonicalChart::read, invert and advance stay because canonical_chart_steps uses them), or of any item of gpu_kernels/resident_arrow.rs: ResidentRowJetHandle had no constructor anywhere, and ArrowCurvature, ArrowScore, ARROW_REDUCTION_LEAF_ROWS and RESIDENT_ARROW_KERNEL_SOURCE were named only inside that file, whose only other reference was its mod declaration in gpu_kernels/mod.rs, now removed; the listed fmt, deterministic, path and residual_scale are that file's own impl methods. The module had no tests and no test called any item. A zero-use sweep of private items over tip..probe found nothing newly dead, and the test census shows no test loss. MSI verification (ban scanner, workspace --all-targets check, cargo doc -p gam-sae, guard and census) runs on the landed sha."
   }
 ]

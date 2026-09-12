@@ -1987,51 +1987,6 @@ impl CanonicalChart<'_> {
     }
 }
 
-/// Read one `d = 1` atom's chart in its CANONICAL (arc-length) coordinate at the
-/// supplied raw coordinates (gh#2081's `coords_u_arc`, rescaled onto the chart's
-/// own span so it is directly comparable with a raw coordinate).
-///
-/// This is the coordinate a steering dose, an angle, or an adjacency claim must
-/// be expressed in: the raw fitted parameter is a point of the reparameterization
-/// gauge orbit and carries no unit. Errors when the atom has no `d = 1` canonical
-/// chart (wrong latent dimension, no installed evaluator, an active curvature
-/// homotopy) or when the chart is degenerate.
-pub fn canonical_chart_coordinates(
-    model: &SaeManifoldTerm,
-    atom_k: usize,
-    raw: &[f64],
-) -> Result<CanonicalChartCoordinates, String> {
-    canonical_chart(model, atom_k)?.read(raw)
-}
-
-/// Invert [`canonical_chart_coordinates`]: the raw fitted-chart coordinates whose
-/// canonical (arc-length) coordinates are `canonical`.
-///
-/// This is what turns an honest request — "put this row a quarter of the way
-/// around its feature" — into the `t_to` that [`steer_delta`] /
-/// [`steer_to_target_nats`] take. Values outside `[0, span)` are moved into the
-/// chart's own topology first (a circle wraps, a bounded patch clamps).
-pub fn canonical_chart_raw_coordinates(
-    model: &SaeManifoldTerm,
-    atom_k: usize,
-    canonical: &[f64],
-) -> Result<Vec<f64>, String> {
-    let chart = canonical_chart(model, atom_k)?;
-    let targets: Vec<f64> = canonical
-        .iter()
-        .map(|&c| {
-            if !c.is_finite() {
-                return Err(format!(
-                    "canonical chart: atom {atom_k} was asked for a non-finite canonical \
-                     coordinate {c}"
-                ));
-            }
-            Ok(chart.advance(0.0, c))
-        })
-        .collect::<Result<_, _>>()?;
-    chart.invert(&targets)
-}
-
 /// The fitted-chart step that moves each of `rows` of atom `atom_k` by
 /// `canonical_delta` in the atom's CANONICAL (unit-speed / arc-length) chart.
 /// This is the step [`SaeManifoldTerm::steer_rows`] and
