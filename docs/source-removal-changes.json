@@ -1886,5 +1886,13 @@
     ],
     "reason": "User directive 2026-09-11: delete code only tests use and code nothing uses. gam-spec LikelihoodSpec::tweedie_log and LikelihoodSpec::beta_logit had no caller; the regression tests that name tweedie_log and beta_logit bind local variables built with LikelihoodSpec::new.",
     "evidence": "Re-confirmed at the tip with git grep -nw over crates src tests examples bench benches plus a qualified-path search (LikelihoodSpec::, Self::, method-call form), which found no use. The other hits are local variable names in tests/regressions and one doc example list, which now names gamma_log. Gates pass base..head; MSI verification at the pushed sha follows."
+  },
+  {
+    "base": "5110f6487f701380da3b96714b25acb661eaa4ae",
+    "items": [
+      "crates/gam-sae/src/candidate_index.rs:fn:vec_norm"
+    ],
+    "reason": "User directive 2026-09-11: delete code nothing uses. aa4199edb deleted the random-projection sketch from candidate_index.rs, and with it every caller of the private helper vec_norm, so the gam-sae lib failed to compile under warnings = deny.",
+    "evidence": "MSI job 429846 (cargo check --workspace --exclude gam-pyffi --all-targets --keep-going over aa4199edb; log /scratch.global/sauer354/sw-status/prepush.429846.log): crates/gam-sae/src/candidate_index.rs:555:4: error: function `vec_norm` is never used, then could not compile `gam-sae` (lib) and (lib test). At 5110f6487f701380da3b96714b25acb661eaa4ae, git grep -nP over crates/gam-sae for the word vec_norm finds only that declaration. The other workspace occurrence is an unrelated private fn vec_norm in crates/gam-models/src/inference/full_conformal.rs, which stays."
   }
 ]

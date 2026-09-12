@@ -551,11 +551,6 @@ fn gaussian_projection(rows: usize, cols: usize, seed: u64) -> Array2<f64> {
     m
 }
 
-#[inline]
-fn vec_norm(v: ArrayView1<f64>) -> f64 {
-    v.iter().map(|&x| x * x).sum::<f64>().sqrt()
-}
-
 /// Pack the sign bits of `bank · s` into a `u64` signature. `bank` is
 /// `(bits, sketch_dim)`; `bits ≤ 64` (enforced by config-derived bit widths).
 /// Canonicalize a sign signature under global sign flip.
