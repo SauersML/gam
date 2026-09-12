@@ -4938,6 +4938,14 @@ impl DesignMatrix {
     pub fn try_to_dense_by_chunks(&self, context: &str) -> Result<Array2<f64>, String> {
         let n = self.nrows();
         let p = self.ncols();
+        // Owned-return variant: the escaping buffer cannot carry an RAII charge,
+        // so account at least the construction window on the joint ledger. A
+        // design the process cannot hold is refused here, before allocation,
+        // instead of exhausting memory (SPEC rule 10). Callers that can hold the
+        // charge for the buffer's lifetime use `try_to_dense_governed`.
+        let construction_charge = MemoryGovernor::global()
+            .try_reserve_dense_f64(n, p, context)
+            .map_err(|err| format!("refusing to densify {n}x{p} design: {err}"))?;
         let chunk_rows = dense_materialization_chunk_rows(n, p);
         let mut out = Array2::<f64>::zeros((n, p));
         for start in (0..n).step_by(chunk_rows) {
@@ -4946,6 +4954,8 @@ impl DesignMatrix {
             self.row_chunk_into(start..end, slice)
                 .map_err(|err| format!("{context}: failed to materialize row chunk: {err}"))?;
         }
+        // The charge covers exactly the construction window (see above).
+        drop(construction_charge);
         Ok(out)
     }
 
