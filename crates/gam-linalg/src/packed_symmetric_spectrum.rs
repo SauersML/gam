@@ -90,6 +90,7 @@ const PARALLEL_MIN_ROWS: usize = 256;
 ///
 /// * a length mismatch between `n`, `packed` and `probe`;
 /// * a non-finite entry in `packed` or `probe`;
+/// * an eigenvalue or projected probe component outside the finite `f64` range;
 /// * QL non-convergence within `QL_MAX_SWEEPS_PER_EIGENVALUE` per eigenvalue.
 pub fn packed_symmetric_spectrum_with_probe(
     n: usize,
@@ -125,12 +126,32 @@ pub fn packed_symmetric_spectrum_with_probe(
         ));
     }
 
+    // Positive rescaling preserves the eigenvectors and their ordering. Work
+    // at unit entry scale so QL's sums of adjacent diagonal magnitudes cannot
+    // overflow and its shifts/rotations do not underflow on a tiny matrix.
+    // In particular, diag=(1e308,1e308), offdiag=5e307 must not deflate merely
+    // because the two diagonal magnitudes sum to infinity.
+    let matrix_scale = packed.iter().fold(0.0_f64, |scale, value| scale.max(value.abs()));
+    if matrix_scale == 0.0 {
+        // The identity eigenbasis is a valid choice for the zero matrix.
+        return Ok(vec![0.0; n]);
+    }
+    for value in packed.iter_mut() {
+        *value /= matrix_scale;
+    }
+    // A Householder update can overflow its intermediate dot product even
+    // when every final coordinate of Qᵀw is finite. Normalize the probe
+    // independently and restore its units after the same orthogonal maps.
+    let probe_scale = probe.iter().fold(0.0_f64, |scale, value| scale.max(value.abs()));
+    if probe_scale > 0.0 {
+        for value in probe.iter_mut() {
+            *value /= probe_scale;
+        }
+    }
+
     let (mut diagonal, mut offdiagonal) = tridiagonalize_packed_with_probe(n, packed, probe);
-    // The reduction is scale-invariant by construction and cannot manufacture a
-    // non-finite entry from finite input; this says so out loud rather than
-    // letting a NaN reach the QL sweep, where `NaN <= floor` is false forever
-    // and the failure is reported as a non-convergence at an index that means
-    // nothing. Costs `O(n)` against the `O(n³)` above.
+    // Refuse a broken reduction before a NaN reaches the QL sweep, where
+    // `NaN <= floor` is false forever. Costs O(n) against O(n³) above.
     let broken = diagonal
         .iter()
         .chain(offdiagonal.iter())
@@ -144,6 +165,17 @@ pub fn packed_symmetric_spectrum_with_probe(
     }
     implicit_ql_with_probe(&mut diagonal, &mut offdiagonal, probe)?;
     sort_spectrum_ascending(&mut diagonal, probe);
+    for value in diagonal.iter_mut() {
+        *value *= matrix_scale;
+    }
+    if probe_scale > 0.0 {
+        for value in probe.iter_mut() {
+            *value *= probe_scale;
+        }
+    }
+    if diagonal.iter().chain(probe.iter()).any(|value| !value.is_finite()) {
+        return Err("packed symmetric spectrum: an eigenvalue or projected probe component is not representable as a finite f64".to_string());
+    }
     Ok(diagonal)
 }
 
@@ -513,6 +545,56 @@ fn dot(a: &[f64], b: &[f64]) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn two_by_two_spectrum_and_probe_are_invariant_to_extreme_matrix_scale() {
+        for scale in [1.0, 1.0e308, 1.0e-308, f64::from_bits(2)] {
+            let mut packed = vec![scale, 0.5 * scale, scale];
+            let mut probe = vec![3.0, 1.0];
+            let eigenvalues = packed_symmetric_spectrum_with_probe(2, &mut packed, &mut probe)
+                .unwrap();
+            for (actual, expected) in eigenvalues.iter().zip([0.5, 1.5]) {
+                assert!((actual / scale - expected).abs() < 4.0 * f64::EPSILON);
+            }
+            // The eigenvectors are (1,-1)/√2 and (1,1)/√2, up to sign.
+            assert!((probe[0] * probe[0] - 2.0).abs() < 2.0e-14);
+            assert!((probe[1] * probe[1] - 8.0).abs() < 2.0e-14);
+        }
+    }
+
+    #[test]
+    fn householder_spectrum_preserves_probe_mass_at_extreme_scales() {
+        for scale in [1.0, 3.0e307, 1.0e-308] {
+            // A/scale = I + 11ᵀ: spectrum (1,1,4), with top eigenvector
+            // (1,1,1)/√3. Check the total mass of the tied lower eigenspace.
+            let mut packed = vec![2.0 * scale, scale, scale, 2.0 * scale, scale, 2.0 * scale];
+            let mut probe = vec![1.0, 2.0, 3.0];
+            let eigenvalues = packed_symmetric_spectrum_with_probe(3, &mut packed, &mut probe)
+                .unwrap();
+            for (actual, expected) in eigenvalues.iter().zip([1.0, 1.0, 4.0]) {
+                assert!((actual / scale - expected).abs() < 2.0e-14);
+            }
+            assert!((probe[0] * probe[0] + probe[1] * probe[1] - 2.0).abs() < 2.0e-13);
+            assert!((probe[2] * probe[2] - 12.0).abs() < 2.0e-13);
+        }
+    }
+
+    #[test]
+    fn large_probe_is_scaled_without_changing_its_eigenbasis_coordinates() {
+        let mut packed = vec![2.0, 1.0, 1.0, 2.0, 1.0, 2.0];
+        let scale = 1.0e308;
+        let mut probe = vec![scale; 3];
+        packed_symmetric_spectrum_with_probe(3, &mut packed, &mut probe).unwrap();
+        assert!((probe[0] / scale).abs() < 2.0e-14);
+        assert!((probe[1] / scale).abs() < 2.0e-14);
+        assert!((probe[2].abs() / scale - 3.0_f64.sqrt()).abs() < 2.0e-14);
+
+        let mut zero = vec![0.0; 6];
+        let original = probe.clone();
+        assert_eq!(packed_symmetric_spectrum_with_probe(3, &mut zero, &mut probe).unwrap(),
+            vec![0.0; 3]);
+        assert_eq!(probe, original);
+    }
 
     #[test]
     fn a_non_finite_input_is_refused_rather_than_decomposed() {
