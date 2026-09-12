@@ -81,69 +81,6 @@ class PartialSupervisionFit:
     warnings: list[str] = field(default_factory=list)
     report: Any = None
 
-    def predict(self, X_new: np.ndarray) -> np.ndarray:
-        """Apply the fitted gauge to a new T-block of shape ``(N', T_dim)``.
-
-        Routes through the same Rust primitive used by :meth:`fit`,
-        passing the fitted map as the input ``T_supervised`` slice. For
-        ``procrustes`` and ``soft_l2`` the supervised slice is
-        right-multiplied by ``map_R`` / ``map_A``; for ``anchor`` the
-        affine map is applied. The free slice is orthogonalized against
-        the new supervised slice when a free constraint is configured.
-
-        Returns
-        -------
-        ndarray
-            Concatenated supervised and free latent block.
-
-        Raises
-        ------
-        ValueError
-            If ``X_new`` is not 2D or its width does not equal ``T_dim``.
-        RuntimeError
-            If the fitted map needed by ``sup_method`` is missing.
-        """
-        X = np.ascontiguousarray(np.asarray(X_new, dtype=np.float64))
-        if X.ndim != 2:
-            raise ValueError(f"predict expects a 2D array, got shape {X.shape}")
-        d_sup = self.T_supervised.shape[1]
-        d_free = self.T_free.shape[1]
-        if X.shape[1] != d_sup + d_free:
-            raise ValueError(
-                f"predict expects T_dim={d_sup + d_free} columns, got {X.shape[1]}"
-            )
-        T_sup_raw = X[:, :d_sup]
-        T_free_raw = X[:, d_sup:]
-        if self.sup_method == "procrustes" and self.map_R is not None:
-            T_sup_new = T_sup_raw @ self.map_R
-        elif self.sup_method == "anchor" and self.map_A is not None and self.map_b is not None:
-            T_sup_new = T_sup_raw @ self.map_A + self.map_b
-        elif self.sup_method == "soft_l2" and self.map_A is not None:
-            T_sup_new = T_sup_raw @ self.map_A
-        else:
-            raise RuntimeError(
-                f"predict: missing fitted map for sup_method={self.sup_method!r}"
-            )
-        # Use the Rust primitive's free-block projection so that the
-        # orthogonalization stays in one place. We re-pass the (already
-        # aligned) sup slice as both `t_sup` and `aux`; with method
-        # "procrustes" and that input the SVD step returns R=I and leaves
-        # T_sup_new unchanged, while the free-block orthogonal-complement
-        # projection runs.
-        if self.free_constraint == "orthogonal_to_sup" and d_free > 0:
-            result = rust_module().partial_supervision_solve(
-                np.ascontiguousarray(T_sup_new),
-                np.ascontiguousarray(T_sup_new),
-                np.ascontiguousarray(T_free_raw),
-                "procrustes",
-                [],
-                "orthogonal_to_sup",
-            )
-            T_free_new = np.asarray(result["t_free"], dtype=np.float64)
-        else:
-            T_free_new = T_free_raw.copy()
-        return np.concatenate([T_sup_new, T_free_new], axis=1)
-
 
 @dataclass(slots=True)
 class PartialSupervisionExample:
