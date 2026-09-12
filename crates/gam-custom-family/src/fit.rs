@@ -741,6 +741,21 @@ pub(crate) fn resolvability_rho_domain(
     Ok((lower, upper))
 }
 
+/// The #2812 ρ domain of per-block penalties, by the same law
+/// [`fit_custom_family`] applies to its outer search, for a driver that
+/// searches these blocks' ρ jointly with other hyperparameters and would
+/// otherwise keep the precision box (the spatial length-scale route, #2896).
+/// Joint cross-block penalties are not part of `specs`, so none are folded in.
+pub fn per_block_resolvability_rho_domain(
+    specs: &[ParameterBlockSpec],
+    options: &BlockwiseFitOptions,
+) -> Result<(Array1<f64>, Array1<f64>), CustomFamilyError> {
+    let penalty_counts = validate_blockspecs(specs)?;
+    let label_layout = penalty_label_layout_with_joint(specs, penalty_counts, Vec::new())?;
+    let n_rho = label_layout.initial_rho.len();
+    resolvability_rho_domain(specs, &label_layout, n_rho, options.rho_lower_bound)
+}
+
 /// Unit-weight Gram of the STACKED block parameter vector, `blkdiag(X_bᵀ X_b)`.
 ///
 /// A joint penalty matrix is `(total_compiled, total_compiled)`: it acts on the

@@ -413,8 +413,24 @@ pub fn fit_transformation_normal(
     let exact_mode_branch: RefCell<ExactCoefficientModeBranch> =
         RefCell::new(ExactCoefficientModeBranch::default());
 
-    let joint_setup =
-        ExactJointHyperSetup::new(rho0, kappa0, kappa_lower, kappa_upper);
+    // The ρ domain of the CTN tensor penalties by the #2812 resolvability law the
+    // non-spatial `fit_custom_family` route applies to the same block. The driver
+    // cannot derive it from the covariate term collection, which declares one
+    // penalty for the four tensor coordinates, so without it this search kept the
+    // precision box ±ln(1/√ε) and railed ρ at −18.022 in large_scale run
+    // 34666040783 (#2896).
+    let (rho_lower, rho_upper) =
+        crate::custom_family::per_block_resolvability_rho_domain(&probe_blocks, &options)
+            .map_err(|error| format!("transformation-normal rho resolvability domain: {error}"))?;
+    if rho_lower.len() != rho0.len() || rho_upper.len() != rho0.len() {
+        return Err(format!(
+            "transformation-normal rho resolvability domain has {} coordinates for {} smoothing penalties",
+            rho_lower.len(),
+            rho0.len(),
+        ));
+    }
+    let joint_setup = ExactJointHyperSetup::new(rho0, kappa0, kappa_lower, kappa_upper)
+        .with_rho_domain(rho_lower, rho_upper);
 
     // Clone response basis parts for use inside closures.
     let rv = resp_val.clone();
