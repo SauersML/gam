@@ -56,7 +56,8 @@ fn wide_box_2817(dim: usize) -> (Array1<f64>, Array1<f64>) {
 /// The schedule is the whole fixture: a CONSTANT cost is a criterion that has
 /// stopped moving (the guard's window fills and the stall is adjudicated), a
 /// DECREASING one is a search still making progress (the window never fills and
-/// nothing is adjudicated). Evaluation stops at the first error.
+/// nothing is adjudicated). Evaluation stops at the first error. Value probes
+/// answer with the schedule's first cost: a criterion that is flat everywhere.
 fn drive_arc_oracle_2817(
     point: Array1<f64>,
     samples: Vec<(f64, Array1<f64>)>,
@@ -64,16 +65,31 @@ fn drive_arc_oracle_2817(
     bounds: (Array1<f64>, Array1<f64>),
     floor: Option<f64>,
 ) -> (Vec<Result<f64, String>>, Option<CostStallExit>) {
+    let flat = samples[0].0;
+    drive_arc_oracle_valued_2817(point, samples, hessian, bounds, floor, move |_| flat)
+}
+
+/// [`drive_arc_oracle_2817`] with the criterion's value probe supplied. The
+/// strict-saddle adjudication (#1082) steps along the reported negative
+/// eigenvector through `eval_cost`, so `value` decides whether the criterion
+/// confirms that claim or contradicts it.
+fn drive_arc_oracle_valued_2817(
+    point: Array1<f64>,
+    samples: Vec<(f64, Array1<f64>)>,
+    hessian: Array2<f64>,
+    bounds: (Array1<f64>, Array1<f64>),
+    floor: Option<f64>,
+    mut value: impl FnMut(&Array1<f64>) -> f64,
+) -> (Vec<Result<f64, String>>, Option<CostStallExit>) {
     let table = Arc::new(samples.clone());
     let calls = Arc::new(AtomicUsize::new(0));
     let problem = OuterProblem::new(point.len())
         .with_gradient(Derivative::Analytic)
         .with_hessian(DeclaredHessianForm::Either);
     let scripted_hessian = hessian.clone();
-    let cost_table = Arc::clone(&table);
     let mut obj = problem.build_objective_with_eval_order(
         (),
-        move |_: &mut (), _: &Array1<f64>| Ok(cost_table[0].0),
+        move |_: &mut (), theta: &Array1<f64>| Ok(value(theta)),
         |_: &mut (), _: &Array1<f64>| {
             Err(EstimationError::InvalidInput(
                 "legacy eager eval should not run".to_string(),
@@ -136,6 +152,20 @@ fn drive_arc_oracle_2817(
 /// window.
 fn flatlined_2817(gradient: Array1<f64>, count: usize) -> Vec<(f64, Array1<f64>)> {
     (0..count).map(|_| (COST_2817, gradient.clone())).collect()
+}
+
+/// The quadratic model a scripted sample claims, as the criterion itself:
+/// `V(θ) = COST_2817 + g·d + ½·dᵀHd` with `d = θ − center`. Along a negative
+/// eigenvector of `H` it really falls, so the strict-saddle adjudication (#1082)
+/// confirms the claim instead of contradicting it.
+fn quadratic_criterion_1082(
+    theta: &Array1<f64>,
+    center: &Array1<f64>,
+    gradient: &Array1<f64>,
+    hessian: &Array2<f64>,
+) -> f64 {
+    let d = theta - center;
+    COST_2817 + gradient.dot(&d) + 0.5 * d.dot(&hessian.dot(&d))
 }
 
 /// A criterion still buying real decrease every step: each entry improves on
@@ -298,6 +328,13 @@ fn the_adjudication_threshold_is_the_criterion_resolution_2817() {
 /// reduced Hessian is indefinite, and the shifted Cholesky behind
 /// `newton_predicted_decrease` has no positive factor to build a decrement out
 /// of.
+///
+/// The criterion really has the saddle: along the negative eigenvector it falls
+/// by `½α²`, so the strict-saddle adjudication (#1082) confirms the descent and
+/// the escape stands. A criterion that does not move along it contradicts the
+/// claim instead, which is the stop
+/// `a_strict_saddle_claim_the_criterion_contradicts_stops_at_the_incumbent_1082`
+/// pins.
 #[test]
 fn a_strict_saddle_is_never_adjudicated_stationary_2817() {
     let hessian = array![[1.0, 0.0], [0.0, -1.0]];
@@ -312,12 +349,15 @@ fn a_strict_saddle_is_never_adjudicated_stationary_2817() {
         Some(false),
         "the reduced-Hessian gate must see the negative eigenvalue"
     );
-    let (outcomes, published) = drive_arc_oracle_2817(
-        array![0.5, 0.5],
+    let center = array![0.5, 0.5];
+    let (claimed_gradient, claimed_hessian) = (gradient.clone(), hessian.clone());
+    let (outcomes, published) = drive_arc_oracle_valued_2817(
+        center.clone(),
         flatlined_2817(gradient, ARC_COST_STALL_WINDOW + 3),
         hessian,
         wide_box_2817(2),
         Some(FLOOR_2817),
+        move |theta| quadratic_criterion_1082(theta, &center, &claimed_gradient, &claimed_hessian),
     );
     assert!(
         outcomes.iter().all(|o| o.is_ok()),
@@ -327,6 +367,66 @@ fn a_strict_saddle_is_never_adjudicated_stationary_2817() {
     assert!(
         published.is_none_or(|exit| !exit.converged),
         "a strict saddle must never be published as converged"
+    );
+}
+
+/// #1082 — A STRICT-SADDLE CLAIM THE CRITERION CONTRADICTS IS A STOP, at the
+/// incumbent, exactly as the terminal certificate accepts it (#2612).
+///
+/// Same point, gradient and Hessian as the saddle fixture above; only the
+/// criterion changes. It does not move along the reported negative eigenvector,
+/// so no trial of the adjudication ladder lowers it, the claim is
+/// `Contradicted`, and with `|Pg| = 1.4e-6` inside the solver band
+/// ([`COST_STALL_PROJECTED_GRAD_FLOOR`] here) the bridge stops ARC where the
+/// certificate would accept.
+#[test]
+fn a_strict_saddle_claim_the_criterion_contradicts_stops_at_the_incumbent_1082() {
+    let (outcomes, published) = drive_arc_oracle_valued_2817(
+        array![0.5, 0.5],
+        flatlined_2817(array![1.0e-6, 1.0e-6], ARC_COST_STALL_WINDOW + 3),
+        array![[1.0, 0.0], [0.0, -1.0]],
+        wide_box_2817(2),
+        Some(FLOOR_2817),
+        |_| COST_2817,
+    );
+    assert_eq!(
+        outcomes.last().expect("ran").clone().err().as_deref(),
+        Some(ARC_CURVATURE_STATIONARY_SENTINEL),
+        "a strict-saddle claim the criterion contradicts, inside the solver band, must end \
+         the stall: {outcomes:?}"
+    );
+    assert!(
+        outcomes.len() >= ARC_COST_STALL_WINDOW,
+        "the adjudication waits for the guard's window to fill: it took {} evaluations",
+        outcomes.len()
+    );
+    let published = published.expect("the stop publishes the incumbent");
+    assert!(published.converged);
+    assert_eq!(published.rho, array![0.5, 0.5]);
+    assert_eq!(published.value, COST_2817);
+}
+
+/// NEGATIVE CONTROL ON THE BAND. The same contradicted claim at a residual ABOVE
+/// the solver band is not a stop: that band is the rung the stop answers to, so
+/// the escape stands and ARC keeps every sample.
+#[test]
+fn a_contradicted_strict_saddle_outside_the_solver_band_keeps_the_search_moving_1082() {
+    let (outcomes, published) = drive_arc_oracle_valued_2817(
+        array![0.5, 0.5],
+        flatlined_2817(array![5.0e-3, 5.0e-3], ARC_COST_STALL_WINDOW + 3),
+        array![[1.0, 0.0], [0.0, -1.0]],
+        wide_box_2817(2),
+        Some(FLOOR_2817),
+        |_| COST_2817,
+    );
+    assert!(
+        outcomes.iter().all(|o| o.is_ok()),
+        "a residual above the solver band must reach ARC whatever the adjudication says: \
+         {outcomes:?}"
+    );
+    assert!(
+        published.is_none_or(|exit| !exit.converged),
+        "such a stall must never be published as converged"
     );
 }
 

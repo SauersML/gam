@@ -1307,7 +1307,9 @@ pub enum OuterResultOrigin {
     ArcInfeasibleStallCheckpoint,
     /// ARC was stopped at a point its own terminal certificate accepts: the
     /// Newton decrement ½gᵀH⁻¹g of the rail-projected gradient sat at or below
-    /// the criterion's resolution under a PSD reduced Hessian (#2817).
+    /// the criterion's resolution under a PSD reduced Hessian (#2817), or a
+    /// strict-saddle incumbent inside the solver band carried negative curvature
+    /// the criterion contradicted (#1082).
     ArcCurvatureStationaryStop,
     /// The BFGS cost-stall guard halted the search and published its best
     /// iterate, which was rebuilt into this result.
@@ -2251,7 +2253,7 @@ pub(crate) enum SaddleAdjudication {
 /// clears the box projection with a strict objective decrease. Restores the
 /// objective's profiled inner state to `rho` before returning either way, so the
 /// refusal path that follows measures the checkpoint rather than the last probe.
-fn adjudicate_negative_curvature(
+pub(crate) fn adjudicate_negative_curvature(
     obj: &mut dyn OuterObjective,
     rho: &Array1<f64>,
     gradient: &Array1<f64>,
@@ -2556,9 +2558,10 @@ fn adjudicate_negative_curvature(
             context,
         );
         log::info!(
-            "[CERTIFICATE] {context}: interior strict saddle (λ_min={lambda_min:.3e} < 0, |Pg| \
-             within band); minting a negative-curvature escape reseed (objective {:.6e} → \
-             {:.6e}) for one retry (#2357)",
+            "[CERTIFICATE] {context}: the criterion CONFIRMS the interior strict saddle \
+             (λ_min={lambda_min:.3e} < 0, |Pg| within band): a feasible step along its \
+             eigenvector lowers the objective {:.6e} → {:.6e}; the caller decides whether that \
+             point seeds a retry (#2357)",
             baseline_cost,
             descent.cost,
         );

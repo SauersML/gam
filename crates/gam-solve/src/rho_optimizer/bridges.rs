@@ -221,6 +221,12 @@ pub(crate) const ARC_INFEASIBLE_STALL_SENTINEL: &str = "OUTER_ARC_INFEASIBLE_STA
 /// Hessian at this exact point and has evaluated the certificate's own rung on
 /// it; and the mandatory final analytic certificate re-derives its verdict from
 /// a fresh evaluation regardless, so this claims a STOP, never an exemption.
+///
+/// Two of the certificate's acceptances reach it: the decrement rung under a
+/// reduced Hessian PSD at the criterion's curvature resolution, and, at a
+/// strict-saddle incumbent whose projected gradient is inside the solver band,
+/// the certificate's own adjudication contradicting the reported negative
+/// curvature (#1082, #2612).
 pub(crate) const ARC_CURVATURE_STATIONARY_SENTINEL: &str = "OUTER_ARC_CURVATURE_STATIONARY";
 
 /// Verdict produced by folding one accepted outer iterate into
@@ -671,6 +677,10 @@ pub(crate) struct CostStallGuard {
     /// Facts staged by the bridge for the sample it is about to observe; adopted
     /// only if that sample becomes the incumbent.
     staged_curvature: Option<IncumbentCurvature>,
+    /// Set when a filled window at a strict-saddle incumbent grants an escape.
+    /// The second-order bridge takes it and adjudicates the incumbent's negative
+    /// curvature against the criterion before the escape is spent (#1082).
+    strict_saddle_refusal: bool,
     no_improve_streak: usize,
     /// Consecutive infeasible (non-finite cost) outer trials since the last
     /// finite observation. On a near-separable multinomial fit ARC repeatedly
@@ -754,6 +764,7 @@ impl CostStallGuard {
             best_hessian_psd: None,
             best_curvature: None,
             staged_curvature: None,
+            strict_saddle_refusal: false,
             no_improve_streak: 0,
             infeasible_streak: 0,
             accepted_iters: 0,
@@ -1129,6 +1140,7 @@ impl CostStallGuard {
                     self.best_curvature_note(),
                     self.stuck_escapes,
                 );
+                self.strict_saddle_refusal = true;
                 return CostStallVerdict::Continue;
             }
             log::info!(
@@ -2828,6 +2840,11 @@ impl OuterSecondOrderBridge<'_> {
                 adjudicate_second_order = true;
             }
         }
+        // #1082: an escape granted just now at a strict-saddle incumbent is
+        // adjudicated against the criterion before it is spent.
+        if let Some(stop) = self.adjudicate_strict_saddle_refusal(x) {
+            return Some(stop);
+        }
         // The guard's own verdict is FIRST-ORDER and, on this route, deferred:
         // only ARC holds a synchronized reduced Hessian at the point, so the
         // guard may not halt a second-order search on a gradient reading. What
@@ -2939,6 +2956,119 @@ impl OuterSecondOrderBridge<'_> {
         Some(ObjectiveEvalError::fatal(
             ARC_CURVATURE_STATIONARY_SENTINEL.to_string(),
         ))
+    }
+
+    /// The terminal certificate's adjudication of a strict-saddle verdict, run
+    /// when the guard refuses the stall rather than after the budget is spent
+    /// (#1082).
+    ///
+    /// A filled window at a strict-saddle incumbent grants an escape so cubic
+    /// regularization can exploit the negative curvature. The terminal
+    /// certificate asks the criterion first: `run::adjudicate_negative_curvature`
+    /// steps along the most negative eigenvector of the judged sub-block, both
+    /// signs, from one e-fold down to where the claim's predicted decrease reaches
+    /// the criterion's resolution. When no trial lowers the objective the claim is
+    /// `Contradicted`, and `certificate_meets_curvature_requirement` accepts the
+    /// point on its gradient rung alone.
+    ///
+    /// This calls that function on the incumbent with the certificate's inputs:
+    /// the synchronized gradient and Hessian the verdict was taken on, the
+    /// margin-railed coordinates of the search box, the objective's declared
+    /// invariance, and the resolution `floor·(1 + |V|)` that the certificate's
+    /// `asymptote_objective_tol` equals. It stops ARC only when the claim is
+    /// contradicted AND `|Pg|` is inside the solver band `grad_threshold`, the
+    /// strictest rung the certificate applies; the mandatory final certificate
+    /// re-derives its verdict from a fresh evaluation regardless. A descended or
+    /// declined adjudication leaves the escape standing, and the objective is
+    /// re-evaluated at `x` so ARC's next trial starts from the state it holds.
+    ///
+    /// Measured on the penguin real-data arm at `de5cc1107` (pool job 506845):
+    /// seed 1 refused its incumbent `V = 1.092247e1` (`|g| = 6.593e-4`, band
+    /// `2.290e-3`) at `λ_min = −3.991e-4` against resolution `2.384e-4` and ran to
+    /// `max_iter`. Seeds 2 and 3 and the budget retry followed, and only then did
+    /// the terminal adjudication contradict the claim (`λ_min = −4.891e-5`, two
+    /// trials) and certify the retry's point.
+    fn adjudicate_strict_saddle_refusal(
+        &mut self,
+        x: &Array1<f64>,
+    ) -> Option<ObjectiveEvalError> {
+        let floor = self.curvature_stationary_floor?;
+        let bounds = self.cost_stall_bounds.clone()?;
+        let guard = self.cost_stall.as_mut()?;
+        if !std::mem::take(&mut guard.strict_saddle_refusal)
+            || !(guard.best_grad_norm <= guard.grad_threshold)
+            || !guard.best_value.is_finite()
+        {
+            return None;
+        }
+        let rho = guard.best_rho.clone()?;
+        let curvature = guard.best_curvature.clone()?;
+        let value = guard.best_value;
+        let grad_norm = guard.best_grad_norm;
+        let grad_threshold = guard.grad_threshold;
+        let iterations = guard.accepted_iters;
+        let railed: Vec<usize> = curvature.railed.iter().map(|railed| railed.index).collect();
+        let invariance = self.obj.criterion_invariant_directions(&rho);
+        let objective_resolution = floor * (1.0 + value.abs());
+        let context = "ARC strict-saddle stall refusal";
+        match super::run::adjudicate_negative_curvature(
+            &mut *self.obj,
+            &rho,
+            &curvature.gradient,
+            &curvature.hessian,
+            &railed,
+            invariance.as_ref(),
+            value,
+            objective_resolution,
+            &bounds,
+            context,
+        ) {
+            super::run::SaddleAdjudication::Contradicted {
+                probed,
+                smallest_step,
+                ..
+            } => {
+                log::info!(
+                    "[OUTER] ARC stopping at the strict-saddle incumbent its own certificate \
+                     accepts: the criterion CONTRADICTS the reported negative curvature \
+                     ({curvature}; {probed} trial(s) down to step {smallest_step:.3e} lowered \
+                     the objective nowhere against resolution {objective_resolution:.3e}), and \
+                     |Pg|={grad_norm:.3e} is inside the solver band {grad_threshold:.3e} after \
+                     {iterations} accepted outer iteration(s) (value={value:.6e}; #1082, #2612).",
+                );
+                let guard = self.cost_stall.as_mut()?;
+                if let Ok(mut slot) = guard.exit.lock() {
+                    *slot = Some(CostStallExit {
+                        rho,
+                        value,
+                        grad_norm,
+                        iterations,
+                        converged: true,
+                        // No stall window's noise measurement is claimed: the
+                        // rung that stopped this run is the solver band.
+                        noise_grad_bound: None,
+                        probe_scale: None,
+                    });
+                }
+                Some(ObjectiveEvalError::fatal(
+                    ARC_CURVATURE_STATIONARY_SENTINEL.to_string(),
+                ))
+            }
+            other => {
+                if let super::run::SaddleAdjudication::Declined(reason) = &other {
+                    log::info!(
+                        "[OUTER] {context}: adjudication declined -- {reason}; the escape stands."
+                    );
+                }
+                if let Err(err) = self.obj.eval_cost(x) {
+                    log::warn!(
+                        "[OUTER] {context}: failed to restore the objective to the ARC iterate \
+                         after adjudicating the incumbent: {err}"
+                    );
+                }
+                None
+            }
+        }
     }
 
     /// Fold one INFEASIBLE ARC trial (non-finite cost) into the cost-stall
@@ -3768,6 +3898,10 @@ pub(crate) struct IncumbentCurvature {
     interior_min: Option<f64>,
     resolution: f64,
     railed: Vec<RailedCurvature>,
+    /// The synchronized gradient and Hessian the verdict was taken on, so a
+    /// refusal can be adjudicated against the criterion (#1082).
+    gradient: Array1<f64>,
+    hessian: Array2<f64>,
 }
 
 impl std::fmt::Display for IncumbentCurvature {
@@ -3840,6 +3974,8 @@ pub(crate) fn incumbent_curvature(
                 curvature: hessian[[index, index]],
             })
             .collect(),
+        gradient: gradient.clone(),
+        hessian: hessian.clone(),
     })
 }
 

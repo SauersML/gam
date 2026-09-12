@@ -2831,8 +2831,10 @@ pub(crate) fn run_outer_with_plan(
                             // #2817 — the bridge stopped ARC at a point its own
                             // terminal certificate accepts: PSD reduced Hessian,
                             // and a Newton decrement at or below the criterion's
-                            // resolution. Unlike the infeasible-stall sentinel
-                            // above, the bridge held a synchronized analytic
+                            // resolution, or (#1082) a strict-saddle incumbent
+                            // inside the solver band whose negative curvature the
+                            // criterion contradicts. Unlike the infeasible-stall
+                            // sentinel above, the bridge held a synchronized analytic
                             // Hessian AT this point and evaluated the
                             // certificate's rung on it, so the rebuilt result is
                             // reported converged. The mandatory final analytic
