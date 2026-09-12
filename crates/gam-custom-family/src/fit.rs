@@ -3581,15 +3581,12 @@ fn fit_custom_family_user_fixed_log_lambdas_impl<
             ),
         })?;
     if !inner.converged {
-        return Err(CustomFamilyError::Optimization {
-            context: "fit_custom_family_fixed_log_lambdas inner solve",
-            reason: format!(
-                "fixed-log-lambda inner solve did not converge after {} cycles; \
-                 rho_checkpoint={:?}; no fit was assembled",
-                inner.cycles,
-                rho.as_slice().unwrap_or(&[])
-            ),
-        });
+        // The inner result holds the terminal verdict (which exit fired, the
+        // KKT residual and its tolerance). Rendering only the cycle count
+        // reported "did not converge after 0 cycles" for a joint-Newton solve
+        // that refused inside its first cycle, and hid which guard refused it
+        // (#1561). The producer used by every outer route keeps that verdict.
+        return Err(inner_solve_not_converged_error(&inner, rho.len(), 0));
     }
     let penalized_objective = inner_penalized_objective(
         &inner,
