@@ -33,7 +33,7 @@ APIs such as a matrix kernel.
 | Persistence | saved-model envelope | fit writes and all consumers read it | `save`, `load`, `loads`, `Model.save`, `dumps`, `model_from_dict` | One Rust wire format |
 | Multinomial fit/predict/inference | Rust multinomial request/model | selected by `--family multinomial` | `family="multinomial"`, `MultinomialModel` | Parity |
 | Event history | Rust event-history engine | `fit-events` | `fit_event_history`, `EventHistoryModel` | Parity |
-| Manifold crosscoder | Rust auto-fit/report engine | `crosscoder` and its override flags | `sae_crosscoder_fit` / crosscoder objects | Same Rust engine; transport-specific inputs |
+| Manifold crosscoder | Rust auto-fit/report engine | `crosscoder`, `--random-state` | `sae_crosscoder_fit` / crosscoder objects | Same Rust engine; transport-specific inputs |
 | Response geometry | Rust geometry/fitting modules | complete versioned request/artifact workflows | `fit(..., response_geometry=...)`, `ResponseGeometryModel` | Programmatic API; no duplicate CLI math |
 
 ## CLI command and flag inventory
@@ -50,7 +50,7 @@ The one global flag is `--log-level`.
 | `generate` | `MODEL DATA`; `--n-draws`, `--seed`, `--out` |
 | `report` | `MODEL [DATA] [OUT]` |
 | `fit-events` | `--subjects`, `--events`, `--covariates`, `--formula` or `--mark-formula` (one per mark), `--marks`, `--horizons-after-exit`, `--forecast-cutoff`, `--reference-row`, `--reference-stratum`, `--out` |
-| `crosscoder` | named anchor/block matrices, atom/harmonic counts, sparsity/smoothness/optimizer overrides, transport-law controls, `--out` |
+| `crosscoder` | named anchor/block matrices, atom/harmonic counts, `--random-state`, transport-law controls, `--out` |
 
 ## Python public fitting, prediction, and diagnostic inventory
 

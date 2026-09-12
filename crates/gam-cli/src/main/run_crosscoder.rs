@@ -110,13 +110,8 @@ pub(crate) fn run_crosscoder(args: CrosscoderArgs) -> CliResult<()> {
         })
         .collect::<Result<Vec<_>, String>>()?;
     let config = SaeCrosscoderAutoFitOverrides {
-        sparsity_strength: args.sparsity_strength,
-        smoothness: args.smoothness,
-        max_iter: args.max_iter,
-        learning_rate: args.learning_rate,
-        ridge_ext_coord: args.ridge_ext_coord,
-        ridge_beta: args.ridge_beta,
         random_state: args.random_state,
+        ..SaeCrosscoderAutoFitOverrides::default()
     }
     .resolve(args.atoms, args.harmonics);
     let fit = run_auto_sae_crosscoder_fit(SaeCrosscoderAutoFitRequest {
@@ -176,12 +171,6 @@ mod tests {
         };
         assert_eq!(args.anchor.label, "anchor");
         assert_eq!(args.block.len(), 1);
-        assert!(args.sparsity_strength.is_none());
-        assert!(args.smoothness.is_none());
-        assert!(args.max_iter.is_none());
-        assert!(args.learning_rate.is_none());
-        assert!(args.ridge_ext_coord.is_none());
-        assert!(args.ridge_beta.is_none());
         assert!(args.random_state.is_none());
         assert!(args.transport_grid_resolution.is_none());
         assert!(args.law_gap_tolerance.is_none());
@@ -227,6 +216,19 @@ mod tests {
             !help.contains("--outer-rho-search"),
             "automatic fits must not expose a fixed-rho shortcut:\n{help}"
         );
+        for removed in [
+            "--sparsity-strength",
+            "--smoothness",
+            "--max-iter",
+            "--learning-rate",
+            "--ridge-ext-coord",
+            "--ridge-beta",
+        ] {
+            assert!(
+                !help.contains(removed),
+                "library fit policy must not be a CLI override: {removed:?} in:\n{help}"
+            );
+        }
     }
 
     #[test]

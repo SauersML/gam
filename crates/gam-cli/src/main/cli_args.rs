@@ -161,30 +161,6 @@ pub(crate) struct CrosscoderArgs {
     #[arg(long, value_parser = parse_positive_usize_cli)]
     pub(crate) harmonics: usize,
 
-    /// Override the Rust library's assignment-sparsity strength.
-    #[arg(long, value_parser = parse_nonnegative_f64_cli)]
-    pub(crate) sparsity_strength: Option<f64>,
-
-    /// Override the Rust library's manifold smoothness strength.
-    #[arg(long, value_parser = parse_nonnegative_f64_cli)]
-    pub(crate) smoothness: Option<f64>,
-
-    /// Override the Rust library's fit iteration limit.
-    #[arg(long, value_parser = parse_positive_usize_cli)]
-    pub(crate) max_iter: Option<usize>,
-
-    /// Override the Rust library's inner learning rate.
-    #[arg(long, value_parser = parse_positive_f64_cli)]
-    pub(crate) learning_rate: Option<f64>,
-
-    /// Override the Rust library's external-coordinate ridge.
-    #[arg(long, value_parser = parse_positive_f64_cli)]
-    pub(crate) ridge_ext_coord: Option<f64>,
-
-    /// Override the Rust library's decoder ridge.
-    #[arg(long, value_parser = parse_positive_f64_cli)]
-    pub(crate) ridge_beta: Option<f64>,
-
     /// Override the Rust library's deterministic random seed.
     #[arg(long)]
     pub(crate) random_state: Option<u64>,

@@ -22,8 +22,7 @@ gam --help
 | `gam transformation-score MODEL DATA [--out scores.csv]` | Evaluate a fitted conditional transformation model at observed responses. |
 
 Every subcommand also accepts `--log-level off|error|warn|info|debug|trace`
-(default `warn`), and the shorthands `-v`/`-vv`/`-vvv` (increasing verbosity)
-and `-q` (quiet). `--log-level` wins if both are given.
+(default `warn`).
 
 ## Fit
 
@@ -149,7 +148,7 @@ gam crosscoder \
 | `--block LABEL=FILE` | Named non-anchor activation matrix, row-aligned with the anchor. Repeat once per additional layer. |
 | `--atoms N` | Number of shared manifold atoms. |
 | `--harmonics N` | Harmonic order of each periodic manifold atom. |
-| `--sparsity-strength`, `--smoothness`, `--max-iter`, `--learning-rate`, `--ridge-ext-coord`, `--ridge-beta`, `--random-state` | Overrides for the underlying Rust library defaults. |
+| `--random-state N` | Seed for the library's deterministic initialization. Every other fit control belongs to the library. |
 | `--transport-grid-resolution N`, `--law-gap-tolerance VALUE` | Grid resolution and tolerance for classifying consecutive-layer transport. |
 
 ## Formula Notes
