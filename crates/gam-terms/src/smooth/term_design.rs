@@ -1211,20 +1211,6 @@ pub fn place_term_in_collection_gauge(
     let realized = realize_smooth_collection_gauge(design, gauge, termname)?;
     let coefficient_gauge =
         gam_problem::Gauge::from_block_transforms(&[realized.coefficient_transform.clone()]);
-    let candidates = penalty_candidates_under_collection_gauge(
-        active_penalties,
-        Some(&coefficient_gauge),
-        termname,
-    )?;
-    let filtered = filter_penalty_candidates(candidates)?;
-    let mut dropped_penalties = dropped_penalties;
-    dropped_penalties.extend(filtered.dropped);
-    let linear_constraints_local = linear_constraints_local.map(|lin| {
-        gam_problem::LinearInequalityConstraints {
-            a: lin.a.dot(&coefficient_gauge.block_transform(0)),
-            b: lin.b.clone(),
-        }
-    });
     let realized_transform = match joint_null_rotation {
         Some(rotation) => {
             gam_linalg::faer_ndarray::fast_ab(&rotation.rotation, &realized.coefficient_transform)
@@ -1232,6 +1218,19 @@ pub fn place_term_in_collection_gauge(
         None => realized.coefficient_transform.clone(),
     };
     let metadata = with_identifiability_transform(metadata, Some(&realized_transform))?;
+    let (active_penalties, dropped_penalties) = penalties_in_collection_chart(
+        active_penalties,
+        dropped_penalties,
+        Some(&coefficient_gauge),
+        &metadata,
+        termname,
+    )?;
+    let linear_constraints_local = linear_constraints_local.map(|lin| {
+        gam_problem::LinearInequalityConstraints {
+            a: lin.a.dot(&coefficient_gauge.block_transform(0)),
+            b: lin.b.clone(),
+        }
+    });
     let parametric_residualization = Some(ParametricResidualizationChart {
         owner_terms: gauge.owner_terms.clone(),
         has_parametric_block: gauge.has_parametric_block,
@@ -1240,11 +1239,46 @@ pub fn place_term_in_collection_gauge(
     Ok(CollectionGaugedTerm {
         design: realized.design,
         metadata,
-        active_penalties: filtered.active,
+        active_penalties,
         dropped_penalties,
         linear_constraints_local,
         parametric_residualization,
     })
+}
+
+/// A smooth term's penalty set in its collection's coefficient chart: the active
+/// blocks, and the dropped ones following `local_dropped`.
+///
+/// A Matérn term's penalties are re-derived from `placed_metadata`, its metadata
+/// with the collection's chart composed in, instead of congruencing the
+/// term-local blocks. Those blocks are PSD reconstructions that drop
+/// eigen-directions below their spectral tolerance, and a collection chart far
+/// from orthogonal amplifies what they dropped. On the gam#2895 fixture a
+/// `Residualize` chart with max|T0| = 5.4e6 and ‖T0ᵀT0 − I‖_F = 8.4e13 turned a
+/// rel 9.0e-10 difference in the tension block into rel 0.56 (MSI job 438255).
+/// The triplet applies the chart to the collocation operators before forming
+/// each Gram, and it is the builder the n-free κ re-key and the ψ-derivative
+/// already read, so the criterion and its gradient see the same blocks.
+fn penalties_in_collection_chart(
+    active_penalties: &[ActivePenalty],
+    local_dropped: Vec<DroppedPenaltyInfo>,
+    coefficient_gauge: Option<&gam_problem::Gauge>,
+    placed_metadata: &BasisMetadata,
+    term_name: &str,
+) -> Result<(Vec<ActivePenalty>, Vec<DroppedPenaltyInfo>), BasisError> {
+    if coefficient_gauge.is_some() && matches!(placed_metadata, BasisMetadata::Matern { .. }) {
+        // The term-local build replaced its penalties with this same triplet
+        // (the Matérn override in the basis dispatch), so the local dropped
+        // blocks are the triplet's own and are not counted twice.
+        let filtered = matern_operator_penalty_triplet_from_metadata(placed_metadata)?;
+        return Ok((filtered.active, filtered.dropped));
+    }
+    let candidates =
+        penalty_candidates_under_collection_gauge(active_penalties, coefficient_gauge, term_name)?;
+    let filtered = filter_penalty_candidates(candidates)?;
+    let mut dropped = local_dropped;
+    dropped.extend(filtered.dropped);
+    Ok((filtered.active, dropped))
 }
 
 /// Largest relative residual tolerated before a constrained design is rejected
@@ -1788,12 +1822,33 @@ fn apply_global_smooth_identifiability(
             .as_ref()
             .map(|z| gam_problem::Gauge::from_block_transforms(&[z.clone()]));
 
-        let penalty_candidates = penalty_candidates_under_collection_gauge(
+        let realized_transform = match (term.joint_null_rotation.as_ref(), z_opt.as_ref()) {
+            (Some(rotation), Some(z)) => {
+                Some(gam_linalg::faer_ndarray::fast_ab(&rotation.rotation, z))
+            }
+            (Some(rotation), None) => Some(rotation.rotation.clone()),
+            (None, Some(z)) => Some(z.clone()),
+            (None, None) => None,
+        };
+        // Factor-smooth kinds cannot absorb the realized transform into their
+        // metadata (see the export below). Every other kind's placed metadata is
+        // the chart its penalties live in.
+        let absorbs_realized_transform = !matches!(
+            &termspec.basis,
+            SmoothBasisSpec::FactorSumToZero { .. } | SmoothBasisSpec::FactorSmooth { .. }
+        );
+        let placed_metadata = if absorbs_realized_transform {
+            with_identifiability_transform(&term.metadata, realized_transform.as_ref())?
+        } else {
+            term.metadata.clone()
+        };
+        let (active_penalties, dropped_penalties) = penalties_in_collection_chart(
             &term.active_penalties,
+            term.dropped_penalties.clone(),
             coefficient_gauge.as_ref(),
+            &placed_metadata,
             &term.name,
         )?;
-        let filtered = filter_penalty_candidates(penalty_candidates)?;
         let linear_constraints_constrained =
             if let Some(lin_local) = term.linear_constraints_local.as_ref() {
                 if let Some(gauge) = coefficient_gauge.as_ref() {
@@ -1821,18 +1876,9 @@ fn apply_global_smooth_identifiability(
         local_collection_gauge[idx] = collection_gauge;
         local_dims[idx] = design_constrained.ncols();
         local_designs[idx] = Some(design_constrained);
-        local_active_penalties[idx] = filtered.active;
-        local_dropped_penalties[idx] = term.dropped_penalties.clone();
-        local_dropped_penalties[idx].extend(filtered.dropped);
+        local_active_penalties[idx] = active_penalties;
+        local_dropped_penalties[idx] = dropped_penalties;
         local_linear_constraints[idx] = linear_constraints_constrained;
-        let realized_transform = match (term.joint_null_rotation.as_ref(), z_opt.as_ref()) {
-            (Some(rotation), Some(z)) => {
-                Some(gam_linalg::faer_ndarray::fast_ab(&rotation.rotation, z))
-            }
-            (Some(rotation), None) => Some(rotation.rotation.clone()),
-            (None, Some(z)) => Some(z.clone()),
-            (None, None) => None,
-        };
         // Factor-smooth kinds cannot absorb the realized transform into their
         // metadata, so it is exported on the term instead and persisted onto
         // the spec by `freeze_term_collection_from_design` (#978):
@@ -1857,18 +1903,10 @@ fn apply_global_smooth_identifiability(
         // `s(x) + s(g, x, bs=sz)` / `s(x) + fs(x, g)` was silently dropped:
         // the fit used the narrowed `X·Z` design while every predict rebuilt
         // the full-width design, making the model unpredictable (#978).
-        match &termspec.basis {
-            SmoothBasisSpec::FactorSumToZero { .. } | SmoothBasisSpec::FactorSmooth { .. } => {
-                local_metadata[idx] = Some(term.metadata.clone());
-                local_unabsorbed_z[idx] = z_opt.clone();
-            }
-            _ => {
-                local_metadata[idx] = Some(with_identifiability_transform(
-                    &term.metadata,
-                    realized_transform.as_ref(),
-                )?);
-            }
+        if !absorbs_realized_transform {
+            local_unabsorbed_z[idx] = z_opt.clone();
         }
+        local_metadata[idx] = Some(placed_metadata);
     }
 
     let total_p: usize = local_dims.iter().sum();
