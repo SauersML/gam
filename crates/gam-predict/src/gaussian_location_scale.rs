@@ -19,6 +19,20 @@ pub struct GaussianLocationScalePredictor {
     pub link_wiggle: Option<SavedLinkWiggleRuntime>,
 }
 
+/// `sqrt(E[(floor + exp(Z))²])` for `Z ~ N(mean, variance)`. Form square
+/// roots of all three nonnegative moment terms before combining them so a
+/// representable SD is not lost when its variance overflows or underflows.
+fn shifted_lognormal_root_second_moment(mean: f64, variance: f64, floor: f64) -> f64 {
+    let exponential_sd = (mean + variance).exp();
+    let cross_sd = if floor == 0.0 {
+        0.0
+    } else {
+        (0.5 * std::f64::consts::LN_2 + 0.5 * floor.ln() + 0.5 * mean + 0.25 * variance)
+            .exp()
+    };
+    floor.hypot(exponential_sd).hypot(cross_sd)
+}
+
 impl GaussianLocationScalePredictor {
     /// Reconstruct σ in raw response units from the persisted Scale-block
     /// coefficients.
@@ -87,8 +101,8 @@ impl GaussianLocationScalePredictor {
     /// `η_s ~ N(m, v)`, the lognormal moments give exactly
     ///   `E[σ²] = f² + 2·f·exp(m + v/2) + exp(2m + 2v)`,
     /// which reduces to the plug-in `σ(m)²` at `v = 0` (also the no-covariance
-    /// degrade). An overflowing moment is reported as `+inf` rather than
-    /// replaced by a finite surrogate.
+    /// degrade). The SD is evaluated without forming an overflowing squared
+    /// moment; `+inf` is returned only when the SD itself is outside the range.
     fn integrated_noise_sd(&self, input: &PredictInput) -> Result<Array1<f64>, EstimationError> {
         let design_noise = input.design_noise.as_ref().ok_or_else(|| {
             EstimationError::InvalidInput(
@@ -116,11 +130,7 @@ impl GaussianLocationScalePredictor {
             None => Array1::zeros(eta_noise.len()),
         };
         Ok(Array1::from_shape_fn(eta_noise.len(), |i| {
-            let m = eta_noise[i];
-            let v = log_sigma_var[i];
-            let e1 = (m + 0.5 * v).exp();
-            let e2 = (2.0 * m + 2.0 * v).exp();
-            (scaled_floor * scaled_floor + 2.0 * scaled_floor * e1 + e2).sqrt()
+            shifted_lognormal_root_second_moment(eta_noise[i], log_sigma_var[i], scaled_floor)
         }))
     }
 
@@ -352,5 +362,40 @@ impl PredictableModel for GaussianLocationScalePredictor {
         } else {
             vec![BlockRole::Location, BlockRole::Scale]
         }
+    }
+}
+
+#[cfg(test)]
+mod noise_moment_tests {
+    use super::shifted_lognormal_root_second_moment;
+
+    #[test]
+    fn gaussian_noise_sd_retains_extreme_finite_standard_deviations() {
+        // A zero posterior variance makes the conditional noise SD exactly
+        // floor+exp(mean), even when its square lies outside the float range.
+        for mean in [-400.0_f64, 400.0] {
+            for floor in [0.0, 0.25, (-401.0_f64).exp()] {
+                let expected = floor + mean.exp();
+                let actual = shifted_lognormal_root_second_moment(mean, 0.0, floor);
+                assert!((actual / expected - 1.0).abs() < 1e-13);
+            }
+        }
+    }
+
+    #[test]
+    fn gaussian_noise_sd_matches_lognormal_moments_with_uncertainty() {
+        let mean = 0.3_f64;
+        let variance = 0.4_f64;
+        let floor = 0.2_f64;
+        let expected = (floor * floor
+            + 2.0 * floor * (mean + 0.5 * variance).exp()
+            + (2.0 * mean + 2.0 * variance).exp())
+        .sqrt();
+        let actual = shifted_lognormal_root_second_moment(mean, variance, floor);
+        assert!((actual / expected - 1.0).abs() < 1e-14);
+        assert_eq!(
+            shifted_lognormal_root_second_moment(800.0, 0.0, 0.0),
+            f64::INFINITY
+        );
     }
 }
