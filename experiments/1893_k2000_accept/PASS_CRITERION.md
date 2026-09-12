@@ -36,9 +36,10 @@ SAE, at usable throughput? PASS iff ALL THREE legs hold (the driver prints
 - **Venv is PINNED per-job**: a fresh `python3 -m venv` + `pip install
   gamfit==$GAMFIT_VERSION numpy scikit-learn torch` — never trusts a shared venv's
   wheel. Submit with `GAMFIT_VERSION=<the ≥0.1.252 wheel>`.
-- **Data is MSI-resident + fail-loud**: `CHUNK_DIR` defaults to the creditscope
-  Qwen3.5-35B-A3B **layer-30 residual** set —
-  `/projects/standard/hsiehph/sauer354/creditscope_acts/activations/layer_30_residual_post/`,
+- **Data is pinned + fail-loud**: `CHUNK_DIR` is required and holds the creditscope
+  Qwen3.5-35B-A3B **layer-30 residual** set as fetched by
+  `experiments/1026_close/fetch_creditscope_l30.sh` (`sarel/creditscope-activations-v2`
+  at a pinned revision, every chunk sha256-verified),
   8 float16 `chunk_0000..0007.npy` shards, 360,002 tokens total (also the set the
   #1026 close bar names). The sbatch `test -f`s `chunk_0000.npy` and aborts (rc 2)
   rather than degrading to a synthetic fallback. The driver memory-maps the shards
@@ -51,4 +52,5 @@ SAE, at usable throughput? PASS iff ALL THREE legs hold (the driver prints
 ## Operator-confirm item (not resolvable from the repo)
 
 - `GAMFIT_VERSION` — the published wheel to pin (lead sets it when PyPI serves the
-  `>= 2d86f98bb` wheel). Everything else defaults to the creditscope set.
+  `>= 2d86f98bb` wheel). `CHUNK_DIR` comes from `experiments/1026_close/fetch_creditscope_l30.sh`;
+  everything else has a default.

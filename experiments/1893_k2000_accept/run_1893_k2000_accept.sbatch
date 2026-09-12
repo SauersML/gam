@@ -8,10 +8,9 @@
 # (contains the #1094/#1095/#2228 acceptance-deflation fixes + a215a7345 = #1995
 # block-GEMM throughput fix):
 #
-#   GAMFIT_VERSION=0.1.252 sbatch run_1893_k2000_accept.sbatch
+#   GAMFIT_VERSION=0.1.252 CHUNK_DIR=<dir> sbatch run_1893_k2000_accept.sbatch
 #
-# (CHUNK_DIR defaults to the creditscope L30 residual set; override R/CHUNK_DIR to
-#  point elsewhere. Only GAMFIT_VERSION is required.)
+# (CHUNK_DIR is a directory filled by experiments/1026_close/fetch_creditscope_l30.sh.)
 #
 #SBATCH --job-name=sae_1893_k2000
 #SBATCH --partition=amdsmall
@@ -23,11 +22,12 @@ set -uo pipefail
 
 R=${R:-/projects/standard/hsiehph/sauer354}
 GAMFIT_VERSION=${GAMFIT_VERSION:?set GAMFIT_VERSION (e.g. 0.1.252) — the wheel to pin}
-# MSI-resident real-activation set: creditscope Qwen3.5-35B-A3B layer-30 residual,
-# 8 float16 chunk_0000..0007.npy shards (~205MB each, 360,002 tokens total). This is
-# the sarel/creditscope set the #1026 close bar also names, so this harness serves
-# both. p (= 35B d_model) is read from the shard shape by the driver, not hardcoded.
-CHUNK_DIR=${CHUNK_DIR:-$R/creditscope_acts/activations/layer_30_residual_post}
+# Real-activation set: creditscope Qwen3.5-35B-A3B layer-30 residual, 8 float16
+# chunk_0000..0007.npy shards (~205MB each, 360,002 tokens total), fetched at a pinned
+# revision by experiments/1026_close/fetch_creditscope_l30.sh. This is the
+# sarel/creditscope set the #1026 close bar also names, so this harness serves both.
+# p (= 35B d_model) is read from the shard shape by the driver, not hardcoded.
+CHUNK_DIR=${CHUNK_DIR:?set CHUNK_DIR to a directory filled by experiments/1026_close/fetch_creditscope_l30.sh}
 MAX_ROWS=${MAX_ROWS:-120000}       # ~100k train + 20k held-out from the 360k corpus
 K=${K:-2000}
 TOP_K=${TOP_K:-32}

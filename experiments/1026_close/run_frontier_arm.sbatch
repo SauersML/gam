@@ -73,9 +73,10 @@ ATOM_MANIFOLD=${ATOM_MANIFOLD:-product}
 ATOM_BASIS=${ATOM_BASIS:-fourier}
 TAG=${TAG:-frontier-K${K}-s${SEED}}
 
-# MSI-resident real-activation set: creditscope Qwen3.5-35B-A3B layer-30
-# residual, the exact set the #1026 close bar names. p is read from the shard.
-CHUNK_DIR=${CHUNK_DIR:-$R/creditscope_acts/activations/layer_30_residual_post}
+# Real-activation set: creditscope Qwen3.5-35B-A3B layer-30 residual, the exact set
+# the #1026 close bar names, fetched at a pinned revision by fetch_creditscope_l30.sh.
+# p is read from the shard.
+CHUNK_DIR=${CHUNK_DIR:?set CHUNK_DIR to a directory filled by experiments/1026_close/fetch_creditscope_l30.sh}
 OUT=${OUT:-$R/1026_frontier/results_1026.jsonl}
 VENV=${VENV:-$R/saevenv}
 DRIVER=${DRIVER:-$(dirname "$(scontrol show job "${SLURM_JOB_ID:-0}" 2>/dev/null | awk -F= '/Command=/{print $2}')")/driver_1026_arms.py}

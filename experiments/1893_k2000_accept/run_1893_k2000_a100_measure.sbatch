@@ -47,7 +47,7 @@ module load cuda/12.1.1
 # clear RUSTFLAGS so a login-profile export cannot leak in.
 unset RUSTFLAGS
 
-CHUNK_DIR=${CHUNK_DIR:-$R/creditscope_acts/activations/layer_30_residual_post}
+CHUNK_DIR=${CHUNK_DIR:?set CHUNK_DIR to a directory filled by experiments/1026_close/fetch_creditscope_l30.sh}
 MAX_ROWS=${MAX_ROWS:-120000}
 K=${K:-2000}
 TOP_K=${TOP_K:-32}
