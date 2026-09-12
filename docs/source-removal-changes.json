@@ -3446,5 +3446,22 @@
     ],
     "reason": "SPEC rule 5 (#2901 V15). The soft-L2 partial-supervision map penalized the map coefficients (a ridge on A), which is not a functional of the fitted block T A. It now penalizes the function mass λ‖T A‖², whose REML weight has a closed form. The certified log-λ search over the coefficient-ridge profile therefore has no caller, so ridge_reml_select_weight, RidgeRemlWeight with its score method, and their two unit tests are deleted.",
     "evidence": "At the base, git grep -l ridge_reml_select_weight outside the generated tools/codebase-city bundle finds crates/gam-sae/src/identifiability.rs and two doc comments in crates/gam-math/src/score_opt.rs, which this change rewrites. git grep -l RidgeRemlWeight finds only identifiability.rs. The only production caller was the PartialSupervisionSupMethod::SoftL2 branch of partial_supervision_solve, which is replaced here. RidgeRemlWeight::score had no caller. Both deleted tests call only ridge_reml_select_weight. The item list applies source_removal_guard.py's ITEM regex and occurrence rule to the removed hunks by hand: three public declarations and two test-scoped fns, and no private declaration is removed. Compile is covered by the lead's shared tip check."
+  },
+  {
+    "base": "9bdf036fefc0d58fdda36b465d18431db935c84c",
+    "items": [
+      "crates/gam-geometry/src/optimizer.rs:const:BOUNDARY_FRAC",
+      "crates/gam-geometry/src/optimizer.rs:const:STEIHAUG_CG_FORCING_FACTOR",
+      "crates/gam-geometry/src/optimizer.rs:fn:boundary_tau",
+      "crates/gam-geometry/src/optimizer.rs:fn:cauchy_point",
+      "crates/gam-geometry/src/optimizer.rs:fn:g_inner",
+      "crates/gam-geometry/src/optimizer.rs:fn:g_norm",
+      "crates/gam-geometry/src/optimizer.rs:fn:metric_norm_from_product",
+      "crates/gam-geometry/src/optimizer.rs:fn:model_reduction",
+      "crates/gam-geometry/src/optimizer.rs:fn:relative_stationarity",
+      "crates/gam-geometry/src/optimizer.rs:fn:solve_subproblem"
+    ],
+    "reason": "#2900 SPEC rule 24: general outer-optimizer work belongs in opt. The Riemannian trust-region solver internals of gam-geometry optimizer.rs moved to opt as mod riemannian (SauersML/opt 02462430e74c4468176e0b2e71e6e2fb2ab94576): metric inner product, certified metric norm, relative stationarity, Steihaug truncated-CG subproblem, Cauchy point, boundary root and model reduction, together with the forcing factor and boundary fraction constants. RiemannianTrustRegion::minimize_reporting_termination now calls opt::RiemannianTrustRegion::minimize through a RiemannianManifold adapter, and the public surface of optimizer.rs is unchanged.",
+    "evidence": "All ten are private items of crates/gam-geometry/src/optimizer.rs. At base, every other occurrence of these names in optimizer.rs is a use from inside the removed solver, or the metric_norm_from_product call in the overflowed-norm test, which now drives RiemannianTrustRegion::minimize instead. The other occurrences outside optimizer.rs are homonyms in other modules that this change does not touch: the word g_inner in a manifold.rs doc line and gam-solve binomial_reml_outer_cost_1575_tests.rs; local variables named g_norm in gam-solve pirls, rho_optimizer bridges and gpu_kernels, gam-models full_conformal, gam-pyffi reml_latent_fit_ffi and a geomstats quality test; and the relative_stationarity field and locals in gam-custom-family exact_joint_fit, gam-problem custom_family_error and gam-pyffi. Pool job 507641 (log /scratch.global/sauer354/pool/spec-scale/gate4.507641.log): gam-geometry check --all-targets rc 0, optimizer::tests 7 passed, and the indefinite-metric pin turns red under a mutated opt certificate. Not compiled locally (user directive); the workspace compile rests on the shared tip check."
   }
 ]

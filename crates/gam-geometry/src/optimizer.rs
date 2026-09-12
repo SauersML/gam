@@ -1,15 +1,7 @@
-use gam_linalg::roundoff::accumulation_band;
+use gam_linalg::faer_ndarray::fast_av;
 use ndarray::{Array1, ArrayView1};
-use opt::TrustRegionPolicy;
 
-use crate::manifold::{GeometryResult, RiemannianManifold, check_len, quad_form};
-
-/// Linear factor of the Steihaug truncated-CG forcing sequence: the inner CG
-/// solve is terminated once the residual drops to `min(η·‖r₀‖, ‖r₀‖²)`. The
-/// quadratic `‖r₀‖²` term gives the super-linear convergence of an inexact
-/// Newton step near the optimum, while `η·‖r₀‖` caps wasted inner work far from
-/// it (Nocedal & Wright, *Numerical Optimization*, §7.1, eq. 7.3).
-const STEIHAUG_CG_FORCING_FACTOR: f64 = 1.0e-2;
+use crate::manifold::{GeometryError, GeometryResult, RiemannianManifold, check_len};
 
 pub trait RiemannianObjective {
     fn value_gradient(&mut self, point: ArrayView1<'_, f64>) -> GeometryResult<(f64, Array1<f64>)>;
@@ -45,102 +37,6 @@ pub trait RiemannianObjective {
         check_len("hessian_vector_product tangent", tangent.len(), point.len())?;
         Ok(None)
     }
-}
-
-/// Metric inner product `g_x(a, b) = aᵀ G(x) b` using the manifold metric
-/// tensor at `point`. For manifolds whose metric is the ambient identity
-/// (Euclidean, Sphere, Circle, Torus, …) this reduces to the Euclidean dot
-/// product; for a genuine Riemannian metric (e.g. the affine-invariant SPD
-/// metric) it evaluates the correct geometric inner product on the tangent
-/// space. Every norm and inner product in both optimizers below routes through
-/// this so the algorithms are metric-correct on curved manifolds.
-fn g_inner(
-    manifold: &dyn RiemannianManifold,
-    point: ArrayView1<'_, f64>,
-    a: ArrayView1<'_, f64>,
-    b: ArrayView1<'_, f64>,
-) -> GeometryResult<f64> {
-    let g = manifold.metric_tensor(point)?;
-    Ok(quad_form(g.view(), a, b))
-}
-
-fn g_norm(
-    manifold: &dyn RiemannianManifold,
-    point: ArrayView1<'_, f64>,
-    a: ArrayView1<'_, f64>,
-) -> GeometryResult<f64> {
-    let metric = manifold.metric_tensor(point)?;
-    let metric_times_a = gam_linalg::faer_ndarray::fast_av(&metric.view(), &a);
-    metric_norm_from_product(a, metric_times_a.view())
-}
-
-/// Certify `sqrt(a^T G a)` once the metric product `G a` is available.
-///
-/// The absolute accumulation is part of the backward-error certificate.  It
-/// must itself remain finite: an infinite error scale would make every finite
-/// negative quadratic look like harmless roundoff and could certify a
-/// non-zero vector as having zero norm under an indefinite metric.
-fn metric_norm_from_product(
-    a: ArrayView1<'_, f64>,
-    metric_times_a: ArrayView1<'_, f64>,
-) -> GeometryResult<f64> {
-    check_len("metric norm product", metric_times_a.len(), a.len())?;
-    let mut squared_norm = 0.0_f64;
-    let mut absolute_sum = 0.0_f64;
-    for (&left, &right) in a.iter().zip(metric_times_a.iter()) {
-        let term = left * right;
-        squared_norm += term;
-        absolute_sum += term.abs();
-    }
-    if !squared_norm.is_finite() {
-        return Ok(f64::INFINITY);
-    }
-    if !absolute_sum.is_finite() {
-        return Err(crate::manifold::GeometryError::InvalidPoint(
-            "Riemannian metric norm error bound overflowed",
-        ));
-    }
-    // A Riemannian metric is positive definite. Permit only the backward-error
-    // band of the final dot product; clamping a materially negative quadratic
-    // to zero would falsely turn an indefinite metric into a stationary point.
-    // That band is Wilkinson's for this exact accumulation — both of its inputs,
-    // the term count and the absolute sum, are the loop's own state — so it is
-    // computed rather than guessed. A fixed multiple of EPSILON would be too
-    // tight on a high-dimensional tangent space, rejecting metrics whose
-    // squared norm is zero in exact arithmetic, and needlessly loose on a
-    // low-dimensional one.
-    let negative_roundoff = accumulation_band(a.len(), absolute_sum);
-    if squared_norm < -negative_roundoff {
-        return Err(crate::manifold::GeometryError::InvalidPoint(
-            "Riemannian metric produced a negative squared norm",
-        ));
-    }
-    Ok(squared_norm.max(0.0).sqrt())
-}
-
-/// Shift-invariant relative-gradient stationarity measure
-/// `‖grad_k‖_g / max(‖grad_0‖_g, 1)`, comparing the current Riemannian gradient
-/// norm to the gradient norm at the INITIAL iterate. The initial gradient norm
-/// carries the same *multiplicative* scale the objective and its gradient share
-/// (`f → c·f` ⇒ `grad → c·grad`), so a fixed `grad_tol` still reads as a
-/// *relative* tolerance — but, unlike dividing by `max(|f|, 1)`, `‖grad_0‖` is
-/// invariant under an additive shift `f → f + C`, which leaves the minimizers,
-/// gradient, trust-region model reduction, Armijo slope, and accepted path all
-/// unchanged. Dividing by `|f|` was non-invariant: a large additive constant
-/// inflates the denominator and can falsely certify convergence at a
-/// non-stationary iterate (e.g. `f̃(x) = C + x²` at `x = 1` with `C > 2/τ − 1`),
-/// issue #954. The `max(·, 1)` floor reduces this to the absolute test
-/// `‖grad_k‖ ≤ grad_tol` on a unit-scale objective and preserves the
-/// O(n)-gradient calibration of the profiled REML latent objective (whose
-/// `‖grad_0‖` is itself O(n), issue #879). The non-intrinsic `‖x‖_typ` factor is
-/// dropped: ambient iterate magnitude is not coordinate/chart invariant on a
-/// manifold, so it does not belong in a Riemannian stationarity test. A
-/// non-finite gradient maps to `+∞` so a blown-up iterate is never stationary.
-fn relative_stationarity(grad_norm: f64, grad0_norm: f64) -> f64 {
-    if !grad_norm.is_finite() || !grad0_norm.is_finite() {
-        return f64::INFINITY;
-    }
-    grad_norm / grad0_norm.max(1.0)
 }
 
 /// The context string of the trust-region first-order certificate, shared by the
@@ -194,46 +90,17 @@ impl Default for RiemannianTrustRegion {
 }
 
 impl RiemannianTrustRegion {
-    /// A genuine Riemannian trust-region method.
+    /// A Riemannian trust-region method on `manifold`.
     ///
-    /// At each iterate `x` we build the quadratic model in the tangent space
-    /// `T_xM`,
-    ///
-    /// ```text
-    ///   m(η) = f(x) + g_x(grad, η) + ½ g_x(η, Hη),
-    /// ```
-    ///
-    /// where `g_x(·,·)` is the manifold metric inner product and `H` is the
-    /// Riemannian Hessian (accessed only through Hessian–vector products). The
-    /// step is the (approximate) solution of the trust-region subproblem
-    ///
-    /// ```text
-    ///   min_{η ∈ T_xM, ‖η‖_g ≤ Δ}  m(η).
-    /// ```
-    ///
-    /// When the objective supplies Hessian–vector products AND the manifold's
-    /// `retract` is at least a second-order retraction
-    /// ([`RiemannianManifold::retraction_is_second_order`]) we solve the
-    /// subproblem with the Steihaug truncated-CG method (stopping at negative
-    /// curvature or the trust-region boundary). Otherwise — no curvature, or a
-    /// first-order retraction whose pullback second derivative is not the
-    /// Riemannian Hessian (issue #956) — we fall back to the Cauchy point: the
-    /// exact minimizer of the model along the steepest-descent direction within
-    /// the trust region (with curvature taken from the model where available,
-    /// and the boundary point of the decreasing linear model otherwise). The
-    /// linear term `Df_x[η]` is retraction-independent, so the Cauchy model
-    /// keeps ρ and the radius control valid along any retraction. Either way
-    /// this is a real model-based step — not clipped descent.
-    ///
-    /// We then form the ratio of actual to predicted reduction
-    ///
-    /// ```text
-    ///   ρ = (f(x) − f(x⁺)) / (m(0) − m(η)),
-    /// ```
-    ///
-    /// accept the step only when `ρ > η₁`, and adapt Δ: shrink on a poor ratio,
-    /// expand on an excellent ratio that reaches the boundary, otherwise hold.
-    /// Only accepted steps are retracted onto the manifold.
+    /// The method is `opt::RiemannianTrustRegion`, because general outer
+    /// optimizer work lives in `opt` (SPEC rule 24): a quadratic model in the
+    /// tangent space under the manifold metric, a Steihaug truncated-CG step when
+    /// the objective supplies Hessian–vector products and the manifold's
+    /// retraction is second-order ([`RiemannianManifold::retraction_is_second_order`]),
+    /// the Cauchy point otherwise (issue #956), and radius control from
+    /// `opt::TrustRegionPolicy::classic`. This type adapts a manifold and an
+    /// objective of this crate to it, and returns a point only when the
+    /// relative-gradient certificate holds.
     pub fn minimize(
         &self,
         manifold: &dyn RiemannianManifold,
@@ -244,7 +111,7 @@ impl RiemannianTrustRegion {
         if termination.certifies() {
             Ok(termination.point)
         } else {
-            Err(crate::manifold::GeometryError::NonConvergence {
+            Err(GeometryError::NonConvergence {
                 context: TRUST_REGION_RELATIVE_GRADIENT_CONTEXT,
                 iterations: termination.iterations,
                 residual: termination.residual,
@@ -263,318 +130,139 @@ impl RiemannianTrustRegion {
     /// with only a residual there is nothing to resume from. Genuine failures —
     /// a non-finite value, an invalid radius, an objective or manifold error —
     /// are still `Err` here; only the first-order test is demoted from an error
-    /// to a reported verdict, so `minimize` above reconstructs its own behavior
-    /// exactly and every existing caller is unaffected.
+    /// to a reported verdict.
     pub fn minimize_reporting_termination(
         &self,
         manifold: &dyn RiemannianManifold,
         objective: &mut dyn RiemannianObjective,
         initial: ArrayView1<'_, f64>,
     ) -> GeometryResult<TrustRegionTermination> {
-        // Trust-region acceptance and radius control come from `opt`, not
-        // from constants re-declared here. SPEC-22 puts general outer
-        // optimizer work in `opt`, and a trust-region rho-controller is
-        // exactly that: this loop's five constants were bit-for-bit the
-        // ones `TrustRegionPolicy::classic` already ships (accept 0.1,
-        // shrink below 0.25, expand above 0.75 at the boundary, x0.25,
-        // x2.0), so keeping a private copy bought nothing and gave the
-        // radius rule two places to drift apart.
-        let policy = TrustRegionPolicy::classic(self.max_radius);
-        let mut x = initial.to_owned();
-        let d = manifold.ambient_dim();
-        check_len("trust-region initial point", x.len(), d)?;
-        if !(self.radius.is_finite() && self.radius > 0.0) {
-            return Err(crate::manifold::GeometryError::InvalidPoint(
-                "trust-region radius must be finite and positive",
-            ));
-        }
-        if !(self.max_radius.is_finite() && self.max_radius > 0.0) {
-            return Err(crate::manifold::GeometryError::InvalidPoint(
-                "trust-region maximum radius must be finite and positive",
-            ));
-        }
-        if !(self.grad_tol.is_finite() && self.grad_tol >= 0.0) {
-            return Err(crate::manifold::GeometryError::InvalidPoint(
-                "trust-region gradient tolerance must be finite and non-negative",
-            ));
-        }
-
-        // Establish the trust-region invariant `0 < Δ_k ≤ Δmax` *before* the
-        // first step, not just on later expansions. The expansion rule below
-        // caps via `min(·, max_radius)` and contraction only shrinks, so once
-        // `0 < Δ₀ ≤ Δmax` holds we have `0 < Δ_k ≤ Δmax` for all `k` by
-        // induction; every subproblem then obeys `‖η_k‖_g ≤ Δ_k ≤ Δmax`,
-        // restoring `max_radius` as the documented hard cap. A configured
-        // `radius > max_radius` (or a non-finite `radius`) would otherwise let
-        // the very first Cauchy/Steihaug step overshoot the advertised maximum,
-        // so we clamp the initial radius into `(0, max_radius]` here.
-        let mut delta = self.radius.min(self.max_radius);
-
-        // Initial Riemannian gradient norm, captured on the first iteration and
-        // used as the shift-invariant scale in the relative stationarity test
-        // (see `relative_stationarity`).
-        let mut grad0_norm: Option<f64> = None;
-        let mut iterations = 0usize;
-
-        for _ in 0..self.max_iter {
-            let (f_curr, grad_e) = objective.value_gradient(x.view())?;
-            if !f_curr.is_finite() {
-                return Err(crate::manifold::GeometryError::InvalidPoint(
-                    "trust-region objective returned a non-finite value",
-                ));
-            }
-            iterations += 1;
-            // Raise the ambient Euclidean differential to the *Riemannian*
-            // gradient through the manifold metric. Merely projecting onto the
-            // tangent space is the Riemannian gradient only for the embedded
-            // (identity) metric; for a genuine metric (affine-invariant SPD,
-            // canonical Stiefel) it is the wrong direction, making the model
-            // linear term `g_x(grad, η)` not the differential `Df_x[η]` and the
-            // step not first-order correct (issue #955).
-            let grad = manifold.riemannian_gradient(x.view(), grad_e.view())?;
-            let grad_norm = g_norm(manifold, x.view(), grad.view())?;
-            // Shift-invariant (relative) stationarity test. Comparing the bare
-            // gradient norm to a fixed absolute `grad_tol` is mis-calibrated for
-            // objectives whose natural scale is large — e.g. the *profiled*
-            // Gaussian REML latent objective, whose `n·log σ̂²` term leaves
-            // `‖grad‖` at an O(n) magnitude even at a genuine stationary point
-            // near interpolation (issue #879). We instead test the dimensionless
-            // ratio `‖grad_k‖_g / max(‖grad_0‖_g, 1)`, where `‖grad_0‖_g` is the
-            // gradient norm at the initial iterate. It carries the same
-            // *multiplicative* scale the objective and its gradient share but is
-            // invariant under an additive shift `f → f + C` (unlike `max(|f|,1)`,
-            // which a large constant inflates into a false convergence, #954),
-            // and reduces to the absolute test on a unit-scale objective.
-            let grad0 = *grad0_norm.get_or_insert(grad_norm);
-            if relative_stationarity(grad_norm, grad0) <= self.grad_tol {
-                break;
-            }
-
-            // Solve the trust-region subproblem in T_xM.
-            let (step, predicted_reduction, hit_boundary) =
-                self.solve_subproblem(manifold, objective, x.view(), grad.view(), delta)?;
-
-            // A non-positive predicted reduction means the model offers no
-            // descent (e.g. a vanishing step); shrink and retry from the same
-            // point rather than dividing by ~0 in ρ.
-            if !(predicted_reduction > 0.0) {
-                delta *= policy.shrink_factor;
-                if delta <= self.grad_tol * self.grad_tol {
-                    break;
-                }
-                continue;
-            }
-
-            let trial_x = manifold.retract(x.view(), step.view())?;
-            let f_trial = objective.value_gradient(trial_x.view())?.0;
-            let actual_reduction = f_curr - f_trial;
-            // The step's length in the manifold metric — the same norm
-            // `hit_boundary` was decided in. `classic` sets no rejection
-            // step cap so the policy does not currently consult it, but
-            // handing it a placeholder would make the call a lie the day
-            // that changes.
-            let step_norm = g_inner(manifold, x.view(), step.view(), step.view())?
-                .max(0.0)
-                .sqrt();
-            // A non-finite trial value reaches the policy as a non-finite
-            // `actual_reduction`, which cannot clear `rho > eta_accept`, so
-            // the explicit `f_trial.is_finite()` conjunct the hand-rolled
-            // version carried is subsumed rather than dropped.
-            let tr = policy.update(
-                delta,
-                step_norm,
-                hit_boundary,
-                actual_reduction,
-                predicted_reduction,
-                f_curr,
-            );
-            delta = tr.new_radius;
-
-            // Accept only sufficiently-good steps; otherwise keep x (the next
-            // iteration recomputes f and the gradient at the retained point).
-            if tr.accepted {
-                x = trial_x;
-            }
-        }
-        // Returning a point is a mathematical claim: it must satisfy the same
-        // first-order certificate that controls the loop. Budget exhaustion,
-        // a collapsed radius, or a failed model step is not success merely
-        // because the last iterate is finite.
-        let (f_final, grad_e_final) = objective.value_gradient(x.view())?;
-        if !f_final.is_finite() {
-            return Err(crate::manifold::GeometryError::InvalidPoint(
-                "trust-region objective returned a non-finite terminal value",
-            ));
-        }
-        let grad_final = manifold.riemannian_gradient(x.view(), grad_e_final.view())?;
-        let grad_final_norm = g_norm(manifold, x.view(), grad_final.view())?;
-        let grad0 = grad0_norm.unwrap_or(grad_final_norm);
-        let residual = relative_stationarity(grad_final_norm, grad0);
+        let solver = opt::RiemannianTrustRegion {
+            radius: self.radius,
+            max_radius: self.max_radius,
+            max_iter: self.max_iter,
+            grad_tol: self.grad_tol,
+        };
+        let termination = solver
+            .minimize(
+                &ManifoldGeometry(manifold),
+                &mut ObjectiveCallbacks(objective),
+                initial,
+            )
+            .map_err(geometry_error)?;
         Ok(TrustRegionTermination {
-            point: x,
-            iterations,
-            residual,
-            tolerance: self.grad_tol,
+            point: termination.point,
+            iterations: termination.iterations,
+            residual: termination.residual,
+            tolerance: termination.tolerance,
         })
     }
+}
 
-    /// Solve `min_{‖η‖_g ≤ Δ} m(η)` and return `(η, m(0) − m(η), hit_boundary)`.
-    ///
-    /// Uses Steihaug truncated-CG when the objective provides Hessian–vector
-    /// products *and* the manifold's `retract` is at least a second-order
-    /// retraction ([`RiemannianManifold::retraction_is_second_order`]). When the
-    /// retraction is only first-order the Riemannian-Hessian quadratic term is
-    /// not the second derivative of `f∘R_x`, so scoring it would corrupt ρ
-    /// (issue #956); we then take the Cauchy point, whose linear model is
-    /// first-order correct along any retraction (as we also do when no curvature
-    /// is available).
-    fn solve_subproblem(
-        &self,
-        manifold: &dyn RiemannianManifold,
-        objective: &mut dyn RiemannianObjective,
-        x: ArrayView1<'_, f64>,
-        grad: ArrayView1<'_, f64>,
-        delta: f64,
-    ) -> GeometryResult<(Array1<f64>, f64, bool)> {
-        const BOUNDARY_FRAC: f64 = 0.9;
+/// A manifold of this crate as the geometry `opt`'s Riemannian trust region runs
+/// on. The metric product goes through the GPU-dispatched `fast_av`, as every
+/// metric inner product in this crate does.
+struct ManifoldGeometry<'a>(&'a dyn RiemannianManifold);
 
-        // Probe for curvature once: if the objective exposes no Hessian–vector
-        // product we take the Cauchy point.
-        let has_hessian = objective.hessian_vector_product(x, grad)?.is_some();
+impl opt::RiemannianGeometry for ManifoldGeometry<'_> {
+    type Error = GeometryError;
 
-        // The Riemannian-Hessian quadratic model `½ g_x(η, Hη)` is the correct
-        // second-order model of `f` along the trial path ONLY when that path is
-        // generated by the exponential map or another second-order retraction:
-        // for a first-order retraction `R_x` the pullback `f∘R_x` has a second
-        // derivative at `0` that is NOT the Riemannian Hessian, so scoring the
-        // curved model against `manifold.retract` corrupts ρ and the radius
-        // control (issue #956). The linear term `g_x(grad, η) = Df_x[η]` is
-        // retraction-independent, so the curvature-free Cauchy model stays
-        // first-order correct along ANY retraction. We therefore use the curved
-        // Steihaug truncated-CG step only when the objective supplies curvature
-        // AND the manifold's retraction is (at least) second-order; otherwise we
-        // take the Cauchy point — never asserting a second-order model the
-        // retraction cannot honor.
-        if !has_hessian || !manifold.retraction_is_second_order() {
-            return self.cauchy_point(manifold, x, grad, delta);
-        }
-
-        // --- Steihaug truncated-CG on the metric inner product. ---
-        // Solve min m(η) = g_x(grad, η) + ½ g_x(η, Hη) within ‖η‖_g ≤ Δ.
-        let n = grad.len();
-        let mut z = Array1::<f64>::zeros(n); // current iterate η
-        let mut r = grad.to_owned(); // residual = grad + Hz (z=0 ⇒ grad)
-        let mut p = -&r; // search direction
-        let r0_norm = g_norm(manifold, x, r.view())?;
-        let tol = (STEIHAUG_CG_FORCING_FACTOR * r0_norm).min(r0_norm * r0_norm);
-
-        // model reduction tracker m(0) − m(z); m(0) = 0 here (constant dropped).
-        // m(z) = g(grad,z) + ½ g(z,Hz); we recompute it at the end for ρ.
-        let max_cg = 2 * n + 1;
-        for _ in 0..max_cg {
-            let hp = objective.hessian_vector_product(x, p.view())?.ok_or(
-                crate::manifold::GeometryError::Unsupported(
-                    "Hessian–vector product became unavailable mid-subproblem",
-                ),
-            )?;
-            let php = g_inner(manifold, x, p.view(), hp.view())?;
-            if php <= 0.0 {
-                // Negative curvature: go to the boundary along p.
-                let (tau, _) = boundary_tau(manifold, x, z.view(), p.view(), delta)?;
-                let eta = &z + &(&p * tau);
-                let red = model_reduction(manifold, objective, x, grad, eta.view())?;
-                return Ok((eta, red, true));
-            }
-            let rr = g_inner(manifold, x, r.view(), r.view())?;
-            let alpha = rr / php;
-            let z_next = &z + &(&p * alpha);
-            if g_norm(manifold, x, z_next.view())? >= delta {
-                // Trust-region boundary crossed: step to it.
-                let (tau, _) = boundary_tau(manifold, x, z.view(), p.view(), delta)?;
-                let eta = &z + &(&p * tau);
-                let red = model_reduction(manifold, objective, x, grad, eta.view())?;
-                return Ok((eta, red, true));
-            }
-            z = z_next;
-            let r_next = &r + &(&hp * alpha);
-            let r_next_norm = g_norm(manifold, x, r_next.view())?;
-            if r_next_norm <= tol {
-                let red = model_reduction(manifold, objective, x, grad, z.view())?;
-                let hit = g_norm(manifold, x, z.view())? >= BOUNDARY_FRAC * delta;
-                return Ok((z, red, hit));
-            }
-            let rr_next = g_inner(manifold, x, r_next.view(), r_next.view())?;
-            let beta = rr_next / rr;
-            p = &(-&r_next) + &(&p * beta);
-            r = r_next;
-        }
-        let red = model_reduction(manifold, objective, x, grad, z.view())?;
-        let hit = g_norm(manifold, x, z.view())? >= BOUNDARY_FRAC * delta;
-        Ok((z, red, hit))
+    fn ambient_dim(&self) -> usize {
+        self.0.ambient_dim()
     }
 
-    /// Cauchy point: the exact minimizer of the model along the steepest-descent
-    /// direction `−grad` within the trust region. With no curvature available
-    /// the model is the decreasing linear `m(τ·(−grad)) = −τ‖grad‖²_g`, whose
-    /// constrained minimizer sits on the boundary `τ = Δ / ‖grad‖_g`, giving a
-    /// predicted reduction `Δ·‖grad‖_g`.
-    fn cauchy_point(
+    fn riemannian_gradient(
         &self,
-        manifold: &dyn RiemannianManifold,
-        x: ArrayView1<'_, f64>,
-        grad: ArrayView1<'_, f64>,
-        delta: f64,
-    ) -> GeometryResult<(Array1<f64>, f64, bool)> {
-        let grad_norm = g_norm(manifold, x, grad.view())?;
-        if grad_norm <= 0.0 {
-            return Ok((Array1::<f64>::zeros(grad.len()), 0.0, false));
-        }
-        let tau = delta / grad_norm;
-        let step = &grad.to_owned() * (-tau);
-        // Predicted reduction of the linear model m(0) − m(η) = τ‖grad‖²_g.
-        let predicted = tau * grad_norm * grad_norm;
-        Ok((step, predicted, true))
+        point: ArrayView1<'_, f64>,
+        differential: ArrayView1<'_, f64>,
+    ) -> GeometryResult<Array1<f64>> {
+        self.0.riemannian_gradient(point, differential)
+    }
+
+    fn metric_product(
+        &self,
+        point: ArrayView1<'_, f64>,
+        tangent: ArrayView1<'_, f64>,
+    ) -> GeometryResult<Array1<f64>> {
+        let metric = self.0.metric_tensor(point)?;
+        check_len("metric product tangent", tangent.len(), metric.ncols())?;
+        Ok(fast_av(&metric.view(), &tangent))
+    }
+
+    fn retract(
+        &self,
+        point: ArrayView1<'_, f64>,
+        tangent: ArrayView1<'_, f64>,
+    ) -> GeometryResult<Array1<f64>> {
+        self.0.retract(point, tangent)
+    }
+
+    fn retraction_is_second_order(&self) -> bool {
+        self.0.retraction_is_second_order()
     }
 }
 
-/// Largest `τ ≥ 0` with `‖z + τ p‖_g = Δ`, solving the quadratic
-/// `‖p‖²_g τ² + 2 g(z,p) τ + (‖z‖²_g − Δ²) = 0`. Returns `(τ, ‖z + τp‖_g)`.
-fn boundary_tau(
-    manifold: &dyn RiemannianManifold,
-    x: ArrayView1<'_, f64>,
-    z: ArrayView1<'_, f64>,
-    p: ArrayView1<'_, f64>,
-    delta: f64,
-) -> GeometryResult<(f64, f64)> {
-    let pp = g_inner(manifold, x, p, p)?;
-    let zp = g_inner(manifold, x, z, p)?;
-    let zz = g_inner(manifold, x, z, z)?;
-    if pp <= 0.0 {
-        return Ok((0.0, zz.max(0.0).sqrt()));
+/// An objective of this crate as `opt`'s Riemannian objective.
+struct ObjectiveCallbacks<'a, 'o>(&'a mut (dyn RiemannianObjective + 'o));
+
+impl opt::RiemannianObjective<GeometryError> for ObjectiveCallbacks<'_, '_> {
+    fn value_gradient(&mut self, point: ArrayView1<'_, f64>) -> GeometryResult<(f64, Array1<f64>)> {
+        self.0.value_gradient(point)
     }
-    let c = zz - delta * delta;
-    let disc = (zp * zp - pp * c).max(0.0);
-    let tau = (-zp + disc.sqrt()) / pp;
-    let tau = tau.max(0.0);
-    Ok((tau, delta))
+
+    fn hessian_vector_product(
+        &mut self,
+        point: ArrayView1<'_, f64>,
+        tangent: ArrayView1<'_, f64>,
+    ) -> GeometryResult<Option<Array1<f64>>> {
+        self.0.hessian_vector_product(point, tangent)
+    }
 }
 
-/// Model reduction `m(0) − m(η) = −g(grad, η) − ½ g(η, Hη)`.
-fn model_reduction(
-    manifold: &dyn RiemannianManifold,
-    objective: &mut dyn RiemannianObjective,
-    x: ArrayView1<'_, f64>,
-    grad: ArrayView1<'_, f64>,
-    eta: ArrayView1<'_, f64>,
-) -> GeometryResult<f64> {
-    let lin = g_inner(manifold, x, grad, eta)?;
-    let heta = objective.hessian_vector_product(x, eta)?.ok_or(
-        crate::manifold::GeometryError::Unsupported(
+/// The trust region's refusals in this crate's error vocabulary, with the
+/// messages this crate has always reported for them.
+fn geometry_error(error: opt::RiemannianTrustRegionError<GeometryError>) -> GeometryError {
+    use opt::RiemannianTrustRegionError as Refusal;
+    match error {
+        Refusal::Callback(inner) => inner,
+        Refusal::InitialPointLength { expected, got } => GeometryError::DimensionMismatch {
+            context: "trust-region initial point",
+            expected,
+            got,
+        },
+        Refusal::InvalidRadius => {
+            GeometryError::InvalidPoint("trust-region radius must be finite and positive")
+        }
+        Refusal::InvalidMaxRadius => {
+            GeometryError::InvalidPoint("trust-region maximum radius must be finite and positive")
+        }
+        Refusal::InvalidGradientTolerance => GeometryError::InvalidPoint(
+            "trust-region gradient tolerance must be finite and non-negative",
+        ),
+        Refusal::NonFiniteValue => {
+            GeometryError::InvalidPoint("trust-region objective returned a non-finite value")
+        }
+        Refusal::NonFiniteTerminalValue => GeometryError::InvalidPoint(
+            "trust-region objective returned a non-finite terminal value",
+        ),
+        Refusal::MetricBoundOverflow => {
+            GeometryError::InvalidPoint("Riemannian metric norm error bound overflowed")
+        }
+        Refusal::IndefiniteMetric => {
+            GeometryError::InvalidPoint("Riemannian metric produced a negative squared norm")
+        }
+        Refusal::MetricProductLength { expected, got } => GeometryError::DimensionMismatch {
+            context: "metric norm product",
+            expected,
+            got,
+        },
+        Refusal::CurvatureWithdrawnMidSubproblem => GeometryError::Unsupported(
+            "Hessian–vector product became unavailable mid-subproblem",
+        ),
+        Refusal::CurvatureWithdrawnWhileScoring => GeometryError::Unsupported(
             "Hessian–vector product unavailable while scoring the model",
         ),
-    )?;
-    let quad = g_inner(manifold, x, eta, heta.view())?;
-    Ok(-lin - 0.5 * quad)
+    }
 }
 
 #[cfg(test)]
@@ -849,10 +537,106 @@ mod tests {
         // The signed quadratic cancels to zero in this order, while the sum of
         // absolute terms overflows. Treating an infinite backward-error band
         // as a valid tolerance would turn this indefinite quadratic into a
-        // zero norm and falsely certify stationarity.
-        let vector = ndarray::array![1.0, 1.0, 1.0, 1.0];
-        let metric_product = ndarray::array![9.0e307, -9.0e307, 9.0e307, -9.0e307];
-        let error = metric_norm_from_product(vector.view(), metric_product.view())
+        // zero norm and falsely certify stationarity. The alternating metric
+        // ±9e307 applied to an all-ones Riemannian gradient produces exactly that
+        // product, [9e307, −9e307, 9e307, −9e307], at the first certificate.
+        struct OverflowingMetric;
+
+        impl RiemannianManifold for OverflowingMetric {
+            fn dim(&self) -> usize {
+                4
+            }
+
+            fn tangent_basis(&self, point: ArrayView1<'_, f64>) -> GeometryResult<Array2<f64>> {
+                assert_eq!(point.len(), 4, "OverflowingMetric points are four-dimensional");
+                Ok(Array2::eye(4))
+            }
+
+            fn exp_map(
+                &self,
+                point: ArrayView1<'_, f64>,
+                tangent_vec: ArrayView1<'_, f64>,
+            ) -> GeometryResult<Array1<f64>> {
+                Ok(&point.to_owned() + &tangent_vec)
+            }
+
+            fn log_map(
+                &self,
+                p_from: ArrayView1<'_, f64>,
+                p_to: ArrayView1<'_, f64>,
+            ) -> GeometryResult<Array1<f64>> {
+                Ok(&p_to.to_owned() - &p_from)
+            }
+
+            fn parallel_transport(
+                &self,
+                point_along: ArrayView2<'_, f64>,
+                vec: ArrayView1<'_, f64>,
+            ) -> GeometryResult<Array1<f64>> {
+                assert_eq!(
+                    point_along.ncols(),
+                    4,
+                    "OverflowingMetric transport paths are four-dimensional"
+                );
+                Ok(vec.to_owned())
+            }
+
+            fn metric_tensor(&self, point: ArrayView1<'_, f64>) -> GeometryResult<Array2<f64>> {
+                assert_eq!(point.len(), 4, "OverflowingMetric points are four-dimensional");
+                Ok(Array2::from_diag(&ndarray::array![
+                    9.0e307, -9.0e307, 9.0e307, -9.0e307
+                ]))
+            }
+
+            fn sectional_curvature(
+                &self,
+                point: ArrayView1<'_, f64>,
+                tangent_pair: (ArrayView1<'_, f64>, ArrayView1<'_, f64>),
+            ) -> GeometryResult<f64> {
+                assert_eq!(point.len(), 4, "OverflowingMetric points are four-dimensional");
+                assert_eq!(
+                    tangent_pair.0.len(),
+                    4,
+                    "OverflowingMetric tangents are four-dimensional"
+                );
+                assert_eq!(
+                    tangent_pair.1.len(),
+                    4,
+                    "OverflowingMetric tangents are four-dimensional"
+                );
+                Ok(0.0)
+            }
+
+            fn riemannian_gradient(
+                &self,
+                point: ArrayView1<'_, f64>,
+                euclidean_grad: ArrayView1<'_, f64>,
+            ) -> GeometryResult<Array1<f64>> {
+                assert_eq!(point.len(), 4, "OverflowingMetric points are four-dimensional");
+                assert_eq!(
+                    euclidean_grad.len(),
+                    4,
+                    "OverflowingMetric gradients are four-dimensional"
+                );
+                Ok(Array1::ones(4))
+            }
+        }
+
+        struct Flat;
+
+        impl RiemannianObjective for Flat {
+            fn value_gradient(
+                &mut self,
+                point: ArrayView1<'_, f64>,
+            ) -> GeometryResult<(f64, Array1<f64>)> {
+                assert_eq!(point.len(), 4, "Flat is four-dimensional");
+                Ok((0.0, Array1::ones(4)))
+            }
+        }
+
+        let x0 = Array1::zeros(4);
+        let error = RiemannianTrustRegion::default()
+            .minimize(&OverflowingMetric, &mut Flat, x0.view())
             .expect_err("an overflowed norm error bound must be rejected");
         assert!(matches!(
             error,
