@@ -86,8 +86,6 @@ const MAX_PERIODIC_BASIS: usize = 20;
 /// Open-interval internal-knot bounds.
 const MIN_OPEN_INTERNAL_KNOTS: usize = 4;
 const MAX_OPEN_INTERNAL_KNOTS: usize = 12;
-/// Dense grid used for the fold / orientation check of `h′`.
-const FOLD_CHECK_GRID: usize = 512;
 /// Default evaluation grid for the composition-law defect.
 pub const DEFAULT_COMPOSITION_GRID: usize = 256;
 
@@ -591,7 +589,8 @@ pub struct FittedTransport {
     /// Whether `h` is compatible with both chart topologies: a degree-±1
     /// circle cover without folds, or a fold-free interval homeomorphism.
     pub topology_preserved: bool,
-    /// `min over a dense grid of orientation·h′(t)`; positive ⇔ no folds.
+    /// Exact minimum of `orientation·h′(t)` over the source domain, taken per
+    /// knot span where `h′` is a known-degree polynomial; positive ⇔ no folds.
     pub min_directional_derivative: f64,
     /// RMS of the response residuals at the fitted map.
     pub residual_rms: f64,
@@ -674,9 +673,9 @@ impl FittedTransport {
     /// domain, returning the certified orientation (+1 increasing, −1
     /// decreasing) or an `Err` describing where monotonicity fails.
     ///
-    /// Unlike [`Self::topology_preserved`], which only samples `h′` on a fixed
-    /// 512-point grid and so can miss a fold *between* grid samples, this is a
-    /// span-exact certificate. On each knot span `h′` is a single polynomial of
+    /// This reads the same exact minimum the fit publishes as
+    /// [`FittedTransport::min_directional_derivative`], and from which it derives
+    /// [`FittedTransport::topology_preserved`]. On each knot span `h′` is a single polynomial of
     /// degree `d = `[`DomainBasis::derivative_poly_degree`]` (cubic spline ⇒
     /// quadratic). A degree-`d` polynomial is determined by `d + 1` samples, so
     /// per span we evaluate `h′` at `d + 1` equally-spaced abscissae, reconstruct
@@ -688,6 +687,25 @@ impl FittedTransport {
     /// the reconstruction is verified against an independent interior sample;
     /// any mismatch falls back to refusing the span.
     fn certify_strict_monotonicity(&self) -> Result<f64, String> {
+        let (orientation, minimum, argmin) = self.exact_minimum_oriented_derivative()?;
+        if !(minimum > 0.0) {
+            return Err(format!(
+                "transport map is not strictly monotone: orientation·h′ = {minimum} ≤ 0 at \
+                 t = {argmin}"
+            ));
+        }
+        Ok(orientation)
+    }
+
+    /// The exact minimum of `orientation·h′` over the source domain, with the
+    /// orientation (+1 increasing, −1 decreasing, read off the pre-wrap map's
+    /// endpoints) and the coordinate where the minimum sits. Each knot span holds
+    /// one known-degree polynomial piece, reconstructed from `d + 1` samples, so
+    /// the span minimum is at a span endpoint or an interior critical point. Folds
+    /// are reported through a non-positive minimum, not an error. An error means
+    /// a span could not be reconstructed as a polynomial of the assumed degree,
+    /// or `h′` was not finite there.
+    fn exact_minimum_oriented_derivative(&self) -> Result<(f64, f64, f64), String> {
         let (lo, hi) = match self.topology_from {
             ChartTopology::Circle => (0.0, TAU),
             ChartTopology::Interval { lo, hi } => (lo, hi),
@@ -700,6 +718,8 @@ impl FittedTransport {
 
         let deg = self.basis.derivative_poly_degree().max(1);
         let breaks = self.basis.derivative_breakpoints();
+        let mut minimum = f64::INFINITY;
+        let mut argmin = lo;
         // Restrict the breakpoints to the active domain (the periodic segment
         // grid already coincides with `[lo, hi]`).
         for window in breaks.windows(2) {
@@ -755,33 +775,37 @@ impl FittedTransport {
                 ));
             }
 
-            // Require positivity at the closed-span endpoints.
-            for &edge in &[a, b] {
-                let u = (edge - nodes[0]) / step;
-                let v = eval_monomial(&coeffs, u);
-                if !(v > 0.0) {
-                    return Err(format!(
-                        "transport map is not strictly monotone: orientation·h′ = {v} ≤ 0 at \
-                         t = {edge}"
-                    ));
-                }
-            }
-            // Require positivity at every interior critical point of the
-            // polynomial within the span.
+            // The piece's minimum over the closed span is at an endpoint or at an
+            // interior critical point.
+            let mut candidates: Vec<(f64, f64)> = [a, b]
+                .iter()
+                .map(|&edge| (edge, eval_monomial(&coeffs, (edge - nodes[0]) / step)))
+                .collect();
             for u_crit in monomial_critical_points(&coeffs) {
                 let t_crit = nodes[0] + u_crit * step;
                 if t_crit > a && t_crit < b {
-                    let v = eval_monomial(&coeffs, u_crit);
-                    if !(v > 0.0) {
-                        return Err(format!(
-                            "transport map folds: orientation·h′ = {v} ≤ 0 at interior \
-                             extremum t = {t_crit}"
-                        ));
-                    }
+                    candidates.push((t_crit, eval_monomial(&coeffs, u_crit)));
+                }
+            }
+            for (t_candidate, value) in candidates {
+                if !value.is_finite() {
+                    return Err(format!(
+                        "transport monotonicity certificate met a non-finite orientation·h′ at \
+                         t = {t_candidate}"
+                    ));
+                }
+                if value < minimum {
+                    minimum = value;
+                    argmin = t_candidate;
                 }
             }
         }
-        Ok(orientation)
+        if !minimum.is_finite() {
+            return Err(
+                "transport monotonicity certificate found no knot span to certify".to_string(),
+            );
+        }
+        Ok((orientation, minimum, argmin))
     }
 
     /// Invert the transport: for each target-chart coordinate `y`, return the
@@ -929,7 +953,7 @@ pub struct LayerTransportReport {
     pub isometry_defect: f64,
     /// Delta-method SE of the isometry defect.
     pub isometry_defect_se: f64,
-    /// Fold diagnostic: min of orientation·h′ over a dense grid.
+    /// Fold diagnostic: exact minimum of orientation·h′ over the source domain.
     pub min_directional_derivative: f64,
     /// EDF of the REML transport smooth.
     pub transport_edf: f64,
@@ -1073,33 +1097,12 @@ pub fn fit_transport_map(
     grad.mapv_inplace(|v| v / n as f64);
     let isometry_defect_se = grad.dot(&fit.covariance.dot(&grad)).max(0.0).sqrt();
 
-    // --- fold / orientation check on a dense grid ---------------------------
-    let grid = domain_grid(topology_from, FOLD_CHECK_GRID);
-    let grid_deriv = basis
-        .derivative_rows(grid.view())?
-        .dot(&fit.beta)
-        .mapv(|v| v + slope);
-    let orientation = if slope != 0.0 {
-        slope.signum()
-    } else {
-        let mean = grid_deriv.iter().sum::<f64>() / grid_deriv.len() as f64;
-        if mean < 0.0 { -1.0 } else { 1.0 }
-    };
-    let min_directional_derivative = grid_deriv
-        .iter()
-        .map(|&v| orientation * v)
-        .fold(f64::INFINITY, f64::min);
-    let topology_preserved = match (topology_from, topology_to) {
-        (ChartTopology::Circle, ChartTopology::Circle) => {
-            matches!(degree, Some(1) | Some(-1)) && min_directional_derivative > 0.0
-        }
-        (ChartTopology::Interval { .. }, ChartTopology::Interval { .. }) => {
-            min_directional_derivative > 0.0
-        }
-        _ => false,
-    };
-
-    Ok(FittedTransport {
+    // --- fold / orientation certificate --------------------------------------
+    // `h′` is a known-degree polynomial on each knot span, so its minimum over
+    // the source domain is exact. The published fold diagnostic and the
+    // topology verdict both read that minimum; a sampled grid can pass over a
+    // fold between its samples.
+    let mut fitted = FittedTransport {
         topology_from,
         topology_to,
         degree,
@@ -1113,12 +1116,24 @@ pub fn fit_transport_map(
         n_obs: n,
         isometry_defect: defect,
         isometry_defect_se,
-        topology_preserved,
-        min_directional_derivative,
+        topology_preserved: false,
+        min_directional_derivative: f64::NAN,
         residual_rms: fit.residual_rms,
         basis,
         coefficient_score_influence: fit.coefficient_score_influence,
-    })
+    };
+    let min_directional_derivative = fitted.exact_minimum_oriented_derivative()?.1;
+    fitted.min_directional_derivative = min_directional_derivative;
+    fitted.topology_preserved = match (topology_from, topology_to) {
+        (ChartTopology::Circle, ChartTopology::Circle) => {
+            matches!(degree, Some(1) | Some(-1)) && min_directional_derivative > 0.0
+        }
+        (ChartTopology::Interval { .. }, ChartTopology::Interval { .. }) => {
+            min_directional_derivative > 0.0
+        }
+        _ => false,
+    };
+    Ok(fitted)
 }
 
 /// Estimate the transport map between two layers and package the evidence.
@@ -1745,16 +1760,7 @@ mod invert_tests {
         for (actual, expected) in design.dot(&beta).iter().zip(target.iter()) {
             assert!((actual - expected).abs() <= tolerance, "fixture interpolation");
         }
-        let derivative = basis
-            .derivative_rows(domain_grid(interval(lo, hi), FOLD_CHECK_GRID).view())
-            .expect("fixture derivative")
-            .dot(&beta);
-        let orientation = (target[target.len() - 1] - target[0]).signum();
-        let min_directional_derivative = derivative
-            .iter()
-            .map(|slope| orientation * slope)
-            .fold(f64::INFINITY, f64::min);
-        FittedTransport {
+        let mut fitted = FittedTransport {
             topology_from: interval(lo, hi),
             topology_to: interval(lo, hi),
             degree: None,
@@ -1768,30 +1774,38 @@ mod invert_tests {
             n_obs: from.len(),
             isometry_defect: 0.0,
             isometry_defect_se: 0.0,
-            topology_preserved: min_directional_derivative > 0.0,
-            min_directional_derivative,
+            topology_preserved: false,
+            min_directional_derivative: f64::NAN,
             residual_rms: 0.0,
             coefficient_score_influence: Array2::<f64>::zeros((m, from.len())),
             basis,
-        }
+        };
+        let min_directional_derivative = fitted
+            .exact_minimum_oriented_derivative()
+            .expect("fixture exact fold minimum")
+            .1;
+        fitted.min_directional_derivative = min_directional_derivative;
+        fitted.topology_preserved = min_directional_derivative > 0.0;
+        fitted
     }
 
     /// Reviewer's between-grid fold reproducer: h(t) = (t−0.5)³/3 − (0.4/511)²·t
-    /// hides a narrow fold between the 512-point certification-grid samples.
-    /// `topology_preserved` (the sampled diagnostic) reads true, yet a dense
-    /// grid finds orientation·h′ < 0 — the span-exact certificate that `invert`
-    /// now gates on must reject the fit.
+    /// hides a narrow fold between the samples of a 512-point grid, which is the
+    /// grid the fold diagnostic used to be sampled on. That sampled minimum reads
+    /// positive while a 10× denser grid finds orientation·h′ < 0. The published
+    /// diagnostic is now the exact span minimum, so it must read the fold, the
+    /// topology verdict must be false, and `invert` must still refuse.
     #[test]
     fn invert_rejects_between_grid_fold() {
         let n = 256;
         let from: Array1<f64> = Array1::from_iter((0..n).map(|i| i as f64 / (n as f64 - 1.0)));
         let eps = 0.4 / 511.0;
         let target: Array1<f64> = from.mapv(|t| (t - 0.5).powi(3) / 3.0 - eps * eps * t);
-        let mut ft = fitted_from_target(from.view(), target.view(), 0.0, 1.0);
+        let ft = fitted_from_target(from.view(), target.view(), 0.0, 1.0);
 
-        // Confirm the fold is genuinely between the 512-pt certification grid:
-        // recompute the sampled diagnostic the production fit uses.
-        let grid = domain_grid(interval(0.0, 1.0), FOLD_CHECK_GRID);
+        // Confirm the fold is genuinely between the samples of the historical
+        // 512-point grid, and exposed by a 10× denser one.
+        let grid = domain_grid(interval(0.0, 1.0), 512);
         let grid_d = ft.derivative(grid.view()).expect("grid deriv");
         let mean = grid_d.iter().sum::<f64>() / grid_d.len() as f64;
         let orientation = if mean < 0.0 { -1.0 } else { 1.0 };
@@ -1806,12 +1820,20 @@ mod invert_tests {
             .iter()
             .map(|&v| orientation * v)
             .fold(f64::INFINITY, f64::min);
-        ft.topology_preserved = min_grid > 0.0;
-        ft.min_directional_derivative = min_grid;
         assert!(
             min_grid > 0.0 && min_dense < 0.0,
             "fixture must hide a between-grid fold: min on 512-grid={min_grid}, \
              min on dense grid={min_dense}"
+        );
+        // The published diagnostic is the exact minimum, so it cannot pass over
+        // the fold the sampled grid missed.
+        assert!(
+            ft.min_directional_derivative < 0.0 && !ft.topology_preserved,
+            "exact fold diagnostic must read the between-grid fold: \
+             min_directional_derivative={}, topology_preserved={}, min on 512-grid={min_grid}, \
+             min on dense grid={min_dense}",
+            ft.min_directional_derivative,
+            ft.topology_preserved
         );
 
         // The span-exact certificate must reject it even though the sampled
