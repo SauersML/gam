@@ -1817,5 +1817,36 @@
     ],
     "reason": "Completes the fix-forward for main's compile break. c4c012c93 deleted families/gpu.rs and gpu_kernel.rs and recorded the ledger, but its landing script dropped the four edited files. families/mod.rs still declared both modules (file not found), and raw_block_rows and apply_analytic_penalty were still dead. This push lands those four files: the mod lines, raw_block_rows, apply_analytic_penalty and the prelude import only it used.",
     "evidence": "The four blobs are byte-identical (md5) to the candidate that compiled workspace-wide over 5e967c204 (MSI job 424523, rc 0); none of those paths changed between 48ee099d4 and this base. The two identities are the guard's own output for that candidate."
+  },
+  {
+    "base": "b30862c09e58ba82283bd209731a846edc71469a",
+    "items": [
+      "crates/gam-sae/src/candidate_index.rs:const:SKETCH_PROJECTION_SALT",
+      "crates/gam-sae/src/candidate_index.rs:enum:MissReason",
+      "crates/gam-sae/src/candidate_index.rs:fn:alignment",
+      "crates/gam-sae/src/candidate_index.rs:fn:atom_bucket_sketches",
+      "crates/gam-sae/src/candidate_index.rs:fn:atom_sketch",
+      "crates/gam-sae/src/candidate_index.rs:fn:brute_force_top_s",
+      "crates/gam-sae/src/candidate_index.rs:fn:from_decoder_blocks",
+      "crates/gam-sae/src/candidate_index.rs:fn:in_range_component",
+      "crates/gam-sae/src/candidate_index.rs:fn:mat_vec",
+      "crates/gam-sae/src/candidate_index.rs:fn:normalize_in_place",
+      "crates/gam-sae/src/candidate_index.rs:fn:num_atoms",
+      "crates/gam-sae/src/candidate_index.rs:fn:orthonormal_frame",
+      "crates/gam-sae/src/candidate_index.rs:fn:output_dim",
+      "crates/gam-sae/src/candidate_index.rs:fn:project_direction",
+      "crates/gam-sae/src/candidate_index.rs:fn:proposal_recall_report",
+      "crates/gam-sae/src/candidate_index.rs:fn:query_sketch",
+      "crates/gam-sae/src/candidate_index.rs:fn:recall_report",
+      "crates/gam-sae/src/candidate_index.rs:fn:routability_shortlist_size",
+      "crates/gam-sae/src/candidate_index.rs:fn:sketch_dim",
+      "crates/gam-sae/src/candidate_index.rs:fn:sublinearity_ratio",
+      "crates/gam-sae/src/candidate_index.rs:struct:ProposalRecallReport",
+      "crates/gam-sae/src/candidate_index.rs:struct:RandomProjectionFrameSketch",
+      "crates/gam-sae/src/candidate_index.rs:struct:RecallMiss",
+      "crates/gam-sae/src/candidate_index.rs:struct:RecallReport"
+    ],
+    "reason": "user directive: delete all useless slop (only used by tests / unused)",
+    "evidence": "At b30862c09, git grep -nw over crates, src, tests, examples, bench and benches found no caller of RandomProjectionFrameSketch, from_decoder_blocks, routability_shortlist_size, recall_report, proposal_recall_report or any of the report types: each is named only by its own definition, error strings, doc links or prose. The rest were reachable only through them: brute_force_top_s (called only by proposal_recall_report); RecallReport, ProposalRecallReport, RecallMiss, MissReason and both sublinearity_ratio methods (produced only by the two reports); in_range_component and the sketch's AtomFrameSketch impl methods (alignment, atom_bucket_sketches, atom_sketch, num_atoms, output_dim, project_direction, query_sketch, sketch_dim) on the deleted type; and the private orthonormal_frame, mat_vec, normalize_in_place and SKETCH_PROJECTION_SALT only the sketch used. The AtomFrameSketch trait, SaeCandidateIndex and propose stay (encode.rs uses them). No test called any item. MSI verification (ban scanner, workspace --all-targets check, cargo doc -p gam-sae, guard and census) runs on the landed sha."
   }
 ]
