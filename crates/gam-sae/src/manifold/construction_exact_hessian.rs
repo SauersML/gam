@@ -4615,8 +4615,9 @@ impl SaeManifoldTerm {
 
     /// #2267 — price ONE step of the dense exact-stationarity route BEFORE paying
     /// for it, by timing what the materialization will perform: its per-state
-    /// plans once, and one planned apply times its `slots + k` probes (#2731; the
-    /// column loop the numbers below were measured on performed `dim` applies).
+    /// plans once, and one planned apply per batch of its `slots + k` probes, which
+    /// run in batches of the pool width (#2731; the column loop the numbers below
+    /// were measured on performed `dim` applies one at a time).
     ///
     /// This is a FORECAST, not a bar. It exists because the two candidate
     /// denominations for a size predicate on this route were both unsupported:
@@ -4682,16 +4683,19 @@ impl SaeManifoldTerm {
                     .to_string(),
             );
         }
-        // The probe count `materialize_exact_hessian_dense` performs: one probe per
-        // coordinate slot of the widest row, one per border column.
+        // The probe batches `materialize_exact_hessian_dense` performs: one probe per
+        // coordinate slot of the widest row and one per border column, run in
+        // batches of the pool width. A batch cannot finish before one of its applies
+        // does, so one apply per batch keeps this a lower bound on the pooled build.
         let slots = (0..cache.n_rows())
             .map(|row| cache.row_offsets[row + 1] - cache.row_offsets[row])
             .max()
             .unwrap_or(0);
-        let probes = slots + k;
+        let pool_threads = rayon::current_num_threads().max(1);
+        let batches = slots.div_ceil(pool_threads) + k.div_ceil(pool_threads);
         Ok((
             dim,
-            prepare_elapsed + per_apply.saturating_mul(probes.max(1) as u32),
+            prepare_elapsed + per_apply.saturating_mul(batches.max(1) as u32),
         ))
     }
 
@@ -4774,36 +4778,55 @@ impl SaeManifoldTerm {
         // contracted here once, where every probe used to rebuild them.
         let residual = self.prepare_residual_curvature_rows(target, cache)?;
         let mut a = Array2::<f64>::zeros((dim, dim));
-        let mut unit = SaeArrowVector {
-            t: Array1::<f64>::zeros(total_t),
-            beta: Array1::<f64>::zeros(k),
-        };
-        for slot in 0..slots {
-            unit.t.fill(0.0);
-            for row in 0..n_rows {
-                let (start, end) = (offsets[row], offsets[row + 1]);
-                if start + slot < end {
-                    unit.t[start + slot] = 1.0;
-                }
-            }
-            let mut av = self.apply_exact_hessian_prepared(
-                rho, target, cache, &unit, &prepared, &residual,
-            )?;
-            for (coefficient, carrier) in &mass_carriers {
-                let projection = carrier
-                    .iter()
-                    .map(|&(index, value)| value * unit.t[index])
-                    .sum::<f64>();
-                for &(index, value) in carrier {
-                    av.t[index] -= coefficient * value * projection;
-                }
-            }
-            for row in 0..n_rows {
-                let (start, end) = (offsets[row], offsets[row + 1]);
-                if start + slot < end {
-                    let col = start + slot;
-                    for i in start..end {
-                        a[[i, col]] = av.t[i];
+        // #2731 — every probe is an independent apply of one fixed operator against
+        // plans prepared once for this state, so the probes run on the rayon pool.
+        // Columns are written serially in probe order: `a` is bit-identical to the
+        // one-probe-at-a-time loop, and the first failing probe's error is the one
+        // returned. Probes run in batches of the pool width, so at most one batch of
+        // `dim`-length columns is held beside `a`. Job 391502 read 290 probes of
+        // 699–827 ms each per polish step at `p = 2048, charts = 32`, on one core.
+        use rayon::prelude::*;
+        let pool_threads = rayon::current_num_threads().max(1);
+        for batch_start in (0..slots).step_by(pool_threads) {
+            let batch_end = (batch_start + pool_threads).min(slots);
+            let columns: Vec<Result<SaeArrowVector, String>> = (batch_start..batch_end)
+                .into_par_iter()
+                .map(|slot| -> Result<SaeArrowVector, String> {
+                    let mut unit = SaeArrowVector {
+                        t: Array1::<f64>::zeros(total_t),
+                        beta: Array1::<f64>::zeros(k),
+                    };
+                    for row in 0..n_rows {
+                        let (start, end) = (offsets[row], offsets[row + 1]);
+                        if start + slot < end {
+                            unit.t[start + slot] = 1.0;
+                        }
+                    }
+                    let mut av = self.apply_exact_hessian_prepared(
+                        rho, target, cache, &unit, &prepared, &residual,
+                    )?;
+                    for (coefficient, carrier) in &mass_carriers {
+                        let projection = carrier
+                            .iter()
+                            .map(|&(index, value)| value * unit.t[index])
+                            .sum::<f64>();
+                        for &(index, value) in carrier {
+                            av.t[index] -= coefficient * value * projection;
+                        }
+                    }
+                    Ok(av)
+                })
+                .collect();
+            for (offset, av) in columns.into_iter().enumerate() {
+                let av = av?;
+                let slot = batch_start + offset;
+                for row in 0..n_rows {
+                    let (start, end) = (offsets[row], offsets[row + 1]);
+                    if start + slot < end {
+                        let col = start + slot;
+                        for i in start..end {
+                            a[[i, col]] = av.t[i];
+                        }
                     }
                 }
             }
@@ -4815,20 +4838,31 @@ impl SaeManifoldTerm {
                 }
             }
         }
-        unit.t.fill(0.0);
-        for j in 0..k {
-            unit.beta.fill(0.0);
-            unit.beta[j] = 1.0;
-            let av = self.apply_exact_hessian_prepared(
-                rho, target, cache, &unit, &prepared, &residual,
-            )?;
-            let col = total_t + j;
-            for i in 0..total_t {
-                a[[i, col]] = av.t[i];
-                a[[col, i]] = av.t[i];
-            }
-            for i in 0..k {
-                a[[total_t + i, col]] = av.beta[i];
+        for batch_start in (0..k).step_by(pool_threads) {
+            let batch_end = (batch_start + pool_threads).min(k);
+            let columns: Vec<Result<SaeArrowVector, String>> = (batch_start..batch_end)
+                .into_par_iter()
+                .map(|j| -> Result<SaeArrowVector, String> {
+                    let mut unit = SaeArrowVector {
+                        t: Array1::<f64>::zeros(total_t),
+                        beta: Array1::<f64>::zeros(k),
+                    };
+                    unit.beta[j] = 1.0;
+                    self.apply_exact_hessian_prepared(
+                        rho, target, cache, &unit, &prepared, &residual,
+                    )
+                })
+                .collect();
+            for (offset, av) in columns.into_iter().enumerate() {
+                let av = av?;
+                let col = total_t + batch_start + offset;
+                for i in 0..total_t {
+                    a[[i, col]] = av.t[i];
+                    a[[col, i]] = av.t[i];
+                }
+                for i in 0..k {
+                    a[[total_t + i, col]] = av.beta[i];
+                }
             }
         }
         for r in 0..dim {
@@ -4840,9 +4874,9 @@ impl SaeManifoldTerm {
         }
         let build_elapsed = build_started.elapsed();
         log::info!(
-            "[SAE-EXACT-DENSE] operator BUILT: dim={dim}, {} arrow probes + symmetrization in \
-             {:.3} s ({:.3} ms per apply); the O(dim^3) symmetric eigendecomposition has NOT \
-             started yet",
+            "[SAE-EXACT-DENSE] operator BUILT: dim={dim}, {} arrow probes on {pool_threads} pool \
+             threads + symmetrization in {:.3} s ({:.3} ms wall per probe); the O(dim^3) \
+             symmetric eigendecomposition has NOT started yet",
             slots + k,
             build_elapsed.as_secs_f64(),
             build_elapsed.as_secs_f64() * 1.0e3 / ((slots + k).max(1) as f64),
