@@ -5519,8 +5519,8 @@ mod tests {
         use gam_linalg::faer_ndarray::FaerEigh;
         use ndarray::{Array2, Axis};
 
-        let x = [0.0, 0.3, 0.55, 1.1, 1.4, 2.0, 2.6, 2.8, 3.4, 4.0];
-        let w = [0.5, 2.0, 1.0, 3.0, 0.7, 1.3, 2.2, 0.4, 1.8, 1.1];
+        let x: [f64; 10] = [0.0, 0.3, 0.55, 1.1, 1.4, 2.0, 2.6, 2.8, 3.4, 4.0];
+        let w: [f64; 10] = [0.5, 2.0, 1.0, 3.0, 0.7, 1.3, 2.2, 0.4, 1.8, 1.1];
         let y: Vec<f64> = x.iter().map(|value| value.sin()).collect();
         for order in 1..=MAX_ORDER {
             let (nodes, _within, _n_obs, _response_origin) =
