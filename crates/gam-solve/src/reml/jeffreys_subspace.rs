@@ -4831,7 +4831,7 @@ mod tests {
     /// with the gate-band motion active and through a rectangular span.
     #[test]
     fn observed_hessian_completion_matches_the_pairwise_completion_2893() {
-        let rows = array![
+        let rows: Array2<f64> = array![
             [1.0, 0.2, -0.3],
             [1.0, -0.5, 0.4],
             [1.0, 0.9, 0.1],
@@ -4839,7 +4839,7 @@ mod tests {
             [1.0, 0.6, 0.7],
             [1.0, -0.7, -0.2],
         ];
-        let beta = array![0.1, -0.2, 0.3];
+        let beta: Array1<f64> = array![0.1, -0.2, 0.3];
         // `Σ_k exp(x_kᵀβ) x_k x_kᵀ` and its directional derivatives: the Hessian of `Σ_k exp(x_kᵀβ)`.
         let raw = |u: Option<&Array1<f64>>, v: Option<&Array1<f64>>| {
             let mut h = Array2::<f64>::zeros((3, 3));
