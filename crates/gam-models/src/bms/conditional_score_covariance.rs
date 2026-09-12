@@ -153,15 +153,6 @@ use super::{
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
 use serde::{Deserialize, Serialize};
 
-/// Damped Fisher-scoring iterations allowed for one log-linear innovation
-/// variance. The objective is strictly concave and bounded above and every
-/// accepted step strictly ascends it, so the loop terminates on its own; this
-/// cap exists to bound it, not to select an answer, and a run that reaches it is
-/// a refusal rather than a truncation. Measured on the module's own fixtures the
-/// hardest fit converges in 22 accepted steps, with the gain shrinking by about
-/// 4.5x per step — from which 64 is roughly 40 orders of magnitude of headroom.
-const LOG_INNOVATION_MAX_ITERATIONS: usize = 64;
-
 /// One coordinate of the modified Cholesky decomposition.
 ///
 /// `autoregression[k]` (for `k < j`) holds the coefficients of `φ_{jk}(a)` and
@@ -788,12 +779,17 @@ fn fit_log_innovation(
     gamma[0] = homoskedastic.ln();
 
     // The Gaussian log-likelihood of the log-linear variance model, up to a
-    // constant: `ℓ(γ) = −½ Σ w (A_iᵀγ + ε_i²·exp(−A_iᵀγ))`. Non-finite is a
-    // legitimate answer — an iterate that drives `exp(−A_iᵀγ)` past the
+    // constant: `ℓ(γ) = −½ Σ w (A_iᵀγ + ε_i²·exp(−A_iᵀγ))`, with the rounding band
+    // of the arithmetic that assembles it. `A_iᵀγ` is a `width`-term inner
+    // product, five more rounded operations form the row term (the square, the
+    // exponential, a product, a sum and the weight), and `n − 1` additions sum the
+    // rows, so the band is `γ_{n+width+4}` of the terms' absolute sum. Non-finite
+    // is a legitimate answer — an iterate that drives `exp(−A_iᵀγ)` past the
     // representable range is simply not an ascent step, and the line search
     // below halves past it rather than the whole fit refusing.
-    let log_likelihood = |coefficients: &[f64]| -> Option<f64> {
+    let log_likelihood = |coefficients: &[f64]| -> Option<(f64, f64)> {
         let mut total = 0.0_f64;
+        let mut magnitude = 0.0_f64;
         for row in 0..n {
             let weight = weights[row];
             if !(weight > 0.0) {
@@ -803,9 +799,16 @@ fn fit_log_innovation(
             for column in 0..width {
                 linear += coefficients[column] * basis[[row, column]];
             }
-            total -= 0.5 * weight * (linear + residual[row] * residual[row] * (-linear).exp());
+            let term = 0.5 * weight * (linear + residual[row] * residual[row] * (-linear).exp());
+            total -= term;
+            magnitude += term.abs();
         }
-        total.is_finite().then_some(total)
+        total.is_finite().then(|| {
+            (
+                total,
+                gam_linalg::roundoff::accumulation_growth(n + width + 4) * magnitude,
+            )
+        })
     };
 
     // Fisher scoring with a step-halving line search.
@@ -825,14 +828,16 @@ fn fit_log_innovation(
     // the optimum by 4.5 nats. Damping restores monotone ASCENT, which is the
     // property a strictly concave objective actually supports, and the same run
     // then converges in 22 accepted steps.
-    let mut current = log_likelihood(&gamma).ok_or_else(|| {
+    let (mut current, mut current_band) = log_likelihood(&gamma).ok_or_else(|| {
         format!(
             "conditional score covariance log-variance seed log d = {} is not evaluable",
             gamma[0]
         )
     })?;
-    let mut converged = false;
-    for _ in 0..LOG_INNOVATION_MAX_ITERATIONS {
+    // Every step that continues gains more than the two evaluations' bands, and a
+    // concave likelihood bounded above admits only finitely many such gains, so
+    // the ascent ends on its own derived exits and needs no iteration cap.
+    loop {
         let mut deviation = Array1::<f64>::zeros(n);
         for row in 0..n {
             let mut linear = 0.0;
@@ -854,10 +859,10 @@ fn fit_log_innovation(
         )?;
         // Halve until the step ascends. Two derived exits and no chosen
         // tolerance: a trial that no longer moves `γ` at all in floating point
-        // cannot ascend, and a gain below the log-likelihood's own last place is
-        // not a gain.
+        // cannot ascend, and a gain inside the two evaluations' rounding bands is
+        // not a gain the arithmetic attests to.
         let mut trial = 1.0_f64;
-        let mut accepted: Option<(Vec<f64>, f64)> = None;
+        let mut accepted: Option<(Vec<f64>, f64, f64)> = None;
         while trial > 0.0 {
             let candidate: Vec<f64> = gamma
                 .iter()
@@ -871,32 +876,26 @@ fn fit_log_innovation(
             {
                 break;
             }
-            if let Some(value) = log_likelihood(&candidate)
+            if let Some((value, band)) = log_likelihood(&candidate)
                 && value > current
             {
-                accepted = Some((candidate, value));
+                accepted = Some((candidate, value, band));
                 break;
             }
             trial *= 0.5;
         }
-        let Some((candidate, value)) = accepted else {
+        let Some((candidate, value, band)) = accepted else {
             // No representable step ascends: this IS the optimum to round-off.
-            converged = true;
             break;
         };
         let gain = value - current;
+        let gain_band = band + current_band;
         gamma = candidate;
         current = value;
-        if gain <= f64::EPSILON * (1.0 + current.abs()) {
-            converged = true;
+        current_band = band;
+        if gain <= gain_band {
             break;
         }
-    }
-    if !converged {
-        return Err(format!(
-            "conditional score covariance log-variance scoring did not converge in \
-             {LOG_INNOVATION_MAX_ITERATIONS} damped Fisher steps"
-        ));
     }
     let range = linear_predictor_range(&gamma, basis, weights);
     Ok((gamma, range))
