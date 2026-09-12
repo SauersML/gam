@@ -244,13 +244,23 @@ fn perfect_reconstruction_zero_residual_is_a_defined_audit_not_an_error() {
     }
     assert_eq!(audit.quantiles.len(), 2);
 
-    // Near-zero (below the 1e-12 skip threshold) residuals behave identically.
-    // Per-element 1e-13 over p=4 columns → row norm 2e-13 < 1e-12, so every row skips.
-    let tiny = Array2::<f32>::from_elem((n, p), 1.0e-13_f32);
+    // A residual has no minimum norm: only an exactly zero row is skipped. Rows of norm
+    // 2^-43 are audited, and because a cross-gate is a row's projection divided by its
+    // own norm, scaling the residuals by a power of two scales every f64 product, sum,
+    // square root and quotient exactly, so the audit is identical to the unit-norm one.
+    let unit = unit_rows(n, p, 0x2822_0001);
+    let tiny = unit.mapv(|v| v * 2.0_f32.powi(-43));
+    let unit_audit = routability_audit(decoder.view(), unit.view(), 1, 0.05, &[0.5, 0.9])
+        .expect("unit-norm residual audit");
     let tiny_audit = routability_audit(decoder.view(), tiny.view(), 1, 0.05, &[0.5, 0.9])
-        .expect("sub-threshold residual is still a defined audit");
-    assert_eq!(tiny_audit.n_rows, 0);
-    assert_eq!(tiny_audit.fraction_below_floor, 1.0);
+        .expect("a tiny nonzero residual is a defined audit");
+    assert_eq!(tiny_audit.n_rows, n, "no nonzero residual row is skipped");
+    assert_eq!(tiny_audit.quantiles, unit_audit.quantiles);
+    assert_eq!(tiny_audit.empirical_mean, unit_audit.empirical_mean);
+    assert_eq!(tiny_audit.empirical_max, unit_audit.empirical_max);
+    assert_eq!(tiny_audit.confidence_quantile, unit_audit.confidence_quantile);
+    assert_eq!(tiny_audit.coherence_excess, unit_audit.coherence_excess);
+    assert_eq!(tiny_audit.fraction_below_floor, unit_audit.fraction_below_floor);
 }
 
 #[test]

@@ -161,7 +161,7 @@ pub fn minimum_routable_energy(floor: &RoutabilityFloor) -> f64 {
 /// closed-form floor.
 #[derive(Clone, Debug)]
 pub struct RoutabilityAudit {
-    /// Number of residual rows audited (rows with (near-)zero norm are skipped).
+    /// Number of residual rows audited (rows of exactly zero norm are skipped).
     pub n_rows: usize,
     /// The closed-form floor this audit is measured against.
     pub floor: RoutabilityFloor,
@@ -262,7 +262,7 @@ pub fn routability_audit(
     }
     let n_rows = per_row.len();
     if n_rows == 0 {
-        // Every residual row has (near-)zero norm: the dictionary reconstructs the
+        // Every residual row is exactly zero: the dictionary reconstructs the
         // data exactly, so there is no residual mass left to (mis)route. This is
         // the ideal — fully routable — case, not an error: zero unroutable mass at
         // every confidence level. Report a defined audit against the (geometry-only)
