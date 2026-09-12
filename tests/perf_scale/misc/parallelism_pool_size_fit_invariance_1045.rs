@@ -20,7 +20,7 @@
 //! per-site deterministic gating.
 
 use gam::ResourcePolicy;
-use gam::families::bms::{BernoulliMarginalSlopeTermSpec, LatentZPolicy};
+use gam::families::bms::BernoulliMarginalSlopeTermSpec;
 use gam::families::custom_family::BlockwiseFitOptions;
 use gam::families::survival::lognormal_kernel::FrailtySpec;
 use gam::terms::basis::{CenterStrategy, MaternBasisSpec, MaternIdentifiability, MaternNu};
@@ -126,7 +126,7 @@ fn build(n: usize, centers: usize) -> (Array2<f64>, BernoulliMarginalSlopeTermSp
         frailty: FrailtySpec::None,
         score_warp: None,
         link_dev: None,
-        latent_z_policy: LatentZPolicy::exploratory_fit_weighted(),
+        latent_z_policy: gam_test_support::synthetic::exploratory_fit_weighted_latent_z_policy(),
         score_influence_jacobian: None,
     };
     (data, spec)

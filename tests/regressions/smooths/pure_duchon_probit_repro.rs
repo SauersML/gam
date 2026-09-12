@@ -24,7 +24,7 @@ use gam::basis::{
     MaternBasisSpec, MaternIdentifiability, MaternNu, SpatialIdentifiability,
 };
 use gam::custom_family::BlockwiseFitOptions;
-use gam::families::bms::{BernoulliMarginalSlopeTermSpec, LatentZPolicy};
+use gam::families::bms::BernoulliMarginalSlopeTermSpec;
 use gam::families::survival::lognormal_kernel::FrailtySpec;
 use gam::smooth::{
     LinearCoefficientGeometry, LinearTermSpec, ShapeConstraint, SmoothBasisSpec, SmoothTermSpec,
@@ -158,7 +158,7 @@ fn build_problem(
             frailty: FrailtySpec::None,
             score_warp: None,
             link_dev: None,
-            latent_z_policy: LatentZPolicy::exploratory_fit_weighted(),
+            latent_z_policy: gam_test_support::synthetic::exploratory_fit_weighted_latent_z_policy(),
             score_influence_jacobian: None,
         },
     )

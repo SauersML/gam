@@ -14,7 +14,7 @@
     "crates/gam-math": 257,
     "crates/gam-model-api": 10,
     "crates/gam-model-kernels": 84,
-    "crates/gam-models": 1409,
+    "crates/gam-models": 1397,
     "crates/gam-predict": 105,
     "crates/gam-problem": 346,
     "crates/gam-pyffi": 126,

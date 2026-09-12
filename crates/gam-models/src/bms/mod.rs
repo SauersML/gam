@@ -617,18 +617,6 @@ impl LatentZPolicy {
             max_abs_excess_kurtosis: 20.0,
         }
     }
-
-    pub fn exploratory_fit_weighted() -> Self {
-        Self {
-            check_mode: LatentZCheckMode::WarnOnly,
-            normalization: LatentZNormalizationMode::FitWeighted,
-            latent_measure: LatentMeasureSpec::auto_default(),
-            mean_tol_multiplier: 8.0,
-            sd_tol_multiplier: 8.0,
-            max_abs_skew: 4.0,
-            max_abs_excess_kurtosis: 20.0,
-        }
-    }
 }
 
 impl Default for LatentZPolicy {

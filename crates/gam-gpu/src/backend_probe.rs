@@ -2,8 +2,8 @@
 //! `src/gpu/*`.
 //!
 //! Before this module existed, every GPU backend (`bms_flex`,
-//! `survival_flex`, `cubic_bspline_moments`, `cubic_cell`, `pirls_row`,
-//! `sphere`, ...) carried its own near-identical `probe_linux` prologue:
+//! `survival_flex`, `cubic_cell`, `pirls_row`, `sphere`, ...) carried its own
+//! near-identical `probe_linux` prologue:
 //!
 //!   1. Resolve the process-wide [`crate::GpuRuntime`] losslessly. Typed hardware
 //!      absence becomes a labelled `DriverLibraryUnavailable`; probe faults
@@ -188,10 +188,10 @@ mod tests {
     /// caller's label; on a host with a runtime, the probe must resolve the
     /// *same* selected-device ordinal and compute capability the runtime
     /// advertises, with a context bound to that ordinal and a usable
-    /// default stream. This is the regression guard that keeps the six
-    /// migrated backends (`bms_flex`, `survival_flex`,
-    /// `cubic_bspline_moments`, `cubic_cell`, `pirls_row`, `sphere`) routed
-    /// through one prologue instead of drifting copies.
+    /// default stream. This is the regression guard that keeps the five
+    /// migrated backends (`bms_flex`, `survival_flex`, `cubic_cell`,
+    /// `pirls_row`, `sphere`) routed through one prologue instead of drifting
+    /// copies.
     #[test]
     fn shared_probe_matches_runtime_device_and_labels_errors() {
         match GpuRuntime::availability() {
@@ -221,7 +221,6 @@ mod tests {
                 for label in [
                     "bms_flex",
                     "survival_flex",
-                    "cubic_bspline_moments",
                     "cubic_cell",
                     "pirls_row",
                     "sphere",

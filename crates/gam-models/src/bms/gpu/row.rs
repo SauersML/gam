@@ -2827,56 +2827,6 @@ pub(crate) fn validate_bms_flex_row_hvp_multi_shape(
     Ok(rhs_elems)
 }
 
-/// Transient device bytes for a multi-RHS HVP launch, excluding persistent
-/// row-Hessian/design storage. Scratch scales with
-/// `rhs_count * num_chunks * p_total`, not `rhs_count * n * r * r`.
-#[cfg(target_os = "linux")]
-pub fn bms_flex_row_hvp_multi_scratch_bytes_for_shape(
-    n: usize,
-    p_total: usize,
-    rhs_count: usize,
-) -> Result<u64, GpuError> {
-    if rhs_count == 0 || rhs_count > BMS_FLEX_ROW_HVP_MAX_RHS {
-        return Err(GpuError::DriverCallFailed {
-            reason: format!(
-                "bms_flex_row hvp_multi_scratch_bytes: rhs_count={rhs_count} outside 1..={BMS_FLEX_ROW_HVP_MAX_RHS}"
-            ),
-        });
-    }
-    let num_chunks = num_hvp_chunks(n);
-    let partial = rhs_count
-        .checked_mul(num_chunks)
-        .and_then(|v| v.checked_mul(p_total))
-        .ok_or_else(|| GpuError::DriverCallFailed {
-            reason: format!(
-                "bms_flex_row hvp_multi_scratch_bytes: rhs_count({rhs_count})*num_chunks({num_chunks})*p_total({p_total}) overflow"
-            ),
-        })?;
-    let rhs_vectors = rhs_count
-        .checked_mul(p_total)
-        .and_then(|v| v.checked_mul(2))
-        .ok_or_else(|| GpuError::DriverCallFailed {
-            reason: format!(
-                "bms_flex_row hvp_multi_scratch_bytes: 2*rhs_count({rhs_count})*p_total({p_total}) overflow"
-            ),
-        })?;
-    let elems = partial
-        .checked_add(rhs_vectors)
-        .ok_or_else(|| GpuError::DriverCallFailed {
-            reason: "bms_flex_row hvp_multi_scratch_bytes: element count overflow".to_string(),
-        })?;
-    let bytes = elems
-        .checked_mul(std::mem::size_of::<f64>())
-        .ok_or_else(|| GpuError::DriverCallFailed {
-            reason: "bms_flex_row hvp_multi_scratch_bytes: byte count overflow".to_string(),
-        })?;
-    u64::try_from(bytes).map_err(|_| GpuError::DriverCallFailed {
-        reason: format!(
-            "bms_flex_row hvp_multi_scratch_bytes: byte count={bytes} exceeds u64 range"
-        ),
-    })
-}
-
 #[cfg(target_os = "linux")]
 pub(crate) fn run_bms_flex_row_multi_partial_reduce(
     storage: &DeviceResidentRowHess,
@@ -3545,34 +3495,6 @@ mod tests {
         assert!(
             source.len() < 40_000,
             "generated CUDA source unexpectedly bloated"
-        );
-    }
-
-    // ── Phase-3 HVP / diagonal CPU oracles + GPU parity tests ────────────────
-
-    #[test]
-    pub(crate) fn bms_flex_row_hvp_multi_scratch_is_bounded_at_large_scale_shape() {
-        let n = 195_000_usize;
-        let r = 20_usize;
-        let p_total = 44_usize;
-        let rhs_count = 4_usize;
-        let scratch = bms_flex_row_hvp_multi_scratch_bytes_for_shape(n, p_total, rhs_count)
-            .expect("large-scale multi-RHS scratch budget");
-        let per_rhs_full_row_cache =
-            (n * r * r * std::mem::size_of::<f64>()) as u64 * rhs_count as u64;
-        assert!(
-            scratch < per_rhs_full_row_cache / 100,
-            "multi-RHS scratch must tile by row chunks instead of materializing \
-             a row-Hessian copy per RHS: scratch={scratch} full_per_rhs={per_rhs_full_row_cache}"
-        );
-        assert!(
-            bms_flex_row_hvp_multi_scratch_bytes_for_shape(
-                n,
-                p_total,
-                BMS_FLEX_ROW_HVP_MAX_RHS + 1
-            )
-            .is_err(),
-            "multi-RHS launch must reject unbounded RHS counts"
         );
     }
 

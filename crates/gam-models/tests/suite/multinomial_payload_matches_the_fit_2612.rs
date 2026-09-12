@@ -25,7 +25,6 @@ use gam_data::encode_recordswith_inferred_schema;
 use gam_models::fit_orchestration::FitConfig;
 use gam_models::multinomial::{
     MultinomialFitRequest, MultinomialSavedModel, fit_penalized_multinomial_formula,
-    predict_multinomial_formula_plugin,
 };
 
 const N: usize = 240;
@@ -154,21 +153,40 @@ fn deviance_from_payload(model: &MultinomialSavedModel) -> f64 {
     -2.0 * total
 }
 
-/// The largest spread of any class's plug-in probability across the training
-/// rows — zero exactly when the fitted surface is constant in `x`.
-fn plugin_probability_spread(model: &MultinomialSavedModel, rows: Vec<StringRecord>) -> f64 {
-    let data = encode_recordswith_inferred_schema(vec!["x".to_string(), "y".to_string()], rows)
-        .expect("encode dataset");
-    let probabilities =
-        predict_multinomial_formula_plugin(model, &data).expect("plug-in probabilities");
-    (0..probabilities.ncols())
-        .map(|class| {
-            let column = probabilities.column(class);
-            let lo = column.iter().copied().fold(f64::INFINITY, f64::min);
-            let hi = column.iter().copied().fold(f64::NEG_INFINITY, f64::max);
-            hi - lo
-        })
-        .fold(0.0_f64, f64::max)
+/// The largest spread of any class's plug-in probability `softmax(η̂)` across the
+/// training rows — zero exactly when the fitted surface is constant in `x`. Rebuilt
+/// from the payload's training design and active coefficients, with the reference
+/// class's `η = 0` last, the same convention the deviance recompute above uses.
+fn plugin_probability_spread(model: &MultinomialSavedModel) -> f64 {
+    let design = model.training_design().expect("training design");
+    let beta = model.coefficients_active().expect("coefficients");
+    let m = model.n_active_classes;
+    let mut lo = vec![f64::INFINITY; m + 1];
+    let mut hi = vec![f64::NEG_INFINITY; m + 1];
+    for row in 0..design.nrows() {
+        let design_row = design.row(row);
+        let eta: Vec<f64> = (0..m)
+            .map(|a| {
+                design_row
+                    .iter()
+                    .zip(beta.column(a).iter())
+                    .map(|(x, b)| x * b)
+                    .sum::<f64>()
+            })
+            .collect();
+        let shift = eta.iter().copied().fold(0.0_f64, f64::max);
+        let mut partition = (-shift).exp();
+        for &value in &eta {
+            partition += (value - shift).exp();
+        }
+        for class in 0..=m {
+            let logit = if class < m { eta[class] } else { 0.0 };
+            let probability = (logit - shift).exp() / partition;
+            lo[class] = lo[class].min(probability);
+            hi[class] = hi[class].max(probability);
+        }
+    }
+    (0..=m).map(|class| hi[class] - lo[class]).fold(0.0_f64, f64::max)
 }
 
 /// The exact defect: `K = 2` with a smooth term. Also the class of defect —
@@ -217,7 +235,7 @@ fn a_two_class_smooth_multinomial_recovers_a_non_constant_surface_2612() {
         model.edf_per_class,
     );
 
-    let spread = plugin_probability_spread(&model, two_class_rows(7));
+    let spread = plugin_probability_spread(&model);
     assert!(
         spread > 0.30,
         "the fitted class-probability surface spans only {spread:.6} across a truth \
@@ -241,7 +259,7 @@ fn a_two_class_smooth_multinomial_recovers_a_non_constant_surface_2612() {
 #[test]
 fn a_three_class_smooth_multinomial_recovers_a_non_constant_surface_2612() {
     let model = fit(three_class_rows(7), "y ~ s(x, bs='tp', k=8)");
-    let spread = plugin_probability_spread(&model, three_class_rows(7));
+    let spread = plugin_probability_spread(&model);
     assert!(
         spread > 0.20,
         "the three-class fitted surface spans only {spread:.6}"

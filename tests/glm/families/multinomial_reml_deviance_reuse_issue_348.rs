@@ -22,7 +22,8 @@
 //! it from `predict_multinomial_formula`, which was that function when #348 was
 //! written and is not any more: gam#2612 made the default predict path publish
 //! the posterior MEAN `E[softmax(η)]`, computed as a ratio of normalising
-//! constants, and moved `softmax(η̂)` to `predict_multinomial_formula_plugin`.
+//! constants. The mode's own `softmax(η̂)` is recomputed below from the training
+//! design and active coefficients the payload publishes.
 //!
 //! So the assertion became a comparison of two different estimands and failed on
 //! their difference — `7.502289` against `7.110750` on this fixture — which is
@@ -35,7 +36,6 @@
 use csv::StringRecord;
 use gam::families::multinomial::{
     MultinomialFitRequest, fit_penalized_multinomial_formula, predict_multinomial_formula,
-    predict_multinomial_formula_plugin,
 };
 use gam::{FitConfig, encode_recordswith_inferred_schema, init_parallelism};
 
@@ -102,7 +102,26 @@ fn multinomial_formula_deviance_equals_independent_softmax_recompute() {
         -2.0 * total
     };
 
-    let plugin = predict_multinomial_formula_plugin(&model, &data).expect("plug-in probabilities");
+    // The mode's own probability `softmax(η̂)` on the training rows, rebuilt from
+    // the payload's training design and active coefficients with the reference
+    // class's `η = 0` last.
+    let plugin = {
+        let design = model.training_design().expect("training design");
+        let beta = model.coefficients_active().expect("active coefficients");
+        let eta = design.dot(&beta);
+        let active = eta.ncols();
+        let mut probs = ndarray::Array2::<f64>::zeros((eta.nrows(), active + 1));
+        for (row, mut out) in eta.rows().into_iter().zip(probs.rows_mut()) {
+            let shift = row.iter().copied().fold(0.0_f64, f64::max);
+            let partition =
+                (-shift).exp() + row.iter().map(|&value| (value - shift).exp()).sum::<f64>();
+            for (class, &value) in row.iter().enumerate() {
+                out[class] = (value - shift).exp() / partition;
+            }
+            out[active] = (-shift).exp() / partition;
+        }
+        probs
+    };
     let recomputed_deviance = deviance_from(&plugin, "plug-in");
 
     assert!(

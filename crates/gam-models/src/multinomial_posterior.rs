@@ -363,24 +363,29 @@ pub struct MultinomialPosteriorMoments {
     pub covariance_range_projection_bound: f64,
 }
 
-/// Integrate reference-coded logistic-normal softmax moments for one row.
-///
-/// `active_mean` has length `M = K - 1`; `active_covariance` must be a finite,
-/// symmetric positive-semidefinite `(M, M)` matrix in the same active-class
-/// order.  The returned arrays include the implicit reference class as their
-/// final entry.
-pub fn integrate_logistic_normal_softmax_moments(
-    active_mean: ArrayView1<'_, f64>,
-    active_covariance: ArrayView2<'_, f64>,
-    control: &MultinomialPosteriorIntegrationControl,
-) -> Result<MultinomialPosteriorMoments, EstimationError> {
-    let mut conditioned_three_class_rules = ConditionedThreeClassRuleLadder::default();
-    integrate_logistic_normal_softmax_moments_with_rule_ladder(
-        active_mean,
-        active_covariance,
-        control,
-        &mut conditioned_three_class_rules,
-    )
+#[cfg(test)]
+mod test_support {
+    use super::*;
+
+    /// Integrate reference-coded logistic-normal softmax moments for one row.
+    ///
+    /// `active_mean` has length `M = K - 1`; `active_covariance` must be a finite,
+    /// symmetric positive-semidefinite `(M, M)` matrix in the same active-class
+    /// order.  The returned arrays include the implicit reference class as their
+    /// final entry.
+    pub(crate) fn integrate_logistic_normal_softmax_moments(
+        active_mean: ArrayView1<'_, f64>,
+        active_covariance: ArrayView2<'_, f64>,
+        control: &MultinomialPosteriorIntegrationControl,
+    ) -> Result<MultinomialPosteriorMoments, EstimationError> {
+        let mut conditioned_three_class_rules = ConditionedThreeClassRuleLadder::default();
+        integrate_logistic_normal_softmax_moments_with_rule_ladder(
+            active_mean,
+            active_covariance,
+            control,
+            &mut conditioned_three_class_rules,
+        )
+    }
 }
 
 fn integrate_logistic_normal_softmax_moments_with_rule_ladder(
@@ -1888,7 +1893,7 @@ fn binomial_as_f64(n: usize, k: usize) -> Result<f64, EstimationError> {
 /// class's `η = 0` appended last — the plug-in probability `softmax(η)` at a
 /// single point, with no posterior integration.
 ///
-/// Shared with `multinomial::predict_multinomial_formula_plugin` rather than
+/// Shared with the reference-coded class mapping in `multinomial` rather than
 /// re-derived there: the max-shift, the implicit reference logit and the class
 /// ordering are all conventions this module owns, and a second copy of them is
 /// a second place for the reference class to move.
@@ -2056,6 +2061,7 @@ fn remove_covariance_roundoff(
 
 #[cfg(test)]
 mod tests {
+    use super::test_support::integrate_logistic_normal_softmax_moments;
     use super::*;
 
     fn control(absolute_tolerance: f64) -> MultinomialPosteriorIntegrationControl {

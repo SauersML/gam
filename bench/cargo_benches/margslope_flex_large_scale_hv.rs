@@ -25,12 +25,6 @@ use margslope_flex_equivalence::build_large_scale_shape_problem;
 
 const DEFAULT_REPRO_N: usize = 50_000;
 const BENCH_INNER_CYCLES: usize = 1;
-#[cfg(target_os = "linux")]
-const BENCH_MULTI_RHS_PROBE: usize = 4;
-#[cfg(target_os = "linux")]
-const LARGE_SCALE_HVP_PRIMARY_R: usize = 20;
-#[cfg(target_os = "linux")]
-const LARGE_SCALE_HVP_P_TOTAL: usize = 44;
 
 struct CountingAllocator;
 
@@ -114,29 +108,6 @@ fn bench_margslope_flex_large_scale_cycle0(c: &mut Criterion) {
     gam::init_parallelism();
     let n = DEFAULT_REPRO_N;
     let inner_cycles = BENCH_INNER_CYCLES;
-    #[cfg(target_os = "linux")]
-    {
-        let scratch = gam::families::bms::gpu::row::bms_flex_row_hvp_multi_scratch_bytes_for_shape(
-            n,
-            LARGE_SCALE_HVP_P_TOTAL,
-            BENCH_MULTI_RHS_PROBE,
-        )
-        .expect("large-scale multi-RHS HVP scratch budget");
-        let per_rhs_full_row_cache = (n
-            * LARGE_SCALE_HVP_PRIMARY_R
-            * LARGE_SCALE_HVP_PRIMARY_R
-            * std::mem::size_of::<f64>()) as u64
-            * BENCH_MULTI_RHS_PROBE as u64;
-        eprintln!(
-            "[MS-FLEX-LARGE_SCALE-BENCH-HVP-MULTI-RHS] n={} p={} r={} rhs={} scratch_mib={:.3} full_row_cache_per_rhs_mib={:.3}",
-            n,
-            LARGE_SCALE_HVP_P_TOTAL,
-            LARGE_SCALE_HVP_PRIMARY_R,
-            BENCH_MULTI_RHS_PROBE,
-            scratch as f64 / (1024.0 * 1024.0),
-            per_rhs_full_row_cache as f64 / (1024.0 * 1024.0),
-        );
-    }
     let problem = build_large_scale_shape_problem(n);
     let allocation_problem = problem.clone();
     begin_allocation_measurement();

@@ -1411,8 +1411,7 @@ impl ResidentBytes for CellDerivativeMomentState {
 /// 25.4), tabulated to f64 precision. Used here for the Drezner–Wesolowsky
 /// bivariate normal CDF representation — 20 points give >30-digit accuracy for
 /// the smooth arcsin-transformed integrand, ensuring the BVN value is exact to
-/// f64 precision for all (h, k, ρ) — and shared with the cubic-cell B-spline
-/// moment parity gate in `crate::gpu_kernels::cubic_bspline_moments`.
+/// f64 precision for all (h, k, ρ).
 pub const GL20_NODES: [f64; 20] = [
     -0.993_128_599_185_094_9,
     -0.963_971_927_277_913_8,

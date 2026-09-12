@@ -394,5 +394,15 @@
     "unit_test_decreases": {
       "crates/gam-sae": 4
     }
+  },
+  {
+    "base": "73282dd28fb4e13a4401720cc4a46fab224e2134",
+    "reason": "user directive: delete all useless slop and code only tests use",
+    "evidence": "Measured on MSI by sw9 job 441280, over 01e3dfadc2bf12a8a79de7376d82d30a1a95d8e0 plus v2 of this batch (lane head 2801ca75e3cf8a0cb9d304772c259eaf8008bead). Reports: /scratch.global/sauer354/sw9-logs/fold1_guard.441280.log, fold1_census.441280.json and fold1_pubapi.441280.json. The pushed tree differs from v2 in one place only: an inline LatentZPolicy literal in tests/src_modules/misc/families_bms_identifiability_rigid_tests.rs, which adds and removes no declaration and no test. Replacements: tests that compared against the multinomial plug-in predictor now build a local softmax over training_design() times coefficients_active(). Integration tests and examples that used LatentZPolicy::exploratory_fit_weighted call gam_test_support::synthetic::exploratory_fit_weighted_latent_z_policy. integrate_logistic_normal_softmax_moments moves into a private #[cfg(test)] mod test_support. The GPU cubic B-spline moment module, bms_flex_row_hvp_multi_scratch_bytes_for_shape and their benches had no production caller.",
+    "test_count_decrease": 12,
+    "removed_pins": {},
+    "unit_test_decreases": {
+      "crates/gam-models": 12
+    }
   }
 ]

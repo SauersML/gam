@@ -4349,8 +4349,7 @@ fn build_multinomial_predict_design(
 /// The posterior mean is computed as a ratio of normalising constants rather
 /// than by integrating `softmax` over the Laplace Gaussian; see
 /// [`crate::multinomial_predictive`] for why the latter is not an approximation
-/// of this estimand (#2612). For the plug-in `softmax(x'β̂)` every other softmax
-/// implementation reports, ask [`predict_multinomial_formula_plugin`] by name.
+/// of this estimand (#2612).
 pub fn predict_multinomial_formula(
     model: &MultinomialSavedModel,
     data: &EncodedDataset,
@@ -4358,57 +4357,6 @@ pub fn predict_multinomial_formula(
     model.validate()?;
     let x_dense = build_multinomial_predict_design(model, data)?;
     model.predict_probabilities(x_dense.view())
-}
-
-/// Plug-in class probabilities `softmax(x'β̂)` at the posterior MODE, for a
-/// saved multinomial model on fresh data.
-///
-/// [`predict_multinomial_formula`] returns a different estimand: the
-/// posterior-mean probability `E[softmax(η)]`. Both are legitimate and they are
-/// not interchangeable, but the difference between them is much smaller than it
-/// used to appear, and the reason is worth stating here because this function is
-/// where a reader compares the two.
-///
-/// `softmax` is concave along the winning coordinate, so averaging it over
-/// posterior width pulls the answer toward the centre of the simplex. The
-/// posterior of a logit is also right-skewed toward larger `|η|`, which pulls
-/// the other way. A correct posterior mean carries BOTH; the Gaussian
-/// integration this path used to perform carried only the first, which is why
-/// the published probability read as under-confident at unchanged argmax
-/// (#2612). Measured on a quasi-separated fixture against an MCMC posterior, the
-/// Gaussian-integrated quantity is off by up to `2.1e-1` in probability while
-/// the ratio estimator [`predict_multinomial_formula`] now uses is off by
-/// `4.4e-3` — and the plug-in below sits much closer to the posterior mean than
-/// the Gaussian did.
-///
-/// `nnet::multinom`, `scikit-learn`, `statsmodels` and every other softmax
-/// reference report the plug-in quantity, so a held-out log-loss comparison
-/// against any of them is a comparison of two estimands unless this function is
-/// the one supplying gam's side.
-///
-/// This is deliberately NOT a fallback: the posterior-mean path refuses rather
-/// than degrading to a plug-in when it cannot certify its own accuracy, and that
-/// refusal stands. A caller who wants the mode's own probability has to ask for
-/// it here, by name.
-pub fn predict_multinomial_formula_plugin(
-    model: &MultinomialSavedModel,
-    data: &EncodedDataset,
-) -> Result<Array2<f64>, EstimationError> {
-    model.validate()?;
-    let x_dense = build_multinomial_predict_design(model, data)?;
-    let coefficients = model.coefficients_active()?;
-    let eta = x_dense.dot(&coefficients);
-    let n_rows = eta.nrows();
-    let n_classes = model.n_active_classes + 1;
-    let mut probabilities = Array2::<f64>::zeros((n_rows, n_classes));
-    for (row, mut destination) in eta.rows().into_iter().zip(probabilities.rows_mut()) {
-        let active: Vec<f64> = row.iter().copied().collect();
-        let row_probabilities = softmax_with_reference(&active)?;
-        for (class, probability) in row_probabilities.iter().enumerate() {
-            destination[class] = *probability;
-        }
-    }
-    Ok(probabilities)
 }
 
 /// Draw `n_draws` posterior-predictive replicate class-label assignments for a

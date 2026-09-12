@@ -1116,5 +1116,36 @@
     },
     "reason": "user directive: delete all useless slop (only used by tests / unused)",
     "evidence": "scripts/public_api_census.py on MSI lane sw2 (job 441111) over 01e3dfadc..the 7b candidate measured exactly these 8 declarations: row_jet_program.rs's public tower-program methods, none with a caller."
+  },
+  {
+    "base": "73282dd28fb4e13a4401720cc4a46fab224e2134",
+    "removed": {
+      "crates/gam-models/src/bms/gpu/row.rs::bms_flex_row_hvp_multi_scratch_bytes_for_shape": 1,
+      "crates/gam-models/src/bms/gpu/row.rs::bms_flex_row_hvp_multi_scratch_is_bounded_at_large_scale_shape": 1,
+      "crates/gam-models/src/bms/mod.rs::exploratory_fit_weighted": 1,
+      "crates/gam-models/src/gpu_kernels/cubic_bspline_moments.rs::active_pair_index": 1,
+      "crates/gam-models/src/gpu_kernels/cubic_bspline_moments.rs::build": 1,
+      "crates/gam-models/src/gpu_kernels/cubic_bspline_moments.rs::build_hex_tensor_moments_device": 2,
+      "crates/gam-models/src/gpu_kernels/cubic_bspline_moments.rs::compiled": 1,
+      "crates/gam-models/src/gpu_kernels/cubic_bspline_moments.rs::convolve_basis_pair": 1,
+      "crates/gam-models/src/gpu_kernels/cubic_bspline_moments.rs::cubic_basis_local_coeffs": 1,
+      "crates/gam-models/src/gpu_kernels/cubic_bspline_moments.rs::d": 2,
+      "crates/gam-models/src/gpu_kernels/cubic_bspline_moments.rs::differentiate_basis_coeffs": 1,
+      "crates/gam-models/src/gpu_kernels/cubic_bspline_moments.rs::download_alpha_major": 1,
+      "crates/gam-models/src/gpu_kernels/cubic_bspline_moments.rs::moment_1d_local": 1,
+      "crates/gam-models/src/gpu_kernels/cubic_bspline_moments.rs::moment_local": 1,
+      "crates/gam-models/src/gpu_kernels/cubic_bspline_moments.rs::n_alpha": 2,
+      "crates/gam-models/src/gpu_kernels/cubic_bspline_moments.rs::n_beta": 1,
+      "crates/gam-models/src/gpu_kernels/cubic_bspline_moments.rs::n_spans": 1,
+      "crates/gam-models/src/gpu_kernels/cubic_bspline_moments.rs::probe": 1,
+      "crates/gam-models/src/gpu_kernels/cubic_bspline_moments.rs::prod": 1,
+      "crates/gam-models/src/gpu_kernels/cubic_bspline_moments.rs::span_is_active": 1,
+      "crates/gam-models/src/gpu_kernels/cubic_bspline_moments.rs::tensor_hex_moment_cpu": 1,
+      "crates/gam-models/src/gpu_kernels/cubic_bspline_moments.rs::try_device_tetrahedral_moments": 2,
+      "crates/gam-models/src/gpu_kernels/cubic_bspline_moments.rs::validate": 2,
+      "crates/gam-models/src/multinomial.rs::predict_multinomial_formula_plugin": 1
+    },
+    "reason": "user directive: delete all useless slop and code only tests use",
+    "evidence": "Measured on MSI by sw9 job 441280, over 01e3dfadc2bf12a8a79de7376d82d30a1a95d8e0 plus v2 of this batch (lane head 2801ca75e3cf8a0cb9d304772c259eaf8008bead). Reports: /scratch.global/sauer354/sw9-logs/fold1_guard.441280.log, fold1_census.441280.json and fold1_pubapi.441280.json. The pushed tree differs from v2 in one place only: an inline LatentZPolicy literal in tests/src_modules/misc/families_bms_identifiability_rigid_tests.rs, which adds and removes no declaration and no test. Replacements: tests that compared against the multinomial plug-in predictor now build a local softmax over training_design() times coefficients_active(). Integration tests and examples that used LatentZPolicy::exploratory_fit_weighted call gam_test_support::synthetic::exploratory_fit_weighted_latent_z_policy. integrate_logistic_normal_softmax_moments moves into a private #[cfg(test)] mod test_support. The GPU cubic B-spline moment module, bms_flex_row_hvp_multi_scratch_bytes_for_shape and their benches had no production caller."
   }
 ]

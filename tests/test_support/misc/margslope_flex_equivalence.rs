@@ -11,7 +11,6 @@
 use gam::ResourcePolicy;
 use gam::families::bms::{
     BernoulliMarginalSlopeFitResult, BernoulliMarginalSlopeTermSpec, DeviationBlockConfig,
-    LatentZPolicy,
 };
 use gam::families::custom_family::BlockwiseFitOptions;
 use gam::families::survival::lognormal_kernel::FrailtySpec;
@@ -181,7 +180,7 @@ pub fn build_large_scale_shape_problem(n: usize) -> LargeScaleShapeProblem {
             frailty: FrailtySpec::None,
             score_warp: Some(dev_cfg.clone()),
             link_dev: Some(dev_cfg),
-            latent_z_policy: LatentZPolicy::exploratory_fit_weighted(),
+            latent_z_policy: gam_test_support::synthetic::exploratory_fit_weighted_latent_z_policy(),
             score_influence_jacobian: None,
         },
     }

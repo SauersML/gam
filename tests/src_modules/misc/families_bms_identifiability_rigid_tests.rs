@@ -6582,7 +6582,15 @@ fn latent_z_normalization_accepts_finite_sample_gaussian_scores() {
         &z,
         &weights,
         "bernoulli-marginal-slope",
-        &LatentZPolicy::exploratory_fit_weighted(),
+        &LatentZPolicy {
+            check_mode: LatentZCheckMode::WarnOnly,
+            normalization: LatentZNormalizationMode::FitWeighted,
+            latent_measure: LatentMeasureSpec::auto_default(),
+            mean_tol_multiplier: 8.0,
+            sd_tol_multiplier: 8.0,
+            max_abs_skew: 4.0,
+            max_abs_excess_kurtosis: 20.0,
+        },
     )
     .unwrap_or_else(|e| panic!("{} failed: {:?}", "normalize z", e));
     let replayed = normalization

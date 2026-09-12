@@ -580,6 +580,24 @@ pub fn cliff_gradient_magnitude(
     Some(out)
 }
 
+/// The fit-weighted latent-z policy the marginal-slope fixtures fit under:
+/// warn-only adequacy checks, the latent score normalized by its own
+/// fit-weighted mean and sd, and 8x mean/sd tolerance multipliers.
+pub fn exploratory_fit_weighted_latent_z_policy() -> gam_models::bms::LatentZPolicy {
+    use gam_models::bms::{
+        LatentMeasureSpec, LatentZCheckMode, LatentZNormalizationMode, LatentZPolicy,
+    };
+    LatentZPolicy {
+        check_mode: LatentZCheckMode::WarnOnly,
+        normalization: LatentZNormalizationMode::FitWeighted,
+        latent_measure: LatentMeasureSpec::auto_default(),
+        mean_tol_multiplier: 8.0,
+        sd_tol_multiplier: 8.0,
+        max_abs_skew: 4.0,
+        max_abs_excess_kurtosis: 20.0,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

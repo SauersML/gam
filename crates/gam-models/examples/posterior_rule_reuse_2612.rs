@@ -7,10 +7,9 @@
 //! through the public API and prints wall-clock measurements for both routes.
 
 use gam_models::multinomial_posterior::{
-    MultinomialPosteriorIntegrationControl, integrate_logistic_normal_softmax_moments,
-    integrate_multinomial_design_moments,
+    MultinomialPosteriorIntegrationControl, integrate_multinomial_design_moments,
 };
-use ndarray::{Array1, Array2};
+use ndarray::Array2;
 use std::error::Error;
 use std::time::Instant;
 
@@ -65,20 +64,21 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
     }
 
-    let active_mean = Array1::from_vec(vec![1.1, -0.6]);
+    let single_row = Array2::<f64>::ones((1, 1));
     let independent_start = Instant::now();
-    let mut final_rule = None;
-    let mut final_evaluations = 0usize;
     for row in 0..ROWS {
-        let independent = integrate_logistic_normal_softmax_moments(
-            active_mean.view(),
+        // A one-row design owns its own rule ladder, so each of these rows is
+        // integrated independently of every other.
+        let independent = integrate_multinomial_design_moments(
+            coefficients.view(),
             coefficient_covariance.view(),
+            single_row.view(),
             &control,
         )?;
         for class in 0..3 {
             let mean_difference =
-                (independent.class_mean[class] - batched.class_mean[[row, class]]).abs();
-            let deviation_difference = (independent.class_standard_deviation[class]
+                (independent.class_mean[[0, class]] - batched.class_mean[[row, class]]).abs();
+            let deviation_difference = (independent.class_standard_deviation[[0, class]]
                 - batched.class_standard_deviation[[row, class]])
             .abs();
             if mean_difference > 2.0e-14 || deviation_difference > 2.0e-14 {
@@ -89,16 +89,11 @@ fn main() -> Result<(), Box<dyn Error>> {
                 )));
             }
         }
-        final_evaluations = independent.function_evaluations;
-        final_rule = Some(independent.rule);
     }
     let independent_wall = independent_start.elapsed();
-    let rule =
-        final_rule.ok_or_else(|| mismatch("no independent row was evaluated".to_string()))?;
 
     println!(
-        "POSTERIOR_RULE_REUSE_2612 rows={ROWS} batched_wall_ms={:.3} \
-         independent_wall_ms={:.3} final_rule={rule:?} evaluations_per_row={final_evaluations}",
+        "POSTERIOR_RULE_REUSE_2612 rows={ROWS} batched_wall_ms={:.3} independent_wall_ms={:.3}",
         batched_wall.as_secs_f64() * 1.0e3,
         independent_wall.as_secs_f64() * 1.0e3,
     );
