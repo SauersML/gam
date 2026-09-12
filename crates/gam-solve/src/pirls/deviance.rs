@@ -94,37 +94,35 @@ fn loglog_binomial_geometry(y: f64, eta: f64) -> (f64, f64, f64) {
         );
     }
     let log_mu = -r;
-    let log_one_minus_mu = gam_math::probability::log1mexp_positive(r);
+    // 1 - exp(-r) = exp(-eta) * exprel(-r).  Keeping -eta
+    // outside the exponential retains the log probability when r underflows.
+    let log_one_minus_mu = -eta + log_exprel(-r);
     let survival_score = if r == 0.0 {
         1.0
-    } else if r > 709.0 {
-        0.0
     } else {
-        r / r.exp_m1()
+        (-eta - r - log_one_minus_mu).exp()
     };
     (log_mu, log_one_minus_mu, (1.0 - y) * survival_score - y * r)
 }
 
 #[inline]
 fn cauchit_binomial_geometry(y: f64, eta: f64) -> (f64, f64, f64) {
-    let (mu, one_minus_mu) = if eta > 0.0 {
+    let (mu, one_minus_mu, log_mu, log_one_minus_mu) = if eta > 0.0 {
         let tail = (1.0 / eta).atan() / std::f64::consts::PI;
-        (1.0 - tail, tail)
+        (1.0 - tail, tail, (-tail).ln_1p(), tail.ln())
     } else if eta < 0.0 {
         let head = (-1.0 / eta).atan() / std::f64::consts::PI;
-        (head, 1.0 - head)
+        (head, 1.0 - head, head.ln(), (-head).ln_1p())
     } else {
-        (0.5, 0.5)
+        (0.5, 0.5, -std::f64::consts::LN_2, -std::f64::consts::LN_2)
     };
-    let log_mu = mu.ln();
-    let log_one_minus_mu = one_minus_mu.ln();
     let absolute_eta = eta.abs();
     let log_dmu = if absolute_eta <= f64::MAX.sqrt() {
         -std::f64::consts::PI.ln() - eta.mul_add(eta, 1.0).ln()
     } else {
         -std::f64::consts::PI.ln() - 2.0 * absolute_eta.ln() - (1.0 / absolute_eta).powi(2).ln_1p()
     };
-    let residual = mu - y;
+    let residual = if y <= 0.5 { mu - y } else { (1.0 - y) - one_minus_mu };
     let negative_score = if residual == 0.0 {
         0.0
     } else {
@@ -2598,3 +2596,36 @@ pub fn tweedie_exact_loglik_total_from_eta(
 // module never estimates a covariance internally.
 //
 // Composition with the existing signed-Gram API:
+
+#[cfg(test)]
+mod tail_geometry_tests {
+    use super::{cauchit_binomial_geometry, loglog_binomial_geometry};
+
+    #[test]
+    fn cauchit_retains_small_likelihood_and_score_in_both_tails() {
+        for eta in [1e20_f64, 1e100, 1e150] {
+            let tail = (1.0 / eta).atan() / std::f64::consts::PI;
+            let derivative = (1.0 / eta) / eta / std::f64::consts::PI;
+            let (log_mu, _, score) = cauchit_binomial_geometry(1.0, eta);
+            assert!(log_mu < 0.0 && score < 0.0);
+            assert!((log_mu / (-tail).ln_1p() - 1.0).abs() < 1e-14);
+            assert!((score / -derivative - 1.0).abs() < 3e-13);
+            let (_, log_survival, reflected_score) = cauchit_binomial_geometry(0.0, -eta);
+            assert_eq!(log_survival, log_mu);
+            assert_eq!(reflected_score, -score);
+        }
+    }
+
+    #[test]
+    fn loglog_retains_underflowed_log_survival_and_large_rate_score() {
+        let (_, log_survival, score) = loglog_binomial_geometry(0.0, 800.0);
+        assert_eq!(log_survival, -800.0);
+        assert_eq!(score, 1.0);
+        let eta = -710.0_f64.ln();
+        let rate = (-eta).exp();
+        let (_, _, score) = loglog_binomial_geometry(0.0, eta);
+        let expected = (-eta - rate).exp();
+        assert!(score > 0.0);
+        assert!((score / expected - 1.0).abs() < 1e-12);
+    }
+}
