@@ -5289,6 +5289,76 @@ mod tests {
         );
     }
 
+    /// The drift read from contractions against the ambient axis kernels equals the
+    /// drift read from the perturbed axis matrices, on a gate-band spectrum, over the
+    /// full span and over a Jeffreys span narrower than the coefficient space (#979).
+    #[test]
+    fn axis_contraction_drift_matches_axis_matrix_drift_979() {
+        let p = 4usize;
+        let h0 = array![
+            [30.0, 1.0, 0.5, 0.2],
+            [1.0, 12.0, 0.3, 0.1],
+            [0.5, 0.3, 5.0, 0.4],
+            [0.2, 0.1, 0.4, 1.5],
+        ];
+        let pert_h = array![
+            [2.0, 0.3, 0.1, 0.05],
+            [0.3, 1.5, 0.2, 0.1],
+            [0.1, 0.2, 1.0, 0.15],
+            [0.05, 0.1, 0.15, 0.7],
+        ];
+        let make_sym = |seed: f64| -> Array2<f64> {
+            let a = Array2::from_shape_fn((p, p), |(i, j)| {
+                (seed + 0.37 * i as f64 - 0.19 * j as f64).sin()
+                    + 0.5 * ((i + j) as f64 * seed).cos()
+            });
+            (&a + &a.t()).mapv(|v| 0.5 * v)
+        };
+        let hdots: Vec<Array2<f64>> = (0..p).map(|a| make_sym(1.0 + a as f64)).collect();
+        let pert_axes: Vec<Array2<f64>> =
+            (0..p).map(|a| make_sym(7.0 + 2.0 * a as f64)).collect();
+        let half = std::f64::consts::FRAC_1_SQRT_2;
+        let narrow = array![
+            [1.0, 0.0, 0.0],
+            [0.0, half, 0.0],
+            [0.0, half, 0.0],
+            [0.0, 0.0, 1.0],
+        ];
+        for z in [Array2::<f64>::eye(p), narrow] {
+            let base =
+                JeffreysHphiDriftBase::prepare_with_axes(h0.view(), z.view(), hdots.clone())
+                    .expect("valid Jeffreys drift base")
+                    .expect("the gate-band spectrum keeps the term active");
+            let from_matrices = base
+                .perturbation_derivative_batched_axes(&pert_h, Some(pert_axes.clone()))
+                .expect("drift from the axis matrices");
+            let kernels = base.ambient_axis_kernels();
+            let contractions = Array2::from_shape_fn((p, p), |(a, b)| {
+                pert_axes[a]
+                    .iter()
+                    .zip(kernels[b].iter())
+                    .map(|(&value, &kernel)| value * kernel)
+                    .sum::<f64>()
+            });
+            let from_contractions = base
+                .perturbation_derivative_from_axis_contractions(&pert_h, &contractions)
+                .expect("drift from the axis contractions");
+            let max_abs =
+                |matrix: &Array2<f64>| matrix.iter().fold(0.0_f64, |acc, v| acc.max(v.abs()));
+            let scale = max_abs(&from_matrices);
+            let magnitude = scale.max(max_abs(&contractions));
+            let gap = max_abs(&(&from_matrices - &from_contractions));
+            assert!(scale > 1e-6, "the drift is not exercised: max |drift| = {scale:e}");
+            assert!(
+                gap <= 1e-10 * magnitude,
+                "span width {}: contracted drift differs from the axis-matrix drift by {gap:e} \
+                 (max |drift| {scale:e}, max |contraction| {:e})",
+                z.ncols(),
+                max_abs(&contractions)
+            );
+        }
+    }
+
     #[test]
     pub(crate) fn perturbation_derivative_matches_finite_difference_below_floor() {
         let p = 3usize;

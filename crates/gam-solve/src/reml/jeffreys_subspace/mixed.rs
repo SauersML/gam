@@ -753,6 +753,65 @@ impl JeffreysHphiDriftBase {
         Ok(result)
     }
 
+    /// The fixed ambient kernels `K_b = U·(Ψ∘Ṽ_b)·Uᵀ`, one per coefficient axis.
+    /// For a symmetric axis matrix `A`, `⟨vec sym(UᵀAU), vec(Ψ∘Ṽ_b)⟩ = ⟨A, K_b⟩`, so
+    /// [`Self::perturbation_derivative_from_axis_contractions`] needs only the
+    /// Frobenius products of the axis matrices against these kernels.
+    pub fn ambient_axis_kernels(&self) -> Vec<Array2<f64>> {
+        let m = self.m;
+        self.aw_rows
+            .outer_iter()
+            .map(|row| {
+                let weighted = Array2::from_shape_vec((m, m), row.to_vec())
+                    .expect("each weighted axis row holds one m x m block");
+                self.ambient_eigenbasis
+                    .dot(&weighted)
+                    .dot(&self.ambient_eigenbasis.t())
+            })
+            .collect()
+    }
+
+    /// The explicit-perturbation drift from the contractions
+    /// `contractions[[a, b]] = ⟨A_a, K_b⟩` of the symmetric perturbed axis matrices
+    /// `A_a = ∂Hdot[e_a]` against [`Self::ambient_axis_kernels`], without forming or
+    /// rotating any `A_a`. With `da` the rotated axis rows, the zero-direction
+    /// Fréchet map is the Hadamard product with the same pair divided differences
+    /// `Ψ` the weighted rows carry, so `L(da)·a_rowsᵀ = da·(Ψ∘a_rows)ᵀ` is
+    /// `contractions` and `(Ψ∘a_rows)·daᵀ` is its transpose. Every other term is the
+    /// axis-matrix drift's.
+    pub fn perturbation_derivative_from_axis_contractions(
+        &self,
+        pert_h: &Array2<f64>,
+        contractions: &Array2<f64>,
+    ) -> Result<Array2<f64>, String> {
+        if pert_h.dim() != (self.p, self.p) || contractions.dim() != (self.p, self.p) {
+            return Err("Jeffreys drift contraction dimension mismatch".into());
+        }
+        let e = symmetric_basis_contraction(pert_h.view(), self.ambient_eigenbasis.view());
+        let mut dw = self.inverse_frechet_rows(&self.a_rows, &[&e], 0);
+        if self.floor_in_relative_regime {
+            let dfloor = REDUCED_INFO_RELATIVE_FLOOR * e[[self.idx_max, self.idx_max]];
+            if dfloor != 0.0 {
+                dw.scaled_add(dfloor, &self.inverse_frechet_rows(&self.a_rows, &[], 1));
+            }
+        }
+        let mut result = (dw.dot(&self.a_rows.t()) + contractions + &contractions.t())
+            * (-0.5 * self.gate_weight);
+        let (g_min, g_max) =
+            conditioning_gate_weight_grad(self.evals[self.idx_min], self.evals[self.idx_max]);
+        let dg = g_min * e[[self.idx_min, self.idx_min]]
+            + g_max * e[[self.idx_max, self.idx_max]];
+        if dg != 0.0 {
+            result.scaled_add(-0.5 * dg, &self.aw_rows.dot(&self.a_rows.t()));
+        }
+        let mut result = result.as_standard_layout().to_owned();
+        symmetrize_contiguous(&mut result);
+        if result.iter().any(|v| !v.is_finite()) {
+            return Err("Jeffreys drift produced nonfinite curvature".into());
+        }
+        Ok(result)
+    }
+
     pub(super) fn rotate_axis_rows(&self, axes: &[Array2<f64>]) -> Result<Array2<f64>, String> {
         if axes.len() != self.p || axes.iter().any(|a| a.dim() != (self.p, self.p)) {
             return Err("Jeffreys mixed drift requires one full information derivative per coefficient axis".into());
