@@ -1388,5 +1388,34 @@
     },
     "reason": "#2899 group-A public-surface sweep, under the #2829 rule in docs/rust-library-surface.md: a pub fn that no product uses is deleted. try_to_dense_by_chunks_budgeted (only caller: the gam-test-support design_diagnostics helper, now on try_to_dense_by_chunks), SparseHessianAccumulator::from_single_csr (a wrapper over from_multi_csr that only its own test called, rewritten against from_multi_csr) and gam_math::special::exprel (only special.rs tests called it; log_exprel survives).",
     "evidence": "public_api_census.py --base fe9438c25 --head 141ae3682 reports exactly these three identities (/scratch.global/sauer354/pool/prune-api-a/slice1.census.json). At fe9438c25, git grep -n -w finds no product caller for any of them, and the prune-api-a token census at ac3c0b807 agrees (/scratch.global/sauer354/pool/prune-api-a/census_ac3c0b8.tsv)."
+  },
+  {
+    "base": "ef137a60379495f2cf9264952ccda1637a68c9dc",
+    "removed": {
+      "crates/gam-solve/src/estimate/outer_eval_capture.rs::atoms": 1,
+      "crates/gam-solve/src/estimate/outer_eval_capture.rs::begin_outer_criterion_component_capture": 1,
+      "crates/gam-solve/src/estimate/outer_eval_capture.rs::begin_outer_gradient_component_capture": 1,
+      "crates/gam-solve/src/estimate/outer_eval_capture.rs::enable_outer_gradient_fd_capture_for_psi": 1,
+      "crates/gam-solve/src/estimate/outer_eval_capture.rs::enable_outer_gradient_fd_capture_over_theta": 1,
+      "crates/gam-solve/src/estimate/outer_eval_capture.rs::outer_gradient_audit_capture_armed": 1,
+      "crates/gam-solve/src/estimate/outer_eval_capture.rs::outer_gradient_component_capture_enabled": 1,
+      "crates/gam-solve/src/estimate/outer_eval_capture.rs::outer_gradient_fd_capture_enabled": 1,
+      "crates/gam-solve/src/estimate/outer_eval_capture.rs::outer_gradient_fd_capture_grades_rho": 1,
+      "crates/gam-solve/src/estimate/outer_eval_capture.rs::peek_outer_tangent_basis": 1,
+      "crates/gam-solve/src/estimate/outer_eval_capture.rs::record_outer_curvature_snapshot": 1,
+      "crates/gam-solve/src/estimate/outer_eval_capture.rs::record_outer_eval": 1,
+      "crates/gam-solve/src/estimate/outer_eval_capture.rs::record_outer_gradient_component": 1,
+      "crates/gam-solve/src/estimate/outer_eval_capture.rs::record_outer_gradient_fd": 1,
+      "crates/gam-solve/src/estimate/outer_eval_capture.rs::record_psi_gram_anchor_deltas": 1,
+      "crates/gam-solve/src/estimate/outer_eval_capture.rs::restore_rho_outer_audit": 1,
+      "crates/gam-solve/src/estimate/outer_eval_capture.rs::take_outer_criterion_components": 1,
+      "crates/gam-solve/src/estimate/outer_eval_capture.rs::take_outer_curvature_snapshot": 1,
+      "crates/gam-solve/src/estimate/outer_eval_capture.rs::take_outer_gradient_components": 1,
+      "crates/gam-solve/src/estimate/outer_eval_capture.rs::take_outer_gradient_fd_capture": 1,
+      "crates/gam-solve/src/estimate/outer_eval_capture.rs::take_outer_selected_mode": 1,
+      "crates/gam-solve/src/estimate/outer_eval_capture.rs::take_psi_gram_anchor_deltas": 1
+    },
+    "reason": "SPEC rule 2 (#2901 V3): the production outer-gradient finite-difference audit is deleted, and with it its arming API, its record accessors and the evaluator publication channels only it read. The runner lends an armed test an analytic OuterSeedProbe instead.",
+    "evidence": "public_api_census.py's public_functions predicate over crates/gam-solve/src/estimate/outer_eval_capture.rs at the base and after the change yields these 22 removed pub or pub(crate) fns. No other changed file under crates/ or src/ loses a pub fn. Their consumers at the base were the #2765 gate (rewritten onto observe_next_outer_seed), the two examples/probe_2765_* programs (deleted), the deleted run_plan.rs audit, and publication sites in estimate/joint_hyper.rs and reml_outer_engine/objective.rs that are removed here. outer_gradient_audit_capture_armed is renamed outer_seed_capture_armed."
   }
 ]

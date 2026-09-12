@@ -92,27 +92,14 @@ fn contains_fd_identifier_token(source: &str) -> bool {
 /// the old `root/src/...` monolith and down into a `crates/<crate>/src/...`
 /// tree).
 const SANCTIONED_FD_FILES: &[&str] = &[
-    // ── FD-audit oracle + certificate machinery (NEVER on the fit-math path) ──
-    // The outer-gradient FD audit is a sanctioned DIAGNOSTIC: it differences the
-    // objective only to CHECK the analytic gradient (a Richardson directional
-    // probe) and never feeds the optimizer. The oracle lives in `fd_audit.rs`; the
-    // certificate it produces is stored, copied, and reported through these files
-    // (the `fd_directional` / `fd_error` / `fd_step` fields), all gated behind
-    // `outer_fd_audit_eligible` and bounded by an explicit Richardson error bar.
-    // `fd_audit.rs` was folded into the two files below in a6dbd67a7: the Ridders
-    // probe now lives beside the seed evaluation it audits (`run_plan.rs`), and the
-    // certificate is held in a thread-local store (`outer_eval_capture.rs`).
-    "crates/gam-solve/src/rho_optimizer/run_plan.rs",
-    "crates/gam-solve/src/estimate/outer_eval_capture.rs",
-    "crates/gam-solve/src/estimate/mod.rs", // facade: re-exports the audit entry points only
-    "crates/gam-solve/src/rho_optimizer.rs", // module decl + re-export of the audit oracle
-    "crates/gam-solve/src/rho_optimizer/run.rs", // builds the FD-audit certificate from the oracle
-    "crates/gam-models/src/fit_orchestration/drivers/spatial_optimization.rs", // FD-audit eligibility gate (diagnostic only)
-    "crates/gam-custom-family/src/fit.rs", // FD-audit eligibility gate (diagnostic only)
-    "crates/gam-solve/src/model_types/result_types.rs", // stores the audit certificate fields
-    "crates/gam-solve/src/inference/certificate_impls.rs", // serialises the audit certificate
-    "crates/gam-report/src/lib.rs",        // reports the audit certificate
-    "crates/gam-cli/src/main/run_sample_generate_report.rs",
+    // Declares the `hessian_fd_probes` module, whose pub accessors hand tests the
+    // dense effective Hessian and the converged inner state at a fixed theta.
+    // The accessors difference nothing; the tests that call them form the
+    // differences.
+    "crates/gam-solve/src/estimate/mod.rs",
+    // Implements the external `opt` crate's `set_finite_difference_bounds` hook by
+    // delegation. gam takes no finite difference there.
+    "crates/gam-solve/src/rho_optimizer/run.rs",
 ];
 
 /// The root crate `src` plus every `crates/*/src`, in stable sorted order. This
@@ -638,22 +625,16 @@ fn sanctioned_fd_allowlist_membership_is_correct() {
     assert!(!fd_ok_markers_allowed(Path::new(
         "crates/gam-sae/src/manifold/construction.rs"
     )));
-    // The FD-audit oracle and its certificate-plumbing files ARE allowlisted: the
-    // audit differences the objective only to CHECK the analytic gradient and is
-    // never on the fit-math path (#1440 sanctioned diagnostic).
-    // `fd_audit.rs` NO LONGER EXISTS. a6dbd67a7 folded the Ridders probe into
-    // `run_plan.rs`, beside the seed evaluation it audits, and the certificate
-    // into a thread-local store in `outer_eval_capture.rs`. The allowlist above
-    // was updated -- it names both successors and says so in its own comment --
-    // but this membership assertion was not, so it has been asserting that a
-    // deleted path is allowlisted, which it is not. That made this test RED.
-    //
-    // Name the two files the oracle was folded INTO, and pin the retired path as
-    // NOT allowlisted so it cannot creep back in unreviewed.
-    assert!(fd_ok_markers_allowed(Path::new(
+    // The outer-gradient FD audit is gone (#2901). `run_plan.rs` ran its Ridders
+    // probe at an armed seed and `outer_eval_capture.rs` held its record; the
+    // runner now lends an armed test an analytic seed probe, and the test forms
+    // its own difference. Neither file, nor the retired `fd_audit.rs` before
+    // them, is allowlisted, so a finite difference cannot creep back into them
+    // unreviewed.
+    assert!(!fd_ok_markers_allowed(Path::new(
         "crates/gam-solve/src/rho_optimizer/run_plan.rs"
     )));
-    assert!(fd_ok_markers_allowed(Path::new(
+    assert!(!fd_ok_markers_allowed(Path::new(
         "crates/gam-solve/src/estimate/outer_eval_capture.rs"
     )));
     assert!(!fd_ok_markers_allowed(Path::new(

@@ -852,17 +852,6 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
                 && gram_delta.dim() == cache.xtwx_orig.dim()
                 && rhs_delta.len() == cache.xtwy_orig.len()
             {
-                // #2464: this correction moves the criterion's VALUE, and the
-                // derivative installed below is the UNCORRECTED tensor's, so a
-                // non-zero magnitude here means the tensor's slope error is
-                // loose in the gradient lane. Reported through the typed audit
-                // channel rather than a log line: `gam-models --lib` installs no
-                // logger backend, so a `log::debug!` here emits nothing and its
-                // silence reads as a measured zero.
-                crate::estimate::outer_eval_capture::record_psi_gram_anchor_deltas(
-                    gram_delta.iter().fold(0.0_f64, |a, &v| a.max(v.abs())),
-                    rhs_delta.iter().fold(0.0_f64, |a, &v| a.max(v.abs())),
-                );
                 cache.xtwx_orig += gram_delta;
                 cache.xtwy_orig += rhs_delta;
                 corrected_at = Some((

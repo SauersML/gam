@@ -673,11 +673,10 @@ fn certify_quadratic_at_declared_curvature_2458(
 /// The rejected repair was to close the gap inside the certifier by
 /// forward-differencing the gradient-only route's analytic gradient. It closed
 /// the gap and it was wrong twice over: SPEC line 2 permits finite differences
-/// only outside production, and the distinction that makes that rule bite here
-/// is that the workspace's other production finite difference (the ψ audit in
-/// `run_plan.rs`, behind `outer_gradient_fd_capture_enabled`) is read by nothing
-/// outside tests — it RECORDS what happened, while a rung that overwrites
-/// `stationarity_bound` DECIDES what is true.
+/// only in tests, and a rung that overwrites `stationarity_bound` DECIDES what
+/// is true rather than recording what happened. Production now differences
+/// nothing at all: the ψ audit `run_plan.rs` once ran at an armed seed is an
+/// analytic seed probe whose test forms its own difference (#2901).
 ///
 /// So the contract is: the derived standard is reached by supplying curvature,
 /// never by estimating it on the route's behalf, and a route that cannot supply

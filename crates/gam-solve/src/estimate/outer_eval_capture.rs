@@ -1,566 +1,190 @@
 //! Structured capture of outer-objective evidence for integration tests.
 //!
-//! The raw-evaluation window serves flexible-link measurements (#1876). The
-//! finite-difference record serves end-to-end gradient gates (#2460): when
-//! explicitly enabled, the generic outer runner compares the analytic gradient
-//! at its first bounded seed with a finite difference of that same objective.
-//! Tests consume typed arrays rather than scraping formatted production logs.
+//! Two channels serve tests that grade the outer criterion's derivatives. Both
+//! are disabled by default and thread-local, so a parallel integration test can
+//! neither consume nor overwrite another test's evidence, and an ordinary fit
+//! pays one thread-local read per publication site.
 //!
-//! Both channels are disabled by default. The raw window is process-global
-//! because its flexible-link measurements intentionally span helper calls. The
-//! finite-difference request is thread-local: a parallel integration test can
-//! neither consume nor overwrite another test's one-shot audit.
+//! - The outer-seed probe (#2460, #2765). A test registers an observer with
+//!   [`observe_next_outer_seed`]. At the first seed with enough ψ axes the
+//!   generic outer runner lends it an [`OuterSeedProbe`], which evaluates the
+//!   real objective at any θ from that seed's own inner start. Every evaluation
+//!   returns analytic evidence only: the criterion value, its analytic gradient,
+//!   the scalar criterion components, and the selected coefficient mode with its
+//!   analytic mode response. A test that compares that evidence with a finite
+//!   difference forms the difference itself, so the production tree differences
+//!   nothing (SPEC rule 2, #2901).
+//! - The ρ-block audit (#2454), below.
+//!
+//! Tests consume typed arrays rather than scraping formatted production logs.
 
+use crate::estimate::EstimationError;
 use ndarray::{Array1, Array2};
 use std::cell::RefCell;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Mutex, OnceLock};
 
-/// One captured outer evaluation: the outer coordinate `theta = (ρ ‖ link)`, the
-/// scalar cost, and the analytic outer gradient in the same layout.
-#[derive(Clone, Debug)]
-pub struct OuterEvalRecord {
-    pub theta: Array1<f64>,
-    pub cost: f64,
-    pub gradient: Array1<f64>,
+/// Which derivative order one probe evaluation returns.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OuterSeedOrder {
+    /// The criterion value alone.
+    Value,
+    /// The criterion value and its analytic θ-gradient.
+    ValueAndGradient,
 }
 
-/// Analytic-vs-finite-difference evidence for the ψ block at one real outer
-/// seed.
+/// The seed a probe is lent at, and the box every evaluation it makes has to
+/// stay inside.
 ///
-/// `theta` retains the complete outer seed and `rho_dim` locates the ψ block in
-/// that seed. Every gradient and scalar-stencil array contains exactly
-/// `psi_dim` entries in ψ-local order. Smoothing-parameter ρ coordinates are
-/// deliberately excluded: the κ/geometry gates that request this record do not
-/// grade them, and each unnecessary finite-difference coordinate costs two
-/// complete inner profiles.
+/// `seed` is the complete outer coordinate `θ = (ρ ‖ ψ)`, and `rho_dim` locates
+/// the ψ block inside it.
 #[derive(Clone, Debug)]
-pub struct OuterGradientFdRecord {
-    pub theta: Array1<f64>,
+pub struct OuterSeedLayout {
+    pub seed: Array1<f64>,
+    pub lower: Array1<f64>,
+    pub upper: Array1<f64>,
     pub rho_dim: usize,
     pub psi_dim: usize,
+}
+
+/// Analytic evidence from one probe evaluation at one θ.
+#[derive(Clone, Debug)]
+pub struct OuterSeedEvaluation {
+    /// The criterion value.
     pub cost: f64,
-    pub analytic_psi_gradient: Array1<f64>,
-    pub finite_difference_psi_gradient: Array1<f64>,
-    pub psi_steps: Array1<f64>,
-    /// Ridders' estimate of each ψ finite difference's OWN error, and the
-    /// truncation order of the accepted extrapolant (`2` is a raw stencil, `4`
-    /// one Richardson stage, …).
+    /// The analytic θ-gradient, present exactly when the evaluation asked for
+    /// [`OuterSeedOrder::ValueAndGradient`].
+    pub gradient: Option<Array1<f64>>,
+    /// `(cost, [fixed_beta, logdet_h, logdet_s, kkt])` as the evaluator
+    /// published them.
     ///
-    /// Present because a finite difference is an estimator: without it a
-    /// consumer cannot tell an analytic-gradient defect from its own oracle's
-    /// truncation, and has to grade at whatever tolerance the worst step
-    /// happens to need — which is how these gates ended up at `5e-2` (#2461).
-    /// `f64::INFINITY` marks a coordinate the ladder could not resolve; such a
-    /// component says nothing about the analytic gradient.
-    pub psi_fd_uncertainty: Array1<f64>,
-    pub psi_fd_orders: Vec<usize>,
-
-    /// Max-abs of the `#1033b` psi-Gram anchor correction applied to the
-    /// criterion's VALUE at this seed, as `(gram_delta, rhs_delta)`.
-    ///
-    /// `joint_hyper` pins the n-free tensor to the exactly streamed statistics
-    /// by adding a constant offset measured at one reference psi, then installs
-    /// the derivative of the UNCORRECTED tensor. A constant removes nothing from
-    /// a derivative, so a non-zero value here is the tensor's own value error at
-    /// this seed and its SLOPE error is loose in the gradient lane (#2464).
-    ///
-    /// `None` means the correction never ran on this seed -- NOT that it ran and
-    /// was zero. The distinction is the whole point of the field: a probe that
-    /// reports `0.0` for "never fired" is unfalsifiable, and reading an absent
-    /// emission as a measured zero is exactly how this quantity was first
-    /// mis-measured.
-    pub psi_gram_anchor_deltas: Option<(f64, f64)>,
-    /// The per-atom breakdown of the same comparison, when the objective's
-    /// criterion is assembled from atoms at all.
-    pub decomposition: OuterGradientFdDecomposition,
-    /// The SAME comparison for the ρ (log-smoothing) block, when the caller
-    /// armed [`enable_outer_gradient_fd_capture_over_theta`].
-    ///
-    /// `None` is the default and means the ρ coordinates were not differenced —
-    /// NOT that they agreed. The two blocks are separate fields rather than one
-    /// θ-indexed array because grading ρ is a deliberate, expensive opt-in: each
-    /// coordinate costs a full Ridders ladder of inner profiles, and the shipped
-    /// κ/geometry gates that consume the ψ block do not grade ρ.
-    pub rho: Option<OuterGradientFdRhoBlock>,
-    /// The curvature the `logdet_h` atom is taken on, differenced as a MATRIX
-    /// against the analytic drift the same evaluation published (#2765).
-    ///
-    /// `None` when the backend cannot hand out a dense `H`. See
-    /// [`OuterCurvatureDriftAudit`] for why a scalar-only audit cannot decide
-    /// what this decides.
-    pub curvature: Option<OuterCurvatureDriftAudit>,
+    /// `None` where the criterion is not assembled from REML atoms. The
+    /// constant-curvature fair profile computes its value and derivative in
+    /// closed form and publishes neither this nor a selected mode.
+    pub criterion_components: Option<(f64, [f64; 4])>,
+    /// The selected coefficient mode `β̂` and, on gradient evaluations, the
+    /// analytic extended-coordinate response columns `v_i`, with
+    /// `dβ̂/dψ_i = −v_i`.
+    pub selected_mode: Option<(Array1<f64>, Option<Array2<f64>>)>,
 }
 
-/// The criterion's own curvature and its per-θ-coordinate analytic drift, as
-/// MATRICES, at one evaluation point (#2765).
-///
-/// The scalar audit above compares `½ tr(K·Ḣ_i)` against a finite difference of
-/// `½ log|H|`. When those disagree, three objects could be at fault and the
-/// scalar cannot separate them: the curvature `H` itself, the drift `Ḣ_i`, or
-/// the trace kernel `K` the cost's log-determinant pairs with. Differencing `H`
-/// as a matrix and comparing it to `Ḣ_i` entry by entry answers the middle
-/// question outright, and answers it in a form that names WHICH block of the
-/// joint coefficient space is wrong rather than reporting one contracted number.
-#[derive(Clone, Debug)]
-pub struct OuterCurvatureSnapshot {
-    /// The dense curvature whose log-determinant the `logdet_h` atom reports.
-    pub hessian: Array2<f64>,
-    /// The orthonormal tangent basis `Z` of `null(A_act)` when the inner solve
-    /// returned on an active inequality face and the criterion is therefore the
-    /// TANGENT-projected `½log|ZᵀHZ|` (#2765).
+/// Evaluation access to the real outer objective at one runner seed.
+pub trait OuterSeedProbe {
+    /// The seed this probe was lent at, and its box.
+    fn layout(&self) -> &OuterSeedLayout;
+
+    /// Evaluate the criterion at `theta` from the seed's own inner start.
     ///
-    /// Recorded because it is the coordinate system the whole comparison lives
-    /// in: a drift stated in `p`-space says nothing about a determinant taken on
-    /// an `m`-dimensional face, and a face that MOVES between two displaced θ is
-    /// not a differentiable criterion at all — a distinction the contracted
-    /// scalar cannot express and the previous audit silently averaged over.
-    pub tangent_basis: Option<Array2<f64>>,
-    /// `log|H|` as the criterion consumes it, i.e. the operator's own
-    /// log-determinant plus any uniform-rescale correction. Recorded so a gap
-    /// against `½ log det(hessian)` — a value/kernel disagreement rather than a
-    /// derivative one — is visible instead of assumed absent.
-    pub logdet: f64,
-    /// Total analytic `Ḣ_i` per θ coordinate, ρ block first then ψ, densified.
-    pub drifts: Vec<Array2<f64>>,
+    /// Every call resets the objective first, so two calls at one θ are the
+    /// same evaluation, and a displaced θ is solved from the starting point the
+    /// seed itself is solved from.
+    fn evaluate(
+        &mut self,
+        theta: &Array1<f64>,
+        order: OuterSeedOrder,
+    ) -> Result<OuterSeedEvaluation, EstimationError>;
 }
 
-/// Per-θ-coordinate evidence that the analytic drift IS the derivative of the
-/// curvature the criterion's log-determinant is taken on (#2765).
-#[derive(Clone, Debug)]
-pub struct OuterCurvatureDriftAudit {
-    /// `‖Ḣ_i^analytic − (H(θ+h) − H(θ−h))/2h‖_max` per θ coordinate.
-    pub drift_max_abs_error: Array1<f64>,
-    /// The same, relative to `‖Ḣ_i‖_max` of the two.
-    pub drift_relative_error: Array1<f64>,
-    /// `(row, col)` of the entry carrying `drift_max_abs_error`.
-    pub drift_worst_entry: Vec<(usize, usize)>,
-    /// `‖Z₊Z₊ᵀ − Z₋Z₋ᵀ‖_max` per θ coordinate: how far the ACTIVE FACE the
-    /// criterion's determinant is taken on moves between the two displaced
-    /// evaluations. A non-zero entry means the finite difference straddles two
-    /// different criteria, so the analytic derivative is not wrong there — the
-    /// question is not well posed there.
-    pub face_drift_max_abs: Array1<f64>,
-    /// Tangent dimension at the base point, and at each coordinate's `θ ± h`.
-    pub tangent_dim: Option<usize>,
-    pub displaced_tangent_dim: Vec<(Option<usize>, Option<usize>)>,
-    /// The two objects the comparison is between, retained per θ coordinate:
-    /// the analytic `ZᵀḢ_iZ` and the measured `d(ZᵀHZ)/dθ_i`. A max-abs number
-    /// says a drift is wrong; these say HOW — whether the error is a multiple
-    /// of the face curvature, a rank-one leak, or one block's own.
-    pub analytic_face_drift: Vec<Array2<f64>>,
-    pub measured_face_drift: Vec<Array2<f64>>,
-    /// `ZᵀHZ` itself, the curvature whose determinant the atom reports.
-    pub face_curvature: Array2<f64>,
-    /// `‖Ḣ_i^analytic‖_max`, so a relative error can be read against a scale.
-    pub analytic_drift_max_abs: Array1<f64>,
-    /// `½ log det(H)` recomputed from the captured dense matrix, against the
-    /// `logdet` the criterion actually consumed. A gap here means the operator's
-    /// log-determinant is not the plain one of this matrix (spectral
-    /// regularization, a rank mask, a uniform rescale), which changes what the
-    /// trace kernel has to be.
-    pub dense_half_logdet: f64,
-    pub criterion_half_logdet: f64,
+/// A test's inspection of the outer objective at one seed.
+///
+/// The runner logs an error it returns and proceeds with the seed cascade
+/// unchanged: an observer must not decide the fit it observes.
+pub type OuterSeedObserver =
+    Box<dyn FnOnce(&mut dyn OuterSeedProbe) -> Result<(), EstimationError>>;
+
+/// What the evaluator published during one probe evaluation.
+#[derive(Default)]
+pub(crate) struct OuterSeedCapture {
+    criterion_components: Option<(f64, [f64; 4])>,
+    selected_mode: Option<(Array1<f64>, Option<Array2<f64>>)>,
 }
 
-/// Analytic-vs-finite-difference evidence for the ρ (log-smoothing) block at the
-/// same seed, in ρ-local order (#2765).
-///
-/// The ψ block above and this one are graded by the SAME Ridders ladder against
-/// the SAME criterion, which is the point: the two blocks share the criterion's
-/// moving-Hessian machinery (the trace kernel `K` and the mode-response drift
-/// `D_β H[v]`) but have structurally different frozen drifts — `λ_k S_k`, a
-/// known exact matrix, for ρ, and the family's own `∂_ψ H|_β` for ψ. So a
-/// defect that shows in BOTH blocks lives in the shared machinery and a defect
-/// that shows in only one lives in that block's own drift. Without this the
-/// bisection could not be made, and a ψ-only audit could only report that
-/// *something* in the chain was wrong.
-///
-/// The analytic parts come from the ρ-block audit channel
-/// ([`RhoGradientParts`]), which the capture arms for itself; the
-/// finite-difference parts come from the same criterion-component stencils the
-/// ψ block uses.
-#[derive(Clone, Debug)]
-pub struct OuterGradientFdRhoBlock {
-    pub analytic_gradient: Array1<f64>,
-    pub finite_difference_gradient: Array1<f64>,
-    pub steps: Array1<f64>,
-    pub fd_uncertainty: Array1<f64>,
-    pub fd_orders: Vec<usize>,
-    /// The analytic entry as the ρ-block audit reports it, before the prior
-    /// gradient and the canonical-face KKT projection the assembly applies
-    /// afterwards. Equal to `analytic_gradient` on every model that carries
-    /// neither; recorded separately so a gap between them is visible rather
-    /// than charged to the derivative.
-    pub analytic_audit_total: Array1<f64>,
-    pub analytic_fixed_beta: Array1<f64>,
-    pub analytic_logdet_h: Array1<f64>,
-    /// `analytic_logdet_h` split at the drift: the half that does not read the
-    /// coefficient mode response, `½ tr(K · λ_k S_k)`, and the half that does,
-    /// `½ tr(K · D_β H[v_k])`. The first is PSD-by-construction, so a negative
-    /// entry is a defect that needs no oracle at all.
-    pub analytic_frozen_logdet_h: Array1<f64>,
-    pub analytic_mode_response_logdet_h: Array1<f64>,
-    pub analytic_logdet_s: Array1<f64>,
-    /// `audit_total − (fixed_beta + logdet_h + logdet_s)`: the IFT/KKT fold.
-    pub analytic_kkt: Array1<f64>,
-    pub finite_difference_fixed_beta: Array1<f64>,
-    pub finite_difference_logdet_h: Array1<f64>,
-    pub finite_difference_logdet_s: Array1<f64>,
-    pub finite_difference_kkt: Array1<f64>,
-}
-
-/// Whether the audited criterion decomposes into REML atoms, and the evidence
-/// either way (#2460).
-///
-/// The comparison above — one analytic ψ gradient against one Ridders-certified
-/// finite difference of the same objective — is available from any outer
-/// objective that declares a ψ block, because it needs only `eval_cost` and
-/// `eval_with_order`. The breakdown below is not: it exists where the criterion
-/// is `fixed-β likelihood + ½log|H| − ½log|S|₊ + KKT residual` and the evaluator
-/// publishes those atoms as it assembles them.
-///
-/// Routes that evaluate a criterion directly — the constant-curvature fair
-/// profile computes its value and derivative in closed form and never enters a
-/// REML assembly — have no atoms to publish and no selected coefficient mode to
-/// difference. Making the breakdown a PRECONDITION of the measurement is what
-/// left those routes with no audit at all, which is the wrong way round: a
-/// hand-derived derivative on a bespoke profile is the one that most wants
-/// checking.
-#[derive(Clone, Debug)]
-pub enum OuterGradientFdDecomposition {
-    /// The evaluator published every atom, and each is differenced at the step
-    /// the Ridders ladder accepted for the total.
-    Decomposed(Box<OuterGradientFdAtoms>),
-    /// The evaluator published no atoms, no scalar criterion components and no
-    /// selected coefficient mode. `reason` names the objective so a consumer
-    /// reports which route it got rather than an empty array.
-    ///
-    /// A PARTIAL publication is never reported here — it is a defect in an
-    /// evaluator that means to decompose, and the capture still fails loudly.
-    NotDecomposed { reason: String },
-}
-
-impl OuterGradientFdDecomposition {
-    /// The atoms, or `None` where the criterion does not decompose.
-    pub fn atoms(&self) -> Option<&OuterGradientFdAtoms> {
-        match self {
-            Self::Decomposed(atoms) => Some(atoms),
-            Self::NotDecomposed { .. } => None,
+impl OuterSeedCapture {
+    pub(crate) fn into_evaluation(
+        self,
+        cost: f64,
+        gradient: Option<Array1<f64>>,
+    ) -> OuterSeedEvaluation {
+        OuterSeedEvaluation {
+            cost,
+            gradient,
+            criterion_components: self.criterion_components,
+            selected_mode: self.selected_mode,
         }
     }
 }
 
-/// Per-atom analytic-vs-finite-difference evidence, in ψ-local order.
-///
-/// This is what localizes a total mismatch to a term: the survival marginal-slope
-/// gate reads it to separate an agreeing fixed-β atom from a disagreeing
-/// moving-Hessian chain, which is a different bug report from "the gradient is
-/// wrong".
-#[derive(Clone, Debug)]
-pub struct OuterGradientFdAtoms {
-    pub fixed_beta_psi_gradient: Array1<f64>,
-    pub logdet_h_psi_gradient: Array1<f64>,
-    pub frozen_logdet_h_psi_gradient: Array1<f64>,
-    pub mode_response_logdet_h_psi_gradient: Array1<f64>,
-    pub analytic_mode_response_norm: Array1<f64>,
-    pub finite_difference_mode_response_norm: Array1<f64>,
-    pub mode_response_relative_error: Array1<f64>,
-    pub mode_response_max_abs_error: Array1<f64>,
-    pub logdet_s_psi_gradient: Array1<f64>,
-    pub kkt_psi_gradient: Array1<f64>,
-    pub finite_difference_fixed_beta_psi_gradient: Array1<f64>,
-    pub finite_difference_logdet_h_psi_gradient: Array1<f64>,
-    pub finite_difference_logdet_s_psi_gradient: Array1<f64>,
-    pub finite_difference_kkt_psi_gradient: Array1<f64>,
-}
-
-/// Maximum evaluations retained per capture window (opening iterates only).
-const MAX_CAPTURED: usize = 8;
-
-static ENABLED: AtomicBool = AtomicBool::new(false);
-
-struct OuterGradientFdCapture {
-    min_psi_dim: usize,
-    grade_rho: bool,
-    record: Option<OuterGradientFdRecord>,
-    components: Vec<(f64, f64, f64, f64, f64, f64)>,
-    criterion_components: Option<(f64, [f64; 4])>,
-    psi_gram_anchor_deltas: Option<(f64, f64)>,
-    selected_mode: Option<(Array1<f64>, Option<Array2<f64>>)>,
-    curvature: Option<OuterCurvatureSnapshot>,
-    tangent_basis: Option<Array2<f64>>,
-}
-
 thread_local! {
-    static FD_CAPTURE: RefCell<Option<OuterGradientFdCapture>> = const { RefCell::new(None) };
+    static SEED_OBSERVER: RefCell<Option<(usize, OuterSeedObserver)>> = const { RefCell::new(None) };
+    static SEED_CAPTURE: RefCell<Option<OuterSeedCapture>> = const { RefCell::new(None) };
 }
 
-fn buffer() -> &'static Mutex<Vec<OuterEvalRecord>> {
-    static BUFFER: OnceLock<Mutex<Vec<OuterEvalRecord>>> = OnceLock::new();
-    BUFFER.get_or_init(|| Mutex::new(Vec::new()))
+/// Lend `observer` a probe at the next outer seed on this thread that has at
+/// least `min_psi_dim` ψ axes. Replaces an observer that has not run yet.
+pub fn observe_next_outer_seed(min_psi_dim: usize, observer: OuterSeedObserver) {
+    SEED_OBSERVER.with(|slot| *slot.borrow_mut() = Some((min_psi_dim, observer)));
 }
 
-/// Request one structured audit over the WHOLE θ vector — the ψ block and the
-/// ρ (log-smoothing) block — at the next outer seed with enough ψ axes.
-///
-/// Opt-in rather than the default because grading ρ costs a full Ridders ladder
-/// of inner profiles per coordinate, which is the same price the ψ block pays
-/// and which the shipped κ/geometry gates have no use for. What it buys is the
-/// bisection described on [`OuterGradientFdRhoBlock`]: the two blocks share the
-/// criterion's moving-Hessian machinery and differ in their frozen drift, so a
-/// disagreement present in one and absent in the other localizes the defect
-/// without any new instrumentation inside the evaluator.
-pub fn enable_outer_gradient_fd_capture_over_theta(min_psi_dim: usize) {
-    arm_outer_gradient_fd_capture(min_psi_dim, true);
-}
-
-/// Request the extended-coordinate audit without differencing smoothing
-/// parameters. Use this when the acceptance gate grades only the ψ block;
-/// each omitted ρ ladder would otherwise repeat full coefficient fits whose
-/// derivatives the gate does not inspect.
-pub fn enable_outer_gradient_fd_capture_for_psi(min_psi_dim: usize) {
-    arm_outer_gradient_fd_capture(min_psi_dim, false);
-}
-
-fn arm_outer_gradient_fd_capture(min_psi_dim: usize, grade_rho: bool) {
-    FD_CAPTURE.with(|capture| {
-        *capture.borrow_mut() = Some(OuterGradientFdCapture {
-            min_psi_dim,
-            grade_rho,
-            record: None,
-            components: Vec::new(),
-            criterion_components: None,
-            psi_gram_anchor_deltas: None,
-            selected_mode: None,
-            curvature: None,
-            tangent_basis: None,
-        });
-    });
-}
-
-/// Whether the armed audit was asked to difference the ρ block too.
-pub(crate) fn outer_gradient_fd_capture_grades_rho() -> bool {
-    FD_CAPTURE.with(|capture| {
-        capture
-            .borrow()
+/// Take this thread's observer when a seed with `psi_dim` ψ axes satisfies it.
+pub(crate) fn take_outer_seed_observer(psi_dim: usize) -> Option<OuterSeedObserver> {
+    SEED_OBSERVER.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        if slot
             .as_ref()
-            .is_some_and(|state| state.record.is_none() && state.grade_rho)
-    })
-}
-
-pub(crate) fn begin_outer_gradient_component_capture() {
-    FD_CAPTURE.with(|capture| {
-        if let Some(state) = capture.borrow_mut().as_mut() {
-            state.components.clear();
-        }
-    });
-}
-
-pub(crate) fn outer_gradient_component_capture_enabled() -> bool {
-    FD_CAPTURE.with(|capture| {
-        capture
-            .borrow()
-            .as_ref()
-            .is_some_and(|state| state.record.is_none())
-    })
-}
-
-pub(crate) fn record_outer_gradient_component(
-    fixed_beta: f64,
-    logdet_h: f64,
-    frozen_logdet_h: f64,
-    mode_response_logdet_h: f64,
-    logdet_s: f64,
-    kkt: f64,
-) {
-    FD_CAPTURE.with(|capture| {
-        if let Some(state) = capture.borrow_mut().as_mut()
-            && state.record.is_none()
+            .is_some_and(|(min_psi_dim, _)| psi_dim >= *min_psi_dim)
         {
-            state.components.push((
-                fixed_beta,
-                logdet_h,
-                frozen_logdet_h,
-                mode_response_logdet_h,
-                logdet_s,
-                kkt,
-            ));
+            slot.take().map(|(_, observer)| observer)
+        } else {
+            None
         }
-    });
-}
-
-pub(crate) fn take_outer_gradient_components() -> Vec<(f64, f64, f64, f64, f64, f64)> {
-    FD_CAPTURE.with(|capture| {
-        capture
-            .borrow_mut()
-            .as_mut()
-            .map_or_else(Vec::new, |state| std::mem::take(&mut state.components))
     })
 }
 
-pub(crate) fn begin_outer_criterion_component_capture() {
-    FD_CAPTURE.with(|capture| {
-        if let Some(state) = capture.borrow_mut().as_mut() {
-            state.criterion_components = None;
-            state.psi_gram_anchor_deltas = None;
-            state.selected_mode = None;
-            state.curvature = None;
-            state.tangent_basis = None;
-        }
-    });
+/// Open the publication window for one probe evaluation.
+pub(crate) fn begin_outer_seed_capture() {
+    SEED_CAPTURE.with(|capture| *capture.borrow_mut() = Some(OuterSeedCapture::default()));
 }
 
-pub(crate) fn peek_outer_tangent_basis() -> Option<Array2<f64>> {
-    FD_CAPTURE.with(|capture| {
-        capture
-            .borrow()
-            .as_ref()
-            .and_then(|state| state.tangent_basis.clone())
-    })
+/// Close the publication window and take what the evaluation published.
+pub(crate) fn end_outer_seed_capture() -> OuterSeedCapture {
+    SEED_CAPTURE.with(|capture| capture.borrow_mut().take().unwrap_or_default())
 }
 
-/// Retain the criterion's dense curvature and its analytic drifts for an armed
-/// audit (#2765).
+/// Whether a probe evaluation is in flight on this thread.
 ///
-/// Called from the REML/LAML assembly, which is the only place that holds both
-/// the operator the log-determinant is taken on and the per-coordinate drift
-/// that claims to be its derivative. No-op unless a finite-difference audit
-/// armed this thread, so an ordinary fit pays one thread-local read.
-pub fn record_outer_curvature_snapshot(snapshot: OuterCurvatureSnapshot) {
-    FD_CAPTURE.with(|capture| {
-        if let Some(state) = capture.borrow_mut().as_mut()
-            && state.record.is_none()
-        {
-            state.curvature = Some(snapshot);
-        }
-    });
+/// Emitters consult this before building the evidence they would hand to
+/// [`record_outer_selected_mode`], so an ordinary fit pays a thread-local read
+/// rather than a coefficient-vector clone on every outer evaluation.
+pub(crate) fn outer_seed_capture_armed() -> bool {
+    SEED_CAPTURE.with(|capture| capture.borrow().is_some())
 }
 
-pub(crate) fn take_outer_curvature_snapshot() -> Option<OuterCurvatureSnapshot> {
-    FD_CAPTURE.with(|capture| {
-        capture
-            .borrow_mut()
-            .as_mut()
-            .and_then(|state| state.curvature.take())
-    })
-}
-
-/// Retain the final selected scalar-criterion decomposition for an armed
-/// outer-gradient audit.
+/// Publish the selected scalar-criterion decomposition to an in-flight probe
+/// evaluation.
 ///
-/// This is public only so sibling workspace evaluators can report through the
-/// same typed sink after their own nonconvex mode selection. It is a no-op
-/// unless [`enable_outer_gradient_fd_capture_over_theta`] armed the calling thread.
+/// Public so sibling workspace evaluators can report through the same typed
+/// sink after their own nonconvex mode selection. No-op outside a probe
+/// evaluation.
 pub fn record_outer_criterion_components(cost: f64, components: [f64; 4]) {
-    FD_CAPTURE.with(|capture| {
-        if let Some(state) = capture.borrow_mut().as_mut()
-            && state.record.is_none()
-        {
+    SEED_CAPTURE.with(|capture| {
+        if let Some(state) = capture.borrow_mut().as_mut() {
             state.criterion_components = Some((cost, components));
         }
     });
 }
 
-/// Report the psi-Gram anchor correction's magnitude for an armed audit.
-///
-/// Public for the same reason as [`record_outer_criterion_components`]: the
-/// correction is applied in the evaluator, not in the outer runner that builds
-/// the record. No-op unless [`enable_outer_gradient_fd_capture_over_theta`] armed this
-/// thread. Called on every application, so the LAST application before the
-/// record is finalized is the one reported -- the seed the audit grades.
-pub fn record_psi_gram_anchor_deltas(gram_delta_max_abs: f64, rhs_delta_max_abs: f64) {
-    FD_CAPTURE.with(|capture| {
-        if let Some(state) = capture.borrow_mut().as_mut()
-            && state.record.is_none()
-        {
-            state.psi_gram_anchor_deltas = Some((gram_delta_max_abs, rhs_delta_max_abs));
-        }
-    });
-}
-
-pub(crate) fn take_psi_gram_anchor_deltas() -> Option<(f64, f64)> {
-    FD_CAPTURE.with(|capture| {
-        capture
-            .borrow_mut()
-            .as_mut()
-            .and_then(|state| state.psi_gram_anchor_deltas.take())
-    })
-}
-
-pub(crate) fn take_outer_criterion_components() -> Option<(f64, [f64; 4])> {
-    FD_CAPTURE.with(|capture| {
-        capture
-            .borrow_mut()
-            .as_mut()
-            .and_then(|state| state.criterion_components.take())
-    })
-}
-
-/// Retain the selected coefficient mode and its analytic extended-coordinate
-/// response columns for an armed finite-difference audit.
+/// Publish the selected coefficient mode and its analytic extended-coordinate
+/// response columns to an in-flight probe evaluation.
 ///
 /// Sibling workspace evaluators call this only after nonconvex candidate
 /// selection, beside [`record_outer_criterion_components`]. Value-only
-/// evaluations pass no response columns but still retain their selected
-/// coefficients for the scalar stencil.
+/// evaluations pass no response columns but still publish their selected
+/// coefficients. No-op outside a probe evaluation.
 pub fn record_outer_selected_mode(
     beta: Array1<f64>,
     ext_mode_response_cols: Option<Array2<f64>>,
 ) {
-    FD_CAPTURE.with(|capture| {
-        if let Some(state) = capture.borrow_mut().as_mut()
-            && state.record.is_none()
-        {
+    SEED_CAPTURE.with(|capture| {
+        if let Some(state) = capture.borrow_mut().as_mut() {
             state.selected_mode = Some((beta, ext_mode_response_cols));
-        }
-    });
-}
-
-/// Whether a finite-difference audit is armed on this thread at all.
-///
-/// Emitters consult this before building the evidence they would hand to
-/// [`record_outer_selected_mode`], so an unarmed fit pays a thread-local read
-/// rather than a coefficient-vector clone on every outer evaluation.
-pub fn outer_gradient_audit_capture_armed() -> bool {
-    FD_CAPTURE.with(|capture| {
-        capture
-            .borrow()
-            .as_ref()
-            .is_some_and(|state| state.record.is_none())
-    })
-}
-
-pub(crate) fn take_outer_selected_mode() -> Option<(Array1<f64>, Option<Array2<f64>>)> {
-    FD_CAPTURE.with(|capture| {
-        capture
-            .borrow_mut()
-            .as_mut()
-            .and_then(|state| state.selected_mode.take())
-    })
-}
-
-/// Stop the audit window and take its single record.
-pub fn take_outer_gradient_fd_capture() -> Option<OuterGradientFdRecord> {
-    FD_CAPTURE.with(|capture| capture.borrow_mut().take().and_then(|state| state.record))
-}
-
-pub(crate) fn outer_gradient_fd_capture_enabled(psi_dim: usize) -> bool {
-    FD_CAPTURE.with(|capture| {
-        capture
-            .borrow()
-            .as_ref()
-            .is_some_and(|state| state.record.is_none() && psi_dim >= state.min_psi_dim)
-    })
-}
-
-pub(crate) fn record_outer_gradient_fd(record: OuterGradientFdRecord) {
-    FD_CAPTURE.with(|capture| {
-        if let Some(state) = capture.borrow_mut().as_mut()
-            && state.record.is_none()
-            && record.psi_dim >= state.min_psi_dim
-        {
-            state.record = Some(record);
         }
     });
 }
@@ -569,7 +193,7 @@ pub(crate) fn record_outer_gradient_fd(record: OuterGradientFdRecord) {
 //  ρ-block outer audit (#2454)
 // ═══════════════════════════════════════════════════════════════════════════
 //
-// The ψ block has carried a typed analytic-vs-FD record since #2460; the ρ
+// The seed probe has carried typed analytic ψ evidence since #2460; the ρ
 // block had none, so every large-λ smoothing-gradient investigation had to
 // scrape `log::trace!` lines or bolt an environment-gated instrument onto the
 // evaluator. This channel closes that asymmetry: it emits, per outer
@@ -578,7 +202,7 @@ pub(crate) fn record_outer_gradient_fd(record: OuterGradientFdRecord) {
 // gradient — so a caller can finite-difference each criterion component and
 // grade the gradient part that owns it, instead of grading only their sum.
 //
-// Thread-local and disabled by default, matching the ψ channel: a parallel
+// Thread-local and disabled by default, matching the seed probe: a parallel
 // integration test can neither consume nor overwrite another test's audit.
 
 /// One ρ coordinate's analytic gradient, split into the additive parts that
@@ -780,15 +404,6 @@ pub fn take_rho_outer_audit() -> Option<RhoOuterAudit> {
     RHO_AUDIT.with(|audit| audit.borrow_mut().take())
 }
 
-/// Re-arm the ρ-block audit with a window taken earlier.
-///
-/// Exists so a nested consumer — the outer-gradient FD capture, which arms this
-/// channel for itself to read the analytic ρ atoms — can hand a caller's window
-/// back untouched instead of silently disarming an audit it did not open.
-pub fn restore_rho_outer_audit(window: RhoOuterAudit) {
-    RHO_AUDIT.with(|audit| *audit.borrow_mut() = Some(window));
-}
-
 pub(crate) fn rho_outer_audit_enabled() -> bool {
     RHO_AUDIT.with(|audit| audit.borrow().is_some())
 }
@@ -877,20 +492,4 @@ pub(crate) fn record_rho_gradient_parts(parts: Vec<RhoGradientParts>) {
             state.parts = parts;
         }
     });
-}
-
-/// Record one outer evaluation when capture is enabled (no-op otherwise). Only
-/// the first [`MAX_CAPTURED`] evaluations of a window are retained.
-pub(crate) fn record_outer_eval(theta: &Array1<f64>, cost: f64, gradient: &Array1<f64>) {
-    if !ENABLED.load(Ordering::Relaxed) {
-        return;
-    }
-    let mut b = buffer().lock().expect("outer-eval capture buffer");
-    if b.len() < MAX_CAPTURED {
-        b.push(OuterEvalRecord {
-            theta: theta.clone(),
-            cost,
-            gradient: gradient.clone(),
-        });
-    }
 }

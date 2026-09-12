@@ -2321,19 +2321,15 @@ impl<'a> RemlState<'a> {
             result.cost,
             components,
         );
-        // The audit's OTHER half. `record_outer_selected_mode` was emitted only
-        // from the custom-family evaluator, so on every standard fit
-        // `capture_outer_gradient_fd_at_seed` failed with "received no analytic
-        // selected coefficient mode" before it differenced anything — the
-        // Matérn, constant-curvature and survival outer-gradient FD gates could
-        // not produce a record at all, whatever their tolerance said. The
+        // The seed probe's other half: the selected coefficient mode and its
+        // analytic mode response, published beside the criterion components.
+        // It was once emitted only from the custom-family evaluator, so no
+        // standard fit could hand a test a coefficient mode to difference. The
         // standard path has both halves of the evidence right here, so it
-        // records them beside the criterion components exactly as the
-        // custom-family path does. Guarded on `..._armed()` so an ordinary fit
-        // pays a thread-local read rather than a coefficient clone per outer
-        // evaluation. (#2461 needed this to verify its own change; #2460 owns
-        // the audit.)
-        if crate::estimate::outer_eval_capture::outer_gradient_audit_capture_armed() {
+        // publishes them exactly as the custom-family path does. Guarded on
+        // `outer_seed_capture_armed()` so an ordinary fit pays a thread-local
+        // read rather than a coefficient clone per outer evaluation (#2460).
+        if crate::estimate::outer_eval_capture::outer_seed_capture_armed() {
             let ext_cols = result
                 .ext_mode_response_cols
                 .as_ref()

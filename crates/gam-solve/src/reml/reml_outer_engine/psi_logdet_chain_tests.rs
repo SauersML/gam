@@ -2,8 +2,8 @@
 //! Does the ψ/ext block's `½ ∂_ψ log|H|` term differentiate the criterion's OWN
 //! `logdet_h` scalar? (gam#2765 / gam#2767, the #979/#1040 lane.)
 //!
-//! The end-to-end audit on survival marginal-slope
-//! (`examples/probe_2765_outer_gradient_fd.rs`) records the ψ gradient's
+//! The end-to-end audit on survival marginal-slope (the since-deleted
+//! `examples/probe_2765_outer_gradient_fd.rs`) recorded the ψ gradient's
 //! `fixed_beta` atom agreeing with its Ridders oracle to six digits while the
 //! `logdet_h` atom disagrees by 130 % and 700 % of itself, with the oracle's own
 //! uncertainty nine orders below the gap. Every existing gate sits on one side

@@ -1738,8 +1738,7 @@ pub fn audit_stationary_point(
 // convergence while the criterion is not actually stationary there (or the
 // optimizer stalls and rails λ). The certificate makes the engine check
 // itself, once, at θ̂, on every generic outer fit — purely from the ANALYTIC
-// objective, per SPEC rule 2 (finite differences never run outside tests;
-// the FD gradient oracle now lives in the test-only `fd_audit` module): the
+// objective, per SPEC rule 2 (finite differences never run outside tests): the
 // KKT-projected analytic gradient norm against the same score-relative
 // stationarity bound the outer loop already uses to accept flat-valley
 // stalls (#1690), a scaled PSD probe of the tracked outer Hessian, and the
@@ -4569,11 +4568,9 @@ fn certify_outer_optimality_at_terminal_fidelity(
     // removal) is the reason this comment exists rather than a code block.
     // Forward-differencing the route's analytic gradient produces a number that
     // decides which fits are certified, and SPEC line 2 permits finite
-    // differences only outside production. The workspace's one other production
-    // finite difference -- the psi audit in `run_plan.rs`, behind
-    // `outer_gradient_fd_capture_enabled` -- is read by nothing outside tests:
-    // it RECORDS what happened. A rung that overwrites `stationarity_bound`
-    // DECIDES what is true, and the precedent does not reach it.
+    // differences only in tests. Production differences nothing: the psi audit
+    // `run_plan.rs` once ran at an armed seed is now an analytic seed probe, and
+    // the test that arms it forms its own difference (#2901).
     //
     // The correct fix is upstream and is being applied there: a route with no
     // analytic Hessian should acquire one, not have one estimated on its behalf
