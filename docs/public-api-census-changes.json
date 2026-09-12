@@ -1179,5 +1179,15 @@
     },
     "reason": "#2023: the co-collapse reseed never reads principal components. set_data_row_reseed configured a lever that every production entry hard-coded false and that is now deleted. reseed_atoms_onto_distinct_residual_pcs is replaced by reseed_atoms_from_residual, which reads graph harmonics or the worst-reconstructed rows. sae_data_row_anchored_euclidean_coords (flat atoms only) is replaced by the kind-aware sae_data_row_anchored_coords.",
     "evidence": "Replacements in the same commit: reseed_atoms_from_residual in fit_drivers.rs, now called at all three former reseed call sites, and sae_data_row_anchored_coords in pca_seed.rs, called from reseed_charts_from_residual and the pca_seed diversification test. At the base, set_data_row_reseed was called only from fit_seed.rs and tests_pc_reseed_provenance_2023.rs, and no gam-pyffi or gamfit file named any of the three."
+  },
+  {
+    "base": "62483802465559c5d79a0d6db5ace822fcedfe18",
+    "removed": {
+      "crates/gam-gpu/src/policy.rs::blocked": 1,
+      "crates/gam-gpu/src/policy.rs::from_device_measurement": 1,
+      "crates/gam-gpu/src/policy.rs::from_device_measurement_against": 1
+    },
+    "reason": "user directive: delete all useless slop (only used by tests / unused)",
+    "evidence": "EncodeDeploymentDecision's three public constructors (from_device_measurement, from_device_measurement_against, blocked) had no caller after fb2a87bc8 removed gam-sae's device-encode throughput measurement; git grep at 3bb12aea8 finds none."
   }
 ]

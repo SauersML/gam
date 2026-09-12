@@ -3078,5 +3078,18 @@
     ],
     "reason": "#2023: the co-collapse reseed no longer reads principal components. reseed_atoms_onto_distinct_residual_pcs is renamed reseed_atoms_from_residual (graph harmonics for circle/torus/sphere sets, the worst-reconstructed rows otherwise). sae_data_row_anchored_euclidean_coords is replaced by the kind-aware sae_data_row_anchored_coords. set_data_row_reseed goes with the data_row_reseed lever, which every production entry hard-coded false. The three pins asserted the principal-component reseed and the lever; the chart-atom one credited principal components for a seed that was graph harmonics.",
     "evidence": "The identities are this guard's own output over base..candidate, candidate built from the base plus this patch. At the base, set_data_row_reseed was called only by fit_seed.rs (with a request field that every constructor set false) and tests_pc_reseed_provenance_2023.rs. reseed_atoms_onto_distinct_residual_pcs had three call sites, all in fit_drivers.rs and all repointed in this patch. sae_data_row_anchored_euclidean_coords was called from fit_drivers.rs and one pca_seed.rs test, both repointed. The replacement pins are flat_reseed_follows_the_worst_row_where_principal_components_disagree_2023, circle_atoms_reseed_from_the_residual_graph_harmonics_2023 and projective_plane_reseed_rows_are_unit_vectors_anchored_at_the_worst_row_2023."
+  },
+  {
+    "base": "62483802465559c5d79a0d6db5ace822fcedfe18",
+    "items": [
+      "crates/gam-gpu/src/policy.rs:const:GPU_THROUGHPUT_TARGET_ROWS_PER_SEC",
+      "crates/gam-gpu/src/policy.rs:enum:EncodeDecisionBlocked",
+      "crates/gam-gpu/src/policy.rs:enum:EncodeDeploymentDecision",
+      "crates/gam-gpu/src/policy.rs:fn:blocked",
+      "crates/gam-gpu/src/policy.rs:fn:from_device_measurement",
+      "crates/gam-gpu/src/policy.rs:fn:from_device_measurement_against"
+    ],
+    "reason": "user directive: delete all useless slop (only used by tests / unused)",
+    "evidence": "The only consumer of these policy.rs items was gam-sae's device-resident certified encode (sae_encode_resident.rs measure_device_encode_throughput), removed by fb2a87bc8. At origin/main 3bb12aea8, git grep -nw over crates, src, tests, examples, bench and benches finds EncodeDeploymentDecision, EncodeDecisionBlocked, from_device_measurement and GPU_THROUGHPUT_TARGET_ROWS_PER_SEC only inside policy.rs's own definitions and docs, and no test calls them."
   }
 ]
