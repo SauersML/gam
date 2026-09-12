@@ -14,8 +14,8 @@ timeout was the (now-fixed) GPU-death / sparsity-default defect, not a compute
 wall; if it does not, we have reproduced the wall at documented scale.
 
 Usage:
-  python examples/_gen_synthetic_activations_2267.py --out /scratch.global/<you>/synth_635.npy
-  python examples/sae_ev_vs_k_olmo.py --npy /scratch.global/<you>/synth_635.npy \
+  python experiments/_gen_synthetic_activations_2267.py --out /scratch.global/<you>/synth_635.npy
+  python experiments/sae_ev_vs_k_olmo.py --npy /scratch.global/<you>/synth_635.npy \
       --pcs 32 --seed 42 --out /scratch.global/<you>/2267_synth_timing.json
 """
 from __future__ import annotations

@@ -20,7 +20,7 @@ straight into `sae_ev_vs_k_olmo.py`. Exit 3 + a `MISSING` line (with the
 harvest command to generate one) when nothing qualifies.
 
 USAGE (on a compute node):
-  python examples/sae_corpus_discover.py \
+  python experiments/sae_corpus_discover.py \
       --candidate <data-root>/olmo_data/base/activations.npy:25 \
       --candidate <data-root>/olmo_data/instruct \
       --min-d-model 2048
@@ -120,7 +120,7 @@ def main() -> int:
     print("MISSING")
     print(
         "[discover] no full-width activation cache found. Generate one with:\n"
-        f"  python examples/harvest_residual_activations.py --model {args.harvest_model} \\\n"
+        f"  python experiments/harvest_residual_activations.py --model {args.harvest_model} \\\n"
         f"      --dataset wikitext --config wikitext-103-raw-v1 --layer {args.harvest_layer} \\\n"
         "      --n-tokens 4000 --out resid_cache.pt\n"
         "  then: python examples/sae_ev_vs_k_olmo.py --pt resid_cache.pt --pcs 32 --seed 42",

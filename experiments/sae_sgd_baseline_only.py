@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 """#1026 — FAST standalone linear SGD-SAE baseline (no gam fit).
 
-Companion to examples/sae_ev_vs_k_olmo.py: that driver produces the gam
+Companion to experiments/sae_ev_vs_k_olmo.py: that driver produces the gam
 manifold-SAE held-out EV-vs-K (curved vs euclidean). This script produces the
 matching LINEAR SGD-SAE held-out EV at matched K and at a large overcomplete
 budget, on the SAME activation slice / split / PCA projection. It runs in

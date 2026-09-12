@@ -9,7 +9,7 @@ import numpy as np
 
 
 def _load_driver_module():
-    path = Path(__file__).resolve().parents[1] / "examples" / "sae_ev_vs_k_olmo.py"
+    path = Path(__file__).resolve().parents[1] / "experiments" / "sae_ev_vs_k_olmo.py"
     spec = importlib.util.spec_from_file_location("sae_ev_vs_k_olmo", path)
     assert spec is not None
     assert spec.loader is not None

@@ -53,12 +53,12 @@ Use --linear-score-mode=required only for a deliberately GPU-resident sparse-
 linear measurement; it fails closed if the device route is not admitted.
 
 EXAMPLE (OLMo-3-32B base, layer 25, on a cluster compute node):
-  python examples/sae_ev_vs_k_olmo.py \
+  python experiments/sae_ev_vs_k_olmo.py \
       --npy /path/to/scratch/olmo_data/.../base/activations.npy \
       --olmo-layer 25 --pcs 32 --seed 42
 
 EXAMPLE (generic harvested cache):
-  python examples/sae_ev_vs_k_olmo.py --npy qwen3_8b_wikitext/resid_L18.npy \
+  python experiments/sae_ev_vs_k_olmo.py --npy qwen3_8b_wikitext/resid_L18.npy \
       --max-rows 2000 --pcs 32 --cpu-partial
 """
 from __future__ import annotations
