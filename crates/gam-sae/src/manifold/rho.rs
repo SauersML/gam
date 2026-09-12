@@ -146,11 +146,7 @@ pub struct SaeManifoldRho {
     ///
     /// The block weight scales the augmented crosscoder target's block columns by
     /// `√λ_ℓ` (never the design), so it enters the criterion only through the
-    /// per-block residual sum of squares and the `√λ_ℓ` target-scaling Jacobian —
-    /// its closed-form REML variance ratio is
-    /// `crate::manifold::behavior::OutputBlock::reml_updated_log_lambda` and its
-    /// analytic outer gradient is
-    /// `crate::manifold::behavior::profiled_penalized_quasi_laplace_block_log_lambda_gradient`.
+    /// per-block residual sum of squares and the `√λ_ℓ` target-scaling Jacobian.
     pub log_lambda_block: Vec<f64>,
     /// #2604 — per-atom sectional curvature `kappa` for constant-curvature
     /// atoms, in atom order. EMPTY for every dictionary without one, which is
@@ -245,17 +241,6 @@ impl SaeManifoldRho {
             kappa: Vec::new(),
             kappa_atoms: Vec::new(),
         }
-    }
-
-    /// Return a copy of this ρ carrying the crosscoder per-block relevance weights
-    /// `log(λ_ℓ)` (#2231 §2a). The block sub-vector is APPENDED to the flat
-    /// layout after ARD; an empty `log_lambda_block` restores the plain-SAE
-    /// byte-identical layout. The block order must match a term's
-    /// [`crate::manifold::CrosscoderLayout::block_dims`].
-    #[must_use]
-    pub fn with_log_lambda_block(mut self, log_lambda_block: Vec<f64>) -> Self {
-        self.log_lambda_block = log_lambda_block;
-        self
     }
 
     /// Attach sectional curvatures as `(atom_index, kappa)` pairs. Empty
@@ -454,15 +439,6 @@ impl SaeManifoldRho {
         }
     }
 
-    /// Shift every scale-coupled penalty seed by the profiled reconstruction
-    /// dispersion scale. SAE's Gaussian data-fit term is in squared output
-    /// units, while `lambda_sparse`, `lambda_smooth`, and ARD precisions are
-    /// absolute penalty weights; adding `log(phi_seed)` makes the seeded
-    /// effective stiffness `lambda / phi_seed` dimensionless.
-    pub fn seed_scaled_by_dispersion(&self, dispersion: f64) -> Result<Self, String> {
-        self.seed_scaled_by_dispersion_with_sparse_policy(dispersion, true)
-    }
-
     /// Assignment-aware seed scaling.
     ///
     /// The response-dispersion shift `λ → λ·φ_seed` makes the seeded effective
@@ -569,8 +545,8 @@ impl SaeManifoldRho {
     ) -> Result<Self, String> {
         if !(dispersion.is_finite() && dispersion > 0.0) {
             return Err(format!(
-                "SaeManifoldRho::seed_scaled_by_dispersion: dispersion must be finite and \
-                 positive; got {dispersion}"
+                "SaeManifoldRho::seed_scaled_by_dispersion_with_sparse_policy: dispersion must be \
+                 finite and positive; got {dispersion}"
             ));
         }
         let shift = dispersion.ln();

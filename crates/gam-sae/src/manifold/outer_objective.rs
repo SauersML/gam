@@ -4529,110 +4529,6 @@ pub struct CurvatureWalkReport {
     pub reseeds: usize,
 }
 
-/// Curvature-homotopy output linear-span (low-rank / Eckart-Young) anchor.
-///
-/// This stage-1 primitive certifies the rank-`Σ basis_size` Eckart-Young residual
-/// CEILING of the target by sequential residual SVDs, canonicalizing every
-/// recovered output *linear subspace* (the span of the top singular vectors — the
-/// "linear span" this anchor names) through the same [`GrassmannFrame`] gauge used
-/// by the #972 frame machinery. The ceiling is a lower bound on the residual at
-/// every `eta`; it is NOT a claim that the `eta = 0` parametric endpoint is a
-/// linear/affine model (for curved bases that base-topology chart still embeds
-/// curvature). It does not mutate `term` or replace the existing seed cascade.
-pub fn linear_span_anchor(
-    term: &SaeManifoldTerm,
-    targets: ArrayView2<'_, f64>,
-) -> Result<LinearSpanAnchor, String> {
-    let n = term.n_obs();
-    let p = term.output_dim();
-    if targets.dim() != (n, p) {
-        return Err(format!(
-            "linear_span_anchor: targets shape {:?} != ({n}, {p})",
-            targets.dim()
-        ));
-    }
-    if term.k_atoms() == 0 {
-        return Err("linear_span_anchor: term must contain at least one atom".into());
-    }
-    if !targets.iter().all(|v| v.is_finite()) {
-        return Err("linear_span_anchor: targets must be finite".into());
-    }
-    let gates = neutral_gate_weights(term.assignment.mode, term.k_atoms());
-    let mut residual = targets.to_owned();
-    let mut reconstruction = Array2::<f64>::zeros((n, p));
-    let mut atoms = Vec::with_capacity(term.k_atoms());
-    for (atom_idx, atom) in term.atoms.iter().enumerate() {
-        let gate = gates[atom_idx];
-        if !(gate.is_finite() && gate > 0.0) {
-            return Err(format!(
-                "linear_span_anchor: neutral gate for atom {atom_idx} must be positive finite; got {gate}"
-            ));
-        }
-        let requested_rank = atom.basis_size().min(n).min(p);
-        if requested_rank == 0 {
-            return Err(format!(
-                "linear_span_anchor: atom {atom_idx} has no recoverable linear span rank"
-            ));
-        }
-        let weighted = residual.mapv(|v| gate * v);
-        let (_u_opt, singular_values_full, vt_opt) = weighted
-            .svd(false, true)
-            .map_err(|err| format!("linear_span_anchor: SVD failed for atom {atom_idx}: {err}"))?;
-        let vt = vt_opt.ok_or_else(|| {
-            format!("linear_span_anchor: SVD returned no right factor for atom {atom_idx}")
-        })?;
-        let rank = requested_rank
-            .min(vt.nrows())
-            .min(singular_values_full.len());
-        if rank == 0 {
-            return Err(format!(
-                "linear_span_anchor: atom {atom_idx} SVD returned rank zero"
-            ));
-        }
-        let mut frame = Array2::<f64>::zeros((p, rank));
-        for col in 0..rank {
-            for row in 0..p {
-                frame[[row, col]] = vt[[col, row]];
-            }
-        }
-        let singular_values = singular_values_full.slice(s![..rank]).to_owned();
-        let frame = GrassmannFrame::from_oriented(frame, singular_values.clone());
-        let frame_matrix = frame.frame().to_owned();
-        let mut coordinates = residual.dot(&frame_matrix);
-        coordinates.mapv_inplace(|v| v / gate);
-        let contribution = gam_linalg::faer_ndarray::fast_abt(&coordinates, &frame_matrix).mapv(|v| gate * v);
-        reconstruction += &contribution;
-        residual -= &contribution;
-        atoms.push(LinearSpanAtomAnchor {
-            gate_weight: gate,
-            frame,
-            decoder_coordinates: coordinates,
-            singular_values,
-        });
-    }
-    let residual_norm_sq = residual.iter().map(|v| v * v).sum();
-    Ok(LinearSpanAnchor {
-        atoms,
-        reconstruction,
-        residual_norm_sq,
-    })
-}
-
-#[derive(Debug, Clone)]
-pub struct LinearSpanAtomAnchor {
-    pub gate_weight: f64,
-    pub frame: GrassmannFrame,
-    pub decoder_coordinates: Array2<f64>,
-    pub singular_values: Array1<f64>,
-}
-
-#[derive(Debug, Clone)]
-pub struct LinearSpanAnchor {
-    pub atoms: Vec<LinearSpanAtomAnchor>,
-    pub reconstruction: Array2<f64>,
-    pub residual_norm_sq: f64,
-}
-
 pub(crate) fn sae_cholesky_solve_neg_gradient(
     h: ArrayView2<'_, f64>,
     g: ArrayView1<'_, f64>,
@@ -4754,43 +4650,8 @@ pub(crate) fn solve_design_least_squares(
 
 #[cfg(test)]
 mod linear_parity_anchor_1026_tests {
-    //! #1026 — reconstruction-parity instrument + gate for the LINEAR-SAE
-    //! Eckart-Young anchor.
-    //!
-    //! For a purely-LINEAR dictionary the reconstruction ceiling is the
-    //! rank-(Σ_k basis_size_k) PCA / Eckart-Young projection of the target (the
-    //! best linear subspace of that total rank). [`linear_span_anchor`] is the
-    //! η=0 primitive that seeds the curvature walk with exactly that projection
-    //! via sequential per-atom residual SVDs, so — independent of the downstream
-    //! routing / inner Newton — its OWN reconstruction must attain the PCA
-    //! ceiling at the dictionary's total rank. If it does, any end-to-end
-    //! linear-SAE parity shortfall is a DOWNSTREAM (routing / canonicalization)
-    //! effect, not an anchor defect; if it does not, the anchor itself loses
-    //! reconstructible variance the linear dictionary is entitled to. This test
-    //! pins the anchor at the ceiling so a regression that weakens the
-    //! sequential-deflation parity (wrong per-atom rank, gate mishandling, a
-    //! non-orthogonal deflation) is caught.
-    //!
-    //! ## #1026 routing-bound finding (why a GATED linear SAE under-reconstructs)
-    //!
-    //! The anchor reaches the rank-(K·d) PCA ceiling because its NEUTRAL gates
-    //! ([`neutral_gate_weights`]: softmax `1/K`, ordered Beta--Bernoulli prior) keep every atom ON for
-    //! every row, so all `K·d` decoder directions are available to reconstruct
-    //! each row — exactly the unrestricted linear subspace PCA uses. A FITTED
-    //! softmax/ordered Beta--Bernoulli SAE instead routes each row through learned gates, so its
-    //! per-row reconstruction is `Σ_k a_k(row)·γ_k(t_k(row))` — a gate-WEIGHTED
-    //! (softmax: simplex `Σ_k a_k ≈ 1`) combination whose per-row effective rank is
-    //! bounded by that row's active-atom count. End-to-end linear-SAE parity with
-    //! PCA is therefore REACHABLE iff each row's active rank ≥ the data's local
-    //! rank — i.e. with dense-enough routing (high `top_k` / low sparsity `λ`); the
-    //! residual gap under SPARSE routing is the price of sparsity, not a defect.
-    //! The engine already retains the anchor-quality basin where reachable: the
-    //! [`SaeManifoldOuterObjective::into_fitted`] seed-basin + pristine-seed
-    //! fallbacks restore the anchor-seeded state whenever the inner solve degrades
-    //! EV. The parity-vs-sparsity tradeoff is the genuine #1026 frontier; the
-    //! UNGATED linear/background tier (a linear atom routed with `a_k ≡ 1`, added
-    //! to the gated curved residual) is the architectural lever that lets the
-    //! linear component carry full-rank variance while curved atoms stay sparse.
+    //! #1026 — the hybrid curved+linear dictionary's expressivity: a union basis
+    //! reconstructs strictly more variance than either single-geometry dictionary.
 
     use super::*;
 

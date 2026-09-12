@@ -15,8 +15,8 @@
 //! the 2-D seed chart to the ambient image on the training rows, predict the
 //! held-out rows, report R². This is the exact objective (grid fixture, decoder,
 //! split, thresholds) her landed numpy/Rust falsifier uses — intrinsic R²=0.9996,
-//! PCA-2 R²=0.825 — lifted here to run against the CANONICAL seeder
-//! [`sae_intrinsic_seed_initial_coords`] and its end-to-end auto-seed path.
+//! PCA-2 R²=0.825 — lifted here to run against the end-to-end auto-seed path
+//! (`build_sae_minimal_seed`).
 
 use super::*;
 use gam_linalg::faer_ndarray::{FaerCholesky, FaerSvd, fast_ata, fast_atb};

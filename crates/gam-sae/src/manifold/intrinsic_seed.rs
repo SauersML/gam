@@ -25,23 +25,18 @@
 //!   5. the L-Isomap distance-based (Nyström-style) extension of the landmark
 //!      coordinates to every row.
 //!
-//! The output of [`sae_intrinsic_seed_initial_coords`] has the SAME
-//! `(K_atoms, n_obs, d_max)` shape and per-chart-kind conventions as
-//! [`super::sae_pca_seed_initial_coords`], so any chart family consumes it
-//! unchanged; on a fold it unrolls where PCA creases, and on a non-fold it is a
-//! near-isometric embedding that ties the linear seed. The seed RACE (born-atom
-//! topology adjudication in `structure_harvest.rs`) keeps PCA as the cheaper
-//! default and only adopts the intrinsic seed when it earns higher REML evidence.
+//! [`intrinsic_geodesic_embedding`] returns those coordinates for every row: on
+//! a fold it unrolls where PCA creases, and on a non-fold it is a near-isometric
+//! embedding that ties the linear seed. `structure_harvest.rs` and the local
+//! atlas read it directly.
 //!
 //! Determinism is fleet law: no RNG anywhere. kNN ties break by index, landmarks
 //! by first-wins-lowest-index, Dijkstra by (distance, node) so equal-cost frontier
 //! nodes pop in index order, and the eigendecomposition is faer's deterministic
 //! self-adjoint solver. Same input ⇒ bit-identical coordinates run-to-run.
 
-use super::SaeAtomBasisKind;
-use super::pca_seed::{seed_storage_d_max, write_ambient_sphere_row};
 use gam_linalg::faer_ndarray::FaerEigh;
-use ndarray::{Array2, Array3, ArrayView2};
+use ndarray::{Array2, ArrayView2};
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
 
@@ -440,159 +435,6 @@ pub fn intrinsic_geodesic_embedding(
     Ok(out)
 }
 
-fn min_max_normalize_into(out: &mut Array3<f64>, atom_idx: usize, axis: usize, values: &[f64]) {
-    let (lo, hi) = values
-        .iter()
-        .fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), &v| {
-            (lo.min(v), hi.max(v))
-        });
-    let span = hi - lo;
-    if span > 0.0 && span.is_finite() {
-        for (row, &v) in values.iter().enumerate() {
-            out[[atom_idx, row, axis]] = (v - lo) / span - 0.5;
-        }
-    }
-}
-
-/// Number of independent intrinsic embedding functions needed to seed a chart.
-///
-/// This is deliberately distinct from the chart's latent dimension. A periodic
-/// coordinate is the phase of a two-function plane, a sphere's two coordinates
-/// need a three-function frame, and every torus coordinate needs its own
-/// two-function phase plane. Using only `latent_dim` embedding axes silently
-/// collapsed sphere latitude and every torus axis after the first to zero.
-fn intrinsic_chart_embedding_axes(kind: &SaeAtomBasisKind, latent_dim: usize) -> usize {
-    match kind {
-        SaeAtomBasisKind::Periodic => 2 + latent_dim.max(1).saturating_sub(1),
-        // `RP²` shares the sphere's ambient cover, so it needs the same
-        // three-function frame — it previously fell through to `latent_dim`,
-        // which left the third ambient axis unseeded.
-        SaeAtomBasisKind::Sphere | SaeAtomBasisKind::ProjectivePlane => 3,
-        SaeAtomBasisKind::Torus => 2 * latent_dim.max(1),
-        _ => latent_dim.max(1),
-    }
-}
-
-/// Intrinsic-metric seed with the SAME `(K_atoms, n_obs, d_max)` output contract
-/// and per-chart-kind conventions as [`super::sae_pca_seed_initial_coords`], built
-/// from a single geodesic embedding of `z` wide enough for every atom's chart
-/// functions. Each
-/// atom reads its chart off the leading intrinsic axes (the tensor's `d_max` is
-/// the widest coordinate STORAGE, which is what the padded-stack consumer
-/// indexes by, not the widest intrinsic dimension):
-///   * flat (Euclidean/Linear/other) — leading `d` axes, min-max normalized to
-///     `[-0.5, 0.5]` (the flat PCA convention);
-///   * periodic — `[0, 1)` phase off axes 0/1 via `atan2`, extra axes min-max;
-///   * sphere / projective plane — the unit-normalized leading 3 axes AS the
-///     ambient 3-vector the plan is parameterised by (not `(lat, lon)`: the
-///     ambient plan replaced that chart, and a 2-wide seed no longer names a
-///     point of the manifold);
-///   * torus — `[0, 1)` phase per axis off disjoint intrinsic-axis pairs.
-///
-/// A drop-in for the PCA seed: same shape, finite, ready for any chart family. Its
-/// value is on folded manifolds, where the geodesic axes unroll a sheet the linear
-/// PCA seed would crease.
-pub fn sae_intrinsic_seed_initial_coords(
-    z: ArrayView2<'_, f64>,
-    basis_kinds: &[SaeAtomBasisKind],
-    atom_dim: &[usize],
-) -> Result<Array3<f64>, String> {
-    let k_atoms = basis_kinds.len();
-    if atom_dim.len() != k_atoms {
-        return Err(format!(
-            "sae_intrinsic_seed_initial_coords: basis_kinds and atom_dim must have the same length; got {} and {}",
-            k_atoms,
-            atom_dim.len()
-        ));
-    }
-    let (n_obs, _p) = z.dim();
-    // Coordinate STORAGE width, not intrinsic dimension: `S²` / `RP²` are
-    // parameterised by their ambient unit 3-vector. See
-    // `super::pca_seed::seed_storage_width` — this seeder is documented as a
-    // drop-in for the PCA seed, so it owes the same array shape.
-    let latent_d_max = seed_storage_d_max(basis_kinds, atom_dim);
-    let embedding_axes = basis_kinds
-        .iter()
-        .zip(atom_dim.iter().copied())
-        .map(|(kind, d)| intrinsic_chart_embedding_axes(kind, d))
-        .max()
-        .unwrap_or(1);
-    let mut out = Array3::<f64>::zeros((k_atoms, n_obs, latent_d_max));
-    if n_obs == 0 || z.ncols() == 0 || k_atoms == 0 {
-        return Ok(out);
-    }
-    let embed = intrinsic_geodesic_embedding(z, embedding_axes)?;
-    let two_pi = std::f64::consts::TAU;
-    for atom_idx in 0..k_atoms {
-        let d = atom_dim[atom_idx];
-        if d == 0 {
-            continue;
-        }
-        match &basis_kinds[atom_idx] {
-            SaeAtomBasisKind::Periodic => {
-                if embed.ncols() >= 2 {
-                    for row in 0..n_obs {
-                        let phase = embed[[row, 1]].atan2(embed[[row, 0]]) / two_pi;
-                        out[[atom_idx, row, 0]] = phase - phase.floor();
-                    }
-                } else {
-                    let col: Vec<f64> = (0..n_obs).map(|r| embed[[r, 0]]).collect();
-                    // Single-axis fallback: min-max the lone geodesic axis to a
-                    // phase in [0, 1).
-                    let (lo, hi) = col
-                        .iter()
-                        .fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), &v| {
-                            (lo.min(v), hi.max(v))
-                        });
-                    let span = hi - lo;
-                    if span > 0.0 {
-                        for (row, &v) in col.iter().enumerate() {
-                            out[[atom_idx, row, 0]] = (v - lo) / span;
-                        }
-                    }
-                }
-                for axis in 1..d {
-                    if axis + 1 >= embed.ncols() {
-                        break;
-                    }
-                    let vals: Vec<f64> = (0..n_obs).map(|r| embed[[r, axis + 1]]).collect();
-                    min_max_normalize_into(&mut out, atom_idx, axis, &vals);
-                }
-            }
-            SaeAtomBasisKind::Sphere | SaeAtomBasisKind::ProjectivePlane => {
-                for row in 0..n_obs {
-                    let x = embed[[row, 0]];
-                    let y = embed[[row, 1]];
-                    let zz = embed[[row, 2]];
-                    write_ambient_sphere_row(&mut out, atom_idx, row, x, y, zz);
-                }
-            }
-            SaeAtomBasisKind::Torus => {
-                for axis in 0..d {
-                    let (ca, cb) = (2 * axis, 2 * axis + 1);
-                    if cb >= embed.ncols() {
-                        break;
-                    }
-                    for row in 0..n_obs {
-                        let phase = embed[[row, cb]].atan2(embed[[row, ca]]) / two_pi;
-                        out[[atom_idx, row, axis]] = phase - phase.floor();
-                    }
-                }
-            }
-            _ => {
-                for axis in 0..d {
-                    if axis >= embed.ncols() {
-                        break;
-                    }
-                    let vals: Vec<f64> = (0..n_obs).map(|r| embed[[r, axis]]).collect();
-                    min_max_normalize_into(&mut out, atom_idx, axis, &vals);
-                }
-            }
-        }
-    }
-    Ok(out)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -673,76 +515,5 @@ mod tests {
         let a = intrinsic_geodesic_embedding(z.view(), 2).unwrap();
         let b = intrinsic_geodesic_embedding(z.view(), 2).unwrap();
         assert_eq!(a, b, "intrinsic embedding must be bit-identical run-to-run");
-    }
-
-    /// Chart coordinates and embedding functions are not the same dimension:
-    /// sphere latitude needs a 3-frame, and a 2-torus needs two independent
-    /// phase planes. Pin the production allocation rule so those coordinates
-    /// cannot silently collapse back to zero.
-    #[test]
-    fn intrinsic_seed_allocates_every_chart_function_2240() {
-        assert_eq!(
-            intrinsic_chart_embedding_axes(&SaeAtomBasisKind::Periodic, 1),
-            2
-        );
-        assert_eq!(
-            intrinsic_chart_embedding_axes(&SaeAtomBasisKind::Periodic, 3),
-            4
-        );
-        assert_eq!(
-            intrinsic_chart_embedding_axes(&SaeAtomBasisKind::Sphere, 2),
-            3
-        );
-        assert_eq!(
-            intrinsic_chart_embedding_axes(&SaeAtomBasisKind::Torus, 2),
-            4
-        );
-        assert_eq!(
-            intrinsic_chart_embedding_axes(&SaeAtomBasisKind::ProjectivePlane, 2),
-            3
-        );
-        assert_eq!(
-            intrinsic_chart_embedding_axes(&SaeAtomBasisKind::Linear, 2),
-            2
-        );
-
-        // Ten points spanning four ambient dimensions make the kNN graph
-        // complete for a four-axis embedding, so classical MDS recovers four
-        // genuine functions. Both coordinates of each chart must vary. With
-        // the old latent-dimension allocation, sphere latitude and torus axis 1
-        // were identically zero here.
-        let mut z = Array2::<f64>::zeros((10, 4));
-        for axis in 0..4 {
-            z[[2 * axis, axis]] = 1.0;
-            z[[2 * axis + 1, axis]] = -1.0;
-        }
-        z[[8, 0]] = 0.5;
-        z[[8, 1]] = -0.25;
-        z[[8, 2]] = 0.75;
-        z[[8, 3]] = 0.125;
-        z[[9, 0]] = -0.375;
-        z[[9, 1]] = 0.625;
-        z[[9, 2]] = 0.25;
-        z[[9, 3]] = -0.875;
-        let seed = sae_intrinsic_seed_initial_coords(
-            z.view(),
-            &[SaeAtomBasisKind::Sphere, SaeAtomBasisKind::Torus],
-            &[2, 2],
-        )
-        .unwrap();
-        for atom in 0..2 {
-            for axis in 0..2 {
-                let (lo, hi) = seed
-                    .slice(ndarray::s![atom, .., axis])
-                    .iter()
-                    .fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), &v| {
-                        (lo.min(v), hi.max(v))
-                    });
-                assert!(
-                    hi > lo,
-                    "intrinsic chart {atom} axis {axis} must carry a genuine coordinate"
-                );
-            }
-        }
     }
 }

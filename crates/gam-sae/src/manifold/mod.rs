@@ -190,7 +190,6 @@ mod curl;
 mod curl_census;
 pub mod curve_promotion;
 mod derivative_oracle;
-mod dual;
 mod embeddedness;
 mod evaluator_rebuild;
 mod fisher_metric;
@@ -200,11 +199,9 @@ mod fit_seed;
 mod gauge;
 mod geometry_plan;
 mod graph_atom;
-mod inframe_curved;
 mod intrinsic_seed;
 mod isa_seed;
 mod kronecker;
-pub mod lift;
 mod local_charts;
 mod loss;
 mod minimal_seed;
@@ -221,7 +218,6 @@ mod row_layout;
 mod schedule;
 mod seed_routing;
 mod shape_uncertainty;
-mod stagewise;
 mod stall_polish_progress;
 mod steering;
 mod stratum_births;
@@ -238,7 +234,6 @@ mod term;
 pub(crate) mod tests_topology_fixtures;
 mod transport_law;
 mod wbic_audit;
-mod weight_frame_catalog;
 
 #[cfg(test)]
 mod tests;
@@ -331,12 +326,6 @@ mod tests_encode_whitened_gls_2021;
 
 #[cfg(test)]
 mod tests_coatom_sigma_coherence_2021;
-
-#[cfg(test)]
-mod tests_2101_birth_locus_probe;
-
-#[cfg(test)]
-mod tests_2111_dense_torus_acceptance;
 
 #[cfg(test)]
 mod tests_rank_charge_2101;
@@ -504,19 +493,10 @@ mod tests_crosscoder_rho_2231;
 mod tests_checkpoint_resume_wiring;
 
 #[cfg(test)]
-mod tests_transport_law;
-
-#[cfg(test)]
 mod tests_crosscoder_block_fd_2231;
 
 #[cfg(test)]
 mod tests_crosscoder_drift;
-
-#[cfg(test)]
-mod tests_ln_sphere_ambient_f4;
-
-#[cfg(test)]
-mod tests_inframe_curved_2130;
 
 #[cfg(test)]
 mod tests_topology_persistence_f3;
@@ -603,7 +583,6 @@ pub use fit_seed::*;
 pub use gauge::*;
 pub use geometry_plan::*;
 pub use graph_atom::*;
-pub use inframe_curved::*;
 pub use intrinsic_seed::*;
 pub use isa_seed::*;
 pub(crate) use kronecker::*;
@@ -622,7 +601,6 @@ pub use row_layout::*;
 pub use schedule::*;
 pub use seed_routing::*;
 pub use shape_uncertainty::*;
-pub use stagewise::*;
 pub use stratum_births::*;
 pub use streaming_plan::*;
 pub use support_outer::*;
@@ -631,4 +609,3 @@ pub use support_term::*;
 pub use term::*;
 pub use transport_law::*;
 pub use wbic_audit::*;
-pub use weight_frame_catalog::*;

@@ -72,8 +72,7 @@ fn lcg_normal(s: &mut u64) -> f64 {
 /// residual the metric weights is genuinely nonzero.
 fn build_term(n: usize, p: usize, k: usize) -> SaeManifoldTerm {
     let coord_block = Array2::<f64>::from_shape_fn((n, 1), |(r, _)| 0.05 * (r as f64));
-    // #2822: stagewise growth prices the θ-adjoint, which needs each atom's basis second
-    // jets, so the atoms carry the width-2 `[1, t]` patch evaluator over their own latent
+    // The atoms carry the width-2 `[1, t]` patch evaluator over their own latent
     // coordinate instead of a hand-built constant basis with no evaluator attached.
     let evaluator = Arc::new(
         EuclideanPatchEvaluator::new(1, 1).expect("a degree-1 patch on one latent axis is valid"),
@@ -302,66 +301,4 @@ fn behavioral_fisher_anisotropic_moves_only_the_reconstruction() {
     assert_eq!(loss_gls.assignment_sparsity, loss_iid.assignment_sparsity);
     assert_eq!(loss_gls.smoothness, loss_iid.smoothness);
     assert_eq!(loss_gls.ard, loss_iid.ard);
-}
-
-/// The **Rung-1 (B4) stagewise wiring** contract: a `BehavioralFisher` metric
-/// installed on the K=1 seed BEFORE [`fit_stagewise`] is carried through the
-/// entire forward-births + backfitting composition and is present, unchanged in
-/// provenance, on the terminal grown term — **provided** `structured_whitening`
-/// is `false`. This is the invariant the FFI relies on to price every born
-/// atom's reconstruction in nats (not just the seed): `fit_stagewise` clones the
-/// seed's `row_metric` into each birth-candidate / backfit sub-term
-/// (construction clone) and, with structured whitening off, never overwrites it
-/// with a refit `Σ⁻¹`. The stagewise FFI therefore refuses the
-/// `structured_whitening=true` + likelihood-whitening-metric combination rather
-/// than let the per-birth `Σ`-refit silently clobber the harvest metric.
-#[test]
-fn behavioral_fisher_metric_survives_stagewise_growth() {
-    use crate::manifold::{StagewiseConfig, fit_stagewise};
-
-    let (n, p) = (12usize, 4usize);
-    let seed = build_term(n, p, 1);
-    let z = target(n, p);
-    let rho = SaeManifoldRho::new(-1.0, -6.0, vec![Array1::<f64>::from_elem(1, 0.0)]);
-
-    let mut seeded = seed;
-    let metric = behavioral_fisher_anisotropic(n, p);
-    assert!(metric.whitens_likelihood());
-    seeded.set_row_metric(metric).unwrap();
-
-    // structured_whitening = false ⇒ the pre-installed fixed GLS metric must NOT
-    // be clobbered by a per-birth Σ-refit. Small caps keep the test fast; the
-    // property holds whether or not a birth is actually accepted.
-    let config = StagewiseConfig {
-        inner_max_iter: 8,
-        learning_rate: 1.0,
-        ridge_ext_coord: 1e-6,
-        ridge_beta: 1e-6,
-        max_births: 2,
-        max_backfit_sweeps: 1,
-        min_effect_ev: 0.0,
-        max_factor_rank: 2,
-        structured_whitening: false,
-    };
-    let result = fit_stagewise(seeded, rho, z.view(), None, None, &config, None, None).unwrap();
-
-    // The terminal grown term still carries the behavioral-Fisher likelihood
-    // weight — the harvest metric priced every stage, seed through births.
-    let terminal_metric = result
-        .term
-        .row_metric()
-        .expect("terminal term must retain the installed behavioral-Fisher metric");
-    assert!(
-        terminal_metric.whitens_likelihood(),
-        "the fixed GLS metric must still whiten the terminal likelihood"
-    );
-    assert!(
-        matches!(
-            terminal_metric.provenance(),
-            MetricProvenance::BehavioralFisher { .. }
-        ),
-        "structured_whitening=false must leave the BehavioralFisher provenance \
-         intact (got {:?})",
-        terminal_metric.provenance()
-    );
 }

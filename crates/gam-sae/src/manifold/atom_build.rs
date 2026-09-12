@@ -203,7 +203,7 @@ pub fn sae_build_atom_plans(
                 // truncated Fourier expansion (basis size `2·n_harmonics + 1`),
                 // not a latent-space dimensionality. Setting
                 // `latent_dim = atom_dim` would make
-                // `build_sae_basis_evaluators` reject the atom (the analytic
+                // `SaeAtomGeometryPlan::build_evaluator` reject the atom (the analytic
                 // `PeriodicHarmonicEvaluator` requires `latent_dim == 1`),
                 // since there is no longer a frozen-snapshot fallback. Bind the
                 // optimizer-visible latent dimension to 1 and route the user's
@@ -403,8 +403,7 @@ pub fn sae_build_atom_plans(
                 // A cylinder atom is not SEEDED through `sae_manifold_fit_minimal`:
                 // it arises only by EVIDENCE, when the #977 birth topology race
                 // selects `S¹ × ℝ` for a residual factor (the born atom's evaluator
-                // is built directly by `race_birth_topology`, and OOS refresh reads
-                // it back through `build_sae_basis_evaluators`). There is no
+                // is built directly by `race_birth_topology`). There is no
                 // user-facing cylinder seed geometry to derive a plan from here, so
                 // a cylinder in the seed dictionary is a caller error, surfaced
                 // loudly rather than mis-built as a torus / patch.

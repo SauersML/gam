@@ -374,7 +374,7 @@ mod amortized_encoder_tests {
         );
 
         // The production `logdet_trace` channel in ISOLATION, reproduced exactly as
-        // `analytic_outer_rho_gradient_components` assembles it (smooth EDF trace +
+        // `analytic_outer_rho_gradient_components_with_bundle` assembles it (smooth EDF trace +
         // ARD joint trace), so this validates CH4
         // independently of the rank-charge / third-order channels.
         let base = rho.to_flat();

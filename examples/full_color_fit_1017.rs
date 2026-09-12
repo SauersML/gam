@@ -36,7 +36,6 @@ use gam::terms::{
     sae::manifold::SaeManifoldAtom, sae::manifold::SaeManifoldOuterObjective,
     sae::manifold::SaeManifoldRho, sae::manifold::SaeManifoldTerm,
 };
-use gam_sae::manifold::StagewiseConfig;
 use ndarray::{Array1, Array2};
 
 // Production color-arm shape from #1017: few rows, very wide ambient output.
@@ -45,6 +44,14 @@ const P: usize = 5120;
 const N_ATOMS: usize = 1;
 const LATENT_DIM: usize = 1;
 const PERIODIC_BASIS_WIDTH: usize = 3;
+
+// Inner-fit resolution controls handed to the outer objective. `INNER_MAX_ITER` is a
+// refinement chunk: the REML evaluator extends until its stationarity certificate is
+// reached and returns an error otherwise.
+const INNER_MAX_ITER: usize = 64;
+const INNER_LEARNING_RATE: f64 = 1.0;
+const INNER_RIDGE_EXT_COORD: f64 = 1.0e-6;
+const INNER_RIDGE_BETA: f64 = 1.0e-6;
 
 const LOG_LAMBDA_SPARSE: f64 = -12.0;
 const LOG_LAMBDA_SMOOTH: f64 = -12.0;
@@ -166,20 +173,16 @@ fn run() -> Result<(), String> {
     }
 
     let registry = AnalyticPenaltyRegistry::new();
-    // Single source of truth for production inner-fit controls. `inner_max_iter`
-    // is a refinement chunk: the REML evaluator extends until its stationarity
-    // certificate is reached and returns an error otherwise.
-    let inner = StagewiseConfig::default();
     let initial_rho_flat = initial_rho.to_flat();
     let mut objective = SaeManifoldOuterObjective::new(
         term,
         target.clone(),
         Some(registry.clone()),
         initial_rho,
-        inner.inner_max_iter,
-        inner.learning_rate,
-        inner.ridge_ext_coord,
-        inner.ridge_beta,
+        INNER_MAX_ITER,
+        INNER_LEARNING_RATE,
+        INNER_RIDGE_EXT_COORD,
+        INNER_RIDGE_BETA,
     );
     // A single explicit initial state: the optimizer moves continuously in rho;
     // no seed lattice or grid is evaluated.

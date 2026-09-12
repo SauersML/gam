@@ -4,8 +4,8 @@ mixed topologies within a single SAE-manifold fit.
 The production code fully supports per-atom topologies: the Python API's
 ``_bases`` / ``_dims`` accept per-atom lists, the FFI threads a
 ``Vec<String> atom_basis`` and ``Vec<usize> atom_dim`` through
-``sae_build_atom_plans``, and ``build_sae_basis_evaluators`` dispatches a
-topology-specific evaluator per atom (matching on ``basis_kinds[k]``).
+``sae_build_atom_plans``, and each atom's geometry plan builds its own
+topology-specific evaluator.
 ``SaeManifoldTerm::apply_newton_step`` refreshes each atom's basis
 independently. None of the existing tests exercises a heterogeneous
 ``atom_basis`` list end to end:

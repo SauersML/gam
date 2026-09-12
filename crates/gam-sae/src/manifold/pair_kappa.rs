@@ -275,27 +275,6 @@ pub fn screen_pair_with_contexts(
     }
 }
 
-/// Screen every co-activating pair among the accepted candidates and return the
-/// merge proposals (pairs flagged as one bound structure). The full pairwise
-/// verdict set is available via [`screen_pair`]; this convenience returns only the
-/// flagged pairs, in `(a<b)` order.
-pub fn screen_all_pairs(
-    data: ArrayView2<'_, f64>,
-    mean: &Array1<f64>,
-    candidates: &[IsaPlaneCandidate],
-) -> Vec<PairVerdict> {
-    let mut out = Vec::new();
-    for a in 0..candidates.len() {
-        for b in (a + 1)..candidates.len() {
-            let v = screen_pair(data, mean, a, b, &candidates[a], &candidates[b]);
-            if v.merge_proposed {
-                out.push(v);
-            }
-        }
-    }
-    out
-}
-
 fn residual_conditionality(
     ea: &PlaneEnergies,
     eb: &PlaneEnergies,
@@ -482,54 +461,6 @@ mod tests {
             v.rho > 1.5,
             "co-gated torus ρ must be ≫ 1 (anchor 1/q≈2.5); got {:.4}",
             v.rho
-        );
-    }
-
-    /// screen_all_pairs on a three-atom set (independent A, and a co-gated B–C
-    /// torus) must return exactly the {B,C} proposal.
-    #[test]
-    fn screen_all_pairs_selects_only_bound_pair() {
-        let mut s = 0xC0FFEE_u64;
-        let n = 6000usize;
-        let p = 12usize;
-        let q_iso = 0.5;
-        let q_tor = 0.4;
-        let mut data = Array2::<f64>::zeros((n, p));
-        let mut act_a = vec![false; n];
-        let mut act_bc = vec![false; n];
-        for i in 0..n {
-            if lcg(&mut s) < q_iso {
-                act_a[i] = true;
-                let th = std::f64::consts::TAU * lcg(&mut s);
-                data[[i, 0]] += th.cos();
-                data[[i, 1]] += th.sin();
-            }
-            if lcg(&mut s) < q_tor {
-                act_bc[i] = true;
-                let tb = std::f64::consts::TAU * lcg(&mut s);
-                let tc = std::f64::consts::TAU * lcg(&mut s);
-                data[[i, 2]] += tb.cos();
-                data[[i, 3]] += tb.sin();
-                data[[i, 4]] += tc.cos();
-                data[[i, 5]] += tc.sin();
-            }
-            for j in 0..p {
-                data[[i, j]] += 0.02 * lcg_normal(&mut s);
-            }
-        }
-        let mean = Array1::<f64>::zeros(p);
-        let cands = vec![
-            axis_candidate(p, 0, 1, &act_a),  // 0: independent
-            axis_candidate(p, 2, 3, &act_bc), // 1: torus factor
-            axis_candidate(p, 4, 5, &act_bc), // 2: torus factor
-        ];
-        let flags = screen_all_pairs(data.view(), &mean, &cands);
-        assert_eq!(flags.len(), 1, "exactly one bound pair expected");
-        assert!(
-            flags[0].atom_a == 1 && flags[0].atom_b == 2,
-            "the flagged pair must be the co-gated torus factors (1,2); got ({},{})",
-            flags[0].atom_a,
-            flags[0].atom_b
         );
     }
 }

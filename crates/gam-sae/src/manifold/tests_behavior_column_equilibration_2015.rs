@@ -9,9 +9,8 @@
 //! capacity explaining them). Measured on MSI 13021686 at the wired commit:
 //! `zz2015_tiny_inner_crawl_terminates` refused at the co-collapse floor
 //! (EV 0.4566 vs null 0.4583) and the planted transport-law verdicts
-//! collapsed (phase R² 0.139, smooth R² 0.837). The `equilibrate_crosscoder_columns`
-//! primitive below is kept (spec'd + unit-tested); the fit path passes a unit
-//! `column_scale` and no longer calls it.
+//! collapsed (phase R² 0.139, smooth R² 0.837). The fit path passes a unit
+//! `column_scale`.
 //!
 //! The κ≈1e8 conditioning fix instead lives in the inner SOLVER's linear
 //! algebra (design: issue 2015 comment 4949898801, landed in

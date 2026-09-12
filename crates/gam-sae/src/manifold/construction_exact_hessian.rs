@@ -3232,25 +3232,6 @@ impl SaeManifoldTerm {
         Ok(hessian)
     }
 
-    /// Analytic SAE penalized quasi-Laplace outer-ρ gradient components at the already converged
-    /// inner state represented by `loss` and `cache`.
-    ///
-    /// The returned gradient is the assembled analytic outer derivative:
-    /// explicit penalty terms, direct logdet traces, Occam terms, and the #1006
-    /// implicit-state third-order correction.
-    pub(crate) fn analytic_outer_rho_gradient_components(
-        &self,
-        target: ArrayView2<'_, f64>,
-        rho: &SaeManifoldRho,
-        loss: &SaeManifoldLoss,
-        cache: &ArrowFactorCache,
-        solver: &DeflatedArrowSolver<'_>,
-    ) -> Result<SaeOuterRhoGradientComponents, OuterGradientError> {
-        self.analytic_outer_rho_gradient_components_with_bundle(
-            target, rho, loss, cache, solver, None, None,
-        )
-    }
-
     /// #2080 forward plumbing — the analytic outer-ρ gradient with an OPTIONAL
     /// low-rank representation of the reduced-logdet derivative.
     ///
@@ -3413,7 +3394,7 @@ impl SaeManifoldTerm {
                 .direct_logdet_admitted();
             if !value_route_is_exact_a {
                 return Err(OuterGradientError::internal(format!(
-                    "analytic_outer_rho_gradient_components: log-determinant route \
+                    "analytic_outer_rho_gradient_components_with_bundle: log-determinant route \
                      incoherence — this gradient would differentiate the exact ½log|A|, \
                      but at shape n={}, p={}, K={} the criterion VALUE is priced by the \
                      streaming ½log|B| implementation (direct_logdet_admitted = false). \
@@ -3494,7 +3475,7 @@ impl SaeManifoldTerm {
                     )
                     .map_err(|err| OuterGradientError::InternalInvariant {
                         reason: format!(
-                            "analytic_outer_rho_gradient_components: smooth dof (matrix-free): {err}"
+                            "analytic_outer_rho_gradient_components_with_bundle: smooth dof (matrix-free): {err}"
                         ),
                     })?,
                 None => self
@@ -3504,7 +3485,7 @@ impl SaeManifoldTerm {
                         &lambda_smooth_vec,
                     )
                     .map_err(|err| OuterGradientError::InternalInvariant {
-                        reason: format!("analytic_outer_rho_gradient_components: {err}"),
+                        reason: format!("analytic_outer_rho_gradient_components_with_bundle: {err}"),
                     })?,
             })
         };
@@ -3544,14 +3525,14 @@ impl SaeManifoldTerm {
                     )
                     .map_err(|err| OuterGradientError::InternalInvariant {
                         reason: format!(
-                            "analytic_outer_rho_gradient_components: ARD logdet trace \
+                            "analytic_outer_rho_gradient_components_with_bundle: ARD logdet trace \
                              (matrix-free): {err}"
                         ),
                     })?,
                 None => self
                     .ard_log_precision_hessian_trace(rho, cache, solver, evidence_operator)
                     .map_err(|err| OuterGradientError::InternalInvariant {
-                        reason: format!("analytic_outer_rho_gradient_components: {err}"),
+                        reason: format!("analytic_outer_rho_gradient_components_with_bundle: {err}"),
                     })?,
             };
             Some(joint)
@@ -3716,7 +3697,7 @@ impl SaeManifoldTerm {
             (None, Some(adjoint)) => Ok(adjoint),
             (None, None) => self.solve_exact_stationarity(rho, target, cache, &gamma),
             (Some(_), Some(_)) => Err(
-                "analytic_outer_rho_gradient_components: dense exact-A adjoint was assembled \
+                "analytic_outer_rho_gradient_components_with_bundle: dense exact-A adjoint was assembled \
                  for a matrix-free operator route"
                     .to_string(),
             ),
@@ -3735,7 +3716,7 @@ impl SaeManifoldTerm {
                 let &(p_x, ref block_dims) =
                     self.crosscoder_pricing_spans.as_ref().ok_or_else(|| {
                         OuterGradientError::internal(
-                            "analytic_outer_rho_gradient_components: rho carries block \
+                            "analytic_outer_rho_gradient_components_with_bundle: rho carries block \
                              coordinates but no crosscoder pricing spans are installed"
                                 .to_string(),
                         )

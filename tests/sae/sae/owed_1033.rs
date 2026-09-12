@@ -49,17 +49,12 @@
 //! in the hyperparameter dimension and not in n — even though BUILDING each
 //! channel still costs O(n) per ρ (the part that is not removable here).
 //!
-//! This test pins that invariant: build the SAME two-atom term — identical
-//! atoms, decoders, ARD layout, and ρ — over two DIFFERENT row counts, run the
-//! public `penalized_quasi_laplace_criterion_with_cache`, take the public
-//! `analytic_outer_rho_gradient_at_converged`, and assert every gradient channel
-//! has the k-dim length `1 + K + Σ_k d_k` for BOTH n, and that the assembled
-//! gradient vector has that same n-invariant length. A regression that routed an
-//! n-sized object into the outer-search payload (re-introducing an n-dimensional
-//! coordinate the optimizer would have to walk) would change one of these
-//! lengths and fail here. The ρ flat-coordinate round trip (`to_flat` /
-//! `from_flat`) is pinned n-invariant for the same reason: the search space the
-//! engine optimizes over is k-dim.
+//! This test pins the k-dim search space the engine optimizes over: the ρ
+//! flat-coordinate round trip (`to_flat` / `from_flat`) at length
+//! `1 + K + Σ_k d_k`, independent of the row count n. A regression that routed an
+//! n-sized object into the outer-search coordinates (re-introducing an
+//! n-dimensional coordinate the optimizer would have to walk) would change that
+//! length and fail here.
 //!
 //! No `let _`, no `#[allow(...)]`, no env vars, no `#[cfg(feature=...)]`.
 

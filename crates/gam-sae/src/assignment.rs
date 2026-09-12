@@ -908,19 +908,6 @@ impl SaeAssignment {
     }
 }
 
-pub(crate) fn neutral_gate_weights(mode: AssignmentMode, k_atoms: usize) -> Array1<f64> {
-    match mode {
-        AssignmentMode::Softmax { .. } => Array1::from_elem(k_atoms, 1.0 / (k_atoms.max(1) as f64)),
-        AssignmentMode::OrderedBetaBernoulli { temperature, .. } => {
-            ordered_beta_bernoulli_row(Array1::<f64>::zeros(k_atoms).view(), temperature)
-        }
-        AssignmentMode::ThresholdGate { .. } => Array1::from_elem(k_atoms, 0.5),
-        // At all-equal (zero) logits the deterministic tie-break admits the
-        // FIRST k atoms — the neutral support under index-stable ordering.
-        AssignmentMode::TopK { k } => topk_row(Array1::<f64>::zeros(k_atoms).view(), k),
-    }
-}
-
 pub(crate) fn softmax_row(logits: ArrayView1<'_, f64>, temperature: f64) -> Array1<f64> {
     let k = logits.len();
     let inv_tau = 1.0 / temperature;

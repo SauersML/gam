@@ -3000,24 +3000,6 @@ impl SaeManifoldTerm {
         Ok(made_progress)
     }
 
-    /// Public analytic outer-ρ gradient at a converged inner state, constructing
-    /// the deflated arrow solver from the supplied cache. Use this seam from
-    /// integration tests and external consumers that have a converged
-    /// `(loss, cache)` from [`Self::penalized_quasi_laplace_criterion_with_cache`] but no access to
-    /// the crate-private `DeflatedArrowSolver`.
-    pub fn analytic_outer_rho_gradient_at_converged(
-        &self,
-        target: ArrayView2<'_, f64>,
-        rho: &SaeManifoldRho,
-        loss: &SaeManifoldLoss,
-        cache: &ArrowFactorCache,
-    ) -> Result<SaeOuterRhoGradientComponents, String> {
-        self.assignment.validate_rho_domain(rho)?;
-        let solver = self.outer_gradient_arrow_solver(cache, &rho.lambda_smooth_vec()?)?;
-        self.analytic_outer_rho_gradient_components(target, rho, loss, cache, &solver)
-            .map_err(|e| e.to_string())
-    }
-
     pub(crate) fn outer_gradient_arrow_solver<'a>(
         &'a self,
         cache: &'a ArrowFactorCache,

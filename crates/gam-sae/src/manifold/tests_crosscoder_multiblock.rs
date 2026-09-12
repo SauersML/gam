@@ -403,14 +403,14 @@ fn crosscoder_two_layers_shares_one_latent_and_selects_lambda() {
     // units, and it must equal the by-hand slice+unscale to the bit (the accessor
     // is exactly the offset bookkeeping + `√λ_ℓ` division the test used to do).
     let via_accessor = term.layer_decoder(0, 0).unwrap();
-    let manual = blocks[0].split_honest_decoder(
-        term.atoms[0]
-            .decoder_coefficients()
-            .slice(ndarray::s![.., p_x..p_tot]),
-    );
+    let inv = 1.0 / blocks[0].sqrt_lambda();
+    let manual = term.atoms[0]
+        .decoder_coefficients()
+        .slice(ndarray::s![.., p_x..p_tot])
+        .mapv(|value| inv * value);
     assert!(
         bit_identical(&via_accessor, &manual),
-        "layer_decoder must reproduce the by-hand split_honest_decoder bit-for-bit"
+        "layer_decoder must reproduce the by-hand slice+unscale bit-for-bit"
     );
     let honest_norm = via_accessor.iter().map(|v| v * v).sum::<f64>().sqrt();
     assert!(

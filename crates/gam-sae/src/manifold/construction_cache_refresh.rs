@@ -1,9 +1,8 @@
-//! Isometry-penalty cache-refresh leaf helpers, split out of `construction.rs`
-//! to keep that tracked file under the #780 10k-line gate. These are the two
-//! trailing free functions (`refresh_isometry_caches_from_atom` /
-//! `refresh_isometry_caches_from_term`); they are re-exported from `mod.rs` via
-//! `pub use construction_cache_refresh::*;` so every caller keeps reaching them
-//! bare through `use super::*`.
+//! Isometry-penalty cache-refresh leaf helper, split out of `construction.rs`
+//! to keep that tracked file under the #780 10k-line gate. This is the trailing
+//! free function `refresh_isometry_caches_from_atom`; it is re-exported from
+//! `mod.rs` via `pub use construction_cache_refresh::*;` so every caller keeps
+//! reaching it bare through `use super::*`.
 
 use super::*;
 
@@ -175,75 +174,4 @@ pub fn refresh_isometry_caches_from_atom(
     penalty.refresh_caches(Some(Arc::new(jac)), jac2_opt);
     penalty.set_third_decoder_derivative(jac3_opt);
     Ok(installed)
-}
-
-/// Walk an [`AnalyticPenaltyRegistry`] and refresh every Isometry penalty
-/// against the SAE atom it owns. The alignment rule is positional within each
-/// `(latent_dim, p_out)` signature: the penalty's `target.latent_dim` must
-/// equal the atom's `latent_dim` AND the penalty's `p_out` must equal the
-/// atom's decoder column count `p`. Multi-atom configurations install one
-/// isometry penalty per atom, so the *k*-th isometry penalty matching a given
-/// signature is paired with the *k*-th atom matching that same signature. This
-/// reduces to the unambiguous single-atom/single-penalty case wired by
-/// `solver/workflow.rs`, and never collapses multiple penalties onto the first
-/// matching atom (which would leave every later atom's coords un-refreshed).
-///
-/// Returns the number of penalties that got both caches populated (i.e. the
-/// number of atoms whose `basis_second_jet` slot holds a
-/// [`SaeBasisSecondJet`] implementation supplying the analytic Hessian).
-pub fn refresh_isometry_caches_from_term(
-    registry: &AnalyticPenaltyRegistry,
-    term: &SaeManifoldTerm,
-    coords_per_atom: &[Array2<f64>],
-) -> Result<usize, String> {
-    if coords_per_atom.len() != term.atoms.len() {
-        return Err(format!(
-            "refresh_isometry_caches_from_term: coords_per_atom length {} != number of atoms {}",
-            coords_per_atom.len(),
-            term.atoms.len()
-        ));
-    }
-    let mut refreshed_with_second = 0usize;
-    // Per-signature cursor: how many atoms matching a given (latent_dim, p_out)
-    // have already been consumed by earlier isometry penalties. Pairing the
-    // k-th penalty of a signature with the k-th atom of that signature gives a
-    // stable one-to-one mapping for multi-atom configs.
-    let mut consumed_per_signature: std::collections::HashMap<(usize, usize), usize> =
-        std::collections::HashMap::new();
-    for entry in registry.penalties.iter() {
-        let AnalyticPenaltyKind::Isometry(p) = entry else {
-            continue;
-        };
-        let Some(p_latent_dim) = p.target.latent_dim else {
-            continue;
-        };
-        let signature = (p_latent_dim, p.p_out);
-        let already_consumed = consumed_per_signature.entry(signature).or_insert(0);
-        // Advance to the (already_consumed)-th atom matching this signature.
-        let mut seen = 0usize;
-        let mut paired: Option<usize> = None;
-        for (atom_idx, atom) in term.atoms.iter().enumerate() {
-            let matches = atom.latent_dim() == p_latent_dim
-                && atom.decoder_coefficients().ncols() == p.p_out
-                && atom.basis_evaluator.is_some();
-            if !matches {
-                continue;
-            }
-            if seen == *already_consumed {
-                paired = Some(atom_idx);
-                break;
-            }
-            seen += 1;
-        }
-        let Some(atom_idx) = paired else {
-            continue;
-        };
-        *already_consumed += 1;
-        let atom = &term.atoms[atom_idx];
-        let coords = coords_per_atom[atom_idx].view();
-        if refresh_isometry_caches_from_atom(p, atom, coords)? {
-            refreshed_with_second += 1;
-        }
-    }
-    Ok(refreshed_with_second)
 }

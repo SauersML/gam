@@ -339,5 +339,30 @@
     "unit_test_decreases": {
       "crates/gam-problem": 6
     }
+  },
+  {
+    "base": "440cefbc74fc3528d850a5d1061433089445f31d",
+    "reason": "user directive: delete all useless slop",
+    "evidence": "52 tests removed (crates/gam-sae -52). Each exercised only items this commit removes. Issue-pinned names removed: anchor_scored_birth_prefers_uncontested_factor_2080, batch_birth_ledger_preserves_harvest_order_and_exact_dispositions_2556, born_circle_survives_on_incumbent_sparse_rows_2109, certificate_rejects_two_circle_blend_2111, co_collapse_flags_duplicate_charts_2280, co_collapse_spares_healthy_swiss_roll_atlas_2280, co_collapse_thresholds_bracket_the_gate_2280, dense_torus_fixture_has_2k_signal_dirs_2111, intrinsic_seed_allocates_every_chart_function_2240, kappa_deflation_extracts_clean_circle_from_dense_torus_2111, residual_principal_fallback_fires_on_disjoint_not_noise_2080, residual_principal_seeds_circle_as_rank2_not_dc_2101, serial_birth_ledger_retains_errors_and_selects_the_best_arm_2556, top_factor_birth_mirrors_circle_seed_2109. In the same commit, the floor lowers each affected key by exactly its measured decrease and drops an issue key that reaches zero. Compile evidence, MSI job 440633 on lane sw8: these same changes, applied over main 57409ec77 as lane commit 91761a443, passed `cargo check --workspace --exclude gam-pyffi --all-targets --keep-going` with rc 0 and no diagnostics (deny(warnings) intact), `cargo doc -p gam-sae --no-deps` with 0 errors, and the ban scanner with rc 0. This commit applies them over a later main, whose upstream delta since then adds no use of any name removed here. It is pushed at once under the user's commit-after-every-edit directive and checked at the pushed sha afterwards. scripts/source_removal_guard.py listed exactly these 322 identities, and the census and difference functions of scripts/test_census.py and scripts/public_api_census.py measured the test and public-function deltas this commit acknowledges.",
+    "test_count_decrease": 52,
+    "removed_pins": {
+      "anchor_scored_birth_prefers_uncontested_factor_2080": 1,
+      "batch_birth_ledger_preserves_harvest_order_and_exact_dispositions_2556": 1,
+      "born_circle_survives_on_incumbent_sparse_rows_2109": 1,
+      "certificate_rejects_two_circle_blend_2111": 1,
+      "co_collapse_flags_duplicate_charts_2280": 1,
+      "co_collapse_spares_healthy_swiss_roll_atlas_2280": 1,
+      "co_collapse_thresholds_bracket_the_gate_2280": 1,
+      "dense_torus_fixture_has_2k_signal_dirs_2111": 1,
+      "intrinsic_seed_allocates_every_chart_function_2240": 1,
+      "kappa_deflation_extracts_clean_circle_from_dense_torus_2111": 1,
+      "residual_principal_fallback_fires_on_disjoint_not_noise_2080": 1,
+      "residual_principal_seeds_circle_as_rank2_not_dc_2101": 1,
+      "serial_birth_ledger_retains_errors_and_selects_the_best_arm_2556": 1,
+      "top_factor_birth_mirrors_circle_seed_2109": 1
+    },
+    "unit_test_decreases": {
+      "crates/gam-sae": 52
+    }
   }
 ]

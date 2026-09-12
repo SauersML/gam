@@ -912,8 +912,7 @@ impl SaeManifoldTerm {
             // `set_crosscoder_layout` records one). Bit-for-bit historical path.
             crosscoder_layout: None,
             // #2023 C4 — Tier-0 shared mean: default None (no de-meaning; the
-            // historical path is bit-for-bit). Installed via `set_tier0_mean` /
-            // `fit_tier0_mean`.
+            // historical path is bit-for-bit). Installed via `set_tier0_mean`.
             tier0_mean: None,
             tier0_scale: None,
         })
@@ -1480,46 +1479,13 @@ impl SaeManifoldTerm {
         Ok(())
     }
 
-    /// #2023 C4 — fit the Tier-0 shared mean as the column mean of the fit target
-    /// `Z` (`N×P`), install it on the term, and return the DE-MEANED target
-    /// `Z − μ` the atoms should be fit against. This is the single seam a driver
-    /// calls before the joint fit so the global DC is carried by Tier-0 and the
-    /// atoms chase only structure. The mean is the TRAIN-split mean: hold it fixed
-    /// and reuse it for out-of-sample de-meaning and the EV baseline so held-out
-    /// EV is measured against the same Tier-0 constant (no full-data leak).
-    ///
-    /// DOUBLE-SUBTRACTION HAZARD: exactly ONE stage may own the mean. If an
-    /// upstream data-prep step already centers the target (e.g. the COMPOSE L17
-    /// driver's `tier0.json` mean/scale), the term must NOT also de-mean — leave
-    /// `tier0_mean` at `None` (the default), which is CORRECT for already-centered
-    /// data. Only call this on RAW (un-centered) targets, where the term takes
-    /// ownership of the mean.
-    pub fn fit_tier0_mean(&mut self, z: ArrayView2<'_, f64>) -> Result<Array2<f64>, String> {
-        let p = self.output_dim();
-        if z.ncols() != p {
-            return Err(format!(
-                "SaeManifoldTerm::fit_tier0_mean: target has P={} but output_dim is {p}",
-                z.ncols()
-            ));
-        }
-        if z.nrows() == 0 {
-            return Err("SaeManifoldTerm::fit_tier0_mean: empty target".to_string());
-        }
-        let mean = z.mean_axis(ndarray::Axis(0)).ok_or_else(|| {
-            "SaeManifoldTerm::fit_tier0_mean: mean_axis returned None".to_string()
-        })?;
-        let demeaned = &z - &mean.view().insert_axis(ndarray::Axis(0));
-        self.set_tier0_mean(mean)?;
-        Ok(demeaned)
-    }
-
     /// #2023 C4 — install a Tier-0 shared mean μ (the manifold analogue of
     /// [`crate::tiered::Tier0Mean`]). Once set, `Self::try_fitted_with_rho` adds
     /// μ back to the assembled per-atom reconstruction, so the atoms only ever
     /// need to explain the DE-MEANED target `Z − μ`. Pass a length-`p` vector;
     /// mismatched length is rejected. Passing the column-mean of the fit target
-    /// (see `Self::fit_tier0_mean`) moves the global DC out of the K per-atom
-    /// intercepts into ONE shared mean — structurally removing the
+    /// moves the global DC out of the K per-atom intercepts into ONE shared mean —
+    /// structurally removing the
     /// co-collapse-to-mean incentive (a pure DC-constant decoder then reconstructs
     /// a constant that the de-meaned target no longer contains, so it earns zero
     /// EV and is priced at realised rank 0 by the rank charge — unrepresentable as
@@ -3860,7 +3826,7 @@ impl SaeManifoldTerm {
     /// ones; only the assignment masses come from `assignments`. Because this
     /// entry point has no target, it explicitly refuses a collapse-rescued image;
     /// callers with a target must use
-    /// `Self::reconstruct_from_assignments_target_aware`.
+    /// `Self::reconstruct_with_atom_images_target_aware`.
     pub fn reconstruct_from_assignments(
         &self,
         assignments: ArrayView2<'_, f64>,
@@ -3903,7 +3869,7 @@ impl SaeManifoldTerm {
             .find(|image| image.is_collapse_rescued())
         {
             return Err(format!(
-                "SaeManifoldTerm::reconstruct_from_assignments: collapse-rescued atom {} requires reconstruct_from_assignments_target_aware",
+                "SaeManifoldTerm::reconstruct_from_assignments: collapse-rescued atom {} requires reconstruct_with_atom_images_target_aware",
                 image.atom_idx
             ));
         }
@@ -4043,11 +4009,7 @@ impl SaeManifoldTerm {
     /// [`Self::reconstruct_from_assignments`] would layer UNDER any fitted /
     /// attached collapse policy for `assignments`. Empty when a completed fit
     /// (`hybrid_split_report`) or an attached OOS policy (`oos_linear_images`)
-    /// already owns the collapse decision — those are respected verbatim, exactly
-    /// as the reconstruction does. The SINGLE guard shared by the reconstruction
-    /// path and the public verdict accessor
-    /// ([`Self::hybrid_collapse_verdict_from_assignments`]) so the two can never
-    /// disagree about which slots collapse.
+    /// already owns the collapse decision — those are respected verbatim.
     fn collapse_fit_free_images(
         &self,
         assignments: ArrayView2<'_, f64>,
@@ -4077,67 +4039,6 @@ impl SaeManifoldTerm {
         ))
     }
 
-    /// #1026/#2394 — the collapse VERDICT reachable from the fit-free public
-    /// reconstruction path: the slot indices whose `d = 1` realized contribution
-    /// collapses to its straight (`Θ → 0`) sub-model under
-    /// `reconstruct_from_assignments(assignments, /*collapse=*/ true)`, in
-    /// ascending order.
-    ///
-    /// This is the observable form of the linear-dominance guarantee. The
-    /// reconstruction merely SUBSTITUTES a collapsed slot's straight image for its
-    /// curved decode; when the curved decode already lies on that straight image
-    /// at the assigned coordinates (exactly-linear data — a circle sampled only at
-    /// the two points its tangent line also passes through), the substitution is
-    /// value-preserving to round-off, so the *reconstruction* is bit-for-bit
-    /// unchanged and the verdict is INVISIBLE through a value comparison. Consumers
-    /// that need to know a slot collapsed (the #1026 "attach the linear verdict"
-    /// contract) must read it here, NOT by differencing collapsed vs. uncollapsed
-    /// reconstructions — that difference is exactly zero on the collapse-safe case
-    /// the guarantee is about.
-    ///
-    /// Honours a completed fit's `hybrid_split_report` and any attached
-    /// `oos_linear_images` (their `atom_idx` set is returned) before falling back
-    /// to the fit-free adjudication from `assignments`; the union is deduplicated
-    /// so the same slot is never reported twice. Errors only on an
-    /// assignment-shape mismatch, mirroring the reconstruction's own guard.
-    pub fn hybrid_collapse_verdict_from_assignments(
-        &self,
-        assignments: ArrayView2<'_, f64>,
-    ) -> Result<Vec<usize>, String> {
-        let n = self.n_obs();
-        let k_atoms = self.k_atoms();
-        if assignments.dim() != (n, k_atoms) {
-            return Err(format!(
-                "SaeManifoldTerm::hybrid_collapse_verdict_from_assignments: assignments {:?} != ({n}, {k_atoms})",
-                assignments.dim()
-            ));
-        }
-        // Same union the reconstruction forms: the fitted / OOS collapse policy
-        // (`hybrid_linear_image_map`) plus the fit-free images that layer under it
-        // (empty when a fitted / OOS policy already owns the decision).
-        let mut collapsed: std::collections::BTreeSet<usize> =
-            self.hybrid_linear_image_map().keys().copied().collect();
-        for image in self.collapse_fit_free_images(assignments) {
-            collapsed.insert(image.atom_idx);
-        }
-        Ok(collapsed.into_iter().collect())
-    }
-
-    /// Assemble a hybrid-collapsed reconstruction from explicit assignment
-    /// masses and the response being reconstructed. Ordinary straight images use
-    /// the atom's realized coordinate. A collapse-rescued image derives every
-    /// coordinate from that row's leave-this-atom-out residual projected onto its
-    /// persisted direction `v`; no train-row coordinate cache exists.
-    pub fn reconstruct_from_assignments_target_aware(
-        &self,
-        target: ArrayView2<'_, f64>,
-        assignments: ArrayView2<'_, f64>,
-    ) -> Result<Array2<f64>, String> {
-        let (fitted, _, _) =
-            self.reconstruct_from_assignments_target_aware_impl(target, assignments, false)?;
-        Ok(fitted)
-    }
-
     fn reconstruct_from_assignments_target_aware_impl(
         &self,
         target: ArrayView2<'_, f64>,
@@ -4156,7 +4057,7 @@ impl SaeManifoldTerm {
         let k_atoms = self.k_atoms();
         if target.dim() != (n, p) || assignments.dim() != (n, k_atoms) {
             return Err(format!(
-                "SaeManifoldTerm::reconstruct_from_assignments_target_aware: target={:?}, assignments={:?} disagree with ({n}, {p}) and ({n}, {k_atoms})",
+                "SaeManifoldTerm::reconstruct_with_atom_images_target_aware: target={:?}, assignments={:?} disagree with ({n}, {p}) and ({n}, {k_atoms})",
                 target.dim(),
                 assignments.dim()
             ));
@@ -4210,7 +4111,7 @@ impl SaeManifoldTerm {
                         }
                         image.coordinate_from_residual(&residual).ok_or_else(|| {
                             format!(
-                                "SaeManifoldTerm::reconstruct_from_assignments_target_aware: collapse-rescued atom {atom_idx} cannot project a {p}-channel residual"
+                                "SaeManifoldTerm::reconstruct_with_atom_images_target_aware: collapse-rescued atom {atom_idx} cannot project a {p}-channel residual"
                             )
                         })?
                     } else {
@@ -4350,36 +4251,6 @@ impl SaeManifoldTerm {
         self.try_fitted_with_rho(Some(rho), false)
     }
 
-    /// #1026 — the LOAD-BEARING collapsed reconstruction: the assembled
-    /// dictionary output `Σ_k a[i,k]·g_k(coord[i,k])` in which every slot whose
-    /// hybrid-split verdict selected LINEAR has its curved decoded image replaced
-    /// by its fitted straight sub-model `b₀ + (t − t̄)·b₁`. This is what makes the
-    /// verdict *change the reconstruction* instead of merely logging a choice:
-    /// the linear-collapsed atom no longer pays its `M·p` curved coefficients, it
-    /// carries a `2·p` straight image whose decoded curve has zero turning.
-    ///
-    /// The straight images are the exact weighted-least-squares lines already
-    /// realized inside [`Self::compute_hybrid_split_report`] (no re-fit, no outer
-    /// continuation, sidestepping #1051). Returns the curved reconstruction
-    /// unchanged when no verdict selected linear, or when the report has not been
-    /// computed yet (`hybrid_split_report == None`). A collapse-rescued image is
-    /// refused because this method has no target from which to derive its
-    /// coordinate; use [`Self::try_fitted_target_aware`] instead.
-    pub fn hybrid_collapsed_reconstruction(
-        &self,
-        rho: &SaeManifoldRho,
-    ) -> Result<Array2<f64>, String> {
-        // #1026 — the hybrid collapse is realised by the SINGLE reconstruction
-        // path ([`Self::try_fitted_with_rho`]) with the collapse flag set: a
-        // verdict-linear `d = 1` slot decodes its straight sub-model image
-        // instead of its curved curve. This replaces the dedicated re-collapse
-        // loop this method used to carry (a parallel layer). The production
-        // `try_fitted` shares the identical routine at `rho = None`; this entry
-        // point keeps the rho-keyed, target-less collapse for callers whose
-        // report contains only ordinary straight images.
-        self.try_fitted_with_rho(Some(rho), true)
-    }
-
     pub(crate) fn try_fitted_with_rho(
         &self,
         rho: Option<&SaeManifoldRho>,
@@ -4401,8 +4272,7 @@ impl SaeManifoldTerm {
         // adjudication — no re-fit, no #1051 outer continuation).
         //
         // The collapse engages only when the caller asks for it (`collapse`):
-        // the production `try_fitted` path and the explicit
-        // `hybrid_collapsed_reconstruction` entry point. The pure-curved
+        // the production `try_fitted` path. The pure-curved
         // `try_fitted_for_rho` opts out — the joint fit's loss/assembly optimise
         // the curved decoder coefficients and must see the curved image, and the
         // #1026 adjudication itself compares the curved fit against its straight
@@ -5845,16 +5715,15 @@ include!("construction_row_jet_logdet_channels.rs");
 // entry points above dispatch into it at `K >= MIN_ATOMS`.
 include!("construction_smoothness_dof.rs");
 
-// [#780 line-count gate] `term_from_padded_blocks_with_mode` (the padded-FFI
+// [#780 line-count gate] `term_from_geometry_plans_with_mode` (the geometry-plan
 // term builder) was split into the sibling `construction_padded_blocks.rs`
 // module (declared and re-exported from `mod.rs`), keeping this tracked file
 // under the 10k limit. Callers still reach it bare through `use super::*`.
 
-// [#780 line-count gate] `refresh_isometry_caches_from_atom` and
-// `refresh_isometry_caches_from_term` were split into the sibling
-// `construction_cache_refresh.rs` module (declared and re-exported from
+// [#780 line-count gate] `refresh_isometry_caches_from_atom` was split into the
+// sibling `construction_cache_refresh.rs` module (declared and re-exported from
 // `mod.rs`), keeping this tracked file under the 10k limit. Callers still reach
-// both functions bare through `use super::*`.
+// it bare through `use super::*`.
 
 // [#780 line-count gate] The `#[cfg(test)]` modules below the production code
 // are mechanically split into a sibling `*_tests` file and inlined via

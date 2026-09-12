@@ -238,14 +238,6 @@ pub struct CurlCensus {
 }
 
 impl CurlCensus {
-    /// Pairs whose ROBUST geometry gate passed — the population the calibrated
-    /// test was actually run on, before multiplicity. (`recommend_curl` adds the
-    /// κ gate, which has no breakdown point and refuses planted ground truth; see
-    /// [`super::curl::CurlVerdict::geometry_ok`].)
-    pub fn screen_accepted(&self) -> usize {
-        self.pairs.iter().filter(|p| p.verdict.geometry_ok).count()
-    }
-
     /// e-BH discoveries: the pairs the census reports as shattered circles.
     pub fn accepted(&self) -> usize {
         self.pairs.iter().filter(|p| p.fdr_discovery).count()

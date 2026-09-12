@@ -582,9 +582,8 @@ pub struct SaeManifoldAtom {
     /// for the harmonic and sphere-chart bases the base block already carries
     /// extrinsic curvature (a first-harmonic `[sin, cos]` traces a circle, the
     /// sphere chart's `[x, y, z]` traces the sphere). Its decoder sub-problem is
-    /// still convex, and a genuine low-rank (Eckart-Young / PCA) residual ceiling
-    /// is certified by `linear_span_anchor` — a rank bound on every `η`, not a
-    /// claim that `η = 0` is curvature-free. The certified tracker walks `η`
+    /// still convex, which is not a claim that `η = 0` is curvature-free. The
+    /// certified tracker walks `η`
     /// from `0 → 1`; every other caller sees the default `1.0`, which makes
     /// [`Self::refresh_basis`] bit-for-bit identical to the un-dialed `evaluate`
     /// path (`evaluate_phi_eta` at `η = 1` returns the unscaled basis).
@@ -1797,23 +1796,6 @@ impl SaeManifoldAtom {
         frame.reconstruct_decoder(coords)
     }
 
-    /// Install border coordinates `C_k` (`M_k × r`) returned by the factored
-    /// border solve, refreshing `decoder_coefficients = C_k · Uᵀ` so all
-    /// full-`B` consumers stay consistent with the profiled frame (issue #972).
-    pub fn set_factored_coordinates(&mut self, coords: ArrayView2<'_, f64>) -> Result<(), String> {
-        let reconstructed = self.reconstruct_decoder_coefficients(coords)?;
-        if reconstructed.dim() != self.decoder_coefficients.dim() {
-            return Err(format!(
-                "SaeManifoldAtom::set_factored_coordinates: reconstructed decoder {:?} \
-                 must match {:?}",
-                reconstructed.dim(),
-                self.decoder_coefficients.dim()
-            ));
-        }
-        self.decoder_coefficients = reconstructed;
-        Ok(())
-    }
-
     /// Closed-form streaming polar refresh of the active frame from an
     /// accumulated `p × r` cross-moment (issue #972): `U ← polar(Mcm)`, then
     /// re-project the coordinates so `B_k` is unchanged in span. The frame
@@ -1896,40 +1878,6 @@ impl SaeManifoldAtom {
             *slot = 0.0;
         }
         for basis_col in 0..m {
-            let dphi = self.basis_jacobian[[row, basis_col, latent_axis]];
-            if dphi == 0.0 {
-                continue;
-            }
-            let dec = self.decoder_coefficients.row(basis_col);
-            for (o, &d) in out.iter_mut().zip(dec.iter()) {
-                *o += dphi * d;
-            }
-        }
-    }
-
-    /// #1026 — `∂²g_k/∂t_{ik,axis}∂η` for one row/axis, restricted to the curved
-    /// basis columns. Because the η-dial scales exactly the curved columns
-    /// (`∂Φ^η/∂η = Φ_curved`), the η-derivative of the coordinate Jacobian
-    /// `∂(∂Φ/∂t·B)/∂η` is the SAME coordinate-Jacobian contraction summed over
-    /// only the curved columns. This is the coordinate-channel analog of the
-    /// β-predictor's curvature-basis η-derivative, and supplies the missing
-    /// `w_t = ∂g_t/∂η` forcing that lets the homotopy walk track onto the curved
-    /// branch instead of riding the base-topology shadow. `curved_cols` are the
-    /// atom's `phi_eta_split` curved column indices; a base-only atom (no dialed
-    /// columns) writes zeros.
-    pub fn fill_decoded_curved_derivative_row(
-        &self,
-        row: usize,
-        latent_axis: usize,
-        curved_cols: &[usize],
-        out: &mut [f64],
-    ) {
-        let p = self.output_dim();
-        assert_eq!(out.len(), p);
-        for slot in out.iter_mut() {
-            *slot = 0.0;
-        }
-        for &basis_col in curved_cols {
             let dphi = self.basis_jacobian[[row, basis_col, latent_axis]];
             if dphi == 0.0 {
                 continue;

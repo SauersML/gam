@@ -13,7 +13,7 @@
 //! dropped curvature `ΔC = A − B` is nonzero (large residual, indefinite entropy,
 //! periodic ARD past a quarter period).
 //!
-//! FIX (landed in `analytic_outer_rho_gradient_components`,
+//! FIX (landed in `analytic_outer_rho_gradient_components_with_bundle`,
 //! `solve_exact_stationarity`, `apply_exact_hessian_minus_b` in
 //! `src/terms/sae/manifold/construction.rs`): the IFT correction now applies the
 //! TRUE `A⁻¹` via a `B⁻¹`-preconditioned Neumann fixed point

@@ -170,10 +170,7 @@ pub trait SaeBasisEvaluator: Send + Sync + std::fmt::Debug {
 /// "linear/curvature-free": for the harmonic and sphere-chart bases the base
 /// block already embeds curvature (first-harmonic `[sin, cos]`, the sphere
 /// chart's `[x, y, z]`). The `eta = 0` endpoint is thus the base-topology
-/// relaxation, not an affine/Eckart-Young linear model. The genuine
-/// low-rank (Eckart-Young / PCA) certificate lives in
-/// `crate::manifold::outer_objective::linear_span_anchor` and is a rank
-/// ceiling that bounds every `eta`, independent of this split.
+/// relaxation, not an affine/Eckart-Young linear model.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PhiEtaSplit {
     pub base_cols: Vec<usize>,

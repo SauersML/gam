@@ -14,8 +14,8 @@
 //! CONSTRUCTION — the ordinary arrow-Schur joint fit reconstructs every layer,
 //! and the per-layer relevance weight `λ_ℓ` is REML-selected (the closed-form
 //! variance ratio `λ_ℓ = (R_x/p_x)/(R_ℓ/p_ℓ)`), never hand-tuned.
-//! [`OutputBlock::split_honest_decoder`] un-does the `√λ_ℓ`, so each layer's
-//! decoder is recovered in that layer's own units.
+//! Dividing a layer's decoder columns by its `√λ_ℓ` recovers that decoder in
+//! the layer's own units.
 //!
 //! # Follow-up client (not built here)
 //!

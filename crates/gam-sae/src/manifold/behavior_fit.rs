@@ -15,16 +15,16 @@
 //!   (n·p̃/2)·log((R_x + λ_y·R_y)/(n·p̃)) − (n·p_y/2)·log λ_y ,
 //! ```
 //!
-//! (the second term is the `√λ_y` target-scaling Jacobian,
-//! [`BehaviorBlock::reml_log_lambda_jacobian`]) whose unique stationary point is
+//! (the second term is the `√λ_y` target-scaling Jacobian) whose unique
+//! stationary point is
 //! the closed-form variance ratio
 //!
 //! ```text
 //!   λ_y = (R_x/p_x) / (R_y/p_y)
 //! ```
 //!
-//! ([`BehaviorBlock::reml_updated_log_lambda_y`]) — the classical REML estimate
-//! of a variance-component ratio under a shared mean structure. The driver
+//! This is the classical REML estimate of a variance-component ratio under a
+//! shared mean structure. The driver
 //! below alternates (fit at fixed `λ_y`) ↔ (closed-form `λ_y` update at the
 //! fitted residuals): block-coordinate descent on the joint profiled criterion,
 //! each half-step solving its subproblem exactly. No grid search, no
@@ -152,8 +152,8 @@ impl SaeManifoldTerm {
     /// The term's atoms must be built at the augmented width
     /// `p̃ = p_x + Σ_ℓ p_ℓ`. On return the term holds the fitted state at the
     /// selected weights and each block in `blocks` carries its converged
-    /// `log λ_ℓ`, so a decoder slice for block `ℓ` un-scaled by
-    /// [`OutputBlock::split_honest_decoder`] decodes in honest units.
+    /// `log λ_ℓ`, so [`Self::layer_decoder`] returns block `ℓ`'s decoder in
+    /// honest units.
     ///
     /// A block whose residual carries no variance is *held* (its `λ_ℓ` frozen,
     /// `identifiable = false`) and excluded from the convergence test; when every
@@ -324,8 +324,7 @@ impl SaeManifoldTerm {
                 // `(R_x + P)/p_x` — the penalty-priced anchor variance. The
                 // coupled multiblock fixed point `λ_ℓ·R_ℓ = d_ℓ·pooled'/p̃`
                 // collapses to `λ_ℓ* = ((R_x+P)/p_x)/(R_ℓ/d_ℓ)`, so `P` enters
-                // the closed form only through this numerator (see
-                // `profiled_penalized_quasi_laplace_block_efs_log_lambda_steps`).
+                // the closed form only through this numerator.
                 let var_x = (base_rx + base_pen) / px as f64;
                 if !(r_ell > 0.0) || !(var_x > 0.0) {
                     // No block residual variance ⇒ λ_ℓ unidentifiable; hold it.
@@ -638,7 +637,7 @@ impl SaeManifoldTerm {
     /// the decoder columns of block `ℓ` divided by `√λ_ℓ` (un-doing the target
     /// scaling that `stack_augmented_target` applied), and — when a Tier-0
     /// column-equilibration scale is installed (#2015; see
-    /// [`Self::set_tier0_scale`] and `crosscoder_fit::equilibrate_crosscoder_columns`)
+    /// [`Self::set_tier0_scale`])
     /// — un-doing that per-column scale too, so the returned decoder is honest in
     /// the CALLER's raw target units regardless of the internal conditioning
     /// frame the inner solve actually ran on. Requires an installed
@@ -676,8 +675,8 @@ impl SaeManifoldTerm {
     }
 
     /// The full-width (augmented) decoder of atom `k`, with the Tier-0
-    /// column-equilibration scale (#2015; [`Self::set_tier0_scale`],
-    /// `crosscoder_fit::equilibrate_crosscoder_columns`) undone column-by-column
+    /// column-equilibration scale (#2015; [`Self::set_tier0_scale`]) undone
+    /// column-by-column
     /// when one is installed — a strict no-op on the historical (unequilibrated)
     /// path. Every consumer that carves an honest per-layer decoder out of the
     /// full augmented width ([`Self::layer_decoder`] above, the crosscoder
