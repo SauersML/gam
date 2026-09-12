@@ -1794,7 +1794,7 @@ impl BernoulliMarginalSlopePredictor {
                     }
 
                     let intercept = intercepts_view[local_row];
-                    let (_, m_a_raw, _) = self.evaluate_prediction_calibration(
+                    let (_, m_a, _) = self.evaluate_prediction_calibration(
                         intercept,
                         q,
                         slope,
@@ -1804,7 +1804,17 @@ impl BernoulliMarginalSlopePredictor {
                         score_corr_row,
                         link_corr_row,
                     )?;
-                    let m_a = m_a_raw.max(1e-12);
+                    // ∂a/∂θ = −F_θ/F_a by the implicit function theorem. The
+                    // calibration F is increasing in a, so F_a is positive unless
+                    // every quadrature density has underflowed; the intercept then
+                    // has no finite gradient and the row is refused.
+                    if !(m_a > 0.0 && m_a.is_finite()) {
+                        return Err(EstimationError::InvalidInput(format!(
+                            "bernoulli marginal-slope prediction row {i}: the intercept \
+                             calibration derivative dF/da is {m_a:e}, so the intercept has \
+                             no finite gradient"
+                        )));
+                    }
                     a_q.as_mut().expect("a_q allocated when need_gradient")[local_row] =
                         marginal_map[i].mu1 / m_a;
                     let mut f_b = 0.0;
@@ -2298,7 +2308,7 @@ impl BernoulliMarginalSlopePredictor {
                         score_corr_row,
                         link_corr_row,
                     )?;
-                    let (_, m_a_raw, _) = self.evaluate_prediction_calibration(
+                    let (_, m_a, _) = self.evaluate_prediction_calibration(
                         intercept,
                         q,
                         slope,
@@ -2308,7 +2318,15 @@ impl BernoulliMarginalSlopePredictor {
                         score_corr_row,
                         link_corr_row,
                     )?;
-                    let m_a = m_a_raw.max(1e-12);
+                    // ∂a/∂θ = −F_θ/F_a: a non-positive F_a leaves the intercept
+                    // with no finite gradient, so the row is refused.
+                    if !(m_a > 0.0 && m_a.is_finite()) {
+                        return Err(EstimationError::InvalidInput(format!(
+                            "bernoulli marginal-slope prediction row {i}: the intercept \
+                             calibration derivative dF/da is {m_a:e}, so the intercept has \
+                             no finite gradient"
+                        )));
+                    }
                     let mut f_b = 0.0;
                     if let Some(grid) = empirical_grid.as_ref() {
                         for (node, weight) in grid.pairs() {
