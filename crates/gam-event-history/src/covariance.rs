@@ -75,13 +75,15 @@ pub fn eigenmodes(matrix: &Array2<f64>) -> Result<(Array1<f64>, Array2<f64>), Ev
 /// a rank-one covariance, the dimension for an isotropic one, zero for the
 /// zero matrix.
 pub fn effective_rank(covariance: &Array2<f64>) -> f64 {
-    let trace: f64 = covariance.diag().sum();
-    let frobenius: f64 = covariance.iter().map(|c| c * c).sum();
-    if frobenius > 0.0 {
-        trace * trace / frobenius
-    } else {
-        0.0
+    // The ratio is scale invariant. Normalize before squaring so a change
+    // of variance units cannot turn a nonzero rank into zero or NaN.
+    let scale = covariance.iter().map(|c| c.abs()).fold(0.0_f64, f64::max);
+    if scale == 0.0 {
+        return 0.0;
     }
+    let trace: f64 = covariance.diag().iter().map(|c| c / scale).sum();
+    let frobenius: f64 = covariance.iter().map(|c| (c / scale).powi(2)).sum();
+    trace * trace / frobenius
 }
 
 /// One subject's residual scores at the current fit.
