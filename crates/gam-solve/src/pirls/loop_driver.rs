@@ -205,13 +205,15 @@ pub(super) fn default_beta_guess_external(
                 totalweight += wi;
             }
             if totalweight > 0.0 {
-                let prevalence =
-                    ((weighted_sum + 0.5) / (totalweight + 1.0)).clamp(1e-6, 1.0 - 1e-6);
+                // The Jeffreys-smoothed prevalence `(Σwy + ½)/(Σw + 1)` lies strictly
+                // inside (0, 1) for any response in [0, 1] (until `Σw` nears 2⁵²), so
+                // the link transforms below need no clamp (#2469).
+                let prevalence = (weighted_sum + 0.5) / (totalweight + 1.0);
                 beta[intercept_col] = match link_function {
                     LinkFunction::Logit => (prevalence / (1.0 - prevalence)).ln(),
                     LinkFunction::Probit => {
                         standard_normal_quantile(prevalence).unwrap_or_else(|err| {
-                            // `prevalence` is clamped to (0, 1); this fallback is
+                            // `prevalence` lies inside (0, 1); this fallback is
                             // only for defensive robustness under non-finite upstream inputs.
                             log::debug!(
                                 "[PIRLS init] probit intercept seed: Φ⁻¹({prevalence:.6}) \

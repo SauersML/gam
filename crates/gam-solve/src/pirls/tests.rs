@@ -1113,7 +1113,6 @@ mod tests {
         let beta =
             default_beta_guess_external(3, LinkFunction::Logit, y.view(), w.view(), None, None);
         let prevalence: f64 = (3.0 + 0.5) / (4.0 + 1.0);
-        let prevalence = prevalence.max(1e-6_f64).min(1.0_f64 - 1e-6_f64);
         let expected = (prevalence / (1.0 - prevalence)).ln();
         assert!((beta[0] - expected).abs() < 1e-12);
         assert_eq!(beta[1], 0.0);
@@ -1127,10 +1126,9 @@ mod tests {
         let beta =
             default_beta_guess_external(3, LinkFunction::Probit, y.view(), w.view(), None, None);
         let prevalence: f64 = (3.0 + 0.5) / (4.0 + 1.0);
-        let prevalence = prevalence.max(1e-6_f64).min(1.0_f64 - 1e-6_f64);
         let log_odds = (prevalence / (1.0 - prevalence)).ln();
         let expected =
-            standard_normal_quantile(prevalence).expect("clamped prevalence must be valid");
+            standard_normal_quantile(prevalence).expect("prevalence lies inside (0, 1)");
         assert!((expected - log_odds).abs() > 1e-3);
         assert!((beta[0] - expected).abs() < 1e-12);
         assert_eq!(beta[1], 0.0);
