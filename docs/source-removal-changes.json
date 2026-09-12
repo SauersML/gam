@@ -2887,5 +2887,36 @@
     ],
     "reason": "User directive 2026-09-11: delete code only tests use (#2023). tiered::fit carried the remnants of a public support-sparse linear peel that no production entry calls: LinearPeelConfig::derive, LinearPeelState with composed_mean, linear_reconstruct and offset, and LinearPeel::state were reached only from the peel_tests module, which also exercised a linear_peel=False public configuration that does not exist.",
     "evidence": "git grep -nw over crates, gamfit and src at the base finds LinearPeelConfig, LinearPeel and LinearPeelState only inside crates/gam-sae/src/tiered/, and fit_linear_peel's only caller is fit_tiered, called by its tests and the tiered_dominance, tiered_gpu_scale and tiered_k2000_measure examples, none of which name a removed item. The identities are this guard's own output over base..candidate (candidate commit built from the base plus this patch). The peel_tests helpers planted_bulk_plus_curvature and chart_curved go with the four tests. The Tier-2 support-sparse engine chart_curved drove stays exercised by tiered::fit::fit_tests."
+  },
+  {
+    "base": "3b0f82f8d175d9fe3d098800a94184e699ff0976",
+    "items": [
+      "crates/gam-sae/src/row_jet_program.rs:const:SAE_FIXED_COORD_SLOT",
+      "crates/gam-sae/src/row_jet_program.rs:enum:RowGate",
+      "crates/gam-sae/src/row_jet_program.rs:fn:all_gates",
+      "crates/gam-sae/src/row_jet_program.rs:fn:basis_tower",
+      "crates/gam-sae/src/row_jet_program.rs:fn:beta_border_batch_generic",
+      "crates/gam-sae/src/row_jet_program.rs:fn:beta_border_generic",
+      "crates/gam-sae/src/row_jet_program.rs:fn:beta_border_order1_packed",
+      "crates/gam-sae/src/row_jet_program.rs:fn:beta_border_tower",
+      "crates/gam-sae/src/row_jet_program.rs:fn:beta_border_tower_packed",
+      "crates/gam-sae/src/row_jet_program.rs:fn:beta_border_towers_packed",
+      "crates/gam-sae/src/row_jet_program.rs:fn:decoded_tower",
+      "crates/gam-sae/src/row_jet_program.rs:fn:fixed_gate",
+      "crates/gam-sae/src/row_jet_program.rs:fn:gate_tower",
+      "crates/gam-sae/src/row_jet_program.rs:fn:n_basis",
+      "crates/gam-sae/src/row_jet_program.rs:fn:out_dim",
+      "crates/gam-sae/src/row_jet_program.rs:fn:recip",
+      "crates/gam-sae/src/row_jet_program.rs:fn:reconstruction_all_columns_generic",
+      "crates/gam-sae/src/row_jet_program.rs:fn:reconstruction_all_columns_packed",
+      "crates/gam-sae/src/row_jet_program.rs:fn:reconstruction_column",
+      "crates/gam-sae/src/row_jet_program.rs:fn:reconstruction_column_generic",
+      "crates/gam-sae/src/row_jet_program.rs:fn:reconstruction_column_packed",
+      "crates/gam-sae/src/row_jet_program.rs:fn:softmax_fixture_k",
+      "crates/gam-sae/src/row_jet_program.rs:struct:AtomRowBasisJet",
+      "crates/gam-sae/src/row_jet_program.rs:struct:SaeReconstructionRowProgram"
+    ],
+    "reason": "user directive: delete all useless slop (only used by tests / unused)",
+    "evidence": "row_jet_program.rs's owned tower program had no production consumer. SaeReconstructionRowProgram was constructed only in its own #932 test; AtomRowBasisJet and RowGate existed only for it; the seven pub tower methods had zero uses anywhere at 5d498d0e9 (MSI name-usage scan, job 438081), and outside the file only doc prose in manifold/construction_row_jet_logdet_channels.rs named them. Their private generics, recip, SAE_FIXED_COORD_SLOT, AtomRowBasisJet::n_basis and the test-only softmax_fixture_k were reached only from them. The #932 test keeps every assertion on a gate-value-only source. MSI job 441111 over 01e3dfadc..candidate: gam-sae compiled, cargo doc 0 errors / 0 warnings, the #932 test passed, census unchanged; these items are that job's guard output. The only later change is four test-source parameter renames for the root ban scanner, with no item names changed."
   }
 ]

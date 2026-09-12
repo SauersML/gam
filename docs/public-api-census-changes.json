@@ -1101,5 +1101,20 @@
     },
     "reason": "User directive 2026-09-11: delete code only tests use (#2023). LinearPeelConfig::derive, LinearPeelState::composed_mean, ::linear_reconstruct, ::offset and LinearPeel::state were the public half of a linear peel the public support-sparse entry no longer runs; only tiered::fit's own peel_tests called them.",
     "evidence": "At the base no file under crates, gamfit or src outside crates/gam-sae/src/tiered/ names LinearPeelConfig, LinearPeel or LinearPeelState, and gam-pyffi's support_sparse_sae_ffi.rs builds its seed directly with build_sae_support_seed. No replacement: the retained fit_linear_peel and fit_tiered carry the one live cadence, used by the tiered_* examples."
+  },
+  {
+    "base": "3b0f82f8d175d9fe3d098800a94184e699ff0976",
+    "removed": {
+      "crates/gam-sae/src/row_jet_program.rs::beta_border_order1_packed": 1,
+      "crates/gam-sae/src/row_jet_program.rs::beta_border_tower": 1,
+      "crates/gam-sae/src/row_jet_program.rs::beta_border_tower_packed": 1,
+      "crates/gam-sae/src/row_jet_program.rs::beta_border_towers_packed": 1,
+      "crates/gam-sae/src/row_jet_program.rs::out_dim": 1,
+      "crates/gam-sae/src/row_jet_program.rs::reconstruction_all_columns_packed": 1,
+      "crates/gam-sae/src/row_jet_program.rs::reconstruction_column": 1,
+      "crates/gam-sae/src/row_jet_program.rs::reconstruction_column_packed": 1
+    },
+    "reason": "user directive: delete all useless slop (only used by tests / unused)",
+    "evidence": "scripts/public_api_census.py on MSI lane sw2 (job 441111) over 01e3dfadc..the 7b candidate measured exactly these 8 declarations: row_jet_program.rs's public tower-program methods, none with a caller."
   }
 ]
