@@ -1151,20 +1151,18 @@ pub(crate) fn matrix_det(a: &Array2<f64>) -> f64 {
 /// Cholesky factor `L` of a symmetric positive-definite matrix (`A = L Lᵀ`).
 ///
 /// This is a *positive-definiteness* test, not a conditioning test: a genuine
-/// SPD matrix with tiny eigenvalues (e.g. `[[1e-16]]`) must factor
-/// successfully. A pivot is rejected only when it is non-finite or fails to be
-/// strictly positive *relative to the matrix scale*. The floor
-/// `GEOMETRY_EPS · max(1, trace(A)/n)` is the ambient scale of the matrix
-/// multiplied by the relative machine-noise tolerance, so a positive pivot that
-/// is merely small in absolute terms (but large relative to nothing — the whole
-/// matrix is small) passes, while a zero, negative, or numerically-noise pivot
-/// (indefinite / singular directions) is rejected.
+/// SPD matrix of any scale (e.g. `[[1e-16]]`, or `diag(1, 1e-13)`) must factor
+/// successfully. A pivot `a_jj − Σ_{k<j} l_jk²` is one rounded square and one
+/// subtraction per eliminated term, so it rounds by at most
+/// `γ_{2j+1}·(|a_jj| + Σ_{k<j} l_jk²)`. A pivot is rejected when it is
+/// non-finite or lies inside that band: a zero, negative, or roundoff pivot is
+/// an indefinite or singular direction, while a pivot that is merely small
+/// relative to the rest of the matrix is resolved and factors.
 ///
 /// Callers needing a *conditioning* margin (a lower bound on the smallest
-/// eigenvalue) must check that separately; overloading this PD test with an
-/// absolute `GEOMETRY_EPS` floor wrongly rejected well-formed small-scale SPD
-/// points. No current caller (only `SpdManifold::matrix`, which validates SPD
-/// membership) depends on a conditioning margin here.
+/// eigenvalue) must check that separately. No current caller (only
+/// `SpdManifold::matrix`, which validates SPD membership) depends on a
+/// conditioning margin here.
 pub(crate) fn cholesky_spd(a: &Array2<f64>) -> GeometryResult<Array2<f64>> {
     let n = a.nrows();
     if n != a.ncols() {
@@ -1172,41 +1170,19 @@ pub(crate) fn cholesky_spd(a: &Array2<f64>) -> GeometryResult<Array2<f64>> {
             "Cholesky requires square input",
         ));
     }
-    // Scale-relative positive-definiteness floor. `trace(A)/n` is the mean
-    // diagonal, which equals `mean(eigenvalues)` and is therefore the natural
-    // scale of an SPD matrix's spectrum. The acceptance floor scales WITH the
-    // matrix (it shrinks for tiny matrices), so a uniformly small but genuine
-    // SPD matrix like `[[1e-16]]` — scale 1e-16, floor GEOMETRY_EPS·1e-16 =
-    // 1e-28 — passes, while a pivot that has collapsed to numerical noise
-    // relative to the matrix's own scale (the indefinite/singular directions)
-    // is rejected. An absolute `GEOMETRY_EPS` floor would have wrongly rejected
-    // such tiny SPD matrices; clamping the floor up to a constant would do the
-    // same, so we deliberately let it shrink with the spectrum.
-    let mut trace = 0.0_f64;
-    for i in 0..n {
-        trace += a[[i, i]];
-    }
-    if !trace.is_finite() {
-        return Err(GeometryError::InvalidPoint(
-            "matrix is not positive definite",
-        ));
-    }
-    // Reference scale of the matrix's spectrum. The acceptance floor is this
-    // scale times the relative tolerance, so a uniformly-tiny SPD matrix (small
-    // scale) has a correspondingly tiny floor and still factors, while a pivot
-    // that has collapsed to noise *relative to the matrix's own scale* (the
-    // indefinite/singular case) is rejected.
-    let scale = (trace / n as f64).abs().max(f64::MIN_POSITIVE);
-    let scale_eps = GEOMETRY_EPS * scale;
     let mut l = Array2::<f64>::zeros((n, n));
     for i in 0..n {
         for j in 0..=i {
             let mut sum = a[[i, j]];
+            let mut magnitude = sum.abs();
             for k in 0..j {
-                sum -= l[[i, k]] * l[[j, k]];
+                let term = l[[i, k]] * l[[j, k]];
+                sum -= term;
+                magnitude += term.abs();
             }
             if i == j {
-                if !sum.is_finite() || sum <= scale_eps {
+                let pivot_band = gam_linalg::roundoff::accumulation_growth(2 * j + 1) * magnitude;
+                if !sum.is_finite() || sum <= pivot_band {
                     return Err(GeometryError::InvalidPoint(
                         "matrix is not positive definite",
                     ));
