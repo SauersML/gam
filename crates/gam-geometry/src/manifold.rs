@@ -726,6 +726,10 @@ pub(crate) fn inverse(a: &Array2<f64>) -> GeometryResult<Array2<f64>> {
     if n != a.ncols() {
         return Err(GeometryError::Singular("inverse requires a square matrix"));
     }
+    // Gauss–Jordan with partial pivoting is backward stable to `n·ε·max|a_ij|`,
+    // so a best pivot inside that band cannot be told from a singular column.
+    let elimination_band =
+        n as f64 * f64::EPSILON * a.iter().fold(0.0_f64, |acc, v| acc.max(v.abs()));
     let mut aug = Array2::<f64>::zeros((n, 2 * n));
     for i in 0..n {
         for j in 0..n {
@@ -743,7 +747,7 @@ pub(crate) fn inverse(a: &Array2<f64>) -> GeometryResult<Array2<f64>> {
                 pivot = row;
             }
         }
-        if best < GEOMETRY_EPS {
+        if best <= elimination_band {
             return Err(GeometryError::Singular("matrix inverse pivot underflow"));
         }
         if pivot != col {
