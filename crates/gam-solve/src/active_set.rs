@@ -924,10 +924,13 @@ pub(crate) fn feasible_point_for_linear_constraints(
         return None;
     };
     let max_singular = singular.iter().fold(0.0_f64, |acc, &v| acc.max(v.abs()));
-    // Rank tolerance relative to the LARGEST singular value only — an absolute
-    // `max(σ_max, 1)` floor declares a uniformly small (but perfectly
-    // well-conditioned) system rank-deficient purely because of its units.
-    let tol = 100.0 * f64::EPSILON * constraints.a.nrows().max(1) as f64 * max_singular;
+    // Rank tolerance: the symmetric eigensolve's own rounding band `m·ε·σ_max`
+    // of the `m × m` Gram, relative to the LARGEST singular value only — an
+    // absolute `max(σ_max, 1)` floor declares a uniformly small (but perfectly
+    // well-conditioned) system rank-deficient purely because of its units. The
+    // candidate is certified feasible below whichever directions this keeps, so
+    // no extra factor on the band buys safety (#2469). `m ≥ 1` was checked above.
+    let tol = constraints.a.nrows() as f64 * f64::EPSILON * max_singular;
     let mut coeff = u.t().dot(&constraints.b);
     for (idx, value) in coeff.iter_mut().enumerate() {
         let sigma = singular[idx];
@@ -943,11 +946,12 @@ pub(crate) fn feasible_point_for_linear_constraints(
         return None;
     }
     // Accept on per-row GEOMETRIC slack (raw slack over ‖a_i‖), the same
-    // scale-invariant metric the active-set gates use.
+    // scale-invariant metric and the same tolerance the active-set gates use.
     let feasible = (0..constraints.a.nrows()).all(|i| {
         let norm = constraints.a.row(i).dot(&constraints.a.row(i)).sqrt();
         if norm > 0.0 {
-            (constraints.a.row(i).dot(&beta) - constraints.b[i]) / norm >= -1e-8
+            (constraints.a.row(i).dot(&beta) - constraints.b[i]) / norm
+                >= -ACTIVE_SET_PRIMAL_FEASIBILITY_TOL
         } else {
             constraints.b[i] <= 0.0
         }
@@ -1170,7 +1174,10 @@ pub fn project_point_strictly_into_feasible_cone(
         let (u_opt, sing, vt_opt) = e_mat.svd(true, true).ok()?;
         let (u_mat, vt) = (u_opt?, vt_opt?);
         let smax = sing.iter().fold(0.0_f64, |acc, &v| acc.max(v));
-        let rank_tol = smax.max(1.0) * (k.max(p) as f64) * f64::EPSILON * 100.0;
+        // The SVD's own rounding band `max(k, p)·ε·σ_max`, with no absolute
+        // floor and no extra factor: `cE` has the rank of `E` for every `c > 0`,
+        // and the seed is certified against the original rows below (#2469).
+        let rank_tol = smax * (k.max(p) as f64) * f64::EPSILON;
         let rank = sing.iter().filter(|&&s| s > rank_tol).count();
         if rank == 0 || rank >= p {
             return None;
@@ -1180,31 +1187,37 @@ pub fn project_point_strictly_into_feasible_cone(
             let coeff = u_mat.column(idx).dot(&e_rhs) / sing[idx];
             beta_p.scaled_add(coeff, &vt.row(idx));
         }
-        // Orthonormal null basis: Gram-Schmidt the standard axes against the row
-        // space `vt[0..rank]` and the null vectors collected so far.
-        let mut basis: Vec<Array1<f64>> = (0..rank).map(|i| vt.row(i).to_owned()).collect();
-        let mut z = Array2::<f64>::zeros((p, p - rank));
-        let mut collected = 0usize;
-        for axis in 0..p {
-            if collected == p - rank {
-                break;
-            }
-            let mut v = Array1::<f64>::zeros(p);
-            v[axis] = 1.0;
-            for q in basis.iter() {
-                let c = q.dot(&v);
-                v.scaled_add(-c, q);
-            }
-            let nrm = v.dot(&v).sqrt();
-            if nrm > 1e-8 {
-                v /= nrm;
-                z.column_mut(collected).assign(&v);
-                basis.push(v);
-                collected += 1;
+        // Orthonormal null basis: pivoted Gram-Schmidt of the standard axes
+        // against the row space `vt[0..rank]`. The columns of `residual` are
+        // every axis's component outside the span collected so far, i.e. the
+        // columns of the projector onto that span's complement, whose squared
+        // Frobenius norm is the complement's dimension `d ≥ 1`. The longest
+        // column therefore has squared norm at least `d/p ≥ 1/p`, so taking it
+        // fills all `p − rank` columns without a cutoff on how short an accepted
+        // residual may be (#2469).
+        fn deflate(residual: &mut Array2<f64>, unit: ArrayView1<'_, f64>) {
+            let coefficients = unit.dot(&*residual);
+            for (row, &component) in unit.iter().enumerate() {
+                residual.row_mut(row).scaled_add(-component, &coefficients);
             }
         }
-        if collected != p - rank {
-            return None;
+        let mut residual = Array2::<f64>::eye(p);
+        for i in 0..rank {
+            deflate(&mut residual, vt.row(i));
+        }
+        let mut z = Array2::<f64>::zeros((p, p - rank));
+        for col in 0..(p - rank) {
+            let (pivot, squared_norm) = (0..p)
+                .map(|axis| (axis, residual.column(axis).dot(&residual.column(axis))))
+                .fold((0usize, 0.0_f64), |best, candidate| {
+                    if candidate.1 > best.1 { candidate } else { best }
+                });
+            if !(squared_norm > 0.0) {
+                return None;
+            }
+            let unit = residual.column(pivot).to_owned() / squared_norm.sqrt();
+            deflate(&mut residual, unit.view());
+            z.column_mut(col).assign(&unit);
         }
         let a_red = a_ineq.dot(&z);
         let b_red = &b_ineq - &a_ineq.dot(&beta_p);
@@ -1220,18 +1233,18 @@ pub fn project_point_strictly_into_feasible_cone(
     if beta.len() != p || beta.iter().any(|v| !v.is_finite()) {
         return None;
     }
-    // Certify against the ORIGINAL constraints: every genuine one-sided row must
-    // clear (most of) its requested margin so the QP step solver sees no spurious
-    // active rows; equality-pair rows need only be feasible — they are
-    // legitimately tight.
-    const SEED_FEASIBILITY_TOL: f64 = 1e-9;
+    // Certify against the ORIGINAL constraints with exactly what the strictly-
+    // interior QP guarantees: its iterate violates each shifted row by at most
+    // `ACTIVE_SET_PRIMAL_FEASIBILITY_TOL` in scaled units. A genuine one-sided
+    // row therefore keeps `margin − tol` of its requested clearance, and an
+    // equality-pair row, which carries no shift and is legitimately tight, is
+    // feasible to the same contract. The reduced QP's rows `a_iᵀZ` are no longer
+    // than `a_i` (`Z` is orthonormal), so its guarantee holds on the original rows
+    // unchanged (#2469).
     for i in 0..m {
         let s = scaled_constraint_slack(&beta, constraints, i);
-        let lower = if is_equality_member[i] {
-            -SEED_FEASIBILITY_TOL
-        } else {
-            0.5 * margin[i] - SEED_FEASIBILITY_TOL
-        };
+        let clearance = if is_equality_member[i] { 0.0 } else { margin[i] };
+        let lower = clearance - ACTIVE_SET_PRIMAL_FEASIBILITY_TOL;
         if s < lower {
             return None;
         }
@@ -2732,7 +2745,7 @@ fn project_stationarity_residual_on_constraint_set_undivided(
 ///
 /// A refusal is a typed [`EstimationError::ParameterConstraintViolation`]
 /// naming the failing condition (dimension mismatch, non-finite iterate, or
-/// the specific row whose half-margin the projection could not clear), never a
+/// the specific row whose margin the projection could not keep), never a
 /// bare `None`: the caller decides whether that refusal is fatal or a soft
 /// fallback, but it is never a silent one.
 pub fn project_point_strictly_into_feasible_constraint_set(
@@ -2787,21 +2800,23 @@ pub fn project_point_strictly_into_feasible_constraint_set(
                     "strict-interior projection produced a non-finite iterate".to_string(),
                 ));
             }
-            // Certify against the ORIGINAL (unshifted) rows with half-margin
-            // clearance, mirroring the dense projection's exit contract.
-            const SEED_FEASIBILITY_TOL: f64 = 1e-9;
+            // Certify against the ORIGINAL (unshifted) rows with what the dual
+            // projection guarantees on the shifted ones, mirroring the dense
+            // projection's exit contract: a scaled violation of at most
+            // `ACTIVE_SET_PRIMAL_FEASIBILITY_TOL`, so every row keeps
+            // `margin − tol` of its clearance (#2469).
             let unshifted = ConstraintSetOps::new(set, 0.0)?;
             let values = unshifted.values(&beta)?;
-            let half_margin = 0.5 * ACTIVE_SET_INTERIOR_SEED_MARGIN - SEED_FEASIBILITY_TOL;
+            let clearance = ACTIVE_SET_INTERIOR_SEED_MARGIN - ACTIVE_SET_PRIMAL_FEASIBILITY_TOL;
             for row in 0..unshifted.nrows() {
                 if unshifted.norms[row] <= 0.0 {
                     continue;
                 }
                 let slack = unshifted.scaled_slack(&values, row);
-                if slack < half_margin {
+                if slack < clearance {
                     return Err(EstimationError::ParameterConstraintViolation(format!(
-                        "strict-interior projection could not clear the half-margin at row {row}: \
-                         scaled slack {slack:.3e} < {half_margin:.3e}"
+                        "strict-interior projection could not keep its margin at row {row}: \
+                         scaled slack {slack:.3e} < {clearance:.3e}"
                     )));
                 }
             }
