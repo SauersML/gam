@@ -5422,11 +5422,11 @@ pub fn discover_primary_atom_topologies(
             } else {
                 None
             };
-            // #2240 — for a Duchon-sheet winner, GROW the center count by the
-            // same REML evidence (the #2243 pattern lifted from harmonics to
-            // thin-plate centers): the race ran the sheet at the seed-economy
-            // budget only to discriminate topology; a tightly rolled sheet's
-            // fidelity is capped by that budget.
+            // #2240 — for a Duchon-sheet winner, set the center count to the
+            // chart's cosine bandwidth (the #2243 spectral rule lifted from
+            // harmonics to thin-plate centers): the race ran the sheet at the
+            // seed-economy budget only to discriminate topology; a tightly rolled
+            // sheet's fidelity is capped by that budget.
             let n_duchon_centers = if fit_kind == SaeAtomBasisKind::Duchon {
                 let coords = sheet_coords.as_ref().ok_or_else(|| {
                     format!(
@@ -5659,8 +5659,8 @@ const DUCHON_SHEET_NULLSPACE_DIM: usize = 6;
 /// Race-time center budget for the 2-D Duchon-sheet candidate (#2240) —
 /// mirrors the seed builder's economy band (`sae_build_atom_plans`: floor
 /// `nullspace + d + 1`, dense ceiling 32) so the race scores the exact chart a
-/// default seed would build; the evidence ladder
-/// ([`select_duchon_sheet_resolution`]) then grows a WINNER past this budget.
+/// default seed would build; a WINNER's installed resolution is then the chart's
+/// cosine bandwidth ([`select_duchon_sheet_resolution`]).
 /// Returns 0 (no realizable candidate) when the cluster cannot identify the
 /// thin-plate nullspace.
 fn duchon_sheet_race_center_budget(n_cluster: usize) -> usize {
@@ -5695,83 +5695,155 @@ fn duchon_sheet_centers(
     Some(centers)
 }
 
-/// Evidence-driven center count for a Duchon-sheet primary winner (#2240 — the
-/// #2243 resolution-growth pattern lifted from circle harmonics to thin-plate
-/// centers). The topology race scored the sheet at the seed-economy budget
-/// only to discriminate topology; a swiss-roll-class factor's fidelity is
-/// capped by that budget, so the winner's center count is selected by the SAME
-/// proper closed-form REML marginal likelihood the race scores with
-/// (`fit_topology_candidate` → `raw_reml`, complexity-priced, lower is
-/// better), taking the GLOBAL evidence minimum over a dyadic ladder — the
-/// evidence need not be unimodal in resolution.
+/// Spectral center count for a Duchon-sheet primary winner (#2240 — the #2243
+/// bandwidth rule lifted from harmonics to thin-plate centers). The race scored
+/// the sheet at the seed-economy budget only to discriminate topology; the
+/// installed resolution is the chart's COSINE BANDWIDTH. No model is fitted and
+/// no resolution is searched.
 ///
-/// The ladder is bounded by two hard, data-derived limits (no tuned
-/// resolution constant): the seed-economy floor below and the identifiability
-/// ceiling `n_centers < n_cluster` (the Duchon design has one column per
-/// center, and a weighted REML cannot be identified with as many columns as
-/// the cluster has observations). The ceiling rung is always included so a
-/// near-noiseless factor can reach full resolution.
+/// The chart is normalized to the unit square over the weighted cluster rows,
+/// where the products `cos(π·h₀·u)·cos(π·h₁·v)` are a complete spectral basis for
+/// a non-periodic sheet: the cosine series of the even extension has no boundary
+/// leakage for a smooth field, unlike the complex exponentials the torus uses. The
+/// modes are Gram–Schmidt orthonormalized on the `√w`-scaled rows in order of
+/// per-axis order `max(h₀, h₁)`, so a mode's energy `Σ_c ⟨q, √w·z_c⟩²` is exactly
+/// the target energy it adds beyond the lower modes, and irregular sampling cannot
+/// leak one mode's energy into another. A mode whose residual norm is within the
+/// numerical-rank tolerance `m·ε` of its own is numerically dependent on the lower
+/// modes and is skipped. The bandwidth is the largest per-axis order of any mode
+/// whose energy clears the measured [`spectral_noise_floor`], the criterion
+/// [`select_periodic_resolution`] and [`select_torus_resolution`] apply.
+///
+/// A thin-plate sheet represents the `(H + 1)²` cosine modes up to order `H` only
+/// with at least that many centers, so the count is `(H + 1)²`, bounded below by
+/// the identifiability floor `nullspace + d + 1` and above by `m − 1` (a weighted
+/// fit cannot be identified with as many columns as observations); the per-axis
+/// order is capped where `(H + 1)²` reaches that ceiling. Over-provisioning is
+/// smoothed away by the fit's own REML λ, while under-provisioning caps
+/// reconstruction. That is why the retired REML argmin over a ladder of center
+/// counts was wrong twice over: it was a grid search, and its complexity term stops
+/// the argmin below the real bandwidth on clean data (see [`spectral_noise_floor`]).
+///
+/// Cost at the order ceiling is `O(m³)` time and `O(m²)` memory for `m` weighted
+/// rows, the same order as the retired ladder's top rung.
 fn select_duchon_sheet_resolution(
     sheet_coords: &Array2<f64>,
     target: ArrayView2<'_, f64>,
     weights: ArrayView1<'_, f64>,
     rows: &[usize],
 ) -> Result<usize, String> {
-    let floor = duchon_sheet_race_center_budget(rows.len());
-    if floor == 0 {
-        return Err(
-            "select_duchon_sheet_resolution: cluster too small to identify the thin-plate nullspace"
-                .to_string(),
-        );
+    let floor = DUCHON_SHEET_NULLSPACE_DIM + 2 + 1;
+    // The design is scaled by `√w`, exactly as the fit weights the rows.
+    let active: Vec<(usize, f64)> = rows
+        .iter()
+        .filter(|&&row| weights[row] > 0.0)
+        .map(|&row| (row, weights[row].sqrt()))
+        .collect();
+    let m = active.len();
+    if m <= floor {
+        return Err(format!(
+            "select_duchon_sheet_resolution: {m} weighted cluster rows cannot identify the \
+             thin-plate nullspace, which needs more than {floor}"
+        ));
     }
-    let ceiling = rows.len().saturating_sub(1).max(floor);
-    let mut ladder: Vec<usize> = Vec::new();
-    let mut c = floor;
-    while c < ceiling {
-        ladder.push(c);
-        c = c.saturating_mul(2);
-    }
-    ladder.push(ceiling);
-    let mut best_c = 0usize;
-    let mut best_score = f64::INFINITY;
-    for &n_centers in &ladder {
-        let Some(centers) = duchon_sheet_centers(sheet_coords, rows, n_centers) else {
-            continue;
-        };
-        let geometry = match SaeAtomGeometryPlan::new(
-            SaeAtomBasisKind::Duchon,
-            2,
-            SaeBasisResolution::DuchonCoordinates { centers },
-            SaeReferenceMetricPlan::EuclideanDuchon,
-        ) {
-            Ok(geometry) => geometry,
-            Err(_) => continue,
-        };
-        let spec = TopologyCandidateSpec::new(
-            AutoTopologyKind::DuchonSheet,
-            geometry,
-            LatentManifold::Euclidean,
-            sheet_coords.clone(),
-        )?;
-        // `raw_reml` is the proper REML evidence (lower is better) on a common
-        // `n_obs`, so comparing it directly selects the same resolution the
-        // race machinery would (see `select_periodic_resolution`).
-        let score = match fit_topology_candidate(&spec, target, weights) {
-            Ok(evidence) => evidence.raw_reml,
-            Err(_) => continue,
-        };
-        if score.is_finite() && score < best_score {
-            best_score = score;
-            best_c = n_centers;
+    let ceiling = m - 1;
+    let mut lo = [f64::INFINITY; 2];
+    let mut hi = [f64::NEG_INFINITY; 2];
+    for &(row, _) in &active {
+        for axis in 0..2 {
+            lo[axis] = lo[axis].min(sheet_coords[[row, axis]]);
+            hi[axis] = hi[axis].max(sheet_coords[[row, axis]]);
         }
     }
-    if best_c == 0 {
+    for axis in 0..2 {
+        let span = hi[axis] - lo[axis];
+        if !(span > 0.0 && span.is_finite()) {
+            return Err(format!(
+                "select_duchon_sheet_resolution: the sheet chart's axis {axis} has no finite \
+                 spread over the cluster"
+            ));
+        }
+    }
+    let unit: Vec<[f64; 2]> = active
+        .iter()
+        .map(|&(row, _)| {
+            [
+                (sheet_coords[[row, 0]] - lo[0]) / (hi[0] - lo[0]),
+                (sheet_coords[[row, 1]] - lo[1]) / (hi[1] - lo[1]),
+            ]
+        })
+        .collect();
+    let order_ceiling = ceiling.isqrt().saturating_sub(1).max(1);
+    let pi = std::f64::consts::PI;
+    let p_out = target.ncols();
+    let mut basis: Vec<Vec<f64>> = Vec::new();
+    let mut energies: Vec<(usize, f64)> = Vec::new();
+    for order in 0..=order_ceiling {
+        // Every mode of per-axis order `order`, in one fixed sequence.
+        let modes = (0..=order)
+            .map(|h0| (h0, order))
+            .chain((0..order).map(|h1| (order, h1)));
+        for (h0, h1) in modes {
+            let mut column: Vec<f64> = active
+                .iter()
+                .zip(&unit)
+                .map(|(&(_, sqrt_w), uv)| {
+                    sqrt_w * (pi * h0 as f64 * uv[0]).cos() * (pi * h1 as f64 * uv[1]).cos()
+                })
+                .collect();
+            let own_norm_sq: f64 = column.iter().map(|value| value * value).sum();
+            // Modified Gram–Schmidt applied twice: one pass leaves an `O(ε·κ)` loss of
+            // orthogonality and the second pass removes it.
+            for _pass in 0..2 {
+                for q in &basis {
+                    let projection: f64 = q.iter().zip(&column).map(|(a, b)| a * b).sum();
+                    for (value, &q_value) in column.iter_mut().zip(q) {
+                        *value -= projection * q_value;
+                    }
+                }
+            }
+            let residual_sq: f64 = column.iter().map(|value| value * value).sum();
+            let rank_tolerance_sq = (m as f64 * f64::EPSILON).powi(2) * own_norm_sq;
+            if !(residual_sq > rank_tolerance_sq) {
+                continue;
+            }
+            let inv_norm = residual_sq.sqrt().recip();
+            for value in column.iter_mut() {
+                *value *= inv_norm;
+            }
+            if order > 0 {
+                let energy: f64 = (0..p_out)
+                    .map(|out| {
+                        let projection: f64 = active
+                            .iter()
+                            .zip(&column)
+                            .map(|(&(row, sqrt_w), &q)| q * sqrt_w * target[[row, out]])
+                            .sum();
+                        projection * projection
+                    })
+                    .sum();
+                energies.push((order, energy));
+            }
+            basis.push(column);
+        }
+    }
+    let values: Vec<f64> = energies.iter().map(|&(_, energy)| energy).collect();
+    let peak = values.iter().copied().fold(0.0_f64, f64::max);
+    if !(peak > 0.0) {
         return Err(
-            "select_duchon_sheet_resolution: no fittable center count for the duchon-sheet winner"
+            "select_duchon_sheet_resolution: the duchon-sheet winner carries no energy beyond \
+             the constant mode"
                 .to_string(),
         );
     }
-    Ok(best_c)
+    let noise_floor = spectral_noise_floor(&values, peak);
+    let bandwidth = energies
+        .iter()
+        .filter(|&&(_, energy)| energy > noise_floor)
+        .map(|&(order, _)| order)
+        .max()
+        .unwrap_or(1);
+    Ok(((bandwidth + 1) * (bandwidth + 1)).clamp(floor, ceiling))
 }
 
 /// Measured spectral noise floor for evidence-driven resolution selection

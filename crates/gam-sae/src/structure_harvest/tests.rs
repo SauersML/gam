@@ -668,6 +668,44 @@ fn select_torus_resolution_grows_past_default_over_harmonic_gap_2243() {
     );
 }
 
+/// #2240 — a Duchon-sheet winner's center count is its chart's cosine bandwidth.
+/// A 30 × 30 unit grid carrying cosine mode `(3, 1)` needs the `(3 + 1)² = 16`
+/// modes up to order 3, and one carrying `(6, 2)` needs `(6 + 1)² = 49`: the count
+/// follows the planted bandwidth, so it is neither the retired ladder's REML argmin
+/// nor a constant. Both fields are exact modes of the grid, so every mode above the
+/// planted order carries only roundoff, far below the measured noise floor.
+#[test]
+fn duchon_sheet_resolution_is_the_cosine_bandwidth_2240() {
+    use ndarray::Array1;
+
+    let side = 30usize;
+    let n = side * side;
+    let chart = Array2::<f64>::from_shape_fn((n, 2), |(row, axis)| {
+        let index = if axis == 0 { row / side } else { row % side };
+        index as f64 / (side - 1) as f64
+    });
+    let rows: Vec<usize> = (0..n).collect();
+    let weights = Array1::<f64>::ones(n);
+    let planted = |h0: f64, h1: f64| {
+        Array2::<f64>::from_shape_fn((n, 2), |(row, out)| {
+            let (u, v) = (chart[[row, 0]], chart[[row, 1]]);
+            let pi = std::f64::consts::PI;
+            if out == 0 {
+                (pi * h0 * u).cos() * (pi * h1 * v).cos()
+            } else {
+                (pi * u).cos()
+            }
+        })
+    };
+    let low = select_duchon_sheet_resolution(&chart, planted(3.0, 1.0).view(), weights.view(), &rows)
+        .expect("a planted order-3 sheet has a bandwidth");
+    let high = select_duchon_sheet_resolution(&chart, planted(6.0, 2.0).view(), weights.view(), &rows)
+        .expect("a planted order-6 sheet has a bandwidth");
+    eprintln!("[resolution-2240] duchon centers: order-3 field={low} order-6 field={high}");
+    assert_eq!(low, 16, "a sheet carrying cosine mode (3, 1) needs (3 + 1)² centers");
+    assert_eq!(high, 49, "a sheet carrying cosine mode (6, 2) needs (6 + 1)² centers");
+}
+
 /// Deterministic low-discrepancy sequence on `[0, 1)` (van der Corput, base
 /// 2) for RNG-free synthetic birth targets.
 fn vdc(n: usize) -> Vec<f64> {
