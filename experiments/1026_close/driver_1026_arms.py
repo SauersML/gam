@@ -345,10 +345,10 @@ def load_chunk_dir(chunk_dir: str, max_rows: int, seed: int):
             raise SystemExit(f"inconsistent p across shards: {p} vs {m.shape[1]}")
     counts = [int(m.shape[0]) for m in mms]
     manifest = {
-        "schema": "gam.issue2283.creditscope-shards.v1",
+        "schema": "gam.issue2283.creditscope-shards.v2",
         "shards": [
             {
-                "path": str(Path(path).resolve()),
+                "name": Path(path).name,
                 "bytes": int(os.path.getsize(path)),
                 "shape": [int(value) for value in mmap.shape],
                 "dtype": mmap.dtype.str,
