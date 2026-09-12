@@ -4,7 +4,7 @@
 //! The event Jacobian also depends on the slope rate; its log derivative is a
 //! finite Taylor composition in (q, qdot, g, gdot), including the q*gdot term.
 
-use super::information_third::{FACTORIAL, mixed_fifth};
+use super::information_third::{FACTORIAL, PrimaryThirdDirections, mixed_fifth};
 use super::*;
 
 // Base-six indexing makes multiplication an index addition when total degree
@@ -207,6 +207,15 @@ impl SurvivalMarginalSlopeRowKernel<DYNAMIC_SLOPE_PRIMARIES, DynamicSlopeGeometr
         v: &[f64],
     ) -> Result<Vec<Array2<f64>>, String> {
         self.third_information_all_axes_from(u, v, dynamic_row_fifth)
+    }
+
+    /// [`Self::primary_third_information_all_axes_from`] on the follow-up-varying slope frame.
+    pub(crate) fn primary_third_information_all_axes(
+        &self,
+        row_weights: &[f64],
+        directions: impl Fn(usize) -> Result<PrimaryThirdDirections<DYNAMIC_SLOPE_PRIMARIES>, String>,
+    ) -> Result<Vec<Array2<f64>>, String> {
+        self.primary_third_information_all_axes_from(row_weights, directions, dynamic_row_fifth)
     }
 }
 

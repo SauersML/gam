@@ -9,6 +9,7 @@
 
 use super::*;
 use crate::row_kernel::RowKernel;
+use gam_math::jet_scalar::JetScalar;
 
 pub(super) const FACTORIAL: [f64; 7] = [1.0, 1.0, 2.0, 6.0, 24.0, 120.0, 720.0];
 
@@ -257,6 +258,15 @@ impl SurvivalMarginalSlopeRowKernel<STATIC_SLOPE_PRIMARIES, StaticSlopeGeometry>
         self.third_information_all_axes_from(u, v, static_row_fifth)
     }
 
+    /// [`Self::primary_third_information_all_axes_from`] on the time-constant slope frame.
+    pub(crate) fn primary_third_information_all_axes(
+        &self,
+        row_weights: &[f64],
+        directions: impl Fn(usize) -> Result<PrimaryThirdDirections<STATIC_SLOPE_PRIMARIES>, String>,
+    ) -> Result<Vec<Array2<f64>>, String> {
+        self.primary_third_information_all_axes_from(row_weights, directions, static_row_fifth)
+    }
+
     /// `⟨W, H³[u, e_a, e_b]⟩` for every axis pair: the fifth likelihood derivatives
     /// contracted with the row-projected trace weight and one direction, pulled back as a
     /// Hessian in one row pass (gam#2894). Linear in the symmetric weight `W`.
@@ -360,6 +370,12 @@ impl SurvivalMarginalSlopeRowKernel<STATIC_SLOPE_PRIMARIES, StaticSlopeGeometry>
     }
 }
 
+/// One row's primary directions for
+/// [`SurvivalMarginalSlopeRowKernel::primary_third_information_all_axes_from`]: the
+/// pair the fifth likelihood derivatives contract with, and the direction, if any,
+/// the fourth derivatives contract with.
+pub(crate) type PrimaryThirdDirections<const P: usize> = ([f64; P], [f64; P], Option<[f64; P]>);
+
 impl<const P: usize, G: SlopeRowGeometry<P>> SurvivalMarginalSlopeRowKernel<P, G> {
     pub(super) fn third_information_all_axes_from(
         &self,
@@ -373,26 +389,81 @@ impl<const P: usize, G: SlopeRowGeometry<P>> SurvivalMarginalSlopeRowKernel<P, G
                 "survival third information derivative requires finite directions of length {p}"
             ));
         }
+        let unit_measure = vec![1.0; self.family.n];
+        self.primary_third_information_all_axes_from(
+            &unit_measure,
+            |row| Ok((self.jacobian_action(row, u), self.jacobian_action(row, v), None)),
+            fifth,
+        )
+    }
+
+    /// `{D_β_a M}` along every coefficient axis `a`, where row `r` contributes
+    /// `w_r·Jᵀ(T⁴[x_r, y_r] + T³[z_r])J` to `M`: its fifth likelihood derivatives
+    /// contracted with the primary directions `x_r, y_r`, plus its fourth derivatives
+    /// contracted with `z_r`. `row_weights` is the outer row measure, zero on a row
+    /// the measure leaves out.
+    ///
+    /// The directions are primary-space vectors rather than coefficient directions
+    /// because a baseline-chart coordinate moves the location index's offsets and
+    /// leaves the coefficient map `J` fixed (gam#2765).
+    pub(super) fn primary_third_information_all_axes_from(
+        &self,
+        row_weights: &[f64],
+        directions: impl Fn(usize) -> Result<PrimaryThirdDirections<P>, String>,
+        fifth: impl Fn(&[f64; P], &RigidRowInputs) -> Result<[[[[[f64; P]; P]; P]; P]; P], String>,
+    ) -> Result<Vec<Array2<f64>>, String> {
+        if row_weights.len() != self.family.n {
+            return Err(format!(
+                "survival third information derivative row measure has {} weights for {} rows",
+                row_weights.len(),
+                self.family.n,
+            ));
+        }
         let mut tensors = Vec::with_capacity(self.family.n);
         for row in 0..self.family.n {
-            let inputs = rigid_row_inputs(
-                &self.family,
-                &self.block_states,
-                row,
-                "third information derivative",
-            )?;
-            let primaries =
-                rigid_row_kernel_primaries::<P, G>(&self.family, &self.block_states, row)?;
-            let fifth = fifth(&primaries, &inputs)?;
-            let du = self.jacobian_action(row, u);
-            let dv = self.jacobian_action(row, v);
             let mut tensor = [[[0.0; P]; P]; P];
-            for a in 0..P {
-                for b in 0..P {
-                    for c in 0..P {
-                        for d in 0..P {
-                            for e in 0..P {
-                                tensor[a][b][c] += fifth[a][b][c][d][e] * du[d] * dv[e];
+            let weight = row_weights[row];
+            if weight != 0.0 {
+                let inputs = rigid_row_inputs(
+                    &self.family,
+                    &self.block_states,
+                    row,
+                    "third information derivative",
+                )?;
+                let primaries =
+                    rigid_row_kernel_primaries::<P, G>(&self.family, &self.block_states, row)?;
+                let fifth = fifth(&primaries, &inputs)?;
+                let (x, y, z) = directions(row)?;
+                for a in 0..P {
+                    for b in 0..P {
+                        for c in 0..P {
+                            for d in 0..P {
+                                for e in 0..P {
+                                    tensor[a][b][c] += fifth[a][b][c][d][e] * x[d] * y[e];
+                                }
+                            }
+                        }
+                    }
+                }
+                if let Some(z) = z {
+                    let vars: [SparseTower4<P, RIGID_LINEAR_MASK>; P] =
+                        std::array::from_fn(|axis| SparseTower4::variable(primaries[axis], axis));
+                    let tower = rigid_row_nll::<P, G, _>(&vars, &inputs)?;
+                    for a in 0..P {
+                        for b in 0..P {
+                            for c in 0..P {
+                                for d in 0..P {
+                                    tensor[a][b][c] += tower.t4[a][b][c][d] * z[d];
+                                }
+                            }
+                        }
+                    }
+                }
+                if weight != 1.0 {
+                    for plane in &mut tensor {
+                        for line in plane {
+                            for entry in line {
+                                *entry *= weight;
                             }
                         }
                     }

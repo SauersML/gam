@@ -482,4 +482,57 @@ impl ExactNewtonJointPsiWorkspace for SurvivalMarginalSlopePsiWorkspace {
                 .map(|result| result.map(gam_problem::DriftDerivResult::Dense)),
         }
     }
+
+    fn hessian_second_directional_derivative_all_beta_axes(
+        &self,
+        psi_index: usize,
+        d_beta_flat: &Array1<f64>,
+    ) -> Result<Option<Vec<Array2<f64>>>, String> {
+        match self
+            .family
+            .family_hyper_role(&self.hyper_layout, psi_index)?
+        {
+            Some(SurvivalMarginalSlopeFamilyHyperAxis::Baseline(axis)) => self
+                .family
+                .baseline_exact_joint_psihessian_second_directional_derivative_all_beta_axes_with_options(
+                    &self.block_states,
+                    axis,
+                    d_beta_flat,
+                    &self.options,
+                )
+                .map(Some),
+            None => Err(format!(
+                "survival marginal-slope design psi axis {psi_index} has no exact third information derivative along a coefficient direction"
+            )),
+            Some(SurvivalMarginalSlopeFamilyHyperAxis::LogSigma) => Err(format!(
+                "survival marginal-slope log-sigma psi axis {psi_index} has no exact third information derivative along a coefficient direction"
+            )),
+        }
+    }
+
+    fn second_order_hessian_directional_derivative_all_beta_axes(
+        &self,
+        psi_i: usize,
+        psi_j: usize,
+    ) -> Result<Option<Vec<Array2<f64>>>, String> {
+        let axis_i = self.family.family_hyper_role(&self.hyper_layout, psi_i)?;
+        let axis_j = self.family.family_hyper_role(&self.hyper_layout, psi_j)?;
+        match (axis_i, axis_j) {
+            (
+                Some(SurvivalMarginalSlopeFamilyHyperAxis::Baseline(axis)),
+                Some(SurvivalMarginalSlopeFamilyHyperAxis::Baseline(other_axis)),
+            ) => self
+                .family
+                .baseline_exact_joint_psisecond_order_hessian_directional_derivative_all_beta_axes_with_options(
+                    &self.block_states,
+                    axis,
+                    other_axis,
+                    &self.options,
+                )
+                .map(Some),
+            _ => Err(format!(
+                "survival marginal-slope psi pair ({psi_i}, {psi_j}) has an exact third information derivative only when both axes are baseline-chart coordinates"
+            )),
+        }
+    }
 }

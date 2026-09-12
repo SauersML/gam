@@ -1228,3 +1228,131 @@ fn beta_hessian_second_drift_matches_finite_difference_slope_pair_2765() {
         );
     }
 }
+
+// ── The mixed third information derivatives of a baseline coordinate ────────
+//
+// The explicit Jeffreys curvature differentiates `H_Φ` along ψ and β together, so
+// for every baseline-chart coordinate θ it reads `D_β(D_β ∂_θ H[v])` and
+// `D_β ∂²_θθ' H` along every coefficient axis. The survival ψ workspace had
+// neither, and #2765's acceptance fit certified its outer search and then refused
+// the `ValueGradientHessian` evaluation that came next ("exact third information
+// derivatives are unavailable for psi axis 0"). Each object is differenced along
+// every coefficient axis against the lower-order hook it differentiates; the gates
+// above difference those hooks against the family's own Hessian.
+
+fn grade_all_beta_axes(
+    label: &str,
+    analytic: &[Array2<f64>],
+    beta: &Array1<f64>,
+    lower_order_at: impl Fn(&Array1<f64>) -> Array2<f64>,
+) {
+    let dim = beta.len();
+    assert_eq!(analytic.len(), dim, "{label}: one matrix per coefficient axis");
+    let global_scale = analytic
+        .iter()
+        .fold(0.0_f64, |acc, matrix| acc.max(max_abs(matrix.iter())));
+    let h = 1e-3;
+    for (coefficient_axis, matrix) in analytic.iter().enumerate() {
+        assert_eq!(matrix.dim(), (dim, dim), "{label}: axis {coefficient_axis} shape");
+        let at = |t: f64| {
+            let mut displaced = beta.clone();
+            displaced[coefficient_axis] += t;
+            lower_order_at(&displaced)
+        };
+        let (coarse_plus, coarse_minus) = (at(h), at(-h));
+        let (fine_plus, fine_minus) = (at(0.5 * h), at(-0.5 * h));
+        let scale = max_abs(matrix.iter())
+            .max(1e-6 * global_scale)
+            .max(1e-12);
+        for row in 0..dim {
+            for column in 0..dim {
+                let oracle = ridders(
+                    (coarse_plus[[row, column]] - coarse_minus[[row, column]]) / (2.0 * h),
+                    (fine_plus[[row, column]] - fine_minus[[row, column]]) / h,
+                );
+                assert_matches(
+                    &format!("{label} coefficient axis {coefficient_axis} [{row},{column}]"),
+                    matrix[[row, column]],
+                    &oracle,
+                    scale,
+                );
+            }
+        }
+    }
+}
+
+/// `D_β(D_β ∂_θ H[v])` for every baseline coordinate, in both slope frames.
+#[test]
+fn baseline_psi_by_beta_third_information_matches_finite_difference_2765() {
+    let options = BlockwiseFitOptions::default();
+    let direction = ndarray::array![0.23, 0.17, 0.41, -0.27, 0.33, 0.19];
+    for frame in [SlopeFrame::Static, SlopeFrame::FollowUpVarying] {
+        let (family, beta) = drift_family_and_states(frame);
+        for baseline_axis in 0..3 {
+            let analytic = family
+                .baseline_exact_joint_psihessian_second_directional_derivative_all_beta_axes_with_options(
+                    &states_at_beta(&family, &beta),
+                    baseline_axis,
+                    &direction,
+                    &options,
+                )
+                .expect("baseline-by-coefficient third information derivative");
+            grade_all_beta_axes(
+                &format!("{}/baseline {baseline_axis} by beta", frame.label()),
+                &analytic,
+                &beta,
+                |displaced| {
+                    family
+                        .baseline_exact_joint_psihessian_directional_derivative_with_options(
+                            &states_at_beta(&family, displaced),
+                            baseline_axis,
+                            &direction,
+                            &options,
+                        )
+                        .expect("baseline ψ Hessian drift")
+                        .expect("a rigid baseline chart publishes its ψ Hessian drift")
+                },
+            );
+        }
+    }
+}
+
+/// `D_β ∂²_θθ' H` for diagonal and cross baseline pairs, in both slope frames.
+#[test]
+fn baseline_psi_pair_third_information_matches_finite_difference_2765() {
+    let options = BlockwiseFitOptions::default();
+    for frame in [SlopeFrame::Static, SlopeFrame::FollowUpVarying] {
+        let (family, beta) = drift_family_and_states(frame);
+        let total = beta.len();
+        for (axis, other_axis) in [(0, 0), (1, 1), (0, 2), (1, 2)] {
+            let analytic = family
+                .baseline_exact_joint_psisecond_order_hessian_directional_derivative_all_beta_axes_with_options(
+                    &states_at_beta(&family, &beta),
+                    axis,
+                    other_axis,
+                    &options,
+                )
+                .expect("baseline-pair third information derivative");
+            grade_all_beta_axes(
+                &format!("{}/baseline pair ({axis},{other_axis})", frame.label()),
+                &analytic,
+                &beta,
+                |displaced| {
+                    let terms = family
+                        .baseline_exact_joint_psisecond_order_terms_with_options(
+                            &states_at_beta(&family, displaced),
+                            axis,
+                            other_axis,
+                            &options,
+                        )
+                        .expect("baseline pair terms")
+                        .expect("a rigid baseline chart publishes its pair terms");
+                    match terms.hessian_psi_psi_operator.as_ref() {
+                        Some(operator) => operator.mul_mat(&Array2::<f64>::eye(total)),
+                        None => terms.hessian_psi_psi.clone(),
+                    }
+                },
+            );
+        }
+    }
+}

@@ -9,6 +9,7 @@
 
 use super::timepoint_exact::flex_jet::{FlexFamilyCoefficientTerms, FlexFamilyRowDirection};
 use super::*;
+use crate::row_kernel::RowKernel;
 use gam_math::jet_scalar::{JetScalar, OneSeed, Order2};
 use gam_math::nested_dual::{Dual2, JetField};
 
@@ -717,5 +718,109 @@ impl SurvivalMarginalSlopeFamily {
             })?
         };
         Ok(Some(operator.to_dense()))
+    }
+
+    /// The outer row measure as one weight per row: a retained row carries its
+    /// Horvitz–Thompson weight and a row the measure leaves out carries zero.
+    fn rigid_baseline_third_row_weights(&self, options: &BlockwiseFitOptions) -> Vec<f64> {
+        let mut weights = vec![0.0; self.n];
+        for row in crate::marginal_slope_shared::outer_weighted_rows(options, self.n) {
+            weights[row.index] = row.weight;
+        }
+        weights
+    }
+
+    /// Closed-form fifth likelihood derivatives exist for the rigid shared-slope
+    /// row program only.
+    fn require_rigid_baseline_third(
+        &self,
+        block_states: &[ParameterBlockState],
+        context: &str,
+    ) -> Result<(), String> {
+        if self.per_z_slope_active()
+            || self.effective_flex_active(block_states)?
+            || self.flex_timewiggle_active()
+        {
+            return Err(format!(
+                "survival marginal-slope {context} has closed-form fifth likelihood derivatives on the rigid shared-slope row program only; FLEX, time-wiggle and per-score slopes have none"
+            ));
+        }
+        Ok(())
+    }
+
+    /// `{D_β_a D_β ∂_θ H[v]}` along every coefficient axis `a`: the mixed third
+    /// information derivative of a baseline-chart coordinate `θ` that the explicit
+    /// Jeffreys curvature reads along `(θ, v)` (gam#2765).
+    ///
+    /// The chart moves the offsets `o` of the location index and leaves the
+    /// coefficient map `J` fixed, so a row contributes `Jᵀ T⁵[o, Jv, J e_a] J`.
+    pub(crate) fn baseline_exact_joint_psihessian_second_directional_derivative_all_beta_axes_with_options(
+        &self,
+        block_states: &[ParameterBlockState],
+        axis: usize,
+        d_beta_flat: &Array1<f64>,
+        options: &BlockwiseFitOptions,
+    ) -> Result<Vec<Array2<f64>>, String> {
+        let geometry = self.rigid_baseline_geometry()?;
+        self.require_rigid_baseline_third(
+            block_states,
+            "baseline-by-coefficient third information derivative",
+        )?;
+        let total = block_slices(self, block_states).total;
+        let d_beta = d_beta_flat
+            .as_slice()
+            .filter(|direction| {
+                direction.len() == total && direction.iter().all(|value| value.is_finite())
+            })
+            .ok_or_else(|| {
+                format!(
+                    "survival marginal-slope baseline third information derivative needs a finite contiguous coefficient direction of length {total}"
+                )
+            })?;
+        let row_weights = self.rigid_baseline_third_row_weights(options);
+        in_slope_frame!(self, P, Frame, {
+            let kernel = SurvivalMarginalSlopeRowKernel::<P, Frame>::new(
+                self.clone(),
+                block_states.to_vec(),
+            );
+            kernel.primary_third_information_all_axes(&row_weights, |row| {
+                Ok((
+                    Self::rigid_baseline_primary_first::<P>(geometry, row, axis)?,
+                    kernel.jacobian_action(row, d_beta),
+                    None,
+                ))
+            })
+        })
+    }
+
+    /// `{D_β_a ∂²_θθ' H}` along every coefficient axis `a` for a pair of
+    /// baseline-chart coordinates (gam#2765). A row contributes
+    /// `Jᵀ(T⁵[o, o', J e_a] + T⁴[o_θθ', J e_a])J`, where `o_θθ'` is the chart's
+    /// second motion of the offsets.
+    pub(crate) fn baseline_exact_joint_psisecond_order_hessian_directional_derivative_all_beta_axes_with_options(
+        &self,
+        block_states: &[ParameterBlockState],
+        axis: usize,
+        other_axis: usize,
+        options: &BlockwiseFitOptions,
+    ) -> Result<Vec<Array2<f64>>, String> {
+        let geometry = self.rigid_baseline_geometry()?;
+        self.require_rigid_baseline_third(block_states, "baseline-pair third information derivative")?;
+        let row_weights = self.rigid_baseline_third_row_weights(options);
+        in_slope_frame!(self, P, Frame, {
+            let kernel = SurvivalMarginalSlopeRowKernel::<P, Frame>::new(
+                self.clone(),
+                block_states.to_vec(),
+            );
+            kernel.primary_third_information_all_axes(&row_weights, |row| {
+                Ok((
+                    Self::rigid_baseline_primary_first::<P>(geometry, row, axis)?,
+                    Self::rigid_baseline_primary_first::<P>(geometry, row, other_axis)?,
+                    Some(Self::rigid_baseline_primary_second::<P>(
+                        geometry, row, axis, other_axis,
+                    )?),
+                ))
+            })
+        })
     }
 }
