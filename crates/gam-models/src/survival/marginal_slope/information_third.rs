@@ -267,6 +267,23 @@ impl SurvivalMarginalSlopeRowKernel<STATIC_SLOPE_PRIMARIES, StaticSlopeGeometry>
         self.primary_third_information_all_axes_from(row_weights, directions, static_row_fifth)
     }
 
+    /// [`Self::design_psi_third_information_all_axes_from`] on the time-constant slope frame.
+    pub(crate) fn design_psi_third_information_all_axes(
+        &self,
+        derivative_blocks: &[Vec<crate::custom_family::CustomFamilyBlockPsiDerivative>],
+        psi_index: usize,
+        d_beta: &[f64],
+        row_weights: &[f64],
+    ) -> Result<Option<Vec<Array2<f64>>>, String> {
+        self.design_psi_third_information_all_axes_from(
+            derivative_blocks,
+            psi_index,
+            d_beta,
+            row_weights,
+            static_row_fifth,
+        )
+    }
+
     /// `⟨W, H³[u, e_a, e_b]⟩` for every axis pair: the fifth likelihood derivatives
     /// contracted with the row-projected trace weight and one direction, pulled back as a
     /// Hessian in one row pass (gam#2894). Linear in the symmetric weight `W`.
@@ -472,6 +489,170 @@ impl<const P: usize, G: SlopeRowGeometry<P>> SurvivalMarginalSlopeRowKernel<P, G
             tensors.push(tensor);
         }
         self.all_axes_primary_tensor_pullback(&tensors)
+    }
+
+    /// `{D_β_a D_β ∂_ψ H[v]}` along every coefficient axis `a` for a design
+    /// hyperparameter ψ that moves the marginal or the slope design (gam#2765).
+    ///
+    /// With the design motion `J_ψ = L ⊗ x_ψ` (primary loading `L`, design-derivative
+    /// row `x_ψ`), a row contributes `Jᵀ(T⁵[J_ψβ, Jv, J e_a] + T⁴[J_ψv, J e_a])J`,
+    /// `J_ψᵀ T⁴[J e_a, Jv] J` with its transpose, and, on an axis the design moves,
+    /// `Jᵀ T⁴[J_ψ e_a, Jv] J`. Returns `None` where the family has no ψ block for the
+    /// axis, as the first-order drift does.
+    pub(super) fn design_psi_third_information_all_axes_from(
+        &self,
+        derivative_blocks: &[Vec<crate::custom_family::CustomFamilyBlockPsiDerivative>],
+        psi_index: usize,
+        d_beta: &[f64],
+        row_weights: &[f64],
+        fifth: impl Fn(&[f64; P], &RigidRowInputs) -> Result<[[[[[f64; P]; P]; P]; P]; P], String>,
+    ) -> Result<Option<Vec<Array2<f64>>>, String> {
+        let family = &self.family;
+        let Some((block_idx, local_idx, p_psi, label)) =
+            family.psi_block_info(derivative_blocks, psi_index)?
+        else {
+            return Ok(None);
+        };
+        let block_loading = spatial_block_primary_loading(family, block_idx)?;
+        if block_loading.len() != P {
+            return Err(format!(
+                "survival design ψ third information derivative: primary loading has {} entries for a {P}-primary frame",
+                block_loading.len()
+            ));
+        }
+        let loading: [f64; P] = std::array::from_fn(|k| block_loading[k]);
+        let p = self.n_coefficients();
+        if d_beta.len() != p || row_weights.len() != family.n {
+            return Err(format!(
+                "survival design ψ third information derivative requires a direction of length {p} and {} row weights",
+                family.n
+            ));
+        }
+        let (beta_block, psi_range) = match block_idx {
+            1 => (&self.block_states[1].beta, self.slices.marginal.clone()),
+            _ => (&self.block_states[2].beta, self.slices.slope.clone()),
+        };
+        let policy = gam_runtime::resource::ResourcePolicy::default_library();
+        let psi_map = crate::custom_family::resolve_custom_family_x_psi_map(
+            &derivative_blocks[block_idx][local_idx],
+            family.n,
+            p_psi,
+            0..family.n,
+            label,
+            &policy,
+        )
+        .map_err(|error| error.to_string())?;
+        let d_beta_block = ndarray::ArrayView1::from(&d_beta[psi_range.clone()]);
+        let psi_row_at = |row: usize| {
+            psi_map
+                .row_vector(row)
+                .map_err(|error| format!("survival design ψ third information row: {error}"))
+        };
+
+        let mut axes = self.primary_third_information_all_axes_from(
+            row_weights,
+            |row| {
+                let psi_row = psi_row_at(row)?;
+                let motion = psi_row.dot(beta_block);
+                let action = psi_row.dot(&d_beta_block);
+                Ok((
+                    std::array::from_fn(|k| loading[k] * motion),
+                    self.jacobian_action(row, d_beta),
+                    Some(std::array::from_fn(|k| loading[k] * action)),
+                ))
+            },
+            fifth,
+        )?;
+
+        let slices = &self.slices;
+        let p_h = slices.score_warp.as_ref().map_or(0, |range| range.len());
+        let p_w = slices.link_dev.as_ref().map_or(0, |range| range.len());
+        let p_i = slices.influence.as_ref().map_or(0, |range| range.len());
+        let (p_t, p_m, p_g) = (slices.time.len(), slices.marginal.len(), slices.slope.len());
+        let identity = Array2::<f64>::eye(p);
+        let jacobians = self.jacobian_action_matrix(identity.view()).ok_or_else(|| {
+            "survival design ψ third information derivative requires a dense J·I projection"
+                .to_string()
+        })?;
+        let rows: Vec<usize> = (0..family.n).filter(|&row| row_weights[row] != 0.0).collect();
+        let accumulators = crate::marginal_slope_shared::chunked_row_reduction(
+            rows.as_slice(),
+            || {
+                (0..p)
+                    .map(|_| BlockHessianAccumulator::new(p_t, p_m, p_g, p_h, p_w, p_i))
+                    .collect::<Vec<_>>()
+            },
+            |row, accumulators| -> Result<(), String> {
+                let inputs = rigid_row_inputs(
+                    family,
+                    &self.block_states,
+                    row,
+                    "design ψ third information derivative",
+                )?;
+                let primaries =
+                    rigid_row_kernel_primaries::<P, G>(family, &self.block_states, row)?;
+                let vars: [SparseTower4<P, RIGID_LINEAR_MASK>; P] =
+                    std::array::from_fn(|axis| SparseTower4::variable(primaries[axis], axis));
+                let tower = rigid_row_nll::<P, G, _>(&vars, &inputs)?;
+                let jv = self.jacobian_action(row, d_beta);
+                // `K[k, γ] = w·T⁴[L, e_k, e_γ, Jv]`: the J_ψ-sided kernel and, on an
+                // axis the design moves, that axis's pullback coefficient.
+                let weight = row_weights[row];
+                let mut kernel = Array2::<f64>::zeros((P, P));
+                for k in 0..P {
+                    for gamma in 0..P {
+                        let mut sum = 0.0;
+                        for alpha in 0..P {
+                            if loading[alpha] == 0.0 {
+                                continue;
+                            }
+                            for delta in 0..P {
+                                sum += loading[alpha] * tower.t4[alpha][k][gamma][delta] * jv[delta];
+                            }
+                        }
+                        kernel[[k, gamma]] = weight * sum;
+                    }
+                }
+                let psi_row = psi_row_at(row)?;
+                let mut right_primary = ndarray::Array1::<f64>::zeros(P);
+                for (axis, accumulator) in accumulators.iter_mut().enumerate() {
+                    right_primary.fill(0.0);
+                    for k in 0..P {
+                        let axis_loading = jacobians[[row, k * p + axis]];
+                        if axis_loading != 0.0 {
+                            right_primary.scaled_add(axis_loading, &kernel.row(k));
+                        }
+                    }
+                    accumulator.add_rank1_psi_cross(
+                        family,
+                        row,
+                        block_idx,
+                        &psi_row,
+                        &right_primary,
+                    )?;
+                    if psi_range.contains(&axis) {
+                        let coefficient = psi_row[axis - psi_range.start];
+                        if coefficient != 0.0 {
+                            accumulator.add_pullback(
+                                family,
+                                row,
+                                &kernel.mapv(|value| value * coefficient),
+                            )?;
+                        }
+                    }
+                }
+                Ok(())
+            },
+            |total, chunk| {
+                for (left, right) in total.iter_mut().zip(chunk.iter()) {
+                    left.add(right);
+                }
+            },
+        )?;
+        for (axis, accumulator) in accumulators.iter().enumerate() {
+            axes[axis] += &accumulator.to_dense(slices);
+        }
+        Ok(Some(axes))
     }
 }
 

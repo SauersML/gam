@@ -722,7 +722,7 @@ impl SurvivalMarginalSlopeFamily {
 
     /// The outer row measure as one weight per row: a retained row carries its
     /// Horvitz–Thompson weight and a row the measure leaves out carries zero.
-    fn rigid_baseline_third_row_weights(&self, options: &BlockwiseFitOptions) -> Vec<f64> {
+    fn rigid_third_row_weights(&self, options: &BlockwiseFitOptions) -> Vec<f64> {
         let mut weights = vec![0.0; self.n];
         for row in crate::marginal_slope_shared::outer_weighted_rows(options, self.n) {
             weights[row.index] = row.weight;
@@ -732,7 +732,7 @@ impl SurvivalMarginalSlopeFamily {
 
     /// Closed-form fifth likelihood derivatives exist for the rigid shared-slope
     /// row program only.
-    fn require_rigid_baseline_third(
+    fn require_rigid_third(
         &self,
         block_states: &[ParameterBlockState],
         context: &str,
@@ -762,22 +762,12 @@ impl SurvivalMarginalSlopeFamily {
         options: &BlockwiseFitOptions,
     ) -> Result<Vec<Array2<f64>>, String> {
         let geometry = self.rigid_baseline_geometry()?;
-        self.require_rigid_baseline_third(
+        self.require_rigid_third(
             block_states,
             "baseline-by-coefficient third information derivative",
         )?;
-        let total = block_slices(self, block_states).total;
-        let d_beta = d_beta_flat
-            .as_slice()
-            .filter(|direction| {
-                direction.len() == total && direction.iter().all(|value| value.is_finite())
-            })
-            .ok_or_else(|| {
-                format!(
-                    "survival marginal-slope baseline third information derivative needs a finite contiguous coefficient direction of length {total}"
-                )
-            })?;
-        let row_weights = self.rigid_baseline_third_row_weights(options);
+        let d_beta = self.finite_flat_direction(block_states, d_beta_flat)?;
+        let row_weights = self.rigid_third_row_weights(options);
         in_slope_frame!(self, P, Frame, {
             let kernel = SurvivalMarginalSlopeRowKernel::<P, Frame>::new(
                 self.clone(),
@@ -805,8 +795,8 @@ impl SurvivalMarginalSlopeFamily {
         options: &BlockwiseFitOptions,
     ) -> Result<Vec<Array2<f64>>, String> {
         let geometry = self.rigid_baseline_geometry()?;
-        self.require_rigid_baseline_third(block_states, "baseline-pair third information derivative")?;
-        let row_weights = self.rigid_baseline_third_row_weights(options);
+        self.require_rigid_third(block_states, "baseline-pair third information derivative")?;
+        let row_weights = self.rigid_third_row_weights(options);
         in_slope_frame!(self, P, Frame, {
             let kernel = SurvivalMarginalSlopeRowKernel::<P, Frame>::new(
                 self.clone(),
@@ -822,5 +812,52 @@ impl SurvivalMarginalSlopeFamily {
                 ))
             })
         })
+    }
+
+    /// `{D_β_a D_β ∂_ψ H[v]}` along every coefficient axis `a` for a design
+    /// hyperparameter ψ (gam#2765); see
+    /// `SurvivalMarginalSlopeRowKernel::design_psi_third_information_all_axes_from`.
+    pub(crate) fn design_psi_hessian_second_directional_derivative_all_beta_axes_with_options(
+        &self,
+        block_states: &[ParameterBlockState],
+        derivative_blocks: &[Vec<crate::custom_family::CustomFamilyBlockPsiDerivative>],
+        psi_index: usize,
+        d_beta_flat: &Array1<f64>,
+        options: &BlockwiseFitOptions,
+    ) -> Result<Option<Vec<Array2<f64>>>, String> {
+        self.require_rigid_third(
+            block_states,
+            "design-by-coefficient third information derivative",
+        )?;
+        let d_beta = self.finite_flat_direction(block_states, d_beta_flat)?;
+        let row_weights = self.rigid_third_row_weights(options);
+        in_slope_frame!(self, P, Frame, {
+            SurvivalMarginalSlopeRowKernel::<P, Frame>::new(self.clone(), block_states.to_vec())
+                .design_psi_third_information_all_axes(
+                    derivative_blocks,
+                    psi_index,
+                    d_beta,
+                    &row_weights,
+                )
+        })
+    }
+
+    /// A flat coefficient direction as a finite contiguous slice of the joint width.
+    fn finite_flat_direction<'direction>(
+        &self,
+        block_states: &[ParameterBlockState],
+        d_beta_flat: &'direction Array1<f64>,
+    ) -> Result<&'direction [f64], String> {
+        let total = block_slices(self, block_states).total;
+        d_beta_flat
+            .as_slice()
+            .filter(|direction| {
+                direction.len() == total && direction.iter().all(|value| value.is_finite())
+            })
+            .ok_or_else(|| {
+                format!(
+                    "survival marginal-slope third information derivative needs a finite contiguous coefficient direction of length {total}"
+                )
+            })
     }
 }

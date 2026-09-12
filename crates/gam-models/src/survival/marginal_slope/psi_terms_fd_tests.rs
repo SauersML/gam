@@ -1317,6 +1317,49 @@ fn baseline_psi_by_beta_third_information_matches_finite_difference_2765() {
     }
 }
 
+/// `D_β(D_β ∂_ψ H[v])` for a design ψ: on the marginal surface in both slope frames,
+/// and on the slope surface of a time-constant slope (the follow-up frame refuses it).
+#[test]
+fn design_psi_by_beta_third_information_matches_finite_difference_2765() {
+    let options = BlockwiseFitOptions::default();
+    let direction = ndarray::array![0.23, 0.17, 0.41, -0.27, 0.33, 0.19];
+    for (axis, frame) in [
+        (PsiAxis::MarginalDesign, SlopeFrame::Static),
+        (PsiAxis::MarginalDesign, SlopeFrame::FollowUpVarying),
+        (PsiAxis::SlopeDesign, SlopeFrame::Static),
+    ] {
+        let layout = hyper_layout(axis);
+        let (family, beta) = drift_family_and_states(frame);
+        let analytic = family
+            .design_psi_hessian_second_directional_derivative_all_beta_axes_with_options(
+                &states_at_beta(&family, &beta),
+                layout.design_derivative_blocks(),
+                0,
+                &direction,
+                &options,
+            )
+            .expect("design-by-coefficient third information derivative")
+            .expect("a design ψ axis on a supported block publishes its third information derivative");
+        grade_all_beta_axes(
+            &format!("{}/{axis:?} by beta", frame.label()),
+            &analytic,
+            &beta,
+            |displaced| {
+                family
+                    .psi_hessian_directional_derivative_with_options(
+                        &states_at_beta(&family, displaced),
+                        layout.design_derivative_blocks(),
+                        0,
+                        &direction,
+                        &options,
+                    )
+                    .expect("design ψ Hessian drift")
+                    .expect("a design ψ axis on a supported block publishes its Hessian drift")
+            },
+        );
+    }
+}
+
 /// `D_β ∂²_θθ' H` for diagonal and cross baseline pairs, in both slope frames.
 #[test]
 fn baseline_psi_pair_third_information_matches_finite_difference_2765() {

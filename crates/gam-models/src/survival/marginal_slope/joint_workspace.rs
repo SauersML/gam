@@ -501,9 +501,15 @@ impl ExactNewtonJointPsiWorkspace for SurvivalMarginalSlopePsiWorkspace {
                     &self.options,
                 )
                 .map(Some),
-            None => Err(format!(
-                "survival marginal-slope design psi axis {psi_index} has no exact third information derivative along a coefficient direction"
-            )),
+            None => self
+                .family
+                .design_psi_hessian_second_directional_derivative_all_beta_axes_with_options(
+                    &self.block_states,
+                    self.hyper_layout.design_derivative_blocks(),
+                    psi_index,
+                    d_beta_flat,
+                    &self.options,
+                ),
             Some(SurvivalMarginalSlopeFamilyHyperAxis::LogSigma) => Err(format!(
                 "survival marginal-slope log-sigma psi axis {psi_index} has no exact third information derivative along a coefficient direction"
             )),
