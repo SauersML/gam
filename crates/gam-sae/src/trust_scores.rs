@@ -50,16 +50,19 @@ pub fn row_trust_scores(
     let mut per_atom = Array2::<f64>::zeros((n_rows, n_atoms));
     let mut row = Array1::<f64>::zeros(n_rows);
     for i in 0..n_rows {
-        // Row weight over the non-negative (routed) part of the assignment.
-        let mut denom = 0.0_f64;
+        // Normalize the routed weights by their largest entry before summing;
+        // the ratio is unchanged when the unscaled row sum would overflow.
+        let mut scale = 0.0_f64;
         for k in 0..n_atoms {
-            let w = assignments[[i, k]].max(0.0);
-            denom += w;
+            scale = scale.max(assignments[[i, k]]);
         }
-        if denom > 0.0 {
+        if scale > 0.0 {
+            let denom: f64 = (0..n_atoms)
+                .map(|k| assignments[[i, k]].max(0.0) / scale)
+                .sum();
             let mut r = 0.0_f64;
             for k in 0..n_atoms {
-                let w = assignments[[i, k]].max(0.0);
+                let w = assignments[[i, k]].max(0.0) / scale;
                 let credit = (w / denom) * atom_trust[k];
                 per_atom[[i, k]] = credit;
                 r += credit;
@@ -90,6 +93,16 @@ mod tests {
         assert!((per_atom[[1, 0]]).abs() < 1e-12);
         assert!((per_atom[[1, 1]] - 0.8).abs() < 1e-12);
         assert!((row[1] - 0.8).abs() < 1e-12);
+    }
+
+    #[test]
+    fn routing_trust_preserves_normalization_when_weight_sum_overflows() {
+        let assignments = array![[f64::MAX, f64::MAX / 3.0]];
+        let atom_trust = array![0.2, 0.8];
+        let (row, per_atom) = row_trust_scores(assignments.view(), atom_trust.view()).unwrap();
+        assert!((row[0] - 0.35).abs() < 1.0e-14);
+        assert!((per_atom[[0, 0]] - 0.15).abs() < 1.0e-14);
+        assert!((per_atom[[0, 1]] - 0.20).abs() < 1.0e-14);
     }
 
     #[test]
