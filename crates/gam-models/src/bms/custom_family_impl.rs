@@ -3515,13 +3515,11 @@ impl BernoulliMarginalSlopeFamily {
         if n == 0 || rank == 0 || n_dirs == 0 {
             return Ok(Array1::zeros(n_dirs));
         }
+        // The one row-chunk rule for streamed dense kernels (#2469, #2704): each
+        // row of this pass carries four panels of `rank + n_dirs` f64 values.
         let rows_per_chunk = {
-            // Imported, not transcribed (#2704). The `/ panels` below makes
-            // this a budget DERIVED from the shared base, not a different one.
-            const TARGET_BYTES: usize = gam_runtime::resource::LIBRARY_ROW_CHUNK_TARGET_BYTES;
             let panels = 4usize;
-            let width = rank + n_dirs;
-            (TARGET_BYTES / (panels * width.max(1) * 8)).max(1).min(n)
+            gam_runtime::resource::byte_balanced_row_chunk(panels * (rank + n_dirs), n)
         };
         let factor_m = factor.slice(s![slices.marginal.clone(), ..]);
         let factor_g = factor.slice(s![slices.slope.clone(), ..]);

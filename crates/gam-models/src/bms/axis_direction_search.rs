@@ -1340,22 +1340,20 @@ impl BernoulliMarginalSlopeFamily {
         // materialization by keeping one accumulator per ψ axis in the
         // rayon fold.
         let weighted_rows = cache.outer_weighted_rows_cached(options, n);
-        // Rows per hoisted ψ block. Each hoisted row carries one design row per
-        // axis, so the block is the library row-chunk budget divided by those
-        // bytes, and never less than one row.
-        let psi_row_bytes = axes
+        // Rows per hoisted ψ block, by the one row-chunk rule for streamed dense
+        // kernels (#2469, #2704): each hoisted row carries one design row per axis.
+        let psi_row_cols = axes
             .iter()
             .map(|axis| {
-                std::mem::size_of::<f64>()
-                    * if axis.block_idx == 0 {
-                        slices.marginal.len()
-                    } else {
-                        slices.slope.len()
-                    }
+                if axis.block_idx == 0 {
+                    slices.marginal.len()
+                } else {
+                    slices.slope.len()
+                }
             })
             .sum::<usize>();
         let psi_row_block =
-            (gam_runtime::resource::LIBRARY_ROW_CHUNK_TARGET_BYTES / psi_row_bytes.max(1)).max(1);
+            gam_runtime::resource::byte_balanced_row_chunk(psi_row_cols, weighted_rows.len());
         let make_acc = || -> Vec<(f64, Array1<f64>, BernoulliBlockHessianAccumulator)> {
             (0..k)
                 .map(|_| {
