@@ -1,5 +1,4 @@
 use super::*;
-use gam_math::special::bessel_i0_log_and_ratio;
 use gam_solve::rho_optimizer::{
     FixedPointCertificateEval, FixedPointCoordinateCertificate, OuterResult,
 };
@@ -2466,29 +2465,22 @@ impl SaeManifoldOuterObjective {
         (diff_sq / ss_tot) < SAE_FINAL_EV_DEGRADATION_TOL
     }
 
-    /// Fellner-Schall / Mackay multiplicative fixed-point step on ρ at
-    /// `rho_flat`. Runs the inner `(t, β)` solve to convergence at fixed ρ
-    /// (sharing the single Direct factor with the penalized quasi-Laplace criterion), then
-    /// returns `(cost, additive-log-steps, β̂)`.
+    /// Fellner-Schall / MacKay fixed-point step on ρ at `rho_flat`. Runs the inner
+    /// `(t, β)` solve to convergence at fixed ρ (sharing the single Direct factor
+    /// with the penalized quasi-Laplace criterion), then returns
+    /// `(cost, additive-log-steps, β̂)`.
     ///
     /// All ρ coords are log-quantities, so the engine's additive step
-    /// `rho_new = rho + step` IS the multiplicative FS update. Per coord:
-    /// - ARD axis (k,j): `α_new = n / (‖t_kj‖² + tr_kj(H⁻¹))` (unit-dispersion
-    ///   MacKay fixed point, #F1 — no `φ̂`),
-    ///   `step = ln α_new − log_ard[k][j]`. The `tr_kj(H⁻¹)` posterior
-    ///   variance (from the selected-inverse latent diagonal) is exactly the
-    ///   term the deleted `α=n/‖t‖²` rule dropped, so α cannot collapse on a
-    ///   degenerate axis: as `‖t‖²→0`, `tr_kj(H⁻¹)→1/α` bounds the
-    ///   denominator and the fixed point has a finite root.
-    /// - λ_smooth[k] (per-atom, #1556): `λ_k_new = [p·rank S_k − tr_k(S_β⁻¹ M_k)]
-    ///   / B_kᵀ(S_k⊗I_p)B_k` (Wood-Fasiolo EFS, already per-coordinate, #F1 — no
-    ///   `φ̂`),
-    ///   `step = ln λ_k_new − log_lambda_smooth[k]`, written into each atom's own
-    ///   step slot `1+k`.
-    /// - λ_sparse: 0.0 — the assignment-sparsity priors (softmax entropy,
-    ///   gated L1, ordered Beta--Bernoulli) are non-quadratic, so no Gaussian-logdet FS fixed
-    ///   point exists; it stays cost-driven (the cascade still moves it via
-    ///   the cost path when EFS is not the active lane for that coord).
+    /// `rho_new = rho + step` is a multiplicative update. Every coordinate steps
+    /// from the complete analytic gradient `g` of the returned cost, so each step's
+    /// only zero is `g = 0`:
+    /// - ARD axis (k,j), λ_smooth[k] (per-atom, #1556) and crosscoder block ℓ:
+    ///   `step = ln(1 − 2·g/energy)` with the coordinate's penalty energy
+    ///   `α·(‖t_kj‖² + tr_kj(H⁻¹))`, `λ_k·B_kᵀ(S_k⊗I_p)B_k` or `R̃_ℓ`. Restricted to
+    ///   the explicit, trace and Occam channels this is the historical MacKay /
+    ///   Wood–Fasiolo closed form (#F1 — no `φ̂`); see `root_equivalent_log_step`.
+    /// - assignment strength and sectional curvature: the normalized negative
+    ///   gradient `−g/max(|g|, 1)`, since no multiplicative equation exists.
     /// #2330 — the `_` below discards the ONLY copy of the refusal diagnosis.
     ///
     /// When an evaluation is refused, `infeasible_evaluation` records why in every
@@ -2676,23 +2668,25 @@ impl SaeManifoldOuterObjective {
             ));
         }
 
-        // The MacKay/Fellner–Schall fixed point uses the observed row count.
-        // Design-honesty weights are mean-one and only redistribute the weighted
-        // coordinate sum of squares in the denominator.
-        let n_eff = self.term.n_obs() as f64;
         let sumsq = self.term.ard_coord_sumsq();
-        // The assignment-strength ψ coordinate has no EFS equation. Its one
-        // exact gradient component comes from the complete all-coordinate
-        // assembler; single-adjoint form makes this the same one solve the old
-        // coordinate-specialized forward response paid.
-        let complete_gradient = if rho.sparse_flat_index().is_some() || !rho.kappa.is_empty() {
-            Some(
-                self.analytic_gradient_for_outer_evaluation(&rho, &evaluation)
-                    .map_err(|error| error.to_string())?,
-            )
-        } else {
-            None
-        };
+        // Every coordinate below proposes from the COMPLETE analytic derivative of
+        // the scalar returned as `cost`: explicit, trace, Occam, rank-response and
+        // single-adjoint IFT channels, assembled by the authority the fixed-point
+        // certificate reads. A Fellner–Schall/MacKay root built from the explicit,
+        // trace and Occam channels alone has a different zero. Iterating those
+        // proposals on the #2668 collapse fixture climbed λ_smooth from log λ 0.48 to
+        // 35 while the cost rose from −0.78 to +0.95, until the atom vanished. The
+        // fixed-point bridge backtracks only steps above its line-search threshold,
+        // and abandons EFS for a gradient solver when that fails.
+        let complete_gradient = self
+            .analytic_gradient_for_outer_evaluation(&rho, &evaluation)
+            .map_err(|error| error.to_string())?;
+        if complete_gradient.iter().any(|value| !value.is_finite()) {
+            self.probe_telemetry.infeasible_criterion_evals += 1;
+            return Ok(infeasible_evaluation(
+                "the complete analytic criterion gradient is non-finite",
+            ));
+        }
         let cache = &evaluation.cache;
         let inverse_probe_bundle = evaluation
             .matrix_free
@@ -2735,10 +2729,7 @@ impl SaeManifoldOuterObjective {
                 assignment_strength_gradient_coordinate(&rho),
                 Some(sparse_index)
             );
-            let gradient = complete_gradient
-                .as_ref()
-                .expect("sparse rho coordinate requested its complete analytic gradient")
-                [sparse_index];
+            let gradient = complete_gradient[sparse_index];
             // A normalized negative gradient is a bounded feasible-descent
             // update whose zero is exactly the full criterion root.
             let gradient_scale = gradient.abs().max(1.0);
@@ -2760,10 +2751,7 @@ impl SaeManifoldOuterObjective {
                     "SaeManifoldOuterObjective::efs_step: atom {atom} has curvature state but no flat coordinate"
                 )
             })?;
-            let gradient = complete_gradient
-                .as_ref()
-                .expect("curvature coordinate requested its complete analytic gradient")
-                [coordinate];
+            let gradient = complete_gradient[coordinate];
             let step = -gradient / gradient.abs().max(1.0);
             steps[coordinate] = step;
             fixed_point_coordinates[coordinate] =
@@ -2772,266 +2760,108 @@ impl SaeManifoldOuterObjective {
             psi_indices.push(coordinate);
         }
 
-        // λ_smooth (layout-derived K-coordinate block): per-atom Wood-Fasiolo EFS multiplicative
-        // update (#1556). The EFS fixed point is already per-coordinate, so each
-        // atom `k` gets `λ_k_new = (rank_k − edof_k)/energy_k` written into its
-        // own step slot. `rank_k = r_k·rank(S_k)`, `edof_k = tr_k(H⁻¹ M_k)`, and
-        // `energy_k = <B_k, S_k B_k>` are the per-atom splits of the historical
-        // global totals. The penalized-dimension `rank_k` uses the atom's
-        // `border_frame_rank()` r_k — the number of decoder channels the `S_k`
-        // roughness penalty actually acts on (`r_k == p` on the full-`B` path, the
-        // smaller frame rank when a Grassmann frame is active), NOT the full output
-        // dim `p`. This matches the criterion's EDF trace / penalty energy / Occam
-        // derivative (all `border_frame_rank`-based); using `p` when `r_k < p`
-        // overcounted the FS numerator by `(p−r_k)·rank(S_k)` and drove
-        // `λ_smooth` too high on frame-active fits.
-        let k_smooth = rho.log_lambda_smooth.len();
-        let lambda_smooth_vec = rho.lambda_smooth_vec()?;
-        let quad_per_atom = self.term.decoder_smoothness_quadratic_form_per_atom()?;
-        // #2080: reuse the SAME shared (probes, S⁻¹·probes) bundle taken once above
-        // for the ARD trace. When present, the smoothness EDF is the matrix-free
-        // tr(S⁻¹·M_k) off that bundle (no dense `beta_inv`); otherwise (dense-
-        // admitted, or no lane) fall back to the dense selected-inverse trace.
-        let eff_dof_per_atom = if let Some((probes, sinv)) = inverse_probe_bundle.as_ref() {
-            self.term
-                .decoder_smoothness_effective_dof_per_atom_from_probes(
-                    probes,
-                    sinv,
-                    &lambda_smooth_vec,
-                )
-                .map_err(|e| {
-                    format!("SaeManifoldOuterObjective::efs_step: smooth dof (matrix-free): {e}")
-                })?
-        } else {
-            self.term
-                .decoder_smoothness_effective_dof_per_atom(&cache, &lambda_smooth_vec)
-                .map_err(|e| format!("SaeManifoldOuterObjective::efs_step: smooth dof: {e}"))?
-        };
-        for atom_idx in 0..k_smooth {
-            let coordinate = rho.smooth_flat_index(atom_idx);
-            let lambda_k = lambda_smooth_vec[atom_idx];
-            let rank_k = (self.term.atoms[atom_idx].border_frame_rank() as f64)
-                * (SaeManifoldTerm::symmetric_rank(self.term.atoms[atom_idx].smooth_penalty())?
-                    as f64);
-            let quad_k = quad_per_atom[atom_idx];
-            let eff_dof_k = eff_dof_per_atom[atom_idx];
-            // Guard the FS ratio against a vanishing penalty energy or a
-            // non-positive numerator (transient far from the optimum) by holding
-            // that atom's λ fixed (step 0) — the cost path still moves it then.
-            if !(quad_k > 0.0) {
-                fixed_point_coordinates[coordinate] = FixedPointCoordinateCertificate::uncovered(
-                    format!("atom {atom_idx} smoothness energy is not positive"),
-                );
-            } else if !(rank_k - eff_dof_k > 0.0) {
-                fixed_point_coordinates[coordinate] = FixedPointCoordinateCertificate::uncovered(
-                    format!("atom {atom_idx} smoothness rank-minus-edf numerator is not positive"),
-                );
-            } else if !(lambda_k > 0.0 && lambda_k.is_finite()) {
-                fixed_point_coordinates[coordinate] = FixedPointCoordinateCertificate::uncovered(
-                    format!("atom {atom_idx} smoothness precision is not finite and positive"),
-                );
-            } else {
-                // #F1 — NO dispersion factor. The outer objective the value/gradient
-                // lanes minimize is the UNIT-dispersion penalized Laplace criterion
-                // `v = ½‖r‖² + ½Σ_k λ_k·B_kᵀS_kB_k + ½log|H| − ½Σ_k rank_k·log λ_k`
-                // (`penalized_quasi_laplace_criterion_*`: `loss.data_fit` is the raw half-SSE, with no
-                // `1/φ̂` on the data term and no `(np/2)·ln φ̂` scale term). Its
-                // stationarity in `ρ_k = log λ_k` — using `edof_k = tr(H⁻¹·λ_k S_k)`
-                // so `tr(H⁻¹S_k) = edof_k/λ_k` — is
-                //   ½B_kᵀS_kB_k + ½·edof_k/λ_k − ½·rank_k/λ_k = 0
-                //   ⇒ λ_k = (rank_k − edof_k)/B_kᵀS_kB_k,
-                // with NO `φ̂`. The former `φ̂·(…)` fixed point was the textbook
-                // ESTIMATED-scale GAM update; against this unit-scale criterion it
-                // walked to `φ̂·λ*`, so the EFS lane and the value lane optimized two
-                // different objectives inside one solve. Matches the φ̂-free value
-                // gradient (`reml_occam_log_lambda_smooth_derivative` +
-                // `decoder_smoothness_value_per_atom`).
-                let lambda_new = (rank_k - eff_dof_k) / quad_k;
-                if lambda_new.is_finite() && lambda_new > 0.0 {
-                    let step = lambda_new.ln() - rho.log_lambda_smooth[atom_idx];
+        // Precision coordinates (λ_smooth, ARD, crosscoder blocks) take the
+        // multiplicative step of `root_equivalent_log_step`. A coordinate whose
+        // update would leave the positive precisions is held, and its certificate
+        // stays uncovered.
+        let mut record_precision_step = |coordinate: usize, energy: f64, subject: String| {
+            let gradient = complete_gradient[coordinate];
+            match root_equivalent_log_step(gradient, energy) {
+                Some(step) => {
                     steps[coordinate] = step;
                     fixed_point_coordinates[coordinate] =
                         FixedPointCoordinateCertificate::covered(step, 1.0);
-                } else {
+                }
+                None => {
                     fixed_point_coordinates[coordinate] =
                         FixedPointCoordinateCertificate::uncovered(format!(
-                            "atom {atom_idx} smoothness equation proposed a non-finite precision"
+                            "{subject}: the multiplicative update leaves the positive precisions \
+                             (penalty energy {energy:.3e}, criterion gradient {gradient:.3e})"
                         ));
                 }
             }
+        };
+
+        // λ_smooth (layout-derived K-coordinate block), one coordinate per atom
+        // (#1556). The unit-dispersion criterion carries `½·λ_k·E_k` with
+        // `E_k = <B_k, S_k B_k>` (#F1 — no `φ̂`). The Wood–Fasiolo update
+        // `λ_new = λ_k − 2·g_k/E_k` is the Newton step in `λ_k` whose curvature
+        // `E_k/(2·λ_k)` is the Occam normalizer's at the root, taken as the additive
+        // log step `ln(1 − 2·g_k/(λ_k·E_k))`. Restricting `g_k` to the explicit,
+        // trace and Occam channels gives the historical `(rank_k − edof_k)/E_k`; the
+        // complete gradient adds the inner-mode response those channels omit, and
+        // the step's only zero is `g_k = 0`.
+        let k_smooth = rho.log_lambda_smooth.len();
+        let lambda_smooth_vec = rho.lambda_smooth_vec()?;
+        let quad_per_atom = self.term.decoder_smoothness_quadratic_form_per_atom()?;
+        for atom_idx in 0..k_smooth {
+            record_precision_step(
+                rho.smooth_flat_index(atom_idx),
+                lambda_smooth_vec[atom_idx] * quad_per_atom[atom_idx],
+                format!("atom {atom_idx} smoothness"),
+            );
         }
 
-        // ARD axes (after the layout-derived smooth block): Mackay fixed point
-        // with posterior variance
-        // (Gaussian closed form on Euclidean axes; the exact von-Mises root on
-        // periodic axes, see `von_mises_ard_precision`).
+        // ARD axes (after the layout-derived smooth block). The coordinate prior
+        // contributes `½·α·‖t‖²` and `½log|A|` contributes `½·α·tr(H⁻¹)`, so with
+        // `E = ‖t‖² + tr(H⁻¹)` the MacKay update is the same step in `α`,
+        // `ln(1 − 2·g/(α·E))` (historically `n_eff/E` on a Euclidean axis, #F1 — no
+        // `φ̂`). The complete gradient also carries the exact von-Mises normalizer on
+        // a periodic axis, so one step form serves both geometries.
         // #1026 shared-ARD: in `Shared` mode several atoms alias ONE outer
-        // coordinate `sparse_dim+K+axis`, so the fixed point pools the evidence across the
-        // atoms owning the axis — `α_axis_new = (count·n) / Σ_k(‖t_kj‖²+tr_kj)`
-        // (#F1 — no `φ̂`) — and writes a single step. Walking a raw per-atom cursor there indexes
-        // past the flat length `sparse_dim+K+max_d` (OOB) and splits one shared strength
-        // across phantom slots. In `PerAtom` mode each `(k, axis)` is its own
-        // coordinate and this reduces to the historical per-atom Mackay update.
-        // Per-(atom, axis) periodicity: a PERIODIC (Circle) axis's empirical-Bayes
-        // precision is the von-Mises root (`von_mises_ard_precision`), NOT the
-        // Gaussian closed form `denom` alone encodes; a non-periodic (Euclidean)
-        // axis keeps the exact Gaussian Mackay/FS update unchanged.
-        let ard_periods: Vec<Vec<Option<f64>>> = self
-            .term
-            .assignment
-            .coords
-            .iter()
-            .map(|c| c.effective_axis_periods())
-            .collect();
+        // coordinate, so the energy pools across the owning atoms and one step is
+        // written. Walking a raw per-atom cursor there indexes past the flat length
+        // and splits one shared strength across phantom slots. An axis no atom owns
+        // keeps its default uncovered certificate.
         match rho.ard_sharing() {
             ArdSharing::PerAtom => {
                 for (k, axis_logard) in rho.log_ard.iter().enumerate() {
                     for (j, &logard_kj) in axis_logard.iter().enumerate() {
-                        let coordinate = rho.ard_flat_index(k, j);
-                        let denom = sumsq[k][j] + traces[k][j];
-                        if denom > 0.0 {
-                            // #F1 — NO dispersion factor (same unit-dispersion
-                            // criterion as λ_smooth). The Gaussian coordinate prior
-                            // contributes `+½α‖t‖² − ½·n_eff·log α` to the unit-scale
-                            // `v`, and `½log|H|` contributes `½α·tr(H⁻¹)`; stationarity
-                            // in `log α` gives `α(‖t‖² + tr) = n_eff`, i.e. `α_new =
-                            // n_eff/denom` with NO `φ̂` — matching the φ̂-free value
-                            // gradient `ard_log_precision_explicit_derivatives`
-                            // (`normalizer_deriv = −½·n_eff`). The former `φ̂·n_eff/…`
-                            // walked the ARD precision to `φ̂·α*`.
-                            let alpha_gauss = n_eff / denom;
-                            let alpha_new = match ard_periods[k].get(j).copied().flatten() {
-                                Some(period) => von_mises_ard_precision(
-                                    alpha_gauss,
-                                    std::f64::consts::TAU / period,
-                                ),
-                                None => alpha_gauss,
-                            };
-                            if alpha_new.is_finite() && alpha_new > 0.0 {
-                                let step = alpha_new.ln() - logard_kj;
-                                steps[coordinate] = step;
-                                fixed_point_coordinates[coordinate] =
-                                    FixedPointCoordinateCertificate::covered(step, 1.0);
-                            } else {
-                                fixed_point_coordinates[coordinate] =
-                                    FixedPointCoordinateCertificate::uncovered(format!(
-                                        "atom {k} ARD axis {j} equation proposed a non-finite precision"
-                                    ));
-                            }
-                        } else {
-                            fixed_point_coordinates[coordinate] =
-                                FixedPointCoordinateCertificate::uncovered(format!(
-                                    "atom {k} ARD axis {j} posterior second moment is not positive"
-                                ));
-                        }
+                        record_precision_step(
+                            rho.ard_flat_index(k, j),
+                            logard_kj.exp() * (sumsq[k][j] + traces[k][j]),
+                            format!("atom {k} ARD axis {j}"),
+                        );
                     }
                 }
             }
             ArdSharing::Shared => {
-                let max_d = rho.max_ard_axes();
-                for axis in 0..max_d {
-                    let mut denom = 0.0_f64;
-                    let mut count = 0usize;
-                    let mut shared_logard = 0.0_f64;
-                    let mut shared_period: Option<f64> = None;
+                for axis in 0..rho.max_ard_axes() {
+                    let mut energy = 0.0_f64;
+                    let mut owned = false;
                     for (k, axis_logard) in rho.log_ard.iter().enumerate() {
                         if axis < axis_logard.len() {
-                            denom += sumsq[k][axis] + traces[k][axis];
-                            // Broadcast table: every owner carries the same value.
-                            shared_logard = axis_logard[axis];
-                            // Owners aliasing one shared axis share its geometry, so
-                            // the period is common; take the first owner's.
-                            if shared_period.is_none() {
-                                shared_period = ard_periods[k].get(axis).copied().flatten();
-                            }
-                            count += 1;
+                            // Broadcast table: every owner carries the same precision.
+                            energy += axis_logard[axis].exp() * (sumsq[k][axis] + traces[k][axis]);
+                            owned = true;
                         }
                     }
-                    let coordinate = rho.ard_flat_index(0, axis);
-                    if count == 0 {
-                        fixed_point_coordinates[coordinate] =
-                            FixedPointCoordinateCertificate::uncovered(format!(
-                                "shared ARD axis {axis} has no owning atom"
-                            ));
-                    } else if !(denom > 0.0) {
-                        fixed_point_coordinates[coordinate] =
-                            FixedPointCoordinateCertificate::uncovered(format!(
-                                "shared ARD axis {axis} posterior second moment is not positive"
-                            ));
-                    } else {
-                        // #F1 — NO dispersion factor (see the PerAtom branch). The
-                        // shared axis pools `count` owners' evidence, so `n_eff` is
-                        // lifted by `count`; the φ̂-free form is `α_new =
-                        // count·n_eff/denom`.
-                        let alpha_gauss = n_eff * (count as f64) / denom;
-                        let alpha_new = match shared_period {
-                            Some(period) => {
-                                von_mises_ard_precision(alpha_gauss, std::f64::consts::TAU / period)
-                            }
-                            None => alpha_gauss,
-                        };
-                        if alpha_new.is_finite() && alpha_new > 0.0 {
-                            let step = alpha_new.ln() - shared_logard;
-                            steps[coordinate] = step;
-                            fixed_point_coordinates[coordinate] =
-                                FixedPointCoordinateCertificate::covered(step, 1.0);
-                        } else {
-                            fixed_point_coordinates[coordinate] =
-                                FixedPointCoordinateCertificate::uncovered(format!(
-                                    "shared ARD axis {axis} equation proposed a non-finite precision"
-                                ));
-                        }
+                    if owned {
+                        record_precision_step(
+                            rho.ard_flat_index(0, axis),
+                            energy,
+                            format!("shared ARD axis {axis}"),
+                        );
                     }
                 }
             }
         }
 
         // Block weights (trailing L-1 coordinates): the crosscoder block-relevance
-        // Fellner–Schall step (#2231 Inc-B stage 2). The `#F1` criterion's
-        // explicit data + Jacobian channels are stationary in `log λ_ℓ` at
-        // `R̃_ℓ = n·p_ℓ` (block ½·R̃_ℓ − n·p_ℓ/2 = 0; see
-        // `block_log_lambda_gradient`), and `R̃_ℓ = λ_ℓ·R_ℓ`, so the
-        // multiplicative fixed point `λ_ℓ_new = n·p_ℓ/R_ℓ = λ_ℓ·n·p_ℓ/R̃_ℓ`
-        // becomes the ADDITIVE log-space step `Δlog λ_ℓ = ln(n·p_ℓ/R̃_ℓ)`. This
-        // is a PROPOSAL heuristic (like the λ_smooth/ARD EFS steps above): the
-        // full analytic gradient additionally carries the `−½·Γᵀθ̂_ρ` Laplace
-        // adjoint (`crosscoder_block_ift_rhs`), an `O(dim H / (n·p_ℓ))` relative
-        // correction the quasi-Newton lane prices exactly; EFS proposals are
-        // still accepted only on criterion improvement, so the heuristic root
-        // cannot bias the fitted λ. Held (step 0) for a block with no residual
-        // variance (`R̃_ℓ ≤ 0`: perfectly reconstructed / unidentifiable) or a
-        // non-finite proposal, matching the λ_smooth/ARD guards above. No-op for a
-        // plain SAE.
+        // step (#2231 Inc-B stage 2). The `#F1` criterion's explicit data and
+        // Jacobian channels contribute `½·R̃_ℓ − ½·n·p_ℓ` to `∂/∂log λ_ℓ`
+        // (`block_log_lambda_gradient`) with `R̃_ℓ = λ_ℓ·R_ℓ`, so the step has energy
+        // `R̃_ℓ`: `ln(1 − 2·g_ℓ/R̃_ℓ)`, historically `ln(n·p_ℓ/R̃_ℓ)`. The complete
+        // gradient adds the `−½·Γᵀθ̂_ρ` Laplace adjoint (`crosscoder_block_ift_rhs`);
+        // a proposal without it has a different zero. No-op for a plain SAE.
         if let Some(scaled_rss) = self.block_scaled_rss(&rho)? {
-            let n = self.term.n_obs() as f64;
             let blocks = self
                 .crosscoder_blocks
                 .as_ref()
                 .expect("block_scaled_rss returned Some ⇒ crosscoder pricing is installed");
             let tail = n_params - rho.kappa.len() - blocks.block_dims.len();
-            for (l, (&p_l, &r_tilde)) in blocks.block_dims.iter().zip(scaled_rss.iter()).enumerate()
-            {
-                let coordinate = tail + l;
-                if r_tilde > 0.0 {
-                    let step = (n * p_l as f64 / r_tilde).ln();
-                    if step.is_finite() {
-                        steps[coordinate] = step;
-                        fixed_point_coordinates[coordinate] =
-                            FixedPointCoordinateCertificate::uncovered(format!(
-                                "crosscoder block {l} EFS proposal omits the logdet IFT adjoint and is not a complete stationarity equation"
-                            ));
-                    } else {
-                        fixed_point_coordinates[coordinate] =
-                            FixedPointCoordinateCertificate::uncovered(format!(
-                                "crosscoder block {l} equation proposed a non-finite update"
-                            ));
-                    }
-                } else {
-                    fixed_point_coordinates[coordinate] =
-                        FixedPointCoordinateCertificate::uncovered(format!(
-                            "crosscoder block {l} scaled residual energy is not positive"
-                        ));
-                }
+            for (l, &r_tilde) in scaled_rss.iter().enumerate().take(blocks.block_dims.len()) {
+                record_precision_step(tail + l, r_tilde, format!("crosscoder block {l}"));
             }
         }
 
@@ -3058,73 +2888,21 @@ impl SaeManifoldOuterObjective {
     }
 }
 
-/// Correct the Gaussian Mackay/Fellner–Schall ARD precision proposal to the
-/// EXACT von-Mises empirical-Bayes fixed point on a PERIODIC axis.
+/// Additive log-space fixed-point step for a precision coordinate whose penalty
+/// contributes `½·energy` to the criterion: `energy = λ·<B, S B>` for decoder
+/// smoothness, `α·(‖t‖² + tr H⁻¹)` for ARD, `R̃_ℓ` for a crosscoder block.
 ///
-/// The closed-form update `α_gauss = n_eff/(Σ q + tr H⁻¹)` (#F1 — no `φ̂`) is the
-/// stationary precision only for a Gaussian coordinate prior, whose normalized
-/// log-partition contributes `−½ n_eff log α` (ρ-derivative `−½ n_eff`). On a
-/// periodic (von-Mises) axis the normalized prior's log-partition is
-/// `log P − η + log I0(η)`, `η = α/κ²`, whose ρ-derivative is
-/// `n_eff·η·(A(η)−1)` with `A(η) = I1(η)/I0(η)` — the Gaussian `−½ n_eff` is only
-/// its `η→∞` limit (`A(η) ≈ 1 − 1/(2η)`). Setting the criterion's ρ-derivative to
-/// zero over the SAME `denom = Σ q + tr H⁻¹` the Gaussian update uses collapses to
-///   `A(η) = 1 − 1/(2·η_gauss)`,  `η_gauss = α_gauss/κ²`,
-/// so the correction → `α_gauss` in the `η→∞` limit (`A(η) ≈ 1 − 1/(2η)`) and only
-/// re-scales the diffuse regime the Gaussian surrogate mis-ranks. It differs from
-/// `α_gauss` at every finite η by design, so the bit-for-bit-unchanged guarantee
-/// holds only for Euclidean (`period = None`) axes, which bypass this function
-/// entirely. When the target ratio leaves `(0,1)` the root is ill-posed
-/// (`η_gauss ≤ ½`: maximally diffuse) and the Gaussian proposal is returned
-/// unchanged (no regression). `A` is strictly increasing on `(0,∞)`, so the root
-/// is found by monotone safeguarded bisection using the crate's stable `I1/I0`
-/// evaluator. The posterior-variance term keeps the plain Fellner–Schall trace
-/// surrogate `T = Σ w·(H⁻¹)ᵢᵢ` (not the exact `cos`-weighted `Σ w·(α cos κt)ᵢ(H⁻¹)ᵢᵢ`);
-/// this refines the analytically-dominant normalizer channel to the von-Mises form
-/// while the outer ρ-gradient (`ard_log_precision_explicit_derivatives`) stays the
-/// exact, value-consistent objective the step is safeguarded against.
-fn von_mises_ard_precision(alpha_gauss: f64, kappa: f64) -> f64 {
-    if !(alpha_gauss.is_finite() && alpha_gauss > 0.0 && kappa.is_finite() && kappa > 0.0) {
-        return alpha_gauss;
-    }
-    let kappa2 = kappa * kappa;
-    let eta_gauss = alpha_gauss / kappa2;
-    // Exact stationarity over the shared denominator: A(η) = 1 − 1/(2·η_gauss).
-    let a_target = 1.0 - 0.5 / eta_gauss;
-    if !(a_target > 0.0 && a_target < 1.0) {
-        return alpha_gauss;
-    }
-    let a_of = |eta: f64| bessel_i0_log_and_ratio(eta).1;
-    // Bracket the monotone root around η_gauss (A increasing in η).
-    let mut lo = eta_gauss;
-    let mut hi = eta_gauss;
-    let mut guard = 0;
-    while lo > f64::MIN_POSITIVE && a_of(lo) > a_target && guard < 256 {
-        lo *= 0.5;
-        guard += 1;
-    }
-    guard = 0;
-    while hi.is_finite() && a_of(hi) < a_target && guard < 256 {
-        hi *= 2.0;
-        guard += 1;
-    }
-    if !(lo.is_finite() && hi.is_finite() && lo > 0.0 && hi > lo) {
-        return alpha_gauss;
-    }
-    for _ in 0..80 {
-        let mid = 0.5 * (lo + hi);
-        if a_of(mid) < a_target {
-            lo = mid;
-        } else {
-            hi = mid;
-        }
-    }
-    let alpha = kappa2 * 0.5 * (lo + hi);
-    if alpha.is_finite() && alpha > 0.0 {
-        alpha
-    } else {
-        alpha_gauss
-    }
+/// `ln(1 − 2·g/energy)` is the Wood–Fasiolo/MacKay multiplicative update written
+/// against the complete criterion gradient `g = ∂V/∂log precision`: restricting
+/// `g` to the explicit, trace and Occam channels reproduces the historical closed
+/// forms (`(rank − edof)/<B, S B>`, `n_eff/(‖t‖² + tr H⁻¹)`, `n·p_ℓ/R_ℓ`), and the
+/// only fixed point is `g = 0`, the root the fixed-point certificate checks.
+/// `None` when the energy is not positive or the update would leave the positive
+/// precisions (`2·g ≥ energy`): no multiplicative equation proposes a move there,
+/// so the caller holds the coordinate and leaves its certificate uncovered.
+fn root_equivalent_log_step(gradient: f64, energy: f64) -> Option<f64> {
+    let ratio = 1.0 - 2.0 * gradient / energy;
+    (energy > 0.0 && ratio > 0.0 && ratio.is_finite()).then(|| ratio.ln())
 }
 
 /// Exact scale of the decoder data curvature relative to one unit of an atom's
@@ -3571,12 +3349,11 @@ pub(crate) fn periodic_ard_domain_upper(
 impl OuterObjective for SaeManifoldOuterObjective {
     fn capability(&self) -> OuterCapability {
         let gradient = sae_outer_gradient_capability();
-        // SAE's Fellner--Schall/MacKay updates are useful simultaneous proposal
-        // directions, but their zeros omit the profiled criterion's state-
-        // response/third-order channels. They may drive a fixed-point solver
-        // only when the complete analytic gradient is available to certify the
-        // terminal KKT root. Matrix-free SAE currently lacks that proof surface
-        // and must refuse rather than mint a surrogate fixed point (#2253).
+        // SAE's Fellner--Schall/MacKay steps are written against the complete
+        // analytic gradient (`root_equivalent_log_step`), so every step's zero is
+        // the profiled criterion's KKT root, including its state-response and
+        // third-order channels. The fixed-point certificate re-checks that root on
+        // the authoritative sample (#2253, #2668).
         let exact_gradient_certificate = matches!(gradient, Derivative::Analytic);
         let psi_gradient_dim =
             usize::from(assignment_strength_gradient_coordinate(&self.baseline_rho).is_some())
@@ -3611,20 +3388,16 @@ impl OuterObjective for SaeManifoldOuterObjective {
                 0
             },
             // The SAE path minimizes its explicitly named custom quasi-Laplace
-            // criterion. The extended Fellner--Schall fixed point needs only the traces
-            // tr(H⁻¹ S_c) (decoder_smoothness_effective_dof + ard_inverse_traces),
-            // never a finite-difference or autodiff gradient — which is required
-            // here because the per-atom-ARD outer problem is O(K)-dimensional and a
-            // gradient/BFGS descent over it costs O(K) inner fits per step,
-            // intractable at large K. EFS updates all coords SIMULTANEOUSLY from a
-            // single trace pass, so it scales. The #1023 boundary-collapse (EFS
-            // railing λ_smooth and collapsing the decoder to the mean) is guarded
-            // two ways now: efs_step's update targets the finite penalized quasi-Laplace stationary
-            // point λ_new = (rank−edof)/energy (#F1 — the unit-dispersion fixed
-            // point the value criterion's ∂/∂ρ = 0 defines; `rank−edof ≤ rank`
-            // bounded and `energy > 0`, so λ cannot rail to a mean-collapse).
-            // Fitted-data collapse is recorded separately as a structure-search
-            // verdict and never changes this fixed-point objective.
+            // criterion. EFS updates all coords SIMULTANEOUSLY from one inner solve,
+            // the ARD inverse traces and the single-adjoint complete analytic gradient,
+            // never a finite-difference or autodiff gradient. Each coordinate's step
+            // is the MacKay/Wood–Fasiolo Newton step in its precision written against
+            // that complete gradient (`root_equivalent_log_step`), so the iteration's
+            // fixed point is the criterion's root. The explicit-channel closed form
+            // `λ_new = (rank−edof)/energy` has a different zero on a bilinear decoder
+            // scale orbit, and iterating it railed λ_smooth until the atom vanished
+            // (#1023, #2668). Fitted-data collapse is recorded separately as a
+            // structure-search verdict and never changes this fixed-point objective.
             fixed_point_available: exact_gradient_certificate,
             barrier_config: None,
             prefer_gradient_only: false,
@@ -4012,14 +3785,14 @@ impl OuterObjective for SaeManifoldOuterObjective {
         rho: &Array1<f64>,
     ) -> Result<FixedPointCertificateEval, EstimationError> {
         self.check_cancelled()?;
-        // EFS/MacKay step zeros are not the stationarity equations of the full
-        // profiled quasi-Laplace objective: the exact gradient also contains
-        // logdet state response, the third-order correction, and rank-response
-        // channels. Re-evaluate the authoritative analytic sample and expose its
-        // negative gradient as the signed feasible-descent residual. The generic
-        // fixed-point certificate projects this vector at the rho box and applies
-        // the same tolerance as the first-order optimizer, so an EFS proposal can
-        // accelerate iteration but can never certify a different root (#2253).
+        // The EFS steps are written against the complete analytic gradient, so a
+        // zero step is a stationary point of the profiled quasi-Laplace objective.
+        // The proof still re-evaluates the authoritative analytic sample and
+        // exposes its negative gradient as the signed feasible-descent residual:
+        // the generic fixed-point certificate projects this vector at the rho box
+        // and applies the same tolerance as the first-order optimizer, so no
+        // iteration history (a restored incumbent, a relaxed step) can certify a
+        // point the value lane does not agree is stationary (#2253).
         let evaluation = self.eval(rho)?;
         let coordinates = evaluation
             .gradient
