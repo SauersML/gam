@@ -502,21 +502,17 @@ fn covariance_factor(eigen: &PsdEigen) -> Array2<f64> {
 }
 
 fn factor_standard_errors(curve_factor: &Array2<f64>) -> Array1<f64> {
-    let variances = Array1::from_iter(
+    // Each row is a covariance factor, so its variance is a sum of squares
+    // and has no negative roundoff to clip. A threshold derived from OTHER
+    // rows incorrectly turns a small, uncertain contrast into an exact one.
+    // Hypot also keeps representable standard errors whose squares would
+    // underflow or overflow.
+    Array1::from_iter(
         curve_factor
             .rows()
             .into_iter()
-            .map(|row| row.iter().map(|value| value * value).sum::<f64>()),
-    );
-    let variance_scale = variances.iter().copied().fold(0.0_f64, f64::max);
-    let variance_tolerance = roundoff_tolerance(variance_scale, curve_factor.ncols());
-    variances.mapv(|variance| {
-        if variance > variance_tolerance {
-            variance.sqrt()
-        } else {
-            0.0
-        }
-    })
+            .map(|row| row.iter().fold(0.0_f64, |norm, &value| norm.hypot(value))),
+    )
 }
 
 fn simultaneous_critical(
@@ -702,5 +698,30 @@ mod tests {
             assert_abs_diff_eq!(signed.lower[row], -first.upper[row], epsilon = 1e-14);
             assert_abs_diff_eq!(signed.upper[row], -first.lower[row], epsilon = 1e-14);
         }
+    }
+
+    #[test]
+    fn simultaneous_bands_preserve_small_nonzero_contrast_scales() {
+        let report = effect_report(
+            array![0.0].view(),
+            array![[1.0]].view(),
+            array![[1.0], [1e-9]].view(),
+            BandOptions::Simultaneous(SimultaneousBandOptions {
+                simulations: 64,
+                ..SimultaneousBandOptions::default()
+            }),
+        )
+        .expect("scaled contrasts of the same Gaussian coefficient");
+        assert_eq!(report.se[0], 1.0);
+        assert_eq!(report.se[1], 1e-9);
+        assert!(report.upper[1] > 0.0);
+        assert_abs_diff_eq!(report.upper[1] / report.upper[0], 1e-9, epsilon = 1e-24);
+    }
+
+    #[test]
+    fn factor_standard_errors_do_not_square_outside_the_float_range() {
+        let se = factor_standard_errors(&array![[3e200, 4e200], [3e-200, 4e-200]]);
+        assert_abs_diff_eq!(se[0] / 5e200, 1.0, epsilon = 1e-14);
+        assert_abs_diff_eq!(se[1] / 5e-200, 1.0, epsilon = 1e-14);
     }
 }
