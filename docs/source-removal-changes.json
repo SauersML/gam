@@ -3043,5 +3043,19 @@
     ],
     "reason": "#2897: no row-count window may choose the binary marginal-slope estimator. BMS_FLEX_SPATIAL_OUTER_PILOT_ROW_THRESHOLD was such a window: at 50,000 rows it replaced REML/LAML selection of flex-spatial length scales with pilot geometry.",
     "evidence": "At f2156a78e4c30b1bd4b815ca3ecc591df907d6c0, git grep -w over crates, tests, examples and bench found the constant only at its definition (bms/mod.rs:76) and in the branch this commit removes (block_specs.rs:2012). No replacement is needed: joint kappa/psi optimization now runs at every n whenever it is enabled."
+  },
+  {
+    "base": "06ac8a9f9bd141293b7e70028e5b257c1f8a664f",
+    "items": [
+      "crates/gam-models/src/survival/marginal_slope/joint_eval.rs:enum:BlockwiseHessianAccumulator",
+      "crates/gam-models/src/survival/marginal_slope/joint_eval.rs:fn:add_assign",
+      "crates/gam-models/src/survival/marginal_slope/joint_eval.rs:fn:evaluate_blockwise_exact_newton_mixed",
+      "crates/gam-models/src/survival/marginal_slope/joint_eval.rs:fn:evaluate_blockwise_exact_newton_sparse",
+      "crates/gam-models/src/survival/marginal_slope/joint_eval.rs:fn:into_symmetric",
+      "crates/gam-models/src/survival/marginal_slope/joint_eval.rs:type:MixedAcc",
+      "crates/gam-models/src/survival/marginal_slope/joint_eval.rs:type:SAcc"
+    ],
+    "reason": "SPEC rules 23 and 6 (lead finding 2026-09-11): evaluate_blockwise_exact_newton switched at 512 coefficients from the row-kernel dense block pullback to evaluate_blockwise_exact_newton_sparse and evaluate_blockwise_exact_newton_mixed, which computed the same block Hessians in CSR storage through a second copy of the pullback and could not express a follow-up-varying slope. The dense route is now the one rigid route at every width.",
+    "evidence": "At the base, git grep over crates/gam-models/src finds evaluate_blockwise_exact_newton_sparse and evaluate_blockwise_exact_newton_mixed only at their declarations and at the two call sites inside evaluate_blockwise_exact_newton in joint_eval.rs, both removed here; no test calls either function. Every other identity in this entry is declared inside one of those two function bodies."
   }
 ]
