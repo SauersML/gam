@@ -2922,21 +2922,32 @@ impl SaeManifoldTerm {
                 } else {
                     f64::INFINITY
                 };
-                let remaining = (max_steps - step - 1) as f64;
-                let projected_steps = if contraction > 0.0 && contraction < 1.0 {
-                    (grad_tolerance / after_gate).ln() / contraction.ln()
-                } else {
-                    f64::INFINITY
-                };
-                if !(projected_steps <= remaining) {
-                    log::debug!(
-                        "terminal Newton: stopping on trajectory, not on budget — step {} \
-                         contracted the gate norm by {contraction:.6e} ({gate_norm:.6e} → \
-                         {after_gate:.6e}), which puts the {grad_tolerance:.6e} band \
-                         {projected_steps:.1} steps away against {remaining:.0} remaining",
-                        step + 1,
-                    );
-                    break;
+                // #2267/#2283 — only a step that CONTRACTED the gate defines a rate
+                // to extrapolate. The step is accepted on Armijo decrease of the
+                // penalized objective (#2861), and on a resolved negative-curvature
+                // mode that descent generally RAISES the gate norm. Measured on the
+                // #2283 documented cell and the #2267 TopK surrogate (pin f9a38e3e6,
+                // sw7 job 431241): all 12 polish calls accepted step 1 with the gate
+                // norm rising 3.3x to 42.7x, and the extrapolation read each as "the
+                // band is infinitely far" and ended the phase after that one step,
+                // in exactly the regime the objective-currency step exists for. A
+                // step that did not contract the gate predicts nothing about when
+                // the band is reached, so it cannot justify stopping: the phase keeps
+                // descending the objective, bounded by `max_steps` and by the
+                // damping ladder refusing once no Armijo decrease is left.
+                if contraction < 1.0 {
+                    let remaining = (max_steps - step - 1) as f64;
+                    let projected_steps = (grad_tolerance / after_gate).ln() / contraction.ln();
+                    if !(projected_steps <= remaining) {
+                        log::debug!(
+                            "terminal Newton: stopping on trajectory, not on budget — step {} \
+                             contracted the gate norm by {contraction:.6e} ({gate_norm:.6e} → \
+                             {after_gate:.6e}), which puts the {grad_tolerance:.6e} band \
+                             {projected_steps:.1} steps away against {remaining:.0} remaining",
+                            step + 1,
+                        );
+                        break;
+                    }
                 }
             }
             // Walk back toward the undamped Newton step: a damping under
@@ -2946,10 +2957,11 @@ impl SaeManifoldTerm {
             if damping < smallest_damping {
                 damping = 0.0;
             }
-            // The penalized objective at the committed state, next to the merit
-            // the step was accepted on: this phase descends ‖g‖², the refine
-            // window descends the objective, and whether they agree on the
-            // direction of progress is readable only with both on one line.
+            // The penalized objective at the committed state, next to the gate
+            // norm it left behind. Both the phase and the refine window descend
+            // the objective (#2861), so a step that lowers the objective while
+            // raising the gate norm is the negative-curvature case above, and it
+            // is readable as such only with both on one line.
             let committed_objective = self
                 .penalized_objective_total(target, rho_fixed, registry, 1.0)
                 .unwrap_or(f64::NAN);
