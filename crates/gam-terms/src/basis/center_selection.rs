@@ -6,6 +6,14 @@ pub struct CollocationOperatorMatrices {
     pub d0: Array2<f64>,
     pub d1: Array2<f64>,
     pub d2: Array2<f64>,
+    /// Gram `D₃ᵀD₃` of the collocated third-derivative operator
+    /// `∂³φ/∂x_a∂x_b∂x_c`, in the same coefficient chart as `d0`–`d2`
+    /// (identifiability-projected, intercept-padded). It is accumulated in closed
+    /// form rather than materializing the `points·d³`-row operator, and is
+    /// present exactly when the kernel admits the third-order operator penalty
+    /// (isotropic Matérn with ν ≥ 5/2, [`MaternNu::admits_third_order_operator`]).
+    /// `None` for Duchon.
+    pub third_order_gram: Option<Array2<f64>>,
     pub collocation_points: Array2<f64>,
     /// Kernel-constraint nullspace transform `Z` applied internally to the
     /// raw kernel-basis K×K operator matrices (Some for Duchon, None for

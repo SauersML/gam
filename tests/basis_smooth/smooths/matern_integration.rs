@@ -109,9 +109,9 @@ fn matern_fit_term_collection_gaussian_simulated_10d() {
     )
     .expect("Matérn term-collection fit should succeed");
 
-    // High-dimensional Matérn smooths use the canonical operator penalty
-    // triplet: mass, tension, and stiffness.
-    assert_eq!(fitted.fit.lambdas.len(), 3);
+    // An isotropic ν = 5/2 Matérn smooth carries the operator penalties mass,
+    // tension, stiffness and the third-order energy its Sobolev norm controls.
+    assert_eq!(fitted.fit.lambdas.len(), 4);
     assert!(fitted.fit.edf_total().is_some_and(f64::is_finite));
 
     let pred_mean = fitted.design.design.to_dense().dot(&fitted.fit.beta) + &offset;

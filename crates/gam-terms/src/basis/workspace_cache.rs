@@ -391,7 +391,13 @@ pub(crate) fn build_matern_operator_penalty_candidates(
     // (e.g. ν=1/2) is not over-smoothed by a higher-order roughness penalty its
     // own RKHS norm does not control (#707).
     let matern_spec = DuchonOperatorPenaltySpec::matern_for_smoothness(nu, centers.ncols());
-    operator_penalty_candidates_from_collocation(&ops.d0, &ops.d1, &ops.d2, &matern_spec)
+    operator_penalty_candidates_from_collocation(
+        &ops.d0,
+        &ops.d1,
+        &ops.d2,
+        ops.third_order_gram.as_ref(),
+        &matern_spec,
+    )
 }
 
 /// True when every entry of `m` is finite.

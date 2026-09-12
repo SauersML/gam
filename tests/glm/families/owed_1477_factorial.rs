@@ -437,6 +437,7 @@ fn extract_constrained_penalties(
             PenaltySource::OperatorMass
             | PenaltySource::OperatorTension
             | PenaltySource::OperatorStiffness
+            | PenaltySource::OperatorThirdOrder
             | PenaltySource::OperatorRelevance { .. }
             | PenaltySource::TensorMarginal { .. }
             | PenaltySource::TensorSeparable { .. }

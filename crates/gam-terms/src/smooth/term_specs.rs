@@ -5640,11 +5640,13 @@ pub fn matern_operator_penalty_triplet_at_length_scale(
     // ν=3/2 kernel (m=2) carries stiffness as well as mass+tension. The sole
     // exception is ν=1/2: its center cusp makes collocated D1/D2 undefined and
     // it therefore retains mass only (#707). The matching topology gate lives
-    // at `DuchonOperatorPenaltySpec::matern_for_smoothness`.
+    // at `DuchonOperatorPenaltySpec::matern_for_smoothness`. The third-order
+    // energy is appended below whenever the collocation builder emitted its
+    // Gram (`MaternNu::admits_third_order_operator`, isotropic metric).
     const ORDER_EPS: f64 = 1e-9;
     let d = penalty_centers.ncols();
     let m = nu.half_integer_value() + 0.5 * d as f64;
-    let mut candidates = Vec::with_capacity(3);
+    let mut candidates = Vec::with_capacity(4);
     for (raw, source, min_order) in [
         (ops.d0.t().dot(&ops.d0), PenaltySource::OperatorMass, 0.0),
         (ops.d1.t().dot(&ops.d1), PenaltySource::OperatorTension, 1.0),
@@ -5663,6 +5665,20 @@ pub fn matern_operator_penalty_triplet_at_length_scale(
         candidates.push(PenaltyCandidate {
             matrix: ConstructiveQuadratic::try_from_dense_psd(matrix, "Matérn operator penalty")?,
             source,
+            normalization_scale,
+            kronecker_factors: None,
+            op: None,
+        });
+    }
+    if let Some(gram) = ops.third_order_gram.as_ref() {
+        let sym = (gram + &gram.t()) * 0.5;
+        let (matrix, normalization_scale) = normalize_penalty_in_constrained_space(&sym);
+        candidates.push(PenaltyCandidate {
+            matrix: ConstructiveQuadratic::try_from_dense_psd(
+                matrix,
+                "Matérn third-order operator penalty",
+            )?,
+            source: PenaltySource::OperatorThirdOrder,
             normalization_scale,
             kronecker_factors: None,
             op: None,

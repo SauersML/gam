@@ -1155,6 +1155,68 @@ pub(crate) fn exp_poly_scaled_s2_psi_triplet(
     (y, y_psi, y_psi_psi)
 }
 
+/// [`exp_poly_scaled_s2_psi_triplet`] at a general power of `s`:
+///   y(ψ) = scalar·s(ψ)^m·e^{−a}·P(a),  a = s r,  ds/dψ = s,  da/dψ = a,
+///   y'   = scalar·s^m e^{−a}[mP + a(P' − P)],
+///   y''  = scalar·s^m e^{−a}[m²P + (2m+1)a(P' − P) + a²(P'' − 2P' + P)].
+#[inline(always)]
+pub(crate) fn exp_poly_scaled_power_psi_triplet(
+    s: f64,
+    a: f64,
+    coeffs: &[f64],
+    scalar: f64,
+    power: i32,
+) -> (f64, f64, f64) {
+    // Every term carries exp(-a); past its underflow the result is exactly 0 and
+    // evaluating the polynomial would only risk 0·inf.
+    if a > 700.0 {
+        return (0.0, 0.0, 0.0);
+    }
+    let e = (-a).exp();
+    let (p0, p1, p2) = eval_polywith_derivatives(coeffs, a);
+    let d = p1 - p0;
+    let m = f64::from(power);
+    let scale = scalar * s.powi(power) * e;
+    (
+        scale * p0,
+        scale * (m * p0 + a * d),
+        scale * (m * m * p0 + (2.0 * m + 1.0) * a * d + a * a * (p2 - 2.0 * p1 + p0)),
+    )
+}
+
+/// Third-order radial scalars of a Matérn kernel that admits the third-order
+/// operator, with their ψ-derivatives at fixed `r` (ψ = log κ):
+///   t(r)  = (φ''(r) − φ'(r)/r)/r² = s⁴e^{−a}T(a),
+///   t'(r) = s⁵e^{−a}(T' − T)(a),
+/// returned as `((t, t_ψ, t_ψψ), (t', t'_ψ, t'_ψψ))`, or `None` for a kernel
+/// without the operator.
+pub(crate) fn matern_third_order_psi_scalars(
+    r: f64,
+    length_scale: f64,
+    nu: MaternNu,
+) -> Option<((f64, f64, f64), (f64, f64, f64))> {
+    let kappa = 1.0 / length_scale;
+    let (s, t_poly, t_r_poly): (f64, &[f64], &[f64]) = match nu {
+        MaternNu::Half | MaternNu::ThreeHalves => return None,
+        MaternNu::FiveHalves => (5.0_f64.sqrt() * kappa, &[1.0 / 3.0], &[-1.0 / 3.0]),
+        MaternNu::SevenHalves => (
+            7.0_f64.sqrt() * kappa,
+            &[1.0 / 15.0, 1.0 / 15.0],
+            &[0.0, -1.0 / 15.0],
+        ),
+        MaternNu::NineHalves => (
+            3.0 * kappa,
+            &[1.0 / 35.0, 1.0 / 35.0, 1.0 / 105.0],
+            &[0.0, -1.0 / 105.0, -1.0 / 105.0],
+        ),
+    };
+    let a = s * r;
+    Some((
+        exp_poly_scaled_power_psi_triplet(s, a, t_poly, 1.0, 4),
+        exp_poly_scaled_power_psi_triplet(s, a, t_r_poly, 1.0, 5),
+    ))
+}
+
 #[inline(always)]
 pub(crate) fn matern_operator_psi_triplet(
     r: f64,
@@ -1422,8 +1484,9 @@ pub fn build_matern_operator_penalty_psi_derivatives(
     // 4. Normalize each block by constrained Frobenius norm and propagate
     //    derivatives with exact quotient rules.
     //
-    // Returned vectors correspond to [S0, S1, S2] derivatives after
-    // constrained-space normalization.
+    // Returned vectors correspond to [S0, S1, S2] derivatives, followed by S3
+    // when the kernel carries the third-order operator, after constrained-space
+    // normalization.
     let p = centers.nrows();
     let d = centers.ncols();
     let mut d0_raw = Array2::<f64>::zeros((p, p));
@@ -1435,6 +1498,10 @@ pub fn build_matern_operator_penalty_psi_derivatives(
     let mut d0_raw_psi_psi = Array2::<f64>::zeros((p, p));
     let mut d1_raw_psi_psi = Array2::<f64>::zeros((p * d, p));
     let mut d2_raw_psi_psi = Array2::<f64>::zeros((p * d * d, p));
+    // The third-order operator, gated exactly as the forward collocation builder
+    // (`build_matern_collocation_operator_matrices`) gates it, so the derivative
+    // list stays aligned with the forward penalties.
+    let third_order = nu.admits_third_order_operator() && aniso_log_scales.is_none() && d > 0;
     let metric_weights = aniso_log_scales
         .map(centered_aniso_metric_weights)
         .unwrap_or_else(|| vec![1.0; d]);
@@ -1594,6 +1661,88 @@ pub fn build_matern_operator_penalty_psi_derivatives(
     if include_intercept {
         d0.column_mut(kernel_cols).fill(1.0);
     }
+    // Gram of the third-order operator and its ψ-derivatives, accumulated in
+    // closed form (`third_order_gram_pair`) with the product rule applied per
+    // collocation point: S₃' = Σ ⟨E', E⟩ + ⟨E, E'⟩, S₃'' = Σ ⟨E'', E⟩ + 2⟨E', E'⟩
+    // + ⟨E, E''⟩, where each ψ-derivative replaces (t, t') by its own.
+    let third_order_blocks = if third_order {
+        let mut s3 = Array2::<f64>::zeros((p, p));
+        let mut s3_psi = Array2::<f64>::zeros((p, p));
+        let mut s3_psi_psi = Array2::<f64>::zeros((p, p));
+        let mut displacement = Array2::<f64>::zeros((p, d));
+        let mut distance = vec![0.0_f64; p];
+        let zero = ThirdOrderRadial { t: 0.0, t_r: 0.0 };
+        let mut value = vec![zero; p];
+        let mut first = vec![zero; p];
+        let mut second = vec![zero; p];
+        for k in 0..p {
+            for j in 0..p {
+                for c in 0..d {
+                    displacement[[j, c]] = centers[[k, c]] - centers[[j, c]];
+                }
+                let r = stable_euclidean_norm(displacement.row(j).iter().copied());
+                let ((t, t_psi, t_psi_psi), (t_r, t_r_psi, t_r_psi_psi)) =
+                    matern_third_order_psi_scalars(r, length_scale, nu).ok_or_else(|| {
+                        BasisError::InvalidInput(format!(
+                            "Matérn nu={nu:?} admits no third-order operator"
+                        ))
+                    })?;
+                distance[j] = r;
+                value[j] = ThirdOrderRadial { t, t_r };
+                first[j] = ThirdOrderRadial {
+                    t: t_psi,
+                    t_r: t_r_psi,
+                };
+                second[j] = ThirdOrderRadial {
+                    t: t_psi_psi,
+                    t_r: t_r_psi_psi,
+                };
+            }
+            for j in 0..p {
+                for l in j..p {
+                    let u_dot_v: f64 = (0..d)
+                        .map(|c| displacement[[j, c]] * displacement[[l, c]])
+                        .sum();
+                    let pair = |a: ThirdOrderRadial, b: ThirdOrderRadial| {
+                        third_order_gram_pair(a, distance[j], b, distance[l], u_dot_v, d)
+                    };
+                    let entries = [
+                        pair(value[j], value[l]),
+                        pair(first[j], value[l]) + pair(value[j], first[l]),
+                        pair(second[j], value[l])
+                            + 2.0 * pair(first[j], first[l])
+                            + pair(value[j], second[l]),
+                    ];
+                    for (gram, entry) in [&mut s3, &mut s3_psi, &mut s3_psi_psi]
+                        .into_iter()
+                        .zip(entries)
+                    {
+                        gram[[j, l]] += entry;
+                        if l != j {
+                            gram[[l, j]] += entry;
+                        }
+                    }
+                }
+            }
+        }
+        // `project` restricts columns (`M·Z`); applied to `(S·Z)ᵀ` it yields the
+        // congruence `Zᵀ·S·Z` for the symmetric Gram, then the intercept pads.
+        let conjugate = |gram: Array2<f64>| {
+            let right = project(gram);
+            let kernel = project(right.t().to_owned());
+            let mut out = Array2::<f64>::zeros((total_cols, total_cols));
+            out.slice_mut(s![0..kernel_cols, 0..kernel_cols])
+                .assign(&kernel);
+            out
+        };
+        Some(normalize_penaltywith_psi_derivatives(
+            &conjugate(s3),
+            &conjugate(s3_psi),
+            &conjugate(s3_psi_psi),
+        ))
+    } else {
+        None
+    };
 
     // The forward Matérn operator-penalty path
     // (`operator_penalty_candidates_from_collocation`) builds the Mass block
@@ -1626,7 +1775,7 @@ pub fn build_matern_operator_penalty_psi_derivatives(
     // path never built, desyncing the κ-gradient against a mismatched penalty
     // set (gam#902).
     let matern_spec = DuchonOperatorPenaltySpec::matern_for_smoothness(nu, d);
-    let mut candidates = Vec::with_capacity(3);
+    let mut candidates = Vec::with_capacity(4);
     for (spec_gate, source, matrix, normalization_scale) in [
         (&matern_spec.mass, PenaltySource::OperatorMass, s0_norm, c0),
         (
@@ -1656,22 +1805,32 @@ pub fn build_matern_operator_penalty_psi_derivatives(
             op: None,
         });
     }
+    let mut first_blocks = vec![s0_norm_psi, s1_norm_psi, s2_norm_psi];
+    let mut second_blocks = vec![s0_norm_psi_psi, s1_norm_psi_psi, s2_norm_psi_psi];
+    if let Some((s3_norm, s3_norm_psi, s3_norm_psi_psi, c3)) = third_order_blocks {
+        candidates.push(PenaltyCandidate {
+            matrix: ConstructiveQuadratic::try_from_dense_psd(
+                s3_norm,
+                "Matérn third-order operator penalty",
+            )?,
+            source: PenaltySource::OperatorThirdOrder,
+            normalization_scale: c3,
+            kronecker_factors: None,
+            op: None,
+        });
+        first_blocks.push(s3_norm_psi);
+        second_blocks.push(s3_norm_psi_psi);
+    }
     // `active_operator_penalty_derivatives` selects the κ-derivative for each
     // SURVIVING penalty by its `source` kind out of the canonical
-    // `[mass, tension, stiffness]` triple, so a gated-out (or rank-0-dropped)
-    // operator is simply never requested and the returned derivative list stays
-    // index-aligned with the forward penalty list.
+    // `[mass, tension, stiffness]` blocks plus the third-order block, so a
+    // gated-out (or rank-0-dropped) operator is simply never requested and the
+    // returned derivative list stays index-aligned with the forward penalty list.
     let filtered = filter_penalty_candidates(candidates)?;
-    let penalties_derivative = active_operator_penalty_derivatives(
-        &filtered.active,
-        &[s0_norm_psi, s1_norm_psi, s2_norm_psi],
-        "Matérn",
-    )?;
-    let penaltiessecond_derivative = active_operator_penalty_derivatives(
-        &filtered.active,
-        &[s0_norm_psi_psi, s1_norm_psi_psi, s2_norm_psi_psi],
-        "Matérn",
-    )?;
+    let penalties_derivative =
+        active_operator_penalty_derivatives(&filtered.active, &first_blocks, "Matérn")?;
+    let penaltiessecond_derivative =
+        active_operator_penalty_derivatives(&filtered.active, &second_blocks, "Matérn")?;
     Ok((penalties_derivative, penaltiessecond_derivative))
 }
 

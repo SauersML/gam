@@ -158,6 +158,22 @@ impl MaternNu {
             MaternNu::NineHalves => 4.5,
         }
     }
+
+    /// Whether the kernel carries the collocated third-derivative operator
+    /// penalty `Σ_abc (∂³f/∂x_a∂x_b∂x_c)²` ([`PenaltySource::OperatorThirdOrder`]).
+    ///
+    /// The RKHS of a Matérn-ν kernel in `d` dimensions is the Sobolev space
+    /// `H^m`, `m = ν + d/2`, so derivative energies through order `m` belong to
+    /// its norm, and `m ≥ 3` for every ν ≥ 5/2. The collocated third derivatives
+    /// must also exist at a coincident center: `φ(r)` of ν = 3/2 carries an `r³`
+    /// term whose third derivative changes sign across `r = 0` (ν = 1/2 has a
+    /// cusp), while ν ≥ 5/2 is `C⁴` there.
+    pub const fn admits_third_order_operator(self) -> bool {
+        matches!(
+            self,
+            MaternNu::FiveHalves | MaternNu::SevenHalves | MaternNu::NineHalves
+        )
+    }
 }
 
 /// Matérn radial basis and penalties.
@@ -1847,6 +1863,11 @@ pub enum PenaltySource {
     OperatorMass,
     OperatorTension,
     OperatorStiffness,
+    /// Collocated third-derivative energy `Σ_abc (∂³f/∂x_a∂x_b∂x_c)²` of an
+    /// isotropic Matérn smooth whose kernel admits it
+    /// ([`MaternNu::admits_third_order_operator`]): the order-3 term of the
+    /// kernel's Sobolev norm, which mass, tension and stiffness do not control.
+    OperatorThirdOrder,
     /// One per input axis `a` of a multivariate Duchon smooth: the gradient
     /// energy along axis `a`, `Σ(∂f/∂x_a)²`, each with its own REML λ_a. REML
     /// shrinks an axis's contribution toward flat only when it does not earn

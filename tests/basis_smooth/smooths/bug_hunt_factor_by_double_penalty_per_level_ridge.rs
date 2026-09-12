@@ -136,6 +136,7 @@ fn factor_by_double_penalty_ridge_is_per_level_in_constrained_chart() {
                 PenaltySource::OperatorMass
                 | PenaltySource::OperatorTension
                 | PenaltySource::OperatorStiffness
+                | PenaltySource::OperatorThirdOrder
                 | PenaltySource::OperatorRelevance { .. }
                 | PenaltySource::TensorMarginal { .. }
                 | PenaltySource::TensorSeparable { .. }

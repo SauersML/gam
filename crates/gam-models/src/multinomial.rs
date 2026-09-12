@@ -2016,6 +2016,7 @@ fn penalty_component_label(info: Option<&PenaltyBlockInfo>, pen_idx: usize) -> S
         Some(PenaltySource::OperatorMass) => Some("mass".to_string()),
         Some(PenaltySource::OperatorTension) => Some("tension".to_string()),
         Some(PenaltySource::OperatorStiffness) => Some("stiffness".to_string()),
+        Some(PenaltySource::OperatorThirdOrder) => Some("third order".to_string()),
         Some(PenaltySource::OperatorRelevance { axis }) => Some(format!("axis {axis}")),
         Some(PenaltySource::TensorMarginal { dim }) => Some(format!("margin {dim}")),
         Some(PenaltySource::TensorSeparable { penalized_margins }) => {

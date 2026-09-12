@@ -4292,6 +4292,7 @@ impl FittedModel {
                     | PenaltySource::OperatorMass
                     | PenaltySource::OperatorTension
                     | PenaltySource::OperatorStiffness
+                    | PenaltySource::OperatorThirdOrder
                     | PenaltySource::OperatorRelevance { .. }
                     | PenaltySource::TensorMarginal { .. }
                     | PenaltySource::TensorSeparable { .. }

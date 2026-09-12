@@ -384,6 +384,7 @@ pub fn build_duchon_collocation_operator_matriceswithworkspace(
         d0,
         d1,
         d2,
+        third_order_gram: None,
         collocation_points: collocation_points.to_owned(),
         kernel_nullspace_transform: Some(z),
         polynomial_block_cols: poly_cols,

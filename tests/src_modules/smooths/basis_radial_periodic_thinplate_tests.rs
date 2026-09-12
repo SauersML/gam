@@ -5305,7 +5305,8 @@ fn test_matern_operator_penalties_follow_rkhs_smoothness() {
         vec![
             PenaltySource::OperatorMass,
             PenaltySource::OperatorTension,
-            PenaltySource::OperatorStiffness
+            PenaltySource::OperatorStiffness,
+            PenaltySource::OperatorThirdOrder
         ]
     );
 }
