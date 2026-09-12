@@ -1311,5 +1311,26 @@
     ],
     "reason": "user directive: delete all useless slop",
     "evidence": "At d1b00c6b2, git grep -nw found the listed items named only at their definitions, in comments, or by tests and benches that exist to exercise them; the remaining items were reachable only through the listed ones (the tail-cache enable flag was written only by the deleted setter, so it was constant true). The two tests and two benches that only exercised the cache key and setter are deleted with them. MSI verification (ban scanner, workspace --all-targets check, cargo doc -p gam-model-kernels) runs on the landed sha."
+  },
+  {
+    "base": "93c197c950e18823eff94b85451cc0bc25796eca",
+    "items": [
+      "crates/gam-sae/src/identifiability.rs:const:ATOM_TRANSPORT_LADDER_PARALLEL_MIN",
+      "crates/gam-sae/src/identifiability.rs:fn:atom_checkpoint_dynamics",
+      "crates/gam-sae/src/identifiability.rs:fn:atom_transport_ladder_reports",
+      "crates/gam-sae/src/identifiability.rs:fn:canonical_coords_for_transport",
+      "crates/gam-sae/src/identifiability.rs:fn:dictionary_report_with_transport_ladders",
+      "crates/gam-sae/src/identifiability.rs:fn:enumerated_unit_generators",
+      "crates/gam-sae/src/identifiability.rs:fn:fit_atom_transport_ladder_report",
+      "crates/gam-sae/src/identifiability.rs:fn:frame_inner_rotation_dim",
+      "crates/gam-sae/src/identifiability.rs:fn:from_ranks",
+      "crates/gam-sae/src/identifiability.rs:fn:piecewise_linear_eval",
+      "crates/gam-sae/src/identifiability.rs:fn:residual_gauge_exact",
+      "crates/gam-sae/src/identifiability.rs:fn:with_frame_inner_rotation",
+      "crates/gam-sae/src/identifiability.rs:fn:with_inner_fit",
+      "crates/gam-sae/src/identifiability.rs:struct:AtomTransportLadderInput"
+    ],
+    "reason": "user directive: delete all useless slop (only used by tests / unused)",
+    "evidence": "At 93c197c95, git grep -nw over crates, src, tests, examples, bench and benches found no caller of any item: each is named only by its own definition, its own error strings, doc links or prose (one integration-test module doc and two manifold/construction.rs comments). The cascade items were reachable only through deleted ones: atom_transport_ladder_reports, fit_atom_transport_ladder_report, canonical_coords_for_transport, ATOM_TRANSPORT_LADDER_PARALLEL_MIN and AtomTransportLadderInput only through dictionary_report_with_transport_ladders, and FrameInnerRotationGauge::from_ranks with frame_inner_rotation_dim only through with_frame_inner_rotation. DictionaryReport.transport_ladders and AtomTransportLadderReport stay, because the report field names them. No test called any item. MSI verification (ban scanner, workspace --all-targets check, cargo doc -p gam-sae, guard and census) runs on the landed sha."
   }
 ]

@@ -87,8 +87,7 @@ pub use frame_curvature::{
     StreamedLambdaMax, TriangularRootAccumulator, streamed_lambda_max,
 };
 
-use crate::chart_canonicalization::CanonicalChartTopology;
-use crate::inference::layer_transport::{ChartTopology, TransportLadderReport, transport_ladder};
+use crate::inference::layer_transport::TransportLadderReport;
 use crate::inference::riesz::{RieszInput, SmoothFunctional, debias_with_dense_hessian};
 use faer::Side;
 use gam_linalg::faer_ndarray::{
@@ -100,11 +99,6 @@ use gam_math::score_opt::{
 use gam_problem::{MetricProvenance, RowMetric};
 use gam_terms::inference::structure_evidence::{StructureCertificate, StructureLedger};
 use ndarray::{Array1, Array2, Array3, Array4, ArrayView1, ArrayView2, s};
-use std::f64::consts::TAU;
-
-// At two or more independent ladders, each fit is pure and order-independent; fan
-// them out unless this call is already running inside a rayon worker.
-const ATOM_TRANSPORT_LADDER_PARALLEL_MIN: usize = 2;
 
 /// Smoothed column-2-norm of the decoder Jacobian.
 ///
@@ -359,40 +353,6 @@ pub fn derive_ivae_aux_scale(
             let z = (aux[[row, col]] - mean) / safe_std;
             let log_sigma = log_amplitude * (freq * z).tanh();
             out[[row, col]] = log_sigma.exp();
-        }
-    }
-    out
-}
-
-/// Helper: evaluate a piecewise-linear "smooth" `f(u)` columnwise, given a
-/// (k_centres, latent_dim) coefficient table and a (n_rows,) auxiliary vector
-/// `u`. Used by the Python wrapper to back the iVAE per-latent (μ_i(u), σ_i(u))
-/// without having to round-trip through gam's full Smooth machinery for the
-/// minimal experiments. Centres are assumed evenly spaced in [u_min, u_max].
-pub fn piecewise_linear_eval(
-    u: ArrayView1<f64>,
-    coeffs: ArrayView2<f64>,
-    u_min: f64,
-    u_max: f64,
-) -> Array2<f64> {
-    let (k, d) = coeffs.dim();
-    assert!(k >= 2, "piecewise_linear_eval: need ≥2 centres");
-    let n = u.len();
-    let mut out = Array2::<f64>::zeros((n, d));
-    let step = (u_max - u_min) / (k - 1) as f64;
-    for (row, &val) in u.iter().enumerate() {
-        // Clamp `pos` to the exact endpoint `(k-1)`, not `(k-1) - 1e-12`,
-        // so `val = u_max` evaluates to exactly `coeffs[k-1, col]` instead
-        // of `coeffs[k-1, col] + 1e-12 · (coeffs[k-2, col] − coeffs[k-1,
-        // col])`. The historical `1e-12` shift was there to keep `lo + 1`
-        // in range, but capping `lo` at `k − 2` achieves the same
-        // structural guarantee without perturbing the endpoint value.
-        let pos = ((val - u_min) / step).clamp(0.0, (k - 1) as f64);
-        let lo = (pos.floor() as usize).min(k - 2);
-        let hi = lo + 1;
-        let frac = pos - lo as f64;
-        for col in 0..d {
-            out[[row, col]] = coeffs[[lo, col]] * (1.0 - frac) + coeffs[[hi, col]] * frac;
         }
     }
     out
@@ -1123,9 +1083,9 @@ pub struct FittedAtom {
     ///
     /// The certificate path that builds `FittedSaeManifold` does so *without* a
     /// fit harness in scope, so it leaves this `None`; callers that own the
-    /// fitted term attach it through `FittedAtom::with_inner_fit` (the term
-    /// builder fills it from the live per-atom basis, decoder, assignment mass,
-    /// and smoothness Gram). When `None`, both reports below are `None`: the
+    /// fitted term set it directly (the term builder fills it from the live
+    /// per-atom basis, decoder, assignment mass, and smoothness Gram). When
+    /// `None`, both reports below are `None`: the
     /// genuine prerequisite — the post-fit inner-smooth design, penalized
     /// Hessian, and row scores — is simply not present on a bare
     /// certificate-only `FittedSaeManifold`.
@@ -1174,16 +1134,6 @@ pub struct AtomInnerFit {
     pub peak_design_row: Array1<f64>,
     /// Design row at the latent mode `t_mode` (largest assignment mass).
     pub mode_design_row: Array1<f64>,
-}
-
-impl FittedAtom {
-    /// Attach the inner-decoder-smooth byproducts harvested at fit time. The
-    /// term builder calls this so [`dictionary_report`] can produce the three
-    /// post-PIRLS atom inference reports.
-    pub fn with_inner_fit(mut self, inner_fit: AtomInnerFit) -> Self {
-        self.inner_fit = Some(inner_fit);
-        self
-    }
 }
 
 /// Descriptive penalty-debiased POINT summaries of one fitted atom's decoder
@@ -1529,27 +1479,6 @@ pub struct FrameInnerRotationGauge {
     pub dim: usize,
 }
 
-impl FrameInnerRotationGauge {
-    /// Enumerate the gauge from the active frame ranks.
-    pub fn from_ranks(per_atom_ranks: Vec<usize>) -> Self {
-        let dim = frame_inner_rotation_dim(&per_atom_ranks);
-        Self {
-            per_atom_ranks,
-            dim,
-        }
-    }
-}
-
-/// `Σ_k r_k (r_k − 1) / 2` — the dimension of the #972 inner-rotation gauge
-/// group `∏_k O(r_k)` over the active frame ranks. Rank-1 frames contribute
-/// `0` (`O(1)` is finite, a sign — absorbed by the orientation gauge), so a
-/// dictionary of single-direction atoms reports a zero-dimensional inner
-/// gauge, matching the intuition that one direction has no inner rotation to
-/// fix.
-pub fn frame_inner_rotation_dim(ranks: &[usize]) -> usize {
-    ranks.iter().map(|&r| r * r.saturating_sub(1) / 2).sum()
-}
-
 /// What the certificate's reported `pinning_rank` is a rank OF — a property of
 /// the MEASUREMENT, declared rather than inferred (#2757).
 ///
@@ -1628,9 +1557,8 @@ pub struct ResidualGaugeReport {
     pub sym_f_trivial_under_output_fisher: Option<bool>,
     /// The #972 decoder-frame inner-rotation gauge `∏_k O(r_k)` — enumerated,
     /// never curvature-tested (see [`FrameInnerRotationGauge`] for why).
-    /// `None` when the caller declared no frame factorization (full-`B`
-    /// dictionaries, or a pre-#972 caller using `residual_gauge` directly);
-    /// attach via `ResidualGaugeReport::with_frame_inner_rotation`.
+    /// `None` when no frame factorization was declared (full-`B` dictionaries,
+    /// or a pre-#972 caller using `residual_gauge` directly).
     pub frame_inner_rotation: Option<FrameInnerRotationGauge>,
     /// Human-readable one-line summary.
     pub summary: String,
@@ -1655,23 +1583,6 @@ impl ResidualGaugeReport {
             ),
             _ => base,
         }
-    }
-
-    /// Attach the #972 frame inner-rotation enumeration to the certificate
-    /// (consumed by frame-factored dictionaries; `ranks` are the active frame
-    /// ranks `r_k`, one per factored atom). Extends the summary so the
-    /// one-line report names the enumerated-but-convention-fixed gauge.
-    pub fn with_frame_inner_rotation(mut self, ranks: Vec<usize>) -> Self {
-        let gauge = FrameInnerRotationGauge::from_ranks(ranks);
-        if gauge.dim > 0 {
-            self.summary.push_str(&format!(
-                "; frame inner-rotation gauge ∏O(r_k) of dim {} enumerated \
-                 (exact reparameterization, fixed by the canonical orientation gauge)",
-                gauge.dim
-            ));
-        }
-        self.frame_inner_rotation = Some(gauge);
-        self
     }
 }
 
@@ -3364,34 +3275,6 @@ fn measure_streamed(
     })
 }
 
-/// The #998 full-resolution certificate: within-atom gauge families are
-/// realised as **exact orbits** in the model's own (decoder, coordinate)
-/// parameter space for every atom that supplies an [`AtomParameterView`],
-/// while cross-atom families (output-frame rotations, atom permutations) and
-/// any unviewed atom (e.g. spheres, whose chart action is nonlinear) keep the
-/// frame-space path with its #995 lowering-error calibration.
-///
-/// For a viewed atom the compensated orbit is a data-null **by construction**
-/// when the basis family is closed under the group action — the verdict
-/// carries no calibration (`lowering_error_scale = 0`), the compensation
-/// residual is the computed closure, and all pinning of true model-class
-/// symmetries flows through the per-atom [`OrbitPenaltyOperator`] channel
-/// (the isometry pin / ARD prior — rungs 2 and 4 of the #981 ladder).
-///
-/// `views` and `penalty_ops` are aligned with `model.atoms`; a `None` view
-/// keeps that atom entirely on the frame path. Supplying a view for an atom
-/// whose pin is active without also supplying its penalty operator would
-/// over-claim freedom, so callers must pass the operator (or no view) for
-/// pinned atoms.
-pub fn residual_gauge_exact(
-    model: &FittedSaeManifold,
-    views: &[Option<AtomParameterView>],
-    penalty_ops: &[Option<OrbitPenaltyOperator>],
-) -> Result<ResidualGaugeReport, String> {
-    let exact = residual_gauge_exact_inputs(model, views, penalty_ops)?;
-    residual_gauge_inner(model, Some(exact), CurvatureAccess::FromModel)
-}
-
 /// Exact-orbit residual-gauge certificate with a pre-reduced streamed
 /// curvature `H = RᵀR`.
 ///
@@ -3550,31 +3433,6 @@ fn enumerate_generators(
     }
 
     gens
-}
-
-/// The unit directions [`residual_gauge`] would test, in the order it tests
-/// them, for the model and exact-orbit split a caller is about to certify with.
-///
-/// `views` is the same slice handed to [`residual_gauge_exact`]: an atom with a
-/// view has its within-atom families realised as exact orbits (#998) and is
-/// therefore absent from this list, exactly as it is absent from the
-/// curvature-tested block of the report.
-///
-/// The alignment is positional and it is the whole reason this is public: the
-/// report's first `len()` verdicts are the verdicts on these directions, in this
-/// order, so a caller that wants to re-derive a measured energy — or check one
-/// against its own construction of `Rξ̂` — can do it without re-implementing the
-/// enumeration and hoping the two agree. `None` marks a structurally trivial
-/// generator, which carries no direction and is vetoed rather than measured.
-pub fn enumerated_unit_generators(
-    model: &FittedSaeManifold,
-    views: &[Option<AtomParameterView>],
-) -> Vec<Option<Array1<f64>>> {
-    let mask: Vec<bool> = views.iter().map(|view| view.is_some()).collect();
-    enumerate_generators(model, Some(&mask))
-        .into_iter()
-        .map(|generator| generator.unit)
-        .collect()
 }
 
 fn residual_gauge_inner(
@@ -3859,10 +3717,9 @@ fn residual_gauge_inner(
         residual_gauge_dim,
         diffeomorphism_unpinned,
         sym_f_trivial_under_output_fisher,
-        // The #972 inner-rotation gauge is declared by the caller (it lives in
-        // the (U_k, C_k) parameterization, not in the latent-frame coordinates
-        // this certificate's generators are tangent to); frame-factored
-        // dictionaries attach it via `with_frame_inner_rotation`.
+        // The #972 inner-rotation gauge lives in the (U_k, C_k) parameterization,
+        // not in the latent-frame coordinates this certificate's generators are
+        // tangent to, so this certificate does not enumerate it.
         frame_inner_rotation: None,
         summary,
     })
@@ -3900,12 +3757,9 @@ pub struct DictionaryReport {
     /// What the data established
     /// ([`gam_terms::inference::structure_evidence::StructureLedger::certify`]).
     pub structure: StructureCertificate,
-    /// Per-atom inter-layer transport ladders (#1096). Empty when the caller
-    /// has not supplied at least one atom's canonical coordinates across two or
-    /// more layers. These reports are computed in the transport module's chart
-    /// convention: circle coordinates are radians on `[0, 2π)`, while SAE
-    /// canonical circle charts may use an arbitrary period and are rescaled by
-    /// `dictionary_report_with_transport_ladders` before fitting.
+    /// Per-atom inter-layer transport ladders (#1096). No entry point fills this
+    /// field, so it is empty. A report here is in the transport module's chart
+    /// convention: circle coordinates are radians on `[0, 2π)`.
     pub transport_ladders: Vec<AtomTransportLadderReport>,
     /// Per-atom post-PIRLS inference reports (#1097 penalty-debiased functional
     /// POINT summaries, #1103 split-LRT smooth-structure e-value), one entry
@@ -3921,25 +3775,6 @@ pub struct DictionaryReport {
     /// built by the residual-gauge path with no fit harness — leaves every
     /// `inner_fit` `None`, so both fields are `None`).
     pub atom_inference: Vec<AtomInferenceReport>,
-}
-
-/// Canonical per-layer coordinates for one atom, ready for the #1096 transport
-/// ladder integration.
-///
-/// The caller owns extraction from the SAE fit: `layers[i]`, `coords[i]`, and
-/// `topologies[i]` describe the same atom at the same layer. This type keeps
-/// that extraction outside `dictionary_report` so the core certificate can be
-/// wired without reaching into `SaeManifoldTerm`.
-#[derive(Debug, Clone)]
-pub struct AtomTransportLadderInput {
-    /// Index into [`FittedSaeManifold::atoms`].
-    pub atom_index: usize,
-    /// Layer labels in ladder order.
-    pub layers: Vec<usize>,
-    /// One canonical coordinate vector per layer, all over the same rows.
-    pub coords: Vec<Array1<f64>>,
-    /// One canonical chart topology per layer.
-    pub topologies: Vec<CanonicalChartTopology>,
 }
 
 /// One atom's fitted inter-layer transport ladder.
@@ -4215,180 +4050,6 @@ pub fn dictionary_report(
         transport_ladders: Vec::new(),
         atom_inference: atom_inference_reports(model),
     })
-}
-
-// --- #1100: closed-loop probe runner FFI ---------------------------------
-// Top-level entry points exposing the steering→structure-evidence probe loop
-// (`crate::inference::probe_runner::ProbeRunner`) beside `dictionary_report`, so
-// the Python driver can design and absorb interventional probes against the same
-// fitted term and evidence ledger the certificate is built from.
-
-/// Produce the paired certificate plus #1096 per-atom layer-transport ladders.
-///
-/// This is the strict wiring seam for callers that already have canonical
-/// per-layer atom coordinates. It validates atom indices, topology/coordinate
-/// lengths, finite coordinates, and the circle-period convention before calling
-/// [`transport_ladder`]. Single-layer inputs are refused: no transport estimand
-/// exists without at least one adjacent layer pair.
-pub fn dictionary_report_with_transport_ladders(
-    model: &FittedSaeManifold,
-    ledger: &StructureLedger,
-    alpha: f64,
-    ladders: &[AtomTransportLadderInput],
-) -> Result<DictionaryReport, String> {
-    let mut report = dictionary_report(model, ledger, alpha)?;
-    report.transport_ladders = atom_transport_ladder_reports(model, ladders)?;
-    Ok(report)
-}
-
-/// Fit #1096 transport ladders for the supplied atom/layer coordinate blocks.
-pub fn atom_transport_ladder_reports(
-    model: &FittedSaeManifold,
-    ladders: &[AtomTransportLadderInput],
-) -> Result<Vec<AtomTransportLadderReport>, String> {
-    if ladders.len() >= ATOM_TRANSPORT_LADDER_PARALLEL_MIN
-        && rayon::current_thread_index().is_none()
-    {
-        use rayon::prelude::*;
-
-        let fitted: Vec<Result<AtomTransportLadderReport, String>> = ladders
-            .par_iter()
-            .map(|input| fit_atom_transport_ladder_report(model, input))
-            .collect();
-        fitted.into_iter().collect()
-    } else {
-        ladders
-            .iter()
-            .map(|input| fit_atom_transport_ladder_report(model, input))
-            .collect()
-    }
-}
-
-fn fit_atom_transport_ladder_report(
-    model: &FittedSaeManifold,
-    input: &AtomTransportLadderInput,
-) -> Result<AtomTransportLadderReport, String> {
-    let atom = model.atoms.get(input.atom_index).ok_or_else(|| {
-        format!(
-            "atom transport ladder index {} out of range for {} fitted atoms",
-            input.atom_index,
-            model.atoms.len()
-        )
-    })?;
-    let depth = input.layers.len();
-    if depth < 2 {
-        return Err(format!(
-            "atom transport ladder for atom {} ('{}') needs at least two layers, got {depth}",
-            input.atom_index, atom.name
-        ));
-    }
-    if input.coords.len() != depth || input.topologies.len() != depth {
-        return Err(format!(
-            "atom transport ladder for atom {} ('{}') has {} layers, {} coordinate blocks, {} topologies",
-            input.atom_index,
-            atom.name,
-            depth,
-            input.coords.len(),
-            input.topologies.len()
-        ));
-    }
-
-    let mut coords = Vec::with_capacity(depth);
-    let mut topologies = Vec::with_capacity(depth);
-    for (layer_pos, (coord, topology)) in
-        input.coords.iter().zip(input.topologies.iter()).enumerate()
-    {
-        coords.push(canonical_coords_for_transport(
-            coord,
-            topology,
-            input.atom_index,
-            &atom.name,
-            input.layers[layer_pos],
-        )?);
-        topologies.push(ChartTopology::from(topology));
-    }
-
-    let report = transport_ladder(&input.layers, &coords, &topologies).map_err(|e| {
-        format!(
-            "atom transport ladder for atom {} ('{}') failed: {e}",
-            input.atom_index, atom.name
-        )
-    })?;
-    Ok(AtomTransportLadderReport {
-        atom_index: input.atom_index,
-        atom_name: atom.name.clone(),
-        report,
-    })
-}
-
-fn canonical_coords_for_transport(
-    coords: &Array1<f64>,
-    topology: &CanonicalChartTopology,
-    atom_index: usize,
-    atom_name: &str,
-    layer: usize,
-) -> Result<Array1<f64>, String> {
-    if coords.iter().any(|v| !v.is_finite()) {
-        return Err(format!(
-            "atom transport ladder for atom {atom_index} ('{atom_name}') layer {layer} has non-finite coordinates"
-        ));
-    }
-    match topology {
-        CanonicalChartTopology::Circle { period } => {
-            if !(period.is_finite() && *period > 0.0) {
-                return Err(format!(
-                    "atom transport ladder for atom {atom_index} ('{atom_name}') layer {layer} has invalid circle period {period}"
-                ));
-            }
-            Ok(coords.mapv(|t| (t / *period) * TAU))
-        }
-        CanonicalChartTopology::Interval => Ok(coords.clone()),
-    }
-}
-
-// ----------------------------------------------------------------------------
-// #1102 cross-checkpoint atom-dynamics FFI entry (new top-level block).
-// ----------------------------------------------------------------------------
-
-/// Run #1102 cross-checkpoint Riesz-debiased atom-trajectory dynamics for the
-/// fitted dictionary's atoms.
-///
-/// `decoder_grid` is `[n_checkpoints, n_atoms, n_grid, ambient_dim]` and
-/// `atom_names`/`checkpoint_ids`/`latent_grid` label its axes; see
-/// [`crate::inference::checkpoint_dynamics`] for the estimator and the honest
-/// accounting of which Riesz inputs the bare grid supports. This entry binds
-/// the atom axis to the fitted model: `atom_names` must name exactly the
-/// model's atoms in order, so trajectories are reported against real atoms.
-pub fn atom_checkpoint_dynamics(
-    model: &FittedSaeManifold,
-    decoder_grid: ndarray::ArrayView4<'_, f64>,
-    checkpoint_ids: &[String],
-    atom_names: &[String],
-    latent_grid: ArrayView1<'_, f64>,
-) -> Result<Vec<crate::inference::checkpoint_dynamics::AtomTrajectory>, String> {
-    if atom_names.len() != model.atoms.len() {
-        return Err(format!(
-            "atom_checkpoint_dynamics: {} atom names supplied for {} fitted atoms",
-            atom_names.len(),
-            model.atoms.len()
-        ));
-    }
-    for (idx, (supplied, fitted)) in atom_names.iter().zip(model.atoms.iter()).enumerate() {
-        if supplied != &fitted.name {
-            return Err(format!(
-                "atom_checkpoint_dynamics: atom {idx} name '{supplied}' does not match fitted atom '{}'",
-                fitted.name
-            ));
-        }
-    }
-    crate::inference::checkpoint_dynamics::checkpoint_atom_dynamics(
-        &crate::inference::checkpoint_dynamics::CheckpointDynamicsInput {
-            decoder_grid,
-            checkpoint_ids,
-            atom_names,
-            latent_grid,
-        },
-    )
 }
 
 #[cfg(test)]
