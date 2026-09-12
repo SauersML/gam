@@ -91,8 +91,7 @@
 //! `eᵀ G e ≈ Σᵢ (vᵢᵀ e)² = ‖U_nᵀ e‖²` is exactly what
 //! [`RowMetric::quad_form`] / [`RowMetric::whiten_residual_row`] already
 //! compute — zero train-time model cost, `O(p·s)` per row. See
-//! [`RowMetric::behavioral_fisher`] and the probe-packing helper
-//! [`pack_probe_factors`].
+//! [`RowMetric::behavioral_fisher`].
 
 use ndarray::{Array2, Array3, ArrayView1};
 use std::sync::Arc;
@@ -392,8 +391,8 @@ impl RowMetric {
     /// as `½ eᵀ G_n e`. Validated through [`normalize_fisher_rao_blocks`] like
     /// every factored metric; no solver floor (`δ = 0`).
     ///
-    /// See [`pack_probe_factors`] to build `u` from a natural `(n, p, s)` probe
-    /// stack emitted at harvest time.
+    /// A natural `(n, p, s)` probe stack emitted at harvest time packs into this
+    /// layout as `u[n, i * probes + k] = probes[n, i, k]`.
     pub fn behavioral_fisher(u: Arc<Array2<f64>>, p: usize, probes: usize) -> Result<Self, String> {
         Self::from_factors(
             MetricProvenance::BehavioralFisher { probes },
@@ -880,39 +879,6 @@ impl RowMetric {
     }
 }
 
-/// Pack a harvest-emitted probe stack into the row-major factor layout
-/// [`RowMetric::behavioral_fisher`] expects.
-///
-/// The harvest boundary (the model-interaction side) emits, per token, `s`
-/// probe vectors `vₖ = J_nᵀ F_n^{1/2} uₖ ∈ ℝ^p` — the natural shape is
-/// `probes[n, i, k] = (vₖ)ᵢ`, an `(n_rows, p, probes)` stack. This assembles the
-/// `(n_rows, p · probes)` row-major matrix `u[n, i·probes + k] = probes[n, i, k]`
-/// that the constructor consumes so that column `k` of the per-row factor `U_n`
-/// is exactly probe `vₖ` and `M_n = U_n U_nᵀ = Σₖ vₖ vₖᵀ ≈ G_n`.
-///
-/// This is a pure repack of the standard C-order flattening; it exists so the
-/// harvest → metric seam is a single named, validated Rust surface rather than
-/// an ad-hoc reshape at each call site. Errors on non-finite entries so the
-/// failure is caught here rather than deep in [`normalize_fisher_rao_blocks`].
-pub fn pack_probe_factors(probes: ndarray::ArrayView3<'_, f64>) -> Result<Array2<f64>, String> {
-    let (n_rows, p, s) = probes.dim();
-    if s == 0 {
-        return Err("pack_probe_factors: need at least one probe (s == 0)".to_string());
-    }
-    if !probes.iter().all(|v| v.is_finite()) {
-        return Err("pack_probe_factors: probe entries must be finite".to_string());
-    }
-    let mut u = Array2::<f64>::zeros((n_rows, p * s));
-    for n in 0..n_rows {
-        for i in 0..p {
-            for k in 0..s {
-                u[[n, i * s + k]] = probes[[n, i, k]];
-            }
-        }
-    }
-    Ok(u)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1032,32 +998,6 @@ mod tests {
         assert!((bf.quad_form(0, e.view()) - euc.quad_form(0, e.view())).abs() < 1e-14);
         // and whitened residual is the residual itself (identity whitening)
         assert_eq!(bf.whiten_residual_row(0, e.view()), vec![1.5, -2.0, 0.25]);
-    }
-
-    #[test]
-    fn pack_probe_factors_matches_manual_layout() {
-        use ndarray::Array3;
-        // n=1, p=2, s=2: probes[0,i,k] = v_k[i]; v0=(1,3), v1=(2,4)
-        let mut probes = Array3::<f64>::zeros((1, 2, 2));
-        probes[[0, 0, 0]] = 1.0; // v0[0]
-        probes[[0, 1, 0]] = 3.0; // v0[1]
-        probes[[0, 0, 1]] = 2.0; // v1[0]
-        probes[[0, 1, 1]] = 4.0; // v1[1]
-        let u = pack_probe_factors(probes.view()).unwrap();
-        // Layout U[i,k] = u[i*s + k]: [v0[0],v1[0], v0[1],v1[1]] = [1,2,3,4]
-        assert_eq!(u.as_slice().unwrap(), &[1.0, 2.0, 3.0, 4.0]);
-        // Round-trips into a valid metric whose G = v0 v0ᵀ + v1 v1ᵀ.
-        let m = RowMetric::behavioral_fisher(Arc::new(u), 2, 2).unwrap();
-        // e=(1,0): eᵀGe = v0[0]²+v1[0]² = 1+4 = 5.
-        let e = array![1.0_f64, 0.0];
-        assert!((m.quad_form(0, e.view()) - 5.0).abs() < 1e-12);
-    }
-
-    #[test]
-    fn pack_probe_factors_rejects_zero_probes() {
-        use ndarray::Array3;
-        let probes = Array3::<f64>::zeros((2, 3, 0));
-        assert!(pack_probe_factors(probes.view()).is_err());
     }
 
     #[test]

@@ -1,1 +1,1 @@
-pub use gam_problem::{FisherRaoDefiniteness, normalize_fisher_rao_blocks};
+pub use gam_problem::normalize_fisher_rao_blocks;

@@ -566,13 +566,6 @@ impl CalibrationRng {
 // conformal / model-comparison / ρ-posterior results).
 // ---------------------------------------------------------------------------
 
-/// Type-I error rates the test-size audit sweeps, matching the issue's
-/// `α ∈ {0.01, 0.05, 0.1}`. A test surface is anti-conservative when its
-/// empirical size at `α` exceeds `α` beyond MC error — audited as coverage of
-/// the *non-rejection* event at nominal `1 − α`, so the shared Wilson verdict
-/// applies unchanged (an over-sized test under-covers non-rejection).
-pub const TEST_SIZE_ALPHAS: [f64; 3] = [0.01, 0.05, 0.10];
-
 /// The statistical kind of an uncertainty surface. Selects the audit mode and
 /// documents the object under test.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -604,7 +597,7 @@ pub enum AuditMode {
     /// Empirical coverage vs nominal at [`COVERAGE_NOMINAL_LEVELS`]
     /// (`run_coverage` + `audit_coverage`); anti-conservative gates.
     CoverageSweep,
-    /// Type-I size curve at [`TEST_SIZE_ALPHAS`] under a simulated null; an
+    /// Type-I size curve at `α ∈ {0.01, 0.05, 0.10}` under a simulated null; an
     /// empirical size above `α` beyond MC error gates.
     TestSizeCurve,
     /// SBC rank-uniformity histogram (`run_sbc` + `audit_sbc_uniformity`).

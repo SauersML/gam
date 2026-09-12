@@ -9,51 +9,23 @@
 //! `rᵀ W r`, which must be non-negative for every residual `r`; that holds iff
 //! each block is PSD (all eigenvalues `≥ 0`). Symmetry plus a non-negative
 //! diagonal is **not** sufficient — e.g. `[[1, 2], [2, 1]]` is symmetric with a
-//! non-negative diagonal yet `z = (1, −1)` gives `zᵀ W z = −2 < 0`. The
-//! Cholesky-whitening REML consumer needs the stronger positive-definite
-//! condition (all eigenvalues `> 0`), exposed via
-//! [`normalize_fisher_rao_blocks_pd`]. Single source of truth shared by the
-//! `response_geometry_normalize_fisher_rao` FFI shim and any core consumer.
+//! non-negative diagonal yet `z = (1, −1)` gives `zᵀ W z = −2 < 0`. Single
+//! source of truth shared by the `response_geometry_normalize_fisher_rao` FFI
+//! shim and any core consumer.
 
 use faer::Side;
 use gam_linalg::faer_ndarray::FaerEigh;
 use ndarray::{Array2, Array3, ArrayViewD, IxDyn};
 
-/// Required definiteness of each per-row Fisher–Rao precision block.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum FisherRaoDefiniteness {
-    /// Metric / semi-metric use: `rᵀ W r ≥ 0` for all `r`. Rank-deficient
-    /// (singular) blocks are accepted; only indefinite blocks are rejected.
-    PositiveSemidefinite,
-    /// Cholesky-whitening use: the factorization `L Lᵀ = W` needs strict
-    /// positive-definiteness, so a zero eigenvalue is rejected too.
-    PositiveDefinite,
-}
-
 /// Broadcast and validate a Fisher–Rao weight array into `(n_rows, dim, dim)`
 /// **positive-semidefinite** precision blocks (the general metric API). Accepts
 /// a 1-D `(n_rows,)` isotropic scale, a 2-D `(dim, dim)` shared matrix, or a 3-D
 /// `(n_rows, dim, dim)` stack. Rank-deficient (PSD-singular) blocks are
-/// accepted; indefinite blocks are rejected. Use
-/// [`normalize_fisher_rao_blocks_pd`] for the Cholesky-whitening path.
+/// accepted; indefinite blocks are rejected.
 pub fn normalize_fisher_rao_blocks(
     arr: ArrayViewD<'_, f64>,
     n_rows: usize,
     dim: usize,
-) -> Result<Array3<f64>, String> {
-    normalize_fisher_rao_blocks_with(
-        arr,
-        n_rows,
-        dim,
-        FisherRaoDefiniteness::PositiveSemidefinite,
-    )
-}
-
-fn normalize_fisher_rao_blocks_with(
-    arr: ArrayViewD<'_, f64>,
-    n_rows: usize,
-    dim: usize,
-    definiteness: FisherRaoDefiniteness,
 ) -> Result<Array3<f64>, String> {
     if !arr.iter().all(|v| v.is_finite()) {
         return Err("fisher_rao_w must contain only finite values".to_string());
@@ -125,22 +97,17 @@ fn normalize_fisher_rao_blocks_with(
                 return Err("fisher_rao_w diagonal entries must be non-negative".to_string());
             }
         }
-        validate_block_definiteness(out.index_axis(ndarray::Axis(0), row), row, definiteness)?;
+        validate_block_psd(out.index_axis(ndarray::Axis(0), row), row)?;
     }
     Ok(out)
 }
 
-/// Validate that a single symmetric `(dim, dim)` precision block has the
-/// required definiteness by checking its eigenvalue spectrum. A precision
-/// metric must be PSD so that the induced squared residual `rᵀ W r` is never
-/// negative; the Cholesky-whitening path additionally needs PD. The threshold
+/// Validate that a single symmetric `(dim, dim)` precision block is positive
+/// semidefinite by checking its eigenvalue spectrum, so that the induced squared
+/// residual `rᵀ W r` is never negative. The threshold
 /// is relative to the block's spectral scale (its largest eigenvalue magnitude)
 /// so that the check is invariant to the units of the metric.
-fn validate_block_definiteness(
-    block: ndarray::ArrayView2<'_, f64>,
-    row: usize,
-    definiteness: FisherRaoDefiniteness,
-) -> Result<(), String> {
+fn validate_block_psd(block: ndarray::ArrayView2<'_, f64>, row: usize) -> Result<(), String> {
     if block.nrows() == 0 {
         return Ok(());
     }
@@ -164,39 +131,14 @@ fn validate_block_definiteness(
     // eigenvalue is no more negative than this fraction of its spectral scale,
     // absorbing the rounding of the symmetric eigensolve.
     let tol = 1.0e-10 * spectral_scale;
-    match definiteness {
-        FisherRaoDefiniteness::PositiveSemidefinite => {
-            if min_eigenvalue < -tol {
-                return Err(format!(
-                    "fisher_rao_w row {row} must be positive semidefinite (a precision metric \
-                     induces the squared residual rᵀ W r ≥ 0); smallest eigenvalue {min_eigenvalue} \
-                     is negative"
-                ));
-            }
-        }
-        FisherRaoDefiniteness::PositiveDefinite => {
-            if min_eigenvalue <= tol {
-                return Err(format!(
-                    "fisher_rao_w row {row} must be positive definite for Cholesky whitening; \
-                     smallest eigenvalue {min_eigenvalue} is not strictly positive"
-                ));
-            }
-        }
+    if min_eigenvalue < -tol {
+        return Err(format!(
+            "fisher_rao_w row {row} must be positive semidefinite (a precision metric \
+             induces the squared residual rᵀ W r ≥ 0); smallest eigenvalue {min_eigenvalue} \
+             is negative"
+        ));
     }
     Ok(())
-}
-
-/// Broadcast and validate Fisher–Rao weight blocks requiring each block to be
-/// **positive-definite**, as the Cholesky-whitening REML path needs (a singular
-/// block has no `L Lᵀ = W` factor). Same broadcasting rules as
-/// [`normalize_fisher_rao_blocks`]; the difference is the per-block spectrum
-/// must be strictly positive rather than merely non-negative.
-pub fn normalize_fisher_rao_blocks_pd(
-    arr: ArrayViewD<'_, f64>,
-    n_rows: usize,
-    dim: usize,
-) -> Result<Array3<f64>, String> {
-    normalize_fisher_rao_blocks_with(arr, n_rows, dim, FisherRaoDefiniteness::PositiveDefinite)
 }
 
 #[cfg(test)]
@@ -245,27 +187,12 @@ mod tests {
     }
 
     #[test]
-    fn pd_block_passes_the_cholesky_path() {
-        // Eigenvalues {1, 3}, both strictly positive: valid for Cholesky whitening.
-        let block = block_2x2([[2.0, 1.0], [1.0, 2.0]]);
-        normalize_fisher_rao_blocks_pd(block.view().into_dyn(), 2, 2)
-            .expect("a positive-definite block must pass the Cholesky (PD) path");
-    }
-
-    #[test]
-    fn psd_singular_block_passes_metric_api_but_is_rejected_on_cholesky_path() {
+    fn psd_singular_block_passes_metric_api() {
         // [[1, 1], [1, 1]] has eigenvalues {0, 2}: PSD but singular. The metric
-        // API must accept it (rᵀ W r ≥ 0), while the Cholesky-whitening path
-        // requires strict positive-definiteness and must reject it.
+        // API must accept it (rᵀ W r ≥ 0).
         let block = block_2x2([[1.0, 1.0], [1.0, 1.0]]);
         normalize_fisher_rao_blocks(block.view().into_dyn(), 2, 2)
             .expect("a PSD-singular block must be accepted by the metric API");
-        let err = normalize_fisher_rao_blocks_pd(block.view().into_dyn(), 2, 2)
-            .expect_err("a singular block has no Cholesky factor and must be rejected");
-        assert!(
-            err.contains("positive definite"),
-            "unexpected error message: {err}"
-        );
     }
 
     #[test]

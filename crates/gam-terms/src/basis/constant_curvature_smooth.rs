@@ -91,8 +91,8 @@
 //!   ψ-fixed transforms: `∂X/∂ψ_a = (∂K_dc/∂ψ_a)·z` and
 //!   `∂S/∂ψ_a = symm(zᵀ(∂K_cc/∂ψ_a)z)`, with no normalization quotient to
 //!   propagate (the RKHS penalty ships raw, `normalization_scale = 1`).
-//! - **Available but not yet consumed:** `log_map_kappa_jet` /
-//!   `exp_map_kappa_jet` cover future geodesic/normal-coordinate basis
+//! - **Available but not yet consumed:** `log_map_kappa_jet` covers future
+//!   geodesic/normal-coordinate basis
 //!   variants (e.g. tangent-space designs); the distance jet is the only one
 //!   this kernel construction needs.
 

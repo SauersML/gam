@@ -90,9 +90,9 @@ pub struct BinomialMultiFitInputs<'a> {
     pub penalty: ArrayView2<'a, f64>,
     /// Per-response smoothing parameter `λ_a` (length `K`).
     pub lambdas: ArrayView1<'a, f64>,
-    /// Structural cell activity and numerical likelihood weights. These are
-    /// deliberately distinct: a not-at-risk/missing cell is absent, whereas a
-    /// present cell may legitimately carry numerical weight zero.
+    /// Per-row numerical likelihood weights, shared across the response
+    /// columns. A row may carry weight zero, which removes its likelihood
+    /// contribution.
     pub measure: SeparableCellMeasure<'a>,
     /// Optional per-row Fisher-block override, shape `(N, K, K)`. The `K`
     /// binomial columns are fit independently, so only the per-column diagonal
@@ -115,8 +115,7 @@ pub struct BinomialMultiFitOutputs {
     /// Coefficient matrix, shape `(P, K)` (column `a` is `β_a`).
     pub coefficients: Array2<f64>,
     /// Fitted probabilities `μ_{n,a} = g⁻¹((X β_a)_n + offset_{n,a})`,
-    /// shape `(N, K)`. Values are returned for every requested prediction cell;
-    /// structural activity controls fitting, not whether a predictor is defined.
+    /// shape `(N, K)`.
     pub fitted_probabilities: Array2<f64>,
     /// Number of joint Newton iterations executed (including the final step
     /// that satisfied the tolerance). The `K` columns share the design and
@@ -144,15 +143,8 @@ struct BinomialMultiLikelihood<'a> {
     link: InverseLink,
 }
 
-impl BinomialMultiLikelihood<'_> {
-    #[inline]
-    fn active_weight(&self, row: usize, output: usize) -> Option<f64> {
-        self.measure.active_weight(row, output)
-    }
-}
-
 impl VectorLikelihood for BinomialMultiLikelihood<'_> {
-    /// `Σ_(n,a)∈C w_{n,a} [ y_{n,a} log μ_{n,a} + (1 − y_{n,a}) log(1 − μ_{n,a}) ]`,
+    /// `Σ_{n,a} w_n [ y_{n,a} log μ_{n,a} + (1 − y_{n,a}) log(1 − μ_{n,a}) ]`,
     /// evaluated through cancellation-free log-probability towers. No fitted
     /// probability is clamped, so value, score, and Fisher curvature remain
     /// derivatives of one likelihood even in representable link tails.
@@ -165,13 +157,11 @@ impl VectorLikelihood for BinomialMultiLikelihood<'_> {
         let (n, k) = eta.dim();
         let mut acc = 0.0_f64;
         for row in 0..n {
+            let w = self.measure.row_weight(row);
+            if w == 0.0 {
+                continue;
+            }
             for a in 0..k {
-                let Some(w) = self.active_weight(row, a) else {
-                    continue;
-                };
-                if w == 0.0 {
-                    continue;
-                }
                 let observation =
                     bernoulli_natural_observation(row, y[[row, a]], eta[[row, a]], &self.link)?;
                 acc += w * observation.log_likelihood;
@@ -190,13 +180,11 @@ impl VectorLikelihood for BinomialMultiLikelihood<'_> {
         let (n, k) = eta.dim();
         let mut out = Array2::<f64>::zeros((n, k));
         for row in 0..n {
+            let w = self.measure.row_weight(row);
+            if w == 0.0 {
+                continue;
+            }
             for a in 0..k {
-                let Some(w) = self.active_weight(row, a) else {
-                    continue;
-                };
-                if w == 0.0 {
-                    continue;
-                }
                 let observation =
                     bernoulli_natural_observation(row, y[[row, a]], eta[[row, a]], &self.link)?;
                 out[[row, a]] = w * observation.score;
@@ -205,7 +193,7 @@ impl VectorLikelihood for BinomialMultiLikelihood<'_> {
         Ok(out)
     }
 
-    /// Per-output Fisher curvature `1_C(n,a) w_{n,a} (dμ/dη)²/[μ(1−μ)]`.
+    /// Per-output Fisher curvature `w_n (dμ/dη)²/[μ(1−μ)]`.
     fn hess_diag(
         &self,
         eta: ArrayView2<'_, f64>,
@@ -215,13 +203,11 @@ impl VectorLikelihood for BinomialMultiLikelihood<'_> {
         let (n, k) = eta.dim();
         let mut out = Array2::<f64>::zeros((n, k));
         for row in 0..n {
+            let w = self.measure.row_weight(row);
+            if w == 0.0 {
+                continue;
+            }
             for a in 0..k {
-                let Some(w) = self.active_weight(row, a) else {
-                    continue;
-                };
-                if w == 0.0 {
-                    continue;
-                }
                 let observation =
                     bernoulli_natural_observation(row, y[[row, a]], eta[[row, a]], &self.link)?;
                 out[[row, a]] = (w.ln() + observation.log_fisher).exp();
@@ -295,7 +281,7 @@ pub fn fit_penalized_binomial_multi(
             lambdas.len()
         );
     }
-    measure.validate(n_obs, k).map_err(|error| {
+    measure.validate(n_obs).map_err(|error| {
         EstimationError::InvalidInput(format!(
             "fit_penalized_binomial_multi: invalid separable response measure: {error}"
         ))
@@ -323,17 +309,9 @@ pub fn fit_penalized_binomial_multi(
                      (independent columns have a row-diagonal Fisher block); got {v}"
                 );
             }
-            if a == b && measure.active_weight(n_idx, a).is_none() && v != 0.0 {
-                crate::bail_invalid_estim!(
-                    "fit_penalized_binomial_multi: fisher_w_override[{n_idx},{a},{a}] must be zero because the response cell is structurally inactive (got {v})"
-                );
-            }
         }
     }
     for ((i, j), &v) in y.indexed_iter() {
-        if measure.active_weight(i, j).is_none() {
-            continue;
-        }
         // The per-entry objective y log μ + (1 − y) log(1 − μ) is the binomial
         // (Bernoulli / proportion) log-likelihood only when 0 ≤ y ≤ 1. Outside
         // that range it is unbounded above in η (e.g. y = 2 gives
@@ -405,7 +383,6 @@ pub fn fit_penalized_binomial_multi(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gam_problem::{IndexedCellSet, LikelihoodWeights, StructuralCells};
     use gam_spec::StandardLink;
     use ndarray::{Array1, Array3};
 
@@ -448,7 +425,9 @@ mod tests {
             offset: None,
             penalty: penalty.view(),
             lambdas: lambdas.view(),
-            measure: SeparableCellMeasure::uniform(),
+            measure: SeparableCellMeasure::row_weighted(
+                Array1::<f64>::ones(design.nrows()).view(),
+            ),
             fisher_w_override: None,
             max_iter: 50,
             tol: 1.0e-9,
@@ -462,7 +441,9 @@ mod tests {
             offset: None,
             penalty: penalty.view(),
             lambdas: lambdas.view(),
-            measure: SeparableCellMeasure::uniform(),
+            measure: SeparableCellMeasure::row_weighted(
+                Array1::<f64>::ones(design.nrows()).view(),
+            ),
             fisher_w_override: None,
             max_iter: 50,
             tol: 1.0e-9,
@@ -491,7 +472,9 @@ mod tests {
             offset: Some(offset.view()),
             penalty: penalty.view(),
             lambdas: lambdas.view(),
-            measure: SeparableCellMeasure::uniform(),
+            measure: SeparableCellMeasure::row_weighted(
+                Array1::<f64>::ones(design.nrows()).view(),
+            ),
             fisher_w_override: None,
             max_iter: 10,
             tol: 1.0e-12,
@@ -518,7 +501,9 @@ mod tests {
             offset: Some(offset.view()),
             penalty: penalty.view(),
             lambdas: lambdas.view(),
-            measure: SeparableCellMeasure::uniform(),
+            measure: SeparableCellMeasure::row_weighted(
+                Array1::<f64>::ones(design.nrows()).view(),
+            ),
             fisher_w_override: None,
             max_iter: 10,
             tol: 1.0e-12,
@@ -537,11 +522,8 @@ mod tests {
 
     #[test]
     fn active_zero_weight_cell_never_evaluates_an_impossible_tail() {
-        let weights = ndarray::array![[0.0]];
-        let measure = SeparableCellMeasure::new(
-            StructuralCells::All,
-            LikelihoodWeights::ByCell(weights.view()),
-        );
+        let weights = ndarray::array![0.0];
+        let measure = SeparableCellMeasure::row_weighted(weights.view());
         let link = InverseLink::Standard(StandardLink::CLogLog);
         let likelihood = BinomialMultiLikelihood {
             measure,
@@ -580,97 +562,15 @@ mod tests {
             offset: Some(wrong_columns.view()),
             penalty: penalty.view(),
             lambdas: lambdas.view(),
-            measure: SeparableCellMeasure::uniform(),
+            measure: SeparableCellMeasure::row_weighted(
+                Array1::<f64>::ones(design.nrows()).view(),
+            ),
             fisher_w_override: None,
             max_iter: 50,
             tol: 1.0e-9,
         })
         .expect_err("an offset outside the active response geometry must fail");
         assert!(format!("{error}").contains("offset shape"));
-    }
-
-    #[test]
-    fn structurally_inactive_cells_have_no_likelihood_score_or_curvature() {
-        let excluded =
-            IndexedCellSet::from_cells(2, 2, vec![(0, 1)]).expect("valid sparse exclusion set");
-        let cell_weights = ndarray::array![[2.0, 7.0], [3.0, 5.0]];
-        let measure = SeparableCellMeasure::new(
-            StructuralCells::AllExcept(&excluded),
-            LikelihoodWeights::ByCell(cell_weights.view()),
-        );
-        measure.validate(2, 2).expect("valid indexed measure");
-        let link = logit_link();
-        let likelihood = BinomialMultiLikelihood {
-            measure,
-            link,
-        };
-        let eta = ndarray::array![[0.2, -0.8], [0.5, 1.1]];
-        let y = ndarray::array![[1.0, 1.0], [0.0, 1.0]];
-
-        let gradient = likelihood
-            .grad_eta(eta.view(), y.view())
-            .expect("indexed score");
-        let curvature = likelihood
-            .hess_diag(eta.view(), y.view())
-            .expect("indexed curvature");
-        assert_eq!(gradient[[0, 1]], 0.0);
-        assert_eq!(curvature[[0, 1]], 0.0);
-
-        // Active cells carry the Bernoulli score and Fisher weight. Production
-        // evaluates them through the stable natural-parameter observation (the
-        // curvature in the log domain), so they agree with the textbook
-        // `w·(y − μ)` and `w·μ(1 − μ)` to roundoff, not bit for bit.
-        let agrees = |value: f64, reference: f64| {
-            (value - reference).abs() <= 8.0 * f64::EPSILON * reference.abs().max(1.0)
-        };
-        for &(row, output) in &[(0usize, 0usize), (1, 0), (1, 1)] {
-            let mu = logit_mu(eta[[row, output]]);
-            let weight = cell_weights[[row, output]];
-            let score = weight * (y[[row, output]] - mu);
-            let fisher = weight * mu * (1.0 - mu);
-            assert!(
-                agrees(gradient[[row, output]], score),
-                "cell ({row},{output}) score {} vs w(y-mu) {score}",
-                gradient[[row, output]]
-            );
-            assert!(
-                agrees(curvature[[row, output]], fisher),
-                "cell ({row},{output}) curvature {} vs w mu(1-mu) {fisher}",
-                curvature[[row, output]]
-            );
-        }
-    }
-
-    #[test]
-    fn curvature_override_cannot_reintroduce_an_inactive_cell() {
-        let (design, y, penalty, lambdas) = toy_inputs();
-        let excluded =
-            IndexedCellSet::from_cells(design.nrows(), y.ncols(), vec![(0usize, 1usize)])
-                .expect("valid sparse exclusion set");
-        let measure = SeparableCellMeasure::new(
-            StructuralCells::AllExcept(&excluded),
-            LikelihoodWeights::Uniform,
-        );
-        let mut override_blocks = Array3::<f64>::zeros((design.nrows(), y.ncols(), y.ncols()));
-        for row in 0..design.nrows() {
-            for output in 0..y.ncols() {
-                override_blocks[[row, output, output]] = 0.25;
-            }
-        }
-        let error = fit_penalized_binomial_multi(BinomialMultiFitInputs {
-            design: design.view(),
-            y: y.view(),
-            link: logit_link(),
-            offset: None,
-            penalty: penalty.view(),
-            lambdas: lambdas.view(),
-            measure,
-            fisher_w_override: Some(override_blocks.view()),
-            max_iter: 50,
-            tol: 1.0e-9,
-        })
-        .expect_err("curvature on an absent response cell must fail");
-        assert!(format!("{error}").contains("structurally inactive"));
     }
 
     #[test]
@@ -683,7 +583,9 @@ mod tests {
             offset: None,
             penalty: penalty.view(),
             lambdas: lambdas.view(),
-            measure: SeparableCellMeasure::uniform(),
+            measure: SeparableCellMeasure::row_weighted(
+                Array1::<f64>::ones(design.nrows()).view(),
+            ),
             fisher_w_override: None,
             max_iter: 0,
             tol: 1.0e-9,
@@ -716,7 +618,9 @@ mod tests {
             offset: None,
             penalty: penalty.view(),
             lambdas: lambdas.view(),
-            measure: SeparableCellMeasure::uniform(),
+            measure: SeparableCellMeasure::row_weighted(
+                Array1::<f64>::ones(design.nrows()).view(),
+            ),
             fisher_w_override: None,
             max_iter: 50,
             tol: 1.0e-9,
@@ -733,7 +637,9 @@ mod tests {
             offset: None,
             penalty: penalty.view(),
             lambdas: lambdas.view(),
-            measure: SeparableCellMeasure::uniform(),
+            measure: SeparableCellMeasure::row_weighted(
+                Array1::<f64>::ones(design.nrows()).view(),
+            ),
             fisher_w_override: None,
             max_iter: 50,
             tol: 1.0e-9,
@@ -755,7 +661,9 @@ mod tests {
             offset: None,
             penalty: penalty.view(),
             lambdas: lambdas.view(),
-            measure: SeparableCellMeasure::uniform(),
+            measure: SeparableCellMeasure::row_weighted(
+                Array1::<f64>::ones(design.nrows()).view(),
+            ),
             fisher_w_override: Some(bad.view()),
             max_iter: 50,
             tol: 1.0e-9,
@@ -779,9 +687,10 @@ mod tests {
                 over[[row, a, a]] = 0.25 * 4.0; // 4× the analytic curvature
             }
         }
+        let unit_weights = Array1::<f64>::ones(n);
         let link = logit_link();
         let likelihood = BinomialMultiLikelihood {
-            measure: SeparableCellMeasure::uniform(),
+            measure: SeparableCellMeasure::row_weighted(unit_weights.view()),
             link,
         };
         let scaled = fit_penalized_vector_glm(

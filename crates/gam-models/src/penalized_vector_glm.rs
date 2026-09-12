@@ -1562,7 +1562,9 @@ mod parity_tests {
             offset: None,
             penalty: penalty.view(),
             lambdas: lambdas.view(),
-            measure: gam_problem::SeparableCellMeasure::uniform(),
+            measure: gam_problem::SeparableCellMeasure::row_weighted(
+                Array1::<f64>::ones(design.nrows()).view(),
+            ),
             fisher_w_override: None,
             max_iter: 100,
             tol: 1.0e-12,
@@ -1617,7 +1619,9 @@ mod parity_tests {
             offset: None,
             penalty: penalty.view(),
             lambdas: lambdas.view(),
-            measure: gam_problem::SeparableCellMeasure::uniform(),
+            measure: gam_problem::SeparableCellMeasure::row_weighted(
+                Array1::<f64>::ones(design.nrows()).view(),
+            ),
             fisher_w_override: None,
             max_iter: 100,
             tol: 1.0e-12,
@@ -1636,7 +1640,9 @@ mod parity_tests {
                 offset: None,
                 penalty: penalty.view(),
                 lambdas: lam.view(),
-                measure: gam_problem::SeparableCellMeasure::uniform(),
+                measure: gam_problem::SeparableCellMeasure::row_weighted(
+                    Array1::<f64>::ones(design.nrows()).view(),
+                ),
                 fisher_w_override: None,
                 max_iter: 100,
                 tol: 1.0e-12,

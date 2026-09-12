@@ -16,7 +16,7 @@
 //! class log-odds — `y` is generated independently of `x`). At
 //! `α ∈ {0.01, 0.05, 0.10}` the empirical rejection rate must not exceed `α`
 //! beyond Monte-Carlo error, audited as coverage of the non-rejection event at
-//! nominal `1 − α` (the shared `TEST_SIZE_ALPHAS` convention): an oversized test
+//! nominal `1 − α`: an oversized test
 //! under-covers non-rejection and gates; an undersized (conservative) test
 //! over-covers and only reports.
 

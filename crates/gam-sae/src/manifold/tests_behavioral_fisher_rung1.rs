@@ -35,10 +35,25 @@ use crate::basis::EuclideanPatchEvaluator;
 use crate::manifold::{
     SaeAtomBasisKind, SaeBasisEvaluator, SaeManifoldAtom, SaeManifoldRho, SaeManifoldTerm,
 };
-use gam_problem::{MetricProvenance, RowMetric, pack_probe_factors};
+use gam_problem::{MetricProvenance, RowMetric};
 use gam_terms::latent::LatentManifold;
 use ndarray::{Array1, Array2, Array3};
 use std::sync::Arc;
+
+/// Pack an `(n_rows, p, probes)` harvest probe stack into the row-major factor layout
+/// `RowMetric::behavioral_fisher` consumes: `u[n, i * probes + k] = probes[n, i, k]`.
+fn pack_probe_factors(probes: ndarray::ArrayView3<'_, f64>) -> Array2<f64> {
+    let (n_rows, p, s) = probes.dim();
+    let mut u = Array2::<f64>::zeros((n_rows, p * s));
+    for n in 0..n_rows {
+        for i in 0..p {
+            for k in 0..s {
+                u[[n, i * s + k]] = probes[[n, i, k]];
+            }
+        }
+    }
+    u
+}
 
 fn lcg_uniform(s: &mut u64) -> f64 {
     *s = s
@@ -113,8 +128,7 @@ fn behavioral_fisher_identity(n: usize, p: usize) -> RowMetric {
     // probes[row, i, k] = δ_ik (same identity on every row).
     let probes =
         Array3::<f64>::from_shape_fn((n, p, p), |(_, i, k)| if i == k { 1.0 } else { 0.0 });
-    let u = pack_probe_factors(probes.view())
-        .expect("the fixture's probe matrix is a valid factor block");
+    let u = pack_probe_factors(probes.view());
     RowMetric::behavioral_fisher(Arc::new(u), p, p)
         .expect("the fixture's probe factor and dimensions define a behavioral Fisher metric")
 }
@@ -137,8 +151,7 @@ fn behavioral_fisher_anisotropic(n: usize, p: usize) -> RowMetric {
         };
         base + 0.2 * lcg_normal(&mut seed)
     });
-    let u = pack_probe_factors(probes.view())
-        .expect("the fixture's probe matrix is a valid factor block");
+    let u = pack_probe_factors(probes.view());
     RowMetric::behavioral_fisher(Arc::new(u), p, s)
         .expect("the fixture's probe factor and dimensions define a behavioral Fisher metric")
 }

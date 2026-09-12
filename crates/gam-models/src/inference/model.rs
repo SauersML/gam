@@ -4549,6 +4549,15 @@ impl FittedModel {
 
     pub fn save_to_path(&self, path: &Path) -> Result<(), FittedModelError> {
         let normalized = self.clone().with_synchronized_stateful_link_metadata();
+        // `serde_json` writes NaN and ±inf as `null`: a required `f64` then fails to
+        // parse back, but an `Option<f64>` reloads as `None`, silently. The structural
+        // guard walks every float the writer would emit and names the first
+        // non-finite one (#2601), before any other check runs or the disk is touched.
+        gam_problem::ensure_serialized_floats_are_finite(&normalized).map_err(|found| {
+            FittedModelError::PayloadCorrupt {
+                reason: format!("refusing to persist a non-finite float: {found}"),
+            }
+        })?;
         normalized.validate_for_persistence()?;
         normalized.validate_numeric_finiteness()?;
         normalized.validate_persisted_form_parses_back()?;
@@ -6275,6 +6284,51 @@ mod tests {
             error.to_string().contains("training_sample_size"),
             "alias disagreement reported an unrelated error: {error}"
         );
+    }
+
+    #[test]
+    fn saving_a_model_holding_a_nan_coefficient_is_refused_2601() {
+        let mut fit = saved_fit(vec![FittedBlock {
+            beta: array![0.25],
+            role: BlockRole::Mean,
+            edf: 1.0,
+            lambdas: Array1::zeros(0),
+        }]);
+        fit.blocks[0].beta[0] = f64::NAN;
+        // A directory that does not exist: the refusal must come before any write,
+        // and without the guard this save fails for a different reason.
+        let error = standard_binomial_model(fit)
+            .save_to_path(Path::new("/nonexistent-2601-finiteness-guard/model.json"))
+            .expect_err("a NaN coefficient must not reach disk");
+        let message = error.to_string();
+        assert!(message.contains("non-finite float"), "refused for an unrelated reason: {message}");
+        assert!(message.contains("beta"), "the refusal must name the coefficient path: {message}");
+    }
+
+    #[test]
+    fn saving_a_nan_in_an_unlisted_optional_scalar_is_refused_by_path_2601() {
+        let model = standard_binomial_model(saved_fit(vec![FittedBlock {
+            beta: array![0.25],
+            role: BlockRole::Mean,
+            edf: 1.0,
+            lambdas: Array1::zeros(0),
+        }]));
+        let mut payload = model.payload().clone();
+        payload.marginal_baseline = Some(0.5);
+        assert!(
+            gam_problem::ensure_serialized_floats_are_finite(&FittedModel::from_payload(payload.clone()))
+                .is_ok(),
+            "a finite optional scalar passes the guard"
+        );
+        // `validate_numeric_finiteness` does not list `marginal_baseline`, and the JSON
+        // round trip would reload this NaN as `None`.
+        payload.marginal_baseline = Some(f64::NAN);
+        let error = FittedModel::from_payload(payload)
+            .save_to_path(Path::new("/nonexistent-2601-finiteness-guard/model.json"))
+            .expect_err("a NaN optional scalar would otherwise reload as None");
+        let message = error.to_string();
+        assert!(message.contains("marginal_baseline"), "the refusal must name the field: {message}");
+        assert!(message.contains("must be finite"), "refused for an unrelated reason: {message}");
     }
 
     #[test]

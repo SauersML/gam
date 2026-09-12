@@ -141,11 +141,7 @@ pub use finite_validation::{
     validate_all_finite_trial_point,
 };
 pub use serde_finite::{NonFiniteFloat, ensure_serialized_floats_are_finite};
-pub use fisher_rao::{
-    FisherRaoDefiniteness,
-    normalize_fisher_rao_blocks,
-    normalize_fisher_rao_blocks_pd,
-};
+pub use fisher_rao::normalize_fisher_rao_blocks;
 pub use roundoff::{roundoff_growth_factor, weighted_residual_is_at_roundoff_floor};
 use gam_linalg::dense;
 pub use gam_linalg::faer_ndarray::{in_nested_parallel_region, with_nested_parallel};
@@ -158,10 +154,7 @@ pub use identifiability_audit::{
     JointRankCertificate,
     MapUniquenessError,
 };
-pub use indexed_response::{
-    IndexedCellSet, IndexedResponseError, LikelihoodWeights, OwnedLikelihoodWeights,
-    OwnedSeparableCellMeasure, OwnedStructuralCells, SeparableCellMeasure, StructuralCells,
-};
+pub use indexed_response::{IndexedResponseError, SeparableCellMeasure};
 pub use joint_penalty::{JointPenaltyBundle, JointPenaltyError, JointPenaltySpec};
 pub use linear_constraints::LinearInequalityConstraints;
 pub use log_strength::{
@@ -203,7 +196,6 @@ pub use row_metric::{
     MetricProvenance,
     RowMetric,
     WeightField,
-    pack_probe_factors,
 };
 pub use schedule::{GumbelTemperatureSchedule, ScheduleKind};
 pub use seeding::{OrderedRhoBounds, SeedConfig, SeedRiskProfile};

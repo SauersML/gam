@@ -717,5 +717,34 @@
     },
     "reason": "user directive: delete all useless slop",
     "evidence": "scripts/public_api_census.py on MSI over 57409ec77 -> the M6 lane commit (job 440611, /scratch.global/sauer354/sw5-logs/stageM6.440611.pubapi.txt) measured exactly this removed map. The same tree compiles with every workspace target."
+  },
+  {
+    "base": "ad53212ec50b036f9679a93a6cf9b4e75da7c31b",
+    "removed": {
+      "crates/gam-geometry/src/manifolds/constant_curvature.rs::exp_map_kappa_jet": 1,
+      "crates/gam-models/src/indexed_natural.rs::fit_indexed_natural_laml": 1,
+      "crates/gam-models/src/indexed_natural.rs::from_program": 1,
+      "crates/gam-models/src/indexed_natural.rs::n_outputs": 1,
+      "crates/gam-models/src/indexed_natural.rs::n_rows": 1,
+      "crates/gam-models/src/indexed_natural.rs::program": 1,
+      "crates/gam-problem/src/fisher_rao.rs::normalize_fisher_rao_blocks_pd": 1,
+      "crates/gam-problem/src/indexed_response.rs::active_weight": 2,
+      "crates/gam-problem/src/indexed_response.rs::as_borrowed": 1,
+      "crates/gam-problem/src/indexed_response.rs::contains": 1,
+      "crates/gam-problem/src/indexed_response.rs::from_cells": 1,
+      "crates/gam-problem/src/indexed_response.rs::is_active": 2,
+      "crates/gam-problem/src/indexed_response.rs::is_empty": 1,
+      "crates/gam-problem/src/indexed_response.rs::len": 1,
+      "crates/gam-problem/src/indexed_response.rs::n_outputs": 2,
+      "crates/gam-problem/src/indexed_response.rs::n_rows": 2,
+      "crates/gam-problem/src/indexed_response.rs::new": 3,
+      "crates/gam-problem/src/indexed_response.rs::position": 1,
+      "crates/gam-problem/src/indexed_response.rs::to_owned": 1,
+      "crates/gam-problem/src/indexed_response.rs::uniform": 2,
+      "crates/gam-problem/src/row_metric.rs::pack_probe_factors": 1,
+      "crates/gam-test-support/src/reference.rs::dml_partial_linear_reference": 1
+    },
+    "reason": "User directive 2026-09-11: delete code only tests use and code nothing uses.\n- gam-test-support: TEST_SIZE_ALPHAS and dml_partial_linear_reference (with DmlPartialLinearReference) had no code use.\n- gam-geometry: nothing called exp_map_kappa_jet.\n- gam-problem: only unit tests called normalize_fisher_rao_blocks_pd, and FisherRaoDefiniteness existed only to select it.\n- gam-problem: pack_probe_factors was used only by its own unit tests and one gam-sae fixture, which now carries a private copy.\n- Measure collapse (lead-approved): production builds SeparableCellMeasure only through gam-pyffi's row_weighted. Only tests built IndexedCellSet, the StructuralCells and LikelihoodWeights enums, SeparableCellMeasure::{uniform, new, is_active, to_owned} or the owned measure types. Their one other consumer, crates/gam-models/src/indexed_natural.rs, has had no IndexedNaturalDiagonalProgram implementor since 5e967c204.",
+    "evidence": "Candidates came from the restored src_items_used_only_by_tests scanner at 7bc19ed40 on MSI (job 432643), plus lead-approved proposals. Each was re-read at the base with word-matched single-name greps:\n- exp_map_kappa_jet and dml_partial_linear_reference are named only at their definitions, re-exports and prose.\n- normalize_fisher_rao_blocks_pd is called only in fisher_rao.rs tests.\n- FisherRaoDefiniteness appears only in fisher_rao.rs and two re-exports.\n- pack_probe_factors appears only in row_metric.rs, its re-export, and tests_behavioral_fisher_rung1.rs.\n- gam-pyffi's row_weighted is the only production producer of a measure.\n- IndexedCellSet is built only by from_cells in test fixtures.\n- indexed_natural.rs names its trait and fit entry only inside itself.\n- REFERENCE_ENV_MISSING was kept because reference.rs uses it through format-string captures.\n- binomial_multi.rs reads one weight per row. Its unit-weight fixtures (and three in penalized_vector_glm.rs) pass explicit row weights of 1.0, numerically identical to Uniform.\nPre-push on MSI over the exact candidate tree: workspace --all-targets check, cargo check -p gam-pyffi, a leftover-name grep, and the three gates."
   }
 ]

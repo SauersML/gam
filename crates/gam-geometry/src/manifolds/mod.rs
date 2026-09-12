@@ -39,8 +39,7 @@ pub mod torus;
 pub use circle::CircleManifold;
 pub use constant_curvature::{
     ConstantCurvature, constant_curvature_dirichlet_penalty,
-    constant_curvature_dirichlet_penalty_kappa_derivative, distance_kappa_jet, exp_map_kappa_jet,
-    log_map_kappa_jet,
+    constant_curvature_dirichlet_penalty_kappa_derivative, distance_kappa_jet, log_map_kappa_jet,
 };
 pub use euclidean::EuclideanManifold;
 pub use grassmann::GrassmannManifold;

@@ -39,7 +39,7 @@ const N_OBS: usize = 8;
 /// is `N_REPLICATIONS·α = 40`, enough for the Wilson verdict to resolve a
 /// genuinely oversized test without over-resolving MC noise into a spurious gate.
 const N_REPLICATIONS: usize = 4000;
-/// The type-I error rates swept, matching `TEST_SIZE_ALPHAS`.
+/// The type-I error rates swept.
 const ALPHAS: [f64; 3] = [0.01, 0.05, 0.10];
 /// The true (and null) rate — the null is exact, so any rejection is a type-I
 /// error. Value is immaterial (the statistic is scale-equivariant); fixed for

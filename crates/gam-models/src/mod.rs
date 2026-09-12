@@ -82,7 +82,6 @@ pub(crate) mod exact_mode_branch;
 pub mod family_runtime;
 pub(crate) mod fnv1a;
 pub mod gamlss;
-pub mod indexed_natural;
 pub mod joint_penalty;
 pub(crate) mod location_scale_engine;
 pub mod marginal_slope_orthogonal;

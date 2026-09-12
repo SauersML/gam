@@ -1,7 +1,7 @@
 //! Curvature-as-an-estimand: the inference layer on top of the κ-jets.
 //!
-//! #944 stage 3. The κ-jets (`distance_kappa_jet` / `log_map_kappa_jet` /
-//! `exp_map_kappa_jet`) and the analytic Jacobi-field `exp_map_vjp` for the
+//! #944 stage 3. The κ-jets (`distance_kappa_jet` / `log_map_kappa_jet`) and
+//! the analytic Jacobi-field `exp_map_vjp` for the
 //! `ConstantCurvature` chart are landed and
 //! FD-gated. This module turns the fitted curvature `κ̂` from "we chose
 //! hyperbolic space" into a reported estimate with a confidence interval and a

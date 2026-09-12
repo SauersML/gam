@@ -16,7 +16,7 @@
     "crates/gam-model-kernels": 84,
     "crates/gam-models": 1409,
     "crates/gam-predict": 105,
-    "crates/gam-problem": 352,
+    "crates/gam-problem": 346,
     "crates/gam-pyffi": 126,
     "crates/gam-report": 42,
     "crates/gam-row-macros": 40,
