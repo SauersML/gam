@@ -116,9 +116,7 @@ fn fit_request_document_from_fit_args(
         precompute_conformal: Some(args.precompute_conformal),
         persistent_warm_start_root: args.persistent_warm_start_root.clone(),
         scale_dimensions: args.scale_dimensions.then_some(true),
-        sigma_time_degree: Some(args.sigma_time_degree),
         sigma_time_k: args.sigma_time_k,
-        slope_time_degree: Some(args.slope_time_degree),
         slope_time_k: args.slope_time_k,
         smooth_descriptors,
         // `None` (flag unset) flows through so the Surv() seam resolves the one
@@ -128,11 +126,8 @@ fn fit_request_document_from_fit_args(
         // configuration this document is supposed to carry in full — the flag
         // declares a conflict with `--request` on exactly that premise (#2631).
         survival_time_anchor: args.survival_time_anchor,
-        threshold_time_degree: Some(args.threshold_time_degree),
         threshold_time_k: args.threshold_time_k,
         time_basis: Some(args.time_basis.clone()),
-        time_degree: Some(args.time_degree),
-        time_num_internal_knots: Some(args.time_num_internal_knots),
         transformation_normal: args.transformation_normal.then_some(true),
         weights: args.weights_column.clone(),
         z_column: args.z_column.clone(),
@@ -1850,14 +1845,10 @@ pub(crate) fn validate_fit_args_preflight(
     validate_time_margin_args(
         "--threshold-time-k",
         args.threshold_time_k,
-        args.threshold_time_degree,
+        fit_config.threshold_time_degree,
     )?;
-    validate_time_margin_args("--sigma-time-k", args.sigma_time_k, args.sigma_time_degree)?;
-    validate_time_margin_args(
-        "--slope-time-k",
-        args.slope_time_k,
-        args.slope_time_degree,
-    )?;
+    validate_time_margin_args("--sigma-time-k", args.sigma_time_k, fit_config.sigma_time_degree)?;
+    validate_time_margin_args("--slope-time-k", args.slope_time_k, fit_config.slope_time_degree)?;
     if time_basis_raw == "ispline" {
         parse_survival_time_basis_config(
             &fit_config.time_basis,

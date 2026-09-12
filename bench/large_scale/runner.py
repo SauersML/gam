@@ -3074,10 +3074,6 @@ def run_rust_survival(spec: MethodSpec, train_csv: Path, test_csv: Path, out_dir
             likelihood_mode,
             "--time-basis",
             "ispline",
-            "--time-degree",
-            "3",
-            "--time-num-internal-knots",
-            "8",
             "--out",
             str(model_path),
         ]

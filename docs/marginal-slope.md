@@ -204,8 +204,7 @@ margin in `log t`, exactly as `threshold_time_k` and `sigma_time_k` do for the
 location-scale family, so `b` becomes a fitted surface `b(x, t)` with
 independent smoothing parameters for the covariate and time directions.
 `slope_time_degree` (default `3`) sets the margin's polynomial degree; the
-same `k >= degree + 1` rule applies. The CLI spelling is `--slope-time-k` /
-`--slope-time-degree`.
+same `k >= degree + 1` rule applies. The CLI spelling is `--slope-time-k`.
 
 Why this needs family support rather than data reshaping: the marginal-slope
 likelihood is a *transformation* model, `S(t | x, z) = Φ(−η(t))`, not a hazard

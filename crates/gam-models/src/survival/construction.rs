@@ -947,13 +947,13 @@ pub fn parse_survival_time_basis_config(
         "ispline" => {
             if time_degree < 1 {
                 return Err(
-                    "time-basis degree must be >= 1 for ispline time basis (CLI: --time-degree; Python: time_degree=)"
+                    "time-basis degree must be >= 1 for ispline time basis (request config: time_degree)"
                         .to_string(),
                 );
             }
             if time_num_internal_knots == 0 {
                 return Err(
-                    "time-basis must have > 0 internal knots for ispline time basis (CLI: --time-num-internal-knots; Python: time_num_internal_knots=)"
+                    "time-basis must have > 0 internal knots for ispline time basis (request config: time_num_internal_knots)"
                         .to_string(),
                 );
             }

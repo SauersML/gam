@@ -219,14 +219,9 @@ pub(crate) struct FitArgs {
             "baseline_rate",
             "baseline_makeham",
             "time_basis",
-            "time_degree",
-            "time_num_internal_knots",
             "threshold_time_k",
-            "threshold_time_degree",
             "sigma_time_k",
-            "sigma_time_degree",
             "slope_time_k",
-            "slope_time_degree",
             "scale_dimensions",
             "precompute_conformal",
             "inference",
@@ -355,37 +350,22 @@ pub(crate) struct FitArgs {
     /// rejected at parse time; use the structural survival paths instead.
     #[arg(long = "time-basis", default_value = "ispline", value_parser = parse_time_basis_cli)]
     pub(crate) time_basis: String,
-    /// Degree for survival time basis.
-    #[arg(long = "time-degree", default_value_t = 3, value_parser = parse_positive_usize_cli)]
-    pub(crate) time_degree: usize,
-    /// Number of internal knots for non-linear survival time bases.
-    #[arg(long = "time-num-internal-knots", default_value_t = 8, value_parser = parse_positive_usize_cli)]
-    pub(crate) time_num_internal_knots: usize,
     /// Number of B-spline basis functions for the time margin of the threshold
     /// tensor product (enables time-varying threshold). When omitted, threshold
     /// depends on covariates only.
     #[arg(long = "threshold-time-k", value_parser = parse_positive_usize_cli)]
     pub(crate) threshold_time_k: Option<usize>,
-    /// B-spline degree for the time margin of the threshold tensor product.
-    #[arg(long = "threshold-time-degree", default_value_t = 3, value_parser = parse_positive_usize_cli)]
-    pub(crate) threshold_time_degree: usize,
     /// Number of B-spline basis functions for the time margin of the log-sigma
     /// tensor product (enables time-varying scale). When omitted, scale depends
     /// on covariates only.
     #[arg(long = "sigma-time-k", value_parser = parse_positive_usize_cli)]
     pub(crate) sigma_time_k: Option<usize>,
-    /// B-spline degree for the time margin of the log-sigma tensor product.
-    #[arg(long = "sigma-time-degree", default_value_t = 3, value_parser = parse_positive_usize_cli)]
-    pub(crate) sigma_time_degree: usize,
     /// Number of B-spline basis functions for the time margin of the slope
     /// tensor product in the survival marginal-slope family, i.e. how much the
     /// latent score's effect is allowed to move along the follow-up axis.
     /// Omitted = a slope that is constant within a person.
     #[arg(long = "slope-time-k", value_parser = parse_positive_usize_cli)]
     pub(crate) slope_time_k: Option<usize>,
-    /// B-spline degree for the time margin of the slope tensor product.
-    #[arg(long = "slope-time-degree", default_value_t = 3, value_parser = parse_positive_usize_cli)]
-    pub(crate) slope_time_degree: usize,
     /// Enable per-axis anisotropic spatial optimization for all eligible
     /// spatial terms (Matérn and Duchon). Hybrid Duchon jointly optimizes a
     /// scalar kappa plus per-axis contrasts; pure Duchon optimizes shape-only
