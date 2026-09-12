@@ -159,34 +159,50 @@ fn main() -> Result<(), String> {
     }
 
     // ---- Offload verdict sweep: the K=2000-vs-#2230 engagement question ---------
-    let policy = GpuDispatchPolicy::default();
+    // `eligible` is the pre-probe verdict at the most permissive calibrated floor;
+    // `seed` is the verdict of the uncalibrated seed policy. A probed device's
+    // calibrated policy decides; its floor is never below the eligibility floor.
+    let seed_policy = GpuDispatchPolicy::default();
     println!(
-        "--- reduced_schur_matvec_should_offload(n, k, d={d}, cg_iters={}) ---",
+        "--- reduced-Schur matvec offload(n, k, d={d}, cg_iters={}) ---",
         args.pcg_iters
     );
     println!(
         "    DEVICE_LOOP_MIN_P floor = {}",
         GpuDispatchPolicy::DEVICE_LOOP_MIN_P
     );
+    let verdict = |probe_n: usize, probe_k: usize| {
+        let eligible = GpuDispatchPolicy::reduced_schur_matvec_admissible_under_any_policy(
+            probe_n,
+            probe_k,
+            d.max(1),
+            args.pcg_iters,
+        );
+        let seed = seed_policy.reduced_schur_matvec_should_offload(
+            probe_n,
+            probe_k,
+            d.max(1),
+            args.pcg_iters,
+        );
+        format!(
+            "eligible={} seed={}",
+            if eligible { "YES" } else { "no" },
+            if seed { "YES" } else { "no" }
+        )
+    };
     // Sweep the border from a K=2000-scale value up to the #2230 border, at both
     // the assembled n and the #2230 n, so the crossover is explicit.
     for &probe_n in &[n, 60_000usize] {
         for &probe_k in &[64usize, 512, 2_048, 8_192, 21_504, k] {
-            let verdict = policy.reduced_schur_matvec_should_offload(
-                probe_n,
-                probe_k,
-                d.max(1),
-                args.pcg_iters,
-            );
             println!(
-                "    n={probe_n:>6} k={probe_k:>6} -> offload={}",
-                if verdict { "YES" } else { "no" }
+                "    n={probe_n:>6} k={probe_k:>6} -> {}",
+                verdict(probe_n, probe_k)
             );
         }
     }
     println!(
-        "verdict at THIS assembled shape (n={n}, k={k}): offload={}",
-        policy.reduced_schur_matvec_should_offload(n, k, d.max(1), args.pcg_iters)
+        "verdict at THIS assembled shape (n={n}, k={k}): {}",
+        verdict(n, k)
     );
     println!("=== done ===");
     Ok(())

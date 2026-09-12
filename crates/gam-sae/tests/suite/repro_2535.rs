@@ -77,9 +77,11 @@ fn build_k2(
 
 #[test]
 fn fresh_arrow_schur_joint_fits_are_bit_reproducible_at_k2_2535() {
-    // Shape chosen from the #2512 offload gate so the device PCG is ENGAGED:
-    // k = (M1+M2)*p = 80, d = row_block_dim, cg_iters = 200, and the d != 1
-    // floor is MATVEC_OFFLOAD_FLOPS_MIN = 1e7.
+    // Shape chosen from the #2512 offload gate so the device PCG can engage:
+    // k = (M1+M2)*p = 80 clears DEVICE_LOOP_MIN_P, d = row_block_dim and
+    // cg_iters = 200, so the solve's `cg_iters·n·(4·d·k + d²)` arithmetic clears
+    // the most permissive calibrated dense launch floor and the device's
+    // calibrated policy decides engagement.
     let n = 400usize;
     let p_x = 4usize;
     let vocabulary = 5usize;

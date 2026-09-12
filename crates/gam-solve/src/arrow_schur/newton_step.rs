@@ -343,19 +343,17 @@ pub(crate) fn maybe_inject_gpu_schur_matvec(
     // `try_device_arrow_direct` deliberately keeps the dense gate — that path is
     // one large factorization, not the amortised matvec.
     //
-    // Size gate BEFORE the device probe (startup-tax ordering fix):
-    // `reduced_schur_matvec_should_offload` reads only associated constants
-    // (`DEVICE_LOOP_MIN_P`, the matvec offload floors) — never a calibrated
-    // policy field — so evaluating it on the pre-probe default policy is
-    // IDENTICAL to evaluating it on the probed runtime's policy. A shape it
-    // rejects therefore skips runtime availability resolution (whose first call creates
-    // a CUDA primary context on every GPU); an admitted shape probes exactly as
-    // before.
+    // Size gate BEFORE the device probe (startup-tax ordering fix): at the most
+    // permissive floor any production policy can carry, the predicate rejects
+    // exactly the shapes every reachable policy rejects, so those skip runtime
+    // availability resolution (whose first call creates a CUDA primary context on
+    // every GPU). An admitted shape probes, and the probed device's calibrated
+    // policy then decides.
     let cg_iters = options
         .pcg
         .max_iterations
         .min(options.trust_region.max_iterations);
-    if !gam_gpu::GpuDispatchPolicy::default().reduced_schur_matvec_should_offload(
+    if !gam_gpu::GpuDispatchPolicy::reduced_schur_matvec_admissible_under_any_policy(
         sys.rows.len(),
         sys.k,
         sys.d,
@@ -363,13 +361,18 @@ pub(crate) fn maybe_inject_gpu_schur_matvec(
     ) {
         return Ok(None);
     }
-    // Require a live device before assembling the GPU matvec backend; the
-    // runtime handle itself is not needed here, only its presence.
-    if gam_gpu::device_runtime::GpuRuntime::resolve(options.gpu_policy)
+    // Require a live device whose calibrated policy admits the solve before
+    // assembling the GPU matvec backend.
+    let Some(runtime) = gam_gpu::device_runtime::GpuRuntime::resolve(options.gpu_policy)
         .map_err(|error| ArrowSchurError::SchurFactorFailed {
             reason: format!("Arrow-Schur GPU runtime resolution failed: {error}"),
         })?
-        .is_none()
+    else {
+        return Ok(None);
+    };
+    if !runtime
+        .policy()
+        .reduced_schur_matvec_should_offload(sys.rows.len(), sys.k, sys.d, cg_iters)
     {
         return Ok(None);
     }

@@ -1976,20 +1976,22 @@ pub(crate) fn device_dispatch_predicate_gates_on_work_not_rows() {
 }
 
 /// #1017 Phase-1 call-site re-key: the live matvec-injection gate
-/// (`maybe_inject_gpu_schur_matvec`) now keys on the CG-amortised
-/// `reduced_schur_matvec_should_offload(rows, k, sys.d, cg_iters)` predicate
-/// rather than the dense-Direct `(rows, k)` floor. This asserts the predicate
-/// the gate consults — with the exact `cg_iters` the gate derives from the
-/// options (`pcg.max_iterations.min(trust_region.max_iterations)`) — fires for
-/// the SAE LLM shape (n~2000 rows × k~2048 border × d~8 frame depth) while
-/// staying off for tiny shapes where launch latency dominates. The gate's
-/// typed device-absence short-circuit makes the helper
-/// itself return `None` on a CPU-only host, so the routing logic is asserted
-/// through the predicate it consults (the device==CPU 1e-10 numeric parity is
-/// asserted by the box harness).
+/// (`maybe_inject_gpu_schur_matvec`) keys on the CG-amortised work predicate
+/// rather than the dense-Direct `(rows, k)` floor: before the device probe on
+/// `reduced_schur_matvec_admissible_under_any_policy(rows, k, sys.d, cg_iters)`,
+/// and after it on the probed policy's `reduced_schur_matvec_should_offload`.
+/// This asserts both predicates — with the exact `cg_iters` the gate derives from
+/// the options (`pcg.max_iterations.min(trust_region.max_iterations)`) — fire for
+/// the SAE LLM shape (n~2000 rows × k~2048 border × d~8 frame depth), whose single
+/// apply already clears the uncalibrated seed floor, while staying off for tiny
+/// shapes where launch latency dominates. The gate's typed device-absence
+/// short-circuit makes the helper itself return `None` on a CPU-only host, so the
+/// routing logic is asserted through the predicates it consults (the device==CPU
+/// 1e-10 numeric parity is asserted by the box harness).
 #[test]
 pub(crate) fn matvec_gate_engages_for_llm_shape_off_for_tiny() {
-    let policy = gam_gpu::policy::GpuDispatchPolicy::default();
+    use gam_gpu::policy::GpuDispatchPolicy;
+    let policy = GpuDispatchPolicy::default();
     // The cg_iters the live gate derives from default options is exactly the
     // budget the PCG loop launches with.
     let options = ArrowSolveOptions::inexact_pcg();
@@ -2001,16 +2003,23 @@ pub(crate) fn matvec_gate_engages_for_llm_shape_off_for_tiny() {
 
     // SAE LLM shape: few row blocks, wide border, modest frame depth. The
     // dense-Direct `(rows, k)` floor that the gate used to consult ignores the
-    // frame depth `d` and the CG amortisation — assert the NEW predicate the
-    // re-keyed gate consults admits it.
+    // frame depth `d` and the CG amortisation — assert the predicates the
+    // re-keyed gate consults admit it.
     let (n_llm, k_llm, d_llm) = (2_000_usize, 2_048_usize, 8_usize);
+    assert!(GpuDispatchPolicy::reduced_schur_matvec_admissible_under_any_policy(
+        n_llm, k_llm, d_llm, cg_iters
+    ));
     assert!(policy.reduced_schur_matvec_should_offload(n_llm, k_llm, d_llm, cg_iters));
 
     // Tiny shape: narrow border below the device-loop floor → the gate stays
-    // off regardless of the CG budget (launch latency dominates).
-    assert!(!policy.reduced_schur_matvec_should_offload(30, 8, 2, cg_iters));
+    // off under every policy, regardless of the CG budget.
+    assert!(!GpuDispatchPolicy::reduced_schur_matvec_admissible_under_any_policy(
+        30, 8, 2, cg_iters
+    ));
     // CPU-canary `(300, 8)` shape from the dense floor's own tests: still off.
-    assert!(!policy.reduced_schur_matvec_should_offload(300, 8, 4, cg_iters));
+    assert!(!GpuDispatchPolicy::reduced_schur_matvec_admissible_under_any_policy(
+        300, 8, 4, cg_iters
+    ));
 }
 
 /// #1017 Phase-1 dispatch re-key (kernel side): the device matrix-free SAE
@@ -2806,9 +2815,10 @@ pub(crate) fn sae_structured_system(
 /// cross-block `H_tβ`, and deterministic nonzero gradients. Shared by the Direct
 /// and InexactPCG engagement tests so both exercise the identical operator.
 ///
-/// Shape `k = n_atoms·p = 64 ≥ DEVICE_LOOP_MIN_P (32)`; the work predicate
-/// `n·(2·d·k + d²)·cg_iters` clears `MATVEC_OFFLOAD_FLOPS_MIN` by orders of
-/// magnitude. Modest `n` keeps the CPU reference + dense parity check cheap.
+/// Shape `k = n_atoms·p = 64 ≥ DEVICE_LOOP_MIN_P (32)`; at
+/// `cg_iters = DEFAULT_PCG_MAX_ITERATIONS` the solve's `cg_iters·n·(4·d·k + d²)`
+/// arithmetic is `200·512·(4·4·64 + 16) ≈ 1.07e8` flops, above the uncalibrated
+/// seed floor. Modest `n` keeps the CPU reference + dense parity check cheap.
 pub(crate) fn well_posed_device_sae_system_1551() -> (ArrowSchurSystem, usize, usize) {
     let n = 512usize;
     let q = 4usize; // per-row latent depth d

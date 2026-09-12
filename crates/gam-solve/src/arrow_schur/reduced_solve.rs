@@ -2000,11 +2000,13 @@ pub(crate) fn maybe_build_evidence_gpu_matvec(
     if options.streaming_chunk_size.is_some() {
         return Ok(None);
     }
-    // Size gate BEFORE the device probe (startup-tax ordering): the predicate
-    // reads only associated constants, so a shape it rejects skips
-    // runtime availability resolution (whose first call creates a CUDA primary context on
-    // every GPU); an admitted shape probes exactly as the PCG seam does.
-    if !gam_gpu::GpuDispatchPolicy::default().reduced_schur_matvec_should_offload(
+    // Size gate BEFORE the device probe (startup-tax ordering): at the most
+    // permissive floor any production policy can carry, the predicate rejects
+    // exactly the shapes every reachable policy rejects, so those skip runtime
+    // availability resolution (whose first call creates a CUDA primary context on
+    // every GPU). An admitted shape probes exactly as the PCG seam does, and the
+    // probed device's calibrated policy then decides.
+    if !gam_gpu::GpuDispatchPolicy::reduced_schur_matvec_admissible_under_any_policy(
         sys.rows.len(),
         sys.k,
         sys.d,
@@ -2012,12 +2014,19 @@ pub(crate) fn maybe_build_evidence_gpu_matvec(
     ) {
         return Ok(None);
     }
-    if gam_gpu::device_runtime::GpuRuntime::resolve(options.gpu_policy)
+    let Some(runtime) = gam_gpu::device_runtime::GpuRuntime::resolve(options.gpu_policy)
         .map_err(|error| ArrowSchurError::SchurFactorFailed {
             reason: format!("evidence GPU runtime resolution failed: {error}"),
         })?
-        .is_none()
-    {
+    else {
+        return Ok(None);
+    };
+    if !runtime.policy().reduced_schur_matvec_should_offload(
+        sys.rows.len(),
+        sys.k,
+        sys.d,
+        apply_budget.max(1),
+    ) {
         return Ok(None);
     }
     // #1017: framed matrix-free system with resident device operands — prefer the

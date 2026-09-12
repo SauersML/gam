@@ -285,36 +285,37 @@ fn framed_amplitude_ridge_preserves_device_data_and_curvature_2627() {
 }
 
 /// #1783 SCALE HONESTY (pure policy, CPU-observable): the reporter's exact
-/// realistic `d_atom = 1` shape must clear the reduced-Schur offload gate, so on a
-/// CUDA host the device WOULD be selected. The gate was never the blocker for
-/// `d_atom = 1` — this pins that it admits the thin-atom regime at token scale so
-/// a future regression cannot re-introduce a `d == 1` threshold miss.
+/// realistic `d_atom = 1` shape must be eligible for the reduced-Schur offload, so
+/// on a CUDA host the device's calibrated policy decides rather than the pre-probe
+/// size gate declining it. This pins that the pre-probe gate admits the thin-atom
+/// regime at token scale, so a future regression cannot re-introduce a `d == 1`
+/// threshold miss.
 #[test]
 fn offload_gate_admits_d_atom_1_at_token_scale_1783() {
-    let policy = gam_gpu::policy::GpuDispatchPolicy::default();
+    use gam_gpu::policy::GpuDispatchPolicy;
 
     // Reporter's B200 run: X = (40456, 2048), K = 256, d_atom = 1, circle. The
-    // factored border for 256 curve atoms clears DEVICE_LOOP_MIN_P (32), and even
-    // a single CG apply clears MATVEC_OFFLOAD_FLOPS_MIN:
-    //   n·(2·d·k + d²) = 40456·(2·1·256 + 1) ≈ 2.07e7 ≥ 1e7.
+    // factored border for 256 curve atoms clears DEVICE_LOOP_MIN_P (32), and a
+    // single CG apply is 40456·(4·1·256 + 1) ≈ 4.1e7 flops, above the most
+    // permissive calibrated dense launch floor (MIN_CALIBRATABLE_GEMM_FLOPS).
     assert!(
-        policy.reduced_schur_matvec_should_offload(40_456, 256, 1, 1),
+        GpuDispatchPolicy::reduced_schur_matvec_admissible_under_any_policy(40_456, 256, 1, 1),
         "#1783: the reporter's realistic d_atom=1 shape (n=40456, k=256, d=1) must \
-         clear the offload gate at a single CG apply — the gate was never the \
-         blocker for thin curve atoms"
+         be eligible for the offload at a single CG apply — the pre-probe gate must \
+         never be the blocker for thin curve atoms"
     );
 
-    // The earlier K=64 case at n=24576 also clears at an 8-apply CG budget.
+    // The earlier K=64 case at n=24576 is eligible at an 8-apply CG budget.
     assert!(
-        policy.reduced_schur_matvec_should_offload(24_576, 64, 1, 8),
-        "#1783: the earlier K=64 d_atom=1 shape must also clear the offload gate"
+        GpuDispatchPolicy::reduced_schur_matvec_admissible_under_any_policy(24_576, 64, 1, 8),
+        "#1783: the earlier K=64 d_atom=1 shape must also be eligible for the offload"
     );
 
-    // Honesty floor: a genuinely tiny thin-atom shape still stays on the CPU (the
-    // launch/staging cost dominates), so admitting d=1 at scale did not defeat the
-    // small-shape guard.
+    // Honesty floor: a genuinely tiny thin-atom shape stays on the CPU under every
+    // policy (its border is below the device-loop floor), so admitting d=1 at
+    // scale did not defeat the small-shape guard.
     assert!(
-        !policy.reduced_schur_matvec_should_offload(64, 9, 1, 1),
+        !GpuDispatchPolicy::reduced_schur_matvec_admissible_under_any_policy(64, 9, 1, 1),
         "a tiny framed circle fixture must NOT engage the device (honest fallback)"
     );
 }
@@ -399,8 +400,13 @@ fn production_factored_large_border_routes_to_resident_inexact_pcg_1017() {
         .pcg
         .max_iterations
         .min(options.trust_region.max_iterations);
-    let offload_admitted = gam_gpu::policy::GpuDispatchPolicy::default()
-        .reduced_schur_matvec_should_offload(sys.rows.len(), sys.k, sys.d, cg_iters);
+    let offload_admitted =
+        gam_gpu::policy::GpuDispatchPolicy::reduced_schur_matvec_admissible_under_any_policy(
+            sys.rows.len(),
+            sys.k,
+            sys.d,
+            cg_iters,
+        );
     let operand_report = device.operand_byte_report();
     eprintln!(
         "#1017 production large-border telemetry: beta_dim={} factored_border={} \
