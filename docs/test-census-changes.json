@@ -219,5 +219,15 @@
       "crates/gam-inference": 3,
       "crates/gam-models": 16
     }
+  },
+  {
+    "base": "10ac599e4c5b531cb4f91d0a063e3779afc4df11",
+    "reason": "user directive: delete all useless slop",
+    "evidence": "The three gam-inference unit tests removed (compare_pairs_pointwise_and_orients_a_minus_b, compare_se_uses_unbiased_sample_variance_of_paired_differences, compare_refuses_unpaired_rows) existed only to exercise model_comparison::compare, which no production code, CLI path or integration test named; model_comparison_from_unified, which gam-cli uses, keeps its tests. test_census on MSI over 5e967c204 plus the deletion commit measured test_count_decrease 3, unit crates/gam-inference 134 -> 131, no removed pins. MSI verification at the pushed sha follows.",
+    "removed_pins": {},
+    "test_count_decrease": 3,
+    "unit_test_decreases": {
+      "crates/gam-inference": 3
+    }
   }
 ]

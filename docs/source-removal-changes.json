@@ -1644,5 +1644,39 @@
     ],
     "reason": "user directive: delete all useless slop (only used by tests / unused)",
     "evidence": "At 2c756f482, git grep -nw over crates, src, tests, examples, bench and benches found no caller of any listed item: each is named only by its own definition, its own error strings, doc links or prose. The cascade removals were reachable only through deleted items: estimate_from_designed_sample (called only by estimate_from_measure), Contract::validate (called only by compose_with_trace), CurveballSampler::accumulate (called only by coactivation_exceedance), and CoactivationExceedance with its idx and n_obs methods (returned only by coactivation_exceedance); the CurveballSampler.n_atoms field only accumulate read went with them. No test called any item. MSI verification (ban scanner, workspace --all-targets check, cargo doc -p gam-sae, guard and census) runs on the landed sha."
+  },
+  {
+    "base": "10ac599e4c5b531cb4f91d0a063e3779afc4df11",
+    "items": [
+      "crates/gam-inference/src/gpu_polya_gamma.rs:const:NORMAL_MIN_B",
+      "crates/gam-inference/src/gpu_polya_gamma.rs:fn:cholesky_lower_inplace",
+      "crates/gam-inference/src/gpu_polya_gamma.rs:fn:logistic_gibbs_step",
+      "crates/gam-inference/src/gpu_polya_gamma.rs:fn:saddlepoint_kpp",
+      "crates/gam-inference/src/gpu_polya_gamma.rs:fn:saddlepoint_solve",
+      "crates/gam-inference/src/hmc_io.rs:fn:compute_joint_logp_and_grad_into",
+      "crates/gam-inference/src/hmc_io.rs:fn:estimate_logit_pg_rao_blackwell_terms",
+      "crates/gam-inference/src/hmc_io.rs:fn:hash_rho",
+      "crates/gam-inference/src/hmc_io.rs:fn:inverse_link_with_params",
+      "crates/gam-inference/src/hmc_io.rs:fn:link_param_mode",
+      "crates/gam-inference/src/hmc_io.rs:fn:logp_and_grad",
+      "crates/gam-inference/src/hmc_io.rs:fn:new",
+      "crates/gam-inference/src/hmc_io.rs:fn:pc_prior_params_valid",
+      "crates/gam-inference/src/hmc_io.rs:fn:run_joint_beta_rho_sampling",
+      "crates/gam-inference/src/hmc_io.rs:struct:JointBetaRhoInputs",
+      "crates/gam-inference/src/hmc_io.rs:struct:JointBetaRhoPosterior",
+      "crates/gam-inference/src/hmc_io.rs:struct:JointBetaRhoResult",
+      "crates/gam-inference/src/model_comparison.rs:fn:compare",
+      "crates/gam-inference/src/model_comparison.rs:fn:compare_pairs_pointwise_and_orients_a_minus_b",
+      "crates/gam-inference/src/model_comparison.rs:fn:compare_refuses_unpaired_rows",
+      "crates/gam-inference/src/model_comparison.rs:fn:compare_se_uses_unbiased_sample_variance_of_paired_differences",
+      "crates/gam-inference/src/model_comparison.rs:struct:ComparisonReport",
+      "crates/gam-inference/src/rho_posterior.rs:fn:mixture_coefficient_covariance",
+      "crates/gam-inference/src/rho_posterior.rs:fn:rho_posterior_tier1_quadrature",
+      "crates/gam-inference/src/rho_posterior.rs:struct:MixtureCoefficientCovariance",
+      "crates/gam-inference/src/rho_posterior.rs:struct:RhoQuadratureMixture",
+      "crates/gam-inference/src/rho_posterior.rs:struct:RhoQuadratureNode"
+    ],
+    "reason": "user directive: delete all useless slop",
+    "evidence": "At 5e967c204, git grep -nw on MSI over crates src tests examples bench benches found run_joint_beta_rho_sampling, estimate_logit_pg_rao_blackwell_terms, saddlepoint_solve, logistic_gibbs_step, rho_posterior_tier1_quadrature and mixture_coefficient_covariance named only at their definitions and in doc comments; compare and ComparisonReport were named only by the three in-file tests that existed to exercise them (deleted with them); NORMAL_MIN_B was named only in docs and as one dispatch-table test input, which now uses SADDLE_MAX_B + 1 because production's regime split reads SADDLE_MAX_B. The remaining items (the JointBetaRho structs with their new and logp_and_grad methods, compute_joint_logp_and_grad_into, pc_prior_params_valid, hash_rho, inverse_link_with_params, link_param_mode, saddlepoint_kpp, cholesky_lower_inplace, RhoQuadratureNode, RhoQuadratureMixture, MixtureCoefficientCovariance) were reachable only through the listed ones. The deletion commit 1fdca1867 applies on 5e967c204 with source_removal_guard naming exactly these items. MSI verification (ban scanner, workspace --all-targets check, cargo doc -p gam-inference --no-deps, lib tests) runs on the landed sha."
   }
 ]
