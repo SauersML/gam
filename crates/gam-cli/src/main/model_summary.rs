@@ -260,6 +260,13 @@ pub(crate) fn resolved_covariance_mode(
     })
 }
 
+/// The refusal for an explicit corrected request on a fit that selected
+/// smoothing parameters but carries no correction. Refitting with the same
+/// binary publishes the same absence (a Jeffreys family without its third
+/// information derivative declares no exact outer Hessian, so no correction is
+/// minted), so the message names the modes that exist instead of a refit (#2677).
+const SMOOTHING_CORRECTED_ABSENT: &str = "saved model does not contain smoothing-corrected covariance: its fit selected smoothing parameters but published no rho-uncertainty correction; request --covariance-mode conditional, or omit --covariance-mode to use the covariance the fit publishes";
+
 pub(crate) fn covariance_from_model(
     model: &SavedModel,
     mode: InferenceCovarianceMode,
@@ -287,10 +294,7 @@ pub(crate) fn covariance_from_model(
         // compute. A fit that DOES carry smoothing coordinates keeps the hard
         // refusal: there the correction is a real, absent term.
         if !fit.lambdas.is_empty() {
-            return Err(
-                "saved model does not contain smoothing-corrected covariance; refit before requesting --covariance-mode corrected"
-                    .to_string(),
-            );
+            return Err(SMOOTHING_CORRECTED_ABSENT.to_string());
         }
     }
     if let Some(cov) = fit.beta_covariance() {
@@ -330,10 +334,7 @@ pub(crate) fn prediction_backend_from_model<'a>(
         // through to the conditional sources is the CORRECTED answer here, not
         // a substitution of a narrower band.
         if !fit.lambdas.is_empty() {
-            return Err(
-                "saved model does not contain smoothing-corrected covariance; refit before requesting --covariance-mode corrected"
-                    .to_string(),
-            );
+            return Err(SMOOTHING_CORRECTED_ABSENT.to_string());
         }
     }
     if let Some(covariance) = fit.beta_covariance() {
