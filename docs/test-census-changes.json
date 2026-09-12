@@ -249,5 +249,15 @@
       "crates/gam-custom-family": 3,
       "crates/gam-models": 5
     }
+  },
+  {
+    "base": "48ee099d449adba3ae8d68e36d36ec8755996f98",
+    "reason": "Fix-forward for main's compile break. 0904dd2a2 (gam-identifiability) deleted build_primary_grams_gpu_or_cpu, the only production caller of families::gpu::try_primary_state_gram_cuda, which left the whole GPU gram path in families/gpu.rs and families/gpu_kernel.rs and CompiledMap::raw_block_rows unreferenced. e3b50feaf (gam-solve) deleted add_analytic_penalty_contributions, the only caller of apply_analytic_penalty, and 0b5288b44 removed its sibling helpers but not it. Under warnings = deny every orphan is a build error. Both modules are deleted with their mod lines and tests, along with raw_block_rows, apply_analytic_penalty and the prelude import only it used.",
+    "evidence": "MSI job 422887 at a5a7b96ba: cargo check --workspace --exclude gam-pyffi --all-targets rc 101, 19 dead-code errors in gam-identifiability (GramBundle, CHANNELS, PACKED_LEN, packed_index, try_primary_state_gram_cuda, WorkspaceInner and its methods, weighted_gemm, plain_gemm, from_col_major, assign_block, symmetrise, KERNEL_NAME, TILE_A, TILE_B, KERNEL_SRC, raw_block_rows) plus 4 in gam-solve arrow_schur. Pre-push candidate over 5e967c204 (job 424523): the same check rc 0 in 1m42s. Guard and census over 5e967c204..bccd377e7 (lane-local candidate) list exactly these guarded identities and a loss of the four in-file tests of the deleted modules; no issue-pinned test is removed.",
+    "removed_pins": {},
+    "test_count_decrease": 4,
+    "unit_test_decreases": {
+      "crates/gam-identifiability": 4
+    }
   }
 ]

@@ -1733,5 +1733,42 @@
     ],
     "reason": "User directive 2026-09-11: delete code only tests use and code nothing uses. gam-custom-family realize_coefficient_groups_for_custom_family (with its coefficient_groups module), the two outer-criterion diagnostic evaluators and CustomFamilyWarmStart::active_constraint_rows had no production caller, and the coefficient-group types the realizer consumed and produced were left with no consumer.",
     "evidence": "Re-confirmed at the tip with git grep -nw over crates src tests examples bench benches. gam-models and tests/inference/misc import gam-terms' own CoefficientGroupSpec (gam::smooth), which stays. Removed with the three #2315 realizer unit tests, the #2612 outer-gradient FD suite test restored in 21390b321 (its only subject was evaluate_labeled_outer_criterion_for_diagnostics) and one diagnostic eprintln in kappa_exact_joint_fd_tests.rs. Gates pass base..head; MSI verification at the pushed sha follows."
+  },
+  {
+    "base": "48ee099d449adba3ae8d68e36d36ec8755996f98",
+    "items": [
+      "crates/gam-identifiability/src/families/compiler.rs:fn:raw_block_rows",
+      "crates/gam-identifiability/src/families/gpu.rs:const:CHANNELS",
+      "crates/gam-identifiability/src/families/gpu.rs:const:PACKED_LEN",
+      "crates/gam-identifiability/src/families/gpu.rs:fn:assign_block",
+      "crates/gam-identifiability/src/families/gpu.rs:fn:compute_grams",
+      "crates/gam-identifiability/src/families/gpu.rs:fn:compute_grams_cublas",
+      "crates/gam-identifiability/src/families/gpu.rs:fn:compute_grams_fused",
+      "crates/gam-identifiability/src/families/gpu.rs:fn:cpu_oracle",
+      "crates/gam-identifiability/src/families/gpu.rs:fn:from_col_major",
+      "crates/gam-identifiability/src/families/gpu.rs:fn:make_fixture",
+      "crates/gam-identifiability/src/families/gpu.rs:fn:packed_index",
+      "crates/gam-identifiability/src/families/gpu.rs:fn:packed_index_matches_upper_triangular_layout",
+      "crates/gam-identifiability/src/families/gpu.rs:fn:plain_gemm",
+      "crates/gam-identifiability/src/families/gpu.rs:fn:primary_state_cpu_oracle_is_symmetric_and_nontrivial",
+      "crates/gam-identifiability/src/families/gpu.rs:fn:primary_state_gram_cuda_with_runtime",
+      "crates/gam-identifiability/src/families/gpu.rs:fn:primary_state_gram_matches_cpu_oracle_when_cuda_available",
+      "crates/gam-identifiability/src/families/gpu.rs:fn:symmetrise",
+      "crates/gam-identifiability/src/families/gpu.rs:fn:symmetrise_for_test",
+      "crates/gam-identifiability/src/families/gpu.rs:fn:try_new",
+      "crates/gam-identifiability/src/families/gpu.rs:fn:try_primary_state_gram_cuda",
+      "crates/gam-identifiability/src/families/gpu.rs:fn:weighted_gemm",
+      "crates/gam-identifiability/src/families/gpu.rs:static:FUSED_GRAM_PTX_CACHE",
+      "crates/gam-identifiability/src/families/gpu.rs:struct:GramBundle",
+      "crates/gam-identifiability/src/families/gpu.rs:struct:WorkspaceInner",
+      "crates/gam-identifiability/src/families/gpu_kernel.rs:const:KERNEL_NAME",
+      "crates/gam-identifiability/src/families/gpu_kernel.rs:const:KERNEL_SRC",
+      "crates/gam-identifiability/src/families/gpu_kernel.rs:const:TILE_A",
+      "crates/gam-identifiability/src/families/gpu_kernel.rs:const:TILE_B",
+      "crates/gam-identifiability/src/families/gpu_kernel.rs:fn:kernel_src_declares_expected_symbol",
+      "crates/gam-solve/src/arrow_schur/system.rs:fn:apply_analytic_penalty"
+    ],
+    "reason": "Fix-forward for main's compile break. 0904dd2a2 (gam-identifiability) deleted build_primary_grams_gpu_or_cpu, the only production caller of families::gpu::try_primary_state_gram_cuda, which left the whole GPU gram path in families/gpu.rs and families/gpu_kernel.rs and CompiledMap::raw_block_rows unreferenced. e3b50feaf (gam-solve) deleted add_analytic_penalty_contributions, the only caller of apply_analytic_penalty, and 0b5288b44 removed its sibling helpers but not it. Under warnings = deny every orphan is a build error. Both modules are deleted with their mod lines and tests, along with raw_block_rows, apply_analytic_penalty and the prelude import only it used.",
+    "evidence": "MSI job 422887 at a5a7b96ba: cargo check --workspace --exclude gam-pyffi --all-targets rc 101, 19 dead-code errors in gam-identifiability (GramBundle, CHANNELS, PACKED_LEN, packed_index, try_primary_state_gram_cuda, WorkspaceInner and its methods, weighted_gemm, plain_gemm, from_col_major, assign_block, symmetrise, KERNEL_NAME, TILE_A, TILE_B, KERNEL_SRC, raw_block_rows) plus 4 in gam-solve arrow_schur. Pre-push candidate over 5e967c204 (job 424523): the same check rc 0 in 1m42s. Guard and census over 5e967c204..bccd377e7 (lane-local candidate) list exactly these guarded identities and a loss of the four in-file tests of the deleted modules; no issue-pinned test is removed."
   }
 ]
