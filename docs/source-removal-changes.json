@@ -3856,5 +3856,19 @@
     ],
     "reason": "#2469: detect_active_theta_bounds restated a local 1e-8 active-bound tolerance; railed has one definition in the outer code path, coordinate_rail_margin, which the optimizer's rail test and terminal certificate already use, so the corrected covariance reads the margin from that owner instead of a chosen constant.",
     "evidence": "At the base, git grep -w ACTIVE_THETA_BOUND_TOL finds only its declaration and its one use in crates/gam-solve/src/reml/reml_outer_engine/corrected_covariance.rs; coordinate_rail_margin is pub(crate) in rho_optimizer/bridges.rs and re-exported by rho_optimizer.rs (pub(crate) use bridges::*). active_bound_tests::active_theta_bounds_use_the_optimizer_rail_margin pins the railed set. Salvaged from the unpushed overnight patch scratchpad/b8.patch (top level), which the shared working tree held byte-for-byte."
+  },
+  {
+    "base": "26f6c1bfa6499729bdf4d7e2cef47331cc8e6748",
+    "items": [
+      "crates/gam-solve/src/estimate/optimizer.rs:fn:theta_residual_projects_only_outward_boundary_gradients",
+      "crates/gam-solve/src/pirls/dispersion.rs:const:NEGBIN_THETA_MAX",
+      "crates/gam-solve/src/pirls/dispersion.rs:const:NEGBIN_THETA_MIN",
+      "crates/gam-terms/src/basis/polylog.rs:const:FAST_REGIME_MAX_TERMS",
+      "crates/gam-terms/src/basis/polylog.rs:const:SERIES_TERM_FLOOR",
+      "crates/gam-terms/src/smooth/term_specs.rs:const:ORDER_EPS",
+      "crates/gam-terms/src/term_builder.rs:const:TOL"
+    ],
+    "reason": "#2469: chosen literals replaced by the limits the arithmetic justifies. The NB2 theta profiling box [NEGBIN_THETA_MIN, NEGBIN_THETA_MAX] = [1e-3, 1e6] is deleted: theta is the smallest representable value at which the profile score is not resolvably positive against its own accumulation band, bracketed by doubling or halving from a data-scale seed, and the joint certificate test that projected box-face multipliers (theta_residual_projects_only_outward_boundary_gradients) is replaced by theta_residual_is_zero_only_inside_the_score_band. The polylog series floor and term cap become summation until a term no longer changes the rounded partial sum. The Matern order gate ORDER_EPS and the nu parser TOL compared exactly representable half-integers and are exact comparisons.",
+    "evidence": "At the base, git grep -w finds NEGBIN_THETA_MIN and NEGBIN_THETA_MAX only in crates/gam-solve/src/pirls/dispersion.rs and crates/gam-solve/src/estimate/optimizer.rs (the seed clamp, checkpoint range test, stationarity residual and its test module); SERIES_TERM_FLOOR and FAST_REGIME_MAX_TERMS only in crates/gam-terms/src/basis/polylog.rs; ORDER_EPS only at its declaration and one use in term_specs.rs; the removed TOL is the one local declaration in term_builder.rs parse_matern_nu. theta_residual_projects_only_outward_boundary_gradients existed only in optimizer.rs's negative_binomial_joint_certificate_tests. Salvaged from the unpushed overnight patch scratchpad/b12356.patch, restricted to the 8 files that still apply at the base."
   }
 ]

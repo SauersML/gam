@@ -51,23 +51,25 @@ fn certify_factorized_inference_vector_solve(
     certify_factorized_inference_solve(hessian, &rhs_matrix, &solution_matrix, label)
 }
 
-/// Scale-free KKT residual for the Negative-Binomial conditional ML problem in
-/// `tau = log(theta)`. The score is `d log L / d theta`; therefore the
-/// minimization gradient in `tau` is `-theta * score`. At either admissible
-/// theta boundary, the outward component is a valid KKT multiplier and is
-/// projected away. Interior residuals are normalized by the observed
-/// log-theta curvature, so this is the Newton displacement still required for
-/// theta stationarity rather than an arbitrary percent drift.
-fn negbin_theta_stationarity_residual(theta: f64, score: f64, info: f64) -> f64 {
-    if !theta.is_finite() || theta <= 0.0 || !score.is_finite() || !info.is_finite() {
+/// Scale-free stationarity residual for the Negative-Binomial conditional ML
+/// problem in `tau = log(theta)`. The score is `d log L / d theta`, so the
+/// minimization gradient in `tau` is `-theta * score`. A score inside its own
+/// rounding band is zero to the arithmetic's resolution; that is the residual of
+/// a root and of the Poisson limit alike, and there is no profiling box whose
+/// faces would need a multiplier. Otherwise the residual is normalized by the
+/// observed log-theta curvature, so it is the Newton displacement still required
+/// for theta stationarity rather than an arbitrary percent drift.
+fn negbin_theta_stationarity_residual(theta: f64, profile: &pirls::NegbinThetaScore) -> f64 {
+    let pirls::NegbinThetaScore { score, info, band } = *profile;
+    if !theta.is_finite()
+        || theta <= 0.0
+        || !score.is_finite()
+        || !info.is_finite()
+        || !band.is_finite()
+    {
         return f64::INFINITY;
     }
-    let active_margin = f64::EPSILON.sqrt() * theta.max(1.0);
-    let at_lower = theta <= pirls::NEGBIN_THETA_MIN + active_margin;
-    let at_upper = theta >= pirls::NEGBIN_THETA_MAX - active_margin;
-    // For minimizing -log L: lower-bound KKT requires score <= 0; upper-bound
-    // KKT requires score >= 0. Those are exact one-sided optima.
-    if (at_lower && score <= 0.0) || (at_upper && score >= 0.0) {
+    if score.abs() <= band {
         return 0.0;
     }
     let log_theta_gradient = -theta * score;
@@ -964,9 +966,12 @@ where
         estimated: true,
     } = resolved_likelihood_scale
     {
-        let theta_seed = theta
-            .value()
-            .clamp(pirls::NEGBIN_THETA_MIN, pirls::NEGBIN_THETA_MAX);
+        let theta_seed = theta.value();
+        if !(theta_seed.is_finite() && theta_seed > 0.0) {
+            return Err(EstimationError::InvalidInput(format!(
+                "estimated Negative-Binomial theta seed must be finite and positive, got {theta_seed}"
+            )));
+        }
         // Treat the estimated family value as a warm-start coordinate. This
         // makes an exhaustion checkpoint resumable by reconstructing the same
         // estimated-NB family with the carried theta and passing the carried rho
@@ -1938,9 +1943,7 @@ where
                 ));
             }
             let theta = f64::from_bits(frozen_bits);
-            if !theta.is_finite()
-                || !(pirls::NEGBIN_THETA_MIN..=pirls::NEGBIN_THETA_MAX).contains(&theta)
-            {
+            if !(theta.is_finite() && theta > 0.0) {
                 return Err(EstimationError::InvalidInput(format!(
                     "estimated Negative-Binomial joint solve has invalid theta checkpoint {theta}"
                 )));
@@ -1956,9 +1959,9 @@ where
             pirls_res.likelihood = cfg.likelihood.clone().with_negbin_theta(theta);
 
             let final_eta = pirls_res.final_eta.to_owned();
-            let (theta_score, theta_info) =
+            let theta_profile =
                 pirls::negbin_theta_score_and_info(y_o.view(), &final_eta, w_o.view(), theta)?;
-            let theta_residual = negbin_theta_stationarity_residual(theta, theta_score, theta_info);
+            let theta_residual = negbin_theta_stationarity_residual(theta, &theta_profile);
             // This residual is a Newton displacement in the outer log-theta
             // coordinate, so it shares the outer REML tolerance. The beta
             // PIRLS tolerance certifies a different coordinate system and must
@@ -3916,7 +3919,11 @@ mod shipped_joint_point_identity_2727_tests {
 #[cfg(test)]
 mod negative_binomial_joint_certificate_tests {
     use super::negbin_theta_stationarity_residual;
-    use crate::pirls::{NEGBIN_THETA_MAX, NEGBIN_THETA_MIN};
+    use crate::pirls::NegbinThetaScore;
+
+    fn profile(score: f64, info: f64, band: f64) -> NegbinThetaScore {
+        NegbinThetaScore { score, info, band }
+    }
 
     #[test]
     fn theta_residual_is_the_log_scale_newton_displacement() {
@@ -3925,37 +3932,46 @@ mod negative_binomial_joint_certificate_tests {
         let info: f64 = 5.0;
         let expected = (theta * score).abs() / (theta * theta * info - theta * score);
         assert_eq!(
-            negbin_theta_stationarity_residual(theta, score, info),
+            negbin_theta_stationarity_residual(theta, &profile(score, info, 0.0)),
             expected
         );
         let weight_scale = 1.0e-9;
-        let scaled =
-            negbin_theta_stationarity_residual(theta, weight_scale * score, weight_scale * info);
+        let scaled = negbin_theta_stationarity_residual(
+            theta,
+            &profile(weight_scale * score, weight_scale * info, 0.0),
+        );
         assert!(
             (scaled - expected).abs() <= 8.0 * f64::EPSILON * expected.max(1.0),
             "the theta certificate must be invariant to uniform case-weight scaling: {scaled} vs {expected}"
         );
     }
 
+    /// There is no profiling box and so no bound multiplier: the residual is zero
+    /// exactly when the score is inside its own rounding band, on either side
+    /// (#2469).
     #[test]
-    fn theta_residual_projects_only_outward_boundary_gradients() {
+    fn theta_residual_is_zero_only_inside_the_score_band() {
         assert_eq!(
-            negbin_theta_stationarity_residual(NEGBIN_THETA_MIN, -1.0, 1.0),
+            negbin_theta_stationarity_residual(2.0, &profile(1.0e-12, 5.0, 2.0e-12)),
             0.0
         );
         assert_eq!(
-            negbin_theta_stationarity_residual(NEGBIN_THETA_MAX, 1.0, 1.0),
+            negbin_theta_stationarity_residual(2.0, &profile(-1.0e-12, 5.0, 2.0e-12)),
             0.0
         );
-        assert!(negbin_theta_stationarity_residual(NEGBIN_THETA_MIN, 1.0, 1.0) > 0.0);
-        assert!(negbin_theta_stationarity_residual(NEGBIN_THETA_MAX, -1.0, 1.0) > 0.0);
+        assert!(negbin_theta_stationarity_residual(2.0, &profile(3.0e-12, 5.0, 2.0e-12)) > 0.0);
+        assert!(negbin_theta_stationarity_residual(2.0, &profile(-3.0e-12, 5.0, 2.0e-12)) > 0.0);
     }
 
     #[test]
     fn theta_residual_rejects_invalid_curvature_or_coordinates() {
-        assert!(negbin_theta_stationarity_residual(f64::NAN, 0.0, 1.0).is_infinite());
-        assert!(negbin_theta_stationarity_residual(1.0, 1.0, 0.0).is_infinite());
-        assert!(negbin_theta_stationarity_residual(1.0, 2.0, 1.0).is_infinite());
+        assert!(
+            negbin_theta_stationarity_residual(f64::NAN, &profile(0.0, 1.0, 0.0)).is_infinite()
+        );
+        assert!(negbin_theta_stationarity_residual(1.0, &profile(1.0, 0.0, 0.0)).is_infinite());
+        assert!(negbin_theta_stationarity_residual(1.0, &profile(2.0, 1.0, 0.0)).is_infinite());
+        assert!(
+            negbin_theta_stationarity_residual(1.0, &profile(1.0e-3, 1.0, f64::NAN)).is_infinite()
+        );
     }
-
 }

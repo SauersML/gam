@@ -1988,7 +1988,9 @@ pub(crate) fn duchon_matern_kernel_general_from_distance(
         coeffs_local = duchon_partial_fraction_coeffs(p_order, s_order, kappa);
         &coeffs_local
     };
-    let collision_taylor_radius = DUCHON_COLLISION_TAYLOR_REL * length_scale.max(1e-8);
+    // `length_scale` was refused above unless finite and positive, so the
+    // collision radius is proportional to the validated scale itself.
+    let collision_taylor_radius = DUCHON_COLLISION_TAYLOR_REL * length_scale;
     // The near-collision Taylor expansion uses phi(0) plus even-order
     // derivative collision limits. Those limits only exist when the kernel
     // is finite at the origin, i.e. when 2(p+s) > d. Below that threshold

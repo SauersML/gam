@@ -11,11 +11,21 @@ use super::*;
 /// Saturation threshold used only by inner-loop separation diagnostics.
 pub(super) const PIRLS_ETA_ABS_CAP: f64 = 40.0;
 
-/// Declared finite profiling interval for NB2 theta.  The interval endpoints
-/// are not estimates: absence of an interior ML root is a typed refusal.
-pub(crate) const NEGBIN_THETA_MIN: f64 = 1e-3;
-pub(crate) const NEGBIN_THETA_MAX: f64 = 1e6;
+/// The NB2 profile score `∂ℓ/∂θ`, its observed information `−∂²ℓ/∂θ²`, and the
+/// rounding band of the score's accumulation.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct NegbinThetaScore {
+    pub(crate) score: f64,
+    pub(crate) info: f64,
+    pub(crate) band: f64,
+}
 
+impl NegbinThetaScore {
+    /// Whether the score is positive by more than its own rounding band.
+    pub(crate) fn resolvably_positive(&self) -> bool {
+        self.score > self.band
+    }
+}
 
 fn certified_log_means(eta: &Array1<f64>) -> Result<Vec<f64>, EstimationError> {
     let rows: Vec<Result<f64, EstimationError>> = eta
@@ -364,7 +374,7 @@ fn negbin_theta_score_and_info_from_means(
     means: &[f64],
     priorweights: ArrayView1<'_, f64>,
     theta: f64,
-) -> Result<(f64, f64), EstimationError> {
+) -> Result<NegbinThetaScore, EstimationError> {
     if !(theta.is_finite() && theta > 0.0) {
         crate::bail_invalid_estim!("negative-binomial theta must be finite and positive");
     }
@@ -372,12 +382,12 @@ fn negbin_theta_score_and_info_from_means(
     let trigamma_theta = trigamma(theta);
     let ln_theta = theta.ln();
     let inv_theta = theta.recip();
-    let rows: Vec<Result<(f64, f64), EstimationError>> = (0..eta.len())
+    let rows: Vec<Result<(f64, f64, f64), EstimationError>> = (0..eta.len())
         .into_par_iter()
         .map(|i| {
             let wi = certified_prior_weight(i, eta[i], priorweights[i])?;
             if wi == 0.0 {
-                return Ok((0.0, 0.0));
+                return Ok((0.0, 0.0, 0.0));
             }
             let yi = y[i];
             if !valid_count_response(yi) {
@@ -390,16 +400,24 @@ fn negbin_theta_score_and_info_from_means(
             }
             let theta_plus_mu = theta + means[i];
             let theta_plus_y = theta + yi;
-            let s = digamma(yi + theta) - psi_theta + ln_theta + 1.0
-                - theta_plus_mu.ln()
-                - theta_plus_y / theta_plus_mu;
+            let digamma_y = digamma(yi + theta);
+            let ln_theta_plus_mu = theta_plus_mu.ln();
+            let ratio = theta_plus_y / theta_plus_mu;
+            let s = digamma_y - psi_theta + ln_theta + 1.0 - ln_theta_plus_mu - ratio;
             // Avoid forming `(theta + mu)^2`, which can overflow even when the
             // information term itself is representable.
             let info_row = -trigamma(yi + theta) + trigamma_theta - inv_theta + 2.0 / theta_plus_mu
                 - (theta_plus_y / theta_plus_mu) / theta_plus_mu;
             let score = wi * s;
             let info = wi * info_row;
-            if !(score.is_finite() && info.is_finite()) {
+            let magnitude = wi
+                * (digamma_y.abs()
+                    + psi_theta.abs()
+                    + ln_theta.abs()
+                    + 1.0
+                    + ln_theta_plus_mu.abs()
+                    + ratio.abs());
+            if !(score.is_finite() && info.is_finite() && magnitude.is_finite()) {
                 return Err(EstimationError::pirls_row_geometry_unrepresentable(
                     i,
                     "negative-binomial theta score/information",
@@ -407,10 +425,21 @@ fn negbin_theta_score_and_info_from_means(
                     score,
                 ));
             }
-            Ok((score, info))
+            Ok((score, info, magnitude))
         })
         .collect();
-    certified_pairs_sum(rows)
+    let rows: Vec<(f64, f64, f64)> = rows.into_iter().collect::<Result<_, _>>()?;
+    let (score, info) =
+        certified_pairs_sum(rows.iter().map(|&(score, info, _)| Ok((score, info))).collect())?;
+    let (magnitude, _) =
+        certified_pairs_sum(rows.iter().map(|&(_, _, magnitude)| Ok((magnitude, 0.0))).collect())?;
+    // Each row's score is formed with fourteen rounded operations (three argument
+    // sums, two digammas, two logarithms, the quotient, five additions and the
+    // weight) over a cancelling sum of magnitude `magnitude`, and the rows are
+    // reduced pairwise.
+    let reduction_depth = 14 + (usize::BITS - eta.len().leading_zeros()) as usize;
+    let band = gam_linalg::roundoff::accumulation_band(reduction_depth, magnitude);
+    Ok(NegbinThetaScore { score, info, band })
 }
 
 pub(crate) fn negbin_theta_score_and_info(
@@ -418,12 +447,22 @@ pub(crate) fn negbin_theta_score_and_info(
     eta: &Array1<f64>,
     priorweights: ArrayView1<'_, f64>,
     theta: f64,
-) -> Result<(f64, f64), EstimationError> {
+) -> Result<NegbinThetaScore, EstimationError> {
     let means = certified_log_means(eta)?;
     negbin_theta_score_and_info_from_means(y, eta, &means, priorweights, theta)
 }
 
-/// Profile a finite interior NB2 theta with safeguarded Newton/bisection.
+/// Profile the NB2 theta: the smallest representable theta at which the profile
+/// score is not resolvably positive.
+///
+/// `∂ℓ/∂θ` is positive below the maximizer. For overdispersed data it changes
+/// sign at a finite root; for equidispersed or underdispersed data it decays to
+/// zero without changing sign as θ grows, the Poisson limit. Either way the
+/// estimate is where the score stops being positive beyond its own rounding band:
+/// at a root that is the root to the arithmetic's resolution, and in the Poisson
+/// limit it is the θ past which the data cannot distinguish NB2 from its limit.
+/// The bracket is found by doubling or halving outward from a data-scale seed,
+/// and the only way out of either walk is the representable range itself.
 pub(crate) fn estimate_negbin_theta_from_eta(
     y: ArrayView1<'_, f64>,
     eta: &Array1<f64>,
@@ -478,84 +517,138 @@ pub(crate) fn estimate_negbin_theta_from_eta(
     }
     let mu_bar = wmu / total_weight;
     let pearson_ratio = wpearson / total_weight;
-    let mut theta = if pearson_ratio > 1.0 {
-        mu_bar / (pearson_ratio - 1.0)
+    // The method-of-moments θ when the Pearson statistic shows overdispersion,
+    // otherwise the mean count, which is the data's own scale for θ. This is only
+    // where the outward walk starts; it is never returned as an estimate.
+    let moment = mu_bar / (pearson_ratio - 1.0);
+    let seed = if pearson_ratio > 1.0 && moment.is_finite() && moment > 0.0 {
+        moment
     } else {
-        0.5 * (NEGBIN_THETA_MIN + NEGBIN_THETA_MAX)
+        mu_bar
     };
-    // This projection is only a root-solver seed; it is never returned as an
-    // estimate and therefore does not alter the profiled model.
-    theta = theta.max(NEGBIN_THETA_MIN).min(NEGBIN_THETA_MAX);
+    if !(seed.is_finite() && seed > 0.0) {
+        crate::bail_invalid_estim!(
+            "negative-binomial theta seed is not representable (mean count {mu_bar:?}, Pearson ratio {pearson_ratio:?})"
+        );
+    }
+    let profile =
+        |theta: f64| negbin_theta_score_and_info_from_means(y, eta, &means, priorweights, theta);
 
-    let (score_lo, _) =
-        negbin_theta_score_and_info_from_means(y, eta, &means, priorweights, NEGBIN_THETA_MIN)?;
-    let (score_hi, _) =
-        negbin_theta_score_and_info_from_means(y, eta, &means, priorweights, NEGBIN_THETA_MAX)?;
-    if !(score_lo.is_finite() && score_hi.is_finite()) {
-        crate::bail_invalid_estim!(
-            "negative-binomial theta profile score is unrepresentable at the domain endpoints ({NEGBIN_THETA_MIN}, {NEGBIN_THETA_MAX}); scores=({score_lo:?}, {score_hi:?})"
-        );
+    let mut lo;
+    let mut hi;
+    if profile(seed)?.resolvably_positive() {
+        lo = seed;
+        hi = 2.0 * seed;
+        loop {
+            if !hi.is_finite() {
+                crate::bail_invalid_estim!(
+                    "negative-binomial theta profile score stays resolvably positive past the representable range (seed {seed:?})"
+                );
+            }
+            if !profile(hi)?.resolvably_positive() {
+                break;
+            }
+            lo = hi;
+            hi *= 2.0;
+        }
+    } else {
+        hi = seed;
+        lo = 0.5 * seed;
+        loop {
+            if !(lo > 0.0) {
+                crate::bail_invalid_estim!(
+                    "negative-binomial theta MLE lies below the representable range: the profile score is not resolvably positive at any positive theta below {seed:?}"
+                );
+            }
+            if profile(lo)?.resolvably_positive() {
+                break;
+            }
+            hi = lo;
+            lo *= 0.5;
+        }
     }
-    // `score` IS d/dtheta of the profiled NB2 log-likelihood, so its SIGN at an
-    // endpoint locates the maximizer relative to that endpoint. An interior
-    // root needs `score_lo > 0 > score_hi`; the two one-sided failures are not
-    // "no maximizer", they are a maximizer the representable domain cannot
-    // hold, and the profile's maximum over the domain is then attained AT the
-    // endpoint.
-    //
-    // `score_hi >= 0` is the equidispersed / underdispersed case: the
-    // likelihood is still rising at theta = 1e6, i.e. theta-hat is +inf and the
-    // NB2 model has collapsed onto its Poisson limit. Measured on this
-    // workspace's own fixtures the excess is not even resolvable —
-    // `scores=(6948.2, 9.06e-12)` and `scores=(137678.1, 7.45e-13)`, upper
-    // scores 15 and 17 orders of magnitude below the lower one — so refusing
-    // the WHOLE fit over it discarded a converged model to avoid returning the
-    // one value the profile actually maximizes at.
-    //
-    // `score_lo <= 0` is the mirror image at the lower rail. Both return the
-    // endpoint, which is exactly what the safeguarded bisection below would
-    // converge to if the domain were open; what it must NOT do is silently
-    // report an interior estimate, and it does not: the returned theta is the
-    // rail itself.
-    //
-    // Both endpoints failing at once is a genuinely non-monotone profile score,
-    // which no rail can represent, and keeps the fail-loud refusal.
-    if score_lo <= 0.0 && score_hi >= 0.0 {
-        crate::bail_invalid_estim!(
-            "negative-binomial theta profile score is non-monotone across ({NEGBIN_THETA_MIN}, {NEGBIN_THETA_MAX}); scores=({score_lo:?}, {score_hi:?})"
-        );
-    }
-    if score_hi >= 0.0 {
-        return Ok(NEGBIN_THETA_MAX);
-    }
-    if score_lo <= 0.0 {
-        return Ok(NEGBIN_THETA_MIN);
-    }
-    let mut lo = NEGBIN_THETA_MIN;
-    let mut hi = NEGBIN_THETA_MAX;
-    for _ in 0..100 {
-        let (score, info) =
-            negbin_theta_score_and_info_from_means(y, eta, &means, priorweights, theta)?;
-        if score > 0.0 {
+    // Safeguarded Newton inside `[lo, hi]`. A Newton step is taken only when it
+    // lands strictly inside the bracket and at most halves the previous step;
+    // otherwise the bracket is bisected. Steps therefore shrink geometrically or
+    // the bracket halves, and the loop ends when no representable theta lies
+    // strictly inside the bracket or the step no longer moves theta.
+    let mut theta = hi;
+    let mut previous_step = hi - lo;
+    loop {
+        let at = profile(theta)?;
+        if at.resolvably_positive() {
             lo = theta;
         } else {
             hi = theta;
         }
-        let candidate = theta + score / info;
-        let next = if info.is_finite() && info > 0.0 && candidate > lo && candidate < hi {
-            candidate
+        let bisection = lo + 0.5 * (hi - lo);
+        let newton = theta + at.score / at.info;
+        let next = if at.info > 0.0
+            && newton > lo
+            && newton < hi
+            && (newton - theta).abs() <= 0.5 * previous_step.abs()
+        {
+            newton
         } else {
-            lo + 0.5 * (hi - lo)
+            bisection
         };
-        if (next - theta).abs() <= 1e-10 * theta {
-            theta = next;
+        if !(next > lo && next < hi) || next == theta {
             break;
         }
+        previous_step = next - theta;
         theta = next;
     }
-    if theta.is_finite() && theta > NEGBIN_THETA_MIN && theta < NEGBIN_THETA_MAX {
-        Ok(theta)
-    } else {
-        crate::bail_invalid_estim!("negative-binomial theta solve produced {theta:?}")
+    Ok(hi)
+}
+
+#[cfg(test)]
+mod negbin_theta_profile_tests {
+    use super::*;
+
+    fn profile_at(y: &Array1<f64>, eta: &Array1<f64>, w: &Array1<f64>, theta: f64) -> NegbinThetaScore {
+        negbin_theta_score_and_info(y.view(), eta, w.view(), theta)
+            .expect("the NB2 profile is representable at a positive theta")
+    }
+
+    /// An extremely overdispersed sample has its theta MLE far below any fixed
+    /// profiling rail: the estimate is where the score changes sign, not the
+    /// endpoint of a declared interval (#2469).
+    #[test]
+    fn overdispersed_theta_is_the_root_of_the_profile_score() {
+        let n = 1000;
+        let mut y = Array1::<f64>::zeros(n);
+        y[n - 1] = 1.0e6;
+        let eta = Array1::<f64>::from_elem(n, 1000.0_f64.ln());
+        let w = Array1::<f64>::ones(n);
+        let theta = estimate_negbin_theta_from_eta(y.view(), &eta, w.view())
+            .expect("an overdispersed sample has a finite theta MLE");
+        assert!(theta.is_finite() && theta > 0.0, "theta={theta:e}");
+        let below = profile_at(&y, &eta, &w, 0.5 * theta);
+        let above = profile_at(&y, &eta, &w, 2.0 * theta);
+        assert!(
+            below.score > 0.0 && above.score < 0.0,
+            "the score must change sign across [theta/2, 2 theta] at theta={theta:e}: \
+             below={below:?} above={above:?}"
+        );
+    }
+
+    /// An underdispersed sample has no finite theta MLE: the profile score stays
+    /// positive and decays toward zero, the Poisson limit. The estimate is the
+    /// smallest theta at which that score is no longer resolvably positive, so the
+    /// score there is inside its band and above it at half that theta (#2469).
+    #[test]
+    fn underdispersed_theta_is_where_the_score_stops_being_resolvable() {
+        let y = Array1::from(vec![2.0, 3.0, 4.0, 3.0, 2.0, 4.0, 3.0, 3.0]);
+        let eta = Array1::<f64>::from_elem(y.len(), 3.0_f64.ln());
+        let w = Array1::<f64>::ones(y.len());
+        let theta = estimate_negbin_theta_from_eta(y.view(), &eta, w.view())
+            .expect("the Poisson limit is represented by a finite theta");
+        assert!(theta.is_finite() && theta > 0.0, "theta={theta:e}");
+        let at = profile_at(&y, &eta, &w, theta);
+        let half = profile_at(&y, &eta, &w, 0.5 * theta);
+        assert!(
+            !at.resolvably_positive() && half.resolvably_positive(),
+            "theta={theta:e} must be the resolution limit of the profile score: at={at:?} half={half:?}"
+        );
     }
 }

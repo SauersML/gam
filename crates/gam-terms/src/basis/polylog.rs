@@ -5,8 +5,8 @@
 //! They are pure scalar math with no dependency on the rest of the basis
 //! machinery, used by the closed-form Sobolev Wahba sphere kernels.
 //!
-//! Both use the direct power series with early exit on `z ∈ [0, 0.5]`, where
-//! ~50 terms reach 1e-15, and a reflection on `(0.5, 1)`. The reflections
+//! Both use the direct power series on `z ∈ [0, 0.5]`, summed until a term no
+//! longer changes the rounded partial sum, and a reflection on `(0.5, 1)`. The reflections
 //! differ, because the two functions have different ones available:
 //!
 //! * `Li₂` uses `Li₂(z) = π²/6 − ln z·ln(1−z) − Li₂(1−z)`, which maps the slow
@@ -38,15 +38,27 @@
 //! leading term is just `ζ(3)`. Verified against 50-digit `mpmath.polylog`
 //! values in this module's tests.
 
-/// Per-term magnitude below which the truncated power series is considered
-/// converged: at `1e-18` the dropped tail is well under one ulp of an O(1)
-/// partial sum, so the early exit never costs accuracy.
-pub(crate) const SERIES_TERM_FLOOR: f64 = 1e-18;
-
-/// Hard term cap for the fast regime `z ≤ 0.5`, where the geometric-like decay
-/// reaches [`SERIES_TERM_FLOOR`] in well under this many terms; acts only as a
-/// non-convergence guard.
-pub(crate) const FAST_REGIME_MAX_TERMS: usize = 200;
+/// `Σ_{k≥1} z^k / k^power` for `z ∈ (0, 0.5]`, summed until a term no longer
+/// changes the rounded partial sum.
+///
+/// The terms decrease at least geometrically (ratio `≤ z ≤ 1/2`), so once a
+/// term is below half an ulp of the partial sum every later term is too, and
+/// the whole tail cannot change the result. The loop terminates because the
+/// terms tend to zero and the partial sum is at least `z > 0`.
+fn unit_polylog_series(z: f64, power: i32) -> f64 {
+    let mut sum = 0.0_f64;
+    let mut zk = z;
+    let mut k = 1.0_f64;
+    loop {
+        let next = sum + zk / k.powi(power);
+        if next == sum {
+            return sum;
+        }
+        sum = next;
+        zk *= z;
+        k += 1.0;
+    }
+}
 
 /// Coefficients `ζ(3−k) / k!` of the `μ = ln z` expansion of `Li₃`, for the
 /// `k ≥ 3` at which they do not vanish.
@@ -84,18 +96,7 @@ pub(crate) fn dilog_unit(z: f64) -> f64 {
         return std::f64::consts::PI * std::f64::consts::PI / 6.0;
     }
     if z <= 0.5 {
-        let mut sum = 0.0_f64;
-        let mut zk = z;
-        for k in 1..=FAST_REGIME_MAX_TERMS {
-            let kf = k as f64;
-            let term = zk / (kf * kf);
-            sum += term;
-            if term < SERIES_TERM_FLOOR {
-                break;
-            }
-            zk *= z;
-        }
-        sum
+        unit_polylog_series(z, 2)
     } else {
         let one_minus_z = 1.0 - z;
         let pi2_6 = std::f64::consts::PI * std::f64::consts::PI / 6.0;
@@ -148,18 +149,7 @@ pub(crate) fn trilog_unit(z: f64) -> f64 {
         }
         return sum;
     }
-    let mut sum = 0.0_f64;
-    let mut zk = z;
-    for k in 1..=FAST_REGIME_MAX_TERMS {
-        let kf = k as f64;
-        let term = zk / (kf * kf * kf);
-        sum += term;
-        if term < SERIES_TERM_FLOOR {
-            break;
-        }
-        zk *= z;
-    }
-    sum
+    unit_polylog_series(z, 3)
 }
 
 #[cfg(test)]

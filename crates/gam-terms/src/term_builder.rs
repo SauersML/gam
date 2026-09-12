@@ -5761,16 +5761,18 @@ fn parse_matern_nu(raw: &str) -> Result<MaternNu, String> {
             .map_err(|err| format!("{}: {err}", unsupported_matern_nu_message(raw)))?
     };
 
-    const TOL: f64 = 1e-12;
-    if (value - 0.5).abs() <= TOL {
+    // Every supported smoothness is a half-integer that f64 represents exactly,
+    // and every decimal or rational spelling of one parses to it exactly, so a
+    // value is supported only when it equals one of them.
+    if value == 0.5 {
         Ok(MaternNu::Half)
-    } else if (value - 1.5).abs() <= TOL {
+    } else if value == 1.5 {
         Ok(MaternNu::ThreeHalves)
-    } else if (value - 2.5).abs() <= TOL {
+    } else if value == 2.5 {
         Ok(MaternNu::FiveHalves)
-    } else if (value - 3.5).abs() <= TOL {
+    } else if value == 3.5 {
         Ok(MaternNu::SevenHalves)
-    } else if (value - 4.5).abs() <= TOL {
+    } else if value == 4.5 {
         Ok(MaternNu::NineHalves)
     } else {
         Err(unsupported_matern_nu_message(raw))

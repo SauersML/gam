@@ -1728,6 +1728,24 @@ fn parse_matern_nu_accepts_equivalent_half_integer_forms() {
     }
 }
 
+/// A value that is not exactly one of the supported half-integers is refused,
+/// however close it is: the former `1e-12` window admitted spellings such as
+/// `1.4999999999999` as ν = 3/2 (#2469).
+#[test]
+fn parse_matern_nu_refuses_values_near_but_not_equal_to_a_half_integer() {
+    for raw in [
+        "1.4999999999999",
+        "2.5000000000001",
+        "0.5000000000001",
+        "9/2.0000000000001",
+    ] {
+        assert!(
+            parse_matern_nu(raw).is_err(),
+            "{raw:?} is not a supported half-integer smoothness"
+        );
+    }
+}
+
 #[test]
 fn parse_matern_nu_rejects_unsupported_or_invalid_values() {
     for raw in ["1", "2", "11/2", "1/0", "nan", "fast"] {

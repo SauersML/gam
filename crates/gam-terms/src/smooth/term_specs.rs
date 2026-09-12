@@ -5572,7 +5572,8 @@ pub fn matern_operator_penalty_triplet_at_length_scale(
     // at `DuchonOperatorPenaltySpec::matern_for_smoothness`. The third-order
     // energy is appended below whenever the collocation builder emitted its
     // Gram (`MaternNu::admits_third_order_operator`, isotropic metric).
-    const ORDER_EPS: f64 = 1e-9;
+    // `m` and every `min_order` are small half-integers, which f64 represents
+    // exactly, so the order gate is an exact comparison.
     let d = penalty_centers.ncols();
     let m = nu.half_integer_value() + 0.5 * d as f64;
     let mut candidates = Vec::with_capacity(4);
@@ -5586,7 +5587,7 @@ pub fn matern_operator_penalty_triplet_at_length_scale(
         ),
     ] {
         let nondifferentiable_ou = matches!(nu, crate::basis::MaternNu::Half);
-        if min_order > 0.0 && (nondifferentiable_ou || m + ORDER_EPS < min_order) {
+        if min_order > 0.0 && (nondifferentiable_ou || m < min_order) {
             continue;
         }
         let sym = (&raw + &raw.t()) * 0.5;

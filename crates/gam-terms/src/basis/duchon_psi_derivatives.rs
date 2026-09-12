@@ -199,7 +199,10 @@ pub(crate) fn duchon_partial_fraction_kernel_psi_triplet(
         "partial-fraction psi jet called for the stable-integral Duchon route"
     );
     let smoothness_order = 2 * (p_order + s_order);
-    let collision_taylor_radius = DUCHON_COLLISION_TAYLOR_REL * length_scale.max(1e-8);
+    // Refuse a length scale that is not finite and positive before either
+    // branch, so the collision radius is proportional to the validated scale.
+    let kappa = duchon_inverse_length_scale(length_scale, "Duchon partial-fraction ψ-triplet")?;
+    let collision_taylor_radius = DUCHON_COLLISION_TAYLOR_REL * length_scale;
     if r <= collision_taylor_radius && smoothness_order > k_dim {
         let r2 = r * r;
         let mut value = 0.0_f64;
@@ -229,7 +232,6 @@ pub(crate) fn duchon_partial_fraction_kernel_psi_triplet(
         return Ok((value, first, second));
     }
 
-    let kappa = duchon_inverse_length_scale(length_scale, "Duchon partial-fraction ψ-triplet")?;
     let kappa2 = kappa * kappa;
     let mut value = KahanSum::default();
     let mut first = KahanSum::default();
