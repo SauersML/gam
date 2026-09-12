@@ -99,10 +99,13 @@ impl CorrectedCovariance {
 pub(crate) const INDEFINITE_SUGGESTED_ACTION: &str = "refit with a tighter outer tolerance, verify the inspected objective is the true \
      REML/LAML cost rather than a surrogate, and audit recent active-set transitions";
 
-/// Detect θ-coordinates that are sitting on the [-RHO_BOUND, RHO_BOUND] bound.
+/// Detect θ-coordinates railed against the [-RHO_BOUND, RHO_BOUND] box.
 ///
-/// We use the same `tolerance = 1e-8` as the rest of the outer code path so the
-/// active-set view here agrees with the optimizer's view at the reported optimum.
+/// "Railed" has one definition in the outer code path: within
+/// `coordinate_rail_margin` of either bound, the margin the optimizer's rail test
+/// and the terminal certificate judge the same coordinate against. Reading the
+/// margin from that owner, instead of restating a tolerance here, is what makes
+/// this active set the optimizer's own at the reported optimum.
 pub(crate) fn detect_active_theta_bounds(theta: Option<&[f64]>, q: usize) -> Vec<usize> {
     let Some(theta) = theta else {
         return Vec::new();
@@ -111,13 +114,11 @@ pub(crate) fn detect_active_theta_bounds(theta: Option<&[f64]>, q: usize) -> Vec
         return Vec::new();
     }
     let bound = crate::estimate::RHO_BOUND;
-    // Same active-bound tolerance the outer optimizer uses, so this active-set
-    // view agrees with the optimizer's at the reported optimum.
-    const ACTIVE_THETA_BOUND_TOL: f64 = 1e-8;
+    let margin = crate::rho_optimizer::coordinate_rail_margin(-bound, bound);
     theta
         .iter()
         .enumerate()
-        .filter_map(|(i, &v)| (v.abs() >= bound - ACTIVE_THETA_BOUND_TOL).then_some(i))
+        .filter_map(|(i, &v)| (v <= -bound + margin || v >= bound - margin).then_some(i))
         .collect()
 }
 
@@ -592,4 +593,27 @@ pub fn spectral_epsilon(eigenvalues: &[f64]) -> f64 {
 #[inline]
 pub fn spectral_epsilon_for_dim(dim: usize) -> f64 {
     f64::EPSILON.sqrt() * (dim as f64).max(1.0)
+}
+
+#[cfg(test)]
+mod active_bound_tests {
+    use super::*;
+
+    /// The corrected covariance excludes exactly the coordinates the outer
+    /// optimizer counts as railed: within `coordinate_rail_margin` of either
+    /// bound. The former local `1e-8` tolerance kept coordinates the optimizer
+    /// and its certificate had already judged railed as free directions (#2469).
+    #[test]
+    fn active_theta_bounds_use_the_optimizer_rail_margin() {
+        let bound = crate::estimate::RHO_BOUND;
+        let margin = crate::rho_optimizer::coordinate_rail_margin(-bound, bound);
+        assert!(margin > 0.0, "a covered box has a positive rail margin");
+        let theta = [
+            bound - 0.5 * margin,
+            -bound + 0.5 * margin,
+            bound - 2.0 * margin,
+            0.0,
+        ];
+        assert_eq!(detect_active_theta_bounds(Some(&theta), theta.len()), vec![0, 1]);
+    }
 }

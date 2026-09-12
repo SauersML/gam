@@ -3848,5 +3848,13 @@
     ],
     "reason": "#2899, SPEC rules 23 and 25. gam fit's --survival-time-anchor flag set the centering anchor of the survival baseline time basis. docs/cli.md described re-centering as \"an exact affine reparameterization of the baseline offset, so this picks the frame the smoothing selection sees, not the model\": a numerical frame choice with no model meaning, which the fit already makes (the robust interior median exit for marginal-slope and genuinely left-truncated data, the earliest entry otherwise). The flag is deleted. cli_survival_time_anchor_is_honored_on_the_default_transformation_route_2631 asserted only that the flag's value reached the fit, so it is deleted. cli_weibull_route_anchors_left_truncated_data_and_honors_the_override_2631 loses its override arm and is renamed cli_weibull_route_anchors_left_truncated_data_at_the_median_exit_2631, which keeps the default-anchor assertion.",
     "evidence": "At the base, git grep finds each old test name only at its declaration in tests/src_modules/misc/cli_tests.rs. git grep -e --survival-time-anchor over the tree finds no bench, script, example or workflow caller, only CHANGELOG history, docs/cli.md, docs/frontend-parity.md, and comments in gam-config and gam-models (the two present-tense ones are reworded here). The engine-arm agreement test cli_and_engine_agree_on_the_left_truncated_survival_anchor_2631 and the request-document test cli_request_document_survival_time_anchor_reaches_the_fit_2631 still cover default-anchor selection and the library field. The item list applies source_removal_guard.py's ITEM regex by hand. Compile is covered by the lead's shared tip check."
+  },
+  {
+    "base": "865f67d6a89ae810bf0f0f0e7422d23c8d462b37",
+    "items": [
+      "crates/gam-solve/src/reml/reml_outer_engine/corrected_covariance.rs:const:ACTIVE_THETA_BOUND_TOL"
+    ],
+    "reason": "#2469: detect_active_theta_bounds restated a local 1e-8 active-bound tolerance; railed has one definition in the outer code path, coordinate_rail_margin, which the optimizer's rail test and terminal certificate already use, so the corrected covariance reads the margin from that owner instead of a chosen constant.",
+    "evidence": "At the base, git grep -w ACTIVE_THETA_BOUND_TOL finds only its declaration and its one use in crates/gam-solve/src/reml/reml_outer_engine/corrected_covariance.rs; coordinate_rail_margin is pub(crate) in rho_optimizer/bridges.rs and re-exported by rho_optimizer.rs (pub(crate) use bridges::*). active_bound_tests::active_theta_bounds_use_the_optimizer_rail_margin pins the railed set. Salvaged from the unpushed overnight patch scratchpad/b8.patch (top level), which the shared working tree held byte-for-byte."
   }
 ]
