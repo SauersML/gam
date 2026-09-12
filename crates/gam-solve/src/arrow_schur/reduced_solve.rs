@@ -185,38 +185,32 @@ pub(crate) fn reduce_row_schur_contributions<B: BatchedBlockSolver + Sync>(
         let parallel =
             n_rows >= SCHUR_MATVEC_PARALLEL_ROW_MIN && rayon::current_thread_index().is_none();
         if parallel {
-            use rayon::prelude::*;
-            const CHUNK: usize = 64;
-            let partials: Result<Vec<Array2<f64>>, ArrowSchurError> = (0..n_rows)
-                .into_par_iter()
-                .chunks(CHUNK)
-                .map(|idxs| {
-                    let mut partial = Array2::<f64>::zeros((k, k));
-                    for i in idxs {
-                        subtract_row_schur_contribution(
-                            sys,
-                            i,
-                            &sys.rows[i],
-                            htt_factors.factor(i),
-                            backend,
-                            kind,
-                            &mut partial,
-                        )?;
-                    }
-                    Ok(partial)
-                })
-                .collect();
             // Deterministic ordered fold: chunk partials hold `-Σ contribution`
             // over their rows, so `schur += partial` reproduces the serial
             // `schur -= Σ contribution` in fixed (chunk, a, b) order.
-            for partial in &partials? {
-                for a in 0..k {
-                    for b in 0..k {
-                        schur[[a, b]] += partial[[a, b]];
+            return fold_row_chunk_partials(
+                n_rows,
+                || Array2::<f64>::zeros((k, k)),
+                |partial| partial.fill(0.0),
+                |i, partial| {
+                    subtract_row_schur_contribution(
+                        sys,
+                        i,
+                        &sys.rows[i],
+                        htt_factors.factor(i),
+                        backend,
+                        kind,
+                        partial,
+                    )
+                },
+                |partial| {
+                    for a in 0..k {
+                        for b in 0..k {
+                            schur[[a, b]] += partial[[a, b]];
+                        }
                     }
-                }
-            }
-            return Ok(());
+                },
+            );
         }
         // Serial in-place reduction (original order) — bit-for-bit reference.
         for (i, row) in sys.rows.iter().enumerate() {
@@ -1318,6 +1312,58 @@ pub(crate) fn step_inside_trust_region(
 /// wide border `k`) that issue #1017 names — the per-row `H_βt (H_tt)⁻¹ H_tβ x`
 /// contributions are the matvec's whole cost and parallelize cleanly.
 pub(crate) const SCHUR_MATVEC_PARALLEL_ROW_MIN: usize = 256;
+
+/// Row width of the chunks the parallel Schur folds reduce into partials. It is
+/// fixed rather than tied to the thread count, so the chunk sums and their fold
+/// order do not depend on the pool.
+pub(crate) const SCHUR_FOLD_ROW_CHUNK: usize = 64;
+
+/// Reduce rows `0..n_rows` into zero-seeded partials over fixed
+/// [`SCHUR_FOLD_ROW_CHUNK`]-row chunks and hand every partial to `fold` in chunk
+/// order.
+///
+/// Partials are reduced one pool-width group of chunks at a time into reused
+/// buffers, so at most `rayon::current_num_threads()` of them are alive at once.
+/// Collecting every chunk's partial before folding held `n_rows /
+/// SCHUR_FOLD_ROW_CHUNK` dense blocks at once: at the automatic Direct border
+/// limit (`k = 2000`, 32 MiB per partial) that is about 20 GiB for 40 000 rows,
+/// all of it zeroed and freed on every solve. Each buffer is re-zeroed before
+/// its chunk and every chunk reduces its rows in row order, so the fold is
+/// bit-identical to reducing each chunk into a fresh partial.
+pub(crate) fn fold_row_chunk_partials<P, E>(
+    n_rows: usize,
+    new_partial: impl Fn() -> P,
+    zero_partial: impl Fn(&mut P) + Sync,
+    reduce_row: impl Fn(usize, &mut P) -> Result<(), E> + Sync,
+    mut fold: impl FnMut(&P),
+) -> Result<(), E>
+where
+    P: Send,
+    E: Send,
+{
+    use rayon::prelude::*;
+    let n_chunks = n_rows.div_ceil(SCHUR_FOLD_ROW_CHUNK);
+    let width = rayon::current_num_threads().clamp(1, n_chunks.max(1));
+    let mut partials: Vec<P> = (0..width).map(|_| new_partial()).collect();
+    for first in (0..n_chunks).step_by(width) {
+        let count = width.min(n_chunks - first);
+        partials[..count]
+            .par_iter_mut()
+            .enumerate()
+            .try_for_each(|(offset, partial)| -> Result<(), E> {
+                zero_partial(partial);
+                let start = (first + offset) * SCHUR_FOLD_ROW_CHUNK;
+                for row in start..(start + SCHUR_FOLD_ROW_CHUNK).min(n_rows) {
+                    reduce_row(row, partial)?;
+                }
+                Ok(())
+            })?;
+        for partial in &partials[..count] {
+            fold(partial);
+        }
+    }
+    Ok(())
+}
 
 /// Below this border width `k` the dense `H_ββ` penalty-prologue GEMV stays
 /// sequential: parallelizing a `k×k` matvec only pays once `k²` is large enough
@@ -4312,29 +4358,27 @@ impl JacobiPreconditioner {
         let parallel =
             n >= SCHUR_MATVEC_PARALLEL_ROW_MIN && rayon::current_thread_index().is_none();
         if parallel {
-            use rayon::prelude::*;
-            const CHUNK: usize = 64;
             let n_blocks = block_offsets.len();
             let block_dims: Vec<usize> = block_offsets.iter().map(|r| r.end - r.start).collect();
-            let partials: Vec<Vec<Array2<f64>>> = (0..n)
-                .into_par_iter()
-                .chunks(CHUNK)
-                .map(|idxs| {
-                    let mut local: Vec<Array2<f64>> = block_dims
+            let Ok(()) = fold_row_chunk_partials(
+                n,
+                || {
+                    block_dims
                         .iter()
                         .map(|&b| Array2::<f64>::zeros((b, b)))
-                        .collect();
-                    for i in idxs {
-                        row_into(i, &mut local);
+                        .collect::<Vec<_>>()
+                },
+                |local| local.iter_mut().for_each(|block| block.fill(0.0)),
+                |i, local| {
+                    row_into(i, local);
+                    Ok::<(), std::convert::Infallible>(())
+                },
+                |local| {
+                    for bidx in 0..n_blocks {
+                        schur_blocks[bidx] += &local[bidx];
                     }
-                    local
-                })
-                .collect();
-            for local in &partials {
-                for bidx in 0..n_blocks {
-                    schur_blocks[bidx] += &local[bidx];
-                }
-            }
+                },
+            );
         } else {
             for row in 0..n {
                 row_into(row, &mut schur_blocks);
@@ -4474,30 +4518,25 @@ impl JacobiPreconditioner {
         let parallel =
             n >= SCHUR_MATVEC_PARALLEL_ROW_MIN && rayon::current_thread_index().is_none();
         if parallel {
-            use rayon::prelude::*;
-            const CHUNK: usize = 64;
             let n_blocks = block_offsets.len();
             let block_dims: Vec<usize> = block_offsets.iter().map(|r| r.end - r.start).collect();
-            let partials: Vec<Vec<Array2<f64>>> = (0..n)
-                .into_par_iter()
-                .chunks(CHUNK)
-                .map(|idxs| {
-                    let mut local: Vec<Array2<f64>> = block_dims
+            // Deterministic ordered reduction: fold chunk partials left-to-right.
+            fold_row_chunk_partials(
+                n,
+                || {
+                    block_dims
                         .iter()
                         .map(|&b| Array2::<f64>::zeros((b, b)))
-                        .collect();
-                    for i in idxs {
-                        row_into(i, &sys.rows[i], &mut local)?;
+                        .collect::<Vec<_>>()
+                },
+                |local| local.iter_mut().for_each(|block| block.fill(0.0)),
+                |i, local| row_into(i, &sys.rows[i], local),
+                |local| {
+                    for bidx in 0..n_blocks {
+                        schur_blocks[bidx] += &local[bidx];
                     }
-                    Ok::<_, ArrowSchurError>(local)
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            // Deterministic ordered reduction: fold chunk partials left-to-right.
-            for local in &partials {
-                for bidx in 0..n_blocks {
-                    schur_blocks[bidx] += &local[bidx];
-                }
-            }
+                },
+            )?;
         } else {
             for (i, row) in sys.rows.iter().enumerate() {
                 row_into(i, row, &mut schur_blocks)?;
@@ -4740,10 +4779,11 @@ pub(crate) const IC0_PATTERN_REL_DROP: f64 = 1.0e-13;
 /// is the LOWER triangle filled by the row reduction; callers that need the full
 /// symmetric block must `symmetrize_upper_from_lower`.
 ///
-/// The per-row Schur contribution is fanned over fixed 64-row chunks above
-/// `SCHUR_MATVEC_PARALLEL_ROW_MIN` and folded left-to-right so the assembly is
-/// bit-identical to the serial path (and run-to-run deterministic), exactly as
-/// in `build_block_jacobi` (#1017).
+/// The per-row Schur contribution is fanned over fixed [`SCHUR_FOLD_ROW_CHUNK`]-row
+/// chunks above `SCHUR_MATVEC_PARALLEL_ROW_MIN` and folded in chunk order through
+/// [`fold_row_chunk_partials`], exactly as in `build_block_jacobi`: bit-identical
+/// run-to-run, and equal to the serial path up to the chunk-boundary
+/// reassociation (#1017, #1211).
 pub(crate) fn assemble_local_schur_block<B: BatchedBlockSolver + Sync>(
     sys: &ArrowSchurSystem,
     htt_factors: &ArrowFactorSlab,
@@ -4795,22 +4835,16 @@ pub(crate) fn assemble_local_schur_block<B: BatchedBlockSolver + Sync>(
     let n = sys.rows.len();
     let parallel = n >= SCHUR_MATVEC_PARALLEL_ROW_MIN && rayon::current_thread_index().is_none();
     if parallel {
-        use rayon::prelude::*;
-        const CHUNK: usize = 64;
-        let partials: Vec<Array2<f64>> = (0..n)
-            .into_par_iter()
-            .chunks(CHUNK)
-            .map(|idxs| {
-                let mut local = Array2::<f64>::zeros((b, b));
-                for i in idxs {
-                    cluster_row_into(i, &sys.rows[i], &mut local);
-                }
-                local
-            })
-            .collect();
-        for local in &partials {
-            s_block += local;
-        }
+        let Ok(()) = fold_row_chunk_partials(
+            n,
+            || Array2::<f64>::zeros((b, b)),
+            |local| local.fill(0.0),
+            |i, local| {
+                cluster_row_into(i, &sys.rows[i], local);
+                Ok::<(), std::convert::Infallible>(())
+            },
+            |local| s_block += local,
+        );
     } else {
         for (row_idx, row) in sys.rows.iter().enumerate() {
             cluster_row_into(row_idx, row, &mut s_block);
