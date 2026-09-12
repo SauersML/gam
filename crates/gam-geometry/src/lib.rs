@@ -17,7 +17,6 @@ pub use manifolds::{
 
 pub use closure_family::{
     ClosureFamily, ClosureProfileCi, boundary_conductance, conductance_penalty_jet,
-    profile_ci_from_grid,
 };
 pub use curvature_estimand::{
     CurvatureVerdict, DesignCoordKappaJet, FlatnessTest, KappaEstimateSupport, KappaProfileCi,

@@ -3273,5 +3273,14 @@
     ],
     "reason": "User directive 2026-09-11: delete code nothing uses. The --include-public rescan at 9c526d420 (MSI job 447458) found five bare pub items that nothing names, not even tests: gam-custom-family joint_exact_analytic_outer_hessian_available (a predicate that always returned true), gam-model-api exact_newton_outer_geometry_supports_second_order_solver, gam-identifiability CompiledMap::p_compiled, and gam-problem BlockWorkingSet::natural_diagonal_checked and RowMeasure::indices_and_weights.",
     "evidence": "The scanner report /scratch.global/sauer354/sw1-logs/pp_rescan.json lists each item as unreferenced. At the base, single-name git greps over *.rs find each name only at its definition, in the gam-custom-family re-exports removed here, or in the gam-solve row_measure.rs module doc reworded here. p_compiled survives only as prose naming the compiled width."
+  },
+  {
+    "base": "21738986e09dca46061361e886e3fce41228f0a0",
+    "items": [
+      "crates/gam-geometry/src/closure_family.rs:fn:chi2_1_quantile",
+      "crates/gam-geometry/src/closure_family.rs:fn:profile_ci_from_grid"
+    ],
+    "reason": "SPEC rule 18: profile_ci_from_grid was a grid-argmin profile CI with no caller (#2902 search audit, #2829 ledger); the private chi2_1_quantile in closure_family.rs had no other caller.",
+    "evidence": "git grep -w profile_ci_from_grid at 21738986e0 finds only its definition and its re-export; chi2_1_quantile in closure_family.rs was called only by it (curvature_estimand.rs defines and uses its own). source_removal_guard.py (origin's copy) over 21738986e0..e9e394c362, the code-only commit, refused exactly these items before this entry existed, and it verifies the final commit with the entry. Compile is covered by the lead's shared tip check."
   }
 ]

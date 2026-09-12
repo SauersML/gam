@@ -15,7 +15,7 @@ crates/gam-custom-family/src/fit.rs	evaluate_rho_outer_criterion_for_diagnostics
 crates/gam-geometry/src/closure_family.rs	boundary_conductance	restored-in-place
 crates/gam-geometry/src/closure_family.rs	conductance_penalty_jet	restored-in-place
 crates/gam-geometry/src/closure_family.rs	design_jet	retired-by-later-deletion:f83e9aebaf
-crates/gam-geometry/src/closure_family.rs	profile_ci_from_grid	restored-in-place
+crates/gam-geometry/src/closure_family.rs	profile_ci_from_grid	retired-by-owner:spec-search
 crates/gam-geometry/src/closure_family.rs	row_jet	restored-in-place
 crates/gam-geometry/src/curvature_estimand.rs	design_coord_kappa_derivative	restored-in-place
 crates/gam-geometry/src/curvature_estimand.rs	is_interior	restored-in-place

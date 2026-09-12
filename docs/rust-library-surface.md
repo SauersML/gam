@@ -194,11 +194,11 @@ dropped, and restored items the table above retires were removed again.
 
 | Disposition | Identities |
 | --- | --- |
-| Restored in place | 360 |
+| Restored in place | 359 |
 | Defined elsewhere in the same crate | 13 |
 | Retired by the decisions above | 19 |
 | Retired: nothing that survived depends on it | 290 |
-| Retired by the owning work's own decision | 28 |
+| Retired by the owning work's own decision | 29 |
 | Retired by a later deletion commit named in the row | 509 |
 
 Retired identities carry no compatibility obligation. Restoration is closed
@@ -229,6 +229,8 @@ which forwarded `None` offsets to `from_engine_inputswith_offsets`; and
 Survival retired its own: the `CertifiedLogSigmaCurvature` carrier with its three
 deleted identities, and `survival_location_scale_block_effective_jacobian`, which
 nothing that survived calls.
+The #2902 search audit (spec-search) retired `profile_ci_from_grid`: it took γ̂ as
+the argmin of a caller-supplied grid (SPEC rule 18), and nothing called it.
 Jets retired seven restored identities that only tests used: `normal_sf` and
 `student_t_sf` (`probability.rs`) and `fit_grid_spline_2d` (`grid_spline_2d.rs`)
 are deleted; `FdDerivative::judge` and `ladder_report` (`numeric_derivative.rs`)

@@ -1230,5 +1230,13 @@
     },
     "reason": "User directive 2026-09-11: delete code nothing uses. The --include-public rescan at 9c526d420 (MSI job 447458) found five bare pub items that nothing names, not even tests: gam-custom-family joint_exact_analytic_outer_hessian_available (a predicate that always returned true), gam-model-api exact_newton_outer_geometry_supports_second_order_solver, gam-identifiability CompiledMap::p_compiled, and gam-problem BlockWorkingSet::natural_diagonal_checked and RowMeasure::indices_and_weights.",
     "evidence": "The scanner report /scratch.global/sauer354/sw1-logs/pp_rescan.json lists each item as unreferenced. At the base, single-name git greps over *.rs find each name only at its definition, in the gam-custom-family re-exports removed here, or in the gam-solve row_measure.rs module doc reworded here. p_compiled survives only as prose naming the compiled width."
+  },
+  {
+    "base": "21738986e09dca46061361e886e3fce41228f0a0",
+    "removed": {
+      "crates/gam-geometry/src/closure_family.rs::profile_ci_from_grid": 1
+    },
+    "reason": "SPEC rule 18 (grid search is never allowed): profile_ci_from_grid took γ̂ as the argmin of a caller-supplied grid; found by the #2902 search audit, retired in the #2829 ledger.",
+    "evidence": "git grep -w profile_ci_from_grid at 21738986e0 over crates, src, tests, bench, examples, python and gamfit finds only its definition and the gam-geometry lib.rs re-export, so nothing calls it. This removed map is public_api_census.py's own public_functions predicate (origin's copy) over the two changed files 21738986e0..e9e394c362, and its check_change accepts this entry."
   }
 ]
