@@ -337,7 +337,16 @@ fn check_plan_against_per_apply(
 fn residual_curvature_plan_equals_the_per_apply_form_on_threshold_gate_strata_2731() {
     let mut live = (false, false);
     for straddle in [false, true] {
-        let (term, target, rho) = threshold_gate_tiny_fixture(straddle);
+        let (term, mut target, rho) = threshold_gate_tiny_fixture(straddle);
+        // The fixture draws its target from the state it returns, so at this frozen
+        // anchor every row residual is round-off, the contractions are round-off, and
+        // a relative 1e-6 change to one is absorbed by the O(1) ARD and threshold
+        // remainders: job 448182 saw the mutation arm leave the apply bit-identical
+        // at straddle=false. A fixed offset the frozen state does not interpolate
+        // gives both legs a residual of order 0.05.
+        for ((row, col), value) in target.indexed_iter_mut() {
+            *value += ((row * 5 + col * 3) % 7) as f64 / 70.0 - 0.04;
+        }
         let mut anchor = term.clone();
         let (_value, _loss, cache) = anchor
             .penalized_quasi_laplace_criterion_with_cache(
