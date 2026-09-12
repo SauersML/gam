@@ -1855,7 +1855,7 @@ mod exact_frozen_monotonicity_tests {
         assert_eq!(constraints.b, Array1::<f64>::zeros(3));
 
         let solver_slop = Array1::from_vec(vec![
-            -0.5 * crate::wiggle::MONOTONE_WIGGLE_ACTIVE_SET_TOL,
+            -0.5 * gam_solve::pirls::ACTIVE_SET_PRIMAL_FEASIBILITY_TOL,
             0.2,
             0.0,
         ]);
@@ -1870,7 +1870,7 @@ mod exact_frozen_monotonicity_tests {
         assert_eq!(projected[0], 0.0);
 
         let material_violation = Array1::from_vec(vec![
-            -2.0 * crate::wiggle::MONOTONE_WIGGLE_ACTIVE_SET_TOL,
+            -2.0 * gam_solve::pirls::ACTIVE_SET_PRIMAL_FEASIBILITY_TOL,
             0.2,
             0.0,
         ]);
