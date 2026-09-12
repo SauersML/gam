@@ -11,14 +11,10 @@
 //! Both encode the SAME invariant — a derived penalty/coefficient index must
 //! equal the position the penalty actually occupies once the realized global
 //! layout is emitted — but only at one point each. This harness sweeps that
-//! invariant across a zoo, driving two independent fully-public production
-//! index-derivation paths:
-//!   1. `gam::families::custom_family::realize_coefficient_groups_for_custom_family`
-//!      — the composed layout builder that assigns each physical penalty piece an
-//!      optimizer (outer) coordinate; the derived outer index must equal the
-//!      first-emitted-position anchor of its precision label. This is the reach
-//!      of the layout class behind #2287.
-//!   2. `gam::terms::basis::filter_penalty_candidates` — the atomic penalty
+//! invariant across a zoo through the fully-public production index-derivation
+//! path below. A second path, the custom-family coefficient-group realizer, was
+//! deleted in 48f48f9108 because only tests called it.
+//!   * `gam::terms::basis::filter_penalty_candidates` — the atomic penalty
 //!      canonicalizer that partitions candidates into active identities and
 //!      dropped diagnostics; every retained `ActivePenalty::info.original_index`
 //!      must equal its ORIGINAL input position, so a candidate dropped earlier can

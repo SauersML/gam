@@ -3024,8 +3024,8 @@ fn basis_with_jet<'py>(
             // PyTorch `_BsplineJetFn` uses — NOT the Fourier harmonic basis
             // produced by `kind="periodic"`. So differentiate the actual design
             // matrix here via `periodic_bspline_first_derivative_nd`, which is
-            // the closed form `phi'` that `PeriodicSplineCurve::evaluate_derivative`
-            // also relies on. The non-periodic branch uses the open-uniform
+            // the closed form `phi'` that the latent periodic-curve fits
+            // also rely on. The non-periodic branch uses the open-uniform
             // analytic first derivative.
             let (jet, penalty) = if periodic {
                 let (left, right, num_basis) =

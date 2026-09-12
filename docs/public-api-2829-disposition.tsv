@@ -148,7 +148,7 @@ crates/gam-math/src/jet_scalar.rs	h_at	retired-no-surviving-dependent
 crates/gam-math/src/jet_scalar.rs	hessian_pair_bits	restored-in-place
 crates/gam-math/src/jet_tower.rs	cell_moving_boundary_flux_tower	retired-by-owner:jets
 crates/gam-math/src/jet_tower.rs	compose_unary_single_slot	retired-by-owner:jets
-crates/gam-math/src/jet_tower.rs	compose_unary_with	absent-pending-reference-repair
+crates/gam-math/src/jet_tower.rs	compose_unary_with	retired-no-surviving-dependent
 crates/gam-math/src/jet_tower.rs	digamma	retired-no-surviving-dependent
 crates/gam-math/src/jet_tower.rs	fourth_contracted	retired-by-owner:jets
 crates/gam-math/src/jet_tower.rs	implicit_solve	retired-by-owner:jets
@@ -312,7 +312,7 @@ crates/gam-problem/src/coefficient_prior_mean.rs	functional	retired-no-surviving
 crates/gam-problem/src/coefficient_prior_mean.rs	kernel_basis	retired-no-surviving-dependent
 crates/gam-problem/src/constraint_set.rs	is_blocked_by_active_face	retired-no-surviving-dependent
 crates/gam-problem/src/constraint_set.rs	max_contract_feasible_step	defined-elsewhere-in-crate
-crates/gam-problem/src/constraint_set.rs	row_column_support	absent-pending-reference-repair
+crates/gam-problem/src/constraint_set.rs	row_column_support	retired-no-surviving-dependent
 crates/gam-problem/src/diagnostics.rs	compute_dualridge_check	retired-by-later-deletion:47c2319015
 crates/gam-problem/src/diagnostics.rs	compute_envelopeaudit	retired-by-later-deletion:47c2319015
 crates/gam-problem/src/dispersion_cov.rs	into_array	retired-no-surviving-dependent

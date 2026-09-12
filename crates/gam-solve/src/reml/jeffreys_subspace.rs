@@ -5690,10 +5690,10 @@ mod tests {
     // `c0a21b554` deleted these four gates because `d484a091a` had deleted the
     // `pub fn under_identified_subspace` they called — a gam-solve LIBRARY entry
     // point whose only callers were tests, so no symbol for it appears in the
-    // CLI or pyffi binary and the sweep's criterion held vacuously. The name
-    // still occurs at `jeffreys_subspace.rs:28` in this module's own doc header,
-    // and a separate `pub(crate)` copy lives in
-    // `gam-models/src/multinomial_reml.rs`, but neither is reachable from here.
+    // CLI or pyffi binary and the sweep's criterion held vacuously. This module's
+    // doc header names `under_identified_subspace_in_metric` instead, and the
+    // `pub(crate)` function of the same name in `gam-models/src/multinomial_reml.rs`
+    // is an unrelated homonym.
     //
     // The rebuild calls the surviving `under_identified_subspace_in_metric` with
     // the IDENTITY metric, which is the same measurement: with `G = I` the

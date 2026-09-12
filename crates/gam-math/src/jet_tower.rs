@@ -914,7 +914,8 @@ impl<const K: usize> Tower3<K> {
     /// Compose with a unary special-function whose `[f64; 4]` derivative stack is
     /// built from the base value through `stack_fn`. Evaluates `stack_fn(self.v)`
     /// once and forwards to [`Self::compose_unary`], so it is bit-identical to the
-    /// explicit form. The order-≤3 sibling of `Tower4::compose_unary_with`.
+    /// explicit form. `Tower4` has no such helper;
+    /// build its five-entry stack and call `Tower4::compose_unary`.
     #[inline]
     pub fn compose_unary_with(&self, stack_fn: impl Fn(f64) -> [f64; 4]) -> Self {
         self.compose_unary(stack_fn(self.v))

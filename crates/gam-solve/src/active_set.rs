@@ -1712,8 +1712,9 @@ pub struct ConstraintRowDependence {
 ///
 /// INDEX SPACE: every id here is a [`ConstraintRowId`] in the reduced set's own
 /// constraint-row space (`0..nrows()`), addressing `values()` / `bound()` /
-/// `row_norm()`. It is NOT a coefficient index; to reach β coordinates go
-/// through `gam_problem::ConstraintSet::row_column_support`.
+/// `row_norm()`. It is NOT a coefficient index, and `ConstraintSet` exposes no
+/// row-to-β map; a Khatri-Rao cone row's β support comes from
+/// `gam_problem::KhatriRaoConeConstraints::row_column_support`.
 #[derive(Clone, Debug)]
 pub struct ReducedFace {
     /// Kept independent rows — the lowest-flat-index representative per direction,
@@ -1988,8 +1989,8 @@ pub fn dense_reduced_face(
 /// and it advances by `ncols()`. Using one for the other is only invisible while
 /// every member is square (`nrows() == ncols()`); the moment a member constrains
 /// fewer rows than it has coefficients, the two sequences diverge and the ids
-/// silently name the wrong block. To go from these ids to β coordinates, use
-/// `ConstraintSet::row_column_support` — never arithmetic on the id.
+/// silently name the wrong block. Never reach β coordinates by arithmetic on
+/// these ids: `ConstraintSet` exposes no row-to-β map.
 #[inline]
 fn lift_member_row(local: ConstraintRowId, row_offset: usize) -> ConstraintRowId {
     ConstraintRowId(local.index() + row_offset)

@@ -401,8 +401,6 @@ mod tests {
         assert!((s.weight_scale - 2.0).abs() < 1e-14);
     }
 
-    // ── OuterScoreSubsample::has_variable_weights ─────────────────────────────
-
     // ── RowSet::par_reduce_fold ───────────────────────────────────────────────
 
     #[test]

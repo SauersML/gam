@@ -6,7 +6,7 @@ use ndarray::array;
 /// at `x` and at `x + period` must yield the same derivative row.
 ///
 /// This is the real cyclic-derivative path used in production (the periodic
-/// closed form that `basis_with_jet` / `PeriodicSplineCurve::evaluate_derivative`
+/// closed form that `basis_with_jet` and the latent periodic-curve fits
 /// consume). It wraps its own input into the base period internally
 /// (`wrap_periodic_phase`), so periodicity is a property of the basis itself —
 /// it does NOT depend on the open-basis derivative evaluator wrapping its eval

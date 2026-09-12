@@ -4097,7 +4097,7 @@ impl SaeManifoldTerm {
             // (≈8 GB at the K=32k manifold border) does NOT fit the in-core
             // budget, so estimate log|S| via Stochastic Lanczos Quadrature on the
             // matrix-free `schur_matvec` apply (`gam_solve::arrow_schur::
-            // matrix_free_arrow_evidence_log_det`) instead of assembling +
+            // matrix_free_arrow_evidence_log_det_surrogate`) instead of assembling +
             // Cholesky-factoring the dense Schur. Peak memory is the per-row block
             // storage the inner PCG already holds, not the extra O(k²) dense S.
             //

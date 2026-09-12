@@ -730,9 +730,9 @@ mod cpu_sized_plan_laziness_tests {
     //! size-gated early return and NEVER resolve `GpuRuntime` — resolution
     //! whose first execution probes the driver and creates a CUDA primary
     //! context on every GPU (`cuDevicePrimaryCtxRetain`, ~10% of the profiled
-    //! small-fit wall clock on an 8×B200 node). Runs on any host: the invariant
-    //! is the control-flow ordering, observed via the process-wide
-    //! `resolution_call_count` counter (nextest = one process per test).
+    //! small-fit wall clock on an 8×B200 node). The process-wide probe counter
+    //! that observed this ordering on any host was deleted in 5d498d0e9; the tests
+    //! below pin the plan's host budget and its streaming decisions.
     use super::*;
 
     #[test]

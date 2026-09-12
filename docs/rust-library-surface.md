@@ -197,10 +197,10 @@ dropped, and restored items the table above retires were removed again.
 | Restored in place | 360 |
 | Defined elsewhere in the same crate | 13 |
 | Retired by the decisions above | 19 |
-| Retired: nothing that survived depends on it | 287 |
+| Retired: nothing that survived depends on it | 289 |
 | Retired by the owning work's own decision | 28 |
 | Retired by a later deletion commit named in the row | 509 |
-| Absent while a surviving reference still names it (repair in progress) | 3 |
+| Absent while a surviving reference still names it (repair in progress) | 1 |
 
 Retired identities carry no compatibility obligation. Restoration is closed
 under calls: after the merges, no restored body calls a function the sweep
@@ -255,11 +255,11 @@ Eight rows recorded a restoration the merge never delivered. Five have no
 surviving dependent and are retired: `digamma` in `jet_scalar.rs` and
 `Tower4::digamma`, `Tower4::trigamma`,
 `GaussianPcaPatchSummary::projector_variance_scale`, and
-`FrozenWeightGramTensor::frozen_weights`. Three are absent while a surviving
-reference still names them: comments cite `Tower4::compose_unary_with` and
-`ConstraintSet::row_column_support`, and the producer-less `RiemannianLBFGS`
-carrier outlived its `minimize`. Their repair rewords those comments and deletes
-the carrier. Among the rows once marked defined elsewhere, `row_loss` is retired
+`FrozenWeightGramTensor::frozen_weights`. Two more retired once the
+comments citing `Tower4::compose_unary_with` and `ConstraintSet::row_column_support`
+were reworded. One is absent while a surviving reference still names it: the
+producer-less `RiemannianLBFGS` carrier outlived its `minimize`, and its repair
+deletes the carrier. Among the rows once marked defined elsewhere, `row_loss` is retired
 because its only other definition is a private test helper, and the other
 definitions of `second_derivative_design` and `trivially_converged` were deleted
 later.

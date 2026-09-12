@@ -3463,7 +3463,7 @@ fn periodic_bspline_basis_dense_via_spec(
 /// `order == 0` returns the periodic value basis (the partition of unity);
 /// `order == 1` returns the exact closed-form first derivative by squeezing
 /// the `(N, K, 1)` jet from `periodic_bspline_first_derivative_nd` — the same
-/// jet `basis_with_jet` and `PeriodicSplineCurve::evaluate_derivative` rely
+/// jet `basis_with_jet` and the latent periodic-curve fits rely
 /// on, so the dense matrix and the modelling path agree to machine precision.
 /// Because the value basis is a partition of unity, each derivative row sums
 /// to ~0. Orders ≥ 2 have no exposed periodic jet and are rejected with a

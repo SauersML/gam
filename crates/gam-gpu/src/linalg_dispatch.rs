@@ -1230,8 +1230,10 @@ mod pre_probe_gate_tests {
     //! no reachable policy could admit must be refused by `route_through_gpu`
     //! WITHOUT resolving GPU availability — i.e. without triggering the
     //! device probe and its per-GPU `cuDevicePrimaryCtxRetain` context
-    //! creation. Observable on any host (CUDA or not) through the process-wide
-    //! `resolution_call_count` counter; nextest gives each test its own process.
+    //! creation. The process-wide probe counter that observed this ordering on
+    //! any host was deleted in 5d498d0e9; the tests below check that the
+    //! pre-probe bound never tightens the real admission, and the dispatch
+    //! outcomes with and without a CUDA runtime.
     use super::{DispatchOp, GpuDispatchPolicy};
 
     #[test]

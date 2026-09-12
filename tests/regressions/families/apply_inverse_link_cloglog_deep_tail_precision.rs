@@ -5,10 +5,8 @@
 //!   * `gamfit/_sampling.py::PosteriorSamples.predict_draws` calls the
 //!     PyO3 entry `apply_inverse_link_array`, which is a thin wrapper
 //!     over `apply_inverse_link_vec` (`crates/gam-pyffi/src/lib.rs:13873`).
-//!   * `inference::eta_bands::eta_bands_from_matrix` and
-//!     `inference::posterior_bands::eta_bands_from_matrix` both invoke
-//!     it directly to turn link-scale credible bounds into response-scale
-//!     bounds (see `src/inference/posterior_bands.rs:5,70,82,83`).
+//!   * `gam_model_kernels::inverse_link::apply_inverse_link_spec_vec`, its
+//!     typed companion, forwards the string-tag links to it.
 //!
 //! So any precision loss in `apply_inverse_link_vec` propagates straight
 //! into user-visible posterior probabilities and credible bands.

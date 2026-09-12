@@ -684,9 +684,9 @@ impl KhatriRaoConeConstraints {
 /// concatenation of the member column ranges, so as soon as one member has
 /// `nrows() < ncols()` (a monotone sub-basis alongside unconstrained intercept /
 /// covariate columns) row id `r` of a later block names a β coordinate owned by
-/// an EARLIER block. The newtype exists so that mistake cannot be made silently;
-/// to go from a row to the coefficients it acts on, call
-/// `ConstraintSet::row_column_support`.
+/// an EARLIER block. The newtype exists so that mistake cannot be made silently.
+/// `ConstraintSet` exposes no row-to-coefficient map; a Khatri-Rao cone row's
+/// coefficients come from `KhatriRaoConeConstraints::row_column_support`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ConstraintRowId(pub usize);
 
