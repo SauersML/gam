@@ -3259,28 +3259,37 @@ impl ExactNewtonJointHessianWorkspace for MultinomialHessianWorkspace {
             .exact_newton_joint_hessian_directional_derivative(&self.block_states, d_beta_flat)
     }
 
-    fn directional_derivative_operators(
+    fn directional_derivative_operator(
         &self,
-        d_beta_flats: &[Array1<f64>],
-    ) -> Result<Vec<Option<Arc<dyn HyperOperator>>>, String> {
+        d_beta_flat: &Array1<f64>,
+    ) -> Result<Option<Arc<dyn HyperOperator>>, String> {
         // #932 cutover: the matrix-free `MultinomialDirectionalHyperOperator` is
         // the sole production path. It stores only the per-row `M×M` Fisher jet
         // and contracts against the design on the fly, never materializing the
         // dense `(M·P)×(M·P)` block matrix nor paying the generic dense
         // projection — the multinomial analogue of the primary-GLM matrix-free
         // `trace_projected_factor_all_axes_with_xf`.
-        let probs = self.probs.view();
+        //
+        // The single-direction hook is what the outer Hessian's per-pair IFT
+        // correction calls (`exact_newton_dh_apply`), once per ρ pair. Left to the
+        // trait default it wrapped `directional_derivative`, a dense
+        // `dense_block_xtwx` assembly over every row for every pair (#1082).
+        self.family
+            .directional_hyper_operator(
+                self.probs.view(),
+                d_beta_flat,
+                Arc::clone(&self.projection_cache),
+            )
+            .map(|op| Some(Arc::new(op) as Arc<dyn HyperOperator>))
+    }
+
+    fn directional_derivative_operators(
+        &self,
+        d_beta_flats: &[Array1<f64>],
+    ) -> Result<Vec<Option<Arc<dyn HyperOperator>>>, String> {
         d_beta_flats
             .par_iter()
-            .map(|direction| {
-                self.family
-                    .directional_hyper_operator(
-                        probs,
-                        direction,
-                        Arc::clone(&self.projection_cache),
-                    )
-                    .map(|op| Some(Arc::new(op) as Arc<dyn HyperOperator>))
-            })
+            .map(|direction| self.directional_derivative_operator(direction))
             .collect()
     }
 
@@ -3297,25 +3306,31 @@ impl ExactNewtonJointHessianWorkspace for MultinomialHessianWorkspace {
             )
     }
 
+    fn second_directional_derivative_operator(
+        &self,
+        d_beta_u: &Array1<f64>,
+        d_beta_v: &Array1<f64>,
+    ) -> Result<Option<Arc<dyn HyperOperator>>, String> {
+        // #932 cutover: matrix-free second-directional operator is the sole
+        // production path, for the per-pair single-pair hook too (see
+        // `directional_derivative_operator`).
+        self.family
+            .second_directional_hyper_operator(
+                self.probs.view(),
+                d_beta_u,
+                d_beta_v,
+                Arc::clone(&self.projection_cache),
+            )
+            .map(|op| Some(Arc::new(op) as Arc<dyn HyperOperator>))
+    }
+
     fn second_directional_derivative_operators(
         &self,
         d_beta_pairs: &[(Array1<f64>, Array1<f64>)],
     ) -> Result<Vec<Option<Arc<dyn HyperOperator>>>, String> {
-        // #932 cutover: matrix-free second-directional operator is the sole
-        // production path (see `directional_derivative_operators`).
-        let probs = self.probs.view();
         d_beta_pairs
             .par_iter()
-            .map(|(u, v)| {
-                self.family
-                    .second_directional_hyper_operator(
-                        probs,
-                        u,
-                        v,
-                        Arc::clone(&self.projection_cache),
-                    )
-                    .map(|op| Some(Arc::new(op) as Arc<dyn HyperOperator>))
-            })
+            .map(|(u, v)| self.second_directional_derivative_operator(u, v))
             .collect()
     }
 }
