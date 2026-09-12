@@ -879,5 +879,30 @@
     ],
     "reason": "user directive: delete all useless slop",
     "evidence": "git grep -nw at the base finds each name only at its own definition and in doc prose. The two chi-square wrappers forward to weighted_chi_square_sf_with_bound and signed_weighted_chi_square_sf_to_tolerance, which production (smooth_term_lr.rs) calls; their documentation moved onto those entry points. cone_boundary_log_factor was referenced only by cone_boundary_log_factor_and_derivatives. KernelChannels is constructed nowhere."
+  },
+  {
+    "base": "8e3de85af931a3dc880046c9be775a50bbd0a1c2",
+    "items": [
+      "crates/gam-runtime/src/process_monitor.rs:fn:inc",
+      "crates/gam-runtime/src/process_monitor.rs:fn:set",
+      "crates/gam-runtime/src/process_monitor.rs:fn:snapshot",
+      "crates/gam-runtime/src/process_monitor.rs:fn:track_scope_with_progress",
+      "crates/gam-runtime/src/process_monitor.rs:struct:ProgressCounter",
+      "crates/gam-runtime/src/process_monitor.rs:struct:ScopeProgress",
+      "crates/gam-runtime/src/resource.rs:fn:memory_availability_probe_count",
+      "crates/gam-runtime/src/resource.rs:fn:permissive_small_data",
+      "crates/gam-runtime/src/resource.rs:static:MEMORY_AVAILABILITY_PROBES",
+      "crates/gam-runtime/src/warm_start/key.rs:const:F64",
+      "crates/gam-runtime/src/warm_start/key.rs:const:F64_2D",
+      "crates/gam-runtime/src/warm_start/key.rs:const:F64_SLICE",
+      "crates/gam-runtime/src/warm_start/key.rs:fn:absorb_f64",
+      "crates/gam-runtime/src/warm_start/key.rs:fn:absorb_f64_2d",
+      "crates/gam-runtime/src/warm_start/key.rs:fn:absorb_f64_bytes",
+      "crates/gam-runtime/src/warm_start/key.rs:fn:absorb_f64_slice",
+      "crates/gam-runtime/src/warm_start/session.rs:fn:preload",
+      "crates/gam-runtime/src/warm_start/session.rs:fn:try_load"
+    ],
+    "reason": "user directive: delete all useless slop",
+    "evidence": "At d1b00c6b2, git grep -nw over crates, src, tests, examples, bench and benches found only each item's own definition, doc comments, or in-function error strings; nothing calls any of them. Cascade items were reachable only through the deleted ones. MSI verification (ban scanner, workspace --all-targets check, cargo doc -p gam-runtime, guard and census) runs on the landed sha."
   }
 ]
