@@ -792,13 +792,9 @@ pub(crate) struct GaussianDiagonalRowKernel {
     pub(crate) location_working_response: f64,
     pub(crate) log_sigma_working_weight: f64,
     pub(crate) log_sigma_working_response: f64,
-    pub(crate) joint_w: f64,
-    pub(crate) joint_m: f64,
-    pub(crate) joint_n: f64,
     pub(crate) standardized_residual: f64,
     pub(crate) inv_sigma: f64,
     pub(crate) kappa: f64,
-    pub(crate) kappa_prime: f64,
 }
 
 #[inline]
@@ -833,13 +829,9 @@ pub(crate) fn gaussian_diagonal_row_kernel(
             location_working_response: location_eta,
             log_sigma_working_weight: 0.0,
             log_sigma_working_response: eta_log_sigma,
-            joint_w: 0.0,
-            joint_m: 0.0,
-            joint_n: 0.0,
             standardized_residual: 0.0,
             inv_sigma: 0.0,
             kappa: 0.0,
-            kappa_prime: 0.0,
         });
     }
 
@@ -919,8 +911,6 @@ pub(crate) fn gaussian_diagonal_row_kernel(
         };
         return Err(GamlssError::row_geometry_unrepresentable(row, quantity, eta_log_sigma, value));
     }
-    let kappa_prime = kappa * (1.0 - kappa);
-
     Ok(GaussianDiagonalRowKernel {
         log_likelihood,
         location_working_weight,
@@ -928,13 +918,9 @@ pub(crate) fn gaussian_diagonal_row_kernel(
         location_working_response: y,
         log_sigma_working_weight,
         log_sigma_working_response,
-        joint_w: location_working_weight,
-        joint_m,
-        joint_n,
         standardized_residual,
         inv_sigma,
         kappa,
-        kappa_prime,
     })
 }
 

@@ -130,13 +130,24 @@ pub fn gaussian_location_scale_alo_row_geometry(
         prior_weight,
         (2.0 * std::f64::consts::PI).ln(),
     )?;
+    // The row derivatives in the standardized fit frame are the order-2 surface
+    // of the one declared Gaussian row, `gaussian_normalized_row`. The raw saved
+    // frame scales the location coordinate by the response scale and shifts the
+    // log-scale coordinate by its logarithm, so only the location entries
+    // rescale.
+    let row_atom = gaussian_normalized_row_order2_at_zero(
+        prior_weight,
+        internal.standardized_residual,
+        internal.inv_sigma,
+        internal.kappa,
+    );
+    let row_gradient = row_atom.gradient();
     let inverse_scale = response_scale.recip();
-    let nll_q = -internal.joint_m * inverse_scale;
-    let nll_s = internal.kappa * (prior_weight - internal.joint_n);
-    let h_qq = internal.joint_w * inverse_scale * inverse_scale;
-    let h_qs = 2.0 * internal.kappa * internal.joint_m * inverse_scale;
-    let h_ss = internal.kappa_prime * (prior_weight - internal.joint_n)
-        + 2.0 * internal.kappa * internal.kappa * internal.joint_n;
+    let nll_q = row_gradient[0] * inverse_scale;
+    let nll_s = row_gradient[1];
+    let h_qq = row_atom.hessian_at(0, 0) * inverse_scale * inverse_scale;
+    let h_qs = row_atom.hessian_at(0, 1) * inverse_scale;
+    let h_ss = row_atom.hessian_at(1, 1);
 
     let wiggle_dimension = wiggle_beta.len();
     let dimension = 2 + wiggle_dimension;

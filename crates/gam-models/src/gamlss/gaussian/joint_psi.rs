@@ -14,7 +14,7 @@ use gam_row_macros::row_atom;
 // expression retains the production extreme-value semantics while build-time
 // differentiation emits exact observed H, contracted t3, and contracted t4.
 row_atom! {
-    fn gaussian_normalized_row [generic, order2_at_zero, third_at_zero, fourth_at_zero](
+    pub(crate) fn gaussian_normalized_row [generic, order2_at_zero, third_at_zero, fourth_at_zero](
         delta_mu,
         delta_eta;
         obs_weight: f64,
