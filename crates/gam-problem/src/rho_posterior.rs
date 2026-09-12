@@ -164,15 +164,18 @@ pub enum RhoPosteriorEscalation {
 /// existing decline outcome, no behavioral cliff and no stub.
 pub trait RhoPosteriorEscalator: Send + Sync {
     /// Tier-0 PSIS `ρ`-certificate. `criterion` evaluates the outer criterion
-    /// `−log π(ρ|y)` at a trial `ρ` (`None` for infeasible `ρ`). Returns `None`
-    /// when the certificate cannot be formed (see the monolith implementation).
+    /// `−log π(ρ|y)` at a trial `ρ` (`None` for infeasible `ρ`). Returns
+    /// `Ok(None)` when there is nothing to certify (`K = 0`) and `Err` naming
+    /// the reason when the certificate cannot be formed — a non-positive-definite
+    /// outer Hessian, an infeasible criterion at `ρ̂`, or no finite importance
+    /// weight (see the monolith implementation).
     fn rho_posterior_certificate(
         &self,
         rho_hat: &Array1<f64>,
         outer_hessian: &Array2<f64>,
         criterion: &dyn Fn(&Array1<f64>) -> Option<f64>,
         n_samples: Option<usize>,
-    ) -> Option<RhoPosteriorCertificate>;
+    ) -> Result<Option<RhoPosteriorCertificate>, String>;
 
     /// Auto-selected escalation (Tier-1 quadrature / Tier-2 NUTS / honest
     /// `Unavailable`). `criterion` returns the exact profiled criterion value,

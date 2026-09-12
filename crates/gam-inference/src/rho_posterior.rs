@@ -82,7 +82,7 @@ impl gam_problem::rho_posterior::RhoPosteriorEscalator for HmcIoRhoPosteriorEsca
         outer_hessian: &Array2<f64>,
         criterion: &dyn Fn(&Array1<f64>) -> Option<f64>,
         n_samples: Option<usize>,
-    ) -> Option<RhoPosteriorCertificate> {
+    ) -> Result<Option<RhoPosteriorCertificate>, String> {
         rho_posterior_certificate(rho_hat, outer_hessian, criterion, n_samples)
     }
 
@@ -143,10 +143,14 @@ impl DetNormal {
 /// gives draws with covariance `H_ρ⁻¹`, and `‖z_m‖² = (ρ_m−ρ̂)ᵀ H_ρ (ρ_m−ρ̂)`.
 ///
 /// `R` is the strict Cholesky factor of `H_ρ` itself. An outer Hessian that is
-/// not positive definite has no Gaussian proposal, so it is refused (`None`)
-/// rather than ridged into one whose covariance is not `H_ρ⁻¹`.
-fn whitening_factor_from_outer_hessian(outer_hessian: &Array2<f64>) -> Option<Array2<f64>> {
-    let r = outer_hessian.cholesky(Side::Lower).ok()?.lower_triangular();
+/// not positive definite has no Gaussian proposal, so it is refused with the
+/// factorization's reason rather than ridged into one whose covariance is not
+/// `H_ρ⁻¹`.
+fn whitening_factor_from_outer_hessian(outer_hessian: &Array2<f64>) -> Result<Array2<f64>, String> {
+    let r = outer_hessian
+        .cholesky(Side::Lower)
+        .map_err(|error| format!("outer Hessian is not positive definite: {error:?}"))?
+        .lower_triangular();
     let n = r.nrows();
     // Invert-transpose: solve R z = e_i columns to build R⁻¹, then transpose.
     // L_inv = R⁻ᵀ, so column j of L_inv is row j of R⁻¹. Build R⁻¹ by forward
@@ -162,7 +166,7 @@ fn whitening_factor_from_outer_hessian(outer_hessian: &Array2<f64>) -> Option<Ar
             }
             let rii = r[[i, i]];
             if !(rii.is_finite() && rii.abs() > 0.0) {
-                return None;
+                return Err(format!("outer Hessian Cholesky pivot {i} is {rii}"));
             }
             x[i] = acc / rii;
         }
@@ -261,10 +265,8 @@ where
             "rho_posterior_quadrature: unsupported nodes_per_axis {nodes_per_axis}"
         ))
     })?;
-    let l_inv = whitening_factor_from_outer_hessian(outer_hessian).ok_or_else(|| {
-        EstimationError::RemlOptimizationFailed(
-            "rho_posterior_quadrature: outer Hessian is not positive definite".to_string(),
-        )
+    let l_inv = whitening_factor_from_outer_hessian(outer_hessian).map_err(|reason| {
+        EstimationError::RemlOptimizationFailed(format!("rho_posterior_quadrature: {reason}"))
     })?;
     if !cost_hat.is_finite() {
         return Err(EstimationError::RemlOptimizationFailed(
@@ -552,24 +554,35 @@ where
 ///   (or rebuilds) the objective.
 /// * `n_samples` — proposal draw count `M` (defaults to 64 when `None`).
 ///
-/// Returns `None` when `K = 0`, the outer Hessian is not usable, the criterion
-/// at `ρ̂` is infeasible, or too few finite weights survive for a tail fit.
+/// Returns `Ok(None)` when `K = 0`: there is nothing to certify. Returns `Err`
+/// naming the reason when the certificate cannot be formed — an outer Hessian
+/// whose shape does not match `ρ̂` or that is not positive definite, an
+/// infeasible or non-finite criterion at `ρ̂`, no proposal draw with a finite
+/// criterion, or too few finite weights for the Pareto tail fit.
 pub fn rho_posterior_certificate<F>(
     rho_hat: &Array1<f64>,
     outer_hessian: &Array2<f64>,
     criterion: F,
     n_samples: Option<usize>,
-) -> Option<RhoPosteriorCertificate>
+) -> Result<Option<RhoPosteriorCertificate>, String>
 where
     F: Fn(&Array1<f64>) -> Option<f64>,
 {
     let k = rho_hat.len();
-    if k == 0 || outer_hessian.nrows() != k || outer_hessian.ncols() != k {
-        return None;
+    if k == 0 {
+        return Ok(None);
     }
-    let cost_hat = criterion(rho_hat)?;
+    if outer_hessian.nrows() != k || outer_hessian.ncols() != k {
+        return Err(format!(
+            "outer Hessian is {}x{}, expected {k}x{k}",
+            outer_hessian.nrows(),
+            outer_hessian.ncols()
+        ));
+    }
+    let cost_hat =
+        criterion(rho_hat).ok_or_else(|| "criterion is infeasible at rho_hat".to_string())?;
     if !cost_hat.is_finite() {
-        return None;
+        return Err(format!("criterion at rho_hat is not finite ({cost_hat})"));
     }
     let l_inv = whitening_factor_from_outer_hessian(outer_hessian)?;
     let m = n_samples
@@ -607,7 +620,7 @@ where
         .filter(|v| v.is_finite())
         .fold(f64::NEG_INFINITY, f64::max);
     if !max_lw.is_finite() {
-        return None;
+        return Err("no proposal draw has a finite criterion".to_string());
     }
     let weights: Vec<f64> = raw_weights
         .iter()
@@ -620,25 +633,26 @@ where
         })
         .collect();
 
-    let psis = pareto_smooth_weights(&weights)?;
+    let psis = pareto_smooth_weights(&weights)
+        .ok_or_else(|| "too few finite importance weights for the Pareto tail fit".to_string())?;
     let k_hat = psis.k_hat;
 
     // Self-normalize the smoothed weights.
     let total: f64 = psis.smoothed.iter().sum();
     if !(total.is_finite() && total > 0.0) {
-        return None;
+        return Err(format!("smoothed importance weights sum to {total}"));
     }
     let normalized: Array1<f64> = Array1::from_iter(psis.smoothed.iter().map(|&w| w / total));
     let sum_sq: f64 = normalized.iter().map(|&w| w * w).sum();
     let ess = if sum_sq > 0.0 { 1.0 / sum_sq } else { 0.0 };
 
-    Some(RhoPosteriorCertificate {
+    Ok(Some(RhoPosteriorCertificate {
         k_hat,
         certificate: RhoCertificate::from_k_hat(k_hat),
         n_samples: m,
         weights: normalized,
         effective_sample_size: ess,
-    })
+    }))
 }
 
 #[cfg(test)]
@@ -666,7 +680,9 @@ mod tests {
             }
             Some(0.5 * q)
         };
-        let cert = rho_posterior_certificate(&rho_hat, &h, crit, Some(256)).expect("certificate");
+        let cert = rho_posterior_certificate(&rho_hat, &h, crit, Some(256))
+            .expect("certificate formed")
+            .expect("certificate present");
         // All weights equal ⇒ ESS == M and k̂ small ⇒ plug-in certified.
         assert!(
             (cert.effective_sample_size - cert.n_samples as f64).abs() < 1e-6,
@@ -696,7 +712,9 @@ mod tests {
             let r = rho[0];
             Some((1.0 + r * r).ln())
         };
-        let cert = rho_posterior_certificate(&rho_hat, &h, crit, Some(512)).expect("certificate");
+        let cert = rho_posterior_certificate(&rho_hat, &h, crit, Some(512))
+            .expect("certificate formed")
+            .expect("certificate present");
         assert!(
             cert.k_hat > 0.5,
             "heavy-tailed target must raise k̂ above 0.5, got {}",
@@ -738,8 +756,12 @@ mod tests {
             let d = rho[0] - 1.0;
             Some(0.5 * d * d)
         };
-        let a = rho_posterior_certificate(&rho_hat, &h, crit, Some(64)).expect("a");
-        let b = rho_posterior_certificate(&rho_hat, &h, crit, Some(64)).expect("b");
+        let a = rho_posterior_certificate(&rho_hat, &h, crit, Some(64))
+            .expect("a formed")
+            .expect("a present");
+        let b = rho_posterior_certificate(&rho_hat, &h, crit, Some(64))
+            .expect("b formed")
+            .expect("b present");
         // Self-normalized weights sum to 1.
         let s: f64 = a.weights.iter().sum();
         assert!((s - 1.0).abs() < 1e-10, "weights must sum to 1, got {s}");
@@ -751,7 +773,10 @@ mod tests {
     fn empty_rho_returns_none() {
         let rho_hat: Array1<f64> = array![];
         let h = Array2::<f64>::zeros((0, 0));
-        assert!(rho_posterior_certificate(&rho_hat, &h, |_| Some(0.0), None).is_none());
+        assert!(matches!(
+            rho_posterior_certificate(&rho_hat, &h, |_| Some(0.0), None),
+            Ok(None)
+        ));
     }
 
     /// The whitening factor is `R⁻ᵀ` of the Hessian itself, at any curvature
@@ -776,7 +801,12 @@ mod tests {
     fn singular_outer_hessian_is_refused() {
         let rho_hat = array![0.0, 0.0];
         let h = array![[1.0, 1.0], [1.0, 1.0]];
-        assert!(whitening_factor_from_outer_hessian(&h).is_none());
-        assert!(rho_posterior_certificate(&rho_hat, &h, |_| Some(0.0), Some(64)).is_none());
+        assert!(whitening_factor_from_outer_hessian(&h).is_err());
+        let refusal = rho_posterior_certificate(&rho_hat, &h, |_| Some(0.0), Some(64))
+            .expect_err("a singular outer Hessian must be refused");
+        assert!(
+            refusal.contains("not positive definite"),
+            "the refusal names its reason, got {refusal}"
+        );
     }
 }

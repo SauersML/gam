@@ -1011,12 +1011,22 @@ impl<'a> RemlState<'a> {
         let Ok(outer_hessian) = self.compute_lamlhessian_consistent(final_rho) else {
             return (None, None);
         };
-        let certificate = escalator.rho_posterior_certificate(
+        let certificate = match escalator.rho_posterior_certificate(
             final_rho,
             &outer_hessian,
             &|rho| self.without_persistent_warm_start_store(|| self.compute_cost(rho).ok()),
             n_samples,
-        );
+        ) {
+            Ok(certificate) => certificate,
+            // The certificate is a post-fit diagnostic of a fit the outer
+            // optimizer already certified, so a refusal leaves it absent
+            // rather than failing the fit — but the reason is reported, never
+            // silently collapsed into absence.
+            Err(reason) => {
+                log::warn!("rho-posterior certificate refused at the converged rho: {reason}");
+                None
+            }
+        };
         let escalation = match certificate.as_ref().map(|c| c.certificate) {
             // The certificate refuses to certify the plug-in, but escalation
             // (Tier-1 quadrature / Tier-2 NUTS over ρ) is the expensive tier;
