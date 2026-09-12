@@ -107,20 +107,6 @@ use ndarray::{Array1, Array2, Array3, ArrayView1, ArrayView2};
 /// useful than a number nobody can bound.
 pub const PREDICTIVE_MASS_DEFECT_TOLERANCE: f64 = 5.0e-2;
 
-/// How far the base-mode polish may move the supplied coefficients, relative to
-/// their own largest magnitude, before the predictive refuses.
-///
-/// The polish exists so the base of every ratio is exactly a stationary point of
-/// the objective the ratios are taken against; on a fit whose mode was found
-/// under that same objective it moves the coefficients by the solver's own
-/// residual, which is orders below this. A LARGE move means the supplied mode
-/// belongs to a different objective, and the bar is set where "solver slack" and
-/// "different model" cannot be confused: an inner solve certified at a scaled
-/// KKT residual of `1e-5` leaves a mode displacement far under `1e-3` of the
-/// coefficient scale, while a first-order objective difference in a
-/// near-unpenalized direction moves it by `O(1)`.
-const BASE_MODE_POLISH_TOLERANCE: f64 = 1.0e-3;
-
 /// The training data and penalty a saved multinomial model needs in order to
 /// evaluate its own log-posterior away from the mode.
 ///
@@ -593,30 +579,31 @@ impl<'a> MultinomialPredictiveModel<'a> {
         let (base_mode, base_value, base_logdet) = self.augmented_mode(&base_theta, &[], tilt)?;
         // ... and with the stationarity tilt in place the polish must be a
         // NO-OP: `c` was measured so that the supplied coefficients ARE the
-        // stationary point of this objective. A polish that moves anywhere is
-        // therefore a statement about this module, not about the fit — the tilt
-        // and the gradient it was built from have come apart — and it is checked
-        // rather than assumed, because every ratio below is expanded at this
-        // point and a base that is not a mode makes each of them something other
-        // than a Laplace approximation.
-        let scale = base_theta
-            .iter()
-            .fold(1.0_f64, |acc, value| acc.max(value.abs()));
+        // stationary point of this objective, so the tilted gradient there is only
+        // the rounding residual of `score + (S_λθ − c)`, and its Newton decrement is
+        // that residual squared — far inside the objective's rounding band, where
+        // `augmented_mode` returns its start unchanged. A polish that moves the
+        // coefficients at all is therefore a statement about this module, not about
+        // the fit — the tilt and the gradient it was built from have come apart —
+        // and it is checked rather than assumed, because every ratio below is
+        // expanded at this point and a base that is not a mode makes each of them
+        // something other than a Laplace approximation.
         let drift = base_mode
             .iter()
             .zip(base_theta.iter())
             .fold(0.0_f64, |acc, (polished, supplied)| {
                 acc.max((polished - supplied).abs())
             });
-        if drift > BASE_MODE_POLISH_TOLERANCE * scale {
+        if drift > 0.0 {
+            let scale = base_theta
+                .iter()
+                .fold(0.0_f64, |acc, value| acc.max(value.abs()));
             crate::bail_invalid_estim!(
                 "multinomial predictive: the stationarity-tilted base is not stationary — \
-                 polishing the supplied coefficients moved them by {drift:e} against a \
-                 coefficient scale of {scale:e} (relative {relative:e} > {tol:e}), so the tilt \
-                 and the gradient it was measured from disagree and every ratio below would be \
-                 expanded somewhere other than a mode",
-                relative = drift / scale,
-                tol = BASE_MODE_POLISH_TOLERANCE,
+                 polishing the supplied coefficients moved them by {drift:e} (largest \
+                 coefficient magnitude {scale:e}), so the tilt and the gradient it was measured \
+                 from disagree and every ratio below would be expanded somewhere other than a \
+                 mode"
             );
         }
 
