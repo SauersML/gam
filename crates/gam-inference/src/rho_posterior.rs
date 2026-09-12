@@ -49,6 +49,8 @@
 //! asserting a verdict (rather than reading a diagnostic) must size `M` from
 //! those two helpers.
 
+use faer::Side;
+use gam_linalg::faer_ndarray::FaerCholesky;
 use gam_solve::estimate::EstimationError;
 use gam_solve::psis::pareto_smooth_weights;
 use ndarray::{Array1, Array2};
@@ -135,46 +137,16 @@ impl DetNormal {
     }
 }
 
-/// Lower-triangular Cholesky `L` (`L Lᵀ = a`) with diagonal jitter for safety.
-/// Returns `None` when `a` is not positive definite even after jitter.
-fn cholesky_lower(a: &Array2<f64>) -> Option<Array2<f64>> {
-    let n = a.nrows();
-    if n == 0 || a.ncols() != n {
-        return None;
-    }
-    let scale = (0..n)
-        .map(|i| a[[i, i]].abs())
-        .fold(0.0_f64, f64::max)
-        .max(1.0);
-    let jitter = 1e-10 * scale;
-    let mut l = Array2::<f64>::zeros((n, n));
-    for j in 0..n {
-        let mut d = a[[j, j]] + jitter;
-        for k in 0..j {
-            d -= l[[j, k]] * l[[j, k]];
-        }
-        if !(d.is_finite() && d > 0.0) {
-            return None;
-        }
-        let ljj = d.sqrt();
-        l[[j, j]] = ljj;
-        for i in (j + 1)..n {
-            let mut s = a[[i, j]];
-            for k in 0..j {
-                s -= l[[i, k]] * l[[j, k]];
-            }
-            l[[i, j]] = s / ljj;
-        }
-    }
-    Some(l)
-}
-
 /// Solve `H_ρ⁻¹`'s Cholesky `L_inv` (with `L_inv L_invᵀ = H_ρ⁻¹`) from the outer
 /// Hessian `H_ρ`. We factor `H_ρ = R Rᵀ` (lower `R`) and use `L_inv = R⁻ᵀ`: then
 /// `L_inv L_invᵀ = R⁻ᵀ R⁻¹ = (R Rᵀ)⁻¹ = H_ρ⁻¹`. Mapping `ρ_m = ρ̂ + L_inv z_m`
 /// gives draws with covariance `H_ρ⁻¹`, and `‖z_m‖² = (ρ_m−ρ̂)ᵀ H_ρ (ρ_m−ρ̂)`.
+///
+/// `R` is the strict Cholesky factor of `H_ρ` itself. An outer Hessian that is
+/// not positive definite has no Gaussian proposal, so it is refused (`None`)
+/// rather than ridged into one whose covariance is not `H_ρ⁻¹`.
 fn whitening_factor_from_outer_hessian(outer_hessian: &Array2<f64>) -> Option<Array2<f64>> {
-    let r = cholesky_lower(outer_hessian)?;
+    let r = outer_hessian.cholesky(Side::Lower).ok()?.lower_triangular();
     let n = r.nrows();
     // Invert-transpose: solve R z = e_i columns to build R⁻¹, then transpose.
     // L_inv = R⁻ᵀ, so column j of L_inv is row j of R⁻¹. Build R⁻¹ by forward
@@ -780,5 +752,31 @@ mod tests {
         let rho_hat: Array1<f64> = array![];
         let h = Array2::<f64>::zeros((0, 0));
         assert!(rho_posterior_certificate(&rho_hat, &h, |_| Some(0.0), None).is_none());
+    }
+
+    /// The whitening factor is `R⁻ᵀ` of the Hessian itself, at any curvature
+    /// scale. `2⁻⁶⁰` and `2⁻⁵⁸` have exact square roots, so the factor is
+    /// `diag(2³⁰, 2²⁹)` bit for bit; a ridge sized to `max(1, diag)` swamped
+    /// both curvatures and returned a factor near `1e5`.
+    #[test]
+    fn whitening_factor_is_exact_at_any_curvature_scale() {
+        let tiny = 2.0_f64.powi(-60);
+        let h = array![[tiny, 0.0], [0.0, 4.0 * tiny]];
+        let l_inv = whitening_factor_from_outer_hessian(&h).expect("positive definite");
+        assert_eq!(l_inv[[0, 0]], 2.0_f64.powi(30));
+        assert_eq!(l_inv[[1, 1]], 2.0_f64.powi(29));
+        assert_eq!(l_inv[[0, 1]], 0.0);
+        assert_eq!(l_inv[[1, 0]], 0.0);
+    }
+
+    /// A singular outer Hessian has no Gaussian proposal. The ridge used to turn
+    /// `[[1, 1], [1, 1]]` into a proposal with variance `≈ 1e10` along its null
+    /// direction; the certificate refuses it instead.
+    #[test]
+    fn singular_outer_hessian_is_refused() {
+        let rho_hat = array![0.0, 0.0];
+        let h = array![[1.0, 1.0], [1.0, 1.0]];
+        assert!(whitening_factor_from_outer_hessian(&h).is_none());
+        assert!(rho_posterior_certificate(&rho_hat, &h, |_| Some(0.0), Some(64)).is_none());
     }
 }

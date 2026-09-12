@@ -1163,9 +1163,12 @@ pub fn explained_variance_from_reconstruction(
     }
     let (n, p) = x.dim();
     let mut means = vec![0.0; p];
+    let mut energy = 0.0_f64;
     for i in 0..n {
         for c in 0..p {
-            means[c] += x[[i, c]] as f64;
+            let value = x[[i, c]] as f64;
+            means[c] += value;
+            energy += value * value;
         }
     }
     for mean in &mut means {
@@ -1181,11 +1184,11 @@ pub fn explained_variance_from_reconstruction(
             tss += centered * centered;
         }
     }
-    if tss <= f64::MIN_POSITIVE {
-        Ok(if rss <= f64::MIN_POSITIVE { 1.0 } else { 0.0 })
-    } else {
-        Ok(1.0 - rss / tss)
-    }
+    Ok(crate::k_selection::explained_variance_within_band(
+        rss,
+        tss,
+        crate::k_selection::centered_tss_rounding_band(n, energy),
+    ))
 }
 
 #[cfg(test)]

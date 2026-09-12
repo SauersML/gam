@@ -193,11 +193,15 @@ fn negative_binomial_cdf_at(k: f64, theta: f64, prob: f64) -> f64 {
     beta_reg(theta, k + 1.0, prob.clamp(0.0, 1.0))
 }
 
+/// `2⁵³`, the magnitude below which every integer is representable as an `f64`.
+const EXACT_INTEGER_LIMIT: f64 = (1_u64 << f64::MANTISSA_DIGITS) as f64;
+
 /// Smallest integer `k` with `cdf(k) ≥ p`, found by a geometric bracket grown
 /// from `seed` followed by an integer bisection (invariant `cdf(lo) < p ≤
 /// cdf(hi)`). `cdf` must be a monotone non-decreasing lower-tail CDF on the
-/// non-negative integers. Returns `+∞` if the upper bracket grows past the
-/// `1e18` finite-arithmetic backstop without reaching `p`.
+/// non-negative integers. Returns `+∞` once the upper bracket passes `2⁵³`
+/// without reaching `p`: past it consecutive integers are not representable, so
+/// no bisection can name the smallest one.
 ///
 /// Shared root finder for the discrete count quantiles (Negative-Binomial,
 /// Poisson): both seed a normal approximation on their own moments and then run
@@ -224,13 +228,14 @@ fn count_quantile_bracket_bisect(cdf: impl Fn(f64) -> f64, seed: f64, p: f64) ->
         lo = seed; // CDF(seed) < p
         let mut step = 1.0;
         let mut cand = seed + 1.0;
-        // CDF → 1 as k → ∞ and p < 1, so this terminates; the cap is a
-        // finite-arithmetic backstop (returns an effectively infinite edge).
+        // CDF → 1 as k → ∞ and p < 1, so this terminates unless the root lies
+        // past `2⁵³`, where the integer bisection below could no longer shrink a
+        // bracket whose midpoint rounds onto one of its ends.
         while cdf(cand) < p {
             lo = cand;
             step *= 2.0;
             cand = seed + step;
-            if cand > 1.0e18 {
+            if cand > EXACT_INTEGER_LIMIT {
                 return f64::INFINITY;
             }
         }
@@ -507,16 +512,23 @@ fn tweedie_cdf_at(y: f64, mu: f64, phi: f64, power: f64) -> f64 {
     // any y > 0 for shape 0 is the degenerate point mass already in `zero_mass`).
     let mut acc = zero_mass; // P(Y ≤ y) includes the no-jump mass (Y = 0 ≤ y)
     let mut ln_w = -lambda; // ln Poisson(0; λ)
-    // Centre the truncation window on the Poisson mode so very large λ stays cheap.
-    let k_max = (lambda + 10.0 * lambda.sqrt()).ceil() as usize + 50;
     let mut remaining = 1.0 - zero_mass; // Poisson mass still unaccounted for (k ≥ 1)
-    for k in 1..=k_max {
+    // Magnitude sum of the running subtraction `(1 − e^{−λ}) − Σ w_k`.
+    let mut remaining_magnitude = remaining;
+    for k in 1_usize.. {
         ln_w += lambda.ln() - (k as f64).ln();
         let w = ln_w.exp();
         remaining -= w;
+        remaining_magnitude += w;
         // GammaCDF(y; kα, γ) = P(kα, y/γ) on the unit scale.
         acc += w * regularized_lower_gamma(alpha * k as f64, x);
-        if remaining <= 1e-15 && k as f64 > lambda {
+        // Past the Poisson mode the weights decrease and the unsummed tail is at
+        // most the unaccounted mass; once that sits inside the rounding band of
+        // the subtraction producing it, the tail is indistinguishable from zero.
+        if k as f64 > lambda
+            && remaining
+                <= gam_linalg::roundoff::accumulation_growth(k + 1) * remaining_magnitude
+        {
             break;
         }
     }
@@ -558,26 +570,29 @@ pub fn tweedie_quantile(q: f64, mu: f64, phi: f64, power: f64) -> f64 {
     }
 
     // Normal-approximation seed on the Tweedie moments, then geometric bracketing.
+    // Any positive edge brackets the root once doubled past it, so a seed at or
+    // below the support floor starts from the mean instead.
     let var = phi * mu.powf(power);
     let z = standard_normal_quantile(q).unwrap_or(0.0);
-    let mut hi = (mu + z * var.sqrt()).max(scale_floor(mu));
+    let seed = mu + z * var.sqrt();
+    let mut hi = if seed > 0.0 { seed } else { mu };
     let cdf = |y: f64| tweedie_cdf_at(y, mu, phi, power);
 
-    // Grow `hi` until it covers `q`; `lo` stays below it. CDF → 1 as y → ∞.
+    // Grow `hi` until it covers `q`; `lo` stays below it. CDF → 1 as y → ∞, so
+    // only an edge doubled past the largest finite float fails to cover `q`.
     let mut lo = 0.0_f64;
-    let mut guard = 0;
     while cdf(hi) < q {
         lo = hi;
         hi *= 2.0;
-        guard += 1;
-        if guard > 200 || hi > 1.0e18 {
+        if !hi.is_finite() {
             return f64::INFINITY;
         }
     }
 
     // Bisection on the strictly-increasing continuous part above the atom.
-    // Bisect until no representable `y` lies strictly between the bracket's ends.
-    for _ in 0..200 {
+    // Bisect until no representable `y` lies strictly between the bracket's
+    // ends; every step halves the bracket, so the float grid ends the loop.
+    loop {
         let mid = 0.5 * (lo + hi);
         if !(lo < mid && mid < hi) {
             break;
@@ -589,14 +604,6 @@ pub fn tweedie_quantile(q: f64, mu: f64, phi: f64, power: f64) -> f64 {
         }
     }
     0.5 * (lo + hi)
-}
-
-/// A strictly-positive starting scale for the Tweedie bracket: a small fraction
-/// of the mean keeps the initial `hi` inside the support when the normal seed
-/// underflows to or below zero on a heavily right-skewed row.
-#[inline]
-fn scale_floor(mu: f64) -> f64 {
-    (mu * 1e-3).max(f64::MIN_POSITIVE)
 }
 
 /// Equal-tailed predictive interval for a Tweedie compound Poisson–Gamma
@@ -1657,6 +1664,20 @@ mod tests {
         );
         assert_eq!(tweedie_quantile(0.025, mu, phi, power), 0.0);
         assert_eq!(tweedie_quantile(0.5 * zero_mass, mu, phi, power), 0.0);
+    }
+
+    /// Below `2⁵³` every integer is representable and the smallest qualifying
+    /// count is returned exactly; past it no bisection can name one, and the
+    /// quantile is `+∞` rather than a bracket whose midpoint rounds onto an end.
+    #[test]
+    fn count_quantile_is_exact_below_the_integer_limit_and_infinite_past_it() {
+        let below = EXACT_INTEGER_LIMIT / 2.0 + 1.0;
+        let step_at = |edge: f64| move |k: f64| if k >= edge { 1.0 } else { 0.0 };
+        assert_eq!(count_quantile_bracket_bisect(step_at(below), 1.0, 0.5), below);
+        assert_eq!(
+            count_quantile_bracket_bisect(step_at(EXACT_INTEGER_LIMIT + 2.0), 1.0, 0.5),
+            f64::INFINITY
+        );
     }
 
     #[test]

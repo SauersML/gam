@@ -54,9 +54,9 @@
 //! (variable projection): for any candidate `σ²` the slope/intercept are the
 //! closed-form ordinary-least-squares solution, leaving a smooth one-dimensional
 //! objective in `σ²` alone. That 1-D profile is minimized by golden-section
-//! bracketing **to a numerical tolerance** (not a fixed sweep count and not a
-//! wall-clock budget — the same converge-to-tolerance discipline the lane's CG
-//! block solver uses), over the *derived* bracket `σ² ∈ [0, min_k L_k)`: a noise
+//! bracketing **until the float grid leaves no interior point** (not a fixed sweep
+//! count, not a chosen tolerance and not a wall-clock budget), over the *derived*
+//! bracket `σ² ∈ [0, min_k L_k)`: a noise
 //! variance is non-negative and the plateau cannot exceed the smallest achieved
 //! loss. No finite differences are used (the regression and its standard errors
 //! are closed form); the golden ratio and the reporting confidence quantile are
@@ -214,17 +214,6 @@ pub struct SpectrometerReport {
 /// distribution is adequate; a Student-`t` quantile would widen the interval
 /// slightly (making saturation marginally *easier* to flag).
 const NORMAL_95_QUANTILE: f64 = 1.959_963_984_540_054;
-
-/// Relative width the golden-section profile of `σ²` is driven below before
-/// stopping — a numerical convergence tolerance (cf. the lane's `CG_REL_TOL`),
-/// not a wall-clock budget.
-const PROFILE_REL_TOL: f64 = 1.0e-12;
-
-/// Generous safety cap on golden-section iterations. Golden section contracts the
-/// bracket by the golden ratio each step, so reaching [`PROFILE_REL_TOL`] takes a
-/// few dozen steps; this cap only guards against a pathological non-terminating
-/// bracket (it is never the reason the loop stops on well-posed input).
-const PROFILE_MAX_ITERS: usize = 400;
 
 /// Run the dimension spectrometer: fit a single-atom (`s = 1`) dictionary at each
 /// rung of the doubling ladder, measure the per-rung mean reconstruction loss, and
@@ -510,8 +499,8 @@ fn fit_scaling_law(rungs: &[(usize, f64)]) -> Result<ScalingLaw, String> {
     // non-negative. This DERIVED bracket [0, L_min) is the golden-section domain.
     let l_min = losses.iter().cloned().fold(f64::INFINITY, f64::min);
     // Keep the upper end strictly below L_min so the smallest excess stays positive
-    // (log-defined). The gap is a floating-point safety margin, not a tuned knob.
-    let hi = l_min * (1.0 - 1.0e-9);
+    // (log-defined): the largest float below it leaves every excess at least one ulp.
+    let hi = l_min.next_down();
     let lo = 0.0f64;
 
     let objective = |sigma2: f64| -> f64 {
@@ -560,8 +549,9 @@ fn fit_scaling_law(rungs: &[(usize, f64)]) -> Result<ScalingLaw, String> {
 }
 
 /// Minimize a unimodal 1-D function on `[lo, hi]` by golden-section bracketing,
-/// contracting until the bracket is below [`PROFILE_REL_TOL`] (relative) or the
-/// safety cap [`PROFILE_MAX_ITERS`] is hit. Returns the bracket midpoint.
+/// contracting until no two representable interior points remain strictly inside
+/// the bracket. Every step strictly shrinks the bracket, so the float grid ends the
+/// loop. Returns the bracket midpoint.
 fn golden_section_min<F: FnMut(f64) -> f64>(mut f: F, mut lo: f64, mut hi: f64) -> f64 {
     // Inverse golden ratio 1/φ = (√5 − 1)/2.
     let inv_phi = (5.0f64.sqrt() - 1.0) / 2.0;
@@ -572,10 +562,7 @@ fn golden_section_min<F: FnMut(f64) -> f64>(mut f: F, mut lo: f64, mut hi: f64) 
     let mut d = lo + inv_phi * (hi - lo);
     let mut fc = f(c);
     let mut fd = f(d);
-    for _ in 0..PROFILE_MAX_ITERS {
-        if (hi - lo).abs() <= PROFILE_REL_TOL * (1.0 + lo.abs() + hi.abs()) {
-            break;
-        }
+    while lo < c && c < d && d < hi {
         if fc < fd {
             hi = d;
             d = c;

@@ -286,11 +286,15 @@ impl SparseDictStreamState {
         for c in 0..self.p {
             tss += self.col_sumsq[c] - self.col_sum[c] * self.col_sum[c] / n;
         }
-        let ev = if tss <= 1.0e-24 {
-            if self.rss <= 1.0e-24 { 1.0 } else { 0.0 }
-        } else {
-            1.0 - self.rss / tss
-        };
+        let ev = crate::k_selection::explained_variance_within_band(
+            self.rss,
+            tss,
+            crate::k_selection::streamed_tss_rounding_band(
+                self.row_count,
+                &self.col_sum,
+                &self.col_sumsq,
+            ),
+        );
 
         // (c) routability-gated decoder refresh from accumulated normal equations,
         // then (d) unit-norm. Deferred atoms keep their evidence streaming.

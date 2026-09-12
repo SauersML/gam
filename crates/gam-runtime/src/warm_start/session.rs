@@ -147,7 +147,7 @@ impl Session {
             Err(p) => p.into_inner(),
         };
         let improves = match (objective, guard.best_seen) {
-            (Some(o), Some(b)) => o < b - 1e-12,
+            (Some(o), Some(b)) => o < b,
             (Some(_), None) => true,
             _ => false,
         };

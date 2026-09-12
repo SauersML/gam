@@ -242,11 +242,14 @@ pub(crate) fn compute_split_rhat_and_ess(samples: &Array3<f64>) -> (f64, f64) {
     let mut chain_means = vec![0.0_f64; n_split_chains];
     let mut chainvars = vec![0.0_f64; n_split_chains];
     for d in 0..dim {
+        let mut magnitude = 0.0_f64;
         for chain in 0..n_chains {
             // First half
             let mut sum1 = 0.0;
             for i in 0..half {
-                sum1 += samples[[chain, i, d]];
+                let value = samples[[chain, i, d]];
+                sum1 += value;
+                magnitude = magnitude.max(value.abs());
             }
             let mean1 = sum1 / half as f64;
             let mut var1 = 0.0;
@@ -262,7 +265,9 @@ pub(crate) fn compute_split_rhat_and_ess(samples: &Array3<f64>) -> (f64, f64) {
             // Second half
             let mut sum2 = 0.0;
             for i in half..(2 * half) {
-                sum2 += samples[[chain, i, d]];
+                let value = samples[[chain, i, d]];
+                sum2 += value;
+                magnitude = magnitude.max(value.abs());
             }
             let mean2 = sum2 / half as f64;
             let mut var2 = 0.0;
@@ -292,8 +297,24 @@ pub(crate) fn compute_split_rhat_and_ess(samples: &Array3<f64>) -> (f64, f64) {
         let var_hat = (n_split_samples as f64 - 1.0) / n_split_samples as f64 * w
             + b / n_split_samples as f64;
 
-        // R-hat
-        let rhat_d = if w > 1e-10 { (var_hat / w).sqrt() } else { 1.0 };
+        // R-hat. A within-chain spread inside the rounding band `γ_{n+1}·max|x|`
+        // of the split mean it deviates from is arithmetic, not spread (the
+        // test the ESS path applies per split chain), and a ratio over it reads
+        // rounding. Split chains that are constant to working precision describe
+        // one point when their means agree within their band `γ_{n+m+1}·max|x|`,
+        // and have not mixed when they do not.
+        let within_band =
+            gam_linalg::roundoff::accumulation_growth(n_split_samples + 1) * magnitude;
+        let between_band =
+            gam_linalg::roundoff::accumulation_growth(n_split_samples + n_split_chains + 1)
+                * magnitude;
+        let rhat_d = if w.sqrt() > within_band {
+            (var_hat / w).sqrt()
+        } else if (b / n_split_samples as f64).sqrt() > between_band {
+            f64::INFINITY
+        } else {
+            1.0
+        };
         max_rhat = max_rhat.max(rhat_d);
 
         // Real ESS via split-chain autocorrelation with Geyer IPS truncation.
@@ -307,6 +328,10 @@ pub(crate) fn compute_split_rhat_and_ess(samples: &Array3<f64>) -> (f64, f64) {
 /// Solve L^T * X = I where L is lower triangular.
 ///
 /// Returns X = L^{-T} (the inverse transpose of L).
+///
+/// `l` is a strict Cholesky factor, so every pivot is positive and finite and
+/// divides without a guard: its caller factors a certified SPD Hessian, and a
+/// non-positive pivot is refused by that factorization, never absorbed here.
 ///
 /// This is the correct way to compute the whitening transform matrix:
 /// Given H = L L^T (Cholesky), we need W where W W^T = H^{-1}
@@ -350,12 +375,7 @@ fn solve_upper_triangular_transpose(l: &Array2<f64>, dim: usize) -> Array2<f64> 
         // Forward-substitute L * y = e_col. y[i] = 0 for i < col.
         // Diagonal term:
         let d_col = l_rows[col * dim + col];
-        let inv_d_col = if d_col.abs() > 1e-15 {
-            1.0 / d_col
-        } else {
-            0.0
-        };
-        y[col] = inv_d_col;
+        y[col] = 1.0 / d_col;
 
         // Below-diagonal entries: y[i] = -(sum_{j=col..i} L[i,j] * y[j]) / L[i,i].
         // Each inner loop is a stride-1 dot product on row `i` of L (contiguous).
@@ -370,8 +390,7 @@ fn solve_upper_triangular_transpose(l: &Array2<f64>, dim: usize) -> Array2<f64> 
             for k in 0..l_row.len() {
                 sum += l_row[k] * y_seg[k];
             }
-            let d = l_rows[row_off + i];
-            y[i] = if d.abs() > 1e-15 { -sum / d } else { 0.0 };
+            y[i] = -sum / l_rows[row_off + i];
         }
 
         // Write the column into result transposed: result[col, i] = y[i] for i >= col.
@@ -2382,6 +2401,39 @@ mod tests {
             20,
             "single-chain PG run should return all 20 requested draws"
         );
+    }
+
+    /// Split R-hat is a ratio of spreads, so rescaling a coordinate must not move
+    /// it. A power-of-two scale keeps every sum, quotient, square and root exact,
+    /// so the verdict at `2⁻²⁰` must equal the unit-scale one bit for bit. An
+    /// absolute variance floor reported these two disagreeing chains as `R-hat 1`
+    /// once their variance fell under it.
+    #[test]
+    fn split_rhat_is_invariant_to_the_coordinate_scale() {
+        let draws = [
+            [0.10, -0.20, 0.05, 0.15, -0.10, 0.20, -0.05, 0.00],
+            [3.10, 2.80, 3.05, 3.15, 2.90, 3.20, 2.95, 3.00],
+        ];
+        let unit = ndarray::Array3::from_shape_fn((2, 8, 1), |(c, t, _)| draws[c][t]);
+        let scaled = unit.mapv(|v| v * 2.0_f64.powi(-20));
+        let (rhat_unit, _) = super::compute_split_rhat_and_ess(&unit);
+        let (rhat_scaled, _) = super::compute_split_rhat_and_ess(&scaled);
+        assert!(
+            rhat_unit > 1.0,
+            "the fixture's chains must disagree, got R-hat {rhat_unit}"
+        );
+        assert_eq!(rhat_scaled.to_bits(), rhat_unit.to_bits());
+    }
+
+    /// Split chains that are constant to working precision carry no spread to
+    /// divide by: constants that agree are one point (R-hat 1), and constants
+    /// that disagree are chains that have not mixed (R-hat ∞).
+    #[test]
+    fn split_rhat_of_constant_chains_reads_their_means() {
+        let agree = ndarray::Array3::from_elem((2, 8, 1), 0.1);
+        assert_eq!(super::compute_split_rhat_and_ess(&agree).0, 1.0);
+        let stuck = ndarray::Array3::from_shape_fn((2, 8, 1), |(c, _, _)| 0.1 + c as f64);
+        assert_eq!(super::compute_split_rhat_and_ess(&stuck).0, f64::INFINITY);
     }
 
     #[test]

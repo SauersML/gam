@@ -239,7 +239,7 @@ pub fn routability_audit(
             norm2 += v as f64 * v as f64;
         }
         let norm = norm2.sqrt();
-        if norm <= 1.0e-12 {
+        if norm == 0.0 {
             continue; // a zero residual routes nowhere; it carries no cross-gate
         }
         let mut best = 0.0f64;

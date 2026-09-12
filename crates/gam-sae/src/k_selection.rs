@@ -721,10 +721,35 @@ pub fn explained_variance(x: ArrayView2<'_, f64>, fitted: ArrayView2<'_, f64>) -
             energy += value * value;
         }
     }
-    // A column mean over `n` rows is resolved to `γ_{n+1}·max|x|`, so a total sum of
-    // squares inside `γ_{n+1}²·Σx²` is the rounding residue of constant columns: the
-    // data carry no variance to explain.
-    let band = gam_linalg::roundoff::accumulation_growth(n + 1).powi(2) * energy;
+    explained_variance_within_band(rss, tss, centered_tss_rounding_band(n, energy))
+}
+
+/// Rounding residue of a column-centered total sum of squares over `rows` rows
+/// with uncentered energy `Σx²`. A column mean is resolved to `γ_{rows+1}·max|x|`,
+/// so constant columns leave squared deviations summing to at most
+/// `γ_{rows+1}²·Σx²`: a total sum of squares inside it carries no variance.
+pub(crate) fn centered_tss_rounding_band(rows: usize, energy: f64) -> f64 {
+    gam_linalg::roundoff::accumulation_growth(rows + 1).powi(2) * energy
+}
+
+/// Rounding band of a total sum of squares assembled from streamed moments,
+/// `Σ_c (Σx_c² − (Σx_c)²/n)`. For a constant column the two accumulations are
+/// equal and cancel, so each difference is resolved only to
+/// `γ_{2n+1}·(Σx_c² + (Σx_c)²/n)`; the `p` columns commit `p − 1` more additions.
+pub(crate) fn streamed_tss_rounding_band(rows: usize, col_sum: &[f64], col_sumsq: &[f64]) -> f64 {
+    let magnitude: f64 = col_sum
+        .iter()
+        .zip(col_sumsq)
+        .map(|(&sum, &sumsq)| sumsq + sum * sum / rows as f64)
+        .sum();
+    gam_linalg::roundoff::accumulation_growth(2 * rows + col_sum.len()) * magnitude
+}
+
+/// `1 − RSS/TSS` of the dictionary lanes, with `band` the rounding residue of the
+/// TSS computation. Data whose TSS sits inside it carry no variance to explain: a
+/// reconstruction inside the same band reproduces them (EV 1), any other
+/// reconstruction explains nothing (EV 0).
+pub(crate) fn explained_variance_within_band(rss: f64, tss: f64, band: f64) -> f64 {
     if tss <= band {
         if rss <= band { 1.0 } else { 0.0 }
     } else {

@@ -1017,11 +1017,15 @@ impl BlockSparseStreamState {
             )?
             .max(gradient_residual);
         }
-        let ev = if tss <= 1.0e-24 {
-            if self.rss <= 1.0e-24 { 1.0 } else { 0.0 }
-        } else {
-            1.0 - self.rss / tss
-        };
+        let ev = crate::k_selection::explained_variance_within_band(
+            self.rss,
+            tss,
+            crate::k_selection::streamed_tss_rounding_band(
+                self.row_count,
+                &self.col_sum,
+                &self.col_sumsq,
+            ),
+        );
         // The block lane's exact polar frames carry no matrix-free CG/percolation
         // certificate (that solver serves the atom/dict lane); report a default.
         let decoder_solve_stats = DecoderSolveStats::default();

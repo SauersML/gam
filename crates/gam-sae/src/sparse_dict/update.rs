@@ -3582,36 +3582,41 @@ fn explained_variance(
     let p = x.ncols();
     // Column means for TSS: per-chunk column partials, combined in ascending
     // chunk order (deterministic, thread-count-independent).
-    let mean_partials: Vec<Vec<f64>> = (0..n)
+    let mean_partials: Vec<(Vec<f64>, f64)> = (0..n)
         .collect::<Vec<_>>()
         .par_chunks(RECONSTRUCTION_ROW_CHUNK)
         .map(|rows| {
             let mut sums = vec![0.0f64; p];
+            let mut energy = 0.0f64;
             for &i in rows {
                 let xi = x.row(i);
                 for c in 0..p {
-                    sums[c] += xi[c] as f64;
+                    let value = xi[c] as f64;
+                    sums[c] += value;
+                    energy += value * value;
                 }
             }
-            sums
+            (sums, energy)
         })
         .collect();
     let mut means = vec![0.0f64; p];
-    for partial in &mean_partials {
+    let mut energy = 0.0f64;
+    for (partial, partial_energy) in &mean_partials {
         for c in 0..p {
             means[c] += partial[c];
         }
+        energy += partial_energy;
     }
     for c in 0..p {
         means[c] /= n as f64;
     }
 
     let (rss, tss) = reconstruction_rss_tss_chunks(x, codes, decoder, Some(&means));
-    if tss <= 1.0e-24 {
-        if rss <= 1.0e-24 { 1.0 } else { 0.0 }
-    } else {
-        1.0 - rss / tss
-    }
+    crate::k_selection::explained_variance_within_band(
+        rss,
+        tss,
+        crate::k_selection::centered_tss_rounding_band(n, energy),
+    )
 }
 
 fn residual_scale(
@@ -3653,6 +3658,37 @@ mod exact_solve_tests {
     use std::collections::HashMap;
 
     use gam_linalg::pcg::{CpuPcgBlockBackend, PcgStop};
+
+    /// Explained variance is a ratio of sums of squares, so a power-of-two
+    /// rescaling of the data and the codes leaves it bit for bit unchanged. An
+    /// absolute TSS floor declared this fixture at `2⁻⁵⁰` scale to carry no
+    /// variance at all.
+    #[test]
+    fn explained_variance_is_invariant_to_the_data_scale() {
+        let x = ndarray::array![[1.0_f32, 0.5], [-0.25, 2.0], [0.75, -1.5], [2.5, 0.25]];
+        let decoder = ndarray::array![[1.0_f32, 0.0], [0.0, 1.0]];
+        let codes_at = |scale: f32| -> Vec<SparseCode> {
+            [0.75_f32, -0.5, 1.0, 2.0]
+                .iter()
+                .map(|&c| SparseCode {
+                    indices: vec![0],
+                    codes: vec![c * scale],
+                })
+                .collect()
+        };
+        let scale = 2.0_f32.powi(-50);
+        let unit = explained_variance(x.view(), &codes_at(1.0), decoder.view());
+        let small = explained_variance(
+            x.mapv(|v| v * scale).view(),
+            &codes_at(scale),
+            decoder.view(),
+        );
+        assert!(
+            unit > 0.0 && unit < 1.0,
+            "the fixture must explain part of its variance, got {unit}"
+        );
+        assert_eq!(small.to_bits(), unit.to_bits());
+    }
 
     struct CgSolveResult {
         x: Vec<f64>,

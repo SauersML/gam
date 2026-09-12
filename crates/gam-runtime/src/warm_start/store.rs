@@ -496,7 +496,7 @@ impl WarmStartStore {
             };
             Ok(serde_json::to_vec_pretty(&meta)?)
         };
-        loop {
+        let meta_bytes = loop {
             let bin_tmp = dir.join(format!("{run_id}.bin.tmp.{pid}.{nonce}.{attempt}"));
             let meta_tmp = dir.join(format!("{run_id}.json.tmp.{pid}.{nonce}.{attempt}"));
             let stamp_fn = || self.unix_now_parts();
@@ -514,7 +514,7 @@ impl WarmStartStore {
                 stamp_fn: &stamp_fn,
                 build_meta_json: &build_meta_for_io,
             }) {
-                Ok(()) => break,
+                Ok(written) => break written,
                 Err(e)
                     if e.kind() == io::ErrorKind::NotFound
                         && attempt < SAVE_KEY_DIR_RACE_RETRIES =>
@@ -549,7 +549,7 @@ impl WarmStartStore {
                     return Err(StoreError::Io(e));
                 }
             }
-        }
+        };
         // Fsync the containing directory so the rename itself is durable
         // across a power loss / hard crash. fs::File::sync_all on the
         // payload only guarantees the file content reaches disk; without
@@ -583,8 +583,8 @@ impl WarmStartStore {
         // total forces the very next save to reclaim it. The eviction resyncs
         // `byte_total` to ground truth, so this fires once per crossing rather
         // than on every subsequent save.
-        let approx_added = payload.len() as u64 + APPROX_META_BYTES;
-        let new_total = self.byte_total.fetch_add(approx_added, Ordering::Relaxed) + approx_added;
+        let added = payload.len() as u64 + meta_bytes;
+        let new_total = self.byte_total.fetch_add(added, Ordering::Relaxed) + added;
         let n = self.save_counter.fetch_add(1, Ordering::Relaxed);
         if n == 0
             || n.is_multiple_of(EVICT_EVERY_N_SAVES)
@@ -771,7 +771,9 @@ struct EntryWrite<'a> {
     build_meta_json: &'a dyn Fn(u64, u32) -> io::Result<Vec<u8>>,
 }
 
-fn write_and_promote_entry(w: &EntryWrite<'_>) -> io::Result<()> {
+/// Write and promote one entry, returning the byte length of the metadata it
+/// wrote so the save counter tracks what reached disk.
+fn write_and_promote_entry(w: &EntryWrite<'_>) -> io::Result<u64> {
     // Recreate the dir up front: on the first attempt this is the original
     // `create_dir_all`; on a retry it re-establishes the dir a sibling
     // process' eviction removed.
@@ -807,13 +809,8 @@ fn write_and_promote_entry(w: &EntryWrite<'_>) -> io::Result<()> {
         );
         return Err(e);
     }
-    Ok(())
+    Ok(meta_json.len() as u64)
 }
-
-/// Conservative meta-JSON size used by the throttled save counter. Real
-/// meta files run ~250-400 bytes after pretty-printing; overestimating
-/// just means the throttle fires slightly earlier, never later.
-const APPROX_META_BYTES: u64 = 512;
 
 /// How [`WarmStartStore::lookup_with`] ranks candidate entries.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -1157,7 +1154,7 @@ fn entry_better(candidate: &OnDiskMeta, current: &OnDiskMeta) -> bool {
         (EntryKind::Checkpoint, EntryKind::Checkpoint) => {
             match (candidate.objective, current.objective) {
                 (Some(c), Some(d)) => {
-                    if (c - d).abs() < 1e-12 {
+                    if c == d {
                         entry_newer(candidate, current)
                     } else {
                         c < d
@@ -2085,7 +2082,7 @@ mod tests {
         let meta_final = dir.join("r0.json");
         let stamp_fn = || (0u64, 0u32);
         let build_meta_json = |_: u64, _: u32| -> io::Result<Vec<u8>> { Ok(b"{}".to_vec()) };
-        write_and_promote_entry(&EntryWrite {
+        let meta_bytes = write_and_promote_entry(&EntryWrite {
             dir: &dir,
             bin_tmp: &bin_tmp,
             meta_tmp: &meta_tmp,
@@ -2096,6 +2093,7 @@ mod tests {
             build_meta_json: &build_meta_json,
         })
         .expect("promote into a missing dir must recreate it and succeed");
+        assert_eq!(meta_bytes, fs::metadata(&meta_final).unwrap().len());
         assert!(bin_final.exists() && meta_final.exists());
         assert_eq!(fs::read(&bin_final).unwrap(), b"payload");
     }
