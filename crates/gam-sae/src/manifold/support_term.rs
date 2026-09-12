@@ -637,6 +637,15 @@ fn support_arrow_cross_transpose_add(
     Ok(())
 }
 
+/// The displacement the last accepted support coupled step applied, carried to
+/// the next coupled step together with the support layout it was taken under
+/// (#2576). See `joint_newton_step`.
+struct SupportJointStepMemory {
+    t: Array1<f64>,
+    beta: Array1<f64>,
+    support: Vec<u32>,
+}
+
 /// Apply the undamped Gauss--Newton/majorizer arrow represented by `system`.
 /// The support assembler stores both shared blocks behind sparse closures, so
 /// this small common apply is preferable to materialising either one.
@@ -5640,6 +5649,18 @@ impl SaeSupportSparseTerm {
         self.support_outer_negative_curvature_mode(&system, &rows)
     }
 
+    /// Every row's discrete support, flattened with its length, so a carried
+    /// coupled-step displacement is only reused under the layout it was taken in.
+    fn support_fingerprint(&self) -> Vec<u32> {
+        let mut out = Vec::new();
+        for row in 0..self.n_obs() {
+            let support = self.assignment.support_indices(row);
+            out.push(support.len() as u32);
+            out.extend_from_slice(support);
+        }
+        out
+    }
+
     fn joint_newton_step(
         &mut self,
         target: ArrayView2<'_, f64>,
@@ -5650,9 +5671,11 @@ impl SaeSupportSparseTerm {
         stationarity_tolerance: f64,
         coordinate_snapshot: &mut Vec<f64>,
         scaled_step: &mut Vec<f64>,
+        previous_step: &mut Option<SupportJointStepMemory>,
     ) -> Result<Option<f64>, String> {
         let mut system = self.assemble_arrow_schur(target, lambda_smooth, ard_precisions)?;
         if system.k == 0 || self.n_obs() == 0 {
+            *previous_step = None;
             return Ok(None);
         }
         // Opt the per-row factorisation into spectral discovery. A row whose
@@ -5725,7 +5748,10 @@ impl SaeSupportSparseTerm {
         }
         let (delta_t, delta_beta) = match step_pair {
             Some(pair) => pair,
-            None => return Ok(None),
+            None => {
+                *previous_step = None;
+                return Ok(None);
+            }
         };
         if delta_t.len() != self.coordinate_state_len() {
             return Err(format!(
@@ -5736,6 +5762,7 @@ impl SaeSupportSparseTerm {
             ));
         }
         if !delta_t.iter().chain(delta_beta.iter()).all(|v| v.is_finite()) {
+            *previous_step = None;
             return Ok(None);
         }
         // #2576 — the step is the FIRST iteration of Steihaug–Toint CG on the
@@ -5782,12 +5809,99 @@ impl SaeSupportSparseTerm {
         };
         let applied = self.support_outer_exact_hessian_apply(&system, &rows, &direction)?;
         let exact_curvature = direction.t.dot(&applied.t) + direction.beta.dot(&applied.beta);
-        let exact_scale = (gradient_dot_step < 0.0
-            && exact_curvature.is_finite()
-            && exact_curvature > 0.0)
-            .then(|| -gradient_dot_step / exact_curvature)
-            .filter(|scale| scale.is_finite() && *scale > 0.0);
-        let first_scale = exact_scale.unwrap_or(1.0);
+        // #2576 — the exact first scale along `d` made the model predict the
+        // realised decrease (ratio 1.000 on the 3000x48 chart, job 442005), but
+        // the terminal coupled steps then took s ≈ 0.43 cycle after cycle with a
+        // decrease that GREW about 1.4% per cycle: the iterate walks a valley
+        // along a direction `d` alone does not span. The last accepted
+        // displacement `p` is that valley's secant, so the exact model is
+        // minimised over span{d, p}: one more exact Hessian apply and a 2x2
+        // solve, no second majorizer inverse. It is taken only when the 2x2 exact
+        // curvature is positive definite beyond its round-off floor and the model
+        // descends; otherwise the step is the 1D exact scale along `d`, and the
+        // majorizer ladder from `s = 1` when `dᵀAd` is not positive.
+        let previous = previous_step.take().filter(|memory| {
+            memory.t.len() == delta_t.len()
+                && memory.beta.len() == delta_beta.len()
+                && memory.support == self.support_fingerprint()
+        });
+        let mut subspace = None;
+        if let Some(memory) = previous.as_ref() {
+            let other = SaeArrowVector {
+                t: memory.t.clone(),
+                beta: memory.beta.clone(),
+            };
+            let applied_other = self.support_outer_exact_hessian_apply(&system, &rows, &other)?;
+            let cross = direction.t.dot(&applied_other.t) + direction.beta.dot(&applied_other.beta);
+            let other_curvature = other.t.dot(&applied_other.t) + other.beta.dot(&applied_other.beta);
+            let mut gradient_dot_other = 0.0_f64;
+            for (row, block) in system.rows.iter().enumerate() {
+                let offset = system.row_offsets[row];
+                for j in 0..system.row_dims[row] {
+                    gradient_dot_other += block.gt[j] * other.t[offset + j];
+                }
+            }
+            for (g, value) in system.gb.iter().zip(other.beta.iter()) {
+                gradient_dot_other += g * value;
+            }
+            let determinant = exact_curvature * other_curvature - cross * cross;
+            let magnitude = exact_curvature
+                .abs()
+                .max(other_curvature.abs())
+                .max(cross.abs());
+            if exact_curvature > 0.0
+                && other_curvature > 0.0
+                && determinant.is_finite()
+                && determinant > f64::EPSILON * magnitude * magnitude
+            {
+                let coefficient_d =
+                    (cross * gradient_dot_other - other_curvature * gradient_dot_step) / determinant;
+                let coefficient_p =
+                    (cross * gradient_dot_step - exact_curvature * gradient_dot_other) / determinant;
+                let linear = coefficient_d * gradient_dot_step + coefficient_p * gradient_dot_other;
+                if coefficient_d.is_finite() && coefficient_p.is_finite() && linear < 0.0 {
+                    subspace = Some((coefficient_d, coefficient_p, linear));
+                }
+            }
+        }
+        // `predicted(s) = -(s·linear + ½·s²·quadratic)` for whichever model chose
+        // the first trial, so the acceptance log reads that model's accuracy.
+        let (model, step_t, step_beta, model_linear, model_quadratic, first_scale) =
+            match (subspace, previous.as_ref()) {
+                (Some((coefficient_d, coefficient_p, linear)), Some(memory)) => (
+                    "subspace",
+                    &delta_t * coefficient_d + &memory.t * coefficient_p,
+                    &delta_beta * coefficient_d + &memory.beta * coefficient_p,
+                    linear,
+                    -linear,
+                    1.0,
+                ),
+                _ => {
+                    let exact_scale = (gradient_dot_step < 0.0
+                        && exact_curvature.is_finite()
+                        && exact_curvature > 0.0)
+                        .then(|| -gradient_dot_step / exact_curvature)
+                        .filter(|scale| scale.is_finite() && *scale > 0.0);
+                    match exact_scale {
+                        Some(scale) => (
+                            "exact",
+                            delta_t.clone(),
+                            delta_beta.clone(),
+                            gradient_dot_step,
+                            exact_curvature,
+                            scale,
+                        ),
+                        None => (
+                            "majorizer",
+                            delta_t.clone(),
+                            delta_beta.clone(),
+                            gradient_dot_step,
+                            -gradient_dot_step,
+                            1.0,
+                        ),
+                    }
+                }
+            };
         self.snapshot_coordinates(coordinate_snapshot);
         let restore: Vec<Array2<f64>> = self
             .atoms
@@ -5809,7 +5923,7 @@ impl SaeSupportSparseTerm {
             }
             self.install_coordinates(coordinate_snapshot)?;
             scaled_step.clear();
-            scaled_step.extend(delta_t.iter().map(|value| scale * value));
+            scaled_step.extend(step_t.iter().map(|value| scale * value));
             self.retract_coordinates(scaled_step)?;
             for (atom, base) in restore.iter().enumerate() {
                 let mut decoder = base.clone();
@@ -5817,7 +5931,7 @@ impl SaeSupportSparseTerm {
                 for basis in 0..decoder.nrows() {
                     for channel in 0..output_dim {
                         decoder[[basis, channel]] +=
-                            scale * delta_beta[offset + basis * output_dim + channel];
+                            scale * step_beta[offset + basis * output_dim + channel];
                     }
                 }
                 self.atoms[atom].set_decoder_coefficients(decoder)?;
@@ -5862,13 +5976,7 @@ impl SaeSupportSparseTerm {
             if trial.is_finite() && objective - trial > objective_resolution {
                 // The prediction comes from the model the first trial was chosen
                 // from, so the ratio reads that model's accuracy along this step.
-                let (model, predicted) = match exact_scale {
-                    Some(_) => (
-                        "exact",
-                        -(scale * gradient_dot_step + 0.5 * scale * scale * exact_curvature),
-                    ),
-                    None => ("majorizer", -gradient_dot_step * (scale - 0.5 * scale * scale)),
-                };
+                let predicted = -(scale * model_linear + 0.5 * scale * scale * model_quadratic);
                 log::info!(
                     "support joint Newton: accepted scale={scale:.6e} (2^-{halving} of \
                      {first_scale:.6e}, {model} model) predicted={predicted:+.3e} \
@@ -5877,6 +5985,11 @@ impl SaeSupportSparseTerm {
                     if predicted != 0.0 { (objective - trial) / predicted } else { f64::NAN },
                 );
                 self.reconstruct_into(fitted)?;
+                *previous_step = Some(SupportJointStepMemory {
+                    t: step_t.mapv(|value| scale * value),
+                    beta: step_beta.mapv(|value| scale * value),
+                    support: self.support_fingerprint(),
+                });
                 return Ok(Some(trial));
             }
             halving += 1;
@@ -5885,6 +5998,7 @@ impl SaeSupportSparseTerm {
         for (atom, decoder) in restore.into_iter().enumerate() {
             self.atoms[atom].set_decoder_coefficients(decoder)?;
         }
+        *previous_step = None;
         Ok(None)
     }
 
@@ -5957,6 +6071,7 @@ impl SaeSupportSparseTerm {
         // the schedule itself, not a tuned rate.
         let mut joint_snapshot = Vec::with_capacity(self.coordinate_state_len());
         let mut joint_scaled_step = Vec::with_capacity(self.coordinate_state_len());
+        let mut joint_previous_step: Option<SupportJointStepMemory> = None;
         let mut joint_skip_remaining = 0usize;
         // PHASE. The caller's budget buys the ALTERNATION, and nothing about
         // that phase changes: no joint system is assembled, no coupled step is
@@ -6090,6 +6205,7 @@ impl SaeSupportSparseTerm {
                     tolerance,
                     &mut joint_snapshot,
                     &mut joint_scaled_step,
+                    &mut joint_previous_step,
                 )? {
                     Some(_accepted_objective) => {
                         joint_accepted += 1;
