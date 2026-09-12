@@ -439,5 +439,15 @@
     "unit_test_decreases": {
       "crates/gam-sae": 2
     }
+  },
+  {
+    "base": "268869615842a609a3630d78b480c09005c732bf",
+    "reason": "user directive: delete all useless slop (only used by tests / unused)",
+    "evidence": "The 11 removed tests (general_gain_with_circle_shape_const_equals_circle_gain, codimension_dividend_is_half_log_per_direction, no_gain_without_codimension, bar_threshold_matches_formula_and_gates_correctly, exchange_rate_is_neff_times_codim, kappa_detector_zero_only_at_gaussian_anchor, crossover_uses_the_same_total_distortion_currency_as_score, crossover_charges_selection_delta_when_configs_differ, crossover_says_no_on_the_control_case, criterion_bits_reconcile_no_parallel_accounting, tiling_support_entropy_undercuts_combinatorial_and_shrinks_gap) exercised only the deleted description_length items and carried no issue pin. scripts/test_census.py on MSI lane sw2 measured the same change twice (job 442340 over 8bd5765b0..candidate: 10421 -> 10410 tests; job 448783 over fba9a8d2e..candidate): units/crates/gam-sae -11, no pin loss. origin's floor moved after both jobs, so docs/test-census-floor.json in this commit is origin's floor at the landing tip with units/crates/gam-sae lowered by exactly these 11 tests; no other unit or issue count changes.",
+    "test_count_decrease": 11,
+    "removed_pins": {},
+    "unit_test_decreases": {
+      "crates/gam-sae": 11
+    }
   }
 ]

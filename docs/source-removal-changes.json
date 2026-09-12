@@ -3158,5 +3158,38 @@
     ],
     "reason": "SPEC rules 23 and 25 (#2263): SteerPlan::validity_radius was defined by two hand-chosen constants, a 64-point tau scan and a 10% divergence band. No production code read it, and predicted_nats already prices the exact applied move at any length.",
     "evidence": "Items measured by sw9 job 448227: the source-removal guard over 3bb12aea801c015a03ddb6d4582929043eb5e54b plus this patch, log /scratch.global/sauer354/sw9-logs/steera_guard.448227.log. At that base, git grep finds validity_radius only in steering.rs, pyffi's steer dict, docs/manifold-sae.md, CHANGELOG history and the tests edited here. The renamed dosimetry tests keep their assertions on predicted_nats, delta and off_manifold_norm. The Tier-0 rescale test replaces its radius assertion with an off_manifold_norm bound."
+  },
+  {
+    "base": "268869615842a609a3630d78b480c09005c732bf",
+    "items": [
+      "crates/gam-sae/src/description_length.rs:fn:bar_birth_threshold_nats",
+      "crates/gam-sae/src/description_length.rs:fn:bar_supports_birth",
+      "crates/gam-sae/src/description_length.rs:fn:circle_chart_columns",
+      "crates/gam-sae/src/description_length.rs:fn:circle_shape_const_bits",
+      "crates/gam-sae/src/description_length.rs:fn:crossover_firings",
+      "crates/gam-sae/src/description_length.rs:fn:curved_coding_gain_bits",
+      "crates/gam-sae/src/description_length.rs:fn:evidence_per_log_persistence",
+      "crates/gam-sae/src/description_length.rs:fn:from_criterion_nats",
+      "crates/gam-sae/src/description_length.rs:fn:kappa_coding_gain_detector",
+      "crates/gam-sae/src/description_length.rs:fn:reconciles_with_criterion",
+      "crates/gam-sae/src/description_length.rs:fn:uniform_unit_range_sd",
+      "crates/gam-sae/src/description_length.rs:fn:with_support_entropy",
+      "crates/gam-sae/src/description_length.rs:struct:Crossover",
+      "crates/gam-sae/src/description_length.rs:struct:DescriptionLength",
+      "crates/gam-sae/src/description_length_tests.rs:fn:bar_threshold_matches_formula_and_gates_correctly",
+      "crates/gam-sae/src/description_length_tests.rs:fn:codimension_dividend_is_half_log_per_direction",
+      "crates/gam-sae/src/description_length_tests.rs:fn:criterion_bits_reconcile_no_parallel_accounting",
+      "crates/gam-sae/src/description_length_tests.rs:fn:crossover_charges_selection_delta_when_configs_differ",
+      "crates/gam-sae/src/description_length_tests.rs:fn:crossover_says_no_on_the_control_case",
+      "crates/gam-sae/src/description_length_tests.rs:fn:crossover_uses_the_same_total_distortion_currency_as_score",
+      "crates/gam-sae/src/description_length_tests.rs:fn:exchange_rate_is_neff_times_codim",
+      "crates/gam-sae/src/description_length_tests.rs:fn:general_gain_with_circle_shape_const_equals_circle_gain",
+      "crates/gam-sae/src/description_length_tests.rs:fn:kappa_detector_zero_only_at_gaussian_anchor",
+      "crates/gam-sae/src/description_length_tests.rs:fn:no_gain_without_codimension",
+      "crates/gam-sae/src/description_length_tests.rs:fn:tiling_codes",
+      "crates/gam-sae/src/description_length_tests.rs:fn:tiling_support_entropy_undercuts_combinatorial_and_shrinks_gap"
+    ],
+    "reason": "user directive: delete all useless slop (only used by tests / unused)",
+    "evidence": "At 8bd5765b0 the listed description_length.rs items had no production caller (gam-e0's measured inventory, re-confirmed with in-file greps and single-name git greps): they were named only by their definitions, docs and the listed tests, and bar_birth_threshold_nats was called only by bar_supports_birth. The 11 listed test functions exercised only them, and tiling_codes was only the tiling test's fixture. Two mixed tests keep their live assertions with the helper values inlined. MSI job 442340, exact candidate tree: cargo check --workspace --exclude gam-pyffi --all-targets --keep-going rc 0 with 0 error lines; cargo doc -p gam-sae 0 errors / 0 warnings; the remaining 19 description_length tests pass. These items are that job's guard output over 8bd5765b0..candidate."
   }
 ]

@@ -1199,5 +1199,24 @@
     },
     "reason": "user directive: delete unnecessary code; the inner stall branch no longer consults the gate-norm continuation certificate (#2283, #2267)",
     "evidence": "public_api_census.py over 9d289eb63 -> a private-index candidate holding only this change measured exactly this removed map (/scratch.global/sauer354/pool/sae-fit/m12/cand/pa.err). StallPolishProgressCertificate::new, observe and StallPolishProgressVerdict::permits_continuation were called only by the stall branch this commit changes."
+  },
+  {
+    "base": "268869615842a609a3630d78b480c09005c732bf",
+    "removed": {
+      "crates/gam-sae/src/description_length.rs::bar_birth_threshold_nats": 1,
+      "crates/gam-sae/src/description_length.rs::bar_supports_birth": 1,
+      "crates/gam-sae/src/description_length.rs::circle_chart_columns": 1,
+      "crates/gam-sae/src/description_length.rs::circle_shape_const_bits": 1,
+      "crates/gam-sae/src/description_length.rs::crossover_firings": 1,
+      "crates/gam-sae/src/description_length.rs::curved_coding_gain_bits": 1,
+      "crates/gam-sae/src/description_length.rs::evidence_per_log_persistence": 1,
+      "crates/gam-sae/src/description_length.rs::from_criterion_nats": 1,
+      "crates/gam-sae/src/description_length.rs::kappa_coding_gain_detector": 1,
+      "crates/gam-sae/src/description_length.rs::reconciles_with_criterion": 1,
+      "crates/gam-sae/src/description_length.rs::uniform_unit_range_sd": 1,
+      "crates/gam-sae/src/description_length.rs::with_support_entropy": 1
+    },
+    "reason": "user directive: delete all useless slop (only used by tests / unused)",
+    "evidence": "scripts/public_api_census.py on MSI lane sw2 (job 442340) over 8bd5765b0..the exact candidate tree measured exactly these 12 declarations, description_length.rs's test-only surface removed in this commit."
   }
 ]
