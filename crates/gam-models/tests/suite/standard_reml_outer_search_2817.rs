@@ -15,7 +15,6 @@
 
 use csv::StringRecord;
 use gam_data::encode_recordswith_inferred_schema;
-use gam_linalg::matrix::LinearOperator;
 use gam_models::fit_orchestration::{FitConfig, FitResult, fit_from_formula};
 use gam_solve::estimate::reml::reml_outer_engine::{
     MATRIX_FREE_OUTER_HESSIAN_DIM_AT_LARGE_N, MATRIX_FREE_OUTER_HESSIAN_LARGE_N_THRESHOLD,
