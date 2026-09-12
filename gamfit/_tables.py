@@ -463,17 +463,6 @@ def detect_table_kind(data: Any) -> str:
     return "unknown"
 
 
-def response_column_name(formula: str) -> str | None:
-    if "~" not in formula:
-        return None
-    candidate = formula.split("~", 1)[0].strip()
-    if not candidate or candidate.startswith("Surv("):
-        return None
-    if candidate.replace("_", "").isalnum():
-        return candidate
-    return None
-
-
 def mapping_table_columns(data: Mapping[Any, Any]) -> dict[str, list[Any]]:
     columns: dict[str, list[Any]] = {}
     for key, value in data.items():

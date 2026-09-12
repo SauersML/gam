@@ -4902,6 +4902,7 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
         module
     )?)?;
     module.add_function(wrap_pyfunction!(sklearn_fit_metadata, module)?)?;
+    module.add_function(wrap_pyfunction!(response_column_name, module)?)?;
     module.add_function(wrap_pyfunction!(build_info, module)?)?;
     module.add_function(wrap_pyfunction!(identifiability_check_json, module)?)?;
     module.add_function(wrap_pyfunction!(set_log_level, module)?)?;

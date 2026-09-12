@@ -37,7 +37,6 @@ from ._survival import (
 )
 from ._tables import (
     normalize_table,
-    response_column_name,
     restore_output_table,
     table_columns,
 )
@@ -1215,7 +1214,7 @@ class Model:
 
     @property
     def response_name(self) -> str | None:
-        return response_column_name(self.formula)
+        return rust_module().response_column_name(self.formula)
 
     @property
     def training_table_kind(self) -> str:

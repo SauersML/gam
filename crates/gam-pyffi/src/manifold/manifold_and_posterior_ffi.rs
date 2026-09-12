@@ -3253,13 +3253,9 @@ fn infer_numeric_array_column_kind(column: ArrayView1<'_, f64>) -> ColumnKindTag
     }
 }
 
+#[pyfunction]
 fn response_column_name(formula: &str) -> Option<String> {
-    let candidate = formula.split('~').next()?.trim();
-    if candidate.is_empty() || candidate.starts_with("Surv(") {
-        None
-    } else {
-        Some(candidate.to_string())
-    }
+    gam::terms::inference::formula_dsl::formula_response_column(formula)
 }
 
 fn prediction_model_class_label(model: &FittedModel) -> String {

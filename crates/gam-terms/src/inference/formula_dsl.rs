@@ -780,9 +780,10 @@ fn parse_call_pair(call: Pair<'_, Rule>) -> Result<FunctionCallSpec, String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        CallArgSpec, ParsedTerm, parse_formula, parse_formula_dsl, parse_function_call,
-        parse_linkwiggle_formulaspec, parsed_term_column_names, parsed_terms_reference_column,
-        validate_marginal_slope_z_alias_exclusion, validate_marginal_slope_z_column_exclusion,
+        CallArgSpec, ParsedTerm, formula_response_column, parse_formula, parse_formula_dsl,
+        parse_function_call, parse_linkwiggle_formulaspec, parsed_term_column_names,
+        parsed_terms_reference_column, validate_marginal_slope_z_alias_exclusion,
+        validate_marginal_slope_z_column_exclusion,
     };
     use std::collections::{BTreeMap, BTreeSet, HashMap};
 
@@ -1349,6 +1350,24 @@ mod tests {
                 "{lenient} is a genuine random effect: lenient (lenient_unseen=true) on unseen levels"
             );
         }
+    }
+
+    #[test]
+    fn formula_response_column_names_only_a_plain_response() {
+        // pyffi and the sklearn metadata read the response column from this
+        // owner, so it must equal the CLI's `parse_formula(..).response` for a
+        // plain column and refuse survival responses naming several columns.
+        let formula = "y_obs ~ s(x) + z";
+        let parsed = parse_formula(formula).expect("plain formula parses");
+        assert_eq!(formula_response_column(formula), Some(parsed.response));
+        for survival in [
+            "Surv(entry, exit, event) ~ s(x)",
+            "surv(exit, event) ~ s(x)",
+            "SurvInterval(left, right, event) ~ s(x)",
+        ] {
+            assert_eq!(formula_response_column(survival), None, "{survival}");
+        }
+        assert_eq!(formula_response_column("s(x) + z"), None);
     }
 }
 
@@ -2465,6 +2484,21 @@ pub fn parse_surv_interval_response(
                  observed bracket T ∈ (L, R]); got {n} columns"
             ),
         }),
+    }
+}
+
+/// The data column a formula's response names: the trimmed left-hand side that
+/// [`parse_formula`] stores as the response. `None` when the formula does not
+/// parse, or when the response is a `Surv(...)` or `SurvInterval(...)` call
+/// naming several columns.
+pub fn formula_response_column(formula: &str) -> Option<String> {
+    let response = parse_formula_dsl(formula).ok()?.response_expr;
+    match (
+        parse_surv_response(&response),
+        parse_surv_interval_response(&response),
+    ) {
+        (Ok(None), Ok(None)) if !response.is_empty() => Some(response),
+        _ => None,
     }
 }
 
