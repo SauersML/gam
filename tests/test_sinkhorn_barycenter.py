@@ -89,6 +89,11 @@ def test_no_nan_at_small_eps() -> None:
 
 
 def test_rejects_tiny_eps() -> None:
+    # circular_cost(2) has max 1; eps = u (the unit roundoff, 2**-53) is where the
+    # largest Gibbs exponent 1/eps first rounds by a nat.
     atoms = np.array([[0.5, 0.5], [0.5, 0.5]])
-    with pytest.raises(ValueError):
-        kernels.sinkhorn_barycenter(atoms, eps=1e-15, n_iter=10)
+    for eps in (0.0, -1.0, 2.0**-53):
+        with pytest.raises(ValueError):
+            kernels.sinkhorn_barycenter(atoms, eps=eps, n_iter=10)
+    bary = kernels.sinkhorn_barycenter(atoms, eps=2.0**-52, n_iter=10)
+    assert np.all(np.isfinite(bary))

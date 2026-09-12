@@ -19,7 +19,10 @@
 //!
 //! ## Stability guarantees
 //!
-//! * `eps >= 1e-12` is required (smaller is rejected with `Err`).
+//! * `eps > 0` is required, with `max(cost)/eps` below `1/u` (`u` the unit
+//!   roundoff), where the largest Gibbs exponent still resolves a nat; anything
+//!   else is rejected with `Err`. The bound is on the ratio because the problem
+//!   is: `(c·cost, c·eps)` is the same barycenter for every `c > 0`.
 //! * Input atom rows with truly-zero mass on a support point are
 //!   handled via a large-negative sentinel (`LOG_ZERO_SENTINEL`)
 //!   instead of `-inf`, so additions of `+inf` (from the kernel) and
@@ -51,12 +54,6 @@ use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
 pub const LOG_ZERO_SENTINEL: f64 = -1.0e300;
 
 const LOG_ZERO_SATURATION_THRESHOLD: f64 = LOG_ZERO_SENTINEL * 0.5;
-
-/// Lower bound on the regularization parameter `eps`. Below this the
-/// log-kernel exponents would lose more than 52 bits of mantissa even
-/// for unit-scale costs; we refuse to run instead of silently producing
-/// garbage.
-pub const MIN_EPS: f64 = 1.0e-12;
 
 /// Stabilized `logsumexp` of `log_kernel[i, j] + off[i]` over the first axis
 /// `i`, returning an `(M,)` vector indexed by `j`.
@@ -231,8 +228,8 @@ fn validate_inputs(
             m, m, cm_r, cm_c
         ));
     }
-    if !(eps.is_finite() && eps >= MIN_EPS) {
-        return Err(format!("eps must be finite and >= {MIN_EPS:e}, got {eps}"));
+    if !(eps.is_finite() && eps > 0.0) {
+        return Err(format!("eps must be finite and positive, got {eps}"));
     }
     if n_iter == 0 {
         return Err("n_iter must be at least 1".to_string());
@@ -254,12 +251,24 @@ fn validate_inputs(
     if w_total <= 0.0 {
         return Err("weights must have positive total mass".to_string());
     }
+    let mut cost_max = 0.0_f64;
     for ((i, j), value) in cost.indexed_iter() {
         if !value.is_finite() || *value < 0.0 {
             return Err(format!(
                 "cost must be finite and non-negative; got {value} at ({i}, {j})"
             ));
         }
+        cost_max = cost_max.max(*value);
+    }
+    // The Gibbs exponents are `−cost/eps`. Once the largest one's unit roundoff
+    // reaches a nat, `exp(−cost/eps)` carries no significant digit, and neither
+    // does anything the log-domain updates build from it.
+    let largest_exponent = cost_max / eps;
+    if !(gam_linalg::roundoff::UNIT_ROUNDOFF * largest_exponent < 1.0) {
+        return Err(format!(
+            "eps {eps} is below the resolution of the Gibbs exponents: the largest, \
+             max(cost)/eps = {largest_exponent:e}, rounds by a nat or more"
+        ));
     }
     Ok(())
 }
@@ -910,22 +919,41 @@ mod tests {
         let atoms = Array2::<f64>::from_elem((2, m), 1.0 / m as f64);
         let weights = array![0.5, 0.5];
         let cost = circular_cost(m);
-        let err = sinkhorn_barycenter(atoms.view(), weights.view(), cost.view(), 1.0e-15, 10);
-        assert!(err.is_err());
+        // max(cost) = 4, so the largest Gibbs exponent 4/eps rounds by a nat at eps = 4u.
+        let unit_roundoff = gam_linalg::roundoff::UNIT_ROUNDOFF;
+        for eps in [0.0, -1.0, f64::NAN, f64::INFINITY, 4.0 * unit_roundoff] {
+            let err = sinkhorn_barycenter(atoms.view(), weights.view(), cost.view(), eps, 10);
+            assert!(err.is_err(), "eps {eps:e} must be refused");
+        }
+        let resolved =
+            sinkhorn_barycenter(atoms.view(), weights.view(), cost.view(), 8.0 * unit_roundoff, 10);
+        assert!(resolved.is_ok(), "at eps = 8u every exponent resolves half a nat");
     }
 
     #[test]
-    fn sentinel_saturated_log_a_returns_error() {
-        let m = 3;
-        let atoms = Array2::<f64>::from_elem((1, m), 1.0 / m as f64);
-        let weights = array![1.0];
-        let cost = Array2::<f64>::from_elem((m, m), 1.0e288);
-        let err =
-            sinkhorn_barycenter(atoms.view(), weights.view(), cost.view(), MIN_EPS, 1).unwrap_err();
-        assert!(
-            err.contains("all log_a saturated to sentinel"),
-            "unexpected error: {err}"
-        );
+    fn same_barycenter_at_any_cost_scale() {
+        // `(c·cost, c·eps)` is one problem, so a cost scale that puts `eps` far
+        // below any absolute floor gives the unit-scale answer.
+        let m = 16;
+        let atoms = Array2::<f64>::from_shape_fn((2, m), |(k, j)| {
+            let centre = if k == 0 { 3.0 } else { 11.0 };
+            (-((j as f64 - centre).powi(2)) / 4.0).exp()
+        });
+        let weights = array![0.5, 0.5];
+        let cost = circular_cost(m);
+        let scale = 1.0e-12;
+        let unit =
+            sinkhorn_barycenter(atoms.view(), weights.view(), cost.view(), 1.0e-3, 50).unwrap();
+        let scaled_cost = cost.mapv(|c| c * scale);
+        let scaled = sinkhorn_barycenter(
+            atoms.view(),
+            weights.view(),
+            scaled_cost.view(),
+            1.0e-3 * scale,
+            50,
+        )
+        .unwrap();
+        approx_simplex_eq(&scaled, &unit, 1.0e-8);
     }
 
     #[test]

@@ -121,7 +121,9 @@ def sinkhorn_barycenter(
         Wasserstein interpretation but not enforced here. Defaults
         to :func:`circular_cost`\ ``(M)``.
     eps : float, default 0.01
-        Entropic regularization strength. Must be ``>= 1e-12``.
+        Entropic regularization strength. Must be positive, with
+        ``max(cost) / eps`` below ``1 / u`` (``u`` the unit roundoff): past
+        that the largest Gibbs exponent rounds by a nat.
     n_iter : int, default 20
         Number of outer Sinkhorn iterations.
 
@@ -134,7 +136,7 @@ def sinkhorn_barycenter(
     Notes
     -----
     All updates run in the log domain with stable ``logsumexp``; the
-    kernel does not produce NaN for ``eps >= 1e-12`` even with input
+    kernel does not produce NaN for any accepted ``eps`` even with input
     rows that have zero mass on some support points.
 
     Differentiability is provided by the companion VJP
