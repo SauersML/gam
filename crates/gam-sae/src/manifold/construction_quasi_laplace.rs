@@ -413,8 +413,10 @@ impl SaeManifoldTerm {
         // eigendecomposition yields the joint log|A|, applying the shared PD
         // floor; an indefinite A (a majorizer saddle) returns the typed
         // IndefiniteObservedInformation refusal, which makes saddle-ρ
-        // probe-infeasible (+inf) and steers the outer away until the #2336
-        // accepted-lane saddle-escape lands.
+        // probe-infeasible (+inf) so the outer search steers away. There is no
+        // accepted-lane saddle escape to wait for: 6a5ca5d84 measured it
+        // structurally non-viable (the refine lane returns to the same A-saddle),
+        // so a saddle ρ stays infeasible (#2336).
         let log_det = self.exact_observed_information_log_dets(rho, target, &cache)?;
 
         // 3. Smoothing-penalty Occam term `−½·Σ_k r_k·rank(S_k)·log λ_smooth`
