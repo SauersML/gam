@@ -2578,9 +2578,9 @@ fn validate_bvn_args(h: f64, k: f64, rho: f64) -> Result<(), String> {
         )
         .into());
     }
-    if !rho.is_finite() {
+    if !rho.is_finite() || !(-1.0..=1.0).contains(&rho) {
         return Err(CubicCellKernelError::bivariate_normal_domain(format!(
-            "bivariate normal cdf requires finite correlation, got {rho}"
+            "bivariate normal cdf requires correlation in [-1, 1], got {rho}"
         ))
         .into());
     }
@@ -2588,14 +2588,14 @@ fn validate_bvn_args(h: f64, k: f64, rho: f64) -> Result<(), String> {
 }
 
 #[inline]
-fn bvn_gl_sum(h: f64, k: f64, rho_clamped: f64, asr: f64) -> f64 {
+fn bvn_gl_sum(h: f64, k: f64, rho: f64, asr: f64) -> f64 {
     // The Drezner-Wesolowsky arcsin representation is integrated with the
     // same 20-point Gauss-Legendre rule as before, but mirrored node pairs are
     // evaluated with one sin_cos for the half-angle offset rather than two
     // independent sin calls.  This preserves the quadrature rule (and hence
     // the accuracy envelope) while reducing the transcendental work in the
     // dominant finite-bound path from 20 sin calls to 11 sin/cos evaluations.
-    if rho_clamped == 0.0 {
+    if rho == 0.0 {
         return 0.0;
     }
     let hs = 0.5 * (h * h + k * k);
@@ -2633,28 +2633,27 @@ pub fn bivariate_normal_cdf(h: f64, k: f64, rho: f64) -> Result<f64, String> {
         return Ok(normal_cdf(h));
     }
 
-    let rho_clamped = rho.clamp(-1.0, 1.0);
-    if rho_clamped >= 1.0 - 1e-12 {
+    if rho == 1.0 {
         return Ok(normal_cdf(h.min(k)));
     }
-    if rho_clamped <= -1.0 + 1e-12 {
-        return Ok((normal_cdf(h) - normal_cdf(-k)).clamp(0.0, 1.0));
+    if rho == -1.0 {
+        return Ok(normal_interval_probability(-k, h));
     }
-    if rho_clamped == 0.0 {
+    if rho == 0.0 {
         return Ok((normal_cdf(h) * normal_cdf(k)).clamp(0.0, 1.0));
     }
     if h == 0.0 && k == 0.0 {
-        return Ok((0.25 + rho_clamped.asin() / std::f64::consts::TAU).clamp(0.0, 1.0));
+        return Ok((0.25 + rho.asin() / std::f64::consts::TAU).clamp(0.0, 1.0));
     }
 
-    let asr = rho_clamped.asin();
-    let sum = bvn_gl_sum(h, k, rho_clamped, asr);
+    let asr = rho.asin();
+    let sum = bvn_gl_sum(h, k, rho, asr);
     Ok((normal_cdf(h) * normal_cdf(k) + asr * sum / (4.0 * std::f64::consts::PI)).clamp(0.0, 1.0))
 }
 
 #[inline]
-fn bvn_gl_sum_interval(h: f64, left: f64, right: f64, rho_clamped: f64, asr: f64) -> f64 {
-    if rho_clamped == 0.0 {
+fn bvn_gl_sum_interval(h: f64, left: f64, right: f64, rho: f64, asr: f64) -> f64 {
+    if rho == 0.0 {
         return 0.0;
     }
     let h2 = h * h;
@@ -2684,41 +2683,52 @@ fn bvn_gl_sum_interval(h: f64, left: f64, right: f64, rho_clamped: f64, asr: f64
 }
 
 fn bivariate_normal_cdf_interval(h: f64, left: f64, right: f64, rho: f64) -> Result<f64, String> {
+    validate_bvn_args(h, left, rho)?;
+    validate_bvn_args(h, right, rho)?;
     if right <= left {
         return Ok(0.0);
     }
     if left == f64::NEG_INFINITY && right == f64::INFINITY {
         return Ok(normal_cdf(h));
     }
-    if !left.is_finite() || !right.is_finite() {
-        let upper = bivariate_normal_cdf(h, right, rho)?;
-        let lower = bivariate_normal_cdf(h, left, rho)?;
-        return Ok((upper - lower).clamp(0.0, 1.0));
+    if left == f64::NEG_INFINITY {
+        return bivariate_normal_cdf(h, right, rho);
     }
-    validate_bvn_args(h, left, rho)?;
-    validate_bvn_args(h, right, rho)?;
+    if right == f64::INFINITY {
+        // Reflect the second variate: P(X≤h,Y>left)=Φ₂(h,-left;-ρ).
+        // Subtracting from P(X≤h) would erase a small upper-tail interval.
+        return bivariate_normal_cdf(h, -left, -rho);
+    }
     if h == f64::NEG_INFINITY {
         return Ok(0.0);
     }
     if h == f64::INFINITY {
-        return Ok((normal_cdf(right) - normal_cdf(left)).clamp(0.0, 1.0));
+        return Ok(normal_interval_probability(left, right));
     }
 
-    let rho_clamped = rho.clamp(-1.0, 1.0);
-    if rho_clamped >= 1.0 - 1e-12 || rho_clamped <= -1.0 + 1e-12 {
-        let upper = bivariate_normal_cdf(h, right, rho_clamped)?;
-        let lower = bivariate_normal_cdf(h, left, rho_clamped)?;
-        return Ok((upper - lower).clamp(0.0, 1.0));
+    if rho == 1.0 {
+        return Ok(normal_interval_probability(left, right.min(h)));
+    }
+    if rho == -1.0 {
+        return Ok(normal_interval_probability(left.max(-h), right));
     }
 
     let cdf_h = normal_cdf(h);
-    let normal_part = cdf_h * (normal_cdf(right) - normal_cdf(left));
-    if rho_clamped == 0.0 {
+    let normal_part = cdf_h * normal_interval_probability(left, right);
+    if rho == 0.0 {
         return Ok(normal_part.clamp(0.0, 1.0));
     }
-    let asr = rho_clamped.asin();
-    let sum = bvn_gl_sum_interval(h, left, right, rho_clamped, asr);
+    let asr = rho.asin();
+    let sum = bvn_gl_sum_interval(h, left, right, rho, asr);
     Ok((normal_part + asr * sum / (4.0 * std::f64::consts::PI)).clamp(0.0, 1.0))
+}
+
+#[inline]
+fn normal_interval_probability(left: f64, right: f64) -> f64 {
+    if right <= left {
+        return 0.0;
+    }
+    truncated_gaussian_zeroth_moment(left, right) / std::f64::consts::TAU.sqrt()
 }
 
 fn exp_neg_half_square(x: f64) -> f64 {
@@ -2839,8 +2849,23 @@ fn fill_truncated_gaussian_moments(a: f64, b: f64, out: &mut [f64]) {
     let mut a_pow_n_minus_1 = a; // a^1, used at n = 2
     let mut b_pow_n_minus_1 = b;
     for n in 2..out.len() {
-        let left = if a_finite { a_pow_n_minus_1 * ea } else { 0.0 };
-        let right = if b_finite { b_pow_n_minus_1 * eb } else { 0.0 };
+        let boundary = |x: f64, finite: bool, power: f64, exponential: f64| {
+            if !finite {
+                0.0
+            } else if exponential < f64::MIN_POSITIVE {
+                // Form the product in log space when its exponential alone
+                // loses precision or vanishes. x^(n-1) can restore a
+                // representable boundary term, and at huge finite x this
+                // avoids the indeterminate product infinity * zero.
+                let magnitude =
+                    (((n - 1) as f64) * x.abs().ln() - 0.5 * x * x).exp();
+                if x < 0.0 && (n - 1) % 2 == 1 { -magnitude } else { magnitude }
+            } else {
+                power * exponential
+            }
+        };
+        let left = boundary(a, a_finite, a_pow_n_minus_1, ea);
+        let right = boundary(b, b_finite, b_pow_n_minus_1, eb);
         out[n] = left - right + (n as f64 - 1.0) * out[n - 2];
         a_pow_n_minus_1 *= a;
         b_pow_n_minus_1 *= b;
@@ -2874,8 +2899,9 @@ fn affine_anchor_moment_vector_into(
     out: &mut [f64],
 ) {
     assert_eq!(out.len(), max_degree + 1);
-    let s = (1.0 + beta * beta).sqrt();
-    let mu = -alpha * beta / (1.0 + beta * beta);
+    let s = beta.hypot(1.0);
+    let alpha_over_s = alpha / s;
+    let mu = -alpha_over_s * (beta / s);
     let y_left = if left.is_infinite() {
         if left.is_sign_positive() {
             f64::INFINITY
@@ -2894,7 +2920,21 @@ fn affine_anchor_moment_vector_into(
     } else {
         s * (right - mu)
     };
-    let anchor = (-alpha * alpha / (2.0 * s * s)).exp() / s;
+    let anchor = exp_neg_half_square(alpha_over_s) / s;
+    let tiny_anchor = anchor < f64::MIN_POSITIVE;
+    let inv_s = 1.0 / s;
+    // A small anchor can multiply a large polynomial moment into a perfectly
+    // representable result. Normalize the affine polynomial before summing,
+    // then combine its scale with the anchor in log space on this stratum.
+    let moment_scale = if tiny_anchor { mu.abs().max(inv_s) } else { 1.0 };
+    let log_anchor = if tiny_anchor {
+        -0.5 * alpha_over_s * alpha_over_s - s.ln()
+    } else {
+        0.0
+    };
+    let log_moment_scale = if tiny_anchor { moment_scale.ln() } else { 0.0 };
+    let scaled_mu = mu / moment_scale;
+    let scaled_inv_s = inv_s / moment_scale;
     assert!(
         max_degree <= MAX_AFFINE_ANCHOR_DEGREE,
         "affine_anchor_moment_vector max_degree {} exceeds compile-time bound {}",
@@ -2910,12 +2950,11 @@ fn affine_anchor_moment_vector_into(
     // otherwise dominated the inner loop at large `max_degree`.
     let mut mu_pow = [1.0_f64; MAX_AFFINE_ANCHOR_DEGREE + 1];
     for k in 1..=max_degree {
-        mu_pow[k] = mu_pow[k - 1] * mu;
+        mu_pow[k] = mu_pow[k - 1] * scaled_mu;
     }
-    let inv_s = 1.0 / s;
     let mut inv_s_pow = [1.0_f64; MAX_AFFINE_ANCHOR_DEGREE + 1];
     for k in 1..=max_degree {
-        inv_s_pow[k] = inv_s_pow[k - 1] * inv_s;
+        inv_s_pow[k] = inv_s_pow[k - 1] * scaled_inv_s;
     }
     out.fill(0.0);
     for n in 0..=max_degree {
@@ -2929,7 +2968,11 @@ fn affine_anchor_moment_vector_into(
                 binom = binom * (n - k) as f64 / (k + 1) as f64;
             }
         }
-        out[n] = anchor * acc;
+        out[n] = if tiny_anchor && acc != 0.0 {
+            (log_anchor + n as f64 * log_moment_scale + acc.abs().ln()).exp().copysign(acc)
+        } else {
+            anchor * acc
+        };
     }
 }
 
@@ -2950,7 +2993,7 @@ fn affine_value_from_moment_primitive(
     // This is exact to floating-point precision via the high-accuracy
     // Drezner-Wesolowsky BVN routine, replacing the previous fixed 20-point
     // Gauss-Legendre numerical integration of the derivative primitive.
-    let s = (1.0 + beta * beta).sqrt();
+    let s = beta.hypot(1.0);
     let h = alpha / s;
     let rho = -beta / s;
     bivariate_normal_cdf_interval(h, left, right, rho)
@@ -3921,10 +3964,10 @@ mod tests {
             return normal_cdf(h);
         }
         let rho_clamped = rho.clamp(-1.0, 1.0);
-        if rho_clamped >= 1.0 - 1e-12 {
+        if rho_clamped == 1.0 {
             return normal_cdf(h.min(k));
         }
-        if rho_clamped <= -1.0 + 1e-12 {
+        if rho_clamped == -1.0 {
             return (normal_cdf(h) - normal_cdf(-k)).clamp(0.0, 1.0);
         }
 
@@ -4128,6 +4171,34 @@ mod tests {
         let out = bivariate_normal_cdf(h, k, 0.0).expect("bvn");
         let target = normal_cdf(h) * normal_cdf(k);
         assert!((out - target).abs() < 1e-12);
+    }
+
+    #[test]
+    fn bivariate_normal_intervals_retain_upper_tail_mass() {
+        let expected = normal_cdf(-10.0) - normal_cdf(-12.0);
+        for (h, rho, fraction) in [(f64::INFINITY, 0.3, 1.0), (0.0, 0.0, 0.5),
+            (12.0, 1.0, 1.0), (0.0, -1.0, 1.0)] {
+            let actual = bivariate_normal_cdf_interval(h, 10.0, 12.0, rho).unwrap();
+            assert!((actual / (fraction * expected) - 1.0).abs() < 3.0e-14);
+        }
+        let semi_infinite = bivariate_normal_cdf_interval(0.0, 10.0, f64::INFINITY, 0.0)
+            .unwrap();
+        assert!((semi_infinite / (0.5 * normal_cdf(-10.0)) - 1.0).abs() < 3.0e-14);
+        let singular = bivariate_normal_cdf(12.0, -10.0, -1.0).unwrap();
+        assert!((singular / expected - 1.0).abs() < 3.0e-14);
+    }
+
+    #[test]
+    fn bivariate_normal_preserves_nearly_singular_correlation() {
+        for rho in [1.0 - 5.0e-13, -1.0 + 5.0e-13] {
+            let actual = bivariate_normal_cdf(0.0, 0.0, rho).unwrap();
+            let expected = 0.25 + rho.asin() / std::f64::consts::TAU;
+            assert_eq!(actual, expected);
+            assert!(actual > 0.0 && actual < 0.5);
+        }
+        assert!(bivariate_normal_cdf(0.0, 0.0, 1.01).is_err());
+        assert!(bivariate_normal_cdf_interval(0.0, f64::NEG_INFINITY, f64::INFINITY, 1.01)
+            .is_err());
     }
 
     #[test]
@@ -4635,6 +4706,58 @@ mod tests {
         assert!((out[0] - scale * sqrt_2pi).abs() < 1e-12);
         assert!((out[1] - scale * sqrt_2pi * mu).abs() < 1e-12);
         assert!((out[2] - scale * sqrt_2pi * (mu * mu + 1.0 / (s * s))).abs() < 1e-10);
+    }
+
+    #[test]
+    fn affine_anchor_handles_large_finite_slope_and_intercept() {
+        let scale = 1.0e200;
+        let mass = std::f64::consts::TAU.sqrt() * (-0.5_f64).exp() / scale;
+        for beta in [scale, -scale] {
+            let mu = -beta.signum();
+            for (left, right) in [(f64::NEG_INFINITY, f64::INFINITY), (mu - 1.0, mu + 1.0)] {
+                let moments = affine_anchor_moment_vector(scale, beta, left, right, 4);
+                for (degree, moment) in moments.iter().enumerate() {
+                    let expected = mass * mu.powi(degree as i32);
+                    assert!((moment / expected - 1.0).abs() < 4.0e-15,
+                        "degree {degree}: {moment} vs {expected}");
+                }
+            }
+            let value = affine_value_from_moment_primitive(scale, beta,
+                f64::NEG_INFINITY, f64::INFINITY).unwrap();
+            assert!((value - normal_cdf(1.0)).abs() < 2.0 * f64::EPSILON);
+        }
+    }
+
+    #[test]
+    fn affine_anchor_retains_high_moments_after_anchor_underflow() {
+        let alpha = 40.0 * std::f64::consts::SQRT_2;
+        let moments = affine_anchor_moment_vector(alpha, 1.0,
+            f64::NEG_INFINITY, f64::INFINITY, 64);
+        assert_eq!(moments[0], 0.0);
+
+        // Independent whole-line Gaussian recurrence in log space:
+        // |E Z^n| = |mu| |E Z^(n-1)| + (n-1) variance |E Z^(n-2)|.
+        // All summands have the same sign for a fixed n, so no binomial
+        // expansion or affine-anchor implementation is reused by the oracle.
+        let mean_magnitude = alpha / 2.0;
+        let log_mean = mean_magnitude.ln();
+        let log_variance = 0.5_f64.ln();
+        let mut log_moments = [0.0_f64; 65];
+        log_moments[1] = log_mean;
+        for degree in 2..=64 {
+            let a = log_mean + log_moments[degree - 1];
+            let b = ((degree - 1) as f64).ln() + log_variance + log_moments[degree - 2];
+            let largest = a.max(b);
+            log_moments[degree] = largest + ((a.min(b) - largest).exp()).ln_1p();
+        }
+        let log_mass = -alpha * alpha / 4.0 + 0.5 * std::f64::consts::PI.ln();
+        for degree in [24, 63, 64] {
+            let expected = (log_mass + log_moments[degree]).exp()
+                * if degree % 2 == 0 { 1.0 } else { -1.0 };
+            assert!(expected != 0.0 && moments[degree].is_finite());
+            assert!((moments[degree] / expected - 1.0).abs() < 3.0e-11,
+                "degree {degree}: {} vs {expected}", moments[degree]);
+        }
     }
 
     #[test]
