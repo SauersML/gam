@@ -328,3 +328,105 @@ committed source snapshot with concurrent fifth-order callers and failed to
 compile; the successful run uses the consistent shared MSI checkout. Clean
 committed-source CI remains pending. No local compilation or numerical
 execution was used.
+
+## 2026-09-12 swarm pass (jet932)
+
+Under the 09-12 swarm roster, jet932 holds all of #932 and jet932b holds #2333.
+This section records the #932 landings `c38faa742` and `11a52ed5f`, recovered
+from the previous jet932 session's unlanded patches, and three source censuses.
+
+### BMS FLEX specialization cell, red on EPYC 9V74
+
+Speed Gates run 34661849521 at `b66a7d04e` (gam-models job 103472091878, AMD EPYC
+9V74) failed `BMS-FLEX-CONTRACTED-932` at order 3. The production_fixed/dynamic_jet
+median ratio was **0.939753** for score-warp (wins 0.07, resolution 0.0178) and
+**0.943020** for link-dev (wins 0.00, resolution 0.0053). Order 4 passed at
+2.865857 and 4.640253. Run 34653246193 at `6c1cfb4ae` (job 103448845622) ran on the
+same CPU model and passed order 3 at 1.065264 and 1.021045, both with wins 1.00.
+The fixed-width third specialization therefore had no margin.
+
+Cause, by reading `crates/gam-math/src/jet_scalar.rs`: `OneSeed<K>`'s `JetScalar`
+impl overrode only `constant` and `variable`. `FixedRuntimeJet<OneSeed<K>, K>`
+forwarded `linear_combination`, `multiply_add`, `composed_sum`, `affine_compose`
+and `affine_composed_sum` to the trait defaults, which are chains of complete
+`2·(1+K+K²)`-channel temporaries. It also left `weighted_compose_sum` to the
+`RuntimeJetScalar` default loop, which does one composition and one product per
+coefficient, per calibration node, per lift iteration. The opponent,
+`DynamicOneSeedBatch`, already overrides `linear_combination`, `multiply_add`,
+`affine_composed_sum` and `weighted_compose_sum`.
+
+Change `c38faa742`: `OneSeed<K>` lowers those operations directly. `JetScalar`
+gains `weighted_compose_sum`, whose default is the same loop. `Order2` overrides
+it, and `FixedRuntimeJet` forwards it. `add_constant` keeps its default, so the
+`row_program!` lowerings that the SLS SIMD bit-identity tests compare against do
+not move. `one_seed_fused_932_tests` pins every override against its unfused field
+program at 1e-13 relative, on operands whose ε Hessian channels are all live.
+
+Receipts: pool job 440629 ran at `5d498d0e9` plus the patch. It passed the ban
+scanner, 254 gam-math lib tests (including the three fused tests), the three
+`flex_measure_932_tests`, 29 + 11 gam-row-macros tests, and
+`cargo check --workspace --exclude gam-pyffi --all-targets`. Its mutation arm did
+not compile, so no positive control ran. The release speed verdict comes from the
+first Speed Gates run that contains `c38faa742` and completes, not from a lane run.
+
+### GLM and exponential families: row derivative census
+
+The observed-information tower for the GLM families is derived mechanically in
+`crates/gam-solve/src/pirls/curvature.rs`. `weight_ratio_tower` forms
+`T = h₁/(φV)` and its first four η-derivatives in one Leibniz recurrence on
+`T·φV = h₁`. Its inputs are the inverse-link jet `h₁..h₅` (`mixture_link.rs`) and
+the variance jet `V..V₄`. `W`, `∂W/∂η`, `∂²W/∂η²` and `e_obs = ∂³W/∂η³` are
+polynomials in that tower and the jet. These 1-D primitives are the ones this
+issue expects to keep. Beside the recurrence, `observed_weight_dispatch` carried
+five closed-form specializations:
+
+- **Gaussian log, Gaussian inverse and Binomial logit** were never reached in
+  production. The dispatch has one production caller,
+  `compute_observed_hessian_curvature_arrays_into`. It asserts
+  `supports_observed_hessian_curvature_for_likelihood`, which admits only Gamma
+  (any link), negative binomial under the log link, and the non-canonical Binomial
+  links. `11a52ed5f` deletes these three arms and their helpers, reduces
+  `WeightLink` to {Log, Other}, and drops the dispatch's `eta` parameter, which
+  only the Gaussian-inverse arm read.
+- **Gamma log and NB2 log** are live. Each closed form avoids the generic tower's
+  large-η intermediates, and
+  `gamma_log_observed_curvature_dispatch_avoids_generic_overflow` pins the Gamma
+  case. `11a52ed5f` pins both `(W, ∂W/∂η, ∂²W/∂η²)` triples against Dual3
+  derivatives of `−∂²ℓ/∂η²`, written from each log-likelihood
+  (`gamma_log_observed_curvature_matches_dual3_932`,
+  `negative_binomial_log_observed_curvature_matches_dual3_932`).
+- **`e_obs`** has one production consumer, `hessian_cde_arrays`. It is reached
+  only from `tierney_kadane_terms`, directly and through `hessian_cdef_arrays`.
+  That correction returns zero unless `reml_robust_jeffreys_link` resolves: Firth
+  bias reduction must be requested on a Binomial link with a Fisher-weight jet. No
+  Gamma or negative-binomial fit therefore reads a third derivative. The other
+  `e_obs_from_jets` callers sit in `reml/objective.rs`'s `tk_math_tests`.
+  `11a52ed5f` corrects the `hessian_cde_arrays` prose that listed GammaLog.
+
+Pool job 530387 runs the new pins and the #2273 dispatch tests on `11a52ed5f`.
+
+### BMS oracle census: which bars guard production channels
+
+The #932 tests in `crates/gam-models/src/bms` fall into two groups, and they
+answer the loosened-tolerance row differently.
+
+- **Percent-level finite-difference bars** gate the `#[cfg(test)]` jet substrate
+  in `bms/test_support.rs`, not a production lowering:
+  `cell_base_moment_jets_match_fd_932` (Hessian 1e-3 relative),
+  `cell_base_moment_jets_moving_match_fd_932` (2e-3),
+  `cell_coeff_jet_ab_match_fd_932` (1e-4) and
+  `runtime_jet2_algebra_matches_finite_differences_932` (1e-4 absolute). The
+  substrate (`Jet2`, `RuntimeJet`, `cell_base_moment_jets{,_moving}`,
+  `cell_coeff_jet_ab`) is the test-side oracle that
+  `moving_edge_leibniz_tracks_boundary_flux_932` imports. Its implicit-lift test,
+  `runtime_jet2_implicit_lift_matches_analytic_ift_932`, compares against the
+  analytic IFT at 1e-12.
+- **The production BMS FLEX lowering** is gated by the high-order Richardson
+  verifier `production_flex_grad_hess_matches_independent_fd_{score_warp,link_dev}_932`
+  (gradient 1e-7, Hessian 1e-5 relative), plus the exact rigid and empirical-rigid
+  oracles recorded above.
+- The substrate's `e^{−Δq}` expansion mirrors the survival flex
+  `survival/marginal_slope/timepoint_exact/flex_jet.rs::base_moment_jets`, which is
+  guarded by `base_moment_jets_{first,second}_derivative_matches_fd_932`. Those
+  bars are percent-level too. Replacing them with an exact oracle remains an open
+  item under the loosened-tolerance row.
