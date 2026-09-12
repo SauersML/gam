@@ -49,8 +49,7 @@ pub use code_space::{
     harvest_code_space_pair_promotions, harvest_code_space_promotions, linear_distortion_floor,
 };
 pub use fit::{
-    LinearPeel, LinearPeelConfig, LinearPeelState, TieredFitConfig, TieredFitReport,
-    TieredSeedPolicy, fit_tiered,
+    LinearPeel, LinearPeelConfig, TieredFitConfig, TieredFitReport, TieredSeedPolicy, fit_tiered,
 };
 
 use std::collections::{BTreeMap, BTreeSet};

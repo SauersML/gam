@@ -6,17 +6,15 @@
 //! and the alternation to joint stationarity is the fit. Increment 4 deleted the
 //! public tiered surface (the `sae_manifold_fit_tiered` FFI entry and its
 //! `gamfit._sae_spectral` Python wrapper); the tiered flow is now reached only
-//! through the unified engine + the seed/cadence composition (`examples/
+//! through the unified engine + the seed/cadence composition (`experiments/
 //! compose_tiers.py`: linear warm start via `sparse_dictionary_fit` → curved
 //! alternation via `sae_manifold_fit`).
 //!
 //! This module keeps the in-crate orchestrator [`fit_tiered`] that expresses that
-//! schedule directly in Rust, used by the risk-pin tests + the `tiered_gpu_scale`
-//! example. Increment 5 folded its **seed half** into the public entry: the seed
-//! policy is now the standalone [`fit_linear_peel`] stage, which the public
-//! support-sparse fit runs before seeding the curved engine (so the two lanes
-//! share one declaration of the peel instead of two spellings of it), while
-//! [`fit_tiered`] remains the in-crate expression of the full cadence:
+//! schedule directly in Rust. Its callers are its own tests and the
+//! `tiered_dominance`, `tiered_gpu_scale` and `tiered_k2000_measure` examples; no
+//! production entry reaches it. The seed half is the [`fit_linear_peel`] stage and
+//! the full cadence is:
 //!
 //! **(a) Seed policy** — Tier-0 peels the shared column mean ([`Tier0Mean`]; the
 //!    bulk is fit on `R0 = z − μ`), then Tier-1 warm-starts the linear bulk: the
@@ -144,9 +142,8 @@ impl Default for Tier2SupportConfig {
     }
 }
 
-/// Configuration for [`fit_tiered`]. Internal (in-crate) only — the public
-/// tiered surface was removed in unification Increment 4; this is the seed/cadence
-/// schedule config, slated to fold into `sae_manifold_fit`'s driver in Inc 5.
+/// Configuration for [`fit_tiered`]: the seed/cadence schedule. The public tiered
+/// surface was removed in unification Increment 4.
 #[derive(Clone, Debug)]
 pub struct TieredFitConfig {
     /// Tier-1 block-sparse dictionary configuration (`G` blocks of size `b`, the
@@ -190,12 +187,7 @@ impl TieredFitConfig {
 }
 
 /// The seed half of the schedule (Tier-0 + Tier-1) as a standalone stage: the
-/// **linear peel**. Increment 5 gives the public support-sparse entry the same
-/// warm start the in-crate tiered driver has, so both reach the curved engine
-/// through this one declaration rather than two spellings of it.
-///
-/// It carries no width knob of its own — [`LinearPeelConfig::derive`] reads the
-/// geometry off the data and the curved request.
+/// **linear peel** [`fit_tiered`] runs before the curved refinement.
 #[derive(Clone, Debug)]
 pub struct LinearPeelConfig {
     /// Tier-1 block geometry (`G` blocks of size `b`, block budget `k`).
@@ -204,87 +196,13 @@ pub struct LinearPeelConfig {
     pub tier1_seed: TieredSeedPolicy,
 }
 
-impl LinearPeelConfig {
-    /// Derive the Tier-1 block geometry from the corpus width `P`, the curved
-    /// dictionary's effective per-atom dimension `d_max`, and the caller's per-row
-    /// support budget `support_k`. Every field is read off a quantity the caller
-    /// already declared:
-    ///
-    /// * block size `b = d_max` — a linear atom is the curvature-free special case
-    ///   of a curved atom of the same intrinsic dimension (see [`crate::tiered`]),
-    ///   so a `d`-dimensional chart's linear counterpart is a `d`-dimensional block;
-    /// * blocks `G = P / b` — the linear bulk of an `N×P` corpus is spanned by at
-    ///   most `P` directions, so `K_lin = G·b ≤ P` is the widest linear dictionary
-    ///   the data identifies. Past it the frame fixed point enters the #2275
-    ///   over-complete regime where spurious frames rotate freely; charting what
-    ///   the linear span cannot reach is the curved tier's job, not the peel's;
-    /// * block budget `k = min(support_k, G)` — the declared per-row sparsity,
-    ///   spent on blocks instead of curved atoms.
-    ///
-    /// Every remaining knob stays at [`BlockSparseConfig::default`]; the peel
-    /// introduces no constant of its own.
-    pub fn derive(output_dim: usize, d_max: usize, support_k: usize) -> Result<Self, String> {
-        if output_dim == 0 || d_max == 0 || support_k == 0 {
-            return Err(format!(
-                "LinearPeelConfig::derive requires P >= 1, d_max >= 1 and support_k >= 1; got \
-                 P={output_dim}, d_max={d_max}, support_k={support_k}"
-            ));
-        }
-        let n_blocks = output_dim / d_max;
-        if n_blocks == 0 {
-            return Err(format!(
-                "LinearPeelConfig::derive: a curved atom of dimension d_max={d_max} has no linear \
-                 counterpart in P={output_dim} — the linear bulk cannot carry a block wider than \
-                 the corpus. Reduce d_atom or disable the linear peel"
-            ));
-        }
-        let mut tier1 = BlockSparseConfig::new(n_blocks, d_max);
-        tier1.block_topk = support_k.min(n_blocks);
-        // The peel inherits the tiered lane's own operating practice: revival
-        // draws from worst-residual rows at the routing width (its tests run
-        // aux_k = block_topk), and the epoch cap must not bind before the
-        // captured-fraction plateau rule can terminate — the plateau is the
-        // stopping criterion; the cap is a correctness bound only. Measured
-        // on the real 250k-row Qwen chart: without these, Tier-1 refuses at
-        // 30 epochs with frame residual 1.0; with them it converges and the
-        // peel hands the curved engine a residual 30% lighter.
-        tier1.aux_k = tier1.block_topk;
-        tier1.max_epochs = 10 * tier1.max_epochs.max(1);
-        Ok(Self {
-            tier1,
-            tier1_seed: TieredSeedPolicy::Auto,
-        })
-    }
-}
-
-/// The frozen linear peel: everything needed to reproduce `μ + L` on rows the fit
-/// never saw, and nothing that depends on the training corpus. This is what a
-/// fitted public model stores and what its serialization round-trips.
-#[derive(Clone, Debug)]
-pub struct LinearPeelState {
-    /// Tier-0 shared mean `μ`, length `P`.
-    pub mean: Array1<f64>,
-    /// Frozen Tier-1 block frames, `K×P` (`K = G·b`).
-    pub decoder: Array2<f32>,
-    /// Tier-1's tied encoder scalar `γ`.
-    pub gamma: f32,
-    /// Block size `b`.
-    pub block_size: usize,
-    /// Block routing budget `k`.
-    pub block_topk: usize,
-    /// Block-tile width for the out-of-sample route.
-    pub block_tile: usize,
-    /// Local mean of the Tier-1 residual, peeled before charting.
-    pub residual_mean: Array1<f64>,
-}
-
 /// The linear bulk `L` on rows `z` (`N×P`): de-mean by `μ`, route the rows against
 /// the frozen block frames, and decode.
 ///
-/// The peel defines `L` through THIS map both at fit time and at prediction time,
-/// rather than through the trainer's stored codes: those were last encoded before
-/// the final `γ` refresh, so a curved tier fit on a residual built from them would
-/// be charting a residual the deployed model can never reproduce.
+/// The peel defines `L` through THIS map rather than through the trainer's stored
+/// codes: those were last encoded before the final `γ` refresh, so a curved tier fit
+/// on a residual built from them would be charting a residual the frozen frames
+/// never reproduce.
 fn route_linear_bulk(
     mean: &Array1<f64>,
     decoder: ArrayView2<'_, f32>,
@@ -315,37 +233,6 @@ fn route_linear_bulk(
     Ok(linear.mapv(|value| value as f64))
 }
 
-impl LinearPeelState {
-    /// The constant the composed model adds back: `μ + mean(R1)`. Both are
-    /// row-independent, so the curved tier only ever sees their sum.
-    pub fn composed_mean(&self) -> Array1<f64> {
-        &self.mean + &self.residual_mean
-    }
-
-    /// The linear bulk `L` on rows `z` — the same map the fit itself used, so a
-    /// held-out row and a training row are charted identically.
-    pub fn linear_reconstruct(&self, z: ArrayView2<'_, f64>) -> Result<Array2<f64>, String> {
-        route_linear_bulk(
-            &self.mean,
-            self.decoder.view(),
-            self.gamma,
-            self.block_size,
-            self.block_topk,
-            self.block_tile,
-            z,
-        )
-    }
-
-    /// The whole additive offset the curved tier works around on rows `z`:
-    /// `μ + L(z) + mean(R1)`. The composed model is `offset(z) + C` and the target
-    /// the curved tier charts is `z − offset(z)`, so a caller needs exactly this one
-    /// quantity for both directions — and computes the route only once.
-    pub fn offset(&self, z: ArrayView2<'_, f64>) -> Result<Array2<f64>, String> {
-        let linear = self.linear_reconstruct(z)?;
-        Ok(&linear + &self.composed_mean().view().insert_axis(Axis(0)))
-    }
-}
-
 /// A fitted linear peel: the Tier-0 mean, the Tier-1 linear bulk, and the
 /// centered residual the curved tier charts.
 #[derive(Clone, Debug)]
@@ -354,8 +241,6 @@ pub struct LinearPeel {
     pub tier0: Tier0Mean,
     /// Tier-1 block-sparse linear bulk.
     pub tier1: BlockSparseFit,
-    /// Tier-1 reconstruction `L` on the training rows (`N×P`, f64).
-    pub linear: Array2<f64>,
     /// Local mean of `R1 = R0 − L`, peeled before charting and added back on
     /// reconstruction so the curved correction lives in residual space.
     pub residual_mean: Array1<f64>,
@@ -363,32 +248,11 @@ pub struct LinearPeel {
     pub residual: Array2<f64>,
     /// `‖R0‖²`: the Tier-0 baseline energy a composed EV is measured against.
     pub baseline_energy: f64,
-    /// Block-tile width the fit routed with; carried so a prediction routes the
-    /// same way rather than picking its own tiling.
-    pub block_tile: usize,
-}
-
-impl LinearPeel {
-    /// The frozen, corpus-independent half of this peel.
-    pub fn state(&self) -> LinearPeelState {
-        LinearPeelState {
-            mean: self.tier0.mean.clone(),
-            decoder: self.tier1.decoder.clone(),
-            gamma: self.tier1.gamma,
-            block_size: self.tier1.block_size,
-            block_topk: self.tier1.block_topk,
-            block_tile: self.block_tile,
-            residual_mean: self.residual_mean.clone(),
-        }
-    }
 }
 
 /// Run the seed policy — Tier-0 mean peel, then the Tier-1 block-sparse linear
 /// warm start — and hand back the centered residual `R1 = R0 − L − mean(R1)` the
 /// curved engine charts.
-///
-/// This is the single declaration of the peel: [`fit_tiered`] and the public
-/// support-sparse entry both reach the curved engine through it.
 pub fn fit_linear_peel(
     z: ArrayView2<'_, f64>,
     config: &LinearPeelConfig,
@@ -398,9 +262,8 @@ pub fn fit_linear_peel(
     let r0 = tier0.apply(z)?;
     let r0_f32 = r0.mapv(|value| value as f32);
 
-    // Tier 1: block-sparse collapsed-linear bulk on the de-meaned residual. The
-    // seed policy resolves against the corpus size + block geometry so a K≈1e4 bulk
-    // skips the serial O(N·P·K) farthest-point pass (the large-K entry, #2023).
+    // Tier 1: block-sparse collapsed-linear bulk on the de-meaned residual. `Auto`
+    // is the linear-cost data-row seed at every width (#2023).
     let seed_policy = config
         .tier1_seed
         .resolve();
@@ -434,11 +297,9 @@ pub fn fit_linear_peel(
     Ok(LinearPeel {
         tier0,
         tier1,
-        linear,
         residual_mean,
         residual,
         baseline_energy,
-        block_tile: config.tier1.block_tile,
     })
 }
 
@@ -500,12 +361,9 @@ pub struct TieredFitReport {
 /// Tier-0 mean + Tier-1 block-sparse linear warm start (the seed) → Tier-2 curved
 /// support-sparse refinement on the Tier-1 residual.
 ///
-/// **Internal (in-crate) only.** The public tiered FFI/Python surface was deleted
-/// in unification Increment 4; this orchestrator is the in-Rust expression of the
-/// schedule for the risk-pin tests + `tiered_gpu_scale` example. Increment 5 moved
-/// its seed half into `fit_linear_peel`, which the public support-sparse entry
-/// now runs too, so this function is a cadence over the same two phases and not a
-/// second implementation of them.
+/// **No production entry reaches this.** The public tiered FFI/Python surface was
+/// deleted in unification Increment 4; this orchestrator is the in-Rust expression
+/// of the schedule, called by its tests and the `tiered_*` examples.
 ///
 /// The curved tier is fit on the Tier-1 residual through the canonical
 /// support-sparse engine (`fit_tier2_support` → [`run_sae_support_outer`]),
@@ -736,254 +594,6 @@ fn record_support_moves(ledger: &mut SaeMigrationLedger, fit: &Tier2SupportFit) 
             MoveEvidence::none(),
             fit.criterion,
         );
-    }
-}
-
-#[cfg(test)]
-mod peel_tests {
-    use super::*;
-    use ndarray::Array2;
-
-    /// The planted fixture the Increment-5 peel is about: a straight linear bulk
-    /// (cols 0,1) the linear tier explains exactly, a circle (cols 2,3) whose
-    /// curvature is exactly what survives a linear fit, and a non-zero column mean
-    /// so Tier-0 has something to peel. Geometry mirrors the converging tiered test
-    /// `tier2_branch_constructs_the_support_sparse_path` (n=96, P=4, K=8).
-    fn planted_bulk_plus_curvature(n: usize) -> Array2<f64> {
-        let mut z = Array2::<f64>::zeros((n, 4));
-        for i in 0..n {
-            let t = i as f64 / n as f64;
-            let phase = (i as f64) * 0.19;
-            z[[i, 0]] = 1.5 + (2.0 * t - 1.0);
-            z[[i, 1]] = -0.5 + (1.0 - 2.0 * t);
-            z[[i, 2]] = 0.25 + phase.cos();
-            z[[i, 3]] = -0.75 + phase.sin();
-        }
-        z
-    }
-
-    /// The curved half of the public support-sparse entry, verbatim in its stage
-    /// order (seed → term seed → grouped-LAML outer solve). `gam-sae` cannot call
-    /// the pyffi entry, so this stands in for it: what these tests vary is only the
-    /// TARGET the entry hands the engine — peeled residual vs mean-centered data.
-    fn chart_curved(
-        centered: ArrayView2<'_, f64>,
-        n_atoms: usize,
-        support_k: usize,
-    ) -> Result<
-        (
-            SaeSupportSparseTerm,
-            SaeSupportFixedPointReport,
-            OuterCriterionCertificate,
-        ),
-        String,
-    > {
-        let (n_obs, output_dim) = centered.dim();
-        let atom_basis = vec!["periodic".to_string(); n_atoms];
-        let atom_dim = vec![1usize; n_atoms];
-        let effective_dims = sae_support_effective_atom_dims(&atom_basis, &atom_dim)?;
-        let d_max = effective_dims.iter().copied().max().unwrap_or(1);
-        let admission = admit_topk_manifold(n_obs, output_dim, n_atoms, d_max, support_k)?;
-        let seed = build_sae_support_seed(SaeSupportSeedRequest {
-            target: centered,
-            atom_basis: &atom_basis,
-            atom_dim: &atom_dim,
-            support_k,
-            random_state: 0xC0FF_EE00_D15E_A5E5,
-            admission,
-        })?;
-        let retained = seed.retained_atom_indices.clone();
-        let term_seed = build_sae_support_term_seed(SaeSupportTermSeedRequest {
-            assignment: seed.assignment,
-            atom_basis: vec!["periodic".to_string(); retained.len()],
-            atom_dim: vec![1usize; retained.len()],
-            output_dim,
-            random_state: 0xC0FF_EE00_D15E_A5E5,
-        })?;
-        let ard_precisions = (0..term_seed.term.k_atoms())
-            .map(|atom| vec![1.0; term_seed.term.assignment.atom_coord_dim(atom)])
-            .collect::<Vec<_>>();
-        let outer = run_sae_support_outer(SaeSupportOuterRequest {
-            term: term_seed.term,
-            target: centered.to_owned(),
-            initial_smoothness: 1.0,
-            ard_precisions,
-            max_outer_iter: 32,
-            max_inner_iter: 256,
-            // The public entry's relative inner tolerance (#2517).
-            inner_tolerance: 1.0e-4,
-            trust_radius: 1.0,
-            random_state: 0xC0FF_EE00_D15E_A5E5,
-        })
-        .map_err(|error| error.to_string())?;
-        Ok((outer.term, outer.fixed_point, outer.outer_certificate))
-    }
-
-    /// The width derivation reads the block geometry off the corpus and the curved
-    /// request, and refuses a block wider than the corpus rather than inventing one.
-    #[test]
-    fn derived_peel_width_mirrors_the_curved_request() {
-        let config = LinearPeelConfig::derive(16, 2, 3).expect("derives");
-        assert_eq!(config.tier1.block_size, 2, "b = d_max");
-        assert_eq!(config.tier1.n_blocks, 8, "G = P / b");
-        assert_eq!(
-            config.tier1.n_atoms(),
-            16,
-            "K_lin = P, the identifiable width"
-        );
-        assert_eq!(config.tier1.block_topk, 3, "k = support_k");
-        // support_k above the block count cannot fire more blocks than exist.
-        let narrow = LinearPeelConfig::derive(4, 1, 9).expect("derives");
-        assert_eq!(narrow.tier1.block_topk, 4);
-        // A block wider than the corpus has no linear counterpart.
-        let refused = LinearPeelConfig::derive(3, 4, 1);
-        assert!(
-            refused.is_err(),
-            "d_max > P must be refused, not rounded down to a block the caller never asked for"
-        );
-    }
-
-    /// #2232 Increment 5, arm (a): on a planted linear-bulk + curved-residual
-    /// fixture the peeled path drives the support engine to a certified outer
-    /// stationarity point with a RECURRED inner fixed point — the convergence the
-    /// public entry needs the peel to reach.
-    #[test]
-    fn peeled_support_fit_converges_on_planted_bulk_plus_curvature() {
-        let z = planted_bulk_plus_curvature(96);
-        let config = LinearPeelConfig::derive(z.ncols(), 1, 2).expect("peel geometry derives");
-        let peel = fit_linear_peel(z.view(), &config).expect("the linear peel converges");
-        let (term, fixed_point, certificate) =
-            chart_curved(peel.residual.view(), 8, 2).expect("the peeled curved fit runs");
-
-        assert!(
-            certificate.certifies() && certificate.is_stationary(),
-            "the peeled fit must carry a certifying outer stationarity certificate"
-        );
-        assert!(
-            fixed_point.recurred,
-            "the peeled inner fixed point must have RECURRED; got {fixed_point:?}"
-        );
-        assert!(
-            term.k_atoms() >= 1,
-            "the peeled fit must retain a curved atom"
-        );
-    }
-
-    /// Arm (b): the composition is exact. The peel's additive offset `μ + L +
-    /// mean(R1)` plus the curved correction `C` reproduces `μ + L + mean(R1) + C`
-    /// term for term, and the offset a prediction recomputes on the training rows is
-    /// the offset the fit itself used — so `reconstruct` is the same model the fit
-    /// reported, not a second one.
-    #[test]
-    fn composed_reconstruction_is_mu_plus_linear_plus_curved() {
-        let z = planted_bulk_plus_curvature(96);
-        let config = LinearPeelConfig::derive(z.ncols(), 1, 2).expect("peel geometry derives");
-        let peel = fit_linear_peel(z.view(), &config).expect("the linear peel converges");
-
-        // The peel is an exact additive decomposition of the data.
-        for row in 0..z.nrows() {
-            for column in 0..z.ncols() {
-                let parts = peel.tier0.mean[column]
-                    + peel.linear[[row, column]]
-                    + peel.residual_mean[column]
-                    + peel.residual[[row, column]];
-                assert!(
-                    (parts - z[[row, column]]).abs() <= 1.0e-12 * z[[row, column]].abs().max(1.0),
-                    "μ + L + mean(R1) + R1c must reproduce z at ({row}, {column}): {parts} vs {}",
-                    z[[row, column]]
-                );
-            }
-        }
-
-        let state = peel.state();
-        let offset = state.offset(z.view()).expect("offset recomputes");
-        // Re-routing the training rows against the frozen frames returns the SAME
-        // linear bulk the fit used — the peel defines L through the frozen map at
-        // fit time too, so this is an identity, not an approximation.
-        for row in 0..z.nrows() {
-            for column in 0..z.ncols() {
-                let fitted_offset = peel.tier0.mean[column]
-                    + peel.linear[[row, column]]
-                    + peel.residual_mean[column];
-                assert!(
-                    (offset[[row, column]] - fitted_offset).abs() <= 1.0e-12,
-                    "recomputed offset {} != fitted offset {fitted_offset} at ({row}, {column})",
-                    offset[[row, column]]
-                );
-            }
-        }
-
-        let (term, _fixed_point, _certificate) =
-            chart_curved(peel.residual.view(), 8, 2).expect("the peeled curved fit runs");
-        let curved = term.reconstruct().expect("curved reconstruction");
-        let composed = &offset + &curved;
-        for row in 0..z.nrows() {
-            for column in 0..z.ncols() {
-                let expected = peel.tier0.mean[column]
-                    + peel.linear[[row, column]]
-                    + peel.residual_mean[column]
-                    + curved[[row, column]];
-                assert!(
-                    (composed[[row, column]] - expected).abs() <= 1.0e-12,
-                    "composed reconstruction {} != μ + L + mean(R1) + C = {expected} at ({row}, {column})",
-                    composed[[row, column]]
-                );
-            }
-        }
-    }
-
-    /// Arm (c): with the peel disabled the engine still sees exactly the
-    /// mean-centered target the public entry has always handed it — bit-identical,
-    /// so `linear_peel=False` is the pre-Increment-5 fit and not an approximation
-    /// of it. The peeled target is a different one; the peel is the discriminator.
-    #[test]
-    fn peel_disabled_target_is_the_mean_centered_target() {
-        let z = planted_bulk_plus_curvature(96);
-        let training_mean = z.mean_axis(Axis(0)).expect("column mean");
-        let unpeeled = &z - &training_mean.view().insert_axis(Axis(0));
-
-        let config = LinearPeelConfig::derive(z.ncols(), 1, 2).expect("peel geometry derives");
-        let peel = fit_linear_peel(z.view(), &config).expect("the linear peel converges");
-
-        // Tier-0 IS the column mean, so the peel's first stage is bit-identical to
-        // the unpeeled centering; everything after it is the linear bulk.
-        for column in 0..z.ncols() {
-            assert_eq!(
-                peel.tier0.mean[column], training_mean[column],
-                "Tier-0 must be exactly the column mean the unpeeled entry removes"
-            );
-        }
-        let linear_energy: f64 = peel.linear.iter().map(|value| value * value).sum();
-        assert!(
-            linear_energy > 0.0,
-            "the planted straight bulk must give the peel something to remove"
-        );
-        let mut max_delta = 0.0f64;
-        for row in 0..z.nrows() {
-            for column in 0..z.ncols() {
-                max_delta =
-                    max_delta.max((peel.residual[[row, column]] - unpeeled[[row, column]]).abs());
-            }
-        }
-        assert!(
-            max_delta > 1.0e-6,
-            "the peeled target must DIFFER from the mean-centered one; got max delta {max_delta}"
-        );
-
-        // Disabling the peel is a SUPPORTED configuration, not a broken one —
-        // but the unpeeled engine stalling on bulk-carrying data is the very
-        // defect this increment addresses (#2517), so the arm may legally
-        // refuse. What it must never do is fail any other way.
-        match chart_curved(unpeeled.view(), 8, 2) {
-            Ok((_term, _fixed_point, certificate)) => assert!(
-                certificate.certifies(),
-                "an unpeeled fit that returns must return certified"
-            ),
-            Err(error) => assert!(
-                error.to_string().contains("did not recur"),
-                "an unpeeled refusal must be the engine's own stall, got: {error}"
-            ),
-        }
     }
 }
 

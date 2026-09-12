@@ -187,7 +187,7 @@ fn run() -> Result<(), String> {
 
     // --- Tier-1 only (linear-bulk baseline) ---
     let mut lin = TieredFitConfig::linear_bulk(args.n_blocks, args.block_size);
-    lin.tier1_seed = TieredSeedPolicy::Auto; // Auto picks the cheap coordinate seed at K=2000.
+    lin.tier1_seed = TieredSeedPolicy::Auto; // Auto is the data-row seed at every width.
     lin.tier1.block_topk = args.block_topk;
     lin.tier1.aux_k = args.aux_k;
     lin.tier1.max_epochs = args.epochs;
@@ -207,9 +207,9 @@ fn run() -> Result<(), String> {
          ev_residual={:.3e} gamma_residual={:.3e} routing_residual={:.3e} \
          reconstruction_residual={:.3e} accepted_births={} polar_failures={} \
          live_blocks={}/{} epochs_run={} wall={:.1}s",
-        // A returned fit is certified BY CONSTRUCTION: non-convergence errors
-        // out before finalization, so `BlockSparseConvergence` no longer
-        // carries a `certified` flag — the residual fields ARE the evidence.
+        // The residual fields are the evidence behind `cert.certified`: a fit
+        // that neither certifies nor reaches its captured-fraction plateau errors
+        // out before finalization instead of returning.
         cert.frame_residual,
         cert.tolerance,
         cert.ev_residual,

@@ -2868,5 +2868,24 @@
     ],
     "reason": "#2469: MIN_CONDITIONAL_PRECISION (1e-12) was added to the row-precision prior's lambda = alpha + beta*r^2, which is already positive (alpha = exp(rho) on the log-strength domain, beta*r^2 >= 0); BINOMIAL_BINARY_TOL (1e-12) admitted values near 0 or 1 as binary, now exact membership; SCALE_PROJECTION_LEVERAGE_AMPLIFICATION (1e8) was 1/RCOND_FLOOR written a second time, so max(sigma_max/1e8, RCOND_FLOOR*sigma_max) is RCOND_FLOOR*sigma_max.",
     "evidence": "At the base, git grep finds MIN_CONDITIONAL_PRECISION only in crates/gam-terms/src/analytic_penalties/penalty_trait.rs and row_precision.rs, BINOMIAL_BINARY_TOL only in crates/gam-spec/src/lib.rs, and SCALE_PROJECTION_LEVERAGE_AMPLIFICATION only in crates/gam-model-kernels/src/scale_design.rs; every one of those files is edited here and no use remains."
+  },
+  {
+    "base": "9d289eb637c8432a3c00fa03910bed3ed076d48d",
+    "items": [
+      "crates/gam-sae/src/tiered/fit.rs:fn:chart_curved",
+      "crates/gam-sae/src/tiered/fit.rs:fn:composed_mean",
+      "crates/gam-sae/src/tiered/fit.rs:fn:composed_reconstruction_is_mu_plus_linear_plus_curved",
+      "crates/gam-sae/src/tiered/fit.rs:fn:derive",
+      "crates/gam-sae/src/tiered/fit.rs:fn:derived_peel_width_mirrors_the_curved_request",
+      "crates/gam-sae/src/tiered/fit.rs:fn:linear_reconstruct",
+      "crates/gam-sae/src/tiered/fit.rs:fn:offset",
+      "crates/gam-sae/src/tiered/fit.rs:fn:peel_disabled_target_is_the_mean_centered_target",
+      "crates/gam-sae/src/tiered/fit.rs:fn:peeled_support_fit_converges_on_planted_bulk_plus_curvature",
+      "crates/gam-sae/src/tiered/fit.rs:fn:planted_bulk_plus_curvature",
+      "crates/gam-sae/src/tiered/fit.rs:fn:state",
+      "crates/gam-sae/src/tiered/fit.rs:struct:LinearPeelState"
+    ],
+    "reason": "User directive 2026-09-11: delete code only tests use (#2023). tiered::fit carried the remnants of a public support-sparse linear peel that no production entry calls: LinearPeelConfig::derive, LinearPeelState with composed_mean, linear_reconstruct and offset, and LinearPeel::state were reached only from the peel_tests module, which also exercised a linear_peel=False public configuration that does not exist.",
+    "evidence": "git grep -nw over crates, gamfit and src at the base finds LinearPeelConfig, LinearPeel and LinearPeelState only inside crates/gam-sae/src/tiered/, and fit_linear_peel's only caller is fit_tiered, called by its tests and the tiered_dominance, tiered_gpu_scale and tiered_k2000_measure examples, none of which name a removed item. The identities are this guard's own output over base..candidate (candidate commit built from the base plus this patch). The peel_tests helpers planted_bulk_plus_curvature and chart_curved go with the four tests. The Tier-2 support-sparse engine chart_curved drove stays exercised by tiered::fit::fit_tests."
   }
 ]

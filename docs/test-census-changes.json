@@ -384,5 +384,15 @@
     "unit_test_decreases": {
       "crates/gam-sae": 2
     }
+  },
+  {
+    "base": "9d289eb637c8432a3c00fa03910bed3ed076d48d",
+    "reason": "User directive 2026-09-11: delete code only tests use and code nothing uses (#2023). gam-sae tiered::fit carried the remnants of a public support-sparse linear peel that no production entry calls: LinearPeelConfig::derive, LinearPeelState with composed_mean, linear_reconstruct and offset, LinearPeel::state, and the LinearPeel.linear and .block_tile fields. The peel_tests module existed only to exercise them and a linear_peel=False public configuration that does not exist.",
+    "evidence": "At 5d498d0e9 git grep -nw over crates, gamfit and src finds LinearPeelConfig, LinearPeel and LinearPeelState only inside crates/gam-sae/src/tiered/, and fit_linear_peel's only caller is fit_tiered, whose callers are its own tests and the tiered_dominance, tiered_gpu_scale and tiered_k2000_measure examples. Removed with the four peel_tests unit tests: derived_peel_width_mirrors_the_curved_request, peeled_support_fit_converges_on_planted_bulk_plus_curvature, composed_reconstruction_is_mu_plus_linear_plus_curved and peel_disabled_target_is_the_mean_centered_target. The Tier-2 support-sparse path they drove stays exercised by tiered::fit::fit_tests (tier2_branch_constructs_the_support_sparse_path, tiered_curved_refinement_is_certified_and_records_promotions, coordinate_seed_carries_a_full_tiered_fit, insufficient_inner_budget_returns_error_instead_of_a_tiered_report_2023).",
+    "test_count_decrease": 4,
+    "removed_pins": {},
+    "unit_test_decreases": {
+      "crates/gam-sae": 4
+    }
   }
 ]

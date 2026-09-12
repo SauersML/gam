@@ -1089,5 +1089,17 @@
     },
     "reason": "user directive: delete all useless slop",
     "evidence": "Batch B8, from gam-e0's measured inventory: crate-level src/amortized_encoder.rs goes whole. MSI git grep -F -w found no consumer for any of its pub items outside the file; its one user was manifold/amortized_routing.rs, which cbe5f218d removed. lib.rs loses `pub mod amortized_encoder;`. SaeManifoldTerm::amortized_encode_fitted, a wrapper nothing calls, is removed; amortized_encode_target stays live via amortized_encoder_consistency and warm_start_latents_from_amortized_encoder. Compile evidence, MSI job 440633 on lane sw8: these same changes, applied over main 57409ec77 as lane commit d26792868, passed `cargo check --workspace --exclude gam-pyffi --all-targets --keep-going` with rc 0 and no diagnostics (deny(warnings) intact), `cargo doc -p gam-sae --no-deps` with 0 errors, and the ban scanner with rc 0. This commit applies them over a later main, whose upstream delta since then adds no use of any name removed here. It is pushed at once under the user's commit-after-every-edit directive and checked at the pushed sha afterwards. scripts/source_removal_guard.py listed exactly these 28 identities, and the census and difference functions of scripts/test_census.py and scripts/public_api_census.py measured the test and public-function deltas this commit acknowledges."
+  },
+  {
+    "base": "9d289eb637c8432a3c00fa03910bed3ed076d48d",
+    "removed": {
+      "crates/gam-sae/src/tiered/fit.rs::composed_mean": 1,
+      "crates/gam-sae/src/tiered/fit.rs::derive": 1,
+      "crates/gam-sae/src/tiered/fit.rs::linear_reconstruct": 1,
+      "crates/gam-sae/src/tiered/fit.rs::offset": 1,
+      "crates/gam-sae/src/tiered/fit.rs::state": 1
+    },
+    "reason": "User directive 2026-09-11: delete code only tests use (#2023). LinearPeelConfig::derive, LinearPeelState::composed_mean, ::linear_reconstruct, ::offset and LinearPeel::state were the public half of a linear peel the public support-sparse entry no longer runs; only tiered::fit's own peel_tests called them.",
+    "evidence": "At the base no file under crates, gamfit or src outside crates/gam-sae/src/tiered/ names LinearPeelConfig, LinearPeel or LinearPeelState, and gam-pyffi's support_sparse_sae_ffi.rs builds its seed directly with build_sae_support_seed. No replacement: the retained fit_linear_peel and fit_tiered carry the one live cadence, used by the tiered_* examples."
   }
 ]
