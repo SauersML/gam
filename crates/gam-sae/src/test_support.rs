@@ -27,9 +27,7 @@ use crate::encode::{AtomEncodeAtlas, select_nearest_charts_topk};
 /// It is NOT collapsed into [`select_nearest_charts_topk`], because it is not a
 /// thin wrapper: it owns the `certified_radius <= 0.0` gate and the
 /// `recon_center` reuse. Inlining it at the call sites would copy that gate three
-/// times, and the CPU-vs-GPU parity check in `gpu_kernels::sae_encode_resident`
-/// is exactly the consumer that has to compare the device against ONE definition
-/// of the host behaviour.
+/// times.
 ///
 /// If the exhaustive scan makes top-`k` routing permanently unreachable in
 /// production, the honest end state is deleting this together with the tests that

@@ -2899,10 +2899,8 @@ pub(crate) fn amplitude_scaled_center_dist(
 }
 
 /// The shared chart-routing comparator: the SINGLE amplitude-gating + tie-break
-/// decision every chart-routing top-k selection funnels through, so the CPU
-/// atlas encode ([`nearest_chart`], [`nearest_charts_topk`]) and the GPU-host
-/// resident encode
-/// ([`crate::gpu_kernels::sae_encode_resident::nearest_charts_topk`]) can never
+/// decision every chart-routing top-k selection funnels through, so the atlas
+/// encode's routers ([`nearest_chart`], [`nearest_charts_topk`]) can never
 /// drift apart.
 ///
 /// For each of `n_charts` charts (in index order), `recon_into(idx, out)` writes
