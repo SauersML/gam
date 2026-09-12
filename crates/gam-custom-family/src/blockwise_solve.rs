@@ -2607,9 +2607,17 @@ pub(crate) fn symmetric_constrained_hessian_geometry(
     })
 }
 
-/// Numerical nullity of a symmetric penalized Hessian at the shared
-/// `KKT_REFUSAL_RANK_TOL` relative cutoff used by the spectral range and REML
-/// penalty-rank machinery. Returns `None` when no finite curvature scale or
+/// Numerical nullity of a symmetric penalized Hessian: the number of eigenvalues
+/// below the eigensolver's own resolution,
+/// [`crate::joint_newton::joint_hessian_numerical_eigenvalue_floor`]
+/// (`λ_max·√p·ε`, #2690). A mode above that floor carries resolvable curvature.
+///
+/// This used the wider `KKT_REFUSAL_RANK_TOL` conditioning cutoff, which calls
+/// such modes null. The constrained fixed-point certificate, this function's
+/// consumer, then refused a 3-D CTN probe at a constrained KKT point as
+/// rank-deficient. There λ_min = 7.783e-4 against a 1e-10 cutoff of 3.6e-2 and a
+/// resolution near 7e-7, and the flagged direction's likelihood curvature was
+/// 9.3e-3 (MSI job 410061). Returns `None` when no finite curvature scale or
 /// eigendecomposition is available.
 pub(crate) fn symmetric_penalized_hessian_nullity(lhs: &Array2<f64>) -> Option<usize> {
     let p = lhs.nrows();
@@ -2621,7 +2629,7 @@ pub(crate) fn symmetric_penalized_hessian_nullity(lhs: &Array2<f64>) -> Option<u
     if !(max_abs.is_finite() && max_abs > 0.0) {
         return None;
     }
-    let cutoff = KKT_REFUSAL_RANK_TOL * max_abs;
+    let cutoff = crate::joint_newton::joint_hessian_numerical_eigenvalue_floor(max_abs, p);
     Some(evals.iter().filter(|x| x.abs() < cutoff).count())
 }
 
@@ -2657,6 +2665,18 @@ mod constrained_hessian_geometry_tests {
         for (actual, expected) in null_image.iter().zip((mu * &null).iter()) {
             assert!((actual - expected).abs() <= 1e-12);
         }
+    }
+
+    /// The spectrum of the refused 3-D CTN probe (MSI job 410061): a weak but
+    /// resolvable mode beside a large one is not null, and an exact zero is.
+    /// The weak mode sits below the old `1e-10·λ_max` cutoff (3.6e-2) and far
+    /// above the resolution `λ_max·√3·ε` (1.4e-7).
+    #[test]
+    fn resolvable_weak_curvature_is_not_counted_as_null_979() {
+        let weak = array![[3.609e8, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 7.783e-4]];
+        assert_eq!(symmetric_penalized_hessian_nullity(&weak), Some(0));
+        let singular = array![[3.609e8, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 0.0]];
+        assert_eq!(symmetric_penalized_hessian_nullity(&singular), Some(1));
     }
 }
 
