@@ -1090,10 +1090,15 @@ pub(crate) fn custom_family_outer_jeffreys_hphi_drift_batched<
             .into_iter()
             .map(|slot| slot.ok_or_else(|| missing("second information derivatives")))
             .collect::<Result<Vec<_>, CustomFamilyError>>()?;
-        pairs
-            .iter()
-            .zip(pair_frames)
-            .map(|((u, v), (frame_u, frame_v))| {
+        // Each pair reads only its own two directions and the immutable snapshot,
+        // so the `k(k+1)/2` pairs of a dense outer Hessian run concurrently. Every
+        // pair is evaluated and the first refusal in pair order is returned, so the
+        // drift and any refusal are the serial ones (#1082).
+        use rayon::iter::{IndexedParallelIterator, IntoParallelRefIterator, ParallelIterator};
+        let evaluated: Vec<Result<Array2<f64>, CustomFamilyError>> = pairs
+            .par_iter()
+            .zip(pair_frames.par_iter())
+            .map(|((u, v), &(frame_u, frame_v))| {
                 let huv = family_second
                     .joint_jeffreys_information_second_directional_derivative_with_specs(
                         &states_second,
@@ -1123,6 +1128,9 @@ pub(crate) fn custom_family_outer_jeffreys_hphi_drift_batched<
                 derivative *= strength;
                 Ok(derivative)
             })
+            .collect();
+        evaluated
+            .into_iter()
             .collect::<Result<Vec<_>, CustomFamilyError>>()
     });
     Ok(Some(JeffreysHphiDriftBatchFn { first, second, completion_beta, completion_psi: None, response_scale: 1.0 }))
