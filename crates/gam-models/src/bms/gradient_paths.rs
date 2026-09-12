@@ -5,7 +5,6 @@ use gam_linalg::matrix::{FiniteSignedWeightsView, LinearOperator};
 use gam_math::jet_scalar::SymmetricQuadraticCoefficients;
 use gam_math::probability::normal_logcdf_derivatives;
 use gam_row_macros::row_program;
-use opt::{BacktrackConfig, RidgeSchedule, backtracking_line_search, escalate_ridge};
 
 pub(crate) fn standardize_latent_z_with_policy(
     z: &Array1<f64>,
@@ -157,38 +156,16 @@ pub fn padded_deviation_seed(seed: &Array1<f64>, min_iqr: f64, pad_fraction: f64
     Array1::from_vec(out)
 }
 
-// ── Pooled 2-D probit pilot Newton solver tuning ─────────────────────────────
-//
-// `pooled_probit_baseline` solves a 2-parameter (intercept, slope) penalised
-// probit by damped Newton. The values below are the standard convergence /
-// safeguard knobs; they are deliberately conservative because the pilot is a
-// cheap warm-start for the full fit, not the production estimator.
-
-/// Maximum damped-Newton outer iterations for the pooled probit pilot. A 2-D
-/// strictly-convex probit converges in well under this; the cap only guards a
-/// pathological non-finite data configuration.
-const POOLED_PILOT_MAX_NEWTON_ITERS: usize = 50;
-/// Initial Levenberg ridge added to the 2×2 Hessian diagonal before the solve.
-pub(crate) const POOLED_PILOT_RIDGE_INIT: f64 = 1e-8;
-/// Below this absolute determinant the ridged 2×2 system is treated as
-/// singular and the ridge is escalated.
-pub(crate) const POOLED_PILOT_DET_FLOOR: f64 = 1e-18;
-/// Geometric factor by which the ridge grows when the system is singular.
-pub(crate) const POOLED_PILOT_RIDGE_GROWTH: f64 = 10.0;
-/// Ridge ceiling; exceeding it means the Hessian is unusable and the pilot
-/// fails rather than returning a meaningless step.
-pub(crate) const POOLED_PILOT_RIDGE_MAX: f64 = 1e6;
-/// Maximum backtracking-line-search halvings per Newton step.
-const POOLED_PILOT_MAX_BACKTRACKS: usize = 25;
-/// Backtracking step contraction factor.
-pub(crate) const POOLED_PILOT_BACKTRACK_SHRINK: f64 = 0.5;
-/// Objective-change tolerance below which a stalled (rejected) line search is
-/// accepted as converged instead of erroring.
-pub(crate) const POOLED_PILOT_STALL_TOL: f64 = 1e-10;
-/// Minimum-magnitude signed slope returned by the pilot, so the downstream
-/// `b/√(1+b²)` rigid seed never collapses to an exactly flat (zero-slope) link.
-pub(crate) const POOLED_PILOT_MIN_ABS_SLOPE: f64 = 1e-6;
-
+/// Pooled 2-parameter (intercept, slope) probit pilot, by Newton on the convex
+/// negative log-likelihood.
+///
+/// Every exit is a statement of the arithmetic rather than a budget: the iterate
+/// is stationary to its gradient's rounding band, or no representable step along
+/// the Newton direction lowers the objective by more than the rounding bands of
+/// the two evaluations. A likelihood that reaches its supremum is a direction
+/// `z` separates, refused because it has no finite mode; an information whose
+/// determinant sits inside its rounding band is rank one, and the step is its
+/// Moore–Penrose solve rather than a ridged one.
 pub(super) fn pooled_probit_baseline(
     y: &Array1<f64>,
     z: &Array1<f64>,
@@ -257,115 +234,131 @@ pub(super) fn pooled_probit_baseline(
         0.0
     };
 
-    let objective_grad_hess =
-        |intercept: f64, slope: f64| -> Result<(f64, f64, f64, f64, f64, f64), String> {
-            let mut obj = 0.0;
-            let mut g0 = 0.0;
-            let mut g1 = 0.0;
-            let mut h00 = 0.0;
-            let mut h01 = 0.0;
-            let mut h11 = 0.0;
-            for ((&yi, &zi), &wi) in y.iter().zip(z.iter()).zip(weights.iter()) {
-                if wi == 0.0 {
-                    continue;
-                }
-                let eta = intercept + slope * zi;
-                let s = 2.0 * yi - 1.0;
-                let margin = s * eta;
-                let probit = normal_logcdf_derivatives(margin);
-                let logcdf = probit[0];
-                let lambda = probit[1];
-                let g_eta = -wi * s * lambda;
-                let h_eta = -wi * probit[2];
-                obj -= wi * logcdf;
-                g0 += g_eta;
-                g1 += g_eta * zi;
-                h00 += h_eta;
-                h01 += h_eta * zi;
-                h11 += h_eta * zi * zi;
+    // The pooled NLL, its gradient and its information, each gradient entry carried
+    // with the absolute sum of its terms so its rounding band can be stated. The
+    // objective's and the information's terms are non-negative (`−log Φ ≥ 0`, and
+    // `−∂² log Φ ≥ 0` by log-concavity), so their absolute sums are their values,
+    // except the mixed entry, whose sign follows `z`.
+    #[derive(Default)]
+    struct PooledProbitEval {
+        obj: f64,
+        g0: f64,
+        g0_abs: f64,
+        g1: f64,
+        g1_abs: f64,
+        h00: f64,
+        h01: f64,
+        h01_abs: f64,
+        h11: f64,
+    }
+    let objective_grad_hess = |intercept: f64, slope: f64| -> PooledProbitEval {
+        let mut e = PooledProbitEval::default();
+        for ((&yi, &zi), &wi) in y.iter().zip(z.iter()).zip(weights.iter()) {
+            if wi == 0.0 {
+                continue;
             }
-            Ok((obj, g0, g1, h00, h01, h11))
-        };
+            let eta = intercept + slope * zi;
+            let s = 2.0 * yi - 1.0;
+            let probit = normal_logcdf_derivatives(s * eta);
+            let g_eta = -wi * s * probit[1];
+            let h_eta = -wi * probit[2];
+            e.obj -= wi * probit[0];
+            e.g0 += g_eta;
+            e.g0_abs += g_eta.abs();
+            e.g1 += g_eta * zi;
+            e.g1_abs += (g_eta * zi).abs();
+            e.h00 += h_eta;
+            e.h01 += h_eta * zi;
+            e.h01_abs += (h_eta * zi).abs();
+            e.h11 += h_eta * zi * zi;
+        }
+        e
+    };
+    // `γ_{n+k}` for a sum over the `n` rows of terms formed by `k` rounded
+    // operations after the log-CDF jet.
+    let growth = |formation: usize| gam_linalg::roundoff::accumulation_growth(y.len() + formation);
 
-    let mut obj_prev = f64::INFINITY;
-    for _ in 0..POOLED_PILOT_MAX_NEWTON_ITERS {
-        let (obj, g0, g1, h00, h01, h11) = objective_grad_hess(beta0, beta1)?;
-        if !obj.is_finite() || !g0.is_finite() || !g1.is_finite() {
+    loop {
+        let e = objective_grad_hess(beta0, beta1);
+        if !(e.obj.is_finite() && e.g0.is_finite() && e.g1.is_finite()) {
             return Err(
                 "pooled bernoulli-marginal-slope pilot produced non-finite objective or gradient"
                     .to_string(),
             );
         }
-        let grad_max = g0.abs().max(g1.abs());
-        if grad_max < BMS_DERIV_TOL {
+        // `−log Φ(margin)` vanishes only where the margin's tail probability rounds
+        // away: the pooled likelihood is at its supremum, which a finite intercept and
+        // slope reach only when `z` separates the outcomes.
+        if e.obj == 0.0 {
+            return Err(format!(
+                "pooled bernoulli-marginal-slope pilot: z separates the outcomes, so the pooled \
+                 probit likelihood reaches its supremum with no finite mode (intercept \
+                 {beta0:e}, slope {beta1:e})"
+            ));
+        }
+        if e.g0.abs() <= growth(2) * e.g0_abs && e.g1.abs() <= growth(3) * e.g1_abs {
             break;
         }
-        // Ridge budget: the pre-migration loop grew δ from RIDGE_INIT by
-        // RIDGE_GROWTH until it exceeded RIDGE_MAX, so the trial count is the
-        // decade span of [RIDGE_INIT, RIDGE_MAX] inclusive.
-        let ridge_trials = (POOLED_PILOT_RIDGE_MAX / POOLED_PILOT_RIDGE_INIT)
-            .log10()
-            .ceil() as usize
-            + 1;
-        let (step0, step1) = escalate_ridge(
-            RidgeSchedule {
-                initial: POOLED_PILOT_RIDGE_INIT,
-                growth: POOLED_PILOT_RIDGE_GROWTH,
-                max_escalations: ridge_trials,
-            },
-            |ridge| {
-                let h00_r = h00 + ridge;
-                let h11_r = h11 + ridge;
-                let det = h00_r * h11_r - h01 * h01;
-                if !(det.is_finite() && det.abs() > POOLED_PILOT_DET_FLOOR) {
-                    return None;
-                }
-                let s0 = (h11_r * g0 - h01 * g1) / det;
-                let s1 = (-h01 * g0 + h00_r * g1) / det;
-                (s0.is_finite() && s1.is_finite()).then_some((s0, s1))
-            },
-        )
-        .map(|success| success.value)
-        .map_err(|_| "pooled bernoulli-marginal-slope pilot Hessian solve failed".to_string())?;
-        let accepted = backtracking_line_search::<_, String>(
-            BacktrackConfig {
-                contraction: POOLED_PILOT_BACKTRACK_SHRINK,
-                max_steps: POOLED_PILOT_MAX_BACKTRACKS,
-                ..BacktrackConfig::default()
-            },
-            |step_scale| {
-                let cand0 = beta0 - step_scale * step0;
-                let cand1 = beta1 - step_scale * step1;
-                let (cand_obj, _, _, _, _, _) = objective_grad_hess(cand0, cand1)?;
-                Ok(Some((cand_obj, (cand0, cand1))))
-            },
-            |_, cand_obj| cand_obj.is_finite() && cand_obj <= obj,
-        )?;
+        // Newton step on the PSD 2×2 information. The determinant's band is what the
+        // entries' accumulations propagate into its two products, plus their own
+        // rounding and the subtraction's; a determinant inside it is a rank-one
+        // information, whose Moore–Penrose step moves only along the direction the
+        // data inform.
+        let det = e.h00 * e.h11 - e.h01 * e.h01;
+        let det_band = growth(3) * 2.0 * (e.h00 * e.h11 + e.h01.abs() * e.h01_abs)
+            + gam_linalg::roundoff::accumulation_growth(3) * (e.h00 * e.h11 + e.h01 * e.h01);
+        let (step0, step1) = if det > det_band {
+            (
+                (e.h11 * e.g0 - e.h01 * e.g1) / det,
+                (e.h00 * e.g1 - e.h01 * e.g0) / det,
+            )
+        } else {
+            let trace = e.h00 + e.h11;
+            if trace == 0.0 {
+                return Err(
+                    "pooled bernoulli-marginal-slope pilot: every row's probit density underflows, \
+                     so the pooled information is zero and no Newton direction exists"
+                        .to_string(),
+                );
+            }
+            // A rank-one information is `trace·vvᵀ`, `v` its dominant column normalised.
+            let (c0, c1) = if e.h00 >= e.h11 {
+                (e.h00, e.h01)
+            } else {
+                (e.h01, e.h11)
+            };
+            let norm = c0.hypot(c1);
+            let (v0, v1) = (c0 / norm, c1 / norm);
+            let along = (v0 * e.g0 + v1 * e.g1) / trace;
+            (along * v0, along * v1)
+        };
+        if !(step0.is_finite() && step1.is_finite()) {
+            return Err("pooled bernoulli-marginal-slope pilot Newton step is not finite".to_string());
+        }
+        // Halve until a trial lowers the objective by more than the two evaluations'
+        // rounding bands, or no longer moves the iterate in floating point. A convex
+        // objective whose Newton direction admits no such decrease at any representable
+        // length is at its minimum to working precision.
+        let obj_band = growth(1) * e.obj;
+        let mut length = 1.0_f64;
+        let accepted = loop {
+            let cand0 = beta0 - length * step0;
+            let cand1 = beta1 - length * step1;
+            if cand0.to_bits() == beta0.to_bits() && cand1.to_bits() == beta1.to_bits() {
+                break None;
+            }
+            let cand_obj = objective_grad_hess(cand0, cand1).obj;
+            if cand_obj.is_finite() && e.obj - cand_obj > obj_band + growth(1) * cand_obj {
+                break Some((cand0, cand1));
+            }
+            length *= 0.5;
+        };
         match accepted {
-            Some(step) => {
-                (beta0, beta1) = step.payload;
-                obj_prev = step.value;
-            }
-            None => {
-                if (obj_prev - obj).abs() < POOLED_PILOT_STALL_TOL {
-                    break;
-                }
-                return Err("pooled bernoulli-marginal-slope pilot line search failed".to_string());
-            }
+            Some(next) => (beta0, beta1) = next,
+            None => break,
         }
     }
-    let a = beta0;
-    // Signed slope: preserve direction from pilot probit.
-    let b = if beta1.abs() < POOLED_PILOT_MIN_ABS_SLOPE {
-        if beta1.is_sign_negative() {
-            -POOLED_PILOT_MIN_ABS_SLOPE
-        } else {
-            POOLED_PILOT_MIN_ABS_SLOPE
-        }
-    } else {
-        beta1
-    };
-    Ok((a / (1.0 + b * b).sqrt(), b))
+    Ok((beta0 / (1.0 + beta1 * beta1).sqrt(), beta1))
 }
 
 #[cfg(test)]
@@ -391,6 +384,19 @@ mod pooled_probit_prevalence_tests {
         // returns a finite pair.
         let (intercept, slope) = pooled_probit_baseline(&y, &z, &weights).expect("pilot");
         assert!(intercept.is_finite() && slope.is_finite());
+    }
+
+    /// Where `z` separates the outcomes the pooled likelihood has no finite mode:
+    /// Newton walks the slope out until every margin's tail probability rounds away,
+    /// and the pilot refuses there instead of returning the last iterate.
+    #[test]
+    fn a_separating_z_has_no_pooled_probit_mode() {
+        let y = array![0.0, 0.0, 1.0, 1.0];
+        let z = array![-2.0, -1.0, 1.0, 2.0];
+        let weights = Array1::<f64>::ones(4);
+        let error = pooled_probit_baseline(&y, &z, &weights)
+            .expect_err("a separated pooled probit has no finite mode");
+        assert!(error.contains("separates"), "{error}");
     }
 }
 
