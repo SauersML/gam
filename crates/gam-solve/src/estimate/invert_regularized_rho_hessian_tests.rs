@@ -525,3 +525,131 @@ fn the_chain_rule_term_and_the_resolution_are_added_not_maxed_2748() {
         },
     );
 }
+
+/// An outer certificate carrying `curvature` and `curvature_floor`, stationary
+/// by a solver-band gradient.
+fn certificate_with(
+    curvature: crate::model_types::CurvatureEvidence,
+    curvature_floor: Option<crate::model_types::CurvatureFloorClearance>,
+) -> crate::model_types::OuterCriterionCertificate {
+    crate::model_types::OuterCriterionCertificate {
+        stationarity: crate::model_types::OuterStationarityCertificate::AnalyticGradient {
+            grad_norm: 1.0e-6,
+            projected_grad_norm: 1.0e-6,
+            bound: 1.0e-5,
+            rung: crate::model_types::CertifiedRung {
+                label: "solver-band".to_string(),
+                derived_standard: false,
+            },
+        },
+        curvature,
+        lambdas_railed: Vec::new(),
+        railed_facts: Vec::new(),
+        curvature_floor,
+    }
+}
+
+/// #1561, the prostate refusal. The outer certificate decides definiteness by
+/// a shifted Cholesky test — `λ_min ≥ −√ε·max(max|H_ii|, 1)` when no identity
+/// is measured — and called this ρ-Hessian PSD outright. The correction then
+/// re-judged the same matrix against the eigensolver's backward error and
+/// refused `σ = −1.755e-6` below a bar of `1.330e-7` (focused proof run
+/// 34668941743, `quality_vs_sklearn_binomial_logit`). A `psd = true` verdict
+/// is taken at a shift like a floor-cleared one, so its standard travels too.
+#[test]
+fn a_psd_verdict_taken_at_its_shift_travels_to_the_correction_1561() {
+    let (hessian, _q) = build_with_spectrum(&[500.0, 30.0, 3.0, -1.755e-6]);
+    let gradient = Array1::from(vec![1.330e-7, 1.330e-7, 1.330e-7, 1.330e-7]);
+
+    // The certificate's own verdicts on this matrix, from their owners.
+    assert_eq!(
+        crate::rho_optimizer::certificate_hessian_is_psd_off_railed(&hessian, &[], None),
+        Some(true),
+        "fixture must be a matrix the certificate calls PSD outright"
+    );
+    let clearance =
+        crate::rho_optimizer::interior_curvature_floor_clearance(&hessian, &[], &gradient, None)
+            .expect("a measured verdict records its floor clearance");
+    assert!(clearance.cleared, "the floor must clear where the raw matrix passed");
+    assert!(
+        clearance.interior_min_eigenvalue < -clearance.gradient_floor,
+        "fixture must carry negative curvature the gradient floor alone does not excuse: {clearance:?}"
+    );
+
+    // Control: judged without the verdict's standard, the direction is refused.
+    let refused = invert_identified_rho_hessian(&hessian, 0, &gradient, None, &[])
+        .expect_err("with only the eigensolver's resolution this direction is refused");
+    assert!(
+        refused.contains("negative curvature"),
+        "unexpected error text: {refused}"
+    );
+
+    let certificate = certificate_with(
+        crate::model_types::CurvatureEvidence::Measured { psd: true },
+        Some(clearance),
+    );
+    let shift = super::optimizer::certificate_curvature_verdict_resolution(Some(&certificate))
+        .expect("a PSD verdict decided at a shift publishes that shift");
+    assert_eq!(shift, clearance.decided_at_resolution);
+    let forwarded = [gam_linalg::curvature_resolution::MeasuredHessianError::new(
+        "outer-certificate curvature-verdict shift (the resolution its own PSD test was decided at)",
+        shift,
+    )];
+    let inverse = invert_identified_rho_hessian(&hessian, 0, &gradient, None, &forwarded)
+        .unwrap_or_else(|error| {
+            panic!("the certificate accepted this point and the correction refused it: {error}")
+        });
+    assert_eq!(inverse.active_rank, 3);
+    assert_eq!(
+        inverse.unresolvable_curvature, 1,
+        "the admitted direction is excused by the verdict's resolution, not inverted"
+    );
+    assert!(inverse.inverse.iter().all(|value| value.is_finite()));
+}
+
+/// Which verdicts publish a standard for the correction to honour (#2748,
+/// #1561): every MEASURED verdict whose floor cleared, and nothing else.
+#[test]
+fn only_a_cleared_measured_verdict_publishes_its_shift_1561() {
+    use crate::model_types::{CurvatureEvidence, CurvatureFloorClearance};
+    use super::optimizer::certificate_curvature_verdict_resolution as publish;
+
+    let cleared = CurvatureFloorClearance {
+        interior_min_eigenvalue: -0.05,
+        gradient_floor: 0.1,
+        floored_min_eigenvalue: 0.05,
+        measured_resolution: 0.0,
+        decided_at_resolution: f64::EPSILON.sqrt(),
+        cleared: true,
+    };
+    assert_eq!(
+        publish(Some(&certificate_with(CurvatureEvidence::Measured { psd: false }, Some(cleared)))),
+        Some(f64::EPSILON.sqrt()),
+        "the #2748 floor-cleared verdict still travels"
+    );
+    assert_eq!(
+        publish(Some(&certificate_with(CurvatureEvidence::Measured { psd: true }, Some(cleared)))),
+        Some(f64::EPSILON.sqrt()),
+        "a PSD verdict travels at the same standard"
+    );
+    let not_cleared = CurvatureFloorClearance {
+        cleared: false,
+        ..cleared
+    };
+    assert_eq!(
+        publish(Some(&certificate_with(CurvatureEvidence::Measured { psd: false }, Some(not_cleared)))),
+        None,
+        "a refusal admits nothing"
+    );
+    assert_eq!(
+        publish(Some(&certificate_with(CurvatureEvidence::NotAvailable, Some(cleared)))),
+        None,
+        "unmeasured curvature has no verdict to honour"
+    );
+    assert_eq!(
+        publish(Some(&certificate_with(CurvatureEvidence::Measured { psd: true }, None))),
+        None,
+        "no recorded clearance, nothing to forward"
+    );
+    assert_eq!(publish(None), None);
+}

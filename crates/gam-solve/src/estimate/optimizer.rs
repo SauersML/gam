@@ -416,6 +416,34 @@ pub(crate) fn standard_reml_search_prefers_gradient_only(link: LinkFunction) -> 
     !matches!(link, LinkFunction::Identity)
 }
 
+/// The resolution the outer certificate's curvature verdict was decided at,
+/// when that verdict admitted the point (#2748, #1561).
+///
+/// The certificate's definiteness tests add a shift before they factor: the
+/// larger of the measured `‖δH‖₂` and `√ε·max(max|H_ii|, 1)`. A `psd = true`
+/// verdict and a `psd = false` verdict cleared by the gradient-residue floor
+/// therefore both admit every direction inside that shift. The smoothing
+/// correction re-judges the same ρ-Hessian at the same point and has to judge
+/// it at the standard the verdict was taken at, or the fit dies between two
+/// layers that disagree only about resolution. Only a floor that cleared
+/// publishes its shift: a refusal admits nothing, and unmeasured curvature has
+/// no verdict to honour.
+pub(crate) fn certificate_curvature_verdict_resolution(
+    certificate: Option<&crate::model_types::OuterCriterionCertificate>,
+) -> Option<f64> {
+    certificate
+        .filter(|certificate| {
+            matches!(
+                certificate.curvature,
+                crate::rho_optimizer::CurvatureEvidence::Measured { .. }
+            )
+        })
+        .and_then(|certificate| certificate.curvature_floor)
+        .filter(|clearance| clearance.cleared)
+        .map(|clearance| clearance.decided_at_resolution)
+        .filter(|value| value.is_finite() && *value > 0.0)
+}
+
 fn reml_inner_progress_feedback(
     state: &crate::estimate::reml::RemlState<'_>,
 ) -> crate::rho_optimizer::InnerProgressFeedback {
@@ -3049,36 +3077,29 @@ where
             // Only a clearance that actually CLEARED contributes: a refusal
             // carries no admission for this site to honour.
             //
-            // Narrow on purpose: only a certificate whose curvature evidence is
-            // a MEASURED `psd = false` had a negative direction to admit, and
-            // only then is its clearance load-bearing. A fit whose Hessian is
-            // PSD outright cleared nothing, so it publishes nothing and this
-            // site's resolution is bit-unchanged — the widening reaches exactly
-            // the fits where the two layers can disagree, and no others.
-            let certificate_clearance_resolution = outer_result
-                .criterion_certificate
-                .as_ref()
-                .filter(|certificate| {
-                    matches!(
-                        certificate.curvature,
-                        crate::rho_optimizer::CurvatureEvidence::Measured { psd: false }
-                    )
-                })
-                .and_then(|certificate| certificate.curvature_floor)
-                .filter(|clearance| clearance.cleared)
-                .map(|clearance| clearance.decided_at_resolution)
-                .filter(|value| value.is_finite() && *value > 0.0);
+            // A `psd = true` verdict travels as well (#1561). "PSD outright" is
+            // decided by the same shifted Cholesky test, so it too admits every
+            // direction inside its shift, and the floor clearance recorded beside
+            // it clears whenever the raw matrix passed. Withholding it made this
+            // site refuse points the certificate accepted: focused proof run
+            // 34668941743 at 7d3b11307, `quality_vs_sklearn_binomial_logit`
+            // (binomial `s(pc1, k=5) + s(pc2, k=5)` on prostate), where the outer
+            // loop certified a minimum and this site refused sigma = -1.755e-6
+            // against a bar of 1.330e-7 whose resolution components were the
+            // eigensolver's 2.737740e-14 and three exactly-zero identities.
             let measured_hessian_error: Vec<
                 gam_linalg::curvature_resolution::MeasuredHessianError,
-            > = certificate_clearance_resolution
-                .into_iter()
-                .map(|value| {
-                    gam_linalg::curvature_resolution::MeasuredHessianError::new(
-                        "outer-certificate curvature-verdict shift (the resolution its own PSD                          test cleared this direction at)",
-                        value,
-                    )
-                })
-                .collect();
+            > = certificate_curvature_verdict_resolution(
+                outer_result.criterion_certificate.as_ref(),
+            )
+            .into_iter()
+            .map(|value| {
+                gam_linalg::curvature_resolution::MeasuredHessianError::new(
+                    "outer-certificate curvature-verdict shift (the resolution its own PSD test was decided at)",
+                    value,
+                )
+            })
+            .collect();
             let smoothing_outcome = reml_state.compute_smoothing_correction_auto(
                 &final_rho,
                 // Use the same domain as both standard REML outer routes and
