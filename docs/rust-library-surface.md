@@ -113,28 +113,31 @@ default.
 
 ### Rust library surface and removal decisions
 
-The Rust library is a product, alongside the CLI and Python extension. A public
-item reachable through an exported Rust module, re-export, public type, or trait
-implementation is a source-graph root in every supported configuration. Its
-absence from a CLI or extension symbol table does not make it unused. Generic
-instantiation, inlining, and LTO do not change that rule.
+The supported public surface is what a product uses. The products are
+`gam-cli`, `gam-pyffi` with the Python package, and `examples/`, and the
+production code of another workspace crate counts as a product user. Tests and
+benchmarks do not. A `pub` item that no product uses is deleted, or narrowed to
+`pub(crate)` when production code in its own crate uses it. Being reachable
+through an exported module, re-export, public type or trait implementation does
+not make an item supported, and neither does a generic signature. Product use is
+read from source references, never from a linked binary's symbol table, because
+inlining and LTO erase symbols for live code.
 
 The maintained high-level API is `gam::fit_from_formula` for formula/data input,
 `gam::materialize` followed by `gam::fit_model` for typed requests, and
 `gam::predict` for prediction. These route to the same production model owners
-used by the CLI and Python wrapper. Domain crates also expose their documented
-numerical and model-building contracts directly; consumers do not have to link
-either executable to use them.
+used by the CLI and Python wrapper.
 
-Rust's `dead_code` analysis operates on source definitions and visibility,
-including generic bodies and re-exports. The workspace's deny-warnings production
-builds retain exported library items and reject unreferenced private production
-items. Test targets must also compile: test helpers stay under `#[cfg(test)]`
-and are evaluated within their test source graph. A private production helper
-used only by tests is a candidate to move into test scope, not a reason to delete
-the tests. Compiler acceptance establishes source validity, not whether a public
-contract is valuable; removing a public contract still requires a semantic
-decision and review of its callers and documentation.
+Rust's `dead_code` lint cannot report an unused `pub` item, because another crate
+might use it. Narrowing the item to `pub(crate)` puts it back under the lint, and
+the workspace's deny-warnings builds then reject it if nothing in its crate's
+production code uses it. Test targets must also compile: test helpers stay under
+`#[cfg(test)]` and are evaluated within their test source graph. A production
+item that only tests use is not library API. Delete it together with the tests
+that exist only to exercise it. When tests need it to exercise behaviour that
+survives, move it into test scope instead. Compiler acceptance establishes source
+validity, not product use, so every removal still needs its callers read and its
+documentation updated.
 
 `scripts/public_api_census.py` enforces that review for explicit public
 functions. It compares immutable Git trees by `(source path, function name)`
@@ -143,14 +146,14 @@ Every removal, including a move, requires an exact entry in
 `docs/public-api-census-changes.json` with the semantic reason and executable
 replacement or retirement evidence. Its CI positive control replays the
 `d484a091a` sweep and must both detect and refuse those removals. This gate is a
-backstop against repeating that mechanism; it does not decide whether an API is
-valuable and does not replace external-consumer behavior tests.
+backstop against repeating that mechanism. It records removals; it does not
+decide which items a product uses.
 
-There is no compatibility obligation to recreate deleted convenience names.
-Keep one current API per behavior, and use explicit model inputs where defaults
-would silently choose geometry. An exported name with no internal caller can
-still be useful; an abandoned configuration/report carrier with no callable
-producer is not a substitute for an implemented public contract.
+There is no compatibility obligation to recreate deleted names, and no `pub` item
+is kept for a hypothetical external caller. Keep one current API per behavior,
+and use explicit model inputs where defaults would silently choose geometry. A
+configuration or report carrier whose producer is gone is deleted, not kept as
+an abandoned public type.
 
 #### Decisions for the concrete #2829 cases
 
