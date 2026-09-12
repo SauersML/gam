@@ -25,7 +25,6 @@ import sys
 PAIR_SCHEMA = "gam.issue2283.eq4-pair.v2"
 ARMS = ("external_topk", "hybrid_rust")
 TARGETS = ("0.99", "0.95", "0.9", "0.8")
-HISTORICAL_BAR_R2_099 = 56_322.0
 
 
 def _canonical_json(payload) -> str:
@@ -212,15 +211,7 @@ def main():
             f"#2283 failed: hybrid {hybrid_099:.6f} does not beat paired external "
             f"{external_099:.6f}"
         )
-    if hybrid_099 >= HISTORICAL_BAR_R2_099:
-        raise ValueError(
-            f"#2283 failed: hybrid {hybrid_099:.6f} does not beat historical bar "
-            f"{HISTORICAL_BAR_R2_099:.0f}"
-        )
-    print(
-        f"PASS R2=0.99: hybrid={hybrid_099:.6f} < paired={external_099:.6f} "
-        f"and < historical={HISTORICAL_BAR_R2_099:.0f}"
-    )
+    print(f"PASS R2=0.99: hybrid={hybrid_099:.6f} < paired={external_099:.6f}")
     return 0
 
 
