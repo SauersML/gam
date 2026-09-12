@@ -4546,7 +4546,14 @@ fn pure_duchon_from_length_scales_aniso_is_isotropic_single_psi() {
 
 #[test]
 fn explicit_duchon_aniso_length_scale_is_locked_kappa() {
-    let spec = TermCollectionSpec {
+    // An explicit `length_scale` locks a Duchon term only where the term does
+    // not enroll per-axis ψ. Since gam#2735 (8b5ffc479) a hybrid Duchon's η is a
+    // REML coordinate wherever `duchon_spec_supports_axis_psi` certifies the
+    // per-axis derivative surface: there the requested contrasts are a start,
+    // and κ and η are estimated together. Where the capability declines, here a
+    // fractional spectral power whose ψ derivative is not derived, the term keeps
+    // its fixed geometry and the explicit scale locks it.
+    let duchon_with_power = |power: f64| TermCollectionSpec {
         linear_terms: vec![],
         random_effect_terms: vec![],
         smooth_terms: vec![SmoothTermSpec {
@@ -4564,7 +4571,7 @@ fn explicit_duchon_aniso_length_scale_is_locked_kappa() {
                         [0.0, 0.0, 1.0],
                     ]),
                     length_scale: Some(1.0),
-                    power: 1.0,
+                    power,
                     nullspace_order: DuchonNullspaceOrder::Linear,
                     identifiability: SpatialIdentifiability::None,
                     aniso_log_scales: Some(vec![0.7, 0.2, 0.1]),
@@ -4578,13 +4585,32 @@ fn explicit_duchon_aniso_length_scale_is_locked_kappa() {
         }],
     };
 
+    let declined = duchon_with_power(1.5);
     assert!(
-        spatial_term_has_locked_kappa(&spec, 0),
-        "Duchon anisotropy is fixed geometry and must not force ψ optimization"
+        !spatial_term_uses_per_axis_psi(&declined, 0),
+        "a fractional spectral power has no per-axis ψ derivative surface"
     );
     assert!(
-        all_spatial_terms_kappa_fixed(&spec),
+        spatial_term_has_locked_kappa(&declined, 0),
+        "an explicit length_scale locks a Duchon term whose anisotropy is fixed geometry"
+    );
+    assert!(
+        all_spatial_terms_kappa_fixed(&declined),
         "a Duchon term with explicit length_scale and fixed anisotropy has no REML κ/ψ axis"
+    );
+
+    let enrolled = duchon_with_power(1.0);
+    assert!(
+        spatial_term_uses_per_axis_psi(&enrolled, 0),
+        "an integer-power hybrid Duchon enrolls its per-axis ψ (gam#2735)"
+    );
+    assert!(
+        !spatial_term_has_locked_kappa(&enrolled, 0),
+        "enrolled per-axis ψ is estimated, so the explicit length_scale is its start, not a lock"
+    );
+    assert!(
+        !all_spatial_terms_kappa_fixed(&enrolled),
+        "an enrolled Duchon term contributes REML κ/ψ axes"
     );
 }
 
