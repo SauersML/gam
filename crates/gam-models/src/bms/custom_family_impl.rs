@@ -800,14 +800,11 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
             let p_total = specs.iter().map(|spec| spec.design.ncols()).sum::<usize>();
             let matrix_free_inner_requested =
                 crate::custom_family::use_joint_matrix_free_path(p_total, self.y.len());
-            let inner_route = if matrix_free_inner_requested
-                && self.inner_coefficient_hessian_hvp_available(specs)
-            {
+            let workspace_available = self.inner_coefficient_hessian_hvp_available(specs);
+            let inner_route = if matrix_free_inner_requested && workspace_available {
                 "workspace-hvp"
-            } else if p_total < 512 {
+            } else if workspace_available {
                 "workspace-dense"
-            } else if self.inner_coefficient_hessian_hvp_available(specs) {
-                "workspace-hvp"
             } else {
                 "direct-dense"
             };
@@ -963,10 +960,6 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
                 trace_s_pinv_sdot: Array1::zeros(theta_dim),
             }));
         }
-        if total >= 512 {
-            return Ok(None);
-        }
-
         let batched_started = std::time::Instant::now();
         let beta = Self::flatten_block_state_betas_for_specs(block_states, specs)?;
         if log_exact_work(self.y.len()) {
@@ -990,7 +983,7 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
             // `hessian_dense_forced` — that always materialises through the
             // fused row pass instead of falling through to column-basis HVP.
             workspace.hessian_dense_forced()?.ok_or_else(|| {
-                "bernoulli marginal-slope batched gradient requires dense exact joint Hessian below p=512"
+                "bernoulli marginal-slope batched gradient: the exact-Newton workspace supplied no dense joint Hessian"
                     .to_string()
             })?
         } else {
@@ -1415,14 +1408,13 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
         true
     }
 
+    /// The dense joint Hessian at every coefficient width, built in one row pass.
+    /// No width favours reconstructing it from canonical Hessian-vector products;
+    /// see `hessian_dense_forced` on the exact-Newton workspace.
     fn exact_newton_joint_hessian(
         &self,
         block_states: &[ParameterBlockState],
     ) -> Result<Option<Array2<f64>>, String> {
-        let slices = block_slices(self);
-        if slices.total >= 512 {
-            return Ok(None);
-        }
         if !self.effective_flex_active(block_states)? {
             let kern = BernoulliRigidRowKernel::new(self.clone(), block_states.to_vec());
             let cache = build_row_kernel_cache(&kern, &crate::row_kernel::RowSet::All)?;
@@ -2484,9 +2476,6 @@ impl ExactNewtonJointHessianWorkspace for BernoulliMarginalSlopeExactNewtonJoint
     }
 
     fn hessian_dense(&self) -> Result<Option<Array2<f64>>, String> {
-        if self.cache.slices.total >= 512 {
-            return Ok(None);
-        }
         if self.matrix_free_inner_route() {
             // Route the inner-Newton solve through `hessian_matvec` /
             // `hessian_diagonal`. Callers that strictly need a dense matrix
@@ -2579,9 +2568,9 @@ impl ExactNewtonJointHessianWorkspace for BernoulliMarginalSlopeExactNewtonJoint
                 gradient: gradient.gradient.clone(),
             }));
         }
-        if self.cache.slices.total < 512 && !self.matrix_free_inner_route() {
+        if !self.matrix_free_inner_route() {
             // The only current consumer of workspace-side joint gradients is
-            // the exact joint-Newton path. For bounded dense systems it will
+            // the exact joint-Newton path. On the dense inner route it will
             // request the dense Hessian in the same cycle, so build the fused
             // row pass once and let `hessian_dense` reuse it. When the
             // matrix-free inner route is active, the inner solver will pull
