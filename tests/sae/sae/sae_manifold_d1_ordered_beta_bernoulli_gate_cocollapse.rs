@@ -167,7 +167,12 @@ fn sae_manifold_d1_ordered_beta_bernoulli_gate_cocollapse() {
         .certify_outer_result(&result)
         .expect("ordered independent Beta--Bernoulli co-collapse outer result must certify the installed state");
     let fitted = objective.into_fitted().expect("outer fit was evaluated");
-    let fitted_out = fitted.term.fitted();
+    // A co-collapse fit may rescue its atom, and a rescued atom reconstructs only
+    // through the target-aware reader (`try_fitted` refuses it by contract).
+    let fitted_out = fitted
+        .term
+        .try_fitted_target_aware(z.view(), Some(&fitted.rho))
+        .expect("the fitted term reconstructs its own training target");
     let r2 = reconstruction_r2(&fitted_out, &z);
     let converged_via = result
         .converged_via()

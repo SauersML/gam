@@ -511,11 +511,24 @@ fn evidence_consistency_at_fixed_lambda() {
     assert!(!full.frames_active(), "full-B clone must have no frames");
 
     let mut framed = converged.clone();
-    let activated = framed
+    // `auto_activate_decoder_frames` counts only NEWLY installed frames, and the
+    // engine's fit entry already installs every frame a low-rank decoder earns
+    // (`ensure_decoder_frames_active_for_current_decoder`), so a converged clone
+    // can report zero new activations while every atom is framed. The property is
+    // that both atoms carry a frame after the pass.
+    let newly_activated = framed
         .auto_activate_decoder_frames()
         .expect("frame activation on converged decoder");
-    println!("test4: activated {activated}/{k} frames on the converged decoder");
-    assert_eq!(activated, k, "both low-rank atoms must frame at the basin");
+    let framed_atoms = framed
+        .atoms
+        .iter()
+        .filter(|atom| atom.decoder_frame.is_some())
+        .count();
+    println!(
+        "test4: {framed_atoms}/{k} atoms framed on the converged decoder \
+         ({newly_activated} newly activated)"
+    );
+    assert_eq!(framed_atoms, k, "both low-rank atoms must frame at the basin");
     assert!(
         framed.factored_border_dim() < framed.beta_dim(),
         "framed evidence clone border must collapse"

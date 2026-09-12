@@ -192,10 +192,18 @@ fn large_k_sparse_fit_stays_fixed_width_and_never_materializes_dense_n_by_k() {
 
     // Deterministic planted data: each row is a scaled copy of one of `p_out`
     // orthonormal axes so the fit has real structure to route (no RNG dependency).
+    // #2822: a dictionary that reproduces every row exactly leaves zero residual,
+    // and the shared-ρ Fellner–Schall step refuses the resulting `ρ = 0` as
+    // boundary evidence. A deterministic perturbation keeps the residual above the
+    // arithmetic floor while the planted axis still dominates every row.
     let mut x = Array2::<f32>::zeros((n_obs, p_out));
     for row in 0..n_obs {
         let axis = row % p_out;
         x[[row, axis]] = 1.0 + 0.01 * (row / p_out) as f32;
+        for col in 0..p_out {
+            let phase = (row as f32 + 1.0) * 12.9898 + (col as f32 + 1.0) * 78.233;
+            x[[row, col]] += 0.02 * (phase.sin() * 43758.5453).sin();
+        }
     }
 
     let config = SparseDictConfig {
@@ -225,7 +233,7 @@ fn large_k_sparse_fit_stays_fixed_width_and_never_materializes_dense_n_by_k() {
     let solve = fit.decoder_solve_stats;
     assert!(
         solve.dense_cholesky_declines > 0,
-        "fixture must exercise at least one dense Cholesky decline"
+        "fixture must exercise at least one dense Cholesky decline; decoder solve stats: {solve:?}"
     );
     assert!(
         solve.cg_columns > 0,
