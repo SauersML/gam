@@ -48,24 +48,11 @@ use crate::transformation_normal::{
     CtnRowBases, CtnRowFloors, TRANSFORMATION_MONOTONICITY_EPS, TransformationNormalFitResult,
     ctn_component_sensitivity, ctn_row_geometry, transformation_normal_pit_score,
 };
-use faer::Side;
-use gam_linalg::faer_ndarray::{
-    FaerArrayView, factorize_symmetricwith_fallback, fast_ab, fast_abt, fast_xt_diag_x,
-    fast_xt_diag_y,
-};
-use gam_linalg::matrix::FactorizedSystem;
+use gam_linalg::faer_ndarray::{fast_ab, fast_abt, fast_xt_diag_x, fast_xt_diag_y};
+use gam_linalg::roundoff::accumulation_growth;
+use gam_linalg::utils::rank_certified_psd_pseudoinverse;
 use gam_terms::smooth::build_term_collection_design;
 use ndarray::{Array1, Array2, ArrayView2};
-
-/// Floor for the influence-absorber ridge's REML seed.
-///
-/// The §3 absorbed block `+Z_infl·γ` is an estimating-equation correction, not
-/// a new outcome surface, so its identity penalty is *seeded* on the
-/// likelihood-curvature scale rather than at the generic ρ₀ = 0 smooth seed.
-/// The log-λ itself is REML-learned like every other precision (SPEC:
-/// shrinkage is explicit or REML-selected, never a pinned magic constant);
-/// this floor only keeps the seed sane for degenerate row counts.
-pub(crate) const INFLUENCE_ABSORBER_SEED_FLOOR_LOG_LAMBDA: f64 = 0.0;
 
 /// The coefficient chart a *fitted* (in-memory) CTN carries. A fit is the
 /// definition of its own chart — the persisted marker exists so a saved model
@@ -77,15 +64,17 @@ const CTN_CHART: TransformationNormalParameterization =
 
 /// REML seed for the absorber ridge with `n_rows` observations.
 ///
+/// The §3 absorbed block `+Z_infl·γ` is an estimating-equation correction, not
+/// a new outcome surface, so its identity penalty is *seeded* on the
+/// likelihood-curvature scale rather than at the generic ρ₀ = 0 smooth seed.
 /// Seeding γ's penalty at roughly one unit per observation starts the absorber
 /// as a nuisance leakage correction rather than a competing flexible target
 /// surface; the outer REML then moves λ wherever the evidence puts it (large λ
 /// recovers the null correction, small λ engages a data-supported correction —
 /// the residualized columns carry no marginal-span signal by construction).
+/// `ln n ≥ 0` for every row count, so the seed needs no floor.
 pub(crate) fn influence_absorber_log_lambda(n_rows: usize) -> f64 {
-    (n_rows.max(1) as f64)
-        .ln()
-        .max(INFLUENCE_ABSORBER_SEED_FLOOR_LOG_LAMBDA)
+    (n_rows.max(1) as f64).ln()
 }
 
 /// Per-row, per-θ₁ score-influence Jacobian `∂z/∂θ₁` for a fitted CTN, plus the
@@ -382,26 +371,35 @@ pub fn influence_block_design(
 /// (#461, design §3 — single source of truth for the BMS and survival absorbed
 /// blocks):
 ///
-///   Z̃ = Z − M·(MᵀWM + εI)⁻¹·MᵀW·Z.
+///   Z̃ = Z − M·(MᵀWM)⁺·MᵀW·Z.
 ///
 /// Residualizing against **marginal only** deliberately keeps the
 /// slope-aligned component, so the absorber soaks the leakage direction that
 /// would otherwise manufacture spurious `β(x)` heterogeneity. `W` is the PIRLS
 /// row inner product at the rigid pilot, so the resulting orthogonality
 /// `MᵀW Z̃ ≈ 0` holds in the same metric the penalized joint solve sees, not
-/// merely in the Euclidean sense. `eps` is the (caller-scaled) ridge added to
-/// the weighted marginal Gram diagonal so the projection solve stays stable when
-/// the marginal design is rank-deficient at the pilot.
+/// merely in the Euclidean sense.
+///
+/// `(MᵀWM)⁺` is the Moore–Penrose pseudo-inverse, so `M·(MᵀWM)⁺·MᵀW` is the
+/// `W`-orthogonal projector onto `span(M)` whether or not the marginal design is
+/// rank-deficient at the pilot: a dropped or aliased column adds a null
+/// eigenvalue whose direction `M` maps to zero, so discarding it removes nothing
+/// that is in the span. A ridge `εI` in its place leaks the fraction `ε/(λ+ε)` of
+/// every direction with a small but resolvable eigenvalue `λ` back into the
+/// absorber. The discarded eigenvalues are the ones the computed Gram cannot tell
+/// from zero: each entry of `MᵀWM` accumulates `n` two-product terms
+/// `wᵢ·mᵢₐ·mᵢᵦ` whose absolute sum is at most `√(GₐₐGᵦᵦ)`, so by Weyl the
+/// formation moves every eigenvalue by at most `γ_{n+1}·tr(MᵀWM)`, and the
+/// symmetric eigensolver adds its backward error `p·ε·λ_max`.
 ///
 /// `z_infl` must already be the `influence_block_design` output (`n × p₁`).
-/// When the marginal design has zero columns the raw `z_infl` is returned (no
-/// span to project out).
+/// When the marginal design has zero columns, or no column carries mass in the
+/// `W` metric, the raw `z_infl` is returned (no span to project out).
 pub(crate) fn residualize_influence_columns(
     z_infl: &Array2<f64>,
     marginal_design: ArrayView2<f64>,
     w_metric: &Array1<f64>,
-    eps: f64,
-) -> Array2<f64> {
+) -> Result<Array2<f64>, String> {
     let n = marginal_design.nrows();
     assert_eq!(
         z_infl.nrows(),
@@ -417,34 +415,46 @@ pub(crate) fn residualize_influence_columns(
     if p_m == 0 {
         // No marginal span to residualize against; the raw directions are the
         // absorbed columns.
-        return z_infl.clone();
+        return Ok(z_infl.clone());
     }
-    // Weighted Gram MᵀWM and cross term MᵀW Z in the pilot row metric.
-    let mut gram = fast_xt_diag_x(&marginal_design, w_metric);
-    for i in 0..p_m {
-        gram[[i, i]] += eps;
+    // Weighted Gram MᵀWM in the pilot row metric.
+    let gram = fast_xt_diag_x(&marginal_design, w_metric);
+    if gram.iter().any(|value| !value.is_finite()) {
+        return Err(
+            "residualize_influence_columns: weighted marginal Gram has non-finite entries"
+                .to_string(),
+        );
     }
+    let diagonal = gram.diag();
+    if diagonal.iter().any(|&value| value < 0.0) {
+        return Err(
+            "residualize_influence_columns: weighted marginal Gram has a negative diagonal \
+             entry, so the row metric is not positive semidefinite"
+                .to_string(),
+        );
+    }
+    let max_diagonal = diagonal.iter().copied().fold(0.0_f64, f64::max);
+    if max_diagonal == 0.0 {
+        // A PSD Gram with a zero diagonal is the zero matrix: no marginal column
+        // has mass in the W metric, so there is no span to project out.
+        return Ok(z_infl.clone());
+    }
+    // The resolution band above, relative to `λ_max`. `max_diagonal ≤ λ_max`, so
+    // dividing the formation band by it never under-states the band.
+    let relative_cutoff =
+        accumulation_growth(n + 1) * diagonal.sum() / max_diagonal + p_m as f64 * f64::EPSILON;
+    let pseudoinverse = rank_certified_psd_pseudoinverse(&gram, relative_cutoff)
+        .map_err(|error| {
+            format!("residualize_influence_columns: weighted marginal Gram pseudo-inverse: {error}")
+        })?
+        .into_pseudoinverse();
+    // coeffs = (MᵀWM)⁺ MᵀW Z   (p_m × p₁)
     let cross = fast_xt_diag_y(&marginal_design, w_metric, z_infl);
-    let gram_view = FaerArrayView::new(&gram);
-    let factor = factorize_symmetricwith_fallback(gram_view.as_ref(), Side::Lower)
-        .expect("residualize_influence_columns: weighted marginal Gram factorization failed");
-    // coeffs = (MᵀWM + εI)⁻¹ MᵀW Z   (p_m × p₁)
-    let coeffs = factor
-        .solvemulti(&cross)
-        .expect("residualize_influence_columns: marginal projection solve failed");
+    let coeffs = fast_ab(&pseudoinverse, &cross);
     // Z̃ = Z − M·coeffs.
     let projection = fast_ab(&marginal_design, &coeffs);
-    z_infl - &projection
+    Ok(z_infl - &projection)
 }
-
-/// Relative magnitude (vs. the largest weighted marginal-Gram diagonal) of the
-/// ridge added to `MᵀWM` in the §3 projection solve. Tiny — it only regularizes
-/// a rank-deficient marginal design at the pilot (a dropped/aliased spatial
-/// column leaves a zero pivot) and never perturbs a well-conditioned projection.
-pub(crate) const INFLUENCE_PROJECTION_RELATIVE_RIDGE: f64 = 1.0e-10;
-/// Absolute floor on the §3 projection ridge, so a degenerate (all-zero)
-/// weighted marginal Gram still yields an invertible system.
-pub(crate) const INFLUENCE_PROJECTION_RIDGE_FLOOR: f64 = 1.0e-12;
 
 /// The full §3 absorbed-block projection from the raw score-influence Jacobian —
 /// the single shared entry point for both families.
@@ -455,17 +465,15 @@ pub(crate) const INFLUENCE_PROJECTION_RIDGE_FLOOR: f64 = 1.0e-12;
 ///
 ///  1. build the realized leakage directions `Z_infl = diag(s_f·β̂₀)·J`
 ///     ([`influence_block_design`]),
-///  2. derive the projection ridge from the weighted marginal Gram's own
-///     magnitude — `eps = max(diag(MᵀWM))·INFLUENCE_PROJECTION_RELATIVE_RIDGE`
-///     floored at `INFLUENCE_PROJECTION_RIDGE_FLOOR` — so it scales with the
-///     design rather than being a fixed absolute the caller must guess,
-///  3. residualize against the marginal/primary span in the rigid-pilot
+///  2. residualize against the marginal/primary span in the rigid-pilot
 ///     `W`-metric ([`residualize_influence_columns`]):
-///     `Z̃ = Z_infl − M·(MᵀWM + εI)⁻¹·MᵀW·Z_infl`.
+///     `Z̃ = Z_infl − M·(MᵀWM)⁺·MᵀW·Z_infl`, the pseudo-inverse truncated at the
+///     computed Gram's own resolution rather than ridged.
 ///
-/// Returns `Err` if the residualized columns are not all finite (e.g. a
-/// non-finite pilot slope or row metric propagated through) — the finite
-/// guard is baked in so neither call site repeats it. The two families differ
+/// Returns `Err` if the weighted marginal Gram cannot be pseudo-inverted or the
+/// residualized columns are not all finite (e.g. a non-finite pilot slope or row
+/// metric propagated through) — the guards are baked in so neither call site
+/// repeats them. The two families differ
 /// ONLY in how they install the returned `Z̃` (BMS widens `[M | Z̃]`; survival
 /// adds a dedicated additive η₁ channel), never in this math.
 ///
@@ -487,18 +495,7 @@ pub(crate) fn residualized_influence_block(
         z: oof_z.clone(),
     };
     let z_infl = influence_block_design(&jac, pilot_beta0, s_f);
-
-    // Ridge scaled to the weighted marginal Gram's own magnitude. Only the
-    // diagonal is needed to size it, so reuse the same MᵀWM the residualizer
-    // forms internally (the cost is one extra weighted Gram; kept here so the
-    // ε logic lives with the projection it regularizes).
-    let p_m = marginal_design.ncols();
-    let gram = fast_xt_diag_x(&marginal_design, w_metric);
-    let gram_scale = (0..p_m).map(|i| gram[[i, i]]).fold(0.0_f64, f64::max);
-    let eps =
-        (gram_scale * INFLUENCE_PROJECTION_RELATIVE_RIDGE).max(INFLUENCE_PROJECTION_RIDGE_FLOOR);
-
-    let residualized = residualize_influence_columns(&z_infl, marginal_design, w_metric, eps);
+    let residualized = residualize_influence_columns(&z_infl, marginal_design, w_metric)?;
     if residualized.iter().any(|v| !v.is_finite()) {
         return Err(
             "residualized_influence_block: residualized influence columns contain non-finite entries"
@@ -566,19 +563,30 @@ mod tests {
         let z = array![[1.0, 2.0], [3.0, 4.0]];
         let m = Array2::<f64>::zeros((2, 0));
         let w = array![1.0, 1.0];
-        let out = residualize_influence_columns(&z, m.view(), &w, 1e-12);
+        let out = residualize_influence_columns(&z, m.view(), &w).expect("projection");
+        assert_eq!(out, z);
+    }
+
+    #[test]
+    fn residualize_returns_input_when_no_column_has_mass_in_the_metric() {
+        // W ≡ 0 makes MᵀWM the zero matrix: there is no span in the metric, so
+        // the raw columns come back verbatim rather than through a ridge.
+        let z = array![[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]];
+        let m = array![[1.0, 0.0], [1.0, 1.0], [1.0, 2.0]];
+        let w = Array1::<f64>::zeros(3);
+        let out = residualize_influence_columns(&z, m.view(), &w).expect("projection");
         assert_eq!(out, z);
     }
 
     #[test]
     fn residualize_kills_columns_in_marginal_span() {
-        // If Z lies entirely in the column span of M, the residual is ~0
-        // (with a tiny ridge). Build Z = M * C.
+        // If Z lies entirely in the column span of M, the residual is ~0.
+        // Build Z = M * C.
         let m = array![[1.0, 0.0], [1.0, 1.0], [1.0, 2.0], [1.0, 3.0]];
         let c = array![[2.0, -1.0], [0.5, 4.0]];
         let z = fast_ab(&m, &c);
         let w = Array1::<f64>::ones(4);
-        let out = residualize_influence_columns(&z, m.view(), &w, 1e-12);
+        let out = residualize_influence_columns(&z, m.view(), &w).expect("projection");
         let max_abs = out.iter().fold(0.0_f64, |a, &v| a.max(v.abs()));
         assert!(max_abs < 1e-6, "residual of in-span Z too large: {max_abs}");
     }
@@ -590,7 +598,7 @@ mod tests {
         let m = array![[1.0, 0.0], [1.0, 1.0], [1.0, 2.0], [1.0, 4.0]];
         let z = array![[0.3, 1.0], [-2.0, 0.5], [4.0, -1.0], [0.7, 2.0]];
         let w = array![1.0, 2.0, 0.5, 1.5];
-        let out = residualize_influence_columns(&z, m.view(), &w, 1e-12);
+        let out = residualize_influence_columns(&z, m.view(), &w).expect("projection");
         // MᵀW Z̃ should be ~0.
         let mtwz = fast_xt_diag_y(&m, &w, &out);
         let max_abs = mtwz.iter().fold(0.0_f64, |a, &v| a.max(v.abs()));
@@ -602,12 +610,81 @@ mod tests {
         assert_eq!(out.dim(), z.dim());
     }
 
+    #[test]
+    fn residualize_projects_out_a_resolvable_near_collinear_direction() {
+        use faer::Side;
+        use gam_linalg::faer_ndarray::FaerEigh;
+
+        // Two marginal columns that differ by δ·t. The Gram's small eigenvalue
+        // is ≈ 20δ²/λ_max ≈ 2.5e-6 against λ_max ≈ 8, far above the Gram's
+        // resolution, so that direction IS in span(M), and Z = M·[−1, 1]ᵀ = δ·t
+        // lies along it: the exact residual is zero.
+        let delta = 1.0e-3;
+        let m = array![
+            [1.0, 1.0],
+            [1.0, 1.0 + delta],
+            [1.0, 1.0 + 2.0 * delta],
+            [1.0, 1.0 + 3.0 * delta]
+        ];
+        let z = fast_ab(&m, &array![[-1.0], [1.0]]);
+        let w = Array1::<f64>::ones(4);
+        let (n, p) = m.dim();
+        let gram = fast_xt_diag_x(&m, &w);
+        let (evals, evecs) = gram.eigh(Side::Lower).expect("Gram eigh");
+        let lambda_max = evals.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        let lambda_min = evals.iter().copied().fold(f64::INFINITY, f64::min);
+        // Non-vacuity: the near-collinear direction is resolvable, so it belongs
+        // to the span the projection has to remove.
+        let resolution =
+            accumulation_growth(n + 1) * gram.diag().sum() / lambda_max + p as f64 * f64::EPSILON;
+        assert!(
+            lambda_min > resolution * lambda_max,
+            "fixture direction is not resolvable: lambda_min={lambda_min:e}, band={:e}",
+            resolution * lambda_max
+        );
+        // First-order forward error of a projection through the normal
+        // equations: the Gram's relative resolution amplified by its condition.
+        let bar = (lambda_max / lambda_min) * resolution;
+        let z_scale = z.iter().fold(0.0_f64, |acc, &v| acc.max(v.abs()));
+        let leak = |residual: &Array2<f64>| {
+            residual.iter().fold(0.0_f64, |acc, &v| acc.max(v.abs())) / z_scale
+        };
+
+        let out = residualize_influence_columns(&z, m.view(), &w).expect("projection");
+        assert!(
+            leak(&out) <= bar,
+            "pseudo-inverse projection kept {:e} of an in-span Z (bar {bar:e})",
+            leak(&out)
+        );
+
+        // Control: the curvature-scaled ridge this projection replaced,
+        // `1e-10·max diag(MᵀWM)`, keeps the fraction ε/(λ_min + ε) ≈ 1.6e-4 of
+        // the same direction, which is the leak this fixture exists to detect.
+        let retired_ridge = 1.0e-10 * gram.diag().iter().copied().fold(0.0_f64, f64::max);
+        let mut ridged_inverse = Array2::<f64>::zeros((p, p));
+        for k in 0..p {
+            let scale = 1.0 / (evals[k] + retired_ridge);
+            for i in 0..p {
+                for j in 0..p {
+                    ridged_inverse[[i, j]] += scale * evecs[[i, k]] * evecs[[j, k]];
+                }
+            }
+        }
+        let ridged_coeffs = fast_ab(&ridged_inverse, &fast_xt_diag_y(&m, &w, &z));
+        let ridged = &z - &fast_ab(&m, &ridged_coeffs);
+        assert!(
+            leak(&ridged) > bar,
+            "control: the retired ridge kept only {:e} of the in-span Z (bar {bar:e})",
+            leak(&ridged)
+        );
+    }
+
     // ---- residualized_influence_block (end-to-end pure path) ----
 
     #[test]
     fn residualized_block_matches_manual_scale_then_residualize() {
         // The block builds Z_infl = diag(s_f·β̂₀)·J then residualizes against M in
-        // the W-metric with a Gram-scaled ridge. Reconstruct that path manually.
+        // the W-metric. Reconstruct that path manually.
         let raw_jac = array![[1.0, 0.5], [2.0, -1.0], [0.0, 3.0], [1.5, 1.0]];
         let oof_z = array![0.1, 0.2, 0.3, 0.4];
         let pilot = array![1.0, 2.0, -0.5, 0.5];
@@ -618,22 +695,16 @@ mod tests {
         let out =
             residualized_influence_block(&raw_jac, &oof_z, &pilot, s_f, m.view(), &w).unwrap();
 
-        // Manual: scale rows, derive eps from the weighted Gram diagonal, residualize.
+        // Manual: scale rows, then residualize.
         let jac = ScoreInfluenceJacobian {
             columns: raw_jac.clone(),
             z: oof_z.clone(),
         };
         let z_infl = influence_block_design(&jac, &pilot, s_f);
-        let gram = fast_xt_diag_x(&m, &w);
-        let gram_scale = (0..m.ncols()).map(|i| gram[[i, i]]).fold(0.0_f64, f64::max);
-        let eps = (gram_scale * INFLUENCE_PROJECTION_RELATIVE_RIDGE)
-            .max(INFLUENCE_PROJECTION_RIDGE_FLOOR);
-        let expected = residualize_influence_columns(&z_infl, m.view(), &w, eps);
+        let expected =
+            residualize_influence_columns(&z_infl, m.view(), &w).expect("projection");
 
-        assert_eq!(out.dim(), expected.dim());
-        for (a, b) in out.iter().zip(expected.iter()) {
-            assert!((a - b).abs() < 1e-12, "mismatch: {a} vs {b}");
-        }
+        assert_eq!(out, expected);
         // And the result is W-orthogonal to the marginal span.
         let mtwz = fast_xt_diag_y(&m, &w, &out);
         let max_abs = mtwz.iter().fold(0.0_f64, |acc, &v| acc.max(v.abs()));

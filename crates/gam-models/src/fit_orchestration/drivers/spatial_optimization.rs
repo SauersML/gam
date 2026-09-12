@@ -3985,7 +3985,7 @@ fn run_exact_joint_spatial_optimization(
         // BFGS threshold (aniso / multi-ψ).
         suppress_outer_hessian_for_nfree,
         seed_risk_profile_for_likelihood_family(&family),
-        kappa_options.rel_tol.max(1e-6),
+        kappa_options.rel_tol,
         kappa_options.max_outer_iter.max(1),
         // Rho-axis BFGS cap: log-λ's natural step is ≈ 5. Anything tighter
         // throttles BFGS on flat REML valleys.
@@ -7871,7 +7871,7 @@ where
         },
         disable_fixed_point,
         seed_risk_profile,
-        kappa_options.rel_tol.max(1e-6),
+        kappa_options.rel_tol,
         kappa_options.max_outer_iter.max(1),
         // Rho-axis cap: log-λ natural step ≈ 5.
         Some(5.0),

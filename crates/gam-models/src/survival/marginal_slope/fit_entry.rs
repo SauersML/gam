@@ -1528,7 +1528,7 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
         let psi_dim = setup.theta0().len() - setup.rho_dim();
         initial_family.outer_derivative_policy(&initial_blocks, psi_dim, options)
     };
-    let exact_spatial_outer_tol = kappa_options_ref.rel_tol.max(1e-6);
+    let exact_spatial_outer_tol = kappa_options_ref.rel_tol;
     let solved = optimize_spatial_length_scale_exact_joint(
         data,
         &[marginalspec_boot.clone(), slopespec_boot.clone()],
