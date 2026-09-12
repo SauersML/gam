@@ -52,17 +52,18 @@
 //!   automatically in-chart for any σ — the cap is purely about keeping the
 //!   conformal factor (hence the criterion conditioning) modest.
 //!
-//! * **Scale σ = 0.08, n = 4000 (recovery), n = 1500 (coverage/size).**
-//!   Curvature is HARD to resolve at small n: the κ-restoring force enters the
-//!   criterion as `+d·κ·Σ‖yᵢ‖²` with `‖yᵢ‖² = O(σ²)`, so the per-point Fisher
-//!   information for κ scales like `σ⁴`. To resolve κ⋆ = ±4 against finite-
-//!   sample noise the information `∝ n·σ⁴` must dominate; with σ = 0.08
-//!   (`σ⁴ ≈ 4e−5`) that means n in the low thousands — hence n = 4000 for the
-//!   point-recovery table and n = 1500 for the (many-seed) coverage/size loops
-//!   where wall-clock, not single-fit precision, is the binding constraint.
-//!   This `n·σ⁴` law is the resolvable-n threshold #944's power analysis asks
-//!   for: at σ = 0.08, |κ⋆| ≤ 4 needs n ≳ 1e3; halving σ quadruples the n
-//!   needed for the same |κ⋆|.
+//! * **Scale σ = 0.08; n from the information law (recovery), n = 1500
+//!   (coverage/size).** To leading order in σ one point's κ-score is
+//!   `‖y‖⁴/(3σ²)` (the chart radius is `r + κr³/3`). Projecting out the profiled
+//!   scale's score, which is linear in `X = ‖t‖²/σ² ~ χ²₂` (`E Xᵏ = k!·2ᵏ`), leaves
+//!   `Var X² − Cov(X², X)²/Var X = 320 − 32²/4 = 64`, so the information is `64σ⁴/9`
+//!   per point and `se(κ̂) = 3/(8σ²√n)`. At σ = 0.08, n = 4000 that is 0.93; job
+//!   505909 read 95% profile half-widths of 1.8–1.9 at every recovery-grid point.
+//!   The recovery test sizes n so its band is a family-wise bound. The coverage and
+//!   size loops test calibration, which holds at any n, so they keep n = 1500, where
+//!   the replicate count rather than single-fit precision is what matters. The
+//!   resolution scale is `|κ⋆|/se(κ̂) = |κ⋆|·8σ²√n/3`: halving σ needs 16× the n for
+//!   the same |κ⋆|.
 //!
 //! * **Tolerances (Monte-Carlo-se-anchored, not arbitrary).** Recovery bias is
 //!   O(1/n) plus an O(σ²) chart-curvature bias, so the band
@@ -179,7 +180,7 @@ const CHI2_1_95: f64 = 3.841_458_820_694_124; // χ²_{1, 0.95}
 /// (1) RECOVERY + INTERIOR + MONOTONICITY across the full κ⋆ grid.
 ///
 /// For each κ⋆ ∈ {−4,−2,−1,−0.5, 0, 0.5, 1, 2, 4} synthesise one large cloud
-/// (n = 4000) at a deterministic seed and fit κ̂. Assert κ̂ lands inside the
+/// from one shared tangent draw and fit κ̂. Assert κ̂ lands inside the
 /// chart bracket (not railed), recovers κ⋆ within the documented band, and the
 /// fit summary (CI bracketing κ̂, finite non-degenerate flatness p-value) is
 /// well-formed. Finally assert κ̂ is monotone non-decreasing in κ⋆ — the single
@@ -188,13 +189,29 @@ const CHI2_1_95: f64 = 3.841_458_820_694_124; // χ²_{1, 0.95}
 #[test]
 fn response_curvature_recovers_and_is_monotone_across_kappa_grid() {
     let k_grid: [f64; 9] = [-4.0, -2.0, -1.0, -0.5, 0.0, 0.5, 1.0, 2.0, 4.0];
-    let n = 4000usize;
+    // The recovery band's absolute floor: its tightest value, at κ⋆ = 0.
+    let band_floor = 0.9;
+    // n makes that floor a family-wise 95% bound over the grid under the information
+    // law (module header): the two-sided Bonferroni quantile over the nine points
+    // times se(κ̂) = 3/(8σ²√n) must not exceed it. At n = 4000 se ≈ 0.93, so the
+    // floor was one standard error; job 505909 read κ⋆ = 1 at κ̂ = −0.397, outside
+    // the band and inside its own 95% profile CI [−2.119, 1.530].
+    let family_alpha = (1.0 - LEVEL) / k_grid.len() as f64;
+    let family_z = gam::probability::standard_normal_quantile(1.0 - family_alpha / 2.0)
+        .expect("family-wise normal quantile");
+    let n = (3.0 * family_z / (8.0 * SIGMA * SIGMA * band_floor))
+        .powi(2)
+        .ceil() as usize;
     let mut k_hats = Vec::with_capacity(k_grid.len());
+    // One tangent draw for the whole grid (common random numbers). The estimator's
+    // leading-order error is then the same function of the draw at every κ⋆, so the
+    // monotonicity check compares κ̂ across κ⋆ at fixed noise. Independent draws
+    // would set se(κ̂)·√2 against the grid's 0.5 spacing instead.
+    let seed = 0x9444_0000_C0FF_EE01_u64;
 
     println!("\n#944 response-curvature recovery table (dim={DIM}, n={n}, σ={SIGMA}):");
     println!("   κ⋆        κ̂        bias      [CI_lo, CI_hi]      lr(κ=0)    p");
-    for (idx, &k_star) in k_grid.iter().enumerate() {
-        let seed = 0x9444_0000_C0FF_EE00 ^ ((idx as u64).wrapping_mul(0x1000_0001) + 1);
+    for &k_star in &k_grid {
         let values = synth_cloud(DIM, k_star, n, SIGMA, seed);
 
         // Recompute the bracket the estimator uses so the rail check matches the
@@ -225,7 +242,7 @@ fn response_curvature_recovers_and_is_monotone_across_kappa_grid() {
 
         // (b) RECOVERY within the documented O(1/n)+O(σ²) band (catches sign
         // flips / wrong-regime estimates without flaking on finite-sample bias).
-        let band = 0.9 + 0.35 * k_star.abs();
+        let band = band_floor + 0.35 * k_star.abs();
         assert!(
             (fit.kappa_hat - k_star).abs() <= band,
             "κ⋆={k_star}: κ̂={} outside recovery band ±{band:.3}",
@@ -566,48 +583,51 @@ fn bracket_via_criterion(values: ndarray::ArrayView2<'_, f64>) -> (f64, f64) {
 ///
 /// ## The defect this pins, stated so it can lose
 ///
-/// Curvature is resolvable only through the dimensionless product `κ·r²`, and the
-/// per-point Fisher information for κ scales like `σ⁴` (module header). At the
-/// small-spread negative-κ operating point the earlier recovery table uses
-/// (σ = 0.08, κ⋆ < 0 ⇒ `|κ·r²| ≈ 0.025`), a SINGLE cloud's profiled-criterion
-/// argmin κ̂ can land on the WRONG side of zero — empirically a coin-flip — and
-/// because the chart's spherical cap is the nearer bracket bound, that wrong
-/// landing rails toward `+κ`. That is the exact "rails to +1.9 for hyperbolic
-/// truth" behaviour the capstone reopening flags.
+/// Curvature is resolvable only through the resolution scale
+/// `h = |κ⋆|/se(κ̂) = |κ⋆|·8σ²√n/3` (module header). Below `h ≈ 1` a SINGLE cloud's
+/// profiled-criterion argmin κ̂ can land on the WRONG side of zero, and because the
+/// chart's spherical cap is the nearer bracket bound, that wrong landing rails
+/// toward `+κ`. That is the exact "rails to +1.9 for hyperbolic truth" behaviour
+/// the capstone reopening flags.
 ///
 /// The criterion is NOT biased: averaged over clouds it minimises at κ⋆ (the
 /// estimand is sound). The failure is a RESOLUTION limit. The honest fix is to
-/// (a) establish where κ·r² is large enough that the single-cloud point estimate
-/// is reliable, and (b) make the estimator REPORT when it is below that floor so a
-/// caller never quotes a sign-confident κ̂ on noise. This test asserts both, and
-/// asserts the estimator's CI is honest at the floor (it never confidently claims
-/// the WRONG geometry) — converting a silent rail into a reported finding.
+/// (a) establish where the single-cloud point estimate is reliable, and (b) make
+/// the estimator REPORT when it is below that floor so a caller never quotes a
+/// sign-confident κ̂ on noise. This test asserts both, and asserts the estimator's
+/// CI is honest at the floor (it confidently claims the WRONG geometry no more
+/// often than a 95% interval allows), converting a silent rail into a reported
+/// finding.
 ///
 /// ## What is asserted (all against self-constructed truth)
 ///
-///   * **RESOLVED band.** At a well-resolved hyperbolic operating point
-///     (`|κ·r²| ≳ 0.15`), single-cloud sign recovery is reliable across many
-///     seeds AND `sign_resolved = true` AND the CI verdict is `Hyperbolic` — the
-///     point estimate may be quoted with its sign.
-///   * **HONEST FLAT FLOOR.** At the under-resolved operating point
-///     (`|κ·r²| ≈ 0.025`, the recovery-table σ = 0.08 hyperbolic case), the
-///     estimator must FLAG `sign_resolved = false` on essentially every cloud
-///     (the point estimate's sign is noise) AND must NEVER return a CI that
-///     confidently claims the WRONG (spherical) sign. A single railed κ̂ > 0 is
-///     fine ONLY when `sign_resolved` is false — that is the rail made honest.
+///   * **RESOLVED band.** At a well-resolved hyperbolic operating point (`h = 8`),
+///     single-cloud sign recovery is reliable across many seeds AND
+///     `sign_resolved = true` AND the CI verdict is `Hyperbolic`, so the point
+///     estimate may be quoted with its sign.
+///   * **HONEST FLAT FLOOR.** At the under-resolved operating point (`h = ½`), the
+///     estimator must FLAG `sign_resolved = false` on the large majority of clouds
+///     (the point estimate's sign is noise). A positive κ̂ is quoted as resolved
+///     only through a confident spherical CI verdict, never as a separate silent
+///     surface, and those verdicts stay within the calibrated tolerance below.
 ///   * **MONOTONE POWER.** The fraction of clouds whose CI confidently resolves
-///     the (correct, hyperbolic) sign is monotone non-decreasing as `|κ·r²|` grows
-///     across a σ ladder — the power curve the #944 charter asks for.
+///     the (correct, hyperbolic) sign is monotone non-decreasing along the `h`
+///     ladder: the power curve the #944 charter asks for.
 #[test]
 fn response_curvature_sign_resolution_power_curve_and_honest_flat_floor() {
     let dim = DIM;
     let k_star = -2.0; // genuinely hyperbolic truth
     let n = 4000usize;
-    // A σ ladder straddling the resolution floor. σ = 0.08 is the recovery-table
-    // operating point where |κ·r²| ≈ 0.025 (the coin-flip / rail regime); σ = 0.20
-    // lifts |κ·r²| to ≈ 0.16 (reliably resolved). r ≈ 2·(spread) ≈ 2·1.4·σ on this
-    // isotropic cloud, so κ·r² ≈ k_star·(2.8σ)² grows quadratically in σ.
-    let sigmas = [0.08_f64, 0.12, 0.16, 0.20];
+    // The σ ladder sits on the resolution scale h = |κ⋆|·8σ²√n/3. At h = ½ a correct
+    // 95% CI excludes zero on about 8% of clouds; at h = 8 on essentially all. Job
+    // 505909 read the former first rung σ = 0.08 (h ≈ 2.2) at a 0.667 resolved rate
+    // with a correct sign on 0.958 of clouds and no confident wrong sign; the law
+    // puts ≈ 0.58 there, so that rung was never an information floor.
+    let resolution_ladder = [0.5_f64, 2.0, 4.0, 8.0];
+    let sigmas: Vec<f64> = resolution_ladder
+        .iter()
+        .map(|&h| (3.0 * h / (8.0 * k_star.abs() * (n as f64).sqrt())).sqrt())
+        .collect();
     let reps = 24usize;
 
     println!(
@@ -656,16 +676,20 @@ fn response_curvature_sign_resolution_power_curve_and_honest_flat_floor() {
                     fit.kappa_hat, fit.profile_ci.ci_lo, fit.profile_ci.ci_hi
                 );
             }
-            // The CORE honesty contract: whenever the bare point estimate rails to the
-            // WRONG (positive) sign, the estimator MUST have flagged the sign as
-            // unresolved — never a silent sign-confident κ̂ > 0 on hyperbolic data.
-            if fit.kappa_hat > 0.0 {
+            // The CORE honesty contract: a positive point estimate on hyperbolic truth is
+            // quoted as resolved only through a confident SPHERICAL CI verdict, which is
+            // counted above against the calibrated tolerance. The #1059/#977 defect is
+            // the silent form: a wrong-signed κ̂ flagged resolved while the CI says
+            // otherwise. A calibrated 95% interval confidently resolves the wrong sign on
+            // Φ(−h − 1.96) of clouds (≈ 0.7% at h = ½), so a per-cloud "never" is not a
+            // property any correct estimator has at the information floor.
+            if fit.kappa_hat > 0.0 && fit.sign_resolved {
                 assert!(
-                    !fit.sign_resolved,
-                    "SILENT RAIL: κ̂={} railed positive on hyperbolic truth (κ⋆={k_star}, \
-                     σ={sigma}, κ·r²={:.4}) yet sign_resolved=true — the #1059/#977 defect: a \
-                     wrong-signed point estimate quoted as resolved",
-                    fit.kappa_hat, fit.kappa_r2
+                    matches!(fit.profile_ci.verdict, CurvatureVerdict::Spherical),
+                    "SILENT RAIL: κ̂={} positive on hyperbolic truth (κ⋆={k_star}, σ={sigma}, \
+                     κ·r²={:.4}) is flagged sign_resolved=true, but its CI [{:.4},{:.4}] is \
+                     not a spherical verdict: a wrong-signed point estimate quoted as resolved",
+                    fit.kappa_hat, fit.kappa_r2, fit.profile_ci.ci_lo, fit.profile_ci.ci_hi
                 );
             }
         }
@@ -690,32 +714,32 @@ fn response_curvature_sign_resolution_power_curve_and_honest_flat_floor() {
         );
     }
 
-    // ── HONEST FLAT FLOOR at the recovery-table operating point σ = 0.08. ──────
-    // This is the exact "rails to +κ for hyperbolic truth" regime: the TYPICAL
-    // point's geodesic spread is far below the curvature information floor (the
-    // per-point Fisher information ∝ σ⁴), so a single cloud's argmin κ̂ flips sign
-    // on noise. The estimator must DECLINE to resolve the sign on the large
-    // majority of clouds here — `sign_resolved = false` dominates — rather than
-    // quote a sign-confident κ̂ on noise. A minority of genuinely-resolved clouds is
-    // fine; what is forbidden is the estimator PRETENDING it can resolve the sign
-    // when it cannot. (Note: the REPORTED `kappa_r2` uses the cloud's MAX geodesic
-    // radius, so its magnitude is not tiny even here — resolution is set by the
-    // TYPICAL spread, which the CI width, hence `sign_resolved`, measures directly.
-    // We therefore key the floor on the resolution RATE, not a κ·r² threshold.)
+    // ── HONEST FLAT FLOOR at h = ½. ─────────────────────────────────────────────
+    // This is the "rails to +κ for hyperbolic truth" regime: |κ⋆| is half a standard
+    // error, so a single cloud's argmin κ̂ flips sign on noise. The estimator must
+    // DECLINE to resolve the sign on the large majority of clouds here
+    // (`sign_resolved = false` dominates) rather than quote a sign-confident κ̂ on
+    // noise. A calibrated interval resolves ≈ 8% of clouds at this rung; what is
+    // forbidden is the estimator PRETENDING it can resolve the sign when it cannot.
+    // (The REPORTED `kappa_r2` uses the cloud's MAX geodesic radius, so it is not a
+    // resolution measure; the CI width, hence `sign_resolved`, is. The floor is
+    // therefore keyed on the resolution RATE, not a κ·r² threshold.)
     let (_floor_kr2, floor_resolved_rate) = resolved_rates[0];
     assert!(
         floor_resolved_rate <= 0.40,
-        "HONESTY FAIL: at the under-resolved floor (σ=0.08) the estimator flagged \
+        "HONESTY FAIL: at the under-resolved floor (h=½, σ={:.4}) the estimator flagged \
          sign_resolved=true on {:.0}% of clouds — it must DECLINE to resolve the sign at the \
          information floor, not quote a sign on noise",
+        sigmas[0],
         100.0 * floor_resolved_rate
     );
 
-    // ── RESOLVED band at σ = 0.20: the sign becomes reliably resolvable. ───────
+    // ── RESOLVED band at h = 8: the sign becomes reliably resolvable. ──────────
     // Above the floor the estimator must EARN its point estimate: a clear majority
     // of clouds resolve the (correct) sign, demonstrating the flag is not vacuously
-    // always false. This is the right end of the power curve (observed ≈ 0.88; the
-    // 0.55 bar leaves wide Monte-Carlo slack while staying far above the floor).
+    // always false. This is the right end of the power curve (a calibrated interval
+    // resolves essentially every cloud at h = 8; the 0.55 bar leaves wide Monte-Carlo
+    // slack while staying far above the floor).
     let (_top_kr2, top_resolved_rate) = *resolved_rates.last().unwrap();
     assert!(
         top_resolved_rate >= 0.55,
