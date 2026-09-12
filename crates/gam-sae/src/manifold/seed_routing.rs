@@ -1241,6 +1241,108 @@ mod tests {
         );
     }
 
+    /// #2280 acceptance — planted Möbius band: the holonomy sign is detected, and
+    /// handing the band to automatic discovery reproduces the existing
+    /// deck-invariant seed.
+    ///
+    /// Recognition runs on the band and on its matched cylinder, sampled on the same
+    /// `(u, v)` grid: every nerve invariant must agree between the two and the
+    /// verdicts must still differ, so the orientation class is what separates them.
+    ///
+    /// The handoff is `atom_basis = "auto"` (the evidence race with the atlas prior,
+    /// `resolve_auto_primary_atoms`, the minimal seed) against an explicit `"mobius"`
+    /// request on the same rows. Both must build the identical geometry plan,
+    /// coordinates and decoder. The joint fit is a deterministic function of that
+    /// seed, so identical seeds are identical fits.
+    #[test]
+    fn planted_mobius_band_holonomy_hands_off_to_the_deck_invariant_seed_2280() {
+        use crate::manifold::tests_topology_fixtures::{cylinder_strip, mobius_strip};
+        use crate::manifold::{
+            GraphCompressionKind, LocalAtlas, LocalAtlasConfig, SaeFitAssignmentKind,
+            SaeMinimalSeedRequest, build_sae_minimal_seed, observe_atlas_topology,
+        };
+
+        let (n_u, n_v) = (60usize, 14usize);
+        let band = mobius_strip(n_u, n_v);
+        let read = |z: &Array2<f64>| {
+            let atlas = LocalAtlas::build(z.view(), LocalAtlasConfig::balanced(z.nrows(), 2))
+                .expect("a planted band's atlas builds");
+            observe_atlas_topology(&atlas).expect("a planted band's readout computes")
+        };
+        let band_readout = read(&band);
+        let cylinder_readout = read(&cylinder_strip(n_u, n_v));
+        let seed = |basis: &str| match build_sae_minimal_seed(SaeMinimalSeedRequest {
+            target: band.view(),
+            atom_basis: vec![basis.to_string()],
+            atom_dim: vec![2],
+            assignment_kind: SaeFitAssignmentKind::Softmax,
+            alpha: 1.0,
+            tau: 1.0,
+            threshold: 0.0,
+            top_k: None,
+            random_state: 0,
+            initial_logits: None,
+            initial_coords: None,
+        }) {
+            Ok(report) => report,
+            Err(error) => panic!("the {basis} seed of the planted band must build: {error}"),
+        };
+        let automatic = seed("auto");
+        let explicit = seed("mobius");
+        eprintln!("[2280-mobius] band:     {band_readout}");
+        eprintln!("[2280-mobius] cylinder: {cylinder_readout}");
+        eprintln!(
+            "[2280-mobius] auto plan {:?} | explicit plan {:?}",
+            automatic.geometry_plans, explicit.geometry_plans
+        );
+
+        assert_eq!(
+            band_readout.observed_manifold(),
+            Some(GraphCompressionKind::MobiusStrip),
+            "{band_readout}"
+        );
+        assert_eq!(
+            cylinder_readout.observed_manifold(),
+            Some(GraphCompressionKind::Cylinder),
+            "{cylinder_readout}"
+        );
+        let (twisted, orientable) = (band_readout.invariants(), cylinder_readout.invariants());
+        assert_eq!(
+            (
+                twisted.betti.b0,
+                twisted.betti.b1,
+                twisted.betti.b2,
+                twisted.euler_characteristic
+            ),
+            (
+                orientable.betti.b0,
+                orientable.betti.b1,
+                orientable.betti.b2,
+                orientable.euler_characteristic
+            ),
+            "the band and its cylinder must share every nerve invariant, so only the \
+             holonomy class separates them: band={band_readout} cylinder={cylinder_readout}"
+        );
+        assert!(
+            !band_readout.twisted_edges().is_empty() && cylinder_readout.twisted_edges().is_empty(),
+            "the band must carry an irreducible orientation reversal and the cylinder none: \
+             band={band_readout} cylinder={cylinder_readout}"
+        );
+
+        assert_eq!(
+            automatic.geometry_plans, explicit.geometry_plans,
+            "automatic discovery must hand the band to the deck-invariant Möbius plan"
+        );
+        assert_eq!(
+            automatic.initial_coords, explicit.initial_coords,
+            "automatic discovery must install the double-cover chart the explicit Möbius seed builds"
+        );
+        assert_eq!(
+            automatic.decoder_coefficients, explicit.decoder_coefficients,
+            "identical plan and chart must give the identical decoder seed"
+        );
+    }
+
     /// Regression test for issue #174: the joint LSQ seed for K=2 ordered Beta--Bernoulli
     /// must produce a non-zero decoder and a residual smaller than the
     /// trivial zero-decoder baseline. Without this seed the joint Newton

@@ -9288,6 +9288,75 @@ mod tests_atlas_prior_2280 {
         println!("{sweep}");
     }
 
+    /// #2280 acceptance — planted circle, torus and sphere: the atlas's recognition
+    /// agrees with the evidence race's winner.
+    ///
+    /// Each cell is read two independent ways on the same rows: the atlas
+    /// (`LocalAtlas` → `observe_atlas_topology`, no seed and no menu), and the
+    /// unprimed fixed-menu REML race on the global-linear seed with the ambient basis
+    /// threaded, exactly as `atlas_versus_fixed_menu_on_the_planted_zoo_2280` races
+    /// it. The race must name the planted truth, the atlas must never name anything
+    /// else, and on the cells flagged for agreement the two must name the same
+    /// manifold.
+    #[test]
+    fn planted_circle_torus_sphere_recognition_agrees_with_the_race_2280() {
+        use crate::manifold::tests_topology_fixtures::{sphere, torus};
+
+        // (label, planted rows, chart rank, truth, agreement required)
+        let cells: Vec<(&str, Array2<f64>, usize, AutoTopologyKind, bool)> = vec![
+            ("circle", circle(400, 2.0), 1, AutoTopologyKind::Circle, true),
+            ("sphere", sphere(900), 2, AutoTopologyKind::Sphere, true),
+            ("torus_90x45", torus(90, 45, 3.0, 1.5), 2, AutoTopologyKind::Torus, true),
+            ("torus_60x30", torus(60, 30, 3.0, 1.5), 2, AutoTopologyKind::Torus, false),
+            ("torus_30x20", torus(30, 20, 3.0, 1.0), 2, AutoTopologyKind::Torus, false),
+        ];
+        let mut table = String::from(
+            "\n#2280 acceptance: atlas recognition vs the evidence race\n\
+             cell          d  truth        atlas          race\n",
+        );
+        let mut failures: Vec<String> = Vec::new();
+        for (label, target, d, truth, agreement_required) in &cells {
+            let weights = Array1::<f64>::ones(target.nrows());
+            let seed = global_linear_seed(target.view(), target.ncols().min(4).max(*d));
+            let readout = atlas_prior_for_coords(target.view(), *d);
+            let atlas_kind = readout
+                .as_ref()
+                .and_then(|observed| observed.observed_manifold())
+                .and_then(observed_kind_to_auto_topology);
+            let menu = topology_candidates_for_dim(
+                CandidateBases::with_ambient(seed.view(), target.view()),
+                *d,
+            )
+            .expect("the planted cell's menu builds");
+            let race_kind = race_spec_set(menu, target.view(), weights.view(), None)
+                .expect("the planted cell must not error the race")
+                .and_then(|outcome| outcome.ranking.first().map(|entry| entry.kind));
+            table.push_str(&format!(
+                "{label:<13} {d}  {truth:<12?} {:<14} {:<14}\n  readout: {}\n",
+                atlas_kind.map_or("REFUSED".to_string(), |kind| format!("{kind:?}")),
+                race_kind.map_or("REFUSED".to_string(), |kind| format!("{kind:?}")),
+                readout
+                    .as_ref()
+                    .map_or("atlas did not build".to_string(), |observed| observed.to_string()),
+            ));
+            if let Some(kind) = atlas_kind
+                && !names_truth(kind, *truth)
+            {
+                failures.push(format!("{label}: the atlas misnamed {kind:?}, planted {truth:?}"));
+            }
+            if !race_kind.is_some_and(|kind| names_truth(kind, *truth)) {
+                failures.push(format!("{label}: the race named {race_kind:?}, planted {truth:?}"));
+            }
+            if *agreement_required && atlas_kind != race_kind {
+                failures.push(format!(
+                    "{label}: the atlas named {atlas_kind:?} but the race named {race_kind:?}"
+                ));
+            }
+        }
+        println!("{table}");
+        assert!(failures.is_empty(), "{table}\n{failures:#?}");
+    }
+
     /// #2280 — the `swiss_roll(80, 16)` spurious-`b₁` localizer, now certifying that
     /// no carrier is left to name.
     ///

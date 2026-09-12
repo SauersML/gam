@@ -19,7 +19,7 @@
 //! [`sae_intrinsic_seed_initial_coords`] and its end-to-end auto-seed path.
 
 use super::*;
-use gam_linalg::faer_ndarray::{FaerCholesky, fast_ata, fast_atb};
+use gam_linalg::faer_ndarray::{FaerCholesky, FaerSvd, fast_ata, fast_atb};
 use ndarray::{Array2, Array3};
 
 /// fable-mobius's deterministic ~2-turn swiss-roll grid in R³ (no RNG): a flat
@@ -169,6 +169,121 @@ fn swiss_roll_auto_seed_propagates_unfolded_coords_end_to_end() {
         "the auto-seed path must install the UNFOLDED geodesic chart as the final \
          seed coords (the intrinsic race winner must reach the coordinates, not just \
          the kind); held-out R²={r2}"
+    );
+}
+
+/// The planted isometric chart of the shared zoo's `swiss_roll`, read off its own
+/// rows. The zoo rolls the sheet as `(t cos t, t sin t, h)` with `t ≥ 1`, so each
+/// row's radius is its `t` and its third coordinate is its `h`; the unrolled sheet
+/// is arclength along the rolled curve, whose speed is `√(1 + t²)` and whose
+/// arclength is `½(t√(1 + t²) + asinh t)` in closed form.
+fn zoo_swiss_roll_unrolled_chart(z: &Array2<f64>) -> Array2<f64> {
+    let arclength = |t: f64| 0.5 * (t * (1.0 + t * t).sqrt() + t.asinh());
+    Array2::from_shape_fn((z.nrows(), 2), |(row, axis)| {
+        if axis == 0 {
+            arclength(z[[row, 0]].hypot(z[[row, 1]]))
+        } else {
+            z[[row, 2]]
+        }
+    })
+}
+
+/// The global-linear seed's chart: the two leading principal projections.
+fn leading_principal_chart(z: &Array2<f64>) -> Array2<f64> {
+    let mean = z
+        .mean_axis(ndarray::Axis(0))
+        .expect("the planted roll has at least one row");
+    let centered = z - &mean;
+    let (_u, _s, vt) = centered
+        .svd(false, true)
+        .expect("the planted roll's principal frame exists");
+    let vt = vt.expect("the SVD returns the right frame it was asked for");
+    centered.dot(&vt.slice(ndarray::s![0..2, ..]).t())
+}
+
+/// #2280 acceptance — planted swiss roll (1.5 turns): recognized as a sheet, with
+/// unrolled coordinates whose held-out reconstruction matches an oracle unrolled
+/// fit, and no roll-specific code on the path.
+///
+/// The fixture is the shared zoo's `swiss_roll`, whose `t` sweeps 1.5 turns.
+/// Recognition is the atlas readout, which must name `Disk`. Three charts are then
+/// scored through the SAME held-out thin-plate decoder: the ORACLE (the planted
+/// isometric chart, unrolled by construction), the GLOBAL-LINEAR seed (the two
+/// leading principal projections, which fold the windings onto each other), and the
+/// AUTOMATIC seed (`"auto"` through discovery, the evidence race and the minimal
+/// seed).
+///
+/// "Matching the oracle" is decided between the two measured arms rather than
+/// against a chosen bar: the automatic chart's held-out residual fraction must lie
+/// nearer the oracle's than the linear seed's on the log scale, i.e. below their
+/// geometric mean. Residual fractions span orders of magnitude, which is why the log
+/// scale is the one on which "nearer" is free of units. The oracle's residual must
+/// itself be below the linear seed's, or the roll is not folded for the linear seed
+/// and the comparison measures nothing.
+#[test]
+fn planted_swiss_roll_is_a_sheet_with_unrolled_coordinates_2280() {
+    for (n_t, n_h) in [(30usize, 12usize), (40, 12), (60, 14), (80, 16), (100, 20)] {
+        let z = super::tests_topology_fixtures::swiss_roll(n_t, n_h);
+        match LocalAtlas::build(z.view(), LocalAtlasConfig::balanced(z.nrows(), 2)) {
+            Ok(atlas) => match observe_atlas_topology(&atlas) {
+                Ok(readout) => eprintln!("[2280-swiss] {n_t}x{n_h}: {readout}"),
+                Err(error) => eprintln!("[2280-swiss] {n_t}x{n_h}: readout errored: {error}"),
+            },
+            Err(error) => eprintln!("[2280-swiss] {n_t}x{n_h}: build refused: {error:?}"),
+        }
+    }
+
+    let z = super::tests_topology_fixtures::swiss_roll(80, 16);
+    let readout = observe_atlas_topology(
+        &LocalAtlas::build(z.view(), LocalAtlasConfig::balanced(z.nrows(), 2))
+            .expect("the planted roll's atlas builds"),
+    )
+    .expect("the planted roll's readout computes");
+    let report = build_sae_minimal_seed(SaeMinimalSeedRequest {
+        target: z.view(),
+        atom_basis: vec!["auto".to_string()],
+        atom_dim: vec![2],
+        assignment_kind: SaeFitAssignmentKind::Softmax,
+        alpha: 1.0,
+        tau: 1.0,
+        threshold: 0.0,
+        top_k: None,
+        random_state: 0,
+        initial_logits: None,
+        initial_coords: None,
+    })
+    .expect("the automatic seed of the planted roll builds");
+    let residual = |chart: &Array2<f64>| 1.0 - heldout_tps_r2(chart, &z);
+    let oracle = residual(&zoo_swiss_roll_unrolled_chart(&z));
+    let linear = residual(&leading_principal_chart(&z));
+    let automatic = residual(&chart_of(&report.initial_coords, 0));
+    let boundary = (oracle * linear).sqrt();
+    eprintln!(
+        "[2280-swiss] 80x16 held-out residual fraction: oracle={oracle:.4e} linear={linear:.4e} \
+         automatic={automatic:.4e} boundary={boundary:.4e} automatic plan={:?}",
+        report.geometry_plans[0]
+    );
+
+    assert_eq!(
+        readout.observed_manifold(),
+        Some(GraphCompressionKind::Disk),
+        "a rolled flat sheet must be recognized as a sheet: {readout}"
+    );
+    assert!(
+        oracle < linear,
+        "the linear seed must fold the roll (oracle residual {oracle:.4e} vs linear \
+         {linear:.4e}), or this comparison measures nothing"
+    );
+    assert_eq!(
+        report.geometry_plans[0].latent_dim(),
+        2,
+        "a swiss roll is an intrinsically 2-D sheet; auto discovery must resolve d=2"
+    );
+    assert!(
+        automatic < boundary,
+        "the automatic chart must reconstruct held-out rows nearer the oracle unrolled \
+         chart than the folded linear seed: automatic {automatic:.4e}, oracle {oracle:.4e}, \
+         linear {linear:.4e}, geometric-mean boundary {boundary:.4e}"
     );
 }
 
