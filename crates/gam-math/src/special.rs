@@ -19,8 +19,8 @@ pub fn binomial_coefficient_f64(n: usize, k: usize) -> f64 {
     }
     let k_eff = k.min(n - k);
     // Carry the recurrence in u128, not f64. At step `j` the running product
-    // equals the integer `C(n, j)`, which is always divisible by the next
-    // denominator `(j + 1)` (the partial product of `(j+1)` consecutive
+    // equals the integer `C(n, j)`. After multiplying by `n-j`, the product
+    // is divisible by the next denominator `(j + 1)` (the product of `(j+1)` consecutive
     // integers `(n−j)…(n)` is divisible by `(j+1)!`), so each integer division
     // is exact and no rounding accumulates. The earlier all-`f64` recurrence
     // divided in floating point, where `(n−j)/(j+1)` is generally inexact, and
@@ -32,12 +32,19 @@ pub fn binomial_coefficient_f64(n: usize, k: usize) -> f64 {
         match num.checked_mul((n - j) as u128) {
             Some(scaled) => num = scaled / (j as u128 + 1),
             None => {
-                // The true coefficient overflows u128 — astronomically above
-                // `2^53`, where the exactness contract no longer applies.
+                // The intermediate product overflows u128; the coefficient
+                // is already above `2^53`, where the exactness contract no longer applies.
                 // Finish the (now necessarily inexact) recurrence in f64.
                 let mut out = num as f64;
                 for jj in j..k_eff {
-                    out = out * (n - jj) as f64 / (jj + 1) as f64;
+                    // Divide the integer factors first: the unscaled product
+                    // can overflow even when the coefficient is finite.
+                    out *= (n - jj) as f64 / (jj + 1) as f64;
+                    if out.is_infinite() {
+                        // Coefficients increase up to n/2, so every remaining
+                        // step would also be infinite.
+                        return out;
+                    }
                 }
                 return out;
             }
@@ -721,10 +728,13 @@ pub fn xlogy(x: f64, y: f64) -> f64 {
 /// `-∞` when both arguments are `-∞`.
 #[inline]
 pub fn logaddexp(a: f64, b: f64) -> f64 {
+    if a.is_nan() || b.is_nan() {
+        return f64::NAN;
+    }
     let hi = a.max(b);
     let lo = a.min(b);
-    if hi == f64::NEG_INFINITY {
-        f64::NEG_INFINITY
+    if hi.is_infinite() {
+        hi
     } else {
         hi + (lo - hi).exp().ln_1p()
     }
@@ -735,6 +745,9 @@ pub fn logaddexp(a: f64, b: f64) -> f64 {
 /// cancel against `x`; beyond that `exp_m1` is accurate on its own.
 #[inline]
 pub fn expm1_minus_x(x: f64) -> f64 {
+    if !x.is_finite() {
+        return x.abs();
+    }
     if x.abs() > 0.5 {
         return x.exp_m1() - x;
     }
@@ -756,6 +769,9 @@ pub fn expm1_minus_x(x: f64) -> f64 {
 /// same small-argument series treatment as [`expm1_minus_x`].
 #[inline]
 pub fn log1p_minus_x(x: f64) -> f64 {
+    if x.is_nan() || x == f64::INFINITY {
+        return -x;
+    }
     if x.abs() > 0.5 {
         return x.ln_1p() - x;
     }
@@ -779,15 +795,30 @@ pub fn log1p_minus_x(x: f64) -> f64 {
 /// `x = 0` and summed as a series for `|x| ≤ 1/2`.
 #[inline]
 pub fn exprel(x: f64) -> f64 {
-    if x == 0.0 {
-        return 1.0;
+    if x.is_nan() || x == f64::INFINITY {
+        return x;
+    }
+    if x > 700.0 {
+        // Divide before the second multiplication: exp(x) can overflow
+        // while exp(x)/x is still representable. The omitted 1/x is far
+        // below one ulp in this branch.
+        let half_exp = (0.5 * x).exp();
+        return (half_exp / x) * half_exp;
     }
     if x.abs() > 0.5 {
         return x.exp_m1() / x;
     }
-    let mut term = 1.0;
+    1.0 + exprel_minus_one_small(x)
+}
+
+/// The nonconstant Taylor terms of exprel for finite `|x| <= 1/2`.
+/// Keeping the leading one out of the sum lets log_exprel use log1p
+/// without erasing its first-order term near zero.
+#[inline]
+fn exprel_minus_one_small(x: f64) -> f64 {
+    let mut term = 0.5 * x;
     let mut sum = term;
-    let mut k = 1.0;
+    let mut k = 2.0;
     loop {
         k += 1.0;
         term *= x / k;
@@ -803,10 +834,10 @@ pub fn exprel(x: f64) -> f64 {
 /// exponential of a positive argument is ever formed.
 #[inline]
 pub fn log_exprel(x: f64) -> f64 {
-    if x == 0.0 {
-        0.0
+    if !x.is_finite() {
+        x
     } else if x.abs() <= 0.5 {
-        exprel(x).ln()
+        exprel_minus_one_small(x).ln_1p()
     } else if x > 0.0 {
         x + (-(-x).exp()).ln_1p() - x.ln()
     } else {
@@ -963,6 +994,59 @@ pub fn scaled_positive_product_quotient(a: f64, b: f64, c: f64, d: f64) -> f64 {
 #[cfg(test)]
 mod exponential_family_kernel_tests {
     use super::*;
+
+    #[test]
+    fn log_exprel_preserves_small_arguments_and_reflection() {
+        for x in [1e-8_f64, 1e-16, 1e-100, 1e-300] {
+            for sign in [-1.0, 1.0] {
+                let argument = sign * x;
+                let expected = argument * 0.5 + argument * argument / 24.0;
+                let got = log_exprel(argument);
+                assert!((got / expected - 1.0).abs() < 4.0 * f64::EPSILON,
+                    "x={argument}: got {got}, expected {expected}");
+            }
+            let difference = log_exprel(x) - log_exprel(-x);
+            assert!((difference / x - 1.0).abs() < 4.0 * f64::EPSILON);
+        }
+    }
+
+    #[test]
+    fn exprel_remains_finite_after_the_unscaled_exponential_overflows() {
+        for x in [710.0_f64, 712.0, 716.0] {
+            let got = exprel(x);
+            assert!(got.is_finite() && got > 0.0, "x={x}: {got}");
+            assert!((got.ln() - log_exprel(x)).abs() < 2e-13);
+            // exprel(x) = exp(x/2) * (exprel(x/2) + exprel(-x/2)) / 2.
+            let half = x * 0.5;
+            let expected = half.exp() * (0.5 * exprel(half) + 0.5 * exprel(-half));
+            assert!((got / expected - 1.0).abs() < 4.0 * f64::EPSILON);
+        }
+        assert_eq!(exprel(717.0), f64::INFINITY);
+    }
+
+    #[test]
+    fn exponential_family_kernels_have_correct_infinite_limits() {
+        assert_eq!(expm1_minus_x(f64::INFINITY), f64::INFINITY);
+        assert_eq!(expm1_minus_x(f64::NEG_INFINITY), f64::INFINITY);
+        assert_eq!(log1p_minus_x(f64::INFINITY), f64::NEG_INFINITY);
+        assert_eq!(exprel(f64::INFINITY), f64::INFINITY);
+        assert_eq!(exprel(f64::NEG_INFINITY), 0.0);
+        assert_eq!(log_exprel(f64::INFINITY), f64::INFINITY);
+        assert_eq!(log_exprel(f64::NEG_INFINITY), f64::NEG_INFINITY);
+        assert_eq!(logaddexp(f64::INFINITY, f64::INFINITY), f64::INFINITY);
+    }
+
+    #[test]
+    fn exponential_family_kernels_propagate_nan() {
+        assert!(expm1_minus_x(f64::NAN).is_nan());
+        assert!(log1p_minus_x(f64::NAN).is_nan());
+        assert!(exprel(f64::NAN).is_nan());
+        assert!(log_exprel(f64::NAN).is_nan());
+        for x in [0.0, f64::INFINITY, f64::NEG_INFINITY] {
+            assert!(logaddexp(f64::NAN, x).is_nan());
+            assert!(logaddexp(x, f64::NAN).is_nan());
+        }
+    }
 
     #[test]
     fn softplus_and_logistic_agree_with_their_definitions_away_from_the_tails() {
@@ -1921,6 +2005,15 @@ mod tests {
         // The u128-recurrence fix restored this value (old f64 recurrence
         // returned 1_402_659_561_581_459, one short of the true integer).
         assert_eq!(binomial_coefficient_f64(54, 24), 1_402_659_561_581_460.0);
+    }
+
+    #[test]
+    fn binom_large_finite_row_sums_to_the_binomial_theorem() {
+        let total: f64 = (0..=1023).map(|k| binomial_coefficient_f64(1023, k)).sum();
+        let expected = f64::from_bits(2046_u64 << 52); // 2^1023
+        assert!((total / expected - 1.0).abs() < 2e-14, "row sum={total:e}");
+        assert!(binomial_coefficient_f64(1029, 514).is_finite());
+        assert_eq!(binomial_coefficient_f64(1030, 515), f64::INFINITY);
     }
 
     #[test]
