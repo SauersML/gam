@@ -2149,11 +2149,12 @@ fn hybrid_efs_backtracking_uses_half_step_after_first_rejection() {
         seed_fn: None::<fn(&mut (), &Array1<f64>) -> Result<SeedOutcome, EstimationError>>,
         terminal_eval_order: None,
     };
+    let config = OuterConfig::default();
     let mut bridge = OuterFixedPointBridge {
         obj: &mut obj,
         layout: cap.theta_layout(),
         barrier_config: None,
-        fixed_point_tolerance: 1e-8,
+        config: &config,
         evaluated_inner_seed: Arc::new(Mutex::new(None)),
         consecutive_psi_zero_iters: 0,
         last_restored_incumbent_streak: None,
@@ -2229,11 +2230,12 @@ fn hybrid_efs_backtracking_propagates_fatal_cost_failure() {
         seed_fn: None::<fn(&mut (), &Array1<f64>) -> Result<SeedOutcome, EstimationError>>,
         terminal_eval_order: None,
     };
+    let config = OuterConfig::default();
     let mut bridge = OuterFixedPointBridge {
         obj: &mut obj,
         layout: cap.theta_layout(),
         barrier_config: None,
-        fixed_point_tolerance: 1.0e-8,
+        config: &config,
         evaluated_inner_seed: Arc::new(Mutex::new(None)),
         consecutive_psi_zero_iters: 0,
         last_restored_incumbent_streak: None,
@@ -2309,11 +2311,12 @@ fn fixed_point_stops_on_second_consecutive_restored_incumbent_2241() {
         seed_fn: None::<fn(&mut usize, &Array1<f64>) -> Result<SeedOutcome, EstimationError>>,
         terminal_eval_order: None,
     };
+    let config = OuterConfig::default();
     let mut bridge = OuterFixedPointBridge {
         obj: &mut obj,
         layout: cap.theta_layout(),
         barrier_config: None,
-        fixed_point_tolerance: 1.0e-8,
+        config: &config,
         evaluated_inner_seed: Arc::new(Mutex::new(None)),
         consecutive_psi_zero_iters: 0,
         last_restored_incumbent_streak: None,

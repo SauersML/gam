@@ -3974,7 +3974,9 @@ pub(crate) struct OuterFixedPointBridge<'a> {
     pub(crate) obj: &'a mut dyn OuterObjective,
     pub(crate) layout: OuterThetaLayout,
     pub(crate) barrier_config: Option<BarrierConfig>,
-    pub(crate) fixed_point_tolerance: f64,
+    /// The outer configuration: the ψ stall guard reads the certificate band
+    /// it applies at a point's cost (#2817).
+    pub(crate) config: &'a super::run::OuterConfig,
     /// Exact coefficient state produced by the most recent finite EFS
     /// evaluation, bound to the outer coordinate that produced it.
     ///
@@ -4006,8 +4008,18 @@ pub(crate) struct OuterFixedPointBridge<'a> {
 }
 
 impl OuterFixedPointBridge<'_> {
+    /// Refuse a HybridEFS iterate whose ψ block has stopped moving while its
+    /// gradient has not.
+    ///
+    /// "Stopped moving" is the map's own arithmetic: every ψ component of the
+    /// step is at or below `√ε·(1 + |ψ_i|)`, below which a proposal computed from
+    /// traces and logs cannot be told from roundoff. "Has not" is the
+    /// certificate's standard, the band `outer_stationarity_band_and_rung_at`
+    /// applies at this cost. Both used to be the absolute `config.tolerance`,
+    /// a raw gradient bound applied in step currency as well (#2817).
     fn reject_nonstationary_tiny_psi_step(
         &self,
+        x: &Array1<f64>,
         step: &Array1<f64>,
         psi_indices: Option<&[usize]>,
         psi_gradient: Option<&Array1<f64>>,
@@ -4019,18 +4031,23 @@ impl OuterFixedPointBridge<'_> {
         let Some(psi_gradient) = psi_gradient else {
             return Ok(());
         };
-        let psi_step_inf = psi_indices
+        let psi_step_at_resolution = psi_indices
             .iter()
-            .map(|&idx| step[idx].abs())
-            .fold(0.0_f64, f64::max);
+            .all(|&idx| step[idx].abs() <= f64::EPSILON.sqrt() * (1.0 + x[idx].abs()));
         let psi_grad_inf = psi_gradient.iter().map(|v| v.abs()).fold(0.0_f64, f64::max);
-        if psi_step_inf <= self.fixed_point_tolerance && psi_grad_inf > self.fixed_point_tolerance {
+        let band = super::run::outer_stationarity_band_and_rung_at(self.config, cost).bound;
+        if psi_step_at_resolution && psi_grad_inf > band {
+            let psi_step_inf = psi_indices
+                .iter()
+                .map(|&idx| step[idx].abs())
+                .fold(0.0_f64, f64::max);
             return Err(first_order_fallback_error(format!(
-                "HybridEFS ψ nonstationary: ||Δψ||∞={:.3e} <= tol={:.3e} \
-                 but raw ||gψ||∞={:.3e} (rho_dim={}, psi_dim={}, n_params={}, cost={:.6e})",
+                "HybridEFS ψ nonstationary: every ψ step is at its coordinate's arithmetic \
+                 resolution (||Δψ||∞={:.3e}) but raw ||gψ||∞={:.3e} exceeds the certificate \
+                 band {:.3e} (rho_dim={}, psi_dim={}, n_params={}, cost={:.6e})",
                 psi_step_inf,
-                self.fixed_point_tolerance,
                 psi_grad_inf,
+                band,
                 self.layout.rho_dim(),
                 self.layout.psi_dim,
                 self.layout.n_params,
@@ -4249,6 +4266,7 @@ impl FixedPointObjective for OuterFixedPointBridge<'_> {
         let raw_step = Array1::from_vec(eval.steps);
         let psi_indices = eval.psi_indices.clone();
         self.reject_nonstationary_tiny_psi_step(
+            x,
             &raw_step,
             psi_indices.as_deref(),
             eval.psi_gradient.as_ref(),
@@ -4294,20 +4312,10 @@ impl FixedPointObjective for OuterFixedPointBridge<'_> {
                 status: FixedPointStatus::Stop,
             });
         }
-        if self.fixed_point_step_converged(x, &raw_step, psi_indices.as_deref()) {
-            if psi_indices.is_some() {
-                self.consecutive_psi_zero_iters = 0;
-            }
-            return Ok(FixedPointSample {
-                value: current_cost,
-                step: raw_step,
-                status: FixedPointStatus::Stop,
-            });
-        }
-
         // Negligible raw step — the iteration is at (or numerically
-        // indistinguishable from) a fixed point. Pass it through so the
-        // outer step-norm convergence check fires; no point evaluating the
+        // indistinguishable from) a fixed point. Pass it through so opt's
+        // step-norm test stops the walk and the runner screens the point
+        // (#2817); no point evaluating the
         // cost at x + 1e-30·s to chase ULP-level "improvements".
         if max_step_abs < EFS_NEGLIGIBLE_STEP {
             if psi_indices.is_some() {
@@ -4519,28 +4527,6 @@ impl OuterFixedPointBridge<'_> {
             }
             step.payload
         }))
-    }
-
-    fn fixed_point_step_converged(
-        &self,
-        x: &Array1<f64>,
-        step: &Array1<f64>,
-        psi_indices: Option<&[usize]>,
-    ) -> bool {
-        if x.len() != step.len() {
-            return false;
-        }
-        for idx in 0..step.len() {
-            let scale = match psi_indices {
-                Some(indices) if indices.contains(&idx) => x[idx].abs().max(1.0),
-                _ => 1.0,
-            };
-            let normalized = step[idx].abs() / scale;
-            if !normalized.is_finite() || normalized > self.fixed_point_tolerance {
-                return false;
-            }
-        }
-        true
     }
 }
 

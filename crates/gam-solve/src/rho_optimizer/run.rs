@@ -8828,6 +8828,27 @@ pub(crate) fn outer_tolerance(value: f64) -> Result<Tolerance, EstimationError> 
         .map_err(|err| EstimationError::InvalidInput(format!("outer tolerance is invalid: {err}")))
 }
 
+/// The step norm below which a fixed-point map has nothing left to resolve.
+///
+/// A map's proposed step is computed from traces and logs, so its own roundoff
+/// is `√ε` relative to the coordinate it moves: a component below
+/// `√ε·(1 + |θ_i|)` cannot be told from the map's arithmetic. Every coordinate
+/// of the search box satisfies `|θ_i| ≤ max|bound|`, so a step whose every
+/// component sits at that resolution has Euclidean norm at most
+/// `√n·√ε·(1 + max|bound|)`. `opt::FixedPoint` stops once the projected step
+/// reaches this norm, and `run_fixed_point_outer_solver` then judges the point
+/// with the screening certificate. The threshold decides when that judgement is
+/// spent, never what it concludes. It replaces the absolute `config.tolerance`,
+/// which denominated a stationarity claim in step currency (#2817).
+pub(crate) fn fixed_point_step_resolution(config: &OuterConfig, n_params: usize) -> f64 {
+    let (lower, upper) = outer_search_bounds_template(config, n_params);
+    let box_scale = lower
+        .iter()
+        .chain(upper.iter())
+        .fold(0.0_f64, |scale, bound| scale.max(bound.abs()));
+    f64::EPSILON.sqrt() * (n_params.max(1) as f64).sqrt() * (1.0 + box_scale)
+}
+
 /// The relative cost floor shared by the cost-stall guard, the curvature-scaled
 /// flat-valley certificate, and the certify-last resume progress gate: nothing
 /// tighter than what the in-loop stall detector already proved about the
@@ -9308,7 +9329,7 @@ pub(crate) fn run_fixed_point_outer_solver(
         obj: &mut *obj,
         layout,
         barrier_config,
-        fixed_point_tolerance: config.tolerance,
+        config,
         evaluated_inner_seed: Arc::clone(&evaluated_inner_seed),
         consecutive_psi_zero_iters: 0,
         last_restored_incumbent_streak: None,
@@ -9336,7 +9357,10 @@ pub(crate) fn run_fixed_point_outer_solver(
     };
     let (lo, hi) = outer_search_bounds_template(config, layout.n_params);
     let bounds = outer_bounds(&lo, &hi).map_err(FixedPointOuterRunError::Failed)?;
-    let tol = outer_tolerance(config.tolerance).map_err(FixedPointOuterRunError::Failed)?;
+    // The map's step at its own arithmetic resolution, not an absolute
+    // tolerance: this stop only decides when screening is spent (below).
+    let tol = outer_tolerance(fixed_point_step_resolution(config, layout.n_params))
+        .map_err(FixedPointOuterRunError::Failed)?;
     let max_iter =
         outer_max_iterations(config.max_iter).map_err(FixedPointOuterRunError::Failed)?;
     // Publication slot for the complete producer error from the last failed
