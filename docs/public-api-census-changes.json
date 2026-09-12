@@ -492,5 +492,208 @@
     },
     "reason": "user directive: delete all useless slop and code only tests use; lead rulings: delete DeviceArena alloc/release and the arena field, move GPU test-gate helpers into test scope",
     "evidence": "DeviceArena: scripts/public_api_census.py on MSI over 5d498d0e9 plus this patch measured exactly this removed map. DeviceArena::alloc, release and bucket_of had no callers in production, test, example or bench code. Test gate: scripts/public_api_census.py on MSI over 5d498d0e9 plus this patch measured exactly this removed map. The functions survive unchanged in tests/common/gpu/gpu_gate.rs, where their only callers, the arrow_gpu tests and the gate's own self-tests, now reach them."
+  },
+  {
+    "base": "6a27cdf34b75f05fd21786186f53afac26fcef58",
+    "removed": {
+      "crates/gam-sae/src/assignment.rs::assignment_prior_grad_hdiag": 1,
+      "crates/gam-sae/src/assignment.rs::assignment_prior_log_strength_derivative": 1,
+      "crates/gam-sae/src/assignment.rs::assignment_prior_log_strength_hdiag": 1,
+      "crates/gam-sae/src/assignment.rs::assignment_prior_log_strength_target_mixed": 1,
+      "crates/gam-sae/src/assignment.rs::assignment_prior_value": 1,
+      "crates/gam-sae/src/assignment.rs::freeze_routing_from_current_logits": 1,
+      "crates/gam-sae/src/assignment.rs::freeze_routing_in_place": 1,
+      "crates/gam-sae/src/assignment.rs::from_argmax_owners": 1,
+      "crates/gam-sae/src/assignment.rs::ordered_beta_bernoulli_psd_majorizer_third_channels": 1,
+      "crates/gam-sae/src/assignment.rs::select_hybrid_atom_parameterization": 1,
+      "crates/gam-sae/src/assignment.rs::set_frozen_routing_in_place": 1,
+      "crates/gam-sae/src/assignment.rs::thaw_routing": 1,
+      "crates/gam-sae/src/assignment.rs::with_ungated": 1,
+      "crates/gam-sae/src/assignment_state.rs::apply_row_coord_step": 1,
+      "crates/gam-sae/src/assignment_state.rs::as_state": 1,
+      "crates/gam-sae/src/assignment_state.rs::atom_manifold": 1,
+      "crates/gam-sae/src/assignment_state.rs::from_full_support_state": 1,
+      "crates/gam-sae/src/assignment_state.rs::from_topk_support": 1,
+      "crates/gam-sae/src/assignment_state.rs::full_support": 1
+    },
+    "reason": "user directive: delete all useless slop (only used by tests / unused)",
+    "evidence": "Backfilled: b66a7d04e (sae-red gam-sae deletion batch 1 (assignment and assignment_state items), pushed over 6a27cdf34) removed these public functions and landed its docs/source-removal-changes.json entry but omitted this acknowledgement. scripts/public_api_census.py on MSI lane sw2 (job 440374) over 6a27cdf34..b66a7d04e measured exactly these 19 declarations."
+  },
+  {
+    "base": "0904dd2a25bf97d2a95f887cad4b404892695e9e",
+    "removed": {
+      "crates/gam-sae/src/inference/harvest.rs::activations_only": 1,
+      "crates/gam-sae/src/inference/harvest.rs::has_factors": 1,
+      "crates/gam-sae/src/inference/harvest.rs::has_fisher_tier": 1,
+      "crates/gam-sae/src/inference/harvest.rs::plan_next_tier": 1,
+      "crates/gam-sae/src/inference/harvest.rs::tier_metric": 1,
+      "crates/gam-sae/src/inference/harvest.rs::tier_provenance": 1,
+      "crates/gam-sae/src/inference/harvest.rs::tier_row_for": 1,
+      "crates/gam-sae/src/inference/harvest.rs::tier_rows": 1,
+      "crates/gam-sae/src/inference/harvest.rs::with_unweighted_tier": 1,
+      "crates/gam-sae/src/tiered/mod.rs::disabled": 1,
+      "crates/gam-sae/src/tiered/mod.rs::explained_variance_vs_mean": 1,
+      "crates/gam-sae/src/tiered/mod.rs::fit_position0_sink_atom": 1,
+      "crates/gam-sae/src/tiered/mod.rs::interference_subspace": 1,
+      "crates/gam-sae/src/tiered/mod.rs::linear_bulk": 1,
+      "crates/gam-sae/src/tiered/mod.rs::position_zero": 1,
+      "crates/gam-sae/src/tiered/mod.rs::reconstruct_with_sink": 1,
+      "crates/gam-sae/src/tiered/mod.rs::reconstruction": 1,
+      "crates/gam-sae/src/tiered/mod.rs::residual_after_sink": 1
+    },
+    "reason": "user directive: delete all useless slop (only used by tests / unused)",
+    "evidence": "Backfilled: 00735c57e (sae-red gam-sae deletion batch 2 (tiered and inference/harvest items), pushed over 0904dd2a2) removed these public functions and landed its docs/source-removal-changes.json entry but omitted this acknowledgement. scripts/public_api_census.py on MSI lane sw2 (job 440374) over 0904dd2a2..00735c57e measured exactly these 18 declarations."
+  },
+  {
+    "base": "93c197c950e18823eff94b85451cc0bc25796eca",
+    "removed": {
+      "crates/gam-sae/src/identifiability.rs::atom_checkpoint_dynamics": 1,
+      "crates/gam-sae/src/identifiability.rs::atom_transport_ladder_reports": 1,
+      "crates/gam-sae/src/identifiability.rs::dictionary_report_with_transport_ladders": 1,
+      "crates/gam-sae/src/identifiability.rs::enumerated_unit_generators": 1,
+      "crates/gam-sae/src/identifiability.rs::frame_inner_rotation_dim": 1,
+      "crates/gam-sae/src/identifiability.rs::from_ranks": 1,
+      "crates/gam-sae/src/identifiability.rs::piecewise_linear_eval": 1,
+      "crates/gam-sae/src/identifiability.rs::residual_gauge_exact": 1,
+      "crates/gam-sae/src/identifiability.rs::with_frame_inner_rotation": 1,
+      "crates/gam-sae/src/identifiability.rs::with_inner_fit": 1
+    },
+    "reason": "user directive: delete all useless slop (only used by tests / unused)",
+    "evidence": "Backfilled: 95168f488 (sae-red gam-sae deletion batch 3a (identifiability items), pushed over 93c197c95) removed these public functions and landed its docs/source-removal-changes.json entry but omitted this acknowledgement. scripts/public_api_census.py on MSI lane sw2 (job 440374) over 93c197c95..95168f488 measured exactly these 10 declarations."
+  },
+  {
+    "base": "2c756f482912080766a47bdd96321d9fe5019693",
+    "removed": {
+      "crates/gam-sae/src/atom_codes.rs::active_weight_sum": 1,
+      "crates/gam-sae/src/atom_codes.rs::deactivate": 1,
+      "crates/gam-sae/src/atom_codes.rs::weights_matrix": 1,
+      "crates/gam-sae/src/coactivation_conditionality.rs::derive_residual_cluster_labels": 1,
+      "crates/gam-sae/src/coactivation_conditionality.rs::estimate_from_designed_sample": 1,
+      "crates/gam-sae/src/coactivation_conditionality.rs::estimate_from_measure": 1,
+      "crates/gam-sae/src/coactivation_conditionality.rs::full_pass_rows": 1,
+      "crates/gam-sae/src/inference/contracts.rs::compose_with_trace": 1,
+      "crates/gam-sae/src/inference/contracts.rs::from_transport": 1,
+      "crates/gam-sae/src/inference/contracts.rs::holonomy_from_transports": 1,
+      "crates/gam-sae/src/null_sampler.rs::coactivation_exceedance": 1,
+      "crates/gam-sae/src/null_sampler.rs::excess_z": 1,
+      "crates/gam-sae/src/null_sampler.rs::n_obs": 1
+    },
+    "reason": "user directive: delete all useless slop (only used by tests / unused)",
+    "evidence": "Backfilled: 10ac599e4 (sae-red gam-sae deletion batch 4a (atom_codes, coactivation_conditionality, null_sampler, inference/contracts), pushed over 2c756f482) removed these public functions and landed its docs/source-removal-changes.json entry but omitted this acknowledgement. scripts/public_api_census.py, run by CI's Test source integrity census job on 10ac599e4 (run 34663659777), measured exactly these 13 declarations."
+  },
+  {
+    "base": "b30862c09e58ba82283bd209731a846edc71469a",
+    "removed": {
+      "crates/gam-sae/src/candidate_index.rs::brute_force_top_s": 1,
+      "crates/gam-sae/src/candidate_index.rs::from_decoder_blocks": 1,
+      "crates/gam-sae/src/candidate_index.rs::proposal_recall_report": 1,
+      "crates/gam-sae/src/candidate_index.rs::recall_report": 1,
+      "crates/gam-sae/src/candidate_index.rs::routability_shortlist_size": 1,
+      "crates/gam-sae/src/candidate_index.rs::sublinearity_ratio": 2
+    },
+    "reason": "user directive: delete all useless slop (only used by tests / unused)",
+    "evidence": "Backfilled: aa4199edb (sae-red gam-sae deletion batch 4b1 (candidate_index random-projection sketch and recall reports), pushed over b30862c09) removed these public functions and landed its docs/source-removal-changes.json entry but omitted this acknowledgement. scripts/public_api_census.py, run by CI's Test source integrity census job on aa4199edb (run 34664170221), measured exactly these 7 declarations."
+  },
+  {
+    "base": "a9378698342bdc33d190e311d6199ec240a21845",
+    "removed": {
+      "crates/gam-sae/src/null_battery.rs::architecture_matched_random_weight_null": 1,
+      "crates/gam-sae/src/null_battery.rs::first_two_energy_fraction": 1,
+      "crates/gam-sae/src/null_battery.rs::first_two_ordered_circle_stat": 1,
+      "crates/gam-sae/src/null_battery.rs::matched_spectrum_gaussian_null": 1,
+      "crates/gam-sae/src/null_battery.rs::random_rotation_null": 1,
+      "crates/gam-sae/src/null_battery.rs::run_null_battery": 1,
+      "crates/gam-sae/src/null_battery.rs::standing": 1,
+      "crates/gam-sae/src/null_battery.rs::token_shuffle_null": 1,
+      "crates/gam-sae/src/null_battery.rs::top_two_energy_fraction": 1
+    },
+    "reason": "user directive: delete all useless slop (only used by tests / unused)",
+    "evidence": "Backfilled: 5a69c5f0a (sae-red gam-sae deletion batch 4b2 (null_battery harness and first-two statistics), pushed over a93786983) removed these public functions and landed its docs/source-removal-changes.json entry but omitted this acknowledgement. scripts/public_api_census.py, run by CI's Test source integrity census job on 5a69c5f0a (run 34664726178), measured exactly these 9 declarations."
+  },
+  {
+    "base": "7dcf2c4447c21833040ac8f0cd12e9eab678d452",
+    "removed": {
+      "crates/gam-sae/src/basis.rs::function_space_gram": 1,
+      "crates/gam-sae/src/basis.rs::inner_width": 1,
+      "crates/gam-sae/src/basis.rs::nullspace_dimension": 1,
+      "crates/gam-sae/src/basis.rs::select_spherical_harmonic_degree": 1,
+      "crates/gam-sae/src/chart_canonicalization.rs::sphere_chart_isometry_defect": 1,
+      "crates/gam-sae/src/corpus/designed_target.rs::is_designed_subsample": 1,
+      "crates/gam-sae/src/corpus/rho_cascade.rs::includes": 1,
+      "crates/gam-sae/src/inference/intervention_shard.rs::control_floor_nats": 1,
+      "crates/gam-sae/src/inference/intervention_shard.rs::eval_forever_split": 1,
+      "crates/gam-sae/src/inference/probe_runner.rs::absorb": 1,
+      "crates/gam-sae/src/inference/probe_runner.rs::design_next": 1,
+      "crates/gam-sae/src/migration_ledger.rs::assert_no_pc_reseed": 1,
+      "crates/gam-sae/src/migration_ledger.rs::kind_code": 1,
+      "crates/gam-sae/src/sparse_dict/mod.rs::sparse_dictionary_transform": 1,
+      "crates/gam-sae/src/sparse_dict/mod.rs::trivially_converged": 1,
+      "crates/gam-sae/src/sparse_dict/scoring.rs::route_minibatch_dispatch": 1,
+      "crates/gam-sae/src/sparse_dict/scoring.rs::route_row": 1
+    },
+    "reason": "user directive: delete all useless slop (only used by tests / unused)",
+    "evidence": "Backfilled: fb8fada8d (sae-red gam-sae deletion batch 5 (sparse_dict, corpus, migration_ledger, chart_canonicalization, intervention_shard, basis, probe_runner), pushed over 7dcf2c444) removed these public functions and landed its docs/source-removal-changes.json entry but omitted this acknowledgement. scripts/public_api_census.py, run by CI's Test source integrity census job on fb8fada8d (run 34665400223), measured exactly these 17 declarations."
+  },
+  {
+    "base": "6dd50497989219e4fb19ff347ff789f14e9c0c5f",
+    "removed": {
+      "crates/gam-sae/src/candidate_index.rs::auto": 1,
+      "crates/gam-sae/src/candidate_index.rs::auto_candidate_budget": 1,
+      "crates/gam-sae/src/candidate_index.rs::brute_force_best_atom": 1,
+      "crates/gam-sae/src/candidate_index.rs::build": 1,
+      "crates/gam-sae/src/candidate_index.rs::gather_candidates": 1,
+      "crates/gam-sae/src/candidate_index.rs::num_atoms": 1,
+      "crates/gam-sae/src/candidate_index.rs::propose": 1,
+      "crates/gam-sae/src/candidate_index.rs::route_exact": 1,
+      "crates/gam-sae/src/encode.rs::accumulate": 1,
+      "crates/gam-sae/src/encode.rs::amortized_encode_batch_fast": 1,
+      "crates/gam-sae/src/encode.rs::amortized_encode_with_index": 1,
+      "crates/gam-sae/src/encode.rs::amortized_encode_with_index_fast": 1,
+      "crates/gam-sae/src/encode.rs::amortized_fraction": 1,
+      "crates/gam-sae/src/encode.rs::amortized_predict_row": 1,
+      "crates/gam-sae/src/encode.rs::amortized_reconstruct_batch_fast": 1,
+      "crates/gam-sae/src/encode.rs::amortized_reconstruct_with_index_fast": 1,
+      "crates/gam-sae/src/encode.rs::build_data_driven": 1,
+      "crates/gam-sae/src/encode.rs::certified_encode_batch": 1,
+      "crates/gam-sae/src/encode.rs::certified_encode_with_index": 1,
+      "crates/gam-sae/src/encode.rs::coord_dist_sq": 1,
+      "crates/gam-sae/src/encode.rs::data_driven_chart_centers": 1,
+      "crates/gam-sae/src/encode.rs::encode_atom_with_fallback_telemetry": 1,
+      "crates/gam-sae/src/encode.rs::encode_reconstruction_error": 1,
+      "crates/gam-sae/src/encode.rs::multistart_fraction": 1,
+      "crates/gam-sae/src/encode.rs::newton_fraction": 1,
+      "crates/gam-sae/src/encode.rs::total": 1
+    },
+    "reason": "user directive: delete all useless slop (only used by tests / unused)",
+    "evidence": "Backfilled: 728caa9b1 (sae-red gam-sae deletion batch 6a (index-routed encode paths and the candidate_index module), pushed over 6dd504979) removed these public functions and landed its docs/source-removal-changes.json entry but omitted this acknowledgement. scripts/public_api_census.py, run by CI's Test source integrity census job on 728caa9b1 (run 34666582101), measured exactly these 26 declarations."
+  },
+  {
+    "base": "728caa9b19faae0c3c8522b08c62f67b4e5b03b2",
+    "removed": {
+      "crates/gam-sae/src/amortized_encoder.rs::error_stats": 1,
+      "crates/gam-sae/src/gpu_kernels/resident_arrow.rs::deterministic": 1,
+      "crates/gam-sae/src/gpu_kernels/resident_arrow.rs::path": 1,
+      "crates/gam-sae/src/gpu_kernels/resident_arrow.rs::residual_scale": 1,
+      "crates/gam-sae/src/inference/steering.rs::canonical_chart_coordinates": 1,
+      "crates/gam-sae/src/inference/steering.rs::canonical_chart_raw_coordinates": 1
+    },
+    "reason": "user directive: delete all useless slop (only used by tests / unused)",
+    "evidence": "Backfilled: 2f844874e (sae-red gam-sae deletion batch 6b (resident_arrow module, steering canonical-chart readers, error_stats), pushed over 728caa9b1) removed these public functions and landed its docs/source-removal-changes.json entry but omitted this acknowledgement. scripts/public_api_census.py, run by CI's Test source integrity census job on 2f844874e (run 34666644474), measured exactly these 6 declarations."
+  },
+  {
+    "base": "feed7fd081fce0d93b000cd621e5b29d58a4b779",
+    "removed": {
+      "crates/gam-sae/src/gpu_kernels/sae_encode_resident.rs::certified": 1,
+      "crates/gam-sae/src/gpu_kernels/sae_encode_resident.rs::device_engaged": 1,
+      "crates/gam-sae/src/gpu_kernels/sae_encode_resident.rs::emulate_certified_encode_batch": 1,
+      "crates/gam-sae/src/gpu_kernels/sae_encode_resident.rs::emulate_certified_encode_row": 1,
+      "crates/gam-sae/src/gpu_kernels/sae_encode_resident.rs::encode_kernel_source": 1,
+      "crates/gam-sae/src/gpu_kernels/sae_encode_resident.rs::from_atom_atlas": 1,
+      "crates/gam-sae/src/gpu_kernels/sae_encode_resident.rs::measure_device_encode_throughput": 1,
+      "crates/gam-sae/src/gpu_kernels/sae_encode_resident.rs::sae_certified_encode_batch": 1,
+      "crates/gam-sae/src/gpu_kernels/sae_encode_resident.rs::sae_certified_encode_device": 1
+    },
+    "reason": "user directive: delete all useless slop (only used by tests / unused)",
+    "evidence": "Backfilled: fb2a87bc8 (sae-red gam-sae deletion batch 6c (sae_encode_resident device-encode cluster), pushed over feed7fd08) removed these public functions and landed its docs/source-removal-changes.json entry but omitted this acknowledgement. scripts/public_api_census.py, run by CI's Test source integrity census job on fb2a87bc8 (run 34668182385), measured exactly these 9 declarations."
   }
 ]
