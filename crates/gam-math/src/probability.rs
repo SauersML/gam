@@ -12,12 +12,12 @@ const SQRT_2_OVER_PI: f64 = 0.797_884_560_802_865_4;
 /// `I_x(a, b) = p`, where `I` is the regularized incomplete beta.
 ///
 /// `p <= 0` maps to the support floor and `p >= 1` to the support ceiling. A
-/// non-finite or non-positive shape yields `NaN`.
+/// non-finite or non-positive shape, or a NaN probability, yields `NaN`.
 pub fn beta_quantile(p: f64, a: f64, b: f64) -> f64 {
-    if !(a.is_finite() && a > 0.0 && b.is_finite() && b > 0.0) {
+    if p.is_nan() || !(a.is_finite() && a > 0.0 && b.is_finite() && b > 0.0) {
         return f64::NAN;
     }
-    if !p.is_finite() || p <= 0.0 {
+    if p <= 0.0 {
         return 0.0;
     }
     if p >= 1.0 {
@@ -58,8 +58,9 @@ pub fn beta_quantile(p: f64, a: f64, b: f64) -> f64 {
 /// over the same range.
 ///
 /// Underflow then becomes something the function can state rather than paper
-/// over: a true quantile below `f64::MIN_POSITIVE` reaches `exp(y) = 0`, which
-/// is the correctly rounded answer, instead of a spurious positive floor a
+/// over: a true quantile below half the least positive subnormal rounds to
+/// `exp(y) = 0`; larger subnormal quantiles remain representable. This avoids a
+/// spurious positive floor a
 /// caller cannot distinguish from a resolved bound.
 ///
 /// The branch condition is `x·max(1, b) ≤ ½`, which is derived rather than
@@ -80,7 +81,7 @@ fn lower_tail_beta_quantile(p: f64, a: f64, b: f64) -> Option<f64> {
         return None;
     }
     // Reject before iterating if the seed is outside the series branch. The
-    // seed underestimates `x` for `b < 1` and overestimates it for `b > 1`, by
+    // seed overestimates `x` for `b < 1` and underestimates it for `b > 1`, by
     // a factor that is itself `1 + O(x)`, so a seed comfortably inside the
     // branch keeps every iterate inside it.
     let ratio_bound = (0.5_f64).ln() - b.max(1.0).ln();
@@ -1676,8 +1677,9 @@ pub fn standard_normal_quantile(p: f64) -> Result<f64, String> {
 ///
 /// Unlike [`standard_normal_quantile`], this remains defined when `Φ(x)` is
 /// smaller than the least positive `f64`, and when `Φ(x)` is so close to one
-/// that exponentiating `log_p` rounds to exactly one. Acklam's lower-tail
-/// approximation supplies the initial point; Newton polishing solves
+/// that exponentiating `log_p` rounds to exactly one. The ordinary quantile
+/// supplies the initial point for representable probabilities; otherwise a
+/// Gaussian-tail asymptotic supplies a seed directly in log space. Newton polishing solves
 /// `ln Φ(x) = log_p` with the stable log-CDF and Mills ratio, so neither tail
 /// forms a probability-space subtraction.
 #[inline]
@@ -1698,7 +1700,13 @@ pub fn standard_normal_quantile_from_log_cdf(log_p: f64) -> Result<f64, String> 
     let mut x = if p > 0.0 {
         standard_normal_quantile(p)?
     } else {
-        acklam_lower_tail_quantile_from_log_probability(log_p)
+        // ln Phi(-t) = -t^2/2 - ln(t) - ln(2*pi)/2 + O(t^-2).
+        // Start with t0 = sqrt(-2*log_p), then apply the leading logarithmic
+        // correction. Take the square root before scaling so even a log_p
+        // near -f64::MAX has a finite seed. Acklam's polynomial ratio would
+        // overflow here, both in -2*log_p and in the powers of its argument.
+        let t = (-log_p).sqrt() * std::f64::consts::SQRT_2;
+        -t + (t.ln() + 0.5 * (2.0 * std::f64::consts::PI).ln()) / t
     };
     for _ in 0..4 {
         let (current_log_p, mills_ratio) = signed_probit_logcdf_and_mills_ratio(x);
@@ -1722,6 +1730,21 @@ mod tests {
     use super::*;
 
     const TOL: f64 = 1e-12;
+
+    #[test]
+    fn normal_log_quantile_remains_finite_for_extreme_log_probabilities() {
+        for log_p in [-1000.0, -1e6, -1e100, -1e200, -1e300] {
+            let x = standard_normal_quantile_from_log_cdf(log_p).unwrap();
+            assert!(x.is_finite() && x < 0.0, "log_p={log_p}: {x}");
+            let reconstructed = normal_logcdf(x);
+            assert!((reconstructed / log_p - 1.0).abs() < 2e-15,
+                "log_p={log_p}: x={x}, reconstructed={reconstructed}");
+        }
+        let x = standard_normal_quantile_from_log_cdf(-f64::MAX).unwrap();
+        assert!(x.is_finite() && x < 0.0);
+        // At this scale the logarithmic tail correction is below one ulp.
+        assert!((x / f64::MAX.sqrt() + std::f64::consts::SQRT_2).abs() < 4e-16);
+    }
 
     fn rel_err(got: f64, expected: f64) -> f64 {
         (got - expected).abs() / expected.abs().max(1e-300)
@@ -2010,6 +2033,9 @@ mod tests {
 
     #[test]
     fn beta_quantile_boundaries_and_degeneracy() {
+        assert!(beta_quantile(f64::NAN, 2.0, 3.0).is_nan());
+        assert_eq!(beta_quantile(f64::NEG_INFINITY, 2.0, 3.0), 0.0);
+        assert_eq!(beta_quantile(f64::INFINITY, 2.0, 3.0), 1.0);
         assert_eq!(beta_quantile(0.0, 2.0, 3.0), 0.0);
         assert_eq!(beta_quantile(-0.5, 2.0, 3.0), 0.0);
         assert_eq!(beta_quantile(1.0, 2.0, 3.0), 1.0);
