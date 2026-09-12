@@ -154,7 +154,6 @@ fn support_laml_measured_quadrature_tolerance(
         shared.num_probes,
         seed,
         ceiling,
-        shared.power_iters,
         shared.cg_rel_tol,
         system.k,
     )

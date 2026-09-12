@@ -2071,7 +2071,6 @@ pub struct SurrogateLaneConfig {
     pub num_probes: usize,
     pub seed: u64,
     pub rel_tol: f64,
-    pub power_iters: usize,
     pub cg_rel_tol: f64,
     pub deflation_max_rank: usize,
     pub deflation_subspace_iters: usize,
@@ -2423,7 +2422,6 @@ fn matrix_free_arrow_evidence_log_det_surrogate_core(
                         cfg.num_probes,
                         cfg.seed,
                         cfg.rel_tol,
-                        cfg.power_iters,
                         cfg.cg_rel_tol,
                         dim,
                         cfg.deflation_max_rank,
@@ -2443,7 +2441,7 @@ fn matrix_free_arrow_evidence_log_det_surrogate_core(
                                 &backend,
                                 resident.as_ref(),
                                 gpu_matvec,
-                                cfg.power_iters,
+                                cfg.rel_tol,
                                 dim,
                                 slq_seed,
                             )?
@@ -2610,7 +2608,7 @@ fn price_certified_bottom_mode<B: BatchedBlockSolver + Sync>(
     backend: &B,
     resident: Option<&SaeResidentReducedSchur>,
     gpu_matvec: Option<&GpuSchurMatvec>,
-    power_iters: usize,
+    rel_tol: f64,
     max_steps: usize,
     seed: u64,
 ) -> Result<bool, ArrowSchurError> {
@@ -2621,7 +2619,7 @@ fn price_certified_bottom_mode<B: BatchedBlockSolver + Sync>(
         backend,
         resident,
         gpu_matvec,
-        power_iters,
+        rel_tol,
         seed,
     ) else {
         return Ok(false);
@@ -2721,23 +2719,26 @@ fn price_certified_bottom_mode<B: BatchedBlockSolver + Sync>(
     Ok(true)
 }
 
-/// Power-iteration estimate of the largest eigenvalue `λ_max` of the SPD reduced
-/// Schur `S` through the matrix-free `schur_matvec` apply — the upper end of
-/// the spectral bracket the #2080 rational log-det surrogate
-/// ([`RationalLogdetPlan`]) needs to size its bracket-centred DE quadrature.
+/// Certified upper bracket on the largest eigenvalue of the reduced Schur
+/// complement, for sizing the rational quadrature window.
 ///
-/// Deterministic: the start vector is a fixed SplitMix64 Rademacher draw from
-/// `seed`, so a given `(sys, htt_factors, ρ_β, resident, iters, seed)` always
-/// returns the same estimate — the surrogate bracket must be reproducible for the
-/// REML outer loop, exactly like the SLQ probes. `iters` power steps refine the
-/// Rayleigh quotient `vᵀ S v` (each step is one `schur_matvec`); a handful
-/// suffice because the surrogate only needs a bracket good to a factor, not a
-/// converged eigenvalue (the quadrature window is padded two decades each side).
+/// Returns `θ + r`: the top Ritz value of an adaptive, fully reorthogonalized
+/// Lanczos solve on `S`, plus its sharp Ritz residual bound `r = β_j |e_jᵀ y|`.
+/// For a symmetric operator `θ <= λ_max <= θ + r`, so this is an upper bound on
+/// `λ_max` rather than an estimate from below. The quadrature window keeps
+/// `λ_max`'s tail truncation at `λ_max / t_hi`, and an estimate from below
+/// could leave that tail over its tolerance by the estimate's shortfall.
 ///
-/// Returns `None` for a degenerate operator (`k == 0`) or a non-finite /
-/// non-positive Rayleigh quotient (an SPD operator forbids the latter, so it
-/// signals a caller bug or a non-finite operator, both of which must surface
-/// rather than be silently bracketed).
+/// The solve stops at the first step whose relative residual clears `rel_tol`,
+/// the accuracy the caller sizes its quadrature for. The work bound is the
+/// algebraic span `k`: a reorthogonalized Krylov recurrence has exhausted `S`
+/// after `k` steps. The tridiagonal certificate is checked every step, because
+/// its `O(j²)` cost is negligible beside one `S·v`. The former fixed
+/// power-iteration count answered neither question.
+///
+/// `None` when `k == 0`, when the dominant-magnitude Ritz value is not positive
+/// (an operator whose most negative eigenvalue dominates has no positive top
+/// bracket to report), or when the solve does not certify.
 pub fn reduced_schur_lambda_max<B: BatchedBlockSolver + Sync>(
     sys: &ArrowSchurSystem,
     htt_factors: &ArrowFactorSlab,
@@ -2745,21 +2746,21 @@ pub fn reduced_schur_lambda_max<B: BatchedBlockSolver + Sync>(
     backend: &B,
     resident: Option<&SaeResidentReducedSchur>,
     gpu_matvec: Option<&GpuSchurMatvec>,
-    iters: usize,
+    rel_tol: f64,
     seed: u64,
 ) -> Option<f64> {
     let k = sys.k;
-    if k == 0 {
+    if k == 0 || !(rel_tol.is_finite() && rel_tol > 0.0) {
         return None;
     }
     // Deterministic Rademacher start (same stream discipline as the surrogate
     // probes): a ±1 vector never lands orthogonal to the top eigenspace.
-    let mut v = Array1::<f64>::zeros(k);
+    let mut start = vec![0.0_f64; k];
     {
         let mut state = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15);
         let mut bits: u64 = 0;
         let mut remaining: u32 = 0;
-        for value in v.iter_mut() {
+        for value in start.iter_mut() {
             if remaining == 0 {
                 bits = gam_linalg::utils::splitmix64(&mut state);
                 remaining = 64;
@@ -2769,29 +2770,36 @@ pub fn reduced_schur_lambda_max<B: BatchedBlockSolver + Sync>(
             remaining -= 1;
         }
     }
-    let inv_norm0 = v.dot(&v).sqrt().recip();
-    if !inv_norm0.is_finite() {
-        return None;
-    }
-    v.mapv_inplace(|x| x * inv_norm0);
-    // One resident operator reused across every power-iteration apply — device
-    // seam threaded so the bracket estimate rides the SAME resident `S·v` the
-    // ladder/probes use.
+    // One resident operator reused across every Lanczos apply — device seam
+    // threaded so the bracket rides the SAME resident `S·v` the ladder/probes use.
     let op = ReducedSchurOperator::new(sys, htt_factors, ridge_beta, backend, resident)
         .with_gpu_matvec(gpu_matvec);
-    let apply = |x: &Array1<f64>| -> Array1<f64> { op.apply_owned(x) };
-    for _ in 0..iters.max(1) {
-        let sv = apply(&v);
-        let norm = sv.dot(&sv).sqrt();
-        if !(norm.is_finite() && norm > 0.0) {
-            break;
-        }
-        v = sv / norm;
-    }
-    // Rayleigh quotient on the converged iterate (v stays unit).
-    let sv = apply(&v);
-    let lambda = v.dot(&sv);
-    (lambda.is_finite() && lambda > 0.0).then_some(lambda)
+    let options = gam_linalg::lanczos::SymmetricExtremeLanczosOptions {
+        target_rank: 1,
+        max_steps: k,
+        check_every: 1,
+        relative_residual_tol: rel_tol,
+        breakdown_tol: 0.0,
+    };
+    let mut work = Array1::<f64>::zeros(k);
+    let pairs = gam_linalg::lanczos::symmetric_extreme_lanczos_eigenpairs(
+        k,
+        &start,
+        options,
+        |x: &[f64], out: &mut [f64]| {
+            let xv = Array1::from_iter(x.iter().copied());
+            op.apply_into(&xv, &mut work);
+            for (slot, &sv) in out.iter_mut().zip(work.iter()) {
+                *slot = sv;
+            }
+            Ok(())
+        },
+    )
+    .ok()?;
+    let ritz = *pairs.eigenvalues.first()?;
+    let bound = *pairs.residual_bounds.first()?;
+    let upper = ritz + bound;
+    (ritz.is_finite() && bound.is_finite() && ritz > 0.0 && upper.is_finite()).then_some(upper)
 }
 
 /// A measured direction of negative curvature of the reduced Schur complement,
@@ -2954,7 +2962,7 @@ pub fn reduced_schur_negative_curvature<B: BatchedBlockSolver + Sync>(
 /// ([`reduced_schur_lambda_max`]), `λ_min` from the deflation-floor convention
 /// `SPECTRAL_DEFLATION_REL_FLOOR·λ_max` (the operative lower bound of the
 /// unit-deflated spectrum). Deterministic for a fixed
-/// `(sys, htt_factors, ρ_β, resident, num_probes, seed, rel_tol, power_iters,
+/// `(sys, htt_factors, ρ_β, resident, num_probes, seed, rel_tol,
 /// cg_rel_tol, cg_max_iters)`.
 ///
 /// `None` when `k == 0`, the bracket estimate is degenerate, the plan cannot be
@@ -2969,7 +2977,6 @@ pub fn rational_reduced_schur_log_det<B: BatchedBlockSolver + Sync>(
     num_probes: usize,
     seed: u64,
     rel_tol: f64,
-    power_iters: usize,
     cg_rel_tol: f64,
     cg_max_iters: usize,
 ) -> Option<(RationalLogdetPlan, RationalLogdetEval)> {
@@ -2984,7 +2991,7 @@ pub fn rational_reduced_schur_log_det<B: BatchedBlockSolver + Sync>(
         backend,
         resident,
         gpu_matvec,
-        power_iters,
+        rel_tol,
         seed,
     )?;
     // λ_min from the deflation floor: after unit-deflation the operative spectrum
@@ -3052,7 +3059,6 @@ pub fn rational_reduced_schur_plan_derived<B: BatchedBlockSolver + Sync>(
     num_probes: usize,
     seed: u64,
     rel_tol: f64,
-    power_iters: usize,
     cg_rel_tol: f64,
     cg_max_iters: usize,
     deflation_max_rank: usize,
@@ -3077,13 +3083,13 @@ pub fn rational_reduced_schur_plan_derived<B: BatchedBlockSolver + Sync>(
         backend,
         resident,
         gpu_matvec,
-        power_iters,
+        rel_tol,
         seed,
     )
     .ok_or_else(|| {
         format!(
             "spectral bracket unavailable: the power iteration produced no finite λ_max for \
-             reduced Schur dim {k} in {power_iters} iterations"
+             reduced Schur dim {k} within its {k}-step span at relative residual {rel_tol:.3e}"
         )
     })?;
     let lambda_min = (SPECTRAL_DEFLATION_REL_FLOOR * lambda_max).max(f64::MIN_POSITIVE);
@@ -3156,7 +3162,7 @@ pub fn rational_reduced_schur_plan_derived<B: BatchedBlockSolver + Sync>(
                     resident,
                     gpu_matvec,
                     lambda_max,
-                    power_iters,
+                    k,
                     seed,
                 )
                 .map(|found| {

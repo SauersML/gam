@@ -3105,5 +3105,21 @@
     ],
     "reason": "User directive 2026-09-11: delete code nothing uses. gam-problem gauge::CompiledBlockMap existed so Gauge::from_compiled_map could read a compiled identifiability map; that method was deleted in 47c231901, none of the trait's methods is called anywhere, and the trait, its gam-identifiability impl and gam-solve's re-export of the name are removed.",
     "evidence": "Word-matched single-name git grep at the base: CompiledBlockMap appears only at the trait definition, the gam-identifiability impl, the gam-solve re-export and prose. The method-call patterns .raw_from_compiled(, .raw_block_ranges( and .compiled_block_ranges( match nothing; production reads the CompiledMap fields directly. Pre-push on MSI over the exact candidate tree: workspace --all-targets check, cargo check -p gam-pyffi, a leftover-name grep, and the three gates."
+  },
+  {
+    "base": "b855cdf6ba71d0384afd82aebbca6724e68471e5",
+    "items": [
+      "crates/gam-sae/src/manifold/outer_objective.rs:const:SAE_SURROGATE_LANE_POWER_ITERS"
+    ],
+    "reason": "SPEC rule 23: derive the rational surrogate's spectral bracket instead of a fixed power-iteration count (#2576)",
+    "evidence": "SAE_SURROGATE_LANE_POWER_ITERS = 40 fed SurrogateLaneConfig::power_iters, a fixed step count for the reduced-Schur power iteration that brackets λ_max. reduced_schur_lambda_max now certifies θ + r with gam_linalg's adaptive symmetric_extreme_lanczos_eigenpairs at the caller's quadrature rel_tol within the algebraic span k, so the constant and the config field have no reader. source_removal_guard on MSI over f2156a78e plus this patch named exactly these items. Workspace --all-targets verification of the pushed sha follows."
+  },
+  {
+    "base": "8bd5765b0639d5b509ad400593b087dff0168432",
+    "items": [
+      "crates/gam-sae/src/manifold/outer_objective.rs:const:SAE_SURROGATE_LANE_CG_MAX_ITERS"
+    ],
+    "reason": "SPEC rule 23: derive the rational surrogate's spectral bracket instead of a fixed power-iteration count (#2576)",
+    "evidence": "Backfilled: ad53212ec replaced SurrogateLaneConfig::cg_max_iters with the reduced-Schur span k and deleted SAE_SURROGATE_LANE_CG_MAX_ITERS without its acknowledgement. source_removal_guard on MSI over 8bd5765b0..ad53212ec measured exactly these items."
   }
 ]

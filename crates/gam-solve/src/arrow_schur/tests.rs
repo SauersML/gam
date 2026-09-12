@@ -4260,18 +4260,22 @@ fn rational_reduced_schur_log_det_matches_dense_evidence() {
         &backend,
         None,
         None,
-        80,
+        1e-9,
         seed,
     )
-    .expect("power iteration must produce a finite positive λ_max");
+    .expect("certified Lanczos must produce a finite positive λ_max bracket");
+    // `θ <= λ_max <= θ + r`: the returned bracket is an upper bound, tight to its
+    // own residual bound `r <= 1e-9·max(θ, 1)`, up to the dense reference's
+    // arithmetic resolution.
+    let resolution = f64::EPSILON.sqrt() * true_lambda_max.abs().max(1.0);
     assert!(
-        lambda_max <= true_lambda_max * (1.0 + 1e-9),
-        "power-iteration Rayleigh quotient cannot exceed the true λ_max \
+        lambda_max >= true_lambda_max - resolution,
+        "the certified bracket θ + r must not fall below the true λ_max \
          (est={lambda_max}, true={true_lambda_max})"
     );
     assert!(
-        lambda_max >= 0.5 * true_lambda_max,
-        "spectral-bracket λ_max must be within a factor of 2 of the truth \
+        lambda_max <= true_lambda_max + 2.0e-9 * true_lambda_max.abs().max(1.0) + resolution,
+        "the certified bracket must sit within its residual bound of the true λ_max \
          (est={lambda_max}, true={true_lambda_max})"
     );
 
@@ -4286,7 +4290,6 @@ fn rational_reduced_schur_log_det_matches_dense_evidence() {
         64, // num_probes
         seed,
         1e-9, // rel_tol (quadrature)
-        40,   // power_iters
         1e-11,
         20_000,
     )
@@ -4314,7 +4317,6 @@ fn rational_reduced_schur_log_det_matches_dense_evidence() {
         64,
         seed,
         1e-9,
-        40,
         1e-11,
         20_000,
     )
@@ -4369,7 +4371,6 @@ fn rational_reduced_schur_plan_derived_deflates_to_target() {
         32,
         seed,
         1e-9,
-        40,
         1e-11,
         20_000,
         0,
@@ -4414,7 +4415,6 @@ fn rational_reduced_schur_plan_derived_deflates_to_target() {
         32,
         seed,
         1e-9,
-        40,
         1e-11,
         20_000,
         k, // deflation_max_rank: resource ceiling with headroom to certify 0.1×bare
@@ -4454,7 +4454,6 @@ fn rational_reduced_schur_plan_derived_deflates_to_target() {
         32,
         seed,
         1e-9,
-        40,
         1e-11,
         20_000,
         1,
@@ -6232,7 +6231,6 @@ fn matrix_free_exact_a_prices_a_clamp_basin_before_refusing_a_saddle_2515() {
         num_probes: 4,
         seed: 0x2515,
         rel_tol: 1.0e-10,
-        power_iters: 4,
         cg_rel_tol: 1.0e-12,
         deflation_max_rank: 0,
         deflation_subspace_iters: 1,
@@ -6270,7 +6268,6 @@ fn matrix_free_exact_a_prices_a_clamp_basin_before_refusing_a_saddle_2515() {
         num_probes: 4,
         seed: 0x2515,
         rel_tol: 1.0e-10,
-        power_iters: 4,
         cg_rel_tol: 1.0e-12,
         deflation_max_rank: 0,
         deflation_subspace_iters: 1,

@@ -141,7 +141,6 @@ fn main() -> Result<(), String> {
             num_probes: 32,
             seed: 0xC0FFEE,
             rel_tol: 1.0e-8,
-            power_iters: 40,
             cg_rel_tol: 1.0e-8,
             deflation_max_rank: 128,
             deflation_subspace_iters: 4,

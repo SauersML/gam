@@ -156,7 +156,7 @@ fn the_reduced_schur_negative_mode_lifts_to_full_space_negative_curvature() {
         &backend,
         None,
         None,
-        200,
+        1.0e-9,
         0x2731_C0DE,
     )
     .expect("the border still carries positive curvature, so λ_max is positive");
@@ -226,7 +226,7 @@ fn a_definite_reduced_schur_yields_no_negative_direction() {
         &backend,
         None,
         None,
-        200,
+        1.0e-9,
         0x2731_C0DE,
     )
     .expect("λ_max is positive on an SPD reduced Schur");
@@ -289,7 +289,6 @@ fn the_rational_lane_prices_or_refuses_a_bottom_mode_its_fixed_step_conditioning
             num_probes: 4,
             seed: 0x2731,
             rel_tol: 1.0e-10,
-            power_iters: 16,
             cg_rel_tol: 1.0e-12,
             deflation_max_rank: 0,
             deflation_subspace_iters: 1,
