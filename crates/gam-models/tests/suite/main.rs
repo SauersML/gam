@@ -14,3 +14,4 @@ mod multinomial_predictive_ratio_2612;
 mod multinomial_separation_arming_2612;
 mod probe_2695_warp_smoothness;
 mod production_row_program_policy;
+mod standard_reml_outer_search_2817;
