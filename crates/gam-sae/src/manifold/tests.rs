@@ -1455,13 +1455,10 @@ fn structural_restore_fixture_2521() -> SaeManifoldTerm {
 #[test]
 pub(crate) fn snapshot_restore_round_trips_full_and_reduced_atom_topologies_2521() {
     let mut term = structural_restore_fixture_2521();
-    term.atoms[0].decoder_frame = Some(
-        GrassmannFrame::from_orthonormal(
-            array![[1.0_f64], [0.0], [0.0], [0.0], [0.0], [0.0]],
-            array![1.0],
-        )
-        .unwrap(),
-    );
+    term.atoms[0].decoder_frame = Some(GrassmannFrame::from_oriented(
+        array![[1.0_f64], [0.0], [0.0], [0.0], [0.0], [0.0]],
+        array![1.0],
+    ));
     let target = Array2::<f64>::zeros((4, 6));
     let rho = SaeManifoldRho::new(0.0, -6.0, vec![Array1::<f64>::zeros(1)]);
 

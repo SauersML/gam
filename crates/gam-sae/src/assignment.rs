@@ -213,29 +213,6 @@ pub enum AssignmentMode {
     TopK { k: usize },
 }
 
-/// #1033 — the fixed-form predictor that produces the ρ-invariant FROZEN routing
-/// (amortized routing). Both forms are NO-learned-net deterministic functions of
-/// the current dictionary; they differ in how faithfully they track the
-/// dictionary as it evolves across outer iterates. Kept as alternatives so the
-/// accuracy gate can pick whichever passes the fit-quality bar (the cheap
-/// `Snapshot` if it suffices, the `ChartGeometry` distill otherwise).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RoutingPredictor {
-    /// Snapshot the current (converged) logits as the frozen routing — the
-    /// cheapest fixed-form distill, exact at the dictionary it is taken from.
-    /// Goes stale as the dictionary moves (needs a refresh to track), so it is the
-    /// MVP/baseline form.
-    Snapshot,
-    /// Re-derive the per-(row, atom) routing logit from the atom's encode-chart
-    /// geometry against the CURRENT dictionary: encode each row to its predicted
-    /// coord `t̂`, reconstruct the amplitude-1 image `γ_k(t̂) = Bᵀφ(t̂)`, and map
-    /// the reconstruction ALIGNMENT to a logit. This tracks the dictionary
-    /// (a moved decoder changes `γ_k(t̂)` and hence the routing) without re-running
-    /// the free-logit inner solve, so it is the default-readiness form when the
-    /// snapshot proves too stale.
-    ChartGeometry,
-}
-
 impl AssignmentMode {
     /// The family's stable snake_case name, for refusal text and provenance.
     /// Matching on the enum here means a family added later cannot be reported

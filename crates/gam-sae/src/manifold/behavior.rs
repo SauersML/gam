@@ -604,22 +604,6 @@ impl OutputBlock {
     pub fn log_lambda(&self) -> f64 {
         self.log_lambda
     }
-
-    /// A copy re-weighted to a new `log(λ_ℓ)` (the target is untouched, so a REML
-    /// sweep re-weights without re-forming `Y_ℓ`).
-    pub fn with_log_lambda(&self, log_lambda: f64) -> Result<Self, String> {
-        let lambda = gam_problem::checked_exp_log_strength(log_lambda)
-            .map_err(|error| format!("OutputBlock::with_log_lambda: {error}"))?;
-        let sqrt_lambda =
-            gam_problem::checked_exp_log_strength(0.5 * log_lambda).map_err(|error| {
-                format!("OutputBlock::with_log_lambda square-root strength: {error}")
-            })?;
-        let mut next = self.clone();
-        next.log_lambda = log_lambda;
-        next.lambda = lambda;
-        next.sqrt_lambda = sqrt_lambda;
-        Ok(next)
-    }
 }
 
 /// Stacked-column offset bookkeeping for a crosscoder target

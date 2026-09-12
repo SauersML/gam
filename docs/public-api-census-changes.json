@@ -1425,5 +1425,19 @@
     },
     "reason": "#2469 and the delete-useless-public-API rule: skip_transcoder_reml_metrics had no product user. Its only caller was a pyffi shim that gamfit never calls (gamfit/torch/skip_transcoder.py scores its own profile), and it carried a 1e-8 activation threshold and a 1e-12 floor on the residual variance. The function, its module and the shim are deleted.",
     "evidence": "public_api_census.py's public_functions predicate over this diff's removed hunks yields one pub fn, crates/gam-terms/src/decoders/skip_transcoder.rs::skip_transcoder_reml_metrics. The deleted pyffi shim of the same name is private. At the base, git grep reml_metrics over gamfit and tests finds nothing."
+  },
+  {
+    "base": "c44866bfd1d6ddbb994700623805182c6c581e51",
+    "removed": {
+      "crates/gam-sae/src/corpus/residual_stratify.rs::stratify_row_energies": 1,
+      "crates/gam-sae/src/frames.rs::from_orthonormal": 1,
+      "crates/gam-sae/src/inference/cross_model_transport.rs::o2_defect": 1,
+      "crates/gam-sae/src/manifold/behavior.rs::with_log_lambda": 1,
+      "crates/gam-sae/src/manifold/stratum_births.rs::dominant_energy_fraction": 1,
+      "crates/gam-sae/src/manifold/stratum_births.rs::min_effective_rows_for_birth": 1,
+      "crates/gam-sae/src/manifold/stratum_births.rs::stratum_local_birth_residual": 1
+    },
+    "reason": "#2899 public API sweep of gam-sae (prune-api-d): public functions with no product user are deleted. They are OutputBlock::with_log_lambda, CrossModelTransportReport::o2_defect and GrassmannFrame::from_orthonormal, plus the stratum-local birth screen manifold/stratum_births.rs with corpus::stratify_row_energies, whose only consumer was that screen.",
+    "evidence": "At f32e348d2, git grep -n -w over crates, src, tests, examples, bench and gamfit finds no production caller of any removed function in any crate. with_log_lambda has no caller at all. o2_defect is called only by one unit-test assertion, which is dropped. from_orthonormal is called only by crates/gam-sae/src/manifold/tests.rs:1459, which now calls from_oriented. dominant_energy_fraction, min_effective_rows_for_birth and stratum_local_birth_residual are called only inside stratum_births.rs. stratify_row_energies is called only by stratum_births.rs. The removed map is public_api_census.py's census difference over this change, computed on MSI."
   }
 ]

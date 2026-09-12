@@ -3757,5 +3757,30 @@
     ],
     "reason": "#2469. The transformation-normal warm start floored the residual RMS at 1e-6, each |y - μ| at 1e-3·RMS + 1e-12 before ln, exp(η) at that residual floor, and τ at 1e-12 before 1/τ. The seed now refuses a response with no residual variation, gives an exactly zero residual the pooled ln τ̄, and refuses a scale that is not positive and finite or whose reciprocal is not representable. So the four floor constants have no remaining user.",
     "evidence": "At the base, git grep -n -w finds each of WARMSTART_GLOBAL_SCALE_FLOOR, WARMSTART_RESIDUAL_REL_FLOOR, WARMSTART_RESIDUAL_ABS_FLOOR and WARMSTART_INV_SCALE_FLOOR only at its declaration and doc comments in crates/gam-models/src/transformation_normal/config.rs, and at its use in crates/gam-models/src/transformation_normal/warm_start.rs (lines 61, 202 and 203). This change replaces those uses. All four are pub(crate), production-scoped and declared once, and no test names them. The item list applies source_removal_guard.py's ITEM regex and occurrence rule by hand. Compile is covered by the lead's shared tip check."
+  },
+  {
+    "base": "c44866bfd1d6ddbb994700623805182c6c581e51",
+    "items": [
+      "crates/gam-sae/src/assignment.rs:enum:RoutingPredictor",
+      "crates/gam-sae/src/corpus/residual_stratify.rs:fn:default",
+      "crates/gam-sae/src/corpus/residual_stratify.rs:fn:stratify_row_energies",
+      "crates/gam-sae/src/corpus/residual_stratify.rs:struct:RowStratum",
+      "crates/gam-sae/src/frames.rs:fn:from_orthonormal",
+      "crates/gam-sae/src/inference/cross_model_transport.rs:fn:o2_defect",
+      "crates/gam-sae/src/manifold/behavior.rs:fn:with_log_lambda",
+      "crates/gam-sae/src/manifold/stratum_births.rs:fn:dominant_energy_fraction",
+      "crates/gam-sae/src/manifold/stratum_births.rs:fn:easy_floor_declines_no_stratification_needed",
+      "crates/gam-sae/src/manifold/stratum_births.rs:fn:effective_sample_size",
+      "crates/gam-sae/src/manifold/stratum_births.rs:fn:ess_floor_closed_form_and_kish_sample_size",
+      "crates/gam-sae/src/manifold/stratum_births.rs:fn:gauss",
+      "crates/gam-sae/src/manifold/stratum_births.rs:fn:min_effective_rows_for_birth",
+      "crates/gam-sae/src/manifold/stratum_births.rs:fn:one_row_stratum_proposes_nothing_adequate_stratum_proposes",
+      "crates/gam-sae/src/manifold/stratum_births.rs:fn:power_iteration_top_eigenvalue",
+      "crates/gam-sae/src/manifold/stratum_births.rs:fn:stratum_local_admits_a_planted_signal_pooled_rejects",
+      "crates/gam-sae/src/manifold/stratum_births.rs:fn:stratum_local_birth_residual",
+      "crates/gam-sae/src/manifold/stratum_births.rs:struct:StratumLocalPick"
+    ],
+    "reason": "#2899 public API sweep of gam-sae (prune-api-d): a public item stays only when a product root uses it (gam-cli, gam-pyffi, gamfit, examples/, or another crate's production code). These items have no production consumer in any crate and are deleted with the test code that only exercised them. RoutingPredictor and OutputBlock::with_log_lambda have no user anywhere. CrossModelTransportReport::o2_defect was named by one assertion in its own unit test, which is dropped; the test keeps its class, winding, phase, isometry and verdict assertions. GrassmannFrame::from_orthonormal was used by one #2521 test, which now builds the same frame through the crate's production GrassmannFrame::from_oriented. The stratum-local birth screen (manifold/stratum_births.rs: StratumLocalPick, dominant_energy_fraction, effective_sample_size, min_effective_rows_for_birth, stratum_local_birth_residual and its unit tests) has no production caller, so the whole module goes, and with it its only consumer of corpus::stratify_row_energies and RowStratum.",
+    "evidence": "At f32e348d2, git grep -n -w over crates, src, tests, examples, bench and gamfit finds RoutingPredictor and with_log_lambda only at their declarations. o2_defect appears only at its declaration, at the assertion in cross_model_transport.rs's recovers_cross_model_rotation_reflection, and as a JSON key string in crates/gam-sae/examples/behavioral_curvature_map.rs, which is not a call. from_orthonormal appears only in frames.rs and crates/gam-sae/src/manifold/tests.rs:1459. StratumLocalPick, dominant_energy_fraction, min_effective_rows_for_birth and stratum_local_birth_residual appear only inside stratum_births.rs, which is declared by a private `mod stratum_births;` and glob re-exported from manifold/mod.rs. stratify_row_energies and RowStratum appear only in residual_stratify.rs, the corpus/mod.rs re-export and stratum_births.rs. The prune-api-d census at 3ef484e06, which reuses the lexers of scripts/source_removal_guard.py and scripts/src_items_used_only_by_tests.py, reports zero production consumers for each item in any crate. sturges_stratum_cap and EnergyExponentHistogram::bin_of keep production callers in residual_stratify.rs (:411, :190, :259). The #2521 test passes an orthonormal 6x1 frame with gauge [1.0], for which from_orthonormal only validated its input and returned from_oriented. Not compiled locally (user directive). Compile is covered by the lead's shared tip check."
   }
 ]

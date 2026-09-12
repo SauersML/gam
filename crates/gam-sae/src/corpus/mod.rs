@@ -93,8 +93,8 @@ pub use rho_cascade::{RhoCascadeSchedule, RhoStepPlan, row_in_fraction};
 /// by guaranteeing rare high-residual rows representation in the discovery
 /// subsample, with Horvitz–Thompson weights that keep every criterion unbiased.
 pub use residual_stratify::{
-    RowResidualEnergy, RowStratum, SpanResidualEnergy, StratifiedCorpusTarget, Stratum,
-    StratumDesign, collect_stratified_target, design_stratified_subsample, stratify_row_energies,
+    RowResidualEnergy, SpanResidualEnergy, StratifiedCorpusTarget, Stratum, StratumDesign,
+    collect_stratified_target, design_stratified_subsample,
 };
 
 /// ISA post-fit torus-merge audit: flag pairs of accepted atoms that are really
