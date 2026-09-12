@@ -94,9 +94,10 @@ fn chi2_1_sf(t: f64) -> f64 {
     gam_math::probability::erfcx_nonnegative(half.sqrt()) * (-half).exp()
 }
 
-/// `χ²₁(level)` two-sided quantile: `(Φ⁻¹((1+level)/2))²`.
+/// `χ²₁(level)` quantile, evaluated from the small normal tail so a coverage
+/// strictly below one never rounds its normal probability up to one.
 fn chi2_1_quantile(level: f64) -> f64 {
-    let z = inv_std_normal(0.5 * (1.0 + level));
+    let z = inv_std_normal(0.5 * (1.0 - level));
     z * z
 }
 
@@ -269,12 +270,12 @@ pub struct FlatnessTest {
 ///
 /// `v_pp` must be `> 0` (a genuine minimiser of `V_p`); the returned half-width
 /// is `z / √v_pp`. Returns `None` when `v_pp` is non-positive (the Wald
-/// approximation is undefined — fall back to a wider manual bracket).
+/// approximation is undefined) or the coverage is outside `(0, 1)`.
 pub fn wald_half_width(v_pp: f64, level: f64) -> Option<f64> {
-    if !(v_pp.is_finite()) || v_pp <= 0.0 {
+    if !(v_pp.is_finite()) || v_pp <= 0.0 || !(level > 0.0 && level < 1.0) {
         return None;
     }
-    let z = inv_std_normal(0.5 * (1.0 + level));
+    let z = -inv_std_normal(0.5 * (1.0 - level));
     Some(z / v_pp.sqrt())
 }
 
@@ -532,6 +533,28 @@ mod tests {
         assert!((h - z / a.sqrt()).abs() < 1e-12);
         assert!(wald_half_width(0.0, level).is_none());
         assert!(wald_half_width(-1.0, level).is_none());
+    }
+
+    #[test]
+    fn highest_representable_coverage_has_finite_wald_and_profile_intervals() {
+        let level = f64::from_bits(1.0_f64.to_bits() - 1);
+        let width = wald_half_width(1.0, level).unwrap();
+        assert!(width.is_finite() && width > 8.0 && width < 9.0);
+        let tail = chi2_1_sf(chi2_1_quantile(level));
+        assert!((tail / (1.0 - level) - 1.0).abs() < 2.0e-13);
+
+        let ci = profile_ci_walk(quad(0.0, 1.0, 0.0), 0.0, 1.0, -20.0, 20.0, level, 1e-9)
+            .unwrap();
+        assert!(!ci.lo_at_bound && !ci.hi_at_bound);
+        assert!((ci.ci_lo + width).abs() < 1.0e-7);
+        assert!((ci.ci_hi - width).abs() < 1.0e-7);
+    }
+
+    #[test]
+    fn wald_half_width_rejects_invalid_coverage() {
+        for level in [0.0, -0.1, 1.0, 1.1, f64::NAN, f64::INFINITY] {
+            assert!(wald_half_width(1.0, level).is_none());
+        }
     }
 
     #[test]
