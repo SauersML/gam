@@ -409,26 +409,12 @@ impl<const K: usize> Tower4<K> {
 
     /// √self. Caller guarantees positivity.
     pub fn sqrt(&self) -> Self {
-        let u = self.v;
-        let s = u.sqrt();
-        self.compose_unary([
-            s,
-            0.5 / s,
-            -0.25 / (u * s),
-            0.375 / (u * u * s),
-            -0.9375 / (u * u * u * s),
-        ])
+        self.compose_unary(sqrt_derivative_stack(self.v))
     }
 
     /// self^a for real exponent `a`. Caller guarantees a positive base.
     pub fn powf(&self, a: f64) -> Self {
-        let u = self.v;
-        let f0 = u.powf(a);
-        let f1 = a * u.powf(a - 1.0);
-        let f2 = a * (a - 1.0) * u.powf(a - 2.0);
-        let f3 = a * (a - 1.0) * (a - 2.0) * u.powf(a - 3.0);
-        let f4 = a * (a - 1.0) * (a - 2.0) * (a - 3.0) * u.powf(a - 4.0);
-        self.compose_unary([f0, f1, f2, f3, f4])
+        self.compose_unary(power_derivative_stack(self.v, a))
     }
 
     /// ln Γ(self). Caller guarantees positivity.
@@ -662,9 +648,7 @@ impl<const K: usize> Tower2<K> {
 
     /// √self. Caller guarantees positivity.
     pub fn sqrt(&self) -> Self {
-        let u = self.v;
-        let s = u.sqrt();
-        self.compose_unary([s, 0.5 / s, -0.25 / (u * s)])
+        self.compose_unary(sqrt_derivative_stack(self.v))
     }
 }
 
@@ -1003,6 +987,46 @@ impl<const K: usize> std::ops::Add for Tower3<K> {
         }
         out
     }
+}
+
+/// Derivatives of `u^a` for a positive base. For a nonnegative integer
+/// exponent, derivatives above the polynomial degree are identically zero;
+/// do not evaluate their negative powers and turn `0 * infinity` into NaN.
+#[inline]
+pub(crate) fn power_derivative_stack<const N: usize>(u: f64, a: f64) -> [f64; N] {
+    let mut derivatives = [0.0; N];
+    derivatives[0] = u.powf(a);
+    let mut coefficient = 1.0;
+    for (order, derivative) in derivatives.iter_mut().enumerate().skip(1) {
+        let factor = a - (order - 1) as f64;
+        if factor == 0.0 {
+            break;
+        }
+        coefficient *= factor;
+        *derivative = coefficient * u.powf(a - order as f64);
+    }
+    derivatives
+}
+
+/// Square-root derivatives, dividing successively instead of forming a
+/// denominator that can overflow while its reciprocal is still subnormal.
+#[inline]
+pub(crate) fn sqrt_derivative_stack<const N: usize>(u: f64) -> [f64; N] {
+    let root = u.sqrt();
+    let mut derivatives = [0.0; N];
+    derivatives[0] = root;
+    let mut coefficient = 0.5;
+    for (order, derivative) in derivatives.iter_mut().enumerate().skip(1) {
+        if order > 1 {
+            coefficient *= 1.5 - order as f64;
+        }
+        let mut value = coefficient / root;
+        for _ in 1..order {
+            value /= u;
+        }
+        *derivative = value;
+    }
+    derivatives
 }
 
 pub fn ln_gamma_derivative_stack(x: f64) -> [f64; 5] {
