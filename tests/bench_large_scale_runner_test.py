@@ -710,8 +710,8 @@ _MARKER_SAMPLES: dict[str, tuple[str, str]] = {
         "[TANGENT-REJECTED] reason=degenerate_drho d_rho_norm_sq={:.3e}",
     ),
     "_TANGENT_NOOP_PATTERN": (
-        "[TANGENT-NOOP] reason=alpha_below_eps alpha=1.000e-15 eps=1.000e-12",
-        "[TANGENT-NOOP] reason=alpha_below_eps alpha={:.3e} eps={:.3e}",
+        "[TANGENT-NOOP] reason=prediction_equals_current alpha=1.000e-15",
+        "[TANGENT-NOOP] reason=prediction_equals_current alpha={:.3e}",
     ),
     "_OUTER_NONFINITE_PATTERN": (
         "[OUTER non-finite] leverage h^G has non-finite entries",
@@ -1347,9 +1347,9 @@ class PhaseSummaryAggregationTests(unittest.TestCase):
         stderr = "\n".join([
             self._tangent_predict("1.000e+00"),
             self._tangent_predict("1.100e+00"),
-            "[TANGENT-NOOP] reason=alpha_below_eps alpha=1.000e-15 eps=1.000e-12",
-            "[TANGENT-NOOP] reason=alpha_below_eps alpha=5.000e-16 eps=1.000e-12",
-            "[TANGENT-NOOP] reason=alpha_below_eps alpha=1.000e-14 eps=1.000e-12",
+            "[TANGENT-NOOP] reason=prediction_equals_current alpha=1.000e-15",
+            "[TANGENT-NOOP] reason=prediction_equals_current alpha=5.000e-16",
+            "[TANGENT-NOOP] reason=prediction_equals_current alpha=1.000e-14",
             "[TANGENT-REJECTED] reason=alpha_above_cap alpha=2.500e+00 cap=1.500e+00",
             "[PHASE] my-fit fit end elapsed=10.0s",
         ])
