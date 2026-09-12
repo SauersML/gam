@@ -12,7 +12,10 @@
 //!    effect on the Weibull log-scale from a prior, simulate right-censored
 //!    survival times with a KNOWN survival function
 //!    S(t | x) = exp(-(t/λ(x))^k), fit via the real CLI (`gam fit
-//!    "Surv(entry, exit, event) ~ x" --survival-likelihood weibull`).
+//!    "Surv(entry, exit, event) ~ s(x)" --survival-likelihood weibull`). The
+//!    drawn effect is a sine on the log scale, so the fitted model must be a
+//!    smooth: a straight line in `x` cannot represent it, and its interval
+//!    would be graded on misspecification bias instead of on `survival_se`.
 //! 2. [`survival_location_scale_delta_method_se_covers_true_survival_probability_at_nominal`]
 //!    — the `estimand = Plugin` delta-method path for the location-scale
 //!    (AFT) family (`predict_survival_location_scalewith_uncertainty`, via
@@ -141,12 +144,12 @@ fn survival_posterior_mean_se_covers_true_survival_probability_at_nominal() {
         fit_cmd
             .arg("fit")
             .arg(&train_path)
-            .arg("Surv(entry, exit, event) ~ x")
+            .arg("Surv(entry, exit, event) ~ s(x)")
             .arg("--survival-likelihood")
             .arg("weibull")
             .arg("--out")
             .arg(&model_path);
-        run_or_panic(fit_cmd, "gam fit Weibull Surv(...) ~ x for SE coverage");
+        run_or_panic(fit_cmd, "gam fit Weibull Surv(...) ~ s(x) for SE coverage");
         assert!(
             model_path.is_file(),
             "gam fit did not write {model_path:?} (rep {rep})"
