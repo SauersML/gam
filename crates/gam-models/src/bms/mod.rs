@@ -6,7 +6,7 @@ use crate::custom_family::{
     FamilyLinearizationState, ParameterBlockSpec, ParameterBlockState, PenaltyMatrix,
     custom_family_outer_derivatives, evaluate_custom_family_joint_hyper_best_mode_shared,
     fit_custom_family, fit_custom_family_fixed_log_lambdas_from_mode_selection,
-    joint_hyper_options_for_outer_tolerance,
+    joint_hyper_options_for_outer_tolerance, upgrade_custom_family_joint_hyper_mode_shared,
 };
 use crate::exact_mode_branch::ExactCoefficientModeBranch;
 use crate::fit_orchestration::drivers::{

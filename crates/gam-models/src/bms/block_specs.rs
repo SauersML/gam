@@ -2871,7 +2871,7 @@ pub fn fit_bernoulli_marginal_slope_terms(
          designs: &[TermCollectionDesign],
          eval_mode,
          row_set: &crate::row_kernel::RowSet,
-         _| {
+         owned_value_mode| {
             if let Some(err) = runaway_error.borrow().as_ref().cloned() {
                 return Err(err);
             }
@@ -2933,24 +2933,45 @@ pub fn fit_bernoulli_marginal_slope_terms(
                 &tolerance_options,
                 row_set,
             );
-            let (first_iterate, candidates) = exact_mode_branch
-                .borrow_mut()
-                .candidates(effective_mode, &rho);
-            if first_iterate {
+            // At the θ of a value-only evaluation (a line search's accepted
+            // step) the driver hands over that evaluation's converged mode.
+            // Derivatives are assembled on it: re-solving from the anchor
+            // repeated the identical coefficient solve and ValueOnly pass
+            // inside every ValueAndGradient evaluation (#979).
+            let selection = if let Some(value_selection) = owned_value_mode {
                 log::info!(
-                    "[BMS] first derivative-bearing outer evaluation: its certified mode becomes the coefficient-mode anchor every later probe starts from"
+                    "[BMS] upgrading the exact owned ValueOnly coefficient mode at identical theta; skipping coefficient re-solve"
                 );
-            }
-            let selection = evaluate_custom_family_joint_hyper_best_mode_shared(
-                &family,
-                &blocks,
-                &eval_options,
-                &rho,
-                hyper_layout,
-                &candidates,
-                effective_mode,
-            )
-            .map_err(|error| error.to_string())?;
+                upgrade_custom_family_joint_hyper_mode_shared(
+                    &family,
+                    &blocks,
+                    &eval_options,
+                    &rho,
+                    hyper_layout,
+                    value_selection,
+                    effective_mode,
+                )
+                .map_err(|error| error.to_string())?
+            } else {
+                let (first_iterate, candidates) = exact_mode_branch
+                    .borrow_mut()
+                    .candidates(effective_mode, &rho);
+                if first_iterate {
+                    log::info!(
+                        "[BMS] first derivative-bearing outer evaluation: its certified mode becomes the coefficient-mode anchor every later probe starts from"
+                    );
+                }
+                evaluate_custom_family_joint_hyper_best_mode_shared(
+                    &family,
+                    &blocks,
+                    &eval_options,
+                    &rho,
+                    hyper_layout,
+                    &candidates,
+                    effective_mode,
+                )
+                .map_err(|error| error.to_string())?
+            };
             if let Some(err) = bernoulli_marginal_slope_runaway_error(
                 &selection.result.warm_start,
                 &designs[0],
