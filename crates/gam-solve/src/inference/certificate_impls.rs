@@ -14,8 +14,8 @@
 //! crate and these types are owned here in `gam-solve`, so the impls must be
 //! defined in the type's home crate. The bodies are byte-identical to the
 //! monolith originals, so there remains exactly one decision rule per verdict.
-//! (The gam-sae-owned certificate types — `EncodeResult`, `ResidualGaugeReport`,
-//! `CertificateInputs` — carry their own impls in `gam_sae::certificate_impls`.)
+//! (The gam-sae-owned certificate types — `ResidualGaugeReport`, `CertificateInputs`
+//! — carry their own impls in `gam_sae::certificate_impls`.)
 
 use crate::logdet_bounds::LogdetEnclosure;
 use crate::model_types::OuterCriterionCertificate;

@@ -1420,8 +1420,8 @@ fn smooth_threshold_hdiag_third_derivative_matches_central_difference_1415() {
 }
 
 /// Direct FD regression guard for the Kantorovich-certificate primitives
-/// `encode_grad_hess` and `beta_eta_newton` (encode.rs). These are load-bearing
-/// for `certified_encode` (the #1026/#1154 basin path) yet were previously only
+/// `encode_grad_hess_core` and `beta_eta_newton` (encode.rs). These are load-bearing
+/// for the certified encode (the #1026/#1154 basin path) yet were previously only
 /// exercised *indirectly* through the full encode. This pins, at the scalar
 /// periodic (circle) coordinate that #1026 actually uses:
 ///   - the gradient `g = ∂f/∂t` of `f(t) = ½‖z·decode(t) − x‖²` (amplitude factor),
@@ -1433,7 +1433,7 @@ fn smooth_threshold_hdiag_third_derivative_matches_central_difference_1415() {
 /// curvature term are nonzero (a stationary point would zero `r` and hide bugs).
 #[test]
 fn encode_grad_hess_and_beta_eta_match_finite_differences() {
-    use crate::encode::{beta_eta_newton, encode_grad_hess};
+    use crate::encode::{EncodeObjective, beta_eta_newton, encode_grad_hess_core};
     use ndarray::Array2;
 
     // Periodic (circle) atom: real second jet via TestPeriodicEvaluator (d=1).
@@ -1471,11 +1471,18 @@ fn encode_grad_hess_and_beta_eta_match_finite_differences() {
         0.5 * r.dot(&r)
     };
 
-    // Analytic g, H — `encode_grad_hess` returns the TRUE Hessian ∂²f/∂t² (no
+    // Analytic g, H — `encode_grad_hess_core` returns the TRUE Hessian ∂²f/∂t² (no
     // Levenberg ridge is added to the certified field; F2).
     let t_view = ndarray::Array1::from_vec(vec![t0]);
-    let (g, h) = encode_grad_hess(&atom, &eval, t_view.view(), x.view(), amplitude)
-        .expect("encode_grad_hess runs")
+    let (g, h) = encode_grad_hess_core(
+        &atom,
+        &eval,
+        t_view.view(),
+        x.view(),
+        amplitude,
+        &EncodeObjective::euclidean(),
+    )
+    .expect("encode_grad_hess_core runs")
         .expect("second jet present ⇒ Some");
 
     // Central FD of f → gradient.

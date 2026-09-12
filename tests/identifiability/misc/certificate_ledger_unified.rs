@@ -8,7 +8,6 @@ use gam::inference::row_measure::CoresetCertificate;
 use gam::solver::logdet_bounds::LogdetEnclosure;
 use gam::solver::rho_optimizer::{OuterCriterionCertificate, OuterStationarityCertificate};
 use gam::solver::structure_search::{CollapseAction, CollapseEvent};
-use gam::terms::sae::encode::EncodeResult;
 
 fn clean_criterion() -> OuterCriterionCertificate {
     OuterCriterionCertificate {
@@ -55,32 +54,6 @@ fn every_certificate_states_claim_evidence_and_conservative_verdict() {
 }
 
 #[test]
-fn encode_result_batch_verdict_is_all_or_flagged() {
-    // An all-certified batch certifies; one flagged row makes it Insufficient;
-    // an empty batch certifies nothing (Unavailable).
-    let all_good = EncodeResult {
-        coords: ndarray::Array2::zeros((3, 1)),
-        certified: vec![true, true, true],
-        encode_uncertified_count: 0,
-    };
-    assert_eq!(all_good.verdict(), Verdict::Certified);
-
-    let one_flagged = EncodeResult {
-        coords: ndarray::Array2::zeros((3, 1)),
-        certified: vec![true, false, true],
-        encode_uncertified_count: 1,
-    };
-    assert_eq!(one_flagged.verdict(), Verdict::Insufficient);
-
-    let empty = EncodeResult {
-        coords: ndarray::Array2::zeros((0, 1)),
-        certified: vec![],
-        encode_uncertified_count: 0,
-    };
-    assert_eq!(empty.verdict(), Verdict::Unavailable);
-}
-
-#[test]
 fn collapse_terminal_makes_no_health_claim() {
     let terminal = CollapseEvent {
         iteration: 2,
@@ -97,12 +70,6 @@ fn collapse_terminal_makes_no_health_claim() {
 fn all_certified_ledger_rolls_up_certified() {
     let mut ledger = CertificateLedger::new();
     ledger.record(&clean_criterion());
-    let good_encode = EncodeResult {
-        coords: ndarray::Array2::zeros((2, 1)),
-        certified: vec![true, true],
-        encode_uncertified_count: 0,
-    };
-    ledger.record(&good_encode);
     assert_eq!(ledger.overall(), Verdict::Certified);
     assert!(ledger.overall().is_certified());
 }

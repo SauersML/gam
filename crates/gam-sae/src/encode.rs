@@ -52,14 +52,13 @@
 //!    atom's coordinate grid (the SHAPE_BAND grid idiom), each with a certified
 //!    Newton radius `R_c` solved from the Kantorovich inequality at the
 //!    worst-case in-chart start.
-//! 2. **Online, per row** (`EncodeAtlas::certified_encode_row`): route to the
-//!    nearest chart, start from its distilled IFT predictor, take one or two
-//!    Newton steps, then the `h ≤ ½` check AT the start point is the per-row
-//!    certificate.
-//! 3. **Uncertified tail**: rows whose start fails `h ≤ ½` are FLAGGED (counted
-//!    in [`EncodeResult::encode_uncertified_count`]) and must be routed by the
-//!    caller to the existing exact multi-start solve. No approximation enters
-//!    silently.
+//! 2. **Online, per row** ([`EncodeAtlas::certified_encode_row_with_objective`]):
+//!    route to the nearest chart, start from its distilled IFT predictor, take
+//!    one or two Newton steps, then the `h ≤ ½` check AT the start point is the
+//!    per-row certificate.
+//! 3. **Uncertified tail**: rows whose start fails `h ≤ ½` are FLAGGED (their
+//!    [`RowCertificate::certified`] is `false`) and must be routed by the caller
+//!    to the existing exact multi-start solve. No approximation enters silently.
 
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
 use opt::constants::{ARMIJO_C1, BACKTRACK_CONTRACTION};
@@ -600,22 +599,6 @@ pub struct AtomEncodeAtlas {
     pub(crate) periodic_fiber: Option<PeriodicCurveExtrema>,
 }
 
-/// Result of a certified encode over a batch of rows, carrying the honesty
-/// flag: how many rows could NOT be certified and were flagged for the exact
-/// multi-start fallback (issue #1010 — no approximation enters silently).
-#[derive(Debug, Clone)]
-pub struct EncodeResult {
-    /// Per-row encoded latent coordinates (`n_rows × latent_dim`).
-    pub coords: Array2<f64>,
-    /// Per-row certificate: `true` ⇒ the row's start satisfied `h ≤ ½` and the
-    /// 1–2 Newton steps are exact-into-the-certified-ball; `false` ⇒ flagged.
-    pub certified: Vec<bool>,
-    /// Count of rows that could not be certified. These ride the payload so the
-    /// caller routes them to the exact multi-start encode — honesty, never
-    /// silent. Equals `certified.iter().filter(|c| !**c).count()`.
-    pub encode_uncertified_count: usize,
-}
-
 /// Result of solving the frozen dictionary's joint coordinate objective over a
 /// batch. `converged[row]` is a numerical first-order stationarity verdict for
 /// the shared-residual objective, not a Newton--Kantorovich certificate.
@@ -822,53 +805,6 @@ impl JetSups {
             third: family.third_sup(chart),
         }
     }
-}
-
-/// Evaluate one atom's encode objective gradient `F(t) = ∇f_k(t)` and the FULL
-/// Hessian `F'(t) = ∇²f_k(t)` at a single coordinate `t`, for a single target
-/// row `x` and fixed amplitude `z`. With `m(t) = z·BᵀΦ(t)`, `r = m − x`,
-/// `J_m = z·Bᵀ J_Φ`:
-///
-/// ```text
-/// g_t[a]   = J_m[a] · r                                  (= ∇f)
-/// H_tt[a,b] = J_m[a] · J_m[b] + r · ∂²m/∂t_a∂t_b         (= ∇²f, FULL Hessian)
-/// ```
-///
-/// The certificate uses the FULL Hessian rather than the Gauss-Newton block
-/// `J_mᵀ J_m`. This is the principled choice for Newton–Kantorovich: the
-/// theorem certifies convergence of Newton on `F = ∇f` to the unique nearby
-/// ROOT of `∇f`, but a root of `∇f` can be a maximum. The full Hessian is
-/// positive-definite exactly on the genuine-minimum basin, so requiring
-/// `λ_min(H) > 0` (finite `β`) is what flags a start that would otherwise let
-/// Gauss-Newton march into the wrong root (e.g. the circle antipode, a local
-/// max where `∇f = 0` but the full curvature is negative). The residual term
-/// needs the basis second jet `∂²Φ/∂t²`; an evaluator without one returns
-/// `None`, and the row is flagged (no silent Gauss-Newton fallback).
-///
-/// The Hessian returned is the TRUE `∇²f_k` — no Levenberg ridge is added
-/// (F2). The Kantorovich certificate (`row_certificate`) and its `λ_min(H) > 0`
-/// saddle gate must see the genuine field: a ridged `H + λI` certifies neither
-/// the original objective nor a consistently regularized one (a
-/// locally-constant reconstruction has `H = 0`, whose ridged `λI` would falsely
-/// certify a non-isolated, non-unique root). Ridge stays only in the
-/// UNCERTIFIED amortized predictor (`center_amortized_jacobian`/`center_beta`).
-pub fn encode_grad_hess(
-    atom: &SaeManifoldAtom,
-    evaluator: &dyn SaeBasisEvaluator,
-    t: ArrayView1<'_, f64>,
-    x: ArrayView1<'_, f64>,
-    amplitude: f64,
-) -> Result<Option<(Array1<f64>, Array2<f64>)>, String> {
-    // The bare Euclidean, prior-free objective — the historical field, bit-identical
-    // to the metric-free encode (see [`encode_grad_hess_core`], `EncodeObjective`).
-    encode_grad_hess_core(
-        atom,
-        evaluator,
-        t,
-        x,
-        amplitude,
-        &EncodeObjective::euclidean(),
-    )
 }
 
 /// The TRUE per-row encode objective's non-Euclidean ingredients (F3), so the
@@ -1297,10 +1233,39 @@ pub(crate) fn joint_encode_refine_row(
     Ok((coords, converged))
 }
 
-/// Objective-aware gradient/Hessian of the certified encode field (F3). With
-/// [`EncodeObjective::euclidean`] this is bit-for-bit the historical metric-free
-/// field; with a metric it whitens the residual through `M = U Uᵀ`, and with a
-/// prior it adds the ARD/von-Mises gradient and (diagonal) Hessian.
+/// Evaluate one atom's encode objective gradient `F(t) = ∇f_k(t)` and the FULL
+/// Hessian `F'(t) = ∇²f_k(t)` at a single coordinate `t`, for a single target
+/// row `x` and fixed amplitude `z`. With `m(t) = z·BᵀΦ(t)`, `r = m − x`,
+/// `J_m = z·Bᵀ J_Φ`:
+///
+/// ```text
+/// g_t[a]   = J_m[a] · r                                  (= ∇f)
+/// H_tt[a,b] = J_m[a] · J_m[b] + r · ∂²m/∂t_a∂t_b         (= ∇²f, FULL Hessian)
+/// ```
+///
+/// The certificate uses the FULL Hessian rather than the Gauss-Newton block
+/// `J_mᵀ J_m`. This is the principled choice for Newton–Kantorovich: the
+/// theorem certifies convergence of Newton on `F = ∇f` to the unique nearby
+/// ROOT of `∇f`, but a root of `∇f` can be a maximum. The full Hessian is
+/// positive-definite exactly on the genuine-minimum basin, so requiring
+/// `λ_min(H) > 0` (finite `β`) is what flags a start that would otherwise let
+/// Gauss-Newton march into the wrong root (e.g. the circle antipode, a local
+/// max where `∇f = 0` but the full curvature is negative). The residual term
+/// needs the basis second jet `∂²Φ/∂t²`; an evaluator without one returns
+/// `None`, and the row is flagged (no silent Gauss-Newton fallback).
+///
+/// The Hessian returned is the TRUE `∇²f_k` — no Levenberg ridge is added
+/// (F2). The Kantorovich certificate (`row_certificate`) and its `λ_min(H) > 0`
+/// saddle gate must see the genuine field: a ridged `H + λI` certifies neither
+/// the original objective nor a consistently regularized one (a
+/// locally-constant reconstruction has `H = 0`, whose ridged `λI` would falsely
+/// certify a non-isolated, non-unique root). Ridge stays only in the
+/// UNCERTIFIED amortized predictor (`center_amortized_jacobian`/`center_beta`).
+///
+/// This is the objective-aware field (F3): with [`EncodeObjective::euclidean`] it is
+/// exactly the bare field above; with a metric it whitens the residual through
+/// `M = U Uᵀ`, and with a prior it adds the ARD/von-Mises gradient and (diagonal)
+/// Hessian.
 pub(crate) fn encode_grad_hess_core(
     atom: &SaeManifoldAtom,
     evaluator: &dyn SaeBasisEvaluator,
@@ -1316,7 +1281,7 @@ pub(crate) fn encode_grad_hess_core(
     let (phi, jet) = evaluator.evaluate(coords.view())?;
     if phi.dim() != (1, m) {
         return Err(format!(
-            "encode_grad_hess: evaluator returned phi {:?}, expected (1, {m})",
+            "encode_grad_hess_core: evaluator returned phi {:?}, expected (1, {m})",
             phi.dim()
         ));
     }
@@ -2260,7 +2225,7 @@ impl EncodeAtlas {
         let atom_atlas = self
             .atoms
             .get(atom_index)
-            .ok_or_else(|| format!("certified_encode_row: atom {atom_index} not in atlas"))?;
+            .ok_or_else(|| format!("certified_encode_row_with_objective: atom {atom_index} not in atlas"))?;
         let d = atom.latent_dim();
         // A per-row metric factor `U` must be `p × rank` (`M = U Uᵀ` acts on the
         // p-dim output). A shape mismatch is a caller bug — surface it rather than
@@ -2506,7 +2471,7 @@ impl EncodeAtlas {
         let atom_atlas = self
             .atoms
             .get(atom_index)
-            .ok_or_else(|| format!("amortized_encode_row: atom {atom_index} not in atlas"))?;
+            .ok_or_else(|| format!("amortized_encode_row_with_objective: atom {atom_index} not in atlas"))?;
         let d = atom.latent_dim();
         let uncertified = || {
             (
@@ -3525,7 +3490,7 @@ mod encode_fix_tests {
     /// so the point is NOT a genuine isolated minimum and must NOT be certified.
     /// The old code ridged the certified Hessian (`H → ridge·I`, PD), faking
     /// `β = 1/ridge`, `η = 0`, `h = 0 ≤ ½` — a FALSE certificate. With the true
-    /// Hessian (`encode_grad_hess` no longer adds ridge) `beta_eta_newton` sees
+    /// Hessian (`encode_grad_hess_core` no longer adds ridge) `beta_eta_newton` sees
     /// `λ_min = 0` and refuses.
     #[test]
     fn f2_certificate_uses_true_hessian_refuses_singular_field() {
@@ -3537,8 +3502,15 @@ mod encode_fix_tests {
         let t0 = Array1::from(vec![0.0]);
         let x = Array1::from(vec![0.5]);
 
-        let (g, h) = encode_grad_hess(&atom, &eval, t0.view(), x.view(), 1.0)
-            .expect("encode_grad_hess runs")
+        let (g, h) = encode_grad_hess_core(
+            &atom,
+            &eval,
+            t0.view(),
+            x.view(),
+            1.0,
+            &EncodeObjective::euclidean(),
+        )
+        .expect("encode_grad_hess_core runs")
             .expect("second jet present ⇒ Some");
         assert!(
             h.iter().all(|&v| v == 0.0),

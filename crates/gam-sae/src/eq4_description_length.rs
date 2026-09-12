@@ -32,9 +32,9 @@
 //!   256 vs 8192 estimation rows), so the two `N`s are now passed separately and
 //!   the dictionary term depends on the horizon alone.
 //!
-//! Unlike the per-featurizer [`crate::description_length::score`] surface (which
-//! water-fills a single unweighted spectrum), the Eq. 4 scorer water-fills a
-//! collection of firing-probability-weighted spectra against a shared level via
+//! Unlike [`crate::description_length::reverse_water_filling`] (which water-fills
+//! a single unweighted spectrum), the Eq. 4 scorer water-fills a collection of
+//! firing-probability-weighted spectra against a shared level via
 //! [`crate::description_length::weighted_reverse_water_filling`].
 //!
 //! # The featurizer surface
@@ -90,10 +90,8 @@ pub struct Eq4DescriptionLength {
     pub support_bits: f64,
     /// The exact cost `Σ_g H₂(p_g)` of naming an INDEPENDENT support with the
     /// measured per-atom firing rates. Reported alongside [`Self::support_bits`],
-    /// never charged — the same discipline
-    /// [`crate::description_length::ScoreRow`] already applies, where the
-    /// combinatorial line is reported next to the empirical support-entropy price
-    /// so a dictionary with predictable firing is not silently overpaid.
+    /// never charged, so a dictionary with predictable firing is visibly, not
+    /// silently, overpaid by the charged worst case.
     ///
     /// It upper-bounds the true support entropy `H(S)` (dependence between
     /// firings only lowers it) and, being maximised at uniform firing rates,

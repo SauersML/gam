@@ -1,23 +1,19 @@
-//! Description-length (REML-as-MDL) reporting surface (#2085).
+//! Description-length (MDL) reporting surface (#2085).
 //!
-//! The REML negative log-evidence a manifold-SAE / dictionary fit already computes
-//! IS a description length: with `v` in nats, `v / ln 2` is bits, and its terms
-//! decompose as
+//! A manifold-SAE / dictionary fit is priced as a description length in bits,
+//! decomposed as
 //!
-//! * **code** bits — the data-fit / distortion term (`loss.total`), the rate to
-//!   transmit each firing's coefficients at the achieved distortion;
-//! * **selection** bits — the assignment-sparsity term, `log₂ C(G, k)`, naming
-//!   which `k` of `G` atoms fired;
-//! * **dictionary** bits — the effective-parameter term `½log|XᵀX + S| − occam`,
-//!   the amortised cost of storing the decoder.
+//! * **code** bits — the rate to transmit each firing's coefficients at the
+//!   achieved distortion;
+//! * **selection** bits — naming which atoms fired per token;
+//! * **dictionary** bits — the amortised cost of storing the decoder.
 //!
-//! (`SaeManifoldTerm::penalized_quasi_laplace_criterion` forms `v = loss.total + extra_penalty +
-//! ½log_det − occam`; construction.rs owns those internals — this module CONSUMES
-//! their outputs and never recomputes the fit.)
-//!
-//! This module is the permanent gam surface for that accounting, ported from the
-//! hand-verified `Manifold-SAE experiments/mdl_ladder/mdl.py` reference: a
-//! rate-distortion [`score`] of a [`Featurizer`] at a stated distortion floor.
+//! Every quantity is read off an existing fit; nothing here recomputes it. The
+//! surface is ported from the hand-verified `Manifold-SAE
+//! experiments/mdl_ladder/mdl.py` reference: the rate-distortion primitives, the
+//! closed-form curved-birth pre-screen ([`predicted_birth_dl_bits`]), matched
+//! curved-vs-flat description lengths ([`matched_dl`]), and the fit-level
+//! [`manifold_fit_description_length`].
 
 use crate::atom_codes::SparseAtomCodes;
 
@@ -274,135 +270,6 @@ pub fn predicted_birth_dl_bits(p: &BirthMdlPrescreen) -> f64 {
     saving - dictionary_delta
 }
 
-/// One rung of the description-length ladder — a featurizer's reporting inputs.
-///
-/// `coded_var` are the per-coordinate signal variances of the `m` coefficients
-/// emitted per firing (`m = coded_var.len()`): a direction has `m = 1`, a `b`-block
-/// `m = b`, a `d`-chart `m = d`. `n_params` is the DICTIONARY (decoder) scalar
-/// count. `total_var` and `ev` fix the achieved residual `(1−ev)·total_var` for
-/// the feasibility check.
-#[derive(Clone, Debug)]
-pub struct Featurizer {
-    pub name: String,
-    pub kind: String,
-    pub coded_var: Vec<f64>,
-    pub n_params: i64,
-    pub ev: f64,
-    pub total_var: f64,
-    pub n_tokens: i64,
-    pub n_firings: i64,
-    pub g_dict: i64,
-    pub k_active: i64,
-    /// Empirical per-token support-entropy selection currency `H(S)` in bits
-    /// (the Chow–Liu tree estimate from
-    /// [`SparseAtomCodes::support_entropy`](crate::atom_codes::SparseAtomCodes::support_entropy)),
-    /// when the binary support matrix is available. When `Some`, this is the
-    /// DEFAULT selection price the featurizer is scored at — the reviewer-required
-    /// correction so a tiling dictionary's predictable co-firing is not overpaid
-    /// at the combinatorial worst case `log₂ C(G, k)`. When `None`, the scoring
-    /// surface falls back to that combinatorial bound. The combinatorial line is
-    /// reported ALONGSIDE the currency in either case (never dropped).
-    pub support_entropy_bits: Option<f64>,
-}
-
-impl Featurizer {
-    pub fn m(&self) -> usize {
-        self.coded_var.len()
-    }
-    pub fn residual(&self) -> f64 {
-        (1.0 - self.ev) * self.total_var
-    }
-
-    /// The combinatorial (uniform-support) per-token selection price
-    /// `log₂ C(G, k)` — the worst case, always reported.
-    pub fn selection_bits_combinatorial(&self) -> f64 {
-        selection_bits(self.g_dict, self.k_active)
-    }
-
-    /// The selection price this featurizer is CHARGED per token: the empirical
-    /// support entropy `H(S)` when available (the default currency), else the
-    /// combinatorial worst case.
-    pub fn selection_bits_charged(&self) -> f64 {
-        self.support_entropy_bits
-            .unwrap_or_else(|| self.selection_bits_combinatorial())
-    }
-}
-
-/// The scored description length of one featurizer at a stated distortion floor.
-#[derive(Clone, Debug)]
-pub struct ScoreRow {
-    pub name: String,
-    pub kind: String,
-    pub coded_dim_m: usize,
-    pub code_bits_per_firing: f64,
-    pub code_coeff_bits_per_firing: f64,
-    /// The selection bits per firing actually CHARGED — the empirical support
-    /// entropy `H(S)` when `feat.support_entropy_bits` is set (the default
-    /// currency), else the combinatorial `log₂ C(G, k)`.
-    pub selection_bits_per_firing: f64,
-    /// The combinatorial worst-case selection price `log₂ C(G, k)`, reported
-    /// alongside the charged currency in every row (the reviewer's worst-case
-    /// line). Equals `selection_bits_per_firing` when no support entropy was
-    /// supplied.
-    pub selection_bits_combinatorial_per_firing: f64,
-    pub n_params: i64,
-    pub l_param_bits: f64,
-    pub dict_bits: f64,
-    pub code_bits_total: f64,
-    pub total_bits: f64,
-    pub bits_per_token: f64,
-    pub residual_achieved: f64,
-    pub distortion_floor: f64,
-    pub distortion_infeasible: bool,
-}
-
-/// Bits/token description length for `feat` at per-token distortion floor `delta2`.
-///
-/// `l_param_bits` is the cost to store one dictionary scalar. `None` selects the
-/// distortion-matched precision (a decoder weight quantised to the same per-scalar
-/// rate as a code coefficient) = the mean per-coefficient code rate; pass a value
-/// (e.g. 16 for fp16) to override.
-pub fn score(feat: &Featurizer, delta2: f64, l_param_bits: Option<f64>) -> ScoreRow {
-    let (code_coeff, _) = reverse_water_filling(&feat.coded_var, delta2);
-    let sel_comb = feat.selection_bits_combinatorial();
-    let sel = feat.selection_bits_charged();
-    let code_per_firing = code_coeff + sel;
-    let m = feat.m();
-    let l_param = l_param_bits.unwrap_or_else(|| {
-        if m > 0 {
-            code_coeff / m as f64
-        } else {
-            scalar_rate_bits(feat.total_var, delta2)
-        }
-    });
-    let dict_bits = feat.n_params as f64 * l_param;
-    let code_total = code_per_firing * feat.n_firings as f64;
-    let total = code_total + dict_bits;
-    let residual = feat.residual();
-    ScoreRow {
-        name: feat.name.clone(),
-        kind: feat.kind.clone(),
-        coded_dim_m: m,
-        code_bits_per_firing: code_per_firing,
-        code_coeff_bits_per_firing: code_coeff,
-        selection_bits_per_firing: sel,
-        selection_bits_combinatorial_per_firing: sel_comb,
-        n_params: feat.n_params,
-        l_param_bits: l_param,
-        dict_bits,
-        code_bits_total: code_total,
-        total_bits: total,
-        bits_per_token: if feat.n_tokens > 0 {
-            total / feat.n_tokens as f64
-        } else {
-            f64::INFINITY
-        },
-        residual_achieved: residual,
-        distortion_floor: delta2,
-        distortion_infeasible: residual > delta2 * 1.02,
-    }
-}
-
 // ===========================================================================
 // Rate–distortion currency: the curved-coding gain (Theorem 3 of the
 // "Superposed Geometry" memo).
@@ -579,17 +446,15 @@ pub fn matched_dl_delta(flat: &MatchedDl, chart: &MatchedDl) -> f64 {
 
 // ===========================================================================
 // Fit-level bits/token: the headline currency for a WHOLE manifold-SAE fit.
-// The per-featurizer `score` surface prices ONE featurizer at a stated floor;
-// this prices the entire reconstruction at its achieved explained variance, so
+// This prices the entire reconstruction at its achieved explained variance, so
 // the user-facing report can LEAD with bits/token instead of the
 // manifold-insensitive matched-EV number (see
 // `experiments/real_manifold_sae/results.md`).
 // ===========================================================================
 
 /// The fit-level description length of a manifold-SAE reconstruction, in bits,
-/// decomposed into the same three ledgers the [`score`] surface uses: CODE
-/// (the coordinates transmitted per firing), SELECTION (naming which atoms
-/// fired), and DICTIONARY (the amortised decoder).
+/// decomposed into three ledgers: CODE (the coordinates transmitted per firing),
+/// SELECTION (naming which atoms fired), and DICTIONARY (the amortised decoder).
 ///
 /// # Currency (reuses [`reverse_water_filling`] + [`SparseAtomCodes::support_entropy`])
 ///

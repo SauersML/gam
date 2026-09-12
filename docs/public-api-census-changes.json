@@ -1347,5 +1347,18 @@
     },
     "reason": "#2829 public-surface rule (docs/rust-library-surface.md, 6e5362f23): a pub item that no product uses is deleted. These ten restored-in-place identities have no user in gam-cli, gam-pyffi or Python, examples/, another crate's production code, or any test.",
     "evidence": "restored_consumers_2829.py at d8f6ef9be (MSI job 527977, /scratch.global/sauer354/pool/api2829/consumers.d8f6ef9be98996b5c98bd08667aa4fe121561e8f.rows.tsv) scores log_ndtr, log_ndtr_mills_curvature and weighted_chi_square_sf_with_bound as unreferenced. It scores the two addridge and two max_abs_diag rows as consumed_unexplained, only because each name has a second definition in the same crate. At the base, git grep -w over crates, src, tests and examples finds these results. The four numerics_host.rs names appear elsewhere only as C function names inside the CUDA source strings of numerics_device.rs and bms/gpu/row.rs, and in doc comments. erfcx_nonnegative and log_ndtr_and_mills had no Rust caller outside the deleted oracle functions. addridge and max_abs_diag appear only at their declarations, a string, empty test-section header comments, and one gam-solve comment. weighted_chi_square_sf_to_tolerance's one call was inside weighted_chi_square_sf_with_bound. gam-models' smooth_term_lr.rs calls the surviving signed_weighted_chi_square_sf_to_tolerance."
+  },
+  {
+    "base": "274f7c75a751357dc08bdf85da65924640b61dbb",
+    "removed": {
+      "crates/gam-sae/src/description_length.rs::m": 1,
+      "crates/gam-sae/src/description_length.rs::residual": 1,
+      "crates/gam-sae/src/description_length.rs::score": 1,
+      "crates/gam-sae/src/description_length.rs::selection_bits_charged": 1,
+      "crates/gam-sae/src/description_length.rs::selection_bits_combinatorial": 1,
+      "crates/gam-sae/src/encode.rs::encode_grad_hess": 1
+    },
+    "reason": "MISSION relaunch item 4 and the user's directive to delete useless public API: encode_grad_hess was a pub wrapper over the crate-internal encode_grad_hess_core with no product caller, and description_length::score with the Featurizer methods m, residual, selection_bits_combinatorial and selection_bits_charged served only a test helper. No gam-cli, gam-pyffi, python, examples or other-crate production code uses them.",
+    "evidence": "At the base, git grep -w over crates, src, tests, examples, bench and gamfit finds encode_grad_hess only in encode.rs (declaration, one encode_fix_tests call and prose) and sae_contract_probe_tests.rs; score, m, residual, selection_bits_charged and selection_bits_combinatorial as description_length items only in description_length.rs and description_length_tests.rs. Both field tests now call encode_grad_hess_core with EncodeObjective::euclidean(). Salvaged from scratchpad/sae-red/b8.patch (pin c75156782)."
   }
 ]

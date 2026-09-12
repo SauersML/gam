@@ -4,8 +4,8 @@
 //! These `impl Certificate for …` blocks were relocated out of the monolith
 //! root (`gam::inference::certificate_impls`) to satisfy the coherence orphan
 //! rule: the [`Certificate`] trait now lives in the neutral `gam-problem` crate
-//! and the implemented types ([`EncodeResult`], [`ResidualGaugeReport`],
-//! [`CertificateInputs`]) are owned here in `gam-sae`, so the impls must be
+//! and the implemented types ([`ResidualGaugeReport`], [`CertificateInputs`])
+//! are owned here in `gam-sae`, so the impls must be
 //! defined in the type's home crate. The bodies are byte-identical to the
 //! monolith originals: each [`Certificate::verdict`] is still defined in terms
 //! of the type's own (unchanged) decision rule, so there remains exactly one
@@ -13,7 +13,6 @@
 
 use gam_problem::topology_certificates::{Certificate, Claim, Evidence, Verdict};
 
-use crate::encode::EncodeResult;
 use crate::identifiability::ResidualGaugeReport;
 use crate::manifold::{
     CertificateInputs, CoordinateFidelityCertificate, GlobalOptimalityVerdict,
@@ -27,53 +26,6 @@ fn put_finite(evidence: &mut Evidence, key: &'static str, value: f64) {
         evidence.insert(key, value.into());
     } else {
         evidence.insert(key, "n/a".into());
-    }
-}
-
-// ── 4. Kantorovich encode atlas (#1010) ──────────────────────────────────────
-
-impl Certificate for EncodeResult {
-    fn claim(&self) -> Claim {
-        Claim::new(
-            "encode-atlas",
-            "each encoded row carries a per-row Newton–Kantorovich certificate \
-             (h = β·η·L ≤ ½ at the start point); certified rows converge \
-             quadratically into the unique root, and uncertified rows are flagged \
-             for the exact multi-start fallback — never silently encoded wrong",
-        )
-    }
-
-    fn evidence(&self) -> Evidence {
-        let mut e = Evidence::new();
-        let n = self.certified.len();
-        let certified = n - self.encode_uncertified_count;
-        e.insert("rows", n.into());
-        e.insert("certified_rows", certified.into());
-        e.insert(
-            "encode_uncertified_count",
-            self.encode_uncertified_count.into(),
-        );
-        let frac = if n > 0 {
-            certified as f64 / n as f64
-        } else {
-            f64::NAN
-        };
-        put_finite(&mut e, "certified_fraction", frac);
-        e
-    }
-
-    fn verdict(&self) -> Verdict {
-        // Conservative batch roll-up: the whole encode certifies only when EVERY
-        // row certified. One flagged row makes the batch `Insufficient` (the
-        // flagged rows must route to the exact fallback). An empty batch
-        // certifies nothing → `Unavailable`.
-        if self.certified.is_empty() {
-            Verdict::Unavailable
-        } else if self.encode_uncertified_count == 0 {
-            Verdict::Certified
-        } else {
-            Verdict::Insufficient
-        }
     }
 }
 

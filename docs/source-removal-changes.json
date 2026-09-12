@@ -3610,5 +3610,27 @@
     ],
     "reason": "#2829 public-surface rule. No product or test uses the host probit oracle in numerics_host.rs (erfcx_nonnegative, log_ndtr, log_ndtr_and_mills, log_ndtr_mills_curvature). The same holds for SymmetricMatrix::addridge and max_abs_diag, the free utils::addridge and max_abs_diag, and the non-negative chi-square wrappers weighted_chi_square_sf_with_bound and weighted_chi_square_sf_to_tolerance.",
     "evidence": "numerics_host.rs keeps erfc, which gam-solve's pirls_row.rs:824 calls in production. Its probit parity tests still audit the CUDA kernel source: constants against kernel literals, msun-only transcendentals, and erfc symmetry. The five probit constants those tests pin moved into the test module, so their declarations survive in the same file. The Imhof method and oscillatory truncation derivation from weighted_chi_square_sf_with_bound's doc now sit on signed_weighted_chi_square_sf_to_tolerance, and the four intra-doc links to the deleted wrapper are reworded. symmetric.rs's Triplet, SparseColMat and add_sparse_symmetric_upper are still used in production at lines 170-632. The empty test-section headers are gone, and pirls/loop_driver.rs:1553 describes the removed call without naming it. The item list applies source_removal_guard.py's ITEM regex by hand. Compile is covered by the lead's shared tip check."
+  },
+  {
+    "base": "274f7c75a751357dc08bdf85da65924640b61dbb",
+    "items": [
+      "crates/gam-sae/src/certificate_impls.rs:fn:claim",
+      "crates/gam-sae/src/certificate_impls.rs:fn:evidence",
+      "crates/gam-sae/src/certificate_impls.rs:fn:verdict",
+      "crates/gam-sae/src/description_length.rs:fn:m",
+      "crates/gam-sae/src/description_length.rs:fn:residual",
+      "crates/gam-sae/src/description_length.rs:fn:score",
+      "crates/gam-sae/src/description_length.rs:fn:selection_bits_charged",
+      "crates/gam-sae/src/description_length.rs:fn:selection_bits_combinatorial",
+      "crates/gam-sae/src/description_length.rs:struct:Featurizer",
+      "crates/gam-sae/src/description_length.rs:struct:ScoreRow",
+      "crates/gam-sae/src/description_length_tests.rs:fn:feat",
+      "crates/gam-sae/src/description_length_tests.rs:fn:score_uses_reverse_water_filling_for_total_distortion",
+      "crates/gam-sae/src/encode.rs:fn:encode_grad_hess",
+      "crates/gam-sae/src/encode.rs:struct:EncodeResult",
+      "tests/identifiability/misc/certificate_ledger_unified.rs:fn:encode_result_batch_verdict_is_all_or_flagged"
+    ],
+    "reason": "User directive, delete all slop and code only used in tests: encode::EncodeResult lost its last producer when the batch encoders were deleted, and only its Certificate impl (the claim/evidence/verdict declarations removed from gam-sae certificate_impls.rs) and one integration test built it; encode::encode_grad_hess was a pub wrapper over encode_grad_hess_core with no production caller; description_length::Featurizer was constructed only by the test helper feat, so Featurizer, ScoreRow, score and the Featurizer methods m, residual, selection_bits_combinatorial and selection_bits_charged were reachable only from score_uses_reverse_water_filling_for_total_distortion. The tests that exercised only these items go with them; the two encode field tests now call encode_grad_hess_core with EncodeObjective::euclidean(), which the core documents as bit-identical.",
+    "evidence": "At the base, git grep -w over crates, src, tests, examples, bench and gamfit finds EncodeResult only in encode.rs, gam-sae certificate_impls.rs, tests/identifiability/misc/certificate_ledger_unified.rs and module prose in gam-inference, gam-problem and gam-solve; encode_grad_hess only in encode.rs and sae_contract_probe_tests.rs; Featurizer, the gam-sae ScoreRow, score, selection_bits_charged and selection_bits_combinatorial only in description_length.rs, description_length_tests.rs and eq4_description_length.rs prose (gam-solve evidence.rs ScoreRow is a different type; bench/*.py mention a Featurizer concept in comments only). Salvaged from the unpushed overnight swarm patch scratchpad/sae-red/b8.patch (pin c75156782), which the shared working tree held byte-for-byte."
   }
 ]

@@ -618,8 +618,9 @@ fn matched_dl_for_block(
         })
         .collect();
     // Distortion-matched per-scalar decoder precision, PER ARM: the mean per-firing
-    // coding rate of THAT arm's coordinate (the `description_length::score`
-    // convention — a decoder weight quantised to match its coded coordinate). The
+    // coding rate of THAT arm's coordinate (the convention of
+    // `description_length::manifold_fit_description_length` — a decoder weight
+    // quantised to match its coded coordinate). The
     // flat arm's columns store amplitude directions (amplitude rate); the chart's
     // store harmonic rows read out by the phase (phase rate). Empty ⇒ zero precision.
     let mean_rate = |ses: &[f64]| -> f64 {

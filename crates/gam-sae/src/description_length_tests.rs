@@ -1,12 +1,11 @@
 //! Parity tests: the Rust description-length surface must reproduce the
 //! hand-verified `Manifold-SAE experiments/mdl_ladder/mdl.py` reference numbers
-//! exactly, and the criterion-bits reconciliation invariant must hold.
+//! exactly.
 
 use super::{
-    BirthMdlPrescreen, Featurizer, ScoreRow, circle_coding_gain_bits,
-    manifold_fit_description_length, matched_dl, matched_dl_delta, predicted_birth_dl_bits,
-    reverse_water_filling, scalar_rate_bits, score, se_resolution_bits, selection_bits,
-    weighted_reverse_water_filling,
+    BirthMdlPrescreen, circle_coding_gain_bits, manifold_fit_description_length, matched_dl,
+    matched_dl_delta, predicted_birth_dl_bits, reverse_water_filling, scalar_rate_bits,
+    se_resolution_bits, selection_bits, weighted_reverse_water_filling,
 };
 use crate::atom_codes::SparseAtomCodes;
 
@@ -347,33 +346,6 @@ fn circle_gain_matches_closed_form() {
     assert_eq!(circle_coding_gain_bits(0.0, 0.1), 0.0);
 }
 
-fn feat(
-    name: &str,
-    kind: &str,
-    coded_var: &[f64],
-    n_params: i64,
-    ev: f64,
-    total_var: f64,
-    n_tokens: i64,
-    n_firings: i64,
-    g_dict: i64,
-    k_active: i64,
-) -> Featurizer {
-    Featurizer {
-        name: name.to_string(),
-        kind: kind.to_string(),
-        coded_var: coded_var.to_vec(),
-        n_params,
-        ev,
-        total_var,
-        n_tokens,
-        n_firings,
-        g_dict,
-        k_active,
-        support_entropy_bits: None,
-    }
-}
-
 fn close(a: f64, b: f64, tol: f64) -> bool {
     (a - b).abs() <= tol
 }
@@ -422,34 +394,6 @@ fn weighted_water_filling_solves_shared_level_exactly() {
     let expected_second = scalar_rate_bits(0.5, theta);
     assert!(close(rates[0], expected_first, 1.0e-12));
     assert!(close(rates[1], expected_second, 1.0e-12));
-}
-
-#[test]
-fn score_uses_reverse_water_filling_for_total_distortion() {
-    let block = feat("b2", "block", &[1.10, 0.34], 32, 0.58, 2.55, 35, 35, 1, 1);
-    let chart = feat("circle", "chart", &[1.49], 64, 0.584, 2.55, 35, 35, 1, 1);
-    let delta2 = chart.residual(); // task-derived floor = best chart residual
-    assert!(close(delta2, 1.0608, 1e-4), "delta2 {delta2}");
-
-    let sb: ScoreRow = score(&block, delta2, None);
-    let (expected_block_rate, _) = reverse_water_filling(&block.coded_var, delta2);
-    assert!(close(
-        sb.code_coeff_bits_per_firing,
-        expected_block_rate,
-        1e-12
-    ));
-    assert!(close(sb.l_param_bits, expected_block_rate / 2.0, 1e-12));
-    assert!(close(sb.dict_bits, 32.0 * sb.l_param_bits, 1e-12));
-
-    let sc = score(&chart, delta2, None);
-    let (expected_chart_rate, _) = reverse_water_filling(&chart.coded_var, delta2);
-    assert!(close(
-        sc.code_coeff_bits_per_firing,
-        expected_chart_rate,
-        1e-12
-    ));
-    // both feasible at the chart's own residual floor
-    assert!(!sc.distortion_infeasible);
 }
 
 /// #2233 closed-form birth pre-screen: hand-computed crossover on a planted
