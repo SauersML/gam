@@ -374,7 +374,7 @@ fn tangent_basis_orthogonal_to(axis: ArrayView1<'_, f64>) -> Result<Array2<f64>,
 /// The two-block fit is realized as an **output-space augmentation** of the
 /// ordinary `SaeManifoldTerm`: each atom's decoder is widened to
 /// `p̃ = p_x + p_y = [B_k | C_k]`, and the fit target is the stack
-/// `Z̃ = [Z | √λ_y · Y]` ([`Self::augmented_target`]). Because both output
+/// `Z̃ = [Z | √λ_y · Y]`. Because both output
 /// blocks are decoded from the SAME per-row basis `Φ_k(t_ik)` and the SAME gate
 /// `a_ik`, the latent coordinate `t` and the routing `a` are shared by
 /// construction — the whole arrow-Schur / REML / smoothness / evidence stack
@@ -456,40 +456,6 @@ impl BehaviorBlock {
         self.log_lambda_y
     }
 
-    /// Stack the activation target `Z` (`n × p_x`) with the `√λ_y`-scaled
-    /// behavior target to form the augmented fit target `Z̃ = [Z | √λ_y · Y]`
-    /// (`n × p̃`). This is what the two-block term is fit against; a change to
-    /// `λ_y` is realized by re-stacking (Inc3 lifts this to an in-loop
-    /// output-column weight so `λ_y` moves under REML without re-stacking).
-    pub fn augmented_target(&self, activation: ArrayView2<'_, f64>) -> Result<Array2<f64>, String> {
-        let (n, px) = activation.dim();
-        if px != self.activation_dim {
-            return Err(format!(
-                "BehaviorBlock::augmented_target: activation has {px} columns; block activation_dim \
-                 is {}",
-                self.activation_dim
-            ));
-        }
-        if self.target.nrows() != n {
-            return Err(format!(
-                "BehaviorBlock::augmented_target: activation has {n} rows but behavior target has {}",
-                self.target.nrows()
-            ));
-        }
-        let py = self.behavior_dim();
-        let sqrt_lambda = self.sqrt_lambda_y();
-        let mut augmented = Array2::<f64>::zeros((n, px + py));
-        for i in 0..n {
-            for j in 0..px {
-                augmented[[i, j]] = activation[[i, j]];
-            }
-            for j in 0..py {
-                augmented[[i, px + j]] = sqrt_lambda * self.target[[i, j]];
-            }
-        }
-        Ok(augmented)
-    }
-
     /// Split a fitted augmented decoder `B̃_k` (`M × p̃`) into the activation
     /// decoder `B_k` (`M × p_x`) and the **true** behavior decoder `C_k`
     /// (`M × p_y`), un-doing the `√λ_y` scaling so `C_k` decodes directly into
@@ -525,8 +491,7 @@ impl BehaviorBlock {
     /// A copy of this block re-weighted to a new `log(λ_y)`. Because the target
     /// `Y` is stored **unscaled**, only the scalar weight changes — the chart and
     /// the embedded behavior are untouched — so a two-block REML fit can sweep
-    /// `λ_y` without ever re-embedding. The new augmented target is recovered by
-    /// [`Self::augmented_target`] at the updated weight.
+    /// `λ_y` without ever re-embedding.
     pub fn with_log_lambda_y(&self, log_lambda_y: f64) -> Result<Self, String> {
         let lambda_y = gam_problem::checked_exp_log_strength(log_lambda_y)
             .map_err(|error| format!("BehaviorBlock::with_log_lambda_y: {error}"))?;
@@ -551,8 +516,8 @@ impl BehaviorBlock {
 ///
 /// [`BehaviorBlock`] is the two-block machinery specialized to a behavior
 /// target: the augmented fit `Z̃ = [Z | √λ_y·Y]`, the single shared dispersion
-/// `φ̂`, and the closed-form variance-ratio `λ_y = (R_x/p_x)/(R_y/p_y)` are
-/// derived in `behavior_fit.rs`. **Nothing in that derivation cares that `Y` is
+/// `φ̂`, and the closed-form variance-ratio `λ_y = (R_x/p_x)/(R_y/p_y)`.
+/// **Nothing in that derivation cares that `Y` is
 /// behavior** — it uses only the block's *width* `p_ℓ` and its *residual
 /// variance*. Generalising to `Z̃ = [Z | √λ_1·Y_1 | … | √λ_{K-1}·Y_{K-1}]` and
 /// profiling the `K` dispersions gives, at the joint stationary point,
@@ -566,14 +531,13 @@ impl BehaviorBlock {
 /// coupling cancels: summing the `K-1` stationarity equations forces
 /// `φ̂ = R_x/p_x`, and each `λ_ℓ` then reads only its own residual against the
 /// anchor). So one shared latent + per-block decoders + a per-block closed-form
-/// `λ_ℓ` update is the whole generalization; see
-/// [`SaeManifoldTerm::run_multiblock_reml_fit`](crate::manifold::SaeManifoldTerm::run_multiblock_reml_fit).
+/// `λ_ℓ` update is the whole generalization.
 ///
 /// # Clients
 ///
 /// * **Curved crosscoder** — each block is the NEXT layer's activations, so one
 ///   shared latent coordinate is decoded into several layers at once and `λ_ℓ`
-///   REML-selects each layer's relevance (see the `curved_crosscoder` example).
+///   REML-selects each layer's relevance.
 /// * **Development-coder** (follow-up) — each block is a later training
 ///   checkpoint's activations along the *checkpoint* axis.
 ///
@@ -665,8 +629,7 @@ impl OutputBlock {
 /// # Why this exists — one owner of the offset arithmetic
 ///
 /// Every consumer of the augmented layout — stacking the target
-/// ([`stack_augmented_target`]), reading a block's residual sum of squares
-/// (`SaeManifoldTerm::run_multiblock_reml_fit`'s `augmented_block_rss`), and
+/// ([`stack_augmented_target`]), reading a block's residual sum of squares, and
 /// carving the honest per-layer decoder
 /// (`B_k^(ℓ) = C̃_k[:, off_ℓ..off_ℓ+p_ℓ] / √λ_ℓ`,
 /// `SaeManifoldTerm::layer_decoder`) — recomputed `off_ℓ = p_x + Σ_{m<ℓ} p_m`
@@ -826,9 +789,7 @@ impl CrosscoderLayout {
 /// `Z̃ = [Z | √λ_1·Y_1 | … | √λ_{K-1}·Y_{K-1}]` (`n × p̃`,
 /// `p̃ = p_x + Σ_ℓ p_ℓ`).
 ///
-/// For a single block this is byte-identical to
-/// [`BehaviorBlock::augmented_target`] (same per-entry formula, same order), so
-/// the multi-block fit reduces to the two-block fit at `K = 2`. The `√λ_ℓ` per
+/// The `√λ_ℓ` per
 /// column is what lets the single shared reconstruction dispersion `φ̂` play the
 /// anchor's noise while block `ℓ` carries noise `φ̂/λ_ℓ`.
 pub fn stack_augmented_target(
@@ -867,83 +828,6 @@ pub fn stack_augmented_target(
         }
     }
     Ok(augmented)
-}
-
-/// The multi-block profiled penalized quasi-Laplace criterion (the quantity minimised over the
-/// block weights), evaluated at a fitted state's UNSCALED residual sums of
-/// squares and its penalty energy. Up to `log λ`-independent constants it is
-///
-/// ```text
-///   C = (n·p̃/2)·log((R_x + Σ_ℓ λ_ℓ·R_ℓ + P)/(n·p̃)) − Σ_ℓ (n·p_ℓ/2)·log λ_ℓ ,
-/// ```
-///
-/// (`p̃ = p_x + Σ p_ℓ`, `n = n_obs`), the profiled Gaussian negative-log-marginal
-/// plus the `√λ_ℓ` target-scaling Jacobian.
-/// The `−(n p_ℓ/2)·log λ_ℓ` term diverges to `+∞` as `λ_ℓ → 0`, so the criterion
-/// PENALISES a vanishing weight — which is exactly what a plain fixed-point λ
-/// update (that treats the residual as frozen) fails to see, letting the shared
-/// coordinate trade a down-weighted block away in a positive-feedback runaway.
-/// A driver that only accepts a `λ` step when this criterion decreases (Armijo
-/// backtracking) is monotone and cannot diverge; its stationary point is the
-/// same per-block variance ratio the closed form targets.
-///
-/// # The penalty term `P` and the envelope theorem (#2228)
-///
-/// `penalty_energy = P` is TWICE the non-data-fit penalized-objective energy the
-/// inner engine drives to at the fitted state, i.e. `P = 2·(penalized_objective_total
-/// − data_fit)` (decoder smoothness + ARD + assignment prior + any analytic
-/// registry / repulsion / barrier energy, each entering `½·φ⁻¹` of the Gaussian
-/// exponent under the mgcv scaled-prior convention). The FACTOR OF TWO is not
-/// cosmetic: the inner solve makes `∂(½·pooled_raw + ½·P)/∂θ̂ = 0` at the fitted
-/// `θ̂ = (decoder, coords, logits)`, so `pooled' = pooled_raw + P` obeys
-/// `∂pooled'/∂θ̂ = 2·∂(inner objective)/∂θ̂ = 0`. That is exactly the condition for
-/// the envelope theorem to cancel the fitted-state response of the profiled
-/// criterion, so `dC/d log λ_ℓ` equals its EXPLICIT partial and the closed-form
-/// variance-ratio `λ*` is again the exact per-block minimiser at held residuals.
-///
-/// This term was UNNECESSARY (P ≡ 0 was exact) only while the inner engine
-/// returned the near-LS data-fit residuals. It became load-bearing at
-/// `2e178664f` ("invert the inner engine — block sweeps first"), which made
-/// `run_joint_fit_arrow_schur` converge to the PENALIZED-objective fixed point:
-/// the returned residuals then carry the penalty trade-off, the RSS-only pooled
-/// broke the envelope, and the two-block λ-sweep stalled (the closed-form `λ*`
-/// proposed moves the truncated-refit criterion refused). Pricing `P` inside the
-/// pooled dispersion restores value/`λ*` coherence against that engine.
-///
-/// Returns `+∞` for a non-positive pooled residual (an invalid state a caller's
-/// line search should reject).
-pub fn profiled_penalized_quasi_laplace_criterion(
-    n_obs: usize,
-    p_x: usize,
-    rss_x: f64,
-    block_rss_unscaled: &[f64],
-    block_dims: &[usize],
-    block_log_lambda: &[f64],
-    penalty_energy: f64,
-) -> Result<f64, String> {
-    let lambdas = gam_problem::checked_exp_log_strengths(block_log_lambda.iter().copied())
-        .map_err(|error| format!("profiled block criterion: {error}"))?;
-    let n = n_obs as f64;
-    let mut p_tilde = p_x as f64;
-    let mut pooled = rss_x;
-    let mut jac = 0.0_f64;
-    for (((&rss, &dim), &log_lambda), &lambda) in block_rss_unscaled
-        .iter()
-        .zip(block_dims.iter())
-        .zip(block_log_lambda.iter())
-        .zip(lambdas.iter())
-    {
-        pooled += lambda * rss;
-        p_tilde += dim as f64;
-        jac += (dim as f64) * log_lambda;
-    }
-    // Price the fitted-state penalty energy into the pooled dispersion (envelope
-    // term — held fixed w.r.t. `log λ_ℓ`, see the item comment above).
-    pooled += penalty_energy;
-    if !(pooled > 0.0) {
-        return Ok(f64::INFINITY);
-    }
-    Ok(0.5 * n * p_tilde * (pooled / (n * p_tilde)).ln() - 0.5 * n * jac)
 }
 
 #[cfg(test)]

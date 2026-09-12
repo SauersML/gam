@@ -442,8 +442,6 @@ mod tests_gauge_orbit_descent_2762;
 mod tests_behavior_column_equilibration_2015;
 #[cfg(test)]
 mod tests_behavior_isometry_2015;
-#[cfg(test)]
-mod tests_behavior_twoblock_rung2;
 
 #[cfg(test)]
 mod tests_crosscoder_multiblock;
@@ -524,7 +522,6 @@ pub use atom::*;
 pub use basin_bundle::*;
 pub use behavior::*;
 pub use behavior_entry::*;
-pub use behavior_fit::*;
 pub use behavior_isometry::*;
 pub use certificate::*;
 pub use chart_atlas::*;

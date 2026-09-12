@@ -845,8 +845,8 @@ pub struct SaeManifoldTerm {
     pub(crate) behavior: Option<crate::manifold::BehaviorBlock>,
     /// Crosscoder — stacked-column layout of a multi-block fit: the anchor width
     /// `p_x`, the per-layer output-block widths/labels, and the fitted per-block
-    /// relevance `log λ_ℓ`. `Some` after a [`SaeManifoldTerm::run_multiblock_reml_fit`]
-    /// (or an explicit [`SaeManifoldTerm::set_crosscoder_layout`]); it is the single
+    /// relevance `log λ_ℓ`. `Some` after a
+    /// [`SaeManifoldTerm::set_crosscoder_layout`]; it is the single
     /// owner of the offset bookkeeping so [`SaeManifoldTerm::layer_decoder`] returns
     /// an honest per-layer decoder `B_k^(ℓ)` without any caller re-slicing by hand.
     /// Pure descriptor state (which columns are which layer, and each layer's

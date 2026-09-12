@@ -1454,8 +1454,7 @@ impl SaeManifoldOuterObjective {
     /// so `R̃_ℓ` is the scaled-block residual the `#F1` unit-dispersion data term
     /// `½‖r̃‖² = ½(R_x + Σ_ℓ R̃_ℓ)` already carries. In UNSCALED form
     /// `R̃_ℓ = λ_ℓ·R_ℓ` where `R_ℓ = ‖r̃_ℓ‖²/λ_ℓ` is the block's honest-units
-    /// residual (the quantity `run_multiblock_reml_fit`'s `augmented_block_rss`
-    /// reports); the two coincide at `λ_ℓ = 1`. Returns `None` when crosscoder
+    /// residual; the two coincide at `λ_ℓ = 1`. Returns `None` when crosscoder
     /// pricing is off (plain SAE). The reconstruction is read from the CONVERGED
     /// fitted state, so callers must invoke this only after the lane's inner solve.
     fn block_scaled_rss(&self, rho: &SaeManifoldRho) -> Result<Option<Vec<f64>>, String> {

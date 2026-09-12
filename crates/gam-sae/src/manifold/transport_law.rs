@@ -8,8 +8,7 @@
 //! `t ↦ ±t + φ`; the residual gauge obstruction is the atom's linear stabilizer."
 //! (module header of [`crate::manifold`]). This module turns that claim into a
 //! *measurement* on a fitted 2-layer crosscoder — a shared chart coordinate `t`
-//! decoded through per-layer honest decoders `B^(ℓ)` and `B^(ℓ+1)` (the landed M1
-//! [`SaeManifoldTerm::run_multiblock_reml_fit`] and its
+//! decoded through per-layer honest decoders `B^(ℓ)` and `B^(ℓ+1)` (the
 //! [`CrosscoderLayout`]/[`SaeManifoldTerm::layer_decoder`] bookkeeping).
 //!
 //! # Operational definition of the transport map

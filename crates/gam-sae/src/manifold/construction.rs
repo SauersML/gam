@@ -908,8 +908,8 @@ impl SaeManifoldTerm {
             // bit-for-bit unchanged). Attached via `set_behavior_block`.
             behavior: None,
             // Crosscoder stacked-column layout: default None (no multi-block
-            // layout installed; `layer_decoder` errors until a multi-block fit or
-            // `set_crosscoder_layout` records one). Bit-for-bit historical path.
+            // layout installed; `layer_decoder` errors until `set_crosscoder_layout`
+            // records one). Bit-for-bit historical path.
             crosscoder_layout: None,
             // #2023 C4 — Tier-0 shared mean: default None (no de-meaning; the
             // historical path is bit-for-bit). Installed via `set_tier0_mean`.

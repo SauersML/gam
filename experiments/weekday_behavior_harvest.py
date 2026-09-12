@@ -26,10 +26,8 @@ Output .npz per run:
   template_ids  (n,)
 plus a .prompts.json with the prompt strings and the 7 column token strings.
 
-Consumed by crates/gam-sae/examples/two_block_weekday_demo.rs after a trivial
-npz->csv split (or feed the arrays through the FFI directly once the two-block
-driver is exposed there). All estimation math is Rust; this file only touches
-the frozen HF model (the allowed external boundary).
+All estimation math is Rust; this file only touches the frozen HF model (the
+allowed external boundary).
 
 Example
 -------
