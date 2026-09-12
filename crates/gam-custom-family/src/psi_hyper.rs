@@ -161,7 +161,7 @@ fn prepare_explicit_jeffreys_curvature_drifts<F: CustomFamily + Clone + Send + S
             } else {
                 None
             };
-            Ok(base.completion_drift_action_from_rotated(v, h, &base.rotate_axes(&axes)?, axes_psi.as_ref(), &moving)? * strength)
+            Ok(base.completion_drift_action_from_rotated(v, h, &base.rotate_axes(&axes)?, axes_psi.as_ref(), &base.rotate_axes(&moving)?)? * strength)
         })
     };
     let beta_psi = Arc::new(

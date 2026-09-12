@@ -2552,13 +2552,132 @@ impl MultinomialFamily {
         beta_u: &Array1<f64>,
         beta_v: &Array1<f64>,
     ) -> Result<Vec<Array2<f64>>, String> {
-        let m = self.active_classes();
         let probs = self.row_probabilities(eta);
         let eta_u = self.d_eta_from_d_beta(beta_u)?;
         let eta_v = self.d_eta_from_d_beta(beta_v)?;
+        Ok(self.assemble_all_axis_derivatives_from_row_kernel(
+            self.third_directional_row_kernel(&probs, &eta_u, &eta_v),
+        ))
+    }
+
+    /// `vec(sym(Uᵀ D³H[u, v, e_a] U))` for every coefficient axis `a`, through the same
+    /// row kernel as [`Self::assemble_all_axis_third_directional_derivatives`] but
+    /// without its `(M·P)×(M·P)` axis matrices (#1082).
+    fn assemble_rotated_all_axis_third_directional_derivatives(
+        &self,
+        eta: ArrayView2<'_, f64>,
+        beta_u: &Array1<f64>,
+        beta_v: &Array1<f64>,
+        basis: ArrayView2<'_, f64>,
+    ) -> Result<Array2<f64>, String> {
+        let probs = self.row_probabilities(eta);
+        let eta_u = self.d_eta_from_d_beta(beta_u)?;
+        let eta_v = self.d_eta_from_d_beta(beta_v)?;
+        self.assemble_rotated_all_axis_derivatives_from_row_kernel(
+            basis,
+            self.third_directional_row_kernel(&probs, &eta_u, &eta_v),
+        )
+    }
+
+    /// The rotated form of [`Self::assemble_all_axis_derivatives_from_row_kernel`]:
+    /// row `a = moving_class·P + column` is `vec(sym(Uᵀ A_a U))` with `U = basis`.
+    /// With the class blocks of the basis projected through the design once,
+    /// `Z_c = X U_c` (`n × r`),
+    ///
+    /// ```text
+    /// Uᵀ A_a U = Σ_row X[row, column] · Σ_{c,d} kernel_cd(row) · Z_c[row]ᵀ Z_d[row],
+    /// ```
+    ///
+    /// so no axis matrix is formed: `O(n·M²·r²)` row work per moving class and one
+    /// `P × n × r²` product, against the materialized path's `n × (M·P)²` row
+    /// quadratics per moving class.
+    fn assemble_rotated_all_axis_derivatives_from_row_kernel(
+        &self,
+        basis: ArrayView2<'_, f64>,
+        mut fill_row_kernel: impl FnMut(usize, usize, &mut [f64]),
+    ) -> Result<Array2<f64>, String> {
+        let n = self.weights.len();
+        let p = self.design.ncols();
+        let m = self.active_classes();
+        let dim = m * p;
+        let (basis_rows, r) = basis.dim();
+        if basis_rows != dim {
+            return Err(format!(
+                "multinomial rotated Jeffreys derivative basis has {basis_rows} rows, expected (K-1)·P = {dim}"
+            ));
+        }
+        let squared = r * r;
+        let projected: Vec<Array2<f64>> = (0..m)
+            .map(|class| {
+                fast_ab(
+                    self.design.as_ref(),
+                    &basis.slice(ndarray::s![class * p..(class + 1) * p, ..]),
+                )
+            })
+            .collect();
+        let mut rows = Array2::<f64>::zeros((dim, squared));
+        let mut weighted = Array2::<f64>::zeros((n, squared));
+        let mut row_kernel = vec![0.0_f64; m * m];
+        for moving_class in 0..m {
+            let weighted_values = weighted
+                .as_slice_mut()
+                .expect("row-weighted basis products are contiguous");
+            for row in 0..n {
+                let output = &mut weighted_values[row * squared..(row + 1) * squared];
+                output.fill(0.0);
+                if self.weights[row] == 0.0 {
+                    continue;
+                }
+                fill_row_kernel(row, moving_class, &mut row_kernel);
+                for c in 0..m {
+                    for d in 0..m {
+                        let kernel = row_kernel[c * m + d];
+                        if kernel == 0.0 {
+                            continue;
+                        }
+                        for s in 0..r {
+                            let scale = kernel * projected[c][[row, s]];
+                            let target = &mut output[s * r..(s + 1) * r];
+                            for (entry, &z_t) in target.iter_mut().zip(projected[d].row(row).iter()) {
+                                *entry += scale * z_t;
+                            }
+                        }
+                    }
+                }
+            }
+            let moments = fast_atb(self.design.as_ref(), &weighted);
+            rows.slice_mut(ndarray::s![moving_class * p..(moving_class + 1) * p, ..])
+                .assign(&moments);
+        }
+        let values = rows
+            .as_slice_mut()
+            .expect("rotated axis rows are contiguous");
+        for axis in values.chunks_exact_mut(squared) {
+            for s in 0..r {
+                for t in (s + 1)..r {
+                    let average = 0.5 * (axis[s * r + t] + axis[t * r + s]);
+                    axis[s * r + t] = average;
+                    axis[t * r + s] = average;
+                }
+            }
+        }
+        Ok(rows)
+    }
+
+    /// Per-row `M × M` kernel of the third information derivative along `(u, v)` with
+    /// the canonical axes of `moving_class` as the third direction: axis
+    /// `moving_class·P + column` of `D³H[u, v, ·]` has class block `(c, d)` equal to
+    /// `Σ_row kernel_cd(row) · X[row, column] · X[row]ᵀ X[row]`.
+    fn third_directional_row_kernel<'a>(
+        &'a self,
+        probs: &'a Array2<f64>,
+        eta_u: &'a Array2<f64>,
+        eta_v: &'a Array2<f64>,
+    ) -> impl FnMut(usize, usize, &mut [f64]) + 'a {
+        let m = self.active_classes();
         let mut centered = vec![[0.0; 3]; m + 1];
         let mut derivatives = vec![[0.0; 8]; m];
-        Ok(self.assemble_all_axis_derivatives_from_row_kernel(|row, moving_class, kernel| {
+        move |row, moving_class, kernel| {
             let direction = |class: usize, axis: usize| match axis {
                 0 if class < m => eta_u[[row, class]],
                 1 if class < m => eta_v[[row, class]],
@@ -2598,7 +2717,7 @@ impl MultinomialFamily {
                 }
                 kernel[a*m+b] = self.weights[row] * value;
             }}
-        }))
+        }
     }
 
     /// Index of the single canonical axis `k` if `d_beta_flat` is the unit
@@ -3123,6 +3242,23 @@ impl CustomFamily for MultinomialFamily {
             return Err(format!("multinomial third information has {} axes, expected {p}", axes.len()));
         }
         Ok(Some(axes))
+    }
+
+    fn joint_jeffreys_information_third_directional_rotated_all_axes_with_specs(
+        &self,
+        block_states: &[ParameterBlockState],
+        specs: &[ParameterBlockSpec],
+        u: &Array1<f64>,
+        v: &Array1<f64>,
+        basis: ArrayView2<'_, f64>,
+    ) -> Result<Option<Array2<f64>>, String> {
+        let eta = self.collect_eta_matrix(block_states)?;
+        let rows = self.assemble_rotated_all_axis_third_directional_derivatives(eta.view(), u, v, basis)?;
+        let p: usize = specs.iter().map(|spec| spec.design.ncols()).sum();
+        if rows.nrows() != p {
+            return Err(format!("multinomial rotated third information has {} axes, expected {p}", rows.nrows()));
+        }
+        Ok(Some(rows))
     }
 
     fn joint_jeffreys_information_contracted_trace_hessian_with_specs(
@@ -5877,6 +6013,62 @@ mod tests {
                 (a - b).abs() <= 1e-10 * (1.0 + a.abs()),
                 "{ctx}: to_dense[{r},{c}] dense {a} != matrix-free {b}"
             );
+        }
+    }
+
+    /// #1082: the rotated third information derivative formed through the row kernel
+    /// equals the materialized axes rotated by the drift's congruence.
+    #[test]
+    fn rotated_third_information_axes_match_rotated_materialized_axes_1082() {
+        for &(n, p, k, rank) in &[(11, 4, 3, 2), (17, 10, 3, 7), (13, 3, 5, 5)] {
+            let family = toy_family(n, p, k);
+            let m = family.active_classes();
+            let dim = m * p;
+            let design = family.design.view();
+            let block_states: Vec<ParameterBlockState> = (0..m)
+                .map(|a| {
+                    let beta = Array1::<f64>::from_shape_fn(p, |i| {
+                        0.13 * ((a + 2) as f64) - 0.08 * ((i + 1) as f64).cos()
+                    });
+                    let eta = Array1::<f64>::from_shape_fn(n, |row| {
+                        (0..p).map(|i| design[[row, i]] * beta[i]).sum()
+                    });
+                    ParameterBlockState { beta, eta }
+                })
+                .collect();
+            let eta = family
+                .collect_eta_matrix(&block_states)
+                .expect("eta collection must succeed");
+            let u = Array1::<f64>::from_shape_fn(dim, |idx| 0.23 * ((idx + 1) as f64).sin());
+            let v = Array1::<f64>::from_shape_fn(dim, |idx| -0.17 * ((2 * idx + 3) as f64).cos());
+            let basis = Array2::<f64>::from_shape_fn((dim, rank), |(r, c)| {
+                0.31 * ((r + 3 * c + 1) as f64).sin() + 0.07 * ((2 * r + c + 2) as f64).cos()
+            });
+            let materialized = family
+                .assemble_all_axis_third_directional_derivatives(eta.view(), &u, &v)
+                .expect("materialized third information derivatives");
+            let expected = gam_model_api::jeffreys_rotated_axis_rows(&materialized, basis.view())
+                .expect("rotated materialized axes");
+            let actual = family
+                .assemble_rotated_all_axis_third_directional_derivatives(
+                    eta.view(),
+                    &u,
+                    &v,
+                    basis.view(),
+                )
+                .expect("row-kernel rotated axes");
+            assert_eq!(actual.dim(), (dim, rank * rank), "n={n} p={p} k={k}");
+            let scale = expected.iter().fold(0.0_f64, |acc, x| acc.max(x.abs()));
+            assert!(
+                scale > 1e-6,
+                "positive control: the rotated third derivative must not vanish (n={n} p={p} k={k})"
+            );
+            for ((index, &want), &got) in expected.indexed_iter().zip(actual.iter()) {
+                assert!(
+                    (want - got).abs() <= 1e-11 * (1.0 + scale),
+                    "n={n} p={p} k={k} row {index:?}: materialized {want} != row-kernel {got}"
+                );
+            }
         }
     }
 

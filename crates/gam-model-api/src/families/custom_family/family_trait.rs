@@ -33,6 +33,55 @@ use ndarray::{Array1, Array2};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+/// `sym(Uᵀ A U)` for an information derivative `A` and a Jeffreys drift basis `U`:
+/// the congruence every drift contraction reads. Both triangles are replaced by
+/// their arithmetic mean, so the result is exactly symmetric.
+pub fn jeffreys_symmetric_basis_contraction(
+    matrix: ndarray::ArrayView2<'_, f64>,
+    basis: ndarray::ArrayView2<'_, f64>,
+) -> Array2<f64> {
+    let mut reduced = basis.t().dot(&matrix.dot(&basis));
+    let (rows, columns) = reduced.dim();
+    let values = reduced
+        .as_slice_mut()
+        .expect("owned dense congruence product is contiguous");
+    for row in 0..rows {
+        for column in (row + 1)..columns {
+            let upper = row * columns + column;
+            let lower = column * columns + row;
+            let average = 0.5 * (values[upper] + values[lower]);
+            values[upper] = average;
+            values[lower] = average;
+        }
+    }
+    reduced
+}
+
+/// Coefficient-axis information derivatives `{A_a}` rotated into a Jeffreys drift
+/// basis `U` (`p × r`): row `a` is `vec(sym(Uᵀ A_a U))` in row-major order.
+pub fn jeffreys_rotated_axis_rows(
+    axes: &[Array2<f64>],
+    basis: ndarray::ArrayView2<'_, f64>,
+) -> Result<Array2<f64>, String> {
+    let (p, r) = basis.dim();
+    if axes.len() != p || axes.iter().any(|axis| axis.dim() != (p, p)) {
+        return Err(
+            "Jeffreys drift rotation requires one full information derivative per coefficient axis"
+                .into(),
+        );
+    }
+    let mut rows = Array2::zeros((p, r * r));
+    for (a, matrix) in axes.iter().enumerate() {
+        let rotated = jeffreys_symmetric_basis_contraction(matrix.view(), basis);
+        for i in 0..r {
+            for j in 0..r {
+                rows[[a, i * r + j]] = rotated[[i, j]];
+            }
+        }
+    }
+    Ok(rows)
+}
+
 /// Family evaluation over all parameter blocks.
 #[derive(Clone, Debug)]
 pub struct FamilyEvaluation {
@@ -1933,6 +1982,33 @@ pub trait CustomFamily {
             assert!(direction.iter().all(|value| value.is_finite()), "{context}: non-finite direction");
         }
         Ok(None)
+    }
+
+    /// [`Self::joint_jeffreys_information_third_directional_all_axes_with_specs`]
+    /// in a Jeffreys drift basis `U` (`p × r`): row `a` is
+    /// `vec(sym(Uᵀ D³H[u, v, e_a] U))`, the only form the outer-Hessian drift reads
+    /// (#1082). The default rotates the `p` dense axis derivatives with
+    /// [`jeffreys_rotated_axis_rows`]. A family whose information is a per-row kernel
+    /// contracted with design rows can form the rows without the `p × p` axis
+    /// matrices and overrides this. `None` declares that the exact derivative is
+    /// unavailable.
+    fn joint_jeffreys_information_third_directional_rotated_all_axes_with_specs(
+        &self,
+        block_states: &[ParameterBlockState],
+        specs: &[ParameterBlockSpec],
+        d_beta_u_flat: &Array1<f64>,
+        d_beta_v_flat: &Array1<f64>,
+        basis: ndarray::ArrayView2<'_, f64>,
+    ) -> Result<Option<Array2<f64>>, String> {
+        match self.joint_jeffreys_information_third_directional_all_axes_with_specs(
+            block_states,
+            specs,
+            d_beta_u_flat,
+            d_beta_v_flat,
+        )? {
+            Some(axes) => jeffreys_rotated_axis_rows(&axes, basis).map(Some),
+            None => Ok(None),
+        }
     }
 
     /// Optional contracted second beta-derivative of the observed joint

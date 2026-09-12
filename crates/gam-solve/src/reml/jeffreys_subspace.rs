@@ -2970,6 +2970,22 @@ impl JeffreysHphiDriftBase {
         })
     }
 
+    /// The drift basis `U = Z_J V` that axis derivatives are rotated into; a family
+    /// that forms the rotation itself receives it (see
+    /// `CustomFamily::joint_jeffreys_information_third_directional_rotated_all_axes_with_specs`).
+    pub fn ambient_eigenbasis(&self) -> ArrayView2<'_, f64> {
+        self.ambient_eigenbasis.view()
+    }
+
+    /// Wrap coefficient-axis rows already rotated into this base's eigenbasis
+    /// (`p × m·m`, row `a` = `vec(sym(Uᵀ A_a U))`).
+    pub fn rotated_axes_from_rows(&self, rows: Array2<f64>) -> Result<JeffreysRotatedAxes, String> {
+        if rows.dim() != (self.p, self.m * self.m) {
+            return Err("Jeffreys rotated axis rows dimension mismatch".into());
+        }
+        Ok(JeffreysRotatedAxes { rows })
+    }
+
     /// β-drift along `u` of the motion-completed Jeffreys completion, applied to `v`
     /// (gam#1082).
     ///
@@ -2996,8 +3012,8 @@ impl JeffreysHphiDriftBase {
     ///
     /// where `P̃`, `B̃` and `T̃` are the first, second and third information derivatives
     /// in the reduced eigenbasis. Inputs: `pert_h = H[u]`; `axes_v = {H²[v, e_a]}` and
-    /// `axes_u = {H²[u, e_a]}` rotated by [`Self::rotate_axes`]; `moving_axes =
-    /// {H³[u, v, e_a]}`. `axes_u` is read only where the motion is active, and is
+    /// `axes_u = {H²[u, e_a]}` and `moving_axes = {H³[u, v, e_a]}`, all rotated by
+    /// [`Self::rotate_axes`]. `axes_u` is read only where the motion is active, and is
     /// required there.
     pub fn completion_drift_action_from_rotated(
         &self,
@@ -3005,20 +3021,20 @@ impl JeffreysHphiDriftBase {
         pert_h: &Array2<f64>,
         axes_v: &JeffreysRotatedAxes,
         axes_u: Option<&JeffreysRotatedAxes>,
-        moving_axes: &[Array2<f64>],
+        moving_axes: &JeffreysRotatedAxes,
     ) -> Result<Array1<f64>, String> {
         if v.len() != self.p || pert_h.dim() != (self.p, self.p) {
             return Err("Jeffreys completion drift direction dimension mismatch".into());
         }
         let p_u = symmetric_basis_contraction(pert_h.view(), self.ambient_eigenbasis.view());
-        let third_rows = self.rotate_axis_rows(moving_axes)?;
-        let mut action = self.completion_drift_from_rows(&p_u, &axes_v.rows, &third_rows)?;
+        let third_rows = &moving_axes.rows;
+        let mut action = self.completion_drift_from_rows(&p_u, &axes_v.rows, third_rows)?;
         if self.hessian_motion_active() {
             let axes_u = axes_u.ok_or_else(|| {
                 "Jeffreys completion drift requires H²[u,·] where the gate or the floor moves"
                     .to_string()
             })?;
-            action -= &self.motion_drift_from_rows(v, &p_u, &axes_v.rows, &axes_u.rows, &third_rows)?;
+            action -= &self.motion_drift_from_rows(v, &p_u, &axes_v.rows, &axes_u.rows, third_rows)?;
         }
         Ok(action)
     }
@@ -3328,9 +3344,7 @@ fn symmetric_basis_contraction(
     matrix: ArrayView2<'_, f64>,
     basis: ArrayView2<'_, f64>,
 ) -> Array2<f64> {
-    let mut reduced = basis.t().dot(&matrix.dot(&basis));
-    symmetrize_contiguous(&mut reduced);
-    reduced
+    gam_model_api::jeffreys_symmetric_basis_contraction(matrix, basis)
 }
 
 impl JeffreysHphiDriftBase {
@@ -4013,7 +4027,7 @@ mod tests {
                     &pert_h,
                     &base.rotate_axes(&axes_v).expect("rotated H²[v,·]"),
                     Some(&base.rotate_axes(&axes_u).expect("rotated H²[u,·]")),
-                    &moving,
+                    &base.rotate_axes(&moving).expect("rotated H³[u,v,·]"),
                 )
                 .expect("motion-completed drift");
         let step = 1e-5;
@@ -4337,7 +4351,9 @@ mod tests {
             let axes_v = base
                 .rotate_axes(&(0..p).map(|a| second(beta, &v, &axis(a))).collect::<Vec<_>>())
                 .expect("rotated H²[v,·]");
-            let moving: Vec<Array2<f64>> = (0..p).map(|a| third(beta, &u, &v, &axis(a))).collect();
+            let moving = base
+                .rotate_axes(&(0..p).map(|a| third(beta, &u, &v, &axis(a))).collect::<Vec<_>>())
+                .expect("rotated H³[u,v,·]");
             let column = base
                 .completion_drift_action_from_rotated(&v, &pert_u, &axes_v, Some(&second_u), &moving)
                 .expect("motion-completed completion drift");

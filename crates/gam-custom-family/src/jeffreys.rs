@@ -971,7 +971,11 @@ pub(crate) fn custom_family_outer_jeffreys_hphi_drift_batched<
             // #1082: where the conditioning gate or the relative floor moves, the
             // completion carries their motion, and its drift also reads `H²[u,·]`.
             let axes_u = if base.hessian_motion_active() { Some(rotated(u)?) } else { None };
-            let moving = family.joint_jeffreys_information_third_directional_all_axes_with_specs(&states, &specs, u, v)?.ok_or_else(missing)?;
+            // Only the rotation of `H³[u, v, ·]` is read, so the family forms it (#1082).
+            let moving = family
+                .joint_jeffreys_information_third_directional_rotated_all_axes_with_specs(&states, &specs, u, v, base.ambient_eigenbasis())?
+                .ok_or_else(missing)?;
+            let moving = base.rotated_axes_from_rows(moving)?;
             Ok(base.completion_drift_action_from_rotated(v, &h, &axes_v, axes_u.as_deref(), &moving)? * strength)
         })
     };
@@ -1108,15 +1112,19 @@ pub(crate) fn custom_family_outer_jeffreys_hphi_drift_batched<
                     )?
                     .ok_or_else(|| missing("second information derivative"))?;
                 let axes_uv = family_second
-                    .joint_jeffreys_information_third_directional_all_axes_with_specs(
+                    .joint_jeffreys_information_third_directional_rotated_all_axes_with_specs(
                         &states_second,
                         &specs_second,
                         u,
                         v,
+                        base.ambient_eigenbasis(),
                     )?
                     .ok_or_else(|| {
                         missing("third information derivatives (fifth likelihood derivatives)")
                     })?;
+                let axes_uv = base
+                    .rotated_axes_from_rows(axes_uv)
+                    .map_err(CustomFamilyError::trial_point)?;
                 let mut derivative = base
                     .mixed_perturbation_derivative_from_frames(
                         &frames[frame_u],

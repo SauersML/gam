@@ -757,17 +757,7 @@ impl JeffreysHphiDriftBase {
         if axes.len() != self.p || axes.iter().any(|a| a.dim() != (self.p, self.p)) {
             return Err("Jeffreys mixed drift requires one full information derivative per coefficient axis".into());
         }
-        let mut rows = Array2::zeros((self.p, self.m * self.m));
-        for (a, matrix) in axes.iter().enumerate() {
-            let rotated =
-                symmetric_basis_contraction(matrix.view(), self.ambient_eigenbasis.view());
-            for i in 0..self.m {
-                for j in 0..self.m {
-                    rows[[a, i * self.m + j]] = rotated[[i, j]];
-                }
-            }
-        }
-        Ok(rows)
+        gam_model_api::jeffreys_rotated_axis_rows(axes, self.ambient_eigenbasis.view())
     }
 
     /// Apply Df, D²f[E,.], or D³f[E,F,.] to every axis matrix.
@@ -897,7 +887,7 @@ impl JeffreysHphiDriftBase {
         }
         let u = self.direction_frame(pert_u, axes_u)?;
         let v = self.direction_frame(pert_v, axes_v)?;
-        self.mixed_perturbation_derivative_from_frames(&u, &v, pert_uv, axes_uv)
+        self.mixed_perturbation_derivative_from_frames(&u, &v, pert_uv, &self.rotate_axes(axes_uv)?)
     }
 
     /// Everything the mixed derivative reads from ONE direction: its rotated
@@ -944,14 +934,14 @@ impl JeffreysHphiDriftBase {
     }
 
     /// `D² H_Φ[u,v]` closed from the two directions' frames. Only the pair's own
-    /// objects — `H_uv`, its coefficient-axis derivatives and the second-order
+    /// objects — `H_uv`, its rotated coefficient-axis derivatives and the second-order
     /// spectral rows — are formed here.
     pub fn mixed_perturbation_derivative_from_frames(
         &self,
         u: &JeffreysDirectionFrame,
         v: &JeffreysDirectionFrame,
         pert_uv: &Array2<f64>,
-        axes_uv: &[Array2<f64>],
+        axes_uv: &JeffreysRotatedAxes,
     ) -> Result<Array2<f64>, String> {
         if pert_uv.dim() != (self.p, self.p) {
             return Err("Jeffreys mixed drift information dimension mismatch".into());
@@ -960,7 +950,7 @@ impl JeffreysHphiDriftBase {
         let e = &u.e;
         let f = &v.e;
         let ef = symmetric_basis_contraction(pert_uv.view(), self.ambient_eigenbasis.view());
-        let auv = self.rotate_axis_rows(axes_uv)?;
+        let auv = &axes_uv.rows;
         let a = &self.a_rows;
         let (g_min, g_max) =
             conditioning_gate_weight_grad(self.evals[self.idx_min], self.evals[self.idx_max]);
@@ -1020,7 +1010,7 @@ impl JeffreysHphiDriftBase {
         }
         wuv += &self.first_frechet_rows(&v.rows, e, u.floor_motion);
         wuv += &self.first_frechet_rows(&u.rows, f, v.floor_motion);
-        wuv += &self.inverse_frechet_rows(&auv, &[], 0);
+        wuv += &self.inverse_frechet_rows(auv, &[], 0);
         let w = &self.aw_rows;
         let raw = w.dot(&a.t()) * -0.5;
         let mut result = (wuv.dot(&a.t())
