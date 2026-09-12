@@ -33,9 +33,9 @@ pub fn bartlett_factor_from_mean(mean_w: f64, ref_df: f64) -> Option<f64> {
 ///
 /// These are exactly the diagonal channels of the `K = 1` #932 row tower
 /// ([`gam_math::jet_tower::Tower4`]): the tower carries the row *negative*
-/// log-likelihood, so `ℓ⁽ᵏ⁾ᵢ = −towerᵢ.derivative_k`. `row_derivs_from_nll_tower`
-/// performs that sign flip; constructing this struct directly lets callers feed
-/// closed-form derivatives (e.g. the Gaussian fixture) without a tower.
+/// log-likelihood, so `ℓ⁽ᵏ⁾ᵢ = −towerᵢ.derivative_k`. Callers fill this struct
+/// with those sign-flipped channels or with closed-form derivatives (e.g. the
+/// Gaussian fixture).
 #[derive(Debug, Clone, Copy)]
 pub struct RowLogLikDerivs {
     /// `ℓ'ᵢ = ∂ℓᵢ/∂ηᵢ` (the score contribution).
@@ -46,23 +46,6 @@ pub struct RowLogLikDerivs {
     pub d3: f64,
     /// `ℓ''''ᵢ`.
     pub d4: f64,
-}
-
-/// Flip the sign of a `K = 1` NLL row tower's `(g, h, t3, t4)` diagonal channels
-/// into log-likelihood derivatives. The tower stores the *negative* log
-/// likelihood, so `ℓ⁽ᵏ⁾ = −tower⁽ᵏ⁾`.
-pub fn row_derivs_from_nll_tower(
-    value_grad: f64,
-    hess: f64,
-    third: f64,
-    fourth: f64,
-) -> RowLogLikDerivs {
-    RowLogLikDerivs {
-        d1: -value_grad,
-        d2: -hess,
-        d3: -third,
-        d4: -fourth,
-    }
 }
 
 /// The exact cumulant arrays the Bartlett/Skovgaard expansions consume, over a
@@ -106,94 +89,6 @@ impl CumulantArrays {
     #[inline]
     pub fn nu4(&self, a: usize, b: usize, c: usize, d: usize) -> f64 {
         self.nu4[((a * self.q + b) * self.q + c) * self.q + d]
-    }
-}
-
-/// Assemble [`CumulantArrays`] over a tested block.
-///
-/// * `block` — the `n × q` tested design columns `Z`, as `n` row slices each of
-///   length `q` (row-major rows). This is the block the smooth-term test
-///   targets, in the coordinates the per-row derivatives are taken in.
-/// * `rows` — the per-row log-likelihood `η`-derivatives (length `n`), from the
-///   #932 tower via [`row_derivs_from_nll_tower`] or a family closed form.
-///
-/// Returns `None` on a dimension mismatch, an empty block, or a non-finite
-/// entry. The work is `O(n · q⁴)` and embarrassingly parallel in the rows.
-pub fn assemble_cumulants(block: &[&[f64]], rows: &[RowLogLikDerivs]) -> Option<CumulantArrays> {
-    let n = rows.len();
-    if n == 0 || block.len() != n {
-        return None;
-    }
-    let q = block[0].len();
-    if q == 0 || block.iter().any(|r| r.len() != q) {
-        return None;
-    }
-    let mut info = vec![0.0_f64; q * q];
-    let mut nu3 = vec![0.0_f64; q * q * q];
-    let mut nu4 = vec![0.0_f64; q * q * q * q];
-    for (z, d) in block.iter().zip(rows.iter()) {
-        if !(d.d1.is_finite() && d.d2.is_finite() && d.d3.is_finite() && d.d4.is_finite()) {
-            return None;
-        }
-        if z.iter().any(|v| !v.is_finite()) {
-            return None;
-        }
-        for a in 0..q {
-            let za = z[a];
-            for b in 0..q {
-                let zab = za * z[b];
-                info[a * q + b] -= d.d2 * zab;
-                for c in 0..q {
-                    let zabc = zab * z[c];
-                    nu3[(a * q + b) * q + c] += d.d3 * zabc;
-                    for e in 0..q {
-                        nu4[((a * q + b) * q + c) * q + e] += d.d4 * zabc * z[e];
-                    }
-                }
-            }
-        }
-    }
-    if info
-        .iter()
-        .chain(nu3.iter())
-        .chain(nu4.iter())
-        .any(|v| !v.is_finite())
-    {
-        return None;
-    }
-    Some(CumulantArrays { q, info, nu3, nu4 })
-}
-
-/// Bartlett's standardized cumulant invariants of a scalar (`q = 1`) sub-model,
-/// the building blocks of the LR-statistic correction.
-///
-/// From the assembled scalar cumulants this returns the dimensionless
-/// `ρ₃ = ν₃ / i^{3/2}` and `ρ₄ = ν₄ / i²`, the parametrization-equivariant
-/// standardized third/fourth cumulants of the score. The Bartlett factor of the
-/// LR statistic is a fixed rational form in these invariants (the full Lawley
-/// (1956) scalar expansion — it also requires the score↔information joint
-/// cumulant, NOT just `ρ₃²` and `ρ₄`, which is why this function deliberately
-/// exposes the invariants rather than guessing a two-term coefficient). The
-/// acceptance fixture for any candidate coefficient is the unit-rate Exponential
-/// rate test, whose exact LR Bartlett factor is `2n(log n − ψ(n)) =
-/// 1 + 1/(6n) + O(n⁻³)`.
-///
-/// Returns `None` unless the cumulants are scalar with positive, finite
-/// information.
-pub fn scalar_standardized_cumulants(cumulants: &CumulantArrays) -> Option<(f64, f64)> {
-    if cumulants.q != 1 {
-        return None;
-    }
-    let i = cumulants.info(0, 0);
-    if !(i.is_finite() && i > 0.0) {
-        return None;
-    }
-    let rho3 = cumulants.nu3(0, 0, 0) / i.powf(1.5);
-    let rho4 = cumulants.nu4(0, 0, 0, 0) / (i * i);
-    if rho3.is_finite() && rho4.is_finite() {
-        Some((rho3, rho4))
-    } else {
-        None
     }
 }
 

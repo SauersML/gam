@@ -547,35 +547,6 @@ impl PreparedDecoderIncoherence {
         }
     }
 
-    pub fn remainder_action_add(&self, direction: &[f64], out: &mut [f64]) {
-        assert_eq!(direction.len(), self.dimension);
-        assert_eq!(out.len(), self.dimension);
-        for pair in &self.pairs {
-            // Dense block requests need only incident edges; do not rebuild
-            // every pair's matrix products for a direction supported on one atom.
-            if pair
-                .left
-                .clone()
-                .chain(pair.right.clone())
-                .all(|i| direction[i] == 0.0)
-            {
-                continue;
-            }
-            let local = Self::pair_direction(pair, direction);
-            let delta = pair.geometry.hessian_action(local.view())
-                - pair.geometry.gauss_newton_action(local.view());
-            Self::scatter(pair, delta.view(), out);
-        }
-    }
-
-    pub fn remainder_diagonal_add(&self, out: &mut [f64]) {
-        assert_eq!(out.len(), self.dimension);
-        for pair in &self.pairs {
-            let delta = pair.geometry.diagonal() - pair.geometry.gauss_newton_diagonal();
-            Self::scatter(pair, delta.view(), out);
-        }
-    }
-
     pub fn theta_bilinear_add(&self, exact: bool, left: &[f64], right: &[f64], out: &mut [f64]) {
         assert_eq!(left.len(), self.dimension);
         assert_eq!(right.len(), self.dimension);

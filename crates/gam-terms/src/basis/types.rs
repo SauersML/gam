@@ -646,8 +646,7 @@ pub enum CenterCountRequest {
 /// Computes the resolved center count, final basis dimension, dense byte
 /// estimates for the value design and first/second derivative tiers, and a
 /// recommended [`SpatialStorageMode`] derived from `policy`. This is the
-/// resource-aware replacement for ad-hoc calls to [`default_num_centers`] /
-/// `heuristic_centers`.
+/// resource-aware replacement for ad-hoc calls to [`default_num_centers`].
 pub fn plan_spatial_basis(
     n: usize,
     d: usize,

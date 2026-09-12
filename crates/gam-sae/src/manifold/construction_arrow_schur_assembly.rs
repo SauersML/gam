@@ -1034,16 +1034,14 @@ impl SaeManifoldTerm {
                                 // logits 0..K−1 is exactly the top-left (K−1)×(K−1) submatrix of
                                 // the full K×K majorizer (the fixed logit contributes no
                                 // row/column to the free curvature). The criterion's `log|H|`
-                                // and the #1006 θ-adjoint differentiate this SAME `D` (see the
-                                // `row_psd_majorizer_logit_derivative` site below), so value and
+                                // and the #1006 θ-adjoint differentiate this SAME `D`, so value and
                                 // adjoint stay on one exact branch.
                                 let row_logits: Vec<f64> = (0..k_atoms)
                                     .map(|k| self.assignment.logits[[row, k]])
                                     .collect();
                                 // #991 — fold this row's design weight into the
                                 // majorizer strength (the block is not sourced from
-                                // the weighted `assignment_hdiag`); the θ-adjoint at
-                                // `row_psd_majorizer_logit_derivative` carries the
+                                // the weighted `assignment_hdiag`); the θ-adjoint carries the
                                 // same `w_row` so value and adjoint stay on one branch.
                                 let w_row = row_loss_w.map_or(1.0, |w| w[row]);
                                 let h_dense = penalty.row_psd_majorizer(&row_logits, *scale * w_row);

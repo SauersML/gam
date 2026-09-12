@@ -1,6 +1,5 @@
 use coefficient_transforms::{
-    convex_derivative_control_transform_matrix, cumulative_exp, cumulative_sum_transform_matrix,
-    second_cumulative_exp,
+    convex_derivative_control_transform_matrix, cumulative_sum_transform_matrix,
 };
 
 pub use error::SmoothError;
@@ -425,7 +424,7 @@ impl SmoothBasisSpec {
     /// Rationale: B-spline / tensor / PCA bases have a closed-form column
     /// count, so we use the exact dimension. Radial bases (TPS, Matern,
     /// Duchon, Sphere) and factor smooths choose their column count from the
-    /// data (`heuristic_centers`, `unique_count`); we fall back to a small
+    /// data (e.g. `unique_count`); we fall back to a small
     /// constant floor because a fit on fewer than five rows cannot stabilise
     /// any radial smooth regardless of the configured kernel scale.
     pub fn min_sample_rows(&self) -> usize {
@@ -994,9 +993,8 @@ pub struct SmoothTerm {
     /// cone geometry under a general orthogonal rotation.
     ///
     /// Prediction-side replay: callers building a new-data design `X_new_raw`
-    /// from the *raw* basis must call `SmoothTerm::apply_rotation_to_predict`
-    /// (or equivalent) to obtain `X_new = X_new_raw · Q` matching this
-    /// term's coefficient system.
+    /// from the *raw* basis must right-multiply by `Q` to obtain
+    /// `X_new = X_new_raw · Q` matching this term's coefficient system.
     ///
     /// Persistence replay: `freeze_term_collection_from_design` copies this
     /// rotation into `SmoothTermSpec`, which is serialized with fitted-model
@@ -1035,41 +1033,6 @@ pub struct SmoothTerm {
 }
 
 impl SmoothTerm {
-    /// Apply the joint-null absorption rotation to a raw new-data design
-    /// matrix, returning `X_new_raw · Q` when this term was rotated at
-    /// fit time, or `X_new_raw` unchanged when no rotation was applied.
-    ///
-    /// Callers in the prediction path: after building the smooth's basis
-    /// at new data via the *raw* basis builder (the same builder used at
-    /// fit time, applied to `x_new` instead of the training rows), call
-    /// this method on the resulting matrix before forming `X · β`. The
-    /// fitted `β` lives in `γ`-coordinates if Q was applied; multiplying
-    /// the un-rotated `X_new_raw` by `β` would give a wrong η.
-    ///
-    /// Returns an error if the raw design's column count does not match
-    /// the rotation's `p_local`. The width invariant must hold: the raw
-    /// basis builder MUST emit the same `p_local` columns that the
-    /// fit-time builder did, and the rotation is `(p_local × p_local)`.
-    pub fn apply_rotation_to_predict(
-        &self,
-        x_new_raw: Array2<f64>,
-    ) -> Result<Array2<f64>, BasisError> {
-        let Some(rot) = self.joint_null_rotation.as_ref() else {
-            return Ok(x_new_raw);
-        };
-        let p_local = rot.rotation.nrows();
-        if x_new_raw.ncols() != p_local {
-            crate::bail_dim_basis!(
-                "joint-null rotation replay for term '{}': raw design has {} columns, \
-                 rotation expects {} (the raw basis builder must emit the same column \
-                 count as at fit time)",
-                self.name,
-                x_new_raw.ncols(),
-                p_local,
-            );
-        }
-        Ok(gam_linalg::faer_ndarray::fast_ab(&x_new_raw, &rot.rotation))
-    }
 
     /// Dimension of the **joint** null space of this term's active penalties:
     /// the coefficient directions penalized by *no* penalty. The smooth-component
@@ -1310,11 +1273,6 @@ impl LinearTermSpec {
         } else {
             self.feature_cols.clone()
         }
-    }
-
-    /// True when this term is a Wilkinson-Rogers `:` interaction (multi-col).
-    pub fn is_interaction(&self) -> bool {
-        self.feature_cols.len() > 1 || !self.categorical_levels.is_empty()
     }
 
     /// Realize this linear term's `(n,)` design column from `data`.
@@ -2335,11 +2293,6 @@ impl BlockwisePenalty {
         }
     }
 
-    pub fn with_prior_mean(mut self, prior_mean: gam_problem::CoefficientPriorMean) -> Self {
-        self.prior_mean = prior_mean;
-        self
-    }
-
     /// Attach an op-form penalty handle bit-equivalent to `local`.
     pub fn with_op(
         mut self,
@@ -2511,30 +2464,6 @@ impl KroneckerPenaltySystem {
 
     pub fn num_penalties(&self) -> usize {
         self.marginal_dims.len() + if self.has_double_penalty { 1 } else { 0 }
-    }
-
-    /// Compute `log|S|₊` and its first/second derivatives w.r.t. `ρ_k = log(λ_k)`.
-    ///
-    /// Iterates over the ∏q_j multi-index grid. Cost: O(d · ∏q_j), no O(p²) storage.
-    pub fn logdet_and_derivatives(
-        &self,
-        lambdas: &[f64],
-        objective_ridge: f64,
-    ) -> (f64, Array1<f64>, Array2<f64>) {
-        let n_pen = self.num_penalties();
-        assert_eq!(lambdas.len(), n_pen, "lambda count mismatch");
-        let marginal_evals: Vec<_> = self
-            .marginal_eigensystems
-            .iter()
-            .map(|(evals, _)| evals.view())
-            .collect();
-        crate::construction::kronecker_logdet_and_derivatives(
-            &marginal_evals,
-            &self.marginal_dims,
-            lambdas,
-            self.has_double_penalty,
-            objective_ridge,
-        )
     }
 
     pub fn logdet_rank_and_derivatives(
@@ -6844,24 +6773,6 @@ pub fn build_random_effect_block(
 
 
 impl SmoothDesign {
-    /// Map an unconstrained term coefficient vector to its constrained shape space.
-    /// This is useful for nonlinear fits that optimize unconstrained parameters.
-    pub fn map_term_coefficients(
-        unconstrained: &Array1<f64>,
-        shape: ShapeConstraint,
-    ) -> Result<Array1<f64>, BasisError> {
-        if unconstrained.is_empty() {
-            crate::bail_invalid_basis!("unconstrained coefficient vector cannot be empty");
-        }
-        let mapped = match shape {
-            ShapeConstraint::None => unconstrained.clone(),
-            ShapeConstraint::MonotoneIncreasing => cumulative_exp(unconstrained, 1.0),
-            ShapeConstraint::MonotoneDecreasing => cumulative_exp(unconstrained, -1.0),
-            ShapeConstraint::Convex => second_cumulative_exp(unconstrained, 1.0),
-            ShapeConstraint::Concave => second_cumulative_exp(unconstrained, -1.0),
-        };
-        Ok(mapped)
-    }
 }
 
 pub struct LocalSmoothTermBuild {
@@ -9151,15 +9062,7 @@ pub fn build_single_local_smooth_term(
     })
 }
 
-pub fn build_smooth_design(
-    data: ArrayView2<'_, f64>,
-    terms: &[SmoothTermSpec],
-) -> Result<RawSmoothDesign, BasisError> {
-    let mut ws = crate::basis::BasisWorkspace::new();
-    build_smooth_design_withworkspace(data, terms, &mut ws)
-}
-
-/// Like `build_smooth_design`, but honors the caller workspace policy while
+/// Build the raw smooth design, honoring the caller workspace policy while
 /// building each planned smooth term with an independent per-term workspace.
 ///
 /// Independent workspaces avoid shared mutable distance-cache state during the

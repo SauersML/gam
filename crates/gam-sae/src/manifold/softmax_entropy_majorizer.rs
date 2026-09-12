@@ -115,11 +115,10 @@ pub(crate) fn active_softmax_gershgorin_majorizer_entry(
     acc
 }
 
-/// Active-atom diagonal entry `∂D̃_kk/∂z_w` of the softmax-entropy Gershgorin
-/// majorizer derivative (mirrors
-/// [`SoftmaxAssignmentSparsityPenalty::row_psd_majorizer_logit_derivative`]'s
-/// `out[[kk, kk]]` entry-for-entry — that operator's output is DIAGONAL, so only
-/// `kk == kk` entries are nonzero). The compact #1006 θ-adjoint needs this only
+/// Active-atom diagonal entry `∂D̃_kk/∂z_w` of the logit derivative of the
+/// softmax-entropy Gershgorin majorizer
+/// [`SoftmaxAssignmentSparsityPenalty::row_psd_majorizer`] (that majorizer is
+/// DIAGONAL, so only `kk == kk` entries are nonzero). The compact #1006 θ-adjoint needs this only
 /// for the row's `≤ top_k` active atoms paired with its active logits, so this
 /// computes one diagonal entry directly from the softmax row `a` instead of
 /// materialising the full `K×K` derivative matrix per (row, logit) (#1410).
