@@ -1590,19 +1590,17 @@ where
     // are mathematically equal at the SAME β but, being computed in different
     // associativity orders over n≈3e5 rows, disagree by a handful of ULP. The
     // observed false reject was a 3e-11 gap at NLL≈1.5e5 — exactly 1 ULP at
-    // that magnitude (ulp(1.5e5) = 2^(17-52) ≈ 2.9e-11). Summation over n rows
-    // can accumulate a few ULP of order-dependent drift, so we admit a band of
-    // a modest multiple of the per-value ULP scaled by |threshold|:
-    // `EARLY_EXIT_REJECT_ROUNDING_ULPS × ε × max(|threshold|, 1)`. This stays a
-    // valid reject certificate: it only DEFERS borderline trials whose partial
-    // NLL exceeds the threshold by less than cross-path round-off to the full
-    // exact LL return value plus the caller's objective/ρ accept test; it never
-    // early-accepts a trial whose true full-data NLL is genuinely worse than
-    // the threshold by more than this round-off band.
-    const EARLY_EXIT_REJECT_ROUNDING_ULPS: f64 = 16.0;
-    let early_exit_reject_tol =
-        EARLY_EXIT_REJECT_ROUNDING_ULPS * f64::EPSILON * threshold.abs().max(1.0);
-    let early_exit_reject_threshold = threshold + early_exit_reject_tol;
+    // that magnitude (ulp(1.5e5) = 2^(17-52) ≈ 2.9e-11). Each side accumulates
+    // at most `n` weighted row terms with one product apiece, so whatever its
+    // associativity order Wilkinson's bound holds it within `γ_{n+1}` of the
+    // absolute sum of its terms, and the reject band is the two bands together:
+    // `γ_{n+1}·(|threshold| + |partial LL|)`. This stays a valid reject
+    // certificate: it only DEFERS borderline trials whose partial NLL exceeds the
+    // threshold by less than cross-path round-off to the full exact LL return
+    // value plus the caller's objective/ρ accept test; it never early-accepts a
+    // trial whose true full-data NLL is genuinely worse than the threshold by more
+    // than this round-off band.
+    let accumulation_growth = gam_linalg::roundoff::accumulation_growth(weighted_rows.len() + 1);
     let mut total_ll = 0.0;
     for chunk in weighted_rows.chunks(BERNOULLI_MARGSLOPE_LINE_SEARCH_EARLY_EXIT_CHUNK_ROWS) {
         let chunk_ll: f64 = gam_linalg::pairwise_reduce::par_deterministic_try_block_fold(
@@ -1630,7 +1628,8 @@ where
         // subsample sum (inverse-inclusion weights) is an *unbiased estimator* of
         // the full-data NLL, not a lower bound, so it must never drive a reject
         // against a full-data threshold.
-        if -total_ll > early_exit_reject_threshold {
+        let early_exit_reject_tol = accumulation_growth * (threshold.abs() + total_ll.abs());
+        if -total_ll > threshold + early_exit_reject_tol {
             return Err(format!(
                 "bernoulli marginal-slope line-search rejected early: partial_nll={} threshold={} (reject band={})",
                 -total_ll, threshold, early_exit_reject_tol
