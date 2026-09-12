@@ -399,15 +399,16 @@ static NFREE_RESET_LOGGER: std::sync::OnceLock<NfreeResetLogger> = std::sync::On
 
 fn install_nfree_reset_logger() {
     // Route the solver's `[NFREE-RESET ...]` info diagnostics to a file
-    // (`/tmp/nfree_trace.log`), bypassing nextest's stdout/stderr buffering
-    // which silently drops the early reset-time records. Idempotent: the
-    // `OnceLock` + `set_logger` error-swallow make repeated calls safe.
+    // (`nfree_trace.log` in the process temp directory, which honours TMPDIR),
+    // bypassing nextest's stdout/stderr buffering which silently drops the early
+    // reset-time records. Idempotent: the `OnceLock` + `set_logger`
+    // error-swallow make repeated calls safe.
     let logger = NFREE_RESET_LOGGER.get_or_init(|| {
         let file = std::fs::OpenOptions::new()
             .create(true)
             .write(true)
             .truncate(true)
-            .open("/tmp/nfree_trace.log")
+            .open(std::env::temp_dir().join("nfree_trace.log"))
             .expect("open nfree trace log");
         NfreeResetLogger {
             file: std::sync::Mutex::new(file),
