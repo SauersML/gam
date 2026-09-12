@@ -590,6 +590,7 @@ impl SaeManifoldTerm {
                     .map_or(1.0, |weights| weights[row].sqrt());
                 let input = crate::gpu_kernels::sae_rowjet::SaeSoftmaxRowJetInput::from_source(
                     &source,
+                    crate::gpu_kernels::sae_rowjet::SaeRowGateProgram::Softmax,
                     sqrt_row_weight,
                     shared_beta_layout.clone(),
                 )?;
@@ -701,6 +702,7 @@ impl SaeManifoldTerm {
                     .map_or(1.0, |weights| weights[row].sqrt());
                 let input = crate::gpu_kernels::sae_rowjet::SaeSoftmaxRowJetInput::from_source(
                     &source,
+                    crate::gpu_kernels::sae_rowjet::SaeRowGateProgram::Softmax,
                     sqrt_row_weight,
                     shared_beta_layout.clone(),
                 )?;
@@ -827,6 +829,7 @@ impl SaeManifoldTerm {
                     .map_or(1.0, |weights| weights[row].sqrt());
                 let input = crate::gpu_kernels::sae_rowjet::SaeSoftmaxRowJetInput::from_source(
                     &source,
+                    crate::gpu_kernels::sae_rowjet::SaeRowGateProgram::Softmax,
                     sqrt_row_weight,
                     shared_beta_layout.clone(),
                 )?;
@@ -879,34 +882,92 @@ impl SaeManifoldTerm {
         Ok(())
     }
 
-    /// Resident softmax `Γ = tr(H⁻¹ ∂H/∂θ)` reduction (#2333).
+    /// Resident `Γ = tr(H⁻¹ ∂H/∂θ)` reduction over the joint selected inverse,
+    /// for every gate family (#2333).
     ///
-    /// This is the sole softmax Trace consumer. It constructs the same selected
-    /// inverse blocks as the former hand loop, folds the row deflation map into
-    /// `E_tt`, projects every semantic output base into the row metric chart,
-    /// and sends the complete data-curvature tower through the typed Trace seam.
-    /// Scalar majorizer/ARD channels and the residual third-jet term are host
-    /// post-folds because they are not row-jet channels; all use the same `E_tt`
-    /// so the conditioned operator is differentiated exactly once.
-    pub(crate) fn contracted_softmax_trace_adjoint(
+    /// `H` is the operator the criterion factor builds (Gauss–Newton data
+    /// curvature plus the prior majorizers), so every channel is differentiated
+    /// on the criterion's own branch. This is the sole θ-adjoint consumer of the
+    /// Trace seam: it builds the joint selected-inverse blocks, folds each row's
+    /// deflation map into `E_tt`, projects every semantic output base into the
+    /// row metric chart, and sends the complete data-curvature tower of the
+    /// family's own row program (softmax, or independent logistic) through the
+    /// typed Trace seam. The softmax majorizer, assignment-prior, ARD and
+    /// residual third-jet channels, and the ordered Beta–Bernoulli empirical-mass
+    /// column pass, are host post-folds because they are not row-jet channels;
+    /// all use the same `E_tt` so the conditioned operator is differentiated
+    /// exactly once.
+    pub(crate) fn contracted_trace_adjoint(
         &self,
         rho: &SaeManifoldRho,
         cache: &ArrowFactorCache,
         solver: &DeflatedArrowSolver<'_>,
-        joint_block: bool,
+        // #2515 — which operator's `∂H/∂θ` this differentiates.
         operator: EvidenceOperator,
         residual_target: Option<ArrayView2<'_, f64>>,
     ) -> Result<SaeArrowVector, String> {
-        let AssignmentMode::Softmax {
-            temperature,
-            sparsity,
-        } = self.assignment.mode
-        else {
-            return Err("contracted softmax Trace called on a non-softmax gate".to_string());
+        use crate::gpu_kernels::sae_rowjet::SaeRowGateProgram;
+        self.assignment.validate_rho_domain(rho)?;
+        if cache.arrow_log_det().is_none() {
+            return Err(
+                "logdet_theta_adjoint: cache lacks an authoritative joint-Hessian log-det \
+                 for the selected-inverse operator"
+                    .to_string(),
+            );
+        }
+        let (program, inv_tau, softmax_entropy_scale) = match self.assignment.mode {
+            AssignmentMode::Softmax {
+                temperature,
+                sparsity,
+            } => {
+                let inv_tau = temperature.recip();
+                let entropy_scale = if self.k_atoms() > 1 {
+                    rho.lambda_sparse()? * sparsity * inv_tau * inv_tau
+                } else {
+                    0.0
+                };
+                (SaeRowGateProgram::Softmax, inv_tau, Some(entropy_scale))
+            }
+            AssignmentMode::OrderedBetaBernoulli { temperature, .. }
+            | AssignmentMode::ThresholdGate { temperature, .. } => (
+                SaeRowGateProgram::IndependentLogistic,
+                temperature.recip(),
+                None,
+            ),
+            // A top-k row has no logit primary, so its inverse temperature is
+            // unobservable; `row_jets_for_logdet` uses the same unit value.
+            AssignmentMode::TopK { .. } => (SaeRowGateProgram::IndependentLogistic, 1.0, None),
+        };
+        // The CUDA kernels lower only the softmax program; an independent gate
+        // reduces on the host.
+        let gpu_policy = match program {
+            SaeRowGateProgram::Softmax => self.gpu_policy,
+            SaeRowGateProgram::IndependentLogistic => gam_gpu::GpuPolicy::Off,
+        };
+        let threshold_strength = match self.assignment.mode {
+            AssignmentMode::ThresholdGate { .. } => rho.lambda_sparse()?,
+            _ => 0.0,
+        };
+        // The integrated ordered Beta–Bernoulli majorizer depends on the shared
+        // active mass `M_k = Σ_i z_ik`, so its logit derivative has a row-local
+        // channel and a shared-mass channel accumulated column-wise after the
+        // tile walk.
+        let ordered_beta_bernoulli_channels =
+            ordered_beta_bernoulli_psd_majorizer_third_channels_weighted(
+                &self.assignment,
+                rho,
+                self.row_loss_weights.as_deref(),
+            )?;
+        let (patchd_is_obb, patchd_obb_inv_tau) = match self.assignment.mode {
+            AssignmentMode::OrderedBetaBernoulli { temperature, .. } => {
+                (true, temperature.recip())
+            }
+            _ => (false, 0.0),
         };
         let exact_a = operator.is_exact_a();
         let n = self.n_obs();
         let p = self.output_dim();
+        let k_atoms = self.k_atoms();
         let total_t = cache.delta_t_len();
         let mut gamma_t = Array1::<f64>::zeros(total_t);
         let mut gamma_beta = Array1::<f64>::zeros(cache.k);
@@ -914,23 +975,13 @@ impl SaeManifoldTerm {
         let border = self.border_channels_for_cache(cache)?;
         let n_beta = border.len();
         let ard_precisions = self.validated_ard_precisions(rho)?;
-        let inv_tau = temperature.recip();
-        let entropy_scale = if self.k_atoms() > 1 {
-            rho.lambda_sparse()? * sparsity * inv_tau * inv_tau
-        } else {
-            0.0
-        };
-        let fast_selected = joint_block && solver.plain_selected_inverse_available();
-        let beta_inv = if joint_block {
-            Self::selected_inverse_beta_block(
-                solver,
-                cache,
-                fast_selected,
-                "contracted_softmax_trace_adjoint",
-            )?
-        } else {
-            Array2::<f64>::zeros((cache.k, cache.k))
-        };
+        let fast_selected = solver.plain_selected_inverse_available();
+        let beta_inv = Self::selected_inverse_beta_block(
+            solver,
+            cache,
+            fast_selected,
+            "contracted_trace_adjoint",
+        )?;
         let mut beta_inv_border = vec![0.0_f64; n_beta * n_beta];
         for (i, channel_i) in border.iter().enumerate() {
             for (j, channel_j) in border.iter().enumerate() {
@@ -945,7 +996,7 @@ impl SaeManifoldTerm {
             beta_inv: &beta_inv,
             fast_selected,
             rhs_beta_zero: rhs_beta_zero.view(),
-            context: "contracted_softmax_trace_adjoint",
+            context: "contracted_trace_adjoint",
         };
         let mut rhs_t_scratch = Array1::<f64>::zeros(total_t);
         let whiten = self.whiten_logdet_row_jets();
@@ -953,7 +1004,7 @@ impl SaeManifoldTerm {
             Some(
                 self.row_metric
                     .as_ref()
-                    .ok_or_else(|| "contracted softmax Trace whitening metric absent".to_string())?,
+                    .ok_or_else(|| "contracted Trace whitening metric absent".to_string())?,
             )
         } else {
             None
@@ -965,8 +1016,11 @@ impl SaeManifoldTerm {
         } else {
             None
         };
+        // Per ordered Beta–Bernoulli logit site: row, atom, global t-index, and
+        // the folded diagonal weight `E_tt[a,a] = inv_vv[a,a] − correction(e_a e_aᵀ)`.
+        let mut ordered_beta_bernoulli_logit_sites: Vec<(usize, usize, usize, f64)> = Vec::new();
         let host_budget = crate::manifold::sae_host_in_core_budget_bytes().0;
-        let mut assignments_scratch = Array1::<f64>::zeros(self.k_atoms());
+        let mut assignments_scratch = Array1::<f64>::zeros(k_atoms);
         let mut start = 0usize;
         while start < n {
             let q = cache.row_dims[start];
@@ -976,16 +1030,16 @@ impl SaeManifoldTerm {
                 .count();
             let plan = crate::gpu_kernels::sae_rowjet::plan_softmax_row_jets_trace(
                 same_shape_rows,
-                self.k_atoms(),
+                k_atoms,
                 q,
                 projected_p,
                 n_beta,
-                self.gpu_policy,
+                gpu_policy,
                 host_budget,
             )?;
             if plan.tile_rows == 0 {
                 return Err(format!(
-                    "contracted softmax Trace planner returned an empty tile at row {start}"
+                    "contracted Trace planner returned an empty tile at row {start}"
                 ));
             }
             let tile_rows = plan.tile_rows;
@@ -1001,7 +1055,7 @@ impl SaeManifoldTerm {
                     row,
                     assignments_scratch
                         .as_slice_mut()
-                        .expect("softmax assignment scratch is contiguous"),
+                        .expect("assignment scratch is contiguous"),
                 )?;
                 let source = ProductionRowProgram {
                     term: self,
@@ -1018,6 +1072,7 @@ impl SaeManifoldTerm {
                 let mut input =
                     crate::gpu_kernels::sae_rowjet::SaeSoftmaxRowJetInput::from_source(
                         &source,
+                        program,
                         sqrt_row_weight,
                         if metric.is_some() {
                             None
@@ -1040,28 +1095,13 @@ impl SaeManifoldTerm {
                     shared_beta_layout =
                         Some((input.beta_atoms.clone(), input.beta_outputs.clone()));
                 }
-                let (inv_vv_row, inv_vbeta_row) = if joint_block {
-                    Self::selected_inverse_row_blocks_or_solve(
-                        &selected_ctx,
-                        row,
-                        base,
-                        q,
-                        &mut rhs_t_scratch,
-                    )?
-                } else {
-                    let factor = cache.undamped_factor(row);
-                    let mut inverse = Array2::<f64>::zeros((q, q));
-                    let mut unit = Array1::<f64>::zeros(q);
-                    for col in 0..q {
-                        unit[col] = 1.0;
-                        let solved = cholesky_solve_vector(factor, unit.view());
-                        unit[col] = 0.0;
-                        for inverse_row in 0..q {
-                            inverse[[inverse_row, col]] = solved[inverse_row];
-                        }
-                    }
-                    (inverse, Array2::<f64>::zeros((q, cache.k)))
-                };
+                let (inv_vv_row, inv_vbeta_row) = Self::selected_inverse_row_blocks_or_solve(
+                    &selected_ctx,
+                    row,
+                    base,
+                    q,
+                    &mut rhs_t_scratch,
+                )?;
                 let defl_dirs = cache
                     .deflated_row_directions
                     .get(row)
@@ -1076,6 +1116,18 @@ impl SaeManifoldTerm {
                     defl_dirs,
                     defl_spectrum,
                 );
+                if ordered_beta_bernoulli_channels.is_some() {
+                    for (pos, var) in vars.iter().enumerate() {
+                        if let SaeLocalRowVar::Logit { atom } = *var {
+                            ordered_beta_bernoulli_logit_sites.push((
+                                row,
+                                atom,
+                                base + pos,
+                                e_row[[pos, pos]],
+                            ));
+                        }
+                    }
+                }
                 e_tt.extend(e_row.iter().copied());
                 for a in 0..q {
                     for channel in &border {
@@ -1098,7 +1150,7 @@ impl SaeManifoldTerm {
             )?;
             if (trace.n_rows, trace.q, trace.n_beta) != (tile_rows, q, n_beta) {
                 return Err(format!(
-                    "contracted softmax Trace returned shape ({}, {}, {}); expected ({tile_rows}, {q}, {n_beta})",
+                    "contracted Trace returned shape ({}, {}, {}); expected ({tile_rows}, {q}, {n_beta})",
                     trace.n_rows, trace.q, trace.n_beta
                 ));
             }
@@ -1107,14 +1159,14 @@ impl SaeManifoldTerm {
                 let base = cache.row_offsets[row];
                 let vars = &layouts[local];
                 let assignments = Array1::from_vec(inputs[local].gate_values.clone());
+                let a_row = assignments
+                    .as_slice()
+                    .expect("row assignments are contiguous");
                 let e_row = &e_tt[local * q * q..(local + 1) * q * q];
                 let vbeta_row =
                     &inv_vbeta[local * q * n_beta..(local + 1) * q * n_beta];
-                let m = softmax_majorizer_log_mean(
-                    assignments
-                        .as_slice()
-                        .expect("softmax assignments are contiguous"),
-                );
+                let softmax_majorizer = softmax_entropy_scale
+                    .map(|entropy_scale| (softmax_majorizer_log_mean(a_row), entropy_scale));
                 let w_row = self.row_loss_weights.as_deref().map_or(1.0, |w| w[row]);
                 let patchd_error_metric = patchd_residual.map(|target| {
                     self.patchd_row_error_metric(row, w_row, target, &assignments, whiten)
@@ -1127,22 +1179,21 @@ impl SaeManifoldTerm {
                         assignments: &assignments,
                         second_jets: &second_jets,
                         third_jets: patchd_third_jets.as_deref(),
-                        is_obb: false,
-                        inv_tau: 0.0,
+                        is_obb: patchd_is_obb,
+                        inv_tau: patchd_obb_inv_tau,
                     }
                 });
                 for w in 0..q {
                     let mut gamma = trace.t[local * q + w];
-                    if let SaeLocalRowVar::Logit { atom: atom_w } = vars[w] {
-                        let a_soft = assignments
-                            .as_slice()
-                            .expect("softmax assignments are contiguous");
+                    if let (Some((m, entropy_scale)), SaeLocalRowVar::Logit { atom: atom_w }) =
+                        (softmax_majorizer, vars[w])
+                    {
                         for a in 0..q {
                             if let SaeLocalRowVar::Logit { atom: atom_a } = vars[a] {
                                 gamma += e_row[a * q + a]
                                     * w_row
                                     * active_softmax_majorizer_logit_derivative_entry(
-                                        a_soft,
+                                        a_row,
                                         atom_a,
                                         atom_w,
                                         m,
@@ -1150,6 +1201,19 @@ impl SaeManifoldTerm {
                                         inv_tau,
                                     );
                             }
+                        }
+                    }
+                    for a in 0..q {
+                        if let SaeLocalRowVar::Logit { atom } = vars[a] {
+                            gamma += e_row[a * q + a]
+                                * self.assignment_prior_hdiag_derivative_entry(
+                                    threshold_strength,
+                                    row,
+                                    atom,
+                                    vars[w],
+                                    ordered_beta_bernoulli_channels.as_ref(),
+                                    exact_a,
+                                );
                         }
                     }
                     if let SaeLocalRowVar::Coord { atom, axis } = vars[w] {
@@ -1208,8 +1272,22 @@ impl SaeManifoldTerm {
             }
             start += tile_rows;
         }
-        if exact_a && joint_block {
+        if exact_a {
             gamma_beta += &self.exact_decoder_prior_theta_trace(cache, beta_inv.view())?;
+        }
+        // Empirical-mass channel of the row-local ordered Beta–Bernoulli
+        // majorizer: its diagonal depends on `M_k = Σ_i z_ik`, so a logit in any
+        // row differentiates every retained row-local diagonal in column `k`,
+        // each weighted by its folded diagonal `E_tt[a,a]`.
+        if let Some(channels) = ordered_beta_bernoulli_channels.as_ref() {
+            let mut column_coefficient = vec![0.0_f64; k_atoms];
+            for &(row, atom, _t_index, diagonal_weight) in &ordered_beta_bernoulli_logit_sites {
+                column_coefficient[atom] +=
+                    diagonal_weight * channels.m_channel[row * k_atoms + atom];
+            }
+            for &(row, atom, t_index, _diagonal_weight) in &ordered_beta_bernoulli_logit_sites {
+                gamma_t[t_index] += column_coefficient[atom] * channels.z_jac[row * k_atoms + atom];
+            }
         }
         Ok(SaeArrowVector {
             t: gamma_t,
@@ -1220,12 +1298,12 @@ impl SaeManifoldTerm {
 
 /// #2333 — the algebraic identity the softmax Trace cutover rests on.
 ///
-/// `SaeManifoldTerm::contracted_softmax_trace_adjoint` no longer computes the
+/// `SaeManifoldTerm::contracted_trace_adjoint` no longer computes the
 /// retired hand loop's `contract-then-subtract` shape
 /// `tr(inv_vv·D) − deflation_block_correction(inv_vv, D, …)`; it hands the seam a
 /// SINGLE weight `E_tt` and lets the kernel reduce `Σ_{a,b} E[a,b]·dh[a,b]`
-/// against the materialized tower. Every θ-adjoint value on the softmax route is
-/// therefore only as correct as
+/// against the materialized tower. Every θ-adjoint value, for every gate family,
+/// is therefore only as correct as
 /// `SaeManifoldTerm::deflation_folded_trace_weight` reproducing that
 /// subtraction inside the weight. These tests pin exactly that, at the RELATIVE
 /// tolerance the fold's reassociation of the same `f64` sum earns, for every
@@ -1532,7 +1610,7 @@ mod tests_deflation_trace_fold_2333 {
 /// #2333 — production acceptance for the softmax Trace cutover.
 ///
 /// The identity tests above pin the seam WEIGHT. This pins the CONSUMER: that
-/// `contracted_softmax_trace_adjoint` supplies the row's likelihood metric,
+/// `contracted_trace_adjoint` supplies the row's likelihood metric,
 /// selected inverse and Daleckii–Krein fold to the seam correctly enough to
 /// reproduce the independent dense builder `logdet_theta_adjoint_dense`, which
 /// materializes the joint inverse and every `∂H/∂θ` entry densely and shares no

@@ -26,7 +26,8 @@
 //! they are never hidden by retrying the tile on the CPU.
 
 use crate::row_jet_program::{
-    SaeOrder2RowProgramSource, SaeRowPrimary, SaeScheduledRowJets, execute_softmax_row_program,
+    SaeOrder2RowProgramSource, SaeRowPrimary, SaeScheduledRowJets,
+    execute_independent_logistic_row_program, execute_softmax_row_program,
 };
 
 /// One primary in a complete SAE reconstruction row.
@@ -83,8 +84,42 @@ fn softmax_data_weight_product_logit_factor(
     (left + right) * inv_tau
 }
 
-/// Complete semantic inputs for one softmax row.
+/// The structure-compiled gate program a row's channels are derived from.
 ///
+/// Both programs consume the identical semantic row input and differ only in
+/// how gate masses move with their logits. The CUDA kernels lower the softmax
+/// program alone, so an independent-logistic tile always reduces on the host.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SaeRowGateProgram {
+    /// `z = softmax(inv_tau · logits)`: gate masses normalize to one and every
+    /// logit moves every gate (`execute_softmax_row_program`).
+    Softmax,
+    /// `z_k = σ(inv_tau · (logit_k − shift_k))`: one logit per gate and no
+    /// normalization. Threshold gates, ordered Beta–Bernoulli gates, and the
+    /// logit-free top-k support gate (`execute_independent_logistic_row_program`).
+    IndependentLogistic,
+}
+
+impl SaeRowGateProgram {
+    fn execute<S: SaeOrder2RowProgramSource>(
+        self,
+        source: &S,
+        inv_tau: f64,
+        sqrt_row_w: f64,
+    ) -> SaeScheduledRowJets {
+        match self {
+            Self::Softmax => execute_softmax_row_program(source, inv_tau, sqrt_row_w),
+            Self::IndependentLogistic => {
+                execute_independent_logistic_row_program(source, inv_tau, sqrt_row_w)
+            }
+        }
+    }
+}
+
+/// Complete semantic inputs for one reconstruction row.
+///
+/// `gate_program` names the row program the channels are derived from, and
+/// with it the normalization law `validate` applies to `gate_values`.
 /// `decoded_first` is indexed by the live primary slot (`q * p`); logit slots
 /// are exact zero. `decoded_second` is `q * q * p`; only same-atom coordinate
 /// pairs can be nonzero. These are contractions of the term's live basis
@@ -92,6 +127,7 @@ fn softmax_data_weight_product_logit_factor(
 /// coordinates or a second basis implementation.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SaeSoftmaxRowJetInput {
+    pub gate_program: SaeRowGateProgram,
     pub n_atoms: usize,
     pub out_dim: usize,
     pub primaries: Vec<SaeRowJetPrimary>,
@@ -140,6 +176,7 @@ impl SaeSoftmaxRowJetInput {
     /// derivatives come from the exact live source used by the CPU schedule.
     pub(crate) fn from_source<S: SaeOrder2RowProgramSource>(
         source: &S,
+        gate_program: SaeRowGateProgram,
         sqrt_row_weight: f64,
         shared_beta_layout: Option<(std::sync::Arc<[usize]>, std::sync::Arc<[f64]>)>,
     ) -> Result<Self, String> {
@@ -250,6 +287,7 @@ impl SaeSoftmaxRowJetInput {
         };
 
         let input = Self {
+            gate_program,
             n_atoms,
             out_dim,
             coordinate_slots: Self::coordinate_slots_for(&primaries),
@@ -379,19 +417,24 @@ impl SaeSoftmaxRowJetInput {
                 "SAE row-jet gate_values[{atom}] must be a probability; got {value}"
             ));
         }
-        let gate_sum: f64 = self.gate_values.iter().sum();
-        let rounding_mass = (k as f64) * f64::EPSILON;
-        if rounding_mass >= 1.0 {
-            return Err(format!(
-                "SAE row-jet K={k} is too large to certify a normalized f64 softmax"
-            ));
-        }
-        let summation_bound = rounding_mass / (1.0 - rounding_mass);
-        let normalization_bound = f64::EPSILON + summation_bound + f64::EPSILON * summation_bound;
-        if (gate_sum - 1.0).abs() > normalization_bound * gate_sum.abs().max(1.0) {
-            return Err(format!(
-                "SAE row-jet gate values must sum to one within the f64 normalization bound {normalization_bound:e}; got {gate_sum:e}"
-            ));
+        // Only the softmax program normalizes its gates; an independent gate is
+        // any probability on its own.
+        if self.gate_program == SaeRowGateProgram::Softmax {
+            let gate_sum: f64 = self.gate_values.iter().sum();
+            let rounding_mass = (k as f64) * f64::EPSILON;
+            if rounding_mass >= 1.0 {
+                return Err(format!(
+                    "SAE row-jet K={k} is too large to certify a normalized f64 softmax"
+                ));
+            }
+            let summation_bound = rounding_mass / (1.0 - rounding_mass);
+            let normalization_bound =
+                f64::EPSILON + summation_bound + f64::EPSILON * summation_bound;
+            if (gate_sum - 1.0).abs() > normalization_bound * gate_sum.abs().max(1.0) {
+                return Err(format!(
+                    "SAE row-jet gate values must sum to one within the f64 normalization bound {normalization_bound:e}; got {gate_sum:e}"
+                ));
+            }
         }
         for (slot, primary) in self.primaries.iter().copied().enumerate() {
             let atom = match primary {
@@ -575,11 +618,11 @@ pub enum SaeRowJetContraction<'a> {
     /// The `Γ = tr(H⁻¹ ∂H/∂θ)` log-det θ-adjoint shape (#2304).
     ///
     /// For every t-direction `w` and every β-direction `w_β` the consumer
-    /// (`logdet_theta_adjoint_for_block`) reduces the derivative matrix of the
-    /// tower against the per-row selected inverse. With
-    /// `dh_w[a][b] = ⟨second(a,w),first(b)⟩ + ⟨first(a),second(b,w)⟩` (and the
-    /// softmax data-weight-product substitution below for logit `w` over
-    /// coordinate pairs) the outputs are
+    /// (`SaeManifoldTerm::contracted_trace_adjoint`) reduces the derivative
+    /// matrix of the tower against the per-row selected inverse. With
+    /// `dh_w[a][b] = ⟨second(a,w),first(b)⟩ + ⟨first(a),second(b,w)⟩` (and, for
+    /// the softmax program only, the data-weight-product substitution below for
+    /// logit `w` over coordinate pairs) the outputs are
     ///
     /// `t[r][w]    = Σ_{a,b} E_tt[r][a][b] dh_w[a][b]
     ///             + Σ_a Σ_c 2·inv_vβ[r][a][c] (⟨second(a,w),β(c)⟩ + ⟨first(a),βderiv(w,c)⟩)
@@ -712,6 +755,7 @@ pub fn execute_softmax_row_jet_tile_contracted(
             beta: Vec::new(),
         });
     }
+    refuse_device_for_independent_program(rows, path)?;
     match path {
         SaeRowJetPath::Cpu => cpu_contracted_tile(rows, inv_tau, q, p, n_beta, contraction),
         SaeRowJetPath::Device => {
@@ -746,7 +790,9 @@ fn cpu_contracted_tile(
     let mut beta = vec![0.0_f64; checked_product(&[n, n_beta])?];
     for (row, input) in rows.iter().enumerate() {
         let source = InputSource::new(input);
-        let scheduled = execute_softmax_row_program(&source, inv_tau, input.sqrt_row_weight);
+        let scheduled = input
+            .gate_program
+            .execute(&source, inv_tau, input.sqrt_row_weight);
         source.finish()?;
         match contraction {
             SaeRowJetContraction::Linear { probe } => {
@@ -788,6 +834,7 @@ fn cpu_contracted_tile(
             } => {
                 let e_row = &e_tt[row * q * q..(row + 1) * q * q];
                 let vbeta_row = &inv_vbeta[row * q * n_beta..(row + 1) * q * n_beta];
+                let softmax_program = input.gate_program == SaeRowGateProgram::Softmax;
                 // One t-adjoint direction `w` (a live logit or coordinate slot).
                 for w in 0..q {
                     let (w_is_logit, atom_w) = primary_kind_atom(input.primaries[w]);
@@ -799,7 +846,12 @@ fn cpu_contracted_tile(
                             // Under softmax a logit `w` differentiates the
                             // coordinate-pair data curvature `⟨J_a,J_b⟩` through
                             // the assignment weights, not through second jets.
-                            let mut dh = if w_is_logit && !a_is_logit && !b_is_logit {
+                            // An independent gate's logit moves only its own
+                            // atom, whose logit×coordinate second jets already
+                            // carry that derivative.
+                            let substituted =
+                                softmax_program && w_is_logit && !a_is_logit && !b_is_logit;
+                            let mut dh = if substituted {
                                 dot(scheduled.first(a), scheduled.first(b))
                                     * softmax_data_weight_product_logit_factor(
                                         &input.gate_values,
@@ -1464,8 +1516,32 @@ fn validate_tile(rows: &[SaeSoftmaxRowJetInput]) -> Result<(usize, usize, usize,
                 "SAE row-jet tile row {row} has a different decoder-border atom layout"
             ));
         }
+        if input.gate_program != first.gate_program {
+            return Err(format!(
+                "SAE row-jet tile row {row} gate program {:?} != first-row program {:?}",
+                input.gate_program, first.gate_program
+            ));
+        }
     }
     Ok(shape)
+}
+
+/// The CUDA kernels lower only the softmax program, so a device tile of an
+/// independent-logistic program is refused before staging rather than
+/// evaluated under the softmax gate law.
+fn refuse_device_for_independent_program(
+    rows: &[SaeSoftmaxRowJetInput],
+    path: SaeRowJetPath,
+) -> Result<(), String> {
+    let program = rows
+        .first()
+        .map_or(SaeRowGateProgram::Softmax, |input| input.gate_program);
+    if path == SaeRowJetPath::Device && program != SaeRowGateProgram::Softmax {
+        return Err(format!(
+            "SAE row-jet device kernels lower only the softmax program; got {program:?}"
+        ));
+    }
+    Ok(())
 }
 
 /// Evaluate one already-planned bounded tile. Device failures propagate.
@@ -1483,6 +1559,7 @@ pub fn execute_softmax_row_jet_tile(
     if rows.is_empty() {
         return SaeRowJetChannels::zeros(0, 0, 0, 0, 0);
     }
+    refuse_device_for_independent_program(rows, path)?;
     match path {
         SaeRowJetPath::Cpu => cpu_tile(rows, inv_tau, k, q, p, n_beta),
         SaeRowJetPath::Device => {
@@ -1617,7 +1694,9 @@ fn cpu_tile(
     let mut out = SaeRowJetChannels::zeros(rows.len(), k, q, p, n_beta)?;
     for (row, input) in rows.iter().enumerate() {
         let source = InputSource::new(input);
-        let scheduled = execute_softmax_row_program(&source, inv_tau, input.sqrt_row_weight);
+        let scheduled = input
+            .gate_program
+            .execute(&source, inv_tau, input.sqrt_row_weight);
         source.finish()?;
         for slot in 0..q {
             let target = row * q * p + slot * p;
@@ -2996,6 +3075,7 @@ mod tests {
                 beta_basis_first[4 * n_beta + 1] = 0.7;
                 beta_basis_first[5 * n_beta + 2] = -0.1;
                 SaeSoftmaxRowJetInput {
+                    gate_program: SaeRowGateProgram::Softmax,
                     n_atoms: k,
                     out_dim: p,
                     coordinate_slots: SaeSoftmaxRowJetInput::coordinate_slots_for(&primaries),
@@ -3549,6 +3629,131 @@ mod tests {
         assert!(any_logit, "logit-direction trace must engage");
         assert!(any_coord, "coordinate-direction trace must engage");
         assert!(any_beta, "beta-direction trace must engage");
+    }
+
+    /// #2333 — the Trace seam serves every gate family, not only softmax.
+    ///
+    /// An independent-logistic row (threshold gate, ordered Beta–Bernoulli,
+    /// top-k) moves one gate per logit, so a logit direction reaches a
+    /// coordinate pair only through its own atom's second jets and the softmax
+    /// data-weight-product substitution must not fire. The CPU seam must equal
+    /// the plain reduction of the independent program's materialized channels,
+    /// the normalization law must bind only the softmax program, and the device
+    /// path, whose kernels lower only softmax, must refuse the tile.
+    #[test]
+    fn contracted_trace_reduces_independent_logistic_rows_without_softmax_substitution_2333() {
+        let rows: Vec<SaeSoftmaxRowJetInput> = complete_fixture(4)
+            .into_iter()
+            .enumerate()
+            .map(|(row, mut input)| {
+                input.gate_program = SaeRowGateProgram::IndependentLogistic;
+                input.gate_values = vec![0.30 + 0.05 * row as f64, 0.80 - 0.04 * row as f64, 0.55];
+                input
+            })
+            .collect();
+        let mut as_softmax = rows[0].clone();
+        as_softmax.gate_program = SaeRowGateProgram::Softmax;
+        assert!(
+            as_softmax.validate().is_err(),
+            "unnormalized independent gates must fail the softmax normalization law"
+        );
+        for input in &rows {
+            input
+                .validate()
+                .expect("independent gates carry no normalization law");
+        }
+        let inv_tau = 1.3;
+        let channels = execute_softmax_row_jet_tile(&rows, inv_tau, SaeRowJetPath::Cpu)
+            .expect("CPU independent-logistic row jet");
+        let (n, q, n_beta) = (channels.n_rows, channels.q, channels.n_beta);
+        let scheduled = channels.into_scheduled_rows();
+        let dot =
+            |a: &[f64], b: &[f64]| -> f64 { a.iter().zip(b.iter()).map(|(&x, &y)| x * y).sum() };
+        let (e_tt, inv_vbeta, beta_inv) = trace_weights(n, q, n_beta);
+        let contraction = SaeRowJetContraction::Trace {
+            e_tt: &e_tt,
+            inv_vbeta: &inv_vbeta,
+            beta_inv: &beta_inv,
+            exact_a: true,
+        };
+        let trace =
+            execute_softmax_row_jet_tile_contracted(&rows, inv_tau, SaeRowJetPath::Cpu, contraction)
+                .expect("CPU independent-logistic trace contraction");
+        assert_eq!((trace.n_rows, trace.q, trace.n_beta), (n, q, n_beta));
+        let mut any_logit = false;
+        for (row, jets) in scheduled.iter().enumerate() {
+            let e_row = &e_tt[row * q * q..(row + 1) * q * q];
+            let vbeta_row = &inv_vbeta[row * q * n_beta..(row + 1) * q * n_beta];
+            for w in 0..q {
+                let mut expected = 0.0_f64;
+                for a in 0..q {
+                    for b in 0..q {
+                        let mut dh = dot(jets.second(a, w), jets.first(b))
+                            + dot(jets.first(a), jets.second(b, w));
+                        dh += dot(jets.first(w), jets.second(a, b));
+                        expected += e_row[a * q + b] * dh;
+                    }
+                    for border in 0..n_beta {
+                        let mut dh = dot(jets.second(a, w), jets.beta(border))
+                            + dot(jets.first(a), jets.beta_deriv(w, border));
+                        dh += dot(jets.first(w), jets.beta_deriv(a, border));
+                        expected += 2.0 * vbeta_row[a * n_beta + border] * dh;
+                    }
+                }
+                for i in 0..n_beta {
+                    for j in 0..n_beta {
+                        let dh = dot(jets.beta_deriv(w, i), jets.beta(j))
+                            + dot(jets.beta(i), jets.beta_deriv(w, j));
+                        expected += beta_inv[i * n_beta + j] * dh;
+                    }
+                }
+                assert_eq!(
+                    trace.t[row * q + w],
+                    expected,
+                    "independent-logistic trace t mismatch row={row}, w={w}"
+                );
+                if expected != 0.0
+                    && matches!(rows[row].primaries[w], SaeRowJetPrimary::Logit { .. })
+                {
+                    any_logit = true;
+                }
+            }
+            for w_beta in 0..n_beta {
+                let mut expected = 0.0_f64;
+                for a in 0..q {
+                    for b in 0..q {
+                        let mut dh = dot(jets.beta_l_deriv(a, w_beta), jets.first(b))
+                            + dot(jets.first(a), jets.beta_l_deriv(b, w_beta));
+                        dh += dot(jets.beta(w_beta), jets.second(a, b));
+                        expected += e_row[a * q + b] * dh;
+                    }
+                    for border in 0..n_beta {
+                        let mut dh = dot(jets.beta_l_deriv(a, w_beta), jets.beta(border));
+                        dh += dot(jets.beta(w_beta), jets.beta_deriv(a, border));
+                        expected += 2.0 * vbeta_row[a * n_beta + border] * dh;
+                    }
+                }
+                assert_eq!(
+                    trace.beta[row * n_beta + w_beta],
+                    expected,
+                    "independent-logistic trace beta mismatch row={row}, w_beta={w_beta}"
+                );
+            }
+        }
+        assert!(
+            any_logit,
+            "logit-direction independent-logistic trace must engage"
+        );
+        assert!(
+            execute_softmax_row_jet_tile_contracted(
+                &rows,
+                inv_tau,
+                SaeRowJetPath::Device,
+                contraction
+            )
+            .is_err(),
+            "the device kernels lower only the softmax program and must refuse this tile"
+        );
     }
 
     /// Independent finite-difference oracle for the θ-adjoint's softmax-logit

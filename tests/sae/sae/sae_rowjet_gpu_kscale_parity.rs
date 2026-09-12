@@ -2,7 +2,8 @@
 //! channel and matches the CPU row program on every packed output.
 
 use gam::terms::sae::gpu_kernels::sae_rowjet::{
-    SaeRowJetPath, SaeRowJetPrimary, SaeSoftmaxRowJetInput, execute_softmax_row_jet_tile,
+    SaeRowGateProgram, SaeRowJetPath, SaeRowJetPrimary, SaeSoftmaxRowJetInput,
+    execute_softmax_row_jet_tile,
 };
 
 fn fixture(n: usize) -> Vec<SaeSoftmaxRowJetInput> {
@@ -35,6 +36,7 @@ fn fixture(n: usize) -> Vec<SaeSoftmaxRowJetInput> {
             beta_basis_first[2 * n_beta + 1] = -0.2;
             beta_basis_first[3 * n_beta + 1] = 0.6;
             SaeSoftmaxRowJetInput {
+                gate_program: SaeRowGateProgram::Softmax,
                 n_atoms: k,
                 out_dim: p,
                 coordinate_slots: SaeSoftmaxRowJetInput::coordinate_slots_for(&primaries),

@@ -102,14 +102,7 @@ fn resident_softmax_theta_adjoint_matches_dense_under_both_operators_2828() {
             )
             .expect("dense theta adjoint");
         let resident = anchor
-            .contracted_softmax_trace_adjoint(
-                &rho,
-                &cache,
-                &solver,
-                true,
-                operator,
-                residual_target,
-            )
+            .contracted_trace_adjoint(&rho, &cache, &solver, operator, residual_target)
             .expect("resident softmax trace adjoint");
         let scale = dense
             .t
