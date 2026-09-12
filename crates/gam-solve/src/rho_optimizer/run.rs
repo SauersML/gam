@@ -8216,6 +8216,13 @@ pub(crate) fn run_outer_uncertified(
     // there instead of replaying the same refuted fixed-point walk or throwing
     // away useful work.
     let mut refuted_fixed_point_continuation: Option<OuterResult> = None;
+    // Iterations spent by attempts whose results this function discards: an
+    // exhausted ARC attempt the budget retry continues, a plan the degraded
+    // ladder replaces, a fixed-point walk handed to BFGS. `OuterResult.iterations`
+    // is the total across solver restarts and these are the restarts, so the
+    // returned result carries them. Reporting only the last attempt's count hid
+    // an exhausted budget behind the retry that followed it (#2817).
+    let mut spent_iterations: usize = 0;
 
     'plan_attempts: for (attempt_idx, attempt_cap) in attempts.iter().enumerate() {
         let the_plan = plan(attempt_cap);
@@ -8366,6 +8373,8 @@ pub(crate) fn run_outer_uncertified(
                         "{:?} continuation requested after rho-local trial refusal: {}",
                         request.checkpoint.plan_used.solver, request.refusal,
                     )));
+                    spent_iterations =
+                        spent_iterations.saturating_add(request.checkpoint.iterations);
                     fixed_point_continuation = Some(request.checkpoint);
                     continue 'plan_attempts;
                 }
@@ -8395,6 +8404,7 @@ pub(crate) fn run_outer_uncertified(
                             "{:?} fixed point was refuted by analytic screening",
                             the_plan.solver,
                         )));
+                        spent_iterations = spent_iterations.saturating_add(result.iterations);
                         refuted_fixed_point_continuation = Some(result);
                         continue 'plan_attempts;
                     }
@@ -8538,6 +8548,7 @@ pub(crate) fn run_outer_uncertified(
                             next.previously_refused_seed_points.push(point.clone());
                         }
                     }
+                    spent_iterations = spent_iterations.saturating_add(result.iterations);
                     retry_config = Some(next);
                     arc_retries_left -= 1;
                     obj.reset();
@@ -8557,11 +8568,13 @@ pub(crate) fn run_outer_uncertified(
         };
 
         match outcome {
-            Ok(result) => {
+            Ok(mut result) => {
                 if result.solver_claimed_convergence() {
+                    result.iterations = result.iterations.saturating_add(spent_iterations);
                     return Ok(result);
                 }
 
+                spent_iterations = spent_iterations.saturating_add(result.iterations);
                 let improves_checkpoint = result.final_value.is_finite()
                     && best_checkpoint.as_ref().is_none_or(|checkpoint| {
                         !checkpoint.final_value.is_finite()
@@ -8591,7 +8604,10 @@ pub(crate) fn run_outer_uncertified(
         }
     }
 
-    if let Some(checkpoint) = best_checkpoint {
+    if let Some(mut checkpoint) = best_checkpoint {
+        // Every attempt that ended here, this checkpoint's own included, has
+        // already added its iterations to `spent_iterations`.
+        checkpoint.iterations = spent_iterations;
         // The solver ladder produced no result that its OWN internal
         // (raw-gradient) convergence test accepted — but that test cannot see a
         // railed or already-stationary optimum. At a smoothing parameter railed to

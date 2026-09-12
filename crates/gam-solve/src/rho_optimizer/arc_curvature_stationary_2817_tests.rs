@@ -543,6 +543,79 @@ fn a_residual_along_a_sub_resolution_negative_direction_keeps_the_search_moving_
     );
 }
 
+// ─── the budget retry's iteration ledger ─────────────────────────────────────
+
+/// The ARC budget retry must report every attempt's iterations, not only the
+/// last attempt's.
+///
+/// `OuterResult.iterations` is "total outer iterations across all solver
+/// restarts", and a fit-level `outer_iterations < max_iter` is the only evidence
+/// a caller has that no attempt ran out of budget. The retry dropped each
+/// exhausted attempt's count, so a search that burned its budget and was then
+/// continued read as one short run.
+///
+/// Same quartic ladder as
+/// `run_nonconverged_arc_returns_typed_checkpoint_after_budget_retry_ladder`:
+/// every attempt exhausts `max_iter = 1` and both retries fire, so the ladder
+/// spends more iterations than any one attempt can report. The call goes
+/// through `run_outer_uncertified`, the layer that owns the retry, so the
+/// certification resume in `run_outer` (which adds its own counts) cannot
+/// supply the total.
+#[test]
+fn arc_budget_retry_reports_every_attempts_iterations_2817() {
+    const OFFSET: f64 = 0.5;
+    const SCALE: f64 = 1.0e6;
+    const MAX_ITER: usize = 1;
+    let mut seed_config = gam_problem::SeedConfig::default();
+    seed_config.seed_budget = 1;
+    seed_config.risk_profile = gam_problem::SeedRiskProfile::Gaussian;
+    let problem = OuterProblem::new(1)
+        .with_gradient(Derivative::Analytic)
+        .with_hessian(DeclaredHessianForm::Either)
+        .with_seed_config(seed_config)
+        .with_initial_rho(array![5.0])
+        .with_max_iter(MAX_ITER);
+    let mut obj = problem.build_objective(
+        (),
+        |_: &mut (), theta: &Array1<f64>| Ok(SCALE * (theta[0] - OFFSET).powi(4)),
+        |_: &mut (), theta: &Array1<f64>| {
+            let d = theta[0] - OFFSET;
+            Ok(OuterEval {
+                cost: SCALE * d.powi(4),
+                gradient: array![SCALE * 4.0 * d.powi(3)],
+                hessian: HessianValue::Dense(array![[SCALE * 12.0 * d.powi(2)]]),
+                inner_beta_hint: None,
+            })
+        },
+        None::<fn(&mut ())>,
+        None::<fn(&mut (), &Array1<f64>) -> Result<EfsEval, EstimationError>>,
+    );
+    let checkpoint = super::super::super::run::run_outer_uncertified(
+        &mut obj,
+        &problem.config(),
+        "arc budget retry iterations #2817",
+    )
+    .expect("an exhausted ARC ladder hands its best finite checkpoint to the certificate");
+    eprintln!(
+        "[#2817 arc retry iterations] iterations={} solver_converged={} rho={:?}",
+        checkpoint.iterations,
+        checkpoint.solver_claimed_convergence(),
+        checkpoint.rho,
+    );
+    assert!(
+        !checkpoint.solver_claimed_convergence(),
+        "fixture precondition: no attempt reaches the quartic optimum at {OFFSET} within \
+         max_iter = {MAX_ITER}"
+    );
+    assert!(
+        checkpoint.iterations > MAX_ITER,
+        "the returned checkpoint reports {} iteration(s), a count one exhausted attempt with \
+         max_iter = {MAX_ITER} could spend alone, although the budget retry ran more than one \
+         attempt",
+        checkpoint.iterations
+    );
+}
+
 // ─── the trajectory census (#2735) ───────────────────────────────────────────
 
 fn step_2817(iter: usize, step_norm: f64, radius: f64, actual: f64) -> StepInfo {
