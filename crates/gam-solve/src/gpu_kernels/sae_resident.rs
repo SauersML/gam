@@ -2322,7 +2322,9 @@ pub fn run_battery_sweep_multiplexed(
         fits,
         succeeded,
         wall_seconds,
-        fits_per_second: (fits as f64) / wall_seconds.max(1e-9),
+        // A wall time under the clock's resolution reads as unbounded
+        // throughput, not as a rate against an invented minimum duration.
+        fits_per_second: (fits as f64) / wall_seconds,
     };
     Ok((results, throughput))
 }
@@ -2407,7 +2409,7 @@ pub fn assert_sweep_parity_vs_sequential(
         fits,
         succeeded,
         wall_seconds,
-        fits_per_second: (fits as f64) / wall_seconds.max(1e-9),
+        fits_per_second: (fits as f64) / wall_seconds,
     })
 }
 
