@@ -1143,5 +1143,26 @@
     ],
     "reason": "user directive: delete all useless slop (only used by tests / unused)",
     "evidence": "At 0904dd2a2, git grep -nw over crates, src, tests, examples, bench and benches found no caller of any item: each is named only by its own definition, its own error strings, doc links or doc prose. The cascade items were reachable only through deleted ones: InterferenceSubspace (used only by interference_subspace and WhitenedResidualHandoff), Tier05SinkAtom::reconstruction (called only by the two deleted sink methods), Tier05SinkAtomConfig::position_zero and ::disabled (called only by fit_position0_sink_atom and TieredConfig::linear_bulk), TieredConfig with linear_bulk (named by nothing), and TieredHarvest::tier_row_for and ::tier_rows (named only by has_factors and doc prose). No test called any item. MSI verification (ban scanner, workspace --all-targets check, cargo doc -p gam-sae, guard and census) runs on the landed sha."
+  },
+  {
+    "base": "00735c57ef14174aa03fa006c28f1232052dbb1b",
+    "items": [
+      "crates/gam-geometry/src/closure_family.rs:fn:design_jet",
+      "crates/gam-geometry/src/integrator.rs:fn:default",
+      "crates/gam-geometry/src/integrator.rs:fn:default_has_expected_steps_and_step_size",
+      "crates/gam-geometry/src/integrator.rs:fn:dimension_mismatch_point_returns_error",
+      "crates/gam-geometry/src/integrator.rs:fn:euclidean_geodesic_is_straight_line",
+      "crates/gam-geometry/src/integrator.rs:fn:euclidean_zero_tangent_returns_same_point",
+      "crates/gam-geometry/src/integrator.rs:fn:integrate",
+      "crates/gam-geometry/src/integrator.rs:fn:integrator_default",
+      "crates/gam-geometry/src/integrator.rs:fn:single_step_integrator_still_recovers_euclidean_geodesic",
+      "crates/gam-geometry/src/integrator.rs:struct:GeodesicIntegrator",
+      "crates/gam-geometry/src/manifolds/constant_curvature.rs:fn:jacobian_radial",
+      "crates/gam-geometry/src/manifolds/constant_curvature.rs:fn:t_stacks",
+      "crates/gam-geometry/src/manifolds/poincare.rs:fn:conformal_dirichlet_penalty",
+      "tests/regressions/manifolds/geometry_bug_hunt.rs:fn:geodesic_integrator_should_approximately_conserve_energy_on_sphere"
+    ],
+    "reason": "User directive 2026-09-11: delete code only tests use and code nothing uses. gam-geometry GeodesicIntegrator (with integrate), ClosureFamily::design_jet, t_stacks, ConstantCurvature::jacobian_radial and conformal_dirichlet_penalty had no production caller; the integrator was exercised only by its own unit tests and one integration test.",
+    "evidence": "Re-confirmed at the tip with git grep -nw over crates src tests examples bench benches. Removed with the integrator module's unit tests, both GeodesicIntegrator re-exports, the geometry_bug_hunt energy test, and the doc-only stub tests/manifolds/smooths/poincare_conformal_dirichlet_penalty.rs left by c0a21b554. Docs that linked the deleted items were rewritten. Gates pass base..head; MSI verification at the pushed sha follows."
   }
 ]

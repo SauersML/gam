@@ -1,4 +1,4 @@
-use gam::geometry::{CircleManifold, EuclideanManifold, GeodesicIntegrator, GrassmannManifold, ProductManifold, RiemannianManifold, RiemannianObjective, RiemannianTrustRegion, SpdManifold, SphereManifold, StiefelManifold, TorusManifold};
+use gam::geometry::{CircleManifold, EuclideanManifold, GrassmannManifold, ProductManifold, RiemannianManifold, RiemannianObjective, RiemannianTrustRegion, SpdManifold, SphereManifold, StiefelManifold, TorusManifold};
 use ndarray::{Array1, Array2, array};
 
 fn norm(v: &Array1<f64>) -> f64 {
@@ -196,25 +196,6 @@ fn trust_region_step_should_never_exceed_radius() {
     assert!(
         step_norm <= 0.05 + 1.0e-12,
         "Trust-region proposed step must stay within the trust radius"
-    );
-}
-
-#[test]
-fn geodesic_integrator_should_approximately_conserve_energy_on_sphere() {
-    let m = SphereManifold::new(2);
-    let g = GeodesicIntegrator {
-        steps: 200,
-        step_size: 0.01,
-    };
-    let p = array![1.0, 0.0, 0.0];
-    let v = array![0.0, 0.4, 0.0];
-    let e0 = 0.5 * v.dot(&v);
-    let p1 = g.integrate(&m, p.view(), v.view()).unwrap();
-    let v1 = m.log_map(p.view(), p1.view()).unwrap();
-    let e1 = 0.5 * v1.dot(&v1);
-    assert!(
-        (e1 - e0).abs() < 1.0e-3,
-        "GeodesicIntegrator should approximately conserve kinetic energy along the curve"
     );
 }
 

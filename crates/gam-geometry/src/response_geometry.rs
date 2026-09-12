@@ -766,8 +766,7 @@ pub fn response_frechet_mean(
 // The generative model is the wrapped normal `yᵢ = exp_μ(vᵢ)`, `vᵢ` isotropic at
 // geodesic scale σ. Its density w.r.t. the Riemannian volume `dvol_κ` is
 // `N(sᵢ;0,σ²)/Jᵧ_κ(sᵢ)` with `sᵢ = d_κ(μ,yᵢ)` the geodesic radius and
-// `J_κ(s) = (sn_κ(s)/s)^{d−1}` the exp-map volume Jacobian
-// (`ConstantCurvature::jacobian_radial`). The naive criterion
+// `J_κ(s) = (sn_κ(s)/s)^{d−1}` the exp-map volume Jacobian. The naive criterion
 // `½nd·ln(Σsᵢ²/nd)` (dispersion only), and even the full `dvol_κ`-density NLL
 // `Σ[sᵢ²/2σ² + (d/2)ln2πσ² + ln J_κ(sᵢ)]`, are SCALE-DEGENERATE: rescaling the
 // manifold radius `R = 1/√|κ|` rescales every `sᵢ` and every volume element, and

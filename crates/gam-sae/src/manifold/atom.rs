@@ -108,8 +108,8 @@ pub enum SaeAtomBasisKind {
     /// coordinate runs at a constant multiple of arc length (geodesic distance
     /// `= 2|t|`), so the intrinsic reweighting is a *constant* — coinciding with
     /// the flat arc-length reweighting, since the chart is intrinsically flat in
-    /// 1-D (see `poincare.rs::conformal_dirichlet_penalty`, whose `d = 1` metric
-    /// weight is the constant `G ≡ 1/2`). The genuinely hyperbolic, curvature-
+    /// 1-D (the `d = 1` pullback metric weight is the constant `G ≡ 1/2`). The
+    /// genuinely hyperbolic, curvature-
     /// dependent anisotropy is a `d ≥ 2` matrix effect carried by that pullback,
     /// not by this scalar `d = 1` path. The decoder is nonetheless the tangent-
     /// wrapped exp-map parameterisation, so an atom whose feature density grows

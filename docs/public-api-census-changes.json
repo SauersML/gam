@@ -79,5 +79,17 @@
     },
     "reason": "User directive 2026-09-11: delete code only tests use and code nothing uses. Five gam-identifiability compiler functions (compile_with_dual_metric, build_primary_grams_gpu_or_cpu, CompiledMap::reduce_design, CompiledMap::lift_coefficients, reduce_penalties_with_map) had no caller anywhere; pack_row_hessian_symmetric was called only by build_primary_grams_gpu_or_cpu.",
     "evidence": "Re-confirmed at the tip with git grep -nw over crates src tests examples bench benches: hits were definitions, error strings inside their own bodies, and prose. compile_with_dual_metric was a thin wrapper over compile_with_dual_metric_protected, which keeps its algorithm doc. Gates pass base..head; MSI verification at the pushed sha follows."
+  },
+  {
+    "base": "00735c57ef14174aa03fa006c28f1232052dbb1b",
+    "removed": {
+      "crates/gam-geometry/src/closure_family.rs::design_jet": 1,
+      "crates/gam-geometry/src/integrator.rs::integrate": 1,
+      "crates/gam-geometry/src/manifolds/constant_curvature.rs::jacobian_radial": 1,
+      "crates/gam-geometry/src/manifolds/constant_curvature.rs::t_stacks": 1,
+      "crates/gam-geometry/src/manifolds/poincare.rs::conformal_dirichlet_penalty": 1
+    },
+    "reason": "User directive 2026-09-11: delete code only tests use and code nothing uses. gam-geometry GeodesicIntegrator (with integrate), ClosureFamily::design_jet, t_stacks, ConstantCurvature::jacobian_radial and conformal_dirichlet_penalty had no production caller; the integrator was exercised only by its own unit tests and one integration test.",
+    "evidence": "Re-confirmed at the tip with git grep -nw over crates src tests examples bench benches. Removed with the integrator module's unit tests, both GeodesicIntegrator re-exports, the geometry_bug_hunt energy test, and the doc-only stub tests/manifolds/smooths/poincare_conformal_dirichlet_penalty.rs left by c0a21b554. Docs that linked the deleted items were rewritten. Gates pass base..head; MSI verification at the pushed sha follows."
   }
 ]
