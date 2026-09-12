@@ -209,12 +209,17 @@ pub fn shell_vs_ring_log_evalue(
             if train.len() < 3 {
                 return Ok(None);
             }
-            Ok(Some(fit_ring(coords, train, ridge)))
+            fit_ring(coords, train, ridge)
         },
         |ring, eval| Ok(ring_loglik(coords, eval, ring)),
+        // A fold with no residual variance around its principal axis is fit
+        // exactly by a degenerate linear shell, so the null's supremum there is
+        // `+∞` and the fold banks the valid e-value `0`.
         |eval| {
-            let null = fit_ppca1(coords, eval, ridge)?;
-            Ok(ppca1_loglik(coords, eval, &null))
+            Ok(match fit_ppca1(coords, eval)? {
+                Some(null) => ppca1_loglik(coords, eval, &null),
+                None => f64::INFINITY,
+            })
         },
     )
 }
@@ -234,8 +239,11 @@ struct Ppca1 {
 
 /// Maximum-likelihood fit of the 1-factor PPCA density on `rows`. This is the
 /// honest constrained supremum over the linear-shell null: mean, principal axis,
-/// factor variance, and isotropic residual variance are all re-estimated.
-fn fit_ppca1(coords: &Array2<f64>, rows: &[usize], ridge: f64) -> Result<Ppca1, String> {
+/// factor variance, and isotropic residual variance are all re-estimated. No
+/// ridge: a floor above the MLE variance under-maximizes the null and inflates
+/// the e-value. Returns `None` when the residual variance is zero, where the
+/// supremum is `+∞` (the rows lie on a line the degenerate shell fits exactly).
+fn fit_ppca1(coords: &Array2<f64>, rows: &[usize]) -> Result<Option<Ppca1>, String> {
     let n = rows.len();
     let q = coords.ncols();
     if n == 0 || q == 0 {
@@ -260,8 +268,7 @@ fn fit_ppca1(coords: &Array2<f64>, rows: &[usize], ridge: f64) -> Result<Ppca1, 
         }
     }
     // Biased (MLE) covariance normaliser 1/n, so the density is the genuine
-    // constrained MLE. A relative ridge keeps the trailing variance strictly
-    // positive on a perfectly-degenerate fold.
+    // constrained MLE.
     for v in &mut cov {
         *v /= n as f64;
     }
@@ -272,27 +279,28 @@ fn fit_ppca1(coords: &Array2<f64>, rows: &[usize], ridge: f64) -> Result<Ppca1, 
             .partial_cmp(&vals[a])
             .unwrap_or(std::cmp::Ordering::Equal)
     });
-    let trace: f64 = vals.iter().sum();
-    let floor = (ridge * trace / q as f64).max(1.0e-300);
     let top = order[0];
-    let ell1 = vals[top].max(floor);
+    let ell1 = vals[top].max(0.0);
     let axis: Vec<f64> = (0..q).map(|j| vecs[j * q + top]).collect();
     // σ0² = mean of the q−1 trailing eigenvalues (the isotropic PPCA residual).
     let sigma2 = if q > 1 {
         let rest: f64 = order.iter().skip(1).map(|&k| vals[k].max(0.0)).sum();
-        (rest / (q - 1) as f64).max(floor)
+        rest / (q - 1) as f64
     } else {
         ell1
     };
+    if !(sigma2 > 0.0) {
+        return Ok(None);
+    }
     let lambda = (ell1 - sigma2).max(0.0);
     let logdet = (q as f64 - 1.0) * sigma2.ln() + (sigma2 + lambda).ln();
-    Ok(Ppca1 {
+    Ok(Some(Ppca1 {
         mean,
         axis,
         sigma2,
         lambda,
         logdet,
-    })
+    }))
 }
 
 /// In-sample total log-density `Σ_{i∈rows} ln p_null(y_i)` under a fitted PPCA1.
@@ -334,8 +342,11 @@ struct Ring {
 /// Fit the radial-ring alternative on the train rows. All parameters (mean,
 /// plane, radius, both variances) are functions of the train fold ONLY, so the
 /// resulting density is `D0`-measurable — the predictability the UI e-value
-/// needs.
-fn fit_ring(coords: &Array2<f64>, rows: &[usize], ridge: f64) -> Ring {
+/// needs. The caller's relative `ridge` floors both variances at a fraction of
+/// the fold's own spread. A fold with no spread to floor against cannot support
+/// the curved alternative and returns `None` (the fold banks the valid e-value
+/// `0`); an eigendecomposition failure is an error, never a zero spectrum.
+fn fit_ring(coords: &Array2<f64>, rows: &[usize], ridge: f64) -> Result<Option<Ring>, String> {
     let n = rows.len();
     let q = coords.ncols();
     let mut mean = vec![0.0f64; q];
@@ -359,10 +370,7 @@ fn fit_ring(coords: &Array2<f64>, rows: &[usize], ridge: f64) -> Ring {
     for v in &mut cov {
         *v /= n as f64;
     }
-    let (vals, vecs) = match symmetric_eigh(cov, q) {
-        Ok(pair) => pair,
-        Err(_) => (vec![0.0; q], identity_flat(q)),
-    };
+    let (vals, vecs) = symmetric_eigh(cov, q)?;
     let mut order: Vec<usize> = (0..q).collect();
     order.sort_by(|&a, &b| {
         vals[b]
@@ -374,7 +382,7 @@ fn fit_ring(coords: &Array2<f64>, rows: &[usize], ridge: f64) -> Ring {
     let e1: Vec<f64> = (0..q).map(|j| vecs[j * q + k1]).collect();
     let e2: Vec<f64> = (0..q).map(|j| vecs[j * q + k2]).collect();
     let trace: f64 = vals.iter().sum();
-    let floor = (ridge * trace / q as f64).max(1.0e-12);
+    let floor = ridge * trace / q as f64;
     let mut radius = 0.0;
     let mut radial_var = 0.0;
     let mut perp_ss = 0.0;
@@ -404,14 +412,17 @@ fn fit_ring(coords: &Array2<f64>, rows: &[usize], ridge: f64) -> Ring {
     } else {
         None
     };
-    Ring {
+    if !(sigma2 > 0.0) || sigma_perp2.is_some_and(|variance| !(variance > 0.0)) {
+        return Ok(None);
+    }
+    Ok(Some(Ring {
         mean,
         e1,
         e2,
         radius,
         sigma2,
         sigma_perp2,
-    }
+    }))
 }
 
 /// In-sample total log-density `Σ_{i∈rows} ln p_alt(y_i)` under a fitted Ring.
@@ -443,14 +454,6 @@ fn ring_loglik(coords: &Array2<f64>, rows: &[usize], m: &Ring) -> f64 {
         }
     }
     total
-}
-
-fn identity_flat(q: usize) -> Vec<f64> {
-    let mut v = vec![0.0f64; q * q];
-    for i in 0..q {
-        v[i * q + i] = 1.0;
-    }
-    v
 }
 
 fn logsumexp(xs: &[f64]) -> f64 {
@@ -629,5 +632,15 @@ mod tests {
         );
         let cert = family_fdr_certificate(vec![log_e], 0.1).unwrap();
         assert!(cert.rejected.is_empty());
+    }
+
+    /// Coinciding rows carry no spread: no fold can support a ring, so every fold
+    /// banks the exact zero e-value, whatever the ridge. A floor on the variances
+    /// used to price such a fold with finite densities instead.
+    #[test]
+    fn coinciding_rows_bank_the_zero_e_value() {
+        let coords = Array2::<f64>::from_elem((12, 3), 0.25);
+        let log_e = shell_vs_ring_log_evalue(&coords, 2, 1.0e-6).unwrap();
+        assert_eq!(log_e, f64::NEG_INFINITY);
     }
 }
