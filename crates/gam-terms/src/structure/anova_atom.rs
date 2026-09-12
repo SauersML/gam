@@ -94,10 +94,6 @@ use crate::inference::smooth_test::{
     SmoothTestInput, SmoothTestResult, SmoothTestScale, wood_smooth_test,
 };
 use gam_linalg::faer_ndarray::FaerEigh;
-use gam_math::score_opt::{
-    AffineRemlProfile, ClosedInterval, ScoreOptimumLocation, certified_exp_representative,
-    certified_ln_positive,
-};
 
 /// Interaction energy fraction at or below which the interaction block is
 /// energetically negligible and lossless fission is on the table. The bar is
@@ -290,12 +286,14 @@ pub struct TensorSurfaceFit {
     /// entries are the per-dimension scales the `Vb`s carry.
     pub residual_cross_cov: Array2<f64>,
     /// Scale-FREE coefficient covariance shared by all dimensions
-    /// (`V (Λ+λI)⁻¹ Vᵀ`, `M₁M₂ × M₁M₂`); `coeff_covariance[d]` is this
-    /// times `residual_cross_cov[d,d]`.
+    /// (`V Λ⁺ Vᵀ/(1 + λ)` over the design's numerical range, `M₁M₂ × M₁M₂`);
+    /// `coeff_covariance[d]` is this times `residual_cross_cov[d,d]`.
     pub unit_covariance: Array2<f64>,
-    /// REML-selected ridge strength.
+    /// REML-selected function-mass weight: the surface is the least-squares
+    /// surface shrunk by `1/(1 + λ)`. `∞` is the exact zero surface, `0` no
+    /// shrinkage.
     pub lambda: f64,
-    /// Effective degrees of freedom `Σ dᵢ/(dᵢ+λ)` (per dimension; the
+    /// Effective degrees of freedom `rank(X)/(1 + λ)` (per dimension; the
     /// design and λ are shared).
     pub edf: f64,
     /// Residual degrees of freedom `n − edf` (the denominator d.f. for
@@ -337,10 +335,19 @@ impl TensorSurfaceFit {
 }
 
 /// Fit the tensor-product surface `y_d(θ₁,θ₂) ≈ φ¹(θ₁)ᵀ C_d φ²(θ₂)` to
-/// sampled responses by ridge-penalized least squares with the ridge
-/// strength chosen by GAUSSIAN REML (profiled σ², exact 1-D criterion on
-/// the design's eigenbasis — no GCV, per policy), returning coefficients
+/// sampled responses under a function-mass penalty whose weight is chosen by
+/// GAUSSIAN REML (profiled σ², closed-form criterion on the design's
+/// eigenbasis — no GCV, per policy), returning the posterior mean coefficients
 /// AND their scale-included posterior covariance.
+///
+/// The penalty is on the surface, never on its coefficients (SPEC rule 5): each
+/// response carries `λ‖X vec(C_d)‖²/σ_d²`, the surface's mass over the code
+/// sample, so the prior on the fitted values is `X vec(C_d) ~ N(0, (σ_d²/λ) P)`
+/// with `P` the projector onto the design's range. A coefficient ridge
+/// `λ‖vec(C_d)‖²` changes when the factor bases are rescaled or mixed; this
+/// penalty, the selected λ and the fitted surface do not. The posterior mean is
+/// the least-squares surface shrunk by `1/(1 + λ)`, and λ = ∞ (the exact zero
+/// surface) is selected when the evidence supports no surface.
 ///
 /// This is the missing producer #993 names for both carve arms:
 /// - **representational**: `responses` = the atom's activation
@@ -407,7 +414,6 @@ pub fn fit_tensor_surface(
     // inside the eigensolver's dimension-scaled backward-error band; a mode
     // below that band is evidence of invalid arithmetic, not a zero mode.
     let spectral_roundoff = f64::EPSILON * mm as f64 * spectral_radius;
-    let mut gram_modes = Vec::with_capacity(mm);
     for (index, &value) in evals.iter().enumerate() {
         if value < -spectral_roundoff {
             return Err(format!(
@@ -415,239 +421,162 @@ pub fn fit_tensor_surface(
                  roundoff band -{spectral_roundoff}"
             ));
         }
-        gram_modes.push(value.max(0.0));
     }
-    let d_max = gram_modes.iter().copied().fold(0.0f64, f64::max);
-    if !(d_max > 0.0) {
+    // The modes inside that band are the design's numerical null space: no surface
+    // over the code sample moves along them, so the fit lives on the rest.
+    let range: Vec<usize> = (0..mm).filter(|&i| evals[i] > spectral_roundoff).collect();
+    let rank = range.len();
+    if rank == 0 {
         return Err("fit_tensor_surface: design is identically zero".to_string());
     }
+    if rank >= n {
+        return Err(format!(
+            "fit_tensor_surface: the tensor basis spans every sample (rank {rank}, n={n}); \
+             no residual degrees of freedom are left to weigh the surface against its noise"
+        ));
+    }
     let b = evecs.t().dot(&xty); // mm × D, rotated cross-products
-    let yty: Vec<f64> = (0..d_dims)
-        .map(|d| responses.column(d).dot(&responses.column(d)))
-        .collect();
-    let log_n = certified_ln_positive(n as f64)
-        .ok_or_else(|| "fit_tensor_surface: could not enclose log(n)".to_string())?;
-    let mut null_score_enclosure = ClosedInterval::point(0.0);
-    for (output, &energy) in yty.iter().enumerate() {
+    for d in 0..d_dims {
+        let energy = responses.column(d).dot(&responses.column(d));
         if !(energy.is_finite() && energy > 0.0) {
             return Err(format!(
-                "fit_tensor_surface: response {output} has non-positive energy {energy}; \
+                "fit_tensor_surface: response {d} has non-positive energy {energy}; \
                  its profiled Gaussian scale has no finite REML optimum"
             ));
         }
-        null_score_enclosure = null_score_enclosure.add(
-            certified_ln_positive(energy)
-                .ok_or_else(|| {
-                    format!(
-                        "fit_tensor_surface: could not enclose response {output} energy log"
-                    )
-                })?
-                .sub(log_n),
-        );
     }
-    null_score_enclosure = null_score_enclosure.scale(-0.5 * n as f64);
-
-    // Pooled Gaussian REML in the eigensystem.  For h_i(λ) = d_i + λ,
-    // the profiled score is
-    //
-    //   -1/2 { n Σ_d log(PRSS_d/n)
-    //          + D [Σ_i log h_i - M log λ] },
-    //   PRSS_d = y_dᵀy_d - Σ_i b_id²/h_i.
-    //
-    // `AffineRemlProfile` evaluates this expression together with its exact
-    // first two log-λ derivatives and rigorous derivative enclosures.  The
-    // global search can therefore discard an interval only after proving that
-    // it contains no stationary point; every isolated stationary point and
-    // both finite boundaries participate in the final comparison.
-    // Normalize the pencil by its largest Gram eigenvalue.  This is an exact
-    // change of smoothing-parameter coordinates, λ = d_max·exp(ρ): every
-    // `log(d_i + λ) - log(λ)` contribution is invariant, while exponentiating
-    // ρ cannot underflow merely because the input basis carries extreme units.
-    let profile_gram_modes: Vec<f64> = gram_modes.iter().map(|&value| value / d_max).collect();
-    let penalty_modes = vec![1.0; mm];
-    let rhs_scale = d_max.sqrt();
-    let mut projected_rhs_squared = Vec::with_capacity(mm * d_dims);
+    // Least-squares coefficients on the design's range, C_ls = V Λ⁺ Vᵀ Xᵀy.
+    let mut ls_rot = Array2::<f64>::zeros((mm, d_dims));
+    for &i in &range {
+        for d in 0..d_dims {
+            ls_rot[[i, d]] = b[[i, d]] / evals[i];
+        }
+    }
+    let ls_beta = evecs.dot(&ls_rot); // mm × D
+    let ls_fitted = x.dot(&ls_beta); // n × D
+    // B_d = ‖P y_d‖² and RSS_d = ‖y_d − P y_d‖², the latter from the residual itself
+    // so a near-exact fit keeps its digits.
+    let explained: Vec<f64> = (0..d_dims)
+        .map(|d| {
+            range
+                .iter()
+                .map(|&i| b[[i, d]] * b[[i, d]] / evals[i])
+                .sum::<f64>()
+        })
+        .collect();
+    let residual_energy: Vec<f64> = (0..d_dims)
+        .map(|d| {
+            (0..n)
+                .map(|r| {
+                    let e = responses[[r, d]] - ls_fitted[[r, d]];
+                    e * e
+                })
+                .sum::<f64>()
+        })
+        .collect();
     for d in 0..d_dims {
-        for i in 0..mm {
-            let normalized_rhs = b[[i, d]] / rhs_scale;
-            projected_rhs_squared.push(normalized_rhs * normalized_rhs);
+        if !(explained[d].is_finite() && residual_energy[d].is_finite()) {
+            return Err(format!(
+                "fit_tensor_surface: response {d} sufficient statistics are not finite \
+                 (explained {}, residual {})",
+                explained[d], residual_energy[d]
+            ));
         }
     }
-    let profile = AffineRemlProfile::new(
-        &profile_gram_modes,
-        &penalty_modes,
-        &projected_rhs_squared,
-        &yty,
-        n as f64,
-        mm,
-        0.0,
-    )
-    .map_err(|error| format!("fit_tensor_surface: invalid REML profile: {error}"))?;
 
-    // Cover every spectral transition without a user- or lattice-resolution
-    // knob. At the lower bound λ/d_min = sqrt(machine epsilon), so every
-    // positive Gram mode is numerically at its λ→0 limit; at the upper
-    // bound d_max/λ has the same relation and every mode is at its null-fit
-    // limit. The true λ=∞ null is compared analytically below instead of
-    // being approximated by that finite upper bound.
-    let d_min_relative = profile_gram_modes
-        .iter()
-        .copied()
-        .filter(|&value| value > 0.0)
-        .fold(f64::INFINITY, f64::min);
-    let relative_resolution = f64::EPSILON.sqrt();
-    let log_relative_resolution = certified_ln_positive(relative_resolution).ok_or_else(|| {
-        "fit_tensor_surface: could not enclose the relative-resolution logarithm".to_string()
-    })?;
-    let log_d_min = certified_ln_positive(d_min_relative).ok_or_else(|| {
-        "fit_tensor_surface: could not enclose the smallest spectral transition".to_string()
-    })?;
-    let log_minimum_normal = certified_ln_positive(f64::MIN_POSITIVE).ok_or_else(|| {
-        "fit_tensor_surface: could not enclose the minimum-normal logarithm".to_string()
-    })?;
-    let log_lambda_lo = log_d_min
-        .add(log_relative_resolution)
-        .lo
-        .max(log_minimum_normal.lo);
-    let log_lambda_hi = log_relative_resolution.neg().hi;
-    let search = profile
-        .maximize_value_ordered(log_lambda_lo, log_lambda_hi, relative_resolution)
-        .map_err(|error| {
-            format!("fit_tensor_surface: REML stationary isolation failed: {error}")
-        })?;
-
-    // Exact full-shrinkage boundary. As λ→∞ the determinant correction
-    // is identically zero and PRSS_d→y_dᵀy_d. Choosing infinity is safe for
-    // the algebra below (coefficients, EDF, and covariance all become zero) and
-    // makes null recovery exact rather than a large-finite-λ approximation.
-    let lambda = if search.value_certificate.maximum.lo <= null_score_enclosure.hi {
-        f64::INFINITY
+    // REML weight. With w = λ/(1 + λ) ∈ [0, 1], B_d, RSS_d and r = rank X, the
+    // profiled criterion to minimize is
+    //   Σ_d n·log(RSS_d + w·B_d) − D·r·log w.
+    // Its w-derivative has the sign of
+    //   g(w) = Σ_d n·w·B_d/(RSS_d + w·B_d) − D·r,
+    // a sum of increasing concave terms. So:
+    // - g(1) ≤ 0: the optimum is the exact null w = 1 (λ = ∞, C = 0);
+    // - g(0⁺) ≥ 0: the optimum is w = 0 (λ = 0). A response the basis interpolates
+    //   exactly contributes n to g(0⁺), and the carve re-fit is one by construction;
+    // - otherwise g has one root. With one response it is w = r·RSS/((n − r)·B).
+    //   With several, Newton's method starts from
+    //   w₀ = (D·r − n·#{RSS_d = 0 < B_d})/Σ_{RSS_d > 0} n·B_d/RSS_d, where g ≤ 0
+    //   because each term is at most its tangent at 0. Concavity keeps every
+    //   Newton iterate on that side, so w climbs monotonically to the root, and the
+    //   iteration stops when a step no longer increases it.
+    // The posterior mean is C = (1 − w)·C_ls and the scale-free covariance is
+    // (1 − w)·(XᵀX)⁺. There is no search, grid or tolerance.
+    let observations = n as f64;
+    let rank_f = rank as f64;
+    let responses_f = d_dims as f64;
+    let derivative_sign = |w: f64| -> f64 {
+        (0..d_dims)
+            .map(|d| {
+                if explained[d] == 0.0 {
+                    0.0
+                } else {
+                    observations * w * explained[d] / (residual_energy[d] + w * explained[d])
+                }
+            })
+            .sum::<f64>()
+            - responses_f * rank_f
+    };
+    let interpolated = (0..d_dims)
+        .filter(|&d| residual_energy[d] == 0.0 && explained[d] > 0.0)
+        .count() as f64;
+    let weight = if derivative_sign(1.0) <= 0.0 {
+        1.0
+    } else if observations * interpolated >= responses_f * rank_f {
+        0.0
+    } else if d_dims == 1 {
+        rank_f * residual_energy[0] / ((observations - rank_f) * explained[0])
     } else {
-        if search.value_certificate.maximum_excess
-            > search.value_certificate.comparison_resolution
-        {
-            return Err(format!(
-                "fit_tensor_surface: finite REML candidates are not globally ordered \
-                 (maximum excess {}, comparison resolution {})",
-                search.value_certificate.maximum_excess,
-                search.value_certificate.comparison_resolution
-            ));
-        }
-        // A boundary optimum is an ANSWER, not a failure. The search window is
-        // placed (see the domain comment above) so its lower end already IS the
-        // lambda->0 limit of every positive Gram mode, so a response the tensor
-        // basis interpolates -- the carve re-fit is one by construction -- puts
-        // the profiled maximum exactly there. Refusing it refuses the fit.
-        //
-        // `ScoreOptimumLocation` is initialised to a boundary and only upgraded
-        // to `Stationary` when a stationary point strictly beats it, so
-        // demanding `Stationary` demands that an interior point win. The sibling
-        // REML routine in this crate (`GridSpline2dDesign::fit_reml`) handles all
-        // four arms -- "Both boundaries compete directly with all isolated
-        // optima" -- and so does every other consumer in the workspace. This
-        // call site was the only one refusing them: an incomplete port, not a
-        // designed constraint.
-        //
-        // Every certificate is kept. A boundary is proved with the one-sided KKT
-        // condition, an interior point with the two-sided one, and a
-        // resolution-flat window is still refused outright.
-        enum KktKind {
-            LowerBoundary,
-            UpperBoundary,
-            Stationary,
-        }
-        let (bracket, kkt_kind) = match search.location {
-            ScoreOptimumLocation::LowerBoundary => (
-                ClosedInterval::point(search.lower_boundary.x),
-                KktKind::LowerBoundary,
-            ),
-            ScoreOptimumLocation::UpperBoundary => (
-                ClosedInterval::point(search.upper_boundary.x),
-                KktKind::UpperBoundary,
-            ),
-            ScoreOptimumLocation::Stationary(index) => (
-                search
-                    .stationary_points
-                    .get(index)
-                    .ok_or_else(|| {
-                        "fit_tensor_surface: optimizer returned an invalid stationary index"
-                            .to_string()
-                    })?
-                    .bracket,
-                KktKind::Stationary,
-            ),
-            ScoreOptimumLocation::ResolutionFlat(index) => {
-                let flat = search.resolution_flat_regions.get(index).ok_or_else(|| {
-                    "fit_tensor_surface: optimizer returned an invalid resolution-flat index"
-                        .to_string()
-                })?;
-                return Err(format!(
-                    "fit_tensor_surface: finite REML optimum is value-resolved but not \
-                     stationary on {:?} (gap {}, resolution {})",
-                    flat.bracket, flat.max_score_gap, flat.score_resolution
-                ));
+        let tangent_sum: f64 = (0..d_dims)
+            .filter(|&d| residual_energy[d] > 0.0)
+            .map(|d| observations * explained[d] / residual_energy[d])
+            .sum();
+        let mut w = (responses_f * rank_f - observations * interpolated) / tangent_sum;
+        loop {
+            let value = derivative_sign(w);
+            if !(value < 0.0) {
+                break;
             }
-        };
-        let kkt = profile
-            .enclose(bracket.lo, bracket.hi)
-            .map_err(|error| format!("fit_tensor_surface: {error}"))?;
-        let kkt_holds = match kkt_kind {
-            KktKind::LowerBoundary => kkt.derivative.hi <= 0.0,
-            KktKind::UpperBoundary => kkt.derivative.lo >= 0.0,
-            KktKind::Stationary => kkt.derivative.contains_zero() && kkt.curvature.hi < 0.0,
-        };
-        if !kkt_holds {
-            return Err(format!(
-                "fit_tensor_surface: exact-real REML KKT certificate failed on {bracket:?}: {kkt:?}"
-            ));
+            let slope: f64 = (0..d_dims)
+                .map(|d| {
+                    let denominator = residual_energy[d] + w * explained[d];
+                    observations * explained[d] * residual_energy[d] / (denominator * denominator)
+                })
+                .sum();
+            let next = w - value / slope;
+            if !(next > w) {
+                break;
+            }
+            w = next;
         }
-        let relative_lambda = certified_exp_representative(search.optimum.x).ok_or_else(|| {
-            "fit_tensor_surface: could not construct the certified finite REML representative"
-                .to_string()
-        })?;
-        let lambda = d_max * relative_lambda;
-        if !(lambda.is_finite() && lambda > 0.0) {
-            return Err(format!(
-                "fit_tensor_surface: selected finite REML strength is not representable \
-                 after restoring the Gram scale ({d_max} * {relative_lambda})"
-            ));
-        }
-        lambda
+        w
+    };
+    let shrinkage = 1.0 - weight;
+    let lambda = if shrinkage > 0.0 {
+        weight / shrinkage
+    } else {
+        f64::INFINITY
     };
 
-    // Coefficients, EDF, residuals, covariances at the selected λ.
-    let mut edf = 0.0f64;
-    for i in 0..mm {
-        let d_i = gram_modes[i];
-        edf += d_i / (d_i + lambda);
-    }
-    let residual_df = n as f64 - edf;
-    if residual_df < 1.0 {
-        return Err(format!(
-            "fit_tensor_surface: too few samples for the surface (n={n}, edf={edf:.2}); \
-             the scale estimate needs n − edf ≥ 1"
-        ));
-    }
-    // β̂ in the eigenbasis, then rotate back: beta = V (Λ+λ)⁻¹ b.
-    let mut beta_rot = Array2::<f64>::zeros((mm, d_dims));
-    for i in 0..mm {
-        let denom = gram_modes[i] + lambda;
-        for d in 0..d_dims {
-            beta_rot[[i, d]] = b[[i, d]] / denom;
-        }
-    }
-    let beta = evecs.dot(&beta_rot); // mm × D
-    // #2822 — the coefficients' rounding band. The computed β̂ = V̂(Λ̂+λ)⁻¹V̂ᵀ(Xᵀy)
-    // solves a perturbed system: the Gram accumulation and the backward-stable
-    // eigensystem perturb XᵀX by E with ‖E‖₂ ≤ γₙ·‖|X|ᵀ|X|‖_F + `spectral_roundoff`,
-    // Xᵀy and its rotation V̂ᵀXᵀy carry their accumulation bands, the division is
-    // correctly rounded, and the final rotation V̂·β_rot accumulates M₁M₂ terms.
-    // Per output the forward error therefore satisfies
-    //   ‖Δβ‖₂ ≤ (‖E‖₂·‖β̂‖₂ + ‖band(Xᵀy)‖₂ + ‖band(V̂ᵀXᵀy)‖₂)/(d_min + λ)
+    // Coefficients, EDF, residuals, covariances at the selected weight.
+    let edf = shrinkage * rank_f;
+    let residual_df = observations - edf;
+    let beta_rot = ls_rot.mapv(|value| shrinkage * value);
+    let beta = ls_beta.mapv(|value| shrinkage * value); // mm × D
+    // #2822 — the coefficients' rounding band. The computed
+    // β̂ = (1 − w)·V̂ Λ̂⁺ V̂ᵀ(Xᵀy) solves a perturbed system: the Gram accumulation, the
+    // backward-stable eigensystem and the truncation of the null modes perturb XᵀX by E
+    // with ‖E‖₂ ≤ γₙ·‖|X|ᵀ|X|‖_F + `spectral_roundoff`, Xᵀy and its rotation V̂ᵀXᵀy
+    // carry their accumulation bands, the division is correctly rounded, and the final
+    // rotation V̂·β_rot accumulates M₁M₂ terms. To first order the pseudo-inverse moves
+    // by the solve on the range and by the rotation of the range itself, so per output
+    //   ‖Δβ‖₂ ≤ (1 − w)·[‖E‖₂·‖β_ls‖₂·(1/d_min + 1/gap)
+    //                    + (‖band(Xᵀy)‖₂ + ‖band(V̂ᵀXᵀy)‖₂)/d_min]
     //           + γ₂·‖β̂‖₂ + ‖band(V̂·β_rot)‖₂,
-    // which bounds every entry. The interaction coefficients of an exactly additive
-    // surface are zero only up to this band: the rotations mix O(‖β̂‖) magnitudes
-    // into every entry and cancel them there.
+    // with d_min the smallest retained mode and gap its distance to the largest
+    // dropped one (no rotation term when no mode is dropped). This bounds every entry.
+    // The interaction coefficients of an exactly additive surface are zero only up to
+    // this band: the rotations mix O(‖β̂‖) magnitudes into every entry and cancel them
+    // there.
     let n_growth = gam_linalg::roundoff::accumulation_growth(n);
     let mm_growth = gam_linalg::roundoff::accumulation_growth(mm);
     let division_growth = gam_linalg::roundoff::accumulation_growth(2);
@@ -656,8 +585,19 @@ pub fn fit_tensor_surface(
     let abs_gram = abs_x.t().dot(&abs_x);
     let operator_band =
         n_growth * abs_gram.iter().map(|v| v * v).sum::<f64>().sqrt() + spectral_roundoff;
-    let d_min = gram_modes.iter().copied().fold(f64::INFINITY, f64::min);
-    let conditioning = d_min + lambda;
+    let d_min = range
+        .iter()
+        .map(|&i| evals[i])
+        .fold(f64::INFINITY, f64::min);
+    let rotation_conditioning = if rank < mm {
+        let dropped_max = (0..mm)
+            .filter(|&i| evals[i] <= spectral_roundoff)
+            .map(|i| evals[i].max(0.0))
+            .fold(0.0_f64, f64::max);
+        1.0 / (d_min - dropped_max)
+    } else {
+        0.0
+    };
     let abs_xty_sums = abs_x.t().dot(&responses.mapv(f64::abs)); // mm × D
     let abs_rotated_xty_sums = abs_evecs.t().dot(&xty.mapv(f64::abs)); // mm × D
     let abs_rotation_sums = abs_evecs.dot(&beta_rot.mapv(f64::abs)); // mm × D
@@ -667,10 +607,11 @@ pub fn fit_tensor_surface(
     let mut coeff_band = Vec::with_capacity(d_dims);
     for d in 0..d_dims {
         let beta_norm = column_norm(&beta, d);
-        let solve_band = (operator_band * beta_norm
-            + n_growth * column_norm(&abs_xty_sums, d)
-            + mm_growth * column_norm(&abs_rotated_xty_sums, d))
-            / conditioning;
+        let solve_band = shrinkage
+            * (operator_band * column_norm(&ls_beta, d) * (1.0 / d_min + rotation_conditioning)
+                + (n_growth * column_norm(&abs_xty_sums, d)
+                    + mm_growth * column_norm(&abs_rotated_xty_sums, d))
+                    / d_min);
         let band = solve_band
             + division_growth * beta_norm
             + mm_growth * column_norm(&abs_rotation_sums, d);
@@ -681,7 +622,7 @@ pub fn fit_tensor_surface(
         }
         coeff_band.push(band);
     }
-    let fitted = x.dot(&beta); // n × D
+    let fitted = ls_fitted.mapv(|value| shrinkage * value); // n × D
     let mut residual_cross_cov = Array2::<f64>::zeros((d_dims, d_dims));
     for d in 0..d_dims {
         for e in d..d_dims {
@@ -694,12 +635,12 @@ pub fn fit_tensor_surface(
             residual_cross_cov[[e, d]] = v;
         }
     }
-    // Scale-free V (Λ+λ)⁻¹ Vᵀ.
-    let mut scaled_evecs = evecs.clone();
-    for i in 0..mm {
-        let denom = gram_modes[i] + lambda;
+    // Scale-free (1 − w)·V Λ⁺ Vᵀ over the design's range.
+    let mut scaled_evecs = Array2::<f64>::zeros((mm, mm));
+    for &i in &range {
+        let scale = shrinkage / evals[i];
         for row in 0..mm {
-            scaled_evecs[[row, i]] = evecs[[row, i]] / denom;
+            scaled_evecs[[row, i]] = evecs[[row, i]] * scale;
         }
     }
     let unit_covariance = scaled_evecs.dot(&evecs.t());
@@ -905,7 +846,7 @@ pub enum PairSurfaceBackend {
     /// biharmonic penalty (mixed `f_{x1x2}` term included), O(n) assembly,
     /// exact log-determinants — the first-class pair-component estimator.
     GridExact,
-    /// The dense ridge fallback ([`fit_tensor_surface`]) on the SAME
+    /// The dense function-mass fallback ([`fit_tensor_surface`]) on the SAME
     /// B-spline tensor basis, used only when the grid solve degenerates
     /// (e.g. a non-positive-definite penalized system or `n − edf < 1`).
     DenseRidge,
