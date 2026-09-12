@@ -519,15 +519,7 @@ pub trait JetScalar<const K: usize>: crate::nested_dual::JetField + Copy {
 
     /// `√self`. Caller guarantees positivity.
     fn sqrt(&self) -> Self {
-        let u = self.value();
-        let s = u.sqrt();
-        self.compose_unary([
-            s,
-            0.5 / s,
-            -0.25 / (u * s),
-            0.375 / (u * u * s),
-            -0.9375 / (u * u * u * s),
-        ])
+        self.compose_unary(crate::jet_tower::sqrt_derivative_stack(self.value()))
     }
 
     /// `ln(self)`. Caller guarantees positivity. Same derivative stack
@@ -549,14 +541,7 @@ pub trait JetScalar<const K: usize>: crate::nested_dual::JetField + Copy {
     /// `self^a` for real exponent `a`. Caller guarantees a positive base.
     /// Mirrors [`crate::jet_tower::Tower4::powf`] (falling-factorial stack).
     fn powf(&self, a: f64) -> Self {
-        let u = self.value();
-        self.compose_unary([
-            u.powf(a),
-            a * u.powf(a - 1.0),
-            a * (a - 1.0) * u.powf(a - 2.0),
-            a * (a - 1.0) * (a - 2.0) * u.powf(a - 3.0),
-            a * (a - 1.0) * (a - 2.0) * (a - 3.0) * u.powf(a - 4.0),
-        ])
+        self.compose_unary(crate::jet_tower::power_derivative_stack(self.value(), a))
     }
 
     /// `ln Γ(self)`. Caller guarantees a positive argument. Uses the SAME
@@ -4575,10 +4560,7 @@ impl<L: Lane, const K: usize> Order2Lane<L, K> {
     /// `[s, 0.5/s, -0.25/(u·s)]` (matches [`JetScalar::sqrt`]).
     #[inline]
     pub fn sqrt(&self) -> Self {
-        let d = self.v.unary3(|u| {
-            let s = u.sqrt();
-            [s, 0.5 / s, -0.25 / (u * s)]
-        });
+        let d = self.v.unary3(crate::jet_tower::sqrt_derivative_stack);
         self.compose_unary(d)
     }
 
@@ -4597,13 +4579,7 @@ impl<L: Lane, const K: usize> Order2Lane<L, K> {
     /// falling-factorial stack (matches [`JetScalar::powf`]).
     #[inline]
     pub fn powf(&self, a: f64) -> Self {
-        let d = self.v.unary3(|u| {
-            [
-                u.powf(a),
-                a * u.powf(a - 1.0),
-                a * (a - 1.0) * u.powf(a - 2.0),
-            ]
-        });
+        let d = self.v.unary3(|u| crate::jet_tower::power_derivative_stack(u, a));
         self.compose_unary(d)
     }
 }
@@ -5086,16 +5062,7 @@ impl<L: Lane, const K: usize> OneSeedLane<L, K> {
     /// `√self`; caller guarantees positivity (matches [`JetScalar::sqrt`]).
     #[inline]
     pub fn sqrt(&self) -> Self {
-        let d = self.base.v.unary5(|u| {
-            let s = u.sqrt();
-            [
-                s,
-                0.5 / s,
-                -0.25 / (u * s),
-                0.375 / (u * u * s),
-                -0.9375 / (u * u * u * s),
-            ]
-        });
+        let d = self.base.v.unary5(crate::jet_tower::sqrt_derivative_stack);
         self.compose_unary(d)
     }
 
@@ -5114,15 +5081,7 @@ impl<L: Lane, const K: usize> OneSeedLane<L, K> {
     /// [`JetScalar::powf`]).
     #[inline]
     pub fn powf(&self, a: f64) -> Self {
-        let d = self.base.v.unary5(|u| {
-            [
-                u.powf(a),
-                a * u.powf(a - 1.0),
-                a * (a - 1.0) * u.powf(a - 2.0),
-                a * (a - 1.0) * (a - 2.0) * u.powf(a - 3.0),
-                a * (a - 1.0) * (a - 2.0) * (a - 3.0) * u.powf(a - 4.0),
-            ]
-        });
+        let d = self.base.v.unary5(|u| crate::jet_tower::power_derivative_stack(u, a));
         self.compose_unary(d)
     }
 
@@ -5493,16 +5452,7 @@ impl<L: Lane, const K: usize> TwoSeedLane<L, K> {
     /// `√self`; caller guarantees positivity (matches [`JetScalar::sqrt`]).
     #[inline]
     pub fn sqrt(&self) -> Self {
-        let d = self.base.v.unary5(|u| {
-            let s = u.sqrt();
-            [
-                s,
-                0.5 / s,
-                -0.25 / (u * s),
-                0.375 / (u * u * s),
-                -0.9375 / (u * u * u * s),
-            ]
-        });
+        let d = self.base.v.unary5(crate::jet_tower::sqrt_derivative_stack);
         self.compose_unary(d)
     }
 
@@ -5521,15 +5471,7 @@ impl<L: Lane, const K: usize> TwoSeedLane<L, K> {
     /// [`JetScalar::powf`]).
     #[inline]
     pub fn powf(&self, a: f64) -> Self {
-        let d = self.base.v.unary5(|u| {
-            [
-                u.powf(a),
-                a * u.powf(a - 1.0),
-                a * (a - 1.0) * u.powf(a - 2.0),
-                a * (a - 1.0) * (a - 2.0) * u.powf(a - 3.0),
-                a * (a - 1.0) * (a - 2.0) * (a - 3.0) * u.powf(a - 4.0),
-            ]
-        });
+        let d = self.base.v.unary5(|u| crate::jet_tower::power_derivative_stack(u, a));
         self.compose_unary(d)
     }
 
@@ -5779,6 +5721,87 @@ mod test_support {
         #[must_use]
         pub fn into_channels(self) -> (f64, [f64; K], [[f64; K]; K]) {
             (self.value, self.gradient, self.hessian)
+        }
+    }
+}
+
+#[cfg(test)]
+mod extreme_unary_tests {
+    use super::*;
+    use crate::jet_tower::{Tower2, Tower4};
+
+    fn assert_channels(got: &[f64], expected: &[f64]) {
+        for (&actual, &want) in got.iter().zip(expected) {
+            let tolerance = (8.0 * f64::EPSILON * want.abs()).max(f64::from_bits(1));
+            assert!((actual - want).abs() <= tolerance,
+                "got {actual:e}, expected {want:e}");
+        }
+    }
+
+    #[test]
+    fn polynomial_powers_keep_exact_zero_derivatives_on_small_positive_bases() {
+        let values = [1e-300, 1e-200, 1e-100, 0.7];
+        let packed = wide::f64x4::from(values);
+        for degree in 0..=3 {
+            let a = degree as f64;
+            let batch2 = Order2Batch::<1>::variable(packed, 0).powf(a);
+            let batch3 = OneSeedBatch::<1>::seed_direction(packed, 0, wide::f64x4::ONE).powf(a);
+            let batch4 = TwoSeedBatch::<1>::seed(packed, 0, wide::f64x4::ONE, wide::f64x4::ONE).powf(a);
+            for (lane, u) in values.into_iter().enumerate() {
+                let expected = match degree {
+                    0 => [1.0, 0.0, 0.0, 0.0, 0.0],
+                    1 => [u, 1.0, 0.0, 0.0, 0.0],
+                    2 => [u * u, 2.0 * u, 2.0, 0.0, 0.0],
+                    3 => [u * u * u, 3.0 * u * u, 6.0 * u, 6.0, 0.0],
+                    _ => unreachable!(),
+                };
+                let input = Tower4::<1>::variable(u, 0);
+                for output in [input.powf(a), JetScalar::powf(&input, a)] {
+                    assert_channels(&[output.v, output.g[0], output.h[0][0],
+                        output.t3[0][0][0], output.t4[0][0][0][0]], &expected);
+                }
+                for output in [Order2::<1>::variable(u, 0).powf(a), batch2.lane(lane)] {
+                    assert_channels(&[output.0.v, output.0.g[0], output.0.h[0][0]], &expected);
+                }
+                for output in [OneSeed::<1>::seed_direction(u, 0, 1.0).powf(a), batch3.lane(lane)] {
+                    assert_channels(&[output.base.0.v, output.base.0.g[0], output.base.0.h[0][0],
+                        output.contracted_third()[0][0]], &expected);
+                }
+                for output in [TwoSeed::<1>::seed(u, 0, 1.0, 1.0).powf(a), batch4.lane(lane)] {
+                    assert_channels(&[output.base.0.v, output.base.0.g[0], output.base.0.h[0][0],
+                        output.eps.0.h[0][0], output.contracted_fourth()[0][0]], &expected);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn square_root_derivatives_retain_representable_subnormal_curvature() {
+        // Even binary exponents make every derivative an exactly representable
+        // dyadic number. Each case overflows the old product denominator.
+        for exponent in [300, 420, 700] {
+            let u = libm::scalbn(1.0, exponent);
+            let expected = [
+                libm::scalbn(1.0, exponent / 2),
+                libm::scalbn(0.5, -exponent / 2),
+                libm::scalbn(-0.25, -3 * exponent / 2),
+                libm::scalbn(0.375, -5 * exponent / 2),
+                libm::scalbn(-0.9375, -7 * exponent / 2),
+            ];
+            let input = Tower4::<1>::variable(u, 0);
+            for output in [input.sqrt(), JetScalar::sqrt(&input)] {
+                assert_eq!([output.v, output.g[0], output.h[0][0],
+                    output.t3[0][0][0], output.t4[0][0][0][0]], expected);
+            }
+            let output = Tower2::<1>::variable(u, 0).sqrt();
+            assert_eq!([output.v, output.g[0], output.h[0][0]], expected[..3]);
+            let packed = wide::f64x4::splat(u);
+            let output = Order2Batch::<1>::variable(packed, 0).sqrt().lane(0);
+            assert_eq!([output.0.v, output.0.g[0], output.0.h[0][0]], expected[..3]);
+            let output = OneSeedBatch::<1>::seed_direction(packed, 0, wide::f64x4::ONE).sqrt().lane(0);
+            assert_eq!(output.contracted_third()[0][0], expected[3]);
+            let output = TwoSeedBatch::<1>::seed(packed, 0, wide::f64x4::ONE, wide::f64x4::ONE).sqrt().lane(0);
+            assert_eq!(output.contracted_fourth()[0][0], expected[4]);
         }
     }
 }
