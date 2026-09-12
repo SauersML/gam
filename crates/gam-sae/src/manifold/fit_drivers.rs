@@ -1494,13 +1494,30 @@ impl SaeManifoldTerm {
         atom_idx: usize,
         topology: &crate::chart_canonicalization::CanonicalChartTopology,
     ) -> Result<bool, String> {
+        let Some(chart) = self.prepare_atom_unit_speed_chart(atom_idx, topology)? else {
+            return Ok(false);
+        };
+        self.commit_atom_unit_speed_chart(atom_idx, chart)?;
+        Ok(true)
+    }
+
+    /// The read-only half of [`Self::canonicalize_atom_unit_speed_chart`]: the
+    /// arc-length retraction of one atom and both image-invariance gates. It reads
+    /// only that atom's decoder, basis and coordinates, so
+    /// [`Self::retract_unit_speed_charts_in_loop`] prepares atoms concurrently.
+    /// `Ok(None)` is an honest skip.
+    fn prepare_atom_unit_speed_chart(
+        &self,
+        atom_idx: usize,
+        topology: &crate::chart_canonicalization::CanonicalChartTopology,
+    ) -> Result<Option<PreparedUnitSpeedChart>, String> {
         use crate::chart_canonicalization::{CHART_RECOMPOSITION_REL_TOL, unit_speed_retraction};
         let n = self.n_obs();
         if n == 0 {
-            return Ok(false);
+            return Ok(None);
         }
         let Some(evaluator) = self.atoms[atom_idx].basis_evaluator.as_ref().cloned() else {
-            return Ok(false);
+            return Ok(None);
         };
         let coords = self.assignment.coords[atom_idx].as_matrix();
         let row_coords = coords.column(0).to_owned();
@@ -1511,7 +1528,7 @@ impl SaeManifoldTerm {
             topology,
         )?
         else {
-            return Ok(false);
+            return Ok(None);
         };
 
         // Per-row basis/jet at the canonical coordinates.
@@ -1553,33 +1570,62 @@ impl SaeManifoldTerm {
             max_abs = max_abs.max((a - b).abs());
         }
         if !(fit_scale.is_finite() && max_abs.is_finite()) {
-            return Ok(false);
+            return Ok(None);
         }
         if fit_scale > 0.0 && max_abs > CHART_RECOMPOSITION_REL_TOL * fit_scale {
-            return Ok(false);
+            return Ok(None);
         }
+        Ok(Some(PreparedUnitSpeedChart {
+            new_coords,
+            new_phi,
+            new_jet,
+            new_decoder: repar.new_decoder,
+            decoder_transport: repar.decoder_transport,
+        }))
+    }
 
-        // Commit: canonical coordinates, basis, decoder, and the congruence-
-        // transported smoothness Gram (`B̃ᵀ S̃ B̃ = Bᵀ S B`, same as the affine
-        // gauge pass).
+    /// The commit half of [`Self::canonicalize_atom_unit_speed_chart`]: canonical
+    /// coordinates, basis, decoder, and the congruence-transported smoothness Gram
+    /// (`B̃ᵀ S̃ B̃ = Bᵀ S B`, same as the affine gauge pass).
+    fn commit_atom_unit_speed_chart(
+        &mut self,
+        atom_idx: usize,
+        chart: PreparedUnitSpeedChart,
+    ) -> Result<(), String> {
         let old_smooth_penalty = self.atoms[atom_idx].smooth_penalty().clone();
-        let flat = Array1::from_iter(new_coords.iter().copied());
+        let flat = Array1::from_iter(chart.new_coords.iter().copied());
         self.assignment.coords[atom_idx].set_flat(flat.view());
         let atom = &mut self.atoms[atom_idx];
         let transported_penalty = transport_smooth_penalty_for_decoder(
-            repar.decoder_transport.view(),
+            chart.decoder_transport.view(),
             old_smooth_penalty.view(),
         )?;
         atom.install_reparameterized_basis(
-            new_phi,
-            new_jet,
-            repar.new_decoder,
+            chart.new_phi,
+            chart.new_jet,
+            chart.new_decoder,
             transported_penalty,
         )?;
         atom.chart_canonicalized = true;
-        Ok(true)
+        Ok(())
     }
+}
 
+/// One atom's arc-length retraction, prepared against that atom's state and not
+/// yet committed. See [`SaeManifoldTerm::canonicalize_atom_unit_speed_chart`].
+struct PreparedUnitSpeedChart {
+    /// Canonical per-row coordinates, `(n, 1)`.
+    new_coords: Array2<f64>,
+    /// The basis and its jet at `new_coords`.
+    new_phi: Array2<f64>,
+    new_jet: ndarray::Array3<f64>,
+    /// The recomposed decoder `B̃ = T·B`.
+    new_decoder: Array2<f64>,
+    /// The basis transport `T`.
+    decoder_transport: Array2<f64>,
+}
+
+impl SaeManifoldTerm {
     /// #2022 — the `d = 1` arc-length canonical-chart topology for one atom, or
     /// `None` when the atom has no unit-speed chart (no evaluator, an active
     /// curvature homotopy, a coord/atom latent-dim mismatch, or `d ≠ 1`). Same
@@ -1621,14 +1667,38 @@ impl SaeManifoldTerm {
     /// objective term, which would break Armijo bookkeeping. Runs post-acceptance at
     /// the same cadence as [`Self::enforce_active_mass_guard`] /
     /// [`Self::enforce_decoder_norm_guard`]. Returns the number of atoms re-gauged.
+    ///
+    /// #2731 — each atom's retraction reads only that atom's decoder, basis and
+    /// coordinates, so the retractions are prepared on the rayon pool one batch of
+    /// the pool width at a time and committed serially in atom order. The committed
+    /// state is bit-identical to the one-atom-at-a-time loop, the first failing
+    /// atom's error is the one returned, and at most one batch of prepared charts is
+    /// held at once. Job 510613 read `hook_retract=1.29–1.30 s` of a 2.98–3.21 s
+    /// inner iteration at `p = 2048, charts = 32`, at 1.6 cores.
     pub(crate) fn retract_unit_speed_charts_in_loop(&mut self) -> Result<usize, String> {
+        use crate::chart_canonicalization::CanonicalChartTopology;
+        use rayon::prelude::*;
+        let eligible: Vec<(usize, CanonicalChartTopology)> = (0..self.atoms.len())
+            .filter_map(|atom_idx| {
+                self.d1_unit_speed_topology(atom_idx)
+                    .map(|topology| (atom_idx, topology))
+            })
+            .collect();
+        let pool_threads = rayon::current_num_threads().max(1);
         let mut retracted = 0usize;
-        for atom_idx in 0..self.atoms.len() {
-            let Some(topology) = self.d1_unit_speed_topology(atom_idx) else {
-                continue;
-            };
-            if self.canonicalize_atom_unit_speed_chart(atom_idx, &topology)? {
-                retracted += 1;
+        for batch in eligible.chunks(pool_threads) {
+            let term: &Self = self;
+            let charts: Vec<Result<Option<PreparedUnitSpeedChart>, String>> = batch
+                .par_iter()
+                .map(|(atom_idx, topology)| {
+                    term.prepare_atom_unit_speed_chart(*atom_idx, topology)
+                })
+                .collect();
+            for ((atom_idx, _), chart) in batch.iter().zip(charts) {
+                if let Some(chart) = chart? {
+                    self.commit_atom_unit_speed_chart(*atom_idx, chart)?;
+                    retracted += 1;
+                }
             }
         }
         Ok(retracted)
