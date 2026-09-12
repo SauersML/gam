@@ -299,37 +299,44 @@ pub(super) fn pooled_probit_baseline(
         if e.g0.abs() <= growth(2) * e.g0_abs && e.g1.abs() <= growth(3) * e.g1_abs {
             break;
         }
-        // Newton step on the PSD 2×2 information. The determinant's band is what the
-        // entries' accumulations propagate into its two products, plus their own
-        // rounding and the subtraction's; a determinant inside it is a rank-one
-        // information, whose Moore–Penrose step moves only along the direction the
-        // data inform.
-        let det = e.h00 * e.h11 - e.h01 * e.h01;
-        let det_band = growth(3) * 2.0 * (e.h00 * e.h11 + e.h01.abs() * e.h01_abs)
-            + gam_linalg::roundoff::accumulation_growth(3) * (e.h00 * e.h11 + e.h01 * e.h01);
+        // Newton step on the PSD 2×2 information, solved on the information and the
+        // gradient divided by the information's largest diagonal. The step is invariant
+        // to that common scale; the raw products are not representable. Along a
+        // separating direction every entry decays like the margins' probit density, and
+        // once the densities fall below ~1e-162 the products `h·g` underflow, the step
+        // rounds to zero, and the halving loop below reads the zero step as a minimum.
+        // PSD bounds `|h01|` by the largest diagonal, so every scaled entry is in [-1, 1].
+        let scale = e.h00.max(e.h11);
+        if scale == 0.0 {
+            return Err(
+                "pooled bernoulli-marginal-slope pilot: every row's probit density underflows, \
+                 so the pooled information is zero and no Newton direction exists"
+                    .to_string(),
+            );
+        }
+        let (h00, h01, h01_abs, h11) = (
+            e.h00 / scale,
+            e.h01 / scale,
+            e.h01_abs / scale,
+            e.h11 / scale,
+        );
+        let (g0, g1) = (e.g0 / scale, e.g1 / scale);
+        // The determinant's band is what the entries' accumulations and their division
+        // propagate into its two products, plus their own rounding and the subtraction's;
+        // a determinant inside it is a rank-one information, whose Moore–Penrose step
+        // moves only along the direction the data inform.
+        let det = h00 * h11 - h01 * h01;
+        let det_band = growth(4) * 2.0 * (h00 * h11 + h01.abs() * h01_abs)
+            + gam_linalg::roundoff::accumulation_growth(3) * (h00 * h11 + h01 * h01);
         let (step0, step1) = if det > det_band {
-            (
-                (e.h11 * e.g0 - e.h01 * e.g1) / det,
-                (e.h00 * e.g1 - e.h01 * e.g0) / det,
-            )
+            ((h11 * g0 - h01 * g1) / det, (h00 * g1 - h01 * g0) / det)
         } else {
-            let trace = e.h00 + e.h11;
-            if trace == 0.0 {
-                return Err(
-                    "pooled bernoulli-marginal-slope pilot: every row's probit density underflows, \
-                     so the pooled information is zero and no Newton direction exists"
-                        .to_string(),
-                );
-            }
             // A rank-one information is `trace·vvᵀ`, `v` its dominant column normalised.
-            let (c0, c1) = if e.h00 >= e.h11 {
-                (e.h00, e.h01)
-            } else {
-                (e.h01, e.h11)
-            };
+            let trace = h00 + h11;
+            let (c0, c1) = if h00 >= h11 { (h00, h01) } else { (h01, h11) };
             let norm = c0.hypot(c1);
             let (v0, v1) = (c0 / norm, c1 / norm);
-            let along = (v0 * e.g0 + v1 * e.g1) / trace;
+            let along = (v0 * g0 + v1 * g1) / trace;
             (along * v0, along * v1)
         };
         if !(step0.is_finite() && step1.is_finite()) {
