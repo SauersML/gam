@@ -79,17 +79,6 @@ use ndarray::{ArrayView2, ArrayView3};
 use std::collections::HashSet;
 use std::f64::consts::TAU;
 
-/// Relative slack on the derived unit threshold, absorbing the f32-input /
-/// f64-accumulation rounding of the two dot-product paths (residual and code).
-/// It shifts only the exact `= 1` boundary; a genuine birth (`η ≫ 1`) or a
-/// genuine certificate (`η ≪ 1`) is unaffected.
-const CERT_REL_SLACK: f64 = 1.0e-4;
-
-/// Floor on the implied λ so a degenerate row with no live active mass yields a
-/// large-but-finite `η` instead of a non-finite one. Set to the f32 rounding
-/// unit; a real active support is orders of magnitude above it.
-const LAMBDA_FLOOR: f64 = f32::EPSILON as f64;
-
 /// Quantile levels reported for the per-row optimality-ratio distribution.
 const RATIO_QUANTILES: [f64; 4] = [0.5, 0.9, 0.99, 1.0];
 
@@ -99,7 +88,7 @@ pub struct DualCertificateReport {
     /// Rows the certificate was evaluated over.
     pub n_rows: usize,
     /// Fraction of rows whose greedy support is dual-feasible
-    /// (`optimality_ratio ≤ 1 + slack`) — the certified global optima.
+    /// (`optimality_ratio ≤ 1`) — the certified global optima.
     pub frac_certified: f64,
     /// `(quantile, value)` of the per-row optimality-ratio distribution
     /// (`RATIO_QUANTILES`). The `1.0` entry is the worst row.
@@ -136,7 +125,6 @@ pub fn harmonic_dual_birth_eta(residual_coeffs: &[(f64, f64)], active_mass: f64)
     if residual_coeffs.is_empty() {
         return 0.0;
     }
-    let lambda = active_mass.max(LAMBDA_FLOOR);
     // The supremum of the degree-`H` dual trigonometric polynomial is attained on
     // its complete stationary set, isolated analytically, never on a sampled grid.
     let flat: Vec<f64> = residual_coeffs
@@ -146,7 +134,20 @@ pub fn harmonic_dual_birth_eta(residual_coeffs: &[(f64, f64)], active_mass: f64)
     let (t, _curvature) = crate::sparse_dict::harmonic_argmax(&flat);
     let matched_amplitude =
         harmonic_dual_value(residual_coeffs, t).max(0.0) / residual_coeffs.len() as f64;
-    matched_amplitude / lambda
+    dual_ratio(matched_amplitude, active_mass)
+}
+
+/// Optimal new mass over the implied λ. The implied λ is the weakest live mass,
+/// so a support with none sits at the limit `λ → 0`: a positive dual value is a
+/// strictly improving birth there, and a zero one is none.
+fn dual_ratio(dual_value: f64, implied_lambda: f64) -> f64 {
+    if implied_lambda > 0.0 {
+        dual_value / implied_lambda
+    } else if dual_value > 0.0 {
+        f64::INFINITY
+    } else {
+        0.0
+    }
 }
 
 fn harmonic_dual_value(coeffs: &[(f64, f64)], t: f64) -> f64 {
@@ -162,18 +163,18 @@ fn harmonic_dual_value(coeffs: &[(f64, f64)], t: f64) -> f64 {
 /// Assemble a [`DualCertificateReport`] from per-row certificates.
 fn assemble_report(rows: Vec<RowCertificate>, max_candidates: usize) -> DualCertificateReport {
     let n_rows = rows.len();
-    let threshold = 1.0 + CERT_REL_SLACK;
-
     let mut ratios: Vec<f64> = Vec::with_capacity(n_rows);
     let mut certified = 0usize;
     let mut births: Vec<(usize, u32, f64)> = Vec::new();
     for (row_idx, rc) in rows.iter().enumerate() {
         ratios.push(rc.optimality_ratio);
-        if rc.optimality_ratio <= threshold {
+        // The derived unit threshold. A row exactly at the tie `η = 1` is decided
+        // by rounding on either side, so no slack changes a real verdict.
+        if rc.optimality_ratio <= 1.0 {
             certified += 1;
         }
         if let Some((atom, eta)) = rc.birth {
-            if eta > threshold {
+            if eta > 1.0 {
                 births.push((row_idx, atom, eta));
             }
         }
@@ -309,9 +310,9 @@ pub fn sparse_route_dual_certificate(
             }
         }
         let implied_lambda = if min_active_mass.is_finite() {
-            min_active_mass.max(LAMBDA_FLOOR)
+            min_active_mass
         } else {
-            LAMBDA_FLOOR
+            0.0
         };
 
         // Fold the off-support residual dual value |⟨r, d_k⟩| to a running max.
@@ -332,8 +333,8 @@ pub fn sparse_route_dual_certificate(
             }
         }
 
-        let optimality_ratio = max_off_gate / implied_lambda;
-        let birth = argmax_atom.map(|a| (a, max_off_gate / implied_lambda));
+        let optimality_ratio = dual_ratio(max_off_gate, implied_lambda);
+        let birth = argmax_atom.map(|a| (a, optimality_ratio));
         rows.push(RowCertificate {
             optimality_ratio,
             birth,
@@ -467,9 +468,9 @@ fn block_route_dual_certificate_scaled(
             }
         }
         let implied_lambda = if min_active_gate.is_finite() {
-            min_active_gate.max(LAMBDA_FLOOR)
+            min_active_gate
         } else {
-            LAMBDA_FLOOR
+            0.0
         };
 
         // Residual block gates γ‖r D_gᵀ‖₂ over every block, off-support max.
@@ -488,7 +489,7 @@ fn block_route_dual_certificate_scaled(
             }
         }
 
-        let optimality_ratio = max_off_gate / implied_lambda;
+        let optimality_ratio = dual_ratio(max_off_gate, implied_lambda);
         // Report the block's leading atom index so the birth candidate is a
         // dictionary row, consistent with the linear lane.
         let birth = argmax_block.map(|g| (g * b as u32, optimality_ratio));

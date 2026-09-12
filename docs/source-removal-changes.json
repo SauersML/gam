@@ -3584,5 +3584,14 @@
     ],
     "reason": "#2469. normalize_by_mass accepted a multinomial posterior rule whose computed mass missed one by the caller's absolute tolerance plus SUMMATION_ROUNDOFF_MULTIPLIER·ε·max(Σ|w|, 1), an undocumented 16 with an absolute floor. The mass is a compensated sum of the formed weights, so the envelope is now gam_linalg::roundoff::compensated_band over the roundings that form each weight and normalize each one-dimensional rule (product_rule_roundings), and the constant has no other user.",
     "evidence": "At the base, git grep -n -w SUMMATION_ROUNDOFF_MULTIPLIER finds only its declaration and its single use in normalize_by_mass (crates/gam-models/src/multinomial_posterior.rs), which this change replaces. It is private, production-scoped and declared once. The item list applies source_removal_guard.py's ITEM regex and occurrence rule by hand. Compile is covered by the lead's shared tip check."
+  },
+  {
+    "base": "3ef4b45660c03239b11b22118b21389654f321c9",
+    "items": [
+      "crates/gam-sae/src/dual_certificate.rs:const:CERT_REL_SLACK",
+      "crates/gam-sae/src/dual_certificate.rs:const:LAMBDA_FLOOR"
+    ],
+    "reason": "#2469: CERT_REL_SLACK (1e-4) widened the derived unit threshold of the dual certificate, so rows with 1 < eta <= 1.0001 were counted as certified although they are genuine improving births. A row exactly at the tie eta = 1 is decided by rounding either way, so the threshold is now 1. LAMBDA_FLOOR (f32::EPSILON) floored the implied lambda so that an empty support gave a large finite ratio. The implied lambda is the weakest live mass, so an empty support is the limit lambda -> 0, and dual_ratio returns infinity for a positive dual value and 0 for a zero one.",
+    "evidence": "git grep -n CERT_REL_SLACK at the base finds its declaration and one use in assemble_report. git grep -n LAMBDA_FLOOR in crates/gam-sae/src finds its declaration and five uses, all in crates/gam-sae/src/dual_certificate.rs (harmonic_dual_birth_eta, sparse_route_dual_certificate, block_route_dual_certificate_scaled). chart_canonicalization.rs has a different LM_LAMBDA_FLOOR. Both consts were private to the file. Consumers of the report (gam-pyffi sae_spectral_ffi.rs, tests/test_sae_spectral_facade_smoke.py, tests/test_audit_sae_facade.py) read frac_certified in [0, 1], four quantiles and at most max_candidates births, and each still holds with an infinite ratio. Nothing here was compiled or run locally (user directive); compile is covered by the lead's shared tip check."
   }
 ]
