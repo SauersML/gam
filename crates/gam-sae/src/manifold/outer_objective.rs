@@ -81,10 +81,12 @@ pub(crate) struct OuterTerminationLedger {
 }
 
 #[cfg(test)]
-impl OuterTerminationLedger {
-    /// The ledger's three counters, for the accounting tests.
-    pub(crate) fn counters(&self) -> (u64, u64, Option<f64>) {
-        (self.evals, self.last_improvement_eval, self.best_cost)
+mod outer_termination_ledger_tests {
+    impl super::OuterTerminationLedger {
+        /// The ledger's three counters, for the accounting tests.
+        pub(crate) fn counters(&self) -> (u64, u64, Option<f64>) {
+            (self.evals, self.last_improvement_eval, self.best_cost)
+        }
     }
 }
 
