@@ -576,73 +576,47 @@ pub(crate) fn select_kmeans_centers(
     if num_centers > n {
         crate::bail_invalid_basis!("kmeans requested {num_centers} centers but data has {n} rows");
     }
-    const KMEANS_PILOT_MAX_ROWS: usize = 20_000;
-    if n > KMEANS_PILOT_MAX_ROWS {
-        let pilot_n = KMEANS_PILOT_MAX_ROWS.max(num_centers);
-        // log::info! rather than warn! — this is a deliberate performance
-        // choice (O(n·k·iter) kmeans scales badly past ~20K rows), not a
-        // problem the user can act on. Surfacing it as a warning adds
-        // noise to CI output and mislabels normal operation.
-        log::info!(
-            "kmeans center selection using {}-row pilot subsample instead of full {} rows",
-            pilot_n,
-            n
-        );
-        let pilot = select_equal_mass_covar_representative_centers(data, pilot_n)?;
-        return select_kmeans_centers(pilot.view(), num_centers, max_iter);
-    }
     let mut centers = select_thin_plate_knots(data, num_centers)?;
-    let mut assign = vec![0usize; n];
-    let iters = max_iter.max(1);
+    // No row has a center before the first sweep.
+    let mut assign = vec![usize::MAX; n];
 
-    // For large n (large-scale), parallelize the assignment step.
-    // Each observation's nearest-center query is independent.
-    let use_parallel = n >= 10_000;
-
-    for _ in 0..iters {
+    // Lloyd sweeps over every row, so the centers come from one estimator at
+    // every n (SPEC rule 6); each observation's nearest-center query is
+    // independent. A sweep that reassigns no row reproduces the previous
+    // centroids bit for bit, and so would every later sweep, so stopping there
+    // returns exactly what the remaining sweeps would.
+    const KMEANS_CHUNK: usize = 4096;
+    for _ in 0..max_iter.max(1) {
         // Assignment: find nearest center for each observation.
-        if use_parallel {
-            const KMEANS_CHUNK: usize = 4096;
-            assign
-                .par_chunks_mut(KMEANS_CHUNK)
-                .enumerate()
-                .for_each(|(ci, chunk)| {
-                    let base = ci * KMEANS_CHUNK;
-                    for (local, slot) in chunk.iter_mut().enumerate() {
-                        let i = base + local;
-                        let mut best = 0usize;
-                        let mut best_d2 = f64::INFINITY;
-                        for k in 0..num_centers {
-                            let mut d2 = 0.0;
-                            for c in 0..d {
-                                let delta = data[[i, c]] - centers[[k, c]];
-                                d2 += delta * delta;
-                            }
-                            if d2 < best_d2 {
-                                best_d2 = d2;
-                                best = k;
-                            }
+        let reassigned = assign
+            .par_chunks_mut(KMEANS_CHUNK)
+            .enumerate()
+            .map(|(ci, chunk)| {
+                let base = ci * KMEANS_CHUNK;
+                let mut moved = false;
+                for (local, slot) in chunk.iter_mut().enumerate() {
+                    let i = base + local;
+                    let mut best = 0usize;
+                    let mut best_d2 = f64::INFINITY;
+                    for k in 0..num_centers {
+                        let mut d2 = 0.0;
+                        for c in 0..d {
+                            let delta = data[[i, c]] - centers[[k, c]];
+                            d2 += delta * delta;
                         }
-                        *slot = best;
+                        if d2 < best_d2 {
+                            best_d2 = d2;
+                            best = k;
+                        }
                     }
-                });
-        } else {
-            for i in 0..n {
-                let mut best = 0usize;
-                let mut best_d2 = f64::INFINITY;
-                for k in 0..num_centers {
-                    let mut d2 = 0.0;
-                    for c in 0..d {
-                        let delta = data[[i, c]] - centers[[k, c]];
-                        d2 += delta * delta;
-                    }
-                    if d2 < best_d2 {
-                        best_d2 = d2;
-                        best = k;
-                    }
+                    moved |= *slot != best;
+                    *slot = best;
                 }
-                assign[i] = best;
-            }
+                moved
+            })
+            .reduce(|| false, |left, right| left || right);
+        if !reassigned {
+            break;
         }
         // Update: recompute centroids from assignments.
         let mut sums = Array2::<f64>::zeros((num_centers, d));

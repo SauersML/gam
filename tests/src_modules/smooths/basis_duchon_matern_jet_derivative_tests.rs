@@ -3784,8 +3784,9 @@ fn wahba_sphere_kernel_simd_matches_scalar_within_documented_tolerance() {
 #[test]
 fn auto_streaming_skips_small_bspline_basis() {
     // Representative small B-spline workload: n = 100 rows, k = 10 basis
-    // columns. Dense buffer ≈ 100 · 10 · 8 = 8000 B ≪ 1 GiB threshold,
-    // so streaming must not engage and the helper must return None.
+    // columns. Its 8000-byte dense buffer fits the governed materialization
+    // ceiling of any process able to run this test, so streaming must not
+    // engage and the helper must return None.
     let chunk = auto_streaming_chunk_size_for_dense(100, 10);
     assert!(
         chunk.is_none(),
@@ -3795,19 +3796,29 @@ fn auto_streaming_skips_small_bspline_basis() {
 
 #[test]
 fn auto_streaming_engages_for_large_synthetic_basis() {
-    // Virtual workload: 1e6 rows × 200 basis columns. Dense bytes
-    // = 1e6 · 200 · 8 = 1.6 GB > 1 GiB threshold, so streaming must
-    // engage. Target chunk ≈ 256 MiB / (200 · 8 B) ≈ 167_772 rows,
-    // clamped to [1024, n_rows].
-    let chunk = auto_streaming_chunk_size_for_dense(1_000_000, 200)
-        .expect("dense buffer exceeds 1 GiB → streaming must engage");
-    assert!(chunk >= 1024, "chunk {chunk} below MIN_CHUNK_ROWS");
-    assert!(chunk <= 1_000_000, "chunk {chunk} exceeds n_rows");
-    // The 256 MiB / row_bytes formula should land in the ~150k-200k row
-    // range for this column count.
+    // The switch is the governed single-materialization ceiling, not a fixed
+    // byte count (SPEC rules 6 and 10): the largest 200-column design whose
+    // dense buffer fits materializes, one more row streams, and the streamed
+    // chunk is the library's one row-chunk rule.
+    let cols = 200usize;
+    let ceiling = gam_runtime::resource::ResourcePolicy::default_library()
+        .max_single_materialization_bytes;
+    let fitting_rows = ceiling / (cols * std::mem::size_of::<f64>());
     assert!(
-        (100_000..=300_000).contains(&chunk),
-        "chunk {chunk} outside the expected ~256 MiB / (200·8) window"
+        fitting_rows > 0,
+        "one 200-column row does not fit the governed ceiling {ceiling}"
+    );
+    assert_eq!(
+        auto_streaming_chunk_size_for_dense(fitting_rows, cols),
+        None,
+        "a {fitting_rows}x{cols} design fits the ceiling {ceiling} and must materialize"
+    );
+    let streamed = auto_streaming_chunk_size_for_dense(fitting_rows + 1, cols)
+        .expect("one row past the governed ceiling must stream");
+    assert_eq!(
+        streamed,
+        gam_runtime::resource::byte_balanced_row_chunk(cols, fitting_rows + 1),
+        "a streamed design must use the library row-chunk rule"
     );
 }
 

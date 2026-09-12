@@ -1553,28 +1553,21 @@ mod matern_function_metric_tests {
     }
 }
 
-/// Auto-derive a streaming row chunk size for dense basis evaluation.
+/// Streaming row chunk for dense basis evaluation, or `None` to materialize.
 ///
-/// The opt-in `streaming_chunk_size` knob has been removed from public specs:
-/// streaming activates automatically when the would-be dense buffer
-/// `n_rows * n_basis_cols * 8 bytes` exceeds 1 GiB. When streaming is
-/// active, the chunk size is sized so each resident chunk holds ~256 MiB
-/// of `f64` (`chunk = (256 MiB) / (n_basis_cols * 8)`), clamped to
-/// `[1024, n_rows]`. Returning `None` means "do not stream, materialize
-/// densely".
+/// A basis streams exactly when its would-be dense buffer
+/// (`n_rows × n_basis_cols` `f64`) exceeds the process's governed
+/// single-materialization ceiling, the same authority
+/// `should_use_lazy_spatial_design` consults, so a design that fits real memory
+/// is never streamed and one that does not is never materialized (SPEC rules 6
+/// and 10). A streamed chunk follows the library's one row-chunk rule,
+/// `gam_runtime::resource::byte_balanced_row_chunk`.
 pub fn auto_streaming_chunk_size_for_dense(n_rows: usize, n_basis_cols: usize) -> Option<usize> {
     if n_rows == 0 || n_basis_cols == 0 {
         return None;
     }
-    const DENSE_THRESHOLD_BYTES: usize = 1024 * 1024 * 1024;
-    const TARGET_CHUNK_BYTES: usize = 256 * 1024 * 1024;
-    const MIN_CHUNK_ROWS: usize = 1024;
-    let dense_bytes = n_rows.saturating_mul(n_basis_cols).saturating_mul(8);
-    if dense_bytes <= DENSE_THRESHOLD_BYTES {
-        return None;
-    }
-    let row_bytes = n_basis_cols.saturating_mul(8).max(1);
-    let raw_chunk = TARGET_CHUNK_BYTES / row_bytes;
-    let clamped = raw_chunk.max(MIN_CHUNK_ROWS).min(n_rows);
-    Some(clamped)
+    let ceiling = gam_runtime::resource::ResourcePolicy::default_library()
+        .max_single_materialization_bytes;
+    (dense_design_bytes(n_rows, n_basis_cols) > ceiling)
+        .then(|| gam_runtime::resource::byte_balanced_row_chunk(n_basis_cols, n_rows))
 }
