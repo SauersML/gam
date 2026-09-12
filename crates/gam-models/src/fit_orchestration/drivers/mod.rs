@@ -131,12 +131,6 @@ pub struct SpatialLengthScaleOptimizationTiming {
     pub optim_total_s: f64,
 }
 
-impl SpatialLengthScaleOptimizationTiming {
-    pub fn trial_total_s(self) -> f64 {
-        self.cost_total_s + self.eval_total_s + self.efs_total_s
-    }
-}
-
 #[derive(Clone)]
 pub struct FittedTermCollectionWithSpec {
     pub fit: UnifiedFitResult,

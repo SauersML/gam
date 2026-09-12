@@ -34,16 +34,6 @@
 //!   linear in `z` and the EXACT set is computable from one factorization
 //!   and ≤ 2n linear breakpoints — the ridge result generalized to
 //!   arbitrary penalized smooths (any Sλ, any basis).
-//! - **Layer 2 — discrete arm (implemented below, exact):** Binomial /
-//!   Poisson and any finite-or-windowed response support, by ENUMERATION
-//!   with one symmetric refit per candidate (`SymmetricAugmentedFit`).
-//!   Bernoulli's honest full-conformal set — smoothing re-selection
-//!   included — costs exactly two cold fits; windowed counts carry honest
-//!   tail-resolution flags instead of an unprovable monotone-tail
-//!   assumption. Exactness is by construction: every retained candidate
-//!   was actually refit. Validity is proven in the test module by FULL
-//!   ENUMERATION of every Bernoulli dataset at small n (exact coverage
-//!   ≥ 1 − α as a theorem check, not a simulation).
 //! - **Layer 2 — continuous GLM (implemented below, certified):**
 //!   predictor–corrector homotopy in `z` ([`GlmHomotopyFullConformal`]) —
 //!   exact at corrector points because each correction is a Newton solve of
@@ -111,9 +101,9 @@
 //! `c`-array bounds ‖D_βH\[v\]‖ along the step, giving a computable Newton
 //! attraction radius) — the corrector cannot silently skip a basin. Score
 //! crossings between steps are localized by bisection on the corrected
-//! path. Discrete families (Binomial, Poisson) are FINITE: z walks the
-//! response support with warm starts, and full conformal is exact by
-//! enumeration — no homotopy subtlety at all; implement that arm first.
+//! path. Discrete families (Binomial, Poisson) are FINITE: full conformal is
+//! exact by enumerating the response support — no homotopy subtlety at all —
+//! and this module carries no enumeration arm.
 //!
 //! # Layer 3 contract: the ρ-response and the frozen-ρ certificate
 //!
@@ -183,8 +173,8 @@
 //!
 //! No flags. The predict path requests full conformal exactly like split
 //! conformal (`conformal_level`), and the dispatcher picks: exact Layer 1
-//! for Gaussian-identity fits, enumeration for discrete families, homotopy
-//! beyond. PRIORITY ORDER MATTERS and is a design decision, not an
+//! for Gaussian-identity fits, homotopy beyond. PRIORITY ORDER MATTERS and
+//! is a design decision, not an
 //! optimization: the cheap frozen-ρ exact set runs FIRST, the certificate
 //! is computed, and only on certificate REFUSAL does the engine touch the
 //! expensive honest path — and even then the preferred realization is
@@ -652,185 +642,6 @@ impl ExactGaussianFullConformal {
     }
 }
 
-/// The symmetric augmented fitting map the discrete enumeration arm walks.
-///
-/// `scores(z)` must: fit the n+1 augmented rows `{(x_i, y_i)} ∪ {(x_*, z)}`
-/// and return all n+1 nonconformity scores with the TEST row's score LAST.
-/// The single requirement backing the coverage guarantee is SYMMETRY: the
-/// fitting map must treat the augmented row exactly like a training row
-/// (same loss term, same weight, same participation in any smoothing /
-/// hyperparameter selection the map performs). A map that freezes anything
-/// it selected by looking at the training responses but not at `z` breaks
-/// symmetry and voids the guarantee — for discrete families that honesty is
-/// CHEAP, because the support is walked by enumeration (2 refits for
-/// Bernoulli), so the map can simply be the full cold fit, ρ-selection
-/// included.
-///
-/// `&mut self` so implementations can warm-start across consecutive
-/// candidates (a speed optimization that cannot affect the answer when each
-/// solve is run to its deterministic optimum).
-pub trait SymmetricAugmentedFit {
-    fn scores(&mut self, z: f64) -> Result<Array1<f64>, String>;
-}
-
-/// Blanket impl so plain closures can serve as the fitting map (tests, and
-/// adapter shims that capture a fit configuration).
-impl<F> SymmetricAugmentedFit for F
-where
-    F: FnMut(f64) -> Result<Array1<f64>, String>,
-{
-    fn scores(&mut self, z: f64) -> Result<Array1<f64>, String> {
-        self(z)
-    }
-}
-
-/// One enumerated candidate's conformal verdict.
-#[derive(Clone, Debug)]
-pub struct DiscreteCandidate {
-    pub z: f64,
-    /// Conformal p-value `(1 + #{i ≤ n : e_i ≥ e_*}) / (n+1)`. Ties count
-    /// FOR the candidate (the `≥` convention) — the conservative direction;
-    /// strict-inequality ranking would under-cover under ties.
-    pub p_value: f64,
-    pub member: bool,
-}
-
-/// Exact full-conformal prediction set for a DISCRETE response family,
-/// computed by enumeration of candidate responses with one symmetric refit
-/// per candidate (#942 Layer 2, discrete arm).
-///
-/// There is no homotopy and no approximation anywhere in this object: for
-/// each candidate `z` the fitting map is run to its optimum, the n+1 scores
-/// are ranked, and the candidate is kept iff its conformal p-value exceeds
-/// α. Validity is the standard full-conformal argument — exchangeability of
-/// the n+1 rows plus symmetry of the map — and EXACTNESS is by construction
-/// (the support is finite or explicitly windowed; every retained candidate
-/// was actually refit).
-#[derive(Clone, Debug)]
-pub struct DiscreteFullConformalSet {
-    /// Retained candidates, ascending.
-    pub members: Vec<f64>,
-    /// Every enumerated candidate with its p-value (diagnostics; the
-    /// boundary-adjacent p-values are the discrete analogue of Layer 1's
-    /// `boundary_margin`).
-    pub candidates: Vec<DiscreteCandidate>,
-    pub alpha: f64,
-    /// `n + 1`.
-    pub n_augmented: usize,
-    /// `Some(z_first)` when the SMALLEST enumerated candidate was a member
-    /// of a WINDOWED enumeration — the retained set may continue
-    /// contiguously below the window. Always `None` for exhaustive supports
-    /// (the Bernoulli arm). For a windowed support, `None` only says the
-    /// retained set does not continue through the enumerated edge; absent a
-    /// monotone-tail theorem for the fitting map, it says nothing about
-    /// non-contiguous retained candidates farther outside the window.
-    pub lower_tail_unresolved: Option<f64>,
-    /// Mirror of `lower_tail_unresolved` for the largest candidate.
-    pub upper_tail_unresolved: Option<f64>,
-}
-
-/// Walk an EXHAUSTIVE discrete support (e.g. Bernoulli `{0, 1}`). The
-/// returned set is the exact full-conformal set, period — no tail
-/// semantics, because there is nothing outside the support.
-pub fn discrete_full_conformal_exhaustive<M: SymmetricAugmentedFit>(
-    fit: &mut M,
-    support: &[f64],
-    alpha: f64,
-) -> Result<DiscreteFullConformalSet, String> {
-    let mut set = discrete_walk(fit, support, alpha)?;
-    set.lower_tail_unresolved = None;
-    set.upper_tail_unresolved = None;
-    Ok(set)
-}
-
-/// Walk a WINDOW of an unbounded discrete support (e.g. Poisson counts
-/// `lo..=hi`). Exact ON THE WINDOW; the tail flags report honestly whether
-/// the retained set continues through either edge (edge candidate retained
-/// ⇒ contiguous tail unresolved). An excluded edge resolves only that
-/// contiguous continuation. Without a monotone-tail theorem for the fitting
-/// map, callers must not interpret cleared flags as a global proof that no
-/// non-contiguous retained candidates exist farther outside the window.
-pub fn discrete_full_conformal_window<M: SymmetricAugmentedFit>(
-    fit: &mut M,
-    window: &[f64],
-    alpha: f64,
-) -> Result<DiscreteFullConformalSet, String> {
-    discrete_walk(fit, window, alpha)
-}
-
-/// Bernoulli convenience arm: the support is `{0, 1}`, so the honest
-/// (ρ-re-selecting) full-conformal set costs exactly two cold fits.
-pub fn bernoulli_full_conformal<M: SymmetricAugmentedFit>(
-    fit: &mut M,
-    alpha: f64,
-) -> Result<DiscreteFullConformalSet, String> {
-    discrete_full_conformal_exhaustive(fit, &[0.0, 1.0], alpha)
-}
-
-fn discrete_walk<M: SymmetricAugmentedFit>(
-    fit: &mut M,
-    candidates: &[f64],
-    alpha: f64,
-) -> Result<DiscreteFullConformalSet, String> {
-    if candidates.is_empty() {
-        return Err("discrete full conformal: empty candidate list".to_string());
-    }
-    if !(0.0..1.0).contains(&alpha) {
-        return Err(format!(
-            "discrete full conformal: alpha must be in [0, 1), got {alpha}"
-        ));
-    }
-    if candidates.windows(2).any(|w| !(w[0] < w[1])) {
-        return Err("discrete full conformal: candidates must be strictly increasing".to_string());
-    }
-
-    let mut out = Vec::with_capacity(candidates.len());
-    let mut members = Vec::new();
-    let mut n_augmented = 0usize;
-    for &z in candidates {
-        let scores = fit.scores(z)?;
-        let n1 = scores.len();
-        if n1 < 2 {
-            return Err(
-                "discrete full conformal: fitting map must score at least two rows".to_string(),
-            );
-        }
-        if n_augmented == 0 {
-            n_augmented = n1;
-        } else if n_augmented != n1 {
-            return Err(format!(
-                "discrete full conformal: fitting map returned {n1} scores after returning \
-                 {n_augmented}; the augmented row count cannot change across candidates"
-            ));
-        }
-        if scores.iter().any(|s| !s.is_finite()) {
-            return Err(format!(
-                "discrete full conformal: non-finite nonconformity score at candidate {z}; \
-                 refusing to rank garbage"
-            ));
-        }
-        let e_star = scores[n1 - 1];
-        let count = scores.iter().take(n1 - 1).filter(|&&e| e >= e_star).count();
-        let p_value = (1.0 + count as f64) / (n1 as f64);
-        let member = p_value > alpha;
-        if member {
-            members.push(z);
-        }
-        out.push(DiscreteCandidate { z, p_value, member });
-    }
-
-    let lower_tail_unresolved = out.first().filter(|c| c.member).map(|c| c.z);
-    let upper_tail_unresolved = out.last().filter(|c| c.member).map(|c| c.z);
-    Ok(DiscreteFullConformalSet {
-        members,
-        candidates: out,
-        alpha,
-        n_augmented,
-        lower_tail_unresolved,
-        upper_tail_unresolved,
-    })
-}
-
 /// Layer-3 verdict for the frozen-ρ shortcut. Produced by comparing the
 /// exact ρ-excursion bound (`L · E`, see
 /// [`GaussianRemlRhoResponse::certified_full_conformal`]) against the exact
@@ -975,8 +786,7 @@ impl StationarityQuadratic {
 /// full conformal" method in the literature silently freezes ρ̂ at its
 /// original-data value and never quantifies the resulting symmetry break.
 /// This object closes that gap WITHOUT a homotopy: it computes the honest
-/// re-selecting map exactly (it is a 1-D REML problem per candidate), the
-/// smoothing response `dρ̂/dz` in closed form via the outer IFT, and a
+/// re-selecting map exactly (it is a 1-D REML problem per candidate) and a
 /// per-dataset conditional check that accepts (or refuses) freezing ρ̂. On
 /// acceptance the cheap frozen-ρ set is returned with the rho-grid
 /// assumption that makes equality to the honest set valid; on refusal the
@@ -1007,16 +817,9 @@ impl StationarityQuadratic {
 ///   ∂D/∂ρ = pen ,                ∂D/∂z = 2(z − x_*ᵀβ̂) = 2 r_*
 ///   G    = ∂Ṽ/∂ρ      = (n_eff−M₀)·pen/D + λ tr(A⁻¹S) − r
 ///   ∂²Ṽ/∂ρ²           = (n_eff−M₀)·(pen'·D − pen²)/D² + λ tr(A⁻¹S) − λ² tr((A⁻¹S)²)
-///   ∂²Ṽ/∂ρ∂z          = (n_eff−M₀)·(pen_z'·D − pen·D_z')/D²
 /// ```
 ///
-/// with `pen' = pen − 2λ²·β̂ᵀS A⁻¹ S β̂`, `pen_z' = 2λ·β̂ᵀS (A⁻¹x_*)`,
-/// `D_z' = 2 r_*`. The smoothing response to the candidate is one outer IFT
-/// step on `G(ρ̂(z), z) = 0`:
-///
-/// ```text
-///   dρ̂/dz = − (∂²Ṽ/∂ρ²)⁻¹ · ∂²Ṽ/∂ρ∂z .
-/// ```
+/// with `pen' = pen − 2λ²·β̂ᵀS A⁻¹ S β̂`.
 ///
 /// The score–ρ sensitivity (which the certificate's Lipschitz constant uses)
 /// is `∂μ̂_i/∂ρ = x_iᵀ (dβ̂/dρ)` with `dβ̂/dρ = −λ A⁻¹ S β̂`, so
@@ -1037,8 +840,8 @@ pub struct GaussianRemlRhoResponse<'a> {
 }
 
 /// One closed-form evaluation of the (possibly augmented) Gaussian REML
-/// criterion at `ρ = log λ`, carrying every derivative the IFT and the
-/// certificate consume.
+/// criterion at `ρ = log λ`, carrying every derivative the certificate
+/// consumes.
 #[derive(Clone, Debug)]
 struct RemlEval {
     /// `Ṽ(ρ,z)` (additive constants dropped — only differences in ρ matter).
@@ -1052,12 +855,6 @@ struct RemlEval {
     grad_band: f64,
     /// `∂²Ṽ/∂ρ²`.
     hess: f64,
-    /// `∂²Ṽ/∂ρ∂z` (0 when the test row is absent).
-    cross: f64,
-    /// `∂μ̂_i/∂ρ` at the training rows.
-    mu_rho_train: Array1<f64>,
-    /// `∂μ̂_*/∂ρ` at the test row.
-    mu_rho_test: f64,
     /// The penalized RSS `D` the criterion's `log D` term is taken of.
     penalized_rss: f64,
 }
@@ -1209,47 +1006,13 @@ impl<'a> GaussianRemlRhoResponse<'a> {
         let hess = coef * (pen_prime * d - pen * pen) / (d * d) + lambda * tr_ainv_s
             - lambda * lambda * tr_ainv_s_sq;
 
-        // ∂μ̂/∂ρ = X (dβ̂/dρ) = −λ X v_s.
-        let xv = fast_av(self.x, &v_s);
-        let mu_rho_train = xv.mapv(|t| -lambda * t);
-        let mu_rho_test = -lambda * self.x_star.dot(&v_s);
-
-        let cross = if let Some(zv) = z {
-            let b = chol.solvevec(self.x_star); // dβ̂/dz
-            let pen_z = 2.0 * lambda * sbeta.dot(&b);
-            let r_star = zv - self.x_star.dot(&beta);
-            let d_z = 2.0 * r_star;
-            coef * (pen_z * d - pen * d_z) / (d * d)
-        } else {
-            0.0
-        };
-
         Ok(RemlEval {
             value,
             grad,
             grad_band,
             hess,
-            cross,
-            mu_rho_train,
-            mu_rho_test,
             penalized_rss: d,
         })
-    }
-
-    /// Public, value-only REML criterion (for FD verification of the gradient).
-    pub fn penalized_laml_criterion(&self, rho: f64, z: Option<f64>) -> Result<f64, String> {
-        Ok(self.eval(rho, z)?.value)
-    }
-
-    /// `dρ̂/dz` at a stationary `(ρ, z)` via the outer IFT.
-    pub fn drho_dz(&self, rho: f64, z: f64) -> Result<f64, String> {
-        let ev = self.eval(rho, Some(z))?;
-        if ev.hess.abs() < 1e-14 {
-            return Err(
-                "gaussian reml response: outer Hessian ∂²Ṽ/∂ρ² ≈ 0; dρ̂/dz singular".to_string(),
-            );
-        }
-        Ok(-ev.cross / ev.hess)
     }
 
     /// The stationarity condition `∂V/∂ρ = 0` at a fixed `ρ`, written as the
@@ -1376,18 +1139,6 @@ impl<'a> GaussianRemlRhoResponse<'a> {
         Ok(self.eval(rho, z)?.penalized_rss)
     }
 
-    /// `(∂μ̂_i/∂ρ)_i` over the training rows and `∂μ̂_*/∂ρ` at the test row, at
-    /// one `(ρ, z)`: the pointwise sensitivities the analytic Lipschitz bound
-    /// (`score_rho_lipschitz_sup`) dominates for every `ρ` at once.
-    pub fn mean_sensitivity_to_rho(
-        &self,
-        rho: f64,
-        z: Option<f64>,
-    ) -> Result<(Array1<f64>, f64), String> {
-        let ev = self.eval(rho, z)?;
-        Ok((ev.mu_rho_train, ev.mu_rho_test))
-    }
-
     /// The REML-selected log smoothing strength for the training response
     /// with the test response set to `z` (or the training-only criterion for
     /// `None`), found by the workspace's outer engine: one ρ coordinate with
@@ -1472,36 +1223,6 @@ impl<'a> GaussianRemlRhoResponse<'a> {
              band {})",
             ev.grad, ev.grad_band
         ))
-    }
-
-    /// Honest membership at candidate `z`: re-select ρ̂(z) on the augmented
-    /// data, fit, and apply the conformal rank rule. This IS the honest
-    /// (ρ-re-selecting) full-conformal map, computed exactly per candidate.
-    pub fn honest_membership(&self, z: f64, alpha: f64) -> Result<bool, String> {
-        let rho = self.select_rho(Some(z))?;
-        let lambda = gam_problem::checked_exp_log_strength(rho)
-            .map_err(|error| format!("gaussian REML conformal response: {error}"))?;
-        let p = self.p;
-        let mut a = self.xtx.clone();
-        for i in 0..p {
-            for j in 0..p {
-                a[[i, j]] += lambda * self.s[[i, j]] + self.x_star[i] * self.x_star[j];
-            }
-        }
-        let chol = a
-            .cholesky(Side::Lower)
-            .map_err(|e| format!("gaussian reml response: honest A(λ) not SPD: {e:?}"))?;
-        let mut c = self.xty.clone();
-        for j in 0..p {
-            c[j] += self.x_star[j] * z;
-        }
-        let beta = chol.solvevec(&c);
-        let e_star = (z - self.x_star.dot(&beta)).abs();
-        let xb = fast_av(self.x, &beta);
-        let count = (0..self.n)
-            .filter(|&i| (self.y[i] - xb[i]).abs() >= e_star)
-            .count();
-        Ok((1.0 + count as f64) > alpha * (self.n as f64 + 1.0))
     }
 
     /// Run the certificate-first procedure: build the frozen-ρ exact set, then
@@ -1844,8 +1565,7 @@ impl CanonicalGlmFamily {
 pub struct GlmHomotopyCandidate {
     pub z: f64,
     /// Conformal p-value `(1 + #{i ≤ n : e_i ≥ e_*}) / (n+1)` (ties count
-    /// FOR the candidate — the conservative `≥` convention shared with the
-    /// discrete enumeration arm).
+    /// FOR the candidate — the conservative `≥` convention).
     pub p_value: f64,
     pub member: bool,
     /// The coefficients the verdict was computed from: the homotopy-tracked
@@ -3255,32 +2975,19 @@ mod tests {
         r
     }
 
-    /// The exact smoothing response `dρ̂/dz` (outer IFT) must equal the
-    /// finite-difference of the ACTUAL re-selection map `z ↦ ρ̂(z)` — i.e. the
-    /// IFT derivative is the derivative of the thing it claims to differentiate,
-    /// not a parallel formula. This is the honesty check the issue demands for
-    /// the ρ-response.
+    /// `select_rho(Some(z))` lands on a genuine stationary point of the
+    /// augmented criterion at every candidate: the gradient `eval` reports
+    /// there is below `1e-6`.
     #[test]
-    fn gaussian_reml_smoothing_response_matches_reselection() {
+    fn gaussian_reml_reselection_is_stationary_on_the_augmented_criterion() {
         let (x, y, s) = gauss_reml_fixture(45, 8);
         let x_star = cosine_row(8, 0.42);
         let resp = GaussianRemlRhoResponse::new(&x, &y, &s, &x_star).expect("response");
 
         for &z in &[0.15_f64, 0.4, 0.75] {
             let rho_z = resp.select_rho(Some(z)).expect("select");
-            // ρ̂(z) is a genuine stationary point of the augmented criterion.
             let g = resp.eval(rho_z, Some(z)).expect("eval").grad;
             assert!(g.abs() < 1e-6, "select_rho not stationary: G={g} at z={z}");
-
-            let analytic = resp.drho_dz(rho_z, z).expect("drho");
-            let hh = 2e-3_f64;
-            let fd = (resp.select_rho(Some(z + hh)).expect("u")
-                - resp.select_rho(Some(z - hh)).expect("d"))
-                / (2.0 * hh);
-            assert!(
-                (analytic - fd).abs() <= 1e-3 + 5e-2 * analytic.abs(),
-                "dρ̂/dz IFT vs re-selection FD mismatch at z={z}: analytic={analytic} fd={fd}"
-            );
         }
     }
 
@@ -3310,6 +3017,32 @@ mod tests {
         }
     }
 
+    /// `(∂μ̂_i/∂ρ)_i` at the training rows and `∂μ̂_*/∂ρ` at the test row, at one
+    /// `(ρ, z)`: `∂μ̂/∂ρ = −λ·X·A⁻¹Sβ̂` from one Cholesky of the augmented `A(λ)`,
+    /// computed here independently of the bound it is scored against.
+    fn sampled_mean_sensitivity(
+        resp: &GaussianRemlRhoResponse<'_>,
+        rho: f64,
+        z: f64,
+    ) -> (Array1<f64>, f64) {
+        let lambda = rho.exp();
+        let p = resp.p;
+        let mut a = resp.xtx.clone();
+        for i in 0..p {
+            for j in 0..p {
+                a[[i, j]] += lambda * resp.s[[i, j]] + resp.x_star[i] * resp.x_star[j];
+            }
+        }
+        let chol = a.cholesky(Side::Lower).expect("augmented A(λ) must be SPD");
+        let mut c = resp.xty.clone();
+        for j in 0..p {
+            c[j] += resp.x_star[j] * z;
+        }
+        let beta = chol.solvevec(&c);
+        let v_s = chol.solvevec(&resp.s.dot(&beta));
+        (resp.x.dot(&v_s).mapv(|t| -lambda * t), -lambda * resp.x_star.dot(&v_s))
+    }
+
     /// The analytic Lipschitz bound dominates every sampled `|∂μ̂_i/∂ρ| +
     /// |∂μ̂_*/∂ρ|` on the deciding range, at strengths far from the optimum in
     /// both directions — the positive control that it is a bound, not another
@@ -3324,8 +3057,7 @@ mod tests {
         assert!(bound.is_finite() && bound > 0.0, "bound {bound}");
         for &rho in &[-8.0_f64, -3.0, 0.0, 2.5, 8.0] {
             for &z in &[z_lo, 0.5 * (z_lo + z_hi), z_hi] {
-                let (mu_rho_train, mu_rho_test) =
-                    resp.mean_sensitivity_to_rho(rho, Some(z)).expect("sensitivity");
+                let (mu_rho_train, mu_rho_test) = sampled_mean_sensitivity(&resp, rho, z);
                 let sampled =
                     mu_rho_train.iter().map(|v| v.abs()).fold(0.0_f64, f64::max) + mu_rho_test.abs();
                 assert!(
