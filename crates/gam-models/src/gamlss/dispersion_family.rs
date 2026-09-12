@@ -1142,10 +1142,10 @@ pub(super) fn dispersion_row_kernel(
             // Fisher scoring, which only re-conditions the inner solve and never
             // shifts the optimum. The observed channel `_info_theta_observed` is no
             // longer consumed for the weight.
-            // #1591-follow-up: scalar `trigamma` (== `trigamma_derivative_stack
-            // (·)[0]` bit-for-bit) evaluates ONLY ψ′; the old `[0]`-index form
-            // built the full order-1..5 polygamma stack and discarded four of
-            // five per call (8 wasted polygamma evaluations per NB2 row).
+            // #1591-follow-up: scalar `trigamma` evaluates ONLY ψ′; the old form
+            // built the full order-1..5 polygamma stack, read index 0 and
+            // discarded four of five per call (8 wasted polygamma evaluations per
+            // NB2 row).
             let theta_fraction = if theta >= mu {
                 (mu / theta - yi / theta) / (1.0 + mu / theta)
             } else {

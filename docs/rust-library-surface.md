@@ -193,8 +193,8 @@ dropped, and restored items the table above retires were removed again.
 | Defined elsewhere in the same crate | 17 |
 | Retired by the decisions above | 19 |
 | Retired: nothing that survived depends on it | 278 |
-| Retired by the owning work's own decision | 14 |
-| Deferred to the owner of an actively edited file | 19 |
+| Retired by the owning work's own decision | 22 |
+| Deferred to the owner of an actively edited file | 11 |
 
 Retired identities carry no compatibility obligation. Restoration is closed
 under calls: after the merges, no restored body calls a function the sweep
@@ -222,6 +222,11 @@ are deleted; `FdDerivative::judge` and `ladder_report` (`numeric_derivative.rs`)
 moved into `gam_test_support::FdDerivativeJudgement`; and `Tower4::third_contracted`
 and `fourth_contracted` (`jet_tower.rs`) moved into that file's `#[cfg(test)]`
 module.
+Jets also retired the eight identities deferred to it from `jet_tower.rs`
+(`cell_moving_boundary_flux_tower`, `compose_unary_single_slot`, `implicit_solve`,
+`moving_limit_boundary_tower`, `moving_limit_boundary_tower_theta_integrand`,
+`substitute_intercept`, `trigamma_derivative_stack`, `verify_kernel_channels`):
+nothing that survived defines or calls them.
 
 Three restorations were adapted rather than taken verbatim:
 
