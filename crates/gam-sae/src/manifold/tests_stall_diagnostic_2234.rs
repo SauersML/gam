@@ -137,7 +137,6 @@ fn zz_planted_circle_plain_engine_stall_diagnostic_2234() {
         native_ard_enabled: true,
         seed_refine_routing: minimal.refine_routing,
         seed_refine_random_state: 45,
-        data_row_reseed: false,
         fit_config: SaeFitConfig::default(),
         temperature_schedule: None,
         fisher_metric: None,

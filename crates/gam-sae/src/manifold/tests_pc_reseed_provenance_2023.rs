@@ -1,155 +1,24 @@
-//! #2023 — the co-collapse reseed's seed provenance, with the positive control
-//! the acceptance bar has never had.
+//! #2023 — the co-collapse reseed draws from the residual's data rows or its graph
+//! harmonics, never from its principal components.
 //!
-//! #2023's bar is "no PC reseed events in the log". At `origin/main` before this
-//! module, that bar could not fail, for four independent reasons:
-//!
-//!   1. `BirthSeed::PrincipalComponent` is constructed NOWHERE in the tree —
-//!      every occurrence is its own definition, its own `matches!`, its own
-//!      `code()` arm, and doc comments.
-//!   2. `fit_drivers.rs`, which performs the live PC reseed, contained zero
-//!      references to the migration ledger, so the one path that can violate the
-//!      bar could not reach the counter.
-//!   3. `record_search_round` stamps every accepted structure-search birth
-//!      `BirthSeed::ResidualFactor` unconditionally — the seed is ASSERTED, not
-//!      observed.
-//!   4. `assert_no_pc_reseed`, named in the ledger's own header as the thing
-//!      that "fails loudly", did not exist.
-//!
-//! `b0e19d6e8` fixed (4) and gave the ledger's counter its own control. This
-//! module covers (2): `SaeManifoldTerm` now counts, per reseeded ATOM, which
-//! branch of `reseed_atoms_onto_distinct_residual_pcs` actually ran, and the
-//! tests below require BOTH branches to be observed firing.
-//!
-//! That two-sidedness is the point. A counter wired to a constant passes one arm
-//! and fails the other; a counter incremented in both branches fails whichever it
-//! does not belong to. Only a counter that tracks the branch actually taken
-//! passes both — and only then does a later reading of zero mean the reseed drew
-//! from data rows rather than meaning nobody was watching.
+//! #2023's architecture rule is "dead-atom resampling draws from high-residual data
+//! rows (k-SVD replacement rule), never from PCs". The reseed used to fall through
+//! to the principal-component seed for every set a data-row lever did not cover, and
+//! that lever was hard-coded off at every production entry. The reseed now reads the
+//! graph-harmonic seed for circle, torus and sphere sets and the worst-reconstructed
+//! rows for everything else. These tests pin the coordinates each arm must produce,
+//! on residuals where a principal-component seed produces different ones.
 
 use super::tests::{small_two_atom_periodic_term, trivial_k1_euclidean_term};
 use super::*;
 
-/// A chart-kind atom takes the PRINCIPAL-COMPONENT branch even with the #2023
-/// data-row lever switched ON, and the counter says so.
+/// A flat atom resamples from the WORST-RECONSTRUCTED data rows at every retry, and
+/// the retry index walks down that ranking.
 ///
-/// This is the arm that makes every downstream "no PC reseeds" reading
-/// meaningful, and it also pins the audit finding that motivated it: the
-/// data-row rule's `all_flat` guard admits only `EuclideanPatch | Linear`, so
-/// curved atoms — the ones Tier 2 is made of — can never take it. Enabling the
-/// lever and still landing on PCA is not a bug here; it is the documented
-/// behaviour, and pinning it stops the lever from being mistaken for a
-/// fit-wide switch.
-#[test]
-fn chart_atoms_reseed_from_principal_components_even_with_the_lever_on_2023() {
-    let (mut term, target, rho) = small_two_atom_periodic_term();
-    // The lever ON, so a counter that merely mirrored the flag would fail here.
-    term.set_data_row_reseed(true);
-    assert_eq!(term.pc_reseeded_atoms, 0, "#2023: fresh terms have reseeded nothing");
-    assert_eq!(term.data_row_reseeded_atoms, 0);
-
-    // A large `pc_pair_offset` also clears the exhausted-pool condition, so the
-    // ONLY thing sending this to the PCA branch is the atoms' chart kind.
-    term.reseed_atoms_onto_distinct_residual_pcs(&[0, 1], target.view(), &rho, 8)
-        .expect("#2023: the periodic fixture must reseed onto residual PCs");
-
-    assert_eq!(
-        term.pc_reseeded_atoms, 2,
-        "#2023: the PC branch must count the ATOMS it reseeded (2), not the call (1) — \
-         one exhausted-pool retry that re-plants several atoms on the same leading PCs \
-         is several chances to re-collapse"
-    );
-    assert_eq!(
-        term.data_row_reseeded_atoms, 0,
-        "#2023: the data-row branch did not run and must not be credited"
-    );
-
-    // Accumulates across retries: the bar is over the whole fit's history, so a
-    // second reseed must add rather than replace.
-    term.reseed_atoms_onto_distinct_residual_pcs(&[0], target.view(), &rho, 9)
-        .expect("#2023: a second reseed must succeed");
-    assert_eq!(
-        term.pc_reseeded_atoms, 3,
-        "#2023: seed provenance accumulates over the fit; it is never reset, so a later \
-         reseed cannot launder an earlier one"
-    );
-}
-
-/// A flat atom, the lever ON, and the PC pool exhausted takes the DATA-ROW
-/// branch — and the counter attributes it there rather than to PCs.
-///
-/// Without this arm the test above is satisfied by a counter that is simply
-/// incremented unconditionally.
-#[test]
-fn flat_atoms_past_the_exhausted_pc_pool_reseed_from_data_rows_2023() {
-    let mut term = trivial_k1_euclidean_term();
-    let n = term.n_obs();
-    let p = term.output_dim();
-    // A residual with structure in every output direction, so neither branch is
-    // degenerate on this fixture.
-    let target =
-        Array2::<f64>::from_shape_fn((n, p), |(row, col)| ((row + 1) as f64) * 0.25 - (col as f64) * 0.1);
-    let rho = SaeManifoldRho::new(0.0, 0.0, vec![Array1::<f64>::zeros(1)]);
-    term.set_data_row_reseed(true);
-
-    // `pc_pairs = min(p, n) / 2`; an offset at or past it is the exhausted pool
-    // the data-row rule exists for.
-    let pc_pairs = p.min(n) / 2;
-    term.reseed_atoms_onto_distinct_residual_pcs(&[0], target.view(), &rho, pc_pairs.max(1))
-        .expect("#2023: the euclidean fixture must reseed from data rows");
-
-    assert_eq!(
-        term.data_row_reseeded_atoms, 1,
-        "#2023: a flat atom past the exhausted PC pool with the lever on must be \
-         attributed to the DATA-ROW branch"
-    );
-    assert_eq!(
-        term.pc_reseeded_atoms, 0,
-        "#2023: the PC branch did not run and must not be credited — a counter \
-         incremented unconditionally fails here"
-    );
-}
-
-/// The lever OFF is the shipped default, and it sends a flat atom to the PC
-/// branch however exhausted the pool is.
-///
-/// This is the audit's headline in executable form: the #2023 replacement rule
-/// is implemented but `data_row_reseed` defaults to `false`, so the PC reseed —
-/// #1893's mechanism, the one this issue exists to remove — is what production
-/// runs today.
-#[test]
-fn the_data_row_rule_is_opt_in_so_the_default_is_still_a_pc_reseed_2023() {
-    let mut term = trivial_k1_euclidean_term();
-    let n = term.n_obs();
-    let p = term.output_dim();
-    let target =
-        Array2::<f64>::from_shape_fn((n, p), |(row, col)| ((row + 1) as f64) * 0.25 - (col as f64) * 0.1);
-    let rho = SaeManifoldRho::new(0.0, 0.0, vec![Array1::<f64>::zeros(1)]);
-    // Deliberately NOT calling `set_data_row_reseed` — this is the default a
-    // production fit gets.
-    term.reseed_atoms_onto_distinct_residual_pcs(&[0], target.view(), &rho, p.min(n).max(1))
-        .expect("#2023: the default path must still reseed");
-
-    assert_eq!(
-        term.pc_reseeded_atoms, 1,
-        "#2023: with the lever at its DEFAULT the reseed draws from principal \
-         components — this is the live #1893 mechanism, and the counter is what \
-         makes its presence a measurement rather than an assertion"
-    );
-    assert_eq!(term.data_row_reseeded_atoms, 0);
-}
-
-/// With the lever ON a flat atom resamples from the WORST-RECONSTRUCTED data rows at
-/// every retry, not only once the PC pool is exhausted, and the retry index walks
-/// down that ranking.
-///
-/// The residual is planted so the ranking is known by construction. The fixture's
-/// decoder is zero, so the reconstruction residual is `-target`, whose row energies
-/// are 0.25, 0.64, 4.0 and 1.44: the order is rows [2, 3, 1, 0]. In this residual no
-/// row's similarity to an anchor exceeds the anchor's own, so the anchor row lands at
-/// exactly `+0.5`. Before this rule both arms failed on the same calls: at retry 0
-/// the data-row branch waited for the pool to empty (`pc_pairs = min(n, p) / 2 = 1`),
-/// and at retry 1 the anchor was index arithmetic, row 1, not the second-worst row.
+/// The fixture's decoder is zero, so the reconstruction residual is `-target`, whose
+/// row energies are 0.25, 0.64, 4.0 and 1.44: the order is rows [2, 3, 1, 0]. The
+/// rows are axis-aligned, so an anchor row's projection is non-zero only on its own
+/// axis and the anchor lands at exactly `+0.5`.
 #[test]
 fn flat_atoms_reseed_from_the_worst_reconstructed_rows_at_every_retry_2023() {
     let mut term = trivial_k1_euclidean_term();
@@ -165,16 +34,9 @@ fn flat_atoms_reseed_from_the_worst_reconstructed_rows_at_every_retry_2023() {
         [1.2, 0.0, 0.0],
     ];
     let rho = SaeManifoldRho::new(0.0, 0.0, vec![Array1::<f64>::zeros(1)]);
-    term.set_data_row_reseed(true);
 
-    term.reseed_atoms_onto_distinct_residual_pcs(&[0], target.view(), &rho, 0)
+    term.reseed_atoms_from_residual(&[0], target.view(), &rho, 0)
         .expect("#2023: the first reseed must succeed");
-    assert_eq!(
-        (term.data_row_reseeded_atoms, term.pc_reseeded_atoms),
-        (1, 0),
-        "#2023: with the lever on, the FIRST reseed of a flat atom must already draw \
-         from data rows"
-    );
     let coords = term.assignment.coords[0].as_matrix();
     assert_eq!(
         coords[[2, 0]],
@@ -182,18 +44,133 @@ fn flat_atoms_reseed_from_the_worst_reconstructed_rows_at_every_retry_2023() {
         "#2023: retry 0 must anchor at the worst-reconstructed row, row 2: {coords:?}"
     );
 
-    term.reseed_atoms_onto_distinct_residual_pcs(&[0], target.view(), &rho, 1)
+    term.reseed_atoms_from_residual(&[0], target.view(), &rho, 1)
         .expect("#2023: the second reseed must succeed");
-    assert_eq!(
-        (term.data_row_reseeded_atoms, term.pc_reseeded_atoms),
-        (2, 0),
-        "#2023: every retry of a flat atom with the lever on draws from data rows"
-    );
     let coords = term.assignment.coords[0].as_matrix();
     assert_eq!(
         coords[[3, 0]],
         0.5,
         "#2023: retry 1 must anchor at the second-worst row, row 3, instead of \
          re-anchoring on row 2: {coords:?}"
+    );
+}
+
+/// On a residual whose worst row and leading principal direction disagree, a flat
+/// reseed follows the worst row.
+///
+/// Rows 0..=2 of the target spread along the first output axis, which carries most of
+/// the centred residual's variance (covariance `[[2.75, -0.375], [-0.375, 1.6875]]`
+/// on the first two axes), while row 3 is the single worst-reconstructed row and lies
+/// on the second axis. Anchored at row 3, rows 0..=2 project to zero and read `-0.5`,
+/// and row 3 reads `+0.5`. The principal-component seed of the same residual is
+/// computed as the control: it separates row 0 from row 1, so a reseed that read
+/// principal components would fail the first assertion.
+#[test]
+fn flat_reseed_follows_the_worst_row_where_principal_components_disagree_2023() {
+    let mut term = trivial_k1_euclidean_term();
+    let target = ndarray::array![
+        [1.0, 0.0, 0.0],
+        [-1.0, 0.0, 0.0],
+        [1.0, 0.0, 0.0],
+        [0.0, 1.5, 0.0],
+    ];
+    let rho = SaeManifoldRho::new(0.0, 0.0, vec![Array1::<f64>::zeros(1)]);
+    let residual = term
+        .reconstruction_residual(target.view(), &rho)
+        .expect("#2023: the fixture's residual must evaluate");
+
+    term.reseed_atoms_from_residual(&[0], target.view(), &rho, 0)
+        .expect("#2023: the reseed must succeed");
+    let coords = term.assignment.coords[0].as_matrix();
+    assert_eq!(
+        (coords[[0, 0]], coords[[1, 0]], coords[[2, 0]], coords[[3, 0]]),
+        (-0.5, -0.5, -0.5, 0.5),
+        "#2023: the reseed must anchor at the worst row (row 3), not along the leading \
+         principal direction: {coords:?}"
+    );
+
+    let principal = sae_pca_seed_initial_coords_with_pc_offset(
+        residual.view(),
+        &[SaeAtomBasisKind::EuclideanPatch],
+        &[1],
+        0,
+    )
+    .expect("#2023: the control principal-component seed must evaluate");
+    assert!(
+        (principal[[0, 0, 0]] - principal[[0, 1, 0]]).abs() > 0.5,
+        "#2023: the control must discriminate — the principal-component seed separates \
+         rows 0 and 1 on this residual: {principal:?}"
+    );
+}
+
+/// Circle atoms reseed from the residual graph's harmonics: the reseeded coordinates
+/// are exactly the harmonic seed of the residual at the same retry.
+#[test]
+fn circle_atoms_reseed_from_the_residual_graph_harmonics_2023() {
+    let (mut term, target, rho) = small_two_atom_periodic_term();
+    let residual = term
+        .reconstruction_residual(target.view(), &rho)
+        .expect("#2023: the fixture's residual must evaluate");
+    let kinds = vec![
+        term.atoms[0].basis_kind().clone(),
+        term.atoms[1].basis_kind().clone(),
+    ];
+    let dims = vec![term.atoms[0].latent_dim(), term.atoms[1].latent_dim()];
+    let expected = topology_curved_seed_initial_coords(residual.view(), &kinds, &dims, 1)
+        .expect("#2023: the harmonic seed must evaluate")
+        .expect("#2023: five rows admit the residual's kNN graph");
+
+    term.reseed_atoms_from_residual(&[0, 1], target.view(), &rho, 1)
+        .expect("#2023: the periodic fixture must reseed");
+    for atom in 0..2 {
+        let coords = term.assignment.coords[atom].as_matrix();
+        for row in 0..term.n_obs() {
+            assert_eq!(
+                coords[[row, 0]],
+                expected[[atom, row, 0]],
+                "#2023: atom {atom} row {row} must carry the harmonic seed"
+            );
+        }
+    }
+}
+
+/// A chart the harmonic seed does not cover (RP²) reseeds from data rows: every row is
+/// a unit ambient 3-vector, and the worst-reconstructed row points along the first
+/// frame direction, because its projections on the later Gram–Schmidt directions are
+/// zero.
+#[test]
+fn projective_plane_reseed_rows_are_unit_vectors_anchored_at_the_worst_row_2023() {
+    let n = 6usize;
+    let p = 4usize;
+    let residual = Array2::<f64>::from_shape_fn((n, p), |(row, col)| {
+        ((row * 5 + col * 3) as f64 * 0.7).sin() + 0.1 * (row as f64)
+    });
+    let worst = (0..n)
+        .max_by(|&a, &b| {
+            let ea: f64 = residual.row(a).iter().map(|v| v * v).sum();
+            let eb: f64 = residual.row(b).iter().map(|v| v * v).sum();
+            ea.total_cmp(&eb).then_with(|| b.cmp(&a))
+        })
+        .expect("#2023: the residual has rows");
+
+    let seed = sae_data_row_anchored_coords(
+        residual.view(),
+        &[SaeAtomBasisKind::ProjectivePlane],
+        &[2],
+        0,
+    )
+    .expect("#2023: the RP² data-row seed must evaluate");
+    assert_eq!(seed.dim(), (1, n, 3), "#2023: RP² stores its ambient 3-vector");
+    for row in 0..n {
+        let norm = (0..3).map(|axis| seed[[0, row, axis]].powi(2)).sum::<f64>().sqrt();
+        assert!(
+            (norm - 1.0).abs() <= 1.0e-12,
+            "#2023: row {row} must lie on the unit sphere, norm {norm}"
+        );
+    }
+    let anchor = (seed[[0, worst, 0]], seed[[0, worst, 1]], seed[[0, worst, 2]]);
+    assert!(
+        (anchor.0 - 1.0).abs() <= 1.0e-12 && anchor.1.abs() <= 1.0e-12 && anchor.2.abs() <= 1.0e-12,
+        "#2023: the worst row {worst} must read the first frame direction, got {anchor:?}"
     );
 }

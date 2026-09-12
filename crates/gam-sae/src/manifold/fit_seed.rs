@@ -111,7 +111,6 @@ pub struct SaeFitSeedRequest<'a, 'context> {
     pub native_ard_enabled: bool,
     pub seed_refine_routing: bool,
     pub seed_refine_random_state: u64,
-    pub data_row_reseed: bool,
     pub fit_config: SaeFitConfig,
     pub temperature_schedule: Option<GumbelTemperatureSchedule>,
     pub fisher_metric: Option<SaeFisherRowMetricRequest<'a>>,
@@ -330,7 +329,6 @@ pub fn build_sae_fit_seed(request: SaeFitSeedRequest<'_, '_>) -> Result<SaeFitSe
         &coord_blocks,
         mode,
     )?;
-    base_term.set_data_row_reseed(request.data_row_reseed);
     base_term.set_fit_config(request.fit_config);
     if let Some(schedule) = request.temperature_schedule {
         base_term.set_temperature_schedule(schedule)?;
@@ -457,7 +455,6 @@ mod tests {
             native_ard_enabled: true,
             seed_refine_routing: false,
             seed_refine_random_state: 0,
-            data_row_reseed: false,
             fit_config: SaeFitConfig::default(),
             temperature_schedule: None,
             fisher_metric: None,

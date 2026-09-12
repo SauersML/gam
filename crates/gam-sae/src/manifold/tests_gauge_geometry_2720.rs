@@ -201,7 +201,6 @@ fn seeded_term_of_kind(
         native_ard_enabled: true,
         seed_refine_routing: minimal.refine_routing,
         seed_refine_random_state: 45,
-        data_row_reseed: false,
         fit_config: SaeFitConfig::default(),
         temperature_schedule: None,
         fisher_metric: None,

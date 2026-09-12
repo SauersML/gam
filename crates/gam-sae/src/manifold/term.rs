@@ -592,26 +592,6 @@ pub struct SaeManifoldTerm {
     /// ledger in [`Self::collapse_events`] because a co-collapse reseed is a
     /// whole-dictionary multi-start, not a per-atom second chance.
     pub(crate) dictionary_cocollapse_reseeds: usize,
-    /// #2023 — how many atoms the co-collapse reseed has re-seeded from
-    /// PRINCIPAL COMPONENTS of the reconstruction residual, and how many from
-    /// DATA ROWS. Counted per reseeded ATOM at the branch actually taken in
-    /// [`Self::reseed_atoms_onto_distinct_residual_pcs`], not per call: one
-    /// exhausted-pool retry that re-plants four atoms on the same leading PCs is
-    /// four chances to re-collapse, and a per-call count would report it as one.
-    ///
-    /// These exist because #2023's acceptance bar — "no PC reseed events in the
-    /// log" — was previously unfalsifiable. `BirthSeed::PrincipalComponent` had
-    /// no constructor anywhere, the file performing the reseed never referenced
-    /// the migration ledger, and the structure-search recorder stamped every
-    /// birth `ResidualFactor` unconditionally. The seed was ASSERTED, never
-    /// observed. A counter incremented on the branch taken is the smallest thing
-    /// that lets the bar fail; until it can fail, a zero reading measures nothing.
-    ///
-    /// Never reset. The bar is over the whole fit's history, so a later
-    /// data-row reseed must not be able to launder an earlier PC one — which is
-    /// why these are not cleared alongside the collapse budgets above.
-    pub(crate) pc_reseeded_atoms: usize,
-    pub(crate) data_row_reseeded_atoms: usize,
     /// #2267/#2762 — the inner solver's complete globalization state, carried
     /// across re-entries of the joint fit.
     ///
@@ -817,10 +797,6 @@ pub struct SaeManifoldTerm {
     /// Chunk terms inherit the parent's sample (`materialize_chunk`), so a chunk
     /// can never plan against a different environment than the fit it belongs to.
     pub(crate) host_available_bytes: usize,
-    /// #2023 — persisted per-fit opt-in for the dead-atom DATA-ROW reseed
-    /// (default false). Set from the FFI via the typed `data_row_reseed` kwarg —
-    /// no env lever. Carried across clones.
-    pub(crate) data_row_reseed: bool,
     /// SAC — whether the #976 Layer-1 collapse-guard stack (active-mass /
     /// decoder-norm re-seed, co-collapse reseed-all) is armed on this term's
     /// inner joint fits. Default `true` (bit-for-bit historical path). The
@@ -917,11 +893,6 @@ impl Clone for SaeManifoldTerm {
             criterion_gauge_deflation_last_delta_sign: self
                 .criterion_gauge_deflation_last_delta_sign,
             dictionary_cocollapse_reseeds: self.dictionary_cocollapse_reseeds,
-            // #2023 — seed provenance is part of the persisted term identity: a
-            // clone that forgot a PC reseed would let the bar pass on a fit that
-            // had one.
-            pc_reseeded_atoms: self.pc_reseeded_atoms,
-            data_row_reseeded_atoms: self.data_row_reseeded_atoms,
             // Transient globalization hint — a fresh clone re-establishes the
             // whole line-search/trust-region state together.
             inner_globalization_hint: None,
@@ -951,7 +922,6 @@ impl Clone for SaeManifoldTerm {
             separation_barrier_strength_override: self.separation_barrier_strength_override,
             gpu_policy: self.gpu_policy,
             host_available_bytes: self.host_available_bytes,
-            data_row_reseed: self.data_row_reseed,
             guards_enabled: self.guards_enabled,
             // Rung-2 behavioral identity is persisted configuration (like the
             // assignment mode / barrier override), carried across clones so a

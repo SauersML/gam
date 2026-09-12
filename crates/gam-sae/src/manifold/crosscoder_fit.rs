@@ -562,7 +562,6 @@ pub fn run_auto_sae_crosscoder_fit(
         native_ard_enabled: true,
         seed_refine_routing: refine_routing,
         seed_refine_random_state: request.config.random_state,
-        data_row_reseed: false,
         fit_config: SaeFitConfig::default(),
         temperature_schedule: None,
         fisher_metric: None,

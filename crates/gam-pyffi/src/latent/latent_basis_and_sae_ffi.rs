@@ -1828,7 +1828,6 @@ fn sae_manifold_fit_inner<'py>(
         native_ard_enabled,
         seed_refine_routing,
         seed_refine_random_state,
-        data_row_reseed: false,
         fit_config: gam::terms::sae::manifold::SaeFitConfig {
             separation_barrier_strength_override,
             ordered_beta_bernoulli_alpha_override: None,

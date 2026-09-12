@@ -163,8 +163,9 @@ fn squared_distance_rows(z: ArrayView2<'_, f64>, a: usize, b: usize) -> f64 {
 /// Laplacian eigenfunctions are the discrete harmonic representatives; reading
 /// their phases gives circle/torus coordinates, while normalizing the first
 /// three gives a sphere chart.  If the graph is too small/degenerate this returns
-/// `Ok(None)` and the caller falls back to the older PCA seed.
-fn topology_curved_seed_initial_coords(
+/// `Ok(None)`: the cold-start seed then reads principal components, and the
+/// co-collapse reseed reads data rows ([`sae_data_row_anchored_coords`]).
+pub(crate) fn topology_curved_seed_initial_coords(
     z: ArrayView2<'_, f64>,
     basis_kinds: &[SaeAtomBasisKind],
     atom_dim: &[usize],
@@ -952,39 +953,75 @@ pub fn sae_pca_seed_initial_coords_with_pc_offset(
     Ok(out)
 }
 
-/// #2023 — DATA-ROW-anchored seed for flat (Euclidean/Linear) dead atoms.
-///
-/// The PCA reseed ([`sae_pca_seed_initial_coords_with_pc_offset`]) draws its
-/// per-atom / per-retry diversity from principal-component pairs, of which there
-/// are only `≈ min(n, p) / 2`. A co-collapsed dictionary leaves residual ≈
-/// target, so every multi-start retry re-SVDs the same matrix and, once the
-/// retry offset wraps the PC pool, re-reads the SAME leading components → the
-/// joint LSQ relaxes into the SAME degenerate basin. That p/2 ceiling is the
-/// co-collapse reseed-duplication spiral.
+/// Chart functions one atom's data-row reseed reads: one direction per flat axis,
+/// a phase plane for the leading circle axis plus one direction per extra flat axis
+/// of a `d > 1` periodic atom, a phase plane per torus axis, and a 3-frame for the
+/// ambient `S²` / `RP²` charts.
+fn data_row_seed_need(kind: &SaeAtomBasisKind, d: usize) -> usize {
+    match kind {
+        SaeAtomBasisKind::Periodic => 2 + d.max(1).saturating_sub(1),
+        SaeAtomBasisKind::Torus => 2 * d.max(1),
+        SaeAtomBasisKind::Sphere | SaeAtomBasisKind::ProjectivePlane => 3,
+        _ => d.max(1),
+    }
+}
+
+/// Write `values` into `out[[slot, row, axis]]` min-max normalised to
+/// `[-0.5, 0.5]`, the flat-axis convention of the PCA seed. A constant projection
+/// leaves the axis at zero.
+fn write_min_max_axis(out: &mut Array3<f64>, slot: usize, axis: usize, values: &Array1<f64>) {
+    let (min_v, max_v) = values
+        .iter()
+        .fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), &v| {
+            (lo.min(v), hi.max(v))
+        });
+    let span = max_v - min_v;
+    if span > 0.0 {
+        for (row, &value) in values.iter().enumerate() {
+            out[[slot, row, axis]] = (value - min_v) / span - 0.5;
+        }
+    }
+}
+
+/// #2023 — DATA-ROW-anchored reseed coordinates for dead atoms of every chart kind.
 ///
 /// #2023's architecture resamples a dead atom from the data rows the dictionary
-/// reconstructs WORST (the k-SVD replacement rule), the rule the sparse-dictionary
-/// lane's dead-atom revival already uses (`sparse_dict::update::revive_dead_atoms`).
+/// reconstructs WORST (the k-SVD replacement rule, the rule the sparse-dictionary
+/// lane's dead-atom revival already uses in `sparse_dict::update::revive_dead_atoms`),
+/// never from principal components of the residual: a co-collapsed dictionary leaves
+/// residual ≈ target, so a principal-component reseed reads the same few leading
+/// directions on every retry.
+///
 /// Rows are ranked by descending residual energy `‖residual_i‖²`, ties by ascending
-/// index, and the `t`-th latent axis in atom order anchors at ranked row
-/// `(retry · Σd + t) mod n`: every axis of every atom takes a distinct row, and a
-/// multi-start retry reads the next block of worst rows instead of re-anchoring on
-/// the rows that just re-collapsed. There are `n ≫ p` rows, so the diversity domain
-/// is unbounded. Each row `i`'s latent coordinate on an axis is its residual
-/// SIMILARITY to the anchor row, `<residual_i, residual_anchor>`, min-max normalized
-/// to `[-0.5, 0.5]` — the exact convention of the Euclidean/Linear branch of the PCA
-/// seed, so a downstream refit sees a same-shaped (just more diverse) seed. Returns
-/// the padded `(K, n, d_max)` coordinate array; non-flat kinds are the caller's
-/// responsibility (it keeps them on the PCA path). Rejects non-finite residuals up
-/// front.
-pub fn sae_data_row_anchored_euclidean_coords(
+/// index. Atom slots take consecutive ranked rows starting at `retry · Σ need` (mod
+/// `n`), where `need` is the number of chart functions the atom reads
+/// (`data_row_seed_need`), so every chart function of every atom reads its own row
+/// and a multi-start retry reads the next block of worst rows. Within one atom the
+/// anchor rows are Gram–Schmidt orthonormalised; a row within `SURPLUS_DIR_FLOOR` of
+/// the span of the atom's earlier anchors is passed over for the next ranked row.
+/// Every residual row is projected onto the atom's frame and read with the PCA seed's
+/// chart conventions: a flat axis is the projection min-max normalised to
+/// `[-0.5, 0.5]`; a circle axis is the phase `atan2(b, a)` of a 2-plane in `[0, 1)`,
+/// or the min-max phase when only one direction exists; an `S²` / `RP²` row is the
+/// unit 3-vector of its 3-frame projection. A chart function with no independent row
+/// left stays at zero. Returns the padded `(K, n, D_max)` coordinate array and
+/// rejects non-finite residuals up front.
+pub fn sae_data_row_anchored_coords(
     residual: ArrayView2<'_, f64>,
+    basis_kinds: &[SaeAtomBasisKind],
     atom_dim: &[usize],
     retry: usize,
 ) -> Result<Array3<f64>, String> {
-    let k_atoms = atom_dim.len();
+    if basis_kinds.len() != atom_dim.len() {
+        return Err(format!(
+            "sae_data_row_anchored_coords: {} basis kinds but {} atom dimensions",
+            basis_kinds.len(),
+            atom_dim.len()
+        ));
+    }
+    let k_atoms = basis_kinds.len();
     let (n_obs, p_out) = residual.dim();
-    let d_max = atom_dim.iter().copied().max().unwrap_or(1).max(1);
+    let d_max = seed_storage_d_max(basis_kinds, atom_dim);
     let mut out = Array3::<f64>::zeros((k_atoms, n_obs, d_max));
     if n_obs == 0 || p_out == 0 {
         return Ok(out);
@@ -992,7 +1029,7 @@ pub fn sae_data_row_anchored_euclidean_coords(
     for ((row, col), &value) in residual.indexed_iter() {
         if !value.is_finite() {
             return Err(format!(
-                "sae_data_row_anchored_euclidean_coords: residual must be finite; \
+                "sae_data_row_anchored_coords: residual must be finite; \
                  residual[{row}, {col}] = {value}"
             ));
         }
@@ -1003,37 +1040,103 @@ pub fn sae_data_row_anchored_euclidean_coords(
     }
     let mut ranked: Vec<usize> = (0..n_obs).collect();
     ranked.sort_by(|&a, &b| energy[b].total_cmp(&energy[a]).then_with(|| a.cmp(&b)));
-    let axes_per_retry: usize = atom_dim.iter().sum();
-    let skip = (retry % n_obs) * (axes_per_retry % n_obs) % n_obs;
-    let mut axis_index = 0usize;
-    let mut sim = vec![0.0_f64; n_obs];
+    let needs: Vec<usize> = basis_kinds
+        .iter()
+        .zip(atom_dim.iter())
+        .map(|(kind, &d)| if d == 0 { 0 } else { data_row_seed_need(kind, d) })
+        .collect();
+    let needs_per_retry: usize = needs.iter().sum();
+    let mut cursor = (retry % n_obs) * (needs_per_retry % n_obs) % n_obs;
+    let two_pi = std::f64::consts::TAU;
     for slot in 0..k_atoms {
-        let d = atom_dim[slot];
-        if d == 0 {
+        let need = needs[slot];
+        if need == 0 {
             continue;
         }
-        for axis in 0..d {
-            let anchor = ranked[(skip + axis_index) % n_obs];
-            axis_index += 1;
-            let mut min_v = f64::INFINITY;
-            let mut max_v = f64::NEG_INFINITY;
-            for i in 0..n_obs {
-                let mut dot = 0.0_f64;
-                for col in 0..p_out {
-                    dot += residual[[i, col]] * residual[[anchor, col]];
+        let mut frame: Vec<Array1<f64>> = Vec::with_capacity(need);
+        let mut scanned = 0usize;
+        while frame.len() < need && scanned < n_obs {
+            let anchor = ranked[cursor];
+            cursor = (cursor + 1) % n_obs;
+            scanned += 1;
+            let mut direction = residual.row(anchor).to_owned();
+            let norm = direction.dot(&direction).sqrt();
+            if !(norm > 0.0) {
+                continue;
+            }
+            direction.mapv_inplace(|x| x / norm);
+            for earlier in &frame {
+                let overlap = direction.dot(earlier);
+                direction.scaled_add(-overlap, earlier);
+            }
+            let rest = direction.dot(&direction).sqrt();
+            if rest > SURPLUS_DIR_FLOOR {
+                direction.mapv_inplace(|x| x / rest);
+                frame.push(direction);
+            }
+        }
+        let projections: Vec<Array1<f64>> =
+            frame.iter().map(|direction| residual.dot(direction)).collect();
+        let d = atom_dim[slot];
+        match &basis_kinds[slot] {
+            SaeAtomBasisKind::Periodic => {
+                match (projections.first(), projections.get(1)) {
+                    (Some(a), Some(b)) => {
+                        for row in 0..n_obs {
+                            let phase = b[row].atan2(a[row]) / two_pi;
+                            out[[slot, row, 0]] = phase - phase.floor();
+                        }
+                    }
+                    (Some(a), None) => {
+                        let (min_v, max_v) = a
+                            .iter()
+                            .fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), &v| {
+                                (lo.min(v), hi.max(v))
+                            });
+                        let span = max_v - min_v;
+                        if span > 0.0 {
+                            for row in 0..n_obs {
+                                let phase = (a[row] - min_v) / span;
+                                out[[slot, row, 0]] = phase - phase.floor();
+                            }
+                        }
+                    }
+                    (None, _) => {}
                 }
-                sim[i] = dot;
-                if dot < min_v {
-                    min_v = dot;
-                }
-                if dot > max_v {
-                    max_v = dot;
+                for axis in 1..d {
+                    let Some(values) = projections.get(axis + 1) else {
+                        break;
+                    };
+                    write_min_max_axis(&mut out, slot, axis, values);
                 }
             }
-            let span = max_v - min_v;
-            if span > 0.0 {
-                for i in 0..n_obs {
-                    out[[slot, i, axis]] = (sim[i] - min_v) / span - 0.5;
+            SaeAtomBasisKind::Torus => {
+                for axis in 0..d {
+                    let (Some(a), Some(b)) = (projections.get(2 * axis), projections.get(2 * axis + 1))
+                    else {
+                        break;
+                    };
+                    for row in 0..n_obs {
+                        let phase = b[row].atan2(a[row]) / two_pi;
+                        out[[slot, row, axis]] = phase - phase.floor();
+                    }
+                }
+            }
+            SaeAtomBasisKind::Sphere | SaeAtomBasisKind::ProjectivePlane => {
+                if projections.is_empty() {
+                    continue;
+                }
+                for row in 0..n_obs {
+                    let mut amb = [0.0_f64; 3];
+                    for (i, values) in projections.iter().enumerate().take(3) {
+                        amb[i] = values[row];
+                    }
+                    write_ambient_sphere_row(&mut out, slot, row, amb[0], amb[1], amb[2]);
+                }
+            }
+            _ => {
+                for (axis, values) in projections.iter().enumerate().take(d) {
+                    write_min_max_axis(&mut out, slot, axis, values);
                 }
             }
         }
@@ -1321,8 +1424,13 @@ mod tests {
         // p successive retries (> pc_pairs = 2) must yield > pc_pairs distinct seeds.
         let mut seeds = std::collections::HashSet::new();
         for retry in 0..p {
-            let s = sae_data_row_anchored_euclidean_coords(residual.view(), &dims, retry)
-                .expect("data-row seed");
+            let s = sae_data_row_anchored_coords(
+                residual.view(),
+                &[SaeAtomBasisKind::Linear],
+                &dims,
+                retry,
+            )
+            .expect("data-row seed");
             for v in s.iter() {
                 assert!(
                     v.is_finite() && *v >= -0.5 - 1e-12 && *v <= 0.5 + 1e-12,

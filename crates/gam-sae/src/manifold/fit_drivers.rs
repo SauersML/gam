@@ -4444,18 +4444,18 @@ impl SaeManifoldTerm {
                 self.best_cocollapse_incumbent =
                     Some((ev, candidate_uniformity, self.snapshot_mutable_state()));
             }
-            // Co-collapsed numerically or structurally. Reseed ALL atoms onto
-            // DISTINCT residual PCs — keeping no "anchor", because the same-state
-            // proof says there is no distinct healthy atom worth anchoring. The two
-            // properties an anchor was meant to provide are already supplied by
-            // the residual seeding itself:
+            // Co-collapsed numerically or structurally. Reseed ALL atoms from the
+            // residual — keeping no "anchor", because the same-state proof says
+            // there is no distinct healthy atom worth anchoring. The two properties
+            // an anchor was meant to provide are already supplied by the residual
+            // seeding itself:
             // (1) the residual is computed from the current (degenerate) fit, so
             // with EV≈0 it is ≈ the target and therefore non-degenerate; and
-            // (2) `reseed_atoms_onto_distinct_residual_pcs` assigns each atom slot
-            // its OWN disjoint residual-PC pair (the #671 rule), so the set cannot
-            // re-symmetrise into one basin in a single step. Reseeding all K onto K
-            // distinct PC pairs is the maximal-diversity multi-start — the
-            // strongest basin break available.
+            // (2) `reseed_atoms_from_residual` gives each atom slot its OWN chart
+            // functions (its own worst rows, or its own harmonic combination), so
+            // the set cannot re-symmetrise into one basin in a single step.
+            // Reseeding all K onto K distinct chart functions is the
+            // maximal-diversity multi-start — the strongest basin break available.
             //
             // Budget: a SINGLE maximal-diversity reseed still cannot always break a
             // K≥3 basin — one freshly-diversified start can re-symmetrise back into
@@ -4526,23 +4526,23 @@ impl SaeManifoldTerm {
                  upper bound={residual_scale_upper:.3e}, residual roundoff floor=\
                  {residual_roundoff_floor:.3e}, derived signal boundary=\
                  {signal_vanish_boundary:.3e}) with no relative-norm breach; \
-                 reseeding all {k} atoms onto distinct residual PCs (dictionary multi-start \
+                 reseeding all {k} atoms from the residual (dictionary multi-start \
                  {}/{SAE_DICTIONARY_COCOLLAPSE_RESEED_BUDGET}: total co-collapse, no atom \
                  carries material signal to anchor)",
                 self.dictionary_cocollapse_reseeds
             );
             let all: Vec<usize> = (0..k).collect();
-            // Each multi-start RETRY reads a DISJOINT principal subspace: attempt
-            // 1 (the first reseed) uses the top PC pairs (offset 0), attempt 2 the
-            // next pairs (offset 1), etc. Without this rotation every retry re-reads
-            // the same leading residual PCs — the residual is ≈ the target on every
+            // Each multi-start RETRY reads FRESH chart functions: the next block of
+            // worst-reconstructed rows, or the next generic combination of the
+            // residual graph's harmonics. Without this rotation every retry re-reads
+            // the same chart functions — the residual is ≈ the target on every
             // co-collapsed attempt — so the joint LSQ relaxes back into the SAME
             // degenerate basin and the budget-N multi-start is N IDENTICAL attempts
             // (the K=3 coin-flip). `dictionary_cocollapse_reseeds` was just
-            // incremented to this attempt's 1-based count, so the 0-based offset is
+            // incremented to this attempt's 1-based count, so the 0-based retry is
             // `… − 1`.
-            let pc_pair_offset = self.dictionary_cocollapse_reseeds.saturating_sub(1);
-            self.reseed_atoms_onto_distinct_residual_pcs(&all, target, rho, pc_pair_offset)?;
+            let retry = self.dictionary_cocollapse_reseeds.saturating_sub(1);
+            self.reseed_atoms_from_residual(&all, target, rho, retry)?;
             for atom in 0..k {
                 self.reseed_collapsed_atom_logits(atom);
                 self.collapse_events.push(CollapseEvent {
@@ -4590,7 +4590,7 @@ impl SaeManifoldTerm {
             // A reseed is therefore RETAINED only when it is the new best basin under
             // the SAME EV-then-uniformity ordering used to bank the incumbent
             // ([`prefer_candidate_basin`]); otherwise restore the incumbent so the
-            // next distinct-subspace retry (a fresh `pc_pair_offset`) reads the clean
+            // next distinct-subspace retry (a fresh `retry`) reads the clean
             // degenerate residual rather than a spiralling one. This never blocks a
             // genuine basin break — an improving reseed clears the guard and is kept,
             // exactly as the #2027 disjoint-signal fixtures require — and it is inert
@@ -4630,10 +4630,10 @@ impl SaeManifoldTerm {
         }
         // Decide which breached atoms still have reseed budget (recording a
         // Reseeded or Terminal collapse event for each), then reseed the budgeted
-        // set onto DISTINCT residual PCs in ONE pass. A per-atom top-PC reseed
-        // would collide multiple simultaneously-collapsed atoms onto the same
-        // residual direction and re-collapse them, so the batch seed (the #671
-        // disjoint-PC rule across atom slots) is what actually breaks the basin.
+        // set from the residual in ONE pass. Reseeding each atom on its own would
+        // collide simultaneously-collapsed atoms onto the same residual direction
+        // and re-collapse them, so the batch seed (its own chart functions per
+        // atom slot) is what actually breaks the basin.
         let mut to_reseed: Vec<usize> = Vec::new();
         for &atom in &breached {
             let reseeds_used = self
@@ -4667,9 +4667,9 @@ impl SaeManifoldTerm {
             }
         }
         if !to_reseed.is_empty() {
-            // Per-atom breach arm: a single budgeted reseed onto the top distinct
-            // residual PCs — no multi-start rotation (offset 0).
-            self.reseed_atoms_onto_distinct_residual_pcs(&to_reseed, target, rho, 0)?;
+            // Per-atom breach arm: a single budgeted reseed from the residual — no
+            // multi-start rotation (retry 0).
+            self.reseed_atoms_from_residual(&to_reseed, target, rho, 0)?;
             for &atom in &to_reseed {
                 self.reseed_collapsed_atom_logits(atom);
             }
@@ -4750,86 +4750,53 @@ impl SaeManifoldTerm {
         Ok(1.0 - ss_res / ss_tot)
     }
 
-    /// Reseed a set of collapsed atoms onto DISTINCT principal directions of the
-    /// current reconstruction residual in one pass, reusing the production #671
-    /// disjoint-PC seeding ([`sae_pca_seed_initial_coords`], which assigns atom
-    /// slot `j` its own PC pair). Seeding each collapsed atom independently would
-    /// hand them all the SAME top residual PC and re-collapse the set, so the
-    /// simultaneous-collapse arm seeds them together. A single-element `atoms`
-    /// slice is the one-atom case (the atom seeded onto the top residual PC).
-    /// Only the reseeded atoms' coordinates and basis caches move; decoders are
-    /// left for the caller's joint LSQ refit.
-    pub(crate) fn reseed_atoms_onto_distinct_residual_pcs(
+    /// Reseed a set of collapsed atoms from the current reconstruction residual in
+    /// one pass (#2023), through [`Self::reseed_charts_from_residual`]. Only the
+    /// reseeded atoms' coordinates and basis caches move; decoders are left for the
+    /// caller's refit.
+    pub(crate) fn reseed_atoms_from_residual(
         &mut self,
         atoms: &[usize],
         target: ArrayView2<'_, f64>,
         rho: &SaeManifoldRho,
-        pc_pair_offset: usize,
+        retry: usize,
     ) -> Result<(), String> {
         if atoms.is_empty() {
             return Ok(());
         }
         let residual = self.reconstruction_residual(target, rho)?;
+        self.reseed_charts_from_residual(atoms, residual.view(), retry)
+    }
+
+    /// Write reseed charts for `atoms` from `residual` in one pass (#2023).
+    ///
+    /// A set containing a circle, torus or sphere atom reads the graph-harmonic
+    /// coordinates of the residual's kNN graph
+    /// ([`topology_curved_seed_initial_coords`]); every other set, and any set whose
+    /// graph is unavailable (fewer than four rows, or a degenerate graph), resamples
+    /// from the worst-reconstructed data rows ([`sae_data_row_anchored_coords`]).
+    /// Both constructions give atom slot `j` its own chart functions and move to
+    /// fresh ones on each `retry`, so atoms that collapsed together are not re-planted
+    /// on one direction. Neither reads a principal component of the residual: a
+    /// co-collapsed dictionary leaves residual ≈ target, and its principal
+    /// components are the same few leading directions on every retry.
+    fn reseed_charts_from_residual(
+        &mut self,
+        atoms: &[usize],
+        residual: ArrayView2<'_, f64>,
+        retry: usize,
+    ) -> Result<(), String> {
         let basis_kinds: Vec<SaeAtomBasisKind> = atoms
             .iter()
             .map(|&a| self.atoms[a].basis_kind().clone())
             .collect();
         let dims: Vec<usize> = atoms.iter().map(|&a| self.atoms[a].latent_dim()).collect();
-        // `pc_pair_offset` rotates the residual-PC assignment so a co-collapse
-        // multi-start RETRY (offset = retry index) reads a disjoint principal
-        // subspace from the previous attempt; the per-atom breach arm passes 0
-        // (its single reseed needs no rotation). On the data-row branch the same
-        // index selects the next block of worst-reconstructed rows.
         let n = self.n_obs();
-        // #2023 dead-atom DATA-ROW reseed (the typed, default-off lever
-        // `data_row_reseed`). The PCA reseed's diversity is capped at ≈ min(n, p)/2
-        // principal pairs, and a co-collapsed dictionary leaves residual ≈ target,
-        // so its retries keep re-reading the same leading components. With the
-        // lever on and every reseeded atom a FLAT kind (EuclideanPatch | Linear —
-        // the only kinds whose PCA seed is the euclidean score-projection this path
-        // mirrors), EVERY reseed, at every retry, draws from the worst-reconstructed
-        // data rows instead: the architecture's "dead-atom resampling draws from
-        // high-residual data rows, never from PCs". Unset (default) ⇒ this branch
-        // never runs and the seed is bit-identical to the historical PCA path. Chart
-        // kinds (Periodic/Sphere/Torus/Cylinder/…) always fall through to the PCA
-        // seed — their data-row anchoring is the curved-tier follow-up.
-        // #2023 — typed per-fit opt-in (was the GAM_SAE_DATA_ROW_RESEED env lever).
-        let data_row_reseed = self.data_row_reseed;
-        let all_flat = basis_kinds.iter().all(|k| {
-            matches!(
-                k,
-                SaeAtomBasisKind::EuclideanPatch | SaeAtomBasisKind::Linear
-            )
-        });
-        // #2023 — record the seed ACTUALLY TAKEN, in both arms.
-        //
-        // The migration ledger's acceptance bar is "no PC reseed events in the
-        // log", and before these counters it could not fail:
-        // `BirthSeed::PrincipalComponent` had no constructor anywhere in the
-        // tree, this file had no reference to the ledger at all, and
-        // `record_search_round` stamped every accepted birth
-        // `BirthSeed::ResidualFactor` unconditionally — so the seed was
-        // ASSERTED, never observed, and `pc_reseed_events == 0` held by
-        // construction rather than by evidence. Incrementing on the branch taken
-        // is what makes the bar capable of failing; a bar that cannot fail
-        // measures nothing, however green it reads.
-        //
-        // Per reseeded ATOM, not per call: one exhausted-pool retry that
-        // re-plants four atoms on the same leading PCs is four chances to
-        // re-collapse, and a per-call count would report it as one.
-        let seeded = if data_row_reseed && all_flat && n > 0 {
-            self.data_row_reseeded_atoms =
-                self.data_row_reseeded_atoms.saturating_add(atoms.len());
-            sae_data_row_anchored_euclidean_coords(residual.view(), &dims, pc_pair_offset)?
-        } else {
-            self.pc_reseeded_atoms = self.pc_reseeded_atoms.saturating_add(atoms.len());
-            sae_pca_seed_initial_coords_with_pc_offset(
-                residual.view(),
-                &basis_kinds,
-                &dims,
-                pc_pair_offset,
-            )?
-        };
+        let seeded =
+            match topology_curved_seed_initial_coords(residual, &basis_kinds, &dims, retry)? {
+                Some(harmonic) => harmonic,
+                None => sae_data_row_anchored_coords(residual, &basis_kinds, &dims, retry)?,
+            };
         for (slot, &atom) in atoms.iter().enumerate() {
             let d = dims[slot];
             let mut flat = Array1::<f64>::zeros(n * d);
@@ -4902,12 +4869,11 @@ impl SaeManifoldTerm {
     ///
     /// The co-collapse guard reseeds SEVERAL duplicate atoms in one call. Seeding
     /// them all from the SAME residual re-reads its one leading structure for
-    /// every atom, so they re-collide immediately — the disjoint-PC offset only
-    /// helps when the uncovered residual is high rank, but a co-collapsed
-    /// dictionary typically leaves ONE low-rank structure uncovered (`pc_pairs = 1`
-    /// ⇒ every atom draws PC-pair 0). Peel instead: seed atom 0's chart from the
-    /// current residual via the shared chart-aware curved seed
-    /// ([`Self::seed_atom_chart_coords`]), fit its provisional gated decoder,
+    /// every atom, so they re-collide immediately — distinct chart functions only
+    /// help when the uncovered residual is high rank, but a co-collapsed dictionary
+    /// typically leaves ONE low-rank structure uncovered. Peel instead: reseed atom
+    /// 0's chart from the current residual
+    /// ([`Self::reseed_charts_from_residual`]), fit its provisional gated decoder,
     /// SUBTRACT its fit, and seed atom 1 from what atom 0 left behind — the
     /// block-nursery sequential-composition principle, so each reborn atom charts
     /// a DISJOINT chunk of the uncovered residual. The measured noise-floor
@@ -4919,10 +4885,10 @@ impl SaeManifoldTerm {
     /// final decoders on these freshly-separated charts. Returns the atoms
     /// actually reseeded (the prefix before the terminator fired).
     ///
-    /// Seeds through the SHARED seed entrypoint, so when the curved seed's backend
-    /// gains an intrinsic-metric embedding the reseed inherits it unchanged; the
-    /// disjointness MECHANISM (sequential deflation) is independent of the seed
-    /// SOURCE (PC read or geodesic embedding).
+    /// Seeds through the SHARED reseed entrypoint, so the curved reseed and the
+    /// simultaneous reseed read the same chart functions; the disjointness
+    /// MECHANISM (sequential deflation) is independent of the seed SOURCE (graph
+    /// harmonics or data rows).
     pub(crate) fn reseed_curved_atoms_sequential_deflation(
         &mut self,
         atoms: &[usize],
@@ -4949,9 +4915,10 @@ impl SaeManifoldTerm {
             if !self.residual_view_has_uncovered_signal(residual.view())? {
                 break;
             }
-            // 1. Seed THIS atom's chart from the current (peeled) residual via the
-            //    shared chart-aware seed, then refresh its basis at the new chart.
-            self.seed_atom_chart_coords(atom, n, residual.view(), None)?;
+            // 1. Reseed THIS atom's chart from the current (peeled) residual —
+            //    graph harmonics or data rows, never principal components — then
+            //    refresh its basis at the new chart.
+            self.reseed_charts_from_residual(&[atom], residual.view(), 0)?;
             // 2. Fit a provisional gated decoder (`diag(a_·atom)·Φ_atom`) on the
             //    fresh chart and deflate the residual by its fit, so the NEXT atom
             //    reads a disjoint remainder.
@@ -4989,7 +4956,7 @@ impl SaeManifoldTerm {
     /// The joint decoder least-squares
     /// ([`Self::refit_decoder_least_squares_at_current_state`]) fits ALL atoms
     /// against the SAME target in ONE normal-equations solve. At a co-collapsed
-    /// state the freshly reseeded atoms sit on distinct residual PC pairs, but the
+    /// state the freshly reseeded atoms sit on distinct residual charts, but the
     /// joint Gram is near-degenerate (the atoms' gated designs overlap heavily on
     /// the leading residual direction), and the minimum-norm joint solution spreads
     /// that SAME direction across several atoms — re-symmetrising the very basin the
@@ -5500,18 +5467,18 @@ impl SaeManifoldTerm {
         self.structural_cocollapse_reseeds += 1;
         log::warn!(
             "SaeManifoldTerm: structural coherence collapse — reseeding {} duplicate-output \
-             atom(s) onto residual PCs (structural multi-start \
+             atom(s) from the residual (structural multi-start \
              {}/{SAE_DICTIONARY_COCOLLAPSE_RESEED_BUDGET})",
             to_reseed.len(),
             self.structural_cocollapse_reseeds
         );
-        let pc_pair_offset = self.structural_cocollapse_reseeds.saturating_sub(1);
+        let retry = self.structural_cocollapse_reseeds.saturating_sub(1);
         // #2132 — CURVED reborn atoms take DISJOINT chunks of the uncovered
         // residual by SEQUENTIAL deflation (peel between atoms): a co-collapsed
         // dictionary leaves one low-rank structure, so a simultaneous seed re-reads
         // it for every atom and they re-collide. FLAT atoms keep the simultaneous
-        // PC-offset / data-row seed — their euclidean score-projection charts no
-        // manifold and needs no residual deflation to stay disjoint.
+        // data-row seed — their euclidean projection charts no manifold and needs
+        // no residual deflation to stay disjoint.
         let (curved, flat): (Vec<usize>, Vec<usize>) =
             to_reseed.iter().copied().partition(|&atom| {
                 !matches!(
@@ -5523,7 +5490,7 @@ impl SaeManifoldTerm {
             self.reseed_curved_atoms_sequential_deflation(&curved, target, rho)?;
         }
         if !flat.is_empty() {
-            self.reseed_atoms_onto_distinct_residual_pcs(&flat, target, rho, pc_pair_offset)?;
+            self.reseed_atoms_from_residual(&flat, target, rho, retry)?;
         }
         for &atom in &to_reseed {
             self.reseed_collapsed_atom_logits(atom);

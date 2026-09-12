@@ -866,7 +866,6 @@ impl SaeManifoldTerm {
             temperature_schedule: None,
             last_row_layout: None,
             row_metric: None,
-            data_row_reseed: false,
             // SAC — the collapse-guard stack is armed by default; the stagewise
             // K=1 lane disarms it explicitly (see the field docs on term.rs).
             guards_enabled: true,
@@ -884,10 +883,6 @@ impl SaeManifoldTerm {
             criterion_gauge_deflation_reanchors: 0,
             criterion_gauge_deflation_last_delta_sign: 0,
             dictionary_cocollapse_reseeds: 0,
-            // #2023 — seed-provenance counters for the co-collapse reseed; see
-            // the field docs on `term.rs` for why they are never reset.
-            pc_reseeded_atoms: 0,
-            data_row_reseeded_atoms: 0,
             inner_globalization_hint: None,
             best_cocollapse_incumbent: None,
             best_fit_incumbent: None,
@@ -1880,12 +1875,6 @@ impl SaeManifoldTerm {
             out.push(d);
         }
         Ok(out)
-    }
-
-    /// #2023 — set the per-fit dead-atom data-row reseed opt-in (typed kwarg, no
-    /// env lever). Default false.
-    pub fn set_data_row_reseed(&mut self, enabled: bool) {
-        self.data_row_reseed = enabled;
     }
 
     /// SAC — arm (`true`, the default) or disarm (`false`) the #976 Layer-1

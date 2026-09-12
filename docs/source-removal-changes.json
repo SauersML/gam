@@ -3065,5 +3065,18 @@
     ],
     "reason": "#2469: COUNT_INTEGER_TOL (1e-9) admitted values within 1e-9 of an integer as a Poisson count in infer_from_response. Its stated premise (CSV and integer-to-double round-trips accumulate ULP error) is false: a decimal integer below 2^53 parses to itself exactly, so a count is exactly an integer.",
     "evidence": "At the base, git grep finds COUNT_INTEGER_TOL only in crates/gam-spec/src/lib.rs, which is edited here; the only test pinning the admission, tests/glm/families/magic_family_auto_poisson_count.rs, is restated in the same commit."
+  },
+  {
+    "base": "1855a186f404d3e3f8e2b51e6196da27e129f084",
+    "items": [
+      "crates/gam-sae/src/manifold/construction.rs:fn:set_data_row_reseed",
+      "crates/gam-sae/src/manifold/fit_drivers.rs:fn:reseed_atoms_onto_distinct_residual_pcs",
+      "crates/gam-sae/src/manifold/pca_seed.rs:fn:sae_data_row_anchored_euclidean_coords",
+      "crates/gam-sae/src/manifold/tests_pc_reseed_provenance_2023.rs:fn:chart_atoms_reseed_from_principal_components_even_with_the_lever_on_2023",
+      "crates/gam-sae/src/manifold/tests_pc_reseed_provenance_2023.rs:fn:flat_atoms_past_the_exhausted_pc_pool_reseed_from_data_rows_2023",
+      "crates/gam-sae/src/manifold/tests_pc_reseed_provenance_2023.rs:fn:the_data_row_rule_is_opt_in_so_the_default_is_still_a_pc_reseed_2023"
+    ],
+    "reason": "#2023: the co-collapse reseed no longer reads principal components. reseed_atoms_onto_distinct_residual_pcs is renamed reseed_atoms_from_residual (graph harmonics for circle/torus/sphere sets, the worst-reconstructed rows otherwise). sae_data_row_anchored_euclidean_coords is replaced by the kind-aware sae_data_row_anchored_coords. set_data_row_reseed goes with the data_row_reseed lever, which every production entry hard-coded false. The three pins asserted the principal-component reseed and the lever; the chart-atom one credited principal components for a seed that was graph harmonics.",
+    "evidence": "The identities are this guard's own output over base..candidate, candidate built from the base plus this patch. At the base, set_data_row_reseed was called only by fit_seed.rs (with a request field that every constructor set false) and tests_pc_reseed_provenance_2023.rs. reseed_atoms_onto_distinct_residual_pcs had three call sites, all in fit_drivers.rs and all repointed in this patch. sae_data_row_anchored_euclidean_coords was called from fit_drivers.rs and one pca_seed.rs test, both repointed. The replacement pins are flat_reseed_follows_the_worst_row_where_principal_components_disagree_2023, circle_atoms_reseed_from_the_residual_graph_harmonics_2023 and projective_plane_reseed_rows_are_unit_vectors_anchored_at_the_worst_row_2023."
   }
 ]

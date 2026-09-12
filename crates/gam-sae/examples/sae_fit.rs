@@ -73,7 +73,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         native_ard_enabled: true,
         seed_refine_routing: refine_routing,
         seed_refine_random_state: 0,
-        data_row_reseed: false,
         fit_config: SaeFitConfig::default(),
         temperature_schedule: None,
         fisher_metric: None,
