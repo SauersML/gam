@@ -807,6 +807,93 @@ impl CustomFamily for SurvivalMarginalSlopeFamily {
         })
     }
 
+    fn joint_jeffreys_completion_outer_derivatives_available(&self) -> bool {
+        // The closed-form fifth and sixth likelihood derivatives cover the rigid,
+        // time-constant slope frame only; every configuration the third hook
+        // refuses, and a follow-up-varying slope, has neither contraction.
+        !(self.per_z_slope_active()
+            || self.flex_active()
+            || self.flex_timewiggle_active()
+            || self.slope_is_follow_up_varying())
+    }
+
+    fn joint_jeffreys_information_contracted_trace_hessian_directional_with_specs(
+        &self,
+        states: &[ParameterBlockState],
+        specs: &[ParameterBlockSpec],
+        weight: &Array2<f64>,
+        u: &Array1<f64>,
+    ) -> Result<Option<Array2<f64>>, String> {
+        if specs.len() != states.len() {
+            return Err("survival contracted trace Hessian derivative block count mismatch".into());
+        }
+        if !self.outer_default_trustworthy_for_joint_hessian(specs)
+            && !self.joint_hessian_is_structurally_coupled(states)?
+        {
+            return Ok(None);
+        }
+        if self.per_z_slope_active()
+            || self.effective_flex_active(states)?
+            || self.flex_timewiggle_active()
+            || self.slope_is_follow_up_varying()
+        {
+            return Ok(None);
+        }
+        let kernel =
+            SurvivalMarginalSlopeRowKernel::<STATIC_SLOPE_PRIMARIES, StaticSlopeGeometry>::new(
+                self.clone(),
+                states.to_vec(),
+            );
+        kernel
+            .contracted_trace_hessian_directional(
+                weight,
+                u.as_slice()
+                    .ok_or("non-contiguous contracted trace Hessian direction u")?,
+            )
+            .map(Some)
+    }
+
+    fn joint_jeffreys_information_contracted_trace_hessian_second_directional_with_specs(
+        &self,
+        states: &[ParameterBlockState],
+        specs: &[ParameterBlockSpec],
+        weight: &Array2<f64>,
+        u: &Array1<f64>,
+        w: &Array1<f64>,
+    ) -> Result<Option<Array2<f64>>, String> {
+        if specs.len() != states.len() {
+            return Err(
+                "survival contracted trace Hessian second derivative block count mismatch".into(),
+            );
+        }
+        if !self.outer_default_trustworthy_for_joint_hessian(specs)
+            && !self.joint_hessian_is_structurally_coupled(states)?
+        {
+            return Ok(None);
+        }
+        if self.per_z_slope_active()
+            || self.effective_flex_active(states)?
+            || self.flex_timewiggle_active()
+            || self.slope_is_follow_up_varying()
+        {
+            return Ok(None);
+        }
+        let kernel =
+            SurvivalMarginalSlopeRowKernel::<STATIC_SLOPE_PRIMARIES, StaticSlopeGeometry>::new(
+                self.clone(),
+                states.to_vec(),
+            );
+        kernel
+            .contracted_trace_hessian_second_directional(
+                weight,
+                u.as_slice()
+                    .ok_or("non-contiguous contracted trace Hessian direction u")?,
+                w.as_slice()
+                    .ok_or("non-contiguous contracted trace Hessian direction w")?,
+            )
+            .map(Some)
+    }
+
     /// gam#979 wide-p Jeffreys completion: `∇²_β tr(W · H(β))` for a
     /// caller-supplied full-joint trace weight `W`, in ONE `O(n · p_block²)`
     /// pass instead of the `p(p+1)/2` pairwise `H''[e_a, e_b]` fallback.

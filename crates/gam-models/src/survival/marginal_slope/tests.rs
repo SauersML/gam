@@ -7657,6 +7657,132 @@ fn rigid_survival_second_all_axes_each_matches_single_direction_979() {
     }
 }
 
+/// gam#2894: the contracted trace Hessian's first and second directional derivatives,
+/// which the outer gradient and Hessian of a criterion priced on the complete Jeffreys
+/// curvature read, checked against central differences of the exact contracted trace
+/// Hessian and of the first derivative, on the rigid fixture of the contracted-trace gate
+/// below.
+#[test]
+fn survival_contracted_trace_hessian_directional_derivatives_match_fd_2894() {
+    let n = 120usize;
+    let z: Vec<f64> = (0..n).map(|r| ((r as f64) * 0.29).sin() * 0.9).collect();
+    let weights: Vec<f64> = (0..n).map(|r| 0.6 + 0.4 * ((r % 5) as f64) / 5.0).collect();
+    let event: Vec<f64> = (0..n).map(|r| ((r % 3 == 0) as u8) as f64).collect();
+
+    let p_m = 2usize;
+    let p_g = 2usize;
+    let marginal_design = Array2::from_shape_fn((n, p_m), |(r, j)| {
+        0.2 + 0.05 * (r as f64).cos() + 0.11 * (j as f64) - 0.013 * (r as f64) / (n as f64)
+    });
+    let slope_design = Array2::from_shape_fn((n, p_g), |(r, j)| {
+        0.1 + 0.07 * (r as f64).sin() - 0.09 * (j as f64) + 0.004 * (r as f64) / (n as f64)
+    });
+
+    let mut family = oracle_rigid_family(n, &z, &weights, &event, None);
+    family.marginal_design = DesignMatrix::from(marginal_design.clone());
+    family
+        .slope_layout
+        .replace_coefficient_design(DesignMatrix::from(slope_design.clone()));
+    assert!(family.joint_jeffreys_completion_outer_derivatives_available());
+
+    let total = 1 + p_m + p_g;
+    let specs = vec![
+        dummy_blockspec(1),
+        dummy_blockspec(p_m),
+        dummy_blockspec(p_g),
+    ];
+    // beta_flat = [time(1), marginal(2), slope(2)].
+    let states_at = |beta_flat: &Array1<f64>| -> Vec<ParameterBlockState> {
+        let beta_time = beta_flat.slice(ndarray::s![0..1]).to_owned();
+        let beta_marginal = beta_flat.slice(ndarray::s![1..1 + p_m]).to_owned();
+        let beta_slope = beta_flat.slice(ndarray::s![1 + p_m..total]).to_owned();
+        let marginal_eta = marginal_design.dot(&beta_marginal);
+        let slope_eta = slope_design.dot(&beta_slope);
+        vec![
+            ParameterBlockState {
+                beta: beta_time,
+                eta: Array1::zeros(n),
+            },
+            ParameterBlockState {
+                beta: beta_marginal,
+                eta: marginal_eta,
+            },
+            ParameterBlockState {
+                beta: beta_slope,
+                eta: slope_eta,
+            },
+        ]
+    };
+
+    let beta0 = array![0.6, 0.18, -0.12, -0.2, 0.13];
+    let mut raw_weight = Array2::<f64>::zeros((total, total));
+    for i in 0..total {
+        for j in 0..total {
+            raw_weight[[i, j]] = ((i * 7 + j * 11 + 2) % 13) as f64 * 0.1 - 0.6;
+        }
+    }
+    let trace_weight = (&raw_weight + &raw_weight.t()).mapv(|value| value * 0.5);
+    let direction_u = array![0.3, -0.2, 0.1, 0.25, -0.15];
+    let direction_w = array![0.2, 0.1, -0.35, 0.15, 0.3];
+
+    let contracted_at = |beta_flat: &Array1<f64>| {
+        family
+            .joint_jeffreys_information_contracted_trace_hessian_with_specs(
+                &states_at(beta_flat),
+                &specs,
+                &trace_weight,
+            )
+            .expect("contracted trace Hessian call")
+            .expect("the rigid path must supply the contracted trace Hessian")
+    };
+    let directional_at = |beta_flat: &Array1<f64>| {
+        family
+            .joint_jeffreys_information_contracted_trace_hessian_directional_with_specs(
+                &states_at(beta_flat),
+                &specs,
+                &trace_weight,
+                &direction_u,
+            )
+            .expect("contracted trace Hessian directional call")
+            .expect("the rigid static path must supply the directional contraction")
+    };
+    let second = family
+        .joint_jeffreys_information_contracted_trace_hessian_second_directional_with_specs(
+            &states_at(&beta0),
+            &specs,
+            &trace_weight,
+            &direction_u,
+            &direction_w,
+        )
+        .expect("contracted trace Hessian second directional call")
+        .expect("the rigid static path must supply the second directional contraction");
+    let first = directional_at(&beta0);
+    assert_eq!(first.dim(), (total, total));
+    assert_eq!(second.dim(), (total, total));
+
+    let step = 1.0e-5;
+    let fd_first = (contracted_at(&(&beta0 + &(&direction_u * step)))
+        - contracted_at(&(&beta0 - &(&direction_u * step))))
+        / (2.0 * step);
+    let fd_second = (directional_at(&(&beta0 + &(&direction_w * step)))
+        - directional_at(&(&beta0 - &(&direction_w * step))))
+        / (2.0 * step);
+    for (label, analytic, fd) in [("first", &first, &fd_first), ("second", &second, &fd_second)] {
+        let largest = analytic.iter().fold(0.0_f64, |acc, value| acc.max(value.abs()));
+        assert!(
+            largest > 1.0e-3,
+            "{label}: the fixture must exercise a nonzero derivative, max={largest:e}"
+        );
+        for (actual, expected) in analytic.iter().zip(fd.iter()) {
+            assert!(
+                (actual - expected).abs() <= 1.0e-5 * (1.0 + expected.abs()),
+                "{label}: analytic={actual:e} fd={expected:e}"
+            );
+        }
+    }
+}
+
+
 /// gam#979 Jeffreys wide-p contracted-trace-Hessian FD verification (survival
 /// twin of the BMS gate `bernoulli_jeffreys_contracted_trace_hessian_matches_fd_of_trace`).
 ///

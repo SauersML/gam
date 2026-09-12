@@ -1300,7 +1300,6 @@ pub fn normal_logcdf_derivatives(x: f64) -> [f64; 5] {
         return [f64::NEG_INFINITY, f64::INFINITY, -1.0, 0.0, 0.0];
     }
 
-    const RIGHT_LOG_MAGNITUDE_SWITCH: f64 = 8.0;
     if x <= LEFT_CONTINUED_FRACTION_SWITCH {
         return normal_logcdf_derivatives_left_tail(x);
     }
@@ -1492,55 +1491,139 @@ pub fn normal_logcdf_derivatives_through_fifth(x: f64) -> [f64; 6] {
     } else if x.is_infinite() {
         0.0
     } else if x <= LEFT_CONTINUED_FRACTION_SWITCH {
-        // Carry q'''' through the same positive Laplace continued fraction.
-        // Differentiating λ=-x+q(-x) four times leaves q''''; recovering it
-        // from λ's recurrence would cancel its entire deep-tail signal.
-        let t = -x;
-        let mut q = [0.0_f64; 5];
-        // At the worst endpoint t=4 the same 64 levels as the order-four
-        // path leave 1.94e-17 relative truncation error in q'''' (100-digit
-        // reference); deeper in the tail convergence is faster.
-        for n in (1..=64).rev() {
-            let inverse = (t + q[0]).recip();
-            let value = f64::from(n) * inverse;
-            let a = (1.0 + q[1]) * inverse;
-            let b = q[2] * inverse;
-            let c = q[3] * inverse;
-            let e = q[4] * inverse;
-            q = [
-                value,
-                -value * a,
-                value * (2.0 * a * a - b),
-                value * (-6.0 * a * a * a + 6.0 * a * b - c),
-                value * (24.0 * a.powi(4) - 36.0 * a * a * b + 6.0 * b * b + 8.0 * a * c - e),
-            ];
-        }
-        q[4]
-    } else if x >= 8.0 {
-        // Hermite/Mills polynomial in signed log magnitude: the leading
-        // x^4 φ(x) can still be representable when φ itself underflows.
-        let log_lambda = -0.5 * x * x - 0.5 * (2.0 * std::f64::consts::PI).ln() - d[0];
-        let log_x = x.ln();
-        let inverse_x2 = x.recip().powi(2);
-        signed_exp_sum(
-            &[
-                4.0 * log_x + (-6.0 * inverse_x2 + 3.0 * inverse_x2.powi(2)).ln_1p() + log_lambda,
-                15.0_f64.ln()
-                    + 3.0 * log_x
-                    + (-(5.0 / 3.0) * inverse_x2).ln_1p()
-                    + 2.0 * log_lambda,
-                50.0_f64.ln() + 2.0 * log_x + (-0.4 * inverse_x2).ln_1p() + 3.0 * log_lambda,
-                60.0_f64.ln() + log_x + 4.0 * log_lambda,
-                24.0_f64.ln() + 5.0 * log_lambda,
-            ],
-            &[1.0; 5],
-        )
+        mills_correction_through_fifth_derivative(-x)[4]
+    } else if x >= RIGHT_LOG_MAGNITUDE_SWITCH {
+        right_tail_logcdf_fifth(RightTailLogScale::new(x, d[0]))
     } else {
-        // λ'=-xλ-λ²; its third derivative gives λ'''' without a new
-        // special-function evaluation.
-        -(x + 2.0 * d[1]) * d[4] - 3.0 * d[3] - 6.0 * d[2] * d[3]
+        moderate_logcdf_fifth(x, &d)
     };
     [d[0], d[1], d[2], d[3], d[4], fifth]
+}
+
+/// Value and six derivatives of `log Φ`. The sixth is the leaf of the fourth
+/// information derivative, which the outer Hessian of a criterion priced on the
+/// complete Jeffreys curvature consumes through `D² completion` (gam#2894).
+/// Callers that need only the fifth keep calling
+/// [`normal_logcdf_derivatives_through_fifth`], which does not pay for this one.
+pub fn normal_logcdf_derivatives_through_sixth(x: f64) -> [f64; 7] {
+    let d = normal_logcdf_derivatives(x);
+    let (fifth, sixth) = if x.is_nan() {
+        (f64::NAN, f64::NAN)
+    } else if x.is_infinite() {
+        (0.0, 0.0)
+    } else if x <= LEFT_CONTINUED_FRACTION_SWITCH {
+        let q = mills_correction_through_fifth_derivative(-x);
+        (q[4], -q[5])
+    } else if x >= RIGHT_LOG_MAGNITUDE_SWITCH {
+        let scale = RightTailLogScale::new(x, d[0]);
+        (right_tail_logcdf_fifth(scale), right_tail_logcdf_sixth(scale))
+    } else {
+        // λ'=-xλ-λ²; its fourth derivative gives λ⁽⁵⁾ from λ'''' without a new
+        // special-function evaluation.
+        let fifth = moderate_logcdf_fifth(x, &d);
+        let sixth = -(x + 2.0 * d[1]) * fifth - (4.0 + 8.0 * d[2]) * d[4] - 6.0 * d[3] * d[3];
+        (fifth, sixth)
+    };
+    [d[0], d[1], d[2], d[3], d[4], fifth, sixth]
+}
+
+/// The Mills correction `q(t)` of the positive Laplace continued fraction and its
+/// first five derivatives. Differentiating `λ = −x + q(−x)` leaves `q''''` and
+/// `−q'''''` as the fifth and sixth derivatives of `log Φ`; recovering them from
+/// λ's recurrence would cancel their entire deep-tail signal. Where the level
+/// update needs only the fifth, nothing below `q[5]` reads `q[5]`, so the carried
+/// sixth does not move the fifth.
+#[inline]
+fn mills_correction_through_fifth_derivative(t: f64) -> [f64; 6] {
+    let mut q = [0.0_f64; 6];
+    // At the worst endpoint t=4 the same 64 levels as the order-four
+    // path leave 1.94e-17 relative truncation error in q'''' (100-digit
+    // reference); deeper in the tail convergence is faster.
+    for n in (1..=64).rev() {
+        let inverse = (t + q[0]).recip();
+        let value = f64::from(n) * inverse;
+        let a = (1.0 + q[1]) * inverse;
+        let b = q[2] * inverse;
+        let c = q[3] * inverse;
+        let e = q[4] * inverse;
+        let f = q[5] * inverse;
+        // Leibniz on `(t+q)·(1/(t+q)) = 1` gives each level derivative as `value`
+        // times `p_k = −Σ_{j=1..k} C(k,j)·(s^(j)/s)·p_{k−j}`.
+        let p1 = -a;
+        let p2 = 2.0 * a * a - b;
+        let p3 = -6.0 * a * a * a + 6.0 * a * b - c;
+        let p4 = 24.0 * a.powi(4) - 36.0 * a * a * b + 6.0 * b * b + 8.0 * a * c - e;
+        let p5 = -(5.0 * a * p4 + 10.0 * b * p3 + 10.0 * c * p2 + 5.0 * e * p1 + f);
+        q = [value, value * p1, value * p2, value * p3, value * p4, value * p5];
+    }
+    q
+}
+
+const RIGHT_LOG_MAGNITUDE_SWITCH: f64 = 8.0;
+
+/// Signed-log inputs of the right-tail Hermite/Mills polynomials: the leading
+/// `x^k φ(x)` can still be representable when φ itself underflows.
+#[derive(Clone, Copy)]
+struct RightTailLogScale {
+    log_lambda: f64,
+    log_x: f64,
+    inverse_x2: f64,
+}
+
+impl RightTailLogScale {
+    #[inline]
+    fn new(x: f64, log_cdf: f64) -> Self {
+        Self {
+            log_lambda: -0.5 * x * x - 0.5 * (2.0 * std::f64::consts::PI).ln() - log_cdf,
+            log_x: x.ln(),
+            inverse_x2: x.recip().powi(2),
+        }
+    }
+}
+
+/// `λ'''' = (x⁴−6x²+3)λ + (15x³−25x)λ² + (50x²−20)λ³ + 60xλ⁴ + 24λ⁵`.
+#[inline]
+fn right_tail_logcdf_fifth(scale: RightTailLogScale) -> f64 {
+    let RightTailLogScale { log_lambda, log_x, inverse_x2 } = scale;
+    signed_exp_sum(
+        &[
+            4.0 * log_x + (-6.0 * inverse_x2 + 3.0 * inverse_x2.powi(2)).ln_1p() + log_lambda,
+            15.0_f64.ln() + 3.0 * log_x + (-(5.0 / 3.0) * inverse_x2).ln_1p() + 2.0 * log_lambda,
+            50.0_f64.ln() + 2.0 * log_x + (-0.4 * inverse_x2).ln_1p() + 3.0 * log_lambda,
+            60.0_f64.ln() + log_x + 4.0 * log_lambda,
+            24.0_f64.ln() + 5.0 * log_lambda,
+        ],
+        &[1.0; 5],
+    )
+}
+
+/// `λ⁽⁵⁾ = −(x⁵−10x³+15x)λ − (31x⁴−101x²+28)λ² − (180x³−210x)λ³ − (390x²−120)λ⁴
+/// − 360xλ⁵ − 120λ⁶`, from `p_{n+1,k} = p'_{n,k} − k·x·p_{n,k} − (k−1)·p_{n,k−1}`.
+/// Every bracket is positive for `x ≥ 8`, so each term enters with sign −1.
+#[inline]
+fn right_tail_logcdf_sixth(scale: RightTailLogScale) -> f64 {
+    let RightTailLogScale { log_lambda, log_x, inverse_x2 } = scale;
+    signed_exp_sum(
+        &[
+            5.0 * log_x + (-10.0 * inverse_x2 + 15.0 * inverse_x2.powi(2)).ln_1p() + log_lambda,
+            31.0_f64.ln()
+                + 4.0 * log_x
+                + (-(101.0 / 31.0) * inverse_x2 + (28.0 / 31.0) * inverse_x2.powi(2)).ln_1p()
+                + 2.0 * log_lambda,
+            180.0_f64.ln() + 3.0 * log_x + (-(7.0 / 6.0) * inverse_x2).ln_1p() + 3.0 * log_lambda,
+            390.0_f64.ln() + 2.0 * log_x + (-(4.0 / 13.0) * inverse_x2).ln_1p() + 4.0 * log_lambda,
+            360.0_f64.ln() + log_x + 5.0 * log_lambda,
+            120.0_f64.ln() + 6.0 * log_lambda,
+        ],
+        &[-1.0; 6],
+    )
+}
+
+/// λ'=-xλ-λ²; its third derivative gives λ'''' without a new special-function
+/// evaluation.
+#[inline]
+fn moderate_logcdf_fifth(x: f64, d: &[f64; 5]) -> f64 {
+    -(x + 2.0 * d[1]) * d[4] - 3.0 * d[3] - 6.0 * d[2] * d[3]
 }
 
 #[inline]
@@ -2844,6 +2927,78 @@ mod tests {
         let reference = 2.5398281413501576417e-318;
         assert!(actual > 0.0);
         assert!((actual - reference).abs() <= 4.0 * f64::from_bits(1));
+    }
+
+    #[test]
+    fn normal_logcdf_sixth_matches_fifth_derivative() {
+        for x in [
+            -100.0_f64, -20.0, -8.0, -4.1, -2.0, 0.0, 2.0, 7.9, 8.1, 20.0,
+        ] {
+            let h = 1.0e-4;
+            let left = normal_logcdf_derivatives_through_fifth(x - h)[5];
+            let right = normal_logcdf_derivatives_through_fifth(x + h)[5];
+            let fd = (right - left) / (2.0 * h);
+            let exact = normal_logcdf_derivatives_through_sixth(x)[6];
+            let relative = (fd - exact).abs() / exact.abs().max(1.0e-300);
+            assert!(
+                relative < 3.0e-5,
+                "x={x}: sixth={exact:e} fd={fd:e} relative={relative:e}"
+            );
+        }
+    }
+
+    #[test]
+    fn normal_logcdf_sixth_matches_high_precision_reference_2894() {
+        // mpmath 1.3, 100 decimal digits, independently differentiating
+        // log(ncdf(x)) six times on MSI. The same run reproduced every fifth
+        // reference above digit for digit.
+        for (x, reference) in [
+            (-100.0, 1.1949750790831413317e-10_f64),
+            (-20.0, 1.6919513765186140654e-6),
+            (-8.0, 2.5595769931701898387e-4),
+            (-4.0, 4.7311895587015692797e-3),
+            (-2.0, 2.0590019459645697822e-2),
+            (0.0, -1.526585338416569301e-1),
+            (2.0, 4.4238511384330602855e-1),
+            (8.0, -1.4029146344765558916e-10),
+            (20.0, -1.722701517444710908e-81),
+        ] {
+            let actual = normal_logcdf_derivatives_through_sixth(x)[6];
+            let relative = (actual - reference).abs() / reference.abs();
+            assert!(
+                relative < 2.0e-10,
+                "x={x}: sixth={actual:e}, reference={reference:e}, relative={relative:e}"
+            );
+        }
+        // At x=38.6 the density has underflowed, but x^5*phi(x) has not. A
+        // 450-digit reference verifies the signed-log tail keeps the sixth
+        // derivative representable (allow four subnormal ulps).
+        let actual = normal_logcdf_derivatives_through_sixth(38.6)[6];
+        let reference = -9.7773639908950781406e-317;
+        assert!(actual < 0.0);
+        assert!((actual - reference).abs() <= 4.0 * f64::from_bits(1));
+    }
+
+    #[test]
+    fn normal_logcdf_through_sixth_carries_the_fifth_bit_for_bit_2894() {
+        // Two dispatchers share one set of branch helpers; a branch that moved in
+        // one and not the other would change the fifth only where it moved.
+        for x in [
+            f64::NEG_INFINITY, -1.0e100, -100.0, -20.0, -8.0, -4.0, -3.999, -2.0, 0.0, 2.0,
+            7.999, 8.0, 20.0, 38.6, f64::INFINITY,
+        ] {
+            let fifth = normal_logcdf_derivatives_through_fifth(x);
+            let sixth = normal_logcdf_derivatives_through_sixth(x);
+            for order in 0..6 {
+                assert_eq!(
+                    fifth[order].to_bits(),
+                    sixth[order].to_bits(),
+                    "x={x}, order={order}: through_fifth={:e} through_sixth={:e}",
+                    fifth[order],
+                    sixth[order]
+                );
+            }
+        }
     }
 
     /// Absolute-accuracy pin of the full `ln Φ(x)` derivative tower against an

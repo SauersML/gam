@@ -1814,7 +1814,7 @@ impl<const P: usize, G: SlopeRowGeometry<P>> SurvivalMarginalSlopeRowKernel<P, G
     /// fixed 256-row chunk, chunks reduce in chunk-index order on the caller
     /// thread. `per_row(row, &mut acc)` accumulates one row's pullback into the
     /// `p×p` accumulator exactly as the generic per-axis fold does.
-    fn chunked_pullback_reduce<F>(&self, p: usize, per_row: F) -> Result<Array2<f64>, String>
+    pub(super) fn chunked_pullback_reduce<F>(&self, p: usize, per_row: F) -> Result<Array2<f64>, String>
     where
         F: Fn(usize, &mut Array2<f64>) -> Result<(), String> + Sync,
     {
@@ -2070,7 +2070,7 @@ impl<const P: usize, G: SlopeRowGeometry<P>> SurvivalMarginalSlopeRowKernel<P, G
     /// `O(p_total²)`, since only the 3 real blocks (`time, marginal,
     /// slope`) — never the optional flex/influence ones, which this hook
     /// only runs when inactive — are read.
-    fn primary_trace_weight(
+    pub(super) fn primary_trace_weight(
         &self,
         row: usize,
         weight: &Array2<f64>,

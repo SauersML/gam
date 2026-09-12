@@ -1877,6 +1877,64 @@ pub trait CustomFamily {
         Ok(None)
     }
 
+    /// Whether this family implements both
+    /// [`Self::joint_jeffreys_information_contracted_trace_hessian_directional_with_specs`]
+    /// and [`Self::joint_jeffreys_information_contracted_trace_hessian_second_directional_with_specs`]
+    /// exactly, i.e. returns `Some` from them.
+    ///
+    /// A criterion priced on the complete Jeffreys curvature (`H_Φ` plus its second-order
+    /// completion) reads the completion's first β-drift in its outer gradient and its second
+    /// in its outer Hessian, and both contract these derivatives (gam#2894). Override to
+    /// `true` exactly when both hooks are implemented.
+    fn joint_jeffreys_completion_outer_derivatives_available(&self) -> bool {
+        false
+    }
+
+    /// `⟨W, D³I_J[u, e_a, e_b]⟩` for every axis pair: the contracted trace Hessian of
+    /// [`Self::joint_jeffreys_information_contracted_trace_hessian_with_specs`] differentiated
+    /// along one coefficient direction. Linear in the symmetric weight `W`, which need not be
+    /// PSD. `None` declares the exact contraction unavailable.
+    fn joint_jeffreys_information_contracted_trace_hessian_directional_with_specs(
+        &self,
+        block_states: &[ParameterBlockState],
+        specs: &[ParameterBlockSpec],
+        weight: &Array2<f64>,
+        d_beta_u_flat: &Array1<f64>,
+    ) -> Result<Option<Array2<f64>>, String> {
+        let context = "contracted trace Hessian directional derivative";
+        assert_valid_blockspecs(specs, context);
+        assert_states_match_specs(block_states, specs, context);
+        let total = block_states.iter().map(|state| state.beta.len()).sum::<usize>();
+        assert_eq!(weight.dim(), (total, total), "{context}: trace weight shape");
+        assert_eq!(d_beta_u_flat.len(), total, "{context}: joint direction width");
+        assert!(d_beta_u_flat.iter().all(|value| value.is_finite()), "{context}: non-finite direction");
+        Ok(None)
+    }
+
+    /// `⟨W, D⁴I_J[u, w, e_a, e_b]⟩` for every axis pair: the contracted trace Hessian
+    /// differentiated along two coefficient directions, which for an observed-information
+    /// family reads the sixth likelihood derivative. `None` declares the exact contraction
+    /// unavailable.
+    fn joint_jeffreys_information_contracted_trace_hessian_second_directional_with_specs(
+        &self,
+        block_states: &[ParameterBlockState],
+        specs: &[ParameterBlockSpec],
+        weight: &Array2<f64>,
+        d_beta_u_flat: &Array1<f64>,
+        d_beta_w_flat: &Array1<f64>,
+    ) -> Result<Option<Array2<f64>>, String> {
+        let context = "contracted trace Hessian second directional derivative";
+        assert_valid_blockspecs(specs, context);
+        assert_states_match_specs(block_states, specs, context);
+        let total = block_states.iter().map(|state| state.beta.len()).sum::<usize>();
+        assert_eq!(weight.dim(), (total, total), "{context}: trace weight shape");
+        for direction in [d_beta_u_flat, d_beta_w_flat] {
+            assert_eq!(direction.len(), total, "{context}: joint direction width");
+            assert!(direction.iter().all(|value| value.is_finite()), "{context}: non-finite direction");
+        }
+        Ok(None)
+    }
+
     /// Optional contracted second beta-derivative of the observed joint
     /// Newton information:
     ///
