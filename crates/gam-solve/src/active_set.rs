@@ -422,7 +422,7 @@ struct ActiveFace {
 /// Treating the row as free lets the refinement move along its normal — inward
 /// when the objective wants to leave the boundary — while the caller's primal
 /// feasibility check still refuses any step that would cross it.
-pub(crate) fn binding_constraint_rows(
+pub fn binding_constraint_rows(
     beta: &Array1<f64>,
     gradient: &Array1<f64>,
     constraints: &LinearInequalityConstraints,

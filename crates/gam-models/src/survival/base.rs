@@ -2996,6 +2996,35 @@ impl WorkingModelSurvival {
         )
         .map_err(EstimationError::InvalidInput)?;
 
+        // The inner P-IRLS minimizes on the monotonicity face, so the mode moves
+        // only along that face as rho changes. The mode response the LAML
+        // gradient differentiates through must be restricted to the same face
+        // (`try_tangent_projected_evaluate`), or the gradient is not the derivative
+        // of the value whenever a time coefficient binds. The binding rows are
+        // the ones carrying a positive multiplier at this mode, the rule the
+        // inner certificate's exact decrement above already uses, mapped into
+        // the Qs frame as `A·Qs`.
+        let active_constraints = match monotonicity_constraints.as_ref() {
+            Some(inequalities) => {
+                let rows = gam_solve::active_set::binding_constraint_rows(
+                    beta,
+                    &state.gradient,
+                    inequalities,
+                )
+                .ok_or_else(|| EstimationError::TrialPointRefused {
+                    reason: "survival LAML could not resolve the multipliers of its binding \
+                             monotonicity face at this rho"
+                        .to_string(),
+                })?;
+                (rows.nrows() > 0).then(|| {
+                    std::sync::Arc::new(gam_solve::model_types::ActiveLinearConstraintBlock {
+                        a: rows.dot(&reparam_inner.qs),
+                    })
+                })
+            }
+            None => None,
+        };
+
         // Hessian operator on the transformed H′. Orthogonal similarity
         // preserves strict positive definiteness and the exact spectrum.
         // An indefinite inner Hessian here is a property of THIS rho, not of the
@@ -3073,7 +3102,7 @@ impl WorkingModelSurvival {
             fixed_drift_deriv: None,
             contracted_psi_second_order: None,
             kkt_residual: None,
-            active_constraints: None,
+            active_constraints,
         }
         .evaluate(
             rho.as_slice().expect("rho must be contiguous"),
