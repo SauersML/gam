@@ -95,8 +95,9 @@ pub fn exp_sigma_inverse_from_eta_scalar(eta: f64) -> f64 {
 /// magnitude; saturation to ±MAX happens only when |q0| genuinely exceeds
 /// `f64::MAX` — the representability boundary of the number format, not an
 /// arbitrary ceiling. When `exp(-eta_ls)` alone is unrepresentable but the
-/// product is finite (|eta_t| tiny), the magnitude is evaluated in the log
-/// domain instead of through the saturated factor.
+/// product is finite (|eta_t| tiny), or the inverse scale underflows while
+/// the product remains representable (|eta_t| large), the magnitude is
+/// evaluated in the log domain instead of through the rounded factor.
 #[inline]
 pub fn survival_q0_from_eta(eta_t: f64, eta_ls: f64) -> f64 {
     if eta_t == 0.0 {
@@ -106,11 +107,12 @@ pub fn survival_q0_from_eta(eta_t: f64, eta_ls: f64) -> f64 {
     if log_abs > EXP_SATURATION_MAX_ARG {
         return if eta_t > 0.0 { -f64::MAX } else { f64::MAX };
     }
-    if -eta_ls > EXP_SATURATION_MAX_ARG {
+    let inverse_scale = exp_sigma_inverse_from_eta_scalar(eta_ls);
+    if -eta_ls > EXP_SATURATION_MAX_ARG || inverse_scale < f64::MIN_POSITIVE {
         let mag = log_abs.exp();
         return if eta_t > 0.0 { -mag } else { mag };
     }
-    let q = -eta_t * exp_sigma_inverse_from_eta_scalar(eta_ls);
+    let q = -eta_t * inverse_scale;
     if q.is_finite() {
         q
     } else {
@@ -273,6 +275,18 @@ mod tests {
     use super::*;
     use std::fs;
     use std::path::Path;
+
+    #[test]
+    fn survival_threshold_preserves_product_when_inverse_scale_underflows() {
+        for eta_ls in [740.0_f64, 800.0] {
+            let eta_t = 700.0_f64.exp();
+            let expected = (700.0 - eta_ls).exp();
+            let threshold = survival_q0_from_eta(eta_t, eta_ls);
+            assert!(threshold < 0.0);
+            assert!((threshold / -expected - 1.0).abs() < 1.0e-12);
+            assert_eq!(survival_q0_from_eta(-eta_t, eta_ls), -threshold);
+        }
+    }
 
     fn collect_rs_files(dir: &Path, out: &mut Vec<std::path::PathBuf>) {
         let Ok(entries) = fs::read_dir(dir) else {
