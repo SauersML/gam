@@ -5080,6 +5080,60 @@ mod tests {
             .expect("the family's own specs must satisfy its flat-layout guard");
     }
 
+    /// #2744, the other end of the same contract: the CANONICALISER must honour
+    /// the raw-width declaration on a shared design that is genuinely
+    /// rank-deficient.
+    ///
+    /// The failing arm's design is `s(x1) + s(x2) + te(x1, x2)`, where the
+    /// tensor term re-spans its own marginals — one column lies in the span of
+    /// two others. That shape is reproduced here directly, so the audit has a
+    /// real deficiency to attribute and the assertion is not vacuous: without
+    /// the lock the `#933` path reduces both class blocks and the family's flat
+    /// layout no longer describes the specs the solver holds.
+    #[test]
+    fn canonicalisation_keeps_multinomial_blocks_at_raw_width_2744() {
+        let (n, p, k) = (48, 4, 3);
+        let mut family = toy_family(n, p, k);
+        // Column `p-1` becomes an exact linear combination of columns 0 and 1 —
+        // the marginal/tensor confounding, not a duplicated-column alias pair.
+        let deficient = {
+            let mut design = (*family.design).clone();
+            let combo = &design.column(0).to_owned() * 0.75 + &design.column(1).to_owned() * 0.5;
+            design.column_mut(p - 1).assign(&combo);
+            design
+        };
+        family.design = Arc::new(deficient);
+        let specs = family.build_block_specs();
+
+        let canonical =
+            gam_identifiability::canonical::canonicalize_for_identifiability_with_operating_scalars(
+                &specs,
+                &vec![gam_problem::CoefficientCoordinate::Spanning; specs.len()],
+                None,
+            )
+            .expect("a rank-deficient shared design must canonicalise, not fail closed");
+
+        // NON-VACUITY CONTROL: the audit must actually have found the
+        // deficiency. If it attributed nothing there would be no reduction to
+        // suppress and the width assertion below would pass on any code.
+        assert!(
+            !canonical.audit.dropped_columns.is_empty(),
+            "the fixture must present the audit with a real rank deficiency to attribute; \
+             it reported none, so the raw-width assertion would be vacuous"
+        );
+        for (raw, reduced) in specs.iter().zip(canonical.reduced_specs.iter()) {
+            assert_eq!(
+                reduced.design.ncols(),
+                raw.design.ncols(),
+                "block '{}' was column-reduced despite locking its raw width",
+                raw.name,
+            );
+        }
+        family
+            .check_spec_coefficient_width(&canonical.reduced_specs, "canonicalised specs")
+            .expect("the canonicalised specs must still match the family's flat layout");
+    }
+
     #[test]
     fn convexity_certificate_tracks_the_complete_multinomial_objective() {
         let unbiased = toy_family(8, 3, 4).with_joint_jeffreys_term(false);
