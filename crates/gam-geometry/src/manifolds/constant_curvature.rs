@@ -75,7 +75,7 @@
 
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
 
-use crate::manifold::{GEOMETRY_EPS, GeometryError, GeometryResult, RiemannianManifold};
+use crate::manifold::{GeometryError, GeometryResult, RiemannianManifold};
 use gam_math::jet_tower::Tower2;
 
 /// Branch threshold for the `C`/`S` series in `u = κt²`. The series terms
@@ -459,7 +459,11 @@ fn dirichlet_weight_coefficients(
     let tn_prime_dot = r * r * (3.0 * a + 2.0 * u * a_prime);
 
     let gauge = 1.0 + kappa * tn * tn;
-    if gauge <= GEOMETRY_EPS {
+    // For κ < 0 the gauge is `sech²(√−κ·r)`, formed as `1 − tanh²` by cancellation.
+    // `tn` carries seven roundings (`u = κr²` 2, its root 1, the factors `S` and `C`
+    // 2, `r·S/C` 2); squaring doubles them and `κ·tn²` and the sum add two, so a
+    // gauge inside `γ₁₆` of its terms' absolute sum has no significant digit left.
+    if gauge <= gam_linalg::roundoff::accumulation_band(16, 1.0 + kappa.abs() * tn * tn) {
         return Err(GeometryError::InvalidPoint(
             "constant-curvature Dirichlet weight: exp of the tangent coordinate leaves the chart",
         ));
@@ -576,7 +580,9 @@ fn dirichlet_gram_assembly(
                 }
             }
         }
-        if norm > GEOMETRY_EPS {
+        // At `norm = 0` the weight is isotropic (`rad = iso`, the exact `r = 0`
+        // limit); any positive norm makes `t/norm` a unit vector.
+        if norm > 0.0 {
             let radial_weight = rad_coeff - iso_coeff;
             if radial_weight != 0.0 {
                 let inv_norm = 1.0 / norm;
@@ -682,8 +688,13 @@ impl ConstantCurvature {
     /// positive for the point to lie in the chart (automatic for κ ≥ 0,
     /// the open-ball constraint for κ < 0).
     fn chart_gauge(&self, x: ArrayView1<'_, f64>) -> GeometryResult<f64> {
-        let gauge = 1.0 + self.kappa * x.dot(&x);
-        if gauge <= GEOMETRY_EPS {
+        let xx = x.dot(&x);
+        let gauge = 1.0 + self.kappa * xx;
+        // `‖x‖²` is a `d`-term inner product, and `κ·‖x‖²` and the sum round twice
+        // more: a gauge inside that band sits on the chart boundary to its precision.
+        let band =
+            gam_linalg::roundoff::accumulation_band(x.len() + 2, 1.0 + self.kappa.abs() * xx);
+        if gauge <= band {
             return Err(GeometryError::InvalidPoint(
                 "constant-curvature point outside the κ-stereographic chart",
             ));
@@ -823,8 +834,12 @@ impl ConstantCurvature {
 
     /// `tn_κ(t) = sn(t)/cs(t) = t·S(κt²)/C(κt²)` — the generalized tangent.
     fn tn(&self, t: f64) -> GeometryResult<f64> {
-        let (c, s) = cs_val(self.kappa * t * t);
-        if c.abs() <= GEOMETRY_EPS {
+        let u = self.kappa * t * t;
+        let (c, s) = cs_val(u);
+        // The Dirichlet weight's conjugate-point band: `C = cos √u` to one ulp at an
+        // argument carrying three roundings; the series branch never nears zero.
+        let band = gam_linalg::roundoff::accumulation_growth(3) * u.abs().sqrt() + f64::EPSILON;
+        if c.abs() <= band {
             return Err(GeometryError::Singular(
                 "constant-curvature exp map at a conjugate point (cos(√κ t) = 0)",
             ));
@@ -870,7 +885,8 @@ impl RiemannianManifold for ConstantCurvature {
         self.check_len("constant-curvature exp tangent", tangent_vec.len())?;
         let gauge = self.chart_gauge(point)?;
         let n = tangent_vec.dot(&tangent_vec).sqrt();
-        if n <= GEOMETRY_EPS {
+        // `tn(n/gauge)/n = S/(C·gauge)` divides back by `n` exactly for any positive `n`.
+        if n == 0.0 {
             return Ok(point.to_owned());
         }
         let t = n / gauge; // λ_x‖v‖/2 = ‖v‖/(1 + κ‖x‖²)
@@ -1016,7 +1032,7 @@ impl RiemannianManifold for ConstantCurvature {
     /// both Jacobians are the identity and the reverse reduces to `(ḡ, ḡ)`,
     /// matched by the early return. At `v = 0` the differential of `exp_x` is
     /// the identity in both slots, so we return `(ḡ, ḡ)` there too (mirroring
-    /// the `n ≤ GEOMETRY_EPS` short-circuit in `exp_map`). The conjugate-point
+    /// the `n = 0` short-circuit in `exp_map`). The conjugate-point
     /// guard (`tn` errors at `cos(√κ t)=0`) and the Möbius antipodal-denominator
     /// guard propagate exactly as in the forward map.
     fn exp_map_vjp(
@@ -1032,14 +1048,14 @@ impl RiemannianManifold for ConstantCurvature {
             grad_output.len(),
         )?;
         let k = self.kappa;
-        if k.abs() <= GEOMETRY_EPS {
+        if k == 0.0 {
             // Doubled-gauge flat space: exp is the chart translation x + v, so
             // both Jacobians are the identity and the VJP is the cotangent itself.
             return Ok((grad_output.to_owned(), grad_output.to_owned()));
         }
         let d = point.len();
         let n = tangent_vec.dot(&tangent_vec).sqrt();
-        if n <= GEOMETRY_EPS {
+        if n == 0.0 {
             // At v = 0 the differential of exp_x is the identity in both slots.
             return Ok((grad_output.to_owned(), grad_output.to_owned()));
         }
@@ -1092,9 +1108,10 @@ impl RiemannianManifold for ConstantCurvature {
         let scale_bar = step_bar.dot(&tangent_vec);
         let mut v_bar = step_bar.mapv(|z| z * scale);
 
-        // scale = τ/n  ⇒  τ_bar = scale_bar/n,  n_bar = −scale_bar·τ/n².
+        // scale = τ/n  ⇒  τ_bar = scale_bar/n,  n_bar = −scale_bar·τ/n² = −scale_bar·scale/n,
+        // formed without n², which underflows long before n does.
         let tau_bar = scale_bar / n;
-        let mut n_bar = -scale_bar * tau / (n * n);
+        let mut n_bar = -scale_bar * scale / n;
 
         // τ = tn_κ(t),  tn′(t) = 1 + κτ²  ⇒  t_bar = τ_bar·(1 + κτ²).
         let t_bar = tau_bar * (1.0 + k * tau * tau);
@@ -1181,13 +1198,29 @@ pub fn distance_kappa_jet(
     for wi in &w {
         nw2 = nw2 + *wi * *wi;
     }
-    if nw2.v <= GEOMETRY_EPS * GEOMETRY_EPS {
-        // Coincident points: d ≡ 0 along the whole κ-path.
+    // Coincident points: w ≡ 0 along the whole κ-path, so d ≡ 0.
+    let largest = w.iter().fold(0.0_f64, |acc, wi| acc.max(wi.v.abs()));
+    if largest == 0.0 {
         return Ok((0.0, 0.0, 0.0));
     }
+    // The κ-jet of ‖w‖ from its unit direction ŵ: ‖w‖′ = ŵ·w′ and
+    // ‖w‖″ = ŵ·w″ + ‖w′ − (ŵ·w′)ŵ‖²/‖w‖. The square-root jet of Σwᵢ² needs
+    // −1/(4‖w‖³), which overflows once ‖w‖³ is below 1/f64::MAX.
+    let norm_value = largest * w.iter().map(|wi| (wi.v / largest).powi(2)).sum::<f64>().sqrt();
+    let slope: f64 = w.iter().map(|wi| wi.v / norm_value * wi.g[0]).sum();
+    let mut transverse = 0.0_f64;
+    let mut bend = 0.0_f64;
+    for wi in &w {
+        let unit = wi.v / norm_value;
+        transverse += (wi.g[0] - slope * unit).powi(2);
+        bend += unit * wi.h[0][0];
+    }
+    let mut norm = KJet::constant(norm_value);
+    norm.g[0] = slope;
+    norm.h[0][0] = bend + transverse / norm_value;
     let arg = kappa * nw2;
     let t = arg.compose_unary(t_stacks3(arg.v));
-    let d = nw2.sqrt() * t * 2.0;
+    let d = norm * t * 2.0;
     Ok((d.v, d.g[0], d.h[0][0]))
 }
 

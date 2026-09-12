@@ -2,8 +2,6 @@ use std::fmt;
 
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
 
-pub const GEOMETRY_EPS: f64 = 1.0e-12;
-
 #[derive(Debug, Clone, PartialEq)]
 pub enum GeometryError {
     DimensionMismatch {
@@ -1203,7 +1201,7 @@ mod cholesky_tests {
 
     /// A genuine SPD matrix with a uniformly tiny spectrum (`[[1e-16]]`) must
     /// factor: the issue is positive-definiteness, not absolute scale. The old
-    /// absolute `GEOMETRY_EPS` floor wrongly rejected it.
+    /// absolute `1e-12` floor wrongly rejected it.
     #[test]
     fn cholesky_accepts_tiny_spd() {
         let mut a = Array2::<f64>::zeros((1, 1));
