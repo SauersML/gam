@@ -126,10 +126,9 @@ pub struct AmortizationErrorStats {
     pub amplitude_rmse: f64,
 }
 
-/// The exact per-row test-time optimizer's solution on the held-out rows, the
-/// oracle input to [`crate::manifold`]'s `amortization_gap`: the exact
-/// reconstruction plus the exact code (gate logits, per-atom coordinate blocks,
-/// amplitudes) against which the one-matmul amortized encode is scored.
+/// The exact per-row test-time optimizer's solution on the held-out rows: the
+/// exact reconstruction plus the exact code (gate logits, per-atom coordinate
+/// blocks, amplitudes) against which the one-matmul amortized encode is scored.
 pub struct ExactRowSolution<'a> {
     /// Exact reconstruction of the held-out rows (the oracle line's EV numerator).
     pub recon: ArrayView2<'a, f64>,

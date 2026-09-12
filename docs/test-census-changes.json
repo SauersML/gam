@@ -175,5 +175,15 @@
       "crates/gam-geometry": 5,
       "tests/regressions": 1
     }
+  },
+  {
+    "base": "a5a7b96ba25b9863eb0d68c376d4cc2a7de99202",
+    "reason": "user directive: delete all useless slop",
+    "evidence": "Batch B1 deletes five dead manifold modules, and their tests with them: terracini.rs (closed_form_angle_margin_and_excess, logdet_channel_split_is_exact, orthogonal_is_perfectly_conditioned, collision_diverges, singular_joint_jacobian_has_infinite_attribution_risk_even_with_whitening_ridge, overcomplete_is_refused, aggregator_is_bounded_and_ranks_worst_first, stratified_coverage_hits_every_atom) and amortized_routing.rs (amortized_encode_reaches_high_fraction_of_exact_ev). Every one of them exercised only items of its own module, which nothing outside the module names. No issue-pinned test is removed. The gam-sae floor in docs/test-census-floor.json drops from 1390 to 1381 in this same change; the probe over f83e9aeba (lane plumbing commit 4b0c373db) measured 1390 -> 1381.",
+    "test_count_decrease": 9,
+    "removed_pins": {},
+    "unit_test_decreases": {
+      "crates/gam-sae": 9
+    }
   }
 ]

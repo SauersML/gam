@@ -21,7 +21,7 @@
     "crates/gam-report": 42,
     "crates/gam-row-macros": 40,
     "crates/gam-runtime": 103,
-    "crates/gam-sae": 1390,
+    "crates/gam-sae": 1381,
     "crates/gam-solve": 1762,
     "crates/gam-spec": 77,
     "crates/gam-terms": 707,
