@@ -104,6 +104,18 @@ class SrcItemsUsedOnlyByTests(unittest.TestCase):
         })
         self.assertEqual(report, EMPTY)
 
+    def test_with_include_public_an_unnamed_bare_pub_item_is_unreferenced_2818(self):
+        files = {
+            "crates/a/src/lib.rs": "pub fn orphan_api() {}\npub fn live_api() {}\nfn private_orphan() {}\n",
+            "crates/a/src/user.rs": "pub(crate) fn consumer() { crate::live_api() }\n",
+            "crates/a/src/tests_consumer.rs": "#[test] fn t() { crate::consumer(); }\n",
+        }
+        report = scanner.scan(files, include_public=True)
+        self.assertEqual(identities(report, "unreferenced"), ["crates/a/src/lib.rs:fn:orphan_api"],
+                         "an unnamed bare pub fn is reported; a named one and a private one are not")
+        self.assertEqual(identities(report, "test_only"), ["crates/a/src/user.rs:fn:consumer"])
+        self.assertEqual(scanner.scan(files)["unreferenced"], [], "without the flag bare pub stays out of scope")
+
     def test_the_ledger_ratchets_in_both_directions_2818(self):
         report = {"test_only": [{"identity": "crates/a/src/lib.rs:fn:helper", "line": 1, "test_reference": "x"}],
                   "unreferenced": [{"identity": "crates/a/src/lib.rs:fn:new_orphan", "line": 2}]}

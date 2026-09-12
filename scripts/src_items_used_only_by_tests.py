@@ -13,7 +13,8 @@ Two classes are reported from the tree at one immutable revision:
 * test-only: a non-`pub` production item named by test code (a test file, or a
   `#[cfg(test)]` region of a source file) and by no production line. It is test
   support in the wrong scope, or production code whose only callers are tests.
-* unreferenced: a `pub(crate)`/`pub(super)`/`pub(in ...)` item named nowhere.
+* unreferenced: a `pub(crate)`/`pub(super)`/`pub(in ...)` item named nowhere, and with
+  `--include-public` a bare `pub` item named nowhere too.
 
 Bare `pub` items are out of scope by default: their consumers may live outside the
 workspace, which is exactly the library surface a symbol-table sweep deletes.
@@ -210,11 +211,12 @@ def scan(files, include_public=False):
                 continue
             if definition["public"] and (not include_public or foreign_export(path, lines, number)):
                 continue
-            candidates.append((path, number, definition["kind"], definition["name"], bool(definition["scoped"])))
+            candidates.append((path, number, definition["kind"], definition["name"], bool(definition["scoped"]),
+                               bool(definition["public"])))
         files_naming.update(named.keys())
         lines_naming[path] = named
     report = {"test_only": [], "unreferenced": []}
-    for path, number, kind, name, scoped in candidates:
+    for path, number, kind, name, scoped, public in candidates:
         # The declaration's own line names it once; any other production line,
         # in this file or another, is a consumer.
         if files_naming[name] > 1 or lines_naming[path][name] > 1:
@@ -223,7 +225,9 @@ def scan(files, include_public=False):
         if name in test_references:
             report["test_only"].append({"identity": identity, "line": number,
                                         "test_reference": test_references[name]})
-        elif scoped:
+        elif scoped or (include_public and public):
+            # A bare `pub` item is a candidate only under `--include-public`; nothing naming it
+            # anywhere makes it unreferenced, the same verdict a scoped item gets.
             report["unreferenced"].append({"identity": identity, "line": number})
     return report
 
