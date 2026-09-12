@@ -572,9 +572,16 @@ fn fit_varying_coefficient_gam(
         }
     }
     let y: Vec<f64> = rows.iter().map(|&row| gate_j[row]).collect();
-    let reml = GaussianRemlProblem::new(&design, &y, likelihood_weights, &penalty, penalty_rank)?;
-    let selected_log_smoothing = reml.select_log_smoothing()?;
-    let final_fit = reml.fit(selected_log_smoothing)?;
+    let null_basis = penalty_null_basis(beta_cols, config.penalty_order);
+    let reml = GaussianRemlProblem::new(
+        &design,
+        &y,
+        likelihood_weights,
+        &penalty,
+        penalty_rank,
+        &null_basis,
+    )?;
+    let (selected_log_smoothing, final_fit) = reml.select_and_fit()?;
     let mut coefficients = vec![0.0_f64; beta_cols];
     coefficients.copy_from_slice(&final_fit.coef[1..]);
     let mut beta_at_rows = Vec::with_capacity(n);
@@ -644,6 +651,19 @@ struct GaussianRemlProblem<'a> {
     penalty: &'a [Vec<f64>],
     penalty_rank: usize,
     residual_df: f64,
+    null_space: NullSpaceFit,
+}
+
+/// The fit of the penalty null space `N` (`p × k`), the smooth's unpenalized
+/// model. A null-space coefficient pays no penalty, so it is feasible at every
+/// `λ` and every penalized fit keeps `P(ρ) ≤ P_null`.
+struct NullSpaceFit {
+    /// `N·ĉ`, in design coordinates.
+    coef: Vec<f64>,
+    /// `P_null = yᵀWy − gᵀĉ`, `g = NᵀXᵀWy`, `ĉ = (NᵀXᵀWXN)⁻¹g`.
+    penalized_rss: f64,
+    /// The arithmetic resolution of the cancelling difference `penalized_rss`.
+    resolution: f64,
 }
 
 /// The penalized solve at one `ρ`, shared by the criterion value, its
@@ -663,13 +683,16 @@ impl<'a> GaussianRemlProblem<'a> {
         weights: &[f64],
         penalty: &'a [Vec<f64>],
         penalty_rank: usize,
+        null_basis: &[Vec<f64>],
     ) -> Result<Self, String> {
         let p = design
             .first()
             .map(|row| row.len())
             .ok_or_else(|| "coactivation REML: empty design".to_string())?;
         let mut xtwx = vec![vec![0.0_f64; p]; p];
+        let mut xtwx_magnitude = vec![vec![0.0_f64; p]; p];
         let mut xtwy = vec![0.0_f64; p];
+        let mut xtwy_magnitude = vec![0.0_f64; p];
         let mut ywy = 0.0_f64;
         for (row, values) in design.iter().enumerate() {
             let w = weights[row];
@@ -677,9 +700,13 @@ impl<'a> GaussianRemlProblem<'a> {
             ywy += w * yy * yy;
             for a in 0..p {
                 let xa = values[a];
-                xtwy[a] += w * xa * yy;
+                let cross = w * xa * yy;
+                xtwy[a] += cross;
+                xtwy_magnitude[a] += cross.abs();
                 for b in 0..p {
-                    xtwx[a][b] += w * xa * values[b];
+                    let gram = w * xa * values[b];
+                    xtwx[a][b] += gram;
+                    xtwx_magnitude[a][b] += gram.abs();
                 }
             }
         }
@@ -697,6 +724,15 @@ impl<'a> GaussianRemlProblem<'a> {
                  residual degrees of freedom"
             ));
         }
+        let null_space = null_space_fit(
+            &xtwx,
+            &xtwx_magnitude,
+            &xtwy,
+            &xtwy_magnitude,
+            ywy,
+            null_basis,
+            design.len(),
+        )?;
         Ok(Self {
             xtwx,
             xtwy,
@@ -704,6 +740,7 @@ impl<'a> GaussianRemlProblem<'a> {
             penalty,
             penalty_rank,
             residual_df,
+            null_space,
         })
     }
 
@@ -805,6 +842,35 @@ impl<'a> GaussianRemlProblem<'a> {
         })
     }
 
+    /// Select `ρ̂` and return it with the fit there.
+    ///
+    /// When the penalty null space interpolates the sample, with `P_null` inside
+    /// its own arithmetic resolution, every `P(ρ) ≤ P_null` is inside it too. The
+    /// profiled criterion then has no finite value at any `ρ`, and there is no
+    /// smoothing parameter to select. That is a structural result, not a failed
+    /// search: the coefficient is the null space's (exactly constant under the
+    /// default order-1 penalty), which is the `λ → ∞` limit of the penalized fit.
+    /// It is reported at `log λ = +∞`, with the criterion's infimum `−∞` as its
+    /// score and the null dimension as its effective degrees of freedom.
+    /// Otherwise `ρ̂` is selected by the outer engine.
+    fn select_and_fit(&self) -> Result<(f64, PenalizedFit), String> {
+        let null_space = &self.null_space;
+        if null_space.penalized_rss.is_finite()
+            && !(null_space.penalized_rss > null_space.resolution)
+        {
+            return Ok((
+                f64::INFINITY,
+                PenalizedFit {
+                    coef: null_space.coef.clone(),
+                    reml_score: f64::NEG_INFINITY,
+                    effective_degrees: (self.xtwy.len() - self.penalty_rank) as f64,
+                },
+            ));
+        }
+        let selected = self.select_log_smoothing()?;
+        Ok((selected, self.fit(selected)?))
+    }
+
     /// Select `ρ̂` with the workspace's outer engine on the analytic `V′`, `V″`.
     ///
     /// The domain is the term's own resolvability interval (#2812): the
@@ -873,6 +939,98 @@ impl<'a> GaussianRemlProblem<'a> {
         }
         Ok(result.rho[0])
     }
+}
+
+/// Fit the penalty null space `N` (`p × k`) from the sufficient statistics.
+///
+/// `P_null = yᵀWy − gᵀĉ`, with `G = NᵀXᵀWXN`, `g = NᵀXᵀWy` and `ĉ = G⁻¹g`, is a
+/// cancelling difference. To first order, rounding `δg`, `δG` in the accumulated
+/// statistics moves it by `−2ĉᵀδg + ĉᵀδGĉ`. Under the `γ_m = m·ε/(1 − m·ε)` model
+/// each accumulation is off by at most `γ_m` times the absolute sum of its
+/// elementary terms. The resolution is therefore
+/// `γ_m·(yᵀWy + 2|ĉ|ᵀ|g| + |ĉ|ᵀ|G||ĉ|)`, where `|g|` and `|G|` are those absolute
+/// term sums. `m` adds up the accumulation depths and the solve's backward
+/// errors: `n` rows, `p²` products per entry of `G` and `p` per entry of `g`,
+/// `γ_{k+1}` for the `k×k` Cholesky factor, `γ_k` for each of its two triangular
+/// solves (Higham, *Accuracy and Stability of Numerical Algorithms*, chs. 8 and
+/// 10), `k` for the fitted energy, and one subtraction. Both factors are
+/// derived, and the bar scales with the response energy, so it is invariant to
+/// a rescaling of `y`.
+fn null_space_fit(
+    xtwx: &[Vec<f64>],
+    xtwx_magnitude: &[Vec<f64>],
+    xtwy: &[f64],
+    xtwy_magnitude: &[f64],
+    ywy: f64,
+    null_basis: &[Vec<f64>],
+    rows: usize,
+) -> Result<NullSpaceFit, String> {
+    let p = xtwy.len();
+    if null_basis.len() != p {
+        return Err(format!(
+            "coactivation REML: the null-space basis has {} rows for {p} coefficients",
+            null_basis.len()
+        ));
+    }
+    let k = null_basis.first().map_or(0, |row| row.len());
+    let mut gram = vec![vec![0.0_f64; k]; k];
+    let mut gram_magnitude = vec![vec![0.0_f64; k]; k];
+    let mut rhs = vec![0.0_f64; k];
+    let mut rhs_magnitude = vec![0.0_f64; k];
+    for i in 0..k {
+        for a in 0..p {
+            let n_ai = null_basis[a][i];
+            rhs[i] += n_ai * xtwy[a];
+            rhs_magnitude[i] += n_ai.abs() * xtwy_magnitude[a];
+            for j in 0..k {
+                for b in 0..p {
+                    let n_bj = null_basis[b][j];
+                    gram[i][j] += n_ai * xtwx[a][b] * n_bj;
+                    gram_magnitude[i][j] += (n_ai * n_bj).abs() * xtwx_magnitude[a][b];
+                }
+            }
+        }
+    }
+    let factor = cholesky_decompose(&gram)?;
+    let c = cholesky_solve(&factor, &rhs);
+    let penalized_rss = ywy - dot(&rhs, &c);
+    let mut magnitude = ywy;
+    for i in 0..k {
+        magnitude += 2.0 * c[i].abs() * rhs_magnitude[i];
+        for j in 0..k {
+            magnitude += c[i].abs() * gram_magnitude[i][j] * c[j].abs();
+        }
+    }
+    let operations = rows + p * p + p + (k + 1) + 2 * k + k + 1;
+    let n_eps = operations as f64 * f64::EPSILON;
+    let resolution = if n_eps < 1.0 {
+        n_eps / (1.0 - n_eps) * magnitude
+    } else {
+        f64::INFINITY
+    };
+    let coef = null_basis.iter().map(|row| dot(row, &c)).collect();
+    Ok(NullSpaceFit {
+        coef,
+        penalized_rss,
+        resolution,
+    })
+}
+
+/// A basis of the null space of the penalty `diag(0, D_mᵀD_m)` on the design
+/// `[1, gate·B(x)]`, as `(width + 1) × (1 + m)` columns. The columns are the
+/// intercept and the coefficient sequences `k^j` (`j < m`) that every order-`m`
+/// difference annihilates.
+fn penalty_null_basis(width: usize, order: usize) -> Vec<Vec<f64>> {
+    let mut basis = vec![vec![0.0_f64; 1 + order]; width + 1];
+    basis[0][0] = 1.0;
+    for k in 0..width {
+        let mut power = 1.0_f64;
+        for j in 0..order {
+            basis[k + 1][j + 1] = power;
+            power *= k as f64;
+        }
+    }
+    basis
 }
 
 fn difference_penalty(width: usize, order: usize) -> Result<Vec<Vec<f64>>, String> {
@@ -1182,8 +1340,15 @@ mod tests {
                 penalty[r + 1][c + 1] = beta_penalty[r][c];
             }
         }
-        let problem =
-            GaussianRemlProblem::new(&design, &y, &weights, &penalty, 2).expect("REML problem");
+        let problem = GaussianRemlProblem::new(
+            &design,
+            &y,
+            &weights,
+            &penalty,
+            2,
+            &penalty_null_basis(3, 1),
+        )
+        .expect("REML problem");
         let step = 1.0e-5;
         for rho in [-3.0_f64, 0.0, 4.0] {
             let (value, gradient, hessian) = problem.jet(rho).expect("jet");
