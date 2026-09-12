@@ -1651,8 +1651,10 @@ pub(super) fn pirls_soft_acceptance(
     // `relative_gradient_norm`, the Δdeviance against `scaled_dev_tol` — so the
     // relative-band plateau is equivariant rather than mixing the two scales
     // (which the old `objective_scale`-only gradient test did, and which the
-    // `.max(1.0)` floor then masked at unit scale).
-    if state.relative_gradient_norm(projected_grad) <= progress_tol.max(1e-6)
+    // `.max(1.0)` floor then masked at unit scale). The gradient band is
+    // `progress_tol` itself: a `.max(1e-6)` floor widened it for every caller
+    // asking for sub-1e-6 precision, the defect `near_stationary_kkt` records.
+    if state.relative_gradient_norm(projected_grad) <= progress_tol
         && dev_change.abs() < scaled_dev_tol * 0.1
         && dev_change >= 0.0
     {
