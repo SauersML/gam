@@ -487,3 +487,159 @@ fn rho_local_efs_refusal_resumes_bfgs_from_last_finite_incumbent_once_2653() {
     );
 }
 
+/// #2817 — a step-norm stop is not stationarity. The EFS map proposes no step,
+/// so the fixed-point walk stops at the seed, while the analytic gradient there
+/// is 1 in every coordinate. The runner must judge that stop with the screening
+/// certificate and hand the exact incumbent to the analytic-gradient plan. It
+/// used to return a convergence claim, which the plan refuted only after it had
+/// abandoned the seed.
+#[test]
+fn a_step_norm_stop_at_a_non_stationary_point_continues_the_incumbent_2817() {
+    let efs_calls = Arc::new(AtomicUsize::new(0));
+    let problem = OuterProblem::new(3)
+        .with_gradient(Derivative::Analytic)
+        .with_hessian(DeclaredHessianForm::Unavailable)
+        .with_max_iter(20);
+    let mut obj = problem.build_objective(
+        (),
+        |_: &mut (), theta: &Array1<f64>| Ok(0.5 * theta.dot(theta)),
+        |_: &mut (), theta: &Array1<f64>| {
+            Ok(OuterEval {
+                cost: 0.5 * theta.dot(theta),
+                gradient: theta.clone(),
+                hessian: HessianValue::Unavailable,
+                inner_beta_hint: None,
+            })
+        },
+        None::<fn(&mut ())>,
+        {
+            let efs_calls = Arc::clone(&efs_calls);
+            Some(move |_: &mut (), theta: &Array1<f64>| {
+                efs_calls.fetch_add(1, Ordering::Relaxed);
+                Ok(EfsEval {
+                    cost: 0.5 * theta.dot(theta),
+                    steps: vec![0.0; theta.len()],
+                    beta: None,
+                    psi_gradient: None,
+                    psi_indices: None,
+                    inner_hessian_scale: None,
+                    logdet_enclosure_gap: None,
+                    consecutive_restored_incumbents: None,
+                })
+            })
+        },
+    );
+    let capability = obj.capability();
+    let the_plan = plan(&capability);
+    assert_eq!(the_plan.solver, Solver::Efs);
+    let seed = Array1::from_elem(3, 1.0);
+
+    let request = match run_fixed_point_outer_solver(
+        &mut obj,
+        capability.theta_layout(),
+        capability.barrier_config.clone(),
+        &problem.config(),
+        "non-stationary EFS step-norm stop",
+        &seed,
+        the_plan,
+        "EFS",
+        "EFS failed",
+    ) {
+        Err(FixedPointOuterRunError::IterationRejected(request)) => request,
+        Ok(result) => panic!(
+            "a zero EFS step at |g| = sqrt(3) came back as a result (converged={}) \
+             instead of continuing the incumbent",
+            result.converged()
+        ),
+        Err(FixedPointOuterRunError::SeedRejected(error)) => {
+            panic!("the finite seed evaluation succeeded; this is not a seed rejection: {error}")
+        }
+        Err(FixedPointOuterRunError::ImmediateFallback(_)) => {
+            panic!("the step-norm stop must be screened, not routed as a solver request")
+        }
+        Err(FixedPointOuterRunError::Failed(error)) => {
+            panic!("a refused step-norm stop was made fatal: {error}")
+        }
+    };
+    assert!(request.refusal.is_recoverable());
+    assert_eq!(request.checkpoint.point, seed);
+    assert_eq!(request.checkpoint.plan_used.solver, Solver::Efs);
+    assert_eq!(
+        efs_calls.load(Ordering::Relaxed),
+        1,
+        "the seed sample serves iteration zero, so the stop is judged without another EFS evaluation"
+    );
+}
+
+/// Positive control for the pin above: the same zero EFS step at a point whose
+/// analytic gradient is zero is stationary, and screening certifies it in the
+/// runner.
+#[test]
+fn a_step_norm_stop_at_a_stationary_point_is_certified_2817() {
+    let problem = OuterProblem::new(3)
+        .with_gradient(Derivative::Analytic)
+        .with_hessian(DeclaredHessianForm::Unavailable)
+        .with_max_iter(20);
+    let mut obj = problem.build_objective(
+        (),
+        |_: &mut (), theta: &Array1<f64>| Ok(0.5 * theta.dot(theta)),
+        |_: &mut (), theta: &Array1<f64>| {
+            Ok(OuterEval {
+                cost: 0.5 * theta.dot(theta),
+                gradient: theta.clone(),
+                hessian: HessianValue::Unavailable,
+                inner_beta_hint: None,
+            })
+        },
+        None::<fn(&mut ())>,
+        Some(|_: &mut (), theta: &Array1<f64>| {
+            Ok(EfsEval {
+                cost: 0.5 * theta.dot(theta),
+                steps: vec![0.0; theta.len()],
+                beta: None,
+                psi_gradient: None,
+                psi_indices: None,
+                inner_hessian_scale: None,
+                logdet_enclosure_gap: None,
+                consecutive_restored_incumbents: None,
+            })
+        }),
+    );
+    let capability = obj.capability();
+    let the_plan = plan(&capability);
+    assert_eq!(the_plan.solver, Solver::Efs);
+    let seed = Array1::<f64>::zeros(3);
+
+    let result = match run_fixed_point_outer_solver(
+        &mut obj,
+        capability.theta_layout(),
+        capability.barrier_config.clone(),
+        &problem.config(),
+        "stationary EFS step-norm stop",
+        &seed,
+        the_plan,
+        "EFS",
+        "EFS failed",
+    ) {
+        Ok(result) => result,
+        Err(FixedPointOuterRunError::IterationRejected(request)) => {
+            panic!("a stationary step-norm stop was refused: {}", request.refusal)
+        }
+        Err(FixedPointOuterRunError::SeedRejected(error)) => {
+            panic!("the finite seed evaluation succeeded; this is not a seed rejection: {error}")
+        }
+        Err(FixedPointOuterRunError::ImmediateFallback(_)) => {
+            panic!("a zero step at a zero gradient is not a solver request")
+        }
+        Err(FixedPointOuterRunError::Failed(error)) => {
+            panic!("a stationary step-norm stop was made fatal: {error}")
+        }
+    };
+    assert!(
+        result.converged(),
+        "screening certifies a zero-gradient stop in the runner"
+    );
+    assert!(result.criterion_certificate.is_some());
+    assert_eq!(result.rho, seed);
+}
+
