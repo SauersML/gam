@@ -2027,7 +2027,6 @@ pub struct SurrogateLaneConfig {
     pub rel_tol: f64,
     pub power_iters: usize,
     pub cg_rel_tol: f64,
-    pub cg_max_iters: usize,
     pub deflation_max_rank: usize,
     pub deflation_subspace_iters: usize,
     pub deflation_target_std_err_rel: f64,
@@ -2276,7 +2275,7 @@ fn matrix_free_arrow_evidence_log_det_surrogate_core(
     // frame is only staged on the CPU lane.
     let cfg_apply_budget = lane
         .as_ref()
-        .map(|s| s.cfg.num_probes.saturating_mul(s.cfg.cg_max_iters))
+        .map(|s| s.cfg.num_probes.saturating_mul(sys.k))
         .unwrap_or_else(|| slq_num_probes.saturating_mul(slq_lanczos_steps));
     let device_matvec =
         maybe_build_evidence_gpu_matvec(sys, ridge_t, ridge_beta, options, cfg_apply_budget)?;
@@ -2380,7 +2379,7 @@ fn matrix_free_arrow_evidence_log_det_surrogate_core(
                         cfg.rel_tol,
                         cfg.power_iters,
                         cfg.cg_rel_tol,
-                        cfg.cg_max_iters,
+                        dim,
                         cfg.deflation_max_rank,
                         cfg.deflation_subspace_iters,
                         cfg.deflation_target_std_err_rel,
@@ -2399,7 +2398,7 @@ fn matrix_free_arrow_evidence_log_det_surrogate_core(
                                 resident.as_ref(),
                                 gpu_matvec,
                                 cfg.power_iters,
-                                cfg.cg_max_iters,
+                                dim,
                                 slq_seed,
                             )?
                         }
@@ -2467,7 +2466,7 @@ fn matrix_free_arrow_evidence_log_det_surrogate_core(
                             &matvec,
                             &precond,
                             state.cfg.cg_rel_tol,
-                            state.cfg.cg_max_iters,
+                            dim,
                         )
                         .ok_or_else(|| ArrowSchurError::SchurFactorFailed {
                             reason: "rational log-det surrogate evaluation returned non-finite"
@@ -2497,7 +2496,7 @@ fn matrix_free_arrow_evidence_log_det_surrogate_core(
                         &plan.probes,
                         state.warm_inverse_probes.as_deref(),
                         state.cfg.cg_rel_tol,
-                        state.cfg.cg_max_iters,
+                        dim,
                     )
                     .ok_or_else(|| ArrowSchurError::SchurFactorFailed {
                         reason: "rational surrogate inverse-probe bundle solve failed".to_string(),

@@ -884,7 +884,6 @@ pub(crate) fn assignment_strength_gradient_coordinate(rho: &SaeManifoldRho) -> O
 const SAE_SURROGATE_LANE_QUADRATURE_REL_TOL: f64 = 1.0e-8;
 const SAE_SURROGATE_LANE_POWER_ITERS: usize = 40;
 const SAE_SURROGATE_LANE_CG_REL_TOL: f64 = 1.0e-8;
-const SAE_SURROGATE_LANE_CG_MAX_ITERS: usize = 20_000;
 const SAE_SURROGATE_LANE_DEFLATION_MAX_RANK: usize = 128;
 const SAE_SURROGATE_LANE_DEFLATION_SUBSPACE_ITERS: usize = 4;
 
@@ -895,7 +894,6 @@ pub(crate) fn sae_surrogate_lane_config() -> SurrogateLaneConfig {
         rel_tol: SAE_SURROGATE_LANE_QUADRATURE_REL_TOL,
         power_iters: SAE_SURROGATE_LANE_POWER_ITERS,
         cg_rel_tol: SAE_SURROGATE_LANE_CG_REL_TOL,
-        cg_max_iters: SAE_SURROGATE_LANE_CG_MAX_ITERS,
         deflation_max_rank: SAE_SURROGATE_LANE_DEFLATION_MAX_RANK,
         deflation_subspace_iters: SAE_SURROGATE_LANE_DEFLATION_SUBSPACE_ITERS,
         deflation_target_std_err_rel: 0.1 * SAE_MANIFOLD_INNER_OBJECTIVE_STALL_REL_TOL,

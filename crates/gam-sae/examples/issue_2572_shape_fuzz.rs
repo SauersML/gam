@@ -216,7 +216,6 @@ fn run_cell(cell: &Cell) -> Result<String, String> {
         rel_tol: 1.0e-4,
         power_iters: 8,
         cg_rel_tol: 1.0e-4,
-        cg_max_iters: 400,
         deflation_max_rank: 8,
         deflation_subspace_iters: 2,
         deflation_target_std_err_rel: 1.0e-2,
