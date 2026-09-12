@@ -1266,5 +1266,16 @@
     },
     "reason": "SPEC rule 25 (unnecessary options are deleted), #2898. The firth_pair_terms_unavailable downgrade in the tau-tau Hessian policy was hardcoded false at both production call sites, so it never fired. Its policy, byte plans, the DirectionalHyperParam helpers only the plan read, the penaltysecond_partner_indices setter and the tests pinning the policy had no other consumer. No replacement is needed: exact tau-tau Hessian requests reach the unified evaluator unmodified, as they already did.",
     "evidence": "git grep over crates at 5b2452012 finds exact_tau_tau_hessian_policy_with_firth called only from reml/hyper.rs and estimate/joint_hyper.rs, each with firth_pair_terms_unavailable = false. prefer_gradient_only and total_bytes in reml/mod.rs are called only from those warn blocks. has_implicit_multidim_duchon, penalty_first_component_count and has_penaltysecond_pair_at are called only from the policy constructor. with_penaltysecond_partner_indices is called only at spatial_optimization.rs:1285, which this change removes. The four tests call only the deleted policy. This removed map lists every pub/pub(crate) fn this change deletes from reml/mod.rs, which is the scope of public_api_census.py's public_functions predicate."
+  },
+  {
+    "base": "3e5348c9473ba966b2d115cd84cdfd2f923cd96a",
+    "removed": {
+      "crates/gam-math/src/order2_graph.rs::into_order2": 1,
+      "crates/gam-math/src/order2_graph.rs::lower_into": 1,
+      "crates/gam-math/src/order2_graph.rs::new": 1,
+      "crates/gam-math/src/order2_graph.rs::reset": 1
+    },
+    "reason": "SPEC rule 1 (#2901 V2): Order2Graph is reverse-mode AD with zero consumers, and its public methods go with it.",
+    "evidence": "The explicit pub fn declarations in crates/gam-math/src/order2_graph.rs are Order2GraphWorkspace::new and ::reset, Order2Graph::lower_into, and into_order2 in the file's cfg(test) test_support module. That is public_api_census.py's public_functions predicate over the deleted file. At the base, git grep -w finds no use of Order2Graph or Order2GraphWorkspace outside the file and its pub mod line."
   }
 ]
