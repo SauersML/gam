@@ -4088,134 +4088,6 @@ impl BernoulliMarginalSlopeFamily {
         let slices = block_slices(self);
         let flex_active = self.effective_flex_active(block_states)?;
 
-        // ── Block-diagonal direct path (rigid, p < 512) ─────────────────
-        //
-        // The RowKernel<2> is the single source of truth in objective space
-        // (negative log-likelihood). The full joint Hessian's off-diagonal
-        // marginal/slope cross block is unused by the per-block working
-        // sets the inner solver consumes, so we accumulate only the two
-        // diagonal blocks via the family's sparse-aware syr / axpy.  This
-        // avoids the Θ(n·(p_m+p_g)²) joint assembly + immediate slice that
-        // the previous implementation paid.
-        if !flex_active && slices.total < 512 {
-            let kern = BernoulliRigidRowKernel::new(self.clone(), block_states.to_vec());
-            let cache = build_row_kernel_cache(&kern, &crate::row_kernel::RowSet::All)?;
-            let ll = row_kernel_log_likelihood(&cache, &crate::row_kernel::RowSet::All);
-            let joint_gradient = Self::exact_newton_score_from_objective_gradient(
-                row_kernel_gradient(&kern, &cache, &crate::row_kernel::RowSet::All),
-            );
-
-            let n = cache.n;
-            let p_marginal = slices.marginal.len();
-            let p_slope = slices.slope.len();
-            let make_pair = || {
-                (
-                    Array2::<f64>::zeros((p_marginal, p_marginal)),
-                    Array2::<f64>::zeros((p_slope, p_slope)),
-                )
-            };
-            let row_chunk = bms_row_chunk_size(n);
-            let n_row_chunks = n.div_ceil(row_chunk);
-            let (hess_marginal, hess_slope) =
-                gam_linalg::pairwise_reduce::par_deterministic_try_block_fold(
-                    n_row_chunks,
-                    |chunk_range| -> Result<(Array2<f64>, Array2<f64>), String> {
-                        let (mut hm, mut hl) = make_pair();
-                        for chunk_idx in chunk_range {
-                            let start = chunk_idx * row_chunk;
-                            let end = (start + row_chunk).min(n);
-                            let rows = end - start;
-                            // Zero-copy fast path: borrow the chunk rows from the
-                            // stored dense matrix as `ArrayView2` (wrapped in
-                            // `CowArray`) when materialised, avoiding the per-chunk
-                            // `.to_owned()` copy on every pre-warm cycle.
-                            // `add_weighted_chunk_gram` is generic over
-                            // `Data<Elem = f64>`, so the view drives the identical
-                            // Gram kernel with identical arithmetic.
-                            let marginal_chunk: ndarray::CowArray<'_, f64, ndarray::Ix2> =
-                                match self.marginal_design.as_dense_ref() {
-                                    Some(x_full) => x_full.slice(s![start..end, ..]).into(),
-                                    None => self
-                                        .marginal_design
-                                        .try_row_chunk(start..end)
-                                        .map_err(|e| {
-                                            format!("bernoulli marginal_design try_row_chunk: {e}")
-                                        })?
-                                        .into(),
-                                };
-                            let slope_chunk: ndarray::CowArray<'_, f64, ndarray::Ix2> =
-                                match self.slope_design.as_dense_ref() {
-                                    Some(g_full) => g_full.slice(s![start..end, ..]).into(),
-                                    None => self
-                                        .slope_design
-                                        .try_row_chunk(start..end)
-                                        .map_err(|e| {
-                                            format!("bernoulli slope_design try_row_chunk: {e}")
-                                        })?
-                                        .into(),
-                                };
-                            let mut hm_w_buf = [0.0f64; ROW_CHUNK_SIZE];
-                            let mut hl_w_buf = [0.0f64; ROW_CHUNK_SIZE];
-                            let hm_w = &mut hm_w_buf[..rows];
-                            let hl_w = &mut hl_w_buf[..rows];
-                            for local_row in 0..rows {
-                                let h = &cache.hessians[start + local_row];
-                                hm_w[local_row] = h[0][0];
-                                hl_w[local_row] = h[1][1];
-                            }
-                            add_weighted_chunk_gram(&marginal_chunk, hm_w, &mut hm)?;
-                            add_weighted_chunk_gram(&slope_chunk, hl_w, &mut hl)?;
-                        }
-                        Ok((hm, hl))
-                    },
-                    |(mut lhm, mut lhl),
-                     (rhm, rhl)|
-                     -> Result<(Array2<f64>, Array2<f64>), String> {
-                        lhm += &rhm;
-                        lhl += &rhl;
-                        Ok((lhm, lhl))
-                    },
-                )?
-                .unwrap_or_else(make_pair);
-
-            let hess_marginal =
-                Self::exact_newton_observed_information_from_objective_hessian(hess_marginal);
-            let hess_slope =
-                Self::exact_newton_observed_information_from_objective_hessian(hess_slope);
-
-            let grad_marginal = joint_gradient.slice(s![slices.marginal.clone()]).to_owned();
-            let grad_slope = joint_gradient.slice(s![slices.slope.clone()]).to_owned();
-
-            let mut sets = vec![
-                BlockWorkingSet::ExactNewton {
-                    gradient: grad_marginal,
-                    hessian: SymmetricMatrix::Dense(hess_marginal),
-                },
-                BlockWorkingSet::ExactNewton {
-                    gradient: grad_slope,
-                    hessian: SymmetricMatrix::Dense(hess_slope),
-                },
-            ];
-            if let Some(range) = slices.h.as_ref() {
-                // Rigid mode does not exercise h/w; mirror the blockwise
-                // fallback by exposing zero working sets.
-                sets.push(BlockWorkingSet::ExactNewton {
-                    gradient: Array1::zeros(range.len()),
-                    hessian: SymmetricMatrix::Dense(Array2::zeros((range.len(), range.len()))),
-                });
-            }
-            if let Some(range) = slices.w.as_ref() {
-                sets.push(BlockWorkingSet::ExactNewton {
-                    gradient: Array1::zeros(range.len()),
-                    hessian: SymmetricMatrix::Dense(Array2::zeros((range.len(), range.len()))),
-                });
-            }
-            return Ok(FamilyEvaluation {
-                log_likelihood: ll,
-                blockworking_sets: sets,
-            });
-        }
-
         // ── Flex block-diagonal path ─────────────────────────────────
         // Flexible rows are independent once the intercept cache is built, so
         // `evaluate_flex_block_diagonals_from_cache` accumulates each row into
@@ -4226,13 +4098,16 @@ impl BernoulliMarginalSlopeFamily {
             return self.evaluate_flex_block_diagonals_from_cache(block_states, &slices, &cache);
         }
 
-        // ── Blockwise fallback (p >= 512) ───────────────────────────────
+        // ── Rigid block-diagonal path (every width) ─────────────────────
         //
-        // The joint dense Hessian is too large to materialise.  Block
-        // Hessians are assembled independently via the same per-row
-        // kernel, so the algebra is correct but not structurally guaranteed
-        // identical to the joint object.  This path should only be reached
-        // for very large models where memory is the binding constraint.
+        // One streamed pass per row chunk. Each row's value, score and primary
+        // curvature come from `rigid_row_kernel_eval`: the shipped order-two
+        // lowering of `rigid_standard_normal_program`, or the empirical-grid
+        // closed form pinned by `empirical_rigid_jet_oracle_tests`. The marginal
+        // and slope block Grams accumulate without an n-row cache and without a
+        // joint p×p assembly. A width switch used to send narrower models through
+        // a cached generic-jet lowering of the same declaration instead; nothing
+        // about the width favours that second lowering.
         let n = self.y.len();
         let p_marginal = slices.marginal.len();
         let p_slope = slices.slope.len();
