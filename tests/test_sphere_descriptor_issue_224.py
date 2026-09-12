@@ -1,12 +1,14 @@
-"""RED tests for issue #224: Sphere descriptor must not bind basis size
-to the number of evaluation rows, and ``basis_size`` must not require a
-Rust round-trip with bogus inputs.
+"""Contract tests for issue #224: a Sphere descriptor's basis size must not
+depend on the number of evaluation rows, and ``basis_size`` must be answerable
+without a Rust round-trip on synthetic inputs.
 
 See: https://github.com/SauersML/gam/issues/224
 
-Each test is an *intent* test: it asserts the descriptor contract the
-Python API advertises. They are expected to FAIL on `main` until the
-underlying bug is fixed.
+Each test asserts the descriptor contract the Python API advertises. Without
+explicit ``centers=``, ``Sphere.evaluate`` resolves centers by farthest-point
+sampling from the evaluation rows and refuses fewer than ``n_centers`` rows, so
+the tests that evaluate fewer rows than centers fail. That is the #224 defect,
+still unfixed, not an expected outcome.
 """
 
 from __future__ import annotations
