@@ -1244,8 +1244,8 @@ fn build_row_procedural_matvec(
 ///
 /// `S` is the already-reduced symmetric positive-definite `K × K` Schur
 /// complement the streaming SAE joint fit accumulates across minibatches
-/// (`StreamingArrowSchur::take_accumulators` summed over chunks, with the
-/// global β ridge folded in). The per-row latent blocks have already been
+/// (the `StreamingArrowSchur` accumulator summed over chunks by
+/// `accumulate_chunk`, with the global β ridge folded in). The per-row latent blocks have already been
 /// eliminated into `S` on the host streaming path; the device's job is the
 /// dense `K`-dimensional solve, which is the dominant cost at `K = 100K`.
 ///

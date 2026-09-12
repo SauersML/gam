@@ -213,7 +213,7 @@ pub mod util;
 pub use gam_data as data;
 pub use gam_data::{encode_recordswith_inferred_schema, load_csvwith_inferred_schema};
 pub use geometry::{
-    CircleManifold, EuclideanManifold, GeodesicIntegrator, GeometryError, GeometryResult,
+    CircleManifold, EuclideanManifold, GeometryError, GeometryResult,
     GrassmannManifold, ManifoldSpec, ProductManifold, RiemannianLBFGS, RiemannianManifold,
     RiemannianObjective, RiemannianTrustRegion, SpdManifold, SphereManifold, StiefelManifold,
     TorusManifold,

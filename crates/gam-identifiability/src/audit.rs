@@ -17,7 +17,7 @@
 //     sharing identical raw-X columns may still be separately identifiable
 //     through orthogonal K-channels of the row Jacobian. Callers supply
 //     one `RowJacobianOperator` per block and a `RowHessian` structural
-//     metric; the audit routes through `compile_with_dual_metric` so the
+//     metric; the audit routes through `compile_with_dual_metric_protected` so the
 //     rank decision uses the structural metric rather than a
 //     possibly-rank-deficient pilot curvature.
 //
@@ -1999,7 +1999,7 @@ fn audit_identifiability_impl(
 ///
 /// `row_hess` is the structural row metric `K^S` (typically an
 /// [`crate::families::compiler::IdentityRowHessian`] —
-/// see [`compile_with_dual_metric`] for why the structural metric is
+/// see [`compile_with_dual_metric_protected`] for why the structural metric is
 /// the rank-decision metric, not the pilot curvature).
 ///
 /// The output [`IdentifiabilityAudit`] preserves the same contract as
@@ -2532,7 +2532,7 @@ pub fn audit_identifiability_channel_aware(
     // ones strong enough to break the inner solve regardless. Any remaining
     // joint-rank shortfall comes from either
     //   (a) per-block compile-time structural reductions — the compiler's
-    //       `compile_with_dual_metric` shrinks each block's kept basis when
+    //       `compile_with_dual_metric_protected` shrinks each block's kept basis when
     //       its own column space has redundancies, and that reduction is
     //       absorbed into `CompiledBlock::t_lw` (with the penalty pull-back
     //       enlarging the structural nullspace correspondingly), so the
@@ -2731,7 +2731,7 @@ pub fn audit_identifiability_channel_aware(
 /// numerical rank of `[J_joint; S_blockdiag]`, whose null space is precisely
 /// `ker(J_joint) ∩ ker(S)`.
 ///
-/// The structural rank from `compile_with_dual_metric` answers
+/// The structural rank from `compile_with_dual_metric_protected` answers
 /// `rank(J_joint)` alone — penalty-BLIND. A direction that is design-null
 /// (collinear in the row Jacobian) but COVERED by a block's smoothness
 /// penalty is still fully estimated by the penalized normal equations

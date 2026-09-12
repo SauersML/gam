@@ -150,56 +150,16 @@ pub fn cs_stacks(u: f64) -> ([f64; 5], [f64; 5]) {
     }
 }
 
-/// Derivative stack `[T, T′, T″, T‴, T⁗]` (in `w`) of
-/// `T(w) = atan(√w)/√w | artanh(√−w)/√−w`. Defined for `w > −1`
-/// (automatic in-chart: `w = κ‖·‖²` with `κ‖x‖² > −1` inside the ball).
-pub fn t_stacks(w: f64) -> [f64; 5] {
-    if w.abs() <= T_SERIES_W_MAX {
-        let mut t = [0.0; 5];
-        for (j, slot) in t.iter_mut().enumerate() {
-            // a_m = (−1)^m m!/(m−j)! w^{m−j} / (2m+1).
-            let mut term = 1.0;
-            for f in 1..=j {
-                let fj = f as f64;
-                term *= -fj * (2.0 * fj - 1.0) / (2.0 * fj + 1.0);
-            }
-            let mut acc = term;
-            for m in j..(j + T_SERIES_TERMS) {
-                let mf = m as f64;
-                let jf = j as f64;
-                term *= -w * (mf + 1.0) * (2.0 * mf + 1.0) / ((mf + 1.0 - jf) * (2.0 * mf + 3.0));
-                acc += term;
-            }
-            *slot = acc;
-        }
-        t
-    } else {
-        let t0 = if w > 0.0 {
-            let r = w.sqrt();
-            r.atan() / r
-        } else {
-            let r = (-w).sqrt();
-            r.atanh() / r
-        };
-        let mut t = [t0, 0.0, 0.0, 0.0, 0.0];
-        let mut r_j = 1.0 / (1.0 + w); // R⁽ʲ⁾ = (−1)^j j! / (1+w)^{j+1}
-        for j in 0..4 {
-            t[j + 1] = (r_j - (2.0 * j as f64 + 1.0) * t[j]) / (2.0 * w);
-            r_j *= -((j + 1) as f64) / (1.0 + w);
-        }
-        t
-    }
-}
-
-/// Order-≤2 slice `[T, T′, T″]` of [`t_stacks`] — the *exact* prefix the
-/// second-order κ-jets consume.
+/// Order-≤2 derivative stack `[T, T′, T″]` (in `w`) of
+/// `T(w) = atan(√w)/√w | artanh(√−w)/√−w` — the *exact* prefix the
+/// second-order κ-jets consume. Defined for `w > −1`.
 ///
 /// The κ-jets ride [`Tower2`], whose `compose_unary` reads only `d[0..=2]`; the
-/// `T‴`/`T⁗` slots the full [`t_stacks`] builds are pure waste on that path (in
-/// the series branch each is its own 48-term sum). Each slot `j` is an
+/// `T‴`/`T⁗` slots are pure waste on that path (in the series branch each is its
+/// own 48-term sum). Each slot `j` is an
 /// independent series, and the closed-form recurrence advances one slot at a
-/// time, so the first three entries are produced by the *identical* arithmetic
-/// as [`t_stacks`] — a strict, bit-for-bit prune of the discarded high orders.
+/// time, so these three entries are exactly the first three slots of the full
+/// five-slot stack.
 pub(crate) fn t_stacks3(w: f64) -> [f64; 3] {
     if w.abs() <= T_SERIES_W_MAX {
         let mut t = [0.0; 3];
@@ -327,11 +287,11 @@ pub(crate) fn cs_stacks3(u: f64) -> ([f64; 3], [f64; 3]) {
     }
 }
 
-/// Value-only `T(w)` — bit-for-bit `t_stacks(w)[0]` (and `t_stacks3(w)[0]`),
+/// Value-only `T(w)` — bit-for-bit `t_stacks3(w)[0]`,
 /// the *only* slot the geodesic-distance / log-map value paths consume.
 ///
-/// `distance`, `log_map`, and the radial code read just `[0]`, yet the full
-/// [`t_stacks`] builds five independent 48-term series to do it. This computes
+/// `distance`, `log_map`, and the radial code read just `[0]`, yet a derivative
+/// stack builds several independent 48-term series to do it. This computes
 /// the `j = 0` series alone — the identical arithmetic (`jf = 0`, so
 /// `mf + 1.0 - jf == mf + 1.0`) — and stops as soon as a term no longer moves
 /// the sum (monotone tail on `|w| ≤ T_SERIES_W_MAX`, so a strict no-op prune).
@@ -640,13 +600,12 @@ fn dirichlet_gram_assembly(
 }
 
 /// Pullback Dirichlet Gram of a basis whose latent is the TANGENT COORDINATE at
-/// the origin of `M_κ` — the κ-generic form of
-/// `crate::manifolds::poincare::conformal_dirichlet_penalty`.
+/// the origin of `M_κ`, for every constant curvature κ.
 ///
 /// # Why this exists
 ///
-/// The hyperbolic version hardcodes `κ = −1` through `require_negative_curvature`,
-/// which makes a SAE Poincaré atom a fixed-geometry special case rather than a
+/// A hyperbolic-only version hardcoded `κ = −1`, which made a SAE Poincaré atom
+/// a fixed-geometry special case rather than a
 /// member of the `S^d ← ℝ^d → H^d` family. Freeing κ is what lets one atom cover
 /// the whole family, so `Poincare` stops being its own topology and becomes
 /// `κ < 0` of a constant-curvature atom (#2604, #2603).
@@ -668,13 +627,12 @@ fn dirichlet_gram_assembly(
 ///   G(t) = λ^{d−2}[ e_t^{d−3} e_r (I − t̂t̂ᵀ) + e_t^{d−1} e_r⁻¹ t̂t̂ᵀ ]
 /// ```
 ///
-/// This is the SAME expression the hyperbolic version documents, with
+/// For `κ = −1` this is the closed-form hyperbolic pullback, with
 /// `tanh(s)/s → tn(r)/r`, `sech²(s) → tn′(r)`, `2cosh²(s) → 2/(1 + κ·tn(r)²)`.
 ///
 /// # Two exact reductions pin it
 ///
-/// * **κ = −1** reproduces `conformal_dirichlet_penalty` entry for entry — the
-///   same quantity by a different route, not merely a close one.
+/// * **κ = −1** is the hyperbolic tangent-chart pullback Gram, entry for entry.
 /// * **κ = 0** gives `G ≡ 2^{d−2} I` identically (not just as a `‖t‖ → 0`
 ///   limit), because `e_t = e_r = 1` and `λ = 2` for every `t`.
 ///
@@ -732,52 +690,6 @@ impl ConstantCurvature {
     /// Conformal factor λ_x = 2 / (1 + κ‖x‖²).
     pub fn conformal_factor(&self, x: ArrayView1<'_, f64>) -> GeometryResult<f64> {
         Ok(2.0 / self.chart_gauge(x)?)
-    }
-
-    /// Radial Jacobian determinant `J_κ(r) = det(d exp_μ)|_{‖v‖=r}` of the
-    /// exponential map in geodesic normal coordinates — the volume element that
-    /// converts the flat tangent measure `dr` into the Riemannian volume
-    /// `dvol_κ` at geodesic radius `r` from any base point (homogeneous, so it
-    /// depends only on `r`, never on the base).
-    ///
-    /// In a space form of curvature κ the Jacobi-field solution gives
-    /// `J_κ(r) = (sn_κ(r) / r)^{d−1}` with the curvature-normalized sine
-    /// `sn_κ(r) = sin(√κ r)/√κ` (κ>0), `r` (κ=0), `sinh(√−κ r)/√−κ` (κ<0).
-    /// Writing `S(u) = sn(t)/t` with `u = κ r²` (the entire function already in
-    /// the chart's [`cs_stacks`]), this is exactly `S(κ r²)^{d−1}` — analytic
-    /// through κ = 0 with no special case. `J_κ(0) = 1`.
-    ///
-    /// On a 1-D space form (`d = 1`) the exponent is 0, so `J_κ ≡ 1`: the exp
-    /// map is a radial isometry and the volume Jacobian carries no curvature
-    /// information (consistent with #944's reduced-information d = 1 power
-    /// analysis — there κ is identified by the conformal-factor term alone).
-    ///
-    /// Past the κ>0 conjugate radius (`√κ·r > π`, the antipodal shell) `S(u)`
-    /// turns negative. The geodesic ball is no longer embedded there, so the
-    /// well-defined non-negative volume element is `max(S(u), 0)^{d−1}` — the
-    /// clamp is on `S` itself, not on the (possibly even) power, so it stays a
-    /// genuine `→ 0⁺` collapse at the shell for every `d` (an even `d−1` would
-    /// otherwise resurrect a spurious positive volume past the cut). The
-    /// `response_kappa_bounds` cap keeps the search strictly before this shell;
-    /// the clamp only hardens stray CI/LR probes.
-    ///
-    /// This is the κ-dependent volume term whose log enters the #1104 honest
-    /// change-of-variables criterion and breaks the radius/scale degeneracy of
-    /// a dispersion-only curvature criterion.
-    pub fn jacobian_radial(&self, r: f64) -> f64 {
-        // The transverse exponent d − 1. At d ≤ 1 the exp map is a radial
-        // isometry (`d = 1`) or degenerate (`d = 0`): there are no transverse
-        // Jacobi directions, so J ≡ 1 with no exponentiation. Guarding `d ≤ 1`
-        // (not just `d == 1`) keeps a stray `d = 0` probe from forming `powi(−1)`.
-        if self.dim <= 1 {
-            return 1.0;
-        }
-        let exponent = (self.dim - 1) as i32;
-        let u = self.kappa * r * r;
-        let s = cs_val(u).1; // S(u) = sn_κ(r)/r ≥ 0 inside the chart
-        // Clamp S (not the power) at the κ>0 conjugate shell so the volume
-        // element collapses to 0⁺ there regardless of the parity of d−1.
-        s.max(0.0).powi(exponent)
     }
 
     /// Möbius addition `x ⊕_κ y` — the chart realization of geodesic

@@ -1102,7 +1102,98 @@
     "evidence": "At d1b00c6b2, git grep -nw over crates, src, tests, examples, bench and benches found only each item's own definition, doc comments, or its own error label; no caller and no named re-export in the facade or gam-pyffi. The wrapped implementations remain. MSI verification (ban scanner, workspace --all-targets check, cargo doc -p gam-predict) runs on the landed sha."
   },
   {
+    "base": "d33caf143c4c3a61d1ab0d3776a595286a87250d",
+    "items": [
+      "crates/gam-identifiability/src/families/compiler.rs:fn:build_primary_grams_gpu_or_cpu",
+      "crates/gam-identifiability/src/families/compiler.rs:fn:compile_with_dual_metric",
+      "crates/gam-identifiability/src/families/compiler.rs:fn:lift_coefficients",
+      "crates/gam-identifiability/src/families/compiler.rs:fn:pack_row_hessian_symmetric",
+      "crates/gam-identifiability/src/families/compiler.rs:fn:reduce_design",
+      "crates/gam-identifiability/src/families/compiler.rs:fn:reduce_penalties_with_map"
+    ],
+    "reason": "User directive 2026-09-11: delete code only tests use and code nothing uses. Five gam-identifiability compiler functions (compile_with_dual_metric, build_primary_grams_gpu_or_cpu, CompiledMap::reduce_design, CompiledMap::lift_coefficients, reduce_penalties_with_map) had no caller anywhere; pack_row_hessian_symmetric was called only by build_primary_grams_gpu_or_cpu.",
+    "evidence": "Re-confirmed at the tip with git grep -nw over crates src tests examples bench benches: hits were definitions, error strings inside their own bodies, and prose. compile_with_dual_metric was a thin wrapper over compile_with_dual_metric_protected, which keeps its algorithm doc. Gates pass base..head; MSI verification at the pushed sha follows."
+  },
+  {
+    "base": "0904dd2a25bf97d2a95f887cad4b404892695e9e",
+    "items": [
+      "crates/gam-sae/src/inference/harvest.rs:fn:activations_only",
+      "crates/gam-sae/src/inference/harvest.rs:fn:has_factors",
+      "crates/gam-sae/src/inference/harvest.rs:fn:has_fisher_tier",
+      "crates/gam-sae/src/inference/harvest.rs:fn:plan_next_tier",
+      "crates/gam-sae/src/inference/harvest.rs:fn:tier_metric",
+      "crates/gam-sae/src/inference/harvest.rs:fn:tier_provenance",
+      "crates/gam-sae/src/inference/harvest.rs:fn:tier_row_for",
+      "crates/gam-sae/src/inference/harvest.rs:fn:tier_rows",
+      "crates/gam-sae/src/inference/harvest.rs:fn:with_unweighted_tier",
+      "crates/gam-sae/src/tiered/mod.rs:fn:disabled",
+      "crates/gam-sae/src/tiered/mod.rs:fn:explained_variance_vs_mean",
+      "crates/gam-sae/src/tiered/mod.rs:fn:fit_position0_sink_atom",
+      "crates/gam-sae/src/tiered/mod.rs:fn:interference_subspace",
+      "crates/gam-sae/src/tiered/mod.rs:fn:linear_bulk",
+      "crates/gam-sae/src/tiered/mod.rs:fn:position_zero",
+      "crates/gam-sae/src/tiered/mod.rs:fn:reconstruct_with_sink",
+      "crates/gam-sae/src/tiered/mod.rs:fn:reconstruction",
+      "crates/gam-sae/src/tiered/mod.rs:fn:residual_after_sink",
+      "crates/gam-sae/src/tiered/mod.rs:struct:InterferenceSubspace",
+      "crates/gam-sae/src/tiered/mod.rs:struct:TieredConfig",
+      "crates/gam-sae/src/tiered/mod.rs:struct:TieredPrechartResidual",
+      "crates/gam-sae/src/tiered/mod.rs:struct:TieredSaeFit",
+      "crates/gam-sae/src/tiered/mod.rs:struct:WhitenedResidualHandoff"
+    ],
+    "reason": "user directive: delete all useless slop (only used by tests / unused)",
+    "evidence": "At 0904dd2a2, git grep -nw over crates, src, tests, examples, bench and benches found no caller of any item: each is named only by its own definition, its own error strings, doc links or doc prose. The cascade items were reachable only through deleted ones: InterferenceSubspace (used only by interference_subspace and WhitenedResidualHandoff), Tier05SinkAtom::reconstruction (called only by the two deleted sink methods), Tier05SinkAtomConfig::position_zero and ::disabled (called only by fit_position0_sink_atom and TieredConfig::linear_bulk), TieredConfig with linear_bulk (named by nothing), and TieredHarvest::tier_row_for and ::tier_rows (named only by has_factors and doc prose). No test called any item. MSI verification (ban scanner, workspace --all-targets check, cargo doc -p gam-sae, guard and census) runs on the landed sha."
+  },
+  {
     "base": "00735c57ef14174aa03fa006c28f1232052dbb1b",
+    "items": [
+      "crates/gam-geometry/src/closure_family.rs:fn:design_jet",
+      "crates/gam-geometry/src/integrator.rs:fn:default",
+      "crates/gam-geometry/src/integrator.rs:fn:default_has_expected_steps_and_step_size",
+      "crates/gam-geometry/src/integrator.rs:fn:dimension_mismatch_point_returns_error",
+      "crates/gam-geometry/src/integrator.rs:fn:euclidean_geodesic_is_straight_line",
+      "crates/gam-geometry/src/integrator.rs:fn:euclidean_zero_tangent_returns_same_point",
+      "crates/gam-geometry/src/integrator.rs:fn:integrate",
+      "crates/gam-geometry/src/integrator.rs:fn:integrator_default",
+      "crates/gam-geometry/src/integrator.rs:fn:single_step_integrator_still_recovers_euclidean_geodesic",
+      "crates/gam-geometry/src/integrator.rs:struct:GeodesicIntegrator",
+      "crates/gam-geometry/src/manifolds/constant_curvature.rs:fn:jacobian_radial",
+      "crates/gam-geometry/src/manifolds/constant_curvature.rs:fn:t_stacks",
+      "crates/gam-geometry/src/manifolds/poincare.rs:fn:conformal_dirichlet_penalty",
+      "tests/regressions/manifolds/geometry_bug_hunt.rs:fn:geodesic_integrator_should_approximately_conserve_energy_on_sphere"
+    ],
+    "reason": "User directive 2026-09-11: delete code only tests use and code nothing uses. gam-geometry GeodesicIntegrator (with integrate), ClosureFamily::design_jet, t_stacks, ConstantCurvature::jacobian_radial and conformal_dirichlet_penalty had no production caller; the integrator was exercised only by its own unit tests and one integration test.",
+    "evidence": "Re-confirmed at the tip with git grep -nw over crates src tests examples bench benches. Removed with the integrator module's unit tests, both GeodesicIntegrator re-exports, the geometry_bug_hunt energy test, and the doc-only stub tests/manifolds/smooths/poincare_conformal_dirichlet_penalty.rs left by c0a21b554. Docs that linked the deleted items were rewritten. Gates pass base..head; MSI verification at the pushed sha follows."
+  },
+  {
+    "base": "f83e9aebaf810a9fc42be420e8b1158ebfbfd1dc",
+    "items": [
+      "crates/gam-solve/src/arrow_schur/rational_logdet.rs:fn:with_deflation",
+      "crates/gam-solve/src/arrow_schur/rational_logdet.rs:fn:with_two_sided_deflation",
+      "crates/gam-solve/src/arrow_schur/reduced_solve.rs:fn:arrow_precond_ladder_iteration_study",
+      "crates/gam-solve/src/arrow_schur/reduced_solve.rs:fn:rational_reduced_schur_directional",
+      "crates/gam-solve/src/arrow_schur/reduced_solve.rs:fn:solve_streaming_reduced_beta",
+      "crates/gam-solve/src/arrow_schur/reduced_solve.rs:struct:PrecondLadderRow",
+      "crates/gam-solve/src/arrow_schur/solve_options.rs:fn:sqrt_ba",
+      "crates/gam-solve/src/arrow_schur/solve_options.rs:fn:with_solve_precision_policy",
+      "crates/gam-solve/src/arrow_schur/solve_options.rs:fn:with_streaming_chunk_size",
+      "crates/gam-solve/src/arrow_schur/system.rs:fn:add_analytic_penalty_contributions",
+      "crates/gam-solve/src/arrow_schur/system.rs:fn:add_beta_penalty",
+      "crates/gam-solve/src/arrow_schur/system.rs:fn:add_ext_coord_penalty",
+      "crates/gam-solve/src/arrow_schur/system.rs:fn:add_ext_coord_penalty_gradient_only",
+      "crates/gam-solve/src/arrow_schur/system.rs:fn:exact_arrow_log_det",
+      "crates/gam-solve/src/arrow_schur/system.rs:fn:new_matrix_free_shared",
+      "crates/gam-solve/src/arrow_schur/system.rs:fn:new_with_empty_hbb_and_htbeta_cols",
+      "crates/gam-solve/src/arrow_schur/system.rs:fn:schur_inverse_apply_deflated",
+      "crates/gam-solve/src/arrow_schur/system.rs:fn:schur_inverse_block_deflated",
+      "crates/gam-solve/src/arrow_schur/system.rs:fn:solve_with_lm_escalation",
+      "crates/gam-solve/src/arrow_schur/system.rs:fn:take_accumulators"
+    ],
+    "reason": "user directive: delete all useless slop",
+    "evidence": "At d1b00c6b2, git grep -nw over crates, src, tests, examples, bench and benches found no reference to any removed item outside its own definition, doc prose and error-message prefixes rewritten in this commit, and the removed ranges, with every hit set unchanged since the bab62c696 scan. The three pub(crate) penalty helpers were called only from add_analytic_penalty_contributions, and PrecondLadderRow was produced only by arrow_precond_ladder_iteration_study. Extents and prose anchors are asserted against the push base; MSI compile, doc, guard and census verification run on the landed sha."
+  },
+  {
+    "base": "a5a7b96ba25b9863eb0d68c376d4cc2a7de99202",
     "items": [
       "crates/gam-model-kernels/src/cubic_cell_kernel.rs:fn:base_moments_match_direct",
       "crates/gam-model-kernels/src/cubic_cell_kernel.rs:fn:cell_first_derivative_required_max_degree",

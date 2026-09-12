@@ -167,6 +167,17 @@
   },
   {
     "base": "00735c57ef14174aa03fa006c28f1232052dbb1b",
+    "reason": "User directive 2026-09-11: delete code only tests use and code nothing uses. gam-geometry GeodesicIntegrator (with integrate), ClosureFamily::design_jet, t_stacks, ConstantCurvature::jacobian_radial and conformal_dirichlet_penalty had no production caller; the integrator was exercised only by its own unit tests and one integration test.",
+    "evidence": "Re-confirmed at the tip with git grep -nw over crates src tests examples bench benches. Removed with the integrator module's unit tests, both GeodesicIntegrator re-exports, the geometry_bug_hunt energy test, and the doc-only stub tests/manifolds/smooths/poincare_conformal_dirichlet_penalty.rs left by c0a21b554. Docs that linked the deleted items were rewritten. Gates pass base..head; MSI verification at the pushed sha follows.",
+    "test_count_decrease": 6,
+    "removed_pins": {},
+    "unit_test_decreases": {
+      "crates/gam-geometry": 5,
+      "tests/regressions": 1
+    }
+  },
+  {
+    "base": "a5a7b96ba25b9863eb0d68c376d4cc2a7de99202",
     "reason": "user directive: delete all useless slop",
     "evidence": "The two gam-model-kernels unit tests removed (cell_moment_fingerprint_exact_cache_matches_current_evaluator, fuzzy_cell_moment_fingerprint_error_scales_with_epsilon) existed only to exercise cell_moment_cache_key, which only tests and the deleted cell_moment_dedup_large_scale_shape bench named; production evaluates cell moments without that key. Re-confirmed with git grep -nw over crates src tests examples bench benches. source_removal_guard and test_census pass base..head; MSI verification at the pushed sha follows.",
     "removed_pins": {},

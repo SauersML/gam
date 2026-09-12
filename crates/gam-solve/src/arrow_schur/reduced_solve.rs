@@ -1303,90 +1303,6 @@ pub(crate) fn solve_dense_reduced_system(
     Ok((delta, Some(factor), diag))
 }
 
-/// Solve an externally accumulated dense reduced β system
-/// `S Δβ = rhs_β` with the same LM-style ridge escalation the full-batch
-/// driver applies: on a `SchurFactorFailed` (non-PD or ill-conditioned `S`),
-/// geometrically grow a proximal ridge on `S`'s diagonal and retry.
-///
-/// Used by the SAE streaming joint fit, which accumulates `S` and `rhs_β` over
-/// re-materialized row chunks (via [`StreamingArrowSchur::take_accumulators`])
-/// and must solve the single global reduced system without a per-row
-/// `ArrowSchurSystem`. `S` is symmetrized from its lower triangle before each
-/// factorization. `base_ridge_beta` is folded into the caller's `S` already;
-/// this routine only adds the *escalation* ridge on top.
-pub fn solve_streaming_reduced_beta(
-    s_acc: &Array2<f64>,
-    rhs_beta: &Array1<f64>,
-    options: &ArrowSolveOptions,
-) -> Result<Array1<f64>, ArrowSchurError> {
-    let mut proximal_ridge = 0.0_f64;
-    let mut last_err: Option<ArrowSchurError> = None;
-    for attempt in 0..=DEFAULT_PROXIMAL_MAX_ATTEMPTS {
-        let mut schur = s_acc.clone();
-        symmetrize_upper_from_lower(&mut schur);
-        if proximal_ridge > 0.0 {
-            for j in 0..schur.nrows() {
-                schur[[j, j]] += proximal_ridge;
-            }
-        }
-        // Reduced K-system on device: Jacobi-preconditioned CG over the dense
-        // symmetric `S`. The `O(K²)` `S·p` matvec runs device-side; only the
-        // K-vectors cross the boundary per CG iteration. This is the dominant
-        // cost of the streaming SAE joint fit at `K = 100K`. Any device-side
-        // failure (`Unavailable`, non-PD Jacobi diagonal) falls through to the
-        // CPU `solve_dense_reduced_system`, which then drives the same proximal
-        // ridge escalation. A genuine device PD failure is non-recoverable for
-        // this attempt's `schur`, so we let the CPU path re-confirm and escalate.
-        if gam_gpu::device_runtime::GpuRuntime::resolve(options.gpu_policy)
-            .map_err(|error| ArrowSchurError::SchurFactorFailed {
-                reason: format!("GPU runtime resolution failed before reduced solve: {error}"),
-            })?
-            .is_some()
-        {
-            match crate::gpu_kernels::arrow_schur::solve_reduced_beta_pcg(
-                &schur,
-                rhs_beta,
-                options.trust_region.max_iterations,
-                options.trust_region.steihaug_relative_tolerance,
-            ) {
-                Ok(delta_beta) => return Ok(delta_beta),
-                Err(crate::gpu_kernels::arrow_schur::ArrowSchurGpuFailure::Unavailable) => {
-                    log::debug!("reduced solve: device unavailable; CPU path owns the solve");
-                }
-                Err(declined) => {
-                    // Device declined this `schur` (e.g. non-PD Jacobi diag);
-                    // let the CPU path confirm and escalate the proximal ridge.
-                    log::debug!(
-                        "reduced solve: device declined ({declined:?}); \
-                         CPU path confirms and escalates the proximal ridge"
-                    );
-                }
-            }
-        }
-        match solve_dense_reduced_system(&schur, rhs_beta, options, None) {
-            Ok((delta_beta, _factor, _diag)) => return Ok(delta_beta),
-            Err(err) => {
-                let recoverable = matches!(
-                    err,
-                    ArrowSchurError::SchurFactorFailed { .. }
-                        | ArrowSchurError::PcgFailed { .. }
-                        | ArrowSchurError::UnboundedNegativeCurvature { .. }
-                );
-                last_err = Some(err);
-                if !recoverable || attempt == DEFAULT_PROXIMAL_MAX_ATTEMPTS {
-                    break;
-                }
-                proximal_ridge = if proximal_ridge == 0.0 {
-                    DEFAULT_PROXIMAL_INITIAL_RIDGE
-                } else {
-                    proximal_ridge * DEFAULT_PROXIMAL_RIDGE_GROWTH
-                };
-            }
-        }
-    }
-    Err(last_err.expect("escalation loop set last_err on failure"))
-}
-
 pub(crate) fn step_inside_trust_region(
     step: ArrayView1<'_, f64>,
     radius: f64,
@@ -2984,7 +2900,7 @@ pub fn reduced_schur_negative_curvature<B: BatchedBlockSolver + Sync>(
 /// `eval.estimate` = the surrogate value `L̃ ≈ log|S|` (with `eval.std_err` the
 /// honest Hutchinson error bar), and (b) later contract the SAME shifted-solve
 /// bundle against any per-ρ-coordinate Schur-derivative operator `∂S` via
-/// `rational_reduced_schur_directional`. Because both the value and that
+/// `RationalLogdetPlan::directional_derivative`. Because both the value and that
 /// derivative are the exact value / gradient of the ONE deterministic function
 /// `L̃(ρ)` (fixed probes, fixed quadrature), the outer optimiser descends a
 /// function whose gradient is its own — the objective↔gradient desync class the
@@ -3138,7 +3054,7 @@ pub fn rational_reduced_schur_plan_derived<B: BatchedBlockSolver + Sync>(
         )
     })?;
     // One resident operator across the pilot, every deflation re-solve, and the
-    // subspace-iteration `with_two_sided_deflation` applies — the whole rank-derivation
+    // subspace-iteration `with_two_sided_deflation_preconditioned` applies — the whole rank-derivation
     // ladder (the two-sided deflation: block-power on S + inverse subspace
     // iteration on S⁻¹) reuses the same staged residency / device `S·v`.
     let op = ReducedSchurOperator::new(sys, htt_factors, ridge_beta, backend, resident)
@@ -3351,10 +3267,9 @@ pub struct ReducedSchurLogdetPrecondRow {
 /// log-determinant plan on one reduced Schur, once per preconditioner tier, and
 /// report what each cost.
 ///
-/// This is the evidence-side companion to
-/// `arrow_precond_ladder_iteration_study`, which does the same for the Newton
-/// PCG ladder. It exists because the two questions are different: the Newton
-/// ladder asks which preconditioner solves a STEP fastest, while this asks what
+/// It exists because the Newton PCG ladder and this study ask different
+/// questions: the Newton ladder asks which preconditioner solves a STEP fastest,
+/// while this asks what
 /// the log-determinant's shifted-solve ladder costs — and before #2576 that
 /// second question had no answer at all, because nothing measured it and the
 /// solves were unpreconditioned.
@@ -3712,26 +3627,6 @@ pub fn reduced_schur_logdet_shift_ladder_profile<B: BatchedBlockSolver + Sync>(
         symmetry_defect,
         bracket: (lambda_min, lambda_max),
     })
-}
-
-/// Contract the surrogate's shifted-solve bundle from
-/// [`rational_reduced_schur_log_det`] against a reduced-Schur derivative operator
-/// `∂S` (supplied through its matvec `dmatvec(v) = (∂S)·v`) to obtain the EXACT
-/// ρ-derivative of the surrogate value:
-/// `∂L̃ = (1/m)·Σ_{j,ℓ} w_ℓ · y_{jℓ}ᵀ (∂S) y_{jℓ}`, `y_{jℓ} = (S+t_ℓ I)⁻¹ v_j`.
-///
-/// This is the true gradient of the SAME function the value came from — value
-/// and gradient can never desync. Thin reduced-Schur wrapper over
-/// [`RationalLogdetPlan::directional_derivative`]; the `∂S` matvec is the
-/// per-ρ-coordinate Schur-derivative operator the SAE trace channels assemble
-/// row-locally (`(∂S)·y = (∂H_ββ)y − Σ_i[ (∂H_βt^(i))(H_tt⁻¹H_tβ y) −
-/// H_βt H_tt⁻¹(∂H_tt^(i))H_tt⁻¹H_tβ y + H_βt H_tt⁻¹(∂H_tβ^(i))y ]`).
-pub fn rational_reduced_schur_directional(
-    plan: &RationalLogdetPlan,
-    eval: &RationalLogdetEval,
-    dmatvec: &(impl Fn(ArrayView1<f64>) -> Array1<f64> + Sync),
-) -> Option<f64> {
-    plan.directional_derivative(eval, dmatvec)
 }
 
 /// Convergence certificate for one matrix-free reduced-Schur CG solve.
@@ -6318,157 +6213,6 @@ pub(crate) fn incomplete_cholesky_level0(
         }
     }
     Some((col_ptr, row_idx, val))
-}
-
-/// One row of the #299 preconditioner-ladder iteration study: the converged
-/// PCG iteration count and stop reason for a single preconditioner tier.
-#[derive(Debug, Clone, Copy)]
-pub struct PrecondLadderRow {
-    /// PCG iterations to convergence (or to the `MaxIter` cutoff).
-    pub iterations: usize,
-    /// Whether the PCG converged (vs hit `MaxIter` / negative curvature).
-    pub converged: bool,
-    /// Final relative residual reported by the PCG.
-    pub final_relative_residual: f64,
-}
-
-/// Full #299 ladder iteration study on one reduced-Schur system: run the SAME
-/// preconditioned CG (same `rhs`, tolerances, trust radius) once per ladder tier
-/// and report the iteration count of each. This is the public seam the
-/// `tests/owed_299.rs` iteration-reduction gate drives — it keeps the internal
-/// `run_pcg_with_preconditioner` / preconditioner constructors `pub(crate)`
-/// while exposing exactly the per-tier measurement the issue asks for.
-///
-/// Tiers (in escalation order): scalar `Diagonal`, `BetaBlockJacobi`,
-/// `ClusterJacobi`, `AdditiveSchwarz{overlap:1}`, `DiagAssembledSchwarz{1}`, and
-/// `BlockIncompleteCholesky`. A tier whose build fails (e.g. non-PD reduced
-/// Schur with no curvature floor) reports `None` for that entry; every healthy
-/// SPD reduced system populates all six.
-pub fn arrow_precond_ladder_iteration_study(
-    sys: &ArrowSchurSystem,
-    ridge_beta: f64,
-    rhs: &Array1<f64>,
-    pcg: &ArrowPcgOptions,
-    trust: &ArrowTrustRegionOptions,
-) -> Result<Vec<(SchurPreconditionerKind, Option<PrecondLadderRow>)>, ArrowSchurError> {
-    let backend = CpuBatchedBlockSolver;
-    let htt_factors = backend.factor_blocks(&sys.rows, 0.0, sys.d, false)?;
-
-    let run = |apply: &dyn Fn(&Array1<f64>) -> Array1<f64>| -> Option<PrecondLadderRow> {
-        let (_sol, diag) = run_pcg_with_preconditioner(
-            sys,
-            &htt_factors,
-            ridge_beta,
-            rhs,
-            |r| apply(r),
-            pcg,
-            trust,
-            &backend,
-            None,
-            None,
-            None,
-        )
-        .ok()?;
-        Some(PrecondLadderRow {
-            iterations: diag.iterations,
-            converged: matches!(diag.stopping_reason, PcgStopReason::Converged),
-            final_relative_residual: diag.final_relative_residual,
-        })
-    };
-
-    let mut out: Vec<(SchurPreconditionerKind, Option<PrecondLadderRow>)> = Vec::with_capacity(7);
-
-    // Scalar Diagonal Jacobi: force the scalar path by clearing block_offsets on
-    // a clone so the build does not pick up the per-block dense Schur blocks.
-    let diag_row = {
-        let mut bare = sys.clone();
-        bare.set_block_offsets(std::sync::Arc::from([] as [Range<usize>; 0]));
-        let bare_factors = backend.factor_blocks(&bare.rows, 0.0, bare.d, false)?;
-        JacobiPreconditioner::from_arrow_schur(&bare, &bare_factors, ridge_beta, &backend, None)
-            .ok()
-            .and_then(|p| {
-                run_pcg_with_preconditioner(
-                    &bare,
-                    &bare_factors,
-                    ridge_beta,
-                    rhs,
-                    |r| p.apply(r),
-                    pcg,
-                    trust,
-                    &backend,
-                    None,
-                    None,
-                    None,
-                )
-                .ok()
-                .map(|(_s, diag)| PrecondLadderRow {
-                    iterations: diag.iterations,
-                    converged: matches!(diag.stopping_reason, PcgStopReason::Converged),
-                    final_relative_residual: diag.final_relative_residual,
-                })
-            })
-    };
-    out.push((SchurPreconditionerKind::Diagonal, diag_row));
-
-    let block_row =
-        JacobiPreconditioner::from_arrow_schur(sys, &htt_factors, ridge_beta, &backend, None)
-            .ok()
-            .and_then(|p| run(&|r| p.apply(r)));
-    out.push((SchurPreconditionerKind::BetaBlockJacobi, block_row));
-
-    let cluster_row =
-        ClusterJacobiPreconditioner::from_arrow_schur(sys, &htt_factors, ridge_beta, &backend)
-            .ok()
-            .and_then(|p| run(&|r| p.apply(r)));
-    out.push((SchurPreconditionerKind::ClusterJacobi, cluster_row));
-
-    let covis_row = ClusterJacobiPreconditioner::from_arrow_schur_covisibility(
-        sys,
-        &htt_factors,
-        ridge_beta,
-        &backend,
-    )
-    .ok()
-    .and_then(|p| run(&|r| p.apply(r)));
-    out.push((
-        SchurPreconditionerKind::CoVisibilityClusterJacobi,
-        covis_row,
-    ));
-
-    let schwarz_row =
-        AdditiveSchwarzPreconditioner::from_arrow_schur(sys, &htt_factors, ridge_beta, &backend, 1)
-            .ok()
-            .and_then(|p| run(&|r| p.apply(r)));
-    out.push((
-        SchurPreconditionerKind::AdditiveSchwarz { overlap: 1 },
-        schwarz_row,
-    ));
-
-    let diag_schwarz_row = DiagAssembledSchwarzPreconditioner::from_arrow_schur(
-        sys,
-        &htt_factors,
-        ridge_beta,
-        &backend,
-        1,
-    )
-    .ok()
-    .and_then(|p| run(&|r| p.apply(r)));
-    out.push((
-        SchurPreconditionerKind::DiagAssembledSchwarz { overlap: 1 },
-        diag_schwarz_row,
-    ));
-
-    let ic0_row = BlockIncompleteCholeskyPreconditioner::from_arrow_schur(
-        sys,
-        &htt_factors,
-        ridge_beta,
-        &backend,
-    )
-    .ok()
-    .and_then(|p| run(&|r| p.apply(r)));
-    out.push((SchurPreconditionerKind::BlockIncompleteCholesky, ic0_row));
-
-    Ok(out)
 }
 
 /// Build scalar diagonal inverses for a set of global column indices.

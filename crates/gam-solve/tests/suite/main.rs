@@ -2,7 +2,6 @@
 //! standalone tests/*.rs crate and therefore its own link of gam-solve and
 //! its dependency tree. One binary, same tests, same names.
 
-mod arrow_schur_deflation_gate;
 mod bug_hunt_psis_light_tail_nan_khat;
 mod inner_fit_core_scaling;
 mod issue_1017_resident_frame;

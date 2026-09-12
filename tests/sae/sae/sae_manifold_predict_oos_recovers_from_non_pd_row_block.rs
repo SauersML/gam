@@ -12,7 +12,7 @@
 //! breaks the Cholesky.
 //!
 //! The principled fix routes every Newton-step solve through
-//! `ArrowSchurSystem::solve_with_lm_escalation`, which geometrically grows a
+//! `arrow_schur::newton_step::solve_with_lm_escalation_inner`, which geometrically grows a
 //! proximal ridge on top of `ridge_ext_coord` / `ridge_beta` until the
 //! per-row / Schur factor succeeds — the same Ceres-style LM damping the
 //! training-time `run_joint_fit_arrow_schur` driver already used inline.

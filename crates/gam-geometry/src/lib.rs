@@ -1,6 +1,5 @@
 pub mod closure_family;
 pub mod curvature_estimand;
-pub mod integrator;
 pub mod latent_seed;
 pub mod manifold;
 pub mod manifolds;
@@ -24,7 +23,6 @@ pub use curvature_estimand::{
     CurvatureVerdict, DesignCoordKappaJet, FlatnessTest, KappaEstimateSupport, KappaProfileCi,
     design_coord_kappa_derivative, flatness_lr_test, profile_ci_walk, wald_half_width,
 };
-pub use integrator::GeodesicIntegrator;
 pub use latent_seed::laplacian_eigenmap_coords;
 pub use manifold::{GeometryError, GeometryResult, ManifoldSpec, RiemannianManifold};
 pub use manifolds::{

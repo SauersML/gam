@@ -1,12 +1,12 @@
 {
-  "generated_from": "9709850b01468302f974ed116183a1843e958015",
+  "generated_from": "ec91a396a041e0f8fafabe0a8f8970d2712ceb24",
   "units": {
     "crates/gam-cli": 27,
     "crates/gam-config": 18,
     "crates/gam-custom-family": 289,
     "crates/gam-data": 47,
     "crates/gam-event-history": 121,
-    "crates/gam-geometry": 272,
+    "crates/gam-geometry": 267,
     "crates/gam-gpu": 76,
     "crates/gam-identifiability": 76,
     "crates/gam-inference": 137,
@@ -47,7 +47,7 @@
     "tests/pyffi": 16,
     "tests/quality": 430,
     "tests/quality_1082": 0,
-    "tests/regressions": 511,
+    "tests/regressions": 510,
     "tests/sae": 127,
     "tests/src_modules": 540,
     "tests/survival": 80,

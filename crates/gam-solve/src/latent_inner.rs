@@ -133,10 +133,9 @@ pub struct LatentInnerOutcome {
 /// The driver owns the basis evaluation (`Φ(t)`), the radial jet
 /// (`∂Φ/∂t` via
 /// [`gam_terms::latent::LatentCoordValues::design_gradient_wrt_t`]),
-/// the Gauss–Newton block assembly
+/// and the Gauss–Newton block assembly
 /// (`H_tt^(i) ← (g_i β)(g_i β)^T`, `H_tβ^(i) ← (g_i β) ⊗ Φ_i`,
-/// `H_ββ ← Φ^T W Φ + Σ_k λ_k S_k`), and the analytic-penalty fold-in via
-/// `crate::arrow_schur::ArrowSchurSystem::add_analytic_penalty_contributions`.
+/// `H_ββ ← Φ^T W Φ + Σ_k λ_k S_k`).
 pub trait ArrowSystemAssembler {
     /// Build a freshly-populated arrow system at the current `(β, t)`.
     ///

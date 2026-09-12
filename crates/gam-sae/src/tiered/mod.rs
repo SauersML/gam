@@ -34,20 +34,6 @@
 //!     It is typed structure, not a nuisance scalar: the atom keeps its
 //!     fixed-support anchors and decoder rows, is charged as a finite set, and
 //!     only the residual after peeling it is handed to semantic charting.
-//!   * [`TieredConfig`] — the composed-fit knobs.
-//!   * `interference_subspace` — Tier-1's active subspace `Q` (what the linear
-//!     dictionary already explains) and its orthogonal complement `Q⊥`. Per the
-//!     #2021 coupling the linear dictionary *is* the interference model for the
-//!     curved fit: the Tier-2 GLS weight down-weights `Q` (penalizes `Q⊥`), so
-//!     curved atoms chase only residual directions. Emitted so Tier-2 can install
-//!     a HELD `behavioral_fisher` metric (`structured_whitening=False`) — the
-//!     path that both realizes #2021 and avoids the structured-whitening fitter
-//!     bug.
-//!   * [`WhitenedResidualHandoff`] — the Mode-B (shared whitened residual)
-//!     hand-off to Tier-2.
-//!   * [`TieredSaeFit`] — the composed artifact. Generic over the Tier-2 artifact
-//!     type `T2` so the `tier2-curved` owner defines that struct without a
-//!     circular dependency on this module.
 //!
 //! Term-level composition (concatenating a Tier-1 linear term with a Tier-2
 //! curved term into one solve) already lives in [`crate::manifold`]:
@@ -70,12 +56,10 @@ pub use fit::{
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
-use gam_linalg::faer_ndarray::FaerEigh;
 use ndarray::{Array1, Array2, ArrayView2, Axis};
 
 use crate::basis::{AnchorIndicatorEvaluator, SaeBasisEvaluator};
 use crate::manifold::{SaeAtomBasisKind, SaeManifoldAtom, finite_set_rank_charge};
-use crate::sparse_dict::{SparseDictConfig, SparseDictFit};
 
 /// Tier-0: the single shared mean μ (length `p`). The global DC lives here, not
 /// duplicated across `K` per-atom intercepts.
@@ -292,22 +276,6 @@ impl Default for Tier05SinkAtomConfig {
 }
 
 impl Tier05SinkAtomConfig {
-    pub fn disabled() -> Self {
-        Self {
-            enabled: false,
-            include_position_zero: true,
-            delimiter_classes: Vec::new(),
-        }
-    }
-
-    pub fn position_zero() -> Self {
-        Self {
-            enabled: true,
-            include_position_zero: true,
-            delimiter_classes: Vec::new(),
-        }
-    }
-
     pub fn anchors(&self) -> Result<Vec<SinkAnchor>, String> {
         if !self.enabled {
             return Ok(Vec::new());
@@ -336,8 +304,8 @@ impl Tier05SinkAtomConfig {
 /// `SaeAtomBasisKind::FiniteSet`, the basis is a one-hot
 /// `AnchorIndicatorEvaluator`, and the row support is fixed from known
 /// positions/delimiter metadata before the decoder is fit. The atom is additive:
-/// downstream semantic charting sees `residual_after_sink`, while reconstruction
-/// adds the sink contribution back.
+/// downstream semantic charting sees the residual with the sink peeled off, while
+/// reconstruction adds the sink contribution back.
 #[derive(Clone, Debug)]
 pub struct Tier05SinkAtom {
     pub atom: SaeManifoldAtom,
@@ -345,47 +313,6 @@ pub struct Tier05SinkAtom {
     pub anchor_counts: Vec<usize>,
     pub rank_charge: usize,
     pub variance_absorbed: f64,
-}
-
-impl Tier05SinkAtom {
-    /// Dense training reconstruction of the sink atom (`N×P`).
-    pub fn reconstruction(&self) -> Array2<f64> {
-        self.atom.basis_values.dot(self.atom.decoder_coefficients())
-    }
-
-    /// Peel the sink from a same-row residual matrix before semantic charting.
-    pub fn residual_after_sink(
-        &self,
-        residual: ArrayView2<'_, f64>,
-    ) -> Result<Array2<f64>, String> {
-        let expected = (self.atom.basis_values.nrows(), self.atom.output_dim());
-        if residual.dim() != expected {
-            return Err(format!(
-                "Tier05SinkAtom::residual_after_sink: residual shape {:?} incompatible with atom rows/output ({}, {})",
-                residual.dim(),
-                self.atom.basis_values.nrows(),
-                self.atom.output_dim()
-            ));
-        }
-        Ok(&residual - &self.reconstruction())
-    }
-
-    /// Add the sink contribution back to a semantic reconstruction.
-    pub fn reconstruct_with_sink(
-        &self,
-        semantic_recon: ArrayView2<'_, f64>,
-    ) -> Result<Array2<f64>, String> {
-        let expected = (self.atom.basis_values.nrows(), self.atom.output_dim());
-        if semantic_recon.dim() != expected {
-            return Err(format!(
-                "Tier05SinkAtom::reconstruct_with_sink: reconstruction shape {:?} incompatible with atom rows/output ({}, {})",
-                semantic_recon.dim(),
-                self.atom.basis_values.nrows(),
-                self.atom.output_dim()
-            ));
-        }
-        Ok(&semantic_recon + &self.reconstruction())
-    }
 }
 
 /// Fit the Tier-0.5 sink atom on a post-Tier-0 residual.
@@ -528,232 +455,6 @@ pub fn fit_tier05_sink_atom(
     }))
 }
 
-/// Position-only convenience wrapper for the measured position-0 sink.
-pub fn fit_position0_sink_atom(
-    residual: ArrayView2<'_, f64>,
-    positions: &[i64],
-) -> Result<Tier05SinkAtom, String> {
-    let config = Tier05SinkAtomConfig::position_zero();
-    fit_tier05_sink_atom(residual, positions, &[], &config)?.ok_or_else(|| {
-        "fit_position0_sink_atom: position-0 sink config unexpectedly disabled".to_string()
-    })
-}
-
-/// Pre-chart residual after Tier-0 and optional Tier-0.5 peeling.
-#[derive(Clone, Debug)]
-pub struct TieredPrechartResidual {
-    pub tier0: Tier0Mean,
-    pub tier05_sink: Option<Tier05SinkAtom>,
-    /// Residual handed to semantic Tier-1/Tier-2 charting.
-    pub residual: Array2<f64>,
-}
-
-
-/// Knobs for a composed tiered fit.
-#[derive(Clone, Debug)]
-pub struct TieredConfig {
-    /// Tier-1 collapsed-linear sparse dictionary configuration (carries `K`, the
-    /// active budget `s`, epochs, and the GPU score-routing mode).
-    pub tier1: SparseDictConfig,
-    /// Rank `r` of the interference subspace `Q` handed to Tier-2 (`None` ⇒ pick
-    /// by the 99% energy threshold in `interference_subspace`).
-    pub lambda_seed_rank: Option<usize>,
-    /// Whether to run the Tier-2 curved tier at all (`false` ⇒ Tier-0 + Tier-1
-    /// only, the linear-bulk baseline).
-    pub tier2_enabled: bool,
-    /// Optional Tier-0.5 finite-anchor attention-sink atom, peeled after Tier-0
-    /// and before semantic Tier-1/Tier-2 charting.
-    pub tier05_sink: Tier05SinkAtomConfig,
-}
-
-impl TieredConfig {
-    /// A Tier-0 + Tier-1 config at dictionary width `k_linear` (Tier-2 disabled).
-    pub fn linear_bulk(k_linear: usize) -> Self {
-        Self {
-            tier1: SparseDictConfig::new(k_linear),
-            lambda_seed_rank: None,
-            tier2_enabled: false,
-            tier05_sink: Tier05SinkAtomConfig::disabled(),
-        }
-    }
-}
-
-/// Tier-1's active subspace: the directions the linear dictionary already
-/// explains (`q`), its orthogonal complement (`q_perp`), and the per-direction
-/// energy scale (`scale`, the singular values of the usage-weighted decoder).
-///
-/// `q` is `P×r` with orthonormal columns; `q_perp` is `P×(P−r)` with orthonormal
-/// columns; together they are a full orthonormal basis of `ℝ^P` (`q ⟂ q_perp`).
-///
-/// DIAGNOSTIC ONLY — span reporting. **Do NOT use `q_perp` as a GLS weight on the
-/// Tier-2 residual.** A `G = q_perp q_perpᵀ = I − q qᵀ` weight is a proven design
-/// error (audit 2026-07-03): a curve's chords span the curve's OWN plane, so the
-/// post-linear curvature signal (chord-sag) lives INSIDE `span(q)` — the measured
-/// counterexample put 95.4% of the residual energy inside `q` and a Q⊥ weight
-/// crushed the in-plane signal to noise. Curvature is a constraint AMONG the
-/// directions Tier-1 spans, not a direction it missed, so Tier-2 fits the RAW
-/// residual; anti-rechasing is priced by the evidence criterion (the ledger),
-/// never by a projector, and the only sanctioned reweighting is a soft `Σ̂`
-/// estimated from the actual (anisotropic) residual. See the
-/// `qperp_weight_is_blind_to_in_plane_curvature` regression test.
-#[derive(Clone, Debug)]
-pub struct InterferenceSubspace {
-    /// Active subspace, `P×r`, orthonormal columns (what Tier-1 explains).
-    pub q: Array2<f64>,
-    /// Orthogonal complement, `P×(P−r)`, orthonormal columns (`Q⊥`).
-    pub q_perp: Array2<f64>,
-    /// Singular values of the usage-weighted decoder along `q`, length `r`.
-    pub scale: Array1<f64>,
-}
-
-/// Compute Tier-1's [`InterferenceSubspace`] from a fitted sparse dictionary.
-///
-/// DIAGNOSTIC span report — how much of `ℝ^P` the linear dictionary already
-/// spans. It must NOT weight or gate the Tier-2 fit (see [`InterferenceSubspace`]
-/// for why `q_perp`-weighting is blind to curvature).
-///
-/// Forms the usage-weighted decoder Gram `G = Σ_k w_k d_k d_kᵀ` (`P×P`), where
-/// `d_k` is atom `k`'s decoder row and `w_k = Σ_i codes[i,k]²` is its total fired
-/// energy (so dead atoms contribute nothing and `Q` is genuinely the *active*
-/// subspace). The eigenvectors of `G` split into the top-`r` (the active subspace
-/// `Q`) and the trailing `P−r` (`Q⊥`); `scale = √eval` along `Q`.
-///
-/// `rank`: `Some(r)` pins `r = min(r, P)`; `None` keeps the smallest `r` whose
-/// eigen-energy reaches 99% of the total (at least 1).
-pub fn interference_subspace(
-    fit: &SparseDictFit,
-    rank: Option<usize>,
-) -> Result<InterferenceSubspace, String> {
-    let decoder = fit.decoder.view();
-    let k = decoder.nrows();
-    let p = decoder.ncols();
-    if k == 0 || p == 0 {
-        return Err("interference_subspace: empty decoder".to_string());
-    }
-
-    // Per-atom fired energy w_k = Σ_i codes[i,k]².
-    let mut weight = vec![0.0f64; k];
-    for (idx_row, code_row) in fit.indices.rows().into_iter().zip(fit.codes.rows()) {
-        for (&atom_u32, &code) in idx_row.iter().zip(code_row.iter()) {
-            let atom = atom_u32 as usize;
-            if atom < k {
-                weight[atom] += (code as f64) * (code as f64);
-            }
-        }
-    }
-
-    // Usage-weighted decoder `Dw` (K×P), Dw_k = √w_k · d_k, then G = Dwᵀ Dw (P×P)
-    // via a single GEMM rather than K rank-1 updates.
-    let mut dw = Array2::<f64>::zeros((k, p));
-    for atom in 0..k {
-        let sw = weight[atom].max(0.0).sqrt();
-        if sw == 0.0 {
-            continue;
-        }
-        let src = decoder.row(atom);
-        let mut dst = dw.row_mut(atom);
-        for c in 0..p {
-            dst[c] = sw * (src[c] as f64);
-        }
-    }
-    let gram = dw.t().dot(&dw);
-
-    // Symmetric eigendecomposition: ascending eigenvalues, columns are the
-    // orthonormal eigenvectors (leading direction is the LAST column).
-    let (evals, evecs) = gram
-        .eigh(faer::Side::Lower)
-        .map_err(|err| format!("interference_subspace eigensolve failed: {err}"))?;
-    let total: f64 = evals.iter().map(|&e| e.max(0.0)).sum();
-    if total <= 0.0 {
-        return Err(
-            "interference_subspace: Tier-1 decoder carries no fired energy (all atoms dead)"
-                .to_string(),
-        );
-    }
-
-    // Choose r (columns are ascending, so the active subspace is the TAIL).
-    let r = match rank {
-        Some(r) => r.min(p).max(1),
-        None => {
-            // Smallest r whose top-r eigen-energy reaches 99% of the total.
-            // 0.99 is a REPORTING tolerance for this span DIAGNOSTIC only (how
-            // many directions to list); it gates/weights no fit and prices no
-            // atom — decisions stay with the rank-charge evidence criterion.
-            let mut acc = 0.0f64;
-            let mut chosen = 1usize;
-            for (taken, &e) in evals.iter().rev().enumerate() {
-                acc += e.max(0.0);
-                chosen = taken + 1;
-                if acc >= 0.99 * total {
-                    break;
-                }
-            }
-            chosen.min(p).max(1)
-        }
-    };
-
-    // q = last r columns (largest eigenvalues), scale = √eval along q.
-    let mut q = Array2::<f64>::zeros((p, r));
-    let mut scale = Array1::<f64>::zeros(r);
-    for j in 0..r {
-        let col = p - 1 - j; // descending: p-1 is the largest
-        q.column_mut(j).assign(&evecs.column(col));
-        scale[j] = evals[col].max(0.0).sqrt();
-    }
-    // q_perp = the leading (p − r) columns (smallest eigenvalues), the complement.
-    let pr = p - r;
-    let mut q_perp = Array2::<f64>::zeros((p, pr));
-    for j in 0..pr {
-        q_perp.column_mut(j).assign(&evecs.column(j));
-    }
-
-    Ok(InterferenceSubspace { q, q_perp, scale })
-}
-
-/// Mode-B hand-off: the RAW post-Tier-1 shared residual handed to the Tier-2
-/// curved fit (`tier2-curved` / #17). Tier-2 fits its curved atoms on `residual`
-/// DIRECTLY — no projector weight. Anti-rechasing (a curved atom duplicating
-/// linear work) is priced by the evidence criterion, NOT enforced by a metric;
-/// the only sanctioned reweighting is a soft `Σ̂` estimated from this actual
-/// (anisotropic) residual. `interference` rides along as a span DIAGNOSTIC only —
-/// it must NOT gate or weight the fit (`q_perp`-weighting is blind to curvature;
-/// see [`InterferenceSubspace`]).
-#[derive(Clone, Debug)]
-pub struct WhitenedResidualHandoff {
-    /// Post-Tier-1 residual, `N×P`, f64. Without Tier-0.5 this is
-    /// `R = (z − μ) − T1.reconstruct()`; with a sink atom it is
-    /// `R = (z − μ − sink) − T1.reconstruct()`. Tier-2 fits this RAW residual
-    /// directly.
-    pub residual: Array2<f64>,
-    /// Tier-1's active subspace (`q`, `q_perp`, `scale`) — DIAGNOSTIC only.
-    pub interference: InterferenceSubspace,
-    /// The frozen Tier-1 decoder, `K×P` (for out-of-sample residual recompute).
-    pub tier1_decoder: Array2<f32>,
-    /// The Tier-0 shared mean μ, length `P`.
-    pub mean: Array1<f64>,
-    /// Optional Tier-0.5 finite-anchor attention-sink atom already peeled from
-    /// `residual`; downstream reconstruction adds it back before Tier-0.
-    pub tier05_sink: Option<Tier05SinkAtom>,
-}
-
-/// The composed tiered artifact. Generic over the Tier-2 artifact `T2` (defined
-/// by the `tier2-curved` owner as `Tier2CurvedArtifact`) so this container has no
-/// circular dependency on the curved-tier module. `tier2` is `None` when Tier-2
-/// is disabled or every curved birth is rejected.
-#[derive(Clone, Debug)]
-pub struct TieredSaeFit<T2> {
-    /// Tier-0 shared mean.
-    pub tier0: Tier0Mean,
-    /// Optional Tier-0.5 finite-anchor attention-sink atom.
-    pub tier05_sink: Option<Tier05SinkAtom>,
-    /// Tier-1 linear sparse-dictionary bulk.
-    pub tier1: SparseDictFit,
-    /// Tier-2 curved artifact (owner-defined), if present.
-    pub tier2: Option<T2>,
-    /// Combined held-in explained variance against the Tier-0 mean baseline.
-    pub explained_variance: f64,
-}
-
 /// `1 − RSS/TSS` — the one definition of explained variance in the SAE stack.
 ///
 /// Returns `NaN` when `tss` is not positive. With no variance to explain the
@@ -767,26 +468,6 @@ pub struct TieredSaeFit<T2> {
 /// question about the same quantity.
 pub fn explained_variance_from_sums(rss: f64, tss: f64) -> f64 {
     if tss > 0.0 { 1.0 - rss / tss } else { f64::NAN }
-}
-
-/// Explained variance `1 − RSS/TSS` of `recon` against `z`, with the total sum of
-/// squares taken about the supplied Tier-0 `mean` (the honest tiered baseline: a
-/// model must beat "predict the shared mean", not "predict zero").
-pub fn explained_variance_vs_mean(
-    z: ArrayView2<'_, f64>,
-    recon: ArrayView2<'_, f64>,
-    mean: &Array1<f64>,
-) -> f64 {
-    let mut rss = 0.0f64;
-    for (zr, rr) in z.rows().into_iter().zip(recon.rows()) {
-        for c in 0..z.ncols() {
-            let d = zr[c] - rr[c];
-            rss += d * d;
-        }
-    }
-    let baseline = &z - &mean.view().insert_axis(Axis(0));
-    let tss: f64 = baseline.iter().map(|&v| v * v).sum();
-    explained_variance_from_sums(rss, tss)
 }
 
 #[cfg(test)]
