@@ -260,9 +260,6 @@ impl JointLikelihood {
         })
     }
 
-    pub fn specification(&self) -> &JointSpecification {
-        &self.spec
-    }
     pub fn layout(&self) -> &JointParameterLayout {
         &self.layout
     }

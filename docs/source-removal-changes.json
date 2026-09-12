@@ -933,5 +933,17 @@
     ],
     "reason": "User directive 2026-09-11: delete source items only tests use, and code nothing uses. gam-model-api default_coefficient_gradient_cost was named only by its definition and prose; gam-data infer_and_encode_column_major had no production caller (gam-pyffi included).",
     "evidence": "Re-confirmed at the tip with git grep -nw over crates src tests examples bench benches. Removed with the one gam-data unit test that only exercised it, the typed-frame parity step of tests/misc/misc/owed_cli_categorical_roles.rs and that file's now-unused column_values helper. Gates test_census, source_removal_guard and public_api_census pass base..head; MSI verification at the pushed sha follows."
+  },
+  {
+    "base": "94410581a70e7b4b198e988d4b7ede898171f49f",
+    "items": [
+      "crates/gam-event-history/src/cohort.rs:fn:encode_level",
+      "crates/gam-event-history/src/cohort.rs:fn:terminal_marks",
+      "crates/gam-event-history/src/family.rs:fn:reference_grid",
+      "crates/gam-event-history/src/family.rs:fn:risk_set_centred",
+      "crates/gam-event-history/src/joint.rs:fn:specification"
+    ],
+    "reason": "user directive: delete all useless slop",
+    "evidence": "At 94410581a, git grep -nw over crates, src, tests, examples, bench and benches names terminal_marks, risk_set_centred and reference_grid only at their own definitions; the only other encode_level is a closure local to a test in crates/gam-models/src/inference/model.rs, and the only other specification is the helper fn in crates/gam-event-history/src/joint/reference_tests.rs or prose. No .name( or ::name( call of any of the five exists, and no test exercised them."
   }
 ]

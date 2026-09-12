@@ -338,10 +338,6 @@ impl EventHistoryFamily {
         self
     }
 
-    pub fn risk_set_centred(&self) -> bool {
-        self.reference.is_some()
-    }
-
     /// The reference law at exactly the supplied coefficient state.
     pub fn refresh_normaliser(&self, states: &[ParameterBlockState]) -> Result<RiskSetCentring, String> {
         self.computed_reference(states)
@@ -1265,12 +1261,6 @@ pub struct EventHistoryFit {
 }
 
 impl EventHistoryFit {
-    /// The reference grid the settled normaliser lives on, when the baselines
-    /// are the risk sets' rates.
-    pub fn reference_grid(&self) -> Option<&ReferenceGrid> {
-        self.centring.as_ref().map(|snapshot| &snapshot.grid)
-    }
-
     /// `log M_d(t)` for one stratum at an arbitrary time, by the same linear
     /// interpolation in the log of the normaliser the fit used. Empty when
     /// the baselines are centred on the stationary prior.

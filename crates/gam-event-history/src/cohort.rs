@@ -249,14 +249,6 @@ impl EventHistoryCohort {
         self.mark_names.len()
     }
 
-    /// One flag per mark: whether it is terminal.
-    pub fn terminal_marks(&self) -> Vec<bool> {
-        self.mark_kinds
-            .iter()
-            .map(|k| *k == MarkKind::Terminal)
-            .collect()
-    }
-
     /// Validate every subject and sort its events and segments in time.
     pub fn validate(&mut self) -> Result<(), EventHistoryError> {
         if self.mark_names.is_empty() {
@@ -490,21 +482,6 @@ impl EventHistoryCohort {
             return 1;
         }
         (widest / narrowest).log2().ceil().max(1.0).min(60.0) as usize
-    }
-
-    /// Encode the label of a categorical covariate into its code.
-    pub fn encode_level(&self, column: usize, label: &str) -> Result<f64, EventHistoryError> {
-        let levels = &self.covariate_levels[column];
-        levels
-            .iter()
-            .position(|l| l == label)
-            .map(|i| i as f64)
-            .ok_or_else(|| {
-                invalid(format!(
-                    "unknown level {label:?} for categorical covariate {:?}; levels: {:?}",
-                    self.covariate_names[column], levels
-                ))
-            })
     }
 }
 
