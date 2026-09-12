@@ -430,16 +430,20 @@ fn dirichlet_weight_coefficients(
     r: f64,
     d: usize,
 ) -> GeometryResult<(f64, f64, f64, f64)> {
-    if r <= GEOMETRY_EPS {
+    if r == 0.0 {
         // `D exp₀(0) = I`, so both eigenvalues are 1 and `λ = 2`; the weight is
-        // isotropic and its κ-movement vanishes with `r`.
+        // isotropic and its κ-movement vanishes with `r`. Any positive `r` takes
+        // the general branch, where `tn = r·S/C` divides back by `r` exactly.
         let iso = 2.0_f64.powi(d as i32 - 2);
         return Ok((iso, iso, 0.0, 0.0));
     }
     let u = kappa * r * r;
     let (c_stack, s_stack) = cs_stacks(u);
     let (c, s) = (c_stack[0], s_stack[0]);
-    if c.abs() <= GEOMETRY_EPS {
+    // Beyond the series branch `C = cos √u`, evaluated to one ulp at an argument
+    // carrying three roundings, so a conjugate-point cosine is resolved only above
+    // `γ_3·√|u| + ε`; inside the series branch `C` never approaches zero.
+    if c.abs() <= gam_linalg::roundoff::accumulation_growth(3) * u.abs().sqrt() + f64::EPSILON {
         return Err(GeometryError::Singular(
             "constant-curvature Dirichlet weight at a conjugate point (cos(√κ r) = 0)",
         ));
