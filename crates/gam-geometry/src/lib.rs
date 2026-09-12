@@ -53,21 +53,22 @@ pub(crate) fn normalize_weights(
             if w.len() != n {
                 return Err("weights length must match the number of rows".to_string());
             }
-            let mut total = 0.0_f64;
+            let mut scale = 0.0_f64;
             for value in w.iter() {
                 if !value.is_finite() || *value < 0.0 {
                     return Err(
                         "weights must be finite, non-negative, and have positive total".to_string(),
                     );
                 }
-                total += *value;
+                scale = scale.max(*value);
             }
-            if total <= 0.0 {
+            if scale <= 0.0 {
                 return Err(
                     "weights must be finite, non-negative, and have positive total".to_string(),
                 );
             }
-            Ok(w.mapv(|v| v / total))
+            let total = w.iter().map(|v| v / scale).sum::<f64>();
+            Ok(w.mapv(|v| (v / scale) / total))
         }
     }
 }
