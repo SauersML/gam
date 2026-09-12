@@ -1,4 +1,4 @@
-"""RED tests for issue #237.
+"""Contract tests for issue #237.
 
 Public contract (``gamfit/smooth.py:124-129``):
 
@@ -11,10 +11,8 @@ every advertised ``(d, m)`` default. The PyFFI ``gamfit.duchon_basis``
 (basis-only path, no penalty returned to Python) must also accept these
 defaults without tripping the D2 collocation validator.
 
-These tests are currently expected to FAIL for d=2 (and likely d=3) with
-``m=2`` defaults because the PyFFI builds the spec with all three operator
-penalties active (mass + tension + stiffness), forcing ``max_op=2`` and
-requiring ``2*(p+s) > d+2``.
+#237 is fixed; the note above the PyFFI tests records the cause. A failure
+here is a regression.
 """
 
 from __future__ import annotations

@@ -1,9 +1,7 @@
-"""RED tests for issue #243 — sae_manifold_fit drops user-supplied atom_basis
-from the topology metadata, leaving `summary()["atom_topology"]` stuck at the
-default `"circle"` even when atom geometry was resolved correctly.
-
-These tests must fail today and pass once the topology field is reconciled
-with `atom_basis` (or callers are forced to supply both consistently).
+"""Contract tests for issue #243: sae_manifold_fit must carry the user-supplied
+atom_basis into the topology metadata. #243 was `summary()["atom_topology"]`
+staying at the default `"circle"` even when the atom geometry was resolved
+correctly.
 """
 from __future__ import annotations
 

@@ -1,22 +1,17 @@
-"""RED tests for issue #226: penalty descriptors must not pass empty rho.
+"""Contract tests for issue #226: penalty descriptors must not pass empty rho.
 
-The descriptors in ``gamfit/_penalty_descriptors.py`` call the Rust FFI
-``analytic_penalty_value_grad`` / ``analytic_penalty_hvp`` with
+#226 was the descriptors in ``gamfit/_penalty_descriptors.py`` calling the
+Rust FFI ``analytic_penalty_value_grad`` / ``analytic_penalty_hvp`` with
 ``rho = np.zeros(0)``. The FFI rejects any rho whose length disagrees with
-``registry.total_rho_count()`` (``crates/gam-pyffi/src/lib.rs:25444``).
-
-ARD declares ``rho_count == latent_dim`` (``analytic_penalties.rs:2417``),
-so ``ARDPenalty(...).value_grad(t)`` currently raises:
+``registry.total_rho_count()``, and ARD declares ``rho_count == latent_dim``,
+so ``ARDPenalty(...).value_grad(t)`` raised:
 
     rho length 0 does not match analytic penalty rho_count <d>
 
-The fix is to pass ``None`` (or a correctly sized vector) so the FFI's
-default-rho branch (``lib.rs:25440-25443``) fills zeros of the right length.
-
-These tests are RED until that fix lands. The ordered independent Beta--Bernoulli / BlockOrthogonality /
-MechanismSparsity descriptors happen to declare ``rho_count == 0`` for the
-non-learnable mode the wrapper sets, so they pass today; pinning the
-contract here guards against future descriptors that expose rho_count > 0.
+The ordered independent Beta--Bernoulli / BlockOrthogonality /
+MechanismSparsity descriptors declare ``rho_count == 0`` for the
+non-learnable mode the wrapper sets; their tests guard against a future
+descriptor that exposes rho_count > 0.
 """
 
 from __future__ import annotations
@@ -36,7 +31,7 @@ from gamfit._penalty_descriptors import (
 
 
 # ---------------------------------------------------------------------------
-# ARD — rho_count == latent_dim, currently fails
+# ARD — rho_count == latent_dim
 # ---------------------------------------------------------------------------
 
 

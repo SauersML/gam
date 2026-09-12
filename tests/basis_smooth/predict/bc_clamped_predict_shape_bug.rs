@@ -68,9 +68,8 @@ fn bspline_bc_clamped_predict_at_new_points_succeeds() {
         new_data[[i, 1]] = 0.0;
     }
 
-    // This currently panics with "frozen identifiability transform mismatch:
-    // design has N columns but transform has M rows". When the fix lands,
-    // predict will succeed and we'll get a finite vector of predictions.
+    // The original bug failed here with "frozen identifiability transform
+    // mismatch: design has N columns but transform has M rows".
     let design = build_term_collection_design(new_data.view(), &fit.resolvedspec)
         .expect("BC clamped predict design should rebuild from frozen spec");
     let pred = design.design.apply(&fit.fit.beta);

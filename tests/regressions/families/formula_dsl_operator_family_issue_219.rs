@@ -1,15 +1,8 @@
-//! RED tests for https://github.com/SauersML/gam/issues/219
-//!
-//! The Pest grammar in `src/inference/formula_dsl.rs` does not include `:` as
-//! an interaction operator. These tests pin the *desired* behavior of the
-//! documented Wilkinson-Rogers operator family (`+`, `:`, `*`, `/`, `^`,
-//! `I(...)`) and of the smooth/group constructors that are advertised in
-//! the README and docs. They are expected to fail until the grammar +
-//! materializer accept the colon interaction operator (and any other gaps
-//! these probes surface).
-//!
-//! Each test is written to fail loudly and explicitly rather than be
-//! marked `#[ignore]`, so the gap is visible in CI output.
+//! Contract tests for https://github.com/SauersML/gam/issues/219: the formula
+//! DSL parses the documented Wilkinson-Rogers operator family (`+`, `:`, `*`,
+//! `/`, `^`, `I(...)`) and the smooth/group constructors advertised in the
+//! README and docs. #219 was the grammar rejecting `:` as an interaction
+//! operator. Each test fails with the parser's error if a formula is rejected.
 
 use gam::inference::formula_dsl::{parse_formula, parse_formula_dsl};
 
