@@ -616,7 +616,7 @@ fn bracket_via_criterion(values: ndarray::ArrayView2<'_, f64>) -> (f64, f64) {
 #[test]
 fn response_curvature_sign_resolution_power_curve_and_honest_flat_floor() {
     let dim = DIM;
-    let k_star = -2.0; // genuinely hyperbolic truth
+    let k_star = -2.0_f64; // genuinely hyperbolic truth
     let n = 4000usize;
     // The σ ladder sits on the resolution scale h = |κ⋆|·8σ²√n/3. At h = ½ a correct
     // 95% CI excludes zero on about 8% of clouds; at h = 8 on essentially all. Job
