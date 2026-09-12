@@ -3681,19 +3681,23 @@ impl OuterObjective for SaeManifoldOuterObjective {
         // objective-owned state" and must be a no-op. Typed reactive-domain
         // entry begins without a coefficient hint, while cache replay only
         // calls this hook for a populated coefficient vector owned by the exact
-        // outer seed. Only a populated β must match the decoder dimension.
+        // outer seed.
         if beta.is_empty() {
             // NoSlot says that this call installed nothing. A subsequent exact
             // evaluation may publish a populated `inner_beta_hint` for the next
             // typed reactive waypoint.
             return Ok(SeedOutcome::NoSlot);
         }
+        // A populated β laid out for a different decoder width is declined, not
+        // fatal. Cache replay is the one production caller, and a banked β need
+        // not share this term's width: `reduce_basis_to_subspace` (#1117) changes
+        // an atom's basis width in place, so agreeing on ρ-dim does not imply
+        // agreeing on β-dim. `Incompatible` is the trait's typed reply for exactly
+        // this case — nothing is installed and the fit resumes ρ-only. Refusing
+        // here turned a warm-start mismatch into a failed fit (#2234: "β length 4
+        // != decoder dim 6").
         if beta.len() != self.term.beta_dim() {
-            return Err(EstimationError::RemlOptimizationFailed(format!(
-                "SaeManifoldOuterObjective::seed_inner_state: β length {} != decoder dim {}",
-                beta.len(),
-                self.term.beta_dim()
-            )));
+            return Ok(SeedOutcome::Incompatible);
         }
         self.seeded_beta = Some(beta.clone());
         // #2080 (a) — a freshly installed β seed is a NEW instruction the pending

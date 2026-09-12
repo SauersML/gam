@@ -1211,27 +1211,39 @@ pub(crate) fn seed_inner_state_installs_and_reuses_matching_beta() {
     }
 }
 
-/// The seed contract is only relaxed for the EMPTY sentinel. A populated
-/// β whose length disagrees with the decoder dimension is a genuine
-/// layout bug and must still surface a typed error rather than being
-/// silently dropped.
+/// A populated β whose length disagrees with the decoder dimension is the
+/// trait's typed `SeedOutcome::Incompatible` case, not a fatal error. Cache
+/// replay is the one production caller, and `reduce_basis_to_subspace` (#1117)
+/// changes an atom's basis width in place, so a banked β can legitimately be
+/// laid out for another width. The β must be declined without installing
+/// anything, so the fit resumes ρ-only instead of failing (#2234: "β length 4
+/// != decoder dim 6").
 #[test]
 pub(crate) fn seed_inner_state_rejects_wrong_length_populated_beta() {
     let mut obj = warmstart_test_objective();
     let dim = obj.term.beta_dim();
+    let before = obj.term.flatten_beta();
     let wrong: Array1<f64> = Array1::zeros(dim + 1);
-    let err = obj
+    let outcome = obj
         .seed_inner_state(&wrong)
-        .expect_err("a populated β of the wrong length must be rejected");
-    match err {
-        EstimationError::RemlOptimizationFailed(msg) => {
-            assert!(
-                msg.contains("decoder dim"),
-                "error must name the decoder-dim mismatch; got: {msg}"
-            );
-        }
-        other => panic!("expected RemlOptimizationFailed, got {other:?}"),
-    }
+        .expect("a populated β of the wrong length is declined, not a fatal error");
+    assert!(
+        matches!(outcome, SeedOutcome::Incompatible),
+        "a wrong-length β must report Incompatible (ρ-only resume); got {outcome:?}"
+    );
+    assert!(
+        obj.seeded_beta.is_none(),
+        "a declined β must not become the pending seed"
+    );
+    let after = obj.term.flatten_beta();
+    assert!(
+        after.len() == before.len()
+            && after
+                .iter()
+                .zip(before.iter())
+                .all(|(a, b)| a.to_bits() == b.to_bits()),
+        "a declined β must leave the objective's coefficients bit-identical"
+    );
 }
 
 pub(crate) fn gamma_fd_tiny_fixture() -> (SaeManifoldTerm, Array2<f64>, SaeManifoldRho) {
