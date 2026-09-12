@@ -5,7 +5,6 @@ use std::collections::HashMap;
 #[cfg(target_os = "linux")]
 use std::panic::{self, AssertUnwindSafe, catch_unwind};
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicU64, Ordering};
 #[cfg(target_os = "linux")]
 use std::sync::{Arc, Mutex};
 
@@ -67,20 +66,6 @@ pub enum GpuAvailabilityRef<'a> {
     Available(&'a GpuRuntime),
     Absent(&'a GpuAbsence),
 }
-
-/// Process-wide count of lossless runtime-resolution calls.
-///
-/// Incremented on every [`GpuRuntime::availability`] call before the one-time probe
-/// runs — so it counts the moments at which the device probe (and thus CUDA
-/// primary-context creation on each GPU, `cuDevicePrimaryCtxRetain`) could be
-/// triggered. Size-gated accessors that short-circuit for CPU-sized problems
-/// deliberately do not resolve availability, so a test can pin this counter across
-/// such a call and prove the CPU-sized decision path made ZERO driver contact.
-///
-/// Cross-platform (not `cfg(target_os = "linux")`) so the laziness/ordering
-/// contract is testable on CUDA-less hosts: even where the probe itself is a
-/// no-op, the invariant we verify is that the size check precedes resolution.
-static RESOLUTION_CALLS: AtomicU64 = AtomicU64::new(0);
 
 #[cfg(target_os = "linux")]
 thread_local! {
@@ -319,10 +304,6 @@ impl GpuRuntime {
 
     /// Return the cached probe outcome without collapsing faults into absence.
     pub fn availability() -> Result<GpuAvailabilityRef<'static>, GpuError> {
-        // Record every entry BEFORE the `OnceLock` probe, so the size-gated
-        // accessors below (which never reach this point for CPU-sized problems)
-        // can be proven not to have triggered a device probe / context creation.
-        RESOLUTION_CALLS.fetch_add(1, Ordering::Relaxed);
         static RUNTIME: OnceLock<Result<GpuAvailability, GpuError>> = OnceLock::new();
         let cached = RUNTIME.get_or_init(|| {
             let outcome = Self::probe();
@@ -387,45 +368,6 @@ impl GpuRuntime {
                 reason: "required CUDA runtime resolved to an absent state".to_string(),
             }
         })
-    }
-
-    /// Number of times [`Self::availability`] has been entered process-wide.
-    ///
-    /// Test-facing instrumentation for the laziness contract: a size-gated
-    /// caller that returns before resolving availability leaves this unchanged, so
-    /// a test can assert a CPU-sized decision path created no CUDA context. This
-    /// is a monotone call counter, NOT a probe-success flag.
-    #[must_use]
-    pub fn resolution_call_count() -> u64 {
-        RESOLUTION_CALLS.load(Ordering::Relaxed)
-    }
-
-    /// Size-gated [`Self::resolve`]: resolve the process-wide runtime only when the
-    /// estimated dense arithmetic `work_flops` clears the GPU-dispatch flop floor.
-    ///
-    /// This is the ordering fix for the CUDA startup tax. For a CPU-sized problem
-    /// (`work_flops` below the floor) it returns `Ok(None)` without calling
-    /// [`Self::resolve`], so the device probe — and the `cuDevicePrimaryCtxRetain`
-    /// primary-context creation it performs on every GPU — never runs. The
-    /// problem-size decision therefore strictly precedes any driver contact, and
-    /// a CPU-sized fit pays ZERO CUDA cost.
-    ///
-    /// The floor is [`GpuDispatchPolicy::MIN_CALIBRATABLE_GEMM_FLOPS`] — the
-    /// smallest `gemm_min_flops` ANY reachable policy (default seed or
-    /// device-calibrated) can carry, known WITHOUT a device — so the gate never
-    /// needs a probe to decide it should not probe, and refusing below it can
-    /// never block work that any policy would have dispatched. Work at or above
-    /// the floor falls through to the identical lossless resolution path (where
-    /// the real, possibly calibrated policy still gates each op), so device
-    /// behaviour for genuinely GPU-sized problems is unchanged.
-    pub fn resolve_if_dense_work_exceeds_floor(
-        policy: super::GpuPolicy,
-        work_flops: u128,
-    ) -> Result<Option<&'static Self>, GpuError> {
-        if work_flops < GpuDispatchPolicy::MIN_CALIBRATABLE_GEMM_FLOPS {
-            return Ok(None);
-        }
-        Self::resolve(policy)
     }
 
     /// Size-gated [`Self::resolve`] for independent fused row kernels.

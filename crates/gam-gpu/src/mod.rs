@@ -27,7 +27,6 @@ pub mod dictionary_score;
 pub mod driver;
 pub mod engagement;
 pub mod linalg_dispatch;
-pub mod memory;
 pub mod numerics_device;
 pub mod numerics_host;
 pub mod policy;
@@ -48,10 +47,9 @@ pub use dictionary_score::{
     DictionaryScoreRoutePlan,
 };
 pub use gpu_error::GpuError;
-pub use memory::{DeviceBuffer, DeviceCsrMatrix, DeviceMatrix, DeviceVector};
 pub use policy::{GpuDispatchPolicy, GpuMixedPrecisionPolicy};
 pub use pool::{balanced_partition, scatter_batched};
-pub use profile::{GpuExecutionTelemetry, KernelStat, KernelStatsSnapshot};
+pub use profile::{KernelStat, KernelStatsSnapshot};
 
 // ---------------------------------------------------------------------------
 // User-facing policy and instrumentation hooks (formerly src/gpu.rs).
@@ -68,21 +66,6 @@ pub use profile::{GpuExecutionTelemetry, KernelStat, KernelStatsSnapshot};
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::sync::OnceLock;
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum CudaBackendStatus {
-    CudaUnavailable,
-    CudaReady,
-}
-
-#[inline]
-pub(crate) fn cuda_backend_status() -> Result<CudaBackendStatus, GpuError> {
-    Ok(if device_runtime::GpuRuntime::resolve(global_policy())?.is_some() {
-        CudaBackendStatus::CudaReady
-    } else {
-        CudaBackendStatus::CudaUnavailable
-    })
-}
 
 /// User-facing GPU backend policy.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]

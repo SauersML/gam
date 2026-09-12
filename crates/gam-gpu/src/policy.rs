@@ -168,10 +168,6 @@ impl GpuDispatchPolicy {
             && self.xtwy_flops(n, px, q) >= self.dense_reduction_flops_min()
     }
 
-    pub const fn potrf_target_is_gpu(&self, p: usize, h_resident: bool) -> bool {
-        h_resident && p >= self.potrf_min_p
-    }
-
     /// Whether a batched Pólya-Gamma draw of `n` rows is worth dispatching to
     /// the device.
     ///
@@ -187,20 +183,6 @@ impl GpuDispatchPolicy {
     #[inline]
     pub const fn polya_gamma_batch_target_is_gpu(&self, n: usize) -> bool {
         n >= self.fused_kernel_min_n
-    }
-
-    /// Whether a batched per-row BMS kernel over `n` design rows is worth
-    /// dispatching to the device.
-    ///
-    /// The flex-row HVP and dense-block builders are batched over rows with the
-    /// per-row frames staged once, which is the same shape `row_kernel_min_n`
-    /// is calibrated for (it is set directly from the measured XtWX crossover
-    /// row count). Keyed on rows rather than a wall-clock ratio so the decision
-    /// is a property of the workload and the device, not of whoever else is on
-    /// the box.
-    #[inline]
-    pub const fn row_batch_target_is_gpu(&self, n: usize) -> bool {
-        n >= self.row_kernel_min_n
     }
 
     pub const fn dense_hessian_work_target_is_gpu(&self, n: usize, p: usize) -> bool {
@@ -252,13 +234,6 @@ impl GpuDispatchPolicy {
     /// on the CPU solely because the conservative general-frame lower-bound
     /// undercounts the transpose cross term.
     pub const THIN_CURVE_MATVEC_OFFLOAD_FLOPS_MIN: u128 = 1_000_000;
-
-    /// Conservative seed for the reduced-Schur PCG iteration count when the
-    /// caller cannot supply a measured budget. InexactPCG on an SAE β-block of
-    /// width `k` converges in `O(√κ)` iterations; this floor keeps the work
-    /// estimate honest (≥ this many applies) without over-claiming a tight
-    /// solve. Used only to amortise the staging cost in the work estimate.
-    pub const MATVEC_OFFLOAD_MIN_CG_ITERS: usize = 8;
 
     /// Per-apply flop estimate for one reduced-Schur matvec `S·x` of a
     /// matrix-free SAE Kronecker system, as a pure function of the system shape.
@@ -326,9 +301,8 @@ impl GpuDispatchPolicy {
     /// * `k`        — border β width (the SAE decoder atom count `K`).
     /// * `d`        — per-row latent / active-frame depth (the M dimension).
     /// * `cg_iters` — expected PCG iteration budget; the per-apply work is
-    ///   multiplied by this because the frames stay resident across iterations.
-    ///   Pass [`Self::MATVEC_OFFLOAD_MIN_CG_ITERS`] when no measured budget is
-    ///   available; a tighter (smaller) value only makes the gate stricter.
+    ///   multiplied by this because the frames stay resident across iterations;
+    ///   a tighter (smaller) value only makes the gate stricter.
     ///
     /// ## Live arrow-Schur call site
     ///
@@ -368,224 +342,6 @@ impl GpuDispatchPolicy {
     }
 }
 
-/// Factorization strategy for the arrow-Schur border (shared `β`) solve, chosen
-/// from the *shape* of the joint system rather than a single fixed border-width
-/// cut (`ArrowSolverMode::automatic`'s `DIRECT_SOLVE_MAX_K = 2000`).
-///
-/// The border width alone is a blunt selector: it cannot see that the data-fit
-/// contribution to the `k × k` border is only rank `Σ_i d_i ≈ n·d`. For the
-/// #1017 color arm (`n = 180`, per-row depth `d = 2`, border `k = 15360`) the
-/// data information is rank `360` yet a dense Direct solve pays a full `k³/3 ≈
-/// 1.2e12`-flop Cholesky — the measured 26-min-class fit. This maps cleanly onto
-/// the two `ArrowSolverMode` variants the solver already implements.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub enum ArrowBorderStrategy {
-    /// Eliminate the per-row blocks, form the dense `k × k` reduced Schur, and
-    /// Cholesky-factor it (`ArrowSolverMode::Direct`). Appropriate for modest,
-    /// near-square borders where the `k³/3` factorization is cheap and the
-    /// data-fit rank is comparable to `k`.
-    DenseDirect,
-    /// Solve the reduced Schur iteratively by matrix-free PCG
-    /// (`ArrowSolverMode::InexactPCG`), never materialising the `k × k` factor.
-    /// Appropriate when the dense `k³` factorization dominates and/or the
-    /// data-fit contribution to the border is rank-deficient (`n·d < k`).
-    ReducedIterative,
-}
-
-/// Cost model + recommendation for the arrow-Schur border solve, a pure function
-/// of the joint-system shape (unit-testable, no device required).
-///
-/// This operationalises the measured #1017 finding that the full arrow-Schur
-/// Newton solve is dominated by the dense `k × k` border Cholesky (the on-device
-/// dense Direct solve was measured at ~0.94× — a slowdown — because the `k³/3`
-/// factorization, not the GPU-favourable batched per-row work, is the bottleneck
-/// at LLM/SAE border widths). The lever the issue calls for is to *shrink or
-/// factor the dense border* so the batched `n`-row work dominates; the plan
-/// makes that decision inspectable and honest.
-///
-/// ## Flop model (deliberate, documented approximations)
-///
-/// * **Dense Direct** ≈ `2·n·d·k²` (assemble the reduced Schur: per row a
-///   rank-`d` symmetric update `H_βt (H_tt)⁻¹ H_tβ` to the `k × k` border,
-///   `≈ 2·d·k²` flops) `+ k³/3` (Cholesky of the dense `k × k` Schur).
-/// * **Reduced iterative** ≈ `cg_iters · n·(4·d·k + d²)` (matrix-free PCG:
-///   per matvec a forward + transpose cross-block GEMV `4·d·k` plus the per-row
-///   `d × d` solve `d²`, summed over `n` row blocks, over `cg_iters` applies).
-///
-/// Both are dispatch-grade estimates, not exact operation counts; they omit
-/// preconditioner setup and lower-order terms symmetrically, so their ratio (the
-/// only thing the recommendation consumes) is meaningful while neither figure
-/// should be reused for speedup accounting.
-///
-/// ## Status
-///
-/// Advisory / diagnostic. It is **not** wired into the live
-/// `ArrowSolverMode::automatic` selector: replacing the fixed `DIRECT_SOLVE_MAX_K`
-/// cut with this shape-driven crossover changes which production fits take the
-/// Direct vs PCG path and must be validated on GPU hardware (#1017 Phase 2–4)
-/// before it can change numerics. Today it is consumed by the honest
-/// `examples/full_color_fit_1017.rs` measurement harness (modeled-vs-measured)
-/// and by the unit tests below.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct ArrowBorderSolvePlan {
-    /// Number of per-row blocks (SAE observations / latent rows).
-    pub n: usize,
-    /// Border `β` width (the SAE decoder atom count `K` × basis width).
-    pub k: usize,
-    /// Per-row latent / active-frame depth (the `M` dimension).
-    pub d: usize,
-    /// CG iteration budget assumed for the iterative estimate.
-    pub cg_iters: usize,
-    /// Effective rank of the data-fit contribution to the `k × k` border,
-    /// bounded by `Σ_i d_i ≈ n·d` and never more than `k`.
-    pub data_fit_rank: usize,
-    /// True when `n·d < k`: the dense `k × k` Cholesky spends `O(k³)` factorising
-    /// a border whose data information is only rank `n·d` — the pathological
-    /// wide-sparse-border regime (color arm: `n·d = 360 ≪ k = 15360`).
-    pub dense_border_rank_deficient: bool,
-    /// `≈ 2·n·d·k² + k³/3` — reduced-Schur assembly plus dense border Cholesky.
-    pub dense_direct_flops: u128,
-    /// `≈ cg_iters · n·(4·d·k + d²)` — matrix-free PCG matvecs.
-    pub reduced_iterative_flops: u128,
-    /// The recommended strategy. `DenseDirect` is chosen only for a full-rank
-    /// border (`n·d ≥ k`, so the `k × k` reduced Schur is non-singular and its
-    /// Cholesky exists) whose `k³/3` border factorization is no costlier than
-    /// the matrix-free CG solve at `cg_iters`; otherwise `ReducedIterative`. A
-    /// rank-deficient border is always `ReducedIterative` — a dense Cholesky of
-    /// a singular border does not exist.
-    pub recommended: ArrowBorderStrategy,
-    /// Whether running the *recommended* strategy on the device is expected to
-    /// pay off. For `ReducedIterative` this is `reduced_schur_matvec_should_offload`;
-    /// for `DenseDirect` the device wins only when the batched per-row assembly
-    /// work (`2·n·d·k²`, GPU-favourable batched GEMM/POTRF) at least matches the
-    /// border Cholesky (`k³/3`) *and* clears the dense flop floor — the honest
-    /// encoding of the measured 0.94× dense-Direct-on-device slowdown.
-    pub device_favorable: bool,
-}
-
-impl GpuDispatchPolicy {
-    /// Assembly flops for the dense reduced Schur: per row a rank-`d` update to
-    /// the `k × k` border (`≈ 2·d·k²`), summed over `n` rows.
-    const fn dense_schur_assembly_flops(n: usize, k: usize, d: usize) -> u128 {
-        2u128
-            .saturating_mul(n as u128)
-            .saturating_mul(d as u128)
-            .saturating_mul((k as u128).saturating_mul(k as u128))
-    }
-
-    /// Cholesky flops for the dense `k × k` reduced Schur: `≈ k³/3`.
-    const fn dense_border_cholesky_flops(k: usize) -> u128 {
-        let k = k as u128;
-        k.saturating_mul(k).saturating_mul(k) / 3
-    }
-
-    /// Total matrix-free PCG flops: `cg_iters · n·(4·d·k + d²)`.
-    const fn reduced_iterative_flops(n: usize, k: usize, d: usize, cg_iters: usize) -> u128 {
-        let n = n as u128;
-        let k = k as u128;
-        let d = d as u128;
-        let per_apply = n.saturating_mul(
-            4u128
-                .saturating_mul(d)
-                .saturating_mul(k)
-                .saturating_add(d.saturating_mul(d)),
-        );
-        per_apply.saturating_mul(cg_iters as u128)
-    }
-
-    /// Build the shape-driven [`ArrowBorderSolvePlan`] for a joint arrow-Schur
-    /// system with `n` row blocks, border width `k`, per-row depth `d`, and an
-    /// assumed CG budget `cg_iters` (pass
-    /// [`Self::MATVEC_OFFLOAD_MIN_CG_ITERS`] when none is measured; a smaller
-    /// value only biases the recommendation toward `DenseDirect`, never the
-    /// reverse).
-    ///
-    /// Degenerate shapes (`n`, `k`, or `d` zero) return an all-zero plan
-    /// recommending `DenseDirect` (the trivial/empty solve stays on the simple
-    /// path) with `device_favorable = false`.
-    pub fn arrow_border_solve_plan(
-        &self,
-        n: usize,
-        k: usize,
-        d: usize,
-        cg_iters: usize,
-    ) -> ArrowBorderSolvePlan {
-        if n == 0 || k == 0 || d == 0 {
-            return ArrowBorderSolvePlan {
-                n,
-                k,
-                d,
-                cg_iters,
-                data_fit_rank: 0,
-                dense_border_rank_deficient: false,
-                dense_direct_flops: 0,
-                reduced_iterative_flops: 0,
-                recommended: ArrowBorderStrategy::DenseDirect,
-                device_favorable: false,
-            };
-        }
-
-        let assembly = Self::dense_schur_assembly_flops(n, k, d);
-        let border_chol = Self::dense_border_cholesky_flops(k);
-        let dense_direct_flops = assembly.saturating_add(border_chol);
-        let iters = if cg_iters == 0 { 1 } else { cg_iters };
-        let reduced_iterative_flops = Self::reduced_iterative_flops(n, k, d, iters);
-
-        let data_fit_rank = (n.saturating_mul(d)).min(k);
-        let dense_border_rank_deficient = n.saturating_mul(d) < k;
-
-        // Recommend the exact dense factorization only when it is both VALID and
-        // not the bottleneck:
-        //   * Validity — a rank-deficient border (`n·d < k`) has a singular
-        //     `k × k` reduced Schur, so its Cholesky does not exist. DenseDirect
-        //     is inadmissible there and we must solve matrix-free. (The pure
-        //     assembly+Cholesky-vs-iterative flop rule this replaced ignored
-        //     rank and could recommend factorizing a provably-singular border
-        //     whenever the small-`k` dense flops happened to be the cheaper
-        //     count — e.g. `n=1, d=1, k=2`.)
-        //   * Cost — the reduced-Schur reduction is an embarrassingly-parallel
-        //     batched GEMM whichever path runs; the term that scales badly with
-        //     border width is the `k³/3` Cholesky. Prefer the exact,
-        //     RHS-reusable, convergence-free dense solve while that Cholesky is
-        //     no costlier than the full matrix-free CG solve, and fall to
-        //     ReducedIterative once the `k³` factorization overtakes it.
-        let recommended =
-            if !dense_border_rank_deficient && border_chol <= reduced_iterative_flops {
-                ArrowBorderStrategy::DenseDirect
-            } else {
-                ArrowBorderStrategy::ReducedIterative
-            };
-
-        let device_favorable = match recommended {
-            ArrowBorderStrategy::ReducedIterative => {
-                self.reduced_schur_matvec_should_offload(n, k, d, iters)
-            }
-            ArrowBorderStrategy::DenseDirect => {
-                // Dense Direct wins on device only when the batched per-row
-                // assembly work dominates the (poorly GPU-scaling, and here
-                // rank-deficient) border Cholesky, and the total clears the
-                // dense reduction floor. This is the honest encoding of the
-                // measured 0.94× on-device dense-Direct slowdown: when the k³
-                // Cholesky dominates, stay on the CPU.
-                assembly >= border_chol && dense_direct_flops >= self.dense_reduction_flops_min()
-            }
-        };
-
-        ArrowBorderSolvePlan {
-            n,
-            k,
-            d,
-            cg_iters: iters,
-            data_fit_rank,
-            dense_border_rank_deficient,
-            dense_direct_flops,
-            reduced_iterative_flops,
-            recommended,
-            device_favorable,
-        }
-    }
-}
-
 /// The aspirational single-GPU design-row throughput the #1412 decision gate is
 /// supposed to establish for the LLM-shape batched-Cholesky + tile-GEMM fit
 /// pipeline: 100 000 design rows processed per wall-clock second per device.
@@ -593,53 +349,10 @@ impl GpuDispatchPolicy {
 /// The original gate *claimed* this number without ever measuring it. The
 /// honest contract is the other way around: a benchmark
 /// (`examples/throughput_1412.rs`) measures the true rows/sec on a real device,
-/// and `GpuThroughputVerdict::from_measurement` reports whether the measured
-/// value meets the target — the verdict is a *function of the measurement*, not
-/// a hardcoded assertion. See `tests/owed_1412.rs`.
+/// and `EncodeDeploymentDecision::from_device_measurement` reports whether the
+/// measured value meets the target — the decision is a *function of the
+/// measurement*, not a hardcoded assertion.
 pub const GPU_THROUGHPUT_TARGET_ROWS_PER_SEC: f64 = 100_000.0;
-
-/// Outcome of comparing a *measured* GPU throughput against the target. The
-/// only way to construct one is `Self::from_measurement`, so a verdict can
-/// never assert a target that was not actually established by a measurement.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct GpuThroughputVerdict {
-    /// The measured design-rows-per-second on the device under test.
-    pub measured_rows_per_sec: f64,
-    /// The target the measurement is compared against.
-    pub target_rows_per_sec: f64,
-    /// `measured / target`. ≥ 1.0 means the target was established.
-    pub fraction_of_target: f64,
-    /// True iff `measured_rows_per_sec >= target_rows_per_sec`.
-    pub meets_target: bool,
-}
-
-impl GpuThroughputVerdict {
-    /// Build a verdict from a measured throughput against
-    /// [`GPU_THROUGHPUT_TARGET_ROWS_PER_SEC`]. A non-finite or non-positive
-    /// measurement can never meet the target (it is not a usable measurement).
-    #[inline]
-    pub fn from_measurement(measured_rows_per_sec: f64) -> Self {
-        Self::from_measurement_against(measured_rows_per_sec, GPU_THROUGHPUT_TARGET_ROWS_PER_SEC)
-    }
-
-    /// Build a verdict against an explicit target (used by tests that probe the
-    /// comparison logic without depending on the global target constant).
-    #[inline]
-    pub fn from_measurement_against(measured_rows_per_sec: f64, target_rows_per_sec: f64) -> Self {
-        let usable = measured_rows_per_sec.is_finite() && measured_rows_per_sec > 0.0;
-        let fraction_of_target = if usable && target_rows_per_sec > 0.0 {
-            measured_rows_per_sec / target_rows_per_sec
-        } else {
-            0.0
-        };
-        Self {
-            measured_rows_per_sec,
-            target_rows_per_sec,
-            fraction_of_target,
-            meets_target: usable && measured_rows_per_sec >= target_rows_per_sec,
-        }
-    }
-}
 
 /// Why a Stage-3 encode deployment decision could not be made from a real device
 /// measurement (#988, #1412). Each variant is a state in which the
@@ -753,28 +466,6 @@ impl EncodeDeploymentDecision {
     pub fn blocked(reason: EncodeDecisionBlocked) -> Self {
         Self::Undetermined { reason }
     }
-
-    /// True ONLY when a device measurement cleared the target: the exact encode
-    /// ships and no surrogate is built. Never true from a CPU proxy.
-    #[must_use]
-    pub fn surrogate_unneeded(&self) -> bool {
-        matches!(self, Self::Met { .. })
-    }
-
-    /// True ONLY when a device measurement missed the target: the certified
-    /// amortized surrogate becomes justified. Never true without a measurement.
-    #[must_use]
-    pub fn surrogate_justified(&self) -> bool {
-        matches!(self, Self::Unmet { .. })
-    }
-
-    /// True when no device measurement is available and the decision is blocked
-    /// on hardware (neither [`Self::surrogate_unneeded`] nor
-    /// [`Self::surrogate_justified`]).
-    #[must_use]
-    pub fn is_undetermined(&self) -> bool {
-        matches!(self, Self::Undetermined { .. })
-    }
 }
 
 /// Which `(response, link)` family the Stage 3.3 device-resident PIRLS loop
@@ -799,9 +490,9 @@ pub enum PirlsLoopCurvatureKind {
     Observed,
 }
 
-/// Inputs to `should_run_reml_outer_on_device`. The admission predicate
-/// for routing the *outer* REML BFGS-over-ρ loop onto a fully device-resident
-/// driver (rather than the host orchestrator that hops out per step).
+/// Admission descriptor for routing the *outer* REML BFGS-over-ρ loop onto a
+/// fully device-resident driver (rather than the host orchestrator that hops
+/// out per step).
 ///
 /// Fields are intentionally lifted from data the CPU REML entry has on hand
 /// before it touches the seed generator or the inner P-IRLS loop, so the
@@ -856,8 +547,8 @@ impl GpuDispatchPolicy {
     /// Below this width the per-iteration `XᵀWX + Cholesky` is dominated by
     /// launch latency and PCIe staging rather than arithmetic, so the host LM
     /// loop (which populates the full `PirlsResult` surface as a free
-    /// side-effect) is strictly cheaper. Shared by both the inner PIRLS and
-    /// outer REML admission predicates so they cannot drift apart.
+    /// side-effect) is strictly cheaper. Shared by the inner PIRLS admission
+    /// predicate and the reduced-Schur matvec gate so they cannot drift apart.
     pub const DEVICE_LOOP_MIN_P: usize = 32;
 
     /// Conservative admission predicate for routing
@@ -875,35 +566,6 @@ impl GpuDispatchPolicy {
             return false;
         }
         if !self.dense_hessian_work_target_is_gpu(adm.n, adm.p) {
-            return false;
-        }
-        match adm.family {
-            Some(_) => true,
-            None => false,
-        }
-    }
-
-    /// Admission predicate for routing the outer REML BFGS-over-ρ loop onto
-    /// a device-resident driver that keeps the BFGS state (ρ, gradient,
-    /// Hessian approx) on-device and only downloads the per-step scalar
-    /// metrics (objective value, gradient norm, convergence flag).
-    ///
-    /// The dense-work threshold piggybacks on the existing inner-PIRLS admission
-    /// predicate because the device-resident outer loop calls
-    /// `pirls_loop_on_stream` per step and must not pay the host hop for small
-    /// fits the inner loop would have rejected anyway. The
-    /// `num_rho ≥ 2` floor rules out the trivial single-smoother case where
-    /// host orchestration is already negligible and the device BFGS state
-    /// (one length-`num_rho` gradient + a `num_rho × num_rho` Hessian
-    /// approx) collapses to a couple of scalars not worth keeping on device.
-    pub const fn should_run_reml_outer_on_device(&self, adm: RemlOuterAdmission) -> bool {
-        if !adm.gpu_available {
-            return false;
-        }
-        if !self.dense_hessian_work_target_is_gpu(adm.n, adm.p) {
-            return false;
-        }
-        if adm.num_rho < 2 {
             return false;
         }
         match adm.family {
@@ -987,12 +649,7 @@ mod reduced_schur_matvec_offload_tests {
         let pol = GpuDispatchPolicy::default();
         // n≈2000 rows, k≈2048 atoms, M≈8 frame depth — n is far below the 50k
         // row gate, yet the summed CG matvec work is large.
-        assert!(pol.reduced_schur_matvec_should_offload(
-            2_000,
-            2_048,
-            8,
-            GpuDispatchPolicy::MATVEC_OFFLOAD_MIN_CG_ITERS,
-        ));
+        assert!(pol.reduced_schur_matvec_should_offload(2_000, 2_048, 8, 8));
         // The same shape would be rejected by the row-count-style dense gate,
         // confirming the re-keying is what admits it.
         assert!(!pol.dense_hessian_work_target_is_gpu(2_000, 8));
@@ -1028,12 +685,7 @@ mod reduced_schur_matvec_offload_tests {
     #[test]
     fn rejects_tiny_shape_where_transfer_dominates() {
         let pol = GpuDispatchPolicy::default();
-        assert!(!pol.reduced_schur_matvec_should_offload(
-            30,
-            8,
-            2,
-            GpuDispatchPolicy::MATVEC_OFFLOAD_MIN_CG_ITERS,
-        ));
+        assert!(!pol.reduced_schur_matvec_should_offload(30, 8, 2, 8));
         // The 300×8 shape the production seam tests use as the "stay CPU"
         // canary is rejected here too.
         assert!(!pol.reduced_schur_matvec_should_offload(300, 8, 4, 16));

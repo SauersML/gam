@@ -3,8 +3,8 @@
 //! This executable is a convergence and execution-path probe, not a deadline
 //! benchmark. It runs the real `SaeManifoldOuterObjective` through the shared
 //! `OuterProblem`, refuses to materialize a fitted model unless the outer
-//! optimizer reports convergence, and only then reports elapsed time and GPU
-//! telemetry. There is no wall-clock deadline, iteration-cap sweep, or grid
+//! optimizer reports convergence, and only then reports elapsed time. There is
+//! no wall-clock deadline, iteration-cap sweep, or grid
 //! search; work interrupted by a scheduler wall is preserved by the production
 //! SAE checkpoint/resume path owned by the objective.
 //!
@@ -26,7 +26,6 @@ use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Instant;
 
-use gam::gpu::profile::{GpuExecutionTelemetry, telemetry_reset, telemetry_snapshot};
 use gam::solver::arrow_schur::ArrowSolverMode;
 use gam::solver::rho_optimizer::OuterProblem;
 use gam::solver::seeding::SeedConfig;
@@ -156,26 +155,6 @@ fn build_color_term() -> Result<(SaeManifoldTerm, Array2<f64>, SaeManifoldRho), 
     Ok((term, target, rho))
 }
 
-fn telemetry_delta(before: &GpuExecutionTelemetry, after: &GpuExecutionTelemetry) -> String {
-    format!(
-        "handles=+{} kernels=+{} factorizations=+{} h2d=+{}KiB d2h=+{}KiB cpu_fallbacks=+{}",
-        after
-            .handle_creation_count
-            .saturating_sub(before.handle_creation_count),
-        after
-            .kernel_launch_count
-            .saturating_sub(before.kernel_launch_count),
-        after
-            .factorization_count
-            .saturating_sub(before.factorization_count),
-        after.h2d_bytes.saturating_sub(before.h2d_bytes) / 1024,
-        after.d2h_bytes.saturating_sub(before.d2h_bytes) / 1024,
-        after
-            .cpu_fallback_count
-            .saturating_sub(before.cpu_fallback_count),
-    )
-}
-
 fn run() -> Result<(), String> {
     let (term, target, initial_rho) = build_color_term()?;
     let initial_beta_dim = term.beta_dim();
@@ -218,8 +197,6 @@ fn run() -> Result<(), String> {
             ..SeedConfig::default()
         });
 
-    telemetry_reset();
-    let telemetry_before = telemetry_snapshot();
     let started = Instant::now();
     let outer = problem
         .run(&mut objective, "#1017 production color SAE")
@@ -244,7 +221,6 @@ fn run() -> Result<(), String> {
         .into_fitted()
         .map_err(|err| format!("full color fit finalization failed: {err}"))?;
     let elapsed = started.elapsed();
-    let telemetry_after = telemetry_snapshot();
     let mut fitted_term = fitted.term;
     let factored_border_dim = fitted_term.factored_border_dim();
     let assembled =
@@ -267,9 +243,8 @@ fn run() -> Result<(), String> {
         assembled.k,
     );
     println!(
-        "FULLCOLOR_1017 elapsed_seconds={:.6} gpu[{}]",
+        "FULLCOLOR_1017 elapsed_seconds={:.6}",
         elapsed.as_secs_f64(),
-        telemetry_delta(&telemetry_before, &telemetry_after),
     );
     Ok(())
 }

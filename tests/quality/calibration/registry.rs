@@ -12,7 +12,7 @@
 //!     registered target (`assert_registry_covers_fields`).
 //!   * **Exhaustiveness** — the classification walk destructures each payload
 //!     struct with NO `..` rest pattern (`PredictUncertaintyResult`,
-//!     `PredictPosteriorMeanResult`, `CoefficientUncertaintyResult`) and matches
+//!     `PredictPosteriorMeanResult`) and matches
 //!     the covariance/interval mode enums with no wildcard, so adding a new field
 //!     or mode fails to compile until it is classified here. That is what stops
 //!     the next recycled-SE (#1875) from shipping unaudited.
@@ -25,8 +25,8 @@
 use gam::families::multinomial::{MultinomialPredictionIntervals, MultinomialSmoothSignificance};
 use gam::families::survival::predict::SurvivalPredictResult;
 use gam_predict::{
-    CoefficientUncertaintyResult, InferenceCovarianceMode, MeanIntervalMethod,
-    PredictPosteriorMeanResult, PredictUncertaintyResult,
+    InferenceCovarianceMode, MeanIntervalMethod, PredictPosteriorMeanResult,
+    PredictUncertaintyResult,
 };
 use gam_test_support::calibration::{
     AuditMode, CalibrationTarget, FieldAudit, SurfaceKind, assert_registry_covers_fields,
@@ -363,25 +363,6 @@ fn predict_payload_field_audits(payload: &PredictUncertaintyResult) -> Vec<Field
     ]
 }
 
-/// Exhaustive classification of every field of [`CoefficientUncertaintyResult`].
-fn coefficient_payload_field_audits(payload: &CoefficientUncertaintyResult) -> Vec<FieldAudit> {
-    let CoefficientUncertaintyResult {
-        estimate,
-        standard_error,
-        lower,
-        upper,
-        covariance_source,
-    } = payload;
-    std::hint::black_box((estimate, standard_error, lower, upper, covariance_source));
-    vec![
-        FieldAudit::point("estimate"),
-        FieldAudit::audited("standard_error", "coefficient_wald_interval"),
-        FieldAudit::audited("lower", "coefficient_wald_interval"),
-        FieldAudit::audited("upper", "coefficient_wald_interval"),
-        FieldAudit::point("covariance_source"),
-    ]
-}
-
 /// Exhaustive classification of every field of [`PredictPosteriorMeanResult`] —
 /// the posterior-mean predict path surfaced by the FFI/CLI predict tables
 /// (`std_error` / `mean_lower` / `mean_upper` columns, #1536). This is the very
@@ -609,18 +590,6 @@ fn posterior_mean_probe() -> PredictPosteriorMeanResult {
     }
 }
 
-/// A minimal well-formed `CoefficientUncertaintyResult` probe.
-fn coefficient_probe() -> CoefficientUncertaintyResult {
-    let one = Array1::<f64>::zeros(1);
-    CoefficientUncertaintyResult {
-        estimate: one.clone(),
-        standard_error: one.clone(),
-        lower: one.clone(),
-        upper: one.clone(),
-        covariance_source: InferenceCovarianceMode::SmoothingCorrected,
-    }
-}
-
 #[test]
 fn registry_is_internally_well_formed() {
     assert_registry_well_formed(&uq_surface_registry());
@@ -637,13 +606,6 @@ fn predict_payload_uncertainty_fields_are_all_registered() {
 fn posterior_mean_payload_uncertainty_fields_are_all_registered() {
     let registry = uq_surface_registry();
     let audits = posterior_mean_payload_field_audits(&posterior_mean_probe());
-    assert_registry_covers_fields(&audits, &registry);
-}
-
-#[test]
-fn coefficient_payload_uncertainty_fields_are_all_registered() {
-    let registry = uq_surface_registry();
-    let audits = coefficient_payload_field_audits(&coefficient_probe());
     assert_registry_covers_fields(&audits, &registry);
 }
 

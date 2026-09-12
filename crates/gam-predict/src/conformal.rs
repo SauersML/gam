@@ -45,8 +45,7 @@
 //! # Where the calibration lives, and how it is wired
 //!
 //! Conformal calibration is a *post-fit* operation: a single scalar `q̂` is
-//! derived once and then applied per prediction. There are two ways to build
-//! it, matching the two exchangeability regimes:
+//! derived once and then applied per prediction, from a held-out fold:
 //!
 //! * **Held-out fold (the predict-path default).** When the calibration data
 //!   were NOT used to fit the model — a genuinely held-out, labeled fold — the
@@ -60,16 +59,8 @@
 //!   `gam_predict::ConformalCalibrationFold`. The fold carries
 //!   its own design and may be of ANY size, fully decoupled from the training
 //!   rows.
-//! * **In-sample (no held-out fold available).** When the only data are the
-//!   training set, `ConformalCalibrator::from_fit` uses the
-//!   first-order approximate-leave-one-out diagnostics in
-//!   [`gam_solve::inference::alo`] to manufacture leave-one-out residuals from the
-//!   training rows. This is a calibrated heuristic: it inherits the split
-//!   conformal finite-sample guarantee only to the extent that the approximate
-//!   ALO scores match true leave-one-out exchangeable scores; there is no
-//!   separate distribution-free finite-sample theorem for the approximation.
 //!
-//! Either way the predict path consumes `q̂` through the opt-in
+//! The predict path consumes `q̂` through the opt-in
 //! `conformal_level` field on
 //! `gam_predict::PredictUncertaintyOptions`, which calls
 //! `ConformalCalibrator::calibrated_interval` to replace the model-based
@@ -100,13 +91,8 @@
 
 use crate::interval_policy::ResponseBounds;
 use gam_math::quantile::order_statistic;
-use gam_models::family_runtime::FamilyStrategy;
-use gam_models::family_runtime::strategy_for_spec;
 use gam_problem::EstimationError;
-use gam_solve::inference::alo::compute_alo_diagnostics_from_unified;
-use gam_solve::model_types::UnifiedFitResult;
-use gam_spec::LikelihoodSpec;
-use ndarray::{Array1, Array2, ArrayView1};
+use ndarray::{Array1, ArrayView1};
 
 fn effective_scale(scale: f64, idx: usize, role: &str) -> Result<f64, EstimationError> {
     if !(scale.is_finite() && scale >= 0.0) {
@@ -220,16 +206,9 @@ impl ConformalCalibrator {
         self.n_calibration
     }
 
-    /// Whether the calibration set was large enough to certify finite
-    /// intervals at the requested level (`q̂` finite). When `false` the
-    /// honest interval is unbounded.
-    pub fn certifies_finite(&self) -> bool {
-        self.q_hat.is_finite()
-    }
-
     /// Build a calibrator directly from held-out residuals and per-point
-    /// raw scales. This is the pure core both `ConformalCalibrator::from_fit`
-    /// and the e2e tests route through.
+    /// raw scales. This is the pure core both
+    /// `ConformalCalibrator::from_held_out_fold` and the e2e tests route through.
     pub fn from_residuals_and_scales(
         residuals: ArrayView1<'_, f64>,
         scales: ArrayView1<'_, f64>,
@@ -291,65 +270,6 @@ impl ConformalCalibrator {
         for i in 0..n {
             residuals[i] = y_cal[i] - mu_cal[i];
             scales[i] = effective_scale(scale_cal[i], i, "conformal calibration scale")?;
-        }
-        Self::from_residuals_and_scales(residuals.view(), scales.view(), alpha)
-    }
-
-    /// Build a calibrator from a fitted model and its training data.
-    ///
-    /// Computes first-order approximate-leave-one-out diagnostics (held-out
-    /// linear predictors `η̃_i` and per-point posterior SE `se_bayes_i`), maps
-    /// both onto the response scale through the fitted family's inverse link,
-    /// forms the response-scale held-out residuals `r_i = y_i − g⁻¹(η̃_i)` and
-    /// scales `s_i = |dμ/dη(η̃_i)| · se_bayes_i`, applies the shared
-    /// effective-scale transform, and returns the resulting `q̂`.
-    ///
-    /// This ALO path is a calibrated heuristic. It has the split-conformal
-    /// finite-sample marginal coverage guarantee only insofar as these
-    /// first-order ALO scores match true leave-one-out exchangeable scores; it
-    /// is not itself a distribution-free finite-sample guarantee.
-    ///
-    /// `design`, `offset`, `phi` mirror the arguments
-    /// [`compute_alo_diagnostics_from_unified`] requires; `eta` is the fitted
-    /// in-sample linear predictor `Xβ̂ + offset`.
-    pub fn from_fit(
-        fit: &UnifiedFitResult,
-        family: &LikelihoodSpec,
-        design: &Array2<f64>,
-        eta: &Array1<f64>,
-        offset: &Array1<f64>,
-        y: ArrayView1<'_, f64>,
-        phi: f64,
-        alpha: f64,
-    ) -> Result<Self, EstimationError> {
-        let alo = compute_alo_diagnostics_from_unified(fit, design, eta, offset, phi)?;
-        if alo.eta_tilde.len() != y.len() {
-            return Err(EstimationError::InvalidInput(format!(
-                "conformal calibration: ALO produced {} held-out predictors but y has length {}",
-                alo.eta_tilde.len(),
-                y.len()
-            )));
-        }
-        let strategy = strategy_for_spec(family);
-        let n = y.len();
-        let mut residuals = Array1::<f64>::zeros(n);
-        let mut scales = Array1::<f64>::zeros(n);
-        for i in 0..n {
-            let eta_tilde = alo.eta_tilde[i];
-            let jet = strategy.inverse_link_jet(eta_tilde)?;
-            let mu_tilde = jet.mu;
-            // Response-scale held-out residual.
-            residuals[i] = y[i] - mu_tilde;
-            // Response-scale held-out SE: |dμ/dη| · se_bayes (delta method on
-            // the held-out posterior SE), then the same effective-scale map
-            // used by the prediction interval.
-            let dmu_deta = jet.d1.abs();
-            let scale = effective_scale(
-                dmu_deta * alo.se_bayes[i],
-                i,
-                "conformal ALO response-scale SE",
-            )?;
-            scales[i] = scale;
         }
         Self::from_residuals_and_scales(residuals.view(), scales.view(), alpha)
     }

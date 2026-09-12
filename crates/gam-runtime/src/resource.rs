@@ -216,10 +216,6 @@ impl MemoryAvailability {
         self.available_bytes
     }
 
-    pub fn available_bytes_usize(&self) -> usize {
-        usize::try_from(self.available_bytes).unwrap_or(usize::MAX)
-    }
-
     pub const fn limiting_source(&self) -> MemoryAvailabilitySource {
         self.limiting_source
     }
@@ -292,13 +288,6 @@ pub fn resample_memory_availability() -> MemoryAvailability {
 ///   makes those compensations unnecessary rather than load-bearing.
 pub fn process_memory_availability() -> &'static MemoryAvailability {
     &MemoryGovernor::global().ledger.availability
-}
-
-/// The process's available-memory figure in bytes, saturating to `usize`.
-/// Convenience over [`process_memory_availability`] for planners that only
-/// need the scalar.
-pub fn process_available_memory_bytes() -> usize {
-    process_memory_availability().available_bytes_usize()
 }
 
 /// Convert one provenance-preserving availability observation to the process

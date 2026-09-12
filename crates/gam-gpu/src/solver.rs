@@ -6,10 +6,6 @@
 
 use ndarray::{Array2, ArrayView2};
 
-pub fn solver_backend_status() -> Result<super::CudaBackendStatus, super::GpuError> {
-    super::cuda_backend_status()
-}
-
 /// Outcome reported by [`iterative_refinement_cholesky_solve`].
 #[derive(Clone, Debug)]
 pub struct RefinementOutcome {

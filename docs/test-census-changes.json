@@ -297,5 +297,17 @@
       "crates/gam-math": 1,
       "tests/src_modules": 3
     }
+  },
+  {
+    "base": "7d3b1130789d463ff77416e1c012adab95768709",
+    "reason": "user directive: delete all useless slop",
+    "evidence": "gam-gpu: The one tests/arrow_gpu test removed (owed_1412.rs resident_normal_equations_matches_host_solve_or_declines) existed only to exercise ResidentDesignGram::solve_normal_equations, which no production code named. test_census on MSI over fb8fada8d plus this patch measured test_count_decrease 1 (tests/arrow_gpu), no removed pins. gam-predict: The one tests/quality test removed (coefficient_payload_uncertainty_fields_are_all_registered) walked the fields of CoefficientUncertaintyResult, whose only producer coefficient_uncertaintywith_mode is deleted here; the registry's other payload lints and its coefficient_wald_interval target remain. test_census on MSI over 0367fa300 plus this patch measured test_count_decrease 1 (tests/quality) and no removed pins. gam-model-kernels: The four gam-model-kernels unit tests removed (event_and_exposure_rows_add_to_the_exact_process_likelihood, zero_exposure_remains_exact_in_the_finite_log_intensity_tail, curvature_tower_matches_finite_differences, invalid_measure_and_unrepresentable_intensity_are_typed_errors) existed only to exercise point_process_natural_observation, which no production code named. test_census on MSI over 0367fa300 plus this patch measured test_count_decrease 4 (crates/gam-model-kernels) and no removed pins.",
+    "removed_pins": {},
+    "test_count_decrease": 6,
+    "unit_test_decreases": {
+      "tests/arrow_gpu": 1,
+      "tests/quality": 1,
+      "crates/gam-model-kernels": 4
+    }
   }
 ]

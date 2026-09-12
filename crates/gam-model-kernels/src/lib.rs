@@ -24,6 +24,5 @@ pub mod inverse_link;
 pub mod monotone_root;
 pub mod natural_observation;
 pub mod penalized_projection;
-pub mod point_process;
 pub mod scale_design;
 pub mod sigma_link;

@@ -304,15 +304,9 @@ fn offload_gate_admits_d_atom_1_at_token_scale_1783() {
          blocker for thin curve atoms"
     );
 
-    // The earlier K=64 case at n=24576 also clears (with the conservative default
-    // CG budget the seam derives).
+    // The earlier K=64 case at n=24576 also clears at an 8-apply CG budget.
     assert!(
-        policy.reduced_schur_matvec_should_offload(
-            24_576,
-            64,
-            1,
-            gam_gpu::policy::GpuDispatchPolicy::MATVEC_OFFLOAD_MIN_CG_ITERS,
-        ),
+        policy.reduced_schur_matvec_should_offload(24_576, 64, 1, 8),
         "#1783: the earlier K=64 d_atom=1 shape must also clear the offload gate"
     );
 

@@ -327,31 +327,6 @@ impl DeviceResidentArrowWorkspace {
         }
     }
 
-    /// Opaque device-context identifier for telemetry: `1` when the resident
-    /// device buffers are live on this workspace, `0` when no device was bound.
-    /// Distinguishes "a device executed this fit" from "silent CPU fallback"
-    /// without leaking the cudarc handle.
-    #[must_use]
-    fn context_id(&self) -> usize {
-        usize::from(self.device_resident())
-    }
-
-    /// Bytes the re-uploading / frame-build path moves host→device for a full
-    /// `D`/`B`/`g`/border refresh, used to attribute H2D traffic in telemetry.
-    #[must_use]
-    fn frame_upload_bytes(&self) -> usize {
-        [
-            self.slabs.row_hessian_slabs.len(),
-            self.slabs.row_cross_slabs.len(),
-            self.slabs.row_gradient_slabs.len(),
-            self.slabs.border_hessian.len(),
-            self.slabs.border_gradient.len(),
-        ]
-        .into_iter()
-        .sum::<usize>()
-            * std::mem::size_of::<f64>()
-    }
-
     #[must_use]
     pub fn host_shadow_bytes(&self) -> usize {
         [
@@ -644,13 +619,6 @@ impl DeviceResidentArrowWorkspace {
                     // minus the across-iteration buffer/factor reuse — so EVERY
                     // iterate creates handles, factorizes, launches, and re-uploads
                     // the full slabs.
-                    gam_gpu::profile::telemetry_record_handle_creation(self.context_id());
-                    gam_gpu::profile::telemetry_record_factorization();
-                    gam_gpu::profile::telemetry_record_h2d(self.frame_upload_bytes());
-                    gam_gpu::profile::telemetry_record_kernel_launch();
-                    gam_gpu::profile::telemetry_record_d2h(
-                        (n * d + p) * std::mem::size_of::<f64>(),
-                    );
                     solve_arrow_newton_step(&residual, ridge_t, ridge_beta, None)
                         .map_err(map_gpu_error)
                 }
@@ -1095,9 +1063,6 @@ impl DeviceResidentArrowWorkspace {
                     Some(apply) => {
                         let moved = (t.len() + beta.len()) * std::mem::size_of::<f64>();
                         let returned = (t.len() + 2 * beta.len()) * std::mem::size_of::<f64>();
-                        gam_gpu::profile::telemetry_record_h2d(moved);
-                        gam_gpu::profile::telemetry_record_kernel_launch();
-                        gam_gpu::profile::telemetry_record_d2h(returned);
                         return (
                             apply,
                             OperatorApplyCost {
@@ -1465,7 +1430,6 @@ impl DeviceResidentArrowWorkspace {
     ) -> Result<ArrowSchurGpuSolution, DeviceResidentArrowError> {
         let n = self.shape.n;
         let d = self.shape.d;
-        let p = self.shape.p;
         let mut g_t = Vec::with_capacity(n * d);
         for row in &residual.rows {
             for &v in row.gt.iter() {
@@ -1473,8 +1437,6 @@ impl DeviceResidentArrowWorkspace {
             }
         }
         let g_beta: Vec<f64> = residual.gb.iter().copied().collect();
-        let gradient_bytes = (g_t.len() + g_beta.len()) * std::mem::size_of::<f64>();
-        let readback_bytes = (n * d + p) * std::mem::size_of::<f64>();
 
         // Level 1: the resident base blocks. Built at most once per loop.
         if !frames.base_declined && frames.base.is_none() {
@@ -1484,8 +1446,6 @@ impl DeviceResidentArrowWorkspace {
             accounting.frame_build_seconds += build_start.elapsed().as_secs_f64();
             match built {
                 Ok(base) => {
-                    gam_gpu::profile::telemetry_record_handle_creation(self.context_id());
-                    gam_gpu::profile::telemetry_record_h2d(self.frame_upload_bytes());
                     frames.base_builds += 1;
                     accounting.base_builds += 1;
                     frames.base = Some(base);
@@ -1524,8 +1484,6 @@ impl DeviceResidentArrowWorkspace {
                 let factors = factored.map_err(map_gpu_error)?;
                 frames.base_refactors += 1;
                 accounting.base_refactors += 1;
-                gam_gpu::profile::telemetry_record_factorization();
-                gam_gpu::profile::telemetry_record_h2d(n * d * d * std::mem::size_of::<f64>());
                 frames.base_keyed = Some(factors);
             } else {
                 frames.base_gradient_solves += 1;
@@ -1533,9 +1491,6 @@ impl DeviceResidentArrowWorkspace {
             }
             match frames.base_keyed.as_ref() {
                 Some(factors) => {
-                    gam_gpu::profile::telemetry_record_h2d(gradient_bytes);
-                    gam_gpu::profile::telemetry_record_kernel_launch();
-                    gam_gpu::profile::telemetry_record_d2h(readback_bytes);
                     return base
                         .solve_with_factors(factors, &g_t, &g_beta)
                         .map_err(map_gpu_error);
@@ -1559,9 +1514,6 @@ impl DeviceResidentArrowWorkspace {
         if keyed_matches {
             match frames.keyed.as_ref() {
                 Some((_, _, frame)) => {
-                    gam_gpu::profile::telemetry_record_h2d(gradient_bytes);
-                    gam_gpu::profile::telemetry_record_kernel_launch();
-                    gam_gpu::profile::telemetry_record_d2h(readback_bytes);
                     return frame.solve_gradient(&g_t, &g_beta).map_err(map_gpu_error);
                 }
                 None => {
@@ -1582,18 +1534,12 @@ impl DeviceResidentArrowWorkspace {
             Ok(frame) => {
                 frames.frame_builds += 1;
                 accounting.frame_builds += 1;
-                gam_gpu::profile::telemetry_record_handle_creation(self.context_id());
-                gam_gpu::profile::telemetry_record_factorization();
-                gam_gpu::profile::telemetry_record_h2d(self.frame_upload_bytes());
                 frames.keyed = Some((ridge_t, ridge_beta, frame));
             }
             Err(err) => return Err(map_gpu_error(err)),
         }
         match frames.keyed.as_ref() {
             Some((_, _, frame)) => {
-                gam_gpu::profile::telemetry_record_h2d(gradient_bytes);
-                gam_gpu::profile::telemetry_record_kernel_launch();
-                gam_gpu::profile::telemetry_record_d2h(readback_bytes);
                 frame.solve_gradient(&g_t, &g_beta).map_err(map_gpu_error)
             }
             None => Err(DeviceResidentArrowError::Solve {
