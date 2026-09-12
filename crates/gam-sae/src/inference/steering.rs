@@ -65,6 +65,8 @@
 //! `δ` of [`RowMetric`] never enters any number it reports (the fisher-mass /
 //! pullback face is `δ`-free, #747).
 
+use faer::Side;
+use gam_linalg::faer_ndarray::FaerEigh;
 use ndarray::{Array1, Array2, ArrayView1};
 
 use crate::basis::SaeBasisEvaluator;
@@ -1588,8 +1590,13 @@ pub fn collateral_curve(
     // field, i.e. the leading eigenvector of `G = Σ_i g_i g_iᵀ` with
     // `g_i = ∂g_k/∂t_axis|_{t_i}`. This is the single best fixed decoder column a
     // flat SAE would steer this feature with (the mean tangent is not usable — it
-    // averages to ≈0 over a full circle). Found by power iteration on the small
-    // `p × p` Gram, which is exact for the leading direction.
+    // averages to ≈0 over a full circle). Read off the exact symmetric
+    // eigendecomposition of the `p × p` Gram rather than an iteration whose step
+    // count would decide how close to leading the direction is. A repeated
+    // leading eigenvalue (a round ring's tangent field is isotropic in its plane)
+    // defines the direction only up to that eigenspace; every unit vector of it
+    // maximizes the same `Σ_i (wᵀ g_i)²`, and the decomposition's basis vector is
+    // used.
     let mut gram = Array2::<f64>::zeros((p, p));
     for frame in &target_frames {
         for i in 0..p {
@@ -1602,26 +1609,19 @@ pub fn collateral_curve(
             }
         }
     }
-    let mut w = Array1::<f64>::from_elem(p, 1.0 / (p as f64).sqrt());
-    for _ in 0..128 {
-        let mut next = Array1::<f64>::zeros(p);
-        for i in 0..p {
-            let mut acc = 0.0_f64;
-            for j in 0..p {
-                acc += gram[[i, j]] * w[j];
-            }
-            next[i] = acc;
-        }
-        let norm = next.iter().map(|&x| x * x).sum::<f64>().sqrt();
-        if !(norm > 0.0) {
-            return Err(format!(
+    let (eigenvalues, eigenvectors) = gram.eigh(Side::Lower).map_err(|error| {
+        format!("collateral_curve: tangent-field Gram eigendecomposition failed: {error:?}")
+    })?;
+    let leading = (0..eigenvalues.len())
+        .max_by(|&a, &b| eigenvalues[a].total_cmp(&eigenvalues[b]))
+        .filter(|&index| eigenvalues[index] > 0.0)
+        .ok_or_else(|| {
+            format!(
                 "collateral_curve: atom {atom_k} has a vanishing tangent field along axis {axis}; \
                  no fixed direction to define the flat control"
-            ));
-        }
-        next.mapv_inplace(|x| x / norm);
-        w = next;
-    }
+            )
+        })?;
+    let w = eigenvectors.column(leading).to_owned();
 
     // Decompose one per-row move field into (effect, off-target collateral,
     // cross-feature leakage) RMS over rows.
