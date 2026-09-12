@@ -607,7 +607,6 @@ pub(crate) enum FamilyArg {
     Tweedie,
     Beta,
     RoystonParmar,
-    TransformationNormal,
     Expectile,
     /// Penalized multinomial-logit GAM: a categorical response with K classes
     /// modelled by a shared-covariate softmax over K-1 active-class linear

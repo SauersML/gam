@@ -1730,18 +1730,7 @@ pub(crate) fn validate_fit_args_preflight(
         }
         return Ok(());
     }
-    if args.family == FamilyArg::TransformationNormal && !args.transformation_normal {
-        return Err(
-            "--family transformation-normal does not select the transformation-normal fitter; use --transformation-normal"
-                .to_string(),
-        );
-    }
-    if args.transformation_normal
-        && !matches!(
-            args.family,
-            FamilyArg::Auto | FamilyArg::TransformationNormal
-        )
-    {
+    if args.transformation_normal && args.family != FamilyArg::Auto {
         return Err(format!(
             "--transformation-normal conflicts with --family {}",
             family_arg_name(args.family)
@@ -1874,7 +1863,6 @@ pub(crate) fn family_arg_name(arg: FamilyArg) -> &'static str {
         FamilyArg::Tweedie => "tweedie",
         FamilyArg::Beta => "beta",
         FamilyArg::RoystonParmar => "royston-parmar",
-        FamilyArg::TransformationNormal => "transformation-normal",
         FamilyArg::Expectile => "expectile",
         FamilyArg::Multinomial => "multinomial",
     }

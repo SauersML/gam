@@ -34,7 +34,7 @@ Common options:
 
 | Option | Meaning |
 | --- | --- |
-| `--family auto|gaussian|binomial-logit|binomial-probit|binomial-cloglog|latent-cloglog-binomial|poisson-log|negative-binomial|gamma-log|tweedie|beta|royston-parmar|transformation-normal` | Explicit response family. `auto` infers from the response. |
+| `--family auto|gaussian|binomial-logit|binomial-probit|binomial-cloglog|latent-cloglog-binomial|poisson-log|negative-binomial|gamma-log|tweedie|beta|royston-parmar|expectile|multinomial` | Explicit response family. `auto` infers from the response. |
 | `--negative-binomial-theta VALUE` | Fixed size / overdispersion for negative-binomial fits. |
 | `--weights-column COLUMN` | Non-negative per-row likelihood weights. |
 | `--offset-column COLUMN` | Additive offset for the primary linear predictor. |
