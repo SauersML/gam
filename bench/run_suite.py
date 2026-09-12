@@ -21,20 +21,16 @@ from shutil import disk_usage
 from time import monotonic, perf_counter
 
 # Statistical-regression gate. Lives in bench/gate.py so it can
-# be invoked stand-alone post-hoc as well. Loaded lazily-safely: if the
-# module is unavailable for any reason the gate just stays quiet.
-try:
-    _gate_path = Path(__file__).resolve().parent / "gate.py"
-    _gate_spec = importlib.util.spec_from_file_location("_bench_gate", _gate_path)
-    if _gate_spec is None or _gate_spec.loader is None:
-        raise ImportError(f"failed to load statistical gate from {_gate_path}")
-    _gate_module = importlib.util.module_from_spec(_gate_spec)
-    _gate_spec.loader.exec_module(_gate_module)
-    _gate_extract_fit_quality = _gate_module.extract_fit_quality
-    _gate_cmd_check_results = _gate_module.cmd_check_results
-except Exception:  # pragma: no cover - bench infra only
-    _gate_extract_fit_quality = None
-    _gate_cmd_check_results = None
+# be invoked stand-alone post-hoc as well. gate.py imports only the standard
+# library, so a load failure is a defect in it and must stop the suite.
+_gate_path = Path(__file__).resolve().parent / "gate.py"
+_gate_spec = importlib.util.spec_from_file_location("_bench_gate", _gate_path)
+if _gate_spec is None or _gate_spec.loader is None:
+    raise ImportError(f"failed to load statistical gate from {_gate_path}")
+_gate_module = importlib.util.module_from_spec(_gate_spec)
+_gate_spec.loader.exec_module(_gate_module)
+_gate_extract_fit_quality = _gate_module.extract_fit_quality
+_gate_cmd_check_results = _gate_module.cmd_check_results
 
 
 def _env_flag(name: str, default: bool = False) -> bool:
@@ -1664,11 +1660,8 @@ def run_rust_scenario_cv(
             # while it is already in memory. Goes into the cv row and is
             # aggregated lane-wide by _finalize_cv_result.
             fit_quality_row: dict[str, typing.Any] | None = None
-            if model_payload is not None and _gate_extract_fit_quality is not None:
-                try:
-                    fit_quality_row = _gate_extract_fit_quality({"payload": model_payload})
-                except Exception:
-                    fit_quality_row = None
+            if model_payload is not None:
+                fit_quality_row = _gate_extract_fit_quality({"payload": model_payload})
             try:
                 model_summary = model.summary()
             except Exception as e:
@@ -3391,17 +3384,13 @@ def main() -> None:
     gate_mode = args.gate or os.environ.get("BENCH_GATE", "").strip().lower() or "strict"
     if gate_mode not in ("report", "strict", "off"):
         gate_mode = "strict"
-    if gate_mode != "off" and _gate_cmd_check_results is not None:
+    if gate_mode != "off":
         gate_args = argparse.Namespace(
             results=str(args.out),
             gate=gate_mode,
             update_baseline=bool(args.update_baseline),
         )
-        try:
-            gate_rc = int(_gate_cmd_check_results(gate_args))
-        except Exception as e:  # pragma: no cover - bench infra only
-            print(f"[gate] error: {e}", file=sys.stderr)
-            gate_rc = 0
+        gate_rc = int(_gate_cmd_check_results(gate_args))
         if gate_rc != 0 and gate_mode == "strict":
             raise SystemExit(f"benchmark statistical-regression gate failed (rc={gate_rc})")
 

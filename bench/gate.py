@@ -267,22 +267,17 @@ def _gate_one(key: str, current: dict[str, Any], *, update: bool, mode: str) -> 
     if not baseline_path.is_file():
         print(f"[BENCH-GATE] no baseline for lane '{key}', skipping (not fail)")
         return True
+    # A checked-in baseline the gate cannot compare against is a broken gate,
+    # not an unmeasured lane: `--update-baseline` only writes a dict carrying
+    # final_neg_v or edf_per_term.
     try:
-        baseline_text = baseline_path.read_text()
+        baseline = json.loads(baseline_path.read_text())
     except (OSError, ValueError) as e:
-        print(f"[gate] SKIP {key}: baseline unreadable ({e})")
-        return True
-    if not baseline_text.strip():
-        print(f"[BENCH-GATE] no baseline for lane '{key}', skipping (not fail)")
-        return True
-    try:
-        baseline = json.loads(baseline_text)
-    except ValueError as e:
-        print(f"[gate] SKIP {key}: baseline unreadable ({e})")
-        return True
+        print(f"[gate] {key} FAIL: baseline {baseline_path} unreadable ({e})")
+        return False
     if not _has_baseline_data(baseline):
-        print(f"[BENCH-GATE] no baseline for lane '{key}', skipping (not fail)")
-        return True
+        print(f"[gate] {key} FAIL: baseline {baseline_path} carries neither final_neg_v nor edf_per_term")
+        return False
     passed, messages = compare(current, baseline)
     header = f"[gate] {key} {'PASS' if passed else 'FAIL'}"
     print(header)
