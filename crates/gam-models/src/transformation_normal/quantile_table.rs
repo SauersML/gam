@@ -221,14 +221,27 @@ impl CtnTransformTable {
     /// quantile function is continuous and strictly increasing in `target` on
     /// the whole real line.
     pub fn invert(&self, row: usize, target: f64) -> f64 {
+        self.invert_with_slope(row, target).0
+    }
+
+    /// `h⁻¹(target | x_row)` together with its exact latent slope
+    /// `d h⁻¹ / d target = 1 / h'(y)`, taken on the same interpolant
+    /// [`CtnTransformTable::invert`] inverts: `1 / h'` at the nearer end node on
+    /// the affine exterior, and `width / slope(t)` of the bracketing Hermite
+    /// cell inside. Consumers that interpolate the quantile function use this
+    /// derivative instead of differencing tabulated quantiles.
+    pub fn invert_with_slope(&self, row: usize, target: f64) -> (f64, f64) {
         let g = self.grid_y.len();
         let h = self.h.row(row);
         let slope = self.h_prime.row(row);
         if target <= h[0] {
-            return self.grid_y[0] + (target - h[0]) / slope[0];
+            return (self.grid_y[0] + (target - h[0]) / slope[0], 1.0 / slope[0]);
         }
         if target >= h[g - 1] {
-            return self.grid_y[g - 1] + (target - h[g - 1]) / slope[g - 1];
+            return (
+                self.grid_y[g - 1] + (target - h[g - 1]) / slope[g - 1],
+                1.0 / slope[g - 1],
+            );
         }
         let mut lo = 0usize;
         let mut hi = g - 1;
@@ -241,7 +254,8 @@ impl CtnTransformTable {
             }
         }
         let cell = self.cell(row, lo);
-        self.grid_y[lo] + cell.width * cell.invert(target)
+        let t = cell.invert(target);
+        (self.grid_y[lo] + cell.width * t, cell.width / cell.slope(t))
     }
 
     fn cell(&self, row: usize, index: usize) -> HermiteCell {
@@ -500,6 +514,57 @@ mod tests {
         assert!(
             worst < 1.0e-12,
             "invert is not the inverse of the interpolant it evaluates: {worst:.6e}"
+        );
+    }
+
+    #[test]
+    fn invert_with_slope_returns_the_exact_derivative_of_the_inverse() {
+        // Affine rows: `dy/dz = 1/slope` everywhere, both tails included.
+        let affine = affine_table();
+        for &z in &[-8.0_f64, -1.5, 0.0, 0.7, 8.0] {
+            let (y0, s0) = affine.invert_with_slope(0, z);
+            let (y1, s1) = affine.invert_with_slope(1, z);
+            assert!(
+                (y0 - 0.5 * z).abs() < 1e-12 && (s0 - 0.5).abs() < 1e-12,
+                "row 0 at z={z}: ({y0}, {s0})"
+            );
+            assert!(
+                (y1 - 0.25 * z).abs() < 1e-12 && (s1 - 0.25).abs() < 1e-12,
+                "row 1 at z={z}: ({y1}, {s1})"
+            );
+        }
+
+        // Curved row `h = ln y`: at every node the slope is `1/h' = y` there, and
+        // everywhere else it matches a central difference of `invert` on the
+        // tails and in every cell. Finite differences are sanctioned in tests.
+        let table = log_table(17);
+        let grid = table.grid_y().to_owned();
+        let latent = table.latent().to_owned();
+        for k in 0..grid.len() {
+            let (y, slope) = table.invert_with_slope(0, latent[[0, k]]);
+            assert!((y - grid[k]).abs() < 1e-12, "node {k}: value {y} vs {}", grid[k]);
+            assert!(
+                (slope - grid[k]).abs() < 1e-10 * grid[k].max(1.0),
+                "node {k}: slope {slope} vs 1/h' = {}",
+                grid[k]
+            );
+        }
+        let h = 1e-6;
+        let mut worst = 0.0_f64;
+        for step in 0..=2000 {
+            let z = -9.0 + 18.0 * (step as f64) / 2000.0;
+            let (y, slope) = table.invert_with_slope(0, z);
+            assert_eq!(
+                y.to_bits(),
+                table.invert(0, z).to_bits(),
+                "invert must be the value half of invert_with_slope at z={z}"
+            );
+            let central = (table.invert(0, z + h) - table.invert(0, z - h)) / (2.0 * h);
+            worst = worst.max((slope - central).abs() / central.abs().max(1e-12));
+        }
+        assert!(
+            worst < 1e-5,
+            "invert_with_slope disagrees with a central difference of invert: {worst:.3e}"
         );
     }
 

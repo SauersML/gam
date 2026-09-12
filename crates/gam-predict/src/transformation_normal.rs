@@ -30,63 +30,12 @@ pub struct TransformationNormalPredictor {
     pub covariance: Option<Array2<f64>>,
 }
 
-/// The secant `dy/dz` of the ladder across cell `j`.
-#[inline]
-fn ladder_secant(ladder_row: ndarray::ArrayView1<'_, f64>, j: usize, step: f64) -> f64 {
-    (ladder_row[j + 1] - ladder_row[j]) / step
-}
-
-/// `dy/dz` at ladder node `j`, by the shape-preserving (PCHIP / Fritsch-Carlson)
-/// rule: the harmonic mean of the two neighbouring secants in the interior, and
-/// the one-sided three-point estimate limited to `3·d` at the two ends.
-///
-/// The harmonic mean is what makes the resulting cubic monotone — it vanishes
-/// wherever the data have an extremum and never exceeds three times either
-/// neighbouring secant — which matters here because the interpolated object is a
-/// *quantile function*: a band whose interpolation could overshoot would report
-/// a lower limit above its own upper limit.
-///
-/// Slopes are computed from the ladder rather than stored because `PredictInput`
-/// carries the ladder as a plain `n × m` matrix, and `m = 65` per row is already
-/// the memory budget for this path.
-fn ladder_slope(ladder_row: ndarray::ArrayView1<'_, f64>, j: usize, step: f64) -> f64 {
-    let m = ladder_row.len();
-    let one_sided = |near: f64, far: f64| {
-        let estimate = 0.5 * (3.0 * near - far);
-        if estimate <= 0.0 {
-            0.0
-        } else if estimate > 3.0 * near {
-            3.0 * near
-        } else {
-            estimate
-        }
-    };
-    if m == 2 {
-        return ladder_secant(ladder_row, 0, step);
-    }
-    if j == 0 {
-        return one_sided(
-            ladder_secant(ladder_row, 0, step),
-            ladder_secant(ladder_row, 1, step),
-        );
-    }
-    if j == m - 1 {
-        return one_sided(
-            ladder_secant(ladder_row, m - 2, step),
-            ladder_secant(ladder_row, m - 3, step),
-        );
-    }
-    let before = ladder_secant(ladder_row, j - 1, step);
-    let after = ladder_secant(ladder_row, j, step);
-    if before <= 0.0 || after <= 0.0 {
-        return 0.0;
-    }
-    2.0 / (1.0 / before + 1.0 / after)
-}
-
-/// Interpolate one row of the tabulated response-quantile ladder
-/// `Q[j] = h⁻¹(z_j | x)` at an arbitrary latent value `z`. The ladder nodes are
-/// the fixed even grid from `transformation_normal_band_z_nodes`.
+/// Interpolate one row of the tabulated response-quantile ladder at an arbitrary
+/// latent value `z`. The row holds `m` node values `Q[j] = h⁻¹(z_j | x)` on the
+/// fixed even grid from `transformation_normal_band_z_nodes`, followed by their
+/// exact latent slopes `Q'[j] = 1 / h'(Q[j] | x)`, which the input builder reads
+/// off the same interpolant it inverts. The slope of a function we hold is its
+/// derivative, never a difference of its samples (SPEC rule 2).
 ///
 /// Two things this must not do, both of which it used to (gam#2600):
 ///
@@ -97,36 +46,39 @@ fn ladder_slope(ladder_row: ndarray::ArrayView1<'_, f64>, j: usize, step: f64) -
 ///   continuation; where `h⁻¹(±z_max)` still falls inside the support it is a
 ///   first-order one, which is strictly better than a constant.
 /// * **Interpolate a curved quantile function with a chord.** `Q` is `h⁻¹`
-///   sampled every `2·z_max/(m−1) = 0.125` in the latent, and `h⁻¹` is as curved
+///   sampled every `2·z_max/(m−1) = 0.25` in the latent, and `h⁻¹` is as curved
 ///   as the response is skewed — for a lognormal response `d²y/dz² = y`, so a
-///   chord carries `O(Δz²·y/8) ≈ 2e-3·y`, i.e. two parts in a thousand of the
-///   reported limit. The shape-preserving cubic through the same nodes is third
-///   order and, being monotone, keeps the band ordered.
+///   chord carries `O(Δz²·y/8) ≈ 8e-3·y`. The cubic Hermite through the same
+///   nodes with their exact slopes is fourth order (`O(Δz⁴·y/384) ≈ 1e-5·y`). A
+///   cell whose end slopes could make that cubic overshoot (either slope above
+///   three secants, the Fritsch–Carlson bound) falls back to its chord, so the
+///   band stays ordered; the secant decides only that and is never a derivative.
 fn ladder_quantile(ladder_row: ndarray::ArrayView1<'_, f64>, z: f64) -> f64 {
-    let m = ladder_row.len();
+    let m = TRANSFORMATION_NORMAL_BAND_Z_NODES;
     assert_eq!(
-        m, TRANSFORMATION_NORMAL_BAND_Z_NODES,
-        "quantile ladder row must be tabulated on the fixed even z grid"
+        ladder_row.len(),
+        2 * m,
+        "quantile ladder row must hold node values then slopes on the fixed even z grid"
     );
+    let values = ladder_row.slice(ndarray::s![..m]);
+    let slopes = ladder_row.slice(ndarray::s![m..]);
     let z_max = TRANSFORMATION_NORMAL_BAND_Z_MAX;
     let step = 2.0 * z_max / ((m - 1) as f64);
     let t = (z + z_max) / step;
     if t <= 0.0 {
-        return ladder_row[0] + (z + z_max) * ladder_slope(ladder_row, 0, step);
+        return values[0] + (z + z_max) * slopes[0];
     }
     if t >= (m - 1) as f64 {
-        return ladder_row[m - 1] + (z - z_max) * ladder_slope(ladder_row, m - 1, step);
+        return values[m - 1] + (z - z_max) * slopes[m - 1];
     }
     let j = t.floor() as usize;
     let frac = t - j as f64;
-    let (q0, q1) = (ladder_row[j], ladder_row[j + 1]);
-    let secant = ladder_secant(ladder_row, j, step);
-    if !(secant > 0.0) {
-        // A cell the transform could not separate: nothing to shape-preserve.
+    let (q0, q1) = (values[j], values[j + 1]);
+    let (m0, m1) = (slopes[j], slopes[j + 1]);
+    let secant = (q1 - q0) / step;
+    if !(secant > 0.0 && m0 <= 3.0 * secant && m1 <= 3.0 * secant) {
         return q0 + frac * (q1 - q0);
     }
-    let m0 = ladder_slope(ladder_row, j, step);
-    let m1 = ladder_slope(ladder_row, j + 1, step);
     let (t2, t3) = (frac * frac, frac * frac * frac);
     (2.0 * t3 - 3.0 * t2 + 1.0) * q0
         + (t3 - 2.0 * t2 + frac) * step * m0
@@ -269,18 +221,20 @@ impl PredictableModel for TransformationNormalPredictor {
                         .to_string(),
                 )
             })?;
-            if ladder.nrows() != n || ladder.ncols() != TRANSFORMATION_NORMAL_BAND_Z_NODES {
+            if ladder.nrows() != n || ladder.ncols() != 2 * TRANSFORMATION_NORMAL_BAND_Z_NODES {
                 return Err(EstimationError::InvalidInput(format!(
-                    "transformation-normal quantile ladder shape mismatch: expected {}x{}, got {}x{}",
+                    "transformation-normal quantile ladder shape mismatch: expected {}x{} \
+                     (node values then slopes), got {}x{}",
                     n,
-                    TRANSFORMATION_NORMAL_BAND_Z_NODES,
+                    2 * TRANSFORMATION_NORMAL_BAND_Z_NODES,
                     ladder.nrows(),
                     ladder.ncols()
                 )));
             }
             // Equal-tailed response-scale predictive band: the p-quantile of
             // `Y|x = h⁻¹(Z|x)` is `h⁻¹(Φ⁻¹(p)|x)`, interpolated from the
-            // tabulated ladder. `h⁻¹` is monotone increasing, so the band is
+            // tabulated node values and their exact slopes. `h⁻¹` is monotone
+            // increasing and the interpolant is shape-preserving, so the band is
             // ordered by construction.
             let lower = Array1::from_shape_fn(n, |i| ladder_quantile(ladder.row(i), -z));
             let upper = Array1::from_shape_fn(n, |i| ladder_quantile(ladder.row(i), z));
@@ -305,12 +259,14 @@ mod tests {
 
     /// The ladder a lognormal response actually produces: `h(y) = ln y`, so
     /// `h⁻¹(z) = exp(z)` — smooth, strongly curved, and known in closed form, so
-    /// every deviation below is interpolation error and nothing else.
+    /// every deviation below is interpolation error and nothing else. The row
+    /// holds the node values followed by their exact slopes, which for `exp`
+    /// are the values themselves.
     fn exp_ladder() -> Array1<f64> {
         let m = TRANSFORMATION_NORMAL_BAND_Z_NODES;
         let z_max = TRANSFORMATION_NORMAL_BAND_Z_MAX;
-        Array1::from_shape_fn(m, |j| {
-            (-z_max + 2.0 * z_max * (j as f64) / ((m - 1) as f64)).exp()
+        Array1::from_shape_fn(2 * m, |slot| {
+            (-z_max + 2.0 * z_max * ((slot % m) as f64) / ((m - 1) as f64)).exp()
         })
     }
 
@@ -319,8 +275,9 @@ mod tests {
         // A requested level past `z_max` used to return the outermost tabulated
         // quantile, so every band beyond 99.994 % was the same interval.
         let ladder = exp_ladder();
+        let m = TRANSFORMATION_NORMAL_BAND_Z_NODES;
         let z_max = TRANSFORMATION_NORMAL_BAND_Z_MAX;
-        let end = ladder[ladder.len() - 1];
+        let end = ladder[m - 1];
         let mut previous = end;
         for &z in &[4.5_f64, 5.0, 6.0] {
             let value = ladder_quantile(ladder.view(), z);
@@ -340,9 +297,8 @@ mod tests {
             );
             previous = value;
         }
-        // The continuation is the ladder's own end slope, exactly.
-        let step = 2.0 * z_max / ((ladder.len() - 1) as f64);
-        let slope = ladder_slope(ladder.view(), ladder.len() - 1, step);
+        // The continuation is the ladder's own exact end slope.
+        let slope = ladder[2 * m - 1];
         let far = ladder_quantile(ladder.view(), z_max + 1.5);
         assert!(
             (far - (end + 1.5 * slope)).abs() < 1e-9,
@@ -354,7 +310,7 @@ mod tests {
     #[test]
     fn band_ladder_interpolation_is_shape_preserving_and_beats_the_chord_2600() {
         let ladder = exp_ladder();
-        let m = ladder.len();
+        let m = TRANSFORMATION_NORMAL_BAND_Z_NODES;
         let z_max = TRANSFORMATION_NORMAL_BAND_Z_MAX;
         let step = 2.0 * z_max / ((m - 1) as f64);
         let (mut shaped, mut chord) = (0.0_f64, 0.0_f64);
@@ -394,7 +350,7 @@ mod tests {
     #[test]
     fn band_ladder_reproduces_its_own_nodes_exactly_2600() {
         let ladder = exp_ladder();
-        let m = ladder.len();
+        let m = TRANSFORMATION_NORMAL_BAND_Z_NODES;
         let z_max = TRANSFORMATION_NORMAL_BAND_Z_MAX;
         for j in 0..m {
             let z = -z_max + 2.0 * z_max * (j as f64) / ((m - 1) as f64);

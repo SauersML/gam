@@ -654,12 +654,16 @@ fn transformation_normal_observed_scores(
 }
 
 /// Number of latent-z nodes on which the CTM predict input tabulates the
-/// response-scale predictive quantile ladder `h⁻¹(z_j | x_i)`.
-pub const TRANSFORMATION_NORMAL_BAND_Z_NODES: usize = 65;
+/// response-scale predictive quantile ladder `h⁻¹(z_j | x_i)`. Each ladder row
+/// holds the node values and then their exact latent slopes, `2·m = 66`
+/// entries, the same per-row budget the 65-node value-only ladder spent. At the
+/// resulting step `0.25` the exact-slope cubic Hermite carries
+/// `O(Δz⁴·y⁽⁴⁾/384) ≈ 1e-5` relative error for a lognormal response.
+pub const TRANSFORMATION_NORMAL_BAND_Z_NODES: usize = 33;
 
 /// Half-width of the latent-z ladder. `Φ(4) ≈ 0.999968`, so every two-sided
 /// observation level up to ≈ 0.99993 interpolates strictly inside the ladder;
-/// beyond it the band clamps to the outermost tabulated quantile.
+/// beyond it the band continues affinely at the end node's exact slope (#2600).
 pub const TRANSFORMATION_NORMAL_BAND_Z_MAX: f64 = 4.0;
 
 /// The fixed, evenly spaced latent-z ladder shared by the CTM input builder
@@ -1034,10 +1038,20 @@ fn build_predict_input_for_model_inner(
             // genuine response-scale observation bands by interpolating this
             // matrix — instead of adding standard-normal quantiles to `E[Y|x]`
             // in latent-normal units, which is wrong by exactly the (unknown to
-            // the predictor) scale of `h⁻¹`.
+            // the predictor) scale of `h⁻¹`. Each row holds the node values
+            // `h⁻¹(z_j|x)` followed by their exact latent slopes `1/h'(h⁻¹(z_j|x)|x)`,
+            // read off the same interpolant `invert` inverts, so the predictor
+            // interpolates with derivatives instead of differencing the samples.
             let z_nodes = transformation_normal_band_z_nodes();
-            let quantile_ladder =
-                Array2::from_shape_fn((n, z_nodes.len()), |(i, j)| table.invert(i, z_nodes[j]));
+            let m = z_nodes.len();
+            let mut quantile_ladder = Array2::<f64>::zeros((n, 2 * m));
+            for i in 0..n {
+                for (j, &z) in z_nodes.iter().enumerate() {
+                    let (value, slope) = table.invert_with_slope(i, z);
+                    quantile_ladder[[i, j]] = value;
+                    quantile_ladder[[i, m + j]] = slope;
+                }
+            }
             // The predictor passes the offset through unchanged as `eta` and
             // `mean`, so storing E[Y|x] here yields a y-independent response-scale
             // prediction for both columns on a covariate-only frame.

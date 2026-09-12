@@ -3507,5 +3507,14 @@
     ],
     "reason": "#2829 public-surface rule: no product uses these restored functions, and the two carriers existed only as their return and argument types. DesignCoordKappaJet was design_coord_kappa_derivative's return type. PrimaryChannelBlocks was the input of the two channel-block Gram builders.",
     "evidence": "At the base, git grep -w over crates, src, tests and examples finds DesignCoordKappaJet only in curvature_estimand.rs (declaration, the deleted function's signature and body) and gam-geometry's lib.rs pub use. It finds PrimaryChannelBlocks only at its declaration and in the two deleted builders' signatures. The deleted builders were the only uses of the fast_ata and fast_xt_diag_y imports in compiler.rs, and the deleted adapter was the only use of curvature_estimand.rs's Array1, ArrayView1, GeometryResult, ConstantCurvature and log_map_kappa_jet imports. The adapter's orphaned test comments and the module doc's seam section now name log_map_kappa_jet. The item list applies source_removal_guard.py's ITEM regex by hand. Compile is covered by the lead's shared tip check; nothing was built locally."
+  },
+  {
+    "base": "d49cab30441f247b01907b6350792b2f914f36ac",
+    "items": [
+      "crates/gam-predict/src/transformation_normal.rs:fn:ladder_secant",
+      "crates/gam-predict/src/transformation_normal.rs:fn:ladder_slope"
+    ],
+    "reason": "SPEC rule 2 (#2901 V16). The transformation-normal observation band estimated each ladder node's slope dy/dz by PCHIP secant differences of the tabulated quantiles, which is a finite-difference derivative of a function the model holds. The ladder now carries the exact slopes 1/h' that CtnTransformTable::invert_with_slope reads off the interpolant it inverts, so the two private secant/slope estimators are deleted.",
+    "evidence": "At the base, git grep -w over *.rs finds ladder_secant and ladder_slope only in crates/gam-predict/src/transformation_normal.rs: their declarations, their uses in each other and in ladder_quantile, and one use in the band_ladder_does_not_clamp_past_its_own_ends_2600 test. This change rewrites every one of those uses. Both are private, and each is guarded because its name occurs more than once at the base. No public item is removed. Compile is covered by the lead's shared tip check."
   }
 ]
