@@ -56,7 +56,7 @@ impl KroneckerInvariantStructure {
         let mut marginal_qs = Vec::with_capacity(d);
         for (evals, evecs) in kronecker_marginal_eigensystems(
             marginal_penalties,
-            "kronecker_reparameterization_engine",
+            "KroneckerInvariantStructure::compute",
         )? {
             marginal_eigenvalues.push(evals);
             marginal_qs.push(evecs);

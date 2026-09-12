@@ -1276,20 +1276,6 @@ pub fn fit_grid_spline_2d(
     GridSpline2dDesign::build(x1, x2, y, w, k, metric)?.fit_reml()
 }
 
-/// Build the streaming design and fit at a FIXED `log λ` (σ² supplied or profiled).
-pub fn fit_grid_spline_2d_at(
-    x1: &[f64],
-    x2: &[f64],
-    y: &[f64],
-    w: &[f64],
-    k: usize,
-    metric: [f64; 2],
-    log_lambda: f64,
-    sigma2: Option<f64>,
-) -> Result<GridSpline2dFit, String> {
-    GridSpline2dDesign::build(x1, x2, y, w, k, metric)?.fit_at(log_lambda, sigma2)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

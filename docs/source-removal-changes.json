@@ -1342,5 +1342,38 @@
     ],
     "reason": "user directive: delete all useless slop",
     "evidence": "At e3b50feaf, git grep -nw names analytic_penalty_row_hessian_fingerprint and cross_row_penalty_fingerprint only at their own definitions: each had one caller, inside add_analytic_penalty_contributions, which e3b50feaf removed. analytic_penalty_is_row_block_diagonal was called only from analytic_penalty_row_hessian_fingerprint. All three are pub(crate), so they are dead code under the workspace deny-warnings build. MSI compile, doc, guard and census verification run on the landed sha."
+  },
+  {
+    "base": "0b5288b44e866112f7fc14bfbb4b6cea5f61b07b",
+    "items": [
+      "crates/gam-terms/src/basis/closed_form_penalty.rs:fn:anisotropic_duchon_penalty",
+      "crates/gam-terms/src/basis/closed_form_penalty.rs:fn:kappa_first_derivative",
+      "crates/gam-terms/src/basis/closed_form_penalty.rs:fn:kappa_second_derivative",
+      "crates/gam-terms/src/basis/closed_form_penalty.rs:fn:psi_first_derivative",
+      "crates/gam-terms/src/basis/closed_form_penalty.rs:fn:psi_kappa_mixed_derivative",
+      "crates/gam-terms/src/basis/closed_form_penalty.rs:fn:psi_second_derivative",
+      "crates/gam-terms/src/basis/duchon_psi_derivatives.rs:fn:build_duchon_basis_log_kappa_derivative",
+      "crates/gam-terms/src/basis/duchon_psi_derivatives.rs:fn:build_duchon_basis_log_kappa_derivatives",
+      "crates/gam-terms/src/basis/duchon_psi_derivatives.rs:fn:build_duchon_basis_log_kappasecond_derivative",
+      "crates/gam-terms/src/basis/duchon_psi_derivatives.rs:fn:duchon_design_build_count",
+      "crates/gam-terms/src/basis/duchon_thinplate.rs:fn:build_thin_plate_basis_log_kappa_derivative",
+      "crates/gam-terms/src/basis/duchon_thinplate.rs:fn:build_thin_plate_basis_log_kappasecond_derivative",
+      "crates/gam-terms/src/basis/duchon_thinplate.rs:fn:create_thin_plate_spline_basis",
+      "crates/gam-terms/src/basis/duchon_thinplate.rs:fn:create_thin_plate_spline_basis_in_chart",
+      "crates/gam-terms/src/basis/duchon_thinplate.rs:fn:create_thin_plate_spline_basis_with_knot_count",
+      "crates/gam-terms/src/basis/sphere_basis.rs:fn:build_matern_basis_log_kappa_derivative",
+      "crates/gam-terms/src/basis/sphere_basis.rs:fn:build_matern_basis_log_kappasecond_derivative",
+      "crates/gam-terms/src/basis/sphere_gpu.rs:fn:build_center_kernel_device",
+      "crates/gam-terms/src/basis/sphere_gpu.rs:fn:build_householder_constrained_design_device",
+      "crates/gam-terms/src/basis/sphere_gpu.rs:fn:constrained_penalty_host",
+      "crates/gam-terms/src/basis/workspace_cache.rs:fn:spherical_wahba_kernel_matrix",
+      "crates/gam-terms/src/basis/workspace_cache.rs:fn:spherical_wahba_kernel_matrix_cpu",
+      "crates/gam-terms/src/construction.rs:fn:kronecker_reparameterization_engine",
+      "crates/gam-terms/src/dictionary.rs:fn:rank_one_centered_pca_ceiling",
+      "crates/gam-terms/src/grid_spline_2d.rs:fn:fit_grid_spline_2d_at",
+      "crates/gam-terms/src/latent.rs:fn:project_matrix_columns_to_tangent"
+    ],
+    "reason": "user directive: delete all useless slop",
+    "evidence": "git grep -nw at the base finds each name only at its own definition, in doc or comment prose, and in string labels; the error labels in kronecker.rs and dictionary.rs now name the functions that raise them. Pre-push lane job 422535 applied this patch over d33caf143 and ran cargo check --workspace --exclude gam-pyffi --all-targets (rc 0, Finished) and RUSTDOCFLAGS=\"-D warnings\" cargo doc -p gam-terms --no-deps (0 errors). docs/public-api-2829-disposition.tsv lists most of these as restored-in-place under #2829; the user directive supersedes that."
   }
 ]

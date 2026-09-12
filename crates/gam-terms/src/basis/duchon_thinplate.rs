@@ -2548,63 +2548,12 @@ pub(crate) fn thin_plate_kernel_psi_triplet_from_distance(
     Ok((value, psi, psi_psi))
 }
 
-/// Creates a thin-plate regression spline basis from data and knot locations.
-///
-/// # Arguments
-/// * `data` - `n x d` matrix of evaluation points
-/// * `knots` - `k x d` matrix of knot locations
-///
-/// # Returns
-/// `ThinPlateSplineBasis` containing:
-/// - `basis`: `n x (k_c + M)` matrix (`[K_c | P]`) where `M` is the TPS
-///   polynomial null-space dimension for the selected ambient dimension
-/// - `penalty_bending`: constrained TPS curvature penalty
-/// - `penalty_ridge`: center-metric penalty for null-function shrinkage
-pub fn create_thin_plate_spline_basis(
-    data: ArrayView2<f64>,
-    knots: ArrayView2<f64>,
-) -> Result<ThinPlateSplineBasis, BasisError> {
-    let mut workspace = BasisWorkspace::default();
-    create_thin_plate_spline_basiswithworkspace(data, knots, &mut workspace)
-}
-
 pub fn create_thin_plate_spline_basiswithworkspace(
     data: ArrayView2<f64>,
     knots: ArrayView2<f64>,
     workspace: &mut BasisWorkspace,
 ) -> Result<ThinPlateSplineBasis, BasisError> {
     create_thin_plate_spline_basis_scaledwithworkspace(data, knots, 1.0, None, workspace)
-}
-
-/// Evaluates a thin-plate basis at `data` in a radial chart supplied by the
-/// caller, rather than one chosen from `data` itself.
-///
-/// [`create_thin_plate_spline_basis`] selects its radial chart `V` from the rows
-/// it is handed: since #1347 the reparameterization is taken in the *realized
-/// data metric* `G_c = (K Z)ᵀ (K Z)`, so two different row sets over the same
-/// knots yield two different `V`, and the design columns `Φ Z V` are two
-/// different coordinate systems for the same model space. A coefficient vector
-/// fitted against one therefore does not describe the same function against the
-/// other — silently, since both designs have the same shape.
-///
-/// Scoring a fit on rows it was not fitted to must consequently replay the
-/// training chart: pass the [`ThinPlateSplineBasis::radial_reparam`] of the
-/// basis the coefficients were fitted against. The knots must be the same ones,
-/// as usual; the chart is checked against the side-constrained radial dimension
-/// and a mismatch is a typed error rather than a wrong answer.
-pub fn create_thin_plate_spline_basis_in_chart(
-    data: ArrayView2<f64>,
-    knots: ArrayView2<f64>,
-    radial_reparam: &Array2<f64>,
-) -> Result<ThinPlateSplineBasis, BasisError> {
-    let mut workspace = BasisWorkspace::default();
-    create_thin_plate_spline_basis_scaledwithworkspace(
-        data,
-        knots,
-        1.0,
-        Some(radial_reparam),
-        &mut workspace,
-    )
 }
 
 pub(crate) fn create_thin_plate_spline_basis_scaledwithworkspace(
@@ -3219,14 +3168,6 @@ pub(crate) fn build_thin_plate_scalar_design_psi_derivatives(
     )
 }
 
-pub fn build_thin_plate_basis_log_kappa_derivative(
-    data: ArrayView2<'_, f64>,
-    spec: &ThinPlateBasisSpec,
-) -> Result<BasisPsiDerivativeResult, BasisError> {
-    let mut workspace = BasisWorkspace::default();
-    build_thin_plate_basis_log_kappa_derivativewithworkspace(data, spec, &mut workspace)
-}
-
 pub fn build_thin_plate_basis_log_kappa_derivativewithworkspace(
     data: ArrayView2<'_, f64>,
     spec: &ThinPlateBasisSpec,
@@ -3318,14 +3259,6 @@ pub fn build_thin_plate_basis_log_kappa_derivativeswithworkspace(
     })
 }
 
-pub fn build_thin_plate_basis_log_kappasecond_derivative(
-    data: ArrayView2<'_, f64>,
-    spec: &ThinPlateBasisSpec,
-) -> Result<BasisPsiSecondDerivativeResult, BasisError> {
-    let mut workspace = BasisWorkspace::default();
-    build_thin_plate_basis_log_kappasecond_derivativewithworkspace(data, spec, &mut workspace)
-}
-
 pub fn build_thin_plate_basis_log_kappasecond_derivativewithworkspace(
     data: ArrayView2<'_, f64>,
     spec: &ThinPlateBasisSpec,
@@ -3335,15 +3268,6 @@ pub fn build_thin_plate_basis_log_kappasecond_derivativewithworkspace(
         build_thin_plate_basis_log_kappa_derivativeswithworkspace(data, spec, workspace)?;
     bundle.second.implicit_operator = bundle.implicit_operator;
     Ok(bundle.second)
-}
-
-/// High-level TPS constructor: selects knots from data, then builds basis+penalty.
-pub fn create_thin_plate_spline_basis_with_knot_count(
-    data: ArrayView2<f64>,
-    num_knots: usize,
-) -> Result<(ThinPlateSplineBasis, Array2<f64>), BasisError> {
-    let mut workspace = BasisWorkspace::default();
-    create_thin_plate_spline_basis_with_knot_count_andworkspace(data, num_knots, &mut workspace)
 }
 
 pub fn create_thin_plate_spline_basis_with_knot_count_andworkspace(

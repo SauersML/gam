@@ -612,7 +612,7 @@ fn validate_inputs(
 /// [`fit_rank_one_centered_lane`], which subtracts the column mean, takes the
 /// leading eigenvector of the CENTERED second-moment matrix, and adds the mean
 /// back, so the reported EV is a genuine centered-PCA ceiling even on uncentered
-/// input. See that function and [`rank_one_centered_pca_ceiling`] for details.
+/// input. See that function for details.
 fn fit_rank_one_pca_lane(
     x: ArrayView2<'_, f64>,
     config: &LinearDictionaryConfig,
@@ -711,11 +711,11 @@ fn centered_rank_one_components(
     code_ridge: f64,
 ) -> Result<CenteredRankOne, String> {
     if x.nrows() == 0 || x.ncols() == 0 {
-        return Err("rank_one_centered_pca_ceiling requires a non-empty 2-D matrix".to_string());
+        return Err("centered_rank_one_components requires a non-empty 2-D matrix".to_string());
     }
     if !(code_ridge.is_finite() && code_ridge > 0.0) {
         return Err(format!(
-            "rank_one_centered_pca_ceiling code_ridge must be finite and positive; got {code_ridge}"
+            "centered_rank_one_components code_ridge must be finite and positive; got {code_ridge}"
         ));
     }
     let means = x.mean_axis(Axis(0)).expect("non-empty input has means");
@@ -723,7 +723,7 @@ fn centered_rank_one_components(
     let covariance = centered.t().dot(&centered);
     let (evals, evecs) = covariance
         .eigh(Side::Lower)
-        .map_err(|err| format!("rank_one_centered_pca_ceiling eigensolve failed: {err}"))?;
+        .map_err(|err| format!("centered_rank_one_components eigensolve failed: {err}"))?;
     let last = evals.len() - 1;
     let mut atom = evecs.column(last).to_owned();
     orient_vector(&mut atom);
@@ -744,24 +744,6 @@ fn centered_rank_one_components(
         fitted,
         explained_variance: ev,
     })
-}
-
-/// Centered rank-1 PCA ceiling for the K=1 lane, exposed for callers that want the
-/// ceiling reconstruction/EV directly. Subtracts the column means, takes the
-/// leading eigenvector of the CENTERED second-moment matrix, fits the rank-1 code
-/// on the centered data with the same ridge shrink the uncentered lane uses, then
-/// adds the mean back so the reconstruction lives in the original space. Returns
-/// `(fitted, explained_variance)`; the EV is measured against the same centered
-/// denominator as the rest of the crate, so it is directly comparable to (and an
-/// upper bound on) the uncentered lane's EV. Prefer setting
-/// `LinearDictionaryConfig::center_rank_one = true` to route the K=1 lane through
-/// this computation as part of a full [`LinearDictionaryFit`].
-pub fn rank_one_centered_pca_ceiling(
-    x: ArrayView2<'_, f64>,
-    code_ridge: f64,
-) -> Result<(Array2<f64>, f64), String> {
-    let components = centered_rank_one_components(x, code_ridge)?;
-    Ok((components.fitted, components.explained_variance))
 }
 
 fn initialize_atoms(x: ArrayView2<'_, f64>, n_atoms: usize) -> Array2<f64> {

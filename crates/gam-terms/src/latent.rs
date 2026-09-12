@@ -738,17 +738,6 @@ impl LatentManifold {
         out
     }
 
-    /// Project every column of an ambient matrix into `T_t M`.
-    pub fn project_matrix_columns_to_tangent(
-        &self,
-        t: ArrayView1<'_, f64>,
-        matrix: ArrayView2<'_, f64>,
-    ) -> Array2<f64> {
-        let mut out = Array2::<f64>::zeros(matrix.dim());
-        self.project_matrix_columns_to_tangent_into(t, matrix, out.view_mut());
-        out
-    }
-
     /// In-place column-wise tangent projection: writes the projection of every
     /// column of `matrix` into the matching column of `out`. Both `matrix` and
     /// `out` must have shape `(ambient_dim × ncols)`. Callers that project the

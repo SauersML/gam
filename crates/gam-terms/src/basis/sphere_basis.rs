@@ -3427,14 +3427,6 @@ pub(crate) fn active_matern_double_penalty_derivatives(
         .collect()
 }
 
-pub fn build_matern_basis_log_kappa_derivative(
-    data: ArrayView2<'_, f64>,
-    spec: &MaternBasisSpec,
-) -> Result<BasisPsiDerivativeResult, BasisError> {
-    let mut workspace = BasisWorkspace::default();
-    build_matern_basis_log_kappa_derivativewithworkspace(data, spec, &mut workspace)
-}
-
 pub fn build_matern_basis_log_kappa_derivativewithworkspace(
     data: ArrayView2<'_, f64>,
     spec: &MaternBasisSpec,
@@ -3562,14 +3554,6 @@ pub fn build_matern_basis_log_kappa_derivativeswithworkspace(
         },
         implicit_operator: design_derivatives.implicit_operator,
     })
-}
-
-pub fn build_matern_basis_log_kappasecond_derivative(
-    data: ArrayView2<'_, f64>,
-    spec: &MaternBasisSpec,
-) -> Result<BasisPsiSecondDerivativeResult, BasisError> {
-    let mut workspace = BasisWorkspace::default();
-    build_matern_basis_log_kappasecond_derivativewithworkspace(data, spec, &mut workspace)
 }
 
 pub fn build_matern_basis_log_kappasecond_derivativewithworkspace(

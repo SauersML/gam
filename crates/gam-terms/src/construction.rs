@@ -3038,8 +3038,7 @@ impl KroneckerReparamResult {
 /// Compute `log|S|₊` and its first/second derivatives w.r.t. `ρ_k = log(λ_k)`
 /// from factored marginal eigenvalues.
 ///
-/// Shared implementation for `KroneckerPenaltySystem::logdet_and_derivatives`
-/// and `kronecker_reparameterization_engine`.  Iterates over the ∏q_j
+/// Iterates over the ∏q_j
 /// multi-index grid in O(d · ∏q_j) time with no O(p²) storage.
 fn kronecker_structural_zero_band(marginal_eigenvalues: &[ArrayView1<'_, f64>]) -> f64 {
     // A λ-free eigenvalue sum inside the marginal eigensolvers' rounding bands
@@ -3216,44 +3215,11 @@ pub fn kronecker_logdet_and_derivatives(
 // here is replaced by an import so the cache and this engine share one type.
 use crate::kronecker::KroneckerInvariantStructure;
 
-/// Kronecker-factored reparameterization for tensor-product penalties.
-///
-/// Instead of eigendecomposing the full p×p balanced penalty (O(p³)), this
-/// eigendecomposes each marginal penalty separately (O(Σ q_k³)) and computes
-/// the joint eigensystem as the Kronecker product of marginal eigensystems.
-pub fn kronecker_reparameterization_engine(
-    marginal_designs: &[Array2<f64>],
-    marginal_penalties: &[Array2<f64>],
-    marginal_dims: &[usize],
-    lambdas: &[f64],
-    has_double_penalty: bool,
-) -> Result<KroneckerReparamResult, EstimationError> {
-    let d = marginal_dims.len();
-    if marginal_designs.len() != d || marginal_penalties.len() != d {
-        return Err(EstimationError::LayoutError(format!(
-            "kronecker_reparameterization_engine: dimension mismatch: designs={}, penalties={}, dims={}",
-            marginal_designs.len(),
-            marginal_penalties.len(),
-            d
-        )));
-    }
-
-    let invariant =
-        KroneckerInvariantStructure::compute(marginal_designs, marginal_penalties, marginal_dims)?;
-    kronecker_reparameterization_engine_with_invariant(
-        &invariant,
-        marginal_dims,
-        lambdas,
-        has_double_penalty,
-    )
-}
-
 /// Kronecker-factored reparameterization reusing a precomputed λ-invariant
 /// structure (eigensystems, reparameterized marginals, shrinkage scale).
 ///
-/// Bit-identical to `kronecker_reparameterization_engine` for the same marginal
-/// data — the only difference is that the `eigh()` / `B_k U_k` work was hoisted
-/// out of the per-iterate path into the cached `invariant`. Only the λ-dependent
+/// The `eigh()` / `B_k U_k` work is hoisted out of the per-iterate path into the
+/// cached `invariant`. Only the λ-dependent
 /// `kronecker_logdet_and_derivatives` sweep runs here.
 pub fn kronecker_reparameterization_engine_with_invariant(
     invariant: &KroneckerInvariantStructure,

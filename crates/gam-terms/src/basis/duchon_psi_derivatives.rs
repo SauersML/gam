@@ -10,11 +10,6 @@ use super::*;
 pub(crate) static DUCHON_DESIGN_BUILD_COUNT: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
-/// Current value of the Duchon design-build counter (test-support).
-pub fn duchon_design_build_count() -> usize {
-    DUCHON_DESIGN_BUILD_COUNT.load(std::sync::atomic::Ordering::Relaxed)
-}
-
 pub(crate) fn duchon_coeff_exponents(p_order: usize, s_order: usize, m_or_n: usize) -> f64 {
     // In the partial fractions
     //   1 / (z^p (z + kappa^2)^s)
@@ -1472,14 +1467,6 @@ pub(crate) fn build_duchon_design_psi_derivativeswithworkspace(
     )
 }
 
-pub fn build_duchon_basis_log_kappa_derivative(
-    data: ArrayView2<'_, f64>,
-    spec: &DuchonBasisSpec,
-) -> Result<BasisPsiDerivativeResult, BasisError> {
-    let mut workspace = BasisWorkspace::default();
-    build_duchon_basis_log_kappa_derivativewithworkspace(data, spec, &mut workspace)
-}
-
 pub fn build_duchon_basis_log_kappa_derivativewithworkspace(
     data: ArrayView2<'_, f64>,
     spec: &DuchonBasisSpec,
@@ -1488,14 +1475,6 @@ pub fn build_duchon_basis_log_kappa_derivativewithworkspace(
     let mut bundle = build_duchon_basis_log_kappa_derivativeswithworkspace(data, spec, workspace)?;
     bundle.first.implicit_operator = bundle.implicit_operator;
     Ok(bundle.first)
-}
-
-pub fn build_duchon_basis_log_kappa_derivatives(
-    data: ArrayView2<'_, f64>,
-    spec: &DuchonBasisSpec,
-) -> Result<BasisPsiDerivativeBundle, BasisError> {
-    let mut workspace = BasisWorkspace::default();
-    build_duchon_basis_log_kappa_derivativeswithworkspace(data, spec, &mut workspace)
 }
 
 pub(crate) fn duchon_operator_penalties_requested(spec: &DuchonOperatorPenaltySpec) -> bool {
@@ -1772,14 +1751,6 @@ pub fn build_duchon_basis_log_kappa_derivativeswith_collocationwithworkspace(
         },
         implicit_operator: design_derivatives.implicit_operator,
     })
-}
-
-pub fn build_duchon_basis_log_kappasecond_derivative(
-    data: ArrayView2<'_, f64>,
-    spec: &DuchonBasisSpec,
-) -> Result<BasisPsiSecondDerivativeResult, BasisError> {
-    let mut workspace = BasisWorkspace::default();
-    build_duchon_basis_log_kappasecond_derivativewithworkspace(data, spec, &mut workspace)
 }
 
 pub fn build_duchon_basis_log_kappasecond_derivativewithworkspace(
