@@ -1060,17 +1060,27 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
                 // would otherwise hand back `None` from the spec-less
                 // default and silently drop off the joint-Newton path.
                 let h_joint_opt = family.exact_newton_joint_hessian_with_specs(&states, specs)?;
+                // The caller routed this family to the exact joint path, which
+                // returns its result directly: there is no blockwise loop behind
+                // it to fall back to, so a family that supplies no joint Hessian
+                // here is a routing contract violation, not a non-converged solve.
                 let Some(h_joint) = h_joint_opt else {
-                    break; // Fall back to blockwise if joint Hessian unavailable
+                    return Err(CustomFamilyError::UnsupportedConfiguration {
+                        reason: format!(
+                            "exact joint Newton at cycle {cycle}: the family was routed to the \
+                             coupled joint path but supplied no joint Hessian (neither a \
+                             workspace curvature source nor exact_newton_joint_hessian_with_specs)"
+                        ),
+                    });
                 };
-                match symmetrized_square_matrix(
+                // A wrongly-shaped or non-finite joint Hessian is refused with
+                // the typed error the helper already builds, not dropped by a
+                // bare `break` that left the solve labelled `cycle budget`.
+                JointHessianSource::Dense(symmetrized_square_matrix(
                     h_joint,
                     total_p,
                     "joint Newton inner exact-newton Hessian shape mismatch",
-                ) {
-                    Ok(matrix) => JointHessianSource::Dense(matrix),
-                    Err(_) => break,
-                }
+                )?)
             }
         };
         let hessian_source_elapsed = workspace_build_started.elapsed();
@@ -1091,9 +1101,18 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
             );
         }
 
-        // Concatenate block gradients and betas.
+        // Concatenate block gradients and betas. The joint gradient is loaded
+        // before every cycle; its absence or a wrong length is a broken
+        // contract with the family, so it is refused as one rather than left
+        // to end the solve as an unlabelled non-convergence.
         let Some(grad_joint) = cached_joint_gradient.clone() else {
-            break;
+            return Err(CustomFamilyError::UnsupportedConfiguration {
+                reason: format!(
+                    "exact joint Newton at cycle {cycle}: no joint gradient was loaded for this \
+                     iterate; the family supplies neither a workspace gradient, an exact joint \
+                     gradient evaluation, nor exact-Newton working sets"
+                ),
+            });
         };
         // Row measure observed by the gradient at β. `cached_joint_gradient`
         // was loaded earlier under `options`; if the auto-subsample
@@ -1103,7 +1122,13 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
         let tr_row_measure_gradient =
             gam_solve::row_measure::RowSubsampleMask::from_options(options, total_joint_n);
         if grad_joint.len() != total_p {
-            break;
+            return Err(CustomFamilyError::DimensionMismatch {
+                reason: format!(
+                    "exact joint Newton at cycle {cycle}: joint gradient has length {} but the \
+                     joint coefficient vector has {total_p} entries",
+                    grad_joint.len()
+                ),
+            });
         }
         let mut beta_joint = Array1::<f64>::zeros(total_p);
         for b in 0..specs.len() {
@@ -1154,6 +1179,14 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
                 cycle,
                 inner_max_cycles,
             );
+            if let Some(gam_problem::InnerConvergenceTerminalState::JointNewton {
+                termination_reason,
+                ..
+            }) = terminal_convergence_state.as_mut()
+            {
+                *termination_reason =
+                    gam_problem::JointNewtonTerminalReason::NonFiniteCurvature { cycle };
+            }
             converged = false;
             break;
         }
@@ -1446,14 +1479,11 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
             joint_step_spectral_nullity,
             joint_reduced_face_kind,
         ) = if solve_joint_constraints_dense && let Some(constraints) = joint_constraints.as_ref() {
-            let mut lhs = match materialize_joint_hessian_source(
+            let mut lhs = materialize_joint_hessian_source(
                 &joint_hessian_source,
                 total_p,
                 "joint Newton inner constrained Hessian materialization",
-            ) {
-                Ok(matrix) => matrix,
-                Err(_) => break,
-            };
+            )?;
             let exact_lhs = if true_jeffreys_hessian_required {
                 assemble_true_joint_objective_hessian(
                     lhs.clone(),
@@ -1498,10 +1528,7 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
             })?;
             let warm_joint_active =
                 flatten_joint_active_set(&cached_active_sets, &block_constraints);
-            let lower_bounds = match extract_simple_lower_bounds(constraints, total_p) {
-                Ok(bounds) => bounds,
-                Err(_) => break,
-            };
+            let lower_bounds = extract_simple_lower_bounds(constraints, total_p)?;
             // Newton IRLS step in absolute-β space:
             //
             //   β_new = H_pen⁻¹ (H_L β + ∇ℓ)
@@ -1881,12 +1908,17 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
                     }
                     JointHessianSource::Operator { apply_into, .. } => {
                         let apply_h_into = Arc::clone(apply_into);
-                        gam_linalg::utils::solve_spd_pcg_with_info_into(
+                        // A failed matvec used to be logged and replaced by a zero
+                        // vector, so CG solved a different system and handed back
+                        // a step for it. The first failure is kept and refuses the
+                        // trial point once the solve returns.
+                        let matvec_failure = std::cell::RefCell::new(None::<String>);
+                        let solved = gam_linalg::utils::solve_spd_pcg_with_info_into(
                             |v, out| {
                                 if let Err(error) = apply_h_into(v, out) {
-                                    log::warn!(
-                                        "joint Newton inner operator matvec failed: {error}"
-                                    );
+                                    matvec_failure
+                                        .borrow_mut()
+                                        .get_or_insert_with(|| error.to_string());
                                     out.fill(0.0);
                                 }
                                 let mut pen = penalty_workspace.borrow_mut();
@@ -1914,7 +1946,15 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
                                 &info,
                             );
                             solution
-                        })
+                        });
+                        if let Some(error) = matvec_failure.into_inner() {
+                            return Err(CustomFamilyError::trial_point(format!(
+                                "exact joint Newton at cycle {cycle}: the joint Hessian operator \
+                                 failed a matvec during the CG solve ({error}), so no Newton step \
+                                 exists for this iterate"
+                            )));
+                        }
+                        solved
                     }
                 }
             } else {
@@ -1932,16 +1972,16 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
             }
             if delta.is_none() {
                 if pcg_requested {
-                    break;
+                    return Err(CustomFamilyError::trial_point(format!(
+                        "exact joint Newton at cycle {cycle}: the preconditioned CG solve of the \
+                         penalized Newton system returned no solution at this iterate"
+                    )));
                 }
-                let likelihood_hessian = match materialize_joint_hessian_source(
+                let likelihood_hessian = materialize_joint_hessian_source(
                     &joint_hessian_source,
                     total_p,
                     "joint Newton inner dense fallback Hessian materialization",
-                ) {
-                    Ok(matrix) => matrix,
-                    Err(_) => break,
-                };
+                )?;
                 // Capture the unpenalized dense `H` for the rest of this
                 // cycle (gam#1040): the Cauchy leg and trust-region
                 // predicted-reduction matvecs below can then reuse it as a
@@ -2193,11 +2233,20 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
                 joint_spectrum = Some(spectrum);
             }
 
+            // There is no blockwise loop behind this path (the caller returns
+            // the joint result directly), so a Newton system that yields no
+            // step, or a non-finite one, refuses this trial point by name.
             let Some(delta) = delta else {
-                break; // Fall back to blockwise
+                return Err(CustomFamilyError::trial_point(format!(
+                    "exact joint Newton at cycle {cycle}: the penalized Newton system produced no \
+                     step at this iterate"
+                )));
             };
             if !delta.iter().all(|v| v.is_finite()) {
-                break; // Fall back to blockwise
+                return Err(CustomFamilyError::trial_point(format!(
+                    "exact joint Newton at cycle {cycle}: the penalized Newton step is non-finite \
+                     at this iterate"
+                )));
             }
             (
                 beta_joint.clone() + &delta,
@@ -4716,7 +4765,12 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
         // objective the step descends. No-op when the Jeffreys term is
         // unavailable or condition-gated to zero.
         let Some(gradient) = cached_joint_gradient.as_ref() else {
-            break;
+            return Err(CustomFamilyError::UnsupportedConfiguration {
+                reason: format!(
+                    "exact joint Newton at cycle {cycle}: no joint gradient was reloaded after \
+                     the accepted step, so the post-step stationarity residual cannot be formed"
+                ),
+            });
         };
         let jeffreys_augmented_gradient: Option<Array1<f64>> = if jeffreys_skippable_this_cycle {
             // Well-conditioned ⇒ ∇Φ = 0, so the KKT residual is the bare
@@ -5113,6 +5167,17 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
                 lastobjective,
                 -current_log_likelihood,
             );
+            if let Some(gam_problem::InnerConvergenceTerminalState::JointNewton {
+                termination_reason,
+                ..
+            }) = terminal_convergence_state.as_mut()
+            {
+                *termination_reason = gam_problem::JointNewtonTerminalReason::NonFiniteInnerState {
+                    residual,
+                    objective: lastobjective,
+                    log_likelihood: current_log_likelihood,
+                };
+            }
             converged = false;
             break;
         }
@@ -5873,17 +5938,24 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
                         constrained_fixed_point_nullity,
                     );
                 // The error string prints the terminal reason, so the declining
-                // condition travels there as well as in the report.
-                if let Some(&condition) = declining_conditions.first()
-                    && let Some(gam_problem::InnerConvergenceTerminalState::JointNewton {
-                        termination_reason,
-                        ..
-                    }) = terminal_convergence_state.as_mut()
+                // condition travels there as well as in the report. When no
+                // constrained fixed-point condition declined, the refusal
+                // report's own classification is the reason (gam#2695).
+                if let Some(gam_problem::InnerConvergenceTerminalState::JointNewton {
+                    termination_reason,
+                    ..
+                }) = terminal_convergence_state.as_mut()
                 {
-                    *termination_reason =
-                        gam_problem::JointNewtonTerminalReason::ConstrainedFixedPointDeclined {
-                            condition,
-                        };
+                    *termination_reason = match declining_conditions.first() {
+                        Some(&condition) => {
+                            gam_problem::JointNewtonTerminalReason::ConstrainedFixedPointDeclined {
+                                condition,
+                            }
+                        }
+                        None => gam_problem::JointNewtonTerminalReason::KktCertificateRefused {
+                            diagnosis: report.diagnosis,
+                        },
+                    };
                 }
                 let report = KktRefusalReport {
                     constrained_fixed_point_verdict:
@@ -6206,8 +6278,9 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
             // still falling and the block residual growing: a descending ray,
             // which the outer restores rather than discards. The ray was
             // computed only at the slow-rate exit below, so those seeds were
-            // refused "as evaluated" and the next seed started cold.
-            if let Some(ray) = descending_ray_restoration(
+            // refused "as evaluated" and the next seed started cold. Without a
+            // ray the exit is a stall with clipped steps, and says so.
+            let ray = descending_ray_restoration(
                 &old_beta,
                 &states,
                 &grad_joint,
@@ -6216,18 +6289,28 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
                 specs,
                 joint_bundle,
                 total_p,
-            ) && let Some(gam_problem::InnerConvergenceTerminalState::JointNewton {
+            );
+            if let Some(gam_problem::InnerConvergenceTerminalState::JointNewton {
                 termination_reason,
                 ..
             }) = terminal_convergence_state.as_mut()
             {
-                *termination_reason =
-                    gam_problem::JointNewtonTerminalReason::StalledOnDescendingRay {
+                *termination_reason = match ray {
+                    Some(ray) => gam_problem::JointNewtonTerminalReason::StalledOnDescendingRay {
                         residual,
                         residual_tol,
                         cycles: cycles_done,
                         ray,
-                    };
+                    },
+                    None => gam_problem::JointNewtonTerminalReason::ResidualStall {
+                        residual,
+                        residual_tol,
+                        best_residual: best_residual_seen,
+                        cycles_without_improvement: cycles_since_residual_improved,
+                        accepted_step_inf,
+                        trust_radius: joint_trust_radius,
+                    },
+                };
             }
             converged = false;
             break;
@@ -6326,8 +6409,9 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
             cycles_done = cycle + 1;
             // The same reading as the divergence exit above (gam#2695): a flat
             // residual whose accepted steps still descend an unclosed ray is
-            // an under-penalized seed, not a failed one.
-            if let Some(ray) = descending_ray_restoration(
+            // an under-penalized seed, not a failed one. Without a ray it is a
+            // flat-residual stall, and says so.
+            let ray = descending_ray_restoration(
                 &old_beta,
                 &states,
                 &grad_joint,
@@ -6336,18 +6420,26 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
                 specs,
                 joint_bundle,
                 total_p,
-            ) && let Some(gam_problem::InnerConvergenceTerminalState::JointNewton {
+            );
+            if let Some(gam_problem::InnerConvergenceTerminalState::JointNewton {
                 termination_reason,
                 ..
             }) = terminal_convergence_state.as_mut()
             {
-                *termination_reason =
-                    gam_problem::JointNewtonTerminalReason::StalledOnDescendingRay {
+                *termination_reason = match ray {
+                    Some(ray) => gam_problem::JointNewtonTerminalReason::StalledOnDescendingRay {
                         residual,
                         residual_tol,
                         cycles: cycles_done,
                         ray,
-                    };
+                    },
+                    None => gam_problem::JointNewtonTerminalReason::FlatResidualStall {
+                        residual,
+                        residual_tol,
+                        best_residual: best_residual_seen,
+                        cycles_without_improvement: cycles_since_residual_improved,
+                    },
+                };
             }
             converged = false;
             break;
