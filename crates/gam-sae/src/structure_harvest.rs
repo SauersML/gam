@@ -4391,9 +4391,11 @@ fn atlas_prior_for_coords(
     intrinsic_dim: usize,
 ) -> Option<AtlasTopologyReadout> {
     let (n, p) = target.dim();
-    // The atlas needs enough rows to seed several overlapping charts and close a
-    // transition cocycle; below that it cannot corroborate anything and abstains.
-    if n < 6 || p == 0 || intrinsic_dim == 0 {
+    // A birth with no chart rank asks the atlas no question. Every other small or
+    // degenerate image is refused by `LocalAtlas::build` itself, with its typed reason
+    // (too few rows for one patch, no neighborhood spanning `d` directions, certified
+    // coverage below half the rows), so no row-count floor is set here.
+    if intrinsic_dim == 0 {
         return None;
     }
     let intrinsic_dim = intrinsic_dim.min(p);
@@ -7947,7 +7949,7 @@ mod tests_atlas_prior_2280 {
         let tiny = Array2::<f64>::from_shape_fn((4, 3), |(r, c)| (r * 3 + c) as f64);
         assert!(
             atlas_prior_for_coords(tiny.view(), 2).is_none(),
-            "a 4-row residual is below the atlas seeding floor and must abstain"
+            "a 4-row residual cannot build a certified atlas and must abstain"
         );
     }
 
