@@ -3765,10 +3765,14 @@ fn auto_streaming_engages_for_large_synthetic_basis() {
 /// the first partial agreed to rel 6.2e-7 (MSI job 430394).
 ///
 /// Radial orders 4 and 5 are computed but not asserted, because no difference
-/// resolves them. At κR = 0.3, order 5 the Richardson levels of the value
-/// disagree with each other by rel 0.28 (κ = 0.607), and those of the first
-/// partial by rel 0.38 (κ = 1.0). Over the 72 scored points, all five
-/// violations of the bars below were at orders 4 and 5 (job 430394).
+/// resolves them. There the values run from 7e-15 down to 2e-26. At κR = 0.3,
+/// order 5 the Richardson levels of the value disagree with each other by rel
+/// 0.28 (κ = 0.607), and those of the first partial by rel 0.38 (κ = 1.0). Over
+/// the 72 scored points, all five violations of the bars below were at orders 4
+/// and 5 (job 430394). Production reads κ-partials up to order `2q + 1 = 5`
+/// (`pair_block_radial_with_j_second_derivatives_with_powers`). This pin does
+/// not cover orders 4 and 5; they are left to the end-to-end gradient acceptance
+/// of #2895.
 ///
 /// A hand-derived budget missed at the first point it met. It assumed a power-law
 /// κ-dependence, and at κ = 0.607, κR = 0.3 the third radial derivative agreed to
