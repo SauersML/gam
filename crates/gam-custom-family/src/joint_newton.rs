@@ -3224,6 +3224,10 @@ pub(crate) struct KktRefusalReport {
     pub(crate) projected_residual_inf: f64,
 
     pub(crate) diagnosis: KktRefusalDiagnosis,
+    /// The acceptance conditions of the constrained fixed-point certificate that
+    /// failed, each with its value and bound. `None` when that certificate was not
+    /// evaluated at this refusal.
+    pub(crate) constrained_fixed_point_verdict: Option<String>,
 }
 
 // `KktRefusalDiagnosis` was relocated DOWN to `gam_problem::diagnostics`
@@ -4979,6 +4983,7 @@ pub(crate) fn compute_kkt_refusal_report(
         objective_change,
         projected_residual_inf,
         diagnosis,
+        constrained_fixed_point_verdict: None,
     }
 }
 
@@ -5076,6 +5081,12 @@ impl KktRefusalReport {
         )
     }
 
+    fn constrained_fixed_point_label(&self) -> &str {
+        self.constrained_fixed_point_verdict
+            .as_deref()
+            .unwrap_or("not evaluated")
+    }
+
     /// Multi-line structured log emitted at the cert REFUSED site. The
     /// per-block residual / eigenspectrum / diagnosis breakdown is what
     /// makes the failure actionable (vs the legacy one-liner that only
@@ -5088,7 +5099,8 @@ impl KktRefusalReport {
              H_pen spectrum: {}\n  \
              free-null diagnostic: {}\n  \
              cert math: linearized_rel={:.3e}, scalar_relerr={:.3e}, |Δobj|={:.3e} (tol={:.3e}), accepted_step_inf={:.3e} (tol={:.3e}), proposal_step_inf={:.3e}, trust_radius={:.3e}, |β|∞={:.3e}, active_set_rows_total={}\n  \
-             diagnosis: {}",
+             diagnosis: {}\n  \
+             constrained fixed-point certificate: {}",
             self.cycle,
             self.projected_residual_inf,
             four_tol,
@@ -5111,6 +5123,7 @@ impl KktRefusalReport {
             self.beta_inf(),
             self.active_set_rows_total,
             self.diagnosis.as_str(),
+            self.constrained_fixed_point_label(),
         )
     }
 
@@ -5127,7 +5140,8 @@ impl KktRefusalReport {
              free-null diagnostic: {}; \
              cert math: linearized_rel={:.3e}, scalar_relerr={:.3e}, |Δobj|={:.3e}, \
              accepted_step_inf={:.3e}, proposal_step_inf={:.3e}, trust_radius={:.3e}, \
-             |β|∞={:.3e}, active_set_rows_total={}; diagnosis: {}; {}",
+             |β|∞={:.3e}, active_set_rows_total={}; diagnosis: {}; \
+             constrained fixed-point certificate: {}; {}",
             self.cycle,
             self.projected_residual_inf,
             4.0 * self.residual_tol,
@@ -5148,6 +5162,7 @@ impl KktRefusalReport {
             self.beta_inf(),
             self.active_set_rows_total,
             self.diagnosis.as_str(),
+            self.constrained_fixed_point_label(),
             self.diagnosis.guidance(),
         )
     }
@@ -5210,6 +5225,7 @@ mod kkt_refusal_spectrum_format_tests {
             objective_change: 0.0,
             projected_residual_inf: 1.0,
             diagnosis: KktRefusalDiagnosis::RankDeficientHPen,
+            constrained_fixed_point_verdict: None,
         };
         let expected = "λ_max=5.000e0, λ_min=-9.000e0, cond=9.000e12, nullity@1e-10=1 \
              (of 3 eigenvalues)";
@@ -5699,10 +5715,80 @@ pub(crate) fn constrained_numerical_fixed_point_reached(
     accepted_step_inf: f64,
     step_tol: f64,
 ) -> bool {
-    objective_change <= objective_floor
-        && scalar_model_relerr <= 1e-3
-        && accepted_step_inf.is_finite()
-        && accepted_step_inf <= step_tol
+    constrained_numerical_fixed_point_failures(
+        objective_change,
+        objective_floor,
+        scalar_model_relerr,
+        accepted_step_inf,
+        step_tol,
+    )
+    .is_empty()
+}
+
+/// Largest relative error of the scalar Newton model at which the constrained
+/// fixed-point certificate still treats that model as exact.
+pub(crate) const CONSTRAINED_FIXED_POINT_MODEL_RELERR_BOUND: f64 = 1e-3;
+
+/// The conditions of [`constrained_numerical_fixed_point_reached`] that fail,
+/// each with its value and bound. Empty exactly when the fixed point is reached,
+/// so the predicate and the refusal message cannot disagree about which
+/// condition decided.
+pub(crate) fn constrained_numerical_fixed_point_failures(
+    objective_change: f64,
+    objective_floor: f64,
+    scalar_model_relerr: f64,
+    accepted_step_inf: f64,
+    step_tol: f64,
+) -> Vec<String> {
+    let mut failures = Vec::new();
+    let objective_at_floor = objective_change <= objective_floor;
+    if !objective_at_floor {
+        failures.push(format!(
+            "|Δobjective|={objective_change:.3e} is not ≤ objective_floor={objective_floor:.3e}"
+        ));
+    }
+    let model_exact = scalar_model_relerr <= CONSTRAINED_FIXED_POINT_MODEL_RELERR_BOUND;
+    if !model_exact {
+        failures.push(format!(
+            "scalar_relerr={scalar_model_relerr:.3e} is not ≤ \
+             {CONSTRAINED_FIXED_POINT_MODEL_RELERR_BOUND:.0e}"
+        ));
+    }
+    let step_within_tol = accepted_step_inf.is_finite() && accepted_step_inf <= step_tol;
+    if !step_within_tol {
+        failures.push(format!(
+            "accepted_step_inf={accepted_step_inf:.3e} is not ≤ step_tol={step_tol:.3e}"
+        ));
+    }
+    failures
+}
+
+/// What a refusal report says about the constrained fixed-point certificate.
+/// `None` for an unconstrained fit, where that certificate does not apply;
+/// otherwise the condition that declined it, with its value and bound. `nullity`
+/// is `None` when the nullity was never computed and `Some(None)` when it could
+/// not be.
+pub(crate) fn constrained_fixed_point_verdict(
+    any_block_constrained: bool,
+    fixed_point_failures: &[String],
+    nullity: Option<Option<usize>>,
+) -> Option<String> {
+    if !any_block_constrained {
+        return None;
+    }
+    if !fixed_point_failures.is_empty() {
+        return Some(format!("declined: {}", fixed_point_failures.join("; ")));
+    }
+    Some(match nullity {
+        Some(Some(0)) => "all conditions held".to_string(),
+        Some(Some(count)) => format!(
+            "declined: H_pen nullity={count} at the eigensolver resolution λ_max·√p·ε is not 0"
+        ),
+        Some(None) => "declined: H_pen nullity unavailable (materialization or \
+                       eigendecomposition failed)"
+            .to_string(),
+        None => "declined: H_pen nullity was not computed".to_string(),
+    })
 }
 
 /// True iff the recent KKT-residual tail (`history`, oldest→newest) shows STEADY
@@ -5911,5 +5997,30 @@ mod constrained_numerical_fixed_point_tests {
             f64::INFINITY,
             4.3e-11,
         ));
+    }
+
+    // The refused 3-D CTN probe (MSI job 410061): every numerical condition held
+    // (objective_floor = 64·eps·(1+171.09)), so the verdict must name the one
+    // that declined, the nullity, and a declined numerical condition must carry
+    // its value and bound.
+    #[test]
+    fn refusal_verdict_names_the_condition_that_declined_979() {
+        use super::{constrained_fixed_point_verdict, constrained_numerical_fixed_point_failures};
+        let ctn_failures =
+            constrained_numerical_fixed_point_failures(8.811e-13, 2.4455e-12, 8.810e-13, 8.242e-13, 7.633e-9);
+        assert!(ctn_failures.is_empty(), "{ctn_failures:?}");
+        let nullity_verdict =
+            constrained_fixed_point_verdict(true, &ctn_failures, Some(Some(2))).expect("constrained");
+        assert!(nullity_verdict.contains("H_pen nullity=2"), "{nullity_verdict}");
+
+        let step_failures =
+            constrained_numerical_fixed_point_failures(1e-13, 1.10e-12, 1e-12, 1e-6, 4.3e-11);
+        let step_verdict = constrained_fixed_point_verdict(true, &step_failures, None).expect("constrained");
+        assert!(
+            step_verdict.contains("accepted_step_inf=1.000e-6")
+                && step_verdict.contains("step_tol=4.300e-11"),
+            "{step_verdict}"
+        );
+        assert_eq!(constrained_fixed_point_verdict(false, &[], None), None);
     }
 }

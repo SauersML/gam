@@ -5610,14 +5610,18 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
                 // certificate); and `linearized_rel ≥ 0.5` (candidacy) proves the
                 // residual is constraint-normal multiplier mass, not resolvable
                 // descent — so nothing genuinely non-converged is certified.
-                let constrained_numerical_fixed_point =
-                    crate::joint_newton::constrained_numerical_fixed_point_reached(
+                let fixed_point_failures =
+                    crate::joint_newton::constrained_numerical_fixed_point_failures(
                         objective_change,
                         objective_floor,
                         scalar_model_relerr,
                         accepted_step_inf,
                         step_tol,
                     );
+                let constrained_numerical_fixed_point = fixed_point_failures.is_empty();
+                // Kept for the refusal report below, so a declined certificate
+                // names the condition that failed.
+                let mut constrained_fixed_point_nullity: Option<Option<usize>> = None;
                 if any_block_constrained && constrained_numerical_fixed_point {
                     // Materialize H_pen = H + S(λ) (+ model ridge) and count its
                     // numerical null space at the shared rank tolerance: nullity == 0
@@ -5648,6 +5652,7 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
                         symmetric_penalized_hessian_nullity(&h_pen)
                     })
                     .unwrap_or(None);
+                    constrained_fixed_point_nullity = Some(hpen_nullity);
                     if hpen_nullity == Some(0) {
                         log::info!(
                             "[PIRLS/joint-Newton convergence] cycle {:>3} | constrained fixed-point certificate ({}): \
@@ -5861,6 +5866,15 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
                     residual,
                     Some(&math),
                 );
+                let report = KktRefusalReport {
+                    constrained_fixed_point_verdict:
+                        crate::joint_newton::constrained_fixed_point_verdict(
+                            any_block_constrained,
+                            &fixed_point_failures,
+                            constrained_fixed_point_nullity,
+                        ),
+                    ..report
+                };
                 log::warn!(
                     "{}",
                     report.format_structured_log(cert_residual_factor * residual_tol)
