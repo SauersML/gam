@@ -1,7 +1,7 @@
 //! #2644: the outer smoothing-parameter optimizer refusing to certify a
 //! stationary optimum at an interior PSD minimum.
 //!
-//! ONE GATE and two reporting probes.
+//! Four gates: one certification gate and three fits that must succeed.
 //!
 //! ## The gate — `te_with_disparate_scales_certifies`
 //!
@@ -31,7 +31,10 @@
 //! because the quality suite runs on a 6-hour schedule and this is a
 //! sub-second fit.
 //!
-//! ## Reporting probes (print, never fail)
+//! ## Fits that must succeed
+//!
+//! These were print-only probes that passed whether the fit certified or refused.
+//! Each now fails with the refusal text.
 //!
 //! * `prostate` — `y ~ s(pc1,k=5) + s(pc2,k=5)`, binomial/logit, 490 rows of
 //!   `bench/datasets/prostate.csv`. Three reference-quality rows report the
@@ -42,9 +45,10 @@
 //!   fixed `rho`, against an outer cost floor of `1.8e-5`). Recovering that one
 //!   needs a root of `H` that is not formed by summing `XᵀWX` and `S_λ` in f64,
 //!   which is a change to what P-IRLS publishes; it is not attempted here.
-//! * `matern` — the fit the issue thread recommends as a reproducer. Recorded
-//!   because it does NOT reproduce any more (it certifies at `|Pg|=2.025e-5`
-//!   against `bound=9.876e-5`).
+//! * `matern` — the fit the issue thread recommends as a reproducer. It
+//!   certified at `|Pg|=2.025e-5` against `bound=9.876e-5` when measured as a
+//!   probe.
+//! * `matern low n` — `y ~ matern(x, nu=5/2)` on 15 rows of `t²` plus noise.
 //!
 use gam::data::EncodedDataset;
 use gam::{FitConfig, encode_recordswith_inferred_schema, fit_from_formula, load_csvwith_inferred_schema};
@@ -71,7 +75,7 @@ fn subset_rows(ds: &EncodedDataset, rows: &[usize]) -> EncodedDataset {
 }
 
 #[test]
-fn zz_probe_2644_prostate_binomial_logit() {
+fn prostate_binomial_logit_fit_certifies_2644() {
     gam_solve::progress_log::init_logging_at(log::LevelFilter::Info);
     let ds = load_csvwith_inferred_schema(Path::new(PROSTATE_CSV)).expect("load prostate.csv");
     let n = ds.values.nrows();
@@ -89,9 +93,8 @@ fn zz_probe_2644_prostate_binomial_logit() {
         train_rows.len(),
         started.elapsed().as_secs_f64()
     );
-    match outcome {
-        Ok(_) => println!("[probe-2644-prostate] FIT OK"),
-        Err(e) => println!("[probe-2644-prostate] FIT ERR: {e}"),
+    if let Err(e) = outcome {
+        panic!("[2644-prostate] y ~ s(pc1, k=5) + s(pc2, k=5) binomial/logit must fit; got: {e}");
     }
 }
 
@@ -141,7 +144,7 @@ fn build_dataset(n: usize, sigma: f64, seed: u64) -> EncodedDataset {
 }
 
 #[test]
-fn zz_probe_2644_matern_outer_gradient() {
+fn matern_three_axis_k16_fit_certifies_2644() {
     gam_solve::progress_log::init_logging_at(log::LevelFilter::Info);
     let ds = build_dataset(N_TRAIN, SIGMA, TRAIN_SEED);
     let cfg = FitConfig {
@@ -151,9 +154,8 @@ fn zz_probe_2644_matern_outer_gradient() {
     let started = std::time::Instant::now();
     let outcome = fit_from_formula("y ~ matern(x0, x1, x2, k=16)", &ds, &cfg);
     println!("[probe-2644] elapsed={:.2}s", started.elapsed().as_secs_f64());
-    match outcome {
-        Ok(_) => println!("[probe-2644] FIT OK"),
-        Err(e) => println!("[probe-2644] FIT ERR: {e}"),
+    if let Err(e) = outcome {
+        panic!("[2644-matern] y ~ matern(x0, x1, x2, k=16) must fit; got: {e}");
     }
 }
 
@@ -296,7 +298,7 @@ fn mk_1d(n: usize, f: impl Fn(f64) -> f64, sigma: f64, seed: u64) -> EncodedData
 }
 
 #[test]
-fn zz_probe_2644_matern_low_n_route_agreement() {
+fn matern_low_n_fit_certifies_2644() {
     gam_solve::progress_log::init_logging_at(log::LevelFilter::Info);
     let ds = mk_1d(15, |t| t.powi(2), 0.05, 7);
     let cfg = FitConfig {
@@ -309,9 +311,8 @@ fn zz_probe_2644_matern_low_n_route_agreement() {
         "[probe-2644-lown] elapsed={:.2}s",
         started.elapsed().as_secs_f64()
     );
-    match outcome {
-        Ok(_) => println!("[probe-2644-lown] FIT OK"),
-        Err(e) => println!("[probe-2644-lown] FIT ERR: {e}"),
+    if let Err(e) = outcome {
+        panic!("[2644-lown] y ~ matern(x, nu=5/2) on 15 rows must fit; got: {e}");
     }
 }
 
