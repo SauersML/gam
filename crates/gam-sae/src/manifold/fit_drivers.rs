@@ -3099,6 +3099,24 @@ impl SaeManifoldTerm {
             }
             outcome.max_directional_derivative = max_directional;
             let slope = direction.dot(&direction).sqrt();
+            // #2228 — the residual this block is handed, split the same way as the
+            // `[SAE/inner]` trace. After an accepted Newton step this is the only
+            // assembly before the post-step hooks, so it separates what the step
+            // did to ‖g‖ from what the re-gauge hooks do.
+            log::debug!(
+                "SAE gauge-orbit descent: round {} entry ‖g_row‖={:.6e} ‖g_β‖={:.6e} \
+                 ‖Π_V g‖={slope:.6e} (span dim {})",
+                outcome.rounds + 1,
+                gradient
+                    .slice(s![..dense_len])
+                    .dot(&gradient.slice(s![..dense_len]))
+                    .sqrt(),
+                gradient
+                    .slice(s![dense_len..])
+                    .dot(&gradient.slice(s![dense_len..]))
+                    .sqrt(),
+                outcome.dimension,
+            );
             if !(slope.is_finite() && slope > 0.0) {
                 return Ok(outcome);
             }
@@ -7359,9 +7377,17 @@ impl SaeManifoldTerm {
                     grad_norm_sq += row.gt[axis] * row.gt[axis];
                 }
             }
+            // #2228 — the row (coordinate + logit) and decoder-border shares of ‖g‖
+            // for the per-iteration trace. A residual the step does not contract
+            // lives in one block, and the joint norm cannot say which. The joint
+            // accumulator keeps its historical summation order.
+            let row_grad_norm = grad_norm_sq.sqrt();
+            let mut beta_grad_norm_sq = 0.0;
             for idx in 0..sys.k {
                 grad_norm_sq += sys.gb[idx] * sys.gb[idx];
+                beta_grad_norm_sq += sys.gb[idx] * sys.gb[idx];
             }
+            let beta_grad_norm = beta_grad_norm_sq.sqrt();
             let grad_norm = grad_norm_sq.sqrt();
             let iterate_scale = self.inner_iterate_scale();
             let grad_tolerance = SAE_MANIFOLD_INNER_GRAD_REL_TOL * iterate_scale;
@@ -7671,7 +7697,8 @@ impl SaeManifoldTerm {
             // whole per-iterate state of the globalization.
             log::info!(
                 "[SAE/inner] it={outer_iteration} ‖g‖={grad_norm:.6e} \
-                 ‖Π⊥g‖={quotient_grad_norm:.6e} ‖Δ‖={:.6e} gᵀΔ={directional_decrease:.6e} \
+                 ‖Π⊥g‖={quotient_grad_norm:.6e} ‖g_row‖={row_grad_norm:.6e} \
+                 ‖g_β‖={beta_grad_norm:.6e} ‖Δ‖={:.6e} gᵀΔ={directional_decrease:.6e} \
                  alpha={} warm={:.4e} ridge_t={:.3e} ridge_b={:.3e} \
                  obj={pre_step_total:.9e} phases: assemble={assemble_seconds:.2}s \
                  solve={:.2}s trials={:.2}s previous_tail={previous_tail_seconds:.2}s",
@@ -8114,8 +8141,10 @@ impl SaeManifoldTerm {
             // `fixed_point=true` after U moved invisibly (#2253).
             tail_marks.push(("verdict", iteration_started.elapsed().as_secs_f64()));
             let hook_marks = std::cell::RefCell::new(Vec::<(&'static str, f64)>::new());
-            if self.run_objective_guarded_hook(target, rho, analytic_penalties, 0.0, |term| {
-                term.retract_unit_speed_charts_in_loop()?;
+            let unit_speed_atoms = std::cell::Cell::new(0usize);
+            let regauge_kept =
+                self.run_objective_guarded_hook(target, rho, analytic_penalties, 0.0, |term| {
+                unit_speed_atoms.set(term.retract_unit_speed_charts_in_loop()?);
                 hook_marks
                     .borrow_mut()
                     .push(("hook_retract", iteration_started.elapsed().as_secs_f64()));
@@ -8133,10 +8162,19 @@ impl SaeManifoldTerm {
                         .push(("hook_frames", iteration_started.elapsed().as_secs_f64()));
                 }
                 Ok(())
-            })? {
+            })?;
+            if regauge_kept {
                 state_moved = true;
                 moved_at.get_or_insert(StateMoveSite::FrameRefresh);
             }
+            // #2228 — whether the re-gauge triple moved the state it leaves for the
+            // next iterate, and how many unit-speed charts it retracted before the
+            // objective guard ruled.
+            log::debug!(
+                "[SAE/inner] it={outer_iteration} re-gauge hook kept={regauge_kept} \
+                 unit_speed_atoms={}",
+                unit_speed_atoms.get(),
+            );
             tail_marks.extend(hook_marks.into_inner());
             // Unconditional warranty-bank update (see the bank's declaration):
             // strictly-better penalized objective ⇒ this accepted boundary is
