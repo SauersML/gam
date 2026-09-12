@@ -121,16 +121,6 @@ pub const PREDICTIVE_MASS_DEFECT_TOLERANCE: f64 = 5.0e-2;
 /// near-unpenalized direction moves it by `O(1)`.
 const BASE_MODE_POLISH_TOLERANCE: f64 = 1.0e-3;
 
-/// Maximum Newton iterations for one augmented mode. The objective is strictly
-/// convex and the start point is the un-augmented mode, one observation away, so
-/// this bound is never approached on a well-posed fit; it exists so a
-/// pathological row fails loudly instead of spinning.
-const AUGMENTED_MODE_MAX_ITERATIONS: usize = 100;
-
-/// Backtracking line-search contraction factor and its iteration bound.
-const LINE_SEARCH_CONTRACTION: f64 = 0.5;
-const LINE_SEARCH_MAX_STEPS: usize = 60;
-
 /// The training data and penalty a saved multinomial model needs in order to
 /// evaluate its own log-posterior away from the mode.
 ///
@@ -471,6 +461,12 @@ impl<'a> MultinomialPredictiveModel<'a> {
     /// Returns the mode, the objective value there, and the log-determinant of
     /// the precision at that point — the three quantities a Laplace ratio needs
     /// from one side of it.
+    ///
+    /// Both exits are derived rather than budgeted: the Newton decrement falls
+    /// inside the objective's rounding band, or no representable step along the
+    /// Newton direction gains more than that band. Every step that continues
+    /// gains more than the band and the log-posterior is bounded above, so the
+    /// iteration ends on its own.
     fn augmented_mode(
         &self,
         start: &[f64],
@@ -480,8 +476,7 @@ impl<'a> MultinomialPredictiveModel<'a> {
         let d = self.coefficient_dim();
         let mut theta = start.to_vec();
         let mut value = self.log_posterior(&theta, extra, tilt);
-        let mut logdet;
-        for _iteration in 0..AUGMENTED_MODE_MAX_ITERATIONS {
+        loop {
             let (gradient, precision) = self.gradient_and_precision(&theta, extra, tilt);
             let factor = precision.cholesky(faer::Side::Lower).map_err(|error| {
                 EstimationError::InvalidInput(format!(
@@ -490,7 +485,7 @@ impl<'a> MultinomialPredictiveModel<'a> {
                      this prediction row"
                 ))
             })?;
-            logdet = factor.diag().iter().map(|v| v.abs().ln()).sum::<f64>() * 2.0;
+            let logdet = factor.diag().iter().map(|v| v.abs().ln()).sum::<f64>() * 2.0;
             let step = factor.solvevec(&(-&gradient));
             if step.iter().any(|v| !v.is_finite()) {
                 crate::bail_invalid_estim!(
@@ -512,46 +507,54 @@ impl<'a> MultinomialPredictiveModel<'a> {
             // products; a predicted gain inside that accumulation's rounding band
             // `γ·|L|` is one the objective cannot represent.
             let terms = self.training_class_index.len() + extra.len() + d * d + d;
-            let objective_band = gam_linalg::roundoff::accumulation_growth(terms) * value.abs();
+            let growth = gam_linalg::roundoff::accumulation_growth(terms);
+            let objective_band = growth * value.abs();
             if decrement <= objective_band {
                 return Ok((theta, value, logdet));
             }
-            let mut accepted = false;
+            // Halve along the Newton direction until a trial gains more than the two
+            // evaluations' rounding bands, or until the trial no longer moves `θ` in
+            // floating point, which exhausts every representable step length.
             let mut length = 1.0_f64;
-            for _attempt in 0..LINE_SEARCH_MAX_STEPS {
+            let accepted = loop {
                 let mut trial = vec![0.0_f64; d];
                 for i in 0..d {
                     trial[i] = theta[i] + length * step[i];
                 }
+                if trial
+                    .iter()
+                    .zip(theta.iter())
+                    .all(|(new, old)| new.to_bits() == old.to_bits())
+                {
+                    break false;
+                }
                 let trial_value = self.log_posterior(&trial, extra, tilt);
-                // A step is accepted only when the objective actually rises.
-                // A trial that leaves the value bit-identical is not progress,
-                // and accepting it (`>=`) let a solve whose remaining gain sat
-                // under the objective's own round-off — a strong penalty makes
-                // `L` large and its resolution `ε|L|` larger than the
-                // decrement target — burn every iteration on steps that changed
-                // nothing and then report non-convergence.
-                if trial_value.is_finite() && trial_value > value {
+                // A step is accepted only when the objective rises by more than it
+                // can represent. A trial that leaves the value bit-identical, or
+                // moves it inside the rounding bands, is not progress, and accepting
+                // it (`>=`) let a solve whose remaining gain sat under the
+                // objective's own round-off — a strong penalty makes `L` large and
+                // its resolution larger than the decrement target — burn every
+                // iteration on steps that changed nothing and then report
+                // non-convergence.
+                if trial_value.is_finite()
+                    && trial_value - value > objective_band + growth * trial_value.abs()
+                {
                     theta = trial;
                     value = trial_value;
-                    accepted = true;
-                    break;
+                    break true;
                 }
-                length *= LINE_SEARCH_CONTRACTION;
-            }
+                length *= 0.5;
+            };
             if !accepted {
-                // A convex objective whose Newton direction admits no ascent at
-                // any step length is at its optimum to floating-point
-                // resolution; the decrement test above has not fired only
-                // because the remaining gain is below what the objective can
-                // represent, which is the same statement.
+                // A convex objective whose Newton direction admits no gain beyond
+                // the rounding bands at any representable step length is at its
+                // optimum to floating-point resolution; the decrement test above has
+                // not fired only because the remaining gain is below what the
+                // objective can represent, which is the same statement.
                 return Ok((theta, value, logdet));
             }
         }
-        Err(EstimationError::InvalidInput(format!(
-            "multinomial predictive: augmented mode did not converge in \
-             {AUGMENTED_MODE_MAX_ITERATIONS} Newton iterations"
-        )))
     }
 
     /// Posterior-predictive moments at each row of `x_new`.
