@@ -577,25 +577,6 @@ fn model_reduction(
     Ok(-lin - 0.5 * quad)
 }
 
-#[derive(Debug, Clone, PartialEq)]
-pub struct RiemannianLBFGS {
-    pub history: usize,
-    pub step_size: f64,
-    pub max_iter: usize,
-    pub grad_tol: f64,
-}
-
-impl Default for RiemannianLBFGS {
-    fn default() -> Self {
-        Self {
-            history: 10,
-            step_size: 1.0,
-            max_iter: 100,
-            grad_tol: 1.0e-8,
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

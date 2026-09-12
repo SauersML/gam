@@ -27,7 +27,7 @@ crates/gam-geometry/src/manifolds/constant_curvature.rs	log_map_kappa_jet	restor
 crates/gam-geometry/src/manifolds/constant_curvature.rs	t_stacks	retired-by-later-deletion:f83e9aebaf
 crates/gam-geometry/src/manifolds/poincare.rs	conformal_dirichlet_penalty	retired-by-later-deletion:f83e9aebaf
 crates/gam-geometry/src/manifolds/spd.rs	spd_frechet_mean	restored-in-place
-crates/gam-geometry/src/optimizer.rs	minimize	absent-pending-reference-repair
+crates/gam-geometry/src/optimizer.rs	minimize	retired-no-surviving-dependent
 crates/gam-geometry/src/response_geometry.rs	response_projection_residual	retired-no-surviving-dependent
 crates/gam-gpu/src/blas.rs	blas_backend_status	retired-by-later-deletion:5d498d0e9d
 crates/gam-gpu/src/device_runtime.rs	resolution_call_count	retired-by-later-deletion:5d498d0e9d

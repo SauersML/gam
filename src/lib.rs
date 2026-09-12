@@ -214,9 +214,8 @@ pub use gam_data as data;
 pub use gam_data::{encode_recordswith_inferred_schema, load_csvwith_inferred_schema};
 pub use geometry::{
     CircleManifold, EuclideanManifold, GeometryError, GeometryResult,
-    GrassmannManifold, ManifoldSpec, ProductManifold, RiemannianLBFGS, RiemannianManifold,
-    RiemannianObjective, RiemannianTrustRegion, SpdManifold, SphereManifold, StiefelManifold,
-    TorusManifold,
+    GrassmannManifold, ManifoldSpec, ProductManifold, RiemannianManifold, RiemannianObjective,
+    RiemannianTrustRegion, SpdManifold, SphereManifold, StiefelManifold, TorusManifold,
 };
 pub use gpu::GpuPolicy;
 pub use inference::{
