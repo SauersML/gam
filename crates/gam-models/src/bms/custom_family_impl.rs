@@ -1675,18 +1675,22 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
         }
         // Flex-active fits use the dense exact-cache path; only the rigid
         // marginal-slope kernel has the BLAS-3 design-row-Gram batched override.
-        // Fall back to the generic per-axis assembly (bit-for-bit identical to
-        // the trait default) when flex is active.
+        // The per-axis route the trait default takes reaches
+        // `exact_newton_joint_hessian_directional_derivative`, which builds a
+        // fresh exact cache on every call, so a `p`-axis sweep rebuilt the cache
+        // and every row's cached `e_q`/`e_g` third tensors `p` times (gam#2892).
+        // Build the cache once at this β and differentiate every axis from it.
         if self.effective_flex_active(block_states)? {
             let p = specs.iter().map(|spec| spec.design.ncols()).sum::<usize>();
+            let cache = self.build_exact_eval_cache(block_states)?;
             let mut axes = Vec::with_capacity(p);
             for a in 0..p {
                 let mut axis = Array1::<f64>::zeros(p);
                 axis[a] = 1.0;
-                match self.joint_jeffreys_information_directional_derivative_with_specs(
+                match self.exact_newton_joint_hessian_directional_derivative_from_cache(
                     block_states,
-                    specs,
                     &axis,
+                    &cache,
                 )? {
                     Some(m) => axes.push(m),
                     None => return Ok(None),
