@@ -1,4 +1,3 @@
-pub mod amortized_encoder;
 pub mod assignment;
 pub mod assignment_state;
 // The #2280 null arm: the atlas readout measured on data with no manifold in it.

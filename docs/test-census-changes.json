@@ -374,5 +374,15 @@
     "unit_test_decreases": {
       "crates/gam-sae": 8
     }
+  },
+  {
+    "base": "49821c5285b7284897efa561add5ace5965b916c",
+    "reason": "user directive: delete all useless slop",
+    "evidence": "2 tests removed (crates/gam-sae -2). Each exercised only items this commit removes. Issue-pinned names removed: none. In the same commit, the floor lowers each affected key by exactly its measured decrease and drops an issue key that reaches zero. Compile evidence, MSI job 440633 on lane sw8: these same changes, applied over main 57409ec77 as lane commit d26792868, passed `cargo check --workspace --exclude gam-pyffi --all-targets --keep-going` with rc 0 and no diagnostics (deny(warnings) intact), `cargo doc -p gam-sae --no-deps` with 0 errors, and the ban scanner with rc 0. This commit applies them over a later main, whose upstream delta since then adds no use of any name removed here. It is pushed at once under the user's commit-after-every-edit directive and checked at the pushed sha afterwards. scripts/source_removal_guard.py listed exactly these 28 identities, and the census and difference functions of scripts/test_census.py and scripts/public_api_census.py measured the test and public-function deltas this commit acknowledges.",
+    "test_count_decrease": 2,
+    "removed_pins": {},
+    "unit_test_decreases": {
+      "crates/gam-sae": 2
+    }
   }
 ]

@@ -2823,5 +2823,40 @@
     ],
     "reason": "user directive: delete all useless slop",
     "evidence": "Batch B7, per the lead's ruling on the λ-sweep REML driver: no production path calls it. Production two-block fits go through behavior_entry and construction, and the crosscoder fit uses the layout accessors directly. Removed from behavior_fit.rs: run_multiblock_reml_fit, run_two_block_reml_fit, TwoBlockRemlControls, TwoBlockRemlFitReport, BlockRemlOutcome, MultiBlockRemlFitReport, augmented_block_rss, fit_state_snapshot and fit_state_restore; the file keeps set_crosscoder_layout, crosscoder_layout, layer_decoder and tier0_unscaled_full_width_decoder. Removed from behavior.rs: BehaviorBlock::augmented_target and profiled_penalized_quasi_laplace_criterion. Also removed: the examples that only drove the driver (curved_crosscoder, two_block_weekday_demo, real_circle_weekday_fit), experiments/real_circle/real_qwen_circle.py, which shelled out to real_circle_weekday_fit as its fit step (weekday_circle.py stays, being self-contained), tests_behavior_twoblock_rung2.rs, the driver tests in tests_crosscoder_multiblock.rs, and the REML-coupled test in tests_behavior_isometry_2015.rs. The two layout tests of the live accessors stay, and the live isometry test builds its target with stack_augmented_target, and manifold/mod.rs drops the now-empty `pub use behavior_fit::*`. Docs naming the removed items are reworded (behavior.rs, term.rs, outer_objective.rs, transport_law.rs, construction.rs, weekday_behavior_harvest.py). Compile evidence, MSI job 440633 on lane sw8: these same changes, applied over main 57409ec77 as lane commit 87e74c3c7, passed `cargo check --workspace --exclude gam-pyffi --all-targets --keep-going` with rc 0 and no diagnostics (deny(warnings) intact), `cargo doc -p gam-sae --no-deps` with 0 errors, and the ban scanner with rc 0. This commit applies them over a later main, whose upstream delta since then adds no use of any name removed here. It is pushed at once under the user's commit-after-every-edit directive and checked at the pushed sha afterwards. scripts/source_removal_guard.py listed exactly these 64 identities, and the census and difference functions of scripts/test_census.py and scripts/public_api_census.py measured the test and public-function deltas this commit acknowledges."
+  },
+  {
+    "base": "49821c5285b7284897efa561add5ace5965b916c",
+    "items": [
+      "crates/gam-sae/src/amortized_encoder.rs:const:EVIDENCE_MAX_ITERS",
+      "crates/gam-sae/src/amortized_encoder.rs:const:EVIDENCE_REFUSAL_TAIL",
+      "crates/gam-sae/src/amortized_encoder.rs:const:EVIDENCE_REL_TOL",
+      "crates/gam-sae/src/amortized_encoder.rs:enum:FeatureMap",
+      "crates/gam-sae/src/amortized_encoder.rs:fn:apply",
+      "crates/gam-sae/src/amortized_encoder.rs:fn:design",
+      "crates/gam-sae/src/amortized_encoder.rs:fn:error_stats_wrapped",
+      "crates/gam-sae/src/amortized_encoder.rs:fn:fit",
+      "crates/gam-sae/src/amortized_encoder.rs:fn:fit_evidence_ridge",
+      "crates/gam-sae/src/amortized_encoder.rs:fn:fit_with_axis_periods",
+      "crates/gam-sae/src/amortized_encoder.rs:fn:k_atoms",
+      "crates/gam-sae/src/amortized_encoder.rs:fn:next_f64",
+      "crates/gam-sae/src/amortized_encoder.rs:fn:non_periodic_axis_is_bit_identical_raw_passthrough",
+      "crates/gam-sae/src/amortized_encoder.rs:fn:normal",
+      "crates/gam-sae/src/amortized_encoder.rs:fn:predict",
+      "crates/gam-sae/src/amortized_encoder.rs:fn:quantiles_5",
+      "crates/gam-sae/src/amortized_encoder.rs:fn:shrinks_to_null_on_pure_noise",
+      "crates/gam-sae/src/amortized_encoder.rs:fn:stack_targets",
+      "crates/gam-sae/src/amortized_encoder.rs:struct:AmortizationErrorStats",
+      "crates/gam-sae/src/amortized_encoder.rs:struct:AmortizationGap",
+      "crates/gam-sae/src/amortized_encoder.rs:struct:AmortizedCode",
+      "crates/gam-sae/src/amortized_encoder.rs:struct:EvidenceRidge",
+      "crates/gam-sae/src/amortized_encoder.rs:struct:ExactRowSolution",
+      "crates/gam-sae/src/amortized_encoder.rs:struct:Lcg",
+      "crates/gam-sae/src/amortized_encoder.rs:struct:LearnedAmortizedEncoder",
+      "crates/gam-sae/src/amortized_encoder.rs:struct:Standardizer",
+      "crates/gam-sae/src/amortized_encoder.rs:type:AxisPeriods",
+      "crates/gam-sae/src/manifold/construction.rs:fn:amortized_encode_fitted"
+    ],
+    "reason": "user directive: delete all useless slop",
+    "evidence": "Batch B8, from gam-e0's measured inventory: crate-level src/amortized_encoder.rs goes whole. MSI git grep -F -w found no consumer for any of its pub items outside the file; its one user was manifold/amortized_routing.rs, which cbe5f218d removed. lib.rs loses `pub mod amortized_encoder;`. SaeManifoldTerm::amortized_encode_fitted, a wrapper nothing calls, is removed; amortized_encode_target stays live via amortized_encoder_consistency and warm_start_latents_from_amortized_encoder. Compile evidence, MSI job 440633 on lane sw8: these same changes, applied over main 57409ec77 as lane commit d26792868, passed `cargo check --workspace --exclude gam-pyffi --all-targets --keep-going` with rc 0 and no diagnostics (deny(warnings) intact), `cargo doc -p gam-sae --no-deps` with 0 errors, and the ban scanner with rc 0. This commit applies them over a later main, whose upstream delta since then adds no use of any name removed here. It is pushed at once under the user's commit-after-every-edit directive and checked at the pushed sha afterwards. scripts/source_removal_guard.py listed exactly these 28 identities, and the census and difference functions of scripts/test_census.py and scripts/public_api_census.py measured the test and public-function deltas this commit acknowledges."
   }
 ]

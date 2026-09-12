@@ -4791,18 +4791,6 @@ impl SaeManifoldTerm {
         Ok(amplitudes)
     }
 
-    /// #1026 — encode the dictionary's own fit-time target with the amortized
-    /// encoder, deriving the per-row amplitudes from the fitted assignment so the
-    /// caller supplies neither bounds nor amplitudes (magic by default). The
-    /// end-to-end "fit → distilled encoder → certificate-gated encode" path.
-    pub fn amortized_encode_fitted(
-        &self,
-        targets: ArrayView2<'_, f64>,
-    ) -> Result<crate::encode::JointEncodeResult, String> {
-        let amplitudes = self.fitted_assignment_amplitudes()?;
-        self.amortized_encode_target(targets, amplitudes.view())
-    }
-
     /// #1154 — amortized-encoder consistency of the CURRENT dictionary against
     /// its own fit-time target. This is the co-training signal of the joint
     /// amortized-encoder + penalized quasi-Laplace loop (Design A): the amortized (one-mat-vec)
