@@ -31,13 +31,6 @@
 //!    `n`, never on the element values. Two inputs of equal length are
 //!    associated identically.
 //!
-//! 3. **Chunking/streaming invariance.** Feeding a sequence to the streaming
-//!    entry points ([`StreamingPairwise`], `pairwise_reduce_chunked`) in any
-//!    chunking — including one element at a time, or all at once — produces a
-//!    result bit-identical to reducing the whole concatenated sequence with
-//!    [`pairwise_reduce`]. The tree shape is determined by the total element
-//!    index, not by chunk boundaries.
-//!
 //! Note that the contract is about *reproducibility and order-independence of
 //! the association tree*, not about commutativity of `combine`. The *order* of
 //! the summands still matters (floating-point addition is not associative);
@@ -149,146 +142,6 @@ where
 /// slice sums to `+0.0`.
 pub fn pairwise_sum(xs: &[f64]) -> f64 {
     pairwise_reduce(xs, |a, b| a + b, 0.0)
-}
-
-/// A running pairwise accumulator that consumes successive fixed-size chunks
-/// while preserving the exact same tree shape — and hence the exact same
-/// floating-point result — as a single whole-slice [`pairwise_reduce`] over the
-/// concatenation of all chunks.
-///
-/// # How the streaming invariance is achieved
-///
-/// The naive approach of "reduce each chunk, then combine the partials" would
-/// make the tree shape depend on chunk boundaries, breaking contract point (3).
-/// Instead, the accumulator maintains a *forest of completed subtree partials*,
-/// each tagged with the number of leaf elements it covers. Partials are merged
-/// only when two adjacent subtrees have equal leaf-counts that are
-/// power-of-two multiples of [`BASE_CHUNK`] — exactly the merges the recursive
-/// `reduce_range` tree would perform. This makes the resulting association
-/// order identical to the whole-slice tree, regardless of how the input was
-/// sliced into chunks.
-///
-/// The implementation buffers incoming elements into base blocks of
-/// [`BASE_CHUNK`]; each completed base block becomes a partial of weight
-/// `BASE_CHUNK`, and equal-weight adjacent partials cascade-merge. A final
-/// [`StreamingPairwise::finish`] folds the remaining (possibly unequal-weight)
-/// forest — including a short trailing block — in the same right-leaning order
-/// the recursive tree uses for a non-power-of-two tail.
-pub struct StreamingPairwise<T, F>
-where
-    T: Copy,
-    F: Fn(T, T) -> T,
-{
-    combine: F,
-    identity: T,
-    /// Buffer of leaf elements not yet sealed into a base block.
-    buf: Vec<T>,
-    /// Stack of completed subtree partials, each with its leaf-count weight.
-    /// Invariant: weights are strictly decreasing from bottom to top, and each
-    /// is a power-of-two multiple of `BASE_CHUNK` (except possibly after a
-    /// short final block is pushed during `finish`).
-    forest: Vec<(usize, T)>,
-}
-
-impl<T, F> StreamingPairwise<T, F>
-where
-    T: Copy,
-    F: Fn(T, T) -> T,
-{
-    /// Create an empty streaming accumulator.
-    pub fn new(combine: F, identity: T) -> Self {
-        Self {
-            combine,
-            identity,
-            buf: Vec::with_capacity(BASE_CHUNK),
-            forest: Vec::new(),
-        }
-    }
-
-    /// Push a single leaf element into the running tree.
-    pub fn push(&mut self, x: T) {
-        self.buf.push(x);
-        if self.buf.len() == BASE_CHUNK {
-            let block = reduce_block(self.buf[0], &self.buf[1..], &self.combine);
-            self.buf.clear();
-            self.absorb(BASE_CHUNK, block);
-        }
-    }
-
-    /// Push a contiguous chunk of leaf elements, in order.
-    pub fn extend_from_slice(&mut self, chunk: &[T]) {
-        for &x in chunk {
-            self.push(x);
-        }
-    }
-
-    /// Merge a completed subtree partial of the given leaf-count `weight` into
-    /// the forest, cascading equal-weight merges so the association order
-    /// matches the recursive whole-slice tree.
-    fn absorb(&mut self, weight: usize, value: T) {
-        let mut w = weight;
-        let mut v = value;
-        // While the top of the forest has the same weight, it is the left
-        // sibling of the subtree we are inserting; combine them into a parent
-        // of double weight. This reproduces the balanced power-of-two left
-        // subtrees that `left_split` builds.
-        while let Some(&(top_w, top_v)) = self.forest.last() {
-            if top_w == w {
-                self.forest.pop();
-                v = (self.combine)(top_v, v);
-                w = w.saturating_mul(2);
-            } else {
-                break;
-            }
-        }
-        self.forest.push((w, v));
-    }
-
-    /// Finish the stream, returning the bit-identical result of reducing the
-    /// whole concatenated input with [`pairwise_reduce`].
-    pub fn finish(mut self) -> T {
-        // Seal any trailing partial base block (length in 1..BASE_CHUNK).
-        if !self.buf.is_empty() {
-            let tail = reduce_block(self.buf[0], &self.buf[1..], &self.combine);
-            let tail_w = self.buf.len();
-            self.buf.clear();
-            self.forest.push((tail_w, tail));
-        }
-        // Fold the forest. The forest is laid out left-to-right as a sequence
-        // of subtrees with non-increasing weights (the trailing short block may
-        // tie or be smaller). The recursive `reduce_range` combines a balanced
-        // left subtree with the (smaller, right-leaning) remainder; folding the
-        // forest from the right reproduces exactly that association: each parent
-        // is `combine(left_partial, accumulated_right)`.
-        let mut iter = self.forest.into_iter().rev();
-        match iter.next() {
-            None => self.identity,
-            Some((_, mut acc)) => {
-                for (_, left) in iter {
-                    acc = (self.combine)(left, acc);
-                }
-                acc
-            }
-        }
-    }
-}
-
-/// Convenience: reduce an iterator of fixed-size chunks through a streaming
-/// pairwise tree, returning the bit-identical whole-slice result.
-///
-/// `chunks` may be sliced arbitrarily — the result depends only on the ordered
-/// concatenation of all elements, per the determinism contract.
-pub fn pairwise_reduce_chunked<'a, T, F, I>(chunks: I, combine: F, identity: T) -> T
-where
-    T: Copy + 'a,
-    F: Fn(T, T) -> T,
-    I: IntoIterator<Item = &'a [T]>,
-{
-    let mut acc = StreamingPairwise::new(combine, identity);
-    for chunk in chunks {
-        acc.extend_from_slice(chunk);
-    }
-    acc.finish()
 }
 
 /// Parallel, bit-reproducible pairwise map-reduce over the index range
@@ -527,19 +380,6 @@ mod tests {
     fn pairwise_sum_two_base_chunks() {
         let xs = vec![1.0f64; 2 * BASE_CHUNK];
         assert_eq!(pairwise_sum(&xs), (2 * BASE_CHUNK) as f64);
-    }
-
-    // ── chunking invariance ───────────────────────────────────────────────────
-
-    #[test]
-    fn streaming_one_at_a_time_matches_whole_slice() {
-        let xs: Vec<f64> = (0..300).map(|i| i as f64 * 0.1).collect();
-        let expected = pairwise_sum(&xs);
-        let mut acc = StreamingPairwise::new(|a: f64, b: f64| a + b, 0.0);
-        for &x in &xs {
-            acc.push(x);
-        }
-        assert_eq!(acc.finish().to_bits(), expected.to_bits());
     }
 
     // ── parallel deterministic reductions ────────────────────────────────────

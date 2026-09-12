@@ -3550,5 +3550,23 @@
     ],
     "reason": "#2469: GEOMETRY_EPS (1e-12) was an absolute threshold standing where the constant-curvature chart's arithmetic has its own answer: the Dirichlet-weight gauge, the chart gauge, the exp map's conjugate-point cosine, the zero-tangent short-circuits of exp_map and exp_map_vjp, the VJP's flat-curvature short-circuit, the Dirichlet Gram's radial projection and the distance kappa-jet's coincidence test. The gauges are now refused inside their rounding bands, the cosine inside the Dirichlet weight's conjugate-point band, and the short-circuits fire at exact zero, where the general branch is exact. The distance jet forms the kappa-derivatives of the norm of w from its unit direction, so the only coincident case is w = 0, and the VJP forms tau/n^2 as scale/n. With no remaining user the constant is deleted.",
     "evidence": "git grep -w GEOMETRY_EPS at the base over crates, src, tests, gamfit, python, examples, docs, bench and scripts finds only its declaration in crates/gam-geometry/src/manifold.rs, a test comment there, and in crates/gam-geometry/src/manifolds/constant_curvature.rs the import, eight uses and one doc comment. All are rewritten in this commit. The item list applies source_removal_guard.py's ITEM regex by hand. Not compiled or run locally (user directive); compile is covered by the lead's shared tip check."
+  },
+  {
+    "base": "f467c2edbc9a58c50a12f1b49bb1619cc2f55970",
+    "items": [
+      "crates/gam-geometry/src/manifolds/spd.rs:const:ARMIJO_C1",
+      "crates/gam-geometry/src/manifolds/spd.rs:fn:affine_sq_norm",
+      "crates/gam-geometry/src/manifolds/spd.rs:fn:spd_frechet_mean",
+      "crates/gam-linalg/src/pairwise_reduce.rs:fn:absorb",
+      "crates/gam-linalg/src/pairwise_reduce.rs:fn:extend_from_slice",
+      "crates/gam-linalg/src/pairwise_reduce.rs:fn:finish",
+      "crates/gam-linalg/src/pairwise_reduce.rs:fn:new",
+      "crates/gam-linalg/src/pairwise_reduce.rs:fn:pairwise_reduce_chunked",
+      "crates/gam-linalg/src/pairwise_reduce.rs:fn:push",
+      "crates/gam-linalg/src/pairwise_reduce.rs:fn:streaming_one_at_a_time_matches_whole_slice",
+      "crates/gam-linalg/src/pairwise_reduce.rs:struct:StreamingPairwise"
+    ],
+    "reason": "#2829 public-surface rule: no product uses spd_frechet_mean, pairwise_reduce_chunked or the StreamingPairwise accumulator. affine_sq_norm and the function-local ARMIJO_C1 existed only inside spd_frechet_mean, and absorb was StreamingPairwise's private cascade. streaming_one_at_a_time_matches_whole_slice tested only the deleted accumulator. The pairwise-tree functions that survive (pairwise_reduce, pairwise_sum, par_pairwise_*) keep their tests.",
+    "evidence": "At the base, affine_sq_norm occurs 3 times across *.rs, all inside spd.rs's deleted range (declaration and two calls in spd_frechet_mean). The ARMIJO_C1 const at spd.rs:549 is declared inside spd_frechet_mean. The word also names opt's constant, which survives. absorb in pairwise_reduce.rs is StreamingPairwise's private method; streaming_border.rs declares its own absorb, which survives. spd.rs's opt import (BacktrackConfig, armijo_roundoff_cushion, backtracking_line_search) had no use outside the deleted range, while ArrayView2 is still used at spd.rs:130. Contract point 3 in pairwise_reduce.rs's module doc described only the deleted streaming entry points. The item list applies source_removal_guard.py's ITEM regex and occurrence rule by hand. Compile is covered by the lead's shared tip check."
   }
 ]

@@ -26,7 +26,7 @@ pub use manifolds::{
     CircleManifold, ConstantCurvature, EuclideanManifold, GrassmannManifold, ProductManifold,
     SpdManifold, SphereManifold, StiefelManifold, TorusManifold,
     constant_curvature_dirichlet_penalty, constant_curvature_dirichlet_penalty_kappa_derivative,
-    distance_kappa_jet, log_map_kappa_jet, spd_frechet_mean,
+    distance_kappa_jet, log_map_kappa_jet,
 };
 pub use optimizer::{RiemannianObjective, RiemannianTrustRegion, TrustRegionTermination};
 pub use response_geometry::{

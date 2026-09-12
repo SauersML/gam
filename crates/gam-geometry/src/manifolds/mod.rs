@@ -44,7 +44,7 @@ pub use constant_curvature::{
 pub use euclidean::EuclideanManifold;
 pub use grassmann::GrassmannManifold;
 pub use product::ProductManifold;
-pub use spd::{SpdManifold, spd_frechet_mean};
+pub use spd::SpdManifold;
 pub use sphere::SphereManifold;
 pub use stiefel::StiefelManifold;
 pub use torus::TorusManifold;

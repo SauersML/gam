@@ -567,10 +567,7 @@ pub fn dispatch_exp_map(
 /// geometries additionally require the weighted support to lie inside their
 /// analytic strong-convexity radius, certifying the stationary point as the
 /// unique global Fréchet mean; diffuse data return a typed error and require an
-/// explicit base instead of selecting a capped multistart basin. The SPD-specific
-/// version in `crate::manifolds::spd::spd_frechet_mean` remains for the affine
-/// inverse it caches per step; this generic form pays a metric-tensor solve but
-/// covers all four geometries uniformly.
+/// explicit base instead of selecting a capped multistart basin.
 pub fn response_frechet_mean(
     manifold: ResponseManifold,
     values: ArrayView2<'_, f64>,
@@ -638,8 +635,7 @@ pub fn response_frechet_mean(
             // leaves the manifold's domain (e.g. a Poincaré overshoot past the
             // ball boundary) or lands where the dispersion is undefined is an
             // INVALID trial (`Ok(None)`): shrink and retry without consulting
-            // the Armijo test — unlike `spd_frechet_mean`, this generic driver
-            // never aborts the descent on a trial-evaluation error.
+            // the Armijo test. The descent never aborts on a trial-evaluation error.
             let pred = grad_norm * grad_norm;
             let f_tol = armijo_roundoff_cushion(f_cur);
             let accepted = match backtracking_line_search::<_, Infallible>(

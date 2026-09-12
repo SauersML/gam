@@ -26,7 +26,7 @@ crates/gam-geometry/src/manifolds/constant_curvature.rs	jacobian_radial	retired-
 crates/gam-geometry/src/manifolds/constant_curvature.rs	log_map_kappa_jet	restored-in-place
 crates/gam-geometry/src/manifolds/constant_curvature.rs	t_stacks	retired-by-later-deletion:f83e9aebaf
 crates/gam-geometry/src/manifolds/poincare.rs	conformal_dirichlet_penalty	retired-by-later-deletion:f83e9aebaf
-crates/gam-geometry/src/manifolds/spd.rs	spd_frechet_mean	restored-in-place
+crates/gam-geometry/src/manifolds/spd.rs	spd_frechet_mean	retired-no-product-user
 crates/gam-geometry/src/optimizer.rs	minimize	retired-no-surviving-dependent
 crates/gam-geometry/src/response_geometry.rs	response_projection_residual	retired-no-surviving-dependent
 crates/gam-gpu/src/blas.rs	blas_backend_status	retired-by-later-deletion:5d498d0e9d
@@ -129,7 +129,7 @@ crates/gam-linalg/src/numeric_derivative.rs	agreement_bound	restored-in-place
 crates/gam-linalg/src/numeric_derivative.rs	judge	retired-by-owner:jets
 crates/gam-linalg/src/numeric_derivative.rs	ladder_report	retired-by-owner:jets
 crates/gam-linalg/src/packed_symmetric_spectrum.rs	packed_upper_index	retired-no-surviving-dependent
-crates/gam-linalg/src/pairwise_reduce.rs	pairwise_reduce_chunked	restored-in-place
+crates/gam-linalg/src/pairwise_reduce.rs	pairwise_reduce_chunked	retired-no-product-user
 crates/gam-linalg/src/pairwise_reduce.rs	pairwise_sum_chunked	retired-by-later-deletion:b66b773539
 crates/gam-linalg/src/sparse_exact.rs	dense_to_sparse	retired-by-later-deletion:b66b773539
 crates/gam-linalg/src/sparse_exact.rs	factor_nnz	restored-in-place

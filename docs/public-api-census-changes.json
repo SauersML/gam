@@ -1317,5 +1317,18 @@
     },
     "reason": "#932 GLM row-derivative census. observed_weight_dispatch's only production caller, compute_observed_hessian_curvature_arrays_into, admits observed curvature only for Gamma, log-link negative binomial and the non-canonical Binomial links (supports_observed_hessian_curvature_for_likelihood). The Gaussian-log, Gaussian-inverse and Binomial-logit specializations were unreachable and are deleted with their dispatch arms.",
     "evidence": "public_api_census.py's public_functions predicate over the removed hunks of crates/gam-solve/src/pirls/curvature.rs yields observed_weight_gaussian_log and observed_weight_gaussian_inverse (pub) and observed_weight_binomial_logit_from_jet (pub(crate)). At the base, git grep finds none of the three outside that file. No other file loses a pub fn: pirls/tests.rs and firth_noncanonical_curvature_2273_tests.rs change only call arguments and add tests, and reml/gradient_hessian.rs changes only comments."
+  },
+  {
+    "base": "f467c2edbc9a58c50a12f1b49bb1619cc2f55970",
+    "removed": {
+      "crates/gam-geometry/src/manifolds/spd.rs::spd_frechet_mean": 1,
+      "crates/gam-linalg/src/pairwise_reduce.rs::extend_from_slice": 1,
+      "crates/gam-linalg/src/pairwise_reduce.rs::finish": 1,
+      "crates/gam-linalg/src/pairwise_reduce.rs::new": 1,
+      "crates/gam-linalg/src/pairwise_reduce.rs::pairwise_reduce_chunked": 1,
+      "crates/gam-linalg/src/pairwise_reduce.rs::push": 1
+    },
+    "reason": "#2829 public-surface rule (docs/rust-library-surface.md, 6e5362f23): a pub item that no product uses is deleted. spd_frechet_mean and pairwise_reduce_chunked are restored-in-place identities with no product user. StreamingPairwise::{new, push, extend_from_slice, finish} lose their only production caller with pairwise_reduce_chunked, and one test was their only other user.",
+    "evidence": "restored_consumers_2829.py at d8f6ef9be (MSI job 527977, /scratch.global/sauer354/pool/api2829/consumers.d8f6ef9be98996b5c98bd08667aa4fe121561e8f.rows.tsv) scores spd_frechet_mean and pairwise_reduce_chunked as unreferenced. At the base, git grep -w spd_frechet_mean over crates, src, tests and examples finds only its declaration, gam-geometry's two pub use lines, and two comments in response_geometry.rs. git grep -w StreamingPairwise finds pairwise_reduce.rs (declaration, impl, the call inside pairwise_reduce_chunked and the test streaming_one_at_a_time_matches_whole_slice), plus doc comments and one rustdoc link in gam-solve's streaming_border.rs. That file keeps its own entry-wise cascade and now describes it without naming the deleted type."
   }
 ]

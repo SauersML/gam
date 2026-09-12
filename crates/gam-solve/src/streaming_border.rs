@@ -12,9 +12,8 @@
 //! * Each within-chunk Gram entry is a [`pairwise_sum`] over the chunk's rows
 //!   (the already-landed deterministic pairwise tree of
 //!   [`gam_linalg::pairwise_reduce`]).
-//! * Cross-chunk reduction follows the **same fixed pairwise tree** (the
-//!   [`StreamingPairwise`](gam_linalg::pairwise_reduce::StreamingPairwise)
-//!   cascade, applied entry-wise to whole chunk Grams): sequential base blocks
+//! * Cross-chunk reduction follows the **same fixed pairwise tree**, applied
+//!   entry-wise to whole chunk Grams: sequential base blocks
 //!   of [`CROSS_CHUNK_BASE`] chunk partials, then power-of-two cascade merges.
 //!   The tree shape depends only on the chunk count — never on values, device
 //!   timing, or thread scheduling. A unit test pins the cross-chunk
@@ -80,7 +79,7 @@ pub struct BorderGramCheckpoint {
     pub block_len: usize,
     /// Completed cascade subtrees: `(weight in chunks, flattened k·k partial)`
     /// with strictly decreasing power-of-two-multiple-of-base weights, bottom
-    /// to top — exactly the `StreamingPairwise` forest invariant.
+    /// to top, the invariant of an incremental pairwise-tree forest.
     pub forest: Vec<(usize, Vec<f64>)>,
     /// Out-of-order chunk partials waiting for the frontier to reach them:
     /// `(chunk_index, flattened k·k chunk Gram)`, all indices `> frontier`.
@@ -303,7 +302,7 @@ impl StreamingBorderGram {
     }
 
     /// Fold one in-order chunk partial into the cross-chunk cascade. This is
-    /// the `StreamingPairwise` push, applied entry-wise to whole chunk Grams:
+    /// an incremental pairwise-tree push, applied entry-wise to whole chunk Grams:
     /// sequential accumulation within a [`CROSS_CHUNK_BASE`]-chunk base block
     /// (seeded from the block's first partial), then power-of-two cascade
     /// merges of completed blocks.
@@ -329,8 +328,7 @@ impl StreamingBorderGram {
     }
 
     /// Merge a completed subtree partial of the given chunk-count `weight`
-    /// into the forest, cascading equal-weight merges — the exact
-    /// `StreamingPairwise::absorb` cascade, entry-wise on matrices.
+    /// into the forest, cascading equal-weight merges entry-wise on matrices.
     fn absorb(&mut self, weight: usize, value: Vec<f64>) {
         let mut w = weight;
         let mut v = value;
@@ -471,8 +469,7 @@ impl StreamingBorderGram {
                 self.frontier
             ));
         }
-        // Seal the trailing (short) base block, exactly like
-        // `StreamingPairwise::finish`.
+        // Seal the trailing (short) base block.
         if let Some(tail) = self.block_partial.take() {
             let w = self.block_len;
             self.block_len = 0;
