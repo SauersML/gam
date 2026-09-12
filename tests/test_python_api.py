@@ -716,8 +716,13 @@ def test_predict_can_passthrough_id_column() -> None:
 
 
 def _require_extension() -> None:
-    if not gamfit.build_info().get("available"):
-        pytest.skip("rust extension not built")
+    # The module importorskips ``gamfit._rust``, so reaching this point means
+    # the extension imported. build_info() calling it unavailable is a
+    # defect, not a missing build.
+    info = gamfit.build_info()
+    assert info.get("available"), (
+        f"gamfit._rust imported but build_info() reports it unavailable: {info}"
+    )
 
 
 def _pc_duchon(centers: int = 6) -> str:
