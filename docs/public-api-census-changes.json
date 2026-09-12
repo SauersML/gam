@@ -119,5 +119,14 @@
     },
     "reason": "User directive 2026-09-11: delete code only tests use and code nothing uses. BlockwiseFitOptions::independent_prior_factor_labels had no producer left once realize_coefficient_groups_for_custom_family was deleted in 48f48f910: the default and every test literal set it empty, so the prior-factor mask route (compute_block_penalty_logdet_derivs_with_prior_factors and its per-factor geometry groups) only ever ran with all-false masks.",
     "evidence": "Re-confirmed at the tip with git grep -nw over crates src tests examples bench benches: independent_prior_factor_labels was assigned only Vec::new() (the options default and four gam-custom-family test literals) and read only by the assembly.rs mask branch; compute_block_penalty_logdet_derivs_with_prior_factors was called only with that mask and with None. With all-false masks every block had one coalesced group over all its penalties in order, which compute_block_penalty_logdet_derivs now evaluates directly, so the logdet value and derivatives are unchanged. Gates pass base..head; MSI verification at the pushed sha follows."
+  },
+  {
+    "base": "5a69c5f0af44efebc8feacb1a091d1bfe992178d",
+    "removed": {
+      "crates/gam-spec/src/lib.rs::beta_logit": 1,
+      "crates/gam-spec/src/lib.rs::tweedie_log": 1
+    },
+    "reason": "User directive 2026-09-11: delete code only tests use and code nothing uses. gam-spec LikelihoodSpec::tweedie_log and LikelihoodSpec::beta_logit had no caller; the regression tests that name tweedie_log and beta_logit bind local variables built with LikelihoodSpec::new.",
+    "evidence": "Re-confirmed at the tip with git grep -nw over crates src tests examples bench benches plus a qualified-path search (LikelihoodSpec::, Self::, method-call form), which found no use. The other hits are local variable names in tests/regressions and one doc example list, which now names gamma_log. Gates pass base..head; MSI verification at the pushed sha follows."
   }
 ]

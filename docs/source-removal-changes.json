@@ -1877,5 +1877,14 @@
     ],
     "reason": "user directive: delete all useless slop (only used by tests / unused)",
     "evidence": "At a93786983, git grep -nw over crates, src, tests, examples, bench and benches found no caller of NullBatteryConfig, standing, run_null_battery, first_two_ordered_circle_stat, first_two_energy_fraction or top_two_energy_fraction: each is named only by its own definition, error strings or doc prose. The rest were reachable only through them: random_rotation_null, token_shuffle_null, matched_spectrum_gaussian_null and architecture_matched_random_weight_null (called only by run_null_battery; no pyffi, example or test caller), kind_seed (only run_null_battery), scaled_square_ratio (only first_two_energy_fraction) and stable_column_sd (only matched_spectrum_gaussian_null and architecture_matched_random_weight_null). NullKind and its variants, NullBatteryReport (sparse_audit), NullSummary, summarize_null_distribution, per_dimension_shuffle_null, covariance_exact_hadamard_null, covariance_matched_gaussian_null (pyffi) and random_orthogonal (inject_circle_spike, inject_torus_spike) stay. No test called any item. MSI verification (ban scanner, workspace --all-targets check, cargo doc -p gam-sae, guard and census) runs on the landed sha."
+  },
+  {
+    "base": "5a69c5f0af44efebc8feacb1a091d1bfe992178d",
+    "items": [
+      "crates/gam-spec/src/lib.rs:fn:beta_logit",
+      "crates/gam-spec/src/lib.rs:fn:tweedie_log"
+    ],
+    "reason": "User directive 2026-09-11: delete code only tests use and code nothing uses. gam-spec LikelihoodSpec::tweedie_log and LikelihoodSpec::beta_logit had no caller; the regression tests that name tweedie_log and beta_logit bind local variables built with LikelihoodSpec::new.",
+    "evidence": "Re-confirmed at the tip with git grep -nw over crates src tests examples bench benches plus a qualified-path search (LikelihoodSpec::, Self::, method-call form), which found no use. The other hits are local variable names in tests/regressions and one doc example list, which now names gamma_log. Gates pass base..head; MSI verification at the pushed sha follows."
   }
 ]

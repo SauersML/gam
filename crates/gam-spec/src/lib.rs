@@ -1492,7 +1492,7 @@ impl FamilySpecKind {
 impl LikelihoodSpec {
     /// Unchecked constructor: assembles a `(response, link)` cell *without*
     /// validating the legal matrix. Reserved for the in-crate named const
-    /// constructors below (`gaussian_identity`, `poisson_log`, `beta_logit`,
+    /// constructors below (`gaussian_identity`, `poisson_log`, `gamma_log`,
     /// the `binomial_*` family, …), every one of which builds a cell that is
     /// legal by construction. The public, fallible entry point for an arbitrary
     /// `(response, link)` pair is [`LikelihoodSpec::try_new`]; the serde path
@@ -1599,22 +1599,6 @@ impl LikelihoodSpec {
         Self::new(
             ResponseFamily::Poisson,
             InverseLink::Standard(StandardLink::Log),
-        )
-    }
-
-    #[inline]
-    pub const fn tweedie_log(p: f64) -> Self {
-        Self::new(
-            ResponseFamily::Tweedie { p },
-            InverseLink::Standard(StandardLink::Log),
-        )
-    }
-
-    #[inline]
-    pub const fn beta_logit(phi: f64) -> Self {
-        Self::new(
-            ResponseFamily::Beta { phi },
-            InverseLink::Standard(StandardLink::Logit),
         )
     }
 
