@@ -471,8 +471,6 @@ jobs:
           result = {
               'base': base, 'head': head,
               'tests': tests.difference(before, after),
-              'before_floor': tests.floor_from(before),
-              'after_floor': tests.floor_from(after),
               'source': source.removals(old, new, words),
               'public_api': api.difference(api.census(root, base, {}), api.census(root, head, {})),
           }

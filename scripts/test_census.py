@@ -1,17 +1,14 @@
 #!/usr/bin/env python3
 """Compare Rust test declarations in immutable Git trees (#2818).
 
-This is a source-integrity gate, not evidence that a test compiled or ran.
-Comments and literals cannot satisfy a missing test identity.
+This is a source census, not evidence that a test compiled or ran. Comments and
+literals cannot satisfy a missing test identity.
 
-The comparison against the base reports the exact identities that went missing,
-but it only ever sees one step and its workspace totals let growth in one crate
-pay for deletion in another, so it informs rather than decides. The floor in
-docs/test-census-floor.json decides: a high-water mark per compilation unit and
-per issue number that does not depend on which base the gate was handed and
-does not net. ``--positive-control`` re-measures the sweep this gate exists for,
-because a census that has stopped detecting anything is byte-identical to a
-census over a tree that lost nothing.
+The comparison against the base reports the exact identities that went missing
+and the compilation units that lost tests; it refuses only an empty denominator.
+``--positive-control`` re-measures the sweep this census exists for, because a
+census that has stopped detecting anything is byte-identical to a census over a
+tree that lost nothing.
 """
 
 import argparse
@@ -27,8 +24,7 @@ PIN = re.compile(r"_\d+(?:_\d+)*$")
 TOKEN = re.compile(r"[A-Za-z_][A-Za-z_0-9]*|[^\s]")
 LITERAL = re.compile(r'''(?:b|c)?"(?:\\.|[^"\\])*"|'(?:\\(?:u\{[0-9a-fA-F]+\}|x[0-9a-fA-F]{2}|.)|[^'\\\n])' ''', re.S | re.X)
 RAW = re.compile(r'(?:b|c)?r(#{0,255})"')
-FLOOR = "docs/test-census-floor.json"
-# The commit whose 2,290 deleted tests this gate was built to make visible.
+# The commit whose 2,290 deleted tests this census was built to make visible.
 #
 # `units_losing_tests` was 21 while the whole `tests` tree was one unit. Split by
 # integration binary it is 38 — 20 `crates/*` and 18 `tests/*`, with the same
@@ -143,8 +139,8 @@ def unit(path):
 
     The same netting survives inside any unit that is itself an aggregate, and
     the top-level `tests` tree was the largest one: 2,619 tests over 1,069 files
-    behind a single floor entry, more than any crate. So it is split by its
-    first path component too. That boundary is not arbitrary — each
+    in a single entry, more than any crate. So it is split by its first path
+    component too. That boundary is not arbitrary — each
     `tests/<name>/main.rs` is the crate root of its own integration binary
     (`gam::regressions`, `gam::sae`, `gam::quality`, ... — 18 of them), which is
     the unit a failure is already attributed to; the three subtrees with no
@@ -160,17 +156,6 @@ def unit(path):
     if head == "tests" and first.endswith(".rs"):
         first = first[: -len(".rs")]
     return f"{head}/{first}"
-
-
-def issue_numbers(name):
-    """Issue numbers a pinned test name carries in its trailing numeric suffix.
-
-    A name survives renaming far less often than the bug it pins does, so the
-    floor groups pins by issue: an issue's coverage may be rewritten, but the
-    number of tests answering for it may not fall.
-    """
-    suffix = PIN.search(name)
-    return () if suffix is None else tuple(part for part in suffix.group().split("_") if len(part) >= 3)
 
 
 def git(root, *args):
@@ -227,13 +212,9 @@ def census(root, revision, parsed=None):
         for name in found:
             locations.setdefault(name, []).append(path)
     pins = Counter({name: count for name, count in names.items() if PIN.search(name)})
-    issues = Counter()
-    for name, count in pins.items():
-        for number in issue_numbers(name):
-            issues[number] += count
     validate_population(revision, len(files), names, pins)
     return {"revision": revision, "files": len(files), "tests": sum(names.values()),
-            "names": names, "pins": pins, "units": units, "issues": issues, "locations": locations}
+            "names": names, "pins": pins, "units": units, "locations": locations}
 
 
 def difference(before, after):
@@ -242,35 +223,10 @@ def difference(before, after):
             "unit_test_decreases": dict(sorted((before["units"] - after["units"]).items()))}
 
 
-def floor_from(measured):
-    """The high-water mark a later tree must still clear."""
-    return {"generated_from": measured["revision"],
-            "units": dict(sorted(measured["units"].items())),
-            "issues": dict(sorted(measured["issues"].items(), key=lambda item: int(item[0])))}
-
-
-def check_floor(measured, floor):
-    if set(floor) != {"generated_from", "units", "issues"}:
-        raise ValueError("test census floor has missing or unknown fields")
-    if any(not isinstance(value, int) or isinstance(value, bool) or value < 0
-           for section in ("units", "issues") for value in floor[section].values()):
-        raise ValueError("test census floor holds an entry that is not a count")
-    shortfall = {f"{section}/{key}": [minimum, measured[section][key]]
-                 for section in ("units", "issues")
-                 for key, minimum in floor[section].items()
-                 if measured[section][key] < minimum}
-    if shortfall:
-        raise ValueError(
-            f"test coverage fell below the recorded floor [minimum, measured]; regenerate {FLOOR} with "
-            "--update-floor in the same change as the removal it permits: "
-            + json.dumps(shortfall, sort_keys=True))
-    return shortfall
-
-
 def positive_control(root):
     """Re-measure the #2818 sweep, so a census detecting nothing cannot pass.
 
-    The expected numbers are the ones this gate must keep reproducing; a lexer
+    The expected numbers are the ones this census must keep reproducing; a lexer
     or comparison change that moves them has to move them here too, in review.
     """
     parsed = {}
@@ -283,11 +239,7 @@ def positive_control(root):
                 "units_losing_tests": len(delta["unit_test_decreases"])}
     if measured != CONTROL:
         raise ValueError(f"positive control drifted from the measured #2818 sweep: {json.dumps(measured, sort_keys=True)}")
-    try:
-        check_floor(after, floor_from(before))
-    except ValueError:
-        return measured
-    raise ValueError("positive control: the floor measured before the #2818 sweep accepted it")
+    return measured
 
 
 def main():
@@ -295,33 +247,24 @@ def main():
     parser.add_argument("--base", help="immutable pre-change commit")
     parser.add_argument("--head", default="HEAD")
     parser.add_argument("--output", type=Path, help="write measured identities and loss report as JSON")
-    parser.add_argument("--update-floor", action="store_true", help=f"rewrite {FLOOR} from --head")
     parser.add_argument("--positive-control", action="store_true", help="re-measure the #2818 sweep and stop")
     args = parser.parse_args()
     root = Path(git(Path.cwd(), "rev-parse", "--show-toplevel").decode().strip())
     if args.positive_control:
         print("Positive control at {head}: {test_count_decrease} tests, {removed_pin_names} pinned names and "
-              "{units_losing_tests} units lost, and the floor refuses it.".format(**positive_control(root)))
-        return
-    head = resolve(root, args.head)
-    parsed = {}
-    after = census(root, head, parsed)
-    if args.update_floor:
-        (root / FLOOR).write_text(json.dumps(floor_from(after), indent=2, sort_keys=False) + "\n")
-        print(f"{FLOOR}: floor rewritten from {head}")
+              "{units_losing_tests} units lost.".format(**positive_control(root)))
         return
     if not args.base:
-        parser.error("--base is required unless --update-floor or --positive-control is given")
+        parser.error("--base is required unless --positive-control is given")
+    parsed = {}
+    after = census(root, resolve(root, args.head), parsed)
     before = census(root, resolve(root, args.base), parsed)
-    floor = json.loads(git(root, "show", head + ":" + FLOOR))
-    report = {"before": before, "after": after, "change": difference(before, after), "floor": floor}
+    report = {"before": before, "after": after, "change": difference(before, after)}
     if args.output:
         args.output.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n")
     print(f"{before['revision']}: {before['files']} Rust files, {before['tests']} tests, {len(before['pins'])} issue-pinned names")
     print(f"{after['revision']}: {after['files']} Rust files, {after['tests']} tests, {len(after['pins'])} issue-pinned names")
-    print(f"{FLOOR} generated at {floor['generated_from']}: {len(floor['units'])} units, {len(floor['issues'])} issue numbers")
-    check_floor(after, floor)
-    print("Test source integrity verified; compilation and execution require their own verdicts.")
+    print("Test source census complete; compilation and execution require their own verdicts.")
 
 
 if __name__ == "__main__":

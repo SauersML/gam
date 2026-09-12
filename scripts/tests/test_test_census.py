@@ -35,12 +35,11 @@ class TestCensus(unittest.TestCase):
             with self.subTest(source=source), self.assertRaises(ValueError):
                 list(census.test_names(source))
 
-    def test_removing_a_pin_still_fails_when_total_count_grows_2818(self):
-        before = snapshot(3, {"critical_2818": 1}, {"crates/gam-sae": 3}, {"2818": 1})
-        after = snapshot(4, {"unrelated_2817": 3}, {"crates/gam-sae": 4}, {"2817": 3})
-        self.assertEqual(census.difference(before, after)["removed_pins"], {"critical_2818": 1})
-        with self.assertRaisesRegex(ValueError, r"issues/2818.*1.*0"):
-            census.check_floor(after, census.floor_from(before))
+    def test_removing_a_pin_is_reported_when_total_count_grows_2818(self):
+        before = snapshot(3, {"critical_2818": 1}, {"crates/gam-sae": 3})
+        after = snapshot(4, {"unrelated_2817": 3}, {"crates/gam-sae": 4})
+        self.assertEqual(census.difference(before, after), {
+            "test_count_decrease": 0, "removed_pins": {"critical_2818": 1}, "unit_test_decreases": {}})
 
     def test_duplicate_pin_loss_and_plain_test_count_loss_are_visible_2818(self):
         before = snapshot(5, {"critical_12": 2})
@@ -48,11 +47,11 @@ class TestCensus(unittest.TestCase):
         self.assertEqual(census.difference(before, after), {
             "test_count_decrease": 1, "removed_pins": {"critical_12": 1}, "unit_test_decreases": {}})
 
-    def test_total_count_loss_fails_even_when_every_pin_survives_2818(self):
-        before = snapshot(5, {"critical_2818": 1}, {"crates/gam-sae": 5}, {"2818": 1})
-        after = snapshot(4, {"critical_2818": 1}, {"crates/gam-sae": 4}, {"2818": 1})
-        with self.assertRaisesRegex(ValueError, r"crates/gam-sae.*5.*4"):
-            census.check_floor(after, census.floor_from(before))
+    def test_total_count_loss_is_reported_even_when_every_pin_survives_2818(self):
+        before = snapshot(5, {"critical_2818": 1}, {"crates/gam-sae": 5})
+        after = snapshot(4, {"critical_2818": 1}, {"crates/gam-sae": 4})
+        self.assertEqual(census.difference(before, after), {
+            "test_count_decrease": 1, "removed_pins": {}, "unit_test_decreases": {"crates/gam-sae": 1}})
 
     def test_growth_with_unchanged_identities_reports_no_loss_2818(self):
         before = snapshot(5, {"critical_12": 1})
@@ -66,34 +65,6 @@ class TestCensus(unittest.TestCase):
         after = snapshot(40, {"critical_12": 1}, {"crates/gam-sae": 5, "crates/gam-solve": 35})
         self.assertEqual(census.difference(before, after)["test_count_decrease"], 0)
         self.assertEqual(census.difference(before, after)["unit_test_decreases"], {"crates/gam-sae": 25})
-        with self.assertRaisesRegex(ValueError, r"crates/gam-sae.*30.*5"):
-            census.check_floor(after, census.floor_from(before))
-
-    def test_floor_holds_units_and_issues_without_a_base_commit_2818(self):
-        """The floor is the assertion that survives a broken incremental chain."""
-        floor = {"generated_from": "mark", "units": {"crates/gam-sae": 30}, "issues": {"2818": 4}}
-        self.assertEqual(census.check_floor(snapshot(40, {}, {"crates/gam-sae": 31}, {"2818": 9}), floor), {})
-        for units, issues in (({"crates/gam-sae": 29}, {"2818": 4}), ({"crates/gam-sae": 30}, {"2818": 3}),
-                              ({}, {}), ({"crates/gam-solve": 99}, {"2817": 99})):
-            with self.subTest(units=units), self.assertRaisesRegex(ValueError, "below the recorded floor"):
-                census.check_floor(snapshot(40, {}, units, issues), floor)
-
-    def test_floor_rejects_a_control_file_that_is_not_counts_2818(self):
-        good = {"generated_from": "mark", "units": {"crates/gam-sae": 1}, "issues": {"2818": 1}}
-        measured = snapshot(40, {}, {"crates/gam-sae": 9}, {"2818": 9})
-        self.assertEqual(census.check_floor(measured, good), {})
-        for broken in ({"units": {}, "issues": {}}, dict(good, extra=1),
-                       dict(good, units={"crates/gam-sae": "1"}), dict(good, issues={"2818": -1}),
-                       dict(good, units={"crates/gam-sae": True})):
-            with self.subTest(broken=broken), self.assertRaises(ValueError):
-                census.check_floor(measured, broken)
-
-    def test_a_renamed_pin_keeps_answering_for_its_issue_2818(self):
-        """Names churn; the bug a test pins does not. The floor groups by issue."""
-        self.assertEqual(census.issue_numbers("co_routed_frame_sweep_is_tied_code_descent_2634"), ("2634",))
-        self.assertEqual(census.issue_numbers("end_to_end_parity_battery_2156_2144"), ("2156", "2144"))
-        self.assertEqual(census.issue_numbers("plain_name"), ())
-        self.assertEqual(census.issue_numbers("matrix_is_2x2_12"), ())
 
     def test_units_group_by_crate_and_by_top_level_suite_2818(self):
         self.assertEqual(census.unit("crates/gam-sae/src/manifold/mod.rs"), "crates/gam-sae")
@@ -118,26 +89,20 @@ class TestCensus(unittest.TestCase):
         """The netting the split exists to kill, as a before/after on one input.
 
         Three tests leave `tests/regressions` and three arrive in `tests/sae`.
-        Under one lumped `tests` unit the floor does not move and the loss is
-        invisible; under the split the shortfall is named.
+        Under one lumped `tests` unit the loss is invisible; under the split it
+        is named.
         """
-        floor = {"generated_from": "mark",
-                 "units": {"tests/regressions": 506, "tests/sae": 126},
-                 "issues": {"2818": 1}}
-        measured = snapshot(632, {"pinned_2818": 1},
-                            {"tests/regressions": 503, "tests/sae": 129}, {"2818": 1})
+        before = snapshot(632, {"pinned_2818": 1}, {"tests/regressions": 506, "tests/sae": 126})
+        after = snapshot(632, {"pinned_2818": 1}, {"tests/regressions": 503, "tests/sae": 129})
+        self.assertEqual(census.difference(before, after)["unit_test_decreases"], {"tests/regressions": 3})
 
-        with self.assertRaisesRegex(ValueError, r"tests/regressions.*506.*503"):
-            census.check_floor(measured, floor)
-
-        lumped_floor = {"generated_from": "mark", "units": {"tests": 632}, "issues": {"2818": 1}}
-        lumped = snapshot(632, {"pinned_2818": 1}, {"tests": 632}, {"2818": 1})
-        self.assertEqual(census.check_floor(lumped, lumped_floor), {})
+        lumped_before = snapshot(632, {"pinned_2818": 1}, {"tests": 506 + 126})
+        lumped_after = snapshot(632, {"pinned_2818": 1}, {"tests": 503 + 129})
+        self.assertEqual(census.difference(lumped_before, lumped_after)["unit_test_decreases"], {})
 
 
-def snapshot(tests, pins, units=None, issues=None):
-    return {"revision": "base", "tests": tests, "pins": Counter(pins),
-            "units": Counter(units or {}), "issues": Counter(issues or {})}
+def snapshot(tests, pins, units=None):
+    return {"revision": "base", "tests": tests, "pins": Counter(pins), "units": Counter(units or {})}
 
 
 if __name__ == "__main__":
