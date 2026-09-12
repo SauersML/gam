@@ -1,9 +1,9 @@
 {
-  "created_at_utc": "2026-09-12T15:17:31.281771+00:00",
+  "created_at_utc": "2026-09-12T16:05:43.808497+00:00",
   "status": "timeout",
   "method": "rust_margslope_aniso_duchon16d_linkwiggle_scorewarp_fast",
   "dataset": "disease",
   "family": "binomial",
   "timeout_sec": 300,
-  "error": "[HEARTBEAT] command-timeout rc=124 timeout_sec=300 pid=2394 cmd='/home/runner/work/gam/gam/target/release/gam --log-level info fit --slope-formula ...'"
+  "error": "[HEARTBEAT] command-timeout rc=124 timeout_sec=300 pid=2395 cmd='/home/runner/work/gam/gam/target/release/gam --log-level info fit --slope-formula ...'"
 }
