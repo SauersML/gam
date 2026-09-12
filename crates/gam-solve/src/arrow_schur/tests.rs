@@ -2087,47 +2087,6 @@ pub(crate) fn device_seam_declines_without_gpu_and_matches_cpu() {
     }
 }
 
-// ----------------------------------------------------------------------
-/// #1795 — the row-block preconditioner builder is another reduced-Schur
-/// factorization entry point. It must use the same spectral PD-floor as the
-/// direct dense solve, rather than a raw Cholesky, because the preconditioner
-/// inverts the same collapsed decoder subspace before CG handles the explicit
-/// cross-row Woodbury coupling.
-#[test]
-pub(crate) fn cross_row_preconditioner_build_honors_pd_floor_1795() {
-    let backend = CpuBatchedBlockSolver;
-    let mut sys = diagonal_arrow_fixture(2.0, 1.0);
-    // With zero H_tβ blocks, the reduced Schur is exactly H_ββ. This matrix has
-    // eigenvalues {+3, −1}: a bare Cholesky must reject it, while the #1038
-    // spectral floor unit-deflates the collapsed direction relative to λ_max=3.
-    sys.hbb = array![[1.0_f64, 2.0], [2.0, 1.0]];
-
-    let unfloored =
-        ArrowBlockDiagInverse::build(&sys, 0.0, 0.0, None, &backend, gam_gpu::GpuPolicy::Auto);
-    assert!(
-        matches!(unfloored, Err(ArrowSchurError::SchurFactorFailed { .. })),
-        "un-floored cross-row preconditioner must surface the non-PD Schur"
-    );
-
-    let floored = ArrowBlockDiagInverse::build(
-        &sys,
-        0.0,
-        0.0,
-        Some(SPECTRAL_DEFLATION_REL_FLOOR),
-        &backend,
-        gam_gpu::GpuPolicy::Auto,
-    )
-    .expect("cross-row preconditioner must honor the spectral PD-floor");
-
-    let rhs_t = Array1::<f64>::zeros(sys.row_offsets[sys.rows.len()]);
-    let rhs_beta = array![0.25_f64, -0.5];
-    let (_sol_t, sol_beta) = floored.apply(rhs_t.view(), rhs_beta.view());
-    assert!(
-        sol_beta.iter().all(|v| v.is_finite()),
-        "floored cross-row preconditioner solve must produce finite beta components, got {sol_beta:?}"
-    );
-}
-
 /// Build a dense-`htbeta` arrow system at an SAE-LLM-flavoured shape
 /// (`n` row blocks × `d` latent coords × wide border `k`), with
 /// deterministic well-conditioned per-row blocks and cross-blocks. This is
@@ -2523,9 +2482,9 @@ pub(crate) fn cluster_jacobi_build_deterministic_and_matches_serial() {
     );
 }
 
-/// Sequential reference for the cross-row matvec: the row-order fold of the
-/// same per-row contributions `arrow_cross_row_matvec` accumulates, followed by
-/// the post-loop `H_ββ + ridge` prologue and cross-row penalty Hessian. Used to
+/// Sequential reference for the block-diagonal arrow matvec: the row-order fold
+/// of the same per-row contributions `arrow_operator_apply` accumulates, followed
+/// by the post-loop `H_ββ + ridge` prologue. Used to
 /// pin the parallelized n-row loop against an independent serial computation.
 pub(crate) fn cross_row_matvec_sequential_ref(
     sys: &ArrowSchurSystem,
@@ -2566,147 +2525,14 @@ pub(crate) fn cross_row_matvec_sequential_ref(
     for a in 0..k {
         y_beta[a] += ridge_beta * x_beta[a];
     }
-    sys.apply_cross_row_penalty_hessian(x_t, &mut y_t);
     (y_t, y_beta)
-}
-
-/// The parallel cross-row matvec (`arrow_cross_row_matvec`, the per-CG-iteration
-/// operator of the cross-row coupled Newton solve) must, like its `schur_matvec`
-/// twin, be (a) DETERMINISTIC run-to-run — bit-identical across repeated
-/// invocations regardless of thread scheduling (the #1017 gate); and (b) equal
-/// to the sequential row-order fold — bit-identical on the disjoint `y_t` writes
-/// and within ULP-scale reassociation on the cross-row `y_beta` sum. Since the
-/// `y_beta` sum is only tolerance-equal to serial (not bit-for-bit), the
-/// criterion ranking is stable up to that margin but a near-tie winner inside it
-/// can flip; run-to-run determinism alone does not pin the ranking (#1211).
-#[test]
-pub(crate) fn parallel_cross_row_matvec_deterministic_and_matches_sequential() {
-    let n = SCHUR_MATVEC_PARALLEL_ROW_MIN + 96; // trips the parallel path
-    let d = 5usize;
-    let k = 80usize;
-    let sys = dense_arrow_system(n, d, k);
-    let total_dt = sys.row_offsets[n];
-    let ridge_t = 1e-5;
-    let ridge_beta = 1e-6;
-    let x_t = Array1::from_iter((0..total_dt).map(|i| 0.2 * (i as f64).cos() + 0.05));
-    let x_beta = Array1::from_iter((0..k).map(|a| 0.3 * (a as f64).sin() - 0.1));
-
-    // (a) Determinism: two independent invocations of the live (parallel) path
-    // must be bit-identical in both output blocks.
-    let (yt_a, yb_a) = arrow_cross_row_matvec(&sys, ridge_t, ridge_beta, x_t.view(), x_beta.view());
-    let (yt_b, yb_b) = arrow_cross_row_matvec(&sys, ridge_t, ridge_beta, x_t.view(), x_beta.view());
-    for i in 0..total_dt {
-        assert_eq!(
-            yt_a[i].to_bits(),
-            yt_b[i].to_bits(),
-            "parallel cross-row matvec y_t must be deterministic at {i}"
-        );
-    }
-    for a in 0..k {
-        assert_eq!(
-            yb_a[a].to_bits(),
-            yb_b[a].to_bits(),
-            "parallel cross-row matvec y_beta must be deterministic at {a}"
-        );
-    }
-
-    // (b) Equivalence with the sequential row-order fold.
-    let (yt_seq, yb_seq) =
-        cross_row_matvec_sequential_ref(&sys, ridge_t, ridge_beta, x_t.view(), x_beta.view());
-    // y_t writes are disjoint per row → bit-identical to the serial fold.
-    for i in 0..total_dt {
-        assert_eq!(
-            yt_a[i].to_bits(),
-            yt_seq[i].to_bits(),
-            "parallel cross-row matvec y_t must match the sequential fold bit-for-bit at {i}"
-        );
-    }
-    // y_beta is a cross-row accumulation → equal within reassociation error.
-    let scale = yb_seq.iter().fold(0.0_f64, |m, &v| m.max(v.abs())).max(1.0);
-    for a in 0..k {
-        let rel = (yb_a[a] - yb_seq[a]).abs() / scale;
-        assert!(
-            rel < 1e-12,
-            "parallel vs sequential cross-row matvec y_beta must agree to reassociation \
-                 error at {a}: {} vs {} (rel {rel:e})",
-            yb_a[a],
-            yb_seq[a]
-        );
-    }
-}
-
-/// The cross-row preconditioner solve `ArrowBlockDiagInverse::apply` (run once
-/// per cross-row CG iteration) parallelizes both its n-row passes (#1017). It
-/// must be (a) DETERMINISTIC run-to-run and (b) the exact inverse of the
-/// block-diagonal arrow operator `K0 + ridge`. With no cross-row penalties
-/// `P_cross = 0`, so `arrow_cross_row_matvec` IS `K0 + ridge`; the round trip
-/// `(K0+ridge)·apply(r)` must recover `r`.
-#[test]
-pub(crate) fn parallel_block_diag_inverse_apply_deterministic_and_solves() {
-    let n = SCHUR_MATVEC_PARALLEL_ROW_MIN + 64; // trips the parallel path
-    let d = 4usize;
-    let k = 72usize;
-    let sys = dense_arrow_system(n, d, k);
-    let backend = CpuBatchedBlockSolver;
-    let ridge_t = 1e-4;
-    let ridge_beta = 1e-5;
-    let precond = ArrowBlockDiagInverse::build(
-        &sys,
-        ridge_t,
-        ridge_beta,
-        None,
-        &backend,
-        gam_gpu::GpuPolicy::Auto,
-    )
-    .expect("block-diagonal inverse must build");
-    let total_dt = sys.row_offsets[n];
-    let r_t = Array1::from_iter((0..total_dt).map(|i| 0.15 * (i as f64).sin() + 0.02));
-    let r_beta = Array1::from_iter((0..k).map(|a| 0.25 * (a as f64).cos() - 0.05));
-
-    // (a) Determinism run-to-run on the parallel path.
-    let (xt_a, xb_a) = precond.apply(r_t.view(), r_beta.view());
-    let (xt_b, xb_b) = precond.apply(r_t.view(), r_beta.view());
-    for i in 0..total_dt {
-        assert_eq!(
-            xt_a[i].to_bits(),
-            xt_b[i].to_bits(),
-            "preconditioner x_t must be deterministic at {i}"
-        );
-    }
-    for a in 0..k {
-        assert_eq!(
-            xb_a[a].to_bits(),
-            xb_b[a].to_bits(),
-            "preconditioner x_beta must be deterministic at {a}"
-        );
-    }
-
-    // (b) Exact inverse: the round trip recovers the RHS.
-    let (yt, yb) = arrow_cross_row_matvec(&sys, ridge_t, ridge_beta, xt_a.view(), xb_a.view());
-    let scale_t = r_t.iter().fold(0.0_f64, |m, &v| m.max(v.abs())).max(1.0);
-    for i in 0..total_dt {
-        let rel = (yt[i] - r_t[i]).abs() / scale_t;
-        assert!(
-            rel < 1e-9,
-            "preconditioner round-trip y_t at {i}: rel {rel:e}"
-        );
-    }
-    let scale_b = r_beta.iter().fold(0.0_f64, |m, &v| m.max(v.abs())).max(1.0);
-    for a in 0..k {
-        let rel = (yb[a] - r_beta[a]).abs() / scale_b;
-        assert!(
-            rel < 1e-9,
-            "preconditioner round-trip y_beta at {a}: rel {rel:e}"
-        );
-    }
 }
 
 /// `arrow_operator_apply` (the block-diagonal `K0` operator used by the
 /// iterative-refinement residual / backward-error certificate) parallelizes its
 /// n-row pass via the shared `cross_row_matvec_row_into` body (#1017). It must
-/// be deterministic run-to-run and equal to the sequential fold: with no
-/// cross-row penalties it equals `arrow_cross_row_matvec`, so the same
-/// `cross_row_matvec_sequential_ref` is the reference (bit-identical disjoint
+/// be deterministic run-to-run and equal to the sequential fold
+/// `cross_row_matvec_sequential_ref` (bit-identical disjoint
 /// `y_t`, ULP-scale `y_beta` reassociation).
 #[test]
 pub(crate) fn parallel_arrow_operator_apply_deterministic_and_matches_sequential() {
@@ -2816,7 +2642,7 @@ pub(crate) fn parallel_penalty_prologue_bit_identical_to_serial() {
 }
 
 /// `penalty_matvec_add` is the serial `H_ββ·x` accumulate left inside the
-/// per-CG-iteration cross-row matvec (`arrow_cross_row_matvec`); at the wide SAE
+/// block-diagonal arrow matvec (`arrow_operator_apply`); at the wide SAE
 /// border it fans over output rows. Because each `y[a] += Σ_b hbb[a,b]·x[b]` is
 /// one thread's own dot in the same `b` order as serial, the parallel accumulate
 /// is **bit-identical** to serial (not merely deterministic), so the criterion

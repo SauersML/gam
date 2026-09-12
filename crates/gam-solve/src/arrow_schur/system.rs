@@ -1,6 +1,6 @@
 //! The bordered arrow-Schur system itself: [`ArrowRowBlock`], the
-//! [`ArrowSchurSystem`] container and its assembly impl, cross-row latent
-//! penalties, the streaming builder, and the per-row factor caches.
+//! [`ArrowSchurSystem`] container and its assembly impl, the streaming builder,
+//! and the per-row factor caches.
 
 use super::*;
 
@@ -190,23 +190,6 @@ pub struct ArrowSchurSystem {
     /// descriptor is installed only when SAE assembly has a matching CUDA sparse
     /// representation for both `H_tβ` and `H_ββ`.
     pub device_sae_pcg: Option<Arc<DeviceSaePcgData>>,
-    /// Registered Psi-tier analytic penalties whose Hessian couples *distinct*
-    /// latent rows (non-row-block-diagonal). No assembler in the workspace
-    /// populates it.
-    ///
-    /// These penalties (`TotalVariationPenalty`, `SheafConsistencyPenalty`,
-    /// block-orthogonality, …) produce off-row Hessian blocks `∂²P/∂t_i∂t_j`
-    /// (`i ≠ j`) that the arrow elimination — which assumes each `H_tt^(i)` is
-    /// independent of every other row — cannot represent. Their *gradient* is
-    /// still folded into `g_t` exactly like every other Psi penalty; only their
-    /// curvature is held here, applied during the solve as a full-latent
-    /// Hessian-vector product `P_cross · Δt` against the penalty's
-    /// `psd_majorizer_hvp`. When this vector is non-empty,
-    /// `solve_arrow_newton_step_artifacts` auto-selects the matrix-free
-    /// full-system PCG path (arrow block-diagonal inverse as preconditioner)
-    /// instead of the exact one-shot Schur elimination. When empty, the system
-    /// is purely row-block-diagonal and the exact Schur path is unchanged.
-    pub cross_row_penalties: Vec<CrossRowLatentPenalty>,
     /// Optional row-local gauge directions for evidence-only Faddeev-Popov
     /// deflation of an otherwise non-PD `H_tt` row block.
     ///
@@ -272,7 +255,6 @@ impl Clone for ArrowSchurSystem {
             block_offsets: Arc::clone(&self.block_offsets),
             penalty_op: self.penalty_op.clone(),
             device_sae_pcg: self.device_sae_pcg.clone(),
-            cross_row_penalties: self.cross_row_penalties.clone(),
             row_gauge_deflation: self.row_gauge_deflation.clone(),
             beta_gauge_quotient: self.beta_gauge_quotient.clone(),
             htbeta_operator_fingerprint: self.htbeta_operator_fingerprint,
@@ -280,29 +262,6 @@ impl Clone for ArrowSchurSystem {
             exact_a_reduced_conditioning: self.exact_a_reduced_conditioning.clone(),
         }
     }
-}
-
-/// A captured cross-row Psi-tier analytic penalty: the penalty kind plus the
-/// global-ρ slice (`rho_local`) it was registered with.
-///
-/// Holds an owned copy of the local ρ-axes so the penalty's
-/// [`AnalyticPenaltyKind::psd_majorizer_hvp`] can be evaluated during the
-/// matrix-free full-system solve without re-deriving the ρ layout. The penalty
-/// itself is an `Arc`-backed clone (cheap), so capturing it does not copy the
-/// penalty payload.
-#[derive(Clone)]
-pub struct CrossRowLatentPenalty {
-    /// The non-row-block-diagonal Psi penalty (e.g. `TotalVariationPenalty`).
-    pub penalty: AnalyticPenaltyKind,
-    /// The penalty's local ρ-axes (its slice of the global ρ vector).
-    pub rho_local: Array1<f64>,
-    /// The flat latent vector (`N·d`, row-major) the penalty's curvature was
-    /// linearized at. The Hessian of
-    /// a nonlinear penalty (the smoothed-TV curvature weights `φ''(D t)`,
-    /// etc.) depends on this point, so `psd_majorizer_hvp` must be evaluated
-    /// against it for the Newton operator to be the true Hessian at the
-    /// current iterate.
-    pub target_t: Array1<f64>,
 }
 
 impl ArrowSchurSystem {
@@ -355,7 +314,6 @@ impl ArrowSchurSystem {
             block_offsets: Arc::from([] as [Range<usize>; 0]),
             penalty_op: None,
             device_sae_pcg: None,
-            cross_row_penalties: Vec::new(),
             row_gauge_deflation: None,
             beta_gauge_quotient: None,
             htbeta_operator_fingerprint: None,
@@ -403,7 +361,6 @@ impl ArrowSchurSystem {
             block_offsets: Arc::from([] as [Range<usize>; 0]),
             penalty_op: None,
             device_sae_pcg: None,
-            cross_row_penalties: Vec::new(),
             row_gauge_deflation: None,
             beta_gauge_quotient: None,
             htbeta_operator_fingerprint: None,
@@ -485,7 +442,6 @@ impl ArrowSchurSystem {
             block_offsets: Arc::from([] as [Range<usize>; 0]),
             penalty_op: None,
             device_sae_pcg: None,
-            cross_row_penalties: Vec::new(),
             row_gauge_deflation: None,
             beta_gauge_quotient: None,
             htbeta_operator_fingerprint: None,
@@ -743,7 +699,7 @@ impl ArrowSchurSystem {
         } else {
             let k = self.hbb.nrows();
             // The dense `H_ββ·x` accumulate is the serial `O(k²)` GEMV left
-            // inside the per-CG-iteration cross-row matvec (`arrow_cross_row_matvec`)
+            // inside the block-diagonal arrow matvec (`arrow_operator_apply`)
             // and the once-per-Newton-step model reduction: at the SAE wide border
             // (k≈2048, #1017) it is ≈4M ops/call that pinned one core while the
             // per-row work fans out. Parallelism is over independent output rows
@@ -950,40 +906,6 @@ impl ArrowSchurSystem {
             row.gt.assign(&gt);
             row.htt.assign(&htt);
             row.htbeta.assign(&htbeta);
-        }
-    }
-
-    /// Apply the aggregate cross-row penalty Hessian `P_cross · v` over the
-    /// full flat latent vector `v` (length `Σ_i row_dims[i]`), accumulating
-    /// into `out`.
-    ///
-    /// `P_cross = Σ_p psd_majorizer_hvp_p(target_t, ·; ρ_p)` summed over every
-    /// captured cross-row penalty. Each penalty's `psd_majorizer_hvp` is its
-    /// exact (PSD) Hessian-vector product over the `N·d` flat latent vector —
-    /// for `TotalVariationPenalty` this is `Dᵀ diag(φ''(D t)) D · v`, the
-    /// graph/forward-difference Laplacian-style coupling that links distinct
-    /// rows. The ρ scaling is already baked into each penalty's resolved
-    /// weight, so no extra factor is applied here.
-    ///
-    /// This is only valid for homogeneous systems (every row of dimension
-    /// `d`), the only shape cross-row latent penalties are defined on; the
-    /// flat-index convention `flat = i·d + j` matches every penalty's
-    /// `latent_dim`/row-major contract.
-    pub(crate) fn apply_cross_row_penalty_hessian(
-        &self,
-        v: ArrayView1<'_, f64>,
-        out: &mut Array1<f64>,
-    ) {
-        for cross in &self.cross_row_penalties {
-            assert_eq!(cross.target_t.len(), v.len());
-            let hv =
-                cross
-                    .penalty
-                    .psd_majorizer_hvp(cross.target_t.view(), cross.rho_local.view(), v);
-            assert_eq!(hv.len(), out.len());
-            for i in 0..out.len() {
-                out[i] += hv[i];
-            }
         }
     }
 
@@ -2391,7 +2313,7 @@ pub struct ArrowFactorCache {
     /// coordinates) that an undamped evidence factorization stiffened to UNIT
     /// stiffness `λ̃ = 1` (gauge or spectral deflation). Indexed by row; empty
     /// for every PD row factored without deflation, and empty overall on the
-    /// non-deflating solver paths (streaming / cross-row-penalty CG / device).
+    /// non-deflating solver paths (streaming / device).
     ///
     /// A deflated direction contributes `log(1) = 0` to the row-block log-det
     /// and is ρ/θ-INDEPENDENT, so its true contribution to `∂log|H|/∂ρ` is `0`.
@@ -2421,8 +2343,8 @@ pub struct ArrowFactorCache {
     ///
     /// `Some(spectrum)` only for spectrally-deflated rows; `None` for PD rows,
     /// gauge-only deflation (ρ-independent structural null — within-row term
-    /// suffices), and every non-SAE-evidence solver path (streaming / device /
-    /// cross-row CG). Empty overall when no row deflated spectrally.
+    /// suffices), and every non-SAE-evidence solver path (streaming / device).
+    /// Empty overall when no row deflated spectrally.
     pub deflation_row_spectra: Arc<[Option<RowDeflationSpectrum>]>,
     /// Shared-border scale gauge used by the evidence factor.
     ///

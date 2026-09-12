@@ -195,5 +195,17 @@
     "unit_test_decreases": {
       "crates/gam-model-kernels": 2
     }
+  },
+  {
+    "base": "36bf99559b084974eedd1298d5a8a31af2ec4349",
+    "reason": "user directive: delete all useless slop. The cross-row matrix-free PCG route became unreachable when e3b50feaf removed the only writer of ArrowSchurSystem::cross_row_penalties, and this change removes it. The three retired gam-solve tests exercised only that route: its per-CG matvec (parallel_cross_row_matvec_deterministic_and_matches_sequential) and its ArrowBlockDiagInverse preconditioner (cross_row_preconditioner_build_honors_pd_floor_1795, parallel_block_diag_inverse_apply_deterministic_and_solves).",
+    "evidence": "The same commit deletes arrow_cross_row_matvec, solve_arrow_newton_step_cross_row and ArrowBlockDiagInverse from crates/gam-solve/src/arrow_schur/newton_step.rs; the surviving block-diagonal operator arrow_operator_apply keeps its determinism pin parallel_arrow_operator_apply_deterministic_and_matches_sequential against cross_row_matvec_sequential_ref.",
+    "test_count_decrease": 3,
+    "removed_pins": {
+      "cross_row_preconditioner_build_honors_pd_floor_1795": 1
+    },
+    "unit_test_decreases": {
+      "crates/gam-solve": 3
+    }
   }
 ]

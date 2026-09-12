@@ -1933,7 +1933,7 @@ pub(crate) fn slq_reduced_schur_log_det<B: BatchedBlockSolver + Sync>(
 ///
 /// Same admission contract as the PCG matvec offload ([`maybe_inject_gpu_schur_matvec`]):
 /// declines (returns `None`, so every apply stays on the byte-identical CPU lane)
-/// when cross-row penalties or streaming are present, the work predicate rejects
+/// when streaming is present, the work predicate rejects
 /// the shape, or no live device is present. `apply_budget` is the amortising apply
 /// count for the shape predicate — the reduced-Schur matvec is `O(n·d·k)` per
 /// apply and the evidence ladder runs that apply across every probe / Lanczos /
@@ -1951,7 +1951,7 @@ pub(crate) fn maybe_build_evidence_gpu_matvec(
     if options.gpu_matvec.is_some() {
         return Ok(None);
     }
-    if !sys.cross_row_penalties.is_empty() || options.streaming_chunk_size.is_some() {
+    if options.streaming_chunk_size.is_some() {
         return Ok(None);
     }
     // Size gate BEFORE the device probe (startup-tax ordering): the predicate
@@ -4138,14 +4138,6 @@ fn validate_matrix_free_arrow_pair(
                 cache.row_hessian_fingerprint,
                 sys.manifold_mode_fingerprint,
                 cache.manifold_mode_fingerprint,
-            ),
-        });
-    }
-    if !sys.cross_row_penalties.is_empty() {
-        return Err(ArrowSchurError::SchurFactorFailed {
-            reason: format!(
-                "{operation} supports the row-block bordered arrow only; cross-row latent \
-                 curvature requires its own matrix-free inverse carrier"
             ),
         });
     }

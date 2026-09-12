@@ -1413,5 +1413,22 @@
     ],
     "reason": "user directive: delete all useless slop",
     "evidence": "At dc325f190, git grep -nw over crates, src, tests, examples, bench and benches names every removed public item only at its own definition or in doc prose, and that prose is rewritten here. The private helpers binomial, fact_f64, dirichlet_ref_simplex and discrete_walk, and the discrete-arm types SymmetricAugmentedFit, DiscreteCandidate and DiscreteFullConformalSet, are read only by removed items (all file-local in cubic_bspline_moments.rs and full_conformal.rs). Tests keep their checks on production code: the #1101 covariance test calls integrate_multinomial_design_moments directly, the Lipschitz positive control samples the sensitivity with its own Cholesky, and the re-selection test keeps its stationarity assertion."
+  },
+  {
+    "base": "36bf99559b084974eedd1298d5a8a31af2ec4349",
+    "items": [
+      "crates/gam-solve/src/arrow_schur/newton_step.rs:fn:arrow_cross_row_matvec",
+      "crates/gam-solve/src/arrow_schur/newton_step.rs:fn:cholesky_solve_lower",
+      "crates/gam-solve/src/arrow_schur/newton_step.rs:fn:dot2",
+      "crates/gam-solve/src/arrow_schur/newton_step.rs:fn:solve_arrow_newton_step_cross_row",
+      "crates/gam-solve/src/arrow_schur/newton_step.rs:struct:ArrowBlockDiagInverse",
+      "crates/gam-solve/src/arrow_schur/system.rs:fn:apply_cross_row_penalty_hessian",
+      "crates/gam-solve/src/arrow_schur/system.rs:struct:CrossRowLatentPenalty",
+      "crates/gam-solve/src/arrow_schur/tests.rs:fn:cross_row_preconditioner_build_honors_pd_floor_1795",
+      "crates/gam-solve/src/arrow_schur/tests.rs:fn:parallel_block_diag_inverse_apply_deterministic_and_solves",
+      "crates/gam-solve/src/arrow_schur/tests.rs:fn:parallel_cross_row_matvec_deterministic_and_matches_sequential"
+    ],
+    "reason": "user directive: delete all useless slop",
+    "evidence": "e3b50feaf removed add_analytic_penalty_contributions, the only writer of ArrowSchurSystem::cross_row_penalties; at the push base every constructor initialises it empty and nothing pushes to it, so the cross-row matrix-free PCG route (solve_arrow_newton_step_cross_row, arrow_cross_row_matvec, its ArrowBlockDiagInverse preconditioner with cholesky_solve_lower, dot2, apply_cross_row_penalty_hessian, CrossRowLatentPenalty) was unreachable. git grep -nw finds no production user of any removed item outside the route; the three removed tests exercised only the route. MSI compile, doc, guard and census verification run on the landed sha."
   }
 ]
