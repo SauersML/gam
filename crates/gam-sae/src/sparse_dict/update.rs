@@ -912,8 +912,7 @@ fn run_from_decoder(
         // status and residual. The decline count is therefore path telemetry,
         // never an independent veto on a certified CG answer.
         let numerically_sound = decoder_solve_stats.cg_nonconverged_columns == 0
-            && decoder_solve_stats.cg_relative_residual
-                <= decoder_solve_stats.cg_residual_stop.max(f64::MIN_POSITIVE);
+            && decoder_solve_stats.cg_relative_residual <= decoder_solve_stats.cg_residual_stop;
         let structure_settled = accepted_births == 0;
 
         // Arm 1 CERTIFIED: EV, decoder AND routing residuals all closed. Checked

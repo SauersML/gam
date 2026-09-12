@@ -519,7 +519,8 @@ fn fit_penalized_1d(
     let sum_w = weights
         .as_ref()
         .map_or(n as f64, |wv| wv.iter().copied().sum());
-    let residual_rms = (rss / sum_w.max(f64::MIN_POSITIVE)).sqrt();
+    // The weights were validated finite and positive, so `sum_w > 0`.
+    let residual_rms = (rss / sum_w).sqrt();
     let mut coefficient_score_influence = Array2::<f64>::zeros((m, n));
     for row in 0..n {
         let w = weights.as_ref().map_or(1.0, |wv| wv[row]);
@@ -1434,7 +1435,6 @@ pub fn composition_defect(
         calibrated_variance[i] = calibrated_variance[i].max(approximation_sd * approximation_sd);
     }
     let max_var = calibrated_variance.iter().copied().fold(0.0_f64, f64::max);
-    let var_floor = (max_var * 1e-12).max(f64::MIN_POSITIVE);
     let mut max_abs = 0.0_f64;
     let mut sum_abs = 0.0_f64;
     let mut sum_sq = 0.0_f64;
@@ -1446,7 +1446,16 @@ pub fn composition_defect(
         sum_abs += a;
         sum_sq += d * d;
         if max_var > 0.0 {
-            let z = a / calibrated_variance[i].max(var_floor).sqrt();
+            // Studentize by this point's own variance. With none, a nonzero
+            // defect is infinitely many standard errors out and a zero one is none.
+            let variance = calibrated_variance[i];
+            let z = if variance > 0.0 {
+                a / variance.sqrt()
+            } else if a > 0.0 {
+                f64::INFINITY
+            } else {
+                0.0
+            };
             max_z = max_z.max(z);
         }
     }

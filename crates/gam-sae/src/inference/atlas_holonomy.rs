@@ -973,8 +973,7 @@ impl GaussianPcaErrorModel {
         let scale = covariance
             .iter()
             .map(|value| value.abs())
-            .fold(0.0_f64, f64::max)
-            .max(f64::MIN_POSITIVE);
+            .fold(0.0_f64, f64::max);
         let backward_error = f64::EPSILON * dimension.max(1) as f64 * scale;
         let mut symmetric = covariance;
         for row in 0..dimension {
@@ -1284,8 +1283,7 @@ impl GaussBonnetNoiseSource {
         let scale = covariance
             .iter()
             .map(|value| value.abs())
-            .fold(0.0_f64, f64::max)
-            .max(f64::MIN_POSITIVE);
+            .fold(0.0_f64, f64::max);
         let backward_error = f64::EPSILON * rows as f64 * scale;
         let mut symmetric = covariance.clone();
         for i in 0..rows {

@@ -187,8 +187,9 @@ pub fn fit_attention_kernel(
     let separable_width = 1 + 2 * max_harmonic;
     let params_separable = (separable_width * separable_width) as f64;
     let bic = |sse: f64, params: f64| -> f64 {
-        let mean_sq = (sse / n_obs).max(f64::MIN_POSITIVE);
-        n_obs * mean_sq.ln() + params * n_obs.ln()
+        // An exact fit's `ln 0 = −∞` ranks it below every inexact one, and two
+        // exact fits tie, which keeps the stationary kernel.
+        n_obs * (sse / n_obs).ln() + params * n_obs.ln()
     };
     let is_stationary =
         bic(stationary.sse, params_stationary) <= bic(separable.sse, params_separable);

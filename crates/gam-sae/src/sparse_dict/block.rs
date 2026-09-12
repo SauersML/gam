@@ -1824,7 +1824,12 @@ pub(super) fn frame_fixed_point_residual(
 pub(super) fn relative_scalar_change(previous: f32, current: f32) -> f64 {
     let previous = previous as f64;
     let current = current as f64;
-    (current - previous).abs() / previous.abs().max(current.abs()).max(f64::MIN_POSITIVE)
+    let scale = previous.abs().max(current.abs());
+    // Two zeros are no change; any other pair has a positive scale.
+    if scale == 0.0 {
+        return 0.0;
+    }
+    (current - previous).abs() / scale
 }
 
 #[derive(Clone)]
