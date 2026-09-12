@@ -1,13 +1,19 @@
-//! Finite differences of the production joint-penalty multinomial Laplace criterion.
+//! Finite differences of the production joint-penalty multinomial Laplace criterion,
+//! and the terminal certificate of the Jeffreys-armed fit on the same fixture (#2898).
 //! Joint rho coordinates travel in the penalty bundle; block-local rho is empty.
 
 use gam_custom_family::{
     BlockwiseFitOptions, CustomFamilyHyperLayout, evaluate_custom_family_joint_hyper,
+    fit_custom_family_with_rho_prior,
 };
 use gam_models::MultinomialFamily;
-use gam_problem::{EvalMode, HessianValue, PenaltyMatrix};
+use gam_problem::{EvalMode, HessianValue, PenaltyMatrix, RhoPrior};
 use ndarray::{Array1, Array2, array};
 use std::sync::Arc;
+
+/// Entrywise resolution at which the analytic outer Hessian is checked against a
+/// central difference of the analytic gradient.
+const HESSIAN_RELATIVE_TOLERANCE: f64 = 2e-4;
 
 fn quasi_separated_family(armed: bool) -> MultinomialFamily {
     let n = 90;
@@ -38,17 +44,21 @@ fn quasi_separated_family(armed: bool) -> MultinomialFamily {
         .with_joint_jeffreys_term(armed)
 }
 
-fn check_outer_derivatives(armed: bool) {
-    faer::set_global_parallelism(faer::Par::rayon(0));
-    let family = quasi_separated_family(armed);
-    let specs = family.build_block_specs();
-    let options = BlockwiseFitOptions {
+fn laplace_options() -> BlockwiseFitOptions {
+    BlockwiseFitOptions {
         inner_tol: 1e-10,
         use_remlobjective: true,
         use_outer_hessian: true,
         compute_covariance: false,
         ..BlockwiseFitOptions::default()
-    };
+    }
+}
+
+fn check_outer_derivatives(armed: bool) {
+    faer::set_global_parallelism(faer::Par::rayon(0));
+    let family = quasi_separated_family(armed);
+    let specs = family.build_block_specs();
+    let options = laplace_options();
     let layout = CustomFamilyHyperLayout::new(vec![vec![]; specs.len()], vec![], Array1::zeros(0))
         .expect("rho-only layout");
     let joint_specs = Arc::new(family.equivariant_class_penalty_specs().expect("class-function penalties"));
@@ -92,11 +102,36 @@ fn check_outer_derivatives(armed: bool) {
             for row in 0..dimension {
                 let fd = (plus.gradient[row] - minus.gradient[row]) / (2.0 * h);
                 let analytic = hessian[[row, axis]];
-                assert!((analytic - fd).abs() <= 2e-4 * (1.0 + analytic.abs().max(fd.abs())),
+                assert!((analytic - fd).abs() <= HESSIAN_RELATIVE_TOLERANCE * (1.0 + analytic.abs().max(fd.abs())),
                     "armed={armed}, rho={rho:?}, Hessian ({row},{axis}): analytic={analytic}, FD={fd}");
             }
         }
     }
+}
+
+/// The dense exact outer Hessian at one fixed joint rho.
+fn outer_hessian_at(family: &MultinomialFamily, rho: &Array1<f64>) -> Array2<f64> {
+    let specs = family.build_block_specs();
+    let layout = CustomFamilyHyperLayout::new(vec![vec![]; specs.len()], vec![], Array1::zeros(0))
+        .expect("rho-only layout");
+    let joint_specs = Arc::new(family.equivariant_class_penalty_specs().expect("class-function penalties"));
+    let total_p = specs.iter().map(|spec| spec.design.ncols()).sum();
+    let options = BlockwiseFitOptions {
+        joint_penalties: Some(Arc::new(
+            gam_problem::JointPenaltyBundle::new(joint_specs, rho.to_vec(), total_p)
+                .expect("finite joint penalty strengths"),
+        )),
+        ..laplace_options()
+    };
+    let evaluation = evaluate_custom_family_joint_hyper(
+        family, &specs, &options, &Array1::zeros(0), &layout, None, EvalMode::ValueGradientHessian,
+    )
+    .expect("converged fixed joint-rho Laplace mode");
+    assert!(evaluation.inner_converged);
+    let HessianValue::Dense(hessian) = &evaluation.outer_hessian else {
+        panic!("small multinomial must supply dense exact outer curvature");
+    };
+    hessian.clone()
 }
 
 #[test]
@@ -107,4 +142,70 @@ fn unaugmented_outer_gradient_and_hessian_match_the_criterion() {
 #[test]
 fn jeffreys_outer_gradient_and_hessian_match_the_criterion() {
     check_outer_derivatives(true);
+}
+
+/// #2898: the terminal certificate of a Jeffreys-armed fit prices the exact
+/// Jeffreys curvature.
+///
+/// `fit_custom_family` searches gradient-only and keeps the exact outer Hessian
+/// declared, so the mint evaluates `ValueGradientHessian` at the selected point
+/// (#2359). On this armed family that evaluation carries the order-five Jeffreys
+/// pieces, `D²H_Φ` and the completion's pair correction, through the third
+/// information derivative; `jeffreys_outer_gradient_and_hessian_match_the_criterion`
+/// checks their exactness. The certificate must admit the point on that measured
+/// curvature (`curvature_source=terminal-analytic`). At the certified rho the armed
+/// outer Hessian must also differ from the unarmed one by more than the exactness
+/// check's resolution: otherwise the conditioning gate has switched the term off
+/// there, and the verdict says nothing about the Jeffreys curvature.
+#[test]
+fn armed_fit_certifies_on_the_exact_jeffreys_outer_hessian_2898() {
+    faer::set_global_parallelism(faer::Par::rayon(0));
+    let family = quasi_separated_family(true);
+    let specs = family.build_block_specs();
+    let options = BlockwiseFitOptions {
+        // The production formula route pins its seed instead of screening
+        // (`fit_penalized_multinomial_formula`, #715).
+        screen_initial_rho: false,
+        ..laplace_options()
+    };
+    let fit = fit_custom_family_with_rho_prior(&family, &specs, &options, RhoPrior::Flat)
+        .expect("the armed quasi-separated multinomial fit must certify");
+    let certificate = fit
+        .artifacts
+        .criterion_certificate
+        .as_ref()
+        .expect("a certified outer optimum carries its criterion certificate");
+    let rho_hat = fit
+        .artifacts
+        .joint_log_lambdas
+        .clone()
+        .expect("a joint-penalty fit publishes its selected joint rho");
+    eprintln!(
+        "armed fit: outer_iterations={} rho_hat={rho_hat:?} certificate={certificate:?}",
+        fit.outer_iterations
+    );
+    assert!(
+        matches!(
+            certificate.curvature_verdict(),
+            gam_solve::model_types::CurvatureAdmissibility::Admissible
+                | gam_solve::model_types::CurvatureAdmissibility::CriterionContradicted
+        ),
+        "the mint must admit the selected point on the exact outer Hessian it measured \
+         there, not on unspent or unavailable curvature: {certificate:?}"
+    );
+    assert_eq!(rho_hat.len(), family.joint_smoothing_dimension());
+    let armed = outer_hessian_at(&family, &rho_hat);
+    let unarmed = outer_hessian_at(&quasi_separated_family(false), &rho_hat);
+    let largest_relative_gap = armed
+        .iter()
+        .zip(unarmed.iter())
+        .map(|(a, u)| (a - u).abs() / (1.0 + a.abs().max(u.abs())))
+        .fold(0.0_f64, f64::max);
+    eprintln!("largest_relative_gap={largest_relative_gap:.6e} armed={armed:?} unarmed={unarmed:?}");
+    assert!(
+        largest_relative_gap > HESSIAN_RELATIVE_TOLERANCE,
+        "at the certified rho the Jeffreys term must move the outer Hessian by more than the \
+         {:e} resolution of the exactness check: largest relative gap {largest_relative_gap:e}",
+        HESSIAN_RELATIVE_TOLERANCE,
+    );
 }
