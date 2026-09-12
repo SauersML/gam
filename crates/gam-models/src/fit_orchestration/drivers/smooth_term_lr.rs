@@ -213,18 +213,17 @@ impl PartialEq for SmoothLrSelectionReplay {
 /// `p = 0.05`, and the measured control-variate standard error on the fixtures
 /// is between one and two orders below it. It is measured and published per
 /// query rather than assumed, so a caller never has to take this number on
-/// trust — and the cost is one `N × G` reduction per term, `~40 ms`.
+/// trust — and the cost is one certified 1-D global search per draw on the
+/// common-scale lane.
 const SMOOTH_LR_SELECTION_DRAWS: usize = 4096;
 
-/// Grid resolution of the replay's own `argmin` over `ln t`.
+/// Resolution floor of the MULTI-SCALE lane's descent in `ln t`.
 ///
-/// The criterion is smooth in `ln t` and the statistic is smooth in the selected
-/// `t`, so the grid only has to resolve the criterion's minimizer to a fraction
-/// of the scale on which `W` changes. `0.05` in `ln t` is a 5% change in `λ`,
-/// which moves `w_k = 1 − (tν_k/(1+tν_k))²` by at most `0.025` in the worst
-/// direction and much less in every other. The span is the solver's own `ρ` box
-/// translated to the fitted point, so the replay never selects a `λ` the fit
-/// could not have.
+/// The common-scale lane no longer reads it: each of its draws selects the
+/// certified global minimum of a closed-form criterion. `0.05` in `ln t` is a 5%
+/// change in `λ`, which moves `w_k = 1 − (tν_k/(1+tν_k))²` by at most `0.025` in
+/// the worst direction. The multi-scale lane's grid bracket and capped compass
+/// descent are still a SPEC rule 18/19 violation (#2902, table row 4).
 const SMOOTH_LR_SELECTION_LOG_STEP: f64 = 0.05;
 
 /// Total points the multi-scale BRACKET may spend, whatever `m` is.
@@ -949,6 +948,11 @@ pub enum SmoothLrSelectionDecline {
     /// A grid point could not be evaluated, so the replay would have been taken
     /// over a grid with a hole in it. Refused whole rather than sampled partial.
     GridRefused,
+    /// A draw's certified global minimization of its criterion could not resolve
+    /// the criterion's stationary structure, or the criterion was not evaluable
+    /// inside the window, so that draw has no selection. Refused whole rather
+    /// than sampled partial.
+    SelectionUnresolved,
 }
 
 impl SmoothLrSelectionDecline {
@@ -960,7 +964,209 @@ impl SmoothLrSelectionDecline {
             SmoothLrSelectionDecline::GeometryRefused => "geometry_refused",
             SmoothLrSelectionDecline::WindowClosed => "window_closed",
             SmoothLrSelectionDecline::GridRefused => "grid_refused",
+            SmoothLrSelectionDecline::SelectionUnresolved => "selection_unresolved",
         }
+    }
+}
+
+/// One draw's COMMON-SCALE criterion in `u = ln t`, diagonal in the fitted
+/// eigenbasis `ν_j = eig T(1)`:
+///
+/// ```text
+/// C(u) = Σ_j c_j² s_j(u) + Σ_j ln(1 + e^u ν_j) − r·u − Σ_{j<r} ln ν_j,
+/// s_j(u) = e^u ν_j / (1 + e^u ν_j),
+/// ```
+///
+/// with `c_j²` the draw's squared coordinates and `r` the structural rank (the
+/// log-determinant runs over EVERY direction: an unpenalized one has `ν = 0` and
+/// carries `ln 1 = 0`). With `g_j = s_j(1 − s_j)` every derivative is closed
+/// form,
+///
+/// ```text
+/// C′ = Σ_j c_j² g_j + Σ_j s_j − r,
+/// C″ = Σ_j c_j² g_j(1 − 2s_j) + Σ_j g_j,
+/// C‴ = Σ_j c_j² g_j(1 − 6s_j + 6s_j²) + Σ_j g_j(1 − 2s_j),
+/// ```
+///
+/// and every `s_j` increases with `u`, so a cell's derivative and curvature ranges
+/// follow from its two endpoint shares and the stationary points of the share
+/// polynomials (`g` peaks at `s = ½`, `g(1 − 2s)` is extremal at
+/// `s = (3 ∓ √3)/6`). That is what lets the replay take each draw's selection as
+/// the certified global minimum of its criterion over the window,
+/// through [`gam_math::score_opt::maximize_score_1d`].
+struct CommonScaleCriterion<'a> {
+    squares: &'a [f64],
+    generalized: &'a [f64],
+    rank: usize,
+    constant: f64,
+}
+
+/// Range of `f` over the share interval `[lo, hi]`, from its endpoints and the
+/// listed stationary points that fall inside it.
+fn share_polynomial_range(lo: f64, hi: f64, f: impl Fn(f64) -> f64, stationary: &[f64]) -> (f64, f64) {
+    let (at_lo, at_hi) = (f(lo), f(hi));
+    let mut range = (at_lo.min(at_hi), at_lo.max(at_hi));
+    for &point in stationary {
+        if lo <= point && point <= hi {
+            let value = f(point);
+            range = (range.0.min(value), range.1.max(value));
+        }
+    }
+    range
+}
+
+impl CommonScaleCriterion<'_> {
+    /// `[C, C′, C″, C‴]` at `u`, and the forward-error band of `C` (Higham's
+    /// accumulation bound over its summands). `None` when `e^u ν_j` overflows.
+    fn jet(&self, log_t: f64) -> Option<([f64; 4], f64)> {
+        let t = log_t.exp();
+        if !t.is_finite() {
+            return None;
+        }
+        let rank = self.rank as f64;
+        let mut value = -rank * log_t - self.constant;
+        let mut magnitude = (rank * log_t).abs() + self.constant.abs();
+        let (mut first, mut second, mut third) = (-rank, 0.0_f64, 0.0_f64);
+        for (&square, &nu) in self.squares.iter().zip(self.generalized.iter()) {
+            let scaled = t * nu;
+            if !scaled.is_finite() {
+                return None;
+            }
+            let share = scaled / (1.0 + scaled);
+            let spread = share * (1.0 - share);
+            let log_term = scaled.ln_1p();
+            value += square * share + log_term;
+            magnitude += (square * share).abs() + log_term.abs();
+            first += square * spread + share;
+            second += square * spread * (1.0 - 2.0 * share) + spread;
+            third += square * spread * (1.0 - 6.0 * share + 6.0 * share * share)
+                + spread * (1.0 - 2.0 * share);
+        }
+        let band = gam_linalg::roundoff::accumulation_band(4 * self.squares.len() + 2, magnitude);
+        Some(([value, first, second, third], band))
+    }
+
+    /// Outer ranges of `C′` and `C″` over `[a, b]`, each widened by its own
+    /// forward-error band so rounding of the endpoint shares cannot shrink them.
+    fn derivative_ranges(
+        &self,
+        a: f64,
+        b: f64,
+    ) -> Option<(gam_math::score_opt::ClosedInterval, gam_math::score_opt::ClosedInterval)> {
+        let (t_a, t_b) = (a.exp(), b.exp());
+        if !(t_a.is_finite() && t_b.is_finite()) {
+            return None;
+        }
+        let root_three = 3.0_f64.sqrt();
+        let spread_stationary = [0.5_f64];
+        let skew_stationary = [(3.0 - root_three) / 6.0, (3.0 + root_three) / 6.0];
+        let rank = self.rank as f64;
+        let (mut first_lo, mut first_hi) = (-rank, -rank);
+        let (mut second_lo, mut second_hi) = (0.0_f64, 0.0_f64);
+        let (mut first_magnitude, mut second_magnitude) = (rank, 0.0_f64);
+        for (&square, &nu) in self.squares.iter().zip(self.generalized.iter()) {
+            let (scaled_a, scaled_b) = (t_a * nu, t_b * nu);
+            if !(scaled_a.is_finite() && scaled_b.is_finite()) {
+                return None;
+            }
+            let share_lo = scaled_a / (1.0 + scaled_a);
+            let share_hi = scaled_b / (1.0 + scaled_b);
+            let (spread_lo, spread_hi) =
+                share_polynomial_range(share_lo, share_hi, |s| s * (1.0 - s), &spread_stationary);
+            let (skew_lo, skew_hi) = share_polynomial_range(
+                share_lo,
+                share_hi,
+                |s| s * (1.0 - s) * (1.0 - 2.0 * s),
+                &skew_stationary,
+            );
+            first_lo += square * spread_lo + share_lo;
+            first_hi += square * spread_hi + share_hi;
+            second_lo += square * skew_lo + spread_lo;
+            second_hi += square * skew_hi + spread_hi;
+            first_magnitude += square * spread_hi.abs().max(spread_lo.abs()) + share_hi.abs();
+            second_magnitude += square * skew_hi.abs().max(skew_lo.abs()) + spread_hi.abs();
+        }
+        let terms = 4 * self.squares.len() + 1;
+        let first_band = gam_linalg::roundoff::accumulation_band(terms, first_magnitude);
+        let second_band = gam_linalg::roundoff::accumulation_band(terms, second_magnitude);
+        Some((
+            gam_math::score_opt::ClosedInterval::new(first_lo - first_band, first_hi + first_band),
+            gam_math::score_opt::ClosedInterval::new(
+                second_lo - second_band,
+                second_hi + second_band,
+            ),
+        ))
+    }
+
+    /// The statistic `W(u) = Σ_j c_j² w_j`, `w_j = 2f̄_j − f̄_j²` with `f̄ = 1 − s`.
+    fn statistic(&self, log_t: f64) -> f64 {
+        let t = log_t.exp();
+        self.squares
+            .iter()
+            .zip(self.generalized.iter())
+            .map(|(&square, &nu)| {
+                let scaled = t * nu;
+                let share = if scaled.is_finite() {
+                    scaled / (1.0 + scaled)
+                } else {
+                    1.0
+                };
+                let shrinkage = 1.0 - share;
+                square * (2.0 * shrinkage - shrinkage * shrinkage)
+            })
+            .sum()
+    }
+
+    /// The certified global minimizer of `C` over `[low, high]`: every cell of the
+    /// window is derivative-excluded, stationary-isolated to `√ε` in `ln t`, or
+    /// proved dominated, by the workspace's certified 1-D search on `−C`.
+    fn select(&self, low: f64, high: f64) -> Result<f64, String> {
+        use gam_math::score_opt::{
+            ClosedInterval, DerivativeEnclosure, ScoreJet, ScoreSample, ScoreValueEnclosure,
+        };
+        let search = gam_math::score_opt::maximize_score_1d(
+            low,
+            high,
+            f64::EPSILON.sqrt(),
+            |log_t| {
+                self.jet(log_t)
+                    .map(|([value, first, second, third], _)| ScoreJet {
+                        value: -value,
+                        derivative: -first,
+                        curvature: -second,
+                        third: -third,
+                    })
+                    .ok_or_else(|| format!("criterion not evaluable at ln t = {log_t}"))
+            },
+            |left: ScoreSample, right: ScoreSample| {
+                let (first, second) = self
+                    .derivative_ranges(left.x, right.x)
+                    .ok_or_else(|| format!("criterion not evaluable on [{}, {}]", left.x, right.x))?;
+                let band_left = self.jet(left.x).map(|(_, band)| band);
+                let band_right = self.jet(right.x).map(|(_, band)| band);
+                let (Some(band_left), Some(band_right)) = (band_left, band_right) else {
+                    return Err(format!("criterion not evaluable on [{}, {}]", left.x, right.x));
+                };
+                let evaluation_error = band_left.max(band_right);
+                // Mean-value bound from either endpoint: the exact score over the
+                // cell stays within `max|C′|·width` of both endpoint values.
+                let slope = first.lo.abs().max(first.hi.abs());
+                let reach = slope * (right.x - left.x) + evaluation_error;
+                Ok(DerivativeEnclosure {
+                    score: ScoreValueEnclosure {
+                        value: ClosedInterval::new(
+                            left.value.min(right.value) - reach,
+                            left.value.max(right.value) + reach,
+                        ),
+                        evaluation_error,
+                    },
+                    derivative: ClosedInterval::new(-first.hi, -first.lo),
+                    curvature: ClosedInterval::new(-second.hi, -second.lo),
+                })
+            },
+        )
+        .map_err(|error| format!("{error:?}"))?;
+        Ok(search.optimum.x)
     }
 }
 
@@ -1072,17 +1278,20 @@ impl SmoothLrSelectionReplay {
     ///
     /// This is the whole selection when the term has one penalty, and it is the
     /// honest fallback when it has more scales than
-    /// [`SMOOTH_LR_SELECTION_MAX_SCALES`] — where an `m`-dimensional grid inside
-    /// the budget would space its axes about `15` apart in `ln λ`, which is not a
-    /// selection, it is a coin toss.
+    /// [`SMOOTH_LR_SELECTION_MAX_SCALES`].
     ///
     /// Under a common scale `T(t) = t·T(1)`, so the eigenBASIS does not move and
-    /// the whole grid is diagonal in one decomposition: the per-point cost is
-    /// `O(q)` rather than `O(q³)`, which is what pays for the finer `ln t` step.
-    /// The log-determinant is exact in closed form for the same reason —
+    /// each draw's criterion is diagonal in one decomposition, with closed-form
+    /// derivatives of every order ([`CommonScaleCriterion`]). The
+    /// log-determinant is exact in closed form for the same reason —
     /// `log|T(t)|₊ = rank·ln t + log|T(1)|₊` — so the only quantity that has to
     /// be priced carefully is the `t`-free constant, and it is, through the
     /// stacked roots at the fitted point.
+    ///
+    /// Each draw's selection is the certified GLOBAL minimum of its criterion
+    /// over the window (SPEC rule 18: never the best node of a grid). A draw whose
+    /// stationary structure the certified search cannot resolve declines the
+    /// whole replay rather than being sampled partially.
     fn generate_common_scale(
         geometry: &SelectionGeometry,
         log_scale_windows: &[(f64, f64)],
@@ -1119,73 +1328,26 @@ impl SmoothLrSelectionReplay {
             .map(|nu| nu.ln())
             .sum();
 
-        let steps = (((high - low) / SMOOTH_LR_SELECTION_LOG_STEP).ceil() as usize).max(1);
-        // The fitted point is an explicit extra node. It has to be there twice
-        // over: the SELECTION must be able to choose the scale the fit chose —
-        // for the observed data it IS that scale, by construction — and the
-        // control variate's conditional arm is read there, not at whichever node
-        // happens to be nearest.
-        let mut log_grid: Vec<f64> = (0..=steps)
-            .map(|step| low + (high - low) * (step as f64) / (steps as f64))
-            .collect();
-        log_grid.push(0.0);
-        let fitted_index = log_grid.len() - 1;
-
         let dimension = geometry.dimension;
-        // Draws first, then ONE pass per grid point carrying a running argmin,
-        // rather than one pass per draw over the whole grid: the grid's share
-        // and weight vectors are then read once each per point instead of once
-        // per (draw, point), and nothing but `draws` scalars is retained.
-        let mut squares = vec![0.0_f64; draws * dimension];
-        let mut row = vec![0.0_f64; dimension];
+        let mut squares = vec![0.0_f64; dimension];
         let mut stream = SelectionDrawStream::new(dimension, draws);
-        for draw in 0..draws {
-            stream.fill_chi_square_ones(&mut row);
-            squares[draw * dimension..(draw + 1) * dimension].copy_from_slice(&row);
-        }
-
-        let mut best_criterion = vec![f64::INFINITY; draws];
         let mut selection_sample = vec![0.0_f64; draws];
         let mut conditional_sample = vec![0.0_f64; draws];
-        let mut share = vec![0.0_f64; dimension];
-        let mut weight = vec![0.0_f64; dimension];
-        for (index, &log_t) in log_grid.iter().enumerate() {
-            let t = log_t.exp();
-            // `log|I + tT(1)|`, over EVERY direction: an unpenalized one carries
-            // `log(1 + 0) = 0` and is neither special-cased nor dropped.
-            let mut log_det_hessian = 0.0_f64;
-            for (column, &nu) in generalized.iter().enumerate() {
-                let scaled = t * nu;
-                let fraction = if scaled.is_finite() {
-                    scaled / (1.0 + scaled)
-                } else {
-                    1.0
-                };
-                share[column] = fraction;
-                let shrinkage = 1.0 - fraction;
-                weight[column] = 2.0 * shrinkage - shrinkage * shrinkage;
-                log_det_hessian += scaled.ln_1p();
-            }
-            // `log|T(t)|₊ = rank·ln t + Σ_{j < rank} ln ν_j`, over the STRUCTURAL
-            // rank. Deciding that index set by `ν_j > 0` is what put a spurious
-            // `−ln t` per roundoff-positive null direction into the criterion.
-            let determinant = log_det_hessian - (geometry.rank as f64 * log_t + constant);
-            for draw in 0..draws {
-                let coordinates = &squares[draw * dimension..(draw + 1) * dimension];
-                let mut criterion = determinant;
-                let mut statistic = 0.0_f64;
-                for column in 0..dimension {
-                    criterion += coordinates[column] * share[column];
-                    statistic += coordinates[column] * weight[column];
-                }
-                if criterion < best_criterion[draw] {
-                    best_criterion[draw] = criterion;
-                    selection_sample[draw] = statistic;
-                }
-                if index == fitted_index {
-                    conditional_sample[draw] = statistic;
-                }
-            }
+        for draw in 0..draws {
+            stream.fill_chi_square_ones(&mut squares);
+            let criterion = CommonScaleCriterion {
+                squares: &squares,
+                generalized: &generalized,
+                rank: geometry.rank,
+                constant,
+            };
+            let Ok(selected) = criterion.select(low, high) else {
+                return SmoothLrSelection::Declined(SmoothLrSelectionDecline::SelectionUnresolved);
+            };
+            selection_sample[draw] = criterion.statistic(selected);
+            // The control variate's conditional arm is read AT the fitted scale,
+            // `ln t = 0`, on the same draw.
+            conditional_sample[draw] = criterion.statistic(0.0);
         }
         SmoothLrSelection::Replayed(Self {
             generalized: ascending(generalized),
@@ -1218,9 +1380,10 @@ impl SmoothLrSelectionReplay {
     /// ordering is that the missing dimensions matter more than anything else
     /// measured on this issue.
     ///
-    /// Each axis carries its OWN window. The reachable set for scale `i` is
-    /// `ln t_i ∈ [−RHO_BOUND − ρ̂_i, RHO_BOUND − ρ̂_i]`, and those `m` intervals
-    /// are only equal when the `m` fitted scales are. Handing this grid the
+    /// Each axis carries its OWN window. The reachable set for scale `i` is its
+    /// #2812 resolvability interval translated to the fitted point,
+    /// `ln t_i ∈ [lo_i − ρ̂_i, hi_i − ρ̂_i]`, and those `m` intervals are only equal
+    /// when the `m` components' spectra and fitted scales are. Handing this grid the
     /// COMMON-shift intersection — which is what it used to receive — truncates
     /// every axis to the narrowest one and empties the whole replay as soon as
     /// one `λ̂` rails, which for a null-true double-penalty smooth is the normal
@@ -3459,10 +3622,11 @@ mod profiled_scale_reference_tests {
 #[cfg(test)]
 mod selection_replay_tests {
     use super::{
-        MultiscaleBudget, SMOOTH_LR_SELECTION_DRAWS, SMOOTH_LR_SELECTION_GRID_BUDGET,
-        SMOOTH_LR_SELECTION_MAX_SCALES, SMOOTH_LR_SELECTION_REFINE_FLOOR,
-        SMOOTH_LR_SELECTION_REFINE_MAX_EVALUATIONS, SelectionFactor, SelectionGeometry,
-        SmoothLrSelection, SmoothLrSelectionDecline, SmoothLrSelectionReplay,
+        CommonScaleCriterion, MultiscaleBudget, SMOOTH_LR_SELECTION_DRAWS,
+        SMOOTH_LR_SELECTION_GRID_BUDGET, SMOOTH_LR_SELECTION_MAX_SCALES,
+        SMOOTH_LR_SELECTION_REFINE_FLOOR, SMOOTH_LR_SELECTION_REFINE_MAX_EVALUATIONS,
+        SelectionFactor, SelectionGeometry, SmoothLrSelection, SmoothLrSelectionDecline,
+        SmoothLrSelectionReplay,
     };
     use ndarray::Array2;
 
@@ -3470,6 +3634,70 @@ mod selection_replay_tests {
     /// see and a geometric tail the penalty has taken.
     fn spectrum() -> Vec<f64> {
         vec![0.3_f64, 1.0, 4.0, 20.0, 120.0, 900.0]
+    }
+
+    /// The common-scale criterion's closed-form jet against central differences
+    /// of itself, its cell ranges against interior point derivatives, and the
+    /// certified selection a value-local minimum no sampled point undercuts.
+    #[test]
+    fn common_scale_criterion_jet_enclosure_and_selection_agree_2902() {
+        let generalized = spectrum();
+        let squares = [1.7_f64, 0.2, 3.1, 0.05, 2.2, 0.9];
+        let constant: f64 = generalized.iter().map(|nu| nu.ln()).sum();
+        let criterion = CommonScaleCriterion {
+            squares: &squares,
+            generalized: &generalized,
+            rank: generalized.len(),
+            constant,
+        };
+        let jet = |u: f64| criterion.jet(u).expect("evaluable jet").0;
+        let step = 1.0e-5;
+        for u in [-3.0_f64, 0.0, 2.5] {
+            let [_, first, second, third] = jet(u);
+            let (up, down) = (jet(u + step), jet(u - step));
+            for (order, analytic, difference) in [
+                (1, first, (up[0] - down[0]) / (2.0 * step)),
+                (2, second, (up[1] - down[1]) / (2.0 * step)),
+                (3, third, (up[2] - down[2]) / (2.0 * step)),
+            ] {
+                assert!(
+                    (analytic - difference).abs() <= 1.0e-5 * (1.0 + analytic.abs()),
+                    "u={u}: derivative of order {order} {analytic} vs central difference \
+                     {difference}"
+                );
+            }
+        }
+        let (cell_lo, cell_hi) = (-1.0_f64, 1.5_f64);
+        let (first_range, second_range) = criterion
+            .derivative_ranges(cell_lo, cell_hi)
+            .expect("evaluable cell");
+        for index in 0..=8 {
+            let u = cell_lo + (cell_hi - cell_lo) * index as f64 / 8.0;
+            let [_, first, second, _] = jet(u);
+            assert!(
+                first_range.lo <= first && first <= first_range.hi,
+                "C' {first} at u={u} escapes its cell range {first_range:?}"
+            );
+            assert!(
+                second_range.lo <= second && second <= second_range.hi,
+                "C'' {second} at u={u} escapes its cell range {second_range:?}"
+            );
+        }
+        let (low, high) = (-8.0_f64, 8.0_f64);
+        let selected = criterion.select(low, high).expect("certified selection");
+        assert!((low..=high).contains(&selected), "selection {selected} left the window");
+        let value = |u: f64| jet(u)[0];
+        let selected_value = value(selected);
+        for probe in [low, high, 0.0, selected - 1.0e-2, selected + 1.0e-2] {
+            if (low..=high).contains(&probe) {
+                assert!(
+                    selected_value <= value(probe) + 1.0e-9 * (1.0 + selected_value.abs()),
+                    "the certified selection {selected} (C={selected_value}) is undercut at \
+                     u={probe} (C={})",
+                    value(probe)
+                );
+            }
+        }
     }
 
     /// The geometry a bare generalized spectrum corresponds to: unit
