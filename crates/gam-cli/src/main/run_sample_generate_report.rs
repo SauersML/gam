@@ -813,7 +813,12 @@ pub(crate) fn run_report(args: ReportArgs) -> Result<(), String> {
                         .zip(pred.mean.iter())
                         .map(|(&yi, &pi)| (yi - pi).powi(2))
                         .sum();
-                    if ss_tot > 1e-15 {
+                    // A mean over `n` rows is resolved to `γ_{n+1}·max|y|`, so a total sum of
+                    // squares inside `γ_{n+1}²·Σy²` is the rounding residue of a constant
+                    // response, which has no variance to explain.
+                    let energy: f64 = y.iter().map(|&yi| yi * yi).sum();
+                    let band = gam::linalg::roundoff::accumulation_growth(y.len() + 1).powi(2) * energy;
+                    if ss_tot > band {
                         r_squared = Some(1.0 - ss_res / ss_tot);
                     }
                 }
@@ -1368,7 +1373,7 @@ fn report_family_residuals(
 /// Validate a discrete count response and convert it to `u64`.
 fn discrete_count_response(y: f64, family: &str) -> Result<u64, String> {
     let k = y.round();
-    if !(y.is_finite() && k >= 0.0 && (y - k).abs() <= 1e-8) {
+    if !(y.is_finite() && k >= 0.0 && y == k) {
         return Err(format!(
             "{family} response must be a nonnegative integer count, got {y}"
         ));

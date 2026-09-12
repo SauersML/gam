@@ -647,7 +647,7 @@ pub fn render_html(input: &ReportInput) -> Result<String, String> {
         .map(|c| {
             let se_str = c.std_error.map(|v| format!("{v:.6e}")).unwrap_or_else(|| "\u{2014}".to_string());
             let z_str = c.std_error
-                .filter(|&se| se.abs() > 1e-15)
+                .filter(|&se| se != 0.0)
                 .map(|se| format!("{:.3}", c.estimate / se))
                 .unwrap_or_else(|| "\u{2014}".to_string());
             format!(

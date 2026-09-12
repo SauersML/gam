@@ -85,7 +85,7 @@ pub(crate) fn load_prediction_id_values(
 }
 
 pub(crate) fn format_id_number(value: f64) -> String {
-    if (value - value.round()).abs() <= 1e-9 {
+    if value.fract() == 0.0 {
         format!("{value:.0}")
     } else {
         format!("{value:.12}")
