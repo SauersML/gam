@@ -1083,7 +1083,10 @@ pub(crate) fn orthonormal_completion(cols: &Array2<f64>) -> Array2<f64> {
             }
         }
         let nrm = norm(f.view());
-        if nrm > GEOMETRY_EPS {
+        // Two passes of `filled` projections (an `m`-term inner product and `m`
+        // subtractions each) and the `m`-term norm of a unit axis round by at
+        // most this growth factor; a residual inside it is an axis in the span.
+        if nrm > gam_linalg::roundoff::accumulation_growth(m * (4 * filled + 1)) {
             for i in 0..m {
                 basis[[i, filled]] = f[i] / nrm;
             }
