@@ -4691,7 +4691,7 @@ fn scan_log_lambda_domain(
 
 /// Fit with `log λ` selected by the concentrated diffuse REML criterion.
 /// Every stationary interval in the derived, scale-equivariant log-λ domain
-/// ([`scan_log_lambda_domain`]) is isolated using analytic derivatives and
+/// (`scan_log_lambda_domain`) is isolated using analytic derivatives and
 /// rigorous interval bounds; the two boundary/null-recovery candidates are
 /// evaluated exactly.
 pub fn fit_spline_scan(
