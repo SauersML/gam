@@ -62,22 +62,6 @@ pub struct RhoStepPlan {
     pub is_full_pass: bool,
 }
 
-impl RhoStepPlan {
-    /// Decide whether `row_id` is in this step's subsample, and if so return its
-    /// importance weight. A full pass includes every row at weight `1.0`.
-    #[inline]
-    pub fn includes(&self, row_id: u64) -> Option<f64> {
-        if self.is_full_pass {
-            return Some(1.0);
-        }
-        if row_in_fraction(row_id, self.fraction) {
-            Some(self.importance_weight)
-        } else {
-            None
-        }
-    }
-}
-
 /// Deterministic Bernoulli inclusion of `row_id` at the given `fraction`.
 ///
 /// Hashes `row_id` with the canonical `splitmix64` finalizer and includes the

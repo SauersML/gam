@@ -158,7 +158,7 @@ pub(crate) struct SparseDictIterate {
 /// Route + sparse-code every row of `x`, processing the rows in minibatches of
 /// `config.minibatch` so the peak score working set is `minibatch × score_tile`
 /// (never `N × K`). Within a minibatch the rows are routed by the shared
-/// [`TileScorer::route_minibatch_dispatch`] policy: GPU score-blocks when
+/// [`TileScorer`] dispatch policy: GPU score-blocks when
 /// admitted, otherwise the batched CPU GEMM router. The per-row active-set code
 /// solves run in parallel. The returned `Vec<SparseCode>` is in global row order,
 /// identical to a serial row-at-a-time pass up to f32 GEMM rounding.

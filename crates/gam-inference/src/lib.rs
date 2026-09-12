@@ -42,7 +42,6 @@ pub use gam_models::inference::{
 };
 pub use gam_terms::inference::formula_dsl;
 pub mod probability;
-pub use gam_sae::inference::probe_runner;
 pub mod quadrature;
 // `residual_factor` descended into gam-solve (#1521): the structured-residual
 // covariance estimator (#974) whose deps are all ≤ gam-solve (`gam_problem::RowMetric`

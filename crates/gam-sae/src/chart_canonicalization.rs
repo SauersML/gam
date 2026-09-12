@@ -154,9 +154,7 @@
 //! `1/cos lat` boost stays well-conditioned). The same exact-image-frozen LS
 //! decoder transport gates the commit: a boosted image only freezes to the
 //! recomposition floor inside a basis rich enough to absorb it, so a too-poor
-//! basis honestly refuses rather than silently altering the image. The
-//! round-sphere isometry DEFECT remains available as a standalone measurement
-//! (`sphere_chart_isometry_defect`).
+//! basis honestly refuses rather than silently altering the image.
 
 use faer::Side as FaerSide;
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
@@ -2652,9 +2650,9 @@ fn sphere_whitened_boost_row(theta: &[f64], t: [f64; 2]) -> Option<([f64; 4], [[
     }
 
     let (sin_lat_new, cos_lat_new) = moved_lat.sin_cos();
-    // Mirror the pole floor in `sphere_chart_isometry_defect`: at smaller
-    // `|cos(lat̃)|`, the longitudinal whitening row has no reliable metric
-    // content and the chart is honestly outside this coordinate patch.
+    // Pole floor: at smaller `|cos(lat̃)|`, the longitudinal whitening row has
+    // no reliable metric content and the chart is honestly outside this
+    // coordinate patch.
     const SPHERE_EVAL_COS_FLOOR: f64 = 1.0e-6;
     if !(cos_lat_new.is_finite() && cos_lat_new > SPHERE_EVAL_COS_FLOOR) {
         return None;
@@ -2885,132 +2883,6 @@ fn sphere_minimize_boost_defect(
         defect_initial,
         defect_final: state.defect,
     })
-}
-
-/// Scale-invariant isometry defect of a fitted `d = 2` **sphere** atom's
-/// `(lat, lon)` chart against the round-sphere reference metric (#1019 stage 2,
-/// sphere arm).
-///
-/// This is the certified objective the sphere flow-pin
-/// ([`sphere_isometry_flow_reparameterization`]) descends; it is also exposed
-/// on its own as the read-only acceptance measurement (the issue's "defect
-/// within 10% of optimum" quantity), so a chart that is already round-isometric
-/// (a true `O(3)` representative) scores `≈ 0` and a warped chart scores large.
-///
-/// # The defect functional
-///
-/// For the round sphere, the `(lat, lon)` chart's reference first fundamental
-/// form is `g_ref(lat) = diag(1, cos²lat)` (a unit-radius sphere; the lon
-/// circumference shrinks as `cos lat`). The fitted decoder's pullback metric at
-/// row `i` is `G_i = J(t_i)ᵀ J(t_i)` from the exact `(Φ, ∂Φ)` jet, exactly as
-/// in the torus path. The chart is isometric to the round sphere up to a global
-/// scale `c` iff `G_i ≡ c · g_ref(lat_i)` for all `i`. Measuring the residual
-/// with `c` analytically profiled (the exact argmin over the global scale),
-///
-/// ```text
-/// E = Σ_i ‖ Ĝ_i − c · ĝ_ref,i ‖²_F ,
-/// c = Σ_i ⟨Ĝ_i, ĝ_ref,i⟩_F / Σ_i ‖ĝ_ref,i‖²_F ,
-/// ```
-///
-/// where both metrics are normalized by the geometric-mean fitted metric scale
-/// `ḡ = exp(mean_i ½ log det G_i)` so the defect is scale-invariant (a chart
-/// isometric up to ANY global scale scores 0). The Frobenius norm on symmetric
-/// `2×2` matrices uses the `[m00, m11, m01]` storage with the off-diagonal
-/// weighted by 2 (matching the torus path).
-///
-/// Returns `None` on a degenerate chart (empty/non-finite, rank-deficient
-/// pullback metric anywhere, or a degenerate profiled scale) — an honest
-/// refusal, never a fabricated zero. The returned defect is the scale-invariant
-/// `E` above; `0` means the fitted chart is already a round-isometric `O(3)`
-/// representative.
-pub fn sphere_chart_isometry_defect(
-    evaluator: &dyn SaeBasisEvaluator,
-    decoder: ArrayView2<'_, f64>,
-    row_coords: ArrayView2<'_, f64>,
-) -> Result<Option<f64>, String> {
-    let n = row_coords.nrows();
-    let m = decoder.nrows();
-    let p = decoder.ncols();
-    if row_coords.ncols() != 2 {
-        return Err(format!(
-            "sphere_chart_isometry_defect: expected (n, 2) row coordinates; got {:?}",
-            row_coords.dim()
-        ));
-    }
-    if n == 0 || m == 0 || p == 0 {
-        return Ok(None);
-    }
-    for &t in row_coords.iter() {
-        if !t.is_finite() {
-            return Ok(None);
-        }
-    }
-
-    // Fitted pullback metric G_i = J(t_i)ᵀJ(t_i) from the exact jet — identical
-    // extraction to the torus / patch paths (axis 0 = lat, axis 1 = lon), via
-    // the shared helper. The sphere reference below differs (diag(1, cos²lat)
-    // vs flat I), so only the extraction is shared, not the normalization.
-    let Some((g_rows, g_bar)) = extract_pullback_metric_d2(
-        "sphere_chart_isometry_defect",
-        evaluator,
-        decoder,
-        row_coords,
-    )?
-    else {
-        return Ok(None);
-    };
-
-    // Reference metric ĝ_ref,i = diag(1, cos²lat_i) (round sphere, lat = axis 0).
-    // Both G and g_ref are normalized by ḡ; g_ref carries no fitted scale so the
-    // profiled `c` absorbs the absolute size. The reference's own determinant is
-    // cos²lat, which can vanish near the poles — guard it so a pole-adjacent row
-    // does not inject a degenerate reference direction.
-    let mut ghat: Vec<[f64; 3]> = Vec::with_capacity(n);
-    let mut gref: Vec<[f64; 3]> = Vec::with_capacity(n);
-    let mut gref_norm_sq = 0.0_f64;
-    let mut cross = 0.0_f64;
-    for (row, g) in g_rows.iter().enumerate() {
-        let lat = row_coords[[row, 0]];
-        let cos_lat = lat.cos();
-        let r11 = cos_lat * cos_lat;
-        // A pole-adjacent reference column (cos lat → 0) carries no transverse
-        // metric content; treating it as part of the defect would falsely
-        // reward squeezing the lon direction. Refuse charts sitting on the
-        // pole singularity rather than fabricate a defect there.
-        //
-        // NB: `cos(π/2)` is ~6.1e-17 in f64, not exactly 0, so an exactly-on-pole
-        // row gives `r11 = cos²lat ≈ 3.7e-33` — finite and strictly positive. A
-        // bare `r11 > 0.0` therefore lets it through. `lat` is itself resolved only
-        // to `ε·|lat|` and `|cos|` has unit slope at a pole, so a `|cos lat|` inside
-        // that band cannot be told apart from the pole and the row is refused.
-        if !(r11.is_finite() && cos_lat.abs() > f64::EPSILON * lat.abs()) {
-            return Ok(None);
-        }
-        let h = [g[0] / g_bar, g[1] / g_bar, g[2] / g_bar];
-        let r = [1.0_f64, r11, 0.0_f64];
-        cross += h[0] * r[0] + h[1] * r[1] + 2.0 * h[2] * r[2];
-        gref_norm_sq += r[0] * r[0] + r[1] * r[1] + 2.0 * r[2] * r[2];
-        ghat.push(h);
-        gref.push(r);
-    }
-    if !(gref_norm_sq.is_finite() && gref_norm_sq > 0.0) {
-        return Ok(None);
-    }
-    let c = cross / gref_norm_sq;
-    if !(c.is_finite() && c > 0.0) {
-        return Ok(None);
-    }
-    let mut defect = 0.0_f64;
-    for (h, r) in ghat.iter().zip(gref.iter()) {
-        let r00 = h[0] - c * r[0];
-        let r11 = h[1] - c * r[1];
-        let r01 = h[2] - c * r[2];
-        defect += r00 * r00 + r11 * r11 + 2.0 * r01 * r01;
-    }
-    if !defect.is_finite() {
-        return Ok(None);
-    }
-    Ok(Some(defect))
 }
 
 /// Total fitted turning `Θ = ∫ κ ds` of a `d = 1` atom's decoded curve (#1026).

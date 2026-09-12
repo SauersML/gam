@@ -275,15 +275,6 @@ impl TileScorer {
         }
     }
 
-    /// Top-`active` atoms for `row` against `decoder`.
-    pub fn route_row(
-        &self,
-        row: ArrayView1<'_, f32>,
-        decoder: ArrayView2<'_, f32>,
-    ) -> Vec<(u32, f32)> {
-        top_s_online(row, decoder, self.active, self.tile)
-    }
-
     /// Top-`active` atoms for every row of a minibatch `rows` (`B × P`) against
     /// `decoder` (`K × P`), scored a column tile at a time via a batched GEMM.
     ///
@@ -292,7 +283,7 @@ impl TileScorer {
     /// independent of `K`), and each tile is a single `(B × P)·(P × tile)`
     /// matrix multiply rather than `B × tile` scalar dot loops. The online
     /// top-`s` selector sees the atoms in the same global order as
-    /// `Self::route_row` (tile 0 first, ascending atom index). The GEMM
+    /// the row-at-a-time `top_s_online` (tile 0 first, ascending atom index). The GEMM
     /// contracts the same `P` terms but `matrixmultiply` may accumulate them in
     /// a blocked order, so the per-atom scores agree with the row-at-a-time path
     /// only to f32 rounding; where two atoms tie within that rounding the two
@@ -326,22 +317,6 @@ impl TileScorer {
             start = end;
         }
         selectors.into_iter().map(TopSSelector::finish).collect()
-    }
-
-    /// Top-`active` atoms for every row, using the sparse-dict CUDA score-block
-    /// router when the process-wide GPU mode admits it and the `rows × K` route
-    /// clears the device break-even. Auto mode never pays the slower GPU wrapper's
-    /// CPU fallback below break-even: it goes straight to the batched CPU GEMM
-    /// router above. Required mode is fail-closed and propagates the CUDA router's
-    /// error instead of silently routing on the CPU.
-    pub fn route_minibatch_dispatch(
-        &self,
-        rows: ArrayView2<'_, f32>,
-        decoder: ArrayView2<'_, f32>,
-    ) -> Result<Vec<Vec<(u32, f32)>>, String> {
-        Ok(self
-            .route_minibatch_with_mode(rows, decoder, gam_gpu::global_policy())?
-            .selections)
     }
 
     /// Top-`active` atoms for every row under an explicit GPU residency mode.

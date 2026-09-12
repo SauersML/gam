@@ -393,7 +393,7 @@ impl SparseDictStreamState {
     /// finalize: hand back the converged decoder and run metadata. The routing
     /// itself is not materialised here (a streamed corpus has no `N×s` object to
     /// return); route held-out or training shards back through
-    /// `super::sparse_dictionary_transform` against this decoder to encode them.
+    /// `super::sparse_dictionary_transform_with_mode` against this decoder to encode them.
     ///
     /// A fit object must only ever come from a converged optimization (SPEC 20):
     /// if the streaming loop has not met the convergence rule, this is a typed

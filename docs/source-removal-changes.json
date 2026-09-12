@@ -1969,5 +1969,42 @@
     ],
     "reason": "User directive 2026-09-11: delete code only tests use and code nothing uses. gam-problem OwnedCellValues (the whole enum with its dense, by_row, by_output, constant and constant_with_overrides constructors and accessors) had no consumer outside its own unit tests; OwnedSeparableCellMeasure::try_for_each_active was called only by its unit test, and IndexedCellSet::row_outputs only by that visitor and one test's assertions.",
     "evidence": "Re-confirmed at the tip with git grep -nw over crates src tests examples bench benches: OwnedCellValues was named only in indexed_response.rs and the gam-problem lib.rs re-export, and try_for_each_active and row_outputs had no caller outside indexed_response.rs. Removed with the four unit tests that exercised them and three row_outputs assertions in sparse_inclusion_and_exclusion_preserve_structural_geometry, whose remaining assertions are unchanged. Gates pass base..head; MSI verification at the pushed sha follows."
+  },
+  {
+    "base": "7dcf2c4447c21833040ac8f0cd12e9eab678d452",
+    "items": [
+      "crates/gam-sae/src/basis.rs:fn:function_space_gram",
+      "crates/gam-sae/src/basis.rs:fn:inner_width",
+      "crates/gam-sae/src/basis.rs:fn:nullspace_dimension",
+      "crates/gam-sae/src/basis.rs:fn:select_spherical_harmonic_degree",
+      "crates/gam-sae/src/chart_canonicalization.rs:fn:sphere_chart_isometry_defect",
+      "crates/gam-sae/src/corpus/designed_target.rs:fn:is_designed_subsample",
+      "crates/gam-sae/src/corpus/ledger_store.rs:const:STRUCTURE_CERTIFICATE_ALPHA",
+      "crates/gam-sae/src/corpus/rho_cascade.rs:fn:includes",
+      "crates/gam-sae/src/inference/intervention_shard.rs:fn:control_floor_nats",
+      "crates/gam-sae/src/inference/intervention_shard.rs:fn:eval_forever_split",
+      "crates/gam-sae/src/inference/intervention_shard.rs:struct:EvalForeverSplit",
+      "crates/gam-sae/src/inference/probe_runner.rs:const:PROBE_DESIGN_ALPHA",
+      "crates/gam-sae/src/inference/probe_runner.rs:const:PROBE_LATENT_STEP",
+      "crates/gam-sae/src/inference/probe_runner.rs:fn:absorb",
+      "crates/gam-sae/src/inference/probe_runner.rs:fn:candidate_steers",
+      "crates/gam-sae/src/inference/probe_runner.rs:fn:chart_extent_fourth_gain",
+      "crates/gam-sae/src/inference/probe_runner.rs:fn:claim_for_steer",
+      "crates/gam-sae/src/inference/probe_runner.rs:fn:design_next",
+      "crates/gam-sae/src/inference/probe_runner.rs:fn:most_contested_atom_claim",
+      "crates/gam-sae/src/inference/probe_runner.rs:fn:probe_objective",
+      "crates/gam-sae/src/inference/probe_runner.rs:fn:representative_anchor",
+      "crates/gam-sae/src/inference/probe_runner.rs:fn:steerable_atom",
+      "crates/gam-sae/src/inference/probe_runner.rs:struct:ProbeRunner",
+      "crates/gam-sae/src/inference/probe_runner.rs:struct:RealizedProbe",
+      "crates/gam-sae/src/migration_ledger.rs:fn:assert_no_pc_reseed",
+      "crates/gam-sae/src/migration_ledger.rs:fn:kind_code",
+      "crates/gam-sae/src/sparse_dict/mod.rs:fn:sparse_dictionary_transform",
+      "crates/gam-sae/src/sparse_dict/mod.rs:fn:trivially_converged",
+      "crates/gam-sae/src/sparse_dict/scoring.rs:fn:route_minibatch_dispatch",
+      "crates/gam-sae/src/sparse_dict/scoring.rs:fn:route_row"
+    ],
+    "reason": "user directive: delete all useless slop (only used by tests / unused)",
+    "evidence": "At 7dcf2c444, git grep -nw over crates, src, tests, examples, bench and benches found no caller of trivially_converged; sparse_dictionary_transform (the pyffi transform calls sparse_dictionary_transform_with_mode, and its \"sparse_dictionary_transform\" is a label string); TileScorer::route_row; TileScorer::route_minibatch_dispatch (named only by a doc link in sparse_dict/update.rs, now reworded); is_designed_subsample; STRUCTURE_CERTIFICATE_ALPHA (module doc only); RhoStepPlan::includes (no .includes( call in any Rust file); SaeMove::kind_code (examples/support_fit_dump.rs has an unrelated local closure of that name); sphere_chart_isometry_defect (module doc and one comment only); InterventionShard::eval_forever_split and control_floor_nats; select_spherical_harmonic_degree; function_space_gram, nullspace_dimension and inner_width. assert_no_pc_reseed was called only by its own #2023 test, which keeps its counter assertions under the same name. EvalForeverSplit was produced only by eval_forever_split. The inference::probe_runner module had no user anywhere: ProbeRunner and RealizedProbe occur only in their own file, and the module's other references were its mod declaration and a pub use in gam-inference/src/lib.rs, both removed; absorb, design_next and the private consts and helpers go with the file. Kept because they have live callers: sparse_dictionary_transform_with_mode (pyffi), top_s_online (bench, scoring_gpu), is_pc_reseed, inclusive_quantile, eval_forever_mask, row_in_fraction, extract_pullback_metric_d2. The test census reports no test loss. MSI verification (ban scanner, workspace --all-targets check, cargo doc -p gam-sae, guard and census) runs on the landed sha."
   }
 ]

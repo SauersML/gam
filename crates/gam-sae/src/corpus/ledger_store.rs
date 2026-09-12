@@ -18,8 +18,7 @@
 //!   killed-and-restarted discovery run loses compute, never validity.
 //! * **At the chosen stop**, the caller certifies:
 //!   `sae::identifiability::dictionary_report(model, &ledger, α)` pairs
-//!   the e-BH structure certificate with the residual-gauge report. The
-//!   default level is [`STRUCTURE_CERTIFICATE_ALPHA`].
+//!   the e-BH structure certificate with the residual-gauge report.
 //!
 //! # Keying
 //!
@@ -43,13 +42,6 @@ use gam_runtime::warm_start::{Fingerprint, Fingerprinter};
 use gam_terms::inference::structure_evidence::StructureLedger;
 use gam_terms::smooth::TermCollectionSpec;
 use std::time::Duration;
-
-/// The default level for the dictionary's e-BH structure certificate.
-/// 0.05 is the conventional reporting level for the certificate's FDR;
-/// the e-process machinery is level-agnostic (the ledger stores log
-/// e-values, and a consumer may certify at any α post hoc — that re-read
-/// is safe BECAUSE the entries are e-values).
-pub const STRUCTURE_CERTIFICATE_ALPHA: f64 = 0.05;
 
 /// On-disk budget for ledgers. Ledgers are tiny (a few floats per claim);
 /// 16 MiB holds thousands of candidate topologies' ledgers.

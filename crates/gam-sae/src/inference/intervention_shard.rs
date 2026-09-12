@@ -19,7 +19,7 @@
 //! ever, across refits. That only holds if the split is a *deterministic pure
 //! function of (group id, seed)* — independent of record order, of which other
 //! groups happen to be present, and of how many times the shard is reloaded.
-//! `InterventionShard::eval_forever_split` therefore hashes each group id
+//! [`eval_forever_mask`] therefore hashes each group id
 //! through SplitMix64 with the caller's seed and assigns by parity: adding new
 //! groups later can never move an existing group across the fence. The Python
 //! calibration driver consumes the plan produced here, so there is no second
@@ -56,15 +56,6 @@ pub struct InterventionShard {
     pub layer: i64,
     /// Seed of the sampling plan that produced the records.
     pub seed: u64,
-}
-
-/// The G2 manifest: which groups are train, which are eval-forever.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct EvalForeverSplit {
-    /// Groups the calibration fit may use. Sorted ascending, deduplicated.
-    pub train_groups: Vec<i64>,
-    /// Groups reserved for evaluation forever. Sorted ascending, deduplicated.
-    pub eval_groups: Vec<i64>,
 }
 
 /// The one production calibration model.  Keeping the model description next
@@ -218,8 +209,7 @@ fn splitmix64(x: u64) -> u64 {
 
 /// The G2 per-group predicate: group `g` is eval-forever under a split whose
 /// seed hashes to `seed_mix` iff `splitmix64(g ^ seed_mix)` is odd. The single
-/// place the split's membership is decided — shared by
-/// [`InterventionShard::eval_forever_split`] and [`eval_forever_mask`].
+/// place the split's membership is decided, called by [`eval_forever_mask`].
 #[inline]
 fn group_is_eval_forever(g: i64, seed_mix: u64) -> bool {
     splitmix64((g as u64) ^ seed_mix) & 1 == 1
@@ -539,66 +529,6 @@ impl InterventionShard {
     /// Number of records.
     pub fn n_records(&self) -> usize {
         self.row_id.len()
-    }
-
-    /// The G2 eval-forever split: each distinct group id goes to eval iff
-    /// `splitmix64(group_id ^ splitmix64(seed))` is odd. A pure per-group
-    /// function — record order, shard composition, and refit history cannot
-    /// move a group across the fence, which is what makes "eval forever" a
-    /// property of the *function* rather than of bookkeeping.
-    pub fn eval_forever_split(&self, seed: u64) -> EvalForeverSplit {
-        let mut train: Vec<i64> = Vec::new();
-        let mut eval: Vec<i64> = Vec::new();
-        let mut groups: Vec<i64> = self.group.clone();
-        groups.sort_unstable();
-        groups.dedup();
-        let seed_mix = splitmix64(seed);
-        for g in groups {
-            if group_is_eval_forever(g, seed_mix) {
-                eval.push(g);
-            } else {
-                train.push(g);
-            }
-        }
-        EvalForeverSplit {
-            train_groups: train,
-            eval_groups: eval,
-        }
-    }
-
-    /// Guard G3's measurement floor: the `q`-quantile (0 < q < 1, caller
-    /// supplies the same one-sided evidence quantile the certificates use) of
-    /// `nu_measured` over the Δt = 0 control records. Errors when the shard
-    /// carries no controls — a floor from zero controls would be a fabricated
-    /// number, and the design requires the null to be *estimated*.
-    pub fn control_floor_nats(&self, q: f64) -> Result<f64, String> {
-        if !(q > 0.0 && q < 1.0) {
-            return Err(format!(
-                "control_floor_nats: quantile must be in (0, 1); got {q}"
-            ));
-        }
-        let nulls: Vec<f64> = self
-            .nu_measured
-            .iter()
-            .zip(self.is_control.iter())
-            .filter_map(|(&v, &c)| c.then_some(v))
-            .collect();
-        if nulls.is_empty() {
-            return Err(
-                "control_floor_nats: shard has no Δt = 0 control records; the G3 floor \
-                 must be estimated from controls, never assumed"
-                    .to_string(),
-            );
-        }
-        if nulls.iter().any(|value| !value.is_finite()) {
-            return Err(
-                "control_floor_nats: control measurements must be finite before taking a quantile"
-                    .to_string(),
-            );
-        }
-        // Inclusive linear-interpolation quantile (the same convention as
-        // numpy's default), on the validated finite sample.
-        Ok(inclusive_quantile(nulls, q))
     }
 }
 

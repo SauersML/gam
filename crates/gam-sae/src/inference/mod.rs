@@ -16,7 +16,6 @@ pub mod cross_model_transport;
 pub mod harvest;
 pub mod intervention_shard;
 pub mod layer_transport;
-pub mod probe_runner;
 pub mod riesz;
 pub mod sparse_audit;
 pub mod steering;

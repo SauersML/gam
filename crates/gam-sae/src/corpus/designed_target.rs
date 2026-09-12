@@ -90,12 +90,6 @@ impl DesignedCorpusTarget {
     pub fn is_empty(&self) -> bool {
         self.row_ids.is_empty()
     }
-
-    /// Whether selectivity actually engaged (a proper subsample) or the
-    /// collection was the exact full pass.
-    pub fn is_designed_subsample(&self) -> bool {
-        (self.len() as u64) < self.corpus_rows
-    }
 }
 
 /// Collect a designed target from a streaming source.
