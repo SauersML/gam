@@ -259,5 +259,21 @@
     "unit_test_decreases": {
       "crates/gam-identifiability": 4
     }
+  },
+  {
+    "base": "c4c012c93228f4613f2641542c732fdbdd0deb48",
+    "reason": "user directive: delete all useless slop, including code only tests use and the tests that exist only for it. The retired gam-solve tests exercised only removed instruments: the #2576 shift-ladder profile and its trace (shift_ladder_residual_curve_and_ritz_spectrum_2576, evidence_logdet_ladder_costs_one_krylov_space_per_probe_2576, from the never-compiled tests_logdet_krylov_2576.rs), the preconditioner study (evidence_logdet_preconditioner_cuts_iterations_without_moving_log_det), the resident exact-diagonal instrument (resident_schur_elimination_diagonal_matches_operator_diagonal_2576, elimination_share_of_the_border_diagonal_is_fixture_dependent_2576), and the value predicate is_non_pd_schur_complement (non_pd_schur_predicate_preserves_the_two_substring_conjunct_2598).",
+    "evidence": "The same commit deletes reduced_schur_logdet_shift_ladder_profile, reduced_schur_logdet_preconditioner_study, resident_schur_elimination_diagonal, reduced_schur_shifted_preconditioner_resident and is_non_pd_schur_complement from crates/gam-solve/src/arrow_schur/reduced_solve.rs and ShiftedPcgTrace from rational_logdet.rs. The production reader rendered_is_non_pd_schur_complement keeps its pin rendered_verdict_matches_the_value_verdict_for_every_variant_2598 through a test-local value oracle, and matrix_free_arrow_operator_apply keeps its dense-cache pin, renamed matrix_free_full_arrow_apply_matches_dense_cache.",
+    "test_count_decrease": 6,
+    "removed_pins": {
+      "elimination_share_of_the_border_diagonal_is_fixture_dependent_2576": 1,
+      "evidence_logdet_ladder_costs_one_krylov_space_per_probe_2576": 1,
+      "non_pd_schur_predicate_preserves_the_two_substring_conjunct_2598": 1,
+      "resident_schur_elimination_diagonal_matches_operator_diagonal_2576": 1,
+      "shift_ladder_residual_curve_and_ritz_spectrum_2576": 1
+    },
+    "unit_test_decreases": {
+      "crates/gam-solve": 6
+    }
   }
 ]

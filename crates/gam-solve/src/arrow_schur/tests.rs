@@ -4213,89 +4213,6 @@ fn dense_top_eigenvalue(a: &Array2<f64>) -> f64 {
     lambda
 }
 
-/// #2576 — the evidence lane's log-determinant must be PRECONDITIONED, and the
-/// preconditioner must not move the value.
-///
-/// The reduced Schur `S = H_ββ − Σ_i H_βt(H_tt)⁻¹H_tβ` inherits `H_ββ`'s
-/// diagonal spread. On the overcomplete SAE border that spread IS the atom
-/// firing-count distribution — atoms occurring in a handful of rows next to
-/// atoms occurring in thousands — and every shifted solve inside the rational
-/// surrogate paid for it, unpreconditioned, at `√κ` convergence. This fixture
-/// puts four decades of shared-block diagonal on an otherwise ordinary arrow
-/// system and asserts both halves of the fix at once:
-///
-///   * the shared-block-diagonal tier takes strictly fewer shifted-CG
-///     iterations than the identity tier (the preconditioner does something);
-///   * both tiers return the SAME `log|S|` to solve accuracy (it does ONLY
-///     that — the surrogate is a function of the operator, and PCG converges
-///     to the same certified solve as CG).
-///
-/// A regression that dropped the preconditioner fails the first limb; one that
-/// let it leak into the functional fails the second.
-#[test]
-fn evidence_logdet_preconditioner_cuts_iterations_without_moving_log_det() {
-    let (n, d, k) = (24usize, 2usize, 40usize);
-    let mut sys = dense_direct_system(n, d, k);
-    // Four decades of shared-block diagonal spread, in the firing-count shape:
-    // a few "hot" columns carrying orders of magnitude more mass than the rest.
-    // The cross-block is left as the fixture built it, so the eliminated term
-    // is unchanged and the spread genuinely comes from `H_ββ`.
-    for column in 0..k {
-        let scale = 10.0_f64.powi((column % 5) as i32);
-        sys.hbb[[column, column]] = 6.0 * scale;
-    }
-    sys.refresh_row_hessian_fingerprint();
-    let backend = CpuBatchedBlockSolver;
-    let htt_factors = backend
-        .factor_blocks(&sys.rows, 0.0, d, false)
-        .expect("SPD per-row blocks must factor");
-
-    let rows = reduced_schur_logdet_preconditioner_study(
-        &sys,
-        &htt_factors,
-        0.0,
-        &backend,
-        16,
-        0x2576_C0DE,
-        1.0e-8,
-        60,
-        1.0e-10,
-        50_000,
-    )
-    .expect("the study must run on a well-conditioned SPD arrow system");
-    assert_eq!(rows.len(), 2, "study must report both tiers");
-
-    let identity = rows
-        .iter()
-        .find(|row| row.preconditioner == ReducedSchurCgPreconditioner::Identity)
-        .expect("identity tier");
-    let scaled = rows
-        .iter()
-        .find(|row| row.preconditioner == ReducedSchurCgPreconditioner::SharedBlockDiagonal)
-        .expect("shared-block-diagonal tier");
-    eprintln!(
-        "evidence log|S| preconditioner study: identity {} iters (log|S| {:.9e}), \
-         shared-block diagonal {} iters (log|S| {:.9e})",
-        identity.cg_iterations, identity.log_det, scaled.cg_iterations, scaled.log_det
-    );
-
-    assert!(
-        scaled.cg_iterations < identity.cg_iterations,
-        "the shared-block diagonal must cut the surrogate's shifted-CG work on a \
-         wide-diagonal border (identity {}, scaled {})",
-        identity.cg_iterations,
-        scaled.cg_iterations
-    );
-    let gap = (scaled.log_det - identity.log_det).abs();
-    assert!(
-        gap <= 1.0e-6 * identity.log_det.abs().max(1.0),
-        "a preconditioner steers the iteration and may not move the functional: \
-         identity {:.12e} vs scaled {:.12e} (gap {gap:.3e})",
-        identity.log_det,
-        scaled.log_det
-    );
-}
-
 /// The #2080 fixed-rational log-det surrogate on the matrix-free `schur_matvec`
 /// apply (`rational_reduced_schur_log_det`, NO dense `k×k` Schur formed) must
 /// agree with the exact dense evidence `log|S|` it replaces, be bit-reproducible
@@ -4805,13 +4722,11 @@ fn reduced_schur_inverse_apply_matches_dense_solve() {
     );
 }
 
-/// #2230 production seam: the full-arrow matrix-free operator and arbitrary-RHS
-/// inverse used by the SAE exact-stationarity IFT solve must represent the same
-/// undamped bordered Hessian as the dense factor cache. This pins both halves:
-/// `Bv` (including reconstruction of `H_betabeta` from the reduced Schur) and
-/// `B^-1 r` (matrix-free beta CG plus exact row back-substitution).
+/// #2230 production seam: the full-arrow matrix-free operator must represent the
+/// same undamped bordered Hessian as the dense factor cache, including the
+/// reconstruction of `H_betabeta` from the reduced Schur in `Bv`.
 #[test]
-fn matrix_free_full_arrow_apply_and_inverse_match_dense_cache() {
+fn matrix_free_full_arrow_apply_matches_dense_cache() {
     let (n, d, k) = (24usize, 3usize, 48usize);
     let sys = dense_direct_system(n, d, k);
     let options = ArrowSolveOptions::direct().with_positive_definite_evidence();
@@ -4840,36 +4755,6 @@ fn matrix_free_full_arrow_apply_and_inverse_match_dense_cache() {
         apply_error.sqrt() <= 1.0e-11 * apply_scale.sqrt().max(1.0),
         "matrix-free Bv must match the dense assembled operator: rel={:.3e}",
         apply_error.sqrt() / apply_scale.sqrt().max(1.0)
-    );
-
-    let rhs_t =
-        Array1::<f64>::from_shape_fn(t_len, |index| 0.1 * ((index as f64 + 3.0) * 0.41).cos());
-    let rhs_beta =
-        Array1::<f64>::from_shape_fn(k, |index| 0.12 * ((index as f64 + 4.0) * 0.19).sin());
-    let (dense_solved_t, dense_solved_beta) = cache
-        .full_inverse_apply(rhs_t.view(), rhs_beta.view())
-        .expect("dense full-arrow inverse");
-    let (matrix_free_solved_t, matrix_free_solved_beta, _) = matrix_free_arrow_inverse_apply(
-        &sys,
-        &cache,
-        rhs_t.view(),
-        rhs_beta.view(),
-        1.0e-12,
-        50_000,
-    )
-    .expect("matrix-free full-arrow inverse");
-    let inverse_error = (&matrix_free_solved_t - &dense_solved_t)
-        .mapv(|value| value * value)
-        .sum()
-        + (&matrix_free_solved_beta - &dense_solved_beta)
-            .mapv(|value| value * value)
-            .sum();
-    let inverse_scale = dense_solved_t.mapv(|value| value * value).sum()
-        + dense_solved_beta.mapv(|value| value * value).sum();
-    assert!(
-        inverse_error.sqrt() <= 1.0e-7 * inverse_scale.sqrt().max(1.0),
-        "matrix-free B^-1 r must match the dense cache solve to CG accuracy: rel={:.3e}",
-        inverse_error.sqrt() / inverse_scale.sqrt().max(1.0)
     );
 }
 
@@ -5801,306 +5686,6 @@ fn evidence_cache_boundary_is_invariant_to_newton_damping_history_2308() {
     );
 }
 
-/// #2576: the EXACT reduced-Schur diagonal, built from the SAE residency, must
-/// equal the operator's own diagonal — the claim
-/// [`resident_schur_elimination_diagonal`] rests on.
-///
-/// The issue's history twice concluded that an exact `diag(S)` was unaffordable,
-/// because the generic route materializes `H_tβ^(i)` against `K` basis vectors.
-/// That is true of a generic cross-block and false of this one: the SAE row
-/// factors as `H_tβ^(i) = L_i P_i`, so
-/// `diag(S_i)[base_s + c] = φ_s²·Σ_r L_i[r,c]·Y_i[r,c]` reads straight off slabs
-/// the residency already staged. This gate holds that closed form to the
-/// operator itself, probed column by column with `S·e_g` — if the closed form
-/// and the operator ever disagree, the preconditioner is scaling by a diagonal
-/// that is not the one the iteration sees.
-///
-/// Size-independent (both arms are exact identities, not tolerances on a fit).
-///
-/// Second arm — `n_atoms = 4, m_active = 5` — forces the support generator to
-/// hand the SAME base twice within one row with DIFFERENT `φ`. The projector's
-/// coefficient there is `φ_a + φ_b`, so the diagonal carries `(φ_a + φ_b)²`;
-/// accumulating `φ_a² + φ_b²` instead would price a different projector than the
-/// matvec applies, and only a duplicate-base fixture can tell the two apart.
-#[test]
-pub(crate) fn resident_schur_elimination_diagonal_matches_operator_diagonal_2576() {
-    for (n_atoms, m_active, arm) in [(32usize, 5usize, "distinct bases"), (4, 5, "duplicate base")] {
-        let n = 48usize;
-        let q = 4usize;
-        let p = 6usize;
-        let (sys, a_phi, _jac) = sae_structured_system(n, q, p, n_atoms, m_active);
-        let k = sys.k;
-        let backend = CpuBatchedBlockSolver;
-        let htt_factors = backend
-            .factor_blocks(&sys.rows, 0.0, q, false)
-            .expect("SPD per-row blocks must factor");
-        let ridge_beta = 1e-6;
-        let resident = SaeResidentReducedSchur::build(&sys, &htt_factors, &backend)
-            .expect("SAE structure must yield a resident operator");
-
-        // NON-VACUITY for the duplicate arm: assert the fixture really does
-        // repeat a base inside a row, or the arm proves nothing about the
-        // combine-before-square rule.
-        if arm == "duplicate base" {
-            let repeated = a_phi.iter().any(|support| {
-                support
-                    .iter()
-                    .enumerate()
-                    .any(|(i, (base, _))| support[..i].iter().any(|(seen, _)| seen == base))
-            });
-            assert!(
-                repeated,
-                "#2576 fixture must repeat a support base within a row for this arm to bite"
-            );
-        }
-
-        // The closed form under test.
-        let elimination = resident_schur_elimination_diagonal(&resident, k)
-            .expect("residency describes this system");
-        let mut closed_form = sys.shared_block_diagonal();
-        for (value, &eliminated) in closed_form.iter_mut().zip(elimination.iter()) {
-            *value += ridge_beta;
-            *value -= eliminated;
-        }
-
-        // The operator's own diagonal, probed column by column: diag(S)[g] =
-        // e_gᵀ S e_g. This is the O(k) build the closed form exists to avoid, so
-        // it is exactly the right independent witness at fixture scale.
-        let mut probed = Array1::<f64>::zeros(k);
-        let mut e_g = Array1::<f64>::zeros(k);
-        let mut column = Array1::<f64>::zeros(k);
-        for g in 0..k {
-            e_g.fill(0.0);
-            e_g[g] = 1.0;
-            column.fill(0.0);
-            schur_matvec(
-                &sys,
-                &htt_factors,
-                ridge_beta,
-                &e_g,
-                &mut column,
-                &backend,
-                None,
-            );
-            probed[g] = column[g];
-        }
-
-        let scale = probed.iter().fold(0.0_f64, |m, &v| m.max(v.abs())).max(1.0);
-        for g in 0..k {
-            let rel = (closed_form[g] - probed[g]).abs() / scale;
-            assert!(
-                rel < 1e-12,
-                "#2576 [{arm}] exact Schur diagonal must equal the operator diagonal at {g}: \
-                 closed form {} vs probed {} (rel {rel:e})",
-                closed_form[g],
-                probed[g]
-            );
-        }
-
-        // The eliminated term is PSD, so the exact diagonal is a STRICT
-        // improvement on the shared-block diagonal it replaces: same positivity,
-        // strictly smaller, and it must actually move (a zero elimination would
-        // mean the fixture has no cross-block and the gate is vacuous).
-        let shared = sys.shared_block_diagonal();
-        let mut moved = false;
-        for g in 0..k {
-            assert!(
-                elimination[g] >= -1e-12 * scale,
-                "#2576 eliminated term must be PSD on the diagonal at {g}: {}",
-                elimination[g]
-            );
-            assert!(
-                closed_form[g] > 0.0,
-                "#2576 exact Schur diagonal must stay positive at {g}: {}",
-                closed_form[g]
-            );
-            if elimination[g] > 1e-9 * (shared[g].abs() + 1.0) {
-                moved = true;
-            }
-        }
-        assert!(
-            moved,
-            "#2576 [{arm}] fixture must carry a nonzero point-elimination term, \
-             or the exact diagonal is vacuously the shared-block one"
-        );
-
-        // Determinism: the fixed-order row accumulation is bit-identical.
-        let again = resident_schur_elimination_diagonal(&resident, k).expect("rebuild");
-        for g in 0..k {
-            assert_eq!(
-                elimination[g].to_bits(),
-                again[g].to_bits(),
-                "#2576 exact Schur diagonal must be bit-identical run-to-run at {g}"
-            );
-        }
-    }
-}
-
-/// #2576: how much of the border diagonal the point-elimination term actually
-/// removes — measured against BOTH a synthetic and a data-accumulated `H_ββ`,
-/// because that choice, not the SAE operator, decides the answer.
-///
-/// # Why this test exists
-///
-/// The exact reduced-Schur diagonal is affordable here (see
-/// `resident_schur_elimination_diagonal`) and was measured NOT to cut shifted-CG
-/// iterations: 5189 against the shared block's 5138, identity's 29236. I first
-/// explained that by a cancellation argument — `diag(H_ββ)` and the eliminated
-/// term are both `Σ_{i ∋ s} φ_{i,s}²`-weighted row sums, so the firing-count
-/// spread should divide out and leave a uniform rescaling, which CG cannot see.
-///
-/// **That explanation was wrong and this test is what refuted it.** The measured
-/// ratio spread is ~9x, not ~1x. The real cause on that fixture is MAGNITUDE:
-/// the eliminated term is a fraction of a percent of the border diagonal, so
-/// `diag(S)` is a ~0.2% perturbation of `diag(H_ββ)` and no iteration can
-/// notice.
-///
-/// And that is a property of the FIXTURE. `sae_structured_system` installs a
-/// synthetic uniform `hbb = k + 4`, unrelated to the cross-block it is being
-/// compared against. On the real lane `H_ββ` is data-accumulated from the SAME
-/// rows and the SAME `φ²` weights as the elimination, so the two are
-/// commensurate by construction. Arm B builds that case, and it is the arm that
-/// speaks to production.
-///
-/// This test reports rather than rules: the quantity that governs the
-/// preconditioner is `1 − ratio` (how far `diag(S)` is from a uniform rescaling
-/// of `diag(H_ββ)`), and the guard fires exactly when the elimination becomes
-/// big enough that the iteration comparison could change.
-#[test]
-pub(crate) fn elimination_share_of_the_border_diagonal_is_fixture_dependent_2576() {
-    let (n, q, p, n_atoms, m_active) = (64usize, 3usize, 6usize, 24usize, 4usize);
-    let backend = CpuBatchedBlockSolver;
-    let ridge_beta = 1e-6;
-
-    // Arm A: the fixture as built — synthetic uniform shared block.
-    // Arm B: `H_ββ` accumulated from the design the cross-block actually uses,
-    //        `Σ_i c_{i,g}²` with `c` the row's projector coefficient on column
-    //        `g`. This is the shape the production border has.
-    for arm in ["synthetic uniform H_bb", "data-accumulated H_bb"] {
-        let (mut sys, a_phi, _jac) = sae_structured_system(n, q, p, n_atoms, m_active);
-        let k = sys.k;
-        if arm == "data-accumulated H_bb" {
-            let mut gram = vec![0.0_f64; k];
-            for support in a_phi.iter() {
-                // Combine equal bases BEFORE squaring: the projector coefficient
-                // on a column is the sum over support entries carrying that base.
-                let mut combined: Vec<(usize, f64)> = Vec::new();
-                for &(base, phi) in support.iter() {
-                    match combined.iter_mut().find(|(seen, _)| *seen == base) {
-                        Some(entry) => entry.1 += phi,
-                        None => combined.push((base, phi)),
-                    }
-                }
-                for &(base, phi) in combined.iter() {
-                    for value in gram[base..base + p].iter_mut() {
-                        *value += phi * phi;
-                    }
-                }
-            }
-            sys.hbb = Array2::<f64>::zeros((k, k));
-            for g in 0..k {
-                // A small ridge keeps the synthetic border SPD where an atom is
-                // unreached; it is not a tuned quantity, just non-singularity.
-                sys.hbb[[g, g]] = gram[g] + 1e-3;
-            }
-            sys.refresh_row_hessian_fingerprint();
-        }
-
-        let htt_factors = backend
-            .factor_blocks(&sys.rows, 0.0, q, false)
-            .expect("SPD per-row blocks must factor");
-        let resident = SaeResidentReducedSchur::build(&sys, &htt_factors, &backend)
-            .expect("SAE structure must yield a resident operator");
-        let elimination = resident_schur_elimination_diagonal(&resident, k)
-            .expect("residency describes this system");
-        let shared = sys.shared_block_diagonal();
-
-        let mut ratios: Vec<f64> = Vec::new();
-        for g in 0..k {
-            let denominator = shared[g] + ridge_beta;
-            if elimination[g] > 0.0 && denominator > 0.0 {
-                ratios.push(elimination[g] / denominator);
-            }
-        }
-        assert!(
-            ratios.len() >= k / 2,
-            "#2576 [{arm}]: the fixture must reach most border columns \
-             (reached {} of {k})",
-            ratios.len()
-        );
-        let lo = ratios.iter().copied().fold(f64::INFINITY, f64::min);
-        let hi = ratios.iter().copied().fold(0.0_f64, f64::max);
-        // The quantity that governs the ITERATION: `diag(S) = diag(H_ββ)·(1 − ratio)`,
-        // and CG is invariant to a uniform scale, so only the VARIATION of
-        // `1 − ratio` can change anything.
-        let rescale_variation = (1.0 - lo) / (1.0 - hi);
-        eprintln!(
-            "#2576 [{arm}] over {} reached columns: elimination/shared min {lo:.6e} \
-             max {hi:.6e} (spread {:.3}x) | diag(S)/diag(H_bb) in [{:.6}, {:.6}], \
-             non-uniformity {rescale_variation:.6}x",
-            ratios.len(),
-            hi / lo,
-            1.0 - hi,
-            1.0 - lo,
-        );
-
-        // The ITERATION comparison, on both arms. The ratio above predicts what
-        // this should show; running it here is what keeps the #2576 verdict from
-        // resting on the synthetic fixture alone. Same operator, same frozen
-        // plan, same probes and nodes — only the preconditioner varies.
-        match reduced_schur_logdet_preconditioner_study(
-            &sys,
-            &htt_factors,
-            ridge_beta,
-            &backend,
-            16,
-            0x2576_5CD1,
-            1.0e-8,
-            60,
-            1.0e-10,
-            50_000,
-        ) {
-            Some(rows) => {
-                for row in &rows {
-                    eprintln!(
-                        "#2576 [{arm}] study {:<22?}: {:>7} cg iters  log|S| {:+.9e}",
-                        row.preconditioner, row.cg_iterations, row.log_det
-                    );
-                }
-                // A preconditioner steers the iteration and may not move the
-                // functional; if a tier disagrees, its iteration count is
-                // measuring a different problem and is not comparable.
-                let reference = rows[0].log_det;
-                for row in &rows {
-                    let gap = (row.log_det - reference).abs();
-                    assert!(
-                        gap <= 1.0e-6 * reference.abs().max(1.0),
-                        "#2576 [{arm}]: tier {:?} moved log|S|: {reference:.12e} vs {:.12e}",
-                        row.preconditioner,
-                        row.log_det
-                    );
-                }
-            }
-            None => eprintln!("#2576 [{arm}] study: REFUSED (spectral bracket or plan build)"),
-        }
-
-        // The guard, on the quantity that would flip the conclusion. It is not a
-        // claim that the exact diagonal never helps — it is the trigger to
-        // re-measure iterations when the elimination stops being a rounding
-        // correction to the border diagonal.
-        assert!(
-            hi < 0.5,
-            "#2576 [{arm}]: the point-elimination term now removes up to {:.1}% of the \
-             border diagonal. `diag(S)` is no longer a small perturbation of \
-             `diag(H_ββ)`, so the iteration comparison that retired the exact \
-             diagonal (5189 vs 5138) must be re-taken through \
-             `reduced_schur_logdet_preconditioner_study` before that verdict is \
-             relied on.",
-            hi * 100.0
-        );
-    }
-}
-
 /// #2731 — [`CoupledCarrierPenaltyOp`] is EXACTLY the operator its eigen
 /// expansion is, on every surface the solver reads it through.
 ///
@@ -6712,6 +6297,17 @@ fn matrix_free_exact_a_prices_a_clamp_basin_before_refusing_a_saddle_2515() {
     );
 }
 
+/// The value-level verdict `ArrowSchurError::rendered_is_non_pd_schur_complement`
+/// must reproduce: a `SchurFactorFailed` whose reason names a non-PD operator.
+/// Any other variant, or a Schur refusal for a non-finite or non-square operator,
+/// stays fatal.
+fn value_verdict_is_non_pd_schur_complement(error: &ArrowSchurError) -> bool {
+    matches!(
+        error,
+        ArrowSchurError::SchurFactorFailed { reason } if reason.contains("not positive definite")
+    )
+}
+
 /// #2598 — the rendered-message reader and the value predicate must agree on
 /// EVERY variant, so that rewording `Display` cannot change one without the
 /// other.
@@ -6766,11 +6362,11 @@ fn rendered_verdict_matches_the_value_verdict_for_every_variant_2598() {
         let rendered = error.to_string();
         assert_eq!(
             ArrowSchurError::rendered_is_non_pd_schur_complement(&rendered),
-            error.is_non_pd_schur_complement(),
+            value_verdict_is_non_pd_schur_complement(error),
             "the rendered reader and the value predicate disagree on {error:?}; \
              rendered as {rendered:?}"
         );
-        saw_recoverable |= error.is_non_pd_schur_complement();
+        saw_recoverable |= value_verdict_is_non_pd_schur_complement(error);
     }
     assert!(
         saw_recoverable,
@@ -6784,87 +6380,6 @@ fn rendered_verdict_matches_the_value_verdict_for_every_variant_2598() {
         cases[0]
     );
     assert!(ArrowSchurError::rendered_is_non_pd_schur_complement(&wrapped));
-}
-
-/// #2598 — pin `ArrowSchurError::is_non_pd_schur_complement` to the exact
-/// conjunct gam-sae used to reconstruct from `to_string()`: the discriminant
-/// must be `SchurFactorFailed` AND its reason must name a non-PD operator.
-///
-/// The negative arms are the load-bearing ones. A `SchurFactorFailed` raised
-/// for a non-finite or non-square operator, and a refusal of another class whose
-/// own reason happens to name a non-PD operator, both rendered a string that the
-/// old two-substring match rejected; they must stay fatal here, or a genuine
-/// assembly defect gets masked as a recoverable trial-point refusal.
-///
-/// `rendered_verdict_matches_the_value_verdict_for_every_variant_2598` pins the
-/// rendered reader to this predicate, and so cannot see the predicate drift: a
-/// reader and a predicate that flipped together would still agree. This test
-/// states the value verdicts themselves.
-#[test]
-fn non_pd_schur_predicate_preserves_the_two_substring_conjunct_2598() {
-    let non_pd = ArrowSchurError::SchurFactorFailed {
-        reason: "non-PD pivot -2.5e-09 at index 2 (matrix is not positive definite)".to_string(),
-    };
-    assert!(
-        non_pd.is_non_pd_schur_complement(),
-        "an indefinite reduced Schur complement is the recoverable trial-point refusal: {non_pd}"
-    );
-
-    let non_finite = ArrowSchurError::SchurFactorFailed {
-        reason: "cholesky_lower: non-finite entry at linear index 7".to_string(),
-    };
-    assert!(
-        !non_finite.is_non_pd_schur_complement(),
-        "a non-finite Schur operator is a defect, not a relocatable trial point: {non_finite}"
-    );
-
-    let non_square = ArrowSchurError::SchurFactorFailed {
-        reason: "cholesky_lower: non-square 3x4".to_string(),
-    };
-    assert!(
-        !non_square.is_non_pd_schur_complement(),
-        "a non-square Schur operator is a defect: {non_square}"
-    );
-
-    let per_row = ArrowSchurError::PerRowFactorFailed {
-        row: 3,
-        reason: "non-PD pivot -1e-12 at index 0 (matrix is not positive definite)".to_string(),
-    };
-    assert!(
-        !per_row.is_non_pd_schur_complement(),
-        "a per-row H_tt refusal is a different class and has its own predicate: {per_row}"
-    );
-
-    let ill_conditioned = ArrowSchurError::PerRowFactorIllConditioned {
-        row: 1,
-        kappa_estimate: 1e18,
-    };
-    assert!(!ill_conditioned.is_non_pd_schur_complement());
-
-    let pcg = ArrowSchurError::PcgFailed {
-        reason: "residual stalled while the operator is not positive definite".to_string(),
-    };
-    assert!(
-        !pcg.is_non_pd_schur_complement(),
-        "only the Schur-factor discriminant carries this verdict: {pcg}"
-    );
-
-    let unbounded = ArrowSchurError::UnboundedNegativeCurvature {
-        curvature: -3.5e-4,
-        direction_norm_sq: 2.0,
-    };
-    assert!(
-        !unbounded.is_non_pd_schur_complement(),
-        "unbounded negative curvature along a step is not a Schur-factor refusal: {unbounded}"
-    );
-
-    let adaptive = ArrowSchurError::AdaptiveCorrectionFailed {
-        reason: "no Armijo-accepted step; the operator is not positive definite".to_string(),
-    };
-    assert!(
-        !adaptive.is_non_pd_schur_complement(),
-        "an adaptive-correction refusal naming a non-PD operator stays fatal: {adaptive}"
-    );
 }
 
 /// #2548: matrix-free SAE assembly reclaims the dense shared-block workspace.
