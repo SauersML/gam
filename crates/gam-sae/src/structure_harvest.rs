@@ -618,7 +618,7 @@ pub fn harvest_move_proposals(
         params.max_fusions,
         &mut proposals,
         &mut certified_glues,
-    );
+    )?;
 
     // --- Fission audits: absorption-suspect asymmetry, gated by the null ---
     let mut fission_atoms: Vec<(usize, f64)> = Vec::new();
@@ -1971,15 +1971,15 @@ fn harvest_glue_proposals(
     budget: usize,
     proposals: &mut Vec<MoveProposal>,
     certified_glues: &mut Vec<CertifiedGlue>,
-) -> (usize, usize) {
+) -> Result<(usize, usize), String> {
     let k = term.k_atoms();
     if k < 2 || budget == 0 {
-        return (0, 0);
+        return Ok((0, 0));
     }
     let assignments = term.assignment.assignments();
     let n_rows = assignments.nrows();
     if n_rows == 0 {
-        return (0, 0);
+        return Ok((0, 0));
     }
     let floor = ACTIVE_SUPPORT_REL_FLOOR / k as f64;
     // Packed row supports (one bit per row) so the K²/2 pairwise co-fire counts
@@ -2051,11 +2051,16 @@ fn harvest_glue_proposals(
                 continue;
             }
             // Ambient-span alignment (ranking key): cos of the largest principal
-            // angle between the two decoder frames — 1 for a shared plane.
-            let alignment = match fa.max_principal_angle(fb.frame()) {
-                Ok(theta) => theta.cos(),
-                Err(_) => continue,
-            };
+            // angle between the two decoder frames — 1 for a shared plane. Both
+            // frames span decoders of this term's `p` outputs, so the angle refuses
+            // only when its SVD fails, which is a numerical failure to surface
+            // rather than a pair to leave out of the screened count.
+            let alignment = fa
+                .max_principal_angle(fb.frame())
+                .map_err(|error| {
+                    format!("harvest_glue_proposals: atoms {a} and {b}: {error}")
+                })?
+                .cos();
             if !alignment.is_finite() {
                 continue;
             }
@@ -2135,7 +2140,7 @@ fn harvest_glue_proposals(
             proposed += 1;
         }
     }
-    (proposed, screened)
+    Ok((proposed, screened))
 }
 
 /// Warm the glued atom `a`'s chart to cover the union of both arcs by
@@ -7347,17 +7352,23 @@ fn curl_candidates(
             continue;
         };
         // Build the race-ready seed from the accepted orthonormal frame + parse.
-        let seed_circle = match crate::manifold::curl_seed(
+        // `curl_seed` refuses only a malformed plane (mismatched frame, coordinate or
+        // center lengths, or zero harmonics), and an accepted plane the census built
+        // cannot be malformed, so a refusal is a defect to surface, not a pair to skip.
+        let seed_circle = crate::manifold::curl_seed(
             plane.e1.view(),
             plane.e2.view(),
             plane.alpha.view(),
             plane.beta.view(),
             cfg.harmonics,
             plane.center.view(),
-        ) {
-            Ok(s) => s,
-            Err(_) => continue,
-        };
+        )
+        .map_err(|error| {
+            format!(
+                "curl_candidates: the accepted plane of donor atoms {:?} + {:?} has no circle seed: {error}",
+                pair.members_a, pair.members_b
+            )
+        })?;
         // Lift the co-firing phases + own-presence gate to the full row set.
         let mut phase_coords = Array2::<f64>::zeros((n, 1));
         let mut gate = vec![f64::NEG_INFINITY; n];
