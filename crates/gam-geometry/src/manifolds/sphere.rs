@@ -1,7 +1,7 @@
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
 
 use crate::manifold::{
-    GEOMETRY_EPS, GeometryError, GeometryResult, RiemannianManifold, check_len, dot, identity, norm,
+    GeometryError, GeometryResult, RiemannianManifold, check_len, dot, identity, norm,
 };
 use crate::normalize_weights;
 
@@ -65,7 +65,10 @@ impl RiemannianManifold for SphereManifold {
         u[anchor] -= 1.0;
         let u_nrm = norm(u.view());
         let mut basis = Array2::<f64>::zeros((m, self.intrinsic_dim));
-        if u_nrm <= GEOMETRY_EPS {
+        // `u` differs from `sign·p` only in its anchor entry, one subtraction of
+        // magnitude at most `|p_anchor| + 1`; with its `m`-term norm it rounds by
+        // at most `γ_{m+1}·(|p_anchor| + 1)`, so a smaller `u` is `p` on its axis.
+        if u_nrm <= gam_linalg::roundoff::accumulation_growth(m + 1) * (max_abs + 1.0) {
             let mut col = 0usize;
             for row in 0..m {
                 if row != anchor {
@@ -254,7 +257,13 @@ impl RiemannianManifold for SphereManifold {
         let vv = dot(v_t.view(), v_t.view());
         let uv = dot(u_t.view(), v_t.view());
         let area_sq = uu * vv - uv * uv;
-        if !area_sq.is_finite() || area_sq <= GEOMETRY_EPS {
+        // The area cancels exactly on a collinear pair. After the radial
+        // projections and the `m`-term inner products, two products and one
+        // subtraction, it rounds by at most `γ_{4m+3}·(uu·vv + uv²)`; an area
+        // inside that band spans no tangent plane.
+        let area_band = gam_linalg::roundoff::accumulation_growth(4 * point.len() + 3)
+            * (uu * vv + uv * uv);
+        if !area_sq.is_finite() || area_sq <= area_band {
             return Err(GeometryError::Singular(
                 "sectional curvature undefined for collinear/degenerate tangent pair",
             ));
