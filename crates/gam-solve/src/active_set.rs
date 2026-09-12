@@ -2338,25 +2338,10 @@ struct ConstraintSetOps<'a> {
 
 impl<'a> ConstraintSetOps<'a> {
     fn new(set: &'a ConstraintSet, scaled_margin: f64) -> Result<Self, EstimationError> {
-        let m = set.nrows();
-        let mut norms = Vec::with_capacity(m);
-        let mut bounds = Vec::with_capacity(m);
-        for row in 0..m {
-            norms.push(set.row_norm(row).map_err(|e| {
-                EstimationError::ParameterConstraintViolation(format!(
-                    "constraint-set row norm: {e}"
-                ))
-            })?);
-            bounds.push(set.bound(row).map_err(|e| {
-                EstimationError::ParameterConstraintViolation(format!(
-                    "constraint-set row bound: {e}"
-                ))
-            })?);
-        }
         Ok(Self {
             set,
-            norms,
-            bounds,
+            norms: set.all_row_norms().to_vec(),
+            bounds: set.all_bounds().to_vec(),
             scaled_margin,
         })
     }

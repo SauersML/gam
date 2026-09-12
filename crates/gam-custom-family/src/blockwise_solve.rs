@@ -1030,15 +1030,23 @@ pub(crate) fn widen_active_sets_to_tight_face(
             .get(block_idx)
             .and_then(|active| active.clone())
             .unwrap_or_default();
+        let norms = constraints.all_row_norms();
+        let bounds = constraints.all_bounds();
+        let mut recorded = vec![false; constraints.nrows()];
+        for &row in &rows {
+            if row < recorded.len() {
+                recorded[row] = true;
+            }
+        }
         for row in 0..constraints.nrows() {
-            if rows.contains(&row) {
+            if recorded[row] {
                 continue;
             }
-            let norm = constraints.row_norm(row)?;
+            let norm = norms[row];
             if !(norm.is_finite() && norm > 0.0) {
                 continue;
             }
-            let bound = constraints.bound(row)?;
+            let bound = bounds[row];
             if bound == f64::NEG_INFINITY {
                 continue;
             }

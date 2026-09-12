@@ -2635,15 +2635,23 @@ fn resolve_constrained_converged_mode_on_face<F: CustomFamily + Clone + Send + S
     {
         let values_beta = joint_constraints.values(beta.view())?;
         let values_direction = joint_constraints.values(direction.view())?;
+        let norms = joint_constraints.all_row_norms();
+        let bounds = joint_constraints.all_bounds();
+        let mut on_face = vec![false; joint_constraints.nrows()];
+        for &row in &joint_active {
+            if row < on_face.len() {
+                on_face[row] = true;
+            }
+        }
         for row in 0..joint_constraints.nrows() {
-            if joint_active.contains(&row) {
+            if on_face[row] {
                 continue;
             }
-            let norm = joint_constraints.row_norm(row)?;
+            let norm = norms[row];
             if !(norm.is_finite() && norm > 0.0) {
                 continue;
             }
-            let bound = joint_constraints.bound(row)?;
+            let bound = bounds[row];
             if bound == f64::NEG_INFINITY {
                 continue;
             }

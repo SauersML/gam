@@ -627,6 +627,24 @@ impl KhatriRaoConeConstraints {
             .map(|bounds| bounds.as_slice().expect("bounds are contiguous"))
     }
 
+    /// Every row's [`Self::row_norm`], slot-major like [`Self::values`].
+    pub fn all_row_norms(&self) -> Array1<f64> {
+        let n = self.factor.nrows();
+        let mut out = Array1::<f64>::zeros(self.nrows());
+        for slot in 0..self.coupled_rows.len() {
+            out.slice_mut(ndarray::s![slot * n..(slot + 1) * n])
+                .assign(&self.factor_row_norms);
+        }
+        out
+    }
+
+    /// Every row's [`Self::bound`]: `0` for the homogeneous cone.
+    pub fn all_bounds(&self) -> Array1<f64> {
+        self.bounds
+            .clone()
+            .unwrap_or_else(|| Array1::<f64>::zeros(self.nrows()))
+    }
+
     /// Materialize the requested rows as a dense system (active-set KKT use;
     /// the id order of `rows` is preserved). Rows come out RAW (un-normalized),
     /// matching the raw dense construction path; callers that need geometric
@@ -844,6 +862,44 @@ impl ConstraintSet {
             ConstraintSet::BlockDiagonal { blocks, .. } => {
                 let (block, local) = Self::block_for_row(blocks, row)?;
                 block.set.row_norm(local)
+            }
+        }
+    }
+
+    /// Every row's [`Self::row_norm`], in row order, from one pass over the
+    /// carrier. A full-row sweep that asks [`Self::row_norm`] per row
+    /// re-derives the carrier, slot and index and builds a `Result` for every
+    /// row; on the large-scale CTN cone those accessors were ~22% of an inner
+    /// solve's samples (#2896).
+    pub fn all_row_norms(&self) -> Array1<f64> {
+        match self {
+            ConstraintSet::Dense(dense) => Array1::from_iter((0..dense.a.nrows()).map(|row| {
+                let r = dense.a.row(row);
+                r.dot(&r).sqrt()
+            })),
+            ConstraintSet::KhatriRaoCone(cone) => cone.all_row_norms(),
+            ConstraintSet::BlockDiagonal { blocks, .. } => {
+                let mut out = Vec::with_capacity(self.nrows());
+                for block in blocks {
+                    out.extend(block.set.all_row_norms().iter().copied());
+                }
+                Array1::from_vec(out)
+            }
+        }
+    }
+
+    /// Every row's [`Self::bound`], in row order, from one pass over the
+    /// carrier.
+    pub fn all_bounds(&self) -> Array1<f64> {
+        match self {
+            ConstraintSet::Dense(dense) => dense.b.clone(),
+            ConstraintSet::KhatriRaoCone(cone) => cone.all_bounds(),
+            ConstraintSet::BlockDiagonal { blocks, .. } => {
+                let mut out = Vec::with_capacity(self.nrows());
+                for block in blocks {
+                    out.extend(block.set.all_bounds().iter().copied());
+                }
+                Array1::from_vec(out)
             }
         }
     }
@@ -1113,6 +1169,49 @@ mod tests {
     fn beta_fixture() -> Array1<f64> {
         // vec(A) row-major, A = [[9, -4], [1, 2], [0.5, -0.25]]
         array![9.0_f64, -4.0, 1.0, 2.0, 0.5, -0.25]
+    }
+
+    #[test]
+    fn batched_row_metrics_match_per_row_accessors() {
+        let beta = beta_fixture();
+        let cone = ConstraintSet::KhatriRaoCone(cone_fixture());
+        let shifted = cone.shifted_to_delta(beta.view()).expect("shifted cone");
+        let dense = ConstraintSet::Dense(cone_fixture().to_dense().expect("dense"));
+        let joint = ConstraintSet::block_diagonal(
+            vec![
+                PlacedConstraintBlock {
+                    col_start: 0,
+                    set: shifted.clone(),
+                },
+                PlacedConstraintBlock {
+                    col_start: 6,
+                    set: dense.clone(),
+                },
+            ],
+            12,
+        )
+        .expect("joint");
+        // The shifted cone carries nonzero bounds, so the bound comparison is
+        // not vacuous on an all-zero carrier.
+        assert!(shifted.all_bounds().iter().any(|&bound| bound != 0.0));
+        for set in [&cone, &shifted, &dense, &joint] {
+            let norms = set.all_row_norms();
+            let bounds = set.all_bounds();
+            assert_eq!(norms.len(), set.nrows());
+            assert_eq!(bounds.len(), set.nrows());
+            for row in 0..set.nrows() {
+                assert_eq!(
+                    norms[row].to_bits(),
+                    set.row_norm(row).expect("row norm").to_bits(),
+                    "row norm {row}"
+                );
+                assert_eq!(
+                    bounds[row].to_bits(),
+                    set.bound(row).expect("bound").to_bits(),
+                    "bound {row}"
+                );
+            }
+        }
     }
 
     #[test]
