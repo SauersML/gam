@@ -55,6 +55,35 @@ pub enum JointNewtonTerminalReason {
         cycles: usize,
         ray: RayRestoration,
     },
+    /// The constrained fixed-point certificate declined the iterate the loop
+    /// left on, and `condition` is the acceptance condition that failed, with its
+    /// value and bound. Before this, the exit read `cycle budget` at any cycle
+    /// count, so which condition declined had to be inferred (gam#979).
+    ConstrainedFixedPointDeclined {
+        condition: ConstrainedFixedPointCondition,
+    },
+}
+
+/// One acceptance condition of the custom-family joint Newton's constrained
+/// fixed-point certificate, as it failed.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ConstrainedFixedPointCondition {
+    /// The objective is still changing above its machine-eps floor.
+    ObjectiveAboveFloor {
+        objective_change: f64,
+        objective_floor: f64,
+    },
+    /// The scalar Newton model's relative error exceeds its bound.
+    ModelInexact { scalar_model_relerr: f64, bound: f64 },
+    /// The accepted step is not finite or exceeds the stationarity tolerance.
+    StepAboveTolerance {
+        accepted_step_inf: f64,
+        step_tol: f64,
+    },
+    /// `H_pen` has a numerical null space at the eigensolver resolution.
+    HpenNullity { nullity: usize },
+    /// `H_pen` could not be materialized or decomposed.
+    HpenNullityUnavailable,
 }
 
 /// The block-level reading of a ray the joint Newton was descending when it
@@ -180,6 +209,43 @@ impl std::fmt::Display for JointNewtonTerminalReason {
                  {cycles} cycles while the accepted steps kept descending a direction with no \
                  finite minimizer in reach, so the seed is under-penalized rather than \
                  failed; {ray}"
+            ),
+            Self::ConstrainedFixedPointDeclined { condition } => write!(
+                f,
+                "the constrained fixed-point certificate declined: {condition}"
+            ),
+        }
+    }
+}
+
+impl std::fmt::Display for ConstrainedFixedPointCondition {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ObjectiveAboveFloor {
+                objective_change,
+                objective_floor,
+            } => write!(
+                f,
+                "|Δobjective|={objective_change:.3e} is not ≤ objective_floor={objective_floor:.3e}"
+            ),
+            Self::ModelInexact {
+                scalar_model_relerr,
+                bound,
+            } => write!(f, "scalar_relerr={scalar_model_relerr:.3e} is not ≤ {bound:.0e}"),
+            Self::StepAboveTolerance {
+                accepted_step_inf,
+                step_tol,
+            } => write!(
+                f,
+                "accepted_step_inf={accepted_step_inf:.3e} is not ≤ step_tol={step_tol:.3e}"
+            ),
+            Self::HpenNullity { nullity } => write!(
+                f,
+                "H_pen nullity={nullity} at the eigensolver resolution λ_max·√p·ε is not 0"
+            ),
+            Self::HpenNullityUnavailable => write!(
+                f,
+                "H_pen nullity unavailable (materialization or eigendecomposition failed)"
             ),
         }
     }

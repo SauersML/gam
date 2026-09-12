@@ -5739,56 +5739,68 @@ pub(crate) fn constrained_numerical_fixed_point_failures(
     scalar_model_relerr: f64,
     accepted_step_inf: f64,
     step_tol: f64,
-) -> Vec<String> {
+) -> Vec<gam_problem::ConstrainedFixedPointCondition> {
+    use gam_problem::ConstrainedFixedPointCondition as Condition;
     let mut failures = Vec::new();
     let objective_at_floor = objective_change <= objective_floor;
     if !objective_at_floor {
-        failures.push(format!(
-            "|Δobjective|={objective_change:.3e} is not ≤ objective_floor={objective_floor:.3e}"
-        ));
+        failures.push(Condition::ObjectiveAboveFloor {
+            objective_change,
+            objective_floor,
+        });
     }
     let model_exact = scalar_model_relerr <= CONSTRAINED_FIXED_POINT_MODEL_RELERR_BOUND;
     if !model_exact {
-        failures.push(format!(
-            "scalar_relerr={scalar_model_relerr:.3e} is not ≤ \
-             {CONSTRAINED_FIXED_POINT_MODEL_RELERR_BOUND:.0e}"
-        ));
+        failures.push(Condition::ModelInexact {
+            scalar_model_relerr,
+            bound: CONSTRAINED_FIXED_POINT_MODEL_RELERR_BOUND,
+        });
     }
     let step_within_tol = accepted_step_inf.is_finite() && accepted_step_inf <= step_tol;
     if !step_within_tol {
-        failures.push(format!(
-            "accepted_step_inf={accepted_step_inf:.3e} is not ≤ step_tol={step_tol:.3e}"
-        ));
+        failures.push(Condition::StepAboveTolerance {
+            accepted_step_inf,
+            step_tol,
+        });
     }
     failures
 }
 
-/// What a refusal report says about the constrained fixed-point certificate.
-/// `None` for an unconstrained fit, where that certificate does not apply;
-/// otherwise the condition that declined it, with its value and bound. `nullity`
-/// is `None` when the nullity was never computed and `Some(None)` when it could
-/// not be.
-pub(crate) fn constrained_fixed_point_verdict(
+/// The acceptance conditions of the constrained fixed-point certificate that
+/// declined the iterate: the numerical fixed-point failures, or, once those all
+/// held, the `H_pen` nullity. Empty for an unconstrained fit, where that
+/// certificate does not apply, and when every condition held. `nullity` is `None`
+/// when it was never computed and `Some(None)` when it could not be.
+pub(crate) fn constrained_fixed_point_declining_conditions(
     any_block_constrained: bool,
-    fixed_point_failures: &[String],
+    fixed_point_failures: &[gam_problem::ConstrainedFixedPointCondition],
     nullity: Option<Option<usize>>,
-) -> Option<String> {
+) -> Vec<gam_problem::ConstrainedFixedPointCondition> {
+    use gam_problem::ConstrainedFixedPointCondition as Condition;
     if !any_block_constrained {
-        return None;
+        return Vec::new();
     }
     if !fixed_point_failures.is_empty() {
-        return Some(format!("declined: {}", fixed_point_failures.join("; ")));
+        return fixed_point_failures.to_vec();
     }
-    Some(match nullity {
-        Some(Some(0)) => "all conditions held".to_string(),
-        Some(Some(count)) => format!(
-            "declined: H_pen nullity={count} at the eigensolver resolution λ_max·√p·ε is not 0"
-        ),
-        Some(None) => "declined: H_pen nullity unavailable (materialization or \
-                       eigendecomposition failed)"
-            .to_string(),
-        None => "declined: H_pen nullity was not computed".to_string(),
-    })
+    match nullity {
+        Some(Some(count)) if count > 0 => vec![Condition::HpenNullity { nullity: count }],
+        Some(None) => vec![Condition::HpenNullityUnavailable],
+        _ => Vec::new(),
+    }
+}
+
+/// A refusal report's reading of the constrained fixed-point certificate: `None`
+/// when it declined nothing, otherwise every declining condition with its value
+/// and bound.
+pub(crate) fn constrained_fixed_point_verdict(
+    declining: &[gam_problem::ConstrainedFixedPointCondition],
+) -> Option<String> {
+    if declining.is_empty() {
+        return None;
+    }
+    let conditions: Vec<String> = declining.iter().map(ToString::to_string).collect();
+    Some(format!("declined: {}", conditions.join("; ")))
 }
 
 /// True iff the recent KKT-residual tail (`history`, oldest→newest) shows STEADY
@@ -6005,22 +6017,31 @@ mod constrained_numerical_fixed_point_tests {
     // its value and bound.
     #[test]
     fn refusal_verdict_names_the_condition_that_declined_979() {
-        use super::{constrained_fixed_point_verdict, constrained_numerical_fixed_point_failures};
+        use super::{
+            constrained_fixed_point_declining_conditions, constrained_fixed_point_verdict,
+            constrained_numerical_fixed_point_failures,
+        };
         let ctn_failures =
             constrained_numerical_fixed_point_failures(8.811e-13, 2.4455e-12, 8.810e-13, 8.242e-13, 7.633e-9);
         assert!(ctn_failures.is_empty(), "{ctn_failures:?}");
-        let nullity_verdict =
-            constrained_fixed_point_verdict(true, &ctn_failures, Some(Some(2))).expect("constrained");
+        let nullity = constrained_fixed_point_declining_conditions(true, &ctn_failures, Some(Some(2)));
+        let nullity_verdict = constrained_fixed_point_verdict(&nullity).expect("declined");
         assert!(nullity_verdict.contains("H_pen nullity=2"), "{nullity_verdict}");
+        // The same condition travels in the terminal reason the error string prints.
+        let terminal = gam_problem::JointNewtonTerminalReason::ConstrainedFixedPointDeclined {
+            condition: nullity[0],
+        };
+        assert!(terminal.to_string().contains("H_pen nullity=2"), "{terminal}");
 
         let step_failures =
             constrained_numerical_fixed_point_failures(1e-13, 1.10e-12, 1e-12, 1e-6, 4.3e-11);
-        let step_verdict = constrained_fixed_point_verdict(true, &step_failures, None).expect("constrained");
+        let step = constrained_fixed_point_declining_conditions(true, &step_failures, None);
+        let step_verdict = constrained_fixed_point_verdict(&step).expect("declined");
         assert!(
             step_verdict.contains("accepted_step_inf=1.000e-6")
                 && step_verdict.contains("step_tol=4.300e-11"),
             "{step_verdict}"
         );
-        assert_eq!(constrained_fixed_point_verdict(false, &[], None), None);
+        assert!(constrained_fixed_point_declining_conditions(false, &[], None).is_empty());
     }
 }

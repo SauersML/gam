@@ -5866,13 +5866,28 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
                     residual,
                     Some(&math),
                 );
+                let declining_conditions =
+                    crate::joint_newton::constrained_fixed_point_declining_conditions(
+                        any_block_constrained,
+                        &fixed_point_failures,
+                        constrained_fixed_point_nullity,
+                    );
+                // The error string prints the terminal reason, so the declining
+                // condition travels there as well as in the report.
+                if let Some(&condition) = declining_conditions.first()
+                    && let Some(gam_problem::InnerConvergenceTerminalState::JointNewton {
+                        termination_reason,
+                        ..
+                    }) = terminal_convergence_state.as_mut()
+                {
+                    *termination_reason =
+                        gam_problem::JointNewtonTerminalReason::ConstrainedFixedPointDeclined {
+                            condition,
+                        };
+                }
                 let report = KktRefusalReport {
                     constrained_fixed_point_verdict:
-                        crate::joint_newton::constrained_fixed_point_verdict(
-                            any_block_constrained,
-                            &fixed_point_failures,
-                            constrained_fixed_point_nullity,
-                        ),
+                        crate::joint_newton::constrained_fixed_point_verdict(&declining_conditions),
                     ..report
                 };
                 log::warn!(
