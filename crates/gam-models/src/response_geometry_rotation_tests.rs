@@ -129,39 +129,58 @@ fn formula_shared_tangent_fit_preserves_output_rotations_2627() {
     // Rotating the response only relabels the outputs, so the REML criterion is
     // rotation-invariant and both fits certify the SAME optimum, stopping at two
     // points inside its certified ball. To first order
-    // `ρ̂_base − ρ̂_rot = H⁻¹·(g_base − g_rot)`, so the log-λ displacement is bounded
-    // by `(‖Pg_base‖ + ‖Pg_rot‖)/σ_min(H)` at the base optimum: the amplification
-    // this criterion actually has, rather than an absolute constant on λ.
+    // `ρ̂_base − ρ̂_rot = H⁻¹·(g_base − g_rot)`, so along each eigen-direction `v_i` of
+    // `H` at the base optimum the log-λ displacement is bounded by
+    // `(‖Pg_base‖ + ‖Pg_rot‖)/λ_i`: the amplification this criterion actually has,
+    // rather than an absolute constant on λ. That ball exists only where the
+    // certificate could resolve the curvature, `λ_i` above the resolution it decided
+    // definiteness at. A direction inside that resolution is flat to the instrument:
+    // the criterion does not identify λ along it, and the rotation invariance it owes
+    // is the coefficient and prediction agreement asserted above. On this fixture
+    // census job 505917 at 7ad913f69 measured H = [[6.563, 6.2e-9], [6.2e-9, −4.5e-9]]
+    // against a decided resolution of 9.78e-8, so ρ₁ (the rank-one ridge) is flat.
     let base_rho = base.lambdas.mapv(f64::ln);
     let rotated_rho = rotated.lambdas.mapv(f64::ln);
     let base_hessian = prepared
         .evaluate(&base_rho)
         .expect("same-point base diagnostic")
         .hessian;
-    let sigma_min = base_hessian
+    let resolution = base
+        .outer_certificate
+        .curvature_floor
+        .expect("a measured outer Hessian records the resolution its verdict was decided at")
+        .decided_at_resolution;
+    let (curvatures, directions) = base_hessian
         .eigh(Side::Lower)
-        .expect("outer Hessian spectrum")
-        .0
-        .iter()
-        .copied()
-        .fold(f64::INFINITY, f64::min);
+        .expect("outer Hessian spectrum");
     let gradient_sum = base.outer_certificate.stationarity.projected_norm()
         + rotated.outer_certificate.stationarity.projected_norm();
-    assert!(
-        sigma_min > 0.0,
-        "the certified optimum must be locally strict for a displacement ball to exist: \
-         sigma_min={sigma_min:e}"
-    );
-    let rho_ball = gradient_sum / sigma_min;
-    for (index, (base_value, rotated_value)) in base_rho.iter().zip(rotated_rho.iter()).enumerate()
-    {
-        let displacement = (base_value - rotated_value).abs();
-        assert!(
-            displacement <= rho_ball,
-            "log-lambda[{index}] rotation displacement {displacement:e} exceeds the certified ball \
-             {rho_ball:e} (projected-gradient sum {gradient_sum:e}, sigma_min {sigma_min:e})"
-        );
+    let displacement = &base_rho - &rotated_rho;
+    let mut resolvable = 0usize;
+    for (index, &curvature) in curvatures.iter().enumerate() {
+        if curvature > resolution {
+            resolvable += 1;
+            let along = directions.column(index).dot(&displacement).abs();
+            let ball = gradient_sum / curvature;
+            assert!(
+                along <= ball,
+                "log-lambda rotation displacement {along:e} along eigen-direction {index} \
+                 (curvature {curvature:e}) exceeds the certified ball {ball:e} \
+                 (projected-gradient sum {gradient_sum:e})"
+            );
+        } else {
+            assert!(
+                curvature.abs() <= resolution,
+                "eigen-direction {index} carries resolvable negative curvature {curvature:e} \
+                 (resolution {resolution:e}): the certified point is not a minimum"
+            );
+        }
     }
+    assert!(
+        resolvable > 0,
+        "the certified ball must bound at least one resolvable direction: curvatures \
+         {curvatures:?}, resolution {resolution:e}"
+    );
     assert!((base.sigma2 - rotated.sigma2).abs() <= 1.0e-9 * base.sigma2.max(1.0));
 }
 
