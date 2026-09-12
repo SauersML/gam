@@ -1401,12 +1401,21 @@ impl SaeManifoldTerm {
         if bk.ncols() != p {
             return 0.0;
         }
+        // #2731 — each decoder row is read as one contiguous slice instead of `p`
+        // indexed reads. The products accumulate in the same output order, so the
+        // energy is bit-identical to the indexed loop.
+        let bj = bj.as_standard_layout();
+        let bk = bk.as_standard_layout();
+        let bj = bj.as_slice().expect("a standard-layout array is contiguous");
+        let bk = bk.as_slice().expect("a standard-layout array is contiguous");
         let mut cross = 0.0_f64;
         for a in 0..m_j {
+            let row_j = &bj[a * p..(a + 1) * p];
             for b in 0..m_k {
+                let row_k = &bk[b * p..(b + 1) * p];
                 let mut c = 0.0_f64;
-                for o in 0..p {
-                    c += bj[[a, o]] * bk[[b, o]];
+                for (x, y) in row_j.iter().zip(row_k) {
+                    c += x * y;
                 }
                 cross += c * c;
             }
@@ -1420,12 +1429,18 @@ impl SaeManifoldTerm {
     /// rank-1 block. The rank-aware normalizer of [`Self::decoder_gram_cosine_sq`].
     fn decoder_self_gram_frobenius_norm(b: &Array2<f64>) -> f64 {
         let (m, p) = (b.nrows(), b.ncols());
+        // #2731 — contiguous row slices, same accumulation order as the indexed
+        // loop, so the norm is bit-identical.
+        let b = b.as_standard_layout();
+        let b = b.as_slice().expect("a standard-layout array is contiguous");
         let mut s = 0.0_f64;
         for a in 0..m {
+            let row_a = &b[a * p..(a + 1) * p];
             for a2 in 0..m {
+                let row_a2 = &b[a2 * p..(a2 + 1) * p];
                 let mut c = 0.0_f64;
-                for o in 0..p {
-                    c += b[[a, o]] * b[[a2, o]];
+                for (x, y) in row_a.iter().zip(row_a2) {
+                    c += x * y;
                 }
                 s += c * c;
             }
