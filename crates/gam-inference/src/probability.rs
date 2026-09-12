@@ -796,7 +796,8 @@ fn inverse_regularized_lower_gamma(p: f64, a: f64) -> f64 {
     // Initial estimate. For `a > 1` a Wilson–Hilferty transform of a normal
     // quantile works away from the extreme lower tail; there, the small-`x`
     // analytic seed is essentially exact. Both seeds feed the same Halley polish,
-    // so the crossover is continuous at the converged quantile.
+    // which starts from whichever the CDF places closer to `p`, measured in the
+    // same tail the polish measures its residual in.
     let mut x = if a > 1.0 {
         let pp = if p < 0.5 { p } else { 1.0 - p };
         let t = (-2.0 * pp.ln()).sqrt();
@@ -814,10 +815,22 @@ fn inverse_regularized_lower_gamma(p: f64, a: f64) -> f64 {
         if analytic_seed == 0.0 {
             return 0.0;
         }
-        if !wh_seed.is_finite() || wh_seed <= 0.0 || wh_seed < 1.0e-2 || analytic_seed < 1.0e-2 {
+        if !(wh_seed.is_finite() && wh_seed > 0.0) {
             analytic_seed
         } else {
-            wh_seed
+            let residual = |seed: f64| {
+                let (p_at_seed, q_at_seed) = regularized_incomplete_gamma_pair(a, seed);
+                if p > 0.5 {
+                    ((1.0 - p) - q_at_seed).abs()
+                } else {
+                    (p_at_seed - p).abs()
+                }
+            };
+            if residual(analytic_seed) < residual(wh_seed) {
+                analytic_seed
+            } else {
+                wh_seed
+            }
         }
     } else {
         let t = 1.0 - a * (0.253 + a * 0.12);
