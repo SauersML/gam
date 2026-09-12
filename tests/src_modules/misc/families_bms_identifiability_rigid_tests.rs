@@ -3543,24 +3543,26 @@ fn flexible_family_routes_outer_derivatives_by_scale() {
         dummy_blockspec(1, n_large),
         dummy_blockspec(2, n_large),
     ];
-    // Large-scale flex stays on the exact second-order path through the
-    // matrix-free θ-HVP operator: even at n=50k the operator reuses the flex
-    // row stream once per Hv (near-gradient cost) and PCG converges in a few
-    // iters, so the outer Newton converges in ≤ a couple of iterations rather
-    // than several full-inner-resolve BFGS line searches.
+    // Large-scale flex keeps the matrix-free θ-HVP operator and the second-order
+    // derivative order, but declares no outer Hessian. BMS arms a Jeffreys term,
+    // whose exact outer curvature needs the family's third information derivative,
+    // and BMS exposes that hook only on the rigid two-primary path (98f431392).
+    // #2898's lifecycle decision holds such a route to an exact value and gradient,
+    // with the certificate reporting its curvature as not available.
     assert!(large_flex_family.outer_hyper_hessian_hvp_available(&large_flex_specs));
     assert_eq!(
         large_flex_family
             .exact_outer_derivative_order(&large_flex_specs, &BlockwiseFitOptions::default()),
         ExactOuterDerivativeOrder::Second
     );
+    assert!(!large_flex_family.joint_jeffreys_information_third_directional_available());
     let (large_flex_gradient, large_flex_hessian) = custom_family_outer_derivatives(
         &large_flex_family,
         &large_flex_specs,
         &BlockwiseFitOptions::default(),
     );
     assert_eq!(large_flex_gradient, gam_problem::Derivative::Analytic);
-    assert_eq!(large_flex_hessian, gam_problem::DeclaredHessianForm::Either);
+    assert_eq!(large_flex_hessian, gam_problem::DeclaredHessianForm::Unavailable);
 
     let mut large_rigid_family = large_flex_family.clone();
     large_rigid_family.score_warp = None;
@@ -3627,8 +3629,13 @@ fn bms_advertises_exact_outer_hvp_and_plans_arc_outer_newton() {
     assert_eq!(rigid_hessian, DeclaredHessianForm::Either);
     assert_eq!(arc_plan(rigid_hessian, rigid_specs.len(), 0), Solver::Arc);
 
-    // Flex path (score-warp deviation block adds ψ coords): the prior behavior
-    // demoted this to BFGS; it now plans ARC on the exact θ-HVP.
+    // Flex path (score-warp deviation block adds ψ coords). It still advertises the
+    // exact θ-HVP and the second-order derivative order, but declares no outer
+    // Hessian: BMS exposes the Jeffreys third information derivative only on the
+    // rigid two-primary path, and without it an armed Jeffreys term has no exact
+    // outer curvature (98f431392). #2898 records flex arms as exact in value and
+    // gradient with no curvature at the certificate, so the planner takes a
+    // first-order solver instead of ARC.
     let seed = array![-1.0, 0.0, 1.0];
     let score_prepared = build_score_warp_deviation_block_from_seed(
         &seed,
@@ -3657,13 +3664,13 @@ fn bms_advertises_exact_outer_hvp_and_plans_arc_outer_newton() {
         flex_family.exact_outer_derivative_order(&flex_specs, &BlockwiseFitOptions::default()),
         ExactOuterDerivativeOrder::Second
     );
+    assert!(!flex_family.joint_jeffreys_information_third_directional_available());
     let (flex_gradient, flex_hessian) =
         custom_family_outer_derivatives(&flex_family, &flex_specs, &BlockwiseFitOptions::default());
     assert_eq!(flex_gradient, Derivative::Analytic);
-    assert_eq!(flex_hessian, DeclaredHessianForm::Either);
-    // The flex deviation block carries ψ coords; assert ARC wins over the
-    // HybridEfs lane that would otherwise be eligible for a ψ-bearing problem.
-    assert_eq!(arc_plan(flex_hessian, flex_specs.len(), 1), Solver::Arc);
+    assert_eq!(flex_hessian, DeclaredHessianForm::Unavailable);
+    // With no declared Hessian the ψ-bearing flex problem cannot reach the ARC arm.
+    assert_ne!(arc_plan(flex_hessian, flex_specs.len(), 1), Solver::Arc);
 }
 
 #[test]
