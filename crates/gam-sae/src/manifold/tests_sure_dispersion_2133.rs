@@ -103,15 +103,16 @@ fn fitted_circle(
 }
 
 /// Independent hand recomputation of the correction from the term's OWN
-/// primitives (the same objects the production method reads), returning the total
-/// and the maximum absolute per-row contribution. Mirrors the production formula
-/// exactly, so a match validates the wiring (indexing, `a_k`, second-jet
-/// contraction, PD floor) end-to-end.
+/// primitives (the same objects the production method reads), returning the total,
+/// the maximum absolute per-row contribution, and the smallest ratio of a row's exact
+/// within-basin curvature `htt + c + V''` to its Gauss-Newton curvature `htt + V''`.
+/// Mirrors the production formula exactly, so a match validates the wiring
+/// (indexing, `a_k`, second-jet contraction, PD floor) end-to-end.
 fn hand_correction(
     term: &SaeManifoldTerm,
     rho: &SaeManifoldRho,
     residual: &Array2<f64>,
-) -> (f64, f64) {
+) -> (f64, f64, f64) {
     let p = term.output_dim();
     let n = term.n_obs();
     let sj = term
@@ -123,6 +124,7 @@ fn hand_correction(
     let mut a_row = vec![0.0; term.atoms.len()];
     let mut total = 0.0_f64;
     let mut max_abs = 0.0_f64;
+    let mut min_curvature_ratio = f64::INFINITY;
     for i in 0..n {
         term.assignment
             .try_assignments_row_into(i, &mut a_row)
@@ -149,8 +151,9 @@ fn hand_correction(
         let delta = htt / denom_full - htt / denom_gn;
         total += delta;
         max_abs = max_abs.max(delta.abs());
+        min_curvature_ratio = min_curvature_ratio.min((htt + c + v_pp) / denom_gn);
     }
-    (total, max_abs)
+    (total, max_abs, min_curvature_ratio)
 }
 
 /// (1) PLUMBING + STABILITY on a real converged fit.
@@ -187,18 +190,31 @@ fn sure_correction_wiring_and_stability_2133() {
     let correction = term
         .coordinate_sure_deflation_correction(residual.view(), &rho)
         .expect("guards are disabled and the fit converged, so the correction is defined");
-    let (hand, max_abs_row) = hand_correction(&term, &rho, &residual);
+    let (hand, max_abs_row, min_curvature_ratio) = hand_correction(&term, &rho, &residual);
     eprintln!(
-        "[#2133 wiring] correction={correction:.6} hand={hand:.6} max|Δedf/row|={max_abs_row:.4}"
+        "[#2133 wiring] correction={correction:.6} hand={hand:.6} max|Δedf/row|={max_abs_row:.4} \
+         min (htt+c+V'')/(htt+V'')={min_curvature_ratio:.4}"
     );
     assert!(
         (correction - hand).abs() < 1e-9,
         "method {correction} != hand replica {hand}"
     );
-    // Per-row dof correction is bounded (no floor blow-up / instability).
+    // Stability. A row's correction has no data-independent bound. On a circle of
+    // radius R, a row whose data lies at in-plane radius r_d, fitted at its
+    // minimizing angle, leaves an outward residual a_k·R − r_d against the inward
+    // second jet, so its exact within-basin curvature htt + c is proportional to r_d:
+    // the divergence is about a_k·R/r_d and the correction about a_k·R/r_d − 1,
+    // unbounded as the data approaches the center. The former `< 1.5` bar assumed no
+    // row near the center, which σ = 0.3R in-plane noise does not guarantee: census
+    // job 505903 measured 2.696, which that relation places near r_d ≈ 0.27·a_k·R.
+    // What a converged fit does guarantee is that every row's coordinate minimizes
+    // its own penalized objective, so the exact curvature is positive on every row.
+    // A coordinate left at the antipodal angle has negative curvature.
     assert!(
-        max_abs_row < 1.5,
-        "per-row dof correction {max_abs_row} unphysically large"
+        min_curvature_ratio > 0.0,
+        "a row's exact within-basin curvature is not positive (min (htt+c+V'')/(htt+V'') = \
+         {min_curvature_ratio}, max per-row correction {max_abs_row}): its coordinate is not \
+         at a minimum of its own penalized objective"
     );
     // Total correction is a modest fraction of the row count (a per-row edf tweak).
     assert!(
