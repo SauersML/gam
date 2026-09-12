@@ -4201,34 +4201,31 @@ fn cholesky_lower_faer_path_matches_scalar_reference_on_wide_schur() {
     );
 }
 
-/// Dense power-iteration reference for the top eigenvalue of an SPD matrix — a
-/// self-contained oracle for [`reduced_schur_lambda_max`] that needs no eigh
-/// import. Converges to `λ_max` from below; 200 steps is far more than the
-/// well-separated fixture needs.
+/// Top eigenvalue of a symmetric matrix from a dense eigendecomposition: the
+/// oracle for [`reduced_schur_lambda_max`].
+///
+/// A power iteration cannot serve as this oracle. In `dense_direct_system` every
+/// row's `htbeta` block repeats one vector in each of its `d` rows, so the Schur
+/// correction `C` is positive semidefinite with rank at most `n`, and with
+/// `n = 40 < k = 80` the reduced Schur `S = (6 + ridge_beta)·I − C` carries
+/// `λ_max = 6 + ridge_beta` on a subspace of dimension at least 40, with `C`'s
+/// smallest eigenvalues just below it. A Rayleigh quotient approaches `λ_max`
+/// from below at a rate set by that gap; 200 steps left it 7.5e-5 short, over
+/// 10⁴ times the bracket's residual bound.
 fn dense_top_eigenvalue(a: &Array2<f64>) -> f64 {
-    let n = a.nrows();
-    let mut v = Array1::<f64>::from_elem(n, 1.0);
-    let inv = v.dot(&v).sqrt().recip();
-    v.mapv_inplace(|x| x * inv);
-    let mut lambda = 0.0;
-    for _ in 0..200 {
-        let av = a.dot(&v);
-        lambda = v.dot(&av);
-        let norm = av.dot(&av).sqrt();
-        if norm == 0.0 {
-            break;
-        }
-        v = av / norm;
-    }
-    lambda
+    use gam_linalg::faer_ndarray::FaerEigh;
+    let (eigenvalues, _) = a
+        .eigh(faer::Side::Lower)
+        .expect("dense reduced-Schur symmetric eigendecomposition");
+    eigenvalues.iter().copied().fold(f64::NEG_INFINITY, f64::max)
 }
 
 /// The #2080 fixed-rational log-det surrogate on the matrix-free `schur_matvec`
 /// apply (`rational_reduced_schur_log_det`, NO dense `k×k` Schur formed) must
 /// agree with the exact dense evidence `log|S|` it replaces, be bit-reproducible
 /// for a fixed seed (the REML outer loop differentiates a DETERMINISTIC
-/// objective), and bracket the spectrum correctly via the matrix-free power
-/// iteration. Companion to `slq_reduced_schur_log_det_matches_dense_evidence` —
+/// objective), and bracket the spectrum from above via the certified matrix-free
+/// Lanczos solve. Companion to `slq_reduced_schur_log_det_matches_dense_evidence` —
 /// the surrogate's added contract (value/gradient one functional) is exercised
 /// separately by `rational_reduced_schur_directional_matches_fd_of_surrogate`.
 #[test]
@@ -4257,12 +4254,8 @@ fn rational_reduced_schur_log_det_matches_dense_evidence() {
     let exact_logdet: f64 = (0..k).map(|i| 2.0 * l[[i, i]].ln()).sum();
     let true_lambda_max = dense_top_eigenvalue(&schur);
 
-    // Spectral bracket: power iteration on `schur_matvec` recovers λ_max
-    // (Rayleigh quotient converges from below, so it never exceeds the truth).
-    // The surrogate only needs a bracket good to a factor — its quadrature window
-    // is padded two decades each side — so assert a factor-of-2 band rather than a
-    // tight eigenvalue tolerance, which would be flaky when the top two
-    // eigenvalues are close (slow power-iteration convergence).
+    // Spectral bracket: a certified Lanczos solve on `schur_matvec` returns the
+    // top Ritz value plus its residual bound.
     let lambda_max = reduced_schur_lambda_max(
         &sys,
         &htt_factors,
