@@ -193,8 +193,8 @@ dropped, and restored items the table above retires were removed again.
 | Defined elsewhere in the same crate | 17 |
 | Retired by the decisions above | 19 |
 | Retired: nothing that survived depends on it | 278 |
-| Retired by the owning work's own decision | 3 |
-| Deferred to the owner of an actively edited file | 23 |
+| Retired by the owning work's own decision | 7 |
+| Deferred to the owner of an actively edited file | 19 |
 
 Retired identities carry no compatibility obligation. Restoration is closed
 under calls: after the merges, no restored body calls a function the sweep
@@ -206,12 +206,16 @@ deleted instead of getting its producer back, with an entry in
 (`gpu_kernels/resident_arrow.rs`), `DeviceResidentPcgInput` and
 `DeviceResidentPcgOutput` (`bms/gpu/device_pcg.rs`),
 `BernoulliMarginalSlopeAloRowInput` and `BernoulliMarginalSlopeAloRowGeometry`
-(`bms/alo_replay.rs`), and `GraphBirthCandidate` (`structure_harvest.rs`).
+(`bms/alo_replay.rs`), `GraphBirthCandidate` (`structure_harvest.rs`), and
+`CertifiedLogSigmaCurvature` (`survival/latent/survival/log_sigma_curvature_certificate.rs`).
 
 The deferred identities live in files other active work owns (survival, jets,
 and the finite-set race scaffolding); those owners were given each surviving
 carrier and dangling reference. Steering retired its own carriers
 (`CoordinateSetResult`, `InterchangeResult`) and their deleted producers.
+Survival retired its own: the `CertifiedLogSigmaCurvature` carrier with its three
+deleted identities, and `survival_location_scale_block_effective_jacobian`, which
+nothing that survived calls.
 
 Three restorations were adapted rather than taken verbatim:
 

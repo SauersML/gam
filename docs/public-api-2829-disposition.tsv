@@ -283,11 +283,11 @@ crates/gam-models/src/survival/construction.rs	evaluate_initial	retired-no-survi
 crates/gam-models/src/survival/construction.rs	fixed_offsets	retired-no-surviving-dependent
 crates/gam-models/src/survival/construction.rs	marginal_slope_baseline_chain_rule_hessian	retired-no-surviving-dependent
 crates/gam-models/src/survival/construction.rs	optimize_survival_baseline_config_with_gradient	retired-no-surviving-dependent
-crates/gam-models/src/survival/latent/survival/log_sigma_curvature_certificate.rs	is_trustworthy	deferred-to-owner:survival
-crates/gam-models/src/survival/latent/survival/log_sigma_curvature_certificate.rs	latent_survival_log_sigma_curvature_certified	deferred-to-owner:survival
-crates/gam-models/src/survival/latent/survival/log_sigma_curvature_certificate.rs	relative_error	deferred-to-owner:survival
+crates/gam-models/src/survival/latent/survival/log_sigma_curvature_certificate.rs	is_trustworthy	retired-by-owner:survival
+crates/gam-models/src/survival/latent/survival/log_sigma_curvature_certificate.rs	latent_survival_log_sigma_curvature_certified	retired-by-owner:survival
+crates/gam-models/src/survival/latent/survival/log_sigma_curvature_certificate.rs	relative_error	retired-by-owner:survival
 crates/gam-models/src/survival/location_scale/family_solver.rs	block_effective_jacobian	defined-elsewhere-in-crate
-crates/gam-models/src/survival/location_scale/family_solver.rs	survival_location_scale_block_effective_jacobian	deferred-to-owner:survival
+crates/gam-models/src/survival/location_scale/family_solver.rs	survival_location_scale_block_effective_jacobian	retired-by-owner:survival
 crates/gam-models/src/survival/lognormal_kernel.rs	log_kernel_term	retired-no-surviving-dependent
 crates/gam-models/src/survival/marginal_slope/row_math.rs	survival_marginal_slope_vector_eta	retired-no-surviving-dependent
 crates/gam-models/src/survival/marginal_slope/row_math.rs	survival_marginal_slope_vector_scale	retired-no-surviving-dependent
