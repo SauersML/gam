@@ -3221,5 +3221,15 @@
     ],
     "reason": "SPEC rule 19: the spectrometer noise-floor profile no longer uses a value-only golden-section search",
     "evidence": "ff6a77d39 replaced golden_section_min (golden-section contraction of RSS(sigma^2) values over [0, L_min)) with profile_noise_floor: closed-form dRSS/dsigma^2 = 2 r^T u and d2RSS/dsigma^2^2 = 2 |P_perp u|^2 - 2 sum r_i u_i^2, minimized by OuterProblem with its certificate. Its only call site was fit_scaling_law in the same file (source_removal_guard.py over 4e47eed5a..ff6a77d39 blocks exactly this item, production_occurrences 2). The existing scaling_law_recovers_planted_power_law_with_floor and flat_losses_flag_floor_saturation tests pin the behaviour; pool gate job 448206 runs them at ff6a77d39."
+  },
+  {
+    "base": "a9863a62735a0bf2ef57d0b29bc249f814e69708",
+    "items": [
+      "crates/gam-sae/src/dual_certificate.rs:fn:harmonic_dual_argmax",
+      "crates/gam-sae/src/dual_certificate.rs:fn:harmonic_dual_derivative",
+      "crates/gam-sae/src/dual_certificate.rs:fn:harmonic_dual_second_derivative"
+    ],
+    "reason": "SPEC rules 18 and 22: the BLASSO harmonic dual supremum is taken from the trigonometric polynomial's exact stationary set, not a sampled grid with a capped polish",
+    "evidence": "harmonic_dual_argmax took the argmax of a 4H-node grid and polished it with at most 64 Newton steps, keeping the grid node when the polish did not converge. Its only caller, harmonic_dual_birth_eta (reached from the sparse_dict/coordinate.rs harmonic lanes), now reads the supremum from crate::sparse_dict::harmonic_argmax over the same (c_h, s_h) coefficients: every stationary point of the degree-H polynomial isolated through its Chebyshev eliminant, the complete candidate set of a global maximum. harmonic_dual_derivative and harmonic_dual_second_derivative were called only by harmonic_dual_argmax. source_removal_guard.py over this landing's base..candidate blocks exactly these three items and passes with this entry."
   }
 ]

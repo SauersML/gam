@@ -137,7 +137,13 @@ pub fn harmonic_dual_birth_eta(residual_coeffs: &[(f64, f64)], active_mass: f64)
         return 0.0;
     }
     let lambda = active_mass.max(LAMBDA_FLOOR);
-    let (t, _curvature) = harmonic_dual_argmax(residual_coeffs);
+    // The supremum of the degree-`H` dual trigonometric polynomial is attained on
+    // its complete stationary set, isolated analytically, never on a sampled grid.
+    let flat: Vec<f64> = residual_coeffs
+        .iter()
+        .flat_map(|&(c_h, s_h)| [c_h, s_h])
+        .collect();
+    let (t, _curvature) = crate::sparse_dict::harmonic_argmax(&flat);
     let matched_amplitude =
         harmonic_dual_value(residual_coeffs, t).max(0.0) / residual_coeffs.len() as f64;
     matched_amplitude / lambda
@@ -151,70 +157,6 @@ fn harmonic_dual_value(coeffs: &[(f64, f64)], t: f64) -> f64 {
         acc += c_h * cos_h + s_h * sin_h;
     }
     acc
-}
-
-fn harmonic_dual_derivative(coeffs: &[(f64, f64)], t: f64) -> f64 {
-    let mut acc = 0.0;
-    for (h, &(c_h, s_h)) in coeffs.iter().enumerate() {
-        let omega = TAU * (h + 1) as f64;
-        let phase = omega * t;
-        let (sin_h, cos_h) = phase.sin_cos();
-        acc += omega * (-c_h * sin_h + s_h * cos_h);
-    }
-    acc
-}
-
-fn harmonic_dual_second_derivative(coeffs: &[(f64, f64)], t: f64) -> f64 {
-    let mut acc = 0.0;
-    for (h, &(c_h, s_h)) in coeffs.iter().enumerate() {
-        let omega = TAU * (h + 1) as f64;
-        let phase = omega * t;
-        let (sin_h, cos_h) = phase.sin_cos();
-        acc += omega * omega * (-c_h * cos_h - s_h * sin_h);
-    }
-    acc
-}
-
-fn harmonic_dual_argmax(coeffs: &[(f64, f64)]) -> (f64, f64) {
-    let harmonics = coeffs.len();
-    let grid = 4 * harmonics.max(1);
-    let mut best_t = 0.0;
-    let mut best_value = f64::NEG_INFINITY;
-    for idx in 0..grid {
-        let t = idx as f64 / grid as f64;
-        let value = harmonic_dual_value(coeffs, t);
-        if value > best_value {
-            best_value = value;
-            best_t = t;
-        }
-    }
-
-    let tolerance = f64::EPSILON.sqrt();
-    let iteration_cap = 64;
-    let mut t = best_t;
-    let mut converged = false;
-    for _step_idx in 0..iteration_cap {
-        let second = harmonic_dual_second_derivative(coeffs, t);
-        if second.abs() <= f64::MIN_POSITIVE {
-            break;
-        }
-        let step = harmonic_dual_derivative(coeffs, t) / second;
-        t -= step;
-        if step.abs() <= tolerance * (1.0 + t.abs()) {
-            converged = true;
-            break;
-        }
-    }
-
-    let polished_t = t.rem_euclid(1.0);
-    if converged && harmonic_dual_value(coeffs, polished_t) >= best_value {
-        (
-            polished_t,
-            harmonic_dual_second_derivative(coeffs, polished_t),
-        )
-    } else {
-        (best_t, harmonic_dual_second_derivative(coeffs, best_t))
-    }
 }
 
 /// Assemble a [`DualCertificateReport`] from per-row certificates.

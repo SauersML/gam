@@ -903,7 +903,7 @@ fn harmonic_stationary_points(rho: &[f64]) -> Vec<f64> {
 /// Locate the global maximiser of `f` on `[0,1)` by evaluating the complete
 /// stationary set of its degree-`H` trigonometric polynomial. Returns
 /// `(t̂, f''(t̂))`; ties choose the smallest phase deterministically.
-fn harmonic_argmax(rho: &[f64]) -> (f64, f64) {
+pub(crate) fn harmonic_argmax(rho: &[f64]) -> (f64, f64) {
     let stationary = harmonic_stationary_points(rho);
     let Some(&first) = stationary.first() else {
         return (0.0, harmonic_fpp(rho, 0.0));

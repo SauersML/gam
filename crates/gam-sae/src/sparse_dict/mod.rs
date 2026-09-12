@@ -93,6 +93,7 @@ pub use split_lr_fdr::{
 pub use stream::{EpochStats, ShardStats, SparseDictArtifact, SparseDictStreamState};
 pub use update::{DecoderSolveStats, LinearBlockRemlStats, SparseDictionaryError, linear_shared_rho_fs_step};
 pub(crate) use update::extend_linear_reml_schedule;
+pub(crate) use coordinate::harmonic_argmax;
 
 use ndarray::{Array2, ArrayView2};
 
