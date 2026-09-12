@@ -666,11 +666,9 @@ pub(super) fn validate_spec(
             spec.slope_offset.len()
         ));
     }
-    if spec
-        .y
-        .iter()
-        .any(|&yi| !yi.is_finite() || ((yi - 0.0).abs() > 1e-9 && (yi - 1.0).abs() > 1e-9))
-    {
+    // Exact membership: a response within some distance of 0 or 1 is still not
+    // an outcome, and the likelihood would read the value it carries.
+    if spec.y.iter().any(|&yi| !(yi == 0.0 || yi == 1.0)) {
         return Err("bernoulli-marginal-slope requires binary y in {0,1}".to_string());
     }
     if spec.weights.iter().any(|&w| !w.is_finite() || w < 0.0) {

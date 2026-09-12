@@ -215,7 +215,15 @@ pub(super) fn pooled_probit_baseline(
         .map(|(&yi, &wi)| yi * wi)
         .sum::<f64>()
         / weight_sum;
-    let prevalence = prevalence.clamp(1e-6, 1.0 - 1e-6);
+    // The pooled probit has a finite intercept only when both outcomes carry
+    // weight the prevalence can resolve: at exactly 0 or 1 the likelihood has no
+    // finite mode, and a clamped prevalence would seed a mode that is not there.
+    if !(prevalence > 0.0 && prevalence < 1.0) {
+        return Err(format!(
+            "pooled bernoulli-marginal-slope pilot requires both outcomes to carry weight; \
+             the weighted prevalence is {prevalence}"
+        ));
+    }
     let z_mean = z
         .iter()
         .zip(weights.iter())
@@ -358,6 +366,32 @@ pub(super) fn pooled_probit_baseline(
         beta1
     };
     Ok((a / (1.0 + b * b).sqrt(), b))
+}
+
+#[cfg(test)]
+mod pooled_probit_prevalence_tests {
+    use super::pooled_probit_baseline;
+    use ndarray::{Array1, array};
+
+    #[test]
+    fn a_response_weighted_on_one_outcome_has_no_pooled_probit_mode() {
+        let z = array![-1.0, 0.0, 1.0, 2.0];
+        let weights = Array1::<f64>::ones(4);
+        for outcome in [0.0, 1.0] {
+            let y = Array1::from_elem(4, outcome);
+            let error = pooled_probit_baseline(&y, &z, &weights)
+                .expect_err("a response with one outcome has no finite probit intercept");
+            assert!(error.contains("both outcomes"), "{error}");
+        }
+        // Both outcomes present, but the failures carry no weight.
+        let y = array![0.0, 1.0, 0.0, 1.0];
+        let failures_unweighted = array![0.0, 1.0, 0.0, 1.0];
+        assert!(pooled_probit_baseline(&y, &z, &failures_unweighted).is_err());
+        // Non-vacuity: with both outcomes weighted and no separation the pilot
+        // returns a finite pair.
+        let (intercept, slope) = pooled_probit_baseline(&y, &z, &weights).expect("pilot");
+        assert!(intercept.is_finite() && slope.is_finite());
+    }
 }
 
 // Compute a non-degenerate pilot η for the link-deviation cross-block

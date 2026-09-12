@@ -649,15 +649,47 @@ pub(crate) fn binomial_location_scale_link_eta_from_probability(
     link_kind: &InverseLink,
     probability: f64,
 ) -> Result<f64, String> {
-    let target = probability.clamp(1e-6, 1.0 - 1e-6);
+    // The warm-start threshold is the link quantile of the weighted prevalence,
+    // finite only strictly inside (0, 1): a response whose weight sits on one
+    // outcome has no finite threshold, and a clamped probability would seed one.
+    if !(probability > 0.0 && probability < 1.0) {
+        return Err(GamlssError::InvalidInput {
+            reason: format!(
+                "binomial location-scale warm start requires a weighted prevalence strictly \
+                 inside (0, 1); got {probability}"
+            ),
+        }
+        .into());
+    }
     match link_kind {
-        InverseLink::Standard(StandardLink::Logit) => Ok((target / (1.0 - target)).ln()),
-        InverseLink::Standard(StandardLink::Probit) => standard_normal_quantile(target)
+        InverseLink::Standard(StandardLink::Logit) => Ok((probability / (1.0 - probability)).ln()),
+        InverseLink::Standard(StandardLink::Probit) => standard_normal_quantile(probability)
             .map_err(|err| format!("failed to invert probit warm-start probability: {err}")),
-        InverseLink::Standard(StandardLink::CLogLog) => Ok((-((1.0 - target).ln())).ln()),
+        InverseLink::Standard(StandardLink::CLogLog) => Ok((-((1.0 - probability).ln())).ln()),
         other => Err(GamlssError::UnsupportedConfiguration { reason: format!(
             "binomial location-scale warm start requires logit, probit, or cloglog link, got {other:?}"
         ) }.into()),
+    }
+}
+
+#[cfg(test)]
+mod warm_start_prevalence_tests {
+    use super::*;
+
+    #[test]
+    fn a_prevalence_on_one_outcome_has_no_warm_start_threshold() {
+        let logit = InverseLink::Standard(StandardLink::Logit);
+        for probability in [0.0, 1.0] {
+            let error = binomial_location_scale_link_eta_from_probability(&logit, probability)
+                .expect_err("a single-outcome prevalence has no finite threshold");
+            assert!(error.contains("strictly inside (0, 1)"), "{error}");
+        }
+        // Non-vacuity: an interior prevalence below the retired `1e-6` clamp
+        // maps verbatim.
+        let rare = 1.0e-9;
+        let eta = binomial_location_scale_link_eta_from_probability(&logit, rare)
+            .expect("an interior prevalence has a threshold");
+        assert_eq!(eta, (rare / (1.0 - rare)).ln());
     }
 }
 

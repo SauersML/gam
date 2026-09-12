@@ -3388,6 +3388,26 @@ fn validate_spec_rejects_nonfinite_or_negative_weights() {
 }
 
 #[test]
+fn validate_spec_admits_only_exact_binary_outcomes() {
+    let data = Array2::<f64>::zeros((3, 0));
+    let weights = array![1.0, 1.0, 1.0];
+    let z = array![-1.0, 0.0, 1.0];
+    // A value one part in 1e12 from an outcome is not an outcome: the likelihood
+    // would read the value it carries, not the outcome it is near.
+    for near_outcome in [1.0e-12, 1.0 - 1.0e-12] {
+        let err = validate_spec(
+            data.view(),
+            &base_spec(array![0.0, near_outcome, 1.0], weights.clone(), z.clone()),
+        )
+        .expect_err("a response near but not at an outcome should be rejected");
+        assert!(err.contains("binary y in {0,1}"), "{err}");
+    }
+    // Non-vacuity: exact outcomes, including a negative zero, are admitted.
+    validate_spec(data.view(), &base_spec(array![0.0, 1.0, -0.0], weights, z))
+        .unwrap_or_else(|e| panic!("exact binary outcomes should be admitted: {e}"));
+}
+
+#[test]
 fn validate_spec_rejects_nonfinite_z_values() {
     let data = Array2::<f64>::zeros((3, 0));
     let err = validate_spec(
