@@ -610,8 +610,10 @@ pub(crate) enum JeffreysCompletionAssembly {
     Contracted,
     /// Produce the exact objective Hessian. If the family has no fused
     /// contracted implementation, assemble the mathematically identical
-    /// pairwise second-directional form. Returned-mode certification and the
-    /// inner Newton endgame use this authority and may not omit a term.
+    /// second-directional form: one pass per span direction when the information
+    /// is the observed Hessian, one per coefficient pair otherwise. Returned-mode
+    /// certification and the inner Newton endgame use this authority and may not
+    /// omit a term.
     Exact,
 }
 
@@ -707,21 +709,32 @@ pub(crate) fn custom_family_joint_jeffreys_second_order_completion<
                     states, specs, u, v,
                 )
             };
-            match motion.as_ref() {
-                Some(motion) => {
-                    gam_solve::estimate::reml::jeffreys_subspace::joint_jeffreys_second_order_completion_with_motion(
-                        h_joint.view(),
-                        z_joint.view(),
-                        second_direction,
-                        motion,
-                    )?
-                }
-                None => {
-                    gam_solve::estimate::reml::jeffreys_subspace::joint_jeffreys_second_order_completion(
-                        h_joint.view(),
-                        z_joint.view(),
-                        second_direction,
-                    )?
+            if family.joint_jeffreys_information_matches_observed_hessian() {
+                // The observed Hessian's fourth derivative is fully symmetric, so one pass per
+                // span direction replaces one per coefficient pair (#2893).
+                gam_solve::estimate::reml::jeffreys_subspace::joint_jeffreys_observed_hessian_completion(
+                    h_joint.view(),
+                    z_joint.view(),
+                    second_direction,
+                    motion.as_ref(),
+                )?
+            } else {
+                match motion.as_ref() {
+                    Some(motion) => {
+                        gam_solve::estimate::reml::jeffreys_subspace::joint_jeffreys_second_order_completion_with_motion(
+                            h_joint.view(),
+                            z_joint.view(),
+                            second_direction,
+                            motion,
+                        )?
+                    }
+                    None => {
+                        gam_solve::estimate::reml::jeffreys_subspace::joint_jeffreys_second_order_completion(
+                            h_joint.view(),
+                            z_joint.view(),
+                            second_direction,
+                        )?
+                    }
                 }
             }
         }

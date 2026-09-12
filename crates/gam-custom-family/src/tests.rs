@@ -4111,13 +4111,20 @@ pub(crate) fn jeffreys_second_order_completion_prefers_contracted_hook() {
     );
 }
 
-/// gam#1020: for a family without a contracted hook, exact assembly dispatches
-/// to the mathematically identical pairwise second-directional path. The
-/// contracted-only policy must decline because that family contract is absent.
+/// gam#1020: for an expected-information family without a contracted hook, exact
+/// assembly dispatches to the mathematically identical pairwise second-directional
+/// path. The contracted-only policy must decline because that family contract is
+/// absent.
 #[derive(Clone)]
 struct PairwiseJeffreysSeamFamily;
 
 impl CustomFamily for PairwiseJeffreysSeamFamily {
+    // `(u·v)·M` is not the fourth derivative of one scalar, so this fixture stands for an
+    // expected-information family, which keeps the pairwise form (#2893).
+    fn joint_jeffreys_information_matches_observed_hessian(&self) -> bool {
+        false
+    }
+
     // Without this the family never opts into the Jeffreys term, so
     // `joint_jeffreys_term_strength()` returns 0.0 (its default is
     // `if joint_jeffreys_term_required() { 1.0 } else { 0.0 }`) and
@@ -4211,6 +4218,91 @@ pub(crate) fn jeffreys_second_order_completion_exact_pairwise_when_hook_absent()
     assert!(
         contracted_only.is_none(),
         "contracted-only assembly must decline when the family has no contracted hook"
+    );
+}
+
+/// gam#2893: `H''[u, v] = 2(u·v)·I + 2(uvᵀ + vuᵀ)` is the second directional derivative of the
+/// Hessian of `¼‖β‖⁴`, a fully symmetric fourth derivative, so exact assembly contracts it along
+/// the span directions and must reproduce the pairwise form.
+#[derive(Clone)]
+struct ObservedHessianJeffreysSeamFamily;
+
+impl CustomFamily for ObservedHessianJeffreysSeamFamily {
+    fn joint_jeffreys_term_required(&self) -> bool {
+        true
+    }
+
+    fn evaluate(&self, block_states: &[ParameterBlockState]) -> Result<FamilyEvaluation, String> {
+        let n = block_states
+            .first()
+            .ok_or_else(|| "missing block 0".to_string())?
+            .eta
+            .len();
+        Ok(FamilyEvaluation {
+            log_likelihood: 0.0,
+            blockworking_sets: vec![BlockWorkingSet::Diagonal {
+                working_response: Array1::zeros(n),
+                working_weights: Array1::ones(n),
+            }],
+        })
+    }
+
+    fn joint_jeffreys_information_second_directional_derivative_with_specs(
+        &self,
+        block_states: &[ParameterBlockState],
+        specs: &[ParameterBlockSpec],
+        d_beta_u_flat: &Array1<f64>,
+        d_betav_flat: &Array1<f64>,
+    ) -> Result<Option<Array2<f64>>, String> {
+        assert_eq!(block_states.len(), specs.len());
+        let p = d_beta_u_flat.len();
+        let mut second = Array2::<f64>::eye(p) * (2.0 * d_beta_u_flat.dot(d_betav_flat));
+        for a in 0..p {
+            for b in 0..p {
+                second[[a, b]] +=
+                    2.0 * (d_beta_u_flat[a] * d_betav_flat[b] + d_betav_flat[a] * d_beta_u_flat[b]);
+            }
+        }
+        Ok(Some(second))
+    }
+}
+
+#[test]
+pub(crate) fn jeffreys_second_order_completion_exact_contracts_span_directions_2893() {
+    let family = ObservedHessianJeffreysSeamFamily;
+    let specs = vec![jeffreys_seam_spec(2)];
+    let states = vec![jeffreys_seam_state(Array1::zeros(2))];
+    let h_joint = array![[1.0e-4, 0.0], [0.0, 1.0]];
+    let z_joint = Array2::<f64>::eye(2);
+
+    let completion = custom_family_joint_jeffreys_second_order_completion(
+        &family,
+        &states,
+        &specs,
+        &h_joint,
+        &z_joint,
+        JeffreysCompletionAssembly::Exact,
+    )
+    .expect("completion")
+    .expect("completion present");
+    let pairwise =
+        gam_solve::estimate::reml::jeffreys_subspace::joint_jeffreys_second_order_completion(
+            h_joint.view(),
+            z_joint.view(),
+            |u: &Array1<f64>, v: &Array1<f64>| {
+                family.joint_jeffreys_information_second_directional_derivative_with_specs(
+                    &states, &specs, u, v,
+                )
+            },
+        )
+        .expect("direct pairwise completion")
+        .expect("direct pairwise completion present");
+    let scale = pairwise.iter().fold(0.0_f64, |acc, v| acc.max(v.abs()));
+    let gap = (&completion - &pairwise).iter().fold(0.0_f64, |acc, v| acc.max(v.abs()));
+    assert!(scale > 0.0, "pairwise completion should be nonzero on this gated fixture");
+    assert!(
+        gap <= 1e-12 * scale,
+        "span-direction completion must equal the pairwise completion: gap {gap:e}, scale {scale:e}"
     );
 }
 

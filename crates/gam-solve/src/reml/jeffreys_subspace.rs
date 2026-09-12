@@ -2603,7 +2603,22 @@ where
     joint_jeffreys_pairwise_completion(h_joint, z_j, hessian_second_dir, Some(motion))
 }
 
-fn joint_jeffreys_pairwise_completion<Dir2Fn>(
+/// [`joint_jeffreys_second_order_completion_with_motion`] for a Jeffreys information that is
+/// the observed Hessian of one scalar objective, from one second-directional pass per span
+/// direction instead of one per coefficient pair (gam#2893).
+///
+/// With `H = ∇²f`, `H''[u, v]_ab = ∂⁴f[a, b, u, v]` is symmetric in all four slots. Writing the
+/// symmetric reduced weight `W = K + (2/G)·extra_reduced_weight` as `U·diag(s)·Uᵀ` and
+/// `w_k = Z_J·U·e_k`,
+///
+/// ```text
+/// ⟨Z_J W Z_Jᵀ, H''[e_a, e_b]⟩ = Σ_cd (Z_J W Z_Jᵀ)_cd ∂⁴f[c, d, a, b] = Σ_k s_k·H''[w_k, w_k]_ab,
+/// ```
+///
+/// so the `p(p+1)/2` full-data passes of the pairwise form become `Z_J.ncols() ≤ p`. An
+/// expected (Fisher) information is not the Hessian of a scalar, has no such symmetry, and
+/// keeps the pairwise form.
+pub fn joint_jeffreys_observed_hessian_completion<Dir2Fn>(
     h_joint: ArrayView2<'_, f64>,
     z_j: ArrayView2<'_, f64>,
     hessian_second_dir: Dir2Fn,
@@ -2612,6 +2627,60 @@ fn joint_jeffreys_pairwise_completion<Dir2Fn>(
 where
     Dir2Fn: Fn(&Array1<f64>, &Array1<f64>) -> Result<Option<Array2<f64>>, String> + Sync,
 {
+    let p = h_joint.nrows();
+    let Some((gate_weight, mut reduced_weight)) =
+        joint_jeffreys_completion_reduced_weight(h_joint, z_j, motion)?
+    else {
+        return Ok(Some(Array2::zeros((p, p))));
+    };
+    symmetrize_contiguous(&mut reduced_weight);
+    let (weights, basis) = reduced_weight.eigh(Side::Lower).map_err(|e| {
+        format!(
+            "joint_jeffreys_observed_hessian_completion: reduced-weight eigendecomposition failed: {e}"
+        )
+    })?;
+    let directions = z_j.dot(&basis);
+    // One full-data pass per span direction, fanned across the Rayon pool with nested faer
+    // pinned to `Par::Seq` as in the pairwise form. Results resolve in direction order, so the
+    // first anomaly wins deterministically.
+    let passes: Vec<Result<Option<Array2<f64>>, String>> = {
+        use rayon::iter::{IntoParallelIterator, ParallelIterator};
+        (0..directions.ncols())
+            .into_par_iter()
+            .map(|k| {
+                let direction = directions.column(k).to_owned();
+                gam_problem::with_nested_parallel(|| hessian_second_dir(&direction, &direction))
+            })
+            .collect()
+    };
+    let mut completion = Array2::<f64>::zeros((p, p));
+    for (k, pass) in passes.into_iter().enumerate() {
+        let Some(h2) = pass? else {
+            return Ok(None);
+        };
+        if h2.dim() != (p, p) {
+            return Err(format!(
+                "joint_jeffreys_observed_hessian_completion: H''[w_{k}, w_{k}] shape {:?} != ({p}, {p})",
+                h2.dim()
+            ));
+        }
+        completion.scaled_add(-0.5 * gate_weight * weights[k], &h2);
+    }
+    symmetrize_contiguous(&mut completion);
+    if let Some(motion) = motion {
+        completion -= &motion.remainder;
+    }
+    Ok(Some(completion))
+}
+
+/// The conditioning-gate weight `G` and the floored reduced trace weight
+/// `K + (2/G)·extra_reduced_weight` that both completion forms contract. `None` when the
+/// completion vanishes: an empty span or a closed gate.
+fn joint_jeffreys_completion_reduced_weight(
+    h_joint: ArrayView2<'_, f64>,
+    z_j: ArrayView2<'_, f64>,
+    motion: Option<&JointJeffreysHessianMotion>,
+) -> Result<Option<(f64, Array2<f64>)>, String> {
     let p = h_joint.nrows();
     if h_joint.ncols() != p {
         return Err(format!(
@@ -2628,7 +2697,7 @@ where
     }
     let m = z_j.ncols();
     if m == 0 {
-        return Ok(Some(Array2::zeros((p, p))));
+        return Ok(None);
     }
 
     let hz = h_joint.dot(&z_j);
@@ -2644,7 +2713,7 @@ where
         conditioning_gate_weight(lambda_min, lambda_max)
     };
     if gate_weight == 0.0 {
-        return Ok(Some(Array2::zeros((p, p))));
+        return Ok(None);
     }
     let floor = (REDUCED_INFO_RELATIVE_FLOOR * lambda_max).max(REDUCED_INFO_ABSOLUTE_FLOOR);
     let mut inv_diag = Array1::<f64>::zeros(m);
@@ -2679,6 +2748,25 @@ where
         }
         None => k_reduced,
     };
+    Ok(Some((gate_weight, reduced_weight)))
+}
+
+fn joint_jeffreys_pairwise_completion<Dir2Fn>(
+    h_joint: ArrayView2<'_, f64>,
+    z_j: ArrayView2<'_, f64>,
+    hessian_second_dir: Dir2Fn,
+    motion: Option<&JointJeffreysHessianMotion>,
+) -> Result<Option<Array2<f64>>, String>
+where
+    Dir2Fn: Fn(&Array1<f64>, &Array1<f64>) -> Result<Option<Array2<f64>>, String> + Sync,
+{
+    let p = h_joint.nrows();
+    let Some((gate_weight, reduced_weight)) =
+        joint_jeffreys_completion_reduced_weight(h_joint, z_j, motion)?
+    else {
+        return Ok(Some(Array2::zeros((p, p))));
+    };
+    let m = z_j.ncols();
     let mut out = Array2::<f64>::zeros((p, p));
     // PARALLEL SECOND-DIRECTIONAL DERIVATIVES. Each upper-triangle pair `(a, b)`
     // needs one FULL-DATA mixed second-directional pass `H''[e_a, e_b]` — the
@@ -4735,6 +4823,94 @@ mod tests {
             exact_error < 1e-4,
             "motion-completed Jeffreys Hessian vs finite differences: rel {exact_error:e} \
              (frozen-policy rel {frozen_error:e})"
+        );
+    }
+
+    /// gam#2893: when the information is the Hessian of a scalar, contracting `H''` along the
+    /// reduced weight's eigenvectors reproduces the pairwise completion, through the full span
+    /// with the gate-band motion active and through a rectangular span.
+    #[test]
+    fn observed_hessian_completion_matches_the_pairwise_completion_2893() {
+        let rows = array![
+            [1.0, 0.2, -0.3],
+            [1.0, -0.5, 0.4],
+            [1.0, 0.9, 0.1],
+            [1.0, -0.1, -0.8],
+            [1.0, 0.6, 0.7],
+            [1.0, -0.7, -0.2],
+        ];
+        let beta = array![0.1, -0.2, 0.3];
+        // `Σ_k exp(x_kᵀβ) x_k x_kᵀ` and its directional derivatives: the Hessian of `Σ_k exp(x_kᵀβ)`.
+        let raw = |u: Option<&Array1<f64>>, v: Option<&Array1<f64>>| {
+            let mut h = Array2::<f64>::zeros((3, 3));
+            for x in rows.rows() {
+                let mut weight = x.dot(&beta).exp();
+                if let Some(u) = u {
+                    weight *= x.dot(u);
+                }
+                if let Some(v) = v {
+                    weight *= x.dot(v);
+                }
+                for i in 0..3 {
+                    for j in 0..3 {
+                        h[[i, j]] += weight * x[i] * x[j];
+                    }
+                }
+            }
+            h
+        };
+        let (evals, _) = raw(None, None).eigh(Side::Lower).expect("fixture spectrum");
+        let scale = 4.0 / evals.iter().copied().fold(f64::INFINITY, f64::min);
+        let h = raw(None, None).mapv(|value| scale * value);
+        let second = |u: &Array1<f64>, v: &Array1<f64>| -> Result<Option<Array2<f64>>, String> {
+            Ok(Some(raw(Some(u), Some(v)).mapv(|value| scale * value)))
+        };
+        let max_abs = |m: &Array2<f64>| m.iter().fold(0.0_f64, |acc, v| acc.max(v.abs()));
+
+        let z = Array2::<f64>::eye(3);
+        let plan = JointJeffreysPlan::prepare(h.view(), z.view()).expect("Jeffreys plan");
+        assert!(
+            plan.hessian_motion_active(),
+            "the fixture must sit inside the gate's transition band"
+        );
+        let hdots: Vec<Array2<f64>> = (0..3)
+            .map(|a| {
+                let mut axis = Array1::<f64>::zeros(3);
+                axis[a] = 1.0;
+                raw(Some(&axis), None).mapv(|value| scale * value)
+            })
+            .collect();
+        let motion = plan.hessian_motion(&hdots).expect("Hessian motion");
+        let pairwise =
+            joint_jeffreys_second_order_completion_with_motion(h.view(), z.view(), &second, &motion)
+                .expect("pairwise completion")
+                .expect("pairwise completion present");
+        let spanned =
+            joint_jeffreys_observed_hessian_completion(h.view(), z.view(), &second, Some(&motion))
+                .expect("span-direction completion")
+                .expect("span-direction completion present");
+        let gap = max_abs(&(&spanned - &pairwise));
+        assert!(max_abs(&pairwise) > 0.0, "the gate-band completion must be nonzero");
+        assert!(
+            gap <= 1e-10 * max_abs(&pairwise),
+            "full span with motion: gap {gap:e} against {:e}",
+            max_abs(&pairwise)
+        );
+
+        let z_rect = array![[1.0, 0.0], [0.5, 1.0], [0.0, 0.25]];
+        let pairwise = joint_jeffreys_second_order_completion(h.view(), z_rect.view(), &second)
+            .expect("rectangular pairwise completion")
+            .expect("rectangular pairwise completion present");
+        let spanned =
+            joint_jeffreys_observed_hessian_completion(h.view(), z_rect.view(), &second, None)
+                .expect("rectangular span-direction completion")
+                .expect("rectangular span-direction completion present");
+        let gap = max_abs(&(&spanned - &pairwise));
+        assert!(max_abs(&pairwise) > 0.0, "the rectangular completion must be nonzero");
+        assert!(
+            gap <= 1e-10 * max_abs(&pairwise),
+            "rectangular span: gap {gap:e} against {:e}",
+            max_abs(&pairwise)
         );
     }
 
