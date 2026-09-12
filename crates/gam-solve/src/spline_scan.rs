@@ -71,9 +71,6 @@ struct PooledNode {
     w: f64,
 }
 
-/// Search interval for log λ (natural log), generous on both sides.
-const LOG_LAMBDA_LO: f64 = -18.0;
-const LOG_LAMBDA_HI: f64 = 18.0;
 /// Maximum supported smoothing-spline order handled by the fixed-capacity
 /// small-matrix layer. Order `m` penalizes `∫(f^{(m)})²`; the state dimension
 /// is `m`. The exact diffuse leading-block smoother (see the smoother pass)
@@ -4572,10 +4569,131 @@ fn spline_kkt_holds(
     }
 }
 
+/// A sum of positive terms accumulated from their logarithms, so no term
+/// overflows or underflows before the logarithm of the sum is taken.
+#[derive(Clone, Copy)]
+struct LogDomainSum {
+    lead: f64,
+    scaled: f64,
+}
+
+impl LogDomainSum {
+    const EMPTY: Self = Self {
+        lead: f64::NEG_INFINITY,
+        scaled: 0.0,
+    };
+
+    fn add(self, ln_term: f64) -> Self {
+        if ln_term > self.lead {
+            Self {
+                lead: ln_term,
+                scaled: 1.0 + self.scaled * (self.lead - ln_term).exp(),
+            }
+        } else {
+            Self {
+                lead: self.lead,
+                scaled: self.scaled + (ln_term - self.lead).exp(),
+            }
+        }
+    }
+
+    fn ln(self) -> f64 {
+        self.lead + self.scaled.ln()
+    }
+}
+
+/// The `log λ` domain the scan selects over, derived from the pencil's own
+/// spectrum (#2812) rather than handed a window.
+///
+/// Once the diffuse polynomial null space is profiled out, proper mode `j`
+/// enters the criterion as `log(1 + κ_j/λ)`. Here `κ_j` is a generalized
+/// eigenvalue of the zero-start level covariance `K₀` (the IWP at unit `q`)
+/// against the observation covariance `W⁻¹`, on the contrasts that annihilate
+/// the degree-`<m` polynomials. Equivalently it is an eigenvalue of `W` against
+/// the node-space penalty `S`. That is the design-relative spectrum
+/// `estimate::rho_domain` derives its edges from, so the domain is
+/// `[ln(√ε κ_min), ln(κ_max/√ε)]`. Below it every mode is unpenalized to the
+/// criterion gradient's resolution; above it every mode is switched off. A
+/// selection on either edge is a structural result, not a wall.
+///
+/// The spectrum costs `O(n³)` and the scan's contract is `O(n)`, so two `O(n)`
+/// outer bounds keep this domain a superset of that interval:
+///
+/// - `κ_max ≤ tr(W^{1/2} K₀ W^{1/2}) = Σ_t w_t Q̄(x_t − x_0)₀₀`. The pencil is
+///   `W^{1/2} K₀ W^{1/2}` compressed onto an orthonormal frame of whitened
+///   contrasts, so its eigenvalues interlace inside that matrix's (Poincaré
+///   separation), and the diagonal of `K₀` is the zero-start level variance.
+/// - `κ_min ≥ 1 / max_t Σ_s |(W^{−1/2} J_ff W^{−1/2})_{ts}|` (Gershgorin). `S`
+///   is the level block's Schur complement in the joint state precision `J`,
+///   so `S ⪯ J_ff`. The level `f_t` enters only the level row of the two
+///   increments it joins, so `J_ff` is tridiagonal with `±[Q̄(δ_t)⁻¹]₀₀`.
+///
+/// `Q̄(δ) = D Q̄(1) D` with `D = diag(δ^{m−½−i})`, so both level entries carry
+/// `δ^{±(2m−1)}` over their unit values. Both bounds co-transform exactly as λ
+/// does: `x → a·x` moves each edge by `(2m−1)·ln a` and `w → c·w` by `ln c`.
+/// The domain is therefore covariate- and weight-scale equivariant (#1214)
+/// without a separate anchor.
+fn scan_log_lambda_domain(
+    nodes: &[PooledNode],
+    order: usize,
+) -> Result<(f64, f64), SplineScoreProofError> {
+    let (Some(first), Some(last)) = (nodes.first(), nodes.last()) else {
+        return Err(SplineScoreProofError::InvalidInput(
+            "spline scan: pooled data unexpectedly contain no nodes".to_string(),
+        ));
+    };
+    let span = last.x - first.x;
+    if !(span.is_finite() && span > 0.0) {
+        return Err(SplineScoreProofError::InvalidInput(format!(
+            "spline scan: pooled covariate span must be finite and positive, got {span}"
+        )));
+    }
+    let exponent = (2 * order - 1) as f64;
+    let unit_noise = process_noise(1.0, 1.0, order);
+    let unit_precision = mat_inv(&unit_noise, order, "unit IWP process noise")
+        .map_err(SplineScoreProofError::Computation)?;
+    let ln_unit_level_variance = unit_noise[0][0].ln();
+    let ln_unit_level_precision = unit_precision[0][0].ln();
+
+    let mut trace = LogDomainSum::EMPTY;
+    for node in &nodes[1..] {
+        trace = trace
+            .add(node.w.ln() + exponent * (node.x - first.x).ln() + ln_unit_level_variance);
+    }
+    let ln_weights: Vec<f64> = nodes.iter().map(|node| node.w.ln()).collect();
+    let ln_increment_precision: Vec<f64> = nodes
+        .windows(2)
+        .map(|pair| ln_unit_level_precision - exponent * (pair[1].x - pair[0].x).ln())
+        .collect();
+    let mut ln_gershgorin = f64::NEG_INFINITY;
+    for t in 0..nodes.len() {
+        let mut row = LogDomainSum::EMPTY;
+        if t > 0 {
+            let precision = ln_increment_precision[t - 1];
+            row = row
+                .add(precision - ln_weights[t])
+                .add(precision - 0.5 * (ln_weights[t - 1] + ln_weights[t]));
+        }
+        if t + 1 < nodes.len() {
+            let precision = ln_increment_precision[t];
+            row = row
+                .add(precision - ln_weights[t])
+                .add(precision - 0.5 * (ln_weights[t] + ln_weights[t + 1]));
+        }
+        ln_gershgorin = ln_gershgorin.max(row.ln());
+    }
+    let resolution = crate::estimate::rho_domain::log_gradient_resolution();
+    Ok(crate::estimate::rho_domain::coordinate_domain(
+        Some((resolution - ln_gershgorin, trace.ln() - resolution)),
+        None,
+    ))
+}
+
 /// Fit with `log λ` selected by the concentrated diffuse REML criterion.
-/// Every stationary interval in the bounded, scale-equivariant log-λ domain
-/// is isolated using analytic derivatives and rigorous interval bounds; the
-/// two boundary/null-recovery candidates are evaluated exactly.
+/// Every stationary interval in the derived, scale-equivariant log-λ domain
+/// ([`scan_log_lambda_domain`]) is isolated using analytic derivatives and
+/// rigorous interval bounds; the two boundary/null-recovery candidates are
+/// evaluated exactly.
 pub fn fit_spline_scan(
     x: &[f64],
     y: &[f64],
@@ -4588,56 +4706,12 @@ pub fn fit_spline_scan(
         )));
     }
     let (nodes, ssr_within, n_obs, _response_origin) = pool_nodes(x, y, w, order)?;
-    // Covariate-rescaling equivariance (#1214). The order-`m` IWP process noise
-    // is `Q(δ) ∝ q · δ^{2m−1}`, so under an affine covariate rescale `x → a·x`
-    // (all abscissa gaps `δ → a·δ`) the posterior `f(x)` is *exactly* invariant
-    // iff the smoothing parameter co-transforms as `q → q / a^{2m−1}`, i.e.
-    // `log λ → log λ + (2m−1)·log a` (λ = 1/q). The whole smoother — criterion,
-    // fit, and the Gaussian-bridge `predict` — runs self-consistently in the raw
-    // covariate units, so the *only* place covariate scale leaks in is this
-    // outer `log λ` search: a fixed absolute bracket `[LOG_LAMBDA_LO,
-    // LOG_LAMBDA_HI]` does not track the data span, so at small/large covariate
-    // scale the equivariant optimum rails out of the bracket and the fit drifts.
-    // Anchor the bracket to the data's own length scale: search `log λ` around
-    // `(2m−1)·log L` where `L` is the abscissa span (which scales linearly with
-    // the covariate), so the search is performed in scale-free units and the
-    // selected `q · L^{2m−1}` — hence the posterior `f(x)` — is invariant.
-    let first_x = nodes
-        .first()
-        .ok_or_else(|| {
-            SplineScoreProofError::InvalidInput(
-                "spline scan: pooled data unexpectedly contain no nodes".to_string(),
-            )
-        })?
-        .x;
-    let last_x = nodes
-        .last()
-        .ok_or_else(|| {
-            SplineScoreProofError::InvalidInput(
-                "spline scan: pooled data unexpectedly contain no nodes".to_string(),
-            )
-        })?
-        .x;
-    let span = last_x - first_x;
-    if !(span.is_finite() && span > 0.0) {
-        return Err(SplineScoreProofError::InvalidInput(format!(
-            "spline scan: pooled covariate span must be finite and positive, got {span}"
-        )));
-    }
-    let log_span = gam_math::score_opt::certified_ln_positive(span).ok_or(
-        SplineScoreProofError::InvalidArithmetic {
-            context: "covariate-span logarithm",
-        },
-    )?;
-    let log_span_representative = log_span.lo + 0.5 * (log_span.hi - log_span.lo);
-    let scale_shift = (2 * order - 1) as f64 * log_span_representative;
-    let lo_anchor = LOG_LAMBDA_LO + scale_shift;
-    let hi_anchor = LOG_LAMBDA_HI + scale_shift;
+    let (domain_lo, domain_hi) = scan_log_lambda_domain(&nodes, order)?;
     let n_nodes = nodes.len();
     let endpoint_certificates = RefCell::new(HashMap::<u64, CertifiedCriterionJet>::new());
     let search = maximize_score_1d(
-        lo_anchor,
-        hi_anchor,
+        domain_lo,
+        domain_hi,
         f64::EPSILON.sqrt(),
         |ll| {
             let certificate =
@@ -5309,9 +5383,10 @@ mod tests {
     /// the exact acceptance DGP (n=180, step weights 1/9), with the SAME
     /// certified search `fit_spline_scan` runs — but through a counting
     /// wrapper that bails out with the evaluation count and the stuck
-    /// abscissa once the search exceeds a budget no terminating search on a
-    /// 36-wide bracket can legitimately need. A pass proves termination in
-    /// bounded work; the panic message is the diagnosis.
+    /// abscissa once the search exceeds a budget no terminating search on the
+    /// derived domain ([`scan_log_lambda_domain`]) can legitimately need. A
+    /// pass proves termination in bounded work; the panic message is the
+    /// diagnosis.
     #[test]
     fn weighted_scan_dgp_2300_search_terminates_in_bounded_evaluations() {
         // Deterministic stand-in for the acceptance DGP (xorshift Box-Muller;
@@ -5337,10 +5412,8 @@ mod tests {
                 scope.spawn(move || {
                     let (nodes, ssr_within, n_obs, _response_origin) =
                         pool_nodes(x, y, w, order).expect("pool");
-                    let span = nodes.last().unwrap().x - nodes.first().unwrap().x;
-                    let scale_shift = (2 * order - 1) as f64 * span.ln();
-                    let lo = LOG_LAMBDA_LO + scale_shift;
-                    let hi = LOG_LAMBDA_HI + scale_shift;
+                    let (lo, hi) =
+                        scan_log_lambda_domain(&nodes, order).expect("derived domain");
 
                     let n_nodes = nodes.len();
                     let evals = std::cell::Cell::new(0u64);
@@ -5430,6 +5503,119 @@ mod tests {
             y.push(0.4 + (1.3 * xi).sin() + (0.45 / wi.sqrt()) * z);
         }
         (x, y, w)
+    }
+
+    /// The derived domain contains the resolvability interval of the pencil's
+    /// exact spectrum (#2902). The spectrum is formed densely from the
+    /// definition the `O(n)` bounds stand in for: the zero-start IWP level
+    /// covariance `K₀`, whitened by `W^{1/2}`, compressed onto an orthonormal
+    /// frame of the contrasts orthogonal to `√w·(x − x₀)^k` for `k < m`.
+    /// Irregular gaps and weights keep both bounds off equality, and the domain
+    /// must stay inside the representable range, so a clipped or constant
+    /// domain cannot pass.
+    #[test]
+    fn scan_log_lambda_domain_contains_the_exact_spectrum_resolvability_interval_2902() {
+        use faer::Side;
+        use gam_linalg::faer_ndarray::FaerEigh;
+        use ndarray::{Array2, Axis};
+
+        let x = [0.0, 0.3, 0.55, 1.1, 1.4, 2.0, 2.6, 2.8, 3.4, 4.0];
+        let w = [0.5, 2.0, 1.0, 3.0, 0.7, 1.3, 2.2, 0.4, 1.8, 1.1];
+        let y: Vec<f64> = x.iter().map(|value| value.sin()).collect();
+        for order in 1..=MAX_ORDER {
+            let (nodes, _within, _n_obs, _response_origin) =
+                pool_nodes(&x, &y, &w, order).expect("pooled data");
+            let n = nodes.len();
+            let origin = nodes[0].x;
+            let span = nodes[n - 1].x - origin;
+            let mut covariance = Array2::<f64>::zeros((n, n));
+            for s in 0..n {
+                let start = process_noise(nodes[s].x - origin, 1.0, order);
+                for t in s..n {
+                    let level =
+                        mat_mul(&transition(nodes[t].x - nodes[s].x, order), &start, order)[0][0];
+                    let value = (nodes[s].w * nodes[t].w).sqrt() * level;
+                    covariance[[s, t]] = value;
+                    covariance[[t, s]] = value;
+                }
+            }
+            let polynomial = Array2::from_shape_fn((n, order), |(t, k)| {
+                nodes[t].w.sqrt() * ((nodes[t].x - origin) / span).powi(k as i32)
+            });
+            let gram = polynomial.t().dot(&polynomial);
+            let mut gram_small = [[0.0; MAX_ORDER]; MAX_ORDER];
+            for i in 0..order {
+                for j in 0..order {
+                    gram_small[i][j] = gram[[i, j]];
+                }
+            }
+            let gram_inverse =
+                mat_inv(&gram_small, order, "polynomial Gram").expect("polynomial Gram inverse");
+            let gram_inverse = Array2::from_shape_fn((order, order), |(i, j)| gram_inverse[i][j]);
+            let projector =
+                Array2::<f64>::eye(n) - polynomial.dot(&gram_inverse).dot(&polynomial.t());
+            let (projector_values, projector_vectors) = projector
+                .eigh(Side::Lower)
+                .expect("contrast projector eigendecomposition");
+            let frame_columns: Vec<usize> =
+                (0..n).filter(|&j| projector_values[j] > 0.5).collect();
+            assert_eq!(frame_columns.len(), n - order, "order-{order} contrast frame");
+            let frame = projector_vectors.select(Axis(1), &frame_columns);
+            let compressed = frame.t().dot(&covariance).dot(&frame);
+            let (kappas, _) = compressed
+                .eigh(Side::Lower)
+                .expect("pencil eigendecomposition");
+            let kappa_min = kappas.iter().copied().fold(f64::INFINITY, f64::min);
+            let kappa_max = kappas.iter().copied().fold(0.0_f64, f64::max);
+            assert!(
+                kappa_min > 0.0,
+                "order-{order} proper modes must all carry curvature, got {kappa_min:e}"
+            );
+            let resolution = crate::estimate::rho_domain::log_gradient_resolution();
+            let exact_lo = resolution + kappa_min.ln();
+            let exact_hi = kappa_max.ln() - resolution;
+            let (lo, hi) = scan_log_lambda_domain(&nodes, order).expect("derived domain");
+            assert!(
+                gam_problem::LOG_STRENGTH_MIN < lo && hi < gam_problem::LOG_STRENGTH_MAX,
+                "order-{order} domain [{lo}, {hi}] must come from the bounds, not the \
+                 representable clip"
+            );
+            assert!(
+                lo <= exact_lo && exact_hi <= hi,
+                "order-{order} derived domain [{lo}, {hi}] must contain the exact spectrum's \
+                 resolvability interval [{exact_lo}, {exact_hi}]"
+            );
+        }
+    }
+
+    /// `x → a·x` moves every pencil eigenvalue by `a^{2m−1}` and `w → c·w` by
+    /// `c`, so both domain edges must move by exactly `(2m−1)·ln a + ln c`
+    /// (#1214, #2902).
+    #[test]
+    fn scan_log_lambda_domain_is_covariate_and_weight_scale_equivariant_2902() {
+        let (x, y, w) = dgp_2300();
+        let covariate_scale = 1.0e3_f64;
+        let weight_scale = 1.0e-2_f64;
+        let scaled_x: Vec<f64> = x.iter().map(|value| covariate_scale * value).collect();
+        let scaled_w: Vec<f64> = w.iter().map(|value| weight_scale * value).collect();
+        for order in 1..=MAX_ORDER {
+            let (nodes, _within, _n_obs, _response_origin) =
+                pool_nodes(&x, &y, &w, order).expect("pooled data");
+            let (scaled_nodes, _within, _n_obs, _response_origin) =
+                pool_nodes(&scaled_x, &y, &scaled_w, order).expect("scaled pooled data");
+            let (lo, hi) = scan_log_lambda_domain(&nodes, order).expect("derived domain");
+            let (scaled_lo, scaled_hi) =
+                scan_log_lambda_domain(&scaled_nodes, order).expect("scaled derived domain");
+            let shift = (2 * order - 1) as f64 * covariate_scale.ln() + weight_scale.ln();
+            let tolerance =
+                f64::EPSILON.sqrt() * (1.0 + shift.abs() + lo.abs().max(hi.abs()));
+            assert!(
+                (scaled_lo - lo - shift).abs() <= tolerance
+                    && (scaled_hi - hi - shift).abs() <= tolerance,
+                "order-{order} domain [{lo}, {hi}] must move by {shift} under the rescale, \
+                 got [{scaled_lo}, {scaled_hi}]"
+            );
+        }
     }
 
     /// The certified derivative ladder reaches exact endpoint jets throughout
