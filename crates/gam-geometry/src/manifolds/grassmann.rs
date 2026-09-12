@@ -1,9 +1,8 @@
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
 
 use crate::manifold::{
-    GEOMETRY_EPS, GeometryError, GeometryResult, RiemannianManifold, check_len, dot, flatten,
-    from_flat, identity, inverse, symmetric_eigen, projected_standard_basis_tangent, qr_thin, sym,
-    thin_svd_gram,
+    GeometryError, GeometryResult, RiemannianManifold, check_len, dot, flatten, from_flat, identity,
+    inverse, symmetric_eigen, projected_standard_basis_tangent, qr_thin, sym, thin_svd_gram,
 };
 use crate::manifolds::sphere::SphereManifold;
 
@@ -127,11 +126,16 @@ impl RiemannianManifold for GrassmannManifold {
             // converges; only the arbitrary choice among equivalent minimizers
             // is fixed.
             let c = dot(p_from, p_to);
-            if c.abs() <= GEOMETRY_EPS {
+            let n = p_from.len();
+            let scale = (dot(p_from, p_from) * dot(p_to, p_to)).sqrt();
+            // The cosine is one `n`-term inner product, so it rounds by at most
+            // `γ_n·‖p_from‖‖p_to‖`; a cosine inside that band is the cut locus.
+            if c.abs() <= gam_linalg::roundoff::accumulation_growth(n) * scale {
                 let mut dir = p_to.to_owned();
                 dir.scaled_add(-c, &p_from);
                 let norm = dir.dot(&dir).sqrt();
-                if norm <= GEOMETRY_EPS {
+                // `n` products, `n` subtractions and the `n`-term norm.
+                if norm <= gam_linalg::roundoff::accumulation_growth(3 * n) * scale {
                     return Ok(Array1::<f64>::zeros(p_from.len()));
                 }
                 dir.mapv_inplace(|x| x * (std::f64::consts::FRAC_PI_2 / norm));
@@ -164,7 +168,10 @@ impl RiemannianManifold for GrassmannManifold {
             // beside one near π/2; ‖M·v_j‖ carries only M's own rounding.
             let tan_sigma = m_v.column(j).dot(&m_v.column(j)).sqrt();
             sigma[j] = tan_sigma.atan();
-            if tan_sigma > GEOMETRY_EPS {
+            // `U·Σ` returns `M·v_j·atan(t)/t`, which is `M·v_j` shrunk by at most
+            // one, so any positive `t` divides without amplifying anything; only
+            // an exactly zero column has no direction.
+            if tan_sigma > 0.0 {
                 let inv_tan = 1.0 / tan_sigma;
                 for i in 0..self.n {
                     u[[i, j]] = m_v[[i, j]] * inv_tan;
