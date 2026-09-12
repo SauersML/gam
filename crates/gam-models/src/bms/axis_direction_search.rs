@@ -2529,75 +2529,124 @@ impl BernoulliMarginalSlopeFamily {
         let p = cache.slices.total;
         let pm = cache.slices.marginal.len();
         let n = self.y.len();
-        // Accumulate in flat buffers: this is a cubic scalar loop, where
-        // multidimensional ndarray indexing across codegen units is costly.
-        // Each buffer becomes an Array2 by ownership transfer after the sweep.
-        let mut out = vec![vec![0.0; p * p]; p];
         let mut weights = vec![0.0; n];
         for row in cache.outer_weighted_rows_cached(options, n).iter() {
             weights[row.index] += row.weight;
         }
-        let mut x = vec![0.0; p];
-        let mut xu = vec![0.0; p];
-        let primary = |a: usize| usize::from(a >= pm);
-        let row_chunk = bms_row_chunk_size(n);
-        for start in (0..n).step_by(row_chunk) {
-            let end = (start + row_chunk).min(n);
-            let xpsi = axis
-                .psi_map
-                .row_chunk(start..end)
-                .map_err(|e| e.to_string())?;
-            let xm = self
-                .marginal_design
-                .try_row_chunk(start..end)
-                .map_err(|e| e.to_string())?;
-            let xg = self
-                .slope_design
-                .try_row_chunk(start..end)
-                .map_err(|e| e.to_string())?;
-            for row in start..end {
-                let weight = weights[row];
-                if weight == 0.0 {
-                    continue;
-                }
-                for a in 0..p {
-                    x[a] = if a < pm {
-                        xm[[row - start, a]]
-                    } else {
-                        xg[[row - start, a - pm]]
-                    };
-                }
-                let psi_row = xpsi.row(row - start);
-                xu.fill(0.0);
-                let offset = if block == 0 { 0 } else { pm };
-                for (a, &value) in psi_row.iter().enumerate() {
-                    xu[offset + a] = value;
-                }
-                let u = psi_row.dot(&states[block].beta);
-                let t3 = self.rigid_third_full_cached(states, cache, row)?;
-                let t4 = self.rigid_fourth_full_cached(states, cache, row)?;
-                for a in 0..p {
-                    for b in a..p {
-                        for c in b..p {
-                            let value = weight
-                                * (t4[primary(a)][primary(b)][primary(c)][block]
-                                    * u * x[a] * x[b] * x[c]
-                                    + t3[primary(a)][primary(b)][primary(c)]
-                                        * (xu[a] * x[b] * x[c]
-                                            + x[a] * xu[b] * x[c]
-                                            + x[a] * x[b] * xu[c]));
-                            out[a][b * p + c] += value;
+        if n > 0 {
+            // Publish the lazily built row tensor tables before the fold, so no
+            // rayon worker below triggers their full-n parallel build.
+            self.rigid_third_full_cached(states, cache, 0)?;
+            self.rigid_fourth_full_cached(states, cache, 0)?;
+        }
+        let psi_map = &axis.psi_map;
+        let offset = if block == 0 { 0 } else { pm };
+        let psi_beta = &states[block].beta;
+        // A row adds w·(T4·u·x⊗x⊗x + T3·(xu⊗x⊗x + x⊗xu⊗x + x⊗x⊗xu)) to the ordered
+        // triples a ≤ b ≤ c. The tensor entry depends only on which primary each
+        // index loads, so for fixed (a, b) it is constant on at most two
+        // contiguous c-ranges and the innermost update is the branch-free
+        // `dst[c] += α·x[c] + β·xu[c]` (gam#979: the per-triple lookup kept the
+        // old scalar loop serial and unvectorized at ~1.1 s per ψ axis for
+        // n=4800, p=71). Every term carries x or xu at a and at b, so indices
+        // where both vanish are skipped there. Rows fold in a fixed association
+        // tree, independent of the worker count. Each partial packs only the
+        // ordered triples, with (a, b) owning the contiguous run c ∈ b..p, so a
+        // partial is ~p³/6 values however many of them the fold holds at once.
+        let mut pair_start = vec![0usize; p * p];
+        let mut packed_len = 0usize;
+        for a in 0..p {
+            for b in a..p {
+                pair_start[a * p + b] = packed_len;
+                packed_len += p - b;
+            }
+        }
+        let upper = gam_linalg::pairwise_reduce::par_deterministic_try_block_fold(
+            n,
+            |range| -> Result<Vec<f64>, String> {
+                let mut acc = vec![0.0; packed_len];
+                let xpsi = psi_map
+                    .row_chunk(range.clone())
+                    .map_err(|e| e.to_string())?;
+                let xm = self
+                    .marginal_design
+                    .try_row_chunk(range.clone())
+                    .map_err(|e| e.to_string())?;
+                let xg = self
+                    .slope_design
+                    .try_row_chunk(range.clone())
+                    .map_err(|e| e.to_string())?;
+                let mut x = vec![0.0; p];
+                let mut xu = vec![0.0; p];
+                let mut support = Vec::with_capacity(p);
+                for row in range.clone() {
+                    let weight = weights[row];
+                    if weight == 0.0 {
+                        continue;
+                    }
+                    let local_row = row - range.start;
+                    for (a, slot) in x.iter_mut().enumerate() {
+                        *slot = if a < pm {
+                            xm[[local_row, a]]
+                        } else {
+                            xg[[local_row, a - pm]]
+                        };
+                    }
+                    let psi_row = xpsi.row(local_row);
+                    xu.fill(0.0);
+                    for (a, &value) in psi_row.iter().enumerate() {
+                        xu[offset + a] = value;
+                    }
+                    let u = psi_row.dot(psi_beta);
+                    let t3 = self.rigid_third_full_cached(states, cache, row)?;
+                    let t4 = self.rigid_fourth_full_cached(states, cache, row)?;
+                    support.clear();
+                    support.extend((0..p).filter(|&a| x[a] != 0.0 || xu[a] != 0.0));
+                    for (i, &a) in support.iter().enumerate() {
+                        let pa = usize::from(a >= pm);
+                        for &b in &support[i..] {
+                            let pb = usize::from(b >= pm);
+                            let xab = x[a] * x[b];
+                            let mixed = xu[a] * x[b] + x[a] * xu[b];
+                            let start = pair_start[a * p + b];
+                            let dst = &mut acc[start..start + (p - b)];
+                            for pc in pb..2 {
+                                let (lo, hi) = if pc == 0 { (b, pm) } else { (b.max(pm), p) };
+                                let k3 = t3[pa][pb][pc];
+                                let along_x =
+                                    weight * (t4[pa][pb][pc][block] * u * xab + k3 * mixed);
+                                let along_xu = weight * k3 * xab;
+                                for ((d, &xc), &xuc) in dst[lo - b..hi - b]
+                                    .iter_mut()
+                                    .zip(&x[lo..hi])
+                                    .zip(&xu[lo..hi])
+                                {
+                                    *d += along_x * xc + along_xu * xuc;
+                                }
+                            }
                         }
                     }
                 }
-            }
-        }
-        // Only the ordered triples were accumulated. Expand their equal
-        // permutations once, after summation, rather than on every row.
+                Ok(acc)
+            },
+            |mut left, right| -> Result<Vec<f64>, String> {
+                for (sum, value) in left.iter_mut().zip(&right) {
+                    *sum += value;
+                }
+                Ok(left)
+            },
+        )?
+        .unwrap_or_else(|| vec![0.0; packed_len]);
+        // Expand each ordered triple to its equal permutations once, after
+        // summation, rather than on every row. Each buffer becomes an Array2 by
+        // ownership transfer.
+        let mut out = vec![vec![0.0; p * p]; p];
         for a in 0..p {
             for b in a..p {
+                let start = pair_start[a * p + b];
                 for c in b..p {
-                    let value = out[a][b * p + c];
+                    let value = upper[start + (c - b)];
+                    out[a][b * p + c] = value;
                     out[a][c * p + b] = value;
                     out[b][a * p + c] = value;
                     out[b][c * p + a] = value;
