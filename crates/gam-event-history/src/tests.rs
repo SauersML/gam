@@ -1621,6 +1621,35 @@ fn lagrange_basis_keeps_its_derivative_within_roundoff_of_a_node() {
 }
 
 #[test]
+fn transition_preserves_small_correlation_and_log_rate_derivatives() {
+    for k in [40.0_f64, 100.0, 700.0] {
+        let transition = AtomTransition::new(&super::family::seeded_one(k, 1.0));
+        let expected_phi = (-k).exp();
+        assert_eq!(transition.phi.value(), expected_phi);
+        assert_eq!(transition.phi.eps(), -expected_phi);
+        assert!((transition.dphi.value() / (-k * expected_phi) - 1.0).abs() < 1.0e-13);
+        assert!((transition.dphi.eps() / ((k - 1.0) * expected_phi) - 1.0).abs() < 1.0e-13);
+        assert!((transition.d2phi.value() / (k * (k - 1.0) * expected_phi) - 1.0).abs() < 1.0e-13);
+    }
+    // The correlation underflows before its log-rate derivatives do.
+    let transition = AtomTransition::new(&750.0);
+    assert_eq!(transition.phi, 0.0);
+    assert!(transition.dphi < 0.0);
+    assert!(transition.d2phi > 0.0);
+}
+
+#[test]
+fn effective_rank_is_invariant_to_extreme_covariance_units() {
+    let covariance = array![[2.0, 1.0], [1.0, 2.0]];
+    // Eigenvalues 3 and 1 give (3+1)^2/(3^2+1^2) = 1.6.
+    for scale in [1.0e-200, 1.0, 1.0e200] {
+        let rank = super::covariance::effective_rank(&(&covariance * scale));
+        assert!((rank - 1.6).abs() < 1.0e-14);
+    }
+    assert_eq!(super::covariance::effective_rank(&Array2::zeros((2, 2))), 0.0);
+}
+
+#[test]
 fn transition_at_an_overflowed_rate_is_finite_with_zero_sensitivity() {
     // log-rate 800: exp overflows to infinity, φ is exactly zero, and every
     // derivative channel must be finite (zero), not ∞ · 0.
