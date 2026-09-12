@@ -634,6 +634,40 @@ impl FittedTransport {
         Ok((values, variances))
     }
 
+    /// Standard error of the O(2) resultant `R_s = |mean_i e^{i(h(t_i) − s·t_i)}|`
+    /// at the supplied source coordinates for winding `s = ±1`, by the delta
+    /// method through the coefficient covariance. With `ψ_i = h(t_i) − s·t_i` and
+    /// `φ_s` the resultant's argument, `∂R_s/∂h(t_i) = sin(φ_s − ψ_i)/n`, and `h`
+    /// depends on the coefficients through the basis value rows.
+    pub(crate) fn circle_resultant_se(
+        &self,
+        t: ArrayView1<'_, f64>,
+        winding: i8,
+    ) -> Result<f64, String> {
+        let n = t.len();
+        if n == 0 {
+            return Err("circle resultant standard error needs at least one coordinate".to_string());
+        }
+        let rows = self.basis.value_rows(t)?;
+        let values = self.eval(t)?;
+        let sign = f64::from(winding);
+        let (mut cos_sum, mut sin_sum) = (0.0_f64, 0.0_f64);
+        for i in 0..n {
+            let psi = values[i] - sign * t[i];
+            cos_sum += psi.cos();
+            sin_sum += psi.sin();
+        }
+        let phase = sin_sum.atan2(cos_sum);
+        let mut gradient = Array1::<f64>::zeros(rows.ncols());
+        for i in 0..n {
+            let weight = (phase - (values[i] - sign * t[i])).sin() / n as f64;
+            for j in 0..rows.ncols() {
+                gradient[j] += weight * rows[[i, j]];
+            }
+        }
+        Ok(gradient.dot(&self.covariance.dot(&gradient)).max(0.0).sqrt())
+    }
+
     /// Evaluate `h′(t)` (chart-coordinate derivative).
     pub fn derivative(&self, t: ArrayView1<'_, f64>) -> Result<Array1<f64>, String> {
         let rows = self.basis.derivative_rows(t)?;
@@ -1539,17 +1573,17 @@ pub fn transport_ladder(
     }
 
     // O(2) Fourier-rigidity classification of each adjacent circle→circle map,
-    // grid-sampled from the fitted angle map. Additive report; no fitting-path
-    // effect.
+    // evaluated at the map's own observed source coordinates. Additive report;
+    // no fitting-path effect.
     let mut circle_transports = Vec::new();
     for k in 0..depth - 1 {
         if let Some(report) = crate::inference::transport_class::classify_circle_transport_fit(
             &adjacent_fits[k],
+            coords[k].view(),
             topologies[k],
             topologies[k + 1],
             layers[k],
             layers[k + 1],
-            DEFAULT_COMPOSITION_GRID,
         ) {
             circle_transports.push(report);
         }

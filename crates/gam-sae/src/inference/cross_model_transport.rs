@@ -19,9 +19,7 @@
 //! their own uncertainty scale, and otherwise reports the measured obstruction
 //! rather than fitting it away.
 
-use crate::inference::layer_transport::{
-    ChartTopology, DEFAULT_COMPOSITION_GRID, FittedTransport, fit_transport_map,
-};
+use crate::inference::layer_transport::{ChartTopology, FittedTransport, fit_transport_map};
 use crate::inference::transport_class::{
     CircleTransportClass, CircleTransportReport, classify_circle_transport_fit,
 };
@@ -113,9 +111,11 @@ pub struct CrossModelTransportReport {
     pub fit: FittedTransport,
     pub circle: Option<CircleTransportReport>,
     pub verdict: UniversalityVerdict,
-    /// Natural circular/O(2) gauge scale used for the verdict. For circle maps
-    /// this is the classifier's `2/sqrt(n)` separation scale; for non-circle
-    /// transports it is zero because no O(2) gauge is present.
+    /// O(2) gauge uncertainty scale used for the verdict. For circle maps this
+    /// is the fitted defect's own standard error (delta method through the fit's
+    /// coefficient covariance), floored at the same `√ε` roundoff scale as the
+    /// isometry side. For non-circle transports it is zero, because no O(2)
+    /// gauge is present.
     pub gauge_defect_scale: f64,
 }
 
@@ -168,15 +168,15 @@ pub fn fit_cross_model_transport(
 
     let circle = classify_circle_transport_fit(
         &fit,
+        from.coordinate.view(),
         from.topology,
         to.topology,
         0,
         1,
-        DEFAULT_COMPOSITION_GRID,
     );
     let gauge_defect_scale = circle
         .as_ref()
-        .map(|r| 2.0 / (r.n_samples as f64).sqrt())
+        .map(|r| r.defect_se.max(f64::EPSILON.sqrt()))
         .unwrap_or(0.0);
     let verdict = universality_verdict(&fit, circle.as_ref(), gauge_defect_scale);
 

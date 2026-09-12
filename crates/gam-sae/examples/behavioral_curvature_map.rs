@@ -281,11 +281,11 @@ fn run(args: &Args) -> Result<PathBuf, String> {
             .map_err(|e| format!("transport {}→{} failed: {e}", layers[a], layers[b]))?;
             let class = classify_circle_transport_fit(
                 &fit,
+                coords[a].view(),
                 ChartTopology::Circle,
                 ChartTopology::Circle,
                 layers[a] as usize,
                 layers[b] as usize,
-                args.grid,
             )
             .ok_or_else(|| {
                 format!(

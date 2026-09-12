@@ -8,14 +8,14 @@
 //! geometry, not discovered by training.
 //!
 //! The classifier inverts this: from matched `(θ_in, θ_out)` samples (e.g.
-//! [`FittedTransport::eval`] on a grid), `S₊ = |Σ e^{i(θ_out − θ_in)}|`,
+//! [`FittedTransport::eval`] at the fit's own source coordinates), `S₊ = |Σ e^{i(θ_out − θ_in)}|`,
 //! `S₋ = |Σ e^{i(θ_out + θ_in)}|`; the larger resultant selects the winding, its
 //! argument is `φ`, and `defect = 1 − max(S₊, S₋)/n` is the circular variance
 //! about the fitted rigid map — the O(2) departure. A large defect on a pair
 //! whose composition defect is small localizes harmonic mixing. All angles in
 //! radians.
 
-use ndarray::Array1;
+use ndarray::ArrayView1;
 
 use crate::inference::layer_transport::{ChartTopology, FittedTransport};
 
@@ -44,6 +44,10 @@ pub struct CircleTransportReport {
     /// `1 − max(S₊, S₋)/n ∈ [0, 1]`: `0` = exact O(2) element, `≈ 1` = no rigid
     /// structure.
     pub defect: f64,
+    /// Standard error of `defect`. For paired samples, from each pair's empirical
+    /// influence on the winning resultant, `√Σ(cos(ψ_k − φ) − R)²/n`; for a fitted
+    /// map, by the delta method through the fit's coefficient covariance.
+    pub defect_se: f64,
     /// Resultants for both hypotheses (diagnostics).
     pub resultant_shift: f64,
     pub resultant_reflect: f64,
@@ -96,6 +100,16 @@ pub fn classify_circle_transport(
         (-1i8, sm.atan2(cm), r_reflect, r_shift)
     };
     let defect = 1.0 - best;
+    let winning_sign = f64::from(winding);
+    let influence_sq: f64 = theta_in
+        .iter()
+        .zip(theta_out.iter())
+        .map(|(&a, &b)| {
+            let influence = (b - winning_sign * a - phase).cos() - best;
+            influence * influence
+        })
+        .sum();
+    let defect_se = influence_sq.sqrt() / nf;
     let sep = 2.0 / nf.sqrt();
     let class = if best - other <= sep {
         CircleTransportClass::Mixing
@@ -111,33 +125,36 @@ pub fn classify_circle_transport(
         winding,
         phase,
         defect,
+        defect_se,
         resultant_shift: r_shift,
         resultant_reflect: r_reflect,
         class,
     })
 }
 
-/// Classify a fitted transport between two CIRCLE charts by grid-sampling its
-/// angle map. Returns `None` when either endpoint is not a circle (winding is an
-/// O(2) notion; on intervals there is no phase). `grid ≥ 4`.
+/// Classify a fitted transport between two CIRCLE charts at the fit's own
+/// observed source coordinates `coords_from`. These are the rows the map was
+/// estimated from, so `n_samples` is the fit's sample size rather than an
+/// evaluation density, and `defect_se` comes from the fit's coefficient
+/// covariance. The fitted values are smoothed, not independent samples. Returns
+/// `None` when either endpoint is not a circle (winding is an O(2) notion; on
+/// intervals there is no phase).
 pub fn classify_circle_transport_fit(
     fit: &FittedTransport,
+    coords_from: ArrayView1<'_, f64>,
     from: ChartTopology,
     to: ChartTopology,
     layer_from: usize,
     layer_to: usize,
-    grid: usize,
 ) -> Option<CircleTransportReport> {
     if !matches!(from, ChartTopology::Circle) || !matches!(to, ChartTopology::Circle) {
         return None;
     }
-    let g = grid.max(4);
-    let theta_in: Vec<f64> = (0..g)
-        .map(|k| std::f64::consts::TAU * (k as f64) / (g as f64))
-        .collect();
-    let out = fit.eval(Array1::from_vec(theta_in.clone()).view()).ok()?;
-    let theta_out: Vec<f64> = out.to_vec();
-    classify_circle_transport(&theta_in, &theta_out, layer_from, layer_to).ok()
+    let theta_in: Vec<f64> = coords_from.to_vec();
+    let theta_out: Vec<f64> = fit.eval(coords_from).ok()?.to_vec();
+    let mut report = classify_circle_transport(&theta_in, &theta_out, layer_from, layer_to).ok()?;
+    report.defect_se = fit.circle_resultant_se(coords_from, report.winding).ok()?;
+    Some(report)
 }
 
 #[cfg(test)]
