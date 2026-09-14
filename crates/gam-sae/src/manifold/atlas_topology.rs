@@ -820,6 +820,10 @@ mod tests_nerve_membership_2280;
 mod tests_continuous_witness_2280;
 
 #[cfg(test)]
+#[path = "tests_ball_census_2280.rs"]
+mod tests_ball_census_2280;
+
+#[cfg(test)]
 mod tests_2280 {
     use super::*;
     use crate::manifold::LocalAtlas;
