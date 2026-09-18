@@ -33,7 +33,7 @@
 //! and the second and third orders likewise.
 //!
 //! This module owns two things and nothing else: the root itself
-//! ([`solve_anchor`], and [`solve_anchor_in_slot`] through a row's warm-start
+//! ([`solve_anchor`], and [`solve_anchor_in_slot`] through a row's root
 //! slot), and its Taylor table through order five ([`AnchorTaylor`], and
 //! [`anchor_taylor_in_slot`] through the same slot), whose orders through
 //! three are the implicit derivatives the direct order-two lowering reads
@@ -272,7 +272,11 @@ impl RootSlot {
 /// already applied), and the row's grid, which is fixed for the life of the
 /// law that owns this cache — a re-estimated law is a new law with a new
 /// cache. A hash selects a cross-row entry; equality of the stored inputs
-/// decides a hit, and any other stored root is only a seed. The cross-row
+/// decides a hit, and a root stored under any other inputs answers nothing,
+/// not even as a seed (gam#2983). Every stored root was solved from the
+/// closed form, so it is the one root its equation defines, and a hit from
+/// any slot, whichever row or thread published it, is bitwise what a solve
+/// would return. The cross-row
 /// table keeps its own entries per slot kind: every row entering at the time
 /// origin asks one entry equation, and the row-specific exit equation every
 /// row publishes at each iterate would otherwise evict it (gam#2928).
@@ -338,14 +342,15 @@ impl AnchorRootCache {
 /// asks for the root of bitwise the same equation, so the row's slot answers
 /// without evaluating the residual. On a global law, rows asking the same
 /// equation — every row entering at the time origin shares its entry index —
-/// find one row's root in the cross-row table. At a new iterate the slot's
-/// anchor seeds the solve: its root moved to the new inputs along its stored
-/// table where a consumer has differentiated it ([`AnchorTaylor::predict`]),
-/// the bare root otherwise. A seed stored by a rejected trial far from this
-/// iterate can
-/// mislead the solve, so a refused warm solve retries from the closed form,
-/// which depends only on `(q, b)` and cannot be poisoned; however it is
-/// seeded, a solve returns only a root meeting [`anchor_residual_resolution`].
+/// find one row's root in the cross-row table. An equation no slot holds is
+/// solved from the closed form, which depends only on `(q, b)` (gam#2983). A
+/// solve accepts any `α` whose residual meets [`anchor_residual_resolution`],
+/// so where it stops depends on where it started: seeded from a slot that
+/// other rows and threads publish into, the root depended on the order they
+/// ran in, and 12-thread fits of one input diverged run to run (truth2370,
+/// 57% of warm-seeded roots off the closed-form root by up to 6e5 ulps).
+/// Seeded from the closed form, the root is a function of its equation alone,
+/// whatever the slots hold and however many threads fill them.
 pub(crate) fn solve_anchor_in_slot(
     q: f64,
     observed_slope: f64,
@@ -391,31 +396,12 @@ pub(crate) fn anchor_derivatives_in_slot(
     anchor_taylor_in_slot(q, observed_slope, context, row, slot).map(|taylor| taylor.derivatives())
 }
 
-/// The warm seed a stored anchor gives for `(q, b)`: its table's series at the
-/// new inputs ([`AnchorTaylor::predict`]), or the bare root while it holds
-/// none. It is only a seed — the solve certifies whatever it starts from.
-fn predicted_seed(
-    stored: &StoredRoot,
-    taylor: Option<AnchorTaylor>,
-    q: f64,
-    observed_slope: f64,
-) -> f64 {
-    let Some(taylor) = taylor else {
-        return stored.root;
-    };
-    taylor.predict(
-        q - f64::from_bits(stored.q),
-        observed_slope - f64::from_bits(stored.slope),
-    )
-}
-
 /// The slot path both entries share: the anchor for `(q, b)`, carrying
 /// derivatives whenever `differentiate` asks for them.
 ///
 /// The row's own slot is asked first, by its inputs and root alone: its table
-/// is loaded only where a consumer differentiates or a warm seed reads it, and
-/// the cross-row table is hashed only where the row's slot does not answer
-/// (gam#2928).
+/// is loaded only where a consumer differentiates, and the cross-row table is
+/// hashed only where the row's slot does not answer (gam#2928).
 fn anchor_in_slot(
     q: f64,
     observed_slope: f64,
@@ -486,22 +472,7 @@ fn anchor_in_slot(
             return Ok(stored);
         }
         Some(stored) => stored.root,
-        None => match (own, own_root) {
-            (Some(own), Some(stored)) => {
-                let seed = predicted_seed(&stored, own.read_table(&stored), q, observed_slope);
-                match solve_anchor_from(q, observed_slope, context.grid, seed) {
-                    Ok(root) => root,
-                    Err(warm_failure) => {
-                        log::debug!(
-                            "[survival-marginal-slope anchor] row {row}: the slot's seed {seed} did \
-                             not solve ({warm_failure}); retrying from the closed form"
-                        );
-                        solve_anchor(q, observed_slope, context.grid)?
-                    }
-                }
-            }
-            _ => solve_anchor(q, observed_slope, context.grid)?,
-        },
+        None => solve_anchor(q, observed_slope, context.grid)?,
     };
     let anchor = StoredAnchor {
         q: inputs.0,
@@ -1116,40 +1087,6 @@ impl AnchorTaylor {
         }
     }
 
-    /// The root the table's series gives at `(q* + δq, b* + δb)`, summed by
-    /// total degree and stopped before the first degree whose part exceeds
-    /// the largest part already summed: where the step outruns the series the
-    /// parts grow, and a longer sum only extrapolates further. One part that
-    /// cancels to near zero does not end the sum. The bare root where nothing
-    /// finite remains.
-    pub(crate) fn predict(&self, delta_q: f64, delta_b: f64) -> f64 {
-        let mut q_powers = [1.0; TAYLOR_SLOTS];
-        let mut b_powers = [1.0; TAYLOR_SLOTS];
-        for degree in 1..TAYLOR_SLOTS {
-            q_powers[degree] = q_powers[degree - 1] * delta_q;
-            b_powers[degree] = b_powers[degree - 1] * delta_b;
-        }
-        let root = self.coefficients[0][0];
-        let mut sum = root;
-        let mut largest = f64::INFINITY;
-        for degree in 1..TAYLOR_SLOTS {
-            let mut part = 0.0;
-            for i in 0..=degree {
-                part += self.coefficients[i][degree - i] * q_powers[i] * b_powers[degree - i];
-            }
-            if !(part.abs() <= largest) {
-                break;
-            }
-            sum += part;
-            largest = if degree == 1 { part.abs() } else { largest.max(part.abs()) };
-        }
-        if sum.is_finite() {
-            sum
-        } else {
-            root
-        }
-    }
-
     /// `(i, j)` of each coefficient a [`RootSlot`] stores beside the root, by
     /// total degree: `c[d][0], c[d−1][1], …, c[0][d]` for `d = 1..=5`.
     fn stored_entries() -> impl Iterator<Item = (usize, usize)> {
@@ -1694,11 +1631,12 @@ mod anchor_tests {
 
     /// A row's slot answers only for bitwise the inputs its root was solved
     /// for: a sentinel stored under `(q, b)` comes back for exactly `(q, b)`,
-    /// one bit off in either input is a different equation and is solved, a
-    /// warm solve is published under its own inputs, and a root stored far
-    /// away cannot poison the solve it seeds.
+    /// one bit off in either input is a different equation and is solved, and
+    /// a root stored under other inputs, near or far, seeds nothing: every
+    /// solve through the slot is bitwise the closed-form-seeded root, and is
+    /// published under its own inputs (gam#2983).
     #[test]
-    fn anchor_slot_answers_only_its_own_equation_and_survives_a_poisoned_seed() {
+    fn anchor_slot_answers_only_its_own_equation_and_seeds_nothing_2983() {
         let grid = skewed_grid();
         let cache = AnchorRootCache::new(4, 2, false);
         let context = AnchorRowContext {
@@ -1728,32 +1666,51 @@ mod anchor_tests {
             own.write(&sentinel(q, b, 123.0));
             let nudged = solve_anchor_in_slot(nudged_q, nudged_b, context, 2, slot).expect("nudged");
             let fresh = solve_anchor(nudged_q, nudged_b, grid.view()).expect("fresh nudged");
-            assert!(
-                nudged != 123.0 && (nudged - fresh).abs() <= 1e-10 * (1.0 + fresh.abs()),
+            assert_eq!(
+                nudged.to_bits(),
+                fresh.to_bits(),
                 "a one-bit-different equation must be solved: {nudged} vs {fresh}"
             );
         }
 
-        cache.slot(1, slot).expect("row 1 slot").write(&sentinel(q, b, cold));
-        let warm = solve_anchor_in_slot(0.7003, 1.0996, context, 1, slot).expect("warm solve");
-        let fresh = solve_anchor(0.7003, 1.0996, grid.view()).expect("fresh solve");
-        assert!((warm - fresh).abs() <= 1e-10 * (1.0 + fresh.abs()), "warm {warm} vs fresh {fresh}");
-        assert_eq!(
-            cache
-                .slot(1, slot)
-                .and_then(RootSlot::read)
-                .map(|stored| (stored.q, stored.slope, stored.root.to_bits())),
-            Some((0.7003_f64.to_bits(), 1.0996_f64.to_bits(), warm.to_bits())),
-            "the warm solve is published under its own inputs"
-        );
+        // An iterate walk, each equation a small step from the last, through a
+        // slot holding the previous equation's root and table: every root is
+        // bitwise the closed-form-seeded root of its own equation. A root the
+        // slot seeded would be one of the many floats its residual accepts, set
+        // by where the seed sat; warm-seeded, 57% of truth2370's anchor roots
+        // were off the closed-form root (gam#2983).
+        let mut previous = (q, b, cold);
+        for step in 1..=64 {
+            let (next_q, next_b) = (q + 3e-4 * f64::from(step), b - 4e-4 * f64::from(step));
+            let table = AnchorTaylor::at(previous.2, previous.0, previous.1, grid.view()).expect("table");
+            cache.slot(1, slot).expect("row 1 slot").write(&StoredAnchor {
+                q: previous.0.to_bits(),
+                slope: previous.1.to_bits(),
+                root: previous.2,
+                taylor: Some(table),
+            });
+            let through_slot = solve_anchor_in_slot(next_q, next_b, context, 1, slot).expect("slot solve");
+            let fresh = solve_anchor(next_q, next_b, grid.view()).expect("fresh solve");
+            assert_eq!(
+                through_slot.to_bits(),
+                fresh.to_bits(),
+                "step {step}: the slot solve {through_slot:+.17e} is not the closed-form root {fresh:+.17e}"
+            );
+            assert_eq!(
+                cache
+                    .slot(1, slot)
+                    .and_then(RootSlot::read)
+                    .map(|stored| (stored.q, stored.slope, stored.root.to_bits())),
+                Some((next_q.to_bits(), next_b.to_bits(), fresh.to_bits())),
+                "step {step}: the solve is published under its own inputs"
+            );
+            previous = (next_q, next_b, through_slot);
+        }
 
         cache.slot(3, slot).expect("row 3 slot").write(&sentinel(5.0, 0.2, 1e6));
-        let poisoned = solve_anchor_in_slot(-0.4, 0.9, context, 3, slot).expect("poisoned seed");
+        let poisoned = solve_anchor_in_slot(-0.4, 0.9, context, 3, slot).expect("poisoned slot");
         let reference = solve_anchor(-0.4, 0.9, grid.view()).expect("reference");
-        assert!(
-            (poisoned - reference).abs() <= 1e-10 * (1.0 + reference.abs()),
-            "poisoned {poisoned} vs reference {reference}"
-        );
+        assert_eq!(poisoned.to_bits(), reference.to_bits(), "poisoned {poisoned} vs reference {reference}");
     }
 
     /// A point-mass law at `u₀ = 0` anchors at `α = q` for every slope, so
@@ -1953,10 +1910,9 @@ mod anchor_tests {
     /// consumer adds `AnchorTaylor::at` of that root and the order-two lowering
     /// reads its derivatives from it, a sentinel table stored under `(q, b)`
     /// answers for `(q, b)` alone, and a one-bit change in either input is
-    /// solved and differentiated afresh. The table's series lands near the
-    /// root a small step away, and a seed predicted from a stored table —
-    /// sound or poisoned — reaches a root meeting the resolution criterion,
-    /// within what the residuals allow of a cold solve.
+    /// solved and differentiated afresh. A table stored under other inputs,
+    /// sound or poisoned, seeds nothing: the slot's root is bitwise the
+    /// closed-form-seeded root (gam#2983).
     #[test]
     fn anchor_slot_keeps_the_table_of_exactly_its_own_equation() {
         let grid = skewed_grid();
@@ -2009,53 +1965,30 @@ mod anchor_tests {
             );
         }
 
-        // The series at a step of 1e-2 carries the sixth-order remainder of a
-        // table whose coefficients are O(1) on this law: within 1e-8 of the
-        // root, four orders above it, where the first order alone misses by
-        // the curvature term `c[2][0]·δq²`.
-        let (near_q, near_b) = (q + 0.01, b - 0.01);
-        let near = solve_anchor(near_q, near_b, grid.view()).expect("near root");
-        let series = taylor.predict(near_q - q, near_b - b);
-        assert!((series - near).abs() <= 1e-8, "series {series:+.17e} vs root {near:+.17e}");
-
-        // A seed predicted from a sound and from a poisoned table.
-        let (warm_q, warm_b) = (1.05_f64, 1.21_f64);
-        let log_target = normal_logcdf(-warm_q);
-        let residual = |alpha: f64| {
-            anchor_log_residual(alpha, warm_b, grid.view(), true, log_target).expect("residual")
-        };
-        let cold = solve_anchor(warm_q, warm_b, grid.view()).expect("cold");
+        // A table stored under other inputs, sound or poisoned, seeds nothing
+        // (gam#2983): the slot's root is bitwise the closed-form-seeded root.
+        // The nearby equations are where a sound table's series would land a
+        // seed inside the residual resolution, so a solve started there could
+        // stop on other bits. The far one is where the series outruns itself.
         let mut poisoned = taylor;
         poisoned.coefficients[1][0] = 1e6;
         poisoned.coefficients[0][1] = -1e6;
-        for (row, table) in [(1, taylor), (2, poisoned)] {
-            cache.slot(row, slot).expect("slot").write(&store(table));
-            let warm = solve_anchor_in_slot(warm_q, warm_b, context, row, slot).expect("predicted warm solve");
-            let (f_warm, d_warm, _) = residual(warm);
-            let (f_cold, d_cold, _) = residual(cold);
-            assert!(
-                f_warm.abs()
-                    <= anchor_residual_resolution(
-                        warm,
-                        d_warm,
-                        anchor_residual_rounding(log_target, grid.view().len())
-                    ),
-                "row {row}: warm root {warm:+.17e} has residual {f_warm:.3e}"
-            );
-            // `F` is monotone, so by the mean value theorem the roots differ by
-            // at most their residuals over the smallest slope between them,
-            // each residual allowed the rounding of its own evaluation — a sum
-            // of `m` positive terms and a logarithm — as in
-            // `linear_space_roots_match_the_log_space_roots_across_both_tails`:
-            // two roots a float apart can both evaluate to a residual of zero.
-            let noise = (grid.view().len() as f64 + 4.0) * f64::EPSILON * (1.0 + log_target.abs());
-            let (_, d_mid, _) = residual(warm + 0.5 * (cold - warm));
-            let bound =
-                (f_warm.abs() + f_cold.abs() + 2.0 * noise) / d_warm.abs().min(d_cold.abs()).min(d_mid.abs());
-            assert!(
-                (warm - cold).abs() <= bound,
-                "row {row}: warm {warm:+.17e} vs cold {cold:+.17e} exceeds the residual bound {bound:.3e}"
-            );
+        let others = (1..=16)
+            .map(|step| (q + 3e-4 * f64::from(step), b - 4e-4 * f64::from(step)))
+            .chain(std::iter::once((1.05_f64, 1.21_f64)));
+        for (other_q, other_b) in others {
+            let cold = solve_anchor(other_q, other_b, grid.view()).expect("cold");
+            for (row, table) in [(1, taylor), (2, poisoned)] {
+                cache.slot(row, slot).expect("slot").write(&store(table));
+                let through_slot =
+                    solve_anchor_in_slot(other_q, other_b, context, row, slot).expect("slot solve");
+                assert_eq!(
+                    through_slot.to_bits(),
+                    cold.to_bits(),
+                    "({other_q}, {other_b}) row {row}: the slot solve {through_slot:+.17e} is not the \
+                     closed-form root {cold:+.17e}"
+                );
+            }
         }
     }
 

@@ -2958,6 +2958,7 @@ fn link_flex_family_supports_second_order_exact_outer_path() {
 }
 
 mod time_wiggle_and_psi_derivatives;
+mod anchor_history_2983;
 
 #[test]
 fn sigma_exact_joint_psi_terms_returns_analytic_terms() {
