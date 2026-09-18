@@ -110,6 +110,23 @@ pub struct PenaltySubspaceTrace {
 }
 
 impl PenaltySubspaceTrace {
+    /// The forward error of the `log|H|` a criterion built on `operator_bound`'s
+    /// factor and this kernel carries (#2954). Where the kernel replaces the
+    /// operator's determinant (`logdet_correction ≠ 0`) the criterion's `log|H|`
+    /// is the kernel's pseudo-determinant, which carries no derived bound, so
+    /// there is none and a certificate takes no Newton-decrement verdict: the
+    /// operator's bound prices a determinant the criterion does not read.
+    /// Otherwise the operator's bound stands.
+    pub fn determinant_forward_error(&self, operator_bound: Option<f64>) -> Option<f64> {
+        if self.logdet_correction != 0.0 {
+            None
+        } else {
+            operator_bound
+        }
+    }
+}
+
+impl PenaltySubspaceTrace {
     /// Compute `tr(K · A)` where `K = U_S · h_proj_inverse · U_Sᵀ` — the
     /// pseudo-logdet trace kernel (see the struct doc for the two producer
     /// forms and their exactness domains).

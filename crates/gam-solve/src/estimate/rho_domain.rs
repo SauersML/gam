@@ -168,8 +168,18 @@ pub fn resolvability_interval(gammas: &[f64]) -> Option<(f64, f64)> {
 /// the lower resolvability edge is the unpenalized fit's limit model. Otherwise
 /// the penalty is what makes `H_β` positive definite there (a basis wider than
 /// the data support), and that edge is a representability face.
-pub(crate) fn unpenalized_fit_is_identified(gammas: &[f64], columns: usize) -> bool {
-    let frobenius = gammas.iter().map(|gamma| gamma * gamma).sum::<f64>().sqrt();
+pub fn unpenalized_fit_is_identified(gammas: &[f64], columns: usize) -> bool {
+    // Scaled by the largest `γ_j`, so `Σγ_j²` cannot overflow where every `γ_j`
+    // is finite.
+    let scale = gammas
+        .iter()
+        .fold(0.0_f64, |scale, gamma| scale.max(gamma.abs()));
+    let frobenius = scale
+        * gammas
+            .iter()
+            .map(|gamma| (gamma / scale).powi(2))
+            .sum::<f64>()
+            .sqrt();
     let band = columns as f64 * f64::EPSILON * frobenius;
     frobenius.is_finite() && frobenius > 0.0 && gammas.iter().all(|&gamma| gamma > band)
 }

@@ -669,9 +669,37 @@ pub(crate) fn resolvability_rho_domain(
     n_rho: usize,
     family_floor: Option<f64>,
 ) -> Result<(Array1<f64>, Array1<f64>), CustomFamilyError> {
+    resolvability_rho_domain_and_limit_faces(specs, layout, n_rho, family_floor)
+        .map(|domain| (domain.lower, domain.upper))
+}
+
+/// [`resolvability_rho_domain`] with the kind of each face (#2954), by the rule
+/// `gam_solve::estimate::rho_domain` applies to a standard REML design: an edge
+/// is its terms' limit model when it is their own resolvability edge. Past the
+/// upper edge every term on the coordinate sits at its penalty null-space fit;
+/// below the lower edge every term sits at its unpenalized fit, which is a limit
+/// only where each term's data identify it
+/// (`rho_domain::unpenalized_fit_is_identified`). The precision box of a
+/// coordinate no geometry reaches, an edge the representable log-strength range
+/// cut, and a family floor are literals, not limits.
+pub(crate) struct ResolvabilityRhoDomain {
+    pub(crate) lower: Array1<f64>,
+    pub(crate) upper: Array1<f64>,
+    pub(crate) lower_is_limit: Vec<bool>,
+    pub(crate) upper_is_limit: Vec<bool>,
+}
+
+pub(crate) fn resolvability_rho_domain_and_limit_faces(
+    specs: &[ParameterBlockSpec],
+    layout: &PenaltyLabelLayout,
+    n_rho: usize,
+    family_floor: Option<f64>,
+) -> Result<ResolvabilityRhoDomain, CustomFamilyError> {
+    use gam_solve::estimate::rho_domain::unpenalized_fit_is_identified;
     let precision_box = gam_solve::estimate::rho_domain::precision_box();
     let mut intervals: Vec<(f64, f64)> = vec![precision_box; n_rho];
     let mut seen = vec![false; n_rho];
+    let mut identified = vec![true; n_rho];
     let mut physical = 0usize;
     for spec in specs {
         if spec.penalties.is_empty() {
@@ -703,13 +731,13 @@ pub(crate) fn resolvability_rho_domain(
                     &gram, &penalty.to_dense(), &aggregate,
                 )
             };
-            let Some(interval) = gammas
-                .as_deref()
-                .and_then(resolvability_interval)
-            else {
+            let Some((gammas, interval)) = gammas.and_then(|gammas| {
+                resolvability_interval(&gammas).map(|interval| (gammas, interval))
+            }) else {
                 continue; // un-projectable geometry: the precision box stands.
             };
             include_interval(&mut intervals[outer], &mut seen[outer], interval);
+            identified[outer] &= unpenalized_fit_is_identified(&gammas, p);
         }
     }
     if !layout.joint_specs.is_empty()
@@ -731,36 +759,46 @@ pub(crate) fn resolvability_rho_domain(
             }
             offset += p;
         }
-        let mut group_intervals: Vec<(usize, (f64, f64))> = Vec::new();
+        let columns = joint_gram.nrows();
+        let mut group_intervals: Vec<(usize, (f64, f64), bool)> = Vec::new();
         for (joint_idx, joint) in layout.joint_specs.iter().enumerate() {
-            let Some(interval) = gam_solve::estimate::rho_domain::penalty_range_gammas_with_shared_nullspace(
-                &joint_gram, &joint.matrix, &aggregate,
-            )
-                .as_deref()
-                .and_then(resolvability_interval)
+            let Some((gammas, interval)) =
+                gam_solve::estimate::rho_domain::penalty_range_gammas_with_shared_nullspace(
+                    &joint_gram,
+                    &joint.matrix,
+                    &aggregate,
+                )
+                .and_then(|gammas| {
+                    resolvability_interval(&gammas).map(|interval| (gammas, interval))
+                })
             else {
                 continue;
             };
+            let joint_identified = unpenalized_fit_is_identified(&gammas, columns);
             match joint.group {
-                Some(group) => match group_intervals.iter_mut().find(|(g, _)| *g == group) {
-                    Some((_, current)) => {
+                Some(group) => match group_intervals.iter_mut().find(|(g, _, _)| *g == group) {
+                    Some((_, current, group_identified)) => {
                         current.0 = current.0.min(interval.0);
                         current.1 = current.1.max(interval.1);
+                        *group_identified &= joint_identified;
                     }
-                    None => group_intervals.push((group, interval)),
+                    None => group_intervals.push((group, interval, joint_identified)),
                 },
                 None => {
                     if let Some(&outer) = layout.joint_to_outer.get(joint_idx)
                         && outer < n_rho
                     {
                         include_interval(&mut intervals[outer], &mut seen[outer], interval);
+                        identified[outer] &= joint_identified;
                     }
                 }
             }
         }
         for (joint_idx, joint) in layout.joint_specs.iter().enumerate() {
             let Some(group) = joint.group else { continue };
-            let Some(&(_, interval)) = group_intervals.iter().find(|(g, _)| *g == group) else {
+            let Some(&(_, interval, group_identified)) =
+                group_intervals.iter().find(|(g, _, _)| *g == group)
+            else {
                 continue;
             };
             let Some(&outer) = layout.joint_to_outer.get(joint_idx) else {
@@ -768,11 +806,14 @@ pub(crate) fn resolvability_rho_domain(
             };
             if outer < n_rho {
                 include_interval(&mut intervals[outer], &mut seen[outer], interval);
+                identified[outer] &= group_identified;
             }
         }
     }
     let mut lower = Array1::<f64>::zeros(n_rho);
     let mut upper = Array1::<f64>::zeros(n_rho);
+    let mut lower_is_limit = vec![false; n_rho];
+    let mut upper_is_limit = vec![false; n_rho];
     for (outer, interval) in intervals.iter().enumerate() {
         let mut lo = interval.0.max(gam_problem::LOG_STRENGTH_MIN);
         let hi = interval.1.min(gam_problem::LOG_STRENGTH_MAX);
@@ -791,13 +832,21 @@ pub(crate) fn resolvability_rho_domain(
         }
         lower[outer] = lo;
         upper[outer] = hi;
+        lower_is_limit[outer] = seen[outer] && identified[outer] && lo == interval.0;
+        upper_is_limit[outer] = seen[outer] && hi == interval.1;
     }
     log::debug!(
-        "[RHO-DOMAIN] resolvability domain per coordinate: lower={:.3?} upper={:.3?}",
+        "[RHO-DOMAIN] resolvability domain per coordinate: lower={:.3?} upper={:.3?} \
+         lower_is_limit={lower_is_limit:?} upper_is_limit={upper_is_limit:?}",
         lower.to_vec(),
         upper.to_vec(),
     );
-    Ok((lower, upper))
+    Ok(ResolvabilityRhoDomain {
+        lower,
+        upper,
+        lower_is_limit,
+        upper_is_limit,
+    })
 }
 
 /// The #2812 ρ domain of per-block penalties, by the same law
@@ -2566,8 +2615,17 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
     // df reaches one. This is both the optimizer's upper bound and — because
     // every term sits on its penalty nullspace there, leaving a unique
     // parametric mode — the anchor of the #2366 continuation below.
-    let (rho_lower_bounds, rho_upper_bounds) =
-        resolvability_rho_domain(specs, &label_layout, n_rho, options.rho_lower_bound)?;
+    let ResolvabilityRhoDomain {
+        lower: rho_lower_bounds,
+        upper: rho_upper_bounds,
+        lower_is_limit: rho_lower_is_limit,
+        upper_is_limit: rho_upper_is_limit,
+    } = resolvability_rho_domain_and_limit_faces(
+        specs,
+        &label_layout,
+        n_rho,
+        options.rho_lower_bound,
+    )?;
     // The #2366 continuation anchor is the MAXIMAL-smoothing ρ — the uniform
     // ceiling — and not the per-term upper bound above.
     //
@@ -2767,7 +2825,10 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
         // reaches either has found a structural result, not a wall. The hand
         // ceiling of 12 and the effective-df floor of one that used to bound
         // this search are gone with it.
-        .with_bounds(rho_lower_bounds.clone(), rho_upper_bounds.clone());
+        .with_bounds(rho_lower_bounds.clone(), rho_upper_bounds.clone())
+        // #2954: which of those edges are the terms' limit models, so the mint may
+        // rail an exponential tail there and refuses by type at a literal face.
+        .with_limit_faces(rho_lower_is_limit, rho_upper_is_limit);
     // Install the seed-screening cap only when initial-rho screening is
     // wanted. A caller that pins an already-identified `initial_rho` and
     // opts out (`screen_initial_rho == false`) leaves the OuterConfig

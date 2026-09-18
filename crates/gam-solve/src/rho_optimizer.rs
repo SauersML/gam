@@ -54,6 +54,9 @@ mod decrement_bands;
 #[path = "rho_optimizer/efs_fallback_routing_tests.rs"]
 mod efs_fallback_routing_tests;
 mod hessian_operator;
+#[cfg(test)]
+#[path = "rho_optimizer/logdet_forward_error_1b_tests.rs"]
+mod logdet_forward_error_1b_tests;
 mod newton_polish;
 mod objective;
 mod outer_measurement;
@@ -64,6 +67,7 @@ pub mod rail_face;
 mod rail_projection_tests;
 mod run;
 mod run_plan;
+mod saddle_escape_latch;
 mod seed_screening;
 
 pub(crate) use crate::model_types::CERTIFICATE_RAIL_MARGIN;

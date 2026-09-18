@@ -1948,11 +1948,14 @@ fn inner_fit(
     options: &BlockwiseFitOptions,
 ) -> Result<UnifiedFitResult, FitFailure> {
     let mut options = options.clone();
-    // BMS carries fixed physical ridge penalties that regularize coefficient
-    // geometry but are not REML coordinates. The exact hyper-Hessian route can
-    // stall after that projection; the family has a dedicated exact-gradient
-    // path with full-data polish, so make it the primary nested smoother.
-    options.use_outer_hessian = false;
+    // The exact outer Hessian stays declared. Every custom-family search runs
+    // gradient-only on the family's exact gradient (#2898,
+    // `with_prefer_gradient_only`), so that Hessian is priced at the mint and
+    // nowhere in the search, and the mint needs it: its curvature decides
+    // whether a stop is a strict saddle (#2357, #2939), and the Newton-decrement
+    // verdict (#2954) is taken only where curvature is in hand. Disabling it
+    // left the certificate a first-order band, on which gnomon#2359's ρ = −2
+    // seed certified a saddle at 128.32 with descent left.
     floor_default_outer_tol(&mut options);
     crate::custom_family::fit_custom_family_arming_on_evidence(family, blocks, &options)
         .map_err(FitFailure::from)

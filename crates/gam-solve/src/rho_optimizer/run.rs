@@ -7926,6 +7926,7 @@ pub(crate) fn run_outer(
     // #2939 — once a mint has certified a strict saddle, every later run in this
     // solve searches on the declared curvature (`OuterConfig::curvature_search_latched`).
     let mut curvature_search_latched = config.curvature_search_latched;
+    let mut saddle_escapes = 0usize;
     let certificate = loop {
         match certify_diagnose_and_install(obj, &mut result) {
             Ok(certificate) => break certificate,
@@ -8015,11 +8016,20 @@ pub(crate) fn run_outer(
                 retry_cfg.operator_initial_trust_radius = None;
                 retry_cfg.warm_start_outer_hessian = None;
                 // A certified strict saddle latches the declared analytic Hessian into
-                // the search: its escape point is still inside the gradient band, so a
-                // gradient-only restart would stop at iteration 0 (#2939). The latch
-                // survives every later reseed kind in this solve.
+                // the search where its escape point is inside the gradient band, so a
+                // gradient-only restart would stop at iteration 0 (#2939), and at every
+                // later escape (`saddle_escape_latch`). The latch survives every later
+                // reseed kind in this solve.
                 if reseed.kind == CertifyReseedKind::SaddleEscape {
-                    curvature_search_latched = true;
+                    curvature_search_latched = curvature_search_latched
+                        || super::saddle_escape_latch::saddle_escape_needs_curvature_search(
+                            obj,
+                            config,
+                            context,
+                            retry_cfg.initial_rho.as_ref(),
+                            saddle_escapes,
+                        );
+                    saddle_escapes += 1;
                 }
                 retry_cfg.curvature_search_latched = curvature_search_latched;
                 obj.reset();

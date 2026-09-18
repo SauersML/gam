@@ -440,9 +440,13 @@ pub(crate) fn reml_laml_evaluate(
         }
     }
     // #2954: the factor `log|H_β|` is read from, for the certificate's band on
-    // the criterion's value.
+    // the criterion's value. Where a kernel replaces the operator's determinant,
+    // the operator's bound is not the criterion's (`determinant_forward_error`).
     if crate::estimate::outer_eval_capture::certificate_parts_capture_enabled()
-        && let Some(logdet_forward_error) = hop.logdet_forward_error()
+        && let Some(logdet_forward_error) = match solution.penalty_subspace_trace.as_ref() {
+            Some(kernel) => kernel.determinant_forward_error(hop.logdet_forward_error()),
+            None => hop.logdet_forward_error(),
+        }
     {
         crate::estimate::outer_eval_capture::record_certificate_inner_factor(
             crate::estimate::outer_eval_capture::InnerFactorCondition {
