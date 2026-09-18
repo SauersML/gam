@@ -13,7 +13,7 @@ mkdir -p "$RUNS"
 python3 bench/margslope_plain/gen.py "$N" "$RUNS/dch_${N}_sd.csv"
 
 PC_COLS="PC1, PC2, PC3, PC4, PC5, PC6, PC7, PC8, PC9, PC10"
-DUCHON="duchon($PC_COLS, centers=40, order=1, power=2, length_scale=1)"
+DUCHON="duchon($PC_COLS, centers=40)"
 MEAN="case ~ link(type=probit) + sex + $DUCHON"
 
 ./target/release/gam fit \

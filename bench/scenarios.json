@@ -103,13 +103,6 @@
       "seed": 20260226
     },
     {
-      "name": "geo_disease_ps_per_pc",
-      "n": 4000,
-      "seed": 20260226,
-      "exclude_contenders": [
-      ]
-    },
-    {
       "name": "geo_disease_eas_tp_k6",
       "n": 6000,
       "seed": 20260301
@@ -185,23 +178,6 @@
       "seed": 20260301
     },
     {
-      "name": "geo_disease_eas_psperpc_k6",
-      "n": 6000,
-      "seed": 20260301
-    },
-    {
-      "name": "geo_disease_eas_psperpc_k12",
-      "n": 6000,
-      "seed": 20260301,
-      "exclude_contenders": [
-      ]
-    },
-    {
-      "name": "geo_disease_eas_psperpc_k24",
-      "n": 6000,
-      "seed": 20260301
-    },
-    {
       "name": "geo_disease_eas3_tp_k6",
       "n": 6000,
       "seed": 20260301
@@ -247,21 +223,6 @@
       "seed": 20260301
     },
     {
-      "name": "geo_disease_eas3_psperpc_k6",
-      "n": 6000,
-      "seed": 20260301
-    },
-    {
-      "name": "geo_disease_eas3_psperpc_k12",
-      "n": 6000,
-      "seed": 20260301
-    },
-    {
-      "name": "geo_disease_eas3_psperpc_k24",
-      "n": 6000,
-      "seed": 20260301
-    },
-    {
       "name": "papuan_oce_tp_k12",
       "n": 6000,
       "seed": 20260315
@@ -275,13 +236,6 @@
       "name": "papuan_oce_matern_k12",
       "n": 6000,
       "seed": 20260315
-    },
-    {
-      "name": "papuan_oce_psperpc_k12",
-      "n": 6000,
-      "seed": 20260315,
-      "exclude_contenders": [
-      ]
     },
     {
       "name": "papuan_oce4_tp_k6",
@@ -325,21 +279,6 @@
     },
     {
       "name": "papuan_oce4_matern_k24",
-      "n": 6000,
-      "seed": 20260315
-    },
-    {
-      "name": "papuan_oce4_psperpc_k6",
-      "n": 6000,
-      "seed": 20260315
-    },
-    {
-      "name": "papuan_oce4_psperpc_k12",
-      "n": 6000,
-      "seed": 20260315
-    },
-    {
-      "name": "papuan_oce4_psperpc_k24",
       "n": 6000,
       "seed": 20260315
     },
@@ -393,24 +332,6 @@
     },
     {
       "name": "geo_subpop16_matern_k24",
-      "seed": 20260330,
-      "prevalence_min": 0.02,
-      "prevalence_max": 0.4
-    },
-    {
-      "name": "geo_subpop16_psperpc_k6",
-      "seed": 20260330,
-      "prevalence_min": 0.02,
-      "prevalence_max": 0.4
-    },
-    {
-      "name": "geo_subpop16_psperpc_k12",
-      "seed": 20260330,
-      "prevalence_min": 0.02,
-      "prevalence_max": 0.4
-    },
-    {
-      "name": "geo_subpop16_psperpc_k24",
       "seed": 20260330,
       "prevalence_min": 0.02,
       "prevalence_max": 0.4
@@ -521,26 +442,6 @@
       "prevalence_max": 0.1
     },
     {
-      "name": "geo_latlon_superpopnoise_psperpc_k6",
-      "seed": 20260401,
-      "prevalence_min": 0.01,
-      "prevalence_max": 0.1
-    },
-    {
-      "name": "geo_latlon_superpopnoise_psperpc_k12",
-      "seed": 20260401,
-      "prevalence_min": 0.01,
-      "prevalence_max": 0.1,
-      "exclude_contenders": [
-      ]
-    },
-    {
-      "name": "geo_latlon_superpopnoise_psperpc_k24",
-      "seed": 20260401,
-      "prevalence_min": 0.01,
-      "prevalence_max": 0.1
-    },
-    {
       "name": "geo_latlon_equatornoise_tp_k6",
       "seed": 20260401,
       "prevalence_min": 0.01,
@@ -590,26 +491,6 @@
     },
     {
       "name": "geo_latlon_equatornoise_matern_k24",
-      "seed": 20260401,
-      "prevalence_min": 0.01,
-      "prevalence_max": 0.1
-    },
-    {
-      "name": "geo_latlon_equatornoise_psperpc_k6",
-      "seed": 20260401,
-      "prevalence_min": 0.01,
-      "prevalence_max": 0.1
-    },
-    {
-      "name": "geo_latlon_equatornoise_psperpc_k12",
-      "seed": 20260401,
-      "prevalence_min": 0.01,
-      "prevalence_max": 0.1,
-      "exclude_contenders": [
-      ]
-    },
-    {
-      "name": "geo_latlon_equatornoise_psperpc_k24",
       "seed": 20260401,
       "prevalence_min": 0.01,
       "prevalence_max": 0.1

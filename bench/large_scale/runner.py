@@ -274,18 +274,6 @@ TRANSFORMATION_RESPONSE_GRID_SUBDIVISIONS = 4
 # preflight uses a conservative cap so the modelled grid size does not
 # under-report. Bumping this up is safe (only loosens the preflight check).
 CTN_RESPONSE_INTERNAL_KNOTS_CAP = 32
-# Spectral power for the 16-PC joint Duchon smooth. With order=0 the polynomial
-# null-space order is p=1, so 2*(p+power) = 2*(1+power). The exact two-block
-# spatial / transformation-normal (CTN) paths these specs run differentiate the
-# radial kernel at the origin and need its 2nd derivative, which is finite only
-# when 2*(p+power) > dimension+2 = 18. power=8 gives exactly 18 (not strictly
-# greater) and fails; power=9 gives 20 > 18 and clears every path the benchmark
-# exercises. (Kernel existence and D1/D2 collocation are all satisfied at 9, and
-# length_scale=1 makes the hybrid kernel strictly PD so the pure-mode CPD bound
-# 2*power < d does not apply.)
-LARGE_SCALE_DUCHON16D_ORDER = 0
-LARGE_SCALE_DUCHON16D_POWER = 9
-LARGE_SCALE_DUCHON16D_LENGTH_SCALE = 1.0
 PGS_RAW_COLUMN = "pgs_raw"
 PGS_CTN_Z_COLUMN = "pgs_ctn_z"
 PGS_CTN_DIAGNOSTIC_MIN_N = 40
@@ -416,7 +404,7 @@ def preflight_marginal_slope_large_scale(
         f"n_train: {n_train:,}",
         f"d_pc: {d_pc}",
         f"K_pc: {centers}",
-        f"Duchon tuple: order={LARGE_SCALE_DUCHON16D_ORDER}, power={LARGE_SCALE_DUCHON16D_POWER}, length_scale={LARGE_SCALE_DUCHON16D_LENGTH_SCALE:g}",
+        "Duchon kernel: gam's scale-free default (no order, power or length_scale)",
         "Duchon smooth: lazy chunked",
         "marginal-slope anisotropy derivatives: implicit streaming",
         "conditional PGS CTN geometry: isotropic joint-PC Duchon (no scale dimensions)",
@@ -659,12 +647,17 @@ def _pc_std_columns(pc_count: int) -> list[str]:
 
 
 def _large_scale_duchon_pc_term(pc_count: int, centers: int) -> str:
+    """The joint-PC Duchon smooth on gam's scale-free default kernel.
+
+    No order, power or length scale is set. gam's default is an affine null
+    space (p = 2) with spectral power s = (d - 1)/2, 7.5 at d = 16: pure Duchon
+    needs 2s < d (15 < 16), and the two-block spatial and CTN paths need the
+    kernel's second radial derivative at the origin, finite when
+    2(p + s) > d + 2 (19 > 18). The center count is explicit because gam's
+    default count in 16 dimensions is about 2,000 (gam#2993).
+    """
     pc_cols = ", ".join(_pc_std_columns(pc_count))
-    return (
-        f"duchon({pc_cols}, centers={centers}, "
-        f"order={LARGE_SCALE_DUCHON16D_ORDER}, power={LARGE_SCALE_DUCHON16D_POWER}, "
-        f"length_scale={LARGE_SCALE_DUCHON16D_LENGTH_SCALE:g})"
-    )
+    return f"duchon({pc_cols}, centers={centers})"
 
 
 def _large_scale_pc_smooth_term(spatial_basis: str, pc_count: int, centers: int) -> str:

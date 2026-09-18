@@ -407,70 +407,46 @@ class RunSuiteMappingTests(unittest.TestCase):
         self.assert_joint_mapping("papuan_oce4_tp_k12", expected_dim=4, expected_knots=12)
         self.assert_joint_mapping("geo_subpop16_tp_k24", expected_dim=16, expected_knots=24)
 
-    def test_every_psperpc_scenario_emits_additive_per_pc_psplines(self) -> None:
+    def test_no_scenario_builds_a_separate_smooth_per_pc(self) -> None:
         scenarios = json.loads((_REPO_ROOT / "bench" / "scenarios.json").read_text())["scenarios"]
-        names = [s["name"] for s in scenarios if "_psperpc_" in s["name"]]
-        self.assertEqual(len(names), 19)
+        checked = 0
+        for scenario in scenarios:
+            name = scenario["name"]
+            self.assertNotIn("psperpc", name)
+            self.assertNotIn("per_pc", name)
+            cfg = _RUN_SUITE._scenario_fit_mapping(name)
+            if cfg is None:
+                continue
+            declared = list(cfg.get("smooth_cols") or []) + list(cfg.get("linear_cols") or [])
+            pc_cols, _other = _RUN_SUITE._split_pc_columns(list(dict.fromkeys(declared)))
+            if len(pc_cols) < 2:
+                continue
+            with self.subTest(scenario=name):
+                self.assertTrue(_RUN_SUITE._requires_joint_spatial_term(cfg))
+                _family, rust_formula = _RUN_SUITE._rust_formula_for_scenario(name, {"target": "y"})
+                mgcv_formula = _RUN_SUITE._mgcv_formula_for_scenario(name, {"target": "y"})
+                for formula in (rust_formula, mgcv_formula):
+                    # All PCs in one term, and no PC in a smooth or linear term of its own.
+                    self.assertIn(", ".join(pc_cols), formula)
+                    for col in pc_cols:
+                        self.assertNotRegex(formula, rf"\bs\({col}\s*,\s*(type|bs|k|knots|centers)\s*=")
+                        self.assertNotIn(f"linear({col})", formula)
+                checked += 1
+        self.assertGreaterEqual(checked, 60)
 
-        for scenario_name in names:
-            with self.subTest(scenario=scenario_name):
-                cfg = _RUN_SUITE._scenario_fit_mapping(scenario_name)
-                self.assertEqual(cfg["smooth_basis"], "ps")
-                self.assertEqual(cfg["pc_layout"], "additive")
-                self.assertFalse(_RUN_SUITE._requires_joint_spatial_term(cfg))
-
-                _family, rust_formula = _RUN_SUITE._rust_formula_for_scenario(
-                    scenario_name,
-                    {"target": "y"},
-                )
-                mgcv_formula = _RUN_SUITE._mgcv_formula_for_scenario(
-                    scenario_name,
-                    {"target": "y"},
-                )
-                knots = cfg["knots"]
-                for col in cfg["smooth_cols"]:
-                    self.assertIn(f"s({col}, type=ps, knots={knots}", rust_formula)
-                    self.assertIn(
-                        f"s({col}, bs='ps', k=min({knots + 4}, nrow(train_df)-1))",
-                        mgcv_formula,
-                    )
-                self.assertEqual(rust_formula.count("type=ps"), len(cfg["smooth_cols"]))
-                self.assertEqual(mgcv_formula.count("bs='ps'"), len(cfg["smooth_cols"]))
-                self.assertNotIn("duchon(", rust_formula)
-                self.assertNotIn("bs='ds'", mgcv_formula)
-                _RUN_SUITE._assert_basis_parity_for_scenario(
-                    {"name": scenario_name},
-                    ds={"target": "y"},
-                )
-
-    def test_papuan_psperpc_is_not_the_duchon_scenario(self) -> None:
-        ds = {"target": "y"}
-        _family, psperpc = _RUN_SUITE._rust_formula_for_scenario(
-            "papuan_oce4_psperpc_k6", ds
+    def test_a_ps_declared_pc_mapping_is_routed_to_the_joint_smooth(self) -> None:
+        cfg = {
+            "family": "binomial-logit",
+            "smooth_cols": [f"pc{i}" for i in range(1, 5)],
+            "linear_cols": [],
+            "smooth_basis": "ps",
+            "knots": 6,
+        }
+        _family, rust_formula = _RUN_SUITE._rust_formula_for_scenario(
+            "papuan_oce4_duchon_k6", {"target": "y"}, cfg_override=cfg
         )
-        _family, duchon = _RUN_SUITE._rust_formula_for_scenario(
-            "papuan_oce4_duchon_k6", ds
-        )
-        self.assertNotEqual(psperpc, duchon)
-        self.assertEqual(psperpc.count("type=ps"), 4)
-        self.assertIn("duchon(pc1, pc2, pc3, pc4", duchon)
-
-    def test_additive_pc_basis_budget_counts_every_marginal_smooth(self) -> None:
-        folds = [
-            _RUN_SUITE.Fold(
-                train_idx=_RUN_SUITE.np.arange(400),
-                test_idx=_RUN_SUITE.np.arange(400, 500),
-            )
-        ]
-        with self.assertRaisesRegex(
-            RuntimeError,
-            r"geo_subpop16_psperpc_k24: 433 free coefficients require fewer than 400 rows",
-        ):
-            _RUN_SUITE._assert_marginal_pspline_basis_budget(
-                {"name": "geo_subpop16_psperpc_k24"},
-                {"family": "binomial"},
-                folds,
-            )
+        self.assertIn("duchon(pc1, pc2, pc3, pc4", rust_formula)
+        self.assertNotIn("type=ps", rust_formula)
 
     def test_geo_subpop16_dataset_builds_without_external_pc_file(self) -> None:
         ds = _RUN_SUITE.dataset_for_scenario({"name": "geo_subpop16_tp_k6"})

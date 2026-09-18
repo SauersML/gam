@@ -1272,7 +1272,7 @@ def _synthetic_geo_disease_eas_dataset(n: typing.Any=6000, seed: typing.Any=2026
 
 def _geo_disease_eas_scenario_cfg(name: typing.Any) -> typing.Any:
     m = re.match(
-        r"^geo_disease_(eas|eas3)_(tp|duchon|matern|psperpc)_k([0-9]+)(?:_downsample[0-9]+x)?(?:_holdout)?$",
+        r"^geo_disease_(eas|eas3)_(tp|duchon|matern)_k([0-9]+)(?:_downsample[0-9]+x)?(?:_holdout)?$",
         str(name),
     )
     if m is None:
@@ -1281,47 +1281,15 @@ def _geo_disease_eas_scenario_cfg(name: typing.Any) -> typing.Any:
     basis_code = m.group(2)
     knots = max(4, int(m.group(3)))
     n_pcs = 3 if family_code == "eas3" else 16
-    if basis_code == "tp":
-        joint_pcs = _fixed_joint_spatial_pc_count("geo_disease", n_pcs)
-        return {
-            "smooth_basis": "thinplate",
-            "smooth_cols": [f"pc{i}" for i in range(1, joint_pcs + 1)],
-            "linear_cols": [],
-            "knots": knots,
-            "basis_code": basis_code,
-            "n_pcs": n_pcs,
-            "pc_layout": "joint",
-        }
-    if basis_code == "duchon":
-        joint_pcs = _fixed_joint_spatial_pc_count("geo_disease", n_pcs)
-        return {
-            "smooth_basis": "duchon",
-            "smooth_cols": [f"pc{i}" for i in range(1, joint_pcs + 1)],
-            "linear_cols": [],
-            "knots": knots,
-            "basis_code": basis_code,
-            "n_pcs": n_pcs,
-            "pc_layout": "joint",
-        }
-    if basis_code == "matern":
-        joint_pcs = _fixed_joint_spatial_pc_count("geo_disease", n_pcs)
-        return {
-            "smooth_basis": "matern",
-            "smooth_cols": [f"pc{i}" for i in range(1, joint_pcs + 1)],
-            "linear_cols": [],
-            "knots": knots,
-            "basis_code": basis_code,
-            "n_pcs": n_pcs,
-            "pc_layout": "joint",
-        }
+    smooth_basis = {"tp": "thinplate", "duchon": "duchon", "matern": "matern"}[basis_code]
+    joint_pcs = _fixed_joint_spatial_pc_count("geo_disease", n_pcs)
     return {
-        "smooth_basis": "ps",
-        "smooth_cols": [f"pc{i}" for i in range(1, n_pcs + 1)],
+        "smooth_basis": smooth_basis,
+        "smooth_cols": [f"pc{i}" for i in range(1, joint_pcs + 1)],
         "linear_cols": [],
         "knots": knots,
         "basis_code": basis_code,
         "n_pcs": n_pcs,
-        "pc_layout": "additive",
     }
 
 
@@ -1353,23 +1321,13 @@ def _fixed_joint_spatial_pc_count(family: str, n_pcs: int) -> int:
 
 
 def _papuan_oce_scenario_cfg(name: typing.Any) -> typing.Any:
-    m = re.match(r"^papuan_oce(4)?_(tp|duchon|matern|psperpc)_k([0-9]+)$", str(name))
+    m = re.match(r"^papuan_oce(4)?_(tp|duchon|matern)_k([0-9]+)$", str(name))
     if m is None:
         return None
     is_four_pc = m.group(1) is not None
     basis_code = m.group(2)
     knots = max(4, int(m.group(3)))
     n_pcs = 4 if is_four_pc else 16
-    if basis_code == "psperpc":
-        return {
-            "smooth_basis": "ps",
-            "smooth_cols": [f"pc{i}" for i in range(1, n_pcs + 1)],
-            "linear_cols": [],
-            "knots": knots,
-            "basis_code": basis_code,
-            "n_pcs": n_pcs,
-            "pc_layout": "additive",
-        }
     smooth_basis = {"tp": "thinplate", "duchon": "duchon", "matern": "matern"}[basis_code]
     joint_pcs = _fixed_joint_spatial_pc_count("papuan_oce", n_pcs)
     return {
@@ -1379,7 +1337,6 @@ def _papuan_oce_scenario_cfg(name: typing.Any) -> typing.Any:
         "knots": knots,
         "basis_code": basis_code,
         "n_pcs": n_pcs,
-        "pc_layout": "joint",
     }
 
 
@@ -1389,21 +1346,11 @@ def _synthetic_papuan_oce_dataset(n: typing.Any=6000, seed: typing.Any=20260315,
 
 
 def _geo_subpop16_scenario_cfg(name: typing.Any) -> typing.Any:
-    m = re.match(r"^geo_subpop16_(tp|duchon|matern|psperpc)_k([0-9]+)$", str(name))
+    m = re.match(r"^geo_subpop16_(tp|duchon|matern)_k([0-9]+)$", str(name))
     if m is None:
         return None
     basis_code = m.group(1)
     knots = max(4, int(m.group(2)))
-    if basis_code == "psperpc":
-        return {
-            "smooth_basis": "ps",
-            "smooth_cols": [f"pc{i}" for i in range(1, 17)],
-            "linear_cols": [],
-            "knots": knots,
-            "basis_code": basis_code,
-            "n_pcs": 16,
-            "pc_layout": "additive",
-        }
     smooth_basis = {"tp": "thinplate", "duchon": "duchon", "matern": "matern"}[basis_code]
     joint_pcs = _fixed_joint_spatial_pc_count("geo_subpop16", 16)
     return {
@@ -1413,28 +1360,16 @@ def _geo_subpop16_scenario_cfg(name: typing.Any) -> typing.Any:
         "knots": knots,
         "basis_code": basis_code,
         "n_pcs": 16,
-        "pc_layout": "joint",
     }
 
 
 def _geo_latlon_scenario_cfg(name: typing.Any) -> typing.Any:
-    m = re.match(r"^geo_latlon_(superpopnoise|equatornoise)_(tp|duchon|matern|psperpc)_k([0-9]+)$", str(name))
+    m = re.match(r"^geo_latlon_(superpopnoise|equatornoise)_(tp|duchon|matern)_k([0-9]+)$", str(name))
     if m is None:
         return None
     mode_code = m.group(1)
     basis_code = m.group(2)
     knots = max(4, int(m.group(3)))
-    if basis_code == "psperpc":
-        return {
-            "mode_code": mode_code,
-            "smooth_basis": "ps",
-            "smooth_cols": [f"pc{i}" for i in range(1, 7)],
-            "linear_cols": [],
-            "knots": knots,
-            "basis_code": basis_code,
-            "n_pcs": 6,
-            "pc_layout": "additive",
-        }
     smooth_basis = {"tp": "thinplate", "duchon": "duchon", "matern": "matern"}[basis_code]
     joint_pcs = _fixed_joint_spatial_pc_count("geo_latlon", 6)
     return {
@@ -1445,7 +1380,6 @@ def _geo_latlon_scenario_cfg(name: typing.Any) -> typing.Any:
         "knots": knots,
         "basis_code": basis_code,
         "n_pcs": 6,
-        "pc_layout": "joint",
     }
 
 

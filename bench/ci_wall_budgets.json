@@ -7,7 +7,7 @@
     "unmeasured_budget_rule": "A scenario with no `completed` measurement has nothing to calibrate against. It receives the largest budget that any measured scenario earns under the rule above, so no scenario is ever capped below the most expensive scenario that has ever been observed to finish.",
     "ceiling_overhead_rationale": "`timeout-minutes` (the GitHub job ceiling) must sit ABOVE the GNU-timeout budget, or a censored shard is CANCELLED by GitHub instead of exiting 124 and the run loses the ability to tell censored from failed. The gap it must cover is everything outside the bench command -- checkout, Python/R setup, artifact download, smoke imports, upload. That is measured, not guessed: `job_overhead_seconds_observed_max` is the largest gap between job wall time and shard budget across the 22 censored jobs of run 30687540475 (heart_failure_survival), and the ceiling adds `safety_factor` times it, rounded up to the whole minute -- the SAME headroom policy the budget itself uses, applied to the same kind of measured upper bound.",
     "rejected_models": [
-      "work = n*p^2 + p^3 with p = n_pcs*k (a matrix-shape cost model). Refuted by these same measurements: us48_demand_5day completes in 2634 s at work ~ 1e5 while geo_disease_eas3_psperpc_k24 completes in 1376 s at work ~ 3e7. The driver of wall time on this matrix is the CONTENDER MIX (the brms MCMC folds in particular), not the design-matrix shape, so a shape-derived budget formula would be a fitted law on the wrong axis. Each scenario is budgeted from its OWN measured history instead."
+      "work = n*p^2 + p^3 with p = n_pcs*k (a matrix-shape cost model). Refuted by these same measurements: us48_demand_5day completes in 2634 s at work ~ 1e5 while papuan_oce4_duchon_k12 completes in 1529 s at work ~ 1e7. The driver of wall time on this matrix is the CONTENDER MIX (the brms MCMC folds in particular), not the design-matrix shape, so a shape-derived budget formula would be a fitted law on the wrong axis. Each scenario is budgeted from its OWN measured history instead."
     ],
     "job_overhead_seconds_observed_max": 203
   },
@@ -73,18 +73,6 @@
       "outcome": "censored",
       "budget_seconds_at_measurement": 2520
     },
-    "geo_disease_eas3_psperpc_k12": {
-      "job_seconds": 559,
-      "outcome": "completed"
-    },
-    "geo_disease_eas3_psperpc_k24": {
-      "job_seconds": 1376,
-      "outcome": "completed"
-    },
-    "geo_disease_eas3_psperpc_k6": {
-      "job_seconds": 587,
-      "outcome": "completed"
-    },
     "geo_disease_eas3_tp_k12": {
       "job_seconds": 259,
       "outcome": "completed"
@@ -148,21 +136,6 @@
       "outcome": "censored",
       "budget_seconds_at_measurement": 2520
     },
-    "geo_disease_eas_psperpc_k12": {
-      "job_seconds": 2664,
-      "outcome": "censored",
-      "budget_seconds_at_measurement": 2520
-    },
-    "geo_disease_eas_psperpc_k24": {
-      "job_seconds": 2621,
-      "outcome": "censored",
-      "budget_seconds_at_measurement": 2520
-    },
-    "geo_disease_eas_psperpc_k6": {
-      "job_seconds": 2620,
-      "outcome": "censored",
-      "budget_seconds_at_measurement": 2520
-    },
     "geo_disease_eas_tp_k12": {
       "job_seconds": 193,
       "outcome": "completed"
@@ -179,10 +152,6 @@
       "job_seconds": 267,
       "outcome": "errored",
       "budget_seconds_at_measurement": 2520
-    },
-    "geo_disease_ps_per_pc": {
-      "job_seconds": 184,
-      "outcome": "completed"
     },
     "geo_disease_shrinkage": {
       "job_seconds": 175,
@@ -216,21 +185,6 @@
     },
     "geo_latlon_equatornoise_matern_k6": {
       "job_seconds": 266,
-      "outcome": "errored",
-      "budget_seconds_at_measurement": 2520
-    },
-    "geo_latlon_equatornoise_psperpc_k12": {
-      "job_seconds": 2638,
-      "outcome": "censored",
-      "budget_seconds_at_measurement": 2520
-    },
-    "geo_latlon_equatornoise_psperpc_k24": {
-      "job_seconds": 1379,
-      "outcome": "errored",
-      "budget_seconds_at_measurement": 2520
-    },
-    "geo_latlon_equatornoise_psperpc_k6": {
-      "job_seconds": 2396,
       "outcome": "errored",
       "budget_seconds_at_measurement": 2520
     },
@@ -270,21 +224,6 @@
     },
     "geo_latlon_superpopnoise_matern_k6": {
       "job_seconds": 214,
-      "outcome": "errored",
-      "budget_seconds_at_measurement": 2520
-    },
-    "geo_latlon_superpopnoise_psperpc_k12": {
-      "job_seconds": 2685,
-      "outcome": "censored",
-      "budget_seconds_at_measurement": 2520
-    },
-    "geo_latlon_superpopnoise_psperpc_k24": {
-      "job_seconds": 866,
-      "outcome": "errored",
-      "budget_seconds_at_measurement": 2520
-    },
-    "geo_latlon_superpopnoise_psperpc_k6": {
-      "job_seconds": 1948,
       "outcome": "errored",
       "budget_seconds_at_measurement": 2520
     },
@@ -329,21 +268,6 @@
     },
     "geo_subpop16_matern_k6": {
       "job_seconds": 1352,
-      "outcome": "errored",
-      "budget_seconds_at_measurement": 2520
-    },
-    "geo_subpop16_psperpc_k12": {
-      "job_seconds": 2628,
-      "outcome": "censored",
-      "budget_seconds_at_measurement": 2520
-    },
-    "geo_subpop16_psperpc_k24": {
-      "job_seconds": 2649,
-      "outcome": "censored",
-      "budget_seconds_at_measurement": 2520
-    },
-    "geo_subpop16_psperpc_k6": {
-      "job_seconds": 1790,
       "outcome": "errored",
       "budget_seconds_at_measurement": 2520
     },
@@ -422,19 +346,6 @@
       "outcome": "errored",
       "budget_seconds_at_measurement": 2520
     },
-    "papuan_oce4_psperpc_k12": {
-      "job_seconds": 1233,
-      "outcome": "completed"
-    },
-    "papuan_oce4_psperpc_k24": {
-      "job_seconds": 2634,
-      "outcome": "censored",
-      "budget_seconds_at_measurement": 2520
-    },
-    "papuan_oce4_psperpc_k6": {
-      "job_seconds": 559,
-      "outcome": "completed"
-    },
     "papuan_oce4_tp_k12": {
       "job_seconds": 562,
       "outcome": "completed"
@@ -453,11 +364,6 @@
     },
     "papuan_oce_matern_k12": {
       "job_seconds": 2630,
-      "outcome": "censored",
-      "budget_seconds_at_measurement": 2520
-    },
-    "papuan_oce_psperpc_k12": {
-      "job_seconds": 2634,
       "outcome": "censored",
       "budget_seconds_at_measurement": 2520
     },
