@@ -109,6 +109,12 @@ pub struct FitRequestConfigDocument {
     pub group_metadata: Option<BTreeMap<String, JsonValue>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hazard_loading: Option<String>,
+    /// Absolute inner (coefficient) stationarity tolerance of the custom-family
+    /// solver: marginal-slope, survival, transformation-normal, location-scale
+    /// and the link-wiggle refit. Omit for the solver's default. The standard
+    /// GAM route has no inner tolerance to hand it and refuses the key.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub inner_tol: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub latent_coordinates: Option<LatentCoordinatesDocument>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -123,6 +129,11 @@ pub struct FitRequestConfigDocument {
     pub noise_offset: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub offset: Option<String>,
+    /// Absolute outer (smoothing-selection) stationarity tolerance, handed to
+    /// the route's outer optimizer as its `outer_tol` (custom-family routes) or
+    /// `tol` (the standard REML route). Omit for each route's default.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub outer_tol: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub analytic_penalties: Option<AnalyticPenaltiesDocument>,
     #[serde(skip_serializing_if = "Option::is_none")]

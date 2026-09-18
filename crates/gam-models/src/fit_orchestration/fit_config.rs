@@ -270,6 +270,13 @@ impl FitConfig {
         {
             return Err("persistent_warm_start_root must not be empty".to_string());
         }
+        for (name, tolerance) in [("outer_tol", self.outer_tol), ("inner_tol", self.inner_tol)] {
+            if let Some(value) = tolerance
+                && !(value.is_finite() && value > 0.0)
+            {
+                return Err(format!("{name} must be finite and > 0, got {value}"));
+            }
+        }
 
         // Normalize the survival time-anchor override through its one validator,
         // so the CLI flag, a `--request` document, a `gamfit.fit` kwarg and a

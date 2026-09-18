@@ -64,8 +64,8 @@ The formula front doors are `fit`, `fit_array`, `validate_formula`, and
 `baseline_target`, `baseline_scale`, `baseline_shape`, `baseline_rate`,
 `baseline_makeham`, `z_column`, `link`, `slope_formula`, `frailty_kind`,
 `frailty_sd`, `hazard_loading`, `scale_dimensions`, `firth`, `noise_formula`,
-`noise_offset`, `flexible_link`, `precision_hyperpriors`, `constraints`,
-`response_geometry`, `response_columns`, `response_coordinates`,
+`noise_offset`, `flexible_link`, `outer_tol`, `inner_tol`, `precision_hyperpriors`,
+`constraints`, `response_geometry`, `response_columns`, `response_coordinates`,
 `response_reference`, `fisher_rao_w`, `latents`, `penalties`, `smooths`, and
 `config`.
 

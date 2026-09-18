@@ -77,8 +77,9 @@ pub fn canonical_standard_fit_options(
         // projected-gradient threshold ≈ 1e-7) resolves λ̂ to optimiser
         // precision and restores the `w=c ⇔ c-fold replication` invariance in
         // smoothing selection (gam#893). The CLI previously used the stale
-        // `1e-6`, which over-smoothed relative to the formula path.
-        tol: 1e-10,
+        // `1e-6`, which over-smoothed relative to the formula path. A caller's
+        // `outer_tol` replaces it on both entry points alike.
+        tol: config.outer_tol.unwrap_or(1e-10),
         nullspace_dims: vec![],
         linear_constraints: inputs.linear_constraints,
         firth_bias_reduction: inputs.firth_bias_reduction,

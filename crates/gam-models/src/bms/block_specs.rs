@@ -1910,6 +1910,38 @@ mod deviation_penalty_layout_tests {
     }
 }
 
+/// The binary marginal-slope route's outer tolerance floor, `2e-5`, on the
+/// default tolerance only. A tolerance the caller set (a fit request's
+/// `outer_tol`) is the caller's convergence contract and passes unchanged.
+fn floor_default_outer_tol(options: &mut BlockwiseFitOptions) {
+    if !options.outer_tol_is_caller_set {
+        options.outer_tol = options.outer_tol.max(2.0e-5);
+    }
+}
+
+#[cfg(test)]
+mod outer_tol_floor_tests {
+    use super::*;
+
+    /// gnomon-c9's converged reference fit asks for an `outer_tol` below the
+    /// route's `2e-5` floor. The floor still raises the default, and must not
+    /// raise a requested tolerance.
+    #[test]
+    fn the_floor_raises_the_default_and_passes_a_requested_outer_tol() {
+        let mut default = BlockwiseFitOptions::default();
+        floor_default_outer_tol(&mut default);
+        assert_eq!(default.outer_tol, 2.0e-5);
+
+        let mut requested = BlockwiseFitOptions {
+            outer_tol: 1e-8,
+            outer_tol_is_caller_set: true,
+            ..BlockwiseFitOptions::default()
+        };
+        floor_default_outer_tol(&mut requested);
+        assert_eq!(requested.outer_tol, 1e-8);
+    }
+}
+
 fn inner_fit(
     family: &BernoulliMarginalSlopeFamily,
     blocks: &[ParameterBlockSpec],
@@ -1921,7 +1953,7 @@ fn inner_fit(
     // stall after that projection; the family has a dedicated exact-gradient
     // path with full-data polish, so make it the primary nested smoother.
     options.use_outer_hessian = false;
-    options.outer_tol = options.outer_tol.max(2.0e-5);
+    floor_default_outer_tol(&mut options);
     crate::custom_family::fit_custom_family_arming_on_evidence(family, blocks, &options)
         .map_err(FitFailure::from)
 }
@@ -1936,7 +1968,7 @@ fn inner_fit_from_certified_outer(
 ) -> Result<UnifiedFitResult, FitFailure> {
     let mut options = crate::outer_subsample::exact_outer_options(options);
     options.use_outer_hessian = false;
-    options.outer_tol = options.outer_tol.max(2.0e-5);
+    floor_default_outer_tol(&mut options);
     fit_custom_family_fixed_log_lambdas_from_mode_selection(
         family, blocks, &options, mode, theta, outer,
     )

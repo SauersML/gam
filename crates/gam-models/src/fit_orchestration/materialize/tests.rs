@@ -375,6 +375,55 @@ fn survival_time_anchor_rejected_on_nonsurvival_response_2631() {
     );
 }
 
+/// gnomon-c9: a fit request's `outer_tol` / `inner_tol` reach the solver its
+/// route runs, and an absent key leaves every default bit for bit.
+#[test]
+fn caller_tolerances_reach_the_solver_and_absent_keys_keep_the_defaults() {
+    use crate::fit_orchestration::{StandardFitOptionsInputs, canonical_standard_fit_options};
+
+    let defaults = BlockwiseFitOptions::default();
+    let absent = blockwise_fit_options(&FitConfig::default());
+    assert_eq!(absent.outer_tol.to_bits(), defaults.outer_tol.to_bits());
+    assert_eq!(absent.inner_tol.to_bits(), defaults.inner_tol.to_bits());
+    assert!(!absent.outer_tol_is_caller_set);
+    let standard_absent =
+        canonical_standard_fit_options(&FitConfig::default(), StandardFitOptionsInputs::default());
+    assert_eq!(standard_absent.tol.to_bits(), 1e-10_f64.to_bits());
+
+    let requested = FitConfig {
+        outer_tol: Some(1e-8),
+        inner_tol: Some(1e-9),
+        ..FitConfig::default()
+    };
+    let set = blockwise_fit_options(&requested);
+    assert_eq!(set.outer_tol, 1e-8);
+    assert_eq!(set.inner_tol, 1e-9);
+    assert!(set.outer_tol_is_caller_set);
+    let standard_set =
+        canonical_standard_fit_options(&requested, StandardFitOptionsInputs::default());
+    assert_eq!(standard_set.tol, 1e-8);
+}
+
+/// The standard route's PIRLS takes no inner tolerance, so a set `inner_tol` is
+/// refused by name rather than dropped; `outer_tol` is its REML `tol`.
+#[test]
+fn a_standard_fit_refuses_inner_tol_and_takes_outer_tol() {
+    let data = workflow_test_dataset();
+    let inner = FitConfig {
+        inner_tol: Some(1e-9),
+        ..FitConfig::default()
+    };
+    let error = materialize("bmi ~ z", &data, &inner)
+        .err()
+        .expect("a standard fit has no inner tolerance to set");
+    assert!(error.to_string().contains("inner_tol"), "{error}");
+    let outer = FitConfig {
+        outer_tol: Some(1e-8),
+        ..FitConfig::default()
+    };
+    materialize("bmi ~ z", &data, &outer).expect("outer_tol is the standard route's tol");
+}
+
 /// The carrier is survival-only: a standard fit has no survival time basis to
 /// record, and must not fabricate one.
 #[test]

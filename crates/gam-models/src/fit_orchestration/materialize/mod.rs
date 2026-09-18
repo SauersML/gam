@@ -57,11 +57,31 @@ use validation::*;
 /// from here: their model is incomplete without the joint posterior, so their
 /// fit drivers force covariance at the final fit and keep the pilots cheap.
 fn blockwise_fit_options(config: &FitConfig) -> BlockwiseFitOptions {
-    BlockwiseFitOptions {
-        compute_covariance: config.compute_covariance.unwrap_or(true),
-        persistent_warm_start_store: config.persistent_warm_start_store.clone(),
-        ..BlockwiseFitOptions::default()
+    with_caller_tolerances(
+        BlockwiseFitOptions {
+            compute_covariance: config.compute_covariance.unwrap_or(true),
+            persistent_warm_start_store: config.persistent_warm_start_store.clone(),
+            ..BlockwiseFitOptions::default()
+        },
+        config,
+    )
+}
+
+/// The caller's `outer_tol` / `inner_tol`, when set, in place of the solver
+/// defaults. Every custom-family request built from a `FitConfig` passes
+/// through here, so a set tolerance reaches the solver on every such route.
+fn with_caller_tolerances(
+    mut options: BlockwiseFitOptions,
+    config: &FitConfig,
+) -> BlockwiseFitOptions {
+    if let Some(tolerance) = config.outer_tol {
+        options.outer_tol = tolerance;
+        options.outer_tol_is_caller_set = true;
     }
+    if let Some(tolerance) = config.inner_tol {
+        options.inner_tol = tolerance;
+    }
+    options
 }
 
 #[cfg(test)]
