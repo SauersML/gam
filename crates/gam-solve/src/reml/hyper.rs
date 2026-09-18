@@ -1234,6 +1234,25 @@ impl<'a> RemlState<'a> {
     ) -> Result<(f64, Array1<f64>, gam_problem::HessianValue), EstimationError> {
         let t_outer_start = std::time::Instant::now();
         let rho = theta.slice(s![..rho_dim]).to_owned();
+        // The rho-only fallback below is legal ONLY for a theta that carries no
+        // ψ tail: an empty direction list against a [rho, psi] theta would hand
+        // the caller a rho-only gradient whose length silently disagrees with
+        // the declared layout (#2987 — the dense-work guards used to
+        // manufacture exactly that condition). Make the contract unrepresentable
+        // to violate instead of trusting every caller to uphold it.
+        let psi_dim = theta.len().checked_sub(rho_dim).ok_or_else(|| {
+            EstimationError::InvalidInput(format!(
+                "rho_dim {rho_dim} exceeds theta dimension {}",
+                theta.len()
+            ))
+        })?;
+        if hyper_dirs.len() != psi_dim {
+            return Err(EstimationError::InvalidInput(format!(
+                "joint hyper evaluation direction mismatch: psi_dim={psi_dim}, \
+                 hyper_dirs={}; the [rho, psi] gradient cannot be served rho-only",
+                hyper_dirs.len()
+            )));
+        }
 
         if !hyper_dirs.is_empty() {
             let requested_hessian = matches!(
@@ -1316,30 +1335,20 @@ impl<'a> RemlState<'a> {
         EstimationError,
     > {
         let t_tau = std::time::Instant::now();
-        // Guard: non-sparse tau coordinate construction requires dense design.
-        // Skip for large models that would blow memory.
+        // The dense-work budget for this builder is decided by the CALLER
+        // (`evaluate_unified_with_psi_ext`): when n*p exceeds
+        // HYPER_MAX_DENSE_WORK on a non-sparse backend, the caller degrades to
+        // the first-order lane and never reaches this builder (#2987). No
+        // internal fallback exists here — a builder that silently dropped the
+        // psi coordinates it was asked for is the defect itself.
         let n_x = self.x().nrows();
         let p_x = self.x().ncols();
-        const HYPER_MAX_DENSE_WORK: usize = 50_000_000;
-        if n_x.saturating_mul(p_x) > HYPER_MAX_DENSE_WORK
-            && bundle.backend_kind() != GeometryBackendKind::SparseExactSpd
-        {
-            log::warn!(
-                "skipping tau hyper-coordinate construction (n={n_x}, p={p_x}): \
-                 dense design materialization too large; falling back to rho-only REML"
-            );
-            let identity_pair: Box<
-                dyn Fn(usize, usize) -> super::reml_outer_engine::HyperCoordPairResult
-                    + Send
-                    + Sync,
-            > = Box::new(|_, _| Ok(super::reml_outer_engine::HyperCoordPair::zero()));
-            let identity_pair2: Box<
-                dyn Fn(usize, usize) -> super::reml_outer_engine::HyperCoordPairResult
-                    + Send
-                    + Sync,
-            > = Box::new(|_, _| Ok(super::reml_outer_engine::HyperCoordPair::zero()));
-            return Ok((Vec::new(), identity_pair, identity_pair2, None));
-        }
+        debug_assert!(
+            n_x.saturating_mul(p_x) <= 50_000_000
+                || bundle.backend_kind() == GeometryBackendKind::SparseExactSpd,
+            "build_tau_unified_objects_from_bundle reached above the dense-work budget \
+             (n={n_x}, p={p_x}); the caller should have degraded to the first-order lane"
+        );
         let backend_label;
         let result = if bundle.backend_kind() == GeometryBackendKind::SparseExactSpd {
             backend_label = "sparse_exact";
@@ -3037,15 +3046,23 @@ impl<'a> RemlState<'a> {
         let free_basis_opt = self.active_constraint_free_basis(pirls_result);
 
         // Guard: SAS link ext coords require dense design materialization.
+        // Refuse by name when the dense-work budget is exceeded (#2987 — same
+        // class as the tau guard in build_tau_unified_objects_from_bundle):
+        // the caller's theta still carries the link's auxiliary axes, so an
+        // empty list would silently change the gradient's dimension.
         let n_x = pirls_result.x_transformed.nrows();
         let p_x = pirls_result.x_transformed.ncols();
         const LINK_EXT_MAX_DENSE_WORK: usize = 50_000_000;
         if n_x.saturating_mul(p_x) > LINK_EXT_MAX_DENSE_WORK {
-            log::warn!(
-                "skipping SAS link ext coordinate construction (n={n_x}, p={p_x}): \
-                 dense design materialization too large"
-            );
-            return Ok(Vec::new());
+            return Err(EstimationError::TrialPointRefused {
+                reason: format!(
+                    "SAS link ext-coordinate construction exceeds the dense-work budget \
+                     (n={n_x}, p={p_x}, n*p={}); the link's auxiliary axes cannot be \
+                     served by an empty coordinate list; serve the design on a sparse \
+                     backend or raise LINK_EXT_MAX_DENSE_WORK",
+                    n_x.saturating_mul(p_x),
+                ),
+            });
         }
 
         // Transformed design matrix (dense required for link-param B construction).
@@ -3241,15 +3258,23 @@ impl<'a> RemlState<'a> {
         let free_basis_opt = self.active_constraint_free_basis(pirls_result);
 
         // Guard: mixture link ext coords require dense design materialization.
+        // Refuse by name when the dense-work budget is exceeded (#2987 — same
+        // class as the tau guard in build_tau_unified_objects_from_bundle):
+        // the caller's theta still carries the mixture's K-1 free logits, so an
+        // empty list would silently change the gradient's dimension.
         let n_x = pirls_result.x_transformed.nrows();
         let p_x = pirls_result.x_transformed.ncols();
         const LINK_EXT_MAX_DENSE_WORK: usize = 50_000_000;
         if n_x.saturating_mul(p_x) > LINK_EXT_MAX_DENSE_WORK {
-            log::warn!(
-                "skipping mixture link ext coordinate construction (n={n_x}, p={p_x}): \
-                 dense design materialization too large"
-            );
-            return Ok(Vec::new());
+            return Err(EstimationError::TrialPointRefused {
+                reason: format!(
+                    "mixture link ext-coordinate construction exceeds the dense-work budget \
+                     (n={n_x}, p={p_x}, n*p={}); the mixture's auxiliary axes cannot be \
+                     served by an empty coordinate list; serve the design on a sparse \
+                     backend or raise LINK_EXT_MAX_DENSE_WORK",
+                    n_x.saturating_mul(p_x),
+                ),
+            });
         }
 
         let x_dense_arc = pirls_result

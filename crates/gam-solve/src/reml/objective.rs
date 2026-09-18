@@ -2553,43 +2553,82 @@ impl<'a> RemlState<'a> {
         let pirls_ms = t0.elapsed().as_secs_f64() * 1000.0;
 
         let t1 = std::time::Instant::now();
+        // #2987: the dense second-order tau assembly (pair callbacks, drift
+        // closures) is the only lane gated on the dense-work budget. When it
+        // does not fit, DEGRADE THE ORDER — never the dimension: serve the
+        // [rho, psi] gradient on the same policy-aware first-order lane the
+        // gradient-only evaluations already use (implicit/operator routing per
+        // the resource policy), and let the Hessian come back Unavailable,
+        // which the plan takes (`validate_second_order_seed_hessian` returns
+        // Ok for a non-analytic Hessian). The previous behavior — an empty
+        // psi list, "falling back to rho-only REML" — silently changed the
+        // gradient's length for a [rho, psi] theta and surfaced only as a
+        // fatal seed-validation mismatch after the whole gradient-only search
+        // had run (#2987: n=1e5, p=921, 46 min in).
+        const HYPER_MAX_DENSE_WORK: usize = 50_000_000;
+        let dense_second_order_admitted = !(self.x().nrows().saturating_mul(self.x().ncols())
+            > HYPER_MAX_DENSE_WORK
+            && bundle.backend_kind() != GeometryBackendKind::SparseExactSpd);
+        let mut degraded_to_first_order = false;
         let (ext_coords, ext_pair_fn, rho_ext_pair_fn, fixed_drift_deriv) = if !hyper_dirs
             .is_empty()
         {
-            if mode == super::reml_outer_engine::EvalMode::ValueGradientHessian {
+            if mode == super::reml_outer_engine::EvalMode::ValueGradientHessian
+                && dense_second_order_admitted
+            {
                 let (coords, epf, repf, fixed_drift_deriv) =
                     self.build_tau_unified_objects_from_bundle(rho, &bundle, hyper_dirs)?;
                 (coords, Some(epf), Some(repf), fixed_drift_deriv)
-            } else if bundle.backend_kind() == GeometryBackendKind::SparseExactSpd {
-                (
-                    self.build_tau_hyper_coords_sparse_exact(rho, &bundle, hyper_dirs, false)?,
-                    None,
-                    None,
-                    None,
-                )
-            } else if matches!(
-                bundle.pirls_result.coordinate_frame,
-                pirls::PirlsCoordinateFrame::TransformedQs
-            ) && self
-                .active_constraint_free_basis(bundle.pirls_result.as_ref())
-                .is_none()
-            {
-                (
-                    self.build_tau_hyper_coords_original_basis(rho, &bundle, hyper_dirs, false)?,
-                    None,
-                    None,
-                    None,
-                )
             } else {
-                (
-                    self.build_tau_hyper_coords(rho, &bundle, hyper_dirs, false)?,
-                    None,
-                    None,
-                    None,
-                )
+                if mode == super::reml_outer_engine::EvalMode::ValueGradientHessian {
+                    degraded_to_first_order = true;
+                    log::info!(
+                        "[outer-timing] second-order tau assembly exceeds the dense-work budget \
+                         (n={}, p={}); serving the [rho, psi] gradient on the first-order lane \
+                         and returning HessianValue::Unavailable (order degraded, dimension kept)",
+                        self.x().nrows(),
+                        self.x().ncols(),
+                    );
+                }
+                if bundle.backend_kind() == GeometryBackendKind::SparseExactSpd {
+                    (
+                        self.build_tau_hyper_coords_sparse_exact(rho, &bundle, hyper_dirs, false)?,
+                        None,
+                        None,
+                        None,
+                    )
+                } else if matches!(
+                    bundle.pirls_result.coordinate_frame,
+                    pirls::PirlsCoordinateFrame::TransformedQs
+                ) && self
+                    .active_constraint_free_basis(bundle.pirls_result.as_ref())
+                    .is_none()
+                {
+                    (
+                        self.build_tau_hyper_coords_original_basis(rho, &bundle, hyper_dirs, false)?,
+                        None,
+                        None,
+                        None,
+                    )
+                } else {
+                    (
+                        self.build_tau_hyper_coords(rho, &bundle, hyper_dirs, false)?,
+                        None,
+                        None,
+                        None,
+                    )
+                }
             }
         } else {
             (Vec::new(), None, None, None)
+        };
+        // A degraded evaluation is a first-order evaluation: no second-order
+        // objects are formed downstream, and the returned Hessian is
+        // Unavailable rather than a silently-dimensioned surrogate.
+        let mode = if degraded_to_first_order {
+            super::reml_outer_engine::EvalMode::ValueAndGradient
+        } else {
+            mode
         };
         let tau_build_ms = t1.elapsed().as_secs_f64() * 1000.0;
         let t2 = std::time::Instant::now();
