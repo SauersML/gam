@@ -47,7 +47,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use gam_linalg::utils::splitmix64_hash;
 use gam_math::nested_dual::JetField;
 use gam_math::probability::{
-    normal_cdf, normal_logcdf, normal_pdf, signed_probit_logcdf_and_mills_ratio,
+    normal_cdf_and_pdf, normal_logcdf, signed_probit_logcdf_and_mills_ratio,
 };
 use smallvec::SmallVec;
 
@@ -679,9 +679,10 @@ const LINEAR_RESIDUAL_FLOOR: f64 = 1e-250;
 /// subtracts nearly equal survival probabilities where `S` sits near one.
 /// `T` is summed in linear space whenever it sits above
 /// [`LINEAR_RESIDUAL_FLOOR`]: every node term is a positive probability from
-/// its own `erfc`, so the sum keeps each term's relative accuracy, at one
-/// `erfc` and one density per node where the log-space form pays a scaled
-/// complementary error function, its logarithm and a log-sum-exp exponential.
+/// the table route [`normal_cdf_and_pdf`], so the sum keeps each term's
+/// relative accuracy, at one exponential per node for both `Φ` and `φ` where
+/// the log-space form pays a scaled complementary error function, its
+/// logarithm and a log-sum-exp exponential.
 /// The two forms agree to rounding, and deep tails keep the log-space form.
 fn anchor_log_residual(
     alpha: f64,
@@ -696,8 +697,10 @@ fn anchor_log_residual(
     let mut density_eta = 0.0;
     for (&u, &w) in grid.nodes.iter().zip(grid.weights.iter()) {
         let eta = alpha + observed_slope * u;
-        tail += w * normal_cdf(if survival_side { -eta } else { eta });
-        let weighted_pdf = w * normal_pdf(eta);
+        // φ is even, and the table's φ is bitwise normal_pdf at ±η.
+        let (cdf, pdf) = normal_cdf_and_pdf(if survival_side { -eta } else { eta });
+        tail += w * cdf;
+        let weighted_pdf = w * pdf;
         density += weighted_pdf;
         density_eta += weighted_pdf * eta;
     }
@@ -1136,6 +1139,7 @@ mod anchor_tests {
     use super::*;
     use gam_math::jet_scalar::{JetScalar, Order2};
     use gam_math::jet_tower::Tower4;
+    use gam_math::probability::{normal_cdf, normal_pdf};
 
     // ── The closed-form implicit derivatives the table's orders ≤ 3 are pinned against ──
 
