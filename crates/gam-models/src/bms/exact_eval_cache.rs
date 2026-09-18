@@ -1,5 +1,7 @@
+use super::family::{BernoulliInterceptPredictorWarmStart, BernoulliMarginalSlopeFamily};
 use super::hessian_paths::{
     BernoulliMarginalSlopeRowExactContext, BlockSlices, PrimarySlices, RowCellMomentsBundle,
+    block_slices, primary_slices,
 };
 use super::*;
 
@@ -49,6 +51,34 @@ pub(super) fn observe_capacity_floor(runtime_available_bytes: u64) -> u64 {
     bms_row_primary_hessian_capacity_floor()
         .fetch_max(runtime_available_bytes, Ordering::AcqRel)
         .max(runtime_available_bytes)
+}
+
+/// The memory readings the row-primary cache decision takes:
+/// `(runtime_available, stable_capacity, workspace_pinned)`.
+///
+/// A fit on its own reads live availability, the monotone capacity floor and
+/// every co-resident cache's pins. One search of a parallel multistart reads its
+/// lane instead: the availability read once before launch, for both budgets, and
+/// its own pins. Its decision is then the one it makes running alone, whatever
+/// the other searches have pinned (gnomon#2359).
+pub(super) fn row_primary_cache_memory_readings(
+    lane: Option<&gam_runtime::resource::SearchLaneBudget>,
+) -> (u64, u64, u64) {
+    match lane {
+        Some(lane) => (
+            lane.serial_available_bytes(),
+            lane.serial_available_bytes(),
+            lane.pinned_bytes().load(Ordering::Acquire),
+        ),
+        None => {
+            let runtime_available = runtime_available_memory_bytes();
+            (
+                runtime_available,
+                observe_capacity_floor(runtime_available),
+                bms_row_primary_hessian_pinned_bytes().load(Ordering::Acquire),
+            )
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -143,9 +173,80 @@ pub(super) fn decide_row_primary_hessian_cache(
     }
 }
 
+/// One outer search's predicted working set in bytes, when the search runs
+/// alone on `serial_available_bytes` (gnomon#2359, SPEC 10). Each term is what
+/// the search allocates, from the element counts and types of the buffers:
+///
+/// - the row-primary cache (`neglog`, `grad`, `hess`: `n·(r²+r+1)` f64) at the
+///   size `decide_row_primary_hessian_cache` gives it on that availability with
+///   nothing else pinned: materialized or tiled, or nothing when streamed;
+/// - two exact-evaluation caches, the one a search evaluates on and the one the
+///   shared store keeps, each with its per-row contexts, its degree-9 and
+///   degree-15 cell-moment bundles at `RowCellMomentsBundle::estimated_resident_bytes`
+///   over the partition's most cells per row, and its per-row flex third
+///   tensors (two `r×r` f64 per row);
+/// - the row-intercept warm starts: two `u64` and a predictor slot per row,
+///   each predictor two `r`-vectors of f64;
+/// - the block states' linear predictors, `n` f64 per block;
+/// - the joint coefficient Hessian and its factor, two `p×p` f64.
+pub(super) fn outer_search_working_set_bytes(
+    family: &BernoulliMarginalSlopeFamily,
+    specs: &[ParameterBlockSpec],
+    serial_available_bytes: u64,
+) -> u64 {
+    let n = family.y.len() as u64;
+    let r = primary_slices(&block_slices(family)).total as u64;
+    let p = specs.iter().map(|spec| spec.design.ncols() as u64).sum::<u64>();
+    let f64_bytes = std::mem::size_of::<f64>() as u64;
+    let flex_active = family.score_warp.is_some() || family.link_dev.is_some();
+    let row_primary_cache = if flex_active {
+        let plan = decide_row_primary_hessian_cache(
+            n as usize,
+            r as usize,
+            BMS_ROW_PRIMARY_HESSIAN_EXPECTED_REUSE_PASSES,
+            serial_available_bytes,
+            serial_available_bytes,
+            0,
+        );
+        let tiled = plan.expected_reuse_passes >= BMS_ROW_PRIMARY_HESSIAN_MIN_REUSE_PASSES
+            && plan.bytes <= plan.global_pin_budget_bytes;
+        if plan.materialize || tiled { plan.bytes } else { 0 }
+    } else {
+        0
+    };
+    let cells = n.saturating_mul(family.max_denested_partition_cells_per_row() as u64) as usize;
+    let cell_bundles = [9usize, 15]
+        .iter()
+        .map(|&degree| {
+            RowCellMomentsBundle::estimated_resident_bytes(n as usize, cells, degree) as u64
+        })
+        .sum::<u64>();
+    let row_contexts =
+        n.saturating_mul(std::mem::size_of::<BernoulliMarginalSlopeRowExactContext>() as u64);
+    let flex_third = if flex_active {
+        n.saturating_mul(2 * r * r).saturating_mul(f64_bytes)
+    } else {
+        0
+    };
+    let exact_eval_caches = 2 * (row_contexts + cell_bundles + flex_third);
+    let predictor_slot = std::mem::size_of::<Mutex<Option<BernoulliInterceptPredictorWarmStart>>>()
+        as u64
+        + 2 * r * f64_bytes;
+    let intercept_warm_starts =
+        n.saturating_mul(2 * std::mem::size_of::<AtomicU64>() as u64 + predictor_slot);
+    let block_predictors = n.saturating_mul(specs.len() as u64).saturating_mul(f64_bytes);
+    let joint_hessian = 2 * p.saturating_mul(p).saturating_mul(f64_bytes);
+    row_primary_cache
+        .saturating_add(exact_eval_caches)
+        .saturating_add(intercept_warm_starts)
+        .saturating_add(block_predictors)
+        .saturating_add(joint_hessian)
+}
+
 /// RAII handle around a materialized row-primary evaluation cache
-/// (neglog + gradient + Hessian) that decrements the process-global
-/// pinned-bytes counter on drop.
+/// (neglog + gradient + Hessian) that decrements the pinned-bytes counter it
+/// charged on drop: its search's own inside a multistart lane, else the
+/// process-global one.
 pub struct RowPrimaryEvalPin {
     /// Per-row negative log-likelihood, length `n`.
     pub(super) neglog: Array1<f64>,
@@ -154,6 +255,7 @@ pub struct RowPrimaryEvalPin {
     /// Per-row Hessian, shape `(n, r*r)`.
     pub(super) hess: Array2<f64>,
     pub(super) bytes: u64,
+    pub(super) lane: Option<Arc<gam_runtime::resource::SearchLaneBudget>>,
 }
 
 pub(super) struct RowPrimaryEvalTile {
@@ -231,13 +333,18 @@ impl RowPrimaryEvalPin {
         grad: Array2<f64>,
         hess: Array2<f64>,
         bytes: u64,
+        lane: Option<Arc<gam_runtime::resource::SearchLaneBudget>>,
     ) -> Self {
-        bms_row_primary_hessian_pinned_bytes().fetch_add(bytes, Ordering::AcqRel);
+        match lane.as_deref() {
+            Some(lane) => lane.pinned_bytes().fetch_add(bytes, Ordering::AcqRel),
+            None => bms_row_primary_hessian_pinned_bytes().fetch_add(bytes, Ordering::AcqRel),
+        };
         Self {
             neglog,
             grad,
             hess,
             bytes,
+            lane,
         }
     }
 
@@ -256,7 +363,10 @@ impl RowPrimaryEvalPin {
 
 impl Drop for RowPrimaryEvalPin {
     fn drop(&mut self) {
-        bms_row_primary_hessian_pinned_bytes().fetch_sub(self.bytes, Ordering::AcqRel);
+        match self.lane.as_deref() {
+            Some(lane) => lane.pinned_bytes().fetch_sub(self.bytes, Ordering::AcqRel),
+            None => bms_row_primary_hessian_pinned_bytes().fetch_sub(self.bytes, Ordering::AcqRel),
+        };
     }
 }
 

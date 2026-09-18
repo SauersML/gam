@@ -1693,6 +1693,7 @@ mod row_covariance_cache_tests {
         let family = BernoulliMarginalSlopeFamily {
             jeffreys_armed: false,
             residual: Some(Arc::new(runtime)),
+            search_lane: None,
             y: Arc::new(Array1::from_shape_fn(n, |i| if unit(i, 5) < 0.4 { 1.0 } else { 0.0 })),
             weights: Arc::new(Array1::from_shape_fn(n, |i| 0.6 + 0.4 * unit(i, 6))),
             z: Arc::new(scores.column(0).to_owned()),

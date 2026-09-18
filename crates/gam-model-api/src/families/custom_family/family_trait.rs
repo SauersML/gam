@@ -353,6 +353,25 @@ pub trait JeffreysCompletionOuterDerivatives {
     ) -> Result<Option<Array2<f64>>, String>;
 }
 
+/// A family whose outer searches run as independent members of a parallel
+/// multistart (gnomon#2359): each seed searches on its own member, and the
+/// multistart starts a search only once the memory governor has granted its
+/// predicted working set (SPEC 10).
+pub trait IndependentOuterSearch<F> {
+    /// One outer search's predicted working set on `specs`, derived from what it
+    /// allocates, with its caches at the size they take when the search runs
+    /// alone on `serial_available_bytes`.
+    fn outer_search_working_set_bytes(
+        &self,
+        specs: &[ParameterBlockSpec],
+        serial_available_bytes: u64,
+    ) -> u64;
+
+    /// A member for one search: its per-fit state fresh, as a newly built family
+    /// has it, and its memory choices read from `lane`.
+    fn outer_search_member(&self, lane: Arc<gam_runtime::resource::SearchLaneBudget>) -> F;
+}
+
 /// User-defined family contract for multi-block generalized models.
 pub trait CustomFamily {
     /// Optional sampled-derivative pilot owned by this family.
@@ -599,6 +618,16 @@ pub trait CustomFamily {
         config.seed_budget = 1;
         config.screen_max_inner_iterations = 2;
         config
+    }
+
+    /// The family's members for a parallel multistart, when it has them
+    /// ([`IndependentOuterSearch`]). Without them every seed would share this
+    /// family's per-fit state, so a multistart runs only for a family that has.
+    fn independent_outer_search(&self) -> Option<&(dyn IndependentOuterSearch<Self> + Sync)>
+    where
+        Self: Sized,
+    {
+        None
     }
 
     /// Whether outer hyper-derivative evaluation must use a joint exact path.

@@ -3316,6 +3316,7 @@ mod row_kernel_tests {
             let family = BernoulliMarginalSlopeFamily {
                 jeffreys_armed: true,
                 residual: None,
+                search_lane: None,
                 y: Arc::new(y),
                 weights: Arc::new(weights),
                 z: Arc::new(z.clone()),

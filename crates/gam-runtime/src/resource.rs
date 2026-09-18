@@ -408,6 +408,20 @@ impl MemoryGovernor {
         })
     }
 
+    /// A governor whose ledger admits `budget_bytes`, for exercising admission
+    /// against a budget the host's memory does not set (the process-wide
+    /// governor is [`Self::global`]).
+    pub fn with_budget_bytes(budget_bytes: usize) -> Self {
+        Self {
+            ledger: Arc::new(GovernorLedger {
+                budget_bytes,
+                materialization_cap_bytes: budget_bytes,
+                availability: resample_memory_availability(),
+                reserved_bytes: std::sync::atomic::AtomicUsize::new(0),
+            }),
+        }
+    }
+
     fn with_detected_availability(availability: MemoryAvailability) -> Self {
         let budget_bytes = governor_budget_from_availability(&availability);
         let materialization_cap_bytes = governor_materialization_cap_from_availability(&availability);
@@ -619,6 +633,63 @@ impl Drop for MemoryReservation {
         self.ledger
             .reserved_bytes
             .fetch_sub(self.bytes, std::sync::atomic::Ordering::AcqRel);
+    }
+}
+
+/// The memory one outer search of a parallel multistart runs on (SPEC 10).
+///
+/// A multistart starts a search only once the governor has granted the search's
+/// predicted working set, the bytes it takes running alone. Inside the search,
+/// every choice between a cached and a streamed path reads
+/// [`Self::serial_available_bytes`], the available memory read once before
+/// launch, and charges what it pins to this search's own counter, out of its
+/// grant. So each search takes the path it takes running alone, whatever else
+/// runs beside it, and its bytes are on the ledger once.
+#[derive(Debug)]
+pub struct SearchLaneBudget {
+    serial_available_bytes: u64,
+    pinned_bytes: std::sync::atomic::AtomicU64,
+    grant: std::sync::Mutex<Option<MemoryReservation>>,
+}
+
+impl SearchLaneBudget {
+    /// `grant` is `None` for the one search a budget cannot admit even alone: it
+    /// runs anyway, as the serial search would.
+    pub fn new(serial_available_bytes: u64, grant: Option<MemoryReservation>) -> Self {
+        Self {
+            serial_available_bytes,
+            pinned_bytes: std::sync::atomic::AtomicU64::new(0),
+            grant: std::sync::Mutex::new(grant),
+        }
+    }
+
+    /// Available memory as the serial search reads it, fixed before launch.
+    pub fn serial_available_bytes(&self) -> u64 {
+        self.serial_available_bytes
+    }
+
+    /// Bytes this search's caches hold now, out of its grant.
+    pub fn pinned_bytes(&self) -> &std::sync::atomic::AtomicU64 {
+        &self.pinned_bytes
+    }
+
+    pub fn granted_bytes(&self) -> usize {
+        self.grant
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .map_or(0, MemoryReservation::bytes)
+    }
+
+    /// Return the grant to the ledger once the search is over. Caches that
+    /// outlive it (a shared store's last entries) are bounded by that store.
+    pub fn release_grant(&self) {
+        drop(
+            self.grant
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take(),
+        );
     }
 }
 

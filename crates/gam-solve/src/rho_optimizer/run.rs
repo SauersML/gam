@@ -329,6 +329,11 @@ pub(crate) struct OuterConfig {
     /// solve, so the search route does not flip back to BFGS once a saddle is on
     /// record.
     pub(crate) curvature_search_latched: bool,
+    /// The search starts from `initial_rho` and from nothing else: no generated
+    /// seed, no candidate, and no fall-through to another seed whatever this
+    /// one's outcome. Each run of a parallel multistart
+    /// ([`OuterProblem::run_certified_multistart`]) searches one seed this way.
+    pub(crate) sole_seed: bool,
 }
 
 /// The outer search's iteration count when a caller declares none: no count.
@@ -384,6 +389,7 @@ impl Default for OuterConfig {
             rho_canonical_keys: None,
             native_coordinate_order: None,
             curvature_search_latched: false,
+            sole_seed: false,
         }
     }
 }
@@ -399,6 +405,7 @@ impl Default for OuterConfig {
 /// [`OuterCapability`] (what the objective can provide) and the
 /// `OuterConfig` (how the runner should behave) from a small set
 /// of high-level declarations.
+#[derive(Clone)]
 pub struct OuterProblem {
     n_params: usize,
     gradient: Derivative,
@@ -432,6 +439,7 @@ pub struct OuterProblem {
     cache_mirror_sessions: Vec<Arc<CacheSession>>,
     rho_uncertainty_problem_size: crate::rho_uncertainty::RhoUncertaintyProblemSize,
     rho_canonical_keys: Option<Vec<u64>>,
+    sole_seed: bool,
 }
 
 impl OuterProblem {
@@ -473,6 +481,7 @@ impl OuterProblem {
             rho_uncertainty_problem_size:
                 crate::rho_uncertainty::RhoUncertaintyProblemSize::default(),
             rho_canonical_keys: None,
+            sole_seed: false,
         }
     }
 
@@ -589,6 +598,15 @@ impl OuterProblem {
     /// refused checkpoint (`retain_best_outer_checkpoint`).
     pub fn with_screen_initial_rho(mut self, screen_initial_rho: bool) -> Self {
         self.screen_initial_rho = screen_initial_rho;
+        self
+    }
+    /// Search from `rho` and from nothing else: no generated seed, no candidate,
+    /// and no fall-through to another seed whatever this one's outcome
+    /// (`OuterConfig::sole_seed`).
+    pub fn with_sole_seed(mut self, rho: Array1<f64>) -> Self {
+        self.initial_rho = Some(rho);
+        self.initial_rho_candidates.clear();
+        self.sole_seed = true;
         self
     }
     /// Wire the bidirectional inner-PIRLS feedback channel.
@@ -844,6 +862,7 @@ impl OuterProblem {
             native_coordinate_order: None,
             // Latched only by the certify-last reseed loop (#2939).
             curvature_search_latched: false,
+            sole_seed: self.sole_seed,
         }
     }
 
@@ -1887,6 +1906,10 @@ impl CertifiedOuterResult {
 #[cfg(test)]
 #[path = "certified_outer_result_tests.rs"]
 mod certified_outer_result_tests;
+
+#[path = "multistart.rs"]
+mod multistart;
+pub use multistart::MultistartOutcome;
 
 /// Typed refusal from [`audit_stationary_point`]. The rejected point and every
 /// analytic certificate field measured before refusal remain available to the

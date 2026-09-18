@@ -1124,6 +1124,7 @@ fn bernoulli_flex_tiled_hvp_cache_matches_host_cache_small_case() {
                 host_pin.grad().slice(s![rows.clone(), ..]).to_owned(),
                 host_pin.hess().slice(s![rows, ..]).to_owned(),
                 0,
+                None,
             ),
         });
     }

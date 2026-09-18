@@ -2746,6 +2746,7 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
             gam_solve::persistent_warm_start::open_outer_session(&cache.store, &cache.key)
         })
     });
+    let outer_cache_attached = cache_session.is_some();
     let problem = if let Some(session) = cache_session {
         let key_hex = session.key().to_hex();
         log::info!(
@@ -2771,7 +2772,8 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
     // remaining certified strategies. If none reaches stationarity, the outer
     // result below is returned as nonconvergence with checkpoint evidence;
     // no fit or posterior approximation is assembled from the trial state.
-    let eval_outer = |outer: &mut CustomOuterState,
+    let eval_outer = |family: &F,
+                      outer: &mut CustomOuterState,
                       rho: &Array1<f64>,
                       order: OuterEvalOrder|
      -> Result<OuterEval, EstimationError> {
@@ -3011,11 +3013,22 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
         })
     };
 
+    // One complete outer search from `problem`'s seeds, with its own objective
+    // state, stall pulse and accepted-step counter (#2349, #2668). A parallel
+    // multistart runs one per seed (gnomon#2359).
+    let run_outer = |family: &F,
+                     problem: &OuterProblem,
+                     force_cold: Arc<AtomicBool>,
+                     accepted_steps: Arc<AtomicUsize>|
+     -> (
+        Result<gam_solve::rho_optimizer::CertifiedOuterResult, EstimationError>,
+        CustomOuterState,
+    ) {
     let mut obj = problem.build_objective_with_screening_proxy(
         CustomOuterState::new_with_cold_signal(
-            initial_warm_cache,
-            Arc::clone(&outer_force_cold),
-            Arc::clone(&outer_accepted_steps),
+            initial_warm_cache.clone(),
+            force_cold,
+            accepted_steps,
         )
         .with_outer_derivative_pilot(family.outer_derivative_pilot_schedule()),
         |outer: &mut CustomOuterState, rho: &Array1<f64>| {
@@ -3094,6 +3107,7 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
         },
         |outer: &mut CustomOuterState, rho: &Array1<f64>| {
             eval_outer(
+                family,
                 outer,
                 rho,
                 if need_outer_hessian {
@@ -3104,7 +3118,7 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
             )
         },
         |outer: &mut CustomOuterState, rho: &Array1<f64>, order: OuterEvalOrder| {
-            eval_outer(outer, rho, order)
+            eval_outer(family, outer, rho, order)
         },
         Some(|outer: &mut CustomOuterState| {
             outer.reset();
@@ -3222,11 +3236,72 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
     // Hessian, order-five Jeffreys pieces included, twice at the selected point
     // and discarded the first.
     .with_terminal_eval_order(OuterEvalOrder::ValueAndGradient);
-
     let outer_result = problem.run_certified(&mut obj, "custom family");
+    (outer_result, obj.state)
+    };
 
-    let last_error_detail = obj
-        .state
+    // A seed policy whose budget covers every generated seed searches each one in
+    // its own run, in parallel, and keeps the best certified (gnomon#2359), when
+    // the family runs each search on its own member. A warm start or a cached
+    // outer session already names the search's start, so those fits keep the
+    // single cascade.
+    let independent_search = family
+        .independent_outer_search()
+        .filter(|_| problem.searches_every_seed() && !warm_start_present && !outer_cache_attached);
+    let (outer_result, mut outer_state) =
+        if let Some(search) = independent_search {
+            // The family predicts one search's working set with its caches at the
+            // size they take running alone on the availability read here, once.
+            let serial_available = gam_runtime::resource::resample_memory_availability()
+                .available_bytes();
+            let working_set = search.outer_search_working_set_bytes(specs, serial_available);
+            let multistart = problem.run_certified_multistart(
+                "custom family",
+                serial_available,
+                usize::try_from(working_set).unwrap_or(usize::MAX),
+                |_, seed_problem, lane| {
+                    // Each seed searches on its own member of the family: its
+                    // per-fit state fresh and its memory choices read from its lane.
+                    let member = search.outer_search_member(lane);
+                    let force_cold = Arc::new(AtomicBool::new(false));
+                    let accepted_steps = Arc::new(AtomicUsize::new(0));
+                    let seed_problem = seed_problem.with_stuck_stall_cold_reeval_signal(
+                        Arc::clone(&force_cold),
+                        Arc::clone(&accepted_steps),
+                    );
+                    run_outer(&member, &seed_problem, force_cold, accepted_steps)
+                },
+            );
+            match multistart {
+                Ok(mut outcome) => match outcome.winner {
+                    Some(winner) => outcome.runs.swap_remove(winner),
+                    // No seed certified: refuse with every seed's outcome. The
+                    // first seed (the fit's own initial rho) lends its state for
+                    // the refusal's last-evaluation evidence.
+                    None => {
+                        let refusal = outcome.refusal("custom family");
+                        (Err(refusal), outcome.runs.swap_remove(0).1)
+                    }
+                },
+                Err(error) => (
+                    Err(error),
+                    CustomOuterState::new_with_cold_signal(
+                        initial_warm_cache.clone(),
+                        Arc::clone(&outer_force_cold),
+                        Arc::clone(&outer_accepted_steps),
+                    ),
+                ),
+            }
+        } else {
+            run_outer(
+                family,
+                &problem,
+                Arc::clone(&outer_force_cold),
+                Arc::clone(&outer_accepted_steps),
+            )
+        };
+
+    let last_error_detail = outer_state
         .last_error
         .as_ref()
         .map(|e| format!(" last objective error: {e}"))
@@ -3253,13 +3328,12 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
             // near-floor screening probe while the best iterate sat interior.
             // `{e}` already carries the optimizer-owned checkpoint; this reports
             // the cache as what it is.
-            let last_evaluated_rho = obj
-                .state
+            let last_evaluated_rho = outer_state
                 .warm_cache
                 .as_ref()
                 .map(|warm| warm.rho.to_vec())
                 .unwrap_or_else(|| rho0.to_vec());
-            if let Some(warm) = obj.state.warm_cache.as_ref() {
+            if let Some(warm) = outer_state.warm_cache.as_ref() {
                 store_persistent_custom_family_warm_start(
                     persistent_warm_start_cache.as_ref(),
                     specs,
@@ -3272,7 +3346,7 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
                      {e}; last_evaluated_rho={last_evaluated_rho:?}; no fit was assembled.\
                      {last_error_detail}"
                 ),
-                last_refusal: obj.state.last_error.take().map(|mut refusal| {
+                last_refusal: outer_state.last_error.take().map(|mut refusal| {
                     refusal.map_descending_ray_direction(&|reduced| {
                         lift_direction_to_raw(&canonical.gauge, reduced)
                     });
@@ -3281,7 +3355,7 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
                 // The search's most recent uncertified inner solve, which a finite
                 // trial after it does not clear. Only the fit boundary reads it
                 // (#2943).
-                search_inner_refusal: obj.state.last_inner_refusal.take().map(|mut refusal| {
+                search_inner_refusal: outer_state.last_inner_refusal.take().map(|mut refusal| {
                     refusal.map_descending_ray_direction(&|reduced| {
                         lift_direction_to_raw(&canonical.gauge, reduced)
                     });
@@ -3298,7 +3372,7 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
     // smoothing coordinate, and coefficient mode form one sealed identity.
     // Warm starts are deliberately excluded: they are seeds, not evidence
     // about which nonconvex coefficient basin produced the certificate.
-    let terminal = obj.state.terminal_mode.take().ok_or_else(|| {
+    let terminal = outer_state.terminal_mode.take().ok_or_else(|| {
         CustomFamilyError::Optimization {
             context: "fit_custom_family terminal mode ownership",
             reason: "outer optimization certified without retaining a derivative-bearing terminal coefficient mode; no fit was assembled"

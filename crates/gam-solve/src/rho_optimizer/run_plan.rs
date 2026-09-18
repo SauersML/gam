@@ -547,28 +547,19 @@ impl crate::estimate::outer_eval_capture::OuterSeedProbe for RunnerSeedProbe<'_>
     }
 }
 
-/// Execute a single plan attempt (seed generation → solver loop → best result).
-///
-/// `allow_tail_snap_reseed` gates the one-shot #2348 Inc 2b retry from a
-/// confirmed-tail snapped checkpoint (see [`OuterResult::tail_snap_reseed`]);
-/// the retry pass itself runs with it `false` so a reseed can never recurse.
-pub(crate) fn run_outer_with_plan(
-    obj: &mut dyn OuterObjective,
+/// Every seed the cascade searches, in cascade order before screening: the
+/// generated lattice, the caller's candidates ahead of it and `initial_rho` at
+/// slot zero, projected into the search box without duplicates. A sole-seed run
+/// keeps `initial_rho` alone (`OuterConfig::sole_seed`).
+pub(crate) fn outer_seed_cascade(
     config: &OuterConfig,
+    n_params: usize,
     context: &str,
-    cap: &OuterCapability,
-    the_plan: &OuterPlan,
-    allow_tail_snap_reseed: bool,
-) -> Result<PlanRunOutcome, EstimationError> {
-    // Derivative/IFT masking belongs to the model domain, never to a temporary
-    // active-set search face. In particular, freezing a model-lower-rail
-    // coordinate creates a singleton search interval whose "upper" endpoint
-    // is still the MODEL LOWER bound; recording it as an active model upper
-    // bound silently erases the feasible inward derivative (#2514). The seed
-    // lattice is clamped into this domain's envelope (#2902 row 9).
-    let model_domain_bounds = outer_model_domain_bounds_template(config, cap.n_params);
+) -> Result<Vec<Array1<f64>>, EstimationError> {
+    // The seed lattice is clamped into the model domain's envelope (#2902 row 9).
+    let model_domain_bounds = outer_model_domain_bounds_template(config, n_params);
     let mut seeds = crate::seeding::generate_rho_candidates(
-        cap.n_params,
+        n_params,
         config.heuristic_log_lambdas.as_deref(),
         &config.seed_config,
         gam_problem::OrderedRhoBounds::envelope(
@@ -592,17 +583,16 @@ pub(crate) fn run_outer_with_plan(
         } else {
             seeds.insert(0, initial_rho.clone());
         }
+        if config.sole_seed {
+            seeds.truncate(1);
+        }
     }
     if seeds.is_empty() {
         return Err(EstimationError::RemlOptimizationFailed(format!(
             "no seeds generated for outer optimization ({context})"
         )));
     }
-
-    crate::estimate::reml::outer_eval::record_current_outer_rho_model_upper_bounds_for_ift(
-        &model_domain_bounds.1,
-    );
-    let bounds_template = outer_search_bounds_template(config, cap.n_params);
+    let bounds_template = outer_search_bounds_template(config, n_params);
     let mut projected_seeds = Vec::with_capacity(seeds.len());
     for seed in seeds {
         let projected = project_to_bounds(&seed, Some(&bounds_template));
@@ -610,12 +600,37 @@ pub(crate) fn run_outer_with_plan(
             projected_seeds.push(projected);
         }
     }
-    seeds = projected_seeds;
-    if seeds.is_empty() {
+    if projected_seeds.is_empty() {
         return Err(EstimationError::RemlOptimizationFailed(format!(
             "no bounded seeds generated for outer optimization ({context})"
         )));
     }
+    Ok(projected_seeds)
+}
+
+/// Execute a single plan attempt (seed generation → solver loop → best result).
+///
+/// `allow_tail_snap_reseed` gates the one-shot #2348 Inc 2b retry from a
+/// confirmed-tail snapped checkpoint (see [`OuterResult::tail_snap_reseed`]);
+/// the retry pass itself runs with it `false` so a reseed can never recurse.
+pub(crate) fn run_outer_with_plan(
+    obj: &mut dyn OuterObjective,
+    config: &OuterConfig,
+    context: &str,
+    cap: &OuterCapability,
+    the_plan: &OuterPlan,
+    allow_tail_snap_reseed: bool,
+) -> Result<PlanRunOutcome, EstimationError> {
+    let mut seeds = outer_seed_cascade(config, cap.n_params, context)?;
+    // Derivative/IFT masking belongs to the model domain, never to a temporary
+    // active-set search face. In particular, freezing a model-lower-rail
+    // coordinate creates a singleton search interval whose "upper" endpoint
+    // is still the MODEL LOWER bound; recording it as an active model upper
+    // bound silently erases the feasible inward derivative (#2514).
+    crate::estimate::reml::outer_eval::record_current_outer_rho_model_upper_bounds_for_ift(
+        &outer_model_domain_bounds_template(config, cap.n_params).1,
+    );
+    let bounds_template = outer_search_bounds_template(config, cap.n_params);
 
     // #2569 — replay, rather than re-derive, a seed verdict this outer call
     // already recorded. `config.previously_refused_seed_points` is non-empty

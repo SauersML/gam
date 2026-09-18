@@ -3150,6 +3150,7 @@ mod flex_primary_hessian_oracle_tests {
         let family = BernoulliMarginalSlopeFamily {
             jeffreys_armed: true,
             residual: None,
+            search_lane: None,
             y: Arc::new(y),
             weights: Arc::new(weights),
             z: Arc::new(z.clone()),

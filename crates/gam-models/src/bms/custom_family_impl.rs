@@ -567,7 +567,45 @@ impl crate::custom_family::JeffreysArming for BernoulliMarginalSlopeFamily {
     }
 }
 
+impl gam_model_api::families::custom_family::IndependentOuterSearch<BernoulliMarginalSlopeFamily>
+    for BernoulliMarginalSlopeFamily
+{
+    fn outer_search_working_set_bytes(
+        &self,
+        specs: &[ParameterBlockSpec],
+        serial_available_bytes: u64,
+    ) -> u64 {
+        outer_search_working_set_bytes(self, specs, serial_available_bytes)
+    }
+
+    fn outer_search_member(&self, lane: Arc<gam_runtime::resource::SearchLaneBudget>) -> Self {
+        Self {
+            // Each search keeps its own row-intercept warm starts and runs its own
+            // auto-subsample schedule from zero, as a freshly built family does at
+            // the start of a fit: shared, a concurrent search's store evicts this
+            // one's slot between a value and a gradient evaluation at the same β,
+            // and the searches spend one Phase-1 budget between them.
+            intercept_warm_starts: self
+                .intercept_warm_starts
+                .as_ref()
+                .map(|_| new_intercept_warm_start_cache(self.y.len())),
+            auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            auto_subsample_last_rho: Arc::new(Mutex::new(None)),
+            search_lane: Some(lane),
+            ..self.clone()
+        }
+    }
+}
+
 impl CustomFamily for BernoulliMarginalSlopeFamily {
+    fn independent_outer_search(
+        &self,
+    ) -> Option<
+        &(dyn gam_model_api::families::custom_family::IndependentOuterSearch<Self> + Sync),
+    > {
+        Some(self)
+    }
+
     fn outer_derivative_pilot_schedule(
         &self,
     ) -> Option<crate::custom_family::OuterDerivativePilotSchedule> {
@@ -729,15 +767,15 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
         if n_params == 0 {
             return config;
         }
-        // #979: BMS startup seed screening runs real inner solves. With the
-        // default multi-seed pool, large marginal-slope fits can spend minutes
-        // rejecting equivalent seeds before the first outer step. Keep the
-        // principled GLM candidate grid alive (the symmetric over-/under-smooth
-        // stability anchors at rho={2,4} that startup validation relies on),
-        // but budget exactly one screened start so only a single inner solve
-        // is paid at startup rather than the full screening cascade.
+        // Every one of the 6 generated seeds gets a full search (gnomon#2359),
+        // each on its own member in a parallel multistart
+        // (`IndependentOuterSearch`). A seed's start value is an upper bound on
+        // its basin's minimum, never a lower bound, so no start comparison can
+        // skip one: the single screened start this replaced (#979) published a
+        // certified basin 1.49 nats above the one the rho = -2 seed reaches on
+        // gnomon#2359's 200-row calibration.
         config.max_seeds = 6;
-        config.seed_budget = 1;
+        config.seed_budget = config.max_seeds;
         // Two cycles is below the observed KKT reachability floor for
         // marginal-slope startup seeds: it rejects every candidate, then pays
         // an immediate second screening pass at cap=8. Start at the first

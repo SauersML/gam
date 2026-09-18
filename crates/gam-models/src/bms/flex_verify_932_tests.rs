@@ -87,6 +87,7 @@ fn vfixture(is_score_warp: bool, amplitude: f64) -> VFixture {
     let family = BernoulliMarginalSlopeFamily {
         jeffreys_armed: true,
         residual: None,
+        search_lane: None,
         y: Arc::new(Array1::from_vec(vec![1.0])),
         weights: Arc::new(Array1::from_vec(vec![1.0])),
         z: Arc::new(Array1::from_vec(vec![0.45])),
@@ -621,6 +622,7 @@ pub(super) fn standard_normal_flex_fixture() -> (BernoulliMarginalSlopeFamily, V
     let family = BernoulliMarginalSlopeFamily {
         jeffreys_armed: true,
         residual: None,
+        search_lane: None,
         y: Arc::new(Array1::from_vec(vec![1.0])),
         weights: Arc::new(Array1::from_vec(vec![0.9])),
         z: Arc::new(Array1::from_vec(vec![0.35])),

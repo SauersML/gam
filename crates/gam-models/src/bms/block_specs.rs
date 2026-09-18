@@ -2733,6 +2733,7 @@ pub(crate) fn fit_bernoulli_marginal_slope_terms(
         BernoulliMarginalSlopeFamily {
             jeffreys_armed: true,
             residual: residual_runtime.clone(),
+            search_lane: None,
             y: Arc::clone(&y),
             weights: Arc::clone(&weights),
             z: Arc::clone(&z),

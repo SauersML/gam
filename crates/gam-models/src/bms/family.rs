@@ -77,6 +77,11 @@ pub(super) struct BernoulliMarginalSlopeFamily {
     /// `Some` routes every rigid-path consumer through the residual row kernel
     /// (`RowKernel<2+K>`); `None` is the two-primary family unchanged.
     pub(super) residual: Option<Arc<super::residual_repair::ResidualBlockRuntime>>,
+    /// The memory lane of this member's search in a parallel multistart
+    /// (gnomon#2359): its row-primary cache decision reads the lane's
+    /// pre-launch availability and pins, and charges its pins to the lane.
+    /// `None` outside a multistart.
+    pub(super) search_lane: Option<Arc<gam_runtime::resource::SearchLaneBudget>>,
 }
 
 /// Number of outer-gradient evaluations the auto-subsample schedule

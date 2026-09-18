@@ -1809,12 +1809,13 @@ impl BernoulliMarginalSlopeFamily {
         let n = self.y.len();
         let primary = &cache.primary;
         let r = primary.total;
-        let runtime_available = runtime_available_memory_bytes();
-        // Fold the live reading into the monotone capacity floor so the
-        // per-shape single-cache budget is stable across workspace rebuilds;
-        // the live reading still drives the global-pin OOM guard.
-        let stable_capacity = observe_capacity_floor(runtime_available);
-        let workspace_pinned = bms_row_primary_hessian_pinned_bytes().load(Ordering::Acquire);
+        // On its own, the live reading folded into the monotone capacity floor
+        // keeps the per-shape single-cache budget stable across workspace
+        // rebuilds while the live reading drives the global-pin OOM guard. In a
+        // multistart lane both are the availability read before launch and the
+        // pins are the search's own (`row_primary_cache_memory_readings`).
+        let (runtime_available, stable_capacity, workspace_pinned) =
+            row_primary_cache_memory_readings(self.search_lane.as_deref());
         let plan = decide_row_primary_hessian_cache(
             n,
             r,
@@ -2033,6 +2034,7 @@ impl BernoulliMarginalSlopeFamily {
                 packed_grad,
                 packed_hess,
                 plan.bytes,
+                self.search_lane.clone(),
             )));
         }
         let completed_rows = AtomicUsize::new(0);
@@ -2178,6 +2180,7 @@ impl BernoulliMarginalSlopeFamily {
             packed_grad,
             packed_hess,
             bytes,
+            self.search_lane.clone(),
         ))
     }
 

@@ -107,6 +107,7 @@ fn default_test_family() -> BernoulliMarginalSlopeFamily {
     BernoulliMarginalSlopeFamily {
         jeffreys_armed: true,
         residual: None,
+        search_lane: None,
         y: Arc::new(Array1::zeros(0)),
         weights: Arc::new(Array1::zeros(0)),
         z: Arc::new(Array1::zeros(0)),
@@ -133,7 +134,9 @@ fn bernoulli_marginal_slope_outer_seed_config_screens_glm_stability_anchors() {
         config.risk_profile,
         gam_solve::seeding::SeedRiskProfile::GeneralizedLinear
     );
-    assert_eq!(config.seed_budget, 1);
+    // Every generated seed gets its own full search in a parallel multistart
+    // (gnomon#2359): the budget covers all of them, not one screened start.
+    assert_eq!(config.seed_budget, config.max_seeds);
     // The BMS marginal-slope startup screen caps inner iterations at the first
     // viable reachability floor (8). Two cycles sits below the observed KKT
     // reachability floor for these startup seeds: it rejects every candidate
