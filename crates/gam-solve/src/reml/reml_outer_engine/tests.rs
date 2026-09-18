@@ -2131,6 +2131,7 @@ pub(crate) fn build_sentinel_tripwire_solution(
     };
 
     InnerSolution {
+        cone_normalizer: None,
         log_likelihood: -1.25,
         penalty_quadratic: 0.4,
         hessian_op: hop,
@@ -2214,6 +2215,7 @@ pub(crate) fn value_gradient_hessian_prefers_family_supplied_outer_operator() {
     };
 
     let solution = InnerSolution {
+        cone_normalizer: None,
         log_likelihood: -1.25,
         penalty_quadratic: 0.4,
         hessian_op: hop,
@@ -3224,6 +3226,7 @@ pub(crate) fn operator_hessian_matches_dense_with_operator_drifts_and_extended_g
     };
 
     let mut solution = InnerSolution {
+        cone_normalizer: None,
         log_likelihood: -2.3,
         penalty_quadratic: 0.6,
         hessian_op: hop.clone(),
@@ -3426,6 +3429,7 @@ pub(crate) fn operator_hessian_with_contracted_psi_hook_matches_per_pair_dense()
         };
         let pair_b_for_dense = psi_pair_b.clone();
         InnerSolution {
+            cone_normalizer: None,
             log_likelihood: -2.3,
             penalty_quadratic: 0.6,
             hessian_op: hop.clone(),
@@ -3928,6 +3932,7 @@ pub(crate) fn outer_hessian_operator_matvec_matches_dense_subspace_with_null_alp
 
     let beta = array![0.4, -0.7, 0.2, 0.1];
     let solution = InnerSolution {
+        cone_normalizer: None,
         log_likelihood: -2.3,
         penalty_quadratic: 0.6,
         hessian_op: hop.clone(),
@@ -4026,6 +4031,7 @@ pub(crate) fn projected_operator_hessian_matches_dense_subspace_trace() {
     let h_proj = h[[1, 1]];
 
     let solution = InnerSolution {
+        cone_normalizer: None,
         log_likelihood: -2.3,
         penalty_quadratic: 0.6,
         hessian_op: hop.clone(),
@@ -4340,6 +4346,7 @@ pub(crate) fn gaussian_outer_hessian_operator_matches_dense_assembly() {
     let penalty_root_0 = array![[1.0, 0.2], [0.0, 0.4]];
     let penalty_root_1 = array![[0.3, -0.1], [0.0, 0.9]];
     let solution = InnerSolution {
+        cone_normalizer: None,
         log_likelihood: -8.0,
         penalty_quadratic: 0.9,
         hessian_op: hop.clone(),
@@ -4413,6 +4420,7 @@ pub(crate) fn efs_step_is_zero_at_scalar_optimum() {
     let penalty_root = Array2::from_shape_vec((1, 1), vec![1.0]).unwrap();
 
     let solution = InnerSolution {
+        cone_normalizer: None,
         log_likelihood: 0.0,
         penalty_quadratic: 0.0,
         hessian_op: Arc::new(op),
@@ -4592,6 +4600,7 @@ pub(crate) fn test_reml_laml_evaluate_gaussian_basic() {
     let op = DenseSpectralOperator::from_symmetric(&h).unwrap();
 
     let solution = InnerSolution {
+        cone_normalizer: None,
         log_likelihood: -5.0, // −0.5 × deviance = −0.5 × 10
         penalty_quadratic: 2.0,
         hessian_op: Arc::new(op),
@@ -4658,6 +4667,7 @@ pub(crate) fn fixed_dispersion_firth_cost_subtracts_jeffreys_term() {
     let firth_value = firth_op.jeffreys_logdet();
 
     let solution = InnerSolution {
+        cone_normalizer: None,
         log_likelihood: 0.0,
         penalty_quadratic: 0.0,
         hessian_op: Arc::new(DenseSpectralOperator::from_symmetric(&Array2::eye(2)).unwrap()),
@@ -4773,6 +4783,7 @@ pub(crate) fn family_outer_hessian_operator_short_circuits_dense_pairwise_assemb
         matrix: supplied.clone(),
     });
     let solution = InnerSolution {
+        cone_normalizer: None,
         log_likelihood: 0.0,
         penalty_quadratic: 0.4,
         hessian_op: Arc::new(DenseSpectralOperator::from_symmetric(&array![[3.0]]).unwrap()),
@@ -4846,6 +4857,7 @@ pub(crate) fn build_projected_rho_gradient_solution(rho: f64) -> InnerSolution<'
     let projected_logdet = h[[1, 1]].ln();
 
     InnerSolution {
+        cone_normalizer: None,
         log_likelihood: 0.0,
         penalty_quadratic: 0.0,
         hessian_op: Arc::new(
@@ -5078,6 +5090,7 @@ pub(crate) fn build_gaussian_test_solution(rho: &[f64]) -> InnerSolution<'_> {
     let penalty_logdet = gaussian_penalty_logdet_fd(p, &s1, &s2, rho);
 
     InnerSolution {
+        cone_normalizer: None,
         log_likelihood,
         penalty_quadratic: penalty_quad,
         hessian_op: Arc::new(op),
@@ -5132,6 +5145,7 @@ pub(crate) fn build_large_dense_spectral_gaussian_solution(rho: f64) -> InnerSol
     let log_likelihood = -0.5 * deviance;
 
     InnerSolution {
+        cone_normalizer: None,
         log_likelihood,
         penalty_quadratic: penalty_quad,
         hessian_op: Arc::new(op),
@@ -6728,6 +6742,7 @@ pub(crate) fn build_leak_proof_solution(
     };
 
     InnerSolution {
+        cone_normalizer: None,
         log_likelihood: log_lik,
         penalty_quadratic: penalty_quad,
         hessian_op: Arc::new(hop),
@@ -6990,6 +7005,7 @@ pub(crate) fn build_gaussian_solution_at_beta(
     let penalty_logdet = gaussian_penalty_logdet_fd(p, &s1, &s2, rho);
 
     InnerSolution {
+        cone_normalizer: None,
         log_likelihood,
         penalty_quadratic: penalty_quad,
         hessian_op: Arc::new(op),
@@ -7574,6 +7590,7 @@ pub(crate) fn build_scaled_curvature_solution(rho: &[f64], s: f64) -> InnerSolut
     let hessian_logdet_correction = -p * s.ln();
 
     InnerSolution {
+        cone_normalizer: None,
         // β = 0 isolates the log|H| term — penalty quadratic and its
         // ρ-derivative vanish independently of λ, leaving the gradient
         // entirely a `0.5 · tr(K · ∂H/∂ρ)` test.
@@ -8331,6 +8348,7 @@ fn mode_response_solution(
     deriv_provider: Box<dyn HessianDerivativeProvider + 'static>,
 ) -> InnerSolution<'static> {
     InnerSolution {
+        cone_normalizer: None,
         log_likelihood: 0.0,
         penalty_quadratic: 0.0,
         hessian_op: spd([3.0, 5.0]),
@@ -8587,6 +8605,7 @@ fn fold_fixture_solution(
     deriv_provider: Box<dyn HessianDerivativeProvider + 'static>,
 ) -> InnerSolution<'static> {
     InnerSolution {
+        cone_normalizer: None,
         log_likelihood: 0.0,
         penalty_quadratic: 0.0,
         hessian_op: spd(curvature),
@@ -8714,4 +8733,223 @@ pub(crate) fn a_curvature_that_does_not_move_never_refuses_above_its_rounding_ba
         });
         assert!(result.cost.is_finite(), "curvature {weakest:e}: cost {}", result.cost);
     }
+}
+
+/// gam#2765: the constrained Laplace normalizer through the engine, next to a switch of the active set.
+///
+/// A Gaussian quadratic in three coefficients with two correlated inequality rows `Aβ ≥ b`. The first
+/// row's bound is the unconstrained mode's value at `ρ_s`, so the constrained mode is on that row's face
+/// on one side of `ρ_s` and interior on the other; the second row keeps half a posterior standard
+/// deviation of slack there. For a quadratic the cone-integrated criterion is
+/// `F(β*) + ½log|H| − ½log|S|₊ − ln P(u ≥ 0)` with `u ~ N(Aβ* − b, AH⁻¹Aᵀ)`, smooth in ρ across the
+/// switch where the face criterion is not, so central differences of the engine's cost may straddle it.
+/// At two points closer to the switch than either difference step, one on each side, and at two whose
+/// stencils stay on one side, the analytic gradient must match central differences of the cost and the
+/// analytic Hessian central differences of the analytic gradient. Where a stencil stays on one side,
+/// the normalizer's share of the Hessian must also match central differences of its share of the
+/// gradient, and the criterion without it must match its own. The normalizer's share of each gradient
+/// entry must exceed its agreement bar, so a wrong normalizer derivative cannot pass.
+#[test]
+pub(crate) fn the_cone_normalizer_outer_derivatives_match_central_differences_at_a_face_switch_2765() {
+    use crate::model_types::ActiveLinearConstraintBlock;
+
+    let xtx = array![[10.0, 2.0, 1.0], [2.0, 8.0, 0.5], [1.0, 0.5, 6.0]];
+    let s1 = array![[1.0, 0.2, 0.0], [0.2, 1.0, 0.0], [0.0, 0.0, 0.0]];
+    let s2 = array![[0.0, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 0.0, 1.0]];
+    let xty = array![5.0, 3.0, 2.0];
+    let rows = array![[1.0, -0.4, 0.2], [0.3, 1.0, -0.5]];
+    let precision = |rho: &[f64]| {
+        let mut h = xtx.clone();
+        h.scaled_add(rho[0].exp(), &s1);
+        h.scaled_add(rho[1].exp(), &s2);
+        h
+    };
+    let factor = |rho: &[f64]| {
+        DenseSpectralOperator::from_symmetric(&precision(rho))
+            .expect("the fixture precision is positive definite")
+    };
+    let switch = [0.5, 0.3];
+    let bounds = {
+        let op = factor(&switch);
+        let free = op.solve(&xty);
+        let second = rows.row(1).to_owned();
+        let second_sd = second.dot(&op.solve(&second)).sqrt();
+        array![rows.row(0).dot(&free), second.dot(&free) - 0.5 * second_sd]
+    };
+    // The constrained mode: the one active set of the strictly convex quadratic whose multipliers are
+    // nonnegative and whose other rows are feasible.
+    let constrained_mode = |rho: &[f64]| -> (Array1<f64>, Vec<usize>) {
+        let op = factor(rho);
+        let free = op.solve(&xty);
+        for active in [vec![], vec![0], vec![1], vec![0, 1]] {
+            let beta = if active.is_empty() {
+                free.clone()
+            } else {
+                let face = rows.select(ndarray::Axis(0), &active);
+                let normals = op.solve_multi(&face.t().to_owned());
+                let deficit = &bounds.select(ndarray::Axis(0), &active) - &face.dot(&free);
+                let multipliers = DenseSpectralOperator::from_symmetric(&face.dot(&normals))
+                    .expect("the fixture rows are independent")
+                    .solve(&deficit);
+                if multipliers.iter().any(|&multiplier| multiplier < 0.0) {
+                    continue;
+                }
+                &free + &normals.dot(&multipliers)
+            };
+            let slack = &rows.dot(&beta) - &bounds;
+            if (0..rows.nrows()).all(|row| active.contains(&row) || slack[row] > 0.0) {
+                return (beta, active);
+            }
+        }
+        panic!("a strictly convex quadratic has a KKT active set at {rho:?}")
+    };
+    let evaluate = |rho: &[f64], request: EvalMode, priced: bool| {
+        let (beta, active) = constrained_mode(rho);
+        let gradient = precision(rho).dot(&beta) - &xty;
+        let mut solution = build_gaussian_solution_at_beta(rho, beta, false);
+        solution.dispersion = DispersionHandling::Fixed {
+            phi: 1.0,
+            include_logdet_h: true,
+            include_logdet_s: true,
+        };
+        // The builder differences `log|S|₊` numerically, and its second difference carries a
+        // rounding error near 1e-6, the size of the disagreement graded here. `S₁` and `S₂` act on
+        // disjoint coefficients, so `log|S|₊` is `Σ_k rank(S_k)·ρ_k` plus a constant: its first
+        // derivatives are the ranks and its second derivatives vanish.
+        solution.penalty_logdet = PenaltyLogdetDerivs {
+            value: solution.penalty_logdet.value,
+            first: solution.penalty_coords.iter().map(|coordinate| coordinate.rank() as f64).collect(),
+            second: Some(Array2::zeros((rho.len(), rho.len()))),
+        };
+        if !active.is_empty() {
+            solution.active_constraints = Some(Arc::new(ActiveLinearConstraintBlock {
+                a: rows.select(ndarray::Axis(0), &active),
+            }));
+        }
+        if priced {
+            solution.cone_normalizer = Some(Arc::new(ConeNormalizerInput {
+                rows: rows.clone(),
+                bounds: bounds.clone(),
+                gradient,
+                gradient_motion: ConeGradientMotion::Stationary,
+            }));
+        }
+        reml_laml_evaluate(&solution, rho, request, None)
+            .unwrap_or_else(|error| panic!("the fixture evaluates at {rho:?}: {error}"))
+    };
+    let gradient_at = |rho: &[f64], priced: bool| {
+        evaluate(rho, EvalMode::ValueAndGradient, priced)
+            .gradient
+            .expect("an exact quadratic mode publishes its gradient")
+    };
+    let displaced = |rho: &[f64], coordinate: usize, step: f64| {
+        let mut moved = rho.to_vec();
+        moved[coordinate] += step;
+        moved
+    };
+    // Central differences at steps h and h/2, their Richardson combination, and a bar of the two
+    // estimates' disagreement plus the rounding of the coarse one.
+    let richardson = |f: &dyn Fn(f64) -> f64, h: f64| {
+        let (plus, minus) = (f(h), f(-h));
+        let coarse = (plus - minus) / (2.0 * h);
+        let fine = (f(0.5 * h) - f(-0.5 * h)) / h;
+        let rounding = f64::EPSILON * (plus.abs() + minus.abs()) / h;
+        ((4.0 * fine - coarse) / 3.0, (fine - coarse).abs() + 4.0 * rounding)
+    };
+    let step = 1.0e-2;
+    let offset = 0.25 * step;
+    let hessian_at = |rho: &[f64], priced: bool| match evaluate(rho, EvalMode::ValueGradientHessian, priced).hessian {
+        gam_problem::HessianValue::Dense(hessian) => hessian,
+        gam_problem::HessianValue::Operator(_) | gam_problem::HessianValue::Unavailable => {
+            panic!("the fixture assembles a dense outer Hessian at {rho:?}")
+        }
+    };
+    // Two points closer to the switch than either difference step, so their stencils straddle it,
+    // and two whose stencils stay on one side.
+    let points = [
+        ("below", [switch[0] - offset, switch[1]]),
+        ("above", [switch[0] + offset, switch[1]]),
+        ("far below", [switch[0] - 20.0 * step, switch[1]]),
+        ("far above", [switch[0] + 20.0 * step, switch[1]]),
+    ];
+    let (below_active, above_active) = (constrained_mode(&points[0].1).1, constrained_mode(&points[1].1).1);
+    let mut failures = Vec::new();
+    if below_active.contains(&0) == above_active.contains(&0) {
+        failures.push(format!(
+            "the near points do not sit on either side of the first row's switch: {below_active:?} / {above_active:?}"
+        ));
+    }
+    for (name, point) in points {
+        let active = constrained_mode(&point).1;
+        // The stencil stays on the point's face when every difference point keeps its active rows;
+        // only then is the unpriced criterion, whose gradient kinks at the switch, differentiable
+        // across the stencil.
+        let one_sided = (0..point.len()).all(|coordinate| {
+            [step, -step, 0.5 * step, -0.5 * step]
+                .iter()
+                .all(|&t| constrained_mode(&displaced(&point, coordinate, t)).1 == active)
+        });
+        eprintln!("[2765-ENGINE] {name} rho={point:?} active={active:?} one_sided_stencil={one_sided}");
+        let gradient = gradient_at(&point, true);
+        let unpriced = gradient_at(&point, false);
+        let hessian = hessian_at(&point, true);
+        let unpriced_hessian = hessian_at(&point, false);
+        for coordinate in 0..point.len() {
+            let (fd, bar) = richardson(
+                &|t| evaluate(&displaced(&point, coordinate, t), EvalMode::ValueOnly, true).cost,
+                step,
+            );
+            let share = gradient[coordinate] - unpriced[coordinate];
+            eprintln!(
+                "[2765-ENGINE] {name} coordinate={coordinate} gradient={:.12e} fd={fd:.12e} bar={bar:.3e} \
+                 normalizer_share={share:.6e}",
+                gradient[coordinate]
+            );
+            if (gradient[coordinate] - fd).abs() > bar {
+                failures.push(format!("{name} gradient {coordinate}: {} against {fd} (bar {bar})", gradient[coordinate]));
+            }
+            if share.abs() <= bar {
+                failures.push(format!("{name} normalizer share {coordinate}: {share} within the bar {bar}"));
+            }
+            for row in 0..point.len() {
+                let (fd, bar) = richardson(&|t| gradient_at(&displaced(&point, coordinate, t), true)[row], step);
+                let (share_fd, share_bar) = richardson(
+                    &|t| {
+                        let moved = displaced(&point, coordinate, t);
+                        gradient_at(&moved, true)[row] - gradient_at(&moved, false)[row]
+                    },
+                    step,
+                );
+                let (base_fd, base_bar) =
+                    richardson(&|t| gradient_at(&displaced(&point, coordinate, t), false)[row], step);
+                let share_hessian = hessian[[row, coordinate]] - unpriced_hessian[[row, coordinate]];
+                eprintln!(
+                    "[2765-ENGINE] {name} hessian[{row},{coordinate}]={:.12e} fd={fd:.12e} bar={bar:.3e} | \
+                     normalizer {share_hessian:.12e} fd={share_fd:.12e} bar={share_bar:.3e} | \
+                     unpriced {:.12e} fd={base_fd:.12e} bar={base_bar:.3e}",
+                    hessian[[row, coordinate]],
+                    unpriced_hessian[[row, coordinate]]
+                );
+                if (hessian[[row, coordinate]] - fd).abs() > bar {
+                    failures.push(format!(
+                        "{name} hessian [{row},{coordinate}]: {} against {fd} (bar {bar})",
+                        hessian[[row, coordinate]]
+                    ));
+                }
+                if one_sided && (share_hessian - share_fd).abs() > share_bar {
+                    failures.push(format!(
+                        "{name} normalizer hessian [{row},{coordinate}]: {share_hessian} against {share_fd} \
+                         (bar {share_bar})"
+                    ));
+                }
+                if one_sided && (unpriced_hessian[[row, coordinate]] - base_fd).abs() > base_bar {
+                    failures.push(format!(
+                        "{name} unpriced hessian [{row},{coordinate}]: {} against {base_fd} (bar {base_bar})",
+                        unpriced_hessian[[row, coordinate]]
+                    ));
+                }
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{failures:#?}");
 }

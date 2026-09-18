@@ -3357,6 +3357,11 @@ impl WorkingModelSurvival {
                     reason: format!("the {mode:?} survival evaluation refused this trial point: {fold}"),
                 }
             }
+            gam_solve::estimate::reml::reml_outer_engine::RemlLamlError::ConeNormalizer(refusal) => {
+                EstimationError::TrialPointRefused {
+                    reason: format!("the {mode:?} survival evaluation refused this trial point: {refusal}"),
+                }
+            }
             gam_solve::estimate::reml::reml_outer_engine::RemlLamlError::Failed(reason) => {
                 EstimationError::InvalidInput(reason)
             }

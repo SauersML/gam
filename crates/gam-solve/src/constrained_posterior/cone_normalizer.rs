@@ -43,9 +43,12 @@
 //! `P(u ≥ 0)` has no closed form beyond two rows. It is estimated by EP on the orthant's
 //! half-line indicators (Cunningham, Hennig and Lacoste-Julien, 2011): deterministic, smooth in
 //! `(m₀, W)`, and exact for one row and for rows whose normals are `M⁻¹`-orthogonal. A sweep
-//! that moves `ln Z_EP` by no more than its own rounding band ends the iteration. A sweep that
-//! fails to contract the change is refused ([`ConeNormalizerRefusal::NotContracting`]); nothing
-//! truncates the iteration.
+//! that moves `ln Z_EP` by no more than its own rounding band ends the iteration. The change need
+//! not fall monotonically on the way: on strongly correlated rows it can grow for one sweep and
+//! then contract geometrically. A sweep that fails to contract halves the step every later site
+//! update takes toward its full update, which leaves the fixed points, and so every derivative
+//! below, unchanged. The iteration is refused ([`ConeNormalizerRefusal::NotContracting`]) only
+//! when a damped sweep moves no site parameter at all; nothing truncates it.
 //!
 //! # Derivatives
 //!
@@ -74,8 +77,8 @@ pub enum ConeNormalizerRefusal {
     /// An EP cavity lost positive precision, which a log-concave site cannot cause at a resolved
     /// posterior.
     CavityPrecision { row: usize, precision: f64, sweep: usize },
-    /// EP stopped contracting before `ln Z_EP` settled to its rounding band.
-    NotContracting { sweeps: usize, last_change: f64, previous_change: f64, band: f64 },
+    /// EP's damped update stopped moving the sites before `ln Z_EP` settled to its rounding band.
+    NotContracting { sweeps: usize, fraction: f64, last_change: f64, band: f64 },
     /// A system EP's derivatives solve is singular.
     Singular { reason: String },
 }
@@ -91,11 +94,11 @@ impl std::fmt::Display for ConeNormalizerRefusal {
                 "constrained Laplace normalizer: EP cavity precision {precision:e} at row {row} in \
                  sweep {sweep} (gam#2765)"
             ),
-            Self::NotContracting { sweeps, last_change, previous_change, band } => write!(
+            Self::NotContracting { sweeps, fraction, last_change, band } => write!(
                 f,
-                "constrained Laplace normalizer: EP stopped contracting after {sweeps} sweeps \
-                 (ln P moved {last_change:e} after {previous_change:e}) before settling to its \
-                 rounding band {band:e} (gam#2765)"
+                "constrained Laplace normalizer: EP stopped contracting after {sweeps} sweeps: a \
+                 sweep damped to fraction {fraction:e} moved no site while ln P still moved \
+                 {last_change:e}, above its rounding band {band:e} (gam#2765)"
             ),
             Self::Singular { reason } => {
                 write!(f, "constrained Laplace normalizer: {reason} (gam#2765)")
@@ -240,6 +243,9 @@ pub struct OrthantLogMass {
     e: Array2<f64>,
     log_mass: f64,
     sweeps: usize,
+    /// The share of its full update each site took on the last sweep: 1 unless a sweep failed to
+    /// contract.
+    fraction: f64,
 }
 
 impl OrthantLogMass {
@@ -257,14 +263,17 @@ impl OrthantLogMass {
             e: Array2::eye(q),
             log_mass: 0.0,
             sweeps: 0,
+            fraction: 1.0,
         };
         if q == 0 {
             return Ok(state);
         }
         let (mut previous, _) = state.evaluate_log_mass()?;
         let mut previous_change = f64::INFINITY;
+        let mut fraction = 1.0_f64;
         loop {
             state.sweeps += 1;
+            let (mut at_fixed_point, mut moved) = (true, false);
             for j in 0..q {
                 let (tau_c, nu_c) = state.cavity(j);
                 if !(tau_c > 0.0 && tau_c.is_finite()) {
@@ -275,25 +284,35 @@ impl OrthantLogMass {
                     });
                 }
                 let update = site_update(tau_c, nu_c);
-                state.tau[j] = update.tau;
-                state.nu[j] = update.nu;
+                at_fixed_point &= update.tau == state.tau[j] && update.nu == state.nu[j];
+                let tau = (1.0 - fraction) * state.tau[j] + fraction * update.tau;
+                let nu = (1.0 - fraction) * state.nu[j] + fraction * update.nu;
+                moved |= tau != state.tau[j] || nu != state.nu[j];
+                state.tau[j] = tau;
+                state.nu[j] = nu;
                 state.e = inverse_i_plus_wt(&state.w, &state.tau)?;
             }
             let (log_mass, magnitude) = state.evaluate_log_mass()?;
             let change = (log_mass - previous).abs();
-            // Every term of ln Z_EP is formed in O(q²) rounded operations.
+            // Every term of ln Z_EP is formed in O(q²) rounded operations. A damped sweep moves
+            // ln Z_EP by about `fraction` times what the full update would, so the band scales with
+            // it: a short step is not mistaken for a settled one.
             let band = accumulation_growth(4 * q * q + 8 * q) * magnitude;
-            if change <= band {
+            if at_fixed_point || change <= fraction * band {
                 state.log_mass = log_mass;
+                state.fraction = fraction;
                 return Ok(state);
             }
-            if !(change < previous_change) {
+            if !moved {
                 return Err(ConeNormalizerRefusal::NotContracting {
                     sweeps: state.sweeps,
-                    last_change: change,
-                    previous_change,
+                    fraction,
+                    last_change: previous_change,
                     band,
                 });
+            }
+            if !(change < previous_change) {
+                fraction *= 0.5;
             }
             previous_change = change;
             previous = log_mass;
@@ -383,6 +402,11 @@ impl OrthantLogMass {
     /// Sweeps EP took to reach its fixed point.
     pub fn sweeps(&self) -> usize {
         self.sweeps
+    }
+
+    /// The share of its full update each site took on EP's last sweep.
+    pub fn step_fraction(&self) -> f64 {
+        self.fraction
     }
 
     /// `γ = ∂lnP/∂m₀ = Eᵀ(ν̃ − T m₀)`.
@@ -605,6 +629,11 @@ impl ConeNormalizer {
         self.orthant.sweeps()
     }
 
+    /// The share of its full update each EP site took on the last sweep at this mode.
+    pub fn ep_step_fraction(&self) -> f64 {
+        self.orthant.step_fraction()
+    }
+
     /// `ln P(u ≥ 0)`.
     pub fn log_mass(&self) -> f64 {
         self.orthant.log_mass()
@@ -736,6 +765,66 @@ mod tests {
     fn dense_solve(m: &Array2<f64>) -> impl Fn(&Array1<f64>) -> Array1<f64> {
         let inverse = invert(m.clone(), "test precision").expect("the test precision is invertible");
         move |rhs: &Array1<f64>| inverse.dot(rhs)
+    }
+
+    /// The change of `ln Z_EP` need not fall monotonically. This orthant is where EP was refused on
+    /// the #2765 named gate for one growing sweep (seven rows correlated up to 0.98; job 1264873,
+    /// change 1.047e-5 after 1.546e-7 at sweep 5). Continued undamped from there, the same
+    /// iteration contracted by about 0.17 a sweep and settled in eleven more. EP must damp through
+    /// the growing sweep and stop at the fixed point: a further full sweep then moves `ln P` by no
+    /// more than the rounding band an undamped sweep stops at.
+    #[test]
+    fn a_sweep_that_grows_once_is_damped_through_to_the_fixed_point_2765() {
+        let m0 = array![
+            1.4809995771564423e-7, 1.7717232615695905e-7, 2.0363414175511165e-7, 2.2606609011260675e-7,
+            8.162448125194582e-8, 5.321724567424204e-8, 2.9476733560602725e-8
+        ];
+        let w = array![
+            [2.9508210065971846e-9, 3.4958356571107647e-9, 3.912754533017762e-9, 4.464972506819625e-9,
+             1.6279726304593417e-9, 1.0646084495901858e-9, 5.893937617899781e-10],
+            [3.4958356571107647e-9, 4.285289722109347e-9, 4.639471432395575e-9, 5.36668453191144e-9,
+             1.9512472011207427e-9, 1.2777161142067118e-9, 7.071422079398519e-10],
+            [3.912754533017762e-9, 4.639471432395575e-9, 5.473951938184774e-9, 6.063487293971178e-9,
+             2.224874801505365e-9, 1.4505891376259968e-9, 8.036798655566868e-10],
+            [4.464972506819625e-9, 5.36668453191144e-9, 6.063487293971178e-9, 7.097279381627257e-9,
+             2.5735700905130125e-9, 1.6873873160829292e-9, 9.335753852933286e-10],
+            [1.6279726304593417e-9, 1.9512472011207427e-9, 2.224874801505365e-9, 2.5735700905130125e-9,
+             9.527282262398787e-10, 6.182315168699378e-10, 3.4294010893329004e-10],
+            [1.0646084495901858e-9, 1.2777161142067118e-9, 1.4505891376259968e-9, 1.6873873160829292e-9,
+             6.182315168699378e-10, 4.084376808974685e-10, 2.2535505405812938e-10],
+            [5.893937617899781e-10, 7.071422079398519e-10, 8.036798655566868e-10, 9.335753852933286e-10,
+             3.4294010893329004e-10, 2.2535505405812938e-10, 1.250961094155234e-10]
+        ];
+        let mass = OrthantLogMass::converge(&m0, &w)
+            .unwrap_or_else(|refusal| panic!("EP settles on the recorded orthant: {refusal}"));
+        let mut checked = mass.clone();
+        let q = m0.len();
+        for j in 0..q {
+            let (tau_c, nu_c) = checked.cavity(j);
+            let update = site_update(tau_c, nu_c);
+            checked.tau[j] = update.tau;
+            checked.nu[j] = update.nu;
+            checked.e = inverse_i_plus_wt(&checked.w, &checked.tau).expect("admissible sites");
+        }
+        let (after, magnitude) = checked.evaluate_log_mass().expect("a finite EP log mass");
+        let band = accumulation_growth(4 * q * q + 8 * q) * magnitude;
+        eprintln!(
+            "[2765-EP] ln P {:.15e} after {} sweeps at fraction {}; a full sweep moves it {:e} (band {band:e})",
+            mass.log_mass(),
+            mass.sweeps(),
+            mass.step_fraction(),
+            (after - mass.log_mass()).abs()
+        );
+        assert!(
+            mass.step_fraction() < 1.0,
+            "the recorded orthant has a sweep that fails to contract, so EP damps (fraction {})",
+            mass.step_fraction()
+        );
+        assert!(
+            (after - mass.log_mass()).abs() <= band,
+            "a full sweep from the damped stop moves ln P by {:e}, above the band {band:e}",
+            (after - mass.log_mass()).abs()
+        );
     }
 
     #[test]

@@ -2223,6 +2223,11 @@ impl<'a> RemlState<'a> {
                     reason: format!("the {mode:?} evaluation refused this trial point: {fold}"),
                 }
             }
+            super::reml_outer_engine::RemlLamlError::ConeNormalizer(refusal) => {
+                EstimationError::TrialPointRefused {
+                    reason: format!("the {mode:?} evaluation refused this trial point: {refusal}"),
+                }
+            }
             super::reml_outer_engine::RemlLamlError::Failed(reason) => {
                 EstimationError::InvalidInput(reason)
             }
@@ -2334,6 +2339,13 @@ impl<'a> RemlState<'a> {
                 EstimationError::TrialPointRefused {
                     reason: format!(
                         "the {eval_mode:?} EFS evaluation refused this trial point: {fold}"
+                    ),
+                }
+            }
+            super::reml_outer_engine::RemlLamlError::ConeNormalizer(refusal) => {
+                EstimationError::TrialPointRefused {
+                    reason: format!(
+                        "the {eval_mode:?} EFS evaluation refused this trial point: {refusal}"
                     ),
                 }
             }
