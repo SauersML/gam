@@ -1193,5 +1193,15 @@
     ],
     "reason": "#2946 fr-reuse: compare_reuse_reml no longer refuses a penalty with a null space. It takes a penalty set and a declared null space, and it keeps each context's null-space coefficients as flat fixed effects in both hypotheses, so a penalty with a DECLARED null space now computes. The test that pinned the old refusal (a penalty diag(0, 1, 1) refused with ImproperPenalty) is superseded by reml_arm_refuses_an_undeclared_or_unannihilated_null_space. The same penalties with no declared null space are refused by the REML owner's structural rank check, a declared direction the penalties reach is refused with NullSpaceNotAnnihilated, and the declared intercept computes as the positive control. The ImproperPenalty variant the old test matched is deleted with it.",
     "evidence": "Direct gate dy4 fr-reuse-penset at 9f9e719f78 (patch md5 7e5615d9, tree 3bb06cbaa5) without this entry: source_removal_guard.py names exactly this one item, test_scoped true, production_occurrences 0 (direct-dy4-fr-reuse-penset.log.guard). In the same gate, workspace --all-targets check RC 0, RC_PYFFI 0, 8/8 response::reuse tests, public API census 0. In the landing tree, reml_arm_refuses_a_penalty_with_a_null_space occurs 0 times in reuse.rs, and ImproperPenalty occurs 0 times."
+  },
+  {
+    "base": "ece911eb2f42526d846b2d9ab3fa596f127b0330",
+    "items": [
+      "crates/gam-sae/src/response/tiles.rs:const:CLOSED_FORM_OPERATIONS",
+      "crates/gam-sae/src/response/tiles_tests.rs:fn:banded_root",
+      "crates/gam-sae/src/response/tiles_tests.rs:struct:Columns"
+    ],
+    "reason": "#2946: CLOSED_FORM_OPERATIONS = 64 was a hand bound on the floating-point operations of one closed form of gam_math::gaussian_activation, used to band closed-form pairs as γ_64(|K| + |m m|). fr-kernel's pair_kernel publishes a derived per-evaluation bound, PairKernel::value_rounding (f37d909841), so closed-form pairs now take that plus γ_2 for the mean-product difference, and the rounding has one owner. banded_root and Columns were the tiles test's own column producer. The pins now read their columns from the owner, HermiteColumns::for_block, so both are deleted with it.",
+    "evidence": "git grep -n -w CLOSED_FORM_OPERATIONS at a99ab01898 finds its declaration and its one production use in crates/gam-sae/src/response/tiles.rs, plus its import and two uses in tiles_tests.rs, all removed here. Gate job 1271973 at a99ab01898 named exactly these three items (CLOSED_FORM_OPERATIONS production_occurrences 5; banded_root and Columns test_scoped) before this entry existed. It also ran the workspace --all-targets check RC 0, gam-pyffi RC 0, public_api_census RC 0 and assertionless RC 0."
   }
 ]
